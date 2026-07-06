@@ -27,6 +27,8 @@ ENABLE_SESSION_CTX_KEY = "enableSessionCtx"
 
 # --- exec session defaults (configurable via CLI options) ---
 DEFAULT_SESSION_TTL = 90
+DEFAULT_INTERACTIVE_SESSION_TTL = 600
+RELEASE_SESSION_TTL = 0
 DEFAULT_CONCURRENCY = 1
 
 # --- request headers ---
