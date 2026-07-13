@@ -64,13 +64,13 @@ def test_exec_with_args_invokes_once_and_preserves_json_body(monkeypatch):
 
     result = runner.invoke(
         cli,
-        ["exec", "--agent", "urn:demo", "--server", "frontend:31180", "--args", '"你好"'],
+        ["exec", "--agent", "0@default@demo", "--server", "frontend:31180", "--args", '"你好"'],
     )
 
     assert result.exit_code == 0
     assert len(captured) == 1
     assert captured[0]["server"] == "http://frontend:31180"
-    assert captured[0]["urn"] == "urn:demo"
+    assert captured[0]["urn"] == "sn:cn:yrk:default:function:0@default@demo:latest"
     assert captured[0]["body"] == '"你好"'
     assert HEADER_AGENT_SESSION not in captured[0]["headers"]
     assert HEADER_INSTANCE_SESSION not in captured[0]["headers"]
@@ -82,11 +82,13 @@ def test_exec_without_args_enters_interactive_mode_and_wraps_messages(monkeypatc
 
     result = runner.invoke(
         cli,
-        ["exec", "--agent", "urn:demo", "--server", "frontend:31180"],
+        ["exec", "--agent", "0@default@demo", "--server", "frontend:31180"],
         input="你好\n下一轮\n/quit\n",
     )
 
     assert result.exit_code == 0
+    assert "ar> " in result.output
+    assert "yrar> " not in result.output
     assert [json.loads(item["body"]) for item in captured[:2]] == [
         {"message": "你好"},
         {"message": "下一轮"},
@@ -122,7 +124,7 @@ def test_interactive_mode_uses_user_session_ctx(monkeypatch):
         [
             "exec",
             "--agent",
-            "urn:demo",
+            "0@default@demo",
             "--server",
             "frontend:31180",
             "--session-ctx",
@@ -147,7 +149,7 @@ def test_interactive_mode_uses_user_session_id_and_ttl(monkeypatch):
         [
             "exec",
             "--agent",
-            "urn:demo",
+            "0@default@demo",
             "--server",
             "frontend:31180",
             "--session-id",
@@ -186,7 +188,7 @@ def test_interactive_mode_releases_session_when_first_stream_fails(monkeypatch):
 
     result = runner.invoke(
         cli,
-        ["exec", "--agent", "urn:demo", "--server", "frontend:31180"],
+        ["exec", "--agent", "0@default@demo", "--server", "frontend:31180"],
         input="hello\n",
     )
 
@@ -212,7 +214,7 @@ def test_interactive_session_release_ignores_stream_failures(monkeypatch):
 
     result = runner.invoke(
         cli,
-        ["exec", "--agent", "urn:demo", "--server", "frontend:31180"],
+        ["exec", "--agent", "0@default@demo", "--server", "frontend:31180"],
         input="hello\n/exit\n",
     )
 
@@ -228,7 +230,32 @@ def test_exec_args_still_requires_valid_json(monkeypatch):
 
     result = runner.invoke(
         cli,
-        ["exec", "--agent", "urn:demo", "--server", "frontend:31180", "--args", "not-json"],
+        ["exec", "--agent", "0@default@demo", "--server", "frontend:31180", "--args", "not-json"],
+    )
+
+    assert result.exit_code == 2
+
+
+def test_exec_agent_accepts_explicit_version(monkeypatch):
+    captured = _capture_invocations(monkeypatch)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        cli,
+        ["exec", "--agent", "0@default@demo:v1", "--server", "frontend:31180", "--args", "{}"],
+    )
+
+    assert result.exit_code == 0
+    assert captured[0]["urn"] == "sn:cn:yrk:default:function:0@default@demo:v1"
+
+
+def test_exec_agent_rejects_non_default_prefix(monkeypatch):
+    _capture_invocations(monkeypatch)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        cli,
+        ["exec", "--agent", "0@svc@demo", "--server", "frontend:31180", "--args", "{}"],
     )
 
     assert result.exit_code == 2
@@ -240,7 +267,7 @@ def test_session_ttl_without_session_id_aborts_without_sending(monkeypatch):
 
     result = runner.invoke(
         cli,
-        ["exec", "--agent", "urn:demo", "--server", "frontend:31180", "--session-ttl", "120"],
+        ["exec", "--agent", "0@default@demo", "--server", "frontend:31180", "--session-ttl", "120"],
     )
 
     assert result.exit_code == 2
@@ -254,7 +281,7 @@ def test_concurrency_without_session_id_aborts_without_sending(monkeypatch):
 
     result = runner.invoke(
         cli,
-        ["exec", "--agent", "urn:demo", "--server", "frontend:31180", "--concurrency", "4"],
+        ["exec", "--agent", "0@default@demo", "--server", "frontend:31180", "--concurrency", "4"],
     )
 
     assert result.exit_code == 2
@@ -267,7 +294,7 @@ def test_session_ctx_over_max_len_aborts_without_sending(monkeypatch):
 
     result = runner.invoke(
         cli,
-        ["exec", "--agent", "urn:demo", "--server", "frontend:31180", "--session-ctx", "c" * 64],
+        ["exec", "--agent", "0@default@demo", "--server", "frontend:31180", "--session-ctx", "c" * 64],
     )
 
     assert result.exit_code == 2
@@ -281,7 +308,7 @@ def test_session_id_over_max_len_aborts_without_sending(monkeypatch):
 
     result = runner.invoke(
         cli,
-        ["exec", "--agent", "urn:demo", "--server", "frontend:31180", "--session-id", "i" * 64],
+        ["exec", "--agent", "0@default@demo", "--server", "frontend:31180", "--session-id", "i" * 64],
     )
 
     assert result.exit_code == 2
@@ -297,7 +324,7 @@ def test_session_fields_at_max_len_are_allowed(monkeypatch):
         [
             "exec",
             "--agent",
-            "urn:demo",
+            "0@default@demo",
             "--server",
             "frontend:31180",
             "--session-ctx",
@@ -315,7 +342,7 @@ def test_server_without_port_is_rejected(monkeypatch):
     captured = _capture_invocations(monkeypatch)
     runner = CliRunner()
 
-    result = runner.invoke(cli, ["exec", "--agent", "urn:demo", "--server", "frontend", "--args", '"hi"'])
+    result = runner.invoke(cli, ["exec", "--agent", "0@default@demo", "--server", "frontend", "--args", '"hi"'])
 
     assert result.exit_code == 2
     assert "host:port" in result.output
@@ -327,7 +354,7 @@ def test_server_with_invalid_port_is_rejected(monkeypatch):
     runner = CliRunner()
 
     result = runner.invoke(
-        cli, ["exec", "--agent", "urn:demo", "--server", "frontend:99999", "--args", '"hi"']
+        cli, ["exec", "--agent", "0@default@demo", "--server", "frontend:99999", "--args", '"hi"']
     )
 
     assert result.exit_code == 2
@@ -350,7 +377,7 @@ def test_session_ttl_zero_is_rejected(monkeypatch):
 
     result = runner.invoke(
         cli,
-        ["exec", "--agent", "urn:demo", "--server", "frontend:31180", "--session-id", "id1", "--session-ttl", "0"],
+        ["exec", "--agent", "0@default@demo", "--server", "frontend:31180", "--session-id", "id1", "--session-ttl", "0"],
     )
 
     assert result.exit_code == 2
@@ -363,7 +390,7 @@ def test_concurrency_zero_is_rejected(monkeypatch):
 
     result = runner.invoke(
         cli,
-        ["exec", "--agent", "urn:demo", "--server", "frontend:31180", "--session-id", "id1", "--concurrency", "0"],
+        ["exec", "--agent", "0@default@demo", "--server", "frontend:31180", "--session-id", "id1", "--concurrency", "0"],
     )
 
     assert result.exit_code == 2
@@ -379,7 +406,7 @@ def test_session_ttl_with_session_id_is_allowed(monkeypatch):
         [
             "exec",
             "--agent",
-            "urn:demo",
+            "0@default@demo",
             "--server",
             "frontend:31180",
             "--session-id",

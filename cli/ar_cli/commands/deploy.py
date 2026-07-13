@@ -23,6 +23,7 @@ import click
 from ar_cli.client import AgentRuntimeClient
 from ar_cli.const import ENABLE_SESSION_CTX_KEY
 from ar_cli.errors import ArError
+from ar_cli.urn import function_urn_to_public_agent
 from ar_cli.utils import load_spec, normalize_addr, print_logger, validate_server
 
 logger = logging.getLogger(__name__)
@@ -72,9 +73,13 @@ def deploy(ctx: click.Context, spec: str, server: str) -> None:
 
     function = result.get("function", {}) if isinstance(result, dict) else {}
     urn = function.get("functionVersionUrn") or function.get("functionUrn")
-    if urn:
-        print_logger.info("Deployed. functionVersionUrn: %s", urn)
+    public_agent = function_urn_to_public_agent(urn)
+    if public_agent:
+        print_logger.info("Deployed. agent: %s", public_agent)
+    elif urn:
+        logger.warning("Deploy succeeded but function URN is not in public 0@default@funcname format")
+        print_logger.info("Deployed.")
     else:
         logger.warning("Deploy succeeded but no functionVersionUrn found in response")
-        print_logger.info("%s", result)
+        print_logger.info("Deployed.")
     ctx.exit(0)

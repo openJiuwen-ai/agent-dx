@@ -56,7 +56,7 @@ def cli(ctx: click.Context, verbose: bool) -> None:
 
     Example usage:\n
       - ar deploy -s ./agent.json --server <META_SERVICE_ADDR>\n
-      - ar exec --agent <URN> --server <FRONTEND_ADDR>
+      - ar exec --agent <AGENT> --server <FRONTEND_ADDR>
     """
     ctx.ensure_object(dict)
     ctx.obj["verbose"] = verbose

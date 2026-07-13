@@ -35,7 +35,7 @@ ar deploy -s <函数定义> --server <META_SERVICE_ADDR>
 - `-s/--spec` 会做格式校验:若值是已存在的文件则按文件读取并解析 JSON;否则按 inline JSON 解析。两者都不满足(既非合法 JSON,也不是存在的文件路径)时报错退出(退出码 2)。
 - `--server` 必须是 `host:port` 形式(缺端口或端口非法会报错)。
 - 函数定义中若未设置 `enableSessionCtx` 字段,会自动注入默认值 `true`;若已显式设置(`true` 或 `false`),则以用户设置为准。
-- 注册成功后会打印 `functionVersionUrn`,可直接用于 `ar exec --agent`。
+- 注册成功后会打印公开 agent 名称,格式为 `0@default@funcname`,可直接用于 `ar exec --agent`。
 
 示例:
 
@@ -44,19 +44,19 @@ ar deploy -s <函数定义> --server <META_SERVICE_ADDR>
 ar deploy -s ./agent.json --server 127.0.0.1:31182
 
 # inline JSON 方式
-ar deploy -s '{"name":"0@svc@demo","runtime":"python3.11","handler":"demo.handler"}' \
+ar deploy -s '{"name":"0@default@demo","runtime":"python3.11","handler":"demo.handler"}' \
           --server 127.0.0.1:31182
 ```
 
 ### ar exec —— 调用 agent(流式)
 
 ```bash
-ar exec --agent <FUNCTION_VERSION_URN> --server <FRONTEND_ADDR> [可选参数]
+ar exec --agent <AGENT> --server <FRONTEND_ADDR> [可选参数]
 ```
 
 | 参数 | 必选 | 默认 | 说明 |
 |------|------|------|------|
-| `--agent` | 是 | — | 要调用的 agent 的 functionVersionUrn |
+| `--agent` | 是 | — | 要调用的 agent,格式为 `0@default@funcname[:version]`;未传 version 时默认 `latest` |
 | `--server` | 是 | — | frontend 地址,格式为 `host:port`,例如 `127.0.0.1:31180`(默认 http,无需加 `http://` 前缀) |
 | `--session-ctx` | 否 | 无 | agent 会话上下文;传入才会带 `X-Session-Context` 请求头,交互模式会自动生成默认值 |
 | `--session-id` | 否 | 无 | 实例会话 id;传入才会带 `X-Instance-Session` 请求头,交互模式会自动生成默认值 |
@@ -81,13 +81,13 @@ ar exec --agent <FUNCTION_VERSION_URN> --server <FRONTEND_ADDR> [可选参数]
 
 ```bash
 # 最简调用
-ar exec --agent <URN> --server 127.0.0.1:31180
+ar exec --agent <AGENT> --server 127.0.0.1:31180
 
 # 一次性调用
-ar exec --agent <URN> --server 127.0.0.1:31180 --args '{"message":"你好"}'
+ar exec --agent <AGENT> --server 127.0.0.1:31180 --args '{"message":"你好"}'
 
 # 带会话上下文与入参
-ar exec --agent <URN> --server 127.0.0.1:31180 \
+ar exec --agent <AGENT> --server 127.0.0.1:31180 \
         --session-ctx ctx1 --session-id id1 --session-ttl 90 --concurrency 1 \
         --args '{"param1":"你好"}'
 ```
@@ -98,7 +98,7 @@ ar exec --agent <URN> --server 127.0.0.1:31180 \
 - 加 `-v / --verbose` 开启 DEBUG 级日志,会在请求发送前打印请求详情(method、url、headers、body),方便定位问题:
 
   ```bash
-  ar -v exec --agent <URN> --server 127.0.0.1:31180
+  ar -v exec --agent <AGENT> --server 127.0.0.1:31180
   ```
 
 - 普通日志走 stderr,流式数据走 stdout,互不干扰。需要把日志存盘时自行重定向:

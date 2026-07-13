@@ -29,6 +29,7 @@ from ar_cli.errors import ArError
 from ar_cli.lineedit import read_line
 from ar_cli.session import build_invocation_headers
 from ar_cli.sse import stream_sse
+from ar_cli.urn import public_agent_to_function_version_urn
 from ar_cli.utils import (
     normalize_addr,
     parse_json_arg,
@@ -53,14 +54,14 @@ JSON body. Omitting --args enters interactive mode; each line is sent as
 provided, except interactive mode auto-generates session values when omitted.
 
 Example:\n
-  ar exec --agent <URN> --server <FRONTEND_ADDR> --args '{"param1":"hi"}'
+  ar exec --agent <AGENT> --server <FRONTEND_ADDR> --args '{"param1":"hi"}'
 """,
 )
 @click.option(
     "--agent",
     required=True,
     callback=validate_non_empty,
-    help="functionVersionUrn of the agent to invoke.",
+    help="Agent name as 0@default@funcname[:version].",
 )
 @click.option(
     "--server",
@@ -109,19 +110,20 @@ def exec_cmd(
     concurrency: int,
     args: str,
 ) -> None:
-    # session-ttl / concurrency are meaningless without a session id.
-    if args is not None and session_id is None and (session_ttl is not None or concurrency is not None):
+    # session-ttl / concurrency are meaningless without a user-provided session id.
+    if session_id is None and (session_ttl is not None or concurrency is not None):
         raise click.UsageError("--session-ttl/--concurrency require --session-id; nothing was sent")
 
     client = AgentRuntimeClient()
     server_url = normalize_addr(server)
+    agent_urn = public_agent_to_function_version_urn(agent)
 
     try:
         if args is None:
             _run_interactive(
                 client=client,
                 server=server_url,
-                agent=agent,
+                agent=agent_urn,
                 session_ctx=session_ctx,
                 session_id=session_id,
                 session_ttl=session_ttl,
@@ -136,7 +138,7 @@ def exec_cmd(
             session_ttl=session_ttl,
             concurrency=concurrency,
         )
-        _invoke_once(client, server_url, agent, headers=headers, body=args)
+        _invoke_once(client, server_url, agent_urn, headers=headers, body=args)
     except ArError as e:
         logger.error("%s", e)
         ctx.exit(e.exit_code)
@@ -202,7 +204,7 @@ def _run_interactive(
 def _read_interactive_line() -> Optional[str]:
     # read_line() enables cursor/Home/End editing via readline when available,
     # else a built-in raw-mode editor on a TTY, else plain input().
-    return read_line("yrar> ")
+    return read_line("ar> ")
 
 
 def _invoke_once(
