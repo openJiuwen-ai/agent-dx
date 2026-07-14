@@ -23,7 +23,7 @@ import click
 from ar_cli.client import AgentRuntimeClient
 from ar_cli.const import ENABLE_SESSION_CTX_KEY
 from ar_cli.errors import ArError
-from ar_cli.utils import load_spec, normalize_addr, print_logger
+from ar_cli.utils import load_spec, normalize_addr, print_logger, validate_server
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +48,7 @@ Example:\n
 @click.option(
     "--server",
     required=True,
+    callback=validate_server,
     help="meta_service address as host:port, e.g. 127.0.0.1:31182 (http is assumed, no scheme needed).",
 )
 @click.pass_context

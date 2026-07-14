@@ -31,6 +31,9 @@ DEFAULT_INTERACTIVE_SESSION_TTL = 600
 RELEASE_SESSION_TTL = 0
 DEFAULT_CONCURRENCY = 1
 
+# Max length of --session-ctx / --session-id values.
+SESSION_FIELD_MAX_LEN = 63
+
 # --- request headers ---
 HEADER_CONTENT_TYPE = "Content-Type"
 HEADER_ACCEPT = "Accept"
