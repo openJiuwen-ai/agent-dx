@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import json
+import importlib
 
 import pytest
 from click.testing import CliRunner
@@ -22,6 +23,8 @@ from click.testing import CliRunner
 from ar_cli.const import ENABLE_SESSION_CTX_KEY
 from ar_cli.main import cli
 from ar_cli.utils import load_spec
+
+deploy_module = importlib.import_module("ar_cli.commands.deploy")
 
 
 def _capture_registered_spec(monkeypatch):
@@ -31,7 +34,7 @@ def _capture_registered_spec(monkeypatch):
     def fake_register(self, meta_addr, spec):
         captured["addr"] = meta_addr
         captured["spec"] = spec
-        return {"function": {"functionVersionUrn": "sn:test:urn:latest"}}
+        return {"function": {"functionVersionUrn": "sn:cn:yrk:default:function:0@default@demo:latest"}}
 
     monkeypatch.setattr("ar_cli.client.AgentRuntimeClient.register_function", fake_register)
     return captured
@@ -94,6 +97,38 @@ def test_deploy_nonexistent_spec_file_error_mentions_file(monkeypatch):
     result = runner.invoke(cli, ["deploy", "-s", "./no_such_spec.json", "--server", "meta:31182"])
     assert result.exit_code == 2
     assert "existing file" in result.output
+
+
+def test_deploy_prints_public_agent_urn(monkeypatch):
+    _capture_registered_spec(monkeypatch)
+    printed = []
+
+    def fake_print(message, *args):
+        printed.append(message % args)
+
+    monkeypatch.setattr(deploy_module.print_logger, "info", fake_print)
+    runner = CliRunner()
+
+    result = runner.invoke(cli, ["deploy", "-s", '{"name": "demo"}', "--server", "meta:31182"])
+
+    assert result.exit_code == 0
+    assert printed == ["Deployed. agent: 0@default@demo"]
+    assert "sn:cn:yrk" not in printed[0]
+
+
+def test_deploy_prints_explicit_public_agent_version(monkeypatch):
+    def fake_register(self, meta_addr, spec):
+        return {"function": {"functionVersionUrn": "sn:cn:yrk:default:function:0@default@demo:v1"}}
+
+    monkeypatch.setattr("ar_cli.client.AgentRuntimeClient.register_function", fake_register)
+    printed = []
+    monkeypatch.setattr(deploy_module.print_logger, "info", lambda message, *args: printed.append(message % args))
+    runner = CliRunner()
+
+    result = runner.invoke(cli, ["deploy", "-s", '{"name": "demo"}', "--server", "meta:31182"])
+
+    assert result.exit_code == 0
+    assert printed == ["Deployed. agent: 0@default@demo:v1"]
 
 
 def test_load_spec_from_file(tmp_path):

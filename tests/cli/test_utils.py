@@ -15,6 +15,7 @@
 # limitations under the License.
 
 from ar_cli.utils import normalize_addr
+from ar_cli.urn import function_urn_to_public_agent, public_agent_to_function_version_urn
 
 
 def test_bare_host_port_gets_http():
@@ -31,3 +32,35 @@ def test_existing_https_scheme_kept():
 
 def test_surrounding_whitespace_stripped():
     assert normalize_addr("  host:8080  ") == "http://host:8080"
+
+
+def test_public_agent_to_function_version_urn_defaults_latest():
+    assert (
+        public_agent_to_function_version_urn("0@default@demo")
+        == "sn:cn:yrk:default:function:0@default@demo:latest"
+    )
+
+
+def test_public_agent_to_function_version_urn_keeps_version():
+    assert (
+        public_agent_to_function_version_urn("0@default@demo:v2")
+        == "sn:cn:yrk:default:function:0@default@demo:v2"
+    )
+
+
+def test_function_urn_to_public_agent_omits_latest():
+    assert (
+        function_urn_to_public_agent("sn:cn:yrk:default:function:0@default@demo:latest")
+        == "0@default@demo"
+    )
+
+
+def test_function_urn_to_public_agent_keeps_non_latest_version():
+    assert (
+        function_urn_to_public_agent("sn:cn:yrk:default:function:0@default@demo:v2")
+        == "0@default@demo:v2"
+    )
+
+
+def test_function_urn_to_public_agent_rejects_non_default_prefix():
+    assert function_urn_to_public_agent("sn:cn:yrk:default:function:0@svc@demo:latest") is None
