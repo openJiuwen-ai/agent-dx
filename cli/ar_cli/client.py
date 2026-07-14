@@ -101,6 +101,12 @@ class AgentRuntimeClient:
         except requests.RequestException as e:
             raise NetworkError(f"failed to reach frontend at {url}: {e}")
 
+        # SSE is UTF-8 by spec. requests defaults a text/* response without an
+        # explicit charset to ISO-8859-1, which would mojibake non-ASCII (e.g.
+        # Chinese) payloads when decoded; force UTF-8 for both streaming and the
+        # error-body text below.
+        resp.encoding = "utf-8"
+
         if not resp.ok:
             text = _brief(resp.text)
             resp.close()

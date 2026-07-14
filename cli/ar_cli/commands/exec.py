@@ -26,9 +26,17 @@ import click
 from ar_cli.client import AgentRuntimeClient
 from ar_cli.const import DEFAULT_INTERACTIVE_SESSION_TTL, RELEASE_SESSION_TTL
 from ar_cli.errors import ArError
+from ar_cli.lineedit import read_line
 from ar_cli.session import build_invocation_headers
 from ar_cli.sse import stream_sse
-from ar_cli.utils import normalize_addr, parse_json_arg, print_logger
+from ar_cli.utils import (
+    normalize_addr,
+    parse_json_arg,
+    print_logger,
+    validate_non_empty,
+    validate_server,
+    validate_session_field,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -48,25 +56,41 @@ Example:\n
   ar exec --agent <URN> --server <FRONTEND_ADDR> --args '{"param1":"hi"}'
 """,
 )
-@click.option("--agent", required=True, help="functionVersionUrn of the agent to invoke.")
+@click.option(
+    "--agent",
+    required=True,
+    callback=validate_non_empty,
+    help="functionVersionUrn of the agent to invoke.",
+)
 @click.option(
     "--server",
     required=True,
+    callback=validate_server,
     help="frontend address as host:port, e.g. 127.0.0.1:31180 (http is assumed, no scheme needed).",
 )
-@click.option("--session-ctx", default=None, help="Agent session context; sets the X-Session-Context header.")
-@click.option("--session-id", default=None, help="Instance session id; sets the X-Instance-Session header.")
+@click.option(
+    "--session-ctx",
+    default=None,
+    callback=validate_session_field,
+    help="Agent session context; sets the X-Session-Context header (max 63 chars).",
+)
+@click.option(
+    "--session-id",
+    default=None,
+    callback=validate_session_field,
+    help="Instance session id; sets the X-Instance-Session header (max 63 chars).",
+)
 @click.option(
     "--session-ttl",
-    type=int,
+    type=click.IntRange(min=1),
     default=None,
-    help="Instance session TTL (default: 90). Only used with --session-id.",
+    help="Instance session TTL (default: 90, must be > 0). Only used with --session-id.",
 )
 @click.option(
     "--concurrency",
-    type=int,
+    type=click.IntRange(min=1),
     default=None,
-    help="Instance session concurrency (default: 1). Only used with --session-id.",
+    help="Instance session concurrency (default: 1, must be > 0). Only used with --session-id.",
 )
 @click.option(
     "--args",
@@ -87,7 +111,7 @@ def exec_cmd(
 ) -> None:
     # session-ttl / concurrency are meaningless without a session id.
     if args is not None and session_id is None and (session_ttl is not None or concurrency is not None):
-        logger.warning("--session-ttl/--concurrency are ignored without --session-id")
+        raise click.UsageError("--session-ttl/--concurrency require --session-id; nothing was sent")
 
     client = AgentRuntimeClient()
     server_url = normalize_addr(server)
@@ -176,11 +200,9 @@ def _run_interactive(
 
 
 def _read_interactive_line() -> Optional[str]:
-    click.echo("yrar> ", nl=False, err=True)
-    try:
-        return input()
-    except EOFError:
-        return None
+    # read_line() enables cursor/Home/End editing via readline when available,
+    # else a built-in raw-mode editor on a TTY, else plain input().
+    return read_line("yrar> ")
 
 
 def _invoke_once(

@@ -232,3 +232,164 @@ def test_exec_args_still_requires_valid_json(monkeypatch):
     )
 
     assert result.exit_code == 2
+
+
+def test_session_ttl_without_session_id_aborts_without_sending(monkeypatch):
+    captured = _capture_invocations(monkeypatch)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        cli,
+        ["exec", "--agent", "urn:demo", "--server", "frontend:31180", "--session-ttl", "120"],
+    )
+
+    assert result.exit_code == 2
+    assert "require --session-id" in result.output
+    assert captured == []  # nothing was sent
+
+
+def test_concurrency_without_session_id_aborts_without_sending(monkeypatch):
+    captured = _capture_invocations(monkeypatch)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        cli,
+        ["exec", "--agent", "urn:demo", "--server", "frontend:31180", "--concurrency", "4"],
+    )
+
+    assert result.exit_code == 2
+    assert captured == []
+
+
+def test_session_ctx_over_max_len_aborts_without_sending(monkeypatch):
+    captured = _capture_invocations(monkeypatch)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        cli,
+        ["exec", "--agent", "urn:demo", "--server", "frontend:31180", "--session-ctx", "c" * 64],
+    )
+
+    assert result.exit_code == 2
+    assert "at most 63 characters" in result.output
+    assert captured == []  # nothing was sent
+
+
+def test_session_id_over_max_len_aborts_without_sending(monkeypatch):
+    captured = _capture_invocations(monkeypatch)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        cli,
+        ["exec", "--agent", "urn:demo", "--server", "frontend:31180", "--session-id", "i" * 64],
+    )
+
+    assert result.exit_code == 2
+    assert captured == []
+
+
+def test_session_fields_at_max_len_are_allowed(monkeypatch):
+    captured = _capture_invocations(monkeypatch)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        cli,
+        [
+            "exec",
+            "--agent",
+            "urn:demo",
+            "--server",
+            "frontend:31180",
+            "--session-ctx",
+            "c" * 63,
+            "--args",
+            '"hi"',
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert len(captured) == 1
+
+
+def test_server_without_port_is_rejected(monkeypatch):
+    captured = _capture_invocations(monkeypatch)
+    runner = CliRunner()
+
+    result = runner.invoke(cli, ["exec", "--agent", "urn:demo", "--server", "frontend", "--args", '"hi"'])
+
+    assert result.exit_code == 2
+    assert "host:port" in result.output
+    assert captured == []
+
+
+def test_server_with_invalid_port_is_rejected(monkeypatch):
+    captured = _capture_invocations(monkeypatch)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        cli, ["exec", "--agent", "urn:demo", "--server", "frontend:99999", "--args", '"hi"']
+    )
+
+    assert result.exit_code == 2
+    assert captured == []
+
+
+def test_empty_agent_is_rejected(monkeypatch):
+    captured = _capture_invocations(monkeypatch)
+    runner = CliRunner()
+
+    result = runner.invoke(cli, ["exec", "--agent", "  ", "--server", "frontend:31180", "--args", '"hi"'])
+
+    assert result.exit_code == 2
+    assert captured == []
+
+
+def test_session_ttl_zero_is_rejected(monkeypatch):
+    captured = _capture_invocations(monkeypatch)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        cli,
+        ["exec", "--agent", "urn:demo", "--server", "frontend:31180", "--session-id", "id1", "--session-ttl", "0"],
+    )
+
+    assert result.exit_code == 2
+    assert captured == []
+
+
+def test_concurrency_zero_is_rejected(monkeypatch):
+    captured = _capture_invocations(monkeypatch)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        cli,
+        ["exec", "--agent", "urn:demo", "--server", "frontend:31180", "--session-id", "id1", "--concurrency", "0"],
+    )
+
+    assert result.exit_code == 2
+    assert captured == []
+
+
+def test_session_ttl_with_session_id_is_allowed(monkeypatch):
+    captured = _capture_invocations(monkeypatch)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        cli,
+        [
+            "exec",
+            "--agent",
+            "urn:demo",
+            "--server",
+            "frontend:31180",
+            "--session-id",
+            "id1",
+            "--session-ttl",
+            "120",
+            "--args",
+            '"hi"',
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert len(captured) == 1

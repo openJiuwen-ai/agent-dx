@@ -5,17 +5,10 @@ openYuanrong Agent Runtime 的命令行工具。Agent 本质上就是函数,`ar`
 - `ar deploy` —— 通过 meta_service 注册一个 agent(函数)。
 - `ar exec` —— 调用 agent(函数),并以 SSE 流式输出返回结果;未传 `--args` 时进入交互模式。
 
-详细设计见 [`../docs/ar-cli-design.md`](../docs/ar-cli-design.md)。
 
 ## 安装
 
-在本 `cli/` 目录下执行:
-
-```bash
-pip install .
-```
-
-或先构建 whl 再安装:
+先构建 whl 再安装:
 
 ```bash
 python setup.py bdist_wheel
@@ -34,11 +27,13 @@ ar deploy -s <函数定义> --server <META_SERVICE_ADDR>
 
 | 参数 | 必选 | 说明 |
 |------|------|------|
-| `-s, --spec` | 是 | 函数定义,可以是一段 inline JSON 字符串,也可以是 JSON 文件路径(自动识别) |
-| `--server` | 是 | meta_service 地址,格式为 `host:port`,例如 `127.0.0.1:31182`(默认 http,无需加 `http://` 前缀) |
+| `-s, --spec` | 是 | 函数定义,可以是一段 inline JSON 字符串,也可以是 JSON 文件路径(自动识别);非法 JSON、或文件不存在均会报错 |
+| `--server` | 是 | meta_service 地址,格式为 `host:port`,例如 `127.0.0.1:31182`(默认 http,无需加 `http://` 前缀);格式不合法会报错 |
 
 说明:
 
+- `-s/--spec` 会做格式校验:若值是已存在的文件则按文件读取并解析 JSON;否则按 inline JSON 解析。两者都不满足(既非合法 JSON,也不是存在的文件路径)时报错退出(退出码 2)。
+- `--server` 必须是 `host:port` 形式(缺端口或端口非法会报错)。
 - 函数定义中若未设置 `enableSessionCtx` 字段,会自动注入默认值 `true`;若已显式设置(`true` 或 `false`),则以用户设置为准。
 - 注册成功后会打印 `functionVersionUrn`,可直接用于 `ar exec --agent`。
 
@@ -72,6 +67,7 @@ ar exec --agent <FUNCTION_VERSION_URN> --server <FRONTEND_ADDR> [可选参数]
 说明:
 
 - 只有 `--agent` 和 `--server` 必选,其余均可选。
+- `--session-ttl` / `--concurrency` 必须配合 `--session-id` 使用;若只传了它们而没传 `--session-id`,`ar` 会报错并直接退出(退出码 2),**不发送任何请求**。
 - 传入 `--args` 时执行一次性调用,请求体原样使用该 JSON 字符串。
 - 未传 `--args` 时进入交互模式;每轮用户输入会自动包装为 `{"message":"用户输入"}` 后发起一次调用。
 - 交互模式下若未传 `--session-ctx`,会自动生成一个会话上下文,并在每次调用中携带同一个 `X-Session-Context` 请求头;若已传入,则使用用户提供的值。

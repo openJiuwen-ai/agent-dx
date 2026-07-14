@@ -79,6 +79,23 @@ def test_server_addr_gets_http_scheme(monkeypatch):
     assert captured["addr"] == "http://meta:31182"
 
 
+def test_deploy_server_without_port_is_rejected(monkeypatch):
+    captured = _capture_registered_spec(monkeypatch)
+    runner = CliRunner()
+    result = runner.invoke(cli, ["deploy", "-s", '{"name": "demo"}', "--server", "meta"])
+    assert result.exit_code == 2
+    assert "host:port" in result.output
+    assert "addr" not in captured  # registration not attempted
+
+
+def test_deploy_nonexistent_spec_file_error_mentions_file(monkeypatch):
+    _capture_registered_spec(monkeypatch)
+    runner = CliRunner()
+    result = runner.invoke(cli, ["deploy", "-s", "./no_such_spec.json", "--server", "meta:31182"])
+    assert result.exit_code == 2
+    assert "existing file" in result.output
+
+
 def test_load_spec_from_file(tmp_path):
     spec_file = tmp_path / "spec.json"
     spec_file.write_text(json.dumps({"name": "from-file"}), encoding="utf-8")

@@ -22,10 +22,51 @@ import os
 import re
 import sys
 from typing import Any
+from urllib.parse import urlparse
 
 import click
 
+from ar_cli.const import SESSION_FIELD_MAX_LEN
+
 _SCHEME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*://")
+
+
+def validate_session_field(ctx, param, value):
+    """Click callback: reject session field values longer than the max length.
+
+    Shared by --session-ctx / --session-id (and future resume/fork commands).
+    ``None`` (option not provided) passes through unchanged.
+    """
+    if value is not None and len(value) > SESSION_FIELD_MAX_LEN:
+        raise click.BadParameter(
+            f"must be at most {SESSION_FIELD_MAX_LEN} characters (got {len(value)})"
+        )
+    return value
+
+
+def validate_server(ctx, param, value):
+    """Click callback: require a ``host:port`` address (scheme optional).
+
+    Accepts a bare ``host:port`` or one carrying an http(s) scheme. Rejects a
+    missing host or a missing/invalid port. Returns the value unchanged.
+    """
+    if value is None:
+        return value
+    parsed = urlparse(normalize_addr(value))
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    if not parsed.hostname or not port:
+        raise click.BadParameter(f"must be in host:port form, e.g. 127.0.0.1:31180 (got {value!r})")
+    return value
+
+
+def validate_non_empty(ctx, param, value):
+    """Click callback: reject an empty / whitespace-only value."""
+    if value is not None and value.strip() == "":
+        raise click.BadParameter("must not be empty")
+    return value
 
 # Diagnostic logger -> stderr. The ar CLI never writes log files: it is a
 # short-lived, stateless HTTP client. Users who want logs on disk redirect
@@ -85,8 +126,11 @@ def load_spec(spec_arg: str) -> Any:
     try:
         return json.loads(raw)
     except json.JSONDecodeError as e:
-        hint = spec_arg if os.path.isfile(spec_arg) else _truncate(raw)
-        raise click.BadParameter(f"spec is not valid JSON ({hint}): {e}")
+        if os.path.isfile(spec_arg):
+            raise click.BadParameter(f"spec file '{spec_arg}' does not contain valid JSON: {e}")
+        raise click.BadParameter(
+            f"spec is neither valid JSON nor an existing file: {_truncate(spec_arg)} ({e})"
+        )
 
 
 def parse_json_arg(value: str, label: str) -> Any:
