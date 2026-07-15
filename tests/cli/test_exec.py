@@ -249,13 +249,50 @@ def test_exec_agent_accepts_explicit_version(monkeypatch):
     assert captured[0]["urn"] == "sn:cn:yrk:default:function:0@default@demo:v1"
 
 
-def test_exec_agent_rejects_non_default_prefix(monkeypatch):
-    _capture_invocations(monkeypatch)
+def test_exec_agent_accepts_namespace(monkeypatch):
+    captured = _capture_invocations(monkeypatch)
     runner = CliRunner()
 
     result = runner.invoke(
         cli,
         ["exec", "--agent", "0@svc@demo", "--server", "frontend:31180", "--args", "{}"],
+    )
+
+    assert result.exit_code == 0
+    assert captured[0]["urn"] == "sn:cn:yrk:default:function:0@svc@demo:latest"
+
+
+def test_exec_agent_rejects_empty_namespace(monkeypatch):
+    _capture_invocations(monkeypatch)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        cli,
+        ["exec", "--agent", "0@@demo", "--server", "frontend:31180", "--args", "{}"],
+    )
+
+    assert result.exit_code == 2
+
+
+def test_exec_agent_rejects_non_numeric_tenant(monkeypatch):
+    _capture_invocations(monkeypatch)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        cli,
+        ["exec", "--agent", "tenant@svc@demo", "--server", "frontend:31180", "--args", "{}"],
+    )
+
+    assert result.exit_code == 2
+
+
+def test_exec_agent_rejects_non_zero_prefix(monkeypatch):
+    _capture_invocations(monkeypatch)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        cli,
+        ["exec", "--agent", "123@svc@demo", "--server", "frontend:31180", "--args", "{}"],
     )
 
     assert result.exit_code == 2

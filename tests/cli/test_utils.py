@@ -41,6 +41,13 @@ def test_public_agent_to_function_version_urn_defaults_latest():
     )
 
 
+def test_public_agent_to_function_version_urn_keeps_namespace():
+    assert (
+        public_agent_to_function_version_urn("0@faaspy@demo")
+        == "sn:cn:yrk:default:function:0@faaspy@demo:latest"
+    )
+
+
 def test_public_agent_to_function_version_urn_keeps_version():
     assert (
         public_agent_to_function_version_urn("0@default@demo:v2")
@@ -55,6 +62,13 @@ def test_function_urn_to_public_agent_omits_latest():
     )
 
 
+def test_function_urn_to_public_agent_keeps_namespace():
+    assert (
+        function_urn_to_public_agent("sn:cn:yrk:default:function:0@faaspy@demo:latest")
+        == "0@faaspy@demo"
+    )
+
+
 def test_function_urn_to_public_agent_keeps_non_latest_version():
     assert (
         function_urn_to_public_agent("sn:cn:yrk:default:function:0@default@demo:v2")
@@ -62,5 +76,13 @@ def test_function_urn_to_public_agent_keeps_non_latest_version():
     )
 
 
-def test_function_urn_to_public_agent_rejects_non_default_prefix():
-    assert function_urn_to_public_agent("sn:cn:yrk:default:function:0@svc@demo:latest") is None
+def test_function_urn_to_public_agent_rejects_empty_namespace():
+    assert function_urn_to_public_agent("sn:cn:yrk:default:function:0@@demo:latest") is None
+
+
+def test_function_urn_to_public_agent_rejects_non_numeric_tenant():
+    assert function_urn_to_public_agent("sn:cn:yrk:default:function:tenant@faaspy@demo:latest") is None
+
+
+def test_function_urn_to_public_agent_rejects_non_zero_prefix():
+    assert function_urn_to_public_agent("sn:cn:yrk:default:function:123@faaspy@demo:latest") is None
