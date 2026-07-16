@@ -116,6 +116,21 @@ def test_deploy_prints_public_agent_urn(monkeypatch):
     assert "sn:cn:yrk" not in printed[0]
 
 
+def test_deploy_prints_public_agent_with_namespace(monkeypatch):
+    def fake_register(self, meta_addr, spec):
+        return {"function": {"functionVersionUrn": "sn:cn:yrk:default:function:0@faaspy@demo:latest"}}
+
+    monkeypatch.setattr("ar_cli.client.AgentRuntimeClient.register_function", fake_register)
+    printed = []
+    monkeypatch.setattr(deploy_module.print_logger, "info", lambda message, *args: printed.append(message % args))
+    runner = CliRunner()
+
+    result = runner.invoke(cli, ["deploy", "-s", '{"name": "demo"}', "--server", "meta:31182"])
+
+    assert result.exit_code == 0
+    assert printed == ["Deployed. agent: 0@faaspy@demo"]
+
+
 def test_deploy_prints_explicit_public_agent_version(monkeypatch):
     def fake_register(self, meta_addr, spec):
         return {"function": {"functionVersionUrn": "sn:cn:yrk:default:function:0@default@demo:v1"}}

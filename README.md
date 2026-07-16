@@ -33,7 +33,7 @@ ar deploy -s ./agent.json --server 127.0.0.1:31182
 调用 agent/function：
 
 ```bash
-ar exec --agent <FUNCTION_VERSION_URN> --server 127.0.0.1:31180 --args '{"message":"你好"}'
+ar exec --agent <AGENT> --server 127.0.0.1:31180 --args '{"message":"你好"}'
 ```
 
 更多安装方式、参数说明和交互模式用法见 [cli/README.md](cli/README.md)。
