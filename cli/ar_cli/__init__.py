@@ -16,4 +16,15 @@
 
 """openYuanrong Agent Runtime CLI (`ar`)."""
 
-__version__ = "0.1.0"
+from importlib.metadata import PackageNotFoundError, version
+from pathlib import Path
+
+
+def _version() -> str:
+    try:
+        return version("openyuanrong-agentruntime")
+    except PackageNotFoundError:
+        return (Path(__file__).resolve().parents[2] / "VERSION").read_text(encoding="utf-8").strip()
+
+
+__version__ = _version()

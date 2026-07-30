@@ -2,7 +2,7 @@
 
 ## 简介
 
-openYuanrong Agent Runtime 是 openYuanrong 的 agent 运行时接入仓库，用于承载 agent 注册、调用、会话管理等开发者工具。仓库当前提供 Python CLI `ar`，后续也会在这里扩展 SDK 等接入能力。
+openYuanrong Agent Runtime 是 openYuanrong 的 agent 运行时接入仓库，用于承载 agent 注册、调用、会话管理等开发者工具。仓库当前提供 Python CLI `ar` 和独立构建的 Python AgentRuntimeSDK。
 
 ### 关键能力
 
@@ -14,6 +14,7 @@ openYuanrong Agent Runtime 是 openYuanrong 的 agent 运行时接入仓库，�
 - 支持一次性调用和交互式调用。
 
 CLI 的安装、命令参数、示例、退出码和测试说明见 [cli/README.md](cli/README.md)。
+AgentRuntimeSDK 的编程模型、固定 Bootstrap 和部署配置见 [python/README.md](python/README.md)。
 
 ## 入门
 
@@ -56,9 +57,13 @@ ar exec --agent <agent_name> --server {frontend_endpoint} --args '{"message":"�
 ```text
 cli/                 Python CLI 包源码与打包配置
 cli/ar_cli/          ar 命令实现
+python/              Python AgentRuntimeSDK 独立包
 tests/cli/           CLI 单元测试
+tests/python/        AgentRuntimeSDK 单元与集成测试
 pytest.ini           测试配置
 ```
+
+CLI 和 SDK 是两个独立发布包，共享仓库根目录 `VERSION` 中的版本号。
 
 ## 贡献
 

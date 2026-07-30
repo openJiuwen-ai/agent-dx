@@ -17,22 +17,16 @@
 """Packaging for the openYuanrong Agent Runtime CLI (`ar`)."""
 
 import os
-import re
-
 import setuptools
 
 ROOT_DIR = os.path.dirname(__file__)
+REPO_ROOT = os.path.dirname(ROOT_DIR)
 
 
 def get_version():
-    """Read __version__ from ar_cli/__init__.py."""
-    init_path = os.path.join(ROOT_DIR, "ar_cli", "__init__.py")
-    with open(init_path, "r", encoding="utf-8") as f:
-        content = f.read()
-    match = re.search(r'^__version__\s*=\s*["\']([^"\']+)["\']', content, re.MULTILINE)
-    if not match:
-        raise RuntimeError("Unable to find __version__ in ar_cli/__init__.py")
-    return os.getenv("BUILD_VERSION") or match.group(1)
+    """Read the repository-wide package version."""
+    with open(os.path.join(REPO_ROOT, "VERSION"), "r", encoding="utf-8") as version_file:
+        return os.getenv("BUILD_VERSION") or version_file.read().strip()
 
 
 setuptools.setup(

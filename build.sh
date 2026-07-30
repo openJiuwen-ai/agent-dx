@@ -33,6 +33,7 @@ BASE_DIR=$(
 )
 
 CLI_DIR="$BASE_DIR/cli"          # ar_cli package + setup.py live here
+SDK_DIR="$BASE_DIR/python"       # Agent Runtime SDK package
 BUILD_DIR="$BASE_DIR/build"      # intermediate build dir (setup.py -b)
 OUTPUT_DIR="$BASE_DIR/output"    # default wheel output dir
 PYTHON3_BIN_PATH="python3"
@@ -71,7 +72,9 @@ done
 
 if [ "$COMMAND" == "clean" ]; then
     echo "Cleaning build artifacts..."
-    rm -rf "$BUILD_DIR" "$OUTPUT_DIR" "$CLI_DIR"/build "$CLI_DIR"/dist "$CLI_DIR"/*.egg-info
+    rm -rf "$BUILD_DIR" "$OUTPUT_DIR" \
+        "$CLI_DIR"/build "$CLI_DIR"/dist "$CLI_DIR"/*.egg-info \
+        "$SDK_DIR"/build "$SDK_DIR"/dist "$SDK_DIR"/src/*.egg-info
     exit 0
 fi
 
@@ -87,6 +90,9 @@ mkdir -p "$OUTPUT_DIR"
 # must run from there; the wheel is written to OUTPUT_DIR via -d.
 cd "$CLI_DIR"
 "$PYTHON3_BIN_PATH" setup.py bdist_wheel -b "$BUILD_DIR" -d "$OUTPUT_DIR"
+
+cd "$SDK_DIR"
+"$PYTHON3_BIN_PATH" setup.py bdist_wheel -b "$BUILD_DIR/sdk" -d "$OUTPUT_DIR"
 
 echo "Build done. Wheel(s) in: $OUTPUT_DIR"
 ls -1 "$OUTPUT_DIR"/*.whl 2>/dev/null || true
