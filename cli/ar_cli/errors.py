@@ -30,6 +30,11 @@ class ApiError(ArError):
 
     exit_code = EXIT_FAILURE
 
+    def __init__(self, message: str, status_code: int = None, service_code=None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.service_code = service_code
+
 
 class NetworkError(ArError):
     """Could not reach the server (connection refused, timeout, DNS, ...)."""

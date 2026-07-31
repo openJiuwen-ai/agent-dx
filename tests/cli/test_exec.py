@@ -19,6 +19,7 @@ import json
 from click.testing import CliRunner
 
 from ar_cli.const import HEADER_AGENT_SESSION, HEADER_INSTANCE_SESSION
+from ar_cli.interactive.state import CommandResult
 from ar_cli.main import cli
 
 
@@ -54,12 +55,13 @@ def _capture_invocations(monkeypatch):
         )
         return FakeResponse()
 
-    monkeypatch.setattr("ar_cli.client.AgentRuntimeClient.invoke", fake_invoke)
+    monkeypatch.setattr("ar_cli.api.client.AgentRuntimeClient.invoke", fake_invoke)
     return captured
 
 
 def test_exec_with_args_invokes_once_and_preserves_json_body(monkeypatch):
     captured = _capture_invocations(monkeypatch)
+    monkeypatch.setattr("ar_cli.commands.exec.new_session_ctx_id", lambda: "ar-generated")
     runner = CliRunner()
 
     result = runner.invoke(
@@ -72,8 +74,64 @@ def test_exec_with_args_invokes_once_and_preserves_json_body(monkeypatch):
     assert captured[0]["server"] == "http://frontend:31180"
     assert captured[0]["urn"] == "sn:cn:yrk:default:function:0@default@demo:latest"
     assert captured[0]["body"] == '"你好"'
-    assert HEADER_AGENT_SESSION not in captured[0]["headers"]
+    assert json.loads(captured[0]["headers"][HEADER_AGENT_SESSION]) == {
+        "sessionCtx": "ar-generated"
+    }
     assert HEADER_INSTANCE_SESSION not in captured[0]["headers"]
+
+
+def test_exec_with_args_uses_user_session_ctx(monkeypatch):
+    captured = _capture_invocations(monkeypatch)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        cli,
+        [
+            "exec",
+            "--agent",
+            "0@default@demo",
+            "--server",
+            "frontend:31180",
+            "--session-ctx",
+            "ctx-user",
+            "--args",
+            "{}",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert json.loads(captured[0]["headers"][HEADER_AGENT_SESSION]) == {
+        "sessionCtx": "ctx-user"
+    }
+
+
+def test_global_jwt_token_is_passed_to_client(monkeypatch):
+    initialized = []
+
+    def fake_init(self, timeout=None, jwt_token=None):
+        initialized.append(jwt_token)
+
+    monkeypatch.setattr("ar_cli.api.client.AgentRuntimeClient.__init__", fake_init)
+    _capture_invocations(monkeypatch)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        cli,
+        [
+            "--jwt-token",
+            "jwt-token",
+            "exec",
+            "--agent",
+            "0@default@demo",
+            "--server",
+            "frontend:31180",
+            "--args",
+            "{}",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert initialized == ["jwt-token"]
 
 
 def test_exec_without_args_enters_interactive_mode_and_wraps_messages(monkeypatch):
@@ -87,32 +145,34 @@ def test_exec_without_args_enters_interactive_mode_and_wraps_messages(monkeypatc
     )
 
     assert result.exit_code == 0
-    assert "ar> " in result.output
-    assert "yrar> " not in result.output
-    assert [json.loads(item["body"]) for item in captured[:2]] == [
+    assert "[ar-" in result.output
+    assert len(captured) == 3
+    normal_invocations = captured[:2]
+    release_invocation = captured[2]
+    assert [json.loads(item["body"]) for item in normal_invocations] == [
         {"message": "你好"},
         {"message": "下一轮"},
     ]
-    assert json.loads(captured[2]["body"]) == {}
 
-    session_headers = [json.loads(item["headers"][HEADER_AGENT_SESSION]) for item in captured]
+    session_headers = [json.loads(item["headers"][HEADER_AGENT_SESSION]) for item in normal_invocations]
     assert session_headers[0] == session_headers[1]
-    assert session_headers[1] == session_headers[2]
     assert session_headers[0]["sessionCtx"].startswith("ar-")
 
-    instance_headers = [json.loads(item["headers"][HEADER_INSTANCE_SESSION]) for item in captured]
-    assert instance_headers[0] == {
-        "sessionID": instance_headers[0]["sessionID"],
-        "sessionTTL": 600,
-        "concurrency": 1,
-    }
+    instance_headers = [json.loads(item["headers"][HEADER_INSTANCE_SESSION]) for item in normal_invocations]
+    assert instance_headers[0] == instance_headers[1]
     assert instance_headers[0]["sessionID"].startswith("ar-")
-    assert instance_headers[1] == instance_headers[0]
-    assert instance_headers[2] == {
+    assert instance_headers[0]["sessionTTL"] == 600
+    assert instance_headers[0]["concurrency"] == 1
+    assert all("X-Request-Id" not in item["headers"] for item in normal_invocations)
+
+    assert json.loads(release_invocation["headers"][HEADER_AGENT_SESSION]) == session_headers[0]
+    assert json.loads(release_invocation["headers"][HEADER_INSTANCE_SESSION]) == {
         "sessionID": instance_headers[0]["sessionID"],
         "sessionTTL": 0,
         "concurrency": 1,
     }
+    assert release_invocation["body"] == "{}"
+    assert "X-Request-Id" not in release_invocation["headers"]
 
 
 def test_interactive_mode_uses_user_session_ctx(monkeypatch):
@@ -137,7 +197,9 @@ def test_interactive_mode_uses_user_session_ctx(monkeypatch):
     assert len(captured) == 2
     assert json.loads(captured[0]["headers"][HEADER_AGENT_SESSION]) == {"sessionCtx": "ctx-user"}
     assert json.loads(captured[0]["headers"][HEADER_INSTANCE_SESSION])["sessionTTL"] == 600
+    assert json.loads(captured[1]["headers"][HEADER_AGENT_SESSION]) == {"sessionCtx": "ctx-user"}
     assert json.loads(captured[1]["headers"][HEADER_INSTANCE_SESSION])["sessionTTL"] == 0
+    assert captured[1]["body"] == "{}"
 
 
 def test_interactive_mode_uses_user_session_id_and_ttl(monkeypatch):
@@ -172,6 +234,7 @@ def test_interactive_mode_uses_user_session_id_and_ttl(monkeypatch):
         "sessionTTL": 0,
         "concurrency": 1,
     }
+    assert captured[1]["body"] == "{}"
 
 
 def test_interactive_mode_releases_session_when_first_stream_fails(monkeypatch):
@@ -179,11 +242,9 @@ def test_interactive_mode_releases_session_when_first_stream_fails(monkeypatch):
 
     def fake_invoke(self, server, urn, *, headers, body):
         captured.append({"headers": headers, "body": body})
-        if len(captured) == 1:
-            return BrokenStreamResponse()
-        return FakeResponse()
+        return BrokenStreamResponse()
 
-    monkeypatch.setattr("ar_cli.client.AgentRuntimeClient.invoke", fake_invoke)
+    monkeypatch.setattr("ar_cli.api.client.AgentRuntimeClient.invoke", fake_invoke)
     runner = CliRunner()
 
     result = runner.invoke(
@@ -196,32 +257,112 @@ def test_interactive_mode_releases_session_when_first_stream_fails(monkeypatch):
     assert isinstance(result.exception, RuntimeError)
     assert len(captured) == 2
     assert json.loads(captured[0]["body"]) == {"message": "hello"}
-    assert json.loads(captured[1]["body"]) == {}
+    assert captured[1]["body"] == "{}"
+    assert json.loads(captured[0]["headers"][HEADER_INSTANCE_SESSION])["sessionTTL"] == 600
     assert json.loads(captured[1]["headers"][HEADER_INSTANCE_SESSION])["sessionTTL"] == 0
 
 
-def test_interactive_session_release_ignores_stream_failures(monkeypatch):
+def test_interactive_explicit_instance_session_releases_on_exit(monkeypatch):
     captured = []
 
     def fake_invoke(self, server, urn, *, headers, body):
         captured.append({"headers": headers, "body": body})
-        if len(captured) == 2:
-            return BrokenStreamResponse()
         return FakeResponse()
 
-    monkeypatch.setattr("ar_cli.client.AgentRuntimeClient.invoke", fake_invoke)
+    monkeypatch.setattr("ar_cli.api.client.AgentRuntimeClient.invoke", fake_invoke)
     runner = CliRunner()
 
     result = runner.invoke(
         cli,
-        ["exec", "--agent", "0@default@demo", "--server", "frontend:31180"],
+        [
+            "exec",
+            "--agent",
+            "0@default@demo",
+            "--server",
+            "frontend:31180",
+            "--session-id",
+            "id-user",
+        ],
         input="hello\n/exit\n",
     )
 
     assert result.exit_code == 0
     assert len(captured) == 2
-    assert json.loads(captured[1]["body"]) == {}
-    assert json.loads(captured[1]["headers"][HEADER_INSTANCE_SESSION])["sessionTTL"] == 0
+    assert json.loads(captured[0]["headers"][HEADER_INSTANCE_SESSION]) == {
+        "sessionID": "id-user",
+        "sessionTTL": 600,
+        "concurrency": 1,
+    }
+    assert json.loads(captured[1]["headers"][HEADER_INSTANCE_SESSION]) == {
+        "sessionID": "id-user",
+        "sessionTTL": 0,
+        "concurrency": 1,
+    }
+    assert captured[1]["body"] == "{}"
+
+
+def test_interactive_quit_without_normal_message_does_not_release_session(monkeypatch):
+    captured = _capture_invocations(monkeypatch)
+    runner = CliRunner()
+
+    result = runner.invoke(
+        cli,
+        ["exec", "--agent", "0@default@demo", "--server", "frontend:31180"],
+        input="/quit\n",
+    )
+
+    assert result.exit_code == 0
+    assert captured == []
+
+
+def test_interactive_session_switch_releases_old_session_and_remints_id(monkeypatch):
+    captured = _capture_invocations(monkeypatch)
+    runner = CliRunner()
+
+    def switch_context(line, *, state, client):
+        if line == "/new":
+            state.session_ctx = "ctx-next"
+            return CommandResult.CONTINUE
+        assert line == "/quit"
+        return CommandResult.EXIT
+
+    monkeypatch.setattr("ar_cli.interactive.runner.handle_session_command", switch_context)
+    result = runner.invoke(
+        cli,
+        [
+            "exec",
+            "--agent",
+            "0@default@demo",
+            "--server",
+            "frontend:31180",
+            "--session-ctx",
+            "ctx-original",
+        ],
+        input="hello\n/new\nworld\n/quit\n",
+    )
+
+    assert result.exit_code == 0
+    assert len(captured) == 4
+    assert json.loads(captured[0]["headers"][HEADER_AGENT_SESSION]) == {"sessionCtx": "ctx-original"}
+    assert json.loads(captured[1]["headers"][HEADER_AGENT_SESSION]) == {"sessionCtx": "ctx-original"}
+    assert json.loads(captured[2]["headers"][HEADER_AGENT_SESSION]) == {"sessionCtx": "ctx-next"}
+    assert json.loads(captured[3]["headers"][HEADER_AGENT_SESSION]) == {"sessionCtx": "ctx-next"}
+
+    session_a_id = json.loads(captured[0]["headers"][HEADER_INSTANCE_SESSION])["sessionID"]
+    session_b_id = json.loads(captured[2]["headers"][HEADER_INSTANCE_SESSION])["sessionID"]
+    assert session_a_id != session_b_id
+    assert json.loads(captured[1]["headers"][HEADER_INSTANCE_SESSION]) == {
+        "sessionID": session_a_id,
+        "sessionTTL": 0,
+        "concurrency": 1,
+    }
+    assert json.loads(captured[3]["headers"][HEADER_INSTANCE_SESSION]) == {
+        "sessionID": session_b_id,
+        "sessionTTL": 0,
+        "concurrency": 1,
+    }
+    assert captured[1]["body"] == "{}"
+    assert captured[3]["body"] == "{}"
 
 
 def test_exec_args_still_requires_valid_json(monkeypatch):

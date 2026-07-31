@@ -14,10 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Command registry. Add a new command by importing it and appending to COMMANDS.
-
-resume / fork are reserved (see their modules) and not registered yet.
-"""
+"""Command registry for the public ar CLI commands."""
 
 from ar_cli.commands.deploy import deploy
 from ar_cli.commands.exec import exec_cmd

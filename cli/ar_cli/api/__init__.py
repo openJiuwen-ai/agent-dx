@@ -14,16 +14,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""`ar fork` — placeholder for forking an agent session.
+"""HTTP API adapter used by the ar CLI."""
 
-Reserved for a future release. The command is intentionally not registered in
-``commands/__init__.py`` yet. When implemented it should reuse
-``AgentRuntimeClient.invoke`` + ``stream_sse`` with session headers built in
-``session.py``.
-"""
+from ar_cli.api.client import AgentRuntimeClient
 
-# import click
-#
-# @click.command(name="fork")
-# def fork(...):
-#     ...
+__all__ = ["AgentRuntimeClient"]

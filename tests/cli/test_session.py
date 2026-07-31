@@ -17,7 +17,7 @@
 import json
 
 from ar_cli.const import HEADER_AGENT_SESSION, HEADER_INSTANCE_SESSION
-from ar_cli.session import build_invocation_headers
+from ar_cli.api.function_invocation import build_invocation_headers
 
 
 def test_no_session_headers_when_unset():
