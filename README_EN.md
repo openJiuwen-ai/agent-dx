@@ -2,7 +2,7 @@
 
 ## Introduction
 
-openYuanrong Agent Runtime is the agent runtime access repository for openYuanrong, providing developer tools for agent registration, invocation, and session management. The repository currently offers the Python CLI `ar`, with SDK and other access capabilities to be expanded here in the future.
+openYuanrong Agent Runtime is the agent runtime access repository for openYuanrong, providing developer tools for agent registration, invocation, and session management. The repository currently offers the Python CLI `ar` and a separately built Python AgentRuntimeSDK.
 
 ### Key Capabilities
 
@@ -14,6 +14,7 @@ Current CLI capabilities include:
 - Support for one-shot invocation and interactive invocation.
 
 For CLI installation, command parameters, examples, exit codes, and testing details, see [cli/README.md](cli/README.md).
+For the AgentRuntimeSDK programming model, fixed bootstrap, and deployment configuration, see [python/README.md](python/README.md).
 
 ## Getting Started
 
@@ -57,9 +58,14 @@ For more installation methods, parameter details, and interactive mode usage, se
 ```text
 cli/                 Python CLI package source and packaging config
 cli/ar_cli/          ar command implementation
+python/              Independent Python AgentRuntimeSDK package
 tests/cli/           CLI unit tests
+tests/python/        AgentRuntimeSDK unit and integration tests
 pytest.ini           Test configuration
 ```
+
+The CLI and SDK are separate distributions that share the version in the
+repository-level `VERSION` file.
 
 ## Contributing
 
