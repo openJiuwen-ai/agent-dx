@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from ar_cli.sse import stream_sse
+from ar_cli.api.function_invocation import stream_sse
 
 
 class FakeResponse:

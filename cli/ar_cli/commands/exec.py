@@ -16,19 +16,15 @@
 
 """`ar exec` — invoke an agent (function) and stream the SSE response."""
 
-import json
 import logging
-import uuid
-from typing import Optional
 
 import click
 
-from ar_cli.client import AgentRuntimeClient
-from ar_cli.const import DEFAULT_INTERACTIVE_SESSION_TTL, RELEASE_SESSION_TTL
+from ar_cli.api.client import AgentRuntimeClient
+from ar_cli.api.function_invocation import InvocationOptions, invoke_stream
 from ar_cli.errors import ArError
-from ar_cli.lineedit import read_line
-from ar_cli.session import build_invocation_headers
-from ar_cli.sse import stream_sse
+from ar_cli.interactive.lifecycle import new_session_ctx_id
+from ar_cli.interactive.runner import run_interactive
 from ar_cli.urn import public_agent_to_function_version_urn
 from ar_cli.utils import (
     normalize_addr,
@@ -41,17 +37,14 @@ from ar_cli.utils import (
 
 logger = logging.getLogger(__name__)
 
-_INTERACTIVE_EXIT_COMMANDS = {"/exit", "/quit"}
-
-
 @click.command(
     name="exec",
     help="""Invoke an agent (function) and stream its SSE response.
 
 Only --agent and --server are required. Passing --args invokes once with that
 JSON body. Omitting --args enters interactive mode; each line is sent as
-{"message": "<line>"}. Session headers are sent only when their options are
-provided, except interactive mode auto-generates session values when omitted.
+{"message": "<line>"}. SessionCtx is auto-generated when omitted. Interactive
+mode also auto-generates InstanceSession values when omitted.
 
 Example:\n
   ar exec --agent <AGENT> --server <FRONTEND_ADDR> --args '{"param1":"hi"}'
@@ -85,7 +78,7 @@ Example:\n
     "--session-ttl",
     type=click.IntRange(min=1),
     default=None,
-    help="Instance session TTL (default: 90, must be > 0). Only used with --session-id.",
+    help="Instance session TTL (default: 90; 600 in interactive mode, must be > 0). Only used with --session-id.",
 )
 @click.option(
     "--concurrency",
@@ -114,13 +107,13 @@ def exec_cmd(
     if session_id is None and (session_ttl is not None or concurrency is not None):
         raise click.UsageError("--session-ttl/--concurrency require --session-id; nothing was sent")
 
-    client = AgentRuntimeClient()
+    client = AgentRuntimeClient(jwt_token=ctx.obj.get("jwt_token"))
     server_url = normalize_addr(server)
     agent_urn = public_agent_to_function_version_urn(agent)
 
     try:
         if args is None:
-            _run_interactive(
+            run_interactive(
                 client=client,
                 server=server_url,
                 agent=agent_urn,
@@ -132,114 +125,22 @@ def exec_cmd(
             ctx.exit(0)
 
         parse_json_arg(args, "--args")  # validate early; exit code 2 on bad JSON
-        headers = build_invocation_headers(
-            session_ctx=session_ctx,
+        invocation_session_ctx = session_ctx if session_ctx is not None else new_session_ctx_id()
+        options = InvocationOptions(
+            session_ctx=invocation_session_ctx,
             session_id=session_id,
             session_ttl=session_ttl,
             concurrency=concurrency,
         )
-        _invoke_once(client, server_url, agent_urn, headers=headers, body=args)
+        for payload in invoke_stream(
+            client,
+            server_url,
+            agent_urn,
+            headers=options.to_headers(),
+            body=args,
+        ):
+            print_logger.info("%s", payload)
     except ArError as e:
         logger.error("%s", e)
         ctx.exit(e.exit_code)
     ctx.exit(0)
-
-
-def _run_interactive(
-    *,
-    client: AgentRuntimeClient,
-    server: str,
-    agent: str,
-    session_ctx: Optional[str],
-    session_id: Optional[str],
-    session_ttl: Optional[int],
-    concurrency: Optional[int],
-) -> None:
-    if session_ctx is None:
-        session_ctx = f"ar-{uuid.uuid4().hex}"
-    if session_id is None:
-        session_id = f"ar-{uuid.uuid4().hex}"
-    if session_ttl is None:
-        session_ttl = DEFAULT_INTERACTIVE_SESSION_TTL
-
-    click.echo("Entering interactive mode. Type /exit or /quit to quit.", err=True)
-    click.echo(f"session-ctx: {session_ctx}", err=True)
-    click.echo(f"session-id: {session_id}", err=True)
-
-    invoked = False
-    try:
-        while True:
-            line = _read_interactive_line()
-            if line is None:
-                click.echo("", err=True)
-                return
-
-            text = line.strip()
-            if not text:
-                continue
-            if text.lower() in _INTERACTIVE_EXIT_COMMANDS:
-                return
-
-            body = json.dumps({"message": line}, ensure_ascii=False)
-            headers = build_invocation_headers(
-                session_ctx=session_ctx,
-                session_id=session_id,
-                session_ttl=session_ttl,
-                concurrency=concurrency,
-            )
-            invoked = True
-            _invoke_once(client, server, agent, headers=headers, body=body)
-    finally:
-        if invoked:
-            _release_interactive_session(
-                client=client,
-                server=server,
-                agent=agent,
-                session_ctx=session_ctx,
-                session_id=session_id,
-                concurrency=concurrency,
-            )
-
-
-def _read_interactive_line() -> Optional[str]:
-    # read_line() enables cursor/Home/End editing via readline when available,
-    # else a built-in raw-mode editor on a TTY, else plain input().
-    return read_line("ar> ")
-
-
-def _invoke_once(
-    client: AgentRuntimeClient,
-    server: str,
-    agent: str,
-    *,
-    headers: dict,
-    body: str,
-) -> None:
-    resp = client.invoke(server, agent, headers=headers, body=body)
-    with resp:
-        for payload in stream_sse(resp):
-            print_logger.info("%s", payload)
-
-
-def _release_interactive_session(
-    *,
-    client: AgentRuntimeClient,
-    server: str,
-    agent: str,
-    session_ctx: str,
-    session_id: str,
-    concurrency: Optional[int],
-) -> None:
-    headers = build_invocation_headers(
-        session_ctx=session_ctx,
-        session_id=session_id,
-        session_ttl=RELEASE_SESSION_TTL,
-        concurrency=concurrency,
-    )
-    try:
-        resp = client.invoke(server, agent, headers=headers, body="{}")
-        with resp:
-            for _ in stream_sse(resp):
-                pass
-    except Exception as e:
-        logger.warning("failed to release interactive session %s: %s", session_id, e)

@@ -47,8 +47,14 @@ def _print_version(ctx: click.Context, param: click.Parameter, value: bool) -> N
     is_eager=True,
     help="Show version and exit.",
 )
+@click.option(
+    "--jwt-token",
+    envvar="YR_JWT_TOKEN",
+    default=None,
+    help="JWT token for API authentication (sent in X-Auth header).",
+)
 @click.pass_context
-def cli(ctx: click.Context, verbose: bool) -> None:
+def cli(ctx: click.Context, verbose: bool, jwt_token: Optional[str]) -> None:
     """openYuanrong Agent Runtime CLI.
 
     Deploy and invoke agents (functions). Use `-h/--help` on any command for
@@ -60,6 +66,7 @@ def cli(ctx: click.Context, verbose: bool) -> None:
     """
     ctx.ensure_object(dict)
     ctx.obj["verbose"] = verbose
+    ctx.obj["jwt_token"] = jwt_token
     setup_logging(verbose)
 
 

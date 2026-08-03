@@ -14,16 +14,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Minimal in-process line editor for the interactive `ar exec` prompt.
+"""Minimal in-process line editor for the `ar exec` interactive prompt.
 
 input() only supports cursor movement / history when the stdlib ``readline``
 module is available. Some minimal Linux Python builds ship without it, so
 arrow / Home / End keys would otherwise be echoed as raw escape sequences
 (e.g. ``^[[D``). ``read_line()`` picks the best available reader:
 
-  1. stdlib ``readline`` present -> input() (readline does the editing)
-  2. stdin is a TTY + ``termios`` -> the small raw-mode editor below
-  3. otherwise (pipe / no TTY)     -> plain input()
+  1. slash-command completions on a Linux TTY -> raw-mode editor below
+  2. stdlib ``readline`` present -> input() (readline does the editing)
+  3. stdin is a TTY + ``termios`` -> the small raw-mode editor below
+  4. otherwise (pipe / no TTY)     -> plain input()
 
 The raw-mode editor is dispatch-table driven (no long if/elif chains) and
 covers the common editing keys plus UTF-8 (incl. CJK) text input. It is Unix
@@ -34,7 +35,8 @@ import os
 import select
 import sys
 import unicodedata
-from typing import Callable, List, Optional
+from difflib import get_close_matches
+from typing import Callable, List, Optional, Sequence, Tuple
 
 try:
     import termios
@@ -51,6 +53,8 @@ _ESC_TIMEOUT = 0.05
 _readline_checked = False
 _readline_available = False
 
+_Completion = Tuple[str, str]
+
 
 # --- key tables (data, not branches) ---------------------------------------
 
@@ -66,6 +70,7 @@ _ESC_KEYS = {
 # Control byte -> logical key name.
 _CTRL_KEYS = {
     "\r": "ENTER", "\n": "ENTER",
+    "\t": "TAB",
     "\x7f": "BACKSPACE", "\x08": "BACKSPACE",
     "\x04": "EOF",
     "\x01": "HOME", "\x05": "END",
@@ -135,18 +140,85 @@ _ACTIONS = {
 
 # --- public entry point -----------------------------------------------------
 
-def read_line(prompt: str) -> Optional[str]:
+def read_line(prompt: str, *, completions: Sequence[_Completion] = ()) -> Optional[str]:
     """Read one line of input. Returns ``None`` on EOF (closed stdin / Ctrl-D on
-    an empty line). Uses readline if available, else a raw-mode editor on a TTY,
-    else plain input().
+    an empty line).
+
+    When ``completions`` are supplied on a Linux TTY, the raw-mode editor is
+    used even if readline is installed so it can render candidates and process
+    Up/Down/Tab consistently. Other calls use readline if available, else the
+    raw-mode editor, else plain input().
     """
     if not sys.stdin.isatty():
         return _plain_input(prompt)
+    if completions and _HAS_TERMIOS and sys.stdout.isatty():
+        return _raw_read_line(prompt, completions=completions)
     if _ensure_readline():
         return _plain_input(prompt)  # readline-enabled input() does the editing
     if _HAS_TERMIOS:
         return _raw_read_line(prompt)
     return _plain_input(prompt)
+
+
+def can_select_items() -> bool:
+    """Whether the Linux raw-mode SessionCtx selector can be shown."""
+    return _HAS_TERMIOS and sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def select_item(
+    items: List[str],
+    *,
+    selected_index: int,
+    heading: str,
+    header: str,
+) -> Optional[int]:
+    """Select a rendered table row with Linux terminal navigation keys.
+
+    Returns the selected row index, or ``None`` when the user cancels or when
+    raw terminal selection is not available. The caller owns item formatting;
+    this function only renders the selector marker and captures key events.
+    """
+    if not items or not can_select_items():
+        return None
+
+    index = min(max(selected_index, 0), len(items) - 1)
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    read_byte = _make_reader(fd)
+    rendered_lines = 0
+
+    def redraw() -> None:
+        nonlocal rendered_lines
+        if rendered_lines:
+            _write(f"\x1b[{rendered_lines}A")
+        lines = [heading, header]
+        for row_index, row in enumerate(items):
+            marker = ">" if row_index == index else " "
+            lines.append(f"{marker} {row}")
+        for line in lines:
+            _write("\r\x1b[2K" + line + "\n")
+        rendered_lines = len(lines)
+
+    try:
+        tty.setcbreak(fd)
+        redraw()
+        while True:
+            key = _read_key(read_byte)
+            if key in (None, "EOF", "ESC", "q", "Q"):
+                return None
+            if key == "ENTER":
+                return index
+            if key == "UP" and index > 0:
+                index -= 1
+                redraw()
+            elif key == "DOWN" and index < len(items) - 1:
+                index += 1
+                redraw()
+    except KeyboardInterrupt:
+        return None
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        _write("\n")
 
 
 def _ensure_readline() -> bool:
@@ -171,36 +243,63 @@ def _plain_input(prompt: str) -> Optional[str]:
 
 # --- raw-mode editor --------------------------------------------------------
 
-def _raw_read_line(prompt: str) -> Optional[str]:
+def _raw_read_line(prompt: str, *, completions: Sequence[_Completion] = ()) -> Optional[str]:
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
     read_byte = _make_reader(fd)
     line = _Line()
+    rendered_candidates = 0
+    selected_candidate = 0
     try:
         tty.setcbreak(fd)  # no canonical mode / echo, but keep signals (Ctrl-C)
-        _redraw(prompt, line)
+        candidates = _completion_candidates(line, completions)
+        rendered_candidates = _redraw(prompt, line, candidates, selected_candidate, rendered_candidates)
         while True:
             key = _read_key(read_byte)
             if key is None:  # stdin closed
+                _redraw(prompt, line, (), 0, rendered_candidates)
                 _write("\r\n")
                 return None
             if key == "EOF":  # Ctrl-D
                 if not line.buf:
+                    _redraw(prompt, line, (), 0, rendered_candidates)
                     _write("\r\n")
                     return None
                 continue  # non-empty line: ignore
-            if key == "ENTER":
+            candidates = _completion_candidates(line, completions)
+            if key in ("ENTER", "TAB") and candidates:
+                _apply_completion(line, candidates[selected_candidate][0])
+                selected_candidate = 0
+                candidates = ()
+            elif key == "ENTER":
+                _redraw(prompt, line, (), 0, rendered_candidates)
                 _write("\r\n")
                 return "".join(line.buf)
-            action = _ACTIONS.get(key)
-            if action is not None:
-                action(line)
-            elif len(key) == 1 and key.isprintable():
-                line.buf.insert(line.pos, key)
-                line.pos += 1
+            elif key == "UP" and candidates:
+                selected_candidate = _move_completion_selection(selected_candidate, key, len(candidates))
+            elif key == "DOWN" and candidates:
+                selected_candidate = _move_completion_selection(selected_candidate, key, len(candidates))
+            else:
+                action = _ACTIONS.get(key)
+                if action is not None:
+                    action(line)
+                elif len(key) == 1 and key.isprintable():
+                    line.buf.insert(line.pos, key)
+                    line.pos += 1
             # else: unknown key (e.g. "ESC", "IGNORE") -> ignored
-            _redraw(prompt, line)
+            new_candidates = _completion_candidates(line, completions)
+            if new_candidates != candidates:
+                selected_candidate = 0
+            candidates = new_candidates
+            rendered_candidates = _redraw(
+                prompt,
+                line,
+                candidates,
+                selected_candidate,
+                rendered_candidates,
+            )
     except KeyboardInterrupt:  # Ctrl-C cancels the current line
+        _redraw(prompt, line, (), 0, rendered_candidates)
         _write("\r\n")
         return ""
     finally:
@@ -239,7 +338,7 @@ def _read_key(read_byte: Callable[[Optional[float]], bytes]):
                 return _ESC_KEYS[seq]
             if seq[-1].isalpha() or seq[-1] == "~":  # CSI terminator
                 break
-        return _ESC_KEYS.get(seq, "IGNORE")
+        return _ESC_KEYS.get(seq, "ESC" if not seq else "IGNORE")
     ch = b.decode("latin-1")
     if ch in _CTRL_KEYS:
         return _CTRL_KEYS[ch]
@@ -280,14 +379,67 @@ def _width(chars, end: Optional[int] = None) -> int:
     return sum(_char_width(c) for c in (chars if end is None else chars[:end]))
 
 
-def _redraw(prompt: str, line: _Line) -> None:
+def _completion_candidates(line: _Line, completions: Sequence[_Completion]) -> List[_Completion]:
+    """Return prefix matches, or nearby commands when the prefix has a typo."""
     text = "".join(line.buf)
-    # \r -> column 0, rewrite prompt+text, \x1b[K clears any leftover tail.
+    if not completions or not text.startswith("/") or any(char.isspace() for char in text):
+        return []
+
+    needle = text.casefold()
+    if any(command.casefold() == needle for command, _ in completions):
+        return []
+
+    prefix_matches = [item for item in completions if item[0].casefold().startswith(needle)]
+    if prefix_matches:
+        return prefix_matches
+
+    names = [command.casefold() for command, _ in completions]
+    close_names = get_close_matches(needle, names, n=3, cutoff=0.55)
+    by_name = {item[0].casefold(): item for item in completions}
+    return [by_name[name] for name in close_names]
+
+
+def _apply_completion(line: _Line, command: str) -> None:
+    line.buf = list(command)
+    line.pos = len(line.buf)
+
+
+def _move_completion_selection(index: int, key: str, count: int) -> int:
+    if key == "UP":
+        return max(0, index - 1)
+    if key == "DOWN":
+        return min(count - 1, index + 1)
+    return index
+
+
+def _redraw(
+    prompt: str,
+    line: _Line,
+    candidates: Sequence[_Completion] = (),
+    selected_candidate: int = 0,
+    previous_candidate_count: int = 0,
+) -> int:
+    text = "".join(line.buf)
     out = "\r" + prompt + text + "\x1b[K"
-    back = _width(line.buf, len(line.buf)) - _width(line.buf, line.pos)
-    if back > 0:
-        out += f"\x1b[{back}D"  # move cursor left `back` columns to its position
+    candidate_lines = [
+        f"{'>' if index == selected_candidate else ' '} {command:<10} {description}"
+        for index, (command, description) in enumerate(candidates)
+    ]
+    rendered_count = max(previous_candidate_count, len(candidate_lines))
+    for index in range(rendered_count):
+        candidate_line = candidate_lines[index] if index < len(candidate_lines) else ""
+        out += "\n\r\x1b[2K" + candidate_line
+    if rendered_count:
+        cursor_columns = _width(prompt) + _width(line.buf, line.pos)
+        out += f"\x1b[{rendered_count}A\r"
+        if cursor_columns:
+            out += f"\x1b[{cursor_columns}C"
+    else:
+        back = _width(line.buf, len(line.buf)) - _width(line.buf, line.pos)
+        if back > 0:
+            out += f"\x1b[{back}D"
     _write(out)
+    return len(candidate_lines)
 
 
 def _write(s: str) -> None:

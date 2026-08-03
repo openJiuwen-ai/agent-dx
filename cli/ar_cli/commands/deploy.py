@@ -20,7 +20,7 @@ import logging
 
 import click
 
-from ar_cli.client import AgentRuntimeClient
+from ar_cli.api.client import AgentRuntimeClient
 from ar_cli.const import ENABLE_SESSION_CTX_KEY
 from ar_cli.errors import ArError
 from ar_cli.urn import function_urn_to_public_agent
@@ -64,7 +64,7 @@ def deploy(ctx: click.Context, spec: str, server: str) -> None:
     if ENABLE_SESSION_CTX_KEY not in function_spec:
         function_spec[ENABLE_SESSION_CTX_KEY] = True
 
-    client = AgentRuntimeClient()
+    client = AgentRuntimeClient(jwt_token=ctx.obj.get("jwt_token"))
     try:
         result = client.register_function(normalize_addr(server), function_spec)
     except ArError as e:

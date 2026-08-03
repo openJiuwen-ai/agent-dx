@@ -19,6 +19,11 @@
 # --- API paths ---
 FUNCTIONS_PATH = "/serverless/v1/functions"
 INVOCATIONS_PATH = "/serverless/v1/functions/{urn}/invocations"
+FUNCTION_SESSION_CONTEXTS_PATH = "/serverless/v1/functions/{urn}/session-contexts"
+FUNCTION_SESSION_CONTEXT_PATH = FUNCTION_SESSION_CONTEXTS_PATH + "/{session_ctx_id}"
+SESSION_CONTEXT_TURNS_PATH = FUNCTION_SESSION_CONTEXT_PATH + "/turns"
+SESSION_CONTEXT_FORK_PATH = FUNCTION_SESSION_CONTEXT_PATH + "/fork"
+DEFAULT_SESSION_CONTEXT_LIST_LIMIT = 50
 
 # --- Function spec ---
 # Field injected into the function definition on `ar deploy` (defaults to True
@@ -39,6 +44,7 @@ HEADER_CONTENT_TYPE = "Content-Type"
 HEADER_ACCEPT = "Accept"
 HEADER_AGENT_SESSION = "X-Session-Context"
 HEADER_INSTANCE_SESSION = "X-Instance-Session"
+HEADER_AUTH = "X-Auth"
 CONTENT_TYPE_JSON = "application/json"
 ACCEPT_SSE = "text/event-stream"
 

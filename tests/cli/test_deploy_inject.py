@@ -36,7 +36,7 @@ def _capture_registered_spec(monkeypatch):
         captured["spec"] = spec
         return {"function": {"functionVersionUrn": "sn:cn:yrk:default:function:0@default@demo:latest"}}
 
-    monkeypatch.setattr("ar_cli.client.AgentRuntimeClient.register_function", fake_register)
+    monkeypatch.setattr("ar_cli.api.client.AgentRuntimeClient.register_function", fake_register)
     return captured
 
 
@@ -120,7 +120,7 @@ def test_deploy_prints_public_agent_with_namespace(monkeypatch):
     def fake_register(self, meta_addr, spec):
         return {"function": {"functionVersionUrn": "sn:cn:yrk:default:function:0@faaspy@demo:latest"}}
 
-    monkeypatch.setattr("ar_cli.client.AgentRuntimeClient.register_function", fake_register)
+    monkeypatch.setattr("ar_cli.api.client.AgentRuntimeClient.register_function", fake_register)
     printed = []
     monkeypatch.setattr(deploy_module.print_logger, "info", lambda message, *args: printed.append(message % args))
     runner = CliRunner()
@@ -135,7 +135,7 @@ def test_deploy_prints_explicit_public_agent_version(monkeypatch):
     def fake_register(self, meta_addr, spec):
         return {"function": {"functionVersionUrn": "sn:cn:yrk:default:function:0@default@demo:v1"}}
 
-    monkeypatch.setattr("ar_cli.client.AgentRuntimeClient.register_function", fake_register)
+    monkeypatch.setattr("ar_cli.api.client.AgentRuntimeClient.register_function", fake_register)
     printed = []
     monkeypatch.setattr(deploy_module.print_logger, "info", lambda message, *args: printed.append(message % args))
     runner = CliRunner()

@@ -14,8 +14,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from ar_cli import lineedit
-from ar_cli.lineedit import _Line, _read_key, _width
+from types import SimpleNamespace
+
+import pytest
+
+from ar_cli.interactive import lineedit
+from ar_cli.interactive.lineedit import (
+    _Line,
+    _apply_completion,
+    _completion_candidates,
+    _move_completion_selection,
+    _read_key,
+    _width,
+)
 
 
 def _reader(byte_chunks):
@@ -58,11 +69,13 @@ def test_control_keys():
     assert _read_key(_reader([b"\x04"])) == "EOF"
     assert _read_key(_reader([b"\x01"])) == "HOME"
     assert _read_key(_reader([b"\x05"])) == "END"
+    assert _read_key(_reader([b"\t"])) == "TAB"
 
 
-def test_lone_esc_is_ignored():
-    # ESC with no following bytes (timeout) -> not a recognised sequence.
-    assert _read_key(_reader([b"\x1b"])) == "IGNORE"
+def test_lone_esc_is_exposed_to_the_selector():
+    # Line editing still ignores this because ESC has no editing action; the
+    # SessionCtx selector uses it as the cancel key.
+    assert _read_key(_reader([b"\x1b"])) == "ESC"
 
 
 def test_eof_when_no_bytes():
@@ -131,6 +144,70 @@ def test_up_down_are_noops():
     text, pos = _apply(["a", "UP", "b", "DOWN"])
     assert text == "ab"
     assert pos == 2
+
+
+def test_command_completion_prefers_prefix_matches():
+    line = _Line()
+    line.buf = list("/h")
+    line.pos = len(line.buf)
+
+    candidates = _completion_candidates(
+        line,
+        (("/history", "show history"), ("/help", "show help"), ("/new", "new context")),
+    )
+
+    assert candidates == [("/history", "show history"), ("/help", "show help")]
+
+
+def test_command_completion_suggests_nearby_command_and_tab_replaces_input():
+    line = _Line()
+    line.buf = list("/histroy")
+    line.pos = len(line.buf)
+
+    candidates = _completion_candidates(line, (("/history", "show history"), ("/new", "new context")))
+
+    assert candidates == [("/history", "show history")]
+    _apply_completion(line, candidates[0][0])
+    assert "".join(line.buf) == "/history"
+    assert line.pos == len("/history")
+
+
+def test_command_completion_stops_after_command_arguments_or_exact_command():
+    line = _Line()
+    line.buf = list("/fork turn-1")
+    line.pos = len(line.buf)
+    assert _completion_candidates(line, (("/fork", "fork"),)) == []
+
+    line.buf = list("/fork")
+    line.pos = len(line.buf)
+    assert _completion_candidates(line, (("/fork", "fork"),)) == []
+
+
+def test_command_completion_selection_is_bounded():
+    assert _move_completion_selection(0, "UP", 3) == 0
+    assert _move_completion_selection(0, "DOWN", 3) == 1
+    assert _move_completion_selection(2, "DOWN", 3) == 2
+
+
+@pytest.mark.skipif(not lineedit._HAS_TERMIOS, reason="raw terminal editor is Linux-only")
+def test_raw_completion_uses_down_then_tab_before_submitting(monkeypatch):
+    writes = []
+    key_bytes = [b"/", b"\x1b", b"[", b"B", b"\t", b"\r"]
+
+    monkeypatch.setattr(lineedit.sys, "stdin", SimpleNamespace(fileno=lambda: 0))
+    monkeypatch.setattr(lineedit, "_make_reader", lambda _fd: _reader(key_bytes))
+    monkeypatch.setattr(lineedit.tty, "setcbreak", lambda _fd: None)
+    monkeypatch.setattr(lineedit.termios, "tcgetattr", lambda _fd: [])
+    monkeypatch.setattr(lineedit.termios, "tcsetattr", lambda _fd, _when, _old: None)
+    monkeypatch.setattr(lineedit, "_write", writes.append)
+
+    result = lineedit._raw_read_line(
+        "[ctx] > ",
+        completions=(("/sessions", "list sessions"), ("/history", "show history")),
+    )
+
+    assert result == "/history"
+    assert any("> /history" in output for output in writes)
 
 
 # --- display width (CJK counts as 2 columns) -------------------------------
