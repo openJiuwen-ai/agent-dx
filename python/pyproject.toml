@@ -3,9 +3,9 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "openyuanrong-agentruntime-sdk"
+name = "agent-dx-sdk"
 dynamic = ["version"]
-description = "Python SDK and FaaS bootstrap for openYuanrong Agent Runtime"
+description = "Python SDK and FaaS bootstrap for Agent Distributed Executor (agent-dx)"
 readme = "README.md"
 requires-python = ">=3.9"
 # Keep the legacy table form for build environments using setuptools < 77.

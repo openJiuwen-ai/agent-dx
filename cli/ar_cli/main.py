@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Entry point for the `ar` CLI: root group, global options, command wiring."""
+"""Entry point for the `adx` CLI: root group, global options, command wiring."""
 
 from typing import Optional
 
@@ -28,7 +28,7 @@ from ar_cli.utils import print_logger, setup_logging
 def _print_version(ctx: click.Context, param: click.Parameter, value: bool) -> None:
     if not value or ctx.resilient_parsing:
         return
-    print_logger.info("ar version: %s", __version__)
+    print_logger.info("adx version: %s", __version__)
     ctx.exit(0)
 
 
@@ -55,14 +55,14 @@ def _print_version(ctx: click.Context, param: click.Parameter, value: bool) -> N
 )
 @click.pass_context
 def cli(ctx: click.Context, verbose: bool, jwt_token: Optional[str]) -> None:
-    """openYuanrong Agent Runtime CLI.
+    """Agent Distributed Executor (agent-dx) CLI.
 
     Deploy and invoke agents (functions). Use `-h/--help` on any command for
     detailed usage.
 
     Example usage:\n
-      - ar deploy -s ./agent.json --server <META_SERVICE_ADDR>\n
-      - ar exec --agent <AGENT> --server <FRONTEND_ADDR>
+      - adx deploy -s ./agent.json --server <META_SERVICE_ADDR>\n
+      - adx exec --agent <AGENT> --server <FRONTEND_ADDR>
     """
     ctx.ensure_object(dict)
     ctx.obj["verbose"] = verbose
@@ -75,7 +75,7 @@ for _command in COMMANDS:
 
 
 def main(cmdargs: Optional[list] = None) -> None:
-    cli.main(args=cmdargs, prog_name="ar", standalone_mode=True)
+    cli.main(args=cmdargs, prog_name="adx", standalone_mode=True)
 
 
 if __name__ == "__main__":

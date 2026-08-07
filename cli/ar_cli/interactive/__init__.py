@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Interactive ar exec session management."""
+"""Interactive adx exec session management."""
 
 __all__ = [
     "InteractiveCommandError",

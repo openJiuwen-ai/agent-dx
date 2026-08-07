@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Packaging for the openYuanrong Agent Runtime CLI (`ar`)."""
+"""Packaging for the Agent Distributed Executor CLI (`adx`)."""
 
 import os
 import setuptools
@@ -30,10 +30,10 @@ def get_version():
 
 
 setuptools.setup(
-    name="openyuanrong-agentruntime",
+    name="agent-dx-cli",
     version=get_version(),
     author="openyuanrong",
-    description="openYuanrong Agent Runtime CLI (ar): deploy and invoke agents",
+    description="Agent Distributed Executor (agent-dx) CLI: deploy and invoke agents",
     classifiers=[
         "Programming Language :: Python :: 3.9",
         "Programming Language :: Python :: 3.10",
@@ -48,7 +48,7 @@ setuptools.setup(
     ],
     entry_points={
         "console_scripts": [
-            "ar=ar_cli.main:main",
+            "adx=ar_cli.main:main",
         ]
     },
 )

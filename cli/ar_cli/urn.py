@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Function URN conversion for the public ar CLI surface."""
+"""Function URN conversion for the public adx CLI surface."""
 
 from typing import Optional, Tuple
 

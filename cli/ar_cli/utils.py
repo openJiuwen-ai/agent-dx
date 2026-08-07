@@ -68,15 +68,15 @@ def validate_non_empty(ctx, param, value):
         raise click.BadParameter("must not be empty")
     return value
 
-# Diagnostic logger -> stderr. The ar CLI never writes log files: it is a
+# Diagnostic logger -> stderr. The adx CLI never writes log files: it is a
 # short-lived, stateless HTTP client. Users who want logs on disk redirect
-# stderr (e.g. `ar exec ... 2> ar.log`).
+# stderr (e.g. `adx exec ... 2> adx.log`).
 _LOG_FORMAT = "%(asctime)s.%(msecs)03d | %(levelname)-7s | %(name)s:%(funcName)s:%(lineno)d - %(message)s"
 _DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 # Clean output logger -> stdout. Carries command results and the streamed SSE
 # payloads, with no prefixes, so piping/redirecting stays clean.
-print_logger = logging.getLogger("ar.print")
+print_logger = logging.getLogger("adx.print")
 print_logger.setLevel(logging.INFO)
 print_logger.propagate = False
 _print_handler = logging.StreamHandler(sys.stdout)

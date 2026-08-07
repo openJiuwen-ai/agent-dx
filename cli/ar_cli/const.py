@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Constants shared across the ar CLI."""
+"""Constants shared across the adx CLI."""
 
 # --- API paths ---
 FUNCTIONS_PATH = "/serverless/v1/functions"
@@ -26,7 +26,7 @@ SESSION_CONTEXT_FORK_PATH = FUNCTION_SESSION_CONTEXT_PATH + "/fork"
 DEFAULT_SESSION_CONTEXT_LIST_LIMIT = 50
 
 # --- Function spec ---
-# Field injected into the function definition on `ar deploy` (defaults to True
+# Field injected into the function definition on `adx deploy` (defaults to True
 # when the user does not set it).
 ENABLE_SESSION_CTX_KEY = "enableSessionCtx"
 

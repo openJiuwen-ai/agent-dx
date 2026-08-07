@@ -1,9 +1,9 @@
-# ar 命令行
+# adx 命令行
 
-openYuanrong Agent Runtime 的命令行工具。Agent 本质上就是函数,`ar` 把函数的注册、调用包装成对底层 FaaS HTTP 接口的调用。
+Agent Distributed Executor（agent-dx）的命令行工具。Agent 本质上就是函数,`adx` 把函数的注册、调用包装成对底层 FaaS HTTP 接口的调用。
 
-- `ar deploy` —— 通过 meta_service 注册一个 agent(函数)。
-- `ar exec` —— 调用 agent(函数),并以 SSE 流式输出返回结果;未传 `--args` 时进入交互模式。
+- `adx deploy` —— 通过 meta_service 注册一个 agent(函数)。
+- `adx exec` —— 调用 agent(函数),并以 SSE 流式输出返回结果;未传 `--args` 时进入交互模式。
 
 
 ## 安装
@@ -12,32 +12,32 @@ openYuanrong Agent Runtime 的命令行工具。Agent 本质上就是函数,`ar`
 
 ```bash
 python setup.py bdist_wheel
-pip install dist/openyuanrong_agentruntime-*.whl
+pip install dist/agent_dx_cli-*.whl
 ```
 
-安装后即可使用 `ar` 命令,`ar -h` 查看帮助,`ar --version` 查看版本。
+安装后即可使用 `adx` 命令,`adx -h` 查看帮助,`adx --version` 查看版本。
 
 ## 使用
 
 ### JWT 鉴权
 
-`ar` 支持通过全局参数或环境变量提供 JWT,并通过 `X-Auth` 请求头发送:
+`adx` 支持通过全局参数或环境变量提供 JWT,并通过 `X-Auth` 请求头发送:
 
 ```bash
-ar --jwt-token <JWT> exec --agent <AGENT> --server <FRONTEND_ADDR>
+adx --jwt-token <JWT> exec --agent <AGENT> --server <FRONTEND_ADDR>
 ```
 
 ```bash
 export YR_JWT_TOKEN=<JWT>
-ar exec --agent <AGENT> --server <FRONTEND_ADDR>
+adx exec --agent <AGENT> --server <FRONTEND_ADDR>
 ```
 
 `--jwt-token` 是全局参数,需要放在 `deploy` 或 `exec` 子命令之前。SessionCtx 查询、历史查询、Fork 和 Delete 接口要求 Developer JWT。使用 `-v` 时日志中的 JWT 会显示为 `<redacted>`。
 
-### ar deploy —— 注册 agent
+### adx deploy —— 注册 agent
 
 ```bash
-ar deploy -s <函数定义> --server <META_SERVICE_ADDR>
+adx deploy -s <函数定义> --server <META_SERVICE_ADDR>
 ```
 
 | 参数 | 必选 | 说明 |
@@ -50,23 +50,23 @@ ar deploy -s <函数定义> --server <META_SERVICE_ADDR>
 - `-s/--spec` 会做格式校验:若值是已存在的文件则按文件读取并解析 JSON;否则按 inline JSON 解析。两者都不满足(既非合法 JSON,也不是存在的文件路径)时报错退出(退出码 2)。
 - `--server` 必须是 `host:port` 形式(缺端口或端口非法会报错)。
 - 函数定义中若未设置 `enableSessionCtx` 字段,会自动注入默认值 `true`;若已显式设置(`true` 或 `false`),则以用户设置为准。
-- 注册成功后会打印公开 agent 名称,格式为 `0@namespace@funcname`,可直接用于 `ar exec --agent`。
+- 注册成功后会打印公开 agent 名称,格式为 `0@namespace@funcname`,可直接用于 `adx exec --agent`。
 
 示例:
 
 ```bash
 # 文件方式
-ar deploy -s ./agent.json --server 127.0.0.1:31182
+adx deploy -s ./agent.json --server 127.0.0.1:31182
 
 # inline JSON 方式
-ar deploy -s '{"name":"0@faaspy@demo","runtime":"python3.11","handler":"demo.handler"}' \
+adx deploy -s '{"name":"0@faaspy@demo","runtime":"python3.11","handler":"demo.handler"}' \
           --server 127.0.0.1:31182
 ```
 
-### ar exec —— 调用 agent(流式)
+### adx exec —— 调用 agent(流式)
 
 ```bash
-ar exec --agent <AGENT> --server <FRONTEND_ADDR> [可选参数]
+adx exec --agent <AGENT> --server <FRONTEND_ADDR> [可选参数]
 ```
 
 | 参数 | 必选 | 默认 | 说明 |
@@ -82,7 +82,7 @@ ar exec --agent <AGENT> --server <FRONTEND_ADDR> [可选参数]
 说明:
 
 - 只有 `--agent` 和 `--server` 必选,其余均可选。
-- `--session-ttl` / `--concurrency` 必须配合 `--session-id` 使用;若只传了它们而没传 `--session-id`,`ar` 会报错并直接退出(退出码 2),**不发送任何请求**。
+- `--session-ttl` / `--concurrency` 必须配合 `--session-id` 使用;若只传了它们而没传 `--session-id`,`adx` 会报错并直接退出(退出码 2),**不发送任何请求**。
 - 传入 `--args` 时执行一次性调用,请求体原样使用该 JSON 字符串。
 - 未传 `--args` 时进入交互模式;每轮用户输入会自动包装为 `{"message":"用户输入"}` 后发起一次调用。
 - 交互模式下若未传 `--session-ctx`,会自动生成一个会话上下文,并在每次调用中携带同一个 `X-Session-Context` 请求头;若已传入,则使用用户提供的值。
@@ -90,7 +90,7 @@ ar exec --agent <AGENT> --server <FRONTEND_ADDR> [可选参数]
 - 通过 `/sessions`、`/fork` 或 `/new` 切换 SessionCtx 后,CLI 会使用原 SessionCtx 的 InstanceSession ID 发送 `sessionTTL` 为 0 的释放调用,并为新 SessionCtx 生成新的 InstanceSession ID。
 - 至少发起过一次普通消息后,`/quit` 或输入结束会额外发送一条 `sessionTTL` 为 0、body 为 `{}` 的调用,使该 InstanceSession 立即过期。
 - 交互模式输入 `/quit` 退出。
-- 返回结果为 SSE 流,`ar` 会边接收边持续输出,直到服务端发送结束标记。
+- 返回结果为 SSE 流,`adx` 会边接收边持续输出,直到服务端发送结束标记。
 
 #### 交互 SessionCtx 管理(Linux)
 
@@ -113,7 +113,7 @@ Linux TTY 的交互输入支持斜杠命令补全：输入 `/` 或命令前缀�
 示例:
 
 ```console
-$ ar exec --agent 0@default@demo --server 127.0.0.1:31180 --session-ctx research-main
+$ adx exec --agent 0@default@demo --server 127.0.0.1:31180 --session-ctx research-main
 [research-main] > /history
 [research-main] > /fork turn-0001 research-alt
 [research-alt] > 忽略之前的结论,改为检查依赖安全问题
@@ -124,31 +124,31 @@ $ ar exec --agent 0@default@demo --server 127.0.0.1:31180 --session-ctx research
 
 ```bash
 # 最简调用
-ar exec --agent <AGENT> --server 127.0.0.1:31180
+adx exec --agent <AGENT> --server 127.0.0.1:31180
 
 # 一次性调用
-ar exec --agent <AGENT> --server 127.0.0.1:31180 --args '{"message":"你好"}'
+adx exec --agent <AGENT> --server 127.0.0.1:31180 --args '{"message":"你好"}'
 
 # 带会话上下文与入参
-ar exec --agent <AGENT> --server 127.0.0.1:31180 \
+adx exec --agent <AGENT> --server 127.0.0.1:31180 \
         --session-ctx ctx1 --session-id id1 --session-ttl 90 --concurrency 1 \
         --args '{"param1":"你好"}'
 ```
 
 ## 日志与排查
 
-- `ar` 的日志只输出到控制台,不落盘到日志文件。
+- `adx` 的日志只输出到控制台,不落盘到日志文件。
 - 加 `-v / --verbose` 开启 DEBUG 级日志,会在请求发送前打印请求详情(method、url、headers、body),方便定位问题:
 
   ```bash
-  ar -v exec --agent <AGENT> --server 127.0.0.1:31180
+  adx -v exec --agent <AGENT> --server 127.0.0.1:31180
   ```
 
 - DEBUG 日志会将 `X-Auth` 的值替换为 `<redacted>`,避免 JWT 明文输出。
 - 普通日志走 stderr,流式数据走 stdout,互不干扰。需要把日志存盘时自行重定向:
 
   ```bash
-  ar exec ... 2> ar.log
+  adx exec ... 2> adx.log
   ```
 
 ## 退出码

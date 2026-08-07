@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""`ar deploy` — register an agent (function) via meta_service."""
+"""`adx deploy` — register an agent (function) via meta_service."""
 
 import logging
 
@@ -37,7 +37,7 @@ The spec accepts either an inline JSON string or a path to a JSON file. When the
 spec omits `enableSessionCtx`, it defaults to true.
 
 Example:\n
-  ar deploy -s ./agent.json --server <META_SERVICE_ADDR>
+  adx deploy -s ./agent.json --server <META_SERVICE_ADDR>
 """,
 )
 @click.option(

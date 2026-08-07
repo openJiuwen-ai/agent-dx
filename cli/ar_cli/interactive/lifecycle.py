@@ -104,4 +104,4 @@ def validate_resource_id(value: str, label: str) -> str:
 
 
 def new_session_ctx_id() -> str:
-    return f"ar-{uuid.uuid4().hex}"
+    return f"adx-{uuid.uuid4().hex}"

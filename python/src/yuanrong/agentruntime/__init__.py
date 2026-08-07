@@ -1,4 +1,4 @@
-"""Public Agent Runtime SDK."""
+"""Public agent-dx SDK."""
 
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
@@ -13,7 +13,7 @@ from .result import Complete, ExecutionResult, InputRequired
 
 def _version() -> str:
     try:
-        return version("openyuanrong-agentruntime-sdk")
+        return version("agent-dx-sdk")
     except PackageNotFoundError:
         return (Path(__file__).resolve().parents[4] / "VERSION").read_text(encoding="utf-8").strip()
 
