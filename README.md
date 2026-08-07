@@ -1,34 +1,35 @@
-**中文** | [English](README_EN.md)
+[中文](README.zh.md) | **English**
 
-## 简介
+## Introduction
 
-openYuanrong Agent Runtime 是 openYuanrong 的 agent 运行时接入仓库，用于承载 agent 注册、调用、会话管理等开发者工具。仓库当前提供 Python CLI `ar` 和独立构建的 Python AgentRuntimeSDK。
+agent-dx(Agent Distributed eXecutor) is a distributed execution substrate for Agent Runtime, providing developer tools for agent registration, invocation, and session management. The repository currently offers the Python CLI `ar` and a separately built Python Agent Runtime SDK.
 
-### 关键能力
+### Key Capabilities
 
-当前 CLI 能力包括：
+Current CLI capabilities include:
 
-- 通过 openYuanrong meta_service 组件注册 agent/function。
-- 通过 openYuanrong frontend 组件调用 agent/function，并以 SSE 方式流式输出执行结果。
-- 支持 agent session 和 instance session 相关请求头。
-- 支持一次性调用和交互式调用。
+- Register agents/functions via the openYuanrong meta_service component.
+- Invoke agents/functions via the openYuanrong frontend component, with SSE streaming output.
+- Support for agent session and instance session request headers.
+- Support for one-shot invocation and interactive invocation.
 
-CLI 的安装、命令参数、示例、退出码和测试说明见 [cli/README.md](cli/README.md)。
-AgentRuntimeSDK 的编程模型、固定 Bootstrap 和部署配置见 [python/README.md](python/README.md)。
+For CLI installation, command parameters, examples, exit codes, and testing details, see [cli/README.md](cli/README.md).
+For the Agent Runtime SDK programming model, fixed bootstrap, and deployment configuration, see [python/README.md](python/README.md).
 
-## 入门
+## Getting Started
 
-- 安装：`pip install https://openyuanrong.obs.cn-southwest-2.myhuaweicloud.com/release/0.9.0/openeuler/{x86_64 or aarch64}/openyuanrong_agentruntime-0.9.0-py3-none-any.whl`。
-- 依赖：需要先安装并部署 openYuanrong 支持函数服务能力，可参考 [openYuanrong 安装部署](https://docs.openyuanrong.org/zh-cn/latest/deploy/index.html)文档。
+- Install: `pip install https://openyuanrong.obs.cn-southwest-2.myhuaweicloud.com/release/0.9.0/openeuler/{x86_64 or aarch64}/openyuanrong_agentruntime-0.9.0-py3-none-any.whl`.
+- Prerequisites: You need to have openYuanrong deployed with function service capability. See the [openYuanrong Deployment](https://docs.openyuanrong.org/en/latest/deploy/index.html) documentation.
 
-### CLI 工具
+### CLI Tool
 
-参考 openYuanrong [函数服务](https://docs.openyuanrong.org/zh-cn/latest/multi_language_function_programming_interface/development_guide/function_service/index.html)开发指南完成 Agent 开发，使用 CLI 工具 ar 注册：
+Follow the openYuanrong [Function Service](https://docs.openyuanrong.org/en/latest/multi_language_function_programming_interface/development_guide/function_service/index.html) development guide to build your agent, then use the `ar` CLI to register it:
 
 ```bash
 ar deploy -s ./agent.json --server {meta_service_endpoint}
 ```
-agent.json 示例：
+
+Example `agent.json`:
 
 ```json
 {
@@ -44,31 +45,37 @@ agent.json 示例：
 }
 ```
 
-调用 agent：
+Invoke an agent:
 
 ```bash
-ar exec --agent <agent_name> --server {frontend_endpoint} --args '{"message":"你好"}'
+ar exec --agent <agent_name> --server {frontend_endpoint} --args '{"message":"hello"}'
 ```
 
-更多安装方式、参数说明和交互模式用法见 [cli/README.md](cli/README.md)。
+For more installation methods, parameter details, and interactive mode usage, see [cli/README.md](cli/README.md).
 
-### 项目目录结构
+### Project Structure
 
 ```text
-cli/                 Python CLI 包源码与打包配置
-cli/ar_cli/          ar 命令实现
-python/              Python AgentRuntimeSDK 独立包
-tests/cli/           CLI 单元测试
-tests/python/        AgentRuntimeSDK 单元与集成测试
-pytest.ini           测试配置
+cli/                 Python CLI package source and packaging config
+cli/ar_cli/          ar command implementation
+python/              Independent Python Agent Runtime SDK package
+tests/cli/           CLI unit tests
+tests/python/        Agent Runtime SDK unit and integration tests
+pytest.ini           Test configuration
 ```
 
-CLI 和 SDK 是两个独立发布包，共享仓库根目录 `VERSION` 中的版本号。
+The CLI and SDK are separate distributions that share the version in the
+repository-level `VERSION` file.
 
-## 贡献
+## Contributing
 
-我们欢迎您做各种形式的贡献，请参阅我们的[贡献者指南](https://docs.openyuanrong.org/zh-cn/latest/contributor_guide/index.html)。
+We welcome developers to contribute to Agent-dx. You can contribute in the following ways:
 
-## 许可证
+- Submit bugs, feature requests, or usage issues: [Issues](https://github.com/openJiuwen-ai/agent-dx/issues)
+- Submit code, documentation, or examples: [Pull Requests](https://github.com/openJiuwen-ai/agent-dx/pulls)
+
+## License
 
 [Apache License 2.0](./LICENSE)
+
+This product serves solely as a workflow orchestration tool and does not embed any AI model capabilities. When users integrate AI models for specific business scenarios, they shall bear full responsibility for compliance obligations under the EU AI Act and other relevant regulatory frameworks.
