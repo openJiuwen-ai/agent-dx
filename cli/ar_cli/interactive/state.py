@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""State and result types for one interactive ar exec session."""
+"""State and result types for one interactive adx exec session."""
 
 from dataclasses import dataclass
 from enum import Enum

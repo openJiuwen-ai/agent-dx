@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""HTTP API adapter used by the ar CLI."""
+"""HTTP API adapter used by the adx CLI."""
 
 from ar_cli.api.client import AgentRuntimeClient
 

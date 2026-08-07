@@ -20,7 +20,7 @@ from ar_cli.const import EXIT_FAILURE, EXIT_NETWORK_ERROR
 
 
 class ArError(Exception):
-    """Base error for the ar CLI. ``exit_code`` maps to the process exit code."""
+    """Base error for the adx CLI. ``exit_code`` maps to the process exit code."""
 
     exit_code = EXIT_FAILURE
 

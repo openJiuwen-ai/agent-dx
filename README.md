@@ -1,8 +1,10 @@
 [中文](README.zh.md) | **English**
 
+# Agent Distributed Executor (agent-dx)
+
 ## Introduction
 
-agent-dx(Agent Distributed eXecutor) is a distributed execution substrate for Agent Runtime, providing developer tools for agent registration, invocation, and session management. The repository currently offers the Python CLI `ar` and a separately built Python Agent Runtime SDK.
+Agent Distributed Executor (agent-dx) is a distributed execution substrate for agents, providing developer tools for agent registration, invocation, and session management. The repository currently offers the Python CLI `adx` and a separately built agent-dx Python SDK.
 
 ### Key Capabilities
 
@@ -14,19 +16,19 @@ Current CLI capabilities include:
 - Support for one-shot invocation and interactive invocation.
 
 For CLI installation, command parameters, examples, exit codes, and testing details, see [cli/README.md](cli/README.md).
-For the Agent Runtime SDK programming model, fixed bootstrap, and deployment configuration, see [python/README.md](python/README.md).
+For the agent-dx SDK programming model, fixed bootstrap, and deployment configuration, see [python/README.md](python/README.md).
 
 ## Getting Started
 
-- Install: `pip install https://openyuanrong.obs.cn-southwest-2.myhuaweicloud.com/release/0.9.0/openeuler/{x86_64 or aarch64}/openyuanrong_agentruntime-0.9.0-py3-none-any.whl`.
+- Install: `pip install https://openyuanrong.obs.cn-southwest-2.myhuaweicloud.com/release/0.9.0/openeuler/{x86_64 or aarch64}/agent_dx_cli-0.9.0-py3-none-any.whl`.
 - Prerequisites: You need to have openYuanrong deployed with function service capability. See the [openYuanrong Deployment](https://docs.openyuanrong.org/en/latest/deploy/index.html) documentation.
 
 ### CLI Tool
 
-Follow the openYuanrong [Function Service](https://docs.openyuanrong.org/en/latest/multi_language_function_programming_interface/development_guide/function_service/index.html) development guide to build your agent, then use the `ar` CLI to register it:
+Follow the openYuanrong [Function Service](https://docs.openyuanrong.org/en/latest/multi_language_function_programming_interface/development_guide/function_service/index.html) development guide to build your agent, then use the `adx` CLI to register it:
 
 ```bash
-ar deploy -s ./agent.json --server {meta_service_endpoint}
+adx deploy -s ./agent.json --server {meta_service_endpoint}
 ```
 
 Example `agent.json`:
@@ -48,7 +50,7 @@ Example `agent.json`:
 Invoke an agent:
 
 ```bash
-ar exec --agent <agent_name> --server {frontend_endpoint} --args '{"message":"hello"}'
+adx exec --agent <agent_name> --server {frontend_endpoint} --args '{"message":"hello"}'
 ```
 
 For more installation methods, parameter details, and interactive mode usage, see [cli/README.md](cli/README.md).
@@ -57,10 +59,10 @@ For more installation methods, parameter details, and interactive mode usage, se
 
 ```text
 cli/                 Python CLI package source and packaging config
-cli/ar_cli/          ar command implementation
-python/              Independent Python Agent Runtime SDK package
+cli/ar_cli/          adx command implementation
+python/              Independent agent-dx Python SDK package
 tests/cli/           CLI unit tests
-tests/python/        Agent Runtime SDK unit and integration tests
+tests/python/        agent-dx SDK unit and integration tests
 pytest.ini           Test configuration
 ```
 
@@ -69,7 +71,7 @@ repository-level `VERSION` file.
 
 ## Contributing
 
-We welcome developers to contribute to Agent-dx. You can contribute in the following ways:
+We welcome developers to contribute to agent-dx. You can contribute in the following ways:
 
 - Submit bugs, feature requests, or usage issues: [Issues](https://github.com/openJiuwen-ai/agent-dx/issues)
 - Submit code, documentation, or examples: [Pull Requests](https://github.com/openJiuwen-ai/agent-dx/pulls)

@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""`ar exec` — invoke an agent (function) and stream the SSE response."""
+"""`adx exec` — invoke an agent (function) and stream the SSE response."""
 
 import logging
 
@@ -47,7 +47,7 @@ JSON body. Omitting --args enters interactive mode; each line is sent as
 mode also auto-generates InstanceSession values when omitted.
 
 Example:\n
-  ar exec --agent <AGENT> --server <FRONTEND_ADDR> --args '{"param1":"hi"}'
+  adx exec --agent <AGENT> --server <FRONTEND_ADDR> --args '{"param1":"hi"}'
 """,
 )
 @click.option(

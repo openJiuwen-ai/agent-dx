@@ -61,7 +61,7 @@ def _capture_invocations(monkeypatch):
 
 def test_exec_with_args_invokes_once_and_preserves_json_body(monkeypatch):
     captured = _capture_invocations(monkeypatch)
-    monkeypatch.setattr("ar_cli.commands.exec.new_session_ctx_id", lambda: "ar-generated")
+    monkeypatch.setattr("ar_cli.commands.exec.new_session_ctx_id", lambda: "adx-generated")
     runner = CliRunner()
 
     result = runner.invoke(
@@ -75,7 +75,7 @@ def test_exec_with_args_invokes_once_and_preserves_json_body(monkeypatch):
     assert captured[0]["urn"] == "sn:cn:yrk:default:function:0@default@demo:latest"
     assert captured[0]["body"] == '"你好"'
     assert json.loads(captured[0]["headers"][HEADER_AGENT_SESSION]) == {
-        "sessionCtx": "ar-generated"
+        "sessionCtx": "adx-generated"
     }
     assert HEADER_INSTANCE_SESSION not in captured[0]["headers"]
 
@@ -145,7 +145,7 @@ def test_exec_without_args_enters_interactive_mode_and_wraps_messages(monkeypatc
     )
 
     assert result.exit_code == 0
-    assert "[ar-" in result.output
+    assert "[adx-" in result.output
     assert len(captured) == 3
     normal_invocations = captured[:2]
     release_invocation = captured[2]
@@ -156,11 +156,11 @@ def test_exec_without_args_enters_interactive_mode_and_wraps_messages(monkeypatc
 
     session_headers = [json.loads(item["headers"][HEADER_AGENT_SESSION]) for item in normal_invocations]
     assert session_headers[0] == session_headers[1]
-    assert session_headers[0]["sessionCtx"].startswith("ar-")
+    assert session_headers[0]["sessionCtx"].startswith("adx-")
 
     instance_headers = [json.loads(item["headers"][HEADER_INSTANCE_SESSION]) for item in normal_invocations]
     assert instance_headers[0] == instance_headers[1]
-    assert instance_headers[0]["sessionID"].startswith("ar-")
+    assert instance_headers[0]["sessionID"].startswith("adx-")
     assert instance_headers[0]["sessionTTL"] == 600
     assert instance_headers[0]["concurrency"] == 1
     assert all("X-Request-Id" not in item["headers"] for item in normal_invocations)

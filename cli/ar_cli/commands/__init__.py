@@ -14,10 +14,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Command registry for the public ar CLI commands."""
+"""Command registry for the public adx CLI commands."""
 
 from ar_cli.commands.deploy import deploy
 from ar_cli.commands.exec import exec_cmd
 
-# Every click command registered onto the root `ar` group.
+# Every click command registered onto the root `adx` group.
 COMMANDS = [deploy, exec_cmd]

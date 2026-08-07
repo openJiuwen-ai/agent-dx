@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Minimal in-process line editor for the `ar exec` interactive prompt.
+"""Minimal in-process line editor for the `adx exec` interactive prompt.
 
 input() only supports cursor movement / history when the stdlib ``readline``
 module is available. Some minimal Linux Python builds ship without it, so

@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Interactive ar exec loop."""
+"""Interactive adx exec loop."""
 
 import json
 import logging
@@ -125,7 +125,7 @@ def run_interactive(
 
 
 def _new_instance_session_id() -> str:
-    return f"ar-{uuid.uuid4().hex}"
+    return f"adx-{uuid.uuid4().hex}"
 
 
 def _release_interactive_session(

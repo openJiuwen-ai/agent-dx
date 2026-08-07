@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""openYuanrong Agent Runtime CLI (`ar`)."""
+"""agent-dx CLI (`adx`)."""
 
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
@@ -22,7 +22,7 @@ from pathlib import Path
 
 def _version() -> str:
     try:
-        return version("openyuanrong-agentruntime")
+        return version("agent-dx-cli")
     except PackageNotFoundError:
         return (Path(__file__).resolve().parents[2] / "VERSION").read_text(encoding="utf-8").strip()
 

@@ -33,7 +33,7 @@ BASE_DIR=$(
 )
 
 CLI_DIR="$BASE_DIR/cli"          # ar_cli package + setup.py live here
-SDK_DIR="$BASE_DIR/python"       # Agent Runtime SDK package
+SDK_DIR="$BASE_DIR/python"       # agent-dx SDK package
 BUILD_DIR="$BASE_DIR/build"      # intermediate build dir (setup.py -b)
 OUTPUT_DIR="$BASE_DIR/output"    # default wheel output dir
 PYTHON3_BIN_PATH="python3"

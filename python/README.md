@@ -1,6 +1,6 @@
-# openYuanrong Agent Runtime Python SDK
+# agent-dx Python SDK
 
-本软件包提供面向用户的 Agent API 和固定的 FaaS 启动入口。它独立于 `ar` CLI
+本软件包提供面向用户的 Agent API 和固定的 FaaS 启动入口。它独立于 `adx` CLI
 构建，仅通过 openYuanrong 提供的公共 `yr.datasystem` Python SDK 访问
 DataSystem。
 
@@ -55,7 +55,7 @@ class Agent(AgentExecutor):
 待打包的代码目录中，例如：
 
 ```bash
-pip install --target <codePath> openyuanrong-agentruntime-sdk.whl
+pip install --target <codePath> agent_dx_sdk-*.whl
 ```
 
 也可以通过函数层提供 SDK，但必须确保
