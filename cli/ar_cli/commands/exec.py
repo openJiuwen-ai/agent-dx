@@ -37,6 +37,7 @@ from ar_cli.utils import (
 
 logger = logging.getLogger(__name__)
 
+
 @click.command(
     name="exec",
     help="""Invoke an agent (function) and stream its SSE response.

@@ -19,13 +19,16 @@ class FakeFunctionContext:
     def __init__(self, stream=None):
         self.stream = FakeStream() if stream is None else stream
 
-    def getTenantID(self):
+    @staticmethod
+    def getTenantID():
         return "tenant"
 
-    def getFunctionName(self):
+    @staticmethod
+    def getFunctionName():
         return "agent"
 
-    def getVersion(self):
+    @staticmethod
+    def getVersion():
         return "v1"
 
     def get_stream(self):

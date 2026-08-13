@@ -77,7 +77,7 @@ def parse_command(line: str) -> List[str]:
     try:
         tokens = shlex.split(line)
     except ValueError as e:
-        raise InteractiveCommandError(f"invalid command syntax: {e}")
+        raise InteractiveCommandError(f"invalid command syntax: {e}") from e
     if not tokens:
         raise InteractiveCommandError("empty command")
     return tokens

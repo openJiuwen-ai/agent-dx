@@ -48,7 +48,7 @@ def fork_session(args: Sequence[str], context: InteractiveContext) -> CommandRes
         if e.status_code == 409:
             raise InteractiveCommandError(
                 f"fork conflict: {e.service_code or e}"
-            )
+            ) from e
         raise
 
     target_session_ctx = payload.get("sessionContextId")
