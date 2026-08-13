@@ -78,18 +78,18 @@ class HttpClient:
                 timeout=self._timeout,
             )
         except requests.RequestException as e:
-            raise NetworkError(f"failed to reach server at {url}: {e}")
+            raise NetworkError(f"failed to reach server at {url}: {e}") from e
 
         try:
             if not response.ok:
                 raise build_api_error(action, response)
             try:
                 payload = response.json()
-            except ValueError:
+            except ValueError as e:
                 raise ApiError(
                     f"{action} returned a non-JSON response: {brief(response.text)}",
                     status_code=response.status_code,
-                )
+                ) from e
             if not isinstance(payload, dict):
                 raise ApiError(
                     f"{action} returned a non-object JSON response",
@@ -133,7 +133,7 @@ class HttpClient:
                 timeout=self._timeout,
             )
         except requests.RequestException as e:
-            raise NetworkError(f"failed to reach server at {url}: {e}")
+            raise NetworkError(f"failed to reach server at {url}: {e}") from e
 
         try:
             if not response.ok:
@@ -159,7 +159,7 @@ class HttpClient:
                 timeout=self._timeout,
             )
         except requests.RequestException as e:
-            raise NetworkError(f"failed to reach server at {url}: {e}")
+            raise NetworkError(f"failed to reach server at {url}: {e}") from e
 
         response.encoding = "utf-8"
         if not response.ok:

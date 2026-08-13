@@ -50,7 +50,7 @@ class DispatcherTest(unittest.IsolatedAsyncioTestCase):
         operations = []
 
         class RecordingStore(MemoryKVStore):
-            async def set(inner_self, key, value):
+            async def set(self, key, value):
                 await super().set(key, value)
                 if ":e" in key:
                     operations.append(("persist", key))

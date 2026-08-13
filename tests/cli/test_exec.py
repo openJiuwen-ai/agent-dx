@@ -27,18 +27,21 @@ class FakeResponse:
     def __enter__(self):
         return self
 
-    def __exit__(self, exc_type, exc, tb):
+    @staticmethod
+    def __exit__(exc_type, exc, tb):
         return False
 
-    def iter_lines(self, decode_unicode=False):
+    @staticmethod
+    def iter_lines(decode_unicode=False):
         yield "data: ok"
         yield "data: [DONE]"
 
 
 class BrokenStreamResponse(FakeResponse):
-    def iter_lines(self, decode_unicode=False):
+    @staticmethod
+    def iter_lines(decode_unicode=False):
+        yield from ()
         raise RuntimeError("stream interrupted")
-        yield
 
 
 def _capture_invocations(monkeypatch):
@@ -555,7 +558,17 @@ def test_session_ttl_zero_is_rejected(monkeypatch):
 
     result = runner.invoke(
         cli,
-        ["exec", "--agent", "0@default@demo", "--server", "frontend:31180", "--session-id", "id1", "--session-ttl", "0"],
+        [
+            "exec",
+            "--agent",
+            "0@default@demo",
+            "--server",
+            "frontend:31180",
+            "--session-id",
+            "id1",
+            "--session-ttl",
+            "0",
+        ],
     )
 
     assert result.exit_code == 2
@@ -568,7 +581,17 @@ def test_concurrency_zero_is_rejected(monkeypatch):
 
     result = runner.invoke(
         cli,
-        ["exec", "--agent", "0@default@demo", "--server", "frontend:31180", "--session-id", "id1", "--concurrency", "0"],
+        [
+            "exec",
+            "--agent",
+            "0@default@demo",
+            "--server",
+            "frontend:31180",
+            "--session-id",
+            "id1",
+            "--concurrency",
+            "0",
+        ],
     )
 
     assert result.exit_code == 2
