@@ -17,13 +17,14 @@
 set -e
 
 readonly USAGE="
-Usage: bash build.sh [-v VERSION] [-o OUTPUT_DIR] [-p PYTHON] [-C] [-h]
+Usage: bash build.sh [-v VERSION] [-o OUTPUT_DIR] [-p PYTHON] [-C] [-t] [-h]
 
 Options:
     -v  wheel version, overrides ar_cli.__version__ (via BUILD_VERSION).
     -o  output directory for the built wheel (default: <repo>/output).
     -p  python interpreter to use (default: python3).
     -C  clean build/output/egg-info artifacts, then exit.
+    -t  run unit tests (pytest at repo root), then exit.
     -h  usage.
 "
 
@@ -44,7 +45,7 @@ usage() {
     echo -e "$USAGE"
 }
 
-while getopts 'v:o:p:Ch' opt; do
+while getopts 'v:o:p:Cth' opt; do
     case "$opt" in
     v)
         BUILD_VERSION="${OPTARG}"
@@ -57,6 +58,9 @@ while getopts 'v:o:p:Ch' opt; do
         ;;
     C)
         COMMAND="clean"
+        ;;
+    t)
+        COMMAND="test"
         ;;
     h)
         usage
@@ -75,6 +79,13 @@ if [ "$COMMAND" == "clean" ]; then
     rm -rf "$BUILD_DIR" "$OUTPUT_DIR" \
         "$CLI_DIR"/build "$CLI_DIR"/dist "$CLI_DIR"/*.egg-info \
         "$SDK_DIR"/build "$SDK_DIR"/dist "$SDK_DIR"/src/*.egg-info
+    exit 0
+fi
+
+if [ "$COMMAND" == "test" ]; then
+    echo "Running unit tests (pytest)..."
+    cd "$BASE_DIR"
+    "$PYTHON3_BIN_PATH" -m pytest -q
     exit 0
 fi
 
