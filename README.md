@@ -4,7 +4,7 @@
 
 ## Introduction
 
-Agent Distributed Executor (agent-dx) is a distributed execution substrate for agents, providing developer tools for agent registration, invocation, and session management. The repository currently offers the Python CLI `adx` and a separately built agent-dx Python SDK.
+Agent Distributed Executor (agent-dx) is a distributed execution substrate for agents, providing developer tools for agent registration, invocation, and session management. The repository currently offers the Python CLI `adx`, a separately built agent-dx Python SDK, and a platform-owned Executor for custom-image Agent instances.
 
 ### Key Capabilities
 
@@ -17,6 +17,7 @@ Current CLI capabilities include:
 
 For CLI installation, command parameters, examples, exit codes, and testing details, see [cli/README.md](cli/README.md).
 For the agent-dx SDK programming model, fixed bootstrap, and deployment configuration, see [python/README.md](python/README.md).
+For the platform-owned custom-image Agent executor, see [executor/README.md](executor/README.md).
 
 ## Getting Started
 
@@ -61,13 +62,15 @@ For more installation methods, parameter details, and interactive mode usage, se
 cli/                 Python CLI package source and packaging config
 cli/ar_cli/          adx command implementation
 python/              Independent agent-dx Python SDK package
+executor/            Independent platform Agent Executor package
 tests/cli/           CLI unit tests
 tests/python/        agent-dx SDK unit and integration tests
+tests/executor/      Agent Executor unit tests
 pytest.ini           Test configuration
 ```
 
-The CLI and SDK are separate distributions that share the version in the
-repository-level `VERSION` file.
+The CLI, SDK, and Executor are separate distributions that share the version
+in the repository-level `VERSION` file.
 
 ## Contributing
 

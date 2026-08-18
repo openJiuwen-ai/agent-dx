@@ -4,7 +4,7 @@
 
 ## 简介
 
-Agent Distributed Executor（简称 agent-dx）是面向 Agent 的分布式执行底座，用于承载 Agent 注册、调用、会话管理等开发者工具。仓库当前提供 Python CLI `adx` 和独立构建的 agent-dx Python SDK。
+Agent Distributed Executor（简称 agent-dx）是面向 Agent 的分布式执行底座，用于承载 Agent 注册、调用、会话管理等开发者工具。仓库当前提供 Python CLI `adx`、独立构建的 agent-dx Python SDK，以及用于自定义镜像 Agent 实例的平台 Executor。
 
 ### 关键能力
 
@@ -17,6 +17,7 @@ Agent Distributed Executor（简称 agent-dx）是面向 Agent 的分布式执�
 
 CLI 的安装、命令参数、示例、退出码和测试说明见 [cli/README.md](cli/README.md)。
 agent-dx SDK 的编程模型、固定 Bootstrap 和部署配置见 [python/README.md](python/README.md)。
+平台托管的自定义镜像 Agent Executor 见 [executor/README.zh.md](executor/README.zh.md)。
 
 ## 入门
 
@@ -60,12 +61,14 @@ adx exec --agent <agent_name> --server {frontend_endpoint} --args '{"message":"�
 cli/                 Python CLI 包源码与打包配置
 cli/ar_cli/          adx 命令实现
 python/              agent-dx Python SDK 独立包
+executor/            平台 Agent Executor 独立包
 tests/cli/           CLI 单元测试
 tests/python/        agent-dx SDK 单元与集成测试
+tests/executor/      Agent Executor 单元测试
 pytest.ini           测试配置
 ```
 
-CLI 和 SDK 是两个独立发布包，共享仓库根目录 `VERSION` 中的版本号。
+CLI、SDK 和 Executor 是三个独立发布包，共享仓库根目录 `VERSION` 中的版本号。
 
 ## 贡献
 
