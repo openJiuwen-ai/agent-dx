@@ -18,22 +18,87 @@
 
 from __future__ import annotations
 
+import base64
+import ipaddress
 import json
 import logging
 import threading
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any, Optional
 from urllib.parse import parse_qs, urlsplit
-from typing import Optional
 
 from .file_handler import DEFAULT_MAX_FILE_SIZE, FileHandler, FileListTimeoutError
+from .sandbox_instance import SandboxInstance
 
 _LOG = logging.getLogger(__name__)
+DEFAULT_MAX_CONCURRENT_REQUESTS = 64
+DEFAULT_MAX_SANDBOX_REQUEST_SIZE = 512 * 1024 * 1024
+DEFAULT_MAX_SANDBOX_RESPONSE_SIZE = 512 * 1024 * 1024
+_SANDBOX_ENDPOINTS = {
+    "/v1/sandbox/execute",
+    "/v1/sandbox/read_file",
+    "/v1/sandbox/write_file",
+    "/v1/sandbox/list_files",
+    "/v1/sandbox/search_files",
+}
+
+
+class SandboxRequestTooLargeError(ValueError):
+    """Raised when a Sandbox API JSON request exceeds its configured limit."""
+
+
+class SandboxResponseTooLargeError(ValueError):
+    """Raised when a Sandbox API JSON response exceeds its configured limit."""
 
 
 class _ExecutorThreadingHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     block_on_close = False
+
+    def __init__(
+        self,
+        server_address,
+        request_handler_class,
+        *,
+        max_concurrent_requests: int = DEFAULT_MAX_CONCURRENT_REQUESTS,
+    ) -> None:
+        if max_concurrent_requests <= 0:
+            raise ValueError("max_concurrent_requests must be greater than zero")
+        self._request_slots = threading.BoundedSemaphore(max_concurrent_requests)
+        super().__init__(server_address, request_handler_class)
+
+    def process_request(self, request, client_address) -> None:
+        if not self._request_slots.acquire(blocking=False):
+            self._reject_overloaded(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._request_slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._request_slots.release()
+
+    def _reject_overloaded(self, request) -> None:
+        body = b'{"message":"executor is busy"}'
+        response = (
+            b"HTTP/1.1 503 Service Unavailable\r\n"
+            b"Content-Type: application/json\r\n"
+            + f"Content-Length: {len(body)}\r\n".encode("ascii")
+            + b"Connection: close\r\n\r\n"
+            + body
+        )
+        try:
+            request.sendall(response)
+        except OSError:
+            pass
+        finally:
+            self.shutdown_request(request)
 
 
 def parse_range(value: str, total_size: int) -> tuple[int, Optional[int]]:
@@ -54,13 +119,44 @@ def parse_range(value: str, total_size: int) -> tuple[int, Optional[int]]:
 class ExecutorHTTPServer:
     """Owns a background ThreadingHTTPServer."""
 
-    def __init__(self, host: str, port: int, max_file_size: int = DEFAULT_MAX_FILE_SIZE) -> None:
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        max_file_size: int = DEFAULT_MAX_FILE_SIZE,
+        sandbox: Optional[SandboxInstance] = None,
+        *,
+        max_sandbox_request_size: int = DEFAULT_MAX_SANDBOX_REQUEST_SIZE,
+        max_sandbox_response_size: int = DEFAULT_MAX_SANDBOX_RESPONSE_SIZE,
+        max_concurrent_requests: int = DEFAULT_MAX_CONCURRENT_REQUESTS,
+    ) -> None:
+        if max_sandbox_request_size <= 0:
+            raise ValueError("max_sandbox_request_size must be greater than zero")
+        if max_sandbox_response_size <= 0:
+            raise ValueError("max_sandbox_response_size must be greater than zero")
         file_handler = FileHandler(max_file_size=max_file_size)
+        sandbox_instance = sandbox if sandbox is not None else SandboxInstance()
+        sandbox_request_limit = max_sandbox_request_size
+        sandbox_response_limit = max_sandbox_response_size
 
         class RequestHandler(_ExecutorRequestHandler):
             files = file_handler
+            sandbox = sandbox_instance
+            max_sandbox_request_size = sandbox_request_limit
+            max_sandbox_response_size = sandbox_response_limit
 
-        self._server = _ExecutorThreadingHTTPServer((host, port), RequestHandler)
+        self._sandbox = sandbox_instance
+        self._owns_sandbox = sandbox is None
+        try:
+            self._server = _ExecutorThreadingHTTPServer(
+                (host, port),
+                RequestHandler,
+                max_concurrent_requests=max_concurrent_requests,
+            )
+        except BaseException:
+            if self._owns_sandbox:
+                self._sandbox.cleanup()
+            raise
         self._thread = threading.Thread(
             target=self._server.serve_forever,
             name="yuanrong-agentexecutor-http",
@@ -79,11 +175,16 @@ class ExecutorHTTPServer:
         self._server.server_close()
         if self._thread is not threading.current_thread():
             self._thread.join(timeout=5)
+        if self._owns_sandbox:
+            self._sandbox.cleanup()
 
 
 class _ExecutorRequestHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     files = FileHandler()
+    sandbox: SandboxInstance
+    max_sandbox_request_size = DEFAULT_MAX_SANDBOX_REQUEST_SIZE
+    max_sandbox_response_size = DEFAULT_MAX_SANDBOX_RESPONSE_SIZE
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlsplit(self.path)
@@ -99,7 +200,14 @@ class _ExecutorRequestHandler(BaseHTTPRequestHandler):
         self._write_json(HTTPStatus.NOT_FOUND, {"message": "endpoint not found"})
 
     def do_POST(self) -> None:  # noqa: N802
-        self._upload_request()
+        path = urlsplit(self.path).path
+        if path == "/v1/files/upload":
+            self._upload()
+            return
+        if path in _SANDBOX_ENDPOINTS:
+            self._sandbox_request(path)
+            return
+        self._write_json(HTTPStatus.NOT_FOUND, {"message": "endpoint not found"})
 
     def do_PUT(self) -> None:  # noqa: N802
         self._upload_request()
@@ -109,6 +217,210 @@ class _ExecutorRequestHandler(BaseHTTPRequestHandler):
             self._write_json(HTTPStatus.NOT_FOUND, {"message": "endpoint not found"})
             return
         self._upload()
+
+    def _sandbox_request(self, path: str) -> None:
+        if not self._client_is_loopback():
+            self._write_json(HTTPStatus.FORBIDDEN, {"message": "sandbox API is loopback-only"})
+            return
+        try:
+            payload = self._read_json_body()
+            result = self._dispatch_sandbox(path, payload)
+            self._write_json(
+                HTTPStatus.OK, result, max_size=self.max_sandbox_response_size
+            )
+        except (SandboxRequestTooLargeError, SandboxResponseTooLargeError) as exc:
+            self._write_json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"message": str(exc)})
+        except FileNotFoundError as exc:
+            self._write_json(HTTPStatus.NOT_FOUND, {"message": str(exc)})
+        except NotADirectoryError as exc:
+            self._write_json(HTTPStatus.BAD_REQUEST, {"message": str(exc)})
+        except (ValueError, TypeError) as exc:
+            self._write_json(HTTPStatus.BAD_REQUEST, {"message": str(exc)})
+        except OSError as exc:
+            _LOG.exception("sandbox operation failed")
+            self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"message": str(exc)})
+        except Exception as exc:  # noqa: BLE001 - keep the HTTP connection well-formed
+            _LOG.exception("unexpected sandbox operation failure")
+            self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"message": str(exc)})
+
+    def _dispatch_sandbox(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if path == "/v1/sandbox/execute":
+            if "command" not in payload:
+                raise ValueError("command is required")
+            working_dir = self._aliased_value(payload, "working_dir", "cwd")
+            env = self._aliased_value(payload, "env", "environment")
+            timeout = self._aliased_value(payload, "timeout", "timeout_seconds")
+            if working_dir is not None and not isinstance(working_dir, str):
+                raise TypeError("working_dir must be a string")
+            if env is not None:
+                if not isinstance(env, dict) or not all(
+                    isinstance(key, str) and isinstance(value, str)
+                    for key, value in env.items()
+                ):
+                    raise TypeError("env must be an object containing string values")
+            if timeout is not None:
+                if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+                    raise TypeError("timeout must be a number")
+                if timeout <= 0:
+                    raise ValueError("timeout must be greater than zero")
+            return self.sandbox.execute(
+                payload["command"], working_dir=working_dir, env=env, timeout=timeout
+            )
+
+        if path == "/v1/sandbox/read_file":
+            file_path = self._required_string(payload, "path")
+            mode = payload.get("mode", "rb")
+            if not isinstance(mode, str):
+                raise TypeError("mode must be a string")
+            content = self.sandbox.read_file(file_path, mode)
+            if isinstance(content, bytes):
+                return {
+                    "path": file_path,
+                    "mode": mode,
+                    "content": base64.b64encode(content).decode("ascii"),
+                    "content_encoding": "base64",
+                }
+            return {
+                "path": file_path,
+                "mode": mode,
+                "content": content,
+                "content_encoding": "text",
+            }
+
+        if path == "/v1/sandbox/write_file":
+            file_path = self._required_string(payload, "path")
+            mode = payload.get("mode", "wb")
+            if not isinstance(mode, str):
+                raise TypeError("mode must be a string")
+            content = self._aliased_value(payload, "content", "data", required=True)
+            encoding = payload.get("content_encoding", "base64" if "b" in mode else "text")
+            if not isinstance(content, str):
+                raise TypeError("content must be a string")
+            if "b" in mode:
+                if encoding != "base64":
+                    raise ValueError("binary write mode requires content_encoding 'base64'")
+                data: Any = base64.b64decode(content, validate=True)
+            else:
+                if encoding != "text":
+                    raise ValueError("text write mode requires content_encoding 'text'")
+                data = content
+            self.sandbox.write_file(file_path, data, mode)
+            return {"success": True, "path": file_path}
+
+        if path == "/v1/sandbox/list_files":
+            file_path = self._required_string(payload, "path")
+            recursive = self._optional_bool(payload, "recursive", False)
+            include_files = self._optional_bool(payload, "include_files", True)
+            include_dirs = self._optional_bool(payload, "include_dirs", True)
+            max_depth = payload.get("max_depth")
+            if max_depth is not None:
+                if isinstance(max_depth, bool) or not isinstance(max_depth, int):
+                    raise TypeError("max_depth must be an integer")
+                if max_depth < 0:
+                    raise ValueError("max_depth must be non-negative")
+            items = self.sandbox.list_files(
+                file_path,
+                recursive=recursive,
+                max_depth=max_depth,
+                include_files=include_files,
+                include_dirs=include_dirs,
+            )
+            return {"items": items}
+
+        if path == "/v1/sandbox/search_files":
+            file_path = self._required_string(payload, "path")
+            pattern = self._required_string(payload, "pattern")
+            excludes = payload.get("exclude_patterns")
+            if excludes is not None and (
+                not isinstance(excludes, list)
+                or not all(isinstance(item, str) for item in excludes)
+            ):
+                raise TypeError("exclude_patterns must be an array of strings")
+            return {
+                "items": self.sandbox.search_files(
+                    file_path, pattern, exclude_patterns=excludes
+                )
+            }
+
+        raise ValueError("unsupported sandbox operation")
+
+    def _read_json_body(self) -> dict[str, Any]:
+        content_type = self.headers.get("Content-Type", "").partition(";")[0].strip().lower()
+        if content_type != "application/json":
+            raise ValueError("Content-Type must be application/json")
+        content_length = self.headers.get("Content-Length")
+        if content_length is not None:
+            try:
+                parsed_length = int(content_length)
+            except ValueError as exc:
+                raise ValueError("invalid Content-Length") from exc
+            if parsed_length < 0:
+                raise ValueError("Content-Length must be non-negative")
+            if parsed_length > self.max_sandbox_request_size:
+                self.close_connection = True
+                raise SandboxRequestTooLargeError(
+                    f"request body exceeds max {self.max_sandbox_request_size}"
+                )
+        source = self._request_body(content_length)
+        body = bytearray()
+        while True:
+            chunk = source.read(min(1024 * 1024, self.max_sandbox_request_size + 1 - len(body)))
+            if not chunk:
+                break
+            body.extend(chunk)
+            if len(body) > self.max_sandbox_request_size:
+                self.close_connection = True
+                raise SandboxRequestTooLargeError(
+                    f"request body exceeds max {self.max_sandbox_request_size}"
+                )
+        try:
+            payload = json.loads(body)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("request body must be valid JSON") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("request body must be a JSON object")
+        return payload
+
+    def _client_is_loopback(self) -> bool:
+        try:
+            address = ipaddress.ip_address(self.client_address[0])
+        except ValueError:
+            return False
+        if address.is_loopback:
+            return True
+        return bool(
+            address.version == 6
+            and address.ipv4_mapped
+            and address.ipv4_mapped.is_loopback
+        )
+
+    @staticmethod
+    def _required_string(payload: dict[str, Any], name: str) -> str:
+        value = payload.get(name)
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"{name} is required")
+        return value
+
+    @staticmethod
+    def _optional_bool(payload: dict[str, Any], name: str, default: bool) -> bool:
+        value = payload.get(name, default)
+        if not isinstance(value, bool):
+            raise TypeError(f"{name} must be a boolean")
+        return value
+
+    @staticmethod
+    def _aliased_value(
+        payload: dict[str, Any], primary: str, alias: str, *, required: bool = False
+    ) -> Any:
+        if primary in payload and alias in payload:
+            raise ValueError(f"use either {primary} or {alias}, not both")
+        if primary in payload:
+            return payload[primary]
+        if alias in payload:
+            return payload[alias]
+        if required:
+            raise ValueError(f"{primary} is required")
+        return None
 
     def _upload(self) -> None:
         query = parse_qs(urlsplit(self.path).query)
@@ -207,8 +519,14 @@ class _ExecutorRequestHandler(BaseHTTPRequestHandler):
         values = query.get(name)
         return values[0] if values else default
 
-    def _write_json(self, status: HTTPStatus, value: dict) -> None:
+    def _write_json(
+        self, status: HTTPStatus, value: dict, *, max_size: Optional[int] = None
+    ) -> None:
         data = json.dumps(value, separators=(",", ":")).encode("utf-8")
+        if max_size is not None and len(data) > max_size:
+            raise SandboxResponseTooLargeError(
+                f"response body exceeds max {max_size}"
+            )
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
