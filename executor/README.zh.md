@@ -17,8 +17,10 @@ Executor 需安装到元戎 Runtime 使用的 Python 环境中。它属于镜像
 python -m pip install --no-deps agent_dx_executor-<version>-py3-none-any.whl
 ```
 
-该包支持 Python 3.9 及以上版本，不依赖特定 Python 次版本。目前主要运行时目标为
-Python 3.9 和 Python 3.11。
+该包支持 Python 3.9 及以上版本，不依赖特定 Python 次版本。该 wheel 的包根目录会安装到
+Python 的 `platlib`，从而在 `purelib` 和 `platlib` 分别映射到 `lib` 和 `lib64` 的
+系统上，使 `yr.agentexecutor` 与包含原生库的 openYuanRong Runtime 位于同一目录。
+目前主要运行时目标为 Python 3.9 和 Python 3.11。
 
 FaaS 入口如下：
 
