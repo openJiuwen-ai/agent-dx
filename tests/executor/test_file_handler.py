@@ -102,3 +102,58 @@ def test_recursive_list_times_out(tmp_path):
 
     with pytest.raises(FileListTimeoutError, match="file list exceeded"):
         handler.list(str(tmp_path), recursive=True)
+
+
+def test_mkdir_creates_single_directory(tmp_path):
+    target = tmp_path / "sub"
+
+    result = FileHandler().mkdir(str(target))
+
+    assert result == {"success": True, "path": str(target), "created": True}
+    assert target.is_dir()
+
+
+def test_mkdir_recursive_creates_intermediate_parents(tmp_path):
+    target = tmp_path / "a" / "b" / "c"
+
+    result = FileHandler().mkdir(str(target), recursive=True)
+
+    assert result == {"success": True, "path": str(target), "created": True}
+    assert target.is_dir()
+
+
+def test_mkdir_on_existing_directory_is_idempotent(tmp_path):
+    target = tmp_path / "sub"
+    target.mkdir()
+    target.chmod(0o755)
+
+    result = FileHandler().mkdir(str(target))
+
+    assert result == {"success": True, "path": str(target), "created": False}
+    assert target.is_dir()
+
+
+def test_mkdir_mode_is_applied_exactly_ignoring_umask(tmp_path):
+    target = tmp_path / "secret"
+
+    FileHandler().mkdir(str(target), mode="0700")
+
+    assert stat.S_IMODE(target.stat().st_mode) == 0o700
+
+
+def test_mkdir_rejects_invalid_mode(tmp_path):
+    target = tmp_path / "sub"
+
+    with pytest.raises(ValueError, match="expected 3-4 digit octal"):
+        FileHandler().mkdir(str(target), mode="999")
+
+    assert not target.exists()
+
+
+def test_mkdir_non_recursive_with_missing_parent_raises(tmp_path):
+    target = tmp_path / "missing" / "deep"
+
+    with pytest.raises(ValueError, match="parent does not exist"):
+        FileHandler().mkdir(str(target), recursive=False)
+
+    assert not target.exists()

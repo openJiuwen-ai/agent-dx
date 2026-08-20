@@ -59,7 +59,11 @@ def validate_permissions(mode: str) -> Optional[int]:
 
 
 class FileHandler:
-    """Provides atomic upload, ranged download metadata, and directory listing."""
+    """Filesystem operation handler for the sandbox HTTP API.
+
+    Provides atomic upload, ranged download metadata, directory listing,
+    and directory creation.
+    """
 
     def __init__(
         self,
@@ -101,6 +105,23 @@ class FileHandler:
                 pass
             raise
         return {"success": True, "path": str(target), "size": size}
+
+    @staticmethod
+    def mkdir(path: str, mode: str = "", recursive: bool = False) -> dict:
+        target = validate_path(path)
+        permissions = validate_permissions(mode)
+        existed_before = target.is_dir()
+        try:
+            target.mkdir(parents=recursive, exist_ok=True)
+        except FileNotFoundError as exc:
+            if not recursive:
+                raise ValueError(
+                    f"parent does not exist, use recursive=true: {target.parent}"
+                ) from exc
+            raise
+        if permissions is not None:
+            os.chmod(target, permissions)
+        return {"success": True, "path": str(target), "created": not existed_before}
 
     def open_download(self, path: str, start: int = 0, end: Optional[int] = None):
         target = validate_path(path)

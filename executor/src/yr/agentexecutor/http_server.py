@@ -204,6 +204,9 @@ class _ExecutorRequestHandler(BaseHTTPRequestHandler):
         if path == "/v1/files/upload":
             self._upload()
             return
+        if path == "/v1/files/mkdir":
+            self._mkdir()
+            return
         if path in _SANDBOX_ENDPOINTS:
             self._sandbox_request(path)
             return
@@ -455,6 +458,20 @@ class _ExecutorRequestHandler(BaseHTTPRequestHandler):
         if content_length is None:
             raise ValueError("Content-Length or chunked transfer encoding is required")
         return _LengthReader(self.rfile, int(content_length))
+
+    def _mkdir(self) -> None:
+        query = parse_qs(urlsplit(self.path).query)
+        path = self._query_value(query, "path")
+        mode = self._query_value(query, "mode")
+        recursive = self._query_value(query, "recursive", "false").lower() == "true"
+        try:
+            result = self.files.mkdir(path, mode=mode, recursive=recursive)
+            self._write_json(HTTPStatus.OK, result)
+        except (ValueError, FileNotFoundError) as exc:
+            self._write_json(HTTPStatus.BAD_REQUEST, {"message": str(exc)})
+        except OSError as exc:
+            _LOG.exception("file mkdir failed")
+            self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"message": str(exc)})
 
     def _download(self, query: dict[str, list[str]]) -> None:
         path = self._query_value(query, "path")
