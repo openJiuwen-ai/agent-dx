@@ -19,8 +19,27 @@
 import os
 from pathlib import Path
 
-from setuptools import setup
+from setuptools import Distribution, setup
+from wheel.bdist_wheel import bdist_wheel
+
+
+class PlatlibDistribution(Distribution):
+    """Install this pure-Python package through the platform library scheme."""
+
+    def has_ext_modules(self):
+        return True
+
+
+class PlatlibWheel(bdist_wheel):
+    """Keep the platlib wheel portable across Python versions and platforms."""
+
+    def get_tag(self):
+        return "py3", "none", "any"
 
 
 version_file = Path(__file__).resolve().parents[1] / "VERSION"
-setup(version=os.getenv("BUILD_VERSION") or version_file.read_text(encoding="utf-8").strip())
+setup(
+    version=os.getenv("BUILD_VERSION") or version_file.read_text(encoding="utf-8").strip(),
+    distclass=PlatlibDistribution,
+    cmdclass={"bdist_wheel": PlatlibWheel},
+)

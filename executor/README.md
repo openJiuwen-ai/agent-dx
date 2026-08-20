@@ -21,7 +21,11 @@ python -m pip install --no-deps agent_dx_executor-<version>-py3-none-any.whl
 ```
 
 The package supports Python 3.9 and later without a minor-version-specific
-dependency. Current primary runtime targets are Python 3.9 and Python 3.11.
+dependency. The wheel is deliberately rooted in Python's `platlib`, so the
+`yr.agentexecutor` package is colocated with the native
+openYuanRong Runtime on systems where `purelib` and `platlib` map to `lib` and
+`lib64`, respectively. Current primary runtime targets are Python 3.9 and
+Python 3.11.
 
 FaaS entries:
 
