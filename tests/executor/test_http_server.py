@@ -5,6 +5,7 @@ import base64
 import io
 import json
 import os
+import stat
 import threading
 import urllib.error
 import urllib.parse
@@ -203,6 +204,67 @@ def test_existing_file_upload_route_remains_independent(tmp_path):
         with urllib.request.urlopen(request) as response:
             assert json.load(response)["success"] is True
         assert target.read_bytes() == b"frontend payload"
+    finally:
+        server.stop()
+
+
+def test_mkdir_route_creates_directory_with_mode(tmp_path):
+    server = ExecutorHTTPServer("127.0.0.1", 0)
+    server.start()
+    target = tmp_path / "work" / "sub"
+    try:
+        host, port = server.address
+        query = urllib.parse.urlencode(
+            {"path": str(target), "mode": "0755", "recursive": "true"}
+        )
+        request = urllib.request.Request(
+            f"http://{host}:{port}/v1/files/mkdir?{query}",
+            method="POST",
+        )
+        with urllib.request.urlopen(request) as response:
+            assert response.status == 200
+            body = json.load(response)
+        assert body["success"] is True
+        assert body["created"] is True
+        assert target.is_dir()
+        assert stat.S_IMODE(target.stat().st_mode) == 0o755
+
+        with urllib.request.urlopen(request) as response:
+            assert json.load(response)["created"] is False
+    finally:
+        server.stop()
+
+
+def test_mkdir_route_rejects_missing_path():
+    server = ExecutorHTTPServer("127.0.0.1", 0)
+    server.start()
+    try:
+        host, port = server.address
+        request = urllib.request.Request(
+            f"http://{host}:{port}/v1/files/mkdir",
+            method="POST",
+        )
+        with pytest.raises(urllib.error.HTTPError) as caught:
+            urllib.request.urlopen(request)
+        assert caught.value.code == 400
+    finally:
+        server.stop()
+
+
+def test_mkdir_route_rejects_non_recursive_with_missing_parent(tmp_path):
+    server = ExecutorHTTPServer("127.0.0.1", 0)
+    server.start()
+    target = tmp_path / "missing" / "deep"
+    try:
+        host, port = server.address
+        query = urllib.parse.urlencode({"path": str(target), "recursive": "false"})
+        request = urllib.request.Request(
+            f"http://{host}:{port}/v1/files/mkdir?{query}",
+            method="POST",
+        )
+        with pytest.raises(urllib.error.HTTPError) as caught:
+            urllib.request.urlopen(request)
+        assert caught.value.code == 400
     finally:
         server.stop()
 
