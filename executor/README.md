@@ -75,9 +75,10 @@ argv arrays are considered, malformed entries and individual start failures
 are logged and skipped.
 
 Process stdin is connected to `/dev/null`. Stdout and stderr are combined into
-the append-only `${GLOG_log_dir}/bootstrap_cmd_<index>.log`; when
+the append-only `${GLOG_log_dir}/${YR_RUNTIME_ID}/bootstrap_cmd_<index>.log`; when
 `GLOG_log_dir` is unset it defaults to `/home/snuser/log/`, and when the log
-cannot be opened both output streams fall back to `/dev/null`.
+cannot be opened both output streams fall back to `/dev/null`. A missing or
+unsafe runtime ID is replaced with a path-safe component.
 
 The FaaS `PRE_STOP_TIMEOUT` bounds shutdown. By default the Executor reserves
 two seconds of that timeout for forced termination and final cleanup, and uses

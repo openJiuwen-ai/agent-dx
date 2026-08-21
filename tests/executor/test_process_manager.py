@@ -56,7 +56,7 @@ def test_process_manager_combines_stdout_and_stderr_in_compatible_log(tmp_path):
         "-c",
         "import sys; print('stdout-line'); print('stderr-line', file=sys.stderr)",
     ]
-    manager.start([command], log_dir=str(tmp_path))
+    manager.start([command], log_dir=str(tmp_path), runtime_id="runtime-test")
     try:
         deadline = time.monotonic() + 5
         while manager.status()[0]["running"] and time.monotonic() < deadline:
@@ -64,6 +64,39 @@ def test_process_manager_combines_stdout_and_stderr_in_compatible_log(tmp_path):
     finally:
         manager.stop(grace_period_seconds=0.1)
 
-    output = (tmp_path / "bootstrap_cmd_0.log").read_text()
+    output = (tmp_path / "runtime-test" / "bootstrap_cmd_0.log").read_text()
     assert "stdout-line" in output
     assert "stderr-line" in output
+
+
+def test_process_manager_sanitizes_runtime_id_in_log_path(tmp_path):
+    manager = ProcessManager()
+    command = [sys.executable, "-c", "print('runtime-log')"]
+    manager.start([command], log_dir=str(tmp_path), runtime_id="../runtime/id")
+    try:
+        deadline = time.monotonic() + 5
+        while manager.status()[0]["running"] and time.monotonic() < deadline:
+            time.sleep(0.01)
+    finally:
+        manager.stop(grace_period_seconds=0.1)
+
+    assert (tmp_path / ".._runtime_id" / "bootstrap_cmd_0.log").read_text().strip() == "runtime-log"
+
+
+def test_process_manager_reads_runtime_id_from_env(tmp_path):
+    manager = ProcessManager()
+    environ = {
+        "YR_RUNTIME_BOOTSTRAP_CMD": json.dumps([[sys.executable, "-c", "print('env-runtime-log')"]]),
+        "GLOG_log_dir": str(tmp_path),
+        "YR_RUNTIME_ID": "runtime-from-env",
+    }
+    manager.start_from_env(environ)
+    try:
+        deadline = time.monotonic() + 5
+        while manager.status()[0]["running"] and time.monotonic() < deadline:
+            time.sleep(0.01)
+    finally:
+        manager.stop(grace_period_seconds=0.1)
+
+    output = tmp_path / "runtime-from-env" / "bootstrap_cmd_0.log"
+    assert output.read_text().strip() == "env-runtime-log"

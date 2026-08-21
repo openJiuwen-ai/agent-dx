@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import signal
 import subprocess
 import threading
@@ -32,8 +33,17 @@ _LOG = logging.getLogger(__name__)
 
 BOOTSTRAP_COMMAND_ENV = "YR_RUNTIME_BOOTSTRAP_CMD"
 PROCESS_LOG_DIR_ENV = "GLOG_log_dir"
+RUNTIME_ID_ENV = "YR_RUNTIME_ID"
 DEFAULT_PROCESS_LOG_DIR = "/home/snuser/log/"
 MAX_BOOTSTRAP_COMMANDS = 64
+
+
+def _runtime_log_directory(log_dir: str, runtime_id: str) -> Path:
+    """Return a traversal-safe, per-runtime directory for bootstrap logs."""
+    runtime_component = re.sub(r"[^A-Za-z0-9._-]", "_", runtime_id.strip())
+    if runtime_component in {"", ".", ".."}:
+        runtime_component = "unknown-runtime"
+    return Path(log_dir) / runtime_component
 
 
 def parse_bootstrap_commands(value: str) -> list[list[str]]:
@@ -77,24 +87,26 @@ class ProcessManager:
         active_env = os.environ if environ is None else environ
         commands = parse_bootstrap_commands(active_env.get(BOOTSTRAP_COMMAND_ENV, ""))
         log_dir = active_env.get(PROCESS_LOG_DIR_ENV, DEFAULT_PROCESS_LOG_DIR)
-        self.start(commands, log_dir=log_dir)
+        runtime_id = active_env.get(RUNTIME_ID_ENV, "")
+        self.start(commands, log_dir=log_dir, runtime_id=runtime_id)
 
-    def start(self, commands: Sequence[Sequence[str]], *, log_dir: str) -> None:
+    def start(self, commands: Sequence[Sequence[str]], *, log_dir: str, runtime_id: str = "") -> None:
         """Start commands independently; one failure does not fail initialization."""
         with self._lock:
             if self._processes:
                 raise RuntimeError("user processes have already been started")
+            runtime_log_directory = _runtime_log_directory(log_dir, runtime_id)
             log_directory_available = True
             try:
-                Path(log_dir).mkdir(parents=True, exist_ok=True)
+                runtime_log_directory.mkdir(parents=True, exist_ok=True)
             except OSError as exc:
-                _LOG.warning("cannot create bootstrap log directory %s: %s", log_dir, exc)
+                _LOG.warning("cannot create bootstrap log directory %s: %s", runtime_log_directory, exc)
                 log_directory_available = False
             for index, command in enumerate(commands[:MAX_BOOTSTRAP_COMMANDS]):
                 log_file = None
                 try:
                     if log_directory_available:
-                        log_path = Path(log_dir) / f"bootstrap_cmd_{index}.log"
+                        log_path = runtime_log_directory / f"bootstrap_cmd_{index}.log"
                         try:
                             log_file = log_path.open("ab", buffering=0)
                         except OSError as exc:
