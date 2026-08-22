@@ -65,8 +65,9 @@ Runtime 实现的尽力启动语义：最多处理 64 个 argv 数组；格式�
 启动失败会记录日志并跳过，不影响其他命令。
 
 用户进程的 stdin 连接到 `/dev/null`。stdout 和 stderr 合并追加到
-`${GLOG_log_dir}/bootstrap_cmd_<index>.log`；未设置 `GLOG_log_dir` 时默认使用
-`/home/snuser/log/`，日志文件无法打开时两个输出流均回退到 `/dev/null`。
+`${GLOG_log_dir}/${YR_RUNTIME_ID}/bootstrap_cmd_<index>.log`；未设置 `GLOG_log_dir` 时默认使用
+`/home/snuser/log/`，日志文件无法打开时两个输出流均回退到 `/dev/null`。缺失或不安全的
+runtime ID 会替换为路径安全的目录名。
 
 FaaS 的 `PRE_STOP_TIMEOUT` 限制关闭总时长。默认情况下，Executor 为强制终止和最终
 清理预留两秒，其余时间作为子进程收到 SIGTERM 后的优雅退出时间。
