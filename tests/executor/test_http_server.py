@@ -2,21 +2,121 @@
 # coding=UTF-8
 
 import base64
+import fnmatch
 import io
 import json
 import logging
 import os
 import stat
+import subprocess
+import sys
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
 
 from yr.agentexecutor.http_server import ExecutorHTTPServer, _ChunkedReader
+from yr.agentexecutor.sandbox_manager import SandboxManager
+
+
+class _LocalSandbox:
+    """Minimal Sandbox backed by the real filesystem and subprocess.
+
+    The executor HTTP server delegates sandbox operations to an injected
+    Sandbox instance. After the sandbox moved to a remote RPC package the
+    server never constructs one on its own, so tests inject this local stub to
+    route file and execute calls against the host without a runtime.
+    """
+
+    @staticmethod
+    def exec(command, *, working_dir=None, env=None, timeout=None, trace_id=None):
+        merged_env = {**os.environ, **(env or {})}
+        if isinstance(command, str):
+            cmd_args = ["/bin/sh", "-c", command]
+        else:
+            cmd_args = command
+        completed = subprocess.run(
+            cmd_args,
+            cwd=working_dir,
+            env=merged_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+        )
+        return {
+            "returncode": completed.returncode,
+            "stdout": completed.stdout.decode("utf-8", "replace"),
+            "stderr": completed.stderr.decode("utf-8", "replace"),
+        }
+
+    @staticmethod
+    def read_file(file_path, mode="rb", trace_id=None):
+        with open(file_path, mode) as handle:
+            return handle.read()
+
+    @staticmethod
+    def write_file(file_path, data, mode="wb", trace_id=None):
+        directory = os.path.dirname(file_path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        with open(file_path, mode) as handle:
+            handle.write(data)
+
+    @staticmethod
+    def list_files(file_path, *, recursive=False, max_depth=None,
+                   include_files=True, include_dirs=True, trace_id=None):
+        root = Path(file_path)
+        if recursive:
+            paths = list(root.rglob("*"))
+        else:
+            paths = list(root.iterdir()) if root.is_dir() else []
+        items = []
+        for path in sorted(paths):
+            is_directory = path.is_dir()
+            if is_directory and not include_dirs:
+                continue
+            if not is_directory and not include_files:
+                continue
+            items.append(
+                {"name": path.name, "path": str(path), "is_directory": is_directory}
+            )
+        return {"items": items}
+
+    @staticmethod
+    def search_files(file_path, pattern, *, exclude_patterns=None, trace_id=None):
+        excludes = exclude_patterns or []
+        root = Path(file_path)
+        items = []
+        for path in sorted(root.rglob("*")):
+            if path.is_dir():
+                continue
+            if not fnmatch.fnmatch(path.name, pattern):
+                continue
+            if any(fnmatch.fnmatch(path.name, exclude) for exclude in excludes):
+                continue
+            items.append({"name": path.name, "path": str(path)})
+        return {"items": items}
+
+
+def _server(**overrides):
+    """Build an ExecutorHTTPServer with a SandboxManager-backed local sandbox.
+
+    The sandbox is created and owned by AgentExecutorRuntime, which injects a
+    SandboxManager into the server. Tests build a manager pre-loaded with a
+    _LocalSandbox stub (keyed "local") so sandbox endpoints work against the
+    real host without standing up a runtime. Tests that don't need the id
+    route the manager's get() to return the stub for any id via overrides.
+    """
+    manager = SandboxManager()
+    manager.register("local", _LocalSandbox())
+    kwargs = {"host": "127.0.0.1", "port": 0, "sandbox_manager": manager}
+    kwargs.update(overrides)
+    return ExecutorHTTPServer(**kwargs)
 
 
 def _post_json(server, path, payload):
@@ -27,6 +127,30 @@ def _post_json(server, path, payload):
         headers={"Content-Type": "application/json"},
         method="POST",
     )
+    with urllib.request.urlopen(request) as response:
+        return response.status, json.load(response)
+
+
+def _get_json(server, path):
+    host, port = server.address
+    with urllib.request.urlopen(f"http://{host}:{port}{path}") as response:
+        return response.status, json.load(response)
+
+
+def _put_raw(server, path, body: bytes):
+    host, port = server.address
+    request = urllib.request.Request(
+        f"http://{host}:{port}{path}",
+        data=body,
+        method="PUT",
+    )
+    with urllib.request.urlopen(request) as response:
+        return response.status, json.load(response)
+
+
+def _delete(server, path):
+    host, port = server.address
+    request = urllib.request.Request(f"http://{host}:{port}{path}", method="DELETE")
     with urllib.request.urlopen(request) as response:
         return response.status, json.load(response)
 
@@ -43,7 +167,7 @@ def test_chunked_reader_decodes_forwarded_request_body():
 def test_health_and_download(tmp_path):
     target = tmp_path / "file.txt"
     target.write_bytes(b"hello")
-    server = ExecutorHTTPServer("127.0.0.1", 0)
+    server = _server()
     server.start()
     try:
         host, port = server.address
@@ -63,7 +187,7 @@ def test_health_and_download(tmp_path):
 def test_empty_file_range_is_not_satisfiable(tmp_path):
     target = tmp_path / "empty.txt"
     target.touch()
-    server = ExecutorHTTPServer("127.0.0.1", 0)
+    server = _server()
     server.start()
     try:
         host, port = server.address
@@ -80,7 +204,7 @@ def test_empty_file_range_is_not_satisfiable(tmp_path):
 
 
 def test_download_without_path_is_bad_request():
-    server = ExecutorHTTPServer("127.0.0.1", 0)
+    server = _server()
     server.start()
     try:
         host, port = server.address
@@ -93,27 +217,21 @@ def test_download_without_path_is_bad_request():
 
 
 def test_sandbox_execute_and_text_file_operations(tmp_path):
-    server = ExecutorHTTPServer("127.0.0.1", 0)
+    server = _server()
     server.start()
     target = tmp_path / "nested" / "message.txt"
     try:
-        status, written = _post_json(
+        status, written = _put_raw(
             server,
-            "/v1/sandbox/write_file",
-            {
-                "path": str(target),
-                "mode": "w",
-                "content": "hello sandbox",
-                "content_encoding": "text",
-            },
+            f"/v1/sandbox/sandboxes/local/files/write?path={urllib.parse.quote(str(target))}&mode=w",
+            b"hello sandbox",
         )
         assert status == 200
         assert written == {"success": True, "path": str(target)}
 
-        _, read = _post_json(
+        _, read = _get_json(
             server,
-            "/v1/sandbox/read_file",
-            {"path": str(target), "mode": "r"},
+            f"/v1/sandbox/sandboxes/local/files/read?path={urllib.parse.quote(str(target))}&mode=r",
         )
         assert read == {
             "path": str(target),
@@ -124,11 +242,12 @@ def test_sandbox_execute_and_text_file_operations(tmp_path):
 
         _, executed = _post_json(
             server,
-            "/v1/sandbox/execute",
+            "/v1/sandbox/sandboxes/local/execute",
             {
-                "command": ["/bin/sh", "-c", "printf \"$VALUE:$PWD\""],
-                "cwd": str(tmp_path),
-                "environment": {"VALUE": "ok"},
+                "command": [sys.executable, "-c",
+                            "import os,sys; sys.stdout.write(os.environ['VALUE']+':'+os.getcwd())"],
+                "working_dir": str(tmp_path),
+                "env": {"VALUE": "ok"},
             },
         )
         assert executed == {
@@ -141,35 +260,28 @@ def test_sandbox_execute_and_text_file_operations(tmp_path):
 
 
 def test_sandbox_binary_file_list_and_search_operations(tmp_path):
-    server = ExecutorHTTPServer("127.0.0.1", 0)
+    server = _server()
     server.start()
     target = tmp_path / "nested" / "payload.bin"
     ignored = tmp_path / "nested" / "ignored.bin"
     try:
         for path, content in ((target, b"\x00\xff"), (ignored, b"ignored")):
-            _post_json(
+            _put_raw(
                 server,
-                "/v1/sandbox/write_file",
-                {
-                    "path": str(path),
-                    "data": base64.b64encode(content).decode("ascii"),
-                    "mode": "wb",
-                    "content_encoding": "base64",
-                },
+                f"/v1/sandbox/sandboxes/local/files/write?path={urllib.parse.quote(str(path))}&mode=wb",
+                base64.b64encode(content),
             )
 
-        _, read = _post_json(
+        _, read = _get_json(
             server,
-            "/v1/sandbox/read_file",
-            {"path": str(target)},
+            f"/v1/sandbox/sandboxes/local/files/read?path={urllib.parse.quote(str(target))}",
         )
         assert base64.b64decode(read["content"]) == b"\x00\xff"
         assert read["content_encoding"] == "base64"
 
-        _, listed = _post_json(
+        _, listed = _get_json(
             server,
-            "/v1/sandbox/list_files",
-            {"path": str(tmp_path), "recursive": True},
+            f"/v1/sandbox/sandboxes/local/files/list?path={urllib.parse.quote(str(tmp_path))}&recursive=true",
         )
         assert {item["name"] for item in listed["items"]} == {
             "nested",
@@ -177,14 +289,10 @@ def test_sandbox_binary_file_list_and_search_operations(tmp_path):
             "ignored.bin",
         }
 
-        _, searched = _post_json(
+        _, searched = _get_json(
             server,
-            "/v1/sandbox/search_files",
-            {
-                "path": str(tmp_path),
-                "pattern": "*.bin",
-                "exclude_patterns": ["ignored.*"],
-            },
+            f"/v1/sandbox/sandboxes/local/files/search?path={urllib.parse.quote(str(tmp_path))}"
+            "&pattern=*.bin&exclude_patterns=ignored.*",
         )
         assert [item["name"] for item in searched["items"]] == ["payload.bin"]
     finally:
@@ -192,7 +300,7 @@ def test_sandbox_binary_file_list_and_search_operations(tmp_path):
 
 
 def test_existing_file_upload_route_remains_independent(tmp_path):
-    server = ExecutorHTTPServer("127.0.0.1", 0)
+    server = _server()
     server.start()
     target = tmp_path / "frontend-upload.bin"
     try:
@@ -211,7 +319,7 @@ def test_existing_file_upload_route_remains_independent(tmp_path):
 
 
 def test_mkdir_route_creates_directory_with_mode(tmp_path):
-    server = ExecutorHTTPServer("127.0.0.1", 0)
+    server = _server()
     server.start()
     target = tmp_path / "work" / "sub"
     try:
@@ -238,7 +346,7 @@ def test_mkdir_route_creates_directory_with_mode(tmp_path):
 
 
 def test_mkdir_route_rejects_missing_path():
-    server = ExecutorHTTPServer("127.0.0.1", 0)
+    server = _server()
     server.start()
     try:
         host, port = server.address
@@ -254,7 +362,7 @@ def test_mkdir_route_rejects_missing_path():
 
 
 def test_mkdir_route_rejects_non_recursive_with_missing_parent(tmp_path):
-    server = ExecutorHTTPServer("127.0.0.1", 0)
+    server = _server()
     server.start()
     target = tmp_path / "missing" / "deep"
     try:
@@ -272,12 +380,12 @@ def test_mkdir_route_rejects_non_recursive_with_missing_parent(tmp_path):
 
 
 def test_sandbox_rejects_invalid_json_and_oversized_body():
-    server = ExecutorHTTPServer("127.0.0.1", 0, max_sandbox_request_size=8)
+    server = _server(max_sandbox_request_size=8)
     server.start()
     try:
         host, port = server.address
         request = urllib.request.Request(
-            f"http://{host}:{port}/v1/sandbox/execute",
+            f"http://{host}:{port}/v1/sandbox/sandboxes/local/execute",
             data=b"not-json",
             headers={"Content-Type": "application/json"},
             method="POST",
@@ -287,7 +395,7 @@ def test_sandbox_rejects_invalid_json_and_oversized_body():
         assert invalid.value.code == 400
 
         request = urllib.request.Request(
-            f"http://{host}:{port}/v1/sandbox/execute",
+            f"http://{host}:{port}/v1/sandbox/sandboxes/local/execute",
             data=b'{"command":"true"}',
             headers={"Content-Type": "application/json"},
             method="POST",
@@ -300,9 +408,7 @@ def test_sandbox_rejects_invalid_json_and_oversized_body():
 
 
 def test_sandbox_size_limits_are_independent_from_frontend_file_limit(tmp_path):
-    server = ExecutorHTTPServer(
-        "127.0.0.1",
-        0,
+    server = _server(
         max_file_size=8,
         max_sandbox_request_size=1024,
         max_sandbox_response_size=1024,
@@ -310,15 +416,10 @@ def test_sandbox_size_limits_are_independent_from_frontend_file_limit(tmp_path):
     server.start()
     target = tmp_path / "sandbox.txt"
     try:
-        status, result = _post_json(
+        status, result = _put_raw(
             server,
-            "/v1/sandbox/write_file",
-            {
-                "path": str(target),
-                "mode": "w",
-                "content": "more than eight bytes",
-                "content_encoding": "text",
-            },
+            f"/v1/sandbox/sandboxes/local/files/write?path={urllib.parse.quote(str(target))}&mode=w",
+            b"more than eight bytes",
         )
         assert status == 200
         assert result["success"] is True
@@ -330,20 +431,15 @@ def test_sandbox_size_limits_are_independent_from_frontend_file_limit(tmp_path):
 def test_sandbox_rejects_oversized_json_response(tmp_path):
     target = tmp_path / "large.txt"
     target.write_text("response larger than limit")
-    server = ExecutorHTTPServer(
-        "127.0.0.1", 0, max_sandbox_response_size=16
-    )
+    server = _server(max_sandbox_response_size=16)
     server.start()
     try:
         host, port = server.address
-        request = urllib.request.Request(
-            f"http://{host}:{port}/v1/sandbox/read_file",
-            data=json.dumps({"path": str(target), "mode": "r"}).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
         with pytest.raises(urllib.error.HTTPError) as caught:
-            urllib.request.urlopen(request)
+            _get_json(
+                server,
+                f"/v1/sandbox/sandboxes/local/files/read?path={urllib.parse.quote(str(target))}&mode=r",
+            )
         assert caught.value.code == 413
         assert "response body exceeds max 16" in json.load(caught.value)["message"]
     finally:
@@ -356,19 +452,19 @@ def test_server_rejects_requests_above_concurrency_limit():
 
     class BlockingSandbox:
         @staticmethod
-        def execute(*_args, **_kwargs):
+        def exec(*_args, **_kwargs):
             started.set()
             release.wait(timeout=5)
             return {"returncode": 0, "stdout": "", "stderr": ""}
 
-    server = ExecutorHTTPServer(
-        "127.0.0.1", 0, sandbox=BlockingSandbox(), max_concurrent_requests=1
-    )
+    blocking_manager = SandboxManager()
+    blocking_manager.register("local", BlockingSandbox())
+    server = _server(sandbox_manager=blocking_manager, max_concurrent_requests=1)
     server.start()
     first_result = []
 
     def first_request():
-        first_result.append(_post_json(server, "/v1/sandbox/execute", {"command": "true"}))
+        first_result.append(_post_json(server, "/v1/sandbox/sandboxes/local/execute", {"command": "true"}))
 
     thread = threading.Thread(target=first_request)
     thread.start()
@@ -387,56 +483,56 @@ def test_server_rejects_requests_above_concurrency_limit():
     assert first_result == [(200, {"returncode": 0, "stdout": "", "stderr": ""})]
 
 
-def test_server_owns_default_sandbox_lifecycle(monkeypatch):
-    sandbox = Mock()
-    monkeypatch.setattr(
-        "yr.agentexecutor.http_server.SandboxInstance", lambda: sandbox
-    )
-    server = ExecutorHTTPServer("127.0.0.1", 0)
+def test_server_does_not_own_sandbox_lifecycle():
+    """After the sandbox moved to a remote RPC package the HTTP server only
+    holds the injected SandboxManager reference; AgentExecutorRuntime owns the
+    lifecycle. stop() must not touch the managed sandboxes.
+    """
+    sandbox = Mock(spec=_LocalSandbox)
+    manager = SandboxManager()
+    manager.register("local", sandbox)
+    server = _server(sandbox_manager=manager)
 
     server.start()
     server.stop()
 
-    sandbox.cleanup.assert_called_once_with()
+    # The server never constructs a sandbox itself and never terminates one on
+    # stop; the runtime that injected the manager owns cleanup.
+    assert sandbox.method_calls == []
 
 
-def test_sandbox_request_logs_agent_trace_pairs(tmp_path, caplog):
+def test_sandbox_request_logs_agent_trace_pairs(caplog):
     caplog.set_level(logging.INFO)
-    target = tmp_path / "message.txt"
-    server = ExecutorHTTPServer("127.0.0.1", 0)
+    server = _server()
     server.start()
     try:
         host, port = server.address
         request = urllib.request.Request(
-            f"http://{host}:{port}/v1/sandbox/write_file",
-            data=json.dumps({
-                "path": str(target),
-                "mode": "w",
-                "content": "traced",
-                "content_encoding": "text",
-            }).encode("utf-8"),
+            f"http://{host}:{port}/v1/sandbox/sandboxes/local/execute",
+            data=json.dumps({"command": ["true"]}).encode("utf-8"),
             headers={"Content-Type": "application/json", "X-Trace-ID": "t-002"},
             method="POST",
         )
         with urllib.request.urlopen(request) as response:
             assert response.status == 200
-        assert "[agent.write_file.enter] agentexecutor" in caplog.text
+        # POST sandbox 路由的 op 取路径最后一段(execute)
+        assert "[agent.execute.enter] agentexecutor" in caplog.text
         assert "trace_id=t-002" in caplog.text
         # The exit line is logged by the server thread after the response is
         # fully sent, so poll briefly instead of asserting immediately.
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline and (
-            "[agent.write_file.exit] agentexecutor result=HTTP:200" not in caplog.text
+            "[agent.execute.exit] agentexecutor result=HTTP:200" not in caplog.text
         ):
             time.sleep(0.05)
-        assert "[agent.write_file.exit] agentexecutor result=HTTP:200" in caplog.text
+        assert "[agent.execute.exit] agentexecutor result=HTTP:200" in caplog.text
     finally:
         server.stop()
 
 
 def test_healthz_emits_no_agent_trace(caplog):
     caplog.set_level(logging.INFO)
-    server = ExecutorHTTPServer("127.0.0.1", 0)
+    server = _server()
     server.start()
     try:
         host, port = server.address
@@ -451,7 +547,7 @@ def test_file_download_logs_agent_trace(tmp_path, caplog):
     caplog.set_level(logging.INFO)
     target = tmp_path / "file.txt"
     target.write_bytes(b"hello")
-    server = ExecutorHTTPServer("127.0.0.1", 0)
+    server = _server()
     server.start()
     try:
         host, port = server.address

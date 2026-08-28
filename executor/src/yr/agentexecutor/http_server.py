@@ -32,21 +32,16 @@ from typing import Any, Optional
 from urllib.parse import parse_qs, urlsplit
 
 from .file_handler import DEFAULT_MAX_FILE_SIZE, FileHandler, FileListTimeoutError
-from .sandbox_instance import SandboxInstance
+from .sandbox.sandbox import SandboxCreateOptions
+from .sandbox_manager import SandboxManager
 
 _LOG = logging.getLogger(__name__)
 DEFAULT_MAX_CONCURRENT_REQUESTS = 64
 DEFAULT_MAX_SANDBOX_REQUEST_SIZE = 512 * 1024 * 1024
 DEFAULT_MAX_SANDBOX_RESPONSE_SIZE = 512 * 1024 * 1024
+_SANDBOX_PREFIX = "/v1/sandbox/sandboxes"
 TRACE_HEADER = "X-Trace-ID"
 INSTANCE_ID_ENV = "INSTANCE_ID"
-_SANDBOX_ENDPOINTS = {
-    "/v1/sandbox/execute",
-    "/v1/sandbox/read_file",
-    "/v1/sandbox/write_file",
-    "/v1/sandbox/list_files",
-    "/v1/sandbox/search_files",
-}
 
 
 class SandboxRequestTooLargeError(ValueError):
@@ -129,7 +124,7 @@ class ExecutorHTTPServer:
         host: str,
         port: int,
         max_file_size: int = DEFAULT_MAX_FILE_SIZE,
-        sandbox: Optional[SandboxInstance] = None,
+        sandbox_manager: Optional[SandboxManager] = None,
         *,
         max_sandbox_request_size: int = DEFAULT_MAX_SANDBOX_REQUEST_SIZE,
         max_sandbox_response_size: int = DEFAULT_MAX_SANDBOX_RESPONSE_SIZE,
@@ -140,18 +135,19 @@ class ExecutorHTTPServer:
         if max_sandbox_response_size <= 0:
             raise ValueError("max_sandbox_response_size must be greater than zero")
         file_handler = FileHandler(max_file_size=max_file_size)
-        sandbox_instance = sandbox if sandbox is not None else SandboxInstance()
+        if sandbox_manager is None:
+            raise ValueError("a SandboxManager must be provided by the runtime")
+        manager_instance = sandbox_manager
         sandbox_request_limit = max_sandbox_request_size
         sandbox_response_limit = max_sandbox_response_size
 
         class RequestHandler(_ExecutorRequestHandler):
             files = file_handler
-            sandbox = sandbox_instance
+            sandbox_manager = manager_instance
             max_sandbox_request_size = sandbox_request_limit
             max_sandbox_response_size = sandbox_response_limit
 
-        self._sandbox = sandbox_instance
-        self._owns_sandbox = sandbox is None
+        self._sandbox_manager = sandbox_manager
         try:
             self._server = _ExecutorThreadingHTTPServer(
                 (host, port),
@@ -159,8 +155,6 @@ class ExecutorHTTPServer:
                 max_concurrent_requests=max_concurrent_requests,
             )
         except BaseException:
-            if self._owns_sandbox:
-                self._sandbox.cleanup()
             raise
         self._thread = threading.Thread(
             target=self._server.serve_forever,
@@ -180,20 +174,19 @@ class ExecutorHTTPServer:
         self._server.server_close()
         if self._thread is not threading.current_thread():
             self._thread.join(timeout=5)
-        if self._owns_sandbox:
-            self._sandbox.cleanup()
 
 
 class _ExecutorRequestHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     files = FileHandler()
-    sandbox: SandboxInstance
+    sandbox_manager: SandboxManager
     max_sandbox_request_size = DEFAULT_MAX_SANDBOX_REQUEST_SIZE
     max_sandbox_response_size = DEFAULT_MAX_SANDBOX_RESPONSE_SIZE
 
-    def do_GET(self) -> None:  # noqa: N802
+    def _handle_get(self) -> None:
         parsed = urlsplit(self.path)
-        if parsed.path == "/healthz":
+        path = parsed.path
+        if path == "/healthz":
             self._write_json(HTTPStatus.OK, {"status": "ready"})
             return
         if parsed.path == "/v1/files/download":
@@ -204,9 +197,12 @@ class _ExecutorRequestHandler(BaseHTTPRequestHandler):
             with self._agent_trace("filelist", parsed.path):
                 self._list(parse_qs(parsed.query))
             return
+        if path.startswith(f"{_SANDBOX_PREFIX}/"):
+            self._sandbox_request("GET", path, parse_qs(parsed.query))
+            return
         self._write_json(HTTPStatus.NOT_FOUND, {"message": "endpoint not found"})
 
-    def do_POST(self) -> None:  # noqa: N802
+    def _handle_post(self) -> None:
         path = urlsplit(self.path).path
         if path == "/v1/files/upload":
             with self._agent_trace("upload", path):
@@ -216,20 +212,30 @@ class _ExecutorRequestHandler(BaseHTTPRequestHandler):
             with self._agent_trace("mkdir", path):
                 self._mkdir()
             return
-        if path in _SANDBOX_ENDPOINTS:
+        # sandbox POST: /v1/sandbox/sandboxes (create) or /v1/sandbox/sandboxes/{id}/execute
+        if path == _SANDBOX_PREFIX or path.startswith(f"{_SANDBOX_PREFIX}/"):
             with self._agent_trace(path.rsplit("/", 1)[-1], path):
-                self._sandbox_request(path)
+                self._sandbox_request("POST", path, {})
             return
         self._write_json(HTTPStatus.NOT_FOUND, {"message": "endpoint not found"})
 
-    def do_PUT(self) -> None:  # noqa: N802
-        self._upload_request()
-
-    def _upload_request(self) -> None:
-        if urlsplit(self.path).path != "/v1/files/upload":
-            self._write_json(HTTPStatus.NOT_FOUND, {"message": "endpoint not found"})
+    def _handle_put(self) -> None:
+        path = urlsplit(self.path).path
+        if path == "/v1/files/upload":
+            self._upload()
             return
-        self._upload()
+        # sandbox PUT: /v1/sandbox/sandboxes/{id}/files/write
+        if path.startswith(f"{_SANDBOX_PREFIX}/"):
+            self._sandbox_request("PUT", path, parse_qs(urlsplit(self.path).query))
+            return
+        self._write_json(HTTPStatus.NOT_FOUND, {"message": "endpoint not found"})
+
+    def _handle_delete(self) -> None:
+        path = urlsplit(self.path).path
+        if path.startswith(f"{_SANDBOX_PREFIX}/"):
+            self._sandbox_request("DELETE", path, {})
+            return
+        self._write_json(HTTPStatus.NOT_FOUND, {"message": "endpoint not found"})
 
     @contextmanager
     def _agent_trace(self, op: str, path: str):
@@ -258,13 +264,13 @@ class _ExecutorRequestHandler(BaseHTTPRequestHandler):
                 exit_line += f" instance_id={instance_id}"
             _LOG.info(exit_line)
 
-    def _sandbox_request(self, path: str) -> None:
+    def _sandbox_request(self, method: str, path: str, query: dict[str, list[str]]) -> None:
         if not self._client_is_loopback():
             self._write_json(HTTPStatus.FORBIDDEN, {"message": "sandbox API is loopback-only"})
             return
         try:
-            payload = self._read_json_body()
-            result = self._dispatch_sandbox(path, payload)
+            payload: dict[str, Any] = self._read_json_body() if method == "POST" else {}
+            result = self._dispatch_sandbox(method, path, query, payload)
             self._write_json(
                 HTTPStatus.OK, result, max_size=self.max_sandbox_response_size
             )
@@ -276,6 +282,9 @@ class _ExecutorRequestHandler(BaseHTTPRequestHandler):
             self._write_json(HTTPStatus.BAD_REQUEST, {"message": str(exc)})
         except (ValueError, TypeError) as exc:
             self._write_json(HTTPStatus.BAD_REQUEST, {"message": str(exc)})
+        except RuntimeError as exc:
+            _LOG.exception("sandbox operation failed")
+            self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"message": str(exc)})
         except OSError as exc:
             _LOG.exception("sandbox operation failed")
             self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"message": str(exc)})
@@ -283,13 +292,48 @@ class _ExecutorRequestHandler(BaseHTTPRequestHandler):
             _LOG.exception("unexpected sandbox operation failure")
             self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"message": str(exc)})
 
-    def _dispatch_sandbox(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
-        if path == "/v1/sandbox/execute":
+    def _dispatch_sandbox(
+        self, method: str, path: str, query: dict[str, list[str]], payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        if method == "POST" and path == _SANDBOX_PREFIX:
+            options = self._build_sandbox_options(payload)
+            try:
+                instance_id = self.sandbox_manager.create(options)
+            except Exception as exc:
+                if isinstance(exc, RuntimeError) and str(exc).startswith("create sandbox failed"):
+                    raise
+                raise RuntimeError(f"create sandbox failed: {exc}") from exc
+            return {
+                "instance_id": instance_id,
+            }
+
+        rest = path[len(_SANDBOX_PREFIX) + 1:]  # 去掉 "sandboxes/"
+        parts = rest.split("/", 2)
+        if not parts or not parts[0]:
+            raise ValueError("instance_id is required in path")
+        instance_id = parts[0]
+        sub = parts[1] if len(parts) > 1 else ""
+        action = parts[2] if len(parts) > 2 else ""
+
+        if method == "DELETE" and sub == "":
+            success = self.sandbox_manager.delete(instance_id)
+            if not success:
+                return {"success": False, "message": "sandbox not found"}
+            return {"success": True}
+
+        sandbox = self.sandbox_manager.get(instance_id)
+        if sandbox is None:
+            raise FileNotFoundError(f"sandbox {instance_id} not found")
+
+        if method == "POST" and sub == "execute" and action == "":
             if "command" not in payload:
                 raise ValueError("command is required")
-            working_dir = self._aliased_value(payload, "working_dir", "cwd")
-            env = self._aliased_value(payload, "env", "environment")
-            timeout = self._aliased_value(payload, "timeout", "timeout_seconds")
+            working_dir = payload.get("working_dir")
+            env = payload.get("env")
+            timeout = payload.get("timeout")
+            trace_id = payload.get("trace_id")
+            if trace_id is not None and not isinstance(trace_id, str):
+                raise TypeError("trace_id must be a string")
             if working_dir is not None and not isinstance(working_dir, str):
                 raise TypeError("working_dir must be a string")
             if env is not None:
@@ -303,21 +347,31 @@ class _ExecutorRequestHandler(BaseHTTPRequestHandler):
                     raise TypeError("timeout must be a number")
                 if timeout <= 0:
                     raise ValueError("timeout must be greater than zero")
-            return self.sandbox.execute(
-                payload["command"], working_dir=working_dir, env=env, timeout=timeout
-            )
+            try:
+                return sandbox.exec(
+                    payload["command"], working_dir=working_dir, env=env, timeout=timeout, trace_id=trace_id,
+                )
+            except Exception as exc:
+                raise RuntimeError(f"execute failed: {exc}") from exc
 
-        if path == "/v1/sandbox/read_file":
-            file_path = self._required_string(payload, "path")
-            mode = payload.get("mode", "rb")
+        if method == "GET" and sub == "files" and action == "read":
+            file_path = self._query_value(query, "path")
+            if not file_path:
+                raise ValueError("path is required")
+            mode = self._query_value(query, "mode", "rb")
             if not isinstance(mode, str):
                 raise TypeError("mode must be a string")
-            content = self.sandbox.read_file(file_path, mode)
-            if isinstance(content, bytes):
+            trace_id = self._query_value(query, "trace_id", "")
+            try:
+                content = sandbox.read_file(file_path, mode, trace_id=trace_id)
+            except Exception as exc:
+                raise RuntimeError(f"read file failed: {exc}") from exc
+            if isinstance(content, (bytes, bytearray, memoryview)):
+                binary = bytes(content)
                 return {
                     "path": file_path,
                     "mode": mode,
-                    "content": base64.b64encode(content).decode("ascii"),
+                    "content": base64.b64encode(binary).decode("ascii"),
                     "content_encoding": "base64",
                 }
             return {
@@ -327,60 +381,78 @@ class _ExecutorRequestHandler(BaseHTTPRequestHandler):
                 "content_encoding": "text",
             }
 
-        if path == "/v1/sandbox/write_file":
-            file_path = self._required_string(payload, "path")
-            mode = payload.get("mode", "wb")
+        if method == "PUT" and sub == "files" and action == "write":
+            file_path = self._query_value(query, "path")
+            if not file_path:
+                raise ValueError("path is required")
+            mode = self._query_value(query, "mode", "wb")
             if not isinstance(mode, str):
                 raise TypeError("mode must be a string")
-            content = self._aliased_value(payload, "content", "data", required=True)
-            encoding = payload.get("content_encoding", "base64" if "b" in mode else "text")
-            if not isinstance(content, str):
-                raise TypeError("content must be a string")
+            content = self._read_raw_body().decode("utf-8")
+            if not content:
+                raise ValueError("content is required")
             if "b" in mode:
-                if encoding != "base64":
-                    raise ValueError("binary write mode requires content_encoding 'base64'")
-                data: Any = base64.b64decode(content, validate=True)
+                try:
+                    data: Any = base64.b64decode(content, validate=True)
+                except Exception as exc:
+                    raise ValueError(f"invalid base64 content: {exc}") from exc
             else:
-                if encoding != "text":
-                    raise ValueError("text write mode requires content_encoding 'text'")
                 data = content
-            self.sandbox.write_file(file_path, data, mode)
+            trace_id = self._query_value(query, "trace_id", "")
+            try:
+                sandbox.write_file(file_path, data, mode, trace_id=trace_id)
+            except Exception as exc:
+                raise RuntimeError(f"write file failed: {exc}") from exc
             return {"success": True, "path": file_path}
 
-        if path == "/v1/sandbox/list_files":
-            file_path = self._required_string(payload, "path")
-            recursive = self._optional_bool(payload, "recursive", False)
-            include_files = self._optional_bool(payload, "include_files", True)
-            include_dirs = self._optional_bool(payload, "include_dirs", True)
-            max_depth = payload.get("max_depth")
-            if max_depth is not None:
-                if isinstance(max_depth, bool) or not isinstance(max_depth, int):
-                    raise TypeError("max_depth must be an integer")
+        if method == "GET" and sub == "files" and action == "list":
+            file_path = self._query_value(query, "path")
+            if not file_path:
+                raise ValueError("path is required")
+            recursive = self._query_value(query, "recursive", "false").lower() == "true"
+            include_files = self._query_value(query, "include_files", "true").lower() == "true"
+            include_dirs = self._query_value(query, "include_dirs", "true").lower() == "true"
+            max_depth_str = self._query_value(query, "max_depth", "")
+            max_depth: Optional[int] = None
+            if max_depth_str:
+                try:
+                    max_depth = int(max_depth_str)
+                except ValueError as exc:
+                    raise ValueError("max_depth must be an integer") from exc
                 if max_depth < 0:
                     raise ValueError("max_depth must be non-negative")
-            items = self.sandbox.list_files(
-                file_path,
-                recursive=recursive,
-                max_depth=max_depth,
-                include_files=include_files,
-                include_dirs=include_dirs,
-            )
-            return {"items": items}
-
-        if path == "/v1/sandbox/search_files":
-            file_path = self._required_string(payload, "path")
-            pattern = self._required_string(payload, "pattern")
-            excludes = payload.get("exclude_patterns")
-            if excludes is not None and (
-                not isinstance(excludes, list)
-                or not all(isinstance(item, str) for item in excludes)
-            ):
-                raise TypeError("exclude_patterns must be an array of strings")
-            return {
-                "items": self.sandbox.search_files(
-                    file_path, pattern, exclude_patterns=excludes
+            trace_id = self._query_value(query, "trace_id", "")
+            try:
+                return sandbox.list_files(
+                    file_path,
+                    recursive=recursive,
+                    max_depth=max_depth,
+                    include_files=include_files,
+                    include_dirs=include_dirs,
+                    trace_id=trace_id,
                 )
-            }
+            except Exception as exc:
+                raise RuntimeError(f"list files failed: {exc}") from exc
+
+        if method == "GET" and sub == "files" and action == "search":
+            file_path = self._query_value(query, "path")
+            if not file_path:
+                raise ValueError("path is required")
+            pattern = self._query_value(query, "pattern")
+            if not pattern:
+                raise ValueError("pattern is required")
+            excludes_str = self._query_value(query, "exclude_patterns", "")
+            excludes: Optional[list[str]] = None
+            if excludes_str:
+                excludes = [s.strip() for s in excludes_str.split(",") if s.strip()]
+            trace_id = self._query_value(query, "trace_id", "")
+            try:
+                return sandbox.search_files(
+                    file_path, pattern, exclude_patterns=excludes,
+                    trace_id=trace_id,
+                )
+            except Exception as exc:
+                raise RuntimeError(f"search files failed: {exc}") from exc
 
         raise ValueError("unsupported sandbox operation")
 
@@ -421,6 +493,88 @@ class _ExecutorRequestHandler(BaseHTTPRequestHandler):
             raise ValueError("request body must be a JSON object")
         return payload
 
+    def _read_raw_body(self) -> bytes:
+        """Read the request body as raw bytes (for PUT write, not JSON)."""
+        content_length = self.headers.get("Content-Length")
+        if content_length is None:
+            raise ValueError("Content-Length is required")
+        try:
+            parsed_length = int(content_length)
+        except ValueError as exc:
+            raise ValueError("invalid Content-Length") from exc
+        if parsed_length < 0:
+            raise ValueError("Content-Length must be non-negative")
+        if parsed_length > self.max_sandbox_request_size:
+            self.close_connection = True
+            raise SandboxRequestTooLargeError(
+                f"request body exceeds max {self.max_sandbox_request_size}"
+            )
+        source = self._request_body(content_length)
+        body = bytearray()
+        while True:
+            chunk = source.read(min(1024 * 1024, self.max_sandbox_request_size + 1 - len(body)))
+            if not chunk:
+                break
+            body.extend(chunk)
+            if len(body) > self.max_sandbox_request_size:
+                self.close_connection = True
+                raise SandboxRequestTooLargeError(
+                    f"request body exceeds max {self.max_sandbox_request_size}"
+                )
+        return bytes(body)
+
+    @staticmethod
+    def _build_sandbox_options(payload: dict[str, Any]) -> SandboxCreateOptions:
+        """Build SandboxCreateOptions from the create endpoint JSON payload.
+
+        Fields map 1:1 to SandboxCreateOptions (sandbox.py). All optional.
+        """
+        ports_raw = payload.get("ports")
+        if ports_raw is not None:
+            if not isinstance(ports_raw, list) or not all(
+                isinstance(p, str) for p in ports_raw
+            ):
+                raise TypeError("ports must be an array of strings")
+            ports = ports_raw
+        else:
+            ports = None
+        env_raw = payload.get("env")
+        if env_raw is not None:
+            if not isinstance(env_raw, dict) or not all(
+                isinstance(k, str) and isinstance(v, str) for k, v in env_raw.items()
+            ):
+                raise TypeError("env must be an object containing string values")
+            env = env_raw
+        else:
+            env = None
+        cpu = payload.get("cpu")
+        if cpu is not None and (isinstance(cpu, bool) or not isinstance(cpu, int)):
+            raise TypeError("cpu must be an integer")
+        memory = payload.get("memory")
+        if memory is not None and (isinstance(memory, bool) or not isinstance(memory, int)):
+            raise TypeError("memory must be an integer")
+        idle_timeout = payload.get("idle_timeout", 300)
+        if isinstance(idle_timeout, bool) or not isinstance(idle_timeout, int):
+            raise TypeError("idle_timeout must be an integer")
+        if idle_timeout <= 0:
+            raise ValueError("idle_timeout must be greater than zero")
+        trace_id = payload.get("trace_id", "")
+        if not isinstance(trace_id, str):
+            raise TypeError("trace_id must be a string")
+        return SandboxCreateOptions(
+            image=payload.get("image"),
+            cpu=cpu,
+            memory=memory,
+            sandbox_type=payload.get("sandbox_type", ""),
+            ports=ports,
+            upstream=payload.get("upstream"),
+            working_dir=payload.get("working_dir"),
+            env=env,
+            idle_timeout=idle_timeout,
+            trace_id=trace_id,
+            user=payload.get("user"),
+        )
+
     def _client_is_loopback(self) -> bool:
         try:
             address = ipaddress.ip_address(self.client_address[0])
@@ -447,20 +601,6 @@ class _ExecutorRequestHandler(BaseHTTPRequestHandler):
         if not isinstance(value, bool):
             raise TypeError(f"{name} must be a boolean")
         return value
-
-    @staticmethod
-    def _aliased_value(
-        payload: dict[str, Any], primary: str, alias: str, *, required: bool = False
-    ) -> Any:
-        if primary in payload and alias in payload:
-            raise ValueError(f"use either {primary} or {alias}, not both")
-        if primary in payload:
-            return payload[primary]
-        if alias in payload:
-            return payload[alias]
-        if required:
-            raise ValueError(f"{primary} is required")
-        return None
 
     def _upload(self) -> None:
         query = parse_qs(urlsplit(self.path).query)
@@ -574,7 +714,7 @@ class _ExecutorRequestHandler(BaseHTTPRequestHandler):
         values = query.get(name)
         return values[0] if values else default
 
-    def send_response(self, code, message=None):  # noqa: N802
+    def send_response(self, code, message=None):
         """Record the response status so _agent_trace can report it on exit."""
         self._agent_response_status = int(code)
         super().send_response(code, message)
@@ -596,6 +736,11 @@ class _ExecutorRequestHandler(BaseHTTPRequestHandler):
     def log_message(self, format_string: str, *args) -> None:
         # Access-log line duplicates the [agent.<op>.enter/exit] pair; keep at DEBUG.
         _LOG.debug("executor http: " + format_string, *args)
+
+    do_GET = _handle_get
+    do_POST = _handle_post
+    do_PUT = _handle_put
+    do_DELETE = _handle_delete
 
 
 class _LengthReader:
