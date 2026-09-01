@@ -26,6 +26,7 @@ from typing import Mapping, Optional
 from .file_handler import DEFAULT_MAX_FILE_SIZE
 from .http_server import ExecutorHTTPServer
 from .process_manager import ProcessManager
+from .probe import ProbeStartupError, _configure_liveness, _load_probe_set, run_startup
 
 EXECUTOR_HOST_ENV = "YR_AGENT_EXECUTOR_HOST"
 EXECUTOR_PORT_ENV = "YR_AGENT_EXECUTOR_PORT"
@@ -65,12 +66,13 @@ class AgentExecutorRuntime:
     def __init__(self) -> None:
         self._http_server: Optional[ExecutorHTTPServer] = None
         self._process_manager = ProcessManager()
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
 
     def start(self) -> None:
         with self._lock:
             if self._http_server is not None:
                 return
+            startup, liveness = _load_probe_set()
             host = os.getenv(EXECUTOR_HOST_ENV, DEFAULT_EXECUTOR_HOST)
             port = int(os.getenv(EXECUTOR_PORT_ENV, str(DEFAULT_EXECUTOR_PORT)))
             max_file_size = int(os.getenv(EXECUTOR_MAX_FILE_SIZE_ENV, str(DEFAULT_MAX_FILE_SIZE)))
@@ -83,12 +85,34 @@ class AgentExecutorRuntime:
                 server.stop()
                 self._http_server = None
                 raise
+            if startup is not None:
+                try:
+                    run_startup(startup)
+                except ProbeStartupError:
+                    self._cleanup_on_startup_failure()
+                    raise
+            # Liveness is armed only after the startup gate (if any) passes.
+            # Until then probe_liveness() returns DISABLED so the yr runtime
+            # heartbeat callback keeps the instance in CREATING instead of
+            # racing ahead to RUNNING while startup is still blocking.
+            _configure_liveness(liveness)
 
     def stop(self) -> None:
         with self._lock:
             grace = resolve_process_shutdown_grace()
             server = self._http_server
             self._http_server = None
+            try:
+                if server is not None:
+                    server.stop()
+            finally:
+                self._process_manager.stop(grace)
+
+    def _cleanup_on_startup_failure(self) -> None:
+        with self._lock:
+            server = self._http_server
+            self._http_server = None
+            grace = resolve_process_shutdown_grace()
             try:
                 if server is not None:
                     server.stop()
