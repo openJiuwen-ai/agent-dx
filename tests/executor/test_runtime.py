@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 # coding=UTF-8
 
+import threading
+from types import SimpleNamespace
+
 from yr.agentexecutor import handler
+from yr.agentexecutor.probe import ProbeSpec, ProbeStartupError
 from yr.agentexecutor.runtime import AgentExecutorRuntime, resolve_process_shutdown_grace
 
 
@@ -61,3 +65,69 @@ def test_runtime_stops_http_before_user_processes(monkeypatch):
     runtime.stop()
 
     assert events == ["http", ("processes", 8)]
+
+
+def test_start_raises_on_startup_failure_without_deadlock(monkeypatch):
+    # Regression guard: start() runs _cleanup_on_startup_failure() inside its
+    # own with-block. A non-reentrant Lock re-acquired in the cleanup path
+    # would deadlock here. Run start() on a thread and join with a timeout so
+    # a hang fails the test instead of hanging the suite.
+    events = []
+
+    def _pm_start():
+        events.append("process_start")
+
+    def _pm_stop(*_args):
+        events.append("process_stop")
+
+    pm = SimpleNamespace(start_from_env=_pm_start, stop=_pm_stop)
+    # Patch the ProcessManager class so __init__ picks up the double without
+    # touching the protected _process_manager attribute.
+    monkeypatch.setattr("yr.agentexecutor.runtime.ProcessManager", lambda: pm)
+
+    def _server_start():
+        events.append("server_start")
+
+    def _server_stop():
+        events.append("server_stop")
+
+    monkeypatch.setattr(
+        "yr.agentexecutor.runtime.ExecutorHTTPServer",
+        lambda *a, **kw: SimpleNamespace(start=_server_start, stop=_server_stop),
+    )
+
+    startup_spec = ProbeSpec(
+        {"type": "tcp", "port": 1, "host": "127.0.0.1"},
+        initial_delay_seconds=0,
+        period_seconds=0,
+        failure_threshold=1,
+    )
+
+    def _raise_startup(_spec):
+        raise ProbeStartupError("forced startup failure")
+
+    monkeypatch.setattr("yr.agentexecutor.runtime.run_startup", _raise_startup)
+    monkeypatch.setattr("yr.agentexecutor.runtime._load_probe_set", lambda: (startup_spec, None))
+    monkeypatch.setenv("PRE_STOP_TIMEOUT", "10")
+
+    runtime = AgentExecutorRuntime()
+
+    result = {}
+
+    def run():
+        try:
+            runtime.start()
+        except BaseException as exc:
+            result["exc"] = exc
+
+    t = threading.Thread(target=run)
+    t.start()
+    # startup failure path must return promptly; a deadlock would keep the
+    # thread alive past the deadline.
+    t.join(timeout=5.0)
+    assert not t.is_alive(), "start() deadlocked instead of raising on startup failure"
+
+    assert isinstance(result.get("exc"), ProbeStartupError)
+    # cleanup ran before re-raising: http server + user processes both stopped.
+    assert "server_stop" in events
+    assert any(isinstance(e, str) and e == "process_stop" for e in events)
