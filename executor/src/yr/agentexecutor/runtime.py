@@ -66,7 +66,7 @@ class AgentExecutorRuntime:
     def __init__(self) -> None:
         self._http_server: Optional[ExecutorHTTPServer] = None
         self._process_manager = ProcessManager()
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
 
     def start(self) -> None:
         with self._lock:
