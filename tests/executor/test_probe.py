@@ -2,6 +2,7 @@
 # coding=UTF-8
 
 import json
+import logging
 import socket
 
 import pytest
@@ -146,7 +147,7 @@ def test_probe_liveness_returns_healthy_on_pass_and_resets_counter(monkeypatch):
     spec = ProbeSpec({"type": "tcp", "port": 1, "host": "127.0.0.1"}, failure_threshold=2)
     setattr(probe, "_liveness_spec", spec)
     setattr(probe, "_liveness_fail", 1)
-    monkeypatch.setattr(probe, "_probe_once", lambda _action, _timeout: True)
+    monkeypatch.setattr(probe, "_probe_once", lambda _action, _timeout: (True, ""))
 
     assert probe_liveness() == AggregateState.HEALTHY.value
     assert getattr(probe, "_liveness_fail") == 0
@@ -155,7 +156,7 @@ def test_probe_liveness_returns_healthy_on_pass_and_resets_counter(monkeypatch):
 def test_probe_liveness_subhealth_before_threshold(monkeypatch):
     spec = ProbeSpec({"type": "tcp", "port": 1, "host": "127.0.0.1"}, failure_threshold=3)
     setattr(probe, "_liveness_spec", spec)
-    monkeypatch.setattr(probe, "_probe_once", lambda _action, _timeout: False)
+    monkeypatch.setattr(probe, "_probe_once", lambda _action, _timeout: (False, "refused"))
 
     assert probe_liveness() == AggregateState.SUBHEALTH.value
     assert getattr(probe, "_liveness_fail") == 1
@@ -165,7 +166,7 @@ def test_probe_liveness_failed_after_consecutive_threshold(monkeypatch):
     spec = ProbeSpec({"type": "tcp", "port": 1, "host": "127.0.0.1"}, failure_threshold=2)
     setattr(probe, "_liveness_spec", spec)
     setattr(probe, "_liveness_fail", 1)
-    monkeypatch.setattr(probe, "_probe_once", lambda _action, _timeout: False)
+    monkeypatch.setattr(probe, "_probe_once", lambda _action, _timeout: (False, "refused"))
 
     assert probe_liveness() == AggregateState.FAILED.value
     assert getattr(probe, "_liveness_fail") == 2
@@ -174,7 +175,7 @@ def test_probe_liveness_failed_after_consecutive_threshold(monkeypatch):
 def test_probe_liveness_recovery_clears_counter(monkeypatch):
     spec = ProbeSpec({"type": "tcp", "port": 1, "host": "127.0.0.1"}, failure_threshold=3)
     setattr(probe, "_liveness_spec", spec)
-    results = iter([False, True])
+    results = iter([(False, "refused"), (True, "")])
     monkeypatch.setattr(probe, "_probe_once", lambda _action, _timeout: next(results))
 
     assert probe_liveness() == AggregateState.SUBHEALTH.value
@@ -203,7 +204,7 @@ def test_run_startup_returns_on_first_pass(monkeypatch):
         period_seconds=1,
         failure_threshold=3,
     )
-    monkeypatch.setattr(probe, "_probe_once", lambda _action, _timeout: True)
+    monkeypatch.setattr(probe, "_probe_once", lambda _action, _timeout: (True, ""))
 
     run_startup(spec)
 
@@ -215,7 +216,7 @@ def test_run_startup_raises_after_threshold(monkeypatch):
         period_seconds=0,
         failure_threshold=2,
     )
-    monkeypatch.setattr(probe, "_probe_once", lambda _action, _timeout: False)
+    monkeypatch.setattr(probe, "_probe_once", lambda _action, _timeout: (False, "refused"))
     monkeypatch.setattr(probe.time, "sleep", lambda _s: None)
 
     with pytest.raises(ProbeStartupError):
@@ -228,7 +229,7 @@ def test_probe_tcp_succeeds_against_listening_socket():
     server.listen(1)
     port = server.getsockname()[1]
     try:
-        assert _probe_tcp("127.0.0.1", port, timeout=1) is True
+        assert _probe_tcp("127.0.0.1", port, timeout=1) == (True, "")
     finally:
         server.close()
 
@@ -239,7 +240,9 @@ def test_probe_tcp_fails_on_closed_port():
     port = sock.getsockname()[1]
     sock.close()
 
-    assert _probe_tcp("127.0.0.1", port, timeout=1) is False
+    passed, reason = _probe_tcp("127.0.0.1", port, timeout=1)
+    assert passed is False
+    assert "Connection refused" in reason
 
 
 def test_probe_once_dispatches_by_action_type(monkeypatch):
@@ -247,10 +250,37 @@ def test_probe_once_dispatches_by_action_type(monkeypatch):
 
     def fake_tcp(host, port, timeout):
         seen.append(("tcp", host, port, timeout))
-        return True
+        return (True, "")
 
     monkeypatch.setattr(probe, "_probe_tcp", fake_tcp)
     action = {"type": "tcp", "port": 18092, "host": "127.0.0.1"}
 
-    assert _probe_once(action, timeout=2) is True
+    assert _probe_once(action, timeout=2) == (True, "")
     assert seen == [("tcp", "127.0.0.1", 18092, 2)]
+
+
+def test_probe_liveness_logs_only_on_state_transition(monkeypatch, caplog):
+    caplog.set_level(logging.INFO)
+    spec = ProbeSpec({"type": "tcp", "port": 1, "host": "127.0.0.1"}, failure_threshold=3)
+    setattr(probe, "_liveness_spec", spec)
+    setattr(probe, "_liveness_last_state", None)
+    monkeypatch.setattr(probe, "_probe_once", lambda _action, _timeout: (True, ""))
+
+    assert probe_liveness() == AggregateState.HEALTHY.value
+    assert probe_liveness() == AggregateState.HEALTHY.value
+    assert caplog.text.count("liveness probe HEALTHY") == 1
+
+
+def test_probe_liveness_transition_back_to_healthy_is_logged(monkeypatch, caplog):
+    caplog.set_level(logging.INFO)
+    spec = ProbeSpec({"type": "tcp", "port": 1, "host": "127.0.0.1"}, failure_threshold=3)
+    setattr(probe, "_liveness_spec", spec)
+    setattr(probe, "_liveness_last_state", None)
+    results = [(False, "refused"), (True, ""), (True, "")]
+    monkeypatch.setattr(probe, "_probe_once", lambda _action, _timeout: results.pop(0))
+
+    assert probe_liveness() == AggregateState.SUBHEALTH.value
+    assert probe_liveness() == AggregateState.HEALTHY.value
+    assert probe_liveness() == AggregateState.HEALTHY.value
+    assert caplog.text.count("liveness probe HEALTHY") == 1
+    assert caplog.text.count("liveness probe SUBHEALTH") == 1

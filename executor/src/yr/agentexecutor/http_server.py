@@ -22,7 +22,10 @@ import base64
 import ipaddress
 import json
 import logging
+import os
 import threading
+import time
+from contextlib import contextmanager
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Optional
@@ -35,6 +38,8 @@ _LOG = logging.getLogger(__name__)
 DEFAULT_MAX_CONCURRENT_REQUESTS = 64
 DEFAULT_MAX_SANDBOX_REQUEST_SIZE = 512 * 1024 * 1024
 DEFAULT_MAX_SANDBOX_RESPONSE_SIZE = 512 * 1024 * 1024
+TRACE_HEADER = "X-Trace-ID"
+INSTANCE_ID_ENV = "INSTANCE_ID"
 _SANDBOX_ENDPOINTS = {
     "/v1/sandbox/execute",
     "/v1/sandbox/read_file",
@@ -192,23 +197,28 @@ class _ExecutorRequestHandler(BaseHTTPRequestHandler):
             self._write_json(HTTPStatus.OK, {"status": "ready"})
             return
         if parsed.path == "/v1/files/download":
-            self._download(parse_qs(parsed.query))
+            with self._agent_trace("download", parsed.path):
+                self._download(parse_qs(parsed.query))
             return
         if parsed.path == "/v1/files/list":
-            self._list(parse_qs(parsed.query))
+            with self._agent_trace("filelist", parsed.path):
+                self._list(parse_qs(parsed.query))
             return
         self._write_json(HTTPStatus.NOT_FOUND, {"message": "endpoint not found"})
 
     def do_POST(self) -> None:  # noqa: N802
         path = urlsplit(self.path).path
         if path == "/v1/files/upload":
-            self._upload()
+            with self._agent_trace("upload", path):
+                self._upload()
             return
         if path == "/v1/files/mkdir":
-            self._mkdir()
+            with self._agent_trace("mkdir", path):
+                self._mkdir()
             return
         if path in _SANDBOX_ENDPOINTS:
-            self._sandbox_request(path)
+            with self._agent_trace(path.rsplit("/", 1)[-1], path):
+                self._sandbox_request(path)
             return
         self._write_json(HTTPStatus.NOT_FOUND, {"message": "endpoint not found"})
 
@@ -220,6 +230,33 @@ class _ExecutorRequestHandler(BaseHTTPRequestHandler):
             self._write_json(HTTPStatus.NOT_FOUND, {"message": "endpoint not found"})
             return
         self._upload()
+
+    @contextmanager
+    def _agent_trace(self, op: str, path: str):
+        """Emit one [agent.<op>.enter]/[agent.<op>.exit] pair keyed by trace_id/instance_id."""
+        trace_id = self.headers.get(TRACE_HEADER, "")
+        instance_id = os.getenv(INSTANCE_ID_ENV, "")
+        line = f"[agent.{op}.enter] agentexecutor path={path}"
+        if trace_id:
+            line += f" trace_id={trace_id}"
+        if instance_id:
+            line += f" instance_id={instance_id}"
+        _LOG.info(line)
+        started = time.monotonic()
+        try:
+            yield
+        finally:
+            status = getattr(self, "_agent_response_status", None)
+            result = f"HTTP:{int(status)}" if status is not None else "ERR"
+            exit_line = (
+                f"[agent.{op}.exit] agentexecutor result={result} "
+                f"cost_ms={int((time.monotonic() - started) * 1000)}"
+            )
+            if trace_id:
+                exit_line += f" trace_id={trace_id}"
+            if instance_id:
+                exit_line += f" instance_id={instance_id}"
+            _LOG.info(exit_line)
 
     def _sandbox_request(self, path: str) -> None:
         if not self._client_is_loopback():
@@ -498,7 +535,8 @@ class _ExecutorRequestHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Range", f"bytes */{total_size}")
             self.send_header("Content-Length", "0")
             self.end_headers()
-            _LOG.info("rejected file range: %s", exc)
+            # Result is already reported by the [agent.download.exit] HTTP:416 line.
+            _LOG.debug("rejected file range: %s", exc)
             return
 
         status = HTTPStatus.PARTIAL_CONTENT if self.headers.get("Range") else HTTPStatus.OK
@@ -513,7 +551,7 @@ class _ExecutorRequestHandler(BaseHTTPRequestHandler):
             with source:
                 self.files.copy_range(source, self.wfile, length)
         except (BrokenPipeError, ConnectionResetError):
-            _LOG.info("file download client disconnected")
+            _LOG.debug("file download client disconnected")
 
     def _list(self, query: dict[str, list[str]]) -> None:
         path = self._query_value(query, "path")
@@ -536,6 +574,11 @@ class _ExecutorRequestHandler(BaseHTTPRequestHandler):
         values = query.get(name)
         return values[0] if values else default
 
+    def send_response(self, code, message=None):  # noqa: N802
+        """Record the response status so _agent_trace can report it on exit."""
+        self._agent_response_status = int(code)
+        super().send_response(code, message)
+
     def _write_json(
         self, status: HTTPStatus, value: dict, *, max_size: Optional[int] = None
     ) -> None:
@@ -551,7 +594,8 @@ class _ExecutorRequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def log_message(self, format_string: str, *args) -> None:
-        _LOG.info("executor http: " + format_string, *args)
+        # Access-log line duplicates the [agent.<op>.enter/exit] pair; keep at DEBUG.
+        _LOG.debug("executor http: " + format_string, *args)
 
 
 class _LengthReader:
