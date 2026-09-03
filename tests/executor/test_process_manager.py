@@ -64,9 +64,30 @@ def test_process_manager_combines_stdout_and_stderr_in_compatible_log(tmp_path):
     finally:
         manager.stop(grace_period_seconds=0.1)
 
-    output = (tmp_path / "runtime-test" / "bootstrap_cmd_0.log").read_text()
+    output = (tmp_path / "runtime-test.std").read_text()
     assert "stdout-line" in output
     assert "stderr-line" in output
+
+
+def test_process_manager_merges_all_commands_into_single_log(tmp_path):
+    manager = ProcessManager()
+    commands = [
+        [sys.executable, "-c", "print('first-command')"],
+        [sys.executable, "-c", "print('second-command')"],
+    ]
+    manager.start(commands, log_dir=str(tmp_path), runtime_id="runtime-multi")
+    try:
+        deadline = time.monotonic() + 5
+        while manager.status()[0]["running"] and time.monotonic() < deadline:
+            time.sleep(0.01)
+    finally:
+        manager.stop(grace_period_seconds=0.1)
+
+    output = (tmp_path / "runtime-multi.std").read_text()
+    assert "first-command" in output
+    assert "second-command" in output
+    # one flat file per runtime; no per-command bootstrap_cmd_* fragments, no subdirectory
+    assert [entry.name for entry in tmp_path.iterdir()] == ["runtime-multi.std"]
 
 
 def test_process_manager_sanitizes_runtime_id_in_log_path(tmp_path):
@@ -80,7 +101,7 @@ def test_process_manager_sanitizes_runtime_id_in_log_path(tmp_path):
     finally:
         manager.stop(grace_period_seconds=0.1)
 
-    assert (tmp_path / ".._runtime_id" / "bootstrap_cmd_0.log").read_text().strip() == "runtime-log"
+    assert (tmp_path / ".._runtime_id.std").read_text().strip() == "runtime-log"
 
 
 def test_process_manager_reads_runtime_id_from_env(tmp_path):
@@ -98,5 +119,5 @@ def test_process_manager_reads_runtime_id_from_env(tmp_path):
     finally:
         manager.stop(grace_period_seconds=0.1)
 
-    output = tmp_path / "runtime-from-env" / "bootstrap_cmd_0.log"
+    output = tmp_path / "runtime-from-env.std"
     assert output.read_text().strip() == "env-runtime-log"

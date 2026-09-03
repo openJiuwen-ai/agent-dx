@@ -38,12 +38,12 @@ DEFAULT_PROCESS_LOG_DIR = "/home/snuser/log/"
 MAX_BOOTSTRAP_COMMANDS = 64
 
 
-def _runtime_log_directory(log_dir: str, runtime_id: str) -> Path:
-    """Return a traversal-safe, per-runtime directory for bootstrap logs."""
+def _runtime_log_file(log_dir: str, runtime_id: str) -> Path:
+    """Return a traversal-safe, per-runtime log file path for bootstrap logs."""
     runtime_component = re.sub(r"[^A-Za-z0-9._-]", "_", runtime_id.strip())
     if runtime_component in {"", ".", ".."}:
         runtime_component = "unknown-runtime"
-    return Path(log_dir) / runtime_component
+    return Path(log_dir) / (runtime_component + ".std")
 
 
 def parse_bootstrap_commands(value: str) -> list[list[str]]:
@@ -95,22 +95,16 @@ class ProcessManager:
         with self._lock:
             if self._processes:
                 raise RuntimeError("user processes have already been started")
-            runtime_log_directory = _runtime_log_directory(log_dir, runtime_id)
-            log_directory_available = True
+            log_path = _runtime_log_file(log_dir, runtime_id)
+            log_file = None
             try:
-                runtime_log_directory.mkdir(parents=True, exist_ok=True)
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                log_file = log_path.open("ab", buffering=0)
             except OSError as exc:
-                _LOG.warning("cannot create bootstrap log directory %s: %s", runtime_log_directory, exc)
-                log_directory_available = False
-            for index, command in enumerate(commands[:MAX_BOOTSTRAP_COMMANDS]):
+                _LOG.warning("cannot open bootstrap log %s: %s", log_path, exc)
                 log_file = None
+            for command in commands[:MAX_BOOTSTRAP_COMMANDS]:
                 try:
-                    if log_directory_available:
-                        log_path = runtime_log_directory / f"bootstrap_cmd_{index}.log"
-                        try:
-                            log_file = log_path.open("ab", buffering=0)
-                        except OSError as exc:
-                            _LOG.warning("cannot open bootstrap log %s: %s", log_path, exc)
                     output = log_file if log_file is not None else subprocess.DEVNULL
                     process = subprocess.Popen(
                         list(command),
@@ -120,13 +114,13 @@ class ProcessManager:
                         start_new_session=True,
                     )
                     self._processes.append(process)
-                    if log_file is not None:
-                        self._log_files.append(log_file)
                     _LOG.info("started user process pid=%s argv=%s", process.pid, list(command))
                 except (OSError, ValueError) as exc:
                     _LOG.warning("failed to start bootstrap command %r: %s", list(command), exc)
-                    if log_file is not None:
-                        log_file.close()
+            if log_file is not None and not self._processes:
+                log_file.close()
+            elif log_file is not None:
+                self._log_files.append(log_file)
 
     def status(self) -> list[dict]:
         with self._lock:
