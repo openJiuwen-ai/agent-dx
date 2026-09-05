@@ -33,6 +33,9 @@ EXECUTOR_PORT_ENV = "YR_AGENT_EXECUTOR_PORT"
 EXECUTOR_MAX_FILE_SIZE_ENV = "YR_AGENT_EXECUTOR_MAX_FILE_SIZE"
 EXECUTOR_SHUTDOWN_GRACE_ENV = "YR_AGENT_EXECUTOR_SHUTDOWN_GRACE_SECONDS"
 PRE_STOP_TIMEOUT_ENV = "PRE_STOP_TIMEOUT"
+TRACE_ID_ENV = "YR_TRACE_ID"
+INSTANCE_ID_ENV = "INSTANCE_ID"
+RUNTIME_ID_ENV = "YR_RUNTIME_ID"
 DEFAULT_EXECUTOR_HOST = "0.0.0.0"
 DEFAULT_EXECUTOR_PORT = 18093
 DEFAULT_PRE_STOP_TIMEOUT = 10.0
@@ -72,6 +75,17 @@ class AgentExecutorRuntime:
         with self._lock:
             if self._http_server is not None:
                 return
+            trace_id = os.getenv(TRACE_ID_ENV, "")
+            instance_id = os.getenv(INSTANCE_ID_ENV, "")
+            runtime_id = os.getenv(RUNTIME_ID_ENV, "")
+            line = "[agent.start.enter] agentexecutor"
+            if trace_id:
+                line += f" trace_id={trace_id}"
+            if instance_id:
+                line += f" instance_id={instance_id}"
+            if runtime_id:
+                line += f" runtime_id={runtime_id}"
+            _LOG.info(line)
             startup, liveness = _load_probe_set()
             host = os.getenv(EXECUTOR_HOST_ENV, DEFAULT_EXECUTOR_HOST)
             port = int(os.getenv(EXECUTOR_PORT_ENV, str(DEFAULT_EXECUTOR_PORT)))

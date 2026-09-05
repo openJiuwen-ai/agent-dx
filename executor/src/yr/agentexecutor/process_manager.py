@@ -34,6 +34,8 @@ _LOG = logging.getLogger(__name__)
 BOOTSTRAP_COMMAND_ENV = "YR_RUNTIME_BOOTSTRAP_CMD"
 PROCESS_LOG_DIR_ENV = "GLOG_log_dir"
 RUNTIME_ID_ENV = "YR_RUNTIME_ID"
+TRACE_ID_ENV = "YR_TRACE_ID"
+INSTANCE_ID_ENV = "INSTANCE_ID"
 DEFAULT_PROCESS_LOG_DIR = "/home/snuser/log/"
 MAX_BOOTSTRAP_COMMANDS = 64
 
@@ -82,12 +84,16 @@ class ProcessManager:
         self._processes: list[subprocess.Popen] = []
         self._log_files = []
         self._lock = threading.Lock()
+        self._trace_id = ""
+        self._instance_id = ""
 
     def start_from_env(self, environ: Optional[Mapping[str, str]] = None) -> None:
         active_env = os.environ if environ is None else environ
         commands = parse_bootstrap_commands(active_env.get(BOOTSTRAP_COMMAND_ENV, ""))
         log_dir = active_env.get(PROCESS_LOG_DIR_ENV, DEFAULT_PROCESS_LOG_DIR)
         runtime_id = active_env.get(RUNTIME_ID_ENV, "")
+        self._trace_id = active_env.get(TRACE_ID_ENV, "")
+        self._instance_id = active_env.get(INSTANCE_ID_ENV, "")
         self.start(commands, log_dir=log_dir, runtime_id=runtime_id)
 
     def start(self, commands: Sequence[Sequence[str]], *, log_dir: str, runtime_id: str = "") -> None:
@@ -114,7 +120,14 @@ class ProcessManager:
                         start_new_session=True,
                     )
                     self._processes.append(process)
-                    _LOG.info("started user process pid=%s argv=%s", process.pid, list(command))
+                    _LOG.info(
+                        "started user process pid=%s bootstrap_index=%d argv=%s%s%s",
+                        process.pid,
+                        len(self._processes) - 1,
+                        list(command),
+                        f" trace_id={self._trace_id}" if self._trace_id else "",
+                        f" instance_id={self._instance_id}" if self._instance_id else "",
+                    )
                 except (OSError, ValueError) as exc:
                     _LOG.warning("failed to start bootstrap command %r: %s", list(command), exc)
             if log_file is not None and not self._processes:

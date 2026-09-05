@@ -4,9 +4,11 @@
 import base64
 import io
 import json
+import logging
 import os
 import stat
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -396,3 +398,77 @@ def test_server_owns_default_sandbox_lifecycle(monkeypatch):
     server.stop()
 
     sandbox.cleanup.assert_called_once_with()
+
+
+def test_sandbox_request_logs_agent_trace_pairs(tmp_path, caplog):
+    caplog.set_level(logging.INFO)
+    target = tmp_path / "message.txt"
+    server = ExecutorHTTPServer("127.0.0.1", 0)
+    server.start()
+    try:
+        host, port = server.address
+        request = urllib.request.Request(
+            f"http://{host}:{port}/v1/sandbox/write_file",
+            data=json.dumps({
+                "path": str(target),
+                "mode": "w",
+                "content": "traced",
+                "content_encoding": "text",
+            }).encode("utf-8"),
+            headers={"Content-Type": "application/json", "X-Trace-ID": "t-002"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request) as response:
+            assert response.status == 200
+        assert "[agent.write_file.enter] agentexecutor" in caplog.text
+        assert "trace_id=t-002" in caplog.text
+        # The exit line is logged by the server thread after the response is
+        # fully sent, so poll briefly instead of asserting immediately.
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and (
+            "[agent.write_file.exit] agentexecutor result=HTTP:200" not in caplog.text
+        ):
+            time.sleep(0.05)
+        assert "[agent.write_file.exit] agentexecutor result=HTTP:200" in caplog.text
+    finally:
+        server.stop()
+
+
+def test_healthz_emits_no_agent_trace(caplog):
+    caplog.set_level(logging.INFO)
+    server = ExecutorHTTPServer("127.0.0.1", 0)
+    server.start()
+    try:
+        host, port = server.address
+        with urllib.request.urlopen(f"http://{host}:{port}/healthz") as response:
+            assert response.status == 200
+        assert "agent." not in caplog.text
+    finally:
+        server.stop()
+
+
+def test_file_download_logs_agent_trace(tmp_path, caplog):
+    caplog.set_level(logging.INFO)
+    target = tmp_path / "file.txt"
+    target.write_bytes(b"hello")
+    server = ExecutorHTTPServer("127.0.0.1", 0)
+    server.start()
+    try:
+        host, port = server.address
+        request = urllib.request.Request(
+            f"http://{host}:{port}/v1/files/download?path={target}",
+            headers={"X-Trace-ID": "t-003"},
+        )
+        with urllib.request.urlopen(request) as response:
+            assert response.status == 200
+        assert "[agent.download.enter] agentexecutor" in caplog.text
+        # The exit line is logged by the server thread after the response is
+        # fully sent, so poll briefly instead of asserting immediately.
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and (
+            "[agent.download.exit] agentexecutor result=HTTP:200" not in caplog.text
+        ):
+            time.sleep(0.05)
+        assert "[agent.download.exit] agentexecutor result=HTTP:200" in caplog.text
+    finally:
+        server.stop()
