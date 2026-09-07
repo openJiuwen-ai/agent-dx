@@ -2,6 +2,7 @@
 # coding=UTF-8
 
 import json
+import logging
 import sys
 import time
 
@@ -121,3 +122,34 @@ def test_process_manager_reads_runtime_id_from_env(tmp_path):
 
     output = tmp_path / "runtime-from-env.std"
     assert output.read_text().strip() == "env-runtime-log"
+
+
+def test_process_manager_logs_trace_and_instance_ids(tmp_path, caplog):
+    caplog.set_level(logging.INFO)
+    manager = ProcessManager()
+    environ = {
+        "YR_RUNTIME_BOOTSTRAP_CMD": json.dumps([[sys.executable, "-c", "print('traced')"]]),
+        "GLOG_log_dir": str(tmp_path),
+        "YR_RUNTIME_ID": "rt-1",
+        "YR_TRACE_ID": "t-001",
+        "INSTANCE_ID": "default-alice+coder",
+    }
+    manager.start_from_env(environ)
+    try:
+        assert "trace_id=t-001" in caplog.text
+        assert "instance_id=default-alice+coder" in caplog.text
+        assert "bootstrap_index=0" in caplog.text
+    finally:
+        manager.stop(grace_period_seconds=0.1)
+
+
+def test_process_manager_omits_missing_trace_fields(tmp_path, caplog):
+    caplog.set_level(logging.INFO)
+    manager = ProcessManager()
+    manager.start([[sys.executable, "-c", "print('plain')"]], log_dir=str(tmp_path))
+    try:
+        assert "bootstrap_index=0" in caplog.text
+        assert "trace_id=" not in caplog.text
+        assert "instance_id=" not in caplog.text
+    finally:
+        manager.stop(grace_period_seconds=0.1)

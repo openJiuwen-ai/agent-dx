@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # coding=UTF-8
 
+import logging
 import threading
 from types import SimpleNamespace
 
@@ -131,3 +132,41 @@ def test_start_raises_on_startup_failure_without_deadlock(monkeypatch):
     # cleanup ran before re-raising: http server + user processes both stopped.
     assert "server_stop" in events
     assert any(isinstance(e, str) and e == "process_stop" for e in events)
+
+
+def test_start_logs_agent_trace_startup_line(monkeypatch, caplog):
+    caplog.set_level(logging.INFO)
+    monkeypatch.setenv("YR_TRACE_ID", "t-004")
+    monkeypatch.setenv("INSTANCE_ID", "default-alice+coder")
+    monkeypatch.setenv("YR_RUNTIME_ID", "rt-9")
+
+    class ServerStub:
+        def __init__(self, *_args, **_kwargs):
+            self._thread = threading.Thread(target=lambda: None)
+
+        @property
+        def address(self):
+            return ("127.0.0.1", 1)
+
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+    monkeypatch.setattr(
+        "yr.agentexecutor.runtime.ExecutorHTTPServer",
+        lambda host, port, max_file_size=0: ServerStub(),
+    )
+    monkeypatch.setattr(
+        "yr.agentexecutor.runtime.ProcessManager.start_from_env", lambda self, environ=None: None
+    )
+    runtime = AgentExecutorRuntime()
+    runtime.start()
+    try:
+        assert "[agent.start.enter] agentexecutor" in caplog.text
+        assert "trace_id=t-004" in caplog.text
+        assert "instance_id=default-alice+coder" in caplog.text
+        assert "runtime_id=rt-9" in caplog.text
+    finally:
+        runtime.stop()

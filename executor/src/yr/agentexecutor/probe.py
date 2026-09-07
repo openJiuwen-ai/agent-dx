@@ -145,7 +145,8 @@ def _extract_action(raw: Mapping[str, Any], sandbox_ip: Optional[str] = None) ->
     return actions[0]
 
 
-def _probe_once(action: dict, timeout: int) -> bool:
+def _probe_once(action: dict, timeout: int) -> tuple[bool, str]:
+    """Run one probe attempt; returns (passed, fail_reason). fail_reason is "" on pass."""
     kind = action["type"]
     if kind == "tcp":
         return _probe_tcp(action["host"], action["port"], timeout)
@@ -153,19 +154,19 @@ def _probe_once(action: dict, timeout: int) -> bool:
         return _probe_http(action, timeout)
     if kind == "exec":
         return _probe_exec(action["command"], timeout)
-    return False
+    return False, f"unknown probe action type: {kind!r}"
 
 
-def _probe_tcp(host: str, port: int, timeout: int) -> bool:
+def _probe_tcp(host: str, port: int, timeout: int) -> tuple[bool, str]:
     try:
         with socket.create_connection((host, port), timeout=timeout):
-            return True
+            return True, ""
     except OSError as exc:
         _LOG.debug("tcp probe %s:%s failed: %s (errno=%s)", host, port, exc, getattr(exc, "errno", "?"))
-        return False
+        return False, f"tcp connect {host}:{port} failed: {exc} (errno={getattr(exc, 'errno', '?')})"
 
 
-def _probe_http(action: dict, timeout: int) -> bool:
+def _probe_http(action: dict, timeout: int) -> tuple[bool, str]:
     scheme = action["scheme"]
     netloc = action["host"]
     default_port = 443 if scheme == "https" else 80
@@ -177,15 +178,15 @@ def _probe_http(action: dict, timeout: int) -> bool:
         with urllib.request.urlopen(request, timeout=timeout) as resp:
             code = resp.getcode()
             if 200 <= code < 300:
-                return True
+                return True, ""
             _LOG.debug("http probe %s failed: status=%s", url, code)
-            return False
+            return False, f"http GET {url} returned status={code}"
     except (URLError, OSError, ValueError) as exc:
         _LOG.debug("http probe %s failed: %s", url, exc)
-        return False
+        return False, f"http GET {url} failed: {exc}"
 
 
-def _probe_exec(command: list[str], timeout: int) -> bool:
+def _probe_exec(command: list[str], timeout: int) -> tuple[bool, str]:
     try:
         result = subprocess.run(  # noqa: S603
             command,
@@ -195,11 +196,11 @@ def _probe_exec(command: list[str], timeout: int) -> bool:
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         _LOG.debug("exec probe %s failed: %s", command, exc)
-        return False
+        return False, f"exec probe {command} failed: {exc}"
     if result.returncode == 0:
-        return True
+        return True, ""
     _LOG.debug("exec probe %s failed: exit=%s", command, result.returncode)
-    return False
+    return False, f"exec probe {command} exited with code {result.returncode}"
 
 
 def _load_probe_set(
@@ -252,14 +253,29 @@ def _describe_spec(spec: Optional[ProbeSpec]) -> str:
 
 _liveness_spec: Optional[ProbeSpec] = None
 _liveness_fail = 0
+_liveness_last_state: Optional[str] = None
 _liveness_lock = threading.Lock()
 
 
+def _log_liveness_state(state: AggregateState, detail: str) -> None:
+    """Log a state at INFO/WARNING only on transitions; steady-state repeats go to DEBUG."""
+    global _liveness_last_state
+    if state.value == _liveness_last_state:
+        _LOG.debug("liveness probe %s (%s)", state.value, detail)
+        return
+    _liveness_last_state = state.value
+    if state == AggregateState.FAILED:
+        _LOG.warning("liveness probe %s (%s)", state.value, detail)
+    else:
+        _LOG.info("liveness probe %s (%s)", state.value, detail)
+
+
 def _configure_liveness(spec: Optional[ProbeSpec]) -> None:
-    global _liveness_spec, _liveness_fail
+    global _liveness_spec, _liveness_fail, _liveness_last_state
     with _liveness_lock:
         _liveness_spec = spec
         _liveness_fail = 0
+        _liveness_last_state = None
     if spec is None:
         _LOG.info("liveness probe disabled (no spec configured)")
     else:
@@ -276,42 +292,38 @@ def probe_liveness() -> str:
     with _liveness_lock:
         spec = _liveness_spec
         if spec is None:
-            _LOG.info("liveness probe invoked but no spec configured -> DISABLED")
+            _LOG.debug("liveness probe invoked but no spec configured -> DISABLED")
             return AggregateState.DISABLED.value
         try:
-            passed = _probe_once(spec.action, spec.timeout_seconds)
+            passed, reason = _probe_once(spec.action, spec.timeout_seconds)
         except Exception as exc:  # noqa: BLE001
             _LOG.warning("liveness probe raised: %s", exc)
             _liveness_fail += 1
             if _liveness_fail >= spec.failure_threshold:
-                _LOG.warning(
-                    "liveness probe FAILED (consecutive_fail=%s/%s, reason=exception)",
-                    _liveness_fail,
-                    spec.failure_threshold,
+                _log_liveness_state(
+                    AggregateState.FAILED,
+                    f"consecutive_fail={_liveness_fail}/{spec.failure_threshold}, reason=exception: {exc}",
                 )
                 return AggregateState.FAILED.value
-            _LOG.info(
-                "liveness probe SUBHEALTH (consecutive_fail=%s/%s, reason=exception)",
-                _liveness_fail,
-                spec.failure_threshold,
+            _log_liveness_state(
+                AggregateState.SUBHEALTH,
+                f"consecutive_fail={_liveness_fail}/{spec.failure_threshold}, reason=exception: {exc}",
             )
             return AggregateState.SUBHEALTH.value
         if passed:
             _liveness_fail = 0
-            _LOG.info("liveness probe HEALTHY (consecutive_fail=0/%s)", spec.failure_threshold)
+            _log_liveness_state(AggregateState.HEALTHY, f"consecutive_fail=0/{spec.failure_threshold}")
             return AggregateState.HEALTHY.value
         _liveness_fail += 1
         if _liveness_fail >= spec.failure_threshold:
-            _LOG.warning(
-                "liveness probe FAILED (consecutive_fail=%s/%s, reason=action failed)",
-                _liveness_fail,
-                spec.failure_threshold,
+            _log_liveness_state(
+                AggregateState.FAILED,
+                f"consecutive_fail={_liveness_fail}/{spec.failure_threshold}, reason={reason}",
             )
             return AggregateState.FAILED.value
-        _LOG.info(
-            "liveness probe SUBHEALTH (consecutive_fail=%s/%s, reason=action failed)",
-            _liveness_fail,
-            spec.failure_threshold,
+        _log_liveness_state(
+            AggregateState.SUBHEALTH,
+            f"consecutive_fail={_liveness_fail}/{spec.failure_threshold}, reason={reason}",
         )
         return AggregateState.SUBHEALTH.value
 
@@ -331,25 +343,31 @@ def run_startup(startup: ProbeSpec) -> None:
         time.sleep(startup.initial_delay_seconds)
     fail = 0
     while True:
-        passed = _probe_once(startup.action, startup.timeout_seconds)
+        passed, reason = _probe_once(startup.action, startup.timeout_seconds)
         if passed:
             _LOG.info("startup probe PASS after %s failed attempt(s)", fail)
             return
         fail += 1
-        _LOG.info(
-            "startup probe FAIL (attempt=%s, consecutive_fail=%s/%s)",
+        # Per-attempt retries repeat at the probe period while the target boots;
+        # only the final failure is user-visible, intermediate ones go to DEBUG.
+        _LOG.debug(
+            "startup probe FAIL (attempt=%s, consecutive_fail=%s/%s): %s",
             fail,
             fail,
             startup.failure_threshold,
+            reason,
         )
         if fail >= startup.failure_threshold:
             _LOG.warning(
-                "startup probe FAILED after %s consecutive failures (threshold=%s)",
+                "startup probe FAILED after %s consecutive failures (threshold=%s), "
+                "last attempt against %s: %s",
                 fail,
                 startup.failure_threshold,
+                startup.action,
+                reason,
             )
             raise ProbeStartupError(
-                f"startup probe failed {fail} consecutive times (threshold={startup.failure_threshold})"
+                f"startup probe failed {fail} consecutive times (threshold={startup.failure_threshold}): {reason}"
             )
         time.sleep(startup.period_seconds)
 
