@@ -155,6 +155,186 @@ def _delete(server, path):
         return response.status, json.load(response)
 
 
+def _request_method(server, path, method, data=None):
+    """Send a request with an arbitrary method and return raw status/body/headers."""
+    host, port = server.address
+    request = urllib.request.Request(
+        f"http://{host}:{port}{path}", data=data, method=method
+    )
+    try:
+        with urllib.request.urlopen(request) as response:
+            return response.status, response.read(), dict(response.headers)
+    except urllib.error.HTTPError as caught:
+        return caught.code, caught.read(), dict(caught.headers)
+
+
+def test_patch_sandbox_url_returns_405_json(tmp_path):
+    server = _server()
+    server.start()
+    try:
+        status, body, headers = _request_method(
+            server,
+            "/v1/sandbox/sandboxes/local/files/write?path=/tmp/t1.txt&mode=w",
+            "PATCH",
+            data=b"hello files",
+        )
+        assert status == 405
+        payload = json.loads(body)
+        assert "not allowed for sandbox resource" in payload["message"]
+        # Allow is per-resource: files/write only registers PUT.
+        assert headers["Allow"] == "PUT"
+        assert headers["Content-Type"] == "application/json"
+    finally:
+        server.stop()
+
+
+def test_head_sandbox_url_returns_405_json_without_body():
+    server = _server()
+    server.start()
+    try:
+        status, body, headers = _request_method(
+            server, "/v1/sandbox/sandboxes/local/files/read?path=/tmp/t1.txt", "HEAD"
+        )
+        assert status == 405
+        # urllib suppresses the body of a HEAD response, so the RFC-required
+        # message can only be verified through the advertised Content-Length:
+        # it must describe a non-empty JSON body that HEAD itself does not send.
+        # Allow is per-resource: the files/read URL only registers GET.
+        assert headers["Allow"] == "GET"
+        assert headers["Content-Type"] == "application/json"
+        assert int(headers["Content-Length"]) > 0
+        assert body == b""
+    finally:
+        server.stop()
+
+
+def test_patch_create_url_returns_405():
+    server = _server()
+    server.start()
+    try:
+        status, body, headers = _request_method(
+            server, "/v1/sandbox/sandboxes", "PATCH", data=b'{"sandbox_type":"x"}'
+        )
+        assert status == 405
+        assert "not allowed for sandbox resource" in json.loads(body)["message"]
+        # Allow is per-resource: the bare create URL only registers POST.
+        assert headers["Allow"] == "POST"
+    finally:
+        server.stop()
+
+
+def test_wrong_action_on_registered_shape_returns_404_not_405():
+    """URL shape itself is unregistered (bogus action) → 404, not 405."""
+    server = _server()
+    server.start()
+    try:
+        status, body, _ = _request_method(
+            server, "/v1/sandbox/sandboxes/local/files/bogus?path=/tmp/x", "PATCH"
+        )
+        assert status == 404
+        assert "not found" in json.loads(body)["message"]
+    finally:
+        server.stop()
+
+
+def test_bogus_subresource_returns_404_not_405():
+    server = _server()
+    server.start()
+    try:
+        status, body, _ = _request_method(
+            server, "/v1/sandbox/sandboxes/local/bogus/xyz", "PATCH"
+        )
+        assert status == 404
+        assert "not found" in json.loads(body)["message"]
+    finally:
+        server.stop()
+
+
+def test_unregistered_method_on_unknown_instance_returns_404():
+    """Instance existence beats method registration: unknown id → 404, not 405."""
+    server = _server()
+    server.start()
+    try:
+        status, body, _ = _request_method(
+            server,
+            "/v1/sandbox/sandboxes/00000000-0000-0000-0000-000000000000/files/write?path=/tmp/x",
+            "PATCH",
+            data=b"x",
+        )
+        assert status == 404
+        assert "sandbox 00000000" in json.loads(body)["message"]
+    finally:
+        server.stop()
+
+
+def test_unregistered_method_on_live_instance_returns_405():
+    server = _server()
+    server.start()
+    try:
+        status, body, headers = _request_method(
+            server,
+            "/v1/sandbox/sandboxes/local/files/bogus?path=/tmp/x",
+            "GET",
+        )
+        # GET is a registered method but this URL shape does not exist → 404;
+        # contrast with a live sandbox + registered shape + wrong method → 405.
+        assert status == 404
+
+        status, body, headers = _request_method(
+            server, "/v1/sandbox/sandboxes/local/files/read?path=/tmp/x", "PATCH"
+        )
+        assert status == 405
+        assert "method PATCH not allowed" in json.loads(body)["message"]
+        assert headers["Allow"] == "GET"
+    finally:
+        server.stop()
+
+
+def test_patch_non_sandbox_path_returns_404_json():
+    server = _server()
+    server.start()
+    try:
+        status, body, headers = _request_method(server, "/healthz", "PATCH")
+        assert status == 404
+        assert json.loads(body) == {"message": "endpoint not found"}
+        assert headers["Content-Type"] == "application/json"
+        assert headers.get("Allow") is None
+    finally:
+        server.stop()
+
+
+def test_registered_methods_unaffected(tmp_path):
+    server = _server()
+    server.start()
+    target = tmp_path / "regression.txt"
+    try:
+        status, result = _put_raw(
+            server,
+            f"/v1/sandbox/sandboxes/local/files/write?path={urllib.parse.quote(str(target))}&mode=w",
+            b"regression",
+        )
+        assert status == 200
+        assert result["success"] is True
+        status, body = _get_json(server, "/healthz")
+        assert (status, body) == (200, {"status": "ready"})
+        status, executed = _post_json(
+            server,
+            "/v1/sandbox/sandboxes/local/execute",
+            {"command": [sys.executable, "-c", "pass"]},
+        )
+        assert status == 200
+        assert executed["returncode"] == 0
+        # No DELETE here: the _LocalSandbox stub has no terminate(), and the
+        # manager re-raises that as 500 — delete is covered by manager tests.
+        status, body = _get_json(
+            server,
+            f"/v1/sandbox/sandboxes/local/files/read?path={urllib.parse.quote(str(target))}&mode=r",
+        )
+        assert (status, body["content"]) == (200, "regression")
+    finally:
+        server.stop()
+
+
 def test_chunked_reader_decodes_forwarded_request_body():
     source = io.BytesIO(b"4\r\ntest\r\n3\r\n123\r\n0\r\nX-Test: done\r\n\r\n")
     reader = _ChunkedReader(source)
