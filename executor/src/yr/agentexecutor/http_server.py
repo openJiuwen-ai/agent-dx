@@ -52,6 +52,68 @@ class SandboxResponseTooLargeError(ValueError):
     """Raised when a Sandbox API JSON response exceeds its configured limit."""
 
 
+class SandboxMethodNotAllowedError(ValueError):
+    """Method+URL combination has no registered sandbox route (HTTP 405).
+
+    Inherits ValueError so an unmapped except chain degrades to 400, not 500.
+    """
+
+    def __init__(self, method: str, path: str):
+        super().__init__(f"method {method} not allowed for sandbox resource")
+        self.method = method
+        self.path = path
+
+
+# Sandbox 路由表:(method, path 形状, route key)。"bare" 指裸 create URL,
+# "{id}" 为实例段占位。dispatch 的分支匹配与 405 响应的 Allow 头都由这张表
+# 驱动——新增请求方式时在表里加一行 + dispatch 加对应 route 分支即可,
+# Allow 头自动跟随,不存在第二处方法枚举。
+_SANDBOX_ROUTES: tuple[tuple[str, str, str], ...] = (
+    ("POST", "bare", "create"),
+    ("DELETE", "{id}", "delete"),
+    ("POST", "{id}/execute", "execute"),
+    ("GET", "{id}/files/read", "files_read"),
+    ("PUT", "{id}/files/write", "files_write"),
+    ("GET", "{id}/files/list", "files_list"),
+    ("GET", "{id}/files/search", "files_search"),
+)
+
+
+def _shape_matches(shape: str, path: str) -> bool:
+    """Whether ``path`` matches a route shape ("bare", "{id}", "{id}/execute", ...)."""
+    if shape == "bare":
+        return path == _SANDBOX_PREFIX
+    parts = path[len(_SANDBOX_PREFIX) + 1:].split("/", 2)
+    if not parts or not parts[0]:
+        return False
+    sub = parts[1] if len(parts) > 1 else ""
+    action = parts[2] if len(parts) > 2 else ""
+    segments = shape.split("/")[1:]  # 去掉 "{id}"
+    segments += [""] * (2 - len(segments))
+    return sub == segments[0] and action == segments[1]
+
+
+def _match_sandbox_route(method: str, path: str) -> Optional[str]:
+    """Pure method+path lookup in _SANDBOX_ROUTES; None = combination unregistered.
+
+    Callers still resolve instance existence before treating None as 405,
+    so unknown-id requests keep returning 404 (404 优先于 405).
+    """
+    for route_method, shape, key in _SANDBOX_ROUTES:
+        if route_method == method and _shape_matches(shape, path):
+            return key
+    return None
+
+
+def _allowed_sandbox_methods(path: str) -> str:
+    """Allow-header value for a sandbox path: the methods registered on it."""
+    return ", ".join(sorted(
+        route_method
+        for route_method, shape, _ in _SANDBOX_ROUTES
+        if _shape_matches(shape, path)
+    ))
+
+
 class _ExecutorThreadingHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     block_on_close = False
@@ -197,7 +259,7 @@ class _ExecutorRequestHandler(BaseHTTPRequestHandler):
             with self._agent_trace("filelist", parsed.path):
                 self._list(parse_qs(parsed.query))
             return
-        if path.startswith(f"{_SANDBOX_PREFIX}/"):
+        if path == _SANDBOX_PREFIX or path.startswith(f"{_SANDBOX_PREFIX}/"):
             self._sandbox_request("GET", path, parse_qs(parsed.query))
             return
         self._write_json(HTTPStatus.NOT_FOUND, {"message": "endpoint not found"})
@@ -280,6 +342,12 @@ class _ExecutorRequestHandler(BaseHTTPRequestHandler):
             self._write_json(HTTPStatus.NOT_FOUND, {"message": str(exc)})
         except NotADirectoryError as exc:
             self._write_json(HTTPStatus.BAD_REQUEST, {"message": str(exc)})
+        except SandboxMethodNotAllowedError as exc:
+            self._write_json(
+                HTTPStatus.METHOD_NOT_ALLOWED,
+                {"message": str(exc)},
+                extra_headers={"Allow": _allowed_sandbox_methods(exc.path)},
+            )
         except (ValueError, TypeError) as exc:
             self._write_json(HTTPStatus.BAD_REQUEST, {"message": str(exc)})
         except RuntimeError as exc:
@@ -292,10 +360,40 @@ class _ExecutorRequestHandler(BaseHTTPRequestHandler):
             _LOG.exception("unexpected sandbox operation failure")
             self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"message": str(exc)})
 
+    def _sandbox_route_error(self, method: str, path: str) -> Exception:
+        """Map an unmatched method+path to 404 or 405 by what actually exists.
+
+        判定顺序:实例存在性(404) → URL 形状(404) → 方法注册(405)。
+        - bare URL 无 id 段,无实例可查,形状即一切:method 未注册 → 405;
+        - 形状本身不在路由表(url 拼错/资源不存在) → 404;
+        - 形状已注册但该 method 没注册,且实例存在 → 405;实例不存在 → 404。
+        """
+        if path == _SANDBOX_PREFIX:
+            return SandboxMethodNotAllowedError(method, path)
+        rest = path[len(_SANDBOX_PREFIX) + 1:]
+        parts = rest.split("/", 2)
+        if not parts or not parts[0]:
+            return SandboxMethodNotAllowedError(method, path)
+        shape_registered = any(
+            _shape_matches(shape, path) for _, shape, _ in _SANDBOX_ROUTES
+        )
+        if not shape_registered:
+            return FileNotFoundError(f"sandbox resource {path} not found")
+        instance_id = parts[0]
+        if self.sandbox_manager.get(instance_id) is None:
+            return FileNotFoundError(f"sandbox {instance_id} not found")
+        return SandboxMethodNotAllowedError(method, path)
+
     def _dispatch_sandbox(
         self, method: str, path: str, query: dict[str, list[str]], payload: dict[str, Any]
     ) -> dict[str, Any]:
-        if method == "POST" and path == _SANDBOX_PREFIX:
+        # 先按路由表做纯 method+path 匹配;组合未注册时区分 404(资源/形状不存在)
+        # 与 405(资源存在但方法未注册),后续分支只认 route key。
+        route = _match_sandbox_route(method, path)
+        if route is None:
+            raise self._sandbox_route_error(method, path)
+
+        if route == "create":
             options = self._build_sandbox_options(payload)
             try:
                 instance_id = self.sandbox_manager.create(options)
@@ -309,13 +407,11 @@ class _ExecutorRequestHandler(BaseHTTPRequestHandler):
 
         rest = path[len(_SANDBOX_PREFIX) + 1:]  # 去掉 "sandboxes/"
         parts = rest.split("/", 2)
-        if not parts or not parts[0]:
-            raise ValueError("instance_id is required in path")
         instance_id = parts[0]
         sub = parts[1] if len(parts) > 1 else ""
         action = parts[2] if len(parts) > 2 else ""
 
-        if method == "DELETE" and sub == "":
+        if route == "delete":
             success = self.sandbox_manager.delete(instance_id)
             if not success:
                 return {"success": False, "message": "sandbox not found"}
@@ -325,7 +421,7 @@ class _ExecutorRequestHandler(BaseHTTPRequestHandler):
         if sandbox is None:
             raise FileNotFoundError(f"sandbox {instance_id} not found")
 
-        if method == "POST" and sub == "execute" and action == "":
+        if route == "execute":
             if "command" not in payload:
                 raise ValueError("command is required")
             working_dir = payload.get("working_dir")
@@ -354,7 +450,7 @@ class _ExecutorRequestHandler(BaseHTTPRequestHandler):
             except Exception as exc:
                 raise RuntimeError(f"execute failed: {exc}") from exc
 
-        if method == "GET" and sub == "files" and action == "read":
+        if route == "files_read":
             file_path = self._query_value(query, "path")
             if not file_path:
                 raise ValueError("path is required")
@@ -381,7 +477,7 @@ class _ExecutorRequestHandler(BaseHTTPRequestHandler):
                 "content_encoding": "text",
             }
 
-        if method == "PUT" and sub == "files" and action == "write":
+        if route == "files_write":
             file_path = self._query_value(query, "path")
             if not file_path:
                 raise ValueError("path is required")
@@ -405,7 +501,7 @@ class _ExecutorRequestHandler(BaseHTTPRequestHandler):
                 raise RuntimeError(f"write file failed: {exc}") from exc
             return {"success": True, "path": file_path}
 
-        if method == "GET" and sub == "files" and action == "list":
+        if route == "files_list":
             file_path = self._query_value(query, "path")
             if not file_path:
                 raise ValueError("path is required")
@@ -434,7 +530,7 @@ class _ExecutorRequestHandler(BaseHTTPRequestHandler):
             except Exception as exc:
                 raise RuntimeError(f"list files failed: {exc}") from exc
 
-        if method == "GET" and sub == "files" and action == "search":
+        if route == "files_search":
             file_path = self._query_value(query, "path")
             if not file_path:
                 raise ValueError("path is required")
@@ -454,7 +550,8 @@ class _ExecutorRequestHandler(BaseHTTPRequestHandler):
             except Exception as exc:
                 raise RuntimeError(f"search files failed: {exc}") from exc
 
-        raise ValueError("unsupported sandbox operation")
+        # route 匹配保证了此处不可达;保留 raise 以满足类型检查与防御。
+        raise SandboxMethodNotAllowedError(method, path)
 
     def _read_json_body(self) -> dict[str, Any]:
         content_type = self.headers.get("Content-Type", "").partition(";")[0].strip().lower()
@@ -720,7 +817,9 @@ class _ExecutorRequestHandler(BaseHTTPRequestHandler):
         super().send_response(code, message)
 
     def _write_json(
-        self, status: HTTPStatus, value: dict, *, max_size: Optional[int] = None
+        self, status: HTTPStatus, value: dict, *,
+        max_size: Optional[int] = None,
+        extra_headers: Optional[dict[str, str]] = None,
     ) -> None:
         data = json.dumps(value, separators=(",", ":")).encode("utf-8")
         if max_size is not None and len(data) > max_size:
@@ -730,17 +829,37 @@ class _ExecutorRequestHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
+        for key, val in (extra_headers or {}).items():
+            self.send_header(key, val)
         self.end_headers()
-        self.wfile.write(data)
+        if self.command != "HEAD":
+            # RFC 9110 9.3.2: HEAD responses carry headers only.
+            self.wfile.write(data)
 
     def log_message(self, format_string: str, *args) -> None:
         # Access-log line duplicates the [agent.<op>.enter/exit] pair; keep at DEBUG.
         _LOG.debug("executor http: " + format_string, *args)
 
+    def _route_or_404(self) -> None:
+        """Unified entry for methods without a dedicated do_* handler
+        (PATCH/HEAD/OPTIONS/TRACE/CONNECT). Not a method whitelist: route by
+        sandbox path first and let the dispatch tail decide; new methods only
+        add a branch in _dispatch_sandbox, this layer stays untouched."""
+        parsed = urlsplit(self.path)
+        path = parsed.path
+        if path == _SANDBOX_PREFIX or path.startswith(f"{_SANDBOX_PREFIX}/"):
+            # This method never consumes a request body; drop keep-alive so a
+            # pipelined next request cannot read the previous body's leftovers.
+            self.close_connection = True
+            self._sandbox_request(self.command, path, parse_qs(parsed.query))
+            return
+        self._write_json(HTTPStatus.NOT_FOUND, {"message": "endpoint not found"})
+
     do_GET = _handle_get
     do_POST = _handle_post
     do_PUT = _handle_put
     do_DELETE = _handle_delete
+    do_PATCH = do_HEAD = do_OPTIONS = do_TRACE = do_CONNECT = _route_or_404
 
 
 class _LengthReader:
