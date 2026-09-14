@@ -178,6 +178,15 @@ class ProcessManager:
 
     @staticmethod
     def _signal_process_group(process: subprocess.Popen, sig: signal.Signals) -> None:
+        # Probe with signal 0 first: the process may have exited between the
+        # poll() filter and this call, and signaling a dead pid could hit a
+        # reused pid belonging to an unrelated process.
+        try:
+            os.killpg(process.pid, 0)
+        except ProcessLookupError:
+            return
+        except OSError:
+            pass  # probe failed for another reason; still attempt the real signal
         try:
             os.killpg(process.pid, sig)
         except ProcessLookupError:
