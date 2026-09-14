@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "adx-sandbox"
+dynamic = ["version"]
+description = "Python SDK for Agent DX sandboxes with RRT HTTP and reverse-tunnel transport"
+requires-python = ">=3.10"
+dependencies = [
+    "httpx>=0.24",
+    "idna>=3,<4",
+    "websockets>=13.0",
+]
+
+[project.scripts]
+adx-sandbox = "adx_sandbox.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["adx_sandbox*"]
+
+[tool.setuptools.package-data]
+adx_sandbox = ["py.typed"]

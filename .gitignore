@@ -30,3 +30,16 @@ env/
 .vscode/
 *.swp
 .DS_Store
+
+# Monorepo build products
+/target/
+/out/
+.venv/
+**/__pycache__/
+**/*.egg-info/
+**/dist/
+/platform/control-plane/sandbox-api/internal/gen/
+
+# Source scripts under build/ are tracked.
+!/build/
+!/build/**

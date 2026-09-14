@@ -1,0 +1,13 @@
+Frontend source pin: ea1de40c96ca9a979c800f4c969c8295dbd01afa
+Current selection after minimal-dependency reduction:
+
+pkg/frontend/api/sandbox/handler.go -> internal/sandbox/handler.go (adapted)
+pkg/frontend/api/sandbox/reusable_snapshot.go -> internal/sandbox/reusable_snapshot.go (adapted)
+pkg/frontend/api/sandbox/*_test.go -> internal/sandbox/*_test.go (backend fixtures adapted)
+pkg/frontend/sandboxrouter/execendpoint/endpoint.go -> internal/instancecache/summary.go (summary-only subset)
+pkg/frontend/api/api.go Agent route table -> agent_routes.go (9 routes, injected handler)
+
+Small response/header/affinity/resource/encoding definitions are local to the HTTP adapter.
+Generated protobuf inputs remain in platform/api/proto/legacy/frontend.
+The original package-level dependency closure is no longer imported.
+The original Go Agent business handler is not part of this selection.

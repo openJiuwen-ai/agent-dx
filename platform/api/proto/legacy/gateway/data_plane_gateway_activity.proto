@@ -1,0 +1,45 @@
+syntax = "proto3";
+
+package data_plane_gateway_activity;
+
+// Reports one complete snapshot for a gateway process. Omitted instances are
+// zero for that gateway epoch, so retries are idempotent and one RPC covers
+// all active workload instances on the node.
+service DataPlaneGatewayActivityService {
+  rpc ReportActivity(DataPlaneGatewayActivityRequest)
+      returns (DataPlaneGatewayActivityResponse) {}
+}
+
+enum DataPlaneGatewayRouteState {
+  DATA_PLANE_GATEWAY_ROUTE_STATE_UNSPECIFIED = 0;
+  DATA_PLANE_GATEWAY_ROUTE_STATE_ACTIVE = 1;
+  DATA_PLANE_GATEWAY_ROUTE_STATE_RETIRED = 2;
+}
+
+message DataPlaneGatewayActivityRequest {
+  string gateway_epoch = 1;
+  uint64 timestamp_ms = 2;
+  repeated DataPlaneGatewayActivityEntry activities = 3;
+}
+
+message DataPlaneGatewayActivityEntry {
+  string instance_id = 1;
+  uint64 active_stream_count = 3;
+}
+
+message DataPlaneGatewayActivityResponse {
+  int32 code = 1;
+  string message = 2;
+}
+
+message DataPlaneGatewaySetRouteRequest {
+  string instance_id = 1;
+  string workload_id = 2;
+  string sandbox_ip = 3;
+  DataPlaneGatewayRouteState state = 4;
+}
+
+message DataPlaneGatewaySetRouteResponse {
+  int32 code = 1;
+  string message = 2;
+}

@@ -1,0 +1,125 @@
+/*
+ * Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+syntax = "proto3";
+
+package frontend_proxy;
+
+import "common.proto";
+import "core_service.proto";
+
+option go_package = "gitcode.com/robbluo/agent-dx/platform/control-plane/sandbox-api/internal/gen/frontend_proxy;frontend_proxy";
+
+// FrontendProxyService is the frontend-facing entrypoint used by faasfrontend
+// when it already owns the target proxy route. It is intentionally narrower
+// than the runtime POSIX stream API: frontend is a system-service caller, not a
+// runtime instance, so request identity and the result sink are explicit in this API.
+//
+// Requests wrap the existing core_service create/invoke/kill messages. The proxy
+// implementation can adapt them to runtime_rpc.StreamingMessage internally
+// without exposing the full stream oneof to frontend.
+service FrontendProxyService {
+  rpc InvokeInstance (InvokeInstanceRequest) returns (InvokeInstanceResponse) {}
+  rpc InvokeInstanceStream (InvokeInstanceRequest) returns (stream InvokeInstanceStreamResponse) {}
+  rpc CreateInstance (CreateInstanceRequest) returns (CreateInstanceResponse) {}
+  rpc KillInstance (KillInstanceRequest) returns (KillInstanceResponse) {}
+}
+
+message FrontendRequestContext {
+  // frontendClientID identifies the frontend service/client for audit, rate
+  // limiting and connection governance. It must not be treated as a runtime
+  // instance id or old POSIX `from` value.
+  string frontendClientID = 1;
+  string tenantID         = 2;
+  string requestID        = 3;
+  string traceID          = 4;
+  // callerInstanceID is optional and is only populated for true function-internal
+  // calls. Ordinary external frontend requests leave it empty.
+  string callerInstanceID = 5;
+  map<string, string> labels = 6;
+}
+
+message FrontendProxyStatus {
+  // status describes only frontend-to-proxy request handling. Once proxy has
+  // collected a valid runtime CallResult, code is ERR_NONE even when the
+  // function execution represented by CallResult.code failed.
+  common.ErrorCode code = 1;
+  string message        = 2;
+  // retryable tells frontend whether it should re-acquire/retry instead of
+  // expecting proxy-to-proxy forwarding.
+  bool retryable        = 3;
+  string retryReason    = 4;
+}
+
+message InvokeInstanceRequest {
+  FrontendRequestContext context = 1;
+  core_service.InvokeRequest invoke = 2;
+  // Function execution timeout supplied by frontend. The proxy adds its own
+  // result-forwarding buffer before timing out the synchronous wait.
+  int64 invokeTimeoutMs = 3;
+}
+
+message InvokeInstanceResponse {
+  FrontendProxyStatus status = 1;
+  core_service.InvokeResponse invoke = 2;
+  // callResult carries the final runtime result. Direct frontend invokes leave
+  // returnObjectIDs empty, so the inline return payload follows the historical
+  // return-by-message contract in CallResult.message; smallObjects is not the
+  // frontend inline-payload contract.
+  core_service.CallResult callResult = 3;
+}
+
+// InvokeInstanceStreamResponse preserves the runtime event boundary. Event
+// frames are forwarded as opaque bytes in order and the stream terminates with
+// exactly one final response with the same proxy-status/runtime-result split as
+// InvokeInstanceResponse.
+message InvokeInstanceStreamResponse {
+  oneof payload {
+    bytes event = 1;
+    InvokeInstanceResponse final = 2;
+  }
+}
+
+message CreateInstanceRequest {
+  FrontendRequestContext context = 1;
+  core_service.CreateRequest create = 2;
+  // Sandbox create timeout supplied by frontend. FunctionProxy uses this for
+  // its create and ready waiters instead of their legacy fixed defaults.
+  int64 createTimeoutMs = 3;
+}
+
+message CreateInstanceResponse {
+  FrontendProxyStatus status = 1;
+  core_service.CreateResponse create = 2;
+  string routeAddress = 3;
+  // callResult carries the final ready NotifyRequest-compatible result for
+  // raw create compatibility. C++ checked-in generated code may temporarily
+  // write this as unknown field 4 until protobuf regeneration is refreshed.
+  core_service.CallResult callResult = 4;
+}
+
+message KillInstanceRequest {
+  FrontendRequestContext context = 1;
+  core_service.KillRequest kill = 2;
+  // End-to-end lifecycle budget supplied by frontend. Snapshot and pause use
+  // the same budget for checkpoint capture and artifact publication.
+  int64 lifecycleTimeoutMs = 3;
+}
+
+message KillInstanceResponse {
+  FrontendProxyStatus status = 1;
+  core_service.KillResponse kill = 2;
+}

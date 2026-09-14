@@ -1,0 +1,64 @@
+syntax = "proto3";
+package rrt.v1;
+
+// Process/execution primitives. P1 only supports Exec; Start/PTY are planned later.
+service Process {
+  rpc Exec(ExecRequest) returns (ExecResponse);
+}
+message ExecRequest {
+  string cmd = 1;
+  repeated string args = 2;
+  string cwd = 3;
+  map<string, string> env = 4;
+  uint32 timeout_ms = 5; // Reserved; not implemented in P1.
+}
+message ExecResponse {
+  int32 exit_code = 1;
+  bytes stdout = 2;
+  bytes stderr = 3;
+}
+
+// Health check.
+service Health {
+  rpc Check(HealthCheckRequest) returns (HealthCheckResponse);
+}
+message HealthCheckRequest {}
+message HealthCheckResponse {
+  bool healthy = 1;
+  string version = 2;
+}
+
+// Filesystem primitives. This phase uses unary calls; WatchDir is left for later.
+service Filesystem {
+  rpc Stat(StatRequest) returns (StatResponse);
+  rpc ListDir(ListDirRequest) returns (ListDirResponse);
+  rpc MakeDir(MakeDirRequest) returns (Ack);
+  rpc Move(MoveRequest) returns (Ack);
+  rpc Remove(RemoveRequest) returns (Ack);
+  rpc ReadFile(ReadFileRequest) returns (ReadFileResponse);
+  rpc WriteFile(WriteFileRequest) returns (Ack);
+}
+message Ack {}
+message StatRequest { string path = 1; }
+message StatResponse { bool exists = 1; bool is_dir = 2; uint64 size = 3; uint32 mode = 4; int64 mtime_unix = 5; }
+message ListDirRequest { string path = 1; }
+message DirEntry { string name = 1; bool is_dir = 2; uint64 size = 3; }
+message ListDirResponse { repeated DirEntry entries = 1; }
+message MakeDirRequest { string path = 1; bool parents = 2; }
+message MoveRequest { string from = 1; string to = 2; }
+message RemoveRequest { string path = 1; bool recursive = 2; }
+message ReadFileRequest { string path = 1; }
+message ReadFileResponse { bytes content = 1; }
+message WriteFileRequest { string path = 1; bytes content = 2; bool create_parents = 3; }
+
+// Port discovery. This phase only discovers ports; Expose/Unexpose forwarding is left for the next round.
+service Port {
+  rpc ListPorts(ListPortsRequest) returns (ListPortsResponse);
+}
+message ListPortsRequest {}
+message ListenPort {
+  uint32 port = 1;
+  string address = 2;   // Listen address, for example 127.0.0.1 / 0.0.0.0 / ::
+  bool ipv6 = 3;
+}
+message ListPortsResponse { repeated ListenPort ports = 1; }

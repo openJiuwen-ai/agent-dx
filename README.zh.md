@@ -1,84 +1,14 @@
-**中文** | [English](README.md)
+# Agent DX
 
-# Agent Distributed Executor（agent-dx）
+统一维护 Agent 产品、Instance 执行平台和共享 Gateway。源码已按目录规划迁入，Sandbox SDK 使用 adx 命名；其余导入组件的二进制和协议行为保留。
 
-## 简介
+- `agent/`：CLI、Agent SDK、Executor 和现有测试。
+- `gateway/`：Edge、Node Proxy 与公共转发。
+- `platform/runtime/rrt/`：RRT 与现有运行时适配。
+- `platform/sdk/sandbox/python/`：Sandbox 客户端 SDK。
+- `platform/control-plane/sandbox-api/`：Sandbox HTTP handler、快照接口及其最小包级依赖；旧依赖集中于 `internal/legacy/`。
+- `platform/api/proto/legacy/`：本次导入仍使用的协议。
 
-Agent Distributed Executor（简称 agent-dx）是面向 Agent 的分布式执行底座，用于承载 Agent 注册、调用、会话管理等开发者工具。仓库当前提供 Python CLI `adx`、独立构建的 agent-dx Python SDK，以及用于自定义镜像 Agent 实例的平台 Executor。
+本阶段是源码与构建组织迁移。Agent 到 Sandbox SDK 的后端替换、新 Rust 管控面、Redis 路由与新 RRT 控制链按已定方案后续实施。Go API 当前提供可构建的 handler 模块，服务启动与后端接入尚未重构。
 
-### 关键能力
-
-当前 CLI 能力包括：
-
-- 通过 openYuanrong meta_service 组件注册 agent/function。
-- 通过 openYuanrong frontend 组件调用 agent/function，并以 SSE 方式流式输出执行结果。
-- 支持 agent session 和 instance session 相关请求头。
-- 支持一次性调用和交互式调用。
-
-CLI 的安装、命令参数、示例、退出码和测试说明见 [cli/README.md](cli/README.md)。
-agent-dx SDK 的编程模型、固定 Bootstrap 和部署配置见 [python/README.md](python/README.md)。
-平台托管的自定义镜像 Agent Executor 见 [executor/README.zh.md](executor/README.zh.md)。
-
-## 入门
-
-- 安装：`pip install https://openyuanrong.obs.cn-southwest-2.myhuaweicloud.com/release/0.9.0/openeuler/{x86_64 or aarch64}/agent_dx_cli-0.9.0-py3-none-any.whl`。
-- 依赖：需要先安装并部署 openYuanrong 支持函数服务能力，可参考 [openYuanrong 安装部署](https://docs.openyuanrong.org/zh-cn/latest/deploy/index.html)文档。
-
-### CLI 工具
-
-参考 openYuanrong [函数服务](https://docs.openyuanrong.org/zh-cn/latest/multi_language_function_programming_interface/development_guide/function_service/index.html)开发指南完成 Agent 开发，使用 CLI 工具 `adx` 注册：
-
-```bash
-adx deploy -s ./agent.json --server {meta_service_endpoint}
-```
-agent.json 示例：
-
-```json
-{
-    "name":"0@ai@agent",
-    "runtime":"python3.9",
-    "handler":"agent.handler",
-    "kind":"faas",
-    "cpu":1000,
-    "memory":1024,
-    "timeout":600,
-    "storageType":"local",
-    "codePath":"/your/agent/code/absolute/path"
-}
-```
-
-调用 agent：
-
-```bash
-adx exec --agent <agent_name> --server {frontend_endpoint} --args '{"message":"你好"}'
-```
-
-更多安装方式、参数说明和交互模式用法见 [cli/README.md](cli/README.md)。
-
-### 项目目录结构
-
-```text
-cli/                 Python CLI 包源码与打包配置
-cli/ar_cli/          adx 命令实现
-python/              agent-dx Python SDK 独立包
-executor/            平台 Agent Executor 独立包
-tests/cli/           CLI 单元测试
-tests/python/        agent-dx SDK 单元与集成测试
-tests/executor/      Agent Executor 单元测试
-pytest.ini           测试配置
-```
-
-CLI、SDK 和 Executor 是三个独立发布包，共享仓库根目录 `VERSION` 中的版本号。
-
-## 贡献
-
-欢迎开发者参与 agent-dx 的建设。你可以通过以下方式贡献：
-
-- 提交 Bug、功能建议或使用问题：[Issues](https://gitcode.com/openJiuwen/agent-dx/issues)
-- 提交代码、文档或示例：[Pull Requests](https://gitcode.com/openJiuwen/agent-dx/pulls)
-
-## 许可证
-
-[Apache License 2.0](./LICENSE)
-
-本产品仅作为流程编排工具，不包含 AI 模型能力；用户在连接 AI 模型用于特定业务场景时，需自行承担欧盟 AI 法案等相关合规义务。
+构建、测试和打包命令见 [README](README.md)。来源版本、迁移边界与验证结果见 [迁移记录](docs/migration/2026-09-14-import.md)。

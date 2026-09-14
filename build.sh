@@ -21,7 +21,7 @@ Usage: bash build.sh [-v VERSION] [-o OUTPUT_DIR] [-p PYTHON] [-C] [-t] [-h]
 
 Options:
     -v  wheel version, overrides ar_cli.__version__ (via BUILD_VERSION).
-    -o  output directory for the built wheel (default: <repo>/output).
+    -o  output directory for the built wheel (default: <repo>/out/wheels).
     -p  python interpreter to use (default: python3).
     -C  clean build/output/egg-info artifacts, then exit.
     -t  run unit tests (pytest at repo root), then exit.
@@ -33,11 +33,11 @@ BASE_DIR=$(
     pwd
 )
 
-CLI_DIR="$BASE_DIR/cli"          # ar_cli package + setup.py live here
-SDK_DIR="$BASE_DIR/python"       # agent-dx SDK package
-EXECUTOR_DIR="$BASE_DIR/executor" # platform Agent executor package
-BUILD_DIR="$BASE_DIR/build"      # intermediate build dir (setup.py -b)
-OUTPUT_DIR="$BASE_DIR/output"    # default wheel output dir
+CLI_DIR="$BASE_DIR/agent/cli"          # ar_cli package + setup.py live here
+SDK_DIR="$BASE_DIR/agent/sdk/python"       # agent-dx SDK package
+EXECUTOR_DIR="$BASE_DIR/agent/executor" # platform Agent executor package
+BUILD_DIR="$BASE_DIR/out/build"      # intermediate build dir (setup.py -b)
+OUTPUT_DIR="$BASE_DIR/out/wheels"    # default wheel output dir
 PYTHON3_BIN_PATH="python3"
 BUILD_VERSION=""
 COMMAND="build"

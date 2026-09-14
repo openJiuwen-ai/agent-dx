@@ -1,0 +1,107 @@
+{
+  "date": "2026-09-14",
+  "target": {
+    "remote": "git@gitcode.com:robbluo/agent-dx.git",
+    "base": "c816f8bc6a0c7ad68921f541046bb4e256f0b797",
+    "branch": "refactor/monorepo-layout"
+  },
+  "sources": [
+    {
+      "ref": "feature/distribute_env",
+      "commit": "f3d3d52029be361a895acd775ef939008a37a3dd",
+      "paths": {
+        "data-plane-gateway": "gateway",
+        "api/rust/rrt-daemon": "platform/runtime/rrt"
+      },
+      "tree": "67b9ab24d484734abc77b572086de2dbbe4db7bf"
+    },
+    {
+      "commit": "ea1de40c96ca9a979c800f4c969c8295dbd01afa",
+      "selection": "Sandbox handlers/tests and the minimal instance summary model; original Agent routes preserved through an injected Agent-layer HTTP handler. Generic runtime/function/Job/IAM/etcd implementations removed.",
+      "target": "platform/control-plane/sandbox-api",
+      "tree": "a19bf5dfe7d8fc804669e856e00e947071c31787"
+    },
+    {
+      "commit": "d5fde0371911d50855a4cce8b2ee6cff9833515e",
+      "source": "python",
+      "target": "platform/sdk/sandbox/python",
+      "version": "0.10.0",
+      "version_note": "Untagged source pin; preserves setuptools_scm fallback; release override supported",
+      "tree": "d4b6d234e9b05b51f762ed8a890d8ad77536f3ed"
+    }
+  ],
+  "protocols": "Imported protobuf structures retained; component environment variables, route keys and branded headers use ADX naming. Frontend go_package imports are local to this module.",
+  "toolchains": {
+    "rust": "1.97.1",
+    "go_minimum": "1.24.1",
+    "go_validation": "1.25.5",
+    "protoc_validation": "3.21.12",
+    "protoc_gen_go_validation": "1.36.11",
+    "protoc_gen_go_grpc_validation": "1.6.2"
+  },
+  "excluded_legacy_validation": [
+    "data-plane-gateway/tests/aio_3node_e2e.sh",
+    "data-plane-gateway/tests/aio_3node/ (static builder moved to build/images)"
+  ],
+  "validation": {
+    "rust_tests": 199,
+    "agent_tests_passed": 234,
+    "agent_tests_skipped": 1,
+    "sandbox_sdk_tests": 233,
+    "go_test_packages": 2,
+    "python_distributions": 4,
+    "cluster_e2e": "not run",
+    "sandbox_sdk_installed_smoke": "adx_sandbox import, adx-sandbox --help, ADX_* config passed",
+    "go_full_suite": "passed: build, uncached full tests, vet; 107 top-level tests, 200 including subtests, 2 test packages",
+    "branding_source_files_scanned": 299,
+    "branding_python_artifacts_scanned": 8,
+    "branding_matches": 0,
+    "go_minimal_top_level_tests": 107,
+    "go_minimal_including_subtests": 200
+  },
+  "sandbox_sdk_naming": {
+    "distribution": "adx-sandbox",
+    "python_import": "adx_sandbox",
+    "cli": "adx-sandbox",
+    "configuration_prefix": "ADX_"
+  },
+  "provenance_note": "Exact upstream URLs retained in the migration evidence archive; commit/tree IDs below identify source snapshots.",
+  "product_naming": {
+    "agent_sdk": "adx.agentruntime",
+    "agent_executor": "adx.agentexecutor",
+    "binaries": [
+      "adx-node-proxy",
+      "adx-edge-frontend",
+      "adx-data-plane-forward"
+    ],
+    "env": "ADX_",
+    "headers": "X-ADX-",
+    "route_prefix": "/adx/"
+  },
+  "go_minimal_adapter": {
+    "retained": [
+      "internal/sandbox",
+      "internal/httpx",
+      "internal/instancecache",
+      "backend",
+      "Sandbox route registration",
+      "9 Agent route adapters"
+    ],
+    "removed": [
+      "internal/legacy including runtimeapi",
+      "Go data-path proxy",
+      "function and Job helpers",
+      "etcd watchers",
+      "IAM implementation",
+      "scheduler proxy",
+      "Kubernetes adapters"
+    ],
+    "agent_boundary": "Route contract and transparent HTTP adapter only; Agent business handler is injected by the host.",
+    "handwritten_go_files_before": 259,
+    "handwritten_go_files_after": 17,
+    "handwritten_packages_before": 59,
+    "handwritten_packages_after": 5,
+    "direct_dependencies_before": 21,
+    "direct_dependencies_after": 8
+  }
+}
