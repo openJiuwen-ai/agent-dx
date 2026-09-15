@@ -124,3 +124,8 @@ can select the Buildkite build UUID containing its `platform-build` backend
 artifacts. Revision, target, complete file set and every file checksum must pass
 validation. ADX product binaries and SDK are still built from the current commit.
 Omit the variable to rebuild the external runtime from its pinned source.
+
+The image stage caches the pinned Ubuntu amd64 base in SWR. On a cache miss it
+pulls the identical manifest from a configurable regional mirror and checks its
+config/image digest before publishing. The runtime tools image is cached by its
+Dockerfile/bootstrap recipe; all final image inputs use SWR digest references.
