@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import shutil
 import subprocess
 import tempfile
@@ -13,6 +14,18 @@ import urllib.request
 ROOT=Path(__file__).resolve().parents[2]
 def run(args,**kw):return subprocess.check_output(list(map(str,args)),text=True,**kw).strip()
 def sha(p):return hashlib.sha256(p.read_bytes()).hexdigest()
+def release_checksum(manifest, filename):
+    matches=[]
+    for line in manifest.splitlines():
+        parts=line.split()
+        if len(parts)==2 and parts[1].lstrip('*')==filename:
+            if not re.fullmatch(r'[0-9a-fA-F]{64}',parts[0]):
+                raise ValueError('invalid release checksum for '+filename)
+            matches.append(parts[0].lower())
+    if len(matches)!=1:
+        raise ValueError('expected one release checksum for '+filename)
+    return matches[0]
+
 def main():
     p=argparse.ArgumentParser();p.add_argument('--output',type=Path,required=True);p.add_argument('--source',type=Path);p.add_argument('--redis-cli',type=Path,required=True);p.add_argument('--jobs',type=int,default=2);a=p.parse_args()
     if platform.system()!='Linux' or a.jobs<1:raise ValueError('native Linux builder and positive jobs required')
@@ -34,7 +47,7 @@ def main():
         versions=dict(line.split('=',1) for line in (source/'third_party/runtime-versions.env').read_text().splitlines() if line and not line.startswith('#') and '=' in line)
         url=versions['RUNC_RELEASE_BASE_URL']+'/v'+versions['RUNC_VERSION']+'/'
         with urllib.request.urlopen(url+'runc.sha256sum',timeout=60) as r:sums=r.read().decode()
-        expected=next(line.split()[0] for line in sums.splitlines() if line.split()[-1].lstrip('*')=='runc.'+arch)
+        expected=release_checksum(sums,'runc.'+arch)
         if arch=='amd64' and expected!=versions['RUNC_AMD64_SHA256']:raise ValueError('runc release manifest mismatch')
         with urllib.request.urlopen(url+'runc.'+arch,timeout=120) as r:(a.output/'runc').write_bytes(r.read())
         if sha(a.output/'runc')!=expected:raise ValueError('runc checksum mismatch')
