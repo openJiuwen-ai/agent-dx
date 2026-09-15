@@ -11,7 +11,8 @@ steps:
   timeout_in_minutes: 60
   artifact_paths:
   - out/buildkite/logs/**/*
-  - out/buildkite/package/**/*
+  - out/buildkite/adx-release.tar.gz
+  - out/buildkite/adx-release.tar.gz.sha256
   - out/buildkite/backend/**/*
   env:
     BUILDKITE_AGENT_NAME: agent-stack-k8s

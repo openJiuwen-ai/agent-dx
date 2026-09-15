@@ -4,7 +4,11 @@ set -euo pipefail
 [[ -z $(git status --porcelain) ]] || { echo 'clean checkout required'; exit 1; }
 [[ $(git rev-parse HEAD) == "$BUILDKITE_COMMIT" ]]
 mkdir -p out/buildkite/logs
-buildkite-agent artifact download 'out/buildkite/package/**/*' . --step platform-build
+buildkite-agent artifact download 'out/buildkite/adx-release.tar.gz' . --step platform-build
+buildkite-agent artifact download 'out/buildkite/adx-release.tar.gz.sha256' . --step platform-build
+(cd out/buildkite && sha256sum --check adx-release.tar.gz.sha256)
+mkdir -p out/buildkite/package
+tar -xzf out/buildkite/adx-release.tar.gz -C out/buildkite/package
 buildkite-agent artifact download 'out/buildkite/backend/*' . --step platform-build
 daemon_pid=''
 cleanup() {

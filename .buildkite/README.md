@@ -69,7 +69,9 @@ dependency in the Ubuntu runtime image.
 ## Artifact handoff and acceptance
 
 `platform-build` constructs all ADX binaries, the SDK and pinned sandboxd helpers
-from the clean current commit. `platform-images` downloads these artifacts,
+from the clean current commit. `platform-images` downloads the release archive and verifies its SHA256 before
+restoring the complete directory tree and executable permissions. It downloads
+the verified external backend artifacts,
 creates the verified bundle and publishes the node/RRT images. `registry-images.json` records immutable digest
 references, source image IDs and the checksum of `bundle.json`.
 
