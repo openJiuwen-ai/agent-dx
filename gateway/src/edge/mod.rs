@@ -1,6 +1,8 @@
 pub mod auth;
 pub mod connector;
 pub mod http_pool;
+#[cfg(feature = "activity-client")]
+pub mod master_routes;
 pub mod path;
 pub mod pool;
 pub mod resolver;

@@ -760,7 +760,7 @@ async fn assert_half_closed_route_cancel(websocket: bool) {
     assert_eq!(edge.active_sessions(), 2);
     assert_eq!(edge.physical_connections(), 1);
     // A normal upstream FIN preserves the client's writable direction.
-    for (client, byte) in clients.iter_mut().zip([b'a', b'b']) {
+    for (client, byte) in clients.iter_mut().zip(*b"ab") {
         client.write_all(&[byte]).await.unwrap();
         assert_eq!(
             timeout(Duration::from_secs(3), received_rx.recv())

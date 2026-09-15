@@ -1,9 +1,6 @@
-//! CallReq dispatch: is_create returns a create ack; function calls route to akernel methods.
+//! HTTP sandbox action dispatch.
 
 use super::codec;
-use super::{call_result_msg, Args};
-use crate::posix::runtime_rpc::StreamingMessage;
-use crate::posix::runtime_service::CallRequest;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -144,14 +141,6 @@ pub(crate) fn access_command_summary(
         Some(cmd) if !cmd.is_empty() => format!("{method} {}", sanitize_log_field(&cmd)),
         Some(cmd) => format!("{method} {}", sanitize_log_field(&cmd)),
         None => method.to_string(),
-    }
-}
-
-pub(crate) fn access_trace_id(trace_id: &str, request_id: &str) -> String {
-    if !trace_id.is_empty() {
-        trace_id.to_string()
-    } else {
-        request_id.to_string()
     }
 }
 
@@ -405,29 +394,6 @@ fn run_command(
     }
 }
 
-/// yr cross-language serialization: `[16 zero bytes header][msgpack_data]`.
-/// split_buffer sees an all-zero header and infers CROSS_LANGUAGE, with msgpack_data = buffer[16:].
-fn adx_serialize<T: serde::Serialize>(value: &T) -> Vec<u8> {
-    let mp = rmp_serde::to_vec_named(value).unwrap_or_default();
-    let mut buf = vec![0u8; 16];
-    buf.extend_from_slice(&mp);
-    buf
-}
-
-fn value_map_to_kwargs(
-    value: Option<&rmpv::Value>,
-) -> std::collections::BTreeMap<String, rmpv::Value> {
-    let mut out = std::collections::BTreeMap::new();
-    if let Some(rmpv::Value::Map(kvs)) = value {
-        for (k, v) in kvs {
-            if let Some(key) = k.as_str() {
-                out.insert(key.to_string(), v.clone());
-            }
-        }
-    }
-    out
-}
-
 pub(crate) fn normalize_sandbox_action(action: &str) -> Option<&'static str> {
     match action {
         "ping" | "noop" => Some("ping"),
@@ -469,13 +435,6 @@ pub(crate) fn normalize_sandbox_action(action: &str) -> Option<&'static str> {
         "bash_destroy" | "shell.delete" | "shell.destroy" | "shell.close" => Some("bash_destroy"),
         _ => None,
     }
-}
-
-pub(crate) fn dispatch_runtime_action(
-    method: &str,
-    kw: &std::collections::BTreeMap<String, rmpv::Value>,
-) -> Option<rmpv::Value> {
-    dispatch_runtime_action_with_trace(method, kw, "")
 }
 
 pub(crate) fn dispatch_runtime_action_with_trace(
@@ -545,7 +504,7 @@ pub(crate) fn dispatch_runtime_action_with_trace(
 }
 
 /// Execute one public sandbox action through the same normalized RRT primitive
-/// used by both RuntimeRPC and the direct HTTP endpoint.
+/// used by the HTTP endpoint.
 pub(crate) fn execute_sandbox_action(
     action: &str,
     kw: &std::collections::BTreeMap<String, rmpv::Value>,
@@ -562,7 +521,7 @@ pub(crate) fn execute_sandbox_action(
 }
 
 /// Execute a sandbox action at most once for a non-empty request ID. Both
-/// RuntimeRPC and direct HTTP use this cache, so retries crossing transports
+/// HTTP requests use this cache, so concurrent retries
 /// observe the same result.
 pub(crate) fn execute_sandbox_action_once(
     request_id: Option<&str>,
@@ -580,207 +539,6 @@ pub(crate) fn execute_sandbox_action_once(
     let response = execute_sandbox_action(action, kw, trace_id);
     complete_dedup_response(&slot, response.clone());
     response
-}
-
-pub struct Ctx {
-    #[allow(dead_code)]
-    args: Args,
-    instance_id: String,
-}
-
-impl Ctx {
-    pub fn new(args: Args) -> Self {
-        let instance_id = args.instance_id.clone();
-        Ctx { args, instance_id }
-    }
-
-    /// Handle one CallReq and return the CallResult message to send back to proxy.
-    /// Synchronous blocking implementation because cmd/fs/bash are blocking calls; callers must run it in spawn_blocking,
-    /// otherwise long commands block the MessageStream receive loop and starve heartbeats.
-    pub fn handle_call(&self, call: CallRequest) -> StreamingMessage {
-        let oid = if !call.return_object_id.is_empty() {
-            call.return_object_id.clone()
-        } else {
-            call.return_object_i_ds.first().cloned().unwrap_or_default()
-        };
-        if super::debug_on() {
-            rrt_debug!(
-                "[rrt-runtime] returnObjectID={:?} returnObjectIDs={:?}",
-                call.return_object_id,
-                call.return_object_i_ds
-            );
-        }
-        // proto: CallRequest.senderID (caller) maps to CallResult.instanceID; proxy uses it to route results back to the caller.
-        let iid = if !call.sender_id.is_empty() {
-            call.sender_id.clone()
-        } else {
-            self.instance_id.clone()
-        };
-        if call.is_create {
-            return match super::entrypoint::complete_create() {
-                Ok(()) => call_result_msg(call.request_id, iid, oid, 0, "created", Vec::new()),
-                Err(failure) => call_result_msg(
-                    call.request_id,
-                    iid,
-                    oid,
-                    failure.code,
-                    &failure.message,
-                    Vec::new(),
-                ),
-            };
-        }
-        let kw = codec::parse_kwargs(&call.args);
-        let method = codec::kw_str(&kw, "sandbox_method").unwrap_or_default();
-        if super::debug_on() {
-            rrt_debug!("[rrt-runtime] method={method} args={}", call.args.len());
-        }
-        match method.as_str() {
-            "ping" => {
-                let r = std::collections::BTreeMap::from([("status", "ok")]);
-                call_result_msg(call.request_id, iid, oid, 0, "ok", adx_serialize(&r))
-            }
-            "get_info" => {
-                let r = codec::map_value(vec![
-                    ("state", rmpv::Value::from("running")),
-                    ("entrypoint", super::entrypoint::info_value()),
-                ]);
-                call_result_msg(
-                    call.request_id,
-                    iid,
-                    oid,
-                    0,
-                    "ok",
-                    codec::adx_serialize_value(&r),
-                )
-            }
-            "sandbox_invoke" => {
-                let action = codec::kw_str(&kw, "action").unwrap_or_default();
-                let args = value_map_to_kwargs(kw.get("args"));
-                let trace_id = access_trace_id(&call.trace_id, &call.request_id);
-                match execute_sandbox_action_once(Some(&call.request_id), &action, &args, &trace_id)
-                {
-                    Ok(r) => call_result_msg(
-                        call.request_id,
-                        iid,
-                        oid,
-                        0,
-                        "ok",
-                        codec::adx_serialize_value(&r),
-                    ),
-                    Err(message) => {
-                        call_result_msg(call.request_id, iid, oid, 1, &message, Vec::new())
-                    }
-                }
-            }
-            "cmd_run" => {
-                let trace_id = access_trace_id(&call.trace_id, &call.request_id);
-                let started = Instant::now();
-                let command = access_command_summary("cmd_run", &kw);
-                let result = dispatch_runtime_action_with_trace("cmd_run", &kw, &trace_id)
-                    .unwrap_or_else(|| {
-                        codec::map_value(vec![
-                            ("stdout", rmpv::Value::from("")),
-                            ("stderr", rmpv::Value::from("failed to dispatch cmd_run")),
-                            ("exit_code", rmpv::Value::from(-1i64)),
-                        ])
-                    });
-                log_access(&trace_id, &command, started);
-                call_result_msg(
-                    call.request_id,
-                    iid,
-                    oid,
-                    0,
-                    "ok",
-                    codec::adx_serialize_value(&result),
-                )
-            }
-            "fs_read" | "fs_write" | "fs_write_chunk" | "fs_read_chunk" | "fs_list"
-            | "fs_exists" | "fs_remove" | "fs_rename" | "fs_make_dir" | "fs_get_info" => {
-                let r = dispatch_runtime_action(method.as_str(), &kw).unwrap_or_else(|| {
-                    codec::map_value(vec![(
-                        "error",
-                        rmpv::Value::from(format!("unsupported method: {method}")),
-                    )])
-                });
-                call_result_msg(
-                    call.request_id,
-                    iid,
-                    oid,
-                    0,
-                    "ok",
-                    codec::adx_serialize_value(&r),
-                )
-            }
-            "start_tunnel_server" => {
-                match super::tunnel::start_tunnel_server(&call.args, &self.args.deploy_dir) {
-                    Ok(r) => call_result_msg(
-                        call.request_id,
-                        iid,
-                        oid,
-                        0,
-                        "ok",
-                        codec::adx_serialize_value(&r),
-                    ),
-                    Err(e) => {
-                        rrt_error!("[rrt-runtime] start_tunnel_server failed: {e}");
-                        call_result_msg(call.request_id, iid, oid, 1, &e, Vec::new())
-                    }
-                }
-            }
-            "cmd_start" | "cmd_get" | "cmd_poll" | "cmd_wait" | "cmd_kill" | "cmd_list"
-            | "cmd_capabilities" | "cmd_send_stdin" => {
-                let trace_id = access_trace_id(&call.trace_id, &call.request_id);
-                let started = Instant::now();
-                let command = access_command_summary(method.as_str(), &kw);
-                let r = dispatch_runtime_action(method.as_str(), &kw).unwrap_or_else(|| {
-                    codec::map_value(vec![(
-                        "error",
-                        rmpv::Value::from(format!("unsupported method: {method}")),
-                    )])
-                });
-                log_access(&trace_id, &command, started);
-                call_result_msg(
-                    call.request_id,
-                    iid,
-                    oid,
-                    0,
-                    "ok",
-                    codec::adx_serialize_value(&r),
-                )
-            }
-            "bash_init" | "bash_submit" | "bash_poll" | "bash_destroy" => {
-                let trace_id = access_trace_id(&call.trace_id, &call.request_id);
-                let started = Instant::now();
-                let command = access_command_summary(method.as_str(), &kw);
-                let r = dispatch_runtime_action(method.as_str(), &kw).unwrap_or_else(|| {
-                    codec::map_value(vec![(
-                        "error",
-                        rmpv::Value::from(format!("unsupported method: {method}")),
-                    )])
-                });
-                log_access(&trace_id, &command, started);
-                call_result_msg(
-                    call.request_id,
-                    iid,
-                    oid,
-                    0,
-                    "ok",
-                    codec::adx_serialize_value(&r),
-                )
-            }
-            other => {
-                rrt_warn!("[rrt-runtime] unsupported method: {other}");
-                call_result_msg(
-                    call.request_id,
-                    iid,
-                    oid,
-                    1,
-                    &format!("unsupported: {other}"),
-                    Vec::new(),
-                )
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -920,12 +678,6 @@ mod tests {
     }
 
     #[test]
-    fn access_trace_id_falls_back_to_request_id() {
-        assert_eq!(access_trace_id("trace-1", "req-1"), "trace-1");
-        assert_eq!(access_trace_id("", "req-1"), "req-1");
-    }
-
-    #[test]
     fn dispatches_process_exec_action_args() {
         let mut kw = BTreeMap::new();
         kw.insert(
@@ -977,7 +729,8 @@ mod tests {
         kw.insert("timeout".to_string(), rmpv::Value::F64(0.1));
 
         let started = Instant::now();
-        let result = dispatch_runtime_action("cmd_run", &kw).expect("cmd_run should dispatch");
+        let result = dispatch_runtime_action_with_trace("cmd_run", &kw, "")
+            .expect("cmd_run should dispatch");
 
         assert!(
             started.elapsed() < Duration::from_millis(400),

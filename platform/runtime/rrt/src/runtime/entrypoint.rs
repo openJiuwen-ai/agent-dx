@@ -44,9 +44,17 @@ pub(crate) struct ExitInfo {
     message: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(i32)]
+pub(crate) enum FailureCode {
+    // Keep the existing HTTP entrypoint error values without protobuf types.
+    InvalidConfiguration = 1001,
+    ProcessFailed = 2002,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct Failure {
-    pub code: i32,
+    pub code: FailureCode,
     pub message: String,
 }
 
@@ -91,7 +99,7 @@ impl Manager {
         }
     }
 
-    fn fail(&self, code: i32, message: impl Into<String>) {
+    fn fail(&self, code: FailureCode, message: impl Into<String>) {
         self.inner.lock().expect("entrypoint state poisoned").state = State::Failed(Failure {
             code,
             message: message.into(),
@@ -121,7 +129,7 @@ impl Manager {
                     .expect("entrypoint child poisoned")
                     .try_wait()
                     .map_err(|error| Failure {
-                        code: crate::posix::common::ErrorCode::ErrUserFunctionException as i32,
+                        code: FailureCode::ProcessFailed,
                         message: format!("failed to inspect image entrypoint: {error}"),
                     })?;
                 let Some(status) = status else {
@@ -142,13 +150,13 @@ impl Manager {
                     stderr_tail,
                 );
                 Err(Failure {
-                    code: crate::posix::common::ErrorCode::ErrUserFunctionException as i32,
+                    code: FailureCode::ProcessFailed,
                     message: exit_json(&info),
                 })
             }
             State::Failed(failure) => Err(failure.clone()),
             State::Exited(info) => Err(Failure {
-                code: crate::posix::common::ErrorCode::ErrUserFunctionException as i32,
+                code: FailureCode::ProcessFailed,
                 message: exit_json(info),
             }),
         }
@@ -185,29 +193,6 @@ impl Manager {
             ]),
         }
     }
-
-    fn info_value(&self) -> Value {
-        let inner = self.inner.lock().expect("entrypoint state poisoned");
-        match &inner.state {
-            State::Disabled => map_value(vec![("state", Value::from("disabled"))]),
-            State::Failed(failure) => map_value(vec![
-                ("state", Value::from("failed")),
-                ("code", Value::from(failure.code as i64)),
-                ("message", Value::from(failure.message.clone())),
-            ]),
-            State::Running { pid, .. } => map_value(vec![
-                ("state", Value::from("running")),
-                ("pid", Value::from(*pid as i64)),
-            ]),
-            State::Exited(info) => {
-                let mut value = exit_value(info);
-                if let Value::Map(fields) = &mut value {
-                    fields.push((Value::from("state"), Value::from("exited")));
-                }
-                value
-            }
-        }
-    }
 }
 
 pub(crate) fn initialize() {
@@ -227,10 +212,7 @@ fn start_from_environment(manager: Arc<Manager>) {
     let spec = match read_spec(&path) {
         Ok(spec) => spec,
         Err(message) => {
-            manager.fail(
-                crate::posix::common::ErrorCode::ErrParamInvalid as i32,
-                message,
-            );
+            manager.fail(FailureCode::InvalidConfiguration, message);
             return;
         }
     };
@@ -238,10 +220,7 @@ fn start_from_environment(manager: Arc<Manager>) {
     let identity = match resolve_identity(&spec.user) {
         Ok(identity) => identity,
         Err(message) => {
-            manager.fail(
-                crate::posix::common::ErrorCode::ErrParamInvalid as i32,
-                message,
-            );
+            manager.fail(FailureCode::InvalidConfiguration, message);
             return;
         }
     };
@@ -280,7 +259,7 @@ fn start_from_environment(manager: Arc<Manager>) {
         Ok(child) => child,
         Err(error) => {
             manager.fail(
-                crate::posix::common::ErrorCode::ErrUserFunctionException as i32,
+                FailureCode::ProcessFailed,
                 format!("failed to spawn image entrypoint: {error}"),
             );
             return;
@@ -647,10 +626,6 @@ pub(crate) fn poll(wait_timeout: f64) -> Value {
     global().poll(Duration::from_secs_f64(wait_timeout))
 }
 
-pub(crate) fn info_value() -> Value {
-    global().info_value()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -729,10 +704,7 @@ mod tests {
             message: "entrypoint exited with code 0".to_string(),
         });
         let error = manager.complete_create().expect_err("create must fail");
-        assert_eq!(
-            error.code,
-            crate::posix::common::ErrorCode::ErrUserFunctionException as i32
-        );
+        assert_eq!(error.code, FailureCode::ProcessFailed);
     }
 
     #[test]

@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::io;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -29,6 +29,7 @@ pub struct NodeProxy {
     route_shards: Arc<Vec<RwLock<HashMap<RouteKey, RouteBinding>>>>,
     route_revision: Arc<AtomicU64>,
     route_enforcement: bool,
+    bindings_ready: Arc<AtomicBool>,
     active_streams: Arc<AtomicUsize>,
     max_active_streams: usize,
     activity: Option<Arc<ActivityTracker>>,
@@ -84,6 +85,7 @@ impl NodeProxy {
             ),
             route_revision: Arc::new(AtomicU64::new(0)),
             route_enforcement: false,
+            bindings_ready: Arc::new(AtomicBool::new(true)),
             active_streams: Arc::new(AtomicUsize::new(0)),
             max_active_streams: 0,
             activity: None,
@@ -115,7 +117,7 @@ impl NodeProxy {
     }
 
     pub fn ready(&self) -> bool {
-        !self.draining.load(Ordering::Acquire)
+        !self.draining.load(Ordering::Acquire) && self.bindings_ready.load(Ordering::Acquire)
     }
 
     pub fn start_drain(&self) {
@@ -136,6 +138,20 @@ impl NodeProxy {
     pub fn with_route_enforcement(mut self) -> Self {
         self.route_enforcement = true;
         self
+    }
+
+    pub fn set_bindings_ready(&self, ready: bool) {
+        self.bindings_ready.store(ready, Ordering::Release);
+    }
+    pub fn clear_bindings(&self) {
+        self.set_bindings_ready(false);
+        let revision = self.route_revision.fetch_add(1, Ordering::AcqRel) + 1;
+        for shard in self.route_shards.iter() {
+            let mut routes = shard.write().unwrap_or_else(|p| p.into_inner());
+            for (_, binding) in routes.drain() {
+                let _ = binding.revision_tx.send(revision);
+            }
+        }
     }
 
     fn route_shard(&self, key: &RouteKey) -> &RwLock<HashMap<RouteKey, RouteBinding>> {
@@ -258,7 +274,7 @@ impl NodeProxy {
         mut respond: SendResponse<Bytes>,
         mut connection_closed: watch::Receiver<()>,
     ) {
-        if self.draining.load(Ordering::Acquire) {
+        if !self.ready() {
             send_error(&mut respond, StatusCode::SERVICE_UNAVAILABLE);
             return;
         }
@@ -364,7 +380,7 @@ impl NodeProxy {
         };
         self.metrics.connect_total.fetch_add(1, Ordering::Relaxed);
         let _activity = (!passive)
-            .then(|| self.activity.as_ref())
+            .then_some(self.activity.as_ref())
             .flatten()
             .map(|tracker| {
                 tracker.activate(&target.instance_id);

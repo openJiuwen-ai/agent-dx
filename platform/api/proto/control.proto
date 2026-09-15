@@ -1,0 +1,164 @@
+syntax = "proto3";
+
+package adx.control.v1;
+option go_package = "gitcode.com/robbluo/agent-dx/platform/control-plane/sandbox-api/internal/gen/controlv1;controlv1";
+
+// Internal RPCs require authenticated component identity. The receiver must
+// check caller role and tenant ownership; tenant_id alone is not authentication.
+service MasterService {
+  rpc RegisterNode(RegisterNodeRequest) returns (RegisterNodeResponse);
+  rpc InspectNode(InspectNodeRequest) returns (InspectNodeResponse);
+  rpc CreateInstance(CreateInstanceRequest) returns (InstanceResult);
+  rpc GetInstance(GetInstanceRequest) returns (GetInstanceResponse);
+  // Node-owned state decisions are persisted by Master. This does not transfer
+  // ownership of the Instance lifecycle to Master.
+  rpc CommitInstance(CommitInstanceRequest) returns (CommitInstanceResponse);
+}
+
+service NodeService {
+  rpc CreateInstance(StartAssignedInstanceRequest) returns (InstanceResult);
+  rpc DeleteInstance(DeleteInstanceRequest) returns (InstanceResult);
+}
+
+message Resources {
+  uint64 cpu_millis = 1;
+  uint64 memory_bytes = 2;
+  uint64 disk_bytes = 3;
+}
+
+message InstanceSpec {
+  string id = 1;
+  string tenant_id = 2;
+  string image = 3;
+  string runtime = 4;
+  Resources resources = 5;
+  int32 priority = 6;
+  SchedulingPolicy scheduling = 7;
+  map<string,string> env = 8;
+}
+
+message Assignment {
+  string instance_id = 1;
+  string node_id = 2;
+  uint32 domain_id = 3;
+  // Generation is allocated durably by Master before a real backend is started.
+  // Persisted ownership and execution fencing must survive process restarts.
+  uint64 generation = 4;
+  repeated DeviceAllocation devices = 5;
+}
+
+enum InstanceState {
+  INSTANCE_STATE_UNSPECIFIED = 0;
+  INSTANCE_STATE_PENDING = 1;
+  INSTANCE_STATE_STARTING = 2;
+  INSTANCE_STATE_RUNNING = 3;
+  INSTANCE_STATE_DELETING = 4;
+  INSTANCE_STATE_DELETED = 5;
+  INSTANCE_STATE_FAILED = 6;
+}
+
+message InstanceRecord {
+  InstanceSpec spec = 1;
+  Assignment assignment = 2;
+  InstanceState state = 3;
+  uint64 revision = 4;
+  string runtime_id = 5;
+  // Failed does not imply the backend is absent or its capacity can be reused.
+  bool resources_held = 6;
+  string runtime_ip = 7;
+}
+
+enum Durability {
+  DURABILITY_UNSPECIFIED = 0;
+  DURABILITY_PUBLISHED = 1;
+  DURABILITY_JOURNALED = 2;
+}
+
+message InstanceResult {
+  InstanceRecord record = 1;
+  Durability durability = 2;
+}
+
+message RegisterNodeRequest {
+  string node_id = 1;
+  string node_address = 2;
+  Resources capacity = 3;
+  bool accepting_allocations = 4;
+  map<string,string> labels = 5;
+  repeated Device devices = 6;
+  string proxy_address = 7;
+  string session_id = 8; // Unique for one Node Manager process lifetime.
+  uint64 heartbeat_sequence = 9;
+  bool reconciling = 10;
+
+}
+message RegisterNodeResponse { uint32 domain_id = 1; uint64 master_epoch = 2; }
+message CallerContext { string tenant_id = 1; bool administrator = 2; }
+message CreateInstanceRequest { InstanceSpec spec = 1; CallerContext caller = 2; }
+message GetInstanceRequest { string instance_id = 1; CallerContext caller = 2; }
+message GetInstanceResponse { InstanceRecord record = 1; string node_address = 2; }
+message StartAssignedInstanceRequest {
+  InstanceSpec spec = 1;
+  Assignment assignment = 2;
+  string node_session_id = 3;
+}
+message DeleteInstanceRequest { Assignment assignment = 1; CallerContext caller = 2; }
+message CommitInstanceRequest { InstanceRecord record = 1; string node_session_id = 2; }
+message CommitInstanceResponse { InstanceRecord record = 1; }
+
+// Whole physical cards; IDs are local to (node, kind), never fractional shares.
+enum DeviceKind { DEVICE_KIND_UNSPECIFIED = 0; DEVICE_KIND_GPU = 1; DEVICE_KIND_NPU = 2; }
+message Device { uint32 id = 1; DeviceKind kind = 2; string model = 3; bool healthy = 4; }
+message DeviceRequest { DeviceKind kind = 1; optional string model = 2; uint32 count = 3; }
+message DeviceAllocation { uint32 id = 1; DeviceKind kind = 2; string model = 3; }
+enum SelectorOp { SELECTOR_OP_UNSPECIFIED = 0; SELECTOR_OP_IN = 1; SELECTOR_OP_NOT_IN = 2; SELECTOR_OP_EXISTS = 3; SELECTOR_OP_DOES_NOT_EXIST = 4; SELECTOR_OP_GT = 5; SELECTOR_OP_LT = 6; }
+message LabelRequirement { string key = 1; SelectorOp op = 2; repeated string values = 3; }
+message LabelSelector { map<string,string> match_labels = 1; repeated LabelRequirement expressions = 2; }
+message WeightedSelector { LabelSelector selector = 1; uint32 weight = 2; }
+message PeerTerm { LabelSelector selector = 1; string topology_key = 2; repeated string tenants = 3; }
+message WeightedPeer { PeerTerm term = 1; uint32 weight = 2; }
+enum SpreadMode { SPREAD_MODE_UNSPECIFIED = 0; SPREAD_MODE_DO_NOT_SCHEDULE = 1; SPREAD_MODE_SCHEDULE_ANYWAY = 2; }
+message TopologySpread { string topology_key = 1; LabelSelector selector = 2; uint32 max_skew = 3; uint32 min_domains = 4; SpreadMode when_unsatisfiable = 5; }
+message SchedulingPolicy {
+  map<string,string> labels = 1;
+  repeated DeviceRequest devices = 2;
+  repeated LabelSelector required_node = 3;
+  repeated WeightedSelector preferred_node = 4;
+  repeated PeerTerm required_affinity = 5;
+  repeated PeerTerm required_anti_affinity = 6;
+  repeated WeightedPeer preferred_affinity = 7;
+  repeated WeightedPeer preferred_anti_affinity = 8;
+  repeated TopologySpread topology_spread = 9;
+}
+
+// User credentials are verified only by a trusted ingress component.
+service AuthService { rpc VerifyApiKey(VerifyApiKeyRequest) returns (VerifyApiKeyResponse); }
+message VerifyApiKeyRequest { string api_key = 1; }
+message VerifyApiKeyResponse { CallerContext caller = 1; uint64 expires_at_unix_seconds = 2; }
+
+// Called after registration with reconciling=true. Only the owning node may read
+// this complete catalog; RPC failure must never be interpreted as an empty list.
+message InspectNodeRequest { string node_id = 1; string session_id = 2; }
+message InspectNodeResponse { repeated InstanceRecord records = 1; uint64 master_epoch = 2; }
+
+// Each stream starts with an authoritative full snapshot. Later frames apply
+// only when (epoch, base_revision) matches the consumer cursor. Reconnect resets.
+service RouteService { rpc WatchRoutes(WatchRoutesRequest) returns (stream RouteFrame); }
+message WatchRoutesRequest {}
+message PublishedRoute {
+ string instance_id = 1;
+ string tenant_id = 2;
+ string runtime_id = 3;
+ string runtime_ip = 4;
+ string node_proxy_address = 5;
+ uint64 generation = 6;
+ uint64 instance_revision = 7;
+}
+message RouteFrame {
+ uint64 epoch = 1;
+ uint64 revision = 2;
+ uint64 base_revision = 3;
+ bool reset = 4;
+ repeated PublishedRoute upserts = 5;
+ repeated string deleted = 6;
+}

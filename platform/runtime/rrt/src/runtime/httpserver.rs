@@ -5,7 +5,7 @@
 //! RRT atomic-operation HTTP/1.1 server.
 //!
 //! Purpose: expose sandbox-embedded RRT atomic operations over HTTP through sandboxRouter as an L7 reverse proxy,
-//! removing the frontend invoke -> libruntime RuntimeRPC -> msgpack hop.
+//! serving atomic operations directly over HTTP.
 //!
 //! Protocol:
 //! - `POST /invoke`, body = `{"action": "...", "args": {...}}`, shaped like sandbox_invoke,
@@ -15,7 +15,7 @@
 //! - `GET /healthz` → `{"status":"ok"}`。
 //!
 //! Auth model: RRT is privileged, so token auth is required when RRT_HTTP_TOKEN is set. Requests must carry
-//! `X-Auth: <token>` or they receive 401. Production should use JWT validation; this path uses a static token.
+//! `X-Auth: <token>` or they receive 401. The deployment supplies the token.
 //!
 //! No new dependencies: use raw tokio TcpListener plus handwritten HTTP/1.1.
 //! JSON/control responses support sequential keep-alive requests so the Edge
@@ -24,7 +24,6 @@
 
 use futures_util::{SinkExt, StreamExt};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::ffi::OsStr;
 use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -32,11 +31,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpListener, UnixListener, UnixStream};
+use tokio::net::TcpListener;
 use tokio::process::Command;
-use tokio::sync::{mpsc, oneshot, watch};
-
-use crate::posix::runtime_rpc::StreamingMessage;
+use tokio::sync::watch;
 
 const IO_BUFFER_SIZE: usize = 256 * 1024;
 static COMMAND_WATCHERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -107,12 +104,6 @@ impl CopyStats {
     }
 }
 
-/// Serve RRT atomic operations on 0.0.0.0:port. token=None disables auth for isolated/internal use only.
-pub async fn serve(port: u16, token: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
-    let listener = bind(port).await?;
-    serve_listener(listener, token).await
-}
-
 pub(crate) async fn bind(port: u16) -> std::io::Result<TcpListener> {
     TcpListener::bind(("0.0.0.0", port)).await
 }
@@ -128,7 +119,7 @@ struct HttpServerControlInner {
     // Tokio reactor. Each generation clones it and installs that clone in the
     // current reactor, so restored epoll state is never the only accept path.
     listener: std::net::TcpListener,
-    token: Option<String>,
+    token: RwLock<Option<String>>,
     accept_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     generation: AtomicU64,
     ready_tx: watch::Sender<super::RuntimeReadyState>,
@@ -145,7 +136,7 @@ impl HttpServerControl {
         let control = Self {
             inner: Arc::new(HttpServerControlInner {
                 listener,
-                token,
+                token: RwLock::new(token),
                 accept_task: Mutex::new(None),
                 generation: AtomicU64::new(0),
                 ready_tx,
@@ -153,6 +144,15 @@ impl HttpServerControl {
         };
         control.rearm()?;
         Ok(control)
+    }
+
+    pub(crate) fn update_token(&self, token: String) -> std::io::Result<()> {
+        *self
+            .inner
+            .token
+            .write()
+            .map_err(|_| std::io::Error::other("token lock poisoned"))? = Some(token);
+        Ok(())
     }
 
     pub(crate) fn rearm(&self) -> std::io::Result<u64> {
@@ -165,7 +165,12 @@ impl HttpServerControl {
         listener.set_nonblocking(true)?;
         let listener = TcpListener::from_std(listener)?;
         let generation = self.inner.generation.load(Ordering::Relaxed) + 1;
-        let token = self.inner.token.clone();
+        let token = self
+            .inner
+            .token
+            .read()
+            .map_err(|_| std::io::Error::other("token lock poisoned"))?
+            .clone();
         self.inner.generation.store(generation, Ordering::Release);
         // Publish the replacement generation before it can report a failure;
         // a fast accept error must win over Ready rather than be overwritten.
@@ -199,10 +204,15 @@ pub(crate) async fn serve_listener(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let address = listener.local_addr()?;
     rrt_info!("[rrt-http] atomic-ops server listening on {address}");
+    let mut connections = tokio::task::JoinSet::new();
     loop {
-        let (mut sock, _peer) = listener.accept().await?;
+        let accepted = tokio::select! {
+            accepted = listener.accept() => accepted,
+            _ = connections.join_next(), if !connections.is_empty() => continue,
+        };
+        let (mut sock, _peer) = accepted?;
         let token = token.clone();
-        tokio::spawn(async move {
+        connections.spawn(async move {
             if let Err(error) = handle_conn(&mut sock, token).await {
                 rrt_error!("[rrt-http] conn error: {error}");
             }
@@ -230,7 +240,6 @@ async fn handle_one_request(
     sock: &mut tokio::net::TcpStream,
     token: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let _active = super::activity::enter(super::activity::ActivitySource::DirectHttp);
     // Read until the header terminator (\r\n\r\n). Bodies support Content-Length or chunked encoding.
     let mut buf = Vec::with_capacity(4096);
     let mut tmp = [0u8; IO_BUFFER_SIZE];
@@ -273,6 +282,11 @@ async fn handle_one_request(
 
     // Health checks do not need a body.
     if method == "GET" && route == "/healthz" {
+        if super::control::current().is_some_and(|controller| {
+            controller.status().phase != adx_core::runtime::RuntimePhase::Running
+        }) {
+            return write_resp(sock, 503, "{\"status\":\"unavailable\"}").await;
+        }
         return write_resp(sock, 200, "{\"status\":\"ok\"}").await;
     }
     if method == "GET" && route == "/metrics" {
@@ -295,6 +309,37 @@ async fn handle_one_request(
         if auth.as_deref() != Some(expect) {
             return write_resp(sock, 401, "{\"error\":\"unauthorized\"}").await;
         }
+    }
+
+    if route.starts_with("/control/v1/") {
+        if content_len > 65536 || header_has_token(&head, "transfer-encoding", "chunked") {
+            return write_resp(
+                sock,
+                400,
+                "{\"error\":\"control body requires bounded content-length\"}",
+            )
+            .await;
+        }
+        let mut body = buf[header_end..].to_vec();
+        while body.len() < content_len {
+            let n = sock.read(&mut tmp).await?;
+            if n == 0 {
+                return Ok(());
+            }
+            body.extend_from_slice(&tmp[..n]);
+        }
+        let response = control_response(&method, route, &body[..content_len]).await;
+        return write_resp(sock, response.status, &response.body).await;
+    }
+    if super::control::current().is_some_and(|controller| {
+        controller.status().phase != adx_core::runtime::RuntimePhase::Running
+    }) {
+        return write_resp(
+            sock,
+            503,
+            "{\"error\":\"runtime checkpoint transition in progress\"}",
+        )
+        .await;
     }
 
     if method == "GET"
@@ -357,6 +402,60 @@ async fn handle_one_request(
 
     let resp = execute_invoke(request_id, action, kw, trace_id).await;
     write_resp(sock, resp.status, &resp.body).await
+}
+
+async fn control_response(method: &str, path: &str, body: &[u8]) -> CachedResponse {
+    use adx_core::{
+        runtime::{AbortCheckpoint, PrepareCheckpoint},
+        Error,
+    };
+    let Some(controller) = super::control::current() else {
+        return CachedResponse {
+            status: 503,
+            body: err_json("runtime identity is not configured"),
+        };
+    };
+    let result = match (method, path) {
+        ("GET", "/control/v1/status") => Ok(controller.status()),
+        ("POST", "/control/v1/checkpoint/prepare") => {
+            match serde_json::from_slice::<PrepareCheckpoint>(body) {
+                Ok(request) => controller.prepare(request).await,
+                Err(error) => Err(Error::Invalid(error.to_string())),
+            }
+        }
+        ("POST", "/control/v1/checkpoint/abort-unstarted") => {
+            match serde_json::from_slice::<AbortCheckpoint>(body) {
+                Ok(request) => controller.abort_unstarted(
+                    &request.operation_id,
+                    &request.identity,
+                    request.expected_revision,
+                ),
+                Err(error) => Err(Error::Invalid(error.to_string())),
+            }
+        }
+        _ => {
+            return CachedResponse {
+                status: 404,
+                body: err_json("unknown control operation"),
+            }
+        }
+    };
+    match result {
+        Ok(status) => CachedResponse {
+            status: 200,
+            body: serde_json::to_string(&status).expect("serializable status"),
+        },
+        Err(error) => CachedResponse {
+            status: if matches!(error, Error::Conflict) {
+                409
+            } else if matches!(error, Error::Invalid(_)) {
+                400
+            } else {
+                503
+            },
+            body: err_json(&error.to_string()),
+        },
+    }
 }
 
 async fn handle_command_watch(
@@ -583,6 +682,7 @@ async fn handle_upload(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // Streaming upload passes borrowed buffers without copying.
 async fn handle_file_upload(
     sock: &mut tokio::net::TcpStream,
     raw_path: &str,
@@ -672,6 +772,7 @@ async fn handle_file_upload(
     r
 }
 
+#[allow(clippy::too_many_arguments)] // Shares the streaming upload request context.
 async fn handle_file_upload_chunk(
     sock: &mut tokio::net::TcpStream,
     raw_path: &str,
@@ -1214,7 +1315,7 @@ async fn write_resp(
     };
     let resp = format!(
         "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{body}",
-        body.as_bytes().len()
+        body.len()
     );
     sock.write_all(resp.as_bytes()).await?;
     sock.flush().await?;
@@ -1443,418 +1544,14 @@ fn hex_encode(b: &[u8]) -> String {
     s
 }
 
-pub(crate) const RRT_CONTROL_SOCKET_PATH_ENV: &str = "ADX_RRT_CONTROL_SOCKET_PATH";
-const CHECKPOINT_SOCKET_NAME: &str = "rrt.sock";
-
-pub(crate) fn checkpoint_socket_path_from_control_directory(
-    configured_directory: Option<&OsStr>,
-) -> Option<PathBuf> {
-    configured_directory
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .map(|directory| directory.join(CHECKPOINT_SOCKET_NAME))
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct CheckpointHttpResponse {
-    pub status: u16,
-    pub body: String,
-}
-
-#[derive(Debug)]
-struct PendingCheckpointRequest {
-    request_id: String,
-    handoff_complete: bool,
-    snap_started: bool,
-    completion: Option<oneshot::Sender<Result<(), String>>>,
-}
-
-#[derive(Clone, Debug, Default)]
-pub(crate) struct CheckpointRequestCoordinator {
-    pending: Arc<Mutex<Option<PendingCheckpointRequest>>>,
-}
-
-impl CheckpointRequestCoordinator {
-    fn begin(&self, request_id: String) -> Result<oneshot::Receiver<Result<(), String>>, String> {
-        let mut pending = self
-            .pending
-            .lock()
-            .map_err(|_| "checkpoint coordinator lock is poisoned".to_string())?;
-        if pending.is_some() {
-            return Err("checkpoint is already in progress".to_string());
-        }
-        let (completion, receiver) = oneshot::channel();
-        *pending = Some(PendingCheckpointRequest {
-            request_id,
-            handoff_complete: false,
-            snap_started: false,
-            completion: Some(completion),
-        });
-        Ok(receiver)
-    }
-
-    fn fail(&self, request_id: &str, message: String) {
-        let Ok(mut pending) = self.pending.lock() else {
-            return;
-        };
-        if pending.as_ref().map(|value| value.request_id.as_str()) != Some(request_id) {
-            return;
-        }
-        if let Some(mut request) = pending.take() {
-            if let Some(completion) = request.completion.take() {
-                let _ = completion.send(Err(message));
-            }
-        }
-    }
-
-    pub(crate) fn reject_unstarted_checkpoint(&self, request_id: &str, message: String) -> bool {
-        let matches = self.pending.lock().ok().is_some_and(|pending| {
-            pending
-                .as_ref()
-                .is_some_and(|request| request.request_id == request_id)
-        });
-        if matches {
-            self.fail(request_id, format!("proxy rejected checkpoint: {message}"));
-        }
-        matches
-    }
-
-    pub(crate) fn record_proxy_ack(&self, request_id: &str, code: i32, message: String) {
-        if code != crate::posix::common::ErrorCode::ErrNone as i32 {
-            self.fail(request_id, format!("proxy rejected checkpoint: {message}"));
-        }
-    }
-
-    pub(crate) fn record_handoff(&self, outcome: crate::startup::CheckpointOutcome) {
-        if outcome == crate::startup::CheckpointOutcome::Error {
-            self.record_handoff_error("checkpoint handoff reported error".to_string());
-            return;
-        }
-        let Ok(mut pending) = self.pending.lock() else {
-            return;
-        };
-        // A restored runtime inherits the request that initiated the source
-        // checkpoint. The target must still complete its own SnapStarted
-        // handshake. Drop the copied source request so it cannot complete
-        // against the target's lifecycle events or leave the coordinator busy.
-        if outcome == crate::startup::CheckpointOutcome::Restore {
-            pending.take();
-            return;
-        }
-        let should_complete = if let Some(request) = pending.as_mut() {
-            request.handoff_complete = true;
-            request.snap_started
-        } else {
-            false
-        };
-        if should_complete {
-            complete_pending_checkpoint(&mut pending);
-        }
-    }
-
-    pub(crate) fn record_handoff_error(&self, message: String) {
-        let request_id = self
-            .pending
-            .lock()
-            .ok()
-            .and_then(|pending| pending.as_ref().map(|request| request.request_id.clone()));
-        if let Some(request_id) = request_id {
-            self.fail(&request_id, message);
-        }
-    }
-
-    pub(crate) fn record_snap_started(&self, code: i32, message: String) {
-        if code != crate::posix::common::ErrorCode::ErrNone as i32 {
-            self.record_handoff_error(format!("Proxy failed to finalize checkpoint: {message}"));
-            return;
-        }
-        let Ok(mut pending) = self.pending.lock() else {
-            return;
-        };
-        let should_complete = if let Some(request) = pending.as_mut() {
-            request.snap_started = true;
-            request.handoff_complete
-        } else {
-            false
-        };
-        if should_complete {
-            complete_pending_checkpoint(&mut pending);
-        }
-    }
-}
-
-fn complete_pending_checkpoint(pending: &mut Option<PendingCheckpointRequest>) {
-    if let Some(mut request) = pending.take() {
-        if let Some(completion) = request.completion.take() {
-            let _ = completion.send(Ok(()));
-        }
-    }
-}
-
-pub(crate) async fn invoke_checkpoint_handler(
-    instance_id: &str,
-    tx: mpsc::Sender<StreamingMessage>,
-    coordinator: CheckpointRequestCoordinator,
-) -> CheckpointHttpResponse {
-    let _active = super::activity::enter(super::activity::ActivitySource::Checkpoint);
-    let message = super::checkpoint_request_msg(instance_id);
-    let request_id = message.message_id.clone();
-    let completion = match coordinator.begin(request_id.clone()) {
-        Ok(completion) => completion,
-        Err(error) => {
-            return CheckpointHttpResponse {
-                status: 409,
-                body: err_json(&error),
-            };
-        }
-    };
-    if let Err(error) = tx.send(message).await {
-        coordinator.fail(
-            &request_id,
-            format!("checkpoint channel unavailable: {error}"),
-        );
-        return CheckpointHttpResponse {
-            status: 503,
-            body: err_json(&format!("checkpoint channel unavailable: {error}")),
-        };
-    }
-    match completion.await {
-        Ok(Ok(())) => CheckpointHttpResponse {
-            status: 200,
-            body: r#"{"status":"completed"}"#.to_string(),
-        },
-        Ok(Err(error)) => CheckpointHttpResponse {
-            status: 500,
-            body: err_json(&error),
-        },
-        Err(error) => CheckpointHttpResponse {
-            status: 500,
-            body: err_json(&format!("checkpoint completion was canceled: {error}")),
-        },
-    }
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct CheckpointServerControl {
-    inner: Arc<CheckpointServerControlInner>,
-}
-
-#[derive(Debug)]
-struct CheckpointServerControlInner {
-    listener: std::os::unix::net::UnixListener,
-    instance_id: RwLock<String>,
-    tx: mpsc::Sender<StreamingMessage>,
-    accept_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
-    generation: AtomicU64,
-    ready_tx: watch::Sender<super::RuntimeReadyState>,
-    coordinator: CheckpointRequestCoordinator,
-}
-
-impl CheckpointServerControl {
-    pub(crate) fn start(
-        listener: UnixListener,
-        instance_id: String,
-        tx: mpsc::Sender<StreamingMessage>,
-        ready_tx: watch::Sender<super::RuntimeReadyState>,
-    ) -> std::io::Result<Self> {
-        let listener = listener.into_std()?;
-        listener.set_nonblocking(true)?;
-        let control = Self {
-            inner: Arc::new(CheckpointServerControlInner {
-                listener,
-                instance_id: RwLock::new(instance_id),
-                tx,
-                accept_task: Mutex::new(None),
-                generation: AtomicU64::new(0),
-                ready_tx,
-                coordinator: CheckpointRequestCoordinator::default(),
-            }),
-        };
-        control.rearm()?;
-        Ok(control)
-    }
-
-    pub(crate) fn rebind_instance_id(&self, instance_id: &str) {
-        *self
-            .inner
-            .instance_id
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = instance_id.to_string();
-    }
-
-    pub(crate) fn reject_unstarted_checkpoint(&self, request_id: &str, message: String) -> bool {
-        self.inner
-            .coordinator
-            .reject_unstarted_checkpoint(request_id, message)
-    }
-
-    pub(crate) fn record_proxy_ack(&self, request_id: &str, code: i32, message: String) {
-        self.inner
-            .coordinator
-            .record_proxy_ack(request_id, code, message);
-    }
-
-    pub(crate) fn record_handoff(&self, outcome: crate::startup::CheckpointOutcome) {
-        self.inner.coordinator.record_handoff(outcome);
-    }
-
-    pub(crate) fn record_handoff_error(&self, message: String) {
-        self.inner.coordinator.record_handoff_error(message);
-    }
-
-    pub(crate) fn record_snap_started(&self, code: i32, message: String) {
-        self.inner.coordinator.record_snap_started(code, message);
-    }
-
-    pub(crate) fn rearm(&self) -> std::io::Result<u64> {
-        let mut accept_task = self
-            .inner
-            .accept_task
-            .lock()
-            .map_err(|_| std::io::Error::other("checkpoint listener lock is poisoned"))?;
-        let listener = self.inner.listener.try_clone()?;
-        listener.set_nonblocking(true)?;
-        let listener = UnixListener::from_std(listener)?;
-        let generation = self.inner.generation.load(Ordering::Relaxed) + 1;
-        self.inner.generation.store(generation, Ordering::Release);
-        let _ = self.inner.ready_tx.send(super::RuntimeReadyState::Ready);
-        let inner = Arc::downgrade(&self.inner);
-        let task = tokio::spawn(async move {
-            if let Err(error) = serve_checkpoint_listener(listener, inner.clone()).await {
-                if let Some(inner) = inner.upgrade() {
-                    if inner.generation.load(Ordering::Acquire) == generation {
-                        let _ = inner
-                            .ready_tx
-                            .send(super::RuntimeReadyState::Failed(format!(
-                                "checkpoint listener generation {generation} stopped: {error}"
-                            )));
-                    }
-                }
-            }
-        });
-        if let Some(previous) = accept_task.replace(task) {
-            previous.abort();
-        }
-        Ok(generation)
-    }
-}
-
-pub(crate) async fn bind_checkpoint_socket(path: &Path) -> std::io::Result<UnixListener> {
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-    match tokio::fs::remove_file(path).await {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
-    }
-    let listener = UnixListener::bind(path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666))?;
-    }
-    Ok(listener)
-}
-
-async fn serve_checkpoint_listener(
-    listener: UnixListener,
-    inner: std::sync::Weak<CheckpointServerControlInner>,
-) -> std::io::Result<()> {
-    loop {
-        let (mut stream, _) = listener.accept().await?;
-        let Some(inner) = inner.upgrade() else {
-            return Ok(());
-        };
-        let instance_id = inner
-            .instance_id
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
-        let tx = inner.tx.clone();
-        let coordinator = inner.coordinator.clone();
-        tokio::spawn(async move {
-            let _ = handle_checkpoint_connection(&mut stream, &instance_id, tx, coordinator).await;
-        });
-    }
-}
-
-async fn handle_checkpoint_connection(
-    stream: &mut UnixStream,
-    instance_id: &str,
-    tx: mpsc::Sender<StreamingMessage>,
-    coordinator: CheckpointRequestCoordinator,
-) -> std::io::Result<()> {
-    let mut request = Vec::with_capacity(512);
-    let mut buffer = [0u8; 512];
-    loop {
-        let count = stream.read(&mut buffer).await?;
-        if count == 0 {
-            return Ok(());
-        }
-        request.extend_from_slice(&buffer[..count]);
-        if find_subslice(&request, b"\r\n\r\n").is_some() {
-            break;
-        }
-        if request.len() > 8192 {
-            return write_checkpoint_response(stream, 431, r#"{"error":"headers too large"}"#)
-                .await;
-        }
-    }
-    let head = String::from_utf8_lossy(&request);
-    let (method, path) = parse_request_line(&head);
-    let response = if method != "POST" {
-        CheckpointHttpResponse {
-            status: 405,
-            body: r#"{"error":"method not allowed"}"#.to_string(),
-        }
-    } else if request_path(&path) != "/checkpoint" {
-        CheckpointHttpResponse {
-            status: 404,
-            body: r#"{"error":"not found"}"#.to_string(),
-        }
-    } else {
-        invoke_checkpoint_handler(instance_id, tx, coordinator).await
-    };
-    write_checkpoint_response(stream, response.status, &response.body).await
-}
-
-async fn write_checkpoint_response(
-    stream: &mut UnixStream,
-    status: u16,
-    body: &str,
-) -> std::io::Result<()> {
-    let reason = match status {
-        200 => "OK",
-        409 => "Conflict",
-        500 => "Internal Server Error",
-        404 => "Not Found",
-        405 => "Method Not Allowed",
-        431 => "Request Header Fields Too Large",
-        503 => "Service Unavailable",
-        _ => "Error",
-    };
-    let response = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
-    stream.write_all(response.as_bytes()).await?;
-    stream.flush().await
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        bind, checkpoint_socket_path_from_control_directory, handle_conn,
-        invoke_checkpoint_handler, parse_content_length, parse_range_header, percent_decode,
-        query_param, request_path, serve_listener, upload_part_path, upload_type,
-        CheckpointRequestCoordinator, CheckpointServerControl,
+        bind, handle_conn, parse_content_length, parse_range_header, percent_decode, query_param,
+        request_path, serve_listener, upload_part_path, upload_type,
     };
-    use crate::posix::runtime_rpc::StreamingMessage;
     use futures_util::{SinkExt, StreamExt};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::UnixListener;
-    use tokio::sync::{mpsc, watch};
 
     async fn read_http_response(stream: &mut tokio::net::TcpStream) -> (String, Vec<u8>) {
         let mut bytes = Vec::new();
@@ -1871,6 +1568,65 @@ mod tests {
         let mut body = vec![0u8; content_length];
         stream.read_exact(&mut body).await.unwrap();
         (head, body)
+    }
+
+    async fn invoke_over_http(action: &str, args: serde_json::Value) -> serde_json::Value {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            handle_conn(&mut socket, Some("test-token".into()))
+                .await
+                .unwrap();
+        });
+        let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+        let body = serde_json::json!({"action": action, "args": args}).to_string();
+        let request = format!("POST /invoke HTTP/1.1\r\nHost: localhost\r\nX-Auth: test-token\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", body.len(), body);
+        client.write_all(request.as_bytes()).await.unwrap();
+        let (head, body) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            read_http_response(&mut client),
+        )
+        .await
+        .unwrap();
+        assert!(
+            head.starts_with("HTTP/1.1 200"),
+            "{head}: {}",
+            String::from_utf8_lossy(&body)
+        );
+        drop(client);
+        server.await.unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn http_command_returns_actual_stdout_stderr_and_exit_status() {
+        let response = invoke_over_http(
+            "process.exec",
+            serde_json::json!({"command":"printf hello; printf error >&2; exit 7"}),
+        )
+        .await;
+        assert_eq!(response["stdout"], "hello");
+        assert_eq!(response["stderr"], "error");
+        assert_eq!(response["exit_code"], 7);
+    }
+
+    #[tokio::test]
+    async fn http_filesystem_roundtrip_preserves_binary_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sub/file.bin");
+        let response = invoke_over_http(
+            "file.write",
+            serde_json::json!({"path":path,"binary":true,"data":"000aff80"}),
+        )
+        .await;
+        assert!(response["error"].is_null(), "{response}");
+        assert_eq!(std::fs::read(&path).unwrap(), vec![0, 10, 255, 128]);
+        let response =
+            invoke_over_http("file.read", serde_json::json!({"path":path,"binary":true})).await;
+        assert_eq!(response["data"], "000aff80");
     }
 
     #[tokio::test]
@@ -1900,14 +1656,7 @@ mod tests {
         server.await.unwrap();
     }
 
-    use std::ffi::OsStr;
-    use std::path::PathBuf;
     use std::process::Command;
-    use std::time::Duration;
-    use tokio::sync::oneshot;
-
-    use crate::posix::runtime_rpc::streaming_message;
-    use crate::startup::CheckpointOutcome;
 
     #[test]
     fn parses_binary_stream_request_targets() {
@@ -1939,344 +1688,6 @@ mod tests {
         assert_eq!(parse_range_header(head, 20), Some((5, 9)));
         let head = "GET /download HTTP/1.1\r\nRange: bytes=5-\r\n\r\n";
         assert_eq!(parse_range_header(head, 20), Some((5, 19)));
-    }
-
-    #[tokio::test]
-    async fn checkpoint_pre_rpc_rejections_release_wait_and_reuse_one_handoff_reader() {
-        const ISOLATED: &str = "ADX_RRT_REJECTED_HANDOFF_TEST_ISOLATED";
-        if std::env::var_os(ISOLATED).is_none() {
-            let status = Command::new(std::env::current_exe().unwrap())
-                .arg("runtime::httpserver::tests::checkpoint_pre_rpc_rejections_release_wait_and_reuse_one_handoff_reader")
-                .arg("--exact").arg("--test-threads=1").env(ISOLATED, "1")
-                .status().unwrap();
-            assert!(status.success());
-            return;
-        }
-        use super::super::{handle_prepare_snap_on_stream, CheckpointHandoffFuture};
-        use crate::posix::core_service::KillResponse;
-        use std::io::Write;
-        use std::os::unix::ffi::OsStrExt;
-        use tokio_stream::wrappers::ReceiverStream;
-
-        let directory = tempfile::tempdir().unwrap();
-        let listener = UnixListener::bind(directory.path().join("checkpoint.sock")).unwrap();
-        let (tx, _rx) = mpsc::channel(8);
-        let (ready_tx, _ready_rx) = watch::channel(super::super::RuntimeReadyState::Ready);
-        let control =
-            CheckpointServerControl::start(listener, "sandbox".into(), tx, ready_tx).unwrap();
-        let barrier_path = directory.path().join("handoff");
-        let path = std::ffi::CString::new(barrier_path.as_os_str().as_bytes()).unwrap();
-        // A real blocking descriptor models the backend barrier. Keeping its
-        // writer open ensures rejected attempts receive no handoff event.
-        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
-        let mut writer = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&barrier_path)
-            .unwrap();
-        std::env::set_var("ADX_CHECKPOINT_HANDOFF_FILE", &barrier_path);
-        let mut handoff: Option<CheckpointHandoffFuture> = None;
-        let (in_tx, in_rx) = mpsc::channel(8);
-        let mut inbound = ReceiverStream::new(in_rx);
-        let (response_tx, mut response_rx) = mpsc::channel(8);
-        let mut buffered = std::collections::VecDeque::new();
-
-        for attempt in 0..3 {
-            let request_id = format!("checkpoint-{attempt}");
-            let completion = control.inner.coordinator.begin(request_id.clone()).unwrap();
-            in_tx
-                .send(Ok(StreamingMessage {
-                    message_id: request_id,
-                    body: Some(streaming_message::Body::KillRsp(KillResponse {
-                        code: 80034,
-                        message: "sandbox runtime does not advertise checkpoint/restore capability"
-                            .into(),
-                        checkpoint_not_started: true,
-                        ..Default::default()
-                    })),
-                    ..Default::default()
-                }))
-                .await
-                .unwrap();
-            let keep_stream = tokio::time::timeout(
-                Duration::from_secs(1),
-                handle_prepare_snap_on_stream(
-                    format!("prepare-{attempt}"),
-                    &response_tx,
-                    &mut inbound,
-                    &mut buffered,
-                    &mut handoff,
-                    Some(&control),
-                ),
-            )
-            .await
-            .expect("pre-RPC failure must not wait for handoff");
-            assert!(keep_stream);
-            assert!(
-                handoff.is_some(),
-                "reuse the next backend checkpoint generation"
-            );
-            assert!(buffered.is_empty());
-            assert!(completion
-                .await
-                .unwrap()
-                .unwrap_err()
-                .contains("does not advertise"));
-            assert!(matches!(
-                response_rx.recv().await.unwrap().body,
-                Some(streaming_message::Body::PrepareSnapRsp(_))
-            ));
-        }
-
-        let completion = control
-            .inner
-            .coordinator
-            .begin("checkpoint-success".into())
-            .unwrap();
-        writer.write_all(b"resume").unwrap();
-        drop(writer);
-        assert!(tokio::time::timeout(
-            Duration::from_secs(1),
-            handle_prepare_snap_on_stream(
-                "prepare-success".into(),
-                &response_tx,
-                &mut inbound,
-                &mut buffered,
-                &mut handoff,
-                Some(&control),
-            )
-        )
-        .await
-        .unwrap());
-        assert!(handoff.is_none());
-        control.record_snap_started(0, String::new());
-        assert_eq!(completion.await.unwrap(), Ok(()));
-    }
-
-    #[tokio::test]
-    async fn checkpoint_handoff_ignores_unrelated_and_uncertain_rejections() {
-        use super::super::{handle_prepare_snap_on_stream, CheckpointHandoffFuture};
-        use crate::posix::core_service::KillResponse;
-        use tokio_stream::wrappers::ReceiverStream;
-
-        let directory = tempfile::tempdir().unwrap();
-        let listener = UnixListener::bind(directory.path().join("checkpoint.sock")).unwrap();
-        let (tx, _rx) = mpsc::channel(8);
-        let (ready_tx, _ready_rx) = watch::channel(super::super::RuntimeReadyState::Ready);
-        let control =
-            CheckpointServerControl::start(listener, "sandbox".into(), tx, ready_tx).unwrap();
-        let mut completion = control
-            .inner
-            .coordinator
-            .begin("checkpoint".into())
-            .unwrap();
-        let mut handoff: Option<CheckpointHandoffFuture> = Some(Box::pin(std::future::pending()));
-        let (in_tx, in_rx) = mpsc::channel(8);
-        let mut inbound = ReceiverStream::new(in_rx);
-        for (id, not_started) in [("unrelated", true), ("checkpoint", false)] {
-            in_tx
-                .send(Ok(StreamingMessage {
-                    message_id: id.into(),
-                    body: Some(streaming_message::Body::KillRsp(KillResponse {
-                        code: 80034,
-                        checkpoint_not_started: not_started,
-                        ..Default::default()
-                    })),
-                    ..Default::default()
-                }))
-                .await
-                .unwrap();
-        }
-        let (response_tx, _response_rx) = mpsc::channel(8);
-        let mut buffered = std::collections::VecDeque::new();
-        assert!(tokio::time::timeout(
-            Duration::from_millis(50),
-            handle_prepare_snap_on_stream(
-                "prepare".into(),
-                &response_tx,
-                &mut inbound,
-                &mut buffered,
-                &mut handoff,
-                Some(&control),
-            )
-        )
-        .await
-        .is_err());
-        assert_eq!(buffered.len(), 2);
-        assert!(handoff.is_some());
-        assert!(matches!(
-            completion.try_recv(),
-            Err(oneshot::error::TryRecvError::Empty)
-        ));
-        control.record_handoff(CheckpointOutcome::Restore);
-    }
-
-    #[tokio::test]
-    async fn checkpoint_endpoint_waits_for_handoff_and_snap_started() {
-        const ISOLATED_ENV: &str = "ADX_RRT_CHECKPOINT_ACTIVITY_TEST_ISOLATED";
-        if std::env::var_os(ISOLATED_ENV).is_none() {
-            let status = Command::new(std::env::current_exe().expect("current test executable"))
-                .arg(
-                    "runtime::httpserver::tests::checkpoint_endpoint_waits_for_handoff_and_snap_started",
-                )
-                .arg("--exact")
-                .arg("--test-threads=1")
-                .env(ISOLATED_ENV, "1")
-                .status()
-                .expect("run isolated checkpoint activity test");
-            assert!(status.success(), "isolated checkpoint activity test failed");
-            return;
-        }
-
-        let baseline = super::super::activity::active_count();
-        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-        let coordinator = CheckpointRequestCoordinator::default();
-
-        let request = tokio::spawn(invoke_checkpoint_handler(
-            "sandbox-a",
-            tx,
-            coordinator.clone(),
-        ));
-
-        let message = rx.recv().await.expect("checkpoint signal");
-        assert_eq!(super::super::activity::active_count(), baseline + 1);
-        assert!(
-            !request.is_finished(),
-            "HTTP completed before checkpoint handoff"
-        );
-
-        coordinator.record_handoff(CheckpointOutcome::Resume);
-        tokio::task::yield_now().await;
-        assert!(!request.is_finished(), "HTTP completed before SnapStarted");
-
-        coordinator.record_snap_started(
-            crate::posix::common::ErrorCode::ErrNone as i32,
-            String::new(),
-        );
-        let response = tokio::time::timeout(std::time::Duration::from_secs(1), request)
-            .await
-            .expect("checkpoint HTTP completion timed out")
-            .expect("checkpoint HTTP task");
-        assert_eq!(super::super::activity::active_count(), baseline);
-
-        assert_eq!(response.status, 200);
-        assert_eq!(response.body, r#"{"status":"completed"}"#);
-        let Some(streaming_message::Body::KillReq(kill)) = message.body else {
-            panic!("unexpected checkpoint message body")
-        };
-        assert_eq!(kill.instance_id, "sandbox-a");
-        assert_eq!(kill.signal, 24);
-        assert!(!kill.request_id.is_empty());
-    }
-
-    #[test]
-    fn checkpoint_completion_accepts_both_event_orders() {
-        for snap_started_first in [false, true] {
-            for proxy_ack_received in [false, true] {
-                let coordinator = CheckpointRequestCoordinator::default();
-                let mut completion = coordinator.begin("checkpoint-a".to_string()).unwrap();
-                if proxy_ack_received {
-                    coordinator.record_proxy_ack("checkpoint-a", 0, String::new());
-                }
-                assert!(matches!(
-                    completion.try_recv(),
-                    Err(oneshot::error::TryRecvError::Empty)
-                ));
-                if snap_started_first {
-                    coordinator.record_snap_started(0, String::new());
-                } else {
-                    coordinator.record_handoff(CheckpointOutcome::Resume);
-                }
-                assert!(matches!(
-                    completion.try_recv(),
-                    Err(oneshot::error::TryRecvError::Empty)
-                ));
-                if snap_started_first {
-                    coordinator.record_handoff(CheckpointOutcome::Resume);
-                } else {
-                    coordinator.record_snap_started(0, String::new());
-                }
-                assert_eq!(completion.try_recv(), Ok(Ok(())));
-
-                let mut next = coordinator.begin("checkpoint-b".to_string()).unwrap();
-                coordinator.record_proxy_ack("checkpoint-a", 1, "late reply".to_string());
-                assert!(matches!(
-                    next.try_recv(),
-                    Err(oneshot::error::TryRecvError::Empty)
-                ));
-                coordinator.record_handoff(CheckpointOutcome::Resume);
-                coordinator.record_snap_started(0, String::new());
-                assert_eq!(next.try_recv(), Ok(Ok(())));
-            }
-        }
-    }
-
-    #[test]
-    fn checkpoint_completion_preserves_errors() {
-        for failure in ["proxy", "handoff", "snap_started"] {
-            let coordinator = CheckpointRequestCoordinator::default();
-            let mut completion = coordinator.begin("checkpoint-a".to_string()).unwrap();
-            match failure {
-                "proxy" => coordinator.record_proxy_ack("checkpoint-a", 1, "rejected".to_string()),
-                "handoff" => coordinator.record_handoff(CheckpointOutcome::Error),
-                "snap_started" => coordinator.record_snap_started(1, "rearm failed".to_string()),
-                _ => unreachable!(),
-            }
-            assert!(matches!(completion.try_recv(), Ok(Err(_))), "{failure}");
-            assert!(coordinator.begin("checkpoint-b".to_string()).is_ok());
-        }
-    }
-
-    #[tokio::test]
-    async fn restored_runtime_discards_source_checkpoint_request() {
-        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-        let coordinator = CheckpointRequestCoordinator::default();
-        let source_request = tokio::spawn(invoke_checkpoint_handler(
-            "sandbox-source",
-            tx.clone(),
-            coordinator.clone(),
-        ));
-
-        rx.recv().await.expect("source checkpoint signal");
-        coordinator.record_handoff(CheckpointOutcome::Restore);
-        let source_response = source_request.await.expect("source checkpoint HTTP task");
-        assert_eq!(source_response.status, 500);
-        coordinator.record_snap_started(
-            crate::posix::common::ErrorCode::ErrNone as i32,
-            "restored runtime SnapStarted completed".to_string(),
-        );
-
-        let restored_request = tokio::spawn(invoke_checkpoint_handler(
-            "sandbox-restored",
-            tx,
-            coordinator.clone(),
-        ));
-        rx.recv().await.expect("restored checkpoint signal");
-        coordinator.record_handoff(CheckpointOutcome::Resume);
-        coordinator.record_snap_started(
-            crate::posix::common::ErrorCode::ErrNone as i32,
-            String::new(),
-        );
-        let restored_response =
-            tokio::time::timeout(std::time::Duration::from_secs(1), restored_request)
-                .await
-                .expect("restored checkpoint HTTP completion timed out")
-                .expect("restored checkpoint HTTP task");
-        assert_eq!(restored_response.status, 200);
-        assert_eq!(restored_response.body, r#"{"status":"completed"}"#);
-    }
-
-    #[test]
-    fn checkpoint_socket_uses_configured_control_directory() {
-        assert_eq!(
-            checkpoint_socket_path_from_control_directory(Some(OsStr::new("/run/adx-control"))),
-            Some(PathBuf::from("/run/adx-control/rrt.sock")),
-        );
-        assert_eq!(checkpoint_socket_path_from_control_directory(None), None);
-        assert_eq!(
-            checkpoint_socket_path_from_control_directory(Some(OsStr::new(""))),
-            None,
-        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

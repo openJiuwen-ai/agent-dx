@@ -1,0 +1,11 @@
+[package]
+name = "adx-discovery"
+version = "0.1.0"
+edition = "2021"
+[dependencies]
+adx-core = { path = "../core" }
+redis = { version = "1.7", default-features = false, features = ["tokio-comp"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+http = "1"
+tokio = { version = "1", features = ["sync", "time"] }

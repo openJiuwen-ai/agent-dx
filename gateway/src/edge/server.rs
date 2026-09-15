@@ -2121,8 +2121,8 @@ mod tests {
             return;
         }
         for level in ["info", "debug"] {
-            let directory =
-                std::env::temp_dir().join(format!("adx-ingress-log-{}-{level}", std::process::id()));
+            let directory = std::env::temp_dir()
+                .join(format!("adx-ingress-log-{}-{level}", std::process::id()));
             std::fs::create_dir(&directory).unwrap();
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([

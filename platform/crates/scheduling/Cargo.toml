@@ -1,0 +1,8 @@
+[package]
+name = "adx-scheduling"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+adx-core = { path = "../core" }
+im = { version = "15.1", default-features = false }

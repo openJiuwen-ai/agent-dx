@@ -188,15 +188,13 @@ impl NodeProxyConfig {
 
 impl EdgeFrontendConfig {
     pub fn from_env() -> Result<Self, ConfigError> {
-        let value = match env::var(EDGE_FRONTEND_ETCD_ENDPOINTS_ENV) {
-            Ok(value) => value,
-            Err(env::VarError::NotPresent) => return Err(ConfigError::MissingEtcdEndpoints),
-            Err(env::VarError::NotUnicode(_)) => return Err(ConfigError::InvalidEtcdEndpoints),
-        };
-        let etcd_endpoints = Self::parse_etcd_endpoints(&value)?;
+        let etcd_endpoints = Vec::new();
         let tls_bind = parse_env("ADX_DATA_PLANE_EDGE_FRONTEND_TLS_BIND", "0.0.0.0:8443")?;
         let plain_bind = parse_env("ADX_DATA_PLANE_EDGE_FRONTEND_PLAIN_BIND", "0.0.0.0:8080")?;
-        let health_bind = parse_env("ADX_DATA_PLANE_EDGE_FRONTEND_HEALTH_BIND", "127.0.0.1:18080")?;
+        let health_bind = parse_env(
+            "ADX_DATA_PLANE_EDGE_FRONTEND_HEALTH_BIND",
+            "127.0.0.1:18080",
+        )?;
         let tls_cert = env::var("ADX_DATA_PLANE_EDGE_FRONTEND_TLS_CERT").unwrap_or_default();
         let tls_key = env::var("ADX_DATA_PLANE_EDGE_FRONTEND_TLS_KEY").unwrap_or_default();
         if tls_cert.is_empty() || tls_key.is_empty() {
@@ -230,13 +228,8 @@ impl EdgeFrontendConfig {
             Err(env::VarError::NotPresent) => Vec::new(),
             Err(error) => return Err(ConfigError::Invalid(format!("proxy routes file: {error}"))),
         };
-        let validate_iam = parse_bool_env("ADX_DATA_PLANE_EDGE_FRONTEND_VALIDATE_IAM", true)?;
-        let iam_address = env::var("ADX_DATA_PLANE_EDGE_FRONTEND_IAM_ADDRESS").unwrap_or_default();
-        if validate_iam && iam_address.trim().is_empty() {
-            return Err(ConfigError::Invalid(
-                "Edge IAM address is required when tenant and IAM validation are enabled".into(),
-            ));
-        }
+        let validate_iam = false;
+        let iam_address = String::new();
         let auth_cache_ttl = Duration::from_secs(parse_env(
             "ADX_DATA_PLANE_EDGE_FRONTEND_AUTH_CACHE_TTL_SEC",
             "30",
@@ -363,7 +356,8 @@ impl EdgeFrontendConfig {
         let etcd_tls_ca = env::var("ADX_DATA_PLANE_EDGE_FRONTEND_ETCD_TLS_CA").unwrap_or_default();
         let etcd_tls_cert =
             env::var("ADX_DATA_PLANE_EDGE_FRONTEND_ETCD_TLS_CERT").unwrap_or_default();
-        let etcd_tls_key = env::var("ADX_DATA_PLANE_EDGE_FRONTEND_ETCD_TLS_KEY").unwrap_or_default();
+        let etcd_tls_key =
+            env::var("ADX_DATA_PLANE_EDGE_FRONTEND_ETCD_TLS_KEY").unwrap_or_default();
         let etcd_tls_domain =
             env::var("ADX_DATA_PLANE_EDGE_FRONTEND_ETCD_TLS_DOMAIN").unwrap_or_default();
         let etcd_username =
@@ -424,6 +418,7 @@ impl EdgeFrontendConfig {
         })
     }
 
+    #[cfg(test)]
     fn parse_etcd_endpoints(value: &str) -> Result<Vec<String>, ConfigError> {
         let etcd_endpoints = value
             .split(',')

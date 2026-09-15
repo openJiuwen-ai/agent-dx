@@ -1,0 +1,233 @@
+//! Generated transport contracts and validated conversions, without services.
+pub mod control {
+    tonic::include_proto!("adx.control.v1");
+}
+
+use adx_core::{Error, Result};
+mod scheduling;
+
+impl From<adx_core::Resources> for control::Resources {
+    fn from(value: adx_core::Resources) -> Self {
+        Self {
+            cpu_millis: value.cpu_millis,
+            memory_bytes: value.memory_bytes,
+            disk_bytes: value.disk_bytes,
+        }
+    }
+}
+
+impl TryFrom<control::InstanceSpec> for adx_core::InstanceSpec {
+    type Error = Error;
+    fn try_from(value: control::InstanceSpec) -> Result<Self> {
+        let resources = value
+            .resources
+            .ok_or_else(|| Error::Invalid("resources are required".into()))?;
+        let spec = Self {
+            env: value.env.into_iter().collect(),
+            id: value.id,
+            tenant_id: value.tenant_id,
+            image: value.image,
+            runtime: value.runtime,
+            resources: adx_core::Resources {
+                cpu_millis: resources.cpu_millis,
+                memory_bytes: resources.memory_bytes,
+                disk_bytes: resources.disk_bytes,
+            },
+            priority: value.priority,
+            scheduling: value
+                .scheduling
+                .map(TryInto::try_into)
+                .transpose()?
+                .unwrap_or_default(),
+        };
+        spec.validate()?;
+        Ok(spec)
+    }
+}
+
+impl From<adx_core::InstanceSpec> for control::InstanceSpec {
+    fn from(value: adx_core::InstanceSpec) -> Self {
+        Self {
+            env: value.env.into_iter().collect(),
+            id: value.id,
+            tenant_id: value.tenant_id,
+            image: value.image,
+            runtime: value.runtime,
+            resources: Some(value.resources.into()),
+            priority: value.priority,
+            scheduling: Some(value.scheduling.into()),
+        }
+    }
+}
+
+impl TryFrom<control::Assignment> for adx_core::Assignment {
+    type Error = Error;
+    fn try_from(value: control::Assignment) -> Result<Self> {
+        if value.instance_id.trim().is_empty()
+            || value.node_id.trim().is_empty()
+            || value.generation == 0
+        {
+            return Err(Error::Invalid(
+                "assignment requires instance, node and generation".into(),
+            ));
+        }
+        let devices: Vec<adx_core::scheduling::DeviceAllocation> = value
+            .devices
+            .into_iter()
+            .map(TryInto::try_into)
+            .collect::<Result<_>>()?;
+        adx_core::scheduling::validate_allocations(&devices)?;
+        Ok(Self {
+            devices,
+            instance_id: value.instance_id,
+            node_id: value.node_id,
+            domain_id: value.domain_id as usize,
+            generation: value.generation,
+        })
+    }
+}
+
+impl TryFrom<adx_core::Assignment> for control::Assignment {
+    type Error = Error;
+    fn try_from(value: adx_core::Assignment) -> Result<Self> {
+        adx_core::scheduling::validate_allocations(&value.devices)?;
+        Ok(Self {
+            devices: value.devices.into_iter().map(Into::into).collect(),
+            instance_id: value.instance_id,
+            node_id: value.node_id,
+            domain_id: u32::try_from(value.domain_id)
+                .map_err(|_| Error::Invalid("domain id overflow".into()))?,
+            generation: value.generation,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use prost::Message;
+
+    #[test]
+    fn missing_resources_and_zero_generation_are_rejected() {
+        assert!(adx_core::InstanceSpec::try_from(control::InstanceSpec::default()).is_err());
+        assert!(adx_core::Assignment::try_from(control::Assignment::default()).is_err());
+    }
+
+    #[test]
+    fn instance_spec_round_trip_preserves_units_and_priority() {
+        let value = adx_core::InstanceSpec {
+            env: Default::default(),
+            scheduling: Default::default(),
+            id: "a".into(),
+            tenant_id: "t".into(),
+            image: "image".into(),
+            runtime: "runtime".into(),
+            resources: adx_core::Resources {
+                cpu_millis: 1500,
+                memory_bytes: 2 * 1024 * 1024 * 1024,
+                disk_bytes: u64::MAX,
+            },
+            priority: -10,
+        };
+        let bytes = control::InstanceSpec::from(value.clone()).encode_to_vec();
+        let decoded = control::InstanceSpec::decode(bytes.as_slice()).unwrap();
+        assert_eq!(adx_core::InstanceSpec::try_from(decoded).unwrap(), value);
+    }
+}
+
+/// Node-local binding and activity contracts.
+pub mod node_proxy {
+    tonic::include_proto!("adx.node.v1");
+}
+
+pub mod auth;
+
+impl TryFrom<control::InstanceRecord> for adx_core::InstanceRecord {
+    type Error = Error;
+    fn try_from(v: control::InstanceRecord) -> Result<Self> {
+        let spec: adx_core::InstanceSpec = v
+            .spec
+            .ok_or_else(|| Error::Invalid("spec required".into()))?
+            .try_into()?;
+        let assignment: adx_core::Assignment = v
+            .assignment
+            .ok_or_else(|| Error::Invalid("assignment required".into()))?
+            .try_into()?;
+        if spec.id != assignment.instance_id {
+            return Err(Error::Conflict);
+        }
+        adx_core::scheduling::validate_device_assignment(
+            &spec.scheduling.devices,
+            &assignment.devices,
+        )?;
+        let state = match control::InstanceState::try_from(v.state) {
+            Ok(control::InstanceState::Pending) => adx_core::InstanceState::Pending,
+            Ok(control::InstanceState::Starting) => adx_core::InstanceState::Starting,
+            Ok(control::InstanceState::Running) => adx_core::InstanceState::Running,
+            Ok(control::InstanceState::Deleting) => adx_core::InstanceState::Deleting,
+            Ok(control::InstanceState::Deleted) => adx_core::InstanceState::Deleted,
+            Ok(control::InstanceState::Failed) => adx_core::InstanceState::Failed,
+            _ => return Err(Error::Invalid("unknown instance state".into())),
+        };
+        let runtime_ip = if v.runtime_ip.is_empty() {
+            None
+        } else {
+            Some(
+                v.runtime_ip
+                    .parse()
+                    .map_err(|_| Error::Invalid("invalid runtime IP".into()))?,
+            )
+        };
+        Ok(Self {
+            spec,
+            assignment,
+            state,
+            revision: v.revision,
+            runtime_id: v.runtime_id,
+            resources_held: v.resources_held,
+            runtime_ip,
+        })
+    }
+}
+impl TryFrom<adx_core::InstanceRecord> for control::InstanceRecord {
+    type Error = Error;
+    fn try_from(v: adx_core::InstanceRecord) -> Result<Self> {
+        let state = match v.state {
+            adx_core::InstanceState::Pending => control::InstanceState::Pending,
+            adx_core::InstanceState::Starting => control::InstanceState::Starting,
+            adx_core::InstanceState::Running => control::InstanceState::Running,
+            adx_core::InstanceState::Deleting => control::InstanceState::Deleting,
+            adx_core::InstanceState::Deleted => control::InstanceState::Deleted,
+            adx_core::InstanceState::Failed => control::InstanceState::Failed,
+        };
+        Ok(Self {
+            spec: Some(v.spec.into()),
+            assignment: Some(v.assignment.try_into()?),
+            state: state as i32,
+            revision: v.revision,
+            runtime_id: v.runtime_id,
+            resources_held: v.resources_held,
+            runtime_ip: v.runtime_ip.map(|ip| ip.to_string()).unwrap_or_default(),
+        })
+    }
+}
+pub fn status(error: adx_core::Error) -> tonic::Status {
+    match error {
+        Error::Invalid(message) => tonic::Status::invalid_argument(message),
+        Error::Conflict => tonic::Status::failed_precondition("identity or version conflict"),
+        Error::NotFound => tonic::Status::not_found("instance or node not found"),
+        Error::NoCapacity => tonic::Status::resource_exhausted("capacity unavailable"),
+        Error::Unavailable(message) => tonic::Status::unavailable(message),
+    }
+}
+pub fn dependency_status(status: tonic::Status) -> Error {
+    match status.code() {
+        tonic::Code::FailedPrecondition => Error::Conflict,
+        tonic::Code::NotFound => Error::NotFound,
+        tonic::Code::ResourceExhausted => Error::NoCapacity,
+        tonic::Code::InvalidArgument => Error::Invalid("remote request rejected".into()),
+        _ => Error::Unavailable("control RPC unavailable".into()),
+    }
+}
+
+pub mod tls;

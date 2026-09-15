@@ -1,3 +1,13 @@
 [workspace]
 resolver = "2"
-members = ["gateway", "platform/runtime/rrt"]
+members = [
+    "gateway",
+    "platform/runtime/rrt",
+    "platform/crates/core",
+    "platform/crates/scheduling",
+    "platform/crates/protocol",
+    "platform/crates/discovery",
+    "platform/control-plane/master",
+    "platform/control-plane/control-cli",
+    "platform/control-plane/node-manager",
+]

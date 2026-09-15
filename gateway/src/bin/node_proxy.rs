@@ -24,6 +24,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn run(config: NodeProxyConfig) -> Result<(), Box<dyn std::error::Error>> {
+    if config.activity_uds_dir.is_none() {
+        return Err(
+            "ADX_DATA_PLANE_NODE_PROXY_ACTIVITY_UDS_DIR is required for managed bindings".into(),
+        );
+    }
     let listener = TcpListener::bind(config.bind).await?;
     let health_listener = TcpListener::bind(config.health_bind).await?;
     let mut gateway = NodeProxy::new(GatewayPolicy::new(config.allowed_target_networks.clone()))
@@ -31,7 +36,7 @@ async fn run(config: NodeProxyConfig) -> Result<(), Box<dyn std::error::Error>> 
     #[cfg(feature = "activity-client")]
     let activity_control = if let Some(uds_dir) = &config.activity_uds_dir {
         let uds_path = std::path::Path::new(uds_dir)
-            .join("fs.sock")
+            .join("node-manager.sock")
             .to_string_lossy()
             .into_owned();
         let tracker = Arc::new(ActivityTracker::new(config.gateway_epoch.clone()));
@@ -44,14 +49,18 @@ async fn run(config: NodeProxyConfig) -> Result<(), Box<dyn std::error::Error>> 
     };
     let gateway = Arc::new(gateway);
     #[cfg(feature = "activity-client")]
+    if activity_control.is_some() {
+        gateway.set_bindings_ready(false);
+    }
+    #[cfg(feature = "activity-client")]
     if let Some((tracker, activity_uds_path, uds_dir)) = activity_control {
         let route_uds_path = std::path::Path::new(&uds_dir)
             .join("route.sock")
             .to_string_lossy()
             .into_owned();
         // Bind the admission-control socket before publishing the gateway
-        // epoch. FunctionProxy uses the first activity report to replay all
-        // recovered ACTIVE routes after a Node Proxy restart.
+        // session. Node Manager must reconcile bindings before resumed traffic;
+        // activity snapshots are observations, not route replay commands.
         let route_listener = data_plane_gateway::node::bind_route_control(&route_uds_path).await?;
         let route_gateway = gateway.clone();
         tokio::spawn(async move {

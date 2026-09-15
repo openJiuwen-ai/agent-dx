@@ -699,7 +699,7 @@ class SandboxClient:
         returned only after connect/pool failures (known not sent) are exhausted,
         or when the server reports that the direct route does not exist. An
         exhausted unknown-outcome failure is surfaced to the caller and is never
-        replayed through RuntimeRPC.
+        replayed through the Frontend invoke path.
 
         Unlike Frontend invoke, the RRT HTTP server returns raw result JSON (no
         base64 ``BuildJobResponse`` envelope); action-level errors live inside
@@ -756,7 +756,7 @@ class SandboxClient:
                 if resp.status_code == 404:
                     if outcome_unknown:
                         # An earlier attempt may already have executed. Route
-                        # disappearance does not make RuntimeRPC replay safe.
+                        # disappearance does not make Frontend replay safe.
                         last_error = SandboxError(
                             "direct route disappeared after an unknown outcome",
                             request_id=request_id,

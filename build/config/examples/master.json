@@ -1,0 +1,30 @@
+{
+  "listen": "0.0.0.0:19000",
+  "redis_url": "redis://127.0.0.1:6379/",
+  "namespace": "adx",
+  "domains": 1,
+  "placement": "pack",
+  "rpc_timeout_seconds": 30,
+  "tls": {
+    "ca": "/etc/adx/tls/ca.pem",
+    "certificate": "/etc/adx/tls/master.pem",
+    "private_key": "/etc/adx/tls/master.key",
+    "server_name": "adx.internal",
+    "peers": {
+      "frontend": "/etc/adx/tls/frontend.der",
+      "node:node-1": "/etc/adx/tls/node-1.der",
+      "edge": "/etc/adx/tls/edge.der"
+    }
+  },
+  "bootstrap_credentials": [
+    {
+      "key_file": "/etc/adx/secrets/admin-key",
+      "tenant_id": "admin",
+      "administrator": true,
+      "expires_at_unix_seconds": 0
+    }
+  ],
+  "advertised_address": "https://master:19000",
+  "heartbeat_timeout_seconds": 30,
+  "discovery_ttl_seconds": 15
+}

@@ -64,6 +64,7 @@ pub enum ResolveError {
 #[derive(Clone)]
 pub struct EdgeRouteResolver {
     store: Arc<RouteStore>,
+    stream_only: bool,
     point_getter: Option<Arc<dyn RoutePointGetter>>,
 }
 
@@ -94,8 +95,14 @@ impl EdgeRouteResolver {
     pub fn new(store: Arc<RouteStore>) -> Self {
         Self {
             store,
+            stream_only: false,
             point_getter: None,
         }
+    }
+
+    pub fn stream_only(mut self) -> Self {
+        self.stream_only = true;
+        self
     }
 
     pub fn with_point_getter(mut self, point_getter: Arc<dyn RoutePointGetter>) -> Self {
@@ -156,6 +163,11 @@ impl EdgeRouteResolver {
                     .await
                     .map_err(|error| ResolveError::Unavailable(error.to_string()))?
                     .ok_or(ResolveError::NotFound)?,
+                None if self.stream_only => {
+                    return Err(ResolveError::Unavailable(
+                        "route absent from synchronized cache".into(),
+                    ))
+                }
                 None => return Err(ResolveError::NotFound),
             },
         };
@@ -174,7 +186,11 @@ impl EdgeRouteResolver {
         let target = route
             .connect_target(target_port, request_id)
             .ok_or(ResolveError::MissingEndpoint)?;
-        let port_forward_auth_mode = route.port_forward_auth_mode(target_port);
+        let port_forward_auth_mode = if self.stream_only {
+            DataPlaneAuthMode::Token
+        } else {
+            route.port_forward_auth_mode(target_port)
+        };
         Ok(RouteHandle {
             access_kind,
             node_proxy_address: route.node_proxy_address,

@@ -18,7 +18,7 @@ The imported runtime SDK, function/Job helpers, scheduler proxy, IAM implementat
 
 API Key verification returns a tenant/admin identity. Incoming tenant headers are replaced with the verified tenant. Lifecycle and invocation handlers enforce instance ownership; the explicit admin role permits administrative operations. The host's verifier owns expiry and revocation policy.
 
-Execution currently accepts the imported protobuf payloads (`Create`, `Invoke`, and lifecycle signal payloads). This is an interim HTTP compatibility adapter, **not the new Master/Node Manager protocol implementation**. Its small local encoding structures are not a runtime SDK. Concrete backend adapters and service startup remain to be implemented.
+Execution currently accepts the imported protobuf payloads (`Create`, `Invoke`, and lifecycle signal payloads). This is an interim HTTP compatibility adapter, **not the new Master/Node Manager protocol implementation**. Its small local encoding structures are not a runtime SDK. `controlbackend` now translates the supported create/delete path to Instance RPC, caches ownership and API key validation, and `cmd/adx-sandbox-api` supplies a configurable HTTPS entrypoint. Unsupported operations return explicit errors. See [service wiring and validation](../../../docs/testing/frontend-control.md).
 
 ## Agent entrypoints
 

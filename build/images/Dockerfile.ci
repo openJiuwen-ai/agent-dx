@@ -1,0 +1,24 @@
+# Build once, validate, then configure Buildkite with the resulting image digest.
+# Base image arguments can also be supplied as digest-pinned references.
+ARG GO_IMAGE=golang:1.25.5-bookworm
+ARG RUST_IMAGE=rust:1.97.1-bookworm
+ARG PYTHON_IMAGE=python:3.12-bookworm
+FROM ${GO_IMAGE} AS go
+FROM ${RUST_IMAGE} AS rust
+FROM ${PYTHON_IMAGE}
+COPY --from=go /usr/local/go /usr/local/go
+COPY --from=rust /usr/local/cargo /usr/local/cargo
+COPY --from=rust /usr/local/rustup /usr/local/rustup
+ENV CARGO_HOME=/usr/local/cargo RUSTUP_HOME=/usr/local/rustup \
+    PATH=/usr/local/go/bin:/usr/local/cargo/bin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    GOTOOLCHAIN=local
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential cmake pkg-config libssl-dev protobuf-compiler git \
+    && rm -rf /var/lib/apt/lists/*
+RUN GOBIN=/usr/local/bin go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11 \
+    && GOBIN=/usr/local/bin go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.6.2
+COPY build/ci/requirements.lock /tmp/adx-ci-requirements.lock
+RUN python3 -m pip install --no-cache-dir -r /tmp/adx-ci-requirements.lock \
+    && rustc --version && cargo --version && go version && python3 --version \
+    && protoc --version && protoc-gen-go --version && protoc-gen-go-grpc --version
+WORKDIR /workspace

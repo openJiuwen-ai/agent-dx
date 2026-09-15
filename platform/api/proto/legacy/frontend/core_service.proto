@@ -23,21 +23,7 @@ import "affinity.proto";
 
 option go_package = "gitcode.com/robbluo/agent-dx/platform/control-plane/sandbox-api/internal/gen/core;core";
 
-// Core service provides APIs to runtime,
-service CoreService {
-  // Create an instance for specify function
-  rpc Create (CreateRequest) returns (CreateResponse) {}
-  // invoke the created instance
-  rpc Invoke (InvokeRequest) returns (InvokeResponse) {}
-  // exit the created instance
-  rpc Exit (ExitRequest) returns (ExitResponse) {}
-  // save state of the created instance
-  rpc SaveState (StateSaveRequest) returns (StateSaveResponse) {}
-  // load state of the created instance
-  rpc LoadState (StateLoadRequest) returns (StateLoadResponse) {}
-  // Kill the signal to instance
-  rpc Kill (KillRequest) returns (KillResponse) {}
-}
+// Compatibility message types for FrontendProxyService.
 
 enum AffinityType {
   PreferredAffinity     = 0;

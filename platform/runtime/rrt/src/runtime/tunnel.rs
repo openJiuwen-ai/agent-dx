@@ -16,8 +16,6 @@
 //! ordered [name, value] pairs. V1 framing stays
 //! available for mixed-version peers and the replayable small-body fast path.
 
-use super::codec::adx_deserialize;
-use crate::posix::common::Arg;
 use base64::Engine;
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
@@ -29,7 +27,6 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
-use rmpv::Value;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::Infallible;
@@ -791,7 +788,14 @@ impl Frame {
 }
 
 fn control_message(frame: &Frame, legacy_headers: bool) -> Result<Message, ()> {
-    let raw = if let Frame::HttpReq { id, method, path, headers, body } = frame {
+    let raw = if let Frame::HttpReq {
+        id,
+        method,
+        path,
+        headers,
+        body,
+    } = frame
+    {
         if legacy_headers {
             // A peer without hello negotiation expects the original map shape.
             // Keep ordered pairs internally and for every negotiated V2 peer.
@@ -806,7 +810,8 @@ fn control_message(frame: &Frame, legacy_headers: bool) -> Result<Message, ()> {
         }
     } else {
         serde_json::to_string(frame)
-    }.map_err(|_| ())?;
+    }
+    .map_err(|_| ())?;
     (raw.len() <= CONTROL_WS_MESSAGE_BYTES)
         .then_some(Message::Text(raw))
         .ok_or(())
@@ -929,14 +934,19 @@ impl State {
     }
 
     fn send_to_generation(&self, generation: u64, frame: &Frame) -> Result<(), ()> {
-        self.send_message_for_generation(generation, control_message(
-            frame, self.legacy_generation.load(Ordering::Acquire) == generation,
-        )?)
+        self.send_message_for_generation(
+            generation,
+            control_message(
+                frame,
+                self.legacy_generation.load(Ordering::Acquire) == generation,
+            )?,
+        )
     }
 
     async fn send_to_generation_wait(&self, generation: u64, frame: Frame) -> Result<(), ()> {
         let message = control_message(
-            &frame, self.legacy_generation.load(Ordering::Acquire) == generation,
+            &frame,
+            self.legacy_generation.load(Ordering::Acquire) == generation,
         )?;
         let sender = self
             .active_client
@@ -1085,9 +1095,7 @@ impl State {
         ack_offset: Option<u64>,
     ) -> Option<Arc<StreamCredits>> {
         let guard = self.stream_credits.lock().unwrap();
-        let Some(entry) = guard.get(id) else {
-            return None;
-        };
+        let entry = guard.get(id)?;
         entry
             .grant(generation, credits, ack_offset)
             .then(|| entry.clone())
@@ -1517,54 +1525,12 @@ impl Drop for DownstreamStreamGuard {
     }
 }
 
-fn aborts() -> &'static Mutex<Vec<AbortHandle>> {
-    static A: OnceLock<Mutex<Vec<AbortHandle>>> = OnceLock::new();
-    A.get_or_init(|| Mutex::new(Vec::new()))
-}
-
-/// Start the native tunnel server. Positional args carry ws_port then http_port
-/// (akernel `start_tunnel_server.invoke(ws, http)`). Returns Nil once Port B is
-/// listening (parity with the python ready check), Err if it never binds.
-pub fn start_tunnel_server(args: &[Arg], deploy_dir: &str) -> Result<Value, String> {
-    let pos: Vec<i64> = args
-        .iter()
-        .skip(2)
-        .step_by(2)
-        .filter_map(|a| adx_deserialize(&a.value))
-        .filter_map(|v| v.as_i64())
-        .collect();
-    let ws_port = pos.first().copied().unwrap_or(8765) as u16;
-    let http_port = pos.get(1).copied().unwrap_or(8766) as u16;
-    let _ = deploy_dir;
-    rrt_info!("[rrt-runtime] tunnel start ws={ws_port} http={http_port}");
-
-    let handle = tokio::runtime::Handle::try_current()
-        .map_err(|_| "no tokio runtime to host tunnel server".to_string())?;
-    let state = Arc::new(State::default());
-    let jh = handle.spawn(run_servers(ws_port, http_port, state));
-    aborts().lock().unwrap().push(jh.abort_handle());
-
-    // Wait for Port B to accept connections (multi-thread runtime serves the
-    // spawned task on another worker while we poll here).
-    for _ in 0..50 {
-        if std::net::TcpStream::connect(("127.0.0.1", http_port)).is_ok() {
-            return Ok(Value::Nil);
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    Err(format!(
-        "tunnel_server not ready on port {http_port} within 5s"
-    ))
-}
-
-/// Standalone entry (tools/tests): run the tunnel server forever on the given
-/// ports, without the RuntimeRPC dispatch wrapper.
 pub async fn run_standalone(ws_port: u16, http_port: u16) {
     run_servers(ws_port, http_port, Arc::new(State::default())).await;
 }
 
 /// Both tunnel listeners reserved as one startup unit. Binding happens before
-/// RuntimeRPC reports InitCall success, so a configured tunnel cannot be
+/// the runtime reports readiness, so a configured tunnel cannot be
 /// advertised ready with only one of its two ports available.
 pub(super) struct BoundTunnelServers {
     porta: TcpListener,
@@ -1590,7 +1556,6 @@ impl std::fmt::Debug for TunnelServerControl {
 struct TunnelServerControlInner {
     porta: std::net::TcpListener,
     portb: std::net::TcpListener,
-    state: Arc<State>,
     accept_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     generation: AtomicU64,
     ready_tx: watch::Sender<super::RuntimeReadyState>,
@@ -1623,7 +1588,6 @@ impl TunnelServerControl {
             inner: Arc::new(TunnelServerControlInner {
                 porta,
                 portb,
-                state: Arc::new(State::default()),
                 accept_task: Mutex::new(None),
                 generation: AtomicU64::new(0),
                 ready_tx,
@@ -1638,6 +1602,29 @@ impl TunnelServerControl {
         Ok(control)
     }
 
+    pub(super) fn validate_restored_ports(
+        &self,
+        environment: &HashMap<String, String>,
+    ) -> std::io::Result<()> {
+        for (name, expected) in [
+            ("RRT_TUNNEL_WS_PORT", self.inner.porta.local_addr()?.port()),
+            (
+                "RRT_TUNNEL_HTTP_PORT",
+                self.inner.portb.local_addr()?.port(),
+            ),
+        ] {
+            if environment
+                .get(name)
+                .is_some_and(|value| value.parse::<u16>().ok() != Some(expected))
+            {
+                return Err(std::io::Error::other(
+                    "restore cannot change inherited tunnel ports",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn rearm(&self) -> std::io::Result<u64> {
         let mut accept_task =
             self.inner.accept_task.lock().map_err(|_| {
@@ -1645,7 +1632,7 @@ impl TunnelServerControl {
             })?;
         let porta = TcpListener::from_std(self.inner.porta.try_clone()?)?;
         let portb = TcpListener::from_std(self.inner.portb.try_clone()?)?;
-        let state = self.inner.state.clone();
+        let state = Arc::new(State::default());
         let generation = self.inner.generation.load(Ordering::Relaxed) + 1;
         self.inner.generation.store(generation, Ordering::Release);
         let _ = self.inner.ready_tx.send(super::RuntimeReadyState::Ready);
@@ -1703,11 +1690,16 @@ async fn serve(porta: TcpListener, portb: TcpListener, state: Arc<State>) {
 
 // ───────────────────────── Port A: TunnelClient WS ─────────────────────────
 async fn accept_port_a(listener: TcpListener, state: Arc<State>) {
+    let mut connections = tokio::task::JoinSet::new();
     loop {
-        match listener.accept().await {
+        let accepted = tokio::select! {
+            accepted = listener.accept() => accepted,
+            _ = connections.join_next(), if !connections.is_empty() => continue,
+        };
+        match accepted {
             Ok((stream, _)) => {
                 let st = state.clone();
-                tokio::spawn(async move {
+                connections.spawn(async move {
                     if let Err(e) = handle_client(stream, st).await {
                         rrt_warn!("[rrt-runtime] tunnel client_conn_ended error={e}");
                     }
@@ -1722,6 +1714,11 @@ async fn accept_port_a(listener: TcpListener, state: Arc<State>) {
 }
 
 async fn handle_client(stream: TcpStream, state: Arc<State>) -> Result<(), String> {
+    if super::control::current().is_some_and(|controller| {
+        controller.status().phase != adx_core::runtime::RuntimePhase::Running
+    }) {
+        return Err("runtime checkpoint transition in progress".into());
+    }
     let ws = tokio_tungstenite::accept_async(stream)
         .await
         .map_err(|e| format!("ws accept: {e}"))?;
@@ -2368,11 +2365,16 @@ async fn dispatch_binary_from_client(
 
 // ───────────────────────── Port B: sandbox HTTP ─────────────────────────
 async fn accept_port_b(listener: TcpListener, state: Arc<State>) {
+    let mut connections = tokio::task::JoinSet::new();
     loop {
-        match listener.accept().await {
+        let accepted = tokio::select! {
+            accepted = listener.accept() => accepted,
+            _ = connections.join_next(), if !connections.is_empty() => continue,
+        };
+        match accepted {
             Ok((stream, _)) => {
                 let st = state.clone();
-                tokio::spawn(async move {
+                connections.spawn(async move {
                     if let Err(error) = handle_port_b(stream, st).await {
                         rrt_warn!("[rrt-runtime] tunnel port_b_connection_ended error={error}");
                     }
@@ -2387,6 +2389,11 @@ async fn accept_port_b(listener: TcpListener, state: Arc<State>) {
 }
 
 async fn handle_port_b(stream: TcpStream, state: Arc<State>) -> Result<(), String> {
+    if super::control::current().is_some_and(|controller| {
+        controller.status().phase != adx_core::runtime::RuntimePhase::Running
+    }) {
+        return Err("runtime checkpoint transition in progress".into());
+    }
     match request_is_websocket_upgrade(&stream).await? {
         Some(true) => handle_port_b_ws(stream, state).await,
         Some(false) => handle_port_b_http(stream, state).await,
@@ -3165,6 +3172,7 @@ async fn send_ws_binary_to_client(
     Ok(())
 }
 
+#[allow(clippy::result_large_err)] // Tungstenite fixes the handshake callback error type.
 async fn handle_port_b_ws(stream: TcpStream, state: Arc<State>) -> Result<(), String> {
     let local_permit = state
         .ws_permits
@@ -3399,36 +3407,56 @@ mod tests {
             ] {
                 let frame: Frame = serde_json::from_value(serde_json::json!({
                     "type": kind, "id": "request", "status": 200, "headers": headers,
-                })).unwrap();
+                }))
+                .unwrap();
                 let decoded = match frame {
-                    Frame::HttpResp { headers, .. } | Frame::HttpRespBegin { headers, .. } => headers,
+                    Frame::HttpResp { headers, .. } | Frame::HttpRespBegin { headers, .. } => {
+                        headers
+                    }
                     _ => panic!("unexpected frame"),
                 };
                 if headers.is_object() {
                     assert_eq!(decoded, vec![("X-Legacy".into(), "value".into())]);
                 } else {
-                    assert_eq!(decoded, vec![("Set-Cookie".into(), "a=1".into()),
-                                             ("Set-Cookie".into(), "b=2".into())]);
+                    assert_eq!(
+                        decoded,
+                        vec![
+                            ("Set-Cookie".into(), "a=1".into()),
+                            ("Set-Cookie".into(), "b=2".into())
+                        ]
+                    );
                 }
             }
             assert!(serde_json::from_value::<Frame>(serde_json::json!({
                 "type": kind, "id": "bad", "status": 200, "headers": {"X-Bad": 42},
-            })).is_err());
+            }))
+            .is_err());
         }
     }
 
     #[test]
     fn legacy_request_encoding_is_selected_per_connection() {
         let frame = Frame::HttpReq {
-            id: "request".into(), method: "GET".into(), path: "/".into(), body: String::new(),
-            headers: vec![("X-Tag".into(), "one".into()), ("X-Tag".into(), "two".into())],
+            id: "request".into(),
+            method: "GET".into(),
+            path: "/".into(),
+            body: String::new(),
+            headers: vec![
+                ("X-Tag".into(), "one".into()),
+                ("X-Tag".into(), "two".into()),
+            ],
         };
-        let legacy: serde_json::Value = serde_json::from_str(
-            control_message(&frame, true).unwrap().to_text().unwrap()).unwrap();
+        let legacy: serde_json::Value =
+            serde_json::from_str(control_message(&frame, true).unwrap().to_text().unwrap())
+                .unwrap();
         assert_eq!(legacy["headers"], serde_json::json!({"X-Tag": "two"}));
-        let current: serde_json::Value = serde_json::from_str(
-            control_message(&frame, false).unwrap().to_text().unwrap()).unwrap();
-        assert_eq!(current["headers"], serde_json::json!([["X-Tag", "one"], ["X-Tag", "two"]]));
+        let current: serde_json::Value =
+            serde_json::from_str(control_message(&frame, false).unwrap().to_text().unwrap())
+                .unwrap();
+        assert_eq!(
+            current["headers"],
+            serde_json::json!([["X-Tag", "one"], ["X-Tag", "two"]])
+        );
     }
 
     #[test]

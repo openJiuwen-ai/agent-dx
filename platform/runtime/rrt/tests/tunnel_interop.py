@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Real TCP -> Rust RRT -> sandbox-sdk -> strict-upstream checks."""
+"""Real TCP -> Rust RRT -> sandbox-sdk -> HTTP/1 framing checks."""
 
 import gzip
 import http.server
@@ -43,14 +43,38 @@ def header_values(headers, name):
 
 
 class InteropHandler(http.server.BaseHTTPRequestHandler):
-    """Strict upstream: entity bodies are read only from Content-Length."""
+    """Validate framing for buffered and unknown-length streaming requests."""
 
     protocol_version = "HTTP/1.1"
     observations: ClassVar[list] = []
 
     def _record(self):
-        content_length = int(self.headers.get("Content-Length", "0"))
-        body = self.rfile.read(content_length)
+        lengths = self.headers.get_all("Content-Length", [])
+        encodings = self.headers.get_all("Transfer-Encoding", [])
+        if encodings:
+            assert not lengths, "ambiguous request framing"
+            assert encodings == ["chunked"], encodings
+            chunks = []
+            while True:
+                size = int(self.rfile.readline().strip().split(b";", 1)[0], 16)
+                assert 0 <= size <= 1024 * 1024, "invalid fixture chunk size"
+                if size == 0:
+                    while True:
+                        trailer = self.rfile.readline()
+                        assert trailer, "truncated chunk trailers"
+                        if trailer == b"\r\n":
+                            break
+                    break
+                chunk = self.rfile.read(size)
+                assert len(chunk) == size
+                assert self.rfile.read(2) == b"\r\n"
+                chunks.append(chunk)
+            body = b"".join(chunks)
+        else:
+            assert len(lengths) <= 1, lengths
+            content_length = int(lengths[0]) if lengths else 0
+            body = self.rfile.read(content_length)
+            assert len(body) == content_length
         headers = list(self.headers.raw_items())
         type(self).observations.append((self.path, headers, body))
         return body
@@ -219,12 +243,28 @@ def main():
             passed,
         )
         check(
-            "request framing rebuilt",
-            not header_values(upstream_headers, "Transfer-Encoding")
+            "unknown-length streaming framing rebuilt",
+            header_values(upstream_headers, "Transfer-Encoding") == ["chunked"]
             and not header_values(upstream_headers, "X-First-Hop")
-            and header_values(upstream_headers, "Content-Length")
-            == [str(len(payload))],
+            and not header_values(upstream_headers, "Content-Length"),
             repr(upstream_headers),
+            passed,
+        )
+
+        # V2 streams unknown-length bodies. A bounded, known-length request
+        # still exercises the buffered path and its rebuilt Content-Length.
+        status, _, body = raw_request(
+            http_port,
+            b"POST /buffered HTTP/1.1\r\nHost: local\r\nConnection: close\r\n"
+            + f"Content-Length: {len(payload)}\r\n\r\n".encode() + payload,
+        )
+        _, buffered_headers, buffered_body = InteropHandler.observations[-1]
+        check(
+            "known-length buffered framing rebuilt",
+            status == 200 and body == b"ECHO:" + payload and buffered_body == payload
+            and header_values(buffered_headers, "Content-Length") == [str(len(payload))]
+            and not header_values(buffered_headers, "Transfer-Encoding"),
+            f"status={status} headers={buffered_headers!r} body={body!r}",
             passed,
         )
 

@@ -1,0 +1,126 @@
+steps:
+- label: ':package: Build ADX release'
+  key: platform-build
+  agents:
+    queue: default
+    os: linux
+    arch: amd64
+  command: bash .buildkite/build-e2e.sh
+  timeout_in_minutes: 60
+  artifact_paths:
+  - out/buildkite/logs/**/*
+  - out/buildkite/package/**/*
+  - out/buildkite/backend/**/*
+  env:
+    BUILDKITE_AGENT_NAME: agent-stack-k8s
+    CARGO_HOME: /mnt/paas/build-cache/adx/cargo-home
+    CARGO_TARGET_DIR: /mnt/paas/build-cache/adx/cargo-target/amd64
+    GOCACHE: /mnt/paas/build-cache/adx/go-build/amd64
+    GOMODCACHE: /mnt/paas/build-cache/adx/go-mod
+  plugins:
+  - kubernetes:
+      podSpec:
+        imagePullSecrets:
+        - name: swr-pull-secret
+        containers:
+        - image: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/compile-ubuntu2004-rust:v20260507_x86_64
+          volumeMounts:
+          - name: build-cache
+            mountPath: /mnt/paas
+          resources:
+            requests:
+              cpu: '4'
+              memory: 8Gi
+            limits:
+              cpu: '8'
+              memory: 16Gi
+        volumes:
+        - name: build-cache
+          hostPath:
+            path: /mnt/paas
+            type: DirectoryOrCreate
+- label: ':docker: Publish ADX images'
+  key: platform-images
+  depends_on: platform-build
+  agents:
+    queue: default
+    os: linux
+    arch: amd64
+  command: python3 .buildkite/with_registry.py --docker -- bash .buildkite/package-e2e.sh
+  timeout_in_minutes: 40
+  env:
+    BUILDKITE_AGENT_NAME: agent-stack-k8s
+    ADX_E2E_IMAGE_REPOSITORY: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/adx-e2e
+  artifact_paths:
+  - out/buildkite/logs/**/*
+  - out/buildkite/bundle/*.json
+  plugins:
+  - kubernetes:
+      podSpec:
+        imagePullSecrets:
+        - name: swr-pull-secret
+        containers:
+        - image: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/sandbox-packager:v20260506_kubectl
+          securityContext:
+            privileged: true
+          volumeMounts:
+          - name: docker-graph
+            mountPath: /var/lib/docker
+          resources:
+            requests:
+              cpu: '8'
+              memory: 16Gi
+            limits:
+              cpu: '8'
+              memory: 16Gi
+          env: &id001
+          - name: SWR_USERNAME
+            valueFrom:
+              secretKeyRef:
+                name: swr-credentials
+                key: username
+                optional: true
+          - name: SWR_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: swr-credentials
+                key: password
+                optional: true
+          - name: SWR_DOCKER_CONFIG_JSON
+            valueFrom:
+              secretKeyRef:
+                name: swr-pull-secret
+                key: .dockerconfigjson
+                optional: true
+        volumes:
+        - name: docker-graph
+          emptyDir: {}
+- label: ':kubernetes: Public SDK E2E'
+  key: platform-e2e
+  depends_on: platform-images
+  agents:
+    queue: default
+    os: linux
+    arch: amd64
+  command: python3 .buildkite/with_registry.py -- bash .buildkite/run-e2e.sh
+  timeout_in_minutes: 30
+  artifact_paths:
+  - out/buildkite/acceptance/**/*
+  env:
+    BUILDKITE_AGENT_NAME: agent-stack-k8s
+    ADX_KUBECONFIG: /var/run/yr-k8s/target/kubeconfig
+  plugins:
+  - kubernetes:
+      podSpec:
+        imagePullSecrets:
+        - name: swr-pull-secret
+        containers:
+        - image: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/sandbox-deployer:v20260506_kubectl_py39
+          resources:
+            requests:
+              cpu: '2'
+              memory: 4Gi
+            limits:
+              cpu: '4'
+              memory: 8Gi
+          env: *id001

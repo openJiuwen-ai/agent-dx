@@ -661,8 +661,8 @@ fn recovery_rotation_paths(path: &Path) -> io::Result<Vec<PathBuf>> {
     }
     // Legacy .N files use larger indexes for older data. Feed those first so
     // the compressor's .1.gz insertion preserves newest-first ordering.
-    plain_rotations.sort_by(|left, right| right.0.cmp(&left.0));
-    staging_rotations.sort_by(|left, right| left.0.cmp(&right.0));
+    plain_rotations.sort_by_key(|entry| std::cmp::Reverse(entry.0));
+    staging_rotations.sort_by_key(|entry| entry.0);
     Ok(plain_rotations
         .into_iter()
         .map(|(_, path)| path)
@@ -989,10 +989,18 @@ mod tests {
             "adx_access"
         ));
         assert!(!include_general_log_target(
-            true, false, false, true, "adx_audit"
+            true,
+            false,
+            false,
+            true,
+            "adx_audit"
         ));
         assert!(include_general_log_target(
-            true, true, false, true, "adx_audit"
+            true,
+            true,
+            false,
+            true,
+            "adx_audit"
         ));
         assert!(!include_general_log_target(
             true,

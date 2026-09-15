@@ -1,0 +1,115 @@
+use adx_master::{
+    auth::{AuthRpc, Credential},
+    rpc::MasterRpc,
+    storage::RedisStore,
+    Placement,
+};
+use adx_protocol::{
+    control as pb,
+    tls::{read_config, shutdown, TlsFiles},
+};
+use serde::Deserialize;
+use std::{net::SocketAddr, path::PathBuf, time::Duration};
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Bootstrap {
+    key_file: PathBuf,
+    #[serde(flatten)]
+    credential: Credential,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Config {
+    listen: SocketAddr,
+    #[serde(default)]
+    advertised_address: Option<String>,
+    #[serde(default = "default_heartbeat")]
+    heartbeat_timeout_seconds: u64,
+    #[serde(default = "default_ttl")]
+    discovery_ttl_seconds: u64,
+    redis_url: String,
+    namespace: String,
+    domains: usize,
+    placement: String,
+    rpc_timeout_seconds: u64,
+    tls: TlsFiles,
+    bootstrap_credentials: Vec<Bootstrap>,
+}
+fn default_heartbeat() -> u64 {
+    30
+}
+fn default_ttl() -> u64 {
+    15
+}
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let c: Config = read_config()?;
+    if c.heartbeat_timeout_seconds == 0 || c.discovery_ttl_seconds < 3 {
+        return Err("positive heartbeat timeout and discovery TTL >= 3 required".into());
+    }
+    let placement = match c.placement.as_str() {
+        "pack" => Placement::Pack,
+        "spread" => Placement::Spread,
+        _ => return Err("placement must be pack or spread".into()),
+    };
+    let (server_tls, client_tls, peers) = c.tls.load()?;
+    let timeout = Duration::from_secs(c.rpc_timeout_seconds);
+    let listener = tokio::net::TcpListener::bind(c.listen).await?;
+    let store = RedisStore::connect(&c.redis_url, &c.namespace, timeout).await?;
+    let session = store.begin(c.domains).await?;
+    for credential in c.bootstrap_credentials {
+        let key = std::fs::read_to_string(credential.key_file)?;
+        session
+            .bootstrap_credential(key.trim(), &credential.credential)
+            .await?;
+    }
+    let auth = AuthRpc::new(session.clone(), peers.clone());
+    let routes = adx_master::routes::RoutePublisher::new(session.clone(), peers.clone());
+    let rpc = MasterRpc::with_heartbeat_timeout(
+        session.clone(),
+        placement,
+        peers,
+        client_tls,
+        timeout,
+        Duration::from_secs(c.heartbeat_timeout_seconds),
+    )
+    .await?;
+    routes.refresh().await?;
+    let route_task = routes.clone().run(Duration::from_millis(200));
+    let ttl = Duration::from_secs(c.discovery_ttl_seconds);
+    if let Some(address) = &c.advertised_address {
+        session.advertise(&c.namespace, address, ttl).await?;
+    }
+    let maintenance_rpc = rpc.clone();
+    let maintenance = async {
+        let mut tick = tokio::time::interval(Duration::from_secs(
+            (c.heartbeat_timeout_seconds.min(c.discovery_ttl_seconds) / 3).max(1),
+        ));
+        loop {
+            tick.tick().await;
+            if let Err(error) = maintenance_rpc.expire_nodes().await {
+                eprintln!("node health publication unavailable: {error}");
+            }
+            if let Some(address) = &c.advertised_address {
+                if let Err(error) = session.advertise(&c.namespace, address, ttl).await {
+                    eprintln!("Master discovery renewal unavailable: {error}");
+                }
+            }
+        }
+    };
+    eprintln!("adx-master listening on {}", listener.local_addr()?);
+    let server = tonic::transport::Server::builder()
+        .tls_config(server_tls)?
+        .add_service(pb::master_service_server::MasterServiceServer::new(rpc))
+        .add_service(pb::auth_service_server::AuthServiceServer::new(auth))
+        .add_service(
+            pb::route_service_server::RouteServiceServer::new(routes)
+                .max_encoding_message_size(64 * 1024 * 1024),
+        )
+        .serve_with_incoming_shutdown(
+            tokio_stream::wrappers::TcpListenerStream::new(listener),
+            shutdown(),
+        );
+    tokio::select! { result = server => result?, _ = maintenance => (), _ = route_task => () }
+    Ok(())
+}

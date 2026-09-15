@@ -1,0 +1,30 @@
+{
+  "node_id": "node-1",
+  "listen": "0.0.0.0:19001",
+  "advertised_address": "node-1:19001",
+  "proxy_address": "node-1:19002",
+  "tls": {
+    "ca": "/etc/adx/tls/ca.pem",
+    "certificate": "/etc/adx/tls/node-1.pem",
+    "private_key": "/etc/adx/tls/node-1.key",
+    "server_name": "adx.internal",
+    "peers": {
+      "master": "/etc/adx/tls/master.der",
+      "frontend": "/etc/adx/tls/frontend.der"
+    }
+  },
+  "sandboxd_socket": "/run/sandboxd/sandboxd.sock",
+  "proxy_socket": "/run/adx/route.sock",
+  "capacity_file": "/run/adx/resource-observation.json",
+  "report_interval_seconds": 5,
+  "rpc_timeout_seconds": 30,
+  "rrt_port": 50090,
+  "rrt_command": [
+    "/usr/local/bin/rrt-runtime"
+  ],
+  "rrt_env": {},
+  "discovery": {
+    "redis_url": "redis://127.0.0.1:6379/",
+    "namespace": "adx"
+  }
+}

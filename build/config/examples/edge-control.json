@@ -1,0 +1,17 @@
+{
+  "redis_url": "redis://127.0.0.1:6379/",
+  "namespace": "adx",
+  "tls": {
+    "ca": "/etc/adx/tls/ca.pem",
+    "certificate": "/etc/adx/tls/edge.pem",
+    "private_key": "/etc/adx/tls/edge.key",
+    "server_name": "adx.internal",
+    "peers": {
+      "master": "/etc/adx/tls/master.der"
+    }
+  },
+  "rpc_timeout_seconds": 5,
+  "refresh_seconds": 2,
+  "auth_cache_seconds": 10,
+  "auth_cache_entries": 4096
+}

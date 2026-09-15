@@ -10,6 +10,8 @@
 
 ## Builds and tests
 
+- Only `frontend_proxy_service.proto` is a retained legacy gRPC contract. Keep its necessary message dependencies confined to Frontend compatibility. Design new internal RPCs around Instance responsibilities; do not reuse old POSIX/function services. RRT operations and Node Manager runtime cooperation use HTTP; shared payloads live in adx-core runtime types.
+
 - Root Cargo workspace; Go module at `platform/control-plane/sandbox-api`; Python packages build independently.
 - Use Makefile/native package commands. `build/` contains tracked scripts; outputs go to `out/` or explicitly configured external caches.
 - Run focused checks for changed components; report runtime/cluster validation separately.

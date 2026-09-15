@@ -10,11 +10,12 @@ path = "src/lib.rs"
 [[bin]]
 name = "adx-node-proxy"
 path = "src/bin/node_proxy.rs"
+required-features = ["activity-client"]
 
 [[bin]]
 name = "adx-edge-frontend"
 path = "src/bin/edge_frontend.rs"
-required-features = ["etcd-watch"]
+required-features = ["activity-client"]
 
 [[bin]]
 name = "adx-data-plane-forward"
@@ -27,6 +28,9 @@ etcd-watch = ["dep:etcd-client"]
 mock-e2e = []
 
 [dependencies]
+adx-protocol = { path = "../platform/crates/protocol" }
+adx-discovery = { path = "../platform/crates/discovery" }
+sha2 = "0.10"
 async-trait = "0.1"
 base64 = "0.22"
 bytes = "1"
@@ -56,6 +60,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 url = "2"
 tokio-tungstenite = "0.24"
+tokio-stream = { version = "0.1", features = ["net"] }
 
 [dev-dependencies]
 tempfile = "3"

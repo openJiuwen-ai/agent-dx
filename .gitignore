@@ -43,3 +43,6 @@ env/
 # Source scripts under build/ are tracked.
 !/build/
 !/build/**
+
+# Local sandboxd diagnostic output
+/sandboxd.log

@@ -8,24 +8,11 @@ name = "rrt_daemon"
 path = "src/lib.rs"
 
 [[bin]]
-name = "rrt"
-path = "src/main.rs"
-
-[[bin]]
-name = "rrt-probe"
-path = "src/bin/rrt-probe.rs"
-
-[[bin]]
-name = "rrtctl"
-path = "src/bin/rrtctl.rs"
-
-[[bin]]
 name = "rrt-runtime"
 path = "src/bin/rrt-runtime.rs"
 
 [dependencies]
-tonic = "0.12"
-prost = "0.13"
+adx-core = { path = "../../crates/core" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "net", "time", "fs"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 serde_json = "1"
@@ -46,7 +33,5 @@ hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 tempfile = "3"
 
-[build-dependencies]
-tonic-build = "0.12"
-
-protoc-bin-vendored = "3"
+[dev-dependencies]
+adx-node-manager = { path = "../../control-plane/node-manager" }

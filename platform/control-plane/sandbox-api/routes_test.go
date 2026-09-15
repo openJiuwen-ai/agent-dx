@@ -4,6 +4,7 @@ package sandboxapi
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -42,7 +43,7 @@ func (r ownerReader) Read(context.Context, string) (*backend.Instance, error) {
 	if r.err != nil {
 		return nil, r.err
 	}
-	return &backend.Instance{TenantID: r.tenant}, nil
+	return &backend.Instance{TenantID: r.tenant, State: "running", CPU: 500, Memory: 512, Image: "image:test"}, nil
 }
 func (r ownerReader) ConfirmDeleted(context.Context, string) (bool, error) { return false, nil }
 func (r ownerReader) IsRunning(string) bool                                { return true }
@@ -127,4 +128,34 @@ func TestInvokeRejectsCrossTenantBeforeBackend(t *testing.T) {
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 	require.Equal(t, http.StatusForbidden, rec.Code)
+}
+
+func TestSDKInstanceSummaryCompatibilityAndAuthorization(t *testing.T) {
+	for _, tc := range []struct {
+		key, query, owner string
+		code              int
+	}{
+		{"key-owner", "?instance_id=i", "owner", 200},
+		{"key-owner", "?instance_id=i", "other", 403},
+		{"bad", "?instance_id=i", "owner", 401},
+		{"key-owner", "", "owner", 400},
+	} {
+		d := testDependencies(&recordingBackend{}, "owner")
+		d.Instances = ownerReader{tenant: tc.owner}
+		r := gin.New()
+		require.NoError(t, RegisterRoutes(r, d))
+		request := httptest.NewRequest("GET", "/api/instances"+tc.query, nil)
+		request.Header.Set("X-Auth-Token", tc.key)
+		response := httptest.NewRecorder()
+		r.ServeHTTP(response, request)
+		require.Equal(t, tc.code, response.Code)
+		if tc.code == 200 {
+			var items []map[string]any
+			require.NoError(t, json.Unmarshal(response.Body.Bytes(), &items))
+			require.Len(t, items, 1)
+			require.Equal(t, "i", items[0]["id"])
+			require.Equal(t, "running", items[0]["status"])
+			require.Equal(t, float64(512), items[0]["required_mem"])
+		}
+	}
 }

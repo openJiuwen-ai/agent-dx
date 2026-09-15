@@ -39,7 +39,10 @@ type Transport interface {
 	Invoke(Request) ([]byte, error)
 	Lifecycle(LifecycleRequest) (LifecycleResponse, error)
 }
-type Instance struct{ InstanceID, TenantID string }
+type Instance struct {
+	InstanceID, TenantID, State, Image string
+	CPU, Memory                        uint64
+}
 type Instances interface {
 	Read(context.Context, string) (*Instance, error)
 	ConfirmDeleted(context.Context, string) (bool, error)

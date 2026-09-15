@@ -6,22 +6,31 @@ CARGO_TARGET_DIR ?= $(CURDIR)/target
 export CARGO_TARGET_DIR
 JOBS ?= 2
 OUT ?= $(CURDIR)/out
+PYTEST_ARGS ?=
 
-.PHONY: help generate build test rust-test python-test go-test package data-plane-gateway data-plane-gateway-dev data-plane-gateway-ut
+.PHONY: help generate build test rust-test scheduler-bench python-test agent-test sandbox-sdk-test go-test go-vet package ci data-plane-gateway data-plane-gateway-dev data-plane-gateway-ut
 help:
-	@echo 'generate | build | test | package; component tests: rust-test python-test go-test'
+	@echo 'generate | build | test | package | ci SUITE=<suite>; tests: rust-test scheduler-bench python-test go-test go-vet'
 generate:
 	bash build/codegen/go.sh
 build: generate
 	$(CARGO) build --locked --workspace --all-features -j $(JOBS)
-	cd platform/control-plane/sandbox-api && $(GO) build ./...
+	cd platform/control-plane/sandbox-api && $(GO) build -mod=readonly -p $(JOBS) ./...
 rust-test:
 	$(CARGO) test --locked --workspace --all-features -j $(JOBS) -- --test-threads=$(JOBS)
-python-test:
-	$(PYTHON) -m pytest -q
-	PYTHONPATH=platform/sdk/sandbox/python $(PYTHON) -m pytest -q -c platform/sdk/sandbox/pytest.ini platform/sdk/sandbox/python/tests/unit
+scheduler-bench:
+	$(CARGO) test --locked --release -p adx-master --test benchmark -j $(JOBS) -- --ignored --nocapture
+python-test: agent-test sandbox-sdk-test
+agent-test:
+	$(PYTHON) -m pytest -q $(PYTEST_ARGS)
+sandbox-sdk-test:
+	PYTHONPATH=platform/sdk/sandbox/python $(PYTHON) -m pytest -q -c platform/sdk/sandbox/pytest.ini platform/sdk/sandbox/python/tests $(PYTEST_ARGS)
 go-test: generate
-	cd platform/control-plane/sandbox-api && $(GO) test -p $(JOBS) -gcflags=all=-l ./internal/sandbox ./internal/legacy/frontend/sandboxrouter/...
+	cd platform/control-plane/sandbox-api && $(GO) test -mod=readonly -p $(JOBS) -count=1 -json ./...
+go-vet: generate
+	cd platform/control-plane/sandbox-api && $(GO) vet -mod=readonly -p $(JOBS) ./...
+ci:
+	$(PYTHON) build/ci/run.py $(SUITE) --jobs $(JOBS)
 test: rust-test python-test go-test
 package:
 	bash build.sh -p '$(PYTHON)' -o '$(OUT)/wheels'
@@ -32,3 +41,17 @@ data-plane-gateway-dev:
 	$(CARGO) build --locked -p data-plane-gateway --all-features -j $(JOBS)
 data-plane-gateway-ut:
 	$(CARGO) test --locked -p data-plane-gateway --all-features -j $(JOBS) -- --test-threads=$(JOBS)
+
+.PHONY: platform-release process-smoke
+platform-release:
+	JOBS=$(JOBS) PYTHON=$(PYTHON) bash build/release/build.sh
+process-smoke:
+	$(PYTHON) build/ci/process_smoke.py --package "$(PACKAGE_DIR)" --output "$(EVIDENCE_DIR)"
+
+.PHONY: platform-e2e
+platform-e2e:
+	$(PYTHON) build/e2e/run.py --bundle "$(BUNDLE_DIR)" --output "$(EVIDENCE_DIR)"
+
+.PHONY: platform-k8s-e2e
+platform-k8s-e2e:
+	$(PYTHON) build/e2e/kubernetes/run.py --bundle "$(BUNDLE_DIR)/bundle.json" --registry-images "$(BUNDLE_DIR)/registry-images.json" --kubeconfig "$(KUBECONFIG)" --output "$(EVIDENCE_DIR)"

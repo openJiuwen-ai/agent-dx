@@ -8,14 +8,9 @@ the first adapter, not part of the generic relay contract:
   admitted `targetIP:targetPort` TCP connection.
 * `DataPlaneL4Connector` is the Edge-side connector used by HTTP, WebSocket,
   SSH and port-forwarding adapters.
-* `EdgeRouteResolver` consumes the shared `RouteStore`, which lists and watches
-  `/adx/route/business/adxk/{instanceID}` and atomically replaces its in-memory
-  route view after etcd compaction. The production HTTP listener calls this
-  resolver before opening a `DataPlaneL4Connector` stream.
+* `EdgeRouteResolver` reads the shared in-memory `RouteStore`. The production Edge discovers Master through Redis, receives an initial full route snapshot followed by gRPC deltas, and verifies API keys through Master with a bounded short-lived cache.
 
-Build the Edge watcher binary with `--features etcd-watch`; the default build
-compiles the node proxy, optional UDS activity client, and protocol/L4
-primitives.
+The default `activity-client` feature builds the managed Edge and Node Proxy entrypoints. Edge requires `ADX_EDGE_CONTROL_CONFIG` pointing to [edge-control.json](../build/config/examples/edge-control.json). Master must map the Edge client certificate to the `edge` role. Public listener TLS and Edge-to-Node security remain separate settings. The optional `etcd-watch` library and legacy test fixtures are retained separately; the managed Edge entrypoint uses the new Master route service.
 
 The gateway is a member of the root Cargo workspace. Run from repository root:
 
@@ -39,6 +34,7 @@ settings are absent.
 Example development launch:
 
 ```text
+ADX_DATA_PLANE_NODE_PROXY_ACTIVITY_UDS_DIR=/run/adx \
 ADX_DATA_PLANE_NODE_PROXY_BIND=0.0.0.0:8443 \
 ADX_DATA_PLANE_NODE_PROXY_ADVERTISE_ADDRESS=node-a.internal:8443 \
 ADX_DATA_PLANE_ALLOWED_TARGET_CIDRS=10.88.0.0/16 \
@@ -136,7 +132,7 @@ adx-edge-frontend \
   -s 'values.edge_frontend.proxy_connect_timeout_sec=5'
 ```
 
-Supply the normal Edge TLS, etcd, and authentication settings alongside these
+Supply the Edge TLS, `ADX_EDGE_CONTROL_CONFIG`, and authentication settings alongside these
 overrides. The routes file must be readable by the Edge process.
 
 Prefixes match whole path segments: `/grafana` matches `/grafana` and
@@ -250,20 +246,28 @@ canonical internal header spelling follows Frontend style:
 names are case-insensitive; HTTP/2 requires lowercase names on the wire, so the
 Rust h2 implementation encodes the same names as `x-adx-*` / `x-request-id`.
 
-Set `ADX_DATA_PLANE_NODE_PROXY_ACTIVITY_UDS_DIR` on both processes to a dedicated
-node-local directory to enable complete active-stream snapshots to FunctionSystem's
-`DataPlaneGatewayActivityService`. The default heartbeat interval is 30 seconds
-and can be changed with `ADX_DATA_PLANE_NODE_PROXY_ACTIVITY_INTERVAL_SEC`. The socket
-is `<dir>/fs.sock`; the activity RPC does not share the POSIX server.
-Stream state changes trigger a batch after a 10 ms coalescing window. When
-FunctionSystem is starting or unavailable, reconnect attempts are limited to
-once per second while the latest counts remain cached locally.
+Set `ADX_DATA_PLANE_NODE_PROXY_ACTIVITY_UDS_DIR` to a dedicated node-local
+control directory. Node Manager's `proxy_socket` must be `<dir>/route.sock`.
+The managed Node Proxy starts with admission closed. `GetBindingState`,
+`BeginBindings`, and `ReplaceBindings` establish a complete binding snapshot;
+only successful replacement opens admission. Beginning synchronization retires
+existing relay sessions. Individual updates carry the proxy process UUID,
+synchronization epoch, ownership generation and binding revision. A previous
+controller or proxy session cannot reactivate an old binding. Node Manager
+replays its complete local catalog when the proxy process restarts.
+See [publication and recovery contract](../docs/testing/route-publication.md).
 
-FunctionSystem expires a missing heartbeat after 90 seconds. A reporting
-failure never stops the gateway or its data plane: the activity tracker keeps
-the latest complete batch in memory and the publisher retries the UDS until
-it can deliver that snapshot. While all leases are expired, FunctionSystem
-pauses idle reclamation rather than interpreting the missing report as zero.
+Activity snapshots go to Node Manager at `<dir>/node-manager.sock` using
+`adx.node.v1.NodeActivityService`. Each complete snapshot carries the registered
+proxy session and an increasing sequence. The reporting interval is configured
+with `ADX_DATA_PLANE_NODE_PROXY_ACTIVITY_INTERVAL_SEC` (default 30 seconds).
+Stream changes trigger a batch after a 10 ms coalescing window. Connection
+failures retry at most once per second without stopping data traffic.
+
+Node Manager validates the session and snapshot order. An absent or expired
+observation is unknown, never evidence of idleness. Session registration,
+startup reconciliation and process assembly must be wired by the new node
+control implementation. See [protocol boundaries](../platform/api/proto/README.md).
 
 The source layout follows the process and responsibility boundary:
 
@@ -286,9 +290,7 @@ services and covers readiness, tenant admission, direct HTTP, WebSocket,
 CONNECT tunnel, port-forwarding, SSH/raw TCP, route retirement, status errors,
 drain, H2 reuse, and activity-count convergence.
 
-For a process-level check, including a real etcd list/watch and the three
-release binaries, run `bash gateway/tests/real_process_mock.sh target/release`. It uses a temporary
-Docker etcd container and a local mock sandbox service, then cleans them up.
+The historical `gateway/tests/real_process_mock.sh` and Lima harness below target the previous etcd/IAM bootstrap; they need adaptation before use with the managed Edge entrypoint. For the new Redis/mTLS route and real H2/TCP collaboration check, run `python3 build/ci/run.py control-rpc` with `ADX_TEST_REDIS_SERVER` set. This fixture does not launch sandboxd or RRT.
 
 The reusable Lima topology has a separate project harness:
 

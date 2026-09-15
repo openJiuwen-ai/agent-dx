@@ -1,0 +1,103 @@
+import importlib.util
+from pathlib import Path
+import sys
+import unittest
+ROOT=Path(__file__).resolve().parents[1]
+sys.path.insert(0,str(ROOT))
+spec=importlib.util.spec_from_file_location('k8s_manifest',ROOT/'kubernetes/manifest.py')
+k8s=importlib.util.module_from_spec(spec);spec.loader.exec_module(k8s)
+
+class KubernetesDeploymentTests(unittest.TestCase):
+    def resources(self):return k8s.resources('adx-e2e-test','registry.example/node@sha256:'+'a'*64,'amd64',True)
+    def test_two_pods_are_scoped_and_process_deployed(self):
+        pods=[x for x in self.resources() if x['kind']=='Pod']
+        self.assertEqual([p['metadata']['name'] for p in pods],['node1','node2'])
+        for pod in pods:
+            self.assertEqual(pod['metadata']['namespace'],'adx-e2e-test')
+            spec=pod['spec'];self.assertFalse(spec['automountServiceAccountToken'])
+            self.assertNotIn('hostNetwork',spec);self.assertNotIn('hostPID',spec)
+            self.assertEqual(spec['nodeSelector']['kubernetes.io/arch'],'amd64')
+            self.assertTrue(spec['containers'][0]['securityContext']['privileged'])
+            self.assertFalse(any('hostPath' in v for v in spec['volumes']))
+    def test_shared_keys_are_read_only_and_evidence_is_separate(self):
+        pod=next(r for r in self.resources() if r['kind']=='Pod')
+        mounts={m['mountPath']:m for m in pod['spec']['containers'][0]['volumeMounts']}
+        self.assertTrue(mounts['/secrets']['readOnly'])
+        self.assertNotEqual(mounts['/evidence']['name'],mounts['/secrets']['name'])
+        volume=next(v for v in pod['spec']['volumes'] if v['name']=='images')
+        self.assertEqual(volume['emptyDir']['medium'],'Memory')
+    def test_service_dns_matches_platform_configuration(self):
+        services={r['metadata']['name']:r for r in self.resources() if r['kind']=='Service'}
+        self.assertEqual(set(services),{'master','node2'})
+        ports={p['port'] for p in services['master']['spec']['ports']}
+        self.assertTrue({6379,17000,17001,18443,8443}.issubset(ports))
+    def test_namespace_and_image_must_be_explicit(self):
+        for namespace,image in [('default','registry.example/node@sha256:'+'a'*64),('adx-e2e-test','node:latest')]:
+            with self.assertRaises(ValueError):k8s.resources(namespace,image,'amd64',False)
+
+class KubernetesLifecycleTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        spec=importlib.util.spec_from_file_location('k8s_run',ROOT/'kubernetes/run.py')
+        cls.module=importlib.util.module_from_spec(spec);spec.loader.exec_module(cls.module)
+
+    def test_cleanup_never_deletes_replaced_namespace(self):
+        import json,tempfile
+        with tempfile.TemporaryDirectory() as d:
+            run=self.module.KubernetesRun(Path(d),Path('/fixture/kubeconfig'))
+            run.namespace_attempted=True;run.namespace_uid='original'
+            calls=[]
+            def kube(*args,**kwargs):
+                calls.append(args)
+                return json.dumps({'metadata':{'uid':'replacement','labels':{'adx.e2e.run':run.id}}})
+            run.kube=kube
+            errors=run.cleanup()
+            self.assertTrue(errors)
+            self.assertFalse(any('delete' in call for call in calls))
+
+    def test_failed_stop_still_deletes_owned_namespace_and_fails_cleanup(self):
+        import json,tempfile
+        with tempfile.TemporaryDirectory() as d:
+            run=self.module.KubernetesRun(Path(d),Path('/fixture/kubeconfig'))
+            run.namespace_attempted=True;run.namespace_uid='owned';run.nodes=['node1','node2']
+            calls=[];deleted=False
+            def kube(*args,**kwargs):
+                nonlocal deleted
+                calls.append(args)
+                if args[:2]==('get','namespace'):
+                    return '' if deleted else json.dumps({'metadata':{'uid':'owned','labels':{'adx.e2e.run':run.id}}})
+                if args[:2]==('delete','namespace'):deleted=True
+                return ''
+            run.kube=kube
+            run.helper=lambda *a,**k:None
+            def execute(*args,**kwargs):raise RuntimeError('stop failed')
+            run.execute=execute
+            errors=run.cleanup()
+            self.assertTrue(deleted)
+            self.assertEqual(len(errors),2)
+            self.assertEqual([a[3].split(':')[0] for a in calls if len(a)>3 and a[2]=='cp'],['node2','node1'])
+
+    def test_registry_manifest_cannot_point_to_another_bundle(self):
+        import json,tempfile
+        with tempfile.TemporaryDirectory() as d:
+            p=Path(d);(p/'bundle.json').write_text(json.dumps({'schema_version':1,'image_ids':{}}))
+            (p/'registry.json').write_text(json.dumps({'schema_version':1,'bundle_sha256':'wrong','image_ids':{}}))
+            with self.assertRaisesRegex(ValueError,'do not match'):
+                self.module.identity(p/'bundle.json',p/'registry.json')
+
+    def test_pipeline_deploys_through_kubeconfig_without_docker(self):
+        script=(ROOT.parents[1]/'.buildkite/run-e2e.sh').read_text()
+        self.assertIn('build/e2e/kubernetes/run.py',script)
+        self.assertIn('--kubeconfig',script)
+        self.assertNotIn('docker ',script)
+
+    def test_generated_credentials_cover_every_projected_secret_file(self):
+        import base64,tempfile
+        with tempfile.TemporaryDirectory() as d:
+            data=self.module.credentials(Path(d),'registry.example/rrt@sha256:'+'b'*64)
+            objects=k8s.resources('adx-e2e-test','registry.example/node@sha256:'+'a'*64,'amd64')
+            pod=next(o for o in objects if o['kind']=='Pod')
+            secret=next(v['secret'] for v in pod['spec']['volumes'] if v['name']=='credentials')
+            self.assertTrue(all(item['key'] in data for item in secret['items']))
+            self.assertNotIn('ca.key',data)
+            self.assertEqual(base64.b64decode(data['image']).decode(),'registry.example/rrt@sha256:'+'b'*64)

@@ -4,7 +4,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 #[cfg(feature = "activity-client")]
 use std::time::Duration;
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Notify;
 
 const ACTIVITY_SHARD_COUNT: usize = 64;
@@ -17,8 +16,8 @@ pub struct ActivitySnapshot {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActivityBatch {
-    pub gateway_epoch: String,
-    pub timestamp_ms: u64,
+    pub proxy_session_id: String,
+    pub sequence: u64,
     pub activities: Vec<ActivitySnapshot>,
 }
 
@@ -33,23 +32,23 @@ impl ActivitySnapshot {
 
 #[derive(Clone)]
 pub struct ActivityTracker {
-    gateway_epoch: String,
+    proxy_session_id: String,
     count_shards: Arc<Vec<Mutex<HashMap<String, u64>>>>,
     changed: Arc<Notify>,
-    last_timestamp_ms: Arc<AtomicU64>,
+    last_sequence: Arc<AtomicU64>,
 }
 
 impl ActivityTracker {
-    pub fn new(gateway_epoch: impl Into<String>) -> Self {
+    pub fn new(proxy_session_id: impl Into<String>) -> Self {
         Self {
-            gateway_epoch: gateway_epoch.into(),
+            proxy_session_id: proxy_session_id.into(),
             count_shards: Arc::new(
                 (0..ACTIVITY_SHARD_COUNT)
                     .map(|_| Mutex::new(HashMap::new()))
                     .collect(),
             ),
             changed: Arc::new(Notify::new()),
-            last_timestamp_ms: Arc::new(AtomicU64::new(0)),
+            last_sequence: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -81,8 +80,8 @@ impl ActivityTracker {
         }
         activities.sort_by(|left, right| left.instance_id.cmp(&right.instance_id));
         ActivityBatch {
-            gateway_epoch: self.gateway_epoch.clone(),
-            timestamp_ms: self.next_timestamp_ms(),
+            proxy_session_id: self.proxy_session_id.clone(),
+            sequence: self.next_sequence(),
             activities,
         }
     }
@@ -114,23 +113,9 @@ impl ActivityTracker {
         &self.count_shards[hasher.finish() as usize % self.count_shards.len()]
     }
 
-    fn next_timestamp_ms(&self) -> u64 {
-        let wall_clock = now_ms();
-        self.last_timestamp_ms
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |previous| {
-                Some(wall_clock.max(previous.saturating_add(1)))
-            })
-            .unwrap_or_default()
-            .saturating_add(1)
-            .max(wall_clock)
+    fn next_sequence(&self) -> u64 {
+        self.last_sequence.fetch_add(1, Ordering::Relaxed) + 1
     }
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
 }
 
 /// Publishes a complete gateway snapshot. The tracker remains authoritative
@@ -147,9 +132,9 @@ mod client {
     use tower::service_fn;
 
     pub mod proto {
-        tonic::include_proto!("data_plane_gateway_activity");
+        tonic::include_proto!("adx.node.v1");
     }
-    use proto::data_plane_gateway_activity_service_client::DataPlaneGatewayActivityServiceClient;
+    use proto::node_activity_service_client::NodeActivityServiceClient;
 
     const EVENT_COALESCE_DELAY: Duration = Duration::from_millis(10);
     const DISCONNECTED_RETRY_DELAY: Duration = Duration::from_secs(1);
@@ -160,7 +145,7 @@ mod client {
         uds_path: String,
         interval: Duration,
     ) {
-        let mut client: Option<DataPlaneGatewayActivityServiceClient<Channel>> = None;
+        let mut client: Option<NodeActivityServiceClient<Channel>> = None;
         let mut next_report = tokio::time::Instant::now();
         loop {
             let sleep = tokio::time::sleep_until(next_report);
@@ -178,32 +163,30 @@ mod client {
                 client = connect(&uds_path).await.ok();
             }
             if let Some(current) = client.as_mut() {
-                let request = proto::DataPlaneGatewayActivityRequest {
-                    gateway_epoch: batch.gateway_epoch,
-                    timestamp_ms: batch.timestamp_ms,
-                    activities: batch
+                let request = proto::ActivitySnapshot {
+                    proxy_session_id: batch.proxy_session_id,
+                    sequence: batch.sequence,
+                    instances: batch
                         .activities
                         .into_iter()
-                        .map(|entry| proto::DataPlaneGatewayActivityEntry {
+                        .map(|entry| proto::InstanceActivity {
                             instance_id: entry.instance_id,
-                            active_stream_count: entry.active_stream_count,
+                            active_streams: entry.active_stream_count,
                         })
                         .collect(),
                 };
-                if current
-                    .report_activity(Request::new(request))
-                    .await
-                    .is_err()
-                {
-                    client = None;
+                let sequence = request.sequence;
+                match current.report_snapshot(Request::new(request)).await {
+                    Ok(response) if response.get_ref().accepted_sequence >= sequence => {}
+                    _ => client = None,
                 }
             }
             next_report = tokio::time::Instant::now()
                 + if client.is_some() {
                     interval
                 } else {
-                    // Startup reports may be rejected until FunctionSystem has
-                    // completed Sync/Recover. Retry promptly without touching
+                    // Startup reports may be rejected until Node Manager has
+                    // registered the proxy session. Retry promptly without touching
                     // the TCP data plane or discarding the local snapshot.
                     DISCONNECTED_RETRY_DELAY.min(interval)
                 };
@@ -212,7 +195,7 @@ mod client {
 
     async fn connect(
         uds_path: &str,
-    ) -> Result<DataPlaneGatewayActivityServiceClient<Channel>, tonic::transport::Error> {
+    ) -> Result<NodeActivityServiceClient<Channel>, tonic::transport::Error> {
         let path = uds_path.to_owned();
         let endpoint = Endpoint::from_static("http://data-plane-gateway-activity")
             .connect_timeout(ACTIVITY_RPC_TIMEOUT)
@@ -223,7 +206,7 @@ mod client {
                 async move { UnixStream::connect(path).await.map(TokioIo::new) }
             }))
             .await?;
-        Ok(DataPlaneGatewayActivityServiceClient::new(channel))
+        Ok(NodeActivityServiceClient::new(channel))
     }
 }
 
@@ -241,16 +224,16 @@ mod tests {
         tracker.activate("a");
         tracker.deactivate("a");
         let batch = tracker.snapshot();
-        assert_eq!(batch.gateway_epoch, "epoch");
+        assert_eq!(batch.proxy_session_id, "epoch");
         assert_eq!(batch.activities.len(), 1);
         assert_eq!(batch.activities[0], ActivitySnapshot::new("b", 1));
     }
 
     #[test]
-    fn snapshot_timestamp_is_strictly_increasing() {
+    fn snapshot_sequence_is_strictly_increasing() {
         let tracker = ActivityTracker::new("epoch");
-        let first = tracker.snapshot().timestamp_ms;
-        let second = tracker.snapshot().timestamp_ms;
+        let first = tracker.snapshot().sequence;
+        let second = tracker.snapshot().sequence;
         assert!(second > first);
     }
 

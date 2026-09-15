@@ -1,0 +1,63 @@
+syntax = "proto3";
+package adx.node.v1;
+option go_package = "gitcode.com/robbluo/agent-dx/platform/control-plane/sandbox-api/internal/gen/nodev1;nodev1";
+
+// Node Manager is the only writer. Shared-process deployments implement this
+// contract directly; separate processes use a protected local gRPC endpoint.
+service NodeProxyService {
+  rpc GetBindingState(GetBindingStateRequest) returns (BindingState);
+  rpc BeginBindings(BindingState) returns (BindingState);
+  rpc ReplaceBindings(BindingSnapshot) returns (BindingState);
+  rpc UpdateBinding(UpdateBindingRequest) returns (UpdateBindingResponse);
+}
+message RuntimeTarget {
+  string runtime_id = 1;
+  string ip = 2;
+}
+message Retired {}
+message GetBindingStateRequest {}
+message BindingState { string proxy_session_id = 1; uint64 sync_epoch = 2; bool ready = 3; string controller_session_id = 4; }
+message BindingSnapshot { string proxy_session_id = 1; uint64 sync_epoch = 2; repeated UpdateBindingRequest bindings = 3; }
+message UpdateBindingRequest {
+  string proxy_session_id = 6;
+  uint64 sync_epoch = 7;
+  string instance_id = 1;
+  // Ordered lexicographically by (ownership_generation, binding_revision).
+  // The generation comes from the durable Instance assignment.
+  uint64 ownership_generation = 2;
+  uint64 binding_revision = 3;
+  oneof binding {
+    RuntimeTarget active = 4;
+    Retired retired = 5;
+  }
+}
+// Success acknowledges application, including retirement of the previous
+// binding. Identical retries succeed; older versions or conflicting payloads
+// at the same version fail with FAILED_PRECONDITION. Receiver restart requires
+// authoritative reconciliation before it serves traffic.
+message UpdateBindingResponse {
+  uint64 ownership_generation = 1;
+  uint64 binding_revision = 2;
+}
+
+service NodeActivityService {
+  rpc ReportSnapshot(ActivitySnapshot) returns (ActivityAcknowledgement);
+}
+// A complete snapshot for a registered proxy session. An omitted Instance has
+// zero active streams. The receiver validates the session and discards earlier
+// sequences. This is observation only; Node Manager owns idle/lifecycle policy.
+message ActivitySnapshot {
+  string proxy_session_id = 1;
+  uint64 sequence = 2;
+  repeated InstanceActivity instances = 3;
+}
+message InstanceActivity {
+  string instance_id = 1;
+  uint64 active_streams = 2;
+}
+message ActivityAcknowledgement { uint64 accepted_sequence = 1; }
+
+// Supervisor-only local endpoint, served on a protected UDS, never on Node TCP.
+service NodeAdminService { rpc Drain(DrainRequest) returns (DrainResponse); }
+message DrainRequest {}
+message DrainResponse { uint64 deleted_instances = 1; }

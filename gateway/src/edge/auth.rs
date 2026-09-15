@@ -16,6 +16,7 @@ const HEADER_X_AUTH: &str = "x-auth";
 
 #[derive(Debug, Clone)]
 pub struct EdgeAuthenticator {
+    verifier: Option<Arc<dyn CredentialVerifier>>,
     required: bool,
     validate_iam: bool,
     iam_address: String,
@@ -64,7 +65,18 @@ impl AuthError {
     }
 }
 
+#[async_trait::async_trait]
+pub trait CredentialVerifier: Send + Sync + std::fmt::Debug {
+    async fn verify(&self, key: &str) -> Result<AuthenticatedIdentity, AuthError>;
+}
 impl EdgeAuthenticator {
+    pub fn with_verifier(verifier: Arc<dyn CredentialVerifier>) -> Self {
+        let mut auth = Self::disabled();
+        auth.required = true;
+        auth.verifier = Some(verifier);
+        auth
+    }
+
     pub fn new(
         required: bool,
         validate_iam: bool,
@@ -78,6 +90,7 @@ impl EdgeAuthenticator {
             ));
         }
         Ok(Self {
+            verifier: None,
             required,
             validate_iam,
             iam_address,
@@ -170,6 +183,9 @@ impl EdgeAuthenticator {
                     expires_at_unix: None,
                 })
             };
+        }
+        if let Some(verifier) = &self.verifier {
+            return verifier.verify(token).await;
         }
         let claims = parse_claims(token)?;
         if claims.sub.trim().is_empty() {

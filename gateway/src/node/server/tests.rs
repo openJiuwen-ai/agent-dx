@@ -32,10 +32,7 @@ where
     W: AsyncWrite + Unpin,
 {
     let mut bytes = [0; 8192];
-    loop {
-        let Ok(n) = reader.read(&mut bytes).await else {
-            break;
-        };
+    while let Ok(n) = reader.read(&mut bytes).await {
         if n == 0 {
             break;
         }

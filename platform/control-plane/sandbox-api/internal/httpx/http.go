@@ -6,6 +6,8 @@ package httpx
 import (
 	"encoding/json"
 	"fmt"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
@@ -38,6 +40,28 @@ type Response struct {
 }
 
 func SetCtxResponse(c *gin.Context, data any, code int, err error) {
+	if code == http.StatusInternalServerError && err != nil {
+		switch status.Code(err) {
+		case codes.InvalidArgument:
+			code = http.StatusBadRequest
+		case codes.Unauthenticated:
+			code = http.StatusUnauthorized
+		case codes.PermissionDenied:
+			code = http.StatusForbidden
+		case codes.NotFound:
+			code = http.StatusNotFound
+		case codes.AlreadyExists, codes.FailedPrecondition, codes.Aborted:
+			code = http.StatusConflict
+		case codes.ResourceExhausted:
+			code = http.StatusTooManyRequests
+		case codes.Unavailable:
+			code = http.StatusServiceUnavailable
+		case codes.DeadlineExceeded:
+			code = http.StatusGatewayTimeout
+		case codes.Unimplemented:
+			code = http.StatusNotImplemented
+		}
+	}
 	body, marshalErr := json.Marshal(data)
 	response := Response{Code: code}
 	if marshalErr != nil {

@@ -41,6 +41,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/ugorji/go/codec"
 	"golang.org/x/net/idna"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 
 	"gitcode.com/robbluo/agent-dx/platform/control-plane/sandbox-api/backend"
@@ -1532,7 +1534,7 @@ func createSandbox(
 			)
 		} else {
 			httpx.SetCtxResponse(
-				ctx, nil, http.StatusInternalServerError, fmt.Errorf("failed to create sandbox: %v", createErr),
+				ctx, nil, http.StatusInternalServerError, fmt.Errorf("failed to create sandbox: %w", createErr),
 			)
 		}
 	}
@@ -2868,7 +2870,7 @@ func DeleteHandler(ctx *gin.Context) {
 	killRequest.RequestID = requestID
 	if err := deleteOnBackend(killRequest); err != nil {
 		httpx.Logger().Errorf("failed to kill sandbox instance %s: %v", instanceID, err)
-		httpx.SetCtxResponse(ctx, nil, http.StatusInternalServerError, fmt.Errorf("failed to delete sandbox: %v", err))
+		httpx.SetCtxResponse(ctx, nil, http.StatusInternalServerError, fmt.Errorf("failed to delete sandbox: %w", err))
 		return
 	}
 
@@ -3173,6 +3175,10 @@ func setSandboxLifecycleError(ctx *gin.Context, err error) {
 }
 
 func lifecycleHTTPStatus(err error) int {
+	if status.Code(err) == codes.Unimplemented {
+		return http.StatusNotImplemented
+	}
+
 	statusCode := http.StatusInternalServerError
 	var transportError *sandboxLifecycleTransportError
 	var businessError *sandboxLifecycleBusinessError
@@ -3245,6 +3251,9 @@ func authorizeSandboxDelete(ctx *gin.Context, instanceID string) (int, error) {
 	} else {
 		instance, err := readAuthoritativeSandboxInstance(ctx.Request.Context(), instanceID)
 		if err != nil {
+			if status.Code(err) == codes.PermissionDenied {
+				return http.StatusForbidden, err
+			}
 			if errors.Is(err, backend.ErrInstanceNotFound) {
 				return http.StatusNotFound, errors.New("authoritative instance not found")
 			}

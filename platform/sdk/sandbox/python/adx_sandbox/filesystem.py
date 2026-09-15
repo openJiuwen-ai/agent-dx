@@ -3,7 +3,7 @@
 Small file operations use Frontend invoke actions. Binary file and directory
 copy paths prefer the ``/direct`` route so large payloads avoid JSON
 envelopes. The RRT direct route is a published sandbox target and remains
-available under a block-network policy; RuntimeRPC chunks remain the bounded
+available under a block-network policy; invoke chunks remain the bounded
 fallback for transport failures.
 """
 
@@ -232,7 +232,7 @@ class Filesystem:
         )
         return self._entry(result)
 
-    # ── bulk copy via direct HTTP or RuntimeRPC chunks ────────────────
+    # ── bulk copy via direct HTTP or invoke chunks ────────────────
 
     def copy_from_local(self, local_path: str, remote_path: str) -> None:
         """Copy a local file or directory **into** the sandbox.

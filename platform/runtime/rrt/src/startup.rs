@@ -114,7 +114,7 @@ fn configured_or_gvisor_path(environment_key: &str, gvisor_path: &str) -> Option
         // An explicit handoff path is configuration, not a best-effort hint.
         // Keep it so readers fail closed if it is temporarily unavailable;
         // silently falling back to restored in-process identity could reconnect
-        // to the source FunctionProxy.
+        // using the source execution identity.
         return Some(path);
     }
     let path = PathBuf::from(gvisor_path);

@@ -1,11 +1,11 @@
-#![cfg(feature = "etcd-watch")]
+#![cfg(feature = "activity-client")]
 
 use data_plane_gateway::common::resource::raise_nofile_soft_limit_from_env;
 use data_plane_gateway::common::shutdown::shutdown_signal;
 use data_plane_gateway::config::EdgeFrontendConfig;
 use data_plane_gateway::edge::{
     CommandWatchConfig, DataPlaneL4Connector, EdgeAuthenticator, EdgeFrontend, EdgeRouteResolver,
-    RouteStore, RouteWatcher,
+    RouteStore,
 };
 use std::sync::Arc;
 use std::{fs::File, io::BufReader};
@@ -28,19 +28,16 @@ async fn run(config: EdgeFrontendConfig) -> Result<(), Box<dyn std::error::Error
     let health_listener = TcpListener::bind(config.health_bind).await?;
     let store = Arc::new(RouteStore::new());
     let route_changes = store.subscribe();
-    let watcher = Arc::new(RouteWatcher::new(
-        store.clone(),
-        config.etcd_endpoints.clone(),
-        config.etcd_connect_options()?,
-    ));
-    let resolver = Arc::new(EdgeRouteResolver::new(store).with_point_getter(watcher.clone()));
+    let path = std::env::var("ADX_EDGE_CONTROL_CONFIG")
+        .map_err(|_| "ADX_EDGE_CONTROL_CONFIG is required")?;
+    let input = std::fs::read(path)?;
+    let control: data_plane_gateway::edge::master_routes::ControlConfig =
+        serde_json::from_slice(&input)?;
+    let watcher =
+        Arc::new(data_plane_gateway::edge::master_routes::MasterConnection::new(control)?);
+    let resolver = Arc::new(EdgeRouteResolver::new(store.clone()).stream_only());
     let connector = DataPlaneL4Connector::new(config.h2_pool_config()?);
-    let authenticator = EdgeAuthenticator::new(
-        true,
-        config.validate_iam,
-        config.iam_address.clone(),
-        config.auth_cache_ttl,
-    )?;
+    let authenticator = EdgeAuthenticator::with_verifier(watcher.clone());
     let gateway = Arc::new(
         EdgeFrontend::new(
             resolver,
@@ -67,7 +64,7 @@ async fn run(config: EdgeFrontendConfig) -> Result<(), Box<dyn std::error::Error
     );
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    let watcher_task = tokio::spawn(watcher.run());
+    let watcher_task = tokio::spawn(watcher.run(store));
     let route_reconciler_task = tokio::spawn(gateway.clone().run_route_reconciler(route_changes));
     let tls_acceptor = load_tls_acceptor(&config.tls_cert, &config.tls_key)?;
     let tls_task = tokio::spawn(gateway.clone().serve_http_tls(

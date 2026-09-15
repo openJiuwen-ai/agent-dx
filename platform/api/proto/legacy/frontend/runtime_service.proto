@@ -22,25 +22,7 @@ import "common.proto";
 
 option go_package = "gitcode.com/robbluo/agent-dx/platform/control-plane/sandbox-api/internal/gen/runtime;runtime";
 
-// Runtime service provides APIs to core,
-service RuntimeService {
-  // Call a method or init state of instance
-  rpc Call (CallRequest) returns (CallResponse) {}
-  // NotifyResult is applied to async notify result of create or invoke request invoked by runtime
-  rpc NotifyResult (NotifyRequest) returns (NotifyResponse) {}
-  // Checkpoint request a state to save for failure recovery and state migration
-  rpc Checkpoint (CheckpointRequest) returns (CheckpointResponse) {}
-  // Recover state
-  rpc Recover (RecoverRequest) returns (RecoverResponse) {}
-  // GracefulExit request an instance graceful exit
-  rpc GracefulExit (GracefulExitRequest) returns (GracefulExitResponse) {}
-  // Shutdown request an instance shutdown
-  rpc Shutdown (ShutdownRequest) returns (ShutdownResponse) {}
-  // check whether the runtime is alive
-  rpc Heartbeat (HeartbeatRequest) returns (HeartbeatResponse) {}
-  // Signal the signal to instance
-  rpc Signal (SignalRequest) returns (SignalResponse) {}
-}
+// Compatibility payload decoding only; no RuntimeService RPC is generated.
 
 message CallRequest {
   string              function             = 1;

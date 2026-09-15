@@ -20,7 +20,7 @@ fn kw_i64(kw: &BTreeMap<String, Value>, key: &str) -> Option<i64> {
 }
 
 fn decode_hex(data: &str) -> Result<Vec<u8>, String> {
-    if data.len() % 2 != 0 {
+    if !data.len().is_multiple_of(2) {
         return Err("hex data length must be even".to_string());
     }
     (0..data.len())
