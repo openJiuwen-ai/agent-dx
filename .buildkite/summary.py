@@ -1,0 +1,126 @@
+#!/usr/bin/env python3
+"""Publish explicit build artifacts and validation evidence on the build page."""
+import argparse
+import hashlib
+import html
+import json
+import os
+from pathlib import Path
+
+
+def read(path):
+    return json.loads(path.read_text()) if path.is_file() else None
+
+
+def link(label, path):
+    return f'[{label}](artifact://out/buildkite/{path})'
+
+
+def code(value):
+    return '<code>' + html.escape(str(value)) + '</code>'
+
+
+def collect(root, stage, exit_code, commit):
+    previous = {'images': 'release', 'e2e': 'images'}.get(stage)
+    result = read(root / 'summaries' / f'{previous}.json') if previous else None
+    if result and result['commit'] != commit:
+        raise ValueError('summary belongs to a different commit')
+    if previous and not result and exit_code == 0:
+        raise ValueError('previous stage summary missing')
+    result = result or {'commit': commit, 'stages': {}}
+    result['stages'][stage] = {'status': 'passed' if exit_code == 0 else 'failed', 'exit_code': exit_code}
+    if stage == 'release':
+        manifest = read(root / 'release-manifest.json')
+        archive = root / 'adx-release.tar.gz'
+        if manifest and archive.is_file():
+            digest = hashlib.sha256()
+            with archive.open('rb') as source:
+                for chunk in iter(lambda: source.read(1024 * 1024), b''):
+                    digest.update(chunk)
+            result['release'] = {'manifest': manifest, 'bytes': archive.stat().st_size,
+                                 'sha256': digest.hexdigest(),
+                                 'sdk': sorted(p.name for p in (root / 'sdk').glob('*.whl'))}
+        if exit_code == 0 and not result.get('release'):
+            raise ValueError('release artifacts missing')
+    elif stage == 'images':
+        bundle = read(root / 'bundle/bundle.json')
+        registry = read(root / 'bundle/registry-images.json')
+        if bundle and registry:
+            result['images'] = {'references': registry['references'], 'base_images': bundle['base_images'],
+                                'backend': bundle['backend']['sandboxd_revision']}
+        if exit_code == 0 and not result.get('images'):
+            raise ValueError('published image references missing')
+    elif stage == 'e2e':
+        report = read(root / 'acceptance/result.json')
+        result['e2e'] = {'report': report, 'placement': read(root / 'acceptance/placement.json') or []}
+        if exit_code == 0 and (not report or report['status'] != 'passed' or
+                               report['cleanup_errors'] or report['missing_checks']):
+            raise ValueError('Kubernetes acceptance evidence missing or failed')
+    return result
+
+
+def render(result):
+    lines = ['## ADX 构建与产物汇总', '', '提交：' + code(result['commit']), '',
+             '| 阶段 | 状态 | 完整日志 |', '|---|---|---|']
+    for stage, name in [('release', '编译与发布包'), ('images', '镜像构建与推送'), ('e2e', 'Kubernetes E2E')]:
+        state = result['stages'].get(stage)
+        if state:
+            lines.append(f"| {name} | {state['status']}（exit {state['exit_code']}） | " +
+                         link('日志', f'logs/step-{stage}.log') + ' |')
+    release = result.get('release')
+    if release:
+        manifest = release['manifest']
+        lines += ['', '### 发布包', '',
+                  link('下载统一发布包', 'adx-release.tar.gz') + ' · ' +
+                  link('SHA256 文件', 'adx-release.tar.gz.sha256') + ' · ' +
+                  link('文件清单及校验值', 'release-manifest.json'), '',
+                  f"平台：{code(manifest['target'])}；配置：{code(manifest['profile'])}；大小：{release['bytes'] / 1048576:.1f} MiB", '',
+                  'SHA256：' + code(release['sha256']), '',
+                  '组件：' + ', '.join(code(Path(p).name) for p in manifest['files'] if p.startswith(('bin/', 'runtime/')))]
+        if release['sdk']:
+            lines += ['', 'SDK：' + ' · '.join(link(name, 'sdk/' + name) for name in release['sdk'])]
+    images = result.get('images')
+    if images:
+        lines += ['', '### 镜像', '', '| 镜像 | 拉取地址（固定 digest） |', '|---|---|']
+        for role, ref in sorted(images['references'].items()):
+            lines.append(f'| {role} | {code(ref)} |')
+        lines += ['', link('镜像清单', 'bundle/registry-images.json') + ' · ' + link('构建来源', 'bundle/bundle.json'),
+                  '', 'sandboxd revision：' + code(images['backend'])]
+    e2e = result.get('e2e')
+    if e2e:
+        report = e2e['report']
+        lines += ['', '### Kubernetes 验收', '']
+        if report:
+            lines += ['结果：' + code(report['status']) + '；场景：' + ', '.join(report['checks']),
+                      '', '清理错误数：' + str(len(report['cleanup_errors'])) + '；缺失场景数：' + str(len(report['missing_checks'])),
+                      '', link('result.json', 'acceptance/result.json') + ' · ' + link('JUnit', 'acceptance/junit.xml')]
+            if report['error']:
+                lines += ['', '错误：' + code(report['error'])]
+        else:
+            lines += ['验收报告尚未生成，请查看本阶段日志。']
+        placement = e2e['placement']
+        if placement:
+            lines += ['', '| Pod | 宿主节点 | Pod IP |', '|---|---|---|']
+            lines += [f"| {code(p['pod'])} | {code(p['host'])} | {code(p['ip'])} |" for p in placement]
+            if len({p['host'] for p in placement}) == 1:
+                lines += ['', '**本轮两个 Pod 位于同一宿主节点；未覆盖跨宿主机网络。**']
+            lines += ['', link('部署落点', 'acceptance/placement.json')]
+    return '\n'.join(lines) + '\n'
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--stage', choices=('release', 'images', 'e2e'), required=True)
+    parser.add_argument('--exit-code', type=int, required=True)
+    parser.add_argument('--root', type=Path, default=Path('out/buildkite'))
+    args = parser.parse_args()
+    result = collect(args.root, args.stage, args.exit_code, os.environ['BUILDKITE_COMMIT'])
+    output = args.root / 'summaries'
+    output.mkdir(parents=True, exist_ok=True)
+    (output / f'{args.stage}.json').write_text(json.dumps(result, indent=2) + '\n')
+    (output / f'{args.stage}.md').write_text(render(result))
+    print('Build summary: ' + str(output / f'{args.stage}.md'), flush=True)
+
+
+if __name__ == '__main__':
+    main()

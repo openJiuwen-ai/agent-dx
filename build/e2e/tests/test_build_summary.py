@@ -1,0 +1,85 @@
+import importlib.util
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+
+ROOT = Path(__file__).resolve().parents[3]
+spec = importlib.util.spec_from_file_location('ci_summary', ROOT / '.buildkite/summary.py')
+summary = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(summary)
+COMMIT = 'a' * 40
+
+
+def write(root, name, value):
+    path = root / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(value))
+
+
+class BuildSummaryTests(unittest.TestCase):
+    def test_cumulative_artifacts_and_actual_placement(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            write(root, 'release-manifest.json', {'target': 'linux-test', 'profile': 'release',
+                                                 'files': {'bin/adx-master': 'digest'}})
+            (root / 'adx-release.tar.gz').write_bytes(b'archive fixture')
+            (root / 'sdk').mkdir()
+            (root / 'sdk/adx_sandbox-test.whl').write_bytes(b'wheel fixture')
+            release = summary.collect(root, 'release', 0, COMMIT)
+            write(root, 'summaries/release.json', release)
+            write(root, 'bundle/bundle.json', {'base_images': {}, 'backend': {'sandboxd_revision': 'b' * 40}})
+            write(root, 'bundle/registry-images.json', {'references': {'node': 'registry/node@sha256:' + 'c' * 64}})
+            images = summary.collect(root, 'images', 0, COMMIT)
+            write(root, 'summaries/images.json', images)
+            write(root, 'acceptance/result.json', {'status': 'passed', 'checks': ['sdk', 'auth', 'capacity', 'restart', 'stop'],
+                                                  'cleanup_errors': [], 'missing_checks': [], 'error': None})
+            write(root, 'acceptance/placement.json', [{'pod': n, 'host': 'worker-a', 'ip': '10.0.0.1'} for n in ['node1', 'node2']])
+            final = summary.collect(root, 'e2e', 0, COMMIT)
+            text = summary.render(final)
+            self.assertEqual(set(final['stages']), {'release', 'images', 'e2e'})
+            self.assertIn('artifact://out/buildkite/adx-release.tar.gz', text)
+            self.assertIn('artifact://out/buildkite/sdk/adx_sandbox-test.whl', text)
+            self.assertIn('registry/node@sha256:', text)
+            self.assertIn('同一宿主节点', text)
+            self.assertIn('auth, capacity, restart, stop', text)
+            with self.assertRaisesRegex(ValueError, 'different commit'):
+                summary.collect(root, 'e2e', 0, 'd' * 40)
+            (root / 'acceptance/result.json').unlink()
+            with self.assertRaisesRegex(ValueError, 'evidence missing'):
+                summary.collect(root, 'e2e', 0, COMMIT)
+
+    def test_streaming_preserves_failure_and_publishes_failure_summary(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / '.buildkite').mkdir()
+            for name in ['step.sh', 'summary.py']:
+                shutil.copyfile(ROOT / '.buildkite' / name, root / '.buildkite' / name)
+            bin_dir = root / 'bin'
+            bin_dir.mkdir()
+            agent = bin_dir / 'buildkite-agent'
+            agent.write_text('#!/bin/sh\nif [ "$1" = annotate ]; then cat > annotation.md; fi\n')
+            agent.chmod(0o755)
+            command = [sys.executable, '-u', '-c', 'import sys; print("compiler fixture output"); sys.exit(37)']
+            process = subprocess.run(['bash', '.buildkite/step.sh', 'release', *command], cwd=root,
+                                     env={**os.environ, 'PATH': str(bin_dir) + os.pathsep + os.environ['PATH'],
+                                          'BUILDKITE_COMMIT': COMMIT}, text=True, capture_output=True)
+            self.assertEqual(process.returncode, 37, process.stderr)
+            self.assertIn('compiler fixture output', process.stdout)
+            self.assertIn('compiler fixture output', (root / 'out/buildkite/logs/step-release.log').read_text())
+            self.assertIn('failed（exit 37）', (root / 'annotation.md').read_text())
+
+    def test_sourced_setup_streams_without_losing_exports(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / 'setup.sh').write_text('export ADX_TEST_CACHE=/fixture/cache\necho setup-output\n')
+            result = subprocess.run(['bash', '-euo', 'pipefail', '-c',
+                                     'source setup.sh > >(tee setup.log) 2>&1; test "$ADX_TEST_CACHE" = /fixture/cache; wait'],
+                                    cwd=root, text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('setup-output', result.stdout)
+            self.assertIn('setup-output', (root / 'setup.log').read_text())

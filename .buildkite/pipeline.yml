@@ -7,13 +7,15 @@ steps:
     arch: amd64
   concurrency: 1
   concurrency_group: adx/release-amd64
-  command: bash .buildkite/build-e2e.sh
+  command: bash .buildkite/step.sh release bash .buildkite/build-e2e.sh
   timeout_in_minutes: 60
   artifact_paths:
   - out/buildkite/logs/**/*
   - out/buildkite/adx-release.tar.gz
   - out/buildkite/adx-release.tar.gz.sha256
   - out/buildkite/backend/**/*
+  - out/buildkite/release-manifest.json
+  - out/buildkite/sdk/*.whl
   env:
     BUILDKITE_AGENT_NAME: agent-stack-k8s
     ADX_CARGO_HOME: /mnt/paas/build-cache/adx/cargo-home
@@ -52,7 +54,7 @@ steps:
     queue: default
     os: linux
     arch: amd64
-  command: python3 .buildkite/with_registry.py --docker -- bash .buildkite/package-e2e.sh
+  command: bash .buildkite/step.sh images python3 .buildkite/with_registry.py --docker -- bash .buildkite/package-e2e.sh
   timeout_in_minutes: 40
   env:
     BUILDKITE_AGENT_NAME: agent-stack-k8s
@@ -60,7 +62,6 @@ steps:
   artifact_paths:
   - out/buildkite/logs/**/*
   - out/buildkite/bundle/*.json
-  - out/buildkite/bundle/prepare.log
   plugins:
   - kubernetes:
       podSpec:
@@ -109,10 +110,11 @@ steps:
     queue: default
     os: linux
     arch: amd64
-  command: python3 .buildkite/with_registry.py -- bash .buildkite/run-e2e.sh
+  command: bash .buildkite/step.sh e2e python3 .buildkite/with_registry.py -- bash .buildkite/run-e2e.sh
   timeout_in_minutes: 30
   artifact_paths:
   - out/buildkite/acceptance/**/*
+  - out/buildkite/logs/**/*
   env:
     BUILDKITE_AGENT_NAME: agent-stack-k8s
     ADX_KUBECONFIG: /var/run/yr-k8s/target/kubeconfig

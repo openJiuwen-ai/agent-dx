@@ -41,7 +41,7 @@ def main():
         path=a.backend/name
         if path.is_symlink() or sha(path) != backend['files'][name]:raise ValueError('backend integrity mismatch')
     uid=uuid.uuid4().hex[:12];tags={'node':f'adx-e2e-node:{uid}','rrt':f'adx-e2e-rrt:{uid}'}
-    with (a.output/'prepare.log').open('w') as log, tempfile.TemporaryDirectory(prefix='adx-e2e-image-') as d:
+    with tempfile.TemporaryDirectory(prefix='adx-e2e-image-') as d:
         context=Path(d)
         shutil.copytree(a.package,context/'package')
         # Artifact transport may drop Unix mode bits; identity was verified above.
@@ -58,10 +58,10 @@ def main():
         (context/'Dockerfile.node').write_text('ARG BASE\nFROM ${BASE}\nCOPY package /opt/adx/package\nCOPY backend /usr/local/bin\nCOPY e2e /opt/adx/e2e\nRUN python3 -m venv /opt/adx/client && /opt/adx/client/bin/pip install /opt/adx/package/sdk/*.whl\nWORKDIR /opt/adx\nCMD ["sleep", "infinity"]\n')
         (context/'Dockerfile.rrt').write_text('ARG BASE\nFROM ${BASE}\nCOPY package/runtime/rrt-runtime /usr/local/bin/rrt-runtime\nENTRYPOINT ["/usr/local/bin/rrt-runtime"]\n')
         for role,base in [('node',a.runtime_base),('rrt',a.rrt_base)]:
-            subprocess.run(['docker','build','--provenance=false','--build-arg','BASE='+base,'-f',str(context/f'Dockerfile.{role}'),'-t',tags[role],str(context)],stdout=log,stderr=subprocess.STDOUT,check=True,timeout=900)
+            subprocess.run(['docker','build','--progress=plain','--provenance=false','--build-arg','BASE='+base,'-f',str(context/f'Dockerfile.{role}'),'-t',tags[role],str(context)],stderr=subprocess.STDOUT,check=True,timeout=900)
         images={role:json.loads(subprocess.check_output(['docker','image','inspect',tag]))[0] for role,tag in tags.items()}
-        subprocess.run(['docker','save','-o',str(a.output/'images.tar'),*tags.values()],stdout=log,stderr=subprocess.STDOUT,check=True,timeout=600)
-        subprocess.run(['docker','save','-o',str(a.output/'rrt.tar'),tags['rrt']],stdout=log,stderr=subprocess.STDOUT,check=True,timeout=300)
+        subprocess.run(['docker','save','-o',str(a.output/'images.tar'),*tags.values()],stderr=subprocess.STDOUT,check=True,timeout=600)
+        subprocess.run(['docker','save','-o',str(a.output/'rrt.tar'),tags['rrt']],stderr=subprocess.STDOUT,check=True,timeout=300)
     result={'schema_version':1,'package':manifest,'backend':backend,'image_ids':{k:v['Id'] for k,v in images.items()},'architecture':images['node']['Architecture'],'archive_sha256':sha(a.output/'images.tar'),'rrt_archive_sha256':sha(a.output/'rrt.tar'),'base_images':{'node':a.runtime_base,'rrt':a.rrt_base}}
     (a.output/'bundle.json').write_text(json.dumps(result,indent=2)+'\n')
     print('E2E bundle prepared:',a.output)

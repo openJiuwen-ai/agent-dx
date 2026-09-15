@@ -114,7 +114,12 @@ class KubernetesRun(common.Run):
             if obj['kind'] == 'Pod':
                 self.nodes.append(obj['metadata']['name'])
         self.kube('-n', self.id, 'wait', 'pod', '--all', '--for=condition=Ready', '--timeout=300s', timeout=320)
-        edge_pod = json.loads(self.kube('-n', self.id, 'get', 'pod', 'node1', '-o', 'json'))
+        pods = json.loads(self.kube('-n', self.id, 'get', 'pods', '-o', 'json'))['items']
+        placement = [{'pod': p['metadata']['name'], 'host': p['spec']['nodeName'],
+                      'ip': p['status']['podIP']} for p in pods]
+        (self.output / 'placement.json').write_text(json.dumps(placement, indent=2) + '\n')
+        print('Kubernetes placement: ' + json.dumps(placement), flush=True)
+        edge_pod = next(p for p in pods if p['metadata']['name'] == 'node1')
         edge_ip = str(ipaddress.ip_address(edge_pod['status']['podIP']))
         for node in self.nodes:
             self.execute(node, 'python3', '/opt/adx/e2e/preflight.py')

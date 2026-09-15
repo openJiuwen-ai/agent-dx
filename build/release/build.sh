@@ -21,12 +21,15 @@ case "$host" in
 esac
 stage=$(mktemp -d "${TMPDIR:-/tmp}/adx-build.XXXXXX")
 trap 'rm -rf "$stage"' EXIT
+echo "--- :rust: Compile control plane, gateway and RRT"
 cargo build --locked --release -j "$JOBS" -p adx-control-cli -p adx-master -p adx-node-manager -p data-plane-gateway -p rrt-daemon --bins
+echo "--- :go: Generate protocol clients and compile Sandbox API"
 bash build/codegen/go.sh
-(cd platform/control-plane/sandbox-api && go build -mod=readonly -p "$JOBS" -o "$stage/adx-sandbox-api" ./cmd/adx-sandbox-api)
+(cd platform/control-plane/sandbox-api && go build -v -mod=readonly -p "$JOBS" -o "$stage/adx-sandbox-api" ./cmd/adx-sandbox-api)
 for name in adxctl adx-master adx-node-manager adx-edge-frontend adx-node-proxy adx-data-plane-forward rrt-runtime; do
  cp "$CARGO_TARGET_DIR/release/$name" "$stage/$name"
 done
+echo "--- :python: Build Sandbox SDK wheel"
 PYTHON="$PYTHON" bash platform/sdk/sandbox/python/build.sh "$stage/sdk"
 wheel=("$stage"/sdk/adx_sandbox-*.whl)
 [[ ${#wheel[@]} == 1 && -f "${wheel[0]}" ]]

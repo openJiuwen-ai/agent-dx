@@ -131,3 +131,17 @@ The image stage caches the pinned Ubuntu amd64 base in SWR. On a cache miss it
 pulls the identical manifest from a configurable regional mirror and checks its
 config/image digest before publishing. The runtime tools image is cached by its
 Dockerfile/bootstrap recipe; all final image inputs use SWR digest references.
+
+## Build page logs and artifact summary
+
+Every stage streams stdout/stderr to the Buildkite job log and retains the same
+output as `out/buildkite/logs/step-<stage>.log`. Compiler and image-build output
+is grouped by phase. `pipefail` preserves command failures through `tee`.
+Toolchain setup stays in the current shell so exported cache paths reach builds.
+
+Each stage updates the `adx-build-summary` build annotation and uploads its
+Markdown/JSON summary. Later stages extend the earlier summary with immutable
+image references and Kubernetes results. The summary links the release archive,
+SHA256, standalone manifest, SDK wheel, build logs, image provenance, result JSON
+and JUnit. It records actual Pod/host placement and distinguishes same-host runs.
+Failures still publish a summary and retain their original exit status.

@@ -4,6 +4,8 @@ set -euo pipefail
 [[ -z $(git status --porcelain) ]] || { echo 'clean checkout required'; exit 1; }
 [[ $(git rev-parse HEAD) == "$BUILDKITE_COMMIT" ]]
 mkdir -p out/buildkite/logs
+buildkite-agent artifact download 'out/buildkite/summaries/release.json' . --step platform-build
+echo "--- :package: Verify release artifact handoff"
 buildkite-agent artifact download 'out/buildkite/adx-release.tar.gz' . --step platform-build
 buildkite-agent artifact download 'out/buildkite/adx-release.tar.gz.sha256' . --step platform-build
 (cd out/buildkite && sha256sum --check adx-release.tar.gz.sha256)
@@ -28,6 +30,9 @@ if ! docker info >/dev/null 2>&1; then
   done
   docker info >/dev/null
 fi
-source .buildkite/bootstrap-images.sh > out/buildkite/logs/base-images.log 2>&1
-python3 build/e2e/prepare.py --package out/buildkite/package --backend out/buildkite/backend --runtime-base "$ADX_E2E_RUNTIME_BASE" --rrt-base "$ADX_E2E_RRT_BASE" --output out/buildkite/bundle > out/buildkite/logs/prepare.log 2>&1
-python3 build/e2e/kubernetes/publish_images.py --bundle out/buildkite/bundle --repository "$ADX_E2E_IMAGE_REPOSITORY" > out/buildkite/logs/publish-images.log 2>&1
+echo "--- :docker: Resolve runtime base images"
+source .buildkite/bootstrap-images.sh > >(tee out/buildkite/logs/base-images.log) 2>&1
+echo "--- :docker: Build node and RRT images"
+python3 -u build/e2e/prepare.py --package out/buildkite/package --backend out/buildkite/backend --runtime-base "$ADX_E2E_RUNTIME_BASE" --rrt-base "$ADX_E2E_RRT_BASE" --output out/buildkite/bundle 2>&1 | tee out/buildkite/logs/prepare.log
+echo "--- :docker: Push immutable image references"
+python3 -u build/e2e/kubernetes/publish_images.py --bundle out/buildkite/bundle --repository "$ADX_E2E_IMAGE_REPOSITORY" 2>&1 | tee out/buildkite/logs/publish-images.log
