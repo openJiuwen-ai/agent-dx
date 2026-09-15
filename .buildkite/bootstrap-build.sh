@@ -20,7 +20,7 @@ fetch() {
   fi
 }
 if [[ ! -x "$cache/go/bin/go" ]] || [[ $("$cache/go/bin/go" version) != *go1.25.5* ]]; then
-  fetch https://go.dev/dl/go1.25.5.linux-amd64.tar.gz 9e9b755d63b36acf30c12a9a3fc379243714c1c6d3dd72861da637f336ebb35b "$cache/go1.25.5.tar.gz"
+  fetch "${ADX_GO_DOWNLOAD_BASE:-https://mirrors.aliyun.com/golang}/go1.25.5.linux-amd64.tar.gz" 9e9b755d63b36acf30c12a9a3fc379243714c1c6d3dd72861da637f336ebb35b "$cache/go1.25.5.tar.gz"
   tar -xzf "$cache/go1.25.5.tar.gz" -C "$cache"
 fi
 if [[ -z ${ADX_REDIS_SERVER:-} || -z ${ADX_REDIS_CLI:-} ]]; then
