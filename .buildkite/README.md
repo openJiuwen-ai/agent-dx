@@ -36,7 +36,7 @@ and the Kubernetes plugin. Worker images follow the existing CI profiles:
 
 | Step | Reused worker image |
 |---|---|
-| `platform-build` | `swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/compile-ubuntu2004-rust:v20260507_x86_64` |
+| `platform-build` | `swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/compile-ubuntu2004-rust:v20260826_rust1950_musl_x86_64` |
 | `platform-images` | `swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/sandbox-packager:v20260506_kubectl` |
 | `platform-e2e` | `swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/sandbox-deployer:v20260506_kubectl_py39` |
 
@@ -101,3 +101,18 @@ Buildkite syntax follows the official [Agent Stack execution](https://buildkite.
 and [PodSpec configuration](https://buildkite.com/docs/agent/self-hosted/agent-stack-k8s/podspec).
 
 构建会在复用的 worker 中按版本和 SHA256 准备 Go 1.25.5、Redis 7.2.5，并安装固定版本的 Go 协议生成器。未指定基础镜像时，打包步骤按仓库 Dockerfile 构建并发布测试基础镜像，再用 registry digest 构建节点与 RRT 镜像。`ADX_REDIS_SERVER` / `ADX_REDIS_CLI` 和 `ADX_E2E_RUNTIME_BASE` / `ADX_E2E_RRT_BASE` 可显式覆盖。
+
+## Rust image and Cargo cache
+
+The Rust worker uses the existing Rust 1.95.0 image pinned by registry digest.
+CI selects its preinstalled `stable` toolchain and disables automatic toolchain
+installation; bootstrap verifies the actual version against `rust-toolchain.toml`.
+The same numeric pin applies to local builds.
+
+`.buildkite/setup-cargo.sh` restores the image's rsproxy sparse source settings in
+the persistent ADX Cargo home, including Git dependency caching. Both registry/git
+downloads and release compilation outputs survive job Pods under `/mnt/paas`.
+The release target cache is separated by architecture and toolchain; the build
+step is serialized so package assembly cannot copy another job's binaries.
+An existing sccache from the shared worker cache is reused when available, and
+Cargo cache locations/source selection are recorded in `bootstrap.log`.

@@ -6,6 +6,7 @@ mkdir -p "$cache" out/buildkite/logs
 export PATH="$cache/go/bin:$cache/bin:/root/.cargo/bin:/opt/buildtools/protoc/bin:$PATH"
 export GOROOT="$cache/go"
 export GOTOOLCHAIN=local
+source .buildkite/setup-cargo.sh
 export GOPROXY=${GOPROXY:-https://goproxy.cn,direct}
 export GOBIN="$cache/bin"
 exec 9>"$cache/bootstrap.lock"

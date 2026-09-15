@@ -1,7 +1,7 @@
 # Build once, validate, then configure Buildkite with the resulting image digest.
 # Base image arguments can also be supplied as digest-pinned references.
 ARG GO_IMAGE=golang:1.25.5-bookworm
-ARG RUST_IMAGE=rust:1.97.1-bookworm
+ARG RUST_IMAGE=rust:1.95.0-bookworm
 ARG PYTHON_IMAGE=python:3.12-bookworm
 FROM ${GO_IMAGE} AS go
 FROM ${RUST_IMAGE} AS rust

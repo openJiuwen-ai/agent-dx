@@ -5,6 +5,8 @@ steps:
     queue: default
     os: linux
     arch: amd64
+  concurrency: 1
+  concurrency_group: adx/release-amd64
   command: bash .buildkite/build-e2e.sh
   timeout_in_minutes: 60
   artifact_paths:
@@ -14,7 +16,9 @@ steps:
   env:
     BUILDKITE_AGENT_NAME: agent-stack-k8s
     CARGO_HOME: /mnt/paas/build-cache/adx/cargo-home
-    CARGO_TARGET_DIR: /mnt/paas/build-cache/adx/cargo-target/amd64
+    CARGO_TARGET_DIR: /mnt/paas/build-cache/adx/cargo-target/amd64-rust1950
+    RUSTUP_TOOLCHAIN: stable
+    RUSTUP_AUTO_INSTALL: '0'
     GOCACHE: /mnt/paas/build-cache/adx/go-build/amd64
     GOMODCACHE: /mnt/paas/build-cache/adx/go-mod
   plugins:
@@ -23,7 +27,7 @@ steps:
         imagePullSecrets:
         - name: swr-pull-secret
         containers:
-        - image: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/compile-ubuntu2004-rust:v20260507_x86_64
+        - image: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/compile-ubuntu2004-rust:v20260826_rust1950_musl_x86_64@sha256:13008c86d6ce56422b4591570d3b358a92d6d384100aafa41e04f5556a5d8faf
           volumeMounts:
           - name: build-cache
             mountPath: /mnt/paas
