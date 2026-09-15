@@ -26,7 +26,7 @@ def release_checksum(manifest, filename):
     return matches[0]
 
 def download(url, output):
-    subprocess.run(['curl','--fail','--location','--retry','3','--retry-all-errors',
+    subprocess.run(['curl','--fail','--location','--retry','3',
                     '--connect-timeout','20','--max-time','300',url,'-o',str(output)],check=True)
 
 def main():
