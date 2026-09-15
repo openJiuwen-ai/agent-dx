@@ -10,7 +10,6 @@ import re
 import shutil
 import subprocess
 import tempfile
-import urllib.request
 ROOT=Path(__file__).resolve().parents[2]
 def run(args,**kw):return subprocess.check_output(list(map(str,args)),text=True,**kw).strip()
 def sha(p):return hashlib.sha256(p.read_bytes()).hexdigest()
@@ -25,6 +24,10 @@ def release_checksum(manifest, filename):
     if len(matches)!=1:
         raise ValueError('expected one release checksum for '+filename)
     return matches[0]
+
+def download(url, output):
+    subprocess.run(['curl','--fail','--location','--retry','3','--retry-all-errors',
+                    '--connect-timeout','20','--max-time','300',url,'-o',str(output)],check=True)
 
 def main():
     p=argparse.ArgumentParser();p.add_argument('--output',type=Path,required=True);p.add_argument('--source',type=Path);p.add_argument('--redis-cli',type=Path,required=True);p.add_argument('--jobs',type=int,default=2);a=p.parse_args()
@@ -46,10 +49,14 @@ def main():
         for name in ('sandboxd','sbox','runc-shim','sandbox-logger'):shutil.copy2(source/'output'/name,a.output/name)
         versions=dict(line.split('=',1) for line in (source/'third_party/runtime-versions.env').read_text().splitlines() if line and not line.startswith('#') and '=' in line)
         url=versions['RUNC_RELEASE_BASE_URL']+'/v'+versions['RUNC_VERSION']+'/'
-        with urllib.request.urlopen(url+'runc.sha256sum',timeout=60) as r:sums=r.read().decode()
-        expected=release_checksum(sums,'runc.'+arch)
-        if arch=='amd64' and expected!=versions['RUNC_AMD64_SHA256']:raise ValueError('runc release manifest mismatch')
-        with urllib.request.urlopen(url+'runc.'+arch,timeout=120) as r:(a.output/'runc').write_bytes(r.read())
+        if arch=='amd64':
+            # The verified sandboxd revision already pins this release's digest.
+            expected=versions['RUNC_AMD64_SHA256']
+        else:
+            checksums=Path(tmp)/'runc.sha256sum'
+            download(url+'runc.sha256sum',checksums)
+            expected=release_checksum(checksums.read_text(),'runc.'+arch)
+        download(url+'runc.'+arch,a.output/'runc')
         if sha(a.output/'runc')!=expected:raise ValueError('runc checksum mismatch')
         (a.output/'runc').chmod(0o755)
         if '7.2.5' not in run([a.redis_cli.resolve(),'--version']):raise ValueError('Redis CLI version mismatch')
