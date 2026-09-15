@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Sourced before any Cargo invocation in the shared Rust worker.
 set -euo pipefail
-: "${CARGO_HOME:?persistent Cargo download cache required}"
+# Some shared worker profile scripts reset CARGO_HOME after step env injection.
+export CARGO_HOME=${ADX_CARGO_HOME:-/mnt/paas/build-cache/adx/cargo-home}
 : "${CARGO_TARGET_DIR:?persistent Cargo compilation cache required}"
 export RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable}
 export RUSTUP_AUTO_INSTALL=0

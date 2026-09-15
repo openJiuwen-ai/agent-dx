@@ -110,7 +110,9 @@ installation; bootstrap verifies the actual version against `rust-toolchain.toml
 The same numeric pin applies to local builds.
 
 `.buildkite/setup-cargo.sh` restores the image's rsproxy sparse source settings in
-the persistent ADX Cargo home, including Git dependency caching. Both registry/git
+the persistent ADX Cargo home, including Git dependency caching.
+It exports `CARGO_HOME` from `ADX_CARGO_HOME` inside the build process so image
+profile initialization cannot silently redirect downloads back to `/root/.cargo`. Both registry/git
 downloads and release compilation outputs survive job Pods under `/mnt/paas`.
 The release target cache is separated by architecture and toolchain; the build
 step is serialized so package assembly cannot copy another job's binaries.
