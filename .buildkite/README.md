@@ -118,3 +118,9 @@ The release target cache is separated by architecture and toolchain; the build
 step is serialized so package assembly cannot copy another job's binaries.
 An existing sccache from the shared worker cache is reused when available, and
 Cargo cache locations/source selection are recorded in `bootstrap.log`.
+
+For a pinned external sandboxd already built by CI, `ADX_BACKEND_ARTIFACT_BUILD`
+can select the Buildkite build UUID containing its `platform-build` backend
+artifacts. Revision, target, complete file set and every file checksum must pass
+validation. ADX product binaries and SDK are still built from the current commit.
+Omit the variable to rebuild the external runtime from its pinned source.
