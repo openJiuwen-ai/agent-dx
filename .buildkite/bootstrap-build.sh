@@ -35,8 +35,13 @@ if [[ -z ${ADX_REDIS_SERVER:-} || -z ${ADX_REDIS_CLI:-} ]]; then
 fi
 go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.6
 go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.5.1
-flock -u 9
+if [[ ! -x "$cache/python/bin/python3" ]]; then
+  python3 -m venv "$cache/python"
+fi
+export PATH="$cache/python/bin:$PATH"
+export PYTHON="$cache/python/bin/python3"
 python3 -m pip install 'PyYAML==6.0.2' 'build==1.2.2.post1'
+flock -u 9
 rustc --version
 cargo --version
 go version
