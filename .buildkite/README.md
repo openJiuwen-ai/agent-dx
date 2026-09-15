@@ -60,9 +60,11 @@ uploaded artifacts. ADX images default to the existing SWR organization under
 ADX build inputs remain explicit: the root Rust toolchain, Go/protobuf/Python
 build tools, matching `ADX_REDIS_SERVER` / `ADX_REDIS_CLI` 7.2.5 binaries, and
 `ADX_E2E_RUNTIME_BASE` / `ADX_E2E_RRT_BASE` digest-pinned runtime bases. Reusing
-worker images does not change the product's toolchain or dependency pins. These
-inputs must be available in the CI job; the worker profiles have not been live
-validated for this ADX build yet.
+worker images does not change the product's toolchain or dependency pins. The bootstrap prepares pinned Go and Redis dependencies in the worker cache.
+`GOROOT` is set together with `PATH` so the worker's preinstalled Go cannot mix
+standard libraries with the selected compiler. The bundled Redis uses the same
+libc/plain transport build as local acceptance, avoiding a host OpenSSL ABI
+dependency in the Ubuntu runtime image.
 
 ## Artifact handoff and acceptance
 

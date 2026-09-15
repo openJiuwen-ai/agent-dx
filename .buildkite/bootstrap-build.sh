@@ -4,6 +4,7 @@ set -euo pipefail
 cache=${ADX_TOOL_CACHE:-/mnt/paas/build-cache/adx/tools/amd64}
 mkdir -p "$cache" out/buildkite/logs
 export PATH="$cache/go/bin:$cache/bin:/root/.cargo/bin:/opt/buildtools/protoc/bin:$PATH"
+export GOROOT="$cache/go"
 export GOTOOLCHAIN=local
 export GOPROXY=${GOPROXY:-https://goproxy.cn,direct}
 export GOBIN="$cache/bin"
@@ -22,10 +23,12 @@ if [[ ! -x "$cache/go/bin/go" ]] || [[ $("$cache/go/bin/go" version) != *go1.25.
   tar -xzf "$cache/go1.25.5.tar.gz" -C "$cache"
 fi
 if [[ -z ${ADX_REDIS_SERVER:-} || -z ${ADX_REDIS_CLI:-} ]]; then
-  if [[ ! -x "$cache/redis-7.2.5/src/redis-server" || ! -x "$cache/redis-7.2.5/src/redis-cli" ]]; then
+  if [[ ! -f "$cache/redis-7.2.5/.adx-libc-plain" || ! -x "$cache/redis-7.2.5/src/redis-server" || ! -x "$cache/redis-7.2.5/src/redis-cli" ]]; then
     fetch https://download.redis.io/releases/redis-7.2.5.tar.gz 5981179706f8391f03be91d951acafaeda91af7fac56beffb2701963103e423d "$cache/redis-7.2.5.tar.gz"
     tar -xzf "$cache/redis-7.2.5.tar.gz" -C "$cache"
-    make -C "$cache/redis-7.2.5" -j "${JOBS:-2}" MALLOC=libc BUILD_TLS=yes redis-server redis-cli
+    make -C "$cache/redis-7.2.5" distclean
+    make -C "$cache/redis-7.2.5" -j "${JOBS:-2}" MALLOC=libc BUILD_TLS=no REDIS_CFLAGS= REDIS_LDFLAGS= redis-server redis-cli
+    touch "$cache/redis-7.2.5/.adx-libc-plain"
   fi
   export ADX_REDIS_SERVER="$cache/redis-7.2.5/src/redis-server"
   export ADX_REDIS_CLI="$cache/redis-7.2.5/src/redis-cli"
