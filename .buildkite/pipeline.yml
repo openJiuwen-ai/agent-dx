@@ -103,7 +103,7 @@ steps:
         volumes:
         - name: docker-graph
           emptyDir: {}
-- label: ':kubernetes: Public SDK E2E'
+- label: ':kubernetes: Kubernetes E2E (Sandbox SDK)'
   key: platform-e2e
   depends_on: platform-images
   agents:

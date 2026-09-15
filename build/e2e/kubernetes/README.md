@@ -47,3 +47,17 @@ sandboxd. Select eligible nodes with repeated `--node-name` arguments, or set
 The scheduler still applies the Linux/architecture and resource requirements.
 A one-node pool runs two isolated Pods on one host; it does not validate
 cross-host networking. Actual host placement is retained in the acceptance logs.
+
+The E2E job log streams deployment commands and their output as they run, with
+10-second progress notices for long waits. It shows resource creation, Pod/image
+readiness, node prerequisites, sandboxd readiness, ADX registration/routes and
+cleanup. Structured Kubernetes JSON is retained in numbered artifact logs;
+readable Pod placement is printed in the job log. Secret payloads remain on stdin
+and known credential values are redacted before writing or streaming output.
+
+Each scenario emits RUN, PASS/FAIL and elapsed time. Its child-process output is
+streamed without buffering, including SDK instance IDs, command/file assertions,
+authentication checks, capacity wait/resume and restart recovery checks.
+`case-results.json` retains per-case outcomes and duration; JUnit lists all five
+scenarios separately, with unexecuted scenarios marked skipped and cleanup
+reported independently. A failed command or timeout still fails the acceptance.

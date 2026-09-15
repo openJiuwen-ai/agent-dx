@@ -74,22 +74,28 @@ class KubernetesRun(common.Run):
         self.namespace_attempted = False
 
     def kube(self, *args, timeout=180):
-        return self.command([*self.kubectl, *args], timeout)
+        return self.command([*self.kubectl, *args], timeout, stream=not any(
+            args[i:i+2] == ('-o', 'json') for i in range(len(args)-1)))
 
     def apply(self, value):
-        # Secret payload travels only on stdin. Do not write it to command logs.
-        self.commands += 1
-        with (self.output / f'{self.commands:03d}.log').open('w') as log:
-            p = subprocess.run([*self.kubectl, 'create', '-f', '-'],
-                               input=json.dumps(value).encode(), stdout=log,
-                               stderr=subprocess.STDOUT, timeout=60)
-        if p.returncode:
-            raise RuntimeError(f'Kubernetes create failed; see {self.commands:03d}.log')
+        # Secret bodies stay on stdin; redact any API validation error that echoes values.
+        if value['kind'] == 'Secret':
+            for encoded in value.get('data', {}).values():
+                self.redactions.add(encoded)
+                decoded = base64.b64decode(encoded).decode(errors='replace')
+                self.redactions.update(line for line in decoded.splitlines() if len(line) >= 8)
+                self.redactions.add(decoded)
+            self.redactions.discard('')
+        self.command([*self.kubectl, 'create', '-f', '-'], timeout=60,
+                     input_data=json.dumps(value),
+                     label='kubectl create ' + value['kind'] + '/' + value['metadata']['name'])
 
     def execute(self, node, *args, timeout=180):
         return self.kube('-n', self.id, 'exec', node, '-c', 'platform', '--', *args, timeout=timeout)
 
     def deploy(self, m, refs, data, registry_auth=None, node_names=()):
+        print('--- Kubernetes deployment', flush=True)
+        self.event('[DEPLOY] namespace=' + self.id + '; eligible nodes=' + ','.join(node_names))
         # Check credentials/connectivity before creating any test resource.
         self.kube('version', '-o', 'json', timeout=30)
         self.namespace_attempted = True
@@ -113,6 +119,8 @@ class KubernetesRun(common.Run):
             self.apply(obj)
             if obj['kind'] == 'Pod':
                 self.nodes.append(obj['metadata']['name'])
+        self.kube('-n', self.id, 'get', 'pods', '-o', 'wide')
+        self.event('[DEPLOY] Waiting for Pod readiness and image pulls')
         self.kube('-n', self.id, 'wait', 'pod', '--all', '--for=condition=Ready', '--timeout=300s', timeout=320)
         pods = json.loads(self.kube('-n', self.id, 'get', 'pods', '-o', 'json'))['items']
         placement = [{'pod': p['metadata']['name'], 'host': p['spec']['nodeName'],
@@ -121,22 +129,29 @@ class KubernetesRun(common.Run):
         print('Kubernetes placement: ' + json.dumps(placement), flush=True)
         edge_pod = next(p for p in pods if p['metadata']['name'] == 'node1')
         edge_ip = str(ipaddress.ip_address(edge_pod['status']['podIP']))
+        self.event('[DEPLOY] Checking EROFS and bridge netfilter prerequisites')
         for node in self.nodes:
-            self.execute(node, 'python3', '/opt/adx/e2e/preflight.py')
+            self.execute(node, 'python3', '-u', '/opt/adx/e2e/preflight.py')
+        self.event('[DEPLOY] Configuring nodes and starting sandboxd')
         for node in self.nodes:
             self.execute(node, 'env', 'ADX_E2E_EDGE_IP=' + edge_ip,
                          'python3', '/opt/adx/e2e/node.py', 'setup', node)
             self.execute(node, 'sh', '-c', 'python3 /opt/adx/e2e/node.py services ' + node +
                          ' > /evidence/services-' + node + '.log 2>&1 &')
+        self.event('[DEPLOY] Waiting for sandboxd; starting ADX supervisor and services')
         for node in self.nodes:
             self.helper(node, 'backend-ready', timeout=40)
             self.execute(node, 'sh', '-c', '/opt/adx/package/bin/adxctl run --config /tmp/adx-e2e/deployment.json'
                          ' > /evidence/supervisor-' + node + '.log 2>&1 &')
         # Pod Ready only means the fixture is available; platform readiness is a separate gate.
+        self.event('[DEPLOY] Waiting for Master registration, reconciliation and routes')
         self.helper('node1', 'ready', timeout=150)
+        self.event('[PASS] Kubernetes deployment and platform readiness')
         self.kube('-n', self.id, 'get', 'pods', '-o', 'wide')
 
     def cleanup(self):
+        print('--- Kubernetes cleanup', flush=True)
+        self.event('[CLEANUP] Collect diagnostics, stop services and delete ' + self.id)
         errors = []
         if not self.namespace_attempted:
             return errors
@@ -171,9 +186,32 @@ class KubernetesRun(common.Run):
             self.kube('delete', 'namespace', self.id, '--wait=true', '--timeout=180s', timeout=200)
             if self.kube('get', 'namespace', self.id, '--ignore-not-found', '-o', 'name').strip():
                 raise RuntimeError('test namespace remains')
+            self.event('[CLEANUP] Namespace deletion verified')
         except Exception as e:
             errors.append(str(e))
+        self.event('[FAIL] cleanup: ' + '; '.join(errors) if errors else '[PASS] Kubernetes cleanup')
         return errors
+
+
+def write_junit(path, report):
+    suite = ET.Element('testsuite', name='platform-kubernetes-e2e')
+    records = {case['name']: case for case in report['cases']}
+    for name in ('sdk', 'auth', 'capacity', 'restart', 'stop'):
+        record = records.get(name)
+        case = ET.SubElement(suite, 'testcase', name=name, time=str(record['seconds'] if record else 0))
+        if not record:
+            ET.SubElement(case, 'skipped').text = 'Not reached; see acceptance error'
+        elif record['status'] != 'passed':
+            ET.SubElement(case, 'failure').text = record.get('error', 'case failed')
+    cleanup = ET.SubElement(suite, 'testcase', name='cleanup')
+    if report['cleanup_errors']:
+        ET.SubElement(cleanup, 'failure').text = '\n'.join(report['cleanup_errors'])
+    if report['error'] and not any(c['status'] == 'failed' for c in report['cases']):
+        ET.SubElement(ET.SubElement(suite, 'testcase', name='deployment'), 'failure').text = report['error']
+    suite.set('tests', str(len(suite)))
+    suite.set('failures', str(len(suite.findall('testcase/failure'))))
+    suite.set('skipped', str(len(suite.findall('testcase/skipped'))))
+    ET.ElementTree(suite).write(path, encoding='utf-8', xml_declaration=True)
 
 
 def main():
@@ -205,19 +243,22 @@ def main():
             run.scenarios(checks)
         except Exception as e:
             error = f'{type(e).__name__}: {e}'
+            run.event('[FAIL] Kubernetes acceptance: ' + error)
         finally:
             for sig in (signal.SIGTERM, signal.SIGINT):
                 signal.signal(sig, signal.SIG_IGN)
             cleanup_errors = run.cleanup()
     report = common.finish_report(error, cleanup_errors, checks)
-    report.update(run_id=run.id, deployment='kubernetes')
+    report.update(run_id=run.id, deployment='kubernetes', cases=run.case_results)
     (output / 'result.json').write_text(json.dumps(report, indent=2) + '\n')
-    suite = ET.Element('testsuite', name='platform-kubernetes-e2e', tests='1', failures=str(int(report['status'] != 'passed')))
-    case = ET.SubElement(suite, 'testcase', name='public-sdk-two-node-pods')
-    if report['status'] != 'passed':
-        ET.SubElement(case, 'failure').text = json.dumps(report)
-    ET.ElementTree(suite).write(output / 'junit.xml', encoding='utf-8', xml_declaration=True)
-    print(json.dumps(report))
+    write_junit(output / 'junit.xml', report)
+    print('--- Kubernetes acceptance result', flush=True)
+    for case in run.case_results:
+        run.event(f"[{'PASS' if case['status'] == 'passed' else 'FAIL'}] {case['name']} ({case['seconds']:.3f}s)")
+    for name in report['missing_checks']:
+        run.event('[NOT RUN] ' + name)
+    run.event(f"[RESULT] {report['status'].upper()}: {len(checks)}/5 cases passed; cleanup_errors={len(cleanup_errors)}")
+    print(json.dumps(report), flush=True)
     return 0 if report['status'] == 'passed' else 1
 
 if __name__ == '__main__':

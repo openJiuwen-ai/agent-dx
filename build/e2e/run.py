@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """Deploy an immutable bundle into two isolated nodes; fail on any residual resource."""
 import argparse
+from contextlib import contextmanager
 import hashlib
 import json
 import os
 from pathlib import Path
 import signal
+import shlex
+import sys
+import threading
 import subprocess
 import tempfile
 import time
@@ -40,16 +44,103 @@ class Run:
     def __init__(self,output):
         self.output=output;self.id='adx-e2e-'+uuid.uuid4().hex[:12]
         self.nodes=[];self.network=False;self.commands=0
-    def command(self,args,timeout=180):
-        self.commands+=1
-        log=self.output/f'{self.commands:03d}.log'
-        with log.open('w') as f:
-            r=subprocess.run(list(map(str,args)),stdout=f,stderr=subprocess.STDOUT,timeout=timeout)
-        if r.returncode:raise RuntimeError(f'command failed ({r.returncode}); see {log.name}')
+        self.redactions=set();self.case_results=[]
+    def event(self, message):
+        print(time.strftime('%H:%M:%S', time.gmtime()) + ' ' + self.redact(message), flush=True)
+
+    def redact(self, text):
+        for secret in sorted(self.redactions, key=len, reverse=True):
+            text = text.replace(secret, '[REDACTED]')
+        return text
+
+    def command(self, args, timeout=180, *, input_data=None, stream=True, label=None):
+        self.commands += 1
+        log = self.output / f'{self.commands:03d}.log'
+        args = list(map(str, args))
+        name = label or shlex.join(args)
+        self.event(f'[EXEC {log.name}] {name}')
+        start = time.monotonic()
+        read_errors = []
+        with log.open('w') as output:
+            process = subprocess.Popen(args, stdin=subprocess.PIPE if input_data is not None else None,
+                                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                       text=True, errors='replace', start_new_session=True)
+            def forward():
+                try:
+                    for line in process.stdout:
+                        line = self.redact(line)
+                        output.write(line)
+                        output.flush()
+                        if stream:
+                            print(line, end='', flush=True)
+                except Exception as error:
+                    read_errors.append(error)
+            reader = threading.Thread(target=forward, daemon=True)
+            reader.start()
+            try:
+                if input_data is not None:
+                    process.stdin.write(input_data)
+                    process.stdin.close()
+                while True:
+                    remaining = timeout - (time.monotonic() - start)
+                    if remaining <= 0:
+                        raise subprocess.TimeoutExpired(args, timeout)
+                    try:
+                        process.wait(timeout=min(10, remaining))
+                        break
+                    except subprocess.TimeoutExpired:
+                        if time.monotonic() - start >= timeout:
+                            raise
+                        self.event(f'[WAIT {log.name}] {time.monotonic() - start:.0f}s elapsed')
+                reader.join(timeout=5)
+                if reader.is_alive():
+                    raise RuntimeError('command output did not close')
+            except BaseException:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait()
+                reader.join(timeout=5)
+                self.event(f'[FAIL {log.name}] interrupted or timed out after {time.monotonic() - start:.1f}s')
+                raise
+            finally:
+                process.stdout.close()
+                if process.stdin and not process.stdin.closed:
+                    process.stdin.close()
+        if read_errors:
+            raise read_errors[0]
+        self.event(f'[EXIT {log.name}] code={process.returncode}, elapsed={time.monotonic() - start:.1f}s')
+        if process.returncode:
+            if not stream:
+                print(''.join(log.read_text().splitlines(keepends=True)[-20:]), end='', flush=True)
+            raise RuntimeError(f'command failed ({process.returncode}); see {log.name}')
         return log.read_text()
+
+    @contextmanager
+    def case(self, name, checks):
+        print('--- Case: ' + name, flush=True)
+        start = time.monotonic()
+        self.event('[RUN] ' + name)
+        record = {'name': name, 'status': 'failed'}
+        try:
+            yield
+        except Exception as error:
+            record['error'] = self.redact(str(error))
+            self.event(f'[FAIL] {name}: {error}')
+            raise
+        else:
+            checks.append(name)
+            record['status'] = 'passed'
+        finally:
+            record['seconds'] = round(time.monotonic() - start, 3)
+            self.case_results.append(record)
+            (self.output / 'case-results.json').write_text(json.dumps(self.case_results, indent=2) + '\n')
+            self.event(f"[{'PASS' if record['status'] == 'passed' else 'FAIL'}] {name} ({record['seconds']:.3f}s)")
+
     def docker(self,*args,timeout=180):return self.command(['docker',*args],timeout)
     def execute(self,node,*args,timeout=180):return self.docker('exec',self.id+'-'+node,*args,timeout=timeout)
-    def helper(self,node,*args,timeout=180):return self.execute(node,'python3','/opt/adx/e2e/node.py',*args,timeout=timeout)
+    def helper(self,node,*args,timeout=180):return self.execute(node,'python3','-u','/opt/adx/e2e/node.py',*args,timeout=timeout)
     def cleanup(self):
         errors=[]
         for node in reversed(self.nodes):
@@ -88,25 +179,28 @@ class Run:
             self.execute(node,'sh','-c','/opt/adx/package/bin/adxctl run --config /tmp/adx-e2e/deployment.json > /evidence/supervisor-'+node+'.log 2>&1 &')
         self.helper('node1','ready',timeout=120)
     def scenarios(self,checks):
-        self.execute('node1','/opt/adx/client/bin/python','/opt/adx/e2e/scenarios.py','sdk',timeout=600)
-        self.helper('node1','postcheck')
-        for node in self.nodes:self.helper(node,'empty',node)
-        checks.append('sdk')
-        for scenario in ('auth','capacity'):
-            self.execute('node1','/opt/adx/client/bin/python','/opt/adx/e2e/scenarios.py',scenario,timeout=400)
+        with self.case('sdk', checks):
+            self.event('Create/query instances; verify command stdout/stderr/exit code, binary files and deletion')
+            self.execute('node1','/opt/adx/client/bin/python','-u','/opt/adx/e2e/scenarios.py','sdk',timeout=600)
+            self.helper('node1','postcheck')
             for node in self.nodes:self.helper(node,'empty',node)
-            checks.append(scenario)
-        self.execute('node1','/opt/adx/client/bin/python','/opt/adx/e2e/scenarios.py','create',timeout=300)
-        self.helper('node1','sessions')
-        for node in self.nodes:self.helper(node,'restart',node)
-        self.helper('node1','ready','restart',timeout=150)
-        for node in self.nodes:self.helper(node,'unchanged',node)
-        self.execute('node1','/opt/adx/client/bin/python','/opt/adx/e2e/scenarios.py','recovered',timeout=90)
-        checks.append('restart')
-        for node in reversed(self.nodes):
-            self.helper(node,'stop',node,timeout=180)
-            self.helper(node,'empty',node)
-        checks.append('stop')
+        for scenario in ('auth','capacity'):
+            with self.case(scenario, checks):
+                self.execute('node1','/opt/adx/client/bin/python','-u','/opt/adx/e2e/scenarios.py',scenario,timeout=400)
+                for node in self.nodes:self.helper(node,'empty',node)
+        with self.case('restart', checks):
+            self.event('Create live instances and record backend IDs before restarting Node Managers')
+            self.execute('node1','/opt/adx/client/bin/python','-u','/opt/adx/e2e/scenarios.py','create',timeout=300)
+            self.helper('node1','sessions')
+            for node in self.nodes:self.helper(node,'restart',node)
+            self.helper('node1','ready','restart',timeout=150)
+            for node in self.nodes:self.helper(node,'unchanged',node)
+            self.execute('node1','/opt/adx/client/bin/python','-u','/opt/adx/e2e/scenarios.py','recovered',timeout=90)
+        with self.case('stop', checks):
+            self.event('Stop node2 then node1; verify physical backend instances are empty')
+            for node in reversed(self.nodes):
+                self.helper(node,'stop',node,timeout=180)
+                self.helper(node,'empty',node)
 
 def main():
     p=argparse.ArgumentParser();p.add_argument('--bundle',type=Path,required=True);p.add_argument('--output',type=Path,required=True);a=p.parse_args()
