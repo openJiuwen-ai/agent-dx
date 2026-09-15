@@ -39,3 +39,11 @@ is outside these scenarios. Kubernetes requests/limits bound the node container;
 the fixture reads its cgroup limits before advertising ADX capacity.
 
 See [Buildkite setup](../../../.buildkite/README.md) for the reused CI workers, target kubeconfig mount and SWR secrets.
+
+The target worker pool must already provide EROFS and bridge netfilter with
+`bridge-nf-call-iptables=1`. The fixture checks these read-only before starting
+sandboxd. Select eligible nodes with repeated `--node-name` arguments, or set
+`ADX_E2E_NODE_NAMES` to comma-separated Kubernetes node names in Buildkite.
+The scheduler still applies the Linux/architecture and resource requirements.
+A one-node pool runs two isolated Pods on one host; it does not validate
+cross-host networking. Actual host placement is retained in the acceptance logs.

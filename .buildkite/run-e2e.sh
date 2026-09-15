@@ -11,4 +11,8 @@ fi
 if [[ -n ${ADX_KUBE_CONTEXT:-} ]]; then
   args+=(--context "$ADX_KUBE_CONTEXT")
 fi
+if [[ -n ${ADX_E2E_NODE_NAMES:-} ]]; then
+  IFS=',' read -r -a node_names <<< "$ADX_E2E_NODE_NAMES"
+  for node in "${node_names[@]}"; do args+=(--node-name "$node"); done
+fi
 python3 build/e2e/kubernetes/run.py "${args[@]}"

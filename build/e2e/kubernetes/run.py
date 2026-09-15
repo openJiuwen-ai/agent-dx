@@ -89,7 +89,7 @@ class KubernetesRun(common.Run):
     def execute(self, node, *args, timeout=180):
         return self.kube('-n', self.id, 'exec', node, '-c', 'platform', '--', *args, timeout=timeout)
 
-    def deploy(self, m, refs, data, registry_auth=None):
+    def deploy(self, m, refs, data, registry_auth=None, node_names=()):
         # Check credentials/connectivity before creating any test resource.
         self.kube('version', '-o', 'json', timeout=30)
         self.namespace_attempted = True
@@ -106,7 +106,7 @@ class KubernetesRun(common.Run):
             self.apply({'apiVersion': 'v1', 'kind': 'Secret', 'type': 'kubernetes.io/dockerconfigjson',
                         'metadata': {'name': 'adx-test-registry', 'namespace': self.id},
                         'data': {'.dockerconfigjson': base64.b64encode(registry_auth.read_bytes()).decode()}})
-        objects = resources(self.id, refs['node'], m['architecture'], registry_auth is not None)
+        objects = resources(self.id, refs['node'], m['architecture'], registry_auth is not None, node_names)
         # Public manifest contains Secret references, never Secret contents.
         (self.output / 'resources.json').write_text(json.dumps({'apiVersion': 'v1', 'kind': 'List', 'items': objects}, indent=2))
         for obj in objects:
@@ -116,6 +116,8 @@ class KubernetesRun(common.Run):
         self.kube('-n', self.id, 'wait', 'pod', '--all', '--for=condition=Ready', '--timeout=300s', timeout=320)
         edge_pod = json.loads(self.kube('-n', self.id, 'get', 'pod', 'node1', '-o', 'json'))
         edge_ip = str(ipaddress.ip_address(edge_pod['status']['podIP']))
+        for node in self.nodes:
+            self.execute(node, 'python3', '/opt/adx/e2e/preflight.py')
         for node in self.nodes:
             self.execute(node, 'env', 'ADX_E2E_EDGE_IP=' + edge_ip,
                          'python3', '/opt/adx/e2e/node.py', 'setup', node)
@@ -174,6 +176,7 @@ def main():
     for arg in ('bundle', 'registry-images', 'kubeconfig', 'output'):
         p.add_argument('--' + arg, type=Path, required=True)
     p.add_argument('--context')
+    p.add_argument('--node-name', action='append', default=[], help='eligible Kubernetes node; repeat for a pool')
     p.add_argument('--registry-auth', type=Path)
     a = p.parse_args()
     output = a.output.resolve()
@@ -193,7 +196,7 @@ def main():
             (output / 'bundle.json').write_text(json.dumps(m, indent=2))
             (output / 'registry-images.json').write_text(json.dumps(published, indent=2))
             data = credentials(Path(private), published['references']['rrt'])
-            run.deploy(m, published['references'], data, a.registry_auth)
+            run.deploy(m, published['references'], data, a.registry_auth, a.node_name)
             run.scenarios(checks)
         except Exception as e:
             error = f'{type(e).__name__}: {e}'

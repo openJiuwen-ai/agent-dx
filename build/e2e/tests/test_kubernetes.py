@@ -19,6 +19,15 @@ class KubernetesDeploymentTests(unittest.TestCase):
             self.assertEqual(spec['nodeSelector']['kubernetes.io/arch'],'amd64')
             self.assertTrue(spec['containers'][0]['securityContext']['privileged'])
             self.assertFalse(any('hostPath' in v for v in spec['volumes']))
+    def test_eligible_nodes_preserve_architecture_and_pod_isolation(self):
+        objects=k8s.resources('adx-e2e-test','registry.example/node@sha256:'+'a'*64,'amd64',False,['worker-a','worker-b'])
+        for pod in (o for o in objects if o['kind']=='Pod'):
+            spec=pod['spec']
+            terms=spec['affinity']['nodeAffinity']['requiredDuringSchedulingIgnoredDuringExecution']['nodeSelectorTerms']
+            self.assertEqual(terms[0]['matchFields'][0],{'key':'metadata.name','operator':'In','values':['worker-a','worker-b']})
+            self.assertEqual(spec['nodeSelector']['kubernetes.io/arch'],'amd64')
+            self.assertNotIn('nodeName',spec)
+
     def test_shared_keys_are_read_only_and_evidence_is_separate(self):
         pod=next(r for r in self.resources() if r['kind']=='Pod')
         mounts={m['mountPath']:m for m in pod['spec']['containers'][0]['volumeMounts']}
@@ -101,3 +110,21 @@ class KubernetesLifecycleTests(unittest.TestCase):
             self.assertTrue(all(item['key'] in data for item in secret['items']))
             self.assertNotIn('ca.key',data)
             self.assertEqual(base64.b64decode(data['image']).decode(),'registry.example/rrt@sha256:'+'b'*64)
+
+class HostPrerequisiteTests(unittest.TestCase):
+    def test_missing_kernel_capabilities_fail_before_services_start(self):
+        import tempfile
+        from preflight import check
+        with tempfile.TemporaryDirectory() as d:
+            proc=Path(d)
+            (proc/'filesystems').write_text('nodev\ttmpfs\n')
+            with self.assertRaisesRegex(RuntimeError,'erofs, bridge_netfilter'):
+                check(proc)
+            (proc/'filesystems').write_text('\terofs\n')
+            bridge=proc/'sys/net/bridge/bridge-nf-call-iptables'
+            bridge.parent.mkdir(parents=True)
+            bridge.write_text('0\n')
+            with self.assertRaisesRegex(RuntimeError,'bridge_netfilter'):
+                check(proc)
+            bridge.write_text('1\n')
+            self.assertEqual(check(proc),{'erofs':True,'bridge_netfilter':True})
