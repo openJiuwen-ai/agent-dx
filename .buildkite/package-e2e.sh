@@ -5,7 +5,7 @@ set -euo pipefail
 [[ $(git rev-parse HEAD) == "$BUILDKITE_COMMIT" ]]
 mkdir -p out/buildkite/logs
 buildkite-agent artifact download 'out/buildkite/package/**/*' . --step platform-build
-buildkite-agent artifact download 'out/buildkite/backend/**/*' . --step platform-build
+buildkite-agent artifact download 'out/buildkite/backend/*' . --step platform-build
 daemon_pid=''
 cleanup() {
   if [[ -n "$daemon_pid" ]]; then

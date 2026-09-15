@@ -44,8 +44,15 @@ def main():
     with (a.output/'prepare.log').open('w') as log, tempfile.TemporaryDirectory(prefix='adx-e2e-image-') as d:
         context=Path(d)
         shutil.copytree(a.package,context/'package')
+        # Artifact transport may drop Unix mode bits; identity was verified above.
+        for name in package.BINARIES:
+            (context/'package/bin'/name).chmod(0o755)
+        (context/'package/bin/redis-server').chmod(0o755)
+        (context/'package/runtime/rrt-runtime').chmod(0o755)
         (context/'backend').mkdir()
-        for name in BACKEND_BINARIES:shutil.copy2(a.backend/name,context/'backend'/name)
+        for name in BACKEND_BINARIES:
+            shutil.copy2(a.backend/name,context/'backend'/name)
+            (context/'backend'/name).chmod(0o755)
         shutil.copytree(ROOT/'build/e2e',context/'e2e',ignore=shutil.ignore_patterns('__pycache__','tests'))
         shutil.copy2(ROOT/'build/ci/rpc_certificates.py',context/'e2e/rpc_certificates.py')
         (context/'Dockerfile.node').write_text('ARG BASE\nFROM ${BASE}\nCOPY package /opt/adx/package\nCOPY backend /usr/local/bin\nCOPY e2e /opt/adx/e2e\nRUN python3 -m venv /opt/adx/client && /opt/adx/client/bin/pip install /opt/adx/package/sdk/*.whl\nWORKDIR /opt/adx\nCMD ["sleep", "infinity"]\n')
