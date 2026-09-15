@@ -60,6 +60,7 @@ steps:
   artifact_paths:
   - out/buildkite/logs/**/*
   - out/buildkite/bundle/*.json
+  - out/buildkite/bundle/prepare.log
   plugins:
   - kubernetes:
       podSpec:

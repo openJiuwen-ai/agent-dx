@@ -1,5 +1,6 @@
 import importlib.util
 from pathlib import Path
+import py_compile
 import shutil
 import subprocess
 import tempfile
@@ -29,3 +30,18 @@ class ReleaseArchiveTests(unittest.TestCase):
             self.assertTrue((restored/'LICENSE').is_file())
             self.assertTrue((restored/'bin/adx-master').stat().st_mode & 0o111)
             self.assertTrue((restored/'etc/examples/deployment.json').is_file())
+
+    def test_python_bytecode_does_not_dirty_build_sources(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            shutil.copyfile(ROOT / '.gitignore', root / '.gitignore')
+            source = root / 'build/e2e/fixture.py'
+            source.parent.mkdir(parents=True)
+            source.write_text('value = 1\n')
+            subprocess.run(['git', 'init', '-q', temp], check=True)
+            subprocess.run(['git', '-C', temp, 'add', '.gitignore', 'build/e2e/fixture.py'], check=True)
+            bytecode = Path(py_compile.compile(str(source), doraise=True))
+            self.assertTrue(bytecode.is_file())
+            untracked = subprocess.check_output(
+                ['git', '-C', temp, 'ls-files', '--others', '--exclude-standard'], text=True)
+            self.assertEqual(untracked, '')

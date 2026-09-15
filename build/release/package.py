@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -93,7 +94,13 @@ def main():
         verify(args.directory)
     else:
         commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
-        dirty = bool(subprocess.check_output(["git", "status", "--porcelain"], cwd=ROOT, text=True))
+        status = subprocess.check_output(["git", "status", "--porcelain"], cwd=ROOT, text=True)
+        dirty = bool(status)
+        if os.getenv("BUILDKITE"):
+            if commit != os.environ.get("BUILDKITE_COMMIT"):
+                raise ValueError("CI checkout differs from the requested commit")
+            if dirty:
+                raise ValueError("CI source checkout changed during build:\n" + status)
         assemble(args.binary_dir, args.redis, args.wheel, args.output, commit, dirty, args.target, args.profile)
     print("package verified")
 
