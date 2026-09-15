@@ -748,3 +748,117 @@ def test_file_download_logs_agent_trace(tmp_path, caplog):
         assert "[agent.download.exit] agentexecutor result=HTTP:200" in caplog.text
     finally:
         server.stop()
+
+
+def _post_exec(server, payload):
+    """POST /v1/exec and return (status, body) handling error responses."""
+    host, port = server.address
+    request = urllib.request.Request(
+        f"http://{host}:{port}/v1/exec",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request) as response:
+            return response.status, json.load(response)
+    except urllib.error.HTTPError as caught:
+        return caught.code, json.load(caught)
+
+
+def test_exec_command_returns_result():
+    server = _server()
+    server.start()
+    try:
+        status, body = _post_exec(server, {"command": "echo hello"})
+        assert status == 200
+        assert body["returncode"] == 0
+        assert body["stdout"] == "hello\n"
+        assert body["stderr"] == ""
+    finally:
+        server.stop()
+
+
+def test_exec_rejects_missing_command():
+    server = _server()
+    server.start()
+    try:
+        status, body = _post_exec(server, {})
+        assert status == 400
+        assert body["message"] == "command is required"
+    finally:
+        server.stop()
+
+
+def test_exec_accepts_non_loopback():
+    # /v1/exec is served through the frontend tunnel and must not be
+    # restricted to loopback clients, unlike the sandbox endpoints.
+    server = _server(host="0.0.0.0")
+    server.start()
+    try:
+        host, port = server.address
+        # Connect via a non-loopback address when available.
+        target_host = host
+        try:
+            import socket
+
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+                probe.connect(("8.8.8.8", 80))
+                target_host = probe.getsockname()[0]
+        except OSError:
+            target_host = "127.0.0.1"
+        request = urllib.request.Request(
+            f"http://{target_host}:{port}/v1/exec",
+            data=json.dumps({"command": ["true"]}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request) as response:
+            assert response.status == 200
+    finally:
+        server.stop()
+
+
+def test_exec_supports_command_list():
+    server = _server()
+    server.start()
+    try:
+        status, body = _post_exec(server, {"command": ["/bin/sh", "-c", "echo ok"]})
+        assert status == 200
+        assert body["returncode"] == 0
+        assert body["stdout"] == "ok\n"
+    finally:
+        server.stop()
+
+
+def test_exec_timeout_kills_process():
+    server = _server()
+    server.start()
+    try:
+        status, body = _post_exec(
+            server, {"command": "sleep 30", "timeout": 1}
+        )
+        assert status == 200
+        assert body["returncode"] == -1
+        assert "timed out" in body["stderr"]
+    finally:
+        server.stop()
+
+
+def test_exec_with_working_dir_and_env(tmp_path):
+    server = _server()
+    server.start()
+    try:
+        status, body = _post_exec(
+            server,
+            {
+                "command": "echo var=$MY_VAR",
+                "working_dir": str(tmp_path),
+                "env": {"MY_VAR": "hello"},
+            },
+        )
+        assert status == 200
+        assert body["returncode"] == 0
+        assert body["stdout"] == "var=hello\n"
+    finally:
+        server.stop()

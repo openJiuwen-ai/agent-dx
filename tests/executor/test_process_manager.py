@@ -79,7 +79,7 @@ def test_process_manager_merges_all_commands_into_single_log(tmp_path):
     manager.start(commands, log_dir=str(tmp_path), runtime_id="runtime-multi")
     try:
         deadline = time.monotonic() + 5
-        while manager.status()[0]["running"] and time.monotonic() < deadline:
+        while any(p["running"] for p in manager.status()) and time.monotonic() < deadline:
             time.sleep(0.01)
     finally:
         manager.stop(grace_period_seconds=0.1)

@@ -31,6 +31,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Optional
 from urllib.parse import parse_qs, urlsplit
 
+from .command_handler import CommandHandler
 from .file_handler import DEFAULT_MAX_FILE_SIZE, FileHandler, FileListTimeoutError
 from .sandbox.sandbox import SandboxCreateOptions
 from .sandbox_manager import SandboxManager
@@ -197,6 +198,7 @@ class ExecutorHTTPServer:
         if max_sandbox_response_size <= 0:
             raise ValueError("max_sandbox_response_size must be greater than zero")
         file_handler = FileHandler(max_file_size=max_file_size)
+        command_handler_instance = CommandHandler()
         if sandbox_manager is None:
             raise ValueError("a SandboxManager must be provided by the runtime")
         manager_instance = sandbox_manager
@@ -205,6 +207,7 @@ class ExecutorHTTPServer:
 
         class RequestHandler(_ExecutorRequestHandler):
             files = file_handler
+            command_handler = command_handler_instance
             sandbox_manager = manager_instance
             max_sandbox_request_size = sandbox_request_limit
             max_sandbox_response_size = sandbox_response_limit
@@ -241,6 +244,7 @@ class ExecutorHTTPServer:
 class _ExecutorRequestHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     files = FileHandler()
+    command_handler: CommandHandler
     sandbox_manager: SandboxManager
     max_sandbox_request_size = DEFAULT_MAX_SANDBOX_REQUEST_SIZE
     max_sandbox_response_size = DEFAULT_MAX_SANDBOX_RESPONSE_SIZE
@@ -273,6 +277,10 @@ class _ExecutorRequestHandler(BaseHTTPRequestHandler):
         if path == "/v1/files/mkdir":
             with self._agent_trace("mkdir", path):
                 self._mkdir()
+            return
+        if path == "/v1/exec":
+            with self._agent_trace("exec", path):
+                self._exec_command()
             return
         # sandbox POST: /v1/sandbox/sandboxes (create) or /v1/sandbox/sandboxes/{id}/execute
         if path == _SANDBOX_PREFIX or path.startswith(f"{_SANDBOX_PREFIX}/"):
@@ -745,6 +753,38 @@ class _ExecutorRequestHandler(BaseHTTPRequestHandler):
             self._write_json(HTTPStatus.BAD_REQUEST, {"message": str(exc)})
         except OSError as exc:
             _LOG.exception("file mkdir failed")
+            self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"message": str(exc)})
+
+    def _exec_command(self) -> None:
+        try:
+            payload = self._read_json_body()
+            if "command" not in payload:
+                raise ValueError("command is required")
+            command = payload["command"]
+            working_dir = payload.get("working_dir")
+            env = payload.get("env")
+            timeout = payload.get("timeout")
+            if working_dir is not None and not isinstance(working_dir, str):
+                raise TypeError("working_dir must be a string")
+            if env is not None:
+                if not isinstance(env, dict) or not all(
+                    isinstance(key, str) and isinstance(value, str)
+                    for key, value in env.items()
+                ):
+                    raise TypeError("env must be an object containing string values")
+            if timeout is not None:
+                if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+                    raise TypeError("timeout must be a number")
+                if timeout <= 0:
+                    raise ValueError("timeout must be greater than zero")
+            result = self.command_handler.execute(command, working_dir=working_dir, env=env, timeout=timeout)
+            self._write_json(HTTPStatus.OK, result, max_size=self.max_sandbox_response_size)
+        except (SandboxRequestTooLargeError, SandboxResponseTooLargeError) as exc:
+            self._write_json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"message": str(exc)})
+        except (ValueError, TypeError) as exc:
+            self._write_json(HTTPStatus.BAD_REQUEST, {"message": str(exc)})
+        except Exception as exc:  # noqa: BLE001 - keep the HTTP connection well-formed
+            _LOG.exception("exec command failed")
             self._write_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"message": str(exc)})
 
     def _download(self, query: dict[str, list[str]]) -> None:
