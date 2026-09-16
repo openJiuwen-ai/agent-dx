@@ -1,6 +1,6 @@
 # 组件日志采集
 
-组件输出由 Supervisor 写入文件；部署环境运行 OpenTelemetry Collector Contrib，通过 filelog 读取并用 OTLP/HTTP 发送给日志后端。Collector 是独立部署服务，配置样例在 `build/observability/collector.json`，镜像版本和摘要在 `build/observability/source.json`。目前接入组件日志；实例内用户 stdout/stderr 继续使用 RRT/sandboxd 的通道。
+组件输出由 Supervisor 写入文件；部署环境运行 OpenTelemetry Collector Contrib，通过 filelog 读取并用 OTLP/HTTP 发送给日志后端。Collector 是独立部署服务，配置样例在 `build/observability/collector.json`，镜像版本和摘要在 `build/observability/source.json`。目前接入托管组件的文件日志；adxctl 自身诊断由启动它的终端、systemd 或 Pod 日志通道采集。实例内用户 stdout/stderr 继续使用 RRT/sandboxd 的通道。
 
 ## 组件与字段
 
@@ -50,6 +50,8 @@ Node Manager 的 `instance_operation_completed` 事件记录 instance_id、gener
 Collector 只读活动文件与未压缩归档，排除 `.gz`/`.tmp`，避免把同一日志当成两份输入。采集端停机超过未压缩窗口可能造成未读取日志无法实时补传；压缩归档可另行离线导入，但需自行处理重复。读取位置和有界发送队列持久化可覆盖正常重启与短期后端故障，不承诺任意崩溃/磁盘丢失下的 exactly-once。
 
 Collector 自身指标使用独立的 `127.0.0.1:18888/metrics`，避开 Sandbox API 的 8888 端口。Collector 的内存限制、发送队列和重试可独立配置。Collector 不在实例生命周期调用链内；后端不可用时实例操作继续。队列耗尽会产生背压，进而可能超过文件保留窗口，必须监控 Collector 自身的发送失败、排队及内存指标。
+
+已验证的 Collector 0.161.0 自身指标包括 `otelcol_exporter_queue_size`、`otelcol_exporter_queue_capacity`、`otelcol_exporter_sent_log_records`、`otelcol_receiver_accepted_log_records`、`otelcol_receiver_refused_log_records`。队列单位为批次；重试中的请求不等同于最终丢弃。
 
 ## Pod 部署
 

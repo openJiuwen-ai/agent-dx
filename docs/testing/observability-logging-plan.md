@@ -40,7 +40,9 @@
 
 ### 阶段8B的模块落点与首轮测试
 
-下表为后续实施计划，尚不代表已接入Trace：
+组件日志新增 `platform/crates/observability` 初始化入口；现有Go兼容HTTP层可读取部分 `traceparent` 字段，但新内部RPC、Domain队列与Node Manager实例任务尚未形成分布式Trace。`InstanceHandle` 当前发送 `(Command, Reply)`，下一增量需要由命令封装显式携带每次请求的上下文，不能依赖接收任务的线程局部状态。
+
+下表为Trace后续实施计划，尚不代表已接入：
 
 | 当前模块 | 下一步职责 |
 | --- | --- |
@@ -67,4 +69,4 @@
 
 ## 交付与状态维护
 
-交付指标清单、采集与部署说明、统一日志配置、测试与验收报告。进度页独立事项来自 `control-plane-remaining.json`，阶段8保持进行中（日志采集与Trace待实现），阶段9已完成本地与基础K8s验收；首批Metrics事项已标记完成。
+交付指标清单、采集与部署说明、统一日志配置、测试与验收报告。进度页独立事项来自 `control-plane-remaining.json`，阶段8保持进行中（日志采集正在正式验收、Trace待实现），阶段9已完成本地与基础K8s验收；首批Metrics事项已标记完成。
