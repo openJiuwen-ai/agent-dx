@@ -559,6 +559,76 @@ def test_mkdir_route_rejects_non_recursive_with_missing_parent(tmp_path):
         server.stop()
 
 
+def test_mkdir_route_rejects_non_bool_recursive(tmp_path):
+    # gitcode openeuler/yuanrong#404: recursive="aaa" 必须被 400 拒绝,
+    # 而不是静默降级为 False 后在父目录存在时意外建目录成功。
+    server = _server()
+    server.start()
+    target = tmp_path / "should-not-exist"
+    try:
+        host, port = server.address
+        query = urllib.parse.urlencode({"path": str(target), "recursive": "aaa"})
+        request = urllib.request.Request(
+            f"http://{host}:{port}/v1/files/mkdir?{query}",
+            method="POST",
+        )
+        with pytest.raises(urllib.error.HTTPError) as caught:
+            urllib.request.urlopen(request)
+        assert caught.value.code == 400
+        assert b"must be a boolean" in caught.value.read()
+        assert not target.exists()
+    finally:
+        server.stop()
+
+
+def test_mkdir_route_accepts_case_insensitive_bool_recursive(tmp_path):
+    server = _server()
+    server.start()
+    try:
+        host, port = server.address
+        for value in ("True", "FALSE"):
+            target = tmp_path / f"case-{value}"
+            query = urllib.parse.urlencode({"path": str(target), "recursive": value})
+            request = urllib.request.Request(
+                f"http://{host}:{port}/v1/files/mkdir?{query}",
+                method="POST",
+            )
+            with urllib.request.urlopen(request) as response:
+                assert response.status == 200
+            assert target.is_dir()
+    finally:
+        server.stop()
+
+
+def test_files_list_route_rejects_non_bool_recursive(tmp_path):
+    server = _server()
+    server.start()
+    try:
+        host, port = server.address
+        # 公开 /v1/files/list 端点只接受 recursive/max_depth。
+        query = urllib.parse.urlencode({"path": str(tmp_path), "recursive": "aaa"})
+        with pytest.raises(urllib.error.HTTPError) as caught:
+            _get_json(server, f"/v1/files/list?{query}")
+        assert caught.value.code == 400
+        assert b"must be a boolean" in caught.value.read()
+
+        # 沙箱 files_list 路由额外接受 include_files/include_dirs。
+        base = f"/v1/sandbox/sandboxes/local/files/list?path={urllib.parse.quote(str(tmp_path))}"
+        for param in ("include_files", "include_dirs"):
+            with pytest.raises(urllib.error.HTTPError) as caught:
+                _get_json(server, f"{base}&{param}=aaa")
+            assert caught.value.code == 400
+            assert b"must be a boolean" in caught.value.read()
+
+        # 沙箱路由的 recursive 同样严格校验。
+        with pytest.raises(urllib.error.HTTPError) as caught:
+            _get_json(server, f"{base}&recursive=aaa")
+        assert caught.value.code == 400
+        assert b"must be a boolean" in caught.value.read()
+    finally:
+        server.stop()
+
+
 def test_sandbox_rejects_invalid_json_and_oversized_body():
     server = _server(max_sandbox_request_size=8)
     server.start()
