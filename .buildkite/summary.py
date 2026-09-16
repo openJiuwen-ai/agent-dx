@@ -55,7 +55,7 @@ def collect(root, stage, exit_code, commit):
         result['e2e'] = {'report': report, 'placement': read(root / 'acceptance/placement.json') or []}
         result['e2e']['collection'] = {
             node: {kind: read(root / 'acceptance' / node / f'{kind}-{node}.json')
-                   for kind in ('collection', 'gateway-metrics')}
+                   for kind in ('collection', 'gateway-metrics', 'traces')}
             for node in ('node1', 'node2')}
         if exit_code == 0 and result.get('images', {}).get('collector'):
             if not all(e and e.get('status') == 'passed'
@@ -111,7 +111,8 @@ def render(result):
             if evidence:
                 lines += ['', f"{node} 日志采集：{code(evidence['status'])}；唯一记录：{evidence.get('unique_probe_records', 0)}/40；" +
                           link('采集与故障恢复结果', f'acceptance/{node}/collection-{node}.json') + ' · ' +
-                          link('Gateway 指标', f'acceptance/{node}/gateway-metrics-{node}.json')]
+                          link('Gateway 指标', f'acceptance/{node}/gateway-metrics-{node}.json'),
+                          link('Trace 关联', f'acceptance/{node}/traces-{node}.json')]
         placement = e2e['placement']
         if placement:
             lines += ['', '| Pod | 宿主节点 | Pod IP |', '|---|---|---|']

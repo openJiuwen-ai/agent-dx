@@ -2,6 +2,7 @@ package main
 
 import (
 	"github.com/gin-gonic/gin"
+	"go.opentelemetry.io/otel/trace"
 	"log/slog"
 	"time"
 )
@@ -14,6 +15,7 @@ func requestLogging(logger *slog.Logger) gin.HandlerFunc {
 		if route == "" {
 			route = "<unmatched>"
 		}
-		logger.InfoContext(c.Request.Context(), "HTTP request completed", "event", "http_request_completed", "method", c.Request.Method, "route", route, "status", c.Writer.Status(), "duration_seconds", time.Since(start).Seconds())
+		span := trace.SpanContextFromContext(c.Request.Context())
+		logger.InfoContext(c.Request.Context(), "HTTP request completed", "event", "http_request_completed", "trace_id", span.TraceID().String(), "span_id", span.SpanID().String(), "method", c.Request.Method, "route", route, "status", c.Writer.Status(), "duration_seconds", time.Since(start).Seconds())
 	}
 }

@@ -36,16 +36,24 @@
     "title": "组件结构化日志与外部Collector采集",
     "stage": "8",
     "status": "active",
-    "detail": "本地双节点7组及每节点40条恢复探针通过；Buildkite #19构建通过，首轮镜像步骤因下载耗时达到限时，正在重试镜像步骤。K8s尚未验收。",
+    "detail": "日志采集本地两轮双节点验收通过；Buildkite #19编译通过，镜像步骤及唯一重试均下载超时，K8s未运行。",
     "gate": "本地与K8s均通过组件日志接收、敏感字段省略、后端不可用期间SDK生命周期、滚动与重启补传，保存每节点独立证据。"
   },
   {
     "id": "logs-traces",
     "title": "跨组件 Trace 关联与导出",
     "stage": "8",
-    "status": "pending",
-    "detail": "组件结构化日志与Collector采集正在独立验收；Trace上下文透传、异步队列关联、采样和导出仍未实现。",
+    "status": "active",
+    "detail": "OpenTelemetry及HTTP/gRPC/实例队列/Gateway/RRT已接入；本地7组与跨组件Span关联通过，正式K8s及统一实时丢弃计数尚未完成。",
     "gate": "真实创建→执行→删除串联Trace及日志；验证并发上下文隔离、采样、导出故障与敏感字段。"
+  },
+  {
+    "id": "ci-collector-download",
+    "title": "CI Collector区域缓存与正式采集验收",
+    "stage": "8",
+    "status": "blocked",
+    "detail": "#19两次在镜像下载阶段超时；本地已验证上游amd64制品，但SWR认证为空且旧kubeconfig不存在，缓存上传未执行。",
+    "gate": "提供可用认证配置，完成同摘要Collector区域缓存后运行正式K8s日志和Trace采集验收。"
   },
   {
     "id": "log-rotation",

@@ -47,6 +47,13 @@
           "to": "resource[\"service.name\"]"
         }
       ]
+    },
+    "otlp": {
+      "protocols": {
+        "http": {
+          "endpoint": "127.0.0.1:4318"
+        }
+      }
     }
   },
   "processors": {
@@ -63,6 +70,22 @@
   },
   "exporters": {
     "otlp_http/logs": {
+      "endpoint": "${env:ADX_OTLP_ENDPOINT}",
+      "encoding": "json",
+      "timeout": "5s",
+      "sending_queue": {
+        "enabled": true,
+        "storage": "file_storage",
+        "queue_size": 256
+      },
+      "retry_on_failure": {
+        "enabled": true,
+        "initial_interval": "1s",
+        "max_interval": "5s",
+        "max_elapsed_time": "0s"
+      }
+    },
+    "otlp_http/traces": {
       "endpoint": "${env:ADX_OTLP_ENDPOINT}",
       "encoding": "json",
       "timeout": "5s",
@@ -94,6 +117,18 @@
         ],
         "exporters": [
           "otlp_http/logs"
+        ]
+      },
+      "traces": {
+        "receivers": [
+          "otlp"
+        ],
+        "processors": [
+          "memory_limiter",
+          "batch"
+        ],
+        "exporters": [
+          "otlp_http/traces"
         ]
       }
     },

@@ -107,7 +107,8 @@ impl State {
         let Some(domain) = self.scheduler.take_ready_domain() else {
             return Ok(false);
         };
-        let round = self.scheduler.schedule_round(domain)?;
+        let round = adx_observability::trace::Trace::child("domain.schedule_round")
+            .scope(|| self.scheduler.schedule_round(domain))?;
         let progress = round.yielded || !round.assignments.is_empty();
         for assignment in round.assignments {
             let spec = self
@@ -421,7 +422,7 @@ impl MasterRpc {
                     assignment: Some(stored.assignment.clone().try_into().map_err(status)?),
                 };
                 let result = pb::node_service_client::NodeServiceClient::new(channel)
-                    .create_instance(request)
+                    .create_instance(adx_observability::trace::inject(request))
                     .await?
                     .into_inner();
                 let record: InstanceRecord = result
@@ -539,299 +540,328 @@ impl pb::master_service_server::MasterService for MasterRpc {
         &self,
         request: Request<pb::InspectNodeRequest>,
     ) -> std::result::Result<Response<pb::InspectNodeResponse>, Status> {
-        let principal = self.0.peers.authenticate(&request)?;
-        let r = request.into_inner();
-        if principal != Principal::Node(r.node_id.clone()) {
-            return Err(Status::permission_denied("node identity mismatch"));
-        }
-        let mut state = self.0.state.lock().await;
-        state.healthy().map_err(status)?;
-        let live = state
-            .live
-            .get(&r.node_id)
-            .ok_or_else(|| Status::failed_precondition("register node before reconciliation"))?;
-        if live.session != r.session_id || !live.report.reconciling {
-            return Err(Status::failed_precondition(
-                "node must enter reconciliation first",
-            ));
-        }
-        let snapshot = state.session.snapshot().await.map_err(status)?;
-        let retained_checkpoints = snapshot
-            .instances
-            .values()
-            .filter_map(|i| i.result.as_ref().and_then(|r| r.checkpoint.as_ref()))
-            .filter(|cp| cp.artifact.storage != "local")
-            .cloned()
-            .map(Into::into)
-            .collect();
-        let records = snapshot
-            .instances
-            .into_values()
-            .filter(|i| i.assignment.node_id == r.node_id)
-            .map(|i| {
-                i.result
-                    .unwrap_or_else(|| InstanceRecord {
-                        restart_attempts: 0,
-                        restart_pending: false,
-                        runtime_id: format!("{}-{}", i.spec.id, i.assignment.generation),
-                        spec: i.spec,
-                        assignment: i.assignment,
-                        state: InstanceState::Pending,
-                        revision: 0,
-                        resources_held: true,
-                        runtime_ip: None,
-                        checkpoint: None,
-                        last_operation: None,
+        let trace = adx_observability::trace::Trace::rpc("master.inspect_node", &request);
+        trace
+            .run_result(async {
+                let principal = self.0.peers.authenticate(&request)?;
+                let r = request.into_inner();
+                if principal != Principal::Node(r.node_id.clone()) {
+                    return Err(Status::permission_denied("node identity mismatch"));
+                }
+                let mut state = self.0.state.lock().await;
+                state.healthy().map_err(status)?;
+                let live = state.live.get(&r.node_id).ok_or_else(|| {
+                    Status::failed_precondition("register node before reconciliation")
+                })?;
+                if live.session != r.session_id || !live.report.reconciling {
+                    return Err(Status::failed_precondition(
+                        "node must enter reconciliation first",
+                    ));
+                }
+                let snapshot = state.session.snapshot().await.map_err(status)?;
+                let retained_checkpoints = snapshot
+                    .instances
+                    .values()
+                    .filter_map(|i| i.result.as_ref().and_then(|r| r.checkpoint.as_ref()))
+                    .filter(|cp| cp.artifact.storage != "local")
+                    .cloned()
+                    .map(Into::into)
+                    .collect();
+                let records = snapshot
+                    .instances
+                    .into_values()
+                    .filter(|i| i.assignment.node_id == r.node_id)
+                    .map(|i| {
+                        i.result
+                            .unwrap_or_else(|| InstanceRecord {
+                                restart_attempts: 0,
+                                restart_pending: false,
+                                runtime_id: format!("{}-{}", i.spec.id, i.assignment.generation),
+                                spec: i.spec,
+                                assignment: i.assignment,
+                                state: InstanceState::Pending,
+                                revision: 0,
+                                resources_held: true,
+                                runtime_ip: None,
+                                checkpoint: None,
+                                last_operation: None,
+                            })
+                            .try_into()
                     })
-                    .try_into()
+                    .collect::<Result<Vec<_>>>()
+                    .map_err(status)?;
+                let snapshots = state
+                    .session
+                    .node_snapshots(&r.node_id)
+                    .await
+                    .map_err(status)?
+                    .into_iter()
+                    .map(TryInto::try_into)
+                    .collect::<Result<Vec<_>>>()
+                    .map_err(status)?;
+                state.live.get_mut(&r.node_id).unwrap().inspected = true;
+                Ok(Response::new(pb::InspectNodeResponse {
+                    records,
+                    snapshots,
+                    retained_checkpoints,
+                    master_epoch: state.session.epoch(),
+                }))
             })
-            .collect::<Result<Vec<_>>>()
-            .map_err(status)?;
-        let snapshots = state
-            .session
-            .node_snapshots(&r.node_id)
             .await
-            .map_err(status)?
-            .into_iter()
-            .map(TryInto::try_into)
-            .collect::<Result<Vec<_>>>()
-            .map_err(status)?;
-        state.live.get_mut(&r.node_id).unwrap().inspected = true;
-        Ok(Response::new(pb::InspectNodeResponse {
-            records,
-            snapshots,
-            retained_checkpoints,
-            master_epoch: state.session.epoch(),
-        }))
     }
 
     async fn register_node(
         &self,
         request: Request<pb::RegisterNodeRequest>,
     ) -> std::result::Result<Response<pb::RegisterNodeResponse>, Status> {
-        let principal = self.0.peers.authenticate(&request)?;
-        let r = request.into_inner();
-        if principal != Principal::Node(r.node_id.clone()) {
-            return Err(Status::permission_denied(
-                "node identity does not match certificate",
-            ));
-        }
-        if r.session_id.is_empty()
-            || r.session_id.len() > 128
-            || r.heartbeat_sequence == 0
-            || (r.reconciling && r.accepting_allocations)
-        {
-            return Err(Status::invalid_argument(
-                "node session, monotonic heartbeat and closed reconciliation admission required",
-            ));
-        }
-        let node = Node::try_from(r.clone()).map_err(status)?;
-        for address in [&r.node_address, &r.proxy_address] {
-            if address.trim().is_empty() || address.contains(['/', '@', '?', '#']) {
-                return Err(Status::invalid_argument(
-                    "advertised host:port address required",
-                ));
-            }
-            Endpoint::from_shared(format!("https://{address}"))
-                .map_err(|_| Status::invalid_argument("invalid advertised address"))?;
-        }
-        let service = self.clone();
-        tokio::spawn(async move {
-            let predecessor = service.replacement_predecessor(&r).await;
-            let mut state = service.0.state.lock().await;
-            state.healthy().map_err(status)?;
-            if state
-                .retired_sessions
-                .contains(&(r.node_id.clone(), r.session_id.clone()))
-            {
-                return Err(Status::failed_precondition("retired node session"));
-            }
-            if state.overdue(&r.node_id, service.0.heartbeat_timeout) {
-                let result = state.invalidate_node(&r.node_id).await;
-                service.0.changed.notify_waiters();
-                result.map_err(status)?;
-            }
-            let mut inspected = false;
-            if let Some(live) = state.live.get(&r.node_id) {
-                if live.session == r.session_id {
-                    if r.heartbeat_sequence < live.sequence
-                        || (r.heartbeat_sequence == live.sequence && live.report != r)
-                    {
-                        return Err(Status::failed_precondition("stale heartbeat"));
-                    }
-                    if r.heartbeat_sequence == live.sequence && live.expired {
-                        return Err(Status::failed_precondition(
-                            "expired heartbeat; reconciliation required",
-                        ));
-                    }
-                    if r.heartbeat_sequence == live.sequence {
-                        return Ok(Response::new(pb::RegisterNodeResponse {
-                            domain_id: state.nodes[&r.node_id].domain_id as u32,
-                            master_epoch: state.session.epoch(),
-                        }));
-                    }
-                    inspected =
-                        live.inspected && live.last_seen.elapsed() < service.0.heartbeat_timeout;
-                } else if live.last_seen.elapsed() < service.0.heartbeat_timeout
-                    && (predecessor.as_ref() != Some(&live.session)
-                        || live.report.node_address != r.node_address
-                        || live.report.proxy_address != r.proxy_address)
-                {
-                    return Err(Status::failed_precondition(
-                        "another node process is still registered",
+        let trace = adx_observability::trace::Trace::rpc("master.register_node", &request);
+        trace
+            .run_result(async {
+                let principal = self.0.peers.authenticate(&request)?;
+                let r = request.into_inner();
+                if principal != Principal::Node(r.node_id.clone()) {
+                    return Err(Status::permission_denied(
+                        "node identity does not match certificate",
                     ));
                 }
-            }
-            if !r.reconciling && !inspected {
-                return Err(Status::failed_precondition("node requires reconciliation"));
-            }
-            let saved = match state
-                .session
-                .register_session(
-                    node.clone(),
-                    r.node_address.clone(),
-                    r.proxy_address.clone(),
-                    Some(NodeSession {
-                        id: r.session_id.clone(),
-                        sequence: r.heartbeat_sequence,
-                        routable: !r.reconciling,
-                    }),
-                )
-                .await
-            {
-                Ok(saved) => saved,
-                Err(error) => {
-                    if matches!(error, Error::Unavailable(_) | Error::Conflict) {
-                        state.needs_recovery = true;
-                        service.0.changed.notify_waiters();
+                if r.session_id.is_empty()
+                    || r.session_id.len() > 128
+                    || r.heartbeat_sequence == 0
+                    || (r.reconciling && r.accepting_allocations)
+                {
+                    return Err(Status::invalid_argument(
+                "node session, monotonic heartbeat and closed reconciliation admission required",
+            ));
+                }
+                let node = Node::try_from(r.clone()).map_err(status)?;
+                for address in [&r.node_address, &r.proxy_address] {
+                    if address.trim().is_empty() || address.contains(['/', '@', '?', '#']) {
+                        return Err(Status::invalid_argument(
+                            "advertised host:port address required",
+                        ));
                     }
-                    return Err(status(error));
+                    Endpoint::from_shared(format!("https://{address}"))
+                        .map_err(|_| Status::invalid_argument("invalid advertised address"))?;
                 }
-            };
-            let domain = state.scheduler.register(node).map_err(status)?;
-            if domain != saved.domain_id {
-                state.needs_recovery = true;
-                return Err(Status::internal("node domain mismatch; recovery required"));
-            }
-            state.nodes.insert(saved.node.id.clone(), saved);
-            state.recovering.remove(&r.node_id);
-            if let Some(old) = state.live.remove(&r.node_id) {
-                if old.session != r.session_id {
-                    state
+                let service = self.clone();
+                tokio::spawn(async move {
+                    let predecessor = service.replacement_predecessor(&r).await;
+                    let mut state = service.0.state.lock().await;
+                    state.healthy().map_err(status)?;
+                    if state
                         .retired_sessions
-                        .insert((r.node_id.clone(), old.session));
-                }
-            }
-            state.live.insert(
-                r.node_id.clone(),
-                LiveNode {
-                    expired: false,
-                    session: r.session_id.clone(),
-                    sequence: r.heartbeat_sequence,
-                    last_seen: tokio::time::Instant::now(),
-                    inspected,
-                    report: r,
-                },
-            );
-            service.0.changed.notify_waiters();
-            Ok(Response::new(pb::RegisterNodeResponse {
-                domain_id: u32::try_from(domain)
-                    .map_err(|_| Status::internal("domain overflow"))?,
-                master_epoch: state.session.epoch(),
-            }))
-        })
-        .await
-        .map_err(|_| Status::internal("registration task failed"))?
+                        .contains(&(r.node_id.clone(), r.session_id.clone()))
+                    {
+                        return Err(Status::failed_precondition("retired node session"));
+                    }
+                    if state.overdue(&r.node_id, service.0.heartbeat_timeout) {
+                        let result = state.invalidate_node(&r.node_id).await;
+                        service.0.changed.notify_waiters();
+                        result.map_err(status)?;
+                    }
+                    let mut inspected = false;
+                    if let Some(live) = state.live.get(&r.node_id) {
+                        if live.session == r.session_id {
+                            if r.heartbeat_sequence < live.sequence
+                                || (r.heartbeat_sequence == live.sequence && live.report != r)
+                            {
+                                return Err(Status::failed_precondition("stale heartbeat"));
+                            }
+                            if r.heartbeat_sequence == live.sequence && live.expired {
+                                return Err(Status::failed_precondition(
+                                    "expired heartbeat; reconciliation required",
+                                ));
+                            }
+                            if r.heartbeat_sequence == live.sequence {
+                                return Ok(Response::new(pb::RegisterNodeResponse {
+                                    domain_id: state.nodes[&r.node_id].domain_id as u32,
+                                    master_epoch: state.session.epoch(),
+                                }));
+                            }
+                            inspected = live.inspected
+                                && live.last_seen.elapsed() < service.0.heartbeat_timeout;
+                        } else if live.last_seen.elapsed() < service.0.heartbeat_timeout
+                            && (predecessor.as_ref() != Some(&live.session)
+                                || live.report.node_address != r.node_address
+                                || live.report.proxy_address != r.proxy_address)
+                        {
+                            return Err(Status::failed_precondition(
+                                "another node process is still registered",
+                            ));
+                        }
+                    }
+                    if !r.reconciling && !inspected {
+                        return Err(Status::failed_precondition("node requires reconciliation"));
+                    }
+                    let saved = match state
+                        .session
+                        .register_session(
+                            node.clone(),
+                            r.node_address.clone(),
+                            r.proxy_address.clone(),
+                            Some(NodeSession {
+                                id: r.session_id.clone(),
+                                sequence: r.heartbeat_sequence,
+                                routable: !r.reconciling,
+                            }),
+                        )
+                        .await
+                    {
+                        Ok(saved) => saved,
+                        Err(error) => {
+                            if matches!(error, Error::Unavailable(_) | Error::Conflict) {
+                                state.needs_recovery = true;
+                                service.0.changed.notify_waiters();
+                            }
+                            return Err(status(error));
+                        }
+                    };
+                    let domain = state.scheduler.register(node).map_err(status)?;
+                    if domain != saved.domain_id {
+                        state.needs_recovery = true;
+                        return Err(Status::internal("node domain mismatch; recovery required"));
+                    }
+                    state.nodes.insert(saved.node.id.clone(), saved);
+                    state.recovering.remove(&r.node_id);
+                    if let Some(old) = state.live.remove(&r.node_id) {
+                        if old.session != r.session_id {
+                            state
+                                .retired_sessions
+                                .insert((r.node_id.clone(), old.session));
+                        }
+                    }
+                    state.live.insert(
+                        r.node_id.clone(),
+                        LiveNode {
+                            expired: false,
+                            session: r.session_id.clone(),
+                            sequence: r.heartbeat_sequence,
+                            last_seen: tokio::time::Instant::now(),
+                            inspected,
+                            report: r,
+                        },
+                    );
+                    service.0.changed.notify_waiters();
+                    Ok(Response::new(pb::RegisterNodeResponse {
+                        domain_id: u32::try_from(domain)
+                            .map_err(|_| Status::internal("domain overflow"))?,
+                        master_epoch: state.session.epoch(),
+                    }))
+                })
+                .await
+                .map_err(|_| Status::internal("registration task failed"))?
+            })
+            .await
     }
     async fn create_instance(
         &self,
         request: Request<pb::CreateInstanceRequest>,
     ) -> std::result::Result<Response<pb::InstanceResult>, Status> {
-        if self.0.peers.authenticate(&request)? != Principal::Frontend {
-            return Err(Status::permission_denied("Frontend caller required"));
-        }
-        let r = request.into_inner();
-        let raw = r
-            .spec
-            .ok_or_else(|| Status::invalid_argument("spec required"))?;
-        tenant(r.caller.as_ref(), &raw.tenant_id)?;
-        let spec = {
-            let state = self.0.state.lock().await;
-            state.healthy().map_err(status)?;
-            cloning::normalize(&state.session, raw)
+        let trace = adx_observability::trace::Trace::rpc("master.create_instance", &request);
+        trace
+            .run_result(async {
+                if self.0.peers.authenticate(&request)? != Principal::Frontend {
+                    return Err(Status::permission_denied("Frontend caller required"));
+                }
+                let r = request.into_inner();
+                let raw = r
+                    .spec
+                    .ok_or_else(|| Status::invalid_argument("spec required"))?;
+                tenant(r.caller.as_ref(), &raw.tenant_id)?;
+                let spec = {
+                    let state = self.0.state.lock().await;
+                    state.healthy().map_err(status)?;
+                    cloning::normalize(&state.session, raw)
+                        .await
+                        .map_err(status)?
+                };
+                let service = self.clone();
+                tokio::spawn(
+                    adx_observability::trace::Trace::child("master.create")
+                        .run(async move { service.create(spec).await.map(Response::new) }),
+                )
                 .await
-                .map_err(status)?
-        };
-        let service = self.clone();
-        tokio::spawn(async move { service.create(spec).await.map(Response::new) })
+                .map_err(|_| Status::internal("creation task failed"))?
+            })
             .await
-            .map_err(|_| Status::internal("creation task failed"))?
     }
     async fn get_instance(
         &self,
         request: Request<pb::GetInstanceRequest>,
     ) -> std::result::Result<Response<pb::GetInstanceResponse>, Status> {
-        let principal = self.0.peers.authenticate(&request)?;
-        let r = request.into_inner();
-        let state = self.0.state.lock().await;
-        let stored = state.session.get(&r.instance_id).await.map_err(status)?;
-        match principal {
-            Principal::Frontend => tenant(r.caller.as_ref(), &stored.spec.tenant_id)?,
-            Principal::Node(ref id) if id == &stored.assignment.node_id => (),
-            _ => {
-                return Err(Status::permission_denied(
-                    "caller may not read this instance",
-                ))
-            }
-        }
-        let node = state
-            .nodes
-            .get(&stored.assignment.node_id)
-            .ok_or_else(|| Status::unavailable("owner node missing"))?;
-        let record = stored.result.unwrap_or_else(|| InstanceRecord {
-            restart_attempts: 0,
-            restart_pending: false,
-            runtime_id: format!("{}-{}", stored.spec.id, stored.assignment.generation),
-            spec: stored.spec,
-            assignment: stored.assignment,
-            state: InstanceState::Pending,
-            revision: 0,
-            resources_held: true,
-            runtime_ip: None,
-            checkpoint: None,
-            last_operation: None,
-        });
-        Ok(Response::new(pb::GetInstanceResponse {
-            record: Some(record.try_into().map_err(status)?),
-            node_address: node.address.clone(),
-            node_proxy_address: node.proxy_address.clone(),
-        }))
+        let trace = adx_observability::trace::Trace::rpc("master.get_instance", &request);
+        trace
+            .run_result(async {
+                let principal = self.0.peers.authenticate(&request)?;
+                let r = request.into_inner();
+                let state = self.0.state.lock().await;
+                let stored = state.session.get(&r.instance_id).await.map_err(status)?;
+                match principal {
+                    Principal::Frontend => tenant(r.caller.as_ref(), &stored.spec.tenant_id)?,
+                    Principal::Node(ref id) if id == &stored.assignment.node_id => (),
+                    _ => {
+                        return Err(Status::permission_denied(
+                            "caller may not read this instance",
+                        ))
+                    }
+                }
+                let node = state
+                    .nodes
+                    .get(&stored.assignment.node_id)
+                    .ok_or_else(|| Status::unavailable("owner node missing"))?;
+                let record = stored.result.unwrap_or_else(|| InstanceRecord {
+                    restart_attempts: 0,
+                    restart_pending: false,
+                    runtime_id: format!("{}-{}", stored.spec.id, stored.assignment.generation),
+                    spec: stored.spec,
+                    assignment: stored.assignment,
+                    state: InstanceState::Pending,
+                    revision: 0,
+                    resources_held: true,
+                    runtime_ip: None,
+                    checkpoint: None,
+                    last_operation: None,
+                });
+                Ok(Response::new(pb::GetInstanceResponse {
+                    record: Some(record.try_into().map_err(status)?),
+                    node_address: node.address.clone(),
+                    node_proxy_address: node.proxy_address.clone(),
+                }))
+            })
+            .await
     }
     async fn commit_instance(
         &self,
         request: Request<pb::CommitInstanceRequest>,
     ) -> std::result::Result<Response<pb::CommitInstanceResponse>, Status> {
-        let principal = self.0.peers.authenticate(&request)?;
-        let r = request.into_inner();
-        let record: InstanceRecord = r
-            .record
-            .ok_or_else(|| Status::invalid_argument("record required"))?
-            .try_into()
-            .map_err(status)?;
-        if principal != Principal::Node(record.assignment.node_id.clone()) {
-            return Err(Status::permission_denied("only owning node may commit"));
-        }
-        let service = self.clone();
-        tokio::spawn(async move {
-            let record = service
-                .commit(record, r.node_session_id)
+        let trace = adx_observability::trace::Trace::rpc("master.commit_instance", &request);
+        trace
+            .run_result(async {
+                let principal = self.0.peers.authenticate(&request)?;
+                let r = request.into_inner();
+                let record: InstanceRecord = r
+                    .record
+                    .ok_or_else(|| Status::invalid_argument("record required"))?
+                    .try_into()
+                    .map_err(status)?;
+                if principal != Principal::Node(record.assignment.node_id.clone()) {
+                    return Err(Status::permission_denied("only owning node may commit"));
+                }
+                let service = self.clone();
+                tokio::spawn(adx_observability::trace::Trace::child("master.commit").run(
+                    async move {
+                        let record = service
+                            .commit(record, r.node_session_id)
+                            .await
+                            .map_err(status)?;
+                        Ok(Response::new(pb::CommitInstanceResponse {
+                            record: Some(record.try_into().map_err(status)?),
+                        }))
+                    },
+                ))
                 .await
-                .map_err(status)?;
-            Ok(Response::new(pb::CommitInstanceResponse {
-                record: Some(record.try_into().map_err(status)?),
-            }))
-        })
-        .await
-        .map_err(|_| Status::internal("commit task failed"))?
+                .map_err(|_| Status::internal("commit task failed"))?
+            })
+            .await
     }
 }

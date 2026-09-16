@@ -104,8 +104,13 @@ func run() error {
 		return errors.New("invalid TLS CA")
 	}
 	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: roots, Certificates: []tls.Certificate{cert}, ServerName: c.ServerName}
+	shutdownTracing, err := initTracing(context.Background())
+	if err != nil {
+		return err
+	}
+	defer shutdownTracing()
 	timeout := time.Duration(c.RPCTimeoutSeconds) * time.Second
-	options := []grpc.DialOption{grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig))}
+	options := []grpc.DialOption{grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)), grpc.WithChainUnaryInterceptor(traceUnary)}
 	target := c.MasterAddress
 	if c.Discovery != nil {
 		builder, closeRedis, e := discovery.New(*c.Discovery, timeout)
@@ -143,7 +148,7 @@ func run() error {
 				return nil, errors.New("node connection budget exhausted")
 			}
 			var e error
-			connection, e = grpc.NewClient(address, grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)))
+			connection, e = grpc.NewClient(address, grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)), grpc.WithChainUnaryInterceptor(traceUnary))
 			if e != nil {
 				return nil, e
 			}
@@ -156,6 +161,7 @@ func run() error {
 		return err
 	}
 	router := gin.New()
+	router.Use(traceHTTP())
 	router.Use(requestLogging(slog.Default()))
 	router.Use(gin.CustomRecoveryWithWriter(io.Discard, func(c *gin.Context, _ any) {
 		slog.Error("request panic", "event", "http_panic")

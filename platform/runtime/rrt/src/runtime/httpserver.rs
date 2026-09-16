@@ -257,7 +257,14 @@ async fn handle_one_request(
         }
     };
     let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
+    let trace = adx_observability::trace::Trace::remote(
+        "rrt.http",
+        parse_header(&head, "traceparent").as_deref(),
+        parse_header(&head, "tracestate").as_deref(),
+    );
+    trace.run_result(async {
     let (method, path) = parse_request_line(&head);
+    adx_observability::trace::attribute("instance.id",std::env::var("ADX_INSTANCE_ID").unwrap_or_default());
     let content_len = parse_content_length(&head);
     let body_mode = if header_has_token(&head, "transfer-encoding", "chunked") {
         RequestBody::Chunked
@@ -402,6 +409,7 @@ async fn handle_one_request(
 
     let resp = execute_invoke(request_id, action, kw, trace_id).await;
     write_resp(sock, resp.status, &resp.body).await
+    }).await
 }
 
 async fn control_response(method: &str, path: &str, body: &[u8]) -> CachedResponse {

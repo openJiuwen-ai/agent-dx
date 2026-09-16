@@ -20,7 +20,10 @@ pub async fn serve(listener: TcpListener, master: MasterRpc) -> std::io::Result<
                             (404, String::new())
                         } else {
                             match master.metrics().await {
-                                Ok(text) => (200, text),
+                                Ok(mut text) => {
+                                    text.push_str(&adx_observability::trace::metrics());
+                                    (200, text)
+                                }
                                 Err(_) => (503, "metrics temporarily unavailable\n".into()),
                             }
                         };

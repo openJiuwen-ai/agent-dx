@@ -177,7 +177,8 @@ impl H2ConnectionPool {
                     crate::common::protocol::ACTIVITY_CLASS_PASSIVE,
                 );
             }
-            let request = request.body(()).map_err(io_error)?;
+            let mut request = request.body(()).map_err(io_error)?;
+            adx_observability::trace::inject_headers(request.headers_mut());
             let (response, send) = match sender.send_request(request, false) {
                 Ok(streams) => streams,
                 Err(error) => {

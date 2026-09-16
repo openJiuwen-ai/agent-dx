@@ -32,7 +32,7 @@ run_id=`adx-e2e-c6ac8608ed63`，使用外部sandboxd/runc。最终证据目录�
 
 ## 正式基础K8s
 
-[Buildkite #19](https://buildkite.com/agent-dx/agent-dx/builds/19)的发布包构建通过。首轮镜像步骤在40分钟限时后退出：发布包下载约31分钟，随后Collector镜像仍在拉取。K8s用例未执行；已仅重试失败的镜像步骤一次，仍使用同一提交，等待最终核验。独立Collector sidecar、每节点采集证据和Gateway指标进入SDK/stop组及构建汇总。只有实际Pod部署、七组用例、采集证据与清理全部通过后才判定正式验收成功。
+[Buildkite #19](https://buildkite.com/agent-dx/agent-dx/builds/19)发布包构建通过；镜像步骤及唯一重试均在Collector下载阶段达到40分钟限时，K8s用例未执行。独立Collector sidecar、每节点采集证据和Gateway指标进入SDK/stop组及构建汇总。只有实际Pod部署、七组用例、采集证据与清理全部通过后才判定正式验收成功。
 
 ## 证据与边界
 

@@ -27,10 +27,24 @@ enum Command {
     Tick(oneshot::Sender<Result<()>>),
 }
 type Reply = oneshot::Sender<Result<OperationResult>>;
+struct Envelope {
+    command: Command,
+    reply: Reply,
+    trace: adx_observability::trace::Trace,
+}
+impl Envelope {
+    fn new(command: Command, reply: Reply) -> Self {
+        Self {
+            command,
+            reply,
+            trace: adx_observability::trace::Trace::child("instance.queue"),
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct InstanceHandle {
-    tx: mpsc::Sender<(Command, Reply)>,
+    tx: mpsc::Sender<Envelope>,
 }
 
 impl InstanceHandle {
@@ -41,7 +55,7 @@ impl InstanceHandle {
         let (tx, rx) = oneshot::channel();
         let (unused, _) = oneshot::channel();
         self.tx
-            .send((Command::Snapshot(request, tx), unused))
+            .send(Envelope::new(Command::Snapshot(request, tx), unused))
             .await
             .map_err(|_| Error::Unavailable("instance controller stopped".into()))?;
         rx.await
@@ -51,7 +65,7 @@ impl InstanceHandle {
     async fn send(&self, command: Command) -> Result<OperationResult> {
         let (tx, rx) = oneshot::channel();
         self.tx
-            .send((command, tx))
+            .send(Envelope::new(command, tx))
             .await
             .map_err(|_| Error::Unavailable("instance controller stopped".into()))?;
         rx.await
@@ -85,7 +99,7 @@ impl InstanceHandle {
         let (tx, rx) = oneshot::channel();
         let (unused, _) = oneshot::channel();
         self.tx
-            .send((Command::Discard(tx), unused))
+            .send(Envelope::new(Command::Discard(tx), unused))
             .await
             .map_err(|_| Error::Unavailable("instance controller stopped".into()))?;
         rx.await
@@ -95,7 +109,7 @@ impl InstanceHandle {
         let (tx, rx) = oneshot::channel();
         let (unused, _) = oneshot::channel();
         self.tx
-            .send((Command::Expire(now, tx), unused))
+            .send(Envelope::new(Command::Expire(now, tx), unused))
             .await
             .map_err(|_| Error::Unavailable("instance controller stopped".into()))?;
         rx.await
@@ -105,7 +119,7 @@ impl InstanceHandle {
         let (tx, rx) = oneshot::channel();
         let (unused, _) = oneshot::channel();
         self.tx
-            .send((Command::Tick(tx), unused))
+            .send(Envelope::new(Command::Tick(tx), unused))
             .await
             .map_err(|_| Error::Unavailable("instance controller stopped".into()))?;
         rx.await
@@ -141,7 +155,7 @@ pub(crate) fn spawn(
 }
 
 pub(crate) fn spawn_restored(record: InstanceRecord, services: Arc<Services>) -> InstanceHandle {
-    let (tx, mut rx) = mpsc::channel::<(Command, Reply)>(32);
+    let (tx, mut rx) = mpsc::channel::<Envelope>(32);
     let mut controller = Controller {
         recovery_files: None,
         held: record.resources_held,
@@ -155,96 +169,115 @@ pub(crate) fn spawn_restored(record: InstanceRecord, services: Arc<Services>) ->
         health_failures: 0,
     };
     tokio::spawn(async move {
-        while let Some((command, reply)) = rx.recv().await {
-            let command = match command {
-                Command::Snapshot(request, ack) => {
-                    let result = if controller.retired {
-                        Err(Error::Conflict)
-                    } else {
-                        controller.snapshot(request).await
-                    };
-                    let _ = ack.send(result);
-                    continue;
-                }
-                Command::Tick(ack) => {
-                    let result = if controller.retired {
-                        Err(Error::Conflict)
-                    } else {
-                        controller.tick().await
-                    };
-                    let _ = ack.send(result);
-                    continue;
-                }
-                Command::Expire(now, ack) => {
-                    let result = if controller.retired {
-                        Err(Error::Conflict)
-                    } else {
-                        controller.expire_checkpoint(now).await
-                    };
-                    let _ = ack.send(result);
-                    continue;
-                }
-                Command::Discard(ack) => {
-                    let result = if controller.retired {
-                        Ok(())
-                    } else {
-                        controller.cleanup().await
-                    };
-                    if result.is_ok() {
-                        controller.retired = true;
-                    }
-                    let _ = ack.send(result);
-                    continue;
-                }
-                command => command,
-            };
-            if controller.retired {
-                let _ = reply.send(Err(Error::Conflict));
-                continue;
-            }
-            let operation = match &command {
-                Command::Pause(_) => "pause",
-                Command::Resume(_) => "resume",
-                Command::Recover(_) => "recover",
-                Command::Create | Command::Clone(_) => "create",
-                Command::Delete => "delete",
-                Command::Sync => "sync",
-                Command::Reconcile => "reconcile",
-                _ => unreachable!(),
-            };
-            let result = match command {
-                Command::Snapshot(_, _)
-                | Command::Discard(_)
-                | Command::Expire(_, _)
-                | Command::Tick(_) => unreachable!(),
-                Command::Pause(request) => controller.pause(request).await,
-                Command::Resume(request) => controller.resume(request).await,
-                Command::Recover(request) => controller.recover(request).await,
-                Command::Create => controller.create().await,
-                Command::Clone(snapshot) => controller.clone_snapshot(*snapshot).await,
-                Command::Delete => controller.delete().await,
-                Command::Sync => controller.sync().await,
-                Command::Reconcile => controller.reconcile().await,
-            };
-            if let Err(error) = &result {
-                eprintln!(
-                    "{}",
-                    serde_json::json!({
-                        "event": "instance operation failed",
-                        "unix_seconds": crate::checkpoint::now().ok(),
-                        "instance_id": controller.record.spec.id,
-                        "runtime_id": controller.record.runtime_id,
-                        "revision": controller.record.revision,
-                        "operation": operation,
-                        "error": error.to_string(),
-                    })
-                );
-            }
-            // Dropping the caller's reply never cancels an accepted operation.
-            let _ = reply.send(result);
+        while let Some(Envelope {
+            command,
+            reply,
+            trace,
+        }) = rx.recv().await
+        {
+            trace.attribute("instance.id", controller.record.spec.id.clone());
+            trace
+                .run(async {
+                    adx_observability::trace::Trace::child("instance.execute")
+                        .run(controller.dispatch(command, reply))
+                        .await;
+                })
+                .await;
         }
     });
     InstanceHandle { tx }
+}
+
+impl Controller {
+    async fn dispatch(&mut self, command: Command, reply: Reply) {
+        let command = match command {
+            Command::Snapshot(request, ack) => {
+                let result = if self.retired {
+                    Err(Error::Conflict)
+                } else {
+                    self.snapshot(request).await
+                };
+                let _ = ack.send(result);
+                return;
+            }
+            Command::Tick(ack) => {
+                let result = if self.retired {
+                    Err(Error::Conflict)
+                } else {
+                    self.tick().await
+                };
+                let _ = ack.send(result);
+                return;
+            }
+            Command::Expire(now, ack) => {
+                let result = if self.retired {
+                    Err(Error::Conflict)
+                } else {
+                    self.expire_checkpoint(now).await
+                };
+                let _ = ack.send(result);
+                return;
+            }
+            Command::Discard(ack) => {
+                let result = if self.retired {
+                    Ok(())
+                } else {
+                    self.cleanup().await
+                };
+                if result.is_ok() {
+                    self.retired = true;
+                }
+                let _ = ack.send(result);
+                return;
+            }
+            command => command,
+        };
+        if self.retired {
+            let _ = reply.send(Err(Error::Conflict));
+            return;
+        }
+        let operation = match &command {
+            Command::Pause(_) => "pause",
+            Command::Resume(_) => "resume",
+            Command::Recover(_) => "recover",
+            Command::Create | Command::Clone(_) => "create",
+            Command::Delete => "delete",
+            Command::Sync => "sync",
+            Command::Reconcile => "reconcile",
+            _ => unreachable!(),
+        };
+        let result = match command {
+            Command::Snapshot(_, _)
+            | Command::Discard(_)
+            | Command::Expire(_, _)
+            | Command::Tick(_) => unreachable!(),
+            Command::Pause(request) => self.pause(request).await,
+            Command::Resume(request) => self.resume(request).await,
+            Command::Recover(request) => self.recover(request).await,
+            Command::Create => self.create().await,
+            Command::Clone(snapshot) => self.clone_snapshot(*snapshot).await,
+            Command::Delete => self.delete().await,
+            Command::Sync => self.sync().await,
+            Command::Reconcile => self.reconcile().await,
+        };
+        if let Err(error) = &result {
+            adx_observability::trace::error();
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "event": "instance operation failed",
+                    "unix_seconds": crate::checkpoint::now().ok(),
+                    "instance_id": self.record.spec.id,
+                    "runtime_id": self.record.runtime_id,
+                    "revision": self.record.revision,
+                    "operation": operation,
+                    "error": error.to_string(),
+                })
+            );
+        }
+        // Dropping the caller's reply never cancels an accepted operation.
+        let _ = reply.send(result);
+    }
 }
 
 struct Controller {

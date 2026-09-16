@@ -645,12 +645,45 @@ impl EdgeFrontend {
         ingress_security: IngressSecurity,
         peer: std::net::SocketAddr,
     ) -> Result<Response<ProxyBody>, Infallible> {
+        let trace = adx_observability::trace::Trace::remote(
+            "edge.http",
+            request
+                .headers()
+                .get("traceparent")
+                .and_then(|v| v.to_str().ok()),
+            request
+                .headers()
+                .get("tracestate")
+                .and_then(|v| v.to_str().ok()),
+        );
+        trace
+            .run(async {
+                adx_observability::trace::inject_headers(request.headers_mut());
+                let response = self
+                    .handle_http_inner(request, ingress_security, peer)
+                    .await?;
+                if response.status().is_server_error() {
+                    adx_observability::trace::error();
+                }
+                Ok(response)
+            })
+            .await
+    }
+
+    async fn handle_http_inner(
+        self: Arc<Self>,
+        mut request: Request<Incoming>,
+        ingress_security: IngressSecurity,
+        peer: std::net::SocketAddr,
+    ) -> Result<Response<ProxyBody>, Infallible> {
         let _in_flight = AtomicMetricGuard::new(&self.request_metrics.in_flight);
         let started = Instant::now();
         let request_id = ensure_request_id(&mut request);
         let method = request.method().to_string();
         let path = request.uri().path().to_owned();
         let (access_kind, instance_id, target_port) = self.access_fields(&request);
+        adx_observability::trace::attribute("instance.id", instance_id.clone());
+        adx_observability::trace::attribute("http.request.method", method.clone());
         let response = match request.uri().path() {
             COMMAND_WATCH_PATH => {
                 self.handle_command_watch(&mut request, ingress_security)

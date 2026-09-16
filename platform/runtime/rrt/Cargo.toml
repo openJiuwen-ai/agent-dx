@@ -12,6 +12,7 @@ name = "rrt-runtime"
 path = "src/bin/rrt-runtime.rs"
 
 [dependencies]
+adx-observability = { path = "../../crates/observability" }
 adx-core = { path = "../../crates/core" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "net", "time", "fs"] }
 tokio-stream = { version = "0.1", features = ["net"] }

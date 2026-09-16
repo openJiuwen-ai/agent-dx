@@ -1,4 +1,5 @@
 //! Process logging setup; collection and storage remain deployment services.
+pub mod trace;
 pub use tracing::{debug, error, info, warn};
 pub fn json_enabled() -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     match std::env::var("ADX_LOG_FORMAT").as_deref().unwrap_or("text") {

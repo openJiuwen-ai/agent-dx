@@ -7,6 +7,7 @@ use tokio::sync::Semaphore;
 
 struct Dependencies {
     events: Mutex<Vec<String>>,
+    traces: Mutex<Vec<(String, Option<String>)>>,
     fail_at: Mutex<Option<String>>,
     durability: Mutex<Durability>,
     start_entered: Semaphore,
@@ -18,6 +19,7 @@ impl Dependencies {
     fn new(block_start: bool) -> Arc<Self> {
         Arc::new(Self {
             events: Mutex::default(),
+            traces: Mutex::default(),
             fail_at: Mutex::default(),
             durability: Mutex::new(Durability::Published),
             start_entered: Semaphore::new(0),
@@ -27,6 +29,10 @@ impl Dependencies {
     }
     fn event(&self, name: &str) -> Result<()> {
         self.events.lock().unwrap().push(name.into());
+        self.traces
+            .lock()
+            .unwrap()
+            .push((name.into(), adx_observability::trace::traceparent()));
         if self.fail_at.lock().unwrap().as_deref() == Some(name) {
             Err(Error::Unavailable(name.into()))
         } else {
@@ -505,4 +511,46 @@ async fn metrics_follow_reservations_and_capacity_shrink() {
     let text = node.metrics();
     assert!(text.contains("adx_node_available_memory_bytes 0\n"));
     assert!(text.contains("adx_node_capacity_memory_bytes 512\n"));
+}
+
+#[tokio::test]
+async fn accepted_instance_operations_keep_request_context_after_caller_cancellation() {
+    let _provider = adx_observability::trace::init("queue-test").unwrap();
+    let deps = Dependencies::new(true);
+    let node = node(&deps);
+    let instance = node.instance(spec("trace"), assignment("trace")).unwrap();
+    let first = instance.clone();
+    let create = tokio::spawn(
+        adx_observability::trace::Trace::remote(
+            "create",
+            Some("00-11111111111111111111111111111111-1111111111111111-01"),
+            None,
+        )
+        .run(async move { first.create().await }),
+    );
+    deps.start_entered.acquire().await.unwrap().forget();
+    create.abort(); // Accepted operation keeps running in its controller.
+    let delete = tokio::spawn(
+        adx_observability::trace::Trace::remote(
+            "delete",
+            Some("00-22222222222222222222222222222222-2222222222222222-01"),
+            None,
+        )
+        .run(async move { instance.delete().await }),
+    );
+    deps.start_release.add_permits(1);
+    delete.await.unwrap().unwrap();
+    for (event, parent) in deps.traces.lock().unwrap().iter() {
+        let expected = if ["start", "ready", "activate", "commit:Running"].contains(&event.as_str())
+        {
+            "11111111111111111111111111111111"
+        } else {
+            "22222222222222222222222222222222"
+        };
+        assert_eq!(
+            &parent.as_ref().expect("controller context missing")[3..35],
+            expected,
+            "event {event}"
+        );
+    }
 }

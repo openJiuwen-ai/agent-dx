@@ -23,6 +23,7 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 #[must_use = "keep the logging guard alive until the service has drained"]
 pub struct LoggingGuard {
     workers: Vec<WorkerGuard>,
+    _trace: adx_observability::trace::TraceGuard,
 }
 
 impl LoggingGuard {
@@ -43,6 +44,8 @@ pub fn init(
     edge_component: bool,
 ) -> Result<LoggingGuard, Box<dyn std::error::Error>> {
     let config = LoggingConfig::from_env()?;
+    let trace = adx_observability::trace::init(component)
+        .map_err(|e| -> Box<dyn std::error::Error> { e })?;
     if adx_observability::json_enabled().map_err(|e| -> Box<dyn std::error::Error> { e })? {
         if config.directory.is_some() {
             return Err("JSON logging uses stdout; leave ADX_DATA_PLANE_LOG_DIR unset".into());
@@ -71,6 +74,7 @@ pub fn init(
             .try_init()?;
         return Ok(LoggingGuard {
             workers: Vec::new(),
+            _trace: trace,
         });
     }
     let mut workers = Vec::new();
@@ -156,7 +160,10 @@ pub fn init(
         .with(file_layer)
         .with(access_layer)
         .try_init()?;
-    Ok(LoggingGuard { workers })
+    Ok(LoggingGuard {
+        workers,
+        _trace: trace,
+    })
 }
 
 fn include_general_log_target(

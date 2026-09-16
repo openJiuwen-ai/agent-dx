@@ -46,6 +46,8 @@ fn default_ttl() -> u64 {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     adx_observability::init().map_err(|e| -> Box<dyn std::error::Error> { e })?;
+    let _trace = adx_observability::trace::init("adx-master")
+        .map_err(|e| -> Box<dyn std::error::Error> { e })?;
     let c: Config = read_config()?;
     if c.heartbeat_timeout_seconds == 0 || c.discovery_ttl_seconds < 3 {
         return Err("positive heartbeat timeout and discovery TTL >= 3 required".into());

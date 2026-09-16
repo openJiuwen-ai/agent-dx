@@ -54,6 +54,7 @@ def setup(node):
     (P/'collector-state').mkdir(exist_ok=True)
     (P/'state/logs').mkdir(parents=True,exist_ok=True)
     config=json.loads(Path('/opt/adx/observability/collector.json').read_text())
+    config['receivers']['otlp']['protocols']['http']['endpoint']='0.0.0.0:14317'
     env={'ADX_LOG_DIR':str(P/'state/logs'),'ADX_NODE_ID':node,'ADX_COLLECTOR_STATE':str(P/'collector-state'),'ADX_OTLP_ENDPOINT':'http://127.0.0.1:14318'}
     text=json.dumps(config)
     for key,value in env.items():text=text.replace('${env:'+key+'}',value)
@@ -71,7 +72,7 @@ def run():
         def do_POST(self):
             data=self.rfile.read(int(self.headers.get('Content-Length','0')))
             if self.headers.get('Content-Encoding')=='gzip':data=gzip.decompress(data)
-            if self.path!='/v1/logs':self.send_error(404);return
+            if self.path not in ('/v1/logs','/v1/traces'):self.send_error(404);return
             if (P/'sink-paused').exists():
                 (D/'collector-backend-unavailable').write_text('observed')
                 self.send_error(503);return
@@ -79,7 +80,8 @@ def run():
                 (D/'collector-secret-leak').write_text('credential found before collection storage')
                 self.send_error(400);return
             batch=json.loads(data)
-            with lock, BATCHES.open('a') as f:
+            destination=BATCHES if self.path=='/v1/logs' else D/'collected-traces.jsonl'
+            with lock, destination.open('a') as f:
                 f.write(json.dumps(batch)+'\n');f.flush()
             self.send_response(200);self.send_header('Content-Type','application/json');self.end_headers();self.wfile.write(b'{}')
     server=http.server.ThreadingHTTPServer(('127.0.0.1',14318),Handler)
@@ -133,6 +135,47 @@ def outage(node, start):
             (D/'collector-metrics.txt').write_bytes(response.read())
         print('[COLLECTION PASS] public SDK lifecycle succeeded during backend outage: '+node,flush=True)
 
+def trace_records():
+    path=D/'collected-traces.jsonl'
+    rows=[]
+    if not path.exists():return rows
+    for line in path.read_text().splitlines():
+        try:batch=json.loads(line)
+        except json.JSONDecodeError:continue # Writer may be appending the last batch.
+        for resource in batch.get('resourceSpans',[]):
+            attrs={a['key']:any_value(a['value']) for a in resource.get('resource',{}).get('attributes',[])}
+            for scope in resource.get('scopeSpans',[]):
+                rows.extend({**span,'service':attrs.get('service.name')} for span in scope.get('spans',[]))
+    return list({(s['traceId'],s['spanId']):s for s in rows}.values())
+
+def check_trace_links(rows):
+    index={(s['traceId'],s['spanId']):s for s in rows}
+    executions=[s for s in rows if s['name']=='instance.execute']
+    assert executions,'instance execution spans missing'
+    for span in executions:
+        parent=index.get((span['traceId'],span.get('parentSpanId')))
+        assert parent and parent['name']=='instance.queue','queue parent missing or belongs to another trace'
+    return len(executions)
+
+def validate_traces(node):
+    rows=trace_records()
+    count=check_trace_links(rows)
+    services={s['service'] for s in rows}
+    assert 'adx-node-manager' in services,services
+    assert any(s['name']=='rrt.http' and s.get('parentSpanId','').strip('0') for s in rows),'RRT did not receive data request context'
+    trace_ids=[]
+    if node=='node1':
+        names={'edge.http','sandbox-api.http','master.create_instance','node.create_instance','instance.queue','instance.execute','master.commit_instance'}
+        groups={}
+        for span in rows:groups.setdefault(span['traceId'],set()).add(span['name'])
+        trace_ids=[key for key,value in groups.items() if names <= value]
+        assert trace_ids,'no complete Edge/API/Master/Node/state-commit creation trace'
+        assert any(s['name']=='node.delete_instance' for s in rows),'delete trace missing'
+    result={'status':'passed','span_count':len(rows),'services':sorted(services),'instance_executions':count,'complete_create_trace_ids':trace_ids,'rrt_context_received':True}
+    (E/f'traces-{node}.json').write_text(json.dumps(result,indent=2))
+    print(f'[TRACE PASS] {node}: {len(rows)} spans; {count} queue/execution parent links; RRT context received',flush=True)
+
+
 def validate(node):
     node_context(node)
     wait(lambda:(P/'collector-starts').exists(),'collector never started')
@@ -166,6 +209,7 @@ def validate(node):
     assert 'Running' in states and 'Deleted' in states, states
     assert not (D/'collector-secret-leak').exists(),'credential leaked into log pipeline'
     assert json.loads((D/'business-outage.json').read_text())['sdk_lifecycle_passed']
+    validate_traces(node)
     result={'status':'passed','sdk_during_backend_outage':True,'probe_records':40,'unique_probe_records':40,'collector_restarted':True,'backend_failure_recovered':True,'services':sorted(services),'structured_services':sorted(structured),'instance_states':sorted(s for s in states if s),'credentials_absent':True}
     (E/f'collection-{node}.json').write_text(json.dumps(result,indent=2))
     print(f'[COLLECTION PASS] {node}: 40/40 unique records after rotation, backend outage and Collector restart; service logs received',flush=True)

@@ -286,6 +286,27 @@ impl NodeProxy {
     async fn handle(
         &self,
         request: Request<h2::RecvStream>,
+        respond: SendResponse<Bytes>,
+        connection_closed: watch::Receiver<()>,
+    ) {
+        let trace = adx_observability::trace::Trace::remote(
+            "node-proxy.connect",
+            request
+                .headers()
+                .get("traceparent")
+                .and_then(|v| v.to_str().ok()),
+            request
+                .headers()
+                .get("tracestate")
+                .and_then(|v| v.to_str().ok()),
+        );
+        trace
+            .run(self.handle_inner(request, respond, connection_closed))
+            .await;
+    }
+    async fn handle_inner(
+        &self,
+        request: Request<h2::RecvStream>,
         mut respond: SendResponse<Bytes>,
         mut connection_closed: watch::Receiver<()>,
     ) {

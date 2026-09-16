@@ -5,3 +5,11 @@ edition = "2021"
 [dependencies]
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+opentelemetry = { version = "0.31", default-features = false, features = ["trace", "futures"] }
+opentelemetry_sdk = { version = "0.31", default-features = false, features = ["trace", "internal-logs"] }
+opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client", "reqwest-rustls"] }
+tonic = { version = "0.12", default-features = false, features = ["codegen"] }
+http = "1"
+[dev-dependencies]
+opentelemetry_sdk = { version = "0.31", features = ["testing"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }

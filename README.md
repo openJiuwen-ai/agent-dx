@@ -62,4 +62,4 @@ Reusable snapshot creation, cloning into new Instances, catalog queries and defe
 
 租户凭证的创建、查询、吊销及缓存契约见 [API Key 管理](docs/testing/api-key-management.md)。
 
-可观测： [实例与资源指标](docs/testing/instance-resource-metrics.md) · [组件日志采集](docs/testing/log-collection.md) · [日志滚动压缩](docs/testing/log-rotation.md)。
+可观测： [实例与资源指标](docs/testing/instance-resource-metrics.md) · [组件日志采集](docs/testing/log-collection.md) · [跨组件Trace](docs/testing/distributed-traces.md) · [日志滚动压缩](docs/testing/log-rotation.md)。

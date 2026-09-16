@@ -164,4 +164,4 @@ an isolated Kubernetes Pod and publishes deployment, per-case, JUnit and cleanup
 evidence. See [runtime kit and invocation](../build/e2e/firecracker/README.md).
 The existing basic E2E result alone does not count as this profile passing.
 
-组件日志采集验收复用现有 Edge/Node Proxy 指标端点，并通过真实 OpenTelemetry Collector 接收结构化组件日志。stop 组包含后端 503、文件滚动与 Collector 重启，控制台输出 `[METRICS PASS]` / `[COLLECTION PASS]`；产物含 `gateway-metrics-node*.json`、`collection-node*.json`、`collected-logs.jsonl` 和 `collector-process.log`。部署及保证边界见 `docs/testing/log-collection.md`；Trace 仍为后续增量。
+组件日志采集验收复用现有 Edge/Node Proxy 指标端点，并通过真实 OpenTelemetry Collector 接收结构化组件日志。stop 组包含后端 503、文件滚动与 Collector 重启，控制台输出 `[METRICS PASS]` / `[COLLECTION PASS]`；产物含 `gateway-metrics-node*.json`、`collection-node*.json`、`collected-logs.jsonl` 和 `collector-process.log`。部署及保证边界见 `docs/testing/log-collection.md`。Trace验收输出 `[TRACE PASS]`，保存 `traces-node*.json` 与 `collected-traces.jsonl`，检查完整创建链路和实例队列父子关系；配置见 `docs/testing/distributed-traces.md`。

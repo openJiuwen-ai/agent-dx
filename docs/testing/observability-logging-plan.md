@@ -1,6 +1,6 @@
 # 可观测与日志能力规划
 
-2026-09-16新增需求，状态：首批实例资源Metrics已验收；日志滚动压缩已验收，组件日志采集正在验收，Trace待实施。内部以Instance为统计对象。先交付实例数量与资源分配Metrics，再完善日志采集和Trace；日志滚动压缩单独验收。
+2026-09-16新增需求，状态：首批实例资源Metrics与日志滚动压缩已验收；组件日志采集和Trace已通过本地双节点验收，正式K8s等待CI制品下载问题解决。内部以Instance为统计对象。
 
 ## 当前基础
 
@@ -40,9 +40,9 @@
 
 ### 阶段8B的模块落点与首轮测试
 
-组件日志新增 `platform/crates/observability` 初始化入口；现有Go兼容HTTP层可读取部分 `traceparent` 字段，但新内部RPC、Domain队列与Node Manager实例任务尚未形成分布式Trace。`InstanceHandle` 当前发送 `(Command, Reply)`，下一增量需要由命令封装显式携带每次请求的上下文，不能依赖接收任务的线程局部状态。
+`platform/crates/observability` 已接入OpenTelemetry；Go HTTP/gRPC、Master创建/提交任务、Node Manager每实例队列、Gateway和RRT HTTP均已接线。InstanceHandle通过命令封装显式携带Span，标准Future上下文只在poll期间附着。组件与真实采集证据见[本地Trace验收](2026-09-16-trace-acceptance.md)。
 
-下表为Trace后续实施计划，尚不代表已接入：
+Trace配置与当前接线见[跨组件Trace](distributed-traces.md)。下表列出模块职责，真实采集验收单独记录：
 
 | 当前模块 | 下一步职责 |
 | --- | --- |
@@ -69,4 +69,4 @@
 
 ## 交付与状态维护
 
-交付指标清单、采集与部署说明、统一日志配置、测试与验收报告。进度页独立事项来自 `control-plane-remaining.json`，阶段8保持进行中（日志采集正在正式验收、Trace待实现），阶段9已完成本地与基础K8s验收；首批Metrics事项已标记完成。
+交付指标清单、采集与部署说明、统一日志配置、测试与验收报告。进度页独立事项来自 `control-plane-remaining.json`，阶段8保持进行中（组件日志和Trace本地通过，正式K8s待验收），阶段9已完成本地与基础K8s验收；首批Metrics事项已标记完成。导出失败计数已接入Master和Node Manager；各语言统一的实时队列丢弃计数仍待补齐。

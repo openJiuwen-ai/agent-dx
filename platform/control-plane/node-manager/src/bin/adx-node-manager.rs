@@ -87,6 +87,8 @@ async fn sample(
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     adx_observability::init().map_err(|e| -> Box<dyn std::error::Error> { e })?;
+    let _trace = adx_observability::trace::init("adx-node-manager")
+        .map_err(|e| -> Box<dyn std::error::Error> { e })?;
     let c: Config = read_config()?;
     c.checkpoint_gc.validate()?;
     let _logging_guard = if c.proxy_mode == adx_node_manager::proxy::ProxyMode::Embedded {

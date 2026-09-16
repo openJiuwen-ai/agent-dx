@@ -64,6 +64,7 @@ impl Metrics {
 impl NodeManager {
     pub fn metrics(&self) -> String {
         let mut output = self.services.metrics.render();
+        output.push_str(&adx_observability::trace::metrics());
         let lifecycle_ready =
             self.lifecycle_ready.try_read().is_ok_and(|ready| *ready) && !self.is_draining();
         let admission = self.services.admission.lock().unwrap();

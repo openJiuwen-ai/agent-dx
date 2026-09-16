@@ -61,7 +61,7 @@ class BuildSummaryTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,'Collector'):
                 summary.collect(root,'e2e',0,COMMIT)
             for node in ('node1','node2'):
-                for kind in ('collection','gateway-metrics'):
+                for kind in ('collection','gateway-metrics','traces'):
                     write(root,f'acceptance/{node}/{kind}-{node}.json',{'status':'passed'})
             self.assertEqual(summary.collect(root,'e2e',0,COMMIT)['e2e']['collection']['node2']['collection']['status'],'passed')
 
