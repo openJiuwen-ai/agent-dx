@@ -57,7 +57,8 @@ and known credential values are redacted before writing or streaming output.
 
 Each scenario emits RUN, PASS/FAIL and elapsed time. Its child-process output is
 streamed without buffering, including SDK instance IDs, command/file assertions,
-authentication checks, capacity wait/resume and restart recovery checks.
-`case-results.json` retains per-case outcomes and duration; JUnit lists all five
+authentication checks, capacity wait/resume, placement rules with expected/actual
+node assignments, and restart recovery checks.
+`case-results.json` retains per-case outcomes and duration; JUnit lists all seven
 scenarios separately, with unexecuted scenarios marked skipped and cleanup
 reported independently. A failed command or timeout still fails the acceptance.

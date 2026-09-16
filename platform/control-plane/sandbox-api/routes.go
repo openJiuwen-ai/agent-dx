@@ -26,6 +26,7 @@ func RegisterRoutes(r gin.IRouter, dependencies backend.Dependencies) error {
 		return err
 	}
 	r = r.Group("", authenticate(dependencies))
+	registerCredentialRoutes(r)
 	r.GET("/api/instances", instanceSummary)
 	legacy := r.Group("/api/sandbox")
 	legacy.POST("/create", sandbox.CreateHandler)

@@ -30,10 +30,17 @@ impl ActivitySnapshot {
     }
 }
 
+#[derive(Default)]
+struct Count {
+    active: u64,
+    revision: u64,
+    retired: bool,
+}
+
 #[derive(Clone)]
 pub struct ActivityTracker {
     proxy_session_id: String,
-    count_shards: Arc<Vec<Mutex<HashMap<String, u64>>>>,
+    count_shards: Arc<Vec<Mutex<HashMap<String, Count>>>>,
     changed: Arc<Notify>,
     last_sequence: Arc<AtomicU64>,
 }
@@ -74,8 +81,8 @@ impl ActivityTracker {
             activities.extend(
                 counts
                     .iter()
-                    .filter(|(_, count)| **count > 0)
-                    .map(|(instance_id, count)| ActivitySnapshot::new(instance_id, *count)),
+                    .filter(|(_, count)| count.active > 0)
+                    .map(|(instance_id, count)| ActivitySnapshot::new(instance_id, count.active)),
             );
         }
         activities.sort_by(|left, right| left.instance_id.cmp(&right.instance_id));
@@ -94,20 +101,51 @@ impl ActivityTracker {
             .count_shard(instance_id)
             .lock()
             .expect("activity tracker mutex poisoned");
-        let entry = counts.entry(instance_id.to_owned()).or_insert(0);
+        let entry = counts.entry(instance_id.to_owned()).or_default();
         if delta > 0 {
-            *entry = entry.saturating_add(delta as u64);
+            entry.active = entry.active.saturating_add(delta as u64);
         } else {
-            *entry = entry.saturating_sub((-delta) as u64);
+            entry.active = entry.active.saturating_sub((-delta) as u64);
         }
-        if *entry == 0 {
+        entry.revision = entry.revision.saturating_add(1);
+        if entry.active == 0 && entry.retired {
             counts.remove(instance_id);
         }
         drop(counts);
         self.changed.notify_one();
     }
 
-    fn count_shard(&self, instance_id: &str) -> &Mutex<HashMap<String, u64>> {
+    pub fn observe(&self, instance_id: &str) -> (u64, u64) {
+        let counts = self
+            .count_shard(instance_id)
+            .lock()
+            .expect("activity tracker mutex poisoned");
+        counts
+            .get(instance_id)
+            .map(|v| (v.revision, v.active))
+            .unwrap_or((0, 0))
+    }
+    pub fn retire(&self, instance_id: &str) {
+        let mut counts = self
+            .count_shard(instance_id)
+            .lock()
+            .expect("activity tracker mutex poisoned");
+        if let Some(count) = counts.get_mut(instance_id) {
+            count.retired = true;
+            if count.active == 0 {
+                counts.remove(instance_id);
+            }
+        }
+    }
+    pub fn register(&self, instance_id: &str) {
+        let mut counts = self
+            .count_shard(instance_id)
+            .lock()
+            .expect("activity tracker mutex poisoned");
+        counts.entry(instance_id.to_string()).or_default().retired = false;
+    }
+
+    fn count_shard(&self, instance_id: &str) -> &Mutex<HashMap<String, Count>> {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         instance_id.hash(&mut hasher);
         &self.count_shards[hasher.finish() as usize % self.count_shards.len()]

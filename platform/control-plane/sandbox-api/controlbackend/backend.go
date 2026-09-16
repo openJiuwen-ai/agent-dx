@@ -40,14 +40,15 @@ type Backend struct {
 	cache  map[string]*entry
 	lru    *list.List
 	// Only in-flight deletes are retained here. Their target cannot change after an ambiguous reply.
-	deletes map[string]*operation
+	deletes     map[string]*operation
+	checkpoints map[string]*checkpointOperation
 }
 
 func New(master pb.MasterServiceClient, dial NodeDialer, config Config) (*Backend, error) {
 	if master == nil || dial == nil || config.CacheTTL <= 0 || config.CacheEntries <= 0 || config.RPCTimeout <= 0 {
 		return nil, status.Error(codes.InvalidArgument, "backend clients and positive cache/RPC bounds required")
 	}
-	return &Backend{master: master, dial: dial, config: config, cache: map[string]*entry{}, lru: list.New(), deletes: map[string]*operation{}}, nil
+	return &Backend{master: master, dial: dial, config: config, cache: map[string]*entry{}, lru: list.New(), deletes: map[string]*operation{}, checkpoints: map[string]*checkpointOperation{}}, nil
 }
 func caller(ctx context.Context) (*pb.CallerContext, error) {
 	i, ok := backend.IdentityFromContext(ctx)
@@ -153,6 +154,9 @@ func (b *Backend) Invoke(backend.Request) ([]byte, error) {
 	return nil, status.Error(codes.Unimplemented, "use the RRT HTTP data endpoint")
 }
 func (b *Backend) Lifecycle(r backend.LifecycleRequest) (backend.LifecycleResponse, error) {
+	if r.Signal == 18 || r.Signal == 19 {
+		return b.checkpoint(r)
+	}
 	if r.Signal != httpx.KillSignalVal {
 		return backend.LifecycleResponse{}, status.Error(codes.Unimplemented, "lifecycle operation is not connected yet")
 	}

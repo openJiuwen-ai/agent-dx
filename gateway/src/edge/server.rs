@@ -1494,7 +1494,8 @@ async fn run_downstream_watch<S>(
                         }
                     }
                     tokio_tungstenite::tungstenite::Message::Ping(payload) => {
-                        if websocket.send(tokio_tungstenite::tungstenite::Message::Pong(payload)).await.is_err() { break; }
+                        let reply = websocket.send(tokio_tungstenite::tungstenite::Message::Pong(payload)).await;
+                        if reply.is_err() { break; }
                     }
                     tokio_tungstenite::tungstenite::Message::Close(_) => break,
                     _ => {}

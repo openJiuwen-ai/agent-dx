@@ -51,6 +51,7 @@ const (
 
 // Affinity -
 type Affinity struct {
+	Weight                   int64 `json:"weight,omitempty"`
 	Kind                     AffinityKindType
 	Affinity                 AffinityType
 	PreferredPriority        bool

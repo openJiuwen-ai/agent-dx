@@ -7,7 +7,7 @@ use std::time::Duration;
 use thiserror::Error;
 
 pub const EDGE_FRONTEND_ETCD_ENDPOINTS_ENV: &str = "ADX_DATA_PLANE_EDGE_FRONTEND_ETCD_ENDPOINTS";
-pub const DEFAULT_CONTROL_PLANE_ROUTES: &str = "exact:/,exact:/healthz,prefix:/terminal,prefix:/api/instances,prefix:/api/jobs,prefix:/api/sandbox,prefix:/functions,prefix:/api-docs,prefix:/admin/v1/functions,prefix:/serverless/v1/functions,prefix:/serverless/v1/stream,prefix:/serverless/v1/componentshealth,prefix:/serverless/v1/posix,prefix:/frontend/v1/instance,prefix:/datasystem/v1,prefix:/serverless/v2,prefix:/app/v1,prefix:/client/v1/lease,prefix:/invocations,prefix:/global-scheduler";
+pub const DEFAULT_CONTROL_PLANE_ROUTES: &str = "exact:/,exact:/healthz,prefix:/terminal,prefix:/api/instances,prefix:/api/admin/v1/keys,prefix:/api/jobs,prefix:/api/sandbox,prefix:/functions,prefix:/api-docs,prefix:/admin/v1/functions,prefix:/serverless/v1/functions,prefix:/serverless/v1/stream,prefix:/serverless/v1/componentshealth,prefix:/serverless/v1/posix,prefix:/frontend/v1/instance,prefix:/datasystem/v1,prefix:/serverless/v2,prefix:/app/v1,prefix:/client/v1/lease,prefix:/invocations,prefix:/global-scheduler";
 
 /// Strongly typed process configuration for the Edge Frontend.
 ///

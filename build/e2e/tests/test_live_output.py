@@ -85,6 +85,6 @@ class LiveOutputTests(unittest.TestCase):
                       'error': 'auth failed', 'cleanup_errors': ['namespace remains']}
             module.write_junit(path, report)
             suite = ET.parse(path).getroot()
-            self.assertEqual(suite.attrib, {'name': 'platform-kubernetes-e2e', 'tests': '6', 'failures': '2', 'skipped': '3'})
+            self.assertEqual(suite.attrib, {'name': 'platform-kubernetes-e2e', 'tests': '8', 'failures': '2', 'skipped': '5'})
             self.assertIsNotNone(suite.find("testcase[@name='auth']/failure"))
             self.assertIsNotNone(suite.find("testcase[@name='cleanup']/failure"))

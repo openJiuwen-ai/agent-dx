@@ -40,7 +40,11 @@ impl RuntimeBackend for Runtime {
 }
 fn record() -> InstanceRecord {
     InstanceRecord {
+        restart_attempts: 0,
+        restart_pending: false,
         spec: InstanceSpec {
+            snapshot_id: None,
+            lifecycle: Default::default(),
             env: Default::default(),
             scheduling: Default::default(),
             id: "i".into(),
@@ -66,6 +70,8 @@ fn record() -> InstanceRecord {
         runtime_id: "i-1".into(),
         resources_held: true,
         runtime_ip: Some("127.0.0.1".parse().unwrap()),
+        checkpoint: None,
+        last_operation: None,
     }
 }
 struct Server(tokio::task::JoinHandle<()>);

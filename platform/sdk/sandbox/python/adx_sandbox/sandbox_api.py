@@ -15,6 +15,7 @@ from urllib.parse import urlparse
 
 from ._transport import SandboxClient, SandboxError
 from .commands import Commands
+from .scheduling import encode_affinities, instance_labels
 from .filesystem import Filesystem
 from .pty import Pty
 from .shell import Shells
@@ -27,6 +28,7 @@ from .types import (
     PauseResult,
     PortForwarding,
     ResumeResult,
+    RestartPolicy,
     S3Config,
     SandboxInfo,
     SnapshotInfo,
@@ -38,10 +40,6 @@ DEFAULT_SCHEDULE_TIMEOUT = 30
 _INIT_CALL_TIMEOUT = 30
 CREATE_TIMEOUT_BUFFER = 30
 _CREATE_TIMEOUT_RESERVE = _INIT_CALL_TIMEOUT + CREATE_TIMEOUT_BUFFER
-_AFFINITY_KIND_RESOURCE = 0
-_AFFINITY_REQUIRED = 2
-_LABEL_OPERATION_IN = 0
-_NODE_ID_LABEL = "NODE_ID"
 _SUPPORTED_XPU_TYPES = frozenset({"gpu", "npu"})
 _SNAPSHOT_RESOURCE_FIELDS = frozenset(
     {"cpu", "memory", "cpu_limit", "mem_limit"}
@@ -203,7 +201,8 @@ class Sandbox:
         """Create a new sandbox by restoring a READY reusable Snapshot.
 
         Resource fields omitted from ``kwargs`` are inherited from the
-        Snapshot. Explicit resource fields override the Snapshot template.
+        Snapshot. Explicit resource fields must be compatible with its runtime;
+        the current Firecracker backend requires the original resource geometry.
         """
         value = (
             snapshot_id.snapshot_id
@@ -261,10 +260,10 @@ class Sandbox:
         client.delete_snapshot(snapshot_id)
 
     @classmethod
-    def get_snapshot(cls, snapshot_id: str) -> SnapshotInfo:
+    def get_snapshot(cls, snapshot_id: str, *, connection: Optional[ConnectionConfig] = None) -> SnapshotInfo:
         if not isinstance(snapshot_id, str) or not snapshot_id.strip():
             raise ValueError("snapshot_id must be a non-empty string")
-        client = SandboxClient()
+        client = SandboxClient(connection=connection) if connection is not None else SandboxClient()
         try:
             return cls._get_snapshot(client, snapshot_id.strip())
         finally:
@@ -277,6 +276,7 @@ class Sandbox:
         name: Optional[str] = None,
         page_token: Optional[str] = None,
         page_size: Optional[int] = None,
+        connection: Optional[ConnectionConfig] = None,
     ) -> Tuple[List[SnapshotInfo], str]:
         if name is not None and (
             not isinstance(name, str) or not name.strip()
@@ -289,7 +289,7 @@ class Sandbox:
                 raise TypeError("page_size must be an integer or None")
             if page_size <= 0:
                 raise ValueError("page_size must be greater than 0")
-        client = SandboxClient()
+        client = SandboxClient(connection=connection) if connection is not None else SandboxClient()
         try:
             return cls._list_snapshots(
                 client,
@@ -301,10 +301,10 @@ class Sandbox:
             client.close()
 
     @classmethod
-    def delete_snapshot(cls, snapshot_id: str) -> None:
+    def delete_snapshot(cls, snapshot_id: str, *, connection: Optional[ConnectionConfig] = None) -> None:
         if not isinstance(snapshot_id, str) or not snapshot_id.strip():
             raise ValueError("snapshot_id must be a non-empty string")
-        client = SandboxClient()
+        client = SandboxClient(connection=connection) if connection is not None else SandboxClient()
         try:
             cls._delete_snapshot(client, snapshot_id.strip())
         finally:
@@ -314,7 +314,7 @@ class Sandbox:
         self,
         image: Optional[str] = None,
         rootfs: Optional[S3Config] = None,
-        runtime: str = "runsc",
+        runtime: Optional[str] = None,
         cpu: int = 1000,
         memory: int = 4096,
         cpu_limit: int = 0,
@@ -332,7 +332,10 @@ class Sandbox:
         detached: bool = False,
         node_id: Optional[str] = None,
         *,
+        labels: Optional[Dict[str, str]] = None,
+        schedule_affinities: Optional[List[Dict[str, Any]]] = None,
         snapshot_id: Optional[str] = None,
+        restart_policy: Optional[RestartPolicy] = None,
         failover: bool = False,
         inherit_entrypoint: bool = False,
         xpu: Optional[str] = None,
@@ -357,6 +360,7 @@ class Sandbox:
             cpu_limit: CPU cgroup limit in milli-cores (0 = same as *cpu*).
             mem_limit: Memory cgroup limit in MB (0 = same as *memory*).
             idle_timeout: Seconds before idle sandbox is reclaimed (default 300).
+            restart_policy: Optional bounded node-local restart after an unexpected exit.
             create_timeout: Logical create budget in seconds. By default it is
                 derived as ``schedule_timeout + 60``. An
                 ``ADX_SANDBOX_CREATE_TIMEOUT`` value or a legacy explicit pair
@@ -538,10 +542,14 @@ class Sandbox:
             "createTimeoutSeconds": resolved_create_timeout,
             "scheduleTimeoutSeconds": resolved_schedule_timeout,
             "initCallTimeoutSeconds": _INIT_CALL_TIMEOUT,
-            "rootfs": {"runtime": runtime},
+            "rootfs": ({"runtime": runtime or "runsc"} if runtime is not None or snapshot_id is None else {}),
         }
         if body["snapshotId"] is None:
             del body["snapshotId"]
+        if restart_policy is not None:
+            if not isinstance(restart_policy, RestartPolicy):
+                raise TypeError("restart_policy must be a RestartPolicy")
+            body["restartPolicy"] = restart_policy.to_dict()
         if inherit_entrypoint:
             body["inheritEntrypoint"] = True
         if image:
@@ -582,20 +590,11 @@ class Sandbox:
         body["storage_limit_mb"] = storage_limit_mb
         if env:
             body["env"] = dict(env)
-        if node_id:
-            body["scheduleAffinities"] = [
-                {
-                    "kind": _AFFINITY_KIND_RESOURCE,
-                    "affinity": _AFFINITY_REQUIRED,
-                    "labelOps": [
-                        {
-                            "type": _LABEL_OPERATION_IN,
-                            "labelKey": _NODE_ID_LABEL,
-                            "labelValues": [node_id],
-                        }
-                    ],
-                }
-            ]
+        placement = encode_affinities(schedule_affinities, node_id)
+        if placement:
+            body["scheduleAffinities"] = placement
+        if labels is not None:
+            body["labels"] = instance_labels(labels)
         if mount_list:
             body["mounts"] = [mount.to_dict() for mount in mount_list]
         if network is not None and not network.is_empty:
@@ -624,7 +623,7 @@ class Sandbox:
         # Frontend owns RRT_HTTP_PORT=50090 and its sandbox network mapping for
         # /direct. SDK callers should not expose that internal control port.
         if connection is None:
-            self._client = SandboxClient()
+            self._client = SandboxClient(connection=connection) if connection is not None else SandboxClient()
         else:
             self._client = SandboxClient(connection=connection)
         self._connection = connection

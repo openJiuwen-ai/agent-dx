@@ -8,6 +8,8 @@ use std::sync::{
 
 fn spec(id: &str) -> InstanceSpec {
     InstanceSpec {
+        snapshot_id: None,
+        lifecycle: Default::default(),
         env: Default::default(),
         scheduling: Default::default(),
         id: id.into(),

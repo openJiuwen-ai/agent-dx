@@ -80,3 +80,62 @@ fn remote_redis_requires_private_password_configuration() {
     std::fs::write(password, "invalid\nrequirepass injected").unwrap();
     assert!(d.render(&root.path().join("bad")).is_err());
 }
+
+#[test]
+fn embedded_proxy_has_one_socket_owner_and_matches_control_path() {
+    let root = tempfile::tempdir().unwrap();
+    let mut d = config(root.path());
+    let dir = root.path().join("proxy");
+    d.services[0].config["proxy_mode"] = json!("embedded");
+    d.services[0].config["proxy_socket"] = json!(dir.join("route.sock"));
+    d.services[0].env.insert(
+        "ADX_DATA_PLANE_NODE_PROXY_ACTIVITY_UDS_DIR".into(),
+        dir.to_string_lossy().into_owned(),
+    );
+    d.validate().unwrap();
+    d.services.push(serde_json::from_value(json!({"id":"proxy","role":"node-proxy","config":{},"env":{"ADX_DATA_PLANE_NODE_PROXY_ACTIVITY_UDS_DIR":dir}})).unwrap());
+    assert!(
+        d.validate().is_err(),
+        "two services cannot own the same binding socket"
+    );
+    d.services.pop();
+    d.services[0].config["proxy_socket"] = json!(root.path().join("different.sock"));
+    assert!(
+        d.validate().is_err(),
+        "embedded proxy must serve the configured binding path"
+    );
+    d.services[0].config["proxy_mode"] = json!("invalid");
+    assert!(d.validate().is_err());
+}
+
+#[test]
+fn sandbox_api_discovery_defaults_and_overrides_are_usable() {
+    let root = tempfile::tempdir().unwrap();
+    let mut d: Deployment = serde_json::from_str(include_str!(
+        "../../../../build/config/examples/deployment.json"
+    ))
+    .unwrap();
+    d.state_dir = root.path().to_owned();
+    d.render(&root.path().join("defaults")).unwrap();
+    let generated: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(root.path().join("defaults/sandbox-api.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(generated["discovery"]["poll_seconds"], 5);
+    let api = d
+        .services
+        .iter()
+        .position(|s| s.role == Role::SandboxApi)
+        .unwrap();
+    d.services[api].config["discovery"] = json!({"poll_seconds": 2});
+    d.render(&root.path().join("override")).unwrap();
+    let generated: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(root.path().join("override/sandbox-api.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(generated["discovery"]["poll_seconds"], 2);
+    for invalid in [json!(0), json!(-1), json!("5"), json!(null), json!(86401)] {
+        d.services[api].config["discovery"]["poll_seconds"] = invalid;
+        assert!(d.validate().is_err());
+    }
+}

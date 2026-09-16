@@ -18,6 +18,8 @@ fn weighted(name: &'static str, value: u32, weight: u32) -> WeightedScore {
 }
 fn request() -> InstanceSpec {
     InstanceSpec {
+        snapshot_id: None,
+        lifecycle: Default::default(),
         env: Default::default(),
         scheduling: Default::default(),
         id: "i".into(),
@@ -74,6 +76,7 @@ fn builtin_profile_exposes_actual_static_registration() {
             "resource-fit",
             "device-fit",
             "node-affinity",
+            "placement-groups",
             "instance-affinity",
             "topology-spread"
         ]
@@ -81,6 +84,7 @@ fn builtin_profile_exposes_actual_static_registration() {
     assert_eq!(
         framework.score_weights(),
         [
+            ("placement-group-preference", 1),
             ("resource-balance", 1),
             ("node-preference", 1),
             ("instance-preference", 1),

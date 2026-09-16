@@ -154,6 +154,7 @@ impl Deployment {
         }
         let mut ids = BTreeSet::new();
         let mut sockets = BTreeSet::new();
+        let mut proxy_owners = BTreeSet::new();
         for s in &self.services {
             if s.id.is_empty()
                 || !s
@@ -173,11 +174,54 @@ impl Deployment {
             {
                 return Err("discovery config must be an object".into());
             }
+            if s.role == Role::SandboxApi
+                && s.config
+                    .get("discovery")
+                    .and_then(|d| d.get("poll_seconds"))
+                    .is_some_and(|v| !v.as_u64().is_some_and(|n| n > 0 && n <= 86_400))
+            {
+                return Err(
+                    "Sandbox API discovery poll_seconds must be between 1 and 86400".into(),
+                );
+            }
             if s.env
                 .iter()
                 .any(|(k, v)| k.is_empty() || k.contains(['=', '\0']) || v.contains('\0'))
             {
                 return Err("invalid environment entry".into());
+            }
+            let embedded = if s.role == Role::NodeManager {
+                match s.config.get("proxy_mode") {
+                    None => false,
+                    Some(Value::String(mode)) if mode == "standalone" => false,
+                    Some(Value::String(mode)) if mode == "embedded" => true,
+                    _ => return Err("proxy_mode must be standalone or embedded".into()),
+                }
+            } else {
+                false
+            };
+            if s.role == Role::NodeProxy || embedded {
+                let dir = s
+                    .env
+                    .get("ADX_DATA_PLANE_NODE_PROXY_ACTIVITY_UDS_DIR")
+                    .filter(|d| !d.is_empty())
+                    .ok_or("Node Proxy control directory required")?;
+                let socket = Path::new(dir).join("route.sock");
+                if !socket.is_absolute()
+                    || socket.as_os_str().len() > 100
+                    || !proxy_owners.insert(socket.clone())
+                {
+                    return Err("unique absolute Node Proxy control socket required".into());
+                }
+                if embedded
+                    && s.config
+                        .get("proxy_socket")
+                        .and_then(Value::as_str)
+                        .map(Path::new)
+                        != Some(socket.as_path())
+                {
+                    return Err("embedded proxy_socket must match its control directory".into());
+                }
             }
             if s.role == Role::Redis {
                 RedisConfig::parse(&s.config)?;
@@ -236,6 +280,13 @@ impl Deployment {
                     config.as_object_mut().unwrap().remove("master_address");
                     config["discovery"]["redis_url"] = json!(self.redis_url);
                     config["discovery"]["namespace"] = json!(self.namespace);
+                    if s.role == Role::SandboxApi {
+                        config["discovery"]
+                            .as_object_mut()
+                            .unwrap()
+                            .entry("poll_seconds")
+                            .or_insert(json!(5));
+                    }
                     if s.role == Role::NodeManager {
                         let socket = self.admin_path(s);
                         config["admin_socket"] = json!(socket);

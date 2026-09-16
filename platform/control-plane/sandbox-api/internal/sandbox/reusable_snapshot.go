@@ -18,12 +18,13 @@ package sandbox
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
+	"gitcode.com/robbluo/agent-dx/platform/control-plane/sandbox-api/backend"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"net/http"
-	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -35,26 +36,11 @@ import (
 	"gitcode.com/robbluo/agent-dx/platform/control-plane/sandbox-api/internal/httpx"
 )
 
-const reusableSnapshotMasterPath = "/snap-manager/reusable-snapshots"
-
 const reusableSnapshotRequestTimeout = 30 * time.Second
 
 const (
 	sandboxCheckpointDefaultTimeoutSeconds = 300
 	sandboxCheckpointMaxTimeoutSeconds     = 3600
-)
-
-type reusableSnapshotMasterClient interface {
-	GetActiveMasterAddr() string
-}
-
-type reusableSnapshotDoer interface {
-	Do(*http.Request) (*http.Response, error)
-}
-
-var (
-	newReusableSnapshotMasterClient                      = func(ctx context.Context) reusableSnapshotMasterClient { return snapshotMasterEndpoint{ctx: ctx} }
-	reusableSnapshotHTTPClient      reusableSnapshotDoer = snapshotHTTPTransport{}
 )
 
 type reusableSnapshotCreateRequest struct {
@@ -133,114 +119,68 @@ func CreateReusableSnapshotV1Handler(ctx *gin.Context) {
 	}, http.StatusOK, nil)
 }
 
-// GetReusableSnapshotV1Handler returns one tenant-scoped reusable Snapshot.
+func catalog(ctx *gin.Context) (backend.SnapshotCatalog, context.Context, context.CancelFunc) {
+	request, cancel := context.WithTimeout(ctx.Request.Context(), reusableSnapshotRequestTimeout)
+	c := backend.Current(request).Snapshots
+	if c == nil {
+		setSandboxLifecycleError(ctx, status.Error(codes.Unavailable, "snapshot catalog unavailable"))
+	}
+	return c, request, cancel
+}
 func GetReusableSnapshotV1Handler(ctx *gin.Context) {
-	snapshotID := strings.TrimSpace(ctx.Param("snapshotID"))
-	if snapshotID == "" {
-		httpx.SetCtxResponse(ctx, nil, http.StatusBadRequest, errors.New("snapshotID is required"))
+	id := strings.TrimSpace(ctx.Param("snapshotID"))
+	if id == "" {
+		setSandboxLifecycleError(ctx, status.Error(codes.InvalidArgument, "snapshotID is required"))
 		return
 	}
-	query := url.Values{"snapshot_id": {snapshotID}}
-	proxyReusableSnapshotRequest(ctx, http.MethodGet, query)
-}
-
-// ListReusableSnapshotsV1Handler lists tenant-scoped reusable Snapshots.
-func ListReusableSnapshotsV1Handler(ctx *gin.Context) {
-	query := url.Values{}
-	if name := strings.TrimSpace(ctx.Query("name")); name != "" {
-		query.Set("name", name)
-	}
-	if pageToken := strings.TrimSpace(ctx.Query("pageToken")); pageToken != "" {
-		query.Set("pageToken", pageToken)
-	}
-	if pageSize := strings.TrimSpace(ctx.Query("pageSize")); pageSize != "" {
-		query.Set("pageSize", pageSize)
-	}
-	proxyReusableSnapshotRequest(ctx, http.MethodGet, query)
-}
-
-// DeleteReusableSnapshotV1Handler deletes one tenant-scoped reusable Snapshot.
-func DeleteReusableSnapshotV1Handler(ctx *gin.Context) {
-	snapshotID := strings.TrimSpace(ctx.Param("snapshotID"))
-	if snapshotID == "" {
-		httpx.SetCtxResponse(ctx, nil, http.StatusBadRequest, errors.New("snapshotID is required"))
-		return
-	}
-	requestID := strings.TrimSpace(ctx.GetHeader(sandboxLifecycleRequestIDHeader))
-	if requestID == "" {
-		httpx.SetCtxResponse(ctx, nil, http.StatusBadRequest,
-			fmt.Errorf("%s is required", sandboxLifecycleRequestIDHeader))
-		return
-	}
-	query := url.Values{"snapshot_id": {snapshotID}, "request_id": {requestID}}
-	proxyReusableSnapshotRequest(ctx, http.MethodDelete, query)
-}
-
-func proxyReusableSnapshotRequest(ctx *gin.Context, method string, query url.Values) {
-	activeMasterAddr := strings.TrimSpace(newReusableSnapshotMasterClient(ctx.Request.Context()).GetActiveMasterAddr())
-	if activeMasterAddr == "" {
-		httpx.SetCtxResponse(ctx, nil, http.StatusServiceUnavailable,
-			errors.New("active function master is unavailable"))
-		return
-	}
-	query.Set("tenant_id", reusableSnapshotTenant(ctx))
-	upstreamURL := normalizeReusableSnapshotMasterURL(activeMasterAddr) + reusableSnapshotMasterPath
-	requestCtx, cancel := context.WithTimeout(ctx.Request.Context(), reusableSnapshotRequestTimeout)
+	c, request, cancel := catalog(ctx)
 	defer cancel()
-	request, err := http.NewRequestWithContext(requestCtx, method,
-		upstreamURL+"?"+query.Encode(), nil)
-	if err != nil {
-		httpx.SetCtxResponse(ctx, nil, http.StatusInternalServerError, err)
+	if c == nil {
 		return
 	}
-	for _, header := range []string{
-		httpx.HeaderTraceID, httpx.HeaderTraceParent,
-		sandboxLifecycleRequestIDHeader, "Authorization", "X-Auth-Token",
-	} {
-		if value := ctx.GetHeader(header); value != "" {
-			request.Header.Set(header, value)
+	value, err := c.Get(request, id)
+	if err != nil {
+		setSandboxLifecycleError(ctx, err)
+		return
+	}
+	httpx.SetCtxResponse(ctx, value, http.StatusOK, nil)
+}
+func ListReusableSnapshotsV1Handler(ctx *gin.Context) {
+	var size uint64
+	if raw := ctx.Query("pageSize"); raw != "" {
+		var err error
+		size, err = strconv.ParseUint(raw, 10, 32)
+		if err != nil || size > 1000 {
+			setSandboxLifecycleError(ctx, status.Error(codes.InvalidArgument, "invalid pageSize"))
+			return
 		}
 	}
-	response, err := reusableSnapshotHTTPClient.Do(request)
+	c, request, cancel := catalog(ctx)
+	defer cancel()
+	if c == nil {
+		return
+	}
+	value, err := c.List(request, strings.TrimSpace(ctx.Query("name")), strings.TrimSpace(ctx.Query("pageToken")), uint32(size))
 	if err != nil {
-		httpx.SetCtxResponse(ctx, nil, http.StatusBadGateway,
-			fmt.Errorf("active function master request failed: %w", err))
+		setSandboxLifecycleError(ctx, err)
 		return
 	}
-	defer response.Body.Close()
-	body, err := io.ReadAll(response.Body)
-	if err != nil {
-		httpx.SetCtxResponse(ctx, nil, http.StatusBadGateway,
-			fmt.Errorf("active function master response failed: %w", err))
-		return
-	}
-	if response.StatusCode >= http.StatusBadRequest {
-		httpx.SetCtxResponse(ctx, nil, response.StatusCode,
-			fmt.Errorf("active function master rejected request: %s", strings.TrimSpace(string(body))))
-		return
-	}
-	var payload json.RawMessage = body
-	if !json.Valid(payload) {
-		httpx.SetCtxResponse(ctx, nil, http.StatusBadGateway,
-			errors.New("active function master returned invalid JSON"))
-		return
-	}
-	httpx.SetCtxResponse(ctx, payload, response.StatusCode, nil)
+	httpx.SetCtxResponse(ctx, value, http.StatusOK, nil)
 }
-
-func reusableSnapshotTenant(ctx *gin.Context) string {
-	if tenant := httpx.GetCompatibleGinHeader(ctx.Request, httpx.HeaderTenantID, "tenantId"); tenant != "" {
-		return tenant
+func DeleteReusableSnapshotV1Handler(ctx *gin.Context) {
+	id := strings.TrimSpace(ctx.Param("snapshotID"))
+	if id == "" || strings.TrimSpace(ctx.GetHeader(sandboxLifecycleRequestIDHeader)) == "" {
+		setSandboxLifecycleError(ctx, status.Error(codes.InvalidArgument, "snapshotID and request ID required"))
+		return
 	}
-	if tenant := tenantClaim(ctx.Request); tenant != "" {
-		return tenant
+	c, request, cancel := catalog(ctx)
+	defer cancel()
+	if c == nil {
+		return
 	}
-	return "default"
-}
-
-func normalizeReusableSnapshotMasterURL(addr string) string {
-	if strings.HasPrefix(addr, "http://") || strings.HasPrefix(addr, "https://") {
-		return strings.TrimRight(addr, "/")
+	if err := c.Delete(request, id); err != nil {
+		setSandboxLifecycleError(ctx, err)
+		return
 	}
-	return "http://" + strings.TrimRight(addr, "/")
+	httpx.SetCtxResponse(ctx, struct{}{}, http.StatusOK, nil)
 }

@@ -16,6 +16,29 @@ ADX_GET_DEFAULT_TIMEOUT = 300
 ADX_GET_TIMEOUT_BUFFER = 30
 
 
+@dataclass(frozen=True)
+class RestartPolicy:
+    """Bounded node-local restart after an unexpected runtime exit."""
+
+    max_attempts: int = 3
+    initial_backoff_seconds: int = 1
+    max_backoff_seconds: int = 30
+
+    def __post_init__(self):
+        for value, limit in ((self.max_attempts, (1 << 32) - 1),
+                             (self.initial_backoff_seconds, (1 << 64) - 1),
+                             (self.max_backoff_seconds, (1 << 64) - 1)):
+            if isinstance(value, bool) or not isinstance(value, int) or not 0 < value <= limit:
+                raise ValueError("restart limits must be positive integers within protocol bounds")
+        if self.initial_backoff_seconds > self.max_backoff_seconds:
+            raise ValueError("initial restart backoff must not exceed maximum backoff")
+
+    def to_dict(self) -> Dict[str, int]:
+        return {"maxAttempts": self.max_attempts,
+                "initialBackoffSeconds": self.initial_backoff_seconds,
+                "maxBackoffSeconds": self.max_backoff_seconds}
+
+
 _DNS_LABEL_PATTERN = re.compile(r"^[a-z0-9_-]+$")
 _NETWORK_ACTIONS = frozenset({"allow", "deny"})
 _NETWORK_DIRECTIONS = frozenset({"ingress", "egress", "both"})

@@ -14,6 +14,8 @@ key=PRIVATE/'api-key'
 if not key.exists(): key.write_text(secrets.token_hex(32)); key.chmod(0o600)
 other=PRIVATE/'other-key'
 if not other.exists(): other.write_text(secrets.token_hex(32)); other.chmod(0o600)
+admin=PRIVATE/'admin-key'
+if not admin.exists(): admin.write_text(secrets.token_hex(32)); admin.chmod(0o600)
 def tls(n,peers):return {'ca':str(T/'ca.pem'),'certificate':str(T/f'{n}.pem'),'private_key':str(T/f'{n}.key'),'server_name':'localhost','peers':{k:str(T/f'{v}.der') for k,v in peers.items()}}
 R=P/'sandboxd'; R.mkdir(exist_ok=True)
 for f,data in [('oss.json',{'oss':{},'type':'oss'}),('registry.json',{'registry':{'scheme':'https' if os.getenv('ADX_E2E_KUBERNETES') else 'http','skip_verify':False if os.getenv('ADX_E2E_KUBERNETES') else True},'type':'registry'}),('oss_auths.json',{}),('registry_auths.json',{'auths':{}})]: (R/f).write_text(json.dumps(data))
@@ -77,7 +79,7 @@ def add(id,role,c={},env={}):services.append({'id':id,'role':role,'config':c,'en
 if node=='node1':
  (P/'redis').mkdir(exist_ok=True)
  add('redis','redis',{'bind':'0.0.0.0','port':6379,'data_dir':str(P/'redis'),'appendfsync':'always','password_file':str(redis_key)})
- add('master','master',{'listen':'0.0.0.0:17000','advertised_address':'https://master:17000','domains':1,'placement':'spread','rpc_timeout_seconds':120,'tls':tls('master',{'frontend':'frontend','edge':'edge','node:node1':'node','node:node2':'node2'}),'bootstrap_credentials':[{'key_file':str(key),'tenant_id':'e2e','administrator':False,'expires_at_unix_seconds':0},{'key_file':str(other),'tenant_id':'e2e-other','administrator':False,'expires_at_unix_seconds':0}]})
+ add('master','master',{'listen':'0.0.0.0:17000','advertised_address':'https://master:17000','domains':1,'placement':'spread','rpc_timeout_seconds':120,'tls':tls('master',{'frontend':'frontend','edge':'edge','node:node1':'node','node:node2':'node2'}),'bootstrap_credentials':[{'key_file':str(admin),'tenant_id':'admin','administrator':True,'expires_at_unix_seconds':0},{'key_file':str(key),'tenant_id':'e2e','administrator':False,'expires_at_unix_seconds':0},{'key_file':str(other),'tenant_id':'e2e-other','administrator':False,'expires_at_unix_seconds':0}]})
 edge_peer=os.getenv('ADX_E2E_EDGE_IP')
 edge_cidrs=(edge_peer+('/128' if ':' in edge_peer else '/32')+',127.0.0.1/32') if edge_peer else '172.16.0.0/12,127.0.0.1/32'
 common={'ADX_DATA_PLANE_EDGE_FRONTEND_NODE_SECURITY_MODE':'mtls','RUST_LOG':'info'}

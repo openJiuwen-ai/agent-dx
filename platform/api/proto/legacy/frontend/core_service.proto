@@ -204,6 +204,7 @@ message SnapStartOptions {
 message SnapInfo {
   string snapshotID = 1;
   int64 size = 2;
+  uint64 expiresAtUnixSeconds = 3;
 }
 
 message SnapStartedInfo {

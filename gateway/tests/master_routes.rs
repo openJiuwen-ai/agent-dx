@@ -144,3 +144,38 @@ fn full_snapshot_same_cursor_must_be_identical() {
     assert!(consumer.apply(conflict).is_err());
     assert!(store.get("a").is_some());
 }
+
+#[test]
+fn resumed_execution_route_replaces_source_and_rejects_older_revision() {
+    let store = Arc::new(RouteStore::new());
+    let mut c = RouteConsumer::new(store.clone());
+    c.apply(RouteFrame {
+        epoch: 1,
+        revision: 1,
+        reset: true,
+        upserts: vec![route("i")],
+        ..Default::default()
+    })
+    .unwrap();
+    let mut restored = route("i");
+    restored.runtime_id = "i-1-r5".into();
+    restored.instance_revision = 6;
+    c.apply(RouteFrame {
+        epoch: 1,
+        revision: 2,
+        base_revision: 1,
+        upserts: vec![restored],
+        ..Default::default()
+    })
+    .unwrap();
+    assert_eq!(store.get("i").unwrap().sandbox_id, "i-1-r5");
+    assert!(c
+        .apply(RouteFrame {
+            epoch: 1,
+            revision: 3,
+            base_revision: 2,
+            upserts: vec![route("i")],
+            ..Default::default()
+        })
+        .is_err());
+}

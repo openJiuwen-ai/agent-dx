@@ -1,0 +1,91 @@
+#!/usr/bin/env python3
+import json, os, pathlib, subprocess, sys, time, signal, shutil
+BASE=pathlib.Path(os.environ.get('ADX_FC_BASE', '/opt/adx')); RUN=pathlib.Path(sys.argv[1]); E=RUN/'evidence'
+env={**os.environ,'PATH':f'/opt/adx-fc/bin:{BASE}/tools:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin','ADX_FC_RUN_ROOT':str(RUN)}
+# Fail before deployment when the selected Pod/VM cannot run KVM.
+import fcntl, platform
+if platform.system() != 'Linux': raise RuntimeError('Linux KVM runtime required')
+with open('/dev/kvm','rb',buffering=0) as kvm:
+ if fcntl.ioctl(kvm.fileno(),0xAE00,0) != 12: raise RuntimeError('unsupported KVM API')
+if os.environ.get('ADX_FC_PROXY_MODE','embedded') not in ('embedded','standalone'): raise ValueError('invalid proxy mode')
+subprocess.run(['python3',str(BASE/'e2e/firecracker/configure.py'),'node1'],env=env,check=True)
+env.update({'MINIO_ROOT_USER':(RUN/'secrets/s3-user').read_text().strip(),'MINIO_ROOT_PASSWORD':(RUN/'secrets/s3-key').read_text().strip()})
+# Validate the package before launching any control-plane process.
+subprocess.run(['python3',str(BASE/'e2e/package.py'),'verify',str(BASE/'package')],check=True)
+manifest=json.loads((BASE/'package/manifest.json').read_text())
+if os.environ.get('ADX_EXPECTED_COMMIT') and (manifest.get('dirty') or manifest.get('commit') != os.environ['ADX_EXPECTED_COMMIT']): raise ValueError('deployed package does not match CI commit')
+children=[]
+def spawn(name,args):
+ f=(E/(name+'.log')).open('w');p=subprocess.Popen(list(map(str,args)),env=env,stdout=f,stderr=subprocess.STDOUT);children.append((name,p));return p
+
+def run(args):return subprocess.check_output(list(map(str,args)),env=env,text=True,timeout=30).strip()
+def wait(test,seconds=120):
+ end=time.monotonic()+seconds
+ while True:
+  for name,proc in children:
+   if proc.poll() is not None:raise RuntimeError(name+' exited; see '+str(E/(name+'.log')))
+  try:
+   result=test()
+   if result:return result
+  except (OSError,subprocess.SubprocessError,KeyError,ValueError):pass
+  if time.monotonic()>end:raise TimeoutError('readiness timeout')
+  time.sleep(.5)
+
+summary={'status':'failed','root':str(RUN)}
+try:
+ (RUN/'objects').mkdir(parents=True)
+ minio=spawn('minio',[BASE/'tools/minio','server',RUN/'objects','--address','127.0.0.1:19090','--console-address','127.0.0.1:19091'])
+ import urllib.request
+ wait(lambda:urllib.request.urlopen('http://127.0.0.1:19090/minio/health/ready',timeout=2).status==200)
+ subprocess.run(['python3',str(BASE/'e2e/firecracker/s3_probe.py'),str(RUN),'--create'],env=env,check=True)
+ image=os.environ.get('ADX_E2E_RRT_IMAGE')
+ if not image:
+  registry=spawn('registry',['docker-registry','serve',RUN/'registry.yaml'])
+  sys.path.insert(0,str(BASE/'e2e'))
+  import publish
+  digest=publish.publish(str(BASE/'rrt.tar'))
+  image='127.0.0.1:5000/adx-rrt@'+digest
+ (E/'rrt-image.json').write_text(json.dumps({'image':image}))
+ sandboxd=spawn('sandboxd',['sandboxd','--root',RUN/'sandboxd/root','--config',RUN/'sandboxd/config.toml','--socket',RUN/'sandboxd/sandboxd.sock','--http-address','127.0.0.1:18081','--pprof-address','127.0.0.1:16061','--log-file',E/'sandboxd-service.log'])
+ wait(lambda:(RUN/'sandboxd/sandboxd.sock').exists())
+ supervisor=spawn('supervisor',[BASE/'package/bin/adxctl','run','--config',RUN/'deployment.json'])
+ authenv={**env,'REDISCLI_AUTH':(RUN/'secrets/redis-key').read_text().strip()}
+ def catalog():return json.loads(subprocess.check_output(['redis-cli','--json','HGETALL','adx:{acceptance}:control:v1'],env=authenv,text=True))
+ def ready():
+  c=catalog();n=json.loads(c.get('node:node1','{}'));return n.get('session',{}).get('routable') and n.get('node',{}).get('available')
+ wait(ready)
+ (E/'ready.json').write_text(json.dumps({'ready':True}))
+ print('PLATFORM READY',RUN,flush=True)
+ subprocess.run([str(BASE/'client/bin/python'),'-u',str(BASE/'e2e/firecracker/sdk_checkpoint.py'),'--endpoint','127.0.0.1:8443','--token-file',str(RUN/'secrets/api-key'),'--ca',str(RUN/'secrets/tls/ca.pem'),'--image',image,'--output',str(E/'sdk'),'--restart-command','python3',str(BASE/'e2e/firecracker/restart_paused.py'),str(RUN)],env=env,check=True,timeout=1200)
+ subprocess.run([str(BASE/'client/bin/python'),'-u',str(BASE/'e2e/firecracker/sdk_node_lifecycle.py'),'--run-root',str(RUN),'--image',image,'--package',str(BASE/'package'),'--tools',str(BASE/'tools')],env=env,check=True,timeout=600)
+ def snapshots_collected():
+  raw=json.loads(subprocess.check_output(['redis-cli','--json','HGETALL','adx:{acceptance}:control:v1:snapshots'],env=authenv,text=True))
+  snapshots={k:json.loads(v) for k,v in raw.items()}
+  if snapshots and all(s['state']=='Deleted' and not s['references'] for s in snapshots.values()):
+   (E/'snapshots-final.json').write_text(json.dumps(snapshots,indent=2)); return True
+  return False
+ wait(snapshots_collected)
+ saved={k:json.loads(v) for k,v in catalog().items() if k.startswith('instance:')}
+ (E/'catalog-final.json').write_text(json.dumps(saved,indent=2))
+ assert saved and all(i['result']['state']=='Deleted' and not i['result']['resources_held'] for i in saved.values()),saved
+ inventory=run(['sbox','-a',RUN/'sandboxd/sandboxd.sock','list'])
+ assert len(inventory.splitlines())==1,inventory
+ (E/'inventory-final.txt').write_text(inventory)
+ assert not [p for p in (RUN/'checkpoints').rglob('*') if p.is_file()],'checkpoint artifacts leaked'
+ subprocess.run(['python3',str(BASE/'e2e/firecracker/s3_probe.py'),str(RUN)],env=env,check=True)
+ summary['status']='passed'
+except BaseException as error:
+ summary['error']=repr(error);raise
+finally:
+ try:
+  if any(n=='supervisor' and p.poll() is None for n,p in children):
+   print(run([BASE/'package/bin/adxctl','stop','--config',RUN/'deployment.json']),flush=True)
+ except Exception as error:summary['stop_error']=repr(error);summary['status']='failed'
+ for name,proc in reversed(children):
+  if proc.poll() is None:
+   proc.terminate()
+   try:proc.wait(timeout=20)
+   except subprocess.TimeoutExpired:proc.kill();proc.wait()
+ (E/'result.json').write_text(json.dumps(summary,indent=2)+'\n')
+
+if summary['status'] != 'passed': sys.exit(1)

@@ -9,7 +9,6 @@ package backend
 import (
 	"context"
 	"errors"
-	"net/http"
 	"sync"
 )
 
@@ -53,19 +52,29 @@ type Identity struct{ TenantID, Role string }
 const RoleTenant = "tenant"
 const RoleAdmin = "admin"
 
-type HTTPClient interface {
-	Do(*http.Request) (*http.Response, error)
+type Snapshot struct {
+	SnapshotID string   `json:"snapshotId"`
+	Names      []string `json:"names"`
+}
+type SnapshotPage struct {
+	Items         []Snapshot `json:"items"`
+	NextPageToken string     `json:"nextPageToken"`
+}
+type SnapshotCatalog interface {
+	Get(context.Context, string) (Snapshot, error)
+	List(context.Context, string, string, uint32) (SnapshotPage, error)
+	Delete(context.Context, string) error
 }
 type Dependencies struct {
-	Transport          Transport
-	Instances          Instances
-	Authenticate       func(context.Context, string) (Identity, error)
-	MasterAddress      func() string
-	SnapshotHTTPClient HTTPClient
+	Transport    Transport
+	Instances    Instances
+	Authenticate func(context.Context, string) (Identity, error)
+	Snapshots    SnapshotCatalog
+	Keys         KeyManager
 }
 
 func (d Dependencies) Validate() error {
-	if d.Transport == nil || d.Instances == nil || d.Authenticate == nil || d.MasterAddress == nil || d.SnapshotHTTPClient == nil {
+	if d.Transport == nil || d.Instances == nil || d.Authenticate == nil {
 		return ErrUnavailable
 	}
 	return nil

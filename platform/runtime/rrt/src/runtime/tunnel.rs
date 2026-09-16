@@ -3288,11 +3288,12 @@ async fn handle_port_b_ws(stream: TcpStream, state: Arc<State>) -> Result<(), St
             biased;
             message = source.next() => match message {
                 Some(Ok(Message::Text(data))) => {
-                    if state.send_to_generation(generation, &Frame::WsMessage {
+                    let forwarded = state.send_to_generation(generation, &Frame::WsMessage {
                         id: id.clone(),
                         data,
                         binary: false,
-                    }).is_err() {
+                    });
+                    if forwarded.is_err() {
                         let _ = state.send_to_generation(generation, &Frame::Error {
                             id: id.clone(),
                             message: "WebSocket text message exceeds control-frame limit".into(),

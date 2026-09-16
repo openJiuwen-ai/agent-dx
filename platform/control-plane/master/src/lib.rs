@@ -1,5 +1,6 @@
 //! Global and embedded Domain scheduling.
 
+pub use adx_core::snapshots;
 pub mod auth;
 mod domain;
 mod journal;
@@ -170,6 +171,25 @@ impl Master {
     }
 
     /// Global chooses the domain only. Unscheduled work stays in its Domain queue.
+    pub fn submit_recovery(&mut self, spec: InstanceSpec) -> Result<usize> {
+        self.retired.remove(&spec.id);
+        if !self.requests.contains_key(&spec.id) {
+            // Global still rotates; skip domains without any live node.
+            for offset in 0..self.domains.len() {
+                let domain = (self.next_domain + offset) % self.domains.len();
+                if self
+                    .snapshot
+                    .nodes()
+                    .values()
+                    .any(|n| n.available && self.node_domains.get(&n.id) == Some(&domain))
+                {
+                    self.next_domain = domain;
+                    break;
+                }
+            }
+        }
+        self.submit(spec)
+    }
     pub fn submit(&mut self, spec: InstanceSpec) -> Result<usize> {
         spec.validate()?;
         if self.retired.contains(&spec.id) {
@@ -307,6 +327,32 @@ impl Master {
             .ok_or(Error::NotFound)?
             .retry(assignment, spec)?;
         Arc::make_mut(&mut self.snapshot).remove(&assignment.instance_id);
+        self.journal.record(&assignment.node_id);
+        self.wake_pending(None);
+        Ok(())
+    }
+    /// Apply a committed same-node resume to the incremental scheduling view.
+    pub fn restore_assignment(
+        &mut self,
+        spec: &InstanceSpec,
+        assignment: &Assignment,
+    ) -> Result<()> {
+        if self.requests.contains_key(&spec.id)
+            || self.node_domains.get(&assignment.node_id) != Some(&assignment.domain_id)
+        {
+            return Err(Error::Conflict);
+        }
+        self.domains
+            .get_mut(assignment.domain_id)
+            .ok_or(Error::NotFound)?
+            .restore(spec, assignment)?;
+        self.requests
+            .insert(spec.id.clone(), (assignment.domain_id, spec.clone()));
+        Arc::make_mut(&mut self.snapshot).place(PlacedInstance {
+            spec: spec.clone(),
+            node_id: assignment.node_id.clone(),
+        });
+        self.retired.remove(&spec.id);
         self.journal.record(&assignment.node_id);
         self.wake_pending(None);
         Ok(())

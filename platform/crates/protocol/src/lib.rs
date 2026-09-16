@@ -1,8 +1,10 @@
 //! Generated transport contracts and validated conversions, without services.
+mod snapshots;
 pub mod control {
     tonic::include_proto!("adx.control.v1");
 }
 
+pub use adx_core::valid_runtime_id;
 use adx_core::{Error, Result};
 mod scheduling;
 
@@ -23,6 +25,8 @@ impl TryFrom<control::InstanceSpec> for adx_core::InstanceSpec {
             .resources
             .ok_or_else(|| Error::Invalid("resources are required".into()))?;
         let spec = Self {
+            snapshot_id: value.snapshot_id,
+            lifecycle: value.lifecycle.map(Into::into).unwrap_or_default(),
             env: value.env.into_iter().collect(),
             id: value.id,
             tenant_id: value.tenant_id,
@@ -48,6 +52,8 @@ impl TryFrom<control::InstanceSpec> for adx_core::InstanceSpec {
 impl From<adx_core::InstanceSpec> for control::InstanceSpec {
     fn from(value: adx_core::InstanceSpec) -> Self {
         Self {
+            snapshot_id: value.snapshot_id,
+            lifecycle: Some(value.lifecycle.into()),
             env: value.env.into_iter().collect(),
             id: value.id,
             tenant_id: value.tenant_id,
@@ -116,6 +122,8 @@ mod tests {
     #[test]
     fn instance_spec_round_trip_preserves_units_and_priority() {
         let value = adx_core::InstanceSpec {
+            snapshot_id: None,
+            lifecycle: Default::default(),
             env: Default::default(),
             scheduling: Default::default(),
             id: "a".into(),
@@ -166,6 +174,9 @@ impl TryFrom<control::InstanceRecord> for adx_core::InstanceRecord {
             Ok(control::InstanceState::Running) => adx_core::InstanceState::Running,
             Ok(control::InstanceState::Deleting) => adx_core::InstanceState::Deleting,
             Ok(control::InstanceState::Deleted) => adx_core::InstanceState::Deleted,
+            Ok(control::InstanceState::Pausing) => adx_core::InstanceState::Pausing,
+            Ok(control::InstanceState::Paused) => adx_core::InstanceState::Paused,
+            Ok(control::InstanceState::Resuming) => adx_core::InstanceState::Resuming,
             Ok(control::InstanceState::Failed) => adx_core::InstanceState::Failed,
             _ => return Err(Error::Invalid("unknown instance state".into())),
         };
@@ -183,9 +194,13 @@ impl TryFrom<control::InstanceRecord> for adx_core::InstanceRecord {
             assignment,
             state,
             revision: v.revision,
+            restart_attempts: v.restart_attempts,
+            restart_pending: v.restart_pending,
             runtime_id: v.runtime_id,
             resources_held: v.resources_held,
             runtime_ip,
+            checkpoint: v.checkpoint.map(TryInto::try_into).transpose()?,
+            last_operation: v.last_operation.map(TryInto::try_into).transpose()?,
         })
     }
 }
@@ -198,6 +213,9 @@ impl TryFrom<adx_core::InstanceRecord> for control::InstanceRecord {
             adx_core::InstanceState::Running => control::InstanceState::Running,
             adx_core::InstanceState::Deleting => control::InstanceState::Deleting,
             adx_core::InstanceState::Deleted => control::InstanceState::Deleted,
+            adx_core::InstanceState::Pausing => control::InstanceState::Pausing,
+            adx_core::InstanceState::Paused => control::InstanceState::Paused,
+            adx_core::InstanceState::Resuming => control::InstanceState::Resuming,
             adx_core::InstanceState::Failed => control::InstanceState::Failed,
         };
         Ok(Self {
@@ -205,8 +223,12 @@ impl TryFrom<adx_core::InstanceRecord> for control::InstanceRecord {
             assignment: Some(v.assignment.try_into()?),
             state: state as i32,
             revision: v.revision,
+            restart_attempts: v.restart_attempts,
+            restart_pending: v.restart_pending,
             runtime_id: v.runtime_id,
             resources_held: v.resources_held,
+            checkpoint: v.checkpoint.map(Into::into),
+            last_operation: v.last_operation.map(Into::into),
             runtime_ip: v.runtime_ip.map(|ip| ip.to_string()).unwrap_or_default(),
         })
     }
@@ -231,3 +253,125 @@ pub fn dependency_status(status: tonic::Status) -> Error {
 }
 
 pub mod tls;
+
+impl From<adx_core::RestorePoint> for control::RestorePoint {
+    fn from(v: adx_core::RestorePoint) -> Self {
+        Self {
+            id: v.id,
+            expires_at_unix_seconds: v.expires_at_unix_seconds,
+            origin: v.origin.map(Into::into),
+            source_runtime_id: v.source_runtime_id,
+            artifact: Some(control::CheckpointArtifact {
+                storage: v.artifact.storage,
+                location: v.artifact.location,
+                size_bytes: v.artifact.size_bytes,
+            }),
+        }
+    }
+}
+impl TryFrom<control::RestorePoint> for adx_core::RestorePoint {
+    type Error = Error;
+    fn try_from(v: control::RestorePoint) -> Result<Self> {
+        let a = v
+            .artifact
+            .ok_or_else(|| Error::Invalid("checkpoint artifact required".into()))?;
+        if v.id.is_empty()
+            || v.source_runtime_id.is_empty()
+            || v.expires_at_unix_seconds == 0
+            || a.storage.is_empty()
+            || a.location.is_empty()
+            || a.size_bytes == 0
+        {
+            return Err(Error::Invalid("invalid checkpoint metadata".into()));
+        }
+        Ok(Self {
+            id: v.id,
+            expires_at_unix_seconds: v.expires_at_unix_seconds,
+            origin: v.origin.map(TryInto::try_into).transpose()?,
+            source_runtime_id: v.source_runtime_id,
+            artifact: adx_core::CheckpointArtifact {
+                storage: a.storage,
+                location: a.location,
+                size_bytes: a.size_bytes,
+            },
+        })
+    }
+}
+impl From<adx_core::CompletedOperation> for control::CompletedOperation {
+    fn from(v: adx_core::CompletedOperation) -> Self {
+        Self {
+            id: v.id,
+            expected_revision: v.expected_revision,
+            kind: match v.kind {
+                adx_core::LifecycleKind::Pause => 1,
+                adx_core::LifecycleKind::Resume => 2,
+                adx_core::LifecycleKind::Snapshot => 3,
+            },
+        }
+    }
+}
+impl TryFrom<control::CompletedOperation> for adx_core::CompletedOperation {
+    type Error = Error;
+    fn try_from(v: control::CompletedOperation) -> Result<Self> {
+        if v.id.trim().is_empty() || v.id.len() > 128 || v.expected_revision == 0 {
+            return Err(Error::Invalid("invalid completed operation".into()));
+        }
+        Ok(Self {
+            id: v.id,
+            expected_revision: v.expected_revision,
+            kind: match v.kind {
+                1 => adx_core::LifecycleKind::Pause,
+                2 => adx_core::LifecycleKind::Resume,
+                3 => adx_core::LifecycleKind::Snapshot,
+                _ => return Err(Error::Invalid("invalid lifecycle kind".into())),
+            },
+        })
+    }
+}
+
+impl From<control::LifecyclePolicy> for adx_core::lifecycle::LifecyclePolicy {
+    fn from(v: control::LifecyclePolicy) -> Self {
+        Self {
+            idle_timeout_seconds: v.idle_timeout_seconds,
+            restart: v.restart.map(|r| adx_core::lifecycle::RestartPolicy {
+                max_attempts: r.max_attempts,
+                initial_backoff_seconds: r.initial_backoff_seconds,
+                max_backoff_seconds: r.max_backoff_seconds,
+            }),
+        }
+    }
+}
+impl From<adx_core::lifecycle::LifecyclePolicy> for control::LifecyclePolicy {
+    fn from(v: adx_core::lifecycle::LifecyclePolicy) -> Self {
+        Self {
+            idle_timeout_seconds: v.idle_timeout_seconds,
+            restart: v.restart.map(|r| control::RestartPolicy {
+                max_attempts: r.max_attempts,
+                initial_backoff_seconds: r.initial_backoff_seconds,
+                max_backoff_seconds: r.max_backoff_seconds,
+            }),
+        }
+    }
+}
+
+impl From<adx_core::runtime::RuntimeIdentity> for control::RuntimeIdentity {
+    fn from(v: adx_core::runtime::RuntimeIdentity) -> Self {
+        Self {
+            instance_id: v.instance_id,
+            runtime_id: v.runtime_id,
+            ownership_generation: v.ownership_generation,
+        }
+    }
+}
+impl TryFrom<control::RuntimeIdentity> for adx_core::runtime::RuntimeIdentity {
+    type Error = Error;
+    fn try_from(v: control::RuntimeIdentity) -> Result<Self> {
+        let identity = Self {
+            instance_id: v.instance_id,
+            runtime_id: v.runtime_id,
+            ownership_generation: v.ownership_generation,
+        };
+        identity.validate()?;
+        Ok(identity)
+    }
+}

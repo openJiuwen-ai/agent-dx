@@ -143,3 +143,7 @@ Compilation, image publication and Kubernetes acceptance are distinct mandatory
 steps. The separate ADX deployer-image recipe was removed. Reuse/credential
 contracts are included in `out/ci/k8s-e2e/reuse-final-tests.log`; this is source and
 local contract evidence, not a hosted CI run.
+
+## 2026-09-16 放置约束扩展
+
+基础门禁现为六组。package-v17 已完成新一轮双节点真实验收，包含六项亲和／反亲和和节点偏好规则；结果、制品身份与正式 K8s 边界见 [本轮记录](2026-09-16-placement-e2e.md)。以上较早结果保留其当时的覆盖范围。

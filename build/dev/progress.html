@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ADX · 开发进度</title>
+<style>
+:root{color-scheme:light dark;--bg:light-dark(#f8fafb,#111619);--panel:light-dark(#fff,#192025);--fg:light-dark(#19272c,#e2eaee);--muted:light-dark(#5b6b73,#a4b3ba);--line:light-dark(#dce4e8,#34424a);--active:light-dark(#006f68,#6de0ca);--soft:light-dark(#e0f3ef,#193b36);--bad:light-dark(#ab3f26,#ffa98a)}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.65 system-ui,-apple-system,sans-serif}main{max-width:1120px;margin:auto;padding:40px 28px}header{display:flex;align-items:center;justify-content:space-between;gap:20px;flex-wrap:wrap}h1{font-size:28px;margin:0;font-weight:600;letter-spacing:-.8px}h2{font-size:22px;margin:0 0 8px}h3{font-size:14px;font-weight:500;color:var(--muted);margin:24px 0 6px}p{margin:0}.muted{color:var(--muted)}.small{font-size:12px}.eyebrow{font-size:12px;letter-spacing:2px;color:var(--active);margin-bottom:8px}.connection{font-size:13px}.connection::before{content:'●';margin-right:8px;color:var(--active)}.connection.offline::before{color:var(--bad)}.layout{display:grid;grid-template-columns:290px minmax(0,1fr);gap:36px;margin-top:32px}nav{display:flex;flex-direction:column;gap:7px}button{font:inherit;color:inherit;cursor:pointer}nav button{display:grid;grid-template-columns:26px minmax(0,1fr);gap:10px;text-align:left;padding:13px 14px;border:1px solid transparent;border-radius:10px;background:transparent}nav button:hover{background:var(--panel)}nav button[aria-pressed=true]{background:var(--soft);border-color:var(--active)}button:focus-visible{outline:3px solid var(--active);outline-offset:2px}.num{font-variant-numeric:tabular-nums;color:var(--muted)}.stage-status{display:block;font-size:12px;color:var(--muted)}article{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:28px;min-width:0}.note{border-left:3px solid var(--active);padding-left:12px;margin:18px 0;white-space:pre-wrap}.job{padding:14px 0;border-top:1px solid var(--line)}.job-top{display:flex;justify-content:space-between;gap:16px;align-items:start}.badge{font-size:12px;white-space:nowrap;color:var(--active)}.badge.failed,.badge.interrupted,.badge.unknown{color:var(--bad)}.path{overflow-wrap:anywhere}details{margin-top:5px}summary{cursor:pointer;color:var(--muted);font-size:12px}footer{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-top:24px;font-size:12px;color:var(--muted)}#error{color:var(--bad);margin-top:8px}#scope,#gate{white-space:pre-wrap}#jobs{margin-top:12px}a{color:var(--active)}@media(max-width:740px){main{padding:24px 16px}.layout{grid-template-columns:minmax(0,1fr);gap:20px}nav{display:grid;grid-template-columns:repeat(2,minmax(0,1fr))}nav button{padding:10px;grid-template-columns:20px minmax(0,1fr);gap:6px}article{padding:20px}h1{font-size:24px}}@media(max-width:390px){nav{grid-template-columns:minmax(0,1fr)}}
+</style>
+</head>
+<body>
+<main>
+<header><div><div class="eyebrow">AGENT DX / DEVELOPMENT</div><h1>管控面实施进度</h1></div><div><div id="connection" class="connection">正在连接</div><div class="small muted">每 3 秒读取本机状态</div></div></header>
+<p id="error" role="status"></p>
+<div class="layout">
+<nav id="stages" aria-label="实施阶段"></nav>
+<article><div id="stage-status" class="small muted"></div><h2 id="title">正在加载进度…</h2><div id="note" class="note" hidden></div><h3>实施范围</h3><p id="scope"></p><h3>阶段验收</h3><p id="gate"></p><h3>构建与测试</h3><div id="jobs"></div></article>
+</div>
+<footer><span id="updated">状态更新时间：—</span><span id="checked">最近读取：—</span><span id="revision">版本：—</span></footer>
+</main>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const labels = {pending:'待推进',active:'进行中',blocked:'存在卡点',complete:'已验收',running:'运行中',passed:'通过',failed:'失败',interrupted:'已中断',unknown:'进程已结束 · 结果待核对'};
+  let state = null, selected = '1';
+  const time = value => value ? new Date(value).toLocaleString('zh-CN',{hour12:false}) : '—';
+  function node(tag, text, cls) { const element=document.createElement(tag); if(text !== undefined) element.textContent=text; if(cls) element.className=cls; return element; }
+  function render() {
+    const stages=state.stages || [];
+    if(!stages.some(stage=>stage.id===selected)) selected=stages[0]?.id;
+    $('stages').replaceChildren(...stages.map(stage=>{
+      const button=node('button'); button.type='button'; button.setAttribute('aria-pressed', String(stage.id===selected));
+      button.append(node('span',stage.id.padStart(2,'0'),'num'));
+      const title=node('span',stage.title); title.append(node('span',labels[stage.status] || stage.status,'stage-status')); button.append(title);
+      button.addEventListener('click',()=>{selected=stage.id;render()}); return button;
+    }));
+    const stage=stages.find(stage=>stage.id===selected);
+    if(!stage){$('title').textContent='暂无阶段记录';return}
+    $('title').textContent=stage.title;
+    $('stage-status').textContent='阶段 '+stage.id+' / '+stages.length+' · '+(labels[stage.status] || stage.status);
+    $('scope').textContent=stage.scope; $('gate').textContent=stage.gate;
+    $('note').hidden=!stage.note; $('note').textContent=stage.note || '';
+    const jobs=Object.values(state.jobs || {}).filter(job=>job.stage===selected).sort((a,b)=>(b.started_at||'').localeCompare(a.started_at||''));
+    $('jobs').replaceChildren(...jobs.map(job=>{
+      const row=node('div',undefined,'job'); const top=node('div',undefined,'job-top');
+      top.append(node('span',job.label),node('span',labels[job.status] || job.status,'badge '+job.status));row.append(top);
+      const elapsed=Math.max(0,Math.floor(((job.finished_at ? Date.parse(job.finished_at) : Date.now())-Date.parse(job.started_at))/1000));
+      const timing=node('div',time(job.started_at)+(job.historical?' · 历史记录': ' · '+Math.floor(elapsed/60)+'分'+elapsed%60+'秒')+(job.exit_code==null?'':' · 退出码 '+job.exit_code),'small muted');
+      if(job.status==='running')timing.dataset.started=job.started_at;
+      row.append(timing);
+      if(job.note)row.append(node('div',job.note,'small'));
+      if(job.log){const details=node('details');details.append(node('summary','日志路径'),node('div',job.log,'small path'));row.append(details)}
+      return row;
+    }));
+    if(!jobs.length)$('jobs').append(node('p','本阶段尚未接入运行记录','muted'));
+    $('updated').textContent='状态更新时间：'+time(state.updated_at);$('revision').textContent='状态版本：'+state.revision;
+  }
+  async function poll() {
+    try {
+      const response=await fetch('/api/state',{cache:'no-store',signal:AbortSignal.timeout(5000)});
+      if(!response.ok)throw new Error('HTTP '+response.status);
+      const next=await response.json();
+      const changed=!state || JSON.stringify(next)!==JSON.stringify(state);
+      state=next;
+      if(changed)render();
+      document.querySelectorAll('[data-started]').forEach(element=>{const elapsed=Math.max(0,Math.floor((Date.now()-Date.parse(element.dataset.started))/1000));element.textContent=time(element.dataset.started)+' · '+Math.floor(elapsed/60)+'分'+elapsed%60+'秒'});
+      $('connection').textContent='自动刷新已连接';$('connection').classList.remove('offline');$('error').textContent='';
+      $('checked').textContent='最近读取：'+time(new Date().toISOString());
+    }catch(error){$('connection').textContent='连接中断 · 自动重试';$('connection').classList.add('offline');$('error').textContent='保留上次进度；等待本地服务恢复。'}
+    finally{setTimeout(poll,3000)}
+  }
+  poll();
+})();
+</script>
+</body>
+</html>

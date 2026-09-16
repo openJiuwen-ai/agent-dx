@@ -1,5 +1,9 @@
 //! Single-Master Redis persistence. Lua only compares opaque bytes and performs
-//! one HSET; JSON and u64 counters are validated in Rust, never Lua doubles.
+//! atomic hash writes; JSON and u64 counters are validated in Rust, never Lua doubles.
+mod credentials;
+mod failure;
+mod recovery;
+mod snapshots;
 use crate::Node;
 use adx_core::{
     scheduling::validate_device_assignment, Assignment, Error, InstanceRecord, InstanceSpec,
@@ -68,14 +72,24 @@ pub struct StoredNode {
     pub session: Option<NodeSession>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Recovery {
+    pub source: Assignment,
+    pub pending: bool,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredInstance {
+    #[serde(default)]
+    pub recovery: Option<Recovery>,
+    #[serde(default)]
+    pub invalidated: bool,
     pub spec: InstanceSpec,
     pub assignment: Assignment,
     pub result: Option<InstanceRecord>,
 }
 impl StoredInstance {
     pub fn resources_held(&self) -> bool {
-        self.result.as_ref().is_none_or(|r| r.resources_held)
+        (!self.invalidated && self.recovery.as_ref().is_some_and(|r| r.pending))
+            || self.result.as_ref().is_none_or(|r| r.resources_held)
     }
     fn validate(&self) -> Result<()> {
         self.spec.validate()?;
@@ -176,11 +190,68 @@ fn decode<T: for<'a> Deserialize<'a>>(v: &str) -> Result<T> {
     serde_json::from_str(v).map_err(|_| Error::Unavailable("corrupt control record".into()))
 }
 fn validate_result(r: &InstanceRecord) -> Result<()> {
-    if r.revision == 0 || r.runtime_id != format!("{}-{}", r.spec.id, r.assignment.generation) {
+    if r.restart_attempts
+        > r.spec
+            .lifecycle
+            .restart
+            .as_ref()
+            .map_or(0, |p| p.max_attempts)
+        || (r.restart_pending
+            && (r.state != InstanceState::Failed
+                || r.spec
+                    .lifecycle
+                    .restart
+                    .as_ref()
+                    .is_none_or(|p| r.restart_attempts >= p.max_attempts)))
+    {
+        return Err(Error::Conflict);
+    }
+    if r.revision == 0
+        || !adx_core::valid_runtime_id(&r.spec.id, r.assignment.generation, &r.runtime_id)
+    {
+        return Err(Error::Conflict);
+    }
+    if let Some(cp) = &r.checkpoint {
+        if cp.id.is_empty()
+            || cp.artifact.storage.is_empty()
+            || cp.artifact.location.is_empty()
+            || cp.artifact.size_bytes == 0
+            || cp.expires_at_unix_seconds == 0
+            || match &cp.origin {
+                None => !adx_core::valid_runtime_id(
+                    &r.spec.id,
+                    r.assignment.generation,
+                    &cp.source_runtime_id,
+                ),
+                Some(origin) => {
+                    (if origin.instance_id == r.spec.id {
+                        origin.ownership_generation >= r.assignment.generation
+                    } else {
+                        r.spec.snapshot_id.is_none()
+                    }) || origin.runtime_id != cp.source_runtime_id
+                        || !adx_core::valid_runtime_id(
+                            &origin.instance_id,
+                            origin.ownership_generation,
+                            &origin.runtime_id,
+                        )
+                }
+            }
+        {
+            return Err(Error::Conflict);
+        }
+    }
+    if r.last_operation.as_ref().is_some_and(|op| {
+        op.id.is_empty() || op.expected_revision == 0 || op.expected_revision >= r.revision
+    }) {
         return Err(Error::Conflict);
     }
     match r.state {
         InstanceState::Running if r.resources_held && r.runtime_ip.is_some() => Ok(()),
+        InstanceState::Paused
+            if !r.resources_held && r.runtime_ip.is_none() && r.checkpoint.is_some() =>
+        {
+            Ok(())
+        }
         InstanceState::Deleted if !r.resources_held => Ok(()),
         InstanceState::Failed => Ok(()),
         _ => Err(Error::Invalid(
@@ -193,13 +264,44 @@ fn next_result(old: &StoredInstance, r: &InstanceRecord) -> Result<bool> {
         return Err(Error::Conflict);
     }
     validate_result(r)?;
+    if old.invalidated
+        && (!matches!(r.state, InstanceState::Failed | InstanceState::Deleted)
+            || r.resources_held
+            || r.restart_pending
+            || r.runtime_ip.is_some()
+            || (r.state != InstanceState::Deleted
+                && old
+                    .result
+                    .as_ref()
+                    .is_none_or(|previous| previous.checkpoint != r.checkpoint)))
+    {
+        return Err(Error::Conflict);
+    }
     if let Some(previous) = &old.result {
         if previous == r {
             return Ok(false);
         }
-        if r.revision <= previous.revision
+        let restarting = previous.state == InstanceState::Failed
+            && previous.restart_pending
+            && previous.restart_attempts.checked_add(1) == Some(r.restart_attempts)
+            && r.runtime_id != previous.runtime_id
+            && r.checkpoint == previous.checkpoint
+            && matches!(r.state, InstanceState::Running | InstanceState::Failed);
+        if r.restart_attempts < previous.restart_attempts
+            || (r.restart_attempts != previous.restart_attempts && !restarting)
+            || r.revision <= previous.revision
             || previous.state == InstanceState::Deleted
-            || (!previous.resources_held && r.resources_held)
+            || (!previous.resources_held
+                && r.resources_held
+                && !restarting
+                && !(previous.state == InstanceState::Paused
+                    && r.checkpoint == previous.checkpoint
+                    && r.runtime_id != previous.runtime_id
+                    && (r.state == InstanceState::Failed
+                        || r.last_operation.as_ref().is_some_and(|op| {
+                            op.kind == adx_core::LifecycleKind::Resume
+                                && op.expected_revision == previous.revision
+                        }))))
         {
             return Err(Error::Conflict);
         }
@@ -419,15 +521,17 @@ impl Session {
             .arg(
                 r#"
             if redis.call('HGET', KEYS[1], 'header') ~= ARGV[1] then return 0 end
+            if redis.call('HEXISTS', KEYS[3], ARGV[2]) == 1 then return 1 end
             local old=redis.call('HGET', KEYS[2], ARGV[2])
             if old and old ~= ARGV[3] then return 0 end
             redis.call('HSET', KEYS[2], ARGV[2], ARGV[3])
             return 1
         "#,
             )
-            .arg(2)
+            .arg(3)
             .arg(&self.store.key)
             .arg(format!("{}:credentials", self.store.key))
+            .arg(format!("{}:revoked-credentials", self.store.key))
             .arg(header[0].as_deref().ok_or(Error::Conflict)?)
             .arg(digest)
             .arg(encoded);
@@ -548,7 +652,21 @@ impl Session {
         spec: InstanceSpec,
         assignment: Assignment,
     ) -> Result<StoredInstance> {
+        if let Some(id) = &spec.snapshot_id {
+            let snapshot = self.get_snapshot(id).await?;
+            if snapshot.template.tenant_id != spec.tenant_id
+                || !snapshot
+                    .references
+                    .contains(&adx_core::snapshots::Reference::Restore {
+                        instance_id: spec.id.clone(),
+                    })
+            {
+                return Err(Error::Conflict);
+            }
+        }
         let record = StoredInstance {
+            recovery: None,
+            invalidated: false,
             spec,
             assignment,
             result: None,
@@ -625,7 +743,8 @@ impl Session {
             if old.assignment == replacement {
                 return Ok(old);
             }
-            if &old.assignment != previous
+            if old.invalidated
+                || &old.assignment != previous
                 || old
                     .result
                     .as_ref()
@@ -662,6 +781,23 @@ impl Session {
     /// One result write: state and the route publication cursor change atomically.
     /// Identical replay is idempotent; older versions never roll state backward.
     pub async fn commit(&self, result: InstanceRecord) -> Result<InstanceRecord> {
+        if let Some(cp) = &result.checkpoint {
+            if let Some(origin) = cp
+                .origin
+                .as_ref()
+                .filter(|o| o.instance_id != result.spec.id)
+            {
+                let snapshot = self
+                    .get_snapshot(result.spec.snapshot_id.as_deref().ok_or(Error::Conflict)?)
+                    .await?;
+                if snapshot.template.tenant_id != result.spec.tenant_id
+                    || snapshot.origin()? != *origin
+                    || cp.artifact == snapshot.artifact
+                {
+                    return Err(Error::Conflict);
+                }
+            }
+        }
         let field = format!("instance:{}", result.spec.id);
         for _ in 0..ATTEMPTS {
             let values = self.store.fields(&[HEADER.into(), field.clone()]).await?;
@@ -669,6 +805,11 @@ impl Session {
             let mut old: StoredInstance = decode(values[1].as_deref().ok_or(Error::NotFound)?)?;
             if !next_result(&old, &result)? {
                 return Ok(result);
+            }
+            if result.state != InstanceState::Paused {
+                if let Some(recovery) = &mut old.recovery {
+                    recovery.pending = false;
+                }
             }
             old.result = Some(result.clone());
             h.advance()?;

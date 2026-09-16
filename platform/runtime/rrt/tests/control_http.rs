@@ -33,7 +33,11 @@ impl Drop for Runtime {
 }
 fn record(generation: u64) -> InstanceRecord {
     InstanceRecord {
+        restart_attempts: 0,
+        restart_pending: false,
         spec: InstanceSpec {
+            snapshot_id: None,
+            lifecycle: Default::default(),
             env: Default::default(),
             scheduling: Default::default(),
             id: "i".into(),
@@ -55,6 +59,8 @@ fn record(generation: u64) -> InstanceRecord {
         runtime_id: format!("i-{generation}"),
         resources_held: true,
         runtime_ip: Some("127.0.0.1".parse().unwrap()),
+        checkpoint: None,
+        last_operation: None,
     }
 }
 impl Runtime {
@@ -269,4 +275,27 @@ async fn invalid_restore_identity_fails_closed_and_control_rejects_bad_json() {
         .raw("/invoke", "before", r#"{"action":"ping"}"#)
         .await
         .starts_with("HTTP/1.1 503"));
+}
+
+#[tokio::test]
+async fn same_owner_restore_accepts_new_execution_and_rejects_source_control_identity() {
+    let mut runtime = Runtime::start().await;
+    let client = runtime.client("before");
+    client.prepare(&record(1), "same-node", 1).await.unwrap();
+    runtime.handoff("ADX_INSTANCE_ID=i\nADX_RUNTIME_ID=i-1-r5\nADX_OWNERSHIP_GENERATION=1\nRRT_HTTP_TOKEN=after\n", "restore");
+    let mut target = record(1);
+    target.runtime_id = "i-1-r5".into();
+    let restored = runtime.client("after");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(status) = restored.status(&target).await {
+                assert_eq!(status.phase, RuntimePhase::Running);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(restored.status(&record(1)).await.is_err());
 }

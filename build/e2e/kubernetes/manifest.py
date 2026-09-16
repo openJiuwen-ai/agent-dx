@@ -33,7 +33,7 @@ def resources(namespace, image, architecture, registry_auth=False, node_names=()
             certificates += [name + ext for ext in ('.pem', '.key', '.der')]
         volumes[-1]['secret']['items'] = [
             {'key': name, 'path': 'tls/' + name} for name in certificates
-        ] + [{'key': name, 'path': name} for name in ('api-key', 'other-key', 'redis-key', 'image')]
+        ] + [{'key': name, 'path': name} for name in ('api-key', 'other-key', 'admin-key', 'redis-key', 'image')]
         container = {
             'name': 'platform', 'image': image, 'imagePullPolicy': 'IfNotPresent',
             'command': ['sleep', 'infinity'],

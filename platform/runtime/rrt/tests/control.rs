@@ -212,3 +212,55 @@ async fn disconnected_prepare_keeps_operation_and_stale_revision_is_rejected() {
         .is_err());
     handoff.send(HandoffOutcome::Resume).unwrap();
 }
+
+struct CloneHooks;
+impl CheckpointHooks for CloneHooks {
+    fn open(&self) -> io::Result<Handoff> {
+        Ok(Box::pin(async { Ok(HandoffOutcome::Restore) }))
+    }
+    fn restore(&self, _: &RuntimeIdentity) -> io::Result<RuntimeIdentity> {
+        unreachable!()
+    }
+    fn restore_context(
+        &self,
+        old: &RuntimeIdentity,
+    ) -> io::Result<adx_core::runtime::RuntimeRestore> {
+        Ok(adx_core::runtime::RuntimeRestore {
+            target: RuntimeIdentity {
+                instance_id: "clone".into(),
+                runtime_id: "clone-1".into(),
+                ownership_generation: 1,
+            },
+            origin: Some(old.clone()),
+        })
+    }
+}
+#[tokio::test]
+async fn clone_handoff_rebinds_identity_and_rejects_source_requests() {
+    let control = Controller::new(identity(), Arc::new(CloneHooks)).unwrap();
+    control
+        .prepare(PrepareCheckpoint {
+            identity: identity(),
+            operation_id: "clone-source".into(),
+            expected_revision: 1,
+        })
+        .await
+        .unwrap();
+    let mut changes = control.subscribe();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while control.status().identity.instance_id != "clone" {
+            changes.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(control.status().phase, RuntimePhase::Running);
+    assert!(control
+        .prepare(PrepareCheckpoint {
+            identity: identity(),
+            operation_id: "old-source-request".into(),
+            expected_revision: control.status().revision
+        })
+        .await
+        .is_err());
+}

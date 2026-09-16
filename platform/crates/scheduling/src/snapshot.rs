@@ -47,7 +47,11 @@ impl Snapshot {
                 .or_default()
                 .insert(id.clone());
         }
-        if !spec.scheduling.required_anti_affinity.is_empty() {
+        if !spec.scheduling.required_anti_affinity.is_empty()
+            || spec.scheduling.placement_groups.iter().any(|g| {
+                g.target == adx_core::scheduling::PlacementTarget::Instance && g.required && g.anti
+            })
+        {
             self.reverse_anti.insert(id.clone());
         }
         self.instances.insert(id, Arc::new(placement));

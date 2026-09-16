@@ -157,6 +157,37 @@ pub struct TopologySpread {
     pub min_domains: u32,
     pub when_unsatisfiable: SpreadMode,
 }
+/// A bounded OR group. Instance selectors match one same-tenant peer on the
+/// candidate node; the scheduler includes pending placements in that snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlacementTarget {
+    Node,
+    Instance,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlacementGroup {
+    pub target: PlacementTarget,
+    pub terms: Vec<WeightedSelector>,
+    pub required: bool,
+    pub anti: bool,
+    pub ordered: bool,
+}
+impl PlacementGroup {
+    pub fn validate(&self) -> Result<()> {
+        if self.terms.is_empty() || self.terms.len() > 256 {
+            return Err(Error::Invalid(
+                "placement group requires 1..256 terms".into(),
+            ));
+        }
+        for term in &self.terms {
+            term.selector.validate()?;
+            weight(term.weight)?;
+        }
+        Ok(())
+    }
+}
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SchedulingPolicy {
@@ -170,12 +201,19 @@ pub struct SchedulingPolicy {
     pub preferred_affinity: Vec<WeightedPeer>,
     pub preferred_anti_affinity: Vec<WeightedPeer>,
     pub topology_spread: Vec<TopologySpread>,
+    pub placement_groups: Vec<PlacementGroup>,
 }
 impl SchedulingPolicy {
     pub fn matches_node(&self, labels: &BTreeMap<String, String>) -> bool {
         self.required_node.is_empty() || self.required_node.iter().any(|s| s.matches(labels))
     }
     pub fn validate(&self) -> Result<()> {
+        if self.placement_groups.len() > 8 {
+            return Err(Error::Invalid("at most 8 placement groups".into()));
+        }
+        for group in &self.placement_groups {
+            group.validate()?;
+        }
         validate_labels(&self.labels)?;
         validate_requests(&self.devices)?;
         for s in &self.required_node {

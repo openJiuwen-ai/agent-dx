@@ -81,7 +81,9 @@ and immutable references. The target cluster pulls the build's images; neither
 the deployer nor test Pods compile or substitute product binaries.
 
 Mandatory scenarios are SDK create/query/command/file/delete, invalid key and
-tenant isolation, capacity exhaustion/release, Node Manager process restart and
+tenant isolation, administrator key management through Edge, capacity
+exhaustion/release, six two-node placement rules,
+heartbeat expiry with returning-node cleanup, Node Manager process restart and
 supervisor stop with physical runtime cleanup. Missing scenarios, diagnostic or
 cleanup failures prevent a pass. `result.json`, JUnit, Kubernetes resource/events
 and per-Pod logs are uploaded. Secret bodies travel on stdin and are excluded
@@ -145,3 +147,13 @@ image references and Kubernetes results. The summary links the release archive,
 SHA256, standalone manifest, SDK wheel, build logs, image provenance, result JSON
 and JUnit. It records actual Pod/host placement and distinguishes same-host runs.
 Failures still publish a summary and retain their original exit status.
+
+## Firecracker checkpoint profile
+
+`ADX_E2E_CHECKPOINT=1` adds the independent `platform-fc-e2e` job. It requires a
+checksummed native Firecracker kit and an explicitly selected KVM-capable target
+worker. The image step combines that kit with the same verified ADX release;
+the test step runs the public SDK checkpoint, snapshot and node-fault cases inside
+an isolated Kubernetes Pod and publishes deployment, per-case, JUnit and cleanup
+evidence. See [runtime kit and invocation](../build/e2e/firecracker/README.md).
+The existing basic E2E result alone does not count as this profile passing.

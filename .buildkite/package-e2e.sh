@@ -33,6 +33,15 @@ fi
 echo "--- :docker: Resolve runtime base images"
 source .buildkite/bootstrap-images.sh > >(tee out/buildkite/logs/base-images.log) 2>&1
 echo "--- :docker: Build node and RRT images"
-python3 -u build/e2e/prepare.py --package out/buildkite/package --backend out/buildkite/backend --runtime-base "$ADX_E2E_RUNTIME_BASE" --rrt-base "$ADX_E2E_RRT_BASE" --output out/buildkite/bundle 2>&1 | tee out/buildkite/logs/prepare.log
+fc_args=()
+if [[ ${ADX_E2E_CHECKPOINT:-0} == 1 ]]; then
+  if [[ -n ${ADX_FC_KIT_ARTIFACT_BUILD:-} ]]; then
+    buildkite-agent artifact download 'out/buildkite/firecracker-kit/**/*' . --build "$ADX_FC_KIT_ARTIFACT_BUILD"
+    export ADX_FC_KIT_DIR="$PWD/out/buildkite/firecracker-kit"
+  fi
+  : "${ADX_FC_KIT_DIR:?checkpoint profile requires a verified native Firecracker kit directory or artifact build}"
+  fc_args=(--firecracker-kit "$ADX_FC_KIT_DIR")
+fi
+python3 -u build/e2e/prepare.py --package out/buildkite/package --backend out/buildkite/backend --runtime-base "$ADX_E2E_RUNTIME_BASE" --rrt-base "$ADX_E2E_RRT_BASE" --output out/buildkite/bundle "${fc_args[@]}" 2>&1 | tee out/buildkite/logs/prepare.log
 echo "--- :docker: Push immutable image references"
 python3 -u build/e2e/kubernetes/publish_images.py --bundle out/buildkite/bundle --repository "$ADX_E2E_IMAGE_REPOSITORY" 2>&1 | tee out/buildkite/logs/publish-images.log

@@ -87,6 +87,7 @@ class ReusableSnapshotTests(unittest.TestCase):
             clone = Sandbox.create(snapshot, name="clone")
         self.assertEqual(clone.id, "default-clone")
         self.assertEqual(captured["snapshotId"], "snap-ready")
+        self.assertNotIn("runtime", captured["rootfs"])
         for resource_field in ("cpu", "memory", "cpu_limit", "mem_limit"):
             self.assertNotIn(resource_field, captured)
 
@@ -173,6 +174,19 @@ class ReusableSnapshotTests(unittest.TestCase):
         self.assertEqual(client.page, ("base", "p", 10))
         Sandbox._delete_snapshot(client, "snap-1")
         self.assertEqual(client.deleted, "snap-1")
+
+    def test_snapshot_catalog_accepts_explicit_connection(self):
+        connection = adx_sandbox.ConnectionConfig(server_address="control:8443", token="test-key", verify_tls=True)
+        with patch("adx_sandbox.sandbox_api.SandboxClient") as client:
+            client.return_value.get_snapshot.return_value = {"snapshotId": "saved", "names": []}
+            client.return_value.list_snapshots.return_value = {"items": [], "nextPageToken": ""}
+            Sandbox.get_snapshot("saved", connection=connection)
+            Sandbox.list_snapshots(connection=connection)
+            Sandbox.delete_snapshot("saved", connection=connection)
+            self.assertEqual(client.call_count, 3)
+            for call in client.call_args_list:
+                self.assertEqual(call.kwargs, {"connection": connection})
+            self.assertEqual(client.return_value.close.call_count, 3)
 
     def test_snapshot_resource_arguments_are_validated_before_transport(self):
         with self.assertRaisesRegex(ValueError, "snapshot_id"):

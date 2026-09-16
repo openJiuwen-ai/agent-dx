@@ -58,6 +58,18 @@ fn unavailable(error: impl std::fmt::Display) -> Error {
 
 #[async_trait]
 impl Readiness for RrtReadiness {
+    async fn activity(&self, record: &InstanceRecord) -> Result<(u64, u64)> {
+        let status = self.client.status(record).await?;
+        if status.phase != RuntimePhase::Running || status.activity_revision == 0 {
+            return Err(unavailable("runtime activity observation is not ready"));
+        }
+        Ok((
+            status.activity_revision,
+            status
+                .active_requests
+                .saturating_add(status.active_commands),
+        ))
+    }
     async fn wait_ready(&self, record: &InstanceRecord) -> Result<()> {
         tokio::time::timeout(self.ready_timeout, async {
             loop {

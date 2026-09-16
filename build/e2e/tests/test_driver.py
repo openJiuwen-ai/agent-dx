@@ -24,7 +24,17 @@ class AcceptanceGateTests(unittest.TestCase):
         self.assertEqual(driver.finish_report(None, [], ['sdk'])['status'], 'failed')
 
     def test_complete_clean_run_passes(self):
-        self.assertEqual(driver.finish_report(None, [], ['sdk', 'auth', 'capacity', 'restart', 'stop'])['status'], 'passed')
+        self.assertEqual(driver.finish_report(None, [], ['sdk', 'auth', 'capacity', 'placement', 'node-failure', 'restart', 'stop'])['status'], 'passed')
+
+    def test_missing_node_failure_scenario_cannot_pass(self):
+        report = driver.finish_report(None, [], ['sdk', 'auth', 'capacity', 'placement', 'restart', 'stop'])
+        self.assertEqual(report['status'], 'failed')
+        self.assertEqual(report['missing_checks'], ['node-failure'])
+
+    def test_old_five_scenarios_without_placement_cannot_pass(self):
+        report = driver.finish_report(None, [], ['sdk', 'auth', 'capacity', 'restart', 'stop'])
+        self.assertEqual(report['status'], 'failed')
+        self.assertIn('placement', report['missing_checks'])
 
     def test_runtime_architecture_must_match_artifact(self):
         with self.assertRaisesRegex(ValueError, 'architecture'):

@@ -8,6 +8,8 @@ use adx_master::{
 };
 fn saved() -> StoredSnapshot {
     let request = InstanceSpec {
+        snapshot_id: None,
+        lifecycle: Default::default(),
         env: Default::default(),
         id: "i".into(),
         tenant_id: "t".into(),
@@ -67,6 +69,8 @@ fn saved() -> StoredSnapshot {
         instances: [(
             "i".into(),
             StoredInstance {
+                recovery: None,
+                invalidated: false,
                 spec: request,
                 assignment,
                 result: None,

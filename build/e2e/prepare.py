@@ -26,6 +26,7 @@ def main():
     p=argparse.ArgumentParser()
     for name in ('package','backend','output'):p.add_argument('--'+name,type=Path,required=True)
     p.add_argument('--runtime-base',required=True);p.add_argument('--rrt-base',required=True)
+    p.add_argument('--firecracker-kit',type=Path)
     a=p.parse_args();a.output.mkdir(parents=True,exist_ok=False)
     manifest=package.verify(a.package)
     if os.getenv('BUILDKITE'):
@@ -40,6 +41,10 @@ def main():
     for name in BACKEND_BINARIES:
         path=a.backend/name
         if path.is_symlink() or sha(path) != backend['files'][name]:raise ValueError('backend integrity mismatch')
+    fc_kit=None
+    if a.firecracker_kit:
+        from firecracker.kit import verify as verify_kit
+        fc_kit=verify_kit(a.firecracker_kit,backend)
     uid=uuid.uuid4().hex[:12];tags={'node':f'adx-e2e-node:{uid}','rrt':f'adx-e2e-rrt:{uid}'}
     with tempfile.TemporaryDirectory(prefix='adx-e2e-image-') as d:
         context=Path(d)
@@ -55,7 +60,17 @@ def main():
             (context/'backend'/name).chmod(0o755)
         shutil.copytree(ROOT/'build/e2e',context/'e2e',ignore=shutil.ignore_patterns('__pycache__','tests'))
         shutil.copy2(ROOT/'build/ci/rpc_certificates.py',context/'e2e/rpc_certificates.py')
+        shutil.copy2(ROOT/'build/release/package.py',context/'e2e/package.py')
+        if fc_kit:
+            for name in fc_kit['files']:
+                output=context/'fc-kit'/name;output.parent.mkdir(parents=True,exist_ok=True)
+                shutil.copy2(a.firecracker_kit/name,output)
+                if not name.startswith('artifacts/'):output.chmod(0o755)
+            (context/'fc-kit/manifest.json').write_text(json.dumps(fc_kit,indent=2))
         (context/'Dockerfile.node').write_text('ARG BASE\nFROM ${BASE}\nCOPY package /opt/adx/package\nCOPY backend /usr/local/bin\nCOPY e2e /opt/adx/e2e\nRUN python3 -m venv /opt/adx/client && /opt/adx/client/bin/pip install /opt/adx/package/sdk/*.whl\nWORKDIR /opt/adx\nCMD ["sleep", "infinity"]\n')
+        if fc_kit:
+            with (context/'Dockerfile.node').open('a') as dockerfile:
+                dockerfile.write('COPY fc-kit /opt/adx-fc\nCOPY fc-kit/tools /opt/adx/tools\n')
         (context/'Dockerfile.rrt').write_text('ARG BASE\nFROM ${BASE}\nCOPY package/runtime/rrt-runtime /usr/local/bin/rrt-runtime\nENTRYPOINT ["/usr/local/bin/rrt-runtime"]\n')
         for role,base in [('node',a.runtime_base),('rrt',a.rrt_base)]:
             subprocess.run(['docker','build','--progress=plain','--provenance=false','--build-arg','BASE='+base,'-f',str(context/f'Dockerfile.{role}'),'-t',tags[role],str(context)],stderr=subprocess.STDOUT,check=True,timeout=900)
@@ -63,6 +78,7 @@ def main():
         subprocess.run(['docker','save','-o',str(a.output/'images.tar'),*tags.values()],stderr=subprocess.STDOUT,check=True,timeout=600)
         subprocess.run(['docker','save','-o',str(a.output/'rrt.tar'),tags['rrt']],stderr=subprocess.STDOUT,check=True,timeout=300)
     result={'schema_version':1,'package':manifest,'backend':backend,'image_ids':{k:v['Id'] for k,v in images.items()},'architecture':images['node']['Architecture'],'archive_sha256':sha(a.output/'images.tar'),'rrt_archive_sha256':sha(a.output/'rrt.tar'),'base_images':{'node':a.runtime_base,'rrt':a.rrt_base}}
+    if fc_kit:result['firecracker_kit']=fc_kit
     (a.output/'bundle.json').write_text(json.dumps(result,indent=2)+'\n')
     print('E2E bundle prepared:',a.output)
 

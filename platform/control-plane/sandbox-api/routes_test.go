@@ -55,7 +55,7 @@ func testDependencies(b *recordingBackend, tenant string) backend.Dependencies {
 			}
 			return backend.Identity{TenantID: tenant, Role: backend.RoleTenant}, nil
 		},
-		MasterAddress: func() string { return "http://master.invalid" }, SnapshotHTTPClient: http.DefaultClient}
+	}
 }
 func serveDelete(r http.Handler, key string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(http.MethodDelete, "/api/sandbox/owned-instance", nil)

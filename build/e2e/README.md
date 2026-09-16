@@ -4,6 +4,12 @@ Buildkite deploys to **Kubernetes** through [kubernetes/run.py](kubernetes/READM
 It creates a dedicated namespace with two node Pods and Services, using immutable
 images from the build step. Each Pod runs the platform as processes.
 
+## Installed example reproduction
+
+[Installed example acceptance](example/README.md) runs the shipped complete
+deployment configuration on a dedicated Linux KVM host, checks public SDK
+operations and shutdown cleanup, and preserves configuration hashes.
+
 ## Local Docker reproduction
 
 For local reproduction, `prepare.py` turns a verified ADX release package and pinned external backend
@@ -39,9 +45,18 @@ Local Docker reproduction requires access to the same bind-mounted paths as the 
   binary file round-trip, explicit deletion, Redis terminal state and released
   resources, and empty sandboxd inventories.
 - `auth`: invalid key and another tenant cannot read or delete the instance;
-  the owner's instance remains running.
+  the owner's instance remains running. An administrator creates, lists and
+  revokes a tenant key through HTTPS Edge; tenant management requests are denied,
+  and revocation takes effect within the configured authentication cache budget.
 - `capacity`: fill both nodes' advertised CPU capacity, verify another create
   waits, then release capacity and require that request to become executable.
+- `placement`: use the public SDK on two nodes to verify instance affinity OR,
+  instance anti-affinity, weighted and ordered node preferences, node ID
+  constraints on every OR branch, and reverse instance anti-affinity; verify
+  actual assignments, execute a command and check physical cleanup.
+- `node-failure`: suspend node2 Node Manager heartbeats while its runtime remains
+  independently hosted; require persisted invalidation, resume the same process,
+  require backend cleanup before readiness, and prove node1 remains executable.
 - `restart`: terminate only Node Manager processes, wait for fresh node sessions
   and completed reconciliation, prove backend IDs are unchanged, then query and
   execute on the original instances.
@@ -59,7 +74,7 @@ are retained as build artifacts/cache; test containers and network are removed.
 
 The basic case uses runc, `idle_timeout=0`, and no writable-layer quota. It does
 not validate pause/resume, snapshots, Master outage, cross-node recovery, XPU,
-tunnels, affinity or performance. Resource observations read the node's cgroup
+tunnels, mixed-load scheduling or performance. Resource observations read the node's cgroup
 limits and filesystem with infrastructure reservations; this fixture is not
 the future production sandboxd collector.
 

@@ -133,3 +133,34 @@ steps:
               cpu: '4'
               memory: 8Gi
           env: *id001
+- label: ':kubernetes: Firecracker checkpoint + snapshots + faults'
+  key: platform-fc-e2e
+  if: build.env("ADX_E2E_CHECKPOINT") == "1"
+  depends_on: platform-images
+  agents:
+    queue: default
+    os: linux
+    arch: amd64
+  command: bash .buildkite/firecracker-step.sh
+  timeout_in_minutes: 40
+  artifact_paths:
+  - out/buildkite/firecracker/**/*
+  - out/buildkite/logs/firecracker-kubernetes.log
+  env:
+    BUILDKITE_AGENT_NAME: agent-stack-k8s
+    ADX_KUBECONFIG: /var/run/yr-k8s/target/kubeconfig
+  plugins:
+  - kubernetes:
+      podSpec:
+        imagePullSecrets:
+        - name: swr-pull-secret
+        containers:
+        - image: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/sandbox-deployer:v20260506_kubectl_py39
+          resources:
+            requests:
+              cpu: '2'
+              memory: 4Gi
+            limits:
+              cpu: '4'
+              memory: 8Gi
+          env: *id001

@@ -15,7 +15,6 @@
   },
   "sandboxd_socket": "/run/sandboxd/sandboxd.sock",
   "proxy_socket": "/run/adx/route.sock",
-  "capacity_file": "/run/adx/resource-observation.json",
   "report_interval_seconds": 5,
   "rpc_timeout_seconds": 30,
   "rrt_port": 50090,
@@ -26,5 +25,29 @@
   "discovery": {
     "redis_url": "redis://127.0.0.1:6379/",
     "namespace": "adx"
+  },
+  "checkpoint_dir": "/var/lib/adx/checkpoints",
+  "resource_source": {
+    "kind": "sandboxd",
+    "socket": "/run/sandboxd/node-resource.sock",
+    "valid_for_seconds": 30
+  },
+  "degradation_journal": "/var/lib/adx/degraded/results.sqlite",
+  "pressure": {
+    "disk_path": "/var/lib/adx",
+    "thresholds": {
+      "memory_high_percent": 90,
+      "memory_low_percent": 80,
+      "disk_high_percent": 90,
+      "disk_low_percent": 80
+    }
+  },
+  "metrics_listen": "127.0.0.1:19003",
+  "runtime_ready_timeout_seconds": 120,
+  "checkpoint_gc": {
+    "enabled": true,
+    "min_age_seconds": 86400,
+    "interval_seconds": 300,
+    "max_artifacts": 100
   }
 }

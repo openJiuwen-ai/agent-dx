@@ -1,0 +1,78 @@
+import importlib.util
+from pathlib import Path
+import tempfile
+import unittest
+import json
+import sys
+
+ROOT=Path(__file__).resolve().parents[1]
+sys.path.insert(0,str(ROOT/'firecracker'))
+
+class FirecrackerEvidenceTests(unittest.TestCase):
+    def test_missing_or_duplicate_cases_cannot_pass(self):
+        import acceptance
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d)
+            (root/'sdk').mkdir(); (root/'lifecycle').mkdir()
+            (root/'result.json').write_text(json.dumps({'status':'passed'}))
+            for group in ('sdk','lifecycle'):
+                (root/group/'result.json').write_text(json.dumps({'status':'passed','cases':[{'name':'duplicate','passed':True}]*5}))
+            with self.assertRaises(ValueError): acceptance.verify(root)
+    def test_manifest_requires_kvm_and_pinned_images_and_selected_node(self):
+        import acceptance
+        image='registry.example/node@sha256:'+'a'*64
+        pod=acceptance.pod('adx-e2e-test',image,'amd64','worker-a',True)
+        spec=pod['spec'];self.assertFalse(spec['automountServiceAccountToken']);self.assertNotIn('hostPID',spec);self.assertNotIn('hostNetwork',spec)
+        self.assertEqual(spec['nodeSelector']['kubernetes.io/hostname'],'worker-a')
+        self.assertIn({'name':'kvm','hostPath':{'path':'/dev/kvm','type':'CharDevice'}},spec['volumes'])
+        with self.assertRaises(ValueError): acceptance.pod('adx-e2e-test','node:latest','amd64','worker-a',True)
+
+    def test_kit_rejects_altered_files_and_backend_identity(self):
+        import kit,hashlib
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d);files={}
+            for name in kit.REQUIRED:
+                p=root/name;p.parent.mkdir(parents=True,exist_ok=True);p.write_bytes(name.encode());files[name]=hashlib.sha256(p.read_bytes()).hexdigest()
+            backend={'target':'aarch64-unknown-linux-gnu','sandboxd_revision':'pinned','files':{'sandboxd':files['bin/sandboxd'],'sbox':files['bin/sbox'],'redis-cli':files['tools/redis-cli']}}
+            (root/'manifest.json').write_text(json.dumps({'schema_version':1,'target':backend['target'],'sandboxd_revision':'pinned','files':files}))
+            kit.verify(root,backend)
+            (root/'artifacts/Image').write_bytes(b'altered')
+            with self.assertRaises(ValueError):kit.verify(root,backend)
+
+    def test_complete_evidence_passes_but_cleanup_error_fails(self):
+        import acceptance
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d)
+            for group,names in acceptance.CASES.items():
+                (root/group).mkdir();(root/group/'result.json').write_text(json.dumps({'status':'passed','cases':[{'name':name,'passed':True} for name in names]}))
+            (root/'result.json').write_text(json.dumps({'status':'passed'}))
+            (root/'sdk/snapshot-collected-before-clone-resume.json').write_text(json.dumps({'snapshot_id':'saved','state':'Deleted','references':[]}))
+            (root/'orphan-gc.json').write_text(json.dumps({**{k:True for k in ('passed','current_session_preserved','retired_session_removed','foreign_preserved','unmarked_preserved')},'registered_checkpoint_preserved':'saved'}))
+            (root/'snapshots-final.json').write_text(json.dumps({'saved':{'state':'Deleted','references':[]}}))
+            (root/'catalog-final.json').write_text(json.dumps({'instance:a':{'result':{'state':'Deleted','resources_held':False}}}))
+            (root/'s3-final.xml').write_text('<ListBucketResult />');(root/'inventory-final.txt').write_text('ID STATUS\n')
+            self.assertEqual(len(acceptance.verify(root)),sum(map(len,acceptance.CASES.values())))
+            (root/'result.json').write_text(json.dumps({'status':'passed','stop_error':'failed'}))
+            with self.assertRaises(ValueError):acceptance.verify(root)
+
+    def test_fc_cleanup_refuses_replaced_namespace(self):
+        spec=importlib.util.spec_from_file_location('fc_kube',ROOT/'firecracker/kubernetes.py')
+        module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as d:
+            run=module.FirecrackerRun(Path(d),Path('/test/kubeconfig'));run.namespace_attempted=True;run.namespace_uid='original';calls=[]
+            def command(*args,**kwargs):
+                calls.append(args);return json.dumps({'metadata':{'uid':'replacement','labels':{'adx.e2e.run':run.id}}})
+            run.kube=command
+            self.assertTrue(run.cleanup());self.assertFalse(any('delete' in c for c in calls))
+
+    def test_ci_summary_does_not_pass_missing_or_partial_result(self):
+        import subprocess
+        script=ROOT.parents[1]/'.buildkite/fc-summary.py'
+        with tempfile.TemporaryDirectory() as d:
+            directory=Path(d)/'out/buildkite/firecracker'
+            result=subprocess.run([sys.executable,str(script),'--exit-code','0'],cwd=d,capture_output=True,text=True)
+            self.assertNotEqual(result.returncode,0)
+            self.assertIn('FAIL',(directory/'summary.md').read_text())
+            (directory/'result.json').write_text(json.dumps({'status':'passed','cases':[{'name':str(n)} for n in range(9)]}))
+            result=subprocess.run([sys.executable,str(script),'--exit-code','0'],cwd=d,capture_output=True,text=True)
+            self.assertNotEqual(result.returncode,0)

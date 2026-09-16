@@ -3721,3 +3721,16 @@ func TestCreateV1HandlerRejectsInvalidNetworkPolicy(t *testing.T) {
 		})
 	}
 }
+
+func TestAffinityWeightAndModeValidation(t *testing.T) {
+	conditions := []Affinity{{Kind: AffinityKindResource, Affinity: PreferredAffinity, PreferredPriority: true, Weight: 9, LabelOps: []LabelOperator{{Type: LabelOpExists, LabelKey: "a"}}}}
+	require.NoError(t, validateScheduleAffinities(conditions))
+	raw, err := buildSandboxRawScheduleAffinity(conditions)
+	require.NoError(t, err)
+	require.Equal(t, int64(9), raw.Resource.PreferredAffinity.Condition.SubConditions[0].Weight)
+	conditions = append(conditions, Affinity{Kind: AffinityKindResource, Affinity: PreferredAffinity, LabelOps: []LabelOperator{{Type: LabelOpExists, LabelKey: "b"}}})
+	_, err = buildSandboxRawScheduleAffinity(conditions)
+	require.Error(t, err)
+	conditions[0].Weight = -1
+	require.Error(t, validateScheduleAffinities(conditions))
+}

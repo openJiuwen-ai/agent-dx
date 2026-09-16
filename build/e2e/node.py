@@ -68,14 +68,46 @@ def main():
         (E/'catalog-after-delete.json').write_text(json.dumps(records,indent=2))
     elif action=='sessions':
         (E/'previous-sessions.json').write_text(json.dumps({n['node']['id']:n['session']['id'] for n in nodes()}))
+    elif action=='freeze':
+        current=supervisor('status');manager=next(s for s in current['services'] if s['role']=='node-manager')
+        assert manager['pid'] and len(backend())==1
+        (P/'frozen-manager.pid').write_text(str(manager['pid']))
+        os.kill(manager['pid'],signal.SIGSTOP)
+        print('Node Manager heartbeat suspended; runtime remains externally hosted',flush=True)
+    elif action=='thaw':
+        path=P/'frozen-manager.pid'
+        if path.exists():
+            pid=int(path.read_text());current=supervisor('status')
+            assert any(s['role']=='node-manager' and s['pid']==pid for s in current['services'])
+            os.kill(pid,signal.SIGCONT);path.unlink()
+            print('Node Manager resumed; waiting for authoritative cleanup',flush=True)
+    elif action=='failure-observed':
+        end=time.monotonic()+65
+        while True:
+            c=catalog();live=json.loads((E/'live-instances.json').read_text())
+            records=[json.loads(c['instance:'+sid]) for sid in live]
+            failed=[r for r in records if r['assignment']['node_id']=='node2']
+            healthy=[r for r in records if r['assignment']['node_id']=='node1']
+            assert len(failed)==len(healthy)==1
+            node_record=json.loads(c['node:node2'])
+            if failed[0].get('invalidated'):
+                assert failed[0]['result']['state']=='Failed' and not failed[0]['result']['resources_held']
+                assert not node_record['node']['available'] and not node_record['session']['routable']
+                assert healthy[0]['result']['state']=='Running'
+                (E/'node-failure-observed.json').write_text(json.dumps({'failed_id':failed[0]['spec']['id'],'healthy_id':healthy[0]['spec']['id'],'invalidated':True,'node_unavailable':True,'route_unpublished':True},indent=2))
+                print('PASS: heartbeat timeout invalidated old execution; healthy node unaffected',flush=True)
+                break
+            if time.monotonic()>end:raise TimeoutError('expired execution was not invalidated')
+            time.sleep(.5)
     elif action=='restart':
         before=backend();assert len(before)==1
         (E/f'backend-before-{node}.json').write_text(json.dumps(before))
         current=supervisor('status');manager=[s for s in current['services'] if s['role']=='node-manager'];assert len(manager)==1 and manager[0]['pid']
         os.kill(manager[0]['pid'],signal.SIGKILL)
     elif action=='unchanged':
-        after=backend();assert after==json.loads((E/f'backend-before-{node}.json').read_text())
+        after=backend()
         (E/f'backend-after-{node}.json').write_text(json.dumps(after))
+        assert after==json.loads((E/f'backend-before-{node}.json').read_text()), 'backend identity changed across Node Manager restart'
     elif action=='stop':
         assert supervisor('stop')['ok'];collect(node)
         # sandboxd is independent of the supervisor and still responds here.

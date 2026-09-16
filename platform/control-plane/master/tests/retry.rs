@@ -2,6 +2,8 @@ use adx_core::{Error, InstanceSpec, Resources};
 use adx_master::{Master, Node, Placement};
 fn spec() -> InstanceSpec {
     InstanceSpec {
+        snapshot_id: None,
+        lifecycle: Default::default(),
         env: Default::default(),
         id: "r".into(),
         tenant_id: "t".into(),

@@ -53,7 +53,7 @@ impl RouteConsumer {
                 || r.tenant_id.is_empty()
                 || r.generation == 0
                 || r.instance_revision == 0
-                || r.runtime_id != format!("{}-{}", r.instance_id, r.generation)
+                || !adx_protocol::valid_runtime_id(&r.instance_id, r.generation, &r.runtime_id)
                 || r.runtime_ip.parse::<std::net::IpAddr>().is_err()
                 || r.node_proxy_address.contains(['/', '@', '?', '#'])
                 || r.node_proxy_address

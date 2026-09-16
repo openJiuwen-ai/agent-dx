@@ -2,9 +2,14 @@
 
 pub mod activity;
 pub mod admin;
+pub mod checkpoint;
 mod controller;
+pub mod journal;
+pub mod metrics;
+pub mod proxy;
 pub mod readiness;
 mod reconciliation;
+pub mod resources;
 pub mod routes;
 pub mod rpc;
 pub mod runtime_control;
@@ -46,6 +51,49 @@ pub struct RuntimeObservation {
 
 #[async_trait]
 pub trait RuntimeBackend: Send + Sync {
+    async fn stats(&self, _runtime_id: &str) -> Result<metrics::RuntimeUsage> {
+        Err(Error::Unavailable("runtime usage is unavailable".into()))
+    }
+    async fn checkpoint_supported(&self, _runtime: &str) -> Result<()> {
+        Err(Error::Invalid(
+            "runtime does not support checkpoint/restore".into(),
+        ))
+    }
+    async fn checkpoint(
+        &self,
+        _runtime_id: &str,
+        _path: &std::path::Path,
+        _timeout: Duration,
+    ) -> Result<()> {
+        Err(Error::Invalid("runtime does not support checkpoint".into()))
+    }
+    async fn restore(
+        &self,
+        _spec: &InstanceSpec,
+        _runtime_id: &str,
+        _generation: u64,
+        _devices: &[DeviceAllocation],
+        _path: &std::path::Path,
+    ) -> Result<std::net::IpAddr> {
+        Err(Error::Invalid("runtime does not support restore".into()))
+    }
+    async fn restore_from(
+        &self,
+        spec: &InstanceSpec,
+        runtime_id: &str,
+        generation: u64,
+        devices: &[DeviceAllocation],
+        path: &std::path::Path,
+        origin: Option<&adx_core::runtime::RuntimeIdentity>,
+    ) -> Result<std::net::IpAddr> {
+        if origin.is_some() {
+            return Err(Error::Invalid(
+                "runtime does not support snapshot cloning".into(),
+            ));
+        }
+        self.restore(spec, runtime_id, generation, devices, path)
+            .await
+    }
     /// Complete inventory of managed runtimes. Failure is never an empty list.
     async fn inventory(&self) -> Result<Vec<RuntimeObservation>> {
         Err(Error::Unavailable(
@@ -69,12 +117,19 @@ pub trait RuntimeBackend: Send + Sync {
 
 #[async_trait]
 pub trait Readiness: Send + Sync {
+    async fn activity(&self, _record: &InstanceRecord) -> Result<(u64, u64)> {
+        Err(Error::Unavailable("runtime activity is unavailable".into()))
+    }
     /// Runtime execution and the platform runtime service must both be ready.
     async fn wait_ready(&self, record: &InstanceRecord) -> Result<()>;
 }
 
 #[async_trait]
 pub trait Routes: Send + Sync {
+    /// (process session, cumulative activity revision, active streams).
+    async fn activity(&self, _record: &InstanceRecord) -> Result<(String, u64, u64)> {
+        Err(Error::Unavailable("proxy activity is unavailable".into()))
+    }
     async fn begin_reconcile(&self) -> Result<()> {
         Ok(())
     }
@@ -110,11 +165,13 @@ pub(crate) struct Admission {
     devices_valid_until: Option<Instant>,
     valid_until: Option<Instant>,
     maintenance: bool,
+    pressure: bool,
 }
 
 impl Admission {
     fn reserve(&mut self, id: &str, spec: &InstanceSpec, assignment: &Assignment) -> Result<()> {
         if self.maintenance
+            || self.pressure
             || self.valid_until.is_none_or(|until| Instant::now() >= until)
             || (!spec.scheduling.devices.is_empty()
                 && self
@@ -149,6 +206,10 @@ pub(crate) struct Services {
     sink: Arc<dyn StateSink>,
     admission: Arc<Mutex<Admission>>,
     operation_timeout: Duration,
+    checkpoint: Option<Arc<checkpoint::CheckpointServices>>,
+    snapshots: Option<Arc<dyn checkpoint::SnapshotCatalog>>,
+    metrics: metrics::Metrics,
+    health_failure_threshold: Option<u32>,
 }
 
 pub struct NodeManager {
@@ -184,15 +245,56 @@ impl NodeManager {
                     devices_valid_until: None,
                     valid_until: None,
                     maintenance: false,
+                    pressure: false,
                 })),
                 operation_timeout: Duration::from_secs(30),
+                checkpoint: None,
+                snapshots: None,
+                metrics: metrics::Metrics::default(),
+                health_failure_threshold: None,
             }),
             instances: Mutex::default(),
         }
     }
 
+    pub fn with_snapshot_catalog(
+        mut self,
+        catalog: Arc<dyn checkpoint::SnapshotCatalog>,
+    ) -> Result<Self> {
+        Arc::get_mut(&mut self.services)
+            .ok_or(Error::Conflict)?
+            .snapshots = Some(catalog);
+        Ok(self)
+    }
+
+    pub fn with_checkpointing(
+        mut self,
+        store: Arc<dyn checkpoint::CheckpointStore>,
+        cooperation: Arc<dyn checkpoint::CheckpointCooperation>,
+    ) -> Result<Self> {
+        Arc::get_mut(&mut self.services)
+            .ok_or(Error::Conflict)?
+            .checkpoint = Some(Arc::new(checkpoint::CheckpointServices {
+            store,
+            cooperation,
+        }));
+        Ok(self)
+    }
+
     pub async fn sync_proxy(&self) -> Result<()> {
         self.services.routes.ensure_synced().await
+    }
+
+    pub fn with_health_check(mut self, failure_threshold: Option<u32>) -> Result<Self> {
+        if failure_threshold == Some(0) {
+            return Err(Error::Invalid(
+                "health failure threshold must be positive".into(),
+            ));
+        }
+        Arc::get_mut(&mut self.services)
+            .ok_or(Error::Conflict)?
+            .health_failure_threshold = failure_threshold;
+        Ok(self)
     }
 
     pub async fn pause_lifecycle(&self) {
@@ -243,6 +345,22 @@ impl NodeManager {
         self.services.admission.lock().unwrap().maintenance = maintenance;
     }
 
+    pub fn set_pressure(&self, under_pressure: bool) {
+        self.services.admission.lock().unwrap().pressure = under_pressure;
+    }
+
+    pub fn accepting_allocations(&self) -> bool {
+        if !self.lifecycle_ready.try_read().is_ok_and(|ready| *ready) {
+            return false;
+        }
+        let admission = self.services.admission.lock().unwrap();
+        !admission.maintenance
+            && !admission.pressure
+            && admission
+                .valid_until
+                .is_some_and(|until| Instant::now() < until)
+    }
+
     pub fn used(&self) -> Resources {
         self.services.admission.lock().unwrap().ledger.used()
     }
@@ -280,5 +398,65 @@ impl NodeManager {
         let handle = controller::spawn(spec.clone(), assignment.clone(), self.services.clone());
         instances.insert(spec.id.clone(), (spec, assignment, handle.clone()));
         Ok(handle)
+    }
+}
+
+impl NodeManager {
+    /// Best effort across independent instances; each expiration is serialized
+    /// with that instance's accepted lifecycle operations.
+    pub async fn expire_checkpoints(&self) -> Result<()> {
+        let gate = self.lifecycle_ready.read().await;
+        if !*gate || self.is_draining() {
+            return Ok(());
+        }
+        let handles: Vec<_> = self
+            .instances
+            .lock()
+            .unwrap()
+            .values()
+            .map(|(_, _, h)| h.clone())
+            .collect();
+        let now = checkpoint::now()?;
+        let mut failure = None;
+        for h in handles {
+            if let Err(e) = h.expire_checkpoint(now).await {
+                failure = Some(e);
+            }
+        }
+        failure.map_or(Ok(()), Err)
+    }
+}
+
+impl NodeManager {
+    /// Each check enters the Instance's serial controller. Bound fan-out so a
+    /// slow backend cannot create an unbounded number of node monitoring tasks.
+    pub async fn monitor_instances(&self) -> Result<()> {
+        let gate = self.lifecycle_ready.read().await;
+        if !*gate || self.is_draining() {
+            return Ok(());
+        }
+        let handles: Vec<_> = self
+            .instances
+            .lock()
+            .unwrap()
+            .values()
+            .map(|(_, _, h)| h.clone())
+            .collect();
+        let mut error = None;
+        for chunk in handles.chunks(32) {
+            let mut tasks = tokio::task::JoinSet::new();
+            for handle in chunk {
+                let handle = handle.clone();
+                tasks.spawn(async move { handle.tick().await });
+            }
+            while let Some(result) = tasks.join_next().await {
+                match result {
+                    Ok(Ok(())) => (),
+                    Ok(Err(e)) => error = Some(e),
+                    Err(e) => error = Some(Error::Unavailable(format!("lifecycle monitor: {e}"))),
+                }
+            }
+        }
+        error.map_or(Ok(()), Err)
     }
 }

@@ -1,5 +1,7 @@
 # 管控面实施状态
 
+2026-09-16 更新：暂停/恢复、S3 存储、SQLite 降级、空闲回收及自动重启已有真实本地 FC 验收。共用 NodeProxyService、目录 RPC 与 Frontend 查询也已接通。最新能力和未完成项以 [阶段进度](control-plane-roadmap.md) 为准；本文保留早期实施与 TDD 记录。
+
 2026-09-15。内部抽象为 Instance，外部 Sandbox API 保持兼容。已实现库、适配器和服务进程入口，创建／执行／删除及节点进程重启已通过真实两节点本地 E2E，见 [本地验收](local-e2e.md)。Buildkite 远端门禁尚未运行。当前发现与恢复边界见 [节点恢复阶段](recovery-discovery.md)，路由发布与本机代理同步见 [路由阶段](route-publication.md)。
 
 ## 已落地模块
@@ -34,7 +36,7 @@
 
 每个 Instance 的操作在一个任务内顺序执行。客户端断开不会取消已经接收的操作；重复创建不会再执行 Start，提交失败后的重试只重新提交结果。Deleted 不能被旧创建请求重新启动。
 
-`StateSink` 区分 Published（Master 已提交集群存储）与 Journaled（节点持久化降级日志）。Master 现已实现 Redis 存储和调度恢复库；StateSink 的 Master RPC 已接通并通过真实 Redis 协作测试；SQLite 与降级补写尚未实现；节点重启对账已接通，完整平台部署仍待装配。
+`StateSink` 区分 Published（Master 已提交集群存储）与 Journaled（节点持久化降级日志）。Master 现已实现 Redis 存储和调度恢复库；StateSink 的 Master RPC 已接通并通过真实 Redis 协作测试；SQLite 降级与有序补写现已实现，见 [节点生命周期](node-lifecycle.md)；节点重启对账已接通，完整平台部署仍待装配。
 
 sandboxd 适配器把已开始的 RPC 放在独立任务中，持有同一执行身份的锁，防止清理越过未结束的 Start。后端结果不明确时保留资源等待对账。Node Proxy 使用新 gRPC 协议，在接收端按归属代次和绑定版本拒绝迟到更新；退役保留版本记录。两者的进程重启仍需权威对账，内存锁和版本记录不能替代跨重启隔离。
 
@@ -71,7 +73,7 @@ TDD 红灯证据：调度内核和节点控制器分别先因缺失实现失败�
 
 仅 `frontend_proxy_service.proto` 保留为旧 gRPC 兼容服务，导入的消息类型限制在 Frontend 兼容层。已删除其生成范围内的 CoreService、RuntimeService、RuntimeRPC、InvocationRPC 服务。
 
-Node Proxy 绑定/活跃度已改为 `adx.node.v1`，同时修改客户端和服务端；新增的 Node Manager 活跃度接收器会校验会话、序号与观测时效。共进程和分进程使用相同绑定处理契约，进程装配仍待实现。
+Node Proxy 绑定/活跃度已改为 `adx.node.v1`，同时修改客户端和服务端；新增的 Node Manager 活跃度接收器会校验会话、序号与观测时效。共进程和分进程使用相同绑定处理契约，现由共享 NodeProxyService 统一装配，见 [进程模式](node-proxy-process-modes.md)。
 
 RRT `rrt.v1` 的 Process/Health/Filesystem/Port 协议及服务、工具入口已经删除，命令、文件等能力通过 HTTP 验证。RRT POSIX 流、通用 signal 上报、函数调用分发和 protobuf 构建依赖已移除。Node Manager 通过新 HTTP 控制接口读取身份/活跃度、准备 checkpoint、撤销确认未启动的 checkpoint；RRT 在后端 handoff 后完成环境更新和监听器重建。完整协议清单见 [协议边界](../../platform/api/proto/README.md)。
 

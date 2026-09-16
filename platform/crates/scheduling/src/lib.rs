@@ -1,6 +1,7 @@
 //! Synchronous, read-only placement rules shared by scheduling consumers.
 //! Domain owns queues and reservations; plugins only evaluate candidate snapshots.
 pub mod constraints;
+mod groups;
 pub mod plugins;
 pub mod query;
 pub mod snapshot;
@@ -64,6 +65,7 @@ impl Framework {
         let mut framework = Self::new(
             vec![],
             vec![
+                WeightedScore::new(Arc::new(groups::Preference), 1).expect("static weight"),
                 WeightedScore::new(Arc::new(plugins::ResourceBalance(placement)), 1)
                     .expect("static weight"),
                 WeightedScore::new(Arc::new(constraints::NodePreference), 1)
@@ -90,6 +92,7 @@ impl Framework {
             Arc::new(plugins::ResourceFit),
             Arc::new(constraints::DeviceFit),
             Arc::new(constraints::NodeAffinity),
+            Arc::new(groups::Required),
             Arc::new(constraints::InstanceAffinity),
             Arc::new(constraints::Topology),
         ];

@@ -15,6 +15,30 @@ pub struct NodeRpc {
     session_id: String,
 }
 impl NodeRpc {
+    #[allow(clippy::result_large_err)] // tonic transport status is shared by all RPC adapters.
+    fn owned_handle(
+        &self,
+        assignment: Option<pb::Assignment>,
+        caller: Option<&pb::CallerContext>,
+    ) -> std::result::Result<crate::InstanceHandle, Status> {
+        let assignment: adx_core::Assignment = assignment
+            .ok_or_else(|| Status::invalid_argument("assignment required"))?
+            .try_into()
+            .map_err(status)?;
+        let (spec, owner, handle) = self
+            .manager
+            .instances
+            .lock()
+            .unwrap()
+            .get(&assignment.instance_id)
+            .cloned()
+            .ok_or_else(|| Status::not_found("instance not managed on this node"))?;
+        tenant(caller, &spec.tenant_id)?;
+        if owner != assignment {
+            return Err(Status::failed_precondition("assignment changed"));
+        }
+        Ok(handle)
+    }
     pub fn new(manager: Arc<NodeManager>, peers: Peers, session_id: String) -> Self {
         Self {
             manager,
@@ -34,6 +58,102 @@ fn response(result: crate::OperationResult) -> Result<Response<pb::InstanceResul
 }
 #[tonic::async_trait]
 impl pb::node_service_server::NodeService for NodeRpc {
+    async fn recover_instance(
+        &self,
+        request: Request<pb::RecoverInstanceRequest>,
+    ) -> std::result::Result<Response<pb::InstanceResult>, Status> {
+        if self.peers.authenticate(&request)? != Principal::Master {
+            return Err(Status::permission_denied("Master identity required"));
+        }
+        let r = request.into_inner();
+        if r.node_session_id != self.session_id || self.session_id.is_empty() {
+            return Err(Status::failed_precondition("node process session changed"));
+        }
+        let record = r
+            .record
+            .ok_or_else(|| Status::invalid_argument("recovery record required"))?
+            .try_into()
+            .map_err(status)?;
+        response(
+            self.manager
+                .recover_instance(record)
+                .await
+                .map_err(status)?,
+        )
+        .map_err(status)
+    }
+
+    async fn get_session(
+        &self,
+        request: Request<pb::GetNodeSessionRequest>,
+    ) -> std::result::Result<Response<pb::GetNodeSessionResponse>, Status> {
+        if self.peers.authenticate(&request)? != Principal::Master {
+            return Err(Status::permission_denied("Master identity required"));
+        }
+        Ok(Response::new(pb::GetNodeSessionResponse {
+            node_id: self.manager.node_id.clone(),
+            session_id: self.session_id.clone(),
+        }))
+    }
+
+    async fn create_snapshot(
+        &self,
+        request: Request<pb::CreateSnapshotRequest>,
+    ) -> std::result::Result<Response<pb::CreateSnapshotResponse>, Status> {
+        if self.peers.authenticate(&request)? != Principal::Frontend {
+            return Err(Status::permission_denied(
+                "validated Frontend caller required",
+            ));
+        }
+        let gate = self.manager.lifecycle_ready.read().await;
+        if !*gate {
+            return Err(Status::unavailable("node is reconciling"));
+        }
+        let r = request.into_inner();
+        let handle = self.owned_handle(r.assignment, r.caller.as_ref())?;
+        let saved = handle
+            .snapshot(crate::checkpoint::SnapshotRequest {
+                operation_id: r.operation_id,
+                expected_revision: r.expected_revision,
+                names: r.names,
+                timeout_seconds: r.timeout_seconds,
+            })
+            .await
+            .map_err(status)?;
+        Ok(Response::new(pb::CreateSnapshotResponse {
+            snapshot: Some(saved.snapshot.try_into().map_err(status)?),
+            instance: Some(response(saved.instance).map_err(status)?.into_inner()),
+        }))
+    }
+    async fn collect_snapshot(
+        &self,
+        request: Request<pb::CollectSnapshotRequest>,
+    ) -> std::result::Result<Response<pb::CollectSnapshotResponse>, Status> {
+        if self.peers.authenticate(&request)? != Principal::Master {
+            return Err(Status::permission_denied("Master identity required"));
+        }
+        let gate = self.manager.lifecycle_ready.read().await;
+        if !*gate {
+            return Err(Status::unavailable("node is reconciling"));
+        }
+        let r = request.into_inner();
+        if self.session_id.is_empty() || r.node_session_id != self.session_id {
+            return Err(Status::failed_precondition("node process session changed"));
+        }
+        let snapshot = r
+            .snapshot
+            .ok_or_else(|| Status::invalid_argument("snapshot required"))?
+            .try_into()
+            .map_err(status)?;
+        self.manager
+            .collect_snapshot(&snapshot)
+            .await
+            .map_err(status)?;
+        Ok(Response::new(pb::CollectSnapshotResponse {
+            snapshot_id: snapshot.id,
+            revision: snapshot.revision,
+        }))
+    }
     async fn create_instance(
         &self,
         request: Request<pb::StartAssignedInstanceRequest>,
@@ -62,7 +182,69 @@ impl pb::node_service_server::NodeService for NodeRpc {
             .try_into()
             .map_err(status)?;
         let handle = self.manager.instance(spec, assignment).map_err(status)?;
-        response(handle.create().await.map_err(status)?).map_err(status)
+        let result = match r.snapshot {
+            Some(snapshot) => {
+                handle
+                    .create_from_snapshot(snapshot.try_into().map_err(status)?)
+                    .await
+            }
+            None => handle.create().await,
+        };
+        response(result.map_err(status)?).map_err(status)
+    }
+    async fn pause_instance(
+        &self,
+        request: Request<pb::PauseInstanceRequest>,
+    ) -> std::result::Result<Response<pb::InstanceResult>, Status> {
+        if self.peers.authenticate(&request)? != Principal::Frontend {
+            return Err(Status::permission_denied(
+                "validated Frontend caller required",
+            ));
+        }
+        let gate = self.manager.lifecycle_ready.read().await;
+        if !*gate {
+            return Err(Status::unavailable("node is reconciling"));
+        }
+        let r = request.into_inner();
+        let handle = self.owned_handle(r.assignment, r.caller.as_ref())?;
+        response(
+            handle
+                .pause(crate::checkpoint::PauseRequest {
+                    operation_id: r.operation_id,
+                    expected_revision: r.expected_revision,
+                    ttl_seconds: r.ttl_seconds,
+                    timeout_seconds: r.timeout_seconds,
+                })
+                .await
+                .map_err(status)?,
+        )
+        .map_err(status)
+    }
+    async fn resume_instance(
+        &self,
+        request: Request<pb::ResumeInstanceRequest>,
+    ) -> std::result::Result<Response<pb::InstanceResult>, Status> {
+        if self.peers.authenticate(&request)? != Principal::Frontend {
+            return Err(Status::permission_denied(
+                "validated Frontend caller required",
+            ));
+        }
+        let gate = self.manager.lifecycle_ready.read().await;
+        if !*gate {
+            return Err(Status::unavailable("node is reconciling"));
+        }
+        let r = request.into_inner();
+        let handle = self.owned_handle(r.assignment, r.caller.as_ref())?;
+        response(
+            handle
+                .resume(crate::checkpoint::ResumeRequest {
+                    operation_id: r.operation_id,
+                    expected_revision: r.expected_revision,
+                })
+                .await
+                .map_err(status)?,
+        )
+        .map_err(status)
     }
     async fn delete_instance(
         &self,
@@ -101,6 +283,7 @@ impl pb::node_service_server::NodeService for NodeRpc {
 
 #[derive(Clone)]
 pub struct MasterStateSink {
+    snapshots: Arc<std::sync::RwLock<pb::snapshot_service_client::SnapshotServiceClient<Channel>>>,
     client: Arc<std::sync::RwLock<pb::master_service_client::MasterServiceClient<Channel>>>,
     session_id: String,
     timeout: Duration,
@@ -112,6 +295,9 @@ impl MasterStateSink {
             return Err(Error::Invalid("RPC timeout must be positive".into()));
         }
         Ok(Self {
+            snapshots: Arc::new(std::sync::RwLock::new(
+                pb::snapshot_service_client::SnapshotServiceClient::new(channel.clone()),
+            )),
             client: Arc::new(std::sync::RwLock::new(
                 pb::master_service_client::MasterServiceClient::new(channel),
             )),
@@ -124,6 +310,8 @@ impl MasterStateSink {
         self
     }
     pub fn reconnect(&self, channel: Channel) {
+        *self.snapshots.write().unwrap() =
+            pb::snapshot_service_client::SnapshotServiceClient::new(channel.clone());
         *self.client.write().unwrap() =
             pb::master_service_client::MasterServiceClient::new(channel);
     }
@@ -140,7 +328,12 @@ impl StateSink for MasterStateSink {
         let response = tokio::time::timeout(self.timeout, client.commit_instance(request))
             .await
             .map_err(|_| Error::Unavailable("state commit RPC timed out".into()))?
-            .map_err(dependency_status)?
+            .map_err(|status| match status.code() {
+                tonic::Code::PermissionDenied | tonic::Code::Unauthenticated => {
+                    Error::Invalid("Master rejected node credentials".into())
+                }
+                _ => dependency_status(status),
+            })?
             .into_inner();
         let accepted: InstanceRecord = response
             .record
@@ -150,5 +343,41 @@ impl StateSink for MasterStateSink {
             return Err(Error::Conflict);
         }
         Ok(Durability::Published)
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::checkpoint::SnapshotCatalog for MasterStateSink {
+    async fn get(&self, id: &str) -> Result<adx_core::snapshots::Snapshot> {
+        let mut client = self.snapshots.read().unwrap().clone();
+        let mut request = Request::new(pb::GetSnapshotRequest {
+            id: id.into(),
+            caller: None,
+            node_session_id: self.session_id.clone(),
+        });
+        request.set_timeout(self.timeout);
+        tokio::time::timeout(self.timeout, client.get_snapshot(request))
+            .await
+            .map_err(|_| Error::Unavailable("snapshot lookup timed out".into()))?
+            .map_err(dependency_status)?
+            .into_inner()
+            .try_into()
+    }
+    async fn publish(
+        &self,
+        snapshot: adx_core::snapshots::Snapshot,
+    ) -> Result<adx_core::snapshots::Snapshot> {
+        let mut client = self.snapshots.read().unwrap().clone();
+        let mut request = Request::new(pb::PublishSnapshotRequest {
+            snapshot: Some(snapshot.try_into()?),
+            node_session_id: self.session_id.clone(),
+        });
+        request.set_timeout(self.timeout);
+        tokio::time::timeout(self.timeout, client.publish_snapshot(request))
+            .await
+            .map_err(|_| Error::Unavailable("snapshot publication timed out".into()))?
+            .map_err(dependency_status)?
+            .into_inner()
+            .try_into()
     }
 }

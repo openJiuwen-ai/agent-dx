@@ -3,6 +3,8 @@ use adx_protocol::control;
 #[test]
 fn record_roundtrip_preserves_identity_state_and_ownership() {
     let spec = InstanceSpec {
+        snapshot_id: None,
+        lifecycle: Default::default(),
         env: Default::default(),
         id: "i".into(),
         tenant_id: "t".into(),
@@ -17,6 +19,8 @@ fn record_roundtrip_preserves_identity_state_and_ownership() {
         scheduling: Default::default(),
     };
     let r = InstanceRecord {
+        restart_attempts: 0,
+        restart_pending: false,
         spec,
         assignment: Assignment {
             instance_id: "i".into(),
@@ -30,6 +34,8 @@ fn record_roundtrip_preserves_identity_state_and_ownership() {
         runtime_id: "i-9".into(),
         resources_held: true,
         runtime_ip: Some("10.0.0.2".parse().unwrap()),
+        checkpoint: None,
+        last_operation: None,
     };
     let wire = control::InstanceRecord::try_from(r.clone()).unwrap();
     assert_eq!(InstanceRecord::try_from(wire.clone()).unwrap(), r);

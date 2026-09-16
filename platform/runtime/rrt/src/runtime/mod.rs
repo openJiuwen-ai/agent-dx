@@ -121,16 +121,26 @@ impl control::CheckpointHooks for RuntimeHooks {
         }))
     }
     fn restore(&self, previous: &RuntimeIdentity) -> std::io::Result<RuntimeIdentity> {
+        Ok(self.restore_context(previous)?.target)
+    }
+    fn restore_context(
+        &self,
+        previous: &RuntimeIdentity,
+    ) -> std::io::Result<adx_core::runtime::RuntimeRestore> {
         let path = crate::startup::restore_environment_file_path()
             .ok_or_else(|| std::io::Error::other("restore environment is required"))?;
         let environment = crate::startup::read_environment_file(&path)?;
         let target = identity_from(&environment)?
             .ok_or_else(|| std::io::Error::other("restored identity is missing"))?;
-        if &target != previous && target.ownership_generation <= previous.ownership_generation {
-            return Err(std::io::Error::other(
-                "restored execution requires newer ownership",
-            ));
-        }
+        let restored = adx_core::runtime::RuntimeRestore {
+            target,
+            origin: environment
+                .get("ADX_RESTORE_ORIGIN")
+                .filter(|value| !value.is_empty())
+                .map(|value| serde_json::from_str(value).map_err(std::io::Error::other))
+                .transpose()?,
+        };
+        restored.validate(previous).map_err(std::io::Error::other)?;
         if let Some(value) = environment.get("RRT_HTTP_PORT") {
             if value.parse::<u16>().ok() != Some(self.port) {
                 return Err(std::io::Error::other(
@@ -152,7 +162,7 @@ impl control::CheckpointHooks for RuntimeHooks {
         if let Some(tunnel) = &self.tunnel {
             tunnel.rearm().map_err(std::io::Error::other)?;
         }
-        Ok(target)
+        Ok(restored)
     }
 }
 async fn boot(

@@ -130,6 +130,12 @@ impl NodeProxy {
         self
     }
 
+    pub fn instance_activity(&self, instance_id: &str) -> Option<(u64, u64)> {
+        self.activity
+            .as_ref()
+            .map(|tracker| tracker.observe(instance_id))
+    }
+
     pub fn with_activity_tracker(mut self, tracker: Arc<ActivityTracker>) -> Self {
         self.activity = Some(tracker);
         self
@@ -148,7 +154,10 @@ impl NodeProxy {
         let revision = self.route_revision.fetch_add(1, Ordering::AcqRel) + 1;
         for shard in self.route_shards.iter() {
             let mut routes = shard.write().unwrap_or_else(|p| p.into_inner());
-            for (_, binding) in routes.drain() {
+            for (key, binding) in routes.drain() {
+                if let Some(tracker) = &self.activity {
+                    tracker.retire(&key.instance_id);
+                }
                 let _ = binding.revision_tx.send(revision);
             }
         }
@@ -167,6 +176,9 @@ impl NodeProxy {
         workload_id: String,
         sandbox_ip: IpAddr,
     ) {
+        if let Some(tracker) = &self.activity {
+            tracker.register(&instance_id);
+        }
         let key = RouteKey {
             instance_id,
             workload_id,
@@ -192,6 +204,9 @@ impl NodeProxy {
     /// Retire one route before sandboxd reclaims its IP. New streams are
     /// rejected immediately and existing relays observe the route revision.
     pub async fn retire_route(&self, instance_id: String, workload_id: String) {
+        if let Some(tracker) = &self.activity {
+            tracker.retire(&instance_id);
+        }
         let key = RouteKey {
             instance_id,
             workload_id,

@@ -482,3 +482,14 @@ result = command.wait()
 context as a notification channel. The final result is always read back from
 RRT's authoritative command registry. A local wait timeout or client restart
 does not terminate the remote command.
+
+
+### Placement
+
+`Sandbox(..., labels={"app": "worker"}, schedule_affinities=[...])` exposes the
+platform's grouped node and same-tenant instance placement rules. Conditions
+use the public `scheduleAffinities` shape with `kind`, `affinity`, `labelOps`,
+optional `weight` and `preferredPriority`. `node_id` remains a hard requirement
+when combined with alternatives. See [placement rules](../../../../docs/testing/http-node-placement.md)
+for the matching, ranking and label contracts. Caller-provided option lists are
+copied before the SDK adds a node constraint.

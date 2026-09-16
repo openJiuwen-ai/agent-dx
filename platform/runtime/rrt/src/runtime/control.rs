@@ -20,6 +20,12 @@ pub trait CheckpointHooks: Send + Sync + 'static {
     fn open(&self) -> io::Result<Handoff>;
     /// Validate restored identity, refresh environment and rearm listeners.
     fn restore(&self, previous: &RuntimeIdentity) -> io::Result<RuntimeIdentity>;
+    fn restore_context(&self, previous: &RuntimeIdentity) -> io::Result<RuntimeRestore> {
+        Ok(RuntimeRestore {
+            target: self.restore(previous)?,
+            origin: None,
+        })
+    }
 }
 struct State {
     status: RuntimeStatus,
@@ -52,6 +58,7 @@ impl Controller {
                     checkpoint: None,
                     active_requests: 0,
                     active_commands: 0,
+                    activity_revision: 1,
                 },
                 prepare: None,
                 reader_running: false,
@@ -64,6 +71,7 @@ impl Controller {
         let mut status = self.state.lock().unwrap().status.clone();
         status.active_requests = super::activity::active_count().max(0) as u64;
         status.active_commands = super::activity::active_command_count().max(0) as u64;
+        status.activity_revision = super::activity::revision();
         status
     }
     pub fn subscribe(&self) -> watch::Receiver<u64> {
@@ -193,16 +201,9 @@ impl Controller {
             state.status.identity.clone()
         };
         let restored = if matches!(outcome, Ok(HandoffOutcome::Restore)) {
-            Some(self.hooks.restore(&previous).and_then(|identity| {
-                identity.validate().map_err(io::Error::other)?;
-                if identity != previous
-                    && identity.ownership_generation <= previous.ownership_generation
-                {
-                    return Err(io::Error::other(
-                        "restored execution requires a newer ownership generation",
-                    ));
-                }
-                Ok(identity)
+            Some(self.hooks.restore_context(&previous).and_then(|restored| {
+                restored.validate(&previous).map_err(io::Error::other)?;
+                Ok(restored.target)
             }))
         } else {
             None

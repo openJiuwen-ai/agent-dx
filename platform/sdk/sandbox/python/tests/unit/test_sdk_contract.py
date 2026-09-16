@@ -264,6 +264,18 @@ class SDKContractTests(unittest.TestCase):
         ):
             Sandbox(image="ubuntu:22.04", failover=1, detached=True)
 
+    def test_affinity_groups_keep_weights_and_conjoin_node_id_in_every_alternative(self):
+        groups = [{"kind": 0, "affinity": 2, "labelOps": [{"type": 0, "labelKey": "pool", "labelValues": [pool]}]} for pool in ("a", "b")]
+        groups.append({"kind": 1, "affinity": 0, "weight": 9, "labelOps": [{"type": 2, "labelKey": "app"}]})
+        with patch("adx_sandbox.sandbox_api.SandboxClient", _FakeClient):
+            Sandbox(image="ubuntu", node_id="node-a", labels={"app": "worker"}, schedule_affinities=groups, detached=True)
+        body = _FakeClient.created[-1]
+        self.assertEqual(body["labels"], {"app": "worker"})
+        self.assertEqual(body["scheduleAffinities"][2]["weight"], 9)
+        for group in body["scheduleAffinities"][:2]:
+            self.assertEqual(group["labelOps"][-1]["labelKey"], "NODE_ID")
+        self.assertEqual(len(groups[0]["labelOps"]), 1)
+
     def test_node_id_is_encoded_as_frontend_affinity_semantics(self):
         with patch("adx_sandbox.sandbox_api.SandboxClient", _FakeClient):
             Sandbox(

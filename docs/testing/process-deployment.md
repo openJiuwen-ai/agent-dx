@@ -1,5 +1,7 @@
 # 统一进程部署与发布包
 
+实际安装和配置步骤见 [单机进程部署](../deployment/standalone.md)。本文保留 CLI 实现与早期验收记录。
+
 2026-09-15。新增 `platform/control-plane/control-cli`，以 Rust `adxctl` 承载部署配置和轻量 supervisor；新增 Node Manager 本机停止清理接口。统一包同时携带控制面和数据面。本阶段验证进程托管、停止契约和出包，完整 Sandbox SDK E2E 尚未完成。
 
 ## 模块
@@ -43,7 +45,7 @@ adxctl stop --config /etc/adx/deployment.json
 
 Node Manager 未完成权威对账时，不能用空内存目录宣称清理完成。清理开始后保持 draining；失败可再次执行。作用域是本机已接收并管理的 Instance，不执行远端节点排空或迁移。完整 E2E 还需覆盖停止与 Master 在途分配之间的竞争。
 
-sandboxd 始终由部署环境独立托管，角色枚举不允许 supervisor 拉起它。RRT 随包交付到 `runtime/`，须进入实际实例环境；不会被当成宿主公共服务启动。共进程 Node Manager／Node Proxy 装配仍待实现，本轮运行分进程方式。
+sandboxd 始终由部署环境独立托管，角色枚举不允许 supervisor 拉起它。RRT 随包交付到 `runtime/`，须进入实际实例环境；不会被当成宿主公共服务启动。现已接通 `proxy_mode` 的共进程／分进程装配，配置与验证边界见 [进程模式](node-proxy-process-modes.md)。
 
 ## Redis
 

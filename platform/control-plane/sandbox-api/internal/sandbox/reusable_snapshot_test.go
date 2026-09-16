@@ -20,7 +20,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -29,6 +28,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
 
+	"gitcode.com/robbluo/agent-dx/platform/control-plane/sandbox-api/backend"
 	"gitcode.com/robbluo/agent-dx/platform/control-plane/sandbox-api/internal/gen/common"
 	"gitcode.com/robbluo/agent-dx/platform/control-plane/sandbox-api/internal/gen/core"
 	"gitcode.com/robbluo/agent-dx/platform/control-plane/sandbox-api/internal/httpx"
@@ -140,79 +140,49 @@ func TestCreateFromSnapshotForwardsSnapshotID(t *testing.T) {
 	require.Equal(t, "snap-ready", captured.GetSnapshotID())
 }
 
-type reusableSnapshotMasterClientStub struct{ addr string }
+type snapshotCatalogStub struct{ t *testing.T }
 
-func (s reusableSnapshotMasterClientStub) GetActiveMasterAddr() string { return s.addr }
-
-type reusableSnapshotHTTPDoer func(*http.Request) (*http.Response, error)
-
-func (f reusableSnapshotHTTPDoer) Do(req *http.Request) (*http.Response, error) { return f(req) }
-
-func TestReusableSnapshotResourceHandlersForwardToActiveMaster(t *testing.T) {
-	oldMasterClient, oldHTTPClient := newReusableSnapshotMasterClient, reusableSnapshotHTTPClient
-	t.Cleanup(func() { newReusableSnapshotMasterClient, reusableSnapshotHTTPClient = oldMasterClient, oldHTTPClient })
-	newReusableSnapshotMasterClient = func(context.Context) reusableSnapshotMasterClient {
-		return reusableSnapshotMasterClientStub{addr: "master.internal:8080"}
-	}
-	tests := []struct {
-		name      string
-		method    string
-		path      string
-		wantQuery string
-		wantReqID string
-		params    gin.Params
-		handler   gin.HandlerFunc
+func (s snapshotCatalogStub) Get(ctx context.Context, id string) (backend.Snapshot, error) {
+	require.Equal(s.t, "snap-1", id)
+	identity, ok := backend.IdentityFromContext(ctx)
+	require.True(s.t, ok)
+	require.Equal(s.t, "verified", identity.TenantID)
+	return backend.Snapshot{SnapshotID: id, Names: []string{}}, nil
+}
+func (s snapshotCatalogStub) List(ctx context.Context, name, token string, size uint32) (backend.SnapshotPage, error) {
+	require.Equal(s.t, "base", name)
+	require.Equal(s.t, "cursor", token)
+	require.Equal(s.t, uint32(17), size)
+	return backend.SnapshotPage{Items: []backend.Snapshot{{SnapshotID: "snap-1", Names: []string{"base"}}}}, nil
+}
+func (s snapshotCatalogStub) Delete(ctx context.Context, id string) error {
+	require.Equal(s.t, "snap-1", id)
+	return nil
+}
+func TestReusableSnapshotResourceHandlersUseTypedCatalog(t *testing.T) {
+	for _, tt := range []struct {
+		name, method, path, body string
+		handler                  gin.HandlerFunc
 	}{
-		{
-			name: "get", method: http.MethodGet, path: "/api/sandbox/v1/snapshots/snap-1",
-			params:    gin.Params{{Key: "snapshotID", Value: "snap-1"}},
-			wantQuery: "snapshot_id=snap-1&tenant_id=tenant-a", handler: GetReusableSnapshotV1Handler,
-		},
-		{
-			name: "list", method: http.MethodGet,
-			path:      "/api/sandbox/v1/snapshots?name=base&pageToken=next-1&pageSize=17",
-			wantQuery: "name=base&pageSize=17&pageToken=next-1&tenant_id=tenant-a",
-			handler:   ListReusableSnapshotsV1Handler,
-		},
-		{
-			name: "delete", method: http.MethodDelete, path: "/api/sandbox/v1/snapshots/snap-1",
-			params: gin.Params{{Key: "snapshotID", Value: "snap-1"}}, wantReqID: "delete-1",
-			wantQuery: "request_id=delete-1&snapshot_id=snap-1&tenant_id=tenant-a",
-			handler:   DeleteReusableSnapshotV1Handler,
-		},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			reusableSnapshotHTTPClient = reusableSnapshotHTTPDoer(func(
-				req *http.Request,
-			) (*http.Response, error) {
-				require.Equal(t, test.method, req.Method)
-				require.Equal(t, "http://master.internal:8080/snap-manager/reusable-snapshots",
-					req.URL.Scheme+"://"+req.URL.Host+req.URL.Path)
-				require.Equal(t, test.wantQuery, req.URL.RawQuery)
-				if test.wantReqID != "" {
-					require.Equal(t, test.wantReqID, req.Header.Get("X-ADX-Request-ID"))
-				}
-				return &http.Response{
-					StatusCode: http.StatusOK,
-					Header:     http.Header{"Content-Type": []string{"application/json"}},
-					Body: io.NopCloser(bytes.NewBufferString(
-						`{"snapshotId":"snap-1","names":[]}`)),
-				}, nil
-			})
-			recorder := httptest.NewRecorder()
-			ctx, _ := gin.CreateTestContext(recorder)
-			ctx.Params = test.params
-			ctx.Request = httptest.NewRequest(test.method, test.path, nil)
-			ctx.Request.Header.Set(httpx.HeaderTenantID, "tenant-a")
-			if test.wantReqID != "" {
-				ctx.Request.Header.Set("X-ADX-Request-ID", test.wantReqID)
-			}
-			test.handler(ctx)
-			require.Equal(t, http.StatusOK, recorder.Code)
+		{"get", "GET", "/snapshots/snap-1", `{"snapshotId":"snap-1","names":[]}`, GetReusableSnapshotV1Handler},
+		{"list", "GET", "/snapshots?name=base&pageToken=cursor&pageSize=17", `{"items":[{"snapshotId":"snap-1","names":["base"]}],"nextPageToken":""}`, ListReusableSnapshotsV1Handler},
+		{"delete", "DELETE", "/snapshots/snap-1", `{}`, DeleteReusableSnapshotV1Handler},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			ctx, _ := gin.CreateTestContext(w)
+			ctx.Params = gin.Params{{Key: "snapshotID", Value: "snap-1"}}
+			req := httptest.NewRequest(tt.method, tt.path, nil)
+			req.Header.Set(httpx.HeaderTenantID, "spoofed")
+			req.Header.Set("X-ADX-Request-ID", "delete-1")
+			c := backend.WithIdentity(req.Context(), backend.Identity{TenantID: "verified", Role: backend.RoleTenant})
+			c = backend.WithDependencies(c, backend.Dependencies{Snapshots: snapshotCatalogStub{t}})
+			ctx.Request = req.WithContext(c)
+			tt.handler(ctx)
+			require.Equal(t, http.StatusOK, w.Code)
 			var response httpx.Response
-			require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &response))
-			require.JSONEq(t, `{"snapshotId":"snap-1","names":[]}`, string(response.Data))
+			require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+			require.JSONEq(t, tt.body, string(response.Data))
 		})
 	}
 }

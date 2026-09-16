@@ -204,6 +204,7 @@ impl TryFrom<wire::SchedulingPolicy> for model::SchedulingPolicy {
             preferred_affinity: decode(v.preferred_affinity)?,
             preferred_anti_affinity: decode(v.preferred_anti_affinity)?,
             topology_spread: decode(v.topology_spread)?,
+            placement_groups: decode(v.placement_groups)?,
         };
         value.validate()?;
         Ok(value)
@@ -221,6 +222,7 @@ impl From<model::SchedulingPolicy> for wire::SchedulingPolicy {
             preferred_affinity: encode(v.preferred_affinity),
             preferred_anti_affinity: encode(v.preferred_anti_affinity),
             topology_spread: encode(v.topology_spread),
+            placement_groups: encode(v.placement_groups),
         }
     }
 }
@@ -273,7 +275,13 @@ fn spread_wire(v: model::SpreadMode) -> i32 {
 }
 impl TryFrom<wire::RegisterNodeRequest> for model::Node {
     type Error = Error;
-    fn try_from(v: wire::RegisterNodeRequest) -> Result<Self> {
+    fn try_from(mut v: wire::RegisterNodeRequest) -> Result<Self> {
+        if v.labels.get("NODE_ID").is_some_and(|id| id != &v.node_id) {
+            return Err(Error::Invalid(
+                "NODE_ID label must match the authenticated node identity".into(),
+            ));
+        }
+        v.labels.insert("NODE_ID".into(), v.node_id.clone());
         let cap = required(v.capacity)?;
         let node = Self {
             id: v.node_id,
@@ -288,5 +296,59 @@ impl TryFrom<wire::RegisterNodeRequest> for model::Node {
         };
         node.validate()?;
         Ok(node)
+    }
+}
+
+impl TryFrom<wire::PlacementGroup> for model::PlacementGroup {
+    type Error = Error;
+    fn try_from(v: wire::PlacementGroup) -> Result<Self> {
+        let group = Self {
+            target: match wire::PlacementTarget::try_from(v.target).ok() {
+                Some(wire::PlacementTarget::Node) => model::PlacementTarget::Node,
+                Some(wire::PlacementTarget::Instance) => model::PlacementTarget::Instance,
+                _ => return Err(Error::Invalid("invalid placement target".into())),
+            },
+            terms: decode(v.terms)?,
+            required: v.required,
+            anti: v.anti,
+            ordered: v.ordered,
+        };
+        group.validate()?;
+        Ok(group)
+    }
+}
+impl From<model::PlacementGroup> for wire::PlacementGroup {
+    fn from(v: model::PlacementGroup) -> Self {
+        Self {
+            target: match v.target {
+                model::PlacementTarget::Node => wire::PlacementTarget::Node as i32,
+                model::PlacementTarget::Instance => wire::PlacementTarget::Instance as i32,
+            },
+            terms: encode(v.terms),
+            required: v.required,
+            anti: v.anti,
+            ordered: v.ordered,
+        }
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+    #[test]
+    fn registered_node_has_authoritative_identity_label() {
+        let mut request = wire::RegisterNodeRequest {
+            node_id: "node-a".into(),
+            capacity: Some(wire::Resources {
+                cpu_millis: 1000,
+                memory_bytes: 1024,
+                disk_bytes: 0,
+            }),
+            ..Default::default()
+        };
+        let node = model::Node::try_from(request.clone()).unwrap();
+        assert_eq!(node.labels["NODE_ID"], "node-a");
+        request.labels.insert("NODE_ID".into(), "other".into());
+        assert!(model::Node::try_from(request).is_err());
     }
 }

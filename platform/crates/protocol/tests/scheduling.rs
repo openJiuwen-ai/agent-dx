@@ -19,6 +19,8 @@ fn protobuf_round_trip_preserves_every_placement_constraint_and_card_identity() 
         tenants: vec!["t".into()],
     };
     let spec = InstanceSpec {
+        snapshot_id: None,
+        lifecycle: Default::default(),
         env: Default::default(),
         id: "i".into(),
         tenant_id: "t".into(),
@@ -31,6 +33,16 @@ fn protobuf_round_trip_preserves_every_placement_constraint_and_card_identity() 
             disk_bytes: 0,
         },
         scheduling: SchedulingPolicy {
+            placement_groups: vec![PlacementGroup {
+                target: PlacementTarget::Instance,
+                terms: vec![WeightedSelector {
+                    selector: selector(),
+                    weight: 7,
+                }],
+                required: true,
+                anti: false,
+                ordered: true,
+            }],
             labels: [("app".into(), "a".into())].into(),
             devices: vec![DeviceRequest {
                 kind: DeviceKind::Gpu,

@@ -57,11 +57,6 @@ func validateIngress(c config) error {
 	return nil
 }
 
-type unsupportedSnapshots struct{}
-
-func (unsupportedSnapshots) Do(*http.Request) (*http.Response, error) {
-	return nil, errors.New("snapshot API is not connected yet")
-}
 func run() error {
 	file := flag.String("config", "", "service JSON configuration")
 	flag.Parse()
@@ -154,7 +149,7 @@ func run() error {
 	}
 	router := gin.New()
 	router.Use(gin.Recovery())
-	d := backend.Dependencies{Transport: b, Instances: b, Authenticate: auth.Verify, MasterAddress: func() string { return "" }, SnapshotHTTPClient: unsupportedSnapshots{}}
+	d := backend.Dependencies{Transport: b, Instances: b, Authenticate: auth.Verify, Snapshots: controlbackend.NewSnapshotCatalog(pb.NewSnapshotServiceClient(master), timeout), Keys: controlbackend.NewKeyManager(pb.NewCredentialServiceClient(master), timeout)}
 	if err = api.RegisterRoutes(router, d); err != nil {
 		return err
 	}

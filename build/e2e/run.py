@@ -16,7 +16,7 @@ import time
 import uuid
 import xml.etree.ElementTree as ET
 
-REQUIRED = {'sdk','auth','capacity','restart','stop'}
+REQUIRED = {'sdk','auth','capacity','placement','node-failure','restart','stop'}
 
 def sha(path):
     h=hashlib.sha256()
@@ -184,10 +184,21 @@ class Run:
             self.execute('node1','/opt/adx/client/bin/python','-u','/opt/adx/e2e/scenarios.py','sdk',timeout=600)
             self.helper('node1','postcheck')
             for node in self.nodes:self.helper(node,'empty',node)
-        for scenario in ('auth','capacity'):
+        for scenario in ('auth','capacity','placement'):
             with self.case(scenario, checks):
                 self.execute('node1','/opt/adx/client/bin/python','-u','/opt/adx/e2e/scenarios.py',scenario,timeout=400)
                 for node in self.nodes:self.helper(node,'empty',node)
+        with self.case('node-failure', checks):
+            self.execute('node1','/opt/adx/client/bin/python','-u','/opt/adx/e2e/scenarios.py','create',timeout=300)
+            try:
+                self.helper('node2','freeze','node2')
+                self.helper('node1','failure-observed',timeout=75)
+            finally:
+                self.helper('node2','thaw','node2')
+            self.helper('node1','ready',timeout=150)
+            self.helper('node2','empty','node2')
+            self.execute('node1','/opt/adx/client/bin/python','-u','/opt/adx/e2e/scenarios.py','failure-cleanup',timeout=90)
+            for node in self.nodes:self.helper(node,'empty',node)
         with self.case('restart', checks):
             self.event('Create live instances and record backend IDs before restarting Node Managers')
             self.execute('node1','/opt/adx/client/bin/python','-u','/opt/adx/e2e/scenarios.py','create',timeout=300)

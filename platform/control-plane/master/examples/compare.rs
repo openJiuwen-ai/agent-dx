@@ -23,6 +23,8 @@ fn node(i: usize, capacity: u64, revision: usize) -> Node {
 }
 fn spec(i: usize) -> InstanceSpec {
     InstanceSpec {
+        snapshot_id: None,
+        lifecycle: Default::default(),
         env: Default::default(),
         id: format!("r{i}"),
         tenant_id: "t".into(),

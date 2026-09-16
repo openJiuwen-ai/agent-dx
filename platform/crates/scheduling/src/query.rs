@@ -16,6 +16,8 @@ pub struct Prepared {
     pub preferred_anti: Vec<PeerMatches>,
     pub reverse: BTreeSet<(String, Option<String>)>,
     pub reverse_missing_node: bool,
+    pub groups: Vec<Vec<BTreeSet<String>>>,
+    pub reverse_group_nodes: BTreeSet<String>,
     pub spread: Vec<BTreeMap<String, u64>>,
 }
 impl Prepared {
@@ -62,8 +64,40 @@ impl Prepared {
                 .collect(),
             ..Default::default()
         };
+        result.groups = r
+            .scheduling
+            .placement_groups
+            .iter()
+            .map(|g| {
+                g.terms
+                    .iter()
+                    .map(|term| {
+                        if g.target == PlacementTarget::Node {
+                            BTreeSet::new()
+                        } else {
+                            snapshot
+                                .matching(&r.tenant_id, &term.selector)
+                                .map(|p| p.node_id.clone())
+                                .collect()
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
         for id in &snapshot.reverse_anti {
             let p = &snapshot.instances[id];
+            if p.spec.tenant_id == r.tenant_id
+                && p.spec.scheduling.placement_groups.iter().any(|g| {
+                    g.target == PlacementTarget::Instance
+                        && g.required
+                        && g.anti
+                        && g.terms
+                            .iter()
+                            .any(|t| t.selector.matches(&r.scheduling.labels))
+                })
+            {
+                result.reverse_group_nodes.insert(p.node_id.clone());
+            }
             for t in &p.spec.scheduling.required_anti_affinity {
                 if t.matches(&p.spec.tenant_id, &r.tenant_id, &r.scheduling.labels) {
                     match snapshot.node(&p.node_id) {

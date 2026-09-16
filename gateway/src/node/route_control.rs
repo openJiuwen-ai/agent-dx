@@ -216,6 +216,34 @@ fn ack(request: &UpdateBindingRequest) -> UpdateBindingResponse {
 }
 #[tonic::async_trait]
 impl NodeProxyService for BindingService {
+    async fn get_instance_activity(
+        &self,
+        request: Request<proto::GetInstanceActivityRequest>,
+    ) -> Result<Response<proto::InstanceActivityState>, Status> {
+        let r = request.into_inner();
+        let state = self.state.lock().await;
+        let binding = state
+            .versions
+            .get(&r.instance_id)
+            .and_then(|v| v.binding.as_ref());
+        if !state.ready
+            || !matches!(binding, Some(Binding::Active(target)) if target.runtime_id == r.runtime_id)
+        {
+            return Err(Status::failed_precondition(
+                "activity requires current execution binding",
+            ));
+        }
+        let (activity_revision, active_streams) = self
+            .proxy
+            .instance_activity(&r.instance_id)
+            .ok_or_else(|| Status::unavailable("activity tracking disabled"))?;
+        Ok(Response::new(proto::InstanceActivityState {
+            proxy_session_id: self.session.clone(),
+            activity_revision,
+            active_streams,
+        }))
+    }
+
     async fn get_binding_state(
         &self,
         _: Request<proto::GetBindingStateRequest>,
@@ -269,12 +297,20 @@ pub async fn serve_route_control(
     proxy: Arc<NodeProxy>,
     listener: UnixListener,
 ) -> std::io::Result<()> {
+    serve_route_control_until(proxy, listener, std::future::pending()).await
+}
+
+pub async fn serve_route_control_until(
+    proxy: Arc<NodeProxy>,
+    listener: UnixListener,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> std::io::Result<()> {
     tonic::transport::Server::builder()
         .add_service(
             NodeProxyServiceServer::new(BindingService::new(proxy))
                 .max_decoding_message_size(64 * 1024 * 1024),
         )
-        .serve_with_incoming(UnixListenerStream::new(listener))
+        .serve_with_incoming_shutdown(UnixListenerStream::new(listener), shutdown)
         .await
         .map_err(std::io::Error::other)
 }

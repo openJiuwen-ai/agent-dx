@@ -211,6 +211,23 @@ fn rpc_error(s: tonic::Status) -> Error {
 }
 #[async_trait]
 impl Routes for UdsRoutes {
+    async fn activity(&self, record: &InstanceRecord) -> Result<(String, u64, u64)> {
+        let mut client = self.connect().await?;
+        let result = client
+            .get_instance_activity(self.request(pb::GetInstanceActivityRequest {
+                instance_id: record.spec.id.clone(),
+                runtime_id: record.runtime_id.clone(),
+            }))
+            .await
+            .map_err(rpc_error)?
+            .into_inner();
+        Ok((
+            result.proxy_session_id,
+            result.activity_revision,
+            result.active_streams,
+        ))
+    }
+
     async fn begin_reconcile(&self) -> Result<()> {
         let mut s = self.local.lock().await;
         let mut client = self.connect().await?;

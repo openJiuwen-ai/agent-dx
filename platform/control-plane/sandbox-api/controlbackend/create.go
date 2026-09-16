@@ -32,15 +32,34 @@ func createSpec(raw *core.CreateRequest, c *pb.CallerContext) (*pb.InstanceSpec,
 	if raw.DesignatedInstanceID == "" || raw.SchedulingOps == nil {
 		return nil, status.Error(codes.InvalidArgument, "instance ID and resources required")
 	}
-	if raw.SnapshotID != "" || raw.Failover {
-		return nil, status.Error(codes.Unimplemented, "snapshot creation is not connected yet")
+	if raw.Failover {
+		return nil, status.Error(codes.Unimplemented, "automatic failover request is not supported")
 	}
 	o := raw.SchedulingOps
 	e := o.Extension
-	for _, key := range []string{"mounts", "extra_config", "inherit_entrypoint", "network_policy", "idle_timeout", "data_plane_tunnel_security_mode", "data_plane_port_forward_security_mode"} {
+	for _, key := range []string{"mounts", "extra_config", "inherit_entrypoint", "network_policy", "data_plane_tunnel_security_mode", "data_plane_port_forward_security_mode"} {
 		if e[key] != "" {
 			return nil, status.Errorf(codes.Unimplemented, "%s is not connected yet", key)
 		}
+	}
+	lifecycle := &pb.LifecyclePolicy{}
+	if value := e["idle_timeout"]; value != "" {
+		seconds, parseErr := strconv.ParseUint(value, 10, 64)
+		if parseErr != nil {
+			return nil, status.Error(codes.InvalidArgument, "invalid idle timeout")
+		}
+		lifecycle.IdleTimeoutSeconds = seconds
+	}
+	if value := e["restart_policy"]; value != "" {
+		var policy struct {
+			MaxAttempts           uint32 `json:"maxAttempts"`
+			InitialBackoffSeconds uint64 `json:"initialBackoffSeconds"`
+			MaxBackoffSeconds     uint64 `json:"maxBackoffSeconds"`
+		}
+		if json.Unmarshal([]byte(value), &policy) != nil || policy.MaxAttempts == 0 || policy.InitialBackoffSeconds == 0 || policy.MaxBackoffSeconds < policy.InitialBackoffSeconds {
+			return nil, status.Error(codes.InvalidArgument, "invalid restart policy")
+		}
+		lifecycle.Restart = &pb.RestartPolicy{MaxAttempts: policy.MaxAttempts, InitialBackoffSeconds: policy.InitialBackoffSeconds, MaxBackoffSeconds: policy.MaxBackoffSeconds}
 	}
 	cpu, err := resource(o.Resources["CPU"], 1)
 	if err != nil {
@@ -75,11 +94,14 @@ func createSpec(raw *core.CreateRequest, c *pb.CallerContext) (*pb.InstanceSpec,
 			}
 		}
 	}
-	if cpu == 0 || memory == 0 {
+	if raw.SnapshotID == "" && (cpu == 0 || memory == 0) {
 		return nil, status.Error(codes.InvalidArgument, "CPU and memory must be positive")
 	}
 	image := strings.TrimSpace(e["rootfs"])
 	runtime := "runsc"
+	if raw.SnapshotID != "" {
+		runtime = ""
+	}
 	if strings.HasPrefix(image, "{") {
 		var root struct {
 			Type    string `json:"type"`
@@ -89,7 +111,7 @@ func createSpec(raw *core.CreateRequest, c *pb.CallerContext) (*pb.InstanceSpec,
 		if err = json.Unmarshal([]byte(image), &root); err != nil {
 			return nil, status.Error(codes.InvalidArgument, "invalid rootfs")
 		}
-		if root.Type != "image" {
+		if root.Type != "image" && !(raw.SnapshotID != "" && root.Type == "") {
 			return nil, status.Error(codes.Unimplemented, "only image rootfs is connected")
 		}
 		image = root.Image
@@ -97,7 +119,7 @@ func createSpec(raw *core.CreateRequest, c *pb.CallerContext) (*pb.InstanceSpec,
 			runtime = root.Runtime
 		}
 	}
-	if image == "" {
+	if image == "" && raw.SnapshotID == "" {
 		return nil, status.Error(codes.InvalidArgument, "image required")
 	}
 	p := &pb.SchedulingPolicy{Labels: map[string]string{}}
@@ -144,8 +166,11 @@ func createSpec(raw *core.CreateRequest, c *pb.CallerContext) (*pb.InstanceSpec,
 		}
 		p.Labels[key] = value
 	}
-	if o.ScheduleAffinity != nil {
-		return nil, status.Error(codes.Unimplemented, "HTTP affinity translation is not connected yet")
+	if len(o.Affinity) != 0 {
+		return nil, status.Error(codes.Unimplemented, "legacy affinity map is not supported")
+	}
+	if err := translateNodeAffinity(o.ScheduleAffinity, p); err != nil {
+		return nil, err
 	}
 	env := map[string]string{}
 	if text := raw.CreateOptions[httpx.DelegateEnvVar]; text != "" {
@@ -158,7 +183,11 @@ func createSpec(raw *core.CreateRequest, c *pb.CallerContext) (*pb.InstanceSpec,
 			return nil, status.Errorf(codes.InvalidArgument, "environment %s is reserved", key)
 		}
 	}
-	return &pb.InstanceSpec{Id: raw.DesignatedInstanceID, TenantId: c.TenantId, Image: image, Runtime: runtime, Resources: &pb.Resources{CpuMillis: cpu, MemoryBytes: memory, DiskBytes: disk}, Priority: o.Priority, Scheduling: p, Env: env}, nil
+	var snapshotID *string
+	if raw.SnapshotID != "" {
+		snapshotID = &raw.SnapshotID
+	}
+	return &pb.InstanceSpec{SnapshotId: snapshotID, Id: raw.DesignatedInstanceID, TenantId: c.TenantId, Image: image, Runtime: runtime, Resources: &pb.Resources{CpuMillis: cpu, MemoryBytes: memory, DiskBytes: disk}, Priority: o.Priority, Scheduling: p, Env: env, Lifecycle: lifecycle}, nil
 }
 func (b *Backend) Create(r backend.Request) ([]byte, error) {
 	c, err := caller(r.Context)
@@ -179,9 +208,37 @@ func (b *Backend) Create(r backend.Request) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if result == nil || result.Record == nil || !proto.Equal(result.Record.Spec, spec) || result.Record.State != pb.InstanceState_INSTANCE_STATE_RUNNING || result.Durability != pb.Durability_DURABILITY_PUBLISHED {
+	if result == nil || result.Record == nil || !matchesCreateSpec(spec, result.Record.Spec) || result.Record.State != pb.InstanceState_INSTANCE_STATE_RUNNING || result.Durability != pb.Durability_DURABILITY_PUBLISHED {
 		return nil, status.Error(codes.Unavailable, "create result is not durably confirmed")
 	}
 	// The first lifecycle request resolves the address once; subsequent requests use the cache.
 	return proto.Marshal(&oldruntime.NotifyRequest{Message: fmt.Sprintf("instance %s running", spec.Id)})
+}
+
+// Master resolves omitted checkpoint geometry. Still reject an unrelated result
+// or silently changed explicit fields before acknowledging public creation.
+func matchesCreateSpec(want, got *pb.InstanceSpec) bool {
+	if want == nil || got == nil {
+		return false
+	}
+	if want.GetSnapshotId() == "" {
+		return proto.Equal(want, got)
+	}
+	if want.Id != got.Id || want.TenantId != got.TenantId || want.GetSnapshotId() != got.GetSnapshotId() || got.Image == "" || got.Runtime == "" || got.Resources == nil {
+		return false
+	}
+	if want.Image != "" && want.Image != got.Image || want.Runtime != "" && want.Runtime != got.Runtime {
+		return false
+	}
+	if want.Resources != nil {
+		if want.Resources.CpuMillis != 0 && want.Resources.CpuMillis != got.Resources.CpuMillis || want.Resources.MemoryBytes != 0 && want.Resources.MemoryBytes != got.Resources.MemoryBytes || want.Resources.DiskBytes != 0 && want.Resources.DiskBytes != got.Resources.DiskBytes {
+			return false
+		}
+	}
+	for key, value := range want.Env {
+		if got.Env[key] != value {
+			return false
+		}
+	}
+	return want.Priority == got.Priority && proto.Equal(want.Lifecycle, got.Lifecycle)
 }

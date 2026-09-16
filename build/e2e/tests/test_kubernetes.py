@@ -108,6 +108,9 @@ class KubernetesLifecycleTests(unittest.TestCase):
             pod=next(o for o in objects if o['kind']=='Pod')
             secret=next(v['secret'] for v in pod['spec']['volumes'] if v['name']=='credentials')
             self.assertTrue(all(item['key'] in data for item in secret['items']))
+            self.assertIn({'key':'admin-key','path':'admin-key'}, secret['items'])
+            self.assertNotIn('ca.key',data)
+            self.assertNotEqual(data['admin-key'],data['api-key'])
             self.assertNotIn('ca.key',data)
             self.assertEqual(base64.b64decode(data['image']).decode(),'registry.example/rrt@sha256:'+'b'*64)
 

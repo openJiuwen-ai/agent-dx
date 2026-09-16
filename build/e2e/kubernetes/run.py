@@ -52,7 +52,7 @@ def credentials(directory, image):
             '-CAkey', tls / 'ca.key', '-CAcreateserial', '-out', tls / 'node2.pem',
             '-days', '2', '-extfile', tls / 'extensions.cnf')
     openssl('x509', '-in', tls / 'node2.pem', '-outform', 'DER', '-out', tls / 'node2.der')
-    for name in ('api-key', 'other-key', 'redis-key'):
+    for name in ('api-key', 'other-key', 'admin-key', 'redis-key'):
         path = directory / name
         path.write_text(secrets.token_hex(32))
         path.chmod(0o600)
@@ -60,7 +60,7 @@ def credentials(directory, image):
     data = {p.name: base64.b64encode(p.read_bytes()).decode() for p in tls.iterdir()
             if p.suffix in ('.pem', '.key', '.der') and p.name != 'ca.key'}
     data.update({name: base64.b64encode((directory / name).read_bytes()).decode()
-                 for name in ('api-key', 'other-key', 'redis-key', 'image')})
+                 for name in ('api-key', 'other-key', 'admin-key', 'redis-key', 'image')})
     return data
 
 
@@ -196,7 +196,7 @@ class KubernetesRun(common.Run):
 def write_junit(path, report):
     suite = ET.Element('testsuite', name='platform-kubernetes-e2e')
     records = {case['name']: case for case in report['cases']}
-    for name in ('sdk', 'auth', 'capacity', 'restart', 'stop'):
+    for name in ('sdk', 'auth', 'capacity', 'placement', 'node-failure', 'restart', 'stop'):
         record = records.get(name)
         case = ET.SubElement(suite, 'testcase', name=name, time=str(record['seconds'] if record else 0))
         if not record:

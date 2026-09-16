@@ -6,7 +6,6 @@ package sandbox
 import (
 	"context"
 	"errors"
-	"net/http"
 	"testing"
 
 	"gitcode.com/robbluo/agent-dx/platform/control-plane/sandbox-api/backend"
@@ -48,7 +47,7 @@ func setTransportForTest(t *testing.T, transport backend.Transport) func() {
 		Authenticate: func(context.Context, string) (backend.Identity, error) {
 			return backend.Identity{}, errors.New("invalid credential")
 		},
-		MasterAddress: func() string { return "" }, SnapshotHTTPClient: http.DefaultClient})
+	})
 	if err != nil {
 		t.Fatal(err)
 	}

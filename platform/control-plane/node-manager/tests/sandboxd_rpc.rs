@@ -15,6 +15,8 @@ use tonic::{Request, Response, Status};
 #[derive(Clone)]
 struct Server {
     requests: Arc<Mutex<Vec<String>>>,
+    starts: Arc<Mutex<Vec<StartRequest>>>,
+    unready: Arc<std::sync::atomic::AtomicUsize>,
     running: Arc<Mutex<bool>>,
     xpu: Arc<Mutex<Vec<XpuAllocation>>>,
     entered: Arc<Semaphore>,
@@ -29,6 +31,8 @@ impl Default for Server {
     fn default() -> Self {
         Self {
             requests: Arc::default(),
+            starts: Arc::default(),
+            unready: Arc::default(),
             running: Arc::default(),
             xpu: Arc::default(),
             entered: Arc::new(Semaphore::new(0)),
@@ -49,6 +53,7 @@ impl sandbox_service_server::SandboxService for Server {
     ) -> Result<Response<StartResponse>, Status> {
         let request = request.into_inner();
         assert!(request.sandbox_id.is_empty());
+        self.starts.lock().unwrap().push(request.clone());
         *self.labels.lock().unwrap() = request.labels.clone();
         *self.xpu.lock().unwrap() = request.xpu_allocations.clone();
         self.requests
@@ -126,9 +131,20 @@ impl sandbox_service_server::SandboxService for Server {
     }
     async fn checkpoint(
         &self,
-        _: Request<CheckpointRequest>,
+        request: Request<CheckpointRequest>,
     ) -> Result<Response<CheckpointResponse>, Status> {
-        Err(Status::unimplemented("unused"))
+        let r = request.into_inner();
+        assert_eq!(r.id, "generated-backend-id");
+        assert!(!r.leave_running);
+        assert_eq!(r.timeout_seconds, 60);
+        assert_eq!(r.snapshot_type, "Full");
+        std::fs::write(
+            std::path::Path::new(&r.checkpoint_dir).join("memory"),
+            b"state",
+        )
+        .unwrap();
+        *self.running.lock().unwrap() = false;
+        Ok(Response::new(CheckpointResponse {}))
     }
     async fn wait(&self, _: Request<WaitRequest>) -> Result<Response<WaitResponse>, Status> {
         Err(Status::unimplemented("unused"))
@@ -137,7 +153,23 @@ impl sandbox_service_server::SandboxService for Server {
         &self,
         _: Request<ListAvailableRuntimesRequest>,
     ) -> Result<Response<ListAvailableRuntimesResponse>, Status> {
-        Err(Status::unimplemented("unused"))
+        use std::sync::atomic::Ordering;
+        if self
+            .unready
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return Err(Status::unavailable("sandbox service not ready"));
+        }
+        Ok(Response::new(ListAvailableRuntimesResponse {
+            runtime_classes: vec!["runsc".into()],
+            runtimes: vec![RuntimeInfo {
+                runtime_class: "runsc".into(),
+                supports_checkpoint_restore: true,
+                checkpoint_handoff_path: "/run/backend/checkpoint".into(),
+                restore_env_path: "/run/backend/environment".into(),
+            }],
+        }))
     }
     async fn set_network_policy(
         &self,
@@ -185,6 +217,8 @@ async fn connect(server: Server) -> (Sandboxd, Harness) {
 }
 fn spec() -> InstanceSpec {
     InstanceSpec {
+        snapshot_id: None,
+        lifecycle: Default::default(),
         env: Default::default(),
         scheduling: Default::default(),
         id: "i".into(),
@@ -391,4 +425,45 @@ async fn cleanup_after_restart_finds_uncommitted_runtime_by_labels() {
     .unwrap();
     restored.remove("i-1").await.unwrap();
     assert!(!*server.running.lock().unwrap());
+}
+
+#[tokio::test]
+async fn checkpoint_uses_physical_id_and_restore_generates_new_backend_id_with_fresh_environment() {
+    let server = Server::default();
+    let starts = server.starts.clone();
+    server.release.add_permits(1);
+    let (adapter, _harness) = connect(server).await;
+    adapter.start(&spec(), "i-1", 1, &[]).await.unwrap();
+    let checkpoint = tempfile::tempdir().unwrap();
+    adapter
+        .checkpoint("i-1", checkpoint.path(), Duration::from_secs(60))
+        .await
+        .unwrap();
+    adapter.remove("i-1").await.unwrap();
+    adapter
+        .restore(&spec(), "i-1-r5", 1, &[], checkpoint.path())
+        .await
+        .unwrap();
+    assert!(adapter.is_running("i-1-r5").await.unwrap());
+    let requests = starts.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(requests.iter().all(|r| r.sandbox_id.is_empty()));
+    assert_eq!(
+        requests[0].envs["ADX_CHECKPOINT_HANDOFF_FILE"],
+        "/run/backend/checkpoint"
+    );
+    assert_eq!(requests[1].envs["ADX_RUNTIME_ID"], "i-1-r5");
+    assert_eq!(requests[1].envs["ADX_ENV_FILE"], "/run/backend/environment");
+    assert_eq!(
+        requests[1].checkpoint_info.as_ref().unwrap().checkpoint_dir,
+        checkpoint.path().to_str().unwrap()
+    );
+}
+
+#[tokio::test]
+async fn node_startup_waits_for_backend_capabilities_readiness() {
+    let server = Server::default();
+    server.unready.store(2, std::sync::atomic::Ordering::SeqCst);
+    let (adapter, _harness) = connect(server).await;
+    adapter.wait_ready().await.unwrap();
 }

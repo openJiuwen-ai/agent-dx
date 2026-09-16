@@ -9,7 +9,10 @@ service NodeProxyService {
   rpc BeginBindings(BindingState) returns (BindingState);
   rpc ReplaceBindings(BindingSnapshot) returns (BindingState);
   rpc UpdateBinding(UpdateBindingRequest) returns (UpdateBindingResponse);
+  rpc GetInstanceActivity(GetInstanceActivityRequest) returns (InstanceActivityState);
 }
+message GetInstanceActivityRequest { string instance_id = 1; string runtime_id = 2; }
+message InstanceActivityState { string proxy_session_id = 1; uint64 activity_revision = 2; uint64 active_streams = 3; }
 message RuntimeTarget {
   string runtime_id = 1;
   string ip = 2;

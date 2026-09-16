@@ -59,7 +59,10 @@ def commands_for(suite, output, jobs):
                 ["env", "ADX_TUNNEL_PROTOCOL_VERSION=2", "ADX_TUNNEL_FAST_PATH_BODY_BYTES=65536",
                  f"RRT_RUNTIME={target / 'debug/rrt-runtime'}",
                  f"PYTHONPATH={ROOT / 'platform/sdk/sandbox/python'}", python,
-                 "platform/runtime/rrt/tests/tunnel_interop.py"]]
+                 "platform/runtime/rrt/tests/tunnel_interop.py"],
+                [python, "build/ci/rpc_certificates.py", str(output / "tls")],
+                ["env", f"PYTHONPATH={ROOT / 'platform/sdk/sandbox/python'}", python,
+                 "build/ci/command_watch_tls.py", "--tls", str(output / "tls")]]
     if suite == "package":
         packages = ["agent/cli", "agent/sdk/python", "agent/executor", "platform/sdk/sandbox/python"]
         return [[python, "-m", "build", "--no-isolation", "--wheel", "--sdist",

@@ -1,5 +1,11 @@
 //! Instance and resource contracts shared by the control plane.
 
+pub mod checkpoint;
+pub mod lifecycle;
+pub mod snapshots;
+pub use checkpoint::{
+    valid_runtime_id, CheckpointArtifact, CompletedOperation, LifecycleKind, RestorePoint,
+};
 pub mod runtime;
 pub mod scheduling;
 
@@ -64,6 +70,10 @@ impl Resources {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstanceSpec {
     #[serde(default)]
+    pub snapshot_id: Option<String>,
+    #[serde(default)]
+    pub lifecycle: lifecycle::LifecyclePolicy,
+    #[serde(default)]
     pub env: BTreeMap<String, String>,
     pub id: String,
     pub tenant_id: String,
@@ -87,6 +97,7 @@ impl InstanceSpec {
                 return Err(Error::Invalid(format!("{name} is required")));
             }
         }
+        self.lifecycle.validate()?;
         self.resources.validate()?;
         self.scheduling.validate()
     }
@@ -163,6 +174,9 @@ pub enum InstanceState {
     Pending,
     Starting,
     Running,
+    Pausing,
+    Paused,
+    Resuming,
     Deleting,
     Deleted,
     Failed,
@@ -172,6 +186,10 @@ pub enum InstanceState {
 pub enum Event {
     Start,
     Ready,
+    Pause,
+    Checkpointed,
+    Resume,
+    Rollback,
     Delete,
     Removed,
     Fail,
@@ -183,11 +201,18 @@ impl InstanceState {
         use Event::*;
         use InstanceState::*;
         match (self, event) {
-            (Pending, Start) => Ok(Starting),
-            (Starting, Ready) => Ok(Running),
-            (Pending | Starting | Running | Failed, Delete) => Ok(Deleting),
+            (Pending | Failed, Start) => Ok(Starting),
+            (Starting | Resuming, Ready) => Ok(Running),
+            (Running, Pause) => Ok(Pausing),
+            (Pausing, Checkpointed) => Ok(Paused),
+            (Paused, Resume) => Ok(Resuming),
+            (Pausing, Rollback) => Ok(Running),
+            (Resuming, Rollback) => Ok(Paused),
+            (Pending | Starting | Running | Pausing | Paused | Resuming | Failed, Delete) => {
+                Ok(Deleting)
+            }
             (Deleting, Removed) => Ok(Deleted),
-            (Starting | Running | Deleting, Fail) => Ok(Failed),
+            (Starting | Running | Pausing | Paused | Resuming | Deleting, Fail) => Ok(Failed),
             _ => Err(Error::Conflict),
         }
     }
@@ -205,6 +230,10 @@ pub struct Assignment {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstanceRecord {
+    #[serde(default)]
+    pub restart_attempts: u32,
+    #[serde(default)]
+    pub restart_pending: bool,
     pub spec: InstanceSpec,
     pub assignment: Assignment,
     pub state: InstanceState,
@@ -213,6 +242,10 @@ pub struct InstanceRecord {
     /// Failed does not imply cleanup. Keep capacity reserved while this is true.
     pub resources_held: bool,
     pub runtime_ip: Option<std::net::IpAddr>,
+    #[serde(default)]
+    pub checkpoint: Option<RestorePoint>,
+    #[serde(default)]
+    pub last_operation: Option<CompletedOperation>,
 }
 
 #[cfg(test)]

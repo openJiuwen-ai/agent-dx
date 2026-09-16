@@ -31,6 +31,7 @@ import (
 	"net/netip"
 	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -216,14 +217,22 @@ type reusableSnapshotInfo struct {
 }
 
 // CreateRequest holds the parameters for sandbox creation.
+type RestartPolicy struct {
+	MaxAttempts           uint32 `json:"maxAttempts"`
+	InitialBackoffSeconds uint64 `json:"initialBackoffSeconds"`
+	MaxBackoffSeconds     uint64 `json:"maxBackoffSeconds"`
+}
+
 type CreateRequest struct {
-	Name      string   `json:"name"`
-	Namespace string   `json:"namespace"`
-	Tenant    string   `json:"tenant"`
-	Runtime   string   `json:"runtime"`
-	Rootfs    string   `json:"rootfs"`
-	Image     string   `json:"image"`
-	Ports     []string `json:"ports"`
+	Labels        map[string]string `json:"labels,omitempty"`
+	RestartPolicy *RestartPolicy    `json:"restartPolicy,omitempty"`
+	Name          string            `json:"name"`
+	Namespace     string            `json:"namespace"`
+	Tenant        string            `json:"tenant"`
+	Runtime       string            `json:"runtime"`
+	Rootfs        string            `json:"rootfs"`
+	Image         string            `json:"image"`
+	Ports         []string          `json:"ports"`
 	// portRouteKinds is populated only by the frontend for runtime-owned ports.
 	// It is deliberately not part of the public SDK request contract.
 	portRouteKinds map[int]string
@@ -370,9 +379,11 @@ type DataPlanePolicy struct {
 
 // CreateV1Request holds POST /api/sandbox/v1/sandboxes parameters.
 type CreateV1Request struct {
-	Name      string `json:"name"`
-	Namespace string `json:"namespace"`
-	Tenant    string `json:"tenant"`
+	Labels        map[string]string `json:"labels,omitempty"`
+	RestartPolicy *RestartPolicy    `json:"restartPolicy,omitempty"`
+	Name          string            `json:"name"`
+	Namespace     string            `json:"namespace"`
+	Tenant        string            `json:"tenant"`
 	// LegacyRuntime accepts the deprecated top-level runtime field from old
 	// clients. New clients encode the isolation runtime as rootfs.runtime.
 	LegacyRuntime          string                   `json:"runtime,omitempty"`
@@ -779,7 +790,8 @@ func prepareCreateV1Request(req *CreateV1Request) (string, *TunnelInfo, error) {
 	if req.Rootfs.Runtime == "" {
 		req.Rootfs.Runtime = req.LegacyRuntime
 	}
-	if req.Rootfs.Runtime == "" {
+	inheritRuntime := strings.TrimSpace(req.SnapshotID) != "" && req.Rootfs.Runtime == ""
+	if req.Rootfs.Runtime == "" && !inheritRuntime {
 		req.Rootfs.Runtime = "runsc"
 	}
 	if err := validateScheduleAffinities(req.ScheduleAffinities); err != nil {
@@ -801,6 +813,18 @@ func prepareCreateV1Request(req *CreateV1Request) (string, *TunnelInfo, error) {
 	rootfs, err := buildRootfsOption(req.Rootfs, req.Image)
 	if err != nil {
 		return "", nil, err
+	}
+	if inheritRuntime {
+		var root map[string]interface{}
+		if err := json.Unmarshal([]byte(rootfs), &root); err != nil {
+			return "", nil, err
+		}
+		delete(root, "runtime")
+		encoded, err := json.Marshal(root)
+		if err != nil {
+			return "", nil, err
+		}
+		rootfs = string(encoded)
 	}
 	if req.InheritEntrypoint {
 		resolvedRootfs, image := normalizeRootfsSpec(req.Rootfs, req.Image)
@@ -1192,6 +1216,9 @@ func normalizeSandboxDomainPattern(pattern, description string) (string, error) 
 
 func validateScheduleAffinities(affinities []Affinity) error {
 	for affinityIndex, affinity := range affinities {
+		if affinity.Weight < 0 || affinity.Weight > 1000 {
+			return fmt.Errorf("scheduleAffinities[%d].weight must be between 0 and 1000", affinityIndex)
+		}
 		if affinity.Kind != AffinityKindResource &&
 			affinity.Kind != AffinityKindInstance {
 			return fmt.Errorf(
@@ -1244,6 +1271,7 @@ func validateScheduleAffinities(affinities []Affinity) error {
 
 func createRequestFromV1(req CreateV1Request, rootfs string) CreateRequest {
 	return CreateRequest{
+		RestartPolicy:          req.RestartPolicy,
 		Name:                   req.Name,
 		Namespace:              req.Namespace,
 		Tenant:                 req.Tenant,
@@ -1264,6 +1292,7 @@ func createRequestFromV1(req CreateV1Request, rootfs string) CreateRequest {
 		Network:                req.Network,
 		DataPlane:              req.DataPlane,
 		ScheduleAffinities:     req.ScheduleAffinities,
+		Labels:                 req.Labels,
 		SnapshotID:             strings.TrimSpace(req.SnapshotID),
 		Failover:               req.Failover,
 		InheritEntrypoint:      req.InheritEntrypoint,
@@ -1762,10 +1791,13 @@ func buildSandboxRawScheduleAffinity(
 		if selector.Condition == nil {
 			selector.Condition = &affinity.Condition{}
 		}
+		if len(selector.Condition.SubConditions) > 0 && selector.Condition.OrderPriority != scheduleAffinity.PreferredPriority {
+			return nil, fmt.Errorf("affinity alternatives must use the same preferredPriority mode")
+		}
 		selector.Condition.OrderPriority = scheduleAffinity.PreferredPriority
 		selector.Condition.SubConditions = append(
 			selector.Condition.SubConditions,
-			&affinity.SubCondition{Expressions: expressions},
+			&affinity.SubCondition{Expressions: expressions, Weight: scheduleAffinity.Weight},
 		)
 	}
 	return rawAffinity, nil
@@ -1961,7 +1993,19 @@ func newSandboxInvokeOptions(req sandboxInvokeOptionRequest) (createOptions, err
 	if err != nil {
 		return createOptions{}, err
 	}
+	var labels []string
+	if len(req.createReq.Labels) > 256 {
+		return createOptions{}, fmt.Errorf("at most 256 instance labels")
+	}
+	for key, value := range req.createReq.Labels {
+		if strings.TrimSpace(key) == "" || strings.ContainsAny(key, ":=") {
+			return createOptions{}, fmt.Errorf("invalid instance label key")
+		}
+		labels = append(labels, key+":"+value)
+	}
+	sort.Strings(labels)
 	invokeOpts := createOptions{
+		Labels:             labels,
 		TraceID:            req.traceID,
 		Cpu:                cpu,
 		Memory:             memory,
@@ -2042,6 +2086,17 @@ func fillSandboxCustomExtensions(
 ) error {
 	if traceParent != "" {
 		invokeOpts.CustomExtensions["traceparent"] = traceParent
+	}
+	if req.RestartPolicy != nil {
+		policy := req.RestartPolicy
+		if policy.MaxAttempts == 0 || policy.InitialBackoffSeconds == 0 || policy.MaxBackoffSeconds < policy.InitialBackoffSeconds {
+			return fmt.Errorf("invalid restart policy")
+		}
+		value, err := json.Marshal(policy)
+		if err != nil {
+			return err
+		}
+		invokeOpts.CustomExtensions["restart_policy"] = string(value)
 	}
 	if idleTimeoutSeconds > 0 {
 		invokeOpts.CustomExtensions["idle_timeout"] = strconv.Itoa(idleTimeoutSeconds)
@@ -2877,7 +2932,7 @@ func DeleteHandler(ctx *gin.Context) {
 	httpx.SetCtxResponse(ctx, map[string]string{"status": "deleted"}, http.StatusOK, nil)
 }
 
-// PauseV1Handler synchronously pauses one sandbox through signal 18.
+// PauseV1Handler synchronously pauses one sandbox.
 func PauseV1Handler(ctx *gin.Context) {
 	instanceID := strings.TrimSpace(ctx.Param("sandboxID"))
 	runningSummary, hadRunningSummary := instancecache.Default().GetSummary(instanceID)
@@ -2939,16 +2994,20 @@ func PauseV1Handler(ctx *gin.Context) {
 		runningSummary.ContainerIP = ""
 		instancecache.Default().PutSummary(runningSummary)
 	}
+	expiresAt := int64(snapInfo.GetExpiresAtUnixSeconds())
+	if expiresAt == 0 {
+		expiresAt = time.Now().Unix() + int64(req.TTLSeconds)
+	}
 	httpx.SetCtxResponse(ctx, pauseV1Response{
 		SandboxID:  instanceID,
 		SnapshotID: snapInfo.GetSnapshotID(),
 		Size:       snapInfo.GetSize(),
 		State:      "paused",
-		ExpiresAt:  time.Now().Unix() + int64(req.TTLSeconds),
+		ExpiresAt:  expiresAt,
 	}, http.StatusOK, nil)
 }
 
-// ResumeV1Handler synchronously resumes one sandbox through signal 19.
+// ResumeV1Handler synchronously resumes one sandbox.
 func ResumeV1Handler(ctx *gin.Context) {
 	instanceID := strings.TrimSpace(ctx.Param("sandboxID"))
 	payload, err := proto.Marshal(&core.SnapStartOptions{Type: common.SnapType_PAUSE_RESUME})
@@ -2983,8 +3042,8 @@ func ResumeV1Handler(ctx *gin.Context) {
 		httpx.SetCtxResponse(ctx, nil, http.StatusInternalServerError, fmt.Errorf("invalid resume port mappings: %v", err))
 		return
 	}
-	// SandboxRouter caches converge independently through ETCD watch/read-through;
-	// local route publication is not part of the lifecycle success boundary.
+	// Node binding and the Running record have been committed; Edge converges
+	// through the Master route stream.
 	httpx.SetCtxResponse(ctx, resumeV1Response{
 		SandboxID:       started.GetInstanceID(),
 		State:           "running",
@@ -3175,8 +3234,23 @@ func setSandboxLifecycleError(ctx *gin.Context, err error) {
 }
 
 func lifecycleHTTPStatus(err error) int {
-	if status.Code(err) == codes.Unimplemented {
+	switch status.Code(err) {
+	case codes.Unimplemented:
 		return http.StatusNotImplemented
+	case codes.InvalidArgument:
+		return http.StatusBadRequest
+	case codes.FailedPrecondition, codes.Aborted:
+		return http.StatusConflict
+	case codes.NotFound:
+		return http.StatusNotFound
+	case codes.PermissionDenied:
+		return http.StatusForbidden
+	case codes.Unauthenticated:
+		return http.StatusUnauthorized
+	case codes.Unavailable:
+		return http.StatusServiceUnavailable
+	case codes.DeadlineExceeded:
+		return http.StatusGatewayTimeout
 	}
 
 	statusCode := http.StatusInternalServerError

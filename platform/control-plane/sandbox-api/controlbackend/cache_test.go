@@ -41,7 +41,7 @@ func (n *nodeFake) DeleteInstance(_ context.Context, r *pb.DeleteInstanceRequest
 	return &pb.InstanceResult{Record: &pb.InstanceRecord{Spec: &pb.InstanceSpec{Id: "i", TenantId: "t"}, Assignment: r.Assignment, State: pb.InstanceState_INSTANCE_STATE_DELETED, Revision: 4}, Durability: pb.Durability_DURABILITY_PUBLISHED}, nil
 }
 func owner(generation uint64) *pb.GetInstanceResponse {
-	return &pb.GetInstanceResponse{NodeAddress: "node:1234", Record: &pb.InstanceRecord{Spec: &pb.InstanceSpec{Id: "i", TenantId: "t"}, Assignment: &pb.Assignment{InstanceId: "i", NodeId: "n", Generation: generation}, State: pb.InstanceState_INSTANCE_STATE_RUNNING, Revision: 2}}
+	return &pb.GetInstanceResponse{NodeAddress: "node:1234", NodeProxyAddress: "node:8443", Record: &pb.InstanceRecord{Spec: &pb.InstanceSpec{Id: "i", TenantId: "t"}, Assignment: &pb.Assignment{InstanceId: "i", NodeId: "n", Generation: generation}, State: pb.InstanceState_INSTANCE_STATE_RUNNING, Revision: 2}}
 }
 func request() backend.LifecycleRequest {
 	return backend.LifecycleRequest{Context: backend.WithIdentity(context.Background(), backend.Identity{TenantID: "t", Role: backend.RoleTenant}), InstanceID: "i", Signal: 1, RequestID: "delete-a"}

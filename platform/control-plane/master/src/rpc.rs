@@ -1,4 +1,7 @@
 //! Async RPC coordination around the synchronous scheduler and Redis repository.
+mod cloning;
+mod recovery;
+mod snapshots;
 use crate::{
     storage::{NodeSession, Session, StoredInstance, StoredNode},
     Master, Node, Placement,
@@ -20,6 +23,7 @@ use tonic::{
 };
 
 struct LiveNode {
+    expired: bool,
     session: String,
     sequence: u64,
     last_seen: tokio::time::Instant,
@@ -33,10 +37,21 @@ struct State {
     instances: BTreeMap<String, StoredInstance>,
     nodes: BTreeMap<String, StoredNode>,
     needs_recovery: bool,
+    recovery_cursor: Option<String>,
     live: BTreeMap<String, LiveNode>,
+    recovering: BTreeMap<String, tokio::time::Instant>,
     retired_sessions: BTreeSet<(String, String)>,
 }
 impl State {
+    fn overdue(&self, id: &str, timeout: Duration) -> bool {
+        self.live
+            .get(id)
+            .is_some_and(|live| !live.expired && live.last_seen.elapsed() >= timeout)
+            || self
+                .recovering
+                .get(id)
+                .is_some_and(|since| since.elapsed() >= timeout)
+    }
     fn healthy(&self) -> Result<()> {
         if self.needs_recovery {
             Err(Error::Unavailable(
@@ -45,6 +60,46 @@ impl State {
         } else {
             Ok(())
         }
+    }
+    async fn invalidate_node(&mut self, id: &str) -> Result<()> {
+        let mut node = self.nodes.get(id).ok_or(Error::Conflict)?.clone();
+        let session_id = node.session.as_ref().ok_or(Error::Conflict)?.id.clone();
+        node.node.available = false;
+        node.session.as_mut().unwrap().routable = false;
+        self.scheduler.register(node.node.clone())?;
+        self.nodes.insert(id.to_owned(), node);
+        let saved = match self.session.invalidate_node(id, &session_id).await {
+            Ok(saved) => saved,
+            Err(error) => {
+                self.needs_recovery = true;
+                return Err(error);
+            }
+        };
+        self.nodes.insert(id.to_owned(), saved.nodes[id].clone());
+        self.scheduler.generation = self.scheduler.generation.max(saved.generation);
+        for (instance_id, stored) in saved.instances {
+            if stored.assignment.node_id == id && stored.invalidated {
+                if self
+                    .scheduler
+                    .snapshot()
+                    .instances()
+                    .contains_key(&instance_id)
+                {
+                    if let Err(error) = self.scheduler.release(&stored.assignment) {
+                        self.needs_recovery = true;
+                        return Err(error);
+                    }
+                }
+                self.specs.insert(instance_id.clone(), stored.spec.clone());
+                self.instances.insert(instance_id, stored);
+            }
+        }
+        self.recovering.remove(id);
+        if let Some(live) = self.live.get_mut(id) {
+            live.inspected = false;
+            live.expired = true;
+        }
+        Ok(())
     }
     async fn drive(&mut self) -> Result<bool> {
         self.healthy()?;
@@ -59,9 +114,31 @@ impl State {
                 .get(&assignment.instance_id)
                 .ok_or(Error::Conflict)?
                 .clone();
-            match self.session.reserve(spec, assignment).await {
+            let recovery = self
+                .instances
+                .get(&spec.id)
+                .filter(|i| i.invalidated)
+                .cloned();
+            let saved = if let Some(old) = recovery {
+                self.session
+                    .reserve_recovery(&old.assignment, assignment.clone(), recovery::now()?)
+                    .await
+            } else {
+                self.session.reserve(spec, assignment.clone()).await
+            };
+            match saved {
                 Ok(record) => {
                     self.instances.insert(record.spec.id.clone(), record);
+                }
+                Err(Error::Conflict)
+                    if self
+                        .instances
+                        .get(&assignment.instance_id)
+                        .is_some_and(|i| i.invalidated) =>
+                {
+                    self.scheduler.release(&assignment)?;
+                    let fresh = self.session.get(&assignment.instance_id).await?;
+                    self.instances.insert(assignment.instance_id.clone(), fresh);
                 }
                 Err(error) => {
                     self.needs_recovery = true;
@@ -117,6 +194,17 @@ impl MasterRpc {
             return Err(Error::Invalid("RPC timeout must be positive".into()));
         }
         let mut saved = session.snapshot().await?;
+        // The pending queues are intentionally memory-only. Release their old
+        // source pins after a new Master epoch has fenced all previous writers.
+        for snapshot in session.retained_snapshots().await? {
+            for reference in snapshot.references {
+                if let adx_core::snapshots::Reference::Restore { instance_id } = &reference {
+                    if !saved.instances.contains_key(instance_id) {
+                        session.release_snapshot(&snapshot.id, reference).await?;
+                    }
+                }
+            }
+        }
         // Persist unreachability before exposing a recovered routing snapshot.
         for node in saved.nodes.values_mut() {
             node.node.available = false;
@@ -142,6 +230,10 @@ impl MasterRpc {
             .iter()
             .map(|(id, i)| (id.clone(), i.spec.clone()))
             .collect();
+        // Monotonic heartbeat timestamps cannot survive a process restart. Give
+        // recovered nodes one bounded registration grace, with routes kept closed.
+        let now = tokio::time::Instant::now();
+        let recovering = saved.nodes.keys().map(|id| (id.clone(), now)).collect();
         Ok(Self(Arc::new(Inner {
             state: Mutex::new(State {
                 session,
@@ -150,7 +242,9 @@ impl MasterRpc {
                 instances: saved.instances,
                 nodes: saved.nodes,
                 needs_recovery: false,
+                recovery_cursor: None,
                 live: BTreeMap::new(),
+                recovering,
                 retired_sessions: BTreeSet::new(),
             }),
             changed: Notify::new(),
@@ -160,38 +254,57 @@ impl MasterRpc {
             heartbeat_timeout,
         })))
     }
-    /// Close placement and cluster route publication; retain all resource claims.
+    /// Invalidate expired executions and their routes before admitting a returning node.
     pub async fn expire_nodes(&self) -> Result<usize> {
         let mut state = self.0.state.lock().await;
         state.healthy()?;
         let ids: Vec<_> = state
-            .live
-            .iter()
-            .filter(|(_, n)| n.last_seen.elapsed() >= self.0.heartbeat_timeout)
-            .map(|(id, _)| id.clone())
+            .nodes
+            .keys()
+            .filter(|id| state.overdue(id, self.0.heartbeat_timeout))
+            .cloned()
             .collect();
         for id in &ids {
-            let mut node = state.nodes.get(id).ok_or(Error::Conflict)?.clone();
-            node.node.available = false;
-            if let Some(s) = &mut node.session {
-                s.routable = false;
-            }
-            // Close in-memory placement even when persistence is unavailable.
-            state.scheduler.register(node.node.clone())?;
-            state.nodes.insert(id.clone(), node.clone());
-            let saved = state
-                .session
-                .register_session(node.node, node.address, node.proxy_address, node.session)
-                .await?;
-            state.nodes.insert(id.clone(), saved);
-            if let Some(live) = state.live.get_mut(id) {
-                live.inspected = false;
-            }
-        }
-        if !ids.is_empty() {
+            let result = state.invalidate_node(id).await;
             self.0.changed.notify_waiters();
+            result?;
         }
         Ok(ids.len())
+    }
+
+    /// A restarted process can retain unexpired assignments only if it is the
+    /// authenticated service at the existing address. Probe without holding the
+    /// scheduler lock; the caller rechecks the old session and deadline on commit.
+    async fn replacement_predecessor(&self, r: &pb::RegisterNodeRequest) -> Option<String> {
+        let predecessor = {
+            let state = self.0.state.lock().await;
+            let live = state.live.get(&r.node_id)?;
+            if !r.reconciling
+                || live.session == r.session_id
+                || live.last_seen.elapsed() >= self.0.heartbeat_timeout
+                || live.report.node_address != r.node_address
+                || live.report.proxy_address != r.proxy_address
+                || state
+                    .retired_sessions
+                    .contains(&(r.node_id.clone(), r.session_id.clone()))
+            {
+                return None;
+            }
+            live.session.clone()
+        };
+        let endpoint = Endpoint::from_shared(format!("https://{}", r.node_address))
+            .ok()?
+            .tls_config(self.0.node_tls.clone())
+            .ok()?
+            .connect_timeout(self.0.timeout)
+            .timeout(self.0.timeout);
+        let channel = endpoint.connect().await.ok()?;
+        let actual = pb::node_service_client::NodeServiceClient::new(channel)
+            .get_session(pb::GetNodeSessionRequest {})
+            .await
+            .ok()?
+            .into_inner();
+        (actual.node_id == r.node_id && actual.session_id == r.session_id).then_some(predecessor)
     }
 
     async fn create(&self, spec: InstanceSpec) -> std::result::Result<pb::InstanceResult, Status> {
@@ -208,7 +321,34 @@ impl MasterRpc {
                     ));
                 }
             } else {
-                state.scheduler.submit(spec.clone()).map_err(status)?;
+                if let Some(id) = &spec.snapshot_id {
+                    state
+                        .session
+                        .acquire_snapshot(
+                            id,
+                            &spec.tenant_id,
+                            adx_core::snapshots::Reference::Restore {
+                                instance_id: spec.id.clone(),
+                            },
+                        )
+                        .await
+                        .map_err(status)?;
+                }
+                if let Err(error) = state.scheduler.submit(spec.clone()) {
+                    if let Some(id) = &spec.snapshot_id {
+                        state
+                            .session
+                            .release_snapshot(
+                                id,
+                                adx_core::snapshots::Reference::Restore {
+                                    instance_id: spec.id.clone(),
+                                },
+                            )
+                            .await
+                            .map_err(status)?;
+                    }
+                    return Err(status(error));
+                }
                 state.specs.insert(spec.id.clone(), spec.clone());
             }
             let drive = state.drive().await;
@@ -242,6 +382,21 @@ impl MasterRpc {
                 {
                     return Err(Status::unavailable("owner node requires reconciliation"));
                 }
+                let snapshot = match &spec.snapshot_id {
+                    Some(id) => {
+                        let snapshot = state.session.get_snapshot(id).await.map_err(status)?;
+                        if !snapshot
+                            .references
+                            .contains(&adx_core::snapshots::Reference::Restore {
+                                instance_id: spec.id.clone(),
+                            })
+                        {
+                            return Err(Status::failed_precondition("snapshot reference missing"));
+                        }
+                        Some(snapshot.try_into().map_err(status)?)
+                    }
+                    None => None,
+                };
                 drop(state);
                 let endpoint = Endpoint::from_shared(format!("https://{}", node.address))
                     .map_err(|_| Status::invalid_argument("invalid node address"))?
@@ -254,6 +409,7 @@ impl MasterRpc {
                     .await
                     .map_err(|_| Status::unavailable("node connection unavailable"))?;
                 let request = pb::StartAssignedInstanceRequest {
+                    snapshot,
                     node_session_id: node
                         .session
                         .as_ref()
@@ -309,6 +465,16 @@ impl MasterRpc {
     }
     async fn commit(&self, record: InstanceRecord, session_id: String) -> Result<InstanceRecord> {
         let mut state = self.0.state.lock().await;
+        state.healthy()?;
+        let id = &record.assignment.node_id;
+        if state.overdue(id, self.0.heartbeat_timeout) {
+            let result = state.invalidate_node(id).await;
+            self.0.changed.notify_waiters();
+            result?;
+        }
+        if state.live.get(id).is_none_or(|live| live.expired) {
+            return Err(Error::Conflict);
+        }
         if state
             .nodes
             .get(&record.assignment.node_id)
@@ -318,8 +484,20 @@ impl MasterRpc {
             return Err(Error::Conflict);
         }
         let accepted = state.session.commit(record).await?;
+        if let Some(stored) = state.instances.get_mut(&accepted.spec.id) {
+            stored.result = Some(accepted.clone());
+            if accepted.state != InstanceState::Paused {
+                if let Some(recovery) = &mut stored.recovery {
+                    recovery.pending = false;
+                }
+            }
+        }
+        let held = state
+            .instances
+            .get(&accepted.spec.id)
+            .is_some_and(|s| s.resources_held());
         if !state.needs_recovery
-            && !accepted.resources_held
+            && !held
             && state
                 .scheduler
                 .snapshot()
@@ -327,6 +505,22 @@ impl MasterRpc {
                 .contains_key(&accepted.spec.id)
         {
             if let Err(error) = state.scheduler.release(&accepted.assignment) {
+                state.needs_recovery = true;
+                return Err(error);
+            }
+        }
+        if !state.needs_recovery
+            && held
+            && !state
+                .scheduler
+                .snapshot()
+                .instances()
+                .contains_key(&accepted.spec.id)
+        {
+            if let Err(error) = state
+                .scheduler
+                .restore_assignment(&accepted.spec, &accepted.assignment)
+            {
                 state.needs_recovery = true;
                 return Err(error);
             }
@@ -361,6 +555,14 @@ impl pb::master_service_server::MasterService for MasterRpc {
             ));
         }
         let snapshot = state.session.snapshot().await.map_err(status)?;
+        let retained_checkpoints = snapshot
+            .instances
+            .values()
+            .filter_map(|i| i.result.as_ref().and_then(|r| r.checkpoint.as_ref()))
+            .filter(|cp| cp.artifact.storage != "local")
+            .cloned()
+            .map(Into::into)
+            .collect();
         let records = snapshot
             .instances
             .into_values()
@@ -368,6 +570,8 @@ impl pb::master_service_server::MasterService for MasterRpc {
             .map(|i| {
                 i.result
                     .unwrap_or_else(|| InstanceRecord {
+                        restart_attempts: 0,
+                        restart_pending: false,
                         runtime_id: format!("{}-{}", i.spec.id, i.assignment.generation),
                         spec: i.spec,
                         assignment: i.assignment,
@@ -375,14 +579,27 @@ impl pb::master_service_server::MasterService for MasterRpc {
                         revision: 0,
                         resources_held: true,
                         runtime_ip: None,
+                        checkpoint: None,
+                        last_operation: None,
                     })
                     .try_into()
             })
             .collect::<Result<Vec<_>>>()
             .map_err(status)?;
+        let snapshots = state
+            .session
+            .node_snapshots(&r.node_id)
+            .await
+            .map_err(status)?
+            .into_iter()
+            .map(TryInto::try_into)
+            .collect::<Result<Vec<_>>>()
+            .map_err(status)?;
         state.live.get_mut(&r.node_id).unwrap().inspected = true;
         Ok(Response::new(pb::InspectNodeResponse {
             records,
+            snapshots,
+            retained_checkpoints,
             master_epoch: state.session.epoch(),
         }))
     }
@@ -419,6 +636,7 @@ impl pb::master_service_server::MasterService for MasterRpc {
         }
         let service = self.clone();
         tokio::spawn(async move {
+            let predecessor = service.replacement_predecessor(&r).await;
             let mut state = service.0.state.lock().await;
             state.healthy().map_err(status)?;
             if state
@@ -426,6 +644,11 @@ impl pb::master_service_server::MasterService for MasterRpc {
                 .contains(&(r.node_id.clone(), r.session_id.clone()))
             {
                 return Err(Status::failed_precondition("retired node session"));
+            }
+            if state.overdue(&r.node_id, service.0.heartbeat_timeout) {
+                let result = state.invalidate_node(&r.node_id).await;
+                service.0.changed.notify_waiters();
+                result.map_err(status)?;
             }
             let mut inspected = false;
             if let Some(live) = state.live.get(&r.node_id) {
@@ -435,6 +658,11 @@ impl pb::master_service_server::MasterService for MasterRpc {
                     {
                         return Err(Status::failed_precondition("stale heartbeat"));
                     }
+                    if r.heartbeat_sequence == live.sequence && live.expired {
+                        return Err(Status::failed_precondition(
+                            "expired heartbeat; reconciliation required",
+                        ));
+                    }
                     if r.heartbeat_sequence == live.sequence {
                         return Ok(Response::new(pb::RegisterNodeResponse {
                             domain_id: state.nodes[&r.node_id].domain_id as u32,
@@ -443,7 +671,11 @@ impl pb::master_service_server::MasterService for MasterRpc {
                     }
                     inspected =
                         live.inspected && live.last_seen.elapsed() < service.0.heartbeat_timeout;
-                } else if live.last_seen.elapsed() < service.0.heartbeat_timeout {
+                } else if live.last_seen.elapsed() < service.0.heartbeat_timeout
+                    && (predecessor.as_ref() != Some(&live.session)
+                        || live.report.node_address != r.node_address
+                        || live.report.proxy_address != r.proxy_address)
+                {
                     return Err(Status::failed_precondition(
                         "another node process is still registered",
                     ));
@@ -481,6 +713,7 @@ impl pb::master_service_server::MasterService for MasterRpc {
                 return Err(Status::internal("node domain mismatch; recovery required"));
             }
             state.nodes.insert(saved.node.id.clone(), saved);
+            state.recovering.remove(&r.node_id);
             if let Some(old) = state.live.remove(&r.node_id) {
                 if old.session != r.session_id {
                     state
@@ -491,6 +724,7 @@ impl pb::master_service_server::MasterService for MasterRpc {
             state.live.insert(
                 r.node_id.clone(),
                 LiveNode {
+                    expired: false,
                     session: r.session_id.clone(),
                     sequence: r.heartbeat_sequence,
                     last_seen: tokio::time::Instant::now(),
@@ -516,12 +750,17 @@ impl pb::master_service_server::MasterService for MasterRpc {
             return Err(Status::permission_denied("Frontend caller required"));
         }
         let r = request.into_inner();
-        let spec: InstanceSpec = r
+        let raw = r
             .spec
-            .ok_or_else(|| Status::invalid_argument("spec required"))?
-            .try_into()
-            .map_err(status)?;
-        tenant(r.caller.as_ref(), &spec.tenant_id)?;
+            .ok_or_else(|| Status::invalid_argument("spec required"))?;
+        tenant(r.caller.as_ref(), &raw.tenant_id)?;
+        let spec = {
+            let state = self.0.state.lock().await;
+            state.healthy().map_err(status)?;
+            cloning::normalize(&state.session, raw)
+                .await
+                .map_err(status)?
+        };
         let service = self.clone();
         tokio::spawn(async move { service.create(spec).await.map(Response::new) })
             .await
@@ -549,6 +788,8 @@ impl pb::master_service_server::MasterService for MasterRpc {
             .get(&stored.assignment.node_id)
             .ok_or_else(|| Status::unavailable("owner node missing"))?;
         let record = stored.result.unwrap_or_else(|| InstanceRecord {
+            restart_attempts: 0,
+            restart_pending: false,
             runtime_id: format!("{}-{}", stored.spec.id, stored.assignment.generation),
             spec: stored.spec,
             assignment: stored.assignment,
@@ -556,10 +797,13 @@ impl pb::master_service_server::MasterService for MasterRpc {
             revision: 0,
             resources_held: true,
             runtime_ip: None,
+            checkpoint: None,
+            last_operation: None,
         });
         Ok(Response::new(pb::GetInstanceResponse {
             record: Some(record.try_into().map_err(status)?),
             node_address: node.address.clone(),
+            node_proxy_address: node.proxy_address.clone(),
         }))
     }
     async fn commit_instance(

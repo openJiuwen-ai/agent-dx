@@ -14,6 +14,9 @@ def event(message):print(message,flush=True)
 event('[SCENARIO] '+sys.argv[1])
 if sys.argv[1]=='sdk':
     subprocess.run([sys.executable,'-u','/opt/adx/e2e/sdk_smoke.py','--endpoint','127.0.0.1:8443','--token-file',str(S/'api-key'),'--ca',str(S/'tls/ca.pem'),'--image',image,'--output',str(E/'sdk')],check=True)
+elif sys.argv[1]=='placement':
+    from placement import run
+    run(connection,image,E/'placement-result.json')
 elif sys.argv[1]=='auth':
     from adx_sandbox import PermissionDenied, SandboxError
     s=Sandbox(image=image,runtime='runc',cpu=500,memory=512,idle_timeout=0,connection=connection,create_timeout=150)
@@ -34,7 +37,9 @@ elif sys.argv[1]=='auth':
             else:raise AssertionError('unauthorized delete accepted')
         assert s.is_running()
         event('Authentication checks passed; owner instance remains running')
-        (E/'auth-result.json').write_text(json.dumps({'status':'passed','invalid_key':True,'tenant_read_isolation':True,'tenant_delete_isolation':True}))
+        from credentials import check_management
+        management=check_management(S,event)
+        (E/'auth-result.json').write_text(json.dumps({'status':'passed','invalid_key':True,'tenant_read_isolation':True,'tenant_delete_isolation':True,'key_management':management}))
     finally:s.kill();s.close()
 elif sys.argv[1]=='capacity':
     from concurrent.futures import ThreadPoolExecutor, TimeoutError
@@ -74,6 +79,21 @@ elif sys.argv[1]=='create':
         (E/'live-instances.json').write_text(json.dumps([s.id for s in instances]))
     finally:
         for s in instances:s.close()
+elif sys.argv[1]=='failure-cleanup':
+    from node import catalog
+    observed=json.loads((E/'node-failure-observed.json').read_text())
+    healthy=Sandbox.from_id(observed['healthy_id'],connection=connection)
+    try:
+        result=healthy.commands.run('printf unaffected')
+        assert result.exit_code==0 and result.stdout=='unaffected'
+    finally:healthy.close()
+    for sid in json.loads((E/'live-instances.json').read_text()):Sandbox.delete(sid,connection=connection)
+    records=catalog()
+    for sid in json.loads((E/'live-instances.json').read_text()):
+        result=json.loads(records['instance:'+sid])['result']
+        assert result['state']=='Deleted' and not result['resources_held']
+    (E/'node-failure-result.json').write_text(json.dumps({'status':'passed',**observed,'reconnected_backend_empty':True,'cleanup_committed':True},indent=2))
+    event('PASS: reconnected node cleaned old execution; healthy instance still executes; final deletion committed')
 elif sys.argv[1]=='recovered':
     checks=[]
     for sid in json.loads((E/'live-instances.json').read_text()):

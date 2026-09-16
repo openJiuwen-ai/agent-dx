@@ -1,6 +1,7 @@
 //! Real Node Manager client -> real Node Proxy gRPC handler over local UDS.
 use adx_core::{Assignment, Error, InstanceRecord, InstanceSpec, InstanceState, Resources};
 use adx_node_manager::{routes::UdsRoutes, Routes};
+use data_plane_gateway::node::route_control::proto as pb;
 use data_plane_gateway::{
     common::protocol::GatewayPolicy,
     node::{
@@ -22,7 +23,11 @@ use tonic::{Request, Response, Status};
 
 fn record() -> InstanceRecord {
     InstanceRecord {
+        restart_attempts: 0,
+        restart_pending: false,
         spec: InstanceSpec {
+            snapshot_id: None,
+            lifecycle: Default::default(),
             env: Default::default(),
             scheduling: Default::default(),
             id: "i".into(),
@@ -45,6 +50,8 @@ fn record() -> InstanceRecord {
         },
         runtime_id: "i-42".into(),
         runtime_ip: Some("10.0.0.2".parse().unwrap()),
+        checkpoint: None,
+        last_operation: None,
         state: InstanceState::Starting,
         revision: 1,
         resources_held: true,
@@ -96,6 +103,13 @@ async fn start<T: NodeProxyService>(service: T) -> (Server, UdsRoutes) {
 struct Handler(Arc<BindingService>);
 #[tonic::async_trait]
 impl NodeProxyService for Handler {
+    async fn get_instance_activity(
+        &self,
+        _: Request<pb::GetInstanceActivityRequest>,
+    ) -> Result<Response<pb::InstanceActivityState>, Status> {
+        Err(Status::unimplemented("fixture has no activity"))
+    }
+
     async fn get_binding_state(
         &self,
         r: Request<data_plane_gateway::node::route_control::proto::GetBindingStateRequest>,
@@ -182,6 +196,13 @@ struct Delayed {
 }
 #[tonic::async_trait]
 impl NodeProxyService for Delayed {
+    async fn get_instance_activity(
+        &self,
+        _: Request<pb::GetInstanceActivityRequest>,
+    ) -> Result<Response<pb::InstanceActivityState>, Status> {
+        Err(Status::unimplemented("fixture has no activity"))
+    }
+
     async fn get_binding_state(
         &self,
         r: Request<data_plane_gateway::node::route_control::proto::GetBindingStateRequest>,

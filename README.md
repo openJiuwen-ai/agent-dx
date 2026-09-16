@@ -11,14 +11,17 @@ Monorepo for Agent Distributed Executor, the Instance execution platform, and sh
 | `gateway` | Rust Edge, Node Proxy, and forwarder |
 | `platform/runtime/rrt` | RRT daemon and runtime adapter |
 | `platform/sdk/sandbox/python` | Public Sandbox SDK |
+| `platform/control-plane/master` | Rust Master, Domain scheduling, Redis and route/snapshot catalogs |
+| `platform/control-plane/node-manager` | Instance lifecycle, sandboxd, checkpoints and outage journal |
+| `platform/control-plane/control-cli` | Rust adxctl and process supervisor |
 | `platform/control-plane/sandbox-api` | Go Sandbox HTTP handlers and their required compatibility dependencies |
 | `platform/api/proto/legacy` | Imported wire contracts used by the current implementations |
 
-The Agent product uses the public Sandbox SDK in the target architecture. Rust Master and Node Manager now expose authenticated service processes, Redis persistence/discovery, scheduling and node lifecycle recovery; the Go Sandbox API connects to those services. Edge subscribes to committed routes over gRPC, while Node Proxy requires a complete local binding synchronization before admission. See [implementation status](docs/testing/control-plane-implementation.md) and [route publication](docs/testing/route-publication.md). The Rust process supervisor and unified package are implemented; see [process deployment](docs/testing/process-deployment.md). Real sandboxd/SDK end-to-end acceptance remains unfinished.
+The Agent product uses the public Sandbox SDK in the target architecture. Rust Master and Node Manager now expose authenticated service processes, Redis persistence/discovery, scheduling and node lifecycle recovery; the Go Sandbox API connects to those services. Edge subscribes to committed routes over gRPC, while Node Proxy requires a complete local binding synchronization before admission. See [implementation status](docs/testing/control-plane-implementation.md) and [route publication](docs/testing/route-publication.md). The Rust process supervisor and unified package are implemented; see [process deployment](docs/testing/process-deployment.md). Local public-SDK acceptance now covers real Firecracker pause/resume, S3 recovery and node lifecycle failures. See the [stage roadmap](docs/testing/control-plane-roadmap.md) for completed gates and remaining work.
 
 ## Build and test
 
-Local component and Socket checks use `python3 build/ci/run.py <suite>`. Buildkite is planned around building, deploying, and testing the complete platform through its public SDK. See [local checks and end-to-end acceptance](docs/testing/control-plane-ci.md) for prerequisites and implementation milestones.
+Local component and Socket checks use `python3 build/ci/run.py <suite>`. Buildkite has separate release, image and Kubernetes public-SDK steps. The newly added checkpoint and failure scenarios still require their formal Kubernetes acceptance. See [local checks and end-to-end acceptance](docs/testing/control-plane-ci.md) for prerequisites and implementation milestones.
 
 Rust uses the root Cargo workspace. The Sandbox SDK uses distribution `adx-sandbox`, import `adx_sandbox`, CLI `adx-sandbox`, and `ADX_*` environment settings. Agent namespaces are `adx.agentruntime` and `adx.agentexecutor`; Gateway binaries use `adx-`, configuration uses `ADX_`, and internal branded headers use `X-ADX-`. Run matching component versions together.
 
@@ -41,3 +44,18 @@ Set `CARGO_TARGET_DIR`, `GOCACHE`, and `GOMODCACHE` to persistent caches in auto
 The Go API has an `adx-sandbox-api` process entrypoint and configuration under `build/config/examples/`. Component integration evidence is separate from complete platform deployment validation.
 
 See [migration status](docs/migration/2026-09-14-import.md), [source pins](docs/migration/sources.json), [architecture](docs/architecture/repository-layout.md), and [Agent usage](agent/README.md).
+
+
+## Instance lifecycle and deployment
+
+- [Single-host installation, certificates and CLI](docs/deployment/standalone.md)
+- [CLI and unified process deployment](docs/testing/process-deployment.md)
+- [Node lifecycle, resource collection and SQLite outage contract](docs/testing/node-lifecycle.md)
+- [Checkpoint storage, S3 and snapshot catalog](docs/testing/snapshot-storage.md)
+- [Node Manager / Node Proxy process modes](docs/testing/node-proxy-process-modes.md)
+- [Current scheduling baseline recheck](docs/testing/2026-09-16-scheduling-recheck.md)
+- [Live development progress](docs/testing/live-progress.md)
+
+Reusable snapshot creation, cloning into new Instances, catalog queries and deferred artifact deletion are wired through the control plane. The recorded package-v16 Firecracker/MinIO run passed 17 scenarios, including independent clone identities, process memory, writable files and retired-session orphan cleanup after authoritative recovery. Later package-v17 runs exposed an intermittent dual-clone network failure; see the [investigation](docs/testing/2026-09-16-fc-clone-network.md). Fault takeover remains under development. Full stage completion is tracked separately from passing component tests or local runtime scenarios.
+
+租户凭证的创建、查询、吊销及缓存契约见 [API Key 管理](docs/testing/api-key-management.md)。

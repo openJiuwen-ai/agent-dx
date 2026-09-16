@@ -5,8 +5,6 @@ package sandbox
 
 import (
 	"context"
-	"net/http"
-
 	"gitcode.com/robbluo/agent-dx/platform/control-plane/sandbox-api/backend"
 	"gitcode.com/robbluo/agent-dx/platform/control-plane/sandbox-api/internal/gen/common"
 	"gitcode.com/robbluo/agent-dx/platform/control-plane/sandbox-api/internal/gen/core"
@@ -49,24 +47,4 @@ func deleteOnBackend(r backend.LifecycleRequest) error {
 		return &sandboxLifecycleBusinessError{operation: "delete", code: v.GetCode(), message: v.GetMessage()}
 	}
 	return nil
-}
-
-type snapshotMasterEndpoint struct{ ctx context.Context }
-
-func (s snapshotMasterEndpoint) GetActiveMasterAddr() string {
-	d := backend.Current(s.ctx)
-	if d.MasterAddress == nil {
-		return ""
-	}
-	return d.MasterAddress()
-}
-
-type snapshotHTTPTransport struct{}
-
-func (snapshotHTTPTransport) Do(r *http.Request) (*http.Response, error) {
-	d := backend.Current(r.Context())
-	if d.SnapshotHTTPClient == nil {
-		return nil, backend.ErrUnavailable
-	}
-	return d.SnapshotHTTPClient.Do(r)
 }

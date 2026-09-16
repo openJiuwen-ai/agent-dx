@@ -16,9 +16,21 @@ service MasterService {
 }
 
 service NodeService {
+  rpc RecoverInstance(RecoverInstanceRequest) returns (InstanceResult);
+  // Master verifies the process currently serving an already registered address
+  // before accepting a pre-timeout process replacement. Available during reconciliation.
+  rpc GetSession(GetNodeSessionRequest) returns (GetNodeSessionResponse);
   rpc CreateInstance(StartAssignedInstanceRequest) returns (InstanceResult);
   rpc DeleteInstance(DeleteInstanceRequest) returns (InstanceResult);
+  rpc PauseInstance(PauseInstanceRequest) returns (InstanceResult);
+  rpc ResumeInstance(ResumeInstanceRequest) returns (InstanceResult);
+  rpc CreateSnapshot(CreateSnapshotRequest) returns (CreateSnapshotResponse);
+  rpc CollectSnapshot(CollectSnapshotRequest) returns (CollectSnapshotResponse);
 }
+
+message RecoverInstanceRequest { InstanceRecord record = 1; string node_session_id = 2; }
+message GetNodeSessionRequest {}
+message GetNodeSessionResponse { string node_id = 1; string session_id = 2; }
 
 message Resources {
   uint64 cpu_millis = 1;
@@ -27,6 +39,7 @@ message Resources {
 }
 
 message InstanceSpec {
+  optional string snapshot_id = 10;
   string id = 1;
   string tenant_id = 2;
   string image = 3;
@@ -35,7 +48,10 @@ message InstanceSpec {
   int32 priority = 6;
   SchedulingPolicy scheduling = 7;
   map<string,string> env = 8;
+  LifecyclePolicy lifecycle = 9;
 }
+message LifecyclePolicy { uint64 idle_timeout_seconds = 1; RestartPolicy restart = 2; }
+message RestartPolicy { uint32 max_attempts = 1; uint64 initial_backoff_seconds = 2; uint64 max_backoff_seconds = 3; }
 
 message Assignment {
   string instance_id = 1;
@@ -55,6 +71,9 @@ enum InstanceState {
   INSTANCE_STATE_DELETING = 4;
   INSTANCE_STATE_DELETED = 5;
   INSTANCE_STATE_FAILED = 6;
+  INSTANCE_STATE_PAUSING = 7;
+  INSTANCE_STATE_PAUSED = 8;
+  INSTANCE_STATE_RESUMING = 9;
 }
 
 message InstanceRecord {
@@ -66,6 +85,10 @@ message InstanceRecord {
   // Failed does not imply the backend is absent or its capacity can be reused.
   bool resources_held = 6;
   string runtime_ip = 7;
+  RestorePoint checkpoint = 8;
+  CompletedOperation last_operation = 9;
+  uint32 restart_attempts = 10;
+  bool restart_pending = 11;
 }
 
 enum Durability {
@@ -96,8 +119,9 @@ message RegisterNodeResponse { uint32 domain_id = 1; uint64 master_epoch = 2; }
 message CallerContext { string tenant_id = 1; bool administrator = 2; }
 message CreateInstanceRequest { InstanceSpec spec = 1; CallerContext caller = 2; }
 message GetInstanceRequest { string instance_id = 1; CallerContext caller = 2; }
-message GetInstanceResponse { InstanceRecord record = 1; string node_address = 2; }
+message GetInstanceResponse { InstanceRecord record = 1; string node_address = 2; string node_proxy_address = 3; }
 message StartAssignedInstanceRequest {
+  ReusableSnapshot snapshot = 4;
   InstanceSpec spec = 1;
   Assignment assignment = 2;
   string node_session_id = 3;
@@ -119,6 +143,14 @@ message PeerTerm { LabelSelector selector = 1; string topology_key = 2; repeated
 message WeightedPeer { PeerTerm term = 1; uint32 weight = 2; }
 enum SpreadMode { SPREAD_MODE_UNSPECIFIED = 0; SPREAD_MODE_DO_NOT_SCHEDULE = 1; SPREAD_MODE_SCHEDULE_ANYWAY = 2; }
 message TopologySpread { string topology_key = 1; LabelSelector selector = 2; uint32 max_skew = 3; uint32 min_domains = 4; SpreadMode when_unsatisfiable = 5; }
+enum PlacementTarget { PLACEMENT_TARGET_UNSPECIFIED = 0; PLACEMENT_TARGET_NODE = 1; PLACEMENT_TARGET_INSTANCE = 2; }
+message PlacementGroup {
+  PlacementTarget target = 1;
+  repeated WeightedSelector terms = 2;
+  bool required = 3;
+  bool anti = 4;
+  bool ordered = 5;
+}
 message SchedulingPolicy {
   map<string,string> labels = 1;
   repeated DeviceRequest devices = 2;
@@ -129,6 +161,7 @@ message SchedulingPolicy {
   repeated WeightedPeer preferred_affinity = 7;
   repeated WeightedPeer preferred_anti_affinity = 8;
   repeated TopologySpread topology_spread = 9;
+  repeated PlacementGroup placement_groups = 10;
 }
 
 // User credentials are verified only by a trusted ingress component.
@@ -139,7 +172,7 @@ message VerifyApiKeyResponse { CallerContext caller = 1; uint64 expires_at_unix_
 // Called after registration with reconciling=true. Only the owning node may read
 // this complete catalog; RPC failure must never be interpreted as an empty list.
 message InspectNodeRequest { string node_id = 1; string session_id = 2; }
-message InspectNodeResponse { repeated InstanceRecord records = 1; uint64 master_epoch = 2; }
+message InspectNodeResponse { repeated InstanceRecord records = 1; uint64 master_epoch = 2; repeated ReusableSnapshot snapshots = 3; repeated RestorePoint retained_checkpoints = 4; }
 
 // Each stream starts with an authoritative full snapshot. Later frames apply
 // only when (epoch, base_revision) matches the consumer cursor. Reconnect resets.
@@ -162,3 +195,79 @@ message RouteFrame {
  repeated PublishedRoute upserts = 5;
  repeated string deleted = 6;
 }
+
+message CheckpointArtifact { string storage = 1; string location = 2; uint64 size_bytes = 3; }
+message RuntimeIdentity { string instance_id = 1; string runtime_id = 2; uint64 ownership_generation = 3; }
+message RestorePoint { RuntimeIdentity origin = 5; string id = 1; CheckpointArtifact artifact = 2; uint64 expires_at_unix_seconds = 3; string source_runtime_id = 4; }
+enum LifecycleKind { LIFECYCLE_KIND_UNSPECIFIED = 0; LIFECYCLE_KIND_PAUSE = 1; LIFECYCLE_KIND_RESUME = 2; LIFECYCLE_KIND_SNAPSHOT = 3; }
+// Only the latest completed operation is retained. Retries must carry the original expected revision.
+message CompletedOperation { string id = 1; LifecycleKind kind = 2; uint64 expected_revision = 3; }
+
+message PauseInstanceRequest { Assignment assignment = 1; CallerContext caller = 2; string operation_id = 3; uint64 expected_revision = 4; uint64 ttl_seconds = 5; uint64 timeout_seconds = 6; }
+message ResumeInstanceRequest { Assignment assignment = 1; CallerContext caller = 2; string operation_id = 3; uint64 expected_revision = 4; }
+
+// Reusable artifact directory. Instance lifecycle still executes on its owner.
+service SnapshotService {
+  rpc PublishSnapshot(PublishSnapshotRequest) returns (ReusableSnapshot);
+  rpc GetSnapshot(GetSnapshotRequest) returns (ReusableSnapshot);
+  rpc ListSnapshots(ListSnapshotsRequest) returns (ListSnapshotsResponse);
+  rpc DeleteSnapshot(DeleteSnapshotRequest) returns (ReusableSnapshot);
+}
+enum SnapshotState {
+  SNAPSHOT_STATE_UNSPECIFIED = 0;
+  SNAPSHOT_STATE_READY = 1;
+  SNAPSHOT_STATE_DELETING = 2;
+  SNAPSHOT_STATE_DELETED = 3;
+}
+message SnapshotReference {
+  oneof owner {
+    string restore_instance_id = 1;
+    TemplateReference template = 2;
+  }
+}
+message TemplateReference { string node_id = 1; string template_id = 2; }
+message ReusableSnapshot {
+  string id = 1;
+  repeated string names = 2;
+  InstanceSpec template = 3;
+  string source_node_id = 4;
+  string source_runtime_id = 5;
+  CheckpointArtifact artifact = 6;
+  uint64 revision = 7;
+  SnapshotState state = 8;
+  repeated SnapshotReference references = 9;
+}
+message PublishSnapshotRequest { ReusableSnapshot snapshot = 1; string node_session_id = 2; }
+message GetSnapshotRequest { string id = 1; CallerContext caller = 2; string node_session_id = 3; }
+message ListSnapshotsRequest { CallerContext caller = 1; string name = 2; string page_token = 3; uint32 page_size = 4; }
+message ListSnapshotsResponse { repeated ReusableSnapshot snapshots = 1; string next_page_token = 2; }
+message DeleteSnapshotRequest { string id = 1; CallerContext caller = 2; }
+
+// Administrator operations are accepted only from authenticated Frontend.
+// Plaintext is returned once on creation and is never stored in the catalog.
+service CredentialService {
+  rpc CreateTenantKey(CreateTenantKeyRequest) returns (CreateTenantKeyResponse);
+  rpc ListTenantKeys(ListTenantKeysRequest) returns (ListTenantKeysResponse);
+  rpc RevokeTenantKey(RevokeTenantKeyRequest) returns (RevokeTenantKeyResponse);
+}
+message TenantKey {
+  string id = 1;
+  string tenant_id = 2;
+  uint64 expires_at_unix_seconds = 3;
+}
+message CreateTenantKeyRequest { CallerContext caller = 1; string tenant_id = 2; uint64 expires_at_unix_seconds = 3; }
+message CreateTenantKeyResponse { TenantKey key = 1; string api_key = 2; }
+message ListTenantKeysRequest { CallerContext caller = 1; string tenant_id = 2; string page_token = 3; uint32 page_size = 4; }
+message ListTenantKeysResponse { repeated TenantKey keys = 1; string next_page_token = 2; }
+message RevokeTenantKeyRequest { CallerContext caller = 1; string id = 2; }
+message RevokeTenantKeyResponse {}
+
+// Master authorizes physical deletion only after closing and draining references.
+message CollectSnapshotRequest { ReusableSnapshot snapshot = 1; string node_session_id = 2; }
+message CollectSnapshotResponse { string snapshot_id = 1; uint64 revision = 2; }
+
+message CreateSnapshotRequest {
+  Assignment assignment = 1; CallerContext caller = 2; string operation_id = 3;
+  uint64 expected_revision = 4; repeated string names = 5; uint64 timeout_seconds = 6;
+}
+message CreateSnapshotResponse { ReusableSnapshot snapshot = 1; InstanceResult instance = 2; }

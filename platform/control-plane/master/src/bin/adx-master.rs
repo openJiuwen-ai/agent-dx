@@ -97,10 +97,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     };
+    let recovery_rpc = rpc.clone();
+    let recovery = async {
+        let mut tick = tokio::time::interval(Duration::from_secs(2));
+        loop {
+            tick.tick().await;
+            if let Err(error) = recovery_rpc.recover_instances().await {
+                eprintln!("instance recovery incomplete: {error}");
+            }
+        }
+    };
+    let collection_rpc = rpc.clone();
+    let collection = async {
+        let mut tick = tokio::time::interval(Duration::from_secs(5));
+        loop {
+            tick.tick().await;
+            if let Err(error) = collection_rpc.collect_snapshots().await {
+                eprintln!("snapshot collection incomplete: {error}");
+            }
+        }
+    };
     eprintln!("adx-master listening on {}", listener.local_addr()?);
     let server = tonic::transport::Server::builder()
         .tls_config(server_tls)?
+        .add_service(pb::snapshot_service_server::SnapshotServiceServer::new(
+            rpc.clone(),
+        ))
         .add_service(pb::master_service_server::MasterServiceServer::new(rpc))
+        .add_service(pb::credential_service_server::CredentialServiceServer::new(
+            auth.clone(),
+        ))
         .add_service(pb::auth_service_server::AuthServiceServer::new(auth))
         .add_service(
             pb::route_service_server::RouteServiceServer::new(routes)
@@ -110,6 +136,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tokio_stream::wrappers::TcpListenerStream::new(listener),
             shutdown(),
         );
-    tokio::select! { result = server => result?, _ = maintenance => (), _ = route_task => () }
+    tokio::select! { result = server => result?, _ = maintenance => (), _ = route_task => (), _ = collection => (), _ = recovery => () }
     Ok(())
 }
