@@ -69,6 +69,7 @@ pub(crate) struct Domain {
     nodes: BTreeMap<String, NodeState>,
     queue: TenantQueue,
     deferred: TenantQueue,
+    deferred_arrivals: bool,
     sequence: u64,
     assigned: BTreeMap<String, Assignment>,
     framework: Arc<Framework>,
@@ -83,6 +84,7 @@ impl Domain {
             nodes: BTreeMap::new(),
             queue: TenantQueue::default(),
             deferred: TenantQueue::default(),
+            deferred_arrivals: false,
             sequence: 0,
             assigned: BTreeMap::new(),
             framework,
@@ -119,9 +121,13 @@ impl Domain {
     pub fn remaining_sweep(&self) -> bool {
         !self.queue.is_empty()
     }
+    pub fn has_deferred_arrivals(&self) -> bool {
+        self.deferred_arrivals
+    }
     pub fn begin_round(&mut self) {
         if self.queue.is_empty() {
             std::mem::swap(&mut self.queue, &mut self.deferred);
+            self.deferred_arrivals = false;
         }
     }
     pub fn register(&mut self, node: Node) -> Result<()> {
@@ -151,7 +157,17 @@ impl Domain {
         // Start the next sweep before adding new work to an exhausted one.
         // Deferred tickets must participate in priority/FIFO ordering.
         self.begin_round();
-        self.queue.restore(Entry {
+        // Once a request has been deferred, keep the current sweep finite.
+        // Continuous arrivals must not postpone retrying recovered capacity forever.
+        // The next sweep merges these tickets with deferred work using the same
+        // tenant rotation and original priority/FIFO sequence.
+        let queue = if self.deferred.is_empty() {
+            &mut self.queue
+        } else {
+            self.deferred_arrivals = true;
+            &mut self.deferred
+        };
+        queue.restore(Entry {
             sequence: self.sequence,
             spec: request,
         });

@@ -305,6 +305,7 @@ impl Master {
         }
         if outcome.error.is_none()
             && (outcome.yielded
+                || self.domains[domain].has_deferred_arrivals()
                 || (!outcome.assignments.is_empty() && self.domains[domain].pending() > 0))
         {
             self.wake(domain);
