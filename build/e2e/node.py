@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Node-side fixture operations; SDK business assertions live in scenarios.py."""
 import json
+import gzip
 import os
 from pathlib import Path
 import shutil
@@ -24,11 +25,13 @@ def supervisor(action):return json.loads(command([A/'package/bin/adxctl',action,
 def collect(node):
     dest=E/f'logs-{node}';dest.mkdir(exist_ok=True)
     secrets=[p.read_bytes().strip() for p in S.glob('*key') if p.is_file()]
-    for path in (P/'state/logs').glob('*.log'):
-        data=path.read_bytes()
+    for path in (P/'state/logs').glob('*.log*'):
+        if path.name.endswith('.tmp') or not path.is_file():continue
+        try:data=gzip.decompress(path.read_bytes()) if path.suffix=='.gz' else path.read_bytes()
+        except FileNotFoundError:continue
         for secret in secrets:
             if secret:data=data.replace(secret,b'REDACTED')
-        (dest/path.name).write_bytes(data)
+        (dest/path.name).write_bytes(gzip.compress(data) if path.suffix=='.gz' else data)
 
 def main():
     action=sys.argv[1];node=sys.argv[2] if len(sys.argv)>2 else ''
@@ -109,7 +112,13 @@ def main():
         (E/f'backend-after-{node}.json').write_text(json.dumps(after))
         assert after==json.loads((E/f'backend-before-{node}.json').read_text()), 'backend identity changed across Node Manager restart'
     elif action=='stop':
-        assert supervisor('stop')['ok'];collect(node)
+        stopped=supervisor('stop');assert stopped['ok'];collect(node)
+        logs=list((P/'state/logs').glob('*.gz'));assert logs,'no compressed component logs'
+        assert not list((P/'state/logs').glob('*.tmp')),'incomplete compression after stop'
+        for path in logs:gzip.decompress(path.read_bytes())
+        health=[s['logging'] for s in stopped['services']];assert all(h is not None and h['error'] is None and h['failed_bytes']==0 for h in health),health
+        (E/f'logging-{node}.json').write_text(json.dumps({'status':'passed','gzip_files':len(logs),'no_temporary_files':True,'services':stopped['services']},indent=2))
+        print(f'[LOGGING PASS] {node}: {len(logs)} gzip archives, all readable; no I/O loss or temporary residue',flush=True)
         # sandboxd is independent of the supervisor and still responds here.
         assert not backend()
         os.kill(int((P/'sandboxd.pid').read_text()),signal.SIGTERM)

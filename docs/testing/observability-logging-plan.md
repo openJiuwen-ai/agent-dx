@@ -1,16 +1,16 @@
 # 可观测与日志能力规划
 
-2026-09-16新增需求，状态：待实施。内部以Instance为统计对象。先交付实例数量与资源分配Metrics，再完善日志采集和Trace；日志滚动压缩单独验收。
+2026-09-16新增需求，状态：首批实例资源Metrics已验收；日志滚动压缩正在验收，日志采集与Trace待实施。内部以Instance为统计对象。先交付实例数量与资源分配Metrics，再完善日志采集和Trace；日志滚动压缩单独验收。
 
 ## 当前基础
 
 - `platform/control-plane/node-manager/src/metrics.rs` 已提供 `/metrics`：实例CPU累计用量、内存用量/限额、采样年龄，以及节点准入状态、已预留CPU/内存/磁盘。
-- `platform/control-plane/control-cli/src/supervisor.rs` 当前将子进程stdout/stderr追加写入组件日志文件。此处尚无滚动压缩管理。
+- `platform/control-plane/control-cli/src/supervisor.rs` 通过可配置的输出接管实现文件大小/时间滚动、后台gzip及历史保留，见[日志契约](log-rotation.md)，当前正在验收。
 - 上述能力是增量实施的基础，不代表完整可观测链路已通过验收。
 
 ## 阶段8A：实例数量与资源分配Metrics（优先）
 
-首批正在实现，指标与配置见[实例资源Metrics](instance-resource-metrics.md)。未完成全部验收前仍保留待完成状态。
+首批已通过本地与Buildkite #17基础K8s验收，见[验收报告](2026-09-16-metrics-acceptance.md)；指标与配置见[实例资源Metrics](instance-resource-metrics.md)。实卡验证仍按阶段5待办推进。
 
 | 范围 | 规划指标与口径 |
 | --- | --- |
@@ -48,4 +48,4 @@
 
 ## 交付与状态维护
 
-交付指标清单、采集与部署说明、统一日志配置、测试与验收报告。进度页独立事项来自 `control-plane-remaining.json`，阶段8、9保持待推进，完成验收后再更新状态。
+交付指标清单、采集与部署说明、统一日志配置、测试与验收报告。进度页独立事项来自 `control-plane-remaining.json`，阶段8保持进行中（日志采集与Trace待实现），阶段9正在验收；首批Metrics事项已标记完成。

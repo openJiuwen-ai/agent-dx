@@ -43,6 +43,8 @@ pub struct Service {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Deployment {
+    #[serde(default)]
+    pub logging: crate::logging::Policy,
     pub schema_version: u32,
     pub package_dir: PathBuf,
     pub state_dir: PathBuf,
@@ -131,6 +133,7 @@ impl Deployment {
         Ok(d)
     }
     pub fn validate(&self) -> Result<()> {
+        self.logging.validate()?;
         if self.schema_version != 1
             || !self.package_dir.is_absolute()
             || !self.state_dir.is_absolute()

@@ -13,6 +13,7 @@ name = "adx-control-cli"
 version = "0.1.0"
 dependencies = [
  "adx-protocol",
+ "flate2",
  "hyper-util",
  "libc",
  "serde",

@@ -155,3 +155,9 @@ fn metrics_endpoints_are_preserved_by_deployment_rendering() {
         assert_eq!(config["metrics_listen"], format!("127.0.0.1:{port}"));
     }
 }
+
+#[test]
+fn deployment_accepts_bounded_log_rotation_policy() {
+    let d: Deployment = serde_json::from_value(json!({"schema_version":1,"package_dir":"/tmp/package","state_dir":"/tmp/state","redis_url":"redis://localhost:6379/","namespace":"test","restart_limit":2,"restart_delay_ms":20,"stop_timeout_seconds":3,"services":[{"id":"master","role":"master","config":{}}],"logging":{"enabled":true,"max_file_bytes":1024,"rotate_seconds":60,"compress":true,"max_files":4,"max_age_seconds":3600,"max_total_bytes":8192}})).unwrap();
+    d.validate().unwrap();
+}

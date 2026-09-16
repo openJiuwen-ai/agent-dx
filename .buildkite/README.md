@@ -90,6 +90,12 @@ and per-Pod logs are uploaded. Secret bodies travel on stdin and are excluded
 from manifests and evidence; generated API/Redis keys are redacted from collected
 component logs.
 
+Capacity checks also save Master/Node resource scrapes at allocated, queued and
+released points. The unified supervisor runs with log rotation enabled in both
+Pods. Stop checks decompress the closed gzip files, reject unfinished compression
+and reported log I/O failures, and save `logging-node1.json` / `logging-node2.json`.
+The E2E log includes `[METRICS PASS]` and `[LOGGING PASS]` evidence.
+
 Cleanup validates namespace ownership label and UID, stops nodes in reverse
 order while Master is still present, deletes the namespace and confirms absence.
 A replaced/unowned namespace is never deleted. A host/job SIGKILL can interrupt

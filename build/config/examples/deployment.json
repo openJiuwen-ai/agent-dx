@@ -142,5 +142,14 @@
         "ADX_DATA_PLANE_EDGE_FRONTEND_NODE_TLS_CLIENT_KEY": "/etc/adx/tls/edge.key"
       }
     }
-  ]
+  ],
+  "logging": {
+    "enabled": true,
+    "max_file_bytes": 104857600,
+    "rotate_seconds": 86400,
+    "compress": true,
+    "max_files": 5,
+    "max_age_seconds": 604800,
+    "max_total_bytes": 1073741824
+  }
 }

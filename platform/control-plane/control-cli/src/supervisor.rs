@@ -29,23 +29,53 @@ struct Managed {
     restarts: u32,
     next_start: Instant,
     failed: bool,
+    capture: Option<crate::logging::Capture>,
+    finished_log: Option<crate::logging::Status>,
 }
 impl Managed {
-    fn start(&mut self, logs: &Path) -> Result<()> {
-        let log = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(0o600)
-            .open(logs.join(format!("{}.log", self.config.id)))?;
+    fn start(&mut self, logs: &Path, policy: &crate::logging::Policy) -> Result<()> {
         let mut command = Command::new(&self.config.binary);
         command
             .args(&self.config.args)
             .envs(&self.config.env)
             .stdin(Stdio::null())
-            .stdout(log.try_clone()?)
-            .stderr(log)
             .process_group(0);
+        let capture = if policy.enabled {
+            Some(crate::logging::Capture::attach(
+                &mut command,
+                logs,
+                &self.config.id,
+                policy.clone(),
+            )?)
+        } else {
+            let log = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(logs.join(format!("{}.log", self.config.id)))?;
+            command.stdout(log.try_clone()?).stderr(log);
+            None
+        };
         self.child = Some(command.spawn()?);
+        self.capture = capture;
+        Ok(())
+    }
+    async fn finish_logs(&mut self) -> Result<()> {
+        if let Some(mut capture) = self.capture.take() {
+            let state = tokio::task::spawn_blocking(move || {
+                capture.finish();
+                capture.status()
+            })
+            .await?;
+            if let Some(error) = &state.error {
+                eprintln!(
+                    "service {} log error: {} (failed batch bytes {})",
+                    self.config.id, error, state.failed_bytes
+                );
+            }
+            self.finished_log = Some(state);
+        }
         Ok(())
     }
     fn signal(&mut self, signal: i32) -> Result<()> {
@@ -174,11 +204,12 @@ async fn stop(children: &mut [Managed], timeout: Duration) -> Result<()> {
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+        m.finish_logs().await?;
     }
     Ok(())
 }
 fn status(children: &[Managed]) -> Value {
-    json!({"ok":true,"services":children.iter().map(|m|json!({"id":m.config.id,"role":m.config.role,"pid":m.child.as_ref().map(Child::id),"restarts":m.restarts,"failed":m.failed})).collect::<Vec<_>>()})
+    json!({"ok":true,"services":children.iter().map(|m|json!({"id":m.config.id,"role":m.config.role,"pid":m.child.as_ref().map(Child::id),"restarts":m.restarts,"failed":m.failed,"logging":m.capture.as_ref().map(|capture|capture.status()).or_else(||m.finished_log.clone())})).collect::<Vec<_>>()})
 }
 pub async fn run(d: Deployment) -> Result<()> {
     d.validate()?;
@@ -210,8 +241,10 @@ pub async fn run(d: Deployment) -> Result<()> {
             restarts: 0,
             next_start: Instant::now(),
             failed: false,
+            capture: None,
+            finished_log: None,
         };
-        if let Err(error) = m.start(&logs) {
+        if let Err(error) = m.start(&logs, &d.logging) {
             eprintln!("service {} spawn failed: {error}", m.config.id);
             m.next_start = Instant::now() + Duration::from_millis(d.restart_delay_ms);
         }
@@ -226,7 +259,7 @@ pub async fn run(d: Deployment) -> Result<()> {
           let (stream,_)=accepted?;let mut stream=BufReader::new(stream.take(128));let mut line=String::new();
           if tokio::time::timeout(Duration::from_secs(2),stream.read_line(&mut line)).await.is_err(){continue;}
           let quitting=line.trim()=="stop";
-          let response=match line.trim(){"status"=>status(&children),"stop"=>match stop(&mut children,Duration::from_secs(d.stop_timeout_seconds)).await{Ok(())=>json!({"ok":true,"stopped":true}),Err(_)=>json!({"ok":false,"error":"cleanup or termination failed"})},_=>json!({"ok":false,"error":"unknown action"})};
+          let response=match line.trim(){"status"=>status(&children),"stop"=>match stop(&mut children,Duration::from_secs(d.stop_timeout_seconds)).await{Ok(())=>json!({"ok":true,"stopped":true,"services":status(&children)["services"]}),Err(_)=>json!({"ok":false,"error":"cleanup or termination failed"})},_=>json!({"ok":false,"error":"unknown action"})};
           let done=quitting&&response["ok"]==true;
           let mut stream=stream.into_inner().into_inner();let _=stream.write_all(&serde_json::to_vec(&response)?).await;let _=stream.shutdown().await;
           if done{return Ok(());}
@@ -235,11 +268,11 @@ pub async fn run(d: Deployment) -> Result<()> {
          _=interrupt.recv()=>{if stop(&mut children,Duration::from_secs(d.stop_timeout_seconds)).await.is_ok(){return Ok(());}eprintln!("stop cleanup incomplete; dependencies remain running");}
          _=tick.tick()=>{
           for m in &mut children {
-           if let Some(c)=&mut m.child {if c.try_wait()?.is_some(){m.child=None;m.next_start=Instant::now()+Duration::from_millis(d.restart_delay_ms);}}
+           if let Some(c)=&mut m.child {if c.try_wait()?.is_some(){m.child=None;m.finish_logs().await?;m.next_start=Instant::now()+Duration::from_millis(d.restart_delay_ms);}}
            if m.child.is_none()&&!m.failed&&Instant::now()>=m.next_start {
             if m.restarts>=d.restart_limit{m.failed=true;continue;}
             m.restarts+=1;
-            if m.start(&logs).is_err(){m.next_start=Instant::now()+Duration::from_millis(d.restart_delay_ms);}
+            if m.start(&logs, &d.logging).is_err(){m.next_start=Instant::now()+Duration::from_millis(d.restart_delay_ms);}
            }
           }
          }

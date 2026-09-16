@@ -1,6 +1,6 @@
 # 实例数量与资源分配 Metrics
 
-阶段8首批能力。Master与Node Manager可通过配置 `metrics_listen` 启用HTTP `GET /metrics`，未配置时不开端口。示例配置使用Master `127.0.0.1:19090`、Node Manager `127.0.0.1:19091`；`adxctl`按服务配置下发。其他路径/方法返回404。端点用于监控采集，没有用户API Key认证；跨机采集时应绑定部署的私有监控接口并由部署环境限制访问。
+阶段8首批能力，已通过[本地与Buildkite #17验收](2026-09-16-metrics-acceptance.md)。Master与Node Manager可通过配置 `metrics_listen` 启用HTTP `GET /metrics`，未配置时不开端口。示例配置使用Master `127.0.0.1:19090`、Node Manager `127.0.0.1:19091`；`adxctl`按服务配置下发。其他路径/方法返回404。端点用于监控采集，没有用户API Key认证；跨机采集时应绑定部署的私有监控接口并由部署环境限制访问。
 
 ## 指标口径
 

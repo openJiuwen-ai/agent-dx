@@ -122,3 +122,52 @@ async fn failed_instance_cleanup_keeps_dependencies_running_then_retries() {
     task.await.unwrap().unwrap();
     rpc.abort();
 }
+
+#[tokio::test]
+async fn supervisor_drains_rotated_logs_on_stop() {
+    let tmp = tempfile::Builder::new()
+        .prefix("adx-logs-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let root = tmp.path();
+    bin(root,"adx-master","#!/bin/sh\ni=1; while [ $i -le 120 ]; do printf 'entry-%s\\n' \"$i\"; i=$((i+1)); done\nexec sleep 100\n");
+    let mut d = config(root, json!([{"id":"master","role":"master","config":{}}]));
+    d.logging.enabled = true;
+    d.logging.max_file_bytes = 64;
+    d.logging.max_files = 100;
+    let state = d.state_dir.clone();
+    let task = tokio::spawn(supervisor::run(d));
+    ready(&state).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if std::fs::read_dir(state.join("logs")).unwrap().count() > 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    supervisor::request(&state, "stop", Duration::from_secs(5))
+        .await
+        .unwrap();
+    task.await.unwrap().unwrap();
+    let mut files = std::fs::read_dir(state.join("logs"))
+        .unwrap()
+        .map(|f| f.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|s| s == "gz"))
+        .collect::<Vec<_>>();
+    files.sort();
+    let mut content = Vec::new();
+    use std::io::Read;
+    for file in files {
+        flate2::read::GzDecoder::new(std::fs::File::open(file).unwrap())
+            .read_to_end(&mut content)
+            .unwrap();
+    }
+    content.extend(std::fs::read(state.join("logs/master.log")).unwrap());
+    let expected = (1..=120)
+        .map(|i| format!("entry-{i}\n"))
+        .collect::<String>();
+    assert_eq!(content, expected.as_bytes());
+}

@@ -31,7 +31,7 @@ adxctl stop --config /etc/adx/deployment.json
 
 统一配置示例为 `build/config/examples/deployment.json`。`services` 选择本机角色；同一包可以部署 Master 主机或工作节点。每个服务的原有细节放在 `config` 和 `env` 中；公共 Redis／namespace 和管理 socket 由 CLI 注入。当前校验覆盖部署结构、公共字段、Redis 和 socket 等约束；TLS 文件、资源观测及其他组件细节仍由对应服务执行最终校验。
 
-配置目录权限为 0700、生成文件和管理 socket 为 0600。日志在 `state_dir/logs/<service-id>.log`；状态响应不返回环境变量或配置正文。日志轮转继续依赖组件或部署环境，supervisor 不另建采集服务。
+配置目录权限为 0700、生成文件和管理 socket 为 0600。日志在 `state_dir/logs/<service-id>.log`；状态响应不返回环境变量或配置正文。统一部署的 `logging` 可启用 Supervisor 输出接管、大小/时间滚动、gzip 压缩及历史保留；见[日志配置与故障契约](log-rotation.md)。
 
 ## 进程和停止契约
 

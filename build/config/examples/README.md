@@ -51,3 +51,5 @@ protected mode enabled. Set the matching credentials in the shared `redis_url`
 contains a secret. Components use that URL for both storage and discovery.
 
 Master and Node Manager examples enable loopback `metrics_listen` on ports 19090 and 19091. See [instance and resource metrics](../../../docs/testing/instance-resource-metrics.md) for metric definitions and external collection.
+
+部署示例已启用组件日志滚动与 gzip 压缩，所有历史保留限制按组件计算。配置和异常处理见[组件日志滚动与压缩](../../../docs/testing/log-rotation.md)。

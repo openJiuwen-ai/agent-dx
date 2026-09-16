@@ -6,6 +6,7 @@ edition = "2021"
 name = "adxctl"
 path = "src/main.rs"
 [dependencies]
+flate2 = "1"
 adx-protocol = { path = "../../crates/protocol" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

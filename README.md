@@ -54,6 +54,8 @@ See [migration status](docs/migration/2026-09-14-import.md), [source pins](docs/
 - [Checkpoint storage, S3 and snapshot catalog](docs/testing/snapshot-storage.md)
 - [Node Manager / Node Proxy process modes](docs/testing/node-proxy-process-modes.md)
 - [Current scheduling baseline recheck](docs/testing/2026-09-16-scheduling-recheck.md)
+- [Instance inventory and resource metrics](docs/testing/instance-resource-metrics.md)
+- [Component log rotation and compression](docs/testing/log-rotation.md)
 - [Live development progress](docs/testing/live-progress.md)
 
 Reusable snapshot creation, cloning into new Instances, catalog queries and deferred artifact deletion are wired through the control plane. The recorded package-v16 Firecracker/MinIO run passed 17 scenarios, including independent clone identities, process memory, writable files and retired-session orphan cleanup after authoritative recovery. Later package-v17 runs exposed an intermittent dual-clone network failure; see the [investigation](docs/testing/2026-09-16-fc-clone-network.md). Fault takeover remains under development. Full stage completion is tracked separately from passing component tests or local runtime scenarios.
