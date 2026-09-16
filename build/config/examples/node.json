@@ -42,7 +42,7 @@
       "disk_low_percent": 80
     }
   },
-  "metrics_listen": "127.0.0.1:19003",
+  "metrics_listen": "127.0.0.1:19091",
   "runtime_ready_timeout_seconds": 120,
   "checkpoint_gc": {
     "enabled": true,

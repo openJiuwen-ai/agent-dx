@@ -31,3 +31,9 @@ python3 build/dev/progress.py stage 2 --status active
 ```
 
 `--state /绝对路径/state.json` 可在子命令前指定独立任务状态文件。`serve --port 端口` 可固定本机地址，默认自动选取可用端口。服务显示包装器进程已消失但没有结束记录的任务为“结果待核对”；不会据此判通过。重启系统后需重新启动服务。
+
+## 未完成事项
+
+页面顶部独立展示待完成事项，暂缓／后续规划项可展开查看。每项包含所属阶段、当前缺口与完成条件，数据来自 `docs/testing/control-plane-remaining.json`，服务在每次状态请求时重新读取；修改后页面在下一次轮询自动更新。完成的事项将 `status` 改为 `complete` 后不再出现在清单中；暂缓项使用 `deferred`，待完成项使用 `pending`。维护清单时同步更新阶段路线图。
+
+可通过 `serve --remaining /绝对路径/remaining.json` 指定其他清单。页面文件在每次访问时重新读取，修改页面布局后刷新浏览器即可。

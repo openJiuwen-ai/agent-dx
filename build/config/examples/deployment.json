@@ -37,7 +37,8 @@
         ],
         "advertised_address": "https://127.0.0.1:19000",
         "heartbeat_timeout_seconds": 30,
-        "discovery_ttl_seconds": 15
+        "discovery_ttl_seconds": 15,
+        "metrics_listen": "127.0.0.1:19090"
       }
     },
     {
@@ -88,7 +89,8 @@
           "disk_path": "/var/lib/adx",
           "valid_for_seconds": 30
         },
-        "degradation_journal": "/var/lib/adx/degraded/results.sqlite"
+        "degradation_journal": "/var/lib/adx/degraded/results.sqlite",
+        "metrics_listen": "127.0.0.1:19091"
       }
     },
     {

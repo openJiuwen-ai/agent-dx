@@ -25,6 +25,29 @@ use tonic::{
     Request,
 };
 
+async fn scrape_metrics(address: std::net::SocketAddr) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let mut socket = tokio::net::TcpStream::connect(address).await.unwrap();
+            socket
+                .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            let mut response = Vec::new();
+            socket.read_to_end(&mut response).await.unwrap();
+            let response = String::from_utf8(response).unwrap();
+            if response.starts_with("HTTP/1.1 200") {
+                return response;
+            }
+            assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap()
+}
+
 fn file(name: &str) -> Vec<u8> {
     std::fs::read(
         PathBuf::from(
@@ -241,6 +264,9 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
     )
     .await
     .unwrap();
+    let metrics_rpc = master.clone();
+    let metrics_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let metrics_address = metrics_listener.local_addr().unwrap();
     let ml = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let ma = ml.local_addr().unwrap();
     let mut servers = Servers(vec![tokio::spawn(async move {
@@ -256,6 +282,11 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
             .await
             .unwrap();
     })]);
+    servers.0.push(tokio::spawn(async move {
+        adx_master::metrics::serve(metrics_listener, metrics_rpc)
+            .await
+            .unwrap();
+    }));
     let backend = Arc::new(Backend {
         session: session.clone(),
         started: AtomicUsize::new(0),
@@ -333,6 +364,12 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
     assert_eq!(first.durability, pb::Durability::Published as i32);
     assert_eq!(backend.started.load(Ordering::SeqCst), 1);
     let first_record = first.record.unwrap();
+    let metrics = scrape_metrics(metrics_address).await;
+    assert!(metrics
+        .contains("adx_master_instances{domain_id=\"0\",node_id=\"node\",state=\"Running\"} 1\n"));
+    assert!(metrics
+        .contains("adx_master_node_reserved_cpu_millis{domain_id=\"0\",node_id=\"node\"} 100\n"));
+
     let mut stale_master =
         pb::node_service_client::NodeServiceClient::new(channel(na, "master").await);
     assert_eq!(
@@ -478,6 +515,10 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
     let mut pending = Request::new(create("second"));
     pending.set_timeout(Duration::from_millis(80));
     assert!(frontend.create_instance(pending).await.is_err());
+    assert!(scrape_metrics(metrics_address)
+        .await
+        .contains("adx_master_queued_requests{domain_id=\"0\"} 1\n"));
+
     assert_eq!(
         session.get("second").await.unwrap_err(),
         adx_core::Error::NotFound
@@ -536,6 +577,13 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
         .unwrap()
         .is_empty());
     assert!(backend.running.lock().unwrap().is_empty());
+    let metrics = scrape_metrics(metrics_address).await;
+    assert!(metrics
+        .contains("adx_master_instances{domain_id=\"0\",node_id=\"node\",state=\"Running\"} 0\n"));
+    assert!(metrics.contains("adx_master_deleted_records 2\n"));
+    assert!(metrics
+        .contains("adx_master_node_reserved_cpu_millis{domain_id=\"0\",node_id=\"node\"} 0\n"));
+
     if let Ok(api_binary) = std::env::var("ADX_TEST_SANDBOX_API") {
         use adx_master::auth::Credential;
         for (key, tenant) in [("a".repeat(40), "tenant"), ("b".repeat(40), "other")] {
@@ -670,11 +718,14 @@ async fn master_process_loads_configuration_and_restores_bootstrap_credentials()
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     drop(listener);
+    let metrics_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let metrics_address = metrics_listener.local_addr().unwrap();
+    drop(metrics_listener);
     let key = "master-process-test-key-".repeat(3);
     let key_file = directory.path().join("bootstrap.key");
     std::fs::write(&key_file, &key).unwrap();
     let config = serde_json::json!({
-        "listen":address.to_string(),"advertised_address":format!("https://{address}"),"discovery_ttl_seconds":3,"redis_url":redis.url,"namespace":"process","domains":1,"placement":"pack","rpc_timeout_seconds":2,
+        "listen":address.to_string(),"metrics_listen":metrics_address.to_string(),"advertised_address":format!("https://{address}"),"discovery_ttl_seconds":3,"redis_url":redis.url,"namespace":"process","domains":1,"placement":"pack","rpc_timeout_seconds":2,
         "tls":{"ca":tls.join("ca.pem"),"certificate":tls.join("master.pem"),"private_key":tls.join("master.key"),"server_name":"localhost","peers":{"frontend":tls.join("frontend.der"),"node:node":tls.join("node.der")}},
         "bootstrap_credentials":[{"key_file":key_file,"tenant_id":"admin","administrator":true,"expires_at_unix_seconds":0}]
     });
@@ -712,6 +763,9 @@ async fn master_process_loads_configuration_and_restores_bootstrap_credentials()
         })
         .await
         .unwrap();
+        assert!(scrape_metrics(metrics_address)
+            .await
+            .contains("adx_master_deleted_records 0\n"));
         let discovery =
             adx_discovery::RedisDiscovery::new(&redis.url, "process", Duration::from_secs(1))
                 .unwrap();
@@ -857,6 +911,13 @@ async fn heartbeat_expiry_reconciliation_and_old_session_fencing() {
     assert!(!snapshot.nodes["node"].node.available);
     assert!(snapshot.routes().unwrap().is_empty());
     assert!(!snapshot.instances["held"].resources_held());
+    let metrics = rpc.metrics().await.unwrap();
+    assert!(metrics.contains(
+        "adx_master_instances{domain_id=\"0\",node_id=\"node\",state=\"Invalidated\"} 1\n"
+    ));
+    assert!(metrics
+        .contains("adx_master_node_available_cpu_millis{domain_id=\"0\",node_id=\"node\"} 0\n"));
+
     assert_eq!(
         snapshot.instances["held"].result.as_ref().unwrap().state,
         InstanceState::Failed

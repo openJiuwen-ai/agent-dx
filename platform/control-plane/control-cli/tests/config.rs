@@ -139,3 +139,19 @@ fn sandbox_api_discovery_defaults_and_overrides_are_usable() {
         assert!(d.validate().is_err());
     }
 }
+
+#[test]
+fn metrics_endpoints_are_preserved_by_deployment_rendering() {
+    let root = tempfile::tempdir().unwrap();
+    let mut d = config(root.path());
+    d.services[0].config["metrics_listen"] = json!("127.0.0.1:19091");
+    d.services[1].config["metrics_listen"] = json!("127.0.0.1:19090");
+    let dir = root.path().join("metrics-config");
+    d.render(&dir).unwrap();
+    for (id, port) in [("node", 19091), ("master", 19090)] {
+        let config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join(format!("{id}.json"))).unwrap())
+                .unwrap();
+        assert_eq!(config["metrics_listen"], format!("127.0.0.1:{port}"));
+    }
+}

@@ -49,3 +49,5 @@ path to a deployment-owned secret (32–512 printable non-space ASCII bytes).
 protected mode enabled. Set the matching credentials in the shared `redis_url`
 (URI-escape special characters); protect the deployment file because that URL
 contains a secret. Components use that URL for both storage and discovery.
+
+Master and Node Manager examples enable loopback `metrics_listen` on ports 19090 and 19091. See [instance and resource metrics](../../../docs/testing/instance-resource-metrics.md) for metric definitions and external collection.

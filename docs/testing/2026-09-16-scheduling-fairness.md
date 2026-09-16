@@ -36,4 +36,4 @@
 - `final-regression.log`、`final-mixed.log`、`mixed-final.json`：最终测试、负载日志和机器可读结果。
 - 复现：`cargo test --release -p adx-master --test fairness`；`cargo run --release -p adx-master --example mixed_load -- 1000`。
 
-本轮没有连接sandboxd、Redis/RPC或实际GPU/NPU。持续高优先级流下低优先级请求的保底份额不属于既定严格优先级策略。真实设备、真实服务混合长稳和暂缓的FC/x86双克隆验证继续分开记录。基础K8s将在此修复提交后再次验收。
+本轮没有连接sandboxd、Redis/RPC或实际GPU/NPU。持续高优先级流下低优先级请求的保底份额不属于既定严格优先级策略。真实设备、真实服务混合长稳和暂缓的FC/x86双克隆验证继续分开记录。修复已提交并推送为 `d032459`；[Buildkite #16](2026-09-16-buildkite-16.md) 的构建、镜像与基础K8s七组全部通过，JUnit含清理共8项无失败/跳过，namespace无残留。两个Pod同宿主，FC本轮关闭。

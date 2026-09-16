@@ -140,16 +140,17 @@ def run(args):
 
 
 def serve(args):
-    page = Path(__file__).with_name('progress.html').read_bytes()
+    page = Path(__file__).with_name('progress.html')
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             route = self.path.split('?', 1)[0]
             if route == '/':
-                content, mime = page, 'text/html; charset=utf-8'
+                content, mime = page.read_bytes(), 'text/html; charset=utf-8'
             elif route == '/api/state':
                 try:
                     state = read_state(args.state)
+                    state['remaining'] = json.loads(args.remaining.read_text())
                     for job in state['jobs'].values():
                         if job['status'] == 'running':
                             try:
@@ -205,6 +206,8 @@ def main():
     command.add_argument('command', nargs=argparse.REMAINDER)
     server = commands.add_parser('serve')
     server.add_argument('--port', type=int, default=0)
+    server.add_argument('--remaining', type=Path, default=Path(__file__).resolve().parents[2] /
+                        'docs/testing/control-plane-remaining.json')
     args = parser.parse_args()
     return {'init': initialize, 'stage': change_stage, 'run': run, 'serve': serve}[args.action](args)
 

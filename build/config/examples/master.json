@@ -26,5 +26,6 @@
   ],
   "advertised_address": "https://master:19000",
   "heartbeat_timeout_seconds": 30,
-  "discovery_ttl_seconds": 15
+  "discovery_ttl_seconds": 15,
+  "metrics_listen": "127.0.0.1:19090"
 }

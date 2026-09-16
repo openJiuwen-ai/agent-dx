@@ -370,6 +370,13 @@ pub struct DeviceLedger {
     busy: BTreeSet<(DeviceKind, u32)>,
 }
 impl DeviceLedger {
+    pub fn inventory(&self) -> &[Device] {
+        &self.inventory
+    }
+    pub fn allocated(&self) -> impl Iterator<Item = &DeviceAllocation> {
+        self.held.values().flatten()
+    }
+
     pub fn update(&mut self, devices: Vec<Device>) -> Result<()> {
         validate_inventory(&devices)?;
         self.inventory = devices;

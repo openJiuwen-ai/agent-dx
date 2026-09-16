@@ -42,6 +42,7 @@ elif sys.argv[1]=='auth':
         (E/'auth-result.json').write_text(json.dumps({'status':'passed','invalid_key':True,'tenant_read_isolation':True,'tenant_delete_isolation':True,'key_management':management}))
     finally:s.kill();s.close()
 elif sys.argv[1]=='capacity':
+    from metrics import check as check_metrics
     from concurrent.futures import ThreadPoolExecutor, TimeoutError
     from node import catalog
     instances=[]
@@ -53,12 +54,14 @@ elif sys.argv[1]=='capacity':
         records=[json.loads(v) for k,v in catalog().items() if k.startswith('instance:')]
         held=[r for r in records if r.get('result') and r['result']['resources_held']]
         assert len(held)==2 and {r['assignment']['node_id'] for r in held}=={'node1','node2'}
+        check_metrics('allocated',running=2,reserved=4000,pending=0)
         with ThreadPoolExecutor(max_workers=1) as pool:
             pending=pool.submit(create)
             try:
                 extra=pending.result(timeout=2);instances.append(extra)
             except TimeoutError:event('PASS: third create is waiting while both nodes are full')
             else:raise AssertionError('overcommitted full nodes')
+            check_metrics('queued',running=2,reserved=4000,pending=1)
             event('Releasing capacity by deleting '+instances[0].id)
             instances[0].kill()
             resumed=pending.result(timeout=120);instances.append(resumed)
@@ -69,6 +72,7 @@ elif sys.argv[1]=='capacity':
         (E/'capacity-result.json').write_text(json.dumps({'status':'passed','not_overcommitted':True,'pending_create_resumed':True}))
     finally:
         for s in instances:s.kill();s.close()
+    check_metrics('released',running=0,reserved=0,pending=0)
 elif sys.argv[1]=='create':
     instances=[]
     try:

@@ -1,0 +1,82 @@
+[
+  {
+    "id": "fc-clone-network",
+    "title": "FC 双克隆网络问题",
+    "stage": "5",
+    "status": "pending",
+    "detail": "r21/r22 出现 FDB 错误端口学习和 CONNECT 超时；具体触发报文尚未定位。",
+    "gate": "定位并修复后端网络问题，完整复跑双克隆与快照用例。"
+  },
+  {
+    "id": "real-devices",
+    "title": "GPU / NPU 真实整卡验收",
+    "stage": "5",
+    "status": "pending",
+    "detail": "调度规则已有组件测试；当前 Lima 环境没有实际 GPU/NPU 设备，测试节点待提供。",
+    "gate": "在带卡节点验证设备发现、整卡分配、卡号传递、实际执行及释放。"
+  },
+  {
+    "id": "service-soak",
+    "title": "真实服务混合负载与长稳",
+    "stage": "5",
+    "status": "pending",
+    "detail": "52.8万请求覆盖调度模块，K8s 七组覆盖基础流程；尚未运行完整服务持续负载。",
+    "gate": "约定时长与负载，持续验证创建/执行/删除、资源回收、错误率及延迟。"
+  },
+  {
+    "id": "instance-resource-metrics",
+    "title": "实例数量与资源分配 Metrics（优先）",
+    "stage": "8",
+    "status": "pending",
+    "detail": "首批Master实例数量/排队和两侧资源账本导出已接通，真实Redis/mTLS与HTTP抓取已通过；正在做发布包端到端验收。",
+    "gate": "创建、排队、暂停、恢复、删除和节点失效时，实例计数及CPU/内存/磁盘/GPU/NPU容量、已分配、可用量与权威账本一致；真实采集验收通过。"
+  },
+  {
+    "id": "logs-traces",
+    "title": "日志采集与 Trace 接入",
+    "stage": "8",
+    "status": "pending",
+    "detail": "基础Metrics优先；随后统一结构化日志、关联字段及跨组件Trace，采集由部署环境提供。",
+    "gate": "打通一次创建→执行→删除的日志和Trace关联；验证采样、脱敏、导出及采集端故障时业务可继续。"
+  },
+  {
+    "id": "log-rotation",
+    "title": "日志滚动、压缩与保留策略",
+    "stage": "9",
+    "status": "pending",
+    "detail": "Supervisor当前追加写组件日志文件；需要可配置的大小/时间滚动、压缩与容量保留限制。",
+    "gate": "持续写入、滚动、压缩、重启与清理后日志可读取；正常滚动无丢失/重复，磁盘与压缩失败有明确行为；进程与Pod部署均验证。"
+  },
+  {
+    "id": "x86-clone",
+    "title": "x86 双克隆对照",
+    "stage": "5",
+    "status": "deferred",
+    "detail": "按用户决定暂缓；保留 ARM64 失败证据。",
+    "gate": "恢复推进后，在指定 x86 节点对齐版本并采集 MAC / TAP / FDB 与报文。"
+  },
+  {
+    "id": "k8s-fc",
+    "title": "正式 K8s Firecracker 验收",
+    "stage": "7",
+    "status": "deferred",
+    "detail": "当前正式流水线仅基础 K8s；FC 继续本地验收。",
+    "gate": "准备 KVM worker 和对应架构 runtime kit，再启用独立 FC profile。"
+  },
+  {
+    "id": "certificate-reload",
+    "title": "配置与证书热重载",
+    "stage": "6",
+    "status": "deferred",
+    "detail": "本期通过重启组件应用更新，热重载后续按运维需求规划。",
+    "gate": "需求确认后实现并验证证书轮换和配置重载。"
+  },
+  {
+    "id": "template-prewarm",
+    "title": "节点模板预热",
+    "stage": "3",
+    "status": "deferred",
+    "detail": "按用户决定暂不支持，不计入本期阶段验收。",
+    "gate": "有实际需求后再规划模板目标数量、节点预算与补充回收。"
+  }
+]

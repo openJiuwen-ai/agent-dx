@@ -1,5 +1,6 @@
 //! Async RPC coordination around the synchronous scheduler and Redis repository.
 mod cloning;
+mod metrics;
 mod recovery;
 mod snapshots;
 use crate::{

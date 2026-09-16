@@ -1,6 +1,6 @@
 # 管控面重构：本地测试与 Buildkite
 
-最新正式验证：[Buildkite #15 基础 Kubernetes 七组验收](2026-09-16-buildkite-k8s.md)。FC 按当前决策继续本地验收。
+最新正式验证：[Buildkite #16 调度修复后的基础 Kubernetes 七组复验](2026-09-16-buildkite-16.md)。FC 按当前决策继续本地验收。
 
 2026-09-15。开发验证在本地执行，Buildkite 使用完整系统的端到端验收入口。统一包、两节点环境驱动器和流水线配置已落地：`build/e2e/prepare.py` 构建验收制品，`build/e2e/kubernetes/run.py` 在目标 Kubernetes 集群部署、验收、收集并清理。真实 sandboxd、本次包内 RRT 和安装后的 SDK 均参与执行。流水线复用现有 default/linux/amd64 队列、builder/packager/deployer、目标 kubeconfig 挂载与 SWR Secret，见 [Buildkite 说明](../../.buildkite/README.md)。本地通过不等于远端 Buildkite 已通过。
 
@@ -83,9 +83,11 @@ export PIP_CACHE_DIR=/your/cache/pip
 
 基础门禁包含七组用例：SDK 创建／命令／文件／删除、API Key 与租户隔离、资源不足与释放后重新调度、双节点放置约束、心跳超时与恢复清理、Node Manager 进程重启、supervisor 停机清理。放置组检查实例亲和 OR、实例反亲和、加权与有序节点偏好、每个 OR 分支的 node_id 约束及反向实例反亲和，并比对实际节点归属。业务操作使用公共 SDK；管理查询、只读状态检查和受控故障注入用于验证内部结果，不替代真实调用链。
 
+容量组新增Metrics核对：实际抓取Master和两个Node Manager，验证满载实例数量/分配量、排队请求及删除后的释放，保存原始指标证据。
+
 通过条件同时覆盖：用户可见结果、真实执行结果、持久化状态、路由和资源回收。例如创建必须能实际执行命令，删除必须确认旧实例及路由退出服务。清理后的残留检查也是门禁的一部分。
 
-暂停/恢复、快照、Master 重启、节点恢复等功能实现时，把对应场景加入这条流水线。普通流程可在同宿主运行两个逻辑节点；节点故障和网络分区场景使用可独立隔离的环境。
+暂停/恢复、快照与跨节点 checkpoint 恢复当前使用本地 Firecracker 验收，后续具备 KVM worker 与对应架构 runtime kit 时再启用独立 FC profile。基础流程使用两个逻辑节点；同宿主 Pod 的进程故障注入不代表已覆盖跨宿主网络分区或宿主机故障。
 
 ### 4. 结果、清理与最终状态
 
@@ -95,13 +97,13 @@ export PIP_CACHE_DIR=/your/cache/pip
 
 ### 接入状态
 
-`.buildkite/README.md` 保存端到端流程约定。`.buildkite/pipeline.yml` 已定义构建及制品交接、两节点完整平台验收两个步骤。构建阶段发布固定 digest 的节点／RRT 镜像，运行阶段在 Kubernetes 中只使用这批镜像，验证 commit、架构及 SHA256；五组场景和环境清理全部成功后才通过。CI 基础设施沿用现有配置，ADX 的工具链与运行制品仍按自身约束构建；本轮未触发远端 Buildkite。
+`.buildkite/README.md` 保存端到端流程约定。基础流水线有三个独立步骤：`platform-build` 构建与交接发布包，`platform-images` 发布固定 digest 的节点／RRT 镜像，`platform-e2e` 部署 Kubernetes 并执行七组用例。运行阶段只使用这批制品，验证 commit、架构及 SHA256；七组场景和环境清理全部成功后才通过。当前正式验收及制品身份见本文顶部记录。
 
 本地组件测试继续用于每一步的测试驱动开发；同一套完整 E2E 驱动器也应支持在具备环境的本地机器上复现 Buildkite 失败。
 
 ## 新管控面的测试驱动实施顺序
 
-每个功能先写本地规则/协作测试，再定义公共 SDK 的 E2E 验收用例；补实现使测试通过后，将 E2E 用例纳入 Buildkite 必过门禁。尚未开始实现的功能记录在本节，不使用 skip 占位制造“完整系统通过”。
+每个功能先写本地规则/协作测试，再定义公共 SDK 的 E2E 验收用例；补实现使测试通过后，按约定环境纳入验收门禁。以下保留实施顺序，各阶段当前完成情况与剩余项见[阶段路线图](control-plane-roadmap.md)。未执行的用例不以 skip 计为通过。
 
 ### 第一条纵向链路：创建、命令、删除
 
@@ -136,7 +138,7 @@ Sandbox SDK → Go Sandbox API → Master / Global → Domain → Node Manager �
 | 状态持久化 | 正常经 Master 写 Redis；故障降级日志；节点重启而 Master 不可用时只观察，等待权威对账 |
 | 快照 | 本地/对象存储接口、可复用快照、引用及延迟删除、缓存、恢复点过期 |
 | 故障恢复 | Master 重启、路由重新同步、节点接管；有效共享 checkpoint 可跨节点恢复；local-only 或缺失 checkpoint 明确失败 |
-| 调度完善 | 租户轮转、优先级/FIFO、亲和/拓扑、整卡分配、压力和维护开关 |
+| 调度完善 | 租户轮转、优先级/FIFO、亲和/反亲和、整卡分配、压力和维护开关 |
 | 进程组合 | Node Manager / Node Proxy 共进程和分进程的同一业务契约；分别验证故障行为 |
 
 故障用例使用受控时钟、明确注入点和有期限的条件等待。心跳超时用于故障判定，但网络分区中的旧进程是否还能执行，必须单独写明隔离机制或部署假设；“相同 ID 不会并行执行”不能只检查 Master 状态表。

@@ -473,3 +473,36 @@ async fn drain_before_authoritative_recovery_cannot_claim_empty_node() {
     assert!(node.drain().await.is_err());
     assert!(!node.is_draining());
 }
+
+#[tokio::test]
+async fn metrics_follow_reservations_and_capacity_shrink() {
+    let deps = Dependencies::new(false);
+    let node = node(&deps);
+    let instance = node
+        .instance(spec("metrics"), assignment("metrics"))
+        .unwrap();
+    instance.create().await.unwrap();
+    let text = node.metrics();
+    assert!(text.contains("adx_node_capacity_cpu_millis 1\n"));
+    assert!(text.contains("adx_node_available_memory_bytes 0\n"));
+    node.update_capacity(
+        Resources {
+            cpu_millis: 1,
+            memory_bytes: 512,
+            disk_bytes: 1024,
+        },
+        Duration::from_secs(30),
+    )
+    .unwrap();
+    let text = node.metrics();
+    assert!(text.contains("adx_node_reserved_memory_bytes 1024\n"));
+    assert!(text.contains("adx_node_overcommitted_memory_bytes 512\n"));
+    instance.delete().await.unwrap();
+    let text = node.metrics();
+    assert!(text.contains("adx_node_reserved_memory_bytes 0\n"));
+    assert!(text.contains("adx_node_available_memory_bytes 512\n"));
+    node.set_maintenance(true);
+    let text = node.metrics();
+    assert!(text.contains("adx_node_available_memory_bytes 0\n"));
+    assert!(text.contains("adx_node_capacity_memory_bytes 512\n"));
+}

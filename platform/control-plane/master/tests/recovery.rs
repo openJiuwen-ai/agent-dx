@@ -153,3 +153,29 @@ fn capacity_reduction_does_not_erase_persisted_scalar_usage() {
     m.release(&saved.instances["i"].assignment).unwrap();
     assert!(m.schedule(0).unwrap().is_some());
 }
+
+#[test]
+fn metrics_preserve_missing_device_and_overcapacity_reservations_after_restart() {
+    let saved = saved();
+    let mut master = Master::restore(&saved, Placement::Pack).unwrap();
+    let text = master.metrics();
+    assert!(
+        text.contains("adx_master_node_reserved_cpu_millis{domain_id=\"0\",node_id=\"n\"} 100\n")
+    );
+    assert!(text
+        .contains("adx_master_node_overcommitted_cpu_millis{domain_id=\"0\",node_id=\"n\"} 50\n"));
+    assert!(
+        text.contains("adx_master_node_available_cpu_millis{domain_id=\"0\",node_id=\"n\"} 0\n")
+    );
+    assert!(text.contains("kind=\"gpu\",model=\"card\",state=\"reserved\"} 1\n"));
+    let mut pending = saved.instances["i"].spec.clone();
+    pending.id = "pending".into();
+    master.submit(pending).unwrap();
+    assert!(master
+        .metrics()
+        .contains("adx_master_queued_requests{domain_id=\"0\"} 1\n"));
+    master.release(&saved.instances["i"].assignment).unwrap();
+    assert!(master
+        .metrics()
+        .contains("adx_master_node_reserved_cpu_millis{domain_id=\"0\",node_id=\"n\"} 0\n"));
+}

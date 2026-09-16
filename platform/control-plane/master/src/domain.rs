@@ -94,6 +94,33 @@ impl Domain {
             stats: SchedulingStats::default(),
         }
     }
+    pub fn metrics(
+        &self,
+        out: &mut adx_core::metrics::Text,
+        domain: usize,
+        unavailable: &BTreeSet<String>,
+    ) {
+        let domain_labels = [("domain_id", domain.to_string())];
+        out.gauge(
+            "adx_master_queued_requests",
+            &domain_labels,
+            self.pending() as u64,
+        );
+        for (id, state) in &self.nodes {
+            let labels = [("domain_id", domain.to_string()), ("node_id", id.clone())];
+            let accepting = state.node.available && !unavailable.contains(id);
+            out.gauge("adx_master_node_schedulable", &labels, u64::from(accepting));
+            adx_core::metrics::resources(
+                out,
+                "adx_master_node",
+                &labels,
+                &state.scalar,
+                &state.devices,
+                accepting,
+                true,
+            );
+        }
+    }
     pub fn node_count(&self) -> usize {
         self.nodes.len()
     }

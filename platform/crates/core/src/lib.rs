@@ -2,6 +2,7 @@
 
 pub mod checkpoint;
 pub mod lifecycle;
+pub mod metrics;
 pub mod snapshots;
 pub use checkpoint::{
     valid_runtime_id, CheckpointArtifact, CompletedOperation, LifecycleKind, RestorePoint,

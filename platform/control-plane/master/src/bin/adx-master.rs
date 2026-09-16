@@ -22,6 +22,8 @@ struct Bootstrap {
 struct Config {
     listen: SocketAddr,
     #[serde(default)]
+    metrics_listen: Option<SocketAddr>,
+    #[serde(default)]
     advertised_address: Option<String>,
     #[serde(default = "default_heartbeat")]
     heartbeat_timeout_seconds: u64,
@@ -74,6 +76,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Duration::from_secs(c.heartbeat_timeout_seconds),
     )
     .await?;
+    let metrics_listener = match c.metrics_listen {
+        Some(address) => Some(tokio::net::TcpListener::bind(address).await?),
+        None => None,
+    };
+    let metrics_rpc = rpc.clone();
+    let metrics = async move {
+        if let Some(listener) = metrics_listener {
+            adx_master::metrics::serve(listener, metrics_rpc).await?;
+        }
+        std::future::pending::<std::io::Result<()>>().await
+    };
     routes.refresh().await?;
     let route_task = routes.clone().run(Duration::from_millis(200));
     let ttl = Duration::from_secs(c.discovery_ttl_seconds);
@@ -136,6 +149,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tokio_stream::wrappers::TcpListenerStream::new(listener),
             shutdown(),
         );
-    tokio::select! { result = server => result?, _ = maintenance => (), _ = route_task => (), _ = collection => (), _ = recovery => () }
+    tokio::select! { result = server => result?, _ = maintenance => (), _ = route_task => (), _ = collection => (), _ = recovery => (), result = metrics => result? }
     Ok(())
 }

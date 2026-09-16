@@ -4,6 +4,7 @@ pub use adx_core::snapshots;
 pub mod auth;
 mod domain;
 mod journal;
+pub mod metrics;
 mod queue;
 pub mod routes;
 pub mod rpc;
@@ -62,6 +63,20 @@ pub struct Master {
 }
 
 impl Master {
+    pub fn metrics(&self) -> String {
+        self.metrics_excluding(&BTreeSet::new()).finish()
+    }
+    pub(crate) fn metrics_excluding(
+        &self,
+        unavailable: &BTreeSet<String>,
+    ) -> adx_core::metrics::Text {
+        let mut text = adx_core::metrics::Text::default();
+        for (id, domain) in self.domains.iter().enumerate() {
+            domain.metrics(&mut text, id, unavailable);
+        }
+        text
+    }
+
     /// Rebuild only persisted allocations. Waiting requests are intentionally
     /// not recovered. Nodes must re-register before new work can be placed.
     pub fn restore(saved: &storage::StoredSnapshot, placement: Placement) -> Result<Self> {

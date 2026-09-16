@@ -64,12 +64,34 @@ impl Metrics {
 impl NodeManager {
     pub fn metrics(&self) -> String {
         let mut output = self.services.metrics.render();
-        output.push_str(&format!(
-            "adx_node_accepting_allocations {}\n",
-            u8::from(self.accepting_allocations() && !self.is_draining())
-        ));
-        let used = self.used();
-        output.push_str(&format!("adx_node_reserved_cpu_millis {}\nadx_node_reserved_memory_bytes {}\nadx_node_reserved_disk_bytes {}\n", used.cpu_millis, used.memory_bytes, used.disk_bytes));
+        let lifecycle_ready =
+            self.lifecycle_ready.try_read().is_ok_and(|ready| *ready) && !self.is_draining();
+        let admission = self.services.admission.lock().unwrap();
+        let fresh = admission
+            .valid_until
+            .is_some_and(|until| tokio::time::Instant::now() < until);
+        let devices_fresh = admission
+            .devices_valid_until
+            .is_some_and(|until| tokio::time::Instant::now() < until);
+        let accepting = lifecycle_ready && fresh && !admission.maintenance && !admission.pressure;
+        let mut text = adx_core::metrics::Text::default();
+        text.gauge("adx_node_accepting_allocations", &[], u64::from(accepting));
+        text.gauge("adx_node_resource_observation_fresh", &[], u64::from(fresh));
+        text.gauge(
+            "adx_node_device_observation_fresh",
+            &[],
+            u64::from(devices_fresh),
+        );
+        adx_core::metrics::resources(
+            &mut text,
+            "adx_node",
+            &[],
+            &admission.ledger,
+            &admission.devices,
+            accepting,
+            devices_fresh,
+        );
+        output.push_str(&text.finish());
         output
     }
 }
