@@ -505,9 +505,9 @@ class _ExecutorRequestHandler(BaseHTTPRequestHandler):
             file_path = self._query_value(query, "path")
             if not file_path:
                 raise ValueError("path is required")
-            recursive = self._query_value(query, "recursive", "false").lower() == "true"
-            include_files = self._query_value(query, "include_files", "true").lower() == "true"
-            include_dirs = self._query_value(query, "include_dirs", "true").lower() == "true"
+            recursive = self._query_bool(query, "recursive", False)
+            include_files = self._query_bool(query, "include_files", True)
+            include_dirs = self._query_bool(query, "include_dirs", True)
             max_depth_str = self._query_value(query, "max_depth", "")
             max_depth: Optional[int] = None
             if max_depth_str:
@@ -737,8 +737,8 @@ class _ExecutorRequestHandler(BaseHTTPRequestHandler):
         query = parse_qs(urlsplit(self.path).query)
         path = self._query_value(query, "path")
         mode = self._query_value(query, "mode")
-        recursive = self._query_value(query, "recursive", "false").lower() == "true"
         try:
+            recursive = self._query_bool(query, "recursive", False)
             result = self.files.mkdir(path, mode=mode, recursive=recursive)
             self._write_json(HTTPStatus.OK, result)
         except (ValueError, FileNotFoundError) as exc:
@@ -792,8 +792,8 @@ class _ExecutorRequestHandler(BaseHTTPRequestHandler):
 
     def _list(self, query: dict[str, list[str]]) -> None:
         path = self._query_value(query, "path")
-        recursive = self._query_value(query, "recursive", "false").lower() == "true"
         try:
+            recursive = self._query_bool(query, "recursive", False)
             max_depth = int(self._query_value(query, "max_depth", "0"))
             if max_depth < 0:
                 raise ValueError("max_depth must be non-negative")
@@ -810,6 +810,23 @@ class _ExecutorRequestHandler(BaseHTTPRequestHandler):
     def _query_value(query: dict[str, list[str]], name: str, default: str = "") -> str:
         values = query.get(name)
         return values[0] if values else default
+
+    @staticmethod
+    def _query_bool(query: dict[str, list[str]], name: str, default: bool) -> bool:
+        """Strictly parse a boolean query parameter; anything else is a 400.
+
+        与 JSON body 端点的 _optional_bool 同一哲学：类型错误显式拒绝,
+        而非静默降级为 False(那会让 recursive="aaa" 意外走非递归分支)。
+        """
+        values = query.get(name)
+        if not values:
+            return default
+        value = values[0].lower()
+        if value == "true":
+            return True
+        if value == "false":
+            return False
+        raise ValueError(f"{name} must be a boolean ('true' or 'false')")
 
     def send_response(self, code, message=None):
         """Record the response status so _agent_trace can report it on exit."""
