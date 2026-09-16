@@ -47,12 +47,20 @@ def collect(root, stage, exit_code, commit):
         registry = read(root / 'bundle/registry-images.json')
         if bundle and registry:
             result['images'] = {'references': registry['references'], 'base_images': bundle['base_images'],
-                                'backend': bundle['backend']['sandboxd_revision']}
+                                'backend': bundle['backend']['sandboxd_revision'], 'collector': bundle.get('collector')}
         if exit_code == 0 and not result.get('images'):
             raise ValueError('published image references missing')
     elif stage == 'e2e':
         report = read(root / 'acceptance/result.json')
         result['e2e'] = {'report': report, 'placement': read(root / 'acceptance/placement.json') or []}
+        result['e2e']['collection'] = {
+            node: {kind: read(root / 'acceptance' / node / f'{kind}-{node}.json')
+                   for kind in ('collection', 'gateway-metrics')}
+            for node in ('node1', 'node2')}
+        if exit_code == 0 and result.get('images', {}).get('collector'):
+            if not all(e and e.get('status') == 'passed'
+                       for node in result['e2e']['collection'].values() for e in node.values()):
+                raise ValueError('Collector and Gateway metrics evidence missing or failed')
         if exit_code == 0 and (not report or report['status'] != 'passed' or
                                report['cleanup_errors'] or report['missing_checks']):
             raise ValueError('Kubernetes acceptance evidence missing or failed')
@@ -98,6 +106,12 @@ def render(result):
                 lines += ['', '错误：' + code(report['error'])]
         else:
             lines += ['验收报告尚未生成，请查看本阶段日志。']
+        for node, checks in e2e.get('collection', {}).items():
+            evidence = checks.get('collection')
+            if evidence:
+                lines += ['', f"{node} 日志采集：{code(evidence['status'])}；唯一记录：{evidence.get('unique_probe_records', 0)}/40；" +
+                          link('采集与故障恢复结果', f'acceptance/{node}/collection-{node}.json') + ' · ' +
+                          link('Gateway 指标', f'acceptance/{node}/gateway-metrics-{node}.json')]
         placement = e2e['placement']
         if placement:
             lines += ['', '| Pod | 宿主节点 | Pod IP |', '|---|---|---|']

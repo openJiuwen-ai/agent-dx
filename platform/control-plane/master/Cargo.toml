@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+adx-observability = { path = "../../crates/observability" }
 hyper-util = { version = "0.1", features = ["tokio"] }
 hyper = { version = "1", features = ["server", "http1"] }
 http-body-util = "0.1"

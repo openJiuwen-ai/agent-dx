@@ -47,3 +47,5 @@ Edge/Node Proxy 已有独立的组件文件日志开关。统一 Supervisor 部�
 组件测试验证 stdout/stderr 连续输出在多次大小滚动、压缩及重新启动后的逐字节一致性、空闲时间滚动、历史数量/年龄/容量清理及压缩发布失败恢复。Linux 使用 `/dev/full` 验证写入层返回 ENOSPC；这不等同于整盘耗尽或 I/O 挂起故障注入。
 
 共享 E2E 驱动启用小阈值滚动，真实创建、执行、重启和删除后停止 Supervisor，解压两节点归档并检查最终日志健康，输出 `logging-node1.json` / `logging-node2.json` 以及 `[LOGGING PASS]`。本地与 K8s 使用相同检查。本地macOS组件16项、Linux组件17项、Clippy及53项驱动测试通过；ARM64双节点真实runc公共SDK七组全通过，两个节点分别40/6个gzip归档可读，无报告I/O错误或临时文件残留，清理无残留。Buildkite #18基础K8s七组及两节点40/6个gzip归档检查也通过，详见[验收记录](2026-09-16-logging-acceptance.md)。
+
+用于结构化文件采集时，可以开启完整行滚动与延迟压缩。新增配置、超长记录及采集窗口的磁盘预算语义见[组件日志采集](log-collection.md)。

@@ -32,12 +32,20 @@
     "gate": "创建、排队、暂停、恢复、删除和节点失效时，实例计数及CPU/内存/磁盘/GPU/NPU容量、已分配、可用量与权威账本一致；真实采集验收通过。"
   },
   {
+    "id": "component-log-collection",
+    "title": "组件结构化日志与外部Collector采集",
+    "stage": "8",
+    "status": "active",
+    "detail": "JSON日志、完整行滚动及配置验证通过；正在本地双节点验证后端故障、Collector重启与Gateway指标抓取，随后基础K8s。",
+    "gate": "本地与K8s均通过组件日志接收、敏感字段省略、后端不可用期间SDK生命周期、滚动与重启补传，保存每节点独立证据。"
+  },
+  {
     "id": "logs-traces",
-    "title": "日志采集与 Trace 接入",
+    "title": "跨组件 Trace 关联与导出",
     "stage": "8",
     "status": "pending",
-    "detail": "首批Metrics和组件日志滚动已验收；接下来统一结构化日志、关联字段及跨组件Trace，优先验证每实例异步队列上下文传递，采集由部署环境提供。",
-    "gate": "打通一次创建→执行→删除的日志和Trace关联；验证采样、脱敏、导出及采集端故障时业务可继续。"
+    "detail": "组件结构化日志与Collector采集正在独立验收；Trace上下文透传、异步队列关联、采样和导出仍未实现。",
+    "gate": "真实创建→执行→删除串联Trace及日志；验证并发上下文隔离、采样、导出故障与敏感字段。"
   },
   {
     "id": "log-rotation",

@@ -19,6 +19,18 @@ class KubernetesDeploymentTests(unittest.TestCase):
             self.assertEqual(spec['nodeSelector']['kubernetes.io/arch'],'amd64')
             self.assertTrue(spec['containers'][0]['securityContext']['privileged'])
             self.assertFalse(any('hostPath' in v for v in spec['volumes']))
+    def test_collector_is_independent_and_has_shared_log_storage(self):
+        for pod in (p for p in self.resources() if p['kind']=='Pod'):
+            containers={c['name']:c for c in pod['spec']['containers']}
+            self.assertEqual(set(containers),{'platform','collector'})
+            collector=containers['collector']
+            self.assertNotIn('privileged',collector['securityContext'])
+            self.assertFalse(collector['securityContext']['allowPrivilegeEscalation'])
+            mounts={m['name'] for m in collector['volumeMounts']}
+            self.assertIn('state',mounts);self.assertIn('evidence',mounts)
+            self.assertNotIn('images',mounts)
+            self.assertNotIn('shareProcessNamespace',pod['spec'])
+
     def test_eligible_nodes_preserve_architecture_and_pod_isolation(self):
         objects=k8s.resources('adx-e2e-test','registry.example/node@sha256:'+'a'*64,'amd64',False,['worker-a','worker-b'])
         for pod in (o for o in objects if o['kind']=='Pod'):

@@ -1,11 +1,13 @@
 # 可观测与日志能力规划
 
-2026-09-16新增需求，状态：首批实例资源Metrics已验收；日志滚动压缩已验收，日志采集与Trace待实施。内部以Instance为统计对象。先交付实例数量与资源分配Metrics，再完善日志采集和Trace；日志滚动压缩单独验收。
+2026-09-16新增需求，状态：首批实例资源Metrics已验收；日志滚动压缩已验收，组件日志采集正在验收，Trace待实施。内部以Instance为统计对象。先交付实例数量与资源分配Metrics，再完善日志采集和Trace；日志滚动压缩单独验收。
 
 ## 当前基础
 
 - `platform/control-plane/node-manager/src/metrics.rs` 已提供 `/metrics`：实例CPU累计用量、内存用量/限额、采样年龄，以及节点准入状态、已预留CPU/内存/磁盘。
 - `platform/control-plane/control-cli/src/supervisor.rs` 通过可配置的输出接管实现文件大小/时间滚动、后台gzip及历史保留，见[日志契约](log-rotation.md)，本地与基础K8s已验收。
+- Edge / Node Proxy 已有 `/metrics` 和日志初始化/过滤；本轮复用这些能力并补真实抓取与结构化采集验收。
+- 组件采集配置与契约见[日志采集](log-collection.md)。
 - 上述能力是增量实施的基础，不代表完整可观测链路已通过验收。
 
 ## 阶段8A：实例数量与资源分配Metrics（优先）

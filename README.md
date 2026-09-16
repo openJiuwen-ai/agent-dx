@@ -61,3 +61,5 @@ See [migration status](docs/migration/2026-09-14-import.md), [source pins](docs/
 Reusable snapshot creation, cloning into new Instances, catalog queries and deferred artifact deletion are wired through the control plane. The recorded package-v16 Firecracker/MinIO run passed 17 scenarios, including independent clone identities, process memory, writable files and retired-session orphan cleanup after authoritative recovery. Later package-v17 runs exposed an intermittent dual-clone network failure; see the [investigation](docs/testing/2026-09-16-fc-clone-network.md). Fault takeover remains under development. Full stage completion is tracked separately from passing component tests or local runtime scenarios.
 
 租户凭证的创建、查询、吊销及缓存契约见 [API Key 管理](docs/testing/api-key-management.md)。
+
+可观测： [实例与资源指标](docs/testing/instance-resource-metrics.md) · [组件日志采集](docs/testing/log-collection.md) · [日志滚动压缩](docs/testing/log-rotation.md)。

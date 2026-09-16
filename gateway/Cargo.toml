@@ -28,6 +28,7 @@ etcd-watch = ["dep:etcd-client"]
 mock-e2e = []
 
 [dependencies]
+adx-observability = { path = "../platform/crates/observability" }
 adx-protocol = { path = "../platform/crates/protocol" }
 adx-discovery = { path = "../platform/crates/discovery" }
 sha2 = "0.10"

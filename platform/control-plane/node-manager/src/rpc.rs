@@ -48,6 +48,9 @@ impl NodeRpc {
     }
 }
 fn response(result: crate::OperationResult) -> Result<Response<pb::InstanceResult>> {
+    adx_observability::info!(event="instance_operation_completed", instance_id=%result.record.spec.id,
+        generation=result.record.assignment.generation, revision=result.record.revision,
+        state=?result.record.state, "instance operation completed");
     Ok(Response::new(pb::InstanceResult {
         record: Some(result.record.try_into()?),
         durability: match result.durability {

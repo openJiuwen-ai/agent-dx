@@ -53,6 +53,18 @@ class BuildSummaryTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'evidence missing'):
                 summary.collect(root, 'e2e', 0, COMMIT)
 
+    def test_collector_summary_requires_both_nodes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp)
+            write(root, 'summaries/images.json', {'commit':COMMIT,'stages':{},'images':{'collector':{'version':'test'}}})
+            write(root, 'acceptance/result.json', {'status':'passed','cleanup_errors':[],'missing_checks':[]})
+            with self.assertRaisesRegex(ValueError,'Collector'):
+                summary.collect(root,'e2e',0,COMMIT)
+            for node in ('node1','node2'):
+                for kind in ('collection','gateway-metrics'):
+                    write(root,f'acceptance/{node}/{kind}-{node}.json',{'status':'passed'})
+            self.assertEqual(summary.collect(root,'e2e',0,COMMIT)['e2e']['collection']['node2']['collection']['status'],'passed')
+
     def test_streaming_preserves_failure_and_publishes_failure_summary(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

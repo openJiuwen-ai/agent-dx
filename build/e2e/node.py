@@ -35,11 +35,14 @@ def collect(node):
 
 def main():
     action=sys.argv[1];node=sys.argv[2] if len(sys.argv)>2 else ''
-    if action=='setup':subprocess.run(['python3',str(H/'configure.py'),node],check=True)
+    if action=='setup':
+        subprocess.run(['python3',str(H/'configure.py'),node],check=True)
+        subprocess.run(['python3',str(H/'telemetry.py'),'setup',node],check=True)
     elif action=='services':
         jobs=[['python3',str(H/'observe.py')],['sandboxd','--root',str(P/'sandboxd/root'),'--config',str(P/'sandboxd/config.toml'),'--socket',str(P/'sandboxd/sandboxd.sock'),'--http-address','127.0.0.1:18081','--pprof-address','127.0.0.1:16061','--log-file',str(E/f'sandboxd-{node}.log')]]
         if not os.getenv('ADX_E2E_KUBERNETES'):
             jobs += [['docker-registry','serve',str(H/'registry.yaml')]] if node=='node1' else [['python3',str(H/'registry-relay.py')]]
+        if not os.getenv('ADX_E2E_KUBERNETES'):jobs.append(['python3',str(H/'telemetry.py'),'run'])
         children=[subprocess.Popen(c) for c in jobs]
         (P/'sandboxd.pid').write_text(str(children[1].pid))
         while True:
@@ -112,7 +115,9 @@ def main():
         (E/f'backend-after-{node}.json').write_text(json.dumps(after))
         assert after==json.loads((E/f'backend-before-{node}.json').read_text()), 'backend identity changed across Node Manager restart'
     elif action=='stop':
+        subprocess.run(['python3',str(H/'telemetry.py'),'metrics',node],check=True)
         stopped=supervisor('stop');assert stopped['ok'];collect(node)
+        subprocess.run(['python3',str(H/'telemetry.py'),'validate',node],check=True)
         logs=list((P/'state/logs').glob('*.gz'));assert logs,'no compressed component logs'
         assert not list((P/'state/logs').glob('*.tmp')),'incomplete compression after stop'
         for path in logs:gzip.decompress(path.read_bytes())

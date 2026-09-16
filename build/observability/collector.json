@@ -1,0 +1,117 @@
+{
+  "extensions": {
+    "file_storage": {
+      "directory": "${env:ADX_COLLECTOR_STATE}",
+      "create_directory": true
+    }
+  },
+  "receivers": {
+    "filelog/adx": {
+      "include": [
+        "${env:ADX_LOG_DIR}/*.log",
+        "${env:ADX_LOG_DIR}/*.log.[0-9]*"
+      ],
+      "exclude": [
+        "${env:ADX_LOG_DIR}/*.gz",
+        "${env:ADX_LOG_DIR}/*.tmp"
+      ],
+      "start_at": "beginning",
+      "storage": "file_storage",
+      "poll_interval": "100ms",
+      "include_file_name": true,
+      "include_file_path": true,
+      "max_log_size": "1MiB",
+      "fingerprint_size": "128",
+      "retry_on_failure": {
+        "enabled": true,
+        "max_elapsed_time": "0s"
+      },
+      "resource": {
+        "adx.node.id": "${env:ADX_NODE_ID}"
+      },
+      "operators": [
+        {
+          "type": "json_parser",
+          "if": "body matches '^[[:space:]]*[{]'",
+          "parse_to": "body",
+          "on_error": "send"
+        },
+        {
+          "type": "regex_parser",
+          "parse_from": "attributes[\"log.file.name\"]",
+          "regex": "^(?P<component>.+)\\.log(?:\\.[0-9]{20})?$"
+        },
+        {
+          "type": "move",
+          "from": "attributes.component",
+          "to": "resource[\"service.name\"]"
+        }
+      ]
+    }
+  },
+  "processors": {
+    "memory_limiter": {
+      "check_interval": "1s",
+      "limit_mib": 96,
+      "spike_limit_mib": 24
+    },
+    "batch": {
+      "timeout": "1s",
+      "send_batch_size": 128,
+      "send_batch_max_size": 256
+    }
+  },
+  "exporters": {
+    "otlp_http/logs": {
+      "endpoint": "${env:ADX_OTLP_ENDPOINT}",
+      "encoding": "json",
+      "timeout": "5s",
+      "sending_queue": {
+        "enabled": true,
+        "storage": "file_storage",
+        "queue_size": 256
+      },
+      "retry_on_failure": {
+        "enabled": true,
+        "initial_interval": "1s",
+        "max_interval": "5s",
+        "max_elapsed_time": "0s"
+      }
+    }
+  },
+  "service": {
+    "extensions": [
+      "file_storage"
+    ],
+    "pipelines": {
+      "logs": {
+        "receivers": [
+          "filelog/adx"
+        ],
+        "processors": [
+          "memory_limiter",
+          "batch"
+        ],
+        "exporters": [
+          "otlp_http/logs"
+        ]
+      }
+    },
+    "telemetry": {
+      "metrics": {
+        "readers": [
+          {
+            "pull": {
+              "exporter": {
+                "prometheus": {
+                  "host": "127.0.0.1",
+                  "port": 18888
+                }
+              }
+            }
+          }
+        ]
+      }
+    }
+  }
+}

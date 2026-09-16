@@ -43,6 +43,36 @@ pub fn init(
     edge_component: bool,
 ) -> Result<LoggingGuard, Box<dyn std::error::Error>> {
     let config = LoggingConfig::from_env()?;
+    if adx_observability::json_enabled().map_err(|e| -> Box<dyn std::error::Error> { e })? {
+        if config.directory.is_some() {
+            return Err("JSON logging uses stdout; leave ADX_DATA_PLANE_LOG_DIR unset".into());
+        }
+        let access = config.edge_access_log;
+        let audit = config.edge_audit_log;
+        let stdout = config.stdout;
+        tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .json()
+                    .with_ansi(false)
+                    .with_target(true)
+                    .with_filter(filter_fn(move |metadata| {
+                        stdout
+                            && include_general_log_target(
+                                edge_component,
+                                true,
+                                access,
+                                audit,
+                                metadata.target(),
+                            )
+                    }))
+                    .with_filter(env_filter()),
+            )
+            .try_init()?;
+        return Ok(LoggingGuard {
+            workers: Vec::new(),
+        });
+    }
     let mut workers = Vec::new();
     let edge_access_enabled = edge_component && config.edge_access_log;
     let edge_audit_enabled = edge_component && config.edge_audit_log;

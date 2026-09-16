@@ -4,6 +4,7 @@ members = [
     "gateway",
     "platform/runtime/rrt",
     "platform/crates/core",
+    "platform/crates/observability",
     "platform/crates/scheduling",
     "platform/crates/protocol",
     "platform/crates/discovery",

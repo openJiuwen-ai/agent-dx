@@ -86,6 +86,7 @@ async fn sample(
 }
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    adx_observability::init().map_err(|e| -> Box<dyn std::error::Error> { e })?;
     let c: Config = read_config()?;
     c.checkpoint_gc.validate()?;
     let _logging_guard = if c.proxy_mode == adx_node_manager::proxy::ProxyMode::Embedded {
@@ -234,7 +235,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match sample(&source, &runtime, timeout).await {
             Ok(sample) => break sample,
             Err(error) => {
-                eprintln!("waiting for first valid capacity observation: {error}");
+                adx_observability::warn!("waiting for first valid capacity observation: {error}");
                 tokio::select! { _ = tokio::time::sleep(Duration::from_secs(c.report_interval_seconds)) => (), _ = shutdown() => return Ok(()) }
             }
         }
@@ -293,8 +294,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             interval.tick().await;
             while let Some(result) = gc_jobs.try_join_next() {
                 match result {
-                    Ok(Ok(Ok(count))) => eprintln!("remote orphan GC completed: removed={count}"),
-                    other => eprintln!("remote orphan GC incomplete: {other:?}"),
+                    Ok(Ok(Ok(count))) => {
+                        adx_observability::warn!("remote orphan GC completed: removed={count}")
+                    }
+                    other => adx_observability::warn!("remote orphan GC incomplete: {other:?}"),
                 }
             }
             if let Some(discovery) = &discovery {
@@ -365,7 +368,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     .map(TryInto::try_into)
                                     .collect::<adx_core::Result<Vec<_>>>()?;
                                 if let Err(error) = journal.recover(&records).await {
-                                    eprintln!("degradation journal recovery incomplete: {error}");
+                                    adx_observability::warn!(
+                                        "degradation journal recovery incomplete: {error}"
+                                    );
                                     continue;
                                 }
                                 // Replay may change executions and checkpoint ownership. Fetch
@@ -407,7 +412,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     result = &mut recovery => {
                                         match result {
                                             Ok(()) => reconciled = true,
-                                            Err(error) => eprintln!("node reconciliation incomplete: {error}"),
+                                            Err(error) => adx_observability::warn!("node reconciliation incomplete: {error}"),
                                         }
                                         break;
                                     }
@@ -422,7 +427,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
                         }
-                        Err(_) => eprintln!(
+                        Err(_) => adx_observability::warn!(
                             "authoritative node catalog unavailable; lifecycle remains closed"
                         ),
                     }
@@ -437,7 +442,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 reconciled = false;
                                 manager.pause_lifecycle().await;
                             }
-                            eprintln!("degradation journal publication incomplete: {error}");
+                            adx_observability::warn!(
+                                "degradation journal publication incomplete: {error}"
+                            );
                             continue;
                         }
                     }
@@ -456,7 +463,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if status.code() == tonic::Code::FailedPrecondition {
                         reconciled = false;
                     }
-                    eprintln!("node heartbeat unavailable; waiting to register or reconcile");
+                    adx_observability::warn!(
+                        "node heartbeat unavailable; waiting to register or reconcile"
+                    );
                 }
             }
         }
@@ -477,7 +486,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         loop {
             interval.tick().await;
             if let Err(error) = manager.monitor_instances().await {
-                eprintln!("instance observation incomplete: {error}");
+                adx_observability::warn!("instance observation incomplete: {error}");
             }
         }
     };
@@ -486,11 +495,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         loop {
             interval.tick().await;
             if let Err(error) = manager.expire_checkpoints().await {
-                eprintln!("checkpoint expiry incomplete: {error}");
+                adx_observability::warn!("checkpoint expiry incomplete: {error}");
             }
         }
     };
-    eprintln!("adx-node-manager RPC listener ready");
+    adx_observability::info!("adx-node-manager RPC listener ready");
     let proxy_failure = async {
         match &mut embedded {
             Some(proxy) => proxy.failed().await,

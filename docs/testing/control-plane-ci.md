@@ -156,3 +156,5 @@ Go 使用 Linux arm64 容器，其余使用 macOS arm64。完整平台尚未部�
 首次接入互操作脚本时，未知长度 POST 返回 502。已定位到旧测试上游只读取 Content-Length，无法消费 V2 流式请求的 chunked 编码。仅修正测试夹具，新增已知长度 buffered 请求断言，复测 11 项通过；产品数据面实现未修改。失败与成功记录分别保存在 `out/ci/interop/` 的独立运行目录。
 
 Master 存储阶段的契约与运行方法见 [Redis 持久化与恢复](master-storage.md)。`storage` 属于真实依赖的组件集成验证，不代表完整平台 E2E。
+
+组件日志采集验收复用现有 Edge/Node Proxy 指标端点，并通过真实 OpenTelemetry Collector 接收结构化组件日志。stop 组包含后端 503、文件滚动与 Collector 重启，控制台输出 `[METRICS PASS]` / `[COLLECTION PASS]`；产物含 `gateway-metrics-node*.json`、`collection-node*.json`、`collected-logs.jsonl` 和 `collector-process.log`。部署及保证边界见 `docs/testing/log-collection.md`；Trace 仍为后续增量。

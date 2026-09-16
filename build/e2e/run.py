@@ -181,7 +181,9 @@ class Run:
     def scenarios(self,checks):
         with self.case('sdk', checks):
             self.event('Create/query instances; verify command stdout/stderr/exit code, binary files and deletion')
+            for node in self.nodes:self.execute(node,'python3','/opt/adx/e2e/telemetry.py','outage-start',node)
             self.execute('node1','/opt/adx/client/bin/python','-u','/opt/adx/e2e/scenarios.py','sdk',timeout=600)
+            for node in self.nodes:self.execute(node,'python3','/opt/adx/e2e/telemetry.py','outage-end',node)
             self.helper('node1','postcheck')
             for node in self.nodes:self.helper(node,'empty',node)
         for scenario in ('auth','capacity','placement'):

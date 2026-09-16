@@ -18,6 +18,7 @@ import (
 	"google.golang.org/grpc/credentials"
 	"io"
 	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -58,6 +59,13 @@ func validateIngress(c config) error {
 }
 
 func run() error {
+	switch os.Getenv("ADX_LOG_FORMAT") {
+	case "", "text":
+	case "json":
+		slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
+	default:
+		return errors.New("ADX_LOG_FORMAT must be text or json")
+	}
 	file := flag.String("config", "", "service JSON configuration")
 	flag.Parse()
 	if *file == "" {
@@ -148,7 +156,11 @@ func run() error {
 		return err
 	}
 	router := gin.New()
-	router.Use(gin.Recovery())
+	router.Use(requestLogging(slog.Default()))
+	router.Use(gin.CustomRecoveryWithWriter(io.Discard, func(c *gin.Context, _ any) {
+		slog.Error("request panic", "event", "http_panic")
+		c.AbortWithStatus(http.StatusInternalServerError)
+	}))
 	d := backend.Dependencies{Transport: b, Instances: b, Authenticate: auth.Verify, Snapshots: controlbackend.NewSnapshotCatalog(pb.NewSnapshotServiceClient(master), timeout), Keys: controlbackend.NewKeyManager(pb.NewCredentialServiceClient(master), timeout)}
 	if err = api.RegisterRoutes(router, d); err != nil {
 		return err

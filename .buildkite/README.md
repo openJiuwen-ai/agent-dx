@@ -163,3 +163,5 @@ the test step runs the public SDK checkpoint, snapshot and node-fault cases insi
 an isolated Kubernetes Pod and publishes deployment, per-case, JUnit and cleanup
 evidence. See [runtime kit and invocation](../build/e2e/firecracker/README.md).
 The existing basic E2E result alone does not count as this profile passing.
+
+组件日志采集验收复用现有 Edge/Node Proxy 指标端点，并通过真实 OpenTelemetry Collector 接收结构化组件日志。stop 组包含后端 503、文件滚动与 Collector 重启，控制台输出 `[METRICS PASS]` / `[COLLECTION PASS]`；产物含 `gateway-metrics-node*.json`、`collection-node*.json`、`collected-logs.jsonl` 和 `collector-process.log`。部署及保证边界见 `docs/testing/log-collection.md`；Trace 仍为后续增量。

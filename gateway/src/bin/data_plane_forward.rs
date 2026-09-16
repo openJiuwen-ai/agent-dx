@@ -15,9 +15,7 @@ const L4_COPY_BUFFER_SIZE: usize = 64 * 1024;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     data_plane_gateway::common::install_crypto_provider();
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
+    adx_observability::init().map_err(|e| -> Box<dyn std::error::Error> { e })?;
     let nofile_soft_limit = raise_nofile_soft_limit_from_env()?;
     tracing::info!(nofile_soft_limit, "Data Plane Forward FD limit configured");
     let config = ForwardConfig::from_args(std::env::args().skip(1))?;

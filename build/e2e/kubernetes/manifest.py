@@ -48,7 +48,13 @@ def resources(namespace, image, architecture, registry_auth=False, node_names=()
             'restartPolicy': 'Never', 'automountServiceAccountToken': False,
             'terminationGracePeriodSeconds': 90,
             'nodeSelector': {'kubernetes.io/os': 'linux', 'kubernetes.io/arch': architecture},
-            'containers': [container], 'volumes': volumes,
+            'containers': [container, {
+                'name':'collector','image':image,'imagePullPolicy':'IfNotPresent',
+                'command':['python3','/opt/adx/e2e/telemetry.py','run'],
+                'securityContext':{'runAsUser':0,'allowPrivilegeEscalation':False,'capabilities':{'drop':['ALL']}},
+                'resources':{'requests':{'cpu':'100m','memory':'128Mi'},'limits':{'cpu':'1','memory':'256Mi'}},
+                'volumeMounts':[dict(m) for m in mounts if m['name'] in ('state','evidence','credentials')]
+            }], 'volumes': volumes,
             'affinity': {'podAntiAffinity': {'preferredDuringSchedulingIgnoredDuringExecution': [{
                 'weight': 100, 'podAffinityTerm': {
                     'labelSelector': {'matchLabels': {LABEL: namespace}},

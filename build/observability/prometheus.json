@@ -1,0 +1,9 @@
+{
+  "global": {"scrape_interval": "15s"},
+  "scrape_configs": [
+    {"job_name": "adx-master", "static_configs": [{"targets": ["127.0.0.1:17090"]}]},
+    {"job_name": "adx-node-manager", "static_configs": [{"targets": ["127.0.0.1:17091"]}]},
+    {"job_name": "adx-edge", "static_configs": [{"targets": ["127.0.0.1:18080"]}]},
+    {"job_name": "adx-node-proxy", "static_configs": [{"targets": ["127.0.0.1:19443"]}]}
+  ]
+}

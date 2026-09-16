@@ -45,6 +45,7 @@ fn default_ttl() -> u64 {
 }
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    adx_observability::init().map_err(|e| -> Box<dyn std::error::Error> { e })?;
     let c: Config = read_config()?;
     if c.heartbeat_timeout_seconds == 0 || c.discovery_ttl_seconds < 3 {
         return Err("positive heartbeat timeout and discovery TTL >= 3 required".into());
@@ -101,11 +102,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         loop {
             tick.tick().await;
             if let Err(error) = maintenance_rpc.expire_nodes().await {
-                eprintln!("node health publication unavailable: {error}");
+                adx_observability::warn!("node health publication unavailable: {error}");
             }
             if let Some(address) = &c.advertised_address {
                 if let Err(error) = session.advertise(&c.namespace, address, ttl).await {
-                    eprintln!("Master discovery renewal unavailable: {error}");
+                    adx_observability::warn!("Master discovery renewal unavailable: {error}");
                 }
             }
         }
@@ -116,7 +117,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         loop {
             tick.tick().await;
             if let Err(error) = recovery_rpc.recover_instances().await {
-                eprintln!("instance recovery incomplete: {error}");
+                adx_observability::warn!("instance recovery incomplete: {error}");
             }
         }
     };
@@ -126,11 +127,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         loop {
             tick.tick().await;
             if let Err(error) = collection_rpc.collect_snapshots().await {
-                eprintln!("snapshot collection incomplete: {error}");
+                adx_observability::warn!("snapshot collection incomplete: {error}");
             }
         }
     };
-    eprintln!("adx-master listening on {}", listener.local_addr()?);
+    adx_observability::info!("adx-master listening on {}", listener.local_addr()?);
     let server = tonic::transport::Server::builder()
         .tls_config(server_tls)?
         .add_service(pb::snapshot_service_server::SnapshotServiceServer::new(

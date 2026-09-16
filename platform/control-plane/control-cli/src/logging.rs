@@ -22,6 +22,9 @@ use std::{
 #[serde(default, deny_unknown_fields)]
 pub struct Policy {
     pub enabled: bool,
+    pub line_records: bool,
+    pub max_record_bytes: usize,
+    pub compress_after_seconds: u64,
     pub max_file_bytes: u64,
     pub rotate_seconds: Option<u64>,
     pub compress: bool,
@@ -34,6 +37,9 @@ impl Default for Policy {
     fn default() -> Self {
         Self {
             enabled: false,
+            line_records: false,
+            max_record_bytes: 65536,
+            compress_after_seconds: 0,
             max_file_bytes: 100 * 1024 * 1024,
             rotate_seconds: Some(86400),
             compress: true,
@@ -45,7 +51,9 @@ impl Default for Policy {
 }
 impl Policy {
     pub fn validate(&self) -> crate::Result<()> {
-        if self.max_file_bytes == 0
+        if self.max_record_bytes == 0
+            || self.max_record_bytes > 16 * 1024 * 1024
+            || self.max_file_bytes == 0
             || self.max_files == 0
             || self.max_total_bytes == 0
             || self.rotate_seconds == Some(0)
@@ -121,6 +129,11 @@ fn open(path: &Path) -> io::Result<File> {
 fn maintain(root: &Path, id: &str, policy: &Policy) -> io::Result<()> {
     if policy.compress {
         for archive in archives(root, id)? {
+            if archive.modified.elapsed().unwrap_or_default()
+                < Duration::from_secs(policy.compress_after_seconds)
+            {
+                continue;
+            }
             if archive.path.extension().is_some_and(|s| s == "gz") {
                 continue;
             }
@@ -156,6 +169,11 @@ fn maintain(root: &Path, id: &str, policy: &Policy) -> io::Result<()> {
     let mut count = files.len();
     let mut bytes = files.iter().map(|f| u128::from(f.bytes)).sum::<u128>();
     for file in files {
+        if file.modified.elapsed().unwrap_or_default()
+            < Duration::from_secs(policy.compress_after_seconds)
+        {
+            continue;
+        }
         let expired = policy.max_age_seconds.is_some_and(|age| {
             file.modified
                 .elapsed()
@@ -226,6 +244,17 @@ impl Writer {
         }
         Ok(())
     }
+    fn record(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.tick()?;
+        if self.bytes > 0
+            && self.bytes.saturating_add(bytes.len() as u64) > self.policy.max_file_bytes
+        {
+            self.rotate()?;
+        }
+        self.file.as_mut().unwrap().write_all(bytes)?;
+        self.bytes += bytes.len() as u64;
+        Ok(())
+    }
     fn write(&mut self, mut bytes: &[u8]) -> io::Result<()> {
         while !bytes.is_empty() {
             self.tick()?;
@@ -237,6 +266,49 @@ impl Writer {
             bytes = &bytes[n..];
         }
         Ok(())
+    }
+}
+#[derive(Default)]
+struct Records {
+    pending: Vec<u8>,
+    discarding: bool,
+}
+impl Records {
+    fn push(&mut self, bytes: &[u8], writer: &mut Writer, health: &Health) {
+        for part in bytes.split_inclusive(|b| *b == b'\n') {
+            let end = part.ends_with(b"\n");
+            if self.discarding {
+                health
+                    .failed_bytes
+                    .fetch_add(part.len() as u64, Ordering::Relaxed);
+                if end {
+                    self.discarding = false;
+                }
+                continue;
+            }
+            if self.pending.len() + part.len() > writer.policy.max_record_bytes {
+                health
+                    .failed_bytes
+                    .fetch_add((self.pending.len() + part.len()) as u64, Ordering::Relaxed);
+                health.report(io::Error::other(
+                    "component log record exceeds max_record_bytes",
+                ));
+                self.pending.clear();
+                self.discarding = !end;
+                continue;
+            }
+            self.pending.extend_from_slice(part);
+            if end {
+                if let Err(error) = writer.record(&self.pending) {
+                    health
+                        .failed_bytes
+                        .fetch_add(self.pending.len() as u64, Ordering::Relaxed);
+                    health.report(error);
+                    writer.file = None;
+                }
+                self.pending.clear();
+            }
+        }
     }
 }
 pub struct Capture {
@@ -298,10 +370,15 @@ impl Capture {
                 }
             });
             let mut buffer = [0; 16384];
+            let mut records = Records::default();
             loop {
                 match read.read(&mut buffer) {
                     Ok(0) => break,
                     Ok(n) => {
+                        if writer.policy.line_records {
+                            records.push(&buffer[..n], &mut writer, &state);
+                            continue;
+                        }
                         if let Err(error) = writer.write(&buffer[..n]) {
                             state.failed_bytes.fetch_add(n as u64, Ordering::Relaxed);
                             state.report(error);
@@ -327,6 +404,9 @@ impl Capture {
                         break;
                     }
                 }
+            }
+            if writer.policy.line_records && !records.pending.is_empty() {
+                records.push(b"\n", &mut writer, &state);
             }
             if let Some(file) = &writer.file {
                 if let Err(error) = file.sync_all() {
@@ -382,6 +462,7 @@ mod tests {
             max_files: 100,
             max_age_seconds: None,
             max_total_bytes: 100000,
+            ..Default::default()
         }
     }
     fn read_all(root: &Path) -> Vec<u8> {
@@ -403,6 +484,94 @@ mod tests {
         }
         bytes
     }
+    #[test]
+    fn line_records_survive_rotation_as_complete_json() {
+        let root = tempfile::tempdir().unwrap();
+        let p: Policy = serde_json::from_value(serde_json::json!({
+            "enabled":true,"line_records":true,"max_record_bytes":1024,
+            "max_file_bytes":50,"compress_after_seconds":60,"max_files":100
+        }))
+        .unwrap();
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg("i=1; while [ $i -le 20 ]; do printf '{\"sequence\":%s,\"message\":\"record across read and file boundaries\"}\\n' \"$i\"; i=$((i+1)); done");
+        let mut capture = Capture::attach(&mut command, root.path(), "test", p).unwrap();
+        assert!(command.status().unwrap().success());
+        drop(command);
+        capture.finish();
+        assert!(capture.status().error.is_none());
+        let files = archives(root.path(), "test").unwrap();
+        assert!(files.len() > 1);
+        let mut sequences = Vec::new();
+        for path in files
+            .into_iter()
+            .map(|f| f.path)
+            .chain([root.path().join("test.log")])
+        {
+            assert_ne!(path.extension().unwrap(), "gz");
+            for line in fs::read_to_string(path).unwrap().lines() {
+                let row: serde_json::Value = serde_json::from_str(line).unwrap();
+                sequences.push(row["sequence"].as_u64().unwrap());
+            }
+        }
+        assert_eq!(sequences, (1..=20).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn record_buffer_bounds_and_recovers_after_oversize_line() {
+        let root = tempfile::tempdir().unwrap();
+        let (wake, _events) = mpsc::sync_channel(1);
+        let mut p = policy();
+        p.max_record_bytes = 8;
+        let mut writer = Writer {
+            root: root.path().into(),
+            id: "test".into(),
+            policy: p,
+            file: None,
+            bytes: 0,
+            sequence: 0,
+            since: SystemTime::now(),
+            wake,
+        };
+        let health = Health::default();
+        let mut records = Records::default();
+        records.push(b"ab", &mut writer, &health);
+        records.push(b"c\n123456", &mut writer, &health);
+        records.push(b"789", &mut writer, &health);
+        assert!(records.pending.is_empty());
+        records.push(b"0\nok\n", &mut writer, &health);
+        assert_eq!(read_all(root.path()), b"abc\nok\n");
+        assert_eq!(health.failed_bytes.load(Ordering::Relaxed), 11);
+        assert!(health.error.lock().unwrap().is_some());
+    }
+    #[test]
+    fn collection_grace_defers_compression_and_retention() {
+        let root = tempfile::tempdir().unwrap();
+        let mut p = policy();
+        p.compress_after_seconds = 60;
+        p.max_files = 1;
+        for n in 1..=3 {
+            fs::write(root.path().join(format!("test.log.{n:020}")), b"line\n").unwrap();
+        }
+        maintain(root.path(), "test", &p).unwrap();
+        let files = archives(root.path(), "test").unwrap();
+        assert_eq!(files.len(), 3);
+        for file in files {
+            assert_ne!(file.path.extension().unwrap(), "gz");
+            File::options()
+                .write(true)
+                .open(file.path)
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(SystemTime::UNIX_EPOCH))
+                .unwrap();
+        }
+        maintain(root.path(), "test", &p).unwrap();
+        let files = archives(root.path(), "test").unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].sequence, 3);
+        assert_eq!(files[0].path.extension().unwrap(), "gz");
+        assert_eq!(read_all(root.path()), b"line\n");
+    }
+
     #[test]
     fn capture_preserves_stdout_stderr_across_size_rotation_and_restarts() {
         let root = tempfile::tempdir().unwrap();

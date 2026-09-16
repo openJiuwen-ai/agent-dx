@@ -32,6 +32,12 @@ if ! docker info >/dev/null 2>&1; then
 fi
 echo "--- :docker: Resolve runtime base images"
 source .buildkite/bootstrap-images.sh > >(tee out/buildkite/logs/base-images.log) 2>&1
+echo "--- :docker: Resolve pinned external Collector"
+if [[ -z ${ADX_COLLECTOR_IMAGE:-} ]]; then
+  collector_digest=$(python3 -c 'import json; print(json.load(open("build/observability/source.json"))["image"].split("@",1)[1])')
+  export ADX_COLLECTOR_IMAGE="${ADX_COLLECTOR_MIRROR:-docker.m.daocloud.io/otel/opentelemetry-collector-contrib}@$collector_digest"
+fi
+docker pull "$ADX_COLLECTOR_IMAGE"
 echo "--- :docker: Build node and RRT images"
 fc_args=()
 if [[ ${ADX_E2E_CHECKPOINT:-0} == 1 ]]; then
