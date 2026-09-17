@@ -26,7 +26,7 @@
 
 `RoundOutcome` 同时包含 `assignments` 和 `error`。后续请求的插件失败不撤销前面的成功预留，也不丢弃失败请求。调用者必须处理已返回分配，再按错误策略重试。`schedule(domain)` 保留单个结果接口；大量工作应使用 `schedule_round(domain)`。
 
-典型事件循环：取 `take_ready_domain()`，调用 `schedule_round`，派发其已完成分配，再处理错误。只有资源变化、请求到达或预算用尽且还有工作时继续唤醒。插件错误交给调用者退避处理。一个插件调用和一个请求的候选扫描不会被强行抢占，因此 10 ms 是协作预算，不是实时硬截止。
+典型事件循环：取 `take_ready_shard()`，调用 `schedule_round`，派发其已完成分配，再处理错误。只有资源变化、请求到达或预算用尽且还有工作时继续唤醒。插件错误交给调用者退避处理。一个插件调用和一个请求的候选扫描不会被强行抢占，因此 10 ms 是协作预算，不是实时硬截止。
 
 `MutationJournal` 是进程内缓存变更日志，不是 Redis/SQLite 持久化日志。Master 直接拥有内存账本及预留增量，不再搬入旧实现的异步镜像账本/确认协议；恢复持久化状态后才能开放调度仍是服务接线要求。
 
@@ -41,7 +41,7 @@
 | `candidate_cache_entries` | 32 | 每 Shard 最多保存的计算签名；超限按进入顺序淘汰，0 关闭复用 |
 | `mutation_history` | 65,536 | 有界变更日志条数；溢出后消费者重建 |
 
-请求数、时间和日志容量须大于零。这些调优项当前只通过 Rust 配置接口设置；Master 服务 JSON 暴露 `domains` 与 `placement`，未暴露上述 SchedulerConfig 调优字段。
+请求数、时间和日志容量须大于零。这些调优项当前只通过 Rust 配置接口设置；Master 服务 JSON 暴露 `scheduler_shards` 与 `placement`，未暴露上述 SchedulerConfig 调优字段。
 
 ## 自动验证入口
 

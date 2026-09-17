@@ -11,12 +11,12 @@
 | `src/plugins.rs` | NodeAvailable, ResourceFit, ResourceBalance(Pack/Spread) |
 | `src/groups.rs` | Public node/Instance condition groups, reverse anti-affinity, weighted/ordered preferences |
 | `src/constraints.rs` | DeviceFit, NodeAffinity, InstanceAffinity, Topology; NodePreference, InstancePreference, TopologyPreference |
-| `master/src/domain.rs` | Queue ownership, framework call, atomic scalar/card reservation and release |
+| `master/src/shard.rs` | Queue ownership, framework call, atomic scalar/card reservation and release |
 | `node-manager` | Fresh inventory check, local scalar/card reservation, sandboxd device mapping and confirmed cleanup |
 
 Default filters, in order: `node-available → resource-fit → device-fit → node-affinity → placement-groups → instance-affinity → topology-spread`. These hard filters apply to every profile. Default scores: placement-group preference, resource balance, node preference, Instance preference and topology preference, each with weight 1.
 
-`Master::new(domain_count, placement)` installs that profile. `Framework::new(additional_filters, weighted_scores)` / `Master::with_framework` allow static Rust composition. Only eligible candidates are scored. Scores must be in `0..=MAX_SCORE` (3,000,000). Higher weighted sums win; ties use ascending node ID. Empty scoring configuration uses node ID and therefore disables soft preferences. Invalid names/weights/scores are rejected. Plugins must not mutate reservations or perform blocking network requests. Errors preserve queued work and do not consume capacity.
+`Master::new(shard_count, placement)` installs that profile. `Framework::new(additional_filters, weighted_scores)` / `Master::with_framework` allow static Rust composition. Only eligible candidates are scored. Scores must be in `0..=MAX_SCORE` (3,000,000). Higher weighted sums win; ties use ascending node ID. Empty scoring configuration uses node ID and therefore disables soft preferences. Invalid names/weights/scores are rejected. Plugins must not mutate reservations or perform blocking network requests. Errors preserve queued work and do not consume capacity.
 
 ## GPU/NPU whole cards
 
@@ -72,7 +72,7 @@ The migrated optimizations are documented with baseline provenance, configuratio
 - `snapshot.rs`: persistent node/Instance maps, tenant/label indexes and reverse anti-affinity membership. Snapshot fields are read-only to callers; `update_node/place/remove` update the indexes together. Holding an old snapshot does not expose later changes.
 - `query.rs`: prepare peer queries once per request, using the narrowest exact-label/tenant index and evaluating remaining selector expressions. Plugins share the prepared view across candidates.
 - `master/src/journal.rs`: bounded node-mutation sequence; caches read only the new suffix, refresh absolute reservation values and rebuild on overflow.
-- `master/src/domain.rs`: semantic computation groups and ranked candidate reuse. After a reservation/release/update, re-evaluate changed nodes and reposition their scores, including Spread. Unknown plugin profiles and non-scalar policies use normal per-request evaluation.
+- `master/src/shard.rs`: semantic computation groups and ranked candidate reuse. After a reservation/release/update, re-evaluate changed nodes and reposition their scores, including Spread. Unknown plugin profiles and non-scalar policies use normal per-request evaluation.
 - `master/src/queue.rs`: ordered priority/FIFO trees per tenant, round-robin across tenants, retained tickets for deferred requests. No full backlog drain on each assignment.
 
-These changes do not add distributed queues or persistence. The event-loop API is `take_ready_domain` + `schedule_round`; `RoundOutcome.error` can coexist with successful assignments, which the caller must still dispatch. Topology expansion is outside this optimization iteration.
+These changes do not add distributed queues or persistence. The event-loop API is `take_ready_shard` + `schedule_round`; `RoundOutcome.error` can coexist with successful assignments, which the caller must still dispatch. Topology expansion is outside this optimization iteration.
