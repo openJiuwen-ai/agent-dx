@@ -57,3 +57,9 @@
 阶段8、9为新增特性，不影响已有阶段的验收记录。阶段8先完成实例数量和资源分配Metrics，再接日志采集与Trace；阶段9单独交付日志滚动、压缩和保留策略。详细范围及验收见[可观测与日志规划](observability-logging-plan.md)。
 
 阶段8首批Metrics已完成：提交 `5f592cf`，53项Rust、53项驱动、Clippy、本地双节点SDK七组与Buildkite #17基础K8s通过；真实抓取确认满载/排队/删除后的指标与两侧资源账本一致。见[验收报告](2026-09-16-metrics-acceptance.md)。阶段8的日志采集与Trace已通过本地及Buildkite #21正式K8s验收，见[日志与Trace报告](2026-09-17-observability-k8s.md)；阶段8按本期范围完成；统一实时队列丢弃指标按用户决定后置；阶段9日志滚动压缩已完成：`3985f4b`，macOS 16项/Linux 17项Rust检查、53项驱动检查、Clippy、本地双节点SDK与Buildkite #18基础K8s七组通过；两节点40/6个gzip归档可读，清理无残留。见[日志验收记录](2026-09-16-logging-acceptance.md)。
+
+
+## 阶段11：节点本地优先创建
+
+已接入可配置 API 节点轮转、共用 Admission 暂留、原子 claim 与中心账本同步、同 ID 并发收敛、未知写入屏障恢复及后台重试。
+本地 Redis/mTLS/HTTPS 验证及新制品真实 sandboxd/runc/RRT 双节点8组验收均通过，包含 `local-first`，见 [端到端报告](2026-09-17-local-first-e2e.md)；正式K8s新制品验收待执行。见 [契约](atomic-instance-claim.md)。

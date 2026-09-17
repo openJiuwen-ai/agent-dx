@@ -77,11 +77,14 @@ pub(super) async fn normalize(
             policy.required_node.push(Default::default());
         }
         for alternative in &mut policy.required_node {
-            alternative.expressions.push(pb::LabelRequirement {
+            let required = pb::LabelRequirement {
                 key: "NODE_ID".into(),
                 op: pb::SelectorOp::In as i32,
                 values: vec![snapshot.source_node_id.clone()],
-            });
+            };
+            if !alternative.expressions.contains(&required) {
+                alternative.expressions.push(required);
+            }
         }
     }
     request.try_into()

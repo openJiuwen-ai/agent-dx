@@ -81,7 +81,7 @@ export PIP_CACHE_DIR=/your/cache/pip
 
 ### 3. 公共 SDK 执行用例
 
-基础门禁包含七组用例：SDK 创建／命令／文件／删除、API Key 与租户隔离、资源不足与释放后重新调度、双节点放置约束、心跳超时与恢复清理、Node Manager 进程重启、supervisor 停机清理。放置组检查实例亲和 OR、实例反亲和、加权与有序节点偏好、每个 OR 分支的 node_id 约束及反向实例反亲和，并比对实际节点归属。业务操作使用公共 SDK；管理查询、只读状态检查和受控故障注入用于验证内部结果，不替代真实调用链。
+基础门禁包含八组用例：SDK 创建／命令／文件／删除、API Key 与租户隔离、资源不足与释放后重新调度、双节点放置约束、本地优先创建与同 ID 并发收敛、心跳超时与恢复清理、Node Manager 进程重启、supervisor 停机清理。放置组检查实例亲和 OR、实例反亲和、加权与有序节点偏好、每个 OR 分支的 node_id 约束及反向实例反亲和，并比对实际节点归属。业务操作使用公共 SDK；管理查询、只读状态检查和受控故障注入用于验证内部结果，不替代真实调用链。
 
 容量组新增Metrics核对：实际抓取Master和两个Node Manager，验证满载实例数量/分配量、排队请求及删除后的释放，保存原始指标证据。
 
@@ -97,7 +97,7 @@ export PIP_CACHE_DIR=/your/cache/pip
 
 ### 接入状态
 
-`.buildkite/README.md` 保存端到端流程约定。基础流水线有三个独立步骤：`platform-build` 构建与交接发布包，`platform-images` 发布固定 digest 的节点／RRT 镜像，`platform-e2e` 部署 Kubernetes 并执行七组用例。运行阶段只使用这批制品，验证 commit、架构及 SHA256；七组场景和环境清理全部成功后才通过。当前正式验收及制品身份见本文顶部记录。
+`.buildkite/README.md` 保存端到端流程约定。基础流水线有三个独立步骤：`platform-build` 构建与交接发布包，`platform-images` 发布固定 digest 的节点／RRT 镜像，`platform-e2e` 部署 Kubernetes 并执行八组用例。运行阶段只使用这批制品，验证 commit、架构及 SHA256；八组场景和环境清理全部成功后才通过。当前正式验收及制品身份见本文顶部记录。
 
 本地组件测试继续用于每一步的测试驱动开发；同一套完整 E2E 驱动器也应支持在具备环境的本地机器上复现 Buildkite 失败。
 
@@ -158,3 +158,5 @@ Go 使用 Linux arm64 容器，其余使用 macOS arm64。完整平台尚未部�
 Master 存储阶段的契约与运行方法见 [Redis 持久化与恢复](master-storage.md)。`storage` 属于真实依赖的组件集成验证，不代表完整平台 E2E。
 
 组件日志采集验收复用现有 Edge/Node Proxy 指标端点，并通过真实 OpenTelemetry Collector 接收结构化组件日志。stop 组包含后端 503、文件滚动与 Collector 重启，控制台输出 `[METRICS PASS]` / `[COLLECTION PASS]`；产物含 `gateway-metrics-node*.json`、`collection-node*.json`、`collected-logs.jsonl` 和 `collector-process.log`。部署及保证边界见 `docs/testing/log-collection.md`。Trace 已纳入采集验收，输出 `[TRACE PASS]` 并保存 `traces-node*.json` 和 `collected-traces.jsonl`；正式结果见 [Buildkite #21](2026-09-17-observability-k8s.md)。
+
+新增 `local-first` 组需要当前源码构建的新制品；历史 Buildkite #24 的七组成功不覆盖该功能。源码接线和组件证据见 [本地优先创建](atomic-instance-claim.md)。

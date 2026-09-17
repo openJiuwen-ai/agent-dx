@@ -1,4 +1,5 @@
 //! Node RPC adaptation; InstanceHandle remains the lifecycle owner.
+mod local_create;
 use crate::{Durability, NodeManager, StateSink};
 use adx_core::{Error, InstanceRecord, Result};
 use adx_protocol::{
@@ -13,6 +14,12 @@ pub struct NodeRpc {
     manager: Arc<NodeManager>,
     peers: Peers,
     session_id: String,
+    master: Option<MasterStateSink>,
+    entry_locks: Arc<
+        std::sync::Mutex<
+            std::collections::BTreeMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>,
+        >,
+    >,
 }
 impl NodeRpc {
     #[allow(clippy::result_large_err)] // tonic transport status is shared by all RPC adapters.
@@ -39,11 +46,17 @@ impl NodeRpc {
         }
         Ok(handle)
     }
+    pub fn with_local_creation(mut self, master: MasterStateSink) -> Self {
+        self.master = Some(master);
+        self
+    }
     pub fn new(manager: Arc<NodeManager>, peers: Peers, session_id: String) -> Self {
         Self {
             manager,
             peers,
             session_id,
+            master: None,
+            entry_locks: Arc::default(),
         }
     }
 }
@@ -61,6 +74,21 @@ fn response(result: crate::OperationResult) -> Result<Response<pb::InstanceResul
 }
 #[tonic::async_trait]
 impl pb::node_service_server::NodeService for NodeRpc {
+    async fn create_local_instance(
+        &self,
+        request: Request<pb::LocalCreateRequest>,
+    ) -> std::result::Result<Response<pb::InstanceResult>, Status> {
+        let trace = adx_observability::trace::Trace::rpc("node.create_local_instance", &request);
+        if self.peers.authenticate(&request)? != Principal::ApiServer {
+            return Err(Status::permission_denied("API Server required"));
+        }
+        let service = self.clone();
+        let request = request.into_inner();
+        tokio::spawn(trace.run(async move { service.create_local(request).await }))
+            .await
+            .map_err(|_| Status::internal("local creation task failed"))?
+    }
+
     async fn recover_instance(
         &self,
         request: Request<pb::RecoverInstanceRequest>,

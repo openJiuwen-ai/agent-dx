@@ -208,6 +208,7 @@ impl NodeManager {
         if let Some(checkpoint) = &self.services.checkpoint {
             checkpoint.store.authorize_remote_gc(&retained).await?;
         }
+        self.local_holds.lock().unwrap().clear();
         *ready = true;
         Ok(())
     }

@@ -9,6 +9,10 @@ import public "credentials.proto";
 import public "routes.proto";
 
 service MasterService {
+  rpc WatchNodes(WatchNodesRequest) returns (stream NodeDirectory);
+  rpc PrepareCreate(LocalCreateRequest) returns (PreparedCreate);
+  rpc ClaimInstance(ClaimInstanceRequest) returns (ClaimInstanceResponse);
+  rpc ForwardCreate(LocalCreateRequest) returns (InstanceResult);
   rpc RegisterNode(RegisterNodeRequest) returns (RegisterNodeResponse);
   rpc InspectNode(InspectNodeRequest) returns (InspectNodeResponse);
   rpc CreateInstance(CreateInstanceRequest) returns (InstanceResult);
@@ -19,6 +23,7 @@ service MasterService {
 }
 
 service NodeService {
+  rpc CreateLocalInstance(LocalCreateRequest) returns (InstanceResult);
   rpc RecoverInstance(RecoverInstanceRequest) returns (InstanceResult);
   // Master verifies the process currently serving an already registered address
   // before accepting a pre-timeout process replacement. Available during reconciliation.
@@ -81,3 +86,18 @@ message PauseInstanceRequest { Assignment assignment = 1; CallerContext caller =
 message ResumeInstanceRequest { Assignment assignment = 1; CallerContext caller = 2; string operation_id = 3; uint64 expected_revision = 4; }
 
 
+
+// Node-local entry discovery. Every frame is a complete, bounded-lifetime view.
+message WatchNodesRequest {}
+message NodeEndpoint { string node_id = 1; string address = 2; string session_id = 3; }
+message NodeDirectory { uint64 epoch = 1; repeated NodeEndpoint nodes = 2; uint64 valid_for_millis = 3; }
+message LocalCreateRequest { CreateInstanceRequest create = 1; string node_session_id = 2; }
+message PreparedCreate { InstanceSpec spec = 1; ReusableSnapshot snapshot = 2; }
+message ClaimInstanceRequest { InstanceSpec spec = 1; CallerContext caller = 2; string node_session_id = 3; repeated DeviceAllocation devices = 4; }
+message ClaimInstanceResponse {
+  oneof outcome {
+    StartAssignedInstanceRequest owned = 1;
+    GetInstanceResponse existing = 2;
+    bool fallback = 3; // Definitive no-write result; safe to release this attempt's hold.
+  }
+}

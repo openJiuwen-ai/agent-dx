@@ -16,7 +16,7 @@ import time
 import uuid
 import xml.etree.ElementTree as ET
 
-REQUIRED = {'sdk','auth','capacity','placement','node-failure','restart','stop'}
+REQUIRED = {'sdk','auth','capacity','placement','local-first','node-failure','restart','stop'}
 
 def sha(path):
     h=hashlib.sha256()
@@ -190,6 +190,13 @@ class Run:
             with self.case(scenario, checks):
                 self.execute('node1','/opt/adx/client/bin/python','-u','/opt/adx/e2e/scenarios.py',scenario,timeout=400)
                 for node in self.nodes:self.helper(node,'empty',node)
+        with self.case('local-first', checks):
+            self.helper('node1','create-mode','local_first')
+            try:
+                self.execute('node1','/opt/adx/client/bin/python','-u','/opt/adx/e2e/scenarios.py','local-first',timeout=600)
+                for node in self.nodes:self.helper(node,'empty',node)
+            finally:
+                self.helper('node1','create-mode','central')
         with self.case('node-failure', checks):
             self.execute('node1','/opt/adx/client/bin/python','-u','/opt/adx/e2e/scenarios.py','create',timeout=300)
             try:

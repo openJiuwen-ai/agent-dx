@@ -24,6 +24,8 @@
 
 创建：Master 先持久化 Assignment，再由 Node Manager 本机准入、启动 sandboxd、确认 RRT 就绪和本机绑定，最后提交 Running。普通已有实例操作从 API Server 归属缓存直达节点，无需预先向 Master 登记每次操作意图。
 
+可配置 `create_mode: "local_first"`：API Server 订阅可用节点并轮转入口，Node Manager 用同一 Admission 暂留标量资源和整卡，再由 Master 验证硬约束、CAS 确认归属并同步内存账本后启动。本地不满足时保留同 ID 回退 ShardScheduler。Pack/Spread、软评分和队列公平性仅适用于中心路径；默认仍为 `central`。并发、暂留释放和结果未知契约见 [本地优先与原子归属](atomic-instance-claim.md)。
+
 暂停：节点完成 checkpoint、确认旧执行删除、保存制品，再经 Master 提交 Paused 和恢复点。对象存储成功要求上传完成。恢复：公开 resume 直达所属节点重新准入和恢复，完成 RRT/绑定后提交 Running；共享 checkpoint 的故障跨节点恢复由 Master 协调新归属。删除先退役本机绑定、确认后端删除，再释放资源和提交结果。
 
 `StateSink` 返回 Published 表示 Master 已提交 Redis；Journaled 表示结果只进入 SQLite 降级日志。后者不发布集群路由，API Server 不返回集群生命周期成功。Master 恢复后去重补写；Node Manager 重启而 Master 不可用时只观察，等待权威对账。详见 [节点生命周期](node-lifecycle.md)、[暂停恢复](instance-checkpoint.md) 和 [存储](snapshot-storage.md)。
@@ -38,6 +40,7 @@
 
 ## 验收与剩余范围
 
+- 本地优先创建链路已通过真实 Redis/mTLS/HTTPS 与新制品本地双节点8组验收，见 [报告](2026-09-17-local-first-e2e.md)；正式K8s仍待执行，不能沿用下列历史成功。
 - 最新正式基础 K8s：[Buildkite #24](2026-09-17-rust-api-server-k8s.md)，测试提交 `385b698043f0b62fac943a43da3de17bf59f6441`，七组及清理通过，包含资源 Metrics、日志滚动/采集和跨组件 Trace。两个 Pod 位于同一宿主。
 - 本地 FC：暂停/恢复、S3、SQLite 降级、快照与跨节点恢复分别有真实验收，见 [路线图](control-plane-roadmap.md)。后续双克隆运行暴露网络问题，不能只引用较早成功批次宣称已解决。
 - 本期未完成：FC 双克隆网络、GPU/NPU 实卡验收、真实服务混合负载与长稳。

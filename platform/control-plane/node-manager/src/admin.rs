@@ -18,6 +18,11 @@ impl NodeManager {
                 "authoritative node reconciliation required before cleanup".into(),
             ));
         }
+        if !self.local_holds.lock().unwrap().is_empty() {
+            return Err(Error::Unavailable(
+                "unconfirmed local claims require reconciliation before drain".into(),
+            ));
+        }
         self.draining.store(true, Ordering::Release);
         self.set_maintenance(true);
         *ready = false;

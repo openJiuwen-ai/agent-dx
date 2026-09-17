@@ -11,10 +11,19 @@ pub struct Discovery {
 fn poll() -> u64 {
     2
 }
+#[derive(Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CreateMode {
+    #[default]
+    Central,
+    LocalFirst,
+}
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub listen: SocketAddr,
+    #[serde(default)]
+    pub create_mode: CreateMode,
     #[serde(default)]
     pub loopback_http: bool,
     #[serde(default)]

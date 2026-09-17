@@ -33,7 +33,7 @@ fn node(id: &str, capacity: u64) -> Node {
             disk_bytes: 10000,
         },
         available: true,
-        labels: Default::default(),
+        labels: [("NODE_ID".into(), id.into())].into(),
         devices: vec![],
     }
 }
@@ -157,4 +157,56 @@ fn unschedulable_tenant_does_not_block_a_fitting_other_tenant() {
     master.submit(spec("b", "tenant-b", 0)).unwrap();
     assert_eq!(master.schedule(0).unwrap().unwrap().instance_id, "b");
     assert!(master.schedule(0).unwrap().is_none());
+}
+
+#[test]
+fn locally_claimed_owner_updates_capacity_queue_and_generation_exactly_once() {
+    use adx_core::Assignment;
+    let mut master = Master::new(1, Placement::Spread).unwrap();
+    master.register(node("n1", 1)).unwrap();
+    master.register(node("n2", 1)).unwrap();
+    let local = spec("local", "t", 0);
+    master.submit(local.clone()).unwrap(); // A concurrent center request is already queued.
+    let assignment = Assignment {
+        instance_id: "local".into(),
+        node_id: "n1".into(),
+        shard_id: 0,
+        generation: 77,
+        devices: vec![],
+    };
+    master.accept_claim(&local, &assignment).unwrap();
+    master.accept_claim(&local, &assignment).unwrap();
+    assert_eq!(master.pending(0).unwrap(), 0);
+    master.submit(spec("next", "t", 0)).unwrap();
+    let next = master.schedule(0).unwrap().unwrap();
+    assert_eq!(next.node_id, "n2");
+    assert_eq!(next.generation, 78);
+    master.release(&assignment).unwrap();
+    assert_eq!(master.snapshot().instances().len(), 1);
+}
+
+#[test]
+fn local_candidate_obeys_hard_constraints_and_occupancy_without_global_score() {
+    use adx_core::scheduling::LabelSelector;
+    let mut master = Master::new(1, Placement::Pack).unwrap();
+    master.register(node("n1", 1)).unwrap();
+    master.register(node("n2", 2)).unwrap();
+    let mut request = spec("local", "t", 0);
+    request.scheduling.required_node = vec![LabelSelector {
+        match_labels: [("NODE_ID".into(), "n2".into())].into(),
+        ..Default::default()
+    }];
+    assert!(!master.local_candidate(&request, "n1", &[]).unwrap());
+    assert!(master.local_candidate(&request, "n2", &[]).unwrap());
+    let assignment = adx_core::Assignment {
+        instance_id: request.id.clone(),
+        node_id: "n2".into(),
+        shard_id: 0,
+        generation: 1,
+        devices: vec![],
+    };
+    master.accept_claim(&request, &assignment).unwrap();
+    let mut too_large = spec("other", "t", 0);
+    too_large.resources.cpu_millis = 2;
+    assert!(!master.local_candidate(&too_large, "n2", &[]).unwrap());
 }

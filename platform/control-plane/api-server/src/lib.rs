@@ -6,3 +6,5 @@ pub mod contract;
 pub mod http;
 pub mod operations;
 pub mod ownership;
+
+mod directory;

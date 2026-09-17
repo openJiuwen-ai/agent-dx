@@ -554,3 +554,132 @@ async fn accepted_instance_operations_keep_request_context_after_caller_cancella
         );
     }
 }
+
+#[tokio::test]
+async fn local_reservations_share_one_hold_and_transfer_to_one_controller() {
+    let deps = Dependencies::new(false);
+    let manager = Arc::new(node(&deps));
+    let a = manager.reserve_local(&spec("a")).unwrap();
+    let b = manager.reserve_local(&spec("a")).unwrap();
+    assert_eq!(a.token, b.token);
+    assert_eq!(manager.used(), resources());
+    assert_eq!(
+        manager.reserve_local(&spec("b")).unwrap_err(),
+        Error::NoCapacity
+    );
+    let x = manager.instance(spec("a"), assignment("a")).unwrap();
+    let y = manager.instance(spec("a"), assignment("a")).unwrap();
+    // A delayed losing/retry path must never release a transferred runtime hold.
+    manager.release_local("a", &a).unwrap();
+    let (x, y) = tokio::join!(x.create(), y.create());
+    assert_eq!(x.unwrap(), y.unwrap());
+    assert_eq!(manager.used(), resources());
+    assert_eq!(
+        deps.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| *e == "start")
+            .count(),
+        1
+    );
+    manager
+        .instance(spec("a"), assignment("a"))
+        .unwrap()
+        .delete()
+        .await
+        .unwrap();
+    assert_eq!(manager.used(), Resources::default());
+}
+
+#[tokio::test]
+async fn losing_attempt_releases_only_its_token_and_partial_device_reservation_is_atomic() {
+    use adx_core::scheduling::{DeviceKind, DeviceRequest};
+    let deps = Dependencies::new(false);
+    let manager = node(&deps);
+    let mut bad = spec("a");
+    bad.scheduling.devices = vec![DeviceRequest {
+        kind: DeviceKind::Gpu,
+        model: None,
+        count: 1,
+    }];
+    assert!(manager.reserve_local(&bad).is_err());
+    assert_eq!(manager.used(), Resources::default());
+    let a = manager.reserve_local(&spec("a")).unwrap();
+    manager.release_local("a", &a).unwrap();
+    let b = manager.reserve_local(&spec("a")).unwrap();
+    assert_ne!(a.token, b.token);
+    manager.release_local("a", &a).unwrap();
+    assert_eq!(manager.used(), resources());
+    let mut other = spec("a");
+    other.tenant_id = "other".into();
+    assert_eq!(manager.reserve_local(&other).unwrap_err(), Error::Conflict);
+    assert_eq!(manager.used(), resources());
+    manager.release_local("a", &b).unwrap();
+    assert_eq!(manager.used(), Resources::default());
+}
+
+#[tokio::test]
+async fn local_gpu_npu_tokens_transfer_and_stale_release_cannot_free_cards() {
+    use adx_core::scheduling::*;
+    let deps = Dependencies::new(false);
+    let manager = node(&deps);
+    manager
+        .update_capacity(
+            Resources {
+                cpu_millis: 100,
+                memory_bytes: 10240,
+                disk_bytes: 10240,
+            },
+            Duration::from_secs(30),
+        )
+        .unwrap();
+    let cards = vec![
+        Device {
+            id: 0,
+            kind: DeviceKind::Gpu,
+            model: "gpu".into(),
+            healthy: true,
+        },
+        Device {
+            id: 1,
+            kind: DeviceKind::Npu,
+            model: "npu".into(),
+            healthy: true,
+        },
+    ];
+    manager
+        .update_devices(cards, Duration::from_secs(30))
+        .unwrap();
+    let mut requested = spec("cards");
+    requested.scheduling.devices = vec![
+        DeviceRequest {
+            kind: DeviceKind::Gpu,
+            model: None,
+            count: 1,
+        },
+        DeviceRequest {
+            kind: DeviceKind::Npu,
+            model: None,
+            count: 1,
+        },
+    ];
+    let token = manager.reserve_local(&requested).unwrap();
+    assert_eq!(token.devices.len(), 2);
+    let mut assigned = assignment("cards");
+    assigned.devices = token.devices.clone();
+    let instance = manager.instance(requested.clone(), assigned).unwrap();
+    instance.create().await.unwrap();
+    manager.release_local("cards", &token).unwrap();
+    requested.id = "other".into();
+    assert_eq!(
+        manager.reserve_local(&requested).unwrap_err(),
+        Error::NoCapacity
+    );
+    assert_eq!(manager.used(), resources());
+    instance.delete().await.unwrap();
+    let next = manager.reserve_local(&requested).unwrap();
+    assert_eq!(next.devices, token.devices);
+    manager.release_local("other", &next).unwrap();
+    assert_eq!(manager.used(), Resources::default());
+}

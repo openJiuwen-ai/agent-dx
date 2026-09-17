@@ -1,5 +1,7 @@
 //! Single-Master Redis persistence. Lua only compares opaque bytes and performs
 //! atomic hash writes; JSON and u64 counters are validated in Rust, never Lua doubles.
+mod claims;
+pub use claims::{ClaimOutcome, LocalClaim};
 mod credentials;
 mod failure;
 mod recovery;

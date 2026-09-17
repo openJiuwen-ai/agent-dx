@@ -54,6 +54,10 @@ Local Docker reproduction requires access to the same bind-mounted paths as the 
   instance anti-affinity, weighted and ordered node preferences, node ID
   constraints on every OR branch, and reverse instance anti-affinity; verify
   actual assignments, execute a command and check physical cleanup.
+- `local-first`: restart API Server with `create_mode: "local_first"`, verify
+  entry-node rotation, concurrent same-name creation converging to one Instance,
+  conflicting specifications rejected, real RRT commands, and physical cleanup.
+  Require Master local-claim logs, then restore the central deployment mode.
 - `node-failure`: suspend node2 Node Manager heartbeats while its runtime remains
   independently hosted; require persisted invalidation, resume the same process,
   require backend cleanup before readiness, and prove node1 remains executable.

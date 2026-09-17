@@ -2014,13 +2014,14 @@ async fn snapshot_gc_waits_for_node_ack_and_recovers_from_lost_ack() {
         )
         .with_checkpointing(store.clone(), Arc::new(LocalChecks))
         .unwrap()
-        .with_snapshot_catalog(sink)
+        .with_snapshot_catalog(sink.clone())
         .unwrap(),
     );
     manager
         .update_capacity(spec("i").resources, Duration::from_secs(60))
         .unwrap();
-    let node = NodeRpc::new(manager.clone(), peers(), "gc-boot".into());
+    let node = NodeRpc::new(manager.clone(), peers(), "gc-boot".into())
+        .with_local_creation((*sink).clone());
     let nl = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let na = nl.local_addr().unwrap();
     servers.0.push(tokio::spawn(async move {
@@ -2193,8 +2194,11 @@ async fn snapshot_gc_waits_for_node_ack_and_recovers_from_lost_ack() {
         api.create_instance(denied).await.unwrap_err().code(),
         tonic::Code::InvalidArgument
     );
-    let created = api
-        .create_instance(request.clone())
+    let created = frontend
+        .create_local_instance(pb::LocalCreateRequest {
+            create: Some(request.clone()),
+            node_session_id: "gc-boot".into(),
+        })
         .await
         .unwrap()
         .into_inner()
@@ -2236,6 +2240,19 @@ async fn snapshot_gc_waits_for_node_ack_and_recovers_from_lost_ack() {
     assert!(!std::path::Path::new(&reusable.artifact.as_ref().unwrap().location).exists());
     assert!(std::path::Path::new(&clone_artifact.location).exists());
     // Retry a completed create even after its source was collected.
+    assert_eq!(
+        frontend
+            .create_local_instance(pb::LocalCreateRequest {
+                create: Some(request.clone()),
+                node_session_id: "gc-boot".into(),
+            })
+            .await
+            .unwrap()
+            .into_inner()
+            .record
+            .unwrap(),
+        created
+    );
     assert_eq!(
         api.create_instance(request)
             .await
@@ -2662,3 +2679,6 @@ async fn shared_checkpoint_moves_to_new_node_and_old_node_cleans_without_deletin
     assert_eq!(returned.collect_remote_orphans().await.unwrap(), 0);
     assert!(returned_store.materialize(&artifact).await.is_ok());
 }
+
+#[path = "rpc/local_first.rs"]
+mod local_first;

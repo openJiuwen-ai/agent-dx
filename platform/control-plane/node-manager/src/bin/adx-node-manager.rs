@@ -269,10 +269,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         reconciling: true,
     };
     // Bind before registration so dispatch cannot race an unbound address.
+    let node_rpc = NodeRpc::new(manager.clone(), peers, session_id.clone())
+        .with_local_creation((*sink).clone());
+    let claim_retries = async {
+        let mut interval = tokio::time::interval(Duration::from_secs(c.report_interval_seconds));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            node_rpc.retry_local_claims().await;
+        }
+    };
     let server = tonic::transport::Server::builder()
         .tls_config(server_tls)?
         .add_service(pb::node_service_server::NodeServiceServer::new(
-            NodeRpc::new(manager.clone(), peers, session_id.clone()),
+            node_rpc.clone(),
         ))
         .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener));
     tokio::pin!(server);
@@ -508,7 +518,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             None => std::future::pending::<adx_core::Result<()>>().await,
         }
     };
-    tokio::select! {r=proxy_failure=>r?,r=&mut server=>r?,r=report=>r?,r=metrics=>r?,_=monitoring=>{},_=expiry=>{},r=admin=>r.map_err(|e| -> Box<dyn std::error::Error> { e })?,_=shutdown()=>{}}
+    tokio::select! {r=proxy_failure=>r?,r=&mut server=>r?,r=report=>r?,r=metrics=>r?,_=claim_retries=>{},_=monitoring=>{},_=expiry=>{},r=admin=>r.map_err(|e| -> Box<dyn std::error::Error> { e })?,_=shutdown()=>{}}
     if let Some(proxy) = embedded {
         proxy.shutdown().await?;
     }

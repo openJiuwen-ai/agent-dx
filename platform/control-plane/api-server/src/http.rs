@@ -320,20 +320,22 @@ impl Api {
         {
             let mut names = self.names.lock().await;
             if let Some(existing) = names.get(&op.spec.id) {
-                if existing != &key {
+                if existing != &key
+                    && self.clients.config.create_mode == crate::config::CreateMode::Central
+                {
                     return Err(Status::already_exists("instance create in progress"));
                 }
             }
             names.insert(op.spec.id.clone(), key.clone());
         }
         let result=async{
-   match self.clients.owner(&op.spec.id,caller,true).await{
+   if self.clients.config.create_mode == crate::config::CreateMode::Central { match self.clients.owner(&op.spec.id,caller,true).await{
     Ok(_)=>return Err(Status::already_exists("instance already exists")),
     Err(e) if e.code()==Code::NotFound=>{},Err(e)=>return Err(e)
    }
-   let mut client=pb::master_service_client::MasterServiceClient::new(self.clients.master().await?);
+   }
    let budget=Duration::from_secs(contract::create_timeout(&input)?).min(self.clients.config.timeout());
-   let result=self.clients.rpc_with_timeout("api_server.create",budget,client.create_instance(trace::inject(pb::CreateInstanceRequest{spec:Some(op.spec.clone()),caller:Some(caller.clone())}))).await?;
+   let result=self.clients.create_instance(pb::CreateInstanceRequest{spec:Some(op.spec.clone()),caller:Some(caller.clone())},budget).await?;
    authorize(caller,result.record.as_ref())?;
    let r=result.record.unwrap();let got=r.spec.as_ref().unwrap();
    if r.state!=pb::InstanceState::Running as i32 || result.durability!=pb::Durability::Published as i32 || !matches_spec(&op.spec,got){return Err(Status::unavailable("create is not durably confirmed"));}
@@ -345,8 +347,13 @@ impl Api {
    Ok(value)
   }.await;
         self.names.lock().await.remove(&op.spec.id);
-        // Keep an uncertain result as such; it must never be retried with a newly generated ID.
-        op.result = Some(result.clone());
+        // An uncertain result is retryable only through this retained spec/ID.
+        if !result
+            .as_ref()
+            .is_err_and(|e| matches!(e.code(), Code::Unavailable | Code::DeadlineExceeded))
+        {
+            op.result = Some(result.clone());
+        }
         op.touched = Instant::now();
         result
     }

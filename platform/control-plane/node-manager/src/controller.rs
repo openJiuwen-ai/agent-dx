@@ -134,6 +134,7 @@ pub(crate) fn spawn(
     spec: InstanceSpec,
     assignment: Assignment,
     services: Arc<Services>,
+    held: bool,
 ) -> InstanceHandle {
     let runtime_id = format!("{}-{}", spec.id, assignment.generation);
     spawn_restored(
@@ -145,7 +146,7 @@ pub(crate) fn spawn(
             runtime_id,
             state: InstanceState::Pending,
             revision: 0,
-            resources_held: false,
+            resources_held: held,
             runtime_ip: None,
             checkpoint: None,
             last_operation: None,
@@ -438,11 +439,13 @@ impl Controller {
         } else {
             self.record.runtime_id.clone()
         };
-        self.services.admission.lock().unwrap().reserve(
-            &runtime_id,
-            &self.record.spec,
-            &self.record.assignment,
-        )?;
+        if !self.held || restart {
+            self.services.admission.lock().unwrap().reserve(
+                &runtime_id,
+                &self.record.spec,
+                &self.record.assignment,
+            )?;
+        }
         if restart {
             self.record.runtime_id = runtime_id;
             self.record.runtime_ip = None;

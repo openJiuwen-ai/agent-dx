@@ -1,3 +1,5 @@
+#[path = "storage/claims.rs"]
+mod claims;
 mod common;
 use adx_core::{Assignment, Error, InstanceRecord, InstanceSpec, InstanceState, Resources};
 use adx_master::{storage::StoredNode, Master, Node, Placement};

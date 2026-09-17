@@ -223,6 +223,65 @@ impl Master {
         Ok(shard)
     }
 
+    /// Apply a confirmed Redis owner before exposing it or scheduling further work.
+    /// Also removes an identical queued center request; replay never double charges.
+    pub fn accept_claim(&mut self, spec: &InstanceSpec, assignment: &Assignment) -> Result<()> {
+        spec.validate()?;
+        if assignment.instance_id != spec.id
+            || assignment.generation == 0
+            || self.node_shards.get(&assignment.node_id) != Some(&assignment.shard_id)
+        {
+            return Err(Error::Conflict);
+        }
+        if let Some((shard, existing)) = self.requests.get(&spec.id) {
+            if existing != spec {
+                return Err(Error::Conflict);
+            }
+            if let Some(old) = self.shards[*shard].assignment(&spec.id).cloned() {
+                if old == *assignment {
+                    self.generation = self.generation.max(assignment.generation);
+                    return Ok(());
+                }
+                self.release(&old)?;
+            }
+        }
+        for shard in &mut self.shards {
+            shard.forget_queued(&spec.id);
+        }
+        self.requests.remove(&spec.id);
+        self.restore_assignment(spec, assignment)?;
+        self.generation = self.generation.max(assignment.generation);
+        Ok(())
+    }
+    /// Apply an authoritative result that no longer holds resources. Includes
+    /// late commits first observed through a repeated ownership claim.
+    pub fn retire_claim(&mut self, id: &str) -> Result<()> {
+        let assignment = self
+            .requests
+            .get(id)
+            .and_then(|(shard, _)| self.shards[*shard].assignment(id))
+            .cloned();
+        if let Some(assignment) = assignment {
+            self.release(&assignment)?;
+        }
+        for shard in &mut self.shards {
+            shard.forget_queued(id);
+        }
+        self.requests.remove(id);
+        self.retired.insert(id.to_string());
+        Ok(())
+    }
+    pub fn local_candidate(
+        &self,
+        spec: &InstanceSpec,
+        node: &str,
+        devices: &[adx_core::scheduling::DeviceAllocation],
+    ) -> Result<bool> {
+        let Some(shard) = self.node_shards.get(node) else {
+            return Ok(false);
+        };
+        self.shards[*shard].local_candidate(spec, node, devices, &self.snapshot)
+    }
     pub fn snapshot(&self) -> Arc<Snapshot> {
         self.snapshot.clone()
     }

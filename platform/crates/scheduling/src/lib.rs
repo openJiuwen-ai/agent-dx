@@ -129,15 +129,23 @@ impl Framework {
             && request.scheduling == Default::default()
             && !snapshot.has_reverse_anti_affinity()
     }
+    /// Hard rules only; local-first admission intentionally skips all scoring.
+    pub fn allows(&self, request: &InstanceSpec, candidate: &Candidate<'_>) -> Result<bool> {
+        request.validate()?;
+        for filter in &self.filters {
+            if !filter.filter(request, candidate)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
     pub fn evaluate(
         &self,
         request: &InstanceSpec,
         candidate: &Candidate<'_>,
     ) -> Result<Option<u64>> {
-        for filter in &self.filters {
-            if !filter.filter(request, candidate)? {
-                return Ok(None);
-            }
+        if !self.allows(request, candidate)? {
+            return Ok(None);
         }
         let mut total = 0;
         for score in &self.scores {

@@ -15,6 +15,7 @@ use tonic::{
 
 pub struct Clients {
     pub config: Config,
+    directory: Mutex<crate::directory::Directory>,
     tls: ClientTlsConfig,
     discovery: Option<adx_discovery::RedisDiscovery>,
     endpoint: Mutex<Cache<(), String>>,
@@ -40,15 +41,97 @@ impl Clients {
             })
             .transpose()?;
         let limit = config.cache_entries;
-        Ok(Arc::new(Self {
+        let clients = Arc::new(Self {
             config,
+            directory: Mutex::default(),
             tls,
             discovery,
             endpoint: Mutex::new(Cache::new(1)),
             channels: Mutex::new(Cache::new(limit)),
             auth: Mutex::new(Cache::new(limit)),
             owners: Mutex::new(Cache::new(limit)),
-        }))
+        });
+        if clients.config.create_mode == crate::config::CreateMode::LocalFirst {
+            let weak = Arc::downgrade(&clients);
+            tokio::spawn(async move {
+                while let Some(clients) = weak.upgrade() {
+                    let _ = clients.watch_directory().await;
+                    clients.directory.lock().await.clear();
+                    drop(clients);
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            });
+        }
+        Ok(clients)
+    }
+    async fn watch_directory(&self) -> Result<(), Status> {
+        let mut client = pb::master_service_client::MasterServiceClient::new(self.master().await?);
+        let mut stream = self
+            .rpc(
+                "api_server.watch_nodes",
+                client.watch_nodes(pb::WatchNodesRequest {}),
+            )
+            .await?;
+        loop {
+            let frame = tokio::time::timeout(Duration::from_secs(5), stream.message())
+                .await
+                .map_err(|_| Status::unavailable("node directory expired"))??
+                .ok_or_else(|| Status::unavailable("node directory closed"))?;
+            self.directory.lock().await.update(frame)?;
+        }
+    }
+    pub async fn create_instance(
+        &self,
+        request: pb::CreateInstanceRequest,
+        budget: Duration,
+    ) -> Result<pb::InstanceResult, Status> {
+        if self.config.create_mode == crate::config::CreateMode::LocalFirst {
+            let node = self.directory.lock().await.select();
+            if let Some(node) = node {
+                let mut client = pb::node_service_client::NodeServiceClient::new(
+                    self.channel(&node.address).await?,
+                );
+                let result = self
+                    .rpc_with_timeout(
+                        "api_server.create_local",
+                        budget / 2,
+                        client.create_local_instance(trace::inject(pb::LocalCreateRequest {
+                            create: Some(request.clone()),
+                            node_session_id: node.session_id,
+                        })),
+                    )
+                    .await;
+                match result {
+                    Ok(result) => return Ok(result),
+                    Err(e)
+                        if matches!(
+                            e.code(),
+                            tonic::Code::Unavailable
+                                | tonic::Code::DeadlineExceeded
+                                | tonic::Code::FailedPrecondition
+                        ) => {}
+                    Err(e) => return Err(e),
+                }
+                // Same identity/specification. Master serializes this against
+                // any in-flight claim; NotFound never licenses a replacement ID.
+                let mut client =
+                    pb::master_service_client::MasterServiceClient::new(self.master().await?);
+                return self
+                    .rpc_with_timeout(
+                        "api_server.create",
+                        budget / 2,
+                        client.create_instance(trace::inject(request)),
+                    )
+                    .await;
+            }
+        }
+        let mut client = pb::master_service_client::MasterServiceClient::new(self.master().await?);
+        self.rpc_with_timeout(
+            "api_server.create",
+            budget,
+            client.create_instance(trace::inject(request)),
+        )
+        .await
     }
     pub async fn master(&self) -> Result<Channel, Status> {
         let address = if let Some(discovery) = &self.discovery {

@@ -24,12 +24,17 @@ class AcceptanceGateTests(unittest.TestCase):
         self.assertEqual(driver.finish_report(None, [], ['sdk'])['status'], 'failed')
 
     def test_complete_clean_run_passes(self):
-        self.assertEqual(driver.finish_report(None, [], ['sdk', 'auth', 'capacity', 'placement', 'node-failure', 'restart', 'stop'])['status'], 'passed')
+        self.assertEqual(driver.finish_report(None, [], ['sdk', 'auth', 'capacity', 'placement', 'local-first', 'node-failure', 'restart', 'stop'])['status'], 'passed')
 
     def test_missing_node_failure_scenario_cannot_pass(self):
-        report = driver.finish_report(None, [], ['sdk', 'auth', 'capacity', 'placement', 'restart', 'stop'])
+        report = driver.finish_report(None, [], ['sdk', 'auth', 'capacity', 'placement', 'local-first', 'restart', 'stop'])
         self.assertEqual(report['status'], 'failed')
         self.assertEqual(report['missing_checks'], ['node-failure'])
+
+    def test_old_seven_scenarios_without_local_first_cannot_pass(self):
+        report = driver.finish_report(None, [], ['sdk', 'auth', 'capacity', 'placement', 'node-failure', 'restart', 'stop'])
+        self.assertEqual(report['status'], 'failed')
+        self.assertEqual(report['missing_checks'], ['local-first'])
 
     def test_old_five_scenarios_without_placement_cannot_pass(self):
         report = driver.finish_report(None, [], ['sdk', 'auth', 'capacity', 'restart', 'stop'])

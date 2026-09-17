@@ -4,6 +4,8 @@ pub mod activity;
 pub mod admin;
 pub mod checkpoint;
 mod controller;
+mod local;
+pub use local::LocalReservation;
 pub mod journal;
 pub mod metrics;
 pub mod proxy;
@@ -214,6 +216,7 @@ pub(crate) struct Services {
 
 pub struct NodeManager {
     node_id: String,
+    local_holds: Mutex<BTreeMap<String, local::LocalHold>>,
     draining: std::sync::atomic::AtomicBool,
     lifecycle_ready: tokio::sync::RwLock<bool>,
     retired_generations: Mutex<BTreeMap<String, u64>>,
@@ -231,6 +234,7 @@ impl NodeManager {
     ) -> Self {
         Self {
             node_id,
+            local_holds: Mutex::default(),
             draining: std::sync::atomic::AtomicBool::new(false),
             lifecycle_ready: tokio::sync::RwLock::new(true),
             retired_generations: Mutex::default(),
@@ -395,7 +399,13 @@ impl NodeManager {
             };
         }
         // The registry lock makes controller creation atomic across concurrent callers.
-        let handle = controller::spawn(spec.clone(), assignment.clone(), self.services.clone());
+        let held = self.adopt_local(&spec, &assignment)?;
+        let handle = controller::spawn(
+            spec.clone(),
+            assignment.clone(),
+            self.services.clone(),
+            held,
+        );
         instances.insert(spec.id.clone(), (spec, assignment, handle.clone()));
         Ok(handle)
     }

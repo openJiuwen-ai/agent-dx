@@ -72,3 +72,12 @@ Rust 重写已通过 [Buildkite #24](2026-09-17-rust-api-server-k8s.md) 独立K8
 Go 测试／构建使用 Linux ARM64 Go 1.25.5 容器，交叉编译 macOS ARM64 API 二进制；RPC、独立 Master 进程与 Redis 7.2.5 在 macOS ARM64 运行。Node Manager 入口通过编译和静态检查，未用真实 sandboxd 启动完整节点。`source-manifest.json` 保存源码和可执行文件 SHA256；最终 RPC 结果另包含 API 与 Redis 二进制摘要。基准提交为 `1e49d86f2123173a8f5358182ca294fab9a9b1e4`，验证对象是其上的未提交工作树。
 
 `integration-complete/frontend-http.log`、`sandbox-api.log`、`master-process-0.log` 和 `master-process-1.log` 分别保存跨语言断言、API 进程以及 Master 首次启动／重启证据。普通 Rust 回归中的忽略用例不算通过；对应真实入口分别实际执行上述 2 项 RPC 和 6 项 Redis 测试。
+
+
+## 创建入口模式
+
+API Server 的 `create_mode` 默认 `central`；配置为 `local_first` 后，订阅 Master 的可用节点目录并轮转选择 Node Manager。
+本地资源和硬约束满足时通过原子 claim 创建；否则保持同 Instance ID 进入 ShardScheduler。
+本地成功不经过 Pack/Spread、软偏好评分或中心队列。相同规格的同 ID 创建收敛，规格/租户变化返回冲突。
+入口超时使用同身份向 Master 重试；不会把一次缺失查询当作重新生成 ID 的许可。
+目录有效期、mTLS、暂留资源和验收范围见 [创建契约](atomic-instance-claim.md)。

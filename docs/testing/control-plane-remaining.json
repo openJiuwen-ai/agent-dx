@@ -110,5 +110,13 @@
     "status": "complete",
     "detail": "Rust API Server、Shard命名与直接Instance RPC已完成；本地回归及Buildkite #24基础K8s七组通过，发布包/镜像身份一致，日志、Trace、Metrics与清理均通过。",
     "gate": "删除旧 Go/legacy 适配后，契约测试、完整回归和基础 K8s 七组验收通过。"
+  },
+  {
+    "id": "local-first-create",
+    "title": "本地优先创建：正式K8s验收",
+    "stage": "11",
+    "status": "pending",
+    "detail": "组件、Redis、RPC/HTTPS及Clippy通过；当前release制品本地真实sandboxd/runc/RRT双节点8组通过，清理无残留。本地验收使用工作树release制品，正式K8s未执行。",
+    "gate": "从已提交代码构建正式制品，运行K8s基础8组（含local-first），核对唯一归属、命令、删除、claim日志与清理。"
   }
 ]

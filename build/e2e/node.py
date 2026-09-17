@@ -105,6 +105,32 @@ def main():
                 break
             if time.monotonic()>end:raise TimeoutError('expired execution was not invalidated')
             time.sleep(.5)
+    elif action=='create-mode':
+        assert node in ('central','local_first')
+        current=supervisor('status')
+        api=next(s for s in current['services'] if s['role']=='api-server')
+        pid=api['pid'];assert pid
+        args=Path(f'/proc/{pid}/cmdline').read_bytes().decode().split('\0')
+        path=Path(args[args.index('--config')+1])
+        assert path.resolve().is_relative_to((P/'state').resolve()), path
+        config=json.loads(path.read_text());config['create_mode']=node
+        temporary=path.with_suffix('.new');temporary.write_text(json.dumps(config));temporary.chmod(0o600)
+        temporary.replace(path)
+        os.kill(pid,signal.SIGTERM)
+        end=time.monotonic()+30
+        while True:
+            api=next(s for s in supervisor('status')['services'] if s['role']=='api-server')
+            if api['pid'] and api['pid']!=pid:
+                import urllib.request, urllib.error
+                try: urllib.request.urlopen('http://127.0.0.1:8888/api/instances',timeout=1)
+                except urllib.error.HTTPError as error:
+                    if error.code==401:break
+                except (OSError,urllib.error.URLError):pass
+            if time.monotonic()>end:raise TimeoutError('API Server mode switch did not become ready')
+            time.sleep(.2)
+        time.sleep(1.2) # Receive the fresh full node directory before creating.
+        (E/f'create-mode-{node}.json').write_text(json.dumps({'mode':node,'previous_pid':pid,'pid':api['pid']}))
+        print('PASS API Server mode: '+node,flush=True)
     elif action=='restart':
         before=backend();assert len(before)==1
         (E/f'backend-before-{node}.json').write_text(json.dumps(before))

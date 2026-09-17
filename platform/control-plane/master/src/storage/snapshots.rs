@@ -3,10 +3,10 @@
 use super::*;
 use adx_core::snapshots::{Reference, Snapshot, SnapshotState};
 impl Session {
-    fn snapshots_key(&self) -> String {
+    pub(super) fn snapshots_key(&self) -> String {
         format!("{}:snapshots", self.store.key)
     }
-    async fn snapshot_raw(&self, id: &str) -> Result<Option<String>> {
+    pub(super) async fn snapshot_raw(&self, id: &str) -> Result<Option<String>> {
         self.header(&self.store.fields(&[HEADER.into()]).await?[0])?;
         let mut command = redis::cmd("HGET");
         command.arg(self.snapshots_key()).arg(id);

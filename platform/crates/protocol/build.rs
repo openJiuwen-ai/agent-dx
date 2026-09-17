@@ -12,6 +12,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("cargo:rerun-if-changed=../../api/proto/{file}");
     }
     tonic_build::configure()
+        .boxed(".adx.control.v1.ClaimInstanceResponse.outcome.owned")
+        .boxed(".adx.control.v1.ClaimInstanceResponse.outcome.existing")
         .compile_protos(&["../../api/proto/instance.proto"], &["../../api/proto"])?;
     println!("cargo:rerun-if-changed=../../api/proto/node.proto");
     tonic_build::configure()

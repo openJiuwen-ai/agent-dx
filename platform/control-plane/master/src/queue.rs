@@ -39,6 +39,15 @@ impl TenantQueue {
             .insert((Reverse(request.priority), entry.sequence), request);
         self.len += 1;
     }
+    pub(crate) fn remove(&mut self, id: &str) {
+        for queue in self.queues.values_mut() {
+            let before = queue.len();
+            queue.retain(|_, spec| spec.id != id);
+            self.len -= before - queue.len();
+        }
+        self.queues.retain(|_, q| !q.is_empty());
+        self.tenants.retain(|t| self.queues.contains_key(t));
+    }
     pub fn len(&self) -> usize {
         self.len
     }

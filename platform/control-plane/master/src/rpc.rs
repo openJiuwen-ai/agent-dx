@@ -1,4 +1,5 @@
 //! Async RPC coordination around the synchronous scheduler and Redis repository.
+mod claims;
 mod cloning;
 mod metrics;
 mod recovery;
@@ -38,6 +39,8 @@ struct State {
     instances: BTreeMap<String, StoredInstance>,
     nodes: BTreeMap<String, StoredNode>,
     needs_recovery: bool,
+    claim_recovery: bool,
+    placement: Placement,
     recovery_cursor: Option<String>,
     live: BTreeMap<String, LiveNode>,
     recovering: BTreeMap<String, tokio::time::Instant>,
@@ -142,6 +145,14 @@ impl State {
                     let fresh = self.session.get(&assignment.instance_id).await?;
                     self.instances.insert(assignment.instance_id.clone(), fresh);
                 }
+                Err(Error::Conflict) => {
+                    // Rebuild the whole precomputed round after a competing owner
+                    // or generation wins. Only uncommitted work is requeued.
+                    self.claim_recovery = true;
+                    self.needs_recovery = true;
+                    self.recover_claim_write().await?;
+                    return Ok(true);
+                }
                 Err(error) => {
                     self.needs_recovery = true;
                     return Err(error);
@@ -244,6 +255,8 @@ impl MasterRpc {
                 instances: saved.instances,
                 nodes: saved.nodes,
                 needs_recovery: false,
+                claim_recovery: false,
+                placement,
                 recovery_cursor: None,
                 live: BTreeMap::new(),
                 recovering,
@@ -259,6 +272,7 @@ impl MasterRpc {
     /// Invalidate expired executions and their routes before admitting a returning node.
     pub async fn expire_nodes(&self) -> Result<usize> {
         let mut state = self.0.state.lock().await;
+        state.recover_claim_write().await?;
         state.healthy()?;
         let ids: Vec<_> = state
             .nodes
@@ -315,6 +329,7 @@ impl MasterRpc {
             tokio::pin!(changed);
             changed.as_mut().enable();
             let mut state = self.0.state.lock().await;
+            state.recover_claim_write().await.map_err(status)?;
             state.healthy().map_err(status)?;
             if let Some(existing) = state.specs.get(&spec.id) {
                 if existing != &spec {
@@ -361,6 +376,11 @@ impl MasterRpc {
             if state.instances.contains_key(&spec.id) {
                 // Recheck storage session before using a cached assignment.
                 let stored = state.session.get(&spec.id).await.map_err(status)?;
+                if stored.invalidated || stored.recovery.as_ref().is_some_and(|r| r.pending) {
+                    return Err(Status::failed_precondition(
+                        "existing instance requires recovery/query",
+                    ));
+                }
                 if let Some(result) = stored.result {
                     if result.state != InstanceState::Running {
                         return Err(Status::failed_precondition(
@@ -421,10 +441,20 @@ impl MasterRpc {
                     spec: Some(spec.clone().into()),
                     assignment: Some(stored.assignment.clone().try_into().map_err(status)?),
                 };
-                let result = pb::node_service_client::NodeServiceClient::new(channel)
+                let result = match pb::node_service_client::NodeServiceClient::new(channel)
                     .create_instance(adx_observability::trace::inject(request))
-                    .await?
-                    .into_inner();
+                    .await
+                {
+                    Ok(result) => result.into_inner(),
+                    Err(error) if error.code() == tonic::Code::ResourceExhausted => {
+                        // A node can hold an as-yet unconfirmed local attempt.
+                        // Keep this confirmed owner; retry admission after that
+                        // attempt resolves, never allocate another generation.
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
                 let record: InstanceRecord = result
                     .record
                     .clone()
@@ -467,6 +497,7 @@ impl MasterRpc {
     }
     async fn commit(&self, record: InstanceRecord, session_id: String) -> Result<InstanceRecord> {
         let mut state = self.0.state.lock().await;
+        state.recover_claim_write().await?;
         state.healthy()?;
         let id = &record.assignment.node_id;
         if state.overdue(id, self.0.heartbeat_timeout) {
@@ -536,6 +567,105 @@ impl MasterRpc {
 }
 #[tonic::async_trait]
 impl pb::master_service_server::MasterService for MasterRpc {
+    type WatchNodesStream =
+        tokio_stream::wrappers::ReceiverStream<std::result::Result<pb::NodeDirectory, Status>>;
+    async fn watch_nodes(
+        &self,
+        request: Request<pb::WatchNodesRequest>,
+    ) -> std::result::Result<Response<Self::WatchNodesStream>, Status> {
+        if self.0.peers.authenticate(&request)? != Principal::ApiServer {
+            return Err(Status::permission_denied("API Server required"));
+        }
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let service = self.clone();
+        tokio::spawn(async move {
+            loop {
+                let frame = {
+                    let state = service.0.state.lock().await;
+                    state.healthy().map_err(status).map(|()| pb::NodeDirectory {
+                        epoch: state.session.epoch(),
+                        valid_for_millis: 2500,
+                        nodes: state
+                            .nodes
+                            .values()
+                            .filter(|n| {
+                                n.node.available
+                                    && n.session.as_ref().is_some_and(|session| {
+                                        state
+                                            .live_claimant(
+                                                &n.node.id,
+                                                &session.id,
+                                                service.0.heartbeat_timeout,
+                                            )
+                                            .is_ok()
+                                    })
+                            })
+                            .map(|n| pb::NodeEndpoint {
+                                node_id: n.node.id.clone(),
+                                address: n.address.clone(),
+                                session_id: n.session.as_ref().unwrap().id.clone(),
+                            })
+                            .collect(),
+                    })
+                };
+                let failed = frame.is_err();
+                if tx.send(frame).await.is_err() || failed {
+                    break;
+                }
+                tokio::select! { _ = tx.closed() => break, _ = tokio::time::sleep(Duration::from_secs(1)) => (), _ = service.0.changed.notified() => () }
+            }
+        });
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            rx,
+        )))
+    }
+    async fn prepare_create(
+        &self,
+        request: Request<pb::LocalCreateRequest>,
+    ) -> std::result::Result<Response<pb::PreparedCreate>, Status> {
+        let Principal::Node(node) = self.0.peers.authenticate(&request)? else {
+            return Err(Status::permission_denied("Node Manager required"));
+        };
+        self.prepare_local(&node, request.into_inner())
+            .await
+            .map(Response::new)
+    }
+    async fn claim_instance(
+        &self,
+        request: Request<pb::ClaimInstanceRequest>,
+    ) -> std::result::Result<Response<pb::ClaimInstanceResponse>, Status> {
+        let trace = adx_observability::trace::Trace::rpc("master.claim_instance", &request);
+        let Principal::Node(node) = self.0.peers.authenticate(&request)? else {
+            return Err(Status::permission_denied("Node Manager required"));
+        };
+        let service = self.clone();
+        let request = request.into_inner();
+        tokio::spawn(
+            trace.run(async move { service.claim_local(node, request).await.map(Response::new) }),
+        )
+        .await
+        .map_err(|_| Status::internal("claim task failed"))?
+    }
+    async fn forward_create(
+        &self,
+        request: Request<pb::LocalCreateRequest>,
+    ) -> std::result::Result<Response<pb::InstanceResult>, Status> {
+        let trace = adx_observability::trace::Trace::rpc("master.forward_create", &request);
+        let Principal::Node(node) = self.0.peers.authenticate(&request)? else {
+            return Err(Status::permission_denied("Node Manager required"));
+        };
+        let prepared = self.prepare_local(&node, request.into_inner()).await?;
+        let spec = prepared
+            .spec
+            .ok_or_else(|| Status::internal("missing prepared spec"))?
+            .try_into()
+            .map_err(status)?;
+        let service = self.clone();
+        tokio::spawn(trace.run(async move { service.create(spec).await.map(Response::new) }))
+            .await
+            .map_err(|_| Status::internal("forwarded creation task failed"))?
+    }
+
     async fn inspect_node(
         &self,
         request: Request<pb::InspectNodeRequest>,
@@ -549,6 +679,7 @@ impl pb::master_service_server::MasterService for MasterRpc {
                     return Err(Status::permission_denied("node identity mismatch"));
                 }
                 let mut state = self.0.state.lock().await;
+                state.recover_claim_write().await.map_err(status)?;
                 state.healthy().map_err(status)?;
                 let live = state.live.get(&r.node_id).ok_or_else(|| {
                     Status::failed_precondition("register node before reconciliation")
@@ -647,6 +778,7 @@ impl pb::master_service_server::MasterService for MasterRpc {
                 tokio::spawn(async move {
                     let predecessor = service.replacement_predecessor(&r).await;
                     let mut state = service.0.state.lock().await;
+                    state.recover_claim_write().await.map_err(status)?;
                     state.healthy().map_err(status)?;
                     if state
                         .retired_sessions
@@ -769,7 +901,8 @@ impl pb::master_service_server::MasterService for MasterRpc {
                     .ok_or_else(|| Status::invalid_argument("spec required"))?;
                 tenant(r.caller.as_ref(), &raw.tenant_id)?;
                 let spec = {
-                    let state = self.0.state.lock().await;
+                    let mut state = self.0.state.lock().await;
+                    state.recover_claim_write().await.map_err(status)?;
                     state.healthy().map_err(status)?;
                     cloning::normalize(&state.session, raw)
                         .await

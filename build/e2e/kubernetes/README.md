@@ -59,6 +59,8 @@ Each scenario emits RUN, PASS/FAIL and elapsed time. Its child-process output is
 streamed without buffering, including SDK instance IDs, command/file assertions,
 authentication checks, capacity wait/resume, placement rules with expected/actual
 node assignments, and restart recovery checks.
-`case-results.json` retains per-case outcomes and duration; JUnit lists all seven
+`case-results.json` retains per-case outcomes and duration; JUnit lists all eight
 scenarios separately, with unexecuted scenarios marked skipped and cleanup
 reported independently. A failed command or timeout still fails the acceptance.
+
+The `local-first` case switches only API Server into local-first mode, checks SDK concurrent create/execute/delete and confirmed local-claim evidence, then restores central mode. This case requires newly built artifacts; earlier seven-case runs do not validate it.

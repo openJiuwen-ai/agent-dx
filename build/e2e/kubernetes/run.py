@@ -196,7 +196,7 @@ class KubernetesRun(common.Run):
 def write_junit(path, report):
     suite = ET.Element('testsuite', name='platform-kubernetes-e2e')
     records = {case['name']: case for case in report['cases']}
-    for name in ('sdk', 'auth', 'capacity', 'placement', 'node-failure', 'restart', 'stop'):
+    for name in ('sdk', 'auth', 'capacity', 'placement', 'local-first', 'node-failure', 'restart', 'stop'):
         record = records.get(name)
         case = ET.SubElement(suite, 'testcase', name=name, time=str(record['seconds'] if record else 0))
         if not record:
@@ -257,7 +257,7 @@ def main():
         run.event(f"[{'PASS' if case['status'] == 'passed' else 'FAIL'}] {case['name']} ({case['seconds']:.3f}s)")
     for name in report['missing_checks']:
         run.event('[NOT RUN] ' + name)
-    run.event(f"[RESULT] {report['status'].upper()}: {len(checks)}/5 cases passed; cleanup_errors={len(cleanup_errors)}")
+    run.event(f"[RESULT] {report['status'].upper()}: {len(checks)}/{len(common.REQUIRED)} cases passed; cleanup_errors={len(cleanup_errors)}")
     print(json.dumps(report), flush=True)
     return 0 if report['status'] == 'passed' else 1
 

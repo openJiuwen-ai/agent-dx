@@ -142,6 +142,44 @@ impl ShardScheduler {
         self.assigned.insert(spec.id.clone(), assignment.clone());
         Ok(())
     }
+    pub fn forget_queued(&mut self, id: &str) {
+        self.queue.remove(id);
+        self.deferred.remove(id);
+        self.excluded.remove(id);
+    }
+    pub fn assignment(&self, id: &str) -> Option<&Assignment> {
+        self.assigned.get(id)
+    }
+    pub fn local_candidate(
+        &self,
+        spec: &InstanceSpec,
+        node: &str,
+        devices: &[adx_core::scheduling::DeviceAllocation],
+        snapshot: &Snapshot,
+    ) -> Result<bool> {
+        let Some(state) = self.nodes.get(node) else {
+            return Ok(false);
+        };
+        let prepared = Prepared::new(spec, snapshot);
+        if !self.framework.allows(
+            spec,
+            &Candidate {
+                node: &state.node,
+                available: state.scalar.available(),
+                devices: &state.free_devices,
+                snapshot,
+                prepared: Some(&prepared),
+            },
+        )? {
+            return Ok(false);
+        }
+        let mut cards = state.devices.clone();
+        match cards.reserve(&spec.id, &spec.scheduling.devices, devices) {
+            Ok(()) => Ok(true),
+            Err(adx_core::Error::NoCapacity) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
     pub fn pending(&self) -> usize {
         self.queue.len() + self.deferred.len()
     }
