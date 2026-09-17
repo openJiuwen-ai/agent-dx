@@ -4,5 +4,6 @@
   "upstream": "https://github.com/open-telemetry/opentelemetry-collector-releases/releases/tag/v0.161.0",
   "platform_manifests": {
     "linux/amd64": "sha256:b5cf983651c32c3ca13f936deb51742015a54d121f388cac248923ddeb8cc9fc"
-  }
+  },
+  "ci_image": "swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/adx-e2e@sha256:b5cf983651c32c3ca13f936deb51742015a54d121f388cac248923ddeb8cc9fc"
 }

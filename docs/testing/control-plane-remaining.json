@@ -49,11 +49,11 @@
   },
   {
     "id": "ci-collector-download",
-    "title": "CI Collector区域缓存与正式采集验收",
+    "title": "CI Collector区域缓存",
     "stage": "8",
-    "status": "blocked",
-    "detail": "#19两次在镜像下载阶段超时；本地已验证上游amd64制品，但SWR认证为空且旧kubeconfig不存在，缓存上传未执行。",
-    "gate": "提供可用认证配置，完成同摘要Collector区域缓存后运行正式K8s日志和Trace采集验收。"
+    "status": "complete",
+    "detail": "Buildkite #20完成0.161.0 Linux AMD64镜像同步至西南二区SWR，原摘要推送及回拉通过；CI默认地址已切换。正式K8s日志和Trace验收仍在对应条目中跟踪。",
+    "gate": "按上游native manifest摘要同步，远端按摘要回拉通过，CI默认从SWR拉取。"
   },
   {
     "id": "log-rotation",
