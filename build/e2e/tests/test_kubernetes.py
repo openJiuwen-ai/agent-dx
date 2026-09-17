@@ -130,16 +130,33 @@ class HostPrerequisiteTests(unittest.TestCase):
     def test_missing_kernel_capabilities_fail_before_services_start(self):
         import tempfile
         from preflight import check
+        def mount_probe(_image):
+            return None
         with tempfile.TemporaryDirectory() as d:
             proc=Path(d)
             (proc/'filesystems').write_text('nodev\ttmpfs\n')
             with self.assertRaisesRegex(RuntimeError,'erofs, bridge_netfilter'):
-                check(proc)
+                check(proc,mount_probe=mount_probe)
             (proc/'filesystems').write_text('\terofs\n')
             bridge=proc/'sys/net/bridge/bridge-nf-call-iptables'
             bridge.parent.mkdir(parents=True)
             bridge.write_text('0\n')
             with self.assertRaisesRegex(RuntimeError,'bridge_netfilter'):
-                check(proc)
+                check(proc,mount_probe=mount_probe)
             bridge.write_text('1\n')
-            self.assertEqual(check(proc),{'erofs':True,'bridge_netfilter':True})
+            self.assertEqual(check(proc,mount_probe=mount_probe),
+                             {'erofs':True,'erofs_mount':True,'bridge_netfilter':True})
+
+    def test_erofs_name_without_a_working_mount_fails_preflight(self):
+        import tempfile
+        from preflight import check
+        with tempfile.TemporaryDirectory() as d:
+            proc=Path(d)
+            (proc/'filesystems').write_text('\terofs\n')
+            bridge=proc/'sys/net/bridge/bridge-nf-call-iptables'
+            bridge.parent.mkdir(parents=True)
+            bridge.write_text('1\n')
+            def unsupported(_image):
+                raise OSError('mount returned operation not supported')
+            with self.assertRaisesRegex(RuntimeError,'erofs_mount.*operation not supported'):
+                check(proc,mount_probe=unsupported)

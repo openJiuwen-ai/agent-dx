@@ -1,6 +1,6 @@
 # 本地运行环境与 RRT PID 1 验证
 
-工作树 `fix/atomic-instance-claim`，基线 `d467c2cfc90c182111b209241843270b809c4b8c` 加本轮未提交修改。使用原生 Linux ARM64 release 制品；manifest 明确记录 `dirty: true`。正式 K8s 与 Firecracker 本轮未运行。
+工作树 `fix/atomic-instance-claim`，本地功能验证基于 `d467c2cfc90c182111b209241843270b809c4b8c` 加本轮修改，使用原生 Linux ARM64 release 制品；manifest 明确记录 `dirty: true`。正式 K8s 构建、镜像及环境兼容性结果另见下文；Firecracker 本轮未运行。
 
 ## 行为
 
@@ -27,6 +27,15 @@ RRT 作为 PID 1 时，在创建 Tokio 与任何导出线程前 fork 服务子�
 SDK 组额外验证默认环境、仅覆盖 runtime、自定义镜像三条路径。自定义镜像内没有 `/usr/local/bin/rrt-runtime`，由挂载提供 `/__adx/usr/local/bin/rrt-runtime`，执行命令并删除成功。后端为仓库固定 sandboxd PR #56、runc；运行 ID 为 `adx-e2e-6315b6b24b0c`。
 
 首次独立 PID 1 GREEN 验证因测试脚本在 HTTP 就绪后过早结束 PID 发现而失败；修正测试竞态后使用同一二进制通过，原日志 `pid1-green.log` 保留。首次构建受 apt 下载失败影响，第二次构建因容器未挂载 worktree 的 Git 公共目录而打包失败，分别保留 `build-e2e-1.log` 和 `build-e2e-2.log`。
+
+## Buildkite 与 K8s 环境结论
+
+- [Buildkite #25](https://buildkite.com/agent-dx/agent-dx/builds/25) 在 Ubuntu 20.04 自带 `erofs-utils 1.0` 缺少 `fsck.erofs` 时停止。构建链已改为校验源码摘要并缓存固定的 `erofs-utils 1.8.10`。
+- [Buildkite #26](https://buildkite.com/agent-dx/agent-dx/builds/26) 的 `platform-build` 和 `platform-images` 通过；K8s E2E 在首个默认环境创建时失败，sandboxd 对发布包内 EROFS 执行只读 loop mount 返回 `EOPNOTSUPP`，尚未进入 SDK 功能用例。
+- 在目标集群两台 HCE 2.0、Linux `5.10.0-182.0.0.95.r3090_252.hce2.x86_64` worker 上复核。当前 ADX 制品、现场生成的最小 EROFS，以及既有 `yr-runtime-rootfs.img` 均得到相同结果，因此排除发布包路径、复制过程和本轮 mkfs 版本为单一原因。
+- preflight 现在真实挂载并卸载发布包内运行环境，而不只检查 `/proc/filesystems` 是否出现 `erofs`。不具备有效 EROFS loop mount 的 worker 会在 sandboxd 和控制面启动前报告 `erofs_mount` 环境错误。
+
+该结果说明现有 K8s worker 不满足此运行环境的验收前置条件；它不是正式 K8s 功能验收通过记录。完整日志与探针记录保存在 `out/ci/runtime-environment/buildkite/` 和 `out/ci/runtime-environment/preflight/`。
 
 ## 制品
 

@@ -186,3 +186,7 @@ the source archive SHA256 before compiling native tools under `ADX_TOOL_CACHE`.
 Both `mkfs.erofs` and `fsck.erofs` are required; the distribution's 1.0 package
 lacks the checker. The runtime payload stays uncompressed and disables inline
 data; the tools are build dependencies and are not included in the release.
+The Kubernetes preflight mounts and unmounts the packaged payload through a
+read-only loop device. Listing `erofs` in `/proc/filesystems` alone is not an
+acceptance gate because some worker kernels register the driver but reject
+actual block-backed mounts.

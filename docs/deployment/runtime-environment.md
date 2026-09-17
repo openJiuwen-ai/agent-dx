@@ -38,4 +38,6 @@ RRT 在 Linux PID 1 场景内置进程回收：单线程启动阶段 fork 实际
 
 发布构建需要原生 musl Rust target、musl C 工具链、`busybox-static`、`erofs-utils` 和 `readelf`。`build/runtime/rootfs.py` 拒绝带动态解释器的 RRT/BusyBox，再生成并检查 EROFS。构建示例与进程部署见 [standalone](standalone.md)。
 
+节点必须支持从普通文件创建只读 loop 设备并实际挂载 EROFS。`/proc/filesystems` 中出现 `erofs` 只表示驱动已登记，不足以证明该内核构建和设备路径可用；K8s 验收 preflight 会对发布包内制品执行一次真实挂载和卸载。失败时节点不进入 sandboxd 与控制面启动阶段。
+
 本轮真实 runc 启动、双节点 SDK 和 PID 1 回收结果见 [验证记录](../testing/2026-09-17-runtime-environment.md)。
