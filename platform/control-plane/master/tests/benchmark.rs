@@ -48,6 +48,7 @@ fn run(cache: usize, heterogeneous: bool) -> (Duration, SchedulingStats, Vec<Str
             .unwrap();
         }
         let r = InstanceSpec {
+            runtime_environment: None,
             snapshot_id: None,
             lifecycle: Default::default(),
             env: Default::default(),

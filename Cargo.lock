@@ -41,6 +41,7 @@ dependencies = [
 name = "adx-control-cli"
 version = "0.1.0"
 dependencies = [
+ "adx-core",
  "adx-protocol",
  "flate2",
  "hyper-util",

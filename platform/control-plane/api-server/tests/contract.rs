@@ -107,3 +107,29 @@ fn create_timeout_compatibility_and_invalid_reserves() {
         assert!(budget(c, s, i).is_err());
     }
 }
+
+#[test]
+fn deployment_environment_supplies_default_root_and_runtime_but_snapshot_inherits_source() {
+    let environment = serde_json::from_value(json!({
+        "rootfs":{"runtime":"runc","type":"local","path":"/opt/adx/runtime/rootfs.img","readonly":false},
+        "bootstrap":{"type":"erofs","root":"/opt/adx/runtime/rootfs.img","target":"/__adx",
+          "entrypoint":["/__adx/usr/local/bin/rrt-runtime"]}
+    })).unwrap();
+    let create = |body| {
+        adx_api_server::contract::create_spec_with_environment(body, &caller(), Some(&environment))
+            .unwrap()
+    };
+    let default = create(json!({"name":"default"}));
+    assert!(default.image.is_empty());
+    assert_eq!(default.runtime, "runc");
+    assert!(default.runtime_environment.is_some());
+    let runtime_only = create(json!({"rootfs":{"runtime":"firecracker"}}));
+    assert!(runtime_only.image.is_empty());
+    assert_eq!(runtime_only.runtime, "firecracker");
+    let custom = create(json!({"image":"ubuntu:24.04"}));
+    assert_eq!(custom.image, "ubuntu:24.04");
+    assert_eq!(custom.runtime_environment, default.runtime_environment);
+    let clone = create(json!({"snapshotId":"saved"}));
+    assert!(clone.runtime_environment.is_none());
+    assert!(clone.runtime.is_empty());
+}

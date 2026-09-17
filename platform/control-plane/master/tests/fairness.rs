@@ -4,6 +4,7 @@ use std::time::Duration;
 
 fn request(id: &str, tenant: &str) -> InstanceSpec {
     InstanceSpec {
+        runtime_environment: None,
         id: id.into(),
         tenant_id: tenant.into(),
         image: "image".into(),

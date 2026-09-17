@@ -185,7 +185,11 @@ impl Api {
             {
                 input.as_object_mut().unwrap().remove("runtime");
             }
-            let spec = match contract::create_spec(input.clone(), &caller) {
+            let spec = match contract::create_spec_with_environment(
+                input.clone(),
+                &caller,
+                self.clients.config.runtime_environment.as_ref(),
+            ) {
                 Ok(s) => s,
                 Err(e) => return envelope(status_code(&e), None, Some(e.message())),
             };
@@ -566,7 +570,7 @@ fn matches_spec(want: &pb::InstanceSpec, got: &pb::InstanceSpec) -> bool {
     want.id == got.id
         && want.tenant_id == got.tenant_id
         && want.snapshot_id == got.snapshot_id
-        && !got.image.is_empty()
+        && (!got.image.is_empty() || got.runtime_environment.is_some())
         && !got.runtime.is_empty()
         && (want.image.is_empty() || want.image == got.image)
         && (want.runtime.is_empty() || want.runtime == got.runtime)

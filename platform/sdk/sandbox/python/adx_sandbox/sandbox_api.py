@@ -542,7 +542,7 @@ class Sandbox:
             "createTimeoutSeconds": resolved_create_timeout,
             "scheduleTimeoutSeconds": resolved_schedule_timeout,
             "initCallTimeoutSeconds": _INIT_CALL_TIMEOUT,
-            "rootfs": ({"runtime": runtime or "runsc"} if runtime is not None or snapshot_id is None else {}),
+            "rootfs": ({"runtime": runtime} if runtime is not None else {}),
         }
         if body["snapshotId"] is None:
             del body["snapshotId"]

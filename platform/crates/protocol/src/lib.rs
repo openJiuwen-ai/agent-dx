@@ -1,4 +1,5 @@
 //! Generated transport contracts and validated conversions, without services.
+mod environment;
 mod snapshots;
 pub mod control {
     tonic::include_proto!("adx.control.v1");
@@ -25,6 +26,10 @@ impl TryFrom<control::InstanceSpec> for adx_core::InstanceSpec {
             .resources
             .ok_or_else(|| Error::Invalid("resources are required".into()))?;
         let spec = Self {
+            runtime_environment: value
+                .runtime_environment
+                .map(TryInto::try_into)
+                .transpose()?,
             snapshot_id: value.snapshot_id,
             lifecycle: value.lifecycle.map(Into::into).unwrap_or_default(),
             env: value.env.into_iter().collect(),
@@ -52,6 +57,7 @@ impl TryFrom<control::InstanceSpec> for adx_core::InstanceSpec {
 impl From<adx_core::InstanceSpec> for control::InstanceSpec {
     fn from(value: adx_core::InstanceSpec) -> Self {
         Self {
+            runtime_environment: value.runtime_environment.map(Into::into),
             snapshot_id: value.snapshot_id,
             lifecycle: Some(value.lifecycle.into()),
             env: value.env.into_iter().collect(),
@@ -122,6 +128,7 @@ mod tests {
     #[test]
     fn instance_spec_round_trip_preserves_units_and_priority() {
         let value = adx_core::InstanceSpec {
+            runtime_environment: None,
             snapshot_id: None,
             lifecycle: Default::default(),
             env: Default::default(),

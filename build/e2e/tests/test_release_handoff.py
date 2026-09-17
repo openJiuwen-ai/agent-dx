@@ -14,7 +14,7 @@ class ReleaseArchiveTests(unittest.TestCase):
     def test_artifact_roundtrip_preserves_manifest_nested_files_and_modes(self):
         with tempfile.TemporaryDirectory() as temp:
             root=Path(temp);bins=root/'bins';bins.mkdir()
-            for name in (*package.BINARIES,'rrt-runtime'):
+            for name in (*package.BINARIES,'rrt-runtime','adx-runtime-rootfs.img'):
                 path=bins/name;path.write_bytes(b'fixture binary');path.chmod(0o755)
             redis=root/'redis-server';redis.write_text('#!/bin/sh\necho "Redis server v=7.2.5 fixture"\n');redis.chmod(0o755)
             wheel=root/'adx_sandbox-0.10.0-py3-none-any.whl';wheel.write_bytes(b'fixture wheel')

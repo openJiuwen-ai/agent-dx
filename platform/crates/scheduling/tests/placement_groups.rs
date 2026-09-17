@@ -3,6 +3,7 @@ use adx_scheduling::{Candidate, Framework, Node, PlacedInstance, Placement, Snap
 use std::collections::BTreeMap;
 fn request(id: &str) -> InstanceSpec {
     InstanceSpec {
+        runtime_environment: None,
         snapshot_id: None,
         lifecycle: Default::default(),
         env: Default::default(),

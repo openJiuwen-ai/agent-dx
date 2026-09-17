@@ -95,6 +95,7 @@ async fn channel(address: std::net::SocketAddr, name: &str) -> Channel {
 }
 fn spec(id: &str) -> InstanceSpec {
     InstanceSpec {
+        runtime_environment: None,
         snapshot_id: None,
         lifecycle: Default::default(),
         env: Default::default(),

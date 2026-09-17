@@ -4,6 +4,7 @@ fn placed(id: &str, tenant: &str, labels: &[(&str, &str)]) -> PlacedInstance {
     PlacedInstance {
         node_id: "n".into(),
         spec: InstanceSpec {
+            runtime_environment: None,
             snapshot_id: None,
             lifecycle: Default::default(),
             env: Default::default(),

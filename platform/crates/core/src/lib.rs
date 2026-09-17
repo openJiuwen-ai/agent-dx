@@ -1,6 +1,7 @@
 //! Instance and resource contracts shared by the control plane.
 
 pub mod checkpoint;
+pub mod environment;
 pub mod lifecycle;
 pub mod metrics;
 pub mod snapshots;
@@ -71,6 +72,8 @@ impl Resources {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InstanceSpec {
     #[serde(default)]
+    pub runtime_environment: Option<environment::RuntimeEnvironment>,
+    #[serde(default)]
     pub snapshot_id: Option<String>,
     #[serde(default)]
     pub lifecycle: lifecycle::LifecyclePolicy,
@@ -91,12 +94,18 @@ impl InstanceSpec {
         for (name, value) in [
             ("id", &self.id),
             ("tenant", &self.tenant_id),
-            ("image", &self.image),
             ("runtime", &self.runtime),
         ] {
             if value.trim().is_empty() {
                 return Err(Error::Invalid(format!("{name} is required")));
             }
+        }
+        if let Some(environment) = &self.runtime_environment {
+            environment.validate()?;
+        } else if self.image.trim().is_empty() {
+            return Err(Error::Invalid(
+                "image or runtime environment is required".into(),
+            ));
         }
         self.lifecycle.validate()?;
         self.resources.validate()?;

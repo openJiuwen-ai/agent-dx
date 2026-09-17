@@ -44,6 +44,8 @@ pub struct Service {
 #[serde(deny_unknown_fields)]
 pub struct Deployment {
     #[serde(default)]
+    pub runtime_environment: Option<adx_core::environment::RuntimeEnvironment>,
+    #[serde(default)]
     pub logging: crate::logging::Policy,
     pub schema_version: u32,
     pub package_dir: PathBuf,
@@ -134,6 +136,9 @@ impl Deployment {
     }
     pub fn validate(&self) -> Result<()> {
         self.logging.validate()?;
+        if let Some(e) = &self.runtime_environment {
+            e.validate()?;
+        }
         if self.schema_version != 1
             || !self.package_dir.is_absolute()
             || !self.state_dir.is_absolute()
@@ -280,6 +285,9 @@ impl Deployment {
                     vec!["--config".into(), file.display().to_string()]
                 }
                 Role::NodeManager | Role::ApiServer => {
+                    if let Some(e) = &self.runtime_environment {
+                        config["runtime_environment"] = serde_json::to_value(e)?;
+                    }
                     config.as_object_mut().unwrap().remove("master_address");
                     config["discovery"]["redis_url"] = json!(self.redis_url);
                     config["discovery"]["namespace"] = json!(self.namespace);

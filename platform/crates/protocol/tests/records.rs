@@ -3,12 +3,17 @@ use adx_protocol::control;
 #[test]
 fn record_roundtrip_preserves_identity_state_and_ownership() {
     let spec = InstanceSpec {
+        runtime_environment: Some(serde_json::from_value(serde_json::json!({
+            "rootfs": {"runtime": "runc", "type": "local", "path": "/opt/adx/runtime/rootfs.img", "readonly": false},
+            "bootstrap": {"type": "erofs", "root": "/opt/adx/runtime/rootfs.img", "target": "/__adx", "entrypoint": ["/__adx/usr/local/bin/rrt-runtime"]},
+            "env": {"PATH": "/bin:/usr/bin"}
+        })).unwrap()),
         snapshot_id: None,
         lifecycle: Default::default(),
         env: Default::default(),
         id: "i".into(),
         tenant_id: "t".into(),
-        image: "image".into(),
+        image: String::new(),
         runtime: "runc".into(),
         resources: Resources {
             cpu_millis: 10,
@@ -37,6 +42,11 @@ fn record_roundtrip_preserves_identity_state_and_ownership() {
         checkpoint: None,
         last_operation: None,
     };
+    let persisted = serde_json::to_vec(&r).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<InstanceRecord>(&persisted).unwrap(),
+        r
+    );
     let wire = control::InstanceRecord::try_from(r.clone()).unwrap();
     assert_eq!(InstanceRecord::try_from(wire.clone()).unwrap(), r);
     let mut invalid = wire.clone();

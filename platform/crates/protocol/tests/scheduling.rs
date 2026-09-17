@@ -19,6 +19,7 @@ fn protobuf_round_trip_preserves_every_placement_constraint_and_card_identity() 
         tenants: vec!["t".into()],
     };
     let spec = InstanceSpec {
+        runtime_environment: None,
         snapshot_id: None,
         lifecycle: Default::default(),
         env: Default::default(),

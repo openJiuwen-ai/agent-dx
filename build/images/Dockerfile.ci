@@ -13,7 +13,7 @@ ENV CARGO_HOME=/usr/local/cargo RUSTUP_HOME=/usr/local/rustup \
     PATH=/usr/local/go/bin:/usr/local/cargo/bin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
     GOTOOLCHAIN=local
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      build-essential cmake pkg-config libssl-dev protobuf-compiler git \
+      build-essential cmake pkg-config libssl-dev protobuf-compiler git erofs-utils busybox-static musl-tools \
     && rm -rf /var/lib/apt/lists/*
 RUN GOBIN=/usr/local/bin go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11 \
     && GOBIN=/usr/local/bin go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.6.2

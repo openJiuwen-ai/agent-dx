@@ -13,6 +13,9 @@ image=(S/'image').read_text().strip()
 def event(message):print(message,flush=True)
 event('[SCENARIO] '+sys.argv[1])
 if sys.argv[1]=='sdk':
+    if Path('/opt/adx/package/runtime/adx-runtime-rootfs.img').is_file():
+        from runtime_environment import run
+        run(connection,image,E/'runtime-environment-result.json')
     subprocess.run([sys.executable,'-u','/opt/adx/e2e/sdk_smoke.py','--endpoint','127.0.0.1:8443','--token-file',str(S/'api-key'),'--ca',str(S/'tls/ca.pem'),'--image',image,'--output',str(E/'sdk')],check=True)
 elif sys.argv[1]=='local-first':
     from local_first import run

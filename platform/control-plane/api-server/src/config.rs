@@ -21,6 +21,8 @@ pub enum CreateMode {
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    #[serde(default)]
+    pub runtime_environment: Option<adx_core::environment::RuntimeEnvironment>,
     pub listen: SocketAddr,
     #[serde(default)]
     pub create_mode: CreateMode,
@@ -42,6 +44,9 @@ pub struct Config {
 }
 impl Config {
     pub fn validate(&self) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(e) = &self.runtime_environment {
+            e.validate()?;
+        }
         if self.master_address.is_empty() == self.discovery.is_none()
             || self.server_name.is_empty()
             || self.rpc_timeout_seconds == 0

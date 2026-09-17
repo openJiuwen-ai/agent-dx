@@ -18,6 +18,7 @@ fn weighted(name: &'static str, value: u32, weight: u32) -> WeightedScore {
 }
 fn request() -> InstanceSpec {
     InstanceSpec {
+        runtime_environment: None,
         snapshot_id: None,
         lifecycle: Default::default(),
         env: Default::default(),

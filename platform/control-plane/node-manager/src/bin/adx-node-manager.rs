@@ -55,7 +55,11 @@ struct Config {
     #[serde(default = "runtime_ready_timeout")]
     runtime_ready_timeout_seconds: u64,
     rrt_port: u16,
+    #[serde(default)]
+    runtime_environment: Option<adx_core::environment::RuntimeEnvironment>,
+    #[serde(default)]
     rrt_command: Vec<String>,
+    #[serde(default)]
     rrt_env: HashMap<String, String>,
 }
 #[derive(Deserialize)]
@@ -177,6 +181,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Sandboxd::connect(
             c.sandboxd_socket,
             RuntimeConfig {
+                runtime_environment: c.runtime_environment,
                 command: c.rrt_command,
                 env,
                 cwd: "/".into(),

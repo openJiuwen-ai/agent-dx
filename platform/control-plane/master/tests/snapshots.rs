@@ -7,6 +7,7 @@ fn snapshot() -> Snapshot {
         "snapshot-1".into(),
         vec!["base".into()],
         InstanceSpec {
+            runtime_environment: None,
             snapshot_id: None,
             id: "source".into(),
             tenant_id: "tenant".into(),

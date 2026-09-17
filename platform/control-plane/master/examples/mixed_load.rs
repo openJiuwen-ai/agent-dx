@@ -36,6 +36,7 @@ fn submit(
 ) {
     let shape = [(3, 1, 0), (1, 3, 0), (1, 1, 3), (2, 2, 0)][(*serial / DOMAINS + *serial) % 4];
     let request = InstanceSpec {
+        runtime_environment: None,
         id: format!("r{serial}"),
         tenant_id: format!("t{tenant}"),
         image: "test-image".into(),

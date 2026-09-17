@@ -46,3 +46,10 @@ cargo --version
 go version
 protoc --version
 "$ADX_REDIS_SERVER" --version
+
+# Runtime payloads are built natively, with a static RRT independent of user libc.
+if ! command -v mkfs.erofs >/dev/null || ! command -v musl-gcc >/dev/null || ! command -v readelf >/dev/null || ! dpkg-query -W -f='${Status}' busybox-static 2>/dev/null | grep -q 'install ok installed'; then
+  apt-get update
+  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends erofs-utils busybox-static musl-tools binutils
+fi
+rustup target add x86_64-unknown-linux-musl --toolchain "$(rustup show active-toolchain | awk '{print $1}')"

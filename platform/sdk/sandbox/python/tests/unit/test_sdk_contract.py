@@ -816,7 +816,7 @@ class SDKContractTests(unittest.TestCase):
 
         body = _FakeClient.created[-1]
         self.assertNotIn("image", body)
-        self.assertEqual(body["rootfs"], {"runtime": "runsc"})
+        self.assertEqual(body["rootfs"], {})
 
     def test_runtime_override_without_explicit_rootfs_preserves_cluster_default(self):
         with patch("adx_sandbox.sandbox_api.SandboxClient", _FakeClient):

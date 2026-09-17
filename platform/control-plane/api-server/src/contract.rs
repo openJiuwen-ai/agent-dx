@@ -99,6 +99,16 @@ fn positive(value: i64, scale: u64) -> Result<u64, Status> {
         .ok_or_else(|| invalid("invalid resource amount"))
 }
 pub fn create_spec(body: Value, caller: &pb::CallerContext) -> Result<pb::InstanceSpec, Status> {
+    create_spec_with_environment(body, caller, None)
+}
+pub fn create_spec_with_environment(
+    body: Value,
+    caller: &pb::CallerContext,
+    environment: Option<&adx_core::environment::RuntimeEnvironment>,
+) -> Result<pb::InstanceSpec, Status> {
+    if let Some(e) = environment {
+        e.validate().map_err(|e| invalid(&e.to_string()))?;
+    }
     let mut r: Create =
         serde_json::from_value(body).map_err(|_| invalid("invalid create request"))?;
     if caller.tenant_id.is_empty() {
@@ -128,11 +138,13 @@ pub fn create_spec(body: Value, caller: &pb::CallerContext) -> Result<pb::Instan
         root.imageurl = r.image;
     }
     let snapshot = (!r.snapshot_id.trim().is_empty()).then(|| r.snapshot_id.trim().to_string());
-    if snapshot.is_none() && root.imageurl.trim().is_empty() {
+    if snapshot.is_none() && environment.is_none() && root.imageurl.trim().is_empty() {
         return Err(invalid("image required"));
     }
     if snapshot.is_none() && root.runtime.is_empty() {
-        root.runtime = "runsc".into();
+        root.runtime = environment
+            .map(|e| e.rootfs.runtime.clone())
+            .unwrap_or_else(|| "runsc".into());
     }
     resolve_create_timeout(r.create_timeout, r.schedule_timeout, r.init_timeout)?;
     if r.create_timeout < 0 || r.schedule_timeout < 0 || r.init_timeout < 0 || r.idle < 0 {
@@ -284,6 +296,11 @@ pub fn create_spec(body: Value, caller: &pb::CallerContext) -> Result<pb::Instan
             .insert("RRT_TUNNEL_WS_PORT".into(), (port - 1).to_string());
     }
     Ok(pb::InstanceSpec {
+        runtime_environment: if snapshot.is_none() {
+            environment.cloned().map(Into::into)
+        } else {
+            None
+        },
         id: format!("{}-{}", r.namespace, r.name),
         tenant_id: caller.tenant_id.clone(),
         image: root.imageurl.trim().into(),

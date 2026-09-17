@@ -14,7 +14,7 @@ operations and shutdown cleanup, and preserves configuration hashes.
 
 For local reproduction, `prepare.py` turns a verified ADX release package and pinned external backend
 into portable runtime images. `run.py` loads and verifies that bundle, starts
-Redis, Master/Domain, Sandbox API, Edge, two Node Managers and Node Proxies, and
+Redis, Master/ShardScheduler, API Server, Edge, two Node Managers and Node Proxies, and
 independently starts real sandboxd on each node. Business tests use the public
 SDK installed into the image from the release wheel; no product source checkout
 is mounted into the test nodes.
@@ -41,7 +41,9 @@ Local Docker reproduction requires access to the same bind-mounted paths as the 
 
 ## Assertions
 
-- `sdk`: two real instances across two nodes; query, stdout/stderr/exit code,
+- `sdk`: Linux release packages first verify the built-in local rootfs, runtime-only
+  override and a plain custom image with the read-only RRT bootstrap mount. Then
+  two real instances across two nodes verify query, stdout/stderr/exit code,
   binary file round-trip, explicit deletion, Redis terminal state and released
   resources, and empty sandboxd inventories.
 - `auth`: invalid key and another tenant cannot read or delete the instance;

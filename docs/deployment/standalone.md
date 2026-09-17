@@ -6,7 +6,7 @@
 
 - 使用与 Linux 主机架构一致的 ADX release 包；部署前执行 `python3 build/release/package.py verify /path/to/package` 校验完整清单。将整个包安装到 `/opt/adx`，不要混用不同包的二进制或 SDK。
 - 按 `third_party/sandboxd/source.json` 准备外部 sandboxd。默认示例连接 `/run/sandboxd/sandboxd.sock`。sandboxd 的运行时、网络、镜像访问与主机权限由部署环境准备。
-- 实例镜像应包含同包的 `runtime/rrt-runtime`，安装路径为 `/usr/local/bin/rrt-runtime`，与 Node Manager 的 `rrt_command` 一致。宿主机安装 RRT 不等于实例镜像已包含它。
+- 配置随包部署的本地 `runtime/adx-runtime-rootfs.img`：默认用作实例根文件系统，自定义镜像时只读挂载内置环境，用户镜像不需要预装 RRT。配置及启动语义见 [本地运行环境](runtime-environment.md)。
 - Redis 位于示例的 `redis://127.0.0.1:6379/`。应启用 AOF 和持久化磁盘；`always`、`everysec`、`no` 按部署要求选择。需要由 ADX 托管 Redis 时，按 [进程部署](../testing/process-deployment.md#redis) 增加 Redis 角色。
 
 ```sh

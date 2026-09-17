@@ -217,6 +217,7 @@ async fn connect(server: Server) -> (Sandboxd, Harness) {
 }
 fn spec() -> InstanceSpec {
     InstanceSpec {
+        runtime_environment: None,
         snapshot_id: None,
         lifecycle: Default::default(),
         env: Default::default(),

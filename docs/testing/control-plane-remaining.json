@@ -118,5 +118,13 @@
     "status": "pending",
     "detail": "组件、Redis、RPC/HTTPS及Clippy通过；当前release制品本地真实sandboxd/runc/RRT双节点8组通过，清理无残留。本地验收使用工作树release制品，正式K8s未执行。",
     "gate": "从已提交代码构建正式制品，运行K8s基础8组（含local-first），核对唯一归属、命令、删除、claim日志与清理。"
+  },
+  {
+    "id": "runtime-environment-acceptance",
+    "title": "本地运行环境：正式K8s与FC验证",
+    "stage": "12",
+    "status": "pending",
+    "detail": "静态RRT、EROFS本地/自定义镜像路径、PID1回收及真实runc双节点8组通过；正式K8s与FC尚未运行，工作树修改未提交。",
+    "gate": "已提交代码构建正式制品后完成基础K8s；FC验证新入口与快照恢复，单独保留证据。"
   }
 ]

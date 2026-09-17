@@ -5,6 +5,7 @@ use adx_core::{
 #[test]
 fn snapshot_wire_preserves_template_and_durable_references() {
     let spec = InstanceSpec {
+        runtime_environment: None,
         snapshot_id: None,
         id: "source".into(),
         tenant_id: "tenant".into(),

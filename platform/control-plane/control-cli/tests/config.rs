@@ -161,3 +161,24 @@ fn deployment_accepts_bounded_log_rotation_policy() {
     let d: Deployment = serde_json::from_value(json!({"schema_version":1,"package_dir":"/tmp/package","state_dir":"/tmp/state","redis_url":"redis://localhost:6379/","namespace":"test","restart_limit":2,"restart_delay_ms":20,"stop_timeout_seconds":3,"services":[{"id":"master","role":"master","config":{}}],"logging":{"enabled":true,"max_file_bytes":1024,"rotate_seconds":60,"compress":true,"max_files":4,"max_age_seconds":3600,"max_total_bytes":8192}})).unwrap();
     d.validate().unwrap();
 }
+
+#[test]
+fn common_environment_is_rendered_to_node_and_api() {
+    let root = tempfile::tempdir().unwrap();
+    let env = json!({"rootfs":{"runtime":"runsc","type":"local","path":"/opt/adx/root.img","readonly":false},
+       "bootstrap":{"type":"erofs","root":"/opt/adx/root.img","target":"/__adx","entrypoint":["/__adx/usr/local/bin/rrt-runtime"]}});
+    let mut d = config(root.path());
+    d.runtime_environment = Some(serde_json::from_value(env).unwrap());
+    d.services
+        .push(serde_json::from_value(json!({"id":"api","role":"api-server","config":{}})).unwrap());
+    let dir = root.path().join("env-config");
+    d.render(&dir).unwrap();
+    for role in ["node", "api"] {
+        let c: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join(format!("{role}.json"))).unwrap())
+                .unwrap();
+        let actual: adx_core::environment::RuntimeEnvironment =
+            serde_json::from_value(c["runtime_environment"].clone()).unwrap();
+        assert_eq!(Some(actual), d.runtime_environment);
+    }
+}

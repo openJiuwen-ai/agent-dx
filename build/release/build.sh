@@ -24,6 +24,13 @@ cargo build --locked --release -j "$JOBS" -p adx-api-server -p adx-control-cli -
 for name in adx-api-server adxctl adx-master adx-node-manager adx-edge-frontend adx-node-proxy adx-data-plane-forward rrt-runtime; do
  cp "$CARGO_TARGET_DIR/release/$name" "$stage/$name"
 done
+if [[ "$host" == *-linux-gnu ]]; then
+  musl_target="${host%-gnu}-musl"
+  echo "--- :package: Static RRT and local EROFS runtime"
+  cargo build --locked --release --target "$musl_target" -j "$JOBS" -p rrt-daemon --bin rrt-runtime
+  cp "$CARGO_TARGET_DIR/$musl_target/release/rrt-runtime" "$stage/rrt-runtime"
+  "$PYTHON" build/runtime/rootfs.py --binary "$stage/rrt-runtime" --output "$stage/adx-runtime-rootfs.img"
+fi
 echo "--- :python: Build Sandbox SDK wheel"
 PYTHON="$PYTHON" bash platform/sdk/sandbox/python/build.sh "$stage/sdk"
 wheel=("$stage"/sdk/adx_sandbox-*.whl)

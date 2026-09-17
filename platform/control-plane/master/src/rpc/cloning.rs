@@ -35,6 +35,7 @@ pub(super) async fn normalize(
     }
     snapshot.origin()?;
     let template = &snapshot.template;
+    request.runtime_environment = template.runtime_environment.clone().map(Into::into);
     if request.image.is_empty() {
         request.image = template.image.clone();
     }

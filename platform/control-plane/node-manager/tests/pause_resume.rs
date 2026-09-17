@@ -210,6 +210,7 @@ fn fixture() -> (
     node.update_capacity(resources, Duration::from_secs(300))
         .unwrap();
     let spec = InstanceSpec {
+        runtime_environment: None,
         snapshot_id: None,
         lifecycle: Default::default(),
         id: "instance".into(),

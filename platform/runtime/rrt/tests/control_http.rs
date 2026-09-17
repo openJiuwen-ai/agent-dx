@@ -36,6 +36,7 @@ fn record(generation: u64) -> InstanceRecord {
         restart_attempts: 0,
         restart_pending: false,
         spec: InstanceSpec {
+            runtime_environment: None,
             snapshot_id: None,
             lifecycle: Default::default(),
             env: Default::default(),

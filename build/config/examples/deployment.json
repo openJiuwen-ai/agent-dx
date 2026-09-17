@@ -79,9 +79,6 @@
         "report_interval_seconds": 5,
         "rpc_timeout_seconds": 30,
         "rrt_port": 50090,
-        "rrt_command": [
-          "/usr/local/bin/rrt-runtime"
-        ],
         "rrt_env": {},
         "checkpoint_dir": "/var/lib/adx/checkpoints",
         "resource_source": {
@@ -151,5 +148,24 @@
     "max_files": 5,
     "max_age_seconds": 604800,
     "max_total_bytes": 1073741824
+  },
+  "runtime_environment": {
+    "rootfs": {
+      "runtime": "runsc",
+      "type": "local",
+      "path": "/opt/adx/runtime/adx-runtime-rootfs.img",
+      "readonly": false
+    },
+    "bootstrap": {
+      "type": "erofs",
+      "root": "/opt/adx/runtime/adx-runtime-rootfs.img",
+      "target": "/__adx",
+      "entrypoint": [
+        "/__adx/usr/local/bin/rrt-runtime"
+      ]
+    },
+    "env": {
+      "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    }
   }
 }

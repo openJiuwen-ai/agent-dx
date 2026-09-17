@@ -585,7 +585,7 @@ def test_sandbox_create_timeout_precedence_and_body():
     _check(seen[1]["scheduleTimeoutSeconds"] == 45, f"explicit schedule timeout body: {seen[1]}")
     _check(seen[2]["createTimeoutSeconds"] == 500, f"env timeout body: {seen[2]}")
     _check(seen[2]["scheduleTimeoutSeconds"] == 30, f"default schedule timeout body: {seen[2]}")
-    _check(seen[2]["rootfs"]["runtime"] == "runsc", f"default isolation runtime body: {seen[2]}")
+    _check("runtime" not in seen[2]["rootfs"], f"default isolation runtime body: {seen[2]}")
     _check("runtime" not in seen[2], f"top-level runtime body: {seen[2]}")
     _check(seen[3]["createTimeoutSeconds"] == 105, f"derived create timeout body: {seen[3]}")
     _check(seen[3]["scheduleTimeoutSeconds"] == 45, f"derived schedule timeout body: {seen[3]}")

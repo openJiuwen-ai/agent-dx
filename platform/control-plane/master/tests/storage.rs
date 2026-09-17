@@ -6,6 +6,7 @@ use adx_master::{storage::StoredNode, Master, Node, Placement};
 
 fn spec(id: &str) -> InstanceSpec {
     InstanceSpec {
+        runtime_environment: None,
         snapshot_id: None,
         lifecycle: Default::default(),
         env: Default::default(),

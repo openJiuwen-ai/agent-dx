@@ -20,6 +20,13 @@ def assemble(binary_dir, redis, wheel, output, commit, dirty, target, profile):
         raise ValueError("output already exists")
     inputs = {f"bin/{name}": binary_dir / name for name in BINARIES}
     inputs["runtime/rrt-runtime"] = binary_dir / "rrt-runtime"
+    # Native Linux release builder supplies the EROFS payload. Debug/native macOS
+    # packages retain binary-only development support.
+    runtime_root = binary_dir / "adx-runtime-rootfs.img"
+    if profile == "release" and "linux" in target:
+        inputs["runtime/adx-runtime-rootfs.img"] = runtime_root
+    elif runtime_root.is_file():
+        inputs["runtime/adx-runtime-rootfs.img"] = runtime_root
     inputs["bin/redis-server"] = redis
     if not wheel.name.startswith("adx_sandbox-") or wheel.suffix != ".whl":
         raise ValueError("an adx_sandbox wheel is required")
@@ -63,6 +70,8 @@ def verify(directory):
         raise ValueError("invalid package manifest")
     expected = set(manifest["files"])
     required = {f"bin/{b}" for b in BINARIES} | {"bin/redis-server", "runtime/rrt-runtime"}
+    if manifest.get("profile") == "release" and "linux" in manifest.get("target", ""):
+        required.add("runtime/adx-runtime-rootfs.img")
     if not required.issubset(expected) or not any(n.startswith("sdk/adx_sandbox-") and n.endswith(".whl") for n in expected):
         raise ValueError("incomplete package")
     actual = set()

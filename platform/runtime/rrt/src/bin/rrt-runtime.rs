@@ -6,6 +6,9 @@
 //! Start with `rrt-runtime`; Node Manager supplies the explicit Instance identity.
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(code) = rrt_daemon::init::enter()? {
+        std::process::exit(code);
+    }
     // Fork-based warm starts hold here until the child is ready. Refresh the
     // restored environment before constructing Tokio or reading runtime args.
     rrt_daemon::startup::prepare_runtime_environment()?;

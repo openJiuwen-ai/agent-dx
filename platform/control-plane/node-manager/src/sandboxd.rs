@@ -21,6 +21,7 @@ use proto::sandbox_service_client::SandboxServiceClient;
 
 #[derive(Clone)]
 pub struct Config {
+    pub runtime_environment: Option<adx_core::environment::RuntimeEnvironment>,
     pub command: Vec<String>,
     pub env: HashMap<String, String>,
     pub cwd: String,
@@ -30,6 +31,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            runtime_environment: None,
             command: vec!["/usr/local/bin/rrt-runtime".into()],
             env: HashMap::from([
                 ("RRT_HTTP_ONLY".into(), "1".into()),
@@ -63,10 +65,32 @@ fn unavailable(error: impl std::fmt::Display) -> Error {
 
 impl Sandboxd {
     pub async fn connect(path: PathBuf, config: Config) -> Result<Self> {
-        if config.command.is_empty() || config.rpc_timeout.is_zero() {
+        if (config.command.is_empty() && config.runtime_environment.is_none())
+            || config.rpc_timeout.is_zero()
+        {
             return Err(Error::Invalid(
                 "sandboxd command and positive RPC timeout are required".into(),
             ));
+        }
+        if let Some(e) = &config.runtime_environment {
+            e.validate()?;
+            for path in [&e.rootfs.path, &e.bootstrap.root] {
+                let metadata = std::fs::metadata(path)
+                    .map_err(|error| Error::Invalid(format!("runtime artifact {path}: {error}")))?;
+                if !metadata.is_file() {
+                    return Err(Error::Invalid(
+                        "runtime artifact must be a regular EROFS file".into(),
+                    ));
+                }
+                use std::io::{Read, Seek, SeekFrom};
+                let mut f = std::fs::File::open(path).map_err(unavailable)?;
+                let mut magic = [0; 4];
+                f.seek(SeekFrom::Start(1024)).map_err(unavailable)?;
+                f.read_exact(&mut magic).map_err(unavailable)?;
+                if magic != [0xe2, 0xe1, 0xf5, 0xe0] {
+                    return Err(Error::Invalid("runtime artifact is not EROFS".into()));
+                }
+            }
         }
         let channel = Endpoint::from_static("http://localhost")
             .connect_timeout(config.rpc_timeout)
@@ -351,7 +375,10 @@ pub fn start_request(
 ) -> Result<proto::StartRequest> {
     spec.validate()?;
     adx_core::scheduling::validate_device_assignment(&spec.scheduling.devices, devices)?;
-    if runtime_id.is_empty() || ownership_generation == 0 || config.command.is_empty() {
+    if runtime_id.is_empty()
+        || ownership_generation == 0
+        || (config.command.is_empty() && config.runtime_environment.is_none())
+    {
         return Err(Error::Invalid(
             "runtime identity and command are required".into(),
         ));
@@ -362,7 +389,16 @@ pub fn start_request(
             "resource value exceeds sandboxd numeric precision".into(),
         ));
     }
+    if spec.runtime_environment != config.runtime_environment {
+        return Err(Error::Invalid(
+            "instance runtime environment differs from this node deployment".into(),
+        ));
+    }
+    let environment = spec.runtime_environment.as_ref();
     let mut envs: HashMap<String, String> = spec.env.clone().into_iter().collect();
+    if let Some(e) = environment {
+        envs.extend(e.env.clone());
+    }
     // Deployment configuration owns control ports, tokens, and execution identity.
     envs.extend(config.env.clone());
     envs.remove("ADX_RESTORE_ORIGIN");
@@ -393,13 +429,40 @@ pub fn start_request(
             .collect(),
         sandbox_id: String::new(),
         runtime: spec.runtime.clone(),
-        rootfs: Some(proto::RootfsConfig {
-            readonly: false,
-            r#type: proto::RootfsSrcType::Image as i32,
-            source: Some(proto::rootfs_config::Source::ImageUrl(spec.image.clone())),
-            writable_layer_size_bytes: 0,
-        }),
-        command: config.command.clone(),
+        rootfs: Some(
+            if let Some(e) = environment.filter(|_| spec.image.is_empty()) {
+                proto::RootfsConfig {
+                    readonly: e.rootfs.readonly,
+                    r#type: proto::RootfsSrcType::Local as i32,
+                    source: Some(proto::rootfs_config::Source::Path(e.rootfs.path.clone())),
+                    writable_layer_size_bytes: 0,
+                }
+            } else {
+                proto::RootfsConfig {
+                    readonly: false,
+                    r#type: proto::RootfsSrcType::Image as i32,
+                    source: Some(proto::rootfs_config::Source::ImageUrl(spec.image.clone())),
+                    writable_layer_size_bytes: 0,
+                }
+            },
+        ),
+        mounts: if !spec.image.is_empty() {
+            environment
+                .map(|e| {
+                    vec![proto::Mount {
+                        r#type: e.bootstrap.r#type.clone(),
+                        target: e.bootstrap.target.clone(),
+                        options: vec!["ro".into()],
+                        source: Some(proto::mount::Source::HostPath(e.bootstrap.root.clone())),
+                    }]
+                })
+                .unwrap_or_default()
+        } else {
+            vec![]
+        },
+        command: environment
+            .map(|e| e.bootstrap.entrypoint.clone())
+            .unwrap_or_else(|| config.command.clone()),
         cwd: config.cwd.clone(),
         envs,
         resources: HashMap::from([
@@ -645,6 +708,7 @@ mod tests {
     #[test]
     fn request_preserves_execution_identity_image_and_resource_units() {
         let spec = InstanceSpec {
+            runtime_environment: None,
             snapshot_id: None,
             lifecycle: Default::default(),
             env: [

@@ -75,7 +75,12 @@ def main():
         if fc_kit:
             with (context/'Dockerfile.node').open('a') as dockerfile:
                 dockerfile.write('COPY fc-kit /opt/adx-fc\nCOPY fc-kit/tools /opt/adx/tools\n')
-        (context/'Dockerfile.rrt').write_text('ARG BASE\nFROM ${BASE}\nCOPY package/runtime/rrt-runtime /usr/local/bin/rrt-runtime\nENTRYPOINT ["/usr/local/bin/rrt-runtime"]\n')
+        if not fc_kit and 'runtime/adx-runtime-rootfs.img' in manifest['files']:
+            # A plain user image proves that RRT comes from the local bootstrap,
+            # not from a preinstalled binary in the user rootfs.
+            (context/'Dockerfile.rrt').write_text('ARG BASE\nFROM ${BASE}\n')
+        else:
+            (context/'Dockerfile.rrt').write_text('ARG BASE\nFROM ${BASE}\nCOPY package/runtime/rrt-runtime /usr/local/bin/rrt-runtime\nENTRYPOINT ["/usr/local/bin/rrt-runtime"]\n')
         for role,base in [('node',a.runtime_base),('rrt',a.rrt_base)]:
             subprocess.run(['docker','build','--progress=plain','--provenance=false','--build-arg','BASE='+base,'--build-arg','COLLECTOR='+collector_image,'-f',str(context/f'Dockerfile.{role}'),'-t',tags[role],str(context)],stderr=subprocess.STDOUT,check=True,timeout=900)
         images={role:json.loads(subprocess.check_output(['docker','image','inspect',tag]))[0] for role,tag in tags.items()}

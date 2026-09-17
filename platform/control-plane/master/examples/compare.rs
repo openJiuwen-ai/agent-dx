@@ -23,6 +23,7 @@ fn node(i: usize, capacity: u64, revision: usize) -> Node {
 }
 fn spec(i: usize) -> InstanceSpec {
     InstanceSpec {
+        runtime_environment: None,
         snapshot_id: None,
         lifecycle: Default::default(),
         env: Default::default(),
