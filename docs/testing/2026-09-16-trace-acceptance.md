@@ -31,6 +31,6 @@ node1采集到 `adx-master`、`adx-node-manager`、`adx-rrt`、`adx-sandbox-api`
 
 [Buildkite #19](https://buildkite.com/agent-dx/agent-dx/builds/19)验收的是前一日志采集提交447e135，编译通过；镜像步骤及唯一一次重试均因Collector下载达到40分钟限时，K8s未运行。第二次在同一层`3c661e367453`等待约29分钟。它不是本轮Trace代码的正式验收结果。
 
-本轮Trace已进入基础K8s的采集检查和构建汇总，但尚未重新运行正式K8s。当前本机SWR认证为空、旧kubeconfig路径不存在，区域缓存上传未执行；需要可用的CI认证配置再推进，不重复触发已知受阻的下载。
+本轮Trace已进入基础K8s采集检查和构建汇总。2026-09-17，[Buildkite #20](https://buildkite.com/agent-dx/agent-dx/builds/20)已完成Collector同步至SWR及原摘要回拉；[Buildkite #21](https://buildkite.com/agent-dx/agent-dx/builds/21)已对b3145d6完成正式K8s验收，七组用例及日志/Trace核验通过，见[正式验收记录](2026-09-17-observability-k8s.md)。
 
 尚未覆盖真实GPU/NPU、FC本轮Trace验证、长时间导出端中断、统一的各语言实时队列丢弃计数、SDK事务级根Span、用户进程内部Span。HTTP/gRPC单次请求、生命周期队列和节点操作的关联已验证；不把上述边界描述成完整业务全链路覆盖。

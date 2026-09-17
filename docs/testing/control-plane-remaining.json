@@ -35,17 +35,25 @@
     "id": "component-log-collection",
     "title": "组件结构化日志与外部Collector采集",
     "stage": "8",
-    "status": "active",
-    "detail": "日志采集本地两轮双节点验收通过；Buildkite #19编译通过，镜像步骤及唯一重试均下载超时，K8s未运行。",
+    "status": "complete",
+    "detail": "本地与Buildkite #21正式K8s通过；两节点40/40唯一探针、Collector重启补传、后端故障期SDK生命周期、字段检查和清理全部通过。",
     "gate": "本地与K8s均通过组件日志接收、敏感字段省略、后端不可用期间SDK生命周期、滚动与重启补传，保存每节点独立证据。"
   },
   {
     "id": "logs-traces",
     "title": "跨组件 Trace 关联与导出",
     "stage": "8",
-    "status": "active",
-    "detail": "OpenTelemetry及HTTP/gRPC/实例队列/Gateway/RRT已接入；本地7组与跨组件Span关联通过，正式K8s及统一实时丢弃计数尚未完成。",
+    "status": "complete",
+    "detail": "本地与Buildkite #21正式K8s通过；3273个Span、1098组queue→execute父子关系、9条完整创建Trace和两节点RRT远端上下文已验证。实时队列丢弃指标单列。",
     "gate": "真实创建→执行→删除串联Trace及日志；验证并发上下文隔离、采样、导出故障与敏感字段。"
+  },
+  {
+    "id": "trace-export-health",
+    "title": "Trace统一实时队列丢弃指标",
+    "stage": "8",
+    "status": "pending",
+    "detail": "Master/Node Manager已有导出成功及失败Span计数；各组件统一的实时队列满丢弃计数尚未实现，SDK日志不等同于指标。",
+    "gate": "各组件按明确口径区分导出失败与队列满丢弃，队列压满故障测试和实际指标抓取通过。"
   },
   {
     "id": "ci-collector-download",

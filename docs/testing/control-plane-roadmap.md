@@ -53,4 +53,4 @@
 
 阶段8、9为新增特性，不影响已有阶段的验收记录。阶段8先完成实例数量和资源分配Metrics，再接日志采集与Trace；阶段9单独交付日志滚动、压缩和保留策略。详细范围及验收见[可观测与日志规划](observability-logging-plan.md)。
 
-阶段8首批Metrics已完成：提交 `5f592cf`，53项Rust、53项驱动、Clippy、本地双节点SDK七组与Buildkite #17基础K8s通过；真实抓取确认满载/排队/删除后的指标与两侧资源账本一致。见[验收报告](2026-09-16-metrics-acceptance.md)。阶段8保持进行中，日志采集与Trace待实现；阶段9日志滚动压缩已完成：`3985f4b`，macOS 16项/Linux 17项Rust检查、53项驱动检查、Clippy、本地双节点SDK与Buildkite #18基础K8s七组通过；两节点40/6个gzip归档可读，清理无残留。见[日志验收记录](2026-09-16-logging-acceptance.md)。
+阶段8首批Metrics已完成：提交 `5f592cf`，53项Rust、53项驱动、Clippy、本地双节点SDK七组与Buildkite #17基础K8s通过；真实抓取确认满载/排队/删除后的指标与两侧资源账本一致。见[验收报告](2026-09-16-metrics-acceptance.md)。阶段8的日志采集与Trace已通过本地及Buildkite #21正式K8s验收，见[日志与Trace报告](2026-09-17-observability-k8s.md)；阶段8仍保留统一实时队列丢弃指标待办；阶段9日志滚动压缩已完成：`3985f4b`，macOS 16项/Linux 17项Rust检查、53项驱动检查、Clippy、本地双节点SDK与Buildkite #18基础K8s七组通过；两节点40/6个gzip归档可读，清理无残留。见[日志验收记录](2026-09-16-logging-acceptance.md)。

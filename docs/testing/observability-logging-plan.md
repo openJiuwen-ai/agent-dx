@@ -1,6 +1,6 @@
 # 可观测与日志能力规划
 
-2026-09-16新增需求，状态：首批实例资源Metrics与日志滚动压缩已验收；组件日志采集和Trace已通过本地双节点验收，正式K8s等待CI制品下载问题解决。内部以Instance为统计对象。
+2026-09-16新增需求，状态：首批实例资源Metrics与日志滚动压缩已验收；组件日志采集和Trace已通过本地双节点及Buildkite #21正式K8s验收，见[报告](2026-09-17-observability-k8s.md)。内部以Instance为统计对象。
 
 ## 当前基础
 
@@ -44,7 +44,7 @@
 
 Trace配置与当前接线见[跨组件Trace](distributed-traces.md)。下表列出模块职责，真实采集验收单独记录：
 
-| 当前模块 | 下一步职责 |
+| 当前模块 | 职责 |
 | --- | --- |
 | `gateway/src/common/logging.rs` | 复用现有日志初始化与过滤入口，接统一结构化字段；统一部署使用stdout进入Supervisor，独立文件模式保持独立目录。 |
 | Sandbox API的HTTP入口与`controlbackend` | 将请求关联上下文带入Master及Node RPC；缓存命中后的直达路径也携带上下文。 |
@@ -69,4 +69,4 @@ Trace配置与当前接线见[跨组件Trace](distributed-traces.md)。下表列
 
 ## 交付与状态维护
 
-交付指标清单、采集与部署说明、统一日志配置、测试与验收报告。进度页独立事项来自 `control-plane-remaining.json`，阶段8保持进行中（组件日志和Trace本地通过，正式K8s待验收），阶段9已完成本地与基础K8s验收；首批Metrics事项已标记完成。导出失败计数已接入Master和Node Manager；各语言统一的实时队列丢弃计数仍待补齐。
+交付指标清单、采集与部署说明、统一日志配置、测试与验收报告。进度页独立事项来自 `control-plane-remaining.json`，阶段8保持进行中（组件日志和Trace本地与正式K8s已通过，统一实时队列丢弃指标单列待办），阶段9已完成本地与基础K8s验收；首批Metrics事项已标记完成。导出失败计数已接入Master和Node Manager；各语言统一的实时队列丢弃计数仍待补齐。
