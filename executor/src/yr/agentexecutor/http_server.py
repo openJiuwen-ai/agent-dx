@@ -14,12 +14,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Internal HTTP server exposed through the platform TCP tunnel."""
+"""Internal HTTP server exposed through the platform TCP tunnel.
+
+The sandbox API (routes, validation, size limits, error mapping) lives in
+``sandbox_http.SandboxRequestMixin``; this module keeps the transport layer
+(files + exec handlers, JSON writing, body readers, concurrency limits)
+shared by both slices.
+"""
 
 from __future__ import annotations
 
-import base64
-import ipaddress
 import json
 import logging
 import os
@@ -28,90 +32,24 @@ import time
 from contextlib import contextmanager
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Optional
+from typing import Optional
 from urllib.parse import parse_qs, urlsplit
 
 from .file_handler import DEFAULT_MAX_FILE_SIZE, FileHandler, FileListTimeoutError
-from .sandbox.sandbox import SandboxCreateOptions
+from .sandbox_http import (
+    DEFAULT_MAX_SANDBOX_REQUEST_SIZE,
+    DEFAULT_MAX_SANDBOX_RESPONSE_SIZE,
+    SANDBOX_PREFIX,
+    SandboxRequestMixin,
+    SandboxRequestTooLargeError,
+    SandboxResponseTooLargeError,
+)
 from .sandbox_manager import SandboxManager
 
 _LOG = logging.getLogger(__name__)
 DEFAULT_MAX_CONCURRENT_REQUESTS = 64
-DEFAULT_MAX_SANDBOX_REQUEST_SIZE = 512 * 1024 * 1024
-DEFAULT_MAX_SANDBOX_RESPONSE_SIZE = 512 * 1024 * 1024
-_SANDBOX_PREFIX = "/v1/sandbox/sandboxes"
 TRACE_HEADER = "X-Trace-ID"
 INSTANCE_ID_ENV = "INSTANCE_ID"
-
-
-class SandboxRequestTooLargeError(ValueError):
-    """Raised when a Sandbox API JSON request exceeds its configured limit."""
-
-
-class SandboxResponseTooLargeError(ValueError):
-    """Raised when a Sandbox API JSON response exceeds its configured limit."""
-
-
-class SandboxMethodNotAllowedError(ValueError):
-    """Method+URL combination has no registered sandbox route (HTTP 405).
-
-    Inherits ValueError so an unmapped except chain degrades to 400, not 500.
-    """
-
-    def __init__(self, method: str, path: str):
-        super().__init__(f"method {method} not allowed for sandbox resource")
-        self.method = method
-        self.path = path
-
-
-# Sandbox 路由表:(method, path 形状, route key)。"bare" 指裸 create URL,
-# "{id}" 为实例段占位。dispatch 的分支匹配与 405 响应的 Allow 头都由这张表
-# 驱动——新增请求方式时在表里加一行 + dispatch 加对应 route 分支即可,
-# Allow 头自动跟随,不存在第二处方法枚举。
-_SANDBOX_ROUTES: tuple[tuple[str, str, str], ...] = (
-    ("POST", "bare", "create"),
-    ("DELETE", "{id}", "delete"),
-    ("POST", "{id}/execute", "execute"),
-    ("GET", "{id}/files/read", "files_read"),
-    ("PUT", "{id}/files/write", "files_write"),
-    ("GET", "{id}/files/list", "files_list"),
-    ("GET", "{id}/files/search", "files_search"),
-)
-
-
-def _shape_matches(shape: str, path: str) -> bool:
-    """Whether ``path`` matches a route shape ("bare", "{id}", "{id}/execute", ...)."""
-    if shape == "bare":
-        return path == _SANDBOX_PREFIX
-    parts = path[len(_SANDBOX_PREFIX) + 1:].split("/", 2)
-    if not parts or not parts[0]:
-        return False
-    sub = parts[1] if len(parts) > 1 else ""
-    action = parts[2] if len(parts) > 2 else ""
-    segments = shape.split("/")[1:]  # 去掉 "{id}"
-    segments += [""] * (2 - len(segments))
-    return sub == segments[0] and action == segments[1]
-
-
-def _match_sandbox_route(method: str, path: str) -> Optional[str]:
-    """Pure method+path lookup in _SANDBOX_ROUTES; None = combination unregistered.
-
-    Callers still resolve instance existence before treating None as 405,
-    so unknown-id requests keep returning 404 (404 优先于 405).
-    """
-    for route_method, shape, key in _SANDBOX_ROUTES:
-        if route_method == method and _shape_matches(shape, path):
-            return key
-    return None
-
-
-def _allowed_sandbox_methods(path: str) -> str:
-    """Allow-header value for a sandbox path: the methods registered on it."""
-    return ", ".join(sorted(
-        route_method
-        for route_method, shape, _ in _SANDBOX_ROUTES
-        if _shape_matches(shape, path)
-    ))
 
 
 class _ExecutorThreadingHTTPServer(ThreadingHTTPServer):
@@ -238,7 +176,7 @@ class ExecutorHTTPServer:
             self._thread.join(timeout=5)
 
 
-class _ExecutorRequestHandler(BaseHTTPRequestHandler):
+class _ExecutorRequestHandler(SandboxRequestMixin, BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     files = FileHandler()
     sandbox_manager: SandboxManager
@@ -259,7 +197,7 @@ class _ExecutorRequestHandler(BaseHTTPRequestHandler):
             with self._agent_trace("filelist", parsed.path):
                 self._list(parse_qs(parsed.query))
             return
-        if path == _SANDBOX_PREFIX or path.startswith(f"{_SANDBOX_PREFIX}/"):
+        if path == SANDBOX_PREFIX or path.startswith(f"{SANDBOX_PREFIX}/"):
             self._sandbox_request("GET", path, parse_qs(parsed.query))
             return
         self._write_json(HTTPStatus.NOT_FOUND, {"message": "endpoint not found"})
@@ -275,7 +213,7 @@ class _ExecutorRequestHandler(BaseHTTPRequestHandler):
                 self._mkdir()
             return
         # sandbox POST: /v1/sandbox/sandboxes (create) or /v1/sandbox/sandboxes/{id}/execute
-        if path == _SANDBOX_PREFIX or path.startswith(f"{_SANDBOX_PREFIX}/"):
+        if path == SANDBOX_PREFIX or path.startswith(f"{SANDBOX_PREFIX}/"):
             with self._agent_trace(path.rsplit("/", 1)[-1], path):
                 self._sandbox_request("POST", path, {})
             return
@@ -287,14 +225,14 @@ class _ExecutorRequestHandler(BaseHTTPRequestHandler):
             self._upload()
             return
         # sandbox PUT: /v1/sandbox/sandboxes/{id}/files/write
-        if path.startswith(f"{_SANDBOX_PREFIX}/"):
+        if path.startswith(f"{SANDBOX_PREFIX}/"):
             self._sandbox_request("PUT", path, parse_qs(urlsplit(self.path).query))
             return
         self._write_json(HTTPStatus.NOT_FOUND, {"message": "endpoint not found"})
 
     def _handle_delete(self) -> None:
         path = urlsplit(self.path).path
-        if path.startswith(f"{_SANDBOX_PREFIX}/"):
+        if path.startswith(f"{SANDBOX_PREFIX}/"):
             self._sandbox_request("DELETE", path, {})
             return
         self._write_json(HTTPStatus.NOT_FOUND, {"message": "endpoint not found"})
@@ -847,7 +785,7 @@ class _ExecutorRequestHandler(BaseHTTPRequestHandler):
         add a branch in _dispatch_sandbox, this layer stays untouched."""
         parsed = urlsplit(self.path)
         path = parsed.path
-        if path == _SANDBOX_PREFIX or path.startswith(f"{_SANDBOX_PREFIX}/"):
+        if path == SANDBOX_PREFIX or path.startswith(f"{SANDBOX_PREFIX}/"):
             # This method never consumes a request body; drop keep-alive so a
             # pipelined next request cannot read the previous body's leftovers.
             self.close_connection = True
