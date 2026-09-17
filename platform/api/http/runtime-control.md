@@ -15,7 +15,8 @@ sandboxd Start 环境包含 `ADX_INSTANCE_ID`、`ADX_RUNTIME_ID`、`ADX_OWNERSHI
   "phase": "running",
   "checkpoint": null,
   "active_requests": 0,
-  "active_commands": 0
+  "active_commands": 0,
+  "activity_revision": 0
 }
 ```
 
@@ -42,8 +43,8 @@ Prepared 仅证明实例内的 handoff 准备完成，不代表 checkpoint 制�
 
 ## 恢复
 
-`restore` handoff 后，RRT 重新读取完整执行身份。身份变化要求 ownership_generation 增大。恢复端不能改变已继承监听 socket 的端口。身份校验通过后刷新子进程环境、可选 HTTP token，关闭继承的 HTTP/tunnel 会话，重新注册监听器，再进入 Running/Restored。源端 `resume` 保留原身份。
+`restore` handoff 后，RRT 重新读取完整执行身份。同实例恢复允许归属代次增加，或在同归属代次下推进 execution runtime ID；跨 Instance 克隆另校验 checkpoint 源身份与受控的 `ADX_RESTORE_ORIGIN`。恢复端不能改变已继承监听 socket 的端口。身份校验通过后刷新子进程环境、可选 HTTP token，关闭继承的 HTTP/tunnel 会话，重新注册监听器，再进入 Running/Restored。源端 `resume` 保留原身份。
 
 节点需使用目标执行记录查询状态，只有身份和阶段匹配后才能绑定目标路由。RRT 不向 Master 注册，不负责迁移归属，也不直接发布 Edge 路由。
 
-当前实现没有把 Node Manager 的完整暂停/恢复状态机、sandboxd Checkpoint、对象存储和 Redis 提交串成产品流程。`control_http.rs` 验证真实客户端/进程及 FIFO 通知；完整 checkpoint E2E 必须在已固定的 sandboxd PR #56 环境执行。
+完整暂停/恢复、sandboxd checkpoint、本地/S3 和 Redis 提交已接入产品流程，并有 [本地 FC 验收](../../../docs/testing/control-plane-roadmap.md)。`control_http.rs` 的真实客户端/进程与 FIFO 通知测试仅证明协议行为。正式 K8s FC 后置，不能由基础 K8s 通过推导。

@@ -1,5 +1,7 @@
 # 实例数量与资源分配Metrics验收
 
+> 当次验收/调查记录：版本、数字及未覆盖范围仅适用于文中批次；当前实现与状态见 [实施总览](control-plane-implementation.md) 和 [阶段路线图](control-plane-roadmap.md)。
+
 首批功能提交 `5f592cf57c9c0138fc3a22784c48e75a9c80f4fb`，已推送 `ci/control-plane-k8s-20260916`。指标口径和采集配置见[实例资源Metrics](instance-resource-metrics.md)。
 
 ## 实现与本地验证

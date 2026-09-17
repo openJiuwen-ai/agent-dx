@@ -1,5 +1,7 @@
 # Collector SWR 镜像同步
 
+> 当次验收/调查记录：版本、数字及未覆盖范围仅适用于文中批次；当前实现与状态见 [实施总览](control-plane-implementation.md) 和 [阶段路线图](control-plane-roadmap.md)。
+
 - 验收：[Buildkite #20](https://buildkite.com/agent-dx/agent-dx/builds/20)，独立 `collector-sync` 步骤通过。
 - 同步脚本提交：`bb3f8e5175e058def452d6f0770bf26c665ee869`。
 - 上游版本：OpenTelemetry Collector Contrib `0.161.0`，平台 `linux/amd64`。

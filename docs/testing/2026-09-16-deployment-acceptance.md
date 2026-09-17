@@ -1,5 +1,7 @@
 # 部署接线与公开密钥管理验收
 
+> 当次验收/调查记录：版本、数字及未覆盖范围仅适用于文中批次；当前实现与状态见 [实施总览](control-plane-implementation.md) 和 [阶段路线图](control-plane-roadmap.md)。
+
 后续已完成 package-v22 的整份安装示例启动复验，见[完整安装示例验收](2026-09-16-installed-example.md)。以下保留 package-v18 当次证据及范围。
 
 2026-09-16，修复统一部署示例的三处不匹配：Edge 控制路由使用可解析的 exact/prefix 格式并包含管理接口；Edge 上游对应本机 HTTP Frontend；Edge 与 Node Proxy 两侧配置完整 mTLS。示例的内部服务地址采用单机回环地址，资源源采用 auto，并配置 SQLite 降级日志。

@@ -1,5 +1,7 @@
 # 节点失效与恢复清理验收
 
+> 当次验收/调查记录：版本、数字及未覆盖范围仅适用于文中批次；当前实现与状态见 [实施总览](control-plane-implementation.md) 和 [阶段路线图](control-plane-roadmap.md)。
+
 2026-09-16，阶段4第一部分按已确认的契约实现：心跳超时判旧执行失效，原 Node Manager 恢复后对账清理。本轮尚不实现跨节点 checkpoint 恢复。
 
 ## 实现

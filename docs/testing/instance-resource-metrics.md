@@ -1,6 +1,6 @@
 # 实例数量与资源分配 Metrics
 
-阶段8首批能力，已通过[本地与Buildkite #17验收](2026-09-16-metrics-acceptance.md)。Master与Node Manager可通过配置 `metrics_listen` 启用HTTP `GET /metrics`，未配置时不开端口。示例配置使用Master `127.0.0.1:19090`、Node Manager `127.0.0.1:19091`；`adxctl`按服务配置下发。其他路径/方法返回404。端点用于监控采集，没有用户API Key认证；跨机采集时应绑定部署的私有监控接口并由部署环境限制访问。
+阶段8首批能力，后续 [Buildkite #21](2026-09-17-observability-k8s.md) 已复验；首批已通过[本地与Buildkite #17验收](2026-09-16-metrics-acceptance.md)。Master与Node Manager可通过配置 `metrics_listen` 启用HTTP `GET /metrics`，未配置时不开端口。示例配置使用Master `127.0.0.1:19090`、Node Manager `127.0.0.1:19091`；`adxctl`按服务配置下发。其他路径/方法返回404。端点用于监控采集，没有用户API Key认证；跨机采集时应绑定部署的私有监控接口并由部署环境限制访问。
 
 ## 指标口径
 
@@ -22,7 +22,7 @@
 
 capacity是可分配上限（设备仅计健康库存）；reserved来自实际账本，包含待启动预留。available为当前可调度余量，不可调度时为0，设备采集过期也为0。overcommitted显示超过当前容量的占用；设备消失或变为不健康不抹掉原分配，模型标签来自原分配记录。没有设备也没有保留分配的型号不输出设备时间序列。
 
-CPU使用量等既有 `adx_instance_*` 指标保持，由RuntimeBackend采样。使用量与reserved不同，不应互相替代；高基数实例明细配置和完整采样失败诊断后续补齐。
+CPU使用量等既有 `adx_instance_*` 指标保持，由RuntimeBackend采样。使用量与reserved不同，不应互相替代；当前使用量指标带 `instance_id` 和 `runtime_id`，无独立明细开关；采样年龄可诊断陈旧数据，完整采样失败计数尚未提供。
 
 Master导出当前已应用的目录与调度账本，不在抓取时访问Redis。状态锁繁忙或需要权威恢复时返回503，让采集器标记该次抓取不可用，避免输出假零。跨组件采样并非原子快照：Master反映最近提交，节点故障降级期间两端允许出现差异。
 

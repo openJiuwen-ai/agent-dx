@@ -44,6 +44,6 @@ JUnit含清理共8项，无失败、错误、跳过；`cleanup_errors=[]`、`mis
 - Buildkite日志包含部署指令、逐组RUN/PASS及METRICS/COLLECTION/TRACE PASS。产物为`out/buildkite/acceptance/`中的result.json、case-results.json、junit.xml、placement.json及每节点采集记录，累计汇总为`out/buildkite/summaries/e2e.json`。
 - 下载后的核验摘要：`out/ci/stage-7/preflight/build-21-evidence/verified.json`；本地完整日志：`out/ci/stage-8/k8s-21/`。
 
-## 尚未完成的范围
+## 验收范围与后置事项
 
-统一的实时队列满丢弃指标单列待办；现有导出成功/失败Span计数与SDK队列丢弃不是同一口径。真实GPU/NPU、FC双克隆问题、跨宿主及长稳验证继续按原待办推进。当前验收不覆盖任意长时间中断、Pod删除后采集状态持久化、SDK事务根Span或用户进程内部Span。
+统一的实时队列满丢弃指标按用户决定后置，不阻塞本期阶段8完成；现有导出成功/失败Span计数与SDK队列丢弃不是同一口径。真实GPU/NPU、FC双克隆问题、跨宿主及长稳验证继续按原待办推进。当前验收不覆盖任意长时间中断、Pod删除后采集状态持久化、SDK事务根Span或用户进程内部Span。

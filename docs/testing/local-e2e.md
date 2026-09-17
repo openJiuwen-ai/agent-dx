@@ -1,5 +1,7 @@
 # Local public SDK acceptance
 
+> Historical local/driver integration record. Counts and unavailable-CI statements below refer to those batches. The current driver has seven groups; hosted K8s has since passed [Buildkite #21](2026-09-17-observability-k8s.md). Use [current instructions](../../build/e2e/README.md) for reproduction.
+
 The local Linux ARM64 environment runs two isolated Docker nodes. Each node runs
 real sandboxd (PR #56, `efc201531d7e2e9d69505da151eb66084b61eebf`), Node Manager
 and Node Proxy. Node 1 also hosts Redis 7.2.5, Master with an embedded Domain,
@@ -13,7 +15,7 @@ instance. The test registry is local and separate from the platform data path.
 
 Resource observations read each Linux container's cgroup CPU/memory limits and
 filesystem free capacity, then reserve capacity for infrastructure. This test
-observation producer is not the planned production sandboxd collector.
+observation producer is not the production sandboxd collector.
 
 ## Reproduction and evidence
 
@@ -114,7 +116,7 @@ attempts retain separate results and also confirmed scoped cleanup.
 
 `.buildkite/pipeline.yml` uses the same build/deployment entrypoints with an
 artifact handoff. Its YAML/dependency/artifact structure and shell syntax were
-checked locally. A native amd64 Buildkite run has not been triggered; configuring
+checked locally. At that time a native amd64 Buildkite run had not been triggered; configuring
 queues and digest-pinned runtime images and publishing a clean revision remain
 necessary. The external backend build script and native release build were not
 rerun in this driver validation; it reused the previously verified package and
@@ -133,7 +135,7 @@ ownership and cleanup after a failed stop. The shared fixture's local regression
 also passed all five scenarios and cleaned its containers/network
 (`out/ci/k8s-e2e/local-regression/result.json`). Kubernetes-specific Pod addressing
 and backend startup waiting were checked in source/contract validation only.
-No target kubeconfig was available for a real cluster run; neither these tests
+At that time no target kubeconfig was available for a real cluster run; neither these tests
 nor the prior Docker results establish Kubernetes or remote Buildkite acceptance.
 
 The Kubernetes pipeline now directly reuses the existing CI `default/linux/amd64`
@@ -146,4 +148,4 @@ local contract evidence, not a hosted CI run.
 
 ## 2026-09-16 放置约束扩展
 
-基础门禁现为六组。package-v17 已完成新一轮双节点真实验收，包含六项亲和／反亲和和节点偏好规则；结果、制品身份与正式 K8s 边界见 [本轮记录](2026-09-16-placement-e2e.md)。以上较早结果保留其当时的覆盖范围。
+该批次基础门禁扩展为六组（当前为七组）。package-v17 已完成新一轮双节点真实验收，包含六项亲和／反亲和和节点偏好规则；结果、制品身份与正式 K8s 边界见 [本轮记录](2026-09-16-placement-e2e.md)。以上较早结果保留其当时的覆盖范围。

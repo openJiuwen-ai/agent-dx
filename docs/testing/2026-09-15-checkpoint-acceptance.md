@@ -1,5 +1,7 @@
 # 同节点暂停／恢复本地验收
 
+> 当次验收/调查记录：版本、数字及未覆盖范围仅适用于文中批次；当前实现与状态见 [实施总览](control-plane-implementation.md) 和 [阶段路线图](control-plane-roadmap.md)。
+
 日期：2026-09-15。结论：阶段 1 的真实公共 SDK 本地验收通过。部署为一个 Lima ARM64 KVM 节点，控制面与 Gateway 以独立进程运行，sandboxd 独立托管，实例使用 Firecracker 与 OCI RRT 镜像。
 
 ## 验收路径

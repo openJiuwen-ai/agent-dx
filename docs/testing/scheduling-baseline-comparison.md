@@ -119,16 +119,16 @@ python3 build/ci/compare_schedulers.py \
 
 | 证据 | 路径 |
 |---|---|
-| 源码、二进制及环境摘要 | [provenance-final.json](../../out/ci/scheduler-comparison/provenance-final.json) |
-| 旧二进制解析到的动态库 | [old-linked-libraries.txt](../../out/ci/scheduler-comparison/old-linked-libraries.txt) |
-| 正式中位数 | [summary.json](../../out/ci/scheduler-comparison/final-rounds/summary.json) |
-| 含预热的原始测量 | [raw.json](../../out/ci/scheduler-comparison/final-rounds/raw.json) |
-| 每条准确命令、日志名和日志摘要 | [commands.json](../../out/ci/scheduler-comparison/final-rounds/commands.json) |
-| 最终矩阵运行日志 | [final-driver.log](../../out/ci/scheduler-comparison/final-driver.log) |
-| 首版重试退化证据 | [首轮 summary.json](../../out/ci/scheduler-comparison/rounds/summary.json) |
-| 定向测试 | [adx-regression-final.log](../../out/ci/scheduler-comparison/adx-regression-final.log) |
-| 严格 Clippy | [adx-clippy-final.log](../../out/ci/scheduler-comparison/adx-clippy-final.log) |
-| 最终 Linux 构建 | [build-adx-retry-fix.log](../../out/ci/scheduler-comparison/build-adx-retry-fix.log) |
+| 源码、二进制及环境摘要 | `out/ci/scheduler-comparison/provenance-final.json`（当次本地产物） |
+| 旧二进制解析到的动态库 | `out/ci/scheduler-comparison/old-linked-libraries.txt`（当次本地产物） |
+| 正式中位数 | `out/ci/scheduler-comparison/final-rounds/summary.json`（当次本地产物） |
+| 含预热的原始测量 | `out/ci/scheduler-comparison/final-rounds/raw.json`（当次本地产物） |
+| 每条准确命令、日志名和日志摘要 | `out/ci/scheduler-comparison/final-rounds/commands.json`（当次本地产物） |
+| 最终矩阵运行日志 | `out/ci/scheduler-comparison/final-driver.log`（当次本地产物） |
+| 首版重试退化证据 | `out/ci/scheduler-comparison/rounds/summary.json`（当次本地产物） |
+| 定向测试 | `out/ci/scheduler-comparison/adx-regression-final.log`（当次本地产物） |
+| 严格 Clippy | `out/ci/scheduler-comparison/adx-clippy-final.log`（当次本地产物） |
+| 最终 Linux 构建 | `out/ci/scheduler-comparison/build-adx-retry-fix.log`（当次本地产物） |
 
 ## 尚未测到的范围
 

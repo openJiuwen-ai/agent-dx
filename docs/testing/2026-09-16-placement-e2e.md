@@ -1,5 +1,7 @@
 # 双节点放置约束端到端验收
 
+> 当次验收/调查记录：版本、数字及未覆盖范围仅适用于文中批次；当前实现与状态见 [实施总览](control-plane-implementation.md) 和 [阶段路线图](control-plane-roadmap.md)。
+
 2026-09-16，统一 package-v17 的 Linux ARM64 release 制品在本地 Docker 双节点环境通过六组基础验收。产品调用链使用安装后的 Sandbox SDK、Edge、Frontend、Master/Domain、Node Manager、Node Proxy、外部 sandboxd 和真实 RRT；只读 Redis 目录用于核对实际归属和资源释放。
 
 ## 结果

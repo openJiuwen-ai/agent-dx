@@ -1,6 +1,6 @@
 # Sandbox HTTP adapter and Agent compatibility routes
 
-This module preserves the Sandbox HTTP paths and payloads and the nine `/api/agent` entrypoints. It is a library for an embedding service, not a standalone server.
+This module preserves the Sandbox HTTP paths and payloads and the nine `/api/agent` entrypoints. It provides an embeddable router library and the standalone `cmd/adx-sandbox-api` service.
 
 ## Retained code
 
@@ -14,11 +14,11 @@ The imported runtime SDK, function/Job helpers, scheduler proxy, IAM implementat
 
 ## Host integration
 
-`RegisterRoutes(router, dependencies)` validates all Sandbox dependencies before mounting any routes. The host supplies execution transport, instance-state reads, API Key verification, Master address resolution and a configured snapshot HTTP client. There is no default connection to an old runtime or metadata store. Missing dependencies fail registration.
+`RegisterRoutes(router, dependencies)` validates all Sandbox dependencies before mounting any routes. The host supplies execution transport, instance-state reads, API Key verification, Master address resolution and a configured Master SnapshotService gRPC client. There is no default connection to an old runtime or metadata store. Missing dependencies fail registration.
 
 API Key verification returns a tenant/admin identity. Incoming tenant headers are replaced with the verified tenant. Lifecycle and invocation handlers enforce instance ownership; the explicit admin role permits administrative operations. The host's verifier owns expiry and revocation policy.
 
-Execution currently accepts the imported protobuf payloads (`Create`, `Invoke`, and lifecycle signal payloads). This is an interim HTTP compatibility adapter, **not the new Master/Node Manager protocol implementation**. Its small local encoding structures are not a runtime SDK. `controlbackend` now translates the supported create/delete path to Instance RPC, caches ownership and API key validation, and `cmd/adx-sandbox-api` supplies a configurable HTTPS entrypoint. Unsupported operations return explicit errors. See [service wiring and validation](../../../docs/testing/frontend-control.md).
+Execution currently accepts the imported protobuf payloads (`Create`, `Invoke`, and lifecycle signal payloads). This is an interim HTTP compatibility adapter, **not the new Master/Node Manager protocol implementation**. Its small local encoding structures are not a runtime SDK. `controlbackend` now translates the supported create/delete, pause/resume and reusable-snapshot paths to Instance RPC, caches ownership and API key validation, and `cmd/adx-sandbox-api` supplies a configurable HTTPS entrypoint. Unsupported operations return explicit errors. See [service wiring and validation](../../../docs/testing/frontend-control.md).
 
 ## Agent entrypoints
 

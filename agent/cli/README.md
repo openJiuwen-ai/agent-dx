@@ -1,6 +1,6 @@
 # adx 命令行
 
-Agent Distributed Executor（agent-dx）的命令行工具。Agent 本质上就是函数,`adx` 把函数的注册、调用包装成对底层 FaaS HTTP 接口的调用。
+Agent Distributed Executor（agent-dx）的命令行工具。当前实现把 Agent 注册、调用包装成旧 FaaS HTTP 请求；这描述现有适配，不是新 Instance 平台的抽象。需要兼容 meta_service/frontend，新平台 `adxctl` 部署不会提供这些旧服务。
 
 - `adx deploy` —— 通过 meta_service 注册一个 agent(函数)。
 - `adx exec` —— 调用 agent(函数),并以 SSE 流式输出返回结果;未传 `--args` 时进入交互模式。
@@ -8,9 +8,10 @@ Agent Distributed Executor（agent-dx）的命令行工具。Agent 本质上就�
 
 ## 安装
 
-先构建 whl 再安装:
+从仓库根目录进入 `agent/cli`，先构建 wheel 再安装:
 
 ```bash
+cd agent/cli
 python setup.py bdist_wheel
 pip install dist/agent_dx_cli-*.whl
 ```
@@ -162,7 +163,7 @@ adx exec --agent <AGENT> --server 127.0.0.1:31180 \
 
 ## 测试
 
-测试代码位于仓库根目录的 `agent/tests/cli/`。在**仓库根目录**执行(`pytest.ini` 已把 `cli/` 加入路径):
+测试代码位于仓库根目录的 `agent/tests/cli/`。在**仓库根目录**执行(`pytest.ini` 已把 `agent/cli/` 加入路径):
 
 ```bash
 python -m pytest -q

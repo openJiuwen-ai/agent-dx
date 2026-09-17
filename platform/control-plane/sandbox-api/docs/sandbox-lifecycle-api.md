@@ -3,7 +3,9 @@
 This document is the Frontend-owned reference for the sandbox lifecycle HTTP
 surface. It describes the HTTP contract implemented by the Frontend; snapshot
 catalog state, checkpoint bytes, and scheduler decisions are owned by the
-downstream services.
+Rust Master (catalog, placement, Redis) and Node Manager (lifecycle and execution).
+
+**Support boundary:** the compatibility router accepts a larger schema than the new Instance backend. Network policy, mounts, entrypoint inheritance, extra_config, independent request/limit values, published user ports and per-Instance data-plane security are rejected by `controlbackend/create.go`. `failover=true` and reload are not implemented; ordinary `/invoke` compatibility transport is also unavailable. Commands/files use Edge → Node Proxy → RRT. Node/Instance placement, idle deletion and restart policy are wired. See [placement](../../../../docs/testing/http-node-placement.md) and [node lifecycle](../../../../docs/testing/node-lifecycle.md).
 
 All ordinary responses use the Frontend response envelope:
 
@@ -21,22 +23,16 @@ SSE create responses are an exception and are described below.
 | --- | --- | --- | --- |
 | Create sandbox | `POST /api/sandbox/v1/sandboxes` | create fields, including optional `snapshotId` and `failover` | `{"sandboxId":"default-name","instanceId":"default-name","status":"running","requestId":"..."}`; `tunnel` is included when requested |
 | Create reusable snapshot | `POST /api/sandbox/v1/sandboxes/{sandboxID}/snapshots` | `{"name":"optional","timeoutSeconds":300}` | `{"snapshotId":"...","names":["optional"]}` |
-| Get reusable snapshot | `GET /api/sandbox/v1/snapshots/{snapshotID}` | none | tenant-scoped catalog JSON returned by the active Function Master |
-| List reusable snapshots | `GET /api/sandbox/v1/snapshots?name=&pageToken=&pageSize=` | none | tenant-scoped catalog JSON returned by the active Function Master |
-| Delete reusable snapshot | `DELETE /api/sandbox/v1/snapshots/{snapshotID}` | none | tenant-scoped catalog JSON returned by the active Function Master |
+| Get reusable snapshot | `GET /api/sandbox/v1/snapshots/{snapshotID}` | none | tenant-scoped catalog JSON returned by the Rust Master SnapshotService |
+| List reusable snapshots | `GET /api/sandbox/v1/snapshots?name=&pageToken=&pageSize=` | none | tenant-scoped catalog JSON returned by the Rust Master SnapshotService |
+| Delete reusable snapshot | `DELETE /api/sandbox/v1/snapshots/{snapshotID}` | none | tenant-scoped catalog JSON returned by the Rust Master SnapshotService |
 | Pause | `POST /api/sandbox/v1/sandboxes/{sandboxID}/pause` | `{"ttlSeconds":90000,"timeoutSeconds":300}` | `{"sandboxId":"...","snapshotId":"...","size":8192,"state":"paused","expiresAt":...}` |
-| Resume | `POST /api/sandbox/v1/sandboxes/{sandboxID}/resume` | none | `{"sandboxId":"...","state":"running","routeAddress":"host:port","functionProxyId":"...","nodeId":"...","portMappings":{"8080":41080}}` |
-| Reload | `POST /api/sandbox/v1/sandboxes/{sandboxID}/reload` | none | `{"success":true}` |
+| Resume | `POST /api/sandbox/v1/sandboxes/{sandboxID}/resume` | none | `{"sandboxId":"...","state":"running","routeAddress":"host:port","functionProxyId":"...","nodeId":"...","portMappings":{}}` |
+| Reload (compatibility route only) | `POST /api/sandbox/v1/sandboxes/{sandboxID}/reload` | none | unsupported by the new Instance backend; no successful recovery result |
 
 `snapshotId` on the normal create route creates a new sandbox from a reusable
 snapshot. The snapshot is reusable; creating from it does not consume it.
-The downstream snapshot resolver decides whether the snapshot is READY and
-whether its function and resource type are compatible with the new request.
-It then applies the source template's create options. The current resolver does
-not independently validate every source/target reverse-tunnel mismatch, so a
-caller requesting a tunnel must use a source template with the same tunnel
-shape; otherwise the returned route may not correspond to a provisioned
-tunnel.
+The Rust Master resolves the tenant-scoped Ready snapshot, protects it with a restore reference and applies compatible template fields. A local-only artifact pins the clone to the source node; shared storage permits normal scheduling. A deleting snapshot admits only an already-held reference. Explicit image, runtime and scalar resource geometry must match the snapshot; omitted resources inherit. Clones receive independent Instance/backend identities and artifact copies. See [snapshot storage](../../../../docs/testing/snapshot-storage.md).
 
 Create uses the ordinary `X-Request-Id` header. It is optional: when absent,
 Frontend derives the request ID from the trace ID, echoes it as `X-Request-Id`,
@@ -73,41 +69,24 @@ pairs that reserved only the former 30-second response buffer remain accepted;
 Frontend preserves their scheduling budget and expands the effective create
 budget to include initialization. A create-only request likewise keeps its
 legacy `create - 30` scheduling budget before the outer budget is expanded.
+These compatibility budget calculations do not create a durable scheduling deadline: `controlbackend` bounds Master.CreateInstance by its configured `rpc_timeout_seconds` (and the incoming request context). An accepted task may continue after the caller times out.
 A legacy environment value below the new
 default is normalized to the default 90-second create and 30-second schedule
 budgets. Sandbox action invocation keeps its independent 60-second timeout.
 
-For a snapshot create, positive `cpu` or `memory` values override the template.
-Omitted, zero, and `null` values preserve template inheritance: `null`
-unmarshals to the Go zero value and follows the same non-positive-resource path
-as `0`. This special handling applies only when `snapshotId` is non-empty; a
-normal create retains the usual Frontend resource defaults.
+For snapshot creation, omitted/zero resource values inherit the source. Positive CPU/memory/disk values must equal its resource geometry; restoring with larger limits or resizing is rejected. This applies to the new Rust resolver even though the HTTP handler can encode positive overrides.
 
-The scheduler may select a fresh target for a create from a reusable snapshot
-or for resume. Neither operation is pinned to the source node. By contrast,
-reload and failover are same-node local-recovery operations, not reusable or
-cross-node restore operations. They restore the latest local recovery
-candidate and require it to exist. The selector filters
-`localRecoveryCandidate`; internal checkpoints and Pause-created artifacts can
-both carry that flag, with no separate internal-only discriminator. A missing
-candidate, local-snapshot query failure, invalid metadata, or restore/deploy
-failure is an error; neither operation has an alternate recovery path.
-
-`failover` is a boolean create/configuration option that enables automatic
-same-node recovery after a qualifying sandbox failure. It is **not** an HTTP
-lifecycle operation: there is no `/failover` endpoint to call.
+Public resume uses the owner cache and calls the owning Node Manager; it performs same-node admission. Cross-node recovery of the same ID is the Master's failed-node recovery flow using a valid shared checkpoint, not a promise made by an ordinary resume request. `failover=true` and the compatibility reload route do not select that flow.
 
 ## Reusable snapshots
 
 Creating a reusable snapshot leaves its source sandbox running and requests a
 non-expiring snapshot. `name` is optional on raw HTTP; it may be absent or the
 empty string, but a supplied whitespace-only name is rejected. The resulting
-snapshot belongs to the tenant selected from `X-ADX-Tenant-ID` (or compatible
-`tenantId`), the authenticated tenant claim, or `default`.
+snapshot belongs to the verified API Key identity. The service replaces incoming tenant headers; a caller cannot claim another tenant via a header or body.
 
 Raw `timeoutSeconds` is honored for reusable snapshots and pause: it defaults
-to 300 and must be from 1 through 3600 when supplied. Frontend passes it as
-the checkpoint timeout and the direct-proxy lifecycle timeout. Pause also
+to 300 and must be from 1 through 3600 when supplied. Frontend encodes it into the Node checkpoint RPC timeout. The RPC context additionally includes the configured transport timeout. Pause also
 accepts `ttlSeconds`; omitted or zero becomes 90000 and only a negative value
 is rejected. Snapshot and Pause are currently the only lifecycle bodies with a
 caller-provided logical timeout; SDK HTTP transport waits use that logical
@@ -118,8 +97,7 @@ The SDK generates a fresh reusable-Snapshot request ID for each call. Raw HTTP
 clients retrying an uncertain result must reuse an ID only for the same source
 and name; they must not reuse one identity for different catalog content.
 
-The get/list/delete routes proxy that tenant-scoped catalog to the active
-Function Master. List accepts the optional `name`, `pageToken`, and `pageSize`
+The get/list/delete routes call the Rust Master SnapshotService with verified tenant context. List accepts the optional `name`, `pageToken`, and `pageSize`
 query parameters. Delete requires a non-empty `X-ADX-Request-ID`, which is
 forwarded to the catalog operation.
 
@@ -151,7 +129,7 @@ about an unknown network outcome outside Frontend.
 
 For pause, resume, reload, and snapshot creation, malformed or missing
 lifecycle IDs and invalid local input map to `400`; downstream business
-rejection maps to `409`; Frontend-to-proxy transport failure maps to `503`; and
+rejection maps to `409`; Frontend-to-Node transport failure maps to `503`; and
 malformed/invalid authoritative response data maps to `500`. Reload retains
 its `{"success":false}` decoded data on an error response. A `503`, a gateway
 failure, or a lost connection can be an unknown result: retry only with the
@@ -163,15 +141,14 @@ SDK behavior is deliberately not identical to raw HTTP behavior:
 - `Sandbox.create_snapshot(name=None, timeout_seconds=300)` rejects blank names
   and validates an integral timeout from 1 through 3600. It sends
   `timeoutSeconds` and makes one HTTP attempt with that configured timeout plus
-  a 30-second buffer; raw HTTP forwards that field to the checkpoint and
-  direct-proxy lifecycle timeouts. The SDK treats gateway/connection failure
+  a 30-second buffer; raw HTTP forwards that field to the checkpoint RPC timeout. The SDK treats gateway/connection failure
   while creating a reusable snapshot as uncertain and does not silently retry
   it.
 - `Sandbox.pause(ttl_seconds=90000, *, timeout_seconds=300)` rejects zero,
   negative, and boolean TTLs and validates its keyword-only timeout from 1
   through 3600. Raw HTTP treats an omitted or zero `ttlSeconds` as `90000`,
   rejects only a negative value, and forwards `timeoutSeconds` as the
-  checkpoint/direct-proxy lifecycle timeout. The SDK request timeout is the
+  checkpoint RPC timeout. The SDK request timeout is the
   configured timeout plus 30 seconds.
 - Pause, resume, and reload use up to three SDK HTTP attempts for retryable
   transport/gateway failures, retaining one `pause-`, `resume-`, or `reload-`
@@ -197,20 +174,12 @@ create-timeout handling, replay/identity checks, and business failures happen
 after `accepted` and are reported by that final event. After `accepted`, the
 final event—not a later HTTP status—is the completion boundary.
 
-## Pause, resume, reload, and routing
+## Pause, resume, and publication
 
-Pause succeeds only with an authoritative non-empty snapshot ID equal to its
-request ID and a positive snapshot size. Its response reports `state: "paused"`
-and an `expiresAt` calculated from the effective TTL.
+Pause requires a complete checkpoint, positive size, matching request/snapshot ID and a published Paused record. Object-storage upload must finish before submission. A local SQLite Journaled result means cluster publication is pending and returns an unavailable error, not pause success.
 
-Resume succeeds only with an authoritative result for the requested sandbox
-that includes a route address and function-proxy ID. Its returned route and
-port mappings identify the selected target. SandboxRouter route-cache
-convergence happens separately through its watch/read-through path; local route
-publication is explicitly outside the resume success boundary.
+Resume requires a matching Running record, completed RRT readiness and Node Proxy binding, followed by Master/Redis submission. `functionProxyId` is a retained HTTP field populated with the node ID; it does not imply a FunctionProxy process. Current `portMappings` is empty. Master route publication and Edge receiving that update are asynchronous; a successful operation does not guarantee every Edge already has the new route.
 
-Reload sends the local-recovery request and reports only success or failure.
-It restores only from an existing latest local recovery candidate.
-Missing candidates and query, metadata, or restore failures remain failures;
-reload has no alternate recovery path. Reload is distinct from reusable
-snapshot restore and from automatic failover.
+Reusable snapshot creation briefly pauses the source, copies its artifact, publishes the catalog and resumes the source. Success requires both the snapshot and resumed source result to be committed. It does not promise uninterrupted source execution. Deleting a referenced snapshot marks it deleting and prevents new references; physical removal follows reference release and backend confirmation.
+
+The reload route retains request validation and error shaping for compatibility; its new backend returns Unimplemented. Do not use it as a recovery command.

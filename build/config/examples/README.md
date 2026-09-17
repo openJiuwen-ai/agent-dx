@@ -9,7 +9,7 @@ certificates, supplied by deployment. Certificates must include the configured
 name. Keep private keys and bootstrap API key files readable only by the service.
 API keys contain 32–512 bytes. Configurations do not embed the raw key.
 
-The Node entrypoint consumes an external observation file with this shape:
+The shipped deployment selects `resource_source.kind=auto`; `kind=sandboxd` selects the external resource collector. See [resource sources](../../../docs/testing/node-lifecycle.md). The compatible, mutually exclusive `capacity_file` input consumes an observation file with this shape:
 
 ```json
 {
@@ -22,20 +22,19 @@ The Node entrypoint consumes an external observation file with this shape:
 The resource producer must atomically replace that file with measured capacity,
 physical devices and a future expiry; `0` above is an expired placeholder. A
 missing/invalid update uses the last observation until expiry, then closes new
-admission. The file reader is not the future sandboxd collector or automatic
-hardware detector. Do not publish a configured resource budget as a measurement.
+admission. The file reader is separate from the implemented sandboxd collector and automatic capacity source. Do not publish a configured resource budget as a measurement.
 
 Node startup obtains the complete authoritative catalog before reconciling
 managed runtimes. It restores committed running Instances and cleans runtimes
 confirmed unowned or left by uncommitted starts. An unavailable Master never
-means an empty catalog. The planned CLI stop cleanup remains a separate operation.
+means an empty catalog. Explicit CLI stop performs local Instance cleanup before service shutdown.
 
 
 Master 配置 `advertised_address` 发布可续期的 Redis 地址，默认 TTL 15 秒。Node 与 Sandbox API 示例通过相同 Redis namespace 发现它；也可改用显式 `master_address`，不能同时配置两种方式。Master 心跳超时默认 30 秒，Node 报告间隔应显著小于该值。Node 重启先注册为对账中，完成权威目录恢复后才开放新分配。完整契约见 [发现与恢复](../../../docs/testing/recovery-discovery.md)。
 
 Edge 的 `edge-control.json` 与 Master 使用相同 Redis namespace；Master `tls.peers` 必须登记 Edge 证书。Node Proxy 设置 `ADX_DATA_PLANE_NODE_PROXY_ACTIVITY_UDS_DIR=/run/adx`，Node Manager 的 `proxy_socket` 相应为 `/run/adx/route.sock`。代理首次启动与重新同步期间关闭数据准入，完成 Node Manager 全量绑定同步后开放。详见 [路由发布与本机同步](../../../docs/testing/route-publication.md)。
 
-See [process deployment](../../../docs/testing/process-deployment.md) for foreground supervisor commands, managed Redis AOF configuration and explicit stop cleanup. The deployment example requires environment-provided certificates, sandboxd and resource observations; it is not a self-contained E2E environment.
+See [process deployment](../../../docs/testing/process-deployment.md) for foreground supervisor commands, managed Redis AOF configuration and explicit stop cleanup. The deployment example requires environment-provided certificates, sandboxd and a configured resource source; it is not a self-contained E2E environment.
 
 For a co-located Edge, Sandbox API can set `loopback_http: true` with a literal
 loopback `listen` address such as `127.0.0.1:8888`. Edge forwards control requests

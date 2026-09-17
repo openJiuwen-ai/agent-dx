@@ -39,7 +39,7 @@ Master 使用单调时钟判断心跳是否过期，`heartbeat_timeout_seconds` 
 
 节点回来后重新进入对账握手；Master 重启后同样要求重新对账。恢复的节点从 Master 加载目录完成时起有一个心跳超时周期的报到期限，期间路由关闭；逾期未报到的旧执行失效，迟到注册和结果提交也先检查期限。较长的对账期间继续发送关闭准入的心跳。CommitInstance 校验节点证书、当前进程 session、完整 Assignment、Spec 和 revision。Master 派发 Create 也携带目标 Node session，节点拒绝发送给旧进程身份的迟到请求。
 
-失效标记在 Redis/Master 重启后继续有效。迟到的 Running、Paused 或自动重启结果不能恢复旧执行资格。原 Node Manager 恢复连接后先清理旧控制器与实际运行时，再开放准入。跨节点 checkpoint 恢复和归属转移仍待后续实现，详见 [节点失效契约](node-failure-takeover.md)。
+失效标记在 Redis/Master 重启后继续有效。迟到的 Running、Paused 或自动重启结果不能恢复旧执行资格。原 Node Manager 恢复连接后先清理旧控制器与实际运行时，再开放准入。有效共享 checkpoint 的跨节点恢复和归属转移已实现，并通过本地 FC 验收，详见 [节点失效契约](node-failure-takeover.md)。
 
 ## 本机恢复规则
 
@@ -71,7 +71,7 @@ ADX_TEST_REDIS_SERVER=/path/to/redis-server ADX_TEST_SANDBOX_API=/path/to/adx-sa
 
 本地红灯、回归、真实 Redis、mTLS RPC 和 Go 进程验证证据保存于 `out/ci/recovery-discovery/`。红灯首先确认 RuntimeObservation／inventory／reconcile 接口缺失。真实 Redis 检查发现过期与 epoch 切换，RPC 检查心跳重复／过期／重新对账／旧 session 拒绝，Node 测试检查不重新启动、资源恢复、未提交实例清理以及失败时保留占用。
 
-这些是组件与服务协作验证：运行时、RRT 就绪与本机路由部分使用测试后端。后续 [路由发布阶段](route-publication.md) 已接入 Edge 订阅与 Node Proxy 完整启动同步。真实 sandboxd、统一 supervisor 和两节点 SDK 创建—执行—删除的 Buildkite 验收仍待接线。
+这些是组件与服务协作验证：运行时、RRT 就绪与本机路由部分使用测试后端。后续 [路由发布阶段](route-publication.md) 已接入 Edge 订阅与 Node Proxy 完整启动同步。真实 sandboxd、统一 supervisor 和两节点 SDK 链路已通过 [Buildkite #21](2026-09-17-observability-k8s.md)；本段所列早期组件结果仍不等同于该 E2E。
 
 
 ## 本轮结果

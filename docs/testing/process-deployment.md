@@ -2,7 +2,7 @@
 
 实际安装和配置步骤见 [单机进程部署](../deployment/standalone.md)。本文保留 CLI 实现与早期验收记录。
 
-2026-09-15。新增 `platform/control-plane/control-cli`，以 Rust `adxctl` 承载部署配置和轻量 supervisor；新增 Node Manager 本机停止清理接口。统一包同时携带控制面和数据面。本阶段验证进程托管、停止契约和出包，完整 Sandbox SDK E2E 尚未完成。
+2026-09-15。新增 `platform/control-plane/control-cli`，以 Rust `adxctl` 承载部署配置和轻量 supervisor；新增 Node Manager 本机停止清理接口。统一包同时携带控制面和数据面。本文描述现有进程托管、停止契约和出包；末尾保留早期组件测试。完整 SDK 基础 K8s 已通过 [Buildkite #21](2026-09-17-observability-k8s.md)。
 
 ## 模块
 
@@ -90,7 +90,7 @@ package/
 - 真实包 smoke 托管真实 Redis＋Master，检查 Redis 地址发布、Master 强制退出后的新 PID／新 epoch，以及 `adxctl stop` 后 supervisor 退出。
 - Go 协议生成、全包测试和服务构建单独执行；原有 HTTPS／RPC／Redis 协作套件继续回归。
 
-这不是两节点完整平台验收：没有启动真实 sandboxd／RRT，也没有通过安装后的公开 SDK 完成创建—命令—文件—删除。下一阶段需要环境驱动器、真实实例镜像／资源采集接线及 SDK 用例；然后才能启用 Buildkite E2E 门禁。不会用本阶段的包构建或 Master smoke 代替该门禁。
+这不是两节点完整平台验收：没有启动真实 sandboxd／RRT，也没有通过安装后的公开 SDK 完成创建—命令—文件—删除。后续环境驱动器、实例镜像、资源源与 SDK 用例已接通，正式结果见本文开头。不会用本阶段的包构建或 Master smoke 代替该门禁。
 
 ## 本轮结果
 

@@ -1,5 +1,7 @@
 # Firecracker 双克隆 CONNECT 超时取证
 
+> 当次验收/调查记录：版本、数字及未覆盖范围仅适用于文中批次；当前实现与状态见 [实施总览](control-plane-implementation.md) 和 [阶段路线图](control-plane-roadmap.md)。
+
 统一 package-v17 在 Lima `adx-fc` 上运行 r21、r22，均在第一个克隆的文件写入失败；每次已通过10/18项，包括新增的SDK实例标签、亲和条件组及偏好参数接线。r22补充网络取证，产品二进制、SDK、RRT与超时设置保持相同。两轮完整验收均失败，不能用其中已通过的用例代替完整通过。
 
 ## 已确认的故障边界

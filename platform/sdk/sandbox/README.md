@@ -1,6 +1,6 @@
 # Agent DX Sandbox SDKs
 
-This repository is the multi-language SDK workspace for Agent DX remote
+This subtree is the multi-language SDK workspace for Agent DX remote
 sandboxes.  The Python SDK is implemented today; Go, Rust, and Java are reserved
 as first-class SDK directories so future clients can share the same repository,
 release process, examples policy, and protocol vocabulary.
@@ -20,16 +20,16 @@ release process, examples policy, and protocol vocabulary.
 See [`python/README.md`](python/README.md) for install/configuration details and
 runnable examples.
 
-Quick build from the workspace root:
+Quick build from the monorepo root:
 
 ```bash
-PYTHON=python3 bash build.sh /tmp/adx-sandbox-dist
+PYTHON=python3 bash platform/sdk/sandbox/build.sh /tmp/adx-sandbox-dist
 ```
 
 Equivalent Python-only build:
 
 ```bash
-cd python
+cd platform/sdk/sandbox/python
 PYTHON=python3 bash build.sh /tmp/adx-sandbox-dist
 ```
 
@@ -51,7 +51,7 @@ All language SDKs should keep the same user-facing concepts:
 
 All language SDKs should target the current frontend HTTP/WS contract instead
 of exposing runtime-internal ports to users. The detailed platform reference is
-maintained in the main adx workspace at `docs/features/sandbox-rest-api.md`.
+maintained in the [Go HTTP reference](../../control-plane/sandbox-api/docs/sandbox-lifecycle-api.md). That reference distinguishes retained client options from the new server's supported capabilities.
 
 ### Environment and auth
 
@@ -63,7 +63,7 @@ variables. Omitting it preserves the environment-based behavior below.
 | Setting | Meaning |
 | --- | --- |
 | `ADX_SERVER_ADDRESS` | Primary service entry `host:port`. Used for lifecycle and required `/direct` traffic. |
-| `ADX_TOKEN` | JWT used for authenticated service routes. |
+| `ADX_TOKEN` | API Key for the new platform; the SDK transports an opaque credential. |
 | `ADX_TLS` | `1/true/yes` selects `https://` for primary service routes; `0/false/no` selects plaintext HTTP. |
 | `ADX_GATEWAY_ADDRESS` | Optional gateway/router `host:port` for reverse tunnel and user port URLs; falls back to `ADX_SERVER_ADDRESS`. |
 | `ADX_GATEWAY_TLS` | `1/true/yes` selects `wss://` for `/tunnel` and `https://` for user port URLs; default is plaintext. |
@@ -76,7 +76,7 @@ Base path: `/api/sandbox/v1/sandboxes` on `ADX_SERVER_ADDRESS`.
 | --- | --- | --- | --- |
 | `POST` | `/api/sandbox/v1/sandboxes` | `CreateV1Request` JSON | `{sandboxId, instanceId, status, tunnel?}` |
 | `DELETE` | `/api/sandbox/v1/sandboxes/{sandboxID}` | none | idempotent teardown; `404` is treated as already deleted by the SDK |
-| `POST` | `/api/sandbox/v1/sandboxes/{sandboxID}/invoke` | `{"action": string, "args": object}` | action result JSON |
+| `POST` | `/api/sandbox/v1/sandboxes/{sandboxID}/invoke` | compatibility route | unsupported by the new backend; use `/direct` |
 
 `CreateV1Request` fields used by SDKs include `name`, `namespace`, `tenant`,
 `runtime`, `image`/`rootfs`, `ports`, `idleTimeoutSeconds`,
@@ -84,8 +84,7 @@ Base path: `/api/sandbox/v1/sandboxes` on `ADX_SERVER_ADDRESS`.
 `cpu_limit`, `mem_limit`, `storage_limit_mb`, `env`, `mounts`, `extra_config`,
 `tunnel`, and the
 optional per-sandbox `dataPlane` security policy. Python exposes the latter as
-`DataPlaneSecurityPolicy`; `tls` and `tls-token` are supported, unset fields
-inherit the server defaults, and `/direct` remains fixed to `tls-token`.
+`DataPlaneSecurityPolicy`; the client model accepts `tls` and `tls-token`, but per-sandbox policy is rejected by the new control backend. Direct remains TLS with authentication. Mounts, extra_config, public ports and independent limits in the retained schema are also not supported by this server.
 Frontend owns internal RRT port environment injection (`RRT_HTTP_PORT`,
 `RRT_TUNNEL_WS_PORT`, `RRT_TUNNEL_HTTP_PORT`); SDK callers should request
 features declaratively instead of setting those ports.
@@ -101,10 +100,7 @@ covered.
 
 ### Direct data plane
 
-SDKs should prefer the frontend `/direct` aliases and fall back to frontend
-`/invoke` only when `/direct` is unavailable. The frontend authenticates the
-request, strips platform credentials before proxying to sandboxRouter/RRT, and
-hides the internal RRT control port from user URLs.
+Commands/files use Edge `/direct` → Node Proxy → RRT. Edge authenticates and strips public credentials before node forwarding. The SDK retains a legacy `/invoke` fallback, but the new Go backend rejects that transport; it is not a second working data path.
 
 | Method | Path | Body / query | Use |
 | --- | --- | --- | --- |
@@ -122,7 +118,7 @@ SDKs should not expose it.
 | Surface | URL shape | Notes |
 | --- | --- | --- |
 | Reverse tunnel | `/tunnel/{safeID}` | SDK connects a local upstream to the gateway; default is plaintext `ws://` and does not send `ADX_TOKEN`. |
-| User port forwarding | `http://<sandbox-router>/<safeID>/<port>` | Returned by SDK `get_port_url(port)` for ports requested at create time. User service ports are public at router layer. |
+| User port forwarding | `http://<sandbox-router>/<safeID>/<port>` | Returned by SDK `get_port_url(port)` for ports requested at create time. The SDK URL helper remains; new control-plane publication of user ports is unsupported. |
 
 The shared action envelope is always `{"action": <name>, "args": {...}}`.
 Supported action names include process (`process.exec`, `process.start`,

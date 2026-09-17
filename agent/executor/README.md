@@ -1,8 +1,10 @@
 [中文](README.zh.md) | **English**
 
+> 当前使用旧 FaaS/外部运行时依赖，尚未完成通过 Sandbox SDK 接入新 Instance 平台。以下启动和部署说明要求兼容的 Agent 后端；平台基础 K8s 验收不覆盖这些 Agent 业务。
+
 # agent-dx-executor
 
-Platform-owned FaaS code package for custom-image Agent instances. It starts
+Agent-layer FaaS code package for custom-image Agent instances. It starts
 the executor HTTP server and user processes from the existing FaaS
 initializer. The wheel is installed into the Agent base image and is not a
 user-facing SDK.

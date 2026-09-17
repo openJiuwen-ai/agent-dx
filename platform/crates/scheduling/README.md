@@ -9,11 +9,12 @@
 | `adx-core/src/scheduling.rs` | Typed selectors, hard/soft policies, device inventories, card allocations and DeviceLedger |
 | `src/lib.rs` | Filter/Score interfaces, immutable cluster snapshot, profile validation, weighted selection |
 | `src/plugins.rs` | NodeAvailable, ResourceFit, ResourceBalance(Pack/Spread) |
+| `src/groups.rs` | Public node/Instance condition groups, reverse anti-affinity, weighted/ordered preferences |
 | `src/constraints.rs` | DeviceFit, NodeAffinity, InstanceAffinity, Topology; NodePreference, InstancePreference, TopologyPreference |
 | `master/src/domain.rs` | Queue ownership, framework call, atomic scalar/card reservation and release |
 | `node-manager` | Fresh inventory check, local scalar/card reservation, sandboxd device mapping and confirmed cleanup |
 
-Default filters, in order: `node-available → resource-fit → device-fit → node-affinity → instance-affinity → topology-spread`. These hard filters apply to every profile. Default scores: resource balance, node preference, Instance preference and topology preference, each with weight 1.
+Default filters, in order: `node-available → resource-fit → device-fit → node-affinity → placement-groups → instance-affinity → topology-spread`. These hard filters apply to every profile. Default scores: placement-group preference, resource balance, node preference, Instance preference and topology preference, each with weight 1.
 
 `Master::new(domain_count, placement)` installs that profile. `Framework::new(additional_filters, weighted_scores)` / `Master::with_framework` allow static Rust composition. Only eligible candidates are scored. Scores must be in `0..=MAX_SCORE` (3,000,000). Higher weighted sums win; ties use ascending node ID. Empty scoring configuration uses node ID and therefore disables soft preferences. Invalid names/weights/scores are rejected. Plugins must not mutate reservations or perform blocking network requests. Errors preserve queued work and do not consume capacity.
 
@@ -41,11 +42,11 @@ Eligible topology values come from available nodes matching the request's requir
 
 ScheduleAnyway prefers less-populated values but does not reject placement for skew; missing topology labels receive zero score. The default profile combines this preference with other scores, rather than claiming it overrides every other preference.
 
-Master incrementally publishes a coherent snapshot across all embedded Domains. Bounded rounds share its persistent roots; each reservation updates the view before the next request. Peer and spread checks see all recorded assignments. Selection remains within the Domain chosen by Global; these rules do not add cross-Domain retry or migration. Both queues and assignment ledgers are currently in memory and must be restored before exposing a restarted service.
+Master incrementally publishes a coherent snapshot across all embedded Domains. Bounded rounds share its persistent roots; each reservation updates the view before the next request. Peer and spread checks see all recorded assignments. Selection remains within the Domain chosen by Global; these rules do not add cross-Domain retry or migration. The waiting queue is memory-only and is not restored after restart. Master restores persisted assignments and ledger occupancy from Redis before node reconciliation and new admission.
 
 ## Contract and configuration
 
-`control.proto` carries typed policies, node labels/inventory and concrete allocations. Rust conversions reject unknown enums, missing constraint submessages, invalid selectors and duplicate allocations. The policy is available through Rust and internal gRPC contracts. CLI configuration, external Sandbox API field mapping and physical collector discovery are part of the remaining service assembly, not supplied by this scheduling library.
+`control.proto` carries typed policies, node labels/inventory and concrete allocations. Rust conversions reject unknown enums, missing constraint submessages, invalid selectors and duplicate allocations. The policy is available through Rust and internal gRPC contracts. Service configuration, resource sources and public HTTP node/Instance placement are wired outside this library; see [public placement](../../../docs/testing/http-node-placement.md). Public HTTP does not expose this internal topology-spread schema. Physical GPU/NPU execution remains unverified.
 
 Example `InstanceSpec.scheduling` JSON representation (the protobuf fields model the same structure):
 

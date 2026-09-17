@@ -8,7 +8,8 @@ usage, and backend requirements.
 
 The Python SDK supports:
 
-- Sandbox lifecycle: create, delete/kill, detached lifecycle flag.
+- Sandbox lifecycle: create, delete/kill, detached flag, pause/resume and reusable snapshot APIs.
+- Node and same-tenant Instance placement via labels and schedule_affinities.
 - Filesystem operations: write/read/exists/list/make_dir/stat/rename/remove,
   resumable file upload/download, directory tar upload/download.
 - Command execution: sync commands, long-timeout poll path, background process,
@@ -17,8 +18,9 @@ The Python SDK supports:
 - Direct frontend `/direct/{sandbox}/...` route for command and file data plane,
   including requestId on direct invoke.
 - Reverse tunnel through gateway `/tunnel/{sandbox}`.
-- User port forwarding through the sandbox router:
-  `http://<gateway>/<safeID>/<port>`.
+- User-port URL helper: `http://<gateway>/<safeID>/<port>`; publication is not supported by the new control backend.
+
+See [server compatibility](README.md#server-compatibility) before using retained client options. SDK support, backend support and formal E2E coverage are separate.
 
 ## Open items
 

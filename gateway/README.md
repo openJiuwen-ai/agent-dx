@@ -22,7 +22,7 @@ cargo build --locked -p data-plane-gateway --all-features --release
 
 Root targets stage host-native binaries in `target/` (or `CARGO_TARGET_DIR`). Optional Linux static builds use `gateway/scripts/build-static-linux.sh` and `build/images/Dockerfile.gateway-static`; these require a Linux builder and are not part of the native migration checks. The source adx split-wheel/Buildkite/image harness is recorded in the migration manifest; it depended on the old full control-plane tree.
 
-The node never resolves DNS, accepts a user JWT, or chooses an arbitrary target
+The node never resolves DNS, accepts a user API Key, or chooses an arbitrary target
 address. The target IP must be present in
 `ADX_DATA_PLANE_ALLOWED_TARGET_CIDRS`; for the current sandbox adapter this is
 the node's sandbox bridge CIDR. The Edge chooses the TCP port. Edge-to-Node
@@ -56,14 +56,13 @@ provide equivalent sandbox-veth/host-firewall isolation before enabling
 `ADX_DATA_PLANE_NODE_PROXY_ALLOW_ANY_EDGE=1` /
 `ADX_DATA_PLANE_EDGE_FRONTEND_ALLOW_ANY_CLIENT=1` remain development-only ACL escapes.
 Edge has separate TLS and plaintext listeners. Direct is accepted only on the
-TLS listener and always requires a user token. Tunnel and port-forwarding/SSH
-default to anonymous access on either listener. A `portForwardRoutes` entry can
+TLS listener and always requires a user token. The generic relay supports anonymous tunnel and port-forwarding/SSH routes. The managed Master route resolver forces token authentication for port-forwarding/SSH; such routes require TLS. The new control backend does not publish user ports. A `portForwardRoutes` entry can
 require a token for one target port; that port is then rejected on the plaintext
 listener and authenticated on the TLS listener. Plaintext requests carrying
 `Authorization`, `X-Auth`, or a token query parameter are rejected so credentials
 cannot accidentally cross the clear-text entrypoint.
 Frontend is not a data-plane hop. Edge removes credentials before opening Node
-streams, so user JWTs never reach Node or the workload.
+streams, so user API Keys never reach Node or the workload.
 
 New Edge-to-Node physical H2 connections complete a PING/PONG exchange before
 entering the pool. TCP, optional TLS, and this protocol check share the pool's
@@ -122,18 +121,16 @@ Each route has a unique `name`, a `path_prefix`, and an HTTP origin `upstream`
 port. Routes are loaded and validated at startup; restart Edge after editing the
 file. Invalid or duplicate routes fail startup.
 
-With the process-mode CLI, configure the file and pool via `values.edge_frontend`:
+Configure these environment variables on the `edge` service in the unified deployment JSON, then run `adxctl` as described in [process deployment](../docs/testing/process-deployment.md):
 
-```sh
-adx-edge-frontend \
-  -s 'values.edge_frontend.proxy_routes_file="/etc/adx/edge-proxy-routes.json"' \
-  -s 'values.edge_frontend.proxy_max_idle_connections=512' \
-  -s 'values.edge_frontend.proxy_idle_timeout_sec=30' \
-  -s 'values.edge_frontend.proxy_connect_timeout_sec=5'
+```text
+ADX_DATA_PLANE_EDGE_FRONTEND_PROXY_ROUTES_FILE=/etc/adx/edge-proxy-routes.json
+ADX_DATA_PLANE_EDGE_FRONTEND_PROXY_MAX_IDLE_CONNECTIONS=512
+ADX_DATA_PLANE_EDGE_FRONTEND_PROXY_IDLE_TIMEOUT_SEC=30
+ADX_DATA_PLANE_EDGE_FRONTEND_PROXY_CONNECT_TIMEOUT_SEC=5
 ```
 
-Supply the Edge TLS, `ADX_EDGE_CONTROL_CONFIG`, and authentication settings alongside these
-overrides. The routes file must be readable by the Edge process.
+`adx-edge-frontend` reads its environment; it does not accept the former `-s values.edge_frontend...` CLI overrides. Supply TLS, `ADX_EDGE_CONTROL_CONFIG`, authentication and deployment network settings alongside them.
 
 Prefixes match whole path segments: `/grafana` matches `/grafana` and
 `/grafana/api/live/`, but not `/grafana2`. A trailing slash in the configured
@@ -201,13 +198,14 @@ ADX_DATA_PLANE_LOG_MAX_SIZE_MB=40              # size per active/rotated file
 ADX_DATA_PLANE_LOG_MAX_FILES=10                # retained rotated files
 ADX_DATA_PLANE_LOG_QUEUE_CAPACITY=32768         # bounded records per file writer
 ADX_DATA_PLANE_LOG_FLUSH_INTERVAL_MS=200        # background flush interval
-ADX_DATA_PLANE_LOG_STDOUT=true                 # false by default in process mode
+ADX_DATA_PLANE_LOG_STDOUT=true                 # true by default
+ADX_DATA_PLANE_LOG_COMPRESSION=gzip            # gzip (default) or none
 ADX_DATA_PLANE_EDGE_FRONTEND_ACCESS_LOG_ENABLED=true
 ```
 
 The resulting files are `edge-frontend.log`, `edge-frontend-access.log`, and
 `node-proxy.log`, with `.1.gz` through `.N.gz` suffixes for older generations.
-Gzip compression is enabled by default and is not a deployment option. Each
+Gzip compression is the default; `ADX_DATA_PLANE_LOG_COMPRESSION=none` disables it. Each
 tracing event is formatted into one record and offered to a bounded queue
 without waiting for disk I/O. A dedicated writer thread performs rotation and
 flushes to the operating-system page cache every 200 ms by default; it does not
@@ -215,9 +213,7 @@ flushes to the operating-system page cache every 200 ms by default; it does not
 warning to stderr instead of stalling the data plane. Rotation hands the closed
 file to a separate compressor thread, so gzip cannot pause queue consumption.
 Compression failure retains the uncompressed staging file and reports an error
-rather than deleting log data. Edge access/audit events go only to the dedicated
-access file when that sink is enabled; disabling it drops those events instead
-of redirecting them into the service file.
+rather than deleting log data. When a dedicated access file exists, enabled access/audit events go there. Without a file sink, enabled events enter stdout. The access and audit enable switches are independent; disabling one drops its corresponding events.
 
 Edge Frontend also replaces Traefik for the existing public control-plane
 surface. Only a fixed set of paths such as `/api/sandbox`, `/functions`,
@@ -265,9 +261,7 @@ Stream changes trigger a batch after a 10 ms coalescing window. Connection
 failures retry at most once per second without stopping data traffic.
 
 Node Manager validates the session and snapshot order. An absent or expired
-observation is unknown, never evidence of idleness. Session registration,
-startup reconciliation and process assembly must be wired by the new node
-control implementation. See [protocol boundaries](../platform/api/proto/README.md).
+observation is unknown, never evidence of idleness. Session registration, startup reconciliation and process assembly are wired by Node Manager in both process modes. See [protocol boundaries](../platform/api/proto/README.md).
 
 The source layout follows the process and responsibility boundary:
 
@@ -309,18 +303,8 @@ VM IPs are rediscovered on every run and all processes/netns are removed before
 the reusable VMs are stopped. Evidence is retained under
 `.adx-cache/data-plane-gateway-3vm/<run-id>/`.
 
-Run the live Python sandbox-sdk matrix against a master plus two worker AIO
-cluster with:
+For the current public Sandbox SDK platform acceptance, use [build/e2e](../build/e2e/README.md). The old full-cluster AIO harness was not imported and is not a runnable command in this repository.
 
-```text
-ADX_GATEWAY_AIO_BASE=<local-aio-image> \
-  [legacy adx-only AIO target; see migration record]
-```
+The relay library supports tunnel, SSH and configured user-port forwarding; that does not imply the new control plane publishes user ports. Current public create rejects user-port publication and per-Instance data-plane security overrides. Generic reverse-proxy routes can forward Agent traffic to a separately supplied service; they do not implement the Agent backend.
 
-This builds the current Linux arm64 Gateway and RRT binaries, launches an
-isolated three-node cluster, and verifies lifecycle, commands, persistent
-shell, PTY, filesystem operations, small and resumable file copy, directory
-copy, reverse tunnel, and user port forwarding. Machine-readable results,
-process logs, and Edge/Node metrics are retained below
-`.adx-cache/data-plane-gateway-aio/<run-id>/`; containers and the test network
-are removed after both success and failure.
+For current production logging, use [structured collection](../docs/testing/log-collection.md) and [supervisor rotation](../docs/testing/log-rotation.md). Gateway's optional own file writer above is an alternative sink; the unified JSON collection deployment leaves it disabled to avoid double writing. Trace propagation and export are implemented in Edge and Node Proxy, see [distributed traces](../docs/testing/distributed-traces.md).

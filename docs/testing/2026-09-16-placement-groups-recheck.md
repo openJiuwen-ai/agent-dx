@@ -1,5 +1,7 @@
 # 放置条件组接线后的调度复测（2026-09-16）
 
+> 当次验收/调查记录：版本、数字及未覆盖范围仅适用于文中批次；当前实现与状态见 [实施总览](control-plane-implementation.md) 和 [阶段路线图](control-plane-roadmap.md)。
+
 新增HTTP/SDK实例标签、实例亲和条件组和偏好评分后，重新构建当前ADX compare。与保存的历史 `feature/distribute_env` 二进制在同一Linux ARM64容器内交替执行：1轮预热、7轮测量、6类场景、18个配置组全部断言通过。FC验收停止后才开始本次构建和顺序测量。
 
 ## 七轮中位数

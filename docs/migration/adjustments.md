@@ -1,5 +1,7 @@
 # 导入适配
 
+> 首次导入阶段的历史记录。后续 Rust 控制面、HTTP RRT、统一部署和 K8s 已实施；当前目录和状态见 [架构](../architecture/repository-layout.md) 与 [实施总览](../testing/control-plane-implementation.md)。以下来源、数量和当时边界保留。
+
 - Agent 包与测试目录移动；版本文件的相对路径/源码包包含规则同步调整。
 - Sandbox SDK 采用组件 VERSION，避免继承 Agent 仓的 Git tag；保留发布版本环境变量覆盖。
 - Gateway、RRT 加入根 Cargo workspace。根锁文件以 Gateway 原锁为基础补充 RRT 依赖。

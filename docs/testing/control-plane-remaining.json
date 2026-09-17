@@ -60,7 +60,7 @@
     "title": "CI Collector区域缓存",
     "stage": "8",
     "status": "complete",
-    "detail": "Buildkite #20完成0.161.0 Linux AMD64镜像同步至西南二区SWR，原摘要推送及回拉通过；CI默认地址已切换。正式K8s日志和Trace验收仍在对应条目中跟踪。",
+    "detail": "Buildkite #20完成0.161.0 Linux AMD64镜像同步至西南二区SWR，原摘要推送及回拉通过；CI默认地址已切换，随后#21日志与Trace正式K8s验收通过。",
     "gate": "按上游native manifest摘要同步，远端按摘要回拉通过，CI默认从SWR拉取。"
   },
   {

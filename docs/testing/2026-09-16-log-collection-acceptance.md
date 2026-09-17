@@ -1,5 +1,7 @@
 # 组件结构化日志与采集验收
 
+> 当次验收/调查记录：版本、数字及未覆盖范围仅适用于文中批次；当前实现与状态见 [实施总览](control-plane-implementation.md) 和 [阶段路线图](control-plane-roadmap.md)。
+
 功能提交 `447e135efa9ddb6b776d3b1888d5b18103090d29`，分支 `ci/control-plane-k8s-20260916`。配置及采集保证边界见[组件日志采集](log-collection.md)。
 
 ## 实现与组件检查

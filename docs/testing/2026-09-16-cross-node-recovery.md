@@ -1,5 +1,7 @@
 # 共享 checkpoint 跨节点恢复
 
+> 当次验收/调查记录：版本、数字及未覆盖范围仅适用于文中批次；当前实现与状态见 [实施总览](control-plane-implementation.md) 和 [阶段路线图](control-plane-roadmap.md)。
+
 本轮接通心跳失效后的自动恢复：Master 使用已登记、未过期的共享 checkpoint，通过 Domain 调度选择其他节点，保持 Instance ID 并分配新的执行代次。节点本地恢复点、缺失或过期的恢复点不进入调度，旧执行保留 Failed；不从原始镜像重新创建。
 
 ## 实现边界

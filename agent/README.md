@@ -2,9 +2,11 @@
 
 # Agent Distributed Executor (agent-dx)
 
+> These Agent packages still use legacy FaaS/external-runtime APIs. The examples require compatible meta_service/frontend services. The new Instance platform and nine Agent forwarding routes do not implement that backend. Sandbox SDK integration remains a separate migration; see [current architecture](../docs/architecture/repository-layout.md).
+
 ## Introduction
 
-Agent Distributed Executor (agent-dx) is a distributed execution substrate for agents, providing developer tools for agent registration, invocation, and session management. The repository currently offers the Python CLI `adx`, a separately built agent-dx Python SDK, and a platform-owned Executor for custom-image Agent instances.
+Agent Distributed Executor (agent-dx) is a distributed execution substrate for agents, providing developer tools for agent registration, invocation, and session management. The repository currently offers the Python CLI `adx`, a separately built agent-dx Python SDK, and a Agent-layer Executor for custom-image Agent instances.
 
 ### Key Capabilities
 
@@ -16,8 +18,8 @@ Current CLI capabilities include:
 - Support for one-shot invocation and interactive invocation.
 
 For CLI installation, command parameters, examples, exit codes, and testing details, see [cli/README.md](cli/README.md).
-For the agent-dx SDK programming model, fixed bootstrap, and deployment configuration, see [python/README.md](python/README.md).
-For the platform-owned custom-image Agent executor, see [executor/README.md](executor/README.md).
+For the agent-dx SDK programming model, fixed bootstrap, and deployment configuration, see [sdk/python/README.md](sdk/python/README.md).
+For the Agent-layer custom-image Executor, see [executor/README.md](executor/README.md).
 
 ## Getting Started
 
@@ -58,12 +60,12 @@ For more installation methods, parameter details, and interactive mode usage, se
 ```text
 cli/                 Python CLI package source and packaging config
 cli/ar_cli/          adx command implementation
-python/              Independent agent-dx Python SDK package
-executor/            Independent platform Agent Executor package
-agent/tests/cli/           CLI unit tests
-agent/tests/python/        agent-dx SDK unit and integration tests
-agent/tests/executor/      Agent Executor unit tests
-pytest.ini           Test configuration
+sdk/python/          Independent agent-dx Python SDK package
+executor/            Independent Agent Executor package
+tests/cli/           CLI unit tests
+tests/python/        agent-dx SDK unit and integration tests
+tests/executor/      Agent Executor unit tests
+../pytest.ini        Test configuration
 ```
 
 The CLI, SDK, and Executor are separate distributions that share the version
@@ -78,6 +80,6 @@ We welcome developers to contribute to agent-dx. You can contribute in the follo
 
 ## License
 
-[Apache License 2.0](./LICENSE)
+[Apache License 2.0](../LICENSE)
 
 This product serves solely as a workflow orchestration tool and does not embed any AI model capabilities. When users integrate AI models for specific business scenarios, they shall bear full responsibility for compliance obligations under the EU AI Act and other relevant regulatory frameworks.

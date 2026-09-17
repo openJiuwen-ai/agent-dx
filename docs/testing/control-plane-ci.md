@@ -1,6 +1,6 @@
 # 管控面重构：本地测试与 Buildkite
 
-最新正式验证：[Buildkite #17 基础 Kubernetes 与实例资源Metrics验收](2026-09-16-metrics-acceptance.md)。FC 按当前决策继续本地验收。
+最新正式验证：[Buildkite #21 基础 Kubernetes、Metrics、日志与 Trace 验收](2026-09-17-observability-k8s.md)。FC 按当前决策继续本地验收。
 
 2026-09-15。开发验证在本地执行，Buildkite 使用完整系统的端到端验收入口。统一包、两节点环境驱动器和流水线配置已落地：`build/e2e/prepare.py` 构建验收制品，`build/e2e/kubernetes/run.py` 在目标 Kubernetes 集群部署、验收、收集并清理。真实 sandboxd、本次包内 RRT 和安装后的 SDK 均参与执行。流水线复用现有 default/linux/amd64 队列、builder/packager/deployer、目标 kubeconfig 挂载与 SWR Secret，见 [Buildkite 说明](../../.buildkite/README.md)。本地通过不等于远端 Buildkite 已通过。
 
@@ -46,7 +46,7 @@ export PIP_CACHE_DIR=/your/cache/pip
 .venv/bin/python build/ci/run.py package
 ```
 
-也可使用 `make ci SUITE=go PYTHON=.venv/bin/python JOBS=2`。`--list` 仅打印将执行的命令。各轮结果默认写入 `out/ci/<suite>/<UTC时间>-<随机ID>/`；指定 `--output` 时必须使用新目录，重试不会覆盖上次失败证据。
+也可使用 `make ci SUITE=go PYTHON=.venv/bin/python JOBS=2`。`--list` 打印将执行的命令，不运行测试；它仍会检查前置配置，`frontend-control` 需要通过 `ADX_TEST_SANDBOX_API` 指向已构建、可执行的 Go API 二进制。各轮结果默认写入 `out/ci/<suite>/<UTC时间>-<随机ID>/`；指定 `--output` 时必须使用新目录，重试不会覆盖上次失败证据。
 
 每个结果包含 commit、本地 dirty 标记、平台、Python/工具版本日志、命令与退出码、耗时、配置的缓存位置和制品校验和。Buildkite 环境要求入口执行前工作树干净。本地 dirty 运行允许，但不能当作该 commit 的正式 CI 结果。
 
@@ -157,4 +157,4 @@ Go 使用 Linux arm64 容器，其余使用 macOS arm64。完整平台尚未部�
 
 Master 存储阶段的契约与运行方法见 [Redis 持久化与恢复](master-storage.md)。`storage` 属于真实依赖的组件集成验证，不代表完整平台 E2E。
 
-组件日志采集验收复用现有 Edge/Node Proxy 指标端点，并通过真实 OpenTelemetry Collector 接收结构化组件日志。stop 组包含后端 503、文件滚动与 Collector 重启，控制台输出 `[METRICS PASS]` / `[COLLECTION PASS]`；产物含 `gateway-metrics-node*.json`、`collection-node*.json`、`collected-logs.jsonl` 和 `collector-process.log`。部署及保证边界见 `docs/testing/log-collection.md`；Trace 仍为后续增量。
+组件日志采集验收复用现有 Edge/Node Proxy 指标端点，并通过真实 OpenTelemetry Collector 接收结构化组件日志。stop 组包含后端 503、文件滚动与 Collector 重启，控制台输出 `[METRICS PASS]` / `[COLLECTION PASS]`；产物含 `gateway-metrics-node*.json`、`collection-node*.json`、`collected-logs.jsonl` 和 `collector-process.log`。部署及保证边界见 `docs/testing/log-collection.md`。Trace 已纳入采集验收，输出 `[TRACE PASS]` 并保存 `traces-node*.json` 和 `collected-traces.jsonl`；正式结果见 [Buildkite #21](2026-09-17-observability-k8s.md)。

@@ -1,5 +1,5 @@
 Frontend source pin: ea1de40c96ca9a979c800f4c969c8295dbd01afa
-Current selection after minimal-dependency reduction:
+Historical import selection after minimal-dependency reduction (2026-09-14):
 
 pkg/frontend/api/sandbox/handler.go -> internal/sandbox/handler.go (adapted)
 pkg/frontend/api/sandbox/reusable_snapshot.go -> internal/sandbox/reusable_snapshot.go (adapted)

@@ -1,5 +1,7 @@
 # 完整安装示例验收
 
+> 当次验收/调查记录：版本、数字及未覆盖范围仅适用于文中批次；当前实现与状态见 [实施总览](control-plane-implementation.md) 和 [阶段路线图](control-plane-roadmap.md)。
+
 2026-09-16，在独立 Lima ARM64 KVM 主机上，用 package-v22 按[单机安装指南](../deployment/standalone.md)安装并运行整份发布包示例。Master、Node Manager、Node Proxy、Sandbox API、Edge 分进程启动；Redis 和 sandboxd 由测试环境独立托管。节点使用自动资源探测，业务通过 HTTPS Edge 和包内 Sandbox SDK 访问真实 Firecracker 实例。
 
 ## 结果

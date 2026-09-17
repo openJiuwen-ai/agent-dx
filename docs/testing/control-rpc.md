@@ -13,7 +13,7 @@
 | `platform/api/proto/control.proto` | 增加可信 CallerContext、节点代理地址、查询结果中的 Node Manager 地址 |
 | `build/ci/run.py control-rpc` | 生成独立测试证书、运行真实 Redis／TLS 协作测试、保存证据 |
 
-这些是可装配的 RPC 服务实现与客户端，尚无产品服务进程入口。部署配置解析、证书加载／重载和进程托管仍由后续启动层装配；没有在组件中新增独立身份服务。
+服务进程、部署配置、启动时证书加载和 supervisor 已装配；证书热重载后置。用户身份由 Master API Key 模块管理。下文测试结果保留早期组件验证边界，完整系统结果见 [Buildkite #21](2026-09-17-observability-k8s.md)。
 
 ## 调用顺序
 
@@ -46,9 +46,9 @@ Node 的删除入口只接受本机已经管理的精确 Assignment；不会因�
 
 `MasterStateSink` 使用带节点客户端证书的 Channel 调用 CommitInstance，校验响应包含完全相同的 InstanceRecord，才返回 Published。超时／断线返回 Unavailable，版本或身份冲突返回 Conflict；不把未提交结果当作成功。
 
-删除已在本机完成、但 Redis 提交失败时，Node Manager 保留 Deleted 结果。后续同一删除调用只重新提交结果，不再次删除运行时。当前没有 SQLite 实现，因此这个真实 RPC StateSink 不会返回 Journaled；协议中的 Journaled 保留给后续降级实现。
+删除已在本机完成、但 Redis 提交失败时，Node Manager 保留 Deleted 结果。后续同一删除调用只重新提交结果，不再次删除运行时。底层 MasterStateSink 仅返回 Published 或错误；产品节点外层 SQLite JournalSink 在符合降级条件时持久化结果并返回 Journaled。Journaled 不等于集群发布成功，详见 [节点降级契约](node-lifecycle.md)。
 
-Master 收到 Published 的创建结果后再读取已提交记录核对，避免把未落盘的节点响应当作集群成功。路由发布仍只从已提交 Running 记录生成；本轮没有完成 Edge 订阅接线。
+Master 收到 Published 的创建结果后再读取已提交记录核对，避免把未落盘的节点响应当作集群成功。路由发布仍只从已提交 Running 记录生成；Edge 已通过全量/增量流订阅，重连重新同步。
 
 ## 组件身份与租户边界
 
@@ -101,8 +101,8 @@ Rust／RPC 在 macOS ARM64 执行，测试 Redis 7.2.5 使用 AOF always；二�
 
 `red.log` 保留协议转换缺失时的红灯，早期 Clippy 失败日志也保留。最终 RPC 目录包含 Redis 日志和临时测试证书。七个默认忽略的测试不能计入 94 项通过数；本轮通过专门入口实际运行其中的 RPC 用例，先前阶段的五项 Redis 存储用例结果见 [存储验证](master-storage.md)。
 
-## 下一条接线边界
+## 当前接线与限制
 
-Go HTTP 后端、服务配置、Redis 发现、节点心跳与重启对账已接通。下一步接入路由全量／增量发布与 Edge，补 Node Proxy 完整启动同步、统一制品、真实 sandboxd／RRT 和两节点公共 SDK E2E。证书热重载、SQLite 降级、暂停／恢复及跨节点接管仍需独立实施。
+Go HTTP、服务配置、Redis 发现、心跳与重启对账、Edge 路由订阅、Node Proxy 启动同步、SQLite 降级及本地 FC 暂停/恢复、跨节点恢复均已接线。统一发布与基本 K8s 已验收；证书热重载和 K8s FC 后置。
 
-节点明确拒绝后的持久化替换已有存储接口，RPC 不自动触发跨节点重试：必须先补齐节点对旧分配的终止确认，避免迟到的重复 Create 再次启动旧分配。不能把任意 Node RPC 超时当成未执行的证明。
+`replace_rejected` 的持久化接口与节点故障后的 checkpoint 恢复流程职责不同。RPC 不把任意 Node 超时当作“尚未执行”来调用旧分配替换；故障恢复按持久化失效、有效 checkpoint、新归属和返回节点对账处理，见 [恢复契约](node-failure-takeover.md)。

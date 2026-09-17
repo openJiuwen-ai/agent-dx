@@ -6,7 +6,7 @@ extend the old POSIX, function, or generic signal services for new functionality
 | Contract | Responsibility | Status |
 |---|---|---|
 | `control.proto` / `adx.control.v1` | Master/Node registration, allocation and node-owned state submission | mTLS service processes, Redis discovery/state, route publication |
-| `node.proto` / `adx.node.v1` | Versioned Node Proxy bindings and node activity snapshots | Client/handler implementations and local tests |
+| `node.proto` / `adx.node.v1` | Versioned Node Proxy bindings and node activity snapshots | UDS services, activity reporting and both Node Proxy process modes wired |
 | RRT HTTP | Commands, files, health and command observation; HTTP/WebSocket tunnel transport | Existing implementation retained and tested |
 | Node Manager/RRT HTTP control | Identity-aware status, checkpoint preparation/abort and restored listener setup | Runtime controller and Node Manager client implemented; see [HTTP contract](../http/runtime-control.md) |
 | `legacy/frontend/frontend_proxy_service.proto` | Frontend compatibility entrypoint | The sole retained legacy gRPC service contract |
@@ -35,8 +35,7 @@ one. Node Manager uses two binding revisions per state revision, reserving the
 later one for cleanup when creation fails.
 
 Node Proxy serves this service over the protected `route.sock` UDS; the old
-custom length-prefixed protobuf framing is removed. The same `BindingService`
-handler can be invoked in process; deployment assembly remains separate work.
+custom length-prefixed protobuf framing is removed. Both embedded and standalone Node Proxy use the same `NodeProxyService` implementation and UDS control contract; process assembly is implemented.
 `GetBindingState` returns a proxy process UUID and synchronization epoch.
 `BeginBindings` compares that identity, advances the epoch, closes admission and
 retires existing streams. `ReplaceBindings` validates the complete snapshot

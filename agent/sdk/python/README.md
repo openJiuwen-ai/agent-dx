@@ -1,5 +1,7 @@
 # agent-dx Python SDK
 
+> 当前使用旧 FaaS/外部运行时依赖，尚未完成通过 Sandbox SDK 接入新 Instance 平台。以下启动和部署说明要求兼容的 Agent 后端；平台基础 K8s 验收不覆盖这些 Agent 业务。
+
 本软件包提供面向用户的 Agent API 和固定的 FaaS 启动入口。它独立于 `adx` CLI
 构建；当前 DataSystem 适配器仍依赖外部 `yr.datasystem` Python SDK，
 存储后端替换属于后续功能迁移。

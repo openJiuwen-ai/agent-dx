@@ -47,6 +47,6 @@ CLI 校验共进程的 `proxy_socket` 与控制目录一致，并拒绝同一部
 
 `out/ci/pause-resume/fc-r12/evidence/` 记录 package-v10 的真实共进程 Firecracker/S3 验收：公共 SDK 10项全部通过，计数从93恢复到215、PID保持16，覆盖 Node Manager 重启、Master 失联时本地记录与补写、资源采集失效和最终清理。`deployment-final.json` 从实际运行配置导出并只保留非敏感字段，确认进程角色只有 redis/master/node1/api/edge，node1 为 embedded；早期 `deployment-node1.json` 是配置变更前的副本，不作为最终部署证据。
 
-这证明两种进程模式均已接通；阶段6中的密钥管理与证书/配置重载仍需另行验收。
+这证明两种进程模式均已接通；密钥管理与完整部署示例已另行验收，见 [部署报告](2026-09-16-installed-example.md)；配置/证书更新通过重启组件应用，热重载后置。
 
 2026-09-16更新：最新package-v11在Lima r14再次通过10项共进程FC/S3验收，并覆盖SDK指定节点；证据位于 `out/ci/pause-resume/fc-r14/evidence/`。

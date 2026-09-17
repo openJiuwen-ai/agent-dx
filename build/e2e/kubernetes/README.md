@@ -26,7 +26,7 @@ on; private registry credentials are mounted read-only and supplied to both
 Kubernetes and sandboxd. No cluster selection or credential material is embedded
 in the source tree.
 
-Five scenario groups are shared with the local driver. Kubernetes-specific
+Seven scenario groups are shared with the local driver. Kubernetes-specific
 contract tests cover manifests, Secret projection, Service addresses, immutable
 artifact handoff and namespace ownership/cleanup failures. These tests do not
 execute a Kubernetes cluster. Pod readiness alone does not pass the platform

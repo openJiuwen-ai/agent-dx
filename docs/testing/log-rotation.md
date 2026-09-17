@@ -1,10 +1,11 @@
 # 组件日志滚动与压缩
 
-统一部署配置的 `logging` 控制 Supervisor 管理的各组件 stdout/stderr 文件日志。进程部署和 Pod 内运行使用同一套实现；由部署环境管理的 sandboxd，以及 guest 内实例日志，仍由实际日志生产方负责。结构化日志、Trace 和外部采集接入另外推进。
+统一部署配置的 `logging` 控制 Supervisor 管理的各组件 stdout/stderr 文件日志。进程部署和 Pod 内运行使用同一套实现；由部署环境管理的 sandboxd，以及 guest 内实例日志，仍由实际日志生产方负责。结构化日志、Trace 和外部采集已接通，见 [日志采集](log-collection.md) 与 [Trace](distributed-traces.md)。
 
 ## 配置
 
 ```json
+{
 "logging": {
   "enabled": true,
   "max_file_bytes": 104857600,
@@ -14,6 +15,7 @@
   "max_age_seconds": 604800,
   "max_total_bytes": 1073741824
 }
+}
 ```
 
 省略 `logging` 时默认关闭滚动并保持文件追加；统一部署示例显式启用。除 `enabled` 外，上例均为默认值。大小、数量和时间必须大于零；`rotate_seconds` 和 `max_age_seconds` 可设置为 `null`，分别关闭时间滚动和年龄清理。修改配置后重启 Supervisor 生效。
@@ -22,7 +24,7 @@
 
 ## 文件和写入契约
 
-日志目录为 `state_dir/logs`，当前文件 `<service-id>.log`，历史文件 `<service-id>.log.<20位序号>`，压缩后增加 `.gz`。读取时按序号读取历史文件，再读取当前文件。大小滚动按字节分割，因此一行可能跨文件边界；还原原始输出应先拼接字节再按行解析。
+日志目录为 `state_dir/logs`，当前文件 `<service-id>.log`，历史文件 `<service-id>.log.<20位序号>`，压缩后增加 `.gz`。读取时按序号读取历史文件，再读取当前文件。默认 `line_records=false` 按字节滚动，一行可能跨文件边界；还原时先拼接字节。启用 `line_records=true` 后只在完整行间滚动，单条记录可超过文件阈值，超长记录按 `max_record_bytes` 限制，详见 [采集契约](log-collection.md)。
 
 Supervisor 接管子进程 stdout/stderr，通过专用读取线程写文件；达到大小或时间阈值时关闭当前文件、重命名并打开新的当前文件。没有新输出时也检查非空文件的时间阈值。stdout/stderr 共用通道，保留读取到的字节顺序，不为多个并发写入者另定义业务事件顺序。
 

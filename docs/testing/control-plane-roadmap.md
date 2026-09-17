@@ -7,7 +7,7 @@
 | 1. 同节点暂停／恢复 | Node Manager 串行状态机、RRT HTTP 协作、sandboxd checkpoint/restore、本地存储、Redis 提交、Frontend、路由 | 真实 Firecracker 创建→执行→暂停→Node Manager 重启→恢复→删除；内存计数器、PID、文件、执行身份、资源和路由 |
 | 2. 节点生命周期与降级 | 空闲删除、可配置自动重启及退避、资源源选择与过期保护、压力准入、SQLite 降级日志与补写 | Master 失联、节点进程重启、采集失败、清理失败；遵守节点生命周期所有权和权威对账规则 |
 | 3. 快照与存储 | 对象存储适配、可复用快照目录、引用与延迟删除、预算缓存、未登记制品回收 | 上传失败回滚、恢复点过期、引用期间删除、缓存淘汰、从快照创建新实例 |
-| 4. 跨节点恢复与接管 | 同 Instance ID 归属转移、旧执行隔离、心跳故障处理、恢复与路由切换 | 源节点恢复、旧请求重放、接管中途失败；缺少 checkpoint 或 local-only 制品明确失败 |
+| 4. 跨节点恢复与接管 | 同 Instance ID 归属转移、旧归属撤销与返回清理、心跳故障处理、恢复与路由切换 | 源节点恢复、旧请求重放、接管中途失败；缺少 checkpoint 或 local-only 制品明确失败 |
 | 5. 调度能力与性能 | Global 轮转、Domain 调度、Local 准入；优先级、GPU/NPU 整卡、亲和／反亲和；增量状态与候选复用 | 不超分、卡号正确、排队公平、规则正确；同一 Linux 主机与既有分支统一负载比较 QPS/P99/更新及冲突成本 |
 | 6. 接口与部署收口 | 最小 API Key 管理、启动配置和证书加载、Node Manager/Node Proxy 两种进程模式、统一 CLI 与发布包 | HTTP/SDK 兼容、身份隔离、进程重启、停止清理、同包角色组合、安装文档可复现 |
 | 7. 正式基础端到端流水线 | 独立 K8s 部署和用例步骤、基础功能/节点故障用例、日志及制品汇总；FC 本轮保留本地验收 | 部署过程可见、逐用例结果可见、失败日志可定位、包/镜像/源码身份一致 |
@@ -18,7 +18,7 @@
 
 阶段 2 已完成本地验收：Lima r7 的 checkpoint 与节点生命周期共 10 项真实 Firecracker 用例通过，141 项 Rust/Redis/HTTP 定向测试、138 项 SDK 单测和 Go 检查通过。契约及证据见 [节点生命周期与降级](node-lifecycle.md)。阶段 3 已完成本地快照与存储验收；阶段4已完成本地故障恢复验收，阶段6已完成本地部署收口验收，阶段7按本轮基础K8s范围完成正式验收，阶段5尚未全部验收完成。本地验收与 Kubernetes Buildkite 分开记录。
 
-阶段 5、6 包含既有实现的补齐与验收，不意味着这些组件需要从头重写。已经确定删除的函数／Actor／FaaS、抢占、拓扑分布、成组调度、租户配额和 Master 弹性池不重新引入。
+阶段 5、6 包含既有实现的补齐与验收，不意味着这些组件需要从头重写。平台控制面不提供函数／Actor／FaaS、抢占、成组调度、租户配额或 Master 弹性池。拓扑分布不作为本期扩展目标；当前内部类型/规则仍存在，公开 HTTP 未暴露。Agent 子树仍保留旧 FaaS 后端依赖，业务迁移单列于 [实现边界](control-plane-implementation.md)。
 
 
 当前推进记录（2026-09-16）：
@@ -29,7 +29,9 @@
 - 阶段6：共用 NodeProxyService 与 Node Manager 共进程接线通过157项定向测试，真实共进程 Firecracker/S3 10项验收通过，见 [进程模式](node-proxy-process-modes.md)。API Key管理的真实HTTPS/mTLS/Redis集成已通过，见 [密钥管理](api-key-management.md)。SDK命令订阅的TLS校验连接已修复，真实TLS Socket与package-v13/Lima r16复验通过；本期证书更新后重启组件生效；热重载移入后续待办。现已修复默认管理路由及部署示例接线，补齐单机安装文档；package-v18 真实HTTPS Edge密钥管理与双节点六组全部通过，示例通过真实CLI校验/渲染，见 [部署验收](2026-09-16-deployment-acceptance.md)。随后直接启动完整示例发现Sandbox API发现轮询默认值遗漏；修复后package-v22/Lima r2六项真实FC安装验收全部通过，7项配置测试及53项驱动回归通过，本地阶段6完成，见 [完整示例验收](2026-09-16-installed-example.md)。
 - 阶段7：基础 K8s 正式验收完成。[Buildkite #15](https://buildkite.com/agent-dx/agent-dx/builds/15) 在已提交的 `85d89e8` 上完成构建、镜像发布与独立 K8s 部署；SDK、认证、容量、放置、节点失联、重启和停机七组全部通过，JUnit 8项无失败/跳过，namespace清理无残留。两个Pod位于同一宿主节点；发布包、镜像与源码身份已核对，见 [正式验收记录](2026-09-16-buildkite-k8s.md)。调度修复后的[Buildkite #16](2026-09-16-buildkite-16.md)也已通过三步骤及七组用例，清理无残留。按本轮决策，FC继续本地验收，独立FC profile暂不启用。
 
-本轮正式流水线范围（2026-09-16）：基础 Kubernetes 公共 SDK 七组验收；Firecracker 暂继续本地验收，不启用 `ADX_E2E_CHECKPOINT`。基础 K8s 通过不替代 FC 的暂停、快照与跨节点恢复证据。
+最新正式基础 K8s 为 [Buildkite #21](2026-09-17-observability-k8s.md)，七组及日志/Trace/Metrics 检查通过。
+
+本轮正式流水线范围（2026-09-17）：基础 Kubernetes 公共 SDK 七组验收；Firecracker 暂继续本地验收，不启用 `ADX_E2E_CHECKPOINT`。基础 K8s 通过不替代 FC 的暂停、快照与跨节点恢复证据。
 
 进度页的独立未完成清单见 [事项数据](control-plane-remaining.json)，包含当前剩余验收及暂缓项。
 

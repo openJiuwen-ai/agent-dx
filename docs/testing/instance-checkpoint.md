@@ -21,11 +21,11 @@
 | `node-manager::controller::lifecycle` | 串行暂停／恢复、资源释放与重新准入、失败回滚 |
 | `CheckpointCooperation` | RRT HTTP prepare／未启动 checkpoint 的 abort |
 | `RuntimeBackend` | 能力检查、checkpoint、restore；sandboxd 适配器负责物理 ID 和 RPC |
-| `CheckpointStore` | 分配暂存、发布、物化、删除与节点本地对账清理；当前实现 `LocalCheckpointStore` |
+| `CheckpointStore` | 分配暂存、发布、物化、删除与节点本地对账清理；实现本地目录与 S3 对象存储 |
 | `master::storage` / Domain | Redis 版本校验、恢复点保存、增量资源记账 |
 | `sandbox-api/controlbackend` | HTTP 兼容格式转换、缓存归属、固定目标与版本的重试 |
 
-`CheckpointStore::publish` 是存储完成边界。后续对象存储可在此上传，通过 `materialize` 下载；当前尚未实现对象存储和跨节点恢复。
+`CheckpointStore::publish` 是存储完成边界。对象存储在此完成上传，通过 `materialize` 下载；本地/S3、缓存引用和跨节点恢复已实现，见 [存储契约](snapshot-storage.md) 与 [跨节点恢复](firecracker-cross-node.md)。
 
 ## 配置与部署
 
@@ -35,7 +35,7 @@ Node Manager 配置增加可选的 `checkpoint_dir`，例如：
 {"checkpoint_dir": "/var/lib/adx/checkpoints"}
 ```
 
-统一部署配置中填写到 `role: node-manager` 的 `config`。不设置时不启用暂停／恢复。该目录必须是 Node Manager 与 sandboxd 都可读写、以相同绝对路径访问的节点目录；本地制品需在 Node Manager 重启后保留。不要将该目录用作其他组件的文件仓库。
+统一部署配置中填写到 `role: node-manager` 的 `config`。也可设置互斥的 `checkpoint_storage` 选择本地或 S3；两者均未设置时不启用暂停／恢复。该目录必须是 Node Manager 与 sandboxd 都可读写、以相同绝对路径访问的节点目录；本地制品需在 Node Manager 重启后保留。不要将该目录用作其他组件的文件仓库。
 
 sandboxd 必须支持 checkpoint／restore，并通过 runtime capabilities 提供 RRT 的 checkpoint handoff 和 restore environment 路径。Node Manager 从能力信息注入这两个路径。Firecracker 的 Linux/KVM、guest kernel、initrd 和网络条件由运行环境提供；本阶段不会替部署环境启动 sandboxd。
 
@@ -45,13 +45,13 @@ sandboxd 必须支持 checkpoint／restore，并通过 runtime capabilities 提�
 
 - API/RPC 断线不会取消已进入实例队列的操作。Frontend 自动重试保持同一 operation ID、归属和原始预期版本。
 - 正常结果记录只保留最近成功操作。Node RPC 拒绝旧预期版本；客户端不能在一个后续操作已改变状态后，把旧请求换成新版本重新执行。
-- checkpoint 已完成而 Master 提交失败时，Node Manager 在内存中保留完成状态。同一操作重试只补交结果。这里未新增 SQLite 降级日志；节点重启后仍以 Redis 对账。
+- checkpoint 已完成而 Master 提交失败时，节点按 [SQLite 降级契约](node-lifecycle.md) 保存待补交结果。同一操作重试只补交；Journaled 不返回集群成功，重启后先等待 Master 权威对账。
 - checkpoint 调用前，准备失败可调用 RRT abort；调用后不再假设 checkpoint 未启动。无法确认停止／清理时保留资源占用并报告失败。
 - 发布制品失败时，从完整本地暂存尝试恢复运行，并返回暂停失败。回滚或清理失败不会伪装成暂停成功。
 - 恢复失败但清理成功时保留恢复点并释放此次资源；清理不确定时保留资源，等待处理。
 - 节点重启后，从 Master 获取完整目录；Paused 记录不会被当作缺失的 Running 实例重建。未持久化且不匹配的执行按既有对账原则清理。
 - 替换、过期和删除恢复点时，先提交新元数据，再清理旧制品。提交或清理失败保留待清理记录，后续同步或同操作重试继续完成清理。
-- 重启对账期间关闭准入，确认所有执行和结果已对账发布后，清理本地存储根目录中不再被引用的 UUID 制品目录。Master 不可用或对账失败时不执行该清理；未来共享存储的对象清理由独立引用管理负责。
+- 重启对账期间关闭准入，确认所有执行和结果已对账发布后，清理本地存储根目录中不再被引用的 UUID 制品目录。Master 不可用或对账失败时不执行该清理；共享存储的目录引用与旧会话孤儿清理见 [存储契约](snapshot-storage.md)。
 
 ## 验证
 
