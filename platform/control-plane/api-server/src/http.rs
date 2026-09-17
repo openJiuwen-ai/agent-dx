@@ -108,7 +108,10 @@ impl Api {
                 )
             }
         };
-        let path = request.uri().path().trim_end_matches('/').to_string();
+        let path = match percent_encoding::percent_decode_str(request.uri().path()).decode_utf8() {
+            Ok(path) => path.trim_end_matches('/').to_string(),
+            Err(_) => return envelope(400, None, Some("invalid path encoding")),
+        };
         let method = request.method().as_str().to_string();
         if agent_route(&method, &path) {
             return Box::pin(self.agent(request, &caller)).await;

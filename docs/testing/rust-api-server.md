@@ -28,6 +28,10 @@ python3 build/ci/run.py api-control --jobs 2 --output out/ci/api-control-new
 
 本地组件验证和正式 Kubernetes 验收分别记录。端到端通过后才替换已发布版本的验收结论。
 
-本轮已通过工作区 370 项测试（29 项环境或性能用例默认忽略）、58 项 E2E 驱动测试、7 项 CI 驱动测试，以及 11 项实际执行的 Redis/mTLS RPC 测试和生产 API 二进制 HTTPS 契约。暂停/恢复重试、快照 CRUD、租户隔离、克隆和 9 条 Agent 流式转发路由均已通过；严格 Clippy 通过；另实际执行 14 项 Redis 存储回归，全部通过。提交 `5dea82e` 的 [Buildkite #22](https://buildkite.com/agent-dx/agent-dx/builds/22) 已通过 Rust release 编译、SDK 打包和统一包校验；外部 runc 下载连续超时后主动取消，未执行 K8s。后续使用既有 `ADX_BACKEND_ARTIFACT_BUILD=21` 复用同一 sandboxd 提交与架构的外部后端制品；流水线逐文件校验摘要，ADX 产品仍从本次提交构建。
+本轮已通过工作区 370 项测试（29 项环境或性能用例默认忽略）、58 项 E2E 驱动测试、7 项 CI 驱动测试，以及 11 项实际执行的 Redis/mTLS RPC 测试和生产 API 二进制 HTTPS 契约。暂停/恢复重试、快照 CRUD、租户隔离、克隆和 9 条 Agent 流式转发路由均已通过；严格 Clippy 通过；另实际执行 14 项 Redis 存储回归，全部通过。提交 `5dea82e` 的 [Buildkite #22](https://buildkite.com/agent-dx/agent-dx/builds/22) 已通过 Rust release 编译、SDK 打包和统一包校验；外部 runc 下载连续超时后主动取消，未执行 K8s。后续使用既有 `ADX_BACKEND_ARTIFACT_BUILD`（#21 的构建 UUID） 复用同一 sandboxd 提交与架构的外部后端制品；流水线逐文件校验摘要，ADX 产品仍从本次提交构建。
 
 证据目录为 `out/ci/api-server/`：`contract-red.log` / `contract-green.log`、`workspace-final.log`、`clippy-final.log`、`storage-final/result.json`、`rpc-6/result.json`、`rpc-6/api-http.log`、`e2e-driver.log`、`ci-driver.log`。RPC 夹具使用真实服务与 Redis/mTLS，RuntimeBackend 和就绪/路由检查为受控实现，因此不替代真实 sandboxd/RRT 的 K8s 验收。
+
+#23 的产品构建通过；后端复用参数误用了页面编号21，artifact CLI要求构建UUID，因此下载被拒绝且未执行K8s。触发参数随后修正为#21的UUID，不改变后端版本或产品代码。
+
+额外兼容回归：含空格、加号与百分号的Instance名称，创建后经转义路径删除的用例先失败；补齐单次路径解码后，11项RPC和全部HTTPS用例再次通过（`escaped-red/`、`escaped-green/`），严格Clippy通过（`clippy-path.log`）。

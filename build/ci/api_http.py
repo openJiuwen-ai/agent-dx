@@ -213,3 +213,10 @@ try:
 finally:
     server.shutdown()
     server.server_close()
+
+# HTTP paths decode escaped instance IDs exactly once.
+from urllib.parse import quote
+identity=create_placement('http space+percent%')
+code,value=call('DELETE','/api/sandbox/'+quote(identity,safe=''))
+assert code==200,(code,value)
+print('Escaped instance ID deletion passed')
