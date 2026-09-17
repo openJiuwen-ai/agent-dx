@@ -111,7 +111,7 @@ Proxy 首次启动关闭实例准入，Node Manager 完成权威对账与全量�
 
 Rust 共用根 Cargo workspace，Python 独立打包；外部 sandboxd 按其锁定版本构建。`adx` 是 Agent CLI；`adxctl` 是平台运维 CLI，支持 validate/render/run/start/status/stop。统一发布包带控制面、Gateway、RRT、Sandbox SDK 和锁定 Redis；可选择外部 Redis，sandboxd 始终由部署环境托管。RRT 需进入实例镜像。
 
-普通进程与 Pod 内都使用相同组件和 supervisor。Buildkite 先构建，再发布不可变镜像，最后独立执行 K8s 七组用例及清理。Rust API Server 重写前的正式记录为 [Buildkite #21](../testing/2026-09-17-observability-k8s.md)。本地 FC 与基础 K8s 分开统计，实际未完成项和后置项见 [路线图](../testing/control-plane-roadmap.md)。
+普通进程与 Pod 内都使用相同组件和 supervisor。Buildkite 先构建，再发布不可变镜像，最后独立执行 K8s 七组用例及清理。Rust API Server 与 Shard 迁移已通过 [Buildkite #24](../testing/2026-09-17-rust-api-server-k8s.md) 正式验收。本地 FC 与基础 K8s 分开统计，实际未完成项和后置项见 [路线图](../testing/control-plane-roadmap.md)。
 
 ## 可观测
 

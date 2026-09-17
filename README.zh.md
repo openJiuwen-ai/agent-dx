@@ -31,6 +31,6 @@ Master 内 Global 轮转选择 Shard，Shard 执行实际调度；Node Manager �
 
 ## 验收状态
 
-Rust API Server 重写前的 [Buildkite #21](docs/testing/2026-09-17-observability-k8s.md) 通过七组基础 K8s 用例及清理，含资源指标、日志和 Trace；两个 Pod 在同一宿主，不能作为跨宿主故障隔离证据。暂停、快照、S3 和跨节点恢复已有本地 Firecracker 验收，正式 K8s FC 暂缓。
+Rust API Server 重写后的 [Buildkite #24](docs/testing/2026-09-17-rust-api-server-k8s.md) 通过七组基础 K8s 用例及清理，含资源指标、日志和 Trace；两个 Pod 在同一宿主，不能作为跨宿主故障隔离证据。暂停、快照、S3 和跨节点恢复已有本地 Firecracker 验收，正式 K8s FC 暂缓。
 
 本期仍需完成 FC 双克隆网络问题、GPU/NPU 实卡验收和真实服务长稳。模板预热、证书热重载及统一实时 Trace 队列丢弃指标已后置。详见 [阶段路线图](docs/testing/control-plane-roadmap.md) 和 [独立事项清单](docs/testing/control-plane-remaining.json)。

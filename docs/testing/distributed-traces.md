@@ -46,4 +46,4 @@ API 请求日志包含 Trace ID 和 Span ID；Node Manager 操作完成日志包
 
 组件测试覆盖跨任务/队列的并发隔离、调用方取消后已接受操作继续关联、采样关闭、导出端不可用时提交不阻塞、失败计数与退出时间。真实部署验收检查完整创建链路的Trace ID，以及每个 `instance.execute` 的父Span确为同Trace内的 `instance.queue`，同时核对RRT收到远端上下文。
 
-重写前的本地与 [Buildkite #21 正式验收](2026-09-17-observability-k8s.md) 已通过；统一实时队列满丢弃指标后置，详见 [事项清单](control-plane-remaining.json)。节点恢复后产生新的后台Trace，以Instance/代次/状态关联，不承诺跨进程重启续接已结束的Span。
+本地与Rust API Server重写后的 [Buildkite #24 正式验收](2026-09-17-rust-api-server-k8s.md) 已通过；统一实时队列满丢弃指标后置，详见 [事项清单](control-plane-remaining.json)。节点恢复后产生新的后台Trace，以Instance/代次/状态关联，不承诺跨进程重启续接已结束的Span。

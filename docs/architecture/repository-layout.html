@@ -75,7 +75,7 @@
 <p>正常结果经 Master 写 Redis；SQLite 只在提交不可用时保存待补交结果。Journaled 不发布 Edge 路由。节点重启而 Master 不可用时等待对账，不从不完整日志重建目录。快照制品走独立的本地/S3 存储抽象。详见 <a href="../testing/node-lifecycle.md">节点契约</a>。</p>
 <h2 id="section-6">构建、部署和验收</h2>
 <p>Rust 共用根 Cargo workspace，Python 独立打包；外部 sandboxd 按其锁定版本构建。<code>adx</code> 是 Agent CLI；<code>adxctl</code> 是平台运维 CLI，支持 validate/render/run/start/status/stop。统一发布包带控制面、Gateway、RRT、Sandbox SDK 和锁定 Redis；可选择外部 Redis，sandboxd 始终由部署环境托管。RRT 需进入实例镜像。</p>
-<p>普通进程与 Pod 内都使用相同组件和 supervisor。Buildkite 先构建，再发布不可变镜像，最后独立执行 K8s 七组用例及清理。Rust API Server 重写前的正式记录为 <a href="../testing/2026-09-17-observability-k8s.md">Buildkite #21</a>。本地 FC 与基础 K8s 分开统计，实际未完成项和后置项见 <a href="../testing/control-plane-roadmap.md">路线图</a>。</p>
+<p>普通进程与 Pod 内都使用相同组件和 supervisor。Buildkite 先构建，再发布不可变镜像，最后独立执行 K8s 七组用例及清理。Rust API Server 与 Shard 迁移已通过 <a href="../testing/2026-09-17-rust-api-server-k8s.md">Buildkite #24</a> 正式验收。本地 FC 与基础 K8s 分开统计，实际未完成项和后置项见 <a href="../testing/control-plane-roadmap.md">路线图</a>。</p>
 <h2 id="section-7">可观测</h2>
 <p>Master/Node Manager 的实例数、资源预留与使用量，Edge/Node Proxy 的连接、流量与请求指标由各自 <code>/metrics</code> 导出。Trace 由组件 OpenTelemetry SDK 经 OTLP/HTTP 发往外部 Collector；结构化 stdout 由 supervisor 滚动压缩，Collector filelog 采集。Pod 可部署 Collector sidecar，进程环境独立托管。统一实时 Trace 队列丢弃指标已后置，不能与已有导出失败计数混同。</p></article></div>
 <footer>由 build/docs/render_architecture.py 从 repository-layout.md 生成；更新 Markdown 后重新生成。验收结果与源码能力分别记录。</footer></main></body></html>

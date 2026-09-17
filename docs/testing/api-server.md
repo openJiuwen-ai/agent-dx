@@ -54,7 +54,7 @@ python3 build/ci/run.py api-control --jobs 2
 
 测试启动真实 Rust HTTPS 进程，经过生产 Rust RPC、mTLS、Redis 和 Node Manager 状态机。运行时、就绪检查和本机路由仍由 RPC 测试夹具提供可控实现，因此不算 sandboxd／RRT／Edge 完整平台 E2E。此前的单独 `control-rpc` 入口保持可运行；`api-control` 要求实际 API 二进制。
 
-Rust 重写的独立验证记录见 [迁移状态](rust-api-server.md)。下面的历史验证使用旧版服务，不代表 Rust 重写已完成端到端验收。
+Rust 重写已通过 [Buildkite #24](2026-09-17-rust-api-server-k8s.md) 独立K8s验收，详见 [迁移记录](rust-api-server.md)。下面保留旧版服务的历史验证数据。
 
 ## 2026-09-15 组件验证记录
 

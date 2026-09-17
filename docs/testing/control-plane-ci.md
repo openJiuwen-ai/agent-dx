@@ -1,6 +1,6 @@
 # 管控面重构：本地测试与 Buildkite
 
-Rust API Server 重写前的正式验证：[Buildkite #21 基础 Kubernetes、Metrics、日志与 Trace 验收](2026-09-17-observability-k8s.md)。FC 按当前决策继续本地验收。
+Rust API Server 重写后的正式验证：[Buildkite #24 基础 Kubernetes、Metrics、日志与 Trace 验收](2026-09-17-rust-api-server-k8s.md)。FC 按当前决策继续本地验收。
 
 2026-09-15。开发验证在本地执行，Buildkite 使用完整系统的端到端验收入口。统一包、两节点环境驱动器和流水线配置已落地：`build/e2e/prepare.py` 构建验收制品，`build/e2e/kubernetes/run.py` 在目标 Kubernetes 集群部署、验收、收集并清理。真实 sandboxd、本次包内 RRT 和安装后的 SDK 均参与执行。流水线复用现有 default/linux/amd64 队列、builder/packager/deployer、目标 kubeconfig 挂载与 SWR Secret，见 [Buildkite 说明](../../.buildkite/README.md)。本地通过不等于远端 Buildkite 已通过。
 

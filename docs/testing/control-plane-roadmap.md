@@ -30,7 +30,7 @@
 - 阶段6：共用 NodeProxyService 与 Node Manager 共进程接线通过157项定向测试，真实共进程 Firecracker/S3 10项验收通过，见 [进程模式](node-proxy-process-modes.md)。API Key管理的真实HTTPS/mTLS/Redis集成已通过，见 [密钥管理](api-key-management.md)。SDK命令订阅的TLS校验连接已修复，真实TLS Socket与package-v13/Lima r16复验通过；本期证书更新后重启组件生效；热重载移入后续待办。现已修复默认管理路由及部署示例接线，补齐单机安装文档；package-v18 真实HTTPS Edge密钥管理与双节点六组全部通过，示例通过真实CLI校验/渲染，见 [部署验收](2026-09-16-deployment-acceptance.md)。随后直接启动完整示例发现Sandbox API发现轮询默认值遗漏；修复后package-v22/Lima r2六项真实FC安装验收全部通过，7项配置测试及53项驱动回归通过，本地阶段6完成，见 [完整示例验收](2026-09-16-installed-example.md)。
 - 阶段7：基础 K8s 正式验收完成。[Buildkite #15](https://buildkite.com/agent-dx/agent-dx/builds/15) 在已提交的 `85d89e8` 上完成构建、镜像发布与独立 K8s 部署；SDK、认证、容量、放置、节点失联、重启和停机七组全部通过，JUnit 8项无失败/跳过，namespace清理无残留。两个Pod位于同一宿主节点；发布包、镜像与源码身份已核对，见 [正式验收记录](2026-09-16-buildkite-k8s.md)。调度修复后的[Buildkite #16](2026-09-16-buildkite-16.md)也已通过三步骤及七组用例，清理无残留。按本轮决策，FC继续本地验收，独立FC profile暂不启用。
 
-最新正式基础 K8s 为 [Buildkite #21](2026-09-17-observability-k8s.md)，七组及日志/Trace/Metrics 检查通过。
+阶段10已完成：Rust API Server、Shard命名和协议拆分通过本地回归与 [Buildkite #24](2026-09-17-rust-api-server-k8s.md)；这是当前最新正式基础 K8s，七组及日志/Trace/Metrics 检查通过。
 
 本轮正式流水线范围（2026-09-17）：基础 Kubernetes 公共 SDK 七组验收；Firecracker 暂继续本地验收，不启用 `ADX_E2E_CHECKPOINT`。基础 K8s 通过不替代 FC 的暂停、快照与跨节点恢复证据。
 

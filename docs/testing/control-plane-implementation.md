@@ -9,7 +9,7 @@
 | `platform/crates/core` | Instance 状态、资源/设备账本、归属代次、checkpoint 与调度类型 | 纯模型，不访问 Redis、sandboxd |
 | `platform/crates/protocol` / `platform/api/proto` | Instance gRPC、身份检查、类型转换；Node Proxy 绑定/活动协议 | 协议按职责拆分；RRT 使用 HTTP |
 | `platform/crates/scheduling` | 静态 Filter/Score、Pack/Spread、整卡、节点/实例亲和与反亲和、增量快照与索引 | 拓扑规则存在于内部类型和库；不是公开 HTTP 已验收能力 |
-| `platform/control-plane/master` | Global 轮转、同进程 Shard 队列与选点、自动分域、Redis、认证、路由/快照目录、节点失效与跨节点恢复协调 | 单 Master；无 scaler、抢占或租户配额；未分配队列仅在内存 |
+| `platform/control-plane/master` | Global 轮转、同进程 Shard 队列与选点、自动分片、Redis、认证、路由/快照目录、节点失效与跨节点恢复协调 | 单 Master；无 scaler、抢占或租户配额；未分配队列仅在内存 |
 | `platform/control-plane/node-manager` | 每 Instance 串行任务、准入、暂停/恢复/删除、空闲删除、可配置重启、资源采集、对账 | 普通生命周期由节点决定；SQLite 是提交故障降级日志 |
 | 同上 `sandboxd.rs` / `runtime_control.rs` | RuntimeBackend、Start/Stats/checkpoint/restore、RRT HTTP 准备与身份校验 | sandboxd 自行生成物理 ID；平台 Instance ID 与后端 ID 分开 |
 | 同上 `checkpoint.rs` / `checkpoint/` | 本地/S3 存储抽象、下载缓存、引用保护、过期和孤儿制品回收 | local-only 制品只在源节点可用；模板预热后置 |
@@ -38,7 +38,7 @@
 
 ## 验收与剩余范围
 
-- 最新正式基础 K8s：[Buildkite #21](2026-09-17-observability-k8s.md)，测试提交 `b3145d6d43d04c06dbc85a91928d441814111d87`，七组及清理通过，包含资源 Metrics、日志滚动/采集和跨组件 Trace。两个 Pod 位于同一宿主。
+- 最新正式基础 K8s：[Buildkite #24](2026-09-17-rust-api-server-k8s.md)，测试提交 `385b698043f0b62fac943a43da3de17bf59f6441`，七组及清理通过，包含资源 Metrics、日志滚动/采集和跨组件 Trace。两个 Pod 位于同一宿主。
 - 本地 FC：暂停/恢复、S3、SQLite 降级、快照与跨节点恢复分别有真实验收，见 [路线图](control-plane-roadmap.md)。后续双克隆运行暴露网络问题，不能只引用较早成功批次宣称已解决。
 - 本期未完成：FC 双克隆网络、GPU/NPU 实卡验收、真实服务混合负载与长稳。
 - 后置：x86 双克隆对照、K8s FC、模板预热、证书热重载、统一实时 Trace 队列丢弃指标。
@@ -47,4 +47,4 @@
 
 本次逐文件核对范围、修订及检查结果见 [2026-09-17 文档核对](2026-09-17-documentation-audit.md)。
 
-Rust API Server 与 Shard 改名的验证单独记录在 [重写状态](rust-api-server.md)，历史 E2E 结果不代表本次重写验收。
+Rust API Server 与 Shard 改名已通过本地回归及独立K8s验收；升级与验证过程见 [迁移记录](rust-api-server.md)。
