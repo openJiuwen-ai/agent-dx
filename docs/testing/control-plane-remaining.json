@@ -51,8 +51,8 @@
     "id": "trace-export-health",
     "title": "Trace统一实时队列丢弃指标",
     "stage": "8",
-    "status": "pending",
-    "detail": "Master/Node Manager已有导出成功及失败Span计数；各组件统一的实时队列满丢弃计数尚未实现，SDK日志不等同于指标。",
+    "status": "deferred",
+    "detail": "按用户决定后置，不作为本期阶段8验收阻塞项。Master/Node Manager已有导出成功及失败Span计数；统一实时队列满丢弃指标尚未实现。",
     "gate": "各组件按明确口径区分导出失败与队列满丢弃，队列压满故障测试和实际指标抓取通过。"
   },
   {
