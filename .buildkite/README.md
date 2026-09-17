@@ -165,3 +165,9 @@ evidence. See [runtime kit and invocation](../build/e2e/firecracker/README.md).
 The existing basic E2E result alone does not count as this profile passing.
 
 组件日志采集验收复用现有 Edge/Node Proxy 指标端点，并通过真实 OpenTelemetry Collector 接收结构化组件日志。stop 组包含后端 503、文件滚动与 Collector 重启，控制台输出 `[METRICS PASS]` / `[COLLECTION PASS]`；产物含 `gateway-metrics-node*.json`、`collection-node*.json`、`collected-logs.jsonl` 和 `collector-process.log`。部署及保证边界见 `docs/testing/log-collection.md`。Trace验收输出 `[TRACE PASS]`，保存 `traces-node*.json` 与 `collected-traces.jsonl`，检查完整创建链路和实例队列父子关系；配置见 `docs/testing/distributed-traces.md`。
+
+### Collector 镜像同步
+
+设置 `ADX_COLLECTOR_SYNC_ONLY=1` 触发独立 `collector-sync` 步骤，跳过编译、产品镜像和 K8s 验收。复用现有 SWR Secret，将 `build/observability/source.json` 锁定的 Linux AMD64 manifest 同步至 `ADX_E2E_IMAGE_REPOSITORY`。默认从 GHCR 拉取，可通过 `ADX_COLLECTOR_SYNC_SOURCE` 指定其他仓库，摘要保持不变。
+
+步骤日志记录下载、推送和按原摘要回拉，产物位于 `out/buildkite/collector-sync/`，含 `result.json` 与镜像地址。同步成功后才更新正式构建的 Collector 默认地址；同步步骤通过不代表 K8s 验收通过。

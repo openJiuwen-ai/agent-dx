@@ -1,1 +1,8 @@
-{"version":"0.161.0","image":"otel/opentelemetry-collector-contrib@sha256:fd328de2552466ad78385e1b1289c3f2402b1c45f265b252aab1955b42845ac1","upstream":"https://github.com/open-telemetry/opentelemetry-collector-releases/releases/tag/v0.161.0"}
+{
+  "version": "0.161.0",
+  "image": "otel/opentelemetry-collector-contrib@sha256:fd328de2552466ad78385e1b1289c3f2402b1c45f265b252aab1955b42845ac1",
+  "upstream": "https://github.com/open-telemetry/opentelemetry-collector-releases/releases/tag/v0.161.0",
+  "platform_manifests": {
+    "linux/amd64": "sha256:b5cf983651c32c3ca13f936deb51742015a54d121f388cac248923ddeb8cc9fc"
+  }
+}

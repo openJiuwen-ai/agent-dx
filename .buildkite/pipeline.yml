@@ -47,6 +47,7 @@ steps:
           hostPath:
             path: /mnt/paas
             type: DirectoryOrCreate
+  if: build.env("ADX_COLLECTOR_SYNC_ONLY") != "1"
 - label: ':docker: Publish ADX images'
   key: platform-images
   depends_on: platform-build
@@ -54,7 +55,8 @@ steps:
     queue: default
     os: linux
     arch: amd64
-  command: bash .buildkite/step.sh images python3 .buildkite/with_registry.py --docker -- bash .buildkite/package-e2e.sh
+  command: bash .buildkite/step.sh images python3 .buildkite/with_registry.py --docker
+    -- bash .buildkite/package-e2e.sh
   timeout_in_minutes: 40
   env:
     BUILDKITE_AGENT_NAME: agent-stack-k8s
@@ -103,6 +105,7 @@ steps:
         volumes:
         - name: docker-graph
           emptyDir: {}
+  if: build.env("ADX_COLLECTOR_SYNC_ONLY") != "1"
 - label: ':kubernetes: Kubernetes E2E (Sandbox SDK)'
   key: platform-e2e
   depends_on: platform-images
@@ -110,7 +113,8 @@ steps:
     queue: default
     os: linux
     arch: amd64
-  command: bash .buildkite/step.sh e2e python3 .buildkite/with_registry.py -- bash .buildkite/run-e2e.sh
+  command: bash .buildkite/step.sh e2e python3 .buildkite/with_registry.py -- bash
+    .buildkite/run-e2e.sh
   timeout_in_minutes: 30
   artifact_paths:
   - out/buildkite/acceptance/**/*
@@ -133,9 +137,11 @@ steps:
               cpu: '4'
               memory: 8Gi
           env: *id001
+  if: build.env("ADX_COLLECTOR_SYNC_ONLY") != "1"
 - label: ':kubernetes: Firecracker checkpoint + snapshots + faults'
   key: platform-fc-e2e
-  if: build.env("ADX_E2E_CHECKPOINT") == "1"
+  if: build.env("ADX_COLLECTOR_SYNC_ONLY") != "1" && (build.env("ADX_E2E_CHECKPOINT")
+    == "1")
   depends_on: platform-images
   agents:
     queue: default
@@ -164,3 +170,58 @@ steps:
               cpu: '4'
               memory: 8Gi
           env: *id001
+- label: ':docker: Mirror pinned OpenTelemetry Collector to SWR'
+  key: collector-sync
+  agents:
+    queue: default
+    os: linux
+    arch: amd64
+  command: python3 .buildkite/with_registry.py --docker -- bash .buildkite/sync-collector.sh
+  timeout_in_minutes: 30
+  env:
+    BUILDKITE_AGENT_NAME: agent-stack-k8s
+    ADX_E2E_IMAGE_REPOSITORY: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/adx-e2e
+  artifact_paths:
+  - out/buildkite/collector-sync/**/*
+  plugins:
+  - kubernetes:
+      podSpec:
+        imagePullSecrets:
+        - name: swr-pull-secret
+        containers:
+        - image: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/sandbox-packager:v20260506_kubectl
+          securityContext:
+            privileged: true
+          volumeMounts:
+          - name: docker-graph
+            mountPath: /var/lib/docker
+          resources:
+            requests:
+              cpu: '8'
+              memory: 16Gi
+            limits:
+              cpu: '8'
+              memory: 16Gi
+          env:
+          - name: SWR_USERNAME
+            valueFrom:
+              secretKeyRef:
+                name: swr-credentials
+                key: username
+                optional: true
+          - name: SWR_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: swr-credentials
+                key: password
+                optional: true
+          - name: SWR_DOCKER_CONFIG_JSON
+            valueFrom:
+              secretKeyRef:
+                name: swr-pull-secret
+                key: .dockerconfigjson
+                optional: true
+        volumes:
+        - name: docker-graph
+          emptyDir: {}
+  if: build.env("ADX_COLLECTOR_SYNC_ONLY") == "1"
