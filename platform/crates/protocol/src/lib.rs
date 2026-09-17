@@ -87,7 +87,7 @@ impl TryFrom<control::Assignment> for adx_core::Assignment {
             devices,
             instance_id: value.instance_id,
             node_id: value.node_id,
-            domain_id: value.domain_id as usize,
+            shard_id: value.shard_id as usize,
             generation: value.generation,
         })
     }
@@ -101,8 +101,8 @@ impl TryFrom<adx_core::Assignment> for control::Assignment {
             devices: value.devices.into_iter().map(Into::into).collect(),
             instance_id: value.instance_id,
             node_id: value.node_id,
-            domain_id: u32::try_from(value.domain_id)
-                .map_err(|_| Error::Invalid("domain id overflow".into()))?,
+            shard_id: u32::try_from(value.shard_id)
+                .map_err(|_| Error::Invalid("shard id overflow".into()))?,
             generation: value.generation,
         })
     }

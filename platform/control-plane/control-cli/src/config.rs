@@ -15,7 +15,7 @@ pub enum Role {
     Master,
     NodeProxy,
     NodeManager,
-    SandboxApi,
+    ApiServer,
     Edge,
 }
 impl Role {
@@ -25,7 +25,7 @@ impl Role {
             Self::Master => "adx-master",
             Self::NodeManager => "adx-node-manager",
             Self::NodeProxy => "adx-node-proxy",
-            Self::SandboxApi => "adx-sandbox-api",
+            Self::ApiServer => "adx-api-server",
             Self::Edge => "adx-edge-frontend",
         }
     }
@@ -177,7 +177,7 @@ impl Deployment {
             {
                 return Err("discovery config must be an object".into());
             }
-            if s.role == Role::SandboxApi
+            if s.role == Role::ApiServer
                 && s.config
                     .get("discovery")
                     .and_then(|d| d.get("poll_seconds"))
@@ -279,11 +279,11 @@ impl Deployment {
                     config["namespace"] = json!(self.namespace);
                     vec!["--config".into(), file.display().to_string()]
                 }
-                Role::NodeManager | Role::SandboxApi => {
+                Role::NodeManager | Role::ApiServer => {
                     config.as_object_mut().unwrap().remove("master_address");
                     config["discovery"]["redis_url"] = json!(self.redis_url);
                     config["discovery"]["namespace"] = json!(self.namespace);
-                    if s.role == Role::SandboxApi {
+                    if s.role == Role::ApiServer {
                         config["discovery"]
                             .as_object_mut()
                             .unwrap()

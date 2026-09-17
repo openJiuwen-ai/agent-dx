@@ -38,7 +38,6 @@ env/
 **/__pycache__/
 **/*.egg-info/
 **/dist/
-/platform/control-plane/sandbox-api/internal/gen/
 
 # Source scripts under build/ are tracked.
 !/build/

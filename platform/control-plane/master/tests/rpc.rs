@@ -77,7 +77,7 @@ fn peers() -> Peers {
         [
             ("master", Principal::Master),
             ("node", Principal::Node("node".into())),
-            ("frontend", Principal::Frontend),
+            ("api-server", Principal::ApiServer),
             ("edge", Principal::Edge),
         ]
         .map(|(name, p)| (file(&format!("{name}.der")), p)),
@@ -273,6 +273,9 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
         Server::builder()
             .tls_config(server_tls("master"))
             .unwrap()
+            .add_service(pb::snapshot_service_server::SnapshotServiceServer::new(
+                master.clone(),
+            ))
             .add_service(pb::master_service_server::MasterServiceServer::new(master))
             .add_service(pb::credential_service_server::CredentialServiceServer::new(
                 auth.clone(),
@@ -298,13 +301,24 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
             .unwrap()
             .with_session("boot-1".into()),
     );
-    let manager = Arc::new(NodeManager::new(
-        "node".into(),
-        backend.clone(),
-        Arc::new(LocalChecks),
-        Arc::new(LocalChecks),
-        sink,
-    ));
+    let checkpoint_root = tempfile::tempdir().unwrap();
+    let checkpoint_store = Arc::new(
+        adx_node_manager::checkpoint::LocalCheckpointStore::new(checkpoint_root.path().into())
+            .unwrap(),
+    );
+    let manager = Arc::new(
+        NodeManager::new(
+            "node".into(),
+            backend.clone(),
+            Arc::new(LocalChecks),
+            Arc::new(LocalChecks),
+            sink.clone(),
+        )
+        .with_checkpointing(checkpoint_store, Arc::new(LocalChecks))
+        .unwrap()
+        .with_snapshot_catalog(sink)
+        .unwrap(),
+    );
     manager
         .update_capacity(spec("i").resources, Duration::from_secs(60))
         .unwrap();
@@ -353,7 +367,7 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
     register.accepting_allocations = true;
     node_master.register_node(register.clone()).await.unwrap();
     let mut frontend =
-        pb::master_service_client::MasterServiceClient::new(channel(ma, "frontend").await);
+        pb::master_service_client::MasterServiceClient::new(channel(ma, "api-server").await);
     let mut duplicate = frontend.clone();
     let (a, b) = tokio::join!(
         frontend.create_instance(create("first")),
@@ -366,9 +380,9 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
     let first_record = first.record.unwrap();
     let metrics = scrape_metrics(metrics_address).await;
     assert!(metrics
-        .contains("adx_master_instances{domain_id=\"0\",node_id=\"node\",state=\"Running\"} 1\n"));
+        .contains("adx_master_instances{shard_id=\"0\",node_id=\"node\",state=\"Running\"} 1\n"));
     assert!(metrics
-        .contains("adx_master_node_reserved_cpu_millis{domain_id=\"0\",node_id=\"node\"} 100\n"));
+        .contains("adx_master_node_reserved_cpu_millis{shard_id=\"0\",node_id=\"node\"} 100\n"));
 
     let mut stale_master =
         pb::node_service_client::NodeServiceClient::new(channel(na, "master").await);
@@ -424,7 +438,7 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
         tonic::Code::PermissionDenied
     );
     let mut node_frontend =
-        pb::node_service_client::NodeServiceClient::new(channel(na, "frontend").await);
+        pb::node_service_client::NodeServiceClient::new(channel(na, "api-server").await);
     assert_eq!(
         node_frontend
             .create_instance(pb::StartAssignedInstanceRequest {
@@ -517,7 +531,7 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
     assert!(frontend.create_instance(pending).await.is_err());
     assert!(scrape_metrics(metrics_address)
         .await
-        .contains("adx_master_queued_requests{domain_id=\"0\"} 1\n"));
+        .contains("adx_master_queued_requests{shard_id=\"0\"} 1\n"));
 
     assert_eq!(
         session.get("second").await.unwrap_err(),
@@ -579,12 +593,12 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
     assert!(backend.running.lock().unwrap().is_empty());
     let metrics = scrape_metrics(metrics_address).await;
     assert!(metrics
-        .contains("adx_master_instances{domain_id=\"0\",node_id=\"node\",state=\"Running\"} 0\n"));
+        .contains("adx_master_instances{shard_id=\"0\",node_id=\"node\",state=\"Running\"} 0\n"));
     assert!(metrics.contains("adx_master_deleted_records 2\n"));
     assert!(metrics
-        .contains("adx_master_node_reserved_cpu_millis{domain_id=\"0\",node_id=\"node\"} 0\n"));
+        .contains("adx_master_node_reserved_cpu_millis{shard_id=\"0\",node_id=\"node\"} 0\n"));
 
-    if let Ok(api_binary) = std::env::var("ADX_TEST_SANDBOX_API") {
+    if let Ok(api_binary) = std::env::var("ADX_TEST_API_SERVER") {
         use adx_master::auth::Credential;
         for (key, tenant) in [("a".repeat(40), "tenant"), ("b".repeat(40), "other")] {
             session
@@ -642,11 +656,14 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
             .advertise("test", &format!("https://{ma}"), Duration::from_secs(60))
             .await
             .unwrap();
-        let config = serde_json::json!({"listen":address.to_string(),"discovery":{"redis_url":redis.url,"namespace":"test","poll_seconds":1},"ca":tls.join("ca.pem"),"certificate":tls.join("frontend.pem"),"private_key":tls.join("frontend.key"),"server_name":"localhost","rpc_timeout_seconds":3,"cache_ttl_seconds":60,"cache_entries":128,"auth_cache_ttl_seconds":1});
+        let agent_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let agent_address = agent_listener.local_addr().unwrap();
+        drop(agent_listener);
+        let config = serde_json::json!({"agent_address":format!("http://{agent_address}"),"listen":address.to_string(),"discovery":{"redis_url":redis.url,"namespace":"test","poll_seconds":1},"ca":tls.join("ca.pem"),"certificate":tls.join("api-server.pem"),"private_key":tls.join("api-server.key"),"server_name":"localhost","rpc_timeout_seconds":3,"cache_ttl_seconds":60,"cache_entries":128,"auth_cache_ttl_seconds":1});
         let path = directory.path().join("api.json");
         std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
         let evidence = PathBuf::from(std::env::var("ADX_TEST_EVIDENCE").unwrap());
-        let log = std::fs::File::create(evidence.join("sandbox-api.log")).unwrap();
+        let log = std::fs::File::create(evidence.join("api-server.log")).unwrap();
         let mut process = tokio::process::Command::new(api_binary)
             .args(["--config", path.to_str().unwrap()])
             .stdout(log.try_clone().unwrap())
@@ -655,15 +672,16 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
             .spawn()
             .unwrap();
         let script =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../build/ci/frontend_http.py");
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../build/ci/api_http.py");
         let result = tokio::process::Command::new("python3")
             .arg(script)
             .env("ADX_TEST_API_ENDPOINT", format!("https://{address}"))
+            .env("ADX_TEST_AGENT_PORT", agent_address.port().to_string())
             .output()
             .await
             .unwrap();
         std::fs::write(
-            evidence.join("frontend-http.log"),
+            evidence.join("api-http.log"),
             [result.stdout.clone(), result.stderr.clone()].concat(),
         )
         .unwrap();
@@ -725,8 +743,8 @@ async fn master_process_loads_configuration_and_restores_bootstrap_credentials()
     let key_file = directory.path().join("bootstrap.key");
     std::fs::write(&key_file, &key).unwrap();
     let config = serde_json::json!({
-        "listen":address.to_string(),"metrics_listen":metrics_address.to_string(),"advertised_address":format!("https://{address}"),"discovery_ttl_seconds":3,"redis_url":redis.url,"namespace":"process","domains":1,"placement":"pack","rpc_timeout_seconds":2,
-        "tls":{"ca":tls.join("ca.pem"),"certificate":tls.join("master.pem"),"private_key":tls.join("master.key"),"server_name":"localhost","peers":{"frontend":tls.join("frontend.der"),"node:node":tls.join("node.der")}},
+        "listen":address.to_string(),"metrics_listen":metrics_address.to_string(),"advertised_address":format!("https://{address}"),"discovery_ttl_seconds":3,"redis_url":redis.url,"namespace":"process","scheduler_shards":1,"placement":"pack","rpc_timeout_seconds":2,
+        "tls":{"ca":tls.join("ca.pem"),"certificate":tls.join("master.pem"),"private_key":tls.join("master.key"),"server_name":"localhost","peers":{"api-server":tls.join("api-server.der"),"node:node":tls.join("node.der")}},
         "bootstrap_credentials":[{"key_file":key_file,"tenant_id":"admin","administrator":true,"expires_at_unix_seconds":0}]
     });
     let path = directory.path().join("master.json");
@@ -753,7 +771,7 @@ async fn master_process_loads_configuration_and_restores_bootstrap_credentials()
                 let endpoint =
                     tonic::transport::Endpoint::from_shared(format!("https://{address}"))
                         .unwrap()
-                        .tls_config(client_tls("frontend"))
+                        .tls_config(client_tls("api-server"))
                         .unwrap();
                 if let Ok(channel) = endpoint.connect().await {
                     break channel;
@@ -879,7 +897,7 @@ async fn heartbeat_expiry_reconciliation_and_old_session_fencing() {
     let assigned = Assignment {
         instance_id: "held".into(),
         node_id: "node".into(),
-        domain_id: 0,
+        shard_id: 0,
         generation: 1,
         devices: vec![],
     };
@@ -913,10 +931,10 @@ async fn heartbeat_expiry_reconciliation_and_old_session_fencing() {
     assert!(!snapshot.instances["held"].resources_held());
     let metrics = rpc.metrics().await.unwrap();
     assert!(metrics.contains(
-        "adx_master_instances{domain_id=\"0\",node_id=\"node\",state=\"Invalidated\"} 1\n"
+        "adx_master_instances{shard_id=\"0\",node_id=\"node\",state=\"Invalidated\"} 1\n"
     ));
     assert!(metrics
-        .contains("adx_master_node_available_cpu_millis{domain_id=\"0\",node_id=\"node\"} 0\n"));
+        .contains("adx_master_node_available_cpu_millis{shard_id=\"0\",node_id=\"node\"} 0\n"));
 
     assert_eq!(
         snapshot.instances["held"].result.as_ref().unwrap().state,
@@ -1097,7 +1115,7 @@ async fn node_restart_before_expiry_requires_new_session_at_registered_endpoint(
     assert_eq!(identity.node_id, "node");
     assert_eq!(identity.session_id, "boot-1");
     let mut untrusted =
-        pb::node_service_client::NodeServiceClient::new(channel(na, "frontend").await);
+        pb::node_service_client::NodeServiceClient::new(channel(na, "api-server").await);
     assert_eq!(
         untrusted
             .get_session(pb::GetNodeSessionRequest {})
@@ -1129,7 +1147,7 @@ async fn node_restart_before_expiry_requires_new_session_at_registered_endpoint(
     report.accepting_allocations = true;
     node_master.register_node(report.clone()).await.unwrap();
     let mut frontend =
-        pb::master_service_client::MasterServiceClient::new(channel(ma, "frontend").await);
+        pb::master_service_client::MasterServiceClient::new(channel(ma, "api-server").await);
     let running = frontend
         .create_instance(create("held"))
         .await
@@ -1272,7 +1290,7 @@ async fn master_restart_bounds_re_registration_grace() {
         let assignment = Assignment {
             instance_id: "held".into(),
             node_id: "node".into(),
-            domain_id: 0,
+            shard_id: 0,
             generation: 1,
             devices: vec![],
         };
@@ -1467,7 +1485,7 @@ async fn published_routes_drive_real_gateway_streams_and_reconnect_to_new_master
     let assignment = Assignment {
         instance_id: "routed".into(),
         node_id: "node".into(),
-        domain_id: 0,
+        shard_id: 0,
         generation: 1,
         devices: vec![],
     };
@@ -1514,7 +1532,7 @@ async fn published_routes_drive_real_gateway_streams_and_reconnect_to_new_master
         .await
         .unwrap();
     let mut forbidden =
-        pb::route_service_client::RouteServiceClient::new(channel(ma, "frontend").await);
+        pb::route_service_client::RouteServiceClient::new(channel(ma, "api-server").await);
     assert_eq!(
         forbidden
             .watch_routes(pb::WatchRoutesRequest {})
@@ -1718,8 +1736,9 @@ async fn snapshot_rpc_enforces_component_tenant_and_deferred_deletion() {
             .await
             .unwrap();
     })]);
-    let mut client =
-        pb::snapshot_service_client::SnapshotServiceClient::new(channel(address, "frontend").await);
+    let mut client = pb::snapshot_service_client::SnapshotServiceClient::new(
+        channel(address, "api-server").await,
+    );
     let get = pb::GetSnapshotRequest {
         node_session_id: String::new(),
         id: snapshot.id.clone(),
@@ -1843,7 +1862,7 @@ async fn tenant_key_rpc_requires_frontend_admin_and_revokes_verification() {
         tonic::Code::PermissionDenied
     );
     let mut client = pb::credential_service_client::CredentialServiceClient::new(
-        channel(addr, "frontend").await,
+        channel(addr, "api-server").await,
     );
     assert_eq!(
         client
@@ -2075,7 +2094,7 @@ async fn snapshot_gc_waits_for_node_ack_and_recovers_from_lost_ack() {
         node_session_id: "gc-boot".into(),
     };
     let mut frontend =
-        pb::node_service_client::NodeServiceClient::new(channel(na, "frontend").await);
+        pb::node_service_client::NodeServiceClient::new(channel(na, "api-server").await);
     assert_eq!(
         frontend
             .collect_snapshot(request.clone())
@@ -2117,7 +2136,7 @@ async fn snapshot_gc_waits_for_node_ack_and_recovers_from_lost_ack() {
     assert_eq!(master.collect_snapshots().await.unwrap(), 0);
 
     let mut api =
-        pb::master_service_client::MasterServiceClient::new(channel(ma, "frontend").await);
+        pb::master_service_client::MasterServiceClient::new(channel(ma, "api-server").await);
     let source = api
         .create_instance(create("snapshot-source"))
         .await
@@ -2360,7 +2379,7 @@ async fn shared_checkpoint_moves_to_new_node_and_old_node_cleans_without_deletin
         Peers::new([
             (file("master.der"), Principal::Master),
             (file("node.der"), Principal::Node("source".into())),
-            (file("frontend.der"), Principal::Node("target".into())),
+            (file("api-server.der"), Principal::Node("target".into())),
         ])
     };
     let rpc = MasterRpc::with_heartbeat_timeout(
@@ -2428,7 +2447,7 @@ async fn shared_checkpoint_moves_to_new_node_and_old_node_cleans_without_deletin
             Arc::new(LocalChecks),
             Arc::new(LocalChecks),
             Arc::new(
-                MasterStateSink::new(channel(ma, "frontend").await, Duration::from_secs(3))
+                MasterStateSink::new(channel(ma, "api-server").await, Duration::from_secs(3))
                     .unwrap()
                     .with_session("target-boot".into()),
             ),
@@ -2453,7 +2472,7 @@ async fn shared_checkpoint_moves_to_new_node_and_old_node_cleans_without_deletin
     }));
     let mut source = pb::master_service_client::MasterServiceClient::new(channel(ma, "node").await);
     let mut target =
-        pb::master_service_client::MasterServiceClient::new(channel(ma, "frontend").await);
+        pb::master_service_client::MasterServiceClient::new(channel(ma, "api-server").await);
     let mut source_report = pb::RegisterNodeRequest {
         node_id: "source".into(),
         node_address: "127.0.0.1:9001".into(),
@@ -2491,7 +2510,7 @@ async fn shared_checkpoint_moves_to_new_node_and_old_node_cleans_without_deletin
     let previous = Assignment {
         instance_id: "held".into(),
         node_id: "source".into(),
-        domain_id: 0,
+        shard_id: 0,
         generation: 1,
         devices: vec![],
     };
@@ -2543,7 +2562,7 @@ async fn shared_checkpoint_moves_to_new_node_and_old_node_cleans_without_deletin
     let result = restored.result.clone().unwrap();
     assert_eq!(result.state, InstanceState::Running);
     assert_eq!(result.assignment.node_id, "target");
-    assert_eq!(result.assignment.domain_id, 1);
+    assert_eq!(result.assignment.shard_id, 1);
     assert!(result.assignment.generation > old.assignment.generation);
     assert_eq!(result.spec, old.spec);
     assert!(!restored.recovery.as_ref().unwrap().pending);

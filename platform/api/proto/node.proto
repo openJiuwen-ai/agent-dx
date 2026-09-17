@@ -1,6 +1,5 @@
 syntax = "proto3";
 package adx.node.v1;
-option go_package = "gitcode.com/robbluo/agent-dx/platform/control-plane/sandbox-api/internal/gen/nodev1;nodev1";
 
 // Node Manager is the only writer. Shared-process deployments implement this
 // contract directly; separate processes use a protected local gRPC endpoint.

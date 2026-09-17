@@ -523,7 +523,7 @@ def test_server_without_port_is_rejected(monkeypatch):
     captured = _capture_invocations(monkeypatch)
     runner = CliRunner()
 
-    result = runner.invoke(cli, ["exec", "--agent", "0@default@demo", "--server", "frontend", "--args", '"hi"'])
+    result = runner.invoke(cli, ["exec", "--agent", "0@default@demo", "--server", "api-server", "--args", '"hi"'])
 
     assert result.exit_code == 2
     assert "host:port" in result.output

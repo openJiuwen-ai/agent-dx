@@ -116,7 +116,7 @@ impl pb::node_service_server::NodeService for NodeRpc {
         let trace = adx_observability::trace::Trace::rpc("node.create_snapshot", &request);
         trace
             .run_result(async {
-                if self.peers.authenticate(&request)? != Principal::Frontend {
+                if self.peers.authenticate(&request)? != Principal::ApiServer {
                     return Err(Status::permission_denied(
                         "validated Frontend caller required",
                     ));
@@ -227,7 +227,7 @@ impl pb::node_service_server::NodeService for NodeRpc {
         let trace = adx_observability::trace::Trace::rpc("node.pause_instance", &request);
         trace
             .run_result(async {
-                if self.peers.authenticate(&request)? != Principal::Frontend {
+                if self.peers.authenticate(&request)? != Principal::ApiServer {
                     return Err(Status::permission_denied(
                         "validated Frontend caller required",
                     ));
@@ -260,7 +260,7 @@ impl pb::node_service_server::NodeService for NodeRpc {
         let trace = adx_observability::trace::Trace::rpc("node.resume_instance", &request);
         trace
             .run_result(async {
-                if self.peers.authenticate(&request)? != Principal::Frontend {
+                if self.peers.authenticate(&request)? != Principal::ApiServer {
                     return Err(Status::permission_denied(
                         "validated Frontend caller required",
                     ));
@@ -291,7 +291,7 @@ impl pb::node_service_server::NodeService for NodeRpc {
         let trace = adx_observability::trace::Trace::rpc("node.delete_instance", &request);
         trace
             .run_result(async {
-                if self.peers.authenticate(&request)? != Principal::Frontend {
+                if self.peers.authenticate(&request)? != Principal::ApiServer {
                     return Err(Status::permission_denied(
                         "validated Frontend caller required",
                     ));

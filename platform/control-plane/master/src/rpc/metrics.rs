@@ -36,10 +36,10 @@ impl MasterRpc {
         let mut counts: BTreeMap<(usize, String, String), u64> = BTreeMap::new();
         for (id, node) in &state.nodes {
             for name in states {
-                counts.insert((node.domain_id, id.clone(), name.into()), 0);
+                counts.insert((node.shard_id, id.clone(), name.into()), 0);
             }
             let labels = [
-                ("domain_id", node.domain_id.to_string()),
+                ("shard_id", node.shard_id.to_string()),
                 ("node_id", id.clone()),
             ];
             out.gauge(
@@ -77,17 +77,17 @@ impl MasterRpc {
             };
             *counts
                 .entry((
-                    instance.assignment.domain_id,
+                    instance.assignment.shard_id,
                     instance.assignment.node_id.clone(),
                     name,
                 ))
                 .or_default() += 1;
         }
-        for ((domain, node, state), count) in counts {
+        for ((shard, node, state), count) in counts {
             out.gauge(
                 "adx_master_instances",
                 &[
-                    ("domain_id", domain.to_string()),
+                    ("shard_id", shard.to_string()),
                     ("node_id", node),
                     ("state", state),
                 ],

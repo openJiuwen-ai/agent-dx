@@ -4,12 +4,12 @@
 
 ## 正常路径
 
-1. Frontend 从本地缓存解析归属，携带已认证身份、operation ID 和预期状态版本直达 Node Manager。
+1. API Server 从本地缓存解析归属，携带已认证身份、operation ID 和预期状态版本直达 Node Manager。
 2. Node Manager 串行执行本实例的请求。先确认后端支持 checkpoint，使用 RRT HTTP 控制接口准备 checkpoint，再关闭本机路由。
 3. sandboxd 完成 `leave_running=false` 的完整 checkpoint。确认源执行已停止、删除成功后，释放本机资源。
-4. 存储后端完成制品持久化；Node Manager 将 Paused 状态、恢复点和过期时间一次提交给 Master。Master 写入 Redis、释放 Domain 占用并撤销发布路由，Frontend 才返回暂停成功。
+4. 存储后端完成制品持久化；Node Manager 将 Paused 状态、恢复点和过期时间一次提交给 Master。Master 写入 Redis、释放 Shard 占用并撤销发布路由，API Server 才返回暂停成功。
 5. 恢复时检查过期时间和制品，进行本机资源准入，通过 sandboxd 的 `Start.checkpoint_info` 恢复。后端自行生成物理 ID。
-6. RRT 确认新执行身份、重新开放服务，本机绑定完成后，Node Manager 提交 Running。Master 增量恢复 Domain 资源占用、发布新路由。
+6. RRT 确认新执行身份、重新开放服务，本机绑定完成后，Node Manager 提交 Running。Master 增量恢复 Shard 资源占用、发布新路由。
 
 同节点恢复不改变 ownership generation，execution ID 使用增加的实例状态版本区分，例如 `instance-7` → `instance-7-r5`。RRT 校验执行版本前进，Edge 和 Node Proxy 校验路由版本；旧执行不会借用恢复后的绑定。
 
@@ -22,7 +22,7 @@
 | `CheckpointCooperation` | RRT HTTP prepare／未启动 checkpoint 的 abort |
 | `RuntimeBackend` | 能力检查、checkpoint、restore；sandboxd 适配器负责物理 ID 和 RPC |
 | `CheckpointStore` | 分配暂存、发布、物化、删除与节点本地对账清理；实现本地目录与 S3 对象存储 |
-| `master::storage` / Domain | Redis 版本校验、恢复点保存、增量资源记账 |
+| `master::storage` / Shard | Redis 版本校验、恢复点保存、增量资源记账 |
 | `sandbox-api/controlbackend` | HTTP 兼容格式转换、缓存归属、固定目标与版本的重试 |
 
 `CheckpointStore::publish` 是存储完成边界。对象存储在此完成上传，通过 `materialize` 下载；本地/S3、缓存引用和跨节点恢复已实现，见 [存储契约](snapshot-storage.md) 与 [跨节点恢复](firecracker-cross-node.md)。
@@ -43,7 +43,7 @@ sandboxd 必须支持 checkpoint／restore，并通过 runtime capabilities 提�
 
 ## 失败与重试
 
-- API/RPC 断线不会取消已进入实例队列的操作。Frontend 自动重试保持同一 operation ID、归属和原始预期版本。
+- API/RPC 断线不会取消已进入实例队列的操作。API Server 自动重试保持同一 operation ID、归属和原始预期版本。
 - 正常结果记录只保留最近成功操作。Node RPC 拒绝旧预期版本；客户端不能在一个后续操作已改变状态后，把旧请求换成新版本重新执行。
 - checkpoint 已完成而 Master 提交失败时，节点按 [SQLite 降级契约](node-lifecycle.md) 保存待补交结果。同一操作重试只补交；Journaled 不返回集群成功，重启后先等待 Master 权威对账。
 - checkpoint 调用前，准备失败可调用 RRT abort；调用后不再假设 checkpoint 未启动。无法确认停止／清理时保留资源占用并报告失败。

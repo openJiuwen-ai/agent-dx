@@ -10,7 +10,7 @@
     "server_name": "adx.internal",
     "peers": {
       "master": "/etc/adx/tls/master.der",
-      "frontend": "/etc/adx/tls/frontend.der"
+      "api-server": "/etc/adx/tls/api-server.der"
     }
   },
   "sandboxd_socket": "/run/sandboxd/sandboxd.sock",

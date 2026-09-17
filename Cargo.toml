@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "platform/control-plane/api-server",
     "gateway",
     "platform/runtime/rrt",
     "platform/crates/core",

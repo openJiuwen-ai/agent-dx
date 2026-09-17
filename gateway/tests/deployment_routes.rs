@@ -22,10 +22,7 @@ fn shipped_example_routes_reach_its_frontend_listener() {
     let config = example();
     let services = config["services"].as_array().unwrap();
     let edge = services.iter().find(|s| s["role"] == "edge").unwrap();
-    let api = services
-        .iter()
-        .find(|s| s["role"] == "sandbox-api")
-        .unwrap();
+    let api = services.iter().find(|s| s["role"] == "api-server").unwrap();
     assert_eq!(api["config"]["loopback_http"], true);
     assert_eq!(
         edge["env"]["ADX_DATA_PLANE_EDGE_FRONTEND_CONTROL_PLANE_ADDRESS"],

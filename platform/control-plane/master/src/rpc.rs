@@ -104,11 +104,11 @@ impl State {
     }
     async fn drive(&mut self) -> Result<bool> {
         self.healthy()?;
-        let Some(domain) = self.scheduler.take_ready_domain() else {
+        let Some(shard) = self.scheduler.take_ready_shard() else {
             return Ok(false);
         };
-        let round = adx_observability::trace::Trace::child("domain.schedule_round")
-            .scope(|| self.scheduler.schedule_round(domain))?;
+        let round = adx_observability::trace::Trace::child("shard.schedule_round")
+            .scope(|| self.scheduler.schedule_round(shard))?;
         let progress = round.yielded || !round.assignments.is_empty();
         for assignment in round.assignments {
             let spec = self
@@ -674,7 +674,7 @@ impl pb::master_service_server::MasterService for MasterRpc {
                             }
                             if r.heartbeat_sequence == live.sequence {
                                 return Ok(Response::new(pb::RegisterNodeResponse {
-                                    domain_id: state.nodes[&r.node_id].domain_id as u32,
+                                    shard_id: state.nodes[&r.node_id].shard_id as u32,
                                     master_epoch: state.session.epoch(),
                                 }));
                             }
@@ -716,10 +716,10 @@ impl pb::master_service_server::MasterService for MasterRpc {
                             return Err(status(error));
                         }
                     };
-                    let domain = state.scheduler.register(node).map_err(status)?;
-                    if domain != saved.domain_id {
+                    let shard = state.scheduler.register(node).map_err(status)?;
+                    if shard != saved.shard_id {
                         state.needs_recovery = true;
-                        return Err(Status::internal("node domain mismatch; recovery required"));
+                        return Err(Status::internal("node shard mismatch; recovery required"));
                     }
                     state.nodes.insert(saved.node.id.clone(), saved);
                     state.recovering.remove(&r.node_id);
@@ -743,8 +743,8 @@ impl pb::master_service_server::MasterService for MasterRpc {
                     );
                     service.0.changed.notify_waiters();
                     Ok(Response::new(pb::RegisterNodeResponse {
-                        domain_id: u32::try_from(domain)
-                            .map_err(|_| Status::internal("domain overflow"))?,
+                        shard_id: u32::try_from(shard)
+                            .map_err(|_| Status::internal("shard overflow"))?,
                         master_epoch: state.session.epoch(),
                     }))
                 })
@@ -760,7 +760,7 @@ impl pb::master_service_server::MasterService for MasterRpc {
         let trace = adx_observability::trace::Trace::rpc("master.create_instance", &request);
         trace
             .run_result(async {
-                if self.0.peers.authenticate(&request)? != Principal::Frontend {
+                if self.0.peers.authenticate(&request)? != Principal::ApiServer {
                     return Err(Status::permission_denied("Frontend caller required"));
                 }
                 let r = request.into_inner();
@@ -797,7 +797,7 @@ impl pb::master_service_server::MasterService for MasterRpc {
                 let state = self.0.state.lock().await;
                 let stored = state.session.get(&r.instance_id).await.map_err(status)?;
                 match principal {
-                    Principal::Frontend => tenant(r.caller.as_ref(), &stored.spec.tenant_id)?,
+                    Principal::ApiServer => tenant(r.caller.as_ref(), &stored.spec.tenant_id)?,
                     Principal::Node(ref id) if id == &stored.assignment.node_id => (),
                     _ => {
                         return Err(Status::permission_denied(

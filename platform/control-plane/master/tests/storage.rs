@@ -56,8 +56,8 @@ async fn restart_recovers_assignment_and_fences_old_writer() {
     let rig = common::Redis::new().await;
     let db = rig.store().await;
     let first = db.begin(2).await.unwrap();
-    assert_eq!(register(&first, "z").await.domain_id, 0);
-    assert_eq!(register(&first, "a").await.domain_id, 1);
+    assert_eq!(register(&first, "z").await.shard_id, 0);
+    assert_eq!(register(&first, "a").await.shard_id, 1);
     let mut scheduler = Master::restore(&first.snapshot().await.unwrap(), Placement::Pack).unwrap();
     // Restored nodes must re-register before they can receive new work.
     scheduler.submit(spec("instance")).unwrap();
@@ -114,7 +114,7 @@ async fn conflicting_commits_never_publish_a_partial_route() {
     let a = Assignment {
         instance_id: "i".into(),
         node_id: "n".into(),
-        domain_id: 0,
+        shard_id: 0,
         generation: (1_u64 << 53) + 7,
         devices: vec![],
     };
@@ -162,7 +162,7 @@ async fn aof_crash_restart_preserves_state_and_reconnect_does_not_change_epoch()
     let assignment = Assignment {
         instance_id: "i".into(),
         node_id: "node".into(),
-        domain_id: 0,
+        shard_id: 0,
         generation: 1,
         devices: vec![],
     };
@@ -240,7 +240,7 @@ async fn rejected_assignment_can_be_replaced_without_accepting_its_late_result()
     let old = Assignment {
         instance_id: "i".into(),
         node_id: "a".into(),
-        domain_id: 0,
+        shard_id: 0,
         generation: 1,
         devices: vec![],
     };
@@ -460,7 +460,7 @@ async fn sqlite_replays_pause_and_resume_after_redis_and_node_sink_restart() {
     let assignment = Assignment {
         instance_id: "journal".into(),
         node_id: "n".into(),
-        domain_id: 0,
+        shard_id: 0,
         generation: 1,
         devices: vec![],
     };
@@ -534,7 +534,7 @@ async fn restart_attempts_survive_master_restart_and_cannot_be_reset() {
     let assignment = Assignment {
         instance_id: request.id.clone(),
         node_id: "n".into(),
-        domain_id: 0,
+        shard_id: 0,
         generation: 1,
         devices: vec![],
     };
@@ -646,7 +646,7 @@ async fn expired_executions_remain_invalid_after_redis_and_master_restart() {
         let assignment = Assignment {
             instance_id: id.into(),
             node_id: owner.into(),
-            domain_id: 0,
+            shard_id: 0,
             generation: index as u64 + 1,
             devices: vec![],
         };
@@ -720,7 +720,7 @@ async fn recovery_assignment_is_durable_and_old_generation_cannot_publish() {
     let previous = Assignment {
         instance_id: "held".into(),
         node_id: "source".into(),
-        domain_id: 0,
+        shard_id: 0,
         generation: 1,
         devices: vec![],
     };
@@ -816,7 +816,7 @@ async fn recovery_never_uses_missing_local_or_expired_checkpoint() {
         let previous = Assignment {
             instance_id: "held".into(),
             node_id: "source".into(),
-            domain_id: 0,
+            shard_id: 0,
             generation: 1,
             devices: vec![],
         };

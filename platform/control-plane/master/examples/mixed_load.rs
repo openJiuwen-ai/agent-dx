@@ -51,9 +51,9 @@ fn submit(
         env: Default::default(),
         scheduling: Default::default(),
     };
-    let domain = master.submit(request.clone()).unwrap();
-    assert_eq!(domain, *serial % DOMAINS, "Global must rotate Domains");
-    pending.insert(request.id.clone(), (request, domain, tick));
+    let shard = master.submit(request.clone()).unwrap();
+    assert_eq!(shard, *serial % DOMAINS, "Global must rotate Domains");
+    pending.insert(request.id.clone(), (request, shard, tick));
     *serial += 1;
 }
 fn run(waves: usize, placement: Placement, cache: usize) -> Value {
@@ -126,17 +126,17 @@ fn run(waves: usize, placement: Placement, cache: usize) -> Value {
             }
             // Consume the real coalesced wake queue, bounded to four rounds per tick.
             for _ in 0..DOMAINS {
-                let Some(domain) = master.take_ready_domain() else {
+                let Some(shard) = master.take_ready_shard() else {
                     break;
                 };
-                let outcome = master.schedule_round(domain).unwrap();
+                let outcome = master.schedule_round(shard).unwrap();
                 assert!(outcome.error.is_none());
                 assert!(outcome.attempted <= 5);
                 rounds += 1;
                 for assignment in outcome.assignments {
-                    let (request, expected_domain, queued_at) =
+                    let (request, expected_shard, queued_at) =
                         pending.remove(&assignment.instance_id).unwrap();
-                    assert_eq!(assignment.domain_id, expected_domain);
+                    assert_eq!(assignment.shard_id, expected_shard);
                     let n: usize = assignment.node_id[1..].parse().unwrap();
                     assert!(
                         n != unavailable || tick >= 3,
@@ -176,8 +176,8 @@ fn run(waves: usize, placement: Placement, cache: usize) -> Value {
         }
         assert!(master.snapshot().instances().is_empty());
         assert!(usage.iter().all(|u| *u == Resources::default()));
-        for domain in 0..DOMAINS {
-            assert_eq!(master.pending(domain).unwrap(), 0);
+        for shard in 0..DOMAINS {
+            assert_eq!(master.pending(shard).unwrap(), 0);
         }
         if (wave + 1) % 250 == 0 {
             eprintln!(
@@ -192,7 +192,7 @@ fn run(waves: usize, placement: Placement, cache: usize) -> Value {
     assert_eq!(completed.iter().sum::<usize>(), serial);
     let p99 = waits[(waits.len() - 1) * 99 / 100];
     let stats: Vec<_> = (0..DOMAINS).map(|d| master.stats(d).unwrap()).collect();
-    json!({"waves":waves,"domains":DOMAINS,"tenants":TENANTS,"requests":serial,"rounds":rounds,
+    json!({"waves":waves,"shards":DOMAINS,"tenants":TENANTS,"requests":serial,"rounds":rounds,
         "cache_entries":cache,"seconds":started.elapsed().as_secs_f64(),"completed_per_tenant":completed,
         "max_wait_ticks_per_tenant":max_wait,"p99_wait_ticks":p99,"decision_sha256":format!("{:x}",digest.finalize()),
         "cache_hits":stats.iter().map(|s|s.cache_hits).sum::<u64>(),"candidate_evaluations":stats.iter().map(|s|s.candidate_evaluations).sum::<u64>(),

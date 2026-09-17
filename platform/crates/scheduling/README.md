@@ -1,6 +1,6 @@
 # Scheduling rules
 
-`adx-scheduling` contains read-only Filter/Score rules and their composition. It uses `adx-core` contracts and `im` persistent collections. Global chooses a Domain by round robin; Domain selects nodes and reserves resources; Node Manager performs final local admission.
+`adx-scheduling` contains read-only Filter/Score rules and their composition. It uses `adx-core` contracts and `im` persistent collections. Global chooses a Shard by round robin; Shard selects nodes and reserves resources; Node Manager performs final local admission.
 
 ## Modules and static registration
 
@@ -22,7 +22,7 @@ Default filters, in order: `node-available → resource-fit → device-fit → n
 
 Requests carry kind (`gpu`/`npu`), optional exact model and positive whole-card count. The node inventory supplies kind, model, node-local u32 ID and health. IDs are unique within a kind, so GPU 0 and NPU 0 are distinct cards. No fractional allocation, sharing or virtual partitions are modeled.
 
-Model-specific requests are matched before wildcard requests; a wildcard cannot consume the only card satisfying a narrower request. Card selection is deterministic by kind/ID. Domain commits CPU/memory/disk and concrete cards together. Pending starts already consume cards. Inventory refresh does not erase reservations, including reservations of cards that temporarily disappear or become unhealthy. Release requires the matching assignment generation and confirmed lifecycle cleanup.
+Model-specific requests are matched before wildcard requests; a wildcard cannot consume the only card satisfying a narrower request. Card selection is deterministic by kind/ID. Shard commits CPU/memory/disk and concrete cards together. Pending starts already consume cards. Inventory refresh does not erase reservations, including reservations of cards that temporarily disappear or become unhealthy. Release requires the matching assignment generation and confirmed lifecycle cleanup.
 
 Assignment carries the concrete IDs/model. Node Manager checks the assignment against the request and fresh local inventory, reserves locally, and forwards IDs grouped as `gpu`/`npu` in sandboxd `StartRequest.xpu_allocations`. Failed starts retain all reservations until cleanup succeeds. CPU-only instances do not require an accelerator inventory; accelerator requests require a nonexpired inventory supplied through `update_devices`.
 
@@ -42,11 +42,11 @@ Eligible topology values come from available nodes matching the request's requir
 
 ScheduleAnyway prefers less-populated values but does not reject placement for skew; missing topology labels receive zero score. The default profile combines this preference with other scores, rather than claiming it overrides every other preference.
 
-Master incrementally publishes a coherent snapshot across all embedded Domains. Bounded rounds share its persistent roots; each reservation updates the view before the next request. Peer and spread checks see all recorded assignments. Selection remains within the Domain chosen by Global; these rules do not add cross-Domain retry or migration. The waiting queue is memory-only and is not restored after restart. Master restores persisted assignments and ledger occupancy from Redis before node reconciliation and new admission.
+Master incrementally publishes a coherent snapshot across all embedded Shards. Bounded rounds share its persistent roots; each reservation updates the view before the next request. Peer and spread checks see all recorded assignments. Selection remains within the Shard chosen by Global; these rules do not add cross-Shard retry or migration. The waiting queue is memory-only and is not restored after restart. Master restores persisted assignments and ledger occupancy from Redis before node reconciliation and new admission.
 
 ## Contract and configuration
 
-`control.proto` carries typed policies, node labels/inventory and concrete allocations. Rust conversions reject unknown enums, missing constraint submessages, invalid selectors and duplicate allocations. The policy is available through Rust and internal gRPC contracts. Service configuration, resource sources and public HTTP node/Instance placement are wired outside this library; see [public placement](../../../docs/testing/http-node-placement.md). Public HTTP does not expose this internal topology-spread schema. Physical GPU/NPU execution remains unverified.
+`instance_types.proto` carries typed policies, node labels/inventory and concrete allocations. Rust conversions reject unknown enums, missing constraint submessages, invalid selectors and duplicate allocations. The policy is available through Rust and internal gRPC contracts. Service configuration, resource sources and public HTTP node/Instance placement are wired outside this library; see [public placement](../../../docs/testing/http-node-placement.md). Public HTTP does not expose this internal topology-spread schema. Physical GPU/NPU execution remains unverified.
 
 Example `InstanceSpec.scheduling` JSON representation (the protobuf fields model the same structure):
 
@@ -63,7 +63,7 @@ Example `InstanceSpec.scheduling` JSON representation (the protobuf fields model
 
 Nodes supply the corresponding pool/storage/host/zone labels. `labels` on the Instance are peer/spread labels; they are distinct from node labels.
 
-Validation covers models, healthy inventory, exclusivity and release, local admission/failed cleanup, hard/soft affinity, self-bootstrap, reverse anti-affinity, tenant scope, cross-Domain snapshots, hard/soft spread, invalid policies, typed protobuf round trips and the actual UDS gRPC adapter's device payload. Tests use synthetic inventories and a sandboxd protocol fixture; physical GPU/NPU execution and full-platform Buildkite E2E are separate validation gates.
+Validation covers models, healthy inventory, exclusivity and release, local admission/failed cleanup, hard/soft affinity, self-bootstrap, reverse anti-affinity, tenant scope, cross-Shard snapshots, hard/soft spread, invalid policies, typed protobuf round trips and the actual UDS gRPC adapter's device payload. Tests use synthetic inventories and a sandboxd protocol fixture; physical GPU/NPU execution and full-platform Buildkite E2E are separate validation gates.
 
 ## Scheduling hot path
 

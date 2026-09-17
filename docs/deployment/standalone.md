@@ -29,7 +29,7 @@ sudo install -m 0600 /opt/adx/etc/examples/deployment.json /etc/adx/deployment.j
 | `tls/ca.pem` | 内部 RPC 及 Edge→Node Proxy 的 CA |
 | `tls/master.pem`、`master.key`、`master.der` | Master 证书、私钥和供对端识别的叶证书 DER |
 | `tls/node-1.pem`、`node-1.key`、`node-1.der` | Node Manager 和本机 Node Proxy |
-| `tls/frontend.pem`、`frontend.key`、`frontend.der` | Frontend 内部 RPC 身份 |
+| `tls/api-server.pem`、`api-server.key`、`api-server.der` | API Server 内部 RPC 身份 |
 | `tls/edge.pem`、`edge.key`、`edge.der` | Edge 内部 RPC 与代理客户端身份 |
 | `tls/edge-public.pem`、`edge-public.key` | Edge 对外 HTTPS；客户端信任其签发 CA |
 | `tls/public-ca.pem` | SDK 及管理客户端信任的对外 HTTPS CA，可与内部 CA 不同 |

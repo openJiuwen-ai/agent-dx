@@ -53,7 +53,7 @@ impl Session {
             let mut cp = old.recovery_point(now).ok_or(Error::Conflict)?.clone();
             let target: StoredNode = decode(values[2].as_deref().ok_or(Error::NotFound)?)?;
             if !target.node.available
-                || target.domain_id != replacement.domain_id
+                || target.shard_id != replacement.shard_id
                 || target.session.as_ref().is_some_and(|s| !s.routable)
             {
                 return Err(Error::Conflict);

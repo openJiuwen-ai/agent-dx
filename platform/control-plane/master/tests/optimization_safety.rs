@@ -97,7 +97,7 @@ fn unsafe_policies_and_custom_profiles_never_enter_semantic_cache() {
     assert_eq!(m.stats(0).unwrap().cache_builds, 0);
 }
 #[test]
-fn cached_scalar_request_respects_new_cross_domain_reverse_anti_affinity() {
+fn cached_scalar_request_respects_new_cross_shard_reverse_anti_affinity() {
     let mut m = Master::new(2, Placement::Pack).unwrap();
     let mut a = node("a");
     a.labels.insert("host".into(), "shared".into());

@@ -41,7 +41,7 @@ sandboxd 的 Firecracker v2 恢复会直接读取调用方制品中的 state/mem
 
 ## 快照目录与引用
 
-Master 的快照目录模型、Redis 存储与 mTLS SnapshotService 已实现。Frontend 的查询、分页和删除接口经已认证的租户上下文调用该服务；创建快照由 Node Manager 串行控制任务执行；克隆复用调度和恢复链路。每条记录包含创建模板、源节点/执行身份、制品、版本和状态。
+Master 的快照目录模型、Redis 存储与 mTLS SnapshotService 已实现。API Server 的查询、分页和删除接口经已认证的租户上下文调用该服务；创建快照由 Node Manager 串行控制任务执行；克隆复用调度和恢复链路。每条记录包含创建模板、源节点/执行身份、制品、版本和状态。
 
 - Ready 接受新引用；引用使用恢复实例或节点模板的明确身份，重试不重复增加计数。
 - 删除将状态改为 Deleting，拒绝新引用，保留已有引用直到释放。
@@ -59,14 +59,14 @@ Lima `adx-fc`，运行目录 `/var/lib/adx-pause-r11`，`package-v9`（基于 `0
 
 证据：`out/ci/pause-resume/fc-r11/evidence/{sdk/result.json,lifecycle/result.json,s3-paused-manifest.json,s3-final.xml,catalog-final.json,inventory-final.txt,result.json}`。完整编译、打包、部署与用例日志为 `out/ci/stage-3/{linux-3,package-3,fc-r11}.log`。MinIO 测试制品为 `RELEASE.2025-09-07T16-13-09Z` Linux ARM64，SHA256 `5c83cd2cf151717ba0243f73e1c7802ff36e272b67144bdd7f1f7d684fd6f03d`。
 
-本轮也修复了 checkpoint 返回与后端源执行退出之间的竞态：不再以一次 Running 查询拒绝暂停，转而等待幂等删除确认后释放容量。r10 为该问题的失败证据，`source-exit-red.log` 为定向复现；`node-green-5.log` 中 74 项节点测试通过。`snapshot-rpc-green-1.log` 验证真实 mTLS、租户隔离、分页与延迟删除，`go-catalog-green-2.log` 验证 Frontend 新目录调用链。Frontend 目录适配是在 package-v9 之后构建，因此 r11 不作为该 HTTP 目录链路的端到端证据。
+本轮也修复了 checkpoint 返回与后端源执行退出之间的竞态：不再以一次 Running 查询拒绝暂停，转而等待幂等删除确认后释放容量。r10 为该问题的失败证据，`source-exit-red.log` 为定向复现；`node-green-5.log` 中 74 项节点测试通过。`snapshot-rpc-green-1.log` 验证真实 mTLS、租户隔离、分页与延迟删除，`go-catalog-green-2.log` 验证 API Server 新目录调用链。API Server 目录适配是在 package-v9 之后构建，因此 r11 不作为该 HTTP 目录链路的端到端证据。
 
 
-本地制品确认丢失的回归：`missing-local-red.log` 复现原实现将 NotFound 当作临时存储故障、导致对账始终关闭；现明确返回 NotFound，权威 Paused 记录转为 Failed。`node-green-6.log` 的75项节点测试与 `clippy-4.log` 通过。Frontend依赖裁剪后，`go-catalog-all.log` 的全部Go包测试、vet和API构建通过。
+本地制品确认丢失的回归：`missing-local-red.log` 复现原实现将 NotFound 当作临时存储故障、导致对账始终关闭；现明确返回 NotFound，权威 Paused 记录转为 Failed。`node-green-6.log` 的75项节点测试与 `clippy-4.log` 通过。API Server依赖裁剪后，`go-catalog-all.log` 的全部Go包测试、vet和API构建通过。
 
 ## 快照创建、节点重启与物理清理
 
-`CreateSnapshot` 由 Frontend 根据缓存的 Instance 归属直达 Node Manager。节点先检查 Master 可达，随后在该 Instance 的串行任务内完成 checkpoint、制品独立复制、目录发布和源实例恢复。成功响应要求快照目录及恢复运行结果均已提交到 Master。创建过程中源实例会短暂暂停；源进程恢复失败会返回失败，不能宣称源实例仍运行。内部中间恢复点使用 24 小时有效期，可复用快照自身不设过期时间。
+`CreateSnapshot` 由 API Server 根据缓存的 Instance 归属直达 Node Manager。节点先检查 Master 可达，随后在该 Instance 的串行任务内完成 checkpoint、制品独立复制、目录发布和源实例恢复。成功响应要求快照目录及恢复运行结果均已提交到 Master。创建过程中源实例会短暂暂停；源进程恢复失败会返回失败，不能宣称源实例仍运行。内部中间恢复点使用 24 小时有效期，可复用快照自身不设过期时间。
 
 复制、目录发布或暂停结果提交失败时，只要已有完整 Paused 恢复点，节点会尝试恢复源实例。发布结果不确定时保留复制制品，不能根据一次超时把可能已发布的快照删掉；远端未登记制品由下文的旧进程会话回收器处理。请求 ID 按租户及 Instance 派生快照 ID，完成结果记录原请求版本；重复调用复用已完成快照，后续生命周期操作之后的旧请求不能重新创建或恢复源实例。
 
@@ -91,7 +91,7 @@ package-v13 / Lima r16 再次通过相同13项验收，并确认 SDK 命令订�
 
 公共入口为 `Sandbox.create(snapshot, connection=...)`。未指定的镜像、运行时、CPU/内存/磁盘从源快照继承。当前 Firecracker 实现要求显式资源与 checkpoint 的资源规格一致，不做恢复时扩缩容。调用者可指定新名称、环境变量和节点约束；新 Instance ID 必须不同于源实例。
 
-Master 将 `snapshot_id` 纳入创建规格与幂等校验；加入 Domain 内存队列前在 Redis 持有以目标 Instance ID 命名的恢复引用。local-only 制品给每个候选节点条件附加源 NODE_ID 约束；共享存储沿正常调度路径选择节点。正在删除的快照仅允许已持有引用的请求继续，禁止新增克隆。Master 重启清理没有持久化分配的旧队列引用，保留已经分配的请求引用。
+Master 将 `snapshot_id` 纳入创建规格与幂等校验；加入 Shard 内存队列前在 Redis 持有以目标 Instance ID 命名的恢复引用。local-only 制品给每个候选节点条件附加源 NODE_ID 约束；共享存储沿正常调度路径选择节点。正在删除的快照仅允许已持有引用的请求继续，禁止新增克隆。Master 重启清理没有持久化分配的旧队列引用，保留已经分配的请求引用。
 
 Node Manager 在串行控制任务内校验来源并复制独立制品，再调用 RuntimeBackend.restore_from。复制失败提交 Failed；创建规格声明了快照却缺少恢复点时拒绝执行。复制成功后的恢复文件保持引用直到执行停止，避免 Firecracker 后续读取时文件被缓存淘汰。目标的恢复点保存 checkpoint 内的源运行身份，供重启和再次恢复校验；之后对目标执行新暂停时，恢复点转为目标自己的运行身份。初次克隆的恢复点跟随实例清理，不单独设置暂停 TTL；显式暂停仍沿用请求 TTL。
 

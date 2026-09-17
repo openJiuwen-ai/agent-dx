@@ -10,7 +10,7 @@
 |---|---|---|
 | Agent 产品 `agent/` | Agent CLI、编程 SDK、会话和执行编排 | 已迁入；仍使用旧 FaaS/外部运行时。目标通过 Sandbox SDK 使用平台，业务后端迁移尚未完成 |
 | 公开能力 `platform/sdk/sandbox` | Sandbox 生命周期、命令/文件、快照、放置约束 | Python SDK 已实现；客户端保留字段与新服务端支持范围不同 |
-| 执行平台 `platform/` | 通用 Instance、调度、持久化、节点生命周期、RRT | Rust 控制面和 Go API 已接通，基础 K8s 与本地 FC 分别验收 |
+| 执行平台 `platform/` | 通用 Instance、调度、持久化、节点生命周期、RRT | Rust API Server 已接入控制面；本轮验证单独记录，历史基础 K8s 与本地 FC 结果分别保留 |
 | 共享接入 `gateway/` | Edge、Node Proxy、反向代理与转发 | 独立 Rust crate、多二进制；Agent upstream 可按地址配置，业务规则仍归 Agent 层 |
 
 Agent 使用新平台的目标边界是公开 Sandbox SDK，不直接访问平台 Redis/SQLite、内部调度 RPC 或 sandboxd。当前九条 `/api/agent` 兼容路由只负责认证与转发，需要配置 `agent_address` 和真正的 Agent 业务服务；默认部署不具备旧 CLI 的 meta_service/FaaS 接口。
@@ -28,14 +28,13 @@ agent-dx/
 │   └── tests/                     # Agent 测试及外部运行时替身
 ├── platform/
 │   ├── control-plane/
-│   │   ├── master/                # Rust Master；Global + 内嵌 Domain
+│   │   ├── master/                # Rust Master；Global + 内嵌 Shard
 │   │   ├── node-manager/          # Rust 本机生命周期和后端/存储适配
 │   │   ├── control-cli/           # Rust adxctl / supervisor
-│   │   └── sandbox-api/           # Go 服务、HTTP 兼容层、新 RPC 客户端
-│   │       ├── cmd/adx-sandbox-api/
-│   │       ├── controlbackend/
-│   │       ├── backend/
-│   │       └── internal/          # handler、httpx、cache、生成代码
+│   │   └── api-server/            # Rust HTTP、认证缓存和 Instance RPC
+│   │       ├── src/               # contract、http、clients、operations
+│   │       ├── tests/             # HTTP 契约与校验
+│   │       └── docs/              # Sandbox HTTP 支持范围
 │   ├── crates/
 │   │   ├── core/                  # Instance、资源、恢复点、调度纯类型
 │   │   ├── protocol/              # gRPC 生成、转换与组件身份
@@ -43,9 +42,12 @@ agent-dx/
 │   │   ├── scheduling/            # Filter / Score、快照与查询索引
 │   │   └── observability/         # Trace 初始化、传播与导出
 │   ├── api/
-│   │   ├── proto/control.proto    # Instance / Master / Node / 目录 / 认证
+│   │   ├── proto/instance.proto   # Master / Node 管理服务
+│   │   ├── proto/instance_types.proto # Instance / 资源 / 调度类型
+│   │   ├── proto/snapshot.proto   # 快照目录与引用
+│   │   ├── proto/credentials.proto # 认证和密钥管理
+│   │   ├── proto/routes.proto     # 路由发布
 │   │   ├── proto/node.proto       # Node Proxy 绑定与活动
-│   │   ├── proto/legacy/frontend/ # 唯一旧服务及必要消息依赖
 │   │   └── http/runtime-control.md
 │   ├── runtime/rrt/               # HTTP 运行时与 checkpoint 协作
 │   └── sdk/sandbox/python/        # adx-sandbox / adx_sandbox
@@ -56,7 +58,7 @@ agent-dx/
 │   └── bin/                       # Edge、Node Proxy、forwarder
 ├── third_party/sandboxd/          # 锁定后端协议、来源与许可证
 ├── build/
-│   ├── ci/ / codegen/ / images/   # 本地检查、Go 代码生成、镜像配方
+│   ├── ci/ / images/              # 本地检查、镜像配方
 │   ├── config/examples/           # 统一部署与组件 JSON 配置
 │   ├── release/                   # 二进制、RRT、SDK、Redis 汇总与验证
 │   ├── e2e/                       # 本地 Docker 公共 SDK 验收
@@ -76,7 +78,7 @@ agent-dx/
 
 | 组件 | 现有主要模块 | 职责 |
 |---|---|---|
-| Master | `lib.rs`、`domain.rs`、`queue.rs`、`journal.rs` | Global 轮转、Domain 内存队列、预留、增量调度视图；租户间轮转，租户内优先级/FIFO |
+| Master | `lib.rs`、`shard.rs`、`queue.rs`、`journal.rs` | Global 轮转、Shard 内存队列、预留、增量调度视图；租户间轮转，租户内优先级/FIFO |
 | Master | `storage.rs`、`storage/`、`rpc.rs`、`rpc/` | Redis 条件提交、目录、节点失效、快照克隆、共享恢复协调；不执行节点普通生命周期 |
 | Master | `auth.rs`、`routes.rs`、`metrics.rs` | API Key 摘要、路由发布、集群指标 |
 | Node Manager | `controller.rs`、`controller/{lifecycle,monitor,snapshots}.rs` | 每 Instance 串行任务、暂停/恢复/删除、空闲回收与重启 |
@@ -84,9 +86,9 @@ agent-dx/
 | Node Manager | `checkpoint.rs`、`checkpoint/` | 可扩展 CheckpointStore、本地/S3、缓存引用和远端孤儿回收 |
 | Node Manager | `journal.rs`、`reconciliation.rs` | SQLite 故障降级日志与 Master 权威目录对账 |
 | Node Manager | `resources.rs`、`routes.rs`、`activity.rs`、`proxy.rs` | 容量源/准入、绑定同步、活动采集、代理进程组合 |
-| Go Sandbox API | `controlbackend/` | HTTP 兼容字段到 Instance RPC；认证和归属缓存、直达节点、快照目录 |
+| Rust API Server | `contract.rs`、`http.rs`、`clients.rs`、`operations.rs` | HTTP 兼容字段到 Instance RPC；认证和归属缓存、直达节点、快照目录 |
 
-`core` 不依赖 Redis/SQLite/tonic/sandboxd 客户端；`protocol` 不承载调度或状态机。Node Manager 可依赖 Gateway 的 node 库，Gateway 不依赖 Master/Node Manager 业务实现。Domain 当前与 Master 同进程。
+`core` 不依赖 Redis/SQLite/tonic/sandboxd 客户端；`protocol` 不承载调度或状态机。Node Manager 可依赖 Gateway 的 node 库，Gateway 不依赖 Master/Node Manager 业务实现。Shard 当前与 Master 同进程。
 
 ## Node Manager / Node Proxy 进程组合
 
@@ -99,17 +101,17 @@ Proxy 首次启动关闭实例准入，Node Manager 完成权威对账与全量�
 
 ## 协议与持久化
 
-公开 HTTP 路由和请求响应由 Go handler 定义，SDK 调用公开契约。目前没有仓库维护的 `sandbox.yaml` 或已接入的 OpenAPI 自动生成流水线。参考 [HTTP 文档](../../platform/control-plane/sandbox-api/docs/sandbox-lifecycle-api.md)。
+公开 HTTP 路由和请求响应由 Rust HTTP handler 定义，SDK 调用公开契约。目前没有仓库维护的 `sandbox.yaml` 或已接入的 OpenAPI 自动生成流水线。参考 [HTTP 文档](../../platform/control-plane/api-server/docs/sandbox-lifecycle-api.md)。
 
-内部 gRPC 使用 `control.proto` 和 `node.proto`；只有 `frontend_proxy_service.proto` 保留旧服务契约，必要消息限制在 Go 适配层。RRT 用户操作及运行时协作使用 HTTP，类型在 `core/src/runtime.rs`；没有新的 runtime.proto/POSIX 服务。
+内部 gRPC 按 Instance、快照、凭证、路由及节点本地控制拆分，详见 [协议目录](../../platform/api/proto/README.md)。RRT 用户操作及运行时协作使用 HTTP，类型在 `core/src/runtime.rs`。
 
 正常结果经 Master 写 Redis；SQLite 只在提交不可用时保存待补交结果。Journaled 不发布 Edge 路由。节点重启而 Master 不可用时等待对账，不从不完整日志重建目录。快照制品走独立的本地/S3 存储抽象。详见 [节点契约](../testing/node-lifecycle.md)。
 
 ## 构建、部署和验收
 
-Rust 共用根 Cargo workspace，Go/Python 分别构建。`adx` 是 Agent CLI；`adxctl` 是平台运维 CLI，支持 validate/render/run/start/status/stop。统一发布包带控制面、Gateway、RRT、Sandbox SDK 和锁定 Redis；可选择外部 Redis，sandboxd 始终由部署环境托管。RRT 需进入实例镜像。
+Rust 共用根 Cargo workspace，Python 独立打包；外部 sandboxd 按其锁定版本构建。`adx` 是 Agent CLI；`adxctl` 是平台运维 CLI，支持 validate/render/run/start/status/stop。统一发布包带控制面、Gateway、RRT、Sandbox SDK 和锁定 Redis；可选择外部 Redis，sandboxd 始终由部署环境托管。RRT 需进入实例镜像。
 
-普通进程与 Pod 内都使用相同组件和 supervisor。Buildkite 先构建，再发布不可变镜像，最后独立执行 K8s 七组用例及清理。最新正式记录为 [Buildkite #21](../testing/2026-09-17-observability-k8s.md)。本地 FC 与基础 K8s 分开统计，实际未完成项和后置项见 [路线图](../testing/control-plane-roadmap.md)。
+普通进程与 Pod 内都使用相同组件和 supervisor。Buildkite 先构建，再发布不可变镜像，最后独立执行 K8s 七组用例及清理。Rust API Server 重写前的正式记录为 [Buildkite #21](../testing/2026-09-17-observability-k8s.md)。本地 FC 与基础 K8s 分开统计，实际未完成项和后置项见 [路线图](../testing/control-plane-roadmap.md)。
 
 ## 可观测
 

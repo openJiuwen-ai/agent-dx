@@ -51,7 +51,7 @@ fn record(generation: u64) -> InstanceRecord {
             devices: vec![],
             instance_id: "i".into(),
             node_id: "n".into(),
-            domain_id: 0,
+            shard_id: 0,
             generation,
         },
         state: InstanceState::Running,

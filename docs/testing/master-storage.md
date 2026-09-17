@@ -22,7 +22,7 @@
 | 字段 | 内容 |
 |---|---|
 | `header` | schema、域数量、Master epoch、generation 下限、全局发布 revision、节点分域轮转位置 |
-| `node:<node_id>` | 节点资源和设备、固定 domain_id、Node Manager 地址、Node Proxy 地址 |
+| `node:<node_id>` | 节点资源和设备、固定 shard_id、Node Manager 地址、Node Proxy 地址 |
 | `instance:<instance_id>` | 原始 InstanceSpec、精确 Assignment、最后一次已提交的节点结果 |
 
 其他现有键：主目录后缀 `:snapshots` 保存快照目录，`:credentials` 保存凭证摘要，`:revoked-credentials` 保存吊销标记；`adx:{namespace}:master:v1` 保存带 TTL 的 Master 发现信息。它们不等同于持久化路由事件队列。
@@ -37,8 +37,8 @@
 
 ## 写入与恢复契约
 
-1. **Master 启动**：`RedisStore::begin(domain_count)` 增加持久化 epoch，返回 Session；加载目录并通过 `Master::restore` 重建调度状态。缺少头部、未知 schema、域数量不兼容、非法归属或重复卡占用会阻止恢复。不会把损坏的数据目录重新初始化为空集群。
-2. **节点注册**：首次按节点数量最少的域分配，并列时轮转；已有节点保留 domain_id。节点地址与资源更新也通过条件提交。恢复到内存后的所有节点暂时关闭新调度，重新注册后才参与选点。
+1. **Master 启动**：`RedisStore::begin(scheduler_shards)` 增加持久化 epoch，返回 Session；加载目录并通过 `Master::restore` 重建调度状态。缺少头部、未知 schema、域数量不兼容、非法归属或重复卡占用会阻止恢复。不会把损坏的数据目录重新初始化为空集群。
+2. **节点注册**：首次按节点数量最少的域分配，并列时轮转；已有节点保留 shard_id。节点地址与资源更新也通过条件提交。恢复到内存后的所有节点暂时关闭新调度，重新注册后才参与选点。
 3. **首次分配**：调度内核产生 Assignment；`Session::reserve` 持久化后才能向节点派发。请求仍在等待资源时不写 Redis，重启后由客户端重试。不能把仅有的内存分配当作可执行的持久化授权。
 4. **节点结果**：Node Manager 完成本机操作后提交结果，Master 核验 InstanceSpec、完整 Assignment、实例 revision 和占用一致性，再调用 `Session::commit`。普通生命周期操作没有新增一轮 Master 操作意图登记。Running 才进入路由视图；Failed/Deleted 移除路由。
 5. **释放资源**：Failed 不等于资源可用；`resources_held=true` 时恢复占用。服务层必须先确认节点清理、提交终态，再释放调度账本；不能仅以 State=Failed 释放。节点心跳失效是单独的持久化失效路径，会释放逻辑预留并关闭节点资格；物理旧执行在返回对账时清理，见 [节点失效](node-failure-takeover.md)。

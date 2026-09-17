@@ -223,7 +223,8 @@ impl InstanceState {
 pub struct Assignment {
     pub instance_id: String,
     pub node_id: String,
-    pub domain_id: usize,
+    #[serde(alias = "domain_id")]
+    pub shard_id: usize,
     pub generation: u64,
     #[serde(default)]
     pub devices: Vec<scheduling::DeviceAllocation>,

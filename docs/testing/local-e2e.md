@@ -4,12 +4,12 @@
 
 The local Linux ARM64 environment runs two isolated Docker nodes. Each node runs
 real sandboxd (PR #56, `efc201531d7e2e9d69505da151eb66084b61eebf`), Node Manager
-and Node Proxy. Node 1 also hosts Redis 7.2.5, Master with an embedded Domain,
+and Node Proxy. Node 1 also hosts Redis 7.2.5, Master with an embedded Shard,
 Sandbox API and Edge. ADX processes are launched from the unified release package
 by `adxctl`; sandboxd is independently hosted. The SDK is installed from a wheel.
 
-Control requests enter Edge over verified TLS, then use the co-located Frontend
-loopback HTTP listener. Frontend/Master/Node RPC and Edge/Node Proxy use mTLS.
+Control requests enter Edge over verified TLS, then use the co-located API Server
+loopback HTTP listener. API Server/Master/Node RPC and Edge/Node Proxy use mTLS.
 Commands and files traverse Edge → Node Proxy → the real RRT inside a runc
 instance. The test registry is local and separate from the platform data path.
 
@@ -68,7 +68,7 @@ not cross-node recovery or a Buildkite run.
 
 ## Findings fixed during integration
 
-- Frontend has a loopback-only HTTP option for Edge's existing control forwarder.
+- API Server has a loopback-only HTTP option for Edge's existing control forwarder.
   Internal RPC retains mTLS; public HTTPS remains the default.
 - Managed Redis supports a password file and requires one for non-loopback binds.
 - The sandboxd adapter leaves `StartRequest.sandbox_id` empty and records
@@ -77,7 +77,7 @@ not cross-node recovery or a Buildkite run.
   or cleanup after Node Manager restart.
 - Explicit Start argument/authentication rejection permits cleanup; ambiguous
   transport failure still retains resources until reconciliation.
-- Frontend restores the SDK's filtered `GET /api/instances?instance_id=...`
+- API Server restores the SDK's filtered `GET /api/instances?instance_id=...`
   compatibility endpoint, including authentication and tenant ownership checks.
 
 ## Boundaries

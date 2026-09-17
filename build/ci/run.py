@@ -15,7 +15,7 @@ import time
 import uuid
 
 ROOT = Path(__file__).resolve().parents[2]
-SUITES = ("harness", "rust", "go", "agent", "sandbox-sdk", "interop", "package", "storage", "control-rpc", "frontend-control")
+SUITES = ("harness", "rust", "api-server", "agent", "sandbox-sdk", "interop", "package", "storage", "control-rpc", "api-control")
 
 
 def commands_for(suite, output, jobs):
@@ -26,9 +26,9 @@ def commands_for(suite, output, jobs):
     if suite == "rust":
         cargo = os.environ.get("CARGO", "cargo")
         return [[cargo, "--version"], make + ["rust-test"]]
-    if suite in ("control-rpc", "frontend-control"):
-        if suite == "frontend-control" and (not Path(os.environ.get("ADX_TEST_SANDBOX_API", "")).is_file() or not os.access(os.environ.get("ADX_TEST_SANDBOX_API", ""), os.X_OK)):
-            raise ValueError("frontend-control requires ADX_TEST_SANDBOX_API executable")
+    if suite in ("control-rpc", "api-control"):
+        if suite == "api-control" and (not Path(os.environ.get("ADX_TEST_API_SERVER", "")).is_file() or not os.access(os.environ.get("ADX_TEST_API_SERVER", ""), os.X_OK)):
+            raise ValueError("api-control requires ADX_TEST_API_SERVER executable")
         cargo = os.environ.get("CARGO", "cargo")
         redis = os.environ.get("ADX_TEST_REDIS_SERVER", "redis-server")
         return [[redis, "--version"],
@@ -43,11 +43,8 @@ def commands_for(suite, output, jobs):
                 ["env", f"ADX_TEST_REDIS_SERVER={redis}", f"ADX_TEST_EVIDENCE={output}",
                  cargo, "test", "--locked", "-p", "adx-master", "--test", "storage",
                  "-j", str(jobs), "--", "--ignored", "--nocapture"]]
-    if suite == "go":
-        go = os.environ.get("GO", "go")
-        return [[go, "version"], ["protoc", "--version"],
-                ["protoc-gen-go", "--version"], ["protoc-gen-go-grpc", "--version"],
-                make + ["go-test", "go-vet"]]
+    if suite == "api-server":
+        return [[os.environ.get("CARGO", "cargo"), "test", "--locked", "-p", "adx-api-server", "-j", str(jobs)]]
     if suite == "agent":
         return [make + ["agent-test", f"PYTEST_ARGS=--junitxml={output / 'junit.xml'}"]]
     if suite == "sandbox-sdk":
@@ -158,12 +155,12 @@ def main():
                 "image": os.environ.get("ADX_CI_IMAGE"), "jobs": args.jobs,
                 "caches": {key: os.environ.get(key) for key in
                            ("CARGO_TARGET_DIR", "GOCACHE", "GOMODCACHE", "PIP_CACHE_DIR")}}
-    if args.suite in ("storage", "control-rpc", "frontend-control"):
+    if args.suite in ("storage", "control-rpc", "api-control"):
         binary = shutil.which(os.environ.get("ADX_TEST_REDIS_SERVER", "redis-server"))
         metadata["redis_binary_sha256"] = hashlib.sha256(Path(binary).read_bytes()).hexdigest() if binary else None
-    if args.suite == "frontend-control":
-        binary = Path(os.environ["ADX_TEST_SANDBOX_API"])
-        metadata["sandbox_api_binary_sha256"] = hashlib.sha256(binary.read_bytes()).hexdigest()
+    if args.suite == "api-control":
+        binary = Path(os.environ["ADX_TEST_API_SERVER"])
+        metadata["api_server_binary_sha256"] = hashlib.sha256(binary.read_bytes()).hexdigest()
     def interrupt(*_):
         raise KeyboardInterrupt
 

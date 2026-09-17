@@ -1,0 +1,26 @@
+syntax = "proto3";
+
+package adx.control.v1;
+
+service RouteService { rpc WatchRoutes(WatchRoutesRequest) returns (stream RouteFrame); }
+
+message WatchRoutesRequest {}
+
+message PublishedRoute {
+ string instance_id = 1;
+ string tenant_id = 2;
+ string runtime_id = 3;
+ string runtime_ip = 4;
+ string node_proxy_address = 5;
+ uint64 generation = 6;
+ uint64 instance_revision = 7;
+}
+
+message RouteFrame {
+ uint64 epoch = 1;
+ uint64 revision = 2;
+ uint64 base_revision = 3;
+ bool reset = 4;
+ repeated PublishedRoute upserts = 5;
+ repeated string deleted = 6;
+}

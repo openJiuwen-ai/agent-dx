@@ -31,7 +31,7 @@ struct Config {
     discovery_ttl_seconds: u64,
     redis_url: String,
     namespace: String,
-    domains: usize,
+    scheduler_shards: usize,
     placement: String,
     rpc_timeout_seconds: u64,
     tls: TlsFiles,
@@ -61,7 +61,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let timeout = Duration::from_secs(c.rpc_timeout_seconds);
     let listener = tokio::net::TcpListener::bind(c.listen).await?;
     let store = RedisStore::connect(&c.redis_url, &c.namespace, timeout).await?;
-    let session = store.begin(c.domains).await?;
+    let session = store.begin(c.scheduler_shards).await?;
     for credential in c.bootstrap_credentials {
         let key = std::fs::read_to_string(credential.key_file)?;
         session

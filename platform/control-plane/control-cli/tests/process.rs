@@ -39,8 +39,8 @@ async fn restart_budget_lock_and_scoped_stop() {
         .unwrap();
     let root = tmp.path();
     bin(root, "adx-master", "#!/bin/sh\nexit 1\n");
-    bin(root, "adx-sandbox-api", "#!/bin/sh\nexec sleep 100\n");
-    let services = json!([{"id":"master","role":"master"},{"id":"api","role":"sandbox-api"}]);
+    bin(root, "adx-api-server", "#!/bin/sh\nexec sleep 100\n");
+    let services = json!([{"id":"master","role":"master"},{"id":"api","role":"api-server"}]);
     let d = config(root, services.clone());
     let state = d.state_dir.clone();
     let task = tokio::spawn(supervisor::run(d));

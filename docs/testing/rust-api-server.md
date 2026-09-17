@@ -1,0 +1,33 @@
+# Rust API Server 与调度 Shard 迁移
+
+2026-09-17。基于 `153f839` 实施，独立工作树 `api-server-rust`，分支 `refactor/api-server-rust`。本页随验证推进更新；此前 Buildkite #21 的结果不代表这次 Rust 重写已验收。
+
+## 契约
+
+- Frontend → API Server，生产二进制 `adx-api-server`，部署角色与受信组件身份 `api-server`。
+- Domain → Scheduling Shard，代码 `ShardScheduler`，内部字段 `shard_id`，Master 配置 `scheduler_shards`。Global 轮转 → Shard Filter/Score → Node Manager 准入的分层保持。
+- 调度指标标签改为 `shard_id`，消费者应同步更新。TLS/DNS domain 与拓扑故障域的名称保持其原本含义。
+- 读取旧 Redis/SQLite 记录时允许旧调度字段别名；新写入使用 Shard 字段。升级需统一更新组件配置和证书角色，不运行混合版本组件。
+- 公共 Sandbox HTTP 路径、响应包装、SSE、请求 ID、租户身份、归属缓存和操作去重保持；内部直接调用 Instance RPC。
+- Agent 路由仍为可选业务服务转发，不将旧 FaaS 执行链带入 API Server。
+
+## 测试驱动记录
+
+首批4项契约测试先对空实现失败，再通过直接 Instance 转换实现：验证租户来源、CPU/内存/磁盘单位、快照省略规格继承、显式拒绝不支持选项、实例亲和 OR 分组。Rust API Server、Master 和 CLI 已编译。新增超时校验、缓存过期和 SSE/重放测试。
+
+真实 Redis/mTLS/HTTPS 验证首轮发现测试配置未迁移与 HTTP 异步状态机栈溢出；保留失败日志并修复。完整服务、SDK、发布包和基础 Kubernetes 验收进行中，当前不声明迁移已完成。
+
+## 复验入口
+
+```bash
+cargo test --locked -p adx-api-server -j 2
+ADX_TEST_API_SERVER=/absolute/path/adx-api-server \
+ADX_TEST_REDIS_SERVER=/absolute/path/redis-server \
+python3 build/ci/run.py api-control --jobs 2 --output out/ci/api-control-new
+```
+
+本地组件验证和正式 Kubernetes 验收分别记录。端到端通过后才替换已发布版本的验收结论。
+
+本轮已通过工作区 370 项测试（29 项环境或性能用例默认忽略）、58 项 E2E 驱动测试、7 项 CI 驱动测试，以及 11 项实际执行的 Redis/mTLS RPC 测试和生产 API 二进制 HTTPS 契约。暂停/恢复重试、快照 CRUD、租户隔离、克隆和 9 条 Agent 流式转发路由均已通过；严格 Clippy 通过。发布包与基础 K8s 验收待本次提交触发。
+
+证据目录为 `out/ci/api-server/`：`contract-red.log` / `contract-green.log`、`workspace-final.log`、`clippy-5.log`、`rpc-6/result.json`、`rpc-6/api-http.log`、`e2e-driver.log`、`ci-driver.log`。RPC 夹具使用真实服务与 Redis/mTLS，RuntimeBackend 和就绪/路由检查为受控实现，因此不替代真实 sandboxd/RRT 的 K8s 验收。

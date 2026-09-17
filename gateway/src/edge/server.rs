@@ -800,7 +800,7 @@ impl EdgeFrontend {
             return tls_required();
         }
         let route = ProxyRoute {
-            name: "frontend".into(),
+            name: "api-server".into(),
             path_prefix: "/".into(),
             upstream: format!("http://{}", self.frontend_address),
             strip_prefix: false,

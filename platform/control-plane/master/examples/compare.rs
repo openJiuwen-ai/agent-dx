@@ -135,14 +135,14 @@ impl Actor {
                         Err(_) => break,
                     }
                 }
-                if let Some(d) = ready.or_else(|| m.take_ready_domain()) {
+                if let Some(d) = ready.or_else(|| m.take_ready_shard()) {
                     let r = m.schedule_round(d).unwrap();
                     assert!(r.error.is_none(), "{:?}", r.error);
                     for a in r.assignments {
                         pending.remove(&a.instance_id).unwrap().send(a).unwrap();
                     }
                 }
-                ready = m.take_ready_domain();
+                ready = m.take_ready_shard();
             }
         });
         Self {

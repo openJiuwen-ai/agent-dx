@@ -240,7 +240,7 @@ impl pb::snapshot_service_server::SnapshotService for MasterRpc {
                 let state = self.0.state.lock().await;
                 state.healthy().map_err(status)?;
                 match &principal {
-                    Principal::Frontend => (),
+                    Principal::ApiServer => (),
                     Principal::Node(id) => {
                         let live = state
                             .live
@@ -264,7 +264,9 @@ impl pb::snapshot_service_server::SnapshotService for MasterRpc {
                 }
                 let snapshot = state.session.get_snapshot(&r.id).await.map_err(status)?;
                 match principal {
-                    Principal::Frontend => tenant(r.caller.as_ref(), &snapshot.template.tenant_id)?,
+                    Principal::ApiServer => {
+                        tenant(r.caller.as_ref(), &snapshot.template.tenant_id)?
+                    }
                     Principal::Node(id) if id == snapshot.source_node_id => (),
                     _ => return Err(Status::permission_denied("snapshot source node mismatch")),
                 }
@@ -284,7 +286,7 @@ impl pb::snapshot_service_server::SnapshotService for MasterRpc {
             adx_observability::trace::Trace::rpc("master.snapshot.list_snapshots", &request);
         trace
             .run_result(async {
-                if self.0.peers.authenticate(&request)? != Principal::Frontend {
+                if self.0.peers.authenticate(&request)? != Principal::ApiServer {
                     return Err(Status::permission_denied("Frontend identity required"));
                 }
                 let r = request.into_inner();
@@ -340,7 +342,7 @@ impl pb::snapshot_service_server::SnapshotService for MasterRpc {
             adx_observability::trace::Trace::rpc("master.snapshot.delete_snapshot", &request);
         trace
             .run_result(async {
-                if self.0.peers.authenticate(&request)? != Principal::Frontend {
+                if self.0.peers.authenticate(&request)? != Principal::ApiServer {
                     return Err(Status::permission_denied("Frontend identity required"));
                 }
                 let r = request.into_inner();

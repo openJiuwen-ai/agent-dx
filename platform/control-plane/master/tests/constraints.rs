@@ -131,7 +131,7 @@ fn instance_affinity_and_reverse_anti_affinity_use_pending_reservations() {
     assert_eq!(master.schedule(0).unwrap().unwrap().node_id, "b");
 }
 #[test]
-fn topology_spread_counts_reservations_in_all_embedded_domains() {
+fn topology_spread_counts_reservations_in_all_embedded_shards() {
     let mut master = Master::new(2, Placement::Pack).unwrap();
     master.register(node("a", "x")).unwrap();
     master.register(node("b", "y")).unwrap();
@@ -223,7 +223,7 @@ fn affinity_defaults_to_own_tenant_and_can_target_explicit_tenants() {
     assert_eq!(master.schedule(0).unwrap().unwrap().instance_id, "explicit");
 }
 #[test]
-fn required_anti_affinity_is_enforced_across_embedded_domains() {
+fn required_anti_affinity_is_enforced_across_embedded_shards() {
     let mut master = Master::new(2, Placement::Pack).unwrap();
     master.register(node("a", "same")).unwrap();
     master.register(node("b", "same")).unwrap();

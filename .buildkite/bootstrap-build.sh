@@ -34,8 +34,6 @@ if [[ -z ${ADX_REDIS_SERVER:-} || -z ${ADX_REDIS_CLI:-} ]]; then
   export ADX_REDIS_SERVER="$cache/redis-7.2.5/src/redis-server"
   export ADX_REDIS_CLI="$cache/redis-7.2.5/src/redis-cli"
 fi
-go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.6
-go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.5.1
 if [[ ! -x "$cache/python/bin/python3" ]]; then
   python3 -m venv "$cache/python"
 fi

@@ -29,7 +29,7 @@ def resources(namespace, image, architecture, registry_auth=False, node_names=()
         ]
         # Secret keys cannot contain slashes; project certificate files into tls/.
         certificates = ['ca.pem']
-        for name in ('master', 'node', 'node2', 'frontend', 'edge'):
+        for name in ('master', 'node', 'node2', 'api-server', 'edge'):
             certificates += [name + ext for ext in ('.pem', '.key', '.der')]
         volumes[-1]['secret']['items'] = [
             {'key': name, 'path': 'tls/' + name} for name in certificates

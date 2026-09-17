@@ -1,0 +1,61 @@
+syntax = "proto3";
+
+package adx.control.v1;
+
+import "instance_types.proto";
+
+service SnapshotService {
+  rpc PublishSnapshot(PublishSnapshotRequest) returns (ReusableSnapshot);
+  rpc GetSnapshot(GetSnapshotRequest) returns (ReusableSnapshot);
+  rpc ListSnapshots(ListSnapshotsRequest) returns (ListSnapshotsResponse);
+  rpc DeleteSnapshot(DeleteSnapshotRequest) returns (ReusableSnapshot);
+}
+
+enum SnapshotState {
+  SNAPSHOT_STATE_UNSPECIFIED = 0;
+  SNAPSHOT_STATE_READY = 1;
+  SNAPSHOT_STATE_DELETING = 2;
+  SNAPSHOT_STATE_DELETED = 3;
+}
+
+message SnapshotReference {
+  oneof owner {
+    string restore_instance_id = 1;
+    TemplateReference template = 2;
+  }
+}
+
+message ReusableSnapshot {
+  string id = 1;
+  repeated string names = 2;
+  InstanceSpec template = 3;
+  string source_node_id = 4;
+  string source_runtime_id = 5;
+  CheckpointArtifact artifact = 6;
+  uint64 revision = 7;
+  SnapshotState state = 8;
+  repeated SnapshotReference references = 9;
+}
+
+message PublishSnapshotRequest { ReusableSnapshot snapshot = 1; string node_session_id = 2; }
+
+message GetSnapshotRequest { string id = 1; CallerContext caller = 2; string node_session_id = 3; }
+
+message ListSnapshotsRequest { CallerContext caller = 1; string name = 2; string page_token = 3; uint32 page_size = 4; }
+
+message ListSnapshotsResponse { repeated ReusableSnapshot snapshots = 1; string next_page_token = 2; }
+
+message DeleteSnapshotRequest { string id = 1; CallerContext caller = 2; }
+
+message CollectSnapshotRequest { ReusableSnapshot snapshot = 1; string node_session_id = 2; }
+
+message CollectSnapshotResponse { string snapshot_id = 1; uint64 revision = 2; }
+
+message CreateSnapshotRequest {
+  Assignment assignment = 1; CallerContext caller = 2; string operation_id = 3;
+  uint64 expected_revision = 4; repeated string names = 5; uint64 timeout_seconds = 6;
+}
+
+message CreateSnapshotResponse { ReusableSnapshot snapshot = 1; InstanceResult instance = 2; }
+
+message TemplateReference { string node_id = 1; string template_id = 2; }

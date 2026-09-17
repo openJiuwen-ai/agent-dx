@@ -4,17 +4,18 @@
 
 | 阶段 | 实施范围 | 验收重点 |
 | --- | --- | --- |
-| 1. 同节点暂停／恢复 | Node Manager 串行状态机、RRT HTTP 协作、sandboxd checkpoint/restore、本地存储、Redis 提交、Frontend、路由 | 真实 Firecracker 创建→执行→暂停→Node Manager 重启→恢复→删除；内存计数器、PID、文件、执行身份、资源和路由 |
+| 1. 同节点暂停／恢复 | Node Manager 串行状态机、RRT HTTP 协作、sandboxd checkpoint/restore、本地存储、Redis 提交、API Server、路由 | 真实 Firecracker 创建→执行→暂停→Node Manager 重启→恢复→删除；内存计数器、PID、文件、执行身份、资源和路由 |
 | 2. 节点生命周期与降级 | 空闲删除、可配置自动重启及退避、资源源选择与过期保护、压力准入、SQLite 降级日志与补写 | Master 失联、节点进程重启、采集失败、清理失败；遵守节点生命周期所有权和权威对账规则 |
 | 3. 快照与存储 | 对象存储适配、可复用快照目录、引用与延迟删除、预算缓存、未登记制品回收 | 上传失败回滚、恢复点过期、引用期间删除、缓存淘汰、从快照创建新实例 |
 | 4. 跨节点恢复与接管 | 同 Instance ID 归属转移、旧归属撤销与返回清理、心跳故障处理、恢复与路由切换 | 源节点恢复、旧请求重放、接管中途失败；缺少 checkpoint 或 local-only 制品明确失败 |
-| 5. 调度能力与性能 | Global 轮转、Domain 调度、Local 准入；优先级、GPU/NPU 整卡、亲和／反亲和；增量状态与候选复用 | 不超分、卡号正确、排队公平、规则正确；同一 Linux 主机与既有分支统一负载比较 QPS/P99/更新及冲突成本 |
+| 5. 调度能力与性能 | Global 轮转、Shard 调度、Local 准入；优先级、GPU/NPU 整卡、亲和／反亲和；增量状态与候选复用 | 不超分、卡号正确、排队公平、规则正确；同一 Linux 主机与既有分支统一负载比较 QPS/P99/更新及冲突成本 |
 | 6. 接口与部署收口 | 最小 API Key 管理、启动配置和证书加载、Node Manager/Node Proxy 两种进程模式、统一 CLI 与发布包 | HTTP/SDK 兼容、身份隔离、进程重启、停止清理、同包角色组合、安装文档可复现 |
 | 7. 正式基础端到端流水线 | 独立 K8s 部署和用例步骤、基础功能/节点故障用例、日志及制品汇总；FC 本轮保留本地验收 | 部署过程可见、逐用例结果可见、失败日志可定位、包/镜像/源码身份一致 |
 | 8. 可观测与日志采集 | 优先补齐实例数量与资源分配 Metrics；结构化日志采集、Trace 上下文与导出 | 指标与权威状态/资源账本一致；真实采集、跨组件关联与采集端故障验收 |
 | 9. 日志滚动与压缩 | 按大小/时间滚动、历史文件压缩、保留数量/时长/总容量、部署配置 | 持续写入及重启下日志完整；压缩/磁盘异常可诊断；进程与Pod部署行为清晰 |
+| 10. Rust API Server 与调度命名 | Rust HTTP 服务直连 Instance RPC、删除 Go/legacy 消息链、调度 Shard 命名与配置迁移 | HTTP/SDK 契约、SSE、认证/缓存/重试、真实 RPC、发布包及基础 K8s 七组 |
 
-阶段 1 已完成本地验收：2026-09-15，独立 Lima ARM64 KVM 节点使用真实 OCI 镜像，通过公共 SDK 完成创建、执行、暂停、Node Manager 重启、恢复和删除。恢复后内存计数器继续增加、PID 不变、二进制文件一致；Redis 记录为 Deleted 且资源释放，sandboxd 清单与 checkpoint 目录为空。122 项定向 Rust/Redis 测试、Clippy、真实 RPC 与 Frontend HTTP 集成通过。详细证据见 [本地验收记录](2026-09-15-checkpoint-acceptance.md)。
+阶段 1 已完成本地验收：2026-09-15，独立 Lima ARM64 KVM 节点使用真实 OCI 镜像，通过公共 SDK 完成创建、执行、暂停、Node Manager 重启、恢复和删除。恢复后内存计数器继续增加、PID 不变、二进制文件一致；Redis 记录为 Deleted 且资源释放，sandboxd 清单与 checkpoint 目录为空。122 项定向 Rust/Redis 测试、Clippy、真实 RPC 与 API Server HTTP 集成通过。详细证据见 [本地验收记录](2026-09-15-checkpoint-acceptance.md)。
 
 阶段 2 已完成本地验收：Lima r7 的 checkpoint 与节点生命周期共 10 项真实 Firecracker 用例通过，141 项 Rust/Redis/HTTP 定向测试、138 项 SDK 单测和 Go 检查通过。契约及证据见 [节点生命周期与降级](node-lifecycle.md)。阶段 3 已完成本地快照与存储验收；阶段4已完成本地故障恢复验收，阶段6已完成本地部署收口验收，阶段7按本轮基础K8s范围完成正式验收，阶段5尚未全部验收完成。本地验收与 Kubernetes Buildkite 分开记录。
 

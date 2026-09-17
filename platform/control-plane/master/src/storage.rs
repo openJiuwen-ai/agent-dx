@@ -32,11 +32,13 @@ const ATTEMPTS: usize = 32;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Header {
     schema: u32,
-    domains: usize,
+    #[serde(alias = "domains")]
+    shards: usize,
     epoch: u64,
     generation: u64,
     revision: u64,
-    next_node_domain: usize,
+    #[serde(alias = "next_node_domain")]
+    next_node_shard: usize,
 }
 impl Header {
     fn advance(&mut self) -> Result<()> {
@@ -45,8 +47,8 @@ impl Header {
     }
     fn validate(&self) -> Result<()> {
         if self.schema != 1
-            || self.domains == 0
-            || self.next_node_domain >= self.domains
+            || self.shards == 0
+            || self.next_node_shard >= self.shards
             || self.epoch == 0
         {
             return Err(Error::Unavailable(
@@ -65,7 +67,8 @@ pub struct NodeSession {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredNode {
     pub node: Node,
-    pub domain_id: usize,
+    #[serde(alias = "domain_id")]
+    pub shard_id: usize,
     pub address: String,
     pub proxy_address: String,
     #[serde(default)]
@@ -116,7 +119,7 @@ pub struct Route {
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredSnapshot {
-    pub domain_count: usize,
+    pub shard_count: usize,
     pub generation: u64,
     /// Cluster publication cursor, including changes that do not add a route.
     pub revision: u64,
@@ -125,13 +128,13 @@ pub struct StoredSnapshot {
 }
 impl StoredSnapshot {
     pub fn validate(&self) -> Result<()> {
-        if self.domain_count == 0 {
+        if self.shard_count == 0 {
             return Err(Error::Conflict);
         }
         for (id, n) in &self.nodes {
             n.node.validate()?;
             if id != &n.node.id
-                || n.domain_id >= self.domain_count
+                || n.shard_id >= self.shard_count
                 || n.address.trim().is_empty()
                 || n.proxy_address.trim().is_empty()
             {
@@ -145,7 +148,7 @@ impl StoredSnapshot {
                 .get(&i.assignment.node_id)
                 .ok_or(Error::Conflict)?;
             if id != &i.spec.id
-                || i.assignment.domain_id != n.domain_id
+                || i.assignment.shard_id != n.shard_id
                 || i.assignment.generation > self.generation
             {
                 return Err(Error::Conflict);
@@ -401,9 +404,9 @@ impl RedisStore {
     }
     /// Called once per Master startup, never on a Redis reconnect. A new epoch
     /// rejects old Master writes; this is fencing, not leader election or HA.
-    pub async fn begin(&self, domains: usize) -> Result<Session> {
-        if domains == 0 {
-            return Err(Error::Invalid("domain count must be positive".into()));
+    pub async fn begin(&self, shards: usize) -> Result<Session> {
+        if shards == 0 {
+            return Err(Error::Invalid("shard count must be positive".into()));
         }
         for _ in 0..ATTEMPTS {
             let raw = self.raw().await?;
@@ -411,16 +414,16 @@ impl RedisStore {
             let mut h = if raw.is_empty() {
                 Header {
                     schema: 1,
-                    domains,
+                    shards,
                     epoch: 1,
                     generation: 0,
                     revision: 0,
-                    next_node_domain: 0,
+                    next_node_shard: 0,
                 }
             } else {
                 let mut h: Header = decode(old)?;
                 h.validate()?;
-                if h.domains != domains {
+                if h.shards != shards {
                     return Err(Error::Conflict);
                 }
                 snapshot(&raw)?.validate()?;
@@ -447,7 +450,7 @@ fn snapshot(raw: &BTreeMap<String, String>) -> Result<StoredSnapshot> {
     )?;
     h.validate()?;
     let mut out = StoredSnapshot {
-        domain_count: h.domains,
+        shard_count: h.shards,
         generation: h.generation,
         revision: h.revision,
         nodes: BTreeMap::new(),
@@ -577,8 +580,8 @@ impl Session {
         self.header(&raw.get(HEADER).cloned())?;
         snapshot(&raw)
     }
-    /// Node identity keeps its assigned Domain. Only first registration scans
-    /// Domain counts; capacity refreshes read/write a single node field.
+    /// Node identity keeps its assigned ShardScheduler. Only first registration scans
+    /// ShardScheduler counts; capacity refreshes read/write a single node field.
     pub async fn register(
         &self,
         node: Node,
@@ -603,27 +606,27 @@ impl Session {
         for _ in 0..ATTEMPTS {
             let values = self.store.fields(&[HEADER.into(), field.clone()]).await?;
             let mut h = self.header(&values[0])?;
-            let domain = if let Some(v) = &values[1] {
-                decode::<StoredNode>(v)?.domain_id
+            let shard = if let Some(v) = &values[1] {
+                decode::<StoredNode>(v)?.shard_id
             } else {
                 let current = self.snapshot().await?;
                 if current.revision != h.revision {
                     continue;
                 }
-                let mut counts = vec![0usize; h.domains];
+                let mut counts = vec![0usize; h.shards];
                 for n in current.nodes.values() {
-                    counts[n.domain_id] += 1;
+                    counts[n.shard_id] += 1;
                 }
-                let domain = (0..h.domains)
-                    .map(|offset| (h.next_node_domain + offset) % h.domains)
+                let shard = (0..h.shards)
+                    .map(|offset| (h.next_node_shard + offset) % h.shards)
                     .min_by_key(|d| counts[*d])
-                    .expect("nonempty domains");
-                h.next_node_domain = (domain + 1) % h.domains;
-                domain
+                    .expect("nonempty shards");
+                h.next_node_shard = (shard + 1) % h.shards;
+                shard
             };
             let record = StoredNode {
                 node: node.clone(),
-                domain_id: domain,
+                shard_id: shard,
                 address: address.clone(),
                 proxy_address: proxy_address.clone(),
                 session: session.clone(),
@@ -692,7 +695,7 @@ impl Session {
                 };
             }
             let node: StoredNode = decode(values[2].as_deref().ok_or(Error::NotFound)?)?;
-            if node.domain_id != record.assignment.domain_id
+            if node.shard_id != record.assignment.shard_id
                 || record.assignment.generation <= h.generation
             {
                 return Err(Error::Conflict);
@@ -754,7 +757,7 @@ impl Session {
                 return Err(Error::Conflict);
             }
             let node: StoredNode = decode(values[2].as_deref().ok_or(Error::NotFound)?)?;
-            if node.domain_id != replacement.domain_id {
+            if node.shard_id != replacement.shard_id {
                 return Err(Error::Conflict);
             }
             old.assignment = replacement.clone();
@@ -828,5 +831,30 @@ impl Session {
         Err(Error::Unavailable(
             "concurrent instance commit; retry request".into(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod naming_tests {
+    use super::*;
+    #[test]
+    fn reads_old_header_without_losing_epoch_and_writes_only_shard_fields() {
+        let old = r#"{"schema":1,"domains":2,"epoch":7,"generation":11,"revision":23,"next_node_domain":1}"#;
+        let h: Header = decode(old).unwrap();
+        h.validate().unwrap();
+        assert_eq!(
+            (
+                h.shards,
+                h.epoch,
+                h.generation,
+                h.revision,
+                h.next_node_shard
+            ),
+            (2, 7, 11, 23, 1)
+        );
+        let v: serde_json::Value = serde_json::from_str(&encode(&h).unwrap()).unwrap();
+        assert_eq!(v["shards"], 2);
+        assert!(v.get("domains").is_none());
+        assert!(v.get("next_node_domain").is_none());
     }
 }

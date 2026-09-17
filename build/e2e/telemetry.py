@@ -165,7 +165,7 @@ def validate_traces(node):
     assert any(s['name']=='rrt.http' and s.get('parentSpanId','').strip('0') for s in rows),'RRT did not receive data request context'
     trace_ids=[]
     if node=='node1':
-        names={'edge.http','sandbox-api.http','master.create_instance','node.create_instance','instance.queue','instance.execute','master.commit_instance'}
+        names={'edge.http','api_server.http','master.create_instance','node.create_instance','instance.queue','instance.execute','master.commit_instance'}
         groups={}
         for span in rows:groups.setdefault(span['traceId'],set()).add(span['name'])
         trace_ids=[key for key,value in groups.items() if names <= value]

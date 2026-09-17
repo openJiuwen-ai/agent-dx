@@ -6,16 +6,16 @@
 
 | 指标 | 标签 | 含义 |
 | --- | --- | --- |
-| `adx_master_instances` | domain_id, node_id, state | 已分配归属的实例当前状态数量，包含无执行结果的Reserved、失效的Invalidated和跨节点Recovering；Deleted不计入 |
-| `adx_master_queued_requests` | domain_id | 尚未分配的内存队列长度；单列，不与实例计数相加解释为运行数量 |
+| `adx_master_instances` | shard_id, node_id, state | 已分配归属的实例当前状态数量，包含无执行结果的Reserved、失效的Invalidated和跨节点Recovering；Deleted不计入 |
+| `adx_master_queued_requests` | shard_id | 尚未分配的内存队列长度；单列，不与实例计数相加解释为运行数量 |
 | `adx_master_deleted_records` | 无 | 当前目录保留的Deleted记录数，Gauge，不是永久累计事件计数 |
-| `adx_master_node_schedulable` | domain_id, node_id | 该节点当前是否可调度；Master重启待报到或心跳过期时为0 |
-| `adx_master_node_reachable` | domain_id, node_id | 当前会话是否已报到且未超出心跳期限，不等同于可调度 |
-| `adx_master_node_heartbeat_age_seconds` | domain_id, node_id | 最近接受的心跳年龄；未报到时不提供时间值 |
+| `adx_master_node_schedulable` | shard_id, node_id | 该节点当前是否可调度；Master重启待报到或心跳过期时为0 |
+| `adx_master_node_reachable` | shard_id, node_id | 当前会话是否已报到且未超出心跳期限，不等同于可调度 |
+| `adx_master_node_heartbeat_age_seconds` | shard_id, node_id | 最近接受的心跳年龄；未报到时不提供时间值 |
 | `adx_node_accepting_allocations` | 无 | Node Manager本机准入开关 |
 | `adx_node_resource_observation_fresh` / `adx_node_device_observation_fresh` | 无 | 本机容量/设备观测是否仍在有效期内 |
 
-资源Gauge有两个前缀：Master为 `adx_master_node`，附带domain_id和node_id；Node Manager为 `adx_node`，节点身份由采集target标签关联。后缀：
+资源Gauge有两个前缀：Master为 `adx_master_node`，附带shard_id和node_id；Node Manager为 `adx_node`，节点身份由采集target标签关联。后缀：
 
 - `_{capacity,reserved,available,overcommitted}_{cpu_millis,memory_bytes,disk_bytes}`。
 - `_devices{kind="gpu|npu",model="…",state="capacity|reserved|available|overcommitted"}`，单位整卡。
@@ -44,7 +44,7 @@ scrape_configs:
 
 Pod部署需为采集方暴露私有metrics端口，并配置相应服务发现。现阶段未引入产品内置Collector或强制监控后端。
 
-按域汇总示例：`sum by (domain_id, state) (adx_master_instances)`；按集群汇总：`sum(adx_master_node_reserved_cpu_millis)`。Master与Node的资源视图分别使用，不叠加求和，避免同一分配计数两次。
+按域汇总示例：`sum by (shard_id, state) (adx_master_instances)`；按集群汇总：`sum(adx_master_node_reserved_cpu_millis)`。Master与Node的资源视图分别使用，不叠加求和，避免同一分配计数两次。
 
 ## 验收
 

@@ -71,7 +71,7 @@ fn weighted(name: &'static str, node: &'static str, points: u32, weight: u32) ->
     WeightedScore::new(Arc::new(Prefer { name, node, points }), weight).unwrap()
 }
 #[test]
-fn domain_uses_filters_before_weighted_scores_and_keeps_admission_guards() {
+fn shard_uses_filters_before_weighted_scores_and_keeps_admission_guards() {
     let framework = Framework::new(
         vec![Arc::new(ExcludeA)],
         vec![

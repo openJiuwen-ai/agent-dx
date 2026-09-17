@@ -224,7 +224,7 @@ fn fixture() -> (
     let assignment = Assignment {
         instance_id: spec.id.clone(),
         node_id: "node".into(),
-        domain_id: 0,
+        shard_id: 0,
         generation: 1,
         devices: vec![],
     };

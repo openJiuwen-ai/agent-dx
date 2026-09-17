@@ -22,7 +22,7 @@
 | 可用资源 | 根据容量与账本计算，容量下降造成的超额占用单独可见；维护/失联节点标识不可调度，不视为空闲容量 |
 | 状态可信度 | 节点可达性、资源采集年龄、数据是否过期；Master与节点对账差异可诊断 |
 
-职责：Master提供集群/Domain调度目录及资源分配视图；Node Manager提供本机账本、准入状态和实际使用量。两个视图分开命名，聚合时避免重复累加。资源“分配量”与CPU/内存“实际用量”明确区分。
+职责：Master提供集群/Shard调度目录及资源分配视图；Node Manager提供本机账本、准入状态和实际使用量。两个视图分开命名，聚合时避免重复累加。资源“分配量”与CPU/内存“实际用量”明确区分。
 
 聚合指标标签为节点、域、状态、资源类型及设备型号。当前 `adx_instance_*` 使用量指标带 Instance/runtime ID，尚无独立明细开关；采集端可按需要过滤。名称、单位和标签以 [指标清单](instance-resource-metrics.md) 为准。
 
@@ -48,7 +48,7 @@ Trace配置与当前接线见[跨组件Trace](distributed-traces.md)。下表列
 | --- | --- |
 | `gateway/src/common/logging.rs` | 复用现有日志初始化与过滤入口，接统一结构化字段；统一部署使用stdout进入Supervisor，独立文件模式保持独立目录。 |
 | Sandbox API的HTTP入口与`controlbackend` | 将请求关联上下文带入Master及Node RPC；缓存命中后的直达路径也携带上下文。 |
-| Master的RPC入口与Domain队列 | 串联准入、排队、放置、分配结果；区分排队耗时与实际执行耗时。 |
+| Master的RPC入口与Shard队列 | 串联准入、排队、放置、分配结果；区分排队耗时与实际执行耗时。 |
 | Node Manager的`rpc.rs`与`controller.rs` | RPC接收上下文后，在每实例串行任务的命令封装中显式携带；执行、状态提交及响应关联到同一操作。 |
 | Gateway到RRT的HTTP路径 | 关联路由选择、本机转发与实例执行，避免仅打通控制请求而遗漏数据面。 |
 | Supervisor的`logging.rs` | 只管理输出的写入/滚动/压缩，不从文本反推业务Span。 |

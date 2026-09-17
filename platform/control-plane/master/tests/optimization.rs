@@ -104,19 +104,19 @@ fn cached_candidates_preserve_spread_and_reconcile_release_and_status_updates() 
     assert_eq!(m.schedule(0).unwrap().unwrap().node_id, "a");
 }
 #[test]
-fn publication_precedes_wakeup_and_stalled_domains_do_not_spin() {
+fn publication_precedes_wakeup_and_stalled_shards_do_not_spin() {
     let mut m = Master::new(1, Placement::Pack).unwrap();
     m.register(node("n", 1)).unwrap();
     let mut n = node("n", 1);
     n.available = false;
     m.register(n).unwrap();
     m.submit(spec("i")).unwrap();
-    assert_eq!(m.take_ready_domain(), Some(0));
+    assert_eq!(m.take_ready_shard(), Some(0));
     assert!(m.schedule_round(0).unwrap().assignments.is_empty());
-    assert_eq!(m.take_ready_domain(), None);
+    assert_eq!(m.take_ready_shard(), None);
     let old = m.snapshot();
     m.register(node("n", 1)).unwrap();
-    assert_eq!(m.take_ready_domain(), Some(0));
+    assert_eq!(m.take_ready_shard(), Some(0));
     assert!(m.snapshot().revision > old.revision);
     assert!(m.snapshot().node("n").unwrap().available);
     assert_eq!(m.schedule_round(0).unwrap().assignments.len(), 1);

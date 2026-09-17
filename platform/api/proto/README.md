@@ -5,17 +5,17 @@ extend the old POSIX, function, or generic signal services for new functionality
 
 | Contract | Responsibility | Status |
 |---|---|---|
-| `control.proto` / `adx.control.v1` | Master/Node registration, allocation and node-owned state submission | mTLS service processes, Redis discovery/state, route publication |
-| `node.proto` / `adx.node.v1` | Versioned Node Proxy bindings and node activity snapshots | UDS services, activity reporting and both Node Proxy process modes wired |
-| RRT HTTP | Commands, files, health and command observation; HTTP/WebSocket tunnel transport | Existing implementation retained and tested |
-| Node Manager/RRT HTTP control | Identity-aware status, checkpoint preparation/abort and restored listener setup | Runtime controller and Node Manager client implemented; see [HTTP contract](../http/runtime-control.md) |
-| `legacy/frontend/frontend_proxy_service.proto` | Frontend compatibility entrypoint | The sole retained legacy gRPC service contract |
+| `instance.proto` / `adx.control.v1` | Master/Node registration, allocation and node-owned state submission | Direct typed RPC from API Server |
+| `instance_types.proto` | Shared Instance, Assignment, resources and scheduling types | Shared by control services |
+| `snapshot.proto` | Snapshot catalog, references and collection | Master and Node snapshot services |
+| `credentials.proto` | API Key validation and administrator operations | AuthService and CredentialService |
+| `routes.proto` | Committed route snapshots and incremental publication | RouteService |
+| `node.proto` / `adx.node.v1` | Versioned Node Proxy bindings and activity | Node-local UDS services |
+| RRT HTTP | Commands, files, health, checkpoint cooperation and tunnels | See [runtime contract](../http/runtime-control.md) |
 
-Frontend compatibility still needs the message types imported by
-`frontend_proxy_service.proto`, and `NotifyRequest` decoding used by the HTTP
-adapter. These files supply compatibility payloads only: CoreService,
-RuntimeService, RuntimeRPC and InvocationRPC service stubs are no longer generated
-for Frontend. New internal protocols do not import these definitions.
+The Rust API Server converts public HTTP JSON directly into Instance RPC types.
+All owned protobuf definitions are generated through the Cargo protocol crate.
+The five control files retain the `adx.control.v1` package and existing wire field numbers.
 
 RRT uses HTTP for operations and runtime cooperation. Its POSIX stream, signal
 reporting, generated protobuf modules and protobuf build script have been removed.
@@ -53,12 +53,11 @@ snapshot means unknown, not idle. The session must be supplied by node process
 registration/assembly; receiving activity never implicitly authorizes a session.
 
 All changes here intentionally require matching component versions in the
-unified release. Only the Frontend compatibility entrypoint carries a legacy
-wire-compatibility requirement.
+unified release. Public Sandbox HTTP paths and response envelopes retain SDK compatibility.
 
 ## Scheduling payloads
 
-`control.proto` defines typed SchedulingPolicy selectors, hard/soft node and
+`instance_types.proto` defines typed SchedulingPolicy selectors, hard/soft node and
 Instance affinity, topology spread, device requests and physical allocations.
 RegisterNode carries labels and healthy device inventory. Assignment carries
 node-local GPU/NPU IDs and models; Node Manager checks these against the request
@@ -85,5 +84,5 @@ begins with a full `RouteFrame` (`reset=true`); subsequent frames specify the
 exact `base_revision`. Epoch identifies the Master storage session. A gap,
 conflicting cursor or regressed execution version causes a fresh subscription.
 Master publishes only committed, Running instances on routable nodes. API key
-verification is shared by trusted Frontend and Edge callers. Route publication
+verification is shared by trusted API Server and Edge callers. Route publication
 and credentials do not transfer Instance lifecycle ownership to Master.

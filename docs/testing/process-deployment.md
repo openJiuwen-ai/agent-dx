@@ -12,7 +12,7 @@
 | `control-cli/src/supervisor.rs` | 单部署文件锁、受保护的控制 UDS、子进程组、日志、有限次数重启、状态查询和停止顺序 |
 | `node-manager/src/admin.rs` | 本机已管理 Instance 的停止清理；保持 Node Manager 的生命周期所有权 |
 | `node.proto / NodeAdminService` | 仅在本机受保护 UDS 服务的 Drain RPC，不挂到 Node TCP 服务 |
-| `build/release/build.sh` | 原生 release 构建、Go 协议生成和编译、SDK wheel 构建、统一包组装 |
+| `build/release/build.sh` | 原生 release 构建、SDK wheel 构建、统一包组装 |
 | `build/release/package.py` | 输入制品完整性检查、Redis 版本检查、清单与 SHA256、已展开目录复核 |
 | `build/ci/process_smoke.py` | 从统一包启动真实 Redis／Master，注入进程退出、检查新 epoch、确认干净停止 |
 
@@ -79,7 +79,7 @@ package/
 └── manifest.json    commit、dirty、target、profile、文件 SHA256
 ```
 
-`build/release/build.sh` 从当前源码构建原生 release 制品，显式要求 Cargo／Go 缓存、目标架构、Redis 二进制和新输出目录。部署阶段只使用已构建包。`package.py assemble` 也可组装显式提供的开发制品，并按实际 profile 标注；不能将 debug 包当成 Linux release 验收。
+`build/release/build.sh` 从当前源码构建原生 release 制品，显式要求 Cargo 缓存、目标架构、Redis 二进制和新输出目录。部署阶段只使用已构建包。`package.py assemble` 也可组装显式提供的开发制品，并按实际 profile 标注；不能将 debug 包当成 Linux release 验收。
 
 `package.py verify <directory>` 校验完整文件集合和哈希，拒绝缺失、额外文件、符号链接及内容变更。哈希用于与受信制品清单核对，本身不是签名或源码构建证明。真实 Buildkite 仍需从干净检出构建并交接这一批制品。
 
@@ -88,7 +88,7 @@ package/
 - TDD 首先确认 `drain`／`is_draining` 接口缺失；随后测试删除提交失败、重试只补提交、未对账拒绝停止、新分配拒绝。
 - supervisor 测试运行真实子进程和 UDS，检查重复启动排他、重启预算、清理失败时依赖存活、再次停止成功。
 - 真实包 smoke 托管真实 Redis＋Master，检查 Redis 地址发布、Master 强制退出后的新 PID／新 epoch，以及 `adxctl stop` 后 supervisor 退出。
-- Go 协议生成、全包测试和服务构建单独执行；原有 HTTPS／RPC／Redis 协作套件继续回归。
+- API Server 通过根 Cargo workspace 编译与测试；原有 HTTPS／RPC／Redis 协作套件继续回归。
 
 这不是两节点完整平台验收：没有启动真实 sandboxd／RRT，也没有通过安装后的公开 SDK 完成创建—命令—文件—删除。后续环境驱动器、实例镜像、资源源与 SDK 用例已接通，正式结果见本文开头。不会用本阶段的包构建或 Master smoke 代替该门禁。
 

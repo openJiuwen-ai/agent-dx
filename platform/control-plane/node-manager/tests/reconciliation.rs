@@ -110,7 +110,7 @@ fn record(id: &str, state: InstanceState) -> InstanceRecord {
         assignment: Assignment {
             instance_id: id.into(),
             node_id: "n".into(),
-            domain_id: 0,
+            shard_id: 0,
             generation: 7,
             devices: vec![],
         },

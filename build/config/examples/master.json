@@ -2,7 +2,7 @@
   "listen": "0.0.0.0:19000",
   "redis_url": "redis://127.0.0.1:6379/",
   "namespace": "adx",
-  "domains": 1,
+  "scheduler_shards": 1,
   "placement": "pack",
   "rpc_timeout_seconds": 30,
   "tls": {
@@ -11,7 +11,7 @@
     "private_key": "/etc/adx/tls/master.key",
     "server_name": "adx.internal",
     "peers": {
-      "frontend": "/etc/adx/tls/frontend.der",
+      "api-server": "/etc/adx/tls/api-server.der",
       "node:node-1": "/etc/adx/tls/node-1.der",
       "edge": "/etc/adx/tls/edge.der"
     }

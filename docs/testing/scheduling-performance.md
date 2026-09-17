@@ -1,6 +1,6 @@
 # 调度优化迁移与验证
 
-本轮以 `feature/distribute_env` 超仓提交 `f3d3d52029be361a895acd775ef939008a37a3dd` 固定的 FunctionSystem 子仓提交 `7cb717dc27778954773c3745ab7fca4c77912377` 为对照，迁移调度热路径优化。Global 只轮转选择 Domain；Domain 与 Master 同进程，负责实际调度；Node Manager 保留本机最终准入。
+本轮以 `feature/distribute_env` 超仓提交 `f3d3d52029be361a895acd775ef939008a37a3dd` 固定的 FunctionSystem 子仓提交 `7cb717dc27778954773c3745ab7fca4c77912377` 为对照，迁移调度热路径优化。Global 只轮转选择 Shard；Shard 与 Master 同进程，负责实际调度；Node Manager 保留本机最终准入。
 
 拓扑分布不作为本轮扩展或性能验收目标。现有节点/实例亲和、反亲和、GPU/NPU 整卡规则参与回归，纯标量快路径不会绕过这些规则。
 
@@ -12,11 +12,11 @@
 | 查询上下文复用 | [query.rs](../../platform/crates/scheduling/src/query.rs)：每请求准备一次匹配结果，多个候选和 Filter/Score 共用；按租户/精确标签中最小集合筛选，NotIn/DoesNotExist 等表达式仍按原语义复核 |
 | `schedule_queue_actor.cpp` 的 256 请求 / 10 ms 有界轮次 | [master/lib.rs](../../platform/control-plane/master/src/lib.rs)：`schedule_round` 在请求之间检查预算；固定基准快照根，轮内每次预留增量进入后续请求视图。到界返回给调用者处理心跳、更新等事件 |
 | `RequestMutationJournal` 与预分配增量对账 | [journal.rs](../../platform/control-plane/master/src/journal.rs)：按序号直接读取新增区间，合并重复节点；缓存刷新该节点的当前可分配量，避免重复扣减；游标过旧时重建候选 |
-| `SchedulingInputSignature` / `SupportsSemanticAggregation` | [domain.rs](../../platform/control-plane/master/src/domain.rs)：按 CPU、内存、镜像和 runtime 聚合计算。仅框架内置 profile、默认空策略、零磁盘请求且无既有反向硬反亲和时启用。自定义插件即使用内置同名也不启用 |
+| `SchedulingInputSignature` / `SupportsSemanticAggregation` | [shard.rs](../../platform/control-plane/master/src/shard.rs)：按 CPU、内存、镜像和 runtime 聚合计算。仅框架内置 profile、默认空策略、零磁盘请求且无既有反向硬反亲和时启用。自定义插件即使用内置同名也不启用 |
 | `SelectFeasible` 候选复用 | 排序候选集按上述签名复用；资源预留、释放和状态变化后，仅重新评估变化节点并更新排序。Pack/Spread 与未启用复用时逐次结果一致；没有重复使用旧分数 |
 | 发布完成后再唤醒等待调度 | Master 先更新快照及变更序列，再合并唤醒事件。包括只有维护状态变化的上报；停滞队列等待新事件，不自行忙循环 |
 
-资源账本不再在每次分配时完整克隆：Domain 先预留标量，再预留卡，卡预留失败撤回本次标量预留。设备忙闲索引随分配/释放更新，不遍历全部实例重建。Node Manager 的最终本机复核不变。
+资源账本不再在每次分配时完整克隆：Shard 先预留标量，再预留卡，卡预留失败撤回本次标量预留。设备忙闲索引随分配/释放更新，不遍历全部实例重建。Node Manager 的最终本机复核不变。
 
 ## 请求顺序与失败契约
 
@@ -38,7 +38,7 @@
 |---|---:|---|
 | `max_attempts` | 256 | 每轮最多尝试请求数，包括未适配请求 |
 | `max_duration` | 10 ms | 请求之间检查的时间预算 |
-| `candidate_cache_entries` | 32 | 每 Domain 最多保存的计算签名；超限按进入顺序淘汰，0 关闭复用 |
+| `candidate_cache_entries` | 32 | 每 Shard 最多保存的计算签名；超限按进入顺序淘汰，0 关闭复用 |
 | `mutation_history` | 65,536 | 有界变更日志条数；溢出后消费者重建 |
 
 请求数、时间和日志容量须大于零。这些调优项当前只通过 Rust 配置接口设置；Master 服务 JSON 暴露 `domains` 与 `placement`，未暴露上述 SchedulerConfig 调优字段。

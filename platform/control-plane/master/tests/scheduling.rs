@@ -39,7 +39,7 @@ fn node(id: &str, capacity: u64) -> Node {
 }
 
 #[test]
-fn global_round_robin_domains_and_balanced_node_registration() {
+fn global_round_robin_shards_and_balanced_node_registration() {
     let mut master = Master::new(2, Placement::Spread).unwrap();
     assert_eq!(master.register(node("n1", 2)).unwrap(), 0);
     assert_eq!(master.register(node("n2", 2)).unwrap(), 1);
@@ -111,7 +111,7 @@ fn duplicate_submission_is_idempotent_but_changed_spec_conflicts() {
 }
 
 #[test]
-fn zero_domains_and_zero_resource_requests_are_rejected() {
+fn zero_shards_and_zero_resource_requests_are_rejected() {
     assert!(Master::new(0, Placement::Pack).is_err());
     let mut master = Master::new(1, Placement::Pack).unwrap();
     let mut request = spec("a", "t", 0);

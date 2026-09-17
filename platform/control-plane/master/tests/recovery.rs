@@ -43,7 +43,7 @@ fn saved() -> StoredSnapshot {
     let assignment = Assignment {
         instance_id: "i".into(),
         node_id: "n".into(),
-        domain_id: 0,
+        shard_id: 0,
         generation: 42,
         devices: vec![DeviceAllocation {
             id: 0,
@@ -52,14 +52,14 @@ fn saved() -> StoredSnapshot {
         }],
     };
     StoredSnapshot {
-        domain_count: 1,
+        shard_count: 1,
         generation: 42,
         revision: 5,
         nodes: [(
             "n".into(),
             StoredNode {
                 node,
-                domain_id: 0,
+                shard_id: 0,
                 address: "127.0.0.1:9000".into(),
                 proxy_address: "127.0.0.1:9001".into(),
                 session: None,
@@ -118,7 +118,7 @@ fn corrupt_ownership_or_double_card_assignment_fails_recovery() {
         Err(Error::Conflict)
     ));
     saved.instances.remove("other");
-    saved.instances.get_mut("i").unwrap().assignment.domain_id = 1;
+    saved.instances.get_mut("i").unwrap().assignment.shard_id = 1;
     assert!(Master::restore(&saved, Placement::Pack).is_err());
 }
 #[test]
@@ -160,22 +160,20 @@ fn metrics_preserve_missing_device_and_overcapacity_reservations_after_restart()
     let mut master = Master::restore(&saved, Placement::Pack).unwrap();
     let text = master.metrics();
     assert!(
-        text.contains("adx_master_node_reserved_cpu_millis{domain_id=\"0\",node_id=\"n\"} 100\n")
+        text.contains("adx_master_node_reserved_cpu_millis{shard_id=\"0\",node_id=\"n\"} 100\n")
     );
     assert!(text
-        .contains("adx_master_node_overcommitted_cpu_millis{domain_id=\"0\",node_id=\"n\"} 50\n"));
-    assert!(
-        text.contains("adx_master_node_available_cpu_millis{domain_id=\"0\",node_id=\"n\"} 0\n")
-    );
+        .contains("adx_master_node_overcommitted_cpu_millis{shard_id=\"0\",node_id=\"n\"} 50\n"));
+    assert!(text.contains("adx_master_node_available_cpu_millis{shard_id=\"0\",node_id=\"n\"} 0\n"));
     assert!(text.contains("kind=\"gpu\",model=\"card\",state=\"reserved\"} 1\n"));
     let mut pending = saved.instances["i"].spec.clone();
     pending.id = "pending".into();
     master.submit(pending).unwrap();
     assert!(master
         .metrics()
-        .contains("adx_master_queued_requests{domain_id=\"0\"} 1\n"));
+        .contains("adx_master_queued_requests{shard_id=\"0\"} 1\n"));
     master.release(&saved.instances["i"].assignment).unwrap();
     assert!(master
         .metrics()
-        .contains("adx_master_node_reserved_cpu_millis{domain_id=\"0\",node_id=\"n\"} 0\n"));
+        .contains("adx_master_node_reserved_cpu_millis{shard_id=\"0\",node_id=\"n\"} 0\n"));
 }

@@ -102,5 +102,13 @@
     "status": "deferred",
     "detail": "按用户决定暂不支持，不计入本期阶段验收。",
     "gate": "有实际需求后再规划模板目标数量、节点预算与补充回收。"
+  },
+  {
+    "id": "rust-api-server",
+    "title": "Rust API Server 与调度 Shard 迁移",
+    "stage": "10",
+    "status": "pending",
+    "detail": "Rust 服务和直接 Instance RPC 已编译；正在验证 HTTP 兼容、缓存/重试及部署链路。",
+    "gate": "删除旧 Go/legacy 适配后，契约测试、完整回归和基础 K8s 七组验收通过。"
   }
 ]

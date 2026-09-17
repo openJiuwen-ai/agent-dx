@@ -45,7 +45,7 @@ fn record() -> InstanceRecord {
             devices: vec![],
             instance_id: "i".into(),
             node_id: "n".into(),
-            domain_id: 0,
+            shard_id: 0,
             generation: 42,
         },
         runtime_id: "i-42".into(),

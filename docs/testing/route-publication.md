@@ -46,7 +46,7 @@ Node Manager 持续运行而仅代理重启时，可直接重放本机内存目�
 
 ## 认证与配置
 
-`RouteService` 只允许 `edge` 组件证书；API Key 校验允许受信 Frontend 和 Edge。Master 配置需要加入 Edge DER 身份。Edge 新入口不调用独立 IAM，也不读 etcd 路由。
+`RouteService` 只允许 `edge` 组件证书；API Key 校验允许受信 API Server 和 Edge。Master 配置需要加入 Edge DER 身份。Edge 新入口不调用独立 IAM，也不读 etcd 路由。
 
 认证缓存只以密钥摘要索引，限制条目数和有效期；有效期取缓存 TTL 与密钥到期时间的较小值。Master 不可用时只接受仍有效的缓存身份，新密钥无法校验。主动吊销最多受到缓存 TTL 的延迟影响。数据请求仍校验租户归属，端口转发也要求凭证。
 
@@ -88,4 +88,4 @@ Edge 对外 TLS、Edge → Node Proxy 的网络／mTLS 配置继续单独设置�
 | 启用 Go HTTP 服务的同一 RPC 套件 | 4 通过、0 忽略 | `frontend-v6/result.json` |
 | 真实 Redis 存储／发现恢复 | 7 通过、0 忽略 | `storage-v6/result.json` |
 
-默认忽略项不算通过；专用 Redis／RPC 用例由上面独立入口实际运行，性能基准未执行。Frontend 表项复用了同一 RPC 套件，不能与 RPC 计数当成八个独立场景。源码、被执行的测试程序和服务制品 SHA256 记录于 `source-manifest.json`。中间失败日志保留，最终通过证据以上表为准。
+默认忽略项不算通过；专用 Redis／RPC 用例由上面独立入口实际运行，性能基准未执行。API Server 表项复用了同一 RPC 套件，不能与 RPC 计数当成八个独立场景。源码、被执行的测试程序和服务制品 SHA256 记录于 `source-manifest.json`。中间失败日志保留，最终通过证据以上表为准。

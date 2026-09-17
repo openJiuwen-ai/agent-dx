@@ -1,0 +1,28 @@
+[package]
+name = "adx-api-server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+adx-core = { path = "../../crates/core" }
+adx-protocol = { path = "../../crates/protocol" }
+adx-discovery = { path = "../../crates/discovery" }
+adx-observability = { path = "../../crates/observability" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
+tonic = { version = "0.12", features = ["tls"] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+base64 = "0.22"
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4"] }
+url = "2"
+futures-util = "0.3"
+tokio-stream = "0.1"
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "stream"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }

@@ -1,0 +1,248 @@
+use crate::{config::Config, ownership::Cache};
+use adx_observability::trace;
+use adx_protocol::control as pb;
+use sha2::{Digest, Sha256};
+use std::{
+    future::Future,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+use tokio::sync::Mutex;
+use tonic::{
+    transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity},
+    Response, Status,
+};
+
+pub struct Clients {
+    pub config: Config,
+    tls: ClientTlsConfig,
+    discovery: Option<adx_discovery::RedisDiscovery>,
+    endpoint: Mutex<Cache<(), String>>,
+    channels: Mutex<Cache<String, Channel>>,
+    auth: Mutex<Cache<[u8; 32], pb::CallerContext>>,
+    owners: Mutex<Cache<String, pb::GetInstanceResponse>>,
+}
+impl Clients {
+    pub fn new(config: Config) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
+        config.validate()?;
+        let tls = ClientTlsConfig::new()
+            .ca_certificate(Certificate::from_pem(std::fs::read(&config.ca)?))
+            .identity(Identity::from_pem(
+                std::fs::read(&config.certificate)?,
+                std::fs::read(&config.private_key)?,
+            ))
+            .domain_name(&config.server_name);
+        let discovery = config
+            .discovery
+            .as_ref()
+            .map(|d| {
+                adx_discovery::RedisDiscovery::new(&d.redis_url, &d.namespace, config.timeout())
+            })
+            .transpose()?;
+        let limit = config.cache_entries;
+        Ok(Arc::new(Self {
+            config,
+            tls,
+            discovery,
+            endpoint: Mutex::new(Cache::new(1)),
+            channels: Mutex::new(Cache::new(limit)),
+            auth: Mutex::new(Cache::new(limit)),
+            owners: Mutex::new(Cache::new(limit)),
+        }))
+    }
+    pub async fn master(&self) -> Result<Channel, Status> {
+        let address = if let Some(discovery) = &self.discovery {
+            let cached = self.endpoint.lock().await.get(&());
+            if let Some(v) = cached {
+                v
+            } else {
+                let value = discovery
+                    .lookup()
+                    .await
+                    .map_err(|_| Status::unavailable("Master discovery unavailable"))?;
+                self.endpoint.lock().await.insert(
+                    (),
+                    value.address.clone(),
+                    Duration::from_secs(self.config.discovery.as_ref().unwrap().poll_seconds),
+                );
+                value.address
+            }
+        } else {
+            self.config.master_address.clone()
+        };
+        self.channel(&address).await
+    }
+    pub async fn channel(&self, address: &str) -> Result<Channel, Status> {
+        let address = if address.contains("://") {
+            address.to_string()
+        } else {
+            format!("https://{address}")
+        };
+        if !address.starts_with("https://") {
+            return Err(Status::unavailable("internal RPC requires TLS"));
+        }
+        let mut channels = self.channels.lock().await;
+        if let Some(v) = channels.get(&address) {
+            return Ok(v);
+        }
+        let endpoint = Endpoint::from_shared(address.clone())
+            .map_err(|_| Status::unavailable("invalid RPC endpoint"))?
+            .tls_config(self.tls.clone())
+            .map_err(|_| Status::unavailable("invalid RPC TLS configuration"))?
+            .connect_timeout(self.config.timeout());
+        let channel = endpoint.connect_lazy();
+        channels.insert(address, channel.clone(), Duration::from_secs(3600));
+        Ok(channel)
+    }
+    pub async fn rpc<T>(
+        &self,
+        name: &'static str,
+        future: impl Future<Output = Result<Response<T>, Status>>,
+    ) -> Result<T, Status> {
+        self.rpc_with_timeout(name, self.config.timeout(), future)
+            .await
+    }
+    pub async fn rpc_with_timeout<T>(
+        &self,
+        name: &'static str,
+        timeout: Duration,
+        future: impl Future<Output = Result<Response<T>, Status>>,
+    ) -> Result<T, Status> {
+        trace::Trace::child(name)
+            .run_result(async {
+                tokio::time::timeout(timeout, future)
+                    .await
+                    .map_err(|_| Status::deadline_exceeded("control RPC deadline exceeded"))?
+                    .map(Response::into_inner)
+            })
+            .await
+    }
+    pub async fn authenticate(&self, key: &str) -> Result<pb::CallerContext, Status> {
+        if !(32..=512).contains(&key.len()) {
+            return Err(Status::unauthenticated("invalid API key"));
+        }
+        let digest: [u8; 32] = Sha256::digest(key.as_bytes()).into();
+        if let Some(c) = self.auth.lock().await.get(&digest) {
+            return Ok(c);
+        }
+        let mut client = pb::auth_service_client::AuthServiceClient::new(self.master().await?);
+        let result = self
+            .rpc(
+                "api_server.verify_key",
+                client.verify_api_key(trace::inject(pb::VerifyApiKeyRequest {
+                    api_key: key.into(),
+                })),
+            )
+            .await?;
+        let caller = result
+            .caller
+            .filter(|c| !c.tenant_id.is_empty())
+            .ok_or_else(|| Status::unauthenticated("invalid identity"))?;
+        let mut ttl = self.config.auth_cache_ttl_seconds;
+        if result.expires_at_unix_seconds != 0 {
+            ttl = ttl.min(
+                result
+                    .expires_at_unix_seconds
+                    .saturating_sub(unix_seconds()),
+            );
+            if ttl == 0 {
+                return Err(Status::unauthenticated("expired API key"));
+            }
+        }
+        self.auth
+            .lock()
+            .await
+            .insert(digest, caller.clone(), Duration::from_secs(ttl));
+        Ok(caller)
+    }
+    pub async fn owner(
+        &self,
+        id: &str,
+        caller: &pb::CallerContext,
+        refresh: bool,
+    ) -> Result<pb::GetInstanceResponse, Status> {
+        if !refresh {
+            if let Some(v) = self.owners.lock().await.get(&id.to_string()) {
+                authorize(caller, v.record.as_ref())?;
+                return Ok(v);
+            }
+        }
+        let mut client = pb::master_service_client::MasterServiceClient::new(self.master().await?);
+        let v = self
+            .rpc(
+                "api_server.get_instance",
+                client.get_instance(trace::inject(pb::GetInstanceRequest {
+                    instance_id: id.into(),
+                    caller: Some(caller.clone()),
+                })),
+            )
+            .await?;
+        authorize(caller, v.record.as_ref())?;
+        if v.record
+            .as_ref()
+            .and_then(|r| r.spec.as_ref())
+            .is_none_or(|s| s.id != id)
+            || v.node_address.is_empty()
+        {
+            return Err(Status::data_loss("incomplete owner response"));
+        }
+        self.put_owner(v.clone()).await;
+        Ok(v)
+    }
+    pub async fn put_owner(&self, value: pb::GetInstanceResponse) {
+        let Some(record) = value.record.as_ref() else {
+            return;
+        };
+        let Some(spec) = record.spec.as_ref() else {
+            return;
+        };
+        let mut owners = self.owners.lock().await;
+        if let Some(old) = owners.get(&spec.id) {
+            if let Some(old) = old.record {
+                let generation =
+                    |r: &pb::InstanceRecord| r.assignment.as_ref().map_or(0, |a| a.generation);
+                if (generation(&old), old.revision) > (generation(record), record.revision) {
+                    return;
+                }
+            }
+        }
+        owners.insert(
+            spec.id.clone(),
+            value,
+            Duration::from_secs(self.config.cache_ttl_seconds),
+        );
+    }
+    pub async fn forget_owner(&self, id: &str) {
+        self.owners.lock().await.remove(&id.to_string());
+    }
+}
+pub fn unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+pub fn authorize(
+    caller: &pb::CallerContext,
+    record: Option<&pb::InstanceRecord>,
+) -> Result<(), Status> {
+    let r = record.ok_or_else(|| Status::data_loss("missing instance record"))?;
+    let spec = r
+        .spec
+        .as_ref()
+        .ok_or_else(|| Status::data_loss("missing instance spec"))?;
+    let assignment = r
+        .assignment
+        .as_ref()
+        .filter(|a| a.instance_id == spec.id && a.generation > 0)
+        .ok_or_else(|| Status::data_loss("invalid assignment"))?;
+    if assignment.node_id.is_empty() {
+        return Err(Status::data_loss("missing node identity"));
+    }
+    if !caller.administrator && caller.tenant_id != spec.tenant_id {
+        return Err(Status::permission_denied(
+            "instance belongs to another tenant",
+        ));
+    }
+    Ok(())
+}

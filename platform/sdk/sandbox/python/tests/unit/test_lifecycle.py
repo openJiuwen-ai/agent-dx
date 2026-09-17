@@ -46,7 +46,7 @@ class LifecycleTests(unittest.TestCase):
         with patch.dict(
             os.environ,
             {
-                "ADX_SERVER_ADDRESS": "frontend-control:8888",
+                "ADX_SERVER_ADDRESS": "api-control:8888",
                 "ADX_TLS": "1",
                 "ADX_GATEWAY_ADDRESS": "frontend-gateway:9443",
                 "ADX_GATEWAY_TLS": "1",
@@ -74,7 +74,7 @@ class LifecycleTests(unittest.TestCase):
         with patch.dict(
             os.environ,
             {
-                "ADX_SERVER_ADDRESS": "frontend-control:8888",
+                "ADX_SERVER_ADDRESS": "api-control:8888",
                 "ADX_TLS": "1",
                 "ADX_GATEWAY_ADDRESS": "sandbox-router:9443",
                 "ADX_GATEWAY_TLS": "1",

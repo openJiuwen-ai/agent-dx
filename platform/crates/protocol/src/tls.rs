@@ -28,7 +28,7 @@ impl TlsFiles {
         for (role, path) in &self.peers {
             let principal = match role.as_str() {
                 "master" => Principal::Master,
-                "frontend" => Principal::Frontend,
+                "api-server" => Principal::ApiServer,
                 "edge" => Principal::Edge,
                 value if value.starts_with("node:") && value.len() > 5 => {
                     Principal::Node(value[5..].into())

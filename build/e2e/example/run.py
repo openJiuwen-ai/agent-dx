@@ -53,7 +53,7 @@ try:
     def openssl(*args):call(['openssl',*args],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
     openssl('req','-x509','-newkey','rsa:2048','-nodes','-keyout',tls/'ca.key','-out',tls/'ca.pem','-days','2','-subj','/CN=ADX example test CA')
     extensions=ROOT/'extensions.cnf';extensions.write_text('basicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth,clientAuth\nsubjectAltName=DNS:adx.internal,DNS:localhost,IP:127.0.0.1\n')
-    for name in ('master','node-1','frontend','edge','edge-public'):
+    for name in ('master','node-1','api-server','edge','edge-public'):
         openssl('req','-newkey','rsa:2048','-nodes','-keyout',tls/(name+'.key'),'-out',ROOT/(name+'.csr'),'-subj','/CN=ADX example '+name)
         openssl('x509','-req','-in',ROOT/(name+'.csr'),'-CA',tls/'ca.pem','-CAkey',tls/'ca.key','-CAcreateserial','-out',tls/(name+'.pem'),'-days','2','-extfile',extensions)
         openssl('x509','-in',tls/(name+'.pem'),'-outform','DER','-out',tls/(name+'.der'))

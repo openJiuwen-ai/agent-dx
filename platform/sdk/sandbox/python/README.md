@@ -20,7 +20,7 @@ with Sandbox(image="python:3.12-slim", cpu=2000, memory=4096) as sandbox:
 
 The new Instance backend supports basic lifecycle, same-node pause/resume, reusable snapshots, grouped placement, idle deletion and restart policy. It requires an image containing the release RRT at the configured command path; generic `python:3.12-slim` below is only an illustrative image name.
 
-SDK surface and server support differ. `inherit_entrypoint`, creation network policy, mounts, extra_config, `failover=True`, independent resource limits, published user ports and per-sandbox data-plane security are rejected by the new backend. `reload()` and the legacy `/invoke` fallback are not implemented there. Runtime policy update models do not establish a configured end-to-end network-policy capability. The sections explicitly marked compatibility require a backend implementing those contracts. See [current HTTP contract](../../../control-plane/sandbox-api/docs/sandbox-lifecycle-api.md).
+SDK surface and server support differ. `inherit_entrypoint`, creation network policy, mounts, extra_config, `failover=True`, independent resource limits, published user ports and per-sandbox data-plane security are rejected by the new backend. `reload()` and the legacy `/invoke` fallback are not implemented there. Runtime policy update models do not establish a configured end-to-end network-policy capability. The sections explicitly marked compatibility require a backend implementing those contracts. See [current HTTP contract](../../../control-plane/api-server/docs/sandbox-lifecycle-api.md).
 
 ## Image startup process (compatibility backend only)
 
@@ -195,7 +195,7 @@ other programming/shape exceptions.
 
 ### SDK versus raw HTTP
 
-These are SDK semantics, not a substitute for the [frontend REST contract](../../../control-plane/sandbox-api/docs/sandbox-lifecycle-api.md).
+These are SDK semantics, not a substitute for the [frontend REST contract](../../../control-plane/api-server/docs/sandbox-lifecycle-api.md).
 The SDK uses these paths internally:
 
 ```text

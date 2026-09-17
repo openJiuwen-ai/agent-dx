@@ -1,22 +1,22 @@
-//! Global and embedded Domain scheduling.
+//! Global and embedded ShardScheduler scheduling.
 
 pub use adx_core::snapshots;
 pub mod auth;
-mod domain;
 mod journal;
 pub mod metrics;
 mod queue;
 pub mod routes;
 pub mod rpc;
+mod shard;
 pub mod storage;
 
 use adx_core::{Assignment, Error, InstanceSpec, Result};
 use adx_scheduling::{Framework, PlacedInstance, Snapshot};
 pub use adx_scheduling::{Node, Placement};
-use domain::Domain;
-pub use domain::SchedulingStats;
 use journal::MutationJournal;
 pub use queue::TenantQueue;
+pub use shard::SchedulingStats;
+use shard::ShardScheduler;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -49,11 +49,11 @@ pub struct RoundOutcome {
     pub error: Option<Error>,
 }
 pub struct Master {
-    domains: Vec<Domain>,
-    node_domains: BTreeMap<String, usize>,
+    shards: Vec<ShardScheduler>,
+    node_shards: BTreeMap<String, usize>,
     requests: BTreeMap<String, (usize, InstanceSpec)>,
-    next_domain: usize,
-    next_node_domain: usize,
+    next_shard: usize,
+    next_node_shard: usize,
     generation: u64,
     config: SchedulerConfig,
     snapshot: Arc<Snapshot>,
@@ -71,8 +71,8 @@ impl Master {
         unavailable: &BTreeSet<String>,
     ) -> adx_core::metrics::Text {
         let mut text = adx_core::metrics::Text::default();
-        for (id, domain) in self.domains.iter().enumerate() {
-            domain.metrics(&mut text, id, unavailable);
+        for (id, shard) in self.shards.iter().enumerate() {
+            shard.metrics(&mut text, id, unavailable);
         }
         text
     }
@@ -88,24 +88,22 @@ impl Master {
         config: SchedulerConfig,
     ) -> Result<Self> {
         saved.validate()?;
-        let mut master = Self::with_config(saved.domain_count, placement, config)?;
+        let mut master = Self::with_config(saved.shard_count, placement, config)?;
         master.generation = saved.generation;
         for (id, registration) in &saved.nodes {
             let mut node = registration.node.clone();
             node.available = false;
-            master
-                .node_domains
-                .insert(id.clone(), registration.domain_id);
-            master.domains[registration.domain_id].register(node.clone())?;
+            master.node_shards.insert(id.clone(), registration.shard_id);
+            master.shards[registration.shard_id].register(node.clone())?;
             Arc::make_mut(&mut master.snapshot).update_node(node);
         }
         for (id, instance) in &saved.instances {
             if instance.resources_held() {
-                let domain = instance.assignment.domain_id;
-                master.domains[domain].restore(&instance.spec, &instance.assignment)?;
+                let shard = instance.assignment.shard_id;
+                master.shards[shard].restore(&instance.spec, &instance.assignment)?;
                 master
                     .requests
-                    .insert(id.clone(), (domain, instance.spec.clone()));
+                    .insert(id.clone(), (shard, instance.spec.clone()));
                 Arc::make_mut(&mut master.snapshot).place(PlacedInstance {
                     spec: instance.spec.clone(),
                     node_id: instance.assignment.node_id.clone(),
@@ -116,22 +114,22 @@ impl Master {
         }
         Ok(master)
     }
-    pub fn new(domain_count: usize, placement: Placement) -> Result<Self> {
-        Self::with_framework(domain_count, Framework::builtin(placement))
+    pub fn new(shard_count: usize, placement: Placement) -> Result<Self> {
+        Self::with_framework(shard_count, Framework::builtin(placement))
     }
 
-    pub fn with_framework(domain_count: usize, framework: Framework) -> Result<Self> {
-        Self::with_framework_config(domain_count, framework, SchedulerConfig::default())
+    pub fn with_framework(shard_count: usize, framework: Framework) -> Result<Self> {
+        Self::with_framework_config(shard_count, framework, SchedulerConfig::default())
     }
     pub fn with_config(
-        domain_count: usize,
+        shard_count: usize,
         placement: Placement,
         config: SchedulerConfig,
     ) -> Result<Self> {
-        Self::with_framework_config(domain_count, Framework::builtin(placement), config)
+        Self::with_framework_config(shard_count, Framework::builtin(placement), config)
     }
     pub fn with_framework_config(
-        domain_count: usize,
+        shard_count: usize,
         framework: Framework,
         config: SchedulerConfig,
     ) -> Result<Self> {
@@ -141,18 +139,18 @@ impl Master {
                 "round and journal limits must be positive".into(),
             ));
         }
-        if domain_count == 0 {
-            return Err(Error::Invalid("domain count must be positive".into()));
+        if shard_count == 0 {
+            return Err(Error::Invalid("shard count must be positive".into()));
         }
         let framework = Arc::new(framework);
         Ok(Self {
-            domains: (0..domain_count)
-                .map(|_| Domain::new(framework.clone()))
+            shards: (0..shard_count)
+                .map(|_| ShardScheduler::new(framework.clone()))
                 .collect(),
-            node_domains: BTreeMap::new(),
+            node_shards: BTreeMap::new(),
             requests: BTreeMap::new(),
-            next_domain: 0,
-            next_node_domain: 0,
+            next_shard: 0,
+            next_node_shard: 0,
             generation: 0,
             journal: MutationJournal::new(config.mutation_history),
             config,
@@ -167,38 +165,38 @@ impl Master {
             return Err(Error::Invalid("node id is required".into()));
         }
         node.validate()?;
-        let domain = if let Some(domain) = self.node_domains.get(&node.id) {
-            *domain
+        let shard = if let Some(shard) = self.node_shards.get(&node.id) {
+            *shard
         } else {
-            let domain = (0..self.domains.len())
-                .map(|offset| (self.next_node_domain + offset) % self.domains.len())
-                .min_by_key(|id| self.domains[*id].node_count())
+            let shard = (0..self.shards.len())
+                .map(|offset| (self.next_node_shard + offset) % self.shards.len())
+                .min_by_key(|id| self.shards[*id].node_count())
                 .unwrap();
-            self.next_node_domain = (domain + 1) % self.domains.len();
-            self.node_domains.insert(node.id.clone(), domain);
-            domain
+            self.next_node_shard = (shard + 1) % self.shards.len();
+            self.node_shards.insert(node.id.clone(), shard);
+            shard
         };
-        self.domains[domain].register(node.clone())?;
+        self.shards[shard].register(node.clone())?;
         Arc::make_mut(&mut self.snapshot).update_node(node.clone());
         self.journal.record(&node.id);
         self.wake_pending(None);
-        Ok(domain)
+        Ok(shard)
     }
 
-    /// Global chooses the domain only. Unscheduled work stays in its Domain queue.
+    /// Global chooses the shard only. Unscheduled work stays in its ShardScheduler queue.
     pub fn submit_recovery(&mut self, spec: InstanceSpec) -> Result<usize> {
         self.retired.remove(&spec.id);
         if !self.requests.contains_key(&spec.id) {
-            // Global still rotates; skip domains without any live node.
-            for offset in 0..self.domains.len() {
-                let domain = (self.next_domain + offset) % self.domains.len();
+            // Global still rotates; skip shards without any live node.
+            for offset in 0..self.shards.len() {
+                let shard = (self.next_shard + offset) % self.shards.len();
                 if self
                     .snapshot
                     .nodes()
                     .values()
-                    .any(|n| n.available && self.node_domains.get(&n.id) == Some(&domain))
+                    .any(|n| n.available && self.node_shards.get(&n.id) == Some(&shard))
                 {
-                    self.next_domain = domain;
+                    self.next_shard = shard;
                     break;
                 }
             }
@@ -210,68 +208,67 @@ impl Master {
         if self.retired.contains(&spec.id) {
             return Err(Error::Conflict);
         }
-        if let Some((domain, existing)) = self.requests.get(&spec.id) {
+        if let Some((shard, existing)) = self.requests.get(&spec.id) {
             return if *existing == spec {
-                Ok(*domain)
+                Ok(*shard)
             } else {
                 Err(Error::Conflict)
             };
         }
-        let domain = self.next_domain;
-        self.next_domain = (domain + 1) % self.domains.len();
-        self.requests
-            .insert(spec.id.clone(), (domain, spec.clone()));
-        self.domains[domain].enqueue(spec);
-        self.wake(domain);
-        Ok(domain)
+        let shard = self.next_shard;
+        self.next_shard = (shard + 1) % self.shards.len();
+        self.requests.insert(spec.id.clone(), (shard, spec.clone()));
+        self.shards[shard].enqueue(spec);
+        self.wake(shard);
+        Ok(shard)
     }
 
     pub fn snapshot(&self) -> Arc<Snapshot> {
         self.snapshot.clone()
     }
-    pub fn pending(&self, domain: usize) -> Result<usize> {
-        self.domains
-            .get(domain)
-            .map(Domain::pending)
+    pub fn pending(&self, shard: usize) -> Result<usize> {
+        self.shards
+            .get(shard)
+            .map(ShardScheduler::pending)
             .ok_or(Error::NotFound)
     }
-    pub fn stats(&self, domain: usize) -> Result<SchedulingStats> {
-        self.domains
-            .get(domain)
+    pub fn stats(&self, shard: usize) -> Result<SchedulingStats> {
+        self.shards
+            .get(shard)
             .map(|d| d.stats)
             .ok_or(Error::NotFound)
     }
-    fn wake(&mut self, domain: usize) {
-        if !self.ready.contains(&domain) {
-            self.ready.push_back(domain);
+    fn wake(&mut self, shard: usize) {
+        if !self.ready.contains(&shard) {
+            self.ready.push_back(shard);
         }
     }
     fn wake_pending(&mut self, exclude: Option<usize>) {
-        for id in 0..self.domains.len() {
-            if Some(id) != exclude && self.domains[id].pending() > 0 {
+        for id in 0..self.shards.len() {
+            if Some(id) != exclude && self.shards[id].pending() > 0 {
                 self.wake(id);
             }
         }
     }
     /// Coalesced event-loop interface. Every wake observes an already-published
     /// snapshot, including status-only node changes. Empty/stalled queues sleep.
-    pub fn take_ready_domain(&mut self) -> Option<usize> {
+    pub fn take_ready_shard(&mut self) -> Option<usize> {
         self.ready.pop_front()
     }
     /// A returned reservation must be kept until the node confirms cleanup.
-    pub fn schedule(&mut self, domain: usize) -> Result<Option<Assignment>> {
-        let mut round = self.run_round(domain, 1)?;
+    pub fn schedule(&mut self, shard: usize) -> Result<Option<Assignment>> {
+        let mut round = self.run_round(shard, 1)?;
         if let Some(error) = round.error {
             return Err(error);
         }
         Ok(round.assignments.pop())
     }
-    pub fn schedule_round(&mut self, domain: usize) -> Result<RoundOutcome> {
-        self.run_round(domain, usize::MAX)
+    pub fn schedule_round(&mut self, shard: usize) -> Result<RoundOutcome> {
+        self.run_round(shard, usize::MAX)
     }
-    fn run_round(&mut self, domain: usize, max_assignments: usize) -> Result<RoundOutcome> {
-        let d = self.domains.get_mut(domain).ok_or(Error::NotFound)?;
-        self.ready.retain(|id| *id != domain);
+    fn run_round(&mut self, shard: usize, max_assignments: usize) -> Result<RoundOutcome> {
+        let d = self.shards.get_mut(shard).ok_or(Error::NotFound)?;
+        self.ready.retain(|id| *id != shard);
         d.begin_round();
         let started = Instant::now();
         // Roots pin the base for this bounded round; subsequent writes are a
@@ -281,7 +278,7 @@ impl Master {
             snapshot_revision: base.revision,
             ..Default::default()
         };
-        while self.domains[domain].remaining_sweep() {
+        while self.shards[shard].remaining_sweep() {
             if outcome.attempted >= self.config.max_attempts
                 || outcome.assignments.len() >= max_assignments
                 || started.elapsed() >= self.config.max_duration
@@ -294,8 +291,8 @@ impl Master {
                 break;
             };
             outcome.attempted += 1;
-            match self.domains[domain].attempt(
-                domain,
+            match self.shards[shard].attempt(
+                shard,
                 generation,
                 &self.snapshot,
                 &self.journal,
@@ -308,7 +305,7 @@ impl Master {
                         node_id: assignment.node_id.clone(),
                     });
                     self.journal.record(&assignment.node_id);
-                    self.wake_pending(Some(domain));
+                    self.wake_pending(Some(shard));
                     outcome.assignments.push(assignment);
                 }
                 Ok(None) => (),
@@ -320,10 +317,10 @@ impl Master {
         }
         if outcome.error.is_none()
             && (outcome.yielded
-                || self.domains[domain].has_deferred_arrivals()
-                || (!outcome.assignments.is_empty() && self.domains[domain].pending() > 0))
+                || self.shards[shard].has_deferred_arrivals()
+                || (!outcome.assignments.is_empty() && self.shards[shard].pending() > 0))
         {
-            self.wake(domain);
+            self.wake(shard);
         }
         Ok(outcome)
     }
@@ -338,8 +335,8 @@ impl Master {
             .ok_or(Error::NotFound)?
             .1
             .clone();
-        self.domains
-            .get_mut(assignment.domain_id)
+        self.shards
+            .get_mut(assignment.shard_id)
             .ok_or(Error::NotFound)?
             .retry(assignment, spec)?;
         Arc::make_mut(&mut self.snapshot).remove(&assignment.instance_id);
@@ -354,16 +351,16 @@ impl Master {
         assignment: &Assignment,
     ) -> Result<()> {
         if self.requests.contains_key(&spec.id)
-            || self.node_domains.get(&assignment.node_id) != Some(&assignment.domain_id)
+            || self.node_shards.get(&assignment.node_id) != Some(&assignment.shard_id)
         {
             return Err(Error::Conflict);
         }
-        self.domains
-            .get_mut(assignment.domain_id)
+        self.shards
+            .get_mut(assignment.shard_id)
             .ok_or(Error::NotFound)?
             .restore(spec, assignment)?;
         self.requests
-            .insert(spec.id.clone(), (assignment.domain_id, spec.clone()));
+            .insert(spec.id.clone(), (assignment.shard_id, spec.clone()));
         Arc::make_mut(&mut self.snapshot).place(PlacedInstance {
             spec: spec.clone(),
             node_id: assignment.node_id.clone(),
@@ -374,8 +371,8 @@ impl Master {
         Ok(())
     }
     pub fn release(&mut self, assignment: &Assignment) -> Result<()> {
-        self.domains
-            .get_mut(assignment.domain_id)
+        self.shards
+            .get_mut(assignment.shard_id)
             .ok_or(Error::NotFound)?
             .release(assignment)?;
         self.requests.remove(&assignment.instance_id);

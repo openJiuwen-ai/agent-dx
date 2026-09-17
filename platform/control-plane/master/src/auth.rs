@@ -50,7 +50,7 @@ impl pb::auth_service_server::AuthService for AuthRpc {
     ) -> std::result::Result<Response<pb::VerifyApiKeyResponse>, Status> {
         if !matches!(
             self.peers.authenticate(&request)?,
-            Principal::Frontend | Principal::Edge
+            Principal::ApiServer | Principal::Edge
         ) {
             return Err(Status::permission_denied(
                 "trusted ingress identity required",
@@ -86,7 +86,7 @@ impl AuthRpc {
         request: &Request<T>,
         caller: Option<&pb::CallerContext>,
     ) -> std::result::Result<(), Status> {
-        if self.peers.authenticate(request)? != Principal::Frontend {
+        if self.peers.authenticate(request)? != Principal::ApiServer {
             return Err(Status::permission_denied("Frontend identity required"));
         }
         if !caller.is_some_and(|c| c.administrator && !c.tenant_id.trim().is_empty()) {

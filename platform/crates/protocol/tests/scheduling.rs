@@ -79,7 +79,7 @@ fn protobuf_round_trip_preserves_every_placement_constraint_and_card_identity() 
     let assignment = Assignment {
         instance_id: "i".into(),
         node_id: "n".into(),
-        domain_id: 0,
+        shard_id: 0,
         generation: 1,
         devices: vec![DeviceAllocation {
             id: 9,

@@ -96,10 +96,10 @@ fn fresh_work_deferred_behind_blocked_sweep_remains_awake_then_sleeps() {
     }
     assert!(master.schedule_round(0).unwrap().assignments.is_empty());
     master.submit(request("fits", "new")).unwrap();
-    assert_eq!(master.take_ready_domain(), Some(0));
+    assert_eq!(master.take_ready_shard(), Some(0));
     assert!(master.schedule_round(0).unwrap().assignments.is_empty());
     assert_eq!(
-        master.take_ready_domain(),
+        master.take_ready_shard(),
         Some(0),
         "fresh deferred work lost its wakeup"
     );
@@ -109,25 +109,21 @@ fn fresh_work_deferred_behind_blocked_sweep_remains_awake_then_sleeps() {
         if assigned.is_some() {
             break;
         }
-        assert_eq!(master.take_ready_domain(), Some(0));
+        assert_eq!(master.take_ready_shard(), Some(0));
     }
     let assignment =
         assigned.expect("new fitting request must run without another resource report");
     assert_eq!(assignment.instance_id, "fits");
     master.release(&assignment).unwrap();
     for _ in 0..5 {
-        let Some(domain) = master.take_ready_domain() else {
+        let Some(shard) = master.take_ready_shard() else {
             break;
         };
-        assert!(master
-            .schedule_round(domain)
-            .unwrap()
-            .assignments
-            .is_empty());
+        assert!(master.schedule_round(shard).unwrap().assignments.is_empty());
     }
     assert_eq!(master.pending(0).unwrap(), 2);
     assert_eq!(
-        master.take_ready_domain(),
+        master.take_ready_shard(),
         None,
         "permanently blocked requests must sleep"
     );

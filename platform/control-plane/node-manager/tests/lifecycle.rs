@@ -113,7 +113,7 @@ fn assignment(id: &str) -> Assignment {
         devices: vec![],
         instance_id: id.into(),
         node_id: "n1".into(),
-        domain_id: 0,
+        shard_id: 0,
         generation: 1,
     }
 }

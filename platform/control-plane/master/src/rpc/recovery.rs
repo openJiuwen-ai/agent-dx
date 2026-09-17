@@ -1,4 +1,4 @@
-//! Recover invalidated executions through normal Domain placement and a durable
+//! Recover invalidated executions through normal ShardScheduler placement and a durable
 //! Paused record at a new generation. No image-start fallback is permitted.
 use super::*;
 use adx_core::scheduling::{LabelRequirement, LabelSelector, SelectorOp};
@@ -36,8 +36,8 @@ impl MasterRpc {
                 }
                 state.scheduler.submit_recovery(spec)?;
             }
-            // Each Domain round already has its own attempt/time budget.
-            for _ in 0..state.scheduler.domains.len() {
+            // Each ShardScheduler round already has its own attempt/time budget.
+            for _ in 0..state.scheduler.shards.len() {
                 if state.drive().await? {
                     self.0.changed.notify_waiters();
                 }

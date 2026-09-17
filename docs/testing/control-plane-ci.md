@@ -1,6 +1,6 @@
 # 管控面重构：本地测试与 Buildkite
 
-最新正式验证：[Buildkite #21 基础 Kubernetes、Metrics、日志与 Trace 验收](2026-09-17-observability-k8s.md)。FC 按当前决策继续本地验收。
+Rust API Server 重写前的正式验证：[Buildkite #21 基础 Kubernetes、Metrics、日志与 Trace 验收](2026-09-17-observability-k8s.md)。FC 按当前决策继续本地验收。
 
 2026-09-15。开发验证在本地执行，Buildkite 使用完整系统的端到端验收入口。统一包、两节点环境驱动器和流水线配置已落地：`build/e2e/prepare.py` 构建验收制品，`build/e2e/kubernetes/run.py` 在目标 Kubernetes 集群部署、验收、收集并清理。真实 sandboxd、本次包内 RRT 和安装后的 SDK 均参与执行。流水线复用现有 default/linux/amd64 队列、builder/packager/deployer、目标 kubeconfig 挂载与 SWR Secret，见 [Buildkite 说明](../../.buildkite/README.md)。本地通过不等于远端 Buildkite 已通过。
 
@@ -14,8 +14,8 @@
 | rust | Cargo workspace all-features 测试；包含 RRT 子进程测试 | 工具版本、Cargo 日志 |
 | storage | 独立真实 Redis：提交、代次校验、AOF 崩溃重启、调度状态恢复 | Redis 版本/摘要、测试与进程日志；设置 ADX_TEST_REDIS_SERVER |
 | control-rpc | Master／Node RPC、StateSink、真实 mTLS 与 Redis 协作 | 临时测试证书、进程日志和结果；运行时为测试实现 |
-| frontend-control | 真实 Go HTTPS 进程 → Rust Master／Node RPC → Redis，另验证 Master 进程启动重启 | 生产 API 二进制摘要、TLS／进程日志；运行时为测试实现 |
-| go | 生成协议，完整 Go 模块测试和 vet | protoc/Go 版本、Go JSON 测试日志 |
+| api-control | 真实 Rust HTTPS 进程 → Rust Master／Node RPC → Redis，另验证 Master 进程启动重启 | 生产 API 二进制摘要、TLS／进程日志；运行时为测试实现 |
+| api-server | Rust API Server 契约与缓存测试 | Cargo 测试日志 |
 | agent | 原 Agent 测试集 | 日志、JUnit XML |
 | sandbox-sdk | 完整离线 SDK 测试集 | 日志、JUnit XML |
 | interop | SDK → 真实 RRT → 测试 HTTP upstream 的 Socket 互操作 | 构建与进程测试日志 |
@@ -25,7 +25,7 @@ Socket 测试只覆盖部分数据链路；Agent 测试包含外部运行时桩�
 
 ## 本地运行
 
-工具链基线：Rust 版本遵循根 `rust-toolchain.toml`，Go 1.25.5，Python 3.12；Go 代码生成使用 protoc、protoc-gen-go 1.36.11、protoc-gen-go-grpc 1.6.2。Python 测试环境固定在 `build/ci/requirements.lock`，仅约束测试/构建环境，不修改 SDK 对用户的依赖范围。
+工具链基线：Rust 版本遵循根 `rust-toolchain.toml`；外部 sandboxd 构建使用锁定 Go 工具链。Python 测试环境固定在 `build/ci/requirements.lock`，仅约束测试/构建环境，不修改 SDK 对用户的依赖范围。
 
 ```bash
 python3.12 -m venv .venv
@@ -39,14 +39,14 @@ export PIP_CACHE_DIR=/your/cache/pip
 
 .venv/bin/python build/ci/run.py harness
 .venv/bin/python build/ci/run.py rust --jobs 2
-.venv/bin/python build/ci/run.py go --jobs 2
+.venv/bin/python build/ci/run.py api-server --jobs 2
 .venv/bin/python build/ci/run.py agent
 .venv/bin/python build/ci/run.py sandbox-sdk
 .venv/bin/python build/ci/run.py interop --jobs 2
 .venv/bin/python build/ci/run.py package
 ```
 
-也可使用 `make ci SUITE=go PYTHON=.venv/bin/python JOBS=2`。`--list` 打印将执行的命令，不运行测试；它仍会检查前置配置，`frontend-control` 需要通过 `ADX_TEST_SANDBOX_API` 指向已构建、可执行的 Go API 二进制。各轮结果默认写入 `out/ci/<suite>/<UTC时间>-<随机ID>/`；指定 `--output` 时必须使用新目录，重试不会覆盖上次失败证据。
+也可使用 `make ci SUITE=api-server PYTHON=.venv/bin/python JOBS=2`。`--list` 打印将执行的命令，不运行测试；它仍会检查前置配置，`api-control` 需要通过 `ADX_TEST_API_SERVER` 指向已构建、可执行的 Rust API Server 二进制。各轮结果默认写入 `out/ci/<suite>/<UTC时间>-<随机ID>/`；指定 `--output` 时必须使用新目录，重试不会覆盖上次失败证据。
 
 每个结果包含 commit、本地 dirty 标记、平台、Python/工具版本日志、命令与退出码、耗时、配置的缓存位置和制品校验和。Buildkite 环境要求入口执行前工作树干净。本地 dirty 运行允许，但不能当作该 commit 的正式 CI 结果。
 
@@ -72,7 +72,7 @@ export PIP_CACHE_DIR=/your/cache/pip
 
 ### 2. 部署完整平台
 
-- 平台组件：Redis、单 Master（Global 与内嵌 Domain）、Sandbox API、Edge、两个 Node Manager 和 Node Proxy。
+- 平台组件：Redis、单 Master（Global 与内嵌 Shard）、Sandbox API、Edge、两个 Node Manager 和 Node Proxy。
 - 执行后端：测试环境独立托管 sandboxd，锁定 PR #56 提交 `efc201531d7e2e9d69505da151eb66084b61eebf`（见 `third_party/sandboxd/source.json`）；使用本次构建的 RRT 准备真实实例环境。
 - 客户端：干净 Python 环境安装本次构建的 SDK wheel，通过对外入口操作；禁止用源码 PYTHONPATH 代替安装包验收。
 - 用例资源：本轮独立的租户/API Key、实例、端口与目录。快照阶段接入实际的对象存储测试后端；GPU/NPU 在对应环境与能力实现后扩展。
@@ -108,13 +108,13 @@ export PIP_CACHE_DIR=/your/cache/pip
 ### 第一条纵向链路：创建、命令、删除
 
 ```text
-Sandbox SDK → Go Sandbox API → Master / Global → Domain → Node Manager → sandboxd
+Sandbox SDK → Rust API Server → Master / Global → Shard → Node Manager → sandboxd
                        现有实例操作 ────────────────────────┘
 命令与文件：SDK → Edge → Node Proxy → RRT
 状态提交：Node Manager → Master → Redis；Master → Edge 发布路由
 ```
 
-先实现纯 Instance 状态与资源类型、Node Manager 串行控制器及 RuntimeBackend 边界。紧接着接入最小 RPC、Redis 提交、内嵌 Domain、Sandbox API 后端，打通完整链路。Global 保留轮转职责，Domain 实际选择节点，Node Manager 本机复核并拥有生命周期状态机。
+先实现纯 Instance 状态与资源类型、Node Manager 串行控制器及 RuntimeBackend 边界。紧接着接入最小 RPC、Redis 提交、内嵌 Shard、Sandbox API 后端，打通完整链路。Global 保留轮转职责，Shard 实际选择节点，Node Manager 本机复核并拥有生命周期状态机。
 
 首批必过的真实功能用例：
 

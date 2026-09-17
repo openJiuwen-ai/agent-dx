@@ -5,8 +5,8 @@ ADX 使用 OpenTelemetry SDK 和 W3C `traceparent` / `tracestate`。采样与导
 ## 请求与任务边界
 
 - Edge 接收 HTTP 上下文、创建 `edge.http` Span，并将子上下文传给 Sandbox API、RRT HTTP 或 Node Proxy CONNECT。
-- Go Sandbox API 创建服务端 Span，gRPC 客户端拦截器携带上下文；节点地址缓存命中后的直达操作也经过同一拦截器。
-- Master 在创建、查询、提交和快照 RPC 入口接收上下文；独立创建/提交任务显式携带子 Span。`domain.schedule_round` 记录实际调度轮次，其父上下文是驱动该轮次的任务；一轮可能服务多个等待请求，不把整个轮次耗时分别归给每个请求。
+- Rust API Server 创建服务端 Span，gRPC 客户端拦截器携带上下文；节点地址缓存命中后的直达操作也经过同一拦截器。
+- Master 在创建、查询、提交和快照 RPC 入口接收上下文；独立创建/提交任务显式携带子 Span。`shard.schedule_round` 记录实际调度轮次，其父上下文是驱动该轮次的任务；一轮可能服务多个等待请求，不把整个轮次耗时分别归给每个请求。
 - Node Manager 在每实例命令封装中保存 `instance.queue` Span，串行执行时创建 `instance.execute`。前者包含等待与执行时间，后者只覆盖实际执行；调用方断开后，已接受操作继续保持原上下文。状态提交继续向 Master 透传。
 - Node Proxy 为 CONNECT 生命周期记录 Span。它转发的是字节流，RRT 的 HTTP Span 延续 Edge 注入的上下文；两者可能是同一请求的并列子 Span。
 - RRT 在解析 HTTP 头后创建 `rrt.http`，Instance ID 作为属性。此 Span 覆盖 HTTP 操作处理；异步提交命令之后的用户进程运行时间尚不属于该 HTTP Span。
@@ -36,7 +36,7 @@ ADX 使用 OpenTelemetry SDK 和 W3C `traceparent` / `tracestate`。采样与导
 
 ## 故障、开销与字段
 
-业务线程只向标准 SDK 的有界批处理队列提交 Span。单次 Rust/Go 导出超时为2秒；Rust退出等待上限3秒，Go使用3秒取消上下文。队列满时 SDK 可丢弃 Trace，不承诺 Trace 持久化或无限重试。Collector 独立配置磁盘发送队列，只有 Collector 已接收的内容才进入该队列。
+业务线程只向标准 SDK 的有界批处理队列提交 Span。单次 Rust 导出超时为2秒；退出等待上限3秒。队列满时 SDK 可丢弃 Trace，不承诺 Trace 持久化或无限重试。Collector 独立配置磁盘发送队列，只有 Collector 已接收的内容才进入该队列。
 
 Master 和 Node Manager 的 `/metrics` 增加 `adx_trace_exported_spans_total`、`adx_trace_export_failed_spans_total`，统计 SDK 导出成功/最终失败的 Span 数；不把它们解释为队列满丢弃数。Rust SDK 会记录开始丢弃及退出时的总丢弃诊断；当前没有统一暴露各语言的实时队列满丢弃计数。Collector 的接收/拒绝/排队/导出指标另外采集。
 
@@ -46,4 +46,4 @@ API 请求日志包含 Trace ID 和 Span ID；Node Manager 操作完成日志包
 
 组件测试覆盖跨任务/队列的并发隔离、调用方取消后已接受操作继续关联、采样关闭、导出端不可用时提交不阻塞、失败计数与退出时间。真实部署验收检查完整创建链路的Trace ID，以及每个 `instance.execute` 的父Span确为同Trace内的 `instance.queue`，同时核对RRT收到远端上下文。
 
-本地与 [Buildkite #21 正式验收](2026-09-17-observability-k8s.md) 已通过；统一实时队列满丢弃指标后置，详见 [事项清单](control-plane-remaining.json)。节点恢复后产生新的后台Trace，以Instance/代次/状态关联，不承诺跨进程重启续接已结束的Span。
+重写前的本地与 [Buildkite #21 正式验收](2026-09-17-observability-k8s.md) 已通过；统一实时队列满丢弃指标后置，详见 [事项清单](control-plane-remaining.json)。节点恢复后产生新的后台Trace，以Instance/代次/状态关联，不承诺跨进程重启续接已结束的Span。

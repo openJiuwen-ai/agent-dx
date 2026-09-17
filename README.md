@@ -11,21 +11,21 @@ Monorepo for Agent Distributed Executor, the Instance execution platform, and sh
 | `gateway` | Rust Edge, Node Proxy, and forwarder |
 | `platform/runtime/rrt` | RRT daemon and runtime adapter |
 | `platform/sdk/sandbox/python` | Public Sandbox SDK |
-| `platform/control-plane/master` | Rust Master, Domain scheduling, Redis and route/snapshot catalogs |
+| `platform/control-plane/master` | Rust Master, Shard scheduling, Redis and route/snapshot catalogs |
 | `platform/control-plane/node-manager` | Instance lifecycle, sandboxd, checkpoints and outage journal |
 | `platform/control-plane/control-cli` | Rust adxctl and process supervisor |
-| `platform/control-plane/sandbox-api` | Go Sandbox HTTP handlers and their required compatibility dependencies |
-| `platform/api/proto` | New Instance/Node protocols; legacy messages confined to the Go compatibility adapter |
+| `platform/control-plane/api-server` | Rust public HTTP API, authentication, ownership cache and direct Instance RPC |
+| `platform/api/proto` | Instance, snapshot, credentials, routes and node-local protocol definitions |
 
-The Agent product targets the public Sandbox SDK; its current CLI/SDK/Executor still require the legacy Agent backend. The new platform package alone does not run that Agent business flow. Rust Master and Node Manager now expose authenticated service processes, Redis persistence/discovery, scheduling and node lifecycle recovery; the Go Sandbox API connects to those services. Edge subscribes to committed routes over gRPC, while Node Proxy requires a complete local binding synchronization before admission. See [implementation status](docs/testing/control-plane-implementation.md) and [route publication](docs/testing/route-publication.md). The Rust process supervisor and unified package are implemented; see [process deployment](docs/testing/process-deployment.md). Local public-SDK acceptance now covers real Firecracker pause/resume, S3 recovery and node lifecycle failures. See the [stage roadmap](docs/testing/control-plane-roadmap.md) for completed gates and remaining work.
+The Agent product targets the public Sandbox SDK; its current CLI/SDK/Executor still require the legacy Agent backend. The new platform package alone does not run that Agent business flow. The Rust API Server rewrite is tracked in [migration status](docs/testing/rust-api-server.md); the earlier E2E evidence below applies to the pre-rewrite release. Rust Master and Node Manager expose authenticated service processes, Redis persistence/discovery, scheduling and node lifecycle recovery; the Rust API Server connects to those services. Edge subscribes to committed routes over gRPC, while Node Proxy requires a complete local binding synchronization before admission. See [implementation status](docs/testing/control-plane-implementation.md) and [route publication](docs/testing/route-publication.md). The Rust process supervisor and unified package are implemented; see [process deployment](docs/testing/process-deployment.md). Local public-SDK acceptance now covers real Firecracker pause/resume, S3 recovery and node lifecycle failures. See the [stage roadmap](docs/testing/control-plane-roadmap.md) for completed gates and remaining work.
 
 ![Current component architecture](docs/architecture/current-architecture.svg)
 
-See [current layout](docs/architecture/repository-layout.md) and [public API support](platform/control-plane/sandbox-api/docs/sandbox-lifecycle-api.md). Client options such as network policy, entrypoint inheritance and reload are not all supported by the new backend.
+See [current layout](docs/architecture/repository-layout.md) and [public API support](platform/control-plane/api-server/docs/sandbox-lifecycle-api.md). Client options such as network policy, entrypoint inheritance and reload are not all supported by the new backend.
 
 ## Build and test
 
-Local component and Socket checks use `python3 build/ci/run.py <suite>`. Buildkite has separate release, image and Kubernetes public-SDK steps. [Buildkite #21](docs/testing/2026-09-17-observability-k8s.md) passed all seven basic K8s groups, including node failure, restart, resource metrics, logs and traces. Checkpoint/snapshot/cross-node recovery use local Firecracker acceptance; the K8s FC profile is deferred. See [local checks and end-to-end acceptance](docs/testing/control-plane-ci.md) for prerequisites and implementation milestones.
+Local component and Socket checks use `python3 build/ci/run.py <suite>`. Buildkite has separate release, image and Kubernetes public-SDK steps. The pre-rewrite baseline [Buildkite #21](docs/testing/2026-09-17-observability-k8s.md) passed all seven basic K8s groups, including node failure, restart, resource metrics, logs and traces. Checkpoint/snapshot/cross-node recovery use local Firecracker acceptance; the K8s FC profile is deferred. See [local checks and end-to-end acceptance](docs/testing/control-plane-ci.md) for prerequisites and implementation milestones.
 
 Rust uses the root Cargo workspace. The Sandbox SDK uses distribution `adx-sandbox`, import `adx_sandbox`, CLI `adx-sandbox`, and `ADX_*` environment settings. Agent namespaces are `adx.agentruntime` and `adx.agentexecutor`; Gateway binaries use `adx-`, configuration uses `ADX_`, and internal branded headers use `X-ADX-`. Run matching component versions together.
 
@@ -34,18 +34,14 @@ cargo test --locked --workspace --all-features -j 2
 python -m pytest -q
 PYTHONPATH=platform/sdk/sandbox/python python -m pytest -q -c platform/sdk/sandbox/pytest.ini platform/sdk/sandbox/python/tests
 
-# Go 1.24.1+ and protoc with protoc-gen-go / protoc-gen-go-grpc on PATH
-bash build/codegen/go.sh
-cd platform/control-plane/sandbox-api
-go build ./...
-go test -mod=readonly -p 2 -count=1 ./...
+cargo test --locked -p adx-api-server -j 2
 ```
 
 `make help` lists the combined entrypoints. Install Python test/build requirements in a virtual environment (`pytest`, `pytest-asyncio`, `setuptools`, `wheel`, `build`, and each package's dependencies). `make package PYTHON=/path/to/venv/bin/python` produces the four Python distributions under `out/wheels`. `BUILD_VERSION` can set release versions explicitly. The Sandbox SDK has its own `VERSION`; it does not derive its version from Agent repository tags.
 
-Set `CARGO_TARGET_DIR`, `GOCACHE`, and `GOMODCACHE` to persistent caches in automation. `build/` contains source scripts; temporary build outputs belong in `out/` or a cache directory. `bash build.sh -C` cleans package artifacts and preserves the source scripts.
+Set `CARGO_TARGET_DIR` to a persistent cache in automation. Building the external sandboxd dependency additionally uses Go caches. `build/` contains source scripts; temporary build outputs belong in `out/` or a cache directory. `bash build.sh -C` cleans package artifacts and preserves the source scripts.
 
-The Go API has an `adx-sandbox-api` process entrypoint and configuration under `build/config/examples/`. Component integration evidence is separate from complete platform deployment validation.
+The Rust API Server has an `adx-api-server` process entrypoint and configuration under `build/config/examples/`. Component integration evidence is separate from complete platform deployment validation.
 
 See [migration status](docs/migration/2026-09-14-import.md), [source pins](docs/migration/sources.json), [architecture](docs/architecture/repository-layout.md), and [Agent usage](agent/README.md).
 

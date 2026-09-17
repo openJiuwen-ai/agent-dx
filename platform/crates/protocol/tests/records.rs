@@ -25,7 +25,7 @@ fn record_roundtrip_preserves_identity_state_and_ownership() {
         assignment: Assignment {
             instance_id: "i".into(),
             node_id: "n".into(),
-            domain_id: 0,
+            shard_id: 0,
             generation: 9,
             devices: vec![],
         },

@@ -1,6 +1,6 @@
 # Node Manager 生命周期与降级
 
-Node Manager 拥有实例串行状态机。Master 提供归属校验、Redis 持久化和路由发布；现存实例的生命周期请求由 Frontend 缓存命中后直达节点。
+Node Manager 拥有实例串行状态机。Master 提供归属校验、Redis 持久化和路由发布；现存实例的生命周期请求由 API Server 缓存命中后直达节点。
 
 ## 运行策略
 

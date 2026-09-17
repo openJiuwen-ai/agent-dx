@@ -5,7 +5,7 @@ your deployment. Master, Node Manager and Sandbox API use `--config /absolute/pa
 
 Certificates and private keys are PEM. Peer identity files are DER leaf
 certificates, supplied by deployment. Certificates must include the configured
-`server_name` as a DNS SAN. The Frontend certificate also covers its public HTTPS
+`server_name` as a DNS SAN. The API Server certificate also covers its public HTTPS
 name. Keep private keys and bootstrap API key files readable only by the service.
 API keys contain 32–512 bytes. Configurations do not embed the raw key.
 

@@ -13,7 +13,7 @@ async def check(tls):
     from adx_sandbox._command_watch import _CommandWaitManager
     from adx_sandbox.types import ConnectionConfig
     server_tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    server_tls.load_cert_chain(tls/'frontend.pem', tls/'frontend.key')
+    server_tls.load_cert_chain(tls/'api-server.pem', tls/'api-server.key')
     done = asyncio.get_running_loop().create_future()
     desired = {('instance', 'command')}
     received = []

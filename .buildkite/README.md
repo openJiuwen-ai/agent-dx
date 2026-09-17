@@ -10,7 +10,7 @@ when the run finishes.
 
 | Resource in the test namespace | Processes |
 |---|---|
-| `node1` Pod | Redis, Master with embedded Domain, Sandbox API, Edge, Node Manager, Node Proxy, independently hosted sandboxd |
+| `node1` Pod | Redis, Master with embedded Shard, Sandbox API, Edge, Node Manager, Node Proxy, independently hosted sandboxd |
 | `node2` Pod | Node Manager, Node Proxy, independently hosted sandboxd |
 | `master` / `node2` Services | Service addresses for Redis, Master and Edge; nodes advertise their Pod IPs for RPC/forwarding |
 | `adx-test-credentials` Secret | Short-lived test certificates and API/Redis keys |
@@ -110,7 +110,7 @@ available separately for development reproduction in [build/e2e](../build/e2e/RE
 Buildkite syntax follows the official [Agent Stack execution](https://buildkite.com/docs/agent/self-hosted/agent-stack-k8s/running-builds)
 and [PodSpec configuration](https://buildkite.com/docs/agent/self-hosted/agent-stack-k8s/podspec).
 
-构建会在复用的 worker 中按版本和 SHA256 准备 Go 1.25.5、Redis 7.2.5，并安装固定版本的 Go 协议生成器。未指定基础镜像时，打包步骤按仓库 Dockerfile 构建并发布测试基础镜像，再用 registry digest 构建节点与 RRT 镜像。`ADX_REDIS_SERVER` / `ADX_REDIS_CLI` 和 `ADX_E2E_RUNTIME_BASE` / `ADX_E2E_RRT_BASE` 可显式覆盖。
+构建会在复用的 worker 中按版本和 SHA256 准备 Go 1.25.5、Redis 7.2.5，用于外部 sandboxd 构建。未指定基础镜像时，打包步骤按仓库 Dockerfile 构建并发布测试基础镜像，再用 registry digest 构建节点与 RRT 镜像。`ADX_REDIS_SERVER` / `ADX_REDIS_CLI` 和 `ADX_E2E_RUNTIME_BASE` / `ADX_E2E_RRT_BASE` 可显式覆盖。
 
 ## Rust image and Cargo cache
 

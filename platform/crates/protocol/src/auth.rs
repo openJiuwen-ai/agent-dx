@@ -6,7 +6,7 @@ use tonic::{Request, Status};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Principal {
     Master,
-    Frontend,
+    ApiServer,
     Edge,
     Node(String),
 }

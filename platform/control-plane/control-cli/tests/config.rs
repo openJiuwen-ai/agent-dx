@@ -118,19 +118,19 @@ fn sandbox_api_discovery_defaults_and_overrides_are_usable() {
     d.state_dir = root.path().to_owned();
     d.render(&root.path().join("defaults")).unwrap();
     let generated: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(root.path().join("defaults/sandbox-api.json")).unwrap(),
+        &std::fs::read(root.path().join("defaults/api-server.json")).unwrap(),
     )
     .unwrap();
     assert_eq!(generated["discovery"]["poll_seconds"], 5);
     let api = d
         .services
         .iter()
-        .position(|s| s.role == Role::SandboxApi)
+        .position(|s| s.role == Role::ApiServer)
         .unwrap();
     d.services[api].config["discovery"] = json!({"poll_seconds": 2});
     d.render(&root.path().join("override")).unwrap();
     let generated: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(root.path().join("override/sandbox-api.json")).unwrap(),
+        &std::fs::read(root.path().join("override/api-server.json")).unwrap(),
     )
     .unwrap();
     assert_eq!(generated["discovery"]["poll_seconds"], 2);

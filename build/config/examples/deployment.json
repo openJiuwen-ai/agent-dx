@@ -13,7 +13,7 @@
       "role": "master",
       "config": {
         "listen": "0.0.0.0:19000",
-        "domains": 1,
+        "scheduler_shards": 1,
         "placement": "pack",
         "rpc_timeout_seconds": 30,
         "tls": {
@@ -22,7 +22,7 @@
           "private_key": "/etc/adx/tls/master.key",
           "server_name": "adx.internal",
           "peers": {
-            "frontend": "/etc/adx/tls/frontend.der",
+            "api-server": "/etc/adx/tls/api-server.der",
             "node:node-1": "/etc/adx/tls/node-1.der",
             "edge": "/etc/adx/tls/edge.der"
           }
@@ -71,7 +71,7 @@
           "server_name": "adx.internal",
           "peers": {
             "master": "/etc/adx/tls/master.der",
-            "frontend": "/etc/adx/tls/frontend.der"
+            "api-server": "/etc/adx/tls/api-server.der"
           }
         },
         "sandboxd_socket": "/run/sandboxd/sandboxd.sock",
@@ -94,13 +94,13 @@
       }
     },
     {
-      "id": "sandbox-api",
-      "role": "sandbox-api",
+      "id": "api-server",
+      "role": "api-server",
       "config": {
         "listen": "127.0.0.1:8888",
         "ca": "/etc/adx/tls/ca.pem",
-        "certificate": "/etc/adx/tls/frontend.pem",
-        "private_key": "/etc/adx/tls/frontend.key",
+        "certificate": "/etc/adx/tls/api-server.pem",
+        "private_key": "/etc/adx/tls/api-server.key",
         "server_name": "adx.internal",
         "rpc_timeout_seconds": 90,
         "cache_ttl_seconds": 60,

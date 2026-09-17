@@ -25,11 +25,11 @@ Node 启动 → Redis 发现 Master → 注册 session_id（对账中、关闭�
           → 后续心跳开放准入
 ```
 
-配置示例在 `build/config/examples/`。Master 的 `advertised_address` 为带明确端口的 HTTPS 地址，`discovery_ttl_seconds` 默认 15 秒。Node 与 Frontend 的 `discovery` 指定 Redis URL 和 namespace；也保留显式 `master_address` 配置，两者互斥。Node 按 `report_interval_seconds` 查询发现并上报；Frontend 按 `discovery.poll_seconds` 刷新。mTLS 仍使用部署环境提供的 CA／证书和组件身份映射。
+配置示例在 `build/config/examples/`。Master 的 `advertised_address` 为带明确端口的 HTTPS 地址，`discovery_ttl_seconds` 默认 15 秒。Node 与 API Server 的 `discovery` 指定 Redis URL 和 namespace；也保留显式 `master_address` 配置，两者互斥。Node 按 `report_interval_seconds` 查询发现并上报；API Server 按 `discovery.poll_seconds` 刷新。mTLS 仍使用部署环境提供的 CA／证书和组件身份映射。
 
 Redis 地址记录位于 `adx:{namespace}:master:v1`，包含 schema、epoch、address。读取时同时读取 `control:v1` 的 header，精确比较 u64 epoch；旧 Master 即使还留下未过期地址，也不再是有效发现结果。发布使用当前 Session 的 CAS，旧 epoch 不能覆盖新进程地址。这不提供选主或主备切换。
 
-发现暂时失败不清空 Frontend 的 Instance 归属缓存。已有连接仍可尝试调用；缓存命中的节点操作继续直达 Node。新地址出现后 resolver 切换 Master 连接。认证缓存继续受其 TTL 和密钥到期时间限制。
+发现暂时失败不清空 API Server 的 Instance 归属缓存。已有连接仍可尝试调用；缓存命中的节点操作继续直达 Node。新地址出现后 resolver 切换 Master 连接。认证缓存继续受其 TTL 和密钥到期时间限制。
 
 ## 心跳契约
 
@@ -66,7 +66,7 @@ cargo test --locked -p adx-node-manager -p adx-master -p adx-discovery -p adx-pr
 cargo clippy --locked -p adx-node-manager -p adx-master -p adx-discovery -p adx-protocol --all-targets -j2 -- -D warnings
 ADX_TEST_REDIS_SERVER=/path/to/redis-server python3 build/ci/run.py storage --jobs 2
 ADX_TEST_REDIS_SERVER=/path/to/redis-server python3 build/ci/run.py control-rpc --jobs 2
-ADX_TEST_REDIS_SERVER=/path/to/redis-server ADX_TEST_SANDBOX_API=/path/to/adx-sandbox-api python3 build/ci/run.py frontend-control --jobs 2
+ADX_TEST_REDIS_SERVER=/path/to/redis-server ADX_TEST_API_SERVER=/path/to/adx-api-server python3 build/ci/run.py api-control --jobs 2
 ```
 
 本地红灯、回归、真实 Redis、mTLS RPC 和 Go 进程验证证据保存于 `out/ci/recovery-discovery/`。红灯首先确认 RuntimeObservation／inventory／reconcile 接口缺失。真实 Redis 检查发现过期与 epoch 切换，RPC 检查心跳重复／过期／重新对账／旧 session 拒绝，Node 测试检查不重新启动、资源恢复、未提交实例清理以及失败时保留占用。
