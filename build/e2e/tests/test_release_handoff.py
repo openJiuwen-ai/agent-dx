@@ -11,6 +11,17 @@ spec=importlib.util.spec_from_file_location('handoff_package',ROOT/'build/releas
 package=importlib.util.module_from_spec(spec);spec.loader.exec_module(package)
 
 class ReleaseArchiveTests(unittest.TestCase):
+    def test_all_e2e_python_sources_compile(self):
+        sources = sorted((ROOT / 'build/e2e').rglob('*.py'))
+        self.assertTrue(sources)
+        with tempfile.TemporaryDirectory() as temp:
+            for index, source in enumerate(sources):
+                py_compile.compile(
+                    str(source),
+                    cfile=str(Path(temp) / f'{index}.pyc'),
+                    doraise=True,
+                )
+
     def test_artifact_roundtrip_preserves_manifest_nested_files_and_modes(self):
         with tempfile.TemporaryDirectory() as temp:
             root=Path(temp);bins=root/'bins';bins.mkdir()
