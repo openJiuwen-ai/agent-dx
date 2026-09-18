@@ -2,7 +2,13 @@ syntax = "proto3";
 
 package adx.control.v1;
 
+import "instance_types.proto";
+
 service RouteService { rpc WatchRoutes(WatchRoutesRequest) returns (stream RouteFrame); }
+
+service InstanceDirectoryService {
+  rpc WatchInstances(WatchInstancesRequest) returns (stream InstanceDirectoryFrame);
+}
 
 message WatchRoutesRequest {}
 
@@ -23,4 +29,21 @@ message RouteFrame {
  bool reset = 4;
  repeated PublishedRoute upserts = 5;
  repeated string deleted = 6;
+}
+
+message WatchInstancesRequest {}
+
+message PublishedInstance {
+  InstanceRecord record = 1;
+  string node_address = 2;
+  string node_proxy_address = 3;
+}
+
+message InstanceDirectoryFrame {
+  uint64 epoch = 1;
+  uint64 revision = 2;
+  uint64 base_revision = 3;
+  bool reset = 4;
+  repeated PublishedInstance upserts = 5;
+  repeated string deleted = 6;
 }

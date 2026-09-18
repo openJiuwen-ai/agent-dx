@@ -19,6 +19,8 @@
 
 ## 本次修订
 
+- API Server 文档和架构图改为 Master 实例目录首次全量、后续增量订阅；普通生命周期查询不再描述为 TTL 缓存未命中后逐项查询。
+- 新增 [实例目录订阅验收](2026-09-18-instance-directory.md)，记录全量/增量、断档重同步、终态幂等和真实 Redis/mTLS/HTTPS 验证边界。
 - 当前架构 SVG 沿用最初版式，仅将 Go Sandbox API／Domain 命名更新为 Rust API Server／Shard；本地优先创建和 EROFS／OCI 等实现细节保留在目录正文。
 - 根中英文 README、Buildkite 和 Kubernetes E2E 指南更新到 #30、八组及 OCI worker 前置条件。
 - 运行环境部署说明补齐 EROFS/OCI 双路径和 OCI 递归只读 bind 语义。
@@ -39,7 +41,7 @@ python3 -m json.tool docs/testing/control-plane-remaining.json
 git diff --check
 ```
 
-检查覆盖 89 份 Markdown／HTML／SVG 文档、453 个本地链接或 Markdown 锚点、22 个 JSON
+检查覆盖 90 份 Markdown／HTML／SVG 文档、455 个本地链接或 Markdown 锚点、22 个 JSON
 示例和 1 个 SVG，0 错误。架构图生成一致性、剩余事项 JSON 解析和差异空白检查均通过。
 另检索“正式 K8s 待执行”“最新 #24”“七组共享”“K8s worker 必须 EROFS”等容易漂移的
 当前表述，没有发现与 #30 冲突的说明。

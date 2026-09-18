@@ -96,6 +96,21 @@ impl StoredInstance {
         (!self.invalidated && self.recovery.as_ref().is_some_and(|r| r.pending))
             || self.result.as_ref().is_none_or(|r| r.resources_held)
     }
+    pub(crate) fn effective_record(&self) -> InstanceRecord {
+        self.result.clone().unwrap_or_else(|| InstanceRecord {
+            restart_attempts: 0,
+            restart_pending: false,
+            runtime_id: format!("{}-{}", self.spec.id, self.assignment.generation),
+            spec: self.spec.clone(),
+            assignment: self.assignment.clone(),
+            state: InstanceState::Pending,
+            revision: 0,
+            resources_held: true,
+            runtime_ip: None,
+            checkpoint: None,
+            last_operation: None,
+        })
+    }
     fn validate(&self) -> Result<()> {
         self.spec.validate()?;
         if self.spec.id != self.assignment.instance_id || self.assignment.generation == 0 {

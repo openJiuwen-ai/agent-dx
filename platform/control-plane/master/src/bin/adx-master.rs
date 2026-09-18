@@ -145,7 +145,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ))
         .add_service(pb::auth_service_server::AuthServiceServer::new(auth))
         .add_service(
-            pb::route_service_server::RouteServiceServer::new(routes)
+            pb::route_service_server::RouteServiceServer::new(routes.clone())
+                .max_encoding_message_size(64 * 1024 * 1024),
+        )
+        .add_service(
+            pb::instance_directory_service_server::InstanceDirectoryServiceServer::new(routes)
                 .max_encoding_message_size(64 * 1024 * 1024),
         )
         .serve_with_incoming_shutdown(

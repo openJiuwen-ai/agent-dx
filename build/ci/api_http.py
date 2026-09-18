@@ -32,6 +32,12 @@ for _ in range(100):
         time.sleep(.05)
 else:
     raise AssertionError('Rust API Server did not listen')
+for _ in range(100):
+    if call('DELETE', '/api/sandbox/absent')[0] == 404:
+        break
+    time.sleep(.05)
+else:
+    raise AssertionError('Rust API Server instance directory did not synchronize')
 for invalid_key in ('z' * 40, 'c' * 40):
     code, _ = call('DELETE', '/api/sandbox/absent', key=invalid_key)
     assert code == 401, code

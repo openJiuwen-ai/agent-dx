@@ -1,6 +1,6 @@
 mod common;
 use adx_core::{scheduling::DeviceAllocation, InstanceRecord, InstanceSpec, Resources, Result};
-use adx_master::{rpc::MasterRpc, storage::Session, Placement};
+use adx_master::{routes::RoutePublisher, rpc::MasterRpc, storage::Session, Placement};
 use adx_node_manager::{
     rpc::{MasterStateSink, NodeRpc},
     NodeManager, Readiness, Routes, RuntimeBackend,
@@ -270,22 +270,33 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
     let metrics_address = metrics_listener.local_addr().unwrap();
     let ml = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let ma = ml.local_addr().unwrap();
-    let mut servers = Servers(vec![tokio::spawn(async move {
-        Server::builder()
-            .tls_config(server_tls("master"))
-            .unwrap()
-            .add_service(pb::snapshot_service_server::SnapshotServiceServer::new(
-                master.clone(),
-            ))
-            .add_service(pb::master_service_server::MasterServiceServer::new(master))
-            .add_service(pb::credential_service_server::CredentialServiceServer::new(
-                auth.clone(),
-            ))
-            .add_service(pb::auth_service_server::AuthServiceServer::new(auth))
-            .serve_with_incoming(TcpListenerStream::new(ml))
-            .await
-            .unwrap();
-    })]);
+    let publication = RoutePublisher::new(session.clone(), peers());
+    publication.refresh().await.unwrap();
+    let updater = publication.clone();
+    let mut servers = Servers(vec![
+        tokio::spawn(updater.run(Duration::from_millis(20))),
+        tokio::spawn(async move {
+            Server::builder()
+                .tls_config(server_tls("master"))
+                .unwrap()
+                .add_service(pb::snapshot_service_server::SnapshotServiceServer::new(
+                    master.clone(),
+                ))
+                .add_service(pb::master_service_server::MasterServiceServer::new(master))
+                .add_service(pb::credential_service_server::CredentialServiceServer::new(
+                    auth.clone(),
+                ))
+                .add_service(pb::auth_service_server::AuthServiceServer::new(auth))
+                .add_service(
+                    pb::instance_directory_service_server::InstanceDirectoryServiceServer::new(
+                        publication,
+                    ),
+                )
+                .serve_with_incoming(TcpListenerStream::new(ml))
+                .await
+                .unwrap();
+        }),
+    ]);
     servers.0.push(tokio::spawn(async move {
         adx_master::metrics::serve(metrics_listener, metrics_rpc)
             .await
@@ -660,7 +671,7 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
         let agent_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let agent_address = agent_listener.local_addr().unwrap();
         drop(agent_listener);
-        let config = serde_json::json!({"agent_address":format!("http://{agent_address}"),"listen":address.to_string(),"discovery":{"redis_url":redis.url,"namespace":"test","poll_seconds":1},"ca":tls.join("ca.pem"),"certificate":tls.join("api-server.pem"),"private_key":tls.join("api-server.key"),"server_name":"localhost","rpc_timeout_seconds":3,"cache_ttl_seconds":60,"cache_entries":128,"auth_cache_ttl_seconds":1});
+        let config = serde_json::json!({"agent_address":format!("http://{agent_address}"),"listen":address.to_string(),"discovery":{"redis_url":redis.url,"namespace":"test","poll_seconds":1},"ca":tls.join("ca.pem"),"certificate":tls.join("api-server.pem"),"private_key":tls.join("api-server.key"),"server_name":"localhost","rpc_timeout_seconds":3,"cache_entries":128,"auth_cache_ttl_seconds":1});
         let path = directory.path().join("api.json");
         std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
         let evidence = PathBuf::from(std::env::var("ADX_TEST_EVIDENCE").unwrap());

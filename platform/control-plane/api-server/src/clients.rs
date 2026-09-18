@@ -1,4 +1,4 @@
-use crate::{config::Config, ownership::Cache};
+use crate::{config::Config, instance_directory::InstanceDirectory, ownership::Cache};
 use adx_observability::trace;
 use adx_protocol::control as pb;
 use sha2::{Digest, Sha256};
@@ -21,7 +21,7 @@ pub struct Clients {
     endpoint: Mutex<Cache<(), String>>,
     channels: Mutex<Cache<String, Channel>>,
     auth: Mutex<Cache<[u8; 32], pb::CallerContext>>,
-    owners: Mutex<Cache<String, pb::GetInstanceResponse>>,
+    instances: Mutex<InstanceDirectory>,
 }
 impl Clients {
     pub fn new(config: Config) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
@@ -49,7 +49,25 @@ impl Clients {
             endpoint: Mutex::new(Cache::new(1)),
             channels: Mutex::new(Cache::new(limit)),
             auth: Mutex::new(Cache::new(limit)),
-            owners: Mutex::new(Cache::new(limit)),
+            instances: Mutex::default(),
+        });
+        let weak = Arc::downgrade(&clients);
+        tokio::spawn(async move {
+            while let Some(clients) = weak.upgrade() {
+                let result = clients.watch_instances().await;
+                if result.as_ref().is_err_and(|error| {
+                    matches!(
+                        error.code(),
+                        tonic::Code::OutOfRange
+                            | tonic::Code::FailedPrecondition
+                            | tonic::Code::DataLoss
+                    )
+                }) {
+                    clients.instances.lock().await.clear();
+                }
+                drop(clients);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
         });
         if clients.config.create_mode == crate::config::CreateMode::LocalFirst {
             let weak = Arc::downgrade(&clients);
@@ -63,6 +81,23 @@ impl Clients {
             });
         }
         Ok(clients)
+    }
+    async fn watch_instances(&self) -> Result<(), Status> {
+        let mut client =
+            pb::instance_directory_service_client::InstanceDirectoryServiceClient::new(
+                self.master().await?,
+            )
+            .max_decoding_message_size(64 * 1024 * 1024);
+        let mut stream = self
+            .rpc(
+                "api_server.watch_instances",
+                client.watch_instances(pb::WatchInstancesRequest {}),
+            )
+            .await?;
+        while let Some(frame) = stream.message().await? {
+            self.instances.lock().await.update(frame)?;
+        }
+        Err(Status::unavailable("instance directory closed"))
     }
     async fn watch_directory(&self) -> Result<(), Status> {
         let mut client = pb::master_service_client::MasterServiceClient::new(self.master().await?);
@@ -245,10 +280,9 @@ impl Clients {
         refresh: bool,
     ) -> Result<pb::GetInstanceResponse, Status> {
         if !refresh {
-            if let Some(v) = self.owners.lock().await.get(&id.to_string()) {
-                authorize(caller, v.record.as_ref())?;
-                return Ok(v);
-            }
+            let value = self.instances.lock().await.get(id)?;
+            authorize(caller, value.record.as_ref())?;
+            return Ok(value);
         }
         let mut client = pb::master_service_client::MasterServiceClient::new(self.master().await?);
         let v = self
@@ -269,34 +303,11 @@ impl Clients {
         {
             return Err(Status::data_loss("incomplete owner response"));
         }
-        self.put_owner(v.clone()).await;
+        self.put_owner(v.clone()).await?;
         Ok(v)
     }
-    pub async fn put_owner(&self, value: pb::GetInstanceResponse) {
-        let Some(record) = value.record.as_ref() else {
-            return;
-        };
-        let Some(spec) = record.spec.as_ref() else {
-            return;
-        };
-        let mut owners = self.owners.lock().await;
-        if let Some(old) = owners.get(&spec.id) {
-            if let Some(old) = old.record {
-                let generation =
-                    |r: &pb::InstanceRecord| r.assignment.as_ref().map_or(0, |a| a.generation);
-                if (generation(&old), old.revision) > (generation(record), record.revision) {
-                    return;
-                }
-            }
-        }
-        owners.insert(
-            spec.id.clone(),
-            value,
-            Duration::from_secs(self.config.cache_ttl_seconds),
-        );
-    }
-    pub async fn forget_owner(&self, id: &str) {
-        self.owners.lock().await.remove(&id.to_string());
+    pub async fn put_owner(&self, value: pb::GetInstanceResponse) -> Result<(), Status> {
+        self.instances.lock().await.put(value)
     }
 }
 pub fn unix_seconds() -> u64 {

@@ -29,7 +29,7 @@ Node 启动 → Redis 发现 Master → 注册 session_id（对账中、关闭�
 
 Redis 地址记录位于 `adx:{namespace}:master:v1`，包含 schema、epoch、address。读取时同时读取 `control:v1` 的 header，精确比较 u64 epoch；旧 Master 即使还留下未过期地址，也不再是有效发现结果。发布使用当前 Session 的 CAS，旧 epoch 不能覆盖新进程地址。这不提供选主或主备切换。
 
-发现暂时失败不清空 API Server 的 Instance 归属缓存。已有连接仍可尝试调用；缓存命中的节点操作继续直达 Node。新地址出现后 resolver 切换 Master 连接。认证缓存继续受其 TTL 和密钥到期时间限制。
+发现或实例目录流暂时失败不清空 API Server 最近完成同步的 Instance 目录。已有节点操作仍可按缓存的 generation 直达 Node 并由节点复核；新 Master 地址出现后 resolver 重连，首帧全量替换旧目录。revision 断档或非法 epoch 增量会清空目录并等待新的全量帧。认证缓存继续受其 TTL 和密钥到期时间限制。
 
 ## 心跳契约
 

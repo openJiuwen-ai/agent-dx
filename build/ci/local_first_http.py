@@ -41,8 +41,15 @@ for _ in range(100):
         time.sleep(.05)
 else:
     raise AssertionError('API Server did not listen')
-# Allow the real WatchNodes initial frame to reach ingress. Rust additionally
-# checks owners: Pack would select a twice, whereas local round-robin selects b.
+# Readiness requires both the instance directory and the local-first node view.
+for _ in range(100):
+    if call('DELETE', '/api/sandbox/absent')[0] == 404:
+        break
+    time.sleep(.05)
+else:
+    raise AssertionError('API Server directories did not synchronize')
+# Rust additionally checks owners: Pack would select a twice, whereas local
+# round-robin selects b.
 time.sleep(1.1)
 first = identity(create('first', 'first'))
 second = identity(create('second', 'second'))

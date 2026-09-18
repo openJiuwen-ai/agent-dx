@@ -36,7 +36,6 @@ pub struct Config {
     pub private_key: PathBuf,
     pub server_name: String,
     pub rpc_timeout_seconds: u64,
-    pub cache_ttl_seconds: u64,
     pub cache_entries: usize,
     pub auth_cache_ttl_seconds: u64,
     #[serde(default)]
@@ -50,7 +49,6 @@ impl Config {
         if self.master_address.is_empty() == self.discovery.is_none()
             || self.server_name.is_empty()
             || self.rpc_timeout_seconds == 0
-            || self.cache_ttl_seconds == 0
             || self.auth_cache_ttl_seconds == 0
             || self.cache_entries == 0
             || self.discovery.as_ref().is_some_and(|d| d.poll_seconds == 0)

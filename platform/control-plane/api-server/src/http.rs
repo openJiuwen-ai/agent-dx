@@ -333,7 +333,7 @@ impl Api {
             names.insert(op.spec.id.clone(), key.clone());
         }
         let result=async{
-   if self.clients.config.create_mode == crate::config::CreateMode::Central { match self.clients.owner(&op.spec.id,caller,true).await{
+   if self.clients.config.create_mode == crate::config::CreateMode::Central { match self.clients.owner(&op.spec.id,caller,false).await{
     Ok(_)=>return Err(Status::already_exists("instance already exists")),
     Err(e) if e.code()==Code::NotFound=>{},Err(e)=>return Err(e)
    }
@@ -343,6 +343,9 @@ impl Api {
    authorize(caller,result.record.as_ref())?;
    let r=result.record.unwrap();let got=r.spec.as_ref().unwrap();
    if r.state!=pb::InstanceState::Running as i32 || result.durability!=pb::Durability::Published as i32 || !matches_spec(&op.spec,got){return Err(Status::unavailable("create is not durably confirmed"));}
+   // Close the read-after-create window without making ordinary lifecycle
+   // requests query Master. The versioned stream remains the steady-state path.
+   self.clients.owner(&got.id,caller,true).await?;
    let mut value=json!({"sandboxId":got.id,"instanceId":got.id,"status":"running","requestId":request_id});
    if input.pointer("/tunnel/enabled").and_then(Value::as_bool)==Some(true){
     let port=got.env.get("RRT_TUNNEL_HTTP_PORT").and_then(|p|p.parse::<u16>().ok()).unwrap_or(8766);let safe=got.id.replace('@',"-at-").replace(['/', '.', '_'],"-");let path=format!("/tunnel/{safe}");

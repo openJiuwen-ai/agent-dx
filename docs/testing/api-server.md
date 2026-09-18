@@ -1,20 +1,25 @@
 # Rust API Server 与服务启动
 
-2026-09-17 核对：HTTP 兼容层已接入 Instance RPC，提供 Master、Node Manager 和 Rust API Server 服务入口。生命周期状态机仍在 Node Manager。下文契约按当前代码描述，末尾测试表保留 2026-09-15 当次证据。
+2026-09-18 核对：HTTP 兼容层已接入 Instance RPC，提供 Master、Node Manager 和 Rust API Server 服务入口。生命周期状态机仍在 Node Manager。下文契约按当前代码描述，末尾测试表保留 2026-09-15 当次证据。
 
 ## 请求链路
 
 ```text
 SDK → Rust API Server
   认证：短时摘要缓存 → 缺失时 Master.VerifyApiKey → Redis 摘要记录
+  目录：Master 首次全量 → revision 增量 upsert/delete → 本地实例目录
   创建：本地兼容字段转换 → Master.CreateInstance → Shard → Node Manager
-  删除：本地归属缓存 → Node Manager.DeleteInstance
-                         ↑ 缺失时 Master.GetInstance
+  删除：本地实例目录 → Node Manager.DeleteInstance
+                         ↑ 仅结果不明／读后写时 Master.GetInstance
 Node Manager → sandboxd / RRT HTTP / Node Proxy UDS
 Node Manager → MasterStateSink → Redis 条件提交
 ```
 
-API Server 的归属缓存包含完整 Assignment、节点地址和最后观察结果，有容量上限与有效期。命中后直接访问节点，节点检查租户与完整 generation；缓存不是生命周期权威。连接失败或归属失效时刷新，自动重试最多一次，且只能使用原 Assignment。新的 generation 不会继承旧删除请求。
+API Server 通过 `InstanceDirectoryService.WatchInstances` 维护完整的内存实例目录，条目包含 InstanceRecord、节点地址和 Node Proxy 地址。每次连接先接收全量 reset，随后按 Master epoch 与 revision 接收增量 upsert/delete；revision 断档或非法 epoch 增量会清空目录并重新全量同步。普通传输断开期间保留最近完整目录并后台重连，节点继续检查租户与完整 generation。`GetInstance` 只用于创建后的读后写收敛，以及结果不明时针对原 Assignment 的恢复查询。
+
+实现与本地验收证据见 [实例目录订阅验收](2026-09-18-instance-directory.md)。
+
+目录未完成首次同步时，API Server 不接受依赖实例归属的请求。已同步目录中的缺失项是确定的 NotFound，不触发逐项 Redis 查询。实例目录与 Edge 路由缓存分开：前者还包含 Redis 保留的 Deleted 等终态记录，以维持重复生命周期请求的幂等结果；公开查询仍将 Deleted 映射为 NotFound。后者只发布可路由的 Running 实例。
 
 正在等待确认的删除固定其目标，不因刷新或缓存淘汰更换目标；待确认操作达到上限时拒绝新的删除。已完成操作由节点的状态机与持久化结果处理重复调用。这些待确认记录仅在 API Server 内存中，不提供 API Server 重启后找回未确认操作的承诺。
 
@@ -40,7 +45,7 @@ Node Manager 装配 Sandboxd、RrtReadiness、UdsRoutes 及带 SQLite 降级的 
 
 Node 启动后先关闭生命周期入口，以本次进程身份注册并获取 Master 完整目录，与 sandboxd 实际实例对账，恢复资源占用和本机绑定后再开放准入。Master 暂不可用时不清理或重建。详细契约见 [发现与重启对账](recovery-discovery.md)。
 
-入口支持 Redis 注册发现，API Server 的 Master／认证客户端共用动态 resolver，节点直达缓存继续保留。Node Proxy 全量同步、统一配置生成与 supervisor 已装配。`adxctl stop` 和 supervisor 的 SIGTERM/SIGINT 会执行本机实例清理；单独 Node Manager 故障重启走权威对账。
+入口支持 Redis 注册发现，API Server 的 Master／认证和目录客户端共用动态 resolver。Node Proxy 全量同步、统一配置生成与 supervisor 已装配。`adxctl stop` 和 supervisor 的 SIGTERM/SIGINT 会执行本机实例清理；单独 Node Manager 故障重启走权威对账。
 
 ## 验证入口
 

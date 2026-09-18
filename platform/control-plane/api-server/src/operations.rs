@@ -251,7 +251,7 @@ impl Operations {
                         }
                     };
                     owner.record = result.record;
-                    c.put_owner(owner).await;
+                    c.put_owner(owner).await?;
                     self.pending.lock().await.remove(&key);
                     return Ok(value);
                 }
@@ -267,7 +267,6 @@ impl Operations {
                         self.pending.lock().await.remove(&key);
                         return Err(error);
                     }
-                    c.forget_owner(id).await;
                     if attempt == 1 {
                         return Err(error);
                     }

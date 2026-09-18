@@ -9,7 +9,7 @@ extend the old POSIX, function, or generic signal services for new functionality
 | `instance_types.proto` | Shared Instance, Assignment, resources and scheduling types | Shared by control services |
 | `snapshot.proto` | Snapshot catalog, references and collection | Master and Node snapshot services |
 | `credentials.proto` | API Key validation and administrator operations | AuthService and CredentialService |
-| `routes.proto` | Committed route snapshots and incremental publication | RouteService |
+| `routes.proto` | Versioned Instance directory and committed route publication | InstanceDirectoryService and RouteService |
 | `node.proto` / `adx.node.v1` | Versioned Node Proxy bindings and activity | Node-local UDS services |
 | RRT HTTP | Commands, files, health, checkpoint cooperation and tunnels | See [runtime contract](../http/runtime-control.md) |
 
@@ -77,7 +77,15 @@ StartAssignedInstance and CommitInstance carry the destination/source node proce
 session to reject delayed requests from a superseded process. Full Assignment and
 record revision checks remain mandatory. See [recovery contract](../../../docs/testing/recovery-discovery.md).
 
-## Master route publication
+## Master directory and route publication
+
+`InstanceDirectoryService.WatchInstances` is restricted to the `api-server`
+mTLS identity. A new stream starts with the complete retained Instance
+directory; later frames contain revision-linked upserts and deletions. API
+Server rejects a revision gap or Master epoch change, clears the local view and
+resubscribes for a new full frame. Normal lifecycle lookups use this local
+directory. `MasterService.GetInstance` remains a targeted read-after-write and
+uncertain-result recovery operation.
 
 `RouteService.WatchRoutes` is restricted to the `edge` mTLS identity. Each stream
 begins with a full `RouteFrame` (`reset=true`); subsequent frames specify the
