@@ -1,144 +1,72 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1440 960" role="img" aria-labelledby="title desc">
-  <title id="title">ADX 当前分层架构与关键链路</title>
-  <desc id="desc">左侧按产品、接入、控制面和节点执行四层展示组件，右侧分别说明中心调度、本地优先创建、数据访问和路由发布链路。</desc>
-  <defs>
-    <marker id="arrow-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#3478bd"/></marker>
-    <marker id="arrow-orange" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#d97706"/></marker>
-    <marker id="arrow-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#16856b"/></marker>
-    <marker id="arrow-purple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#7c5cb3"/></marker>
-    <marker id="arrow-gray" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#6b7f91"/></marker>
-  </defs>
-  <style>
-    text{font-family:system-ui,-apple-system,'PingFang SC','Microsoft YaHei',sans-serif;fill:#17324d}
-    .title{font-size:27px;font-weight:700}.subtitle{font-size:14px;fill:#5a7183}.lane-title{font-size:15px;font-weight:700;letter-spacing:.04em}
-    .component-title{font-size:19px;font-weight:700}.component-body{font-size:14px;fill:#355168}.small{font-size:13px;fill:#5a7183}
-    .flow-title{font-size:17px;font-weight:700}.flow-body{font-size:14px;fill:#355168}.badge{font-size:14px;font-weight:750;fill:white;text-anchor:middle}
-    .lane{stroke:#d7e2ea;stroke-width:1.2;rx:16}.box{stroke:#b9ccd8;stroke-width:1.5;rx:12}.panel{stroke:#cfdae3;stroke-width:1.3;rx:18}
-    .control{fill:none;stroke:#3478bd;stroke-width:2.6;marker-end:url(#arrow-blue)}
-    .local{fill:none;stroke:#d97706;stroke-width:2.8;marker-end:url(#arrow-orange)}
-    .data{fill:none;stroke:#16856b;stroke-width:2.8;marker-end:url(#arrow-green)}
-    .route{fill:none;stroke:#7c5cb3;stroke-width:2.5;marker-end:url(#arrow-purple)}
-    .dependency{fill:none;stroke:#6b7f91;stroke-width:2;marker-end:url(#arrow-gray)}
-    .target{fill:none;stroke:#8899a8;stroke-width:2.2;stroke-dasharray:7 6;marker-end:url(#arrow-gray)}
-  </style>
-
-  <rect width="1440" height="960" fill="#f4f7fa"/>
-  <text x="32" y="42" class="title">Agent DX · 当前分层架构与关键链路</text>
-  <text x="32" y="68" class="subtitle">2026-09-18 ｜ 左侧看组件边界，右侧按请求顺序看链路；虚线表示尚未完成的 Agent 平台接入</text>
-
-  <rect x="32" y="92" width="936" height="816" class="panel" fill="#ffffff"/>
-  <text x="54" y="121" class="lane-title">组件分层</text>
-
-  <rect x="50" y="140" width="900" height="128" class="lane" fill="#fff8ea"/>
-  <text x="70" y="166" class="lane-title" fill="#9a6417">产品与公开能力</text>
-  <rect x="170" y="178" width="326" height="70" class="box" fill="#fff1d6"/>
-  <text x="190" y="206" class="component-title">Agent CLI / SDK / Executor</text>
-  <text x="190" y="231" class="component-body">仍依赖旧 FaaS / 外部运行时</text>
-  <rect x="610" y="178" width="310" height="70" class="box" fill="#e9f5ef"/>
-  <text x="630" y="206" class="component-title">Sandbox Python SDK</text>
-  <text x="630" y="231" class="component-body">生命周期 · 快照 · 命令 · 文件</text>
-  <path d="M496 213H606" class="target"/>
-  <text x="518" y="201" class="small">目标接入</text>
-
-  <rect x="50" y="282" width="900" height="128" class="lane" fill="#eef4fc"/>
-  <text x="70" y="308" class="lane-title" fill="#2f6195">共享接入</text>
-  <rect x="170" y="320" width="326" height="70" class="box" fill="#e4eefb"/>
-  <text x="190" y="348" class="component-title">Rust API Server</text>
-  <text x="190" y="373" class="component-body">HTTP 适配 · 身份 · 归属缓存 · 入口轮转</text>
-  <rect x="610" y="320" width="310" height="70" class="box" fill="#e4eefb"/>
-  <text x="630" y="348" class="component-title">Edge</text>
-  <text x="630" y="373" class="component-body">API 转发 · API Key 缓存 · 路由订阅</text>
-  <path d="M765 248V316" class="control"/>
-  <path d="M606 355H500" class="control"/>
-
-  <rect x="50" y="424" width="900" height="212" class="lane" fill="#edf8f3"/>
-  <text x="70" y="450" class="lane-title" fill="#26725c">控制面</text>
-  <rect x="170" y="466" width="326" height="92" class="box" fill="#dff2e9"/>
-  <text x="190" y="494" class="component-title">Master · 单进程</text>
-  <text x="190" y="519" class="component-body">Global 轮转 → Shard Filter / Score</text>
-  <text x="190" y="542" class="component-body">原子归属 · 目录 · 故障恢复协调</text>
-  <rect x="170" y="574" width="326" height="44" class="box" fill="#ffffff"/>
-  <text x="190" y="602" class="component-body">Redis · 权威状态 / 发现 / 快照 / API Key</text>
-  <rect x="610" y="466" width="310" height="152" class="box" fill="#dff2e9"/>
-  <text x="630" y="494" class="component-title">Node Manager</text>
-  <text x="630" y="519" class="component-body">Local Admission · 原子 claim</text>
-  <text x="630" y="542" class="component-body">每 Instance 串行状态机</text>
-  <text x="630" y="565" class="component-body">资源采集 · RuntimeBackend</text>
-  <text x="630" y="588" class="component-body">checkpoint 与本地降级</text>
-  <path d="M333 390V462" class="control"/>
-  <path d="M496 500H606" class="control"/>
-  <path d="M333 558V570" class="dependency"/>
-  <path d="M476 390C550 404 535 448 606 484" class="local"/>
-  <path d="M610 550C565 550 550 545 500 545" class="local"/>
-  <path d="M450 466V438H565V390H606" class="route"/>
-
-  <rect x="50" y="650" width="900" height="238" class="lane" fill="#f1f4f7"/>
-  <text x="70" y="676" class="lane-title" fill="#526779">节点执行与数据路径</text>
-  <rect x="90" y="704" width="190" height="92" class="box" fill="#ffffff"/>
-  <text x="110" y="734" class="component-title">sandboxd</text>
-  <text x="110" y="759" class="component-body">外部托管执行后端</text>
-  <text x="110" y="781" class="small">本地 EROFS / OCI image</text>
-  <rect x="304" y="704" width="236" height="92" class="box" fill="#ffffff"/>
-  <text x="324" y="734" class="component-title">SQLite / Local / S3</text>
-  <text x="324" y="759" class="component-body">降级日志 / checkpoint 制品</text>
-  <rect x="574" y="704" width="150" height="92" class="box" fill="#e7f2fb"/>
-  <text x="594" y="734" class="component-title">Node Proxy</text>
-  <text x="594" y="759" class="component-body">绑定复核</text>
-  <text x="594" y="781" class="small">转发 / 活动</text>
-  <rect x="748" y="704" width="182" height="132" class="box" fill="#e7f2fb"/>
-  <text x="768" y="734" class="component-title">Instance + RRT</text>
-  <text x="768" y="759" class="component-body">命令 / 文件 / HTTP</text>
-  <text x="768" y="782" class="component-body">静态 RRT · PID 1</text>
-  <text x="768" y="805" class="small">用户镜像挂载 /__adx</text>
-  <path d="M680 618V670H185V700" class="dependency"/>
-  <path d="M748 618V681H422V700" class="dependency"/>
-  <path d="M730 618V690H649V700" class="dependency"/>
-  <path d="M796 618V700" class="dependency"/>
-  <path d="M920 355H940V682H649V700" class="data"/>
-  <path d="M724 750H744" class="data"/>
-
-  <rect x="988" y="92" width="420" height="816" class="panel" fill="#ffffff"/>
-  <text x="1012" y="121" class="lane-title">关键链路</text>
-
-  <rect x="1012" y="140" width="372" height="154" rx="14" fill="#edf5fd" stroke="#bfd4e8"/>
-  <circle cx="1040" cy="169" r="16" fill="#3478bd"/><text x="1040" y="174" class="badge">1</text>
-  <text x="1066" y="175" class="flow-title">中心调度创建</text>
-  <text x="1030" y="205" class="flow-body">SDK → Edge → API Server</text>
-  <text x="1030" y="228" class="flow-body">→ Master Global 轮转</text>
-  <text x="1030" y="251" class="flow-body">→ Shard Filter / Score</text>
-  <text x="1030" y="274" class="flow-body">→ Node Manager → sandboxd</text>
-
-  <rect x="1012" y="310" width="372" height="176" rx="14" fill="#fff5e7" stroke="#e9c99d"/>
-  <circle cx="1040" cy="339" r="16" fill="#d97706"/><text x="1040" y="344" class="badge">2</text>
-  <text x="1066" y="345" class="flow-title">本地优先创建</text>
-  <text x="1030" y="375" class="flow-body">API Server 轮转入口节点</text>
-  <text x="1030" y="398" class="flow-body">→ Node Manager 复用 Admission 暂留</text>
-  <text x="1030" y="421" class="flow-body">→ Master 原子确认唯一归属</text>
-  <text x="1030" y="444" class="flow-body">→ 同步中心账本后启动</text>
-  <text x="1030" y="467" class="small">本地不满足：同一 Instance ID 回退 Shard</text>
-
-  <rect x="1012" y="502" width="372" height="132" rx="14" fill="#eaf7f3" stroke="#b8dace"/>
-  <circle cx="1040" cy="531" r="16" fill="#16856b"/><text x="1040" y="536" class="badge">3</text>
-  <text x="1066" y="537" class="flow-title">数据访问</text>
-  <text x="1030" y="567" class="flow-body">SDK → Edge → Node Proxy → RRT</text>
-  <text x="1030" y="590" class="flow-body">Node Proxy 复核本机绑定后转发</text>
-  <text x="1030" y="613" class="small">不进入 Instance 生命周期任务队列</text>
-
-  <rect x="1012" y="650" width="372" height="132" rx="14" fill="#f3effa" stroke="#d2c5e5"/>
-  <circle cx="1040" cy="679" r="16" fill="#7c5cb3"/><text x="1040" y="684" class="badge">4</text>
-  <text x="1066" y="685" class="flow-title">路由发布</text>
-  <text x="1030" y="715" class="flow-body">Instance 结果提交并持久化</text>
-  <text x="1030" y="738" class="flow-body">→ Master 全量 / 增量发布</text>
-  <text x="1030" y="761" class="flow-body">→ Edge 仅保留内存路由缓存</text>
-
-  <rect x="1012" y="798" width="372" height="86" rx="14" fill="#f5f7f9" stroke="#d5dfe6"/>
-  <text x="1030" y="826" class="flow-title">当前验证边界</text>
-  <text x="1030" y="851" class="flow-body">Buildkite #30：OCI 三模式 + K8s 八组</text>
-  <text x="1030" y="873" class="small">standalone：EROFS；FC 快照另行验收</text>
-
-  <circle cx="54" cy="936" r="5" fill="#3478bd"/><text x="67" y="941" class="small">中心调度</text>
-  <circle cx="170" cy="936" r="5" fill="#d97706"/><text x="183" y="941" class="small">本地优先</text>
-  <circle cx="287" cy="936" r="5" fill="#16856b"/><text x="300" y="941" class="small">数据访问</text>
-  <circle cx="395" cy="936" r="5" fill="#7c5cb3"/><text x="408" y="941" class="small">路由发布</text>
-  <text x="988" y="941" class="small">控制面内部以 Instance 为抽象；sandboxd 始终由部署环境托管</text>
-</svg>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1120 840" role="img" aria-labelledby="title desc">
+<title id="title">ADX 当前组件架构</title><desc id="desc">Agent 目标经 Sandbox SDK 接入，当前尚未迁移；控制链路经过 Rust API Server、Master 与 Node Manager，数据链路经过 Edge、Node Proxy 与 RRT。Redis 持久化与 SQLite 降级分开。</desc>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10Z" fill="#516b83"/></marker></defs>
+<style>text{font-family:system-ui,-apple-system,'PingFang SC',sans-serif;fill:#17324d} .head{font-size:20px;font-weight:650}.body{font-size:15px}.small{font-size:13px;fill:#526b7c}.edge{fill:none;stroke:#516b83;stroke-width:2;marker-end:url(#arrow)}.box{stroke:#b7ccd9;stroke-width:1.5;rx:12}</style>
+<rect width="1120" height="840" fill="#f5f8fb" rx="18"/>
+<text x="32" y="38" class="head">Agent DX · 当前组件与调用方向</text><text x="32" y="63" class="small">2026-09-18 ｜ 实线：已接通；虚线：Agent 平台接入目标</text>
+<rect x="32" y="90" width="490" height="93" class="box" fill="#fff1db"/>
+<text x="50" y="120" class="head">Agent CLI / SDK / Executor</text>
+<text x="50" y="146" class="body">仍依赖旧 FaaS / 外部运行时，平台接入尚未完成</text>
+<rect x="654" y="90" width="432" height="93" class="box" fill="#e6f4ef"/>
+<text x="672" y="120" class="head">Sandbox Python SDK</text>
+<text x="672" y="146" class="body">公开生命周期、快照、命令与文件</text>
+<path d="M522 136H650" class="edge" stroke-dasharray="7 5"/>
+<text x="536" y="125" class="small">目标使用 SDK</text>
+<rect x="654" y="226" width="432" height="82" class="box" fill="#e8f0fc"/>
+<text x="672" y="256" class="head">Edge · 共享接入</text>
+<text x="672" y="282" class="body">API 转发 / API Key 缓存 / 路由订阅</text>
+<path d="M870 183V222" class="edge"/>
+<text x="885" y="208" class="small">HTTPS</text>
+<rect x="32" y="226" width="426" height="82" class="box" fill="#e8f0fc"/>
+<text x="50" y="256" class="head">Rust API Server</text>
+<text x="50" y="282" class="body">HTTP 适配、身份和归属缓存</text>
+<path d="M654 260H462" class="edge"/>
+<text x="487" y="250" class="small">生命周期 HTTP</text>
+<rect x="32" y="354" width="426" height="108" class="box" fill="#e6f4ef"/>
+<text x="50" y="384" class="head">Master · 单进程</text>
+<text x="50" y="410" class="body">Global 轮转 → Shard Filter / Score</text>
+<text x="50" y="433" class="body">目录、认证、节点失效与恢复协调</text>
+<path d="M160 308V350" class="edge"/>
+<text x="172" y="335" class="small">创建 / 查询</text>
+<rect x="540" y="354" width="220" height="108" class="box" fill="#fff"/>
+<text x="558" y="384" class="head">Redis</text>
+<text x="558" y="410" class="body">集群状态 / 发现</text>
+<text x="558" y="433" class="body">快照目录 / API Key</text>
+<path d="M458 391H536" class="edge"/>
+<text x="466" y="382" class="small">条件提交</text>
+<path d="M395 354V329H704V308" class="edge"/>
+<text x="443" y="322" class="small">已提交路由 gRPC</text>
+<rect x="32" y="534" width="426" height="116" class="box" fill="#e6f4ef"/>
+<text x="50" y="564" class="head">Node Manager</text>
+<text x="50" y="590" class="body">Local 准入 / 每 Instance 串行状态机</text>
+<text x="50" y="613" class="body">资源采集 / RuntimeBackend / 制品存储</text>
+<path d="M100 462V530" class="edge" marker-start="url(#arrow)"/>
+<text x="113" y="510" class="small">分配 ↓ / 结果提交 ↑</text>
+<path d="M70 308H16V592H28" class="edge"/>
+<text x="32" y="526" class="small">已有实例直达</text>
+<rect x="654" y="534" width="432" height="116" class="box" fill="#e8f0fc"/>
+<text x="672" y="564" class="head">Node Proxy</text>
+<text x="672" y="590" class="body">本机绑定复核 / 数据转发 / 活动上报</text>
+<text x="672" y="613" class="body">standalone 或嵌入 Node Manager</text>
+<path d="M870 308V530" class="edge"/>
+<text x="884" y="495" class="small">H2 CONNECT 数据</text>
+<path d="M654 573H462" class="edge" marker-start="url(#arrow)"/>
+<text x="473" y="562" class="small">UDS 绑定 / 活动</text>
+<rect x="32" y="698" width="215" height="95" class="box" fill="#fff"/>
+<text x="50" y="728" class="head">sandboxd</text>
+<text x="50" y="754" class="body">外部托管执行后端</text>
+<rect x="277" y="698" width="300" height="95" class="box" fill="#fff"/>
+<text x="295" y="728" class="head">SQLite / 本地 / S3</text>
+<text x="295" y="754" class="body">降级日志 / checkpoint 制品</text>
+<rect x="654" y="698" width="432" height="95" class="box" fill="#e8f0fc"/>
+<text x="672" y="728" class="head">RRT · Instance 内</text>
+<text x="672" y="754" class="body">命令 / 文件 / HTTP 恢复协作</text>
+<path d="M136 650V694" class="edge"/>
+<text x="146" y="678" class="small">后端 RPC</text>
+<path d="M393 650V694" class="edge"/>
+<text x="402" y="678" class="small">降级与存储</text>
+<path d="M870 650V694" class="edge"/>
+<text x="883" y="678" class="small">HTTP 数据</text>
+<path d="M458 624H617V742H650" class="edge"/>
+<text x="464" y="615" class="small">RRT HTTP 控制</text>
+<text x="32" y="822" class="small">各组件导出 Metrics / Trace / 日志；部署环境运行 Collector。数据请求不经过 Instance 生命周期队列。</text></svg>
