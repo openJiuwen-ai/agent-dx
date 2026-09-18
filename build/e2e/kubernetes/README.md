@@ -26,7 +26,7 @@ on; private registry credentials are mounted read-only and supplied to both
 Kubernetes and sandboxd. No cluster selection or credential material is embedded
 in the source tree.
 
-Seven scenario groups are shared with the local driver. Kubernetes-specific
+Eight scenario groups are shared with the local driver. Kubernetes-specific
 contract tests cover manifests, Secret projection, Service addresses, immutable
 artifact handoff and namespace ownership/cleanup failures. These tests do not
 execute a Kubernetes cluster. Pod readiness alone does not pass the platform
@@ -40,9 +40,10 @@ the fixture reads its cgroup limits before advertising ADX capacity.
 
 See [Buildkite setup](../../../.buildkite/README.md) for the reused CI workers, target kubeconfig mount and SWR secrets.
 
-The target worker pool must already provide EROFS and bridge netfilter with
-`bridge-nf-call-iptables=1`. The fixture checks these read-only before starting
-sandboxd. Select eligible nodes with repeated `--node-name` arguments, or set
+The Kubernetes profile uses the digest-pinned OCI runtime image, so the target
+worker pool does not need EROFS loop-mount support. It must provide bridge
+netfilter with `bridge-nf-call-iptables=1`; the fixture checks this before starting
+sandboxd. EROFS deployments use a separate real mount preflight. Select eligible nodes with repeated `--node-name` arguments, or set
 `ADX_E2E_NODE_NAMES` to comma-separated Kubernetes node names in Buildkite.
 The scheduler still applies the Linux/architecture and resource requirements.
 A one-node pool runs two isolated Pods on one host; it does not validate
@@ -63,4 +64,4 @@ node assignments, and restart recovery checks.
 scenarios separately, with unexecuted scenarios marked skipped and cleanup
 reported independently. A failed command or timeout still fails the acceptance.
 
-The `local-first` case switches only API Server into local-first mode, checks SDK concurrent create/execute/delete and confirmed local-claim evidence, then restores central mode. This case requires newly built artifacts; earlier seven-case runs do not validate it.
+The `local-first` case switches only API Server into local-first mode, checks SDK concurrent create/execute/delete and confirmed local-claim evidence, then restores central mode. This case requires newly built artifacts; earlier seven-case runs do not validate it. [Buildkite #30](../../../docs/testing/2026-09-18-runtime-environment-k8s.md) passed the current eight-case OCI profile.

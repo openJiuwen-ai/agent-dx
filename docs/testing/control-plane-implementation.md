@@ -40,14 +40,14 @@
 
 ## 验收与剩余范围
 
-- 本地优先创建链路已通过真实 Redis/mTLS/HTTPS 与新制品本地双节点8组验收，见 [报告](2026-09-17-local-first-e2e.md)；正式K8s仍待执行，不能沿用下列历史成功。
-- 最新正式基础 K8s：[Buildkite #24](2026-09-17-rust-api-server-k8s.md)，测试提交 `385b698043f0b62fac943a43da3de17bf59f6441`，七组及清理通过，包含资源 Metrics、日志滚动/采集和跨组件 Trace。两个 Pod 位于同一宿主。
+- 本地优先创建链路已通过真实 Redis/mTLS/HTTPS 与新制品本地双节点8组验收，见 [本地报告](2026-09-17-local-first-e2e.md)；提交 `363e44f` 的 [Buildkite #30](2026-09-18-runtime-environment-k8s.md) 已用正式发布包完成同一八组 K8s 验收。
+- 最新正式基础 K8s 为 Buildkite #30：OCI default/runtime-only/custom 三种运行环境、资源 Metrics、日志滚动/采集和跨组件 Trace 均通过，清理无残留。两个 Pod 位于同一宿主。历史 [Buildkite #24](2026-09-17-rust-api-server-k8s.md) 保留为 Rust API Server 七组迁移记录。
 - 本地 FC：暂停/恢复、S3、SQLite 降级、快照与跨节点恢复分别有真实验收，见 [路线图](control-plane-roadmap.md)。后续双克隆运行暴露网络问题，不能只引用较早成功批次宣称已解决。
 - 本期未完成：FC 双克隆网络、GPU/NPU 实卡验收、真实服务混合负载与长稳。
 - 后置：x86 双克隆对照、K8s FC、模板预热、证书热重载、统一实时 Trace 队列丢弃指标。
 
 [未完成事项](control-plane-remaining.json) 是进度页清单；[CI 入口](control-plane-ci.md) 区分组件、真实依赖协作与完整 E2E。各报告中的 `out/`、`/tmp/` 是当时的本地产物位置，干净克隆不包含这些文件。历史性能对照的版本、运行条件和测量范围见 [基线报告](scheduling-baseline-comparison.md)，不沿用其数字作为当前服务吞吐承诺。
 
-本次逐文件核对范围、修订及检查结果见 [2026-09-17 文档核对](2026-09-17-documentation-audit.md)。
+当前核对范围、修订及检查结果见 [2026-09-18 文档核对](2026-09-18-documentation-audit.md)；前一轮全仓基线清单保留在 [2026-09-17 核对](2026-09-17-documentation-audit.md)。
 
 Rust API Server 与 Shard 改名已通过本地回归及独立K8s验收；升级与验证过程见 [迁移记录](rust-api-server.md)。

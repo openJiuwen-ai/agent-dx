@@ -12,4 +12,4 @@
 
 同步使用 CI 现有 SWR Secret，经 GHCR 拉取原生 manifest，推送后按同一摘要回拉成功。日志包含每层推送结果、远端摘要和最终 `status: passed`。Buildkite 产物 `out/buildkite/collector-sync/` 保留 `result.json`、`sync.log`、`summary.md`、`dockerd.log`。
 
-正式 CI 从该 SWR 固定引用拉取；显式镜像及上游镜像站覆盖方式继续有效，本地 ARM64 构建保留原多架构来源。Collector 部署方式与采集配置不变。此步骤验证镜像同步，未运行产品编译和 Kubernetes E2E；日志与 Trace 的正式 K8s 验收仍待运行。
+正式 CI 从该 SWR 固定引用拉取；显式镜像及上游镜像站覆盖方式继续有效，本地 ARM64 构建保留原多架构来源。Collector 部署方式与采集配置不变。#20 这一步只验证镜像同步，未运行产品编译和 Kubernetes E2E；后续日志与 Trace 已由 [Buildkite #21](2026-09-17-observability-k8s.md) 验收，并继续在 [Buildkite #30](2026-09-18-runtime-environment-k8s.md) 的八组基础 K8s 中通过。

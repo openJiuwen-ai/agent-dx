@@ -35,9 +35,11 @@ SDK 组额外验证默认环境、仅覆盖 runtime、自定义镜像三条路�
 - 在目标集群两台 HCE 2.0、Linux `5.10.0-182.0.0.95.r3090_252.hce2.x86_64` worker 上复核。当前 ADX 制品、现场生成的最小 EROFS，以及既有 `yr-runtime-rootfs.img` 均得到相同结果，因此排除发布包路径、复制过程和本轮 mkfs 版本为单一原因。
 - preflight 现在真实挂载并卸载发布包内运行环境，而不只检查 `/proc/filesystems` 是否出现 `erofs`。不具备有效 EROFS loop mount 的 worker 会在 sandboxd 和控制面启动前报告 `erofs_mount` 环境错误。
 
-该结果说明现有 K8s worker 不满足此运行环境的验收前置条件；它不是正式 K8s 功能验收通过记录。完整日志与探针记录保存在 `out/ci/runtime-environment/buildkite/` 和 `out/ci/runtime-environment/preflight/`。
+该结果说明现有 K8s worker 不满足 EROFS 模式的验收前置条件；它不是正式 K8s 功能验收通过记录。完整日志与探针记录保存在 `out/ci/runtime-environment/buildkite/` 和 `out/ci/runtime-environment/preflight/`。
 
-后续实现保留这条 EROFS 部署路径，同时增加 OCI 内置环境。Buildkite K8s 验收改用本次构建生成并以 digest 发布的 OCI RRT image：默认实例以它作为 rootfs，自定义用户镜像时通过 sandboxd 的 OCI image mount 挂入 `/__adx`。该变更的正式通过情况以新的 Buildkite 记录为准，不修改上述历史失败结论。
+后续实现保留这条 EROFS 部署路径，同时增加 OCI 内置环境。Buildkite K8s 验收改用本次构建生成并以 digest 发布的 OCI RRT image：默认实例以它作为 rootfs，自定义用户镜像时通过 sandboxd 的 OCI image mount 挂入 `/__adx`。
+
+2026-09-18，提交 `363e44f` 的 [Buildkite #30](2026-09-18-runtime-environment-k8s.md) 已完成正式通过：三阶段全部成功，默认、runtime-only、自定义镜像三种运行环境路径和八组基础 K8s 用例通过，`cleanup_errors=0`。这关闭 OCI K8s 验收，不改变 #25/#26 对 EROFS worker 能力的历史结论；Firecracker 对新运行环境入口的验证仍单列。
 
 ## 制品
 

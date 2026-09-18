@@ -14,6 +14,8 @@
 | 8. 可观测与日志采集 | 优先补齐实例数量与资源分配 Metrics；结构化日志采集、Trace 上下文与导出 | 指标与权威状态/资源账本一致；真实采集、跨组件关联与采集端故障验收 |
 | 9. 日志滚动与压缩 | 按大小/时间滚动、历史文件压缩、保留数量/时长/总容量、部署配置 | 持续写入及重启下日志完整；压缩/磁盘异常可诊断；进程与Pod部署行为清晰 |
 | 10. Rust API Server 与调度命名 | Rust HTTP 服务直连 Instance RPC、删除 Go/legacy 消息链、调度 Shard 命名与配置迁移 | HTTP/SDK 契约、SSE、认证/缓存/重试、真实 RPC、发布包及基础 K8s 七组 |
+| 11. 节点本地优先创建 | API 节点轮转、共用 Admission 暂留、Master 原子 claim 与中心账本同步、同 ID 收敛 | 本地 Redis/mTLS/HTTPS、真实 sandboxd/runc/RRT 和正式 K8s 八组 |
+| 12. 内置运行环境 | 本地 EROFS 与不可变 OCI 双路径、静态 RRT、PID 1 回收、自定义镜像 bootstrap | standalone EROFS、OCI K8s 三模式；Firecracker 新入口单列验证 |
 
 阶段 1 已完成本地验收：2026-09-15，独立 Lima ARM64 KVM 节点使用真实 OCI 镜像，通过公共 SDK 完成创建、执行、暂停、Node Manager 重启、恢复和删除。恢复后内存计数器继续增加、PID 不变、二进制文件一致；Redis 记录为 Deleted 且资源释放，sandboxd 清单与 checkpoint 目录为空。122 项定向 Rust/Redis 测试、Clippy、真实 RPC 与 API Server HTTP 集成通过。详细证据见 [本地验收记录](2026-09-15-checkpoint-acceptance.md)。
 
@@ -30,9 +32,9 @@
 - 阶段6：共用 NodeProxyService 与 Node Manager 共进程接线通过157项定向测试，真实共进程 Firecracker/S3 10项验收通过，见 [进程模式](node-proxy-process-modes.md)。API Key管理的真实HTTPS/mTLS/Redis集成已通过，见 [密钥管理](api-key-management.md)。SDK命令订阅的TLS校验连接已修复，真实TLS Socket与package-v13/Lima r16复验通过；本期证书更新后重启组件生效；热重载移入后续待办。现已修复默认管理路由及部署示例接线，补齐单机安装文档；package-v18 真实HTTPS Edge密钥管理与双节点六组全部通过，示例通过真实CLI校验/渲染，见 [部署验收](2026-09-16-deployment-acceptance.md)。随后直接启动完整示例发现Sandbox API发现轮询默认值遗漏；修复后package-v22/Lima r2六项真实FC安装验收全部通过，7项配置测试及53项驱动回归通过，本地阶段6完成，见 [完整示例验收](2026-09-16-installed-example.md)。
 - 阶段7：基础 K8s 正式验收完成。[Buildkite #15](https://buildkite.com/agent-dx/agent-dx/builds/15) 在已提交的 `85d89e8` 上完成构建、镜像发布与独立 K8s 部署；SDK、认证、容量、放置、节点失联、重启和停机七组全部通过，JUnit 8项无失败/跳过，namespace清理无残留。两个Pod位于同一宿主节点；发布包、镜像与源码身份已核对，见 [正式验收记录](2026-09-16-buildkite-k8s.md)。调度修复后的[Buildkite #16](2026-09-16-buildkite-16.md)也已通过三步骤及七组用例，清理无残留。按本轮决策，FC继续本地验收，独立FC profile暂不启用。
 
-阶段10已完成：Rust API Server、Shard命名和协议拆分通过本地回归与 [Buildkite #24](2026-09-17-rust-api-server-k8s.md)；这是当前最新正式基础 K8s，七组及日志/Trace/Metrics 检查通过。
+阶段10已完成：Rust API Server、Shard命名和协议拆分通过本地回归与 [Buildkite #24](2026-09-17-rust-api-server-k8s.md)。阶段11及阶段12的 OCI K8s 部分随后由 [Buildkite #30](2026-09-18-runtime-environment-k8s.md) 完成，八组及日志/Trace/Metrics 检查通过；这是当前最新正式基础 K8s。
 
-本轮正式流水线范围（2026-09-17）：基础 Kubernetes 公共 SDK 七组验收；Firecracker 暂继续本地验收，不启用 `ADX_E2E_CHECKPOINT`。基础 K8s 通过不替代 FC 的暂停、快照与跨节点恢复证据。
+当前正式流水线范围（2026-09-18）：基础 Kubernetes 公共 SDK 八组验收，使用 OCI 运行环境；Firecracker 暂继续本地验收，不启用 `ADX_E2E_CHECKPOINT`。基础 K8s 通过不替代 FC 的暂停、快照与跨节点恢复证据。
 
 进度页的独立未完成清单见 [事项数据](control-plane-remaining.json)，包含当前剩余验收及暂缓项。
 
@@ -41,6 +43,7 @@
 | 阶段 | 具体剩余项 | 当前限制 |
 | --- | --- | --- |
 | 5 | 双克隆网络故障修复及完整FC复验；GPU/NPU真实设备、真实服务混合长稳验收 | HTTP/SDK放置约束已接线；r21/r22双克隆出现FDB错误端口学习及CONNECT超时，待修复。本机FC环境没有实际GPU/NPU卡。 |
+| 12 | 使用新的 EROFS/OCI 运行环境入口复验 Firecracker 创建与快照恢复 | 基础 K8s OCI 三模式已通过；正式 K8s FC profile 按决定暂缓，先保留本地 KVM 验收。 |
 
 ## 已登记待办
 
@@ -62,4 +65,8 @@
 ## 阶段11：节点本地优先创建
 
 已接入可配置 API 节点轮转、共用 Admission 暂留、原子 claim 与中心账本同步、同 ID 并发收敛、未知写入屏障恢复及后台重试。
-本地 Redis/mTLS/HTTPS 验证及新制品真实 sandboxd/runc/RRT 双节点8组验收均通过，包含 `local-first`，见 [端到端报告](2026-09-17-local-first-e2e.md)；正式K8s新制品验收待执行。见 [契约](atomic-instance-claim.md)。
+本地 Redis/mTLS/HTTPS 验证及新制品真实 sandboxd/runc/RRT 双节点8组验收均通过，包含 `local-first`，见 [端到端报告](2026-09-17-local-first-e2e.md)；提交 `363e44f` 的 [Buildkite #30](2026-09-18-runtime-environment-k8s.md) 已使用正式发布包完成同一八组 K8s 验收。见 [契约](atomic-instance-claim.md)。
+
+## 阶段12：内置运行环境
+
+本地 EROFS 和不可变 OCI image 两种来源已接入统一配置、Instance 持久化和 Node Manager。默认实例直接使用内置环境；自定义用户镜像只读挂载同一 bootstrap 到 `/__adx`。静态 RRT、PID 1 孤儿回收、standalone EROFS 及本地真实 runc 双节点验收已通过；Buildkite #30 使用 OCI 完成 default、runtime-only、custom 三模式及八组 K8s 验收。Firecracker 新入口与快照恢复复验仍单列，不用基础 runc K8s 结果代替。

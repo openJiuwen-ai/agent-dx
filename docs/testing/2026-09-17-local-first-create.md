@@ -40,6 +40,4 @@ Redis 测试二进制 SHA256：`9017e855ae87d02500bb3c8bab84dff77d55156e489c71b9
 
 真实 Redis、mTLS RPC 和 Rust HTTPS 进程均参与；RPC fixture 的 RuntimeBackend 使用测试实现。
 随后已完成新制品真实 sandboxd/runc/RRT 本地双节点8组验收，包含 `local-first`，见 [端到端报告](2026-09-17-local-first-e2e.md)。
-新的 Kubernetes/Buildkite 验收尚未执行，不能沿用历史 Buildkite #24 七组的成功。
-
-上述验收使用提交前工作树制品；进度页将正式K8s新制品验收保留为阶段11待办。
+上述本地验收使用提交前工作树制品，因此当时不能沿用历史 Buildkite #24 七组的成功。后续已提交并由 [Buildkite #30](2026-09-18-runtime-environment-k8s.md) 使用正式发布包完成八组 K8s 验收；阶段11的正式 K8s 门禁已关闭。

@@ -1,6 +1,6 @@
 # 管控面重构：本地测试与 Buildkite
 
-Rust API Server 重写后的正式验证：[Buildkite #24 基础 Kubernetes、Metrics、日志与 Trace 验收](2026-09-17-rust-api-server-k8s.md)。FC 按当前决策继续本地验收。
+当前正式验证：[Buildkite #30 OCI 运行环境、八组基础 Kubernetes、Metrics、日志与 Trace 验收](2026-09-18-runtime-environment-k8s.md)。它包含 Rust API Server、本地优先创建和自定义镜像 bootstrap；FC 按当前决策继续本地验收。
 
 2026-09-15。开发验证在本地执行，Buildkite 使用完整系统的端到端验收入口。统一包、两节点环境驱动器和流水线配置已落地：`build/e2e/prepare.py` 构建验收制品，`build/e2e/kubernetes/run.py` 在目标 Kubernetes 集群部署、验收、收集并清理。真实 sandboxd、本次包内 RRT 和安装后的 SDK 均参与执行。流水线复用现有 default/linux/amd64 队列、builder/packager/deployer、目标 kubeconfig 挂载与 SWR Secret，见 [Buildkite 说明](../../.buildkite/README.md)。本地通过不等于远端 Buildkite 已通过。
 
@@ -159,4 +159,4 @@ Master 存储阶段的契约与运行方法见 [Redis 持久化与恢复](master
 
 组件日志采集验收复用现有 Edge/Node Proxy 指标端点，并通过真实 OpenTelemetry Collector 接收结构化组件日志。stop 组包含后端 503、文件滚动与 Collector 重启，控制台输出 `[METRICS PASS]` / `[COLLECTION PASS]`；产物含 `gateway-metrics-node*.json`、`collection-node*.json`、`collected-logs.jsonl` 和 `collector-process.log`。部署及保证边界见 `docs/testing/log-collection.md`。Trace 已纳入采集验收，输出 `[TRACE PASS]` 并保存 `traces-node*.json` 和 `collected-traces.jsonl`；正式结果见 [Buildkite #21](2026-09-17-observability-k8s.md)。
 
-新增 `local-first` 组需要当前源码构建的新制品；历史 Buildkite #24 的七组成功不覆盖该功能。源码接线和组件证据见 [本地优先创建](atomic-instance-claim.md)。
+`local-first` 组已由当前源码构建的新制品在 Buildkite #30 通过。历史 Buildkite #24 的七组成功仍只代表当时范围；源码接线和组件证据见 [本地优先创建](atomic-instance-claim.md)，正式八组结果见 [#30 验收](2026-09-18-runtime-environment-k8s.md)。

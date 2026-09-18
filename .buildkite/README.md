@@ -176,7 +176,7 @@ The existing basic E2E result alone does not count as this profile passing.
 
 `ADX_BACKEND_ARTIFACT_BUILD` 接受 Buildkite build UUID（API 返回的 `id`），不是页面上的递增构建编号。复用制品仍需匹配 sandboxd 提交、目标架构与完整文件摘要；ADX 产品每次从当前提交构建。
 
-The basic acceptance driver now also runs an independent `local-first` case: restart API Server with `create_mode=local_first`, verify concurrent public SDK creation, real commands and deletion, require confirmed-claim evidence, then restore central mode. Earlier seven-case builds do not validate this new path.
+The basic acceptance driver also runs an independent `local-first` case: restart API Server with `create_mode=local_first`, verify concurrent public SDK creation, real commands and deletion, require confirmed-claim evidence, then restore central mode. [Buildkite #30](https://buildkite.com/agent-dx/agent-dx/builds/30) passed this eight-case gate with the OCI runtime profile; earlier seven-case builds do not validate this path.
 
 ### Local runtime payload tools
 

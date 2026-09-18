@@ -49,7 +49,7 @@ OCI 配置使用同一个 digest 引用作为默认 rootfs 和自定义镜像的
 | 请求 | 行为 |
 |---|---|
 | 不传 image | 选择的内置环境直接作为 rootfs；内置 `/__adx/usr -> /usr` 等软链接保证统一入口有效。 |
-| 指定 image | 用户镜像作为根文件系统；同一个 EROFS 或 OCI 环境只读挂载到 `/__adx`。用户镜像不需要预装 RRT。 |
+| 指定 image | 用户镜像作为根文件系统；同一个 EROFS 或 OCI 环境只读挂载到 `/__adx`。OCI 目录使用 `ro+rbind`，确保 runc 执行递归 bind 后保持只读；用户镜像不需要预装 RRT。 |
 | 仅指定 runtime | 只覆盖 runsc/runc/firecracker 选择，保留内置环境，不添加 bootstrap 挂载。 |
 
 EROFS 本身不会被修改；`rootfs.readonly=false` 表示实例获得自己的可写文件系统。执行后端支持范围仍由 sandboxd 决定。
@@ -62,4 +62,4 @@ RRT 在 Linux PID 1 场景内置进程回收：单线程启动阶段 fork 实际
 
 使用 EROFS 配置的节点必须支持从普通文件创建只读 loop 设备并实际挂载 EROFS。`/proc/filesystems` 中出现 `erofs` 只表示驱动已登记，不足以证明该内核构建和设备路径可用；对应 preflight 会对发布包内制品执行一次真实挂载和卸载。OCI 配置不要求 EROFS，仍要求 sandboxd 能访问并解析配置的 digest 引用。Buildkite K8s 验收使用 OCI 模式；本地与 standalone 验证继续覆盖 EROFS 模式。
 
-本轮真实 runc 启动、双节点 SDK 和 PID 1 回收结果见 [验证记录](../testing/2026-09-17-runtime-environment.md)。
+真实 runc 启动、双节点 SDK 和 PID 1 回收结果见 [本地验证记录](../testing/2026-09-17-runtime-environment.md)；OCI 三种模式及八组 Kubernetes 结果见 [Buildkite #30 正式验收](../testing/2026-09-18-runtime-environment-k8s.md)。

@@ -94,7 +94,7 @@ Master 将它与仍在途的 claim 串行协调。API 不把结果未知缓存�
 
 真实 Redis 的 `CLIENT PAUSE ... WRITE` 验证延迟写入/未知结果；RPC 截止时间用例验证调用被取消后仍只执行一次。
 迟到终态用例在实际后端清理后通过 Session 注入未被协调器观察的提交，不能把它当作真实网络丢包。存储层原“丢失应答”测试只是丢弃返回值。
-RPC/HTTPS fixture 中的 RuntimeBackend 是测试实现；另行完成真实 sandboxd/runc/RRT 新制品本地双节点8组验收，见 [端到端报告](2026-09-17-local-first-e2e.md)。正式K8s验收待执行。
+RPC/HTTPS fixture 中的 RuntimeBackend 是测试实现；真实 sandboxd/runc/RRT 新制品本地双节点8组验收见 [本地端到端报告](2026-09-17-local-first-e2e.md)。提交 `363e44f` 的 [Buildkite #30](2026-09-18-runtime-environment-k8s.md) 已使用正式发布包、OCI 镜像和 Kubernetes 部署完成同一八组验收。
 日志位于当前工作树 `out/ci/local-first/`。最终计数见同目录各套件 `result.json` 和测试日志。
 
 本轮最终通过计数、二进制身份与未运行范围见 [接线验证记录](2026-09-17-local-first-create.md)。

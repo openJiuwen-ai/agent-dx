@@ -42,4 +42,4 @@
 
 首轮前4组通过；local-first 冲突请求使用 `create_timeout=30`，因未给调度预算预留至少30秒而被 SDK 拒绝，尚未发到服务端。将该测试参数与同组正常创建对齐为150秒，重新准备镜像后完整8组通过；没有改变产品超时和重试行为。产品二进制与 SDK 均复用本轮新构建包。`run-1` 失败及清理证据保留。
 
-本轮是本地双 Docker 节点/runc 验收，不是 Kubernetes/Buildkite 验收，也不覆盖 Firecracker checkpoint、XPU、性能或真实网络丢包。结果未知/延迟写入及中心竞争的详细故障验证仍以 Redis/RPC 套件为证。上述验收使用提交前工作树制品；正式 K8s 新制品验收单列待办。
+本轮是本地双 Docker 节点/runc 验收，不是 Kubernetes/Buildkite 验收，也不覆盖 Firecracker checkpoint、XPU、性能或真实网络丢包。结果未知/延迟写入及中心竞争的详细故障验证仍以 Redis/RPC 套件为证。上述验收使用提交前工作树制品；后续提交 `363e44f` 的 [Buildkite #30](2026-09-18-runtime-environment-k8s.md) 已从干净源码构建并完成正式 K8s 八组验收。

@@ -20,7 +20,7 @@
     "title": "真实服务混合负载与长稳",
     "stage": "5",
     "status": "pending",
-    "detail": "52.8万请求覆盖调度模块，K8s 七组覆盖基础流程；尚未运行完整服务持续负载。",
+    "detail": "52.8万请求覆盖调度模块，Buildkite #30 K8s 八组覆盖基础流程；尚未运行完整服务持续负载。",
     "gate": "约定时长与负载，持续验证创建/执行/删除、资源回收、错误率及延迟。"
   },
   {
@@ -108,23 +108,23 @@
     "title": "Rust API Server 与调度 Shard 迁移",
     "stage": "10",
     "status": "complete",
-    "detail": "Rust API Server、Shard命名与直接Instance RPC已完成；本地回归及Buildkite #24基础K8s七组通过，发布包/镜像身份一致，日志、Trace、Metrics与清理均通过。",
+    "detail": "Rust API Server、Shard命名与直接Instance RPC已完成；本地回归及Buildkite #24基础K8s七组通过，当前Buildkite #30八组继续覆盖该链路，发布包/镜像身份一致，日志、Trace、Metrics与清理均通过。",
     "gate": "删除旧 Go/legacy 适配后，契约测试、完整回归和基础 K8s 七组验收通过。"
   },
   {
     "id": "local-first-create",
     "title": "本地优先创建：正式K8s验收",
     "stage": "11",
-    "status": "pending",
-    "detail": "组件、Redis、RPC/HTTPS及Clippy通过；当前release制品本地真实sandboxd/runc/RRT双节点8组通过，清理无残留。本地验收使用工作树release制品，正式K8s未执行。",
+    "status": "complete",
+    "detail": "组件、Redis、RPC/HTTPS及Clippy通过；真实sandboxd/runc/RRT本地双节点8组通过。提交363e44f的Buildkite #30从干净源码构建正式制品，K8s八组、原子claim、命令、删除及清理全部通过。",
     "gate": "从已提交代码构建正式制品，运行K8s基础8组（含local-first），核对唯一归属、命令、删除、claim日志与清理。"
   },
   {
     "id": "runtime-environment-acceptance",
-    "title": "本地运行环境：正式K8s与FC验证",
+    "title": "本地运行环境：FC验证",
     "stage": "12",
     "status": "pending",
-    "detail": "静态RRT、EROFS本地/自定义镜像路径、PID1回收及真实runc双节点8组通过；正式K8s与FC尚未运行，工作树修改未提交。",
-    "gate": "已提交代码构建正式制品后完成基础K8s；FC验证新入口与快照恢复，单独保留证据。"
+    "detail": "静态RRT、EROFS本地/自定义镜像路径、PID1回收及真实runc双节点8组通过；提交363e44f的Buildkite #30已使用OCI完成三种运行环境路径和K8s八组。Firecracker新入口与快照恢复尚未复验。",
+    "gate": "在本地KVM环境验证新的EROFS/OCI入口、Firecracker创建及快照恢复，单独保留证据；正式K8s FC仍暂缓。"
   }
 ]
