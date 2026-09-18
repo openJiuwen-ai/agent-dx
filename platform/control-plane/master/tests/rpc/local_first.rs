@@ -40,17 +40,28 @@ impl Rig {
         let ml = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let ma = ml.local_addr().unwrap();
         let auth = adx_master::auth::AuthRpc::new(session.clone(), local_peers());
+        let publication = adx_master::routes::RoutePublisher::new(session.clone(), local_peers());
+        publication.refresh().await.unwrap();
+        let updater = publication.clone();
         let service = rpc.clone();
-        let mut servers = Servers(vec![tokio::spawn(async move {
-            Server::builder()
-                .tls_config(server_tls("master"))
-                .unwrap()
-                .add_service(pb::master_service_server::MasterServiceServer::new(service))
-                .add_service(pb::auth_service_server::AuthServiceServer::new(auth))
-                .serve_with_incoming(TcpListenerStream::new(ml))
-                .await
-                .unwrap();
-        })]);
+        let mut servers = Servers(vec![
+            tokio::spawn(updater.run(Duration::from_millis(20))),
+            tokio::spawn(async move {
+                Server::builder()
+                    .tls_config(server_tls("master"))
+                    .unwrap()
+                    .add_service(pb::master_service_server::MasterServiceServer::new(service))
+                    .add_service(pb::auth_service_server::AuthServiceServer::new(auth))
+                    .add_service(
+                        pb::instance_directory_service_server::InstanceDirectoryServiceServer::new(
+                            publication,
+                        ),
+                    )
+                    .serve_with_incoming(TcpListenerStream::new(ml))
+                    .await
+                    .unwrap();
+            }),
+        ]);
         let mut node_rpcs = vec![];
         let mut managers = vec![];
         let mut backends = vec![];
@@ -158,6 +169,95 @@ impl Rig {
             .await
             .unwrap();
     }
+}
+
+#[tokio::test]
+#[ignore = "requires real Redis and generated mTLS certificates"]
+async fn instance_directory_streams_full_then_incremental_ownership() {
+    let mut rig = Rig::new().await;
+    let mut directory = pb::instance_directory_service_client::InstanceDirectoryServiceClient::new(
+        channel(rig.address, "api-server").await,
+    )
+    .watch_instances(pb::WatchInstancesRequest {})
+    .await
+    .unwrap()
+    .into_inner();
+    let full = directory.message().await.unwrap().unwrap();
+    assert!(full.reset);
+    assert_eq!(full.base_revision, 0);
+    assert!(full.upserts.is_empty());
+    let mut revision = full.revision;
+
+    let created = rig.nodes[0]
+        .create_local_instance(Rig::request("directory-case", 0))
+        .await
+        .unwrap()
+        .into_inner()
+        .record
+        .unwrap();
+    let upsert = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let frame = directory.message().await.unwrap().unwrap();
+            assert!(!frame.reset);
+            assert_eq!(frame.base_revision, revision);
+            revision = frame.revision;
+            if let Some(entry) = frame.upserts.iter().find(|entry| {
+                entry
+                    .record
+                    .as_ref()
+                    .and_then(|record| record.spec.as_ref())
+                    .is_some_and(|spec| spec.id == "directory-case")
+            }) {
+                break entry.clone();
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        upsert
+            .record
+            .as_ref()
+            .unwrap()
+            .assignment
+            .as_ref()
+            .unwrap()
+            .generation,
+        created.assignment.as_ref().unwrap().generation
+    );
+    assert!(!upsert.node_address.is_empty());
+    assert!(!upsert.node_proxy_address.is_empty());
+
+    rig.delete(&created).await;
+    let terminal = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let frame = directory.message().await.unwrap().unwrap();
+            assert_eq!(frame.base_revision, revision);
+            revision = frame.revision;
+            if let Some(entry) = frame.upserts.iter().find(|entry| {
+                entry
+                    .record
+                    .as_ref()
+                    .and_then(|record| record.spec.as_ref())
+                    .is_some_and(|spec| spec.id == "directory-case")
+            }) {
+                break entry.clone();
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let terminal = terminal.record.unwrap();
+    assert_eq!(terminal.state, pb::InstanceState::Deleted as i32);
+    assert!(!terminal.resources_held);
+
+    let error = pb::instance_directory_service_client::InstanceDirectoryServiceClient::new(
+        channel(rig.address, "node").await,
+    )
+    .watch_instances(pb::WatchInstancesRequest {})
+    .await
+    .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::PermissionDenied);
 }
 
 #[tokio::test]
@@ -534,7 +634,7 @@ async fn local_first_https_directory_round_robin_and_concurrent_creation() {
         "create_mode": "local_first", "ca": tls.join("ca.pem"),
         "certificate": tls.join("api-server.pem"), "private_key": tls.join("api-server.key"),
         "server_name": "localhost", "rpc_timeout_seconds": 5,
-        "cache_ttl_seconds": 30, "cache_entries": 128, "auth_cache_ttl_seconds": 1
+        "cache_entries": 128, "auth_cache_ttl_seconds": 1
     });
     let path = directory.path().join("api.json");
     std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();

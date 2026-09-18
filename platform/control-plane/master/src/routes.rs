@@ -13,6 +13,7 @@ struct View {
     revision: Option<u64>,
     available: bool,
     routes: BTreeMap<String, pb::PublishedRoute>,
+    instances: BTreeMap<String, pb::PublishedInstance>,
 }
 #[derive(Clone)]
 pub struct RoutePublisher {
@@ -20,10 +21,12 @@ pub struct RoutePublisher {
     peers: Peers,
     view: Arc<Mutex<View>>,
     changes: broadcast::Sender<pb::RouteFrame>,
+    instance_changes: broadcast::Sender<pb::InstanceDirectoryFrame>,
 }
 impl RoutePublisher {
     pub fn new(session: Session, peers: Peers) -> Self {
         let (changes, _) = broadcast::channel(64);
+        let (instance_changes, _) = broadcast::channel(64);
         Self {
             session,
             peers,
@@ -31,8 +34,10 @@ impl RoutePublisher {
                 revision: None,
                 available: false,
                 routes: BTreeMap::new(),
+                instances: BTreeMap::new(),
             })),
             changes,
+            instance_changes,
         }
     }
     pub async fn refresh(&self) -> Result<()> {
@@ -67,6 +72,19 @@ impl RoutePublisher {
                 },
             );
         }
+        let mut next_instances = BTreeMap::new();
+        for (id, instance) in &snapshot.instances {
+            let record = instance.effective_record();
+            let node = &snapshot.nodes[&instance.assignment.node_id];
+            next_instances.insert(
+                id.clone(),
+                pb::PublishedInstance {
+                    record: Some(record.try_into()?),
+                    node_address: node.address.clone(),
+                    node_proxy_address: node.proxy_address.clone(),
+                },
+            );
+        }
         let frame = pb::RouteFrame {
             epoch: self.session.epoch(),
             revision: snapshot.revision,
@@ -84,10 +102,29 @@ impl RoutePublisher {
                 .cloned()
                 .collect(),
         };
+        let instance_frame = pb::InstanceDirectoryFrame {
+            epoch: self.session.epoch(),
+            revision: snapshot.revision,
+            base_revision: view.revision.unwrap_or(0),
+            reset: false,
+            upserts: next_instances
+                .iter()
+                .filter(|(id, instance)| view.instances.get(*id) != Some(instance))
+                .map(|(_, instance)| instance.clone())
+                .collect(),
+            deleted: view
+                .instances
+                .keys()
+                .filter(|id| !next_instances.contains_key(*id))
+                .cloned()
+                .collect(),
+        };
         view.routes = next;
+        view.instances = next_instances;
         view.revision = Some(snapshot.revision);
         view.available = true;
         let _ = self.changes.send(frame);
+        let _ = self.instance_changes.send(instance_frame);
         Ok(())
     }
     pub async fn run(self, interval: Duration) {
@@ -98,6 +135,60 @@ impl RoutePublisher {
                 tracing_unavailable();
             }
         }
+    }
+}
+
+#[tonic::async_trait]
+impl pb::instance_directory_service_server::InstanceDirectoryService for RoutePublisher {
+    type WatchInstancesStream =
+        ReceiverStream<std::result::Result<pb::InstanceDirectoryFrame, Status>>;
+
+    async fn watch_instances(
+        &self,
+        request: Request<pb::WatchInstancesRequest>,
+    ) -> std::result::Result<Response<Self::WatchInstancesStream>, Status> {
+        if self.peers.authenticate(&request)? != Principal::ApiServer {
+            return Err(Status::permission_denied("API Server identity required"));
+        }
+        let view = self.view.lock().await;
+        if !view.available {
+            return Err(Status::unavailable("instance publication not ready"));
+        }
+        let mut updates = self.instance_changes.subscribe();
+        let full = pb::InstanceDirectoryFrame {
+            epoch: self.session.epoch(),
+            revision: view.revision.unwrap(),
+            base_revision: 0,
+            reset: true,
+            upserts: view.instances.values().cloned().collect(),
+            deleted: Vec::new(),
+        };
+        drop(view);
+        let (tx, rx) = mpsc::channel(8);
+        tokio::spawn(async move {
+            if tx.send(Ok(full)).await.is_err() {
+                return;
+            }
+            loop {
+                let next = tokio::select! {_=tx.closed()=>return,next=updates.recv()=>next};
+                match next {
+                    Ok(frame) => {
+                        if tx.send(Ok(frame)).await.is_err() {
+                            return;
+                        }
+                    }
+                    Err(_) => {
+                        let _ = tx
+                            .send(Err(Status::out_of_range(
+                                "instance history lost; resubscribe for full snapshot",
+                            )))
+                            .await;
+                        return;
+                    }
+                }
+            }
+        });
+        Ok(Response::new(ReceiverStream::new(rx)))
     }
 }
 fn tracing_unavailable() {

@@ -8,3 +8,4 @@ pub mod operations;
 pub mod ownership;
 
 mod directory;
+mod instance_directory;

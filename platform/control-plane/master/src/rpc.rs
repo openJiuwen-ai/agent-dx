@@ -942,19 +942,7 @@ impl pb::master_service_server::MasterService for MasterRpc {
                     .nodes
                     .get(&stored.assignment.node_id)
                     .ok_or_else(|| Status::unavailable("owner node missing"))?;
-                let record = stored.result.unwrap_or_else(|| InstanceRecord {
-                    restart_attempts: 0,
-                    restart_pending: false,
-                    runtime_id: format!("{}-{}", stored.spec.id, stored.assignment.generation),
-                    spec: stored.spec,
-                    assignment: stored.assignment,
-                    state: InstanceState::Pending,
-                    revision: 0,
-                    resources_held: true,
-                    runtime_ip: None,
-                    checkpoint: None,
-                    last_operation: None,
-                });
+                let record = stored.effective_record();
                 Ok(Response::new(pb::GetInstanceResponse {
                     record: Some(record.try_into().map_err(status)?),
                     node_address: node.address.clone(),

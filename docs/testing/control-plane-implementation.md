@@ -14,7 +14,7 @@
 | 同上 `sandboxd.rs` / `runtime_control.rs` | RuntimeBackend、Start/Stats/checkpoint/restore、RRT HTTP 准备与身份校验 | sandboxd 自行生成物理 ID；平台 Instance ID 与后端 ID 分开 |
 | 同上 `checkpoint.rs` / `checkpoint/` | 本地/S3 存储抽象、下载缓存、引用保护、过期和孤儿制品回收 | local-only 制品只在源节点可用；模板预热后置 |
 | 同上 `routes.rs` / `proxy.rs` | 本机绑定、全量同步、代理重启重放、活动接收；嵌入 NodeProxyService | `proxy_mode=embedded/standalone`；两种模式都使用同一 UDS 控制契约 |
-| `platform/control-plane/api-server` | Rust HTTPS 服务、API Key 缓存、归属缓存直达节点、生命周期和快照适配、管理员密钥接口 | [支持范围](api-server.md)；Agent 路由需要另配业务服务 |
+| `platform/control-plane/api-server` | Rust HTTPS 服务、API Key 缓存、版本化实例目录订阅、生命周期和快照适配、管理员密钥接口 | [支持范围](api-server.md)；Agent 路由需要另配业务服务 |
 | `gateway` | Edge Redis 发现与 gRPC 路由订阅、认证、转发；Node Proxy 绑定复核与数据转发 | 数据请求不进入生命周期队列；Edge 路由仅内存缓存 |
 | `platform/runtime/rrt` | 命令、文件、Shell/PTY、命令观察、HTTP 运行时协作 | 恢复时更新身份/认证、退役旧连接并重建监听 |
 | `platform/control-plane/control-cli` | Rust `adxctl`、统一 JSON 配置、supervisor、清理后停止 | 同一发布包含控制面/数据面；sandboxd 由部署环境托管 |
@@ -22,7 +22,7 @@
 
 ## 生命周期与提交
 
-创建：Master 先持久化 Assignment，再由 Node Manager 本机准入、启动 sandboxd、确认 RRT 就绪和本机绑定，最后提交 Running。普通已有实例操作从 API Server 归属缓存直达节点，无需预先向 Master 登记每次操作意图。
+创建：Master 先持久化 Assignment，再由 Node Manager 本机准入、启动 sandboxd、确认 RRT 就绪和本机绑定，最后提交 Running。Master 向 API Server 首次全量、后续增量发布保留的实例目录，包括用于幂等生命周期结果的终态记录；普通已有实例操作命中本地目录后直达节点，无需预先向 Master 登记每次操作意图。
 
 可配置 `create_mode: "local_first"`：API Server 订阅可用节点并轮转入口，Node Manager 用同一 Admission 暂留标量资源和整卡，再由 Master 验证硬约束、CAS 确认归属并同步内存账本后启动。本地不满足时保留同 ID 回退 ShardScheduler。Pack/Spread、软评分和队列公平性仅适用于中心路径；默认仍为 `central`。并发、暂留释放和结果未知契约见 [本地优先与原子归属](atomic-instance-claim.md)。
 

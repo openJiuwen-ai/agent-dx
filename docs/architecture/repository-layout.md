@@ -86,11 +86,11 @@ agent-dx/
 | Node Manager | `checkpoint.rs`、`checkpoint/` | 可扩展 CheckpointStore、本地/S3、缓存引用和远端孤儿回收 |
 | Node Manager | `journal.rs`、`reconciliation.rs` | SQLite 故障降级日志与 Master 权威目录对账 |
 | Node Manager | `resources.rs`、`routes.rs`、`activity.rs`、`proxy.rs` | 容量源/准入、绑定同步、活动采集、代理进程组合 |
-| Rust API Server | `contract.rs`、`http.rs`、`clients.rs`、`operations.rs` | HTTP 兼容字段到 Instance RPC；认证和归属缓存、入口节点轮转、直达节点、快照目录 |
+| Rust API Server | `contract.rs`、`http.rs`、`clients.rs`、`operations.rs` | HTTP 兼容字段到 Instance RPC；认证、版本化实例目录订阅、入口节点轮转、直达节点、快照目录 |
 
 `core` 不依赖 Redis/SQLite/tonic/sandboxd 客户端；`protocol` 不承载调度或状态机。Node Manager 可依赖 Gateway 的 node 库，Gateway 不依赖 Master/Node Manager 业务实现。Shard 当前与 Master 同进程。
 
-默认创建经 Global 轮转进入 Shard Filter/Score。启用 `create_mode=local_first` 时，API Server 轮转可用入口节点，Node Manager 用同一 Admission 暂留资源，Master 原子确认唯一归属并同步中心账本；本地不满足时使用同一 Instance ID 回退 Shard。已有实例操作由归属缓存直达 Node Manager。
+默认创建经 Global 轮转进入 Shard Filter/Score。启用 `create_mode=local_first` 时，API Server 轮转可用入口节点，Node Manager 用同一 Admission 暂留资源，Master 原子确认唯一归属并同步中心账本；本地不满足时使用同一 Instance ID 回退 Shard。Master 向 API Server 首次全量、后续增量发布保留的实例目录，包括用于幂等生命周期结果的终态记录；已有实例操作命中本地目录后直达 Node Manager。
 
 ## Node Manager / Node Proxy 进程组合
 
