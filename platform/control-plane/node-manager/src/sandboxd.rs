@@ -472,7 +472,15 @@ pub fn start_request(
                             e.bootstrap.r#type.clone()
                         },
                         target: e.bootstrap.target.clone(),
-                        options: vec!["ro".into()],
+                        options: if e.bootstrap.r#type == "image" {
+                            // OCI image-manager returns a mounted directory.  In an OCI
+                            // runtime spec, the bind operation is selected by the mount
+                            // options; type="bind" alone otherwise reaches runc as a
+                            // plain MS_RDONLY mount and fails with ENODEV.
+                            vec!["ro".into(), "rbind".into()]
+                        } else {
+                            vec!["ro".into()]
+                        },
                         source: Some(if e.bootstrap.r#type == "image" {
                             proto::mount::Source::ImageUrl(e.bootstrap.image.clone())
                         } else {

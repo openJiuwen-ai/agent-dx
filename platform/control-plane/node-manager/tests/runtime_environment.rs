@@ -107,7 +107,7 @@ fn custom_rootfs_mounts_the_oci_runtime_image_read_only() {
     let mount = &r.mounts[0];
     assert_eq!(mount.r#type, "bind");
     assert_eq!(mount.target, "/__adx");
-    assert_eq!(mount.options, ["ro"]);
+    assert_eq!(mount.options, ["ro", "rbind"]);
     assert_eq!(
         mount.source,
         Some(proto::mount::Source::ImageUrl(
