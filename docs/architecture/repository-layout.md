@@ -1,6 +1,6 @@
 # Agent DX 当前目录与组件边界
 
-核对日期：2026-09-17。此页描述当前源码布局；首次导入记录保留在 [迁移报告](../migration/2026-09-14-import.md)。[HTML 阅读版](repository-layout.html) 从本文件生成，架构图为仓库内 SVG。
+核对日期：2026-09-18。此页描述当前源码布局；首次导入记录保留在 [迁移报告](../migration/2026-09-14-import.md)。[HTML 阅读版](repository-layout.html) 从本文件生成，架构图为仓库内 SVG。
 
 ![当前组件与调用方向](current-architecture.svg)
 
@@ -10,7 +10,7 @@
 |---|---|---|
 | Agent 产品 `agent/` | Agent CLI、编程 SDK、会话和执行编排 | 已迁入；仍使用旧 FaaS/外部运行时。目标通过 Sandbox SDK 使用平台，业务后端迁移尚未完成 |
 | 公开能力 `platform/sdk/sandbox` | Sandbox 生命周期、命令/文件、快照、放置约束 | Python SDK 已实现；客户端保留字段与新服务端支持范围不同 |
-| 执行平台 `platform/` | 通用 Instance、调度、持久化、节点生命周期、RRT | Rust API Server 已接入控制面；本轮验证单独记录，历史基础 K8s 与本地 FC 结果分别保留 |
+| 执行平台 `platform/` | 通用 Instance、调度、持久化、节点生命周期、RRT | Rust API Server、本地优先创建及 EROFS/OCI 运行环境已接入；当前基础 K8s 八组已通过 |
 | 共享接入 `gateway/` | Edge、Node Proxy、反向代理与转发 | 独立 Rust crate、多二进制；Agent upstream 可按地址配置，业务规则仍归 Agent 层 |
 
 Agent 使用新平台的目标边界是公开 Sandbox SDK，不直接访问平台 Redis/SQLite、内部调度 RPC 或 sandboxd。当前九条 `/api/agent` 兼容路由只负责认证与转发，需要配置 `agent_address` 和真正的 Agent 业务服务；默认部署不具备旧 CLI 的 meta_service/FaaS 接口。
@@ -79,16 +79,18 @@ agent-dx/
 | 组件 | 现有主要模块 | 职责 |
 |---|---|---|
 | Master | `lib.rs`、`shard.rs`、`queue.rs`、`journal.rs` | Global 轮转、Shard 内存队列、预留、增量调度视图；租户间轮转，租户内优先级/FIFO |
-| Master | `storage.rs`、`storage/`、`rpc.rs`、`rpc/` | Redis 条件提交、目录、节点失效、快照克隆、共享恢复协调；不执行节点普通生命周期 |
+| Master | `storage.rs`、`storage/`、`rpc.rs`、`rpc/` | Redis 条件提交、原子归属、目录、节点失效、快照克隆、共享恢复协调；不执行节点普通生命周期 |
 | Master | `auth.rs`、`routes.rs`、`metrics.rs` | API Key 摘要、路由发布、集群指标 |
 | Node Manager | `controller.rs`、`controller/{lifecycle,monitor,snapshots}.rs` | 每 Instance 串行任务、暂停/恢复/删除、空闲回收与重启 |
-| Node Manager | `sandboxd.rs`、`runtime_control.rs`、`readiness.rs` | RuntimeBackend 适配；RRT HTTP 协作与就绪 |
+| Node Manager | `sandboxd.rs`、`runtime_control.rs`、`readiness.rs` | RuntimeBackend 适配；本地 EROFS／OCI image 环境；RRT HTTP 协作与就绪 |
 | Node Manager | `checkpoint.rs`、`checkpoint/` | 可扩展 CheckpointStore、本地/S3、缓存引用和远端孤儿回收 |
 | Node Manager | `journal.rs`、`reconciliation.rs` | SQLite 故障降级日志与 Master 权威目录对账 |
 | Node Manager | `resources.rs`、`routes.rs`、`activity.rs`、`proxy.rs` | 容量源/准入、绑定同步、活动采集、代理进程组合 |
-| Rust API Server | `contract.rs`、`http.rs`、`clients.rs`、`operations.rs` | HTTP 兼容字段到 Instance RPC；认证和归属缓存、直达节点、快照目录 |
+| Rust API Server | `contract.rs`、`http.rs`、`clients.rs`、`operations.rs` | HTTP 兼容字段到 Instance RPC；认证和归属缓存、入口节点轮转、直达节点、快照目录 |
 
 `core` 不依赖 Redis/SQLite/tonic/sandboxd 客户端；`protocol` 不承载调度或状态机。Node Manager 可依赖 Gateway 的 node 库，Gateway 不依赖 Master/Node Manager 业务实现。Shard 当前与 Master 同进程。
+
+默认创建经 Global 轮转进入 Shard Filter/Score。启用 `create_mode=local_first` 时，API Server 轮转可用入口节点，Node Manager 用同一 Admission 暂留资源，Master 原子确认唯一归属并同步中心账本；本地不满足时使用同一 Instance ID 回退 Shard。已有实例操作由归属缓存直达 Node Manager。
 
 ## Node Manager / Node Proxy 进程组合
 
@@ -109,9 +111,9 @@ Proxy 首次启动关闭实例准入，Node Manager 完成权威对账与全量�
 
 ## 构建、部署和验收
 
-Rust 共用根 Cargo workspace，Python 独立打包；外部 sandboxd 按其锁定版本构建。`adx` 是 Agent CLI；`adxctl` 是平台运维 CLI，支持 validate/render/run/start/status/stop。统一发布包带控制面、Gateway、RRT、Sandbox SDK 和锁定 Redis；可选择外部 Redis，sandboxd 始终由部署环境托管。RRT 需进入实例镜像。
+Rust 共用根 Cargo workspace，Python 独立打包；外部 sandboxd 按其锁定版本构建。`adx` 是 Agent CLI；`adxctl` 是平台运维 CLI，支持 validate/render/run/start/status/stop。统一发布包带控制面、Gateway、静态 RRT、Sandbox SDK、EROFS 运行环境和锁定 Redis；可选择外部 Redis，sandboxd 始终由部署环境托管。运行环境也可使用不可变 OCI image；自定义用户镜像从同一环境只读挂载 `/__adx`。
 
-普通进程与 Pod 内都使用相同组件和 supervisor。Buildkite 先构建，再发布不可变镜像，最后独立执行 K8s 七组用例及清理。Rust API Server 与 Shard 迁移已通过 [Buildkite #24](../testing/2026-09-17-rust-api-server-k8s.md) 正式验收。本地 FC 与基础 K8s 分开统计，实际未完成项和后置项见 [路线图](../testing/control-plane-roadmap.md)。
+普通进程与 Pod 内都使用相同组件和 supervisor。Buildkite 先构建，再发布不可变镜像，最后独立执行 K8s 八组用例及清理。[Buildkite #30](../testing/2026-09-18-runtime-environment-k8s.md) 已验证 Rust API Server、本地优先创建及 OCI default/runtime-only/custom 三种环境路径；两个 Pod 同宿主。本地 FC 与基础 K8s 分开统计，实际未完成项和后置项见 [路线图](../testing/control-plane-roadmap.md)。
 
 ## 可观测
 

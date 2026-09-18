@@ -1,9 +1,9 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1120 840" role="img" aria-labelledby="title desc">
-<title id="title">ADX 当前组件架构</title><desc id="desc">Agent 目标经 Sandbox SDK 接入，当前尚未迁移；控制链路经过 Rust API Server、Master 与 Node Manager，数据链路经过 Edge、Node Proxy 与 RRT。Redis 持久化与 SQLite 降级分开。</desc>
+<title id="title">ADX 当前组件架构</title><desc id="desc">Agent 目标经 Sandbox SDK 接入，当前尚未迁移；Rust API Server 支持中心调度与节点本地优先创建，Master 原子确认归属；数据链路经过 Edge、Node Proxy 与 RRT。实例运行环境同时支持本地 EROFS 与不可变 OCI image。</desc>
 <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10Z" fill="#516b83"/></marker></defs>
 <style>text{font-family:system-ui,-apple-system,'PingFang SC',sans-serif;fill:#17324d} .head{font-size:20px;font-weight:650}.body{font-size:15px}.small{font-size:13px;fill:#526b7c}.edge{fill:none;stroke:#516b83;stroke-width:2;marker-end:url(#arrow)}.box{stroke:#b7ccd9;stroke-width:1.5;rx:12}</style>
 <rect width="1120" height="840" fill="#f5f8fb" rx="18"/>
-<text x="32" y="38" class="head">Agent DX · 当前组件与调用方向</text><text x="32" y="63" class="small">2026-09-17 ｜ 实线：已接通；虚线：Agent 平台接入目标</text>
+<text x="32" y="38" class="head">Agent DX · 当前组件与调用方向</text><text x="32" y="63" class="small">2026-09-18 ｜ 实线：已接通；虚线：Agent 平台接入目标</text>
 <rect x="32" y="90" width="490" height="93" class="box" fill="#fff1db"/>
 <text x="50" y="120" class="head">Agent CLI / SDK / Executor</text>
 <text x="50" y="146" class="body">仍依赖旧 FaaS / 外部运行时，平台接入尚未完成</text>
@@ -19,13 +19,13 @@
 <text x="885" y="208" class="small">HTTPS</text>
 <rect x="32" y="226" width="426" height="82" class="box" fill="#e8f0fc"/>
 <text x="50" y="256" class="head">Rust API Server</text>
-<text x="50" y="282" class="body">HTTP 适配、身份和归属缓存</text>
+<text x="50" y="282" class="body">HTTP 适配、身份、归属缓存与入口轮转</text>
 <path d="M654 260H462" class="edge"/>
 <text x="487" y="250" class="small">生命周期 HTTP</text>
 <rect x="32" y="354" width="426" height="108" class="box" fill="#e6f4ef"/>
 <text x="50" y="384" class="head">Master · 单进程</text>
 <text x="50" y="410" class="body">Global 轮转 → Shard Filter / Score</text>
-<text x="50" y="433" class="body">目录、认证、节点失效与恢复协调</text>
+<text x="50" y="433" class="body">目录、原子归属、节点失效与恢复协调</text>
 <path d="M160 308V350" class="edge"/>
 <text x="172" y="335" class="small">创建 / 查询</text>
 <rect x="540" y="354" width="220" height="108" class="box" fill="#fff"/>
@@ -38,12 +38,13 @@
 <text x="443" y="322" class="small">已提交路由 gRPC</text>
 <rect x="32" y="534" width="426" height="116" class="box" fill="#e6f4ef"/>
 <text x="50" y="564" class="head">Node Manager</text>
-<text x="50" y="590" class="body">Local 准入 / 每 Instance 串行状态机</text>
+<text x="50" y="590" class="body">Local 准入 / 原子 claim / 每 Instance 串行状态机</text>
 <text x="50" y="613" class="body">资源采集 / RuntimeBackend / 制品存储</text>
-<path d="M100 462V530" class="edge" marker-start="url(#arrow)"/>
-<text x="113" y="510" class="small">分配 ↓ / 结果提交 ↑</text>
+<path d="M210 462V530" class="edge" marker-start="url(#arrow)"/>
+<text x="223" y="510" class="small">分配 ↓ / 结果提交 ↑</text>
 <path d="M70 308H16V592H28" class="edge"/>
-<text x="32" y="526" class="small">已有实例直达</text>
+<text x="32" y="500" class="small">已有实例直达</text>
+<text x="32" y="520" class="small">本地优先创建入口</text>
 <rect x="654" y="534" width="432" height="116" class="box" fill="#e8f0fc"/>
 <text x="672" y="564" class="head">Node Proxy</text>
 <text x="672" y="590" class="body">本机绑定复核 / 数据转发 / 活动上报</text>
@@ -55,12 +56,14 @@
 <rect x="32" y="698" width="215" height="95" class="box" fill="#fff"/>
 <text x="50" y="728" class="head">sandboxd</text>
 <text x="50" y="754" class="body">外部托管执行后端</text>
+<text x="50" y="777" class="small">本地 EROFS / OCI image</text>
 <rect x="277" y="698" width="300" height="95" class="box" fill="#fff"/>
 <text x="295" y="728" class="head">SQLite / 本地 / S3</text>
 <text x="295" y="754" class="body">降级日志 / checkpoint 制品</text>
 <rect x="654" y="698" width="432" height="95" class="box" fill="#e8f0fc"/>
 <text x="672" y="728" class="head">RRT · Instance 内</text>
 <text x="672" y="754" class="body">命令 / 文件 / HTTP 恢复协作</text>
+<text x="672" y="777" class="small">静态 RRT · PID 1 孤儿回收</text>
 <path d="M136 650V694" class="edge"/>
 <text x="146" y="678" class="small">后端 RPC</text>
 <path d="M393 650V694" class="edge"/>
@@ -69,4 +72,4 @@
 <text x="883" y="678" class="small">HTTP 数据</text>
 <path d="M458 624H617V742H650" class="edge"/>
 <text x="464" y="615" class="small">RRT HTTP 控制</text>
-<text x="32" y="822" class="small">各组件导出 Metrics / Trace / 日志；部署环境运行 Collector。数据请求不经过 Instance 生命周期队列。</text></svg>
+<text x="32" y="822" class="small">Buildkite #30：OCI 三模式 + K8s 八组通过；standalone 保留 EROFS。数据请求不经过 Instance 生命周期队列。</text></svg>
