@@ -19,7 +19,7 @@
 
 ## 本次修订
 
-- 更新当前架构 SVG 及目录 HTML，补充本地优先创建、Master 原子归属、EROFS／OCI 双运行环境与 Buildkite #30 验收边界。
+- 当前架构 SVG 沿用最初版式，仅将 Go Sandbox API／Domain 命名更新为 Rust API Server／Shard；本地优先创建和 EROFS／OCI 等实现细节保留在目录正文。
 - 根中英文 README、Buildkite 和 Kubernetes E2E 指南更新到 #30、八组及 OCI worker 前置条件。
 - 运行环境部署说明补齐 EROFS/OCI 双路径和 OCI 递归只读 bind 语义。
 - 新增 #30 的提交、制品 digest、三种运行环境、八组用例、清理和部署边界记录。
