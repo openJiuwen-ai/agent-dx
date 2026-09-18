@@ -41,8 +41,9 @@ Local Docker reproduction requires access to the same bind-mounted paths as the 
 
 ## Assertions
 
-- `sdk`: Linux release packages first verify the built-in local rootfs, runtime-only
-  override and a plain custom image with the read-only RRT bootstrap mount. Then
+- `sdk`: Linux release packages first verify the configured EROFS or OCI runtime,
+  runtime-only override and a plain custom image with the read-only RRT bootstrap
+  mount. The Kubernetes profile uses OCI; local process acceptance uses EROFS. Then
   two real instances across two nodes verify query, stdout/stderr/exit code,
   binary file round-trip, explicit deletion, Redis terminal state and released
   resources, and empty sandboxd inventories.

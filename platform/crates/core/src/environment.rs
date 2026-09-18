@@ -19,7 +19,10 @@ pub struct RuntimeEnvironment {
 pub struct Rootfs {
     pub runtime: String,
     pub r#type: String,
+    #[serde(default)]
     pub path: String,
+    #[serde(default)]
+    pub image: String,
     #[serde(default)]
     pub readonly: bool,
 }
@@ -27,7 +30,10 @@ pub struct Rootfs {
 #[serde(deny_unknown_fields)]
 pub struct Bootstrap {
     pub r#type: String,
+    #[serde(default)]
     pub root: String,
+    #[serde(default)]
+    pub image: String,
     pub target: String,
     pub entrypoint: Vec<String>,
 }
@@ -41,11 +47,25 @@ fn absolute(value: &str) -> bool {
 }
 impl RuntimeEnvironment {
     pub fn validate(&self) -> Result<()> {
-        if self.rootfs.r#type != "local"
-            || self.bootstrap.r#type != "erofs"
+        let rootfs_source = match self.rootfs.r#type.as_str() {
+            "local" => absolute(&self.rootfs.path) && self.rootfs.image.is_empty(),
+            "image" => self.rootfs.path.is_empty() && valid_image(&self.rootfs.image),
+            _ => false,
+        };
+        let bootstrap_source = match self.bootstrap.r#type.as_str() {
+            "erofs" => absolute(&self.bootstrap.root) && self.bootstrap.image.is_empty(),
+            "image" => self.bootstrap.root.is_empty() && valid_image(&self.bootstrap.image),
+            _ => false,
+        };
+        let matching_sources = match (self.rootfs.r#type.as_str(), self.bootstrap.r#type.as_str()) {
+            ("local", "erofs") => self.rootfs.path == self.bootstrap.root,
+            ("image", "image") => self.rootfs.image == self.bootstrap.image,
+            _ => false,
+        };
+        if !rootfs_source
+            || !bootstrap_source
+            || !matching_sources
             || self.rootfs.runtime.trim().is_empty()
-            || !absolute(&self.rootfs.path)
-            || !absolute(&self.bootstrap.root)
             || !absolute(&self.bootstrap.target)
             || self
                 .bootstrap
@@ -58,8 +78,21 @@ impl RuntimeEnvironment {
                 .iter()
                 .any(|(k, v)| k.is_empty() || k.contains(['=', '\0']) || v.contains('\0'))
         {
-            return Err(Error::Invalid("runtime environment requires local rootfs, EROFS bootstrap, absolute paths and an entrypoint beneath its mount target".into()));
+            return Err(Error::Invalid("runtime environment requires one matching local/EROFS or OCI image source, an absolute target and an entrypoint beneath it".into()));
         }
         Ok(())
     }
+}
+
+fn valid_image(value: &str) -> bool {
+    let value = value.trim();
+    let Some((repository, digest)) = value.rsplit_once("@sha256:") else {
+        return false;
+    };
+    !repository.is_empty()
+        && !repository.chars().any(char::is_whitespace)
+        && digest.len() == 64
+        && digest
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }

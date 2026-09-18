@@ -37,6 +37,8 @@ SDK 组额外验证默认环境、仅覆盖 runtime、自定义镜像三条路�
 
 该结果说明现有 K8s worker 不满足此运行环境的验收前置条件；它不是正式 K8s 功能验收通过记录。完整日志与探针记录保存在 `out/ci/runtime-environment/buildkite/` 和 `out/ci/runtime-environment/preflight/`。
 
+后续实现保留这条 EROFS 部署路径，同时增加 OCI 内置环境。Buildkite K8s 验收改用本次构建生成并以 digest 发布的 OCI RRT image：默认实例以它作为 rootfs，自定义用户镜像时通过 sandboxd 的 OCI image mount 挂入 `/__adx`。该变更的正式通过情况以新的 Buildkite 记录为准，不修改上述历史失败结论。
+
 ## 制品
 
 `package/manifest.json` 记录全部文件摘要，其中：

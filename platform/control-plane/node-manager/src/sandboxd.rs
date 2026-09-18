@@ -74,7 +74,12 @@ impl Sandboxd {
         }
         if let Some(e) = &config.runtime_environment {
             e.validate()?;
-            for path in [&e.rootfs.path, &e.bootstrap.root] {
+            let paths = if e.rootfs.r#type == "local" {
+                vec![&e.rootfs.path, &e.bootstrap.root]
+            } else {
+                vec![]
+            };
+            for path in paths {
                 let metadata = std::fs::metadata(path)
                     .map_err(|error| Error::Invalid(format!("runtime artifact {path}: {error}")))?;
                 if !metadata.is_file() {
@@ -431,11 +436,22 @@ pub fn start_request(
         runtime: spec.runtime.clone(),
         rootfs: Some(
             if let Some(e) = environment.filter(|_| spec.image.is_empty()) {
-                proto::RootfsConfig {
-                    readonly: e.rootfs.readonly,
-                    r#type: proto::RootfsSrcType::Local as i32,
-                    source: Some(proto::rootfs_config::Source::Path(e.rootfs.path.clone())),
-                    writable_layer_size_bytes: 0,
+                if e.rootfs.r#type == "image" {
+                    proto::RootfsConfig {
+                        readonly: e.rootfs.readonly,
+                        r#type: proto::RootfsSrcType::Image as i32,
+                        source: Some(proto::rootfs_config::Source::ImageUrl(
+                            e.rootfs.image.clone(),
+                        )),
+                        writable_layer_size_bytes: 0,
+                    }
+                } else {
+                    proto::RootfsConfig {
+                        readonly: e.rootfs.readonly,
+                        r#type: proto::RootfsSrcType::Local as i32,
+                        source: Some(proto::rootfs_config::Source::Path(e.rootfs.path.clone())),
+                        writable_layer_size_bytes: 0,
+                    }
                 }
             } else {
                 proto::RootfsConfig {
@@ -450,10 +466,18 @@ pub fn start_request(
             environment
                 .map(|e| {
                     vec![proto::Mount {
-                        r#type: e.bootstrap.r#type.clone(),
+                        r#type: if e.bootstrap.r#type == "image" {
+                            "bind".into()
+                        } else {
+                            e.bootstrap.r#type.clone()
+                        },
                         target: e.bootstrap.target.clone(),
                         options: vec!["ro".into()],
-                        source: Some(proto::mount::Source::HostPath(e.bootstrap.root.clone())),
+                        source: Some(if e.bootstrap.r#type == "image" {
+                            proto::mount::Source::ImageUrl(e.bootstrap.image.clone())
+                        } else {
+                            proto::mount::Source::HostPath(e.bootstrap.root.clone())
+                        }),
                     }]
                 })
                 .unwrap_or_default()

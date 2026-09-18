@@ -11,12 +11,14 @@ impl From<RuntimeEnvironment> for pb::RuntimeEnvironment {
                 r#type: v.rootfs.r#type,
                 path: v.rootfs.path,
                 readonly: v.rootfs.readonly,
+                image: v.rootfs.image,
             }),
             bootstrap: Some(pb::RuntimeBootstrap {
                 r#type: v.bootstrap.r#type,
                 root: v.bootstrap.root,
                 target: v.bootstrap.target,
                 entrypoint: v.bootstrap.entrypoint,
+                image: v.bootstrap.image,
             }),
             env: v.env.into_iter().collect(),
         }
@@ -36,11 +38,13 @@ impl TryFrom<pb::RuntimeEnvironment> for RuntimeEnvironment {
                 runtime: r.runtime,
                 r#type: r.r#type,
                 path: r.path,
+                image: r.image,
                 readonly: r.readonly,
             },
             bootstrap: Bootstrap {
                 r#type: b.r#type,
                 root: b.root,
+                image: b.image,
                 target: b.target,
                 entrypoint: b.entrypoint,
             },

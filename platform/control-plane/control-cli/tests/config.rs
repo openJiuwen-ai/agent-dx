@@ -182,3 +182,24 @@ fn common_environment_is_rendered_to_node_and_api() {
         assert_eq!(Some(actual), d.runtime_environment);
     }
 }
+
+#[test]
+fn common_oci_environment_is_rendered_to_node_and_api() {
+    let root = tempfile::tempdir().unwrap();
+    let image = "registry.local/adx-runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let env = json!({"rootfs":{"runtime":"runc","type":"image","image":image,"readonly":false},
+       "bootstrap":{"type":"image","image":image,"target":"/__adx","entrypoint":["/__adx/usr/local/bin/rrt-runtime"]}});
+    let mut d = config(root.path());
+    d.runtime_environment = Some(serde_json::from_value(env).unwrap());
+    d.services
+        .push(serde_json::from_value(json!({"id":"api","role":"api-server","config":{}})).unwrap());
+    let dir = root.path().join("oci-env-config");
+    d.render(&dir).unwrap();
+    for role in ["node", "api"] {
+        let c: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join(format!("{role}.json"))).unwrap())
+                .unwrap();
+        assert_eq!(c["runtime_environment"]["rootfs"]["image"], image);
+        assert_eq!(c["runtime_environment"]["bootstrap"]["image"], image);
+    }
+}

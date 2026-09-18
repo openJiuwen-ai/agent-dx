@@ -1,5 +1,22 @@
 use adx_core::{Assignment, InstanceRecord, InstanceSpec, InstanceState, Resources};
 use adx_protocol::control;
+
+#[test]
+fn runtime_environment_roundtrip_preserves_oci_source() {
+    let environment: adx_core::environment::RuntimeEnvironment =
+        serde_json::from_value(serde_json::json!({
+            "rootfs": {"runtime": "runc", "type": "image", "image": "registry/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+            "bootstrap": {"type": "image", "image": "registry/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "target": "/__adx", "entrypoint": ["/__adx/usr/local/bin/rrt-runtime"]}
+        }))
+        .unwrap();
+    environment.validate().unwrap();
+    let wire: control::RuntimeEnvironment = environment.clone().into();
+    assert_eq!(
+        adx_core::environment::RuntimeEnvironment::try_from(wire).unwrap(),
+        environment
+    );
+}
+
 #[test]
 fn record_roundtrip_preserves_identity_state_and_ownership() {
     let spec = InstanceSpec {

@@ -10,6 +10,14 @@ fn environment() -> RuntimeEnvironment {
         "env":{"PLATFORM_VALUE":"configured"}
     })).unwrap()
 }
+fn image_environment() -> RuntimeEnvironment {
+    serde_json::from_value(json!({
+        "rootfs":{"runtime":"runc","type":"image","image":"registry.local/adx-runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","readonly":false},
+        "bootstrap":{"type":"image","image":"registry.local/adx-runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","target":"/__adx",
+            "entrypoint":["/__adx/usr/local/bin/rrt-runtime"]},
+        "env":{"PLATFORM_VALUE":"configured"}
+    })).unwrap()
+}
 fn spec(image: &str) -> InstanceSpec {
     serde_json::from_value(
         json!({"id":"i","tenant_id":"t","image":image,"runtime":"runc",
@@ -63,6 +71,49 @@ fn custom_image_mounts_the_same_local_environment_read_only() {
         Some(proto::mount::Source::HostPath(environment().bootstrap.root))
     );
     assert_eq!(r.envs["PLATFORM_VALUE"], "configured");
+}
+
+#[test]
+fn default_rootfs_uses_the_configured_oci_runtime_image() {
+    let config = Config {
+        runtime_environment: Some(image_environment()),
+        ..Default::default()
+    };
+    let mut wanted = spec("");
+    wanted.runtime_environment = Some(image_environment());
+    let r = start_request(&wanted, "i-1", 1, &[], &config).unwrap();
+    let root = r.rootfs.unwrap();
+    assert_eq!(root.r#type, proto::RootfsSrcType::Image as i32);
+    assert_eq!(
+        root.source,
+        Some(proto::rootfs_config::Source::ImageUrl(
+            image_environment().rootfs.image
+        ))
+    );
+    assert!(r.mounts.is_empty());
+    assert_eq!(r.command, image_environment().bootstrap.entrypoint);
+}
+
+#[test]
+fn custom_rootfs_mounts_the_oci_runtime_image_read_only() {
+    let config = Config {
+        runtime_environment: Some(image_environment()),
+        ..Default::default()
+    };
+    let mut wanted = spec("ubuntu:24.04");
+    wanted.runtime_environment = Some(image_environment());
+    let r = start_request(&wanted, "i-1", 1, &[], &config).unwrap();
+    assert_eq!(r.mounts.len(), 1);
+    let mount = &r.mounts[0];
+    assert_eq!(mount.r#type, "bind");
+    assert_eq!(mount.target, "/__adx");
+    assert_eq!(mount.options, ["ro"]);
+    assert_eq!(
+        mount.source,
+        Some(proto::mount::Source::ImageUrl(
+            image_environment().bootstrap.image
+        ))
+    );
 }
 
 #[test]

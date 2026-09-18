@@ -40,7 +40,7 @@ def identity(bundle, registry, commit=None, ci=False):
     return m, r
 
 
-def credentials(directory, image):
+def credentials(directory, image, runtime_image):
     subprocess.run([sys.executable, str(ROOT / 'build/ci/rpc_certificates.py'), str(directory / 'tls')], check=True)
     tls = directory / 'tls'
     def openssl(*args):
@@ -57,10 +57,11 @@ def credentials(directory, image):
         path.write_text(secrets.token_hex(32))
         path.chmod(0o600)
     (directory / 'image').write_text(image)
+    (directory / 'runtime-image').write_text(runtime_image)
     data = {p.name: base64.b64encode(p.read_bytes()).decode() for p in tls.iterdir()
             if p.suffix in ('.pem', '.key', '.der') and p.name != 'ca.key'}
     data.update({name: base64.b64encode((directory / name).read_bytes()).decode()
-                 for name in ('api-key', 'other-key', 'admin-key', 'redis-key', 'image')})
+                 for name in ('api-key', 'other-key', 'admin-key', 'redis-key', 'image', 'runtime-image')})
     return data
 
 
@@ -129,9 +130,10 @@ class KubernetesRun(common.Run):
         print('Kubernetes placement: ' + json.dumps(placement), flush=True)
         edge_pod = next(p for p in pods if p['metadata']['name'] == 'node1')
         edge_ip = str(ipaddress.ip_address(edge_pod['status']['podIP']))
-        self.event('[DEPLOY] Checking EROFS and bridge netfilter prerequisites')
+        self.event('[DEPLOY] Checking OCI runtime and bridge netfilter prerequisites')
         for node in self.nodes:
-            self.execute(node, 'python3', '-u', '/opt/adx/e2e/preflight.py')
+            self.execute(node, 'python3', '-u', '/opt/adx/e2e/preflight.py',
+                         '--runtime-source', 'image')
         self.event('[DEPLOY] Configuring nodes and starting sandboxd')
         for node in self.nodes:
             self.execute(node, 'env', 'ADX_E2E_EDGE_IP=' + edge_ip,
@@ -238,7 +240,10 @@ def main():
             m, published = identity(a.bundle, a.registry_images, os.getenv('BUILDKITE_COMMIT'), bool(os.getenv('BUILDKITE')))
             (output / 'bundle.json').write_text(json.dumps(m, indent=2))
             (output / 'registry-images.json').write_text(json.dumps(published, indent=2))
-            data = credentials(Path(private), published['references']['rrt'])
+            user_image = m['base_images']['rrt']
+            if not re.fullmatch(r'[^\s]+@sha256:[0-9a-f]{64}', user_image):
+                raise ValueError('immutable custom user image required')
+            data = credentials(Path(private), user_image, published['references']['rrt'])
             run.deploy(m, published['references'], data, a.registry_auth, a.node_name)
             run.scenarios(checks)
         except Exception as e:

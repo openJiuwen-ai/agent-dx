@@ -49,7 +49,7 @@ See [migration status](docs/migration/2026-09-14-import.md), [source pins](docs/
 ## Instance lifecycle and deployment
 
 - [Single-host installation, certificates and CLI](docs/deployment/standalone.md)
-- [Local runtime rootfs and custom-image bootstrap](docs/deployment/runtime-environment.md)
+- [EROFS/OCI runtime environment and custom-image bootstrap](docs/deployment/runtime-environment.md)
 - [CLI and unified process deployment](docs/testing/process-deployment.md)
 - [Node lifecycle, resource collection and SQLite outage contract](docs/testing/node-lifecycle.md)
 - [Checkpoint storage, S3 and snapshot catalog](docs/testing/snapshot-storage.md)

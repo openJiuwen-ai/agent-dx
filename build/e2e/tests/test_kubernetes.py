@@ -115,7 +115,8 @@ class KubernetesLifecycleTests(unittest.TestCase):
     def test_generated_credentials_cover_every_projected_secret_file(self):
         import base64,tempfile
         with tempfile.TemporaryDirectory() as d:
-            data=self.module.credentials(Path(d),'registry.example/rrt@sha256:'+'b'*64)
+            data=self.module.credentials(Path(d),'registry.example/user@sha256:'+'b'*64,
+                                         'registry.example/rrt@sha256:'+'c'*64)
             objects=k8s.resources('adx-e2e-test','registry.example/node@sha256:'+'a'*64,'amd64')
             pod=next(o for o in objects if o['kind']=='Pod')
             secret=next(v['secret'] for v in pod['spec']['volumes'] if v['name']=='credentials')
@@ -124,7 +125,8 @@ class KubernetesLifecycleTests(unittest.TestCase):
             self.assertNotIn('ca.key',data)
             self.assertNotEqual(data['admin-key'],data['api-key'])
             self.assertNotIn('ca.key',data)
-            self.assertEqual(base64.b64decode(data['image']).decode(),'registry.example/rrt@sha256:'+'b'*64)
+            self.assertEqual(base64.b64decode(data['image']).decode(),'registry.example/user@sha256:'+'b'*64)
+            self.assertEqual(base64.b64decode(data['runtime-image']).decode(),'registry.example/rrt@sha256:'+'c'*64)
 
 class HostPrerequisiteTests(unittest.TestCase):
     def test_missing_kernel_capabilities_fail_before_services_start(self):
@@ -160,3 +162,15 @@ class HostPrerequisiteTests(unittest.TestCase):
                 raise OSError('mount returned operation not supported')
             with self.assertRaisesRegex(RuntimeError,'erofs_mount.*operation not supported'):
                 check(proc,mount_probe=unsupported)
+
+    def test_oci_runtime_does_not_require_erofs(self):
+        import tempfile
+        from preflight import check
+        with tempfile.TemporaryDirectory() as d:
+            proc=Path(d)
+            (proc/'filesystems').write_text('nodev\ttmpfs\n')
+            bridge=proc/'sys/net/bridge/bridge-nf-call-iptables'
+            bridge.parent.mkdir(parents=True)
+            bridge.write_text('1\n')
+            self.assertEqual(check(proc,runtime_source='image'),
+                             {'bridge_netfilter':True})

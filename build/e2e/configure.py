@@ -96,7 +96,17 @@ for service in services:
  service.setdefault('env',{}).update({'ADX_LOG_FORMAT':'json','ADX_TRACE_ENABLED':'true','OTEL_EXPORTER_OTLP_TRACES_ENDPOINT':'http://127.0.0.1:14317/v1/traces','OTEL_BSP_SCHEDULE_DELAY':'200'})
 d={'schema_version':1,'logging':{'enabled':True,'max_file_bytes':4096,'rotate_seconds':1,'compress':True,'line_records':True,'max_record_bytes':65536,'compress_after_seconds':15,'max_files':100,'max_age_seconds':3600,'max_total_bytes':1048576},'package_dir':str(BASE/'package'),'state_dir':str(P/'state'),'redis_url':f'redis://:{redis_key.read_text().strip()}@master:6379/','namespace':'acceptance','restart_limit':3,'restart_delay_ms':1000,'stop_timeout_seconds':30,'services':services}
 runtime_artifact=BASE/'package/runtime/adx-runtime-rootfs.img'
-if runtime_artifact.is_file():
+runtime_image=PRIVATE/'runtime-image'
+if os.getenv('ADX_E2E_KUBERNETES'):
+ if not runtime_image.is_file(): raise RuntimeError('Kubernetes OCI runtime image is missing')
+ image=runtime_image.read_text().strip()
+ if '@sha256:' not in image: raise RuntimeError('Kubernetes OCI runtime image must be digest pinned')
+ d['runtime_environment']={
+  'rootfs':{'runtime':'runc','type':'image','image':image,'readonly':False},
+  'bootstrap':{'type':'image','image':image,'target':'/__adx',
+    'entrypoint':['/__adx/usr/local/bin/rrt-runtime']},
+  'env':{'PATH':'/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'}}
+elif runtime_artifact.is_file():
  d['runtime_environment']={
   'rootfs':{'runtime':'runc','type':'local','path':str(runtime_artifact),'readonly':False},
   'bootstrap':{'type':'erofs','root':str(runtime_artifact),'target':'/__adx',
