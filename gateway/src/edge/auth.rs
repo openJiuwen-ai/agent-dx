@@ -122,6 +122,18 @@ impl EdgeAuthenticator {
         request: &Request<B>,
         required: bool,
     ) -> Result<AuthenticatedIdentity, AuthError> {
+        if let Some(identity) = request.extensions().get::<AuthenticatedIdentity>() {
+            if identity
+                .expires_at_unix
+                .is_some_and(|expires| now_unix_seconds() > expires)
+            {
+                return Err(AuthError::Expired);
+            }
+            if required && identity.tenant_id.is_empty() {
+                return Err(AuthError::Missing);
+            }
+            return Ok(identity.clone());
+        }
         if !self.required {
             return Ok(AuthenticatedIdentity {
                 tenant_id: String::new(),

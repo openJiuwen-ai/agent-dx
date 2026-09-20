@@ -163,47 +163,73 @@ impl BackendHttpPool {
         Fut: Future<Output = io::Result<T>>,
         T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        let endpoint = self.inner.endpoint(&key);
-        let permit = timeout(
-            self.inner.config.acquire_timeout,
-            endpoint.permits.clone().acquire_owned(),
-        )
-        .await
-        .map_err(|_| {
-            self.inner
-                .acquire_timeouts_total
-                .fetch_add(1, Ordering::Relaxed);
-            BackendHttpPoolError::Saturated
-        })?
-        .map_err(|_| BackendHttpPoolError::Closed)?;
+        self.send_recoverable(key, request, open)
+            .await
+            .map_err(|(error, _)| error)
+    }
 
-        let mut sender = loop {
-            let Some(mut idle) = self.inner.take_idle(&endpoint) else {
-                let stream = open().await.map_err(BackendHttpPoolError::Connect)?;
-                let (sender, connection) =
-                    hyper::client::conn::http1::handshake(TokioIo::new(stream))
-                        .await
-                        .map_err(BackendHttpPoolError::Handshake)?;
-                self.inner.opened_total.fetch_add(1, Ordering::Relaxed);
-                tokio::spawn(async move {
-                    if let Err(error) = connection.await {
-                        tracing::debug!(%error, "pooled sandbox HTTP connection closed");
-                    }
-                });
-                break sender;
+    /// Return ownership only if no business request has been sent. Callers may safely re-resolve
+    /// a target in that case, but may never replay an ambiguous send_request failure.
+    pub async fn send_recoverable<F, Fut, T>(
+        &self,
+        key: BackendHttpPoolKey,
+        request: Request<Incoming>,
+        open: F,
+    ) -> Result<Response<PooledResponseBody>, (BackendHttpPoolError, Option<Request<Incoming>>)>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = io::Result<T>>,
+        T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let prepared = async {
+            let endpoint = self.inner.endpoint(&key);
+            let permit = timeout(
+                self.inner.config.acquire_timeout,
+                endpoint.permits.clone().acquire_owned(),
+            )
+            .await
+            .map_err(|_| {
+                self.inner
+                    .acquire_timeouts_total
+                    .fetch_add(1, Ordering::Relaxed);
+                BackendHttpPoolError::Saturated
+            })?
+            .map_err(|_| BackendHttpPoolError::Closed)?;
+
+            let sender = loop {
+                let Some(mut idle) = self.inner.take_idle(&endpoint) else {
+                    let stream = open().await.map_err(BackendHttpPoolError::Connect)?;
+                    let (sender, connection) =
+                        hyper::client::conn::http1::handshake(TokioIo::new(stream))
+                            .await
+                            .map_err(BackendHttpPoolError::Handshake)?;
+                    self.inner.opened_total.fetch_add(1, Ordering::Relaxed);
+                    tokio::spawn(async move {
+                        if let Err(error) = connection.await {
+                            tracing::debug!(%error, "pooled sandbox HTTP connection closed");
+                        }
+                    });
+                    break sender;
+                };
+                if idle.sender.ready().await.is_ok() {
+                    self.inner.reused_total.fetch_add(1, Ordering::Relaxed);
+                    break idle.sender;
+                }
+                self.inner.discarded_total.fetch_add(1, Ordering::Relaxed);
             };
-            if idle.sender.ready().await.is_ok() {
-                self.inner.reused_total.fetch_add(1, Ordering::Relaxed);
-                break idle.sender;
-            }
-            self.inner.discarded_total.fetch_add(1, Ordering::Relaxed);
-        };
 
+            Ok::<_, BackendHttpPoolError>((sender, endpoint, permit))
+        }
+        .await;
+        let (mut sender, endpoint, permit) = match prepared {
+            Ok(value) => value,
+            Err(error) => return Err((error, Some(request))),
+        };
         let request_allows_reuse = !has_connection_close(request.headers());
         let response = sender
             .send_request(request)
             .await
-            .map_err(BackendHttpPoolError::Request)?;
+            .map_err(|error| (BackendHttpPoolError::Request(error), None))?;
         let response_allows_reuse = !has_connection_close(response.headers());
         let reusable = request_allows_reuse && response_allows_reuse;
         let lease = ConnectionLease {
@@ -425,4 +451,108 @@ fn has_connection_close(headers: &http::HeaderMap) -> bool {
         .filter_map(|value| value.to_str().ok())
         .flat_map(|value| value.split(','))
         .any(|token| token.trim().eq_ignore_ascii_case("close"))
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+    use http_body_util::{BodyExt, Full};
+    use hyper::service::service_fn;
+    use std::convert::Infallible;
+    use tokio::io::AsyncReadExt;
+
+    async fn exercise(fail_before_send: bool) {
+        let pool = BackendHttpPool::new(BackendHttpPoolConfig::default());
+        let (front, incoming) = tokio::io::duplex(8192);
+        let task = tokio::spawn(async move {
+            hyper::server::conn::http1::Builder::new()
+                .serve_connection(
+                    TokioIo::new(incoming),
+                    service_fn(move |request| {
+                        let pool = pool.clone();
+                        async move {
+                            let key = BackendHttpPoolKey {
+                                node_proxy_address: "unused".into(),
+                                instance_id: "instance".into(),
+                                workload_id: "workload".into(),
+                                target_ip: "127.0.0.1".parse().unwrap(),
+                                target_port: 8080,
+                            };
+                            let (stream, mut peer) = tokio::io::duplex(8192);
+                            let received = tokio::spawn(async move {
+                                if fail_before_send {
+                                    return Vec::new();
+                                }
+                                let mut all = Vec::new();
+                                let mut chunk = [0u8; 512];
+                                while !all
+                                    .windows(b"one-business-body".len())
+                                    .any(|w| w == b"one-business-body")
+                                {
+                                    let n = peer.read(&mut chunk).await.unwrap();
+                                    assert!(n > 0);
+                                    all.extend_from_slice(&chunk[..n]);
+                                }
+                                // Drop after consuming the body, simulating a lost response.
+                                all
+                            });
+                            let result = pool
+                                .send_recoverable(key, request, || async move {
+                                    if fail_before_send {
+                                        Err(io::Error::other("connect failed"))
+                                    } else {
+                                        Ok(stream)
+                                    }
+                                })
+                                .await;
+                            match result {
+                                Err((BackendHttpPoolError::Connect(_), Some(request)))
+                                    if fail_before_send =>
+                                {
+                                    assert_eq!(
+                                        request.into_body().collect().await.unwrap().to_bytes(),
+                                        Bytes::from_static(b"one-business-body")
+                                    );
+                                }
+                                Err((BackendHttpPoolError::Request(_), None))
+                                    if !fail_before_send => {}
+                                _ => panic!("incorrect replay eligibility"),
+                            }
+                            let bytes = received.await.unwrap();
+                            if !fail_before_send {
+                                assert!(bytes.ends_with(b"one-business-body"));
+                            }
+                            Ok::<_, Infallible>(Response::new(Full::new(Bytes::new())))
+                        }
+                    }),
+                )
+                .await
+                .unwrap();
+        });
+        let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(front))
+            .await
+            .unwrap();
+        let connection = tokio::spawn(connection);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/business")
+            .body(Full::new(Bytes::from_static(b"one-business-body")))
+            .unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(3), sender.send_request(request))
+            .await
+            .unwrap()
+            .unwrap();
+        response.into_body().collect().await.unwrap();
+        drop(sender);
+        connection.abort();
+        task.abort();
+    }
+    #[tokio::test]
+    async fn connection_failure_returns_the_unconsumed_business_body() {
+        exercise(true).await;
+    }
+    #[tokio::test]
+    async fn lost_response_never_returns_a_replayable_business_body() {
+        exercise(false).await;
+    }
 }

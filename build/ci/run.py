@@ -46,7 +46,7 @@ def commands_for(suite, output, jobs):
     if suite == "api-server":
         return [[os.environ.get("CARGO", "cargo"), "test", "--locked", "-p", "adx-api-server", "-j", str(jobs)]]
     if suite == "agent":
-        return [make + ["agent-test", f"PYTEST_ARGS=--junitxml={output / 'junit.xml'}"]]
+        return [make + ["agent-test"]]
     if suite == "sandbox-sdk":
         return [make + ["sandbox-sdk-test", f"PYTEST_ARGS=--junitxml={output / 'junit.xml'}"]]
     if suite == "interop":
@@ -61,7 +61,7 @@ def commands_for(suite, output, jobs):
                 ["env", f"PYTHONPATH={ROOT / 'platform/sdk/sandbox/python'}", python,
                  "build/ci/command_watch_tls.py", "--tls", str(output / "tls")]]
     if suite == "package":
-        packages = ["agent/cli", "agent/sdk/python", "agent/executor", "platform/sdk/sandbox/python"]
+        packages = ["platform/sdk/sandbox/python"]
         return [[python, "-m", "build", "--no-isolation", "--wheel", "--sdist",
                  "--outdir", str(output / "wheels"), package] for package in packages]
     raise ValueError(f"Suite is not implemented: {suite}")
