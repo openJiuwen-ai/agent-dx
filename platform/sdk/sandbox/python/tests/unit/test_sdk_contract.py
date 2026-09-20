@@ -4,6 +4,7 @@ import unittest
 from unittest.mock import patch
 
 import adx_sandbox
+import httpx
 from adx_sandbox import (
     ConnectionConfig,
     DataPlaneSecurityPolicy,
@@ -24,7 +25,7 @@ from adx_sandbox.commands import (
     CommandSubmissionError,
     Commands,
 )
-from adx_sandbox._transport import SandboxHTTPError
+from adx_sandbox._transport import SandboxClient, SandboxHTTPError
 from adx_sandbox.shell import Shells
 from adx_sandbox.shell.shell import Shell
 
@@ -129,6 +130,37 @@ class _FakeClient:
 class SDKContractTests(unittest.TestCase):
     def setUp(self):
         _FakeClient.created.clear()
+
+    def test_structured_platform_error_preserves_retry_contract(self):
+        response = httpx.Response(
+            503,
+            headers={"x-request-id": "request-from-header"},
+            json={
+                "code": 503,
+                "message": "reply lost",
+                "data": None,
+                "error": {
+                    "code": "OUTCOME_UNKNOWN",
+                    "retry": "same_operation",
+                    "outcome": "unknown",
+                    "requestId": "request-a",
+                    "operationId": "pause-a",
+                    "instanceId": "instance-a",
+                },
+            },
+            request=httpx.Request("POST", "https://adx.example/api/sandbox"),
+        )
+
+        with self.assertRaises(SandboxHTTPError) as raised:
+            SandboxClient._json(response)
+
+        error = raised.exception
+        self.assertEqual(error.code, "OUTCOME_UNKNOWN")
+        self.assertEqual(error.retry, "same_operation")
+        self.assertEqual(error.outcome, "unknown")
+        self.assertEqual(error.request_id, "request-a")
+        self.assertEqual(error.operation_id, "pause-a")
+        self.assertEqual(error.instance_id, "instance-a")
 
     def test_pause_resume_results_are_public_frozen_value_types(self):
         pause_result_type = getattr(adx_sandbox, "PauseResult", None)

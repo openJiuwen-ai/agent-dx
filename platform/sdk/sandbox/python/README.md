@@ -182,12 +182,16 @@ attempt rules intentionally differ by operation:
   still uncertain, reconcile the instance state instead of changing the request
   under that identity.
 - Create from Snapshot uses the normal create policy with up to three attempts
-  and one `create-*` identity. An unnamed attempt that reaches another frontend
-  can make an extra sandbox, so give important clones a name and reconcile
-  uncertain outcomes.
+  and one `create-*` identity. When the caller omits `name`, the SDK derives a
+  stable name from that identity, so another API Server replica receives the
+  same Instance ID. An uncertain result must still be queried or retried with
+  the same identity.
 
-Transport and business failures, malformed Snapshot identity results, and
-exhausted attempt budgets raise `SandboxError`. Other malformed typed-result
+Structured server failures raise `SandboxHTTPError`, whose `code`, `retry`,
+`outcome`, `request_id`, `operation_id`, and `instance_id` fields implement the
+[management error contract](../../../api/http/error-contract.md). Transport
+failures with an uncertain write result surface the same fields on
+`SandboxError`. Other malformed typed-result
 shapes can instead surface `ValueError` or `TypeError` while values are
 converted, or `RuntimeError` when resume `portMappings` is not an object.
 `reload()` translates `SandboxError` into `False`; it does not normalize those

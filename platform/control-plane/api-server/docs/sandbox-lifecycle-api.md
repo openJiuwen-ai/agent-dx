@@ -17,6 +17,12 @@ All ordinary responses use the API Server response envelope:
 result. The response examples below show the decoded JSON value of `data`.
 SSE create responses are an exception and are described below.
 
+Error responses retain the numeric `code` for envelope compatibility and add
+a stable `error` object containing `code`, `retry`, `outcome`, `requestId`, and
+the available operation/instance identities. Clients must follow those fields
+instead of inferring retry safety from HTTP status or message text. See the
+[management-plane error contract](../../../api/http/error-contract.md).
+
 ## Routes
 
 | Operation | Method and path | Request body | Decoded successful `data` |
@@ -52,26 +58,16 @@ Use the normal create route with a non-empty `snapshotId`. For example:
 }
 ```
 
-`createTimeoutSeconds` and `scheduleTimeoutSeconds` are optional create
-budgets. When supplied, API Server validates their relationship and uses the resolved create budget to bound the Master RPC; a create that
-does not reach RUNNING before its create budget finishes is an ordinary-HTTP
-`504` or an SSE final event with `status: "timeout"`. They are separate from
-the Snapshot/Pause logical checkpoint timeout and SDK transport buffer
-described below. The create budget must cover the scheduling budget, the
-SDK-supplied runtime initialization budget (30 seconds by default), and a
-30-second API Server response buffer. The SDK keeps the initialization budget
-internal rather than exposing another constructor option. Clients that omit
-the internal request field retain a 30-second compatibility default. When only
-the scheduling budget is supplied, API Server derives the
-create budget by adding those 60 seconds. For compatibility, legacy timeout
-pairs that reserved only the former 30-second response buffer remain accepted;
-API Server preserves their scheduling budget and expands the effective create
-budget to include initialization. A create-only request likewise keeps its
-legacy `create - 30` scheduling budget before the outer budget is expanded.
-These compatibility budget calculations do not create a durable scheduling deadline: `clients.rs` bounds Master.CreateInstance by its configured `rpc_timeout_seconds` and the resolved public create budget. An accepted task may continue after the caller times out.
-A legacy environment value below the new
-default is normalized to the default 90-second create and 30-second schedule
-budgets. User commands use the separate RRT HTTP data path.
+`createTimeoutSeconds` and `scheduleTimeoutSeconds` are separate budgets.
+`createTimeoutSeconds` bounds the complete public create request and is inherited
+by the selected Node Manager and any central fallback. Local-first does not split
+that budget into fixed local and central halves. `scheduleTimeoutSeconds` starts
+only after a request enters the Master central queue and applies only until an
+Assignment is formed. Queue expiry atomically removes an unassigned request and
+releases its restore reference; an existing Assignment is never cancelled by the
+queue timer. Downstream calls inherit the remaining create deadline and cannot
+start a longer one. The default remains 90 seconds for create and 30 seconds for
+central scheduling. User commands use the separate RRT HTTP data path.
 
 For snapshot creation, omitted/zero resource values inherit the source. Positive CPU/memory/disk values must equal its resource geometry; restoring with larger limits or resizing is rejected. This applies to the new Rust resolver even though the HTTP handler can encode positive overrides.
 

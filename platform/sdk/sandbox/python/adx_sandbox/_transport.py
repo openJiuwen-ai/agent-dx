@@ -41,20 +41,47 @@ logger = logging.getLogger(__name__)
 class SandboxError(RuntimeError):
     """Raised when the frontend returns a non-2xx response or an error body."""
 
-    def __init__(self, message: str, *, request_id: Optional[str] = None):
+    def __init__(
+        self,
+        message: str,
+        *,
+        request_id: Optional[str] = None,
+        code: Optional[str] = None,
+        retry: Optional[str] = None,
+        outcome: Optional[str] = None,
+        operation_id: Optional[str] = None,
+        instance_id: Optional[str] = None,
+    ):
         super().__init__(message)
         self.request_id = request_id
+        self.code = code
+        self.retry = retry
+        self.outcome = outcome
+        self.operation_id = operation_id
+        self.instance_id = instance_id
 
 
 class SandboxNotFound(SandboxError):
     def __init__(self, sandbox_id: str, message: Optional[str] = None):
-        super().__init__(message or f"sandbox {sandbox_id} was not found")
+        super().__init__(
+            message or f"sandbox {sandbox_id} was not found",
+            code="NOT_FOUND",
+            retry="never",
+            outcome="terminal",
+            instance_id=sandbox_id,
+        )
         self.sandbox_id = sandbox_id
 
 
 class PermissionDenied(SandboxError):
     def __init__(self, sandbox_id: str, message: Optional[str] = None):
-        super().__init__(message or f"permission denied for sandbox {sandbox_id}")
+        super().__init__(
+            message or f"permission denied for sandbox {sandbox_id}",
+            code="PERMISSION_DENIED",
+            retry="never",
+            outcome="not_started",
+            instance_id=sandbox_id,
+        )
         self.sandbox_id = sandbox_id
 
 
@@ -66,8 +93,21 @@ class SandboxHTTPError(SandboxError):
         message: str,
         *,
         request_id: Optional[str] = None,
+        code: Optional[str] = None,
+        retry: Optional[str] = None,
+        outcome: Optional[str] = None,
+        operation_id: Optional[str] = None,
+        instance_id: Optional[str] = None,
     ):
-        super().__init__(message, request_id=request_id)
+        super().__init__(
+            message,
+            request_id=request_id,
+            code=code,
+            retry=retry,
+            outcome=outcome,
+            operation_id=operation_id,
+            instance_id=instance_id,
+        )
         self.status_code = status_code
         self.payload = payload
 
@@ -80,8 +120,21 @@ class _InvokeResult(dict):
         self.request_id = request_id
 
 
-class _RetryableHTTPStatus(SandboxError):
+class _RetryableHTTPStatus(SandboxHTTPError):
     """Transient gateway response whose create/delete outcome may be unknown."""
+
+    def __init__(self, error: SandboxHTTPError):
+        super().__init__(
+            error.status_code,
+            error.payload,
+            str(error),
+            request_id=error.request_id,
+            code=error.code,
+            retry=error.retry,
+            outcome=error.outcome,
+            operation_id=error.operation_id,
+            instance_id=error.instance_id,
+        )
 
 
 _DIRECT_SAFE_FALLBACK_ERRORS = (
@@ -229,13 +282,11 @@ class SandboxClient:
         )
         request_timeout = logical_timeout + ADX_GET_TIMEOUT_BUFFER
         # A UUIDv4 identifies this logical create across transport retries.
-        # Anonymous names are intentionally left to the receiving frontend:
-        # retries reaching another replica may create an extra sandbox, which
-        # server-side idle reclamation will collect.
         operation_id = str(uuid.uuid4())
         request_id = f"create-{operation_id}"
         request_body = dict(body)
-        request_name = request_body.get("name") or "<frontend-generated>"
+        request_name = request_body.get("name") or f"sandbox-{operation_id}"
+        request_body["name"] = request_name
         deadline = time.monotonic() + request_timeout
         last_error: Optional[BaseException] = None
         attempts = 0
@@ -281,7 +332,11 @@ class SandboxClient:
             "sandbox create transport failed after "
             f"{attempts} attempts "
             f"(requestId={request_id}, name={request_name}): "
-            f"{last_error or 'create deadline exhausted'}"
+            f"{last_error or 'create deadline exhausted'}",
+            request_id=request_id,
+            code="OUTCOME_UNKNOWN",
+            retry="same_operation",
+            outcome="unknown",
         ) from last_error
 
     def _create_info_attempt(
@@ -305,9 +360,10 @@ class SandboxClient:
         ) as resp:
             if resp.status_code in _RETRYABLE_GATEWAY_STATUS_CODES:
                 resp.read()
-                raise _RetryableHTTPStatus(
-                    f"HTTP {resp.status_code}: {resp.text}"
-                )
+                error = self._http_error(resp, request_id=request_id)
+                if error.retry == "never":
+                    raise error
+                raise _RetryableHTTPStatus(error)
             content_type = resp.headers.get("content-type", "").lower()
             if "text/event-stream" not in content_type:
                 resp.read()
@@ -351,10 +407,25 @@ class SandboxClient:
             message = final.get("message") or "sandbox did not reach running state"
             response_request_id = final.get("requestId") or request_id
             sandbox_id = final.get("sandboxId") or final.get("instanceId") or "unknown"
+            detail = final.get("error")
+            if isinstance(detail, dict):
+                raise SandboxHTTPError(
+                    int(code) if isinstance(code, int) else 503,
+                    final,
+                    f"sandbox create {status}: {message}",
+                    request_id=detail.get("requestId") or response_request_id,
+                    code=detail.get("code"),
+                    retry=detail.get("retry"),
+                    outcome=detail.get("outcome"),
+                    operation_id=detail.get("operationId"),
+                    instance_id=detail.get("instanceId") or sandbox_id,
+                )
             raise SandboxError(
                 f"sandbox create {status} "
                 f"(errorCode={code}, requestId={response_request_id}, "
-                f"sandboxId={sandbox_id}): {message}"
+                f"sandboxId={sandbox_id}): {message}",
+                request_id=response_request_id,
+                instance_id=sandbox_id,
             )
         data = final
         return data
@@ -382,14 +453,11 @@ class SandboxClient:
                 if resp.status_code in (200, 202, 204, 404):
                     return
                 if resp.status_code not in _RETRYABLE_GATEWAY_STATUS_CODES:
-                    raise SandboxError(
-                        f"delete {sandbox_id} failed "
-                        f"(requestId={request_id}, attempt={attempt}): "
-                        f"HTTP {resp.status_code} {resp.text}"
-                    )
-                last_error = _RetryableHTTPStatus(
-                    f"HTTP {resp.status_code}: {resp.text}"
-                )
+                    raise self._http_error(resp, request_id=request_id)
+                error = self._http_error(resp, request_id=request_id)
+                if error.retry == "never":
+                    raise error
+                last_error = _RetryableHTTPStatus(error)
 
             if attempt >= _DELETE_MAX_ATTEMPTS:
                 break
@@ -406,7 +474,12 @@ class SandboxClient:
 
         raise SandboxError(
             f"delete {sandbox_id} failed after {_DELETE_MAX_ATTEMPTS} attempts "
-            f"(requestId={request_id}): {last_error}"
+            f"(requestId={request_id}): {last_error}",
+            request_id=request_id,
+            code="OUTCOME_UNKNOWN",
+            retry="same_operation",
+            outcome="unknown",
+            instance_id=sandbox_id,
         ) from last_error
 
     def create_snapshot(
@@ -437,13 +510,16 @@ class SandboxClient:
         except _CREATE_RETRYABLE_ERRORS as exc:
             raise SandboxError(
                 "sandbox snapshot result is uncertain "
-                f"(requestId={request_id}): {exc}"
+                f"(requestId={request_id}): {exc}",
+                request_id=request_id,
+                code="OUTCOME_UNKNOWN",
+                retry="same_operation",
+                outcome="unknown",
+                operation_id=request_id,
+                instance_id=sandbox_id,
             ) from exc
         if resp.status_code in _RETRYABLE_GATEWAY_STATUS_CODES:
-            raise SandboxError(
-                "sandbox snapshot result is uncertain "
-                f"(requestId={request_id}): HTTP {resp.status_code}: {resp.text}"
-            )
+            raise self._http_error(resp, request_id=request_id)
         return self._json(resp)
 
     def get_snapshot(self, snapshot_id: str) -> Dict[str, Any]:
@@ -561,9 +637,10 @@ class SandboxClient:
                             f"the internal requestId={request_id}"
                         )
                     return result
-                last_error = _RetryableHTTPStatus(
-                    f"HTTP {resp.status_code}: {resp.text}"
-                )
+                error = self._http_error(resp, request_id=request_id)
+                if error.retry == "never":
+                    raise error
+                last_error = _RetryableHTTPStatus(error)
 
             if attempt >= _LIFECYCLE_MAX_ATTEMPTS:
                 break
@@ -581,7 +658,13 @@ class SandboxClient:
 
         raise SandboxError(
             f"sandbox {operation} failed after {_LIFECYCLE_MAX_ATTEMPTS} attempts "
-            f"(requestId={request_id}): {last_error}"
+            f"(requestId={request_id}): {last_error}",
+            request_id=request_id,
+            code="OUTCOME_UNKNOWN",
+            retry="same_operation",
+            outcome="unknown",
+            operation_id=request_id,
+            instance_id=sandbox_id,
         ) from last_error
 
     def instance_info(self, sandbox_id: str) -> Dict[str, Any]:
@@ -596,10 +679,7 @@ class SandboxClient:
         if resp.status_code == 403:
             raise PermissionDenied(sandbox_id)
         if resp.status_code >= 400:
-            raise SandboxError(
-                f"get instance {sandbox_id} failed: "
-                f"HTTP {resp.status_code} {resp.text}"
-            )
+            raise self._http_error(resp, request_id=resp.headers.get("x-request-id"))
         try:
             payload = resp.json()
         except ValueError as exc:
@@ -751,6 +831,11 @@ class SandboxClient:
                     "direct invoke outcome is unknown after transport failure "
                     f"(requestId={request_id}): {exc}",
                     request_id=request_id,
+                    code="OUTCOME_UNKNOWN",
+                    retry="same_operation",
+                    outcome="unknown",
+                    operation_id=request_id,
+                    instance_id=sandbox_id,
                 ) from exc
             else:
                 if resp.status_code == 404:
@@ -781,24 +866,12 @@ class SandboxClient:
                 self._direct_route_misses = 0
                 if resp.status_code in _RETRYABLE_GATEWAY_STATUS_CODES:
                     last_error = _RetryableHTTPStatus(
-                        f"HTTP {resp.status_code}: {resp.text}"
+                        self._http_error(resp, request_id=request_id)
                     )
                     last_failure_safe = False
                     outcome_unknown = True
                 elif resp.status_code >= 400:
-                    try:
-                        payload = resp.json()
-                    except ValueError:
-                        payload = {"error": resp.text}
-                    if not isinstance(payload, dict):
-                        payload = {"error": str(payload)}
-                    raise SandboxHTTPError(
-                        resp.status_code,
-                        payload,
-                        f"direct invoke failed: HTTP {resp.status_code} "
-                        f"(requestId={request_id}): {resp.text}",
-                        request_id=request_id,
-                    )
+                    raise self._http_error(resp, request_id=request_id)
                 else:
                     try:
                         parsed = resp.json()
@@ -1195,6 +1268,39 @@ class SandboxClient:
     # ── internal ───────────────────────────────────────────────────────
 
     @staticmethod
+    def _http_error(
+        resp: httpx.Response, *, request_id: Optional[str] = None
+    ) -> SandboxHTTPError:
+        try:
+            payload = resp.json()
+        except (AttributeError, ValueError):
+            payload = {"message": resp.text}
+        if not isinstance(payload, dict):
+            payload = {"message": str(payload)}
+        detail = payload.get("error")
+        detail = detail if isinstance(detail, dict) else {}
+        message = str(payload.get("message") or detail.get("message") or resp.text)
+        resolved_request_id = (
+            detail.get("requestId")
+            or getattr(resp, "headers", {}).get("x-request-id")
+            or request_id
+        )
+        identity = (
+            f" (requestId={resolved_request_id})" if resolved_request_id else ""
+        )
+        return SandboxHTTPError(
+            resp.status_code,
+            payload,
+            f"HTTP {resp.status_code} {message}{identity}",
+            request_id=resolved_request_id,
+            code=detail.get("code"),
+            retry=detail.get("retry"),
+            outcome=detail.get("outcome"),
+            operation_id=detail.get("operationId"),
+            instance_id=detail.get("instanceId"),
+        )
+
+    @staticmethod
     def _json(resp: httpx.Response) -> Dict[str, Any]:
         """Unwrap the job.BuildJobResponse envelope.
 
@@ -1205,7 +1311,7 @@ class SandboxClient:
         handles them while preserving the requested local file layout.
         """
         if resp.status_code >= 400:
-            raise SandboxError(f"HTTP {resp.status_code}: {resp.text}")
+            raise SandboxClient._http_error(resp)
         try:
             envelope = resp.json()
         except ValueError:
