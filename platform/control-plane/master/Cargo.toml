@@ -22,6 +22,7 @@ adx-discovery = { path = "../../crates/discovery" }
 tokio-stream = { version = "0.1", features = ["net"] }
 sha2 = "0.10"
 adx-protocol = { path = "../../crates/protocol" }
+adx-service-runtime = { path = "../../crates/service-runtime" }
 tonic = { version = "0.12", features = ["tls"] }
 adx-core = { path = "../../crates/core" }
 adx-scheduling = { path = "../../crates/scheduling" }

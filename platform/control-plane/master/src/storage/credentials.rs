@@ -5,12 +5,13 @@ use crate::auth::Credential;
 
 impl Session {
     pub async fn list_credentials(&self) -> Result<BTreeMap<String, Credential>> {
-        let header = self.store.fields(&[HEADER.into()]).await?;
-        self.header(&header[0])?;
+        let [header_value] = self.store.fields([HEADER.into()]).await?;
+        self.header(&header_value)?;
+        let expected_header = header_value.as_deref().ok_or(Error::Conflict)?;
         let mut command = redis::cmd("EVAL");
         command.arg("if redis.call('HGET', KEYS[1], 'header') ~= ARGV[1] then return false end; return redis.call('HGETALL', KEYS[2])")
             .arg(2).arg(&self.store.key).arg(format!("{}:credentials", self.store.key))
-            .arg(header[0].as_deref().ok_or(Error::Conflict)?);
+            .arg(expected_header);
         let values: Option<BTreeMap<String, String>> = self.store.query(command).await?;
         values
             .ok_or(Error::Conflict)?
@@ -27,8 +28,9 @@ impl Session {
         if id.len() != 64 || !id.bytes().all(|v| v.is_ascii_hexdigit()) {
             return Err(Error::Invalid("invalid credential ID".into()));
         }
-        let header = self.store.fields(&[HEADER.into()]).await?;
-        self.header(&header[0])?;
+        let [header_value] = self.store.fields([HEADER.into()]).await?;
+        self.header(&header_value)?;
+        let expected_header = header_value.as_deref().ok_or(Error::Conflict)?;
         // Compare the inspected opaque record as well as the Master header.
         // Administrator bootstrap credentials are managed by deployment config.
         let credential = match self.credential(id).await {
@@ -60,7 +62,7 @@ impl Session {
             .arg(&self.store.key)
             .arg(format!("{}:credentials", self.store.key))
             .arg(format!("{}:revoked-credentials", self.store.key))
-            .arg(header[0].as_deref().ok_or(Error::Conflict)?)
+            .arg(expected_header)
             .arg(id)
             .arg(encoded.unwrap_or_default());
         let accepted: u64 = self.store.query(command).await?;

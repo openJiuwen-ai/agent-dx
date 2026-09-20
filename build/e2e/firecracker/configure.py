@@ -1,8 +1,23 @@
 #!/usr/bin/env python3
-import json, pathlib, subprocess, sys, shutil, secrets, os
+import argparse
+import json
+import os
+import pathlib
+import secrets
+import subprocess
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Render one ADX Firecracker E2E node configuration"
+    )
+    parser.add_argument("node", choices=("node1", "node2"))
+    return parser.parse_args()
+
+
 BASE=pathlib.Path(os.environ.get('ADX_FC_BASE', '/opt/adx')); RUN=pathlib.Path(os.environ['ADX_FC_RUN_ROOT']); PRIVATE=RUN/'secrets'; EVIDENCE=RUN/'evidence'; PRIVATE.mkdir(parents=True); EVIDENCE.mkdir();
 P=RUN; P.mkdir(exist_ok=True)
-node=sys.argv[1]; T=PRIVATE/'tls'
+node=parse_args().node; T=PRIVATE/'tls'
 for name in ('s3-user','s3-key'):
  path=PRIVATE/name; path.write_text(secrets.token_hex(32)); path.chmod(0o600)
 if not T.exists():
@@ -68,7 +83,13 @@ cg=pathlib.Path('/sys/fs/cgroup')
 capacity={'cpu_millis':4000,'memory_bytes':3*1024**3,'disk_bytes':4*1024**3}
 (P/'capacity-base.json').write_text(json.dumps(capacity))
 services=[]
-def add(id,role,c={},env={}):services.append({'id':id,'role':role,'config':c,'env':env})
+def add(service_id, role, config=None, env=None):
+ services.append({
+  'id': service_id,
+  'role': role,
+  'config': {} if config is None else config,
+  'env': {} if env is None else env,
+ })
 if node=='node1':
  (P/'redis').mkdir(exist_ok=True)
  add('redis','redis',{'bind':'0.0.0.0','port':6379,'data_dir':str(P/'redis'),'appendfsync':'always','password_file':str(redis_key)})
@@ -86,7 +107,7 @@ if node=='node1':
  ee={**common,'ADX_DATA_PLANE_EDGE_FRONTEND_TLS_BIND':'0.0.0.0:8443','ADX_DATA_PLANE_EDGE_FRONTEND_PLAIN_BIND':'127.0.0.1:8080','ADX_DATA_PLANE_EDGE_FRONTEND_HEALTH_BIND':'127.0.0.1:18080','ADX_DATA_PLANE_EDGE_FRONTEND_TLS_CERT':str(T/'edge.pem'),'ADX_DATA_PLANE_EDGE_FRONTEND_TLS_KEY':str(T/'edge.key'),'ADX_DATA_PLANE_EDGE_FRONTEND_ALLOWED_CLIENT_CIDRS':'127.0.0.1/32','ADX_DATA_PLANE_EDGE_FRONTEND_NODE_TLS_CA':str(T/'ca.pem'),'ADX_DATA_PLANE_EDGE_FRONTEND_NODE_TLS_SERVER_NAME':'localhost','ADX_DATA_PLANE_EDGE_FRONTEND_NODE_TLS_CLIENT_CERT':str(T/'edge.pem'),'ADX_DATA_PLANE_EDGE_FRONTEND_NODE_TLS_CLIENT_KEY':str(T/'edge.key'),'ADX_DATA_PLANE_EDGE_FRONTEND_CONTROL_PLANE_ADDRESS':'127.0.0.1:8888'}
  add('edge','edge',{'tls':tls('edge',{'master':'master'}),'rpc_timeout_seconds':5,'refresh_seconds':1,'auth_cache_seconds':10,'auth_cache_entries':1000},ee)
 d={'schema_version':1,'package_dir':str(BASE/'package'),'state_dir':str(P/'state'),'redis_url':f'redis://:{redis_key.read_text().strip()}@127.0.0.1:6379/','namespace':'acceptance','restart_limit':3,'restart_delay_ms':1000,'stop_timeout_seconds':30,'services':services}
-(P/'deployment.json').write_text(json.dumps(d));(P/'deployment.json').chmod(0o600)
+(P/'deployment.yaml').write_text(json.dumps(d));(P/'deployment.yaml').chmod(0o600)
 
 print('configured',node,capacity)
 
@@ -115,7 +136,7 @@ firecracker = "/opt/adx-fc/bin/firecracker"
 (R/'config.toml').write_text(sandbox_config)
 (P/'registry.yaml').write_text(f"version: 0.1\nlog:\n  level: warn\nstorage:\n  filesystem:\n    rootdirectory: {P}/registry\nhttp:\n  addr: 127.0.0.1:5000\n")
 
-config_path=RUN/'deployment.json'
+config_path=RUN/'deployment.yaml'
 deployment=json.loads(config_path.read_text())
 for service in deployment['services']:
  if service['role']=='node-manager':
@@ -134,9 +155,15 @@ if os.environ.get('ADX_FC_PROXY_MODE','embedded') == 'embedded':
  deployment['services']=[s for s in deployment['services'] if s['role']!='node-proxy']
  config_path.write_text(json.dumps(deployment,indent=2))
  print('embedded Node Proxy enabled in Node Manager',flush=True)
+else:
+ deployment=json.loads(config_path.read_text())
+ node=next(s for s in deployment['services'] if s['role']=='node-manager')
+ node['config']['proxy_mode']='standalone'
+ config_path.write_text(json.dumps(deployment,indent=2))
+ print('standalone Node Proxy explicitly enabled',flush=True)
 run = RUN
 
-d = json.loads((run / 'deployment.json').read_text())
+d = json.loads((run / 'deployment.yaml').read_text())
 allowed = {'node_id', 'listen', 'proxy_mode', 'proxy_socket', 'proxy_address', 'checkpoint_storage', 'checkpoint_gc'}
 result = {'schema_version': d['schema_version'], 'package_dir': d['package_dir'], 'state_dir': d['state_dir'], 'services': [
     {'id': s['id'], 'role': s['role'], 'config': {k: v for k, v in s.get('config', {}).items() if k in allowed}, 'environment_names': sorted(s.get('env', {}))} for s in d['services']]}

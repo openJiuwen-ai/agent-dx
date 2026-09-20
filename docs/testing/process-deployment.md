@@ -2,14 +2,15 @@
 
 实际安装和配置步骤见 [单机进程部署](../deployment/standalone.md)。本文保留 CLI 实现与早期验收记录。
 
-2026-09-15。新增 `platform/control-plane/control-cli`，以 Rust `adxctl` 承载部署配置和轻量 supervisor；新增 Node Manager 本机停止清理接口。统一包同时携带控制面和数据面。本文描述现有进程托管、停止契约和出包；末尾保留早期组件测试。完整 SDK 基础 K8s 已通过 [Buildkite #21](2026-09-17-observability-k8s.md)。
+`platform/deployment` 中的 Rust `adxctl` 承载统一部署配置和轻量 supervisor；它不属于某个平面，配置和托管 Master/API Server、Edge/Node Proxy/Node Manager。Node Manager 仍负责本机 Instance 停止清理。统一包同时携带控制面和数据面。本文描述现有进程托管、停止契约和出包；末尾保留早期组件测试。完整 SDK 基础 K8s 已通过 [Buildkite #21](2026-09-17-observability-k8s.md)。
 
 ## 模块
 
 | 模块 | 职责 |
 |---|---|
-| `control-cli/src/config.rs` | 部署 schema、角色与公共参数校验，生成组件配置、Redis AOF 配置和 Node 管理 socket 地址 |
-| `control-cli/src/supervisor.rs` | 单部署文件锁、受保护的控制 UDS、子进程组、日志、有限次数重启、状态查询和停止顺序 |
+| `platform/deployment/src/cli.rs` | 类型化子命令和参数；`start` 是 `run` 的兼容别名 |
+| `platform/deployment/src/config.rs` | 部署 schema、控制面/数据面角色与公共参数校验，生成组件配置、Redis AOF 配置和 Node 管理 socket 地址 |
+| `platform/deployment/src/supervisor.rs` | 单部署文件锁、受保护的控制 UDS、子进程组、日志、有限次数重启、状态查询和停止顺序 |
 | `node-manager/src/admin.rs` | 本机已管理 Instance 的停止清理；保持 Node Manager 的生命周期所有权 |
 | `node.proto / NodeAdminService` | 仅在本机受保护 UDS 服务的 Drain RPC，不挂到 Node TCP 服务 |
 | `build/release/build.sh` | 原生 release 构建、SDK wheel 构建、统一包组装 |
@@ -19,23 +20,24 @@
 ## 运行入口
 
 ```sh
-adxctl validate --config /etc/adx/deployment.json
-adxctl render --config /etc/adx/deployment.json --output /tmp/adx-generated
-adxctl run --config /etc/adx/deployment.json
+adxctl config init
+adxctl validate
+adxctl render --output /tmp/adx-generated
+adxctl run
 # 另一个终端
-adxctl status --config /etc/adx/deployment.json
-adxctl stop --config /etc/adx/deployment.json
+adxctl status
+adxctl stop
 ```
 
 `start` 与 `run` 相同，前台运行 supervisor，适合直接作为服务或 Pod 的入口进程。状态查询反映子进程 PID、重启次数和失败标记，**不等同于平台业务就绪**。同一 `state_dir` 只允许一个 supervisor，命令经当前进程的 UDS 执行，不读取 PID 文件后盲目 kill。
 
-统一配置示例为 `build/config/examples/deployment.json`。`services` 选择本机角色；同一包可以部署 Master 主机或工作节点。每个服务的原有细节放在 `config` 和 `env` 中；公共 Redis／namespace 和管理 socket 由 CLI 注入。当前校验覆盖部署结构、公共字段、Redis 和 socket 等约束；TLS 文件、资源观测及其他组件细节仍由对应服务执行最终校验。
+默认配置路径为 `/etc/adx/deployment.yaml`；可通过全局 `-c/--config` 或 `ADX_DEPLOYMENT_CONFIG` 修改。`config init` 默认生成带本地托管 Redis 的 standalone 配置，并支持 `standalone-external-redis`、`master`、`node` 和 `edge-api` profile。统一配置示例位于 `build/config/examples/`。`services` 选择本机角色；同一包可以部署 Master 主机或工作节点。每个服务的原有细节放在 `config` 和 `env` 中；公共 Redis／namespace 和管理 socket 由 CLI 注入。当前校验覆盖部署结构、公共字段、Redis 和 socket 等约束；TLS 文件、资源观测及其他组件细节仍由对应服务执行最终校验。
 
 配置目录权限为 0700、生成文件和管理 socket 为 0600。日志在 `state_dir/logs/<service-id>.log`；状态响应不返回环境变量或配置正文。统一部署的 `logging` 可启用 Supervisor 输出接管、大小/时间滚动、gzip 压缩及历史保留；见[日志配置与故障契约](log-rotation.md)。
 
 ## 进程和停止契约
 
-启动顺序为 Redis → Master → Node Proxy → Node Manager → Sandbox API → Edge。该顺序只安排进程拉起；组件通过已有发现和对账握手达到就绪。异常退出按配置延迟重启，超过本次 supervisor 生命周期的预算后标记失败，其他角色保持运行；不会假装故障组件已就绪。初次 spawn 失败同样进入有限重试。
+默认启动顺序为 Redis → Master → Node Manager（含内嵌 Proxy）→ API Server → Edge。显式分进程时，独立 Node Proxy 在 Node Manager 前启动。该顺序只安排进程拉起；组件通过已有发现和对账握手达到就绪。异常退出按配置延迟重启，超过本次 supervisor 生命周期的预算后标记失败，其他角色保持运行；不会假装故障组件已就绪。初次 spawn 失败同样进入有限重试。
 
 显式 `stop` 和 supervisor 收到 SIGTERM／SIGINT 都执行：
 

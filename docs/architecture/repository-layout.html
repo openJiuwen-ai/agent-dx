@@ -22,7 +22,6 @@
 │   ├── control-plane/
 │   │   ├── master/                # Rust Master；Global + 内嵌 Shard
 │   │   ├── node-manager/          # Rust 本机生命周期和后端/存储适配
-│   │   ├── control-cli/           # Rust adxctl / supervisor
 │   │   └── api-server/            # Rust HTTP、认证缓存和 Instance RPC
 │   │       ├── src/               # contract、http、clients、operations
 │   │       ├── tests/             # HTTP 契约与校验
@@ -31,6 +30,7 @@
 │   │   ├── core/                  # Instance、资源、恢复点、调度纯类型
 │   │   ├── protocol/              # gRPC 生成、转换与组件身份
 │   │   ├── discovery/             # Redis 服务地址发现
+│   │   ├── service-runtime/       # 服务参数、配置读取与退出信号
 │   │   ├── scheduling/            # Filter / Score、快照与查询索引
 │   │   └── observability/         # Trace 初始化、传播与导出
 │   ├── api/
@@ -42,6 +42,7 @@
 │   │   ├── proto/node.proto       # Node Proxy 绑定与活动
 │   │   └── http/runtime-control.md
 │   ├── runtime/rrt/               # HTTP 运行时与 checkpoint 协作
+│   ├── deployment/                # 统一 adxctl / supervisor；管理控制面和数据面进程
 │   └── sdk/sandbox/python/        # adx-sandbox / adx_sandbox
 ├── gateway/src/
 │   ├── common/                    # 传输元数据、日志、资源与关闭辅助
@@ -68,7 +69,7 @@
 <p><code>core</code> 不依赖 Redis/SQLite/tonic/sandboxd 客户端；<code>protocol</code> 不承载调度或状态机。Node Manager 可依赖 Gateway 的 node 库，Gateway 不依赖 Master/Node Manager 业务实现。Shard 当前与 Master 同进程。</p>
 <p>默认创建经 Global 轮转进入 Shard Filter/Score。启用 <code>create_mode=local_first</code> 时，API Server 轮转可用入口节点，Node Manager 用同一 Admission 暂留资源，Master 原子确认唯一归属并同步中心账本；本地不满足时使用同一 Instance ID 回退 Shard。Master 向 API Server 首次全量、后续增量发布保留的实例目录，包括用于幂等生命周期结果的终态记录；已有实例操作命中本地目录后直达 Node Manager。</p>
 <h2 id="section-4">Node Manager / Node Proxy 进程组合</h2>
-<div class="table"><table><tr><th>模式</th><th>配置与装配</th><th>共同契约</th></tr><tr><td>standalone（默认）</td><td>两个 supervisor 服务；<code>proxy_mode=standalone</code></td><td>Node Manager 经受保护 UDS 控制 NodeProxyService</td></tr><tr><td>embedded</td><td>Node Manager 配置 <code>proxy_mode=embedded</code>，托管同一 NodeProxyService；Proxy 环境项放到 node-manager 服务</td><td>仍走同一 UDS 和完整绑定同步，不绕过版本/身份检查</td></tr></table></div>
+<div class="table"><table><tr><th>模式</th><th>配置与装配</th><th>共同契约</th></tr><tr><td>embedded（默认）</td><td>Node Manager 省略 <code>proxy_mode</code> 或配置 <code>proxy_mode=embedded</code>，托管同一 NodeProxyService；Proxy 环境项放到 node-manager 服务</td><td>仍走同一 UDS 和完整绑定同步，不绕过版本/身份检查</td></tr><tr><td>standalone</td><td>两个 supervisor 服务；Node Manager 显式配置 <code>proxy_mode=standalone</code></td><td>Node Manager 经受保护 UDS 控制 NodeProxyService</td></tr></table></div>
 <p>Proxy 首次启动关闭实例准入，Node Manager 完成权威对账与全量绑定同步后开放。数据请求直接进入 Node Proxy，不经过 Instance 生命周期队列。共进程共享进程和 Tokio 执行器，故障域与分进程不同。详见 <a href="../testing/node-proxy-process-modes.md">模式配置与验证</a>。</p>
 <h2 id="section-5">协议与持久化</h2>
 <p>公开 HTTP 路由和请求响应由 Rust HTTP handler 定义，SDK 调用公开契约。目前没有仓库维护的 <code>sandbox.yaml</code> 或已接入的 OpenAPI 自动生成流水线。参考 <a href="../../platform/control-plane/api-server/docs/sandbox-lifecycle-api.md">HTTP 文档</a>。</p>

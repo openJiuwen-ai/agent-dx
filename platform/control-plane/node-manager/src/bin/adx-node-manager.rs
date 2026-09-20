@@ -6,10 +6,8 @@ use adx_node_manager::{
     sandboxd::{Config as RuntimeConfig, Sandboxd},
     NodeManager,
 };
-use adx_protocol::{
-    control as pb,
-    tls::{read_config, shutdown, TlsFiles},
-};
+use adx_protocol::{control as pb, tls::TlsFiles};
+use adx_service_runtime::{read_config, shutdown};
 use serde::Deserialize;
 use std::{collections::HashMap, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 #[derive(Deserialize)]
@@ -90,40 +88,50 @@ async fn sample(
 }
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    adx_observability::init().map_err(|e| -> Box<dyn std::error::Error> { e })?;
-    let _trace = adx_observability::trace::init("adx-node-manager")
-        .map_err(|e| -> Box<dyn std::error::Error> { e })?;
-    let c: Config = read_config()?;
-    c.checkpoint_gc.validate()?;
-    let _logging_guard = if c.proxy_mode == adx_node_manager::proxy::ProxyMode::Embedded {
-        Some(data_plane_gateway::common::logging::init(
-            "node-manager",
-            false,
-        )?)
-    } else {
-        None
-    };
-    if c.node_id.is_empty()
-        || c.report_interval_seconds == 0
-        || c.rpc_timeout_seconds == 0
-        || c.runtime_ready_timeout_seconds == 0
+    let config: Config = read_config()?;
+    config.checkpoint_gc.validate()?;
+    // The embedded proxy and manager share one process-wide subscriber and tracer provider.
+    // Standalone mode keeps the control-plane observer because the proxy owns its own process.
+    let (_logging_guard, _trace) =
+        if config.proxy_mode == adx_node_manager::proxy::ProxyMode::Embedded {
+            (
+                Some(data_plane_gateway::common::logging::init(
+                    "adx-node-manager",
+                    false,
+                )?),
+                None,
+            )
+        } else {
+            adx_observability::init().map_err(|e| -> Box<dyn std::error::Error> { e })?;
+            (
+                None,
+                Some(
+                    adx_observability::trace::init("adx-node-manager")
+                        .map_err(|e| -> Box<dyn std::error::Error> { e })?,
+                ),
+            )
+        };
+    if config.node_id.is_empty()
+        || config.report_interval_seconds == 0
+        || config.rpc_timeout_seconds == 0
+        || config.runtime_ready_timeout_seconds == 0
     {
         return Err("node identity and positive intervals required".into());
     }
-    let source = match (c.capacity_file.clone(), c.resource_source.clone()) {
+    let source = match (config.capacity_file.clone(), config.resource_source.clone()) {
         (Some(path), None) => ResourceSource::File { path },
         (None, Some(source)) => source,
         _ => return Err("configure exactly one of capacity_file and resource_source".into()),
     };
-    let mut pressure_gate = c
+    let mut pressure_gate = config
         .pressure
         .as_ref()
         .map(|p| PressureGate::new(p.thresholds.clone()))
         .transpose()?;
-    let (server_tls, client_tls, peers) = c.tls.load()?;
-    let timeout = Duration::from_secs(c.rpc_timeout_seconds);
-    let listener = tokio::net::TcpListener::bind(c.listen).await?;
-    let discovery = match (&c.master_address, &c.discovery) {
+    let (server_tls, client_tls, peers) = config.tls.load()?;
+    let timeout = Duration::from_secs(config.rpc_timeout_seconds);
+    let listener = tokio::net::TcpListener::bind(config.listen).await?;
+    let discovery = match (&config.master_address, &config.discovery) {
         (Some(_), None) => None,
         (None, Some(d)) => Some(adx_discovery::RedisDiscovery::new(
             &d.redis_url,
@@ -133,7 +141,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => return Err("configure exactly one of master_address and discovery".into()),
     };
     let mut endpoint = loop {
-        if let Some(address) = &c.master_address {
+        if let Some(address) = &config.master_address {
             break address.clone();
         }
         match discovery
@@ -144,7 +152,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         {
             Ok(found) => break found.address,
             Err(_) => {
-                tokio::select! { _ = tokio::time::sleep(Duration::from_secs(c.report_interval_seconds)) => (), _ = shutdown() => return Ok(()) }
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(config.report_interval_seconds)) => {}
+                    _ = shutdown() => return Ok(()),
+                }
             }
         }
     };
@@ -159,7 +170,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let channel = channel_for(endpoint.clone())?;
     let session_id = uuid::Uuid::new_v4().to_string();
     // Leave part of the operation deadline for a durable fallback after RPC timeout.
-    let commit_timeout = if c.degradation_journal.is_some() {
+    let commit_timeout = if config.degradation_journal.is_some() {
         timeout / 2
     } else {
         timeout
@@ -167,7 +178,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sink = Arc::new(
         MasterStateSink::new(channel.clone(), commit_timeout)?.with_session(session_id.clone()),
     );
-    let journal = c.degradation_journal.map(|path| {
+    let journal = config.degradation_journal.map(|path| {
         Arc::new(adx_node_manager::journal::JournalSink::new(
             path,
             sink.clone(),
@@ -178,16 +189,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => sink.clone(),
     };
     let mut master = pb::master_service_client::MasterServiceClient::new(channel);
-    let mut env = c.rrt_env;
+    let mut env = config.rrt_env;
     env.insert("RRT_HTTP_ONLY".into(), "1".into());
-    env.insert("RRT_HTTP_PORT".into(), c.rrt_port.to_string());
+    env.insert("RRT_HTTP_PORT".into(), config.rrt_port.to_string());
     let token = env.get("RRT_HTTP_TOKEN").cloned();
     let runtime = Arc::new(
         Sandboxd::connect(
-            c.sandboxd_socket,
+            config.sandboxd_socket,
             RuntimeConfig {
-                runtime_environment: c.runtime_environment,
-                command: c.rrt_command,
+                runtime_environment: config.runtime_environment,
+                command: config.rrt_command,
                 env,
                 cwd: "/".into(),
                 rpc_timeout: timeout,
@@ -196,11 +207,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?,
     );
     runtime
-        .wait_ready_with_timeout(Duration::from_secs(c.runtime_ready_timeout_seconds))
+        .wait_ready_with_timeout(Duration::from_secs(config.runtime_ready_timeout_seconds))
         .await?;
     let mut readiness = RrtReadiness::new(
         runtime.clone(),
-        c.rrt_port,
+        config.rrt_port,
         Duration::from_millis(100),
         timeout,
         timeout,
@@ -209,15 +220,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         readiness = readiness.with_token(token)?;
     }
     let mut manager = NodeManager::new(
-        c.node_id.clone(),
+        config.node_id.clone(),
         runtime.clone(),
         Arc::new(readiness),
-        Arc::new(UdsRoutes::new(c.proxy_socket.clone(), timeout)?),
+        Arc::new(UdsRoutes::new(config.proxy_socket.clone(), timeout)?),
         state_sink,
     )
     .with_operation_timeout(timeout)?
-    .with_health_check(c.rrt_health_failure_threshold)?;
-    let checkpoint_storage = match (c.checkpoint_dir, c.checkpoint_storage) {
+    .with_health_check(config.rrt_health_failure_threshold)?;
+    let checkpoint_storage = match (config.checkpoint_dir, config.checkpoint_storage) {
         (Some(root), None) => Some(adx_node_manager::checkpoint::StorageConfig::Local { root }),
         (None, storage) => storage,
         (Some(_), Some(_)) => {
@@ -226,16 +237,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     if let Some(storage) = checkpoint_storage {
         let mut control =
-            adx_node_manager::runtime_control::RuntimeControlClient::new(c.rrt_port, timeout)?;
+            adx_node_manager::runtime_control::RuntimeControlClient::new(config.rrt_port, timeout)?;
         if let Some(token) = &token {
             control = control.with_token(token)?;
         }
         manager = manager
             .with_checkpointing(
                 storage.build_for_node(
-                    c.node_id.clone(),
+                    config.node_id.clone(),
                     session_id.clone(),
-                    c.checkpoint_gc.clone(),
+                    config.checkpoint_gc.clone(),
                 )?,
                 Arc::new(control),
             )?
@@ -248,18 +259,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(sample) => break sample,
             Err(error) => {
                 adx_observability::warn!("waiting for first valid capacity observation: {error}");
-                tokio::select! { _ = tokio::time::sleep(Duration::from_secs(c.report_interval_seconds)) => (), _ = shutdown() => return Ok(()) }
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(config.report_interval_seconds)) => {}
+                    _ = shutdown() => return Ok(()),
+                }
             }
         }
     };
     manager.update_capacity(o.capacity, valid)?;
     manager.update_devices(o.devices.clone(), valid)?;
-    let mut embedded = if c.proxy_mode == adx_node_manager::proxy::ProxyMode::Embedded {
+    let mut embedded = if config.proxy_mode == adx_node_manager::proxy::ProxyMode::Embedded {
         data_plane_gateway::common::resource::raise_nofile_soft_limit_from_env()?;
         Some(
             adx_node_manager::proxy::EmbeddedProxy::start(
                 data_plane_gateway::config::NodeProxyConfig::from_env()?,
-                &c.proxy_socket,
+                &config.proxy_socket,
             )
             .await?,
         )
@@ -267,12 +281,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
     let registration = pb::RegisterNodeRequest {
-        node_id: c.node_id.clone(),
-        node_address: c.advertised_address,
-        proxy_address: c.proxy_address,
+        node_id: config.node_id.clone(),
+        node_address: config.advertised_address,
+        proxy_address: config.proxy_address,
         capacity: Some(o.capacity.into()),
         devices: o.devices.into_iter().map(Into::into).collect(),
-        labels: c.labels,
+        labels: config.labels,
         accepting_allocations: false,
         session_id: session_id.clone(),
         heartbeat_sequence: 0,
@@ -282,7 +296,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let node_rpc = NodeRpc::new(manager.clone(), peers, session_id.clone())
         .with_local_creation((*sink).clone());
     let claim_retries = async {
-        let mut interval = tokio::time::interval(Duration::from_secs(c.report_interval_seconds));
+        let mut interval =
+            tokio::time::interval(Duration::from_secs(config.report_interval_seconds));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
@@ -297,7 +312,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener));
     tokio::pin!(server);
     let admin = async {
-        if let Some(path) = &c.admin_socket {
+        if let Some(path) = &config.admin_socket {
             adx_node_manager::admin::serve(manager.clone(), path).await?;
         } else {
             std::future::pending::<()>().await;
@@ -307,10 +322,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let report = async {
         let mut last = registration.clone();
         let mut valid_until = tokio::time::Instant::now() + valid;
-        let mut interval = tokio::time::interval(Duration::from_secs(c.report_interval_seconds));
+        let mut interval =
+            tokio::time::interval(Duration::from_secs(config.report_interval_seconds));
         let mut reconciled = false;
         let mut gc_jobs = tokio::task::JoinSet::new();
-        let gc_interval = Duration::from_secs(c.checkpoint_gc.interval_seconds);
+        let gc_interval = Duration::from_secs(config.checkpoint_gc.interval_seconds);
         let mut next_gc = tokio::time::Instant::now();
         loop {
             interval.tick().await;
@@ -346,7 +362,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 r.capacity = Some(o.capacity.into());
                 r.devices = o.devices.into_iter().map(Into::into).collect();
             }
-            if let (Some(config), Some(gate)) = (&c.pressure, &mut pressure_gate) {
+            if let (Some(config), Some(gate)) = (&config.pressure, &mut pressure_gate) {
                 let path = config.disk_path.clone();
                 let accepting = match tokio::task::spawn_blocking(move || {
                     adx_node_manager::resources::pressure(&path)
@@ -375,7 +391,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(_) if !reconciled => {
                     let catalog = master
                         .inspect_node(pb::InspectNodeRequest {
-                            node_id: c.node_id.clone(),
+                            node_id: config.node_id.clone(),
                             session_id: session_id.clone(),
                         })
                         .await;
@@ -399,7 +415,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 // both Instance and snapshot records from the same fresh catalog.
                                 catalog = match master
                                     .inspect_node(pb::InspectNodeRequest {
-                                        node_id: c.node_id.clone(),
+                                        node_id: config.node_id.clone(),
                                         session_id: session_id.clone(),
                                     })
                                     .await
@@ -470,7 +486,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             continue;
                         }
                     }
-                    if c.checkpoint_gc.enabled
+                    if config.checkpoint_gc.enabled
                         && gc_jobs.is_empty()
                         && tokio::time::Instant::now() >= next_gc
                     {
@@ -495,7 +511,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok::<(), Box<dyn std::error::Error>>(())
     };
     let metrics = async {
-        if let Some(bind) = c.metrics_listen {
+        if let Some(bind) = config.metrics_listen {
             adx_node_manager::metrics::serve(manager.clone(), bind).await?;
         } else {
             std::future::pending::<()>().await;
@@ -503,7 +519,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok::<(), std::io::Error>(())
     };
     let monitoring = async {
-        let mut interval = tokio::time::interval(Duration::from_secs(c.report_interval_seconds));
+        let mut interval =
+            tokio::time::interval(Duration::from_secs(config.report_interval_seconds));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
@@ -528,7 +545,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             None => std::future::pending::<adx_core::Result<()>>().await,
         }
     };
-    tokio::select! {r=proxy_failure=>r?,r=&mut server=>r?,r=report=>r?,r=metrics=>r?,_=claim_retries=>{},_=monitoring=>{},_=expiry=>{},r=admin=>r.map_err(|e| -> Box<dyn std::error::Error> { e })?,_=shutdown()=>{}}
+    tokio::select! {
+        result = proxy_failure => result?,
+        result = &mut server => result?,
+        result = report => result?,
+        result = metrics => result?,
+        _ = claim_retries => {}
+        _ = monitoring => {}
+        _ = expiry => {}
+        result = admin => result.map_err(|error| -> Box<dyn std::error::Error> { error })?,
+        _ = shutdown() => {}
+    }
     if let Some(proxy) = embedded {
         proxy.shutdown().await?;
     }

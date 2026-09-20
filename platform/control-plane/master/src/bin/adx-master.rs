@@ -4,10 +4,8 @@ use adx_master::{
     storage::RedisStore,
     Placement,
 };
-use adx_protocol::{
-    control as pb,
-    tls::{read_config, shutdown, TlsFiles},
-};
+use adx_protocol::{control as pb, tls::TlsFiles};
+use adx_service_runtime::{read_config, shutdown};
 use serde::Deserialize;
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
 #[derive(Deserialize)]
@@ -48,21 +46,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     adx_observability::init().map_err(|e| -> Box<dyn std::error::Error> { e })?;
     let _trace = adx_observability::trace::init("adx-master")
         .map_err(|e| -> Box<dyn std::error::Error> { e })?;
-    let c: Config = read_config()?;
-    if c.heartbeat_timeout_seconds == 0 || c.discovery_ttl_seconds < 3 {
+    let config: Config = read_config()?;
+    if config.heartbeat_timeout_seconds == 0 || config.discovery_ttl_seconds < 3 {
         return Err("positive heartbeat timeout and discovery TTL >= 3 required".into());
     }
-    let placement = match c.placement.as_str() {
+    let placement = match config.placement.as_str() {
         "pack" => Placement::Pack,
         "spread" => Placement::Spread,
         _ => return Err("placement must be pack or spread".into()),
     };
-    let (server_tls, client_tls, peers) = c.tls.load()?;
-    let timeout = Duration::from_secs(c.rpc_timeout_seconds);
-    let listener = tokio::net::TcpListener::bind(c.listen).await?;
-    let store = RedisStore::connect(&c.redis_url, &c.namespace, timeout).await?;
-    let session = store.begin(c.scheduler_shards).await?;
-    for credential in c.bootstrap_credentials {
+    let (server_tls, client_tls, peers) = config.tls.load()?;
+    let timeout = Duration::from_secs(config.rpc_timeout_seconds);
+    let listener = tokio::net::TcpListener::bind(config.listen).await?;
+    let store = RedisStore::connect(&config.redis_url, &config.namespace, timeout).await?;
+    let session = store.begin(config.scheduler_shards).await?;
+    for credential in config.bootstrap_credentials {
         let key = std::fs::read_to_string(credential.key_file)?;
         session
             .bootstrap_credential(key.trim(), &credential.credential)
@@ -76,10 +74,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         peers,
         client_tls,
         timeout,
-        Duration::from_secs(c.heartbeat_timeout_seconds),
+        Duration::from_secs(config.heartbeat_timeout_seconds),
     )
     .await?;
-    let metrics_listener = match c.metrics_listen {
+    let metrics_listener = match config.metrics_listen {
         Some(address) => Some(tokio::net::TcpListener::bind(address).await?),
         None => None,
     };
@@ -92,22 +90,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     routes.refresh().await?;
     let route_task = routes.clone().run(Duration::from_millis(200));
-    let ttl = Duration::from_secs(c.discovery_ttl_seconds);
-    if let Some(address) = &c.advertised_address {
-        session.advertise(&c.namespace, address, ttl).await?;
+    let ttl = Duration::from_secs(config.discovery_ttl_seconds);
+    if let Some(address) = &config.advertised_address {
+        session.advertise(&config.namespace, address, ttl).await?;
     }
     let maintenance_rpc = rpc.clone();
     let maintenance = async {
         let mut tick = tokio::time::interval(Duration::from_secs(
-            (c.heartbeat_timeout_seconds.min(c.discovery_ttl_seconds) / 3).max(1),
+            (config
+                .heartbeat_timeout_seconds
+                .min(config.discovery_ttl_seconds)
+                / 3)
+            .max(1),
         ));
         loop {
             tick.tick().await;
             if let Err(error) = maintenance_rpc.expire_nodes().await {
                 adx_observability::warn!("node health publication unavailable: {error}");
             }
-            if let Some(address) = &c.advertised_address {
-                if let Err(error) = session.advertise(&c.namespace, address, ttl).await {
+            if let Some(address) = &config.advertised_address {
+                if let Err(error) = session.advertise(&config.namespace, address, ttl).await {
                     adx_observability::warn!("Master discovery renewal unavailable: {error}");
                 }
             }
@@ -156,6 +158,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tokio_stream::wrappers::TcpListenerStream::new(listener),
             shutdown(),
         );
-    tokio::select! { result = server => result?, _ = maintenance => (), _ = route_task => (), _ = collection => (), _ = recovery => (), result = metrics => result? }
+    tokio::select! {
+        result = server => result?,
+        _ = maintenance => {}
+        _ = route_task => {}
+        _ = collection => {}
+        _ = recovery => {}
+        result = metrics => result?,
+    }
     Ok(())
 }

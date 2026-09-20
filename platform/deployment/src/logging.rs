@@ -18,7 +18,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Policy {
     pub enabled: bool,
@@ -90,8 +90,8 @@ struct Archive {
     bytes: u64,
     modified: SystemTime,
 }
-fn archives(root: &Path, id: &str) -> io::Result<Vec<Archive>> {
-    let prefix = format!("{id}.log.");
+fn archives(root: &Path, service_id: &str) -> io::Result<Vec<Archive>> {
+    let prefix = format!("{service_id}.log.");
     let mut files = Vec::new();
     for entry in fs::read_dir(root)? {
         let entry = entry?;
@@ -101,7 +101,7 @@ fn archives(root: &Path, id: &str) -> io::Result<Vec<Archive>> {
             continue;
         };
         let digits = suffix.strip_suffix(".gz").unwrap_or(suffix);
-        if digits.len() != 20 || !digits.bytes().all(|c| c.is_ascii_digit()) {
+        if digits.len() != 20 || !digits.bytes().all(|character| character.is_ascii_digit()) {
             continue;
         }
         let meta = fs::symlink_metadata(entry.path())?;
@@ -115,7 +115,7 @@ fn archives(root: &Path, id: &str) -> io::Result<Vec<Archive>> {
             modified: meta.modified()?,
         });
     }
-    files.sort_by_key(|a| a.sequence);
+    files.sort_by_key(|archive| archive.sequence);
     Ok(files)
 }
 fn open(path: &Path) -> io::Result<File> {
@@ -126,30 +126,34 @@ fn open(path: &Path) -> io::Result<File> {
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)
 }
-fn maintain(root: &Path, id: &str, policy: &Policy) -> io::Result<()> {
+fn maintain(root: &Path, service_id: &str, policy: &Policy) -> io::Result<()> {
     if policy.compress {
-        for archive in archives(root, id)? {
+        for archive in archives(root, service_id)? {
             if archive.modified.elapsed().unwrap_or_default()
                 < Duration::from_secs(policy.compress_after_seconds)
             {
                 continue;
             }
-            if archive.path.extension().is_some_and(|s| s == "gz") {
+            if archive
+                .path
+                .extension()
+                .is_some_and(|extension| extension == "gz")
+            {
                 continue;
             }
-            let gz = PathBuf::from(format!("{}.gz", archive.path.display()));
-            let temp = PathBuf::from(format!("{}.gz.tmp", archive.path.display()));
+            let compressed_path = PathBuf::from(format!("{}.gz", archive.path.display()));
+            let temporary_path = PathBuf::from(format!("{}.gz.tmp", archive.path.display()));
             // A previous interrupted compression still has its canonical source.
-            match fs::remove_file(&temp) {
+            match fs::remove_file(&temporary_path) {
                 Ok(()) => (),
-                Err(e) if e.kind() == io::ErrorKind::NotFound => (),
-                Err(e) => return Err(e),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => (),
+                Err(error) => return Err(error),
             }
             let file = OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .mode(0o600)
-                .open(&temp)?;
+                .open(&temporary_path)?;
             let mut encoder = GzEncoder::new(file, Compression::fast());
             let mut source = OpenOptions::new()
                 .read(true)
@@ -159,15 +163,18 @@ fn maintain(root: &Path, id: &str, policy: &Policy) -> io::Result<()> {
             let compressed = encoder.finish()?;
             compressed.set_times(fs::FileTimes::new().set_modified(archive.modified))?;
             compressed.sync_all()?;
-            fs::rename(&temp, &gz)?;
+            fs::rename(&temporary_path, &compressed_path)?;
             // If interrupted after rename, retrying from the source safely
             // replaces this gzip, rather than retaining two completed copies.
             fs::remove_file(&archive.path)?;
         }
     }
-    let files = archives(root, id)?;
+    let files = archives(root, service_id)?;
     let mut count = files.len();
-    let mut bytes = files.iter().map(|f| u128::from(f.bytes)).sum::<u128>();
+    let mut total_bytes = files
+        .iter()
+        .map(|file| u128::from(file.bytes))
+        .sum::<u128>();
     for file in files {
         if file.modified.elapsed().unwrap_or_default()
             < Duration::from_secs(policy.compress_after_seconds)
@@ -179,10 +186,10 @@ fn maintain(root: &Path, id: &str, policy: &Policy) -> io::Result<()> {
                 .elapsed()
                 .is_ok_and(|elapsed| elapsed >= Duration::from_secs(age))
         });
-        if count > policy.max_files || bytes > u128::from(policy.max_total_bytes) || expired {
+        if count > policy.max_files || total_bytes > u128::from(policy.max_total_bytes) || expired {
             fs::remove_file(file.path)?;
             count -= 1;
-            bytes -= u128::from(file.bytes);
+            total_bytes -= u128::from(file.bytes);
         }
     }
     Ok(())
@@ -200,10 +207,10 @@ struct Writer {
 impl Writer {
     fn ensure(&mut self) -> io::Result<()> {
         if self.file.is_none() {
-            let f = open(&self.root.join(format!("{}.log", self.id)))?;
-            self.bytes = f.metadata()?.len();
-            self.since = f.metadata()?.modified()?;
-            self.file = Some(f)
+            let file = open(&self.root.join(format!("{}.log", self.id)))?;
+            self.bytes = file.metadata()?.len();
+            self.since = file.metadata()?.modified()?;
+            self.file = Some(file)
         }
         Ok(())
     }
@@ -261,15 +268,15 @@ impl Writer {
     fn write(&mut self, mut bytes: &[u8]) -> io::Result<()> {
         while !bytes.is_empty() {
             self.tick()?;
-            let n = bytes
+            let chunk_size = bytes
                 .len()
                 .min((self.policy.max_file_bytes - self.bytes).min(usize::MAX as u64) as usize);
             self.file
                 .as_mut()
                 .ok_or_else(|| io::Error::other("active log file missing"))?
-                .write_all(&bytes[..n])?;
-            self.bytes += n as u64;
-            bytes = &bytes[n..];
+                .write_all(&bytes[..chunk_size])?;
+            self.bytes += chunk_size as u64;
+            bytes = &bytes[chunk_size..];
         }
         Ok(())
     }
@@ -281,30 +288,30 @@ struct Records {
 }
 impl Records {
     fn push(&mut self, bytes: &[u8], writer: &mut Writer, health: &Health) {
-        for part in bytes.split_inclusive(|b| *b == b'\n') {
-            let end = part.ends_with(b"\n");
+        for chunk in bytes.split_inclusive(|byte| *byte == b'\n') {
+            let ends_record = chunk.ends_with(b"\n");
             if self.discarding {
                 health
                     .failed_bytes
-                    .fetch_add(part.len() as u64, Ordering::Relaxed);
-                if end {
+                    .fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                if ends_record {
                     self.discarding = false;
                 }
                 continue;
             }
-            if self.pending.len() + part.len() > writer.policy.max_record_bytes {
+            if self.pending.len() + chunk.len() > writer.policy.max_record_bytes {
                 health
                     .failed_bytes
-                    .fetch_add((self.pending.len() + part.len()) as u64, Ordering::Relaxed);
+                    .fetch_add((self.pending.len() + chunk.len()) as u64, Ordering::Relaxed);
                 health.report(io::Error::other(
                     "component log record exceeds max_record_bytes",
                 ));
                 self.pending.clear();
-                self.discarding = !end;
+                self.discarding = !ends_record;
                 continue;
             }
-            self.pending.extend_from_slice(part);
-            if end {
+            self.pending.extend_from_slice(chunk);
+            if ends_record {
                 if let Err(error) = writer.record(&self.pending) {
                     health
                         .failed_bytes
@@ -325,51 +332,51 @@ pub struct Capture {
 impl Capture {
     pub fn attach(
         command: &mut Command,
-        root: &Path,
-        id: &str,
+        log_directory: &Path,
+        service_id: &str,
         policy: Policy,
     ) -> io::Result<Self> {
-        let (mut read, write) = UnixStream::pair()?;
-        read.set_read_timeout(Some(Duration::from_millis(100)))?;
-        let sequence = archives(root, id)?
+        let (mut log_reader, log_writer) = UnixStream::pair()?;
+        log_reader.set_read_timeout(Some(Duration::from_millis(100)))?;
+        let sequence = archives(log_directory, service_id)?
             .iter()
-            .map(|a| a.sequence)
+            .map(|archive| archive.sequence)
             .max()
             .unwrap_or(0);
-        let (wake, events) = mpsc::sync_channel(1);
+        let (maintenance_wake, maintenance_events) = mpsc::sync_channel(1);
         let mut writer = Writer {
-            root: root.into(),
-            id: id.into(),
+            root: log_directory.into(),
+            id: service_id.into(),
             policy: policy.clone(),
             file: None,
             bytes: 0,
             sequence,
             since: SystemTime::now(),
-            wake,
+            wake: maintenance_wake,
         };
         writer.ensure()?;
-        let stdout: OwnedFd = write.try_clone()?.into();
-        let stderr: OwnedFd = write.into();
+        let stdout: OwnedFd = log_writer.try_clone()?.into();
+        let stderr: OwnedFd = log_writer.into();
         command
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr));
         let health = Arc::new(Health::default());
         let stop = Arc::new(AtomicBool::new(false));
-        let done = stop.clone();
-        let state = health.clone();
+        let stop_requested = stop.clone();
+        let health_state = health.clone();
         let thread = thread::spawn(move || {
-            let (root, id, policy) = (
+            let (log_directory, service_id, policy) = (
                 writer.root.clone(),
                 writer.id.clone(),
                 writer.policy.clone(),
             );
-            let h = state.clone();
+            let maintenance_health = health_state.clone();
             let maintenance = thread::spawn(move || loop {
-                if let Err(error) = maintain(&root, &id, &policy) {
-                    h.report(error)
+                if let Err(error) = maintain(&log_directory, &service_id, &policy) {
+                    maintenance_health.report(error)
                 }
                 if matches!(
-                    events.recv_timeout(Duration::from_secs(1)),
+                    maintenance_events.recv_timeout(Duration::from_secs(1)),
                     Err(mpsc::RecvTimeoutError::Disconnected)
                 ) {
                     break;
@@ -378,16 +385,18 @@ impl Capture {
             let mut buffer = [0; 16384];
             let mut records = Records::default();
             loop {
-                match read.read(&mut buffer) {
+                match log_reader.read(&mut buffer) {
                     Ok(0) => break,
-                    Ok(n) => {
+                    Ok(bytes_read) => {
                         if writer.policy.line_records {
-                            records.push(&buffer[..n], &mut writer, &state);
+                            records.push(&buffer[..bytes_read], &mut writer, &health_state);
                             continue;
                         }
-                        if let Err(error) = writer.write(&buffer[..n]) {
-                            state.failed_bytes.fetch_add(n as u64, Ordering::Relaxed);
-                            state.report(error);
+                        if let Err(error) = writer.write(&buffer[..bytes_read]) {
+                            health_state
+                                .failed_bytes
+                                .fetch_add(bytes_read as u64, Ordering::Relaxed);
+                            health_state.report(error);
                             writer.file = None;
                         }
                     }
@@ -397,26 +406,26 @@ impl Capture {
                             io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
                         ) =>
                     {
-                        if done.load(Ordering::Acquire) {
+                        if stop_requested.load(Ordering::Acquire) {
                             break;
                         }
                         if let Err(error) = writer.tick() {
-                            state.report(error)
+                            health_state.report(error)
                         }
                     }
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                     Err(error) => {
-                        state.report(error);
+                        health_state.report(error);
                         break;
                     }
                 }
             }
             if writer.policy.line_records && !records.pending.is_empty() {
-                records.push(b"\n", &mut writer, &state);
+                records.push(b"\n", &mut writer, &health_state);
             }
             if let Some(file) = &writer.file {
                 if let Err(error) = file.sync_all() {
-                    state.report(error)
+                    health_state.report(error)
                 }
             }
             // The final wake is consumed before channel disconnection, so the
@@ -424,7 +433,7 @@ impl Capture {
             let _ = writer.wake.send(());
             drop(writer);
             if maintenance.join().is_err() {
-                state.report(io::Error::other("log maintenance thread panicked"));
+                health_state.report(io::Error::other("log maintenance thread panicked"));
             }
         });
         Ok(Self {

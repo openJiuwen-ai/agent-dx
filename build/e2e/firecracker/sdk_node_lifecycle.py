@@ -24,8 +24,8 @@ p.add_argument('--tools', default='/opt/adx-pause/tools', type=Path)
 p.add_argument('--sbox', default='/opt/adx-fc/bin/sbox', type=Path)
 a = p.parse_args()
 root = a.run_root.resolve()
-assert (root/'deployment.json').is_file(), 'explicit deployed fixture required'
-config = json.loads((root/'deployment.json').read_text())
+assert (root/'deployment.yaml').is_file(), 'explicit deployed fixture required'
+config = json.loads((root/'deployment.yaml').read_text())
 assert Path(config['package_dir']).resolve() == a.package.resolve()
 os.environ['SSL_CERT_FILE'] = str(root/'secrets/tls/ca.pem')
 from adx_sandbox import Sandbox, RestartPolicy, ConnectionConfig
@@ -50,7 +50,7 @@ def record(id):
     return catalog().get('instance:'+id,{}).get('result')
 
 def services():
-    return json.loads(command([a.package/'bin/adxctl','status','--config',root/'deployment.json']))['services']
+    return json.loads(command([a.package/'bin/adxctl','status','--config',root/'deployment.yaml']))['services']
 
 def pid(role):
     matches = [s['pid'] for s in services() if s['role'] == role]

@@ -1,0 +1,69 @@
+schema_version: 1
+package_dir: /opt/adx
+state_dir: /run/adx/node
+redis_url: redis://redis.internal:6379/
+namespace: adx
+restart_limit: 3
+restart_delay_ms: 1000
+stop_timeout_seconds: 90
+services:
+  - id: node-manager
+    role: node-manager
+    config:
+      node_id: node-1
+      listen: 0.0.0.0:19001
+      advertised_address: node-1.internal:19001
+      proxy_address: node-1.internal:19002
+      tls:
+        ca: /etc/adx/tls/ca.pem
+        certificate: /etc/adx/tls/node-1.pem
+        private_key: /etc/adx/tls/node-1.key
+        server_name: adx.internal
+        peers:
+          master: /etc/adx/tls/master.der
+          api-server: /etc/adx/tls/api-server.der
+      sandboxd_socket: /run/sandboxd/sandboxd.sock
+      proxy_socket: /run/adx/node/route.sock
+      report_interval_seconds: 5
+      rpc_timeout_seconds: 30
+      rrt_port: 50090
+      rrt_env: {}
+      checkpoint_dir: /var/lib/adx/checkpoints
+      resource_source:
+        kind: auto
+        disk_path: /var/lib/adx
+        valid_for_seconds: 30
+      degradation_journal: /var/lib/adx/degraded/results.sqlite
+      metrics_listen: 127.0.0.1:19091
+    env:
+      ADX_DATA_PLANE_NODE_PROXY_ACTIVITY_UDS_DIR: /run/adx/node
+      ADX_DATA_PLANE_NODE_PROXY_BIND: 0.0.0.0:19002
+      ADX_DATA_PLANE_NODE_PROXY_ADVERTISE_ADDRESS: node-1.internal:19002
+      ADX_DATA_PLANE_ALLOWED_TARGET_CIDRS: 10.88.0.0/16
+      ADX_DATA_PLANE_ALLOWED_EDGE_CIDRS: 127.0.0.1/32
+      ADX_DATA_PLANE_EDGE_FRONTEND_NODE_SECURITY_MODE: mtls
+      ADX_DATA_PLANE_NODE_PROXY_TLS_CERT: /etc/adx/tls/node-1.pem
+      ADX_DATA_PLANE_NODE_PROXY_TLS_KEY: /etc/adx/tls/node-1.key
+      ADX_DATA_PLANE_NODE_PROXY_MTLS_CLIENT_CA: /etc/adx/tls/ca.pem
+logging:
+  enabled: true
+  max_file_bytes: 104857600
+  rotate_seconds: 86400
+  compress: true
+  max_files: 5
+  max_age_seconds: 604800
+  max_total_bytes: 1073741824
+runtime_environment:
+  rootfs:
+    runtime: runsc
+    type: local
+    path: /opt/adx/runtime/adx-runtime-rootfs.img
+    readonly: false
+  bootstrap:
+    type: erofs
+    root: /opt/adx/runtime/adx-runtime-rootfs.img
+    target: /__adx
+    entrypoint:
+      - /__adx/usr/local/bin/rrt-runtime
+  env:
+    PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin

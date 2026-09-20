@@ -1,4 +1,5 @@
 use adx_api_server::{clients::Clients, config::Config, http::Api};
+use adx_service_runtime::{read_config, shutdown};
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use std::{sync::Arc, time::Duration};
@@ -11,7 +12,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     adx_observability::init().map_err(|_| "logging initialization failed")?;
     let _tracing = adx_observability::trace::init("adx-api-server")
         .map_err(|_| "tracing initialization failed")?;
-    let config: Config = adx_protocol::tls::read_config()?;
+    let config: Config = read_config()?;
     config.validate()?;
     let clients = Clients::new(config.clone())?;
     let api = Api::new(clients).map_err(|_| "API initialization failed")?;
@@ -33,20 +34,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     adx_observability::info!(address=%listener.local_addr()?,"adx-api-server listening");
     let (stop, receiver) = watch::channel(false);
     let mut tasks = JoinSet::new();
-    let shutdown = adx_protocol::tls::shutdown();
+    let shutdown = shutdown();
     tokio::pin!(shutdown);
     loop {
         tokio::select! {
-         _=&mut shutdown=>break,
-         Some(_)=tasks.join_next(),if !tasks.is_empty()=>{},
-         accepted=listener.accept()=>{
-          let (socket,_)=accepted?;let api=api.clone();let acceptor=acceptor.clone();let stop=receiver.clone();
-          tasks.spawn(async move{
-           if let Some(acceptor)=acceptor{
-            if let Ok(Ok(stream))=tokio::time::timeout(Duration::from_secs(10),acceptor.accept(socket)).await{serve(stream,api,stop).await;}
-           }else{serve(socket,api,stop).await;}
-          });
-         }
+            _ = &mut shutdown => break,
+            Some(result) = tasks.join_next(), if !tasks.is_empty() => {
+                if let Err(error) = result {
+                    adx_observability::warn!(%error, "API connection task failed");
+                }
+            }
+            accepted = listener.accept() => {
+                let (socket, _peer_address) = accepted?;
+                let api = api.clone();
+                let acceptor = acceptor.clone();
+                let stop = receiver.clone();
+                tasks.spawn(async move {
+                    if let Some(acceptor) = acceptor {
+                        match tokio::time::timeout(
+                            Duration::from_secs(10),
+                            acceptor.accept(socket),
+                        )
+                        .await
+                        {
+                            Ok(Ok(stream)) => serve(stream, api, stop).await,
+                            Ok(Err(error)) => {
+                                adx_observability::warn!(%error, "API TLS handshake failed");
+                            }
+                            Err(_) => {
+                                adx_observability::warn!("API TLS handshake timed out");
+                            }
+                        }
+                    } else {
+                        serve(socket, api, stop).await;
+                    }
+                });
+            }
         }
     }
     let _ = stop.send(true);
@@ -74,5 +97,11 @@ where
         service_fn(move |request| api.clone().serve(request)),
     );
     tokio::pin!(connection);
-    tokio::select! {_=connection.as_mut()=>{},_=stop.changed()=>{connection.as_mut().graceful_shutdown();let _=connection.await;}}
+    tokio::select! {
+        _ = connection.as_mut() => {}
+        _ = stop.changed() => {
+            connection.as_mut().graceful_shutdown();
+            let _ = connection.await;
+        }
+    }
 }

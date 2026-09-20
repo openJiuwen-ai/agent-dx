@@ -90,14 +90,14 @@ def main():
         digest=publish.publish(str(base/'rrt.tar'))
         image=f'{HOST}:5000/adx-rrt@{digest}'
         (evidence/'rrt-image.json').write_text(json.dumps({'image':image}))
-        spawn('control',[base/'package/bin/adxctl','run','--config',root/'deployment.json'])
+        spawn('control',[base/'package/bin/adxctl','run','--config',root/'deployment.yaml'])
         for node,ns in namespaces.items():
             folder=root/node
             mask=folder/'peer-mask';mask.mkdir()
             peer=root/('node2' if node=='node1' else 'node1')
             backend_pids[node]=spawn(node+'-sandboxd',['nsenter','--net=/var/run/netns/'+ns,'unshare','--mount','--propagation','private','sh','-ec','mount --bind "$1" "$2"; shift 2; exec "$@"','sh',mask,peer,'sandboxd','--root',folder/'sandboxd/root','--config',folder/'sandboxd/config.toml','--socket',folder/'sandboxd/sandboxd.sock','--http-address','127.0.0.1:18081','--pprof-address','127.0.0.1:16061','--log-file',evidence/(node+'-sandboxd-service.log')]).pid
             wait(lambda:(folder/'sandboxd/sandboxd.sock').exists())
-            spawn(node,['nsenter','--net=/var/run/netns/'+ns,base/'package/bin/adxctl','run','--config',folder/'deployment.json']);started_nodes.append(node)
+            spawn(node,['nsenter','--net=/var/run/netns/'+ns,base/'package/bin/adxctl','run','--config',folder/'deployment.yaml']);started_nodes.append(node)
         authenv={**env,'REDISCLI_AUTH':(root/'secrets/redis-key').read_text().strip()}
         def ready():
             c=json.loads(subprocess.check_output(['redis-cli','--json','HGETALL','adx:{acceptance}:control:v1'],env=authenv,text=True,timeout=10))
@@ -126,9 +126,9 @@ def main():
                 call([*command,'-D',*rule])
         # Nodes drain while their backend and the control node remain alive.
         for node in reversed(started_nodes):
-            try:call([base/'package/bin/adxctl','stop','--config',root/node/'deployment.json'],timeout=90)
+            try:call([base/'package/bin/adxctl','stop','--config',root/node/'deployment.yaml'],timeout=90)
             except Exception as error:result['cleanup_errors'].append(f'{node}: {error}')
-        try:call([base/'package/bin/adxctl','stop','--config',root/'deployment.json'],timeout=90)
+        try:call([base/'package/bin/adxctl','stop','--config',root/'deployment.yaml'],timeout=90)
         except Exception as error:result['cleanup_errors'].append(f'control: {error}')
         for name,p in reversed(children):
             if p.poll() is None:

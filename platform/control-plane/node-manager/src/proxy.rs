@@ -6,8 +6,8 @@ use tokio::{sync::oneshot, task::JoinHandle};
 #[derive(Default, serde::Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProxyMode {
-    #[default]
     Standalone,
+    #[default]
     Embedded,
 }
 pub struct EmbeddedProxy {
@@ -63,5 +63,21 @@ impl EmbeddedProxy {
 impl Drop for EmbeddedProxy {
     fn drop(&mut self) {
         self.task.abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ProxyMode;
+
+    #[test]
+    fn proxy_is_embedded_by_default() {
+        assert!(ProxyMode::default() == ProxyMode::Embedded);
+    }
+
+    #[test]
+    fn standalone_mode_remains_explicitly_selectable() {
+        let mode: ProxyMode = serde_json::from_str("\"standalone\"").unwrap();
+        assert!(mode == ProxyMode::Standalone);
     }
 }

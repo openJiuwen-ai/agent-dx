@@ -36,7 +36,7 @@ def wait(test,seconds=120):
         time.sleep(.5)
     raise TimeoutError('example readiness timeout')
 def catalog():return {k:json.loads(v) for k,v in json.loads(output(['redis-cli','--json','HGETALL','adx:{adx}:control:v1'])).items()}
-def cli(command,*args):return ['/opt/adx/bin/adxctl',command,'--config','/etc/adx/deployment.json',*args]
+def cli(command,*args):return ['/opt/adx/bin/adxctl',command,'--config','/etc/adx/deployment.yaml',*args]
 def inventory():return output(['sbox','-a',SOCKET,'list']).strip().splitlines()[1:]
 try:
     # Reuse only the external sandboxd prerequisites from the FC fixture helper.
@@ -47,8 +47,8 @@ try:
     shutil.copytree(BASE/'package','/opt/adx',dirs_exist_ok=True)
     call(['python3',BASE/'e2e/package.py','verify','/opt/adx'])
     shutil.copyfile('/opt/adx/manifest.json',E/'package-manifest.json')
-    example=pathlib.Path('/opt/adx/etc/examples/deployment.json')
-    installed=pathlib.Path('/etc/adx/deployment.json');shutil.copyfile(example,installed);installed.chmod(0o600)
+    example=pathlib.Path('/opt/adx/etc/examples/deployment.yaml')
+    installed=pathlib.Path('/etc/adx/deployment.yaml');shutil.copyfile(example,installed);installed.chmod(0o600)
     result['example_sha256']=hashlib.sha256(example.read_bytes()).hexdigest()
     result['installed_sha256']=hashlib.sha256(installed.read_bytes()).hexdigest()
     tls=pathlib.Path('/etc/adx/tls');tls.mkdir(mode=0o700)

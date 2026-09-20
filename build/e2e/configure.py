@@ -1,7 +1,23 @@
-import json, pathlib, subprocess, sys, shutil, secrets, os, socket
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import pathlib
+import secrets
+import shutil
+import socket
+import subprocess
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Render one ADX E2E node configuration")
+    parser.add_argument("node", choices=("node1", "node2"))
+    return parser.parse_args()
+
+
 BASE=pathlib.Path('/opt/adx'); PRIVATE=pathlib.Path('/secrets'); EVIDENCE=pathlib.Path('/evidence')
 P=pathlib.Path('/tmp/adx-e2e'); P.mkdir(exist_ok=True)
-node=sys.argv[1]; T=PRIVATE/'tls'
+node=parse_args().node; T=PRIVATE/'tls'
 if not T.exists():
  subprocess.run(['python3','/opt/adx/e2e/rpc_certificates.py',str(T)],check=True)
  subprocess.run(['openssl','req','-newkey','rsa:2048','-nodes','-keyout',str(T/'node2.key'),'-out',str(T/'node2.csr'),'-subj','/CN=ADX test node2'],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
@@ -75,7 +91,13 @@ else:
 capacity={'cpu_millis':min(cpus,2000),'memory_bytes':min(memory//2,1536*1024**2),'disk_bytes':min(shutil.disk_usage(P).free//4,2*1024**3)}
 (P/'capacity-base.json').write_text(json.dumps(capacity))
 services=[]
-def add(id,role,c={},env={}):services.append({'id':id,'role':role,'config':c,'env':env})
+def add(service_id, role, config=None, env=None):
+ services.append({
+  'id': service_id,
+  'role': role,
+  'config': {} if config is None else config,
+  'env': {} if env is None else env,
+ })
 if node=='node1':
  (P/'redis').mkdir(exist_ok=True)
  add('redis','redis',{'bind':'0.0.0.0','port':6379,'data_dir':str(P/'redis'),'appendfsync':'always','password_file':str(redis_key)})
@@ -84,10 +106,9 @@ edge_peer=os.getenv('ADX_E2E_EDGE_IP')
 edge_cidrs=(edge_peer+('/128' if ':' in edge_peer else '/32')+',127.0.0.1/32') if edge_peer else '172.16.0.0/12,127.0.0.1/32'
 common={'ADX_DATA_PLANE_EDGE_FRONTEND_NODE_SECURITY_MODE':'mtls','RUST_LOG':'info','ADX_LOG_FORMAT':'json'}
 np={**common,'ADX_DATA_PLANE_NODE_PROXY_BIND':'0.0.0.0:18443','ADX_DATA_PLANE_NODE_PROXY_HEALTH_BIND':'127.0.0.1:19443','ADX_DATA_PLANE_ALLOWED_TARGET_CIDRS':f'10.231.{16 if node=="node1" else 32}.0/20','ADX_DATA_PLANE_ALLOWED_EDGE_CIDRS':edge_cidrs,'ADX_DATA_PLANE_NODE_PROXY_TLS_CERT':str(T/('node.pem' if node=='node1' else 'node2.pem')),'ADX_DATA_PLANE_NODE_PROXY_TLS_KEY':str(T/('node.key' if node=='node1' else 'node2.key')),'ADX_DATA_PLANE_NODE_PROXY_MTLS_CLIENT_CA':str(T/'ca.pem'),'ADX_DATA_PLANE_NODE_PROXY_ACTIVITY_UDS_DIR':str(P/'proxy')}
-add('proxy','node-proxy',env=np)
 host=os.getenv('ADX_E2E_NODE_IP') or ('master' if node=='node1' else 'node2')
 if ':' in host: host='['+host+']'
-add(node,'node-manager',{'node_id':node,'listen':'0.0.0.0:17001','metrics_listen':'0.0.0.0:17091','advertised_address':f'{host}:17001','proxy_address':f'{host}:18443','tls':tls('node' if node=='node1' else 'node2',{'master':'master','api-server':'api-server'}),'sandboxd_socket':str(R/'sandboxd.sock'),'proxy_socket':str(P/'proxy/route.sock'),'capacity_file':str(P/'capacity.json'),'report_interval_seconds':2,'rpc_timeout_seconds':120,'rrt_port':50090,'rrt_command':['/usr/local/bin/rrt-runtime'],'rrt_env':{'ADX_TRACE_ENABLED':'true','OTEL_EXPORTER_OTLP_TRACES_ENDPOINT':f'http://{socket.gethostbyname(host)}:14317/v1/traces','OTEL_BSP_SCHEDULE_DELAY':'200'}})
+add(node,'node-manager',{'node_id':node,'listen':'0.0.0.0:17001','metrics_listen':'0.0.0.0:17091','advertised_address':f'{host}:17001','proxy_address':f'{host}:18443','tls':tls('node' if node=='node1' else 'node2',{'master':'master','api-server':'api-server'}),'sandboxd_socket':str(R/'sandboxd.sock'),'proxy_socket':str(P/'proxy/route.sock'),'capacity_file':str(P/'capacity.json'),'report_interval_seconds':2,'rpc_timeout_seconds':120,'rrt_port':50090,'rrt_command':['/usr/local/bin/rrt-runtime'],'rrt_env':{'ADX_TRACE_ENABLED':'true','OTEL_EXPORTER_OTLP_TRACES_ENDPOINT':f'http://{socket.gethostbyname(host)}:14317/v1/traces','OTEL_BSP_SCHEDULE_DELAY':'200'}},np)
 if node=='node1':
  add('api','api-server',{'listen':'127.0.0.1:8888','loopback_http':True,'discovery':{'poll_seconds':1},'ca':str(T/'ca.pem'),'certificate':str(T/'api-server.pem'),'private_key':str(T/'api-server.key'),'server_name':'localhost','rpc_timeout_seconds':120,'cache_entries':1000,'auth_cache_ttl_seconds':10})
  ee={**common,'ADX_DATA_PLANE_EDGE_FRONTEND_TLS_BIND':'0.0.0.0:8443','ADX_DATA_PLANE_EDGE_FRONTEND_PLAIN_BIND':'127.0.0.1:8080','ADX_DATA_PLANE_EDGE_FRONTEND_HEALTH_BIND':'127.0.0.1:18080','ADX_DATA_PLANE_EDGE_FRONTEND_TLS_CERT':str(T/'edge.pem'),'ADX_DATA_PLANE_EDGE_FRONTEND_TLS_KEY':str(T/'edge.key'),'ADX_DATA_PLANE_EDGE_FRONTEND_ALLOWED_CLIENT_CIDRS':'127.0.0.1/32','ADX_DATA_PLANE_EDGE_FRONTEND_NODE_TLS_CA':str(T/'ca.pem'),'ADX_DATA_PLANE_EDGE_FRONTEND_NODE_TLS_SERVER_NAME':'localhost','ADX_DATA_PLANE_EDGE_FRONTEND_NODE_TLS_CLIENT_CERT':str(T/'edge.pem'),'ADX_DATA_PLANE_EDGE_FRONTEND_NODE_TLS_CLIENT_KEY':str(T/'edge.key'),'ADX_DATA_PLANE_EDGE_FRONTEND_CONTROL_PLANE_ADDRESS':'127.0.0.1:8888'}
@@ -112,6 +133,6 @@ elif runtime_artifact.is_file():
   'bootstrap':{'type':'erofs','root':str(runtime_artifact),'target':'/__adx',
     'entrypoint':['/__adx/usr/local/bin/rrt-runtime']},
   'env':{'PATH':'/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'}}
-(P/'deployment.json').write_text(json.dumps(d));(P/'deployment.json').chmod(0o600)
+(P/'deployment.yaml').write_text(json.dumps(d));(P/'deployment.yaml').chmod(0o600)
 (EVIDENCE/f'deployment-{node}.json').write_text(json.dumps({**d,'redis_url':'redis://:REDACTED@master:6379/'},indent=2))
 print('configured',node,capacity)

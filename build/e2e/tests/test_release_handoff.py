@@ -40,7 +40,7 @@ class ReleaseArchiveTests(unittest.TestCase):
             self.assertTrue((restored/'manifest.json').is_file())
             self.assertTrue((restored/'LICENSE').is_file())
             self.assertTrue((restored/'bin/adx-master').stat().st_mode & 0o111)
-            self.assertTrue((restored/'etc/examples/deployment.json').is_file())
+            self.assertTrue((restored/'etc/examples/deployment.yaml').is_file())
 
     def test_python_bytecode_does_not_dirty_build_sources(self):
         with tempfile.TemporaryDirectory() as temp:

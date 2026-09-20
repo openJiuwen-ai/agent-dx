@@ -1,0 +1,56 @@
+schema_version: 1
+package_dir: /opt/adx
+state_dir: /run/adx/master
+redis_url: redis://redis.internal:6379/
+namespace: adx
+restart_limit: 3
+restart_delay_ms: 1000
+stop_timeout_seconds: 90
+services:
+  - id: master
+    role: master
+    config:
+      listen: 0.0.0.0:19000
+      scheduler_shards: 1
+      placement: pack
+      rpc_timeout_seconds: 30
+      tls:
+        ca: /etc/adx/tls/ca.pem
+        certificate: /etc/adx/tls/master.pem
+        private_key: /etc/adx/tls/master.key
+        server_name: adx.internal
+        peers:
+          api-server: /etc/adx/tls/api-server.der
+          node:node-1: /etc/adx/tls/node-1.der
+          edge: /etc/adx/tls/edge.der
+      bootstrap_credentials:
+        - key_file: /etc/adx/secrets/admin-key
+          tenant_id: admin
+          administrator: true
+          expires_at_unix_seconds: 0
+      advertised_address: https://master.internal:19000
+      heartbeat_timeout_seconds: 30
+      discovery_ttl_seconds: 15
+      metrics_listen: 127.0.0.1:19090
+logging:
+  enabled: true
+  max_file_bytes: 104857600
+  rotate_seconds: 86400
+  compress: true
+  max_files: 5
+  max_age_seconds: 604800
+  max_total_bytes: 1073741824
+runtime_environment:
+  rootfs:
+    runtime: runsc
+    type: local
+    path: /opt/adx/runtime/adx-runtime-rootfs.img
+    readonly: false
+  bootstrap:
+    type: erofs
+    root: /opt/adx/runtime/adx-runtime-rootfs.img
+    target: /__adx
+    entrypoint:
+      - /__adx/usr/local/bin/rrt-runtime
+  env:
+    PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin

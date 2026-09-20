@@ -391,10 +391,13 @@ impl RedisStore {
             }
         }
     }
-    async fn fields(&self, fields: &[String]) -> Result<Vec<Option<String>>> {
+    async fn fields<const N: usize>(&self, fields: [String; N]) -> Result<[Option<String>; N]> {
         let mut cmd = redis::cmd("HMGET");
-        cmd.arg(&self.key).arg(fields);
-        self.query(cmd).await
+        cmd.arg(&self.key).arg(&fields);
+        let values: Vec<Option<String>> = self.query(cmd).await?;
+        values.try_into().map_err(|_| {
+            Error::Unavailable("Redis returned an unexpected control field count".into())
+        })
     }
     async fn raw(&self) -> Result<BTreeMap<String, String>> {
         let mut cmd = redis::cmd("HGETALL");
@@ -492,9 +495,8 @@ pub struct Session {
 }
 impl Session {
     pub async fn revision(&self) -> Result<u64> {
-        Ok(self
-            .header(&self.store.fields(&[HEADER.into()]).await?[0])?
-            .revision)
+        let [header_value] = self.store.fields([HEADER.into()]).await?;
+        Ok(self.header(&header_value)?.revision)
     }
     pub fn epoch(&self) -> u64 {
         self.epoch
@@ -511,10 +513,17 @@ impl Session {
         };
         record.validate()?;
         for _ in 0..ATTEMPTS {
-            let raw = self.store.fields(&[HEADER.into()]).await?;
-            self.header(&raw[0])?;
+            let [header_value] = self.store.fields([HEADER.into()]).await?;
+            self.header(&header_value)?;
+            let expected_header = header_value.as_deref().ok_or(Error::Conflict)?;
             let mut cmd = redis::cmd("EVAL");
-            cmd.arg("if redis.call('HGET', KEYS[1], 'header') ~= ARGV[1] then return 0 end; redis.call('SET', KEYS[2], ARGV[2], 'PX', ARGV[3]); return 1").arg(2).arg(&self.store.key).arg(&key).arg(raw[0].as_deref().ok_or(Error::Conflict)?).arg(encode(&record)?).arg(ttl.as_millis() as u64);
+            cmd.arg("if redis.call('HGET', KEYS[1], 'header') ~= ARGV[1] then return 0 end; redis.call('SET', KEYS[2], ARGV[2], 'PX', ARGV[3]); return 1")
+                .arg(2)
+                .arg(&self.store.key)
+                .arg(&key)
+                .arg(expected_header)
+                .arg(encode(&record)?)
+                .arg(ttl.as_millis() as u64);
             let accepted: u64 = self.store.query(cmd).await?;
             if accepted == 1 {
                 return Ok(());
@@ -532,8 +541,9 @@ impl Session {
     ) -> Result<()> {
         credential.validate()?;
         let digest = crate::auth::digest(key)?;
-        let header = self.store.fields(&[HEADER.into()]).await?;
-        self.header(&header[0])?;
+        let [header_value] = self.store.fields([HEADER.into()]).await?;
+        self.header(&header_value)?;
+        let expected_header = header_value.as_deref().ok_or(Error::Conflict)?;
         let encoded = serde_json::to_string(credential)
             .map_err(|_| Error::Invalid("credential encoding failed".into()))?;
         let mut command = redis::cmd("EVAL");
@@ -552,7 +562,7 @@ impl Session {
             .arg(&self.store.key)
             .arg(format!("{}:credentials", self.store.key))
             .arg(format!("{}:revoked-credentials", self.store.key))
-            .arg(header[0].as_deref().ok_or(Error::Conflict)?)
+            .arg(expected_header)
             .arg(digest)
             .arg(encoded);
         let accepted: u64 = self.store.query(command).await?;
@@ -562,7 +572,8 @@ impl Session {
         Ok(())
     }
     pub async fn credential(&self, digest: &str) -> Result<crate::auth::Credential> {
-        self.header(&self.store.fields(&[HEADER.into()]).await?[0])?;
+        let [header_value] = self.store.fields([HEADER.into()]).await?;
+        self.header(&header_value)?;
         let mut command = redis::cmd("HGET");
         command
             .arg(format!("{}:credentials", self.store.key))
@@ -574,23 +585,23 @@ impl Session {
     }
 
     pub async fn get(&self, id: &str) -> Result<StoredInstance> {
-        let values = self
+        let [header_value, instance_value] = self
             .store
-            .fields(&[HEADER.into(), format!("instance:{id}")])
+            .fields([HEADER.into(), format!("instance:{id}")])
             .await?;
-        self.header(&values[0])?;
-        let record: StoredInstance = decode(values[1].as_deref().ok_or(Error::NotFound)?)?;
+        self.header(&header_value)?;
+        let record: StoredInstance = decode(instance_value.as_deref().ok_or(Error::NotFound)?)?;
         record.validate()?;
         Ok(record)
     }
 
     fn header(&self, value: &Option<String>) -> Result<Header> {
-        let h: Header = decode(value.as_deref().ok_or(Error::Conflict)?)?;
-        h.validate()?;
-        if h.epoch != self.epoch {
+        let header: Header = decode(value.as_deref().ok_or(Error::Conflict)?)?;
+        header.validate()?;
+        if header.epoch != self.epoch {
             return Err(Error::Conflict);
         }
-        Ok(h)
+        Ok(header)
     }
     pub async fn snapshot(&self) -> Result<StoredSnapshot> {
         let raw = self.store.raw().await?;
@@ -621,24 +632,25 @@ impl Session {
         }
         let field = format!("node:{}", node.id);
         for _ in 0..ATTEMPTS {
-            let values = self.store.fields(&[HEADER.into(), field.clone()]).await?;
-            let mut h = self.header(&values[0])?;
-            let shard = if let Some(v) = &values[1] {
-                decode::<StoredNode>(v)?.shard_id
+            let [header_value, node_value] =
+                self.store.fields([HEADER.into(), field.clone()]).await?;
+            let mut header = self.header(&header_value)?;
+            let shard = if let Some(node_value) = &node_value {
+                decode::<StoredNode>(node_value)?.shard_id
             } else {
                 let current = self.snapshot().await?;
-                if current.revision != h.revision {
+                if current.revision != header.revision {
                     continue;
                 }
-                let mut counts = vec![0usize; h.shards];
-                for n in current.nodes.values() {
-                    counts[n.shard_id] += 1;
+                let mut counts = vec![0usize; header.shards];
+                for node in current.nodes.values() {
+                    counts[node.shard_id] += 1;
                 }
-                let shard = (0..h.shards)
-                    .map(|offset| (h.next_node_shard + offset) % h.shards)
-                    .min_by_key(|d| counts[*d])
+                let shard = (0..header.shards)
+                    .map(|offset| (header.next_node_shard + offset) % header.shards)
+                    .min_by_key(|shard| counts[*shard])
                     .expect("nonempty shards");
-                h.next_node_shard = (shard + 1) % h.shards;
+                header.next_node_shard = (shard + 1) % header.shards;
                 shard
             };
             let record = StoredNode {
@@ -649,17 +661,17 @@ impl Session {
                 session: session.clone(),
             };
             let encoded = encode(&record)?;
-            if values[1].as_ref() == Some(&encoded) {
+            if node_value.as_ref() == Some(&encoded) {
                 return Ok(record);
             }
-            h.advance()?;
+            header.advance()?;
             if self
                 .store
                 .cas(
-                    values[0]
+                    header_value
                         .as_deref()
                         .expect("validated control header is present"),
-                    &h,
+                    &header,
                     Some((&field, encoded)),
                 )
                 .await?
@@ -700,38 +712,38 @@ impl Session {
         record.validate()?;
         let field = format!("instance:{}", record.spec.id);
         for _ in 0..ATTEMPTS {
-            let values = self
+            let [header_value, instance_value, node_value] = self
                 .store
-                .fields(&[
+                .fields([
                     HEADER.into(),
                     field.clone(),
                     format!("node:{}", record.assignment.node_id),
                 ])
                 .await?;
-            let mut h = self.header(&values[0])?;
-            if let Some(v) = &values[1] {
-                let old: StoredInstance = decode(v)?;
-                return if old.spec == record.spec && old.assignment == record.assignment {
-                    Ok(old)
+            let mut header = self.header(&header_value)?;
+            if let Some(instance_value) = &instance_value {
+                let existing: StoredInstance = decode(instance_value)?;
+                return if existing.spec == record.spec && existing.assignment == record.assignment {
+                    Ok(existing)
                 } else {
                     Err(Error::Conflict)
                 };
             }
-            let node: StoredNode = decode(values[2].as_deref().ok_or(Error::NotFound)?)?;
+            let node: StoredNode = decode(node_value.as_deref().ok_or(Error::NotFound)?)?;
             if node.shard_id != record.assignment.shard_id
-                || record.assignment.generation <= h.generation
+                || record.assignment.generation <= header.generation
             {
                 return Err(Error::Conflict);
             }
-            h.generation = record.assignment.generation;
-            h.advance()?;
+            header.generation = record.assignment.generation;
+            header.advance()?;
             if self
                 .store
                 .cas(
-                    values[0]
+                    header_value
                         .as_deref()
                         .expect("validated control header is present"),
-                    &h,
+                    &header,
                     Some((&field, encode(&record)?)),
                 )
                 .await?
@@ -757,51 +769,52 @@ impl Session {
         }
         let field = format!("instance:{}", previous.instance_id);
         for _ in 0..ATTEMPTS {
-            let values = self
+            let [header_value, instance_value, node_value] = self
                 .store
-                .fields(&[
+                .fields([
                     HEADER.into(),
                     field.clone(),
                     format!("node:{}", replacement.node_id),
                 ])
                 .await?;
-            let mut h = self.header(&values[0])?;
-            let mut old: StoredInstance = decode(values[1].as_deref().ok_or(Error::NotFound)?)?;
-            old.validate()?;
-            if old.assignment == replacement {
-                return Ok(old);
+            let mut header = self.header(&header_value)?;
+            let mut stored_instance: StoredInstance =
+                decode(instance_value.as_deref().ok_or(Error::NotFound)?)?;
+            stored_instance.validate()?;
+            if stored_instance.assignment == replacement {
+                return Ok(stored_instance);
             }
-            if old.invalidated
-                || &old.assignment != previous
-                || old
+            if stored_instance.invalidated
+                || &stored_instance.assignment != previous
+                || stored_instance
                     .result
                     .as_ref()
                     .is_some_and(|r| r.state != InstanceState::Failed || r.resources_held)
-                || replacement.generation <= h.generation
+                || replacement.generation <= header.generation
             {
                 return Err(Error::Conflict);
             }
-            let node: StoredNode = decode(values[2].as_deref().ok_or(Error::NotFound)?)?;
+            let node: StoredNode = decode(node_value.as_deref().ok_or(Error::NotFound)?)?;
             if node.shard_id != replacement.shard_id {
                 return Err(Error::Conflict);
             }
-            old.assignment = replacement.clone();
-            old.result = None;
-            old.validate()?;
-            h.generation = replacement.generation;
-            h.advance()?;
+            stored_instance.assignment = replacement.clone();
+            stored_instance.result = None;
+            stored_instance.validate()?;
+            header.generation = replacement.generation;
+            header.advance()?;
             if self
                 .store
                 .cas(
-                    values[0]
+                    header_value
                         .as_deref()
                         .expect("validated control header is present"),
-                    &h,
-                    Some((&field, encode(&old)?)),
+                    &header,
+                    Some((&field, encode(&stored_instance)?)),
                 )
                 .await?
             {
-                return Ok(old);
+                return Ok(stored_instance);
             }
         }
         Err(Error::Unavailable(
@@ -830,27 +843,29 @@ impl Session {
         }
         let field = format!("instance:{}", result.spec.id);
         for _ in 0..ATTEMPTS {
-            let values = self.store.fields(&[HEADER.into(), field.clone()]).await?;
-            let mut h = self.header(&values[0])?;
-            let mut old: StoredInstance = decode(values[1].as_deref().ok_or(Error::NotFound)?)?;
-            if !next_result(&old, &result)? {
+            let [header_value, instance_value] =
+                self.store.fields([HEADER.into(), field.clone()]).await?;
+            let mut header = self.header(&header_value)?;
+            let mut stored_instance: StoredInstance =
+                decode(instance_value.as_deref().ok_or(Error::NotFound)?)?;
+            if !next_result(&stored_instance, &result)? {
                 return Ok(result);
             }
             if result.state != InstanceState::Paused {
-                if let Some(recovery) = &mut old.recovery {
+                if let Some(recovery) = &mut stored_instance.recovery {
                     recovery.pending = false;
                 }
             }
-            old.result = Some(result.clone());
-            h.advance()?;
+            stored_instance.result = Some(result.clone());
+            header.advance()?;
             if self
                 .store
                 .cas(
-                    values[0]
+                    header_value
                         .as_deref()
                         .expect("validated control header is present"),
-                    &h,
-                    Some((&field, encode(&old)?)),
+                    &header,
+                    Some((&field, encode(&stored_instance)?)),
                 )
                 .await?
             {

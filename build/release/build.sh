@@ -20,7 +20,7 @@ esac
 stage=$(mktemp -d "${TMPDIR:-/tmp}/adx-build.XXXXXX")
 trap 'rm -rf "$stage"' EXIT
 echo "--- :rust: Compile control plane, gateway and RRT"
-cargo build --locked --release -j "$JOBS" -p adx-api-server -p adx-control-cli -p adx-master -p adx-node-manager -p data-plane-gateway -p rrt-daemon --bins
+cargo build --locked --release -j "$JOBS" -p adx-api-server -p adx-deployment -p adx-master -p adx-node-manager -p data-plane-gateway -p rrt-daemon --bins
 for name in adx-api-server adxctl adx-master adx-node-manager adx-edge-frontend adx-node-proxy adx-data-plane-forward rrt-runtime; do
  cp "$CARGO_TARGET_DIR/release/$name" "$stage/$name"
 done

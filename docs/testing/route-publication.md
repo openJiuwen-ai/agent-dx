@@ -58,7 +58,7 @@ Node Manager 持续运行而仅代理重启时，可直接重放本机内存目�
 | `ADX_DATA_PLANE_NODE_PROXY_ACTIVITY_UDS_DIR=/run/adx` | Node Proxy 本机控制 socket 目录，须限制目录访问权限 |
 | Node Manager `proxy_socket=/run/adx/route.sock` | 与上述目录一致 |
 
-Edge 对外 TLS、Edge → Node Proxy 的网络／mTLS 配置继续单独设置。默认 Cargo feature `activity-client` 包含两个受管进程；旧的可选 etcd 库和历史测试脚本还未整体删除，历史脚本须适配新的启动契约后才能复用。
+Edge 对外 TLS、Edge → Node Proxy 的网络／mTLS 配置继续单独设置。默认部署由 Node Manager 内嵌 Proxy；显式 `proxy_mode=standalone` 才启动两个受管进程。旧的可选 etcd 库和历史测试脚本还未整体删除，历史脚本须适配新的启动契约后才能复用。
 
 ## 验证范围
 

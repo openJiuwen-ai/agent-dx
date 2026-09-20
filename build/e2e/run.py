@@ -188,7 +188,7 @@ class Run:
             self.execute(node,'sh','-c','python3 /opt/adx/e2e/node.py services '+node+' > /evidence/services-'+node+'.log 2>&1 &')
         self.execute('node1','python3','/opt/adx/e2e/publish.py',timeout=300)
         for node in self.nodes:
-            self.execute(node,'sh','-c','/opt/adx/package/bin/adxctl run --config /tmp/adx-e2e/deployment.json > /evidence/supervisor-'+node+'.log 2>&1 &')
+            self.execute(node,'sh','-c','/opt/adx/package/bin/adxctl run --config /tmp/adx-e2e/deployment.yaml > /evidence/supervisor-'+node+'.log 2>&1 &')
         self.helper('node1','ready',timeout=120)
     def scenarios(self,checks,required=None):
         required=tuple(required or STANDARD);selected=set(required)

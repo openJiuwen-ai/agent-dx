@@ -45,7 +45,7 @@ def main():
             d={'schema_version':1,'package_dir':str(package),'state_dir':str(root/'state'),'redis_url':f'redis://127.0.0.1:{redis_port}/','namespace':'process-smoke','restart_limit':4,'restart_delay_ms':200,'stop_timeout_seconds':5,'services':[
                 {'id':'redis','role':'redis','config':{'bind':'127.0.0.1','port':redis_port,'data_dir':str(data),'appendfsync':'always'}},
                 {'id':'master','role':'master','config':{'listen':f'127.0.0.1:{master_port}','advertised_address':f'https://127.0.0.1:{master_port}','scheduler_shards':1,'placement':'pack','rpc_timeout_seconds':2,'tls':{'ca':str(tls/'ca.pem'),'certificate':str(tls/'master.pem'),'private_key':str(tls/'master.key'),'server_name':'localhost','peers':{'api-server':str(tls/'api-server.der')}},'bootstrap_credentials':[]}}]}
-            config=root/'deployment.json';config.write_text(json.dumps(d));config.chmod(0o600)
+            config=root/'deployment.yaml';config.write_text(json.dumps(d));config.chmod(0o600)
             command=[str(package/'bin/adxctl')]
             def control(action):
                 return json.loads(subprocess.check_output(command+[action,'--config',str(config)],stderr=subprocess.DEVNULL,text=True,timeout=15))

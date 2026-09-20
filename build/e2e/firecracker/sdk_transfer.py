@@ -27,7 +27,7 @@ def passed(index,**details):
     item={'name':CASES[index],'passed':True,**details};result['cases'].append(item)
     print('PASS',json.dumps(item),flush=True)
 def pid(folder,role):
-    status=json.loads(subprocess.check_output([str(base/'package/bin/adxctl'),'status','--config',str(folder/'deployment.json')],text=True))
+    status=json.loads(subprocess.check_output([str(base/'package/bin/adxctl'),'status','--config',str(folder/'deployment.yaml')],text=True))
     return next(s['pid'] for s in status['services'] if s['role']==role)
 def inventory(node):
     raw=subprocess.check_output(['/opt/adx-fc/bin/sbox','-a',str(root/node/'sandboxd/sandboxd.sock'),'list'],text=True,timeout=10)

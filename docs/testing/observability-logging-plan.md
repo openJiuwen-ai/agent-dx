@@ -5,7 +5,7 @@
 ## 当前基础
 
 - `platform/control-plane/node-manager/src/metrics.rs` 已提供 `/metrics`：实例CPU累计用量、内存用量/限额、采样年龄，以及节点准入状态、已预留CPU/内存/磁盘。
-- `platform/control-plane/control-cli/src/supervisor.rs` 通过可配置的输出接管实现文件大小/时间滚动、后台gzip及历史保留，见[日志契约](log-rotation.md)，本地与基础K8s已验收。
+- `platform/deployment/src/supervisor.rs` 通过可配置的输出接管实现文件大小/时间滚动、后台gzip及历史保留，见[日志契约](log-rotation.md)，本地与基础K8s已验收。
 - Edge / Node Proxy 已有 `/metrics` 和日志初始化/过滤；本轮复用这些能力并补真实抓取与结构化采集验收。
 - 组件采集配置与契约见[日志采集](log-collection.md)。
 - 当前本期 Metrics、组件日志与 Trace 已分别验收；SDK 事务根 Span、用户进程内 Span、任意长时间中断等不在已通过范围。

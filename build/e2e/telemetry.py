@@ -200,7 +200,7 @@ def validate(node):
     time.sleep(2)
     counts=collections.Counter(received());assert counts==collections.Counter(range(40)),dict(counts)
     rows=records();services={a.get('service.name') for a,_ in rows}
-    required={'proxy',node}
+    required={node}
     if node=='node1':required|={'master','api','edge','redis'}
     assert required <= services, (required,services)
     structured={a.get('service.name') for a,b in rows if isinstance(b,dict) and ('level' in b or 'fields' in b)}
