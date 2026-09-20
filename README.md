@@ -27,6 +27,44 @@ See [current layout](docs/architecture/repository-layout.md) and [public API sup
 
 Local component and Socket checks use `python3 build/ci/run.py <suite>`. Buildkite has separate release, image and Kubernetes public-SDK steps. [Buildkite #30](docs/testing/2026-09-18-runtime-environment-k8s.md) passed all eight basic K8s groups, including local-first creation, node failure, restart, resource metrics, logs and traces. Its Kubernetes profile uses the immutable OCI runtime image; standalone deployment retains the local EROFS path. Checkpoint/snapshot/cross-node recovery use local Firecracker acceptance; the K8s FC profile is deferred. See [local checks and end-to-end acceptance](docs/testing/control-plane-ci.md) for prerequisites and implementation milestones.
 
+### Kubernetes E2E target requirements
+
+The current `full` profile requires two distinct schedulable Linux workers. Each
+worker must be able to host one ADX Pod with the following combined platform and
+Collector resources:
+
+| Target-cluster resource | Enforced minimum | Recommended worker |
+|---|---:|---:|
+| Worker count | 2 distinct physical workers | 2 workers in separate failure domains |
+| CPU per worker | 2.1 requested; up to 4 limited | 4 vCPU |
+| Memory per worker | 2 GiB + 128 MiB requested; up to 4 GiB + 256 MiB limited | 8 GiB |
+| Ephemeral storage | state/evidence plus a 1 GiB memory-backed image directory | at least 30 GiB free disk |
+| Architecture | `linux/amd64` or `linux/arm64`, matching every artifact | `linux/amd64` for the current Buildkite pipeline |
+
+The base Kubernetes profile uses OCI images and does not require EROFS. It does
+require privileged Pods, functional cgroup v1 or v2, cross-worker Pod/Service
+networking, `br_netfilter`, and
+`net.bridge.bridge-nf-call-iptables=1`. The repository does not enforce a numeric
+host-kernel or Kubernetes-version floor; use a maintained distribution and a
+5.10/5.15-or-newer LTS kernel as the deployment baseline. Capability preflight,
+not `uname`, is the current gate.
+
+The target kubeconfig must be able to create/delete the isolated namespace and
+manage Pods, Services and Secrets, including exec, copy and diagnostics. The
+workers must pull the digest-pinned Node, RRT and Collector images. `full` checks
+the actual Pod-to-worker placement after scheduling and fails if both Pods land
+on one worker.
+
+Firecracker is a separate conditional profile. It needs one explicitly selected
+KVM worker with a 4 CPU / 6 GiB Pod allocation, `/dev/kvm`, KVM API version 12,
+privileged host-device access and an architecture-matched runtime kit. Running
+the base and Firecracker profiles concurrently is best served by two 4C/8G
+workers plus one 8C/16G KVM worker. GPU/NPU, Redis-PV recovery and network-partition
+profiles remain planned and are not implied by a green base `full` result.
+
+Detailed resources, kernel checks, RBAC/network requirements and CI-worker
+resources are documented in the [Kubernetes E2E README](build/e2e/kubernetes/README.md).
+
 Rust uses the root Cargo workspace. The Sandbox SDK uses distribution `adx-sandbox`, import `adx_sandbox`, CLI `adx-sandbox`, and `ADX_*` environment settings. Agent namespaces are `adx.agentruntime` and `adx.agentexecutor`; Gateway binaries use `adx-`, configuration uses `ADX_`, and internal branded headers use `X-ADX-`. Run matching component versions together.
 
 ```sh

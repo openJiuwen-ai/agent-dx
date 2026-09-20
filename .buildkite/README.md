@@ -31,6 +31,13 @@ requests from node1 enter Edge over TLS and traverse the real control/data paths
 
 ## Existing CI infrastructure
 
+These are Buildkite execution-cluster resources. They are independent of the
+two-worker target-cluster requirements documented in the
+[Kubernetes E2E README](../build/e2e/kubernetes/README.md). The current Agent
+Stack requests/limits are: release build `4/8 CPU` and `8/16 GiB`, image publish
+`8 CPU / 16 GiB`, and the E2E deployer `2/4 CPU` and `4/8 GiB`. The target
+kubeconfig selects a second cluster where the ADX Pods are deployed.
+
 All three steps use the existing `default` queue with `os=linux`, `arch=amd64`
 and the Kubernetes plugin. Worker images follow the existing CI profiles:
 
