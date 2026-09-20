@@ -109,6 +109,22 @@ fn create_timeout_compatibility_and_invalid_reserves() {
 }
 
 #[test]
+fn create_and_central_queue_timeouts_are_distinct() {
+    let timeouts = adx_api_server::contract::create_timeouts(&json!({
+        "image": "img",
+        "createTimeoutSeconds": 120,
+        "scheduleTimeoutSeconds": 20,
+        "initCallTimeoutSeconds": 30
+    }))
+    .unwrap();
+    assert_eq!(timeouts.create_seconds, 120);
+    assert_eq!(timeouts.schedule_seconds, 20);
+
+    let defaults = adx_api_server::contract::create_timeouts(&json!({"image": "img"})).unwrap();
+    assert_eq!(defaults.schedule_seconds, 30);
+}
+
+#[test]
 fn deployment_environment_supplies_default_root_and_runtime_but_snapshot_inherits_source() {
     let environment = serde_json::from_value(json!({
         "rootfs":{"runtime":"runc","type":"local","path":"/opt/adx/runtime/rootfs.img","readonly":false},

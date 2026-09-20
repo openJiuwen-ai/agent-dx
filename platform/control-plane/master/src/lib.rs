@@ -223,6 +223,22 @@ impl Master {
         Ok(shard)
     }
 
+    /// Remove an unassigned request after its central queue deadline.
+    /// Once a shard has reserved an Assignment, lifecycle completion owns cleanup.
+    pub fn cancel_pending(&mut self, id: &str) -> bool {
+        let Some((shard, _)) = self.requests.get(id) else {
+            return false;
+        };
+        if self.shards[*shard].assignment(id).is_some() {
+            return false;
+        }
+        for shard in &mut self.shards {
+            shard.forget_queued(id);
+        }
+        self.requests.remove(id);
+        true
+    }
+
     /// Apply a confirmed Redis owner before exposing it or scheduling further work.
     /// Also removes an identical queued center request; replay never double charges.
     pub fn accept_claim(&mut self, spec: &InstanceSpec, assignment: &Assignment) -> Result<()> {

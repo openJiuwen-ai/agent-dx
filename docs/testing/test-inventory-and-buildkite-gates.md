@@ -2,6 +2,8 @@
 
 UT 与 E2E 分开管理：UT 按代码模块运行；E2E 按业务闭环和部署拓扑逐级扩展。
 
+跨层级的错误、Deadline、sandboxd、Node Manager 和节点故障契约见[系统可靠性门禁](system-reliability-gates.md)。这些场景按所需拓扑分别进入 Standalone、Multi-VM 和 Full Deployment，不能只用组件测试宣称完成。
+
 ## 1. UT 不纳入 E2E 层级
 
 UT 包含 Rust workspace、Agent、Sandbox SDK、构建驱动器，以及使用测试进程或隔离 Redis

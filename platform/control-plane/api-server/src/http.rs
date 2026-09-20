@@ -429,14 +429,16 @@ impl Api {
             }
         }
 
-        let create_timeout = Duration::from_secs(contract::create_timeout(input)?);
-        let budget = create_timeout.min(self.clients.config.timeout());
+        let timeouts = contract::create_timeouts(input)?;
+        let budget = Duration::from_secs(timeouts.create_seconds);
         let result = self
             .clients
             .create_instance(
                 pb::CreateInstanceRequest {
                     spec: Some(spec.clone()),
                     caller: Some(caller.clone()),
+                    schedule_timeout_seconds: timeouts.schedule_seconds,
+                    create_timeout_seconds: timeouts.create_seconds,
                 },
                 budget,
             )

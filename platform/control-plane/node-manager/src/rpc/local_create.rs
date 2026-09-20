@@ -29,10 +29,13 @@ impl NodeRpc {
                         administrator: false,
                     }),
                     spec: Some(spec.into()),
+                    schedule_timeout_seconds: 30,
+                    create_timeout_seconds: 90,
                 }),
                 node_session_id: self.session_id.clone(),
             };
-            if let Err(error) = self.create_local(request).await {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+            if let Err(error) = self.create_local(request, deadline).await {
                 adx_observability::warn!(code=?error.code(), "local claim still requires retry or reconciliation");
             }
         }
@@ -41,6 +44,7 @@ impl NodeRpc {
     pub(super) async fn create_local(
         &self,
         request: pb::LocalCreateRequest,
+        deadline: tokio::time::Instant,
     ) -> std::result::Result<Response<pb::InstanceResult>, Status> {
         if request.node_session_id != self.session_id {
             return Err(Status::failed_precondition("entry node session changed"));
@@ -83,7 +87,8 @@ impl NodeRpc {
                 .expect("shared state lock poisoned")
                 .clone();
             tokio::time::timeout(
-                sink.timeout,
+                remaining(deadline, sink.timeout)
+                    .ok_or_else(|| Status::deadline_exceeded("create deadline exceeded"))?,
                 client.prepare_create(adx_observability::trace::inject(request.clone())),
             )
             .await
@@ -100,7 +105,7 @@ impl NodeRpc {
             Ok(held) => held,
             Err(Error::NoCapacity) => {
                 drop(gate);
-                return self.forward_local(sink, request).await;
+                return self.forward_local(sink, request, deadline).await;
             }
             Err(e) => return Err(status(e)),
         };
@@ -123,7 +128,8 @@ impl NodeRpc {
                 .expect("shared state lock poisoned")
                 .clone();
             answer = match tokio::time::timeout(
-                sink.timeout,
+                remaining(deadline, sink.timeout)
+                    .ok_or_else(|| Status::deadline_exceeded("create deadline exceeded"))?,
                 client.claim_instance(adx_observability::trace::inject(claim.clone())),
             )
             .await
@@ -205,7 +211,7 @@ impl NodeRpc {
                     .map_err(status)
                 } else {
                     drop(gate);
-                    self.forward_local(sink, request).await
+                    self.forward_local(sink, request, deadline).await
                 }
             }
             Outcome::Fallback(true) => {
@@ -213,7 +219,7 @@ impl NodeRpc {
                     .release_local(&spec.id, &reservation)
                     .map_err(status)?;
                 drop(gate);
-                self.forward_local(sink, request).await
+                self.forward_local(sink, request, deadline).await
             }
             Outcome::Fallback(false) => Err(Status::data_loss("invalid fallback decision")),
         }
@@ -222,19 +228,49 @@ impl NodeRpc {
         &self,
         sink: &MasterStateSink,
         request: pb::LocalCreateRequest,
+        deadline: tokio::time::Instant,
     ) -> std::result::Result<Response<pb::InstanceResult>, Status> {
         let mut client = sink
             .client
             .read()
             .expect("shared state lock poisoned")
             .clone();
-        tokio::time::timeout(
-            sink.timeout,
-            client.forward_create(adx_observability::trace::inject(request)),
-        )
-        .await
-        .map_err(|_| {
-            Status::unavailable("forwarded creation result unknown; retry same Instance ID")
-        })?
+        let timeout = remaining(deadline, Duration::MAX)
+            .ok_or_else(|| Status::deadline_exceeded("create deadline exceeded"))?;
+        let mut request = adx_observability::trace::inject(request);
+        request.set_timeout(timeout);
+        tokio::time::timeout(timeout, client.forward_create(request))
+            .await
+            .map_err(|_| {
+                Status::unavailable("forwarded creation result unknown; retry same Instance ID")
+            })?
+    }
+}
+
+fn remaining(deadline: tokio::time::Instant, cap: Duration) -> Option<Duration> {
+    let remaining = deadline
+        .checked_duration_since(tokio::time::Instant::now())
+        .filter(|remaining| !remaining.is_zero())?;
+    Some(remaining.min(cap))
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn forwarded_create_inherits_the_remaining_deadline() {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+        tokio::time::advance(Duration::from_secs(10)).await;
+        assert_eq!(
+            remaining(deadline, Duration::MAX).unwrap(),
+            Duration::from_secs(80)
+        );
+        assert_eq!(
+            remaining(deadline, Duration::from_secs(30)).unwrap(),
+            Duration::from_secs(30)
+        );
+        tokio::time::advance(Duration::from_secs(80)).await;
+        assert_eq!(remaining(deadline, Duration::MAX), None);
     }
 }

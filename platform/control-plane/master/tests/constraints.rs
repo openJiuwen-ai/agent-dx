@@ -46,6 +46,23 @@ fn card(id: u32, kind: DeviceKind, model: &str) -> Device {
         healthy: true,
     }
 }
+
+#[test]
+fn queue_deadline_can_cancel_only_an_unassigned_request() {
+    let mut master = Master::new(1, Placement::Pack).unwrap();
+    master.submit(spec("waiting")).unwrap();
+    assert_eq!(master.pending(0).unwrap(), 1);
+    assert!(master.cancel_pending("waiting"));
+    assert_eq!(master.pending(0).unwrap(), 0);
+    assert!(!master.cancel_pending("waiting"));
+
+    master.register(node("n", "z")).unwrap();
+    master.submit(spec("assigned")).unwrap();
+    let assignment = master.schedule(0).unwrap().unwrap();
+    assert!(!master.cancel_pending("assigned"));
+    master.release(&assignment).unwrap();
+}
+
 #[test]
 fn whole_cards_are_model_selected_reserved_and_released() {
     let mut master = Master::new(1, Placement::Pack).unwrap();

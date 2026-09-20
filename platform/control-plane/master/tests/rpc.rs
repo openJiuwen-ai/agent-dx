@@ -122,6 +122,8 @@ fn create(id: &str) -> pb::CreateInstanceRequest {
     pb::CreateInstanceRequest {
         spec: Some(spec(id).into()),
         caller: caller(),
+        schedule_timeout_seconds: 30,
+        create_timeout_seconds: 90,
     }
 }
 struct Backend {
@@ -538,6 +540,22 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
             .code(),
         tonic::Code::FailedPrecondition
     );
+    let mut expires = create("queue-deadline");
+    expires.schedule_timeout_seconds = 1;
+    let started = tokio::time::Instant::now();
+    assert_eq!(
+        frontend.create_instance(expires).await.unwrap_err().code(),
+        tonic::Code::DeadlineExceeded
+    );
+    assert!(started.elapsed() >= Duration::from_millis(900));
+    assert_eq!(
+        session.get("queue-deadline").await.unwrap_err(),
+        adx_core::Error::NotFound
+    );
+    assert!(scrape_metrics(metrics_address)
+        .await
+        .contains("adx_master_queued_requests{shard_id=\"0\"} 0\n"));
+
     let mut pending = Request::new(create("second"));
     pending.set_timeout(Duration::from_millis(80));
     assert!(frontend.create_instance(pending).await.is_err());

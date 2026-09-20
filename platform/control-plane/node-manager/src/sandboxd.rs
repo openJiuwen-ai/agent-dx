@@ -63,6 +63,35 @@ fn unavailable(error: impl std::fmt::Display) -> Error {
     Error::Unavailable(format!("sandboxd: {error}"))
 }
 
+/// Wait for an externally managed sandboxd without publishing this node for admission.
+/// Invalid local configuration still fails immediately; transport and readiness failures
+/// are retried until the caller cancels this future during process shutdown.
+pub async fn connect_when_ready(
+    path: PathBuf,
+    config: Config,
+    readiness_timeout: Duration,
+    retry_interval: Duration,
+) -> Result<Sandboxd> {
+    if readiness_timeout.is_zero() || retry_interval.is_zero() {
+        return Err(Error::Invalid(
+            "sandboxd readiness and retry intervals must be positive".into(),
+        ));
+    }
+    loop {
+        let unavailable = match Sandboxd::connect(path.clone(), config.clone()).await {
+            Ok(runtime) => match runtime.wait_ready_with_timeout(readiness_timeout).await {
+                Ok(()) => return Ok(runtime),
+                Err(error @ Error::Unavailable(_)) => error,
+                Err(error) => return Err(error),
+            },
+            Err(error @ Error::Unavailable(_)) => error,
+            Err(error) => return Err(error),
+        };
+        adx_observability::warn!(error=%unavailable, "sandboxd unavailable; node admission remains closed");
+        tokio::time::sleep(retry_interval).await;
+    }
+}
+
 impl Sandboxd {
     pub async fn connect(path: PathBuf, config: Config) -> Result<Self> {
         if (config.command.is_empty() && config.runtime_environment.is_none())

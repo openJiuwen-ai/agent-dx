@@ -440,7 +440,27 @@ pub fn resolve_create_timeout(create: i64, schedule: i64, init: i64) -> Result<u
     Ok(result as u64)
 }
 pub fn create_timeout(body: &Value) -> Result<u64, Status> {
+    Ok(create_timeouts(body)?.create_seconds)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CreateTimeouts {
+    pub create_seconds: u64,
+    pub schedule_seconds: u64,
+}
+
+pub fn create_timeouts(body: &Value) -> Result<CreateTimeouts, Status> {
     let r: Create =
         serde_json::from_value(body.clone()).map_err(|_| invalid("invalid create request"))?;
-    resolve_create_timeout(r.create_timeout, r.schedule_timeout, r.init_timeout)
+    let create_seconds =
+        resolve_create_timeout(r.create_timeout, r.schedule_timeout, r.init_timeout)?;
+    let schedule_seconds = if r.schedule_timeout == 0 {
+        30
+    } else {
+        u64::try_from(r.schedule_timeout).map_err(|_| invalid("invalid schedule timeout"))?
+    };
+    Ok(CreateTimeouts {
+        create_seconds,
+        schedule_seconds,
+    })
 }

@@ -235,11 +235,13 @@ async fn instance_directory_streams_full_then_incremental_ownership() {
             assert_eq!(frame.base_revision, revision);
             revision = frame.revision;
             if let Some(entry) = frame.upserts.iter().find(|entry| {
-                entry
-                    .record
-                    .as_ref()
-                    .and_then(|record| record.spec.as_ref())
-                    .is_some_and(|spec| spec.id == "directory-case")
+                entry.record.as_ref().is_some_and(|record| {
+                    record.state == pb::InstanceState::Deleted as i32
+                        && record
+                            .spec
+                            .as_ref()
+                            .is_some_and(|spec| spec.id == "directory-case")
+                })
             }) {
                 break entry.clone();
             }

@@ -126,38 +126,22 @@ impl Clients {
                 let mut client = pb::node_service_client::NodeServiceClient::new(
                     self.channel(&node.address).await?,
                 );
+                let mut request = trace::inject(pb::LocalCreateRequest {
+                    create: Some(request),
+                    node_session_id: node.session_id,
+                });
+                request.set_timeout(budget);
                 let result = self
                     .rpc_with_timeout(
                         "api_server.create_local",
-                        budget / 2,
-                        client.create_local_instance(trace::inject(pb::LocalCreateRequest {
-                            create: Some(request.clone()),
-                            node_session_id: node.session_id,
-                        })),
+                        budget,
+                        client.create_local_instance(request),
                     )
                     .await;
-                match result {
-                    Ok(result) => return Ok(result),
-                    Err(e)
-                        if matches!(
-                            e.code(),
-                            tonic::Code::Unavailable
-                                | tonic::Code::DeadlineExceeded
-                                | tonic::Code::FailedPrecondition
-                        ) => {}
-                    Err(e) => return Err(e),
-                }
-                // Same identity/specification. Master serializes this against
-                // any in-flight claim; NotFound never licenses a replacement ID.
-                let mut client =
-                    pb::master_service_client::MasterServiceClient::new(self.master().await?);
-                return self
-                    .rpc_with_timeout(
-                        "api_server.create",
-                        budget / 2,
-                        client.create_instance(trace::inject(request)),
-                    )
-                    .await;
+                // The entry node owns the only fallback decision. A definitive
+                // local miss is forwarded to the central scheduler with the same
+                // identity; transport failure remains an unknown outcome.
+                return result;
             }
         }
         let mut client = pb::master_service_client::MasterServiceClient::new(self.master().await?);
@@ -316,6 +300,7 @@ impl Clients {
         self.instances.lock().await.put(value)
     }
 }
+
 pub fn unix_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

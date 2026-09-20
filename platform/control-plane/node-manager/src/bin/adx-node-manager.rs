@@ -3,7 +3,7 @@ use adx_node_manager::{
     readiness::RrtReadiness,
     routes::UdsRoutes,
     rpc::{MasterStateSink, NodeRpc},
-    sandboxd::{Config as RuntimeConfig, Sandboxd},
+    sandboxd::{connect_when_ready, Config as RuntimeConfig, Sandboxd},
     NodeManager,
 };
 use adx_protocol::{control as pb, tls::TlsFiles};
@@ -193,22 +193,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env.insert("RRT_HTTP_ONLY".into(), "1".into());
     env.insert("RRT_HTTP_PORT".into(), config.rrt_port.to_string());
     let token = env.get("RRT_HTTP_TOKEN").cloned();
-    let runtime = Arc::new(
-        Sandboxd::connect(
+    let runtime_config = RuntimeConfig {
+        runtime_environment: config.runtime_environment,
+        command: config.rrt_command,
+        env,
+        cwd: "/".into(),
+        rpc_timeout: timeout,
+    };
+    let runtime = Arc::new(tokio::select! {
+        result = connect_when_ready(
             config.sandboxd_socket,
-            RuntimeConfig {
-                runtime_environment: config.runtime_environment,
-                command: config.rrt_command,
-                env,
-                cwd: "/".into(),
-                rpc_timeout: timeout,
-            },
-        )
-        .await?,
-    );
-    runtime
-        .wait_ready_with_timeout(Duration::from_secs(config.runtime_ready_timeout_seconds))
-        .await?;
+            runtime_config,
+            Duration::from_secs(config.runtime_ready_timeout_seconds),
+            Duration::from_secs(config.report_interval_seconds),
+        ) => result?,
+        _ = shutdown() => return Ok(()),
+    });
     let mut readiness = RrtReadiness::new(
         runtime.clone(),
         config.rrt_port,

@@ -1,7 +1,7 @@
 //! Local gRPC/UDS contract tests against the pinned protocol, not sandboxd E2E.
 use adx_core::{InstanceSpec, Resources};
 use adx_node_manager::{
-    sandboxd::{proto::*, Config, Sandboxd},
+    sandboxd::{connect_when_ready, proto::*, Config, Sandboxd},
     RuntimeBackend,
 };
 use std::{
@@ -467,4 +467,38 @@ async fn node_startup_waits_for_backend_capabilities_readiness() {
     server.unready.store(2, std::sync::atomic::Ordering::SeqCst);
     let (adapter, _harness) = connect(server).await;
     adapter.wait_ready().await.unwrap();
+}
+
+#[tokio::test]
+async fn node_startup_waits_when_sandboxd_socket_appears_late() {
+    let directory = tempfile::tempdir().unwrap();
+    let socket = directory.path().join("late.sock");
+    let waiting = tokio::spawn(connect_when_ready(
+        socket.clone(),
+        Config {
+            rpc_timeout: Duration::from_millis(50),
+            ..Default::default()
+        },
+        Duration::from_millis(50),
+        Duration::from_millis(10),
+    ));
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert!(!waiting.is_finished());
+
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(sandbox_service_server::SandboxServiceServer::new(
+                Server::default(),
+            ))
+            .serve_with_incoming(UnixListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+    tokio::time::timeout(Duration::from_secs(2), waiting)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    server.abort();
 }

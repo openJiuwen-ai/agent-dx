@@ -84,7 +84,15 @@ impl pb::node_service_server::NodeService for NodeRpc {
         }
         let service = self.clone();
         let request = request.into_inner();
-        tokio::spawn(trace.run(async move { service.create_local(request).await }))
+        let timeout = request
+            .create
+            .as_ref()
+            .map(|create| Duration::from_secs(create.create_timeout_seconds))
+            .filter(|timeout| !timeout.is_zero())
+            .or_else(|| service.master.as_ref().map(|sink| sink.timeout))
+            .unwrap_or(Duration::from_secs(90));
+        let deadline = tokio::time::Instant::now() + timeout;
+        tokio::spawn(trace.run(async move { service.create_local(request, deadline).await }))
             .await
             .map_err(|_| Status::internal("local creation task failed"))?
     }
