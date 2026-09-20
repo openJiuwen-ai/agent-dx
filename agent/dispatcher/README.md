@@ -36,6 +36,9 @@ Resolve 要求 Session 已存在且活跃，不重放应用请求。Resolve 和�
 
 Sandbox 接口为 `POST /api/sandbox/v2/instances` 和 `GET/DELETE /api/sandbox/v2/instances/{id}?tenant=...`。创建也携带 tenant 查询参数和 `CreateSandbox` body。这是通用 Gateway Sandbox 边界，不另设 Dispatcher 回调接口。数据类型位于 `adx-agent-core::sandbox`。GET 不存在时返回 404；DELETE 只有后端确认且满足迟到创建隔离语义时才能报告 Deleted，404 本身不是删除确认。
 
+该服务边界的机器可读契约见
+[`sandbox.yaml`](../../platform/api/openapi/sandbox.yaml)。
+
 ## 缓存、选址与恢复
 
 一致性 hash 根据完整 Session scope 确定首选节点，每节点包含 128 个 SHA-256 虚拟点。相同节点的 boot 替换不改变 hash 位置，任意存活 Dispatcher 均可处理有效 Session，不需要 owner、分片移交或内存交接。

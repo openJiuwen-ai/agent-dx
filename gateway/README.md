@@ -10,6 +10,11 @@ the first adapter, not part of the generic relay contract:
   SSH and port-forwarding adapters.
 * `EdgeRouteResolver` reads the shared in-memory `RouteStore`. The production Edge discovers Master through Redis, receives an initial full route snapshot followed by gRPC deltas, and verifies API keys through Master with a bounded short-lived cache.
 
+The typed public Edge → Node Proxy → RRT operations are defined by the
+[`data-plane.yaml`](../platform/api/openapi/data-plane.yaml) OpenAPI contract.
+Generic port forwarding and reverse tunnels carry application-defined protocols
+and remain outside that typed API.
+
 The default `activity-client` feature builds the managed Edge and Node Proxy entrypoints. Edge requires `ADX_EDGE_CONTROL_CONFIG` pointing to [edge-control.json](../build/config/examples/edge-control.json). Master must map the Edge client certificate to the `edge` role. Public listener TLS and Edge-to-Node security remain separate settings. The optional `etcd-watch` library and legacy test fixtures are retained separately; the managed Edge entrypoint uses the new Master route service.
 
 The gateway is a member of the root Cargo workspace. Run from repository root:

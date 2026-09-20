@@ -5,6 +5,10 @@ surface. It describes the HTTP contract implemented by the API Server; snapshot
 catalog state, checkpoint bytes, and scheduler decisions are owned by the
 Rust Master (catalog, placement, Redis) and Node Manager (lifecycle and execution).
 
+The machine-readable contract is [`sandbox.yaml`](../../../api/openapi/sandbox.yaml).
+Runtime command and file operations use the separate
+[`data-plane.yaml`](../../../api/openapi/data-plane.yaml) contract.
+
 **Support boundary:** the compatibility router accepts a larger schema than the new Instance backend. Network policy, mounts, entrypoint inheritance, extra_config, independent request/limit values, published user ports and per-Instance data-plane security are rejected by `src/contract.rs`. `failover=true` and reload are not implemented; ordinary `/invoke` compatibility transport is also unavailable. Commands/files use Edge → Node Proxy → RRT. Node/Instance placement, idle deletion and restart policy are wired. See [placement](../../../../docs/testing/http-node-placement.md) and [node lifecycle](../../../../docs/testing/node-lifecycle.md).
 
 All ordinary responses use the API Server response envelope:

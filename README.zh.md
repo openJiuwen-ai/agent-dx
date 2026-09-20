@@ -174,6 +174,8 @@ Sandbox SDK 分发名为 `adx-sandbox`，Python 导入名为 `adx_sandbox`，命
 - [架构与目录规划](docs/architecture/repository-layout.md)
 - [Agent 使用](agent/README.md)
 - [Sandbox API](platform/control-plane/api-server/docs/sandbox-lifecycle-api.md)
+- [Sandbox OpenAPI](platform/api/openapi/sandbox.yaml)
+- [数据面 OpenAPI](platform/api/openapi/data-plane.yaml)
 - [Sandbox Python SDK](platform/sdk/sandbox/python/README.md)
 - [部署配置示例](build/config/examples/README.md)
 - [节点生命周期与资源采集](docs/testing/node-lifecycle.md)

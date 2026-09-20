@@ -1,0 +1,756 @@
+openapi: "3.1.0"
+info:
+  title: ADX Sandbox Management API
+  version: "1.0.0"
+  license:
+    name: Apache-2.0
+    identifier: Apache-2.0
+  description: |
+    Public lifecycle API implemented by the Rust API Server and exposed through
+    Edge. ADX uses Instance internally; Sandbox is the public API and SDK model.
+    Ordinary responses use an envelope whose `data` member is base64-encoded
+    JSON. Create can return Server-Sent Events when requested by the client.
+servers:
+  - url: https://{address}
+    variables:
+      address:
+        default: adx.example.com
+security:
+  - bearerAuth: []
+  - xAuth: []
+tags:
+  - name: Sandboxes
+    description: Public Sandbox lifecycle and current Instance view.
+  - name: Snapshots
+    description: Tenant-scoped reusable checkpoint catalog.
+  - name: Agent Sandbox Service
+    description: Service-authenticated Sandbox capability used by Agent components.
+paths:
+  /api/sandbox/v1/sandboxes:
+    post:
+      tags: [Sandboxes]
+      operationId: createSandbox
+      summary: Create a Sandbox
+      description: |
+        `X-Request-Id` identifies one logical create. A retry must retain both
+        that ID and the same request body. With `Accept: text/event-stream`, an
+        `accepted` event is followed by heartbeats and one authoritative `final`
+        event.
+      parameters:
+        - $ref: "#/components/parameters/RequestId"
+        - name: Accept
+          in: header
+          required: false
+          schema:
+            type: string
+            enum: [application/json, text/event-stream]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateSandboxRequest"
+      responses:
+        "200":
+          description: Created, or an SSE stream whose final event reports the outcome.
+          headers:
+            X-Request-Id:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - $ref: "#/components/schemas/CreateSandboxEnvelopeData"
+            text/event-stream:
+              schema:
+                type: string
+              example: |-
+                event: accepted
+                data: {"status":"creating","requestId":"create-01"}
+
+                event: final
+                data: {"status":"running","sandboxId":"demo","instanceId":"demo","requestId":"create-01"}
+        "4XX":
+          $ref: "#/components/responses/Error"
+        default:
+          $ref: "#/components/responses/Error"
+  /api/instances:
+    get:
+      tags: [Sandboxes]
+      operationId: getSandbox
+      summary: Read the current Instance view for one Sandbox
+      parameters:
+        - name: instance_id
+          in: query
+          required: true
+          schema:
+            type: string
+            minLength: 1
+      responses:
+        "200":
+          description: Single-item compatibility array containing the Instance view.
+          content:
+            application/json:
+              schema:
+                type: array
+                minItems: 1
+                maxItems: 1
+                items:
+                  $ref: "#/components/schemas/InstanceView"
+        "4XX":
+          $ref: "#/components/responses/Error"
+        default:
+          $ref: "#/components/responses/Error"
+  /api/sandbox/v1/sandboxes/{sandboxId}:
+    delete:
+      tags: [Sandboxes]
+      operationId: deleteSandbox
+      summary: Delete a Sandbox
+      parameters:
+        - $ref: "#/components/parameters/SandboxId"
+        - $ref: "#/components/parameters/RequestId"
+      responses:
+        "200":
+          description: Delete result in the standard envelope.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Envelope"
+        "4XX":
+          $ref: "#/components/responses/Error"
+        default:
+          $ref: "#/components/responses/Error"
+  /api/sandbox/v1/sandboxes/{sandboxId}/pause:
+    post:
+      tags: [Sandboxes]
+      operationId: pauseSandbox
+      summary: Pause a Sandbox and publish its restore point
+      parameters:
+        - $ref: "#/components/parameters/SandboxId"
+        - $ref: "#/components/parameters/PauseOperationId"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PauseRequest"
+      responses:
+        "200":
+          description: Restore point bytes and metadata are durable and published.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - $ref: "#/components/schemas/PauseEnvelopeData"
+        "4XX":
+          $ref: "#/components/responses/Error"
+        default:
+          $ref: "#/components/responses/Error"
+  /api/sandbox/v1/sandboxes/{sandboxId}/resume:
+    post:
+      tags: [Sandboxes]
+      operationId: resumeSandbox
+      summary: Resume a paused Sandbox
+      parameters:
+        - $ref: "#/components/parameters/SandboxId"
+        - $ref: "#/components/parameters/ResumeOperationId"
+      responses:
+        "200":
+          description: Instance is running and its local route is bound.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - $ref: "#/components/schemas/ResumeEnvelopeData"
+        "4XX":
+          $ref: "#/components/responses/Error"
+        default:
+          $ref: "#/components/responses/Error"
+  /api/sandbox/v1/sandboxes/{sandboxId}/snapshots:
+    post:
+      tags: [Snapshots]
+      operationId: createSnapshot
+      summary: Create a reusable snapshot and resume the source Sandbox
+      parameters:
+        - $ref: "#/components/parameters/SandboxId"
+        - $ref: "#/components/parameters/SnapshotOperationId"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateSnapshotRequest"
+      responses:
+        "200":
+          description: Snapshot and resumed source state are committed.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - $ref: "#/components/schemas/CreateSnapshotEnvelopeData"
+        "4XX":
+          $ref: "#/components/responses/Error"
+        default:
+          $ref: "#/components/responses/Error"
+  /api/sandbox/v1/snapshots:
+    get:
+      tags: [Snapshots]
+      operationId: listSnapshots
+      summary: List reusable snapshots for the authenticated tenant
+      parameters:
+        - name: name
+          in: query
+          schema:
+            type: string
+        - name: pageToken
+          in: query
+          schema:
+            type: string
+        - name: pageSize
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+      responses:
+        "200":
+          description: Tenant-scoped snapshot catalog page.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - $ref: "#/components/schemas/SnapshotListEnvelopeData"
+        "4XX":
+          $ref: "#/components/responses/Error"
+        default:
+          $ref: "#/components/responses/Error"
+  /api/sandbox/v1/snapshots/{snapshotId}:
+    parameters:
+      - $ref: "#/components/parameters/SnapshotId"
+    get:
+      tags: [Snapshots]
+      operationId: getSnapshot
+      summary: Get a reusable snapshot
+      responses:
+        "200":
+          description: Tenant-scoped snapshot catalog record.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - $ref: "#/components/schemas/SnapshotEnvelopeData"
+        "4XX":
+          $ref: "#/components/responses/Error"
+        default:
+          $ref: "#/components/responses/Error"
+    delete:
+      tags: [Snapshots]
+      operationId: deleteSnapshot
+      summary: Mark a reusable snapshot for deletion
+      description: New references are rejected; bytes are removed after existing references are released.
+      parameters:
+        - $ref: "#/components/parameters/SnapshotDeleteOperationId"
+      responses:
+        "200":
+          description: Current catalog state in the standard envelope.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Envelope"
+        "4XX":
+          $ref: "#/components/responses/Error"
+        default:
+          $ref: "#/components/responses/Error"
+  /api/sandbox/v2/instances:
+    post:
+      tags: [Agent Sandbox Service]
+      operationId: createAgentSandbox
+      summary: Create the stable Sandbox identity requested by an Agent service
+      description: The body tenant must equal the single tenant query value.
+      security:
+        - serviceBearer: []
+      parameters:
+        - $ref: "#/components/parameters/Tenant"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/ServiceCreateSandbox"}
+      responses:
+        "200":
+          description: Current observation after the create converges.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ServiceSandboxObservation"}
+        "4XX":
+          $ref: "#/components/responses/ServiceError"
+        default:
+          $ref: "#/components/responses/ServiceError"
+  /api/sandbox/v2/instances/{sandboxId}:
+    parameters:
+      - $ref: "#/components/parameters/SandboxId"
+      - $ref: "#/components/parameters/Tenant"
+    get:
+      tags: [Agent Sandbox Service]
+      operationId: getAgentSandbox
+      summary: Observe an Agent service Sandbox
+      security:
+        - serviceBearer: []
+      responses:
+        "200":
+          description: Current platform and runtime readiness observation.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ServiceSandboxObservation"}
+        "4XX":
+          $ref: "#/components/responses/ServiceError"
+        default:
+          $ref: "#/components/responses/ServiceError"
+    delete:
+      tags: [Agent Sandbox Service]
+      operationId: deleteAgentSandbox
+      summary: Delete an Agent service Sandbox and return the confirmed observation
+      security:
+        - serviceBearer: []
+      responses:
+        "200":
+          description: Authoritatively deleted Sandbox observation.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ServiceSandboxObservation"}
+        "4XX":
+          $ref: "#/components/responses/ServiceError"
+        default:
+          $ref: "#/components/responses/ServiceError"
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: Tenant or administrator API Key.
+    xAuth:
+      type: apiKey
+      in: header
+      name: X-Auth
+      description: Compatibility API Key header.
+    serviceBearer:
+      type: http
+      scheme: bearer
+      description: Deployment-provided service token used by trusted Agent components.
+  headers:
+    RequestId:
+      description: Logical request identity echoed by API Server.
+      schema:
+        type: string
+  parameters:
+    RequestId:
+      name: X-Request-Id
+      in: header
+      required: false
+      description: API Server generates and echoes an ID when this header is omitted.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 128
+    SandboxId:
+      name: sandboxId
+      in: path
+      required: true
+      schema:
+        type: string
+        minLength: 1
+    SnapshotId:
+      name: snapshotId
+      in: path
+      required: true
+      schema:
+        type: string
+        minLength: 1
+    PauseOperationId:
+      name: X-ADX-Request-ID
+      in: header
+      required: true
+      schema:
+        type: string
+        pattern: "^pause-[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+    ResumeOperationId:
+      name: X-ADX-Request-ID
+      in: header
+      required: true
+      schema:
+        type: string
+        pattern: "^resume-[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+    SnapshotOperationId:
+      name: X-ADX-Request-ID
+      in: header
+      required: true
+      schema:
+        type: string
+        pattern: "^snapshot-[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+    SnapshotDeleteOperationId:
+      name: X-ADX-Request-ID
+      in: header
+      required: true
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 128
+    Tenant:
+      name: tenant
+      in: query
+      required: true
+      description: Exactly one tenant query value is required.
+      schema: {type: string, minLength: 1}
+  responses:
+    Error:
+      description: Stable ADX error envelope; retry behavior comes from `error.retry` and `error.outcome`.
+      headers:
+        X-Request-Id:
+          $ref: "#/components/headers/RequestId"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorEnvelope"
+    ServiceError:
+      description: Agent Sandbox service error; `outcome_unknown` requires inspection of the same ID.
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/ServiceSandboxError"}
+  schemas:
+    CreateSandboxRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        name: {type: string}
+        namespace: {type: string, default: default}
+        image:
+          type: string
+          description: Required unless snapshotId or the deployment Runtime Environment supplies the rootfs.
+        runtime: {type: string}
+        rootfs:
+          oneOf:
+            - type: string
+            - $ref: "#/components/schemas/Rootfs"
+        cpu:
+          type: integer
+          format: int64
+          minimum: 0
+          default: 1000
+          description: CPU request in millicores.
+        memory:
+          type: integer
+          format: int64
+          minimum: 0
+          default: 2048
+          description: Memory request in MiB.
+        storageMb: {type: integer, format: int64, minimum: 1}
+        env:
+          type: object
+          additionalProperties: {type: string}
+        labels:
+          type: object
+          additionalProperties: {type: string}
+        snapshotId:
+          type: string
+          description: Tenant-scoped reusable snapshot used to create a new Sandbox.
+        idleTimeoutSeconds: {type: integer, format: int64, minimum: 0}
+        restartPolicy: {$ref: "#/components/schemas/RestartPolicy"}
+        scheduleAffinities:
+          type: array
+          items: {$ref: "#/components/schemas/ScheduleAffinity"}
+        createTimeoutSeconds:
+          type: integer
+          format: int64
+          minimum: 0
+          default: 90
+          description: End-to-end create budget.
+        scheduleTimeoutSeconds:
+          type: integer
+          format: int64
+          minimum: 0
+          default: 30
+          description: Applies only after admission to the central scheduling queue.
+        initCallTimeoutSeconds: {type: integer, format: int64, minimum: 0}
+        xpu:
+          type: string
+          description: GPU/NPU whole-device request encoded by the compatibility API.
+        tunnel: {$ref: "#/components/schemas/TunnelRequest"}
+    Rootfs:
+      type: object
+      additionalProperties: false
+      properties:
+        runtime: {type: string}
+        type: {type: string, enum: [image]}
+        imageurl: {type: string}
+    RestartPolicy:
+      type: object
+      additionalProperties: false
+      required: [maxAttempts, initialBackoffSeconds, maxBackoffSeconds]
+      properties:
+        maxAttempts: {type: integer, minimum: 0}
+        initialBackoffSeconds: {type: integer, format: int64, minimum: 0}
+        maxBackoffSeconds: {type: integer, format: int64, minimum: 0}
+    ScheduleAffinity:
+      type: object
+      additionalProperties: false
+      properties:
+        kind: {type: integer, format: int32}
+        affinity: {type: integer, format: int32}
+        weight: {type: integer, format: int64}
+        preferredPriority: {type: boolean}
+        preferredAntiOtherLabels: {type: boolean}
+        labelOps:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            properties:
+              type: {type: integer, format: int32}
+              labelKey: {type: string}
+              labelValues:
+                type: array
+                items: {type: string}
+    TunnelRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        enabled: {type: boolean, default: false}
+        proxyPort: {type: integer, minimum: 1, maximum: 65535}
+    CreateSandboxResult:
+      type: object
+      required: [sandboxId, instanceId, status, requestId]
+      properties:
+        sandboxId: {type: string}
+        instanceId: {type: string}
+        status: {type: string, const: running}
+        requestId: {type: string}
+        tunnel: {type: object, additionalProperties: true}
+    InstanceView:
+      type: object
+      required: [id, status, required_cpu, required_mem, image]
+      properties:
+        id: {type: string}
+        status: {type: string}
+        required_cpu: {type: integer, format: int64, description: CPU millicores}
+        required_mem: {type: integer, format: int64, description: Memory MiB}
+        image: {type: string}
+    PauseRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        ttlSeconds: {type: integer, format: int64, minimum: 0, default: 90000}
+        timeoutSeconds: {type: integer, format: int64, minimum: 1, maximum: 3600, default: 300}
+    PauseResult:
+      type: object
+      required: [sandboxId, snapshotId, size, state]
+      properties:
+        sandboxId: {type: string}
+        snapshotId: {type: string}
+        size: {type: integer, format: int64, minimum: 1}
+        state: {type: string, const: paused}
+        expiresAt: {type: [integer, "null"], format: int64}
+    ResumeResult:
+      type: object
+      required: [sandboxId, state, routeAddress, functionProxyId, nodeId, portMappings]
+      properties:
+        sandboxId: {type: string}
+        state: {type: string, const: running}
+        routeAddress: {type: string}
+        functionProxyId:
+          type: string
+          description: Compatibility field containing Node ID; there is no FunctionProxy process.
+        nodeId: {type: string}
+        portMappings: {type: object, additionalProperties: true}
+    CreateSnapshotRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        name: {type: string}
+        timeoutSeconds: {type: integer, format: int64, minimum: 1, maximum: 3600, default: 300}
+    CreateSnapshotResult:
+      type: object
+      required: [snapshotId, names]
+      properties:
+        snapshotId: {type: string}
+        names:
+          type: array
+          items: {type: string}
+    Snapshot:
+      type: object
+      additionalProperties: false
+      required: [snapshotId, names]
+      properties:
+        snapshotId: {type: string}
+        names:
+          type: array
+          items: {type: string}
+    SnapshotList:
+      type: object
+      additionalProperties: false
+      required: [items, nextPageToken]
+      properties:
+        items:
+          type: array
+          items: {$ref: "#/components/schemas/Snapshot"}
+        nextPageToken: {type: string}
+    CreateSandboxEnvelopeData:
+      $ref: "#/components/schemas/EncodedCreateSandboxResult"
+    PauseEnvelopeData:
+      $ref: "#/components/schemas/EncodedPauseResult"
+    ResumeEnvelopeData:
+      $ref: "#/components/schemas/EncodedResumeResult"
+    CreateSnapshotEnvelopeData:
+      $ref: "#/components/schemas/EncodedCreateSnapshotResult"
+    SnapshotListEnvelopeData:
+      $ref: "#/components/schemas/EncodedSnapshotList"
+    SnapshotEnvelopeData:
+      $ref: "#/components/schemas/EncodedSnapshot"
+    EncodedCreateSandboxResult:
+      type: object
+      properties:
+        data:
+          type: string
+          contentEncoding: base64
+          contentMediaType: application/json
+          contentSchema: {$ref: "#/components/schemas/CreateSandboxResult"}
+    EncodedPauseResult:
+      type: object
+      properties:
+        data:
+          type: string
+          contentEncoding: base64
+          contentMediaType: application/json
+          contentSchema: {$ref: "#/components/schemas/PauseResult"}
+    EncodedResumeResult:
+      type: object
+      properties:
+        data:
+          type: string
+          contentEncoding: base64
+          contentMediaType: application/json
+          contentSchema: {$ref: "#/components/schemas/ResumeResult"}
+    EncodedCreateSnapshotResult:
+      type: object
+      properties:
+        data:
+          type: string
+          contentEncoding: base64
+          contentMediaType: application/json
+          contentSchema: {$ref: "#/components/schemas/CreateSnapshotResult"}
+    EncodedSnapshotList:
+      type: object
+      properties:
+        data:
+          type: string
+          contentEncoding: base64
+          contentMediaType: application/json
+          contentSchema: {$ref: "#/components/schemas/SnapshotList"}
+    EncodedSnapshot:
+      type: object
+      properties:
+        data:
+          type: string
+          contentEncoding: base64
+          contentMediaType: application/json
+          contentSchema: {$ref: "#/components/schemas/Snapshot"}
+    Envelope:
+      type: object
+      required: [code, message, data]
+      properties:
+        code: {type: integer, format: int32, example: 200}
+        message: {type: string}
+        data:
+          oneOf:
+            - type: string
+              contentEncoding: base64
+              description: Base64-encoded JSON operation result.
+            - type: "null"
+    ErrorEnvelope:
+      type: object
+      required: [code, message, error]
+      properties:
+        code: {type: integer, format: int32}
+        message: {type: string}
+        data:
+          oneOf:
+            - type: string
+              contentEncoding: base64
+            - type: "null"
+        error: {$ref: "#/components/schemas/ErrorDetail"}
+    ErrorDetail:
+      type: object
+      required: [code, retry, outcome, requestId]
+      properties:
+        code: {type: string, description: Stable symbolic ADX error code}
+        retry: {type: string, enum: [never, same_operation, after_backoff]}
+        outcome: {type: string, enum: [not_started, terminal, unknown]}
+        requestId: {type: string}
+        operationId: {type: string}
+        instanceId: {type: string}
+    ServiceCreateSandbox:
+      type: object
+      additionalProperties: false
+      required: [id, tenant, execution]
+      properties:
+        id: {type: string, minLength: 1}
+        tenant: {type: string, minLength: 1}
+        execution: {$ref: "#/components/schemas/ServiceExecutionSpec"}
+    ServiceExecutionSpec:
+      type: object
+      additionalProperties: false
+      required: [image, isolation_runtime, entrypoint, working_dir, env, resources, service]
+      properties:
+        image: {type: string, minLength: 1}
+        isolation_runtime: {type: string, minLength: 1}
+        entrypoint:
+          type: array
+          items: {type: string}
+        working_dir: {type: string}
+        user: {type: [string, "null"]}
+        env:
+          type: object
+          additionalProperties: {type: string}
+        resources:
+          $ref: "#/components/schemas/ServiceResources"
+        service:
+          type: array
+          items: {$ref: "#/components/schemas/DeclaredService"}
+    ServiceResources:
+      type: object
+      additionalProperties: false
+      required: [cpu_millis, memory_mib]
+      properties:
+        cpu_millis: {type: integer, format: int64, minimum: 1}
+        memory_mib: {type: integer, format: int64, minimum: 1}
+    DeclaredService:
+      type: object
+      additionalProperties: false
+      required: [protocol, port]
+      properties:
+        protocol: {type: string, enum: [http, ws, ssh]}
+        port: {type: integer, minimum: 1, maximum: 65535}
+    ServiceSandboxObservation:
+      type: object
+      additionalProperties: false
+      required: [id, tenant, phase, ready, runtime_id, message]
+      properties:
+        id: {type: string}
+        tenant: {type: string}
+        phase: {type: string, enum: [creating, running, failed, deleted]}
+        ready: {type: boolean}
+        runtime_id: {type: [string, "null"]}
+        message: {type: [string, "null"]}
+    ServiceSandboxError:
+      type: object
+      additionalProperties: false
+      required: [kind]
+      properties:
+        kind:
+          type: string
+          enum: [not_found, invalid, unsupported, conflict, unavailable, outcome_unknown]
+        message: {type: string}
