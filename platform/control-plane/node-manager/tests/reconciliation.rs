@@ -12,6 +12,9 @@ struct Backend {
     actual: Mutex<Vec<RuntimeObservation>>,
     fail_inventory: std::sync::atomic::AtomicBool,
     fail_remove: std::sync::atomic::AtomicBool,
+    block_remove: std::sync::atomic::AtomicBool,
+    remove_entered: tokio::sync::Notify,
+    remove_release: tokio::sync::Notify,
     events: Mutex<Vec<String>>,
 }
 #[async_trait]
@@ -44,6 +47,10 @@ impl RuntimeBackend for Backend {
     }
     async fn remove(&self, id: &str) -> Result<()> {
         self.events.lock().unwrap().push(format!("remove:{id}"));
+        if self.block_remove.load(std::sync::atomic::Ordering::SeqCst) {
+            self.remove_entered.notify_waiters();
+            self.remove_release.notified().await;
+        }
         if self.fail_remove.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(adx_core::Error::Unavailable("delete failed".into()));
         }
@@ -66,7 +73,11 @@ impl Routes for Backend {
             .push(format!("bind:{}", r.runtime_id));
         Ok(())
     }
-    async fn retire(&self, _: &InstanceRecord) -> Result<()> {
+    async fn retire(&self, record: &InstanceRecord) -> Result<()> {
+        self.events
+            .lock()
+            .unwrap()
+            .push(format!("retire:{}", record.runtime_id));
         Ok(())
     }
     async fn retire_orphan(&self, r: &RuntimeObservation) -> Result<()> {
@@ -196,6 +207,10 @@ async fn missing_running_or_uncommitted_start_fails_without_recreation() {
             .count(),
         2
     );
+    let events = b.events.lock().unwrap();
+    assert!(events.contains(&"retire:missing-7".into()));
+    assert!(events.contains(&"retire:pending-7".into()));
+    assert!(!events.iter().any(|event| event.starts_with("bind:")));
 }
 
 #[tokio::test]
@@ -307,4 +322,63 @@ async fn reconnect_discards_live_controller_when_authority_invalidates_execution
         .unwrap()
         .iter()
         .any(|e| e.starts_with("bind:")));
+}
+
+#[tokio::test]
+async fn restart_after_interrupted_reconciliation_retries_physical_cleanup() {
+    let backend = Arc::new(Backend::default());
+    *backend.actual.lock().unwrap() = vec![observed("stale")];
+    backend
+        .block_remove
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let entered = backend.remove_entered.notified();
+    let first = Arc::new(manager(&backend));
+    let reconciling = {
+        let first = first.clone();
+        tokio::spawn(async move { first.reconcile(vec![]).await })
+    };
+    tokio::time::timeout(Duration::from_secs(1), entered)
+        .await
+        .expect("first reconciliation did not enter physical cleanup");
+    assert!(!first.accepting_allocations());
+    assert_eq!(backend.actual.lock().unwrap().len(), 1);
+
+    // Process loss cancels the in-flight cleanup. A fresh manager must inspect
+    // sandboxd again and repeat the idempotent remove before opening admission.
+    reconciling.abort();
+    reconciling
+        .await
+        .expect_err("aborted task unexpectedly completed");
+    let entered_again = backend.remove_entered.notified();
+    let restarted = Arc::new(manager(&backend));
+    let resumed = {
+        let restarted = restarted.clone();
+        tokio::spawn(async move { restarted.reconcile(vec![]).await })
+    };
+    tokio::time::timeout(Duration::from_secs(1), entered_again)
+        .await
+        .expect("restarted reconciliation did not retry physical cleanup");
+    assert!(!restarted.accepting_allocations());
+    backend.remove_release.notify_waiters();
+    resumed.await.unwrap().unwrap();
+
+    assert!(restarted.accepting_allocations());
+    assert!(backend.actual.lock().unwrap().is_empty());
+    assert_eq!(restarted.used(), Resources::default());
+    assert_eq!(
+        backend
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event.as_str() == "remove:stale-7")
+            .count(),
+        2
+    );
+    assert!(!backend
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|event| event.starts_with("bind:")));
 }

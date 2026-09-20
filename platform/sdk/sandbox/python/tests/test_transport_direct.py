@@ -156,6 +156,203 @@ def test_create_rejects_stream_without_final():
     print("ok: create rejects stream without final")
 
 
+def test_create_retries_clean_eof_after_accepted_with_stable_identity():
+    attempts = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(
+            {
+                "request_id": request.headers.get("X-Request-Id"),
+                "body": json.loads(request.read()),
+            }
+        )
+        if len(attempts) == 1:
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                text=(
+                    'event: accepted\n'
+                    'data: {"status":"creating"}\n\n'
+                    ': heartbeat\n\n'
+                ),
+            )
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=(
+                'event: final\n'
+                'data: {"sandboxId":"sandbox-after-eof","status":"running"}\n\n'
+            ),
+        )
+
+    result = _make_client(handler).create_info({"createTimeoutSeconds": 3})
+
+    _check(result["sandboxId"] == "sandbox-after-eof", f"create result: {result}")
+    _check(len(attempts) == 2, f"create attempts: {attempts}")
+    _check(
+        len({attempt["request_id"] for attempt in attempts}) == 1,
+        f"request id changed after missing final: {attempts}",
+    )
+    _check(
+        len({attempt["body"]["name"] for attempt in attempts}) == 1,
+        f"instance identity changed after missing final: {attempts}",
+    )
+
+
+def test_create_clean_eof_exhaustion_reports_unknown_stable_identity():
+    attempts = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(
+            {
+                "request_id": request.headers.get("X-Request-Id"),
+                "body": json.loads(request.read()),
+            }
+        )
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text='event: accepted\ndata: {"status":"creating"}\n\n',
+        )
+
+    try:
+        _make_client(handler).create_info({"createTimeoutSeconds": 3})
+    except SandboxError as error:
+        _check(error.code == "OUTCOME_UNKNOWN", f"error code: {error.code}")
+        _check(error.retry == "same_operation", f"retry: {error.retry}")
+        _check(error.outcome == "unknown", f"outcome: {error.outcome}")
+        _check(error.request_id == attempts[0]["request_id"], f"request id: {error}")
+        _check(
+            error.instance_id == attempts[0]["body"]["name"],
+            f"instance id: {error.instance_id}",
+        )
+    else:
+        raise AssertionError("missing final must have an unknown create outcome")
+
+    _check(len(attempts) == 3, f"create attempts: {attempts}")
+    _check(
+        len({attempt["request_id"] for attempt in attempts}) == 1,
+        f"request id changed across unknown retries: {attempts}",
+    )
+    _check(
+        len({attempt["body"]["name"] for attempt in attempts}) == 1,
+        f"instance identity changed across unknown retries: {attempts}",
+    )
+
+
+def test_create_retries_structured_unknown_final_with_same_identity():
+    attempts = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        request_id = request.headers.get("X-Request-Id")
+        body = json.loads(request.read())
+        attempts.append((request_id, body["name"]))
+        if len(attempts) == 1:
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                text=(
+                    'event: final\n'
+                    'data: {"status":"failed","errorCode":503,'
+                    '"message":"reply lost","error":{'
+                    '"code":"OUTCOME_UNKNOWN","retry":"same_operation",'
+                    '"outcome":"unknown","requestId":"'
+                    + request_id
+                    + '","instanceId":"'
+                    + body["name"]
+                    + '"}}\n\n'
+                ),
+            )
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=(
+                'event: final\n'
+                'data: {"sandboxId":"sandbox-after-unknown","status":"running"}\n\n'
+            ),
+        )
+
+    result = _make_client(handler).create_info({"createTimeoutSeconds": 3})
+
+    _check(result["sandboxId"] == "sandbox-after-unknown", f"create result: {result}")
+    _check(len(attempts) == 2, f"create attempts: {attempts}")
+    _check(len(set(attempts)) == 1, f"logical identity changed: {attempts}")
+
+
+def test_create_structured_unknown_exhaustion_preserves_contract_identity():
+    attempts = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        request_id = request.headers.get("X-Request-Id")
+        body = json.loads(request.read())
+        attempts.append((request_id, body["name"]))
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=(
+                'event: final\n'
+                'data: {"status":"failed","errorCode":503,'
+                '"message":"commit response lost","error":{'
+                '"code":"OUTCOME_UNKNOWN","retry":"same_operation",'
+                '"outcome":"unknown","requestId":"'
+                + request_id
+                + '","operationId":"operation-7","instanceId":"'
+                + body["name"]
+                + '"}}\n\n'
+            ),
+        )
+
+    try:
+        _make_client(handler).create_info({"createTimeoutSeconds": 3})
+    except SandboxError as error:
+        _check(error.code == "OUTCOME_UNKNOWN", f"error code: {error.code}")
+        _check(error.retry == "same_operation", f"retry: {error.retry}")
+        _check(error.outcome == "unknown", f"outcome: {error.outcome}")
+        _check(error.request_id == attempts[0][0], f"request id: {error.request_id}")
+        _check(error.operation_id == "operation-7", f"operation id: {error.operation_id}")
+        _check(error.instance_id == attempts[0][1], f"instance id: {error.instance_id}")
+    else:
+        raise AssertionError("persistent unknown result must fail with query identity")
+
+    _check(len(attempts) == 3, f"create attempts: {attempts}")
+    _check(len(set(attempts)) == 1, f"logical identity changed: {attempts}")
+
+
+def test_create_does_not_retry_structured_terminal_final():
+    attempts = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        request_id = request.headers.get("X-Request-Id")
+        body = json.loads(request.read())
+        attempts.append((request_id, body["name"]))
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=(
+                'event: final\n'
+                'data: {"status":"failed","errorCode":409,'
+                '"message":"specification conflict","error":{'
+                '"code":"CONFLICT","retry":"never",'
+                '"outcome":"not_started","requestId":"'
+                + request_id
+                + '","instanceId":"'
+                + body["name"]
+                + '"}}\n\n'
+            ),
+        )
+
+    try:
+        _make_client(handler).create_info({"createTimeoutSeconds": 3})
+    except SandboxError as error:
+        _check(error.code == "CONFLICT", f"error code: {error.code}")
+        _check(error.retry == "never", f"retry: {error.retry}")
+        _check(error.outcome == "not_started", f"outcome: {error.outcome}")
+    else:
+        raise AssertionError("terminal create result must fail")
+
+    _check(len(attempts) == 1, f"terminal result was retried: {attempts}")
+
+
 def test_create_retries_broken_sse_with_stable_request_identity():
     attempts = []
 
@@ -1736,6 +1933,11 @@ if __name__ == "__main__":
     test_create_transport_default_covers_default_logical_budget()
     test_create_rejects_timeout_final()
     test_create_rejects_stream_without_final()
+    test_create_retries_clean_eof_after_accepted_with_stable_identity()
+    test_create_clean_eof_exhaustion_reports_unknown_stable_identity()
+    test_create_retries_structured_unknown_final_with_same_identity()
+    test_create_structured_unknown_exhaustion_preserves_contract_identity()
+    test_create_does_not_retry_structured_terminal_final()
     test_sandbox_create_timeout_precedence_and_body()
     test_sandbox_create_timeout_validation()
     test_pause_and_resume_retry_with_one_internal_request_id_per_call()

@@ -414,6 +414,65 @@ async fn restart_recovers_generated_backend_id_from_labels() {
 }
 
 #[tokio::test]
+async fn daemon_reconnect_adopts_preserved_runtime_without_second_start() {
+    let server = Server::default();
+    let (adapter, mut harness) = connect(server.clone()).await;
+    adapter.start(&spec(), "i-1", 1, &[]).await.unwrap();
+    assert_eq!(
+        server
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.starts_with("start:"))
+            .count(),
+        1
+    );
+
+    let socket = harness._directory.path().join("rpc.sock");
+    harness.task.abort();
+    tokio::task::yield_now().await;
+    std::fs::remove_file(&socket).unwrap();
+    let listener = UnixListener::bind(&socket).unwrap();
+    let service = server.clone();
+    harness.task = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(sandbox_service_server::SandboxServiceServer::new(service))
+            .serve_with_incoming(UnixListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+
+    let reconnected = connect_when_ready(
+        socket,
+        Config {
+            rpc_timeout: Duration::from_millis(100),
+            ..Default::default()
+        },
+        Duration::from_secs(2),
+        Duration::from_millis(10),
+    )
+    .await
+    .unwrap();
+    let observed = reconnected.inventory().await.unwrap();
+    assert_eq!(observed.len(), 1);
+    assert_eq!(observed[0].instance_id, "i");
+    assert_eq!(observed[0].runtime_id, "i-1");
+    assert_eq!(observed[0].generation, 1);
+    assert!(reconnected.is_running("i-1").await.unwrap());
+    assert_eq!(
+        server
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.starts_with("start:"))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn cleanup_after_restart_finds_uncommitted_runtime_by_labels() {
     let server = Server::default();
     let (adapter, harness) = connect(server.clone()).await;

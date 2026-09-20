@@ -8,10 +8,10 @@
 
 | 门禁 | 场景 | 通过条件 | 当前状态 |
 |---|---|---|---|
-| ERR-01 | 稳定错误映射 | Invalid、Auth、Permission、NotFound、Conflict、NoCapacity、Unavailable、Deadline、OutcomeUnknown、DataLoss、Internal 的 HTTP/gRPC/SDK 映射一致 | API Server 与 Python SDK 已实现并有契约测试；完整进程 E2E 待补 |
-| ERR-02 | 可重试分类 | 稳定业务冲突不重试；临时不可用按退避；结果未知只以同一 request/operation/instance 身份重试 | SDK 已按结构化字段执行，待真实断流 E2E |
-| ERR-03 | 创建应答丢失 | Node 已启动但响应被切断；重试收敛到同一 backend 和 generation | 组件测试已有，待真实断流 E2E |
-| ERR-04 | 查询空结果 | 结果未知后的 404 不触发换 ID 或第二次 Start | SDK 稳定 Instance ID 与原子 claim 已有测试，待真实断流 E2E |
+| ERR-01 | 稳定错误映射 | Invalid、Auth、Permission、NotFound、Conflict、NoCapacity、Unavailable、Deadline、OutcomeUnknown、DataLoss、Internal 的 HTTP/gRPC/SDK 映射一致 | API Server 已逐类校验 HTTP 状态、稳定码、retry、outcome 和操作身份；SDK 结构化解析已有契约测试；完整进程 E2E 待补 |
+| ERR-02 | 可重试分类 | 稳定业务冲突不重试；临时不可用按退避；结果未知只以同一 request/operation/instance 身份重试 | SDK 已覆盖 terminal final 不重试、structured unknown final 同身份重试和重试耗尽；真实断流 E2E 待补 |
+| ERR-03 | 创建应答丢失 | Node 已启动但响应被切断；重试收敛到同一 backend 和 generation | SDK 已覆盖 accepted 后连接报错及正常 EOF 无 final，两类情况均复用 Request ID 和稳定 Instance 名称；原子 claim 有唯一 backend 组件测试；待真实代理断流 E2E |
+| ERR-04 | 查询空结果 | 结果未知后的 404 不触发换 ID 或第二次 Start | SDK 稳定 Instance ID、同身份重试与原子 claim 已有测试；待真实代理断流后查询 E2E |
 
 ## Deadline 契约
 
@@ -32,9 +32,9 @@
 | 门禁 | 场景 | 通过条件 | 当前状态 |
 |---|---|---|---|
 | SD-01 | sandboxd 晚于 Node Manager 启动 | Node Manager 持续等待；不注册、不准入；sandboxd 就绪后才开始对账和服务 | 已有 UDS 定向测试 |
-| SD-02 | daemon 重启且 runtime 保留 | 已有实例不误判退出；资源观测过期后关闭新准入，连接恢复后对账并重新开放 | 待 E2E |
-| SD-03 | daemon 重启且 runtime 丢失，Never | 实例进入 Failed、撤路由、释放资源，不自动冷启动 | 待 E2E |
-| SD-04 | daemon 重启且 runtime 丢失，自动重启 | 遵守重试上限与退避，新 backend 使用同一 Instance ID 和有效 generation | 已有生命周期 E2E，需加入正式门禁 |
+| SD-02 | daemon 重启且 runtime 保留 | 已有实例不误判退出；资源观测过期后关闭新准入，连接恢复后对账并重新开放 | pinned gRPC/UDS 契约测试已覆盖 daemon 连接重建后按标签找回 backend 且不重复 Start；资源门控和真实 daemon 重启仍待 E2E |
+| SD-03 | daemon 重启且 runtime 丢失，Never | 实例进入 Failed、撤路由、释放资源，不自动冷启动 | 已有对账组件测试验证 Failed、撤路由、资源释放且 RuntimeBackend::start 不会被调用；待真实 daemon 重启 E2E |
+| SD-04 | daemon 重启且 runtime 丢失，自动重启 | 遵守重试上限与退避，新 backend 使用同一 Instance ID 和有效 generation | 已有生命周期组件测试验证新 runtime identity、退避和重试上限；需加入正式进程门禁 |
 
 ## Node Manager 与节点故障
 
@@ -42,7 +42,7 @@
 |---|---|---|---|
 | NM-01 | 心跳期限内进程重启 | 新 session 完成权威对账并保留有效 backend；对账完成前不准入 | 已有本地 E2E |
 | NM-02 | 超过心跳期限后进程返回 | 旧实例已经失效；返回节点清理旧执行与绑定后才重新准入 | 已有本地 E2E |
-| NM-03 | 对账期间再次崩溃 | 再次启动继续从 Redis 权威状态收敛，不复活旧 generation | 待故障注入 E2E |
+| NM-03 | 对账期间再次崩溃 | 再次启动继续从 Redis 权威状态收敛，不复活旧 generation | 已有中断物理清理后新 Node Manager 重读 inventory、重复幂等删除并保持准入关闭的组件测试；待真实进程故障注入 E2E |
 | NODE-01 | 节点故障且无 checkpoint | Failed、撤路由，不从镜像冷启动 | 已有组件覆盖，待多 VM 门禁 |
 | NODE-02 | 共享 checkpoint | 跨节点恢复同一 Instance ID，generation 递增，旧执行不能复活 | 已有本地 FC 覆盖，待多 VM 门禁 |
 | NODE-03 | local-only checkpoint | 明确恢复失败，不在其他节点创建空白实例 | 已有组件覆盖，待多 VM 门禁 |
