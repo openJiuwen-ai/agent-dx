@@ -12,6 +12,25 @@ Agent applications use the public Sandbox SDK to create and operate Instances. G
 
 Redis is the authoritative cluster store and discovery backend. Node Manager uses a local SQLite journal only when cluster-state submission is temporarily unavailable. sandboxd is managed by the deployment environment and provides the execution backend. Node Manager embeds Node Proxy by default and also supports an explicit split-process deployment.
 
+## Core abstractions
+
+ADX uses **Instance** as the internal managed execution unit. **Sandbox** is the public API and SDK facade. Agent Distributed Executor sits above the platform and consumes Instance capabilities through the Sandbox SDK; it does not participate in platform scheduling or lifecycle state machines.
+
+| Abstraction | Layer | Meaning and boundary |
+|---|---|---|
+| `Agent` / `Session` | Agent | Agent tasks, sessions, affinity, and execution orchestration; accesses the platform only through the public Sandbox SDK |
+| `Sandbox` | Public API | The user's API/SDK handle; one creation maps to one Instance and is not an internal scheduling object |
+| `Instance` | Control plane | Stable internal identity with tenant, specification, and desired/observed state; create, pause, resume, and delete converge around it |
+| `Assignment` | Scheduler | Authoritative Instance ownership, including node, devices, and `generation`; a newer generation fences late execution from an older owner |
+| `Shard` | Master scheduler | An in-process scheduling partition. Global selection rotates across Shards; each Shard owns queueing, Filter/Score, and node selection |
+| `Node` | Node layer | One Node Manager registration session with capacity, devices, and health; Node Manager performs final local admission |
+| `Runtime Environment` | Execution | How RRT, the bootstrap command, and local EROFS/OCI runtime content enter an Instance; sandboxd is the current execution backend |
+| `Route` / `Binding` | Data plane | Master publishes versioned Instance ownership, Edge caches it, and Node Proxy rechecks the local binding before forwarding |
+| `Restore Point` / `Snapshot` | Recovery | A pause restore point retains the Instance ID; a reusable Snapshot creates a new Instance and stores bytes locally or in object storage |
+| `Request ID` / `Operation ID` | Reliability | Identifies one logical write for retry, deduplication, result lookup, and reconciliation; a timeout does not automatically mean failure |
+
+The fixed layering is: Agent/application → Sandbox SDK/HTTP API → API Server → Master/ShardScheduler or local-first Node Manager → sandboxd. Runtime traffic follows Edge → Node Proxy → RRT inside the Instance and does not enter control-plane lifecycle queues.
+
 | Directory | Responsibility |
 |---|---|
 | `agent/` | Agent APIs, sessions, dispatch, and execution orchestration |
@@ -35,30 +54,99 @@ Redis is the authoritative cluster store and discovery backend. Node Manager use
 - Prometheus metrics, OpenTelemetry traces, structured logs, log rotation, gzip compression, and external Collector integration.
 - Process deployment with managed or external Redis, plus Kubernetes end-to-end deployment profiles.
 
-## Quick start
+## Deployment
 
-Use an ADX release package on a Linux host. The deployment environment must provide sandboxd, certificates, an initial administrator API Key, and Instance networking. The default standalone profile starts Redis, Master, Node Manager with embedded Node Proxy, API Server, and Edge on one host.
+The same ADX release package can start different roles by configuration. The deployment environment must provide a Linux host, separately managed sandboxd, component certificates, an initial administrator API Key, Instance networking, and an architecture-matching release installed at `/opt/adx`. `adxctl` reads one YAML file describing the **current host**, by default `/etc/adx/deployment.yaml`. It validates, renders, and supervises processes; it does not create Instances.
+
+### Standalone with ADX-managed Redis
+
+The default `standalone` profile starts Redis, Master, Node Manager with embedded Node Proxy, API Server, and Edge on one host. sandboxd remains independently managed by the deployment environment.
 
 ```sh
 sudo install -d -m 0700 /etc/adx /etc/adx/tls /etc/adx/secrets /var/lib/adx /run/adx
-sudo /opt/adx/bin/adxctl config init
+sudo /opt/adx/bin/adxctl config init --profile standalone
 
-# Edit /etc/adx/deployment.yaml, then validate and start it.
+# Edit certificates, the bootstrap key, sandboxd socket, Instance CIDR, and disk paths.
 sudo /opt/adx/bin/adxctl validate
 sudo /opt/adx/bin/adxctl render --output /run/adx/config-review
 sudo /opt/adx/bin/adxctl run
 ```
 
-In another terminal:
+`run` keeps the supervisor in the foreground; production deployments should let systemd or the Pod supervise it. In another terminal, inspect or stop the host deployment:
 
 ```sh
 sudo /opt/adx/bin/adxctl status
 sudo /opt/adx/bin/adxctl stop
 ```
 
-Use `standalone-external-redis`, `master`, `node`, or `edge-api` profiles for external Redis and split-host deployments. Each host owns one deployment YAML; hosts join the same cluster through a shared Redis URL and namespace.
+### Standalone with external Redis
 
-See the [standalone guide](docs/deployment/standalone.md), [`adxctl` reference](docs/deployment/adxctl.md), and [runtime environment guide](docs/deployment/runtime-environment.md) for certificates, Redis, sandboxd, networking, SDK setup, and role-specific examples.
+```sh
+sudo /opt/adx/bin/adxctl config init --profile standalone-external-redis
+sudoedit /etc/adx/deployment.yaml   # Set the real redis_url and namespace.
+sudo /opt/adx/bin/adxctl validate
+sudo /opt/adx/bin/adxctl run
+```
+
+External Redis is outside `adxctl status`, restart budgets, and `stop`. Every component must use the same persistent Redis and namespace.
+
+### Split-host roles
+
+Generate an independent configuration on the control host, every worker, and the ingress host. Do not list multiple nodes in one host YAML:
+
+```sh
+# Control host: Master. Add a redis role to the full YAML if this host manages Redis.
+sudo /opt/adx/bin/adxctl config init --profile master
+
+# Every worker: Node Manager with embedded Node Proxy by default.
+sudo /opt/adx/bin/adxctl config init --profile node
+
+# Ingress host: API Server + Edge.
+sudo /opt/adx/bin/adxctl config init --profile edge-api
+```
+
+Edit `/etc/adx/deployment.yaml` on each host. All files use the same `redis_url`, `namespace`, and matching mTLS trust; each worker needs a unique `node_id` and reachable control and proxy addresses. Start Redis → Master → workers → API Server/Edge. Node Proxy becomes a separate process only when `proxy_mode: standalone` is selected explicitly.
+
+YAML string values support `${VAR}` and `${VAR:-default}`. Use `adxctl config dump` to inspect the fully merged profile, environment, and host overrides. Kubernetes runs the same processes in Pods while the deployment environment provides `adxctl run`, certificates, Redis connectivity, and sandboxd.
+
+See the [`adxctl` reference](docs/deployment/adxctl.md), [standalone guide](docs/deployment/standalone.md), [configuration examples](build/config/examples/README.md), and [runtime environment guide](docs/deployment/runtime-environment.md) for complete fields, certificates, Redis, networking, and runtime setup.
+
+## Usage
+
+The release package contains the `adx-sandbox` wheel under `sdk/`. After the deployment is ready, install it and configure the external entrypoint and API Key:
+
+```sh
+python3 -m venv /opt/adx-client
+/opt/adx-client/bin/python -m pip install /opt/adx/sdk/adx_sandbox-*.whl
+
+export ADX_SERVER_ADDRESS=adx.example.com:8443
+export ADX_GATEWAY_ADDRESS=adx.example.com:8443
+export ADX_TOKEN="$(cat /secure/path/tenant-api-key)"
+export ADX_TLS=1
+export ADX_GATEWAY_TLS=1
+export ADX_SANDBOX_IMAGE=python:3.12-slim
+```
+
+Create an Instance, execute through RRT, and delete it explicitly:
+
+```python
+import os
+from adx_sandbox import Sandbox
+
+sandbox = Sandbox(
+    image=os.environ["ADX_SANDBOX_IMAGE"],
+    cpu=1000,
+    memory=2048,
+    name="readme-demo",
+)
+try:
+    result = sandbox.commands.run("printf 'hello from ADX\\n'")
+    print(result.stdout)
+finally:
+    sandbox.kill()
+```
+
+The image must be supported by the configured sandboxd and ADX Runtime Environment. Applications that avoid process-global environment variables can construct `ConnectionConfig` explicitly. See the [Sandbox Python SDK](platform/sdk/sandbox/python/README.md) for pause/resume, reusable snapshots, placement, and retry semantics, and the [Sandbox API](platform/control-plane/api-server/docs/sandbox-lifecycle-api.md) for raw HTTP paths and payloads. Agent applications start from the [Agent guide](agent/README.md) and use the same Sandbox SDK underneath.
 
 ## Build and test
 
