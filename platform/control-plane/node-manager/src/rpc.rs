@@ -36,7 +36,7 @@ impl NodeRpc {
             .manager
             .instances
             .lock()
-            .unwrap()
+            .expect("shared state lock poisoned")
             .get(&assignment.instance_id)
             .cloned()
             .ok_or_else(|| Status::not_found("instance not managed on this node"))?;
@@ -338,7 +338,7 @@ impl pb::node_service_server::NodeService for NodeRpc {
                     .manager
                     .instances
                     .lock()
-                    .unwrap()
+                    .expect("shared state lock poisoned")
                     .get(&assignment.instance_id)
                     .cloned()
                     .ok_or_else(|| Status::not_found("instance not managed on this node"))?;
@@ -381,9 +381,9 @@ impl MasterStateSink {
         self
     }
     pub fn reconnect(&self, channel: Channel) {
-        *self.snapshots.write().unwrap() =
+        *self.snapshots.write().expect("shared state lock poisoned") =
             pb::snapshot_service_client::SnapshotServiceClient::new(channel.clone());
-        *self.client.write().unwrap() =
+        *self.client.write().expect("shared state lock poisoned") =
             pb::master_service_client::MasterServiceClient::new(channel);
     }
 }
@@ -396,7 +396,11 @@ impl StateSink for MasterStateSink {
         });
         adx_observability::trace::inject_metadata(request.metadata_mut());
         request.set_timeout(self.timeout);
-        let mut client = self.client.read().unwrap().clone();
+        let mut client = self
+            .client
+            .read()
+            .expect("shared state lock poisoned")
+            .clone();
         let response = tokio::time::timeout(self.timeout, client.commit_instance(request))
             .await
             .map_err(|_| Error::Unavailable("state commit RPC timed out".into()))?
@@ -421,7 +425,11 @@ impl StateSink for MasterStateSink {
 #[async_trait::async_trait]
 impl crate::checkpoint::SnapshotCatalog for MasterStateSink {
     async fn get(&self, id: &str) -> Result<adx_core::snapshots::Snapshot> {
-        let mut client = self.snapshots.read().unwrap().clone();
+        let mut client = self
+            .snapshots
+            .read()
+            .expect("shared state lock poisoned")
+            .clone();
         let mut request = Request::new(pb::GetSnapshotRequest {
             id: id.into(),
             caller: None,
@@ -440,7 +448,11 @@ impl crate::checkpoint::SnapshotCatalog for MasterStateSink {
         &self,
         snapshot: adx_core::snapshots::Snapshot,
     ) -> Result<adx_core::snapshots::Snapshot> {
-        let mut client = self.snapshots.read().unwrap().clone();
+        let mut client = self
+            .snapshots
+            .read()
+            .expect("shared state lock poisoned")
+            .clone();
         let mut request = Request::new(pb::PublishSnapshotRequest {
             snapshot: Some(snapshot.try_into()?),
             node_session_id: self.session_id.clone(),

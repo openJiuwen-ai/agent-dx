@@ -67,7 +67,7 @@ impl Controller {
             self.services
                 .admission
                 .lock()
-                .unwrap()
+                .expect("shared state lock poisoned")
                 .release(&self.record.runtime_id)?;
             self.held = false;
             self.record.resources_held = false;
@@ -203,10 +203,13 @@ impl Controller {
                     source_runtime_id: self.record.runtime_id.clone(),
                 });
                 self.transition(Event::Checkpointed)?;
-                let path = services
-                    .store
-                    .materialize(&self.record.checkpoint.as_ref().unwrap().artifact)
-                    .await?;
+                let artifact = &self
+                    .record
+                    .checkpoint
+                    .as_ref()
+                    .ok_or(Error::Conflict)?
+                    .artifact;
+                let path = services.store.materialize(artifact).await?;
                 let rollback = self.restore_execution(&path).await;
                 if self.held {
                     self.recovery_files = Some(path);
@@ -243,11 +246,11 @@ impl Controller {
             "{}-{}-r{}",
             self.record.spec.id, self.record.assignment.generation, next_revision
         );
-        self.services.admission.lock().unwrap().reserve(
-            &runtime_id,
-            &self.record.spec,
-            &self.record.assignment,
-        )?;
+        self.services
+            .admission
+            .lock()
+            .expect("shared state lock poisoned")
+            .reserve(&runtime_id, &self.record.spec, &self.record.assignment)?;
         self.record.runtime_id = runtime_id;
         self.held = true;
         self.record.resources_held = true;

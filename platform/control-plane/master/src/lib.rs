@@ -171,7 +171,7 @@ impl Master {
             let shard = (0..self.shards.len())
                 .map(|offset| (self.next_node_shard + offset) % self.shards.len())
                 .min_by_key(|id| self.shards[*id].node_count())
-                .unwrap();
+                .expect("Master is constructed with at least one scheduling shard");
             self.next_node_shard = (shard + 1) % self.shards.len();
             self.node_shards.insert(node.id.clone(), shard);
             shard

@@ -181,7 +181,13 @@ impl Clients {
                 self.endpoint.lock().await.insert(
                     (),
                     value.address.clone(),
-                    Duration::from_secs(self.config.discovery.as_ref().unwrap().poll_seconds),
+                    Duration::from_secs(
+                        self.config
+                            .discovery
+                            .as_ref()
+                            .expect("discovery client requires discovery configuration")
+                            .poll_seconds,
+                    ),
                 );
                 value.address
             }

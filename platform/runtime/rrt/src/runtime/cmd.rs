@@ -693,6 +693,8 @@ pub fn cmd_start(kw: &BTreeMap<String, Value>) -> Value {
                 }
                 Ok(None) if deadline.is_some_and(|deadline| Instant::now() >= deadline) => {
                     waiter_exit.timed_out.store(true, Ordering::Release);
+                    // SAFETY: child is still live and owns this process-group ID. kill receives
+                    // only the scalar ID and retains no Rust data.
                     unsafe {
                         libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
                     }
@@ -956,6 +958,8 @@ pub fn cmd_kill(kw: &BTreeMap<String, Value>) -> Value {
             ("error", Value::from("CommandNotRunning")),
         ]);
     }
+    // SAFETY: pid came from the still-managed child and is checked above; kill receives only the
+    // scalar process-group ID and retains no Rust data.
     let result = unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
     if result == 0 {
         exit.killed.store(true, Ordering::Release);

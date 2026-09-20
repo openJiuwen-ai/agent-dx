@@ -82,7 +82,8 @@ impl Managed {
         if let Some(child) = &mut self.child {
             if child.try_wait()?.is_none() {
                 let id = child.id() as i32;
-                // Child has not been reaped, so its process group cannot belong to a reused PID.
+                // SAFETY: the child has not been reaped, so its process group cannot belong to a
+                // reused PID. kill does not retain the scalar process-group identifier.
                 if unsafe { libc::kill(-id, signal) } != 0 {
                     let e = std::io::Error::last_os_error();
                     if e.raw_os_error() != Some(libc::ESRCH) {
@@ -109,6 +110,8 @@ struct Guard {
 impl Drop for Guard {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.socket);
+        // SAFETY: file owns this valid descriptor for the duration of the call; flock does not
+        // retain it. Unlock failure cannot be recovered while dropping the guard.
         let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
     }
 }
@@ -127,6 +130,8 @@ fn lock(root: &Path) -> Result<Guard> {
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
         .open(root.join("supervisor.lock"))?;
+    // SAFETY: file owns this valid descriptor for the duration of the call; flock does not retain
+    // it. The descriptor remains owned by Guard after the lock succeeds.
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         return Err("deployment already supervised".into());
     }

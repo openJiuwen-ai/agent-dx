@@ -234,6 +234,9 @@ fn start_from_environment(manager: Arc<Manager>) {
         .stderr(Stdio::piped());
     child_env::apply(&mut command);
     if let Some(identity) = identity {
+        // SAFETY: the closure runs in the child immediately before exec, captures owned identity
+        // data whose pointers stay valid for the call, performs no access to parent-only state,
+        // and converts every syscall failure into an aborted exec.
         unsafe {
             command.pre_exec(move || {
                 let group_result = if let Some(user_name) = &identity.user_name {
@@ -432,9 +435,13 @@ fn resolve_user(user: &str) -> Result<(libc::uid_t, libc::gid_t, Option<CString>
         return Ok((uid, lookup_uid_gid(uid).unwrap_or(0), None));
     }
     let name = CString::new(user).map_err(|_| "image user contains NUL".to_string())?;
+    // SAFETY: libc::passwd is a C output structure for which an all-zero value is a valid
+    // initialized placeholder before getpwnam_r fills its fields.
     let mut pwd = unsafe { std::mem::zeroed::<libc::passwd>() };
     let mut result = std::ptr::null_mut();
     let mut buffer = vec![0u8; 16 * 1024];
+    // SAFETY: name is NUL terminated, pwd and result are writable, and buffer remains allocated
+    // for the call. No returned pointer is used after buffer is dropped.
     let rc = unsafe {
         libc::getpwnam_r(
             name.as_ptr(),
@@ -451,9 +458,13 @@ fn resolve_user(user: &str) -> Result<(libc::uid_t, libc::gid_t, Option<CString>
 }
 
 fn lookup_uid_gid(uid: libc::uid_t) -> Option<libc::gid_t> {
+    // SAFETY: libc::passwd is a C output structure for which an all-zero value is a valid
+    // initialized placeholder before getpwuid_r fills its fields.
     let mut pwd = unsafe { std::mem::zeroed::<libc::passwd>() };
     let mut result = std::ptr::null_mut();
     let mut buffer = vec![0u8; 16 * 1024];
+    // SAFETY: pwd and result are writable, and buffer remains allocated for the call. No returned
+    // pointer is used after buffer is dropped.
     let rc = unsafe {
         libc::getpwuid_r(
             uid,
@@ -471,9 +482,13 @@ fn resolve_group(group: &str) -> Result<libc::gid_t, String> {
         return Ok(gid);
     }
     let name = CString::new(group).map_err(|_| "image group contains NUL".to_string())?;
+    // SAFETY: libc::group is a C output structure for which an all-zero value is a valid
+    // initialized placeholder before getgrnam_r fills its fields.
     let mut grp = unsafe { std::mem::zeroed::<libc::group>() };
     let mut result = std::ptr::null_mut();
     let mut buffer = vec![0u8; 16 * 1024];
+    // SAFETY: name is NUL terminated, grp and result are writable, and buffer remains allocated
+    // for the call. No returned pointer is used after buffer is dropped.
     let rc = unsafe {
         libc::getgrnam_r(
             name.as_ptr(),

@@ -95,7 +95,11 @@ impl NodeManager {
             }
             catalog.insert(r.spec.id.clone(), r);
         }
-        let controllers = self.instances.lock().unwrap().clone();
+        let controllers = self
+            .instances
+            .lock()
+            .expect("shared state lock poisoned")
+            .clone();
         for (id, (spec, assignment, _)) in &controllers {
             if let Some(r) = catalog.get(id) {
                 if r.assignment.generation == assignment.generation
@@ -145,11 +149,14 @@ impl NodeManager {
                 handle.discard().await?;
                 self.retired_generations
                     .lock()
-                    .unwrap()
+                    .expect("shared state lock poisoned")
                     .entry(id.clone())
                     .and_modify(|g| *g = (*g).max(assignment.generation))
                     .or_insert(assignment.generation);
-                self.instances.lock().unwrap().remove(&id);
+                self.instances
+                    .lock()
+                    .expect("shared state lock poisoned")
+                    .remove(&id);
             }
         }
         for runtime in &actual {
@@ -174,12 +181,16 @@ impl NodeManager {
         }
         for r in catalog.into_values() {
             let handle = {
-                let mut instances = self.instances.lock().unwrap();
+                let mut instances = self.instances.lock().expect("shared state lock poisoned");
                 if let Some((_, _, handle)) = instances.get(&r.spec.id) {
                     handle.clone()
                 } else {
                     if r.resources_held {
-                        let mut admission = self.services.admission.lock().unwrap();
+                        let mut admission = self
+                            .services
+                            .admission
+                            .lock()
+                            .expect("shared state lock poisoned");
                         // Catalog has already been validated for scalar/card conflicts.
                         admission.ledger.restore(&r.runtime_id, r.spec.resources)?;
                         admission
@@ -208,7 +219,10 @@ impl NodeManager {
         if let Some(checkpoint) = &self.services.checkpoint {
             checkpoint.store.authorize_remote_gc(&retained).await?;
         }
-        self.local_holds.lock().unwrap().clear();
+        self.local_holds
+            .lock()
+            .expect("shared state lock poisoned")
+            .clear();
         *ready = true;
         Ok(())
     }
@@ -262,11 +276,11 @@ impl NodeManager {
             expected_revision: record.revision,
         };
         let handle = {
-            let mut instances = self.instances.lock().unwrap();
+            let mut instances = self.instances.lock().expect("shared state lock poisoned");
             if self
                 .retired_generations
                 .lock()
-                .unwrap()
+                .expect("shared state lock poisoned")
                 .get(&record.spec.id)
                 .is_some_and(|g| *g >= record.assignment.generation)
             {

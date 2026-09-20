@@ -1,7 +1,14 @@
 [package]
 name = "rrt-daemon"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ADX runtime request transport and in-instance runtime daemon"
+
+[lints]
+workspace = true
 
 [lib]
 name = "rrt_daemon"

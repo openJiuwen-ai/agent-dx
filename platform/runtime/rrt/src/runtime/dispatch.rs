@@ -328,6 +328,8 @@ fn run_command(
                 pid,
                 timeout_label
             );
+            // SAFETY: pid belongs to the child that was just observed running; kill receives only
+            // the scalar process-group ID and retains no Rust data.
             let kill_result = unsafe { libc::kill(-pid, libc::SIGKILL) };
             if kill_result != 0 {
                 let error = std::io::Error::last_os_error();
@@ -747,6 +749,8 @@ mod tests {
             .trim()
             .parse::<libc::pid_t>()
             .expect("shell pid should be numeric");
+        // SAFETY: signal zero only probes the scalar PID parsed from the test child; kill retains
+        // no Rust data.
         let alive = unsafe { libc::kill(pid, 0) };
         assert_eq!(
             alive, -1,

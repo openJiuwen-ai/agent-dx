@@ -155,9 +155,12 @@ impl pb::instance_directory_service_server::InstanceDirectoryService for RoutePu
             return Err(Status::unavailable("instance publication not ready"));
         }
         let mut updates = self.instance_changes.subscribe();
+        let revision = view
+            .revision
+            .ok_or_else(|| Status::unavailable("instance publication has no revision"))?;
         let full = pb::InstanceDirectoryFrame {
             epoch: self.session.epoch(),
-            revision: view.revision.unwrap(),
+            revision,
             base_revision: 0,
             reset: true,
             upserts: view.instances.values().cloned().collect(),
@@ -210,9 +213,12 @@ impl pb::route_service_server::RouteService for RoutePublisher {
         }
         // Subscribe under the same lock as the full snapshot so there is no list/watch gap.
         let mut updates = self.changes.subscribe();
+        let revision = view
+            .revision
+            .ok_or_else(|| Status::unavailable("route publication has no revision"))?;
         let full = pb::RouteFrame {
             epoch: self.session.epoch(),
-            revision: view.revision.unwrap(),
+            revision,
             reset: true,
             upserts: view.routes.values().cloned().collect(),
             ..Default::default()

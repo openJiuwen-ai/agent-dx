@@ -655,7 +655,13 @@ impl Session {
             h.advance()?;
             if self
                 .store
-                .cas(values[0].as_deref().unwrap(), &h, Some((&field, encoded)))
+                .cas(
+                    values[0]
+                        .as_deref()
+                        .expect("validated control header is present"),
+                    &h,
+                    Some((&field, encoded)),
+                )
                 .await?
             {
                 return Ok(record);
@@ -722,7 +728,9 @@ impl Session {
             if self
                 .store
                 .cas(
-                    values[0].as_deref().unwrap(),
+                    values[0]
+                        .as_deref()
+                        .expect("validated control header is present"),
                     &h,
                     Some((&field, encode(&record)?)),
                 )
@@ -785,7 +793,9 @@ impl Session {
             if self
                 .store
                 .cas(
-                    values[0].as_deref().unwrap(),
+                    values[0]
+                        .as_deref()
+                        .expect("validated control header is present"),
                     &h,
                     Some((&field, encode(&old)?)),
                 )
@@ -836,7 +846,9 @@ impl Session {
             if self
                 .store
                 .cas(
-                    values[0].as_deref().unwrap(),
+                    values[0]
+                        .as_deref()
+                        .expect("validated control header is present"),
                     &h,
                     Some((&field, encode(&old)?)),
                 )

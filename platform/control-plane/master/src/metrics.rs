@@ -32,7 +32,7 @@ pub async fn serve(listener: TcpListener, master: MasterRpc) -> std::io::Result<
                                 .status(status)
                                 .header("Content-Type", "text/plain; version=0.0.4")
                                 .body(Full::new(Bytes::from(body)))
-                                .unwrap(),
+                                .expect("static metrics response is valid"),
                         )
                     }
                 },

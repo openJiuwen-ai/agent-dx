@@ -263,9 +263,10 @@ impl ObjectCheckpointStore {
         }
         for f in &m.files {
             let path = target.join(&f.path);
-            tokio::fs::create_dir_all(path.parent().unwrap())
-                .await
-                .map_err(io_error)?;
+            let parent = path
+                .parent()
+                .ok_or_else(|| invalid("checkpoint file has no parent"))?;
+            tokio::fs::create_dir_all(parent).await.map_err(io_error)?;
             let mut output = tokio::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -313,7 +314,7 @@ fn inventory(root: &Path) -> Result<FileInventory> {
             if path != root {
                 dirs.push(
                     path.strip_prefix(root)
-                        .unwrap()
+                        .map_err(|_| invalid("checkpoint entry escaped its root"))?
                         .to_str()
                         .ok_or_else(|| invalid("non UTF-8 path"))?
                         .to_owned(),
@@ -325,7 +326,7 @@ fn inventory(root: &Path) -> Result<FileInventory> {
         } else if meta.is_file() {
             let path = path
                 .strip_prefix(root)
-                .unwrap()
+                .map_err(|_| invalid("checkpoint entry escaped its root"))?
                 .to_str()
                 .ok_or_else(|| invalid("non UTF-8 path"))?
                 .to_owned();
@@ -429,7 +430,11 @@ impl CheckpointStore for ObjectCheckpointStore {
         let (files, directories) = tokio::task::spawn_blocking(move || inventory(&scan_root))
             .await
             .map_err(io_error)??;
-        let id = root.file_name().unwrap().to_str().unwrap().to_owned();
+        let id = root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| invalid("checkpoint artifact has no UTF-8 identifier"))?
+            .to_owned();
         self.mark_upload(&id).await?;
         let result = async {
             let mut manifest = Manifest {

@@ -65,7 +65,7 @@ pub async fn shutdown() {
     #[cfg(unix)]
     {
         let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("signal handler");
+            .expect("install SIGTERM handler");
         tokio::select! {_=tokio::signal::ctrl_c()=>{},_=term.recv()=>{}}
     }
     #[cfg(not(unix))]

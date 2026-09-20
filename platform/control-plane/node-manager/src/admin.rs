@@ -18,7 +18,12 @@ impl NodeManager {
                 "authoritative node reconciliation required before cleanup".into(),
             ));
         }
-        if !self.local_holds.lock().unwrap().is_empty() {
+        if !self
+            .local_holds
+            .lock()
+            .expect("shared state lock poisoned")
+            .is_empty()
+        {
             return Err(Error::Unavailable(
                 "unconfirmed local claims require reconciliation before drain".into(),
             ));
@@ -29,7 +34,7 @@ impl NodeManager {
         let handles: Vec<_> = self
             .instances
             .lock()
-            .unwrap()
+            .expect("shared state lock poisoned")
             .values()
             .map(|(_, _, h)| h.clone())
             .collect();

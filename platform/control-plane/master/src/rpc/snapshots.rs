@@ -318,7 +318,9 @@ impl pb::snapshot_service_server::SnapshotService for MasterRpc {
                     .collect();
                 let next_page_token = if page.len() > size {
                     page.pop();
-                    page.last().unwrap().id.clone()
+                    page.last()
+                        .map(|snapshot| snapshot.id.clone())
+                        .unwrap_or_default()
                 } else {
                     String::new()
                 };

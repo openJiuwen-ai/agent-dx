@@ -440,11 +440,11 @@ impl Controller {
             self.record.runtime_id.clone()
         };
         if !self.held || restart {
-            self.services.admission.lock().unwrap().reserve(
-                &runtime_id,
-                &self.record.spec,
-                &self.record.assignment,
-            )?;
+            self.services
+                .admission
+                .lock()
+                .expect("shared state lock poisoned")
+                .reserve(&runtime_id, &self.record.spec, &self.record.assignment)?;
         }
         if restart {
             self.record.runtime_id = runtime_id;
@@ -477,7 +477,9 @@ impl Controller {
                         &self.record.runtime_id,
                         self.record.assignment.generation,
                         &self.record.assignment.devices,
-                        self.recovery_files.as_ref().unwrap(),
+                        self.recovery_files
+                            .as_ref()
+                            .expect("recovery file is stored immediately before restore"),
                         cp.origin.as_ref(),
                     )
                     .await?
@@ -541,7 +543,7 @@ impl Controller {
             self.services
                 .admission
                 .lock()
-                .unwrap()
+                .expect("shared state lock poisoned")
                 .release(&self.record.runtime_id)?;
             self.held = false;
             self.record.resources_held = false;

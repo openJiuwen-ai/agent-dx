@@ -1,8 +1,15 @@
 [package]
 name = "adx-protocol"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Generated and handwritten ADX internal protocol contracts"
 build = "build.rs"
+
+[lints]
+workspace = true
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

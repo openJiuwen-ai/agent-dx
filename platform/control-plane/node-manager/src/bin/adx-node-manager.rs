@@ -136,7 +136,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(address) = &c.master_address {
             break address.clone();
         }
-        match discovery.as_ref().unwrap().lookup().await {
+        match discovery
+            .as_ref()
+            .expect("missing Master address implies configured discovery")
+            .lookup()
+            .await
+        {
             Ok(found) => break found.address,
             Err(_) => {
                 tokio::select! { _ = tokio::time::sleep(Duration::from_secs(c.report_interval_seconds)) => (), _ = shutdown() => return Ok(()) }

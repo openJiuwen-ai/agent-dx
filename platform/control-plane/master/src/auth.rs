@@ -177,7 +177,7 @@ impl pb::credential_service_server::CredentialService for AuthRpc {
             .collect();
         let next_page_token = if keys.len() > size {
             keys.pop();
-            keys.last().unwrap().id.clone()
+            keys.last().map(|key| key.id.clone()).unwrap_or_default()
         } else {
             String::new()
         };

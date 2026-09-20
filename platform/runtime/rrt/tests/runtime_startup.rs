@@ -33,6 +33,8 @@ fn runtime_waits_for_seed_then_refreshes_environment() {
     let temp = tempfile::tempdir().expect("create temp directory");
     let seed_file = temp.path().join("runtime.seed");
     let seed_path = CString::new(seed_file.to_string_lossy().as_bytes()).expect("seed path");
+    // SAFETY: seed_path is NUL terminated and remains valid for the call; mkfifo does not retain
+    // the pointer.
     let result = unsafe { libc::mkfifo(seed_path.as_ptr(), 0o600) };
     assert_eq!(
         result,
