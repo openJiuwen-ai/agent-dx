@@ -110,7 +110,19 @@ class KubernetesLifecycleTests(unittest.TestCase):
         script=(ROOT.parents[1]/'.buildkite/run-e2e.sh').read_text()
         self.assertIn('build/e2e/kubernetes/run.py',script)
         self.assertIn('--kubeconfig',script)
+        self.assertIn('ADX_E2E_PROFILE:-k8s-basic',script)
         self.assertNotIn('docker ',script)
+
+    def test_full_profile_requires_two_distinct_physical_workers(self):
+        same = [
+            {'pod': 'node1', 'host': 'worker-a', 'ip': '10.0.0.1'},
+            {'pod': 'node2', 'host': 'worker-a', 'ip': '10.0.0.2'},
+        ]
+        with self.assertRaisesRegex(RuntimeError, 'distinct Kubernetes workers'):
+            self.module.validate_physical_placement(same, True)
+        self.module.validate_physical_placement(same, False)
+        split = [dict(same[0]), {**same[1], 'host': 'worker-b'}]
+        self.module.validate_physical_placement(split, True)
 
     def test_generated_credentials_cover_every_projected_secret_file(self):
         import base64,tempfile

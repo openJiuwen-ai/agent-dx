@@ -5,9 +5,12 @@ class ExampleAcceptance(unittest.TestCase):
     def test_complete_example_requires_unmodified_config_and_cleanup(self):
         from contract import verify, CASES
         record={'status':'passed','cases':[{'name':n,'passed':True} for n in CASES],
+                'profile':'standalone','deployment':'process','required_checks':list(CASES),
+                'checks':list(CASES),'missing_checks':[],
                 'example_sha256':'abc','installed_sha256':'abc','backend_count':0,
                 'external_dependencies_alive_after_stop':True,'cleanup_errors':[]}
         verify(record)
         for key,value in [('installed_sha256','changed'),('backend_count',1),
-                          ('external_dependencies_alive_after_stop',False),('cleanup_errors',['failed']),('cases',[])]:
+                          ('external_dependencies_alive_after_stop',False),('cleanup_errors',['failed']),
+                          ('profile','l0'),('checks',[]),('cases',[])]:
             with self.assertRaises(ValueError):verify({**record,key:value})

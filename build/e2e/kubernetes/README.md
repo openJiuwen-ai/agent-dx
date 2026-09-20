@@ -20,6 +20,14 @@ python3 build/e2e/kubernetes/run.py \
   --output out/e2e/kubernetes-run-001
 ```
 
+Profiles are explicit:
+
+- `--profile l0` runs the minimum public SDK and authentication closure.
+- `--profile k8s-basic` is the default and runs the eight Kubernetes groups.
+- `--profile full` runs the same functional groups and additionally requires
+  the two platform Pods to be placed on distinct physical workers. Actual Pod
+  to worker placement is checked after scheduling and retained as evidence.
+
 Every invocation requires a new evidence directory and creates a unique test
 namespace. Target images must be digest pinned. Registry TLS verification is
 on; private registry credentials are mounted read-only and supplied to both
@@ -48,6 +56,7 @@ sandboxd. EROFS deployments use a separate real mount preflight. Select eligible
 The scheduler still applies the Linux/architecture and resource requirements.
 A one-node pool runs two isolated Pods on one host; it does not validate
 cross-host networking. Actual host placement is retained in the acceptance logs.
+Such a run can pass `k8s-basic`; it cannot pass `full`.
 
 The E2E job log streams deployment commands and their output as they run, with
 10-second progress notices for long waits. It shows resource creation, Pod/image

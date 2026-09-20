@@ -67,11 +67,15 @@ def main():
             if time.monotonic()>end:raise TimeoutError('both nodes did not become ready')
             time.sleep(1)
     elif action=='postcheck':
-        c=catalog();r=json.loads((E/'sdk/sdk-result.json').read_text());assert r['status']=='passed'
+        result_name=node or 'sdk'
+        c=catalog();r=json.loads((E/result_name/'sdk-result.json').read_text());assert r['status']=='passed'
         records=[json.loads(c['instance:'+i]) for i in r['instances']]
-        assert {r['assignment']['node_id'] for r in records}=={'node1','node2'}
+        assignments={record['assignment']['node_id'] for record in records}
+        assert assignments and assignments <= {'node1','node2'}
+        if result_name=='sdk':assert assignments=={'node1','node2'}
         assert all(r['result']['state']=='Deleted' and not r['result']['resources_held'] for r in records)
-        (E/'catalog-after-delete.json').write_text(json.dumps(records,indent=2))
+        output='catalog-after-delete.json' if result_name=='sdk' else f'catalog-after-delete-{result_name}.json'
+        (E/output).write_text(json.dumps(records,indent=2))
     elif action=='sessions':
         (E/'previous-sessions.json').write_text(json.dumps({n['node']['id']:n['session']['id'] for n in nodes()}))
     elif action=='freeze':

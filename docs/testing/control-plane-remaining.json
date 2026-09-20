@@ -1,5 +1,37 @@
 [
   {
+    "id": "e2e-l0-ci-evidence",
+    "title": "L0 独立 Buildkite 门禁证据",
+    "stage": "7",
+    "status": "pending",
+    "detail": "驱动已支持独立 l0 profile、required_checks 和逐项 JUnit；尚未在正式 Buildkite revision 上生成一次独立 L0 结果。",
+    "gate": "提交当前驱动后运行 L0，确认公共 SDK、认证、清理及制品身份全部通过并上传证据。"
+  },
+  {
+    "id": "e2e-multivm-control-plane",
+    "title": "完整控制面三 VM 验收",
+    "stage": "7",
+    "status": "pending",
+    "detail": "已固化三台机器 inventory/result 契约，要求两个 worker 实际放置和最终物理清理；当前历史三 VM 脚本仅覆盖数据面。",
+    "gate": "补齐制品分发、拓扑配置和场景执行器，在一控制两 worker 上通过 MV-01..09 并由 contract verifier 验证。"
+  },
+  {
+    "id": "e2e-full-cross-worker",
+    "title": "Full K8s 跨物理 worker 验收",
+    "stage": "7",
+    "status": "pending",
+    "detail": "full profile 已在部署后强制检查两个平台 Pod 位于不同 Kubernetes worker；历史 Buildkite #30 为同宿主 k8s-basic。",
+    "gate": "在至少两个可用物理 worker 上运行 full profile，八组、可观测、逐项 JUnit、物理 placement 和 namespace 清理全部通过。"
+  },
+  {
+    "id": "e2e-resilience-expansion",
+    "title": "Standalone 与正式部署韧性扩展",
+    "stage": "7",
+    "status": "pending",
+    "detail": "Redis/SQLite 降级、空闲删除、实例自动重启、Master/API/Edge 独立重启及 Redis AOF/PV 恢复尚未形成统一 E2E 门禁。",
+    "gate": "按 ST-06..10 和 FD-06..08 增加真实故障用例，保存客户端、权威状态和物理后端三类证据。"
+  },
+  {
     "id": "fc-clone-network",
     "title": "FC 双克隆网络问题",
     "stage": "5",

@@ -16,7 +16,18 @@ import time
 import uuid
 import xml.etree.ElementTree as ET
 
-REQUIRED = {'sdk','auth','capacity','placement','local-first','node-failure','restart','stop'}
+STANDARD = ('sdk','auth','capacity','placement','local-first','node-failure','restart','stop')
+PROFILES = {
+    'l0': ('l0','auth'),
+    'standalone': STANDARD,
+    'k8s-basic': STANDARD,
+    'full': STANDARD,
+}
+def required_for_profile(profile):
+    try:
+        return PROFILES[profile]
+    except KeyError as error:
+        raise ValueError('unknown E2E profile: '+profile) from error
 
 def sha(path):
     h=hashlib.sha256()
@@ -36,9 +47,10 @@ def verify_bundle(directory):
     if sha(directory/'rrt.tar') != m.get('rrt_archive_sha256'):raise ValueError('RRT archive integrity check failed')
     return m
 
-def finish_report(error, cleanup_errors, checks):
-    missing=sorted(REQUIRED-set(checks))
-    return {'status':'passed' if not error and not cleanup_errors and not missing else 'failed','error':error,'cleanup_errors':cleanup_errors,'checks':checks,'missing_checks':missing}
+def finish_report(error, cleanup_errors, checks, required=None):
+    required=tuple(required or STANDARD)
+    missing=[name for name in required if name not in checks]
+    return {'status':'passed' if not error and not cleanup_errors and not missing else 'failed','error':error,'cleanup_errors':cleanup_errors,'checks':checks,'required_checks':list(required),'missing_checks':missing}
 
 class Run:
     def __init__(self,output):
@@ -178,54 +190,87 @@ class Run:
         for node in self.nodes:
             self.execute(node,'sh','-c','/opt/adx/package/bin/adxctl run --config /tmp/adx-e2e/deployment.json > /evidence/supervisor-'+node+'.log 2>&1 &')
         self.helper('node1','ready',timeout=120)
-    def scenarios(self,checks):
-        with self.case('sdk', checks):
-            self.event('Create/query instances; verify command stdout/stderr/exit code, binary files and deletion')
-            for node in self.nodes:self.execute(node,'python3','/opt/adx/e2e/telemetry.py','outage-start',node)
-            self.execute('node1','/opt/adx/client/bin/python','-u','/opt/adx/e2e/scenarios.py','sdk',timeout=600)
-            for node in self.nodes:self.execute(node,'python3','/opt/adx/e2e/telemetry.py','outage-end',node)
-            self.helper('node1','postcheck')
-            for node in self.nodes:self.helper(node,'empty',node)
+    def scenarios(self,checks,required=None):
+        required=tuple(required or STANDARD);selected=set(required)
+        if 'l0' in selected:
+            with self.case('l0', checks):
+                self.event('Run the minimum public SDK create/query/command/file/delete flow')
+                self.execute('node1','/opt/adx/client/bin/python','-u','/opt/adx/e2e/scenarios.py','l0',timeout=600)
+                self.helper('node1','postcheck','l0')
+                for node in self.nodes:self.helper(node,'empty',node)
+        if 'sdk' in selected:
+            with self.case('sdk', checks):
+                self.event('Create/query instances; verify command stdout/stderr/exit code, binary files and deletion')
+                for node in self.nodes:self.execute(node,'python3','/opt/adx/e2e/telemetry.py','outage-start',node)
+                self.execute('node1','/opt/adx/client/bin/python','-u','/opt/adx/e2e/scenarios.py','sdk',timeout=600)
+                for node in self.nodes:self.execute(node,'python3','/opt/adx/e2e/telemetry.py','outage-end',node)
+                self.helper('node1','postcheck')
+                for node in self.nodes:self.helper(node,'empty',node)
         for scenario in ('auth','capacity','placement'):
-            with self.case(scenario, checks):
-                self.execute('node1','/opt/adx/client/bin/python','-u','/opt/adx/e2e/scenarios.py',scenario,timeout=400)
+            if scenario in selected:
+                with self.case(scenario, checks):
+                    self.execute('node1','/opt/adx/client/bin/python','-u','/opt/adx/e2e/scenarios.py',scenario,timeout=400)
+                    for node in self.nodes:self.helper(node,'empty',node)
+        if 'local-first' in selected:
+            with self.case('local-first', checks):
+                self.helper('node1','create-mode','local_first')
+                try:
+                    self.execute('node1','/opt/adx/client/bin/python','-u','/opt/adx/e2e/scenarios.py','local-first',timeout=600)
+                    for node in self.nodes:self.helper(node,'empty',node)
+                finally:
+                    self.helper('node1','create-mode','central')
+        if 'node-failure' in selected:
+            with self.case('node-failure', checks):
+                self.execute('node1','/opt/adx/client/bin/python','-u','/opt/adx/e2e/scenarios.py','create',timeout=300)
+                try:
+                    self.helper('node2','freeze','node2')
+                    self.helper('node1','failure-observed',timeout=75)
+                finally:
+                    self.helper('node2','thaw','node2')
+                self.helper('node1','ready',timeout=150)
+                self.helper('node2','empty','node2')
+                self.execute('node1','/opt/adx/client/bin/python','-u','/opt/adx/e2e/scenarios.py','failure-cleanup',timeout=90)
                 for node in self.nodes:self.helper(node,'empty',node)
-        with self.case('local-first', checks):
-            self.helper('node1','create-mode','local_first')
-            try:
-                self.execute('node1','/opt/adx/client/bin/python','-u','/opt/adx/e2e/scenarios.py','local-first',timeout=600)
-                for node in self.nodes:self.helper(node,'empty',node)
-            finally:
-                self.helper('node1','create-mode','central')
-        with self.case('node-failure', checks):
-            self.execute('node1','/opt/adx/client/bin/python','-u','/opt/adx/e2e/scenarios.py','create',timeout=300)
-            try:
-                self.helper('node2','freeze','node2')
-                self.helper('node1','failure-observed',timeout=75)
-            finally:
-                self.helper('node2','thaw','node2')
-            self.helper('node1','ready',timeout=150)
-            self.helper('node2','empty','node2')
-            self.execute('node1','/opt/adx/client/bin/python','-u','/opt/adx/e2e/scenarios.py','failure-cleanup',timeout=90)
-            for node in self.nodes:self.helper(node,'empty',node)
-        with self.case('restart', checks):
-            self.event('Create live instances and record backend IDs before restarting Node Managers')
-            self.execute('node1','/opt/adx/client/bin/python','-u','/opt/adx/e2e/scenarios.py','create',timeout=300)
-            self.helper('node1','sessions')
-            for node in self.nodes:self.helper(node,'restart',node)
-            self.helper('node1','ready','restart',timeout=150)
-            for node in self.nodes:self.helper(node,'unchanged',node)
-            self.execute('node1','/opt/adx/client/bin/python','-u','/opt/adx/e2e/scenarios.py','recovered',timeout=90)
-        with self.case('stop', checks):
-            self.event('Stop node2 then node1; verify physical backend instances are empty')
-            for node in reversed(self.nodes):
-                self.helper(node,'stop',node,timeout=180)
-                self.helper(node,'empty',node)
+        if 'restart' in selected:
+            with self.case('restart', checks):
+                self.event('Create live instances and record backend IDs before restarting Node Managers')
+                self.execute('node1','/opt/adx/client/bin/python','-u','/opt/adx/e2e/scenarios.py','create',timeout=300)
+                self.helper('node1','sessions')
+                for node in self.nodes:self.helper(node,'restart',node)
+                self.helper('node1','ready','restart',timeout=150)
+                for node in self.nodes:self.helper(node,'unchanged',node)
+                self.execute('node1','/opt/adx/client/bin/python','-u','/opt/adx/e2e/scenarios.py','recovered',timeout=90)
+        if 'stop' in selected:
+            with self.case('stop', checks):
+                self.event('Stop node2 then node1; verify physical backend instances are empty')
+                for node in reversed(self.nodes):
+                    self.helper(node,'stop',node,timeout=180)
+                    self.helper(node,'empty',node)
+
+def write_junit(path, report, suite_name='platform-e2e'):
+    suite=ET.Element('testsuite',name=suite_name)
+    records={case['name']:case for case in report['cases']}
+    for name in report.get('required_checks',STANDARD):
+        record=records.get(name)
+        case=ET.SubElement(suite,'testcase',name=name,time=str(record['seconds'] if record else 0))
+        if not record:
+            ET.SubElement(case,'skipped').text='Not reached; see acceptance error'
+        elif record['status']!='passed':
+            ET.SubElement(case,'failure').text=record.get('error','case failed')
+    cleanup=ET.SubElement(suite,'testcase',name='cleanup')
+    if report['cleanup_errors']:
+        ET.SubElement(cleanup,'failure').text='\n'.join(report['cleanup_errors'])
+    if report['error'] and not any(case['status']=='failed' for case in report['cases']):
+        ET.SubElement(ET.SubElement(suite,'testcase',name='deployment'),'failure').text=report['error']
+    suite.set('tests',str(len(suite)))
+    suite.set('failures',str(len(suite.findall('testcase/failure'))))
+    suite.set('skipped',str(len(suite.findall('testcase/skipped'))))
+    ET.ElementTree(suite).write(path,encoding='utf-8',xml_declaration=True)
 
 def main():
-    p=argparse.ArgumentParser();p.add_argument('--bundle',type=Path,required=True);p.add_argument('--output',type=Path,required=True);a=p.parse_args()
+    p=argparse.ArgumentParser();p.add_argument('--bundle',type=Path,required=True);p.add_argument('--output',type=Path,required=True);p.add_argument('--profile',choices=('l0','standalone'),default='standalone');a=p.parse_args()
     out=a.output.resolve();out.mkdir(parents=True,exist_ok=False)
-    run=Run(out);error=None;checks=[];m=None
+    run=Run(out);error=None;checks=[];m=None;required=required_for_profile(a.profile)
     def cancel(signum,frame):raise InterruptedError(f'canceled by signal {signum}')
     for s in (signal.SIGTERM,signal.SIGINT):signal.signal(s,cancel)
     with tempfile.TemporaryDirectory(prefix='adx-e2e-secrets-') as private:
@@ -234,18 +279,15 @@ def main():
             validate_identity(m['package'],m['architecture'],os.getenv('BUILDKITE_COMMIT'),bool(os.getenv('BUILDKITE')))
             (out/'bundle.json').write_text(json.dumps(m,indent=2))
             run.deploy(m,a.bundle.resolve(),Path(private))
-            run.scenarios(checks)
+            run.scenarios(checks,required)
         except Exception as e:error=f'{type(e).__name__}: {e}'
         finally:
             # A second TERM must not interrupt cleanup of resources already owned.
             signal.signal(signal.SIGTERM,signal.SIG_IGN)
             signal.signal(signal.SIGINT,signal.SIG_IGN)
             errors=run.cleanup()
-    report=finish_report(error,errors,checks);report['run_id']=run.id
+    report=finish_report(error,errors,checks,required);report.update(run_id=run.id,deployment='local-docker',profile=a.profile,cases=run.case_results)
     (out/'result.json').write_text(json.dumps(report,indent=2)+'\n')
-    suite=ET.Element('testsuite',name='platform-e2e',tests='1',failures='0' if report['status']=='passed' else '1')
-    case=ET.SubElement(suite,'testcase',name='two-node-public-sdk')
-    if report['status']!='passed':ET.SubElement(case,'failure').text=json.dumps(report)
-    ET.ElementTree(suite).write(out/'junit.xml',encoding='utf-8',xml_declaration=True)
+    write_junit(out/'junit.xml',report)
     print(json.dumps(report));return 0 if report['status']=='passed' else 1
 if __name__=='__main__':raise SystemExit(main())

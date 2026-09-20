@@ -32,6 +32,12 @@ python3 build/e2e/prepare.py \
 python3 build/e2e/run.py --bundle out/e2e/bundle --output out/e2e/run-001
 ```
 
+Use `--profile l0` for the minimum public API/SDK and authentication closure.
+The default `--profile standalone` runs all eight single-host logical two-node
+groups. Both profiles write `required_checks`, per-case results and case-level
+JUnit; a case that was not reached is visible as skipped and prevents the JSON
+result from passing.
+
 All output directories must be new. Local runs allow dirty packages and image
 tags, recording their actual identities. Buildkite requires the current clean
 commit and digest-pinned base images. The local and Kubernetes drivers share business scenarios and gate semantics;
@@ -100,6 +106,10 @@ python build/e2e/sdk_smoke.py --endpoint 127.0.0.1:8443 \
 ```
 
 Running this script alone does not establish the full acceptance result.
+
+The formal three-machine inventory and completed-result contract is documented
+under [multivm](multivm/README.md). The contract verifier does not provision VMs
+or turn historical data-plane scripts into a control-plane acceptance result.
 
 The capacity group also scrapes the live Master and both Node Manager metrics endpoints. It checks two running instances and 4000 allocated CPU millis, one queued request while full, and zero instances/reservations after deletion. Per-node CPU, memory and disk allocation gauges must agree across Master and Node Manager. Raw scrapes are retained as `metrics-allocated.json`, `metrics-queued.json` and `metrics-released.json`.
 

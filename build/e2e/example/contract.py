@@ -3,7 +3,11 @@ CASES=('validate and render installed example','all five example roles ready wit
        'administrator creates tenant key through HTTPS Edge','SDK command and binary file round trip',
        'explicit instance deletion','supervisor stop deletes remaining instance')
 def verify(result):
-    if (result.get('status')!='passed' or not result.get('example_sha256')
+    if (result.get('status')!='passed' or result.get('profile')!='standalone'
+            or result.get('deployment')!='process'
+            or result.get('required_checks')!=list(CASES)
+            or result.get('checks')!=list(CASES) or result.get('missing_checks')!=[]
+            or not result.get('example_sha256')
             or result.get('example_sha256')!=result.get('installed_sha256')
             or result.get('backend_count')!=0
             or result.get('external_dependencies_alive_after_stop') is not True
