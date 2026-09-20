@@ -14,7 +14,7 @@ operations and shutdown cleanup, and preserves configuration hashes.
 
 For local reproduction, `prepare.py` turns a verified ADX release package and pinned external backend
 into portable runtime images. `run.py` loads and verifies that bundle, starts
-Redis, Master/ShardScheduler, API Server, Edge, two Node Managers and Node Proxies, and
+Redis, Master/ShardScheduler, API Server, Edge and two Node Managers with embedded Node Proxies, and
 independently starts real sandboxd on each node. Business tests use the public
 SDK installed into the image from the release wheel; no product source checkout
 is mounted into the test nodes.

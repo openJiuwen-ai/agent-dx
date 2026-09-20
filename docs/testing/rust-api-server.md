@@ -13,7 +13,7 @@
 
 ## 部署迁移
 
-统一更新发布包和部署配置：HTTP 服务角色改为 `api-server`，启动 `adx-api-server`；使用 [API Server 配置](../../build/config/examples/api-server.json) 和 [统一部署示例](../../build/config/examples/deployment.json)。内部 mTLS 受信身份映射同步改为 `api-server`，加载部署环境提供的对应证书，重启组件生效。
+统一更新发布包和部署配置：HTTP 服务角色改为 `api-server`，启动 `adx-api-server`；使用 [API Server 配置](../../build/config/examples/api-server.json) 和 [统一部署示例](../../build/config/examples/deployment.yaml)。内部 mTLS 受信身份映射同步改为 `api-server`，加载部署环境提供的对应证书，重启组件生效。
 
 Master 使用 `scheduler_shards` 配置逻辑分片数量，节点归属仍由 Master 自动分配。指标查询使用 `shard_id` 标签。旧持久化字段的读取兼容用于数据迁移，不代表旧组件和新组件可以混用。公开 Sandbox URL 与 Python SDK 调用方式保持；客户端不需要感知内部 Shard。
 

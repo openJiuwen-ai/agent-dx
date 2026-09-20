@@ -38,12 +38,16 @@ impl Session {
     /// after their producer has returned; a plain NotFound read is not a barrier.
     pub async fn claim_barrier(&self) -> Result<()> {
         for _ in 0..ATTEMPTS {
-            let values = self.store.fields(&[HEADER.into()]).await?;
-            let mut header = self.header(&values[0])?;
+            let [header_value] = self.store.fields([HEADER.into()]).await?;
+            let mut header = self.header(&header_value)?;
             header.advance()?;
             if self
                 .store
-                .cas(values[0].as_deref().ok_or(Error::Conflict)?, &header, None)
+                .cas(
+                    header_value.as_deref().ok_or(Error::Conflict)?,
+                    &header,
+                    None,
+                )
                 .await?
             {
                 return Ok(());
@@ -69,18 +73,18 @@ impl Session {
         validate_device_assignment(&spec.scheduling.devices, &candidate.devices)?;
         let field = format!("instance:{}", spec.id);
         for _ in 0..ATTEMPTS {
-            let values = self
+            let [header_value, instance_value, node_value] = self
                 .store
-                .fields(&[
+                .fields([
                     HEADER.into(),
                     field.clone(),
                     format!("node:{}", candidate.node_id),
                 ])
                 .await?;
-            let mut h = self.header(&values[0])?;
-            let node: StoredNode = decode(values[2].as_deref().ok_or(Error::NotFound)?)?;
+            let mut header = self.header(&header_value)?;
+            let node: StoredNode = decode(node_value.as_deref().ok_or(Error::NotFound)?)?;
             if node.node.id != candidate.node_id
-                || node.shard_id >= h.shards
+                || node.shard_id >= header.shards
                 || node
                     .session
                     .as_ref()
@@ -88,24 +92,24 @@ impl Session {
             {
                 return Err(Error::Conflict);
             }
-            if let Some(raw) = &values[1] {
-                let old: StoredInstance = decode(raw)?;
-                old.validate()?;
-                if old.spec != spec {
+            if let Some(instance_value) = &instance_value {
+                let existing: StoredInstance = decode(instance_value)?;
+                existing.validate()?;
+                if existing.spec != spec {
                     return Err(Error::Conflict);
                 }
-                if old.assignment.node_id != candidate.node_id
-                    || old.result.is_some()
-                    || old.invalidated
-                    || old.recovery.is_some()
+                if existing.assignment.node_id != candidate.node_id
+                    || existing.result.is_some()
+                    || existing.invalidated
+                    || existing.recovery.is_some()
                 {
-                    return Ok(ClaimOutcome::Existing(old));
+                    return Ok(ClaimOutcome::Existing(existing));
                 }
-                if old.assignment.devices != candidate.devices {
+                if existing.assignment.devices != candidate.devices {
                     return Err(Error::Conflict);
                 }
                 claim_admission(&node)?;
-                return Ok(ClaimOutcome::Owned(old));
+                return Ok(ClaimOutcome::Owned(existing));
             }
             claim_admission(&node)?;
             // Snapshot references are kept in a separate hash and do not bump
@@ -125,7 +129,7 @@ impl Session {
             } else {
                 None
             };
-            let generation = h.generation.checked_add(1).ok_or(Error::Conflict)?;
+            let generation = header.generation.checked_add(1).ok_or(Error::Conflict)?;
             let record = StoredInstance {
                 recovery: None,
                 invalidated: false,
@@ -140,8 +144,8 @@ impl Session {
                 },
             };
             record.validate()?;
-            h.generation = generation;
-            h.advance()?;
+            header.generation = generation;
+            header.advance()?;
             let mut command = redis::cmd("EVAL");
             command.arg(r#"
                 if redis.call('HGET', KEYS[1], 'header') ~= ARGV[1] then return 0 end
@@ -149,8 +153,8 @@ impl Session {
                 redis.call('HSET', KEYS[1], 'header', ARGV[2], ARGV[3], ARGV[4]); return 1
             "#)
                 .arg(2).arg(&self.store.key).arg(self.snapshots_key())
-                .arg(values[0].as_deref().ok_or(Error::Conflict)?)
-                .arg(encode(&h)?).arg(&field).arg(encode(&record)?)
+                .arg(header_value.as_deref().ok_or(Error::Conflict)?)
+                .arg(encode(&header)?).arg(&field).arg(encode(&record)?)
                 .arg(spec.snapshot_id.as_deref().unwrap_or(""))
                 .arg(snapshot.as_deref().unwrap_or(""));
             if self.store.query::<u8>(command).await? == 1 {

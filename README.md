@@ -10,11 +10,12 @@ Monorepo for Agent Distributed Executor, the Instance execution platform, and sh
 | `platform/sdk/sandbox/python` | Public Sandbox SDK |
 | `platform/control-plane/master` | Rust Master, Shard scheduling, Redis and route/snapshot catalogs |
 | `platform/control-plane/node-manager` | Instance lifecycle, sandboxd, checkpoints and outage journal |
-| `platform/control-plane/control-cli` | Rust adxctl and process supervisor |
+| `platform/deployment` | Unified Rust `adxctl` configuration and supervisor for control-plane and data-plane services |
 | `platform/control-plane/api-server` | Rust public HTTP API, authentication, ownership cache and direct Instance RPC |
 | `platform/api/proto` | Instance, snapshot, credentials, routes and node-local protocol definitions |
+| `platform/crates/service-runtime` | Typed service `--config` parsing, safe JSON loading and process shutdown signals |
 
-Agent v2 uses Rust APIs embedded in Gateway and an independent Dispatcher; see [Agent usage](agent/README.md). The legacy Python Agent packages have been removed. The Rust API Server rewrite has passed [Kubernetes acceptance](docs/testing/2026-09-17-rust-api-server-k8s.md); see [migration steps](docs/testing/rust-api-server.md). Rust Master and Node Manager expose authenticated service processes, Redis persistence/discovery, scheduling and node lifecycle recovery; the Rust API Server connects to those services. Edge subscribes to committed routes over gRPC, while Node Proxy requires a complete local binding synchronization before admission. See [implementation status](docs/testing/control-plane-implementation.md) and [route publication](docs/testing/route-publication.md). The Rust process supervisor and unified package are implemented; see [process deployment](docs/testing/process-deployment.md). Local public-SDK acceptance now covers real Firecracker pause/resume, S3 recovery and node lifecycle failures. See the [stage roadmap](docs/testing/control-plane-roadmap.md) for completed gates and remaining work.
+Agent v2 uses Rust APIs embedded in Gateway and an independent Dispatcher; see [Agent usage](agent/README.md). The legacy Python Agent packages have been removed. The Rust API Server rewrite has passed [Kubernetes acceptance](docs/testing/2026-09-17-rust-api-server-k8s.md); see [migration steps](docs/testing/rust-api-server.md). Rust Master and Node Manager expose authenticated service processes, Redis persistence/discovery, scheduling and node lifecycle recovery; the Rust API Server connects to those services. Node Manager embeds Node Proxy by default while retaining an explicit split-process mode. Edge subscribes to committed routes over gRPC, while Node Proxy requires a complete local binding synchronization before admission. See [implementation status](docs/testing/control-plane-implementation.md) and [route publication](docs/testing/route-publication.md). The Rust process supervisor and unified package are implemented; see [process deployment](docs/testing/process-deployment.md). Local public-SDK acceptance now covers real Firecracker pause/resume, S3 recovery and node lifecycle failures. See the [stage roadmap](docs/testing/control-plane-roadmap.md) for completed gates and remaining work.
 
 ![Current component architecture](docs/architecture/current-architecture.svg)
 
@@ -87,6 +88,9 @@ See [migration status](docs/migration/2026-09-14-import.md), [source pins](docs/
 
 ## Instance lifecycle and deployment
 
+`adxctl config init` creates the default single-host `/etc/adx/deployment.yaml`; edit the generated addresses, certificates and runtime paths, then use `adxctl validate` and `adxctl run`. The default profile includes the local managed Redis role, and role-specific profiles are available for split-host deployment.
+
+- [`adxctl` commands and role-by-role deployment](docs/deployment/adxctl.md)
 - [Single-host installation, certificates and CLI](docs/deployment/standalone.md)
 - [EROFS/OCI runtime environment and custom-image bootstrap](docs/deployment/runtime-environment.md)
 - [CLI and unified process deployment](docs/testing/process-deployment.md)

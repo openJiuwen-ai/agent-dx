@@ -1,0 +1,140 @@
+schema_version: 1
+package_dir: /opt/adx
+state_dir: /run/adx/control
+redis_url: redis://127.0.0.1:6379/
+namespace: adx
+restart_limit: 3
+restart_delay_ms: 1000
+stop_timeout_seconds: 90
+services:
+  - id: redis
+    role: redis
+    config:
+      bind: 127.0.0.1
+      port: 6379
+      data_dir: /var/lib/adx/redis
+      appendfsync: everysec
+  - id: master
+    role: master
+    config:
+      listen: 0.0.0.0:19000
+      scheduler_shards: 1
+      placement: pack
+      rpc_timeout_seconds: 30
+      tls:
+        ca: /etc/adx/tls/ca.pem
+        certificate: /etc/adx/tls/master.pem
+        private_key: /etc/adx/tls/master.key
+        server_name: adx.internal
+        peers:
+          api-server: /etc/adx/tls/api-server.der
+          node:node-1: /etc/adx/tls/node-1.der
+          edge: /etc/adx/tls/edge.der
+      bootstrap_credentials:
+        - key_file: /etc/adx/secrets/admin-key
+          tenant_id: admin
+          administrator: true
+          expires_at_unix_seconds: 0
+      advertised_address: https://127.0.0.1:19000
+      heartbeat_timeout_seconds: 30
+      discovery_ttl_seconds: 15
+      metrics_listen: 127.0.0.1:19090
+  - id: node-manager
+    role: node-manager
+    config:
+      node_id: node-1
+      listen: 0.0.0.0:19001
+      advertised_address: 127.0.0.1:19001
+      proxy_address: 127.0.0.1:19002
+      tls:
+        ca: /etc/adx/tls/ca.pem
+        certificate: /etc/adx/tls/node-1.pem
+        private_key: /etc/adx/tls/node-1.key
+        server_name: adx.internal
+        peers:
+          master: /etc/adx/tls/master.der
+          api-server: /etc/adx/tls/api-server.der
+      sandboxd_socket: /run/sandboxd/sandboxd.sock
+      proxy_socket: /run/adx/node/route.sock
+      report_interval_seconds: 5
+      rpc_timeout_seconds: 30
+      rrt_port: 50090
+      rrt_env: {}
+      checkpoint_dir: /var/lib/adx/checkpoints
+      resource_source:
+        kind: auto
+        disk_path: /var/lib/adx
+        valid_for_seconds: 30
+      degradation_journal: /var/lib/adx/degraded/results.sqlite
+      metrics_listen: 127.0.0.1:19091
+    env:
+      ADX_DATA_PLANE_NODE_PROXY_ACTIVITY_UDS_DIR: /run/adx/node
+      ADX_DATA_PLANE_NODE_PROXY_BIND: 0.0.0.0:19002
+      ADX_DATA_PLANE_NODE_PROXY_ADVERTISE_ADDRESS: 127.0.0.1:19002
+      ADX_DATA_PLANE_ALLOWED_TARGET_CIDRS: 10.88.0.0/16
+      ADX_DATA_PLANE_ALLOWED_EDGE_CIDRS: 127.0.0.1/32
+      ADX_DATA_PLANE_EDGE_FRONTEND_NODE_SECURITY_MODE: mtls
+      ADX_DATA_PLANE_NODE_PROXY_TLS_CERT: /etc/adx/tls/node-1.pem
+      ADX_DATA_PLANE_NODE_PROXY_TLS_KEY: /etc/adx/tls/node-1.key
+      ADX_DATA_PLANE_NODE_PROXY_MTLS_CLIENT_CA: /etc/adx/tls/ca.pem
+  - id: api-server
+    role: api-server
+    config:
+      listen: 127.0.0.1:8888
+      ca: /etc/adx/tls/ca.pem
+      certificate: /etc/adx/tls/api-server.pem
+      private_key: /etc/adx/tls/api-server.key
+      server_name: adx.internal
+      rpc_timeout_seconds: 90
+      cache_entries: 10000
+      auth_cache_ttl_seconds: 10
+      agent_address: ''
+      loopback_http: true
+  - id: edge
+    role: edge
+    config:
+      tls:
+        ca: /etc/adx/tls/ca.pem
+        certificate: /etc/adx/tls/edge.pem
+        private_key: /etc/adx/tls/edge.key
+        server_name: adx.internal
+        peers:
+          master: /etc/adx/tls/master.der
+      rpc_timeout_seconds: 5
+      refresh_seconds: 2
+      auth_cache_seconds: 10
+      auth_cache_entries: 4096
+    env:
+      ADX_DATA_PLANE_EDGE_FRONTEND_CONTROL_PLANE_ROUTES: exact:/,exact:/healthz,prefix:/api/instances,prefix:/api/sandbox,prefix:/api/admin/v1/keys
+      ADX_DATA_PLANE_EDGE_FRONTEND_TLS_BIND: 0.0.0.0:8443
+      ADX_DATA_PLANE_EDGE_FRONTEND_TLS_CERT: /etc/adx/tls/edge-public.pem
+      ADX_DATA_PLANE_EDGE_FRONTEND_TLS_KEY: /etc/adx/tls/edge-public.key
+      ADX_DATA_PLANE_EDGE_FRONTEND_ALLOWED_CLIENT_CIDRS: 127.0.0.1/32
+      ADX_DATA_PLANE_EDGE_FRONTEND_CONTROL_PLANE_ADDRESS: 127.0.0.1:8888
+      ADX_DATA_PLANE_EDGE_FRONTEND_NODE_SECURITY_MODE: mtls
+      ADX_DATA_PLANE_EDGE_FRONTEND_NODE_TLS_CA: /etc/adx/tls/ca.pem
+      ADX_DATA_PLANE_EDGE_FRONTEND_NODE_TLS_SERVER_NAME: adx.internal
+      ADX_DATA_PLANE_EDGE_FRONTEND_NODE_TLS_CLIENT_CERT: /etc/adx/tls/edge.pem
+      ADX_DATA_PLANE_EDGE_FRONTEND_NODE_TLS_CLIENT_KEY: /etc/adx/tls/edge.key
+logging:
+  enabled: true
+  max_file_bytes: 104857600
+  rotate_seconds: 86400
+  compress: true
+  max_files: 5
+  max_age_seconds: 604800
+  max_total_bytes: 1073741824
+runtime_environment:
+  rootfs:
+    runtime: runsc
+    type: local
+    path: /opt/adx/runtime/adx-runtime-rootfs.img
+    readonly: false
+  bootstrap:
+    type: erofs
+    root: /opt/adx/runtime/adx-runtime-rootfs.img
+    target: /__adx
+    entrypoint:
+      - /__adx/usr/local/bin/rrt-runtime
+  env:
+    PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin

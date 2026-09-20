@@ -14,7 +14,7 @@ for r in records.values():
 inventory=subprocess.check_output(['/opt/adx-fc/bin/sbox','-a',str(P/'sandboxd/sandboxd.sock'),'list'],text=True)
 assert len(inventory.strip().splitlines())==1,inventory
 (E/'inventory-paused.txt').write_text(inventory)
-status=json.loads(subprocess.check_output([str(B/'adxctl'),'status','--config',str(P/'deployment.json')],text=True))
+status=json.loads(subprocess.check_output([str(B/'adxctl'),'status','--config',str(P/'deployment.yaml')],text=True))
 node=[s for s in status['services'] if s['role']=='node-manager'];assert len(node)==1
 session=json.loads(c['node:node1'])['session']['id']
 from orphan_fixture import OrphanFixture

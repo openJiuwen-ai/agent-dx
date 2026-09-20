@@ -4,7 +4,7 @@
 
 ## 组件与字段
 
-在部署配置的每个服务 `env` 中设置 `ADX_LOG_FORMAT=json`。Master、Node Manager、Edge、Node Proxy、转发进程和 Sandbox API 支持此开关，默认保持 text。Rust 日志支持 `RUST_LOG` 级别过滤。Gateway 使用 JSON 时保持 `ADX_DATA_PLANE_LOG_DIR` 未配置，由 Supervisor 接管 stdout；现有 access/audit 开关仍有效。
+在部署配置的每个服务 `env` 中设置 `ADX_LOG_FORMAT=json`。Master、Node Manager、Edge、Node Proxy、转发进程和 API Server 支持此开关，默认保持 text。默认共进程部署中，Node Proxy 与 Node Manager 共享 `node-manager` 服务的 stdout 和日志文件；显式分进程时才有独立的 `node-proxy` 服务日志。Rust 日志支持 `RUST_LOG` 级别过滤。Gateway 使用 JSON 时保持 `ADX_DATA_PLANE_LOG_DIR` 未配置，由 Supervisor 接管 stdout；现有 access/audit 开关仍有效。
 
 Rust 输出包括时间、级别、target 和 fields；Rust API Server 输出时间、级别、event 和 HTTP 路由模板、方法、状态、耗时。Collector 将日志解析为结构化 body，并附加 `service.name`（Supervisor 服务 ID）、`adx.node.id` 和文件路径。Redis 等纯文本仍可采集，保留原文。
 
@@ -26,21 +26,18 @@ Node Manager 的 `instance_operation_completed` 事件记录 instance_id、gener
 
 建议 Supervisor 的配置起点：
 
-```json
-{
-  "logging": {
-    "enabled": true,
-    "line_records": true,
-    "max_record_bytes": 65536,
-    "max_file_bytes": 104857600,
-    "rotate_seconds": 86400,
-    "compress": true,
-    "compress_after_seconds": 300,
-    "max_files": 10,
-    "max_age_seconds": 604800,
-    "max_total_bytes": 1073741824
-  }
-}
+```yaml
+logging:
+  enabled: true
+  line_records: true
+  max_record_bytes: 65536
+  max_file_bytes: 104857600
+  rotate_seconds: 86400
+  compress: true
+  compress_after_seconds: 300
+  max_files: 10
+  max_age_seconds: 604800
+  max_total_bytes: 1073741824
 ```
 
 `line_records` 在完整换行记录之间滚动，避免 JSON 被文件边界截断。单条记录可以超过 `max_file_bytes`，最大受 `max_record_bytes` 限制。超长记录丢弃至下一个换行，记录日志健康错误和丢弃字节数，之后继续接收正常记录；退出时残余短行补换行。

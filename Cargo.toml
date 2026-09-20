@@ -13,8 +13,9 @@ members = [
     "platform/crates/scheduling",
     "platform/crates/protocol",
     "platform/crates/discovery",
+    "platform/crates/service-runtime",
     "platform/control-plane/master",
-    "platform/control-plane/control-cli",
+    "platform/deployment",
     "platform/control-plane/node-manager",
 ]
 

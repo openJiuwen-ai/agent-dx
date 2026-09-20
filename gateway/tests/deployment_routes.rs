@@ -2,7 +2,7 @@ use data_plane_gateway::{config::DEFAULT_CONTROL_PLANE_ROUTES, edge::parse_stati
 use serde_json::Value;
 
 fn example() -> Value {
-    serde_json::from_str(include_str!("../../build/config/examples/deployment.json")).unwrap()
+    serde_saphyr::from_str(include_str!("../../build/config/examples/deployment.yaml")).unwrap()
 }
 
 #[test]
@@ -51,7 +51,10 @@ fn shipped_example_configures_both_sides_of_proxy_mtls() {
     let config = example();
     let services = config["services"].as_array().unwrap();
     let edge = &services.iter().find(|s| s["role"] == "edge").unwrap()["env"];
-    let proxy = &services.iter().find(|s| s["role"] == "node-proxy").unwrap()["env"];
+    let proxy = &services
+        .iter()
+        .find(|s| s["role"] == "node-manager")
+        .unwrap()["env"];
     for env in [edge, proxy] {
         assert_eq!(
             env["ADX_DATA_PLANE_EDGE_FRONTEND_NODE_SECURITY_MODE"],

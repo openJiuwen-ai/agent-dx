@@ -1,17 +1,17 @@
 # 单机进程部署
 
-本文使用统一发布包在一台 Linux 主机上部署 Master、Node Manager、Node Proxy、Sandbox API 和 Edge。sandboxd 与 Redis 是已准备好的依赖。入口是 HTTPS Edge；Sandbox API 的 HTTP 监听只绑定本机回环地址，内部 RPC 与 Edge→Node Proxy 使用 mTLS。
+本文使用统一发布包在一台 Linux 主机上部署 Master、Node Manager（默认内嵌 Node Proxy）、API Server 和 Edge。入口是 HTTPS Edge；API Server 的 HTTP 监听只绑定本机回环地址，内部 RPC 与 Edge→Node Proxy 使用 mTLS。`adxctl` 的命令语义、按角色拆分部署、内置／外置 Redis 配置见独立的 [`adxctl` 部署指南](adxctl.md)。
 
 ## 准备与安装
 
 - 使用与 Linux 主机架构一致的 ADX release 包；部署前执行 `python3 build/release/package.py verify /path/to/package` 校验完整清单。将整个包安装到 `/opt/adx`，不要混用不同包的二进制或 SDK。
 - 按 `third_party/sandboxd/source.json` 准备外部 sandboxd。默认示例连接 `/run/sandboxd/sandboxd.sock`。sandboxd 的运行时、网络、镜像访问与主机权限由部署环境准备。
 - 配置随包部署的本地 `runtime/adx-runtime-rootfs.img`：默认用作实例根文件系统，自定义镜像时只读挂载内置环境，用户镜像不需要预装 RRT。配置及启动语义见 [本地运行环境](runtime-environment.md)。
-- Redis 位于示例的 `redis://127.0.0.1:6379/`。应启用 AOF 和持久化磁盘；`always`、`everysec`、`no` 按部署要求选择。需要由 ADX 托管 Redis 时，按 [进程部署](../testing/process-deployment.md#redis) 增加 Redis 角色。
+- `adxctl config init` 默认生成由 ADX 托管本机 Redis 的单机配置；外置 Redis 使用 `--profile standalone-external-redis`。两种方式都应启用 AOF 和持久化磁盘；具体命令见 [`adxctl` Redis 部署](adxctl.md#单机-standalone-部署)。
 
 ```sh
 sudo install -d -m 0700 /etc/adx /etc/adx/tls /etc/adx/secrets /var/lib/adx /run/adx
-sudo install -m 0600 /opt/adx/etc/examples/deployment.json /etc/adx/deployment.json
+sudo /opt/adx/bin/adxctl config init
 ```
 
 检查配置中的包目录、状态目录、监听地址、Redis 地址和 namespace。示例采用单机回环地址发布内部服务；分节点部署时必须改为对端能访问的地址，并调整防火墙与 CIDR。对外 Edge 默认监听 8443，仅允许本机客户端；远程客户端需要配置 `ADX_DATA_PLANE_EDGE_FRONTEND_ALLOWED_CLIENT_CIDRS`，证书 SAN 也需包含实际入口域名或 IP。
@@ -62,14 +62,14 @@ with os.fdopen(fd, 'w') as output:
 ## 校验、启动和业务就绪
 
 ```sh
-/opt/adx/bin/adxctl validate --config /etc/adx/deployment.json
-/opt/adx/bin/adxctl render --config /etc/adx/deployment.json --output /run/adx/config-review
-/opt/adx/bin/adxctl run --config /etc/adx/deployment.json
+/opt/adx/bin/adxctl validate
+/opt/adx/bin/adxctl render --output /run/adx/config-review
+/opt/adx/bin/adxctl run
 # 另一个终端
-/opt/adx/bin/adxctl status --config /etc/adx/deployment.json
+/opt/adx/bin/adxctl status
 ```
 
-CLI 为 Sandbox API 注入共享 Redis 地址和 namespace，发现轮询间隔 `config.discovery.poll_seconds` 默认 5 秒，可配置为 1–86400 秒。Node Manager 的发现配置采用自身协议，由 CLI 分别生成。
+CLI 为 API Server 注入共享 Redis 地址和 namespace，发现轮询间隔 `config.discovery.poll_seconds` 默认 5 秒，可配置为 1–86400 秒。Node Manager 的发现配置采用自身协议，由 CLI 分别生成。
 
 `validate` 校验部署结构和 CLI 约束；TLS 文件内容、组件字段、sandboxd 和网络连通性由组件启动与真实请求检查。`render` 的输出目录必须尚不存在；生成目录 0700、文件 0600，可能包含 Redis 连接凭证，不应上传为公开日志。`run`/`start` 都在前台运行 supervisor，systemd 或 Pod 可直接托管该进程。
 
@@ -112,6 +112,6 @@ SDK 中的 runtime 及资源数值应与已准备的 sandboxd 后端匹配。例
 
 配置和证书在进程启动时读取。更新证书时，同步更新引用它的 `peers` DER 文件和必要的 CA，再按部署维护流程重启相关组件。本期没有 `adxctl restart` 子命令，也不提供证书热重载或无中断轮换保证。
 
-`adxctl stop --config /etc/adx/deployment.json` 会先删除本机已管理实例，提交清理结果，然后退出服务；停止 supervisor 的 SIGTERM/SIGINT 也遵守该契约。它不适合作为保留现有实例的证书更新命令。需要保留实例时，由部署环境重启选定组件，待 Node Manager 完成权威对账和路由同步后恢复使用。Master 不可用时，Node Manager 重启只能观察实际实例，需等待 Master 对账后恢复生命周期操作。
+`adxctl stop` 会先删除本机已管理实例，提交清理结果，然后退出服务；停止 supervisor 的 SIGTERM/SIGINT 也遵守该契约。它不适合作为保留现有实例的证书更新命令。需要保留实例时，由部署环境重启选定组件，待 Node Manager 完成权威对账和路由同步后恢复使用。Master 不可用时，Node Manager 重启只能观察实际实例，需等待 Master 对账后恢复生命周期操作。
 
 Kubernetes 同样在 Pod 内运行进程，但部署与验收应使用独立的 [K8s 驱动](../../build/e2e/kubernetes/README.md)；其 namespace、镜像身份、用例结果与清理记录单独保存。

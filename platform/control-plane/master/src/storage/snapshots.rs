@@ -7,15 +7,16 @@ impl Session {
         format!("{}:snapshots", self.store.key)
     }
     pub(super) async fn snapshot_raw(&self, id: &str) -> Result<Option<String>> {
-        self.header(&self.store.fields(&[HEADER.into()]).await?[0])?;
+        let [header_value] = self.store.fields([HEADER.into()]).await?;
+        self.header(&header_value)?;
         let mut command = redis::cmd("HGET");
         command.arg(self.snapshots_key()).arg(id);
         self.store.query(command).await
     }
     async fn snapshot_cas(&self, id: &str, old: Option<&str>, next: &Snapshot) -> Result<bool> {
         next.validate()?;
-        let h = self.store.fields(&[HEADER.into()]).await?;
-        self.header(&h[0])?;
+        let [header_value] = self.store.fields([HEADER.into()]).await?;
+        self.header(&header_value)?;
         let mut command = redis::cmd("EVAL");
         command
             .arg(
@@ -31,7 +32,7 @@ impl Session {
             .arg(2)
             .arg(&self.store.key)
             .arg(self.snapshots_key())
-            .arg(h[0].as_deref().ok_or(Error::Conflict)?)
+            .arg(header_value.as_deref().ok_or(Error::Conflict)?)
             .arg(id)
             .arg(old.unwrap_or(""))
             .arg(encode(next)?);
@@ -88,16 +89,17 @@ impl Session {
         &self,
         include: impl Fn(&Snapshot) -> bool,
     ) -> Result<Vec<Snapshot>> {
-        self.header(&self.store.fields(&[HEADER.into()]).await?[0])?;
+        let [header_value] = self.store.fields([HEADER.into()]).await?;
+        self.header(&header_value)?;
         let mut command = redis::cmd("HVALS");
         command.arg(self.snapshots_key());
         let raw: Vec<String> = self.store.query(command).await?;
         let mut result = vec![];
-        for s in raw {
-            let s: Snapshot = decode(&s)?;
-            s.validate()?;
-            if include(&s) {
-                result.push(s);
+        for encoded_snapshot in raw {
+            let snapshot: Snapshot = decode(&encoded_snapshot)?;
+            snapshot.validate()?;
+            if include(&snapshot) {
+                result.push(snapshot);
             }
         }
         result.sort_by(|a, b| a.id.cmp(&b.id));

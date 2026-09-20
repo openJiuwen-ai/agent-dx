@@ -8,7 +8,7 @@ OUT ?= $(CURDIR)/out
 PYTEST_ARGS ?=
 E2E_PROFILE ?= standalone
 K8S_E2E_PROFILE ?= k8s-basic
-RUST_POLICY_PACKAGES := -p adx-api-server -p adx-control-cli -p adx-master \
+RUST_POLICY_PACKAGES := -p adx-api-server -p adx-deployment -p adx-master \
 	-p adx-node-manager -p adx-core -p adx-discovery -p adx-observability \
 	-p adx-protocol -p adx-scheduling
 

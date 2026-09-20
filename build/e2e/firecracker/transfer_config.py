@@ -8,7 +8,7 @@ ADDRESSES = {'node1':'10.240.0.11','node2':'10.240.0.12'}
 
 def configure(root):
     root = Path(root)
-    original = json.loads((root/'deployment.json').read_text())
+    original = json.loads((root/'deployment.yaml').read_text())
     template = next(s for s in original['services'] if s['role']=='node-manager')
     if template['config'].get('proxy_mode') != 'embedded':
         raise ValueError('transfer fixture requires embedded Node Proxy')
@@ -37,7 +37,7 @@ def configure(root):
         env['ADX_DATA_PLANE_ALLOWED_TARGET_CIDRS'] = f'10.231.{16 if name=="node1" else 32}.0/20'
         d = {**original, 'state_dir':str(folder/'state'), 'services':[service],
              'redis_url':original['redis_url'].replace('127.0.0.1',HOST)}
-        path = folder/'deployment.json'
+        path = folder/'deployment.yaml'
         path.write_text(json.dumps(d,indent=2)); path.chmod(0o600)
         backend = folder/'sandboxd'; backend.mkdir()
         for filename in ('oss.json','registry.json','oss_auths.json','registry_auths.json'):
@@ -50,5 +50,5 @@ def configure(root):
     control['services'] = [s for s in control['services'] if s['role'] not in ('node-manager','node-proxy')]
     master = next(s for s in control['services'] if s['role']=='master')['config']
     master.update(advertised_address=f'https://{HOST}:17000', heartbeat_timeout_seconds=12)
-    (root/'deployment.json').write_text(json.dumps(control,indent=2))
+    (root/'deployment.yaml').write_text(json.dumps(control,indent=2))
     path=root/'registry.yaml';path.write_text(path.read_text().replace('127.0.0.1:5000','0.0.0.0:5000'))

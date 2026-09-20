@@ -21,7 +21,7 @@ def nodes():
 def backend():
     lines=command(['sbox','-a',P/'sandboxd/sandboxd.sock','list']).splitlines()
     return sorted(line.split()[0] for line in lines[1:] if line.strip())
-def supervisor(action):return json.loads(command([A/'package/bin/adxctl',action,'--config',P/'deployment.json']))
+def supervisor(action):return json.loads(command([A/'package/bin/adxctl',action,'--config',P/'deployment.yaml']))
 def collect(node):
     dest=E/f'logs-{node}';dest.mkdir(exist_ok=True)
     secrets=[p.read_bytes().strip() for p in S.glob('*key') if p.is_file()]

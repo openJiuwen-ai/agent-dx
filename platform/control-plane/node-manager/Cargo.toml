@@ -20,6 +20,7 @@ serde = { version = "1", features = ["derive"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 adx-core = { path = "../../crates/core" }
 adx-protocol = { path = "../../crates/protocol" }
+adx-service-runtime = { path = "../../crates/service-runtime" }
 async-trait = "0.1"
 tokio = { version = "1", features = ["rt", "sync", "macros", "time"] }
 tonic = "0.12"

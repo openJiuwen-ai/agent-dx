@@ -2,31 +2,27 @@
 
 `gateway::node::NodeProxyService` 统一持有数据监听、健康监听、绑定控制服务和连接任务。`adx-node-proxy` 直接托管该服务；Node Manager 通过 `proxy_mode` 选择是否在本进程托管它。
 
-## 分进程
+## 共进程（默认）
 
-Node Manager 配置省略 `proxy_mode`，或设置 `"proxy_mode": "standalone"`。部署配置同时包含 `node-manager` 和 `node-proxy` 两个服务。Proxy 的环境配置放在 `node-proxy.env`；Node Manager 的 `proxy_socket` 指向相应目录下的 `route.sock`。
+Node Manager 省略 `proxy_mode` 或设置 `"proxy_mode": "embedded"` 时，在本进程托管 Node Proxy。统一部署配置只保留 `node-manager` 服务，Node Proxy 的 `ADX_DATA_PLANE_*` 环境配置放入该服务的 `env`。
 
-## 共进程
-
-Node Manager 设置 `"proxy_mode": "embedded"`。统一部署配置只保留 `node-manager` 服务，将原 Node Proxy 的 `ADX_DATA_PLANE_*` 环境配置移入该服务的 `env`。
-
-```json
-{
-  "id": "node1",
-  "role": "node-manager",
-  "config": {
-    "proxy_mode": "embedded",
-    "proxy_socket": "/run/adx/node1/route.sock"
-  },
-  "env": {
-    "ADX_DATA_PLANE_NODE_PROXY_ACTIVITY_UDS_DIR": "/run/adx/node1",
-    "ADX_DATA_PLANE_NODE_PROXY_BIND": "0.0.0.0:8443",
-    "ADX_DATA_PLANE_NODE_PROXY_HEALTH_BIND": "127.0.0.1:18443",
-    "ADX_DATA_PLANE_ALLOWED_EDGE_CIDRS": "10.0.0.0/8",
-    "ADX_DATA_PLANE_ALLOWED_TARGET_CIDRS": "10.0.0.0/8"
-  }
-}
+```yaml
+services:
+  - id: node-manager
+    role: node-manager
+    config:
+      proxy_socket: /run/adx/node/route.sock
+    env:
+      ADX_DATA_PLANE_NODE_PROXY_ACTIVITY_UDS_DIR: /run/adx/node
+      ADX_DATA_PLANE_NODE_PROXY_BIND: 0.0.0.0:8443
+      ADX_DATA_PLANE_NODE_PROXY_HEALTH_BIND: 127.0.0.1:18443
+      ADX_DATA_PLANE_ALLOWED_EDGE_CIDRS: 10.0.0.0/8
+      ADX_DATA_PLANE_ALLOWED_TARGET_CIDRS: 10.0.0.0/8
 ```
+
+## 分进程（显式选择）
+
+Node Manager 必须设置 `"proxy_mode": "standalone"`，部署配置同时包含 `node-manager` 和 `node-proxy` 两个服务。Proxy 的环境配置放在 `node-proxy.env`；Node Manager 的 `proxy_socket` 指向相应目录下的 `route.sock`。独立二进制仍复用同一个 `NodeProxyService`，用于需要独立故障域或资源隔离的部署。
 
 这是组合方式的配置片段。部署仍需补齐 Master 发现、证书、sandboxd、RRT、资源源和实际网络范围。需要 mTLS 的环境继续配置 Node Proxy 服务端证书、私钥和 Edge 客户端 CA。
 
@@ -50,3 +46,5 @@ CLI 校验共进程的 `proxy_socket` 与控制目录一致，并拒绝同一部
 这证明两种进程模式均已接通；密钥管理与完整部署示例已另行验收，见 [部署报告](2026-09-16-installed-example.md)；配置/证书更新通过重启组件应用，热重载后置。
 
 2026-09-16更新：最新package-v11在Lima r14再次通过10项共进程FC/S3验收，并覆盖SDK指定节点；证据位于 `out/ci/pause-resume/fc-r14/evidence/`。
+
+2026-09-20更新：`embedded` 已改为 Node Manager 和统一部署的默认值。当前源码重新打包后，本地Docker双节点八组公开SDK验收全部通过；`deployment-node1.json` 和 `deployment-node2.json` 均显示每节点只有一个 `node-manager`、没有独立 `node-proxy`。两节点 Proxy `/metrics` 均报告 ready=1，CONNECT错误为0；结果、JUnit和清理检查均通过，证据位于 `out/ci/local-e2e-embedded-default-20260920/`。

@@ -30,7 +30,6 @@ agent-dx/
 │   ├── control-plane/
 │   │   ├── master/                # Rust Master；Global + 内嵌 Shard
 │   │   ├── node-manager/          # Rust 本机生命周期和后端/存储适配
-│   │   ├── control-cli/           # Rust adxctl / supervisor
 │   │   └── api-server/            # Rust HTTP、认证缓存和 Instance RPC
 │   │       ├── src/               # contract、http、clients、operations
 │   │       ├── tests/             # HTTP 契约与校验
@@ -39,6 +38,7 @@ agent-dx/
 │   │   ├── core/                  # Instance、资源、恢复点、调度纯类型
 │   │   ├── protocol/              # gRPC 生成、转换与组件身份
 │   │   ├── discovery/             # Redis 服务地址发现
+│   │   ├── service-runtime/       # 服务参数、配置读取与退出信号
 │   │   ├── scheduling/            # Filter / Score、快照与查询索引
 │   │   └── observability/         # Trace 初始化、传播与导出
 │   ├── api/
@@ -50,6 +50,7 @@ agent-dx/
 │   │   ├── proto/node.proto       # Node Proxy 绑定与活动
 │   │   └── http/runtime-control.md
 │   ├── runtime/rrt/               # HTTP 运行时与 checkpoint 协作
+│   ├── deployment/                # 统一 adxctl / supervisor；管理控制面和数据面进程
 │   └── sdk/sandbox/python/        # adx-sandbox / adx_sandbox
 ├── gateway/src/
 │   ├── common/                    # 传输元数据、日志、资源与关闭辅助
@@ -96,8 +97,8 @@ agent-dx/
 
 | 模式 | 配置与装配 | 共同契约 |
 |---|---|---|
-| standalone（默认） | 两个 supervisor 服务；`proxy_mode=standalone` | Node Manager 经受保护 UDS 控制 NodeProxyService |
-| embedded | Node Manager 配置 `proxy_mode=embedded`，托管同一 NodeProxyService；Proxy 环境项放到 node-manager 服务 | 仍走同一 UDS 和完整绑定同步，不绕过版本/身份检查 |
+| embedded（默认） | Node Manager 省略 `proxy_mode` 或配置 `proxy_mode=embedded`，托管同一 NodeProxyService；Proxy 环境项放到 node-manager 服务 | 仍走同一 UDS 和完整绑定同步，不绕过版本/身份检查 |
+| standalone | 两个 supervisor 服务；Node Manager 显式配置 `proxy_mode=standalone` | Node Manager 经受保护 UDS 控制 NodeProxyService |
 
 Proxy 首次启动关闭实例准入，Node Manager 完成权威对账与全量绑定同步后开放。数据请求直接进入 Node Proxy，不经过 Instance 生命周期队列。共进程共享进程和 Tokio 执行器，故障域与分进程不同。详见 [模式配置与验证](../testing/node-proxy-process-modes.md)。
 

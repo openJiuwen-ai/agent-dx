@@ -13,6 +13,7 @@ workspace = true
 [dependencies]
 adx-core = { path = "../../crates/core" }
 adx-protocol = { path = "../../crates/protocol" }
+adx-service-runtime = { path = "../../crates/service-runtime" }
 adx-discovery = { path = "../../crates/discovery" }
 adx-observability = { path = "../../crates/observability" }
 serde = { version = "1", features = ["derive"] }

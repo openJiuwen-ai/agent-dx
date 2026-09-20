@@ -52,24 +52,3 @@ impl TlsFiles {
         ))
     }
 }
-pub fn read_config<T: serde::de::DeserializeOwned>() -> Result<T, Box<dyn std::error::Error>> {
-    let args: Vec<_> = std::env::args().collect();
-    if args.len() != 3 || args[1] != "--config" {
-        return Err("usage: executable --config /path/to/config.json".into());
-    }
-    // Avoid including configuration bytes in parse errors (may contain credentials).
-    serde_json::from_slice(&std::fs::read(&args[2])?)
-        .map_err(|_| "invalid service configuration".into())
-}
-pub async fn shutdown() {
-    #[cfg(unix)]
-    {
-        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("install SIGTERM handler");
-        tokio::select! {_=tokio::signal::ctrl_c()=>{},_=term.recv()=>{}}
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
-    }
-}

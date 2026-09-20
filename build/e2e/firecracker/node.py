@@ -48,7 +48,7 @@ try:
  (E/'rrt-image.json').write_text(json.dumps({'image':image}))
  sandboxd=spawn('sandboxd',['sandboxd','--root',RUN/'sandboxd/root','--config',RUN/'sandboxd/config.toml','--socket',RUN/'sandboxd/sandboxd.sock','--http-address','127.0.0.1:18081','--pprof-address','127.0.0.1:16061','--log-file',E/'sandboxd-service.log'])
  wait(lambda:(RUN/'sandboxd/sandboxd.sock').exists())
- supervisor=spawn('supervisor',[BASE/'package/bin/adxctl','run','--config',RUN/'deployment.json'])
+ supervisor=spawn('supervisor',[BASE/'package/bin/adxctl','run','--config',RUN/'deployment.yaml'])
  authenv={**env,'REDISCLI_AUTH':(RUN/'secrets/redis-key').read_text().strip()}
  def catalog():return json.loads(subprocess.check_output(['redis-cli','--json','HGETALL','adx:{acceptance}:control:v1'],env=authenv,text=True))
  def ready():
@@ -79,7 +79,7 @@ except BaseException as error:
 finally:
  try:
   if any(n=='supervisor' and p.poll() is None for n,p in children):
-   print(run([BASE/'package/bin/adxctl','stop','--config',RUN/'deployment.json']),flush=True)
+   print(run([BASE/'package/bin/adxctl','stop','--config',RUN/'deployment.yaml']),flush=True)
  except Exception as error:summary['stop_error']=repr(error);summary['status']='failed'
  for name,proc in reversed(children):
   if proc.poll() is None:

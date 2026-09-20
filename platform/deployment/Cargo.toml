@@ -1,11 +1,11 @@
 [package]
-name = "adx-control-cli"
+name = "adx-deployment"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "ADX deployment CLI and process supervisor"
+description = "Unified ADX control-plane and data-plane deployment"
 [lints]
 workspace = true
 
@@ -13,11 +13,13 @@ workspace = true
 name = "adxctl"
 path = "src/main.rs"
 [dependencies]
-adx-core = { path = "../../crates/core" }
+adx-core = { path = "../crates/core" }
+clap = { version = "4", features = ["derive", "env"] }
 flate2 = "1"
-adx-protocol = { path = "../../crates/protocol" }
+adx-protocol = { path = "../crates/protocol" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde-saphyr = { version = "1.3", default-features = false, features = ["deserialize", "serialize"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "signal", "io-util"] }
 tonic = "0.12"
 tower = { version = "0.5", features = ["util"] }

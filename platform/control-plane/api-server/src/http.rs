@@ -84,21 +84,31 @@ impl Api {
         if let Ok(value) = request_id.parse() {
             response.headers_mut().insert("x-request-id", value);
         }
-        adx_observability::info!(event="http_request",trace_id=context.split('-').nth(1).unwrap_or(""),span_id=context.split('-').nth(2).unwrap_or(""),method=%method,route,status=response.status().as_u16(),duration_ms=started.elapsed().as_millis() as u64,"API request completed");
+        let (trace_id, span_id) = trace_identifiers(&context);
+        adx_observability::info!(
+            event = "http_request",
+            trace_id,
+            span_id,
+            method = %method,
+            route,
+            status = response.status().as_u16(),
+            duration_ms = started.elapsed().as_millis() as u64,
+            "API request completed"
+        );
         Ok(response)
     }
     async fn handle(self: Arc<Self>, request: Request<Incoming>) -> Response<Body> {
-        let key = header(&request, "authorization")
+        let api_key = header(&request, "authorization")
             .and_then(|s| s.strip_prefix("Bearer "))
             .or_else(|| header(&request, "x-auth-token"))
             .or_else(|| header(&request, "x-auth"))
             .unwrap_or("")
             .trim();
-        let caller = match Box::pin(self.clients.authenticate(key)).await {
-            Ok(c) => c,
-            Err(e) => {
+        let caller = match Box::pin(self.clients.authenticate(api_key)).await {
+            Ok(caller) => caller,
+            Err(error) => {
                 return envelope(
-                    if matches!(e.code(), Code::Unavailable | Code::DeadlineExceeded) {
+                    if matches!(error.code(), Code::Unavailable | Code::DeadlineExceeded) {
                         503
                     } else {
                         401
@@ -142,41 +152,50 @@ impl Api {
             };
             return match Box::pin(self.keys(&method, &path, &query, body, &caller)).await {
                 Ok((status, data)) => {
-                    let mut r = plain(status, data);
-                    r.headers_mut().insert(
+                    let mut response = plain(status, data);
+                    response.headers_mut().insert(
                         "cache-control",
                         hyper::header::HeaderValue::from_static("no-store"),
                     );
-                    r
+                    response
                 }
-                Err(e) => plain(status_code(&e), json!({"error":e.message()})),
+                Err(error) => plain(status_code(&error), json!({"error":error.message()})),
             };
         }
         if method == "GET" && path == "/api/instances" {
-            let Some(id) = query.get("instance_id").filter(|v| !v.trim().is_empty()) else {
+            let Some(instance_id) = query
+                .get("instance_id")
+                .filter(|value| !value.trim().is_empty())
+            else {
                 return plain(400, json!({"error":"instance_id required"}));
             };
-            return match Box::pin(self.clients.owner(id, &caller, false)).await {
-                Ok(v) => {
-                    let Some(r) = v.record else {
+            return match Box::pin(self.clients.owner(instance_id, &caller, false)).await {
+                Ok(owner) => {
+                    let Some(record) = owner.record else {
                         return plain(
                             502,
                             json!({"error":"instance directory returned no record"}),
                         );
                     };
-                    if r.state == pb::InstanceState::Deleted as i32 {
+                    if record.state == pb::InstanceState::Deleted as i32 {
                         return plain(404, json!({"error":"Not Found"}));
                     }
-                    let Some(spec) = r.spec else {
+                    let Some(spec) = record.spec else {
                         return plain(502, json!({"error":"instance record returned no spec"}));
                     };
                     let resource = spec.resources.unwrap_or_default();
                     plain(
                         200,
-                        json!([{"id":id,"status":state(r.state),"required_cpu":resource.cpu_millis,"required_mem":resource.memory_bytes/1048576,"image":spec.image}]),
+                        json!([{
+                            "id": instance_id,
+                            "status": state(record.state),
+                            "required_cpu": resource.cpu_millis,
+                            "required_mem": resource.memory_bytes / 1048576,
+                            "image": spec.image,
+                        }]),
                     )
                 }
-                Err(e) => plain(status_code(&e), json!({"error":e.message()})),
+                Err(error) => plain(status_code(&error), json!({"error":error.message()})),
             };
         }
         let mut input = match body(request.into_body(), 1048576).await {
@@ -205,28 +224,7 @@ impl Api {
                 Err(e) => return envelope(status_code(&e), None, Some(e.message())),
             };
             if stream && path.ends_with("sandboxes") {
-                let (sender, receiver) = mpsc::channel::<Result<Frame<Bytes>, Error>>(4);
-                let result = Response::builder()
-                    .header("content-type", "text/event-stream")
-                    .header("cache-control", "no-cache")
-                    .header("x-accel-buffering", "no")
-                    .body(
-                        StreamBody::new(tokio_stream::wrappers::ReceiverStream::new(receiver))
-                            .boxed_unsync(),
-                    )
-                    .expect("static event-stream response is valid");
-                let parent = trace::Trace::child("api_server.create_stream");
-                tokio::spawn(parent.run(async move{
-     if sender.send(Ok(sse("accepted",json!({"status":"creating","requestId":request_id})))).await.is_err(){return;}
-     let future=self.create(spec,input,&request_id,&caller);tokio::pin!(future);
-     let final_value=loop{tokio::select!{
-      value=&mut future=>break value,
-      _=tokio::time::sleep(Duration::from_secs(10))=>{let _=sender.try_send(Ok(Frame::data(Bytes::from_static(b": heartbeat\n\n"))));}
-     }};
-     let data=match final_value{Ok(v)=>v,Err(e)=>json!({"status":if e.code()==Code::DeadlineExceeded{"timeout"}else{"failed"},"requestId":request_id,"errorCode":status_code(&e),"message":e.message()})};
-     let _=sender.send(Ok(sse("final",data))).await;
-    }));
-                return result;
+                return self.create_stream(spec, input, request_id, caller);
             }
             let result = Box::pin(self.create(spec, input, &request_id, &caller)).await;
             return response(if path == "/api/sandbox/create" {
@@ -288,6 +286,60 @@ impl Api {
         }
         plain(404, json!({"error":"Not Found"}))
     }
+
+    fn create_stream(
+        self: Arc<Self>,
+        spec: pb::InstanceSpec,
+        input: Value,
+        request_id: String,
+        caller: pb::CallerContext,
+    ) -> Response<Body> {
+        let (sender, receiver) = mpsc::channel::<Result<Frame<Bytes>, Error>>(4);
+        let response = Response::builder()
+            .header("content-type", "text/event-stream")
+            .header("cache-control", "no-cache")
+            .header("x-accel-buffering", "no")
+            .body(
+                StreamBody::new(tokio_stream::wrappers::ReceiverStream::new(receiver))
+                    .boxed_unsync(),
+            )
+            .expect("static event-stream response is valid");
+        let trace = trace::Trace::child("api_server.create_stream");
+        tokio::spawn(trace.run(async move {
+            let accepted = json!({"status":"creating", "requestId":request_id});
+            if sender.send(Ok(sse("accepted", accepted))).await.is_err() {
+                return;
+            }
+
+            let create = self.create(spec, input, &request_id, &caller);
+            tokio::pin!(create);
+            let result = loop {
+                tokio::select! {
+                    result = &mut create => break result,
+                    _ = tokio::time::sleep(Duration::from_secs(10)) => {
+                        let heartbeat = Frame::data(Bytes::from_static(b": heartbeat\n\n"));
+                        let _ = sender.try_send(Ok(heartbeat));
+                    }
+                }
+            };
+            let final_event = match result {
+                Ok(value) => value,
+                Err(error) => json!({
+                    "status": if error.code() == Code::DeadlineExceeded {
+                        "timeout"
+                    } else {
+                        "failed"
+                    },
+                    "requestId": request_id,
+                    "errorCode": status_code(&error),
+                    "message": error.message(),
+                }),
+            };
+            let _ = sender.send(Ok(sse("final", final_event))).await;
+        }));
+        response
+    }
+
     async fn create(
         &self,
         spec: pb::InstanceSpec,
@@ -298,86 +350,141 @@ impl Api {
         if request_id.len() > 256 {
             return Err(Status::invalid_argument("request ID too long"));
         }
-        let key = (caller.tenant_id.clone(), request_id.to_string());
-        let digest = Sha256::digest(
+        let create_key = (caller.tenant_id.clone(), request_id.to_string());
+        let request_digest = Sha256::digest(
             serde_json::to_vec(&input).expect("serde_json::Value serialization is infallible"),
         )
         .to_vec();
-        let op = {
+        let operation = {
             let mut creates = self.creates.lock().await;
-            creates.retain(|_, v| {
-                v.try_lock().map_or(true, |o| {
-                    o.result.is_none() || o.touched.elapsed() < Duration::from_secs(600)
+            creates.retain(|_, operation| {
+                operation.try_lock().map_or(true, |operation| {
+                    operation.result.is_none()
+                        || operation.touched.elapsed() < Duration::from_secs(600)
                 })
             });
-            if let Some(op) = creates.get(&key) {
-                op.clone()
+            if let Some(operation) = creates.get(&create_key) {
+                operation.clone()
             } else {
                 if creates.len() >= self.clients.config.cache_entries {
                     return Err(Status::resource_exhausted("create replay budget exhausted"));
                 }
-                let op = Arc::new(Mutex::new(CreateOperation {
-                    digest: digest.clone(),
+                let operation = Arc::new(Mutex::new(CreateOperation {
+                    digest: request_digest.clone(),
                     spec,
                     result: None,
                     touched: Instant::now(),
                 }));
-                creates.insert(key.clone(), op.clone());
-                op
+                creates.insert(create_key.clone(), operation.clone());
+                operation
             }
         };
-        let mut op = op.lock().await;
-        if op.digest != digest {
+        let mut operation = operation.lock().await;
+        if operation.digest != request_digest {
             return Err(Status::already_exists(
                 "request ID reused with different arguments",
             ));
         }
-        if let Some(result) = &op.result {
+        if let Some(result) = &operation.result {
             return result.clone();
         }
         {
             let mut names = self.names.lock().await;
-            if let Some(existing) = names.get(&op.spec.id) {
-                if existing != &key
+            if let Some(existing) = names.get(&operation.spec.id) {
+                if existing != &create_key
                     && self.clients.config.create_mode == crate::config::CreateMode::Central
                 {
                     return Err(Status::already_exists("instance create in progress"));
                 }
             }
-            names.insert(op.spec.id.clone(), key.clone());
+            names.insert(operation.spec.id.clone(), create_key.clone());
         }
-        let result=async{
-   if self.clients.config.create_mode == crate::config::CreateMode::Central { match self.clients.owner(&op.spec.id,caller,false).await{
-    Ok(_)=>return Err(Status::already_exists("instance already exists")),
-    Err(e) if e.code()==Code::NotFound=>{},Err(e)=>return Err(e)
-   }
-   }
-   let budget=Duration::from_secs(contract::create_timeout(&input)?).min(self.clients.config.timeout());
-   let result=self.clients.create_instance(pb::CreateInstanceRequest{spec:Some(op.spec.clone()),caller:Some(caller.clone())},budget).await?;
-   authorize(caller,result.record.as_ref())?;
-   let r=result.record.ok_or_else(||Status::unavailable("create returned no instance record"))?;
-   let got=r.spec.as_ref().ok_or_else(||Status::unavailable("create returned no instance spec"))?;
-   if r.state!=pb::InstanceState::Running as i32 || result.durability!=pb::Durability::Published as i32 || !matches_spec(&op.spec,got){return Err(Status::unavailable("create is not durably confirmed"));}
-   // Close the read-after-create window without making ordinary lifecycle
-   // requests query Master. The versioned stream remains the steady-state path.
-   self.clients.owner(&got.id,caller,true).await?;
-   let mut value=json!({"sandboxId":got.id,"instanceId":got.id,"status":"running","requestId":request_id});
-   if input.pointer("/tunnel/enabled").and_then(Value::as_bool)==Some(true){
-    let port=got.env.get("RRT_TUNNEL_HTTP_PORT").and_then(|p|p.parse::<u16>().ok()).unwrap_or(8766);let safe=got.id.replace('@',"-at-").replace(['/', '.', '_'],"-");let path=format!("/tunnel/{safe}");
-    value["tunnel"]=json!({"url":path,"path":path,"wsPath":path,"proxyUrl":format!("http://127.0.0.1:{port}"),"proxyPort":port});
-   }
-   Ok(value)
-  }.await;
-        self.names.lock().await.remove(&op.spec.id);
+        let result = self
+            .perform_create(&operation.spec, &input, request_id, caller)
+            .await;
+        self.names.lock().await.remove(&operation.spec.id);
         // An uncertain result is retryable only through this retained spec/ID.
         if !result
             .as_ref()
-            .is_err_and(|e| matches!(e.code(), Code::Unavailable | Code::DeadlineExceeded))
+            .is_err_and(|error| matches!(error.code(), Code::Unavailable | Code::DeadlineExceeded))
         {
-            op.result = Some(result.clone());
+            operation.result = Some(result.clone());
         }
-        op.touched = Instant::now();
+        operation.touched = Instant::now();
         result
+    }
+
+    async fn perform_create(
+        &self,
+        spec: &pb::InstanceSpec,
+        input: &Value,
+        request_id: &str,
+        caller: &pb::CallerContext,
+    ) -> Result<Value, Status> {
+        if self.clients.config.create_mode == crate::config::CreateMode::Central {
+            match self.clients.owner(&spec.id, caller, false).await {
+                Ok(_) => return Err(Status::already_exists("instance already exists")),
+                Err(error) if error.code() == Code::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+
+        let create_timeout = Duration::from_secs(contract::create_timeout(input)?);
+        let budget = create_timeout.min(self.clients.config.timeout());
+        let result = self
+            .clients
+            .create_instance(
+                pb::CreateInstanceRequest {
+                    spec: Some(spec.clone()),
+                    caller: Some(caller.clone()),
+                },
+                budget,
+            )
+            .await?;
+        authorize(caller, result.record.as_ref())?;
+        let record = result
+            .record
+            .ok_or_else(|| Status::unavailable("create returned no instance record"))?;
+        let confirmed_spec = record
+            .spec
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("create returned no instance spec"))?;
+        if record.state != pb::InstanceState::Running as i32
+            || result.durability != pb::Durability::Published as i32
+            || !matches_spec(spec, confirmed_spec)
+        {
+            return Err(Status::unavailable("create is not durably confirmed"));
+        }
+
+        // Close the read-after-create window without making ordinary lifecycle
+        // requests query Master. The versioned stream remains the steady-state path.
+        self.clients.owner(&confirmed_spec.id, caller, true).await?;
+        let mut response = json!({
+            "sandboxId": confirmed_spec.id,
+            "instanceId": confirmed_spec.id,
+            "status": "running",
+            "requestId": request_id,
+        });
+        if input.pointer("/tunnel/enabled").and_then(Value::as_bool) == Some(true) {
+            let port = confirmed_spec
+                .env
+                .get("RRT_TUNNEL_HTTP_PORT")
+                .and_then(|port| port.parse::<u16>().ok())
+                .unwrap_or(8766);
+            let safe_id = confirmed_spec
+                .id
+                .replace('@', "-at-")
+                .replace(['/', '.', '_'], "-");
+            let path = format!("/tunnel/{safe_id}");
+            response["tunnel"] = json!({
+                "url": path,
+                "path": path,
+                "wsPath": path,
+                "proxyUrl": format!("http://127.0.0.1:{port}"),
+                "proxyPort": port,
+            });
+        }
+        Ok(response)
     }
     async fn snapshots(
         &self,
@@ -584,6 +691,14 @@ impl Api {
         }
     }
 }
+fn trace_identifiers(context: &str) -> (&str, &str) {
+    let mut fields = context.split('-');
+    let _version = fields.next();
+    let trace_id = fields.next().unwrap_or("");
+    let span_id = fields.next().unwrap_or("");
+    (trace_id, span_id)
+}
+
 fn matches_spec(want: &pb::InstanceSpec, got: &pb::InstanceSpec) -> bool {
     if want.snapshot_id.is_none() {
         return want == got;
@@ -629,20 +744,25 @@ fn strip_hop_headers(headers: &mut hyper::HeaderMap) {
         headers.remove(name);
     }
 }
-fn key_value(k: &pb::TenantKey) -> Value {
-    json!({"id":k.id,"tenantId":k.tenant_id,"expiresAtUnixSeconds":k.expires_at_unix_seconds})
+fn key_value(key: &pb::TenantKey) -> Value {
+    json!({
+        "id": key.id,
+        "tenantId": key.tenant_id,
+        "expiresAtUnixSeconds": key.expires_at_unix_seconds,
+    })
 }
 fn page_size(query: &HashMap<String, String>) -> Result<u32, Status> {
     query
         .get("pageSize")
-        .map(|s| {
-            s.parse::<u32>()
+        .map(|value| {
+            value
+                .parse::<u32>()
                 .ok()
-                .filter(|v| *v <= 1000)
+                .filter(|size| *size <= 1000)
                 .ok_or_else(|| Status::invalid_argument("invalid page size"))
         })
         .transpose()
-        .map(|v| v.unwrap_or(0))
+        .map(|size| size.unwrap_or(0))
 }
 fn header<'a>(request: &'a Request<Incoming>, key: &str) -> Option<&'a str> {
     request.headers().get(key).and_then(|v| v.to_str().ok())
@@ -666,14 +786,23 @@ async fn body(body: Incoming, limit: usize) -> Result<Value, Status> {
 }
 fn response(value: Result<Value, Status>) -> Response<Body> {
     match value {
-        Ok(v) => envelope(200, Some(v), None),
-        Err(e) => envelope(status_code(&e), None, Some(e.message())),
+        Ok(value) => envelope(200, Some(value), None),
+        Err(error) => envelope(status_code(&error), None, Some(error.message())),
     }
 }
 fn envelope(status: u16, value: Option<Value>, error: Option<&str>) -> Response<Body> {
+    let data = value.filter(|value| !value.is_null()).map(|value| {
+        let bytes =
+            serde_json::to_vec(&value).expect("serde_json::Value serialization is infallible");
+        STANDARD.encode(bytes)
+    });
     plain(
         status,
-        json!({"code":status,"message":error.unwrap_or(""),"data":value.filter(|v|!v.is_null()).map(|v|STANDARD.encode(serde_json::to_vec(&v).expect("serde_json::Value serialization is infallible")))}),
+        json!({
+            "code": status,
+            "message": error.unwrap_or(""),
+            "data": data,
+        }),
     )
 }
 fn plain(status: u16, value: Value) -> Response<Body> {
@@ -707,8 +836,8 @@ fn status_code(error: &Status) -> u16 {
         _ => 500,
     }
 }
-fn state(s: i32) -> &'static str {
-    match pb::InstanceState::try_from(s) {
+fn state(value: i32) -> &'static str {
+    match pb::InstanceState::try_from(value) {
         Ok(pb::InstanceState::Running) => "running",
         Ok(pb::InstanceState::Paused) => "paused",
         Ok(pb::InstanceState::Deleted) => "deleted",
@@ -722,13 +851,18 @@ fn state(s: i32) -> &'static str {
     }
 }
 fn operation_id(value: &str, prefix: &str) -> bool {
-    value.strip_prefix(&format!("{prefix}-")).is_some_and(|s| {
-        !s.is_empty()
-            && s.len() <= 128
-            && s.as_bytes()[0].is_ascii_alphanumeric()
-            && s.bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
-    })
+    value
+        .strip_prefix(&format!("{prefix}-"))
+        .is_some_and(|identifier| {
+            identifier.len() <= 128
+                && identifier
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                && identifier
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+        })
 }
 fn agent_route(method: &str, path: &str) -> bool {
     if path == "/api/agent" {

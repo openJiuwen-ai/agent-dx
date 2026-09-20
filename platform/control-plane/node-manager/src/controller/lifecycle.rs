@@ -121,7 +121,15 @@ impl Controller {
                 self.transition(Event::Fail)?;
                 let retire = self.services.routes.retire(&self.record).await;
                 let commit = self.sync().await;
-                return Err(Error::Unavailable(format!("prepare failed: {error}; abort failed: {abort}; route retirement: {retire:?}; state commit: {}", if commit.is_ok() {"accepted"} else {"unavailable"})));
+                let commit_status = if commit.is_ok() {
+                    "accepted"
+                } else {
+                    "unavailable"
+                };
+                return Err(Error::Unavailable(format!(
+                    "prepare failed: {error}; abort failed: {abort}; route retirement: \
+                     {retire:?}; state commit: {commit_status}"
+                )));
             }
             return Err(error);
         }

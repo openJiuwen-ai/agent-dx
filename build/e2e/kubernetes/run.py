@@ -149,7 +149,7 @@ class KubernetesRun(common.Run):
         self.event('[DEPLOY] Waiting for sandboxd; starting ADX supervisor and services')
         for node in self.nodes:
             self.helper(node, 'backend-ready', timeout=40)
-            self.execute(node, 'sh', '-c', '/opt/adx/package/bin/adxctl run --config /tmp/adx-e2e/deployment.json'
+            self.execute(node, 'sh', '-c', '/opt/adx/package/bin/adxctl run --config /tmp/adx-e2e/deployment.yaml'
                          ' > /evidence/supervisor-' + node + '.log 2>&1 &')
         # Pod Ready only means the fixture is available; platform readiness is a separate gate.
         self.event('[DEPLOY] Waiting for Master registration, reconciliation and routes')
