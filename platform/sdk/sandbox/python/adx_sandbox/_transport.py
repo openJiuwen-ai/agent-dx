@@ -137,6 +137,10 @@ class _RetryableHTTPStatus(SandboxHTTPError):
         )
 
 
+class _CreateOutcomeUnknown(SandboxError):
+    """Create stream ended without an authoritative final result."""
+
+
 _DIRECT_SAFE_FALLBACK_ERRORS = (
     httpx.ConnectError,
     httpx.ConnectTimeout,
@@ -169,6 +173,7 @@ _CREATE_RETRYABLE_ERRORS = (
     httpx.WriteError,
     httpx.WriteTimeout,
     _RetryableHTTPStatus,
+    _CreateOutcomeUnknown,
 )
 _RETRYABLE_GATEWAY_STATUS_CODES = frozenset((502, 503, 504))
 _DELETE_MAX_ATTEMPTS = 3
@@ -328,15 +333,22 @@ class SandboxClient:
             self._last_create = data
             return data
 
+        contract_error = last_error if isinstance(last_error, SandboxError) else None
         raise SandboxError(
             "sandbox create transport failed after "
             f"{attempts} attempts "
             f"(requestId={request_id}, name={request_name}): "
             f"{last_error or 'create deadline exhausted'}",
-            request_id=request_id,
-            code="OUTCOME_UNKNOWN",
-            retry="same_operation",
-            outcome="unknown",
+            request_id=(contract_error.request_id if contract_error else None)
+            or request_id,
+            code=(contract_error.code if contract_error else None)
+            or "OUTCOME_UNKNOWN",
+            retry=(contract_error.retry if contract_error else None)
+            or "same_operation",
+            outcome=(contract_error.outcome if contract_error else None) or "unknown",
+            operation_id=contract_error.operation_id if contract_error else None,
+            instance_id=(contract_error.instance_id if contract_error else None)
+            or request_name,
         ) from last_error
 
     def _create_info_attempt(
@@ -400,7 +412,14 @@ class SandboxClient:
                     data_lines.append(line[5:].lstrip())
 
         if final is None:
-            raise SandboxError("sandbox create stream ended before final event")
+            raise _CreateOutcomeUnknown(
+                "sandbox create stream ended before final event",
+                request_id=request_id,
+                code="OUTCOME_UNKNOWN",
+                retry="same_operation",
+                outcome="unknown",
+                instance_id=str(body.get("name") or "") or None,
+            )
         if final.get("status") != "running":
             status = final.get("status") or "unknown"
             code = final.get("errorCode")
@@ -409,7 +428,7 @@ class SandboxClient:
             sandbox_id = final.get("sandboxId") or final.get("instanceId") or "unknown"
             detail = final.get("error")
             if isinstance(detail, dict):
-                raise SandboxHTTPError(
+                error = SandboxHTTPError(
                     int(code) if isinstance(code, int) else 503,
                     final,
                     f"sandbox create {status}: {message}",
@@ -420,6 +439,9 @@ class SandboxClient:
                     operation_id=detail.get("operationId"),
                     instance_id=detail.get("instanceId") or sandbox_id,
                 )
+                if error.retry == "same_operation" and error.outcome == "unknown":
+                    raise _RetryableHTTPStatus(error)
+                raise error
             raise SandboxError(
                 f"sandbox create {status} "
                 f"(errorCode={code}, requestId={response_request_id}, "

@@ -1029,6 +1029,18 @@ fn route_name(path: &str) -> &'static str {
 mod error_contract_tests {
     use super::*;
 
+    async fn error_body(response: Response<Body>) -> Value {
+        serde_json::from_slice(
+            &response
+                .into_body()
+                .collect()
+                .await
+                .expect("static body")
+                .to_bytes(),
+        )
+        .expect("JSON error body")
+    }
+
     #[tokio::test]
     async fn submitted_write_error_serializes_the_stable_contract() {
         let response = error_response(
@@ -1039,15 +1051,7 @@ mod error_contract_tests {
             true,
         );
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let value: Value = serde_json::from_slice(
-            &response
-                .into_body()
-                .collect()
-                .await
-                .expect("static body")
-                .to_bytes(),
-        )
-        .expect("JSON error body");
+        let value = error_body(response).await;
         assert_eq!(value["code"], 503);
         assert_eq!(value["error"]["code"], "OUTCOME_UNKNOWN");
         assert_eq!(value["error"]["retry"], "same_operation");
@@ -1055,5 +1059,136 @@ mod error_contract_tests {
         assert_eq!(value["error"]["requestId"], "request-a");
         assert_eq!(value["error"]["operationId"], "pause-a");
         assert_eq!(value["error"]["instanceId"], "instance-a");
+    }
+
+    #[tokio::test]
+    async fn documented_grpc_classes_keep_http_retry_and_outcome_semantics() {
+        let cases = [
+            (
+                Code::InvalidArgument,
+                false,
+                400,
+                "INVALID_ARGUMENT",
+                "never",
+                "not_started",
+            ),
+            (
+                Code::OutOfRange,
+                false,
+                413,
+                "INVALID_ARGUMENT",
+                "never",
+                "not_started",
+            ),
+            (
+                Code::Unauthenticated,
+                false,
+                401,
+                "UNAUTHENTICATED",
+                "never",
+                "not_started",
+            ),
+            (
+                Code::PermissionDenied,
+                false,
+                403,
+                "PERMISSION_DENIED",
+                "never",
+                "not_started",
+            ),
+            (Code::NotFound, false, 404, "NOT_FOUND", "never", "terminal"),
+            (
+                Code::AlreadyExists,
+                false,
+                409,
+                "CONFLICT",
+                "never",
+                "not_started",
+            ),
+            (
+                Code::ResourceExhausted,
+                false,
+                429,
+                "RESOURCE_EXHAUSTED",
+                "after_backoff",
+                "not_started",
+            ),
+            (
+                Code::Unimplemented,
+                false,
+                501,
+                "UNSUPPORTED",
+                "never",
+                "not_started",
+            ),
+            (
+                Code::Unavailable,
+                false,
+                503,
+                "UNAVAILABLE",
+                "after_backoff",
+                "not_started",
+            ),
+            (
+                Code::DeadlineExceeded,
+                false,
+                504,
+                "DEADLINE_EXCEEDED",
+                "same_operation",
+                "not_started",
+            ),
+            (Code::DataLoss, false, 500, "DATA_LOSS", "never", "terminal"),
+            (
+                Code::Internal,
+                false,
+                500,
+                "INTERNAL",
+                "after_backoff",
+                "not_started",
+            ),
+            (
+                Code::Unavailable,
+                true,
+                503,
+                "OUTCOME_UNKNOWN",
+                "same_operation",
+                "unknown",
+            ),
+            (
+                Code::DeadlineExceeded,
+                true,
+                504,
+                "OUTCOME_UNKNOWN",
+                "same_operation",
+                "unknown",
+            ),
+            (
+                Code::Internal,
+                true,
+                500,
+                "OUTCOME_UNKNOWN",
+                "same_operation",
+                "unknown",
+            ),
+        ];
+        for (grpc, submitted, http, code, retry, outcome) in cases {
+            let response = error_response(
+                Status::new(grpc, "case"),
+                "request-case",
+                Some("operation-case"),
+                Some("instance-case"),
+                submitted,
+            );
+            assert_eq!(response.status().as_u16(), http, "gRPC {grpc:?}");
+            assert_eq!(response.headers()["content-type"], "application/json");
+            let value = error_body(response).await;
+            assert_eq!(value["code"], http);
+            assert_eq!(value["error"]["code"], code);
+            assert_eq!(value["error"]["retry"], retry);
+            assert_eq!(value["error"]["outcome"], outcome);
+            assert_eq!(value["error"]["requestId"], "request-case");
+            assert_eq!(value["error"]["operationId"], "operation-case");
+            assert_eq!(value["error"]["instanceId"], "instance-case");
+        }
     }
 }

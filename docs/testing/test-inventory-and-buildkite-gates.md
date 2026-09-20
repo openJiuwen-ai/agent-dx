@@ -169,7 +169,7 @@ profile；完整 Multi-VM 在补齐部署器前不能标记为通过。
 | `L0-03` | 已实现 | 公共 SDK 创建和查询，真实 sandboxd/RRT 后端运行 |
 | `L0-04` | 已实现 | 命令 stdout、stderr、退出码及二进制文件往返 |
 | `L0-05` | 已实现 | 显式删除后 Redis 终态、路由、资源及 sandboxd inventory 全部清理 |
-| `L0-06` | 计划 | 同一 Instance ID 的网络超时重试，查询／同 ID 重试收敛且不产生第二后端 |
+| `L0-06` | 组件前置已实现，E2E 计划 | SDK 对断流、正常 EOF 无 final 和结构化 unknown 均以同一 Request／Instance 身份重试；原子 claim 保证唯一后端。仍需在真实代理断流下核对 SDK、Redis 和 sandboxd inventory |
 
 ### 9.2 Local Standalone
 
@@ -183,9 +183,11 @@ profile；完整 Multi-VM 在补齐部署器前不能标记为通过。
 | `ST-FC-01` | 已实现 | KVM 暂停／恢复、可复用快照、克隆和制品清理 |
 | `ST-06` | 计划 | Redis 暂停期间 SQLite 降级日志，恢复后去重补写并恢复生命周期操作 |
 | `ST-07` | 计划 | 空闲超时仅删除；活动刷新阻止误回收，TTL 不参与生命周期 |
-| `ST-08` | 计划 | 实例意外退出后的可配置重启、退避上限和最终失败状态 |
+| `ST-08` | 组件前置已实现，E2E 计划 | 实例意外退出后的 Never 清理，以及可配置重启的新 runtime identity、退避上限和最终失败状态；仍需真实 sandboxd 进程故障注入 |
 | `ST-09` | 计划 | Master、API Server、Edge 分别重启后的 epoch、全量目录和路由重同步 |
 | `ST-10` | 计划 | Node Proxy embedded／standalone 使用同一契约和相同用户结果 |
+| `ST-11` | 组件前置已实现，E2E 计划 | sandboxd daemon 重启且 runtime 保留时重连并接管原 backend，不产生第二次 Start；仍需真实 daemon 重启与资源采集过期证据 |
+| `ST-12` | 组件前置已实现，E2E 计划 | Node Manager 对账清理期间再次退出；新进程重读权威目录和 runtime inventory，完成幂等清理前保持关闭准入 |
 
 ### 9.3 Local Multi-VM
 
