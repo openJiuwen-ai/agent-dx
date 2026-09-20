@@ -58,11 +58,11 @@ git diff --check
 | [README.zh.md](../../README.zh.md) | 当前说明／源码与入口 |
 | [agent/AGENTS.md](../../agent/AGENTS.md) | 当前说明／源码与入口 |
 | [agent/README.md](../../agent/README.md) | 当前说明／源码与入口 |
-| [agent/README.zh.md](../../agent/README.zh.md) | 当前说明／源码与入口 |
-| [agent/cli/README.md](../../agent/cli/README.md) | 当前说明／源码与入口 |
-| [agent/executor/README.md](../../agent/executor/README.md) | 当前说明／源码与入口 |
-| [agent/executor/README.zh.md](../../agent/executor/README.zh.md) | 当前说明／源码与入口 |
-| [agent/sdk/python/README.md](../../agent/sdk/python/README.md) | 当前说明／源码与入口 |
+| `agent/README.zh.md`（当次基线文档，旧 Agent 目录现已清理） | 当前说明／源码与入口 |
+| `agent/cli/README.md`（当次基线文档，旧 Agent 目录现已清理） | 当前说明／源码与入口 |
+| `agent/executor/README.md`（当次基线文档，旧 Agent 目录现已清理） | 当前说明／源码与入口 |
+| `agent/executor/README.zh.md`（当次基线文档，旧 Agent 目录现已清理） | 当前说明／源码与入口 |
+| `agent/sdk/python/README.md`（当次基线文档，旧 Agent 目录现已清理） | 当前说明／源码与入口 |
 | [build/config/examples/README.md](../../build/config/examples/README.md) | 当前说明／源码与入口 |
 | [build/dev/progress.html](../../build/dev/progress.html) | 页面／结构与内容同步 |
 | [build/e2e/README.md](../../build/e2e/README.md) | 当前说明／源码与入口 |

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,101 +14,12 @@
 # limitations under the License.
 #
 
-set -e
-
-readonly USAGE="
-Usage: bash build.sh [-v VERSION] [-o OUTPUT_DIR] [-p PYTHON] [-C] [-t] [-h]
-
-Options:
-    -v  wheel version, overrides ar_cli.__version__ (via BUILD_VERSION).
-    -o  output directory for the built wheel (default: <repo>/out/wheels).
-    -p  python interpreter to use (default: python3).
-    -C  clean build/output/egg-info artifacts, then exit.
-    -t  run unit tests (pytest at repo root), then exit.
-    -h  usage.
-"
-
-BASE_DIR=$(
-    cd "$(dirname "$0")"
-    pwd
-)
-
-CLI_DIR="$BASE_DIR/agent/cli"          # ar_cli package + setup.py live here
-SDK_DIR="$BASE_DIR/agent/sdk/python"       # agent-dx SDK package
-EXECUTOR_DIR="$BASE_DIR/agent/executor" # platform Agent executor package
-BUILD_DIR="$BASE_DIR/out/build"      # intermediate build dir (setup.py -b)
-OUTPUT_DIR="$BASE_DIR/out/wheels"    # default wheel output dir
-PYTHON3_BIN_PATH="python3"
-BUILD_VERSION=""
-COMMAND="build"
-
-usage() {
-    echo -e "$USAGE"
-}
-
-while getopts 'v:o:p:Cth' opt; do
-    case "$opt" in
-    v)
-        BUILD_VERSION="${OPTARG}"
-        ;;
-    o)
-        OUTPUT_DIR=$(readlink -f "${OPTARG}")
-        ;;
-    p)
-        PYTHON3_BIN_PATH="${OPTARG}"
-        ;;
-    C)
-        COMMAND="clean"
-        ;;
-    t)
-        COMMAND="test"
-        ;;
-    h)
-        usage
-        exit 0
-        ;;
-    *)
-        echo "invalid command: -$opt" >&2
-        usage
-        exit 1
-        ;;
-    esac
-done
-
-if [ "$COMMAND" == "clean" ]; then
-    echo "Cleaning build artifacts..."
-    rm -rf "$BUILD_DIR" "$OUTPUT_DIR" \
-        "$CLI_DIR"/build "$CLI_DIR"/dist "$CLI_DIR"/*.egg-info \
-        "$SDK_DIR"/build "$SDK_DIR"/dist "$SDK_DIR"/src/*.egg-info \
-        "$EXECUTOR_DIR"/build "$EXECUTOR_DIR"/dist "$EXECUTOR_DIR"/src/*.egg-info
-    exit 0
-fi
-
-if [ "$COMMAND" == "test" ]; then
-    echo "Running unit tests (pytest)..."
-    cd "$BASE_DIR"
-    "$PYTHON3_BIN_PATH" -m pytest -q
-    exit 0
-fi
-
-# -v overrides the version baked into the wheel; otherwise setup.py falls back
-# to ar_cli.__version__.
-if [ -n "$BUILD_VERSION" ]; then
-    export BUILD_VERSION
-fi
-
-mkdir -p "$OUTPUT_DIR"
-
-# setup.py is under cli/ and uses find_packages() relative to the cwd, so it
-# must run from there; the wheel is written to OUTPUT_DIR via -d.
-cd "$CLI_DIR"
-"$PYTHON3_BIN_PATH" setup.py bdist_wheel -b "$BUILD_DIR" -d "$OUTPUT_DIR"
-
-cd "$SDK_DIR"
-"$PYTHON3_BIN_PATH" setup.py bdist_wheel -b "$BUILD_DIR/sdk" -d "$OUTPUT_DIR"
-
-cd "$EXECUTOR_DIR"
-"$PYTHON3_BIN_PATH" setup.py bdist_wheel -b "$BUILD_DIR/executor" -d "$OUTPUT_DIR"
-
-echo "Build done. Wheel(s) in: $OUTPUT_DIR"
-ls -1 "$OUTPUT_DIR"/*.whl 2>/dev/null || true
+# Agent v2 原生构建；Sandbox SDK 打包使用 make package。
+set -euo pipefail
+cd "$(dirname "$0")"
+case "${1:-}" in
+  '') exec "${CARGO:-cargo}" build --locked -p adx-agent-core -p adx-agent-store -p adx-dispatcher -p adx-agent-api -p data-plane-gateway --features data-plane-gateway/agent-api -j "${JOBS:-2}" ;;
+  -t) exec make agent-test ;;
+  -h|--help) echo '用法：bash build.sh [-t|-h]；默认构建 Rust Agent，-t 执行组件测试。Sandbox SDK 打包使用 make package。' ;;
+  *) echo '旧 Agent Python 打包入口已删除；使用 make package 打包 Sandbox SDK。' >&2; exit 2 ;;
+esac
