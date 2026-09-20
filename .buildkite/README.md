@@ -90,6 +90,12 @@ and per-Pod logs are uploaded. Secret bodies travel on stdin and are excluded
 from manifests and evidence; generated API/Redis keys are redacted from collected
 component logs.
 
+`ADX_E2E_PROFILE` selects the Kubernetes gate. The default is `k8s-basic`.
+Set it to `l0` for the minimum closure or `full` for the cross-physical-worker
+gate. `full` fails after scheduling when both platform Pods land on the same
+worker. `ADX_E2E_NODE_NAMES` may restrict eligible workers, but the recorded
+actual placement remains the acceptance evidence.
+
 Capacity checks also save Master/Node resource scrapes at allocated, queued and
 released points. The unified supervisor runs with log rotation enabled in both
 Pods. Stop checks decompress the closed gzip files, reject unfinished compression

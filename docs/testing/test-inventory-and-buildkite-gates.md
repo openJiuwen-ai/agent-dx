@@ -1,6 +1,5 @@
 # ADX 端到端用例分层与 Buildkite 门禁
 
-本文基于提交 `2e30b80e4426e5edba6af28531e267714dfb1a81` 重新整理测试分类。
 UT 与 E2E 分开管理：UT 按代码模块运行；E2E 按业务闭环和部署拓扑逐级扩展。
 
 ## 1. UT 不纳入 E2E 层级
@@ -144,15 +143,83 @@ Firecracker checkpoint 使用独立 KVM profile；GPU/NPU 使用具备真实设�
 
 | 层级 | 当前状态 | 主要缺口 |
 |---|---|---|
-| L0 | 已具备；由现有 `sdk` 和 `auth` 场景覆盖主体 | 需要从八组驱动中提供独立的 L0 选择入口和单独结果 |
-| Standalone | 已有本地 Docker 八组、安装示例、运行环境和 Lima FC 18 项，但分散在多个入口 | 需要一个统一 Standalone 结果汇总，明确普通 Linux 与 KVM profile |
-| Multi-VM | 部分具备；`gateway/tests/local_3vm_*` 覆盖数据面，FC transfer 驱动覆盖单宿主网络命名空间归属转移 | 缺完整控制面三 VM 部署器，以及发现、调度、故障、恢复和清理的统一验收 |
-| Full Deployment | 基础 K8s 八组及可观测验收已具备 | 历史运行未跨物理 worker；Master/API/Edge 重启、K8s FC、真实 GPU/NPU 仍未纳入基础结果 |
+| L0 | 已增加独立 `--profile l0`；执行 `l0 + auth`，单独输出 `required_checks`、逐项 JSON 和 JUnit | 仍需在 Buildkite 产生一次正式运行证据 |
+| Standalone | `--profile standalone` 统一本地 Docker 八组；安装示例和 Lima FC 各自有严格结果契约 | 需增加汇总清单，把普通 Linux、安装示例和按需 KVM 结果关联到同一 revision |
+| Multi-VM | 已增加三台机器 inventory 和完成结果校验契约，强制双 worker 实际放置及最终清理 | 尚缺负责生成配置、分发制品和执行场景的完整控制面三 VM 部署器；未进行真实三 VM 验收 |
+| Full Deployment | K8s 已支持 `l0`、`k8s-basic`、`full`；`full` 强制两个 Pod 位于不同物理 worker | 需产生 `full` 正式运行证据；Master/API/Edge 重启、K8s FC、真实 GPU/NPU 仍为独立扩展 profile |
 
-因此当前可以直接形成 Buildkite 门禁的是 UT、L0 和基础 K8s 八组。Standalone 可作为独立
-Linux/KVM profile；完整 Multi-VM 在补齐控制面自动化前不能标记为全量通过。
+因此当前可以直接形成 Buildkite 门禁的是 UT、L0 和基础 K8s 八组。`full` 的同宿主假绿已被
+驱动拒绝，但在实际双 worker 环境跑通前不能宣称完成。Standalone 可作为独立 Linux/KVM
+profile；完整 Multi-VM 在补齐部署器前不能标记为通过。
 
-## 9. Buildkite 门禁建议
+## 9. 新增用例规划
+
+以下 ID 用于进度页、Buildkite annotation、`result.json` 和缺口追踪。`已实现` 表示已有可执行
+断言；`计划` 表示契约已确定但尚无通过证据。新增用例必须保存调用结果、平台状态和物理后端
+三类证据，不能只保存客户端成功响应。
+
+### 9.1 L0
+
+| ID | 状态 | 用例与通过条件 |
+|---|---|---|
+| `L0-01` | 已实现 | 部署业务就绪：Master、节点容量、路由和本机绑定均可用 |
+| `L0-02` | 已实现 | 有效／无效 API Key、跨租户拒绝、管理员密钥管理及缓存过期 |
+| `L0-03` | 已实现 | 公共 SDK 创建和查询，真实 sandboxd/RRT 后端运行 |
+| `L0-04` | 已实现 | 命令 stdout、stderr、退出码及二进制文件往返 |
+| `L0-05` | 已实现 | 显式删除后 Redis 终态、路由、资源及 sandboxd inventory 全部清理 |
+| `L0-06` | 计划 | 同一 Instance ID 的网络超时重试，查询／同 ID 重试收敛且不产生第二后端 |
+
+### 9.2 Local Standalone
+
+| ID | 状态 | 用例与通过条件 |
+|---|---|---|
+| `ST-01` | 已实现 | 发布包 verify、配置 validate/render、五角色启动和 stop 清理 |
+| `ST-02` | 已实现 | EROFS、OCI、runtime-only、自定义镜像挂载内置 RRT |
+| `ST-03` | 已实现 | 容量用尽、内存队列、释放唤醒和资源 Metrics 一致 |
+| `ST-04` | 已实现 | Node Manager 新 session 对账，已运行后端身份不变 |
+| `ST-05` | 已实现 | 日志滚动压缩、Metrics、Trace、Collector 中断恢复 |
+| `ST-FC-01` | 已实现 | KVM 暂停／恢复、可复用快照、克隆和制品清理 |
+| `ST-06` | 计划 | Redis 暂停期间 SQLite 降级日志，恢复后去重补写并恢复生命周期操作 |
+| `ST-07` | 计划 | 空闲超时仅删除；活动刷新阻止误回收，TTL 不参与生命周期 |
+| `ST-08` | 计划 | 实例意外退出后的可配置重启、退避上限和最终失败状态 |
+| `ST-09` | 计划 | Master、API Server、Edge 分别重启后的 epoch、全量目录和路由重同步 |
+| `ST-10` | 计划 | Node Proxy embedded／standalone 使用同一契约和相同用户结果 |
+
+### 9.3 Local Multi-VM
+
+| ID | 状态 | 用例与通过条件 |
+|---|---|---|
+| `MV-01` | 契约已固化 | 三个唯一 machine ID，控制节点和两个 worker 完成跨 VM mTLS/Redis/RPC 就绪 |
+| `MV-02` | 契约已固化 | 实例实际落到两个 worker，保存平台 assignment 与各自 sandboxd inventory |
+| `MV-03` | 计划 | 双 worker 总容量、排队、释放唤醒及 Pack/Spread 配置 |
+| `MV-04` | 计划 | Local-first 入口轮转、原子归属、冲突拒绝及中心 fallback 不重复计账 |
+| `MV-05` | 计划 | Edge 经目标 Node Proxy/RRT 的跨 VM 命令与文件路径 |
+| `MV-06` | 计划 | worker 心跳过期使实例失效并撤路由；返回 worker 清理旧后端再准入 |
+| `MV-07` | 计划 | worker 进程重启、session fencing 和权威对账 |
+| `MV-08` | 计划 | Master/API/Edge 重启，Redis 恢复及 API Server 全量目录重同步 |
+| `MV-FC-01` | 条件计划 | 两个 KVM worker 间共享 checkpoint 恢复，同 ID 新 generation 且旧节点清理 |
+| `MV-09` | 契约已固化 | worker 先于控制节点停止，两个 backend inventory 和路由目录最终为空 |
+
+### 9.4 Full Deployment
+
+| ID | 状态 | 用例与通过条件 |
+|---|---|---|
+| `FD-01` | 已实现 | clean commit、发布包 SHA256、SDK、sandboxd revision 和镜像 digest 一致 |
+| `FD-02` | 已实现 | 独立 namespace 的 L0 全量重跑 |
+| `FD-03` | 已实现 | K8s 基础八组及逐项 JUnit、日志、事件和清理证据 |
+| `FD-04` | 已实现 | Metrics、日志、滚动压缩、Collector 重启与 Trace 父子关系 |
+| `FD-05` | 驱动已实现 | `full` profile 的两个 Pod 必须落在不同物理 worker；等待正式运行证据 |
+| `FD-06` | 计划 | Redis Pod/进程重启和持久卷 AOF 恢复，已提交实例状态不丢失 |
+| `FD-07` | 计划 | Master/API/Edge 独立故障与恢复，服务入口和目录重新收敛 |
+| `FD-08` | 计划 | worker 网络分区、心跳失效、返回清理与健康 worker 连续可用 |
+| `FD-FC-01` | 条件计划 | KVM worker 的 Firecracker pause/resume/snapshot profile |
+| `FD-XPU-01` | 条件计划 | 真实 GPU/NPU 整卡发现、过滤、分配、释放和故障清理 |
+| `FD-SOAK-01` | Nightly | 创建／执行／删除循环及反复节点故障，持续 1–24 小时无资源增长 |
+
+推荐执行频率：每次提交运行 `L0-01..05`；主分支运行 `ST-01..05` 和 `FD-01..04`；具备双物理
+worker 时把 `FD-05` 设为合入门槛；Multi-VM、FC、XPU 和长稳按 nightly、相关路径变更及发布候选触发。
+
+## 10. Buildkite 门禁建议
 
 Buildkite 保留 UT 和 E2E 两条清晰的结果线：
 

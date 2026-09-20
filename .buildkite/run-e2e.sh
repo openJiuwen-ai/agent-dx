@@ -7,6 +7,7 @@ buildkite-agent artifact download 'out/buildkite/summaries/images.json' . --step
 echo "--- :kubernetes: Deploy and run public SDK acceptance"
 buildkite-agent artifact download 'out/buildkite/bundle/*.json' . --step platform-images
 args=(--bundle out/buildkite/bundle/bundle.json --registry-images out/buildkite/bundle/registry-images.json --kubeconfig "$ADX_KUBECONFIG" --output out/buildkite/acceptance)
+args+=(--profile "${ADX_E2E_PROFILE:-k8s-basic}")
 if [[ -n ${ADX_E2E_REGISTRY_AUTH_FILE:-} && -f "$ADX_E2E_REGISTRY_AUTH_FILE" ]]; then
   args+=(--registry-auth "$ADX_E2E_REGISTRY_AUTH_FILE")
 fi

@@ -6,6 +6,8 @@ export CARGO_TARGET_DIR
 JOBS ?= 2
 OUT ?= $(CURDIR)/out
 PYTEST_ARGS ?=
+E2E_PROFILE ?= standalone
+K8S_E2E_PROFILE ?= k8s-basic
 
 .PHONY: help generate build test rust-test scheduler-bench python-test agent-test sandbox-sdk-test package ci data-plane-gateway data-plane-gateway-dev data-plane-gateway-ut
 help:
@@ -44,8 +46,8 @@ process-smoke:
 
 .PHONY: platform-e2e
 platform-e2e:
-	$(PYTHON) build/e2e/run.py --bundle "$(BUNDLE_DIR)" --output "$(EVIDENCE_DIR)"
+	$(PYTHON) build/e2e/run.py --bundle "$(BUNDLE_DIR)" --output "$(EVIDENCE_DIR)" --profile "$(E2E_PROFILE)"
 
 .PHONY: platform-k8s-e2e
 platform-k8s-e2e:
-	$(PYTHON) build/e2e/kubernetes/run.py --bundle "$(BUNDLE_DIR)/bundle.json" --registry-images "$(BUNDLE_DIR)/registry-images.json" --kubeconfig "$(KUBECONFIG)" --output "$(EVIDENCE_DIR)"
+	$(PYTHON) build/e2e/kubernetes/run.py --bundle "$(BUNDLE_DIR)/bundle.json" --registry-images "$(BUNDLE_DIR)/registry-images.json" --kubeconfig "$(KUBECONFIG)" --output "$(EVIDENCE_DIR)" --profile "$(K8S_E2E_PROFILE)"

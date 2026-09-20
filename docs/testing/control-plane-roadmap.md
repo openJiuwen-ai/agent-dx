@@ -43,6 +43,7 @@
 | 阶段 | 具体剩余项 | 当前限制 |
 | --- | --- | --- |
 | 5 | 双克隆网络故障修复及完整FC复验；GPU/NPU真实设备、真实服务混合长稳验收 | HTTP/SDK放置约束已接线；r21/r22双克隆出现FDB错误端口学习及CONNECT超时，待修复。本机FC环境没有实际GPU/NPU卡。 |
+| 7 | 独立 L0 正式证据、完整控制面三 VM、跨物理 worker Full K8s，以及 Redis/组件重启等韧性扩展 | L0/full profile 与三 VM 结果契约已接入；历史 #30 是同物理 worker 的 k8s-basic，三 VM 部署执行器尚未完成。用例编号和门禁见 [测试分层](test-inventory-and-buildkite-gates.md)。 |
 | 12 | 使用新的 EROFS/OCI 运行环境入口复验 Firecracker 创建与快照恢复 | 基础 K8s OCI 三模式已通过；正式 K8s FC profile 按决定暂缓，先保留本地 KVM 验收。 |
 
 ## 已登记待办

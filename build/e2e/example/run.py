@@ -14,9 +14,11 @@ if ROOT.exists() or any(p.exists() or p.is_symlink() for p in INSTALL) or SOCKET
 env={**os.environ,'PATH':f'/opt/adx-fc/bin:{BASE}/tools:'+os.environ['PATH'],
      'NO_PROXY':'127.0.0.1,localhost,10.88.0.0/16','no_proxy':'127.0.0.1,localhost,10.88.0.0/16'}
 ROOT.mkdir(parents=True);E=ROOT/'evidence';E.mkdir();children=[];created=[]
-result={'status':'failed','cases':[],'cleanup_errors':[]}
+result={'status':'failed','profile':'standalone','deployment':'process','required_checks':list(CASES),
+        'checks':[],'missing_checks':list(CASES),'cases':[],'cleanup_errors':[]}
 def event(index,**data):
-    result['cases'].append({'name':CASES[index],'passed':True,**data});print('PASS',CASES[index],flush=True)
+    name=CASES[index];result['cases'].append({'name':name,'passed':True,**data});result['checks'].append(name)
+    result['missing_checks']=[case for case in CASES if case not in result['checks']];print('PASS',name,flush=True)
 def call(args,**kw):return subprocess.run(list(map(str,args)),env=env,check=True,**kw)
 def output(args):return subprocess.check_output(list(map(str,args)),env=env,text=True,timeout=15)
 def spawn(name,args):

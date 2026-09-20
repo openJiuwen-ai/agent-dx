@@ -23,6 +23,11 @@ spec.loader.exec_module(common)
 sys.path.insert(0, str(HERE))
 from manifest import LABEL, resources
 
+def validate_physical_placement(placement, required):
+    hosts={item['host'] for item in placement}
+    if required and len(hosts) < 2:
+        raise RuntimeError('full profile requires two distinct Kubernetes workers')
+
 
 def identity(bundle, registry, commit=None, ci=False):
     m = json.loads(bundle.read_text())
@@ -94,7 +99,7 @@ class KubernetesRun(common.Run):
     def execute(self, node, *args, timeout=180):
         return self.kube('-n', self.id, 'exec', node, '-c', 'platform', '--', *args, timeout=timeout)
 
-    def deploy(self, m, refs, data, registry_auth=None, node_names=()):
+    def deploy(self, m, refs, data, registry_auth=None, node_names=(), require_distinct_workers=False):
         print('--- Kubernetes deployment', flush=True)
         self.event('[DEPLOY] namespace=' + self.id + '; eligible nodes=' + ','.join(node_names))
         # Check credentials/connectivity before creating any test resource.
@@ -126,6 +131,7 @@ class KubernetesRun(common.Run):
         pods = json.loads(self.kube('-n', self.id, 'get', 'pods', '-o', 'json'))['items']
         placement = [{'pod': p['metadata']['name'], 'host': p['spec']['nodeName'],
                       'ip': p['status']['podIP']} for p in pods]
+        validate_physical_placement(placement, require_distinct_workers)
         (self.output / 'placement.json').write_text(json.dumps(placement, indent=2) + '\n')
         print('Kubernetes placement: ' + json.dumps(placement), flush=True)
         edge_pod = next(p for p in pods if p['metadata']['name'] == 'node1')
@@ -196,24 +202,7 @@ class KubernetesRun(common.Run):
 
 
 def write_junit(path, report):
-    suite = ET.Element('testsuite', name='platform-kubernetes-e2e')
-    records = {case['name']: case for case in report['cases']}
-    for name in ('sdk', 'auth', 'capacity', 'placement', 'local-first', 'node-failure', 'restart', 'stop'):
-        record = records.get(name)
-        case = ET.SubElement(suite, 'testcase', name=name, time=str(record['seconds'] if record else 0))
-        if not record:
-            ET.SubElement(case, 'skipped').text = 'Not reached; see acceptance error'
-        elif record['status'] != 'passed':
-            ET.SubElement(case, 'failure').text = record.get('error', 'case failed')
-    cleanup = ET.SubElement(suite, 'testcase', name='cleanup')
-    if report['cleanup_errors']:
-        ET.SubElement(cleanup, 'failure').text = '\n'.join(report['cleanup_errors'])
-    if report['error'] and not any(c['status'] == 'failed' for c in report['cases']):
-        ET.SubElement(ET.SubElement(suite, 'testcase', name='deployment'), 'failure').text = report['error']
-    suite.set('tests', str(len(suite)))
-    suite.set('failures', str(len(suite.findall('testcase/failure'))))
-    suite.set('skipped', str(len(suite.findall('testcase/skipped'))))
-    ET.ElementTree(suite).write(path, encoding='utf-8', xml_declaration=True)
+    common.write_junit(path, report, 'platform-kubernetes-e2e')
 
 
 def main():
@@ -223,11 +212,12 @@ def main():
     p.add_argument('--context')
     p.add_argument('--node-name', action='append', default=[], help='eligible Kubernetes node; repeat for a pool')
     p.add_argument('--registry-auth', type=Path)
+    p.add_argument('--profile', choices=('l0','k8s-basic','full'), default='k8s-basic')
     a = p.parse_args()
     output = a.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
     run = KubernetesRun(output, a.kubeconfig, a.context)
-    checks = []
+    checks = [];required=common.required_for_profile(a.profile)
     error = None
     def cancel(signum, frame):
         raise InterruptedError(f'canceled by signal {signum}')
@@ -244,8 +234,9 @@ def main():
             if not re.fullmatch(r'[^\s]+@sha256:[0-9a-f]{64}', user_image):
                 raise ValueError('immutable custom user image required')
             data = credentials(Path(private), user_image, published['references']['rrt'])
-            run.deploy(m, published['references'], data, a.registry_auth, a.node_name)
-            run.scenarios(checks)
+            run.deploy(m, published['references'], data, a.registry_auth, a.node_name,
+                       require_distinct_workers=a.profile == 'full')
+            run.scenarios(checks,required)
         except Exception as e:
             error = f'{type(e).__name__}: {e}'
             run.event('[FAIL] Kubernetes acceptance: ' + error)
@@ -253,8 +244,8 @@ def main():
             for sig in (signal.SIGTERM, signal.SIGINT):
                 signal.signal(sig, signal.SIG_IGN)
             cleanup_errors = run.cleanup()
-    report = common.finish_report(error, cleanup_errors, checks)
-    report.update(run_id=run.id, deployment='kubernetes', cases=run.case_results)
+    report = common.finish_report(error, cleanup_errors, checks,required)
+    report.update(run_id=run.id, deployment='kubernetes', profile=a.profile, cases=run.case_results)
     (output / 'result.json').write_text(json.dumps(report, indent=2) + '\n')
     write_junit(output / 'junit.xml', report)
     print('--- Kubernetes acceptance result', flush=True)
@@ -262,7 +253,7 @@ def main():
         run.event(f"[{'PASS' if case['status'] == 'passed' else 'FAIL'}] {case['name']} ({case['seconds']:.3f}s)")
     for name in report['missing_checks']:
         run.event('[NOT RUN] ' + name)
-    run.event(f"[RESULT] {report['status'].upper()}: {len(checks)}/{len(common.REQUIRED)} cases passed; cleanup_errors={len(cleanup_errors)}")
+    run.event(f"[RESULT] {report['status'].upper()}: {len(checks)}/{len(required)} cases passed; cleanup_errors={len(cleanup_errors)}")
     print(json.dumps(report), flush=True)
     return 0 if report['status'] == 'passed' else 1
 
