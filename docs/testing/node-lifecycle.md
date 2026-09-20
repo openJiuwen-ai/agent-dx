@@ -51,7 +51,7 @@ Rust 用例位于 Node Manager 的 `journal.rs`、`resources.rs`、`pause_resume
 
 `build/e2e/firecracker/sdk_node_lifecycle.py` 在显式指定的 Linux 测试部署中通过公共 SDK 验证后端异常退出重启、Master 失联空闲删除、SQLite 日志、节点进程重启等待、恢复补写和资源源断开。脚本中的 Redis／backend 查询是验收证据，生命周期正常操作仍使用公共 API。
 
-后端首次启动使用独立的 `runtime_ready_timeout_seconds`（默认 120 秒）；日常 `rpc_timeout_seconds` 控制单次 RPC，避免后端资源初始化时间挤占日常故障降级预算。
+后端首次启动使用独立的 `runtime_ready_timeout_seconds`（默认 120 秒）作为单轮就绪探测窗口。连接失败或一轮探测超时后，Node Manager 按 `report_interval_seconds` 继续等待外部 sandboxd；等待期间不注册节点、不启动 RPC 服务，也不开放实例准入。配置错误仍立即退出。日常 `rpc_timeout_seconds` 只控制单次 RPC，避免后端资源初始化时间挤占日常故障降级预算。
 
 ## 本地验收（2026-09-16）
 

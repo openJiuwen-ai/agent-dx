@@ -45,6 +45,7 @@ struct State {
     live: BTreeMap<String, LiveNode>,
     recovering: BTreeMap<String, tokio::time::Instant>,
     retired_sessions: BTreeSet<(String, String)>,
+    scheduling_deadlines: BTreeMap<String, tokio::time::Instant>,
 }
 impl State {
     fn overdue(&self, id: &str, timeout: Duration) -> bool {
@@ -173,6 +174,15 @@ struct Inner {
     timeout: Duration,
     heartbeat_timeout: Duration,
 }
+
+fn scheduling_timeout(seconds: u64) -> Option<Duration> {
+    let seconds = if seconds == 0 { 30 } else { seconds };
+    if seconds > 86_400 {
+        return None;
+    }
+    Some(Duration::from_secs(seconds))
+}
+
 #[derive(Clone)]
 pub struct MasterRpc(Arc<Inner>);
 impl MasterRpc {
@@ -261,6 +271,7 @@ impl MasterRpc {
                 live: BTreeMap::new(),
                 recovering,
                 retired_sessions: BTreeSet::new(),
+                scheduling_deadlines: BTreeMap::new(),
             }),
             changed: Notify::new(),
             peers,
@@ -323,7 +334,12 @@ impl MasterRpc {
         (actual.node_id == r.node_id && actual.session_id == r.session_id).then_some(predecessor)
     }
 
-    async fn create(&self, spec: InstanceSpec) -> std::result::Result<pb::InstanceResult, Status> {
+    async fn create(
+        &self,
+        spec: InstanceSpec,
+        schedule_timeout: Duration,
+    ) -> std::result::Result<pb::InstanceResult, Status> {
+        let mut schedule_deadline = None;
         loop {
             let changed = self.0.changed.notified();
             tokio::pin!(changed);
@@ -331,12 +347,25 @@ impl MasterRpc {
             let mut state = self.0.state.lock().await;
             state.recover_claim_write().await.map_err(status)?;
             state.healthy().map_err(status)?;
+            if schedule_deadline.is_some_and(|deadline| {
+                tokio::time::Instant::now() >= deadline && !state.specs.contains_key(&spec.id)
+            }) {
+                return Err(Status::deadline_exceeded(
+                    "central scheduling queue deadline exceeded; retry the same Instance ID",
+                ));
+            }
             if let Some(existing) = state.specs.get(&spec.id) {
                 if existing != &spec {
                     return Err(Status::already_exists(
                         "instance ID has a different specification",
                     ));
                 }
+                schedule_deadline.get_or_insert_with(|| {
+                    *state
+                        .scheduling_deadlines
+                        .entry(spec.id.clone())
+                        .or_insert_with(|| tokio::time::Instant::now() + schedule_timeout)
+                });
             } else {
                 if let Some(id) = &spec.snapshot_id {
                     state
@@ -367,6 +396,9 @@ impl MasterRpc {
                     return Err(status(error));
                 }
                 state.specs.insert(spec.id.clone(), spec.clone());
+                let deadline = tokio::time::Instant::now() + schedule_timeout;
+                state.scheduling_deadlines.insert(spec.id.clone(), deadline);
+                schedule_deadline.get_or_insert(deadline);
             }
             let drive = state.drive().await;
             if drive.as_ref().is_err() || drive.as_ref().is_ok_and(|progress| *progress) {
@@ -374,6 +406,7 @@ impl MasterRpc {
             }
             let progress = drive.map_err(status)?;
             if state.instances.contains_key(&spec.id) {
+                state.scheduling_deadlines.remove(&spec.id);
                 // Recheck storage session before using a cached assignment.
                 let stored = state.session.get(&spec.id).await.map_err(status)?;
                 if stored.invalidated || stored.recovery.as_ref().is_some_and(|r| r.pending) {
@@ -488,12 +521,50 @@ impl MasterRpc {
                 return Ok(result);
             }
             drop(state);
+            let deadline = schedule_deadline.expect("submitted request has a queue deadline");
             if progress {
                 tokio::task::yield_now().await;
             } else {
-                changed.await;
+                if tokio::time::timeout_at(deadline, changed).await.is_ok() {
+                    continue;
+                }
+                if self.expire_pending(&spec, deadline).await? {
+                    return Err(Status::deadline_exceeded(
+                        "central scheduling queue deadline exceeded; retry the same Instance ID",
+                    ));
+                }
             }
         }
+    }
+
+    async fn expire_pending(
+        &self,
+        spec: &InstanceSpec,
+        deadline: tokio::time::Instant,
+    ) -> std::result::Result<bool, Status> {
+        let mut state = self.0.state.lock().await;
+        if state.instances.contains_key(&spec.id)
+            || state.scheduling_deadlines.get(&spec.id) != Some(&deadline)
+            || !state.scheduler.cancel_pending(&spec.id)
+        {
+            return Ok(false);
+        }
+        state.specs.remove(&spec.id);
+        state.scheduling_deadlines.remove(&spec.id);
+        if let Some(snapshot_id) = &spec.snapshot_id {
+            state
+                .session
+                .release_snapshot(
+                    snapshot_id,
+                    adx_core::snapshots::Reference::Restore {
+                        instance_id: spec.id.clone(),
+                    },
+                )
+                .await
+                .map_err(status)?;
+        }
+        self.0.changed.notify_waiters();
+        Ok(true)
     }
     async fn commit(&self, record: InstanceRecord, session_id: String) -> Result<InstanceRecord> {
         let mut state = self.0.state.lock().await;
@@ -659,16 +730,29 @@ impl pb::master_service_server::MasterService for MasterRpc {
         let Principal::Node(node) = self.0.peers.authenticate(&request)? else {
             return Err(Status::permission_denied("Node Manager required"));
         };
-        let prepared = self.prepare_local(&node, request.into_inner()).await?;
+        let request = request.into_inner();
+        let schedule_timeout = scheduling_timeout(
+            request
+                .create
+                .as_ref()
+                .map_or(0, |create| create.schedule_timeout_seconds),
+        )
+        .ok_or_else(|| Status::invalid_argument("schedule timeout must not exceed 24 hours"))?;
+        let prepared = self.prepare_local(&node, request).await?;
         let spec = prepared
             .spec
             .ok_or_else(|| Status::internal("missing prepared spec"))?
             .try_into()
             .map_err(status)?;
         let service = self.clone();
-        tokio::spawn(trace.run(async move { service.create(spec).await.map(Response::new) }))
-            .await
-            .map_err(|_| Status::internal("forwarded creation task failed"))?
+        tokio::spawn(trace.run(async move {
+            service
+                .create(spec, schedule_timeout)
+                .await
+                .map(Response::new)
+        }))
+        .await
+        .map_err(|_| Status::internal("forwarded creation task failed"))?
     }
 
     async fn inspect_node(
@@ -905,6 +989,10 @@ impl pb::master_service_server::MasterService for MasterRpc {
                     return Err(Status::permission_denied("Frontend caller required"));
                 }
                 let r = request.into_inner();
+                let schedule_timeout =
+                    scheduling_timeout(r.schedule_timeout_seconds).ok_or_else(|| {
+                        Status::invalid_argument("schedule timeout must not exceed 24 hours")
+                    })?;
                 let raw = r
                     .spec
                     .ok_or_else(|| Status::invalid_argument("spec required"))?;
@@ -918,10 +1006,14 @@ impl pb::master_service_server::MasterService for MasterRpc {
                         .map_err(status)?
                 };
                 let service = self.clone();
-                tokio::spawn(
-                    adx_observability::trace::Trace::child("master.create")
-                        .run(async move { service.create(spec).await.map(Response::new) }),
-                )
+                tokio::spawn(adx_observability::trace::Trace::child("master.create").run(
+                    async move {
+                        service
+                            .create(spec, schedule_timeout)
+                            .await
+                            .map(Response::new)
+                    },
+                ))
                 .await
                 .map_err(|_| Status::internal("creation task failed"))?
             })
@@ -993,5 +1085,17 @@ impl pb::master_service_server::MasterService for MasterRpc {
                 .map_err(|_| Status::internal("commit task failed"))?
             })
             .await
+    }
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+
+    #[test]
+    fn central_queue_timeout_has_a_bounded_default() {
+        assert_eq!(scheduling_timeout(0), Some(Duration::from_secs(30)));
+        assert_eq!(scheduling_timeout(7), Some(Duration::from_secs(7)));
+        assert_eq!(scheduling_timeout(86_401), None);
     }
 }

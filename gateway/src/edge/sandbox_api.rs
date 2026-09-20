@@ -496,6 +496,8 @@ impl Sandbox for PlatformSandbox {
             .create_instance(pb::CreateInstanceRequest {
                 spec: Some(spec),
                 caller: Some(caller(&request.tenant)),
+                schedule_timeout_seconds: 30,
+                create_timeout_seconds: 90,
             })
             .await
         {

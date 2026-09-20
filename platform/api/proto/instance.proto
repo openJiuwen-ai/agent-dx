@@ -58,7 +58,14 @@ message RegisterNodeRequest {
 
 message RegisterNodeResponse { uint32 shard_id = 1; uint64 master_epoch = 2; }
 
-message CreateInstanceRequest { InstanceSpec spec = 1; CallerContext caller = 2; }
+message CreateInstanceRequest {
+  InstanceSpec spec = 1;
+  CallerContext caller = 2;
+  // Bounds only time waiting for a central scheduling assignment.
+  uint64 schedule_timeout_seconds = 3;
+  // Bounds the complete public create operation across local or central paths.
+  uint64 create_timeout_seconds = 4;
+}
 
 message GetInstanceRequest { string instance_id = 1; CallerContext caller = 2; }
 
