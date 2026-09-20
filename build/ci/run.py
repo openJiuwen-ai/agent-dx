@@ -25,7 +25,7 @@ def commands_for(suite, output, jobs):
         return [[python, "-m", "unittest", "discover", "-s", "build/ci/tests", "-v"]]
     if suite == "rust":
         cargo = os.environ.get("CARGO", "cargo")
-        return [[cargo, "--version"], make + ["rust-test"]]
+        return [[cargo, "--version"], make + ["rust-check", "rust-test"]]
     if suite in ("control-rpc", "api-control"):
         if suite == "api-control" and (not Path(os.environ.get("ADX_TEST_API_SERVER", "")).is_file() or not os.access(os.environ.get("ADX_TEST_API_SERVER", ""), os.X_OK)):
             raise ValueError("api-control requires ADX_TEST_API_SERVER executable")

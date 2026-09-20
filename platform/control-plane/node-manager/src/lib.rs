@@ -313,7 +313,11 @@ impl NodeManager {
         let until = Instant::now()
             .checked_add(valid_for)
             .ok_or_else(|| Error::Invalid("capacity lifetime overflow".into()))?;
-        let mut admission = self.services.admission.lock().unwrap();
+        let mut admission = self
+            .services
+            .admission
+            .lock()
+            .expect("shared state lock poisoned");
         admission.ledger.set_capacity(resources);
         admission.valid_until = Some(until);
         Ok(())
@@ -328,7 +332,11 @@ impl NodeManager {
         let until = Instant::now()
             .checked_add(valid_for)
             .ok_or_else(|| Error::Invalid("device lifetime overflow".into()))?;
-        let mut admission = self.services.admission.lock().unwrap();
+        let mut admission = self
+            .services
+            .admission
+            .lock()
+            .expect("shared state lock poisoned");
         admission.devices.update(devices)?;
         admission.devices_valid_until = Some(until);
         Ok(())
@@ -346,18 +354,30 @@ impl NodeManager {
     }
 
     pub fn set_maintenance(&self, maintenance: bool) {
-        self.services.admission.lock().unwrap().maintenance = maintenance;
+        self.services
+            .admission
+            .lock()
+            .expect("shared state lock poisoned")
+            .maintenance = maintenance;
     }
 
     pub fn set_pressure(&self, under_pressure: bool) {
-        self.services.admission.lock().unwrap().pressure = under_pressure;
+        self.services
+            .admission
+            .lock()
+            .expect("shared state lock poisoned")
+            .pressure = under_pressure;
     }
 
     pub fn accepting_allocations(&self) -> bool {
         if !self.lifecycle_ready.try_read().is_ok_and(|ready| *ready) {
             return false;
         }
-        let admission = self.services.admission.lock().unwrap();
+        let admission = self
+            .services
+            .admission
+            .lock()
+            .expect("shared state lock poisoned");
         !admission.maintenance
             && !admission.pressure
             && admission
@@ -366,7 +386,12 @@ impl NodeManager {
     }
 
     pub fn used(&self) -> Resources {
-        self.services.admission.lock().unwrap().ledger.used()
+        self.services
+            .admission
+            .lock()
+            .expect("shared state lock poisoned")
+            .ledger
+            .used()
     }
 
     pub fn instance(&self, spec: InstanceSpec, assignment: Assignment) -> Result<InstanceHandle> {
@@ -384,13 +409,13 @@ impl NodeManager {
         if self
             .retired_generations
             .lock()
-            .unwrap()
+            .expect("shared state lock poisoned")
             .get(&spec.id)
             .is_some_and(|g| assignment.generation <= *g)
         {
             return Err(Error::Conflict);
         }
-        let mut instances = self.instances.lock().unwrap();
+        let mut instances = self.instances.lock().expect("shared state lock poisoned");
         if let Some((existing, owner, handle)) = instances.get(&spec.id) {
             return if *existing == spec && *owner == assignment {
                 Ok(handle.clone())
@@ -422,7 +447,7 @@ impl NodeManager {
         let handles: Vec<_> = self
             .instances
             .lock()
-            .unwrap()
+            .expect("shared state lock poisoned")
             .values()
             .map(|(_, _, h)| h.clone())
             .collect();
@@ -448,7 +473,7 @@ impl NodeManager {
         let handles: Vec<_> = self
             .instances
             .lock()
-            .unwrap()
+            .expect("shared state lock poisoned")
             .values()
             .map(|(_, _, h)| h.clone())
             .collect();

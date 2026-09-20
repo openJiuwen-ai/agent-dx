@@ -75,6 +75,8 @@ impl Runtime {
         let tunnel_port = tunnel_listener.local_addr().unwrap().port();
         let fifo = temp.path().join("handoff");
         let name = CString::new(fifo.to_str().unwrap()).unwrap();
+        // SAFETY: name is NUL terminated and remains valid for the call; mkfifo does not retain
+        // the pointer.
         assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
         let writer = Some(
             OpenOptions::new()

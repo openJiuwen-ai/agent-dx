@@ -35,7 +35,7 @@ impl ActivityReceiver {
     pub fn active_streams(&self, instance: &str) -> Option<u64> {
         self.snapshot
             .lock()
-            .unwrap()
+            .expect("shared state lock poisoned")
             .as_ref()
             .filter(|snapshot| snapshot.received.elapsed() < self.max_age)
             .map(|snapshot| snapshot.counts.get(instance).copied().unwrap_or(0))
@@ -59,7 +59,7 @@ impl ActivityReceiver {
                 ));
             }
         }
-        let mut current = self.snapshot.lock().unwrap();
+        let mut current = self.snapshot.lock().expect("shared state lock poisoned");
         if let Some(old) = current.as_ref() {
             if request.sequence < old.sequence {
                 return Ok(ActivityAcknowledgement {

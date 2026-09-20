@@ -8,7 +8,7 @@ impl NodeRpc {
             .manager
             .local_holds
             .lock()
-            .unwrap()
+            .expect("shared state lock poisoned")
             .values()
             .map(|hold| hold.spec.clone())
             .collect();
@@ -16,7 +16,7 @@ impl NodeRpc {
             let busy = self
                 .entry_locks
                 .lock()
-                .unwrap()
+                .expect("shared state lock poisoned")
                 .get(&spec.id)
                 .is_some_and(|lock| lock.strong_count() > 0);
             if busy {
@@ -61,7 +61,7 @@ impl NodeRpc {
             .as_ref()
             .ok_or_else(|| Status::unavailable("local-first entry is not configured"))?;
         let lock = {
-            let mut locks = self.entry_locks.lock().unwrap();
+            let mut locks = self.entry_locks.lock().expect("shared state lock poisoned");
             locks.retain(|_, lock| lock.strong_count() > 0);
             if let Some(lock) = locks.get(&raw.id).and_then(std::sync::Weak::upgrade) {
                 lock
@@ -77,7 +77,11 @@ impl NodeRpc {
             return Err(Status::unavailable("node is reconciling or draining"));
         }
         let spec: adx_core::InstanceSpec = if raw.snapshot_id.is_some() {
-            let mut client = sink.client.read().unwrap().clone();
+            let mut client = sink
+                .client
+                .read()
+                .expect("shared state lock poisoned")
+                .clone();
             tokio::time::timeout(
                 sink.timeout,
                 client.prepare_create(adx_observability::trace::inject(request.clone())),
@@ -113,7 +117,11 @@ impl NodeRpc {
         };
         let mut answer = Err(Status::unavailable("claim unavailable"));
         for _ in 0..2 {
-            let mut client = sink.client.read().unwrap().clone();
+            let mut client = sink
+                .client
+                .read()
+                .expect("shared state lock poisoned")
+                .clone();
             answer = match tokio::time::timeout(
                 sink.timeout,
                 client.claim_instance(adx_observability::trace::inject(claim.clone())),
@@ -215,7 +223,11 @@ impl NodeRpc {
         sink: &MasterStateSink,
         request: pb::LocalCreateRequest,
     ) -> std::result::Result<Response<pb::InstanceResult>, Status> {
-        let mut client = sink.client.read().unwrap().clone();
+        let mut client = sink
+            .client
+            .read()
+            .expect("shared state lock poisoned")
+            .clone();
         tokio::time::timeout(
             sink.timeout,
             client.forward_create(adx_observability::trace::inject(request)),

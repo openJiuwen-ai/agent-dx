@@ -74,7 +74,10 @@ impl RedisDiscovery {
             if guard.is_none() {
                 *guard = Some(self.client.get_multiplexed_async_connection().await?);
             }
-            let mut connection = guard.as_ref().unwrap().clone();
+            let mut connection = guard
+                .as_ref()
+                .expect("connection is initialized above")
+                .clone();
             drop(guard);
             redis::cmd("EVAL")
                 .arg("return {redis.call('GET', KEYS[1]), redis.call('HGET', KEYS[2], 'header')}")

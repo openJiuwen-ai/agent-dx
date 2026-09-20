@@ -77,7 +77,10 @@ impl Operations {
         }
         let c = &self.clients;
         let mut owner = c.owner(id, caller, false).await?;
-        let record = owner.record.as_ref().unwrap();
+        let record = owner
+            .record
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("instance directory returned no record"))?;
         if kind == Kind::Delete
             && record.state == pb::InstanceState::Deleted as i32
             && !record.resources_held
@@ -101,7 +104,9 @@ impl Operations {
                     .filter(|op| op.id == request_id && op.kind == kind.code())
                     .map_or(record.revision, |op| op.expected_revision);
                 let op = Arc::new(Mutex::new(Operation {
-                    assignment: record.assignment.clone().unwrap(),
+                    assignment: record.assignment.clone().ok_or_else(|| {
+                        Status::unavailable("instance record returned no assignment")
+                    })?,
                     expected,
                     kind,
                     body: body.clone(),

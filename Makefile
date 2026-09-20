@@ -8,14 +8,21 @@ OUT ?= $(CURDIR)/out
 PYTEST_ARGS ?=
 E2E_PROFILE ?= standalone
 K8S_E2E_PROFILE ?= k8s-basic
+RUST_POLICY_PACKAGES := -p adx-api-server -p adx-control-cli -p adx-master \
+	-p adx-node-manager -p adx-core -p adx-discovery -p adx-observability \
+	-p adx-protocol -p adx-scheduling
 
-.PHONY: help generate build test rust-test scheduler-bench python-test agent-test sandbox-sdk-test package ci data-plane-gateway data-plane-gateway-dev data-plane-gateway-ut
+.PHONY: help generate build test rust-check rust-test scheduler-bench python-test agent-test sandbox-sdk-test package ci data-plane-gateway data-plane-gateway-dev data-plane-gateway-ut
 help:
-	@echo 'generate | build | test | package | ci SUITE=<suite>; tests: rust-test scheduler-bench python-test'
+	@echo 'generate | build | test | package | ci SUITE=<suite>; tests: rust-check rust-test scheduler-bench python-test'
 generate:
 	$(CARGO) check --locked -p adx-protocol -j $(JOBS)
 build: generate
 	$(CARGO) build --locked --workspace --all-features -j $(JOBS)
+rust-check:
+	$(CARGO) fmt --all -- --check
+	$(CARGO) clippy --locked --workspace --all-features --all-targets -j $(JOBS) -- -D warnings
+	$(CARGO) clippy --locked --no-deps --all-features --lib --bins -j $(JOBS) $(RUST_POLICY_PACKAGES) -- -D clippy::unwrap_used
 rust-test:
 	$(CARGO) test --locked --workspace --all-features -j $(JOBS) -- --test-threads=$(JOBS)
 scheduler-bench:
@@ -27,7 +34,7 @@ sandbox-sdk-test:
 	PYTHONPATH=platform/sdk/sandbox/python $(PYTHON) -m pytest -q -c platform/sdk/sandbox/pytest.ini platform/sdk/sandbox/python/tests $(PYTEST_ARGS)
 ci:
 	$(PYTHON) build/ci/run.py $(SUITE) --jobs $(JOBS)
-test: rust-test python-test
+test: rust-check rust-test python-test
 package:
 	bash build.sh -p '$(PYTHON)' -o '$(OUT)/wheels'
 	PYTHON='$(PYTHON)' bash platform/sdk/sandbox/python/build.sh '$(OUT)/wheels'

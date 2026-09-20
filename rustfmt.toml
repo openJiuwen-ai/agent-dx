@@ -1,0 +1,6 @@
+edition = "2021"
+hard_tabs = false
+max_width = 100
+newline_style = "Unix"
+use_field_init_shorthand = false
+use_try_shorthand = true

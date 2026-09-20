@@ -24,10 +24,11 @@ Master 内 Global 轮转选择 Shard，Shard 执行实际调度；Node Manager �
 - [配置示例](build/config/examples/README.md) · [进程托管与停止清理](docs/testing/process-deployment.md)
 - [Sandbox API 支持范围](platform/control-plane/api-server/docs/sandbox-lifecycle-api.md) · [Python SDK](platform/sdk/sandbox/python/README.md)
 - [构建与测试入口](docs/testing/control-plane-ci.md) · [Buildkite K8s 流水线](.buildkite/README.md)
+- [Rust 编码规范与门禁](docs/development/rust-coding-guidelines.md)
 - [当前实现](docs/testing/control-plane-implementation.md) · [目录与职责](docs/architecture/repository-layout.md) · [来源版本](docs/migration/sources.json)
 - [Metrics](docs/testing/instance-resource-metrics.md) · [日志采集](docs/testing/log-collection.md) · [Trace](docs/testing/distributed-traces.md) · [日志滚动压缩](docs/testing/log-rotation.md)
 
-根目录 `make help` 查看构建入口；Rust 使用 Cargo workspace，Python 包独立构建。`python3 build/ci/run.py <suite>` 运行组件检查，`make package` 生成四个 Python 包；统一进程发布包由 `build/release/package.py` 汇总。运行环境独立托管 sandboxd。
+根目录 `make help` 查看构建入口；Rust 使用 Cargo workspace，提交前运行 `make rust-check` 检查格式、严格 Clippy 及控制面生产代码的 `unwrap` 门禁。Python 包独立构建。`python3 build/ci/run.py <suite>` 运行组件检查，`make package` 生成四个 Python 包；统一进程发布包由 `build/release/package.py` 汇总。运行环境独立托管 sandboxd。
 
 ## 验收状态
 

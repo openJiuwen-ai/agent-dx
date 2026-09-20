@@ -143,8 +143,10 @@ impl Api {
             return match Box::pin(self.keys(&method, &path, &query, body, &caller)).await {
                 Ok((status, data)) => {
                     let mut r = plain(status, data);
-                    r.headers_mut()
-                        .insert("cache-control", "no-store".parse().unwrap());
+                    r.headers_mut().insert(
+                        "cache-control",
+                        hyper::header::HeaderValue::from_static("no-store"),
+                    );
                     r
                 }
                 Err(e) => plain(status_code(&e), json!({"error":e.message()})),
@@ -156,11 +158,18 @@ impl Api {
             };
             return match Box::pin(self.clients.owner(id, &caller, false)).await {
                 Ok(v) => {
-                    let r = v.record.unwrap();
+                    let Some(r) = v.record else {
+                        return plain(
+                            502,
+                            json!({"error":"instance directory returned no record"}),
+                        );
+                    };
                     if r.state == pb::InstanceState::Deleted as i32 {
                         return plain(404, json!({"error":"Not Found"}));
                     }
-                    let spec = r.spec.unwrap();
+                    let Some(spec) = r.spec else {
+                        return plain(502, json!({"error":"instance record returned no spec"}));
+                    };
                     let resource = spec.resources.unwrap_or_default();
                     plain(
                         200,
@@ -183,7 +192,9 @@ impl Api {
                     .and_then(Value::as_str)
                     .is_some_and(|v| matches!(v, "rust" | "rrt" | "rrt-runtime"))
             {
-                input.as_object_mut().unwrap().remove("runtime");
+                if let Some(object) = input.as_object_mut() {
+                    object.remove("runtime");
+                }
             }
             let spec = match contract::create_spec_with_environment(
                 input.clone(),
@@ -203,7 +214,7 @@ impl Api {
                         StreamBody::new(tokio_stream::wrappers::ReceiverStream::new(receiver))
                             .boxed_unsync(),
                     )
-                    .unwrap();
+                    .expect("static event-stream response is valid");
                 let parent = trace::Trace::child("api_server.create_stream");
                 tokio::spawn(parent.run(async move{
      if sender.send(Ok(sse("accepted",json!({"status":"creating","requestId":request_id})))).await.is_err(){return;}
@@ -288,7 +299,10 @@ impl Api {
             return Err(Status::invalid_argument("request ID too long"));
         }
         let key = (caller.tenant_id.clone(), request_id.to_string());
-        let digest = Sha256::digest(serde_json::to_vec(&input).unwrap()).to_vec();
+        let digest = Sha256::digest(
+            serde_json::to_vec(&input).expect("serde_json::Value serialization is infallible"),
+        )
+        .to_vec();
         let op = {
             let mut creates = self.creates.lock().await;
             creates.retain(|_, v| {
@@ -341,7 +355,8 @@ impl Api {
    let budget=Duration::from_secs(contract::create_timeout(&input)?).min(self.clients.config.timeout());
    let result=self.clients.create_instance(pb::CreateInstanceRequest{spec:Some(op.spec.clone()),caller:Some(caller.clone())},budget).await?;
    authorize(caller,result.record.as_ref())?;
-   let r=result.record.unwrap();let got=r.spec.as_ref().unwrap();
+   let r=result.record.ok_or_else(||Status::unavailable("create returned no instance record"))?;
+   let got=r.spec.as_ref().ok_or_else(||Status::unavailable("create returned no instance spec"))?;
    if r.state!=pb::InstanceState::Running as i32 || result.durability!=pb::Durability::Published as i32 || !matches_spec(&op.spec,got){return Err(Status::unavailable("create is not durably confirmed"));}
    // Close the read-after-create window without making ordinary lifecycle
    // requests query Master. The versioned stream remains the steady-state path.
@@ -553,15 +568,18 @@ impl Api {
         match response {
             Err(_) => plain(502, json!({"error":"Agent service unavailable"})),
             Ok(response) => {
-                let mut output = Response::builder().status(response.status());
+                let output = Response::builder().status(response.status());
                 let mut headers = response.headers().clone();
                 strip_hop_headers(&mut headers);
-                *output.headers_mut().unwrap() = headers;
                 let stream = response
                     .bytes_stream()
                     .map_ok(Frame::data)
                     .map_err(|e| -> Error { Box::new(e) });
-                output.body(StreamBody::new(stream).boxed_unsync()).unwrap()
+                let mut output = output
+                    .body(StreamBody::new(stream).boxed_unsync())
+                    .expect("upstream status forms a valid HTTP response");
+                *output.headers_mut() = headers;
+                output
             }
         }
     }
@@ -655,24 +673,24 @@ fn response(value: Result<Value, Status>) -> Response<Body> {
 fn envelope(status: u16, value: Option<Value>, error: Option<&str>) -> Response<Body> {
     plain(
         status,
-        json!({"code":status,"message":error.unwrap_or(""),"data":value.filter(|v|!v.is_null()).map(|v|STANDARD.encode(serde_json::to_vec(&v).unwrap()))}),
+        json!({"code":status,"message":error.unwrap_or(""),"data":value.filter(|v|!v.is_null()).map(|v|STANDARD.encode(serde_json::to_vec(&v).expect("serde_json::Value serialization is infallible")))}),
     )
 }
 fn plain(status: u16, value: Value) -> Response<Body> {
     let data = if status == 204 {
         vec![]
     } else {
-        serde_json::to_vec(&value).unwrap()
+        serde_json::to_vec(&value).expect("serde_json::Value serialization is infallible")
     };
     Response::builder()
-        .status(StatusCode::from_u16(status).unwrap())
+        .status(StatusCode::from_u16(status).expect("internal HTTP status is valid"))
         .header("content-type", "application/json")
         .body(
             Full::new(Bytes::from(data))
                 .map_err(|e: Infallible| match e {})
                 .boxed_unsync(),
         )
-        .unwrap()
+        .expect("static response headers are valid")
 }
 fn status_code(error: &Status) -> u16 {
     match error.code() {

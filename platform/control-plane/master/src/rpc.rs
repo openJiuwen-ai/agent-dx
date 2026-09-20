@@ -69,7 +69,7 @@ impl State {
         let mut node = self.nodes.get(id).ok_or(Error::Conflict)?.clone();
         let session_id = node.session.as_ref().ok_or(Error::Conflict)?.id.clone();
         node.node.available = false;
-        node.session.as_mut().unwrap().routable = false;
+        node.session.as_mut().ok_or(Error::Conflict)?.routable = false;
         self.scheduler.register(node.node.clone())?;
         self.nodes.insert(id.to_owned(), node);
         let saved = match self.session.invalidate_node(id, &session_id).await {
@@ -603,7 +603,12 @@ impl pb::master_service_server::MasterService for MasterRpc {
                             .map(|n| pb::NodeEndpoint {
                                 node_id: n.node.id.clone(),
                                 address: n.address.clone(),
-                                session_id: n.session.as_ref().unwrap().id.clone(),
+                                session_id: n
+                                    .session
+                                    .as_ref()
+                                    .expect("node directory filters entries without a session")
+                                    .id
+                                    .clone(),
                             })
                             .collect(),
                     })
@@ -730,7 +735,11 @@ impl pb::master_service_server::MasterService for MasterRpc {
                     .map(TryInto::try_into)
                     .collect::<Result<Vec<_>>>()
                     .map_err(status)?;
-                state.live.get_mut(&r.node_id).unwrap().inspected = true;
+                state
+                    .live
+                    .get_mut(&r.node_id)
+                    .ok_or_else(|| Status::unavailable("node heartbeat state disappeared"))?
+                    .inspected = true;
                 Ok(Response::new(pb::InspectNodeResponse {
                     records,
                     snapshots,

@@ -76,7 +76,7 @@ pub struct Status {
 }
 impl Health {
     fn report(&self, error: io::Error) {
-        let mut last = self.error.lock().unwrap();
+        let mut last = self.error.lock().expect("shared state lock poisoned");
         let text = error.to_string();
         if last.as_ref() != Some(&text) {
             eprintln!("component log I/O failed: {text}");
@@ -251,7 +251,10 @@ impl Writer {
         {
             self.rotate()?;
         }
-        self.file.as_mut().unwrap().write_all(bytes)?;
+        self.file
+            .as_mut()
+            .ok_or_else(|| io::Error::other("active log file missing"))?
+            .write_all(bytes)?;
         self.bytes += bytes.len() as u64;
         Ok(())
     }
@@ -261,7 +264,10 @@ impl Writer {
             let n = bytes
                 .len()
                 .min((self.policy.max_file_bytes - self.bytes).min(usize::MAX as u64) as usize);
-            self.file.as_mut().unwrap().write_all(&bytes[..n])?;
+            self.file
+                .as_mut()
+                .ok_or_else(|| io::Error::other("active log file missing"))?
+                .write_all(&bytes[..n])?;
             self.bytes += n as u64;
             bytes = &bytes[n..];
         }
@@ -429,7 +435,12 @@ impl Capture {
     }
     pub fn status(&self) -> Status {
         Status {
-            error: self.health.error.lock().unwrap().clone(),
+            error: self
+                .health
+                .error
+                .lock()
+                .expect("shared state lock poisoned")
+                .clone(),
             failed_bytes: self.health.failed_bytes.load(Ordering::Relaxed),
         }
     }
@@ -541,7 +552,11 @@ mod tests {
         records.push(b"0\nok\n", &mut writer, &health);
         assert_eq!(read_all(root.path()), b"abc\nok\n");
         assert_eq!(health.failed_bytes.load(Ordering::Relaxed), 11);
-        assert!(health.error.lock().unwrap().is_some());
+        assert!(health
+            .error
+            .lock()
+            .expect("shared state lock poisoned")
+            .is_some());
     }
     #[test]
     fn collection_grace_defers_compression_and_retention() {

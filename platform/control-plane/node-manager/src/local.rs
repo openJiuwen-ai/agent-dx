@@ -19,7 +19,7 @@ impl NodeManager {
         if self.is_draining() {
             return Err(Error::Unavailable("node draining".into()));
         }
-        let instances = self.instances.lock().unwrap();
+        let instances = self.instances.lock().expect("shared state lock poisoned");
         if let Some((old, assignment, _)) = instances.get(&spec.id) {
             if old != spec {
                 return Err(Error::Conflict);
@@ -29,7 +29,7 @@ impl NodeManager {
                 devices: assignment.devices.clone(),
             });
         }
-        let mut holds = self.local_holds.lock().unwrap();
+        let mut holds = self.local_holds.lock().expect("shared state lock poisoned");
         if let Some(hold) = holds.get(&spec.id) {
             if hold.spec != *spec {
                 return Err(Error::Conflict);
@@ -39,7 +39,11 @@ impl NodeManager {
                 devices: hold.devices.clone(),
             });
         }
-        let mut admission = self.services.admission.lock().unwrap();
+        let mut admission = self
+            .services
+            .admission
+            .lock()
+            .expect("shared state lock poisoned");
         let devices = select_devices(&spec.scheduling.devices, &admission.devices.available())?;
         let token = format!("local-claim:{}", uuid::Uuid::new_v4());
         admission.reserve(
@@ -68,13 +72,13 @@ impl NodeManager {
     }
     /// Only after a definitive losing/fallback response, never after a timeout.
     pub fn release_local(&self, id: &str, reservation: &LocalReservation) -> Result<()> {
-        let mut holds = self.local_holds.lock().unwrap();
+        let mut holds = self.local_holds.lock().expect("shared state lock poisoned");
         if let Some(hold) = holds.get(id) {
             if reservation.token.as_ref() == Some(&hold.token) {
                 self.services
                     .admission
                     .lock()
-                    .unwrap()
+                    .expect("shared state lock poisoned")
                     .release(&hold.token)?;
                 holds.remove(id);
             }
@@ -82,14 +86,18 @@ impl NodeManager {
         Ok(())
     }
     pub(crate) fn adopt_local(&self, spec: &InstanceSpec, assignment: &Assignment) -> Result<bool> {
-        let mut holds = self.local_holds.lock().unwrap();
+        let mut holds = self.local_holds.lock().expect("shared state lock poisoned");
         let Some(hold) = holds.get(&spec.id) else {
             return Ok(false);
         };
         if hold.spec != *spec {
             return Err(Error::Conflict);
         }
-        let mut admission = self.services.admission.lock().unwrap();
+        let mut admission = self
+            .services
+            .admission
+            .lock()
+            .expect("shared state lock poisoned");
         let mut scalar = admission.ledger.clone();
         let mut devices = admission.devices.clone();
         scalar.release(&hold.token)?;

@@ -2072,6 +2072,8 @@ mod tests {
                 l_onoff: 1,
                 l_linger: 0,
             };
+            // SAFETY: client owns this valid descriptor, linger points to a fully initialized
+            // value for the duration of setsockopt, and the kernel does not retain the pointer.
             // Closing with SO_LINGER=0 exercises a real TCP RST, not an EOF.
             let result = unsafe {
                 libc::setsockopt(

@@ -288,13 +288,16 @@ impl Deployment {
                     if let Some(e) = &self.runtime_environment {
                         config["runtime_environment"] = serde_json::to_value(e)?;
                     }
-                    config.as_object_mut().unwrap().remove("master_address");
+                    config
+                        .as_object_mut()
+                        .expect("validated service configuration is an object")
+                        .remove("master_address");
                     config["discovery"]["redis_url"] = json!(self.redis_url);
                     config["discovery"]["namespace"] = json!(self.namespace);
                     if s.role == Role::ApiServer {
                         config["discovery"]
                             .as_object_mut()
-                            .unwrap()
+                            .expect("rendered discovery configuration is an object")
                             .entry("poll_seconds")
                             .or_insert(json!(5));
                     }

@@ -12,7 +12,7 @@ impl Session {
                 return Err(Error::Conflict);
             }
             node.node.available = false;
-            node.session.as_mut().unwrap().routable = false;
+            node.session.as_mut().ok_or(Error::Conflict)?.routable = false;
             let mut writes = vec![(format!("node:{id}"), encode(node)?)];
             for (instance_id, instance) in &mut saved.instances {
                 if instance.assignment.node_id != id

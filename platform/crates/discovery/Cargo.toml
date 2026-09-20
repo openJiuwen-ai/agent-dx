@@ -1,7 +1,14 @@
 [package]
 name = "adx-discovery"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Redis-backed ADX component registration and discovery"
+[lints]
+workspace = true
+
 [dependencies]
 adx-core = { path = "../core" }
 redis = { version = "1.7", default-features = false, features = ["tokio-comp"] }

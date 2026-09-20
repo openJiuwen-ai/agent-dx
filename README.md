@@ -67,6 +67,10 @@ resources are documented in the [Kubernetes E2E README](build/e2e/kubernetes/REA
 
 Rust uses the root Cargo workspace. The Sandbox SDK uses distribution `adx-sandbox`, import `adx_sandbox`, CLI `adx-sandbox`, and `ADX_*` environment settings. Agent namespaces are `adx.agentruntime` and `adx.agentexecutor`; Gateway binaries use `adx-`, configuration uses `ADX_`, and internal branded headers use `X-ADX-`. Run matching component versions together.
 
+Rust changes must pass `make rust-check`, which applies the repository format and
+Clippy policy before running tests. The adopted rules, intentional exceptions and
+migration policy are documented in the [Rust coding guidelines](docs/development/rust-coding-guidelines.md).
+
 ```sh
 cargo test --locked --workspace --all-features -j 2
 python -m pytest -q

@@ -30,6 +30,8 @@ pub fn raise_nofile_soft_limit_from_env() -> io::Result<libc::rlim_t> {
     let desired = limit.rlim_cur.max(requested.min(limit.rlim_max));
     if desired != limit.rlim_cur {
         limit.rlim_cur = desired;
+        // SAFETY: limit is fully initialized, is valid for this call, and setrlimit does not
+        // retain its pointer.
         if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) } != 0 {
             return Err(io::Error::last_os_error());
         }

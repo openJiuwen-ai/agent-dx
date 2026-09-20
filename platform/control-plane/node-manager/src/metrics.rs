@@ -18,11 +18,14 @@ impl Metrics {
     pub fn record(&self, instance: &str, runtime: &str, usage: RuntimeUsage) {
         self.0
             .lock()
-            .unwrap()
+            .expect("shared state lock poisoned")
             .insert(instance.into(), (runtime.into(), usage, Instant::now()));
     }
     pub fn remove(&self, instance: &str) {
-        self.0.lock().unwrap().remove(instance);
+        self.0
+            .lock()
+            .expect("shared state lock poisoned")
+            .remove(instance);
     }
     fn render(&self) -> String {
         let escape = |s: &str| {
@@ -31,7 +34,9 @@ impl Metrics {
                 .replace('\n', "\\n")
         };
         let mut output = String::new();
-        for (id, (runtime, usage, sampled)) in self.0.lock().unwrap().iter() {
+        for (id, (runtime, usage, sampled)) in
+            self.0.lock().expect("shared state lock poisoned").iter()
+        {
             let labels = format!(
                 "instance_id=\"{}\",runtime_id=\"{}\"",
                 escape(id),
@@ -67,7 +72,11 @@ impl NodeManager {
         output.push_str(&adx_observability::trace::metrics());
         let lifecycle_ready =
             self.lifecycle_ready.try_read().is_ok_and(|ready| *ready) && !self.is_draining();
-        let admission = self.services.admission.lock().unwrap();
+        let admission = self
+            .services
+            .admission
+            .lock()
+            .expect("shared state lock poisoned");
         let fresh = admission
             .valid_until
             .is_some_and(|until| tokio::time::Instant::now() < until);
@@ -116,7 +125,7 @@ pub async fn serve(manager: Arc<NodeManager>, bind: std::net::SocketAddr) -> std
                         } else {
                             String::new()
                         })))
-                        .unwrap();
+                        .expect("static metrics response is valid");
                     async move { Ok::<_, std::convert::Infallible>(response) }
                 },
             );

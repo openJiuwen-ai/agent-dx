@@ -222,7 +222,7 @@ impl Sandboxd {
             if !response.id.is_empty() {
                 backend_ids
                     .lock()
-                    .unwrap()
+                    .expect("shared state lock poisoned")
                     .insert(logical_id, response.id.clone());
             }
             if response.code != 0 {
@@ -249,7 +249,7 @@ impl Sandboxd {
     fn cell(&self, id: &str) -> Cell {
         self.starts
             .lock()
-            .unwrap()
+            .expect("shared state lock poisoned")
             .entry(id.into())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(StartState::Idle)))
             .clone()
@@ -264,7 +264,12 @@ impl Sandboxd {
     // Platform execution IDs and backend IDs are independent. Labels rebuild
     // the in-memory mapping after restart; no backend naming convention is assumed.
     async fn list_id(&self, logical_id: &str) -> Result<Vec<proto::SandboxStatus>> {
-        let physical = self.backend_ids.lock().unwrap().get(logical_id).cloned();
+        let physical = self
+            .backend_ids
+            .lock()
+            .expect("shared state lock poisoned")
+            .get(logical_id)
+            .cloned();
         let selector = if !logical_id.is_empty() && physical.is_none() {
             HashMap::from([("adx.runtime_id".into(), logical_id.into())])
         } else {
@@ -313,7 +318,7 @@ impl Sandboxd {
             }
             sandbox.id = logical.clone();
         }
-        let mut ids = self.backend_ids.lock().unwrap();
+        let mut ids = self.backend_ids.lock().expect("shared state lock poisoned");
         for (logical, physical) in &discovered {
             if ids
                 .get(logical)
@@ -326,11 +331,22 @@ impl Sandboxd {
         Ok(sandboxes)
     }
     async fn physical_id(&self, logical_id: &str) -> Result<Option<String>> {
-        if let Some(id) = self.backend_ids.lock().unwrap().get(logical_id).cloned() {
+        if let Some(id) = self
+            .backend_ids
+            .lock()
+            .expect("shared state lock poisoned")
+            .get(logical_id)
+            .cloned()
+        {
             return Ok(Some(id));
         }
         self.list_id(logical_id).await?;
-        Ok(self.backend_ids.lock().unwrap().get(logical_id).cloned())
+        Ok(self
+            .backend_ids
+            .lock()
+            .expect("shared state lock poisoned")
+            .get(logical_id)
+            .cloned())
     }
 
     pub async fn has_managed_instances(&self) -> Result<bool> {
@@ -716,7 +732,10 @@ impl RuntimeBackend for Sandboxd {
         {
             return Err(unavailable("runtime remains after Delete"));
         }
-        self.backend_ids.lock().unwrap().remove(runtime_id);
+        self.backend_ids
+            .lock()
+            .expect("shared state lock poisoned")
+            .remove(runtime_id);
         *state = StartState::Idle;
         Ok(())
     }

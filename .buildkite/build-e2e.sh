@@ -10,6 +10,8 @@ echo "--- :gear: Toolchain and persistent caches"
 source .buildkite/bootstrap-build.sh > >(tee out/buildkite/logs/bootstrap.log) 2>&1
 echo "--- :test_tube: CI driver tests"
 python3 -u -m unittest discover -s build/e2e/tests -v 2>&1 | tee out/buildkite/logs/driver-tests.log
+echo "--- :rust: Rust guideline gate"
+make rust-check JOBS="${JOBS:-2}" 2>&1 | tee out/buildkite/logs/rust-check.log
 echo "--- :package: Rust platform and Sandbox SDK release"
 bash build/release/build.sh 2>&1 | tee out/buildkite/logs/release.log
 # One archive preserves top-level metadata, nested files and executable modes.
