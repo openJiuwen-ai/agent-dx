@@ -36,7 +36,7 @@ use tokio_rustls::TlsAcceptor;
 use uuid::Uuid;
 
 type BoxError = Box<dyn Error + Send + Sync>;
-type ProxyBody = UnsyncBoxBody<Bytes, BoxError>;
+pub(super) type ProxyBody = UnsyncBoxBody<Bytes, BoxError>;
 const L4_COPY_BUFFER_SIZE: usize = 64 * 1024;
 const COMMAND_WATCH_PATH: &str = "/api/sandbox/v1/commands/watch";
 const RRT_COMMAND_PORT: u16 = 50090;
@@ -227,6 +227,10 @@ pub fn parse_static_routes(value: &str) -> Result<Vec<StaticRoute>, String> {
 
 #[derive(Clone)]
 pub struct EdgeFrontend {
+    #[cfg(feature = "agent-api")]
+    agent_api: Option<Arc<super::agent_api::AgentApi>>,
+    #[cfg(feature = "agent-api")]
+    sandbox_api: Option<Arc<super::sandbox_api::SandboxApi>>,
     resolver: Arc<EdgeRouteResolver>,
     connector: DataPlaneL4Connector,
     http_pool: BackendHttpPool,
@@ -260,6 +264,10 @@ impl EdgeFrontend {
         control_plane_routes: Vec<StaticRoute>,
     ) -> Self {
         Self {
+            #[cfg(feature = "agent-api")]
+            agent_api: None,
+            #[cfg(feature = "agent-api")]
+            sandbox_api: None,
             resolver,
             connector,
             http_pool: BackendHttpPool::new(BackendHttpPoolConfig::default()),
@@ -281,6 +289,18 @@ impl EdgeFrontend {
             command_watch_metrics: Arc::new(CommandWatchMetrics::default()),
             request_metrics: Arc::new(EdgeRequestMetrics::default()),
         }
+    }
+
+    #[cfg(feature = "agent-api")]
+    pub fn with_agent_api(mut self, api: Arc<super::agent_api::AgentApi>) -> Self {
+        self.agent_api = Some(api);
+        self
+    }
+
+    #[cfg(feature = "agent-api")]
+    pub fn with_sandbox_api(mut self, api: Arc<super::sandbox_api::SandboxApi>) -> Self {
+        self.sandbox_api = Some(api);
+        self
     }
 
     pub fn with_command_watch_config(mut self, config: CommandWatchConfig) -> Self {
@@ -684,28 +704,92 @@ impl EdgeFrontend {
         let (access_kind, instance_id, target_port) = self.access_fields(&request);
         adx_observability::trace::attribute("instance.id", instance_id.clone());
         adx_observability::trace::attribute("http.request.method", method.clone());
-        let response = match request.uri().path() {
-            COMMAND_WATCH_PATH => {
-                self.handle_command_watch(&mut request, ingress_security)
-                    .await
-            }
-            _ if request.method() == http::Method::CONNECT => {
-                self.handle_connect(&mut request, ingress_security, peer)
-                    .await
-            }
-            _ if self.application_route(&request).is_some() => {
-                if ingress_security == IngressSecurity::Plaintext {
-                    tls_required()
-                } else {
-                    let route = self.application_route(&request).expect("route matched");
-                    self.reverse_proxy.proxy(request, route, peer).await
+        #[cfg(feature = "agent-api")]
+        let agent_data_error = self
+            .prepare_agent_data(&mut request, ingress_security)
+            .await
+            .err();
+        #[cfg(not(feature = "agent-api"))]
+        let agent_data_error: Option<Response<ProxyBody>> = None;
+        let response = if let Some(response) = agent_data_error {
+            response
+        } else {
+            match request.uri().path() {
+                #[cfg(feature = "agent-api")]
+                path if super::agent_api::AgentApi::matches(path) && self.agent_api.is_some() => {
+                    if ingress_security == IngressSecurity::Plaintext {
+                        tls_required()
+                    } else {
+                        match self
+                            .authenticator
+                            .authenticate_request_with_policy(&request, true)
+                            .await
+                        {
+                            Ok(tenant) if !tenant.is_empty() => {
+                                self.agent_api
+                                    .as_ref()
+                                    .expect("configured Agent API")
+                                    .management(request, &tenant)
+                                    .await
+                            }
+                            Ok(_) => response_text(
+                                StatusCode::UNAUTHORIZED,
+                                "tenant authentication required",
+                            ),
+                            Err(error) => response_text(error.status(), &error.to_string()),
+                        }
+                    }
                 }
+                #[cfg(feature = "agent-api")]
+                path if super::sandbox_api::SandboxApi::matches(path)
+                    && self.sandbox_api.is_some() =>
+                {
+                    if ingress_security == IngressSecurity::Plaintext {
+                        tls_required()
+                    } else {
+                        let api = self.sandbox_api.as_ref().expect("configured Sandbox API");
+                        if api.service_authorized(request.headers()) {
+                            api.handle(request, None).await
+                        } else {
+                            match self
+                                .authenticator
+                                .authenticate_request_with_policy(&request, true)
+                                .await
+                            {
+                                Ok(tenant) if !tenant.is_empty() => {
+                                    api.handle(request, Some(&tenant)).await
+                                }
+                                Ok(_) => response_text(
+                                    StatusCode::UNAUTHORIZED,
+                                    "tenant authentication required",
+                                ),
+                                Err(error) => response_text(error.status(), &error.to_string()),
+                            }
+                        }
+                    }
+                }
+                COMMAND_WATCH_PATH => {
+                    self.handle_command_watch(&mut request, ingress_security)
+                        .await
+                }
+                _ if request.method() == http::Method::CONNECT => {
+                    self.handle_connect(&mut request, ingress_security, peer)
+                        .await
+                }
+                _ if self.application_route(&request).is_some() => {
+                    if ingress_security == IngressSecurity::Plaintext {
+                        tls_required()
+                    } else {
+                        let route = self.application_route(&request).expect("route matched");
+                        self.reverse_proxy.proxy(request, route, peer).await
+                    }
+                }
+                path if self.is_control_plane_path(path) => {
+                    self.proxy_control_plane(request, ingress_security, peer)
+                        .await
+                }
+                _ => self.proxy_direct(request, ingress_security).await,
             }
-            path if self.is_control_plane_path(path) => {
-                self.proxy_control_plane(request, ingress_security, peer)
-                    .await
-            }
-            _ => self.proxy_direct(request, ingress_security).await,
         };
         let status = response.status();
         let duration_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
@@ -745,6 +829,41 @@ impl EdgeFrontend {
             );
         }
         Ok(response)
+    }
+
+    #[cfg(feature = "agent-api")]
+    async fn prepare_agent_data<B>(
+        &self,
+        request: &mut Request<B>,
+        ingress_security: IngressSecurity,
+    ) -> Result<(), Response<ProxyBody>> {
+        if let Some(api) = &self.agent_api {
+            if super::agent_api::AgentApi::matches_data(request.uri().path()) {
+                if ingress_security == IngressSecurity::Plaintext {
+                    return Err(tls_required());
+                }
+                let identity = match self
+                    .authenticator
+                    .authenticate_request_identity_with_policy(request, true)
+                    .await
+                {
+                    Ok(identity) if !identity.tenant_id.is_empty() => identity,
+                    Ok(_) => {
+                        return Err(response_text(
+                            StatusCode::UNAUTHORIZED,
+                            "tenant authentication required",
+                        ))
+                    }
+                    Err(error) => return Err(response_text(error.status(), &error.to_string())),
+                };
+                let tenant = identity.tenant_id.clone();
+                request.extensions_mut().insert(identity);
+                api.prepare_data(request, &tenant)
+                    .await
+                    .map_err(|error| super::agent_api::error_response(error, None))?;
+            }
+        }
+        Ok(())
     }
 
     fn access_fields<B>(&self, request: &Request<B>) -> (&'static str, String, u16) {
@@ -1214,25 +1333,72 @@ impl EdgeFrontend {
 
     async fn proxy_direct(
         &self,
-        mut request: Request<Incoming>,
+        request: Request<Incoming>,
         ingress_security: IngressSecurity,
     ) -> Response<ProxyBody> {
+        #[cfg(feature = "agent-api")]
+        if let Some(api) = &self.agent_api {
+            if api.can_retry_data(&request) {
+                return self
+                    .proxy_managed_direct(request, ingress_security, api)
+                    .await;
+            }
+        }
+        self.proxy_direct_attempt(request, ingress_security)
+            .await
+            .unwrap_or_else(|(response, _)| response)
+    }
+
+    #[cfg(feature = "agent-api")]
+    async fn proxy_managed_direct(
+        &self,
+        mut request: Request<Incoming>,
+        ingress_security: IngressSecurity,
+        api: &super::agent_api::AgentApi,
+    ) -> Response<ProxyBody> {
+        loop {
+            // Preserve only managed selection metadata. Ordinary fixed-ID forwarding keeps its
+            // original path with no header copying. The body is never cloned or buffered.
+            let uri = request.uri().clone();
+            let headers = request.headers().clone();
+            match self.proxy_direct_attempt(request, ingress_security).await {
+                Ok(response) => return response,
+                Err((response, mut unconsumed)) => {
+                    *unconsumed.uri_mut() = uri;
+                    *unconsumed.headers_mut() = headers;
+                    match api.retry_data(&mut unconsumed).await {
+                        Ok(true) => {
+                            request = unconsumed;
+                            continue;
+                        }
+                        Ok(false) => return response,
+                        Err(error) => return super::agent_api::error_response(error, None),
+                    }
+                }
+            }
+        }
+    }
+    async fn proxy_direct_attempt(
+        &self,
+        mut request: Request<Incoming>,
+        ingress_security: IngressSecurity,
+    ) -> Result<Response<ProxyBody>, (Response<ProxyBody>, Request<Incoming>)> {
         let Some(parsed) = parse_direct_path(
             request.uri().path(),
             self.default_direct_port,
             self.default_tunnel_port,
         ) else {
-            return plain(StatusCode::NOT_FOUND, "route not found");
+            return Ok(plain(StatusCode::NOT_FOUND, "route not found"));
         };
         if ingress_security == IngressSecurity::Plaintext {
             if parsed.access_kind == AccessKind::Direct {
-                return tls_required();
+                return Ok(tls_required());
             }
             if request_has_credentials(&request) {
-                return plain(
+                return Ok(plain(
                     StatusCode::BAD_REQUEST,
                     "credentials are not accepted on the plaintext listener",
-                );
+                ));
             }
         }
         let request_id = header_string(&request, "x-request-id");
@@ -1246,11 +1412,11 @@ impl EdgeFrontend {
             .await
         {
             Ok(route) => route,
-            Err(error) => return error_response(error),
+            Err(error) => return Err((error_response(error), request)),
         };
         let auth_required = self.auth_required(parsed.access_kind, &route);
         if ingress_security == IngressSecurity::Plaintext && auth_required {
-            return tls_required();
+            return Ok(tls_required());
         }
         let tenant_id = if ingress_security == IngressSecurity::Plaintext {
             String::new()
@@ -1261,7 +1427,7 @@ impl EdgeFrontend {
                 .await
             {
                 Ok(tenant_id) => tenant_id,
-                Err(error) => return plain(error.status(), &error.to_string()),
+                Err(error) => return Ok(plain(error.status(), &error.to_string())),
             }
         };
         let query = request
@@ -1288,17 +1454,17 @@ impl EdgeFrontend {
         if upgrade_requested {
             let stream = match self.open_resolved_stream(route, &tenant_id).await {
                 Ok(stream) => stream,
-                Err(error) => return error_response(error),
+                Err(error) => return Err((error_response(error), request)),
             };
             let cancelled = stream.cancelled.clone();
-            return proxy_http(request, stream, "sandbox", Some(cancelled)).await;
+            return Ok(proxy_http(request, stream, "sandbox", Some(cancelled)).await);
         }
 
         if let Err(error) = self.authorize(&route, &tenant_id) {
-            return error_response(error);
+            return Ok(error_response(error));
         }
         if !self.resolver.route_is_current(&route) {
-            return error_response(EdgeOpenError::RouteChanged);
+            return Err((error_response(EdgeOpenError::RouteChanged), request));
         }
         strip_hop_by_hop_headers(request.headers_mut());
         let key = BackendHttpPoolKey {
@@ -1310,17 +1476,18 @@ impl EdgeFrontend {
         };
         match self
             .http_pool
-            .send(key, request, || self.open_authorized_stream(route))
+            .send_recoverable(key, request, || self.open_authorized_stream(route))
             .await
         {
             Ok(mut response) => {
                 strip_hop_by_hop_headers(response.headers_mut());
-                response.map(|body| {
+                Ok(response.map(|body| {
                     body.map_err(|error| -> BoxError { Box::new(error) })
                         .boxed_unsync()
-                })
+                }))
             }
-            Err(error) => backend_pool_error_response(error),
+            Err((error, Some(request))) => Err((backend_pool_error_response(error), request)),
+            Err((error, None)) => Ok(backend_pool_error_response(error)),
         }
     }
 }
@@ -2422,3 +2589,19 @@ mod tests {
 
 #[cfg(test)]
 mod reverse_proxy_tests;
+
+#[cfg(feature = "agent-api")]
+fn response_text(status: StatusCode, message: &str) -> Response<ProxyBody> {
+    Response::builder()
+        .status(status)
+        .body(
+            Full::new(Bytes::from(message.to_owned()))
+                .map_err(|never: Infallible| -> BoxError { match never {} })
+                .boxed_unsync(),
+        )
+        .expect("static response")
+}
+
+#[cfg(all(test, feature = "agent-api"))]
+#[path = "agent_api_tests.rs"]
+mod agent_api_tests;

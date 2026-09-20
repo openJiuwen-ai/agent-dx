@@ -25,3 +25,9 @@ pub use server::{
     parse_static_routes, CommandWatchConfig, EdgeFrontend, EdgeOpenError, IngressSecurity,
     StaticRoute,
 };
+
+#[cfg(feature = "agent-api")]
+pub mod sandbox_api;
+
+#[cfg(feature = "agent-api")]
+pub mod agent_api;

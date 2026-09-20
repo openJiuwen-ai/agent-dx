@@ -33,8 +33,12 @@ default = ["activity-client"]
 activity-client = ["dep:prost", "dep:tonic", "dep:tower"]
 etcd-watch = ["dep:etcd-client"]
 mock-e2e = []
+agent-api = ["activity-client", "dep:adx-agent-core", "dep:adx-agent-api", "dep:adx-agent-store"]
 
 [dependencies]
+adx-agent-core = { path = "../agent/crates/core", optional = true }
+adx-agent-api = { path = "../agent/api", optional = true }
+adx-agent-store = { path = "../agent/crates/store", optional = true }
 adx-observability = { path = "../platform/crates/observability" }
 adx-protocol = { path = "../platform/crates/protocol" }
 adx-discovery = { path = "../platform/crates/discovery" }
@@ -42,6 +46,7 @@ sha2 = "0.10"
 async-trait = "0.1"
 base64 = "0.22"
 bytes = "1"
+percent-encoding = "2"
 h2 = "0.4"
 hyper-util = { version = "0.1", features = ["tokio", "client-legacy", "http1"] }
 etcd-client = { version = "0.14", optional = true, features = ["tls"] }
@@ -71,6 +76,7 @@ tokio-tungstenite = "0.24"
 tokio-stream = { version = "0.1", features = ["net"] }
 
 [dev-dependencies]
+adx-agent-store = { path = "../agent/crates/store", features = ["test-memory"] }
 tempfile = "3"
 tokio = { version = "1", features = ["test-util"] }
 

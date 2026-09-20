@@ -8,7 +8,7 @@
 
 | 目录 | 职责 |
 |---|---|
-| `agent/` | Agent CLI、SDK、Executor；当前仍依赖旧 Agent/FaaS 后端，接入 Sandbox SDK 是目标，尚未完成业务迁移 |
+| `agent/` | Rust Agent API、独立 Dispatcher、当前状态存储与测试；旧 Python Agent 包已删除 |
 | `platform/control-plane/` | Rust Master、Node Manager、adxctl，Rust API Server |
 | `platform/crates/` | Instance 模型、协议、发现、Filter/Score 与可观测公共库 |
 | `platform/runtime/rrt/` | 实例内命令、文件、终端与恢复协作 |
@@ -28,7 +28,7 @@ Master 内 Global 轮转选择 Shard，Shard 执行实际调度；Node Manager �
 - [当前实现](docs/testing/control-plane-implementation.md) · [目录与职责](docs/architecture/repository-layout.md) · [来源版本](docs/migration/sources.json)
 - [Metrics](docs/testing/instance-resource-metrics.md) · [日志采集](docs/testing/log-collection.md) · [Trace](docs/testing/distributed-traces.md) · [日志滚动压缩](docs/testing/log-rotation.md)
 
-根目录 `make help` 查看构建入口；Rust 使用 Cargo workspace，提交前运行 `make rust-check` 检查格式、严格 Clippy 及控制面生产代码的 `unwrap` 门禁。Python 包独立构建。`python3 build/ci/run.py <suite>` 运行组件检查，`make package` 生成四个 Python 包；统一进程发布包由 `build/release/package.py` 汇总。运行环境独立托管 sandboxd。
+根目录 `make help` 查看构建入口；Rust 使用 Cargo workspace，提交前运行 `make rust-check` 检查格式、严格 Clippy 及控制面生产代码的 `unwrap` 门禁。Python 包独立构建。`python3 build/ci/run.py <suite>` 运行组件检查，`make package` 生成 Sandbox SDK 包；统一进程发布包由 `build/release/package.py` 汇总。运行环境独立托管 sandboxd。
 
 ## 验收状态
 

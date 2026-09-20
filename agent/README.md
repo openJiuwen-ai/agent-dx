@@ -1,85 +1,35 @@
-[中文](README.zh.md) | **English**
+# Agent-DX v2
 
-# Agent Distributed Executor (agent-dx)
+Agent 层使用 Rust 实现，API 嵌入统一 Gateway，Dispatcher 独立部署。
 
-> These Agent packages still use legacy FaaS/external-runtime APIs. The examples require compatible meta_service/frontend services. The new Instance platform and nine Agent forwarding routes do not implement that backend. Sandbox SDK integration remains a separate migration; see [current architecture](../docs/architecture/repository-layout.md).
+| 目录 | 职责 |
+|---|---|
+| `crates/core` | 与平台无关的产品类型、校验和接口契约 |
+| `crates/store` | 当前状态存储、Redis 条件事务；内存实现仅供显式启用的测试使用 |
+| `dispatcher` | 受管实例选址、内部 HTTP 服务和创建/删除协调，见 [Dispatcher 说明](dispatcher/README.md) |
+| `api` | 内嵌 inline/managed API、Dispatcher 发现和调用、受管服务选择 |
 
-## Introduction
+Session 是完整上下文索引，并独占实例池。可选 `affinity_key` 将请求绑定到同一逻辑 Instance；用户进程重启不使亲和失效，Session 删除或逻辑实例确认结束后失效。Session 清理完成后允许复用公开 ID，内部 generation 隔离旧请求。Resolve 的 `bypass_cache` 跳过缓存读取权威状态。
 
-Agent Distributed Executor (agent-dx) is a distributed execution substrate for agents, providing developer tools for agent registration, invocation, and session management. The repository currently offers the Python CLI `adx`, a separately built agent-dx Python SDK, and a Agent-layer Executor for custom-image Agent instances.
+inline create/get/kill 直接适配 Sandbox，不使用 ADX Redis、Dispatcher 或后台恢复任务。共享 HTTP/WS/SSH 转发使用真实 Sandbox ID。旧 Python CLI、SDK、Executor 及其测试已删除；SDK、CLI 和 EventLog 后续补充，执行能力由 Platform RRT 提供。
 
-### Key Capabilities
+## 部署
 
-Current CLI capabilities include:
+复用既有 [Platform 独立进程部署](../docs/deployment/standalone.md)，不要求 Kubernetes。构建统一 Gateway 和独立 Dispatcher：
 
-- Register agents/functions via the adx meta_service component.
-- Invoke agents/functions via the adx frontend component, with SSE streaming output.
-- Support for agent session and instance session request headers.
-- Support for one-shot invocation and interactive invocation.
-
-For CLI installation, command parameters, examples, exit codes, and testing details, see [cli/README.md](cli/README.md).
-For the agent-dx SDK programming model, fixed bootstrap, and deployment configuration, see [sdk/python/README.md](sdk/python/README.md).
-For the Agent-layer custom-image Executor, see [executor/README.md](executor/README.md).
-
-## Getting Started
-
-
-### CLI Tool
-
-
-```bash
-adx deploy -s ./agent.json --server {meta_service_endpoint}
+```sh
+cargo build --locked -p data-plane-gateway --features agent-api --bins
+cargo build --locked -p adx-dispatcher --bin adx-dispatcher
 ```
 
-Example `agent.json`:
+Gateway 保留既有 TLS、租户认证和转发配置，新增 `ADX_AGENT_CONFIG` 与 `ADX_SANDBOX_CONFIG`。`inline_only` 模式不初始化 ADX Redis 或 Dispatcher；`both` 模式启用受管接口。Platform 自身的发现和存储依赖仍保留。
 
-```json
-{
-    "name":"0@ai@agent",
-    "runtime":"python3.9",
-    "handler":"agent.handler",
-    "kind":"faas",
-    "cpu":1000,
-    "memory":1024,
-    "timeout":600,
-    "storageType":"local",
-    "codePath":"/your/agent/code/absolute/path"
-}
-```
+Gateway 与 Dispatcher 共用独立的 Agent Redis namespace，与 Platform namespace 隔离。Redis 保存 Template、Session、Instance、AffinityBinding 和 Dispatcher 成员当前状态。Redis 不可用时已有暖缓存可能继续命中，但状态写入和强制刷新失败，不切换到独立内存存储。事务与可靠性约束见 [存储说明](crates/store/README.md)。
 
-Invoke an agent:
+每个 Dispatcher 使用独立 `node_id` 和 `ADX_DISPATCHER_CONFIG`，启动、替换及内部传输配置见 [Dispatcher 说明](dispatcher/README.md)。Gateway 副本须共享 profiles、Agent namespace 和服务凭证。增加 Gateway/Dispatcher 副本不会自动增加用户实例；本期不启用自动弹性。
 
-```bash
-adx exec --agent <agent_name> --server {frontend_endpoint} --args '{"message":"hello"}'
-```
+当前以预装镜像提供 RRT、解释器、用户脚本及服务依赖，RRT 拉起显式入口。镜像启动配置必须匹配 Sandbox profile；动态注入、迟到创建取消及 RRT 启动锁竞争仍是平台限制。首次 Ready 后由 Substrate 保证健康；直接从 Substrate 删除实例不会自动同步 ADX 状态，应通过 ADX 实例/Session 接口释放。
 
-For more installation methods, parameter details, and interactive mode usage, see [cli/README.md](cli/README.md).
+## 验证
 
-### Project Structure
-
-```text
-cli/                 Python CLI package source and packaging config
-cli/ar_cli/          adx command implementation
-sdk/python/          Independent agent-dx Python SDK package
-executor/            Independent Agent Executor package
-tests/cli/           CLI unit tests
-tests/python/        agent-dx SDK unit and integration tests
-tests/executor/      Agent Executor unit tests
-../pytest.ini        Test configuration
-```
-
-The CLI, SDK, and Executor are separate distributions that share the version
-in the repository-level `VERSION` file.
-
-## Contributing
-
-We welcome developers to contribute to agent-dx. You can contribute in the following ways:
-
-- Submit bugs, feature requests, or usage issues: [Issues](https://github.com/openJiuwen-ai/agent-dx/issues)
-- Submit code, documentation, or examples: [Pull Requests](https://github.com/openJiuwen-ai/agent-dx/pulls)
-
-## License
-
-[Apache License 2.0](../LICENSE)
-
-This product serves solely as a workflow orchestration tool and does not embed any AI model capabilities. When users integrate AI models for specific business scenarios, they shall bear full responsibility for compliance obligations under the EU AI Act and other relevant regulatory frameworks.
+运行 `make agent-test` 验证 Agent 和 Gateway 组件。真实 Redis 测试需将 `ADX_AGENT_TEST_REDIS_URL` 指向一次性数据库，并显式使用 `--ignored`；各测试使用独立命名空间，详见 [存储保证](crates/store/README.md)。组件测试与真实平台端到端验收分开统计，Platform 源码不在本次修改范围。
