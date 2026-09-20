@@ -4,10 +4,7 @@ Monorepo for Agent Distributed Executor, the Instance execution platform, and sh
 
 | Directory | Responsibility |
 |---|---|
-| `agent/cli` | Python `adx` CLI |
-| `agent/sdk/python` | Agent programming SDK |
-| `agent/executor` | In-instance Agent Executor |
-| `agent/tests` | Existing Agent unit/integration tests and shared fixtures |
+| `agent/` | Rust Agent APIs, independent Dispatcher, current-state storage and tests |
 | `gateway` | Rust Edge, Node Proxy, and forwarder |
 | `platform/runtime/rrt` | RRT daemon and runtime adapter |
 | `platform/sdk/sandbox/python` | Public Sandbox SDK |
@@ -17,7 +14,7 @@ Monorepo for Agent Distributed Executor, the Instance execution platform, and sh
 | `platform/control-plane/api-server` | Rust public HTTP API, authentication, ownership cache and direct Instance RPC |
 | `platform/api/proto` | Instance, snapshot, credentials, routes and node-local protocol definitions |
 
-The Agent product targets the public Sandbox SDK; its current CLI/SDK/Executor still require the legacy Agent backend. The new platform package alone does not run that Agent business flow. The Rust API Server rewrite has passed [Kubernetes acceptance](docs/testing/2026-09-17-rust-api-server-k8s.md); see [migration steps](docs/testing/rust-api-server.md). Rust Master and Node Manager expose authenticated service processes, Redis persistence/discovery, scheduling and node lifecycle recovery; the Rust API Server connects to those services. Edge subscribes to committed routes over gRPC, while Node Proxy requires a complete local binding synchronization before admission. See [implementation status](docs/testing/control-plane-implementation.md) and [route publication](docs/testing/route-publication.md). The Rust process supervisor and unified package are implemented; see [process deployment](docs/testing/process-deployment.md). Local public-SDK acceptance now covers real Firecracker pause/resume, S3 recovery and node lifecycle failures. See the [stage roadmap](docs/testing/control-plane-roadmap.md) for completed gates and remaining work.
+Agent v2 uses Rust APIs embedded in Gateway and an independent Dispatcher; see [Agent usage](agent/README.md). The legacy Python Agent packages have been removed. The Rust API Server rewrite has passed [Kubernetes acceptance](docs/testing/2026-09-17-rust-api-server-k8s.md); see [migration steps](docs/testing/rust-api-server.md). Rust Master and Node Manager expose authenticated service processes, Redis persistence/discovery, scheduling and node lifecycle recovery; the Rust API Server connects to those services. Edge subscribes to committed routes over gRPC, while Node Proxy requires a complete local binding synchronization before admission. See [implementation status](docs/testing/control-plane-implementation.md) and [route publication](docs/testing/route-publication.md). The Rust process supervisor and unified package are implemented; see [process deployment](docs/testing/process-deployment.md). Local public-SDK acceptance now covers real Firecracker pause/resume, S3 recovery and node lifecycle failures. See the [stage roadmap](docs/testing/control-plane-roadmap.md) for completed gates and remaining work.
 
 ![Current component architecture](docs/architecture/current-architecture.svg)
 
@@ -65,7 +62,7 @@ profiles remain planned and are not implied by a green base `full` result.
 Detailed resources, kernel checks, RBAC/network requirements and CI-worker
 resources are documented in the [Kubernetes E2E README](build/e2e/kubernetes/README.md).
 
-Rust uses the root Cargo workspace. The Sandbox SDK uses distribution `adx-sandbox`, import `adx_sandbox`, CLI `adx-sandbox`, and `ADX_*` environment settings. Agent namespaces are `adx.agentruntime` and `adx.agentexecutor`; Gateway binaries use `adx-`, configuration uses `ADX_`, and internal branded headers use `X-ADX-`. Run matching component versions together.
+Rust uses the root Cargo workspace. The Sandbox SDK uses distribution `adx-sandbox`, import `adx_sandbox`, CLI `adx-sandbox`, and `ADX_*` environment settings. Agent Rust crates use `adx-agent-`; Gateway binaries use `adx-`, configuration uses `ADX_`, and internal branded headers use `X-ADX-`. Run matching component versions together.
 
 Rust changes must pass `make rust-check`, which applies the repository format and
 Clippy policy before running tests. The adopted rules, intentional exceptions and
@@ -73,15 +70,15 @@ migration policy are documented in the [Rust coding guidelines](docs/development
 
 ```sh
 cargo test --locked --workspace --all-features -j 2
-python -m pytest -q
+make agent-test
 PYTHONPATH=platform/sdk/sandbox/python python -m pytest -q -c platform/sdk/sandbox/pytest.ini platform/sdk/sandbox/python/tests
 
 cargo test --locked -p adx-api-server -j 2
 ```
 
-`make help` lists the combined entrypoints. Install Python test/build requirements in a virtual environment (`pytest`, `pytest-asyncio`, `setuptools`, `wheel`, `build`, and each package's dependencies). `make package PYTHON=/path/to/venv/bin/python` produces the four Python distributions under `out/wheels`. `BUILD_VERSION` can set release versions explicitly. The Sandbox SDK has its own `VERSION`; it does not derive its version from Agent repository tags.
+`make help` lists the combined entrypoints. Install Python test/build requirements in a virtual environment (`pytest`, `pytest-asyncio`, `setuptools`, `wheel`, `build`, and each package's dependencies). `make package PYTHON=/path/to/venv/bin/python` produces the Sandbox SDK distribution under `out/wheels`. `BUILD_VERSION` can set release versions explicitly. The Sandbox SDK has its own `VERSION`; it does not derive its version from Agent repository tags.
 
-Set `CARGO_TARGET_DIR` to a persistent cache in automation. Building the external sandboxd dependency additionally uses Go caches. `build/` contains source scripts; temporary build outputs belong in `out/` or a cache directory. `bash build.sh -C` cleans package artifacts and preserves the source scripts.
+Set `CARGO_TARGET_DIR` to a persistent cache in automation. Building the external sandboxd dependency additionally uses Go caches. `build/` contains source scripts; temporary build outputs belong in `out/` or a cache directory. `bash build.sh` builds Rust Agent components; `bash build.sh -t` runs their tests.
 
 The Rust API Server has an `adx-api-server` process entrypoint and configuration under `build/config/examples/`. Component integration evidence is separate from complete platform deployment validation.
 

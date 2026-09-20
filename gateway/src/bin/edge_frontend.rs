@@ -23,6 +23,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn run(config: EdgeFrontendConfig) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(not(feature = "agent-api"))]
+    if std::env::var_os("ADX_SANDBOX_CONFIG").is_some()
+        || std::env::var_os("ADX_AGENT_CONFIG").is_some()
+    {
+        return Err("ADX_SANDBOX_CONFIG requires a Gateway built with --features agent-api".into());
+    }
     let tls_listener = TcpListener::bind(config.tls_bind).await?;
     let plain_listener = TcpListener::bind(config.plain_bind).await?;
     let health_listener = TcpListener::bind(config.health_bind).await?;
@@ -38,32 +44,78 @@ async fn run(config: EdgeFrontendConfig) -> Result<(), Box<dyn std::error::Error
     let resolver = Arc::new(EdgeRouteResolver::new(store.clone()).stream_only());
     let connector = DataPlaneL4Connector::new(config.h2_pool_config()?);
     let authenticator = EdgeAuthenticator::with_verifier(watcher.clone());
-    let gateway = Arc::new(
-        EdgeFrontend::new(
-            resolver,
-            connector,
-            authenticator,
-            config.default_direct_port,
-            config.default_tunnel_port,
-            config.frontend_address.clone(),
-            config.control_plane_routes.clone(),
-        )
-        .with_backend_http_pool_config(config.backend_http_pool_config())
-        .with_reverse_proxy_config(config.reverse_proxy.clone())
-        .with_proxy_routes(config.proxy_routes.clone())
-        .with_command_watch_config(CommandWatchConfig {
-            max_subscriptions_per_connection: config.command_watch_max_subscriptions,
-            queue_capacity: config.command_watch_queue_capacity,
-            max_frame_bytes: config.command_watch_max_frame_bytes,
-            ping_interval: config.command_watch_ping_interval,
-        })
-        .with_client_acl(
-            config.allowed_client_networks.clone(),
-            config.allow_any_client,
-        ),
+    #[cfg(feature = "agent-api")]
+    let sandbox_api = if let Ok(path) = std::env::var("ADX_SANDBOX_CONFIG") {
+        use data_plane_gateway::edge::sandbox_api::{PlatformSandbox, SandboxApi, SandboxConfig};
+        let settings: SandboxConfig = serde_json::from_slice(&std::fs::read(path)?)
+            .map_err(|_| "invalid Sandbox configuration")?;
+        let backend = Arc::new(PlatformSandbox::new(
+            settings,
+            connector.clone(),
+            std::env::var("ADX_SANDBOX_RRT_TOKEN")?,
+        )?);
+        Some(Arc::new(SandboxApi::new(
+            backend,
+            &std::env::var("ADX_SANDBOX_SERVICE_TOKEN")?,
+        )?))
+    } else {
+        None
+    };
+    #[cfg(feature = "agent-api")]
+    let agent_api = if let Ok(path) = std::env::var("ADX_AGENT_CONFIG") {
+        use data_plane_gateway::edge::agent_api::{AgentApi, AgentConfig};
+        let config: AgentConfig = serde_json::from_slice(&std::fs::read(path)?)
+            .map_err(|_| "invalid Agent configuration")?;
+        let sandbox = sandbox_api
+            .as_ref()
+            .ok_or("Agent APIs require ADX_SANDBOX_CONFIG")?;
+        Some(Arc::new(
+            AgentApi::new(config, sandbox.backend.clone()).await?,
+        ))
+    } else {
+        None
+    };
+    let gateway = EdgeFrontend::new(
+        resolver,
+        connector,
+        authenticator,
+        config.default_direct_port,
+        config.default_tunnel_port,
+        config.frontend_address.clone(),
+        config.control_plane_routes.clone(),
+    )
+    .with_backend_http_pool_config(config.backend_http_pool_config())
+    .with_reverse_proxy_config(config.reverse_proxy.clone())
+    .with_proxy_routes(config.proxy_routes.clone())
+    .with_command_watch_config(CommandWatchConfig {
+        max_subscriptions_per_connection: config.command_watch_max_subscriptions,
+        queue_capacity: config.command_watch_queue_capacity,
+        max_frame_bytes: config.command_watch_max_frame_bytes,
+        ping_interval: config.command_watch_ping_interval,
+    })
+    .with_client_acl(
+        config.allowed_client_networks.clone(),
+        config.allow_any_client,
     );
+    #[cfg(feature = "agent-api")]
+    let gateway = if let Some(api) = sandbox_api {
+        gateway.with_sandbox_api(api)
+    } else {
+        gateway
+    };
+    #[cfg(feature = "agent-api")]
+    let gateway = if let Some(api) = &agent_api {
+        gateway.with_agent_api(api.clone())
+    } else {
+        gateway
+    };
+    let gateway = Arc::new(gateway);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-
+    #[cfg(feature = "agent-api")]
+    let dispatcher_task = agent_api
+        .as_ref()
+        .and_then(|api| api.dispatcher.as_ref())
+        .map(|client| tokio::spawn(client.clone().run(shutdown_rx.clone())));
     let watcher_task = tokio::spawn(watcher.run(store));
     let route_reconciler_task = tokio::spawn(gateway.clone().run_route_reconciler(route_changes));
     let tls_acceptor = load_tls_acceptor(&config.tls_cert, &config.tls_key)?;
@@ -96,6 +148,10 @@ async fn run(config: EdgeFrontendConfig) -> Result<(), Box<dyn std::error::Error
     let deadline = tokio::time::Instant::now() + config.drain_timeout;
     while gateway.active_sessions() > 0 && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    #[cfg(feature = "agent-api")]
+    if let Some(task) = dispatcher_task {
+        task.abort();
     }
     watcher_task.abort();
     route_reconciler_task.abort();

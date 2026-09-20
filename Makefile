@@ -27,16 +27,16 @@ rust-test:
 	$(CARGO) test --locked --workspace --all-features -j $(JOBS) -- --test-threads=$(JOBS)
 scheduler-bench:
 	$(CARGO) test --locked --release -p adx-master --test benchmark -j $(JOBS) -- --ignored --nocapture
-python-test: agent-test sandbox-sdk-test
+python-test: sandbox-sdk-test
 agent-test:
-	$(PYTHON) -m pytest -q $(PYTEST_ARGS)
+	$(CARGO) test --locked -p adx-agent-core -p adx-agent-store -p adx-agent-api -p adx-dispatcher -j $(JOBS)
+	$(CARGO) test --locked -p data-plane-gateway --features agent-api --lib -j $(JOBS)
 sandbox-sdk-test:
 	PYTHONPATH=platform/sdk/sandbox/python $(PYTHON) -m pytest -q -c platform/sdk/sandbox/pytest.ini platform/sdk/sandbox/python/tests $(PYTEST_ARGS)
 ci:
 	$(PYTHON) build/ci/run.py $(SUITE) --jobs $(JOBS)
 test: rust-check rust-test python-test
 package:
-	bash build.sh -p '$(PYTHON)' -o '$(OUT)/wheels'
 	PYTHON='$(PYTHON)' bash platform/sdk/sandbox/python/build.sh '$(OUT)/wheels'
 data-plane-gateway:
 	$(CARGO) build --locked -p data-plane-gateway --all-features --release -j $(JOBS)

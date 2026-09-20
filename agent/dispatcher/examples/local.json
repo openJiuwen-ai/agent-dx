@@ -1,0 +1,11 @@
+{
+  "listen": "127.0.0.1:8091",
+  "node_id": "dispatcher-local-1",
+  "advertised_url": "http://127.0.0.1:8091",
+  "redis_url": "redis://127.0.0.1:6379/0",
+  "namespace": "local-verification",
+  "gateway_url": "http://127.0.0.1:8080",
+  "allow_plaintext_transport": true,
+  "create_timeout_seconds": 60,
+  "gateway_ca_file": null
+}
