@@ -1,6 +1,7 @@
 use crate::{
     clients::{authorize, Clients},
     contract,
+    errors::ErrorDetail,
     operations::{snapshot_value, Kind, Operations},
 };
 use adx_observability::trace;
@@ -98,6 +99,10 @@ impl Api {
         Ok(response)
     }
     async fn handle(self: Arc<Self>, request: Request<Incoming>) -> Response<Body> {
+        let request_id = header(&request, "x-request-id")
+            .filter(|v| !v.trim().is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let api_key = header(&request, "authorization")
             .and_then(|s| s.strip_prefix("Bearer "))
             .or_else(|| header(&request, "x-auth-token"))
@@ -107,20 +112,25 @@ impl Api {
         let caller = match Box::pin(self.clients.authenticate(api_key)).await {
             Ok(caller) => caller,
             Err(error) => {
-                return envelope(
-                    if matches!(error.code(), Code::Unavailable | Code::DeadlineExceeded) {
-                        503
-                    } else {
-                        401
-                    },
-                    None,
-                    Some("authentication failed"),
-                )
+                let status = if matches!(error.code(), Code::Unavailable | Code::DeadlineExceeded) {
+                    Status::unavailable("authentication service unavailable")
+                } else {
+                    Status::unauthenticated("authentication failed")
+                };
+                return error_response(status, &request_id, None, None, false);
             }
         };
         let path = match percent_encoding::percent_decode_str(request.uri().path()).decode_utf8() {
             Ok(path) => path.trim_end_matches('/').to_string(),
-            Err(_) => return envelope(400, None, Some("invalid path encoding")),
+            Err(_) => {
+                return error_response(
+                    Status::invalid_argument("invalid path encoding"),
+                    &request_id,
+                    None,
+                    None,
+                    false,
+                )
+            }
         };
         let method = request.method().as_str().to_string();
         if agent_route(&method, &path) {
@@ -134,21 +144,23 @@ impl Api {
             v.split(',')
                 .any(|v| v.trim().starts_with("text/event-stream"))
         });
-        let request_id = header(&request, "x-request-id")
-            .filter(|v| !v.trim().is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let lifecycle_id = header(&request, "x-adx-request-id")
             .unwrap_or("")
             .trim()
             .to_string();
         if path.starts_with("/api/admin/v1/keys") {
             if !caller.administrator {
-                return plain(403, json!({"error":"administrator required"}));
+                return error_response(
+                    Status::permission_denied("administrator required"),
+                    &request_id,
+                    None,
+                    None,
+                    false,
+                );
             }
             let body = match body(request.into_body(), 8192).await {
                 Ok(v) => v,
-                Err(e) => return plain(400, json!({"error":e.message()})),
+                Err(error) => return error_response(error, &request_id, None, None, false),
             };
             return match Box::pin(self.keys(&method, &path, &query, body, &caller)).await {
                 Ok((status, data)) => {
@@ -159,7 +171,7 @@ impl Api {
                     );
                     response
                 }
-                Err(error) => plain(status_code(&error), json!({"error":error.message()})),
+                Err(error) => error_response(error, &request_id, None, None, method != "GET"),
             };
         }
         if method == "GET" && path == "/api/instances" {
@@ -167,21 +179,42 @@ impl Api {
                 .get("instance_id")
                 .filter(|value| !value.trim().is_empty())
             else {
-                return plain(400, json!({"error":"instance_id required"}));
+                return error_response(
+                    Status::invalid_argument("instance_id required"),
+                    &request_id,
+                    None,
+                    None,
+                    false,
+                );
             };
             return match Box::pin(self.clients.owner(instance_id, &caller, false)).await {
                 Ok(owner) => {
                     let Some(record) = owner.record else {
-                        return plain(
-                            502,
-                            json!({"error":"instance directory returned no record"}),
+                        return error_response(
+                            Status::unavailable("instance directory returned no record"),
+                            &request_id,
+                            None,
+                            Some(instance_id),
+                            false,
                         );
                     };
                     if record.state == pb::InstanceState::Deleted as i32 {
-                        return plain(404, json!({"error":"Not Found"}));
+                        return error_response(
+                            Status::not_found("instance not found"),
+                            &request_id,
+                            None,
+                            Some(instance_id),
+                            false,
+                        );
                     }
                     let Some(spec) = record.spec else {
-                        return plain(502, json!({"error":"instance record returned no spec"}));
+                        return error_response(
+                            Status::data_loss("instance record returned no spec"),
+                            &request_id,
+                            None,
+                            Some(instance_id),
+                            false,
+                        );
                     };
                     let resource = spec.resources.unwrap_or_default();
                     plain(
@@ -195,12 +228,12 @@ impl Api {
                         }]),
                     )
                 }
-                Err(error) => plain(status_code(&error), json!({"error":error.message()})),
+                Err(error) => error_response(error, &request_id, None, Some(instance_id), false),
             };
         }
         let mut input = match body(request.into_body(), 1048576).await {
             Ok(v) => v,
-            Err(e) => return envelope(status_code(&e), None, Some(e.message())),
+            Err(error) => return error_response(error, &request_id, None, None, false),
         };
         if method == "POST"
             && (path == "/api/sandbox/v1/sandboxes" || path == "/api/sandbox/create")
@@ -221,26 +254,50 @@ impl Api {
                 self.clients.config.runtime_environment.as_ref(),
             ) {
                 Ok(s) => s,
-                Err(e) => return envelope(status_code(&e), None, Some(e.message())),
+                Err(error) => return error_response(error, &request_id, None, None, false),
             };
             if stream && path.ends_with("sandboxes") {
                 return self.create_stream(spec, input, request_id, caller);
             }
             let result = Box::pin(self.create(spec, input, &request_id, &caller)).await;
-            return response(if path == "/api/sandbox/create" {
-                result.map(|v| json!({"instance_id":v["instanceId"]}))
-            } else {
-                result
-            });
+            return response(
+                if path == "/api/sandbox/create" {
+                    result.map(|v| json!({"instance_id":v["instanceId"]}))
+                } else {
+                    result
+                },
+                &request_id,
+                None,
+                None,
+                true,
+            );
         }
         if let Some(id) = path.strip_prefix("/api/sandbox/v1/snapshots/") {
             if method == "DELETE" && lifecycle_id.is_empty() {
-                return envelope(400, None, Some("snapshot request ID required"));
+                return error_response(
+                    Status::invalid_argument("snapshot request ID required"),
+                    &request_id,
+                    None,
+                    None,
+                    false,
+                );
             }
-            return response(Box::pin(self.snapshots(&method, Some(id), &query, &caller)).await);
+            return response(
+                Box::pin(self.snapshots(&method, Some(id), &query, &caller)).await,
+                &request_id,
+                (!lifecycle_id.is_empty()).then_some(lifecycle_id.as_str()),
+                None,
+                method != "GET",
+            );
         }
         if path == "/api/sandbox/v1/snapshots" {
-            return response(Box::pin(self.snapshots(&method, None, &query, &caller)).await);
+            return response(
+                Box::pin(self.snapshots(&method, None, &query, &caller)).await,
+                &request_id,
+                None,
+                None,
+                method != "GET",
+            );
         }
         let rest = path
             .strip_prefix("/api/sandbox/v1/sandboxes/")
@@ -267,11 +324,21 @@ impl Api {
                         action
                     };
                     if !operation_id(op_id, prefix) {
-                        return envelope(400, None, Some("invalid operation request ID"));
+                        return error_response(
+                            Status::invalid_argument("invalid operation request ID"),
+                            &request_id,
+                            Some(op_id),
+                            Some(id),
+                            false,
+                        );
                     }
                 }
                 return response(
                     Box::pin(self.operations.execute(kind, id, op_id, input, &caller)).await,
+                    &request_id,
+                    Some(op_id),
+                    Some(id),
+                    true,
                 );
             }
             if matches!(
@@ -279,12 +346,24 @@ impl Api {
                 ("POST", "reload" | "invoke") | ("PUT", "network")
             ) {
                 if let Err(e) = Box::pin(self.clients.owner(id, &caller, false)).await {
-                    return response(Err(e));
+                    return response(Err(e), &request_id, None, Some(id), false);
                 }
-                return envelope(501, None, Some("operation is not supported by this API"));
+                return error_response(
+                    Status::unimplemented("operation is not supported by this API"),
+                    &request_id,
+                    None,
+                    Some(id),
+                    false,
+                );
             }
         }
-        plain(404, json!({"error":"Not Found"}))
+        error_response(
+            Status::not_found("route not found"),
+            &request_id,
+            None,
+            None,
+            false,
+        )
     }
 
     fn create_stream(
@@ -311,6 +390,7 @@ impl Api {
                 return;
             }
 
+            let instance_id = spec.id.clone();
             let create = self.create(spec, input, &request_id, &caller);
             tokio::pin!(create);
             let result = loop {
@@ -324,16 +404,26 @@ impl Api {
             };
             let final_event = match result {
                 Ok(value) => value,
-                Err(error) => json!({
-                    "status": if error.code() == Code::DeadlineExceeded {
-                        "timeout"
-                    } else {
-                        "failed"
-                    },
-                    "requestId": request_id,
-                    "errorCode": status_code(&error),
-                    "message": error.message(),
-                }),
+                Err(error) => {
+                    let detail = ErrorDetail::from_status(
+                        &error,
+                        &request_id,
+                        None,
+                        Some(&instance_id),
+                        true,
+                    );
+                    json!({
+                        "status": if error.code() == Code::DeadlineExceeded {
+                            "timeout"
+                        } else {
+                            "failed"
+                        },
+                        "requestId": request_id,
+                        "errorCode": status_code(&error),
+                        "message": error.message(),
+                        "error": detail,
+                    })
+                }
             };
             let _ = sender.send(Ok(sse("final", final_event))).await;
         }));
@@ -786,11 +876,49 @@ async fn body(body: Incoming, limit: usize) -> Result<Value, Status> {
     }
     serde_json::from_slice(&bytes).map_err(|_| Status::invalid_argument("invalid JSON request"))
 }
-fn response(value: Result<Value, Status>) -> Response<Body> {
+fn response(
+    value: Result<Value, Status>,
+    request_id: &str,
+    operation_id: Option<&str>,
+    instance_id: Option<&str>,
+    execution_may_have_started: bool,
+) -> Response<Body> {
     match value {
         Ok(value) => envelope(200, Some(value), None),
-        Err(error) => envelope(status_code(&error), None, Some(error.message())),
+        Err(error) => error_response(
+            error,
+            request_id,
+            operation_id,
+            instance_id,
+            execution_may_have_started,
+        ),
     }
+}
+
+fn error_response(
+    error: Status,
+    request_id: &str,
+    operation_id: Option<&str>,
+    instance_id: Option<&str>,
+    execution_may_have_started: bool,
+) -> Response<Body> {
+    let status = status_code(&error);
+    let detail = ErrorDetail::from_status(
+        &error,
+        request_id,
+        operation_id,
+        instance_id,
+        execution_may_have_started,
+    );
+    plain(
+        status,
+        json!({
+            "code": status,
+            "message": error.message(),
+            "data": null,
+            "error": detail,
+        }),
+    )
 }
 fn envelope(status: u16, value: Option<Value>, error: Option<&str>) -> Response<Body> {
     let data = value.filter(|value| !value.is_null()).map(|value| {
@@ -894,5 +1022,38 @@ fn route_name(path: &str) -> &'static str {
         "/api/sandbox/*"
     } else {
         "other"
+    }
+}
+
+#[cfg(test)]
+mod error_contract_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn submitted_write_error_serializes_the_stable_contract() {
+        let response = error_response(
+            Status::unavailable("reply lost"),
+            "request-a",
+            Some("pause-a"),
+            Some("instance-a"),
+            true,
+        );
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let value: Value = serde_json::from_slice(
+            &response
+                .into_body()
+                .collect()
+                .await
+                .expect("static body")
+                .to_bytes(),
+        )
+        .expect("JSON error body");
+        assert_eq!(value["code"], 503);
+        assert_eq!(value["error"]["code"], "OUTCOME_UNKNOWN");
+        assert_eq!(value["error"]["retry"], "same_operation");
+        assert_eq!(value["error"]["outcome"], "unknown");
+        assert_eq!(value["error"]["requestId"], "request-a");
+        assert_eq!(value["error"]["operationId"], "pause-a");
+        assert_eq!(value["error"]["instanceId"], "instance-a");
     }
 }

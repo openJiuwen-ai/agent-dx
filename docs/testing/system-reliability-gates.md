@@ -8,10 +8,10 @@
 
 | 门禁 | 场景 | 通过条件 | 当前状态 |
 |---|---|---|---|
-| ERR-01 | 稳定错误映射 | Invalid、Auth、Permission、NotFound、Conflict、NoCapacity、Unavailable、Deadline、OutcomeUnknown、DataLoss、Internal 的 HTTP/gRPC/SDK 映射一致 | 待补统一结构化错误体 |
-| ERR-02 | 可重试分类 | 稳定业务冲突不重试；临时不可用按退避；结果未知只以同一 request/operation/instance 身份重试 | 部分实现，待 E2E |
+| ERR-01 | 稳定错误映射 | Invalid、Auth、Permission、NotFound、Conflict、NoCapacity、Unavailable、Deadline、OutcomeUnknown、DataLoss、Internal 的 HTTP/gRPC/SDK 映射一致 | API Server 与 Python SDK 已实现并有契约测试；完整进程 E2E 待补 |
+| ERR-02 | 可重试分类 | 稳定业务冲突不重试；临时不可用按退避；结果未知只以同一 request/operation/instance 身份重试 | SDK 已按结构化字段执行，待真实断流 E2E |
 | ERR-03 | 创建应答丢失 | Node 已启动但响应被切断；重试收敛到同一 backend 和 generation | 组件测试已有，待真实断流 E2E |
-| ERR-04 | 查询空结果 | 结果未知后的 404 不触发换 ID 或第二次 Start | 待 E2E |
+| ERR-04 | 查询空结果 | 结果未知后的 404 不触发换 ID 或第二次 Start | SDK 稳定 Instance ID 与原子 claim 已有测试，待真实断流 E2E |
 
 ## Deadline 契约
 

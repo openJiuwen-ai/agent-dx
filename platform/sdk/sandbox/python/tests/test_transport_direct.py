@@ -199,8 +199,13 @@ def test_create_retries_broken_sse_with_stable_request_identity():
         f"request id changed across retries: {attempts}",
     )
     _check(
-        all("name" not in item["body"] for item in attempts),
-        f"anonymous create must leave name generation to frontend: {attempts}",
+        len({item["body"]["name"] for item in attempts}) == 1,
+        f"generated instance name changed across retries: {attempts}",
+    )
+    _check(
+        attempts[0]["body"]["name"]
+        == f"sandbox-{attempts[0]['request_id'].removeprefix('create-')}",
+        f"generated name is not tied to the request identity: {attempts}",
     )
     print("ok: broken create SSE retries with stable request identity")
 
@@ -266,7 +271,7 @@ def test_create_http_error_is_not_retried():
     print("ok: create HTTP errors are not retried")
 
 
-def test_distinct_logical_creates_use_distinct_request_ids_without_names():
+def test_distinct_logical_creates_use_distinct_request_ids_and_names():
     attempts = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -298,14 +303,18 @@ def test_distinct_logical_creates_use_distinct_request_ids_without_names():
     for attempt in attempts:
         operation_id = attempt["request_id"].removeprefix("create-")
         _check(
-            "name" not in attempt["body"],
-            f"anonymous create unexpectedly sent a name: {attempt}",
+            attempt["body"]["name"] == f"sandbox-{operation_id}",
+            f"generated name does not match request identity: {attempt}",
         )
         _check(
             uuid.UUID(operation_id).version == 4,
             f"create identity is not a full UUIDv4: {attempt}",
         )
-    print("ok: distinct logical creates use distinct request ids without names")
+    _check(
+        attempts[0]["body"]["name"] != attempts[1]["body"]["name"],
+        f"logical creates reused an instance name: {attempts}",
+    )
+    print("ok: distinct logical creates use distinct request ids and names")
 
 
 def test_create_retries_gateway_503_with_stable_request_id():

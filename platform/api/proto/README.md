@@ -12,6 +12,7 @@ extend the old POSIX, function, or generic signal services for new functionality
 | `routes.proto` | Versioned Instance directory and committed route publication | InstanceDirectoryService and RouteService |
 | `node.proto` / `adx.node.v1` | Versioned Node Proxy bindings and activity | Node-local UDS services |
 | RRT HTTP | Commands, files, health, checkpoint cooperation and tunnels | See [runtime contract](../http/runtime-control.md) |
+| Management errors | Stable HTTP/gRPC/SDK code, retry and outcome semantics | See [error contract](../http/error-contract.md) |
 
 The Rust API Server converts public HTTP JSON directly into Instance RPC types.
 All owned protobuf definitions are generated through the Cargo protocol crate.
