@@ -1,109 +1,98 @@
+**English** | [中文](README.zh.md)
+
 # Agent DX
 
-Monorepo for Agent Distributed Executor, the Instance execution platform, and shared gateways.
+Agent DX is an execution platform for agents and isolated Instances. It provides a public Sandbox API and SDK, distributed scheduling, node-local lifecycle management, shared traffic entrypoints, runtime operations, checkpoint recovery, and deployment tooling in one repository.
+
+![Agent DX architecture](docs/architecture/images/agent-dx.svg)
+
+## Architecture
+
+Agent applications use the public Sandbox SDK to create and operate Instances. Gateway terminates external traffic and separates control requests from data requests. API Server authenticates callers and serves the Sandbox HTTP API. Master owns cluster state, scheduling, node health, route publication, credentials, and snapshot metadata. Node Manager performs final local admission and serializes the lifecycle of every Instance. Node Proxy forwards data traffic to RRT inside the selected Instance.
+
+Redis is the authoritative cluster store and discovery backend. Node Manager uses a local SQLite journal only when cluster-state submission is temporarily unavailable. sandboxd is managed by the deployment environment and provides the execution backend. Node Manager embeds Node Proxy by default and also supports an explicit split-process deployment.
 
 | Directory | Responsibility |
 |---|---|
-| `agent/` | Rust Agent APIs, independent Dispatcher, current-state storage and tests |
-| `gateway` | Rust Edge, Node Proxy, and forwarder |
-| `platform/runtime/rrt` | RRT daemon and runtime adapter |
-| `platform/sdk/sandbox/python` | Public Sandbox SDK |
-| `platform/control-plane/master` | Rust Master, Shard scheduling, Redis and route/snapshot catalogs |
-| `platform/control-plane/node-manager` | Instance lifecycle, sandboxd, checkpoints and outage journal |
-| `platform/deployment` | Unified Rust `adxctl` configuration and supervisor for control-plane and data-plane services |
-| `platform/control-plane/api-server` | Rust public HTTP API, authentication, ownership cache and direct Instance RPC |
-| `platform/api/proto` | Instance, snapshot, credentials, routes and node-local protocol definitions |
-| `platform/crates/service-runtime` | Typed service `--config` parsing, safe JSON loading and process shutdown signals |
+| `agent/` | Agent APIs, sessions, dispatch, and execution orchestration |
+| `gateway/` | Edge entrypoint, Node Proxy, routing, and forwarding |
+| `platform/control-plane/api-server/` | Sandbox HTTP API, authentication, ownership cache, and Instance RPC clients |
+| `platform/control-plane/master/` | Cluster state, scheduling shards, Redis persistence, routes, credentials, and snapshots |
+| `platform/control-plane/node-manager/` | Local admission, Instance lifecycle, sandboxd integration, checkpoints, and outage journal |
+| `platform/runtime/rrt/` | Instance-local command, file, terminal, activity, and recovery operations |
+| `platform/sdk/sandbox/python/` | Public Python Sandbox SDK |
+| `platform/api/proto/` | Internal Instance, node, route, credential, and snapshot contracts |
+| `platform/deployment/` | `adxctl`, configuration rendering, process supervision, and shutdown cleanup |
+| `build/` and `.buildkite/` | Build, packaging, release, and end-to-end validation tooling |
 
-Agent v2 uses Rust APIs embedded in Gateway and an independent Dispatcher; see [Agent usage](agent/README.md). The legacy Python Agent packages have been removed. The Rust API Server rewrite has passed [Kubernetes acceptance](docs/testing/2026-09-17-rust-api-server-k8s.md); see [migration steps](docs/testing/rust-api-server.md). Rust Master and Node Manager expose authenticated service processes, Redis persistence/discovery, scheduling and node lifecycle recovery; the Rust API Server connects to those services. Node Manager embeds Node Proxy by default while retaining an explicit split-process mode. Edge subscribes to committed routes over gRPC, while Node Proxy requires a complete local binding synchronization before admission. See [implementation status](docs/testing/control-plane-implementation.md) and [route publication](docs/testing/route-publication.md). The Rust process supervisor and unified package are implemented; see [process deployment](docs/testing/process-deployment.md). Local public-SDK acceptance now covers real Firecracker pause/resume, S3 recovery and node lifecycle failures. See the [stage roadmap](docs/testing/control-plane-roadmap.md) for completed gates and remaining work.
+## Capabilities
 
-![Current component architecture](docs/architecture/current-architecture.svg)
+- Instance creation, query, deletion, pause, resume, snapshots, and snapshot-based cloning.
+- Central and local-first creation paths with CPU, memory, disk, GPU/NPU device, label, affinity, and preference constraints.
+- API Key authentication with administrator and tenant identities; internal services use configurable mTLS.
+- Versioned route publication from Master to Edge and synchronized local bindings between Node Manager and Node Proxy.
+- Node reconciliation, restart policies, idle deletion, checkpoint recovery, local and S3-compatible snapshot storage, and reference-aware artifact cleanup.
+- Prometheus metrics, OpenTelemetry traces, structured logs, log rotation, gzip compression, and external Collector integration.
+- Process deployment with managed or external Redis, plus Kubernetes end-to-end deployment profiles.
 
-See [current layout](docs/architecture/repository-layout.md) and [public API support](platform/control-plane/api-server/docs/sandbox-lifecycle-api.md). Client options such as network policy, entrypoint inheritance and reload are not all supported by the new backend.
+## Quick start
+
+Use an ADX release package on a Linux host. The deployment environment must provide sandboxd, certificates, an initial administrator API Key, and Instance networking. The default standalone profile starts Redis, Master, Node Manager with embedded Node Proxy, API Server, and Edge on one host.
+
+```sh
+sudo install -d -m 0700 /etc/adx /etc/adx/tls /etc/adx/secrets /var/lib/adx /run/adx
+sudo /opt/adx/bin/adxctl config init
+
+# Edit /etc/adx/deployment.yaml, then validate and start it.
+sudo /opt/adx/bin/adxctl validate
+sudo /opt/adx/bin/adxctl render --output /run/adx/config-review
+sudo /opt/adx/bin/adxctl run
+```
+
+In another terminal:
+
+```sh
+sudo /opt/adx/bin/adxctl status
+sudo /opt/adx/bin/adxctl stop
+```
+
+Use `standalone-external-redis`, `master`, `node`, or `edge-api` profiles for external Redis and split-host deployments. Each host owns one deployment YAML; hosts join the same cluster through a shared Redis URL and namespace.
+
+See the [standalone guide](docs/deployment/standalone.md), [`adxctl` reference](docs/deployment/adxctl.md), and [runtime environment guide](docs/deployment/runtime-environment.md) for certificates, Redis, sandboxd, networking, SDK setup, and role-specific examples.
 
 ## Build and test
 
-Local component and Socket checks use `python3 build/ci/run.py <suite>`. Buildkite has separate release, image and Kubernetes public-SDK steps. [Buildkite #30](docs/testing/2026-09-18-runtime-environment-k8s.md) passed all eight basic K8s groups, including local-first creation, node failure, restart, resource metrics, logs and traces. Its Kubernetes profile uses the immutable OCI runtime image; standalone deployment retains the local EROFS path. Checkpoint/snapshot/cross-node recovery use local Firecracker acceptance; the K8s FC profile is deferred. See [local checks and end-to-end acceptance](docs/testing/control-plane-ci.md) for prerequisites and implementation milestones.
-
-### Kubernetes E2E target requirements
-
-The current `full` profile requires two distinct schedulable Linux workers. Each
-worker must be able to host one ADX Pod with the following combined platform and
-Collector resources:
-
-| Target-cluster resource | Enforced minimum | Recommended worker |
-|---|---:|---:|
-| Worker count | 2 distinct physical workers | 2 workers in separate failure domains |
-| CPU per worker | 2.1 requested; up to 4 limited | 4 vCPU |
-| Memory per worker | 2 GiB + 128 MiB requested; up to 4 GiB + 256 MiB limited | 8 GiB |
-| Ephemeral storage | state/evidence plus a 1 GiB memory-backed image directory | at least 30 GiB free disk |
-| Architecture | `linux/amd64` or `linux/arm64`, matching every artifact | `linux/amd64` for the current Buildkite pipeline |
-
-The base Kubernetes profile uses OCI images and does not require EROFS. It does
-require privileged Pods, functional cgroup v1 or v2, cross-worker Pod/Service
-networking, `br_netfilter`, and
-`net.bridge.bridge-nf-call-iptables=1`. The repository does not enforce a numeric
-host-kernel or Kubernetes-version floor; use a maintained distribution and a
-5.10/5.15-or-newer LTS kernel as the deployment baseline. Capability preflight,
-not `uname`, is the current gate.
-
-The target kubeconfig must be able to create/delete the isolated namespace and
-manage Pods, Services and Secrets, including exec, copy and diagnostics. The
-workers must pull the digest-pinned Node, RRT and Collector images. `full` checks
-the actual Pod-to-worker placement after scheduling and fails if both Pods land
-on one worker.
-
-Firecracker is a separate conditional profile. It needs one explicitly selected
-KVM worker with a 4 CPU / 6 GiB Pod allocation, `/dev/kvm`, KVM API version 12,
-privileged host-device access and an architecture-matched runtime kit. Running
-the base and Firecracker profiles concurrently is best served by two 4C/8G
-workers plus one 8C/16G KVM worker. GPU/NPU, Redis-PV recovery and network-partition
-profiles remain planned and are not implied by a green base `full` result.
-
-Detailed resources, kernel checks, RBAC/network requirements and CI-worker
-resources are documented in the [Kubernetes E2E README](build/e2e/kubernetes/README.md).
-
-Rust uses the root Cargo workspace. The Sandbox SDK uses distribution `adx-sandbox`, import `adx_sandbox`, CLI `adx-sandbox`, and `ADX_*` environment settings. Agent Rust crates use `adx-agent-`; Gateway binaries use `adx-`, configuration uses `ADX_`, and internal branded headers use `X-ADX-`. Run matching component versions together.
-
-Rust changes must pass `make rust-check`, which applies the repository format and
-Clippy policy before running tests. The adopted rules, intentional exceptions and
-migration policy are documented in the [Rust coding guidelines](docs/development/rust-coding-guidelines.md).
+The root Cargo workspace contains the platform and Agent components. Python packages build independently. Build outputs belong under `out/` or a configured external cache.
 
 ```sh
+make help
+make rust-check
+
 cargo test --locked --workspace --all-features -j 2
 make agent-test
-PYTHONPATH=platform/sdk/sandbox/python python -m pytest -q -c platform/sdk/sandbox/pytest.ini platform/sdk/sandbox/python/tests
+PYTHONPATH=platform/sdk/sandbox/python \
+  python -m pytest -q -c platform/sdk/sandbox/pytest.ini \
+  platform/sdk/sandbox/python/tests
 
-cargo test --locked -p adx-api-server -j 2
+make package PYTHON=/path/to/venv/bin/python
 ```
 
-`make help` lists the combined entrypoints. Install Python test/build requirements in a virtual environment (`pytest`, `pytest-asyncio`, `setuptools`, `wheel`, `build`, and each package's dependencies). `make package PYTHON=/path/to/venv/bin/python` produces the Sandbox SDK distribution under `out/wheels`. `BUILD_VERSION` can set release versions explicitly. The Sandbox SDK has its own `VERSION`; it does not derive its version from Agent repository tags.
+Run component and integration suites with `python3 build/ci/run.py <suite>`. End-to-end gates use installed release artifacts, the public Sandbox SDK, Redis, Gateway, the control plane, sandboxd, and RRT. Environment requirements and gate definitions are documented in [control-plane CI](docs/testing/control-plane-ci.md) and the [Kubernetes E2E guide](build/e2e/kubernetes/README.md).
 
-Set `CARGO_TARGET_DIR` to a persistent cache in automation. Building the external sandboxd dependency additionally uses Go caches. `build/` contains source scripts; temporary build outputs belong in `out/` or a cache directory. `bash build.sh` builds Rust Agent components; `bash build.sh -t` runs their tests.
+The Sandbox SDK distribution is `adx-sandbox`, its Python import is `adx_sandbox`, and its CLI is `adx-sandbox`. ADX environment variables use the `ADX_` prefix, and internal branded HTTP headers use `X-ADX-`.
 
-The Rust API Server has an `adx-api-server` process entrypoint and configuration under `build/config/examples/`. Component integration evidence is separate from complete platform deployment validation.
+## Documentation
 
-See [migration status](docs/migration/2026-09-14-import.md), [source pins](docs/migration/sources.json), [architecture](docs/architecture/repository-layout.md), and [Agent usage](agent/README.md).
-
-
-## Instance lifecycle and deployment
-
-`adxctl config init` creates the default single-host `/etc/adx/deployment.yaml`; edit the generated addresses, certificates and runtime paths, then use `adxctl validate` and `adxctl run`. The default profile includes the local managed Redis role, and role-specific profiles are available for split-host deployment.
-
-- [`adxctl` commands and role-by-role deployment](docs/deployment/adxctl.md)
-- [Single-host installation, certificates and CLI](docs/deployment/standalone.md)
-- [EROFS/OCI runtime environment and custom-image bootstrap](docs/deployment/runtime-environment.md)
-- [CLI and unified process deployment](docs/testing/process-deployment.md)
-- [Node lifecycle, resource collection and SQLite outage contract](docs/testing/node-lifecycle.md)
-- [Checkpoint storage, S3 and snapshot catalog](docs/testing/snapshot-storage.md)
-- [Node Manager / Node Proxy process modes](docs/testing/node-proxy-process-modes.md)
-- [Current scheduling baseline recheck](docs/testing/2026-09-16-scheduling-recheck.md)
-- [Instance inventory and resource metrics](docs/testing/instance-resource-metrics.md)
-- [Component log rotation and compression](docs/testing/log-rotation.md)
-- [Live development progress](docs/testing/live-progress.md)
-
-Reusable snapshot creation, cloning into new Instances, catalog queries and deferred artifact deletion are wired through the control plane. The recorded package-v16 Firecracker/MinIO run passed 17 scenarios, including independent clone identities, process memory, writable files and retired-session orphan cleanup after authoritative recovery. Later package-v17 runs exposed an intermittent dual-clone network failure; see the [investigation](docs/testing/2026-09-16-fc-clone-network.md). Local FC cross-node recovery and returning-node cleanup have passed. Remaining current gates are the dual-clone network issue, physical GPU/NPU validation and full-service mixed-load/soak acceptance. Full stage completion is tracked separately from passing component tests or local runtime scenarios.
-
-租户凭证的创建、查询、吊销及缓存契约见 [API Key 管理](docs/testing/api-key-management.md)。
-
-可观测： [实例与资源指标](docs/testing/instance-resource-metrics.md) · [组件日志采集](docs/testing/log-collection.md) · [跨组件Trace](docs/testing/distributed-traces.md) · [日志滚动压缩](docs/testing/log-rotation.md)。
+- [Architecture and repository layout](docs/architecture/repository-layout.md)
+- [Agent usage](agent/README.md)
+- [Sandbox API](platform/control-plane/api-server/docs/sandbox-lifecycle-api.md)
+- [Sandbox Python SDK](platform/sdk/sandbox/python/README.md)
+- [Deployment configuration examples](build/config/examples/README.md)
+- [Node lifecycle and resource collection](docs/testing/node-lifecycle.md)
+- [Checkpoint and snapshot storage](docs/testing/snapshot-storage.md)
+- [Scheduling](docs/testing/scheduling-performance.md)
+- [Route publication](docs/testing/route-publication.md)
+- [Metrics](docs/testing/instance-resource-metrics.md)
+- [Logs](docs/testing/log-collection.md)
+- [Distributed tracing](docs/testing/distributed-traces.md)
+- [Rust coding guidelines](docs/development/rust-coding-guidelines.md)
