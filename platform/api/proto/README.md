@@ -3,6 +3,11 @@
 Internal component protocols are designed for the Instance architecture. Do not
 extend the old POSIX, function, or generic signal services for new functionality.
 
+Public HTTP contracts are separate from these internal gRPC protocols:
+
+- [Sandbox management OpenAPI](../openapi/sandbox.yaml)
+- [Instance data-plane OpenAPI](../openapi/data-plane.yaml)
+
 | Contract | Responsibility | Status |
 |---|---|---|
 | `instance.proto` / `adx.control.v1` | Master/Node registration, allocation and node-owned state submission | Direct typed RPC from API Server |

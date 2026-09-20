@@ -1,0 +1,338 @@
+openapi: "3.1.0"
+info:
+  title: ADX Instance Data Plane API
+  version: "1.0.0"
+  license:
+    name: Apache-2.0
+    identifier: Apache-2.0
+  description: |
+    Typed runtime operations exposed by Edge at `/direct/{instanceId}`. Edge
+    resolves the Instance route, Node Proxy verifies its local binding, and RRT
+    executes the operation inside the Instance. These calls bypass lifecycle and
+    scheduling queues.
+
+    Generic application port forwarding and reverse tunnels transport arbitrary
+    user protocols and are intentionally outside this typed contract.
+servers:
+  - url: https://{address}
+    variables:
+      address:
+        default: adx.example.com
+security:
+  - bearerAuth: []
+  - xAuth: []
+tags:
+  - name: Runtime
+    description: Typed operations executed by RRT inside an Instance.
+  - name: Files
+    description: Streaming and resumable file transfer.
+  - name: Commands
+    description: Process and shell execution plus command status observation.
+paths:
+  /direct/{instanceId}/healthz:
+    get:
+      tags: [Runtime]
+      operationId: runtimeHealth
+      summary: Check whether the target RRT listener is reachable
+      parameters:
+        - $ref: "#/components/parameters/InstanceId"
+      responses:
+        "200":
+          description: RRT is ready.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [status]
+                properties:
+                  status: {type: string, const: ok}
+        "4XX":
+          $ref: "#/components/responses/RuntimeError"
+        default:
+          $ref: "#/components/responses/RuntimeError"
+  /direct/{instanceId}/invoke:
+    post:
+      tags: [Runtime, Commands]
+      operationId: invokeRuntimeAction
+      summary: Invoke a process, shell or file action inside the Instance
+      description: |
+        `action` selects an RRT operation. Mutating calls should carry one
+        `X-ADX-Request-ID`; retry an unknown result with the same ID.
+      parameters:
+        - $ref: "#/components/parameters/InstanceId"
+        - $ref: "#/components/parameters/OperationId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/InvokeRequest"
+      responses:
+        "200":
+          description: Action-specific JSON result.
+          content:
+            application/json:
+              schema: {type: object, additionalProperties: true}
+        "4XX":
+          $ref: "#/components/responses/RuntimeError"
+        default:
+          $ref: "#/components/responses/RuntimeError"
+  /direct/{instanceId}/upload:
+    post:
+      tags: [Files]
+      operationId: uploadFile
+      summary: Upload a file or tar stream, optionally in resumable chunks
+      parameters:
+        - $ref: "#/components/parameters/InstanceId"
+        - $ref: "#/components/parameters/FilePath"
+        - $ref: "#/components/parameters/TransferType"
+        - $ref: "#/components/parameters/UploadId"
+        - $ref: "#/components/parameters/Offset"
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              contentMediaType: application/octet-stream
+              contentEncoding: binary
+      responses:
+        "200":
+          description: Upload or chunk accepted.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/UploadResult"}
+        "4XX":
+          $ref: "#/components/responses/RuntimeError"
+        default:
+          $ref: "#/components/responses/RuntimeError"
+  /direct/{instanceId}/upload/status:
+    get:
+      tags: [Files]
+      operationId: getUploadStatus
+      summary: Query resumable upload progress
+      parameters:
+        - $ref: "#/components/parameters/InstanceId"
+        - $ref: "#/components/parameters/FilePath"
+        - $ref: "#/components/parameters/UploadIdRequired"
+      responses:
+        "200":
+          description: Current committed offset and upload identity.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/UploadStatus"}
+        "4XX":
+          $ref: "#/components/responses/RuntimeError"
+        default:
+          $ref: "#/components/responses/RuntimeError"
+  /direct/{instanceId}/upload/commit:
+    post:
+      tags: [Files]
+      operationId: commitUpload
+      summary: Atomically publish a completed resumable upload
+      parameters:
+        - $ref: "#/components/parameters/InstanceId"
+        - $ref: "#/components/parameters/FilePath"
+        - $ref: "#/components/parameters/UploadIdRequired"
+        - $ref: "#/components/parameters/TotalSize"
+      responses:
+        "200":
+          description: Temporary upload content was committed to the target path.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/UploadResult"}
+        "4XX":
+          $ref: "#/components/responses/RuntimeError"
+        default:
+          $ref: "#/components/responses/RuntimeError"
+  /direct/{instanceId}/download:
+    get:
+      tags: [Files]
+      operationId: downloadFile
+      summary: Download a file or tar stream
+      parameters:
+        - $ref: "#/components/parameters/InstanceId"
+        - $ref: "#/components/parameters/FilePath"
+        - $ref: "#/components/parameters/TransferType"
+        - name: Range
+          in: header
+          required: false
+          schema:
+            type: string
+            pattern: "^bytes=[0-9]+-[0-9]*$"
+      responses:
+        "200":
+          description: Complete file or tar stream.
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                contentMediaType: application/octet-stream
+                contentEncoding: binary
+        "206":
+          description: Requested byte range.
+          headers:
+            Content-Range:
+              schema: {type: string}
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                contentMediaType: application/octet-stream
+                contentEncoding: binary
+        "4XX":
+          $ref: "#/components/responses/RuntimeError"
+        default:
+          $ref: "#/components/responses/RuntimeError"
+  /api/sandbox/v1/commands/watch:
+    get:
+      tags: [Commands]
+      operationId: watchCommands
+      summary: Open the multiplexed command-status WebSocket
+      description: |
+        Upgrade to WebSocket, then subscribe to command identities. OpenAPI does
+        not standardize WebSocket frames; the extension records this boundary.
+      parameters:
+        - name: Upgrade
+          in: header
+          required: true
+          schema: {type: string, const: websocket}
+        - name: Connection
+          in: header
+          required: true
+          schema: {type: string}
+      responses:
+        "101":
+          description: WebSocket protocol switched.
+          x-adx-websocket:
+            upstream: /commands/watch
+            messages: JSON text frames
+        "4XX":
+          $ref: "#/components/responses/RuntimeError"
+        default:
+          $ref: "#/components/responses/RuntimeError"
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: Tenant or administrator API Key validated at Edge.
+    xAuth:
+      type: apiKey
+      in: header
+      name: X-Auth
+      description: Compatibility API Key header.
+  parameters:
+    InstanceId:
+      name: instanceId
+      in: path
+      required: true
+      schema: {type: string, minLength: 1}
+    OperationId:
+      name: X-ADX-Request-ID
+      in: header
+      required: false
+      description: Logical write identity, retained across a retry of the same unknown result.
+      schema: {type: string, minLength: 1, maxLength: 128}
+    FilePath:
+      name: path
+      in: query
+      required: true
+      schema: {type: string, minLength: 1}
+    TransferType:
+      name: type
+      in: query
+      required: false
+      schema: {type: string, enum: [file, tar], default: file}
+    UploadId:
+      name: uploadId
+      in: query
+      required: false
+      schema: {type: string, minLength: 1}
+    UploadIdRequired:
+      name: uploadId
+      in: query
+      required: true
+      schema: {type: string, minLength: 1}
+    Offset:
+      name: offset
+      in: query
+      required: false
+      schema: {type: integer, format: int64, minimum: 0}
+    TotalSize:
+      name: totalSize
+      in: query
+      required: false
+      description: Expected final size; commit conflicts when the uploaded part differs.
+      schema: {type: integer, format: int64, minimum: 0}
+  responses:
+    RuntimeError:
+      description: Gateway routing, authorization or RRT operation error.
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/RuntimeError"}
+  schemas:
+    InvokeRequest:
+      type: object
+      additionalProperties: false
+      required: [action]
+      properties:
+        action:
+          type: string
+          enum:
+            - process.exec
+            - process.run
+            - process.start
+            - process.get
+            - process.poll
+            - process.wait
+            - process.kill
+            - process.list
+            - process.capabilities
+            - process.stdin
+            - process.send_stdin
+            - entrypoint.poll
+            - file.read
+            - file.write
+            - file.write_chunk
+            - file.read_chunk
+            - file.list
+            - file.exists
+            - file.remove
+            - file.rename
+            - file.mkdir
+            - file.make_dir
+            - file.stat
+            - shell.create
+            - shell.run
+            - shell.poll
+            - shell.close
+        args:
+          type: object
+          additionalProperties: true
+          default: {}
+        requestId:
+          type: string
+          description: Body compatibility form of the operation identity.
+    UploadResult:
+      type: object
+      additionalProperties: true
+      properties:
+        ok: {type: boolean}
+        uploadId: {type: string}
+        offset: {type: integer, format: int64}
+        size: {type: integer, format: int64}
+    UploadStatus:
+      type: object
+      additionalProperties: true
+      required: [uploadId, offset]
+      properties:
+        uploadId: {type: string}
+        offset: {type: integer, format: int64, minimum: 0}
+    RuntimeError:
+      type: object
+      additionalProperties: true
+      required: [error]
+      properties:
+        error: {type: string}

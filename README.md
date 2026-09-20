@@ -174,6 +174,8 @@ The Sandbox SDK distribution is `adx-sandbox`, its Python import is `adx_sandbox
 - [Architecture and repository layout](docs/architecture/repository-layout.md)
 - [Agent usage](agent/README.md)
 - [Sandbox API](platform/control-plane/api-server/docs/sandbox-lifecycle-api.md)
+- [Sandbox OpenAPI](platform/api/openapi/sandbox.yaml)
+- [Data-plane OpenAPI](platform/api/openapi/data-plane.yaml)
 - [Sandbox Python SDK](platform/sdk/sandbox/python/README.md)
 - [Deployment configuration examples](build/config/examples/README.md)
 - [Node lifecycle and resource collection](docs/testing/node-lifecycle.md)
