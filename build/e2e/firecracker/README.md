@@ -24,7 +24,7 @@ sudo env ADX_FC_BASE=/opt/adx ADX_FC_PROXY_MODE=embedded \
 
 `kubernetes.py` 创建带唯一名称/标签的 namespace，部署一个选定 KVM worker 上的特权 Pod，执行与本地相同的26项SDK/生命周期用例。除原有 checkpoint、双克隆和故障场景外，当前集合还要求 S3 rootfs、S3 EROFS mount、独立执行 limit、镜像入口继承、reload、创建/运行期网络策略，以及有/无 checkpoint 的 failover。它保存部署命令、Pod/宿主信息、逐用例日志、结果JSON、JUnit、S3/Redis/实例清理证据。清理检查 namespace UID 与标签；不会删除替换后的 namespace。一个Pod不证明跨节点恢复。
 
-镜像由 `build/e2e/prepare.py --firecracker-kit <dir>` 在当前 ADX 发布包上组合。外部 kit 必须包含 `kit.py` 定义的全部文件，`manifest.json` 包含 `schema_version: 1`、`target`、`sandboxd_revision`、`sandboxd_patches` 和文件相对路径到SHA256的 `files` 映射。revision 与补丁摘要共同标识实际 sandboxd 源码；sandboxd、sbox、redis-cli 和 Firecracker guest `initrd.img` 必须与同次 backend 制品摘要一致。这样，涉及 guest agent 的补丁不会只更新 host 进程而遗漏 microVM 内的执行代码。内核、VMM、checkpoint-restore、virtiofsd、distill_fs、MinIO 与测试用 OCI registry 均由kit供应流程准备，此仓库不会在运行节点临时编译或下载浮动版本。
+镜像由 `build/e2e/prepare.py --firecracker-kit <dir>` 在当前 ADX 发布包上组合。外部 kit 必须包含 `kit.py` 定义的全部文件，`manifest.json` 包含 `schema_version: 1`、`target`、`sandboxd_revision` 和文件相对路径到SHA256的 `files` 映射。sandboxd、sbox 和 redis-cli 必须与同次 backend 制品摘要一致；Firecracker guest `initrd.img` 由未修改的固定 sandboxd revision 构建并随 kit 校验。内核、VMM、checkpoint-restore、virtiofsd、distill_fs、MinIO 与测试用 OCI registry 均由kit供应流程准备，此仓库不会在运行节点临时编译或下载浮动版本。
 
 启用独立 `platform-fc-e2e` 步骤需要：
 

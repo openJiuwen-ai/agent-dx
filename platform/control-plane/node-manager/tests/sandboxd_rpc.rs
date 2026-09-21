@@ -300,10 +300,10 @@ fn start_maps_public_sandbox_contract_to_backend_protocol() {
     assert_eq!(request.resources["Memory"], 2048.0);
     assert_eq!(request.writable_layer_limit_bytes, 4 << 30);
     assert_eq!(request.extra_config, "runtime-option=true");
-    assert_eq!(request.inject_entrypoint, "/run/adx/image-process.json");
+    assert_eq!(request.inject_entrypoint, "/etc/adx-image-process.json");
     assert_eq!(
         request.envs["ADX_IMAGE_PROCESS_CONFIG"],
-        "/run/adx/image-process.json"
+        "/etc/adx-image-process.json"
     );
     let rules = &request.network_policy.unwrap().traffic.unwrap().rules;
     for port in [50090, 8080] {

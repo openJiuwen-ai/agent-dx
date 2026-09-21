@@ -2,12 +2,6 @@
   "repository": "https://github.com/inclusionAI/sandboxd.git",
   "pull_request": 56,
   "revision": "efc201531d7e2e9d69505da151eb66084b61eebf",
-  "patches": [
-    {
-      "path": "third_party/sandboxd/patches/0001-use-nydus-s3-backend.patch",
-      "sha256": "64eda8575177f8876e958c9d6f9bd73d7802208559aa54768fcecd73ff66c0eb"
-    }
-  ],
   "files": [
     {
       "source": "api/runtime/v1/sandbox-api.proto",

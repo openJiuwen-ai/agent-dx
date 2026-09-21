@@ -15,7 +15,6 @@ ROOT = Path(__file__).resolve().parents[2]
 spec = importlib.util.spec_from_file_location('release_package', ROOT/'build/release/package.py')
 package = importlib.util.module_from_spec(spec);spec.loader.exec_module(package)
 BACKEND_BINARIES = ('sandboxd','sbox','runc','runc-shim','sandbox-logger','redis-cli')
-BACKEND_FILES = BACKEND_BINARIES + ('firecracker-initrd.img',)
 
 def sha(path):
     h=hashlib.sha256()
@@ -39,10 +38,7 @@ def main():
     pinned=json.loads((ROOT/'third_party/sandboxd/source.json').read_text())
     if backend['sandboxd_revision'] != pinned['revision'] or backend['target'] != manifest['target']:
         raise ValueError('backend revision or architecture mismatch')
-    patches={entry['path']:entry['sha256'] for entry in pinned.get('patches',[])}
-    if backend.get('sandboxd_patches') != patches or any(sha(ROOT/path)!=digest for path,digest in patches.items()):
-        raise ValueError('backend patch set mismatch')
-    for name in BACKEND_FILES:
+    for name in BACKEND_BINARIES:
         path=a.backend/name
         if path.is_symlink() or sha(path) != backend['files'][name]:raise ValueError('backend integrity mismatch')
     collector=json.loads((ROOT/'build/observability/source.json').read_text())

@@ -81,21 +81,11 @@ class FirecrackerEvidenceTests(unittest.TestCase):
             root=Path(d);files={}
             for name in kit.REQUIRED:
                 p=root/name;p.parent.mkdir(parents=True,exist_ok=True);p.write_bytes(name.encode());files[name]=hashlib.sha256(p.read_bytes()).hexdigest()
-            backend={'target':'aarch64-unknown-linux-gnu','sandboxd_revision':'pinned','sandboxd_patches':{'fix.patch':'digest'},'files':{'sandboxd':files['bin/sandboxd'],'sbox':files['bin/sbox'],'redis-cli':files['tools/redis-cli'],'firecracker-initrd.img':files['artifacts/initrd.img']}}
-            (root/'manifest.json').write_text(json.dumps({'schema_version':1,'target':backend['target'],'sandboxd_revision':'pinned','sandboxd_patches':backend['sandboxd_patches'],'files':files}))
+            backend={'target':'aarch64-unknown-linux-gnu','sandboxd_revision':'pinned','files':{'sandboxd':files['bin/sandboxd'],'sbox':files['bin/sbox'],'redis-cli':files['tools/redis-cli']}}
+            (root/'manifest.json').write_text(json.dumps({'schema_version':1,'target':backend['target'],'sandboxd_revision':'pinned','files':files}))
             kit.verify(root,backend)
             (root/'artifacts/Image').write_bytes(b'altered')
             with self.assertRaises(ValueError):kit.verify(root,backend)
-
-    def test_kit_rejects_wrong_sandboxd_patch_identity(self):
-        import kit,hashlib
-        with tempfile.TemporaryDirectory() as d:
-            root=Path(d);files={}
-            for name in kit.REQUIRED:
-                p=root/name;p.parent.mkdir(parents=True,exist_ok=True);p.write_bytes(name.encode());files[name]=hashlib.sha256(p.read_bytes()).hexdigest()
-            backend={'target':'aarch64-unknown-linux-gnu','sandboxd_revision':'pinned','sandboxd_patches':{'fix.patch':'digest'},'files':{'sandboxd':files['bin/sandboxd'],'sbox':files['bin/sbox'],'redis-cli':files['tools/redis-cli'],'firecracker-initrd.img':files['artifacts/initrd.img']}}
-            (root/'manifest.json').write_text(json.dumps({'schema_version':1,'target':backend['target'],'sandboxd_revision':'pinned','sandboxd_patches':{},'files':files}))
-            with self.assertRaisesRegex(ValueError,'source identity'):kit.verify(root,backend)
 
     def test_complete_evidence_passes_but_cleanup_error_fails(self):
         import acceptance
