@@ -1,5 +1,5 @@
-//! Node-local HTTP cooperation with the Instance runtime.
-use adx_core::{runtime::*, Error, InstanceRecord, Result};
+//! Node-local HTTP cooperation with the Capsule runtime.
+use adx_core::{runtime::*, CapsuleRecord, Error, Result};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::{header::HeaderValue, Method, Request, StatusCode};
@@ -41,16 +41,16 @@ impl RuntimeControlClient {
         self.token = Some(value);
         Ok(self)
     }
-    pub fn identity(record: &InstanceRecord) -> RuntimeIdentity {
+    pub fn identity(record: &CapsuleRecord) -> RuntimeIdentity {
         RuntimeIdentity {
-            instance_id: record.spec.id.clone(),
-            runtime_id: record.runtime_id.clone(),
+            capsule_id: record.spec.id.clone(),
+            runtime_id: record.runtime.id.clone(),
             ownership_generation: record.assignment.generation,
         }
     }
     async fn request(
         &self,
-        record: &InstanceRecord,
+        record: &CapsuleRecord,
         path: &str,
         body: Option<Vec<u8>>,
     ) -> Result<RuntimeStatus> {
@@ -58,7 +58,8 @@ impl RuntimeControlClient {
         expected.validate()?;
         let address = SocketAddr::new(
             record
-                .runtime_ip
+                .runtime
+                .ip
                 .ok_or_else(|| Error::Invalid("runtime IP is required".into()))?,
             self.port,
         );
@@ -119,14 +120,14 @@ impl RuntimeControlClient {
         .await
         .map_err(|_| unavailable("deadline exceeded"))?
     }
-    pub async fn status(&self, record: &InstanceRecord) -> Result<RuntimeStatus> {
+    pub async fn status(&self, record: &CapsuleRecord) -> Result<RuntimeStatus> {
         self.request(record, "status", None).await
     }
     /// Prepared acknowledges the runtime barrier only. The caller must then invoke
     /// the execution backend and persist checkpoint artifacts/metadata separately.
     pub async fn prepare(
         &self,
-        record: &InstanceRecord,
+        record: &CapsuleRecord,
         operation_id: &str,
         expected_revision: u64,
     ) -> Result<RuntimeStatus> {
@@ -156,7 +157,7 @@ impl RuntimeControlClient {
     /// Only after the execution backend confirms it did not begin checkpointing.
     pub async fn abort_unstarted(
         &self,
-        record: &InstanceRecord,
+        record: &CapsuleRecord,
         operation_id: &str,
         expected_revision: u64,
     ) -> Result<RuntimeStatus> {
@@ -194,7 +195,7 @@ mod tests {
         runtime::{CheckpointPhase, CheckpointStatus},
         sandbox::SandboxOptions,
         scheduling::SchedulingPolicy,
-        Assignment, InstanceSpec, InstanceState, Resources,
+        Assignment, CapsuleSpec, CapsuleState, Resources,
     };
     use std::{
         collections::BTreeMap,
@@ -203,17 +204,17 @@ mod tests {
         thread,
     };
 
-    fn record(port: u16) -> (InstanceRecord, RuntimeControlClient) {
-        let record = InstanceRecord {
-            spec: InstanceSpec {
-                runtime_environment: None,
+    fn record(port: u16) -> (CapsuleRecord, RuntimeControlClient) {
+        let record = CapsuleRecord {
+            spec: CapsuleSpec {
+                environment: None,
                 snapshot_id: None,
                 lifecycle: LifecyclePolicy::default(),
                 env: BTreeMap::new(),
-                id: "instance-a".into(),
+                id: "capsule-a".into(),
                 tenant_id: "tenant-a".into(),
                 image: "image-a".into(),
-                runtime: "firecracker".into(),
+                runtime_class: "firecracker".into(),
                 resources: Resources {
                     cpu_millis: 1,
                     memory_bytes: 1,
@@ -224,17 +225,19 @@ mod tests {
                 sandbox: SandboxOptions::default(),
             },
             assignment: Assignment {
-                instance_id: "instance-a".into(),
+                capsule_id: "capsule-a".into(),
                 node_id: "node-a".into(),
                 shard_id: 0,
                 generation: 7,
                 devices: vec![],
             },
-            state: InstanceState::Running,
+            state: CapsuleState::Running,
             revision: 2,
-            runtime_id: "runtime-a".into(),
+            runtime: adx_core::Runtime {
+                id: "runtime-a".into(),
+                ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            },
             resources_held: true,
-            runtime_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
             checkpoint: None,
             last_operation: None,
             restart_attempts: 0,

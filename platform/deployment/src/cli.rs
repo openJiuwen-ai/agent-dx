@@ -46,7 +46,7 @@ pub enum Command {
     Run,
     /// Query the running deployment supervisor.
     Status,
-    /// Drain local instances and stop the supervised services.
+    /// Drain local capsules and stop the supervised services.
     Stop,
     /// Inspect or initialize deployment configuration.
     Config {

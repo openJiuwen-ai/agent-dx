@@ -103,8 +103,8 @@ git diff --check
 | [docs/testing/firecracker-cross-node.md](firecracker-cross-node.md) | 当前说明／源码与入口 |
 | [docs/testing/api-server.md](api-server.md) | 当前说明／源码与入口 |
 | [docs/testing/http-node-placement.md](http-node-placement.md) | 当前说明／源码与入口 |
-| [docs/testing/instance-checkpoint.md](instance-checkpoint.md) | 当前说明／源码与入口 |
-| [docs/testing/instance-resource-metrics.md](instance-resource-metrics.md) | 当前说明／源码与入口 |
+| [docs/testing/capsule-checkpoint.md](capsule-checkpoint.md) | 当前说明／源码与入口 |
+| [docs/testing/capsule-resource-metrics.md](capsule-resource-metrics.md) | 当前说明／源码与入口 |
 | [docs/testing/live-progress.md](live-progress.md) | 当前说明／源码与入口 |
 | [docs/testing/local-e2e.md](local-e2e.md) | 当前说明／源码与入口 |
 | [docs/testing/log-collection.md](log-collection.md) | 当前说明／源码与入口 |

@@ -6,7 +6,7 @@
 
 ## 实现与组件检查
 
-Master、Node Manager、Gateway 和 Sandbox API 可输出 JSON。Node Manager 的操作完成日志保留 Instance ID、generation、revision、状态；API 请求日志记录路由模板、方法、状态及耗时，省略查询参数、凭证和正文。Collector 附加节点/服务归属并通过 OTLP/HTTP 发送；Redis 原文日志同样可收集。
+Master、Node Manager、Gateway 和 Sandbox API 可输出 JSON。Node Manager 的操作完成日志保留 Capsule ID、generation、revision、状态；API 请求日志记录路由模板、方法、状态及耗时，省略查询参数、凭证和正文。Collector 附加节点/服务归属并通过 OTLP/HTTP 发送；Redis 原文日志同样可收集。
 
 Supervisor 增加完整行滚动、超长记录边界与延迟压缩窗口。首先验证旧实现拒绝新契约，再增加跨文件 JSON 完整性、跨读取缓冲、超长行后恢复、保留窗口及压缩清理测试。macOS Rust 19项通过，Linux额外覆盖 `/dev/full`；Clippy、三类服务bins检查、Go入口测试/构建及Python驱动55项通过。
 

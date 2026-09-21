@@ -1,7 +1,7 @@
 //! Node-owned checkpoint storage and HTTP runtime cooperation.
 mod object;
 mod orphans;
-use adx_core::{CheckpointArtifact, Error, InstanceRecord, Result};
+use adx_core::{CapsuleRecord, CheckpointArtifact, Error, Result};
 use async_trait::async_trait;
 pub use object::ObjectCheckpointStore;
 pub use orphans::RemoteGcConfig;
@@ -34,7 +34,7 @@ pub struct SnapshotRequest {
 #[derive(Debug, Clone)]
 pub struct SnapshotResult {
     pub snapshot: adx_core::snapshots::Snapshot,
-    pub instance: crate::OperationResult,
+    pub capsule: crate::OperationResult,
 }
 #[async_trait]
 pub trait SnapshotCatalog: Send + Sync {
@@ -61,17 +61,17 @@ pub(crate) fn validate_operation(id: &str, revision: u64) -> Result<()> {
 }
 #[async_trait]
 pub trait CheckpointCooperation: Send + Sync {
-    async fn prepare(&self, record: &InstanceRecord, operation_id: &str) -> Result<()>;
+    async fn prepare(&self, record: &CapsuleRecord, operation_id: &str) -> Result<()>;
     /// Caller guarantees backend checkpoint has not been invoked.
-    async fn abort_unstarted(&self, record: &InstanceRecord, operation_id: &str) -> Result<()>;
+    async fn abort_unstarted(&self, record: &CapsuleRecord, operation_id: &str) -> Result<()>;
 }
 #[async_trait]
 impl CheckpointCooperation for crate::runtime_control::RuntimeControlClient {
-    async fn prepare(&self, record: &InstanceRecord, id: &str) -> Result<()> {
+    async fn prepare(&self, record: &CapsuleRecord, id: &str) -> Result<()> {
         let status = self.status(record).await?;
         self.prepare(record, id, status.revision).await.map(|_| ())
     }
-    async fn abort_unstarted(&self, record: &InstanceRecord, id: &str) -> Result<()> {
+    async fn abort_unstarted(&self, record: &CapsuleRecord, id: &str) -> Result<()> {
         let status = self.status(record).await?;
         self.abort_unstarted(record, id, status.revision)
             .await

@@ -1,6 +1,6 @@
 # 可观测与日志能力规划
 
-2026-09-16新增需求，状态：首批实例资源Metrics与日志滚动压缩已验收；组件日志采集和Trace已通过本地双节点及Buildkite #21正式K8s验收，见[报告](2026-09-17-observability-k8s.md)。内部以Instance为统计对象。
+2026-09-16新增需求，状态：首批Capsule 资源 Metrics与日志滚动压缩已验收；组件日志采集和Trace已通过本地双节点及Buildkite #21正式K8s验收，见[报告](2026-09-17-observability-k8s.md)。内部以Capsule为统计对象。
 
 ## 当前基础
 
@@ -12,7 +12,7 @@
 
 ## 阶段8A：实例数量与资源分配Metrics（优先）
 
-首批已通过本地与Buildkite #17基础K8s验收，见[验收报告](2026-09-16-metrics-acceptance.md)；指标与配置见[实例资源Metrics](instance-resource-metrics.md)。实卡验证仍按阶段5待办推进。
+首批已通过本地与Buildkite #17基础K8s验收，见[验收报告](2026-09-16-metrics-acceptance.md)；指标与配置见[Capsule 资源 Metrics](capsule-resource-metrics.md)。实卡验证仍按阶段5待办推进。
 
 | 范围 | 规划指标与口径 |
 | --- | --- |
@@ -24,13 +24,13 @@
 
 职责：Master提供集群/Shard调度目录及资源分配视图；Node Manager提供本机账本、准入状态和实际使用量。两个视图分开命名，聚合时避免重复累加。资源“分配量”与CPU/内存“实际用量”明确区分。
 
-聚合指标标签为节点、域、状态、资源类型及设备型号。当前 `adx_instance_*` 使用量指标带 Instance/runtime ID，尚无独立明细开关；采集端可按需要过滤。名称、单位和标签以 [指标清单](instance-resource-metrics.md) 为准。
+聚合指标标签为节点、域、状态、资源类型及设备型号。当前 `adx_capsule_*` 使用量指标带 Capsule/runtime ID，尚无独立明细开关；采集端可按需要过滤。名称、单位和标签以 [指标清单](capsule-resource-metrics.md) 为准。
 
 验收：先用状态转换及账本测试验证创建、排队、预留、暂停、恢复、删除、重启与失联不重复计数；再在真实部署中采集指标，与API/资源账本核对。GPU/NPU计数规则可先做组件验证，实际卡分配仍需带卡环境。
 
 ## 阶段8B：日志采集与Trace
 
-- 统一组件日志结构：时间、级别、组件/节点、操作及错误码；按需带Instance ID、请求ID、Trace ID与Span ID。
+- 统一组件日志结构：时间、级别、组件/节点、操作及错误码；按需带Capsule ID、请求ID、Trace ID与Span ID。
 - 明确组件运行日志与实例stdout/stderr的来源、路径及归属；复用sandboxd/RRT既有实例日志通道，不假定Supervisor掌握guest内部日志文件。
 - 提供进程部署及Pod部署的采集配置与示例。部署环境负责采集和存储，产品提供标准输出/文件、指标端点及Trace导出能力；外部采集后端选型另行确定。
 - Trace覆盖创建调度、节点执行、状态提交及数据面请求；补齐HTTP/gRPC上下文透传、关键阶段埋点、可配置采样和导出。后台恢复等异步操作保留关联。
@@ -40,7 +40,7 @@
 
 ### 阶段8B的模块落点与首轮测试
 
-`crates/observability` 已接入OpenTelemetry并统一承载组件日志、Metrics、Trace及supervisor进程日志捕获；HTTP/gRPC、Master创建/提交任务、Node Manager每实例队列、Gateway和RRT HTTP均已接线。InstanceHandle通过命令封装显式携带Span，标准Future上下文只在poll期间附着。组件与真实采集证据见[本地Trace验收](2026-09-16-trace-acceptance.md)。
+`crates/observability` 已接入OpenTelemetry并统一承载组件日志、Metrics、Trace及supervisor进程日志捕获；HTTP/gRPC、Master创建/提交任务、Node Manager每实例队列、Gateway和RRT HTTP均已接线。CapsuleHandle通过命令封装显式携带Span，标准Future上下文只在poll期间附着。组件与真实采集证据见[本地Trace验收](2026-09-16-trace-acceptance.md)。
 
 Trace配置与当前接线见[跨组件Trace](distributed-traces.md)。下表列出模块职责，真实采集验收单独记录：
 

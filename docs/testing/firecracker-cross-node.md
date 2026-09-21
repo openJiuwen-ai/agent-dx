@@ -18,7 +18,7 @@ sudo env ADX_FC_BASE=/opt/adx ADX_TRANSFER_INTERRUPT_MASTER=1 \
 ## 必需证据
 
 - 公共SDK创建、写入二进制文件、启动内存计数进程、暂停并生成共享checkpoint，再恢复源实例。
-- 源节点心跳失效后，同Instance ID由另一节点的新代次恢复；恢复计划进入完成状态。
+- 源节点心跳失效后，同Capsule ID由另一节点的新代次恢复；恢复计划进入完成状态。
 - 恢复后的PID不变、内存计数继续增长、文件字节一致。
 - 原Node Manager返回后，旧backend被清理，目标backend保持运行。
 - Master重启后Redis epoch递增、节点完成对账；恢复后的执行代次和runtime ID保持不变。
@@ -38,7 +38,7 @@ Lima r1未进入用例：sandboxd在 `ip netns exec` 环境下报告 `cgroup v1 
 
 2026-09-16，package-v21、Lima ARM64 KVM，六项全部通过，另包含计划落盘后、恢复RPC执行前的Master重启注入。
 
-- Instance `default-sandbox-4f4175ba-327e-45aa-b84c-8223a2906ed2`：node1/generation 1 → node2/generation 2。
+- Capsule `default-sandbox-4f4175ba-327e-45aa-b84c-8223a2906ed2`：node1/generation 1 → node2/generation 2。
 - 故障注入期间Master epoch 1 → 2，原恢复计划与目标代次不变；成功恢复后再次重启Master，runtime ID和代次保持不变。
 - PID `11` 保留，计数器 `9 → 33`，二进制文件逐字节一致。
 - 原节点返回后backend清单为空；目标保持一个运行实例，已登记S3制品仍可读。
@@ -52,13 +52,13 @@ Lima r1未进入用例：sandboxd在 `ip netns exec` 环境下报告 `cgroup v1 
 
 设置 `ADX_TRANSFER_INTERRUPT_NODE=1` 可验证未提交执行的清理契约。用例在目标网络命名空间中仅阻断到RRT的50090端口，保留sandboxd、资源采集与心跳。待真实backend清单中出现Running执行，同时Redis仍为Paused、recovery.pending=true，再杀死目标Node Manager并放通RRT。
 
-重启后必须满足：节点会话变化；原未提交backend ID消失；同Instance ID、同目标归属代次恢复为一个新的backend ID；PID/内存/文件仍从已登记checkpoint恢复。后续继续执行源节点返回清理、Master重启与最终删除。`node-recovery-before-crash.json` 与 `node-recovery-restart.json` 保存故障点及替换证据。严格验收器会拒绝缺少故障证据、复用旧backend或变更归属代次的运行结果。
+重启后必须满足：节点会话变化；原未提交backend ID消失；同Capsule ID、同目标归属代次恢复为一个新的backend ID；PID/内存/文件仍从已登记checkpoint恢复。后续继续执行源节点返回清理、Master重启与最终删除。`node-recovery-before-crash.json` 与 `node-recovery-restart.json` 保存故障点及替换证据。严格验收器会拒绝缺少故障证据、复用旧backend或变更归属代次的运行结果。
 
 ### r5 验收结果
 
 2026-09-16，package-v21，`ADX_TRANSFER_INTERRUPT_NODE=1`，六项用例及目标节点中断断言全部通过；52项驱动回归通过。
 
-- Instance `default-sandbox-a469af4b-ffc5-4a4d-94f6-85d77cc270b4` 从node1/代次1恢复到node2/代次2。
+- Capsule `default-sandbox-a469af4b-ffc5-4a4d-94f6-85d77cc270b4` 从node1/代次1恢复到node2/代次2。
 - 崩溃时Redis仍为Paused且pending；实际运行的未提交backend为 `sbox-21f5cda3-a0ff-4516-af39-c48851fa54aa`。
 - 重启后节点session改变，原backend清理，新backend为 `sbox-5b22503f-4643-45ae-b9bb-5251130caad8`；归属仍为node2/代次2，最终仅一个执行。
 - PID `11`、内存计数 `8 → 36`、二进制文件一致。源节点返回清理、恢复后Master重启与显式删除均通过。

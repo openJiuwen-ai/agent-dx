@@ -10,8 +10,8 @@ pub mod rpc;
 mod shard;
 pub mod storage;
 
-use adx_core::{Assignment, Error, InstanceSpec, Result};
-use adx_scheduling::{Framework, PlacedInstance, Snapshot};
+use adx_core::{Assignment, CapsuleSpec, Error, Result};
+use adx_scheduling::{Framework, PlacedCapsule, Snapshot};
 pub use adx_scheduling::{Node, Placement};
 use journal::MutationJournal;
 pub use queue::TenantQueue;
@@ -51,7 +51,7 @@ pub struct RoundOutcome {
 pub struct Master {
     shards: Vec<ShardScheduler>,
     node_shards: BTreeMap<String, usize>,
-    requests: BTreeMap<String, (usize, InstanceSpec)>,
+    requests: BTreeMap<String, (usize, CapsuleSpec)>,
     next_shard: usize,
     next_node_shard: usize,
     generation: u64,
@@ -97,16 +97,16 @@ impl Master {
             master.shards[registration.shard_id].register(node.clone())?;
             Arc::make_mut(&mut master.snapshot).update_node(node);
         }
-        for (id, instance) in &saved.instances {
-            if instance.resources_held() {
-                let shard = instance.assignment.shard_id;
-                master.shards[shard].restore(&instance.spec, &instance.assignment)?;
+        for (id, capsule) in &saved.capsules {
+            if capsule.resources_held() {
+                let shard = capsule.assignment.shard_id;
+                master.shards[shard].restore(&capsule.spec, &capsule.assignment)?;
                 master
                     .requests
-                    .insert(id.clone(), (shard, instance.spec.clone()));
-                Arc::make_mut(&mut master.snapshot).place(PlacedInstance {
-                    spec: instance.spec.clone(),
-                    node_id: instance.assignment.node_id.clone(),
+                    .insert(id.clone(), (shard, capsule.spec.clone()));
+                Arc::make_mut(&mut master.snapshot).place(PlacedCapsule {
+                    spec: capsule.spec.clone(),
+                    node_id: capsule.assignment.node_id.clone(),
                 });
             } else {
                 master.retired.insert(id.clone());
@@ -184,7 +184,7 @@ impl Master {
     }
 
     /// Global chooses the shard only. Unscheduled work stays in its ShardScheduler queue.
-    pub fn submit_recovery(&mut self, spec: InstanceSpec) -> Result<usize> {
+    pub fn submit_recovery(&mut self, spec: CapsuleSpec) -> Result<usize> {
         self.retired.remove(&spec.id);
         if !self.requests.contains_key(&spec.id) {
             // Global still rotates; skip shards without any live node.
@@ -203,7 +203,7 @@ impl Master {
         }
         self.submit(spec)
     }
-    pub fn submit(&mut self, spec: InstanceSpec) -> Result<usize> {
+    pub fn submit(&mut self, spec: CapsuleSpec) -> Result<usize> {
         spec.validate()?;
         if self.retired.contains(&spec.id) {
             return Err(Error::Conflict);
@@ -241,9 +241,9 @@ impl Master {
 
     /// Apply a confirmed Redis owner before exposing it or scheduling further work.
     /// Also removes an identical queued center request; replay never double charges.
-    pub fn accept_claim(&mut self, spec: &InstanceSpec, assignment: &Assignment) -> Result<()> {
+    pub fn accept_claim(&mut self, spec: &CapsuleSpec, assignment: &Assignment) -> Result<()> {
         spec.validate()?;
-        if assignment.instance_id != spec.id
+        if assignment.capsule_id != spec.id
             || assignment.generation == 0
             || self.node_shards.get(&assignment.node_id) != Some(&assignment.shard_id)
         {
@@ -289,7 +289,7 @@ impl Master {
     }
     pub fn local_candidate(
         &self,
-        spec: &InstanceSpec,
+        spec: &CapsuleSpec,
         node: &str,
         devices: &[adx_core::scheduling::DeviceAllocation],
     ) -> Result<bool> {
@@ -379,7 +379,7 @@ impl Master {
             ) {
                 Ok(Some((assignment, spec))) => {
                     self.generation = generation;
-                    Arc::make_mut(&mut self.snapshot).place(PlacedInstance {
+                    Arc::make_mut(&mut self.snapshot).place(PlacedCapsule {
                         spec,
                         node_id: assignment.node_id.clone(),
                     });
@@ -406,11 +406,11 @@ impl Master {
 
     /// Only after the owning node rejects before execution or confirms cleanup.
     /// Retains request identity, rolls back the old reservation and excludes
-    /// rejected nodes for this request. A live Instance must not use this path.
+    /// rejected nodes for this request. A live Capsule must not use this path.
     pub fn retry(&mut self, assignment: &Assignment) -> Result<()> {
         let spec = self
             .requests
-            .get(&assignment.instance_id)
+            .get(&assignment.capsule_id)
             .ok_or(Error::NotFound)?
             .1
             .clone();
@@ -418,7 +418,7 @@ impl Master {
             .get_mut(assignment.shard_id)
             .ok_or(Error::NotFound)?
             .retry(assignment, spec)?;
-        Arc::make_mut(&mut self.snapshot).remove(&assignment.instance_id);
+        Arc::make_mut(&mut self.snapshot).remove(&assignment.capsule_id);
         self.journal.record(&assignment.node_id);
         self.wake_pending(None);
         Ok(())
@@ -426,7 +426,7 @@ impl Master {
     /// Apply a committed same-node resume to the incremental scheduling view.
     pub fn restore_assignment(
         &mut self,
-        spec: &InstanceSpec,
+        spec: &CapsuleSpec,
         assignment: &Assignment,
     ) -> Result<()> {
         if self.requests.contains_key(&spec.id)
@@ -440,7 +440,7 @@ impl Master {
             .restore(spec, assignment)?;
         self.requests
             .insert(spec.id.clone(), (assignment.shard_id, spec.clone()));
-        Arc::make_mut(&mut self.snapshot).place(PlacedInstance {
+        Arc::make_mut(&mut self.snapshot).place(PlacedCapsule {
             spec: spec.clone(),
             node_id: assignment.node_id.clone(),
         });
@@ -454,8 +454,8 @@ impl Master {
             .get_mut(assignment.shard_id)
             .ok_or(Error::NotFound)?
             .release(assignment)?;
-        self.requests.remove(&assignment.instance_id);
-        Arc::make_mut(&mut self.snapshot).remove(&assignment.instance_id);
+        self.requests.remove(&assignment.capsule_id);
+        Arc::make_mut(&mut self.snapshot).remove(&assignment.capsule_id);
         self.journal.record(&assignment.node_id);
         self.wake_pending(None);
         Ok(())

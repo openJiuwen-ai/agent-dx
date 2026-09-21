@@ -17,7 +17,7 @@
 | Node Manager 重启 | passed | 4.892 |
 | 停机清理 | passed | 30.408 |
 
-本地优先组确认首两个实例归属 node1/node2；两个独立 SDK 请求创建同名实例收敛到同一个 ID；不同 CPU 规格返回冲突；3 个唯一实例均执行真实 RRT 命令，并在 Master 日志确认 `local_instance_claim`。组后两个 sandboxd inventory 为空。
+本地优先组确认首两个 Capsule 归属 node1/node2；两个独立 SDK 请求创建同名 Capsule 收敛到同一个 ID；不同 CPU 规格返回冲突；3 个唯一 Capsule 均执行真实 RRT 命令，并在当时的 Master 日志确认 `local_instance_claim`。当前 Capsule/Runtime 协议重构后，同一事件名为 `local_capsule_claim`。组后两个 sandboxd inventory 为空。
 
 容量组确认释放后的 Master 与 Node Manager 资源指标归零且一致；节点失联后清理、进程重启保持后端实例身份、带实例停机均通过。最终 `missing_checks=[]`、`cleanup_errors=[]`，两个测试容器及专用网络已移除。
 

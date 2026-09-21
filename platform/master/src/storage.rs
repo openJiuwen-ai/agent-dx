@@ -8,8 +8,8 @@ mod recovery;
 mod snapshots;
 use crate::Node;
 use adx_core::{
-    scheduling::validate_device_assignment, Assignment, Error, InstanceRecord, InstanceSpec,
-    InstanceState, Result,
+    scheduling::validate_device_assignment, Assignment, CapsuleRecord, CapsuleSpec, CapsuleState,
+    Error, Result,
 };
 use redis::{aio::MultiplexedConnection, FromRedisValue};
 use serde::{Deserialize, Serialize};
@@ -82,38 +82,40 @@ pub struct Recovery {
     pub pending: bool,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StoredInstance {
+pub struct StoredCapsule {
     #[serde(default)]
     pub recovery: Option<Recovery>,
     #[serde(default)]
     pub invalidated: bool,
-    pub spec: InstanceSpec,
+    pub spec: CapsuleSpec,
     pub assignment: Assignment,
-    pub result: Option<InstanceRecord>,
+    pub result: Option<CapsuleRecord>,
 }
-impl StoredInstance {
+impl StoredCapsule {
     pub fn resources_held(&self) -> bool {
         (!self.invalidated && self.recovery.as_ref().is_some_and(|r| r.pending))
             || self.result.as_ref().is_none_or(|r| r.resources_held)
     }
-    pub(crate) fn effective_record(&self) -> InstanceRecord {
-        self.result.clone().unwrap_or_else(|| InstanceRecord {
+    pub(crate) fn effective_record(&self) -> CapsuleRecord {
+        self.result.clone().unwrap_or_else(|| CapsuleRecord {
             restart_attempts: 0,
             restart_pending: false,
-            runtime_id: format!("{}-{}", self.spec.id, self.assignment.generation),
+            runtime: adx_core::Runtime {
+                id: format!("{}-{}", self.spec.id, self.assignment.generation),
+                ip: None,
+            },
             spec: self.spec.clone(),
             assignment: self.assignment.clone(),
-            state: InstanceState::Pending,
+            state: CapsuleState::Pending,
             revision: 0,
             resources_held: true,
-            runtime_ip: None,
             checkpoint: None,
             last_operation: None,
         })
     }
     fn validate(&self) -> Result<()> {
         self.spec.validate()?;
-        if self.spec.id != self.assignment.instance_id || self.assignment.generation == 0 {
+        if self.spec.id != self.assignment.capsule_id || self.assignment.generation == 0 {
             return Err(Error::Conflict);
         }
         validate_device_assignment(&self.spec.scheduling.devices, &self.assignment.devices)?;
@@ -128,11 +130,11 @@ impl StoredInstance {
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Route {
-    pub instance_id: String,
+    pub capsule_id: String,
     pub node_id: String,
     pub proxy_address: String,
     pub generation: u64,
-    pub instance_revision: u64,
+    pub capsule_revision: u64,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredSnapshot {
@@ -141,7 +143,7 @@ pub struct StoredSnapshot {
     /// Cluster publication cursor, including changes that do not add a route.
     pub revision: u64,
     pub nodes: BTreeMap<String, StoredNode>,
-    pub instances: BTreeMap<String, StoredInstance>,
+    pub capsules: BTreeMap<String, StoredCapsule>,
 }
 impl StoredSnapshot {
     pub fn validate(&self) -> Result<()> {
@@ -158,7 +160,7 @@ impl StoredSnapshot {
                 return Err(Error::Conflict);
             }
         }
-        for (id, i) in &self.instances {
+        for (id, i) in &self.capsules {
             i.validate()?;
             let n = self
                 .nodes
@@ -178,24 +180,24 @@ impl StoredSnapshot {
     pub fn routes(&self) -> Result<Vec<Route>> {
         self.validate()?;
         Ok(self
-            .instances
+            .capsules
             .values()
             .filter_map(|i| {
                 i.result
                     .as_ref()
                     .filter(|r| {
-                        r.state == InstanceState::Running
+                        r.state == CapsuleState::Running
                             && self.nodes[&r.assignment.node_id]
                                 .session
                                 .as_ref()
                                 .is_none_or(|s| s.routable)
                     })
                     .map(|r| Route {
-                        instance_id: r.spec.id.clone(),
+                        capsule_id: r.spec.id.clone(),
                         node_id: r.assignment.node_id.clone(),
                         proxy_address: self.nodes[&r.assignment.node_id].proxy_address.clone(),
                         generation: r.assignment.generation,
-                        instance_revision: r.revision,
+                        capsule_revision: r.revision,
                     })
             })
             .collect())
@@ -209,7 +211,7 @@ fn encode<T: Serialize>(v: &T) -> Result<String> {
 fn decode<T: for<'a> Deserialize<'a>>(v: &str) -> Result<T> {
     serde_json::from_str(v).map_err(|_| Error::Unavailable("corrupt control record".into()))
 }
-fn validate_result(r: &InstanceRecord) -> Result<()> {
+fn validate_result(r: &CapsuleRecord) -> Result<()> {
     if r.restart_attempts
         > r.spec
             .lifecycle
@@ -217,7 +219,7 @@ fn validate_result(r: &InstanceRecord) -> Result<()> {
             .as_ref()
             .map_or(0, |p| p.max_attempts)
         || (r.restart_pending
-            && (r.state != InstanceState::Failed
+            && (r.state != CapsuleState::Failed
                 || r.spec
                     .lifecycle
                     .restart
@@ -227,7 +229,7 @@ fn validate_result(r: &InstanceRecord) -> Result<()> {
         return Err(Error::Conflict);
     }
     if r.revision == 0
-        || !adx_core::valid_runtime_id(&r.spec.id, r.assignment.generation, &r.runtime_id)
+        || !adx_core::valid_runtime_id(&r.spec.id, r.assignment.generation, &r.runtime.id)
     {
         return Err(Error::Conflict);
     }
@@ -244,13 +246,13 @@ fn validate_result(r: &InstanceRecord) -> Result<()> {
                     &cp.source_runtime_id,
                 ),
                 Some(origin) => {
-                    (if origin.instance_id == r.spec.id {
+                    (if origin.capsule_id == r.spec.id {
                         origin.ownership_generation >= r.assignment.generation
                     } else {
                         r.spec.snapshot_id.is_none()
                     }) || origin.runtime_id != cp.source_runtime_id
                         || !adx_core::valid_runtime_id(
-                            &origin.instance_id,
+                            &origin.capsule_id,
                             origin.ownership_generation,
                             &origin.runtime_id,
                         )
@@ -266,20 +268,20 @@ fn validate_result(r: &InstanceRecord) -> Result<()> {
         return Err(Error::Conflict);
     }
     match r.state {
-        InstanceState::Running if r.resources_held && r.runtime_ip.is_some() => Ok(()),
-        InstanceState::Paused
-            if !r.resources_held && r.runtime_ip.is_none() && r.checkpoint.is_some() =>
+        CapsuleState::Running if r.resources_held && r.runtime.ip.is_some() => Ok(()),
+        CapsuleState::Paused
+            if !r.resources_held && r.runtime.ip.is_none() && r.checkpoint.is_some() =>
         {
             Ok(())
         }
-        InstanceState::Deleted if !r.resources_held => Ok(()),
-        InstanceState::Failed => Ok(()),
+        CapsuleState::Deleted if !r.resources_held => Ok(()),
+        CapsuleState::Failed => Ok(()),
         _ => Err(Error::Invalid(
             "expected a completed node result with consistent resource ownership".into(),
         )),
     }
 }
-fn next_result(old: &StoredInstance, r: &InstanceRecord) -> Result<bool> {
+fn next_result(old: &StoredCapsule, r: &CapsuleRecord) -> Result<bool> {
     let mut expected_spec = old.spec.clone();
     expected_spec.sandbox.network = r.spec.sandbox.network.clone();
     if expected_spec != r.spec || old.assignment != r.assignment {
@@ -287,11 +289,11 @@ fn next_result(old: &StoredInstance, r: &InstanceRecord) -> Result<bool> {
     }
     validate_result(r)?;
     if old.invalidated
-        && (!matches!(r.state, InstanceState::Failed | InstanceState::Deleted)
+        && (!matches!(r.state, CapsuleState::Failed | CapsuleState::Deleted)
             || r.resources_held
             || r.restart_pending
-            || r.runtime_ip.is_some()
-            || (r.state != InstanceState::Deleted
+            || r.runtime.ip.is_some()
+            || (r.state != CapsuleState::Deleted
                 && old
                     .result
                     .as_ref()
@@ -303,23 +305,23 @@ fn next_result(old: &StoredInstance, r: &InstanceRecord) -> Result<bool> {
         if previous == r {
             return Ok(false);
         }
-        let restarting = previous.state == InstanceState::Failed
+        let restarting = previous.state == CapsuleState::Failed
             && previous.restart_pending
             && previous.restart_attempts.checked_add(1) == Some(r.restart_attempts)
-            && r.runtime_id != previous.runtime_id
+            && r.runtime.id != previous.runtime.id
             && r.checkpoint == previous.checkpoint
-            && matches!(r.state, InstanceState::Running | InstanceState::Failed);
+            && matches!(r.state, CapsuleState::Running | CapsuleState::Failed);
         if r.restart_attempts < previous.restart_attempts
             || (r.restart_attempts != previous.restart_attempts && !restarting)
             || r.revision <= previous.revision
-            || previous.state == InstanceState::Deleted
+            || previous.state == CapsuleState::Deleted
             || (!previous.resources_held
                 && r.resources_held
                 && !restarting
-                && !(previous.state == InstanceState::Paused
+                && !(previous.state == CapsuleState::Paused
                     && r.checkpoint == previous.checkpoint
-                    && r.runtime_id != previous.runtime_id
-                    && (r.state == InstanceState::Failed
+                    && r.runtime.id != previous.runtime.id
+                    && (r.state == CapsuleState::Failed
                         || r.last_operation.as_ref().is_some_and(|op| {
                             op.kind == adx_core::LifecycleKind::Resume
                                 && op.expected_revision == previous.revision
@@ -476,13 +478,13 @@ fn snapshot(raw: &BTreeMap<String, String>) -> Result<StoredSnapshot> {
         generation: h.generation,
         revision: h.revision,
         nodes: BTreeMap::new(),
-        instances: BTreeMap::new(),
+        capsules: BTreeMap::new(),
     };
     for (key, value) in raw {
         if let Some(id) = key.strip_prefix("node:") {
             out.nodes.insert(id.into(), decode(value)?);
-        } else if let Some(id) = key.strip_prefix("instance:") {
-            out.instances.insert(id.into(), decode(value)?);
+        } else if let Some(id) = key.strip_prefix("capsule:") {
+            out.capsules.insert(id.into(), decode(value)?);
         } else if key != HEADER {
             return Err(Error::Unavailable("unknown control metadata field".into()));
         }
@@ -586,13 +588,13 @@ impl Session {
         Ok(value)
     }
 
-    pub async fn get(&self, id: &str) -> Result<StoredInstance> {
-        let [header_value, instance_value] = self
+    pub async fn get(&self, id: &str) -> Result<StoredCapsule> {
+        let [header_value, capsule_value] = self
             .store
-            .fields([HEADER.into(), format!("instance:{id}")])
+            .fields([HEADER.into(), format!("capsule:{id}")])
             .await?;
         self.header(&header_value)?;
-        let record: StoredInstance = decode(instance_value.as_deref().ok_or(Error::NotFound)?)?;
+        let record: StoredCapsule = decode(capsule_value.as_deref().ok_or(Error::NotFound)?)?;
         record.validate()?;
         Ok(record)
     }
@@ -689,22 +691,22 @@ impl Session {
     /// Ordinary node lifecycle operations do not write an intent here.
     pub async fn reserve(
         &self,
-        spec: InstanceSpec,
+        spec: CapsuleSpec,
         assignment: Assignment,
-    ) -> Result<StoredInstance> {
+    ) -> Result<StoredCapsule> {
         if let Some(id) = &spec.snapshot_id {
             let snapshot = self.get_snapshot(id).await?;
             if snapshot.template.tenant_id != spec.tenant_id
                 || !snapshot
                     .references
                     .contains(&adx_core::snapshots::Reference::Restore {
-                        instance_id: spec.id.clone(),
+                        capsule_id: spec.id.clone(),
                     })
             {
                 return Err(Error::Conflict);
             }
         }
-        let record = StoredInstance {
+        let record = StoredCapsule {
             recovery: None,
             invalidated: false,
             spec,
@@ -712,9 +714,9 @@ impl Session {
             result: None,
         };
         record.validate()?;
-        let field = format!("instance:{}", record.spec.id);
+        let field = format!("capsule:{}", record.spec.id);
         for _ in 0..ATTEMPTS {
-            let [header_value, instance_value, node_value] = self
+            let [header_value, capsule_value, node_value] = self
                 .store
                 .fields([
                     HEADER.into(),
@@ -723,8 +725,8 @@ impl Session {
                 ])
                 .await?;
             let mut header = self.header(&header_value)?;
-            if let Some(instance_value) = &instance_value {
-                let existing: StoredInstance = decode(instance_value)?;
+            if let Some(capsule_value) = &capsule_value {
+                let existing: StoredCapsule = decode(capsule_value)?;
                 return if existing.spec == record.spec && existing.assignment == record.assignment {
                     Ok(existing)
                 } else {
@@ -758,20 +760,20 @@ impl Session {
         ))
     }
     /// Replace an unexecuted reservation after its node explicitly rejected it
-    /// or confirmed cleanup. This is not failover of a running Instance.
+    /// or confirmed cleanup. This is not failover of a running Capsule.
     pub async fn replace_rejected(
         &self,
         previous: &Assignment,
         replacement: Assignment,
-    ) -> Result<StoredInstance> {
-        if previous.instance_id != replacement.instance_id
+    ) -> Result<StoredCapsule> {
+        if previous.capsule_id != replacement.capsule_id
             || replacement.generation <= previous.generation
         {
             return Err(Error::Conflict);
         }
-        let field = format!("instance:{}", previous.instance_id);
+        let field = format!("capsule:{}", previous.capsule_id);
         for _ in 0..ATTEMPTS {
-            let [header_value, instance_value, node_value] = self
+            let [header_value, capsule_value, node_value] = self
                 .store
                 .fields([
                     HEADER.into(),
@@ -780,18 +782,18 @@ impl Session {
                 ])
                 .await?;
             let mut header = self.header(&header_value)?;
-            let mut stored_instance: StoredInstance =
-                decode(instance_value.as_deref().ok_or(Error::NotFound)?)?;
-            stored_instance.validate()?;
-            if stored_instance.assignment == replacement {
-                return Ok(stored_instance);
+            let mut stored_capsule: StoredCapsule =
+                decode(capsule_value.as_deref().ok_or(Error::NotFound)?)?;
+            stored_capsule.validate()?;
+            if stored_capsule.assignment == replacement {
+                return Ok(stored_capsule);
             }
-            if stored_instance.invalidated
-                || &stored_instance.assignment != previous
-                || stored_instance
+            if stored_capsule.invalidated
+                || &stored_capsule.assignment != previous
+                || stored_capsule
                     .result
                     .as_ref()
-                    .is_some_and(|r| r.state != InstanceState::Failed || r.resources_held)
+                    .is_some_and(|r| r.state != CapsuleState::Failed || r.resources_held)
                 || replacement.generation <= header.generation
             {
                 return Err(Error::Conflict);
@@ -800,9 +802,9 @@ impl Session {
             if node.shard_id != replacement.shard_id {
                 return Err(Error::Conflict);
             }
-            stored_instance.assignment = replacement.clone();
-            stored_instance.result = None;
-            stored_instance.validate()?;
+            stored_capsule.assignment = replacement.clone();
+            stored_capsule.result = None;
+            stored_capsule.validate()?;
             header.generation = replacement.generation;
             header.advance()?;
             if self
@@ -812,11 +814,11 @@ impl Session {
                         .as_deref()
                         .expect("validated control header is present"),
                     &header,
-                    Some((&field, encode(&stored_instance)?)),
+                    Some((&field, encode(&stored_capsule)?)),
                 )
                 .await?
             {
-                return Ok(stored_instance);
+                return Ok(stored_capsule);
             }
         }
         Err(Error::Unavailable(
@@ -825,12 +827,12 @@ impl Session {
     }
     /// One result write: state and the route publication cursor change atomically.
     /// Identical replay is idempotent; older versions never roll state backward.
-    pub async fn commit(&self, result: InstanceRecord) -> Result<InstanceRecord> {
+    pub async fn commit(&self, result: CapsuleRecord) -> Result<CapsuleRecord> {
         if let Some(cp) = &result.checkpoint {
             if let Some(origin) = cp
                 .origin
                 .as_ref()
-                .filter(|o| o.instance_id != result.spec.id)
+                .filter(|o| o.capsule_id != result.spec.id)
             {
                 let snapshot = self
                     .get_snapshot(result.spec.snapshot_id.as_deref().ok_or(Error::Conflict)?)
@@ -843,29 +845,29 @@ impl Session {
                 }
             }
         }
-        let field = format!("instance:{}", result.spec.id);
+        let field = format!("capsule:{}", result.spec.id);
         for _ in 0..ATTEMPTS {
-            let [header_value, instance_value] =
+            let [header_value, capsule_value] =
                 self.store.fields([HEADER.into(), field.clone()]).await?;
             let mut header = self.header(&header_value)?;
-            let mut stored_instance: StoredInstance =
-                decode(instance_value.as_deref().ok_or(Error::NotFound)?)?;
-            if !next_result(&stored_instance, &result)? {
+            let mut stored_capsule: StoredCapsule =
+                decode(capsule_value.as_deref().ok_or(Error::NotFound)?)?;
+            if !next_result(&stored_capsule, &result)? {
                 return Ok(result);
             }
-            if result.state != InstanceState::Paused {
-                if let Some(recovery) = &mut stored_instance.recovery {
+            if result.state != CapsuleState::Paused {
+                if let Some(recovery) = &mut stored_capsule.recovery {
                     recovery.pending = false;
                 }
             }
-            // Runtime network policy is the only mutable part of an Instance
+            // Runtime network policy is the only mutable part of an Capsule
             // specification. Persist it with the result so later lifecycle
             // commits compare against the version already enforced by the
             // runtime, while every placement and resource field remains
             // fenced by `next_result` above.
-            stored_instance.spec = result.spec.clone();
-            stored_instance.result = Some(result.clone());
-            stored_instance.validate()?;
+            stored_capsule.spec = result.spec.clone();
+            stored_capsule.result = Some(result.clone());
+            stored_capsule.validate()?;
             header.advance()?;
             if self
                 .store
@@ -874,7 +876,7 @@ impl Session {
                         .as_deref()
                         .expect("validated control header is present"),
                     &header,
-                    Some((&field, encode(&stored_instance)?)),
+                    Some((&field, encode(&stored_capsule)?)),
                 )
                 .await?
             {
@@ -882,7 +884,7 @@ impl Session {
             }
         }
         Err(Error::Unavailable(
-            "concurrent instance commit; retry request".into(),
+            "concurrent capsule commit; retry request".into(),
         ))
     }
 }

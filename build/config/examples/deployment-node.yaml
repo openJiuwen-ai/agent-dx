@@ -53,9 +53,9 @@ logging:
   max_files: 5
   max_age_seconds: 604800
   max_total_bytes: 1073741824
-runtime_environment:
+environment:
   rootfs:
-    runtime: runsc
+    runtime_class: runsc
     type: local
     path: /opt/adx/runtime/adx-runtime-rootfs.img
     readonly: false

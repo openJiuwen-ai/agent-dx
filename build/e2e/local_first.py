@@ -16,7 +16,7 @@ def run(connection, image, output):
         return Sandbox(name=name, image=image, runtime='runc', cpu=500, memory=512,
                        idle_timeout=0, connection=connection, create_timeout=150, **extra)
     def record(instance):
-        return json.loads(catalog()['instance:' + instance.id])
+        return json.loads(catalog()['capsule:' + instance.id])
     try:
         first = create(prefix + '-a'); instances.append(first)
         second = create(prefix + '-b'); instances.append(second)
@@ -54,7 +54,7 @@ def run(connection, image, output):
                 try:
                     data=gzip.decompress(path.read_bytes()) if path.suffix=='.gz' else path.read_bytes()
                     for line in data.decode(errors='replace').splitlines():
-                        if 'local_instance_claim' in line:
+                        if 'local_capsule_claim' in line:
                             claimed.update(identity for identity in expected if identity in line)
                 except (FileNotFoundError,EOFError,OSError):continue
             if claimed==expected:break

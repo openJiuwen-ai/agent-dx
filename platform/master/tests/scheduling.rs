@@ -1,4 +1,4 @@
-use adx_core::{Error, InstanceSpec, Resources};
+use adx_core::{CapsuleSpec, Error, Resources};
 use adx_master::{Master, Node, Placement, TenantQueue};
 
 fn resources(cpu: u64) -> Resources {
@@ -9,16 +9,16 @@ fn resources(cpu: u64) -> Resources {
     }
 }
 
-fn spec(id: &str, tenant: &str, priority: i32) -> InstanceSpec {
-    InstanceSpec {
-        runtime_environment: None,
+fn spec(id: &str, tenant: &str, priority: i32) -> CapsuleSpec {
+    CapsuleSpec {
+        environment: None,
         snapshot_id: None,
         lifecycle: Default::default(),
         env: Default::default(),
         id: id.into(),
         tenant_id: tenant.into(),
         image: "test-image".into(),
-        runtime: "test-runtime".into(),
+        runtime_class: "test-runtime".into(),
         resources: resources(1),
         priority,
         scheduling: Default::default(),
@@ -64,7 +64,7 @@ fn reservations_prevent_overcommit_and_release_wakes_waiting_work() {
     let a = master.schedule(0).unwrap().unwrap();
     assert!(master.schedule(0).unwrap().is_none());
     master.release(&a).unwrap();
-    assert_eq!(master.schedule(0).unwrap().unwrap().instance_id, "b");
+    assert_eq!(master.schedule(0).unwrap().unwrap().capsule_id, "b");
     assert_eq!(master.release(&a), Err(Error::Conflict));
 }
 
@@ -157,7 +157,7 @@ fn unschedulable_tenant_does_not_block_a_fitting_other_tenant() {
     large.resources.cpu_millis = 10;
     master.submit(large).unwrap();
     master.submit(spec("b", "tenant-b", 0)).unwrap();
-    assert_eq!(master.schedule(0).unwrap().unwrap().instance_id, "b");
+    assert_eq!(master.schedule(0).unwrap().unwrap().capsule_id, "b");
     assert!(master.schedule(0).unwrap().is_none());
 }
 
@@ -170,7 +170,7 @@ fn locally_claimed_owner_updates_capacity_queue_and_generation_exactly_once() {
     let local = spec("local", "t", 0);
     master.submit(local.clone()).unwrap(); // A concurrent center request is already queued.
     let assignment = Assignment {
-        instance_id: "local".into(),
+        capsule_id: "local".into(),
         node_id: "n1".into(),
         shard_id: 0,
         generation: 77,
@@ -184,7 +184,7 @@ fn locally_claimed_owner_updates_capacity_queue_and_generation_exactly_once() {
     assert_eq!(next.node_id, "n2");
     assert_eq!(next.generation, 78);
     master.release(&assignment).unwrap();
-    assert_eq!(master.snapshot().instances().len(), 1);
+    assert_eq!(master.snapshot().capsules().len(), 1);
 }
 
 #[test]
@@ -201,7 +201,7 @@ fn local_candidate_obeys_hard_constraints_and_occupancy_without_global_score() {
     assert!(!master.local_candidate(&request, "n1", &[]).unwrap());
     assert!(master.local_candidate(&request, "n2", &[]).unwrap());
     let assignment = adx_core::Assignment {
-        instance_id: request.id.clone(),
+        capsule_id: request.id.clone(),
         node_id: "n2".into(),
         shard_id: 0,
         generation: 1,

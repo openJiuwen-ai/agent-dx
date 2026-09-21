@@ -1,7 +1,7 @@
-//! Node RPC adaptation; InstanceHandle remains the lifecycle owner.
+//! Node RPC adaptation; CapsuleHandle remains the lifecycle owner.
 mod local_create;
 use crate::{Durability, NodeManager, StateSink};
-use adx_core::{Error, InstanceRecord, Result};
+use adx_core::{CapsuleRecord, Error, Result};
 use adx_protocol::{
     auth::{tenant, Peers, Principal},
     control as pb, dependency_status, status,
@@ -27,19 +27,19 @@ impl NodeRpc {
         &self,
         assignment: Option<pb::Assignment>,
         caller: Option<&pb::CallerContext>,
-    ) -> std::result::Result<crate::InstanceHandle, Status> {
+    ) -> std::result::Result<crate::CapsuleHandle, Status> {
         let assignment: adx_core::Assignment = assignment
             .ok_or_else(|| Status::invalid_argument("assignment required"))?
             .try_into()
             .map_err(status)?;
         let (spec, owner, handle) = self
             .manager
-            .instances
+            .capsules
             .lock()
             .expect("shared state lock poisoned")
-            .get(&assignment.instance_id)
+            .get(&assignment.capsule_id)
             .cloned()
-            .ok_or_else(|| Status::not_found("instance not managed on this node"))?;
+            .ok_or_else(|| Status::not_found("capsule not managed on this node"))?;
         tenant(caller, &spec.tenant_id)?;
         if owner != assignment {
             return Err(Status::failed_precondition("assignment changed"));
@@ -60,11 +60,11 @@ impl NodeRpc {
         }
     }
 }
-fn response(result: crate::OperationResult) -> Result<Response<pb::InstanceResult>> {
-    adx_observability::info!(event="instance_operation_completed", traceparent=?adx_observability::trace::traceparent(), instance_id=%result.record.spec.id,
+fn response(result: crate::OperationResult) -> Result<Response<pb::CapsuleResult>> {
+    adx_observability::info!(event="capsule_operation_completed", traceparent=?adx_observability::trace::traceparent(), capsule_id=%result.record.spec.id,
         generation=result.record.assignment.generation, revision=result.record.revision,
-        state=?result.record.state, "instance operation completed");
-    Ok(Response::new(pb::InstanceResult {
+        state=?result.record.state, "capsule operation completed");
+    Ok(Response::new(pb::CapsuleResult {
         record: Some(result.record.try_into()?),
         durability: match result.durability {
             Durability::Published => pb::Durability::Published,
@@ -74,11 +74,11 @@ fn response(result: crate::OperationResult) -> Result<Response<pb::InstanceResul
 }
 #[tonic::async_trait]
 impl pb::node_service_server::NodeService for NodeRpc {
-    async fn create_local_instance(
+    async fn create_local_capsule(
         &self,
-        request: Request<pb::LocalCreateRequest>,
-    ) -> std::result::Result<Response<pb::InstanceResult>, Status> {
-        let trace = adx_observability::trace::Trace::rpc("node.create_local_instance", &request);
+        request: Request<pb::LocalCapsuleCreateRequest>,
+    ) -> std::result::Result<Response<pb::CapsuleResult>, Status> {
+        let trace = adx_observability::trace::Trace::rpc("node.create_local_capsule", &request);
         if self.peers.authenticate(&request)? != Principal::ApiServer {
             return Err(Status::permission_denied("API Server required"));
         }
@@ -97,11 +97,11 @@ impl pb::node_service_server::NodeService for NodeRpc {
             .map_err(|_| Status::internal("local creation task failed"))?
     }
 
-    async fn recover_instance(
+    async fn recover_capsule(
         &self,
-        request: Request<pb::RecoverInstanceRequest>,
-    ) -> std::result::Result<Response<pb::InstanceResult>, Status> {
-        let trace = adx_observability::trace::Trace::rpc("node.recover_instance", &request);
+        request: Request<pb::RecoverCapsuleRequest>,
+    ) -> std::result::Result<Response<pb::CapsuleResult>, Status> {
+        let trace = adx_observability::trace::Trace::rpc("node.recover_capsule", &request);
         trace
             .run_result(async {
                 if self.peers.authenticate(&request)? != Principal::Master {
@@ -116,13 +116,8 @@ impl pb::node_service_server::NodeService for NodeRpc {
                     .ok_or_else(|| Status::invalid_argument("recovery record required"))?
                     .try_into()
                     .map_err(status)?;
-                response(
-                    self.manager
-                        .recover_instance(record)
-                        .await
-                        .map_err(status)?,
-                )
-                .map_err(status)
+                response(self.manager.recover_capsule(record).await.map_err(status)?)
+                    .map_err(status)
             })
             .await
     }
@@ -174,7 +169,7 @@ impl pb::node_service_server::NodeService for NodeRpc {
                     .map_err(status)?;
                 Ok(Response::new(pb::CreateSnapshotResponse {
                     snapshot: Some(saved.snapshot.try_into().map_err(status)?),
-                    instance: Some(response(saved.instance).map_err(status)?.into_inner()),
+                    capsule: Some(response(saved.capsule).map_err(status)?.into_inner()),
                 }))
             })
             .await
@@ -213,17 +208,15 @@ impl pb::node_service_server::NodeService for NodeRpc {
             })
             .await
     }
-    async fn create_instance(
+    async fn create_capsule(
         &self,
-        request: Request<pb::StartAssignedInstanceRequest>,
-    ) -> std::result::Result<Response<pb::InstanceResult>, Status> {
-        let trace = adx_observability::trace::Trace::rpc("node.create_instance", &request);
+        request: Request<pb::StartAssignedCapsuleRequest>,
+    ) -> std::result::Result<Response<pb::CapsuleResult>, Status> {
+        let trace = adx_observability::trace::Trace::rpc("node.create_capsule", &request);
         trace
             .run_result(async {
                 if self.peers.authenticate(&request)? != Principal::Master {
-                    return Err(Status::permission_denied(
-                        "only Master may assign instances",
-                    ));
+                    return Err(Status::permission_denied("only Master may assign capsules"));
                 }
                 let gate = self.manager.lifecycle_ready.read().await;
                 if !*gate {
@@ -243,7 +236,7 @@ impl pb::node_service_server::NodeService for NodeRpc {
                     .ok_or_else(|| Status::invalid_argument("assignment required"))?
                     .try_into()
                     .map_err(status)?;
-                let handle = self.manager.instance(spec, assignment).map_err(status)?;
+                let handle = self.manager.capsule(spec, assignment).map_err(status)?;
                 let result = match r.snapshot {
                     Some(snapshot) => {
                         handle
@@ -256,11 +249,11 @@ impl pb::node_service_server::NodeService for NodeRpc {
             })
             .await
     }
-    async fn pause_instance(
+    async fn pause_capsule(
         &self,
-        request: Request<pb::PauseInstanceRequest>,
-    ) -> std::result::Result<Response<pb::InstanceResult>, Status> {
-        let trace = adx_observability::trace::Trace::rpc("node.pause_instance", &request);
+        request: Request<pb::PauseCapsuleRequest>,
+    ) -> std::result::Result<Response<pb::CapsuleResult>, Status> {
+        let trace = adx_observability::trace::Trace::rpc("node.pause_capsule", &request);
         trace
             .run_result(async {
                 if self.peers.authenticate(&request)? != Principal::ApiServer {
@@ -289,11 +282,11 @@ impl pb::node_service_server::NodeService for NodeRpc {
             })
             .await
     }
-    async fn resume_instance(
+    async fn resume_capsule(
         &self,
-        request: Request<pb::ResumeInstanceRequest>,
-    ) -> std::result::Result<Response<pb::InstanceResult>, Status> {
-        let trace = adx_observability::trace::Trace::rpc("node.resume_instance", &request);
+        request: Request<pb::ResumeCapsuleRequest>,
+    ) -> std::result::Result<Response<pb::CapsuleResult>, Status> {
+        let trace = adx_observability::trace::Trace::rpc("node.resume_capsule", &request);
         trace
             .run_result(async {
                 if self.peers.authenticate(&request)? != Principal::ApiServer {
@@ -323,7 +316,7 @@ impl pb::node_service_server::NodeService for NodeRpc {
     async fn update_network_policy(
         &self,
         request: Request<pb::UpdateNetworkPolicyRequest>,
-    ) -> std::result::Result<Response<pb::InstanceResult>, Status> {
+    ) -> std::result::Result<Response<pb::CapsuleResult>, Status> {
         let trace = adx_observability::trace::Trace::rpc("node.update_network_policy", &request);
         trace
             .run_result(async {
@@ -349,12 +342,12 @@ impl pb::node_service_server::NodeService for NodeRpc {
                     .await
                     .map_err(status)?;
                 {
-                    let mut instances = self
+                    let mut capsules = self
                         .manager
-                        .instances
+                        .capsules
                         .lock()
                         .expect("shared state lock poisoned");
-                    if let Some((spec, owner, _)) = instances.get_mut(&result.record.spec.id) {
+                    if let Some((spec, owner, _)) = capsules.get_mut(&result.record.spec.id) {
                         if *owner != result.record.assignment {
                             return Err(Status::failed_precondition("assignment changed"));
                         }
@@ -365,11 +358,11 @@ impl pb::node_service_server::NodeService for NodeRpc {
             })
             .await
     }
-    async fn reload_instance(
+    async fn reload_capsule(
         &self,
-        request: Request<pb::ReloadInstanceRequest>,
-    ) -> std::result::Result<Response<pb::InstanceResult>, Status> {
-        let trace = adx_observability::trace::Trace::rpc("node.reload_instance", &request);
+        request: Request<pb::ReloadCapsuleRequest>,
+    ) -> std::result::Result<Response<pb::CapsuleResult>, Status> {
+        let trace = adx_observability::trace::Trace::rpc("node.reload_capsule", &request);
         trace
             .run_result(async {
                 if self.peers.authenticate(&request)? != Principal::ApiServer {
@@ -393,11 +386,11 @@ impl pb::node_service_server::NodeService for NodeRpc {
             })
             .await
     }
-    async fn delete_instance(
+    async fn delete_capsule(
         &self,
-        request: Request<pb::DeleteInstanceRequest>,
-    ) -> std::result::Result<Response<pb::InstanceResult>, Status> {
-        let trace = adx_observability::trace::Trace::rpc("node.delete_instance", &request);
+        request: Request<pb::DeleteCapsuleRequest>,
+    ) -> std::result::Result<Response<pb::CapsuleResult>, Status> {
+        let trace = adx_observability::trace::Trace::rpc("node.delete_capsule", &request);
         trace
             .run_result(async {
                 if self.peers.authenticate(&request)? != Principal::ApiServer {
@@ -417,12 +410,12 @@ impl pb::node_service_server::NodeService for NodeRpc {
                     .map_err(status)?;
                 let (spec, owner, handle) = self
                     .manager
-                    .instances
+                    .capsules
                     .lock()
                     .expect("shared state lock poisoned")
-                    .get(&assignment.instance_id)
+                    .get(&assignment.capsule_id)
                     .cloned()
-                    .ok_or_else(|| Status::not_found("instance not managed on this node"))?;
+                    .ok_or_else(|| Status::not_found("capsule not managed on this node"))?;
                 tenant(r.caller.as_ref(), &spec.tenant_id)?;
                 if owner != assignment {
                     return Err(Status::failed_precondition("assignment changed"));
@@ -470,8 +463,8 @@ impl MasterStateSink {
 }
 #[async_trait::async_trait]
 impl StateSink for MasterStateSink {
-    async fn commit(&self, record: &InstanceRecord) -> Result<Durability> {
-        let mut request = Request::new(pb::CommitInstanceRequest {
+    async fn commit(&self, record: &CapsuleRecord) -> Result<Durability> {
+        let mut request = Request::new(pb::CommitCapsuleRequest {
             record: Some(record.clone().try_into()?),
             node_session_id: self.session_id.clone(),
         });
@@ -482,7 +475,7 @@ impl StateSink for MasterStateSink {
             .read()
             .expect("shared state lock poisoned")
             .clone();
-        let response = tokio::time::timeout(self.timeout, client.commit_instance(request))
+        let response = tokio::time::timeout(self.timeout, client.commit_capsule(request))
             .await
             .map_err(|_| Error::Unavailable("state commit RPC timed out".into()))?
             .map_err(|status| match status.code() {
@@ -492,7 +485,7 @@ impl StateSink for MasterStateSink {
                 _ => dependency_status(status),
             })?
             .into_inner();
-        let accepted: InstanceRecord = response
+        let accepted: CapsuleRecord = response
             .record
             .ok_or_else(|| Error::Unavailable("commit response missing record".into()))?
             .try_into()?;

@@ -122,14 +122,14 @@ if os.getenv('ADX_E2E_KUBERNETES'):
  if not runtime_image.is_file(): raise RuntimeError('Kubernetes OCI runtime image is missing')
  image=runtime_image.read_text().strip()
  if '@sha256:' not in image: raise RuntimeError('Kubernetes OCI runtime image must be digest pinned')
- d['runtime_environment']={
-  'rootfs':{'runtime':'runc','type':'image','image':image,'readonly':False},
+ d['environment']={
+  'rootfs':{'runtime_class':'runc','type':'image','image':image,'readonly':False},
   'bootstrap':{'type':'image','image':image,'target':'/__adx',
     'entrypoint':['/__adx/usr/local/bin/rrt-runtime']},
   'env':{'PATH':'/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'}}
 elif runtime_artifact.is_file():
- d['runtime_environment']={
-  'rootfs':{'runtime':'runc','type':'local','path':str(runtime_artifact),'readonly':False},
+ d['environment']={
+  'rootfs':{'runtime_class':'runc','type':'local','path':str(runtime_artifact),'readonly':False},
   'bootstrap':{'type':'erofs','root':str(runtime_artifact),'target':'/__adx',
     'entrypoint':['/__adx/usr/local/bin/rrt-runtime']},
   'env':{'PATH':'/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'}}

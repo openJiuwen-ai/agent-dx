@@ -8,13 +8,13 @@ message Resources {
   uint64 disk_bytes = 3;
 }
 
-message InstanceSpec {
-  RuntimeEnvironment runtime_environment = 11;
+message CapsuleSpec {
+  EnvironmentSpec environment = 11;
   optional string snapshot_id = 10;
   string id = 1;
   string tenant_id = 2;
   string image = 3;
-  string runtime = 4;
+  string runtime_class = 4;
   Resources resources = 5;
   int32 priority = 6;
   SchedulingPolicy scheduling = 7;
@@ -99,7 +99,7 @@ message LifecyclePolicy { uint64 idle_timeout_seconds = 1; RestartPolicy restart
 message RestartPolicy { uint32 max_attempts = 1; uint64 initial_backoff_seconds = 2; uint64 max_backoff_seconds = 3; }
 
 message Assignment {
-  string instance_id = 1;
+  string capsule_id = 1;
   string node_id = 2;
   uint32 shard_id = 3;
   // Generation is allocated durably by Master before a real backend is started.
@@ -108,33 +108,35 @@ message Assignment {
   repeated DeviceAllocation devices = 5;
 }
 
-enum InstanceState {
-  INSTANCE_STATE_UNSPECIFIED = 0;
-  INSTANCE_STATE_PENDING = 1;
-  INSTANCE_STATE_STARTING = 2;
-  INSTANCE_STATE_RUNNING = 3;
-  INSTANCE_STATE_DELETING = 4;
-  INSTANCE_STATE_DELETED = 5;
-  INSTANCE_STATE_FAILED = 6;
-  INSTANCE_STATE_PAUSING = 7;
-  INSTANCE_STATE_PAUSED = 8;
-  INSTANCE_STATE_RESUMING = 9;
+enum CapsuleState {
+  CAPSULE_STATE_UNSPECIFIED = 0;
+  CAPSULE_STATE_PENDING = 1;
+  CAPSULE_STATE_STARTING = 2;
+  CAPSULE_STATE_RUNNING = 3;
+  CAPSULE_STATE_DELETING = 4;
+  CAPSULE_STATE_DELETED = 5;
+  CAPSULE_STATE_FAILED = 6;
+  CAPSULE_STATE_PAUSING = 7;
+  CAPSULE_STATE_PAUSED = 8;
+  CAPSULE_STATE_RESUMING = 9;
 }
 
-message InstanceRecord {
-  InstanceSpec spec = 1;
+message CapsuleRecord {
+  CapsuleSpec spec = 1;
   Assignment assignment = 2;
-  InstanceState state = 3;
+  CapsuleState state = 3;
   uint64 revision = 4;
-  string runtime_id = 5;
+  Runtime runtime = 5;
   // Failed does not imply the backend is absent or its capacity can be reused.
   bool resources_held = 6;
-  string runtime_ip = 7;
+  reserved 7;
   RestorePoint checkpoint = 8;
   CompletedOperation last_operation = 9;
   uint32 restart_attempts = 10;
   bool restart_pending = 11;
 }
+
+message Runtime { string id = 1; string ip = 2; }
 
 enum Durability {
   DURABILITY_UNSPECIFIED = 0;
@@ -142,8 +144,8 @@ enum Durability {
   DURABILITY_JOURNALED = 2;
 }
 
-message InstanceResult {
-  InstanceRecord record = 1;
+message CapsuleResult {
+  CapsuleRecord record = 1;
   Durability durability = 2;
 }
 
@@ -173,7 +175,7 @@ enum SpreadMode { SPREAD_MODE_UNSPECIFIED = 0; SPREAD_MODE_DO_NOT_SCHEDULE = 1; 
 
 message TopologySpread { string topology_key = 1; LabelSelector selector = 2; uint32 max_skew = 3; uint32 min_domains = 4; SpreadMode when_unsatisfiable = 5; }
 
-enum PlacementTarget { PLACEMENT_TARGET_UNSPECIFIED = 0; PLACEMENT_TARGET_NODE = 1; PLACEMENT_TARGET_INSTANCE = 2; }
+enum PlacementTarget { PLACEMENT_TARGET_UNSPECIFIED = 0; PLACEMENT_TARGET_NODE = 1; PLACEMENT_TARGET_CAPSULE = 2; }
 
 message PlacementGroup {
   PlacementTarget target = 1;
@@ -198,7 +200,7 @@ message SchedulingPolicy {
 
 message CheckpointArtifact { string storage = 1; string location = 2; uint64 size_bytes = 3; }
 
-message RuntimeIdentity { string instance_id = 1; string runtime_id = 2; uint64 ownership_generation = 3; }
+message RuntimeIdentity { string capsule_id = 1; string runtime_id = 2; uint64 ownership_generation = 3; }
 
 message RestorePoint { RuntimeIdentity origin = 5; string id = 1; CheckpointArtifact artifact = 2; uint64 expires_at_unix_seconds = 3; string source_runtime_id = 4; }
 
@@ -206,12 +208,12 @@ enum LifecycleKind { LIFECYCLE_KIND_UNSPECIFIED = 0; LIFECYCLE_KIND_PAUSE = 1; L
 
 message CompletedOperation { string id = 1; LifecycleKind kind = 2; uint64 expected_revision = 3; }
 
-message RuntimeEnvironment {
+message EnvironmentSpec {
   RuntimeRootfs rootfs = 1;
   RuntimeBootstrap bootstrap = 2;
   map<string,string> env = 3;
 }
-message RuntimeRootfs { string runtime = 1; string type = 2; string path = 3; bool readonly = 4; string image = 5; }
+message RuntimeRootfs { string runtime_class = 1; string type = 2; string path = 3; bool readonly = 4; string image = 5; }
 message RuntimeBootstrap {
   string type = 1;
   string root = 2;

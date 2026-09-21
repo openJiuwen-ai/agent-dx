@@ -1,6 +1,6 @@
 # Rust API Server 与服务启动
 
-2026-09-18 核对：HTTP 兼容层已接入 Instance RPC，提供 Master、Node Manager 和 Rust API Server 服务入口。生命周期状态机仍在 Node Manager。下文契约按当前代码描述，末尾测试表保留 2026-09-15 当次证据。
+2026-09-18 核对：HTTP 兼容层已接入 Capsule RPC，提供 Master、Node Manager 和 Rust API Server 服务入口。生命周期状态机仍在 Node Manager。下文契约按当前代码描述，末尾测试表保留 2026-09-15 当次证据。
 
 ## 请求链路
 
@@ -8,16 +8,16 @@
 SDK → Rust API Server
   认证：短时摘要缓存 → 缺失时 Master.VerifyApiKey → Redis 摘要记录
   目录：Master 首次全量 → revision 增量 upsert/delete → 本地实例目录
-  创建：本地兼容字段转换 → Master.CreateInstance → Shard → Node Manager
-  删除：本地实例目录 → Node Manager.DeleteInstance
-                         ↑ 仅结果不明／读后写时 Master.GetInstance
+  创建：本地兼容字段转换 → Master.CreateCapsule → Shard → Node Manager
+  删除：本地实例目录 → Node Manager.DeleteCapsule
+                         ↑ 仅结果不明／读后写时 Master.GetCapsule
 Node Manager → sandboxd / RRT HTTP / Node Proxy UDS
 Node Manager → MasterStateSink → Redis 条件提交
 ```
 
-API Server 通过 `InstanceDirectoryService.WatchInstances` 维护完整的内存实例目录，条目包含 InstanceRecord、节点地址和 Node Proxy 地址。每次连接先接收全量 reset，随后按 Master epoch 与 revision 接收增量 upsert/delete；revision 断档或非法 epoch 增量会清空目录并重新全量同步。普通传输断开期间保留最近完整目录并后台重连，节点继续检查租户与完整 generation。`GetInstance` 只用于创建后的读后写收敛，以及结果不明时针对原 Assignment 的恢复查询。
+API Server 通过 `CapsuleDirectoryService.WatchCapsules` 维护完整的内存实例目录，条目包含 CapsuleRecord、节点地址和 Node Proxy 地址。每次连接先接收全量 reset，随后按 Master epoch 与 revision 接收增量 upsert/delete；revision 断档或非法 epoch 增量会清空目录并重新全量同步。普通传输断开期间保留最近完整目录并后台重连，节点继续检查租户与完整 generation。`GetCapsule` 只用于创建后的读后写收敛，以及结果不明时针对原 Assignment 的恢复查询。
 
-实现与本地验收证据见 [实例目录订阅验收](2026-09-18-instance-directory.md)。
+实现与本地验收证据见 [实例目录订阅验收](2026-09-18-capsule-directory.md)。
 
 目录未完成首次同步时，API Server 不接受依赖实例归属的请求。已同步目录中的缺失项是确定的 NotFound，不触发逐项 Redis 查询。实例目录与 Edge 路由缓存分开：前者还包含 Redis 保留的 Deleted 等终态记录，以维持重复生命周期请求的幂等结果；公开查询仍将 Deleted 映射为 NotFound。后者只发布可路由的 Running 实例。
 
@@ -25,9 +25,9 @@ API Server 通过 `InstanceDirectoryService.WatchInstances` 维护完整的内�
 
 ## HTTP 兼容与支持范围
 
-沿用既有 Sandbox URL、请求／响应封装和 SSE 行为。认证接受 SDK 的 `X-Auth`、`X-Auth-Token` 与 Bearer；调用者不能通过请求体或 `X-Tenant-Id` 自报租户。当前适配镜像、隔离 runtime、CPU、内存、磁盘、GPU/NPU 整卡、环境变量和 Instance ID。CPU 使用 millicores、HTTP 内存 MiB 转成内部字节；环境随 Spec 持久化和下发，执行身份及节点部署参数由 sandboxd 适配器最后覆盖。
+沿用既有 Sandbox URL、请求／响应封装和 SSE 行为。认证接受 SDK 的 `X-Auth`、`X-Auth-Token` 与 Bearer；调用者不能通过请求体或 `X-Tenant-Id` 自报租户。当前适配镜像、隔离 runtime、CPU、内存、磁盘、GPU/NPU 整卡、环境变量和 Capsule ID。CPU 使用 millicores、HTTP 内存 MiB 转成内部字节；环境随 Spec 持久化和下发，执行身份及节点部署参数由 sandboxd 适配器最后覆盖。
 
-公开 JSON 直接转换为 `adx.control.v1` 的 Instance 类型；协议按 Instance、快照、凭证和路由职责拆分。已接通暂停／恢复、reload、可复用快照、空闲回收、重启策略、failover、HTTP 亲和策略、S3 rootfs／mount、镜像入口继承、创建及运行期网络策略、独立 request/limit、extra_config、每实例数据面安全模式、鉴权端口转发和 `upstream` reverse tunnel。公开 API 拒绝本机 rootfs 与 host mount，防止客户端把节点路径作为租户契约；它们只属于部署拥有的本地运行环境。旧 `/invoke` 兼容传输仍未接入；用户命令走 RRT HTTP 数据接口。Agent 路由保留，配置 Agent 服务地址时转发给上层 Agent 服务；未配置时返回暂不可用。
+公开 JSON 直接转换为 `adx.control.v1` 的 Capsule 类型；协议按 Capsule、快照、凭证和路由职责拆分。已接通暂停／恢复、reload、可复用快照、空闲回收、重启策略、failover、HTTP 亲和策略、S3 rootfs／mount、镜像入口继承、创建及运行期网络策略、独立 request/limit、extra_config、每实例数据面安全模式、鉴权端口转发和 `upstream` reverse tunnel。公开 API 拒绝本机 rootfs 与 host mount，防止客户端把节点路径作为租户契约；它们只属于部署拥有的本地运行环境。旧 `/invoke` 兼容传输仍未接入；用户命令走 RRT HTTP 数据接口。Agent 路由保留，配置 Agent 服务地址时转发给上层 Agent 服务；未配置时返回暂不可用。
 
 ## 认证
 
@@ -82,7 +82,7 @@ Go 测试／构建使用 Linux ARM64 Go 1.25.5 容器，交叉编译 macOS ARM64
 ## 创建入口模式
 
 API Server 的 `create_mode` 默认 `central`；配置为 `local_first` 后，订阅 Master 的可用节点目录并轮转选择 Node Manager。
-本地资源和硬约束满足时通过原子 claim 创建；否则保持同 Instance ID 进入 ShardScheduler。
+本地资源和硬约束满足时通过原子 claim 创建；否则保持同 Capsule ID 进入 ShardScheduler。
 本地成功不经过 Pack/Spread、软偏好评分或中心队列。相同规格的同 ID 创建收敛，规格/租户变化返回冲突。
 入口超时使用同身份向 Master 重试；不会把一次缺失查询当作重新生成 ID 的许可。
-目录有效期、mTLS、暂留资源和验收范围见 [创建契约](atomic-instance-claim.md)。
+目录有效期、mTLS、暂留资源和验收范围见 [创建契约](atomic-capsule-claim.md)。

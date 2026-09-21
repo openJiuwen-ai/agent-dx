@@ -1,19 +1,19 @@
 //! SQLite contains only results awaiting cluster publication. It is never a
 //! replacement for the authoritative node catalog or the Edge routing stream.
 use crate::{Durability, StateSink};
-use adx_core::{Error, InstanceRecord, Result};
+use adx_core::{CapsuleRecord, Error, Result};
 use async_trait::async_trait;
 use rusqlite::{params, Connection};
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 use tokio::sync::{Mutex, RwLock};
 
-type Entry = (i64, InstanceRecord);
+type Entry = (i64, CapsuleRecord);
 
 pub struct JournalSink {
     path: PathBuf,
     upstream: Arc<dyn StateSink>,
     ready: RwLock<bool>,
-    instances: Mutex<BTreeMap<String, Arc<Mutex<()>>>>,
+    capsules: Mutex<BTreeMap<String, Arc<Mutex<()>>>>,
 }
 
 fn unavailable(error: impl std::fmt::Display) -> Error {
@@ -29,7 +29,7 @@ impl JournalSink {
             path,
             upstream,
             ready: RwLock::new(ready),
-            instances: Mutex::default(),
+            capsules: Mutex::default(),
         }
     }
 
@@ -66,8 +66,8 @@ impl JournalSink {
                     "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
                  CREATE TABLE IF NOT EXISTS pending (
                     sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-                    instance TEXT NOT NULL, payload TEXT NOT NULL);
-                 CREATE INDEX IF NOT EXISTS pending_instance ON pending(instance,sequence);",
+                    capsule TEXT NOT NULL, payload TEXT NOT NULL);
+                 CREATE INDEX IF NOT EXISTS pending_capsule ON pending(capsule,sequence);",
                 )
                 .map_err(unavailable)?;
             work(Some(connection))
@@ -76,13 +76,13 @@ impl JournalSink {
         .map_err(unavailable)?
     }
 
-    async fn entries(&self, instance: Option<String>) -> Result<Vec<Entry>> {
+    async fn entries(&self, capsule: Option<String>) -> Result<Vec<Entry>> {
         self.database(false, move |connection| {
             let Some(connection) = connection else { return Ok(vec![]); };
             let mut query = connection.prepare(
-                "SELECT sequence,payload FROM pending WHERE (?1 IS NULL OR instance=?1) ORDER BY sequence"
+                "SELECT sequence,payload FROM pending WHERE (?1 IS NULL OR capsule=?1) ORDER BY sequence"
             ).map_err(unavailable)?;
-            let rows = query.query_map([instance], |row| Ok((row.get::<_,i64>(0)?, row.get::<_,String>(1)?)))
+            let rows = query.query_map([capsule], |row| Ok((row.get::<_,i64>(0)?, row.get::<_,String>(1)?)))
                 .map_err(unavailable)?;
             rows.map(|row| {
                 let (sequence,payload) = row.map_err(unavailable)?;
@@ -103,25 +103,25 @@ impl JournalSink {
         .await
     }
 
-    async fn append(&self, record: &InstanceRecord) -> Result<Durability> {
+    async fn append(&self, record: &CapsuleRecord) -> Result<Durability> {
         let record = record.clone();
         self.database(true, move |connection| {
             let mut connection = connection.ok_or_else(|| unavailable("missing database"))?;
             let tx = connection.transaction().map_err(unavailable)?;
             let previous = {
-                let mut query = tx.prepare("SELECT payload FROM pending WHERE instance=?1 ORDER BY sequence DESC LIMIT 1").map_err(unavailable)?;
+                let mut query = tx.prepare("SELECT payload FROM pending WHERE capsule=?1 ORDER BY sequence DESC LIMIT 1").map_err(unavailable)?;
                 let mut rows = query.query([&record.spec.id]).map_err(unavailable)?;
                 rows.next().map_err(unavailable)?.map(|row| row.get::<_,String>(0)).transpose().map_err(unavailable)?
             };
             if let Some(previous) = previous {
-                let old: InstanceRecord = serde_json::from_str(&previous).map_err(unavailable)?;
+                let old: CapsuleRecord = serde_json::from_str(&previous).map_err(unavailable)?;
                 if old == record { return Ok(Durability::Journaled); }
                 if old.assignment != record.assignment || old.spec != record.spec || old.revision >= record.revision {
                     return Err(Error::Conflict);
                 }
             }
             let payload = serde_json::to_string(&record).map_err(unavailable)?;
-            tx.execute("INSERT INTO pending(instance,payload) VALUES (?1,?2)", params![record.spec.id, payload]).map_err(unavailable)?;
+            tx.execute("INSERT INTO pending(capsule,payload) VALUES (?1,?2)", params![record.spec.id, payload]).map_err(unavailable)?;
             tx.commit().map_err(unavailable)?;
             // SQLite FULL syncs the WAL; also persist initial directory entries.
             Ok(Durability::Journaled)
@@ -155,7 +155,7 @@ impl JournalSink {
     /// Register the current process with Master, then supply its complete node
     /// catalog. Discard obsolete ownership; replay each remaining result in order.
     /// The caller must fetch a fresh catalog after this before reconciling runtime.
-    pub async fn recover(&self, catalog: &[InstanceRecord]) -> Result<()> {
+    pub async fn recover(&self, catalog: &[CapsuleRecord]) -> Result<()> {
         let mut ready = self.ready.write().await;
         *ready = false;
         for (sequence, record) in self.entries(None).await? {
@@ -165,7 +165,7 @@ impl JournalSink {
                         && current.spec == record.spec
                         && !(matches!(
                             current.state,
-                            adx_core::InstanceState::Failed | adx_core::InstanceState::Deleted
+                            adx_core::CapsuleState::Failed | adx_core::CapsuleState::Deleted
                         ) && !current.resources_held
                             && !current.restart_pending) =>
                 {
@@ -198,13 +198,13 @@ impl JournalSink {
 
 #[async_trait]
 impl StateSink for JournalSink {
-    async fn commit(&self, record: &InstanceRecord) -> Result<Durability> {
+    async fn commit(&self, record: &CapsuleRecord) -> Result<Durability> {
         let ready = self.ready.read().await;
         if !*ready {
             return Err(unavailable("authoritative recovery required"));
         }
         let serial = self
-            .instances
+            .capsules
             .lock()
             .await
             .entry(record.spec.id.clone())

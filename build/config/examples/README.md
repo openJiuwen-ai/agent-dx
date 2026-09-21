@@ -40,9 +40,9 @@ missing/invalid update uses the last observation until expiry, then closes new
 admission. The file reader is separate from the implemented sandboxd collector and automatic capacity source. Do not publish a configured resource budget as a measurement.
 
 Node startup obtains the complete authoritative catalog before reconciling
-managed runtimes. It restores committed running Instances and cleans runtimes
+managed runtimes. It restores committed running Capsules and cleans runtimes
 confirmed unowned or left by uncommitted starts. An unavailable Master never
-means an empty catalog. Explicit CLI stop performs local Instance cleanup before service shutdown.
+means an empty catalog. Explicit CLI stop performs local Capsule cleanup before service shutdown.
 
 
 Master 配置 `advertised_address` 发布可续期的 Redis 地址，默认 TTL 15 秒。Node 与 Sandbox API 示例通过相同 Redis namespace 发现它；也可改用显式 `master_address`，不能同时配置两种方式。Master 心跳超时默认 30 秒，Node 报告间隔应显著小于该值。Node 重启先注册为对账中，完成权威目录恢复后才开放新分配。完整契约见 [发现与恢复](../../../docs/testing/recovery-discovery.md)。
@@ -64,6 +64,6 @@ protected mode enabled. Set the matching credentials in the shared `redis_url`
 (URI-escape special characters); protect the deployment file because that URL
 contains a secret. Components use that URL for both storage and discovery.
 
-Master and Node Manager examples enable loopback `metrics_listen` on ports 19090 and 19091. See [instance and resource metrics](../../../docs/testing/instance-resource-metrics.md) for metric definitions and external collection.
+Master and Node Manager examples enable loopback `metrics_listen` on ports 19090 and 19091. See [instance and resource metrics](../../../docs/testing/capsule-resource-metrics.md) for metric definitions and external collection.
 
 部署示例已启用组件日志滚动与 gzip 压缩，所有历史保留限制按组件计算。配置和异常处理见[组件日志滚动与压缩](../../../docs/testing/log-rotation.md)。

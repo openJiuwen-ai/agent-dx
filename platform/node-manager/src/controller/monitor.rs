@@ -1,5 +1,5 @@
 use super::Controller;
-use adx_core::{Error, Event, InstanceState, Result};
+use adx_core::{CapsuleState, Error, Event, Result};
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -8,10 +8,10 @@ impl Controller {
         if self.durability == Some(crate::Durability::Journaled) {
             self.sync().await?;
         }
-        if self.record.state == InstanceState::Running {
+        if self.record.state == CapsuleState::Running {
             let running = tokio::time::timeout(
                 self.services.operation_timeout,
-                self.services.runtime.is_running(&self.record.runtime_id),
+                self.services.runtime.is_running(&self.record.runtime.id),
             )
             .await
             .unwrap_or_else(|_| Err(Error::Unavailable("runtime observation timed out".into())));
@@ -27,13 +27,13 @@ impl Controller {
             }
             if let Ok(Ok(usage)) = tokio::time::timeout(
                 self.services.operation_timeout,
-                self.services.runtime.stats(&self.record.runtime_id),
+                self.services.runtime.stats(&self.record.runtime.id),
             )
             .await
             {
                 self.services
                     .metrics
-                    .record(&self.record.spec.id, &self.record.runtime_id, usage);
+                    .record(&self.record.spec.id, &self.record.runtime.id, usage);
             }
             let runtime_activity = if self.record.spec.lifecycle.idle_timeout_seconds > 0
                 || self.services.health_failure_threshold.is_some()
@@ -85,7 +85,7 @@ impl Controller {
                 // Unknown, stale or active observations restart the idle window.
                 _ => self.idle = None,
             }
-        } else if self.record.state == InstanceState::Failed && self.record.restart_pending {
+        } else if self.record.state == CapsuleState::Failed && self.record.restart_pending {
             let Some(policy) = &self.record.spec.lifecycle.restart else {
                 return Ok(());
             };
@@ -100,7 +100,7 @@ impl Controller {
                 self.cleanup().await?;
                 self.start_attempt(true, false, None).await?;
             }
-        } else if self.record.state == InstanceState::Failed && self.record.resources_held {
+        } else if self.record.state == CapsuleState::Failed && self.record.resources_held {
             self.cleanup().await?;
             self.record.revision = self.record.revision.checked_add(1).ok_or(Error::Conflict)?;
             self.sync().await?;

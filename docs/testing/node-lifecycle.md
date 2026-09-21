@@ -4,10 +4,10 @@ Node Manager 拥有实例串行状态机。Master 提供归属校验、Redis 持
 
 ## 运行策略
 
-`InstanceSpec.lifecycle` 包含 `idle_timeout_seconds` 和可选 `restart`。HTTP 保留 `idleTimeoutSeconds`，新增 `restartPolicy`；Python SDK 支持 `RestartPolicy(max_attempts=3, initial_backoff_seconds=1, max_backoff_seconds=30)`。
+`CapsuleSpec.lifecycle` 包含 `idle_timeout_seconds` 和可选 `restart`。HTTP 保留 `idleTimeoutSeconds`，新增 `restartPolicy`；Python SDK 支持 `RestartPolicy(max_attempts=3, initial_backoff_seconds=1, max_backoff_seconds=30)`。
 
 - 空闲超时为 0 时不回收。启用后，运行实例的 RRT 请求／命令计数与 Node Proxy 流计数必须同时为 0，且活动版本在整个空闲窗口内未改变。采样失败或活动版本改变会重置窗口。Node Manager 执行删除。
-- RuntimeBackend 确认执行退出后，节点先退役路由、确认旧执行清理，再标记 Failed。启用重启时，按照指数退避和累计重试上限重新申请本机资源，并分配新的执行 ID，Instance ID 与归属代次保持。
+- RuntimeDriver 确认执行退出后，节点先退役路由、确认旧执行清理，再标记 Failed。启用重启时，按照指数退避和累计重试上限重新申请本机资源，并分配新的执行 ID，Capsule ID 与归属代次保持。
 - `restart_attempts` 和 `restart_pending` 随实例结果写入 Redis／降级日志。进程重启不重置次数。显式删除取消重启。清理未确认时保留资源，禁止启动替代执行。
 - 可配置 `rrt_health_failure_threshold`；省略时不以健康探测失败触发重启。连续失败达到阈值后，仍须先确认旧执行清理。健康检查只覆盖 RRT。
 
@@ -29,7 +29,7 @@ sandboxd 的 `/resource` 通过 Unix Socket 提供 CPU 核数、内存／存储�
 
 采集只更新容量，不重置已有资源预留。首次无有效样本时等待；后续失败沿用旧样本至其过期，过期后关闭新准入。`pressure` 提供内存和磁盘高／低阈值，任一达到高阈值关闭准入，两者都降到低阈值以下才恢复；压力采集失败也关闭准入。
 
-配置 `metrics_listen` 后提供 `/metrics`。实例 CPU／内存经 RuntimeBackend Stats 定时采样，并携带采样年龄；资源预留和节点准入也作为指标导出。日志由部署环境收集。
+配置 `metrics_listen` 后提供 `/metrics`。实例 CPU／内存经 RuntimeDriver Stats 定时采样，并携带采样年龄；资源预留和节点准入也作为指标导出。日志由部署环境收集。
 
 ## SQLite 降级契约
 

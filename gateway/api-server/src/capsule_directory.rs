@@ -3,20 +3,20 @@ use std::collections::{BTreeMap, BTreeSet};
 use tonic::Status;
 
 #[derive(Default)]
-pub(crate) struct InstanceDirectory {
+pub(crate) struct CapsuleDirectory {
     epoch: Option<u64>,
     revision: u64,
-    entries: BTreeMap<String, pb::GetInstanceResponse>,
+    entries: BTreeMap<String, pb::GetCapsuleResponse>,
 }
 
-impl InstanceDirectory {
+impl CapsuleDirectory {
     pub fn clear(&mut self) {
         self.epoch = None;
         self.revision = 0;
         self.entries.clear();
     }
 
-    pub fn update(&mut self, frame: pb::InstanceDirectoryFrame) -> Result<(), Status> {
+    pub fn update(&mut self, frame: pb::CapsuleDirectoryFrame) -> Result<(), Status> {
         let result = self.apply(frame);
         if result.is_err() {
             self.clear();
@@ -24,28 +24,28 @@ impl InstanceDirectory {
         result
     }
 
-    fn apply(&mut self, frame: pb::InstanceDirectoryFrame) -> Result<(), Status> {
+    fn apply(&mut self, frame: pb::CapsuleDirectoryFrame) -> Result<(), Status> {
         if frame.epoch == 0 || frame.revision == 0 {
-            return Err(Status::data_loss("invalid instance directory version"));
+            return Err(Status::data_loss("invalid capsule directory version"));
         }
         let mut next = if frame.reset {
             if frame.base_revision != 0 {
-                return Err(Status::data_loss("invalid instance directory reset"));
+                return Err(Status::data_loss("invalid capsule directory reset"));
             }
             BTreeMap::new()
         } else {
             let Some(epoch) = self.epoch else {
                 return Err(Status::failed_precondition(
-                    "instance directory reset required",
+                    "capsule directory reset required",
                 ));
             };
             if epoch != frame.epoch {
                 return Err(Status::failed_precondition(
-                    "instance directory epoch changed",
+                    "capsule directory epoch changed",
                 ));
             }
             if frame.base_revision != self.revision || frame.revision <= frame.base_revision {
-                return Err(Status::out_of_range("instance directory history gap"));
+                return Err(Status::out_of_range("capsule directory history gap"));
             }
             self.entries.clone()
         };
@@ -53,7 +53,7 @@ impl InstanceDirectory {
         for published in frame.upserts {
             let (id, value) = response(published)?;
             if !touched.insert(id.clone()) {
-                return Err(Status::data_loss("duplicate instance directory entry"));
+                return Err(Status::data_loss("duplicate capsule directory entry"));
             }
             if !frame.reset {
                 if let Some(old) = next.get(&id) {
@@ -66,7 +66,7 @@ impl InstanceDirectory {
         }
         for id in frame.deleted {
             if id.is_empty() || !touched.insert(id.clone()) {
-                return Err(Status::data_loss("invalid instance directory deletion"));
+                return Err(Status::data_loss("invalid capsule directory deletion"));
             }
             next.remove(&id);
         }
@@ -76,9 +76,9 @@ impl InstanceDirectory {
         Ok(())
     }
 
-    pub fn get(&self, id: &str) -> Result<pb::GetInstanceResponse, Status> {
+    pub fn get(&self, id: &str) -> Result<pb::GetCapsuleResponse, Status> {
         if self.epoch.is_none() {
-            return Err(Status::unavailable("instance directory not synchronized"));
+            return Err(Status::unavailable("capsule directory not synchronized"));
         }
         self.entries
             .get(id)
@@ -86,8 +86,8 @@ impl InstanceDirectory {
             .ok_or_else(|| Status::not_found("instance not found"))
     }
 
-    pub fn put(&mut self, value: pb::GetInstanceResponse) -> Result<(), Status> {
-        let published = pb::PublishedInstance {
+    pub fn put(&mut self, value: pb::GetCapsuleResponse) -> Result<(), Status> {
+        let published = pb::PublishedCapsule {
             record: value.record,
             node_address: value.node_address,
             node_proxy_address: value.node_proxy_address,
@@ -103,31 +103,31 @@ impl InstanceDirectory {
     }
 }
 
-fn response(value: pb::PublishedInstance) -> Result<(String, pb::GetInstanceResponse), Status> {
+fn response(value: pb::PublishedCapsule) -> Result<(String, pb::GetCapsuleResponse), Status> {
     let record = value
         .record
-        .ok_or_else(|| Status::data_loss("instance directory record missing"))?;
+        .ok_or_else(|| Status::data_loss("capsule directory record missing"))?;
     let spec = record
         .spec
         .as_ref()
-        .ok_or_else(|| Status::data_loss("instance directory spec missing"))?;
+        .ok_or_else(|| Status::data_loss("capsule directory spec missing"))?;
     let assignment = record
         .assignment
         .as_ref()
-        .ok_or_else(|| Status::data_loss("instance directory assignment missing"))?;
+        .ok_or_else(|| Status::data_loss("capsule directory assignment missing"))?;
     if spec.id.is_empty()
         || spec.tenant_id.is_empty()
-        || assignment.instance_id != spec.id
+        || assignment.capsule_id != spec.id
         || assignment.node_id.is_empty()
         || assignment.generation == 0
         || value.node_address.is_empty()
         || value.node_proxy_address.is_empty()
     {
-        return Err(Status::data_loss("invalid instance directory entry"));
+        return Err(Status::data_loss("invalid capsule directory entry"));
     }
     Ok((
         spec.id.clone(),
-        pb::GetInstanceResponse {
+        pb::GetCapsuleResponse {
             record: Some(record),
             node_address: value.node_address,
             node_proxy_address: value.node_proxy_address,
@@ -135,15 +135,15 @@ fn response(value: pb::PublishedInstance) -> Result<(String, pb::GetInstanceResp
     ))
 }
 
-fn version(value: &pb::GetInstanceResponse) -> Result<(u64, u64), Status> {
+fn version(value: &pb::GetCapsuleResponse) -> Result<(u64, u64), Status> {
     let record = value
         .record
         .as_ref()
-        .ok_or_else(|| Status::data_loss("instance directory record missing"))?;
+        .ok_or_else(|| Status::data_loss("capsule directory record missing"))?;
     let generation = record
         .assignment
         .as_ref()
-        .ok_or_else(|| Status::data_loss("instance directory assignment missing"))?
+        .ok_or_else(|| Status::data_loss("capsule directory assignment missing"))?
         .generation;
     Ok((generation, record.revision))
 }
@@ -152,16 +152,16 @@ fn version(value: &pb::GetInstanceResponse) -> Result<(u64, u64), Status> {
 mod tests {
     use super::*;
 
-    fn entry(id: &str, generation: u64, revision: u64) -> pb::PublishedInstance {
-        pb::PublishedInstance {
-            record: Some(pb::InstanceRecord {
-                spec: Some(pb::InstanceSpec {
+    fn entry(id: &str, generation: u64, revision: u64) -> pb::PublishedCapsule {
+        pb::PublishedCapsule {
+            record: Some(pb::CapsuleRecord {
+                spec: Some(pb::CapsuleSpec {
                     id: id.into(),
                     tenant_id: "tenant".into(),
                     ..Default::default()
                 }),
                 assignment: Some(pb::Assignment {
-                    instance_id: id.into(),
+                    capsule_id: id.into(),
                     node_id: "node".into(),
                     generation,
                     ..Default::default()
@@ -179,10 +179,10 @@ mod tests {
         revision: u64,
         base_revision: u64,
         reset: bool,
-        upserts: Vec<pb::PublishedInstance>,
+        upserts: Vec<pb::PublishedCapsule>,
         deleted: Vec<&str>,
-    ) -> pb::InstanceDirectoryFrame {
-        pb::InstanceDirectoryFrame {
+    ) -> pb::CapsuleDirectoryFrame {
+        pb::CapsuleDirectoryFrame {
             epoch,
             revision,
             base_revision,
@@ -194,7 +194,7 @@ mod tests {
 
     #[test]
     fn full_then_incremental_updates_and_deletes() {
-        let mut directory = InstanceDirectory::default();
+        let mut directory = CapsuleDirectory::default();
         assert_eq!(
             directory.get("one").unwrap_err().code(),
             tonic::Code::Unavailable
@@ -218,7 +218,7 @@ mod tests {
 
     #[test]
     fn revision_gap_or_epoch_change_requires_reset() {
-        let mut directory = InstanceDirectory::default();
+        let mut directory = CapsuleDirectory::default();
         directory
             .update(frame(7, 10, 0, true, vec![entry("one", 1, 1)], vec![]))
             .unwrap();
@@ -248,13 +248,13 @@ mod tests {
 
     #[test]
     fn stale_local_results_never_replace_newer_ownership() {
-        let mut directory = InstanceDirectory::default();
+        let mut directory = CapsuleDirectory::default();
         directory
             .update(frame(7, 10, 0, true, vec![entry("one", 2, 4)], vec![]))
             .unwrap();
         let stale = entry("one", 1, 99);
         directory
-            .put(pb::GetInstanceResponse {
+            .put(pb::GetCapsuleResponse {
                 record: stale.record,
                 node_address: stale.node_address,
                 node_proxy_address: stale.node_proxy_address,
@@ -272,13 +272,13 @@ mod tests {
 
     #[test]
     fn delayed_incremental_never_reverts_a_newer_targeted_read() {
-        let mut directory = InstanceDirectory::default();
+        let mut directory = CapsuleDirectory::default();
         directory
             .update(frame(7, 10, 0, true, vec![entry("one", 1, 1)], vec![]))
             .unwrap();
         let current = entry("one", 2, 4);
         directory
-            .put(pb::GetInstanceResponse {
+            .put(pb::GetCapsuleResponse {
                 record: current.record,
                 node_address: current.node_address,
                 node_proxy_address: current.node_proxy_address,

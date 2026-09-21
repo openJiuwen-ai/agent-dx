@@ -1,4 +1,4 @@
-use adx_core::{scheduling::*, Error, InstanceSpec, Resources, Result};
+use adx_core::{scheduling::*, CapsuleSpec, Error, Resources, Result};
 use adx_master::{Master, Placement, SchedulerConfig};
 use adx_scheduling::{Candidate, Framework, Score, WeightedScore};
 use std::{
@@ -8,16 +8,16 @@ use std::{
     },
     time::Duration,
 };
-fn spec(id: &str) -> InstanceSpec {
-    InstanceSpec {
-        runtime_environment: None,
+fn spec(id: &str) -> CapsuleSpec {
+    CapsuleSpec {
+        environment: None,
         snapshot_id: None,
         lifecycle: Default::default(),
         env: Default::default(),
         id: id.into(),
         tenant_id: "t".into(),
         image: "i".into(),
-        runtime: "r".into(),
+        runtime_class: "r".into(),
         priority: 0,
         resources: Resources {
             cpu_millis: 1,
@@ -81,7 +81,7 @@ fn unsafe_policies_and_custom_profiles_never_enter_semantic_cache() {
         fn name(&self) -> &'static str {
             "resource-balance"
         }
-        fn score(&self, _: &InstanceSpec, _: &Candidate<'_>) -> Result<u32> {
+        fn score(&self, _: &CapsuleSpec, _: &Candidate<'_>) -> Result<u32> {
             Ok(0)
         }
     }
@@ -157,7 +157,7 @@ fn aggregation_keeps_tenant_rotation_priority_and_fifo() {
     assert_eq!(
         r.assignments
             .iter()
-            .map(|a| a.instance_id.as_str())
+            .map(|a| a.capsule_id.as_str())
             .collect::<Vec<_>>(),
         ["a-high-1", "b1", "a-high-2", "b2", "a-low"]
     );
@@ -167,7 +167,7 @@ impl Score for FailSecond {
     fn name(&self) -> &'static str {
         "fail-second"
     }
-    fn score(&self, _: &InstanceSpec, _: &Candidate<'_>) -> Result<u32> {
+    fn score(&self, _: &CapsuleSpec, _: &Candidate<'_>) -> Result<u32> {
         if self.0.fetch_add(1, Ordering::SeqCst) == 1 {
             Err(Error::Unavailable("fixture".into()))
         } else {
@@ -191,18 +191,18 @@ fn partial_round_failure_returns_committed_assignments_and_keeps_failed_request(
     let r = m.schedule_round(0).unwrap();
     assert_eq!(r.assignments.len(), 1);
     assert!(r.error.is_some());
-    assert_eq!(m.snapshot().instances().len(), 1);
+    assert_eq!(m.snapshot().capsules().len(), 1);
     assert_eq!(m.pending(0).unwrap(), 2);
     let next = m.schedule_round(0).unwrap();
     assert_eq!(
         next.assignments
             .iter()
-            .map(|a| a.instance_id.as_str())
+            .map(|a| a.capsule_id.as_str())
             .collect::<Vec<_>>(),
         ["1", "2"]
     );
     m.release(&r.assignments[0]).unwrap();
-    assert_eq!(m.snapshot().instances().len(), 2);
+    assert_eq!(m.snapshot().capsules().len(), 2);
 }
 #[test]
 fn time_budget_yields_between_requests_without_losing_work() {
@@ -211,7 +211,7 @@ fn time_budget_yields_between_requests_without_losing_work() {
         fn name(&self) -> &'static str {
             "slow"
         }
-        fn score(&self, _: &InstanceSpec, _: &Candidate<'_>) -> Result<u32> {
+        fn score(&self, _: &CapsuleSpec, _: &Candidate<'_>) -> Result<u32> {
             std::thread::sleep(Duration::from_millis(5));
             Ok(0)
         }
@@ -241,7 +241,7 @@ fn different_signatures_do_not_share_candidates_and_cache_capacity_is_bounded() 
     m.register(node("a")).unwrap();
     for (i, runtime) in ["r", "other", "r"].iter().enumerate() {
         let mut r = spec(&i.to_string());
-        r.runtime = runtime.to_string();
+        r.runtime_class = runtime.to_string();
         m.submit(r).unwrap();
         m.schedule(0).unwrap();
     }

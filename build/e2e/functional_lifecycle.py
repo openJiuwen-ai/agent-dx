@@ -107,7 +107,7 @@ def run(connection, image, output):
             node_id='node1',
             connection=connection,
             create_timeout=150,
-        ) as context_instance:
+        ) as context_capsule:
             context_id = context_instance.id
             remaining.add(context_id)
             assert context_instance.is_running()

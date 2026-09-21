@@ -12,7 +12,7 @@ use tonic::{Request, Response, Status};
 fn security(value: adx_core::sandbox::DataPlaneSecurityMode) -> i32 {
     match value {
         // The current deployment default is tls-token. Resolve inheritance at
-        // publication so every Edge sees one authoritative per-instance mode.
+        // publication so every Edge sees one authoritative per-capsule mode.
         adx_core::sandbox::DataPlaneSecurityMode::Inherit => {
             pb::DataPlaneSecurityMode::DataPlaneSecurityTlsToken as i32
         }
@@ -28,7 +28,7 @@ struct View {
     revision: Option<u64>,
     available: bool,
     routes: BTreeMap<String, pb::PublishedRoute>,
-    instances: BTreeMap<String, pb::PublishedInstance>,
+    capsules: BTreeMap<String, pb::PublishedCapsule>,
 }
 #[derive(Clone)]
 pub struct RoutePublisher {
@@ -36,12 +36,12 @@ pub struct RoutePublisher {
     peers: Peers,
     view: Arc<Mutex<View>>,
     changes: broadcast::Sender<pb::RouteFrame>,
-    instance_changes: broadcast::Sender<pb::InstanceDirectoryFrame>,
+    capsule_changes: broadcast::Sender<pb::CapsuleDirectoryFrame>,
 }
 impl RoutePublisher {
     pub fn new(session: Session, peers: Peers) -> Self {
         let (changes, _) = broadcast::channel(64);
-        let (instance_changes, _) = broadcast::channel(64);
+        let (capsule_changes, _) = broadcast::channel(64);
         Self {
             session,
             peers,
@@ -49,10 +49,10 @@ impl RoutePublisher {
                 revision: None,
                 available: false,
                 routes: BTreeMap::new(),
-                instances: BTreeMap::new(),
+                capsules: BTreeMap::new(),
             })),
             changes,
-            instance_changes,
+            capsule_changes,
         }
     }
     pub async fn refresh(&self) -> Result<()> {
@@ -72,18 +72,18 @@ impl RoutePublisher {
         let snapshot = self.session.snapshot().await?;
         let mut next = BTreeMap::new();
         for r in snapshot.routes()? {
-            let i = &snapshot.instances[&r.instance_id];
+            let i = &snapshot.capsules[&r.capsule_id];
             let record = i.result.as_ref().ok_or(Error::Conflict)?;
             next.insert(
-                r.instance_id.clone(),
+                r.capsule_id.clone(),
                 pb::PublishedRoute {
-                    instance_id: r.instance_id,
+                    capsule_id: r.capsule_id,
                     tenant_id: i.spec.tenant_id.clone(),
-                    runtime_id: record.runtime_id.clone(),
-                    runtime_ip: record.runtime_ip.ok_or(Error::Conflict)?.to_string(),
+                    runtime_id: record.runtime.id.clone(),
+                    runtime_ip: record.runtime.ip.ok_or(Error::Conflict)?.to_string(),
                     node_proxy_address: r.proxy_address,
                     generation: r.generation,
-                    instance_revision: r.instance_revision,
+                    capsule_revision: r.capsule_revision,
                     tunnel_security_mode: security(i.spec.sandbox.data_plane.tunnel),
                     port_forward_security_mode: security(i.spec.sandbox.data_plane.port_forward),
                     forwarded_ports: i
@@ -96,13 +96,13 @@ impl RoutePublisher {
                 },
             );
         }
-        let mut next_instances = BTreeMap::new();
-        for (id, instance) in &snapshot.instances {
-            let record = instance.effective_record();
-            let node = &snapshot.nodes[&instance.assignment.node_id];
-            next_instances.insert(
+        let mut next_capsules = BTreeMap::new();
+        for (id, capsule) in &snapshot.capsules {
+            let record = capsule.effective_record();
+            let node = &snapshot.nodes[&capsule.assignment.node_id];
+            next_capsules.insert(
                 id.clone(),
-                pb::PublishedInstance {
+                pb::PublishedCapsule {
                     record: Some(record.try_into()?),
                     node_address: node.address.clone(),
                     node_proxy_address: node.proxy_address.clone(),
@@ -126,29 +126,29 @@ impl RoutePublisher {
                 .cloned()
                 .collect(),
         };
-        let instance_frame = pb::InstanceDirectoryFrame {
+        let capsule_frame = pb::CapsuleDirectoryFrame {
             epoch: self.session.epoch(),
             revision: snapshot.revision,
             base_revision: view.revision.unwrap_or(0),
             reset: false,
-            upserts: next_instances
+            upserts: next_capsules
                 .iter()
-                .filter(|(id, instance)| view.instances.get(*id) != Some(instance))
-                .map(|(_, instance)| instance.clone())
+                .filter(|(id, capsule)| view.capsules.get(*id) != Some(capsule))
+                .map(|(_, capsule)| capsule.clone())
                 .collect(),
             deleted: view
-                .instances
+                .capsules
                 .keys()
-                .filter(|id| !next_instances.contains_key(*id))
+                .filter(|id| !next_capsules.contains_key(*id))
                 .cloned()
                 .collect(),
         };
         view.routes = next;
-        view.instances = next_instances;
+        view.capsules = next_capsules;
         view.revision = Some(snapshot.revision);
         view.available = true;
         let _ = self.changes.send(frame);
-        let _ = self.instance_changes.send(instance_frame);
+        let _ = self.capsule_changes.send(capsule_frame);
         Ok(())
     }
     pub async fn run(self, interval: Duration) {
@@ -163,31 +163,31 @@ impl RoutePublisher {
 }
 
 #[tonic::async_trait]
-impl pb::instance_directory_service_server::InstanceDirectoryService for RoutePublisher {
-    type WatchInstancesStream =
-        ReceiverStream<std::result::Result<pb::InstanceDirectoryFrame, Status>>;
+impl pb::capsule_directory_service_server::CapsuleDirectoryService for RoutePublisher {
+    type WatchCapsulesStream =
+        ReceiverStream<std::result::Result<pb::CapsuleDirectoryFrame, Status>>;
 
-    async fn watch_instances(
+    async fn watch_capsules(
         &self,
-        request: Request<pb::WatchInstancesRequest>,
-    ) -> std::result::Result<Response<Self::WatchInstancesStream>, Status> {
+        request: Request<pb::WatchCapsulesRequest>,
+    ) -> std::result::Result<Response<Self::WatchCapsulesStream>, Status> {
         if self.peers.authenticate(&request)? != Principal::ApiServer {
             return Err(Status::permission_denied("API Server identity required"));
         }
         let view = self.view.lock().await;
         if !view.available {
-            return Err(Status::unavailable("instance publication not ready"));
+            return Err(Status::unavailable("capsule publication not ready"));
         }
-        let mut updates = self.instance_changes.subscribe();
+        let mut updates = self.capsule_changes.subscribe();
         let revision = view
             .revision
-            .ok_or_else(|| Status::unavailable("instance publication has no revision"))?;
-        let full = pb::InstanceDirectoryFrame {
+            .ok_or_else(|| Status::unavailable("capsule publication has no revision"))?;
+        let full = pb::CapsuleDirectoryFrame {
             epoch: self.session.epoch(),
             revision,
             base_revision: 0,
             reset: true,
-            upserts: view.instances.values().cloned().collect(),
+            upserts: view.capsules.values().cloned().collect(),
             deleted: Vec::new(),
         };
         drop(view);
@@ -207,7 +207,7 @@ impl pb::instance_directory_service_server::InstanceDirectoryService for RoutePu
                     Err(_) => {
                         let _ = tx
                             .send(Err(Status::out_of_range(
-                                "instance history lost; resubscribe for full snapshot",
+                                "capsule history lost; resubscribe for full snapshot",
                             )))
                             .await;
                         return;

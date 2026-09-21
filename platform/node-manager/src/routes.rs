@@ -1,6 +1,6 @@
 //! Versioned bindings and complete startup synchronization over a protected UDS.
 use crate::Routes;
-use adx_core::{Error, InstanceRecord, Result};
+use adx_core::{CapsuleRecord, Error, Result};
 use adx_protocol::node_proxy::{
     self as pb, node_proxy_service_client::NodeProxyServiceClient, update_binding_request::Binding,
     Retired, RuntimeTarget, UpdateBindingRequest,
@@ -138,7 +138,7 @@ impl UdsRoutes {
     }
     async fn send(&self, mut r: UpdateBindingRequest) -> Result<()> {
         let mut s = self.local.lock().await;
-        if let Some(old) = s.bindings.get(&r.instance_id) {
+        if let Some(old) = s.bindings.get(&r.capsule_id) {
             let a = (old.ownership_generation, old.binding_revision);
             let b = (r.ownership_generation, r.binding_revision);
             if b < a || (b == a && old.binding != r.binding) {
@@ -148,7 +148,7 @@ impl UdsRoutes {
         if !s.initialized && !s.buffering {
             return Err(unavailable("binding catalog not initialized"));
         }
-        s.bindings.insert(r.instance_id.clone(), r.clone());
+        s.bindings.insert(r.capsule_id.clone(), r.clone());
         if s.buffering {
             return Ok(());
         }
@@ -169,7 +169,7 @@ impl UdsRoutes {
         }
         Ok(())
     }
-    async fn apply(&self, r: &InstanceRecord, active: bool) -> Result<()> {
+    async fn apply(&self, r: &CapsuleRecord, active: bool) -> Result<()> {
         let revision = r
             .revision
             .checked_mul(2)
@@ -180,9 +180,10 @@ impl UdsRoutes {
         }
         let binding = if active {
             Binding::Active(RuntimeTarget {
-                runtime_id: r.runtime_id.clone(),
+                runtime_id: r.runtime.id.clone(),
                 ip: r
-                    .runtime_ip
+                    .runtime
+                    .ip
                     .ok_or_else(|| Error::Invalid("runtime IP required".into()))?
                     .to_string(),
             })
@@ -190,7 +191,7 @@ impl UdsRoutes {
             Binding::Retired(Retired {})
         };
         self.send(UpdateBindingRequest {
-            instance_id: r.spec.id.clone(),
+            capsule_id: r.spec.id.clone(),
             ownership_generation: r.assignment.generation,
             binding_revision: revision,
             binding: Some(binding),
@@ -211,12 +212,12 @@ fn rpc_error(s: tonic::Status) -> Error {
 }
 #[async_trait]
 impl Routes for UdsRoutes {
-    async fn activity(&self, record: &InstanceRecord) -> Result<(String, u64, u64)> {
+    async fn activity(&self, record: &CapsuleRecord) -> Result<(String, u64, u64)> {
         let mut client = self.connect().await?;
         let result = client
-            .get_instance_activity(self.request(pb::GetInstanceActivityRequest {
-                instance_id: record.spec.id.clone(),
-                runtime_id: record.runtime_id.clone(),
+            .get_capsule_activity(self.request(pb::GetCapsuleActivityRequest {
+                capsule_id: record.spec.id.clone(),
+                runtime_id: record.runtime.id.clone(),
             }))
             .await
             .map_err(rpc_error)?
@@ -266,7 +267,7 @@ impl Routes for UdsRoutes {
     }
     async fn retire_orphan(&self, r: &crate::RuntimeObservation) -> Result<()> {
         self.send(UpdateBindingRequest {
-            instance_id: r.instance_id.clone(),
+            capsule_id: r.capsule_id.clone(),
             ownership_generation: r.generation,
             binding_revision: u64::MAX,
             binding: Some(Binding::Retired(Retired {})),
@@ -274,10 +275,10 @@ impl Routes for UdsRoutes {
         })
         .await
     }
-    async fn activate(&self, r: &InstanceRecord) -> Result<()> {
+    async fn activate(&self, r: &CapsuleRecord) -> Result<()> {
         self.apply(r, true).await
     }
-    async fn retire(&self, r: &InstanceRecord) -> Result<()> {
+    async fn retire(&self, r: &CapsuleRecord) -> Result<()> {
         self.apply(r, false).await
     }
 }

@@ -3,7 +3,7 @@
 // See the LICENSE file in this repository for the complete license text.
 
 //! rrt-runtime binary: sandbox runtime-mode entrypoint.
-//! Start with `rrt-runtime`; Node Manager supplies the explicit Instance identity.
+//! Start with `rrt-runtime`; Node Manager supplies the explicit Capsule identity.
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(code) = rrt_daemon::init::enter()? {
@@ -11,7 +11,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     // Fork-based warm starts hold here until the child is ready. Refresh the
     // restored environment before constructing Tokio or reading runtime args.
-    rrt_daemon::startup::prepare_runtime_environment()?;
+    rrt_daemon::startup::prepare_environment()?;
     let _logging_guard = adx_observability::logging::init("adx-rrt", false)?;
     build_runtime()?.block_on(run())
 }

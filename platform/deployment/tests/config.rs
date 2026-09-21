@@ -657,10 +657,10 @@ fn shipped_role_deployment_examples_are_valid() {
 #[test]
 fn common_environment_is_rendered_to_node_and_api() {
     let root = tempfile::tempdir().unwrap();
-    let environment = json!({"rootfs":{"runtime":"runsc","type":"local","path":"/opt/adx/root.img","readonly":false},
+    let environment = json!({"rootfs":{"runtime_class":"runsc","type":"local","path":"/opt/adx/root.img","readonly":false},
        "bootstrap":{"type":"erofs","root":"/opt/adx/root.img","target":"/__adx","entrypoint":["/__adx/usr/local/bin/rrt-runtime"]}});
     let mut deployment = test_deployment(root.path());
-    deployment.runtime_environment = Some(serde_json::from_value(environment).unwrap());
+    deployment.environment = Some(serde_json::from_value(environment).unwrap());
     deployment
         .services
         .push(serde_json::from_value(json!({"id":"api","role":"api-server","config":{}})).unwrap());
@@ -671,9 +671,9 @@ fn common_environment_is_rendered_to_node_and_api() {
             &std::fs::read(output_directory.join(format!("{role}.json"))).unwrap(),
         )
         .unwrap();
-        let actual: adx_core::environment::RuntimeEnvironment =
-            serde_json::from_value(rendered_config["runtime_environment"].clone()).unwrap();
-        assert_eq!(Some(actual), deployment.runtime_environment);
+        let actual: adx_core::environment::EnvironmentSpec =
+            serde_json::from_value(rendered_config["environment"].clone()).unwrap();
+        assert_eq!(Some(actual), deployment.environment);
     }
 }
 
@@ -681,10 +681,10 @@ fn common_environment_is_rendered_to_node_and_api() {
 fn common_oci_environment_is_rendered_to_node_and_api() {
     let root = tempfile::tempdir().unwrap();
     let image = "registry.local/adx-runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    let environment = json!({"rootfs":{"runtime":"runc","type":"image","image":image,"readonly":false},
+    let environment = json!({"rootfs":{"runtime_class":"runc","type":"image","image":image,"readonly":false},
        "bootstrap":{"type":"image","image":image,"target":"/__adx","entrypoint":["/__adx/usr/local/bin/rrt-runtime"]}});
     let mut deployment = test_deployment(root.path());
-    deployment.runtime_environment = Some(serde_json::from_value(environment).unwrap());
+    deployment.environment = Some(serde_json::from_value(environment).unwrap());
     deployment
         .services
         .push(serde_json::from_value(json!({"id":"api","role":"api-server","config":{}})).unwrap());
@@ -695,13 +695,7 @@ fn common_oci_environment_is_rendered_to_node_and_api() {
             &std::fs::read(output_directory.join(format!("{role}.json"))).unwrap(),
         )
         .unwrap();
-        assert_eq!(
-            rendered_config["runtime_environment"]["rootfs"]["image"],
-            image
-        );
-        assert_eq!(
-            rendered_config["runtime_environment"]["bootstrap"]["image"],
-            image
-        );
+        assert_eq!(rendered_config["environment"]["rootfs"]["image"], image);
+        assert_eq!(rendered_config["environment"]["bootstrap"]["image"], image);
     }
 }

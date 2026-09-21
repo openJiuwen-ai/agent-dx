@@ -5,14 +5,14 @@ use adx_core::snapshots::{Reference, SnapshotState};
 
 pub(super) async fn normalize(
     session: &Session,
-    mut request: pb::InstanceSpec,
-) -> Result<InstanceSpec> {
+    mut request: pb::CapsuleSpec,
+) -> Result<CapsuleSpec> {
     let Some(id) = &request.snapshot_id else {
         return request.try_into();
     };
     let snapshot = session.get_snapshot(id).await?;
     let reference = Reference::Restore {
-        instance_id: request.id.clone(),
+        capsule_id: request.id.clone(),
     };
     if request.tenant_id != snapshot.template.tenant_id {
         return Err(Error::NotFound);
@@ -35,12 +35,12 @@ pub(super) async fn normalize(
     }
     snapshot.origin()?;
     let template = &snapshot.template;
-    request.runtime_environment = template.runtime_environment.clone().map(Into::into);
+    request.environment = template.environment.clone().map(Into::into);
     if request.image.is_empty() {
         request.image = template.image.clone();
     }
-    if request.runtime.is_empty() {
-        request.runtime = template.runtime.clone();
+    if request.runtime_class.is_empty() {
+        request.runtime_class = template.runtime_class.clone();
     }
     let resources = request.resources.get_or_insert_with(Default::default);
     if resources.cpu_millis == 0 {
@@ -53,7 +53,7 @@ pub(super) async fn normalize(
         resources.disk_bytes = template.resources.disk_bytes;
     }
     if request.image != template.image
-        || request.runtime != template.runtime
+        || request.runtime_class != template.runtime_class
         || *resources != pb::Resources::from(template.resources)
     {
         return Err(Error::Invalid(

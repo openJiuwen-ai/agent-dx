@@ -57,7 +57,7 @@ struct Config {
     runtime_ready_timeout_seconds: u64,
     rrt_port: u16,
     #[serde(default)]
-    runtime_environment: Option<adx_core::environment::RuntimeEnvironment>,
+    environment: Option<adx_core::environment::EnvironmentSpec>,
     #[serde(default)]
     rrt_command: Vec<String>,
     #[serde(default)]
@@ -215,7 +215,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env.insert("RRT_HTTP_PORT".into(), config.rrt_port.to_string());
     let token = env.get("RRT_HTTP_TOKEN").cloned();
     let runtime_config = RuntimeConfig {
-        runtime_environment: config.runtime_environment,
+        environment: config.environment,
         command: config.rrt_command,
         env,
         cwd: "/".into(),
@@ -346,7 +346,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Resource/backend observation is not on the heartbeat critical path.
         // Bound each attempt to one reporting period so a busy or restarting
         // sandboxd closes admission after `valid_until` without causing Master
-        // to expire the node session and fence otherwise healthy instances.
+        // to expire the node session and fence otherwise healthy capsules.
         let sample_timeout = timeout.min(Duration::from_secs(config.report_interval_seconds));
         let mut interval =
             tokio::time::interval(Duration::from_secs(config.report_interval_seconds));
@@ -434,7 +434,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     continue;
                                 }
                                 // Replay may change executions and checkpoint ownership. Fetch
-                                // both Instance and snapshot records from the same fresh catalog.
+                                // both Capsule and snapshot records from the same fresh catalog.
                                 catalog = match inspect_node(
                                     &mut master,
                                     &config.node_id,
@@ -552,8 +552,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
-            if let Err(error) = manager.monitor_instances().await {
-                adx_observability::warn!("instance observation incomplete: {error}");
+            if let Err(error) = manager.monitor_capsules().await {
+                adx_observability::warn!("capsule observation incomplete: {error}");
             }
         }
     };

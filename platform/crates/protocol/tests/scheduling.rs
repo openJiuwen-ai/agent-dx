@@ -1,4 +1,4 @@
-use adx_core::{scheduling::*, Assignment, InstanceSpec, Resources};
+use adx_core::{scheduling::*, Assignment, CapsuleSpec, Resources};
 use adx_protocol::control as wire;
 use prost::Message;
 fn selector() -> LabelSelector {
@@ -18,15 +18,15 @@ fn protobuf_round_trip_preserves_every_placement_constraint_and_card_identity() 
         topology_key: "zone".into(),
         tenants: vec!["t".into()],
     };
-    let spec = InstanceSpec {
-        runtime_environment: None,
+    let spec = CapsuleSpec {
+        environment: None,
         snapshot_id: None,
         lifecycle: Default::default(),
         env: Default::default(),
         id: "i".into(),
         tenant_id: "t".into(),
         image: "image".into(),
-        runtime: "runsc".into(),
+        runtime_class: "runsc".into(),
         priority: 5,
         resources: Resources {
             cpu_millis: 1,
@@ -35,7 +35,7 @@ fn protobuf_round_trip_preserves_every_placement_constraint_and_card_identity() 
         },
         scheduling: SchedulingPolicy {
             placement_groups: vec![PlacementGroup {
-                target: PlacementTarget::Instance,
+                target: PlacementTarget::Capsule,
                 terms: vec![WeightedSelector {
                     selector: selector(),
                     weight: 7,
@@ -75,11 +75,11 @@ fn protobuf_round_trip_preserves_every_placement_constraint_and_card_identity() 
         },
         sandbox: Default::default(),
     };
-    let bytes = wire::InstanceSpec::from(spec.clone()).encode_to_vec();
-    let decoded = wire::InstanceSpec::decode(bytes.as_slice()).unwrap();
-    assert_eq!(InstanceSpec::try_from(decoded).unwrap(), spec);
+    let bytes = wire::CapsuleSpec::from(spec.clone()).encode_to_vec();
+    let decoded = wire::CapsuleSpec::decode(bytes.as_slice()).unwrap();
+    assert_eq!(CapsuleSpec::try_from(decoded).unwrap(), spec);
     let assignment = Assignment {
-        instance_id: "i".into(),
+        capsule_id: "i".into(),
         node_id: "n".into(),
         shard_id: 0,
         generation: 1,
@@ -125,7 +125,7 @@ fn unknown_enums_missing_selectors_and_duplicate_cards_are_rejected() {
         2
     ];
     assert!(Assignment::try_from(wire::Assignment {
-        instance_id: "i".into(),
+        capsule_id: "i".into(),
         node_id: "n".into(),
         generation: 1,
         devices: cards,

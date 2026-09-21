@@ -1,14 +1,14 @@
 openapi: "3.1.0"
 info:
-  title: ADX Instance Data Plane API
+  title: ADX Sandbox Runtime Data Plane API
   version: "1.0.0"
   license:
     name: Apache-2.0
     identifier: Apache-2.0
   description: |
     Typed runtime operations exposed by Edge at `/direct/{instanceId}`. Edge
-    resolves the Instance route, Node Proxy verifies its local binding, and RRT
-    executes the operation inside the Instance. These calls bypass lifecycle and
+    resolves the Capsule route, Node Proxy verifies the current Runtime binding,
+    and RRT executes the operation inside that Runtime. These calls bypass lifecycle and
     scheduling queues.
 
     Generic application port forwarding and reverse tunnels transport arbitrary
@@ -23,7 +23,7 @@ security:
   - xAuth: []
 tags:
   - name: Runtime
-    description: Typed operations executed by RRT inside an Instance.
+    description: Typed operations executed by RRT inside a Sandbox Runtime.
   - name: Files
     description: Streaming and resumable file transfer.
   - name: Commands
@@ -55,7 +55,7 @@ paths:
     post:
       tags: [Runtime, Commands]
       operationId: invokeRuntimeAction
-      summary: Invoke a process, shell or file action inside the Instance
+      summary: Invoke a process, shell or file action inside the Sandbox Runtime
       description: |
         `action` selects an RRT operation. Mutating calls should carry one
         `X-ADX-Request-ID`; retry an unknown result with the same ID.

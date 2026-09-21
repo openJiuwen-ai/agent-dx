@@ -1,4 +1,4 @@
-use adx_core::{InstanceSpec, Resources};
+use adx_core::{CapsuleSpec, Resources};
 use adx_master::{Master, Node, Placement, SchedulerConfig};
 use std::{sync::Arc, time::Duration};
 fn node(id: &str, cpu: u64) -> Node {
@@ -14,16 +14,16 @@ fn node(id: &str, cpu: u64) -> Node {
         devices: vec![],
     }
 }
-fn spec(id: &str) -> InstanceSpec {
-    InstanceSpec {
-        runtime_environment: None,
+fn spec(id: &str) -> CapsuleSpec {
+    CapsuleSpec {
+        environment: None,
         snapshot_id: None,
         lifecycle: Default::default(),
         env: Default::default(),
         id: id.into(),
         tenant_id: "t".into(),
         image: "i".into(),
-        runtime: "r".into(),
+        runtime_class: "r".into(),
         priority: 0,
         resources: Resources {
             cpu_millis: 1,
@@ -47,11 +47,11 @@ fn snapshots_share_unchanged_nodes_and_keep_old_placements_immutable() {
         before.nodes().get("b").unwrap(),
         after.nodes().get("b").unwrap()
     ));
-    assert!(before.instances().is_empty());
-    assert_eq!(after.instances().len(), 1);
+    assert!(before.capsules().is_empty());
+    assert_eq!(after.capsules().len(), 1);
     m.release(&a).unwrap();
-    assert_eq!(after.instances().len(), 1);
-    assert!(m.snapshot().instances().is_empty());
+    assert_eq!(after.capsules().len(), 1);
+    assert!(m.snapshot().capsules().is_empty());
 }
 #[test]
 fn bounded_rounds_progress_past_an_unfittable_prefix_without_draining_the_queue() {
@@ -75,7 +75,7 @@ fn bounded_rounds_progress_past_an_unfittable_prefix_without_draining_the_queue(
         assert!(round.yielded);
     }
     let round = m.schedule_round(0).unwrap();
-    assert_eq!(round.assignments[0].instance_id, "fit");
+    assert_eq!(round.assignments[0].capsule_id, "fit");
     assert_eq!(m.pending(0).unwrap(), 8);
 }
 #[test]
@@ -189,5 +189,5 @@ fn stalled_fifo_is_preserved_when_capacity_returns_before_a_new_submission() {
     assert!(m.schedule(0).unwrap().is_none());
     m.register(node("n", 1)).unwrap();
     m.submit(spec("newer")).unwrap();
-    assert_eq!(m.schedule(0).unwrap().unwrap().instance_id, "older");
+    assert_eq!(m.schedule(0).unwrap().unwrap().capsule_id, "older");
 }

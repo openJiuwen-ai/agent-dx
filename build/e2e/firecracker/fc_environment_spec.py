@@ -22,7 +22,7 @@ def resolve(
             raise RuntimeError("Kubernetes OCI runtime image must be digest pinned")
         return {
             "rootfs": {
-                "runtime": "firecracker",
+                "runtime_class": "firecracker",
                 "type": "image",
                 "image": image,
                 "readonly": False,
@@ -43,7 +43,7 @@ def resolve(
     value = str(artifact.resolve())
     return {
         "rootfs": {
-            "runtime": "firecracker",
+            "runtime_class": "firecracker",
             "type": "local",
             "path": value,
             "readonly": False,

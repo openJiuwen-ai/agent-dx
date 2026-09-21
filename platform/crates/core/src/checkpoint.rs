@@ -32,12 +32,14 @@ pub struct CompletedOperation {
 }
 /// Ownership and an execution lifetime are distinct: a same-node restore starts
 /// a new execution under the existing ownership, fenced by binding revision.
-pub fn valid_runtime_id(instance: &str, generation: u64, runtime: &str) -> bool {
-    let base = format!("{instance}-{generation}");
-    runtime == base
-        || runtime.strip_prefix(&format!("{base}-r")).is_some_and(|s| {
-            !s.is_empty()
-                && s.bytes().all(|b| b.is_ascii_digit())
-                && s.parse::<u64>().is_ok_and(|n| n > 0)
-        })
+pub fn valid_runtime_id(capsule: &str, generation: u64, runtime_id: &str) -> bool {
+    let base = format!("{capsule}-{generation}");
+    runtime_id == base
+        || runtime_id
+            .strip_prefix(&format!("{base}-r"))
+            .is_some_and(|s| {
+                !s.is_empty()
+                    && s.bytes().all(|b| b.is_ascii_digit())
+                    && s.parse::<u64>().is_ok_and(|n| n > 0)
+            })
 }

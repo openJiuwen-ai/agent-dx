@@ -77,7 +77,7 @@ impl ObjectCheckpointStore {
         Ok(())
     }
     pub(super) async fn authorize(&self, retained: &[CheckpointArtifact]) -> Result<()> {
-        // Preserve the union for this boot. Once registered, ordinary Instance /
+        // Preserve the union for this boot. Once registered, ordinary Capsule /
         // snapshot deletion owns the artifact's cleanup, not this orphan collector.
         let mut validated = BTreeSet::new();
         for artifact in retained.iter().filter(|a| a.storage == self.alias) {

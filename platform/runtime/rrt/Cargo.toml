@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "ADX runtime request transport and in-instance runtime daemon"
+description = "ADX runtime request transport and in-Runtime request daemon"
 
 [lints]
 workspace = true

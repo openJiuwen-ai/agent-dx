@@ -1,6 +1,6 @@
-use adx_core::{Assignment, InstanceRecord, InstanceSpec, InstanceState, Resources, Result};
+use adx_core::{Assignment, CapsuleRecord, CapsuleSpec, CapsuleState, Resources, Result};
 use adx_node_manager::{
-    Durability, NodeManager, Readiness, Routes, RuntimeBackend, RuntimeObservation, StateSink,
+    Durability, NodeManager, Readiness, Routes, RuntimeDriver, RuntimeObservation, StateSink,
 };
 use async_trait::async_trait;
 use std::{
@@ -18,7 +18,7 @@ struct Backend {
     events: Mutex<Vec<String>>,
 }
 #[async_trait]
-impl RuntimeBackend for Backend {
+impl RuntimeDriver for Backend {
     async fn inventory(&self) -> Result<Vec<RuntimeObservation>> {
         if self
             .fail_inventory
@@ -38,7 +38,7 @@ impl RuntimeBackend for Backend {
     }
     async fn start(
         &self,
-        _: &InstanceSpec,
+        _: &CapsuleSpec,
         _: &str,
         _: u64,
         _: &[adx_core::scheduling::DeviceAllocation],
@@ -60,24 +60,24 @@ impl RuntimeBackend for Backend {
 }
 #[async_trait]
 impl Readiness for Backend {
-    async fn wait_ready(&self, _: &InstanceRecord) -> Result<()> {
+    async fn wait_ready(&self, _: &CapsuleRecord) -> Result<()> {
         Ok(())
     }
 }
 #[async_trait]
 impl Routes for Backend {
-    async fn activate(&self, r: &InstanceRecord) -> Result<()> {
+    async fn activate(&self, r: &CapsuleRecord) -> Result<()> {
         self.events
             .lock()
             .unwrap()
-            .push(format!("bind:{}", r.runtime_id));
+            .push(format!("bind:{}", r.runtime.id));
         Ok(())
     }
-    async fn retire(&self, record: &InstanceRecord) -> Result<()> {
+    async fn retire(&self, record: &CapsuleRecord) -> Result<()> {
         self.events
             .lock()
             .unwrap()
-            .push(format!("retire:{}", record.runtime_id));
+            .push(format!("retire:{}", record.runtime.id));
         Ok(())
     }
     async fn retire_orphan(&self, r: &RuntimeObservation) -> Result<()> {
@@ -90,7 +90,7 @@ impl Routes for Backend {
 }
 #[async_trait]
 impl StateSink for Backend {
-    async fn commit(&self, r: &InstanceRecord) -> Result<Durability> {
+    async fn commit(&self, r: &CapsuleRecord) -> Result<Durability> {
         self.events
             .lock()
             .unwrap()
@@ -98,12 +98,12 @@ impl StateSink for Backend {
         Ok(Durability::Published)
     }
 }
-fn record(id: &str, state: InstanceState) -> InstanceRecord {
-    InstanceRecord {
+fn record(id: &str, state: CapsuleState) -> CapsuleRecord {
+    CapsuleRecord {
         restart_attempts: 0,
         restart_pending: false,
-        spec: InstanceSpec {
-            runtime_environment: None,
+        spec: CapsuleSpec {
+            environment: None,
             snapshot_id: None,
             lifecycle: Default::default(),
             env: Default::default(),
@@ -111,7 +111,7 @@ fn record(id: &str, state: InstanceState) -> InstanceRecord {
             id: id.into(),
             tenant_id: "t".into(),
             image: "image".into(),
-            runtime: "runc".into(),
+            runtime_class: "runc".into(),
             resources: Resources {
                 cpu_millis: 2,
                 memory_bytes: 2,
@@ -121,20 +121,18 @@ fn record(id: &str, state: InstanceState) -> InstanceRecord {
             sandbox: Default::default(),
         },
         assignment: Assignment {
-            instance_id: id.into(),
+            capsule_id: id.into(),
             node_id: "n".into(),
             shard_id: 0,
             generation: 7,
             devices: vec![],
         },
         state,
-        revision: if state == InstanceState::Pending {
-            0
-        } else {
-            2
+        revision: if state == CapsuleState::Pending { 0 } else { 2 },
+        runtime: adx_core::Runtime {
+            id: format!("{id}-7"),
+            ip: Some("10.0.0.2".parse().unwrap()),
         },
-        runtime_id: format!("{id}-7"),
-        runtime_ip: Some("10.0.0.2".parse().unwrap()),
         checkpoint: None,
         last_operation: None,
         resources_held: true,
@@ -142,7 +140,7 @@ fn record(id: &str, state: InstanceState) -> InstanceRecord {
 }
 fn observed(id: &str) -> RuntimeObservation {
     RuntimeObservation {
-        instance_id: id.into(),
+        capsule_id: id.into(),
         runtime_id: format!("{id}-7"),
         generation: 7,
         tenant_id: "t".into(),
@@ -167,20 +165,20 @@ async fn restores_running_usage_without_start_and_cleans_uncommitted_orphans() {
     let b = Arc::new(Backend::default());
     *b.actual.lock().unwrap() = vec![observed("kept"), observed("orphan")];
     let n = manager(&b);
-    n.reconcile(vec![record("kept", InstanceState::Running)])
+    n.reconcile(vec![record("kept", CapsuleState::Running)])
         .await
         .unwrap();
     assert_eq!(n.used().cpu_millis, 2);
     assert_eq!(b.actual.lock().unwrap().len(), 1);
     let handle = n
-        .instance(
-            record("kept", InstanceState::Running).spec,
-            record("kept", InstanceState::Running).assignment,
+        .capsule(
+            record("kept", CapsuleState::Running).spec,
+            record("kept", CapsuleState::Running).assignment,
         )
         .unwrap();
     assert_eq!(
         handle.create().await.unwrap().record.state,
-        InstanceState::Running
+        CapsuleState::Running
     );
     assert!(b.events.lock().unwrap().contains(&"remove:orphan-7".into()));
     handle.delete().await.unwrap();
@@ -192,8 +190,8 @@ async fn missing_running_or_uncommitted_start_fails_without_recreation() {
     *b.actual.lock().unwrap() = vec![observed("pending")];
     let n = manager(&b);
     n.reconcile(vec![
-        record("missing", InstanceState::Running),
-        record("pending", InstanceState::Pending),
+        record("missing", CapsuleState::Running),
+        record("pending", CapsuleState::Pending),
     ])
     .await
     .unwrap();
@@ -219,7 +217,7 @@ async fn invalid_catalog_does_not_clean_any_runtime() {
     let b = Arc::new(Backend::default());
     *b.actual.lock().unwrap() = vec![observed("orphan")];
     let n = manager(&b);
-    let mut invalid = record("bad", InstanceState::Running);
+    let mut invalid = record("bad", CapsuleState::Running);
     invalid.assignment.node_id = "other".into();
     assert!(n.reconcile(vec![invalid]).await.is_err());
     assert!(b.events.lock().unwrap().is_empty());
@@ -230,11 +228,11 @@ async fn repeated_reconciliation_preserves_usage_and_controller_identity() {
     let b = Arc::new(Backend::default());
     *b.actual.lock().unwrap() = vec![observed("kept")];
     let n = manager(&b);
-    let r = record("kept", InstanceState::Running);
+    let r = record("kept", CapsuleState::Running);
     n.reconcile(vec![r.clone()]).await.unwrap();
     n.reconcile(vec![r.clone()]).await.unwrap();
     assert_eq!(n.used().cpu_millis, 2);
-    n.instance(r.spec, r.assignment)
+    n.capsule(r.spec, r.assignment)
         .unwrap()
         .delete()
         .await
@@ -260,7 +258,7 @@ async fn failed_cleanup_retains_claims_and_retry_releases_once() {
     b.fail_remove
         .store(true, std::sync::atomic::Ordering::SeqCst);
     let n = manager(&b);
-    let r = record("pending", InstanceState::Pending);
+    let r = record("pending", CapsuleState::Pending);
     assert!(n.reconcile(vec![r.clone()]).await.is_err());
     assert_eq!(n.used().cpu_millis, 2);
     b.fail_remove
@@ -274,14 +272,14 @@ async fn authority_removal_cleans_live_controller_and_fences_delayed_calls() {
     let b = Arc::new(Backend::default());
     *b.actual.lock().unwrap() = vec![observed("kept")];
     let n = manager(&b);
-    let r = record("kept", InstanceState::Running);
+    let r = record("kept", CapsuleState::Running);
     n.reconcile(vec![r.clone()]).await.unwrap();
-    let old = n.instance(r.spec.clone(), r.assignment.clone()).unwrap();
+    let old = n.capsule(r.spec.clone(), r.assignment.clone()).unwrap();
     n.reconcile(vec![]).await.unwrap();
     assert!(b.actual.lock().unwrap().is_empty());
     assert_eq!(n.used(), Resources::default());
     assert!(old.create().await.is_err());
-    assert!(n.instance(r.spec, r.assignment).is_err());
+    assert!(n.capsule(r.spec, r.assignment).is_err());
     assert_eq!(
         b.events
             .lock()
@@ -298,13 +296,13 @@ async fn reconnect_discards_live_controller_when_authority_invalidates_execution
     let backend = Arc::new(Backend::default());
     *backend.actual.lock().unwrap() = vec![observed("lost")];
     let node = manager(&backend);
-    let running = record("lost", InstanceState::Running);
+    let running = record("lost", CapsuleState::Running);
     node.reconcile(vec![running.clone()]).await.unwrap();
     backend.events.lock().unwrap().clear();
     let mut failed = running;
-    failed.state = InstanceState::Failed;
+    failed.state = CapsuleState::Failed;
     failed.resources_held = false;
-    failed.runtime_ip = None;
+    failed.runtime.ip = None;
     failed.revision += 1;
     backend
         .fail_remove

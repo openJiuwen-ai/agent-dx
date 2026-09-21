@@ -46,7 +46,7 @@ sudo env ADX_FC_BASE=/opt/adx ADX_FC_PROXY_MODE=embedded \
 package-v13 / Lima r16再次通过13项；本轮同时修复SDK在 `verify_tls=True` 时向 `wss://` 传入 `ssl=None` 的问题。真实TLS Socket认证订阅回归已加入本地 `interop` 套件，r16全量日志不再出现该连接错误或command-watch不可用回退。
 
 
-当前驱动增加三项克隆场景，必需集合共16项：公共 SDK 从同一快照创建两个新 Instance，不传镜像/runtime/资源以验证继承，检查 PID/内存计数及可写文件隔离；删除源快照后等待 Redis 目录进入 Deleted 且无引用，再分别暂停、恢复和删除克隆。`sdk/snapshot-collected-before-clone-resume.json` 记录回收顺序，严格验收器要求该证据存在。生命周期操作全部经过公共 SDK；只读 Redis 查询用作清理时序的测试观测。
+当前驱动增加三项克隆场景，必需集合共16项：公共 SDK 从同一快照创建两个新 Capsule，不传镜像/runtime/资源以验证继承，检查 PID/内存计数及可写文件隔离；删除源快照后等待 Redis 目录进入 Deleted 且无引用，再分别暂停、恢复和删除克隆。`sdk/snapshot-collected-before-clone-resume.json` 记录回收顺序，严格验收器要求该证据存在。生命周期操作全部经过公共 SDK；只读 Redis 查询用作清理时序的测试观测。
 
 package-v15/Lima r18 已通过16项及全部最终清理，严格时序证据已验证；该记录不表示目标Kubernetes已执行。
 

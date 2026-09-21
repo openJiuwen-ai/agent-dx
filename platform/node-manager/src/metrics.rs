@@ -15,17 +15,17 @@ pub struct RuntimeUsage {
 #[derive(Default)]
 pub(crate) struct Metrics(Mutex<BTreeMap<String, (String, RuntimeUsage, Instant)>>);
 impl Metrics {
-    pub fn record(&self, instance: &str, runtime: &str, usage: RuntimeUsage) {
+    pub fn record(&self, capsule: &str, runtime: &str, usage: RuntimeUsage) {
         self.0
             .lock()
             .expect("shared state lock poisoned")
-            .insert(instance.into(), (runtime.into(), usage, Instant::now()));
+            .insert(capsule.into(), (runtime.into(), usage, Instant::now()));
     }
-    pub fn remove(&self, instance: &str) {
+    pub fn remove(&self, capsule: &str) {
         self.0
             .lock()
             .expect("shared state lock poisoned")
-            .remove(instance);
+            .remove(capsule);
     }
     fn render(&self) -> String {
         let escape = |s: &str| {
@@ -38,25 +38,25 @@ impl Metrics {
             self.0.lock().expect("shared state lock poisoned").iter()
         {
             let labels = format!(
-                "instance_id=\"{}\",runtime_id=\"{}\"",
+                "capsule_id=\"{}\",runtime_id=\"{}\"",
                 escape(id),
                 escape(runtime)
             );
             for (name, value) in [
                 (
-                    "adx_instance_cpu_usage_seconds_total",
+                    "adx_capsule_cpu_usage_seconds_total",
                     usage.cpu_usage_ns as f64 / 1e9,
                 ),
                 (
-                    "adx_instance_memory_usage_bytes",
+                    "adx_capsule_memory_usage_bytes",
                     usage.memory_usage_bytes as f64,
                 ),
                 (
-                    "adx_instance_memory_limit_bytes",
+                    "adx_capsule_memory_limit_bytes",
                     usage.memory_limit_bytes as f64,
                 ),
                 (
-                    "adx_instance_stats_age_seconds",
+                    "adx_capsule_stats_age_seconds",
                     sampled.elapsed().as_secs_f64(),
                 ),
             ] {

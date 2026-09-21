@@ -28,9 +28,9 @@ impl Kind {
     }
     fn state(self) -> i32 {
         (match self {
-            Self::Delete => pb::InstanceState::Deleted,
-            Self::Pause => pb::InstanceState::Paused,
-            _ => pb::InstanceState::Running,
+            Self::Delete => pb::CapsuleState::Deleted,
+            Self::Pause => pb::CapsuleState::Paused,
+            _ => pb::CapsuleState::Running,
         }) as i32
     }
 }
@@ -84,9 +84,9 @@ impl Operations {
         let record = owner
             .record
             .as_ref()
-            .ok_or_else(|| Status::unavailable("instance directory returned no record"))?;
+            .ok_or_else(|| Status::unavailable("capsule directory returned no record"))?;
         if kind == Kind::Delete
-            && record.state == pb::InstanceState::Deleted as i32
+            && record.state == pb::CapsuleState::Deleted as i32
             && !record.resources_held
         {
             return Ok(Value::Null);
@@ -109,7 +109,7 @@ impl Operations {
                     .map_or(record.revision, |operation| operation.expected_revision);
                 let operation = Arc::new(Mutex::new(Operation {
                     assignment: record.assignment.clone().ok_or_else(|| {
-                        Status::unavailable("instance record returned no assignment")
+                        Status::unavailable("capsule record returned no assignment")
                     })?,
                     expected,
                     kind,
@@ -144,7 +144,7 @@ impl Operations {
                     clients
                         .rpc(
                             "api_server.delete",
-                            node.delete_instance(trace::inject(pb::DeleteInstanceRequest {
+                            node.delete_capsule(trace::inject(pb::DeleteCapsuleRequest {
                                 assignment,
                                 caller: caller_context,
                             })),
@@ -156,7 +156,7 @@ impl Operations {
                         .rpc_with_timeout(
                             "api_server.pause",
                             clients.config.timeout() + Duration::from_secs(seconds),
-                            node.pause_instance(trace::inject(pb::PauseInstanceRequest {
+                            node.pause_capsule(trace::inject(pb::PauseCapsuleRequest {
                                 assignment,
                                 caller: caller_context,
                                 operation_id: request_id.into(),
@@ -171,7 +171,7 @@ impl Operations {
                     clients
                         .rpc(
                             "api_server.resume",
-                            node.resume_instance(trace::inject(pb::ResumeInstanceRequest {
+                            node.resume_capsule(trace::inject(pb::ResumeCapsuleRequest {
                                 assignment,
                                 caller: caller_context,
                                 operation_id: request_id.into(),
@@ -202,7 +202,7 @@ impl Operations {
                     Ok(result) => {
                         snapshot = result.snapshot;
                         result
-                            .instance
+                            .capsule
                             .ok_or_else(|| Status::data_loss("missing snapshot result"))
                     }
                     Err(error) => Err(error),
@@ -229,7 +229,7 @@ impl Operations {
                     clients
                         .rpc(
                             "api_server.reload",
-                            node.reload_instance(trace::inject(pb::ReloadInstanceRequest {
+                            node.reload_capsule(trace::inject(pb::ReloadCapsuleRequest {
                                 assignment,
                                 caller: caller_context,
                                 operation_id: request_id.into(),

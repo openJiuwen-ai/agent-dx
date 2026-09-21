@@ -1,14 +1,14 @@
 # API Server 实例目录订阅验收
 
-2026-09-18，在 `fix/atomic-instance-claim` 工作树完成。API Server 的普通查询和生命周期请求不再逐次调用 Master `GetInstance`，而是消费 Master 发布的完整实例归属目录。
+2026-09-18，在 `fix/atomic-instance-claim` 工作树完成。API Server 的普通查询和生命周期请求不再逐次调用 Master `GetCapsule`，而是消费 Master 发布的完整实例归属目录。
 
 ## 实现契约
 
-- `InstanceDirectoryService.WatchInstances` 只接受 API Server 的 mTLS 身份。
+- `CapsuleDirectoryService.WatchCapsules` 只接受 API Server 的 mTLS 身份。
 - 每次订阅先发送 `reset=true` 的完整目录，后续发送以 `base_revision` 串联的 upsert/delete 增量；帧携带 Master epoch、控制 revision，实例记录携带 Assignment generation。
-- API Server 在内存维护 `Instance ID → InstanceRecord、Node Manager 地址、Node Proxy 地址`。目录未完成首次同步时返回 Unavailable；已同步目录缺失项直接返回 NotFound。
+- API Server 在内存维护 `Capsule ID → CapsuleRecord、Node Manager 地址、Node Proxy 地址`。目录未完成首次同步时返回 Unavailable；已同步目录缺失项直接返回 NotFound。
 - 普通流断开时继续使用最近一次完整目录并后台重连；revision 断档、非法 epoch 或损坏帧会清空目录并重新全量同步。
-- `MasterService.GetInstance` 只用于创建后的读后写收敛，以及结果不明时固定原 Assignment 的恢复查询。
+- `MasterService.GetCapsule` 只用于创建后的读后写收敛，以及结果不明时固定原 Assignment 的恢复查询。
 - Redis 保留的 Deleted 等终态记录也进入实例目录，使重复删除能返回既有幂等结果；公开查询仍把 Deleted 映射成 NotFound。记录真正回收时才发布 delete 增量。
 - Edge 的路由订阅保持独立，只发布可路由的 Running 实例。
 
@@ -32,4 +32,4 @@
 
 ## 验证边界
 
-验收包含真实 Redis、mTLS、Master、Node Manager RPC 和独立 Rust HTTPS API Server 进程。测试夹具的 RuntimeBackend 仍为可控实现，因此这组证据验证控制链一致性，不替代 sandboxd、RRT、Edge 的完整平台 E2E。既有 Buildkite 基础 K8s 验收发生在此次目录改造之前，不能作为本次未提交源码的 CI 证据。
+验收包含真实 Redis、mTLS、Master、Node Manager RPC 和独立 Rust HTTPS API Server 进程。测试夹具的 RuntimeDriver 仍为可控实现，因此这组证据验证控制链一致性，不替代 sandboxd、RRT、Edge 的完整平台 E2E。既有 Buildkite 基础 K8s 验收发生在此次目录改造之前，不能作为本次未提交源码的 CI 证据。

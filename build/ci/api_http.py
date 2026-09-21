@@ -37,7 +37,7 @@ for _ in range(100):
         break
     time.sleep(.05)
 else:
-    raise AssertionError('Rust API Server instance directory did not synchronize')
+    raise AssertionError('Rust API Server Capsule directory did not synchronize')
 for invalid_key in ('z' * 40, 'c' * 40):
     code, _ = call('DELETE', '/api/sandbox/absent', key=invalid_key)
     assert code == 401, code
@@ -91,7 +91,7 @@ assert code == 400, code
 print('Public HTTPS tenant key creation, admin-only listing/revocation, repeated revoke, cache expiry and invalid expiry passed')
 
 
-# Public affinity groups traverse HTTP -> Instance RPC -> Master -> Redis. Backend
+# Public affinity groups traverse HTTP -> Capsule RPC -> Master -> Redis. Backend
 # execution remains the RPC fixture; multi-node decisions have native tests.
 def create_placement(name, labels=None, affinities=None):
     code, body = call('POST','/api/sandbox/v1/sandboxes', {

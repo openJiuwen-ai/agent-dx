@@ -313,6 +313,6 @@ the reusable VMs are stopped. Evidence is retained under
 
 For the current public Sandbox SDK platform acceptance, use [build/e2e](../build/e2e/README.md). The old full-cluster AIO harness was not imported and is not a runnable command in this repository.
 
-The relay library supports tunnel, SSH and configured user-port forwarding; that does not imply the new control plane publishes user ports. Current public create rejects user-port publication and per-Instance data-plane security overrides. Generic reverse-proxy routes can forward Agent traffic to a separately supplied service; they do not implement the Agent backend.
+The relay library supports tunnel, SSH and configured user-port forwarding; that does not imply the new control plane publishes user ports. Current public create rejects user-port publication and per-Capsule data-plane security overrides. Generic reverse-proxy routes can forward Agent traffic to a separately supplied service; they do not implement the Agent backend.
 
 For current production logging, use [structured collection](../docs/testing/log-collection.md) and [supervisor rotation](../docs/testing/log-rotation.md). Gateway's optional own file writer above is an alternative sink; the unified JSON collection deployment leaves it disabled to avoid double writing. Trace propagation and export are implemented in Edge and Node Proxy, see [distributed traces](../docs/testing/distributed-traces.md).

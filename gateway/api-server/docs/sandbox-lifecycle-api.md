@@ -10,9 +10,9 @@ Runtime command and file operations use the separate
 [`data-plane.yaml`](../../../platform/api/openapi/data-plane.yaml) contract.
 
 **Support boundary:** the API Server maps the Sandbox schema into the typed
-Instance contract. It supports S3 rootfs and mounts, image-backed mounts,
+Capsule contract. It supports S3 rootfs and mounts, image-backed mounts,
 entrypoint inheritance, `extra_config`, independent resource request/limit
-values, published ports, per-Instance data-plane security, creation/runtime
+values, published ports, per-Capsule data-plane security, creation/runtime
 network policy, `failover=true`, and reload. Public local rootfs paths and host
 mounts are rejected because node paths are deployment-owned. `upstream` reverse
 tunnel is carried by the create contract; the legacy `/invoke` compatibility
@@ -59,7 +59,7 @@ instead of inferring retry safety from HTTP status or message text. See the
 
 `snapshotId` on the normal create route creates a new sandbox from a reusable
 snapshot. The snapshot is reusable; creating from it does not consume it.
-The Rust Master resolves the tenant-scoped Ready snapshot, protects it with a restore reference and applies compatible template fields. A local-only artifact pins the clone to the source node; shared storage permits normal scheduling. A deleting snapshot admits only an already-held reference. Explicit image, runtime and scalar resource geometry must match the snapshot; omitted resources inherit. Clones receive independent Instance/backend identities and artifact copies. See [snapshot storage](../../../docs/testing/snapshot-storage.md).
+The Rust Master resolves the tenant-scoped Ready snapshot, protects it with a restore reference and applies compatible template fields. A local-only artifact pins the clone to the source node; shared storage permits normal scheduling. A deleting snapshot admits only an already-held reference. Explicit image, runtime and scalar resource geometry must match the snapshot; omitted resources inherit. Clones receive independent Capsule/backend identities and artifact copies. See [snapshot storage](../../../docs/testing/snapshot-storage.md).
 
 Create uses the ordinary `X-Request-Id` header. It is optional: when absent,
 API Server derives the request ID from the trace ID, echoes it as `X-Request-Id`,
@@ -197,8 +197,8 @@ Resume requires a matching Running record, completed RRT readiness and Node Prox
 
 Reusable snapshot creation briefly pauses the source, copies its artifact, publishes the catalog and resumes the source. Success requires both the snapshot and resumed source result to be committed. It does not promise uninterrupted source execution. Deleting a referenced snapshot marks it deleting and prevents new references; physical removal follows reference release and backend confirmation.
 
-Reload requires a Running Instance with an unexpired checkpoint. Node Manager
-retires and deletes the current backend, restores the same logical Instance as
+Reload requires a Running Capsule with an unexpired checkpoint. Node Manager
+retires and deletes the current backend, restores the same logical Capsule as
 a fresh execution, completes RRT readiness and local route binding, then
 publishes Running. A missing or expired checkpoint fails the operation; reload
 never falls back to a cold start.

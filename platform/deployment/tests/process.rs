@@ -99,12 +99,12 @@ impl pb::node_admin_service_server::NodeAdminService for NodeAdmin {
             return Err(tonic::Status::unavailable("commit failed"));
         }
         Ok(tonic::Response::new(pb::DrainResponse {
-            deleted_instances: 1,
+            deleted_capsules: 1,
         }))
     }
 }
 #[tokio::test]
-async fn failed_instance_cleanup_keeps_dependencies_running_then_retries() {
+async fn failed_capsule_cleanup_keeps_dependencies_running_then_retries() {
     let temp_directory = tempfile::Builder::new()
         .prefix("adx-p-")
         .tempdir_in("/tmp")

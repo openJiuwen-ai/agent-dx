@@ -69,7 +69,7 @@ def main():
     elif action=='postcheck':
         result_name=node or 'sdk'
         c=catalog();r=json.loads((E/result_name/'sdk-result.json').read_text());assert r['status']=='passed'
-        records=[json.loads(c['instance:'+i]) for i in r['instances']]
+        records=[json.loads(c['capsule:'+i]) for i in r['instances']]
         assignments={record['assignment']['node_id'] for record in records}
         assert assignments and assignments <= {'node1','node2'}
         if result_name=='sdk':assert assignments=={'node1','node2'}
@@ -95,7 +95,7 @@ def main():
         end=time.monotonic()+65
         while True:
             c=catalog();live=json.loads((E/'live-instances.json').read_text())
-            records=[json.loads(c['instance:'+sid]) for sid in live]
+            records=[json.loads(c['capsule:'+sid]) for sid in live]
             failed=[r for r in records if r['assignment']['node_id']=='node2']
             healthy=[r for r in records if r['assignment']['node_id']=='node1']
             assert len(failed)==len(healthy)==1

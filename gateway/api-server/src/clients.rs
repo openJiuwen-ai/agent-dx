@@ -1,4 +1,4 @@
-use crate::{config::Config, instance_directory::InstanceDirectory, ownership::Cache};
+use crate::{capsule_directory::CapsuleDirectory, config::Config, ownership::Cache};
 use adx_observability::trace;
 use adx_protocol::control as pb;
 use adx_transport::tls::grpc_client_config;
@@ -22,7 +22,7 @@ pub struct Clients {
     endpoint: Mutex<Cache<(), String>>,
     channels: Mutex<Cache<String, Channel>>,
     auth: Mutex<Cache<[u8; 32], pb::CallerContext>>,
-    instances: Mutex<InstanceDirectory>,
+    capsules: Mutex<CapsuleDirectory>,
 }
 impl Clients {
     pub fn new(config: Config) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
@@ -49,12 +49,12 @@ impl Clients {
             endpoint: Mutex::new(Cache::new(1)),
             channels: Mutex::new(Cache::new(limit)),
             auth: Mutex::new(Cache::new(limit)),
-            instances: Mutex::default(),
+            capsules: Mutex::default(),
         });
         let weak = Arc::downgrade(&clients);
         tokio::spawn(async move {
             while let Some(clients) = weak.upgrade() {
-                let result = clients.watch_instances().await;
+                let result = clients.watch_capsules().await;
                 if result.as_ref().is_err_and(|error| {
                     matches!(
                         error.code(),
@@ -63,7 +63,7 @@ impl Clients {
                             | tonic::Code::DataLoss
                     )
                 }) {
-                    clients.instances.lock().await.clear();
+                    clients.capsules.lock().await.clear();
                 }
                 drop(clients);
                 tokio::time::sleep(Duration::from_secs(1)).await;
@@ -80,22 +80,21 @@ impl Clients {
         });
         Ok(clients)
     }
-    async fn watch_instances(&self) -> Result<(), Status> {
-        let mut client =
-            pb::instance_directory_service_client::InstanceDirectoryServiceClient::new(
-                self.master().await?,
-            )
-            .max_decoding_message_size(64 * 1024 * 1024);
+    async fn watch_capsules(&self) -> Result<(), Status> {
+        let mut client = pb::capsule_directory_service_client::CapsuleDirectoryServiceClient::new(
+            self.master().await?,
+        )
+        .max_decoding_message_size(64 * 1024 * 1024);
         let mut stream = self
             .rpc(
-                "api_server.watch_instances",
-                client.watch_instances(pb::WatchInstancesRequest {}),
+                "api_server.watch_capsules",
+                client.watch_capsules(pb::WatchCapsulesRequest {}),
             )
             .await?;
         while let Some(frame) = stream.message().await? {
-            self.instances.lock().await.update(frame)?;
+            self.capsules.lock().await.update(frame)?;
         }
-        Err(Status::unavailable("instance directory closed"))
+        Err(Status::unavailable("capsule directory closed"))
     }
     async fn watch_directory(&self) -> Result<(), Status> {
         let mut client = pb::master_service_client::MasterServiceClient::new(self.master().await?);
@@ -113,18 +112,18 @@ impl Clients {
             self.directory.lock().await.update(frame)?;
         }
     }
-    pub async fn create_instance(
+    pub async fn create_capsule(
         &self,
-        request: pb::CreateInstanceRequest,
+        request: pb::CreateCapsuleRequest,
         budget: Duration,
-    ) -> Result<pb::InstanceResult, Status> {
+    ) -> Result<pb::CapsuleResult, Status> {
         if self.config.create_mode == crate::config::CreateMode::LocalFirst {
             let node = self.directory.lock().await.select();
             if let Some(node) = node {
                 let mut client = pb::node_service_client::NodeServiceClient::new(
                     self.channel(&node.address).await?,
                 );
-                let mut request = trace::inject(pb::LocalCreateRequest {
+                let mut request = trace::inject(pb::LocalCapsuleCreateRequest {
                     create: Some(request),
                     node_session_id: node.session_id,
                 });
@@ -133,7 +132,7 @@ impl Clients {
                     .rpc_with_timeout(
                         "api_server.create_local",
                         budget,
-                        client.create_local_instance(request),
+                        client.create_local_capsule(request),
                     )
                     .await;
                 // The entry node owns the only fallback decision. A definitive
@@ -146,7 +145,7 @@ impl Clients {
         self.rpc_with_timeout(
             "api_server.create",
             budget,
-            client.create_instance(trace::inject(request)),
+            client.create_capsule(trace::inject(request)),
         )
         .await
     }
@@ -273,18 +272,18 @@ impl Clients {
         id: &str,
         caller: &pb::CallerContext,
         refresh: bool,
-    ) -> Result<pb::GetInstanceResponse, Status> {
+    ) -> Result<pb::GetCapsuleResponse, Status> {
         if !refresh {
-            let value = self.instances.lock().await.get(id)?;
+            let value = self.capsules.lock().await.get(id)?;
             authorize(caller, value.record.as_ref())?;
             return Ok(value);
         }
         let mut client = pb::master_service_client::MasterServiceClient::new(self.master().await?);
         let v = self
             .rpc(
-                "api_server.get_instance",
-                client.get_instance(trace::inject(pb::GetInstanceRequest {
-                    instance_id: id.into(),
+                "api_server.get_capsule",
+                client.get_capsule(trace::inject(pb::GetCapsuleRequest {
+                    capsule_id: id.into(),
                     caller: Some(caller.clone()),
                 })),
             )
@@ -301,8 +300,8 @@ impl Clients {
         self.put_owner(v.clone()).await?;
         Ok(v)
     }
-    pub async fn put_owner(&self, value: pb::GetInstanceResponse) -> Result<(), Status> {
-        self.instances.lock().await.put(value)
+    pub async fn put_owner(&self, value: pb::GetCapsuleResponse) -> Result<(), Status> {
+        self.capsules.lock().await.put(value)
     }
 }
 
@@ -314,9 +313,9 @@ pub fn unix_seconds() -> u64 {
 }
 pub fn authorize(
     caller: &pb::CallerContext,
-    record: Option<&pb::InstanceRecord>,
+    record: Option<&pb::CapsuleRecord>,
 ) -> Result<(), Status> {
-    let r = record.ok_or_else(|| Status::data_loss("missing instance record"))?;
+    let r = record.ok_or_else(|| Status::data_loss("missing capsule record"))?;
     let spec = r
         .spec
         .as_ref()
@@ -324,14 +323,14 @@ pub fn authorize(
     let assignment = r
         .assignment
         .as_ref()
-        .filter(|a| a.instance_id == spec.id && a.generation > 0)
+        .filter(|a| a.capsule_id == spec.id && a.generation > 0)
         .ok_or_else(|| Status::data_loss("invalid assignment"))?;
     if assignment.node_id.is_empty() {
         return Err(Status::data_loss("missing node identity"));
     }
     if !caller.administrator && caller.tenant_id != spec.tenant_id {
         return Err(Status::permission_denied(
-            "instance belongs to another tenant",
+            "capsule belongs to another tenant",
         ));
     }
     Ok(())

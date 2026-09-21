@@ -12,7 +12,7 @@ impl Controller {
         if self.replay_operation(&operation_id, expected_revision, LifecycleKind::Reload)? {
             return self.replay_or_sync().await;
         }
-        if self.record.state != InstanceState::Running {
+        if self.record.state != CapsuleState::Running {
             return Err(Error::Conflict);
         }
         let checkpoint = self
@@ -49,7 +49,7 @@ impl Controller {
         if self.replay_operation(&operation_id, expected_revision, LifecycleKind::Network)? {
             return self.replay_or_sync().await;
         }
-        if self.record.state != InstanceState::Running {
+        if self.record.state != CapsuleState::Running {
             return Err(Error::Conflict);
         }
         if let Some(policy) = &policy {
@@ -58,7 +58,7 @@ impl Controller {
         self.services
             .runtime
             .set_network_policy(
-                &self.record.runtime_id,
+                &self.record.runtime.id,
                 policy.as_ref(),
                 &self.record.spec.sandbox.ports,
             )
@@ -79,12 +79,11 @@ impl Controller {
         else {
             return Ok(());
         };
-        if self.record.state == InstanceState::Paused {
+        if self.record.state == CapsuleState::Paused {
             self.delete().await?;
             return Ok(());
         }
-        if self.record.state != InstanceState::Running && self.record.state != InstanceState::Failed
-        {
+        if self.record.state != CapsuleState::Running && self.record.state != CapsuleState::Failed {
             return Ok(());
         }
         // An expired restore point is no longer usable, but the live execution
@@ -134,7 +133,7 @@ impl Controller {
                 .admission
                 .lock()
                 .expect("shared state lock poisoned")
-                .release(&self.record.runtime_id)?;
+                .release(&self.record.runtime.id)?;
             self.held = false;
             self.record.resources_held = false;
         }
@@ -148,7 +147,7 @@ impl Controller {
         )? {
             return self.replay_or_sync().await;
         }
-        if self.record.state != InstanceState::Running {
+        if self.record.state != CapsuleState::Running {
             return Err(Error::Conflict);
         }
         if request.ttl_seconds == 0
@@ -169,7 +168,7 @@ impl Controller {
             .ok_or_else(|| Error::Invalid("checkpoint storage is not configured".into()))?;
         self.services
             .runtime
-            .checkpoint_supported(&self.record.spec.runtime)
+            .checkpoint_supported(&self.record.spec.runtime_class)
             .await?;
         let staged = services.store.allocate().await?;
         // Preparation errors can be ambiguous: abort is valid only before the backend call.
@@ -227,7 +226,7 @@ impl Controller {
             .services
             .runtime
             .checkpoint(
-                &self.record.runtime_id,
+                &self.record.runtime.id,
                 &staged,
                 Duration::from_secs(request.timeout_seconds),
             )
@@ -245,14 +244,14 @@ impl Controller {
         // Checkpoint success confirms the artifact, not completion of the backend's
         // asynchronous exit notification. Idempotent remove is the stop barrier.
         // Source deletion must be confirmed before releasing local resources.
-        if let Err(error) = self.services.runtime.remove(&self.record.runtime_id).await {
+        if let Err(error) = self.services.runtime.remove(&self.record.runtime.id).await {
             self.transition(Event::Fail)?;
             self.sync().await?;
             return Err(error);
         }
         self.recovery_files = None;
         self.release_capacity()?;
-        self.record.runtime_ip = None;
+        self.record.runtime.ip = None;
         let artifact = match services.store.publish(&staged).await {
             Ok(artifact) => artifact,
             Err(error) => {
@@ -274,7 +273,7 @@ impl Controller {
                     id: request.operation_id.clone(),
                     artifact,
                     expires_at_unix_seconds: expires_at,
-                    source_runtime_id: self.record.runtime_id.clone(),
+                    source_runtime_id: self.record.runtime.id.clone(),
                 });
                 self.transition(Event::Checkpointed)?;
                 let artifact = &self
@@ -288,7 +287,7 @@ impl Controller {
                 if self.held {
                     self.recovery_files = Some(path);
                 }
-                if rollback.is_err() && self.record.state != InstanceState::Failed {
+                if rollback.is_err() && self.record.state != CapsuleState::Failed {
                     self.transition(Event::Fail)?;
                 }
                 self.sync().await?;
@@ -304,7 +303,7 @@ impl Controller {
             id: request.operation_id.clone(),
             artifact,
             expires_at_unix_seconds: expires_at,
-            source_runtime_id: self.record.runtime_id.clone(),
+            source_runtime_id: self.record.runtime.id.clone(),
         });
         self.transition(Event::Checkpointed)?;
         self.completed(
@@ -325,17 +324,17 @@ impl Controller {
             .lock()
             .expect("shared state lock poisoned")
             .reserve(&runtime_id, &self.record.spec, &self.record.assignment)?;
-        self.record.runtime_id = runtime_id;
+        self.record.runtime.id = runtime_id;
         self.held = true;
         self.record.resources_held = true;
         self.transition(Event::Resume)?;
         let attempt = async {
-            self.record.runtime_ip = Some(
+            self.record.runtime.ip = Some(
                 self.services
                     .runtime
                     .restore_from(
                         &self.record.spec,
-                        &self.record.runtime_id,
+                        &self.record.runtime.id,
                         self.record.assignment.generation,
                         &self.record.assignment.devices,
                         path,
@@ -353,7 +352,7 @@ impl Controller {
         if let Err(error) = attempt {
             match self.cleanup().await {
                 Ok(()) => {
-                    self.record.runtime_ip = None;
+                    self.record.runtime.ip = None;
                     self.transition(Event::Rollback)?;
                 }
                 Err(cleanup) => {
@@ -371,7 +370,7 @@ impl Controller {
     pub(super) async fn recover(&mut self, request: ResumeRequest) -> Result<OperationResult> {
         if matches!(
             self.record.state,
-            InstanceState::Failed | InstanceState::Deleted
+            CapsuleState::Failed | CapsuleState::Deleted
         ) {
             return self.replay_or_sync().await;
         }
@@ -380,7 +379,7 @@ impl Controller {
             // Paused plus no local reservation proves this attempt did not leave
             // an execution. A Running result whose publication failed is retried
             // through the operation record, never by starting another runtime.
-            if self.record.state == InstanceState::Paused
+            if self.record.state == CapsuleState::Paused
                 && !self.held
                 && !self.record.resources_held
             {
@@ -399,7 +398,7 @@ impl Controller {
         )? {
             return self.replay_or_sync().await;
         }
-        if self.record.state != InstanceState::Paused {
+        if self.record.state != CapsuleState::Paused {
             return Err(Error::Conflict);
         }
         let cp = self.record.checkpoint.clone().ok_or(Error::Conflict)?;

@@ -95,14 +95,14 @@ class AcceptanceGateTests(unittest.TestCase):
         output = json.dumps({
             'status': 'passed',
             'cases': [
-                {'name': 'instance affinity OR', 'passed': True},
+                {'name': 'capsule affinity OR', 'passed': True},
                 {'name': 'reverse instance anti-affinity', 'passed': True},
             ],
         })
         self.assertEqual(
             driver.sdk_subcases_from_output(output),
             [
-                {'id': 'instance affinity OR', 'status': 'passed', 'seconds': 0.0},
+                {'id': 'capsule affinity OR', 'status': 'passed', 'seconds': 0.0},
                 {'id': 'reverse instance anti-affinity', 'status': 'passed', 'seconds': 0.0},
             ],
         )

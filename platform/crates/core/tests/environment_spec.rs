@@ -1,4 +1,4 @@
-use adx_core::environment::{Bootstrap, Rootfs, RuntimeEnvironment};
+use adx_core::environment::{Bootstrap, EnvironmentSpec, Rootfs};
 
 fn environment(
     rootfs_type: &str,
@@ -7,10 +7,10 @@ fn environment(
     bootstrap_type: &str,
     root: &str,
     bootstrap_image: &str,
-) -> RuntimeEnvironment {
-    RuntimeEnvironment {
+) -> EnvironmentSpec {
+    EnvironmentSpec {
         rootfs: Rootfs {
-            runtime: "runc".into(),
+            runtime_class: "runc".into(),
             r#type: rootfs_type.into(),
             path: path.into(),
             image: rootfs_image.into(),

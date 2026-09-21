@@ -92,7 +92,7 @@ try:
    (E/'snapshots-final.json').write_text(json.dumps(snapshots,indent=2)); return True
   return False
  wait(snapshots_collected)
- saved={k:json.loads(v) for k,v in catalog().items() if k.startswith('instance:')}
+ saved={k:json.loads(v) for k,v in catalog().items() if k.startswith('capsule:')}
  (E/'catalog-final.json').write_text(json.dumps(saved,indent=2))
  assert saved and all(i['result']['state']=='Deleted' and not i['result']['resources_held'] for i in saved.values()),saved
  inventory=run(['sbox','-a',RUN/'sandboxd/sandboxd.sock','list'])

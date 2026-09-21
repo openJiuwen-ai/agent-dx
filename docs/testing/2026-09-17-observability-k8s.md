@@ -31,7 +31,7 @@ JUnit含清理共8项，无失败、错误、跳过；`cleanup_errors=[]`、`mis
 | 后端503期间公共SDK生命周期 | PASS | PASS |
 | 采集载荷无测试凭证 | PASS | PASS |
 
-完整创建Trace包含Edge、Sandbox API、Master、Node Manager、实例队列/执行及状态提交。父子校验以Trace ID与Span ID联合索引进行；数据路径验证RRT收到远端上下文。创建、执行和删除分别属于各自请求Trace，以Instance ID关联。
+完整创建Trace包含Edge、Sandbox API、Master、Node Manager、实例队列/执行及状态提交。父子校验以Trace ID与Span ID联合索引进行；数据路径验证RRT收到远端上下文。创建、执行和删除分别属于各自请求Trace，以Capsule ID关联。
 
 原有资源与Gateway指标、日志滚动压缩同时通过：allocated/queued/released三个时点的Running、预留CPU毫核、排队数量分别为(2,4000,0)、(2,4000,1)、(0,0,0)，Master及两节点账本一致。两个节点均验证gzip归档及日志I/O健康状态。
 

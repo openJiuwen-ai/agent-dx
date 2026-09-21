@@ -1,16 +1,16 @@
 use adx_core::{
     snapshots::{Reference, Snapshot},
-    CheckpointArtifact, InstanceSpec, Resources,
+    CapsuleSpec, CheckpointArtifact, Resources,
 };
 #[test]
 fn snapshot_wire_preserves_template_and_durable_references() {
-    let spec = InstanceSpec {
-        runtime_environment: None,
+    let spec = CapsuleSpec {
+        environment: None,
         snapshot_id: None,
         id: "source".into(),
         tenant_id: "tenant".into(),
         image: "image".into(),
-        runtime: "firecracker".into(),
+        runtime_class: "firecracker".into(),
         resources: Resources {
             cpu_millis: 100,
             memory_bytes: 128,

@@ -48,9 +48,9 @@
     "interval_seconds": 300,
     "max_artifacts": 100
   },
-  "runtime_environment": {
+  "environment": {
     "rootfs": {
-      "runtime": "runsc",
+      "runtime_class": "runsc",
       "type": "local",
       "path": "/opt/adx/runtime/adx-runtime-rootfs.img",
       "readonly": false

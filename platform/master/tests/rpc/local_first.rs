@@ -53,7 +53,7 @@ impl Rig {
                     .add_service(pb::master_service_server::MasterServiceServer::new(service))
                     .add_service(pb::auth_service_server::AuthServiceServer::new(auth))
                     .add_service(
-                        pb::instance_directory_service_server::InstanceDirectoryServiceServer::new(
+                        pb::capsule_directory_service_server::CapsuleDirectoryServiceServer::new(
                             publication,
                         ),
                     )
@@ -152,17 +152,17 @@ impl Rig {
             address: ma,
         }
     }
-    fn request(id: &str, index: usize) -> pb::LocalCreateRequest {
-        pb::LocalCreateRequest {
+    fn request(id: &str, index: usize) -> pb::LocalCapsuleCreateRequest {
+        pb::LocalCapsuleCreateRequest {
             create: Some(create(id)),
             node_session_id: format!("boot-{}", if index == 0 { "a" } else { "b" }),
         }
     }
-    async fn delete(&mut self, record: &pb::InstanceRecord) {
+    async fn delete(&mut self, record: &pb::CapsuleRecord) {
         let owner = record.assignment.as_ref().unwrap();
         let index = usize::from(owner.node_id == "b");
         self.nodes[index]
-            .delete_instance(pb::DeleteInstanceRequest {
+            .delete_capsule(pb::DeleteCapsuleRequest {
                 assignment: Some(owner.clone()),
                 caller: caller(),
             })
@@ -173,12 +173,12 @@ impl Rig {
 
 #[tokio::test]
 #[ignore = "requires real Redis and generated mTLS certificates"]
-async fn instance_directory_streams_full_then_incremental_ownership() {
+async fn capsule_directory_streams_full_then_incremental_ownership() {
     let mut rig = Rig::new().await;
-    let mut directory = pb::instance_directory_service_client::InstanceDirectoryServiceClient::new(
+    let mut directory = pb::capsule_directory_service_client::CapsuleDirectoryServiceClient::new(
         channel(rig.address, "api-server").await,
     )
-    .watch_instances(pb::WatchInstancesRequest {})
+    .watch_capsules(pb::WatchCapsulesRequest {})
     .await
     .unwrap()
     .into_inner();
@@ -189,7 +189,7 @@ async fn instance_directory_streams_full_then_incremental_ownership() {
     let mut revision = full.revision;
 
     let created = rig.nodes[0]
-        .create_local_instance(Rig::request("directory-case", 0))
+        .create_local_capsule(Rig::request("directory-case", 0))
         .await
         .unwrap()
         .into_inner()
@@ -236,7 +236,7 @@ async fn instance_directory_streams_full_then_incremental_ownership() {
             revision = frame.revision;
             if let Some(entry) = frame.upserts.iter().find(|entry| {
                 entry.record.as_ref().is_some_and(|record| {
-                    record.state == pb::InstanceState::Deleted as i32
+                    record.state == pb::CapsuleState::Deleted as i32
                         && record
                             .spec
                             .as_ref()
@@ -250,13 +250,13 @@ async fn instance_directory_streams_full_then_incremental_ownership() {
     .await
     .unwrap();
     let terminal = terminal.record.unwrap();
-    assert_eq!(terminal.state, pb::InstanceState::Deleted as i32);
+    assert_eq!(terminal.state, pb::CapsuleState::Deleted as i32);
     assert!(!terminal.resources_held);
 
-    let error = pb::instance_directory_service_client::InstanceDirectoryServiceClient::new(
+    let error = pb::capsule_directory_service_client::CapsuleDirectoryServiceClient::new(
         channel(rig.address, "node").await,
     )
-    .watch_instances(pb::WatchInstancesRequest {})
+    .watch_capsules(pb::WatchCapsulesRequest {})
     .await
     .unwrap_err();
     assert_eq!(error.code(), tonic::Code::PermissionDenied);
@@ -269,8 +269,8 @@ async fn concurrent_local_entries_converge_and_fallback_preserves_both_ledgers()
     let mut a = rig.nodes[0].clone();
     let mut b = rig.nodes[1].clone();
     let (one, two) = tokio::join!(
-        a.create_local_instance(Rig::request("same", 0)),
-        b.create_local_instance(Rig::request("same", 1))
+        a.create_local_capsule(Rig::request("same", 0)),
+        b.create_local_capsule(Rig::request("same", 1))
     );
     let one = one.unwrap().into_inner();
     assert_eq!(one, two.unwrap().into_inner());
@@ -289,9 +289,9 @@ async fn concurrent_local_entries_converge_and_fallback_preserves_both_ledgers()
             .sum::<u64>(),
         100
     );
-    assert_eq!(rig.session.snapshot().await.unwrap().instances.len(), 1);
+    assert_eq!(rig.session.snapshot().await.unwrap().capsules.len(), 1);
     let replay = a
-        .create_local_instance(Rig::request("same", 0))
+        .create_local_capsule(Rig::request("same", 0))
         .await
         .unwrap()
         .into_inner();
@@ -305,7 +305,7 @@ async fn concurrent_local_entries_converge_and_fallback_preserves_both_ledgers()
         .as_mut()
         .unwrap()
         .image = "different".into();
-    assert!(b.create_local_instance(changed).await.is_err());
+    assert!(b.create_local_capsule(changed).await.is_err());
     assert_eq!(
         rig.managers
             .iter()
@@ -316,7 +316,7 @@ async fn concurrent_local_entries_converge_and_fallback_preserves_both_ledgers()
     // Full local node forwards to the center; center sees the confirmed first hold.
     let index = usize::from(record.assignment.as_ref().unwrap().node_id == "b");
     let second = rig.nodes[index]
-        .create_local_instance(Rig::request("fallback", index))
+        .create_local_capsule(Rig::request("fallback", index))
         .await
         .unwrap()
         .into_inner()
@@ -363,7 +363,7 @@ async fn concurrent_local_entries_converge_and_fallback_preserves_both_ledgers()
         ..Default::default()
     });
     let third = a
-        .create_local_instance(placed)
+        .create_local_capsule(placed)
         .await
         .unwrap()
         .into_inner()
@@ -374,8 +374,8 @@ async fn concurrent_local_entries_converge_and_fallback_preserves_both_ledgers()
     rig.delete(&third).await;
     let mut center = rig.master.clone();
     let (central, local) = tokio::join!(
-        center.create_instance(create("mixed")),
-        a.create_local_instance(Rig::request("mixed", 0))
+        center.create_capsule(create("mixed")),
+        a.create_local_capsule(Rig::request("mixed", 0))
     );
     let central = central.unwrap().into_inner();
     assert_eq!(central, local.unwrap().into_inner());
@@ -393,7 +393,7 @@ async fn concurrent_local_entries_converge_and_fallback_preserves_both_ledgers()
 #[ignore = "requires real Redis and generated mTLS certificates"]
 async fn claim_rpc_auth_session_directory_and_real_delayed_redis_write() {
     let mut rig = Rig::new().await;
-    let claim = pb::ClaimInstanceRequest {
+    let claim = pb::ClaimCapsuleRequest {
         spec: Some(spec("delayed").into()),
         caller: caller(),
         node_session_id: "boot-a".into(),
@@ -401,7 +401,7 @@ async fn claim_rpc_auth_session_directory_and_real_delayed_redis_write() {
     };
     assert_eq!(
         rig.master
-            .claim_instance(claim.clone())
+            .claim_capsule(claim.clone())
             .await
             .unwrap_err()
             .code(),
@@ -409,12 +409,12 @@ async fn claim_rpc_auth_session_directory_and_real_delayed_redis_write() {
     );
     let mut stale = claim.clone();
     stale.node_session_id = "old".into();
-    assert!(rig.claimants[0].claim_instance(stale).await.is_err());
+    assert!(rig.claimants[0].claim_capsule(stale).await.is_err());
     let mut forged = claim.clone();
     forged.caller.as_mut().unwrap().tenant_id = "other".into();
     assert_eq!(
         rig.claimants[0]
-            .claim_instance(forged)
+            .claim_capsule(forged)
             .await
             .unwrap_err()
             .code(),
@@ -452,7 +452,7 @@ async fn claim_rpc_auth_session_directory_and_real_delayed_redis_write() {
         .await
         .unwrap();
     let result = rig.nodes[0]
-        .create_local_instance(Rig::request("delayed", 0))
+        .create_local_capsule(Rig::request("delayed", 0))
         .await
         .unwrap()
         .into_inner()
@@ -496,7 +496,7 @@ async fn abandoned_unknown_claim_is_retried_and_shared_hold_converges() {
         .await
         .unwrap();
     let error = rig.nodes[0]
-        .create_local_instance(Rig::request("abandoned", 0))
+        .create_local_capsule(Rig::request("abandoned", 0))
         .await
         .unwrap_err();
     assert_eq!(error.code(), tonic::Code::Unavailable);
@@ -511,13 +511,13 @@ async fn abandoned_unknown_claim_is_retried_and_shared_hold_converges() {
     assert_eq!(stored.assignment.generation, 1);
     assert_eq!(
         stored.result.as_ref().unwrap().state,
-        adx_core::InstanceState::Running
+        adx_core::CapsuleState::Running
     );
     let mut one = rig.nodes[0].clone();
     let mut two = rig.nodes[0].clone();
     let (one, two) = tokio::join!(
-        one.create_local_instance(Rig::request("abandoned", 0)),
-        two.create_local_instance(Rig::request("abandoned", 0))
+        one.create_local_capsule(Rig::request("abandoned", 0)),
+        two.create_local_capsule(Rig::request("abandoned", 0))
     );
     assert_eq!(one.unwrap().into_inner(), two.unwrap().into_inner());
     assert_eq!(rig.backends[0].started.load(Ordering::SeqCst), 1);
@@ -540,7 +540,7 @@ async fn central_assignment_waits_for_unconfirmed_local_capacity_without_reassig
         ..Default::default()
     });
     let mut master = rig.master.clone();
-    let task = tokio::spawn(async move { master.create_instance(request).await });
+    let task = tokio::spawn(async move { master.create_capsule(request).await });
     let assignment = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             if let Ok(record) = rig.session.get("central").await {
@@ -554,7 +554,7 @@ async fn central_assignment_waits_for_unconfirmed_local_capacity_without_reassig
     // Claim cannot fit Master's committed allocation; it releases only the local
     // token and forwards to b. The center retries a with the original generation.
     let local = rig.nodes[0]
-        .create_local_instance(Rig::request("tentative", 0))
+        .create_local_capsule(Rig::request("tentative", 0))
         .await
         .unwrap()
         .into_inner()
@@ -725,7 +725,7 @@ async fn cancelled_local_rpc_finishes_once_and_retry_reuses_the_owner() {
         .unwrap();
     let mut request = Request::new(Rig::request("cancelled", 0));
     request.set_timeout(Duration::from_millis(40));
-    assert!(rig.nodes[0].create_local_instance(request).await.is_err());
+    assert!(rig.nodes[0].create_local_capsule(request).await.is_err());
     let record = tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             if let Ok(stored) = rig.session.get("cancelled").await {
@@ -739,13 +739,13 @@ async fn cancelled_local_rpc_finishes_once_and_retry_reuses_the_owner() {
     .await
     .unwrap();
     let retry = rig.nodes[1]
-        .create_local_instance(Rig::request("cancelled", 1))
+        .create_local_capsule(Rig::request("cancelled", 1))
         .await
         .unwrap()
         .into_inner()
         .record
         .unwrap();
-    let original: pb::InstanceRecord = record.try_into().unwrap();
+    let original: pb::CapsuleRecord = record.try_into().unwrap();
     assert_eq!(retry, original);
     assert_eq!(
         rig.backends
@@ -763,16 +763,16 @@ async fn cancelled_local_rpc_finishes_once_and_retry_reuses_the_owner() {
 async fn existing_terminal_claim_reconciles_a_late_commit_into_scheduler_accounting() {
     let mut rig = Rig::new().await;
     let running = rig.nodes[0]
-        .create_local_instance(Rig::request("late-delete", 0))
+        .create_local_capsule(Rig::request("late-delete", 0))
         .await
         .unwrap()
         .into_inner()
         .record
         .unwrap();
-    let mut terminal: InstanceRecord = running.clone().try_into().unwrap();
-    terminal.state = adx_core::InstanceState::Deleted;
+    let mut terminal: CapsuleRecord = running.clone().try_into().unwrap();
+    terminal.state = adx_core::CapsuleState::Deleted;
     terminal.resources_held = false;
-    terminal.runtime_ip = None;
+    terminal.runtime.ip = None;
     terminal.revision += 2;
     let mut control = redis::Client::open(rig._redis.url.as_str())
         .unwrap()
@@ -787,7 +787,7 @@ async fn existing_terminal_claim_reconciles_a_late_commit_into_scheduler_account
         .await
         .unwrap();
     assert!(rig.nodes[0]
-        .delete_instance(pb::DeleteInstanceRequest {
+        .delete_capsule(pb::DeleteCapsuleRequest {
             assignment: running.assignment,
             caller: caller(),
         })
@@ -807,10 +807,10 @@ async fn existing_terminal_claim_reconciles_a_late_commit_into_scheduler_account
             .result
             .unwrap()
             .state,
-        adx_core::InstanceState::Deleted
+        adx_core::CapsuleState::Deleted
     );
     assert!(rig.nodes[1]
-        .create_local_instance(Rig::request("late-delete", 1))
+        .create_local_capsule(Rig::request("late-delete", 1))
         .await
         .is_err());
     assert!(rig

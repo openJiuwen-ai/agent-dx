@@ -1,6 +1,6 @@
-//! Explicit stop deletes locally owned Instances before their dependencies stop.
+//! Explicit stop deletes locally owned Capsules before their dependencies stop.
 use crate::{Durability, NodeManager};
-use adx_core::{Error, InstanceState, Result};
+use adx_core::{CapsuleState, Error, Result};
 use adx_protocol::node_proxy as pb;
 use std::{
     os::unix::fs::{FileTypeExt, PermissionsExt},
@@ -32,7 +32,7 @@ impl NodeManager {
         self.set_maintenance(true);
         *ready = false;
         let handles: Vec<_> = self
-            .instances
+            .capsules
             .lock()
             .expect("shared state lock poisoned")
             .values()
@@ -41,7 +41,7 @@ impl NodeManager {
         let count = handles.len();
         for h in handles {
             let r = h.delete().await?;
-            if r.record.state != InstanceState::Deleted
+            if r.record.state != CapsuleState::Deleted
                 || r.record.resources_held
                 || r.durability != Durability::Published
             {
@@ -62,7 +62,7 @@ impl pb::node_admin_service_server::NodeAdminService for NodeAdmin {
     ) -> std::result::Result<tonic::Response<pb::DrainResponse>, tonic::Status> {
         let count = self.0.drain().await.map_err(adx_protocol::status)?;
         Ok(tonic::Response::new(pb::DrainResponse {
-            deleted_instances: count as u64,
+            deleted_capsules: count as u64,
         }))
     }
 }

@@ -31,7 +31,7 @@ pub type Body = UnsyncBoxBody<Bytes, Error>;
 type CreateKey = (String, String);
 struct CreateOperation {
     digest: Vec<u8>,
-    spec: pb::InstanceSpec,
+    spec: pb::CapsuleSpec,
     result: Option<Result<Value, Status>>,
     touched: Instant,
 }
@@ -198,14 +198,14 @@ impl Api {
                 Ok(owner) => {
                     let Some(record) = owner.record else {
                         return error_response(
-                            Status::unavailable("instance directory returned no record"),
+                            Status::unavailable("capsule directory returned no record"),
                             &request_id,
                             None,
                             Some(instance_id),
                             false,
                         );
                     };
-                    if record.state == pb::InstanceState::Deleted as i32 {
+                    if record.state == pb::CapsuleState::Deleted as i32 {
                         return error_response(
                             Status::not_found("instance not found"),
                             &request_id,
@@ -216,7 +216,7 @@ impl Api {
                     }
                     let Some(spec) = record.spec else {
                         return error_response(
-                            Status::data_loss("instance record returned no spec"),
+                            Status::data_loss("capsule record returned no spec"),
                             &request_id,
                             None,
                             Some(instance_id),
@@ -258,7 +258,7 @@ impl Api {
             let spec = match contract::create_spec_with_environment(
                 input.clone(),
                 &caller,
-                self.clients.config.runtime_environment.as_ref(),
+                self.clients.config.environment.as_ref(),
             ) {
                 Ok(s) => s,
                 Err(error) => return error_response(error, &request_id, None, None, false),
@@ -374,7 +374,7 @@ impl Api {
 
     fn create_stream(
         self: Arc<Self>,
-        spec: pb::InstanceSpec,
+        spec: pb::CapsuleSpec,
         input: Value,
         request_id: String,
         caller: pb::CallerContext,
@@ -438,7 +438,7 @@ impl Api {
 
     async fn create(
         &self,
-        spec: pb::InstanceSpec,
+        spec: pb::CapsuleSpec,
         input: Value,
         request_id: &str,
         caller: &pb::CallerContext,
@@ -490,7 +490,7 @@ impl Api {
                 if existing != &create_key
                     && self.clients.config.create_mode == crate::config::CreateMode::Central
                 {
-                    return Err(Status::already_exists("instance create in progress"));
+                    return Err(Status::already_exists("capsule create in progress"));
                 }
             }
             names.insert(operation.spec.id.clone(), create_key.clone());
@@ -512,14 +512,14 @@ impl Api {
 
     async fn perform_create(
         &self,
-        spec: &pb::InstanceSpec,
+        spec: &pb::CapsuleSpec,
         input: &Value,
         request_id: &str,
         caller: &pb::CallerContext,
     ) -> Result<Value, Status> {
         if self.clients.config.create_mode == crate::config::CreateMode::Central {
             match self.clients.owner(&spec.id, caller, false).await {
-                Ok(_) => return Err(Status::already_exists("instance already exists")),
+                Ok(_) => return Err(Status::already_exists("capsule already exists")),
                 Err(error) if error.code() == Code::NotFound => {}
                 Err(error) => return Err(error),
             }
@@ -529,8 +529,8 @@ impl Api {
         let budget = Duration::from_secs(timeouts.create_seconds);
         let result = self
             .clients
-            .create_instance(
-                pb::CreateInstanceRequest {
+            .create_capsule(
+                pb::CreateCapsuleRequest {
                     spec: Some(spec.clone()),
                     caller: Some(caller.clone()),
                     schedule_timeout_seconds: timeouts.schedule_seconds,
@@ -542,12 +542,12 @@ impl Api {
         authorize(caller, result.record.as_ref())?;
         let record = result
             .record
-            .ok_or_else(|| Status::unavailable("create returned no instance record"))?;
+            .ok_or_else(|| Status::unavailable("create returned no capsule record"))?;
         let confirmed_spec = record
             .spec
             .as_ref()
-            .ok_or_else(|| Status::unavailable("create returned no instance spec"))?;
-        if record.state != pb::InstanceState::Running as i32
+            .ok_or_else(|| Status::unavailable("create returned no capsule spec"))?;
+        if record.state != pb::CapsuleState::Running as i32
             || result.durability != pb::Durability::Published as i32
             || !matches_spec(spec, confirmed_spec)
         {
@@ -797,17 +797,17 @@ fn trace_identifiers(context: &str) -> (&str, &str) {
     (trace_id, span_id)
 }
 
-fn matches_spec(want: &pb::InstanceSpec, got: &pb::InstanceSpec) -> bool {
+fn matches_spec(want: &pb::CapsuleSpec, got: &pb::CapsuleSpec) -> bool {
     if want.snapshot_id.is_none() {
         return want == got;
     }
     want.id == got.id
         && want.tenant_id == got.tenant_id
         && want.snapshot_id == got.snapshot_id
-        && (!got.image.is_empty() || got.runtime_environment.is_some())
-        && !got.runtime.is_empty()
+        && (!got.image.is_empty() || got.environment.is_some())
+        && !got.runtime_class.is_empty()
         && (want.image.is_empty() || want.image == got.image)
-        && (want.runtime.is_empty() || want.runtime == got.runtime)
+        && (want.runtime_class.is_empty() || want.runtime_class == got.runtime_class)
         && want.resources.as_ref().is_none_or(|w| {
             got.resources.as_ref().is_some_and(|g| {
                 (w.cpu_millis == 0 || w.cpu_millis == g.cpu_millis)
@@ -973,16 +973,16 @@ fn status_code(error: &Status) -> u16 {
     }
 }
 fn state(value: i32) -> &'static str {
-    match pb::InstanceState::try_from(value) {
-        Ok(pb::InstanceState::Running) => "running",
-        Ok(pb::InstanceState::Paused) => "paused",
-        Ok(pb::InstanceState::Deleted) => "deleted",
-        Ok(pb::InstanceState::Failed) => "failed",
-        Ok(pb::InstanceState::Pending) => "pending",
-        Ok(pb::InstanceState::Starting) => "starting",
-        Ok(pb::InstanceState::Pausing) => "pausing",
-        Ok(pb::InstanceState::Resuming) => "resuming",
-        Ok(pb::InstanceState::Deleting) => "deleting",
+    match pb::CapsuleState::try_from(value) {
+        Ok(pb::CapsuleState::Running) => "running",
+        Ok(pb::CapsuleState::Paused) => "paused",
+        Ok(pb::CapsuleState::Deleted) => "deleted",
+        Ok(pb::CapsuleState::Failed) => "failed",
+        Ok(pb::CapsuleState::Pending) => "pending",
+        Ok(pb::CapsuleState::Starting) => "starting",
+        Ok(pb::CapsuleState::Pausing) => "pausing",
+        Ok(pb::CapsuleState::Resuming) => "resuming",
+        Ok(pb::CapsuleState::Deleting) => "deleting",
         _ => "unknown",
     }
 }

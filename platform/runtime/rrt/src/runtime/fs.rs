@@ -1,4 +1,4 @@
-//! Rust implementation of akernel `fs_*` methods. Return dicts strictly match `akernel_sdk/instance.py` and always include `error`.
+//! Rust implementation of akernel `fs_*` methods. Return dicts strictly match `akernel_sdk/capsule.py` and always include `error`.
 
 use super::codec::{kw_str, map_value};
 use rmpv::Value;

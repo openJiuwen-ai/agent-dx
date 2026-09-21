@@ -1,17 +1,17 @@
-use adx_core::{scheduling::*, InstanceSpec, Resources};
-use adx_scheduling::{PlacedInstance, Snapshot};
-fn placed(id: &str, tenant: &str, labels: &[(&str, &str)]) -> PlacedInstance {
-    PlacedInstance {
+use adx_core::{scheduling::*, CapsuleSpec, Resources};
+use adx_scheduling::{PlacedCapsule, Snapshot};
+fn placed(id: &str, tenant: &str, labels: &[(&str, &str)]) -> PlacedCapsule {
+    PlacedCapsule {
         node_id: "n".into(),
-        spec: InstanceSpec {
-            runtime_environment: None,
+        spec: CapsuleSpec {
+            environment: None,
             snapshot_id: None,
             lifecycle: Default::default(),
             env: Default::default(),
             id: id.into(),
             tenant_id: tenant.into(),
             image: "i".into(),
-            runtime: "r".into(),
+            runtime_class: "r".into(),
             priority: 0,
             resources: Resources {
                 cpu_millis: 1,
@@ -70,7 +70,7 @@ fn indexes_match_full_scan_across_replacement_release_and_negative_selectors() {
                     .map(|p| p.spec.id.clone())
                     .collect();
                 let scan: Vec<_> = snapshot
-                    .instances()
+                    .capsules()
                     .values()
                     .filter(|p| {
                         p.spec.tenant_id == tenant && selector.matches(&p.spec.scheduling.labels)
@@ -81,6 +81,6 @@ fn indexes_match_full_scan_across_replacement_release_and_negative_selectors() {
             }
         }
     }
-    assert_eq!(old.instances().len(), 200);
-    assert_eq!(s.instances().len(), 100);
+    assert_eq!(old.capsules().len(), 200);
+    assert_eq!(s.capsules().len(), 100);
 }

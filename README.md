@@ -2,52 +2,55 @@
 
 # Agent DX
 
-Agent DX is an execution platform for agents and isolated Instances. It provides a public Sandbox API and SDK, distributed scheduling, node-local lifecycle management, shared traffic entrypoints, runtime operations, checkpoint recovery, and deployment tooling in one repository.
+Agent DX is an execution platform for agents and isolated Capsules. It provides a public Sandbox API and SDK, distributed scheduling, node-local lifecycle management, shared traffic entrypoints, runtime operations, checkpoint recovery, and deployment tooling in one repository.
 
 ![Agent DX architecture](docs/architecture/images/agent-dx.svg)
 
 ## Architecture
 
-Agent applications use the public Sandbox SDK to create and operate Instances. Gateway terminates external traffic and separates control requests from data requests. API Server authenticates callers and serves the Sandbox HTTP API. Master owns cluster state, scheduling, node health, route publication, credentials, and snapshot metadata. Node Manager performs final local admission and serializes the lifecycle of every Instance. Node Proxy forwards data traffic to RRT inside the selected Instance.
+Agent applications use the public Sandbox SDK to create and operate Capsules. Gateway terminates external traffic and separates control requests from data requests. API Server authenticates callers and serves the Sandbox HTTP API. Master owns cluster state, scheduling, node health, route publication, credentials, and snapshot metadata. Node Manager performs final local admission and serializes the lifecycle of every Capsule. Node Proxy forwards data traffic to RRT inside the selected Runtime.
 
 Redis is the authoritative cluster store and discovery backend. Node Manager uses a local SQLite journal only when cluster-state submission is temporarily unavailable. sandboxd is managed by the deployment environment and provides the execution backend. API Server embeds Edge by default, and Node Manager embeds Node Proxy by default; both pairs retain an explicit split-process deployment.
 
 ## Core abstractions
 
-ADX uses **Instance** as the internal managed execution unit. **Sandbox** is the public API and SDK facade. Agent Distributed Executor sits above the platform and consumes Instance capabilities through the Sandbox SDK; it does not participate in platform scheduling or lifecycle state machines.
+ADX separates the stable logical unit from its replaceable execution. **Capsule** is the internal managed identity, while **Runtime** is one concrete execution of that Capsule on a node. **Sandbox** remains the public API and SDK facade. Agent Distributed Executor sits above the platform and consumes Capsule capabilities through the Sandbox SDK; it does not participate in platform scheduling or lifecycle state machines.
 
 | Abstraction | Layer | Meaning and boundary |
 |---|---|---|
 | `Agent` / `Session` | Agent | Agent tasks, sessions, affinity, and execution orchestration; accesses the platform only through the public Sandbox SDK |
-| `Sandbox` | Public API | The user's API/SDK handle; one creation maps to one Instance and is not an internal scheduling object |
-| `Instance` | Control plane | Stable internal identity with tenant, specification, and desired/observed state; create, pause, resume, and delete converge around it |
-| `Assignment` | Scheduler | Authoritative Instance ownership, including node, devices, and `generation`; a newer generation fences late execution from an older owner |
+| `Sandbox` | Public API | The user's API/SDK handle; one creation maps to one Capsule and is not an internal scheduling object |
+| `Capsule` | Control plane | Stable internal identity with tenant, specification, and desired/observed state; create, pause, resume, and delete converge around it |
+| `Runtime` | Node execution | One concrete sandboxd execution, identified by `runtime_id` and an optional IP; restart, resume, reload, or cross-node recovery may replace it while retaining the Capsule ID |
+| `Assignment` | Scheduler | Authoritative Capsule ownership, including node, devices, and `generation`; a newer generation fences late execution from an older owner |
 | `Shard` | Master scheduler | An in-process scheduling partition. Global selection rotates across Shards; each Shard owns queueing, Filter/Score, and node selection |
 | `Node` | Node layer | One Node Manager registration session with capacity, devices, and health; Node Manager performs final local admission |
-| `Runtime Environment` | Execution | How RRT, the bootstrap command, and local EROFS/OCI runtime content enter an Instance; sandboxd is the current execution backend |
-| `Route` / `Binding` | Data plane | Master publishes versioned Instance ownership, Edge caches it, and Node Proxy rechecks the local binding before forwarding |
-| `Restore Point` / `Snapshot` | Recovery | A pause restore point retains the Instance ID; a reusable Snapshot creates a new Instance and stores bytes locally or in object storage |
+| `EnvironmentSpec` | Execution | How RRT, the bootstrap command, and local EROFS/OCI content enter a Capsule; `runtime_class` selects the sandboxd runtime driver |
+| `Route` / `Binding` | Data plane | Master publishes versioned Capsule ownership, Edge caches it, and Node Proxy rechecks the local binding before forwarding |
+| `Restore Point` / `Snapshot` | Recovery | A pause restore point retains the Capsule ID; a reusable Snapshot creates a new Capsule and stores bytes locally or in object storage |
 | `Request ID` / `Operation ID` | Reliability | Identifies one logical write for retry, deduplication, result lookup, and reconciliation; a timeout does not automatically mean failure |
 
-The fixed layering is: Agent/application → Sandbox SDK/HTTP API → API Server → Master/ShardScheduler or local-first Node Manager → sandboxd. Runtime traffic follows Edge → Node Proxy → RRT inside the Instance and does not enter control-plane lifecycle queues.
+The fixed layering is: Agent/application → Sandbox SDK/HTTP API → API Server → Master/ShardScheduler or local-first Node Manager → sandboxd. Runtime traffic follows Edge → Node Proxy → RRT inside the current Runtime and does not enter control-plane lifecycle queues.
+
+The compatibility HTTP and SDK contracts still expose names such as `instanceId`, `instance_id`, and `/api/instances`. API Server translates them at the boundary to Capsule IDs; internal Rust types, gRPC services, persistence keys, metrics, and runtime identity use Capsule terminology.
 
 | Directory | Responsibility |
 |---|---|
 | `agent/` | Agent APIs, sessions, dispatch, and execution orchestration |
 | `crates/` | Product-wide error semantics, observability, process bootstrap, and transport support |
 | `gateway/` | Public Sandbox API Server, Edge entrypoint, Node Proxy, routing, and forwarding |
-| `gateway/api-server/` | Sandbox HTTP API, authentication, ownership cache, and Instance RPC clients; embeds Edge by default |
+| `gateway/api-server/` | Sandbox HTTP API, authentication, ownership cache, and Capsule RPC clients; embeds Edge by default |
 | `platform/master/` | Cluster state, scheduling shards, Redis persistence, routes, credentials, and snapshots |
-| `platform/node-manager/` | Local admission, Instance lifecycle, sandboxd integration, checkpoints, and outage journal |
-| `platform/runtime/rrt/` | Instance-local command, file, terminal, activity, and recovery operations |
+| `platform/node-manager/` | Local admission, Capsule lifecycle, sandboxd integration, checkpoints, and outage journal |
+| `platform/runtime/rrt/` | Capsule-local command, file, terminal, activity, and recovery operations |
 | `platform/sdk/sandbox/python/` | Public Python Sandbox SDK |
-| `platform/api/proto/` | Internal Instance, node, route, credential, and snapshot contracts |
+| `platform/api/proto/` | Internal Capsule, node, route, credential, and snapshot contracts |
 | `platform/deployment/` | `adxctl`, configuration rendering, process supervision, and shutdown cleanup |
 | `build/` and `.buildkite/` | Build, packaging, release, and end-to-end validation tooling |
 
 ## Capabilities
 
-- Instance creation, query, deletion, pause, resume, snapshots, and snapshot-based cloning.
+- Capsule creation, query, deletion, pause, resume, snapshots, and snapshot-based cloning.
 - Central and local-first creation paths with CPU, memory, disk, GPU/NPU device, label, affinity, and preference constraints.
 - API Key authentication with administrator and tenant identities; internal services use configurable mTLS.
 - Versioned route publication from Master to Edge and synchronized local bindings between Node Manager and Node Proxy.
@@ -57,7 +60,7 @@ The fixed layering is: Agent/application → Sandbox SDK/HTTP API → API Server
 
 ## Deployment
 
-The same ADX release package can start different roles by configuration. The deployment environment must provide a Linux host, separately managed sandboxd, component certificates, an initial administrator API Key, Instance networking, and an architecture-matching release installed at `/opt/adx`. `adxctl` reads one YAML file describing the **current host**, by default `/etc/adx/deployment.yaml`. It validates, renders, and supervises processes; it does not create Instances.
+The same ADX release package can start different roles by configuration. The deployment environment must provide a Linux host, separately managed sandboxd, component certificates, an initial administrator API Key, Capsule networking, and an architecture-matching release installed at `/opt/adx`. `adxctl` reads one YAML file describing the **current host**, by default `/etc/adx/deployment.yaml`. It validates, renders, and supervises processes; it does not create Capsules.
 
 ### Standalone with ADX-managed Redis
 
@@ -67,7 +70,7 @@ The default `standalone` profile starts Redis, Master, Node Manager with embedde
 sudo install -d -m 0700 /etc/adx /etc/adx/tls /etc/adx/secrets /var/lib/adx /run/adx
 sudo /opt/adx/bin/adxctl config init --profile standalone
 
-# Edit certificates, the bootstrap key, sandboxd socket, Instance CIDR, and disk paths.
+# Edit certificates, the bootstrap key, sandboxd socket, Capsule CIDR, and disk paths.
 sudo /opt/adx/bin/adxctl validate
 sudo /opt/adx/bin/adxctl render --output /run/adx/config-review
 sudo /opt/adx/bin/adxctl run
@@ -128,7 +131,7 @@ export ADX_GATEWAY_TLS=1
 export ADX_SANDBOX_IMAGE=python:3.12-slim
 ```
 
-Create an Instance, execute through RRT, and delete it explicitly:
+Create a Capsule, execute through RRT, and delete it explicitly:
 
 ```python
 import os
@@ -183,7 +186,7 @@ The Sandbox SDK distribution is `adx-sandbox`, its Python import is `adx_sandbox
 - [Checkpoint and snapshot storage](docs/testing/snapshot-storage.md)
 - [Scheduling](docs/testing/scheduling-performance.md)
 - [Route publication](docs/testing/route-publication.md)
-- [Metrics](docs/testing/instance-resource-metrics.md)
+- [Metrics](docs/testing/capsule-resource-metrics.md)
 - [Logs](docs/testing/log-collection.md)
 - [Distributed tracing](docs/testing/distributed-traces.md)
 - [Rust coding guidelines](docs/development/rust-coding-guidelines.md)

@@ -8,7 +8,7 @@
 
 Rust 输出包括时间、级别、target 和 fields；Rust API Server 输出时间、级别、event 和 HTTP 路由模板、方法、状态、耗时。Collector 将日志解析为结构化 body，并附加 `service.name`（Supervisor 服务 ID）、`adx.node.id` 和文件路径。Redis 等纯文本仍可采集，保留原文。
 
-Node Manager 的 `instance_operation_completed` 事件记录 instance_id、generation、revision 和操作返回时的状态。API 请求日志只记录路由模板，不记录 URL 查询参数、Authorization、正文和用户文件。开启Trace后，API请求日志包含Trace ID与Span ID，Node Manager操作完成日志记录traceparent；接线与采样配置见[跨组件Trace](distributed-traces.md)。
+Node Manager 的 `capsule_operation_completed` 事件记录 capsule_id、generation、revision 和操作返回时的状态。API 请求日志只记录路由模板，不记录 URL 查询参数、Authorization、正文和用户文件。开启Trace后，API请求日志包含Trace ID与Span ID，Node Manager操作完成日志记录traceparent；接线与采样配置见[跨组件Trace](distributed-traces.md)。
 
 ## 进程部署
 

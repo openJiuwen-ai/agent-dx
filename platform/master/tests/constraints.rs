@@ -1,15 +1,15 @@
-use adx_core::{scheduling::*, InstanceSpec, Resources};
+use adx_core::{scheduling::*, CapsuleSpec, Resources};
 use adx_master::{Master, Node, Placement};
-fn spec(id: &str) -> InstanceSpec {
-    InstanceSpec {
-        runtime_environment: None,
+fn spec(id: &str) -> CapsuleSpec {
+    CapsuleSpec {
+        environment: None,
         snapshot_id: None,
         lifecycle: Default::default(),
         env: Default::default(),
         id: id.into(),
         tenant_id: "t".into(),
         image: "image".into(),
-        runtime: "runsc".into(),
+        runtime_class: "runsc".into(),
         resources: Resources {
             cpu_millis: 1,
             memory_bytes: 1,
@@ -122,7 +122,7 @@ fn required_and_preferred_node_affinity_drive_selection() {
     assert_eq!(master.schedule(0).unwrap().unwrap().node_id, "b");
 }
 #[test]
-fn instance_affinity_and_reverse_anti_affinity_use_pending_reservations() {
+fn capsule_affinity_and_reverse_anti_affinity_use_pending_reservations() {
     let mut master = Master::new(1, Placement::Pack).unwrap();
     master.register(node("a", "x")).unwrap();
     master.register(node("b", "y")).unwrap();
@@ -239,7 +239,7 @@ fn affinity_defaults_to_own_tenant_and_can_target_explicit_tenants() {
     private.id = "explicit".into();
     private.scheduling.required_affinity[0].tenants = vec!["other".into()];
     master.submit(private).unwrap();
-    assert_eq!(master.schedule(0).unwrap().unwrap().instance_id, "explicit");
+    assert_eq!(master.schedule(0).unwrap().unwrap().capsule_id, "explicit");
 }
 #[test]
 fn required_anti_affinity_is_enforced_across_embedded_shards() {

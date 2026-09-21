@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package adx.control.v1;
 
-import "instance_types.proto";
+import "capsule_types.proto";
 
 service SnapshotService {
   rpc PublishSnapshot(PublishSnapshotRequest) returns (ReusableSnapshot);
@@ -20,7 +20,7 @@ enum SnapshotState {
 
 message SnapshotReference {
   oneof owner {
-    string restore_instance_id = 1;
+    string restore_capsule_id = 1;
     TemplateReference template = 2;
   }
 }
@@ -28,7 +28,7 @@ message SnapshotReference {
 message ReusableSnapshot {
   string id = 1;
   repeated string names = 2;
-  InstanceSpec template = 3;
+  CapsuleSpec template = 3;
   string source_node_id = 4;
   string source_runtime_id = 5;
   CheckpointArtifact artifact = 6;
@@ -56,6 +56,6 @@ message CreateSnapshotRequest {
   uint64 expected_revision = 4; repeated string names = 5; uint64 timeout_seconds = 6;
 }
 
-message CreateSnapshotResponse { ReusableSnapshot snapshot = 1; InstanceResult instance = 2; }
+message CreateSnapshotResponse { ReusableSnapshot snapshot = 1; CapsuleResult capsule = 2; }
 
 message TemplateReference { string node_id = 1; string template_id = 2; }

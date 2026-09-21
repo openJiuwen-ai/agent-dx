@@ -1,16 +1,16 @@
-use adx_core::{scheduling::*, InstanceSpec, Resources};
-use adx_scheduling::{Candidate, Framework, Node, PlacedInstance, Placement, Snapshot};
+use adx_core::{scheduling::*, CapsuleSpec, Resources};
+use adx_scheduling::{Candidate, Framework, Node, PlacedCapsule, Placement, Snapshot};
 use std::collections::BTreeMap;
-fn request(id: &str) -> InstanceSpec {
-    InstanceSpec {
-        runtime_environment: None,
+fn request(id: &str) -> CapsuleSpec {
+    CapsuleSpec {
+        environment: None,
         snapshot_id: None,
         lifecycle: Default::default(),
         env: Default::default(),
         id: id.into(),
         tenant_id: "t".into(),
         image: "image".into(),
-        runtime: "runsc".into(),
+        runtime_class: "runsc".into(),
         resources: Resources {
             cpu_millis: 1,
             memory_bytes: 1,
@@ -30,7 +30,7 @@ fn term(key: &str, value: &str, weight: u32) -> WeightedSelector {
         weight,
     }
 }
-fn selected(r: &InstanceSpec, s: &Snapshot) -> Option<String> {
+fn selected(r: &CapsuleSpec, s: &Snapshot) -> Option<String> {
     Framework::builtin(Placement::Spread)
         .select(
             r,
@@ -63,13 +63,13 @@ fn peer_groups_preserve_or_tenants_pending_placements_and_reverse_exclusion() {
     }
     let mut peer = request("peer");
     peer.scheduling.labels.insert("app".into(), "db".into());
-    s.place(PlacedInstance {
+    s.place(PlacedCapsule {
         spec: peer,
         node_id: "b".into(),
     });
     let mut r = request("client");
     r.scheduling.placement_groups.push(PlacementGroup {
-        target: PlacementTarget::Instance,
+        target: PlacementTarget::Capsule,
         terms: vec![term("app", "missing", 1), term("app", "db", 1)],
         required: true,
         anti: false,
@@ -81,7 +81,7 @@ fn peer_groups_preserve_or_tenants_pending_placements_and_reverse_exclusion() {
     r.tenant_id = "t".into();
     r.scheduling.placement_groups[0].anti = true;
     assert_eq!(selected(&r, &s).as_deref(), Some("a"));
-    s.place(PlacedInstance {
+    s.place(PlacedCapsule {
         spec: r,
         node_id: "a".into(),
     });

@@ -2,7 +2,7 @@
 
 实际安装和配置步骤见 [单机进程部署](../deployment/standalone.md)。本文保留 CLI 实现与早期验收记录。
 
-`platform/deployment` 中的 Rust `adxctl` 承载统一部署配置和轻量 supervisor；它不属于某个平面，配置和托管 Master/API Server、Edge/Node Proxy/Node Manager。Node Manager 仍负责本机 Instance 停止清理。统一包同时携带控制面和数据面。本文描述现有进程托管、停止契约和出包；末尾保留早期组件测试。完整 SDK 基础 K8s 已通过 [Buildkite #21](2026-09-17-observability-k8s.md)。
+`platform/deployment` 中的 Rust `adxctl` 承载统一部署配置和轻量 supervisor；它不属于某个平面，配置和托管 Master/API Server、Edge/Node Proxy/Node Manager。Node Manager 仍负责本机 Capsule 停止清理。统一包同时携带控制面和数据面。本文描述现有进程托管、停止契约和出包；末尾保留早期组件测试。完整 SDK 基础 K8s 已通过 [Buildkite #21](2026-09-17-observability-k8s.md)。
 
 ## 模块
 
@@ -11,7 +11,7 @@
 | `platform/deployment/src/cli.rs` | 类型化子命令和参数；`start` 是 `run` 的兼容别名 |
 | `platform/deployment/src/config.rs` | 部署 schema、控制面/数据面角色与公共参数校验，生成组件配置、Redis AOF 配置和 Node 管理 socket 地址 |
 | `platform/deployment/src/supervisor.rs` | 单部署文件锁、受保护的控制 UDS、子进程组、日志、有限次数重启、状态查询和停止顺序 |
-| `platform/node-manager/src/admin.rs` | 本机已管理 Instance 的停止清理；保持 Node Manager 的生命周期所有权 |
+| `platform/node-manager/src/admin.rs` | 本机已管理 Capsule 的停止清理；保持 Node Manager 的生命周期所有权 |
 | `node.proto / NodeAdminService` | 仅在本机受保护 UDS 服务的 Drain RPC，不挂到 Node TCP 服务 |
 | `build/release/build.sh` | 原生 release 构建、SDK wheel 构建、统一包组装 |
 | `build/release/package.py` | 输入制品完整性检查、Redis 版本检查、清单与 SHA256、已展开目录复核 |
@@ -45,7 +45,7 @@ adxctl stop
 2. 每个删除结果必须为 `Published` 且不占资源。Master 不可用、清理失败或只进入本地降级日志时，停止不成功，保留依赖供重试。
 3. 所有本机节点清理成功后，按相反顺序停止子进程。单个进程终止超时会被强制终止，并使这次停止返回失败。
 
-Node Manager 未完成权威对账时，不能用空内存目录宣称清理完成。清理开始后保持 draining；失败可再次执行。作用域是本机已接收并管理的 Instance，不执行远端节点排空或迁移。完整 E2E 还需覆盖停止与 Master 在途分配之间的竞争。
+Node Manager 未完成权威对账时，不能用空内存目录宣称清理完成。清理开始后保持 draining；失败可再次执行。作用域是本机已接收并管理的 Capsule，不执行远端节点排空或迁移。完整 E2E 还需覆盖停止与 Master 在途分配之间的竞争。
 
 sandboxd 始终由部署环境独立托管，角色枚举不允许 supervisor 拉起它。RRT 随包交付到 `runtime/`，须进入实际实例环境；不会被当成宿主公共服务启动。Node Proxy 和 Edge 均支持默认共进程及显式分进程，见 [Node Proxy 进程模式](node-proxy-process-modes.md)与 [Edge 进程模式](api-edge-process-modes.md)。
 

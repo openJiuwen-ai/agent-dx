@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Real Redis/Master supervision check. No Instance or platform E2E claim."""
+"""Real Redis/Master supervision check. No Capsule or platform E2E claim."""
 import argparse
 import json
 import os

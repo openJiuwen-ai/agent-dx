@@ -56,36 +56,36 @@ impl MasterRpc {
             }
         }
         let mut deleted = 0;
-        for instance in state.instances.values() {
-            if instance
+        for capsule in state.capsules.values() {
+            if capsule
                 .result
                 .as_ref()
-                .is_some_and(|r| r.state == InstanceState::Deleted)
+                .is_some_and(|r| r.state == CapsuleState::Deleted)
             {
                 deleted += 1;
                 continue;
             }
-            let name = if instance.invalidated {
+            let name = if capsule.invalidated {
                 "Invalidated".into()
-            } else if instance.recovery.as_ref().is_some_and(|r| r.pending) {
+            } else if capsule.recovery.as_ref().is_some_and(|r| r.pending) {
                 "Recovering".into()
             } else {
-                instance
+                capsule
                     .result
                     .as_ref()
                     .map_or("Reserved".into(), |r| format!("{:?}", r.state))
             };
             *counts
                 .entry((
-                    instance.assignment.shard_id,
-                    instance.assignment.node_id.clone(),
+                    capsule.assignment.shard_id,
+                    capsule.assignment.node_id.clone(),
                     name,
                 ))
                 .or_default() += 1;
         }
         for ((shard, node, state), count) in counts {
             out.gauge(
-                "adx_master_instances",
+                "adx_master_capsules",
                 &[
                     ("shard_id", shard.to_string()),
                     ("node_id", node),
@@ -94,7 +94,7 @@ impl MasterRpc {
                 count,
             );
         }
-        // Retained terminal directory entries are not live instances or an
+        // Retained terminal directory entries are not live capsules or an
         // all-time event counter: future retention cleanup can decrease this.
         out.gauge("adx_master_deleted_records", &[], deleted);
         Ok(out.finish())

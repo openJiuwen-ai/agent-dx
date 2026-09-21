@@ -1,5 +1,5 @@
 //! Reusable snapshot metadata. References are durable identities, not counters.
-use crate::{CheckpointArtifact, Error, InstanceSpec, Result};
+use crate::{CapsuleSpec, CheckpointArtifact, Error, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -12,7 +12,7 @@ pub enum SnapshotState {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Reference {
     Restore {
-        instance_id: String,
+        capsule_id: String,
     },
     Template {
         node_id: String,
@@ -22,7 +22,7 @@ pub enum Reference {
 impl Reference {
     pub fn validate(&self) -> Result<()> {
         match self {
-            Self::Restore { instance_id } if valid_id(instance_id) => Ok(()),
+            Self::Restore { capsule_id } if valid_id(capsule_id) => Ok(()),
             Self::Template {
                 node_id,
                 template_id,
@@ -39,7 +39,7 @@ fn valid_id(id: &str) -> bool {
 pub struct Snapshot {
     pub id: String,
     pub names: Vec<String>,
-    pub template: InstanceSpec,
+    pub template: CapsuleSpec,
     pub source_node_id: String,
     pub source_runtime_id: String,
     pub artifact: CheckpointArtifact,
@@ -51,7 +51,7 @@ impl Snapshot {
     pub fn new(
         id: String,
         names: Vec<String>,
-        template: InstanceSpec,
+        template: CapsuleSpec,
         source_node_id: String,
         source_runtime_id: String,
         artifact: CheckpointArtifact,
@@ -106,7 +106,7 @@ impl Snapshot {
             return Err(Error::Conflict);
         }
         Ok(crate::runtime::RuntimeIdentity {
-            instance_id: self.template.id.clone(),
+            capsule_id: self.template.id.clone(),
             runtime_id: self.source_runtime_id.clone(),
             ownership_generation: generation,
         })

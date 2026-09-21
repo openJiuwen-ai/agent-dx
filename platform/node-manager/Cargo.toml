@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "ADX node-local instance lifecycle and runtime coordination"
+description = "ADX node-local Capsule lifecycle and runtime coordination"
 build = "build.rs"
 
 [lints]

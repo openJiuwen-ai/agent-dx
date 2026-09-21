@@ -1,6 +1,6 @@
 use super::*;
 use adx_transport::deadline::remaining;
-use pb::claim_instance_response::Outcome;
+use pb::claim_capsule_response::Outcome;
 impl NodeRpc {
     /// Retry only idle, unconfirmed holds. HTTP callers may have disappeared;
     /// ownership must still converge before these resources can be released.
@@ -23,8 +23,8 @@ impl NodeRpc {
             if busy {
                 continue;
             }
-            let request = pb::LocalCreateRequest {
-                create: Some(pb::CreateInstanceRequest {
+            let request = pb::LocalCapsuleCreateRequest {
+                create: Some(pb::CreateCapsuleRequest {
                     caller: Some(pb::CallerContext {
                         tenant_id: spec.tenant_id.clone(),
                         administrator: false,
@@ -44,9 +44,9 @@ impl NodeRpc {
 
     pub(super) async fn create_local(
         &self,
-        request: pb::LocalCreateRequest,
+        request: pb::LocalCapsuleCreateRequest,
         deadline: tokio::time::Instant,
-    ) -> std::result::Result<Response<pb::InstanceResult>, Status> {
+    ) -> std::result::Result<Response<pb::CapsuleResult>, Status> {
         if request.node_session_id != self.session_id {
             return Err(Status::failed_precondition("entry node session changed"));
         }
@@ -81,7 +81,7 @@ impl NodeRpc {
         if !*gate || self.manager.is_draining() {
             return Err(Status::unavailable("node is reconciling or draining"));
         }
-        let spec: adx_core::InstanceSpec = if raw.snapshot_id.is_some() {
+        let spec: adx_core::CapsuleSpec = if raw.snapshot_id.is_some() {
             let mut client = sink
                 .client
                 .read()
@@ -110,7 +110,7 @@ impl NodeRpc {
             }
             Err(e) => return Err(status(e)),
         };
-        let claim = pb::ClaimInstanceRequest {
+        let claim = pb::ClaimCapsuleRequest {
             spec: Some(spec.clone().into()),
             caller,
             node_session_id: self.session_id.clone(),
@@ -131,13 +131,13 @@ impl NodeRpc {
             answer = match tokio::time::timeout(
                 remaining(deadline, sink.timeout)
                     .ok_or_else(|| Status::deadline_exceeded("create deadline exceeded"))?,
-                client.claim_instance(adx_observability::trace::inject(claim.clone())),
+                client.claim_capsule(adx_observability::trace::inject(claim.clone())),
             )
             .await
             {
                 Ok(result) => result.map(Response::into_inner),
                 Err(_) => Err(Status::unavailable(
-                    "claim result unknown; retry same Instance ID",
+                    "claim result unknown; retry same Capsule ID",
                 )),
             };
             if !answer.as_ref().is_err_and(|e| {
@@ -169,7 +169,7 @@ impl NodeRpc {
                     .ok_or_else(|| Status::data_loss("assignment missing"))?
                     .try_into()
                     .map_err(status)?;
-                let got: adx_core::InstanceSpec = owned
+                let got: adx_core::CapsuleSpec = owned
                     .spec
                     .ok_or_else(|| Status::data_loss("spec missing"))?
                     .try_into()
@@ -181,7 +181,7 @@ impl NodeRpc {
                 {
                     return Err(Status::data_loss("claim response identity changed"));
                 }
-                let handle = self.manager.instance(spec, owner).map_err(status)?;
+                let handle = self.manager.capsule(spec, owner).map_err(status)?;
                 let result = match owned.snapshot {
                     Some(snapshot) => {
                         handle
@@ -193,7 +193,7 @@ impl NodeRpc {
                 response(result.map_err(status)?).map_err(status)
             }
             Outcome::Existing(existing) => {
-                let record: InstanceRecord = existing
+                let record: CapsuleRecord = existing
                     .record
                     .ok_or_else(|| Status::data_loss("existing record missing"))?
                     .try_into()
@@ -204,7 +204,7 @@ impl NodeRpc {
                 self.manager
                     .release_local(&spec.id, &reservation)
                     .map_err(status)?;
-                if record.state == adx_core::InstanceState::Running {
+                if record.state == adx_core::CapsuleState::Running {
                     response(crate::OperationResult {
                         record,
                         durability: Durability::Published,
@@ -228,9 +228,9 @@ impl NodeRpc {
     async fn forward_local(
         &self,
         sink: &MasterStateSink,
-        request: pb::LocalCreateRequest,
+        request: pb::LocalCapsuleCreateRequest,
         deadline: tokio::time::Instant,
-    ) -> std::result::Result<Response<pb::InstanceResult>, Status> {
+    ) -> std::result::Result<Response<pb::CapsuleResult>, Status> {
         let mut client = sink
             .client
             .read()
@@ -243,7 +243,7 @@ impl NodeRpc {
         tokio::time::timeout(timeout, client.forward_create(request))
             .await
             .map_err(|_| {
-                Status::unavailable("forwarded creation result unknown; retry same Instance ID")
+                Status::unavailable("forwarded creation result unknown; retry same Capsule ID")
             })?
     }
 }

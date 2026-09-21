@@ -44,10 +44,10 @@ def command(args):
 
 def catalog():
     value = json.loads(command([a.tools/'redis-cli','--json','HGETALL','adx:{acceptance}:control:v1']))
-    return {k:json.loads(v) for k,v in value.items() if k.startswith(('instance:','node:'))}
+    return {k:json.loads(v) for k,v in value.items() if k.startswith(('capsule:','node:'))}
 
 def record(id):
-    return catalog().get('instance:'+id,{}).get('result')
+    return catalog().get('capsule:'+id,{}).get('result')
 
 def services():
     return json.loads(command([a.package/'bin/adxctl','status','--config',root/'deployment.yaml']))['services']
@@ -79,7 +79,7 @@ def create(**kwargs):
     return s
 
 def physical(id):
-    lines = command([a.sbox,'-a',root/'sandboxd/sandboxd.sock','list','--label','adx.instance_id='+id]).splitlines()
+    lines = command([a.sbox,'-a',root/'sandboxd/sandboxd.sock','list','--label','adx.capsule_id='+id]).splitlines()
     return [line.split()[0] for line in lines[1:] if line.strip()]
 
 try:
@@ -94,7 +94,7 @@ try:
     passed('unexpected backend exit restarts with a fresh execution', instance_id=s.id, old_runtime=first['runtime_id'], new_runtime=restarted['runtime_id'])
     def sampled_stats():
         text = urllib.request.urlopen('http://127.0.0.1:17003/metrics',timeout=5).read().decode()
-        return text if 'adx_instance_memory_usage_bytes' in text and s.id in text else None
+        return text if 'adx_capsule_memory_usage_bytes' in text and s.id in text else None
     stats = wait(sampled_stats, 30)
     (out/'metrics.txt').write_text(stats)
     assert 'adx_node_reserved_cpu_millis' in stats
@@ -173,7 +173,7 @@ try:
     wait(lambda:catalog()['node:node1']['node']['available'],30)
     passed('expired resource observations close admission and recover without killing instances')
     observed.kill()
-    wait(lambda:all(v.get('result',{}).get('state')=='Deleted' for k,v in catalog().items() if k.startswith('instance:')))
+    wait(lambda:all(v.get('result',{}).get('state')=='Deleted' for k,v in catalog().items() if k.startswith('capsule:')))
     result['status']='passed'
 except Exception as error:
     result['error']=f'{type(error).__name__}: {error}'

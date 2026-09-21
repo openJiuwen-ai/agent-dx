@@ -1,34 +1,34 @@
 use adx_core::{
-    environment::RuntimeEnvironment,
+    environment::EnvironmentSpec,
     sandbox::{Rootfs, StorageSource},
-    InstanceSpec,
+    CapsuleSpec,
 };
 use adx_node_manager::sandboxd::{proto, start_request, Config};
 use serde_json::json;
 
-fn environment() -> RuntimeEnvironment {
+fn environment() -> EnvironmentSpec {
     serde_json::from_value(json!({
-        "rootfs":{"runtime":"runsc","type":"local","path":"/opt/adx/runtime/rootfs.img","readonly":false},
+        "rootfs":{"runtime_class":"runsc","type":"local","path":"/opt/adx/runtime/rootfs.img","readonly":false},
         "bootstrap":{"type":"erofs","root":"/opt/adx/runtime/rootfs.img","target":"/__adx",
             "entrypoint":["/__adx/usr/local/bin/rrt-runtime"],
             "image_process_config":"/etc/adx/custom-image-process.json"},
         "env":{"PLATFORM_VALUE":"configured"}
     })).unwrap()
 }
-fn image_environment() -> RuntimeEnvironment {
+fn image_environment() -> EnvironmentSpec {
     serde_json::from_value(json!({
-        "rootfs":{"runtime":"runc","type":"image","image":"registry.local/adx-runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","readonly":false},
+        "rootfs":{"runtime_class":"runc","type":"image","image":"registry.local/adx-runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","readonly":false},
         "bootstrap":{"type":"image","image":"registry.local/adx-runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","target":"/__adx",
             "entrypoint":["/__adx/usr/local/bin/rrt-runtime"],
             "image_process_config":"/etc/adx/custom-image-process.json"},
         "env":{"PLATFORM_VALUE":"configured"}
     })).unwrap()
 }
-fn spec(image: &str) -> InstanceSpec {
+fn spec(image: &str) -> CapsuleSpec {
     serde_json::from_value(
-        json!({"id":"i","tenant_id":"t","image":image,"runtime":"runc",
+        json!({"id":"i","tenant_id":"t","image":image,"runtime_class":"runc",
         "resources":{"cpu_millis":100,"memory_bytes":1048576,"disk_bytes":0},"priority":0,
-        "runtime_environment":environment()}),
+        "environment":environment()}),
     )
     .unwrap()
 }
@@ -36,7 +36,7 @@ fn spec(image: &str) -> InstanceSpec {
 #[test]
 fn default_rootfs_uses_local_artifact_without_bootstrap_mount() {
     let config = Config {
-        runtime_environment: Some(environment()),
+        environment: Some(environment()),
         ..Default::default()
     };
     let r = start_request(&spec(""), "i-1", 1, &[], &config).unwrap();
@@ -57,13 +57,13 @@ fn default_rootfs_uses_local_artifact_without_bootstrap_mount() {
 #[test]
 fn runtime_and_readonly_overlay_reuses_the_deployment_root_without_bootstrap_mount() {
     let config = Config {
-        runtime_environment: Some(environment()),
+        environment: Some(environment()),
         ..Default::default()
     };
     let mut wanted = spec("");
-    wanted.runtime = "firecracker".into();
-    let rootfs = &mut wanted.runtime_environment.as_mut().unwrap().rootfs;
-    rootfs.runtime = "firecracker".into();
+    wanted.runtime_class = "firecracker".into();
+    let rootfs = &mut wanted.environment.as_mut().unwrap().rootfs;
+    rootfs.runtime_class = "firecracker".into();
     rootfs.readonly = true;
 
     let request = start_request(&wanted, "i-1", 1, &[], &config).unwrap();
@@ -82,7 +82,7 @@ fn runtime_and_readonly_overlay_reuses_the_deployment_root_without_bootstrap_mou
 #[test]
 fn custom_image_mounts_the_same_local_environment_read_only() {
     let config = Config {
-        runtime_environment: Some(environment()),
+        environment: Some(environment()),
         ..Default::default()
     };
     let mut wanted = spec("ubuntu:24.04");
@@ -119,11 +119,11 @@ fn custom_image_mounts_the_same_local_environment_read_only() {
 #[test]
 fn default_rootfs_uses_the_configured_oci_runtime_image() {
     let config = Config {
-        runtime_environment: Some(image_environment()),
+        environment: Some(image_environment()),
         ..Default::default()
     };
     let mut wanted = spec("");
-    wanted.runtime_environment = Some(image_environment());
+    wanted.environment = Some(image_environment());
     let r = start_request(&wanted, "i-1", 1, &[], &config).unwrap();
     let root = r.rootfs.unwrap();
     assert_eq!(root.r#type, proto::RootfsSrcType::Image as i32);
@@ -140,11 +140,11 @@ fn default_rootfs_uses_the_configured_oci_runtime_image() {
 #[test]
 fn custom_rootfs_mounts_the_oci_runtime_image_read_only() {
     let config = Config {
-        runtime_environment: Some(image_environment()),
+        environment: Some(image_environment()),
         ..Default::default()
     };
     let mut wanted = spec("ubuntu:24.04");
-    wanted.runtime_environment = Some(image_environment());
+    wanted.environment = Some(image_environment());
     let r = start_request(&wanted, "i-1", 1, &[], &config).unwrap();
     assert_eq!(r.mounts.len(), 1);
     let mount = &r.mounts[0];
@@ -160,11 +160,11 @@ fn custom_rootfs_mounts_the_oci_runtime_image_read_only() {
 }
 
 #[test]
-fn s3_rootfs_mounts_the_configured_runtime_environment() {
+fn s3_rootfs_mounts_the_configured_environment() {
     use adx_core::sandbox::{Rootfs, S3Source, StorageSource};
 
     let config = Config {
-        runtime_environment: Some(environment()),
+        environment: Some(environment()),
         ..Default::default()
     };
     let mut wanted = spec("");
@@ -192,18 +192,13 @@ fn s3_rootfs_mounts_the_configured_runtime_environment() {
 fn old_or_unconfigured_environment_cannot_mount_arbitrary_host_files() {
     let mut wanted = spec("custom");
     let config = Config {
-        runtime_environment: Some(environment()),
+        environment: Some(environment()),
         ..Default::default()
     };
-    wanted.runtime_environment.as_mut().unwrap().bootstrap.root = "/etc/other.img".into();
+    wanted.environment.as_mut().unwrap().bootstrap.root = "/etc/other.img".into();
     assert!(start_request(&wanted, "i-1", 1, &[], &config).is_err());
     let mut source_drift = spec("");
-    source_drift
-        .runtime_environment
-        .as_mut()
-        .unwrap()
-        .rootfs
-        .path = "/etc/other.img".into();
+    source_drift.environment.as_mut().unwrap().rootfs.path = "/etc/other.img".into();
     assert!(start_request(&source_drift, "i-1", 1, &[], &config).is_err());
     assert!(start_request(&spec("custom"), "i-1", 1, &[], &Config::default()).is_err());
 }

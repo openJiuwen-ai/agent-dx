@@ -18,9 +18,9 @@ with Sandbox(image="python:3.12-slim", cpu=2000, memory=4096) as sandbox:
 
 ## Server compatibility
 
-The new Instance backend supports basic lifecycle, same-node pause/resume, reusable snapshots, grouped placement, idle deletion and restart policy. It requires an image containing the release RRT at the configured command path; generic `python:3.12-slim` below is only an illustrative image name.
+The new Capsule backend supports basic lifecycle, same-node pause/resume, reusable snapshots, grouped placement, idle deletion and restart policy. It requires an image containing the release RRT at the configured command path; generic `python:3.12-slim` below is only an illustrative image name.
 
-The Instance backend supports S3 rootfs, S3/image mounts, entrypoint inheritance,
+The Capsule backend supports S3 rootfs, S3/image mounts, entrypoint inheritance,
 creation and runtime network policy, `extra_config`, `failover=True`, independent
 resource limits, and per-sandbox data-plane security. Declared user ports use
 Edge and Node Proxy routing. Public local rootfs paths and host mounts are not a
@@ -50,10 +50,10 @@ There are three deliberately different checkpoint paths:
 
 | Path | Public SDK API | Artifact and placement | When to use it |
 | --- | --- | --- | --- |
-| Reusable Snapshot | `create_snapshot()` then `Sandbox.create()` | New Instance identity; shared storage allows fresh placement, local-only pins the source node. | Independent clones from a prepared source. |
-| Pause / resume | `pause()` then `resume()` | Same Instance ID; public resume calls its owning Node Manager. | Stop and resume one logical sandbox. |
-| Failure recovery | `failover=True` | Same Instance and node; restores the latest unexpired checkpoint after unexpected backend exit. | Workloads that must recover execution state rather than cold-start. |
-| Explicit reload | `reload()` | Same Instance; replaces a Running backend from its latest unexpired checkpoint. | Operator-requested reset to a known recovery point. |
+| Reusable Snapshot | `create_snapshot()` then `Sandbox.create()` | New Capsule identity; shared storage allows fresh placement, local-only pins the source node. | Independent clones from a prepared source. |
+| Pause / resume | `pause()` then `resume()` | Same Capsule ID; public resume calls its owning Node Manager. | Stop and resume one logical sandbox. |
+| Failure recovery | `failover=True` | Same Capsule and node; restores the latest unexpired checkpoint after unexpected backend exit. | Workloads that must recover execution state rather than cold-start. |
+| Explicit reload | `reload()` | Same Capsule; replaces a Running backend from its latest unexpired checkpoint. | Operator-requested reset to a known recovery point. |
 
 The SDK is a client-side validation, request-ID, attempt, and result-shaping
 layer. Node Manager owns lifecycle and checkpoint bytes; Master owns placement, committed state and the snapshot catalog.
@@ -121,7 +121,7 @@ clone = Sandbox.create(
 )
 ```
 
-The new Master inherits omitted image/runtime/scalar resources and validates explicit values against the source geometry. It does not resize a restored VM. Environment overrides and placement constraints are carried into the new Instance; local-only snapshots require the source node. Shared snapshots use normal scheduling. The source briefly pauses during snapshot creation and resumes before success. A reusable snapshot is not consumed by cloning; deletion blocks new references and waits for existing references to be released. See [storage and cloning](../../../../docs/testing/snapshot-storage.md).
+The new Master inherits omitted image/runtime/scalar resources and validates explicit values against the source geometry. It does not resize a restored VM. Environment overrides and placement constraints are carried into the new Capsule; local-only snapshots require the source node. Shared snapshots use normal scheduling. The source briefly pauses during snapshot creation and resumes before success. A reusable snapshot is not consumed by cloning; deletion blocks new references and waits for existing references to be released. See [storage and cloning](../../../../docs/testing/snapshot-storage.md).
 
 Later dual-clone FC runs exposed a network failure, tracked in the [investigation](../../../../docs/testing/2026-09-16-fc-clone-network.md); successful earlier batches do not close that issue.
 
@@ -166,7 +166,7 @@ Pausing persists bytes through the configured local or S3 store and commits Paus
 
 `failover=True` restores from the latest unexpired checkpoint after an
 unexpected backend exit on the owning node. If no valid checkpoint exists, the
-Instance becomes Failed and is not recreated from the original image.
+Capsule becomes Failed and is not recreated from the original image.
 `Sandbox.reload() -> bool` explicitly replaces a Running backend from that same
 recovery point. It returns `True` only after the replacement reaches Running and
 the result is durably published. Automatic restart policy is a separate cold
@@ -198,7 +198,7 @@ attempt rules intentionally differ by operation:
 - Create from Snapshot uses the normal create policy with up to three attempts
   and one `create-*` identity. When the caller omits `name`, the SDK derives a
   stable name from that identity, so another API Server replica receives the
-  same Instance ID. An uncertain result must still be queried or retried with
+  same Capsule ID. An uncertain result must still be queried or retried with
   the same identity.
 
 Structured server failures raise `SandboxHTTPError`, whose `code`, `retry`,
@@ -238,7 +238,7 @@ handlers define no body fields. Raw HTTP requires a pattern-valid
 `X-ADX-Request-ID` header;
 the SDK generates that header internally.
 
-Internal signal/POSIX/runtime SDK APIs are not part of this package or the new Instance protocol.
+Internal signal/POSIX/runtime SDK APIs are not part of this package or the new Capsule protocol.
 
 ## Other create options
 
@@ -251,7 +251,7 @@ Sandbox(xpu="gpu::1")  # any GPU model
 ```
 
 The SDK currently accepts one whole-device `gpu` request with a positive count.
-An empty model leaves the scheduler to select a model. The public SDK `xpu` parser currently accepts GPU only; internal Instance RPC also supports NPU. Real GPU/NPU execution is a separate pending validation gate.
+An empty model leaves the scheduler to select a model. The public SDK `xpu` parser currently accepts GPU only; internal Capsule RPC also supports NPU. Real GPU/NPU execution is a separate pending validation gate.
 
 Temporary writable storage is specified in MiB:
 

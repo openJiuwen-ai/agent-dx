@@ -12,7 +12,7 @@ fn public_create_maps_directly_to_instance_and_uses_verified_identity() {
     let spec=create_spec(json!({"name":"case","namespace":"ns","tenant":"spoofed","image":"image","cpu":125,"memory":32,"storageMb":4,"env":{"USER_VALUE":"ok"},"idleTimeoutSeconds":15}), &caller()).unwrap();
     assert_eq!(spec.id, "ns-case");
     assert_eq!(spec.tenant_id, "verified");
-    assert_eq!(spec.runtime, "runsc");
+    assert_eq!(spec.runtime_class, "runsc");
     let resources = spec.resources.unwrap();
     assert_eq!(
         (
@@ -30,7 +30,7 @@ fn clone_preserves_omitted_geometry_and_does_not_invent_image() {
     let spec = create_spec(json!({"name":"clone","snapshotId":"snapshot-1"}), &caller()).unwrap();
     assert_eq!(spec.snapshot_id.as_deref(), Some("snapshot-1"));
     assert!(spec.image.is_empty());
-    assert!(spec.runtime.is_empty());
+    assert!(spec.runtime_class.is_empty());
     assert_eq!(spec.resources.unwrap().cpu_millis, 0);
 }
 #[test]
@@ -100,7 +100,7 @@ fn unsafe_or_inconsistent_sandbox_options_are_rejected() {
     }
     for body in [
         json!({"image":"img","cpu":-1}),
-        json!({"image":"img","env":{"ADX_INSTANCE_ID":"fake"}}),
+        json!({"image":"img","env":{"ADX_CAPSULE_ID":"fake"}}),
         json!({"image":"img","storageMb":0}),
         json!({"image":"img","ports":["0"]}),
         json!({"image":"img","ports":["8080", "8080"]}),
@@ -231,7 +231,7 @@ fn create_and_central_queue_timeouts_are_distinct() {
 #[test]
 fn deployment_environment_supplies_default_root_and_runtime_but_snapshot_inherits_source() {
     let environment = serde_json::from_value(json!({
-        "rootfs":{"runtime":"runc","type":"local","path":"/opt/adx/runtime/rootfs.img","readonly":false},
+        "rootfs":{"runtime_class":"runc","type":"local","path":"/opt/adx/runtime/rootfs.img","readonly":false},
         "bootstrap":{"type":"erofs","root":"/opt/adx/runtime/rootfs.img","target":"/__adx",
           "entrypoint":["/__adx/usr/local/bin/rrt-runtime"]}
     })).unwrap();
@@ -241,39 +241,32 @@ fn deployment_environment_supplies_default_root_and_runtime_but_snapshot_inherit
     };
     let default = create(json!({"name":"default"}));
     assert!(default.image.is_empty());
-    assert_eq!(default.runtime, "runc");
-    assert!(default.runtime_environment.is_some());
+    assert_eq!(default.runtime_class, "runc");
+    assert!(default.environment.is_some());
     let runtime_only = create(json!({"rootfs":{"runtime":"firecracker"}}));
     assert!(runtime_only.image.is_empty());
-    assert_eq!(runtime_only.runtime, "firecracker");
-    let runtime_environment = runtime_only.runtime_environment.unwrap();
-    assert_eq!(runtime_environment.rootfs.unwrap().runtime, "firecracker");
+    assert_eq!(runtime_only.runtime_class, "firecracker");
+    let environment = runtime_only.environment.unwrap();
+    assert_eq!(environment.rootfs.unwrap().runtime_class, "firecracker");
     assert!(runtime_only.sandbox.unwrap().rootfs.is_none());
 
     let readonly_only = create(json!({"rootfs":{"readonly":true}}));
     assert!(readonly_only.image.is_empty());
-    assert!(
-        readonly_only
-            .runtime_environment
-            .unwrap()
-            .rootfs
-            .unwrap()
-            .readonly
-    );
+    assert!(readonly_only.environment.unwrap().rootfs.unwrap().readonly);
     assert!(readonly_only.sandbox.unwrap().rootfs.is_none());
 
     let custom = create(json!({"image":"ubuntu:24.04"}));
     assert_eq!(custom.image, "ubuntu:24.04");
-    assert_eq!(custom.runtime_environment, default.runtime_environment);
+    assert_eq!(custom.environment, default.environment);
     let clone = create(json!({"snapshotId":"saved"}));
-    assert!(clone.runtime_environment.is_none());
-    assert!(clone.runtime.is_empty());
+    assert!(clone.environment.is_none());
+    assert!(clone.runtime_class.is_empty());
 }
 
 #[test]
 fn rootfs_source_replacement_inherits_default_readonly_unless_explicitly_overridden() {
     let environment = serde_json::from_value(json!({
-        "rootfs":{"runtime":"runc","type":"local","path":"/opt/adx/runtime/rootfs.img","readonly":true},
+        "rootfs":{"runtime_class":"runc","type":"local","path":"/opt/adx/runtime/rootfs.img","readonly":true},
         "bootstrap":{"type":"erofs","root":"/opt/adx/runtime/rootfs.img","target":"/__adx",
           "entrypoint":["/__adx/usr/local/bin/rrt-runtime"]}
     }))

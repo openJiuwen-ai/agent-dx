@@ -18,15 +18,15 @@ pub struct LocalClaim {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClaimOutcome {
     /// This node owns a pending initial creation. Includes replay after a lost
-    /// acknowledgement; start through the existing per-Instance controller.
-    Owned(StoredInstance),
+    /// acknowledgement; start through the existing per-Capsule controller.
+    Owned(StoredCapsule),
     /// Another node owns it, or a result/retirement/recovery already exists.
     /// Do not start a new runtime. Reuse/query this record and release only the
     /// losing attempt's tentative resources, never an existing execution's hold.
-    Existing(StoredInstance),
+    Existing(StoredCapsule),
 }
 impl ClaimOutcome {
-    pub fn record(&self) -> &StoredInstance {
+    pub fn record(&self) -> &StoredCapsule {
         match self {
             Self::Owned(record) | Self::Existing(record) => record,
         }
@@ -56,14 +56,14 @@ impl Session {
         Err(Error::Unavailable("claim barrier contended".into()))
     }
 
-    /// Register one globally unique owner for a normalized InstanceSpec.
+    /// Register one globally unique owner for a normalized CapsuleSpec.
     ///
-    /// The spec (including tenant) must match on every retry. The Instance ID is
+    /// The spec (including tenant) must match on every retry. The Capsule ID is
     /// the idempotency key; retries must not generate a new ID. Generation and
     /// ownership are committed in the same Redis CAS. On an unavailable result,
     /// retry this operation or query `get`; a timeout does not prove no write.
-    /// This never transfers ownership or reactivates a completed Instance.
-    pub async fn claim(&self, spec: InstanceSpec, candidate: &LocalClaim) -> Result<ClaimOutcome> {
+    /// This never transfers ownership or reactivates a completed Capsule.
+    pub async fn claim(&self, spec: CapsuleSpec, candidate: &LocalClaim) -> Result<ClaimOutcome> {
         spec.validate()?;
         if candidate.node_id.trim().is_empty() || candidate.node_session_id.trim().is_empty() {
             return Err(Error::Invalid(
@@ -71,9 +71,9 @@ impl Session {
             ));
         }
         validate_device_assignment(&spec.scheduling.devices, &candidate.devices)?;
-        let field = format!("instance:{}", spec.id);
+        let field = format!("capsule:{}", spec.id);
         for _ in 0..ATTEMPTS {
-            let [header_value, instance_value, node_value] = self
+            let [header_value, capsule_value, node_value] = self
                 .store
                 .fields([
                     HEADER.into(),
@@ -92,8 +92,8 @@ impl Session {
             {
                 return Err(Error::Conflict);
             }
-            if let Some(instance_value) = &instance_value {
-                let existing: StoredInstance = decode(instance_value)?;
+            if let Some(capsule_value) = &capsule_value {
+                let existing: StoredCapsule = decode(capsule_value)?;
                 existing.validate()?;
                 if existing.spec != spec {
                     return Err(Error::Conflict);
@@ -120,7 +120,7 @@ impl Session {
                 snapshot.validate()?;
                 if snapshot.template.tenant_id != spec.tenant_id
                     || !snapshot.references.contains(&Reference::Restore {
-                        instance_id: spec.id.clone(),
+                        capsule_id: spec.id.clone(),
                     })
                 {
                     return Err(Error::Conflict);
@@ -130,13 +130,13 @@ impl Session {
                 None
             };
             let generation = header.generation.checked_add(1).ok_or(Error::Conflict)?;
-            let record = StoredInstance {
+            let record = StoredCapsule {
                 recovery: None,
                 invalidated: false,
                 spec: spec.clone(),
                 result: None,
                 assignment: Assignment {
-                    instance_id: spec.id.clone(),
+                    capsule_id: spec.id.clone(),
                     node_id: candidate.node_id.clone(),
                     shard_id: node.shard_id,
                     generation,
@@ -162,7 +162,7 @@ impl Session {
             }
         }
         Err(Error::Unavailable(
-            "concurrent ownership registration; retry same Instance ID".into(),
+            "concurrent ownership registration; retry same Capsule ID".into(),
         ))
     }
 }

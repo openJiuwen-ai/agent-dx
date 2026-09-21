@@ -1,5 +1,5 @@
 //! Local mailbox benchmark. Reports are in-process acknowledgments, not RPC or persistence.
-use adx_core::{Assignment, InstanceSpec, Resources};
+use adx_core::{Assignment, CapsuleSpec, Resources};
 use adx_master::{Master, Node, Placement, SchedulerConfig};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -21,16 +21,16 @@ fn node(i: usize, capacity: u64, revision: usize) -> Node {
         devices: vec![],
     }
 }
-fn spec(i: usize) -> InstanceSpec {
-    InstanceSpec {
-        runtime_environment: None,
+fn spec(i: usize) -> CapsuleSpec {
+    CapsuleSpec {
+        environment: None,
         snapshot_id: None,
         lifecycle: Default::default(),
         env: Default::default(),
         id: format!("r{i}"),
         tenant_id: "t".into(),
         image: "i".into(),
-        runtime: "r".into(),
+        runtime_class: "r".into(),
         priority: 0,
         resources: Resources {
             cpu_millis: 300,
@@ -63,7 +63,7 @@ fn wait<T>(rx: Receiver<T>) -> T {
 // Keep complete command payloads in the benchmark mailbox.
 #[allow(clippy::large_enum_variant)]
 enum Command {
-    Schedule(InstanceSpec, Sender<Assignment>),
+    Schedule(CapsuleSpec, Sender<Assignment>),
     Retry(Assignment, Sender<Assignment>),
     Add(Assignment, Sender<()>),
     Delete(Assignment, Sender<()>),
@@ -86,18 +86,18 @@ fn handle(
             m.submit(r).unwrap();
         }
         Command::Retry(a, tx) => {
-            pending.insert(a.instance_id.clone(), tx);
+            pending.insert(a.capsule_id.clone(), tx);
             m.retry(&a).unwrap();
         }
         Command::Add(a, tx) => {
             let snapshot = m.snapshot();
-            let p = &snapshot.instances()[&a.instance_id];
+            let p = &snapshot.capsules()[&a.capsule_id];
             assert_eq!(p.node_id, a.node_id);
-            assert!(confirmed.insert(a.instance_id));
+            assert!(confirmed.insert(a.capsule_id));
             tx.send(()).unwrap();
         }
         Command::Delete(a, tx) => {
-            assert!(confirmed.remove(&a.instance_id));
+            assert!(confirmed.remove(&a.capsule_id));
             m.release(&a).unwrap();
             tx.send(()).unwrap();
         }
@@ -107,7 +107,7 @@ fn handle(
         }
         Command::Stop(tx) => {
             assert!(pending.is_empty());
-            tx.send(m.snapshot().instances().len()).unwrap();
+            tx.send(m.snapshot().capsules().len()).unwrap();
             return false;
         }
     }
@@ -141,7 +141,7 @@ impl Actor {
                     let r = m.schedule_round(d).unwrap();
                     assert!(r.error.is_none(), "{:?}", r.error);
                     for a in r.assignments {
-                        pending.remove(&a.instance_id).unwrap().send(a).unwrap();
+                        pending.remove(&a.capsule_id).unwrap().send(a).unwrap();
                     }
                 }
                 ready = m.take_ready_shard();
@@ -200,7 +200,7 @@ fn print(
     final_count: usize,
     updates: usize,
 ) {
-    println!("ADX_COMPARE {{\"case\":\"{case}\",\"cache\":{cache},\"nodes\":{NODES},\"requests\":{count},\"qps\":{},\"p50_us\":{},\"p99_us\":{},\"report_p50_us\":{},\"report_p99_us\":{},\"final_instances\":{final_count},\"updates\":{updates},\"success\":{count},\"invalid_placement\":0}}",count as f64/elapsed.as_secs_f64(),percentile(latency,50),percentile(latency,99),percentile(report,50),percentile(report,99));
+    println!("ADX_COMPARE {{\"case\":\"{case}\",\"cache\":{cache},\"nodes\":{NODES},\"requests\":{count},\"qps\":{},\"p50_us\":{},\"p99_us\":{},\"report_p50_us\":{},\"report_p99_us\":{},\"final_capsules\":{final_count},\"updates\":{updates},\"success\":{count},\"invalid_placement\":0}}",count as f64/elapsed.as_secs_f64(),percentile(latency,50),percentile(latency,99),percentile(report,50),percentile(report,99));
 }
 fn main() {
     let args: Vec<_> = std::env::args().collect();
@@ -231,7 +231,7 @@ fn main() {
             t.elapsed(),
             &l,
             &[],
-            m.snapshot().instances().len(),
+            m.snapshot().capsules().len(),
             0,
         );
         return;

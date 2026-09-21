@@ -1,15 +1,15 @@
-use adx_core::{Error, InstanceSpec, Resources};
+use adx_core::{CapsuleSpec, Error, Resources};
 use adx_master::{Master, Node, Placement};
-fn spec() -> InstanceSpec {
-    InstanceSpec {
-        runtime_environment: None,
+fn spec() -> CapsuleSpec {
+    CapsuleSpec {
+        environment: None,
         snapshot_id: None,
         lifecycle: Default::default(),
         env: Default::default(),
         id: "r".into(),
         tenant_id: "t".into(),
         image: "i".into(),
-        runtime: "r".into(),
+        runtime_class: "r".into(),
         priority: 0,
         resources: Resources {
             cpu_millis: 1,
@@ -40,12 +40,12 @@ fn rejected_allocation_retries_another_node_without_leaking_or_overwriting_a_new
     let second = m.schedule(0).unwrap().unwrap();
     assert_ne!(first.node_id, second.node_id);
     assert!(second.generation > first.generation);
-    assert_eq!(m.snapshot().instances().len(), 1);
+    assert_eq!(m.snapshot().capsules().len(), 1);
     assert!(m.stats(0).unwrap().cache_hits > 0);
     assert_eq!(m.release(&first), Err(Error::Conflict));
     m.retry(&second).unwrap();
     assert!(m.schedule(0).unwrap().is_none());
-    assert!(m.snapshot().instances().is_empty());
+    assert!(m.snapshot().capsules().is_empty());
     let mut other = spec();
     other.id = "other".into();
     m.submit(other).unwrap();

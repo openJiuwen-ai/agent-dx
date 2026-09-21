@@ -1,4 +1,4 @@
-//! Public management API, directly using typed Instance RPCs.
+//! Public management API, directly using typed Capsule RPCs.
 #![allow(clippy::result_large_err)]
 pub mod clients;
 pub mod config;
@@ -9,5 +9,5 @@ pub mod http;
 pub mod operations;
 pub mod ownership;
 
+mod capsule_directory;
 mod directory;
-mod instance_directory;

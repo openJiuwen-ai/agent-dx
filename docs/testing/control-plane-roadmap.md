@@ -7,13 +7,13 @@
 | 1. 同节点暂停／恢复 | Node Manager 串行状态机、RRT HTTP 协作、sandboxd checkpoint/restore、本地存储、Redis 提交、API Server、路由 | 真实 Firecracker 创建→执行→暂停→Node Manager 重启→恢复→删除；内存计数器、PID、文件、执行身份、资源和路由 |
 | 2. 节点生命周期与降级 | 空闲删除、可配置自动重启及退避、资源源选择与过期保护、压力准入、SQLite 降级日志与补写 | Master 失联、节点进程重启、采集失败、清理失败；遵守节点生命周期所有权和权威对账规则 |
 | 3. 快照与存储 | 对象存储适配、可复用快照目录、引用与延迟删除、预算缓存、未登记制品回收 | 上传失败回滚、恢复点过期、引用期间删除、缓存淘汰、从快照创建新实例 |
-| 4. 跨节点恢复与接管 | 同 Instance ID 归属转移、旧归属撤销与返回清理、心跳故障处理、恢复与路由切换 | 源节点恢复、旧请求重放、接管中途失败；缺少 checkpoint 或 local-only 制品明确失败 |
+| 4. 跨节点恢复与接管 | 同 Capsule ID 归属转移、旧归属撤销与返回清理、心跳故障处理、恢复与路由切换 | 源节点恢复、旧请求重放、接管中途失败；缺少 checkpoint 或 local-only 制品明确失败 |
 | 5. 调度能力与性能 | Global 轮转、Shard 调度、Local 准入；优先级、GPU/NPU 整卡、亲和／反亲和；增量状态与候选复用 | 不超分、卡号正确、排队公平、规则正确；同一 Linux 主机与既有分支统一负载比较 QPS/P99/更新及冲突成本 |
 | 6. 接口与部署收口 | 最小 API Key 管理、启动配置和证书加载、Node Manager/Node Proxy 两种进程模式、统一 CLI 与发布包 | HTTP/SDK 兼容、身份隔离、进程重启、停止清理、同包角色组合、安装文档可复现 |
 | 7. 正式基础端到端流水线 | 独立 K8s 部署和用例步骤、基础功能/节点故障用例、日志及制品汇总；FC 本轮保留本地验收 | 部署过程可见、逐用例结果可见、失败日志可定位、包/镜像/源码身份一致 |
 | 8. 可观测与日志采集 | 优先补齐实例数量与资源分配 Metrics；结构化日志采集、Trace 上下文与导出 | 指标与权威状态/资源账本一致；真实采集、跨组件关联与采集端故障验收 |
 | 9. 日志滚动与压缩 | 按大小/时间滚动、历史文件压缩、保留数量/时长/总容量、部署配置 | 持续写入及重启下日志完整；压缩/磁盘异常可诊断；进程与Pod部署行为清晰 |
-| 10. Rust API Server 与调度命名 | Rust HTTP 服务直连 Instance RPC、删除 Go/legacy 消息链、调度 Shard 命名与配置迁移 | HTTP/SDK 契约、SSE、认证/缓存/重试、真实 RPC、发布包及基础 K8s 七组 |
+| 10. Rust API Server 与调度命名 | Rust HTTP 服务直连 Capsule RPC、删除 Go/legacy 消息链、调度 Shard 命名与配置迁移 | HTTP/SDK 契约、SSE、认证/缓存/重试、真实 RPC、发布包及基础 K8s 七组 |
 | 11. 节点本地优先创建 | API 节点轮转、共用 Admission 暂留、Master 原子 claim 与中心账本同步、同 ID 收敛 | 本地 Redis/mTLS/HTTPS、真实 sandboxd/runc/RRT 和正式 K8s 八组 |
 | 12. 内置运行环境 | 本地 EROFS 与不可变 OCI 双路径、静态 RRT、PID 1 回收、自定义镜像 bootstrap | standalone EROFS、OCI K8s 三模式；Firecracker 新入口单列验证 |
 
@@ -66,8 +66,8 @@
 ## 阶段11：节点本地优先创建
 
 已接入可配置 API 节点轮转、共用 Admission 暂留、原子 claim 与中心账本同步、同 ID 并发收敛、未知写入屏障恢复及后台重试。
-本地 Redis/mTLS/HTTPS 验证及新制品真实 sandboxd/runc/RRT 双节点8组验收均通过，包含 `local-first`，见 [端到端报告](2026-09-17-local-first-e2e.md)；提交 `363e44f` 的 [Buildkite #30](2026-09-18-runtime-environment-k8s.md) 已使用正式发布包完成同一八组 K8s 验收。见 [契约](atomic-instance-claim.md)。
+本地 Redis/mTLS/HTTPS 验证及新制品真实 sandboxd/runc/RRT 双节点8组验收均通过，包含 `local-first`，见 [端到端报告](2026-09-17-local-first-e2e.md)；提交 `363e44f` 的 [Buildkite #30](2026-09-18-runtime-environment-k8s.md) 已使用正式发布包完成同一八组 K8s 验收。见 [契约](atomic-capsule-claim.md)。
 
 ## 阶段12：内置运行环境
 
-本地 EROFS 和不可变 OCI image 两种来源已接入统一配置、Instance 持久化和 Node Manager。默认实例直接使用内置环境；自定义用户镜像只读挂载同一 bootstrap 到 `/__adx`。静态 RRT、PID 1 孤儿回收、standalone EROFS 及本地真实 runc 双节点验收已通过；Buildkite #30 使用 OCI 完成 default、runtime-only、custom 三模式及八组 K8s 验收。Firecracker 新入口与快照恢复复验仍单列，不用基础 runc K8s 结果代替。
+本地 EROFS 和不可变 OCI image 两种来源已接入统一配置、Capsule 持久化和 Node Manager。默认实例直接使用内置环境；自定义用户镜像只读挂载同一 bootstrap 到 `/__adx`。静态 RRT、PID 1 孤儿回收、standalone EROFS 及本地真实 runc 双节点验收已通过；Buildkite #30 使用 OCI 完成 default、runtime-only、custom 三模式及八组 K8s 验收。Firecracker 新入口与快照恢复复验仍单列，不用基础 runc K8s 结果代替。

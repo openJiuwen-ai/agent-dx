@@ -10,7 +10,7 @@
 - Master 在同一协调锁中检查节点身份、租户、心跳/会话和硬约束，执行 Redis CAS，并同步内存调度账本后确认启动。
 - 中心/本地并发、同节点重复入口及请求取消均保持唯一归属和执行；本地不足时用相同 ID 回退中心。
 - 不同规格竞争失败后的暂留泄漏已修复；迟到终态提交导致的 Master 旧资源占用也已通过先红后绿修复。
-- 具体模块、恢复协议和 Pack/Spread/队列适用范围见 [契约](atomic-instance-claim.md)。
+- 具体模块、恢复协议和 Pack/Spread/队列适用范围见 [契约](atomic-capsule-claim.md)。
 
 ## 验证记录
 
@@ -38,6 +38,6 @@ Redis 测试二进制 SHA256：`9017e855ae87d02500bb3c8bab84dff77d55156e489c71b9
 
 ## 验证边界
 
-真实 Redis、mTLS RPC 和 Rust HTTPS 进程均参与；RPC fixture 的 RuntimeBackend 使用测试实现。
+真实 Redis、mTLS RPC 和 Rust HTTPS 进程均参与；RPC fixture 的 RuntimeDriver 使用测试实现。
 随后已完成新制品真实 sandboxd/runc/RRT 本地双节点8组验收，包含 `local-first`，见 [端到端报告](2026-09-17-local-first-e2e.md)。
 上述本地验收使用提交前工作树制品，因此当时不能沿用历史 Buildkite #24 七组的成功。后续已提交并由 [Buildkite #30](2026-09-18-runtime-environment-k8s.md) 使用正式发布包完成八组 K8s 验收；阶段11的正式 K8s 门禁已关闭。
