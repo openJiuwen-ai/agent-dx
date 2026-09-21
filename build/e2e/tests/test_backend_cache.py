@@ -35,3 +35,10 @@ class BackendCacheTests(unittest.TestCase):
     def test_incomplete_artifact_set_is_rejected(self):
         del self.manifest['files']['runc'];self.save()
         with self.assertRaisesRegex(ValueError,'file set'):cached.verify(self.root,self.manifest['target'])
+
+    def test_buildkite_gate_uses_verified_backend_artifact(self):
+        pipeline=(cached.ROOT/'.buildkite/pipeline.yml').read_text()
+        self.assertIn(
+            'ADX_BACKEND_ARTIFACT_BUILD: 01a0ad6d-9629-4da8-903b-3f8bd1ddc992',
+            pipeline,
+        )

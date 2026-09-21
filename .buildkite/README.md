@@ -76,8 +76,10 @@ dependency in the Ubuntu runtime image.
 
 ## Artifact handoff and acceptance
 
-`platform-build` constructs all ADX binaries, the SDK and pinned sandboxd helpers
-from the clean current commit. `platform-images` downloads the release archive and verifies its SHA256 before
+`platform-build` constructs all ADX binaries and the SDK from the clean current
+commit. It downloads the pinned external sandboxd backend artifact selected by
+`ADX_BACKEND_ARTIFACT_BUILD` and verifies its revision, target and complete file
+digests. `platform-images` downloads the release archive and verifies its SHA256 before
 restoring the complete directory tree and executable permissions. It downloads
 the verified external backend artifacts,
 creates the verified bundle and publishes the node, RRT and entrypoint-fixture images. `registry-images.json` records immutable digest
@@ -124,7 +126,7 @@ available separately for development reproduction in [build/e2e](../build/e2e/RE
 Buildkite syntax follows the official [Agent Stack execution](https://buildkite.com/docs/agent/self-hosted/agent-stack-k8s/running-builds)
 and [PodSpec configuration](https://buildkite.com/docs/agent/self-hosted/agent-stack-k8s/podspec).
 
-构建会在复用的 worker 中按版本和 SHA256 准备 Go 1.25.5、Redis 7.2.5，用于外部 sandboxd 构建。未指定基础镜像时，打包步骤按仓库 Dockerfile 构建并发布测试基础镜像，再用 registry digest 构建节点与 RRT 镜像。`ADX_REDIS_SERVER` / `ADX_REDIS_CLI` 和 `ADX_E2E_RUNTIME_BASE` / `ADX_E2E_RRT_BASE` 可显式覆盖。
+构建会在复用的 worker 中按版本和 SHA256 准备 Go 1.25.5、Redis 7.2.5。基础流水线直接下载并校验固定的 sandboxd 后端产物，不访问 GitHub 重建；只有显式取消 `ADX_BACKEND_ARTIFACT_BUILD` 时才进入源码构建维护路径。未指定基础镜像时，打包步骤按仓库 Dockerfile 构建并发布测试基础镜像，再用 registry digest 构建节点与 RRT 镜像。`ADX_REDIS_SERVER` / `ADX_REDIS_CLI` 和 `ADX_E2E_RUNTIME_BASE` / `ADX_E2E_RRT_BASE` 可显式覆盖。
 
 ## Rust image and Cargo cache
 
@@ -143,11 +145,12 @@ step is serialized so package assembly cannot copy another job's binaries.
 An existing sccache from the shared worker cache is reused when available, and
 Cargo cache locations/source selection are recorded in `bootstrap.log`.
 
-For a pinned external sandboxd already built by CI, `ADX_BACKEND_ARTIFACT_BUILD`
-can select the Buildkite build UUID containing its `platform-build` backend
-artifacts. Revision, target, complete file set and every file checksum must pass
-validation. ADX product binaries and SDK are still built from the current commit.
-Omit the variable to rebuild the external runtime from its pinned source.
+`ADX_BACKEND_ARTIFACT_BUILD` selects the Buildkite build UUID containing the
+`platform-build` backend artifacts. The default gate uses the verified artifacts
+from build `01a0ad6d-9629-4da8-903b-3f8bd1ddc992` (Buildkite #21). Revision,
+target, complete file set and every file checksum must pass validation. ADX
+product binaries and SDK are still built from the current commit. Unset the
+variable only for an explicit external-runtime rebuild from its pinned source.
 
 The image stage caches the pinned Ubuntu amd64 base in SWR. On a cache miss it
 pulls the identical manifest from a configurable regional mirror and checks its
