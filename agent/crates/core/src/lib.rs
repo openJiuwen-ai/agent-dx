@@ -2,17 +2,16 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
-pub mod cache;
-pub mod dispatcher;
+pub mod activator;
+pub mod error;
 pub mod inline;
 pub mod limits;
-pub mod routing;
 pub mod sandbox;
 pub mod transport;
 
 pub type ValidationResult = Result<(), String>;
 
-/// Wall-clock deadline shared across Dispatcher processes. Deployment clocks must be synchronized.
+/// Wall-clock deadline shared across Activator processes. Deployment clocks must be synchronized.
 pub fn unix_time_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -49,7 +48,7 @@ pub struct Scope {
     pub tenant: String,
     pub template: String,
     pub version: String,
-    pub session_id: String,
+    pub environment_id: String,
 }
 
 impl Scope {
@@ -58,19 +57,11 @@ impl Scope {
             ("tenant", &self.tenant),
             ("template", &self.template),
             ("version", &self.version),
-            ("session_id", &self.session_id),
+            ("environment_id", &self.environment_id),
         ] {
             identifier(value, label)?;
         }
         Ok(())
-    }
-    pub fn key(&self) -> String {
-        encode_key(&[
-            &self.tenant,
-            &self.template,
-            &self.version,
-            &self.session_id,
-        ])
     }
 }
 
@@ -157,9 +148,7 @@ impl TemplateVersion {
             if matches!(
                 key.as_str(),
                 "ADX_AGENT_EXECUTION_HASH"
-                    | "ADX_AGENT_SERVICE_PORTS"
-                    | "ADX_AGENT_HAS_ENTRYPOINT"
-                    | "ADX_INSTANCE_ID"
+                    | "ADX_CAPSULE_ID"
                     | "ADX_RUNTIME_ID"
                     | "ADX_OWNERSHIP_GENERATION"
                     | "ADX_IMAGE_PROCESS_CONFIG"
@@ -182,95 +171,18 @@ impl TemplateVersion {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum SessionPhase {
+pub enum EnvironmentPhase {
     Active,
     Deleting,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Session {
+pub struct Environment {
     pub scope: Scope,
-    /// Distinguishes reuse of a public session ID; never reused after deletion.
     pub generation: String,
-    pub phase: SessionPhase,
-    /// Logical instances in this Session, updated atomically with instance state.
-    pub instances: BTreeSet<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DesiredState {
-    Running,
-    Deleted,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum InstancePhase {
-    Creating,
-    Ready,
-    Failed,
-    Deleting,
-    Deleted,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Instance {
-    pub id: String,
-    pub tenant: String,
-    pub scope: Scope,
-    pub session_generation: String,
+    /// Stable Platform identity, including across retries and runtime pause/resume.
     pub sandbox_id: String,
-    pub desired: DesiredState,
-    pub phase: InstancePhase,
-    pub status_message: Option<String>,
-    /// Absolute creation deadline, fixed at reservation and never extended by recovery.
-    pub create_deadline_ms: u64,
-}
-
-impl Instance {
-    pub fn creation_expired(&self) -> bool {
-        self.phase == InstancePhase::Creating && unix_time_millis() >= self.create_deadline_ms
-    }
-
-    /// ADX only reconciles unfinished creation/deletion. Substrate owns health after Ready.
-    pub fn needs_reconciliation(&self) -> bool {
-        self.phase != InstancePhase::Deleted
-            && (self.desired == DesiredState::Deleted || self.phase == InstancePhase::Creating)
-    }
-
-    pub fn accepts_binding(&self, scope: &Scope) -> bool {
-        self.tenant == scope.tenant
-            && self.desired == DesiredState::Running
-            && self.phase == InstancePhase::Ready
-            && &self.scope == scope
-    }
-    pub fn validate(&self) -> ValidationResult {
-        if self.create_deadline_ms == 0 {
-            return Err("creation deadline must be positive".into());
-        }
-        identifier(&self.id, "instance id")?;
-        identifier(&self.tenant, "tenant")?;
-        identifier(&self.sandbox_id, "stable sandbox id")?;
-        self.scope.validate()?;
-        identifier(&self.session_generation, "session generation")?;
-        if self.scope.tenant != self.tenant {
-            return Err("instance tenant differs from session".into());
-        }
-        if self.phase == InstancePhase::Deleted && self.desired != DesiredState::Deleted {
-            return Err("deleted instance cannot desire running".into());
-        }
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AffinityBinding {
-    pub scope: Scope,
-    pub affinity_key: String,
-    pub session_generation: String,
-    pub instance_id: String,
+    /// Product deletion intent only; Sandbox runtime state belongs to Platform.
+    pub phase: EnvironmentPhase,
 }

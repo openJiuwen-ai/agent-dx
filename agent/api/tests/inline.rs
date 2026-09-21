@@ -14,7 +14,6 @@ use tokio::sync::{Mutex, Notify};
 struct Backend {
     instances: Mutex<BTreeMap<String, SandboxObservation>>,
     creates: AtomicUsize,
-    gets: AtomicUsize,
     deletes: AtomicUsize,
     pause_create: AtomicBool,
     pause_delete: AtomicBool,
@@ -57,7 +56,6 @@ impl Sandbox for Backend {
         tenant: &str,
         id: &str,
     ) -> Result<Option<SandboxObservation>, SandboxError> {
-        self.gets.fetch_add(1, Ordering::SeqCst);
         Ok(self
             .instances
             .lock()
@@ -123,7 +121,6 @@ async fn inline_uses_sandbox_identity_and_survives_adapter_replacement_without_s
     let created = first.create("tenant", request()).await.unwrap();
     assert!(uuid::Uuid::parse_str(&created.instance_id).is_ok());
     assert_eq!(backend.creates.load(Ordering::SeqCst), 1);
-    assert_eq!(backend.gets.load(Ordering::SeqCst), 0);
     assert!(backend
         .instances
         .lock()
@@ -159,7 +156,6 @@ async fn create_returns_success_after_sandbox_acceptance() {
     backend.create_resume.notify_one();
     let created = task.await.unwrap().unwrap();
     assert_eq!(created.code, 200);
-    assert_eq!(backend.gets.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
@@ -217,23 +213,9 @@ async fn create_timeout_reports_unknown_outcome() {
 }
 
 #[tokio::test]
-async fn unsupported_probes_mounts_and_invalid_identity_do_not_reach_backend() {
+async fn invalid_identity_is_rejected_before_backend_operations() {
     let backend = Arc::new(Backend::default());
     let service = service(backend.clone());
-    let mut raw = serde_json::to_value(request()).unwrap();
-    raw["mounts"] = serde_json::json!([{"source":"/host","target":"/target","readonly":false}]);
-    let mounted = serde_json::from_value(raw).unwrap();
-    assert!(matches!(
-        service.create("tenant", mounted).await,
-        Err(Error::Unsupported(_))
-    ));
-    let mut raw = serde_json::to_value(request()).unwrap();
-    raw["runtime_spec"]["probes"] = serde_json::json!({"liveness":{"tcpSocket":{"port":8080}}});
-    let probed = serde_json::from_value(raw).unwrap();
-    assert!(matches!(
-        service.create("tenant", probed).await,
-        Err(Error::Unsupported(_))
-    ));
     assert!(service.create("", request()).await.is_err());
     assert!(service.kill("tenant", "adx-managed-id").await.is_err());
     assert_eq!(backend.creates.load(Ordering::SeqCst), 0);

@@ -1,6 +1,6 @@
 # Agent DX 当前目录与组件边界
 
-核对日期：2026-09-21。此页描述当前源码布局；首次导入记录保留在 [迁移报告](../migration/2026-09-14-import.md)。[HTML 阅读版](repository-layout.html) 从本文件生成，架构图为仓库内 SVG。
+核对日期：2026-09-22。此页描述当前源码布局；首次导入记录保留在 [迁移报告](../migration/2026-09-14-import.md)。[HTML 阅读版](repository-layout.html) 从本文件生成，架构图为仓库内 SVG。
 
 ![当前组件与调用方向](../../assets/architecture/current-architecture.svg)
 
@@ -8,12 +8,14 @@
 
 | 层 | 职责 | 当前状态 |
 |---|---|---|
-| Agent 产品 `agent/` | Agent CLI、编程 SDK、会话和执行编排 | 已迁入；仍使用旧 FaaS/外部运行时。目标通过 Sandbox SDK 使用平台，业务后端迁移尚未完成 |
+| Agent 产品 `agent/` | Template、Environment、无状态 Activator、inline 适配 | Rust 产品 API 集成在 Gateway Edge；Environment 与稳定逻辑 Sandbox 1:1 绑定，首次访问按需激活 |
 | 公开能力 `platform/sdk/sandbox` | Sandbox 生命周期、命令/文件、快照、放置约束 | Python SDK 已实现；客户端保留字段与新服务端支持范围不同 |
 | 执行平台 `platform/` | 通用 Capsule、调度、持久化、节点生命周期、RRT | Master、Node Manager、本地优先创建及 EROFS/OCI 运行环境已接入；当前基础 K8s 八组已通过 |
-| 共享接入 `gateway/` | Sandbox API Server、Edge、Node Proxy、反向代理与转发 | API Server 默认内嵌 Edge；Node Manager 默认内嵌 Node Proxy；Agent upstream 可按地址配置，业务规则仍归 Agent 层 |
+| 共享接入 `gateway/` | Sandbox API Server、Edge、Node Proxy、反向代理与转发 | API Server 默认内嵌 Edge；Node Manager 默认内嵌 Node Proxy；Agent API 装配于 Edge，业务规则归 Agent 层 |
 
-Agent 使用新平台的目标边界是公开 Sandbox SDK，不直接访问平台 Redis/SQLite、内部调度 RPC 或 sandboxd。当前九条 `/api/agent` 兼容路由只负责认证与转发，需要配置 `agent_address` 和真正的 Agent 业务服务；默认部署不具备旧 CLI 的 meta_service/FaaS 接口。
+Agent API 在 Gateway Edge 内处理产品请求，通过配置地址访问无状态 Activator。Activator 持久化 Template/Environment，并调用 Gateway 的 Sandbox 能力接口；Sandbox 适配器访问平台。Agent 不直接操作平台 Redis/SQLite 或 sandboxd。inline create/get/kill 直接调用 Sandbox 适配器。用户 Harness 的 HTTP/WS/SSH 经共享数据面转发，业务协议由用户定义。
+
+API Server 仍保留原有九条 `/api/agent` 兼容转发路由，由 `agent_address` 指向外部 Agent 服务；这是平台侧既有入口，不属于当前 Edge Agent API／Activator 链路，本轮保持不变。
 
 平台内部以 **Capsule + Runtime** 建模。Capsule 是跨节点、暂停恢复和故障接管期间保持不变的逻辑身份，持有期望规格、生命周期、归属和 checkpoint 引用；Runtime 是 sandboxd 在某个节点创建的一次物理执行，具有独立 `runtime_id`，重启、恢复或接管时可以替换。二者通过 `RuntimeIdentity { capsule_id, runtime_id, ownership_generation }` 绑定，Node Manager 只允许当前 generation 的 Runtime 对外提供服务。
 
@@ -29,10 +31,9 @@ agent-dx/
 │   ├── logo/                     # 黑白标志、独立图标和反相版本
 │   └── architecture/             # 系统架构与当前组件调用图
 ├── agent/
-│   ├── cli/ar_cli/                 # Python adx 命令
-│   ├── sdk/python/src/adx/         # Agent 编程 SDK
-│   ├── executor/src/adx/           # Agent Executor
-│   └── tests/                     # Agent 测试及外部运行时替身
+│   ├── api/                       # Gateway 产品入口与 inline 适配
+│   ├── activator/                 # 无状态产品管理与按需激活
+│   └── crates/                    # core 协议模型、store 产品状态；测试随各 crate 放置
 ├── crates/                        # 跨 Gateway / Platform / Runtime 的横切库
 │   ├── error/                     # 稳定错误码、重试与操作结果语义
 │   ├── observability/             # 日志、Metrics、Trace 与进程日志捕获
@@ -64,7 +65,7 @@ agent-dx/
 │   │   └── docs/                  # Sandbox HTTP 支持范围
 │   └── src/
 │       ├── common/                # Gateway 内部监听、路由与数据面协议
-│       ├── edge/                  # 路由订阅、认证、连接池、反向代理
+│       ├── edge/                  # Agent/Sandbox 适配、路由订阅、认证、连接池、反向代理
 │       ├── node/                  # NodeProxyService、绑定、活动、转发
 │       └── bin/                   # Edge、Node Proxy、forwarder
 ├── third_party/sandboxd/          # 锁定后端协议、来源与许可证
@@ -131,7 +132,7 @@ Proxy 首次启动关闭 Capsule 准入，Node Manager 完成权威对账与全�
 
 ## 构建、部署和验收
 
-Rust 共用根 Cargo workspace，Python 独立打包；外部 sandboxd 按其锁定版本构建。`adx` 是 Agent CLI；`adxctl` 是平台运维 CLI，支持 validate/render/run/start/status/stop。统一发布包带控制面、Gateway、静态 RRT、Sandbox SDK、EROFS 运行环境和锁定 Redis；可选择外部 Redis，sandboxd 始终由部署环境托管。运行环境也可使用不可变 OCI image；自定义用户镜像从同一环境只读挂载 `/__adx`。
+Rust 共用根 Cargo workspace，Python 独立打包；外部 sandboxd 按其锁定版本构建。`adxctl` 是平台运维 CLI，支持 validate/render/run/start/status/stop。统一发布包带控制面、Gateway、静态 RRT、Sandbox SDK、EROFS 运行环境和锁定 Redis；可选择外部 Redis，sandboxd 始终由部署环境托管。运行环境也可使用不可变 OCI image；自定义用户镜像从同一环境只读挂载 `/__adx`。
 
 普通进程与 Pod 内都使用相同组件和 supervisor。Buildkite 先构建，再发布不可变镜像，最后独立执行 K8s 八组用例及清理。[Buildkite #30](../testing/2026-09-18-runtime-environment-k8s.md) 已验证 Rust API Server、本地优先创建及 OCI default/runtime-only/custom 三种环境路径；两个 Pod 同宿主。本地 FC 与基础 K8s 分开统计，实际未完成项和后置项见 [路线图](../testing/control-plane-roadmap.md)。
 

@@ -108,7 +108,7 @@ fn fixture_with_backend(
     let api = Arc::new(AgentApi {
         inline,
         managed: None,
-        dispatcher: None,
+        activator: None,
     });
     let store = Arc::new(RouteStore::new());
     store.set_ready(true);
@@ -180,7 +180,7 @@ async fn json(response: Response<Incoming>) -> serde_json::Value {
 #[tokio::test]
 async fn legacy_inline_http_contract_and_tenant_boundary() {
     let (gateway, _) = fixture();
-    assert!(gateway.ready()); // No Dispatcher has been constructed.
+    assert!(gateway.ready());
     let (mut sender, server, client) = connection(gateway, IngressSecurity::Tls).await;
     let response = sender
         .send_request(request(
@@ -198,7 +198,6 @@ async fn legacy_inline_http_contract_and_tenant_boundary() {
     assert_eq!(created["code"], 200);
     let id = created["instance_id"].as_str().unwrap();
     assert!(uuid::Uuid::parse_str(id).is_ok());
-    assert_eq!(created.as_object().unwrap().len(), 2);
     let path = format!("/api/agent/{id}");
     let response = sender
         .send_request(request(
@@ -358,76 +357,63 @@ async fn inline_sandbox_identity_is_preserved_for_http_ws_and_connect() {
     api.inline.kill("tenant", &id).await.unwrap();
 }
 
-struct DispatchFixture {
-    state: AgentState,
-    id: String,
-    down: AtomicBool,
-    seen: Mutex<Vec<adx_agent_core::dispatcher::ResolveRequest>>,
+struct ControlFixture {
+    inner: adx_activator::Activator,
 }
 #[async_trait::async_trait]
-impl adx_agent_api::dispatcher::Dispatch for DispatchFixture {
-    async fn resolve(
+impl adx_agent_api::activator::Control for ControlFixture {
+    async fn publish(
         &self,
-        r: &adx_agent_core::dispatcher::ResolveRequest,
-    ) -> adx_agent_api::Result<adx_agent_core::dispatcher::Target> {
-        if self.down.load(Ordering::SeqCst) {
-            return Err(adx_agent_api::Error::Unavailable(
-                "Dispatcher stopped".into(),
-            ));
-        }
-        self.seen.lock().unwrap().push(r.clone());
-        self.state
-            .reserve_cold_start(&r.scope, &self.id, &format!("adx-{}", self.id))
-            .await?;
-        self.state.mark_ready(&r.scope.tenant, &self.id).await?;
-        Ok(adx_agent_core::dispatcher::Target::from_instance(
-            &self
-                .state
-                .instance(&r.scope.tenant, &self.id)
-                .await?
-                .unwrap(),
-        ))
+        tenant: &str,
+        template: &adx_agent_core::TemplateVersion,
+    ) -> adx_agent_api::Result<()> {
+        self.inner.publish(tenant, template).await
     }
-    async fn release(&self, scope: &adx_agent_core::Scope) -> adx_agent_api::Result<()> {
-        let session = self.state.release_session(scope).await?;
-        for id in &session.instances {
-            self.state.begin_delete(&scope.tenant, id).await?;
-            self.state.confirm_deleted(&scope.tenant, id).await?;
-        }
-        self.state
-            .finish_session_delete(scope, &session.generation)
-            .await?;
-        Ok(())
+    async fn template(
+        &self,
+        tenant: &str,
+        name: &str,
+        version: &str,
+    ) -> adx_agent_api::Result<adx_agent_core::TemplateVersion> {
+        self.inner.template(tenant, name, version).await
     }
-    async fn release_instance(
+    async fn create_environment(
         &self,
         scope: &adx_agent_core::Scope,
-        id: &str,
-    ) -> adx_agent_api::Result<()> {
-        self.state.begin_delete(&scope.tenant, id).await?;
-        self.state
-            .confirm_deleted(&scope.tenant, id)
-            .await
-            .map_err(Into::into)
+    ) -> adx_agent_api::Result<adx_agent_core::Environment> {
+        self.inner.create_environment(scope.clone()).await
+    }
+    async fn environment(
+        &self,
+        scope: &adx_agent_core::Scope,
+    ) -> adx_agent_api::Result<adx_agent_core::Environment> {
+        self.inner.environment(scope).await
+    }
+    async fn delete_environment(&self, scope: &adx_agent_core::Scope) -> adx_agent_api::Result<()> {
+        self.inner.delete_environment(scope).await
+    }
+    async fn activate(
+        &self,
+        scope: &adx_agent_core::Scope,
+    ) -> adx_agent_api::Result<adx_agent_core::activator::Target> {
+        self.inner.activate(scope).await
     }
 }
 #[tokio::test]
-async fn managed_routes_resolve_services_and_keep_inline_independent_of_dispatcher() {
+async fn managed_environment_management_and_protocol_forwarding() {
     let (gateway, inline) = fixture();
-    let state = AgentState::new(Arc::new(MemoryRepository::default()));
-    let dispatch = Arc::new(DispatchFixture {
-        state: state.clone(),
-        id: uuid::Uuid::new_v4().to_string(),
-        down: AtomicBool::new(false),
-        seen: Mutex::new(vec![]),
+    let control = Arc::new(ControlFixture {
+        inner: adx_activator::Activator::new(
+            AgentState::new(Arc::new(MemoryRepository::default())),
+            Arc::new(Backend::default()),
+        ),
     });
     let api = Arc::new(AgentApi {
         inline: inline.inline.clone(),
         managed: Some(Arc::new(adx_agent_api::managed::ManagedService::new(
-            state.clone(),
-            dispatch.clone(),
+            control,
         ))),
-        dispatcher: None,
+        activator: None,
     });
     let gateway = Arc::new(
         Arc::try_unwrap(gateway)
@@ -436,7 +422,7 @@ async fn managed_routes_resolve_services_and_keep_inline_independent_of_dispatch
             .with_agent_api(api.clone()),
     );
     let (mut sender, server, client) = connection(gateway.clone(), IngressSecurity::Tls).await;
-    let template = serde_json::json!({"name":"demo","version":"1","image":"app:1","isolation_runtime":"runc","entrypoint":["/app/start"],"resources":{"cpu_millis":1000,"memory_mib":1024},"service":[{"protocol":"http","port":8080},{"protocol":"ws","port":8080},{"protocol":"ssh","port":22}]});
+    let template = serde_json::json!({"name":"demo","version":"1","image":"app:1","isolation_runtime":"runc","entrypoint":["/start"],"resources":{"cpu_millis":1000,"memory_mib":512},"service":[{"protocol":"http","port":8080},{"protocol":"ws","port":8080},{"protocol":"ssh","port":22}]});
     let response = sender
         .send_request(request(
             "POST",
@@ -449,194 +435,76 @@ async fn managed_routes_resolve_services_and_keep_inline_independent_of_dispatch
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     json(response).await;
-    let session = "/api/agent/v2/templates/demo/versions/1/sessions/test";
+    let path = "/api/agent/v2/templates/demo/versions/1/environments/env";
     let response = sender
         .send_request(request(
             "PUT",
-            session,
+            path,
             "tenant",
-            "session",
+            "create",
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let environment = json(response).await["environment"].clone();
+    let id = environment["sandbox_id"].as_str().unwrap();
+    let response = sender
+        .send_request(request(
+            "POST",
+            &format!("{path}/resolve"),
+            "tenant",
+            "ssh",
+            serde_json::json!({"protocol":"ssh"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let resolved = json(response).await;
+    assert_eq!(resolved["sandbox_id"], id);
+    assert_eq!(resolved["port"], 22);
+    for protocol in ["http", "ws"] {
+        let mut builder = Request::builder()
+            .uri(format!("/agent/v2/demo/1/env/{protocol}/8080/path?q=1"))
+            .header("authorization", "Bearer tenant");
+        if protocol == "ws" {
+            builder = builder.header("upgrade", "websocket");
+        }
+        let mut data = builder.body(()).unwrap();
+        gateway
+            .prepare_agent_data(&mut data, IngressSecurity::Tls)
+            .await
+            .unwrap();
+        assert_eq!(data.uri().to_string(), format!("/{id}/8080/path?q=1"));
+        assert!(api.retry_data(&mut data).await.unwrap());
+        assert!(!api.retry_data(&mut data).await.unwrap());
+    }
+    let response = sender
+        .send_request(request(
+            "DELETE",
+            path,
+            "tenant",
+            "delete",
             serde_json::json!({}),
         ))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     json(response).await;
-    let empty_body = Request::builder()
-        .method("PUT")
-        .uri(session)
-        .header("authorization", "Bearer tenant")
-        .body(Full::new(Bytes::new()))
-        .unwrap();
-    let repeated = sender.send_request(empty_body).await.unwrap();
-    assert_eq!(repeated.status(), StatusCode::OK);
-    let session_record = json(repeated).await;
-    assert_eq!(
-        session_record["session"]["instances"],
-        serde_json::json!([])
-    );
-    assert!(dispatch.seen.lock().unwrap().is_empty());
-    let response = sender
-        .send_request(request(
-            "POST",
-            &format!("{session}/resolve"),
-            "tenant",
-            "resolve",
-            serde_json::json!({"protocol":"ssh","affinity_key":"sticky"}),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let target = json(response).await;
-    assert_eq!(target["port"], 22);
-    assert_eq!(target["instance_id"], dispatch.id);
-    assert_eq!(target["sandbox_id"], format!("adx-{}", dispatch.id));
-    let authority = format!("{}:22", target["sandbox_id"].as_str().unwrap());
-    let mut connect = Request::builder()
-        .method("CONNECT")
-        .uri(&authority)
-        .body(())
-        .unwrap();
-    gateway
-        .prepare_agent_data(&mut connect, IngressSecurity::Tls)
-        .await
-        .unwrap();
-    assert_eq!(connect.uri().to_string(), authority);
-
-    let mut data = Request::builder()
-        .uri("/agent/v2/demo/1/test/http/8080/chat?query=original")
-        .header("authorization", "Bearer tenant")
-        .header("x-adx-affinity-key", "sticky")
-        .body(())
-        .unwrap();
-    gateway
-        .prepare_agent_data(&mut data, IngressSecurity::Tls)
-        .await
-        .unwrap();
-    assert_eq!(
-        data.uri().to_string(),
-        format!("/adx-{}/8080/chat?query=original", dispatch.id)
-    );
-    assert!(!data.headers().contains_key("x-adx-affinity-key"));
-    assert_eq!(
-        dispatch
-            .seen
-            .lock()
-            .unwrap()
-            .last()
-            .unwrap()
-            .affinity_key
-            .as_deref(),
-        Some("sticky")
-    );
-    assert!(api.retry_data(&mut data).await.unwrap());
-    assert!(dispatch.seen.lock().unwrap().last().unwrap().bypass_cache);
-    assert_eq!(
-        data.uri().to_string(),
-        format!("/adx-{}/8080/chat?query=original", dispatch.id)
-    );
-    assert!(!api.retry_data(&mut data).await.unwrap());
-    // Exercise the complete request path: this fixture has no backend route, so Gateway
-    // must re-resolve once, with the original affinity, without consuming/replaying a body.
-    let before = dispatch.seen.lock().unwrap().len();
-    let req = Request::builder()
-        .method("POST")
-        .uri("/agent/v2/demo/1/test/http/8080/chat?x=1")
-        .header("authorization", "Bearer tenant")
-        .header("x-adx-affinity-key", "sticky")
-        .body(Full::new(Bytes::from_static(b"business-payload")))
-        .unwrap();
-    let response = sender.send_request(req).await.unwrap();
-    assert!(response.status().is_server_error() || response.status() == StatusCode::NOT_FOUND);
-    response.into_body().collect().await.unwrap();
-    {
-        let seen = dispatch.seen.lock().unwrap();
-        assert_eq!(seen.len(), before + 2);
-        assert!(!seen[before].bypass_cache);
-        assert!(seen[before + 1].bypass_cache);
-        assert_eq!(seen[before + 1].affinity_key.as_deref(), Some("sticky"));
-    }
-    let response = sender
-        .send_request(request(
-            "DELETE",
-            &format!("/api/agent/{}", dispatch.id),
-            "tenant",
-            "wrong-delete",
-            serde_json::Value::Null,
-        ))
-        .await
-        .unwrap();
-    // Inline passes this UUID straight to Sandbox. The managed Sandbox uses adx-UUID,
-    // so it cannot be deleted through this endpoint and ADX state is untouched.
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    json(response).await;
-    assert_eq!(
-        state
-            .instance("tenant", &dispatch.id)
-            .await
-            .unwrap()
-            .unwrap()
-            .phase,
-        adx_agent_core::InstancePhase::Ready
-    );
     let response = sender
         .send_request(request(
             "GET",
-            &format!("{session}/instances/{}", dispatch.id),
+            path,
             "tenant",
-            "get-instance",
-            serde_json::Value::Null,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(json(response).await["instance"]["id"], dispatch.id);
-    let response = sender
-        .send_request(request(
-            "GET",
-            &format!("{session}/instances/{}", dispatch.id),
-            "other",
-            "other-instance",
-            serde_json::Value::Null,
+            "read",
+            serde_json::json!({}),
         ))
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
     json(response).await;
-    dispatch.down.store(true, Ordering::SeqCst);
-    let response = sender
-        .send_request(request(
-            "POST",
-            &format!("{session}/resolve"),
-            "tenant",
-            "down",
-            serde_json::json!({"protocol":"http"}),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    json(response).await;
-    let response = sender
-        .send_request(request("POST", "/api/agent", "tenant", "inline", input()))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    json(response).await;
-    dispatch.down.store(false, Ordering::SeqCst);
-    let response = sender
-        .send_request(request(
-            "DELETE",
-            session,
-            "tenant",
-            "release",
-            serde_json::Value::Null,
-        ))
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(json(response).await["status"], "deleted");
-    client.abort();
     server.abort();
+    client.abort();
 }
 
 #[tokio::test]
@@ -724,30 +592,21 @@ async fn only_managed_data_entrypoint_resolves_and_reuses_authenticated_identity
         tenant: "tenant".into(),
         template: "test".into(),
         version: "1".into(),
-        session_id: "session".into(),
+        environment_id: "env".into(),
     };
     let template = serde_json::from_value(serde_json::json!({"name":"test","version":"1","image":"app:1","isolation_runtime":"runc","entrypoint":["/start"],"resources":{"cpu_millis":1000,"memory_mib":512},"service":[{"protocol":"http","port":8080}]})).unwrap();
     state.publish("tenant", &template).await.unwrap();
-    state.create_session(scope.clone()).await.unwrap();
-    let id = uuid::Uuid::new_v4().to_string();
-    state
-        .reserve_cold_start(&scope, &id, &format!("adx-{id}"))
-        .await
-        .unwrap();
-    state.mark_ready("tenant", &id).await.unwrap();
-    let dispatch = Arc::new(DispatchFixture {
-        state: state.clone(),
-        id: id.clone(),
-        down: AtomicBool::new(false),
-        seen: Mutex::new(vec![]),
+    state.create_environment(scope.clone()).await.unwrap();
+    let id = state.environment(&scope).await.unwrap().unwrap().sandbox_id;
+    let control = Arc::new(ControlFixture {
+        inner: adx_activator::Activator::new(state.clone(), Arc::new(Backend::default())),
     });
     gateway = gateway.with_agent_api(Arc::new(AgentApi {
         inline: api.inline.clone(),
         managed: Some(Arc::new(adx_agent_api::managed::ManagedService::new(
-            state,
-            dispatch.clone(),
+            control,
         ))),
-        dispatcher: None,
+        activator: None,
     }));
     // Even a UUID present in ADX state is a literal Sandbox target on shared routes.
     for target in [&id, &format!("adx-{id}")] {
@@ -775,9 +634,8 @@ async fn only_managed_data_entrypoint_resolves_and_reuses_authenticated_identity
         }
     }
     assert_eq!(verifier.0.load(Ordering::SeqCst), 0);
-    assert!(dispatch.seen.lock().unwrap().is_empty());
     let mut request = Request::builder()
-        .uri("/agent/v2/test/1/session/http/8080/")
+        .uri("/agent/v2/test/1/env/http/8080/")
         .header("authorization", "Bearer tenant")
         .body(())
         .unwrap();
@@ -793,10 +651,10 @@ async fn only_managed_data_entrypoint_resolves_and_reuses_authenticated_identity
             .unwrap(),
         "tenant"
     );
-    assert_eq!(request.uri().path(), format!("/adx-{id}/8080/"));
+    assert_eq!(request.uri().path(), format!("/{id}/8080/"));
     assert_eq!(verifier.0.load(Ordering::SeqCst), 1);
     let mut wrong = Request::builder()
-        .uri("/agent/v2/test/1/session/http/8080/")
+        .uri("/agent/v2/test/1/env/http/8080/")
         .header("authorization", "Bearer other")
         .body(())
         .unwrap();
@@ -841,7 +699,7 @@ async fn agent_management_timeout_distinguishes_queries_from_writes() {
     }
 }
 #[tokio::test]
-async fn inline_only_initializes_without_redis_or_dispatcher() {
+async fn inline_only_create_and_kill() {
     let config = serde_json::from_value(serde_json::json!({
         "mode":"inline_only", "backend_timeout_seconds":2, "max_inflight":4,
         "inline_profiles":[{"sandbox_type":"docker","request_image":"app:1","image":"app:1","isolation_runtime":"runc","working_dir":"/"}]
