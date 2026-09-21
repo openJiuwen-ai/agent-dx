@@ -1,17 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
 : "${ADX_E2E_IMAGE_REPOSITORY:?set the registry repository}"
+: "${ADX_BASE_PACKAGE_BUILD_ID:?set the immutable base-package Buildkite build UUID}"
+: "${ADX_SDK_BUILD_ID:?set the immutable Python SDK Buildkite build UUID}"
 [[ -z $(git status --porcelain) ]] || { echo 'clean checkout required'; exit 1; }
 [[ $(git rev-parse HEAD) == "$BUILDKITE_COMMIT" ]]
 mkdir -p out/buildkite/logs
-buildkite-agent artifact download 'out/buildkite/summaries/release.json' . --step platform-build
 echo "--- :package: Verify release artifact handoff"
-buildkite-agent artifact download 'out/buildkite/adx-release.tar.gz' . --step platform-build
-buildkite-agent artifact download 'out/buildkite/adx-release.tar.gz.sha256' . --step platform-build
+buildkite-agent artifact download 'out/buildkite/adx-release.tar.gz' . --step platform-build --build "$ADX_BASE_PACKAGE_BUILD_ID"
+buildkite-agent artifact download 'out/buildkite/adx-release.tar.gz.sha256' . --step platform-build --build "$ADX_BASE_PACKAGE_BUILD_ID"
 (cd out/buildkite && sha256sum --check adx-release.tar.gz.sha256)
 mkdir -p out/buildkite/package
 tar -xzf out/buildkite/adx-release.tar.gz -C out/buildkite/package
-buildkite-agent artifact download 'out/buildkite/backend/*' . --step platform-build
+buildkite-agent artifact download 'out/buildkite/backend/*' . --step platform-build --build "$ADX_BASE_PACKAGE_BUILD_ID"
+echo "--- :python: Verify independent Sandbox SDK handoff"
+buildkite-agent artifact download 'out/buildkite/sdk/sdk-candidate.json' . --step sdk-package --build "$ADX_SDK_BUILD_ID"
+buildkite-agent artifact download 'out/buildkite/sdk/adx_sandbox-*.whl' . --step sdk-package --build "$ADX_SDK_BUILD_ID"
+sdk_wheels=(out/buildkite/sdk/adx_sandbox-*.whl)
+[[ ${#sdk_wheels[@]} == 1 && -f ${sdk_wheels[0]} ]] || { echo 'exactly one SDK wheel is required' >&2; exit 1; }
 daemon_pid=''
 cleanup() {
   if [[ -n "$daemon_pid" ]]; then
@@ -52,6 +58,9 @@ if [[ ${ADX_E2E_CHECKPOINT:-0} == 1 ]]; then
   : "${ADX_FC_KIT_DIR:?checkpoint profile requires a verified native Firecracker kit directory or artifact build}"
   fc_args=(--firecracker-kit "$ADX_FC_KIT_DIR")
 fi
-python3 -u build/e2e/prepare.py --package out/buildkite/package --backend out/buildkite/backend --runtime-base "$ADX_E2E_RUNTIME_BASE" --rrt-base "$ADX_E2E_RRT_BASE" --output out/buildkite/bundle "${fc_args[@]}" 2>&1 | tee out/buildkite/logs/prepare.log
+python3 -u build/e2e/prepare.py --package out/buildkite/package --backend out/buildkite/backend \
+  --sdk-wheel "${sdk_wheels[0]}" --sdk-candidate out/buildkite/sdk/sdk-candidate.json \
+  --runtime-base "$ADX_E2E_RUNTIME_BASE" --rrt-base "$ADX_E2E_RRT_BASE" \
+  --output out/buildkite/bundle "${fc_args[@]}" 2>&1 | tee out/buildkite/logs/prepare.log
 echo "--- :docker: Push immutable image references"
 python3 -u build/e2e/kubernetes/publish_images.py --bundle out/buildkite/bundle --repository "$ADX_E2E_IMAGE_REPOSITORY" 2>&1 | tee out/buildkite/logs/publish-images.log

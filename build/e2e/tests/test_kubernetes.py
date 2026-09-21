@@ -161,7 +161,7 @@ class KubernetesLifecycleTests(unittest.TestCase):
     def test_pipeline_can_reuse_an_exact_prior_image_build(self):
         repository=ROOT.parents[1]
         script=(repository/'.buildkite/run-e2e.sh').read_text()
-        pipeline=(repository/'.buildkite/pipeline.yml').read_text()
+        pipeline=(repository/'.buildkite/pipeline-full.yml').read_text()
         summary=(repository/'.buildkite/summary.py').read_text()
         self.assertIn('ADX_E2E_ARTIFACT_BUILD',script)
         self.assertIn('ADX_E2E_ARTIFACT_COMMIT',script)

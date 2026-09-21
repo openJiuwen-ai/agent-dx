@@ -5,7 +5,7 @@
 
 当前正式验证：[Buildkite #30 OCI 运行环境、八组基础 Kubernetes、Metrics、日志与 Trace 验收](2026-09-18-runtime-environment-k8s.md)。它包含 Rust API Server、本地优先创建和自定义镜像 bootstrap；FC 按当前决策继续本地验收。
 
-2026-09-15。开发验证在本地执行，Buildkite 使用完整系统的端到端验收入口。统一包、两节点环境驱动器和流水线配置已落地：`build/e2e/prepare.py` 构建验收制品，`build/e2e/kubernetes/run.py` 在目标 Kubernetes 集群部署、验收、收集并清理。真实 sandboxd、本次包内 RRT 和安装后的 SDK 均参与执行。流水线复用现有 default/linux/amd64 队列、builder/packager/deployer、目标 kubeconfig 挂载与 SWR Secret，见 [Buildkite 说明](../../.buildkite/README.md)。本地通过不等于远端 Buildkite 已通过。
+开发验证在本地执行，Buildkite 分为基础包、Python SDK 和 Full 三条独立流水线。Full 只消费显式指定的基础包与 SDK build UUID；`build/e2e/prepare.py` 组合并校验验收镜像，`build/e2e/kubernetes/run.py` 在目标 Kubernetes 集群部署、验收、收集并清理。真实 sandboxd、基础包内 RRT 和独立 SDK wheel 均参与执行。流水线复用现有 default/linux/amd64 队列、builder/packager/deployer、目标 kubeconfig 挂载与 SWR Secret，见 [Buildkite 说明](../../.buildkite/README.md)。本地通过不等于远端 Buildkite 已通过。
 
 ## 本地开发验证
 
@@ -58,18 +58,19 @@ export PIP_CACHE_DIR=/your/cache/pip
 ## Buildkite 端到端验收契约
 
 ```text
-本次提交 → 构建统一部署包及 SDK wheel → 制品校验
-                                    ↓
-                        部署独立 namespace 内的两节点完整平台
-                                    ↓
-                       就绪检查 → 公共 SDK E2E
-                                    ↓
-                       结果与诊断收集 → 环境清理
+agent-dx → 基础包候选 ┐
+                       ├→ agent-dx-full-test → 镜像组合与校验
+agent-dx-python-sdk ───┘                         ↓
+                              独立 namespace 内两节点完整平台
+                                                 ↓
+                                    就绪检查 → 公共 SDK E2E
+                                                 ↓
+                                    结果与诊断收集 → 环境清理
 ```
 
 ### 1. 构建及制品交接
 
-从本次提交生成 Master、Node Manager、Sandbox API、Edge、Node Proxy、RRT、部署工具与 Sandbox SDK；统一包清单记录 commit、各组件版本、外部依赖版本与 SHA256。运行阶段下载并验证这一批制品，部署阶段不重新编译或从开发机借用程序。四个 Python 包构建成功只是构建检查的一部分。
+基础包流水线生成 Master、Node Manager、Sandbox API、Edge、Node Proxy、RRT 和部署工具；SDK 流水线独立测试并生成 wheel、sdist 与候选清单。Full 要求 `ADX_BASE_PACKAGE_BUILD_ID` 和 `ADX_SDK_BUILD_ID`，核对 commit 和 SHA256 后才组合镜像；部署阶段不重新编译或从开发机借用程序。
 
 `build/images/Dockerfile.ci` 保留为构建环境配方，发布后按 digest 引用。运行环境按 sandboxd 的真实运行要求配置；Buildkite 以 Kubernetes Pod 承载测试进程，Pod 内使用统一 supervisor；通过 kubectl 清单部署，不增加产品 Kubernetes 控制器。
 
@@ -84,7 +85,7 @@ export PIP_CACHE_DIR=/your/cache/pip
 
 ### 3. 公共 SDK 执行用例
 
-默认 `k8s-basic` 门禁包含五组有界用例：SDK 创建／命令／文件／删除、API Key 与租户隔离、资源不足与释放后重新调度、双节点放置约束，以及本地优先创建与同 ID 并发收敛。放置组检查实例亲和 OR、实例反亲和、加权与有序节点偏好、每个 OR 分支的 node_id 约束及反向实例反亲和，并比对实际节点归属。业务操作使用公共 SDK；管理查询和只读状态检查用于验证内部结果，不替代真实调用链。
+Full 流水线默认执行十组用例：SDK、数据面、生命周期、认证、容量、放置、本地优先、节点故障、进程重启和停机清理。需要有界诊断时可显式选择 `k8s-basic`，它包含 SDK 创建／命令／文件／删除、API Key 与租户隔离、资源不足与释放后重新调度、双节点放置约束，以及本地优先创建与同 ID 并发收敛。放置组检查实例亲和 OR、实例反亲和、加权与有序节点偏好、每个 OR 分支的 node_id 约束及反向实例反亲和，并比对实际节点归属。业务操作使用公共 SDK；管理查询和只读状态检查用于验证内部结果，不替代真实调用链。
 
 完整数据面资源发现／重连／PTY／端口转发、detached／空闲回收生命周期、心跳超时与恢复清理、Node Manager 重启和 supervisor 停机清理放在本地 `standalone` 与 K8s `full`。这些场景包含固定等待、故障注入或完整停机，保留为完整验收门禁，不进入每次提交的基础路径。
 
@@ -102,7 +103,7 @@ export PIP_CACHE_DIR=/your/cache/pip
 
 ### 接入状态
 
-`.buildkite/README.md` 保存端到端流程约定。流水线有三个独立步骤：`platform-build` 构建与交接发布包，`platform-images` 发布固定 digest 的节点／RRT 镜像，`platform-e2e` 部署 Kubernetes。默认 `k8s-basic` 执行五组；主分支、合入候选和发布候选通过 `ADX_E2E_PROFILE=full` 执行十组。运行阶段只使用本次制品并验证 commit、架构及 SHA256；所选场景和环境清理全部成功后才通过。Buildkite #30 保留为此前八组的正式证据；当前分层需产生新的正式结果。
+`.buildkite/README.md` 保存端到端流程约定。基础包、Python SDK 和 Full 是三个独立 Buildkite pipeline；Full 内的 `platform-images` 组合固定候选，`platform-e2e` 部署 Kubernetes。Full 默认执行十组，`k8s-basic` 仅用于显式的有界诊断。运行阶段只使用指定 build UUID 的制品并验证 commit、架构及 SHA256；所选场景和环境清理全部成功后才通过。Buildkite #58 是拆分前十组 Full 的正式证据；独立流水线还需产生新的正式结果。
 
 本地组件测试继续用于每一步的测试驱动开发；同一套完整 E2E 驱动器也应支持在具备环境的本地机器上复现 Buildkite 失败。
 

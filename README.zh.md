@@ -164,6 +164,10 @@ make package PYTHON=/path/to/venv/bin/python
 
 组件与集成测试使用 `python3 build/ci/run.py <suite>`。端到端门禁使用已安装发布包、公开 Sandbox SDK、Redis、Gateway、控制面、sandboxd 和 RRT。环境要求与门禁定义见[控制面 CI](docs/testing/control-plane-ci.md)和 [Kubernetes E2E 指南](build/e2e/kubernetes/README.md)。
 
+Buildkite 使用相互独立的 `agent-dx`、`agent-dx-python-sdk` 和
+`agent-dx-full-test` 三条流水线。Full 流水线只消费显式指定的基础包与 SDK build
+UUID，不重新构建任一候选；契约见 [Buildkite 流水线说明](.buildkite/README.md)。
+
 SDK 发布名为 `adx-sandbox`，Python 导入名为 `adx_sandbox`，CLI 为 `adx-sandbox`。ADX 环境变量使用 `ADX_` 前缀，内部品牌 HTTP 头使用 `X-ADX-`。
 
 ## 📚 深入了解

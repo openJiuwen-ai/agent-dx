@@ -7,7 +7,7 @@ set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$root"
 output=out/buildkite/obs
-rm -rf "$output" out/buildkite/backend out/buildkite/sdk
+rm -rf "$output" out/buildkite/backend
 mkdir -p "$output" out/buildkite/logs
 
 exec > >(tee out/buildkite/logs/step-obs.log) 2>&1
@@ -16,7 +16,6 @@ echo "--- :arrow_down: Download verified build artifacts"
 buildkite-agent artifact download 'out/buildkite/adx-release.tar.gz' . --step platform-build
 buildkite-agent artifact download 'out/buildkite/adx-release.tar.gz.sha256' . --step platform-build
 buildkite-agent artifact download 'out/buildkite/release-manifest.json' . --step platform-build
-buildkite-agent artifact download 'out/buildkite/sdk/*.whl' . --step platform-build
 buildkite-agent artifact download 'out/buildkite/backend/*' . --step platform-build
 
 (cd out/buildkite && sha256sum --check adx-release.tar.gz.sha256)
@@ -54,8 +53,7 @@ artifacts=(
   "$runtime_archive"
   "$runtime_archive.sha256"
 )
-while IFS= read -r wheel; do artifacts+=("$wheel"); done < <(find out/buildkite/sdk -maxdepth 1 -type f -name '*.whl' -print | sort)
-[[ ${#artifacts[@]} -ge 6 ]] || { echo 'SDK wheel missing from build artifacts' >&2; exit 1; }
+[[ ${#artifacts[@]} -eq 5 ]] || { echo 'base package artifact set is incomplete' >&2; exit 1; }
 
 echo "--- :cloud: Upload ADX artifacts to Huawei Cloud OBS"
 "$python" -c 'from obs import ObsClient' >/dev/null 2>&1 || {

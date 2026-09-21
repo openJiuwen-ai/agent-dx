@@ -164,6 +164,11 @@ make package PYTHON=/path/to/venv/bin/python
 
 Run component and integration suites with `python3 build/ci/run.py <suite>`. End-to-end gates use installed release artifacts, the public Sandbox SDK, Redis, Gateway, the control plane, sandboxd, and RRT. Environment requirements and gate definitions are in [control-plane CI](docs/testing/control-plane-ci.md) and the [Kubernetes E2E guide](build/e2e/kubernetes/README.md).
 
+Buildkite uses independent `agent-dx`, `agent-dx-python-sdk`, and
+`agent-dx-full-test` pipelines. The Full pipeline consumes explicit base-package
+and SDK build UUIDs and does not rebuild either candidate. See the
+[Buildkite pipeline contract](.buildkite/README.md).
+
 The SDK distribution is `adx-sandbox`, its Python import is `adx_sandbox`, and its CLI is `adx-sandbox`. ADX environment variables use the `ADX_` prefix, and internal branded HTTP headers use `X-ADX-`.
 
 ## 📚 Learn more

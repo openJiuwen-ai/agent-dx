@@ -24,7 +24,7 @@ class ExistingCiCredentialsTests(unittest.TestCase):
         self.assertIn('--step platform-images',script)
     def test_node_preparation_is_explicit_scoped_and_persistent(self):
         script=(ROOT/'.buildkite/prepare-k8s-node.sh').read_text()
-        pipeline=(ROOT/'.buildkite/pipeline.yml').read_text()
+        pipeline=(ROOT/'.buildkite/pipeline-maintenance.yml').read_text()
         self.assertIn('ADX_K8S_PREPARE_NODE_NAMES',script)
         self.assertIn('nodeName',script)
         self.assertIn('hostNetwork',script)

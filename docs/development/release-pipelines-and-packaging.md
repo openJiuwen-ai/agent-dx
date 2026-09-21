@@ -13,12 +13,19 @@ Full 流水线消费不可变制品，不得从源码重新编译或替换二进
 
 ## 当前实现与调整边界
 
-当前 `.buildkite/pipeline.yml` 依次完成平台构建、镜像发布和 Kubernetes E2E；
-`build/release/build.sh` 同时编译 Rust 平台、RRT 和 Python SDK，统一
-`adx-release.tar.gz` 内还包含 SDK wheel。它已经提供了干净提交检查、Cargo 缓存、
-逐文件 SHA256、镜像 digest 和 K8s 验收基础，但各类制品的生命周期耦合在一起。
+当前仓库已经提供三个独立配置入口：基础出包使用
+`.buildkite/pipeline-package.yml`，Python SDK 出包使用
+`.buildkite/pipeline-sdk.yml`，Full 验收使用 `.buildkite/pipeline-full.yml`。
+`.buildkite/pipeline.yml` 只根据 Buildkite pipeline slug 分派配置。Full 组合阶段要求显式
+传入基础包与 SDK 的 Buildkite build UUID，并校验提交、候选清单和文件 SHA256。
 
-调整后：
+现阶段 `build/release/build.sh` 仍同时编译 Rust 平台、RRT 和 Python SDK，兼容的一体化
+`adx-release.tar.gz` 仍包含 SDK wheel。独立 SDK 流水线输出的 wheel、sdist 与
+`sdk-candidate.json` 是 Full 验收的 SDK 输入；Full 不使用基础包内的 wheel。继续拆分
+Platform、RRT 和 Runtime Pack 的归档属于后续包结构改造，不能把当前一体包描述成已经
+完成拆分。
+
+目标边界：
 
 - Platform 包不再包含 RRT 或 Python SDK，也不把 RRT payload 或 wheel 当作平台包
   完整性的必需文件。
@@ -33,7 +40,7 @@ Full 流水线消费不可变制品，不得从源码重新编译或替换二进
 
 ## 流水线一：ADX Base Packages
 
-建议 Buildkite pipeline 名称为 `adx-base-package`，配置入口为
+Buildkite pipeline slug 为 `agent-dx`，配置入口为
 `.buildkite/pipeline-package.yml`。
 
 ### 触发
@@ -117,7 +124,7 @@ API Server（默认内嵌 Edge）或 Standalone，避免按角色维护多套二
 
 ## 流水线二：ADX Python SDK Package
 
-建议 Buildkite pipeline 名称为 `adx-python-sdk`，配置入口为
+Buildkite pipeline slug 为 `agent-dx-python-sdk`，配置入口为
 `.buildkite/pipeline-sdk.yml`。
 
 ### 触发
@@ -156,7 +163,7 @@ SDK wheel 不再隐式跟随平台版本。一个 ADX release 通过 `release.js
 
 ## 流水线三：ADX Full Acceptance
 
-建议 Buildkite pipeline 名称为 `adx-full-test`，配置入口为
+Buildkite pipeline slug 为 `agent-dx-full-test`，配置入口为
 `.buildkite/pipeline-full.yml`。
 
 ### 输入与触发
@@ -347,9 +354,10 @@ chart 只组织现有进程、Secret、Service、持久卷和外部 sandboxd Run
 
 1. 先把 `build/release/build.sh` 拆成 Platform 与 RRT 两个独立组装结果，同时拆出
    SDK build，并升级 package manifest schema。
-2. 新增三份 pipeline YAML；保留现有 `.buildkite/pipeline.yml` 作为过渡入口，通过
-   动态上传选择 package、sdk 或 full。
-3. 增加 `release.json` 和候选清单校验器，Full 流水线禁止源码构建。
+2. 已新增三份 pipeline YAML；`.buildkite/pipeline.yml` 只负责按 pipeline slug 动态
+   上传 package、sdk 或 full 配置。
+3. 已增加 SDK 候选清单校验器，并让 Full 显式消费基础包和 SDK build UUID；继续增加
+   完整 `release.json`，并拆分 Platform、RRT 与 Runtime Pack 候选清单。
 4. 完成版本化安装目录、`install.sh` 和 fresh-install 测试。
 5. 增加 `adxctl deploy` 与 systemd 模板，再提供离线包。
 6. 最后增加 Helm chart；复用经过 Full 验证的镜像 digest 和同一份 release 清单。

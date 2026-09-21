@@ -20,8 +20,6 @@ bash build/release/build.sh 2>&1 | tee out/buildkite/logs/release.log
 tar -czf out/buildkite/adx-release.tar.gz -C out/buildkite/package .
 (cd out/buildkite && sha256sum adx-release.tar.gz > adx-release.tar.gz.sha256)
 cp out/buildkite/package/manifest.json out/buildkite/release-manifest.json
-mkdir -p out/buildkite/sdk
-cp out/buildkite/package/sdk/*.whl out/buildkite/sdk/
 echo "--- :package: sandboxd backend artifacts"
 if [[ -n ${ADX_BACKEND_ARTIFACT_BUILD:-} ]]; then
   buildkite-agent artifact download 'out/buildkite/backend/*' . --step platform-build --build "$ADX_BACKEND_ARTIFACT_BUILD" 2>&1 | tee out/buildkite/logs/backend.log
