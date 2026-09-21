@@ -18,6 +18,8 @@ Full 流水线消费不可变制品，不得从源码重新编译或替换二进
 `.buildkite/pipeline-sdk.yml`，Full 验收使用 `.buildkite/pipeline-full.yml`。
 `.buildkite/pipeline.yml` 只根据 Buildkite pipeline slug 分派配置。Full 组合阶段要求显式
 传入基础包与 SDK 的 Buildkite build UUID，并校验提交、候选清单和文件 SHA256。
+对应 Buildkite 实体已经建立为 `agent-dx`、`agent-dx-python-sdk` 和
+`agent-dx-full-test`。
 
 现阶段 `build/release/build.sh` 仍同时编译 Rust 平台、RRT 和 Python SDK，兼容的一体化
 `adx-release.tar.gz` 仍包含 SDK wheel。独立 SDK 流水线输出的 wheel、sdist 与
