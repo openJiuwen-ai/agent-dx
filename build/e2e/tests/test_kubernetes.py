@@ -169,6 +169,31 @@ class KubernetesLifecycleTests(unittest.TestCase):
         self.assertIn('build.env("ADX_E2E_ARTIFACT_BUILD") == null',pipeline)
         self.assertIn("os.environ.get('ADX_E2E_ARTIFACT_COMMIT'",summary)
 
+    def test_reused_product_image_receives_current_test_harness(self):
+        import json,tempfile
+        with tempfile.TemporaryDirectory() as d:
+            output=Path(d)/'output';output.mkdir()
+            run=self.module.KubernetesRun(output,Path('/fixture/kubeconfig'))
+            run.nodes=['node1','node2']
+            calls=[]
+            run.kube=lambda *args,**kwargs:calls.append(args) or ''
+            run.execute=lambda *args,**kwargs:''
+            run.sync_harness('f'*40)
+            copies=[call for call in calls if 'cp' in call]
+            self.assertEqual([call[4].split(':')[0] for call in copies],['node1','node2'])
+            manifest=json.loads((output/'harness.json').read_text())
+            self.assertEqual(manifest['commit'],'f'*40)
+            self.assertIn('functional_lifecycle.py',manifest['files'])
+            self.assertNotIn('tests/test_kubernetes.py',manifest['files'])
+
+    def test_harness_sync_precedes_runtime_preflight_and_setup(self):
+        source=(ROOT/'kubernetes/run.py').read_text()
+        sync=source.index('self.sync_harness(')
+        preflight=source.index("'/opt/adx/e2e/preflight.py'")
+        setup=source.index("'/opt/adx/e2e/node.py', 'setup'")
+        self.assertLess(sync,preflight)
+        self.assertLess(sync,setup)
+
     def test_full_profile_requires_two_distinct_physical_workers(self):
         same = [
             {'pod': 'node1', 'host': 'worker-a', 'ip': '10.0.0.1'},

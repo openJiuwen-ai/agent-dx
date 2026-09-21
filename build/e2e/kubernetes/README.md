@@ -1,5 +1,12 @@
 # Kubernetes process-deployment acceptance
 
+The Kubernetes driver treats product artifacts and acceptance code as separate
+inputs. Image digests and packaged binaries come from the verified bundle. Once
+the Pods are ready, the current Git commit's runtime harness is copied to
+`/opt/adx/e2e` on every platform Pod and verified against `harness.json` before
+preflight, sandboxd setup, or ADX startup. This also applies when the bundle is
+reused from an earlier Buildkite build.
+
 The Buildkite gate uses `run.py` here. `manifest.py` defines two node Pods,
 Services, volume/credential references and node placement. The Pods run ADX as
 processes from the unified release. `publish_images.py` runs on the build worker

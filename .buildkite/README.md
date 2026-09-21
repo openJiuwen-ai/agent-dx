@@ -111,8 +111,12 @@ both `ADX_E2E_ARTIFACT_BUILD` to the source Buildkite build UUID and
 `ADX_E2E_ARTIFACT_COMMIT` to that bundle's 40-character product commit. The
 release and image jobs are skipped; the E2E job downloads the source build's
 `platform-images` manifests, verifies their bundle digest and product commit,
-and deploys the recorded image digests. A build number or an unpaired commit is
-rejected.
+and deploys the recorded image digests. After the Pods become ready, the driver
+copies the current checkout's E2E harness into both Pods and verifies every file
+digest before preflight or service startup. This keeps the product binaries and
+images fixed at the selected artifact commit while allowing a newer test commit
+to repair or extend acceptance logic. `result.json` and `harness.json` record
+both identities. A build number or an unpaired commit is rejected.
 
 CI worker prerequisites are changed only by the explicit maintenance mode
 `ADX_K8S_NODE_PREPARE_ONLY=1`. It also requires the exact comma-separated
