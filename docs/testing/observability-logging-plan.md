@@ -40,18 +40,18 @@
 
 ### 阶段8B的模块落点与首轮测试
 
-`platform/crates/observability` 已接入OpenTelemetry；Go HTTP/gRPC、Master创建/提交任务、Node Manager每实例队列、Gateway和RRT HTTP均已接线。InstanceHandle通过命令封装显式携带Span，标准Future上下文只在poll期间附着。组件与真实采集证据见[本地Trace验收](2026-09-16-trace-acceptance.md)。
+`crates/observability` 已接入OpenTelemetry并统一承载组件日志、Metrics、Trace及supervisor进程日志捕获；HTTP/gRPC、Master创建/提交任务、Node Manager每实例队列、Gateway和RRT HTTP均已接线。InstanceHandle通过命令封装显式携带Span，标准Future上下文只在poll期间附着。组件与真实采集证据见[本地Trace验收](2026-09-16-trace-acceptance.md)。
 
 Trace配置与当前接线见[跨组件Trace](distributed-traces.md)。下表列出模块职责，真实采集验收单独记录：
 
 | 当前模块 | 职责 |
 | --- | --- |
-| `gateway/src/common/logging.rs` | 复用现有日志初始化与过滤入口，接统一结构化字段；统一部署使用stdout进入Supervisor，独立文件模式保持独立目录。 |
+| `crates/observability/src/logging.rs` | 统一组件日志初始化、过滤、滚动与压缩；共进程共享一个subscriber和Trace provider。 |
 | Sandbox API的HTTP入口与`controlbackend` | 将请求关联上下文带入Master及Node RPC；缓存命中后的直达路径也携带上下文。 |
 | Master的RPC入口与Shard队列 | 串联准入、排队、放置、分配结果；区分排队耗时与实际执行耗时。 |
 | Node Manager的`rpc.rs`与`controller.rs` | RPC接收上下文后，在每实例串行任务的命令封装中显式携带；执行、状态提交及响应关联到同一操作。 |
 | Gateway到RRT的HTTP路径 | 关联路由选择、本机转发与实例执行，避免仅打通控制请求而遗漏数据面。 |
-| Supervisor的`logging.rs` | 只管理输出的写入/滚动/压缩，不从文本反推业务Span。 |
+| `crates/observability/src/capture.rs` | Supervisor复用的子进程输出捕获、滚动与压缩，不从文本反推业务Span。 |
 
 首轮RED测试应覆盖RPC进入后经过实例异步队列仍能关联的路径：两个不同请求交错到达不同实例、同一实例串行执行时，不能串用上下文；排队、取消、错误返回后结束对应Span。再接真实创建→执行→删除采集验收，并验证采样关闭、字段脱敏、导出端不可用时的有界队列及失败统计。已有Metrics在该阶段保持可用，逐步补导出健康度。
 

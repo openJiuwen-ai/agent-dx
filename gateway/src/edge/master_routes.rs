@@ -9,7 +9,7 @@ use crate::common::route::{
 };
 use adx_discovery::RedisDiscovery;
 use adx_protocol::control as pb;
-use adx_protocol::tls::TlsFiles;
+use adx_transport::tls::TlsFiles;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{

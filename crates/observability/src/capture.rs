@@ -50,7 +50,7 @@ impl Default for Policy {
     }
 }
 impl Policy {
-    pub fn validate(&self) -> crate::Result<()> {
+    pub fn validate(&self) -> Result<(), &'static str> {
         if self.max_record_bytes == 0
             || self.max_record_bytes > 16 * 1024 * 1024
             || self.max_file_bytes == 0
@@ -59,7 +59,7 @@ impl Policy {
             || self.rotate_seconds == Some(0)
             || self.max_age_seconds == Some(0)
         {
-            return Err("logging size, time and retention limits must be positive".into());
+            return Err("logging size, time and retention limits must be positive");
         }
         Ok(())
     }

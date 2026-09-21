@@ -19,7 +19,7 @@
 | 失败与路由 | 使用当前 Rust Edge 状态与错误映射；删除旧 Sandbox Router 的 FATAL/OOM/410 和 etcd 监听说明 | [Edge 请求处理](../../gateway/src/edge/server.rs)、[失败语义](../../gateway/api-server/docs/sandbox-runtime-failure.md) |
 | 调度 | Filter/Score 含分组亲和规则；拓扑仍存在内部库中，未作为公开 HTTP 验收能力；部分调优参数只有 Rust 配置接口 | [调度库](../../platform/crates/scheduling/README.md)、[服务配置](../../platform/master/src/bin/adx-master.rs) |
 | RRT | HTTP 控制协作已接入完整暂停恢复；恢复身份支持同归属代次推进执行版本；Status 含 activity_revision | [HTTP 契约](../../platform/api/http/runtime-control.md)、[身份类型](../../platform/crates/core/src/runtime.rs) |
-| 日志与指标 | Edge/Node Proxy 已有日志、Metrics、Trace；文件压缩可配置；实例终态数量是 Gauge；实例用量标签当前无单独开关 | [Gateway 日志](../../gateway/src/common/logging.rs)、[可观测说明](observability-logging-plan.md) |
+| 日志与指标 | 组件共享日志、Metrics、Trace；文件压缩可配置；实例终态数量是 Gauge；实例用量标签当前无单独开关 | [公共可观测库](../../crates/observability/src/lib.rs)、[可观测说明](observability-logging-plan.md) |
 | 部署与工具 | 资源源支持 auto/sandboxd；证书启动加载；supervisor 清理实例后停止；修正无效 Gateway 命令及 Agent 构建目录 | [配置示例](../../build/config/examples/README.md)、[进程部署](process-deployment.md) |
 | CI 与进度 | 当前正式基础 K8s 记录更新至 #21；FC 保持本地验收；阶段 8 已完成约定范围 | [#21 验收](2026-09-17-observability-k8s.md)、[剩余事项](control-plane-remaining.json) |
 

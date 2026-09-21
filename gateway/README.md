@@ -189,7 +189,7 @@ an incomplete response discards that connection.
 
 The data-plane processes raise their inherited soft `RLIMIT_NOFILE` to 65,536
 by default without exceeding the hard limit or reducing a higher inherited
-value. Override that target with `ADX_DATA_PLANE_NOFILE_SOFT_LIMIT`; Node stream
+value. Override that target with `ADX_NOFILE_SOFT_LIMIT`; Node stream
 admission is calculated only after the limit is applied. TCP listeners retry
 transient accept failures with bounded exponential backoff, so an FD pressure
 event does not permanently remove an ingress or health listener.

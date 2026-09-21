@@ -26,6 +26,11 @@ agent-dx/
 │   ├── sdk/python/src/adx/         # Agent 编程 SDK
 │   ├── executor/src/adx/           # Agent Executor
 │   └── tests/                     # Agent 测试及外部运行时替身
+├── crates/                        # 跨 Gateway / Platform / Runtime 的横切库
+│   ├── error/                     # 稳定错误码、重试与操作结果语义
+│   ├── observability/             # 日志、Metrics、Trace 与进程日志捕获
+│   ├── process/                   # 进程配置、退出信号和宿主资源准备
+│   └── transport/                 # TLS、请求上下文和 deadline 传播
 ├── platform/
 │   ├── master/                    # Rust Master；Global + 内嵌 Shard
 │   ├── node-manager/              # Rust 本机生命周期和后端/存储适配
@@ -33,9 +38,7 @@ agent-dx/
 │   │   ├── core/                  # Instance、资源、恢复点、调度纯类型
 │   │   ├── protocol/              # gRPC 生成、转换与组件身份
 │   │   ├── discovery/             # Redis 服务地址发现
-│   │   ├── service-runtime/       # 服务参数、配置读取与退出信号
-│   │   ├── scheduling/            # Filter / Score、快照与查询索引
-│   │   └── observability/         # Trace 初始化、传播与导出
+│   │   └── scheduling/            # Filter / Score、快照与查询索引
 │   ├── api/
 │   │   ├── proto/instance.proto   # Master / Node 管理服务
 │   │   ├── proto/instance_types.proto # Instance / 资源 / 调度类型
@@ -53,7 +56,7 @@ agent-dx/
 │   │   ├── tests/                 # HTTP 契约与校验
 │   │   └── docs/                  # Sandbox HTTP 支持范围
 │   └── src/
-│       ├── common/                # 传输元数据、日志、资源与关闭辅助
+│       ├── common/                # Gateway 内部监听、路由与数据面协议
 │       ├── edge/                  # 路由订阅、认证、连接池、反向代理
 │       ├── node/                  # NodeProxyService、绑定、活动、转发
 │       └── bin/                   # Edge、Node Proxy、forwarder
@@ -89,7 +92,7 @@ agent-dx/
 | Node Manager | `resources.rs`、`routes.rs`、`activity.rs`、`proxy.rs` | 容量源/准入、绑定同步、活动采集、代理进程组合 |
 | Rust API Server | `contract.rs`、`http.rs`、`clients.rs`、`operations.rs` | HTTP 兼容字段到 Instance RPC；认证、版本化实例目录订阅、入口节点轮转、直达节点、快照目录 |
 
-`core` 不依赖 Redis/SQLite/tonic/sandboxd 客户端；`protocol` 不承载调度或状态机。Node Manager 可依赖 Gateway 的 node 库，Gateway 不依赖 Master/Node Manager 业务实现。Shard 当前与 Master 同进程。
+`core` 不依赖 Redis/SQLite/tonic/sandboxd 客户端；`protocol` 不承载调度、状态机、证书文件读取或 TLS 构建。稳定错误语义、可观测、服务进程支持和传输机制位于根级 `crates/`。Node Manager 可依赖 Gateway 的 node 库，Gateway 不依赖 Master/Node Manager 业务实现。Shard 当前与 Master 同进程。
 
 默认创建经 Global 轮转进入 Shard Filter/Score。启用 `create_mode=local_first` 时，API Server 轮转可用入口节点，Node Manager 用同一 Admission 暂留资源，Master 原子确认唯一归属并同步中心账本；本地不满足时使用同一 Instance ID 回退 Shard。Master 向 API Server 首次全量、后续增量发布保留的实例目录，包括用于幂等生命周期结果的终态记录；已有实例操作命中本地目录后直达 Node Manager。
 

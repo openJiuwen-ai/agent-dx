@@ -54,9 +54,11 @@ version = "0.1.0"
 dependencies = [
  "adx-core",
  "adx-discovery",
+ "adx-error",
  "adx-observability",
+ "adx-process",
  "adx-protocol",
- "adx-service-runtime",
+ "adx-transport",
  "base64 0.22.1",
  "bytes",
  "data-plane-gateway",
@@ -66,13 +68,10 @@ dependencies = [
  "hyper-util",
  "percent-encoding",
  "reqwest 0.13.5",
- "rustls",
- "rustls-pemfile",
  "serde",
  "serde_json",
  "sha2",
  "tokio",
- "tokio-rustls",
  "tokio-stream",
  "tonic 0.12.3",
  "url",
@@ -92,6 +91,7 @@ name = "adx-deployment"
 version = "0.1.0"
 dependencies = [
  "adx-core",
+ "adx-observability",
  "adx-protocol",
  "clap",
  "flate2",
@@ -137,6 +137,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "adx-error"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "adx-master"
 version = "0.1.0"
 dependencies = [
@@ -144,9 +152,10 @@ dependencies = [
  "adx-discovery",
  "adx-node-manager",
  "adx-observability",
+ "adx-process",
  "adx-protocol",
  "adx-scheduling",
- "adx-service-runtime",
+ "adx-transport",
  "async-trait",
  "bytes",
  "data-plane-gateway",
@@ -173,8 +182,9 @@ dependencies = [
  "adx-core",
  "adx-discovery",
  "adx-observability",
+ "adx-process",
  "adx-protocol",
- "adx-service-runtime",
+ "adx-transport",
  "async-trait",
  "bytes",
  "data-plane-gateway",
@@ -204,14 +214,32 @@ dependencies = [
 name = "adx-observability"
 version = "0.1.0"
 dependencies = [
+ "adx-core",
+ "flate2",
  "http",
+ "libc",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
+ "serde",
+ "serde_json",
+ "tempfile",
  "tokio",
  "tonic 0.12.3",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "adx-process"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
@@ -237,14 +265,19 @@ dependencies = [
 ]
 
 [[package]]
-name = "adx-service-runtime"
+name = "adx-transport"
 version = "0.1.0"
 dependencies = [
- "clap",
+ "adx-protocol",
+ "http",
+ "rustls",
+ "rustls-pemfile",
  "serde",
- "serde_json",
  "tempfile",
  "tokio",
+ "tokio-rustls",
+ "tonic 0.12.3",
+ "uuid",
 ]
 
 [[package]]
@@ -729,13 +762,14 @@ dependencies = [
  "adx-agent-store",
  "adx-discovery",
  "adx-observability",
+ "adx-process",
  "adx-protocol",
+ "adx-transport",
  "arc-swap",
  "async-trait",
  "base64 0.22.1",
  "bytes",
  "etcd-client",
- "flate2",
  "futures-util",
  "h2",
  "http",

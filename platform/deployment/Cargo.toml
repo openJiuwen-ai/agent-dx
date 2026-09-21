@@ -14,8 +14,8 @@ name = "adxctl"
 path = "src/main.rs"
 [dependencies]
 adx-core = { path = "../crates/core" }
+adx-observability = { path = "../../crates/observability" }
 clap = { version = "4", features = ["derive", "env"] }
-flate2 = "1"
 adx-protocol = { path = "../crates/protocol" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -26,5 +26,6 @@ tower = { version = "0.5", features = ["util"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 libc = "0.2"
 [dev-dependencies]
+flate2 = "1"
 tempfile = "3"
 tokio-stream = { version = "0.1", features = ["net"] }

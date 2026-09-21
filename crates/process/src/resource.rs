@@ -1,7 +1,7 @@
 use std::io;
 
 const DEFAULT_NOFILE_SOFT_LIMIT: libc::rlim_t = 65_536;
-const NOFILE_ENV: &str = "ADX_DATA_PLANE_NOFILE_SOFT_LIMIT";
+const NOFILE_ENV: &str = "ADX_NOFILE_SOFT_LIMIT";
 
 /// Raise the inherited soft FD limit before resource budgets are calculated.
 /// Lower hard limits are respected, and an already higher soft limit is never

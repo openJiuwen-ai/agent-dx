@@ -1,4 +1,7 @@
-//! Process logging setup; collection and storage remain deployment services.
+//! Shared ADX logging, metrics, and tracing support.
+pub mod capture;
+pub mod logging;
+pub mod metrics;
 pub mod trace;
 pub use tracing::{debug, error, info, warn};
 pub fn json_enabled() -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {

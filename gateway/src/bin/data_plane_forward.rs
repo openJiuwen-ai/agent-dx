@@ -1,6 +1,6 @@
+use adx_process::resource::raise_nofile_soft_limit_from_env;
 use data_plane_gateway::client::{connect_edge, ConnectClientConfig, EdgeTlsConfig};
 use data_plane_gateway::common::listener::accept_with_backoff;
-use data_plane_gateway::common::resource::raise_nofile_soft_limit_from_env;
 use data_plane_gateway::edge::AccessKind;
 use rustls::pki_types::ServerName;
 use std::fs::File;
@@ -14,8 +14,8 @@ const L4_COPY_BUFFER_SIZE: usize = 64 * 1024;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    data_plane_gateway::common::install_crypto_provider();
-    adx_observability::init().map_err(|e| -> Box<dyn std::error::Error> { e })?;
+    adx_transport::install_crypto_provider();
+    let _logging_guard = adx_observability::logging::init("data-plane-forward", false)?;
     let nofile_soft_limit = raise_nofile_soft_limit_from_env()?;
     tracing::info!(nofile_soft_limit, "Data Plane Forward FD limit configured");
     let config = ForwardConfig::from_args(std::env::args().skip(1))?;

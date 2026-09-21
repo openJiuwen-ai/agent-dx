@@ -267,8 +267,6 @@ pub fn dependency_status(status: tonic::Status) -> Error {
     }
 }
 
-pub mod tls;
-
 impl From<adx_core::RestorePoint> for control::RestorePoint {
     fn from(v: adx_core::RestorePoint) -> Self {
         Self {

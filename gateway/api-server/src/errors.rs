@@ -1,26 +1,11 @@
+use adx_error::{ErrorCode, OperationOutcome, RetryDirective};
 use serde::Serialize;
 use tonic::{Code, Status};
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RetryDirective {
-    Never,
-    SameOperation,
-    AfterBackoff,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum OperationOutcome {
-    NotStarted,
-    Unknown,
-    Terminal,
-}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ErrorDetail<'a> {
-    pub code: &'static str,
+    pub code: ErrorCode,
     pub retry: RetryDirective,
     pub outcome: OperationOutcome,
     pub request_id: &'a str,
@@ -40,52 +25,52 @@ impl<'a> ErrorDetail<'a> {
     ) -> Self {
         let (code, retry, outcome) = match status.code() {
             Code::InvalidArgument | Code::OutOfRange => (
-                "INVALID_ARGUMENT",
+                ErrorCode::InvalidArgument,
                 RetryDirective::Never,
                 OperationOutcome::NotStarted,
             ),
             Code::Unauthenticated => (
-                "UNAUTHENTICATED",
+                ErrorCode::Unauthenticated,
                 RetryDirective::Never,
                 OperationOutcome::NotStarted,
             ),
             Code::PermissionDenied => (
-                "PERMISSION_DENIED",
+                ErrorCode::PermissionDenied,
                 RetryDirective::Never,
                 OperationOutcome::NotStarted,
             ),
             Code::NotFound => (
-                "NOT_FOUND",
+                ErrorCode::NotFound,
                 RetryDirective::Never,
                 OperationOutcome::Terminal,
             ),
             Code::AlreadyExists | Code::FailedPrecondition | Code::Aborted => (
-                "CONFLICT",
+                ErrorCode::Conflict,
                 RetryDirective::Never,
                 OperationOutcome::NotStarted,
             ),
             Code::ResourceExhausted => (
-                "RESOURCE_EXHAUSTED",
+                ErrorCode::ResourceExhausted,
                 RetryDirective::AfterBackoff,
                 OperationOutcome::NotStarted,
             ),
             Code::Unimplemented => (
-                "UNSUPPORTED",
+                ErrorCode::Unsupported,
                 RetryDirective::Never,
                 OperationOutcome::NotStarted,
             ),
             Code::DeadlineExceeded if !execution_may_have_started => (
-                "DEADLINE_EXCEEDED",
+                ErrorCode::DeadlineExceeded,
                 RetryDirective::SameOperation,
                 OperationOutcome::NotStarted,
             ),
             Code::Unavailable if !execution_may_have_started => (
-                "UNAVAILABLE",
+                ErrorCode::Unavailable,
                 RetryDirective::AfterBackoff,
                 OperationOutcome::NotStarted,
             ),
             Code::DataLoss => (
-                "DATA_LOSS",
+                ErrorCode::DataLoss,
                 RetryDirective::Never,
                 OperationOutcome::Terminal,
             ),
@@ -97,13 +82,13 @@ impl<'a> ErrorDetail<'a> {
                 if execution_may_have_started =>
             {
                 (
-                    "OUTCOME_UNKNOWN",
+                    ErrorCode::OutcomeUnknown,
                     RetryDirective::SameOperation,
                     OperationOutcome::Unknown,
                 )
             }
             _ => (
-                "INTERNAL",
+                ErrorCode::Internal,
                 RetryDirective::AfterBackoff,
                 OperationOutcome::NotStarted,
             ),
@@ -132,7 +117,7 @@ mod tests {
             None,
             false,
         );
-        assert_eq!(detail.code, "INVALID_ARGUMENT");
+        assert_eq!(detail.code, ErrorCode::InvalidArgument);
         assert_eq!(detail.retry, RetryDirective::Never);
         assert_eq!(detail.outcome, OperationOutcome::NotStarted);
     }
@@ -146,7 +131,7 @@ mod tests {
             Some("instance-a"),
             true,
         );
-        assert_eq!(detail.code, "OUTCOME_UNKNOWN");
+        assert_eq!(detail.code, ErrorCode::OutcomeUnknown);
         assert_eq!(detail.retry, RetryDirective::SameOperation);
         assert_eq!(detail.outcome, OperationOutcome::Unknown);
     }
@@ -160,7 +145,7 @@ mod tests {
             None,
             false,
         );
-        assert_eq!(detail.code, "UNAVAILABLE");
+        assert_eq!(detail.code, ErrorCode::Unavailable);
         assert_eq!(detail.retry, RetryDirective::AfterBackoff);
         assert_eq!(detail.outcome, OperationOutcome::NotStarted);
     }
@@ -197,7 +182,8 @@ mod tests {
                 submitted,
             );
             assert_eq!(
-                detail.code, expected,
+                detail.code.as_str(),
+                expected,
                 "gRPC {grpc:?}, submitted={submitted}"
             );
         }

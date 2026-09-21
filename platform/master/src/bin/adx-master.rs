@@ -4,8 +4,9 @@ use adx_master::{
     storage::RedisStore,
     Placement,
 };
-use adx_protocol::{control as pb, tls::TlsFiles};
-use adx_service_runtime::{read_config, shutdown};
+use adx_process::{read_config, shutdown};
+use adx_protocol::control as pb;
+use adx_transport::tls::TlsFiles;
 use serde::Deserialize;
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
 #[derive(Deserialize)]
@@ -43,9 +44,7 @@ fn default_ttl() -> u64 {
 }
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    adx_observability::init().map_err(|e| -> Box<dyn std::error::Error> { e })?;
-    let _trace = adx_observability::trace::init("adx-master")
-        .map_err(|e| -> Box<dyn std::error::Error> { e })?;
+    let _logging_guard = adx_observability::logging::init("adx-master", false)?;
     let config: Config = read_config()?;
     if config.heartbeat_timeout_seconds == 0 || config.discovery_ttl_seconds < 3 {
         return Err("positive heartbeat timeout and discovery TTL >= 3 required".into());

@@ -6,6 +6,7 @@ use crate::{
 };
 use adx_observability::trace;
 use adx_protocol::control as pb;
+use adx_transport::request::RequestContext;
 use base64::{engine::general_purpose::STANDARD, Engine};
 use bytes::Bytes;
 use futures_util::TryStreamExt;
@@ -77,9 +78,12 @@ impl Api {
                     .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
             });
         let mut request = request;
-        if let Ok(value) = request_id.parse() {
-            request.headers_mut().insert("x-request-id", value);
-        }
+        let request_context = RequestContext {
+            request_id,
+            operation_id: None,
+        };
+        let _ = request_context.inject(request.headers_mut());
+        let request_id = request_context.request_id;
         let context = trace.scope(trace::traceparent).unwrap_or_default();
         let mut response = trace.run(Box::pin(self.handle(request))).await;
         if let Ok(value) = request_id.parse() {
@@ -99,10 +103,7 @@ impl Api {
         Ok(response)
     }
     async fn handle(self: Arc<Self>, request: Request<Incoming>) -> Response<Body> {
-        let request_id = header(&request, "x-request-id")
-            .filter(|v| !v.trim().is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let request_id = RequestContext::from_headers(request.headers()).request_id;
         let api_key = header(&request, "authorization")
             .and_then(|s| s.strip_prefix("Bearer "))
             .or_else(|| header(&request, "x-auth-token"))

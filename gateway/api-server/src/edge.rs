@@ -1,6 +1,6 @@
 //! Optional in-process Edge using the same service as the standalone binary.
+use adx_process::resource::raise_nofile_soft_limit_from_env;
 use data_plane_gateway::{
-    common::resource::raise_nofile_soft_limit_from_env,
     config::EdgeFrontendConfig,
     edge::{master_routes::ControlConfig, EdgeFrontendService},
 };

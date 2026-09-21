@@ -4,19 +4,18 @@ use adx_api_server::{
     edge::EmbeddedEdge,
     http::Api,
 };
-use adx_service_runtime::{read_config, shutdown};
+use adx_process::{read_config, shutdown};
+use adx_transport::tls::http_server_acceptor;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use std::{sync::Arc, time::Duration};
 use tokio::{net::TcpListener, sync::watch, task::JoinSet};
-use tokio_rustls::TlsAcceptor;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    adx_observability::init().map_err(|_| "logging initialization failed")?;
-    let _tracing = adx_observability::trace::init("adx-api-server")
-        .map_err(|_| "tracing initialization failed")?;
+    adx_transport::install_crypto_provider();
+    let _logging_guard = adx_observability::logging::init("adx-api-server", true)
+        .map_err(|_| "logging initialization failed")?;
     let config: Config = read_config()?;
     config.validate()?;
     let clients = Clients::new(config.clone())?;
@@ -24,16 +23,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let acceptor = if config.loopback_http {
         None
     } else {
-        let cert = std::fs::read(&config.certificate)?;
-        let key = std::fs::read(&config.private_key)?;
-        let certificates =
-            rustls_pemfile::certs(&mut cert.as_slice()).collect::<Result<Vec<_>, _>>()?;
-        let private_key =
-            rustls_pemfile::private_key(&mut key.as_slice())?.ok_or("missing private key")?;
-        let tls = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(certificates, private_key)?;
-        Some(TlsAcceptor::from(Arc::new(tls)))
+        Some(
+            http_server_acceptor(
+                &config.certificate,
+                &config.private_key,
+                None,
+                vec![b"http/1.1".to_vec()],
+            )
+            .map_err(local_error)?,
+        )
     };
     let listener = TcpListener::bind(config.listen).await?;
     let mut embedded_edge = if config.edge_mode == EdgeMode::Embedded {

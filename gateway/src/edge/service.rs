@@ -5,7 +5,7 @@ use super::{
     RouteChange, RouteStore,
 };
 use crate::config::EdgeFrontendConfig;
-use std::{fs::File, future::Future, io::BufReader, sync::Arc};
+use std::{future::Future, sync::Arc};
 use tokio::{
     net::TcpListener,
     sync::{broadcast, watch},
@@ -227,18 +227,7 @@ impl EdgeFrontendService {
 }
 
 fn load_tls_acceptor(cert_path: &str, key_path: &str) -> Result<TlsAcceptor, ServiceError> {
-    let mut cert_reader = BufReader::new(File::open(cert_path)?);
-    let certs = rustls_pemfile::certs(&mut cert_reader).collect::<Result<Vec<_>, _>>()?;
-    if certs.is_empty() {
-        return Err("Edge TLS certificate file is empty".into());
-    }
-    let mut key_reader = BufReader::new(File::open(key_path)?);
-    let key = rustls_pemfile::private_key(&mut key_reader)?.ok_or("Edge TLS key is empty")?;
-    let mut config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)?;
-    config.alpn_protocols = vec![b"http/1.1".to_vec()];
-    Ok(TlsAcceptor::from(Arc::new(config)))
+    adx_transport::tls::http_server_acceptor(cert_path, key_path, None, vec![b"http/1.1".to_vec()])
 }
 
 fn send_error(error: Box<dyn std::error::Error>) -> ServiceError {
@@ -265,7 +254,7 @@ mod tests {
         config::EdgeNodeSecurityMode,
         edge::{parse_static_routes, ReverseProxyConfig},
     };
-    use adx_protocol::tls::TlsFiles;
+    use adx_transport::tls::TlsFiles;
     use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 
     #[tokio::test]

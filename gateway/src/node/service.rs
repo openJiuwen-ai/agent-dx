@@ -2,7 +2,7 @@
 use super::{bind_route_control, serve_health, ActivityTracker, NodeProxy};
 use crate::common::{listener::accept_with_backoff, protocol::GatewayPolicy};
 use crate::config::{EdgeNodeSecurityMode, NodeProxyConfig};
-use std::{fs::File, future::Future, io::BufReader, sync::Arc};
+use std::{future::Future, path::PathBuf, sync::Arc};
 use tokio::{
     net::{TcpListener, UnixListener},
     sync::watch,
@@ -24,7 +24,7 @@ impl NodeProxyService {
     /// Bind every listener before the owner advertises readiness. Bindings start
     /// unavailable and only the Node Manager's complete sync opens admission.
     pub async fn bind(config: NodeProxyConfig) -> Result<Self, ServiceError> {
-        crate::common::install_crypto_provider();
+        adx_transport::install_crypto_provider();
         let dir = config
             .activity_uds_dir
             .as_ref()
@@ -170,26 +170,10 @@ fn load_tls_acceptor(
     key_path: &str,
     mtls_client_ca: &str,
 ) -> Result<TlsAcceptor, Box<dyn std::error::Error + Send + Sync>> {
-    let mut cert_reader = BufReader::new(File::open(cert_path)?);
-    let certs = rustls_pemfile::certs(&mut cert_reader).collect::<Result<Vec<_>, _>>()?;
-    let mut key_reader = BufReader::new(File::open(key_path)?);
-    let key = rustls_pemfile::private_key(&mut key_reader)?.ok_or("no private key found")?;
-    let builder = rustls::ServerConfig::builder();
-    let mut config = if mtls_client_ca.is_empty() {
-        builder.with_no_client_auth().with_single_cert(certs, key)?
-    } else {
-        let mut ca_reader = BufReader::new(File::open(mtls_client_ca)?);
-        let ca_certificates =
-            rustls_pemfile::certs(&mut ca_reader).collect::<Result<Vec<_>, _>>()?;
-        let mut roots = rustls::RootCertStore::empty();
-        for certificate in ca_certificates {
-            roots.add(certificate)?;
-        }
-        let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots)).build()?;
-        builder
-            .with_client_cert_verifier(verifier)
-            .with_single_cert(certs, key)?
-    };
-    config.alpn_protocols = vec![b"h2".to_vec()];
-    Ok(TlsAcceptor::from(Arc::new(config)))
+    adx_transport::tls::http_server_acceptor(
+        cert_path,
+        key_path,
+        (!mtls_client_ca.is_empty()).then(|| PathBuf::from(mtls_client_ca)),
+        vec![b"h2".to_vec()],
+    )
 }

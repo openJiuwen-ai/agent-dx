@@ -1,6 +1,6 @@
 # 管控面当前实现
 
-核对日期：2026-09-20。内部以 Instance 为核心，公开接口保持 Sandbox HTTP/SDK 形态。本文描述当前源码；当次测试数据保留在带日期的验收报告中。
+核对日期：2026-09-21。内部以 Instance 为核心，公开接口保持 Sandbox HTTP/SDK 形态。本文描述当前源码；当次测试数据保留在带日期的验收报告中。
 
 ## 模块与职责
 
@@ -8,7 +8,9 @@
 |---|---|---|
 | `platform/crates/core` | Instance 状态、资源/设备账本、归属代次、checkpoint 与调度类型 | 纯模型，不访问 Redis、sandboxd |
 | `platform/crates/protocol` / `platform/api/proto` | Instance gRPC、身份检查、类型转换；Node Proxy 绑定/活动协议 | 协议按职责拆分；RRT 使用 HTTP |
-| `platform/crates/service-runtime` | 服务进程统一的类型化 `--config`、安全 JSON 配置读取与退出信号 | 不承载 TLS、协议或组件业务配置 |
+| `crates/error` | 稳定错误码、重试指令与操作结果语义 | HTTP/gRPC 适配留在各自边界，公共 crate 不绑定协议框架 |
+| `crates/process` | 服务进程统一的类型化 `--config`、安全 JSON 配置读取、退出信号与 FD limit | 不承载协议或组件业务配置 |
+| `crates/transport` | mTLS/HTTP TLS、请求上下文和剩余 deadline | 不承载路由、调度或生命周期规则 |
 | `platform/crates/scheduling` | 静态 Filter/Score、Pack/Spread、整卡、节点/实例亲和与反亲和、增量快照与索引 | 拓扑规则存在于内部类型和库；不是公开 HTTP 已验收能力 |
 | `platform/master` | Global 轮转、同进程 Shard 队列与选点、自动分片、Redis、认证、路由/快照目录、节点失效与跨节点恢复协调 | 单 Master；无 scaler、抢占或租户配额；未分配队列仅在内存 |
 | `platform/node-manager` | 每 Instance 串行任务、准入、暂停/恢复/删除、空闲删除、可配置重启、资源采集、对账 | 普通生命周期由节点决定；SQLite 是提交故障降级日志 |
@@ -19,7 +21,7 @@
 | `gateway` | 可复用 Edge 服务、Redis 发现与 gRPC 路由订阅、认证、转发；Node Proxy 绑定复核与数据转发 | 数据请求不进入生命周期队列；Edge 路由仅内存缓存；显式分进程复用同一实现 |
 | `platform/runtime/rrt` | 命令、文件、Shell/PTY、命令观察、HTTP 运行时协作 | 恢复时更新身份/认证、退役旧连接并重建监听 |
 | `platform/deployment` | Rust `adxctl`、统一 YAML 配置、supervisor、清理后停止 | API Server 默认内嵌 Edge，Node Manager 默认内嵌 Node Proxy；显式分进程仍使用同一发布包；sandboxd 由部署环境托管 |
-| `platform/crates/observability` 与各组件埋点 | Trace 上下文/采样/OTLP、Metrics、结构化日志；supervisor 滚动压缩 | Collector 是外部采集组件；实时队列丢弃指标后置 |
+| `crates/observability` 与各组件埋点 | Trace 上下文/采样/OTLP、Metrics、结构化日志；组件和 supervisor 的滚动压缩实现 | Collector 是外部采集组件；实时队列丢弃指标后置 |
 
 ## 生命周期与提交
 

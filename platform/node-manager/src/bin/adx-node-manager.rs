@@ -6,8 +6,9 @@ use adx_node_manager::{
     sandboxd::{connect_when_ready, Config as RuntimeConfig, Sandboxd},
     NodeManager,
 };
-use adx_protocol::{control as pb, tls::TlsFiles};
-use adx_service_runtime::{read_config, shutdown};
+use adx_process::{read_config, shutdown};
+use adx_protocol::control as pb;
+use adx_transport::tls::TlsFiles;
 use serde::Deserialize;
 use std::{
     collections::HashMap, future::Future, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration,
@@ -129,27 +130,9 @@ async fn inspect_node(
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config: Config = read_config()?;
     config.checkpoint_gc.validate()?;
-    // The embedded proxy and manager share one process-wide subscriber and tracer provider.
-    // Standalone mode keeps the control-plane observer because the proxy owns its own process.
-    let (_logging_guard, _trace) =
-        if config.proxy_mode == adx_node_manager::proxy::ProxyMode::Embedded {
-            (
-                Some(data_plane_gateway::common::logging::init(
-                    "adx-node-manager",
-                    false,
-                )?),
-                None,
-            )
-        } else {
-            adx_observability::init().map_err(|e| -> Box<dyn std::error::Error> { e })?;
-            (
-                None,
-                Some(
-                    adx_observability::trace::init("adx-node-manager")
-                        .map_err(|e| -> Box<dyn std::error::Error> { e })?,
-                ),
-            )
-        };
+    // Embedded Proxy and Node Manager share this process-wide subscriber and
+    // tracer provider; standalone Proxy initializes the same library itself.
+    let _logging_guard = adx_observability::logging::init("adx-node-manager", false)?;
     if config.node_id.is_empty()
         || config.report_interval_seconds == 0
         || config.rpc_timeout_seconds == 0
@@ -307,7 +290,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     manager.update_capacity(o.capacity, valid)?;
     manager.update_devices(o.devices.clone(), valid)?;
     let mut embedded = if config.proxy_mode == adx_node_manager::proxy::ProxyMode::Embedded {
-        data_plane_gateway::common::resource::raise_nofile_soft_limit_from_env()?;
+        adx_process::resource::raise_nofile_soft_limit_from_env()?;
         Some(
             adx_node_manager::proxy::EmbeddedProxy::start(
                 data_plane_gateway::config::NodeProxyConfig::from_env()?,

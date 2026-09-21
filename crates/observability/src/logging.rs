@@ -23,7 +23,7 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 #[must_use = "keep the logging guard alive until the service has drained"]
 pub struct LoggingGuard {
     workers: Vec<WorkerGuard>,
-    _trace: adx_observability::trace::TraceGuard,
+    _trace: crate::trace::TraceGuard,
 }
 
 impl LoggingGuard {
@@ -44,9 +44,8 @@ pub fn init(
     edge_component: bool,
 ) -> Result<LoggingGuard, Box<dyn std::error::Error>> {
     let config = LoggingConfig::from_env()?;
-    let trace = adx_observability::trace::init(component)
-        .map_err(|e| -> Box<dyn std::error::Error> { e })?;
-    if adx_observability::json_enabled().map_err(|e| -> Box<dyn std::error::Error> { e })? {
+    let trace = crate::trace::init(component).map_err(|e| -> Box<dyn std::error::Error> { e })?;
+    if crate::json_enabled().map_err(|e| -> Box<dyn std::error::Error> { e })? {
         if config.directory.is_some() {
             return Err("JSON logging uses stdout; leave ADX_DATA_PLANE_LOG_DIR unset".into());
         }
