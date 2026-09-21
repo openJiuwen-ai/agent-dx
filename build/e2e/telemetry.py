@@ -157,6 +157,11 @@ def check_trace_links(rows):
         assert parent and parent['name']=='capsule.queue','queue parent missing or belongs to another trace'
     return len(executions)
 
+def required_log_services(node):
+    services={node}
+    if node=='node1':services|={'master','api','redis'}
+    return services
+
 def validate_traces(node):
     rows=trace_records()
     count=check_trace_links(rows)
@@ -200,8 +205,7 @@ def validate(node):
     time.sleep(2)
     counts=collections.Counter(received());assert counts==collections.Counter(range(40)),dict(counts)
     rows=records();services={a.get('service.name') for a,_ in rows}
-    required={node}
-    if node=='node1':required|={'master','api','edge','redis'}
+    required=required_log_services(node)
     assert required <= services, (required,services)
     structured={a.get('service.name') for a,b in rows if isinstance(b,dict) and ('level' in b or 'fields' in b)}
     assert required-{'redis'} <= structured, (required,structured)

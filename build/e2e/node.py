@@ -126,7 +126,7 @@ def main():
         import urllib.error
         import urllib.request
         context=ssl.create_default_context(cafile=str(S/'tls/ca.pem'))
-        request=urllib.request.Request('https://127.0.0.1:8443/api/instances',headers={
+        request=urllib.request.Request('https://127.0.0.1:8443/api/sandbox/v1/resources',headers={
             'Authorization':'Bearer '+(S/'api-key').read_text().strip(),
         })
         while True:
