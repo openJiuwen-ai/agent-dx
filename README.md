@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/logo/agent-dx-lockup.png" alt="Agent DX" width="560">
+  <img src="assets/logo/agent-dx-lockup-primary.png" alt="Agent DX" width="560">
 </p>
 
 <h3 align="center">Distributed execution substrate for openJiuwen Agent Runtime</h3>
@@ -59,17 +59,17 @@ tar -xzf adx-release.tar.gz -C adx-release
 sudo ./adx-release/install.sh
 ```
 
-The installer verifies the manifest, file digests, and host architecture. It installs the release under `/opt/adx/releases/<commit>`, atomically switches `/opt/adx/current`, and preserves `/opt/adx/config`, `/opt/adx/data`, and `/opt/adx/run` across upgrades.
+The installer verifies the manifest, file digests, and host architecture. It installs the release under `/opt/adx/releases/<commit>`, atomically switches `/opt/adx/current`, preserves `/opt/adx/config`, `/opt/adx/data`, and `/opt/adx/run` across upgrades, and exposes `adxctl` through `/usr/local/bin`.
 
 ## 🔧 Quick start
 
 The default `standalone` profile starts managed Redis, Master, Node Manager with embedded Node Proxy, and API Server with embedded Edge on one host. Prepare sandboxd, networking, certificates, and the initial administrator key first.
 
 ```sh
-sudo /opt/adx/current/bin/adxctl config init --profile standalone
+sudo adxctl config init --profile standalone
 sudoedit /opt/adx/config/deployment.yaml
-sudo /opt/adx/current/bin/adxctl validate
-sudo /opt/adx/current/bin/adxctl run
+sudo adxctl validate
+sudo adxctl run
 ```
 
 In another terminal, install the packaged SDK and point it at the public Gateway:

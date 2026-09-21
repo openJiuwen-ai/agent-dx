@@ -4,7 +4,7 @@ This directory is the source of truth for reusable Agent DX brand and architectu
 
 ## Structure
 
-- `logo/agent-dx-lockup.png` — canonical white-on-black horizontal lockup for repository and documentation headers.
+- `logo/agent-dx-lockup-primary.png` — canonical white-on-black horizontal lockup for repository and documentation headers.
 - `logo/agent-dx-lockup-black.png` — black lockup on a transparent field for controlled light surfaces.
 - `architecture/agent-dx.svg` — product and platform system architecture.
 - `architecture/current-architecture.svg` — repository component boundaries and current call paths.

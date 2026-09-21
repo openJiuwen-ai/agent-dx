@@ -8,8 +8,9 @@ import hashlib,json,os,pathlib,secrets,shutil,ssl,subprocess,sys,time,traceback,
 from contract import CASES,verify
 BASE=pathlib.Path(os.environ['ADX_EXAMPLE_BASE']);ROOT=pathlib.Path(sys.argv[1]).resolve()
 INSTALL=pathlib.Path('/opt/adx')
+SYSTEM_CLI=pathlib.Path('/usr/local/bin/adxctl')
 SOCKET=pathlib.Path('/run/sandboxd/sandboxd.sock')
-if ROOT.exists() or INSTALL.exists() or INSTALL.is_symlink() or SOCKET.exists():
+if ROOT.exists() or INSTALL.exists() or INSTALL.is_symlink() or SYSTEM_CLI.exists() or SYSTEM_CLI.is_symlink() or SOCKET.exists():
     raise RuntimeError('example paths must be unused; refusing to overwrite existing deployment')
 env={**os.environ,'PATH':f'/opt/adx-fc/bin:{BASE}/tools:'+os.environ['PATH'],
      'NO_PROXY':'127.0.0.1,localhost,10.88.0.0/16','no_proxy':'127.0.0.1,localhost,10.88.0.0/16'}
@@ -36,7 +37,7 @@ def wait(test,seconds=120):
         time.sleep(.5)
     raise TimeoutError('example readiness timeout')
 def catalog():return {k:json.loads(v) for k,v in json.loads(output(['redis-cli','--json','HGETALL','adx:{adx}:control:v1'])).items()}
-def cli(command,*args):return ['/opt/adx/current/bin/adxctl',command,'--config','/opt/adx/config/deployment.yaml',*args]
+def cli(command,*args):return [SYSTEM_CLI,command,'--config','/opt/adx/config/deployment.yaml',*args]
 def inventory():return output(['sbox','-a',SOCKET,'list']).strip().splitlines()[1:]
 try:
     # Reuse only the external sandboxd prerequisites from the FC fixture helper.
@@ -118,6 +119,7 @@ finally:
             proc.terminate()
             try:proc.wait(timeout=20)
             except subprocess.TimeoutExpired:proc.kill();proc.wait();result['cleanup_errors'].append(name+' forced kill')
+    if SYSTEM_CLI.is_symlink() and SYSTEM_CLI.readlink()==pathlib.Path('/opt/adx/current/bin/adxctl'):SYSTEM_CLI.unlink()
     # Remove only installation paths exclusively created by this run.
     for path in reversed(created):shutil.rmtree(path)
     if SOCKET.exists():SOCKET.unlink()

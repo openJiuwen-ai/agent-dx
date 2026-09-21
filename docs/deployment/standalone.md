@@ -12,13 +12,13 @@
   sudo ./adx-release/install.sh
   ```
 
-  安装器校验 `manifest.json`、所有文件摘要和主机架构，将版本安装到 `/opt/adx/releases/<commit>`，再原子切换 `/opt/adx/current`。它创建并保留 `/opt/adx/config`、`/opt/adx/data`、`/opt/adx/run`；重新安装同一个版本时才需要 `--replace`。`adxctl config init` 创建 `/opt/adx/config/deployment.yaml`。自定义根目录可使用 `--prefix`，并将部署 YAML 中的 `package_dir`、`state_dir` 和数据路径改为该根目录下的对应位置。不要混用不同包的二进制或 SDK。
+  安装器校验 `manifest.json`、所有文件摘要和主机架构，将版本安装到 `/opt/adx/releases/<commit>`，再原子切换 `/opt/adx/current`。它创建并保留 `/opt/adx/config`、`/opt/adx/data`、`/opt/adx/run`，并默认创建 `/usr/local/bin/adxctl`；重新安装同一个版本时才需要 `--replace`。`adxctl config init` 创建 `/opt/adx/config/deployment.yaml`。自定义根目录可使用 `--prefix`，自定义命令目录可使用 `--bin-dir`，同时需要调整部署 YAML 中的包、状态和数据路径。不要混用不同包的二进制或 SDK。
 - 按 `third_party/sandboxd/source.json` 准备外部 sandboxd。默认示例连接 `/run/sandboxd/sandboxd.sock`。sandboxd 的运行时、网络、镜像访问与主机权限由部署环境准备。
 - 配置随包部署的本地 `runtime/adx-runtime-rootfs.img`：默认用作实例根文件系统，自定义镜像时只读挂载内置环境，用户镜像不需要预装 RRT。配置及启动语义见 [本地运行环境](runtime-environment.md)。
 - `adxctl config init` 默认生成由 ADX 托管本机 Redis 的单机配置；外置 Redis 使用 `--profile standalone-external-redis`。两种方式都应启用 AOF 和持久化磁盘；具体命令见 [`adxctl` Redis 部署](adxctl.md#单机-standalone-部署)。
 
 ```sh
-sudo /opt/adx/current/bin/adxctl config init
+sudo adxctl config init
 ```
 
 检查配置中的包目录、状态目录、监听地址、Redis 地址和 namespace。示例采用单机回环地址发布内部服务；分节点部署时必须改为对端能访问的地址，并调整防火墙与 CIDR。对外 Edge 默认监听 8443，仅允许本机客户端；远程客户端需要配置 `ADX_DATA_PLANE_EDGE_FRONTEND_ALLOWED_CLIENT_CIDRS`，证书 SAN 也需包含实际入口域名或 IP。
@@ -69,11 +69,11 @@ with os.fdopen(fd, 'w') as output:
 ## 校验、启动和业务就绪
 
 ```sh
-/opt/adx/current/bin/adxctl validate
-/opt/adx/current/bin/adxctl render --output /opt/adx/run/config-review
-/opt/adx/current/bin/adxctl run
+sudo adxctl validate
+sudo adxctl render --output /opt/adx/run/config-review
+sudo adxctl run
 # 另一个终端
-/opt/adx/current/bin/adxctl status
+sudo adxctl status
 ```
 
 CLI 为 API Server 注入共享 Redis 地址和 namespace，发现轮询间隔 `config.discovery.poll_seconds` 默认 5 秒，可配置为 1–86400 秒。Node Manager 的发现配置采用自身协议，由 CLI 分别生成。

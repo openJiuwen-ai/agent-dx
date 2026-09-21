@@ -7,7 +7,7 @@ only external sandboxd, Redis, registry and test certificates are prepared by
 the fixture. The SDK uses Firecracker with one vCPU and 512 MiB.
 
 Run on the selected **dedicated** Linux KVM host as root. The driver refuses to
-replace any existing `/opt/adx` or sandboxd socket. This installation root is owned for the duration of this test and
+replace any existing `/opt/adx`, `/usr/local/bin/adxctl`, or sandboxd socket. These paths are owned for the duration of this test and
 removed during cleanup. It requires unused example ports and sufficient disk
 for two sequential Firecracker instances.
 

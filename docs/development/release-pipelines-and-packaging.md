@@ -307,8 +307,8 @@ adx-offline-<release-version>-linux-<arch>.tar.zst
 sudo ./install.sh --prefix /opt/adx --runtime runc
 
 # 单机默认配置；生成后可审查 YAML
-sudo /opt/adx/current/bin/adxctl config init --profile standalone
-sudo /opt/adx/current/bin/adxctl deploy --config /opt/adx/config/deployment.yaml
+sudo adxctl config init --profile standalone
+sudo adxctl deploy --config /opt/adx/config/deployment.yaml
 ```
 
 规划新增的 `adxctl deploy` 应完成 `validate`、`render`、systemd unit 安装、按依赖顺序

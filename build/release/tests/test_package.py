@@ -14,6 +14,7 @@ class PackageTests(unittest.TestCase):
             root=Path(t); binaries=root/"bin";binaries.mkdir()
             for name in pkg.BINARIES+("rrt-runtime",):
                 (binaries/name).write_bytes(b"fixture")
+            (binaries/"adxctl").write_text("#!/bin/sh\nexit 0\n")
             redis=root/"redis";redis.write_text("#!/bin/sh\necho 'Redis server v=7.2.5 sha=fixture'\n");redis.chmod(0o700)
             wheel=root/"adx_sandbox-1-py3-none-any.whl";wheel.write_bytes(b"fixture wheel")
             out=root/"package"
@@ -35,28 +36,38 @@ class PackageTests(unittest.TestCase):
             root=Path(t); binaries=root/"bin";binaries.mkdir()
             for name in pkg.BINARIES+("rrt-runtime",):
                 (binaries/name).write_bytes(b"fixture")
+            (binaries/"adxctl").write_text("#!/bin/sh\nexit 0\n")
             redis=root/"redis";redis.write_text("#!/bin/sh\necho 'Redis server v=7.2.5 sha=fixture'\n");redis.chmod(0o700)
             wheel=root/"adx_sandbox-1-py3-none-any.whl";wheel.write_bytes(b"fixture wheel")
             package=root/"package"
             target=f"{platform.machine()}-unknown-linux-gnu"
             pkg.assemble(binaries,redis,wheel,package,"a"*40,False,target,"debug")
             prefix=root/"opt/adx"
-            command=[str(package/"install.sh"),"--prefix",str(prefix)]
+            bin_dir=root/"usr/local/bin"
+            command=[str(package/"install.sh"),"--prefix",str(prefix),"--bin-dir",str(bin_dir)]
+            bin_dir.mkdir(parents=True)
+            unmanaged=bin_dir/"adxctl";unmanaged.write_text("unmanaged\n")
+            self.assertNotEqual(subprocess.run(command,capture_output=True).returncode,0)
+            self.assertFalse(prefix.exists())
+            unmanaged.unlink()
             result=subprocess.run(command,text=True,capture_output=True)
             self.assertEqual(result.returncode,0,result.stderr)
             release=prefix/"releases"/("a"*40)
             self.assertEqual((prefix/"current").resolve(),release)
+            self.assertEqual((bin_dir/"adxctl").resolve(),release/"bin/adxctl")
+            self.assertEqual(subprocess.run([bin_dir/"adxctl"]).returncode,0)
             pkg.verify(release)
             config=prefix/"config/deployment.yaml";config.write_text("user config\n")
             state=prefix/"data/user-state";state.write_text("user state\n")
             runtime=prefix/"run/supervisor.sock";runtime.write_text("runtime state\n")
             upgraded_package=root/"upgraded-package"
             pkg.assemble(binaries,redis,wheel,upgraded_package,"b"*40,False,target,"debug")
-            upgraded_command=[str(upgraded_package/"install.sh"),"--prefix",str(prefix)]
+            upgraded_command=[str(upgraded_package/"install.sh"),"--prefix",str(prefix),"--bin-dir",str(bin_dir)]
             upgraded=subprocess.run(upgraded_command,text=True,capture_output=True)
             self.assertEqual(upgraded.returncode,0,upgraded.stderr)
             upgraded_release=prefix/"releases"/("b"*40)
             self.assertEqual((prefix/"current").resolve(),upgraded_release)
+            self.assertEqual((bin_dir/"adxctl").resolve(),upgraded_release/"bin/adxctl")
             pkg.verify(upgraded_release)
             self.assertTrue(release.is_dir())
             self.assertNotEqual(subprocess.run(upgraded_command,capture_output=True).returncode,0)
