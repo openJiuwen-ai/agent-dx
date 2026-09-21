@@ -2,12 +2,12 @@
   "redis_url": "redis://127.0.0.1:6379/",
   "namespace": "adx",
   "tls": {
-    "ca": "/etc/adx/tls/ca.pem",
-    "certificate": "/etc/adx/tls/edge.pem",
-    "private_key": "/etc/adx/tls/edge.key",
+    "ca": "/opt/adx/config/tls/ca.pem",
+    "certificate": "/opt/adx/config/tls/edge.pem",
+    "private_key": "/opt/adx/config/tls/edge.key",
     "server_name": "adx.internal",
     "peers": {
-      "master": "/etc/adx/tls/master.der"
+      "master": "/opt/adx/config/tls/master.der"
     }
   },
   "rpc_timeout_seconds": 5,

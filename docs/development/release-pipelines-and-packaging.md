@@ -222,9 +222,9 @@ adx-platform-<version>-linux-<arch>/
 └── sbom.spdx.json
 ```
 
-安装到版本化目录 `/opt/adx/releases/<version>`，原子更新
-`/opt/adx/current`；`/etc/adx` 和 `/var/lib/adx` 永远不放进 release 目录，升级不得
-覆盖用户配置和状态。回滚只切换 `current` 并重启对应服务。
+安装到版本化目录 `/opt/adx/releases/<commit>`，原子更新
+`/opt/adx/current`；`/opt/adx/config`、`/opt/adx/data` 和 `/opt/adx/run` 永远不放进
+release 目录，升级不得覆盖用户配置和状态。回滚只切换 `current` 并重启对应服务。
 
 ### 2. RRT 包
 
@@ -308,7 +308,7 @@ sudo ./install.sh --prefix /opt/adx --runtime runc
 
 # 单机默认配置；生成后可审查 YAML
 sudo /opt/adx/current/bin/adxctl config init --profile standalone
-sudo /opt/adx/current/bin/adxctl deploy --config /etc/adx/deployment.yaml
+sudo /opt/adx/current/bin/adxctl deploy --config /opt/adx/config/deployment.yaml
 ```
 
 规划新增的 `adxctl deploy` 应完成 `validate`、`render`、systemd unit 安装、按依赖顺序

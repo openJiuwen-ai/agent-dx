@@ -32,7 +32,7 @@
 Node Manager 配置增加可选的 `checkpoint_dir`，例如：
 
 ```json
-{"checkpoint_dir": "/var/lib/adx/checkpoints"}
+{"checkpoint_dir": "/opt/adx/data/checkpoints"}
 ```
 
 统一部署配置中填写到 `role: node-manager` 的 `config`。也可设置互斥的 `checkpoint_storage` 选择本地或 S3；两者均未设置时不启用暂停／恢复。该目录必须是 Node Manager 与 sandboxd 都可读写、以相同绝对路径访问的节点目录；本地制品需在 Node Manager 重启后保留。不要将该目录用作其他组件的文件仓库。

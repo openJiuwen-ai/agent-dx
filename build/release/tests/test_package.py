@@ -1,5 +1,8 @@
 import importlib.util
 from pathlib import Path
+import platform
+import subprocess
+import sys
 import tempfile
 import unittest
 s = importlib.util.spec_from_file_location("package", Path(__file__).resolve().parents[1] / "package.py")
@@ -16,6 +19,7 @@ class PackageTests(unittest.TestCase):
             out=root/"package"
             m=pkg.assemble(binaries,redis,wheel,out,"a"*40,True,"test-fixture","debug")
             self.assertTrue(m["dirty"]);pkg.verify(out)
+            self.assertTrue((out/"install.sh").stat().st_mode & 0o111)
             (out/"bin/adxctl").write_bytes(b"changed")
             with self.assertRaises(ValueError):pkg.verify(out)
             with self.assertRaises(ValueError):pkg.assemble(binaries,redis,wheel,out,"a"*40,True,"test-fixture","debug")
@@ -24,4 +28,42 @@ class PackageTests(unittest.TestCase):
             root=Path(t);out=root/"package"
             with self.assertRaises(ValueError):pkg.assemble(root,root/"redis",root/"adx_sandbox-1.whl",out,"a"*40,True,"fixture","debug")
             self.assertFalse(out.exists())
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "installer targets Linux hosts")
+    def test_installer_verifies_and_installs_without_overwriting_host_state(self):
+        with tempfile.TemporaryDirectory() as t:
+            root=Path(t); binaries=root/"bin";binaries.mkdir()
+            for name in pkg.BINARIES+("rrt-runtime",):
+                (binaries/name).write_bytes(b"fixture")
+            redis=root/"redis";redis.write_text("#!/bin/sh\necho 'Redis server v=7.2.5 sha=fixture'\n");redis.chmod(0o700)
+            wheel=root/"adx_sandbox-1-py3-none-any.whl";wheel.write_bytes(b"fixture wheel")
+            package=root/"package"
+            target=f"{platform.machine()}-unknown-linux-gnu"
+            pkg.assemble(binaries,redis,wheel,package,"a"*40,False,target,"debug")
+            prefix=root/"opt/adx"
+            command=[str(package/"install.sh"),"--prefix",str(prefix)]
+            result=subprocess.run(command,text=True,capture_output=True)
+            self.assertEqual(result.returncode,0,result.stderr)
+            release=prefix/"releases"/("a"*40)
+            self.assertEqual((prefix/"current").resolve(),release)
+            pkg.verify(release)
+            config=prefix/"config/deployment.yaml";config.write_text("user config\n")
+            state=prefix/"data/user-state";state.write_text("user state\n")
+            runtime=prefix/"run/supervisor.sock";runtime.write_text("runtime state\n")
+            upgraded_package=root/"upgraded-package"
+            pkg.assemble(binaries,redis,wheel,upgraded_package,"b"*40,False,target,"debug")
+            upgraded_command=[str(upgraded_package/"install.sh"),"--prefix",str(prefix)]
+            upgraded=subprocess.run(upgraded_command,text=True,capture_output=True)
+            self.assertEqual(upgraded.returncode,0,upgraded.stderr)
+            upgraded_release=prefix/"releases"/("b"*40)
+            self.assertEqual((prefix/"current").resolve(),upgraded_release)
+            pkg.verify(upgraded_release)
+            self.assertTrue(release.is_dir())
+            self.assertNotEqual(subprocess.run(upgraded_command,capture_output=True).returncode,0)
+            replaced=subprocess.run(upgraded_command+["--replace"],text=True,capture_output=True)
+            self.assertEqual(replaced.returncode,0,replaced.stderr)
+            self.assertEqual((prefix/"current").resolve(),upgraded_release)
+            self.assertEqual(config.read_text(),"user config\n")
+            self.assertEqual(state.read_text(),"user state\n")
+            self.assertEqual(runtime.read_text(),"runtime state\n")
 if __name__=="__main__":unittest.main()

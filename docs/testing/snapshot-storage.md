@@ -16,7 +16,7 @@ Node Manager 可使用原来的 `checkpoint_dir`，或显式选择 `checkpoint_s
     "endpoint": "https://objects.example.internal",
     "allow_http": false,
     "prefix": "production/checkpoints",
-    "root": "/var/lib/adx/checkpoints",
+    "root": "/opt/adx/data/checkpoints",
     "cache_budget_bytes": 4294967296
   }
 }

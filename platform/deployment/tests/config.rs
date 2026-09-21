@@ -136,7 +136,7 @@ service_overrides:
     assert_eq!(node.role, Role::NodeManager);
     assert_eq!(node.config["node_id"], "custom-node");
     assert_eq!(node.config["listen"], "0.0.0.0:19001");
-    assert_eq!(node.config["tls"]["ca"], "/etc/adx/tls/ca.pem");
+    assert_eq!(node.config["tls"]["ca"], "/opt/adx/config/tls/ca.pem");
     assert_eq!(
         node.config["tls"]["certificate"],
         "/etc/adx/tls/custom-node.pem"
@@ -279,7 +279,7 @@ fn edge_api_profile_embeds_edge_in_api_server_by_default() {
     assert_eq!(config["edge_control"]["namespace"], "adx");
     assert_eq!(
         config["edge_control"]["tls"]["certificate"],
-        "/etc/adx/tls/edge.pem"
+        "/opt/adx/config/tls/edge.pem"
     );
     assert!(!output.join("edge.json").exists());
 }

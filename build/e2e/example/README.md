@@ -1,14 +1,13 @@
 # Installed deployment example acceptance
 
-This driver installs the complete package into `/opt/adx` and starts the shipped
-`etc/examples/deployment.yaml` at `/etc/adx/deployment.yaml`. It compares the
+This driver runs the package installer, verifies `/opt/adx/current`, and starts the shipped
+`etc/examples/deployment.yaml` at `/opt/adx/config/deployment.yaml`. It compares the
 source and installed file hashes. The five ADX roles use that configuration;
 only external sandboxd, Redis, registry and test certificates are prepared by
 the fixture. The SDK uses Firecracker with one vCPU and 512 MiB.
 
 Run on the selected **dedicated** Linux KVM host as root. The driver refuses to
-replace any existing `/opt/adx`, `/etc/adx`, `/var/lib/adx`, `/run/adx` or sandboxd
-socket. These installation paths are owned for the duration of this test and
+replace any existing `/opt/adx` or sandboxd socket. This installation root is owned for the duration of this test and
 removed during cleanup. It requires unused example ports and sufficient disk
 for two sequential Firecracker instances.
 

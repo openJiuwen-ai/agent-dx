@@ -4,18 +4,18 @@
   "advertised_address": "node-1:19001",
   "proxy_address": "node-1:19002",
   "tls": {
-    "ca": "/etc/adx/tls/ca.pem",
-    "certificate": "/etc/adx/tls/node-1.pem",
-    "private_key": "/etc/adx/tls/node-1.key",
+    "ca": "/opt/adx/config/tls/ca.pem",
+    "certificate": "/opt/adx/config/tls/node-1.pem",
+    "private_key": "/opt/adx/config/tls/node-1.key",
     "server_name": "adx.internal",
     "peers": {
-      "master": "/etc/adx/tls/master.der",
-      "api-server": "/etc/adx/tls/api-server.der"
+      "master": "/opt/adx/config/tls/master.der",
+      "api-server": "/opt/adx/config/tls/api-server.der"
     }
   },
   "sandboxd_socket": "/run/sandboxd/sandboxd.sock",
   "proxy_mode": "standalone",
-  "proxy_socket": "/run/adx/route.sock",
+  "proxy_socket": "/opt/adx/run/route.sock",
   "report_interval_seconds": 5,
   "rpc_timeout_seconds": 30,
   "rrt_port": 50090,
@@ -24,15 +24,15 @@
     "redis_url": "redis://127.0.0.1:6379/",
     "namespace": "adx"
   },
-  "checkpoint_dir": "/var/lib/adx/checkpoints",
+  "checkpoint_dir": "/opt/adx/data/checkpoints",
   "resource_source": {
     "kind": "sandboxd",
     "socket": "/run/sandboxd/node-resource.sock",
     "valid_for_seconds": 30
   },
-  "degradation_journal": "/var/lib/adx/degraded/results.sqlite",
+  "degradation_journal": "/opt/adx/data/degraded/results.sqlite",
   "pressure": {
-    "disk_path": "/var/lib/adx",
+    "disk_path": "/opt/adx/data",
     "thresholds": {
       "memory_high_percent": 90,
       "memory_low_percent": 80,
@@ -52,12 +52,12 @@
     "rootfs": {
       "runtime_class": "runsc",
       "type": "local",
-      "path": "/opt/adx/runtime/adx-runtime-rootfs.img",
+      "path": "/opt/adx/current/runtime/adx-runtime-rootfs.img",
       "readonly": false
     },
     "bootstrap": {
       "type": "erofs",
-      "root": "/opt/adx/runtime/adx-runtime-rootfs.img",
+      "root": "/opt/adx/current/runtime/adx-runtime-rootfs.img",
       "target": "/__adx",
       "entrypoint": [
         "/__adx/usr/local/bin/rrt-runtime"

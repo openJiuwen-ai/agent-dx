@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Exercise the installed SDK, leaving one instance for documented CLI stop."""
 import json,os,pathlib,sys
-os.environ['SSL_CERT_FILE']='/etc/adx/tls/public-ca.pem'
+os.environ['SSL_CERT_FILE']='/opt/adx/config/tls/public-ca.pem'
 from adx_sandbox import ConnectionConfig,Sandbox
 root=pathlib.Path(sys.argv[1]);image=sys.argv[2]
-connection=ConnectionConfig(server_address='localhost:8443',token=pathlib.Path('/etc/adx/secrets/tenant-key').read_text().strip(),use_tls=True,verify_tls=True)
+connection=ConnectionConfig(server_address='localhost:8443',token=pathlib.Path('/opt/adx/config/secrets/tenant-key').read_text().strip(),use_tls=True,verify_tls=True)
 options=dict(image=image,runtime='firecracker',cpu=1000,memory=512,idle_timeout=0,connection=connection,create_timeout=180)
 one=Sandbox(**options)
 try:

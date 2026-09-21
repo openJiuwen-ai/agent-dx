@@ -11,11 +11,11 @@ fn parses_typed_subcommands_without_positional_argument_assumptions() {
         "--output",
         "/tmp/generated",
         "--config",
-        "/etc/adx/deployment.yaml",
+        "/opt/adx/config/deployment.yaml",
     ])
     .expect("render command should accept named options in either order");
 
-    assert_eq!(cli.config, PathBuf::from("/etc/adx/deployment.yaml"));
+    assert_eq!(cli.config, PathBuf::from("/opt/adx/config/deployment.yaml"));
     assert_eq!(
         cli.command,
         Command::Render {
@@ -26,10 +26,15 @@ fn parses_typed_subcommands_without_positional_argument_assumptions() {
 
 #[test]
 fn start_is_an_explicit_alias_for_run() {
-    let cli = Cli::try_parse_from(["adxctl", "start", "--config", "/etc/adx/deployment.yaml"])
-        .expect("start alias should remain compatible");
+    let cli = Cli::try_parse_from([
+        "adxctl",
+        "start",
+        "--config",
+        "/opt/adx/config/deployment.yaml",
+    ])
+    .expect("start alias should remain compatible");
 
-    assert_eq!(cli.config, PathBuf::from("/etc/adx/deployment.yaml"));
+    assert_eq!(cli.config, PathBuf::from("/opt/adx/config/deployment.yaml"));
     assert_eq!(cli.command, Command::Run);
 }
 

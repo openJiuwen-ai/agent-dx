@@ -4,14 +4,21 @@
 
 ## 准备与安装
 
-- 使用与 Linux 主机架构一致的 ADX release 包；部署前执行 `python3 build/release/package.py verify /path/to/package` 校验完整清单。将整个包安装到 `/opt/adx`，不要混用不同包的二进制或 SDK。
+- 使用与 Linux 主机架构一致的 ADX release 包。下载 tar 包后安装：
+
+  ```sh
+  mkdir adx-release
+  tar -xzf adx-release.tar.gz -C adx-release
+  sudo ./adx-release/install.sh
+  ```
+
+  安装器校验 `manifest.json`、所有文件摘要和主机架构，将版本安装到 `/opt/adx/releases/<commit>`，再原子切换 `/opt/adx/current`。它创建并保留 `/opt/adx/config`、`/opt/adx/data`、`/opt/adx/run`；重新安装同一个版本时才需要 `--replace`。`adxctl config init` 创建 `/opt/adx/config/deployment.yaml`。自定义根目录可使用 `--prefix`，并将部署 YAML 中的 `package_dir`、`state_dir` 和数据路径改为该根目录下的对应位置。不要混用不同包的二进制或 SDK。
 - 按 `third_party/sandboxd/source.json` 准备外部 sandboxd。默认示例连接 `/run/sandboxd/sandboxd.sock`。sandboxd 的运行时、网络、镜像访问与主机权限由部署环境准备。
 - 配置随包部署的本地 `runtime/adx-runtime-rootfs.img`：默认用作实例根文件系统，自定义镜像时只读挂载内置环境，用户镜像不需要预装 RRT。配置及启动语义见 [本地运行环境](runtime-environment.md)。
 - `adxctl config init` 默认生成由 ADX 托管本机 Redis 的单机配置；外置 Redis 使用 `--profile standalone-external-redis`。两种方式都应启用 AOF 和持久化磁盘；具体命令见 [`adxctl` Redis 部署](adxctl.md#单机-standalone-部署)。
 
 ```sh
-sudo install -d -m 0700 /etc/adx /etc/adx/tls /etc/adx/secrets /var/lib/adx /run/adx
-sudo /opt/adx/bin/adxctl config init
+sudo /opt/adx/current/bin/adxctl config init
 ```
 
 检查配置中的包目录、状态目录、监听地址、Redis 地址和 namespace。示例采用单机回环地址发布内部服务；分节点部署时必须改为对端能访问的地址，并调整防火墙与 CIDR。对外 Edge 默认监听 8443，仅允许本机客户端；远程客户端需要配置 `ADX_DATA_PLANE_EDGE_FRONTEND_ALLOWED_CLIENT_CIDRS`，证书 SAN 也需包含实际入口域名或 IP。
@@ -35,7 +42,7 @@ sudo /opt/adx/bin/adxctl config init
 | `tls/public-ca.pem` | SDK 及管理客户端信任的对外 HTTPS CA，可与内部 CA 不同 |
 | `secrets/admin-key` | 初始管理员 API Key 明文文件，仅由 Master 初始化读取 |
 
-以上文件相对 `/etc/adx`。私钥和 API Key 权限设为 0600，目录设为 0700，并允许对应服务用户读取。部署环境可用 `openssl x509 -in component.pem -outform DER -out component.der` 从叶证书生成 DER；`peers` 映射检查叶证书字节，因此只更新 PEM 不足以完成内部身份轮换。`node:node-1` 必须与 Node Manager 的 `node_id` 一致。
+以上文件相对 `/opt/adx/config`。私钥和 API Key 权限设为 0600，目录设为 0700，并允许对应服务用户读取。部署环境可用 `openssl x509 -in component.pem -outform DER -out component.der` 从叶证书生成 DER；`peers` 映射检查叶证书字节，因此只更新 PEM 不足以完成内部身份轮换。`node:node-1` 必须与 Node Manager 的 `node_id` 一致。
 
 用密码学随机数生成初始管理员 API Key 并写入受保护文件。配置只引用路径。Master 保存摘要；用管理员接口创建租户密钥，见 [API Key 管理](../testing/api-key-management.md)。正常业务客户端使用租户密钥。
 
@@ -49,12 +56,12 @@ request = urllib.request.Request(
     'https://localhost:8443/api/admin/v1/keys',
     data=json.dumps({'tenantId': 'example'}).encode(), method='POST',
     headers={'Content-Type': 'application/json',
-             'Authorization': 'Bearer ' + Path('/etc/adx/secrets/admin-key').read_text().strip()},
+             'Authorization': 'Bearer ' + Path('/opt/adx/config/secrets/admin-key').read_text().strip()},
 )
-context = ssl.create_default_context(cafile='/etc/adx/tls/public-ca.pem')
+context = ssl.create_default_context(cafile='/opt/adx/config/tls/public-ca.pem')
 with urllib.request.urlopen(request, context=context, timeout=30) as response:
     credential = json.load(response)
-fd = os.open('/etc/adx/secrets/tenant-key', os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+fd = os.open('/opt/adx/config/secrets/tenant-key', os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
 with os.fdopen(fd, 'w') as output:
     output.write(credential['apiKey'])
 ```
@@ -62,11 +69,11 @@ with os.fdopen(fd, 'w') as output:
 ## 校验、启动和业务就绪
 
 ```sh
-/opt/adx/bin/adxctl validate
-/opt/adx/bin/adxctl render --output /run/adx/config-review
-/opt/adx/bin/adxctl run
+/opt/adx/current/bin/adxctl validate
+/opt/adx/current/bin/adxctl render --output /opt/adx/run/config-review
+/opt/adx/current/bin/adxctl run
 # 另一个终端
-/opt/adx/bin/adxctl status
+/opt/adx/current/bin/adxctl status
 ```
 
 CLI 为 API Server 注入共享 Redis 地址和 namespace，发现轮询间隔 `config.discovery.poll_seconds` 默认 5 秒，可配置为 1–86400 秒。Node Manager 的发现配置采用自身协议，由 CLI 分别生成。
@@ -77,7 +84,7 @@ CLI 为 API Server 注入共享 Redis 地址和 namespace，发现轮询间隔 `
 
 ```sh
 python3 -m venv /opt/adx-client
-/opt/adx-client/bin/python -m pip install /opt/adx/sdk/*.whl
+/opt/adx-client/bin/python -m pip install /opt/adx/current/sdk/*.whl
 # 使用 /opt/adx-client/bin/python 运行下面的SDK示例
 ```
 
@@ -86,10 +93,10 @@ import os
 from pathlib import Path
 from adx_sandbox import ConnectionConfig, Sandbox
 
-os.environ['SSL_CERT_FILE'] = '/etc/adx/tls/public-ca.pem'  # 对外证书的签发 CA
+os.environ['SSL_CERT_FILE'] = '/opt/adx/config/tls/public-ca.pem'  # 对外证书的签发 CA
 connection = ConnectionConfig(
     server_address='localhost:8443',
-    token=Path('/etc/adx/secrets/tenant-key').read_text().strip(),
+    token=Path('/opt/adx/config/secrets/tenant-key').read_text().strip(),
     use_tls=True, verify_tls=True,
 )
 sandbox = Sandbox(image='YOUR_RRT_IMAGE', runtime='runc', cpu=250, memory=256,

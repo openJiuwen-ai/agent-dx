@@ -39,6 +39,7 @@ class ReleaseArchiveTests(unittest.TestCase):
             self.assertEqual(package.verify(restored),package.verify(built))
             self.assertTrue((restored/'manifest.json').is_file())
             self.assertTrue((restored/'LICENSE').is_file())
+            self.assertTrue((restored/'install.sh').stat().st_mode & 0o111)
             self.assertTrue((restored/'bin/adx-master').stat().st_mode & 0o111)
             self.assertTrue((restored/'etc/examples/deployment.yaml').is_file())
             self.assertTrue((restored/'third_party/sandboxd/source.json').is_file())

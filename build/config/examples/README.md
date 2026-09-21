@@ -1,6 +1,6 @@
 # Service configuration examples
 
-`deployment.yaml` is the unified `adxctl` input; JSON deployment input is not supported. `adxctl config init` creates `/etc/adx/deployment.yaml` from the managed-Redis standalone template by default. Add `--compact` to write a versioned profile reference and use `service_overrides` for host-specific differences; `adxctl config dump` prints the fully resolved YAML. Use `--profile standalone-external-redis`, `master`, `node`, or `edge-api` for the other topologies. The individual JSON files describe generated service entrypoints rather than the operator-facing deployment format. Replace addresses and absolute certificate paths for your deployment. Master, Node Manager and API Server use `--config /absolute/path/config.json`. In the default mode API Server embeds Edge and receives its listener environment; explicit `edge_mode: standalone` renders the Edge control JSON and starts `adx-edge-frontend` separately.
+`deployment.yaml` is the unified `adxctl` input; JSON deployment input is not supported. `adxctl config init` creates `/opt/adx/config/deployment.yaml` from the managed-Redis standalone template by default. Add `--compact` to write a versioned profile reference and use `service_overrides` for host-specific differences; `adxctl config dump` prints the fully resolved YAML. Use `--profile standalone-external-redis`, `master`, `node`, or `edge-api` for the other topologies. The individual JSON files describe generated service entrypoints rather than the operator-facing deployment format. Replace addresses and absolute certificate paths for your deployment. Master, Node Manager and API Server use `--config /absolute/path/config.json`. In the default mode API Server embeds Edge and receives its listener environment; explicit `edge_mode: standalone` renders the Edge control JSON and starts `adx-edge-frontend` separately.
 
 Shipped deployment examples:
 
@@ -47,7 +47,7 @@ means an empty catalog. Explicit CLI stop performs local Capsule cleanup before 
 
 Master 配置 `advertised_address` 发布可续期的 Redis 地址，默认 TTL 15 秒。Node 与 Sandbox API 示例通过相同 Redis namespace 发现它；也可改用显式 `master_address`，不能同时配置两种方式。Master 心跳超时默认 30 秒，Node 报告间隔应显著小于该值。Node 重启先注册为对账中，完成权威目录恢复后才开放新分配。完整契约见 [发现与恢复](../../../docs/testing/recovery-discovery.md)。
 
-Edge 的 `edge-control.json` 与 Master 使用相同 Redis namespace；Master `tls.peers` 必须登记 Edge 证书。默认共进程部署在 Node Manager 的 `env` 中设置 `ADX_DATA_PLANE_NODE_PROXY_ACTIVITY_UDS_DIR=/run/adx`，其 `proxy_socket` 相应为 `/run/adx/route.sock`。代理首次启动与重新同步期间关闭数据准入，完成 Node Manager 全量绑定同步后开放。详见 [路由发布与本机同步](../../../docs/testing/route-publication.md)。
+Edge 的 `edge-control.json` 与 Master 使用相同 Redis namespace；Master `tls.peers` 必须登记 Edge 证书。默认共进程部署在 Node Manager 的 `env` 中设置 `ADX_DATA_PLANE_NODE_PROXY_ACTIVITY_UDS_DIR=/opt/adx/run/node`，其 `proxy_socket` 相应为 `/opt/adx/run/node/route.sock`。代理首次启动与重新同步期间关闭数据准入，完成 Node Manager 全量绑定同步后开放。详见 [路由发布与本机同步](../../../docs/testing/route-publication.md)。
 
 See [process deployment](../../../docs/testing/process-deployment.md) for foreground supervisor commands, managed Redis AOF configuration and explicit stop cleanup. The deployment example requires environment-provided certificates, sandboxd and a configured resource source; it is not a self-contained E2E environment.
 

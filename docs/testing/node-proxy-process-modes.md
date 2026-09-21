@@ -11,9 +11,9 @@ services:
   - id: node-manager
     role: node-manager
     config:
-      proxy_socket: /run/adx/node/route.sock
+      proxy_socket: /opt/adx/run/node/route.sock
     env:
-      ADX_DATA_PLANE_NODE_PROXY_ACTIVITY_UDS_DIR: /run/adx/node
+      ADX_DATA_PLANE_NODE_PROXY_ACTIVITY_UDS_DIR: /opt/adx/run/node
       ADX_DATA_PLANE_NODE_PROXY_BIND: 0.0.0.0:8443
       ADX_DATA_PLANE_NODE_PROXY_HEALTH_BIND: 127.0.0.1:18443
       ADX_DATA_PLANE_ALLOWED_EDGE_CIDRS: 10.0.0.0/8

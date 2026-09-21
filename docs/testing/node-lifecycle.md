@@ -22,7 +22,7 @@ Node Manager 拥有实例串行状态机。Master 提供归属校验、Redis 持
 sandboxd 的 `/resource` 通过 Unix Socket 提供 CPU 核数、内存／存储字节数和整卡设备 ID；节点先验证 sandboxd 健康 RPC，再转换为调度器毫核单位。健康检查覆盖 sandboxd 内部资源刷新有效期。
 
 ```json
-{"kind":"auto","disk_path":"/var/lib/adx","valid_for_seconds":30}
+{"kind":"auto","disk_path":"/opt/adx/data","valid_for_seconds":30}
 ```
 
 自动模式读取当前 Linux 进程的 CPU 可用并行度、cgroup v1/v2 层级限制、cpuset、内存上限与目标磁盘可用空间。它不虚构 GPU/NPU 清单；需要设备清单的部署选择 sandboxd 源或带设备信息的观测文件。
