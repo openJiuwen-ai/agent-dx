@@ -108,9 +108,9 @@ def run(connection, image, output):
             connection=connection,
             create_timeout=150,
         ) as context_capsule:
-            context_id = context_instance.id
+            context_id = context_capsule.id
             remaining.add(context_id)
-            assert context_instance.is_running()
+            assert context_capsule.is_running()
         remaining.remove(context_id)
         _wait_deleted(context_id, connection)
         passed('lifecycle.context-manager-deletes', started)
