@@ -1,10 +1,18 @@
-# ADX Kubernetes E2E pipeline
+# ADX Buildkite pipelines
 
-`.buildkite/pipeline.yml` builds the current revision, publishes its node and RRT
-images, then deploys and tests ADX in the target Kubernetes cluster. The E2E step
-runs as a Buildkite Agent Stack for Kubernetes job. It uses a mounted target
-kubeconfig to create a unique `adx-e2e-*` namespace and deletes that namespace
-when the run finishes.
+ADX uses three independent Buildkite pipelines backed by one repository:
+
+| Buildkite pipeline | Configuration | Responsibility |
+|---|---|---|
+| `agent-dx` | `pipeline-package.yml` | Rust/platform checks, base package and optional OBS publication |
+| `agent-dx-python-sdk` | `pipeline-sdk.yml` | Python SDK tests, wheel/sdist, clean install smoke and optional OBS publication |
+| `agent-dx-full-test` | `pipeline-full.yml` | Compose exact base/SDK candidates and run the ten-group Kubernetes Full gate |
+
+`.buildkite/pipeline.yml` only dispatches by `BUILDKITE_PIPELINE_SLUG`; it does
+not contain product build or test jobs. Collector mirroring and target-node
+preparation are isolated in `pipeline-maintenance.yml`. The Full E2E job uses a
+mounted target kubeconfig to create a unique `adx-e2e-*` namespace and deletes
+that namespace when the run finishes.
 
 ## Deployment
 
@@ -45,7 +53,7 @@ and the Kubernetes plugin. Worker images follow the existing CI profiles:
 |---|---|
 | `platform-build` | `swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/compile-ubuntu2004-rust:v20260826_rust1950_musl_x86_64` |
 | `platform-obs` | same pinned compile image as `platform-build` |
-| `platform-images` | `swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/sandbox-packager:v20260506_kubectl` |
+| `sdk-package` / `platform-images` | `swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/sandbox-packager:v20260506_kubectl` |
 | `platform-e2e` | `swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/sandbox-deployer:v20260506_kubectl_py39` |
 
 The builder reuses `/mnt/paas` with ADX cache subdirectories. The packager uses
@@ -76,13 +84,23 @@ dependency in the Ubuntu runtime image.
 
 ## Artifact handoff and acceptance
 
-`platform-build` constructs all ADX binaries and the SDK from the clean current
-commit. It downloads the pinned external sandboxd backend artifact selected by
+`platform-build` constructs the ADX base package from the clean current commit.
+It downloads the pinned external sandboxd backend artifact selected by
 `ADX_BACKEND_ARTIFACT_BUILD` and verifies its revision, target and complete file
-digests. `platform-images` downloads the release archive and verifies its SHA256 before
-restoring the complete directory tree and executable permissions. It downloads
-the verified external backend artifacts,
-creates the verified bundle and publishes the node, RRT and entrypoint-fixture images. `registry-images.json` records immutable digest
+digests. `sdk-package` independently tests the public SDK on Python 3.12, creates
+one wheel and one sdist, installs the wheel in a source-free virtual environment,
+and publishes `sdk-candidate.json` with commit, version and SHA256 values.
+
+The current base archive still carries a convenience copy of the SDK wheel for
+standalone installation compatibility. That copy is not the SDK candidate and
+is never selected by Full. Full installs only the wheel named and hashed by the
+independent `sdk-package` candidate.
+
+The Full pipeline requires `ADX_BASE_PACKAGE_BUILD_ID` and `ADX_SDK_BUILD_ID`.
+`platform-images` downloads both immutable candidates by Buildkite build UUID,
+verifies their commits and digests, restores the base package tree and injects
+the independently built SDK wheel into the test image. It then publishes the
+node, RRT and entrypoint-fixture images. `registry-images.json` records immutable digest
 references, source image IDs and the checksum of `bundle.json`.
 
 `platform-e2e` downloads only those JSON manifests and invokes
@@ -90,19 +108,19 @@ references, source image IDs and the checksum of `bundle.json`.
 and immutable references. The target cluster pulls the build's images; neither
 the deployer nor test Pods compile or substitute product binaries.
 
-The default basic gate runs SDK create/query/command/file/delete, API-key and
-tenant isolation, capacity exhaustion/release, two-node placement, and
-local-first atomic ownership. The `full` profile additionally runs the broad
-data-plane surface, idle lifecycle reclamation, heartbeat expiry with
-returning-node cleanup, Node Manager restart, and supervisor stop with physical
-runtime cleanup. Missing selected scenarios, diagnostic or cleanup failures
+The independent Full pipeline always selects the `full` profile. It runs SDK
+create/query/command/file/delete, API-key and tenant isolation, capacity,
+two-node placement, local-first atomic ownership, the broad data-plane surface,
+idle lifecycle reclamation, heartbeat expiry with returning-node cleanup, Node
+Manager restart, and supervisor stop with physical runtime cleanup. Missing
+selected scenarios, diagnostic or cleanup failures
 prevent a pass. `result.json`, JUnit, Kubernetes resource/events and per-Pod logs
 are uploaded. Secret bodies travel on stdin and are excluded from manifests and
 evidence; generated API/Redis keys are redacted from collected component logs.
 
-`ADX_E2E_PROFILE` selects the Kubernetes gate. The default is `k8s-basic`.
-Set it to `l0` for the minimum closure or `full` for the cross-physical-worker
-gate. `full` fails after scheduling when both platform Pods land on the same
+The Full pipeline sets `ADX_E2E_PROFILE=full`. Direct local driver runs may still
+select `l0` or `k8s-basic` for bounded diagnosis. Full fails after scheduling
+when both platform Pods land on the same
 worker. `ADX_E2E_NODE_NAMES` may restrict eligible workers, but the recorded
 actual placement remains the acceptance evidence.
 
@@ -184,11 +202,11 @@ output as `out/buildkite/logs/step-<stage>.log`. Compiler and image-build output
 is grouped by phase. `pipefail` preserves command failures through `tee`.
 Toolchain setup stays in the current shell so exported cache paths reach builds.
 
-Each stage updates the `adx-build-summary` build annotation and uploads its
-Markdown/JSON summary. Later stages extend the earlier summary with immutable
-image references and Kubernetes results. The summary links the release archive,
-SHA256, standalone manifest, SDK wheel, build logs, image provenance, result JSON
-and JUnit. It records actual Pod/host placement and distinguishes same-host runs.
+Package and Full stages update the `adx-build-summary` annotation and upload
+their Markdown/JSON summaries. The SDK pipeline publishes its candidate,
+JUnit and install-smoke evidence as independent artifacts. Full summaries link
+image provenance, result JSON and JUnit, record actual Pod/host placement and
+distinguish same-host runs.
 Failures still publish a summary and retain their original exit status.
 
 ## OBS artifact publication
@@ -224,16 +242,11 @@ metadata back and rejects an absent object or a size mismatch. The same manifest
 and a compact `urls.txt` are retained under `out/buildkite/obs/`; the manifest
 URL is also stored as Buildkite metadata `obs-manifest-url`.
 
-The current bridge publishes the monolithic release archive, release manifest,
-Sandbox SDK wheel and verified runc backend bundle. When the base-package and
-SDK pipelines are split, each pipeline will invoke the same uploader for its own
-independent artifacts and the final release index will reference those manifests.
-
-For a bounded base-package run, set both `ADX_BASE_ONLY=1` and
-`ADX_OBS_UPLOAD=1`. The pipeline runs `platform-build` and `platform-obs`, while
-the image publication, Kubernetes E2E and Firecracker jobs are skipped. This
-mode validates compilation, unit and contract gates, package assembly, backend
-identity and OBS publication; it is not a Full deployment acceptance result.
+The base pipeline uploads the release archive, release manifest and verified
+runc Runtime Pack. The SDK pipeline's `sdk-obs` step separately verifies and
+uploads its wheel, sdist and `sdk-candidate.json`. Set `ADX_OBS_UPLOAD=1` on the
+pipeline that owns the candidate. Neither upload result is a Full deployment
+acceptance verdict; Full consumes the two exact Buildkite build UUIDs.
 
 ## Firecracker checkpoint profile
 

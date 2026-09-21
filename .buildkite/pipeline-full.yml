@@ -1,0 +1,95 @@
+steps:
+- label: ':docker: Compose and publish Full-test images'
+  key: platform-images
+  if: build.env("ADX_E2E_ARTIFACT_BUILD") == null
+  agents:
+    queue: default
+    os: linux
+    arch: amd64
+  command: bash .buildkite/step.sh images python3 .buildkite/with_registry.py --docker -- bash .buildkite/package-e2e.sh
+  timeout_in_minutes: 40
+  env:
+    BUILDKITE_AGENT_NAME: agent-stack-k8s
+    ADX_E2E_IMAGE_REPOSITORY: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/adx-e2e
+  artifact_paths:
+  - out/buildkite/logs/**/*
+  - out/buildkite/bundle/*.json
+  plugins:
+  - kubernetes:
+      podSpec:
+        imagePullSecrets:
+        - name: swr-pull-secret
+        containers:
+        - image: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/sandbox-packager:v20260506_kubectl
+          securityContext: {privileged: true}
+          volumeMounts:
+          - {name: docker-graph, mountPath: /var/lib/docker}
+          resources:
+            requests: {cpu: '8', memory: 16Gi}
+            limits: {cpu: '8', memory: 16Gi}
+          env: &registry-env
+          - name: SWR_USERNAME
+            valueFrom:
+              secretKeyRef: {name: swr-credentials, key: username, optional: true}
+          - name: SWR_PASSWORD
+            valueFrom:
+              secretKeyRef: {name: swr-credentials, key: password, optional: true}
+          - name: SWR_DOCKER_CONFIG_JSON
+            valueFrom:
+              secretKeyRef: {name: swr-pull-secret, key: .dockerconfigjson, optional: true}
+        volumes:
+        - {name: docker-graph, emptyDir: {}}
+- label: ':kubernetes: ADX Full acceptance (10 groups)'
+  key: platform-e2e
+  depends_on: platform-images
+  agents:
+    queue: default
+    os: linux
+    arch: amd64
+  command: bash .buildkite/step.sh e2e python3 .buildkite/with_registry.py -- bash .buildkite/run-e2e.sh
+  timeout_in_minutes: 30
+  artifact_paths:
+  - out/buildkite/acceptance/**/*
+  - out/buildkite/logs/**/*
+  env:
+    BUILDKITE_AGENT_NAME: agent-stack-k8s
+    ADX_KUBECONFIG: /var/run/yr-k8s/target/kubeconfig
+    ADX_E2E_PROFILE: full
+  plugins:
+  - kubernetes:
+      podSpec:
+        imagePullSecrets:
+        - name: swr-pull-secret
+        containers:
+        - image: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/sandbox-deployer:v20260506_kubectl_py39
+          resources:
+            requests: {cpu: '2', memory: 4Gi}
+            limits: {cpu: '4', memory: 8Gi}
+          env: *registry-env
+- label: ':kubernetes: Firecracker checkpoint + snapshots + faults'
+  key: platform-fc-e2e
+  if: build.env("ADX_E2E_ARTIFACT_BUILD") == null && build.env("ADX_E2E_CHECKPOINT") == "1"
+  depends_on: platform-images
+  agents:
+    queue: default
+    os: linux
+    arch: amd64
+  command: bash .buildkite/firecracker-step.sh
+  timeout_in_minutes: 40
+  artifact_paths:
+  - out/buildkite/firecracker/**/*
+  - out/buildkite/logs/firecracker-kubernetes.log
+  env:
+    BUILDKITE_AGENT_NAME: agent-stack-k8s
+    ADX_KUBECONFIG: /var/run/yr-k8s/target/kubeconfig
+  plugins:
+  - kubernetes:
+      podSpec:
+        imagePullSecrets:
+        - name: swr-pull-secret
+        containers:
+        - image: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/sandbox-deployer:v20260506_kubectl_py39
+          resources:
+            requests: {cpu: '2', memory: 4Gi}
+            limits: {cpu: '4', memory: 8Gi}
+          env: *registry-env

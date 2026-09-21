@@ -13,10 +13,10 @@ operations and shutdown cleanup, and preserves configuration hashes.
 ## Local Docker reproduction
 
 For local reproduction, `prepare.py` turns a verified ADX release package and pinned external backend
-into portable runtime images. `run.py` loads and verifies that bundle, starts
+and an independently built SDK candidate into portable runtime images. `run.py` loads and verifies that bundle, starts
 Redis, Master/ShardScheduler, API Server with embedded Edge and two Node Managers with embedded Node Proxies, and
 independently starts real sandboxd on each node. Business tests use the public
-SDK installed into the image from the release wheel; no product source checkout
+SDK installed into the image from the independent wheel; no product source checkout
 is mounted into the test nodes.
 
 ```sh
@@ -25,6 +25,8 @@ python3 build/e2e/build_backend.py \
   --redis-cli /path/to/redis-cli --jobs 2 --output out/e2e/backend
 python3 build/e2e/prepare.py \
   --package out/release/package --backend out/e2e/backend \
+  --sdk-wheel out/sdk/adx_sandbox-0.1.0-py3-none-any.whl \
+  --sdk-candidate out/sdk/sdk-candidate.json \
   --runtime-base registry.example/adx-e2e-tools@sha256:DIGEST \
   --rrt-base ubuntu@sha256:DIGEST --output out/e2e/bundle
 

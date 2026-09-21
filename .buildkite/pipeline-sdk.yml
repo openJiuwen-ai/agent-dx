@@ -1,0 +1,79 @@
+steps:
+- label: ':python: Test and package ADX Sandbox SDK'
+  key: sdk-package
+  agents:
+    queue: default
+    os: linux
+    arch: amd64
+  concurrency: 1
+  concurrency_group: adx/sdk-package
+  command: python3 .buildkite/with_registry.py --docker -- bash .buildkite/build-sdk.sh
+  timeout_in_minutes: 30
+  artifact_paths:
+  - out/buildkite/sdk/**/*
+  - out/buildkite/logs/sdk-*.log
+  env:
+    BUILDKITE_AGENT_NAME: agent-stack-k8s
+    ADX_SDK_TEST_IMAGE: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/adx-e2e@sha256:c310ebf3f56c846d21744640a899d52e16a98b5442ca39402a3132010c722c4a
+  plugins:
+  - kubernetes:
+      podSpec:
+        imagePullSecrets:
+        - name: swr-pull-secret
+        containers:
+        - image: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/sandbox-packager:v20260506_kubectl
+          securityContext: {privileged: true}
+          volumeMounts:
+          - {name: docker-graph, mountPath: /var/lib/docker}
+          - {name: build-cache, mountPath: /mnt/paas}
+          resources:
+            requests: {cpu: '2', memory: 4Gi}
+            limits: {cpu: '4', memory: 8Gi}
+          env:
+          - name: SWR_USERNAME
+            valueFrom:
+              secretKeyRef: {name: swr-credentials, key: username, optional: true}
+          - name: SWR_PASSWORD
+            valueFrom:
+              secretKeyRef: {name: swr-credentials, key: password, optional: true}
+          - name: SWR_DOCKER_CONFIG_JSON
+            valueFrom:
+              secretKeyRef: {name: swr-pull-secret, key: .dockerconfigjson, optional: true}
+        volumes:
+        - {name: docker-graph, emptyDir: {}}
+        - name: build-cache
+          hostPath: {path: /mnt/paas, type: DirectoryOrCreate}
+- label: ':cloud: Upload ADX Sandbox SDK to OBS'
+  key: sdk-obs
+  depends_on: sdk-package
+  if: build.env("ADX_OBS_UPLOAD") == "1"
+  agents:
+    queue: default
+    os: linux
+    arch: amd64
+  command: bash .buildkite/upload-sdk-obs.sh
+  timeout_in_minutes: 20
+  artifact_paths:
+  - out/buildkite/sdk-obs/**/*
+  - out/buildkite/logs/step-sdk-obs.log
+  env:
+    BUILDKITE_AGENT_NAME: agent-stack-k8s
+    ADX_OBS_BUCKET: openyuanrong
+    ADX_OBS_ENDPOINT: obs.cn-southwest-2.myhuaweicloud.com
+  plugins:
+  - kubernetes:
+      podSpec:
+        imagePullSecrets:
+        - name: swr-pull-secret
+        containers:
+        - image: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/compile-ubuntu2004-rust:v20260826_rust1950_musl_x86_64@sha256:13008c86d6ce56422b4591570d3b358a92d6d384100aafa41e04f5556a5d8faf
+          resources:
+            requests: {cpu: '1', memory: 2Gi}
+            limits: {cpu: '2', memory: 4Gi}
+          env:
+          - name: OBS_ACCESS_KEY_ID
+            valueFrom:
+              secretKeyRef: {name: obs-credentials, key: AK, optional: false}
+          - name: OBS_SECRET_ACCESS_KEY
+            valueFrom:
+              secretKeyRef: {name: obs-credentials, key: SK, optional: false}

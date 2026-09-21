@@ -37,7 +37,7 @@ class BackendCacheTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'file set'):cached.verify(self.root,self.manifest['target'])
 
     def test_buildkite_gate_uses_verified_backend_artifact(self):
-        pipeline=(cached.ROOT/'.buildkite/pipeline.yml').read_text()
+        pipeline=(cached.ROOT/'.buildkite/pipeline-package.yml').read_text()
         self.assertIn(
             'ADX_BACKEND_ARTIFACT_BUILD: 01a0ad6d-9629-4da8-903b-3f8bd1ddc992',
             pipeline,

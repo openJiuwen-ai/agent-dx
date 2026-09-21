@@ -22,15 +22,33 @@ def sha(path):
         for data in iter(lambda:f.read(1024*1024),b''):h.update(data)
     return h.hexdigest()
 
+
+def verify_sdk(wheel, candidate_path, expected_commit):
+    candidate = json.loads(candidate_path.read_text())
+    files = candidate.get('files')
+    if candidate.get('schema_version') != 1 or not isinstance(files, dict):
+        raise ValueError('invalid SDK candidate manifest')
+    if candidate.get('commit') != expected_commit:
+        raise ValueError('SDK and platform commits differ')
+    if wheel.name not in files or files[wheel.name] != sha(wheel):
+        raise ValueError('SDK artifact digest mismatch')
+    if (Path(wheel.name).name != wheel.name or not wheel.name.startswith('adx_sandbox-')
+            or not wheel.name.endswith('-py3-none-any.whl')):
+        raise ValueError('invalid SDK wheel name')
+    return candidate
+
 def main():
     p=argparse.ArgumentParser()
-    for name in ('package','backend','output'):p.add_argument('--'+name,type=Path,required=True)
+    for name in ('package','backend','sdk-wheel','sdk-candidate','output'):
+        p.add_argument('--'+name,type=Path,required=True)
     p.add_argument('--runtime-base',required=True);p.add_argument('--rrt-base',required=True)
     p.add_argument('--firecracker-kit',type=Path)
     a=p.parse_args();a.output.mkdir(parents=True,exist_ok=False)
     manifest=package.verify(a.package)
+    expected_commit=os.getenv('ADX_E2E_ARTIFACT_COMMIT',os.getenv('BUILDKITE_COMMIT',manifest['commit']))
+    sdk=verify_sdk(a.sdk_wheel,a.sdk_candidate,expected_commit)
     if os.getenv('BUILDKITE'):
-        if manifest['dirty'] or manifest['commit'] != os.environ['BUILDKITE_COMMIT']:
+        if manifest['dirty'] or manifest['commit'] != expected_commit:
             raise ValueError('CI requires a clean package from the current commit')
         if any('@sha256:' not in x for x in (a.runtime_base,a.rrt_base)):
             raise ValueError('CI base images must be digest pinned')
@@ -56,6 +74,9 @@ def main():
     with tempfile.TemporaryDirectory(prefix='adx-e2e-image-') as d:
         context=Path(d)
         shutil.copytree(a.package,context/'package')
+        (context/'sdk').mkdir()
+        shutil.copy2(a.sdk_wheel,context/'sdk'/a.sdk_wheel.name)
+        shutil.copy2(a.sdk_candidate,context/'sdk'/'sdk-candidate.json')
         # Artifact transport may drop Unix mode bits; identity was verified above.
         for name in package.BINARIES:
             (context/'package/bin'/name).chmod(0o755)
@@ -75,7 +96,7 @@ def main():
                 shutil.copy2(a.firecracker_kit/name,output)
                 if not name.startswith('artifacts/'):output.chmod(0o755)
             (context/'fc-kit/manifest.json').write_text(json.dumps(fc_kit,indent=2))
-        (context/'Dockerfile.node').write_text('ARG BASE\nARG COLLECTOR\nFROM ${COLLECTOR} AS collector\nFROM ${BASE}\nCOPY --from=collector /otelcol-contrib /usr/local/bin/otelcol-contrib\nCOPY observability /opt/adx/observability\nCOPY package /opt/adx/package\nCOPY backend /usr/local/bin\nCOPY e2e /opt/adx/e2e\nRUN python3 -m venv /opt/adx/client && /opt/adx/client/bin/pip install /opt/adx/package/sdk/*.whl\nWORKDIR /opt/adx\nCMD ["sleep", "infinity"]\n')
+        (context/'Dockerfile.node').write_text('ARG BASE\nARG COLLECTOR\nFROM ${COLLECTOR} AS collector\nFROM ${BASE}\nCOPY --from=collector /otelcol-contrib /usr/local/bin/otelcol-contrib\nCOPY observability /opt/adx/observability\nCOPY package /opt/adx/package\nCOPY sdk /opt/adx/sdk\nCOPY backend /usr/local/bin\nCOPY e2e /opt/adx/e2e\nRUN python3 -m venv /opt/adx/client && /opt/adx/client/bin/pip install /opt/adx/sdk/*.whl\nWORKDIR /opt/adx\nCMD ["sleep", "infinity"]\n')
         if fc_kit:
             with (context/'Dockerfile.node').open('a') as dockerfile:
                 dockerfile.write('COPY fc-kit /opt/adx-fc\nCOPY fc-kit/tools /opt/adx/tools\n')
@@ -97,7 +118,7 @@ def main():
         subprocess.run(['docker','save','-o',str(a.output/'images.tar'),*tags.values()],stderr=subprocess.STDOUT,check=True,timeout=600)
         subprocess.run(['docker','save','-o',str(a.output/'rrt.tar'),tags['rrt']],stderr=subprocess.STDOUT,check=True,timeout=300)
         subprocess.run(['docker','save','-o',str(a.output/'entrypoint.tar'),tags['entrypoint']],stderr=subprocess.STDOUT,check=True,timeout=300)
-    result={'schema_version':1,'package':manifest,'backend':backend,'image_ids':{k:v['Id'] for k,v in images.items()},'architecture':images['node']['Architecture'],'archive_sha256':sha(a.output/'images.tar'),'rrt_archive_sha256':sha(a.output/'rrt.tar'),'entrypoint_archive_sha256':sha(a.output/'entrypoint.tar'),'base_images':{'node':a.runtime_base,'rrt':a.rrt_base}}
+    result={'schema_version':1,'package':manifest,'sdk':sdk,'backend':backend,'image_ids':{k:v['Id'] for k,v in images.items()},'architecture':images['node']['Architecture'],'archive_sha256':sha(a.output/'images.tar'),'rrt_archive_sha256':sha(a.output/'rrt.tar'),'entrypoint_archive_sha256':sha(a.output/'entrypoint.tar'),'base_images':{'node':a.runtime_base,'rrt':a.rrt_base}}
     result['collector']={**collector,'image':collector_image}
     if fc_kit:result['firecracker_kit']=fc_kit
     (a.output/'bundle.json').write_text(json.dumps(result,indent=2)+'\n')
