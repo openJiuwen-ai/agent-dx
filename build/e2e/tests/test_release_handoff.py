@@ -28,7 +28,7 @@ class ReleaseArchiveTests(unittest.TestCase):
             for name in (*package.BINARIES,'rrt-runtime','adx-runtime-rootfs.img'):
                 path=bins/name;path.write_bytes(b'fixture binary');path.chmod(0o755)
             redis=root/'redis-server';redis.write_text('#!/bin/sh\necho "Redis server v=7.2.5 fixture"\n');redis.chmod(0o755)
-            wheel=root/'adx_sandbox-0.10.0-py3-none-any.whl';wheel.write_bytes(b'fixture wheel')
+            wheel=root/'adx_sandbox-0.1.0-py3-none-any.whl';wheel.write_bytes(b'fixture wheel')
             built=root/'built';package.assemble(bins,redis,wheel,built,'a'*40,False,'x86_64-unknown-linux-gnu','release')
             archive=root/'adx-release.tar.gz'
             subprocess.run(['tar','-czf',archive,'-C',built,'.'],check=True)
@@ -41,7 +41,8 @@ class ReleaseArchiveTests(unittest.TestCase):
             self.assertTrue((restored/'LICENSE').is_file())
             self.assertTrue((restored/'bin/adx-master').stat().st_mode & 0o111)
             self.assertTrue((restored/'etc/examples/deployment.yaml').is_file())
-            self.assertTrue((restored/'third_party/sandboxd/patches/0001-use-nydus-s3-backend.patch').is_file())
+            self.assertTrue((restored/'third_party/sandboxd/source.json').is_file())
+            self.assertFalse((restored/'third_party/sandboxd/patches').exists())
 
     def test_python_bytecode_does_not_dirty_build_sources(self):
         with tempfile.TemporaryDirectory() as temp:

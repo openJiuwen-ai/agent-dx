@@ -113,6 +113,7 @@ d['runtime_environment'] = resolve_runtime_environment(
     BASE / 'package',
     bool(os.getenv('ADX_E2E_KUBERNETES')),
     PRIVATE / 'runtime-image',
+    os.getenv('ADX_E2E_IMAGE_PROCESS_CONFIG', '/etc/adx-image-process.json'),
 )
 (P/'deployment.yaml').write_text(json.dumps(d));(P/'deployment.yaml').chmod(0o600)
 
@@ -172,6 +173,6 @@ run = RUN
 
 d = json.loads((run / 'deployment.yaml').read_text())
 allowed = {'node_id', 'listen', 'proxy_mode', 'proxy_socket', 'proxy_address', 'checkpoint_storage', 'checkpoint_gc'}
-result = {'schema_version': d['schema_version'], 'package_dir': d['package_dir'], 'state_dir': d['state_dir'], 'services': [
+result = {'schema_version': d['schema_version'], 'package_dir': d['package_dir'], 'state_dir': d['state_dir'], 'runtime_environment': d['runtime_environment'], 'services': [
     {'id': s['id'], 'role': s['role'], 'config': {k: v for k, v in s.get('config', {}).items() if k in allowed}, 'environment_names': sorted(s.get('env', {}))} for s in d['services']]}
 (EVIDENCE/'deployment-final.json').write_text(json.dumps(result, indent=2))

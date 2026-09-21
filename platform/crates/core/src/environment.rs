@@ -36,6 +36,12 @@ pub struct Bootstrap {
     pub image: String,
     pub target: String,
     pub entrypoint: Vec<String>,
+    #[serde(default = "default_image_process_config")]
+    pub image_process_config: String,
+}
+pub const DEFAULT_IMAGE_PROCESS_CONFIG: &str = "/etc/adx-image-process.json";
+fn default_image_process_config() -> String {
+    DEFAULT_IMAGE_PROCESS_CONFIG.into()
 }
 fn absolute(value: &str) -> bool {
     Path::new(value).is_absolute()
@@ -67,6 +73,7 @@ impl RuntimeEnvironment {
             || !matching_sources
             || self.rootfs.runtime.trim().is_empty()
             || !absolute(&self.bootstrap.target)
+            || !absolute(&self.bootstrap.image_process_config)
             || self
                 .bootstrap
                 .entrypoint
