@@ -7,9 +7,9 @@ pub mod query;
 pub mod snapshot;
 use adx_core::scheduling::Device;
 pub use adx_core::scheduling::Node;
-pub use snapshot::{PlacedInstance, Snapshot};
+pub use snapshot::{PlacedCapsule, Snapshot};
 
-use adx_core::{Error, InstanceSpec, Resources, Result};
+use adx_core::{CapsuleSpec, Error, Resources, Result};
 use std::{collections::BTreeSet, sync::Arc};
 
 #[derive(Debug, Clone, Copy)]
@@ -31,12 +31,12 @@ pub struct Candidate<'a> {
 pub trait Filter: Send + Sync {
     fn name(&self) -> &'static str;
     /// false rejects this candidate; an error aborts this scheduling attempt.
-    fn filter(&self, request: &InstanceSpec, candidate: &Candidate<'_>) -> Result<bool>;
+    fn filter(&self, request: &CapsuleSpec, candidate: &Candidate<'_>) -> Result<bool>;
 }
 pub trait Score: Send + Sync {
     fn name(&self) -> &'static str;
     /// Higher is better. Only filtered candidates are scored, in [0, MAX_SCORE].
-    fn score(&self, request: &InstanceSpec, candidate: &Candidate<'_>) -> Result<u32>;
+    fn score(&self, request: &CapsuleSpec, candidate: &Candidate<'_>) -> Result<u32>;
 }
 /// Three scalar resource dimensions, each normalized to one million.
 pub const MAX_SCORE: u32 = 3_000_000;
@@ -70,7 +70,7 @@ impl Framework {
                     .expect("static weight"),
                 WeightedScore::new(Arc::new(constraints::NodePreference), 1)
                     .expect("static weight"),
-                WeightedScore::new(Arc::new(constraints::InstancePreference), 1)
+                WeightedScore::new(Arc::new(constraints::CapsulePreference), 1)
                     .expect("static weight"),
                 WeightedScore::new(Arc::new(constraints::TopologyPreference), 1)
                     .expect("static weight"),
@@ -93,7 +93,7 @@ impl Framework {
             Arc::new(constraints::DeviceFit),
             Arc::new(constraints::NodeAffinity),
             Arc::new(groups::Required),
-            Arc::new(constraints::InstanceAffinity),
+            Arc::new(constraints::CapsuleAffinity),
             Arc::new(constraints::Topology),
         ];
         filters.extend(additional_filters);
@@ -123,14 +123,14 @@ impl Framework {
 
     /// Unknown/custom profiles are deliberately ineligible, even if they use
     /// builtin-looking names. Reverse hard anti-affinity also disables reuse.
-    pub fn supports_aggregation(&self, request: &InstanceSpec, snapshot: &Snapshot) -> bool {
+    pub fn supports_aggregation(&self, request: &CapsuleSpec, snapshot: &Snapshot) -> bool {
         self.builtin_profile
             && request.resources.disk_bytes == 0
             && request.scheduling == Default::default()
             && !snapshot.has_reverse_anti_affinity()
     }
     /// Hard rules only; local-first admission intentionally skips all scoring.
-    pub fn allows(&self, request: &InstanceSpec, candidate: &Candidate<'_>) -> Result<bool> {
+    pub fn allows(&self, request: &CapsuleSpec, candidate: &Candidate<'_>) -> Result<bool> {
         request.validate()?;
         for filter in &self.filters {
             if !filter.filter(request, candidate)? {
@@ -141,7 +141,7 @@ impl Framework {
     }
     pub fn evaluate(
         &self,
-        request: &InstanceSpec,
+        request: &CapsuleSpec,
         candidate: &Candidate<'_>,
     ) -> Result<Option<u64>> {
         if !self.allows(request, candidate)? {
@@ -162,7 +162,7 @@ impl Framework {
     }
     pub fn select<'a>(
         &self,
-        request: &InstanceSpec,
+        request: &CapsuleSpec,
         candidates: impl IntoIterator<Item = Candidate<'a>>,
     ) -> Result<Option<&'a str>> {
         request.validate()?;

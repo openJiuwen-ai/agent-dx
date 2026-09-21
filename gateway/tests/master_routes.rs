@@ -3,13 +3,13 @@ use data_plane_gateway::edge::{master_routes::RouteConsumer, RouteStore};
 use std::sync::Arc;
 fn route(id: &str) -> PublishedRoute {
     PublishedRoute {
-        instance_id: id.into(),
+        capsule_id: id.into(),
         tenant_id: "t".into(),
         runtime_id: format!("{id}-1"),
         runtime_ip: "10.0.0.2".into(),
         node_proxy_address: "127.0.0.1:9000".into(),
         generation: 1,
-        instance_revision: 2,
+        capsule_revision: 2,
         tunnel_security_mode:
             adx_protocol::control::DataPlaneSecurityMode::DataPlaneSecurityTlsToken as i32,
         port_forward_security_mode:
@@ -224,7 +224,7 @@ fn resumed_execution_route_replaces_source_and_rejects_older_revision() {
     .unwrap();
     let mut restored = route("i");
     restored.runtime_id = "i-1-r5".into();
-    restored.instance_revision = 6;
+    restored.capsule_revision = 6;
     c.apply(RouteFrame {
         epoch: 1,
         revision: 2,

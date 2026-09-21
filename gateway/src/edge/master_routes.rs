@@ -4,7 +4,7 @@ use super::{
     RouteStore,
 };
 use crate::common::route::{
-    DataPlaneAuthMode, DataPlaneSecurityMode, InstanceStatus, PortForwardRoute, RouteCache,
+    CapsuleStatus, DataPlaneAuthMode, DataPlaneSecurityMode, PortForwardRoute, RouteCache,
     RouteInfo,
 };
 use adx_discovery::RedisDiscovery;
@@ -52,27 +52,27 @@ impl RouteConsumer {
             self.routes.clone()
         };
         for r in f.upserts {
-            if r.instance_id.is_empty()
+            if r.capsule_id.is_empty()
                 || r.tenant_id.is_empty()
                 || r.generation == 0
-                || r.instance_revision == 0
-                || !adx_protocol::valid_runtime_id(&r.instance_id, r.generation, &r.runtime_id)
+                || r.capsule_revision == 0
+                || !adx_protocol::valid_runtime_id(&r.capsule_id, r.generation, &r.runtime_id)
                 || r.runtime_ip.parse::<std::net::IpAddr>().is_err()
                 || r.node_proxy_address.contains(['/', '@', '?', '#'])
                 || r.node_proxy_address
                     .parse::<http::uri::Authority>()
                     .ok()
                     .is_none_or(|a| a.port_u16().is_none())
-                || !ids.insert(r.instance_id.clone())
+                || !ids.insert(r.capsule_id.clone())
             {
                 return Err("invalid published route".into());
             }
-            if let Some(old) = self.routes.get(&r.instance_id) {
-                if (r.generation, r.instance_revision) < (old.generation, old.instance_revision) {
+            if let Some(old) = self.routes.get(&r.capsule_id) {
+                if (r.generation, r.capsule_revision) < (old.generation, old.capsule_revision) {
                     return Err("route execution version regressed".into());
                 }
             }
-            next.insert(r.instance_id.clone(), r);
+            next.insert(r.capsule_id.clone(), r);
         }
         for id in f.deleted {
             if id.is_empty() || !ids.insert(id.clone()) {
@@ -94,12 +94,12 @@ impl RouteConsumer {
                 }
             };
             cache.put(RouteInfo {
-                instance_id: r.instance_id.clone(),
+                instance_id: r.capsule_id.clone(),
                 tenant_id: r.tenant_id.clone(),
                 sandbox_id: r.runtime_id.clone(),
                 sandbox_ip: r.runtime_ip.clone(),
                 node_proxy_address: r.node_proxy_address.clone(),
-                instance_status: InstanceStatus {
+                capsule_status: CapsuleStatus {
                     code: 3,
                     ..Default::default()
                 },

@@ -1,16 +1,16 @@
 # Node Manager ↔ RRT HTTP 契约
 
-RRT 使用同一个 HTTP 监听端口提供用户操作与运行时协作。Node Manager 决定 Instance 生命周期并调用 sandboxd，RRT 负责实例内的准备、观测和恢复后初始化。共享 JSON 类型定义在 `platform/crates/core/src/runtime.rs`；服务实现为 `runtime/control.rs`，调用端为 Node Manager `runtime_control.rs`。
+RRT 使用同一个 HTTP 监听端口提供用户操作与运行时协作。Node Manager 决定 Capsule 生命周期并调用 sandboxd，RRT 负责实例内的准备、观测和恢复后初始化。共享 JSON 类型定义在 `platform/crates/core/src/runtime.rs`；服务实现为 `runtime/control.rs`，调用端为 Node Manager `runtime_control.rs`。
 
 ## 身份与就绪
 
-sandboxd Start 环境包含 `ADX_INSTANCE_ID`、`ADX_RUNTIME_ID`、`ADX_OWNERSHIP_GENERATION`；Node Manager 注入的值覆盖普通启动配置中的同名值。三个字段必须同时存在且有效。没有身份配置的独立 HTTP 运行模式只提供数据操作，控制接口返回 503。
+sandboxd Start 环境包含 `ADX_CAPSULE_ID`、`ADX_RUNTIME_ID`、`ADX_OWNERSHIP_GENERATION`；Node Manager 注入的值覆盖普通启动配置中的同名值。三个字段必须同时存在且有效。没有身份配置的独立 HTTP 运行模式只提供数据操作，控制接口返回 503。
 
 `GET /control/v1/status` 返回：
 
 ```json
 {
-  "identity": {"instance_id": "i", "runtime_id": "i-1", "ownership_generation": 1},
+  "identity": {"capsule_id": "c", "runtime_id": "i-1", "ownership_generation": 1},
   "revision": 1,
   "phase": "running",
   "checkpoint": null,
@@ -43,7 +43,7 @@ Prepared 仅证明实例内的 handoff 准备完成，不代表 checkpoint 制�
 
 ## 恢复
 
-`restore` handoff 后，RRT 重新读取完整执行身份。同实例恢复允许归属代次增加，或在同归属代次下推进 execution runtime ID；跨 Instance 克隆另校验 checkpoint 源身份与受控的 `ADX_RESTORE_ORIGIN`。恢复端不能改变已继承监听 socket 的端口。身份校验通过后刷新子进程环境、可选 HTTP token，关闭继承的 HTTP/tunnel 会话，重新注册监听器，再进入 Running/Restored。源端 `resume` 保留原身份。
+`restore` handoff 后，RRT 重新读取完整执行身份。同实例恢复允许归属代次增加，或在同归属代次下推进 execution runtime ID；跨 Capsule 克隆另校验 checkpoint 源身份与受控的 `ADX_RESTORE_ORIGIN`。恢复端不能改变已继承监听 socket 的端口。身份校验通过后刷新子进程环境、可选 HTTP token，关闭继承的 HTTP/tunnel 会话，重新注册监听器，再进入 Running/Restored。源端 `resume` 保留原身份。
 
 节点需使用目标执行记录查询状态，只有身份和阶段匹配后才能绑定目标路由。RRT 不向 Master 注册，不负责迁移归属，也不直接发布 Edge 路由。
 

@@ -4,7 +4,7 @@
 
 ## 实现范围
 
-Rust `adx-api-server` 替换 Go HTTP 服务，公开 Sandbox HTTP/SDK 契约保持，直接调用 Instance RPC；API Key、归属缓存、不可变操作目标重试、SSE、快照接口和 Agent 流式转发已迁移。内部协议拆分为 `instance.proto`、`instance_types.proto`、`snapshot.proto`、`credentials.proto`、`routes.proto`，删除旧 Frontend protobuf 适配。
+Rust `adx-api-server` 替换 Go HTTP 服务，公开 Sandbox HTTP/SDK 契约保持，直接调用 Capsule RPC；API Key、归属缓存、不可变操作目标重试、SSE、快照接口和 Agent 流式转发已迁移。内部协议拆分为 `capsule.proto`、`capsule_types.proto`、`snapshot.proto`、`credentials.proto`、`routes.proto`，删除旧 Frontend protobuf 适配。
 
 调度层命名为 Scheduling Shard：`ShardScheduler`、`shard_id`、`scheduler_shards`。Global 轮转 → Shard Filter/Score → Node Manager 准入保持。CLI、证书身份、配置、统一包、K8s 部署和指标消费者同步迁移，具体升级步骤见 [迁移记录](rust-api-server.md)。
 

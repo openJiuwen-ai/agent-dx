@@ -101,20 +101,20 @@ impl BindingService {
             if binding.proxy_session_id != self.session
                 || binding.sync_epoch != s.epoch
                 || next
-                    .insert(binding.instance_id.clone(), binding.clone())
+                    .insert(binding.capsule_id.clone(), binding.clone())
                     .is_some()
             {
                 return Err(Status::invalid_argument(
                     "duplicate binding or session mismatch",
                 ));
             }
-            check_version(s.versions.get(&binding.instance_id), binding)?;
+            check_version(s.versions.get(&binding.capsule_id), binding)?;
         }
         // Preserve negative knowledge for identities omitted from this authoritative snapshot.
         for (id, old) in &s.versions {
             next.entry(id.clone())
                 .or_insert_with(|| UpdateBindingRequest {
-                    instance_id: id.clone(),
+                    capsule_id: id.clone(),
                     ownership_generation: old.ownership_generation,
                     binding_revision: u64::MAX,
                     binding: Some(Binding::Retired(proto::Retired {})),
@@ -126,7 +126,7 @@ impl BindingService {
             if let Some(Binding::Active(target)) = &binding.binding {
                 self.proxy
                     .activate_route(
-                        binding.instance_id.clone(),
+                        binding.capsule_id.clone(),
                         target.runtime_id.clone(),
                         target.ip.parse().unwrap(),
                     )
@@ -150,8 +150,8 @@ impl BindingService {
                 "complete binding synchronization required",
             ));
         }
-        check_version(s.versions.get(&request.instance_id), &request)?;
-        if let Some(previous) = s.versions.get(&request.instance_id) {
+        check_version(s.versions.get(&request.capsule_id), &request)?;
+        if let Some(previous) = s.versions.get(&request.capsule_id) {
             if previous.ownership_generation == request.ownership_generation
                 && previous.binding_revision == request.binding_revision
             {
@@ -159,27 +159,27 @@ impl BindingService {
             }
             if let Some(Binding::Active(old)) = &previous.binding {
                 self.proxy
-                    .retire_route(request.instance_id.clone(), old.runtime_id.clone())
+                    .retire_route(request.capsule_id.clone(), old.runtime_id.clone())
                     .await;
             }
         }
         if let Some(Binding::Active(target)) = &request.binding {
             self.proxy
                 .activate_route(
-                    request.instance_id.clone(),
+                    request.capsule_id.clone(),
                     target.runtime_id.clone(),
                     target.ip.parse().unwrap(),
                 )
                 .await;
         }
         let response = ack(&request);
-        s.versions.insert(request.instance_id.clone(), request);
+        s.versions.insert(request.capsule_id.clone(), request);
         Ok(response)
     }
 }
 #[allow(clippy::result_large_err)]
 fn validate(r: &UpdateBindingRequest) -> Result<(), Status> {
-    if r.instance_id.trim().is_empty() || r.ownership_generation == 0 || r.binding_revision == 0 {
+    if r.capsule_id.trim().is_empty() || r.ownership_generation == 0 || r.binding_revision == 0 {
         return Err(Status::invalid_argument("versioned binding required"));
     }
     match &r.binding {
@@ -216,15 +216,15 @@ fn ack(request: &UpdateBindingRequest) -> UpdateBindingResponse {
 }
 #[tonic::async_trait]
 impl NodeProxyService for BindingService {
-    async fn get_instance_activity(
+    async fn get_capsule_activity(
         &self,
-        request: Request<proto::GetInstanceActivityRequest>,
-    ) -> Result<Response<proto::InstanceActivityState>, Status> {
+        request: Request<proto::GetCapsuleActivityRequest>,
+    ) -> Result<Response<proto::CapsuleActivityState>, Status> {
         let r = request.into_inner();
         let state = self.state.lock().await;
         let binding = state
             .versions
-            .get(&r.instance_id)
+            .get(&r.capsule_id)
             .and_then(|v| v.binding.as_ref());
         if !state.ready
             || !matches!(binding, Some(Binding::Active(target)) if target.runtime_id == r.runtime_id)
@@ -235,9 +235,9 @@ impl NodeProxyService for BindingService {
         }
         let (activity_revision, active_streams) = self
             .proxy
-            .instance_activity(&r.instance_id)
+            .instance_activity(&r.capsule_id)
             .ok_or_else(|| Status::unavailable("activity tracking disabled"))?;
-        Ok(Response::new(proto::InstanceActivityState {
+        Ok(Response::new(proto::CapsuleActivityState {
             proxy_session_id: self.session.clone(),
             activity_revision,
             active_streams,

@@ -47,7 +47,7 @@ benchmark. Earlier failed attempts remain in separate evidence directories.
 The adapter leaves `StartRequest.sandbox_id` empty. It associates the returned
 `StartResponse.id` with the platform execution ID. List, Stats and Delete use the
 returned backend ID; RRT control and routing retain the platform execution ID.
-The labels `adx.instance_id`, `adx.tenant_id`, `adx.runtime_id` and
+The labels `adx.capsule_id`, `adx.tenant_id`, `adx.runtime_id` and
 `adx.generation` allow a new adapter process to recover that association.
 
 Evidence for this change is separate under `out/ci/backend-generated-id/`.

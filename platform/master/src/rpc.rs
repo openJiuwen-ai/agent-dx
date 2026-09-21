@@ -5,10 +5,10 @@ mod metrics;
 mod recovery;
 mod snapshots;
 use crate::{
-    storage::{NodeSession, Session, StoredInstance, StoredNode},
+    storage::{NodeSession, Session, StoredCapsule, StoredNode},
     Master, Node, Placement,
 };
-use adx_core::{Error, InstanceRecord, InstanceSpec, InstanceState, Result};
+use adx_core::{CapsuleRecord, CapsuleSpec, CapsuleState, Error, Result};
 use adx_protocol::{
     auth::{tenant, Peers, Principal},
     control as pb, status,
@@ -35,8 +35,8 @@ struct LiveNode {
 struct State {
     session: Session,
     scheduler: Master,
-    specs: BTreeMap<String, InstanceSpec>,
-    instances: BTreeMap<String, StoredInstance>,
+    specs: BTreeMap<String, CapsuleSpec>,
+    capsules: BTreeMap<String, StoredCapsule>,
     nodes: BTreeMap<String, StoredNode>,
     needs_recovery: bool,
     claim_recovery: bool,
@@ -82,21 +82,21 @@ impl State {
         };
         self.nodes.insert(id.to_owned(), saved.nodes[id].clone());
         self.scheduler.generation = self.scheduler.generation.max(saved.generation);
-        for (instance_id, stored) in saved.instances {
+        for (capsule_id, stored) in saved.capsules {
             if stored.assignment.node_id == id && stored.invalidated {
                 if self
                     .scheduler
                     .snapshot()
-                    .instances()
-                    .contains_key(&instance_id)
+                    .capsules()
+                    .contains_key(&capsule_id)
                 {
                     if let Err(error) = self.scheduler.release(&stored.assignment) {
                         self.needs_recovery = true;
                         return Err(error);
                     }
                 }
-                self.specs.insert(instance_id.clone(), stored.spec.clone());
-                self.instances.insert(instance_id, stored);
+                self.specs.insert(capsule_id.clone(), stored.spec.clone());
+                self.capsules.insert(capsule_id, stored);
             }
         }
         self.recovering.remove(id);
@@ -117,11 +117,11 @@ impl State {
         for assignment in round.assignments {
             let spec = self
                 .specs
-                .get(&assignment.instance_id)
+                .get(&assignment.capsule_id)
                 .ok_or(Error::Conflict)?
                 .clone();
             let recovery = self
-                .instances
+                .capsules
                 .get(&spec.id)
                 .filter(|i| i.invalidated)
                 .cloned();
@@ -134,17 +134,17 @@ impl State {
             };
             match saved {
                 Ok(record) => {
-                    self.instances.insert(record.spec.id.clone(), record);
+                    self.capsules.insert(record.spec.id.clone(), record);
                 }
                 Err(Error::Conflict)
                     if self
-                        .instances
-                        .get(&assignment.instance_id)
+                        .capsules
+                        .get(&assignment.capsule_id)
                         .is_some_and(|i| i.invalidated) =>
                 {
                     self.scheduler.release(&assignment)?;
-                    let fresh = self.session.get(&assignment.instance_id).await?;
-                    self.instances.insert(assignment.instance_id.clone(), fresh);
+                    let fresh = self.session.get(&assignment.capsule_id).await?;
+                    self.capsules.insert(assignment.capsule_id.clone(), fresh);
                 }
                 Err(Error::Conflict) => {
                     // Rebuild the whole precomputed round after a competing owner
@@ -221,8 +221,8 @@ impl MasterRpc {
         // source pins after a new Master epoch has fenced all previous writers.
         for snapshot in session.retained_snapshots().await? {
             for reference in snapshot.references {
-                if let adx_core::snapshots::Reference::Restore { instance_id } = &reference {
-                    if !saved.instances.contains_key(instance_id) {
+                if let adx_core::snapshots::Reference::Restore { capsule_id } = &reference {
+                    if !saved.capsules.contains_key(capsule_id) {
                         session.release_snapshot(&snapshot.id, reference).await?;
                     }
                 }
@@ -249,7 +249,7 @@ impl MasterRpc {
         }
         let scheduler = Master::restore(&saved, placement)?;
         let specs = saved
-            .instances
+            .capsules
             .iter()
             .map(|(id, i)| (id.clone(), i.spec.clone()))
             .collect();
@@ -262,7 +262,7 @@ impl MasterRpc {
                 session,
                 scheduler,
                 specs,
-                instances: saved.instances,
+                capsules: saved.capsules,
                 nodes: saved.nodes,
                 needs_recovery: false,
                 claim_recovery: false,
@@ -336,9 +336,9 @@ impl MasterRpc {
 
     async fn create(
         &self,
-        spec: InstanceSpec,
+        spec: CapsuleSpec,
         schedule_timeout: Duration,
-    ) -> std::result::Result<pb::InstanceResult, Status> {
+    ) -> std::result::Result<pb::CapsuleResult, Status> {
         let mut schedule_deadline = None;
         loop {
             let changed = self.0.changed.notified();
@@ -351,13 +351,13 @@ impl MasterRpc {
                 tokio::time::Instant::now() >= deadline && !state.specs.contains_key(&spec.id)
             }) {
                 return Err(Status::deadline_exceeded(
-                    "central scheduling queue deadline exceeded; retry the same Instance ID",
+                    "central scheduling queue deadline exceeded; retry the same Capsule ID",
                 ));
             }
             if let Some(existing) = state.specs.get(&spec.id) {
                 if existing != &spec {
                     return Err(Status::already_exists(
-                        "instance ID has a different specification",
+                        "capsule ID has a different specification",
                     ));
                 }
                 schedule_deadline.get_or_insert_with(|| {
@@ -374,7 +374,7 @@ impl MasterRpc {
                             id,
                             &spec.tenant_id,
                             adx_core::snapshots::Reference::Restore {
-                                instance_id: spec.id.clone(),
+                                capsule_id: spec.id.clone(),
                             },
                         )
                         .await
@@ -387,7 +387,7 @@ impl MasterRpc {
                             .release_snapshot(
                                 id,
                                 adx_core::snapshots::Reference::Restore {
-                                    instance_id: spec.id.clone(),
+                                    capsule_id: spec.id.clone(),
                                 },
                             )
                             .await
@@ -405,22 +405,22 @@ impl MasterRpc {
                 self.0.changed.notify_waiters();
             }
             let progress = drive.map_err(status)?;
-            if state.instances.contains_key(&spec.id) {
+            if state.capsules.contains_key(&spec.id) {
                 state.scheduling_deadlines.remove(&spec.id);
                 // Recheck storage session before using a cached assignment.
                 let stored = state.session.get(&spec.id).await.map_err(status)?;
                 if stored.invalidated || stored.recovery.as_ref().is_some_and(|r| r.pending) {
                     return Err(Status::failed_precondition(
-                        "existing instance requires recovery/query",
+                        "existing capsule requires recovery/query",
                     ));
                 }
                 if let Some(result) = stored.result {
-                    if result.state != InstanceState::Running {
+                    if result.state != CapsuleState::Running {
                         return Err(Status::failed_precondition(
-                            "instance already completed; query its result",
+                            "capsule already completed; query its result",
                         ));
                     }
-                    return Ok(pb::InstanceResult {
+                    return Ok(pb::CapsuleResult {
                         record: Some(result.try_into().map_err(status)?),
                         durability: pb::Durability::Published as i32,
                     });
@@ -443,7 +443,7 @@ impl MasterRpc {
                         if !snapshot
                             .references
                             .contains(&adx_core::snapshots::Reference::Restore {
-                                instance_id: spec.id.clone(),
+                                capsule_id: spec.id.clone(),
                             })
                         {
                             return Err(Status::failed_precondition("snapshot reference missing"));
@@ -463,7 +463,7 @@ impl MasterRpc {
                     .connect()
                     .await
                     .map_err(|_| Status::unavailable("node connection unavailable"))?;
-                let request = pb::StartAssignedInstanceRequest {
+                let request = pb::StartAssignedCapsuleRequest {
                     snapshot,
                     node_session_id: node
                         .session
@@ -475,7 +475,7 @@ impl MasterRpc {
                     assignment: Some(stored.assignment.clone().try_into().map_err(status)?),
                 };
                 let result = match pb::node_service_client::NodeServiceClient::new(channel)
-                    .create_instance(adx_observability::trace::inject(request))
+                    .create_capsule(adx_observability::trace::inject(request))
                     .await
                 {
                     Ok(result) => result.into_inner(),
@@ -488,7 +488,7 @@ impl MasterRpc {
                     }
                     Err(error) => return Err(error),
                 };
-                let record: InstanceRecord = result
+                let record: CapsuleRecord = result
                     .record
                     .clone()
                     .ok_or_else(|| Status::unavailable("node result missing"))?
@@ -496,7 +496,7 @@ impl MasterRpc {
                     .map_err(status)?;
                 if record.spec != spec
                     || record.assignment != stored.assignment
-                    || record.state != InstanceState::Running
+                    || record.state != CapsuleState::Running
                 {
                     return Err(Status::failed_precondition(
                         "node returned inconsistent result",
@@ -530,7 +530,7 @@ impl MasterRpc {
                 }
                 if self.expire_pending(&spec, deadline).await? {
                     return Err(Status::deadline_exceeded(
-                        "central scheduling queue deadline exceeded; retry the same Instance ID",
+                        "central scheduling queue deadline exceeded; retry the same Capsule ID",
                     ));
                 }
             }
@@ -539,11 +539,11 @@ impl MasterRpc {
 
     async fn expire_pending(
         &self,
-        spec: &InstanceSpec,
+        spec: &CapsuleSpec,
         deadline: tokio::time::Instant,
     ) -> std::result::Result<bool, Status> {
         let mut state = self.0.state.lock().await;
-        if state.instances.contains_key(&spec.id)
+        if state.capsules.contains_key(&spec.id)
             || state.scheduling_deadlines.get(&spec.id) != Some(&deadline)
             || !state.scheduler.cancel_pending(&spec.id)
         {
@@ -557,7 +557,7 @@ impl MasterRpc {
                 .release_snapshot(
                     snapshot_id,
                     adx_core::snapshots::Reference::Restore {
-                        instance_id: spec.id.clone(),
+                        capsule_id: spec.id.clone(),
                     },
                 )
                 .await
@@ -566,7 +566,7 @@ impl MasterRpc {
         self.0.changed.notify_waiters();
         Ok(true)
     }
-    async fn commit(&self, record: InstanceRecord, session_id: String) -> Result<InstanceRecord> {
+    async fn commit(&self, record: CapsuleRecord, session_id: String) -> Result<CapsuleRecord> {
         let mut state = self.0.state.lock().await;
         state.recover_claim_write().await?;
         state.healthy()?;
@@ -588,17 +588,17 @@ impl MasterRpc {
             return Err(Error::Conflict);
         }
         let accepted = state.session.commit(record).await?;
-        if let Some(stored) = state.instances.get_mut(&accepted.spec.id) {
+        if let Some(stored) = state.capsules.get_mut(&accepted.spec.id) {
             stored.spec = accepted.spec.clone();
             stored.result = Some(accepted.clone());
-            if accepted.state != InstanceState::Paused {
+            if accepted.state != CapsuleState::Paused {
                 if let Some(recovery) = &mut stored.recovery {
                     recovery.pending = false;
                 }
             }
         }
         let held = state
-            .instances
+            .capsules
             .get(&accepted.spec.id)
             .is_some_and(|s| s.resources_held());
         if !state.needs_recovery
@@ -606,7 +606,7 @@ impl MasterRpc {
             && state
                 .scheduler
                 .snapshot()
-                .instances()
+                .capsules()
                 .contains_key(&accepted.spec.id)
         {
             if let Err(error) = state.scheduler.release(&accepted.assignment) {
@@ -619,7 +619,7 @@ impl MasterRpc {
             && !state
                 .scheduler
                 .snapshot()
-                .instances()
+                .capsules()
                 .contains_key(&accepted.spec.id)
         {
             if let Err(error) = state
@@ -630,7 +630,7 @@ impl MasterRpc {
                 return Err(error);
             }
         }
-        if let Some(stored) = state.instances.get_mut(&accepted.spec.id) {
+        if let Some(stored) = state.capsules.get_mut(&accepted.spec.id) {
             stored.result = Some(accepted.clone());
         }
         self.0.changed.notify_waiters();
@@ -705,8 +705,8 @@ impl pb::master_service_server::MasterService for MasterRpc {
     }
     async fn prepare_create(
         &self,
-        request: Request<pb::LocalCreateRequest>,
-    ) -> std::result::Result<Response<pb::PreparedCreate>, Status> {
+        request: Request<pb::LocalCapsuleCreateRequest>,
+    ) -> std::result::Result<Response<pb::PreparedCapsule>, Status> {
         let Principal::Node(node) = self.0.peers.authenticate(&request)? else {
             return Err(Status::permission_denied("Node Manager required"));
         };
@@ -714,11 +714,11 @@ impl pb::master_service_server::MasterService for MasterRpc {
             .await
             .map(Response::new)
     }
-    async fn claim_instance(
+    async fn claim_capsule(
         &self,
-        request: Request<pb::ClaimInstanceRequest>,
-    ) -> std::result::Result<Response<pb::ClaimInstanceResponse>, Status> {
-        let trace = adx_observability::trace::Trace::rpc("master.claim_instance", &request);
+        request: Request<pb::ClaimCapsuleRequest>,
+    ) -> std::result::Result<Response<pb::ClaimCapsuleResponse>, Status> {
+        let trace = adx_observability::trace::Trace::rpc("master.claim_capsule", &request);
         let Principal::Node(node) = self.0.peers.authenticate(&request)? else {
             return Err(Status::permission_denied("Node Manager required"));
         };
@@ -732,8 +732,8 @@ impl pb::master_service_server::MasterService for MasterRpc {
     }
     async fn forward_create(
         &self,
-        request: Request<pb::LocalCreateRequest>,
-    ) -> std::result::Result<Response<pb::InstanceResult>, Status> {
+        request: Request<pb::LocalCapsuleCreateRequest>,
+    ) -> std::result::Result<Response<pb::CapsuleResult>, Status> {
         let trace = adx_observability::trace::Trace::rpc("master.forward_create", &request);
         let Principal::Node(node) = self.0.peers.authenticate(&request)? else {
             return Err(Status::permission_denied("Node Manager required"));
@@ -788,7 +788,7 @@ impl pb::master_service_server::MasterService for MasterRpc {
                 }
                 let snapshot = state.session.snapshot().await.map_err(status)?;
                 let retained_checkpoints = snapshot
-                    .instances
+                    .capsules
                     .values()
                     .filter_map(|i| i.result.as_ref().and_then(|r| r.checkpoint.as_ref()))
                     .filter(|cp| cp.artifact.storage != "local")
@@ -796,21 +796,23 @@ impl pb::master_service_server::MasterService for MasterRpc {
                     .map(Into::into)
                     .collect();
                 let records = snapshot
-                    .instances
+                    .capsules
                     .into_values()
                     .filter(|i| i.assignment.node_id == r.node_id)
                     .map(|i| {
                         i.result
-                            .unwrap_or_else(|| InstanceRecord {
+                            .unwrap_or_else(|| CapsuleRecord {
                                 restart_attempts: 0,
                                 restart_pending: false,
-                                runtime_id: format!("{}-{}", i.spec.id, i.assignment.generation),
+                                runtime: adx_core::Runtime {
+                                    id: format!("{}-{}", i.spec.id, i.assignment.generation),
+                                    ip: None,
+                                },
                                 spec: i.spec,
                                 assignment: i.assignment,
-                                state: InstanceState::Pending,
+                                state: CapsuleState::Pending,
                                 revision: 0,
                                 resources_held: true,
-                                runtime_ip: None,
                                 checkpoint: None,
                                 last_operation: None,
                             })
@@ -986,11 +988,11 @@ impl pb::master_service_server::MasterService for MasterRpc {
             })
             .await
     }
-    async fn create_instance(
+    async fn create_capsule(
         &self,
-        request: Request<pb::CreateInstanceRequest>,
-    ) -> std::result::Result<Response<pb::InstanceResult>, Status> {
-        let trace = adx_observability::trace::Trace::rpc("master.create_instance", &request);
+        request: Request<pb::CreateCapsuleRequest>,
+    ) -> std::result::Result<Response<pb::CapsuleResult>, Status> {
+        let trace = adx_observability::trace::Trace::rpc("master.create_capsule", &request);
         trace
             .run_result(async {
                 if self.0.peers.authenticate(&request)? != Principal::ApiServer {
@@ -1027,23 +1029,23 @@ impl pb::master_service_server::MasterService for MasterRpc {
             })
             .await
     }
-    async fn get_instance(
+    async fn get_capsule(
         &self,
-        request: Request<pb::GetInstanceRequest>,
-    ) -> std::result::Result<Response<pb::GetInstanceResponse>, Status> {
-        let trace = adx_observability::trace::Trace::rpc("master.get_instance", &request);
+        request: Request<pb::GetCapsuleRequest>,
+    ) -> std::result::Result<Response<pb::GetCapsuleResponse>, Status> {
+        let trace = adx_observability::trace::Trace::rpc("master.get_capsule", &request);
         trace
             .run_result(async {
                 let principal = self.0.peers.authenticate(&request)?;
                 let r = request.into_inner();
                 let state = self.0.state.lock().await;
-                let stored = state.session.get(&r.instance_id).await.map_err(status)?;
+                let stored = state.session.get(&r.capsule_id).await.map_err(status)?;
                 match principal {
                     Principal::ApiServer => tenant(r.caller.as_ref(), &stored.spec.tenant_id)?,
                     Principal::Node(ref id) if id == &stored.assignment.node_id => (),
                     _ => {
                         return Err(Status::permission_denied(
-                            "caller may not read this instance",
+                            "caller may not read this capsule",
                         ))
                     }
                 }
@@ -1052,7 +1054,7 @@ impl pb::master_service_server::MasterService for MasterRpc {
                     .get(&stored.assignment.node_id)
                     .ok_or_else(|| Status::unavailable("owner node missing"))?;
                 let record = stored.effective_record();
-                Ok(Response::new(pb::GetInstanceResponse {
+                Ok(Response::new(pb::GetCapsuleResponse {
                     record: Some(record.try_into().map_err(status)?),
                     node_address: node.address.clone(),
                     node_proxy_address: node.proxy_address.clone(),
@@ -1060,16 +1062,16 @@ impl pb::master_service_server::MasterService for MasterRpc {
             })
             .await
     }
-    async fn commit_instance(
+    async fn commit_capsule(
         &self,
-        request: Request<pb::CommitInstanceRequest>,
-    ) -> std::result::Result<Response<pb::CommitInstanceResponse>, Status> {
-        let trace = adx_observability::trace::Trace::rpc("master.commit_instance", &request);
+        request: Request<pb::CommitCapsuleRequest>,
+    ) -> std::result::Result<Response<pb::CommitCapsuleResponse>, Status> {
+        let trace = adx_observability::trace::Trace::rpc("master.commit_capsule", &request);
         trace
             .run_result(async {
                 let principal = self.0.peers.authenticate(&request)?;
                 let r = request.into_inner();
-                let record: InstanceRecord = r
+                let record: CapsuleRecord = r
                     .record
                     .ok_or_else(|| Status::invalid_argument("record required"))?
                     .try_into()
@@ -1084,7 +1086,7 @@ impl pb::master_service_server::MasterService for MasterRpc {
                             .commit(record, r.node_session_id)
                             .await
                             .map_err(status)?;
-                        Ok(Response::new(pb::CommitInstanceResponse {
+                        Ok(Response::new(pb::CommitCapsuleResponse {
                             record: Some(record.try_into().map_err(status)?),
                         }))
                     },

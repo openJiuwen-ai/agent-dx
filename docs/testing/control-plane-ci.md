@@ -119,7 +119,7 @@ Sandbox SDK → Rust API Server → Master / Global → Shard → Node Manager �
 状态提交：Node Manager → Master → Redis；Master → Edge 发布路由
 ```
 
-先实现纯 Instance 状态与资源类型、Node Manager 串行控制器及 RuntimeBackend 边界。紧接着接入最小 RPC、Redis 提交、内嵌 Shard、Sandbox API 后端，打通完整链路。Global 保留轮转职责，Shard 实际选择节点，Node Manager 本机复核并拥有生命周期状态机。
+先实现纯 Capsule 状态与资源类型、Node Manager 串行控制器及 RuntimeDriver 边界。紧接着接入最小 RPC、Redis 提交、内嵌 Shard、Sandbox API 后端，打通完整链路。Global 保留轮转职责，Shard 实际选择节点，Node Manager 本机复核并拥有生命周期状态机。
 
 首批必过的真实功能用例：
 
@@ -156,7 +156,7 @@ Agent 业务通过 Sandbox SDK 验收；平台基础流水线无需启动 Agent 
 
 基于 `1e49d86` 加当前 CI 工作树修改，通过同一 runner 验证：本地执行器 7 项；Rust 199 项；Go 107 个顶层测试（含子测试 200 项）及 vet；Agent 234 项通过、1 项跳过；Sandbox SDK 233 项通过；真实 SDK/RRT Socket 互操作 11 项；四包 8 个 wheel/sdist，SHA256 已复核。
 
-Go 使用 Linux arm64 容器，其余使用 macOS arm64。完整平台尚未部署，以上结果不包含 Instance 生命周期 E2E。
+Go 使用 Linux arm64 容器，其余使用 macOS arm64。完整平台尚未部署，以上结果不包含 Capsule 生命周期 E2E。
 
 首次接入互操作脚本时，未知长度 POST 返回 502。已定位到旧测试上游只读取 Content-Length，无法消费 V2 流式请求的 chunked 编码。仅修正测试夹具，新增已知长度 buffered 请求断言，复测 11 项通过；产品数据面实现未修改。失败与成功记录分别保存在 `out/ci/interop/` 的独立运行目录。
 
@@ -164,4 +164,4 @@ Master 存储阶段的契约与运行方法见 [Redis 持久化与恢复](master
 
 组件日志采集验收复用现有 Edge/Node Proxy 指标端点，并通过真实 OpenTelemetry Collector 接收结构化组件日志。stop 组包含后端 503、文件滚动与 Collector 重启，控制台输出 `[METRICS PASS]` / `[COLLECTION PASS]`；产物含 `gateway-metrics-node*.json`、`collection-node*.json`、`collected-logs.jsonl` 和 `collector-process.log`。部署及保证边界见 `docs/testing/log-collection.md`。Trace 已纳入采集验收，输出 `[TRACE PASS]` 并保存 `traces-node*.json` 和 `collected-traces.jsonl`；正式结果见 [Buildkite #21](2026-09-17-observability-k8s.md)。
 
-`local-first` 组已由当前源码构建的新制品在 Buildkite #30 通过。历史 Buildkite #24 的七组成功仍只代表当时范围；源码接线和组件证据见 [本地优先创建](atomic-instance-claim.md)，正式八组结果见 [#30 验收](2026-09-18-runtime-environment-k8s.md)。
+`local-first` 组已由当前源码构建的新制品在 Buildkite #30 通过。历史 Buildkite #24 的七组成功仍只代表当时范围；源码接线和组件证据见 [本地优先创建](atomic-capsule-claim.md)，正式八组结果见 [#30 验收](2026-09-18-runtime-environment-k8s.md)。

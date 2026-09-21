@@ -1,5 +1,5 @@
 use crate::common::protocol::ConnectTarget;
-use crate::common::route::{DataPlaneAuthMode, DataPlaneSecurityMode, InstanceStatus, RouteInfo};
+use crate::common::route::{CapsuleStatus, DataPlaneAuthMode, DataPlaneSecurityMode, RouteInfo};
 use crate::edge::route_store::{RouteChange, RouteStore};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -48,7 +48,7 @@ pub enum ResolveError {
     #[error("sandbox route not found")]
     NotFound,
     #[error("sandbox instance is not connectable: code={code}, msg={msg}, err_code={err_code}, exit_code={exit_code}, type={kind}")]
-    InstanceStatus {
+    CapsuleStatus {
         code: i32,
         msg: String,
         err_code: i32,
@@ -138,7 +138,7 @@ impl EdgeRouteResolver {
         self.store
             .get(&handle.target.instance_id)
             .is_some_and(|route| {
-                is_connectable(&route.instance_status)
+                is_connectable(&route.capsule_status)
                     && route.node_proxy_address == handle.node_proxy_address
                     && route.sandbox_id == handle.target.workload_id
                     && route.sandbox_ip.parse().ok() == Some(handle.target.target_ip)
@@ -171,13 +171,13 @@ impl EdgeRouteResolver {
                 None => return Err(ResolveError::NotFound),
             },
         };
-        if !is_connectable(&route.instance_status) {
-            return Err(ResolveError::InstanceStatus {
-                code: route.instance_status.code,
-                msg: route.instance_status.msg.clone(),
-                err_code: route.instance_status.err_code,
-                exit_code: route.instance_status.exit_code,
-                kind: route.instance_status.kind,
+        if !is_connectable(&route.capsule_status) {
+            return Err(ResolveError::CapsuleStatus {
+                code: route.capsule_status.code,
+                msg: route.capsule_status.msg.clone(),
+                err_code: route.capsule_status.err_code,
+                exit_code: route.capsule_status.exit_code,
+                kind: route.capsule_status.kind,
             });
         }
         if route.node_proxy_address.is_empty() {
@@ -200,7 +200,7 @@ impl EdgeRouteResolver {
 
 // The control-plane RUNNING status is the only connectable state. This module
 // consumes that state and does not create a second lifecycle state machine.
-fn is_connectable(status: &InstanceStatus) -> bool {
+fn is_connectable(status: &CapsuleStatus) -> bool {
     status.code == 3
 }
 
@@ -212,7 +212,7 @@ mod tests {
     fn route(status: i32) -> RouteInfo {
         RouteInfo {
             instance_id: "i".into(),
-            instance_status: InstanceStatus {
+            capsule_status: CapsuleStatus {
                 code: status,
                 msg: "failed".into(),
                 ..Default::default()
@@ -246,14 +246,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn preserves_instance_status_error() {
+    async fn preserves_capsule_status_error() {
         let store = Arc::new(RouteStore::new());
         store.put(route(5));
         store.set_ready(true);
         let resolver = EdgeRouteResolver::new(store);
         assert!(matches!(
             resolver.resolve("i", 22, AccessKind::Ssh, "req").await,
-            Err(ResolveError::InstanceStatus { code: 5, .. })
+            Err(ResolveError::CapsuleStatus { code: 5, .. })
         ));
     }
 }

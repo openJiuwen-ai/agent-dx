@@ -100,7 +100,7 @@ try:
     event(3);event(4)
     assert len(inventory())==1
     call(cli('stop'),timeout=120);supervisor.wait(timeout=30)
-    records={k:v for k,v in catalog().items() if k.startswith('instance:')}
+    records={k:v for k,v in catalog().items() if k.startswith('capsule:')}
     assert len(records)==2 and all(r['result']['state']=='Deleted' and not r['result']['resources_held'] for r in records.values())
     result['backend_count']=len(inventory());assert result['backend_count']==0
     result['external_dependencies_alive_after_stop']=redis.poll() is None and sandboxd.poll() is None

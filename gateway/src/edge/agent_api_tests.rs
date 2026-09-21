@@ -399,7 +399,7 @@ impl adx_agent_api::dispatcher::Dispatch for DispatchFixture {
             .await?;
         Ok(())
     }
-    async fn release_instance(
+    async fn release_capsule(
         &self,
         scope: &adx_agent_core::Scope,
         id: &str,

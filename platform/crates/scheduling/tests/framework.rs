@@ -1,4 +1,4 @@
-use adx_core::{Error, InstanceSpec, Resources, Result};
+use adx_core::{CapsuleSpec, Error, Resources, Result};
 use adx_scheduling::{
     Candidate, Filter, Framework, Node, Placement, Score, WeightedScore, MAX_SCORE,
 };
@@ -9,16 +9,16 @@ impl Score for Constant {
     fn name(&self) -> &'static str {
         self.0
     }
-    fn score(&self, _: &InstanceSpec, _: &Candidate<'_>) -> Result<u32> {
+    fn score(&self, _: &CapsuleSpec, _: &Candidate<'_>) -> Result<u32> {
         Ok(self.1)
     }
 }
 fn weighted(name: &'static str, value: u32, weight: u32) -> WeightedScore {
     WeightedScore::new(Arc::new(Constant(name, value)), weight).unwrap()
 }
-fn request() -> InstanceSpec {
-    InstanceSpec {
-        runtime_environment: None,
+fn request() -> CapsuleSpec {
+    CapsuleSpec {
+        environment: None,
         snapshot_id: None,
         lifecycle: Default::default(),
         env: Default::default(),
@@ -26,7 +26,7 @@ fn request() -> InstanceSpec {
         id: "i".into(),
         tenant_id: "t".into(),
         image: "image".into(),
-        runtime: "runsc".into(),
+        runtime_class: "runsc".into(),
         priority: 0,
         resources: Resources {
             cpu_millis: 1,
@@ -79,7 +79,7 @@ fn builtin_profile_exposes_actual_static_registration() {
             "device-fit",
             "node-affinity",
             "placement-groups",
-            "instance-affinity",
+            "capsule-affinity",
             "topology-spread"
         ]
     );
@@ -89,7 +89,7 @@ fn builtin_profile_exposes_actual_static_registration() {
             ("placement-group-preference", 1),
             ("resource-balance", 1),
             ("node-preference", 1),
-            ("instance-preference", 1),
+            ("capsule-preference", 1),
             ("topology-preference", 1)
         ]
     );
@@ -99,7 +99,7 @@ impl Filter for FailingFilter {
     fn name(&self) -> &'static str {
         "failing"
     }
-    fn filter(&self, _: &InstanceSpec, _: &Candidate<'_>) -> Result<bool> {
+    fn filter(&self, _: &CapsuleSpec, _: &Candidate<'_>) -> Result<bool> {
         Err(Error::Unavailable("filter observation missing".into()))
     }
 }

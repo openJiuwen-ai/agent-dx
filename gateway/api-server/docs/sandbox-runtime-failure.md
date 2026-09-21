@@ -1,6 +1,6 @@
-# Instance failure and data-path errors
+# Capsule failure and data-path errors
 
-This page describes the current Rust Gateway and Instance backend. The imported Go sandboxrouter, etcd failure read-through and retained FATAL/OOM JSON response implementation were removed during migration; they are not part of the current server contract.
+This page describes the current Rust Gateway and Capsule backend. The imported Go sandboxrouter, etcd failure read-through and retained FATAL/OOM JSON response implementation were removed during migration; they are not part of the current server contract.
 
 ## Current behavior
 
@@ -21,7 +21,7 @@ The Rust Edge maps resolver/connection failures in `gateway/src/edge/server.rs::
 
 These error bodies are plain text. Authentication and individual endpoint validation have their own rejection paths. After response headers have been sent, a transport failure may close the stream instead of returning a new HTTP response.
 
-Do not expect `SANDBOX_EXITED`, `SANDBOX_RECOVERING`, a 410 OOM envelope or ten-minute deleted-instance diagnostic retention from this backend. Loss of a route does not by itself diagnose an OOM. Use the Instance catalog, component logs and the backend execution identity when investigating failures.
+Do not expect `SANDBOX_EXITED`, `SANDBOX_RECOVERING`, a 410 OOM envelope or ten-minute deleted-instance diagnostic retention from this backend. Loss of a route does not by itself diagnose an OOM. Use the Capsule catalog, component logs and the backend execution identity when investigating failures.
 
 ## Recovery and SDK boundary
 

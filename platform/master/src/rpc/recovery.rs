@@ -11,13 +11,13 @@ pub(super) fn now() -> Result<u64> {
         .map_err(|_| Error::Unavailable("system clock before epoch".into()))
 }
 impl MasterRpc {
-    pub async fn recover_instances(&self) -> Result<usize> {
+    pub async fn recover_capsules(&self) -> Result<usize> {
         let work = {
             let mut state = self.0.state.lock().await;
             state.healthy()?;
             let now = now()?;
             let candidates: Vec<_> = state
-                .instances
+                .capsules
                 .values()
                 .filter(|i| i.recovery_point(now).is_some())
                 .cloned()
@@ -44,10 +44,10 @@ impl MasterRpc {
             }
             let cursor = state.recovery_cursor.clone().unwrap_or_default();
             let work: Vec<_> = state
-                .instances
+                .capsules
                 .values()
                 .filter(|i| i.spec.id > cursor)
-                .chain(state.instances.values().filter(|i| i.spec.id <= cursor))
+                .chain(state.capsules.values().filter(|i| i.spec.id <= cursor))
                 .filter(|i| !i.invalidated && i.recovery.as_ref().is_some_and(|r| r.pending))
                 .filter_map(|i| {
                     let node = state.nodes.get(&i.assignment.node_id)?;
@@ -79,7 +79,7 @@ impl MasterRpc {
                 .map_err(|_| Error::Unavailable("recovery node unavailable".into()))?;
             let session = node.session.ok_or(Error::Conflict)?.id;
             let response = pb::node_service_client::NodeServiceClient::new(channel)
-                .recover_instance(pb::RecoverInstanceRequest {
+                .recover_capsule(pb::RecoverCapsuleRequest {
                     record: Some(record.try_into()?),
                     node_session_id: session.clone(),
                 })

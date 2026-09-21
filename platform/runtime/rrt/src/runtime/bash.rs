@@ -1,5 +1,5 @@
 //! Rust implementation of akernel persistent `bash_*` PTY sessions using portable-pty, a global session table, and sentinels.
-//! Semantics match `instance.py`: persistent bash attaches to a PTY, submit writes `cmd; echo SENTINEL$?`, and poll completes after reading the sentinel.
+//! Semantics match `capsule.py`: persistent bash attaches to a PTY, submit writes `cmd; echo SENTINEL$?`, and poll completes after reading the sentinel.
 
 use super::codec::{kw_str, map_value};
 use rmpv::Value;

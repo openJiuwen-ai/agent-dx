@@ -55,7 +55,7 @@ pub struct Service {
 #[serde(deny_unknown_fields)]
 pub struct Deployment {
     #[serde(default)]
-    pub runtime_environment: Option<adx_core::environment::RuntimeEnvironment>,
+    pub environment: Option<adx_core::environment::EnvironmentSpec>,
     #[serde(default)]
     pub logging: crate::logging::Policy,
     pub schema_version: u32,
@@ -154,7 +154,7 @@ struct ProfileDeployment {
     #[serde(default)]
     logging: Option<Value>,
     #[serde(default)]
-    runtime_environment: Option<Value>,
+    environment: Option<Value>,
     #[serde(default)]
     service_overrides: BTreeMap<Role, ServiceOverride>,
 }
@@ -298,7 +298,7 @@ impl Deployment {
     }
     pub fn validate(&self) -> Result<()> {
         self.logging.validate()?;
-        if let Some(environment) = &self.runtime_environment {
+        if let Some(environment) = &self.environment {
             environment.validate()?;
         }
         if self.schema_version != 1
@@ -520,11 +520,8 @@ impl Deployment {
                 }
                 Role::NodeManager | Role::ApiServer => {
                     let fields = config_object_mut(&mut config)?;
-                    if let Some(environment) = &self.runtime_environment {
-                        fields.insert(
-                            "runtime_environment".to_owned(),
-                            serde_json::to_value(environment)?,
-                        );
+                    if let Some(environment) = &self.environment {
+                        fields.insert("environment".to_owned(), serde_json::to_value(environment)?);
                     }
                     fields.remove("master_address");
                     let discovery = fields
@@ -667,11 +664,11 @@ fn resolve_profile(input: ProfileDeployment) -> Result<Deployment> {
         deployment.logging = serde_json::from_value(logging)
             .map_err(|error| format!("invalid logging override: {error}"))?;
     }
-    if let Some(patch) = input.runtime_environment {
-        let mut environment = serde_json::to_value(&deployment.runtime_environment)?;
+    if let Some(patch) = input.environment {
+        let mut environment = serde_json::to_value(&deployment.environment)?;
         merge_value(&mut environment, patch);
-        deployment.runtime_environment = serde_json::from_value(environment)
-            .map_err(|error| format!("invalid runtime_environment override: {error}"))?;
+        deployment.environment = serde_json::from_value(environment)
+            .map_err(|error| format!("invalid environment override: {error}"))?;
     }
     for (role, patch) in input.service_overrides {
         let service = deployment

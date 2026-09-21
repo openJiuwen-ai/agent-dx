@@ -119,8 +119,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut tick = tokio::time::interval(Duration::from_secs(2));
         loop {
             tick.tick().await;
-            if let Err(error) = recovery_rpc.recover_instances().await {
-                adx_observability::warn!("instance recovery incomplete: {error}");
+            if let Err(error) = recovery_rpc.recover_capsules().await {
+                adx_observability::warn!("capsule recovery incomplete: {error}");
             }
         }
     };
@@ -150,7 +150,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .max_encoding_message_size(64 * 1024 * 1024),
         )
         .add_service(
-            pb::instance_directory_service_server::InstanceDirectoryServiceServer::new(routes)
+            pb::capsule_directory_service_server::CapsuleDirectoryServiceServer::new(routes)
                 .max_encoding_message_size(64 * 1024 * 1024),
         )
         .serve_with_incoming_shutdown(

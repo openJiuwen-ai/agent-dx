@@ -1,13 +1,13 @@
 use crate::control as pb;
 use adx_core::{
-    environment::{Bootstrap, Rootfs, RuntimeEnvironment},
+    environment::{Bootstrap, EnvironmentSpec, Rootfs},
     Error, Result,
 };
-impl From<RuntimeEnvironment> for pb::RuntimeEnvironment {
-    fn from(v: RuntimeEnvironment) -> Self {
+impl From<EnvironmentSpec> for pb::EnvironmentSpec {
+    fn from(v: EnvironmentSpec) -> Self {
         Self {
             rootfs: Some(pb::RuntimeRootfs {
-                runtime: v.rootfs.runtime,
+                runtime_class: v.rootfs.runtime_class,
                 r#type: v.rootfs.r#type,
                 path: v.rootfs.path,
                 readonly: v.rootfs.readonly,
@@ -25,9 +25,9 @@ impl From<RuntimeEnvironment> for pb::RuntimeEnvironment {
         }
     }
 }
-impl TryFrom<pb::RuntimeEnvironment> for RuntimeEnvironment {
+impl TryFrom<pb::EnvironmentSpec> for EnvironmentSpec {
     type Error = Error;
-    fn try_from(v: pb::RuntimeEnvironment) -> Result<Self> {
+    fn try_from(v: pb::EnvironmentSpec) -> Result<Self> {
         let r = v
             .rootfs
             .ok_or_else(|| Error::Invalid("runtime rootfs required".into()))?;
@@ -36,7 +36,7 @@ impl TryFrom<pb::RuntimeEnvironment> for RuntimeEnvironment {
             .ok_or_else(|| Error::Invalid("runtime bootstrap required".into()))?;
         let value = Self {
             rootfs: Rootfs {
-                runtime: r.runtime,
+                runtime_class: r.runtime_class,
                 r#type: r.r#type,
                 path: r.path,
                 image: r.image,

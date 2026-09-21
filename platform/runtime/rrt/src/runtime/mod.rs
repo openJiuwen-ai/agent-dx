@@ -1,4 +1,4 @@
-//! Instance runtime boot, HTTP operations and checkpoint listener recovery.
+//! Capsule runtime boot, HTTP operations and checkpoint listener recovery.
 use adx_core::runtime::RuntimeIdentity;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -80,7 +80,7 @@ fn identity_from(
     environment: &std::collections::HashMap<String, String>,
 ) -> std::io::Result<Option<RuntimeIdentity>> {
     let keys = [
-        "ADX_INSTANCE_ID",
+        "ADX_CAPSULE_ID",
         "ADX_RUNTIME_ID",
         "ADX_OWNERSHIP_GENERATION",
     ];
@@ -94,7 +94,7 @@ fn identity_from(
             .ok_or_else(|| std::io::Error::other(format!("missing {key}")))
     };
     let identity = RuntimeIdentity {
-        instance_id: required(keys[0])?,
+        capsule_id: required(keys[0])?,
         runtime_id: required(keys[1])?,
         ownership_generation: required(keys[2])?.parse().map_err(std::io::Error::other)?,
     };

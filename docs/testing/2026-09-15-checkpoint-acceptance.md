@@ -9,10 +9,10 @@
 1. 公共 SDK 创建实例，经 Frontend 调度，命令通过 Edge → Node Proxy → RRT 执行。
 2. 暂停成功时 checkpoint 已生成，元数据已写入 Redis，源后端实例已删除。
 3. 仅重启 Node Manager，从 Master 对账恢复 Paused 状态。
-4. 同 Instance ID 恢复成功，内存计数器从 92 增长到 223，PID 保持 16，二进制文件内容一致。
+4. 同 Capsule ID 恢复成功，内存计数器从 92 增长到 223，PID 保持 16，二进制文件内容一致。
 5. 显式删除后，Redis 状态为 Deleted、`resources_held=false`，sandboxd 清单及 checkpoint 目录为空，平台正常停止。
 
-代码边界和失败契约见 [Instance 暂停与恢复](instance-checkpoint.md)。
+代码边界和失败契约见 [Capsule 暂停与恢复](capsule-checkpoint.md)。
 
 ## 制品身份
 

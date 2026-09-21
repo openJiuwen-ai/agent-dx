@@ -1,4 +1,4 @@
-use adx_core::{Error, InstanceSpec, Resources, Result};
+use adx_core::{CapsuleSpec, Error, Resources, Result};
 use adx_master::{Master, Node};
 use adx_scheduling::{Candidate, Filter, Framework, Score, WeightedScore};
 use std::sync::{
@@ -6,9 +6,9 @@ use std::sync::{
     Arc,
 };
 
-fn spec(id: &str) -> InstanceSpec {
-    InstanceSpec {
-        runtime_environment: None,
+fn spec(id: &str) -> CapsuleSpec {
+    CapsuleSpec {
+        environment: None,
         snapshot_id: None,
         lifecycle: Default::default(),
         env: Default::default(),
@@ -16,7 +16,7 @@ fn spec(id: &str) -> InstanceSpec {
         id: id.into(),
         tenant_id: "t".into(),
         image: "image".into(),
-        runtime: "runsc".into(),
+        runtime_class: "runsc".into(),
         resources: Resources {
             cpu_millis: 1,
             memory_bytes: 1,
@@ -44,7 +44,7 @@ impl Filter for ExcludeA {
     fn name(&self) -> &'static str {
         "exclude-a"
     }
-    fn filter(&self, _: &InstanceSpec, node: &Candidate<'_>) -> Result<bool> {
+    fn filter(&self, _: &CapsuleSpec, node: &Candidate<'_>) -> Result<bool> {
         Ok(node.node.id != "a")
     }
 }
@@ -57,7 +57,7 @@ impl Score for Prefer {
     fn name(&self) -> &'static str {
         self.name
     }
-    fn score(&self, _: &InstanceSpec, candidate: &Candidate<'_>) -> Result<u32> {
+    fn score(&self, _: &CapsuleSpec, candidate: &Candidate<'_>) -> Result<u32> {
         assert!(
             candidate.node.available,
             "unavailable nodes must not be scored"
@@ -95,7 +95,7 @@ fn shard_uses_filters_before_weighted_scores_and_keeps_admission_guards() {
         "custom profile must preserve capacity checks"
     );
     master.release(&first).unwrap();
-    assert_eq!(master.schedule(0).unwrap().unwrap().instance_id, "waiting");
+    assert_eq!(master.schedule(0).unwrap().unwrap().capsule_id, "waiting");
 }
 #[test]
 fn weights_change_selection_and_ties_are_deterministic() {
@@ -128,7 +128,7 @@ impl Score for FallibleScore {
     fn name(&self) -> &'static str {
         "fallible"
     }
-    fn score(&self, _: &InstanceSpec, _: &Candidate<'_>) -> Result<u32> {
+    fn score(&self, _: &CapsuleSpec, _: &Candidate<'_>) -> Result<u32> {
         if self.0.load(Ordering::SeqCst) {
             Err(Error::Unavailable("scoring dependency".into()))
         } else {
@@ -151,7 +151,7 @@ fn plugin_error_does_not_drop_queued_requests_or_reserve_capacity() {
     assert!(matches!(master.schedule(0), Err(Error::Unavailable(_))));
     failing.store(false, Ordering::SeqCst);
     let first = master.schedule(0).unwrap().unwrap();
-    assert_eq!(first.instance_id, "first");
+    assert_eq!(first.capsule_id, "first");
     master.release(&first).unwrap();
-    assert_eq!(master.schedule(0).unwrap().unwrap().instance_id, "second");
+    assert_eq!(master.schedule(0).unwrap().unwrap().capsule_id, "second");
 }

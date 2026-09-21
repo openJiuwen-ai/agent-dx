@@ -14,7 +14,7 @@ def run(connection, image, output):
         handles.append(sandbox);report['instances'].append(sandbox.id)
         return sandbox
     def assigned(sandbox):
-        record=json.loads(catalog()['instance:'+sandbox.id])
+        record=json.loads(catalog()['capsule:'+sandbox.id])
         assert record['result']['state']=='Running'
         return record['assignment']['node_id']
     def verify(name, expected, **options):
@@ -31,7 +31,7 @@ def run(connection, image, output):
         left=create(node_id='node1',labels={'peer':'left'})
         right=create(node_id='node2',labels={'peer':'right'})
         assert (assigned(left),assigned(right))==('node1','node2')
-        verify('instance affinity OR','node1',schedule_affinities=[condition(1,2,'peer','missing'),condition(1,2,'peer','left')])
+        verify('capsule affinity OR','node1',schedule_affinities=[condition(1,2,'peer','missing'),condition(1,2,'peer','left')])
         verify('instance anti-affinity','node2',schedule_affinities=[condition(1,3,'peer','left')])
         # Equal anchor reservations keep the resource score equal across the two nodes.
         verify('weighted node preference','node2',schedule_affinities=[condition(0,0,'NODE_ID','node1',weight=1),condition(0,0,'NODE_ID','node2',weight=9)])
@@ -53,7 +53,7 @@ def run(connection, image, output):
         try:
             records=catalog()
             for sid in report['instances']:
-                result=json.loads(records['instance:'+sid])['result']
+                result=json.loads(records['capsule:'+sid])['result']
                 assert result['state']=='Deleted' and not result['resources_held'],sid
             report['terminal_resources_released']=True
         except Exception as error:report['cleanup_errors'].append(str(error))

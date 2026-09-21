@@ -1,6 +1,6 @@
 # HTTP 与 SDK 放置约束
 
-SDK 的 `node_id` 现在通过既有 `scheduleAffinities` JSON 进入新的 `InstanceSpec.scheduling.required_node`。Node Manager 可在配置中设置 `labels`；Master 在注册节点时根据经过认证的节点 ID 写入 `NODE_ID`，拒绝用其他值伪造该标签。
+SDK 的 `node_id` 现在通过既有 `scheduleAffinities` JSON 进入新的 `CapsuleSpec.scheduling.required_node`。Node Manager 可在配置中设置 `labels`；Master 在注册节点时根据经过认证的节点 ID 写入 `NODE_ID`，拒绝用其他值伪造该标签。
 
 ```json
 {

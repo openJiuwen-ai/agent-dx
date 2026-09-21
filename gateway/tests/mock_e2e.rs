@@ -3,7 +3,7 @@
 use base64::Engine;
 use data_plane_gateway::common::protocol::{ConnectTarget, GatewayPolicy};
 use data_plane_gateway::common::route::{
-    DataPlaneAuthMode, InstanceStatus, PortForwardRoute, RouteInfo,
+    CapsuleStatus, DataPlaneAuthMode, PortForwardRoute, RouteInfo,
 };
 use data_plane_gateway::edge::{
     AccessKind, DataPlaneL4Connector, EdgeAuthenticator, EdgeFrontend, EdgeRouteResolver,
@@ -46,7 +46,7 @@ async fn mock_full_data_plane_protocol_matrix() {
     let store = Arc::new(RouteStore::new());
     let route = RouteInfo {
         instance_id: "instance-a".into(),
-        instance_status: InstanceStatus {
+        capsule_status: CapsuleStatus {
             code: 3,
             ..Default::default()
         },
@@ -133,8 +133,7 @@ async fn mock_full_data_plane_protocol_matrix() {
         assert_connect(edge_http_address, echo_target.port(), access_kind).await;
     }
     assert_route_change_closes_stream(edge_http_address, echo_target.port(), &store, &route).await;
-    assert_instance_status_is_preserved(edge_http_address, http_target.port(), &store, &route)
-        .await;
+    assert_capsule_status_is_preserved(edge_http_address, http_target.port(), &store, &route).await;
     assert_missing_route_is_404(edge_http_address, http_target.port(), &store, &route).await;
     assert_unlistened_port_is_502(edge_http_address).await;
     assert_node_route_retirement(&node_connector, &node, node_address, echo_target).await;
@@ -413,14 +412,14 @@ async fn assert_route_change_closes_stream(
     assert_connect(edge, port, AccessKind::Ssh).await;
 }
 
-async fn assert_instance_status_is_preserved(
+async fn assert_capsule_status_is_preserved(
     edge: std::net::SocketAddr,
     port: u16,
     store: &RouteStore,
     route: &RouteInfo,
 ) {
     let mut failed = route.clone();
-    failed.instance_status = InstanceStatus {
+    failed.capsule_status = CapsuleStatus {
         code: 5,
         exit_code: 137,
         msg: "sandbox crashed".into(),
@@ -695,7 +694,7 @@ async fn assert_half_closed_route_cancel(websocket: bool) {
             .await;
         store.put(RouteInfo {
             instance_id: id.into(),
-            instance_status: InstanceStatus {
+            capsule_status: CapsuleStatus {
                 code: 3,
                 ..Default::default()
             },

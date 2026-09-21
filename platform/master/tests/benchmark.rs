@@ -1,5 +1,5 @@
 //! Run with --release --ignored --nocapture; timing is evidence, not a flaky CI threshold.
-use adx_core::{InstanceSpec, Resources};
+use adx_core::{CapsuleSpec, Resources};
 use adx_master::{Master, Node, Placement, SchedulerConfig, SchedulingStats};
 use std::{
     collections::VecDeque,
@@ -47,8 +47,8 @@ fn run(cache: usize, heterogeneous: bool) -> (Duration, SchedulingStats, Vec<Str
             })
             .unwrap();
         }
-        let r = InstanceSpec {
-            runtime_environment: None,
+        let r = CapsuleSpec {
+            environment: None,
             snapshot_id: None,
             lifecycle: Default::default(),
             env: Default::default(),
@@ -59,7 +59,7 @@ fn run(cache: usize, heterogeneous: bool) -> (Duration, SchedulingStats, Vec<Str
                 "t".into()
             },
             image: "i".into(),
-            runtime: "r".into(),
+            runtime_class: "r".into(),
             priority: 0,
             resources: Resources {
                 cpu_millis: if heterogeneous { 1 + i % 3 } else { 1 },

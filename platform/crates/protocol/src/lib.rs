@@ -20,24 +20,21 @@ impl From<adx_core::Resources> for control::Resources {
     }
 }
 
-impl TryFrom<control::InstanceSpec> for adx_core::InstanceSpec {
+impl TryFrom<control::CapsuleSpec> for adx_core::CapsuleSpec {
     type Error = Error;
-    fn try_from(value: control::InstanceSpec) -> Result<Self> {
+    fn try_from(value: control::CapsuleSpec) -> Result<Self> {
         let resources = value
             .resources
             .ok_or_else(|| Error::Invalid("resources are required".into()))?;
         let spec = Self {
-            runtime_environment: value
-                .runtime_environment
-                .map(TryInto::try_into)
-                .transpose()?,
+            environment: value.environment.map(TryInto::try_into).transpose()?,
             snapshot_id: value.snapshot_id,
             lifecycle: value.lifecycle.map(Into::into).unwrap_or_default(),
             env: value.env.into_iter().collect(),
             id: value.id,
             tenant_id: value.tenant_id,
             image: value.image,
-            runtime: value.runtime,
+            runtime_class: value.runtime_class,
             resources: adx_core::Resources {
                 cpu_millis: resources.cpu_millis,
                 memory_bytes: resources.memory_bytes,
@@ -60,17 +57,17 @@ impl TryFrom<control::InstanceSpec> for adx_core::InstanceSpec {
     }
 }
 
-impl From<adx_core::InstanceSpec> for control::InstanceSpec {
-    fn from(value: adx_core::InstanceSpec) -> Self {
+impl From<adx_core::CapsuleSpec> for control::CapsuleSpec {
+    fn from(value: adx_core::CapsuleSpec) -> Self {
         Self {
-            runtime_environment: value.runtime_environment.map(Into::into),
+            environment: value.environment.map(Into::into),
             snapshot_id: value.snapshot_id,
             lifecycle: Some(value.lifecycle.into()),
             env: value.env.into_iter().collect(),
             id: value.id,
             tenant_id: value.tenant_id,
             image: value.image,
-            runtime: value.runtime,
+            runtime_class: value.runtime_class,
             resources: Some(value.resources.into()),
             priority: value.priority,
             scheduling: Some(value.scheduling.into()),
@@ -82,12 +79,12 @@ impl From<adx_core::InstanceSpec> for control::InstanceSpec {
 impl TryFrom<control::Assignment> for adx_core::Assignment {
     type Error = Error;
     fn try_from(value: control::Assignment) -> Result<Self> {
-        if value.instance_id.trim().is_empty()
+        if value.capsule_id.trim().is_empty()
             || value.node_id.trim().is_empty()
             || value.generation == 0
         {
             return Err(Error::Invalid(
-                "assignment requires instance, node and generation".into(),
+                "assignment requires capsule, node and generation".into(),
             ));
         }
         let devices: Vec<adx_core::scheduling::DeviceAllocation> = value
@@ -98,7 +95,7 @@ impl TryFrom<control::Assignment> for adx_core::Assignment {
         adx_core::scheduling::validate_allocations(&devices)?;
         Ok(Self {
             devices,
-            instance_id: value.instance_id,
+            capsule_id: value.capsule_id,
             node_id: value.node_id,
             shard_id: value.shard_id as usize,
             generation: value.generation,
@@ -112,7 +109,7 @@ impl TryFrom<adx_core::Assignment> for control::Assignment {
         adx_core::scheduling::validate_allocations(&value.devices)?;
         Ok(Self {
             devices: value.devices.into_iter().map(Into::into).collect(),
-            instance_id: value.instance_id,
+            capsule_id: value.capsule_id,
             node_id: value.node_id,
             shard_id: u32::try_from(value.shard_id)
                 .map_err(|_| Error::Invalid("shard id overflow".into()))?,
@@ -128,14 +125,14 @@ mod tests {
 
     #[test]
     fn missing_resources_and_zero_generation_are_rejected() {
-        assert!(adx_core::InstanceSpec::try_from(control::InstanceSpec::default()).is_err());
+        assert!(adx_core::CapsuleSpec::try_from(control::CapsuleSpec::default()).is_err());
         assert!(adx_core::Assignment::try_from(control::Assignment::default()).is_err());
     }
 
     #[test]
-    fn instance_spec_round_trip_preserves_units_and_priority() {
-        let value = adx_core::InstanceSpec {
-            runtime_environment: None,
+    fn capsule_spec_round_trip_preserves_units_and_priority() {
+        let value = adx_core::CapsuleSpec {
+            environment: None,
             snapshot_id: None,
             lifecycle: Default::default(),
             env: Default::default(),
@@ -143,7 +140,7 @@ mod tests {
             id: "a".into(),
             tenant_id: "t".into(),
             image: "image".into(),
-            runtime: "runtime".into(),
+            runtime_class: "runtime".into(),
             resources: adx_core::Resources {
                 cpu_millis: 1500,
                 memory_bytes: 2 * 1024 * 1024 * 1024,
@@ -152,9 +149,9 @@ mod tests {
             priority: -10,
             sandbox: Default::default(),
         };
-        let bytes = control::InstanceSpec::from(value.clone()).encode_to_vec();
-        let decoded = control::InstanceSpec::decode(bytes.as_slice()).unwrap();
-        assert_eq!(adx_core::InstanceSpec::try_from(decoded).unwrap(), value);
+        let bytes = control::CapsuleSpec::from(value.clone()).encode_to_vec();
+        let decoded = control::CapsuleSpec::decode(bytes.as_slice()).unwrap();
+        assert_eq!(adx_core::CapsuleSpec::try_from(decoded).unwrap(), value);
     }
 }
 
@@ -165,10 +162,10 @@ pub mod node_proxy {
 
 pub mod auth;
 
-impl TryFrom<control::InstanceRecord> for adx_core::InstanceRecord {
+impl TryFrom<control::CapsuleRecord> for adx_core::CapsuleRecord {
     type Error = Error;
-    fn try_from(v: control::InstanceRecord) -> Result<Self> {
-        let spec: adx_core::InstanceSpec = v
+    fn try_from(v: control::CapsuleRecord) -> Result<Self> {
+        let spec: adx_core::CapsuleSpec = v
             .spec
             .ok_or_else(|| Error::Invalid("spec required".into()))?
             .try_into()?;
@@ -176,30 +173,34 @@ impl TryFrom<control::InstanceRecord> for adx_core::InstanceRecord {
             .assignment
             .ok_or_else(|| Error::Invalid("assignment required".into()))?
             .try_into()?;
-        if spec.id != assignment.instance_id {
+        if spec.id != assignment.capsule_id {
             return Err(Error::Conflict);
         }
         adx_core::scheduling::validate_device_assignment(
             &spec.scheduling.devices,
             &assignment.devices,
         )?;
-        let state = match control::InstanceState::try_from(v.state) {
-            Ok(control::InstanceState::Pending) => adx_core::InstanceState::Pending,
-            Ok(control::InstanceState::Starting) => adx_core::InstanceState::Starting,
-            Ok(control::InstanceState::Running) => adx_core::InstanceState::Running,
-            Ok(control::InstanceState::Deleting) => adx_core::InstanceState::Deleting,
-            Ok(control::InstanceState::Deleted) => adx_core::InstanceState::Deleted,
-            Ok(control::InstanceState::Pausing) => adx_core::InstanceState::Pausing,
-            Ok(control::InstanceState::Paused) => adx_core::InstanceState::Paused,
-            Ok(control::InstanceState::Resuming) => adx_core::InstanceState::Resuming,
-            Ok(control::InstanceState::Failed) => adx_core::InstanceState::Failed,
-            _ => return Err(Error::Invalid("unknown instance state".into())),
+        let state = match control::CapsuleState::try_from(v.state) {
+            Ok(control::CapsuleState::Pending) => adx_core::CapsuleState::Pending,
+            Ok(control::CapsuleState::Starting) => adx_core::CapsuleState::Starting,
+            Ok(control::CapsuleState::Running) => adx_core::CapsuleState::Running,
+            Ok(control::CapsuleState::Deleting) => adx_core::CapsuleState::Deleting,
+            Ok(control::CapsuleState::Deleted) => adx_core::CapsuleState::Deleted,
+            Ok(control::CapsuleState::Pausing) => adx_core::CapsuleState::Pausing,
+            Ok(control::CapsuleState::Paused) => adx_core::CapsuleState::Paused,
+            Ok(control::CapsuleState::Resuming) => adx_core::CapsuleState::Resuming,
+            Ok(control::CapsuleState::Failed) => adx_core::CapsuleState::Failed,
+            _ => return Err(Error::Invalid("unknown capsule state".into())),
         };
-        let runtime_ip = if v.runtime_ip.is_empty() {
+        let runtime = v
+            .runtime
+            .ok_or_else(|| Error::Invalid("runtime required".into()))?;
+        let runtime_ip = if runtime.ip.is_empty() {
             None
         } else {
             Some(
-                v.runtime_ip
+                runtime
+                    .ip
                     .parse()
                     .map_err(|_| Error::Invalid("invalid runtime IP".into()))?,
             )
@@ -211,27 +212,29 @@ impl TryFrom<control::InstanceRecord> for adx_core::InstanceRecord {
             revision: v.revision,
             restart_attempts: v.restart_attempts,
             restart_pending: v.restart_pending,
-            runtime_id: v.runtime_id,
+            runtime: adx_core::Runtime {
+                id: runtime.id,
+                ip: runtime_ip,
+            },
             resources_held: v.resources_held,
-            runtime_ip,
             checkpoint: v.checkpoint.map(TryInto::try_into).transpose()?,
             last_operation: v.last_operation.map(TryInto::try_into).transpose()?,
         })
     }
 }
-impl TryFrom<adx_core::InstanceRecord> for control::InstanceRecord {
+impl TryFrom<adx_core::CapsuleRecord> for control::CapsuleRecord {
     type Error = Error;
-    fn try_from(v: adx_core::InstanceRecord) -> Result<Self> {
+    fn try_from(v: adx_core::CapsuleRecord) -> Result<Self> {
         let state = match v.state {
-            adx_core::InstanceState::Pending => control::InstanceState::Pending,
-            adx_core::InstanceState::Starting => control::InstanceState::Starting,
-            adx_core::InstanceState::Running => control::InstanceState::Running,
-            adx_core::InstanceState::Deleting => control::InstanceState::Deleting,
-            adx_core::InstanceState::Deleted => control::InstanceState::Deleted,
-            adx_core::InstanceState::Pausing => control::InstanceState::Pausing,
-            adx_core::InstanceState::Paused => control::InstanceState::Paused,
-            adx_core::InstanceState::Resuming => control::InstanceState::Resuming,
-            adx_core::InstanceState::Failed => control::InstanceState::Failed,
+            adx_core::CapsuleState::Pending => control::CapsuleState::Pending,
+            adx_core::CapsuleState::Starting => control::CapsuleState::Starting,
+            adx_core::CapsuleState::Running => control::CapsuleState::Running,
+            adx_core::CapsuleState::Deleting => control::CapsuleState::Deleting,
+            adx_core::CapsuleState::Deleted => control::CapsuleState::Deleted,
+            adx_core::CapsuleState::Pausing => control::CapsuleState::Pausing,
+            adx_core::CapsuleState::Paused => control::CapsuleState::Paused,
+            adx_core::CapsuleState::Resuming => control::CapsuleState::Resuming,
+            adx_core::CapsuleState::Failed => control::CapsuleState::Failed,
         };
         Ok(Self {
             spec: Some(v.spec.into()),
@@ -240,11 +243,13 @@ impl TryFrom<adx_core::InstanceRecord> for control::InstanceRecord {
             revision: v.revision,
             restart_attempts: v.restart_attempts,
             restart_pending: v.restart_pending,
-            runtime_id: v.runtime_id,
+            runtime: Some(control::Runtime {
+                id: v.runtime.id,
+                ip: v.runtime.ip.map(|ip| ip.to_string()).unwrap_or_default(),
+            }),
             resources_held: v.resources_held,
             checkpoint: v.checkpoint.map(Into::into),
             last_operation: v.last_operation.map(Into::into),
-            runtime_ip: v.runtime_ip.map(|ip| ip.to_string()).unwrap_or_default(),
         })
     }
 }
@@ -252,7 +257,7 @@ pub fn status(error: adx_core::Error) -> tonic::Status {
     match error {
         Error::Invalid(message) => tonic::Status::invalid_argument(message),
         Error::Conflict => tonic::Status::failed_precondition("identity or version conflict"),
-        Error::NotFound => tonic::Status::not_found("instance or node not found"),
+        Error::NotFound => tonic::Status::not_found("capsule or node not found"),
         Error::NoCapacity => tonic::Status::resource_exhausted("capacity unavailable"),
         Error::Unavailable(message) => tonic::Status::unavailable(message),
     }
@@ -374,7 +379,7 @@ impl From<adx_core::lifecycle::LifecyclePolicy> for control::LifecyclePolicy {
 impl From<adx_core::runtime::RuntimeIdentity> for control::RuntimeIdentity {
     fn from(v: adx_core::runtime::RuntimeIdentity) -> Self {
         Self {
-            instance_id: v.instance_id,
+            capsule_id: v.capsule_id,
             runtime_id: v.runtime_id,
             ownership_generation: v.ownership_generation,
         }
@@ -384,7 +389,7 @@ impl TryFrom<control::RuntimeIdentity> for adx_core::runtime::RuntimeIdentity {
     type Error = Error;
     fn try_from(v: control::RuntimeIdentity) -> Result<Self> {
         let identity = Self {
-            instance_id: v.instance_id,
+            capsule_id: v.capsule_id,
             runtime_id: v.runtime_id,
             ownership_generation: v.ownership_generation,
         };

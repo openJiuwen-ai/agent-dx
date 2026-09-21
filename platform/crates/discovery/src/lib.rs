@@ -1,4 +1,4 @@
-//! Redis holds a renewable Master endpoint, never instance ownership decisions.
+//! Redis holds a renewable Master endpoint, never capsule ownership decisions.
 use adx_core::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::{sync::Arc, time::Duration};

@@ -1,19 +1,19 @@
 #[path = "storage/claims.rs"]
 mod claims;
 mod common;
-use adx_core::{Assignment, Error, InstanceRecord, InstanceSpec, InstanceState, Resources};
+use adx_core::{Assignment, CapsuleRecord, CapsuleSpec, CapsuleState, Error, Resources};
 use adx_master::{storage::StoredNode, Master, Node, Placement};
 
-fn spec(id: &str) -> InstanceSpec {
-    InstanceSpec {
-        runtime_environment: None,
+fn spec(id: &str) -> CapsuleSpec {
+    CapsuleSpec {
+        environment: None,
         snapshot_id: None,
         lifecycle: Default::default(),
         env: Default::default(),
         id: id.into(),
         tenant_id: "tenant".into(),
         image: "image".into(),
-        runtime: "runc".into(),
+        runtime_class: "runc".into(),
         resources: Resources {
             cpu_millis: 100,
             memory_bytes: 128,
@@ -33,17 +33,19 @@ fn node(id: &str) -> Node {
         devices: vec![],
     }
 }
-fn running(spec: InstanceSpec, assignment: Assignment) -> InstanceRecord {
-    InstanceRecord {
+fn running(spec: CapsuleSpec, assignment: Assignment) -> CapsuleRecord {
+    CapsuleRecord {
         restart_attempts: 0,
         restart_pending: false,
-        runtime_id: format!("{}-{}", spec.id, assignment.generation),
+        runtime: adx_core::Runtime {
+            id: format!("{}-{}", spec.id, assignment.generation),
+            ip: Some("10.0.0.2".parse().unwrap()),
+        },
         spec,
         assignment,
-        state: InstanceState::Running,
+        state: CapsuleState::Running,
         revision: 2,
         resources_held: true,
-        runtime_ip: Some("10.0.0.2".parse().unwrap()),
         checkpoint: None,
         last_operation: None,
     }
@@ -61,7 +63,7 @@ async fn runtime_network_policy_is_the_only_mutable_spec_field() {
     let session = rig.store().await.begin(1).await.unwrap();
     register(&session, "node").await;
     let assignment = Assignment {
-        instance_id: "networked".into(),
+        capsule_id: "networked".into(),
         node_id: "node".into(),
         shard_id: 0,
         generation: 1,
@@ -106,12 +108,12 @@ async fn restart_recovers_assignment_and_fences_old_writer() {
     assert_eq!(register(&first, "a").await.shard_id, 1);
     let mut scheduler = Master::restore(&first.snapshot().await.unwrap(), Placement::Pack).unwrap();
     // Restored nodes must re-register before they can receive new work.
-    scheduler.submit(spec("instance")).unwrap();
+    scheduler.submit(spec("capsule")).unwrap();
     assert!(scheduler.schedule(0).unwrap().is_none());
     scheduler.register(node("z")).unwrap();
     let a = scheduler.schedule(0).unwrap().unwrap();
-    first.reserve(spec("instance"), a.clone()).await.unwrap();
-    let r = running(spec("instance"), a.clone());
+    first.reserve(spec("capsule"), a.clone()).await.unwrap();
+    let r = running(spec("capsule"), a.clone());
     first.commit(r.clone()).await.unwrap();
     let version = first.snapshot().await.unwrap().revision;
     first.commit(r.clone()).await.unwrap();
@@ -126,7 +128,7 @@ async fn restart_recovers_assignment_and_fences_old_writer() {
     restored.submit(spec("waiting")).unwrap();
     assert!(restored.schedule(0).unwrap().is_none());
     let mut deleted = r.clone();
-    deleted.state = InstanceState::Deleted;
+    deleted.state = CapsuleState::Deleted;
     deleted.revision = 4;
     deleted.resources_held = false;
     second.commit(deleted.clone()).await.unwrap();
@@ -142,7 +144,7 @@ async fn restart_recovers_assignment_and_fences_old_writer() {
     let mut restored = Master::restore(&snap, Placement::Pack).unwrap();
     assert_eq!(restored.pending(0).unwrap(), 0);
     restored.register(node("z")).unwrap();
-    assert_eq!(restored.submit(spec("instance")), Err(Error::Conflict));
+    assert_eq!(restored.submit(spec("capsule")), Err(Error::Conflict));
     restored.submit(spec("new")).unwrap();
     let newer = restored.schedule(0).unwrap().unwrap();
     assert!(newer.generation > a.generation);
@@ -158,7 +160,7 @@ async fn conflicting_commits_never_publish_a_partial_route() {
     let s = db.begin(1).await.unwrap();
     register(&s, "n").await;
     let a = Assignment {
-        instance_id: "i".into(),
+        capsule_id: "i".into(),
         node_id: "n".into(),
         shard_id: 0,
         generation: (1_u64 << 53) + 7,
@@ -174,7 +176,7 @@ async fn conflicting_commits_never_publish_a_partial_route() {
     forged.spec.tenant_id = "another".into();
     assert_eq!(s.commit(forged).await, Err(Error::Conflict));
     let mut changed = r.clone();
-    changed.runtime_ip = Some("10.0.0.3".parse().unwrap());
+    changed.runtime.ip = Some("10.0.0.3".parse().unwrap());
     assert_eq!(s.commit(changed).await, Err(Error::Conflict));
     let mut stale = r.clone();
     stale.assignment.generation -= 1;
@@ -187,7 +189,7 @@ async fn conflicting_commits_never_publish_a_partial_route() {
     assert_eq!(s.snapshot().await.unwrap(), before);
     // A cleanup failure removes routing but continues to occupy the node.
     let mut failed = r;
-    failed.state = InstanceState::Failed;
+    failed.state = CapsuleState::Failed;
     failed.revision += 1;
     s.commit(failed).await.unwrap();
     let snap = s.snapshot().await.unwrap();
@@ -206,7 +208,7 @@ async fn aof_crash_restart_preserves_state_and_reconnect_does_not_change_epoch()
     let s = db.begin(1).await.unwrap();
     register(&s, "node").await;
     let assignment = Assignment {
-        instance_id: "i".into(),
+        capsule_id: "i".into(),
         node_id: "node".into(),
         shard_id: 0,
         generation: 1,
@@ -227,7 +229,7 @@ async fn aof_crash_restart_preserves_state_and_reconnect_does_not_change_epoch()
     s.commit(r).await.unwrap();
     let restarted = rig.store().await.begin(1).await.unwrap();
     let after = restarted.snapshot().await.unwrap();
-    assert_eq!(after.instances, before.instances);
+    assert_eq!(after.capsules, before.capsules);
     assert_eq!(after.generation, before.generation);
     assert!(after.revision > before.revision);
     assert_eq!(s.snapshot().await, Err(Error::Conflict));
@@ -284,7 +286,7 @@ async fn rejected_assignment_can_be_replaced_without_accepting_its_late_result()
     register(&s, "a").await;
     register(&s, "b").await;
     let old = Assignment {
-        instance_id: "i".into(),
+        capsule_id: "i".into(),
         node_id: "a".into(),
         shard_id: 0,
         generation: 1,
@@ -416,23 +418,23 @@ async fn pause_resume_persists_recovery_point_fences_old_results_and_restores_ca
     let mut scheduler =
         Master::restore(&session.snapshot().await.unwrap(), Placement::Pack).unwrap();
     scheduler.register(node("node")).unwrap();
-    scheduler.submit(spec("instance")).unwrap();
+    scheduler.submit(spec("capsule")).unwrap();
     let assignment = scheduler.schedule(0).unwrap().unwrap();
     session
-        .reserve(spec("instance"), assignment.clone())
+        .reserve(spec("capsule"), assignment.clone())
         .await
         .unwrap();
-    let initial = running(spec("instance"), assignment.clone());
+    let initial = running(spec("capsule"), assignment.clone());
     session.commit(initial.clone()).await.unwrap();
     let mut paused = initial.clone();
-    paused.state = InstanceState::Paused;
+    paused.state = CapsuleState::Paused;
     paused.revision = 4;
     paused.resources_held = false;
-    paused.runtime_ip = None;
+    paused.runtime.ip = None;
     paused.checkpoint = Some(RestorePoint {
         origin: None,
         id: "pause".into(),
-        source_runtime_id: initial.runtime_id.clone(),
+        source_runtime_id: initial.runtime.id.clone(),
         expires_at_unix_seconds: u64::MAX,
         artifact: CheckpointArtifact {
             storage: "local".into(),
@@ -455,11 +457,11 @@ async fn pause_resume_persists_recovery_point_fences_old_results_and_restores_ca
         .unwrap()
         .is_empty());
     let mut resumed = paused.clone();
-    resumed.state = InstanceState::Running;
+    resumed.state = CapsuleState::Running;
     resumed.revision = 6;
     resumed.resources_held = true;
-    resumed.runtime_id = format!("{}-r5", initial.runtime_id);
-    resumed.runtime_ip = Some("10.0.0.3".parse().unwrap());
+    resumed.runtime.id = format!("{}-r5", initial.runtime.id);
+    resumed.runtime.ip = Some("10.0.0.3".parse().unwrap());
     resumed.last_operation = Some(CompletedOperation {
         id: "resume".into(),
         kind: LifecycleKind::Resume,
@@ -474,7 +476,7 @@ async fn pause_resume_persists_recovery_point_fences_old_results_and_restores_ca
     assert_eq!(session.commit(paused).await, Err(Error::Conflict));
     let restarted = db.begin(1).await.unwrap();
     assert_eq!(
-        restarted.snapshot().await.unwrap().instances["instance"]
+        restarted.snapshot().await.unwrap().capsules["capsule"]
             .result
             .as_ref(),
         Some(&resumed)
@@ -494,7 +496,7 @@ async fn sqlite_replays_pause_and_resume_after_redis_and_node_sink_restart() {
     struct Sink(Arc<adx_master::storage::Session>);
     #[async_trait::async_trait]
     impl StateSink for Sink {
-        async fn commit(&self, r: &InstanceRecord) -> adx_core::Result<Durability> {
+        async fn commit(&self, r: &CapsuleRecord) -> adx_core::Result<Durability> {
             self.0.commit(r.clone()).await?;
             Ok(Durability::Published)
         }
@@ -504,7 +506,7 @@ async fn sqlite_replays_pause_and_resume_after_redis_and_node_sink_restart() {
     let session = Arc::new(db.begin(1).await.unwrap());
     register(&session, "n").await;
     let assignment = Assignment {
-        instance_id: "journal".into(),
+        capsule_id: "journal".into(),
         node_id: "n".into(),
         shard_id: 0,
         generation: 1,
@@ -517,14 +519,14 @@ async fn sqlite_replays_pause_and_resume_after_redis_and_node_sink_restart() {
     let initial = running(spec("journal"), assignment);
     session.commit(initial.clone()).await.unwrap();
     let mut paused = initial.clone();
-    paused.state = InstanceState::Paused;
+    paused.state = CapsuleState::Paused;
     paused.revision = 4;
     paused.resources_held = false;
-    paused.runtime_ip = None;
+    paused.runtime.ip = None;
     paused.checkpoint = Some(RestorePoint {
         origin: None,
         id: "cp".into(),
-        source_runtime_id: initial.runtime_id.clone(),
+        source_runtime_id: initial.runtime.id.clone(),
         expires_at_unix_seconds: u64::MAX,
         artifact: CheckpointArtifact {
             storage: "local".into(),
@@ -538,11 +540,11 @@ async fn sqlite_replays_pause_and_resume_after_redis_and_node_sink_restart() {
         expected_revision: 2,
     });
     let mut resumed = paused.clone();
-    resumed.state = InstanceState::Running;
+    resumed.state = CapsuleState::Running;
     resumed.revision = 6;
-    resumed.runtime_id = "journal-1-r5".into();
+    resumed.runtime.id = "journal-1-r5".into();
     resumed.resources_held = true;
-    resumed.runtime_ip = initial.runtime_ip;
+    resumed.runtime.ip = initial.runtime.ip;
     resumed.last_operation = Some(CompletedOperation {
         id: "resume".into(),
         kind: LifecycleKind::Resume,
@@ -559,7 +561,7 @@ async fn sqlite_replays_pause_and_resume_after_redis_and_node_sink_restart() {
     let sink = JournalSink::new(tmp.path().join("degraded.sqlite"), upstream);
     sink.recover(&[initial]).await.unwrap();
     let snapshot = session.snapshot().await.unwrap();
-    assert_eq!(snapshot.instances["journal"].result, Some(resumed));
+    assert_eq!(snapshot.capsules["journal"].result, Some(resumed));
     assert_eq!(snapshot.routes().unwrap().len(), 1);
     assert_eq!(sink.pending().await.unwrap(), 0);
 }
@@ -578,7 +580,7 @@ async fn restart_attempts_survive_master_restart_and_cannot_be_reset() {
         max_backoff_seconds: 10,
     });
     let assignment = Assignment {
-        instance_id: request.id.clone(),
+        capsule_id: request.id.clone(),
         node_id: "n".into(),
         shard_id: 0,
         generation: 1,
@@ -590,21 +592,21 @@ async fn restart_attempts_survive_master_restart_and_cannot_be_reset() {
         .unwrap();
     let mut result = running(request, assignment);
     session.commit(result.clone()).await.unwrap();
-    result.state = InstanceState::Failed;
+    result.state = CapsuleState::Failed;
     result.revision = 3;
     result.resources_held = false;
     result.restart_pending = true;
     session.commit(result.clone()).await.unwrap();
-    result.state = InstanceState::Running;
+    result.state = CapsuleState::Running;
     result.revision = 5;
-    result.runtime_id = "restart-1-r4".into();
+    result.runtime.id = "restart-1-r4".into();
     result.resources_held = true;
     result.restart_pending = false;
     result.restart_attempts = 1;
     session.commit(result.clone()).await.unwrap();
     let restored = db.begin(1).await.unwrap();
     assert_eq!(
-        restored.snapshot().await.unwrap().instances["restart"].result,
+        restored.snapshot().await.unwrap().capsules["restart"].result,
         Some(result.clone())
     );
     result.revision += 1;
@@ -690,7 +692,7 @@ async fn expired_executions_remain_invalid_after_redis_and_master_restart() {
     .enumerate()
     {
         let assignment = Assignment {
-            instance_id: id.into(),
+            capsule_id: id.into(),
             node_id: owner.into(),
             shard_id: 0,
             generation: index as u64 + 1,
@@ -710,14 +712,14 @@ async fn expired_executions_remain_invalid_after_redis_and_master_restart() {
     let failed = session.invalidate_node("lost", "boot").await.unwrap();
     assert_eq!(failed.routes().unwrap().len(), 1);
     for id in ["running", "pending"] {
-        let instance = &failed.instances[id];
-        assert!(instance.invalidated);
-        let result = instance.result.as_ref().unwrap();
-        assert_eq!(result.state, InstanceState::Failed);
+        let capsule = &failed.capsules[id];
+        assert!(capsule.invalidated);
+        let result = capsule.result.as_ref().unwrap();
+        assert_eq!(result.state, CapsuleState::Failed);
         assert!(!result.resources_held && !result.restart_pending);
-        assert!(result.runtime_ip.is_none());
+        assert!(result.runtime.ip.is_none());
     }
-    assert!(!failed.instances["kept"].invalidated);
+    assert!(!failed.capsules["kept"].invalidated);
     assert_eq!(
         session
             .invalidate_node("lost", "boot")
@@ -733,9 +735,9 @@ async fn expired_executions_remain_invalid_after_redis_and_master_restart() {
     let mut stale = records[0].clone();
     stale.revision = 1000;
     assert_eq!(recovered.commit(stale.clone()).await, Err(Error::Conflict));
-    stale.state = InstanceState::Failed;
+    stale.state = CapsuleState::Failed;
     stale.resources_held = false;
-    stale.runtime_ip = None;
+    stale.runtime.ip = None;
     recovered.commit(stale).await.unwrap();
     assert_eq!(
         recovered.get("kept").await.unwrap().result,
@@ -764,7 +766,7 @@ async fn recovery_assignment_is_durable_and_old_generation_cannot_publish() {
         .unwrap();
     register(&session, "target").await;
     let previous = Assignment {
-        instance_id: "held".into(),
+        capsule_id: "held".into(),
         node_id: "source".into(),
         shard_id: 0,
         generation: 1,
@@ -803,7 +805,7 @@ async fn recovery_assignment_is_durable_and_old_generation_cannot_publish() {
         .expect("shared checkpoint transfers under a new generation");
     assert_eq!(saved.assignment, replacement);
     assert!(saved.resources_held());
-    assert_eq!(saved.result.as_ref().unwrap().state, InstanceState::Paused);
+    assert_eq!(saved.result.as_ref().unwrap().state, CapsuleState::Paused);
     assert_eq!(
         saved,
         session
@@ -815,16 +817,16 @@ async fn recovery_assignment_is_durable_and_old_generation_cannot_publish() {
     assert_eq!(restarted.get("held").await.unwrap(), saved);
     let scheduler = Master::restore(&restarted.snapshot().await.unwrap(), Placement::Pack).unwrap();
     assert!(
-        scheduler.snapshot().instances().contains_key("held"),
+        scheduler.snapshot().capsules().contains_key("held"),
         "pending recovery reservation survives Master restart"
     );
     r.revision = 1000;
     assert_eq!(restarted.commit(r).await, Err(Error::Conflict));
     let mut restored = saved.result.unwrap();
-    restored.state = InstanceState::Running;
+    restored.state = CapsuleState::Running;
     restored.resources_held = true;
-    restored.runtime_ip = Some("10.0.0.3".parse().unwrap());
-    restored.runtime_id = "held-2-r2".into();
+    restored.runtime.ip = Some("10.0.0.3".parse().unwrap());
+    restored.runtime.id = "held-2-r2".into();
     restored.revision += 2;
     restored.last_operation = Some(adx_core::CompletedOperation {
         id: "recover-2".into(),
@@ -860,7 +862,7 @@ async fn recovery_never_uses_missing_local_or_expired_checkpoint() {
             .unwrap();
         register(&session, "target").await;
         let previous = Assignment {
-            instance_id: "held".into(),
+            capsule_id: "held".into(),
             node_id: "source".into(),
             shard_id: 0,
             generation: 1,
@@ -904,6 +906,6 @@ async fn recovery_never_uses_missing_local_or_expired_checkpoint() {
             "{kind}"
         );
         assert_eq!(session.get("held").await.unwrap(), before);
-        assert_eq!(before.result.unwrap().state, InstanceState::Failed);
+        assert_eq!(before.result.unwrap().state, CapsuleState::Failed);
     }
 }

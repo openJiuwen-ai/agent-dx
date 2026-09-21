@@ -508,7 +508,7 @@ impl EdgeFrontend {
                 .filter(|session| session.instance_id == change.instance_id)
             {
                 let still_current = change.current.as_ref().is_some_and(|route| {
-                    route.instance_status.code == 3
+                    route.capsule_status.code == 3
                         && route.sandbox_id == session.workload_id
                         && route.node_proxy_address == session.node_proxy_address
                         && route.sandbox_ip.parse().ok() == Some(session.target_ip)
@@ -2120,7 +2120,7 @@ fn error_response(error: EdgeOpenError) -> Response<ProxyBody> {
         EdgeOpenError::Resolve(ResolveError::NotReady | ResolveError::Unavailable(_))
         | EdgeOpenError::Draining
         | EdgeOpenError::RouteChanged => StatusCode::SERVICE_UNAVAILABLE,
-        EdgeOpenError::Resolve(ResolveError::InstanceStatus { .. }) => StatusCode::CONFLICT,
+        EdgeOpenError::Resolve(ResolveError::CapsuleStatus { .. }) => StatusCode::CONFLICT,
         EdgeOpenError::Resolve(ResolveError::MissingEndpoint) => StatusCode::BAD_GATEWAY,
         EdgeOpenError::Connect(error) => match error.kind() {
             io::ErrorKind::WouldBlock => StatusCode::TOO_MANY_REQUESTS,

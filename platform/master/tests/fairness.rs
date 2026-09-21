@@ -1,14 +1,14 @@
-use adx_core::{InstanceSpec, Resources};
+use adx_core::{CapsuleSpec, Resources};
 use adx_master::{Master, Node, Placement, SchedulerConfig};
 use std::time::Duration;
 
-fn request(id: &str, tenant: &str) -> InstanceSpec {
-    InstanceSpec {
-        runtime_environment: None,
+fn request(id: &str, tenant: &str) -> CapsuleSpec {
+    CapsuleSpec {
+        environment: None,
         id: id.into(),
         tenant_id: tenant.into(),
         image: "image".into(),
-        runtime: "runc".into(),
+        runtime_class: "runc".into(),
         resources: Resources {
             cpu_millis: 1,
             memory_bytes: 1,
@@ -67,7 +67,7 @@ fn recovered_capacity_revisits_old_tenant_under_continuous_arrivals() {
             let outcome = master.schedule_round(0).unwrap();
             assert!(outcome.attempted <= 1);
             for allocation in outcome.assignments {
-                served |= allocation.instance_id == "old";
+                served |= allocation.capsule_id == "old";
                 master.release(&allocation).unwrap();
             }
         }
@@ -115,7 +115,7 @@ fn fresh_work_deferred_behind_blocked_sweep_remains_awake_then_sleeps() {
     }
     let assignment =
         assigned.expect("new fitting request must run without another resource report");
-    assert_eq!(assignment.instance_id, "fits");
+    assert_eq!(assignment.capsule_id, "fits");
     master.release(&assignment).unwrap();
     for _ in 0..5 {
         let Some(shard) = master.take_ready_shard() else {

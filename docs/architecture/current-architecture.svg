@@ -40,8 +40,8 @@
 <text x="32" y="529" class="small">Worker：默认一个 Node Manager 进程；可显式拆分 Proxy</text>
 <rect x="32" y="534" width="426" height="116" class="box" fill="#e6f4ef"/>
 <text x="50" y="564" class="head">Node Manager</text>
-<text x="50" y="590" class="body">Local 准入 / 每 Instance 串行状态机</text>
-<text x="50" y="613" class="body">资源采集 / RuntimeBackend / 制品存储</text>
+<text x="50" y="590" class="body">Local 准入 / 每 Capsule 串行状态机</text>
+<text x="50" y="613" class="body">资源采集 / RuntimeDriver / 制品存储</text>
 <path d="M100 462V530" class="edge" marker-start="url(#arrow)"/>
 <text x="113" y="510" class="small">分配 ↓ / 结果提交 ↑</text>
 <path d="M70 308H16V592H28" class="edge"/>
@@ -61,7 +61,7 @@
 <text x="295" y="728" class="head">SQLite / 本地 / S3</text>
 <text x="295" y="754" class="body">降级日志 / checkpoint 制品</text>
 <rect x="654" y="698" width="432" height="95" class="box" fill="#e8f0fc"/>
-<text x="672" y="728" class="head">RRT · Instance 内</text>
+<text x="672" y="728" class="head">Runtime · RRT + workload</text>
 <text x="672" y="754" class="body">命令 / 文件 / HTTP 恢复协作</text>
 <path d="M136 650V694" class="edge"/>
 <text x="146" y="678" class="small">后端 RPC</text>
@@ -71,4 +71,4 @@
 <text x="883" y="678" class="small">HTTP 数据</text>
 <path d="M458 624H617V742H650" class="edge"/>
 <text x="464" y="615" class="small">RRT HTTP 控制</text>
-<text x="32" y="822" class="small">各组件导出 Metrics / Trace / 日志；部署环境运行 Collector。数据请求不经过 Instance 生命周期队列。</text></svg>
+<text x="32" y="822" class="small">各组件导出 Metrics / Trace / 日志；部署环境运行 Collector。数据请求不经过 Capsule 生命周期队列。</text></svg>

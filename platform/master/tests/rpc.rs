@@ -1,9 +1,9 @@
 mod common;
-use adx_core::{scheduling::DeviceAllocation, InstanceRecord, InstanceSpec, Resources, Result};
+use adx_core::{scheduling::DeviceAllocation, CapsuleRecord, CapsuleSpec, Resources, Result};
 use adx_master::{routes::RoutePublisher, rpc::MasterRpc, storage::Session, Placement};
 use adx_node_manager::{
     rpc::{MasterStateSink, NodeRpc},
-    NodeManager, Readiness, Routes, RuntimeBackend,
+    NodeManager, Readiness, Routes, RuntimeDriver,
 };
 use adx_protocol::{
     auth::{Peers, Principal},
@@ -93,16 +93,16 @@ async fn channel(address: std::net::SocketAddr, name: &str) -> Channel {
         .await
         .unwrap()
 }
-fn spec(id: &str) -> InstanceSpec {
-    InstanceSpec {
-        runtime_environment: None,
+fn spec(id: &str) -> CapsuleSpec {
+    CapsuleSpec {
+        environment: None,
         snapshot_id: None,
         lifecycle: Default::default(),
         env: Default::default(),
         id: id.into(),
         tenant_id: "tenant".into(),
         image: "image".into(),
-        runtime: "runc".into(),
+        runtime_class: "runc".into(),
         resources: Resources {
             cpu_millis: 100,
             memory_bytes: 128,
@@ -119,8 +119,8 @@ fn caller() -> Option<pb::CallerContext> {
         administrator: false,
     })
 }
-fn create(id: &str) -> pb::CreateInstanceRequest {
-    pb::CreateInstanceRequest {
+fn create(id: &str) -> pb::CreateCapsuleRequest {
+    pb::CreateCapsuleRequest {
         spec: Some(spec(id).into()),
         caller: caller(),
         schedule_timeout_seconds: 30,
@@ -134,7 +134,7 @@ struct Backend {
     running: Mutex<BTreeSet<String>>,
 }
 #[async_trait::async_trait]
-impl RuntimeBackend for Backend {
+impl RuntimeDriver for Backend {
     async fn inventory(&self) -> Result<Vec<adx_node_manager::RuntimeObservation>> {
         Ok(self
             .running
@@ -142,9 +142,9 @@ impl RuntimeBackend for Backend {
             .unwrap()
             .iter()
             .map(|id| {
-                let (instance, generation) = id.rsplit_once('-').unwrap();
+                let (capsule, generation) = id.rsplit_once('-').unwrap();
                 adx_node_manager::RuntimeObservation {
-                    instance_id: instance.into(),
+                    capsule_id: capsule.into(),
                     runtime_id: id.clone(),
                     generation: generation.parse().unwrap(),
                     tenant_id: "tenant".into(),
@@ -156,7 +156,7 @@ impl RuntimeBackend for Backend {
 
     async fn start(
         &self,
-        spec: &InstanceSpec,
+        spec: &CapsuleSpec,
         id: &str,
         generation: u64,
         _: &[DeviceAllocation],
@@ -179,7 +179,7 @@ impl RuntimeBackend for Backend {
     }
     async fn restore_from(
         &self,
-        spec: &InstanceSpec,
+        spec: &CapsuleSpec,
         id: &str,
         generation: u64,
         devices: &[DeviceAllocation],
@@ -187,7 +187,7 @@ impl RuntimeBackend for Backend {
         origin: Option<&adx_core::runtime::RuntimeIdentity>,
     ) -> Result<std::net::IpAddr> {
         if let Some(origin) = origin {
-            assert_ne!(origin.instance_id, spec.id);
+            assert_ne!(origin.capsule_id, spec.id);
             let snapshot = self
                 .session
                 .get_snapshot(spec.snapshot_id.as_deref().unwrap())
@@ -196,14 +196,14 @@ impl RuntimeBackend for Backend {
             assert!(snapshot
                 .references
                 .contains(&adx_core::snapshots::Reference::Restore {
-                    instance_id: spec.id.clone()
+                    capsule_id: spec.id.clone()
                 }));
         }
         self.restore(spec, id, generation, devices, path).await
     }
     async fn restore(
         &self,
-        spec: &InstanceSpec,
+        spec: &CapsuleSpec,
         id: &str,
         generation: u64,
         devices: &[DeviceAllocation],
@@ -227,7 +227,7 @@ impl RuntimeBackend for Backend {
 struct LocalChecks;
 #[async_trait::async_trait]
 impl Readiness for LocalChecks {
-    async fn wait_ready(&self, _: &InstanceRecord) -> Result<()> {
+    async fn wait_ready(&self, _: &CapsuleRecord) -> Result<()> {
         Ok(())
     }
 }
@@ -237,10 +237,10 @@ impl Routes for LocalChecks {
         Ok(())
     }
 
-    async fn activate(&self, _: &InstanceRecord) -> Result<()> {
+    async fn activate(&self, _: &CapsuleRecord) -> Result<()> {
         Ok(())
     }
-    async fn retire(&self, _: &InstanceRecord) -> Result<()> {
+    async fn retire(&self, _: &CapsuleRecord) -> Result<()> {
         Ok(())
     }
 }
@@ -291,7 +291,7 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
                 ))
                 .add_service(pb::auth_service_server::AuthServiceServer::new(auth))
                 .add_service(
-                    pb::instance_directory_service_server::InstanceDirectoryServiceServer::new(
+                    pb::capsule_directory_service_server::CapsuleDirectoryServiceServer::new(
                         publication,
                     ),
                 )
@@ -385,8 +385,8 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
         pb::master_service_client::MasterServiceClient::new(channel(ma, "api-server").await);
     let mut duplicate = frontend.clone();
     let (a, b) = tokio::join!(
-        frontend.create_instance(create("first")),
-        duplicate.create_instance(create("first"))
+        frontend.create_capsule(create("first")),
+        duplicate.create_capsule(create("first"))
     );
     let first = a.unwrap().into_inner();
     assert_eq!(first, b.unwrap().into_inner());
@@ -395,7 +395,7 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
     let first_record = first.record.unwrap();
     let metrics = scrape_metrics(metrics_address).await;
     assert!(metrics
-        .contains("adx_master_instances{shard_id=\"0\",node_id=\"node\",state=\"Running\"} 1\n"));
+        .contains("adx_master_capsules{shard_id=\"0\",node_id=\"node\",state=\"Running\"} 1\n"));
     assert!(metrics
         .contains("adx_master_node_reserved_cpu_millis{shard_id=\"0\",node_id=\"node\"} 100\n"));
 
@@ -403,7 +403,7 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
         pb::node_service_client::NodeServiceClient::new(channel(na, "master").await);
     assert_eq!(
         stale_master
-            .create_instance(pb::StartAssignedInstanceRequest {
+            .create_capsule(pb::StartAssignedCapsuleRequest {
                 snapshot: None,
                 spec: Some(spec("late").into()),
                 assignment: first_record.assignment.clone(),
@@ -416,13 +416,13 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
     );
     assert_eq!(backend.started.load(Ordering::SeqCst), 1);
     let assignment = first_record.assignment.clone().unwrap();
-    let get = pb::GetInstanceRequest {
-        instance_id: "first".into(),
+    let get = pb::GetCapsuleRequest {
+        capsule_id: "first".into(),
         caller: caller(),
     };
     assert_eq!(
         frontend
-            .get_instance(get.clone())
+            .get_capsule(get.clone())
             .await
             .unwrap()
             .into_inner()
@@ -432,18 +432,18 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
     let mut other = get.clone();
     other.caller.as_mut().unwrap().tenant_id = "other".into();
     assert_eq!(
-        frontend.get_instance(other).await.unwrap_err().code(),
+        frontend.get_capsule(other).await.unwrap_err().code(),
         tonic::Code::PermissionDenied
     );
     let mut unknown =
         pb::master_service_client::MasterServiceClient::new(channel(ma, "unknown").await);
     assert_eq!(
-        unknown.get_instance(get).await.unwrap_err().code(),
+        unknown.get_capsule(get).await.unwrap_err().code(),
         tonic::Code::PermissionDenied
     );
     assert_eq!(
         frontend
-            .commit_instance(pb::CommitInstanceRequest {
+            .commit_capsule(pb::CommitCapsuleRequest {
                 node_session_id: "boot-1".into(),
                 record: Some(first_record.clone())
             })
@@ -456,7 +456,7 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
         pb::node_service_client::NodeServiceClient::new(channel(na, "api-server").await);
     assert_eq!(
         node_frontend
-            .create_instance(pb::StartAssignedInstanceRequest {
+            .create_capsule(pb::StartAssignedCapsuleRequest {
                 snapshot: None,
                 node_session_id: "boot-1".into(),
                 spec: Some(spec("first").into()),
@@ -467,7 +467,7 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
             .code(),
         tonic::Code::PermissionDenied
     );
-    let mut pause = pb::PauseInstanceRequest {
+    let mut pause = pb::PauseCapsuleRequest {
         assignment: Some(assignment.clone()),
         caller: caller(),
         operation_id: "pause-auth".into(),
@@ -477,7 +477,7 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
     };
     assert_eq!(
         stale_master
-            .pause_instance(pause.clone())
+            .pause_capsule(pause.clone())
             .await
             .unwrap_err()
             .code(),
@@ -485,14 +485,10 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
     );
     pause.caller.as_mut().unwrap().tenant_id = "other".into();
     assert_eq!(
-        node_frontend
-            .pause_instance(pause)
-            .await
-            .unwrap_err()
-            .code(),
+        node_frontend.pause_capsule(pause).await.unwrap_err().code(),
         tonic::Code::PermissionDenied
     );
-    let mut resume = pb::ResumeInstanceRequest {
+    let mut resume = pb::ResumeCapsuleRequest {
         assignment: Some(assignment.clone()),
         caller: caller(),
         operation_id: "resume-auth".into(),
@@ -500,7 +496,7 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
     };
     assert_eq!(
         stale_master
-            .resume_instance(resume.clone())
+            .resume_capsule(resume.clone())
             .await
             .unwrap_err()
             .code(),
@@ -509,20 +505,20 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
     resume.caller.as_mut().unwrap().tenant_id = "other".into();
     assert_eq!(
         node_frontend
-            .resume_instance(resume)
+            .resume_capsule(resume)
             .await
             .unwrap_err()
             .code(),
         tonic::Code::PermissionDenied
     );
-    let mut bad_delete = pb::DeleteInstanceRequest {
+    let mut bad_delete = pb::DeleteCapsuleRequest {
         assignment: Some(assignment.clone()),
         caller: caller(),
     };
     bad_delete.caller.as_mut().unwrap().tenant_id = "other".into();
     assert_eq!(
         node_frontend
-            .delete_instance(bad_delete)
+            .delete_capsule(bad_delete)
             .await
             .unwrap_err()
             .code(),
@@ -532,7 +528,7 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
     stale.generation += 1;
     assert_eq!(
         node_frontend
-            .delete_instance(pb::DeleteInstanceRequest {
+            .delete_capsule(pb::DeleteCapsuleRequest {
                 assignment: Some(stale),
                 caller: caller()
             })
@@ -545,7 +541,7 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
     expires.schedule_timeout_seconds = 1;
     let started = tokio::time::Instant::now();
     assert_eq!(
-        frontend.create_instance(expires).await.unwrap_err().code(),
+        frontend.create_capsule(expires).await.unwrap_err().code(),
         tonic::Code::DeadlineExceeded
     );
     assert!(started.elapsed() >= Duration::from_millis(900));
@@ -559,7 +555,7 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
 
     let mut pending = Request::new(create("second"));
     pending.set_timeout(Duration::from_millis(80));
-    assert!(frontend.create_instance(pending).await.is_err());
+    assert!(frontend.create_capsule(pending).await.is_err());
     assert!(scrape_metrics(metrics_address)
         .await
         .contains("adx_master_queued_requests{shard_id=\"0\"} 1\n"));
@@ -568,12 +564,12 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
         session.get("second").await.unwrap_err(),
         adx_core::Error::NotFound
     );
-    let delete = pb::DeleteInstanceRequest {
+    let delete = pb::DeleteCapsuleRequest {
         assignment: Some(assignment),
         caller: caller(),
     };
-    node_frontend.delete_instance(delete.clone()).await.unwrap();
-    node_frontend.delete_instance(delete).await.unwrap();
+    node_frontend.delete_capsule(delete.clone()).await.unwrap();
+    node_frontend.delete_capsule(delete).await.unwrap();
     // The caller timed out, but the accepted creation continues after release.
     let second = tokio::time::timeout(Duration::from_secs(4), async {
         loop {
@@ -591,7 +587,7 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
     assert_eq!(backend.removed.load(Ordering::SeqCst), 1);
     assert_eq!(
         node_master
-            .commit_instance(pb::CommitInstanceRequest {
+            .commit_capsule(pb::CommitCapsuleRequest {
                 node_session_id: "boot-1".into(),
                 record: Some(first_record)
             })
@@ -601,14 +597,14 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
         tonic::Code::FailedPrecondition
     );
     redis.crash();
-    let delete = pb::DeleteInstanceRequest {
+    let delete = pb::DeleteCapsuleRequest {
         assignment: Some(second.assignment.try_into().unwrap()),
         caller: caller(),
     };
-    assert!(node_frontend.delete_instance(delete.clone()).await.is_err());
+    assert!(node_frontend.delete_capsule(delete.clone()).await.is_err());
     assert_eq!(backend.removed.load(Ordering::SeqCst), 2);
     redis.start().await;
-    node_frontend.delete_instance(delete).await.unwrap();
+    node_frontend.delete_capsule(delete).await.unwrap();
     assert_eq!(
         backend.removed.load(Ordering::SeqCst),
         2,
@@ -624,7 +620,7 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
     assert!(backend.running.lock().unwrap().is_empty());
     let metrics = scrape_metrics(metrics_address).await;
     assert!(metrics
-        .contains("adx_master_instances{shard_id=\"0\",node_id=\"node\",state=\"Running\"} 0\n"));
+        .contains("adx_master_capsules{shard_id=\"0\",node_id=\"node\",state=\"Running\"} 0\n"));
     assert!(metrics.contains("adx_master_deleted_records 2\n"));
     assert!(metrics
         .contains("adx_master_node_reserved_cpu_millis{shard_id=\"0\",node_id=\"node\"} 0\n"));
@@ -859,7 +855,7 @@ async fn master_process_loads_configuration_and_restores_bootstrap_credentials()
 #[tokio::test]
 #[ignore = "requires isolated Redis and mTLS certificates; run control-rpc suite"]
 async fn heartbeat_expiry_reconciliation_and_old_session_fencing() {
-    use adx_core::{Assignment, InstanceState};
+    use adx_core::{Assignment, CapsuleState};
     let redis = common::Redis::new().await;
     let store = redis.store().await;
     let session = store.begin(1).await.unwrap();
@@ -926,7 +922,7 @@ async fn heartbeat_expiry_reconciliation_and_old_session_fencing() {
     report.reconciling = false;
     node.register_node(report.clone()).await.unwrap();
     let assigned = Assignment {
-        instance_id: "held".into(),
+        capsule_id: "held".into(),
         node_id: "node".into(),
         shard_id: 0,
         generation: 1,
@@ -936,16 +932,18 @@ async fn heartbeat_expiry_reconciliation_and_old_session_fencing() {
         .reserve(spec("held"), assigned.clone())
         .await
         .unwrap();
-    let running = InstanceRecord {
+    let running = CapsuleRecord {
         restart_attempts: 0,
         restart_pending: false,
         spec: spec("held"),
         assignment: assigned,
-        state: InstanceState::Running,
+        state: CapsuleState::Running,
         revision: 2,
-        runtime_id: "held-1".into(),
+        runtime: adx_core::Runtime {
+            id: "held-1".into(),
+            ip: Some("10.0.0.2".parse().unwrap()),
+        },
         resources_held: true,
-        runtime_ip: Some("10.0.0.2".parse().unwrap()),
         checkpoint: None,
         last_operation: None,
     };
@@ -959,17 +957,17 @@ async fn heartbeat_expiry_reconciliation_and_old_session_fencing() {
     let snapshot = session.snapshot().await.unwrap();
     assert!(!snapshot.nodes["node"].node.available);
     assert!(snapshot.routes().unwrap().is_empty());
-    assert!(!snapshot.instances["held"].resources_held());
+    assert!(!snapshot.capsules["held"].resources_held());
     let metrics = rpc.metrics().await.unwrap();
     assert!(metrics.contains(
-        "adx_master_instances{shard_id=\"0\",node_id=\"node\",state=\"Invalidated\"} 1\n"
+        "adx_master_capsules{shard_id=\"0\",node_id=\"node\",state=\"Invalidated\"} 1\n"
     ));
     assert!(metrics
         .contains("adx_master_node_available_cpu_millis{shard_id=\"0\",node_id=\"node\"} 0\n"));
 
     assert_eq!(
-        snapshot.instances["held"].result.as_ref().unwrap().state,
-        InstanceState::Failed
+        snapshot.capsules["held"].result.as_ref().unwrap().state,
+        CapsuleState::Failed
     );
     report.heartbeat_sequence = 3;
     assert_eq!(
@@ -1023,7 +1021,7 @@ async fn heartbeat_expiry_reconciliation_and_old_session_fencing() {
     assert_eq!(backend.started.load(Ordering::SeqCst), 0);
 
     assert_eq!(
-        node.commit_instance(pb::CommitInstanceRequest {
+        node.commit_capsule(pb::CommitCapsuleRequest {
             record: Some(running.clone().try_into().unwrap()),
             node_session_id: "first-boot".into()
         })
@@ -1033,7 +1031,7 @@ async fn heartbeat_expiry_reconciliation_and_old_session_fencing() {
         tonic::Code::FailedPrecondition
     );
     assert_eq!(
-        node.commit_instance(pb::CommitInstanceRequest {
+        node.commit_capsule(pb::CommitCapsuleRequest {
             record: Some(running.try_into().unwrap()),
             node_session_id: "second-boot".into(),
         })
@@ -1180,7 +1178,7 @@ async fn node_restart_before_expiry_requires_new_session_at_registered_endpoint(
     let mut frontend =
         pb::master_service_client::MasterServiceClient::new(channel(ma, "api-server").await);
     let running = frontend
-        .create_instance(create("held"))
+        .create_capsule(create("held"))
         .await
         .unwrap()
         .into_inner()
@@ -1244,7 +1242,7 @@ async fn node_restart_before_expiry_requires_new_session_at_registered_endpoint(
     );
     assert_eq!(
         node_master
-            .commit_instance(pb::CommitInstanceRequest {
+            .commit_capsule(pb::CommitCapsuleRequest {
                 record: Some(running.clone()),
                 node_session_id: "boot-1".into(),
             })
@@ -1290,7 +1288,7 @@ async fn node_restart_before_expiry_requires_new_session_at_registered_endpoint(
 #[tokio::test]
 #[ignore = "requires isolated Redis and mTLS certificates; run control-rpc suite"]
 async fn master_restart_bounds_re_registration_grace() {
-    use adx_core::{Assignment, InstanceState};
+    use adx_core::{Assignment, CapsuleState};
     for mode in ["timer", "late-register", "timely-register"] {
         let redis = common::Redis::new().await;
         let store = redis.store().await;
@@ -1319,7 +1317,7 @@ async fn master_restart_bounds_re_registration_grace() {
             .await
             .unwrap();
         let assignment = Assignment {
-            instance_id: "held".into(),
+            capsule_id: "held".into(),
             node_id: "node".into(),
             shard_id: 0,
             generation: 1,
@@ -1329,14 +1327,16 @@ async fn master_restart_bounds_re_registration_grace() {
             .reserve(spec("held"), assignment.clone())
             .await
             .unwrap();
-        let running = InstanceRecord {
+        let running = CapsuleRecord {
             spec: spec("held"),
             assignment,
-            state: InstanceState::Running,
+            state: CapsuleState::Running,
             revision: 2,
-            runtime_id: "held-1".into(),
+            runtime: adx_core::Runtime {
+                id: "held-1".into(),
+                ip: Some("10.0.0.2".parse().unwrap()),
+            },
             resources_held: true,
-            runtime_ip: Some("10.0.0.2".parse().unwrap()),
             checkpoint: None,
             last_operation: None,
             restart_attempts: 0,
@@ -1400,13 +1400,13 @@ async fn master_restart_bounds_re_registration_grace() {
         let stored = session.get("held").await.unwrap();
         assert_eq!(stored.invalidated, mode != "timely-register", "{mode}");
         assert_eq!(catalog.records.len(), 1);
-        let record: InstanceRecord = catalog.records[0].clone().try_into().unwrap();
+        let record: CapsuleRecord = catalog.records[0].clone().try_into().unwrap();
         if mode == "timely-register" {
             assert_eq!(record, running);
         } else {
-            assert_eq!(record.state, InstanceState::Failed, "{mode}");
+            assert_eq!(record.state, CapsuleState::Failed, "{mode}");
             assert!(!record.resources_held);
-            assert!(record.runtime_ip.is_none());
+            assert!(record.runtime.ip.is_none());
         }
     }
 }
@@ -1414,7 +1414,7 @@ async fn master_restart_bounds_re_registration_grace() {
 #[tokio::test]
 #[ignore = "requires isolated Redis and mTLS certificates; run control-rpc suite"]
 async fn published_routes_drive_real_gateway_streams_and_reconnect_to_new_master() {
-    use adx_core::{Assignment, InstanceState};
+    use adx_core::{Assignment, CapsuleState};
     use adx_master::{
         auth::{AuthRpc, Credential},
         routes::RoutePublisher,
@@ -1514,7 +1514,7 @@ async fn published_routes_drive_real_gateway_streams_and_reconnect_to_new_master
         .await
         .unwrap();
     let assignment = Assignment {
-        instance_id: "routed".into(),
+        capsule_id: "routed".into(),
         node_id: "node".into(),
         shard_id: 0,
         generation: 1,
@@ -1524,16 +1524,18 @@ async fn published_routes_drive_real_gateway_streams_and_reconnect_to_new_master
         .reserve(spec("routed"), assignment.clone())
         .await
         .unwrap();
-    let mut record = InstanceRecord {
+    let mut record = CapsuleRecord {
         restart_attempts: 0,
         restart_pending: false,
         spec: spec("routed"),
         assignment,
-        state: InstanceState::Running,
+        state: CapsuleState::Running,
         revision: 2,
-        runtime_id: "routed-1".into(),
+        runtime: adx_core::Runtime {
+            id: "routed-1".into(),
+            ip: Some("127.0.0.1".parse().unwrap()),
+        },
         resources_held: true,
-        runtime_ip: Some("127.0.0.1".parse().unwrap()),
         checkpoint: None,
         last_operation: None,
     };
@@ -1670,7 +1672,7 @@ async fn published_routes_drive_real_gateway_streams_and_reconnect_to_new_master
         .await
         .is_err());
     let next = db.begin(1).await.unwrap();
-    record.state = InstanceState::Deleted;
+    record.state = CapsuleState::Deleted;
     record.resources_held = false;
     record.revision = 4;
     next.commit(record).await.unwrap();
@@ -1971,10 +1973,10 @@ async fn tenant_key_rpc_requires_frontend_admin_and_revokes_verification() {
 
 #[async_trait::async_trait]
 impl adx_node_manager::checkpoint::CheckpointCooperation for LocalChecks {
-    async fn prepare(&self, _: &InstanceRecord, _: &str) -> Result<()> {
+    async fn prepare(&self, _: &CapsuleRecord, _: &str) -> Result<()> {
         Ok(())
     }
-    async fn abort_unstarted(&self, _: &InstanceRecord, _: &str) -> Result<()> {
+    async fn abort_unstarted(&self, _: &CapsuleRecord, _: &str) -> Result<()> {
         Ok(())
     }
 }
@@ -2105,7 +2107,7 @@ async fn snapshot_gc_waits_for_node_ack_and_recovers_from_lost_ack() {
     report.accepting_allocations = true;
     client.register_node(report).await.unwrap();
     let reference = Reference::Restore {
-        instance_id: "clone".into(),
+        capsule_id: "clone".into(),
     };
     session
         .acquire_snapshot(&snapshot.id, "tenant", reference.clone())
@@ -2170,7 +2172,7 @@ async fn snapshot_gc_waits_for_node_ack_and_recovers_from_lost_ack() {
     let mut api =
         pb::master_service_client::MasterServiceClient::new(channel(ma, "api-server").await);
     let source = api
-        .create_instance(create("snapshot-source"))
+        .create_capsule(create("snapshot-source"))
         .await
         .unwrap()
         .into_inner()
@@ -2191,8 +2193,8 @@ async fn snapshot_gc_waits_for_node_ack_and_recovers_from_lost_ack() {
         .into_inner();
     let reusable = saved.snapshot.unwrap();
     assert_eq!(
-        saved.instance.unwrap().record.unwrap().state,
-        pb::InstanceState::Running as i32
+        saved.capsule.unwrap().record.unwrap().state,
+        pb::CapsuleState::Running as i32
     );
     assert!(std::path::Path::new(&reusable.artifact.as_ref().unwrap().location).exists());
     let again = frontend
@@ -2202,7 +2204,7 @@ async fn snapshot_gc_waits_for_node_ack_and_recovers_from_lost_ack() {
         .into_inner();
     assert_eq!(again.snapshot.as_ref().unwrap().id, reusable.id);
     frontend
-        .delete_instance(pb::DeleteInstanceRequest {
+        .delete_capsule(pb::DeleteCapsuleRequest {
             assignment: source.assignment,
             caller: caller(),
         })
@@ -2213,7 +2215,7 @@ async fn snapshot_gc_waits_for_node_ack_and_recovers_from_lost_ack() {
     let raw = request.spec.as_mut().unwrap();
     raw.snapshot_id = Some(reusable.id.clone());
     raw.image.clear();
-    raw.runtime.clear();
+    raw.runtime_class.clear();
     raw.resources = None;
     let mut denied = request.clone();
     denied.spec.as_mut().unwrap().resources = Some(pb::Resources {
@@ -2222,11 +2224,11 @@ async fn snapshot_gc_waits_for_node_ack_and_recovers_from_lost_ack() {
         disk_bytes: 1,
     });
     assert_eq!(
-        api.create_instance(denied).await.unwrap_err().code(),
+        api.create_capsule(denied).await.unwrap_err().code(),
         tonic::Code::InvalidArgument
     );
     let created = frontend
-        .create_local_instance(pb::LocalCreateRequest {
+        .create_local_capsule(pb::LocalCapsuleCreateRequest {
             create: Some(request.clone()),
             node_session_id: "gc-boot".into(),
         })
@@ -2254,7 +2256,7 @@ async fn snapshot_gc_waits_for_node_ack_and_recovers_from_lost_ack() {
         .unwrap()
         .references
         .contains(&Reference::Restore {
-            instance_id: "snapshot-clone".into()
+            capsule_id: "snapshot-clone".into()
         }));
     assert_eq!(master.collect_snapshots().await.unwrap(), 0);
     assert!(session
@@ -2273,7 +2275,7 @@ async fn snapshot_gc_waits_for_node_ack_and_recovers_from_lost_ack() {
     // Retry a completed create even after its source was collected.
     assert_eq!(
         frontend
-            .create_local_instance(pb::LocalCreateRequest {
+            .create_local_capsule(pb::LocalCapsuleCreateRequest {
                 create: Some(request.clone()),
                 node_session_id: "gc-boot".into(),
             })
@@ -2285,7 +2287,7 @@ async fn snapshot_gc_waits_for_node_ack_and_recovers_from_lost_ack() {
         created
     );
     assert_eq!(
-        api.create_instance(request)
+        api.create_capsule(request)
             .await
             .unwrap()
             .into_inner()
@@ -2294,7 +2296,7 @@ async fn snapshot_gc_waits_for_node_ack_and_recovers_from_lost_ack() {
         created
     );
     frontend
-        .delete_instance(pb::DeleteInstanceRequest {
+        .delete_capsule(pb::DeleteCapsuleRequest {
             assignment: created.assignment,
             caller: caller(),
         })
@@ -2329,7 +2331,7 @@ async fn master_restart_releases_snapshot_pins_for_lost_memory_queue_only() {
             &snapshot.id,
             "tenant",
             Reference::Restore {
-                instance_id: "memory-queue-only".into(),
+                capsule_id: "memory-queue-only".into(),
             },
         )
         .await
@@ -2378,13 +2380,13 @@ async fn master_restart_releases_snapshot_pins_for_lost_memory_queue_only() {
 
 struct RecoveryBackend(Backend);
 #[async_trait::async_trait]
-impl RuntimeBackend for RecoveryBackend {
+impl RuntimeDriver for RecoveryBackend {
     async fn inventory(&self) -> Result<Vec<adx_node_manager::RuntimeObservation>> {
         self.0.inventory().await
     }
     async fn start(
         &self,
-        _: &InstanceSpec,
+        _: &CapsuleSpec,
         _: &str,
         _: u64,
         _: &[DeviceAllocation],
@@ -2399,7 +2401,7 @@ impl RuntimeBackend for RecoveryBackend {
     }
     async fn restore_from(
         &self,
-        spec: &InstanceSpec,
+        spec: &CapsuleSpec,
         id: &str,
         generation: u64,
         devices: &[DeviceAllocation],
@@ -2407,7 +2409,7 @@ impl RuntimeBackend for RecoveryBackend {
         origin: Option<&adx_core::runtime::RuntimeIdentity>,
     ) -> Result<std::net::IpAddr> {
         let origin = origin.expect("source checkpoint identity required");
-        assert_eq!(origin.instance_id, spec.id);
+        assert_eq!(origin.capsule_id, spec.id);
         assert!(origin.ownership_generation < generation);
         assert_eq!(
             std::fs::read(path.join("memory")).unwrap(),
@@ -2419,7 +2421,7 @@ impl RuntimeBackend for RecoveryBackend {
 #[tokio::test]
 #[ignore = "requires isolated Redis and mTLS certificates"]
 async fn shared_checkpoint_moves_to_new_node_and_old_node_cleans_without_deleting_artifact() {
-    use adx_core::{Assignment, InstanceState, RestorePoint};
+    use adx_core::{Assignment, CapsuleState, RestorePoint};
     use adx_node_manager::checkpoint::{CheckpointStore, ObjectCheckpointStore, RemoteGcConfig};
     let redis = common::Redis::new().await;
     let session = redis.store().await.begin(2).await.unwrap();
@@ -2556,7 +2558,7 @@ async fn shared_checkpoint_moves_to_new_node_and_old_node_cleans_without_deletin
         client.register_node(report.clone()).await.unwrap();
     }
     let previous = Assignment {
-        instance_id: "held".into(),
+        capsule_id: "held".into(),
         node_id: "source".into(),
         shard_id: 0,
         generation: 1,
@@ -2566,14 +2568,16 @@ async fn shared_checkpoint_moves_to_new_node_and_old_node_cleans_without_deletin
         .reserve(spec("held"), previous.clone())
         .await
         .unwrap();
-    let old = InstanceRecord {
+    let old = CapsuleRecord {
         spec: spec("held"),
         assignment: previous,
-        state: InstanceState::Running,
+        state: CapsuleState::Running,
         revision: 2,
-        runtime_id: "held-1".into(),
+        runtime: adx_core::Runtime {
+            id: "held-1".into(),
+            ip: Some("10.0.0.2".parse().unwrap()),
+        },
         resources_held: true,
-        runtime_ip: Some("10.0.0.2".parse().unwrap()),
         checkpoint: Some(RestorePoint {
             id: "pause".into(),
             artifact: artifact.clone(),
@@ -2605,28 +2609,28 @@ async fn shared_checkpoint_moves_to_new_node_and_old_node_cleans_without_deletin
     target_report.accepting_allocations = true;
     target.register_node(target_report.clone()).await.unwrap();
     assert_eq!(rpc.expire_nodes().await.unwrap(), 1);
-    assert_eq!(rpc.recover_instances().await.unwrap(), 1);
+    assert_eq!(rpc.recover_capsules().await.unwrap(), 1);
     let restored = session.get("held").await.unwrap();
     let result = restored.result.clone().unwrap();
-    assert_eq!(result.state, InstanceState::Running);
+    assert_eq!(result.state, CapsuleState::Running);
     assert_eq!(result.assignment.node_id, "target");
     assert_eq!(result.assignment.shard_id, 1);
     assert!(result.assignment.generation > old.assignment.generation);
     assert_eq!(result.spec, old.spec);
     assert!(!restored.recovery.as_ref().unwrap().pending);
-    assert_eq!(rpc.recover_instances().await.unwrap(), 0);
+    assert_eq!(rpc.recover_capsules().await.unwrap(), 0);
     assert_eq!(backend.0.started.load(Ordering::SeqCst), 1);
     let mut duplicate = result.clone();
-    duplicate.state = InstanceState::Paused;
+    duplicate.state = CapsuleState::Paused;
     duplicate.revision = 1;
     duplicate.resources_held = false;
-    duplicate.runtime_ip = None;
-    duplicate.runtime_id = format!("held-{}", result.assignment.generation);
+    duplicate.runtime.ip = None;
+    duplicate.runtime.id = format!("held-{}", result.assignment.generation);
     duplicate.last_operation = None;
     let mut master_node =
         pb::node_service_client::NodeServiceClient::new(channel(na, "master").await);
     master_node
-        .recover_instance(pb::RecoverInstanceRequest {
+        .recover_capsule(pb::RecoverCapsuleRequest {
             record: Some(duplicate.try_into().unwrap()),
             node_session_id: "target-boot".into(),
         })
@@ -2638,7 +2642,7 @@ async fn shared_checkpoint_moves_to_new_node_and_old_node_cleans_without_deletin
         "target"
     );
     assert!(source
-        .commit_instance(pb::CommitInstanceRequest {
+        .commit_capsule(pb::CommitCapsuleRequest {
             record: Some(old.clone().try_into().unwrap()),
             node_session_id: "source-boot".into()
         })

@@ -29,7 +29,7 @@ pub enum EdgeMode {
 #[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
-    pub runtime_environment: Option<adx_core::environment::RuntimeEnvironment>,
+    pub environment: Option<adx_core::environment::EnvironmentSpec>,
     pub listen: SocketAddr,
     #[serde(default)]
     pub create_mode: CreateMode,
@@ -54,7 +54,7 @@ pub struct Config {
 }
 impl Config {
     pub fn validate(&self) -> Result<(), Box<dyn std::error::Error>> {
-        if let Some(e) = &self.runtime_environment {
+        if let Some(e) = &self.environment {
             e.validate()?;
         }
         if self.master_address.is_empty() == self.discovery.is_none()

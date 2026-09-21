@@ -22,6 +22,6 @@ edge_mode: standalone
 
 ## 验证边界
 
-部署测试验证默认只渲染一个进程、Edge 环境和控制配置完整注入，并验证 `standalone` 明确恢复两个进程。API Server 配置测试拒绝缺少 `edge_control` 的内嵌模式及携带该字段的分进程模式。完整验收还应从公开 SDK 经 Edge 创建 Instance、访问 RRT 并删除，且核对 supervisor 状态中不存在独立 Edge 进程。
+部署测试验证默认只渲染一个进程、Edge 环境和控制配置完整注入，并验证 `standalone` 明确恢复两个进程。API Server 配置测试拒绝缺少 `edge_control` 的内嵌模式及携带该字段的分进程模式。完整验收还应从公开 SDK 经 Edge 创建 Capsule、访问 RRT 并删除，且核对 supervisor 状态中不存在独立 Edge 进程。
 
 2026-09-21 本地验证覆盖：部署配置 24 项、API Server 30 项、Gateway 107 项、Master/Node Manager 169 项，以及相关 crate 的严格 Clippy。另用真实 `adx-api-server` 进程加载内嵌配置，确认同一 PID 同时提供 API 回环监听和 Edge 健康监听，并经 SIGTERM 完成排空退出。该进程验收故意不启动 Master、sandboxd 或 RRT，因此只证明装配、监听与关闭契约；不能代替公开 SDK 创建—访问—删除 E2E。

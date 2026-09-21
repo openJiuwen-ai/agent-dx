@@ -30,7 +30,7 @@ def check(label, running, reserved, pending):
     while True:
         try:
             with urllib.request.urlopen('http://127.0.0.1:17090/metrics',timeout=2) as r:master=r.read().decode()
-            assert sum(values(master,'adx_master_instances',state='Running'))==running
+            assert sum(values(master,'adx_master_capsules',state='Running'))==running
             assert sum(values(master,'adx_master_node_reserved_cpu_millis'))==reserved
             assert sum(values(master,'adx_master_queued_requests'))==pending
             snapshots={'master':master}

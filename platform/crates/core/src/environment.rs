@@ -1,4 +1,4 @@
-//! Deployment-owned runtime root and bootstrap, persisted with each Instance.
+//! Deployment-owned runtime root and bootstrap, persisted with each Capsule.
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -8,7 +8,7 @@ use std::{
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct RuntimeEnvironment {
+pub struct EnvironmentSpec {
     pub rootfs: Rootfs,
     pub bootstrap: Bootstrap,
     #[serde(default)]
@@ -17,7 +17,7 @@ pub struct RuntimeEnvironment {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Rootfs {
-    pub runtime: String,
+    pub runtime_class: String,
     pub r#type: String,
     #[serde(default)]
     pub path: String,
@@ -51,7 +51,7 @@ fn absolute(value: &str) -> bool {
             .components()
             .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
 }
-impl RuntimeEnvironment {
+impl EnvironmentSpec {
     pub fn validate(&self) -> Result<()> {
         let rootfs_source = match self.rootfs.r#type.as_str() {
             "local" => absolute(&self.rootfs.path) && self.rootfs.image.is_empty(),
@@ -71,7 +71,7 @@ impl RuntimeEnvironment {
         if !rootfs_source
             || !bootstrap_source
             || !matching_sources
-            || self.rootfs.runtime.trim().is_empty()
+            || self.rootfs.runtime_class.trim().is_empty()
             || !absolute(&self.bootstrap.target)
             || !absolute(&self.bootstrap.image_process_config)
             || self

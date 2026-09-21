@@ -1,7 +1,7 @@
-use adx_core::{Assignment, Error, InstanceRecord, InstanceSpec, InstanceState, Resources, Result};
+use adx_core::{Assignment, CapsuleRecord, CapsuleSpec, CapsuleState, Error, Resources, Result};
 use adx_node_manager::{
     checkpoint::{CheckpointCooperation, LocalCheckpointStore, PauseRequest, ResumeRequest},
-    Durability, NodeManager, Readiness, Routes, RuntimeBackend, StateSink,
+    Durability, NodeManager, Readiness, Routes, RuntimeDriver, StateSink,
 };
 use async_trait::async_trait;
 use std::{
@@ -32,7 +32,7 @@ impl Backend {
     }
 }
 #[async_trait]
-impl RuntimeBackend for Backend {
+impl RuntimeDriver for Backend {
     async fn inventory(&self) -> Result<Vec<adx_node_manager::RuntimeObservation>> {
         Ok(self
             .running
@@ -40,7 +40,7 @@ impl RuntimeBackend for Backend {
             .unwrap()
             .iter()
             .map(|id| adx_node_manager::RuntimeObservation {
-                instance_id: "instance".into(),
+                capsule_id: "capsule".into(),
                 tenant_id: "tenant".into(),
                 generation: 1,
                 runtime_id: id.clone(),
@@ -50,7 +50,7 @@ impl RuntimeBackend for Backend {
     }
     async fn start(
         &self,
-        _: &InstanceSpec,
+        _: &CapsuleSpec,
         id: &str,
         _: u64,
         _: &[adx_core::scheduling::DeviceAllocation],
@@ -86,7 +86,7 @@ impl RuntimeBackend for Backend {
     }
     async fn restore_from(
         &self,
-        spec: &InstanceSpec,
+        spec: &CapsuleSpec,
         id: &str,
         generation: u64,
         devices: &[adx_core::scheduling::DeviceAllocation],
@@ -94,8 +94,8 @@ impl RuntimeBackend for Backend {
         origin: Option<&adx_core::runtime::RuntimeIdentity>,
     ) -> Result<std::net::IpAddr> {
         if let Some(origin) = origin {
-            assert_eq!(origin.instance_id, "instance");
-            if spec.id == origin.instance_id {
+            assert_eq!(origin.capsule_id, "capsule");
+            if spec.id == origin.capsule_id {
                 assert!(generation > origin.ownership_generation);
             } else {
                 assert_eq!(spec.id, "clone");
@@ -105,7 +105,7 @@ impl RuntimeBackend for Backend {
     }
     async fn restore(
         &self,
-        _: &InstanceSpec,
+        _: &CapsuleSpec,
         id: &str,
         _: u64,
         _: &[adx_core::scheduling::DeviceAllocation],
@@ -125,14 +125,14 @@ impl RuntimeBackend for Backend {
 }
 #[async_trait]
 impl CheckpointCooperation for Backend {
-    async fn prepare(&self, _: &InstanceRecord, _: &str) -> Result<()> {
+    async fn prepare(&self, _: &CapsuleRecord, _: &str) -> Result<()> {
         self.event("prepare");
         if *self.fail_prepare.lock().unwrap() {
             return Err(Error::Unavailable("prepare reply lost".into()));
         }
         Ok(())
     }
-    async fn abort_unstarted(&self, _: &InstanceRecord, _: &str) -> Result<()> {
+    async fn abort_unstarted(&self, _: &CapsuleRecord, _: &str) -> Result<()> {
         self.event("abort");
         if *self.fail_abort.lock().unwrap() {
             return Err(Error::Unavailable("abort unavailable".into()));
@@ -142,35 +142,35 @@ impl CheckpointCooperation for Backend {
 }
 #[async_trait]
 impl Readiness for Backend {
-    async fn activity(&self, _: &InstanceRecord) -> Result<(u64, u64)> {
+    async fn activity(&self, _: &CapsuleRecord) -> Result<(u64, u64)> {
         self.activity
             .lock()
             .unwrap()
             .ok_or_else(|| Error::Unavailable("activity unknown".into()))
     }
-    async fn wait_ready(&self, _: &InstanceRecord) -> Result<()> {
+    async fn wait_ready(&self, _: &CapsuleRecord) -> Result<()> {
         self.event("ready");
         Ok(())
     }
 }
 #[async_trait]
 impl Routes for Backend {
-    async fn activity(&self, _: &InstanceRecord) -> Result<(String, u64, u64)> {
+    async fn activity(&self, _: &CapsuleRecord) -> Result<(String, u64, u64)> {
         Ok(("proxy".into(), 1, 0))
     }
 
-    async fn activate(&self, _: &InstanceRecord) -> Result<()> {
+    async fn activate(&self, _: &CapsuleRecord) -> Result<()> {
         self.event("activate");
         Ok(())
     }
-    async fn retire(&self, _: &InstanceRecord) -> Result<()> {
+    async fn retire(&self, _: &CapsuleRecord) -> Result<()> {
         self.event("retire");
         Ok(())
     }
 }
 #[async_trait]
 impl StateSink for Backend {
-    async fn commit(&self, r: &InstanceRecord) -> Result<Durability> {
+    async fn commit(&self, r: &CapsuleRecord) -> Result<Durability> {
         self.event(&format!("commit:{:?}", r.state));
         if *self.unavailable_commit.lock().unwrap() {
             Err(Error::Unavailable("Master unavailable".into()))
@@ -183,7 +183,7 @@ fn fixture() -> (
     tempfile::TempDir,
     Arc<Backend>,
     NodeManager,
-    InstanceSpec,
+    CapsuleSpec,
     Assignment,
 ) {
     let temp = tempfile::tempdir().unwrap();
@@ -209,14 +209,14 @@ fn fixture() -> (
     .unwrap();
     node.update_capacity(resources, Duration::from_secs(300))
         .unwrap();
-    let spec = InstanceSpec {
-        runtime_environment: None,
+    let spec = CapsuleSpec {
+        environment: None,
         snapshot_id: None,
         lifecycle: Default::default(),
-        id: "instance".into(),
+        id: "capsule".into(),
         tenant_id: "tenant".into(),
         image: "image".into(),
-        runtime: "firecracker".into(),
+        runtime_class: "firecracker".into(),
         resources,
         priority: 0,
         env: Default::default(),
@@ -224,7 +224,7 @@ fn fixture() -> (
         sandbox: Default::default(),
     };
     let assignment = Assignment {
-        instance_id: spec.id.clone(),
+        capsule_id: spec.id.clone(),
         node_id: "node".into(),
         shard_id: 0,
         generation: 1,
@@ -250,7 +250,7 @@ fn resume(revision: u64) -> ResumeRequest {
 #[tokio::test]
 async fn replacing_checkpoint_cleans_previous_only_after_retry_publishes() {
     let (temp, backend, node, spec, assignment) = fixture();
-    let h = node.instance(spec, assignment).unwrap();
+    let h = node.capsule(spec, assignment).unwrap();
     let created = h.create().await.unwrap();
     let paused = h.pause(pause(created.record.revision)).await.unwrap();
     let first = paused
@@ -277,7 +277,7 @@ async fn replacing_checkpoint_cleans_previous_only_after_retry_publishes() {
 #[tokio::test]
 async fn restarted_node_prunes_only_after_authoritative_reconciliation() {
     let (temp, backend, node, spec, assignment) = fixture();
-    let h = node.instance(spec, assignment).unwrap();
+    let h = node.capsule(spec, assignment).unwrap();
     let created = h.create().await.unwrap();
     let paused = h.pause(pause(created.record.revision)).await.unwrap();
     let retained = paused
@@ -319,13 +319,13 @@ async fn restarted_node_prunes_only_after_authoritative_reconciliation() {
 }
 
 #[tokio::test]
-async fn pause_resume_preserves_instance_changes_execution_and_fences_delayed_retries() {
+async fn pause_resume_preserves_capsule_changes_execution_and_fences_delayed_retries() {
     let (_temp, backend, node, spec, assignment) = fixture();
-    let h = node.instance(spec.clone(), assignment).unwrap();
+    let h = node.capsule(spec.clone(), assignment).unwrap();
     let created = h.create().await.unwrap();
     backend.events.lock().unwrap().clear();
     let paused = h.pause(pause(created.record.revision)).await.unwrap();
-    assert_eq!(paused.record.state, InstanceState::Paused);
+    assert_eq!(paused.record.state, CapsuleState::Paused);
     assert!(!paused.record.resources_held);
     assert_eq!(node.used(), Resources::default());
     assert!(
@@ -347,9 +347,9 @@ async fn pause_resume_preserves_instance_changes_execution_and_fences_delayed_re
         paused
     );
     let running = h.resume(resume(paused.record.revision)).await.unwrap();
-    assert_eq!(running.record.state, InstanceState::Running);
+    assert_eq!(running.record.state, CapsuleState::Running);
     assert_eq!(running.record.spec.id, created.record.spec.id);
-    assert_ne!(running.record.runtime_id, created.record.runtime_id);
+    assert_ne!(running.record.runtime.id, created.record.runtime.id);
     assert_eq!(node.used(), spec.resources);
     assert_eq!(
         &backend.events.lock().unwrap()[5..],
@@ -374,7 +374,7 @@ async fn pause_resume_preserves_instance_changes_execution_and_fences_delayed_re
 #[tokio::test]
 async fn unpublished_pause_is_retried_by_commit_without_repeating_checkpoint() {
     let (_temp, backend, node, spec, assignment) = fixture();
-    let h = node.instance(spec, assignment).unwrap();
+    let h = node.capsule(spec, assignment).unwrap();
     let created = h.create().await.unwrap();
     *backend.unavailable_commit.lock().unwrap() = true;
     assert!(h.pause(pause(created.record.revision)).await.is_err());
@@ -382,10 +382,10 @@ async fn unpublished_pause_is_retried_by_commit_without_repeating_checkpoint() {
         .running
         .lock()
         .unwrap()
-        .contains(&created.record.runtime_id));
+        .contains(&created.record.runtime.id));
     *backend.unavailable_commit.lock().unwrap() = false;
     let paused = h.pause(pause(created.record.revision)).await.unwrap();
-    assert_eq!(paused.record.state, InstanceState::Paused);
+    assert_eq!(paused.record.state, CapsuleState::Paused);
     assert_eq!(
         backend
             .events
@@ -401,21 +401,21 @@ async fn unpublished_pause_is_retried_by_commit_without_repeating_checkpoint() {
 #[tokio::test]
 async fn failed_restore_keeps_restore_point_and_releases_confirmed_absent_execution() {
     let (_temp, backend, node, spec, assignment) = fixture();
-    let h = node.instance(spec, assignment).unwrap();
+    let h = node.capsule(spec, assignment).unwrap();
     let created = h.create().await.unwrap();
     let paused = h.pause(pause(created.record.revision)).await.unwrap();
     *backend.fail_restore.lock().unwrap() = true;
     assert!(h.resume(resume(paused.record.revision)).await.is_err());
     let after = h.sync().await.unwrap();
-    assert_eq!(after.record.state, InstanceState::Paused);
+    assert_eq!(after.record.state, CapsuleState::Paused);
     assert_eq!(after.record.checkpoint, paused.record.checkpoint);
     assert_eq!(node.used(), Resources::default());
 }
 
 #[tokio::test]
-async fn expiry_cleans_paused_instance_but_never_deletes_resumed_execution() {
+async fn expiry_cleans_paused_capsule_but_never_deletes_resumed_execution() {
     let (_temp, backend, node, spec, assignment) = fixture();
-    let h = node.instance(spec, assignment).unwrap();
+    let h = node.capsule(spec, assignment).unwrap();
     let created = h.create().await.unwrap();
     let paused = h.pause(pause(created.record.revision)).await.unwrap();
     let cp = paused.record.checkpoint.clone().unwrap();
@@ -427,10 +427,10 @@ async fn expiry_cleans_paused_instance_but_never_deletes_resumed_execution() {
         .running
         .lock()
         .unwrap()
-        .contains(&running.record.runtime_id));
+        .contains(&running.record.runtime.id));
     assert!(Path::new(&cp.artifact.location).exists());
     let r = h.sync().await.unwrap();
-    assert_eq!(r.record.state, InstanceState::Running);
+    assert_eq!(r.record.state, CapsuleState::Running);
     assert_eq!(r.record.checkpoint.as_ref().unwrap().id, cp.id);
     let mut request = pause(r.record.revision);
     request.operation_id = "pause-c".into();
@@ -438,20 +438,20 @@ async fn expiry_cleans_paused_instance_but_never_deletes_resumed_execution() {
     h.expire_checkpoint(paused.record.checkpoint.unwrap().expires_at_unix_seconds)
         .await
         .unwrap();
-    assert_eq!(h.sync().await.unwrap().record.state, InstanceState::Deleted);
+    assert_eq!(h.sync().await.unwrap().record.state, CapsuleState::Deleted);
     assert_eq!(node.used(), Resources::default());
 }
 
 #[tokio::test]
 async fn failed_prepare_and_abort_retire_route_and_keep_uncertain_capacity() {
     let (temp, backend, node, spec, assignment) = fixture();
-    let h = node.instance(spec.clone(), assignment).unwrap();
+    let h = node.capsule(spec.clone(), assignment).unwrap();
     let created = h.create().await.unwrap();
     *backend.fail_prepare.lock().unwrap() = true;
     *backend.fail_abort.lock().unwrap() = true;
     assert!(h.pause(pause(created.record.revision)).await.is_err());
     let state = h.sync().await.unwrap();
-    assert_eq!(state.record.state, InstanceState::Failed);
+    assert_eq!(state.record.state, CapsuleState::Failed);
     assert_eq!(node.used(), spec.resources);
     assert!(backend.events.lock().unwrap().iter().any(|s| s == "retire"));
     assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
@@ -459,14 +459,14 @@ async fn failed_prepare_and_abort_retire_route_and_keep_uncertain_capacity() {
 #[tokio::test]
 async fn restore_cleanup_failure_keeps_resources_and_invalidates_previous_operation() {
     let (_temp, backend, node, spec, assignment) = fixture();
-    let h = node.instance(spec.clone(), assignment).unwrap();
+    let h = node.capsule(spec.clone(), assignment).unwrap();
     let created = h.create().await.unwrap();
     let paused = h.pause(pause(created.record.revision)).await.unwrap();
     *backend.fail_restore.lock().unwrap() = true;
     *backend.fail_remove.lock().unwrap() = true;
     assert!(h.resume(resume(paused.record.revision)).await.is_err());
     let state = h.sync().await.unwrap();
-    assert_eq!(state.record.state, InstanceState::Failed);
+    assert_eq!(state.record.state, CapsuleState::Failed);
     assert_eq!(node.used(), spec.resources);
     assert!(state.record.last_operation.is_none());
     assert_eq!(
@@ -519,12 +519,12 @@ async fn failed_publication_restores_local_staging_and_reports_pause_failure() {
     .unwrap();
     node.update_capacity(spec.resources, Duration::from_secs(300))
         .unwrap();
-    let h = node.instance(spec.clone(), assignment).unwrap();
+    let h = node.capsule(spec.clone(), assignment).unwrap();
     let created = h.create().await.unwrap();
     assert!(h.pause(pause(created.record.revision)).await.is_err());
     let after = h.sync().await.unwrap();
-    assert_eq!(after.record.state, InstanceState::Running);
-    assert_ne!(after.record.runtime_id, created.record.runtime_id);
+    assert_eq!(after.record.state, CapsuleState::Running);
+    assert_ne!(after.record.runtime.id, created.record.runtime.id);
     assert_eq!(node.used(), spec.resources);
     let local = after
         .record
@@ -541,7 +541,7 @@ async fn failed_publication_restores_local_staging_and_reports_pause_failure() {
 async fn idle_deletion_resets_on_bursts_and_unknown_observations() {
     let (_temp, b, node, mut spec, assignment) = fixture();
     spec.lifecycle.idle_timeout_seconds = 10;
-    let h = node.instance(spec, assignment).unwrap();
+    let h = node.capsule(spec, assignment).unwrap();
     h.create().await.unwrap();
     *b.activity.lock().unwrap() = Some((1, 0));
     h.tick().await.unwrap();
@@ -554,10 +554,10 @@ async fn idle_deletion_resets_on_bursts_and_unknown_observations() {
     tokio::time::advance(Duration::from_secs(20)).await;
     *b.activity.lock().unwrap() = Some((3, 0));
     h.tick().await.unwrap();
-    assert_eq!(h.sync().await.unwrap().record.state, InstanceState::Running);
+    assert_eq!(h.sync().await.unwrap().record.state, CapsuleState::Running);
     tokio::time::advance(Duration::from_secs(10)).await;
     h.tick().await.unwrap();
-    assert_eq!(h.sync().await.unwrap().record.state, InstanceState::Deleted);
+    assert_eq!(h.sync().await.unwrap().record.state, CapsuleState::Deleted);
     assert_eq!(node.used(), Resources::default());
 }
 
@@ -569,16 +569,16 @@ async fn unexpected_exit_restarts_with_fresh_identity_and_bounded_backoff() {
         initial_backoff_seconds: 2,
         max_backoff_seconds: 8,
     });
-    let h = node.instance(spec, assignment).unwrap();
+    let h = node.capsule(spec, assignment).unwrap();
     let old = h.create().await.unwrap().record;
     b.running.lock().unwrap().clear();
     h.tick().await.unwrap();
-    assert_eq!(h.sync().await.unwrap().record.state, InstanceState::Failed);
+    assert_eq!(h.sync().await.unwrap().record.state, CapsuleState::Failed);
     tokio::time::advance(Duration::from_secs(2)).await;
     h.tick().await.unwrap();
     let new = h.sync().await.unwrap().record;
-    assert_eq!(new.state, InstanceState::Running);
-    assert_ne!(new.runtime_id, old.runtime_id);
+    assert_eq!(new.state, CapsuleState::Running);
+    assert_ne!(new.runtime.id, old.runtime.id);
     assert_eq!(new.restart_attempts, 1);
     b.running.lock().unwrap().clear();
     *b.fail_start.lock().unwrap() = true;
@@ -610,7 +610,7 @@ async fn unexpected_exit_restarts_with_fresh_identity_and_bounded_backoff() {
 async fn failover_restores_latest_checkpoint_without_cold_start() {
     let (_temp, backend, node, mut spec, assignment) = fixture();
     spec.sandbox.failover = true;
-    let handle = node.instance(spec, assignment).unwrap();
+    let handle = node.capsule(spec, assignment).unwrap();
     let created = handle.create().await.unwrap();
     let paused = handle.pause(pause(created.record.revision)).await.unwrap();
     let running = handle.resume(resume(paused.record.revision)).await.unwrap();
@@ -631,8 +631,8 @@ async fn failover_restores_latest_checkpoint_without_cold_start() {
     backend.running.lock().unwrap().clear();
     handle.tick().await.unwrap();
     let recovered = handle.sync().await.unwrap().record;
-    assert_eq!(recovered.state, InstanceState::Running);
-    assert_ne!(recovered.runtime_id, running.record.runtime_id);
+    assert_eq!(recovered.state, CapsuleState::Running);
+    assert_ne!(recovered.runtime.id, running.record.runtime.id);
     assert_eq!(recovered.restart_attempts, running.record.restart_attempts);
     let events = backend.events.lock().unwrap();
     assert_eq!(
@@ -649,12 +649,12 @@ async fn failover_restores_latest_checkpoint_without_cold_start() {
 async fn failover_without_checkpoint_fails_without_cold_start() {
     let (_temp, backend, node, mut spec, assignment) = fixture();
     spec.sandbox.failover = true;
-    let handle = node.instance(spec, assignment).unwrap();
+    let handle = node.capsule(spec, assignment).unwrap();
     handle.create().await.unwrap();
     backend.running.lock().unwrap().clear();
     assert!(handle.tick().await.is_err());
     let failed = handle.sync().await.unwrap().record;
-    assert_eq!(failed.state, InstanceState::Failed);
+    assert_eq!(failed.state, CapsuleState::Failed);
     assert!(!failed.restart_pending);
     assert_eq!(
         backend
@@ -671,7 +671,7 @@ async fn failover_without_checkpoint_fails_without_cold_start() {
 #[tokio::test]
 async fn reload_replaces_runtime_from_checkpoint_and_replays_result() {
     let (_temp, backend, node, spec, assignment) = fixture();
-    let handle = node.instance(spec, assignment).unwrap();
+    let handle = node.capsule(spec, assignment).unwrap();
     let created = handle.create().await.unwrap();
     let paused = handle.pause(pause(created.record.revision)).await.unwrap();
     let running = handle.resume(resume(paused.record.revision)).await.unwrap();
@@ -686,8 +686,8 @@ async fn reload_replaces_runtime_from_checkpoint_and_replays_result() {
         .reload("reload-a".into(), running.record.revision)
         .await
         .unwrap();
-    assert_eq!(reloaded.record.state, InstanceState::Running);
-    assert_ne!(reloaded.record.runtime_id, running.record.runtime_id);
+    assert_eq!(reloaded.record.state, CapsuleState::Running);
+    assert_ne!(reloaded.record.runtime.id, running.record.runtime.id);
     assert_eq!(
         reloaded.record.restart_attempts,
         running.record.restart_attempts
@@ -717,17 +717,17 @@ async fn reload_replaces_runtime_from_checkpoint_and_replays_result() {
 async fn optional_runtime_health_respects_failure_tolerance() {
     let (_temp, b, node, spec, assignment) = fixture();
     let node = node.with_health_check(Some(2)).unwrap();
-    let h = node.instance(spec, assignment).unwrap();
+    let h = node.capsule(spec, assignment).unwrap();
     h.create().await.unwrap();
     h.tick().await.unwrap();
-    assert_eq!(h.sync().await.unwrap().record.state, InstanceState::Running);
+    assert_eq!(h.sync().await.unwrap().record.state, CapsuleState::Running);
     *b.activity.lock().unwrap() = Some((1, 0));
     h.tick().await.unwrap(); // healthy resets consecutive failures
     *b.activity.lock().unwrap() = None;
     h.tick().await.unwrap();
-    assert_eq!(h.sync().await.unwrap().record.state, InstanceState::Running);
+    assert_eq!(h.sync().await.unwrap().record.state, CapsuleState::Running);
     h.tick().await.unwrap();
-    assert_eq!(h.sync().await.unwrap().record.state, InstanceState::Failed);
+    assert_eq!(h.sync().await.unwrap().record.state, CapsuleState::Failed);
     assert!(b.running.lock().unwrap().is_empty());
 }
 
@@ -735,10 +735,10 @@ async fn optional_runtime_health_respects_failure_tolerance() {
 async fn pause_confirms_cleanup_when_checkpoint_reply_precedes_source_exit() {
     let (_temp, backend, node, spec, assignment) = fixture();
     *backend.checkpoint_leaves_running.lock().unwrap() = true;
-    let h = node.instance(spec, assignment).unwrap();
+    let h = node.capsule(spec, assignment).unwrap();
     let created = h.create().await.unwrap();
     let paused = h.pause(pause(created.record.revision)).await.unwrap();
-    assert_eq!(paused.record.state, InstanceState::Paused);
+    assert_eq!(paused.record.state, CapsuleState::Paused);
     assert!(!paused.record.resources_held);
     assert!(backend.running.lock().unwrap().is_empty());
     let events = backend.events.lock().unwrap();
@@ -750,7 +750,7 @@ async fn pause_confirms_cleanup_when_checkpoint_reply_precedes_source_exit() {
 #[tokio::test]
 async fn authoritative_paused_record_with_missing_local_artifact_becomes_failed() {
     let (temp, backend, node, spec, assignment) = fixture();
-    let handle = node.instance(spec.clone(), assignment.clone()).unwrap();
+    let handle = node.capsule(spec.clone(), assignment.clone()).unwrap();
     let running = handle.create().await.unwrap();
     let paused = handle.pause(pause(running.record.revision)).await.unwrap();
     std::fs::remove_dir_all(&paused.record.checkpoint.as_ref().unwrap().artifact.location).unwrap();
@@ -768,12 +768,12 @@ async fn authoritative_paused_record_with_missing_local_artifact_becomes_failed(
     .unwrap();
     restarted.reconcile(vec![paused.record]).await.unwrap();
     let result = restarted
-        .instance(spec, assignment)
+        .capsule(spec, assignment)
         .unwrap()
         .sync()
         .await
         .unwrap();
-    assert_eq!(result.record.state, InstanceState::Failed);
+    assert_eq!(result.record.state, CapsuleState::Failed);
     assert!(!result.record.resources_held);
     assert!(backend.running.lock().unwrap().is_empty());
 }
@@ -792,7 +792,7 @@ async fn reconciliation_preserves_ready_and_deleting_reusable_snapshots() {
         vec![],
         spec,
         "node".into(),
-        "instance-1".into(),
+        "capsule-1".into(),
         artifact,
     )
     .unwrap();
@@ -806,7 +806,7 @@ async fn reconciliation_preserves_ready_and_deleting_reusable_snapshots() {
         .acquire(
             "tenant",
             Reference::Restore {
-                instance_id: "clone".into(),
+                capsule_id: "clone".into(),
             },
         )
         .unwrap();
@@ -844,13 +844,13 @@ async fn snapshot_collection_requires_closed_references_and_is_retryable() {
         vec![],
         spec,
         "node".into(),
-        "instance-1".into(),
+        "capsule-1".into(),
         store.publish(&path).await.unwrap(),
     )
     .unwrap();
     assert!(node.collect_snapshot(&snapshot).await.is_err());
     let reference = Reference::Restore {
-        instance_id: "clone".into(),
+        capsule_id: "clone".into(),
     };
     snapshot.acquire("tenant", reference.clone()).unwrap();
     snapshot.delete("tenant").unwrap();
@@ -894,7 +894,7 @@ impl adx_node_manager::checkpoint::SnapshotCatalog for Backend {
 async fn reusable_snapshot_survives_source_deletion_and_retries_without_checkpointing() {
     use adx_node_manager::checkpoint::SnapshotRequest;
     let (_temp, backend, node, spec, assignment) = fixture();
-    let h = node.instance(spec, assignment).unwrap();
+    let h = node.capsule(spec, assignment).unwrap();
     let created = h.create().await.unwrap();
     let request = SnapshotRequest {
         operation_id: "snapshot-a".into(),
@@ -903,11 +903,11 @@ async fn reusable_snapshot_survives_source_deletion_and_retries_without_checkpoi
         timeout_seconds: 60,
     };
     let saved = h.snapshot(request.clone()).await.unwrap();
-    assert_eq!(saved.instance.record.state, InstanceState::Running);
-    assert_eq!(saved.instance.durability, Durability::Published);
+    assert_eq!(saved.capsule.record.state, CapsuleState::Running);
+    assert_eq!(saved.capsule.durability, Durability::Published);
     assert_ne!(
         saved.snapshot.artifact,
-        saved.instance.record.checkpoint.as_ref().unwrap().artifact
+        saved.capsule.record.checkpoint.as_ref().unwrap().artifact
     );
     let replay = h.snapshot(request.clone()).await.unwrap();
     assert_eq!(saved.snapshot, replay.snapshot);
@@ -936,7 +936,7 @@ async fn reusable_snapshot_survives_source_deletion_and_retries_without_checkpoi
 async fn snapshot_publication_failure_attempts_to_resume_source() {
     use adx_node_manager::checkpoint::SnapshotRequest;
     let (_temp, backend, node, spec, assignment) = fixture();
-    let h = node.instance(spec, assignment).unwrap();
+    let h = node.capsule(spec, assignment).unwrap();
     let created = h.create().await.unwrap();
     *backend.fail_snapshot_publish.lock().unwrap() = true;
     assert!(h
@@ -948,7 +948,7 @@ async fn snapshot_publication_failure_attempts_to_resume_source() {
         })
         .await
         .is_err());
-    assert_eq!(h.sync().await.unwrap().record.state, InstanceState::Running);
+    assert_eq!(h.sync().await.unwrap().record.state, CapsuleState::Running);
     assert_eq!(backend.running.lock().unwrap().len(), 1);
 }
 
@@ -956,7 +956,7 @@ async fn snapshot_publication_failure_attempts_to_resume_source() {
 async fn snapshot_checkpoint_commit_failure_still_attempts_source_resume() {
     use adx_node_manager::checkpoint::SnapshotRequest;
     let (_temp, backend, node, spec, assignment) = fixture();
-    let h = node.instance(spec, assignment).unwrap();
+    let h = node.capsule(spec, assignment).unwrap();
     let created = h.create().await.unwrap();
     *backend.unavailable_commit.lock().unwrap() = true;
     assert!(h
@@ -975,7 +975,7 @@ async fn snapshot_checkpoint_commit_failure_still_attempts_source_resume() {
 async fn clone_owns_its_checkpoint_after_source_and_snapshot_are_deleted() {
     use adx_core::snapshots::Reference;
     let (_temp, backend, node, spec, assignment) = fixture();
-    let source = node.instance(spec.clone(), assignment.clone()).unwrap();
+    let source = node.capsule(spec.clone(), assignment.clone()).unwrap();
     let running = source.create().await.unwrap();
     let saved = source
         .snapshot(adx_node_manager::checkpoint::SnapshotRequest {
@@ -992,7 +992,7 @@ async fn clone_owns_its_checkpoint_after_source_and_snapshot_are_deleted() {
         .acquire(
             "tenant",
             Reference::Restore {
-                instance_id: "clone".into(),
+                capsule_id: "clone".into(),
             },
         )
         .unwrap();
@@ -1000,8 +1000,8 @@ async fn clone_owns_its_checkpoint_after_source_and_snapshot_are_deleted() {
     spec.id = "clone".into();
     spec.snapshot_id = Some(snapshot.id.clone());
     let mut assignment = assignment;
-    assignment.instance_id = spec.id.clone();
-    let clone = node.instance(spec, assignment).unwrap();
+    assignment.capsule_id = spec.id.clone();
+    let clone = node.capsule(spec, assignment).unwrap();
     // An assignment without its source must never silently boot a clean image.
     let starts = backend
         .events
@@ -1015,7 +1015,7 @@ async fn clone_owns_its_checkpoint_after_source_and_snapshot_are_deleted() {
     assert_eq!(created.record.spec.id, "clone");
     let cp = created.record.checkpoint.as_ref().unwrap();
     assert_ne!(cp.artifact, snapshot.artifact);
-    assert_eq!(cp.origin.as_ref().unwrap().instance_id, "instance");
+    assert_eq!(cp.origin.as_ref().unwrap().capsule_id, "capsule");
     assert_eq!(
         backend
             .events
@@ -1028,7 +1028,7 @@ async fn clone_owns_its_checkpoint_after_source_and_snapshot_are_deleted() {
     );
     snapshot
         .release(&Reference::Restore {
-            instance_id: "clone".into(),
+            capsule_id: "clone".into(),
         })
         .unwrap();
     snapshot.delete("tenant").unwrap();
@@ -1059,7 +1059,7 @@ async fn failed_snapshot_copy_publishes_failure_without_booting_an_image() {
         vec![],
         spec.clone(),
         "node".into(),
-        "instance-1".into(),
+        "capsule-1".into(),
         adx_core::CheckpointArtifact {
             storage: "local".into(),
             location: temp.path().join("missing").to_string_lossy().into(),
@@ -1069,19 +1069,19 @@ async fn failed_snapshot_copy_publishes_failure_without_booting_an_image() {
     .unwrap();
     spec.id = "clone".into();
     spec.snapshot_id = Some(snapshot.id.clone());
-    assignment.instance_id = spec.id.clone();
+    assignment.capsule_id = spec.id.clone();
     snapshot
         .acquire(
             "tenant",
             Reference::Restore {
-                instance_id: spec.id.clone(),
+                capsule_id: spec.id.clone(),
             },
         )
         .unwrap();
-    let handle = node.instance(spec, assignment).unwrap();
+    let handle = node.capsule(spec, assignment).unwrap();
     assert!(handle.create_from_snapshot(snapshot).await.is_err());
     let result = handle.sync().await.unwrap();
-    assert_eq!(result.record.state, InstanceState::Failed);
+    assert_eq!(result.record.state, CapsuleState::Failed);
     assert!(!result.record.resources_held);
     assert!(!backend
         .events
@@ -1096,21 +1096,23 @@ async fn failed_snapshot_copy_publishes_failure_without_booting_an_image() {
 async fn recovery_with_unusable_checkpoint_settles_failed_without_image_start() {
     let (_temp, backend, node, spec, mut assignment) = fixture();
     assignment.generation = 2;
-    let record = InstanceRecord {
+    let record = CapsuleRecord {
         spec,
         assignment,
-        runtime_id: "instance-2".into(),
-        state: InstanceState::Paused,
+        runtime: adx_core::Runtime {
+            id: "capsule-2".into(),
+            ip: None,
+        },
+        state: CapsuleState::Paused,
         revision: 1,
         resources_held: false,
-        runtime_ip: None,
         checkpoint: Some(adx_core::RestorePoint {
             id: "recovery".into(),
-            source_runtime_id: "instance-1".into(),
+            source_runtime_id: "capsule-1".into(),
             expires_at_unix_seconds: u64::MAX,
             origin: Some(adx_core::runtime::RuntimeIdentity {
-                instance_id: "instance".into(),
-                runtime_id: "instance-1".into(),
+                capsule_id: "capsule".into(),
+                runtime_id: "capsule-1".into(),
                 ownership_generation: 1,
             }),
             artifact: adx_core::CheckpointArtifact {
@@ -1124,10 +1126,10 @@ async fn recovery_with_unusable_checkpoint_settles_failed_without_image_start() 
         restart_pending: false,
     };
     let result = node
-        .recover_instance(record.clone())
+        .recover_capsule(record.clone())
         .await
         .expect("recovery publishes a terminal failure");
-    assert_eq!(result.record.state, InstanceState::Failed);
+    assert_eq!(result.record.state, CapsuleState::Failed);
     assert!(!result.record.resources_held);
     assert_eq!(node.used(), Resources::default());
     assert!(!backend
@@ -1137,7 +1139,7 @@ async fn recovery_with_unusable_checkpoint_settles_failed_without_image_start() 
         .iter()
         .any(|e| e == "start" || e == "restore"));
     assert_eq!(
-        node.recover_instance(record).await.unwrap().record,
+        node.recover_capsule(record).await.unwrap().record,
         result.record
     );
 }
@@ -1171,21 +1173,23 @@ async fn recovery_retries_publication_without_repeating_backend_restore() {
     node.update_capacity(spec.resources, Duration::from_secs(60))
         .unwrap();
     assignment.generation = 2;
-    let seed = InstanceRecord {
+    let seed = CapsuleRecord {
         spec,
         assignment,
-        runtime_id: "instance-2".into(),
-        state: InstanceState::Paused,
+        runtime: adx_core::Runtime {
+            id: "capsule-2".into(),
+            ip: None,
+        },
+        state: CapsuleState::Paused,
         revision: 1,
         resources_held: false,
-        runtime_ip: None,
         checkpoint: Some(adx_core::RestorePoint {
             id: "recovery".into(),
-            source_runtime_id: "instance-1".into(),
+            source_runtime_id: "capsule-1".into(),
             expires_at_unix_seconds: u64::MAX,
             origin: Some(adx_core::runtime::RuntimeIdentity {
-                instance_id: "instance".into(),
-                runtime_id: "instance-1".into(),
+                capsule_id: "capsule".into(),
+                runtime_id: "capsule-1".into(),
                 ownership_generation: 1,
             }),
             artifact,
@@ -1195,14 +1199,14 @@ async fn recovery_retries_publication_without_repeating_backend_restore() {
         restart_pending: false,
     };
     *backend.unavailable_commit.lock().unwrap() = true;
-    assert!(node.recover_instance(seed.clone()).await.is_err());
+    assert!(node.recover_capsule(seed.clone()).await.is_err());
     assert_eq!(backend.running.lock().unwrap().len(), 1);
     *backend.unavailable_commit.lock().unwrap() = false;
-    let result = node.recover_instance(seed.clone()).await.unwrap();
+    let result = node.recover_capsule(seed.clone()).await.unwrap();
     assert_eq!(result.durability, Durability::Published);
-    assert_eq!(result.record.state, InstanceState::Running);
+    assert_eq!(result.record.state, CapsuleState::Running);
     assert_eq!(
-        node.recover_instance(seed).await.unwrap().record,
+        node.recover_capsule(seed).await.unwrap().record,
         result.record
     );
     let events = backend.events.lock().unwrap();

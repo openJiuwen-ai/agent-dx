@@ -14,39 +14,41 @@ impl Session {
             node.node.available = false;
             node.session.as_mut().ok_or(Error::Conflict)?.routable = false;
             let mut writes = vec![(format!("node:{id}"), encode(node)?)];
-            for (instance_id, instance) in &mut saved.instances {
-                if instance.assignment.node_id != id
-                    || instance.invalidated
-                    || instance
+            for (capsule_id, capsule) in &mut saved.capsules {
+                if capsule.assignment.node_id != id
+                    || capsule.invalidated
+                    || capsule
                         .result
                         .as_ref()
-                        .is_some_and(|r| r.state == InstanceState::Deleted)
+                        .is_some_and(|r| r.state == CapsuleState::Deleted)
                 {
                     continue;
                 }
-                let mut result = instance.result.clone().unwrap_or_else(|| InstanceRecord {
-                    spec: instance.spec.clone(),
-                    assignment: instance.assignment.clone(),
-                    runtime_id: format!("{}-{}", instance_id, instance.assignment.generation),
+                let mut result = capsule.result.clone().unwrap_or_else(|| CapsuleRecord {
+                    spec: capsule.spec.clone(),
+                    assignment: capsule.assignment.clone(),
+                    runtime: adx_core::Runtime {
+                        id: format!("{}-{}", capsule_id, capsule.assignment.generation),
+                        ip: None,
+                    },
                     revision: 0,
-                    state: InstanceState::Pending,
+                    state: CapsuleState::Pending,
                     resources_held: true,
-                    runtime_ip: None,
                     checkpoint: None,
                     last_operation: None,
                     restart_attempts: 0,
                     restart_pending: false,
                 });
-                result.state = InstanceState::Failed;
+                result.state = CapsuleState::Failed;
                 result.revision = result.revision.checked_add(1).ok_or(Error::Conflict)?;
                 result.resources_held = false;
-                result.runtime_ip = None;
+                result.runtime.ip = None;
                 result.restart_pending = false;
                 result.last_operation = None;
-                instance.result = Some(result);
-                instance.invalidated = true;
-                instance.validate()?;
-                writes.push((format!("instance:{instance_id}"), encode(instance)?));
+                capsule.result = Some(result);
+                capsule.invalidated = true;
+                capsule.validate()?;
+                writes.push((format!("capsule:{capsule_id}"), encode(capsule)?));
             }
             if writes
                 .iter()

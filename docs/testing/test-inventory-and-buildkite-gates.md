@@ -42,11 +42,11 @@ L0 只证明最核心的用户闭环。它必须使用发布包、安装后的 S
 |---|---|
 | 部署就绪 | Master 可发现、Node 注册并完成对账、容量有效、路由和本机绑定同步完成 |
 | API Key | 有效 Key 可访问；无效 Key 和跨租户访问被拒绝 |
-| 创建 Instance | 经公共 SDK 创建，sandboxd 后端真实运行，RRT 就绪，状态和路由已提交 |
-| 查询 Instance | `get/list` 返回正确租户、状态、资源和执行归属 |
+| 创建 Capsule | 经公共 SDK 创建，sandboxd 后端真实运行，RRT 就绪，状态和路由已提交 |
+| 查询 Capsule | `get/list` 返回正确租户、状态、资源和执行归属 |
 | 执行命令 | 真实经过 Edge → Node Proxy → RRT，校验 stdout、stderr 和退出码 |
 | 文件操作 | 二进制写入和读回一致，不能只验证 HTTP 状态码 |
-| 删除 Instance | Redis 终态正确、路由撤销、资源释放、sandboxd inventory 为空 |
+| 删除 Capsule | Redis 终态正确、路由撤销、资源释放、sandboxd inventory 为空 |
 | 环境清理 | 测试进程／容器、临时网络和测试凭证均无残留；清理失败使整轮失败 |
 
 当前十组驱动中的 `sdk` 提供最小创建、查询、命令、文件和删除主体；`data-plane` 独立覆盖
@@ -73,7 +73,7 @@ Standalone 在一台 Linux 主机或一台 Lima KVM VM 上，以进程方式运�
 | 单机容量 | 资源满载不超分、等待请求在释放后继续、账本和 Metrics 一致 |
 | Node Manager 重启 | 新 session 完成权威对账；已运行后端身份和 SDK 操作保持正确 |
 | 日志与可观测 | Metrics、结构化日志、滚动压缩、Collector 中断恢复、Trace 链路 |
-| supervisor stop | 删除本机 Instance 后退出；独立 sandboxd 仍可响应且 inventory 为空 |
+| supervisor stop | 删除本机 Capsule 后退出；独立 sandboxd 仍可响应且 inventory 为空 |
 | Firecracker 生命周期 | 在 KVM 主机验证暂停／恢复、可复用快照、双克隆、对象存储和残留回收 |
 
 仓库的本地 Docker 双容器驱动仍属于 Standalone 级：它能在单宿主上模拟两个逻辑节点，
@@ -88,14 +88,14 @@ SDK 客户端和两个执行节点通过真实 VM 网络通信。它重跑 L0，
 | Multi-VM 用例 | 必须断言 |
 |---|---|
 | 三 VM 部署与发现 | 唯一机器／节点身份、自动 Shard 归属、跨 VM Redis/RPC/mTLS、双方容量和路由就绪 |
-| 双 worker 放置 | 两个 worker 都实际承载 Instance；保存平台归属和 sandboxd 后端证据 |
+| 双 worker 放置 | 两个 worker 都实际承载 Capsule；保存平台归属和 sandboxd 后端证据 |
 | 容量与调度 | 两节点满载、排队、释放唤醒；Pack/Spread 配置；亲和／反亲和和节点偏好 |
 | Local-first | API Server 入口轮转、本机准入、同 ID 并发收敛、冲突规格拒绝、中心 fallback 不重复计账 |
 | 跨节点数据链路 | Edge → 对应 Node Proxy → RRT 的命令、文件和路由结果正确 |
 | worker 失联 | 心跳过期后实例失效、路由撤销、健康 worker 继续服务；返回节点先清理旧后端再开放准入 |
-| worker 进程重启 | 新 node session、实例对账、旧 session fencing，未失效 Instance 仍可查询和执行 |
+| worker 进程重启 | 新 node session、实例对账、旧 session fencing，未失效 Capsule 仍可查询和执行 |
 | 控制面重启 | Redis 权威状态恢复、API Server 内嵌 Edge 重新全量同步、旧 epoch 不能继续写入 |
-| 跨节点 checkpoint | 仅在 VM 均有 KVM 时验证共享 checkpoint、同 Instance ID 新 generation、旧节点清理 |
+| 跨节点 checkpoint | 仅在 VM 均有 KVM 时验证共享 checkpoint、同 Capsule ID 新 generation、旧节点清理 |
 | 有序停机 | 先 worker、后控制面；删除结果提交成功，三台 VM 无后端和路由残留 |
 
 三台 VM 即使位于同一台 Mac 上，也只能证明 guest 网络和进程隔离；不能作为物理宿主故障证据。
@@ -179,7 +179,7 @@ profile；完整 Multi-VM 在补齐部署器前不能标记为通过。
 | `L0-03` | 已实现 | 公共 SDK 创建和查询，真实 sandboxd/RRT 后端运行 |
 | `L0-04` | 已实现 | 命令 stdout、stderr、退出码及二进制文件往返 |
 | `L0-05` | 已实现 | 显式删除后 Redis 终态、路由、资源及 sandboxd inventory 全部清理 |
-| `L0-06` | 组件前置已实现，E2E 计划 | SDK 对断流、正常 EOF 无 final 和结构化 unknown 均以同一 Request／Instance 身份重试；原子 claim 保证唯一后端。仍需在真实代理断流下核对 SDK、Redis 和 sandboxd inventory |
+| `L0-06` | 组件前置已实现，E2E 计划 | SDK 对断流、正常 EOF 无 final 和结构化 unknown 均以同一 Request／Capsule 身份重试；原子 claim 保证唯一后端。仍需在真实代理断流下核对 SDK、Redis 和 sandboxd inventory |
 
 ### 9.2 Local Standalone
 

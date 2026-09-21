@@ -3,8 +3,8 @@ import pathlib,sys,subprocess,json,os,signal,time
 P=pathlib.Path(sys.argv[1]);INSTANCE_ID=sys.argv[2];BASE=pathlib.Path(os.environ.get('ADX_FC_BASE','/opt/adx'));B=BASE/'package/bin';E=P/'evidence'
 env={**os.environ,'REDISCLI_AUTH':(P/'secrets/redis-key').read_text().strip()}
 def catalog():return json.loads(subprocess.check_output([str(BASE/'tools/redis-cli'),'--json','HGETALL','adx:{acceptance}:control:v1'],env=env,text=True,timeout=5))
-c=catalog();key='instance:'+INSTANCE_ID
-assert key in c, 'paused Instance is absent from the authoritative catalog'
+c=catalog();key='capsule:'+INSTANCE_ID
+assert key in c, 'paused Capsule is absent from the authoritative catalog'
 records={key:json.loads(c[key])}
 assert records[key]['result']['state']=='Paused' and not records[key]['result']['resources_held']
 (E/'catalog-paused.json').write_text(json.dumps(records,indent=2))

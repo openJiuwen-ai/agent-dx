@@ -1,5 +1,5 @@
 //! Deterministic sustained scheduling workload. No runtime, RPC or hardware emulation.
-use adx_core::{Assignment, InstanceSpec, Resources};
+use adx_core::{Assignment, CapsuleSpec, Resources};
 use adx_master::{Master, Node, Placement, SchedulerConfig};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -32,15 +32,15 @@ fn submit(
     tenant: usize,
     priority: i32,
     tick: usize,
-    pending: &mut BTreeMap<String, (InstanceSpec, usize, usize)>,
+    pending: &mut BTreeMap<String, (CapsuleSpec, usize, usize)>,
 ) {
     let shape = [(3, 1, 0), (1, 3, 0), (1, 1, 3), (2, 2, 0)][(*serial / DOMAINS + *serial) % 4];
-    let request = InstanceSpec {
-        runtime_environment: None,
+    let request = CapsuleSpec {
+        environment: None,
         id: format!("r{serial}"),
         tenant_id: format!("t{tenant}"),
         image: "test-image".into(),
-        runtime: "runc".into(),
+        runtime_class: "runc".into(),
         resources: Resources {
             cpu_millis: shape.0,
             memory_bytes: shape.1,
@@ -137,7 +137,7 @@ fn run(waves: usize, placement: Placement, cache: usize) -> Value {
                 rounds += 1;
                 for assignment in outcome.assignments {
                     let (request, expected_shard, queued_at) =
-                        pending.remove(&assignment.instance_id).unwrap();
+                        pending.remove(&assignment.capsule_id).unwrap();
                     assert_eq!(assignment.shard_id, expected_shard);
                     let n: usize = assignment.node_id[1..].parse().unwrap();
                     assert!(
@@ -161,7 +161,7 @@ fn run(waves: usize, placement: Placement, cache: usize) -> Value {
                     );
                     digest.update(format!(
                         "{}:{}:{}\n",
-                        assignment.instance_id, assignment.node_id, tick
+                        assignment.capsule_id, assignment.node_id, tick
                     ));
                     let duration = 1 + request.id[1..].parse::<usize>().unwrap() % 7;
                     live.insert(request.id, (assignment, r, tick + duration));
@@ -176,7 +176,7 @@ fn run(waves: usize, placement: Placement, cache: usize) -> Value {
                 pending.len()
             );
         }
-        assert!(master.snapshot().instances().is_empty());
+        assert!(master.snapshot().capsules().is_empty());
         assert!(usage.iter().all(|u| *u == Resources::default()));
         for shard in 0..DOMAINS {
             assert_eq!(master.pending(shard).unwrap(), 0);

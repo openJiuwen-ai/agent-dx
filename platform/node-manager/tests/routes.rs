@@ -1,5 +1,5 @@
 //! Real Node Manager client -> real Node Proxy gRPC handler over local UDS.
-use adx_core::{Assignment, Error, InstanceRecord, InstanceSpec, InstanceState, Resources};
+use adx_core::{Assignment, CapsuleRecord, CapsuleSpec, CapsuleState, Error, Resources};
 use adx_node_manager::{routes::UdsRoutes, Routes};
 use data_plane_gateway::node::route_control::proto as pb;
 use data_plane_gateway::{
@@ -21,12 +21,12 @@ use tokio::{net::UnixListener, sync::Semaphore};
 use tokio_stream::wrappers::UnixListenerStream;
 use tonic::{Request, Response, Status};
 
-fn record() -> InstanceRecord {
-    InstanceRecord {
+fn record() -> CapsuleRecord {
+    CapsuleRecord {
         restart_attempts: 0,
         restart_pending: false,
-        spec: InstanceSpec {
-            runtime_environment: None,
+        spec: CapsuleSpec {
+            environment: None,
             snapshot_id: None,
             lifecycle: Default::default(),
             env: Default::default(),
@@ -34,7 +34,7 @@ fn record() -> InstanceRecord {
             id: "i".into(),
             tenant_id: "t".into(),
             image: "rrt".into(),
-            runtime: "runsc".into(),
+            runtime_class: "runsc".into(),
             resources: Resources {
                 cpu_millis: 1000,
                 memory_bytes: 1 << 30,
@@ -45,16 +45,18 @@ fn record() -> InstanceRecord {
         },
         assignment: Assignment {
             devices: vec![],
-            instance_id: "i".into(),
+            capsule_id: "i".into(),
             node_id: "n".into(),
             shard_id: 0,
             generation: 42,
         },
-        runtime_id: "i-42".into(),
-        runtime_ip: Some("10.0.0.2".parse().unwrap()),
+        runtime: adx_core::Runtime {
+            id: "i-42".into(),
+            ip: Some("10.0.0.2".parse().unwrap()),
+        },
         checkpoint: None,
         last_operation: None,
-        state: InstanceState::Starting,
+        state: CapsuleState::Starting,
         revision: 1,
         resources_held: true,
     }
@@ -63,7 +65,7 @@ fn active(generation: u64, revision: u64) -> UpdateBindingRequest {
     UpdateBindingRequest {
         proxy_session_id: String::new(),
         sync_epoch: 0,
-        instance_id: "i".into(),
+        capsule_id: "i".into(),
         ownership_generation: generation,
         binding_revision: revision,
         binding: Some(Binding::Active(RuntimeTarget {
@@ -105,10 +107,10 @@ async fn start<T: NodeProxyService>(service: T) -> (Server, UdsRoutes) {
 struct Handler(Arc<BindingService>);
 #[tonic::async_trait]
 impl NodeProxyService for Handler {
-    async fn get_instance_activity(
+    async fn get_capsule_activity(
         &self,
-        _: Request<pb::GetInstanceActivityRequest>,
-    ) -> Result<Response<pb::InstanceActivityState>, Status> {
+        _: Request<pb::GetCapsuleActivityRequest>,
+    ) -> Result<Response<pb::CapsuleActivityState>, Status> {
         Err(Status::unimplemented("fixture has no activity"))
     }
 
@@ -198,10 +200,10 @@ struct Delayed {
 }
 #[tonic::async_trait]
 impl NodeProxyService for Delayed {
-    async fn get_instance_activity(
+    async fn get_capsule_activity(
         &self,
-        _: Request<pb::GetInstanceActivityRequest>,
-    ) -> Result<Response<pb::InstanceActivityState>, Status> {
+        _: Request<pb::GetCapsuleActivityRequest>,
+    ) -> Result<Response<pb::CapsuleActivityState>, Status> {
         Err(Status::unimplemented("fixture has no activity"))
     }
 

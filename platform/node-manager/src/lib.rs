@@ -1,4 +1,4 @@
-//! Node-local admission and serial Instance lifecycle ownership.
+//! Node-local admission and serial Capsule lifecycle ownership.
 
 pub mod activity;
 pub mod admin;
@@ -18,11 +18,9 @@ pub mod runtime_control;
 pub mod sandboxd;
 
 use adx_core::scheduling::{validate_device_assignment, Device, DeviceAllocation, DeviceLedger};
-use adx_core::{
-    Assignment, Error, InstanceRecord, InstanceSpec, ResourceLedger, Resources, Result,
-};
+use adx_core::{Assignment, CapsuleRecord, CapsuleSpec, Error, ResourceLedger, Resources, Result};
 use async_trait::async_trait;
-pub use controller::InstanceHandle;
+pub use controller::CapsuleHandle;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -38,13 +36,13 @@ pub enum Durability {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OperationResult {
-    pub record: InstanceRecord,
+    pub record: CapsuleRecord,
     pub durability: Durability,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeObservation {
-    pub instance_id: String,
+    pub capsule_id: String,
     pub runtime_id: String,
     pub generation: u64,
     pub tenant_id: String,
@@ -52,7 +50,7 @@ pub struct RuntimeObservation {
 }
 
 #[async_trait]
-pub trait RuntimeBackend: Send + Sync {
+pub trait RuntimeDriver: Send + Sync {
     async fn stats(&self, _runtime_id: &str) -> Result<metrics::RuntimeUsage> {
         Err(Error::Unavailable("runtime usage is unavailable".into()))
     }
@@ -71,7 +69,7 @@ pub trait RuntimeBackend: Send + Sync {
     }
     async fn restore(
         &self,
-        _spec: &InstanceSpec,
+        _spec: &CapsuleSpec,
         _runtime_id: &str,
         _generation: u64,
         _devices: &[DeviceAllocation],
@@ -81,7 +79,7 @@ pub trait RuntimeBackend: Send + Sync {
     }
     async fn restore_from(
         &self,
-        spec: &InstanceSpec,
+        spec: &CapsuleSpec,
         runtime_id: &str,
         generation: u64,
         devices: &[DeviceAllocation],
@@ -106,7 +104,7 @@ pub trait RuntimeBackend: Send + Sync {
     /// ID. Do not start a second runtime while a previous Start is uncertain.
     async fn start(
         &self,
-        spec: &InstanceSpec,
+        spec: &CapsuleSpec,
         runtime_id: &str,
         ownership_generation: u64,
         devices: &[DeviceAllocation],
@@ -130,17 +128,17 @@ pub trait RuntimeBackend: Send + Sync {
 
 #[async_trait]
 pub trait Readiness: Send + Sync {
-    async fn activity(&self, _record: &InstanceRecord) -> Result<(u64, u64)> {
+    async fn activity(&self, _record: &CapsuleRecord) -> Result<(u64, u64)> {
         Err(Error::Unavailable("runtime activity is unavailable".into()))
     }
     /// Runtime execution and the platform runtime service must both be ready.
-    async fn wait_ready(&self, record: &InstanceRecord) -> Result<()>;
+    async fn wait_ready(&self, record: &CapsuleRecord) -> Result<()>;
 }
 
 #[async_trait]
 pub trait Routes: Send + Sync {
     /// (process session, cumulative activity revision, active streams).
-    async fn activity(&self, _record: &InstanceRecord) -> Result<(String, u64, u64)> {
+    async fn activity(&self, _record: &CapsuleRecord) -> Result<(String, u64, u64)> {
         Err(Error::Unavailable("proxy activity is unavailable".into()))
     }
     async fn begin_reconcile(&self) -> Result<()> {
@@ -159,9 +157,9 @@ pub trait Routes: Send + Sync {
         ))
     }
     /// Return after the local binding is applied, not merely enqueued.
-    async fn activate(&self, record: &InstanceRecord) -> Result<()>;
+    async fn activate(&self, record: &CapsuleRecord) -> Result<()>;
     /// Close local admission and retire sessions for this assignment identity.
-    async fn retire(&self, record: &InstanceRecord) -> Result<()>;
+    async fn retire(&self, record: &CapsuleRecord) -> Result<()>;
 }
 
 #[async_trait]
@@ -169,7 +167,7 @@ pub trait StateSink: Send + Sync {
     /// Normal path: Master -> cluster store. On outage, return Journaled only
     /// after a durable local append. Reject stale assignment generations and
     /// revisions. Repeated commits of an identical record are idempotent.
-    async fn commit(&self, record: &InstanceRecord) -> Result<Durability>;
+    async fn commit(&self, record: &CapsuleRecord) -> Result<Durability>;
 }
 
 pub(crate) struct Admission {
@@ -182,7 +180,7 @@ pub(crate) struct Admission {
 }
 
 impl Admission {
-    fn reserve(&mut self, id: &str, spec: &InstanceSpec, assignment: &Assignment) -> Result<()> {
+    fn reserve(&mut self, id: &str, spec: &CapsuleSpec, assignment: &Assignment) -> Result<()> {
         if self.maintenance
             || self.pressure
             || self.valid_until.is_none_or(|until| Instant::now() >= until)
@@ -213,7 +211,7 @@ impl Admission {
 }
 
 pub(crate) struct Services {
-    runtime: Arc<dyn RuntimeBackend>,
+    runtime: Arc<dyn RuntimeDriver>,
     readiness: Arc<dyn Readiness>,
     routes: Arc<dyn Routes>,
     sink: Arc<dyn StateSink>,
@@ -232,13 +230,13 @@ pub struct NodeManager {
     lifecycle_ready: tokio::sync::RwLock<bool>,
     retired_generations: Mutex<BTreeMap<String, u64>>,
     services: Arc<Services>,
-    instances: Mutex<BTreeMap<String, (InstanceSpec, Assignment, InstanceHandle)>>,
+    capsules: Mutex<BTreeMap<String, (CapsuleSpec, Assignment, CapsuleHandle)>>,
 }
 
 impl NodeManager {
     pub fn new(
         node_id: String,
-        runtime: Arc<dyn RuntimeBackend>,
+        runtime: Arc<dyn RuntimeDriver>,
         readiness: Arc<dyn Readiness>,
         routes: Arc<dyn Routes>,
         sink: Arc<dyn StateSink>,
@@ -268,7 +266,7 @@ impl NodeManager {
                 metrics: metrics::Metrics::default(),
                 health_failure_threshold: None,
             }),
-            instances: Mutex::default(),
+            capsules: Mutex::default(),
         }
     }
 
@@ -353,7 +351,7 @@ impl NodeManager {
         Ok(())
     }
 
-    /// Configure before obtaining any Instance handles.
+    /// Configure before obtaining any Capsule handles.
     pub fn with_operation_timeout(mut self, duration: Duration) -> Result<Self> {
         if duration.is_zero() {
             return Err(Error::Invalid("operation timeout must be positive".into()));
@@ -405,14 +403,14 @@ impl NodeManager {
             .used()
     }
 
-    pub fn instance(&self, spec: InstanceSpec, assignment: Assignment) -> Result<InstanceHandle> {
+    pub fn capsule(&self, spec: CapsuleSpec, assignment: Assignment) -> Result<CapsuleHandle> {
         if self.is_draining() {
             return Err(Error::Unavailable("node is draining".into()));
         }
         spec.validate()?;
         validate_device_assignment(&spec.scheduling.devices, &assignment.devices)?;
         if assignment.node_id != self.node_id
-            || assignment.instance_id != spec.id
+            || assignment.capsule_id != spec.id
             || assignment.generation == 0
         {
             return Err(Error::Conflict);
@@ -426,8 +424,8 @@ impl NodeManager {
         {
             return Err(Error::Conflict);
         }
-        let mut instances = self.instances.lock().expect("shared state lock poisoned");
-        if let Some((existing, owner, handle)) = instances.get(&spec.id) {
+        let mut capsules = self.capsules.lock().expect("shared state lock poisoned");
+        if let Some((existing, owner, handle)) = capsules.get(&spec.id) {
             return if *existing == spec && *owner == assignment {
                 Ok(handle.clone())
             } else {
@@ -442,21 +440,21 @@ impl NodeManager {
             self.services.clone(),
             held,
         );
-        instances.insert(spec.id.clone(), (spec, assignment, handle.clone()));
+        capsules.insert(spec.id.clone(), (spec, assignment, handle.clone()));
         Ok(handle)
     }
 }
 
 impl NodeManager {
-    /// Best effort across independent instances; each expiration is serialized
-    /// with that instance's accepted lifecycle operations.
+    /// Best effort across independent capsules; each expiration is serialized
+    /// with that capsule's accepted lifecycle operations.
     pub async fn expire_checkpoints(&self) -> Result<()> {
         let gate = self.lifecycle_ready.read().await;
         if !*gate || self.is_draining() {
             return Ok(());
         }
         let handles: Vec<_> = self
-            .instances
+            .capsules
             .lock()
             .expect("shared state lock poisoned")
             .values()
@@ -474,15 +472,15 @@ impl NodeManager {
 }
 
 impl NodeManager {
-    /// Each check enters the Instance's serial controller. Bound fan-out so a
+    /// Each check enters the Capsule's serial controller. Bound fan-out so a
     /// slow backend cannot create an unbounded number of node monitoring tasks.
-    pub async fn monitor_instances(&self) -> Result<()> {
+    pub async fn monitor_capsules(&self) -> Result<()> {
         let gate = self.lifecycle_ready.read().await;
         if !*gate || self.is_draining() {
             return Ok(());
         }
         let handles: Vec<_> = self
-            .instances
+            .capsules
             .lock()
             .expect("shared state lock poisoned")
             .values()

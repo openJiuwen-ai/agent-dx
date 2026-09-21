@@ -9,18 +9,18 @@ pub struct LocalReservation {
     pub devices: Vec<DeviceAllocation>,
 }
 pub(crate) struct LocalHold {
-    pub spec: InstanceSpec,
+    pub spec: CapsuleSpec,
     pub token: String,
     pub devices: Vec<DeviceAllocation>,
 }
 impl NodeManager {
-    pub fn reserve_local(&self, spec: &InstanceSpec) -> Result<LocalReservation> {
+    pub fn reserve_local(&self, spec: &CapsuleSpec) -> Result<LocalReservation> {
         spec.validate()?;
         if self.is_draining() {
             return Err(Error::Unavailable("node draining".into()));
         }
-        let instances = self.instances.lock().expect("shared state lock poisoned");
-        if let Some((old, assignment, _)) = instances.get(&spec.id) {
+        let capsules = self.capsules.lock().expect("shared state lock poisoned");
+        if let Some((old, assignment, _)) = capsules.get(&spec.id) {
             if old != spec {
                 return Err(Error::Conflict);
             }
@@ -50,7 +50,7 @@ impl NodeManager {
             &token,
             spec,
             &Assignment {
-                instance_id: spec.id.clone(),
+                capsule_id: spec.id.clone(),
                 node_id: self.node_id.clone(),
                 shard_id: 0,
                 generation: 0,
@@ -85,7 +85,7 @@ impl NodeManager {
         }
         Ok(())
     }
-    pub(crate) fn adopt_local(&self, spec: &InstanceSpec, assignment: &Assignment) -> Result<bool> {
+    pub(crate) fn adopt_local(&self, spec: &CapsuleSpec, assignment: &Assignment) -> Result<bool> {
         let mut holds = self.local_holds.lock().expect("shared state lock poisoned");
         let Some(hold) = holds.get(&spec.id) else {
             return Ok(false);

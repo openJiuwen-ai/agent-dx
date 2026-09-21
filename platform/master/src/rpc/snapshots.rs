@@ -13,10 +13,10 @@ impl MasterRpc {
             let snapshots = state.session.retained_snapshots().await?;
             for snapshot in &snapshots {
                 for reference in &snapshot.references {
-                    if let adx_core::snapshots::Reference::Restore { instance_id } = reference {
-                        if let Some(instance) = state.instances.get(instance_id) {
-                            if instance.spec.snapshot_id.as_deref() == Some(snapshot.id.as_str())
-                                && instance.result.as_ref().is_some_and(|record| {
+                    if let adx_core::snapshots::Reference::Restore { capsule_id } = reference {
+                        if let Some(capsule) = state.capsules.get(capsule_id) {
+                            if capsule.spec.snapshot_id.as_deref() == Some(snapshot.id.as_str())
+                                && capsule.result.as_ref().is_some_and(|record| {
                                     record
                                         .checkpoint
                                         .as_ref()
@@ -24,7 +24,7 @@ impl MasterRpc {
                                         || (!record.resources_held
                                             && matches!(
                                                 record.state,
-                                                InstanceState::Failed | InstanceState::Deleted
+                                                CapsuleState::Failed | CapsuleState::Deleted
                                             ))
                                 })
                             {
@@ -44,7 +44,7 @@ impl MasterRpc {
                     continue;
                 }
                 // Refuse corrupted/aliased ownership instead of deleting another
-                // snapshot or Instance recovery point's bytes.
+                // snapshot or Capsule recovery point's bytes.
                 let same = |a: &adx_core::CheckpointArtifact| {
                     a.storage == snapshot.artifact.storage
                         && a.location == snapshot.artifact.location
@@ -52,7 +52,7 @@ impl MasterRpc {
                 if snapshots
                     .iter()
                     .any(|s| s.id != snapshot.id && same(&s.artifact))
-                    || state.instances.values().any(|i| {
+                    || state.capsules.values().any(|i| {
                         i.result
                             .as_ref()
                             .and_then(|r| r.checkpoint.as_ref())
@@ -167,7 +167,7 @@ impl pb::snapshot_service_server::SnapshotService for MasterRpc {
                         "source node session is not ready",
                     ));
                 }
-                let source = state.instances.get(&snapshot.template.id).ok_or_else(|| {
+                let source = state.capsules.get(&snapshot.template.id).ok_or_else(|| {
                     Status::failed_precondition("snapshot source is not assigned")
                 })?;
                 if source.assignment.node_id != node_id || source.spec != snapshot.template {
@@ -176,7 +176,7 @@ impl pb::snapshot_service_server::SnapshotService for MasterRpc {
                     ));
                 }
                 // Retry an already accepted immutable publication without requiring that
-                // its source Instance still retain the original recovery point.
+                // its source Capsule still retain the original recovery point.
                 match state.session.get_snapshot(&snapshot.id).await {
                     Ok(existing)
                         if existing.same_content(&snapshot)

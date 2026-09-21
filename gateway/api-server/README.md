@@ -1,8 +1,8 @@
 # ADX API Server
 
-Rust public management HTTP service, binary `adx-api-server`, in the root Cargo workspace. It owns API Key validation/cache, HTTP validation and compatibility responses, Instance ownership caching, immutable-target retries, snapshot/key endpoints and Agent route forwarding. Lifecycle state and scheduling stay in Node Manager and Master.
+Rust public management HTTP service, binary `adx-api-server`, in the root Cargo workspace. It owns API Key validation/cache, HTTP validation and compatibility responses, Capsule ownership caching, immutable-target retries, snapshot/key endpoints and Agent route forwarding. Lifecycle state and scheduling stay in Node Manager and Master.
 
-Requests are converted directly to the generated Instance RPC types. There is no Go adapter, function payload, generic Signal dispatch or legacy protobuf dependency. Public Sandbox paths and base64 JSON response envelopes remain compatible with the Sandbox SDK. Existing `functionProxyId` in a resume response is a public compatibility field containing the node ID.
+Requests are converted directly to the generated Capsule RPC types. There is no Go adapter, function payload, generic Signal dispatch or legacy protobuf dependency. Public Sandbox paths and base64 JSON response envelopes remain compatible with the Sandbox SDK. Existing `functionProxyId` in a resume response is a public compatibility field containing the node ID.
 
 ## Modules
 

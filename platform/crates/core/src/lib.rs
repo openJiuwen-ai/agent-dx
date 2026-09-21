@@ -1,4 +1,4 @@
-//! Instance and resource contracts shared by the control plane.
+//! Capsule, runtime, and resource contracts shared by the control plane.
 
 pub mod checkpoint;
 pub mod environment;
@@ -70,9 +70,9 @@ impl Resources {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct InstanceSpec {
+pub struct CapsuleSpec {
     #[serde(default)]
-    pub runtime_environment: Option<environment::RuntimeEnvironment>,
+    pub environment: Option<environment::EnvironmentSpec>,
     #[serde(default)]
     pub snapshot_id: Option<String>,
     #[serde(default)]
@@ -82,7 +82,7 @@ pub struct InstanceSpec {
     pub id: String,
     pub tenant_id: String,
     pub image: String,
-    pub runtime: String,
+    pub runtime_class: String,
     pub resources: Resources,
     pub priority: i32,
     #[serde(default)]
@@ -91,18 +91,18 @@ pub struct InstanceSpec {
     pub sandbox: sandbox::SandboxOptions,
 }
 
-impl InstanceSpec {
+impl CapsuleSpec {
     pub fn validate(&self) -> Result<()> {
         for (name, value) in [
             ("id", &self.id),
             ("tenant", &self.tenant_id),
-            ("runtime", &self.runtime),
+            ("runtime", &self.runtime_class),
         ] {
             if value.trim().is_empty() {
                 return Err(Error::Invalid(format!("{name} is required")));
             }
         }
-        if let Some(environment) = &self.runtime_environment {
+        if let Some(environment) = &self.environment {
             environment.validate()?;
         } else if self.image.trim().is_empty() && self.sandbox.rootfs.is_none() {
             return Err(Error::Invalid(
@@ -183,7 +183,7 @@ impl ResourceLedger {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum InstanceState {
+pub enum CapsuleState {
     Pending,
     Starting,
     Running,
@@ -208,11 +208,11 @@ pub enum Event {
     Fail,
 }
 
-impl InstanceState {
+impl CapsuleState {
     /// Pure transition rules; only the node controller applies these events.
     pub fn apply(self, event: Event) -> Result<Self> {
+        use CapsuleState::*;
         use Event::*;
-        use InstanceState::*;
         match (self, event) {
             (Pending | Failed, Start) => Ok(Starting),
             (Starting | Resuming, Ready) => Ok(Running),
@@ -233,7 +233,7 @@ impl InstanceState {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Assignment {
-    pub instance_id: String,
+    pub capsule_id: String,
     pub node_id: String,
     #[serde(alias = "domain_id")]
     pub shard_id: usize,
@@ -242,20 +242,26 @@ pub struct Assignment {
     pub devices: Vec<scheduling::DeviceAllocation>,
 }
 
+/// One concrete node-local realization of a Capsule.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct InstanceRecord {
+pub struct Runtime {
+    pub id: String,
+    pub ip: Option<std::net::IpAddr>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapsuleRecord {
     #[serde(default)]
     pub restart_attempts: u32,
     #[serde(default)]
     pub restart_pending: bool,
-    pub spec: InstanceSpec,
+    pub spec: CapsuleSpec,
     pub assignment: Assignment,
-    pub state: InstanceState,
+    pub state: CapsuleState,
     pub revision: u64,
-    pub runtime_id: String,
+    pub runtime: Runtime,
     /// Failed does not imply cleanup. Keep capacity reserved while this is true.
     pub resources_held: bool,
-    pub runtime_ip: Option<std::net::IpAddr>,
     #[serde(default)]
     pub checkpoint: Option<RestorePoint>,
     #[serde(default)]
@@ -296,16 +302,16 @@ mod tests {
     #[test]
     fn lifecycle_cannot_publish_running_before_start_or_revive_deleted() {
         assert_eq!(
-            InstanceState::Pending.apply(Event::Ready),
+            CapsuleState::Pending.apply(Event::Ready),
             Err(Error::Conflict)
         );
         assert_eq!(
-            InstanceState::Deleted.apply(Event::Start),
+            CapsuleState::Deleted.apply(Event::Start),
             Err(Error::Conflict)
         );
         assert_eq!(
-            InstanceState::Starting.apply(Event::Ready),
-            Ok(InstanceState::Running)
+            CapsuleState::Starting.apply(Event::Ready),
+            Ok(CapsuleState::Running)
         );
     }
 }

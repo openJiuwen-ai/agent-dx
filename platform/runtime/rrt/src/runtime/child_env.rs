@@ -79,7 +79,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn filters_reserved_runtime_environment() {
+    fn filters_reserved_environment() {
         let values = filtered([
             (OsString::from("PATH"), OsString::from("/bin")),
             (

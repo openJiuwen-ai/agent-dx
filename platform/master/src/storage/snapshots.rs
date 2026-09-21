@@ -1,5 +1,5 @@
 //! Compare opaque records under the current Master epoch. Snapshot mutations do
-//! not change Instance route versions or the scheduling catalog.
+//! not change Capsule route versions or the scheduling catalog.
 use super::*;
 use adx_core::snapshots::{Reference, Snapshot, SnapshotState};
 impl Session {

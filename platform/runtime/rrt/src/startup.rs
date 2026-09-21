@@ -30,7 +30,7 @@ pub(crate) struct CheckpointHandoff {
 
 /// Block on one read from a configured seed file, then refresh the process
 /// environment before any runtime configuration or Tokio worker is created.
-pub fn prepare_runtime_environment() -> io::Result<()> {
+pub fn prepare_environment() -> io::Result<()> {
     wait_for_seed_file()?;
 
     if let Some(env_file) = std::env::var_os(ENV_FILE_ENV).filter(|value| !value.is_empty()) {

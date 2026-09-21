@@ -20,7 +20,7 @@ impl CheckpointHooks for Hooks {
     }
     fn restore(&self, old: &RuntimeIdentity) -> io::Result<RuntimeIdentity> {
         Ok(RuntimeIdentity {
-            instance_id: old.instance_id.clone(),
+            capsule_id: old.capsule_id.clone(),
             runtime_id: "i-2".into(),
             ownership_generation: 2,
         })
@@ -28,7 +28,7 @@ impl CheckpointHooks for Hooks {
 }
 fn identity() -> RuntimeIdentity {
     RuntimeIdentity {
-        instance_id: "i".into(),
+        capsule_id: "i".into(),
         runtime_id: "i-1".into(),
         ownership_generation: 1,
     }
@@ -227,7 +227,7 @@ impl CheckpointHooks for CloneHooks {
     ) -> io::Result<adx_core::runtime::RuntimeRestore> {
         Ok(adx_core::runtime::RuntimeRestore {
             target: RuntimeIdentity {
-                instance_id: "clone".into(),
+                capsule_id: "clone".into(),
                 runtime_id: "clone-1".into(),
                 ownership_generation: 1,
             },
@@ -248,7 +248,7 @@ async fn clone_handoff_rebinds_identity_and_rejects_source_requests() {
         .unwrap();
     let mut changes = control.subscribe();
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        while control.status().identity.instance_id != "clone" {
+        while control.status().identity.capsule_id != "clone" {
             changes.changed().await.unwrap();
         }
     })

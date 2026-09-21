@@ -1,6 +1,6 @@
-# Instance 暂停与恢复
+# Capsule 暂停与恢复
 
-本阶段实现同节点、同 Instance ID 的暂停／恢复。Node Manager 持有实例状态机，Master 负责提交结果和更新调度／路由视图；执行后端仍为外部 sandboxd。
+本阶段实现同节点、同 Capsule ID 的暂停／恢复。Node Manager 持有实例状态机，Master 负责提交结果和更新调度／路由视图；执行后端仍为外部 sandboxd。
 
 ## 正常路径
 
@@ -20,7 +20,7 @@
 | `core::checkpoint` | 恢复点、制品引用、最近成功操作的持久化模型 |
 | `node-manager::controller::lifecycle` | 串行暂停／恢复、资源释放与重新准入、失败回滚 |
 | `CheckpointCooperation` | RRT HTTP prepare／未启动 checkpoint 的 abort |
-| `RuntimeBackend` | 能力检查、checkpoint、restore；sandboxd 适配器负责物理 ID 和 RPC |
+| `RuntimeDriver` | 能力检查、checkpoint、restore；sandboxd 适配器负责物理 ID 和 RPC |
 | `CheckpointStore` | 分配暂存、发布、物化、删除与节点本地对账清理；实现本地目录与 S3 对象存储 |
 | `master::storage` / Shard | Redis 版本校验、恢复点保存、增量资源记账 |
 | `sandbox-api/controlbackend` | HTTP 兼容格式转换、缓存归属、固定目标与版本的重试 |

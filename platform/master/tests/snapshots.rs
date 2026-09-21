@@ -1,18 +1,18 @@
 mod common;
-use adx_core::{CheckpointArtifact, InstanceSpec, Resources};
+use adx_core::{CapsuleSpec, CheckpointArtifact, Resources};
 use adx_master::snapshots::{Reference, Snapshot, SnapshotState};
 
 fn snapshot() -> Snapshot {
     Snapshot::new(
         "snapshot-1".into(),
         vec!["base".into()],
-        InstanceSpec {
-            runtime_environment: None,
+        CapsuleSpec {
+            environment: None,
             snapshot_id: None,
             id: "source".into(),
             tenant_id: "tenant".into(),
             image: "image".into(),
-            runtime: "firecracker".into(),
+            runtime_class: "firecracker".into(),
             resources: Resources {
                 cpu_millis: 100,
                 memory_bytes: 128,
@@ -62,7 +62,7 @@ async fn snapshot_deletion_waits_for_references_and_survives_master_restart() {
             &snapshot.id,
             "tenant",
             Reference::Restore {
-                instance_id: "another".into()
+                capsule_id: "another".into()
             }
         )
         .await
@@ -103,7 +103,7 @@ async fn snapshot_deletion_waits_for_references_and_survives_master_restart() {
             &snapshot.id,
             "tenant",
             Reference::Restore {
-                instance_id: "late".into()
+                capsule_id: "late".into()
             }
         )
         .await
@@ -125,7 +125,7 @@ async fn snapshot_identity_is_immutable_and_tenant_checked() {
             &first.id,
             "another",
             Reference::Restore {
-                instance_id: "a".into()
+                capsule_id: "a".into()
             }
         )
         .await

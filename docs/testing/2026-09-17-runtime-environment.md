@@ -4,7 +4,7 @@
 
 ## 行为
 
-统一配置 `runtime_environment` 下发到 API Server 与 Node Manager，并随 InstanceSpec 持久化。无自定义镜像时使用本地 EROFS；有自定义镜像时只读挂载相同环境到 `/__adx`。启动命令直接运行静态 RRT。详见 [部署配置](../deployment/runtime-environment.md)。
+统一配置 `environment` 下发到 API Server 与 Node Manager，并随 CapsuleSpec 持久化。无自定义镜像时使用本地 EROFS；有自定义镜像时只读挂载相同环境到 `/__adx`。启动命令直接运行静态 RRT。详见 [部署配置](../deployment/runtime-environment.md)。
 
 RRT 作为 PID 1 时，在创建 Tokio 与任何导出线程前 fork 服务子进程。父进程负责等待孤儿和转发信号，服务子进程保留命令与 PTY 的等待所有权；非 PID 1 保持原启动路径。
 

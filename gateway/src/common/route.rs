@@ -5,7 +5,7 @@ use std::net::IpAddr;
 use std::sync::{Arc, RwLock};
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
-pub struct InstanceStatus {
+pub struct CapsuleStatus {
     #[serde(rename = "code", default)]
     pub code: i32,
     #[serde(rename = "exitCode", default)]
@@ -23,7 +23,7 @@ pub struct RouteInfo {
     #[serde(rename = "instanceID", default)]
     pub instance_id: String,
     #[serde(rename = "instanceStatus", default)]
-    pub instance_status: InstanceStatus,
+    pub capsule_status: CapsuleStatus,
     #[serde(rename = "tenantID", default)]
     pub tenant_id: String,
     #[serde(rename = "sandboxID", default)]
@@ -291,12 +291,12 @@ pub fn is_full_route_key(key: &str) -> bool {
 mod tests {
     use super::*;
     #[test]
-    fn route_keeps_instance_status_and_endpoint() {
+    fn route_keeps_capsule_status_and_endpoint() {
         let route: RouteInfo = serde_json::from_str(r#"{"instanceID":"i","instanceStatus":{"code":3,"msg":"ok"},"sandboxID":"s","nodeProxyAddress":"gw:8443","sandboxIP":"10.0.0.2"}"#).unwrap();
         let cache = RouteCache::default();
         cache.put(route.clone());
         assert_eq!(cache.get("i").unwrap().sandbox_ip, "10.0.0.2");
-        assert_eq!(cache.get("i").unwrap().instance_status.code, 3);
+        assert_eq!(cache.get("i").unwrap().capsule_status.code, 3);
     }
 
     #[test]
@@ -324,7 +324,7 @@ mod tests {
     fn cache_resolves_raw_and_safe_instance_ids() {
         let mut route: RouteInfo =
             serde_json::from_str(r#"{"instanceID":"user@host/f.v_1","sandboxID":"s"}"#).unwrap();
-        route.instance_status.code = 3;
+        route.capsule_status.code = 3;
         let cache = RouteCache::default();
         cache.put(route);
         assert_eq!(

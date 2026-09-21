@@ -369,7 +369,7 @@ impl AgentApi {
             (http::Method::DELETE, ["instances", id]) => {
                 let id = segment(id)?;
                 progress.start_write();
-                managed.release_instance(&scope, &id).await?;
+                managed.release_capsule(&scope, &id).await?;
                 Ok(serde_json::json!({"status":"release_requested"}))
             }
             (http::Method::POST, ["resolve"]) => {

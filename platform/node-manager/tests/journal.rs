@@ -1,4 +1,4 @@
-use adx_core::{Assignment, Error, InstanceRecord, InstanceSpec, InstanceState, Resources, Result};
+use adx_core::{Assignment, CapsuleRecord, CapsuleSpec, CapsuleState, Error, Resources, Result};
 use adx_node_manager::{journal::JournalSink, Durability, StateSink};
 use async_trait::async_trait;
 use std::sync::{Arc, Mutex};
@@ -6,11 +6,11 @@ use std::sync::{Arc, Mutex};
 #[derive(Default)]
 struct Master {
     failure: Mutex<Option<Error>>,
-    records: Mutex<Vec<InstanceRecord>>,
+    records: Mutex<Vec<CapsuleRecord>>,
 }
 #[async_trait]
 impl StateSink for Master {
-    async fn commit(&self, record: &InstanceRecord) -> Result<Durability> {
+    async fn commit(&self, record: &CapsuleRecord) -> Result<Durability> {
         if let Some(e) = self.failure.lock().unwrap().clone() {
             return Err(e);
         }
@@ -18,12 +18,12 @@ impl StateSink for Master {
         Ok(Durability::Published)
     }
 }
-fn record(revision: u64) -> InstanceRecord {
-    InstanceRecord {
+fn record(revision: u64) -> CapsuleRecord {
+    CapsuleRecord {
         restart_attempts: 0,
         restart_pending: false,
-        spec: InstanceSpec {
-            runtime_environment: None,
+        spec: CapsuleSpec {
+            environment: None,
             snapshot_id: None,
             lifecycle: Default::default(),
             env: Default::default(),
@@ -31,7 +31,7 @@ fn record(revision: u64) -> InstanceRecord {
             id: "i".into(),
             tenant_id: "t".into(),
             image: "image".into(),
-            runtime: "runc".into(),
+            runtime_class: "runc".into(),
             resources: Resources {
                 cpu_millis: 1,
                 memory_bytes: 1,
@@ -41,15 +41,17 @@ fn record(revision: u64) -> InstanceRecord {
             sandbox: Default::default(),
         },
         assignment: Assignment {
-            instance_id: "i".into(),
+            capsule_id: "i".into(),
             node_id: "n".into(),
             shard_id: 0,
             generation: 1,
             devices: vec![],
         },
-        runtime_id: "i-1".into(),
-        runtime_ip: Some("10.0.0.2".parse().unwrap()),
-        state: InstanceState::Running,
+        runtime: adx_core::Runtime {
+            id: "i-1".into(),
+            ip: Some("10.0.0.2".parse().unwrap()),
+        },
+        state: CapsuleState::Running,
         revision,
         resources_held: true,
         checkpoint: None,
@@ -166,9 +168,9 @@ async fn authoritative_failure_discards_newer_local_running_result() {
     );
     *master.failure.lock().unwrap() = None;
     let mut failed = record(3);
-    failed.state = InstanceState::Failed;
+    failed.state = CapsuleState::Failed;
     failed.resources_held = false;
-    failed.runtime_ip = None;
+    failed.runtime.ip = None;
     journal.recover(&[failed]).await.unwrap();
     journal.flush().await.unwrap();
     assert!(master.records.lock().unwrap().is_empty());

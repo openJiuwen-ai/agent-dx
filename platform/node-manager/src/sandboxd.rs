@@ -1,7 +1,7 @@
 //! sandboxd PR #56 adapter. The RPC task outlives a canceled caller so cleanup
 //! cannot race a still-running Start. Ambiguous transport failures retain capacity.
-use crate::RuntimeBackend;
-use adx_core::{Error, InstanceSpec, Result};
+use crate::RuntimeDriver;
+use adx_core::{CapsuleSpec, Error, Result};
 use async_trait::async_trait;
 use hyper_util::rt::TokioIo;
 use std::collections::{BTreeMap, HashMap};
@@ -21,7 +21,7 @@ use proto::sandbox_service_client::SandboxServiceClient;
 
 #[derive(Clone)]
 pub struct Config {
-    pub runtime_environment: Option<adx_core::environment::RuntimeEnvironment>,
+    pub environment: Option<adx_core::environment::EnvironmentSpec>,
     pub command: Vec<String>,
     pub env: HashMap<String, String>,
     pub cwd: String,
@@ -31,7 +31,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            runtime_environment: None,
+            environment: None,
             command: vec!["/usr/local/bin/rrt-runtime".into()],
             env: HashMap::from([("RRT_HTTP_PORT".into(), "50090".into())]),
             cwd: "/".into(),
@@ -91,14 +91,14 @@ pub async fn connect_when_ready(
 
 impl Sandboxd {
     pub async fn connect(path: PathBuf, config: Config) -> Result<Self> {
-        if (config.command.is_empty() && config.runtime_environment.is_none())
+        if (config.command.is_empty() && config.environment.is_none())
             || config.rpc_timeout.is_zero()
         {
             return Err(Error::Invalid(
                 "sandboxd command and positive RPC timeout are required".into(),
             ));
         }
-        if let Some(e) = &config.runtime_environment {
+        if let Some(e) = &config.environment {
             e.validate()?;
             let paths = if e.rootfs.r#type == "local" {
                 vec![&e.rootfs.path, &e.bootstrap.root]
@@ -184,7 +184,7 @@ impl Sandboxd {
     }
     async fn execution_request(
         &self,
-        spec: &InstanceSpec,
+        spec: &CapsuleSpec,
         runtime_id: &str,
         generation: u64,
         devices: &[adx_core::scheduling::DeviceAllocation],
@@ -196,7 +196,7 @@ impl Sandboxd {
             .env
             .insert("ADX_CHECKPOINT_HANDOFF_FILE".into(), String::new());
         config.env.insert("ADX_ENV_FILE".into(), String::new());
-        if let Some(info) = self.capabilities(&spec.runtime).await? {
+        if let Some(info) = self.capabilities(&spec.runtime_class).await? {
             if info.supports_checkpoint_restore {
                 config.env.insert(
                     "ADX_CHECKPOINT_HANDOFF_FILE".into(),
@@ -318,10 +318,10 @@ impl Sandboxd {
         };
         let mut discovered = BTreeMap::new();
         for sandbox in &mut sandboxes {
-            if !sandbox.labels.contains_key("adx.instance_id") {
+            if !sandbox.labels.contains_key("adx.capsule_id") {
                 continue;
             }
-            let instance = &sandbox.labels["adx.instance_id"];
+            let capsule = &sandbox.labels["adx.capsule_id"];
             let generation = sandbox
                 .labels
                 .get("adx.generation")
@@ -331,10 +331,10 @@ impl Sandboxd {
             let logical = sandbox
                 .labels
                 .get("adx.runtime_id")
-                .filter(|id| adx_core::valid_runtime_id(instance, generation, id))
+                .filter(|id| adx_core::valid_runtime_id(capsule, generation, id))
                 .ok_or_else(|| unavailable("managed runtime has invalid execution labels"))?;
             if sandbox.id.is_empty()
-                || instance.is_empty()
+                || capsule.is_empty()
                 || (!logical_id.is_empty() && logical != logical_id)
                 || discovered
                     .insert(logical.clone(), sandbox.id.clone())
@@ -375,12 +375,12 @@ impl Sandboxd {
             .cloned())
     }
 
-    pub async fn has_managed_instances(&self) -> Result<bool> {
+    pub async fn has_managed_capsules(&self) -> Result<bool> {
         Ok(self
             .list_id("")
             .await?
             .iter()
-            .any(|s| s.labels.contains_key("adx.instance_id")))
+            .any(|s| s.labels.contains_key("adx.capsule_id")))
     }
 
     pub async fn is_running(&self, id: &str) -> Result<bool> {
@@ -414,7 +414,7 @@ impl Sandboxd {
 }
 
 pub fn start_request(
-    spec: &InstanceSpec,
+    spec: &CapsuleSpec,
     runtime_id: &str,
     ownership_generation: u64,
     devices: &[adx_core::scheduling::DeviceAllocation],
@@ -424,7 +424,7 @@ pub fn start_request(
     adx_core::scheduling::validate_device_assignment(&spec.scheduling.devices, devices)?;
     if runtime_id.is_empty()
         || ownership_generation == 0
-        || (config.command.is_empty() && config.runtime_environment.is_none())
+        || (config.command.is_empty() && config.environment.is_none())
     {
         return Err(Error::Invalid(
             "runtime identity and command are required".into(),
@@ -436,15 +436,12 @@ pub fn start_request(
             "resource value exceeds sandboxd numeric precision".into(),
         ));
     }
-    if !deployment_environment_accepts(
-        spec.runtime_environment.as_ref(),
-        config.runtime_environment.as_ref(),
-    ) {
+    if !deployment_environment_accepts(spec.environment.as_ref(), config.environment.as_ref()) {
         return Err(Error::Invalid(
-            "instance runtime environment differs from this node deployment".into(),
+            "capsule runtime environment differs from this node deployment".into(),
         ));
     }
-    let environment = spec.runtime_environment.as_ref();
+    let environment = spec.environment.as_ref();
     let mut envs: HashMap<String, String> = spec.env.clone().into_iter().collect();
     if let Some(e) = environment {
         envs.extend(e.env.clone());
@@ -452,7 +449,7 @@ pub fn start_request(
     // Deployment configuration owns control ports, tokens, and execution identity.
     envs.extend(config.env.clone());
     envs.remove("ADX_RESTORE_ORIGIN");
-    envs.insert("ADX_INSTANCE_ID".into(), spec.id.clone());
+    envs.insert("ADX_CAPSULE_ID".into(), spec.id.clone());
     envs.insert("ADX_RUNTIME_ID".into(), runtime_id.into());
     envs.insert(
         "ADX_OWNERSHIP_GENERATION".into(),
@@ -519,7 +516,7 @@ pub fn start_request(
             })
             .collect(),
         sandbox_id: String::new(),
-        runtime: spec.runtime.clone(),
+        runtime: spec.runtime_class.clone(),
         rootfs: Some(if let Some(rootfs) = &options.rootfs {
             sandbox_rootfs(rootfs)?
         } else if let Some(e) = environment.filter(|_| spec.image.is_empty()) {
@@ -559,7 +556,7 @@ pub fn start_request(
             ("Memory".into(), memory_limit as f64 / 1_048_576.0),
         ]),
         labels: HashMap::from([
-            ("adx.instance_id".into(), spec.id.clone()),
+            ("adx.capsule_id".into(), spec.id.clone()),
             ("adx.tenant_id".into(), spec.tenant_id.clone()),
             ("adx.runtime_id".into(), runtime_id.into()),
             ("adx.generation".into(), ownership_generation.to_string()),
@@ -580,13 +577,13 @@ pub fn start_request(
 }
 
 fn deployment_environment_accepts(
-    requested: Option<&adx_core::environment::RuntimeEnvironment>,
-    configured: Option<&adx_core::environment::RuntimeEnvironment>,
+    requested: Option<&adx_core::environment::EnvironmentSpec>,
+    configured: Option<&adx_core::environment::EnvironmentSpec>,
 ) -> bool {
     match (requested, configured) {
         (None, None) => true,
         (Some(requested), Some(configured)) => {
-            // Instance rootfs settings are an overlay on the trusted node
+            // Capsule rootfs settings are an overlay on the trusted node
             // deployment. The caller may select the runtime and read-only
             // behavior, but cannot redirect the deployment-owned source,
             // bootstrap executable, or environment.
@@ -745,7 +742,7 @@ fn sandbox_network_policy(
 }
 
 #[async_trait]
-impl RuntimeBackend for Sandboxd {
+impl RuntimeDriver for Sandboxd {
     async fn stats(&self, runtime_id: &str) -> Result<crate::metrics::RuntimeUsage> {
         let value = Sandboxd::stats(self, runtime_id).await?;
         Ok(crate::metrics::RuntimeUsage {
@@ -822,7 +819,7 @@ impl RuntimeBackend for Sandboxd {
     }
     async fn restore(
         &self,
-        spec: &InstanceSpec,
+        spec: &CapsuleSpec,
         runtime_id: &str,
         generation: u64,
         devices: &[adx_core::scheduling::DeviceAllocation],
@@ -833,14 +830,14 @@ impl RuntimeBackend for Sandboxd {
     }
     async fn restore_from(
         &self,
-        spec: &InstanceSpec,
+        spec: &CapsuleSpec,
         runtime_id: &str,
         generation: u64,
         devices: &[adx_core::scheduling::DeviceAllocation],
         path: &Path,
         origin: Option<&adx_core::runtime::RuntimeIdentity>,
     ) -> Result<IpAddr> {
-        self.checkpoint_supported(&spec.runtime).await?;
+        self.checkpoint_supported(&spec.runtime_class).await?;
         if !path.is_absolute() {
             return Err(Error::Invalid("absolute checkpoint path required".into()));
         }
@@ -850,7 +847,7 @@ impl RuntimeBackend for Sandboxd {
         if let Some(origin) = origin {
             let context = adx_core::runtime::RuntimeRestore {
                 target: adx_core::runtime::RuntimeIdentity {
-                    instance_id: spec.id.clone(),
+                    capsule_id: spec.id.clone(),
                     runtime_id: runtime_id.into(),
                     ownership_generation: generation,
                 },
@@ -874,9 +871,9 @@ impl RuntimeBackend for Sandboxd {
         self.list_id("")
             .await?
             .into_iter()
-            .filter(|s| s.labels.contains_key("adx.instance_id"))
+            .filter(|s| s.labels.contains_key("adx.capsule_id"))
             .map(|s| {
-                let instance_id = s.labels["adx.instance_id"].clone();
+                let capsule_id = s.labels["adx.capsule_id"].clone();
                 let tenant_id = s
                     .labels
                     .get("adx.tenant_id")
@@ -889,7 +886,7 @@ impl RuntimeBackend for Sandboxd {
                     .filter(|v| *v > 0)
                     .ok_or_else(|| unavailable("managed runtime has invalid identity"))?;
                 Ok(crate::RuntimeObservation {
-                    instance_id,
+                    capsule_id,
                     tenant_id,
                     generation,
                     runtime_id: s.id,
@@ -921,7 +918,7 @@ impl RuntimeBackend for Sandboxd {
     }
     async fn start(
         &self,
-        spec: &InstanceSpec,
+        spec: &CapsuleSpec,
         runtime_id: &str,
         ownership_generation: u64,
         devices: &[adx_core::scheduling::DeviceAllocation],
@@ -988,13 +985,13 @@ mod tests {
 
     #[test]
     fn request_preserves_execution_identity_image_and_resource_units() {
-        let spec = InstanceSpec {
-            runtime_environment: None,
+        let spec = CapsuleSpec {
+            environment: None,
             snapshot_id: None,
             lifecycle: Default::default(),
             env: [
                 ("USER_VALUE".into(), "preserved".into()),
-                ("ADX_INSTANCE_ID".into(), "spoofed-by-spec".into()),
+                ("ADX_CAPSULE_ID".into(), "spoofed-by-spec".into()),
                 ("ADX_RESTORE_ORIGIN".into(), "spoofed-origin".into()),
             ]
             .into(),
@@ -1002,7 +999,7 @@ mod tests {
             id: "i".into(),
             tenant_id: "t".into(),
             image: "image:tag".into(),
-            runtime: "runsc".into(),
+            runtime_class: "runsc".into(),
             resources: adx_core::Resources {
                 cpu_millis: 1500,
                 memory_bytes: 2 * 1024 * 1024 * 1024,
@@ -1016,14 +1013,14 @@ mod tests {
         assert_eq!(default_request.envs["RRT_HTTP_PORT"], "50090");
         let config = Config {
             env: HashMap::from([
-                ("ADX_INSTANCE_ID".into(), "spoofed".into()),
+                ("ADX_CAPSULE_ID".into(), "spoofed".into()),
                 ("USER_ENV".into(), "kept".into()),
             ]),
             ..Config::default()
         };
         let request = start_request(&spec, "i-7", 7, &[], &config).unwrap();
         assert!(!request.envs.contains_key("ADX_RESTORE_ORIGIN"));
-        assert_eq!(request.envs["ADX_INSTANCE_ID"], "i");
+        assert_eq!(request.envs["ADX_CAPSULE_ID"], "i");
         assert_eq!(request.envs["ADX_RUNTIME_ID"], "i-7");
         assert_eq!(request.envs["ADX_OWNERSHIP_GENERATION"], "7");
         assert_eq!(request.envs["USER_ENV"], "kept");

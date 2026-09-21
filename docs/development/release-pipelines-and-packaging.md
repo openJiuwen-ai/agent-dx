@@ -70,7 +70,7 @@ Full 流水线消费不可变制品，不得从源码重新编译或替换二进
      或工作区内的临时二进制。
    - 在单节点真实 Linux 环境启动 Redis、Master、内嵌 Edge 的 API Server、内嵌
      Node Proxy 的 Node Manager、sandboxd 和包内 RRT。
-   - 验证服务就绪、API Key 鉴权、Instance 创建/查询、RRT 命令、文件读写、显式删除、
+   - 验证服务就绪、API Key 鉴权、Capsule 创建/查询、RRT 命令、文件读写、显式删除、
      资源释放和 sandboxd inventory 清空。
    - 用例必须有界，不包含 checkpoint、节点失联、进程重启、日志滚动等待和多节点放置。
    - 使用仓库内固定的轻量 HTTP/数据面 smoke client，不临时构建或发布 Python SDK；
@@ -111,7 +111,7 @@ API Server（默认内嵌 Edge）或 Standalone，避免按角色维护多套二
 二进制仍在同一平台包中供显式分进程配置使用。
 
 基础出包的 `source-gate` 负责单元、契约和静态检查，`package-smoke` 负责验证刚生成
-制品的最小真实闭环。它证明基础包可安装、可启动和可完成一次 Instance 生命周期，
+制品的最小真实闭环。它证明基础包可安装、可启动和可完成一次 Capsule 生命周期，
 但不替代 Full 流水线中的公共 SDK、多节点、故障和恢复验收。只有前述门禁通过的
 候选才允许进入 OBS；上传步骤失败时，该候选不具备可发布状态。
 

@@ -1,6 +1,6 @@
 //! Local readiness HTTP contract checks, independent of a full platform deployment.
-use adx_core::{Assignment, InstanceRecord, InstanceSpec, InstanceState, Resources, Result};
-use adx_node_manager::{readiness::RrtReadiness, Readiness, RuntimeBackend};
+use adx_core::{Assignment, CapsuleRecord, CapsuleSpec, CapsuleState, Resources, Result};
+use adx_node_manager::{readiness::RrtReadiness, Readiness, RuntimeDriver};
 use async_trait::async_trait;
 use std::{
     net::IpAddr,
@@ -20,10 +20,10 @@ struct Runtime {
     checks: AtomicUsize,
 }
 #[async_trait]
-impl RuntimeBackend for Runtime {
+impl RuntimeDriver for Runtime {
     async fn start(
         &self,
-        _: &InstanceSpec,
+        _: &CapsuleSpec,
         _: &str,
         _: u64,
         _: &[adx_core::scheduling::DeviceAllocation],
@@ -38,19 +38,19 @@ impl RuntimeBackend for Runtime {
         Ok(self.running.load(Ordering::SeqCst))
     }
 }
-fn record() -> InstanceRecord {
-    InstanceRecord {
+fn record() -> CapsuleRecord {
+    CapsuleRecord {
         restart_attempts: 0,
         restart_pending: false,
-        spec: InstanceSpec {
-            runtime_environment: None,
+        spec: CapsuleSpec {
+            environment: None,
             snapshot_id: None,
             lifecycle: Default::default(),
             env: Default::default(),
             scheduling: Default::default(),
             id: "i".into(),
             tenant_id: "t".into(),
-            runtime: "runsc".into(),
+            runtime_class: "runsc".into(),
             image: "rrt".into(),
             resources: Resources {
                 cpu_millis: 1000,
@@ -62,16 +62,18 @@ fn record() -> InstanceRecord {
         },
         assignment: Assignment {
             devices: vec![],
-            instance_id: "i".into(),
+            capsule_id: "i".into(),
             node_id: "n".into(),
             shard_id: 0,
             generation: 1,
         },
-        state: InstanceState::Starting,
+        state: CapsuleState::Starting,
         revision: 1,
-        runtime_id: "i-1".into(),
+        runtime: adx_core::Runtime {
+            id: "i-1".into(),
+            ip: Some("127.0.0.1".parse().unwrap()),
+        },
         resources_held: true,
-        runtime_ip: Some("127.0.0.1".parse().unwrap()),
         checkpoint: None,
         last_operation: None,
     }
@@ -130,7 +132,7 @@ fn checker(runtime: Arc<Runtime>, port: u16) -> RrtReadiness {
 #[tokio::test]
 async fn requires_runtime_and_valid_rrt_response() {
     let runtime = runtime(true);
-    let (port, _server, requests) = serve(r#"{"identity":{"instance_id":"i","runtime_id":"i-1","ownership_generation":1},"revision":1,"phase":"running","checkpoint":null,"active_requests":0,"active_commands":0}"#, None).await;
+    let (port, _server, requests) = serve(r#"{"identity":{"capsule_id":"i","runtime_id":"i-1","ownership_generation":1},"revision":1,"phase":"running","checkpoint":null,"active_requests":0,"active_commands":0}"#, None).await;
     checker(runtime.clone(), port)
         .wait_ready(&record())
         .await
@@ -149,7 +151,7 @@ async fn an_http_200_without_rrt_status_is_not_ready() {
 }
 #[tokio::test]
 async fn exited_runtime_does_not_probe_or_publish_ready() {
-    let (port, _server, requests) = serve(r#"{"identity":{"instance_id":"i","runtime_id":"i-1","ownership_generation":1},"revision":1,"phase":"running","checkpoint":null,"active_requests":0,"active_commands":0}"#, None).await;
+    let (port, _server, requests) = serve(r#"{"identity":{"capsule_id":"i","runtime_id":"i-1","ownership_generation":1},"revision":1,"phase":"running","checkpoint":null,"active_requests":0,"active_commands":0}"#, None).await;
     assert!(checker(runtime(false), port)
         .wait_ready(&record())
         .await
@@ -159,6 +161,6 @@ async fn exited_runtime_does_not_probe_or_publish_ready() {
 #[tokio::test]
 async fn runtime_exit_during_probe_is_not_ready() {
     let runtime = runtime(true);
-    let (port, _server, _) = serve(r#"{"identity":{"instance_id":"i","runtime_id":"i-1","ownership_generation":1},"revision":1,"phase":"running","checkpoint":null,"active_requests":0,"active_commands":0}"#, Some(runtime.clone())).await;
+    let (port, _server, _) = serve(r#"{"identity":{"capsule_id":"i","runtime_id":"i-1","ownership_generation":1},"revision":1,"phase":"running","checkpoint":null,"active_requests":0,"active_commands":0}"#, Some(runtime.clone())).await;
     assert!(checker(runtime, port).wait_ready(&record()).await.is_err());
 }

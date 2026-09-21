@@ -56,7 +56,7 @@ upstream，并校验响应体和路径。该项不是客户端序列化单测。
 | storage_mb | FC 用例验证独立 request/limit 可下发并启动 | 仍需写满边界、超限及回收 E2E |
 | S3 rootfs、S3 EROFS mount、failover、inherit_entrypoint、network、独立 request/limit | 本地 KVM 已逐项实跑；r16 SDK 19/19，r17/r18 在已更新 package 上连续通过前 16 项后才触发已知双克隆网络故障 | 继续修复 ARM FC 双克隆网络问题并取得同一次 26/26 严格验收 |
 | data_plane_security | Standalone r4 已通过每实例纯 TLS 与默认 TLS+Token 对照 | 增加非法安全模式和证书轮换场景 |
-| extra_config | API→Instance→sandboxd 请求契约测试已覆盖 | 具体键的含义由 sandboxd/runtime 定义；按实际 runtime 增加语义 E2E |
+| extra_config | API→Capsule→sandboxd 请求契约测试已覆盖 | 具体键的含义由 sandboxd/runtime 定义；按实际 runtime 增加语义 E2E |
 | upstream | Standalone r11 实跑通过 | 增加断线期间在途请求续传和大响应的部署形态 E2E |
 
 ## 错误类型

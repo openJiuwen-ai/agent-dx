@@ -32,13 +32,13 @@ impl ActivityReceiver {
         })
     }
     /// None means unknown/stale, never evidence of idleness.
-    pub fn active_streams(&self, instance: &str) -> Option<u64> {
+    pub fn active_streams(&self, capsule: &str) -> Option<u64> {
         self.snapshot
             .lock()
             .expect("shared state lock poisoned")
             .as_ref()
             .filter(|snapshot| snapshot.received.elapsed() < self.max_age)
-            .map(|snapshot| snapshot.counts.get(instance).copied().unwrap_or(0))
+            .map(|snapshot| snapshot.counts.get(capsule).copied().unwrap_or(0))
     }
     pub fn apply(&self, request: ActivitySnapshot) -> CoreResult<ActivityAcknowledgement> {
         if request.proxy_session_id != self.session {
@@ -48,14 +48,14 @@ impl ActivityReceiver {
             return Err(Error::Invalid("snapshot sequence must be positive".into()));
         }
         let mut counts = BTreeMap::new();
-        for instance in request.instances {
-            if instance.instance_id.trim().is_empty()
+        for capsule in request.capsules {
+            if capsule.capsule_id.trim().is_empty()
                 || counts
-                    .insert(instance.instance_id, instance.active_streams)
+                    .insert(capsule.capsule_id, capsule.active_streams)
                     .is_some()
             {
                 return Err(Error::Invalid(
-                    "snapshot instance identities must be nonempty and unique".into(),
+                    "snapshot capsule identities must be nonempty and unique".into(),
                 ));
             }
         }
@@ -107,15 +107,15 @@ impl NodeActivityService for ActivityReceiver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use adx_protocol::node_proxy::InstanceActivity;
+    use adx_protocol::node_proxy::CapsuleActivity;
     fn snapshot(sequence: u64, count: Option<u64>) -> ActivitySnapshot {
         ActivitySnapshot {
             proxy_session_id: "session".into(),
             sequence,
-            instances: count
+            capsules: count
                 .map(|active_streams| {
-                    vec![InstanceActivity {
-                        instance_id: "i".into(),
+                    vec![CapsuleActivity {
+                        capsule_id: "i".into(),
                         active_streams,
                     }]
                 })

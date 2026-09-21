@@ -1,4 +1,4 @@
-//! Public JSON contract converted directly to typed Instance RPC payloads.
+//! Public JSON contract converted directly to typed Capsule RPC payloads.
 use adx_protocol::control as pb;
 use serde::Deserialize;
 use serde_json::Value;
@@ -462,14 +462,14 @@ fn security(value: &str) -> Result<adx_core::sandbox::DataPlaneSecurityMode, Sta
         _ => Err(invalid("invalid data-plane security mode")),
     }
 }
-pub fn create_spec(body: Value, caller: &pb::CallerContext) -> Result<pb::InstanceSpec, Status> {
+pub fn create_spec(body: Value, caller: &pb::CallerContext) -> Result<pb::CapsuleSpec, Status> {
     create_spec_with_environment(body, caller, None)
 }
 pub fn create_spec_with_environment(
     body: Value,
     caller: &pb::CallerContext,
-    environment: Option<&adx_core::environment::RuntimeEnvironment>,
-) -> Result<pb::InstanceSpec, Status> {
+    environment: Option<&adx_core::environment::EnvironmentSpec>,
+) -> Result<pb::CapsuleSpec, Status> {
     if let Some(e) = environment {
         e.validate().map_err(|e| invalid(&e.to_string()))?;
     }
@@ -502,7 +502,7 @@ pub fn create_spec_with_environment(
     }
     if snapshot.is_none() && root.runtime.is_empty() {
         root.runtime = environment
-            .map(|e| e.rootfs.runtime.clone())
+            .map(|e| e.rootfs.runtime_class.clone())
             .unwrap_or_else(|| "runsc".into());
     }
     resolve_create_timeout(r.create_timeout, r.schedule_timeout, r.init_timeout)?;
@@ -556,7 +556,7 @@ pub fn create_spec_with_environment(
         })
         .transpose()?;
     // Forwarded ports do not allocate host ports: Edge and Node Proxy route
-    // authenticated traffic directly to the Instance IP. Keep the public
+    // authenticated traffic directly to the Capsule IP. Keep the public
     // declaration validated while the originating SDK handle uses it to guard
     // get_port_url().
     let ports = validate_ports(&r.ports)?;
@@ -706,9 +706,9 @@ pub fn create_spec_with_environment(
         r.env
             .insert("RRT_TUNNEL_WS_PORT".into(), (port - 1).to_string());
     }
-    let runtime_environment = if snapshot.is_none() {
+    let environment = if snapshot.is_none() {
         environment.cloned().map(|mut value| {
-            value.rootfs.runtime.clone_from(&root.runtime);
+            value.rootfs.runtime_class.clone_from(&root.runtime);
             if let Some(readonly) = root.readonly {
                 value.rootfs.readonly = readonly;
             }
@@ -717,12 +717,12 @@ pub fn create_spec_with_environment(
     } else {
         None
     };
-    Ok(pb::InstanceSpec {
-        runtime_environment,
+    Ok(pb::CapsuleSpec {
+        environment,
         id: format!("{}-{}", r.namespace, r.name),
         tenant_id: caller.tenant_id.clone(),
         image: root.imageurl.trim().into(),
-        runtime: root.runtime,
+        runtime_class: root.runtime,
         resources: Some(pb::Resources {
             cpu_millis: cpu,
             memory_bytes: memory,
@@ -809,7 +809,7 @@ fn affinities(
         let target = if a.kind == 0 {
             pb::PlacementTarget::Node
         } else {
-            pb::PlacementTarget::Instance
+            pb::PlacementTarget::Capsule
         } as i32;
         let required = a.affinity >= 2;
         let anti = a.affinity % 2 == 1;

@@ -204,11 +204,11 @@ mod client {
                 let request = proto::ActivitySnapshot {
                     proxy_session_id: batch.proxy_session_id,
                     sequence: batch.sequence,
-                    instances: batch
+                    capsules: batch
                         .activities
                         .into_iter()
-                        .map(|entry| proto::InstanceActivity {
-                            instance_id: entry.instance_id,
+                        .map(|entry| proto::CapsuleActivity {
+                            capsule_id: entry.instance_id,
                             active_streams: entry.active_stream_count,
                         })
                         .collect(),

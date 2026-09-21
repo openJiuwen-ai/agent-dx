@@ -141,7 +141,7 @@ async fn local_claim_and_scheduler_reservation_cannot_create_two_owners() {
     let a = claimant(&s, "a").await;
     claimant(&s, "b").await;
     let candidate = Assignment {
-        instance_id: "i".into(),
+        capsule_id: "i".into(),
         node_id: "b".into(),
         shard_id: 0,
         generation: 1,
@@ -161,7 +161,7 @@ async fn local_claim_and_scheduler_reservation_cannot_create_two_owners() {
             assert!(matches!(local, ClaimOutcome::Owned(_)));
         }
     }
-    assert_eq!(s.snapshot().await.unwrap().instances.len(), 1);
+    assert_eq!(s.snapshot().await.unwrap().capsules.len(), 1);
 }
 
 #[tokio::test]
@@ -197,7 +197,7 @@ async fn concurrent_claims_allocate_exact_generations_above_lua_integer_precisio
     s.reserve(
         spec("seed"),
         Assignment {
-            instance_id: "seed".into(),
+            capsule_id: "seed".into(),
             node_id: "a".into(),
             shard_id: 0,
             generation: high,
@@ -280,7 +280,7 @@ async fn snapshot_claim_requires_existing_restore_reference() {
         "snap",
         "tenant",
         Reference::Restore {
-            instance_id: "clone".into(),
+            capsule_id: "clone".into(),
         },
     )
     .await

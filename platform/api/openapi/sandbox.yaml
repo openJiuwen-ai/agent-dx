@@ -7,7 +7,9 @@ info:
     identifier: Apache-2.0
   description: |
     Public lifecycle API implemented by the Rust API Server and exposed through
-    Edge. ADX uses Instance internally; Sandbox is the public API and SDK model.
+    Edge. ADX uses Capsule and Runtime internally; Sandbox is the public API
+    and SDK model. Compatibility fields such as instanceId map to capsule_id at
+    the API Server boundary.
     Lifecycle responses use an envelope whose `data` member is base64-encoded
     JSON. Resource discovery returns its typed JSON document directly. Create
     can return Server-Sent Events when requested by the client.
@@ -21,7 +23,7 @@ security:
   - xAuth: []
 tags:
   - name: Sandboxes
-    description: Public Sandbox lifecycle and current Instance view.
+    description: Public Sandbox lifecycle and current execution view.
   - name: Resources
     description: Current schedulable node capacity exposed to the Sandbox SDK.
   - name: Snapshots
@@ -104,7 +106,7 @@ paths:
     get:
       tags: [Sandboxes]
       operationId: getSandbox
-      summary: Read the current Instance view for one Sandbox
+      summary: Read the current execution view for one Sandbox
       parameters:
         - name: instance_id
           in: query
@@ -114,7 +116,7 @@ paths:
             minLength: 1
       responses:
         "200":
-          description: Single-item compatibility array containing the Instance view.
+          description: Single-item compatibility array containing the Sandbox view.
           content:
             application/json:
               schema:
@@ -183,7 +185,7 @@ paths:
         - $ref: "#/components/parameters/ResumeOperationId"
       responses:
         "200":
-          description: Instance is running and its local route is bound.
+          description: The Sandbox Capsule is running and its local Runtime route is bound.
           content:
             application/json:
               schema:
@@ -223,7 +225,7 @@ paths:
       tags: [Sandboxes]
       operationId: updateSandboxNetworkPolicy
       summary: Atomically replace the complete runtime network policy
-      description: An empty object clears the policy. The committed Instance specification changes only after sandboxd accepts the replacement.
+      description: An empty object clears the policy. The committed Capsule specification changes only after sandboxd accepts the replacement Runtime.
       parameters:
         - $ref: "#/components/parameters/SandboxId"
         - $ref: "#/components/parameters/NetworkOperationId"
@@ -600,8 +602,8 @@ components:
           uniqueItems: true
           description: |
             User ports declared by the SDK. Edge authorizes the tenant and
-            Instance on every forwarded request; Node Proxy then connects to
-            the declared port on that Instance.
+            Capsule on every forwarded request; Node Proxy then connects to
+            the declared port on its current Runtime.
           items:
             type: string
             pattern: "^([1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5])$"

@@ -2,7 +2,7 @@
 use super::*;
 use crate::storage::{ClaimOutcome, LocalClaim};
 use adx_core::snapshots::Reference;
-use pb::claim_instance_response::Outcome;
+use pb::claim_capsule_response::Outcome;
 
 impl State {
     pub(super) async fn recover_claim_write(&mut self) -> Result<()> {
@@ -16,7 +16,7 @@ impl State {
         let pending: Vec<_> = self
             .specs
             .values()
-            .filter(|s| !saved.instances.contains_key(&s.id))
+            .filter(|s| !saved.capsules.contains_key(&s.id))
             .cloned()
             .collect();
         let mut scheduler = Master::restore(&saved, self.placement)?;
@@ -37,15 +37,15 @@ impl State {
         }
         self.scheduler = scheduler;
         self.nodes = saved.nodes;
-        self.instances = saved.instances;
-        for (id, record) in &self.instances {
+        self.capsules = saved.capsules;
+        for (id, record) in &self.capsules {
             self.specs.insert(id.clone(), record.spec.clone());
         }
         self.claim_recovery = false;
         self.needs_recovery = false;
         Ok(())
     }
-    pub(super) fn accept_stored_claim(&mut self, record: StoredInstance) -> Result<()> {
+    pub(super) fn accept_stored_claim(&mut self, record: StoredCapsule) -> Result<()> {
         let synchronized = if record.resources_held() && !record.invalidated {
             self.scheduler
                 .accept_claim(&record.spec, &record.assignment)
@@ -60,7 +60,7 @@ impl State {
         self.scheduler.generation = self.scheduler.generation.max(record.assignment.generation);
         self.specs
             .insert(record.spec.id.clone(), record.spec.clone());
-        self.instances.insert(record.spec.id.clone(), record);
+        self.capsules.insert(record.spec.id.clone(), record);
         Ok(())
     }
     pub(super) fn live_claimant(&self, id: &str, session: &str, timeout: Duration) -> Result<()> {
@@ -81,28 +81,30 @@ impl State {
         }
         Ok(())
     }
-    pub(super) fn instance_response(
+    pub(super) fn capsule_response(
         &self,
-        stored: &StoredInstance,
-    ) -> Result<pb::GetInstanceResponse> {
+        stored: &StoredCapsule,
+    ) -> Result<pb::GetCapsuleResponse> {
         let node = self
             .nodes
             .get(&stored.assignment.node_id)
             .ok_or(Error::NotFound)?;
-        let record = stored.result.clone().unwrap_or_else(|| InstanceRecord {
+        let record = stored.result.clone().unwrap_or_else(|| CapsuleRecord {
             spec: stored.spec.clone(),
             assignment: stored.assignment.clone(),
-            runtime_id: format!("{}-{}", stored.spec.id, stored.assignment.generation),
-            state: InstanceState::Pending,
+            runtime: adx_core::Runtime {
+                id: format!("{}-{}", stored.spec.id, stored.assignment.generation),
+                ip: None,
+            },
+            state: CapsuleState::Pending,
             revision: 0,
             resources_held: true,
-            runtime_ip: None,
             checkpoint: None,
             last_operation: None,
             restart_attempts: 0,
             restart_pending: false,
         });
-        Ok(pb::GetInstanceResponse {
+        Ok(pb::GetCapsuleResponse {
             record: Some(record.try_into()?),
             node_address: node.address.clone(),
             node_proxy_address: node.proxy_address.clone(),
@@ -113,8 +115,8 @@ impl MasterRpc {
     pub(super) async fn prepare_local(
         &self,
         node: &str,
-        request: pb::LocalCreateRequest,
-    ) -> std::result::Result<pb::PreparedCreate, Status> {
+        request: pb::LocalCapsuleCreateRequest,
+    ) -> std::result::Result<pb::PreparedCapsule, Status> {
         let create = request
             .create
             .ok_or_else(|| Status::invalid_argument("create required"))?;
@@ -143,7 +145,7 @@ impl MasterRpc {
             ),
             None => None,
         };
-        Ok(pb::PreparedCreate {
+        Ok(pb::PreparedCapsule {
             spec: Some(spec.into()),
             snapshot,
         })
@@ -151,9 +153,9 @@ impl MasterRpc {
     pub(super) async fn claim_local(
         &self,
         node: String,
-        request: pb::ClaimInstanceRequest,
-    ) -> std::result::Result<pb::ClaimInstanceResponse, Status> {
-        let spec: InstanceSpec = request
+        request: pb::ClaimCapsuleRequest,
+    ) -> std::result::Result<pb::ClaimCapsuleResponse, Status> {
+        let spec: CapsuleSpec = request
             .spec
             .ok_or_else(|| Status::invalid_argument("spec required"))?
             .try_into()
@@ -177,10 +179,10 @@ impl MasterRpc {
             .map_err(status)?;
         if let Some(existing) = state.specs.get(&spec.id) {
             if existing != &spec {
-                return Err(Status::already_exists("instance specification conflict"));
+                return Err(Status::already_exists("capsule specification conflict"));
             }
-            if !state.instances.contains_key(&spec.id) {
-                return Ok(pb::ClaimInstanceResponse {
+            if !state.capsules.contains_key(&spec.id) {
+                return Ok(pb::ClaimCapsuleResponse {
                     outcome: Some(Outcome::Fallback(true)),
                 });
             }
@@ -193,14 +195,14 @@ impl MasterRpc {
         };
         if let Some(record) = &existing {
             if record.spec != spec {
-                return Err(Status::already_exists("instance specification conflict"));
+                return Err(Status::already_exists("capsule specification conflict"));
             }
         } else if !state
             .scheduler
             .local_candidate(&spec, &node, &candidate.devices)
             .map_err(status)?
         {
-            return Ok(pb::ClaimInstanceResponse {
+            return Ok(pb::ClaimCapsuleResponse {
                 outcome: Some(Outcome::Fallback(true)),
             });
         }
@@ -220,7 +222,7 @@ impl MasterRpc {
                         id,
                         &spec.tenant_id,
                         Reference::Restore {
-                            instance_id: spec.id.clone(),
+                            capsule_id: spec.id.clone(),
                         },
                     )
                     .await
@@ -246,12 +248,12 @@ impl MasterRpc {
             .live_claimant(&node, &candidate.node_session_id, self.0.heartbeat_timeout)
             .map_err(status)?;
         if matches!(outcome, ClaimOutcome::Owned(_)) {
-            adx_observability::info!(event="local_instance_claim", instance_id=%record.spec.id,
+            adx_observability::info!(event="local_capsule_claim", capsule_id=%record.spec.id,
                 node_id=%record.assignment.node_id, generation=record.assignment.generation,
                 "local ownership persisted and scheduler ledger synchronized");
         }
         let outcome = match outcome {
-            ClaimOutcome::Owned(_) => Outcome::Owned(Box::new(pb::StartAssignedInstanceRequest {
+            ClaimOutcome::Owned(_) => Outcome::Owned(Box::new(pb::StartAssignedCapsuleRequest {
                 spec: Some(record.spec.into()),
                 assignment: Some(record.assignment.try_into().map_err(status)?),
                 node_session_id: candidate.node_session_id,
@@ -261,11 +263,11 @@ impl MasterRpc {
                     .map_err(status)?,
             })),
             ClaimOutcome::Existing(_) => {
-                Outcome::Existing(Box::new(state.instance_response(&record).map_err(status)?))
+                Outcome::Existing(Box::new(state.capsule_response(&record).map_err(status)?))
             }
         };
         self.0.changed.notify_waiters();
-        Ok(pb::ClaimInstanceResponse {
+        Ok(pb::ClaimCapsuleResponse {
             outcome: Some(outcome),
         })
     }

@@ -4,7 +4,7 @@ use crate::{
     SchedulerConfig,
 };
 use adx_core::scheduling::{select_devices, Device, DeviceLedger};
-use adx_core::{Assignment, Error, InstanceSpec, ResourceLedger, Result};
+use adx_core::{Assignment, CapsuleSpec, Error, ResourceLedger, Result};
 use adx_scheduling::{query::Prepared, Candidate, Framework, Node, Snapshot};
 use std::{
     cmp::Reverse,
@@ -28,11 +28,11 @@ struct Signature {
     cpu: u64,
     memory: u64,
 }
-impl From<&InstanceSpec> for Signature {
-    fn from(r: &InstanceSpec) -> Self {
+impl From<&CapsuleSpec> for Signature {
+    fn from(r: &CapsuleSpec) -> Self {
         Self {
             image: r.image.clone(),
-            runtime: r.runtime.clone(),
+            runtime: r.runtime_class.clone(),
             cpu: r.resources.cpu_millis,
             memory: r.resources.memory_bytes,
         }
@@ -129,7 +129,7 @@ impl ShardScheduler {
             .get(id)
             .map(|state| (state.scalar.capacity(), state.scalar.available()))
     }
-    pub fn restore(&mut self, spec: &InstanceSpec, assignment: &Assignment) -> Result<()> {
+    pub fn restore(&mut self, spec: &CapsuleSpec, assignment: &Assignment) -> Result<()> {
         if self.assigned.contains_key(&spec.id) {
             return Err(Error::Conflict);
         }
@@ -157,7 +157,7 @@ impl ShardScheduler {
     }
     pub fn local_candidate(
         &self,
-        spec: &InstanceSpec,
+        spec: &CapsuleSpec,
         node: &str,
         devices: &[adx_core::scheduling::DeviceAllocation],
         snapshot: &Snapshot,
@@ -223,7 +223,7 @@ impl ShardScheduler {
         }
         Ok(())
     }
-    pub fn enqueue(&mut self, request: InstanceSpec) {
+    pub fn enqueue(&mut self, request: CapsuleSpec) {
         // Start the next sweep before adding new work to an exhausted one.
         // Deferred tickets must participate in priority/FIFO ordering.
         self.begin_round();
@@ -248,7 +248,7 @@ impl ShardScheduler {
     }
     fn select(
         &mut self,
-        request: &InstanceSpec,
+        request: &CapsuleSpec,
         snapshot: &Snapshot,
         journal: &MutationJournal,
         config: &SchedulerConfig,
@@ -355,7 +355,7 @@ impl ShardScheduler {
         snapshot: &Snapshot,
         journal: &MutationJournal,
         config: &SchedulerConfig,
-    ) -> Result<Option<(Assignment, InstanceSpec)>> {
+    ) -> Result<Option<(Assignment, CapsuleSpec)>> {
         let Some(entry) = self.queue.pop_entry() else {
             return Ok(None);
         };
@@ -396,7 +396,7 @@ impl ShardScheduler {
             state.free_devices = state.devices.available();
         }
         let assignment = Assignment {
-            instance_id: r.id.clone(),
+            capsule_id: r.id.clone(),
             node_id,
             shard_id,
             generation,
@@ -405,34 +405,34 @@ impl ShardScheduler {
         self.assigned.insert(r.id.clone(), assignment.clone());
         Ok(Some((assignment, entry.spec)))
     }
-    pub fn retry(&mut self, assignment: &Assignment, spec: InstanceSpec) -> Result<()> {
+    pub fn retry(&mut self, assignment: &Assignment, spec: CapsuleSpec) -> Result<()> {
         let mut excluded = self
             .excluded
-            .get(&assignment.instance_id)
+            .get(&assignment.capsule_id)
             .cloned()
             .unwrap_or_default();
         excluded.insert(assignment.node_id.clone());
         self.release(assignment)?;
         self.excluded
-            .insert(assignment.instance_id.clone(), excluded);
+            .insert(assignment.capsule_id.clone(), excluded);
         self.enqueue(spec);
         Ok(())
     }
     pub fn release(&mut self, assignment: &Assignment) -> Result<()> {
-        if self.assigned.get(&assignment.instance_id) != Some(assignment) {
+        if self.assigned.get(&assignment.capsule_id) != Some(assignment) {
             return Err(Error::Conflict);
         }
         let state = self
             .nodes
             .get_mut(&assignment.node_id)
             .ok_or(Error::NotFound)?;
-        state.scalar.release(&assignment.instance_id)?;
-        state.devices.release(&assignment.instance_id)?;
+        state.scalar.release(&assignment.capsule_id)?;
+        state.devices.release(&assignment.capsule_id)?;
         if !assignment.devices.is_empty() {
             state.free_devices = state.devices.available();
         }
-        self.assigned.remove(&assignment.instance_id);
-        self.excluded.remove(&assignment.instance_id);
+        self.assigned.remove(&assignment.capsule_id);
+        self.excluded.remove(&assignment.capsule_id);
         Ok(())
     }
 }

@@ -1,6 +1,6 @@
 use super::{Durability, OperationResult, Services};
 use adx_core::{
-    Assignment, Error, Event, InstanceRecord, InstanceSpec, InstanceState, LifecycleKind, Result,
+    Assignment, CapsuleRecord, CapsuleSpec, CapsuleState, Error, Event, LifecycleKind, Result,
 };
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
@@ -48,17 +48,17 @@ impl Envelope {
         Self {
             command,
             reply,
-            trace: adx_observability::trace::Trace::child("instance.queue"),
+            trace: adx_observability::trace::Trace::child("capsule.queue"),
         }
     }
 }
 
 #[derive(Clone)]
-pub struct InstanceHandle {
+pub struct CapsuleHandle {
     tx: mpsc::Sender<Envelope>,
 }
 
-impl InstanceHandle {
+impl CapsuleHandle {
     pub async fn snapshot(
         &self,
         request: super::checkpoint::SnapshotRequest,
@@ -68,9 +68,9 @@ impl InstanceHandle {
         self.tx
             .send(Envelope::new(Command::Snapshot(request, tx), unused))
             .await
-            .map_err(|_| Error::Unavailable("instance controller stopped".into()))?;
+            .map_err(|_| Error::Unavailable("capsule controller stopped".into()))?;
         rx.await
-            .map_err(|_| Error::Unavailable("instance controller stopped".into()))?
+            .map_err(|_| Error::Unavailable("capsule controller stopped".into()))?
     }
 
     async fn send(&self, command: Command) -> Result<OperationResult> {
@@ -78,9 +78,9 @@ impl InstanceHandle {
         self.tx
             .send(Envelope::new(command, tx))
             .await
-            .map_err(|_| Error::Unavailable("instance controller stopped".into()))?;
+            .map_err(|_| Error::Unavailable("capsule controller stopped".into()))?;
         rx.await
-            .map_err(|_| Error::Unavailable("instance controller stopped".into()))?
+            .map_err(|_| Error::Unavailable("capsule controller stopped".into()))?
     }
     pub async fn pause(&self, request: PauseRequest) -> Result<OperationResult> {
         self.send(Command::Pause(request)).await
@@ -136,9 +136,9 @@ impl InstanceHandle {
         self.tx
             .send(Envelope::new(Command::Discard(tx), unused))
             .await
-            .map_err(|_| Error::Unavailable("instance controller stopped".into()))?;
+            .map_err(|_| Error::Unavailable("capsule controller stopped".into()))?;
         rx.await
-            .map_err(|_| Error::Unavailable("instance controller stopped".into()))?
+            .map_err(|_| Error::Unavailable("capsule controller stopped".into()))?
     }
     pub async fn expire_checkpoint(&self, now: u64) -> Result<()> {
         let (tx, rx) = oneshot::channel();
@@ -146,9 +146,9 @@ impl InstanceHandle {
         self.tx
             .send(Envelope::new(Command::Expire(now, tx), unused))
             .await
-            .map_err(|_| Error::Unavailable("instance controller stopped".into()))?;
+            .map_err(|_| Error::Unavailable("capsule controller stopped".into()))?;
         rx.await
-            .map_err(|_| Error::Unavailable("instance controller stopped".into()))?
+            .map_err(|_| Error::Unavailable("capsule controller stopped".into()))?
     }
     pub async fn tick(&self) -> Result<()> {
         let (tx, rx) = oneshot::channel();
@@ -156,9 +156,9 @@ impl InstanceHandle {
         self.tx
             .send(Envelope::new(Command::Tick(tx), unused))
             .await
-            .map_err(|_| Error::Unavailable("instance controller stopped".into()))?;
+            .map_err(|_| Error::Unavailable("capsule controller stopped".into()))?;
         rx.await
-            .map_err(|_| Error::Unavailable("instance controller stopped".into()))?
+            .map_err(|_| Error::Unavailable("capsule controller stopped".into()))?
     }
     pub async fn sync(&self) -> Result<OperationResult> {
         self.send(Command::Sync).await
@@ -166,23 +166,25 @@ impl InstanceHandle {
 }
 
 pub(crate) fn spawn(
-    spec: InstanceSpec,
+    spec: CapsuleSpec,
     assignment: Assignment,
     services: Arc<Services>,
     held: bool,
-) -> InstanceHandle {
+) -> CapsuleHandle {
     let runtime_id = format!("{}-{}", spec.id, assignment.generation);
     spawn_restored(
-        InstanceRecord {
+        CapsuleRecord {
             restart_attempts: 0,
             restart_pending: false,
             spec,
             assignment,
-            runtime_id,
-            state: InstanceState::Pending,
+            runtime: adx_core::Runtime {
+                id: runtime_id,
+                ip: None,
+            },
+            state: CapsuleState::Pending,
             revision: 0,
             resources_held: held,
-            runtime_ip: None,
             checkpoint: None,
             last_operation: None,
         },
@@ -190,7 +192,7 @@ pub(crate) fn spawn(
     )
 }
 
-pub(crate) fn spawn_restored(record: InstanceRecord, services: Arc<Services>) -> InstanceHandle {
+pub(crate) fn spawn_restored(record: CapsuleRecord, services: Arc<Services>) -> CapsuleHandle {
     let (tx, mut rx) = mpsc::channel::<Envelope>(32);
     let mut controller = Controller {
         recovery_files: None,
@@ -211,17 +213,17 @@ pub(crate) fn spawn_restored(record: InstanceRecord, services: Arc<Services>) ->
             trace,
         }) = rx.recv().await
         {
-            trace.attribute("instance.id", controller.record.spec.id.clone());
+            trace.attribute("capsule.id", controller.record.spec.id.clone());
             trace
                 .run(async {
-                    adx_observability::trace::Trace::child("instance.execute")
+                    adx_observability::trace::Trace::child("capsule.execute")
                         .run(controller.dispatch(command, reply))
                         .await;
                 })
                 .await;
         }
     });
-    InstanceHandle { tx }
+    CapsuleHandle { tx }
 }
 
 impl Controller {
@@ -315,10 +317,10 @@ impl Controller {
             eprintln!(
                 "{}",
                 serde_json::json!({
-                    "event": "instance operation failed",
+                    "event": "capsule operation failed",
                     "unix_seconds": crate::checkpoint::now().ok(),
-                    "instance_id": self.record.spec.id,
-                    "runtime_id": self.record.runtime_id,
+                    "capsule_id": self.record.spec.id,
+                    "runtime_id": self.record.runtime.id,
                     "revision": self.record.revision,
                     "operation": operation,
                     "error": error.to_string(),
@@ -332,7 +334,7 @@ impl Controller {
 
 struct Controller {
     recovery_files: Option<crate::checkpoint::MaterializedCheckpoint>,
-    record: InstanceRecord,
+    record: CapsuleRecord,
     services: Arc<Services>,
     held: bool,
     durability: Option<Durability>,
@@ -345,11 +347,11 @@ struct Controller {
 
 impl Controller {
     async fn reconcile(&mut self) -> Result<OperationResult> {
-        if self.record.state == InstanceState::Running
+        if self.record.state == CapsuleState::Running
             && self
                 .services
                 .runtime
-                .is_running(&self.record.runtime_id)
+                .is_running(&self.record.runtime.id)
                 .await?
         {
             if self.recovery_files.is_none() {
@@ -365,7 +367,7 @@ impl Controller {
             })
             .await
             .map_err(|_| Error::Unavailable("recovery readiness timed out".into()))??;
-        } else if self.record.state == InstanceState::Paused {
+        } else if self.record.state == CapsuleState::Paused {
             let cp = self.record.checkpoint.clone().ok_or(Error::Conflict)?;
             let services = self.services.checkpoint.clone().ok_or(Error::Conflict)?;
             self.cleanup().await?;
@@ -381,12 +383,12 @@ impl Controller {
             self.cleanup().await?;
             if !matches!(
                 self.record.state,
-                InstanceState::Deleted | InstanceState::Failed
+                CapsuleState::Deleted | CapsuleState::Failed
             ) {
-                self.record.state = InstanceState::Failed;
+                self.record.state = CapsuleState::Failed;
                 self.record.revision =
                     self.record.revision.checked_add(1).ok_or(Error::Conflict)?;
-            } else if self.record.state == InstanceState::Failed {
+            } else if self.record.state == CapsuleState::Failed {
                 self.record.revision =
                     self.record.revision.checked_add(1).ok_or(Error::Conflict)?;
             }
@@ -408,11 +410,11 @@ impl Controller {
     async fn sync(&mut self) -> Result<OperationResult> {
         if matches!(
             self.record.state,
-            InstanceState::Pending
-                | InstanceState::Starting
-                | InstanceState::Deleting
-                | InstanceState::Pausing
-                | InstanceState::Resuming
+            CapsuleState::Pending
+                | CapsuleState::Starting
+                | CapsuleState::Deleting
+                | CapsuleState::Pausing
+                | CapsuleState::Resuming
         ) {
             return Err(Error::Conflict);
         }
@@ -463,10 +465,10 @@ impl Controller {
     }
 
     async fn create(&mut self) -> Result<OperationResult> {
-        if self.record.state == InstanceState::Running {
+        if self.record.state == CapsuleState::Running {
             return self.replay_or_sync().await;
         }
-        if self.record.state != InstanceState::Pending {
+        if self.record.state != CapsuleState::Pending {
             return Err(Error::Conflict);
         }
         if self.record.spec.snapshot_id.is_some() && self.record.checkpoint.is_none() {
@@ -491,7 +493,7 @@ impl Controller {
                 self.record.revision.checked_add(1).ok_or(Error::Conflict)?
             )
         } else {
-            self.record.runtime_id.clone()
+            self.record.runtime.id.clone()
         };
         if !self.held || restart {
             self.services
@@ -501,8 +503,8 @@ impl Controller {
                 .reserve(&runtime_id, &self.record.spec, &self.record.assignment)?;
         }
         if restart {
-            self.record.runtime_id = runtime_id;
-            self.record.runtime_ip = None;
+            self.record.runtime.id = runtime_id;
+            self.record.runtime.ip = None;
             // restart_attempts belongs to the configured cold-restart policy.
             // Checkpoint replacement (explicit reload or failover) has its own
             // recovery contract and must not be rejected by Master as a cold
@@ -519,7 +521,7 @@ impl Controller {
         self.record.resources_held = true;
         self.transition(Event::Start)?;
         let attempt = timeout(self.services.operation_timeout, async {
-            self.record.runtime_ip = Some(
+            self.record.runtime.ip = Some(
                 if restore_checkpoint || self.record.spec.snapshot_id.is_some() {
                     let cp = self.record.checkpoint.as_ref().ok_or(Error::Conflict)?;
                     let store = &self
@@ -535,7 +537,7 @@ impl Controller {
                         .runtime
                         .restore_from(
                             &self.record.spec,
-                            &self.record.runtime_id,
+                            &self.record.runtime.id,
                             self.record.assignment.generation,
                             &self.record.assignment.devices,
                             self.recovery_files
@@ -549,7 +551,7 @@ impl Controller {
                         .runtime
                         .start(
                             &self.record.spec,
-                            &self.record.runtime_id,
+                            &self.record.runtime.id,
                             self.record.assignment.generation,
                             &self.record.assignment.devices,
                         )
@@ -560,7 +562,7 @@ impl Controller {
             self.services.routes.activate(&self.record).await
         })
         .await
-        .unwrap_or_else(|_| Err(Error::Unavailable("instance start timed out".into())));
+        .unwrap_or_else(|_| Err(Error::Unavailable("capsule start timed out".into())));
         if let Err(start_error) = attempt {
             let cleanup = self.cleanup().await;
             self.transition(Event::Fail)?;
@@ -599,10 +601,10 @@ impl Controller {
     async fn cleanup(&mut self) -> Result<()> {
         timeout(self.services.operation_timeout, async {
             self.services.routes.retire(&self.record).await?;
-            self.services.runtime.remove(&self.record.runtime_id).await
+            self.services.runtime.remove(&self.record.runtime.id).await
         })
         .await
-        .map_err(|_| Error::Unavailable("instance cleanup timed out".into()))??;
+        .map_err(|_| Error::Unavailable("capsule cleanup timed out".into()))??;
         self.recovery_files = None;
         self.services.metrics.remove(&self.record.spec.id);
         if self.held {
@@ -610,7 +612,7 @@ impl Controller {
                 .admission
                 .lock()
                 .expect("shared state lock poisoned")
-                .release(&self.record.runtime_id)?;
+                .release(&self.record.runtime.id)?;
             self.held = false;
             self.record.resources_held = false;
         }
@@ -620,11 +622,11 @@ impl Controller {
     async fn delete(&mut self) -> Result<OperationResult> {
         self.record.restart_pending = false;
         self.restart_after = None;
-        if self.record.state == InstanceState::Deleted {
+        if self.record.state == CapsuleState::Deleted {
             return self.replay_or_sync().await;
         }
         self.record.last_operation = None;
-        if self.record.state != InstanceState::Deleting {
+        if self.record.state != CapsuleState::Deleting {
             self.transition(Event::Delete)?;
         }
         if let Err(error) = self.cleanup().await {
@@ -639,7 +641,7 @@ impl Controller {
         if let Some(cp) = self.record.checkpoint.take() {
             self.obsolete_checkpoints.push(cp.artifact);
         }
-        self.record.runtime_ip = None;
+        self.record.runtime.ip = None;
         self.transition(Event::Removed)?;
         self.sync().await
     }

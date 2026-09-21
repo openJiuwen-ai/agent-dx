@@ -3,14 +3,14 @@ use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeIdentity {
-    pub instance_id: String,
+    pub capsule_id: String,
     pub runtime_id: String,
     pub ownership_generation: u64,
 }
 impl RuntimeIdentity {
     pub fn validate_restore_from(&self, previous: &Self) -> Result<()> {
         self.validate()?;
-        if self.instance_id != previous.instance_id
+        if self.capsule_id != previous.capsule_id
             || self.ownership_generation < previous.ownership_generation
         {
             return Err(Error::Conflict);
@@ -22,7 +22,7 @@ impl RuntimeIdentity {
             return Ok(());
         }
         let version = |identity: &Self| -> Option<u64> {
-            let base = format!("{}-{}", identity.instance_id, identity.ownership_generation);
+            let base = format!("{}-{}", identity.capsule_id, identity.ownership_generation);
             if identity.runtime_id == base {
                 Some(0)
             } else {
@@ -39,12 +39,12 @@ impl RuntimeIdentity {
         }
     }
     pub fn validate(&self) -> Result<()> {
-        if self.instance_id.trim().is_empty()
+        if self.capsule_id.trim().is_empty()
             || self.runtime_id.trim().is_empty()
             || self.ownership_generation == 0
         {
             return Err(Error::Invalid(
-                "runtime requires explicit instance, execution and ownership generation".into(),
+                "runtime requires explicit capsule, execution and ownership generation".into(),
             ));
         }
         Ok(())
@@ -118,15 +118,15 @@ impl RuntimeRestore {
             None => self.target.validate_restore_from(previous),
             Some(origin)
                 if origin == previous
-                    && (self.target.instance_id != previous.instance_id
+                    && (self.target.capsule_id != previous.capsule_id
                         || self.target.ownership_generation > previous.ownership_generation)
                     && crate::valid_runtime_id(
-                        &self.target.instance_id,
+                        &self.target.capsule_id,
                         self.target.ownership_generation,
                         &self.target.runtime_id,
                     )
                     && crate::valid_runtime_id(
-                        &origin.instance_id,
+                        &origin.capsule_id,
                         origin.ownership_generation,
                         &origin.runtime_id,
                     ) =>

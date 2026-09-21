@@ -1,6 +1,6 @@
 # `adxctl` 部署指南
 
-`adxctl` 是 ADX 统一发布包的本机进程部署工具。它读取一份 YAML 部署文件，生成本机各组件的最终配置，并以前台 supervisor 方式启动这些组件。它不创建 Instance，也不调用 Sandbox API。
+`adxctl` 是 ADX 统一发布包的本机进程部署工具。它读取一份 YAML 部署文件，生成本机各组件的最终配置，并以前台 supervisor 方式启动这些组件。它不创建 Capsule，也不调用 Sandbox API。
 
 一份部署 YAML 只描述**当前主机**。单机部署可以在一份文件中包含所有角色；多机部署时，每台主机使用自己的文件，各文件通过相同的 `redis_url` 和 `namespace` 加入同一集群。`adxctl` 默认读取 `/etc/adx/deployment.yaml`，也可用全局 `-c/--config` 或 `ADX_DEPLOYMENT_CONFIG` 选择其他文件。它只接受 `.yaml` 或 `.yml`，不接受 JSON 部署文件。
 
@@ -9,15 +9,15 @@
 | 部署角色 | 二进制 | 部署位置 | 作用 |
 | --- | --- | --- | --- |
 | `master` | `adx-master` | 控制节点 | 持久化状态、全局轮转、Shard 调度、节点心跳与路由发布 |
-| `node-manager` | `adx-node-manager` | 每个工作节点 | 本机资源准入、Instance 生命周期、sandboxd 与恢复；默认同时嵌入 Node Proxy |
-| `node-proxy` | `adx-node-proxy` | 显式选择分进程时 | 数据面绑定和到 Instance RRT 的转发 |
+| `node-manager` | `adx-node-manager` | 每个工作节点 | 本机资源准入、Capsule 生命周期、sandboxd 与恢复；默认同时嵌入 Node Proxy |
+| `node-proxy` | `adx-node-proxy` | 显式选择分进程时 | 数据面绑定和到 Capsule RRT 的转发 |
 | `api-server` | `adx-api-server` | 接入节点，默认内嵌 Edge | 用户 API Key、Sandbox HTTP API、归属缓存和生命周期转发 |
 | `edge` | 内嵌时无独立进程；分进程时为 `adx-edge-frontend` | 接入节点 | 对外 TLS、控制请求转发以及到 Node Proxy 的数据连接 |
 | `redis` | `redis-server` | 可选，仅一个主机 | 由 `adxctl` 托管的 Redis 7.2.5 和 AOF |
 
 当前没有 `adx-frontend` 二进制。原控制面 Frontend 已重写并命名为 `adx-api-server`。API Server 默认在同一进程中托管 Edge，两个模块仍保持独立监听与 TLS 身份；显式设置 `edge_mode: standalone` 时才启动 `adx-edge-frontend`。API Server 只监听回环地址，由 Edge 对外提供 HTTPS。
 
-sandboxd 不属于上述角色，始终由部署环境独立启动。RRT 位于发布包 `runtime/`，进入 Instance 环境运行，也不是宿主机服务。
+sandboxd 不属于上述角色，始终由部署环境独立启动。RRT 位于发布包 `runtime/`，进入 Capsule 环境运行，也不是宿主机服务。
 
 ## 命令
 
@@ -69,9 +69,9 @@ sudo /opt/adx/bin/adxctl stop
 
 `run` 不转入后台。systemd、Pod 或其他进程管理器应直接托管它。supervisor 在 `state_dir` 创建锁和 `supervisor.sock`，同一目录只能运行一个部署。日志写入 `state_dir/logs/<service-id>.log`。
 
-`status` 返回子进程 PID、角色、重启次数、失败标记和日志状态。PID 存在只代表进程存活，不代表集群已经可以创建 Instance。
+`status` 返回子进程 PID、角色、重启次数、失败标记和日志状态。PID 存在只代表进程存活，不代表集群已经可以创建 Capsule。
 
-`stop` 先要求本机 Node Manager 停止新准入并删除其管理的 Instance，清理成功后才按反向顺序退出组件。清理失败时命令失败，并保留 Master、Redis、代理等依赖以便重试。
+`stop` 先要求本机 Node Manager 停止新准入并删除其管理的 Capsule，清理成功后才按反向顺序退出组件。清理失败时命令失败，并保留 Master、Redis、代理等依赖以便重试。
 
 ## 部署文件的公共字段
 
@@ -96,7 +96,7 @@ services: []
 | `services` | 当前主机需要启动的角色，不是整个集群的角色清单 |
 | `restart_limit` | 单次 supervisor 生命周期内，每个异常退出进程的最大重启次数 |
 | `stop_timeout_seconds` | 单个 Drain 或进程停止阶段的超时 |
-| `runtime_environment` | Node Manager 和 API Server 共用的本地 EROFS 或 OCI 运行环境定义 |
+| `environment` | Node Manager 和 API Server 共用的本地 EROFS 或 OCI 运行环境定义 |
 | `logging` | supervisor 接管组件输出时的滚动、压缩和保留策略 |
 
 每个 `services[]` 元素由 `id`、`role`、`config` 和可选 `env` 组成。`config` 是组件配置，`env` 用于 Edge 和 Node Proxy 等环境变量入口。不要手工重复公共 `redis_url` 和 `namespace`；`adxctl render` 会按角色注入。
@@ -130,7 +130,7 @@ service_overrides:
 合并规则固定如下：
 
 - 顶层标量覆盖 profile 默认值，未出现的字段保留默认值。
-- `logging` 和 `runtime_environment` 对象递归合并。
+- `logging` 和 `environment` 对象递归合并。
 - `service_overrides` 按本机角色名定位；默认 Node profile 只有 `node-manager`，Proxy 的环境项也覆盖在该角色下。不能改变角色或增加隐藏进程。
 - 服务 `config` 对象递归合并，`env` 按变量名覆盖。
 - 数组整体替换，不按下标合并。
@@ -168,7 +168,7 @@ services:
 
 ## 单机 standalone 部署
 
-单机部署在一台 Linux 主机上运行 Master、Node Manager（内嵌 Node Proxy）和 API Server（内嵌 Edge）。主机还必须先准备 sandboxd、证书、初始管理员密钥以及 Instance 网络。
+单机部署在一台 Linux 主机上运行 Master、Node Manager（内嵌 Node Proxy）和 API Server（内嵌 Edge）。主机还必须先准备 sandboxd、证书、初始管理员密钥以及 Capsule 网络。
 
 ### 使用 `adxctl` 托管 Redis
 
@@ -178,7 +178,7 @@ services:
 sudo install -d -m 0700 /etc/adx /run/adx /var/lib/adx/redis
 sudo /opt/adx/bin/adxctl config init
 
-# 修改证书路径、监听地址、Instance CIDR、sandboxd socket 和磁盘路径后执行
+# 修改证书路径、监听地址、Capsule CIDR、sandboxd socket 和磁盘路径后执行
 sudo /opt/adx/bin/adxctl validate
 sudo /opt/adx/bin/adxctl run
 ```
@@ -230,11 +230,11 @@ sudo /opt/adx/bin/adxctl validate
 sudo /opt/adx/bin/adxctl run
 ```
 
-每个节点的 `node_id` 必须唯一，并与 Master `tls.peers` 中的 `node:<node_id>` 对应。`advertised_address` 是控制 RPC 地址，`proxy_address` 是 Edge 连接的数据面地址。内嵌 Node Proxy 的 `ADX_DATA_PLANE_*` 配置位于 `node-manager.env`；其中 `ADX_DATA_PLANE_ALLOWED_TARGET_CIDRS` 必须覆盖 sandboxd 实际分配的 Instance 网段。
+每个节点的 `node_id` 必须唯一，并与 Master `tls.peers` 中的 `node:<node_id>` 对应。`advertised_address` 是控制 RPC 地址，`proxy_address` 是 Edge 连接的数据面地址。内嵌 Node Proxy 的 `ADX_DATA_PLANE_*` 配置位于 `node-manager.env`；其中 `ADX_DATA_PLANE_ALLOWED_TARGET_CIDRS` 必须覆盖 sandboxd 实际分配的 Capsule 网段。
 
 需要独立故障域或单独限制资源时，可以使用完整部署 YAML：为 Node Manager 显式设置 `proxy_mode: standalone`，把 Proxy 环境项移到独立的 `role: node-proxy` 服务。省略 `proxy_mode` 与设置 `embedded` 等价，不能在默认内嵌模式下再启动独立 Node Proxy。
 
-sandboxd 仍由节点部署环境单独管理。`adxctl stop` 只停止 ADX 进程，完成 Instance 清理后不会停止 sandboxd。
+sandboxd 仍由节点部署环境单独管理。`adxctl stop` 只停止 ADX 进程，完成 Capsule 清理后不会停止 sandboxd。
 
 ### 3. API Server 与 Edge 接入节点
 
@@ -283,6 +283,6 @@ API Frontend 对应 `role: "api-server"` 和 `adx-api-server`。示例将 API �
 - `stop` 失败：至少一个 Node Manager Drain 或组件停止未完成；依赖会保留，检查 `state_dir/logs/` 后使用相同命令重试。
 - `render` 失败且目录已存在：换一个新的输出目录；工具不会覆盖已有审查证据。
 
-配置和证书在组件启动时读取。`adxctl` 当前没有 `restart` 或热重载子命令。完整 `stop` 会删除本机 Instance，因此不应用它进行需要保留实例的普通证书轮换；此类维护由部署环境按组件重启，并等待 Node Manager 对账和路由重新同步。
+配置和证书在组件启动时读取。`adxctl` 当前没有 `restart` 或热重载子命令。完整 `stop` 会删除本机 Capsule，因此不应用它进行需要保留实例的普通证书轮换；此类维护由部署环境按组件重启，并等待 Node Manager 对账和路由重新同步。
 
 完整的单机依赖、证书和 SDK 业务就绪步骤见[单机进程部署](standalone.md)，运行环境见[本地 EROFS 与 OCI](runtime-environment.md)。

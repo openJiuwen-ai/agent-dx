@@ -42,7 +42,7 @@ try:
     paused=sandbox.pause(ttl_seconds=900,timeout_seconds=120)
     assert paused.size>0
     sandbox.resume()
-    old=catalog()['instance:'+sandbox.id]
+    old=catalog()['capsule:'+sandbox.id]
     source=old['assignment']['node_id']; target='node2' if source=='node1' else 'node1'
     assert old['result']['checkpoint']['artifact']['storage']=='shared'
     passed(0,instance_id=sandbox.id,source=source,checkpoint=paused.snapshot_id)
@@ -58,13 +58,13 @@ try:
     (root/'evidence/source-stopped.json').write_text(json.dumps({'pid':stopped,'node_id':source}))
     if result['interruption_requested']:
         def pending():
-            r=catalog()['instance:'+sandbox.id]
+            r=catalog()['capsule:'+sandbox.id]
             return r if r['assignment']['node_id']==target and r.get('recovery',{}).get('pending') else None
         planned=wait(pending)
         epoch=catalog()['header']['epoch']
         os.kill(pid(root,'master'),signal.SIGKILL)
         wait(lambda:catalog()['header']['epoch']>epoch)
-        kept=catalog()['instance:'+sandbox.id]
+        kept=catalog()['capsule:'+sandbox.id]
         assert kept['assignment']==planned['assignment'] and kept['recovery']['pending']
         result['mid_recovery_restart']={'epoch_before':epoch,'epoch_after':catalog()['header']['epoch'], 'assignment':kept['assignment'],'plan_preserved':True}
         (root/'evidence/mid-recovery-master-restart.json').write_text(json.dumps(result['mid_recovery_restart'],indent=2))
@@ -72,7 +72,7 @@ try:
         print('MASTER RESTARTED WITH DURABLE RECOVERY PLAN',flush=True)
     if result['node_interruption_requested']:
         def uncommitted_backend():
-            r=catalog()['instance:'+sandbox.id]
+            r=catalog()['capsule:'+sandbox.id]
             backends=inventory(target)
             if (r['assignment']['node_id']==target and r.get('recovery',{}).get('pending')
                     and r['result']['state']=='Paused' and len(backends)==1 and 'SANDBOX_STATE_RUNNING' in backends[0]):
@@ -87,7 +87,7 @@ try:
         subprocess.run([*blocked_rrt,'-D',*rrt_rule],check=True);blocked_rrt=None
         wait(lambda:catalog()['node:'+target]['session']['id']!=session)
         print('TARGET NODE MANAGER RESTARTED WITH UNCOMMITTED BACKEND',physical,flush=True)
-    new=wait(lambda: (lambda r:r if recovered(old,r) else None)(catalog()['instance:'+sandbox.id]))
+    new=wait(lambda: (lambda r:r if recovered(old,r) else None)(catalog()['capsule:'+sandbox.id]))
     if result['node_interruption_requested']:
         backends=inventory(target)
         assert len(backends)==1
@@ -114,13 +114,13 @@ try:
     old_runtime=new['result']['runtime_id']; master_pid=pid(root,'master'); master_epoch=catalog()['header']['epoch']
     os.kill(master_pid,signal.SIGKILL)
     wait(lambda: catalog()['header']['epoch']>master_epoch and all(catalog()['node:'+n]['session']['routable'] for n in ('node1','node2')))
-    same=catalog()['instance:'+sandbox.id]
+    same=catalog()['capsule:'+sandbox.id]
     assert same['assignment']==new['assignment'] and same['result']['runtime_id']==old_runtime
     assert command('cat /tmp/counter.pid')==saved_pid
     passed(4,generation=same['assignment']['generation'],runtime_id=old_runtime)
     sandbox.kill();sandbox.close();sandbox=None
     wait(lambda: not inventory('node1') and not inventory('node2'))
-    records={k:v for k,v in catalog().items() if k.startswith('instance:')}
+    records={k:v for k,v in catalog().items() if k.startswith('capsule:')}
     assert records and all(v['result']['state']=='Deleted' and not v['result']['resources_held'] for v in records.values())
     (root/'evidence/catalog-final.json').write_text(json.dumps(records,indent=2))
     passed(5)

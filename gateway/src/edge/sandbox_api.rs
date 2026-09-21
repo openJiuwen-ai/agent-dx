@@ -109,12 +109,12 @@ impl PlatformSandbox {
     async fn invalidate(&self) {
         *self.master.lock().await = None;
     }
-    async fn inspect(&self, tenant: &str, id: &str) -> Result<Option<pb::GetInstanceResponse>> {
+    async fn inspect(&self, tenant: &str, id: &str) -> Result<Option<pb::GetCapsuleResponse>> {
         validate_identity(tenant, id)?;
         let mut client = pb::master_service_client::MasterServiceClient::new(self.master().await?);
         match client
-            .get_instance(pb::GetInstanceRequest {
-                instance_id: id.into(),
+            .get_capsule(pb::GetCapsuleRequest {
+                capsule_id: id.into(),
                 caller: Some(caller(tenant)),
             })
             .await
@@ -135,7 +135,7 @@ impl PlatformSandbox {
     }
     async fn observation(
         &self,
-        record: pb::InstanceRecord,
+        record: pb::CapsuleRecord,
         node_proxy: &str,
     ) -> Result<SandboxObservation> {
         let spec = record.spec.as_ref().ok_or_else(|| {
@@ -144,10 +144,10 @@ impl PlatformSandbox {
         let mut result = SandboxObservation {
             id: spec.id.clone(),
             tenant: spec.tenant_id.clone(),
-            phase: match pb::InstanceState::try_from(record.state).ok() {
-                Some(pb::InstanceState::Running) => SandboxPhase::Running,
-                Some(pb::InstanceState::Deleted) => SandboxPhase::Deleted,
-                Some(pb::InstanceState::Failed) => SandboxPhase::Failed,
+            phase: match pb::CapsuleState::try_from(record.state).ok() {
+                Some(pb::CapsuleState::Running) => SandboxPhase::Running,
+                Some(pb::CapsuleState::Deleted) => SandboxPhase::Deleted,
+                Some(pb::CapsuleState::Failed) => SandboxPhase::Failed,
                 _ => SandboxPhase::Creating,
             },
             ready: false,
@@ -172,7 +172,7 @@ impl PlatformSandbox {
     }
     async fn runtime_ready(
         &self,
-        record: &pb::InstanceRecord,
+        record: &pb::CapsuleRecord,
         node_proxy: &str,
     ) -> std::result::Result<bool, String> {
         let spec = record.spec.as_ref().ok_or("missing specification")?;
@@ -231,7 +231,7 @@ impl PlatformSandbox {
     }
     async fn runtime_request(
         &self,
-        record: &pb::InstanceRecord,
+        record: &pb::CapsuleRecord,
         node_proxy: &str,
         port: u16,
         entrypoint: bool,
@@ -307,7 +307,7 @@ fn validate_identity(tenant: &str, id: &str) -> Result<()> {
     }
     Ok(())
 }
-fn validate_record(record: Option<&pb::InstanceRecord>, tenant: &str, id: &str) -> Result<()> {
+fn validate_record(record: Option<&pb::CapsuleRecord>, tenant: &str, id: &str) -> Result<()> {
     let record =
         record.ok_or_else(|| SandboxError::Unavailable("Platform returned no instance".into()))?;
     let spec = record
@@ -319,7 +319,7 @@ fn validate_record(record: Option<&pb::InstanceRecord>, tenant: &str, id: &str) 
         || record
             .assignment
             .as_ref()
-            .is_some_and(|a| a.instance_id != id)
+            .is_some_and(|a| a.capsule_id != id)
     {
         return Err(SandboxError::Unavailable(
             "Platform response identity mismatch".into(),
@@ -327,7 +327,7 @@ fn validate_record(record: Option<&pb::InstanceRecord>, tenant: &str, id: &str) 
     }
     Ok(())
 }
-fn connect_target(record: &pb::InstanceRecord, port: u16) -> Result<ConnectTarget> {
+fn connect_target(record: &pb::CapsuleRecord, port: u16) -> Result<ConnectTarget> {
     let spec = record
         .spec
         .as_ref()
@@ -336,14 +336,18 @@ fn connect_target(record: &pb::InstanceRecord, port: u16) -> Result<ConnectTarge
         .assignment
         .as_ref()
         .ok_or_else(|| SandboxError::Unavailable("missing assignment".into()))?;
-    if !adx_protocol::valid_runtime_id(&spec.id, assignment.generation, &record.runtime_id) {
+    let runtime = record
+        .runtime
+        .as_ref()
+        .ok_or_else(|| SandboxError::Unavailable("missing runtime".into()))?;
+    if !adx_protocol::valid_runtime_id(&spec.id, assignment.generation, &runtime.id) {
         return Err(SandboxError::Unavailable("invalid runtime identity".into()));
     }
     Ok(ConnectTarget {
         instance_id: spec.id.clone(),
-        workload_id: record.runtime_id.clone(),
+        workload_id: runtime.id.clone(),
         target_ip: record
-            .runtime_ip
+            .ip
             .parse()
             .map_err(|_| SandboxError::Unavailable("runtime address unavailable".into()))?,
         target_port: port,
@@ -439,7 +443,7 @@ fn to_platform(
     request: &CreateSandbox,
     profiles: &[PreinstalledProfile],
     rrt_token: &str,
-) -> Result<pb::InstanceSpec> {
+) -> Result<pb::CapsuleSpec> {
     validate_identity(&request.tenant, &request.id)?;
     let execution = &request.execution;
     let profile = matching_profile(execution, profiles)?;
@@ -466,11 +470,11 @@ fn to_platform(
     );
     let hash = Sha256::digest(serde_json::to_vec(execution).expect("execution serialization"));
     env.insert(EXECUTION_HASH.into(), format!("{hash:x}"));
-    Ok(pb::InstanceSpec {
+    Ok(pb::CapsuleSpec {
         id: request.id.clone(),
         tenant_id: request.tenant.clone(),
         image: execution.image.clone(),
-        runtime: execution.isolation_runtime.clone(),
+        runtime_class: execution.isolation_runtime.clone(),
         resources: Some(pb::Resources {
             cpu_millis: execution.resources.cpu_millis,
             memory_bytes: execution.resources.memory_mib * 1024 * 1024,
@@ -482,7 +486,7 @@ fn to_platform(
         lifecycle: None,
         snapshot_id: None,
         // Preinstalled profiles use the node deployment without a runtime environment.
-        runtime_environment: None,
+        environment: None,
         sandbox: None,
     })
 }
@@ -495,7 +499,7 @@ impl Sandbox for PlatformSandbox {
         let spec = to_platform(request, &self.profiles, &self.rrt_token)?;
         let mut client = pb::master_service_client::MasterServiceClient::new(self.master().await?);
         match client
-            .create_instance(pb::CreateInstanceRequest {
+            .create_capsule(pb::CreateCapsuleRequest {
                 spec: Some(spec),
                 caller: Some(caller(&request.tenant)),
                 schedule_timeout_seconds: 30,
@@ -540,7 +544,7 @@ impl Sandbox for PlatformSandbox {
     async fn delete(&self, tenant: &str, id: &str) -> Result<SandboxObservation> {
         let response=self.inspect(tenant,id).await?.ok_or_else(||SandboxError::OutcomeUnknown("Sandbox is absent; Platform provides no tombstone for a never-observed create, so deletion is not confirmed".into()))?;
         let record = response.record.expect("validated record");
-        if record.state == pb::InstanceState::Deleted as i32 {
+        if record.state == pb::CapsuleState::Deleted as i32 {
             return self.observation(record, &response.node_proxy_address).await;
         }
         let assignment = record
@@ -553,7 +557,7 @@ impl Sandbox for PlatformSandbox {
                 .await?,
         );
         let result = client
-            .delete_instance(pb::DeleteInstanceRequest {
+            .delete_capsule(pb::DeleteCapsuleRequest {
                 assignment: Some(assignment),
                 caller: Some(caller(tenant)),
             })
@@ -563,7 +567,7 @@ impl Sandbox for PlatformSandbox {
         validate_record(result.record.as_ref(), tenant, id)?;
         let record = result.record.expect("validated record");
         // Require a published terminal state: journaled local deletion alone is not globally confirmed.
-        if record.state == pb::InstanceState::Deleted as i32
+        if record.state == pb::CapsuleState::Deleted as i32
             && result.durability != pb::Durability::Published as i32
         {
             return Err(SandboxError::OutcomeUnknown(
@@ -804,7 +808,7 @@ mod tests {
         let mapped = to_platform(&request, &[profile()], "test-token").unwrap();
         assert_eq!(mapped.id, request.id);
         assert_eq!(mapped.tenant_id, request.tenant);
-        assert_eq!(mapped.runtime, "runc");
+        assert_eq!(mapped.runtime_class, "runc");
         assert_eq!(mapped.resources.unwrap().memory_bytes, 256 * 1024 * 1024);
         assert_eq!(
             mapped.env["ADX_IMAGE_PROCESS_CONFIG"],
@@ -921,10 +925,10 @@ mod tests {
     }
     #[test]
     fn response_identity_and_generation_are_checked() {
-        let mut record = pb::InstanceRecord {
+        let mut record = pb::CapsuleRecord {
             spec: Some(to_platform(&request(), &[profile()], "token").unwrap()),
             assignment: Some(pb::Assignment {
-                instance_id: "sandbox-id".into(),
+                capsule_id: "sandbox-id".into(),
                 node_id: "node".into(),
                 shard_id: 0,
                 generation: 1,

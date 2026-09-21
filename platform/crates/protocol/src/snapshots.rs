@@ -29,8 +29,8 @@ impl TryFrom<Snapshot> for pb::ReusableSnapshot {
                 .into_iter()
                 .map(|r| pb::SnapshotReference {
                     owner: Some(match r {
-                        Reference::Restore { instance_id } => {
-                            pb::snapshot_reference::Owner::RestoreInstanceId(instance_id)
+                        Reference::Restore { capsule_id } => {
+                            pb::snapshot_reference::Owner::RestoreCapsuleId(capsule_id)
                         }
                         Reference::Template {
                             node_id,
@@ -60,8 +60,8 @@ impl TryFrom<pb::ReusableSnapshot> for Snapshot {
         let mut references = std::collections::BTreeSet::new();
         for r in s.references {
             let owner = match r.owner {
-                Some(pb::snapshot_reference::Owner::RestoreInstanceId(instance_id)) => {
-                    Reference::Restore { instance_id }
+                Some(pb::snapshot_reference::Owner::RestoreCapsuleId(capsule_id)) => {
+                    Reference::Restore { capsule_id }
                 }
                 Some(pb::snapshot_reference::Owner::Template(t)) => Reference::Template {
                     node_id: t.node_id,

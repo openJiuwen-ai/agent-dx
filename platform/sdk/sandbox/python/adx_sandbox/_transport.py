@@ -868,7 +868,7 @@ class SandboxClient:
                     if isinstance(not_found, dict) and not_found.get("error_code"):
                         # RRT uses 404 for an operation-level missing command.
                         # It is an authoritative result from the resolved
-                        # Instance route, not evidence that /direct is absent.
+                        # Capsule route, not evidence that /direct is absent.
                         self._direct_route_misses = 0
                         raise self._http_error(resp, request_id=request_id)
                     if outcome_unknown:

@@ -205,7 +205,7 @@ def validate(node):
     assert required <= services, (required,services)
     structured={a.get('service.name') for a,b in rows if isinstance(b,dict) and ('level' in b or 'fields' in b)}
     assert required-{'redis'} <= structured, (required,structured)
-    states={b.get('fields',{}).get('state') for _,b in rows if isinstance(b,dict) and b.get('fields',{}).get('event')=='instance_operation_completed'}
+    states={b.get('fields',{}).get('state') for _,b in rows if isinstance(b,dict) and b.get('fields',{}).get('event')=='capsule_operation_completed'}
     assert 'Running' in states and 'Deleted' in states, states
     assert not (D/'collector-secret-leak').exists(),'credential leaked into log pipeline'
     assert json.loads((D/'business-outage.json').read_text())['sdk_lifecycle_passed']

@@ -1,21 +1,21 @@
 use adx_core::{
     scheduling::{Device, DeviceAllocation, DeviceKind, DeviceRequest},
-    Assignment, Error, InstanceSpec, Resources,
+    Assignment, CapsuleSpec, Error, Resources,
 };
 use adx_master::{
-    storage::{StoredInstance, StoredNode, StoredSnapshot},
+    storage::{StoredCapsule, StoredNode, StoredSnapshot},
     Master, Node, Placement,
 };
 fn saved() -> StoredSnapshot {
-    let request = InstanceSpec {
-        runtime_environment: None,
+    let request = CapsuleSpec {
+        environment: None,
         snapshot_id: None,
         lifecycle: Default::default(),
         env: Default::default(),
         id: "i".into(),
         tenant_id: "t".into(),
         image: "i".into(),
-        runtime: "r".into(),
+        runtime_class: "r".into(),
         resources: Resources {
             cpu_millis: 100,
             memory_bytes: 100,
@@ -43,7 +43,7 @@ fn saved() -> StoredSnapshot {
         count: 1,
     });
     let assignment = Assignment {
-        instance_id: "i".into(),
+        capsule_id: "i".into(),
         node_id: "n".into(),
         shard_id: 0,
         generation: 42,
@@ -68,9 +68,9 @@ fn saved() -> StoredSnapshot {
             },
         )]
         .into(),
-        instances: [(
+        capsules: [(
             "i".into(),
-            StoredInstance {
+            StoredCapsule {
                 recovery: None,
                 invalidated: false,
                 spec: request,
@@ -86,7 +86,7 @@ fn restore_keeps_over_capacity_usage_and_temporarily_missing_cards() {
     let saved = saved();
     let mut m = Master::restore(&saved, Placement::Pack).unwrap();
     assert!(!m.snapshot().node("n").unwrap().available);
-    let mut request = saved.instances["i"].spec.clone();
+    let mut request = saved.capsules["i"].spec.clone();
     request.id = "waiting".into();
     m.submit(request).unwrap();
     let mut node = saved.nodes["n"].node.clone();
@@ -103,24 +103,24 @@ fn restore_keeps_over_capacity_usage_and_temporarily_missing_cards() {
         m.schedule(0).unwrap().is_none(),
         "reappearing card is still occupied"
     );
-    m.release(&saved.instances["i"].assignment).unwrap();
+    m.release(&saved.capsules["i"].assignment).unwrap();
     let a = m.schedule(0).unwrap().unwrap();
-    assert_eq!(a.instance_id, "waiting");
+    assert_eq!(a.capsule_id, "waiting");
     assert_eq!(a.generation, 43);
 }
 #[test]
 fn corrupt_ownership_or_double_card_assignment_fails_recovery() {
     let mut saved = saved();
-    let mut duplicate = saved.instances["i"].clone();
+    let mut duplicate = saved.capsules["i"].clone();
     duplicate.spec.id = "other".into();
-    duplicate.assignment.instance_id = "other".into();
-    saved.instances.insert("other".into(), duplicate);
+    duplicate.assignment.capsule_id = "other".into();
+    saved.capsules.insert("other".into(), duplicate);
     assert!(matches!(
         Master::restore(&saved, Placement::Pack),
         Err(Error::Conflict)
     ));
-    saved.instances.remove("other");
-    saved.instances.get_mut("i").unwrap().assignment.shard_id = 1;
+    saved.capsules.remove("other");
+    saved.capsules.get_mut("i").unwrap().assignment.shard_id = 1;
     assert!(Master::restore(&saved, Placement::Pack).is_err());
 }
 #[test]
@@ -128,8 +128,8 @@ fn exhausted_generation_never_wraps_to_an_old_identity() {
     let mut saved = saved();
     saved.generation = u64::MAX;
     let mut m = Master::restore(&saved, Placement::Pack).unwrap();
-    m.release(&saved.instances["i"].assignment).unwrap();
-    let mut request = saved.instances["i"].spec.clone();
+    m.release(&saved.capsules["i"].assignment).unwrap();
+    let mut request = saved.capsules["i"].spec.clone();
     request.id = "new".into();
     request.scheduling.devices.clear();
     request.resources.cpu_millis = 1;
@@ -137,7 +137,7 @@ fn exhausted_generation_never_wraps_to_an_old_identity() {
     m.register(saved.nodes["n"].node.clone()).unwrap();
     m.submit(request).unwrap();
     assert_eq!(m.schedule(0), Err(Error::Conflict));
-    assert!(m.snapshot().instances().is_empty());
+    assert!(m.snapshot().capsules().is_empty());
 }
 
 #[test]
@@ -145,14 +145,14 @@ fn capacity_reduction_does_not_erase_persisted_scalar_usage() {
     let saved = saved();
     let mut m = Master::restore(&saved, Placement::Pack).unwrap();
     m.register(saved.nodes["n"].node.clone()).unwrap();
-    let mut request = saved.instances["i"].spec.clone();
+    let mut request = saved.capsules["i"].spec.clone();
     request.id = "cpu-only".into();
     request.scheduling.devices.clear();
     request.resources.cpu_millis = 1;
     request.resources.memory_bytes = 1;
     m.submit(request).unwrap();
     assert!(m.schedule(0).unwrap().is_none());
-    m.release(&saved.instances["i"].assignment).unwrap();
+    m.release(&saved.capsules["i"].assignment).unwrap();
     assert!(m.schedule(0).unwrap().is_some());
 }
 
@@ -168,13 +168,13 @@ fn metrics_preserve_missing_device_and_overcapacity_reservations_after_restart()
         .contains("adx_master_node_overcommitted_cpu_millis{shard_id=\"0\",node_id=\"n\"} 50\n"));
     assert!(text.contains("adx_master_node_available_cpu_millis{shard_id=\"0\",node_id=\"n\"} 0\n"));
     assert!(text.contains("kind=\"gpu\",model=\"card\",state=\"reserved\"} 1\n"));
-    let mut pending = saved.instances["i"].spec.clone();
+    let mut pending = saved.capsules["i"].spec.clone();
     pending.id = "pending".into();
     master.submit(pending).unwrap();
     assert!(master
         .metrics()
         .contains("adx_master_queued_requests{shard_id=\"0\"} 1\n"));
-    master.release(&saved.instances["i"].assignment).unwrap();
+    master.release(&saved.capsules["i"].assignment).unwrap();
     assert!(master
         .metrics()
         .contains("adx_master_node_reserved_cpu_millis{shard_id=\"0\",node_id=\"n\"} 0\n"));

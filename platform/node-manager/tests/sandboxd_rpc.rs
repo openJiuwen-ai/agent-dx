@@ -1,8 +1,8 @@
 //! Local gRPC/UDS contract tests against the pinned protocol, not sandboxd E2E.
-use adx_core::{InstanceSpec, Resources};
+use adx_core::{CapsuleSpec, Resources};
 use adx_node_manager::{
     sandboxd::{connect_when_ready, proto::*, start_request, Config, Sandboxd},
-    RuntimeBackend,
+    RuntimeDriver,
 };
 use std::{
     sync::{Arc, Mutex},
@@ -221,9 +221,9 @@ async fn connect(server: Server) -> (Sandboxd, Harness) {
         },
     )
 }
-fn spec() -> InstanceSpec {
-    InstanceSpec {
-        runtime_environment: None,
+fn spec() -> CapsuleSpec {
+    CapsuleSpec {
+        environment: None,
         snapshot_id: None,
         lifecycle: Default::default(),
         env: Default::default(),
@@ -231,7 +231,7 @@ fn spec() -> InstanceSpec {
         id: "i".into(),
         tenant_id: "tenant".into(),
         image: "rrt:test".into(),
-        runtime: "runsc".into(),
+        runtime_class: "runsc".into(),
         resources: Resources {
             cpu_millis: 1000,
             memory_bytes: 1 << 30,
@@ -617,7 +617,7 @@ async fn daemon_reconnect_adopts_preserved_runtime_without_second_start() {
     .unwrap();
     let observed = reconnected.inventory().await.unwrap();
     assert_eq!(observed.len(), 1);
-    assert_eq!(observed[0].instance_id, "i");
+    assert_eq!(observed[0].capsule_id, "i");
     assert_eq!(observed[0].runtime_id, "i-1");
     assert_eq!(observed[0].generation, 1);
     assert!(reconnected.is_running("i-1").await.unwrap());

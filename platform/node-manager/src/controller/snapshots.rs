@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 
 impl Controller {
     pub(super) async fn snapshot(&mut self, request: SnapshotRequest) -> Result<SnapshotResult> {
-        // The operation ID is scoped to tenant and Instance. Names are deliberately
+        // The operation ID is scoped to tenant and Capsule. Names are deliberately
         // excluded so retries with changed arguments conflict instead of creating twice.
         let key = serde_json::to_vec(&(
             &self.record.spec.tenant_id,
@@ -22,7 +22,7 @@ impl Controller {
             request.expected_revision,
             LifecycleKind::Snapshot,
         )?;
-        if self.record.state != InstanceState::Running
+        if self.record.state != CapsuleState::Running
             || request.timeout_seconds == 0
             || request.timeout_seconds > 3600
         {
@@ -49,13 +49,13 @@ impl Controller {
                 {
                     return Err(Error::Conflict);
                 }
-                let instance = self.sync().await?;
-                if instance.durability != Durability::Published {
+                let capsule = self.sync().await?;
+                if capsule.durability != Durability::Published {
                     return Err(Error::Unavailable(
                         "snapshot source publication pending".into(),
                     ));
                 }
-                return Ok(SnapshotResult { snapshot, instance });
+                return Ok(SnapshotResult { snapshot, capsule });
             }
             Err(Error::NotFound) if !replay => (),
             Err(error) => return Err(error),
@@ -66,7 +66,7 @@ impl Controller {
             request.names,
             self.record.spec.clone(),
             self.record.assignment.node_id.clone(),
-            self.record.runtime_id.clone(),
+            self.record.runtime.id.clone(),
             adx_core::CheckpointArtifact {
                 storage: "pending".into(),
                 location: "pending".into(),
@@ -86,7 +86,7 @@ impl Controller {
             Err(error) => {
                 // The backend may already be stopped even though its completed
                 // result could not be committed. Preserve the source when possible.
-                if self.record.state == InstanceState::Paused {
+                if self.record.state == CapsuleState::Paused {
                     if let Err(resume) = self
                         .resume(ResumeRequest {
                             operation_id: format!("{id}-resume"),
@@ -140,13 +140,13 @@ impl Controller {
             LifecycleKind::Snapshot,
         );
         self.durability = None;
-        let instance = self.sync().await?;
-        if instance.durability != Durability::Published {
+        let capsule = self.sync().await?;
+        if capsule.durability != Durability::Published {
             return Err(Error::Unavailable(
                 "snapshot source publication pending".into(),
             ));
         }
-        Ok(SnapshotResult { snapshot, instance })
+        Ok(SnapshotResult { snapshot, capsule })
     }
 }
 
@@ -162,11 +162,11 @@ impl super::Controller {
             || spec.id == snapshot.template.id
             || spec.tenant_id != snapshot.template.tenant_id
             || spec.image != snapshot.template.image
-            || spec.runtime != snapshot.template.runtime
+            || spec.runtime_class != snapshot.template.runtime_class
             || spec.resources != snapshot.template.resources
             || snapshot.state == SnapshotState::Deleted
             || !snapshot.references.contains(&Reference::Restore {
-                instance_id: spec.id.clone(),
+                capsule_id: spec.id.clone(),
             })
             || (snapshot.artifact.storage == "local"
                 && snapshot.source_node_id != self.record.assignment.node_id)
@@ -174,7 +174,7 @@ impl super::Controller {
             return Err(Error::Conflict);
         }
         let origin = snapshot.origin()?;
-        if self.record.state != InstanceState::Pending || self.record.checkpoint.is_some() {
+        if self.record.state != CapsuleState::Pending || self.record.checkpoint.is_some() {
             return self.create().await;
         }
         let store = self
@@ -193,7 +193,7 @@ impl super::Controller {
         let artifact = match copied {
             Ok(artifact) => artifact,
             Err(error) => {
-                self.record.state = InstanceState::Failed;
+                self.record.state = CapsuleState::Failed;
                 self.record.revision =
                     self.record.revision.checked_add(1).ok_or(Error::Conflict)?;
                 self.sync().await?;

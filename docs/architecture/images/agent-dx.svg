@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1440" height="1100" viewBox="0 0 1440 1100" role="img" aria-labelledby="title desc">
   <title id="title">Agent DX architecture</title>
-  <desc id="desc">Agent CLI, SDK and Executor use the public Sandbox SDK as their target platform boundary. API Server embeds Edge by default; Edge sends control traffic to the API loopback listener and data traffic to Node Proxy. Master embeds Global and Shard scheduling, persists to Redis and publishes routes. Node Manager owns Instance lifecycle, controls sandboxd, synchronizes Node Proxy over UDS and cooperates with RRT over HTTP. RRT runs inside each Instance. Both embedded pairs support explicit split-process deployment.</desc>
+  <desc id="desc">Agent CLI, SDK and Executor use the public Sandbox SDK as their target platform boundary. API Server embeds Edge by default; Edge sends control traffic to the API loopback listener and data traffic to Node Proxy. Master embeds Global and Shard scheduling, persists Capsule state to Redis and publishes routes. Node Manager owns Capsule lifecycle, controls sandboxd, synchronizes Node Proxy over UDS and cooperates with RRT over HTTP. RRT and the workload run inside a replaceable Runtime. Both embedded pairs support explicit split-process deployment.</desc>
   <defs>
     <marker id="blue" markerWidth="9" markerHeight="9" refX="8" refY="4" orient="auto"><path d="M0 0L8 4L0 8" fill="none" stroke="#2563eb" stroke-width="1.5"/></marker>
     <marker id="green" markerWidth="9" markerHeight="9" refX="8" refY="4" orient="auto"><path d="M0 0L8 4L0 8" fill="none" stroke="#0d806c" stroke-width="1.5"/></marker>
@@ -18,7 +18,7 @@
   </defs>
   <rect width="1440" height="1100" rx="20" fill="#f8fafc"/>
   <text x="48" y="60" class="title">Agent DX</text>
-  <text x="48" y="90" class="body" fill="#52647b">Agent product · shared access · Instance execution platform</text>
+  <text x="48" y="90" class="body" fill="#52647b">Agent product · shared access · Capsule execution platform</text>
   <text x="1392" y="62" text-anchor="end" class="small">SYSTEM ARCHITECTURE</text>
 
   <rect x="48" y="120" width="1344" height="116" rx="16" fill="#f1edff" stroke="#ded6f5"/>
@@ -70,14 +70,14 @@
   <text x="976" y="437" class="small">HTTP/2 CONNECT → target TCP</text>
   <rect x="954" y="536" width="366" height="133" rx="12" fill="white" stroke="#dcc391"/>
   <text x="976" y="573" class="name">Node Manager</text>
-  <text x="976" y="602" class="body">Instance lifecycle · local admission</text>
-  <text x="976" y="629" class="body">RuntimeBackend · reconcile</text>
+  <text x="976" y="602" class="body">Capsule lifecycle · local admission</text>
+  <text x="976" y="629" class="body">RuntimeDriver · reconcile</text>
   <text x="976" y="652" class="small">StateSink → Master → Redis</text>
   <rect x="954" y="728" width="366" height="68" rx="12" fill="white" stroke="#dcc391"/>
   <text x="976" y="757" class="name">sandboxd</text>
   <text x="976" y="782" class="small">External service · runtime execution</text>
   <rect x="954" y="835" width="366" height="77" rx="12" fill="#fff0d4" stroke="#dcc391"/>
-  <text x="976" y="864" class="name">Instance: RRT + workload</text>
+  <text x="976" y="864" class="name">Runtime: RRT + workload</text>
   <text x="976" y="891" class="small">Commands / files / ports · HTTP control</text>
 
   <path d="M1182 236V260H60V376H72" class="support"/>

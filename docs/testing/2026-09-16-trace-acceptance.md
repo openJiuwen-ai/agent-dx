@@ -8,7 +8,7 @@
 
 - RED：Rust 新上下文契约和 Go HTTP→RPC 契约分别因新接口未实现而失败，保留 `red.log`、`go-red.log`。
 - Rust 上下文测试：不同请求经过通道和独立任务保持父上下文；取消结束对应 Span。
-- Node Manager 18项生命周期测试通过，含真实 InstanceHandle 队列：创建调用方取消后已接受操作继续；随后删除沿用自己的请求上下文。
+- Node Manager 18项生命周期测试通过，含真实 CapsuleHandle 队列：创建调用方取消后已接受操作继续；随后删除沿用自己的请求上下文。
 - 导出故障测试通过：关闭采样时不沿用上游的采样位；不可达导出端不阻塞 Span 提交，失败计数增加，退出有时间上限。
 - Go 全套测试和服务构建通过；Gateway 67项、RRT HTTP 3项、Python 驱动58项通过；Clippy零警告。
 - Linux ARM64全部 workspace bins重新构建，Go入口重新构建；公共SDK/Redis复用已验证发布包。

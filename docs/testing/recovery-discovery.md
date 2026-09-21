@@ -1,6 +1,6 @@
 # Master 发现、节点心跳与重启对账
 
-2026-09-15。实现范围是创建／删除状态子集的服务发现、节点存活管理和本机控制器恢复。Instance 状态机仍属于 Node Manager。
+2026-09-15。实现范围是创建／删除状态子集的服务发现、节点存活管理和本机控制器恢复。Capsule 状态机仍属于 Node Manager。
 
 ## 模块与调用链
 
@@ -20,7 +20,7 @@ Master 启动 → Redis 建立新 epoch → 恢复资源占用、节点置为不
 
 Node 启动 → Redis 发现 Master → 注册 session_id（对账中、关闭新分配）
           → InspectNode 获取本节点完整目录
-          → RuntimeBackend.inventory 获取实际运行时
+          → RuntimeDriver.inventory 获取实际运行时
           → 恢复控制器／占用／本机绑定，提交清理结果
           → 后续心跳开放准入
 ```
@@ -29,7 +29,7 @@ Node 启动 → Redis 发现 Master → 注册 session_id（对账中、关闭�
 
 Redis 地址记录位于 `adx:{namespace}:master:v1`，包含 schema、epoch、address。读取时同时读取 `control:v1` 的 header，精确比较 u64 epoch；旧 Master 即使还留下未过期地址，也不再是有效发现结果。发布使用当前 Session 的 CAS，旧 epoch 不能覆盖新进程地址。这不提供选主或主备切换。
 
-发现或实例目录流暂时失败不清空 API Server 最近完成同步的 Instance 目录。已有节点操作仍可按缓存的 generation 直达 Node 并由节点复核；新 Master 地址出现后 resolver 重连，首帧全量替换旧目录。revision 断档或非法 epoch 增量会清空目录并等待新的全量帧。认证缓存继续受其 TTL 和密钥到期时间限制。
+发现或实例目录流暂时失败不清空 API Server 最近完成同步的 Capsule 目录。已有节点操作仍可按缓存的 generation 直达 Node 并由节点复核；新 Master 地址出现后 resolver 重连，首帧全量替换旧目录。revision 断档或非法 epoch 增量会清空目录并等待新的全量帧。认证缓存继续受其 TTL 和密钥到期时间限制。
 
 ## 心跳契约
 
@@ -37,7 +37,7 @@ Redis 地址记录位于 `adx:{namespace}:master:v1`，包含 schema、epoch、a
 
 Master 使用单调时钟判断心跳是否过期，`heartbeat_timeout_seconds` 默认 30 秒。过期后在同一 Redis 操作中关闭节点调度/路由，将其未删除的旧执行标记为失效 Failed 并释放逻辑资源占用；保留执行身份与 checkpoint 元数据供对账及后续恢复使用。节点仍不可调度，容量不会因此重新投入分配。维护开关／容量不足与节点是否可路由分别存储，因此停止新调度不等同于下线已有实例。本阶段最初验证的是 Master 路由视图；后续的 [路由发布阶段](route-publication.md) 已接入 Edge 全量／增量订阅。
 
-节点回来后重新进入对账握手；Master 重启后同样要求重新对账。恢复的节点从 Master 加载目录完成时起有一个心跳超时周期的报到期限，期间路由关闭；逾期未报到的旧执行失效，迟到注册和结果提交也先检查期限。较长的对账期间继续发送关闭准入的心跳。CommitInstance 校验节点证书、当前进程 session、完整 Assignment、Spec 和 revision。Master 派发 Create 也携带目标 Node session，节点拒绝发送给旧进程身份的迟到请求。
+节点回来后重新进入对账握手；Master 重启后同样要求重新对账。恢复的节点从 Master 加载目录完成时起有一个心跳超时周期的报到期限，期间路由关闭；逾期未报到的旧执行失效，迟到注册和结果提交也先检查期限。较长的对账期间继续发送关闭准入的心跳。CommitCapsule 校验节点证书、当前进程 session、完整 Assignment、Spec 和 revision。Master 派发 Create 也携带目标 Node session，节点拒绝发送给旧进程身份的迟到请求。
 
 失效标记在 Redis/Master 重启后继续有效。迟到的 Running、Paused 或自动重启结果不能恢复旧执行资格。原 Node Manager 恢复连接后先清理旧控制器与实际运行时，再开放准入。有效共享 checkpoint 的跨节点恢复和归属转移已实现，并通过本地 FC 验收，详见 [节点失效契约](node-failure-takeover.md)。
 

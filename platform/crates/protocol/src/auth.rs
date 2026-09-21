@@ -47,7 +47,7 @@ pub fn tenant(caller: Option<&CallerContext>, owner: &str) -> Result<(), Status>
     }
     if !caller.administrator && caller.tenant_id != owner {
         return Err(Status::permission_denied(
-            "instance belongs to another tenant",
+            "capsule belongs to another tenant",
         ));
     }
     Ok(())

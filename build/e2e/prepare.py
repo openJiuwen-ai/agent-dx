@@ -89,7 +89,7 @@ def main():
             'ARG BASE\nFROM ${BASE}\n'
             # The inherited process must outlive Firecracker boot, RRT
             # readiness and route publication. Exiting during that window is
-            # correctly treated as a failed Instance start.
+            # correctly treated as a failed Capsule start.
             'ENTRYPOINT ["/bin/sh", "-c", "sleep 30; echo adx-entrypoint-stderr >&2; exit 7"]\n')
         for role,base in [('node',a.runtime_base),('rrt',a.rrt_base),('entrypoint',a.rrt_base)]:
             subprocess.run(['docker','build','--progress=plain','--provenance=false','--build-arg','BASE='+base,'--build-arg','COLLECTOR='+collector_image,'-f',str(context/f'Dockerfile.{role}'),'-t',tags[role],str(context)],stderr=subprocess.STDOUT,check=True,timeout=900)

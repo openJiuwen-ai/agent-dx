@@ -1,6 +1,6 @@
 # Master 路由发布与 Node Proxy 同步
 
-2026-09-15。接通 Master → Edge 的路由发布与 Node Manager → Node Proxy 的完整绑定同步。Instance 生命周期仍由 Node Manager 管理。
+2026-09-15。接通 Master → Edge 的路由发布与 Node Manager → Node Proxy 的完整绑定同步。Capsule 生命周期仍由 Node Manager 管理。
 
 ## 模块和实际调用链
 

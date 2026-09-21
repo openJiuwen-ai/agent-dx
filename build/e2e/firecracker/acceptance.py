@@ -51,7 +51,7 @@ def verify(root):
  orphan=json.loads((root/'orphan-gc.json').read_text())
  if any(orphan.get(k) is not True for k in ('passed','current_session_preserved','retired_session_removed','foreign_preserved','unmarked_preserved')) or not orphan.get('registered_checkpoint_preserved'): raise ValueError('orphan GC preservation evidence missing')
  catalog=json.loads((root/'catalog-final.json').read_text())
- if not catalog or any(r.get('result',{}).get('state')!='Deleted' or r['result'].get('resources_held') is not False for r in catalog.values()): raise ValueError('Instance cleanup incomplete')
+ if not catalog or any(r.get('result',{}).get('state')!='Deleted' or r['result'].get('resources_held') is not False for r in catalog.values()): raise ValueError('Capsule cleanup incomplete')
  snapshots=json.loads((root/'snapshots-final.json').read_text())
  if not snapshots or any(s.get('state')!='Deleted' or s.get('references') for s in snapshots.values()): raise ValueError('Snapshot cleanup incomplete')
  if ET.fromstring((root/'s3-final.xml').read_text()).findall('{*}Contents'): raise ValueError('S3 objects remain')

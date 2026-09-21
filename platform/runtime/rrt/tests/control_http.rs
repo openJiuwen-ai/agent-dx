@@ -1,6 +1,6 @@
 //! Real Node Manager HTTP client + RRT process + backend handoff fixture.
 //! This does not invoke sandboxd or create a real kernel checkpoint.
-use adx_core::{runtime::*, Assignment, InstanceRecord, InstanceSpec, InstanceState, Resources};
+use adx_core::{runtime::*, Assignment, CapsuleRecord, CapsuleSpec, CapsuleState, Resources};
 use adx_node_manager::runtime_control::RuntimeControlClient;
 use futures_util::StreamExt;
 use std::{
@@ -31,12 +31,12 @@ impl Drop for Runtime {
         }
     }
 }
-fn record(generation: u64) -> InstanceRecord {
-    InstanceRecord {
+fn record(generation: u64) -> CapsuleRecord {
+    CapsuleRecord {
         restart_attempts: 0,
         restart_pending: false,
-        spec: InstanceSpec {
-            runtime_environment: None,
+        spec: CapsuleSpec {
+            environment: None,
             snapshot_id: None,
             lifecycle: Default::default(),
             env: Default::default(),
@@ -44,23 +44,25 @@ fn record(generation: u64) -> InstanceRecord {
             id: "i".into(),
             tenant_id: "t".into(),
             image: "rrt".into(),
-            runtime: "runsc".into(),
+            runtime_class: "runsc".into(),
             priority: 0,
             resources: Resources::default(),
             sandbox: Default::default(),
         },
         assignment: Assignment {
             devices: vec![],
-            instance_id: "i".into(),
+            capsule_id: "i".into(),
             node_id: "n".into(),
             shard_id: 0,
             generation,
         },
-        state: InstanceState::Running,
+        state: CapsuleState::Running,
         revision: 1,
-        runtime_id: format!("i-{generation}"),
+        runtime: adx_core::Runtime {
+            id: format!("i-{generation}"),
+            ip: Some("127.0.0.1".parse().unwrap()),
+        },
         resources_held: true,
-        runtime_ip: Some("127.0.0.1".parse().unwrap()),
         checkpoint: None,
         last_operation: None,
     }
@@ -89,7 +91,7 @@ impl Runtime {
         let log = std::fs::File::create(temp.path().join("rrt.log")).unwrap();
         std::fs::write(
             temp.path().join("env"),
-            "ADX_INSTANCE_ID=i\nADX_RUNTIME_ID=i-1\nADX_OWNERSHIP_GENERATION=1\n",
+            "ADX_CAPSULE_ID=i\nADX_RUNTIME_ID=i-1\nADX_OWNERSHIP_GENERATION=1\n",
         )
         .unwrap();
         drop((listener, ws_listener, tunnel_listener));
@@ -215,7 +217,7 @@ async fn real_http_client_prepares_retries_aborts_and_refreshes_restored_identit
         .await
         .is_err());
     runtime.handoff(
-        "ADX_INSTANCE_ID=i\nADX_RUNTIME_ID=i-2\nADX_OWNERSHIP_GENERATION=2\nRRT_HTTP_TOKEN=after\n",
+        "ADX_CAPSULE_ID=i\nADX_RUNTIME_ID=i-2\nADX_OWNERSHIP_GENERATION=2\nRRT_HTTP_TOKEN=after\n",
         "restore",
     );
     let restored_client = runtime.client("after");
@@ -265,7 +267,7 @@ async fn invalid_restore_identity_fails_closed_and_control_rejects_bad_json() {
     let client = runtime.client("before");
     client.prepare(&record(1), "a", 1).await.unwrap();
     runtime.handoff(
-        "ADX_INSTANCE_ID=i\nADX_RUNTIME_ID=i-stale\nADX_OWNERSHIP_GENERATION=1\n",
+        "ADX_CAPSULE_ID=i\nADX_RUNTIME_ID=i-stale\nADX_OWNERSHIP_GENERATION=1\n",
         "restore",
     );
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -286,9 +288,9 @@ async fn same_owner_restore_accepts_new_execution_and_rejects_source_control_ide
     let mut runtime = Runtime::start().await;
     let client = runtime.client("before");
     client.prepare(&record(1), "same-node", 1).await.unwrap();
-    runtime.handoff("ADX_INSTANCE_ID=i\nADX_RUNTIME_ID=i-1-r5\nADX_OWNERSHIP_GENERATION=1\nRRT_HTTP_TOKEN=after\n", "restore");
+    runtime.handoff("ADX_CAPSULE_ID=i\nADX_RUNTIME_ID=i-1-r5\nADX_OWNERSHIP_GENERATION=1\nRRT_HTTP_TOKEN=after\n", "restore");
     let mut target = record(1);
-    target.runtime_id = "i-1-r5".into();
+    target.runtime.id = "i-1-r5".into();
     let restored = runtime.client("after");
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {

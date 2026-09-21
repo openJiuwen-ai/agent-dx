@@ -33,7 +33,7 @@ SSE 创建的 `final` 事件保留 `errorCode` 数值字段，并携带同一个
 | 值 | 调用方行为 |
 |---|---|
 | `never` | 不自动重试；修改请求、凭据或由用户处理 |
-| `same_operation` | 只能使用相同 Request ID、Operation ID 和 Instance ID 查询或重试，不能换 ID 重建 |
+| `same_operation` | 只能使用相同 Request ID、Operation ID 和 Capsule ID 查询或重试，不能换 ID 重建 |
 | `after_backoff` | 在整体 deadline 内退避后重试；有稳定操作身份时仍沿用原身份 |
 
 `outcome` 只有以下取值：
@@ -69,7 +69,7 @@ SSE 创建的 `final` 事件保留 `errorCode` 数值字段，并携带同一个
 
 Python SDK 对结构化错误抛出 `SandboxHTTPError`，并公开 `status_code`、`code`、`retry`、`outcome`、`request_id`、`operation_id` 和 `instance_id`。自动重试只能发生在 `same_operation` 或 `after_backoff`，且复用原身份；`never` 立即返回调用方。旧服务没有 `error` 对象时，SDK 保留原有 HTTP 状态兼容路径，但无法给出稳定码。
 
-创建请求未显式提供名称时，SDK 使用 `create-*` Request ID 中的 UUID 生成稳定名称。跨 API Server 重试因此仍得到相同 Instance ID；查询暂时返回 404 不能触发换名称或创建第二个实例。
+创建请求未显式提供名称时，SDK 使用 `create-*` Request ID 中的 UUID 生成稳定名称。跨 API Server 重试因此仍得到相同 Capsule ID；查询暂时返回 404 不能触发换名称或创建第二个实例。
 
 实现位置：
 

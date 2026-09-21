@@ -1,4 +1,4 @@
-use adx_core::InstanceSpec;
+use adx_core::CapsuleSpec;
 use std::{
     cmp::Reverse,
     collections::{BTreeMap, VecDeque},
@@ -6,17 +6,17 @@ use std::{
 
 pub(crate) struct Entry {
     pub sequence: u64,
-    pub spec: InstanceSpec,
+    pub spec: CapsuleSpec,
 }
 #[derive(Default)]
 pub struct TenantQueue {
     tenants: VecDeque<String>,
-    queues: BTreeMap<String, BTreeMap<(Reverse<i32>, u64), InstanceSpec>>,
+    queues: BTreeMap<String, BTreeMap<(Reverse<i32>, u64), CapsuleSpec>>,
     len: usize,
     sequence: u64,
 }
 impl TenantQueue {
-    pub fn push(&mut self, request: InstanceSpec) {
+    pub fn push(&mut self, request: CapsuleSpec) {
         let sequence = self.sequence;
         self.sequence = self
             .sequence
@@ -66,7 +66,7 @@ impl TenantQueue {
         self.len -= 1;
         Some(Entry { sequence, spec })
     }
-    pub fn pop(&mut self) -> Option<InstanceSpec> {
+    pub fn pop(&mut self) -> Option<CapsuleSpec> {
         self.pop_entry().map(|e| e.spec)
     }
 }

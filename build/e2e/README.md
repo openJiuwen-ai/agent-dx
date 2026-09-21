@@ -58,15 +58,15 @@ Local Docker reproduction requires access to the same bind-mounted paths as the 
   binary file round-trip, explicit deletion, Redis terminal state and released
   resources, and empty sandboxd inventories.
 - `data-plane`: query both schedulable nodes through the installed SDK, create on
-  a selected node, reattach by Instance ID, and exercise foreground/background
+  a selected node, reattach by public instance ID (Capsule ID), and exercise foreground/background
   commands, both handle and collection stdin/EOF, sync and async waits, stable
   command replay/conflict, typed not-found/timeout results, both kill entry
   points, filesystem text/binary/depth/directory copy, stateful Shell, interactive
   PTY input/EOF/resize/state, default TLS+Token forwarded-port traffic, and a
-  per-Instance TLS-only forwarded-port policy.
-- `lifecycle`: close a detached handle, reattach to the same running Instance,
-  delete it explicitly, verify ordinary `close()` preserves the remote Instance,
-  verify context-manager deletion, then require an idle-timeout Instance to be
+  per-Capsule TLS-only forwarded-port policy.
+- `lifecycle`: close a detached handle, reattach to the same running Capsule,
+  delete it explicitly, verify ordinary `close()` preserves the remote Capsule,
+  verify context-manager deletion, then require an idle-timeout Capsule to be
   reclaimed without a client-side delete.
 - `auth`: invalid key and another tenant cannot read or delete the instance;
   the owner's instance remains running. An administrator creates, lists and
@@ -74,12 +74,12 @@ Local Docker reproduction requires access to the same bind-mounted paths as the 
   and revocation takes effect within the configured authentication cache budget.
 - `capacity`: fill both nodes' advertised CPU capacity, verify another create
   waits, then release capacity and require that request to become executable.
-- `placement`: use the public SDK on two nodes to verify instance affinity OR,
+- `placement`: use the public SDK on two nodes to verify capsule affinity OR,
   instance anti-affinity, weighted and ordered node preferences, node ID
   constraints on every OR branch, and reverse instance anti-affinity; verify
   actual assignments, execute a command and check physical cleanup.
 - `local-first`: restart API Server with `create_mode: "local_first"`, verify
-  entry-node rotation, concurrent same-name creation converging to one Instance,
+  entry-node rotation, concurrent same-name creation converging to one Capsule,
   conflicting specifications rejected, real RRT commands, and physical cleanup.
   Require Master local-claim logs, then restore the central deployment mode.
 - `node-failure`: suspend node2 Node Manager heartbeats while its runtime remains
