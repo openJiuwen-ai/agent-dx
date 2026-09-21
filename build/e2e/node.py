@@ -122,13 +122,19 @@ def main():
         temporary.replace(path)
         os.kill(pid,signal.SIGTERM)
         end=time.monotonic()+30
+        import ssl
+        import urllib.error
+        import urllib.request
+        context=ssl.create_default_context(cafile=str(S/'tls/ca.pem'))
+        request=urllib.request.Request('https://127.0.0.1:8443/api/instances',headers={
+            'Authorization':'Bearer '+(S/'api-key').read_text().strip(),
+        })
         while True:
             api=next(s for s in supervisor('status')['services'] if s['role']=='api-server')
             if api['pid'] and api['pid']!=pid:
-                import urllib.request, urllib.error
-                try: urllib.request.urlopen('http://127.0.0.1:8888/api/instances',timeout=1)
-                except urllib.error.HTTPError as error:
-                    if error.code==401:break
+                try:
+                    with urllib.request.urlopen(request,context=context,timeout=1) as response:
+                        if response.status==200:break
                 except (OSError,urllib.error.URLError):pass
             if time.monotonic()>end:raise TimeoutError('API Server mode switch did not become ready')
             time.sleep(.2)
