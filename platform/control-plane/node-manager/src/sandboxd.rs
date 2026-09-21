@@ -494,10 +494,14 @@ pub fn start_request(
             }]
         }));
     }
+    let image_process_config = environment.map_or(
+        adx_core::environment::DEFAULT_IMAGE_PROCESS_CONFIG,
+        |value| value.bootstrap.image_process_config.as_str(),
+    );
     if options.inherit_entrypoint {
         envs.insert(
             "ADX_IMAGE_PROCESS_CONFIG".into(),
-            "/etc/adx-image-process.json".into(),
+            image_process_config.into(),
         );
     }
     let cpu_limit = options.limits.cpu_millis.max(spec.resources.cpu_millis);
@@ -567,7 +571,7 @@ pub fn start_request(
             .as_ref()
             .map(|policy| sandbox_network_policy(policy, &options.ports)),
         inject_entrypoint: if options.inherit_entrypoint {
-            "/etc/adx-image-process.json".into()
+            image_process_config.into()
         } else {
             String::new()
         },

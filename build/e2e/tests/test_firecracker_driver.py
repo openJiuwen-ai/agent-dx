@@ -45,14 +45,19 @@ class FirecrackerEvidenceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             root=Path(d); package=root/'package'; artifact=package/'runtime/adx-runtime-rootfs.img'
             artifact.parent.mkdir(parents=True);artifact.write_bytes(b'erofs')
-            local=runtime_environment.resolve(package,False,root/'missing')
+            custom='/etc/adx/custom-image-process.json'
+            local=runtime_environment.resolve(package,False,root/'missing',custom)
             self.assertEqual(local['rootfs']['runtime'],'firecracker')
             self.assertEqual(local['rootfs']['path'],str(artifact.resolve()))
             self.assertEqual(local['bootstrap']['root'],str(artifact.resolve()))
+            self.assertEqual(local['bootstrap']['image_process_config'],custom)
             image=root/'runtime-image';image.write_text('registry.example/adx-runtime@sha256:'+'a'*64)
-            remote=runtime_environment.resolve(package,True,image)
+            remote=runtime_environment.resolve(package,True,image,custom)
             self.assertEqual(remote['rootfs']['image'],image.read_text())
             self.assertEqual(remote['bootstrap']['image'],image.read_text())
+            self.assertEqual(remote['bootstrap']['image_process_config'],custom)
+            with self.assertRaisesRegex(RuntimeError,'must be absolute'):
+                runtime_environment.resolve(package,False,root/'missing','etc/relative.json')
             image.write_text('registry.example/adx-runtime:latest')
             with self.assertRaisesRegex(RuntimeError,'digest pinned'):
                 runtime_environment.resolve(package,True,image)

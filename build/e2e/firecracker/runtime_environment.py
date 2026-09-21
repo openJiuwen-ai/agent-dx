@@ -2,8 +2,17 @@
 
 from pathlib import Path
 
+DEFAULT_IMAGE_PROCESS_CONFIG = "/etc/adx-image-process.json"
 
-def resolve(package: Path, kubernetes: bool, runtime_image_file: Path) -> dict:
+
+def resolve(
+    package: Path,
+    kubernetes: bool,
+    runtime_image_file: Path,
+    image_process_config: str = DEFAULT_IMAGE_PROCESS_CONFIG,
+) -> dict:
+    if not image_process_config.startswith("/"):
+        raise RuntimeError("image process config path must be absolute")
     artifact = package / "runtime/adx-runtime-rootfs.img"
     if kubernetes:
         if not runtime_image_file.is_file():
@@ -23,6 +32,7 @@ def resolve(package: Path, kubernetes: bool, runtime_image_file: Path) -> dict:
                 "image": image,
                 "target": "/__adx",
                 "entrypoint": ["/__adx/usr/local/bin/rrt-runtime"],
+                "image_process_config": image_process_config,
             },
             "env": {
                 "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -43,6 +53,7 @@ def resolve(package: Path, kubernetes: bool, runtime_image_file: Path) -> dict:
             "root": value,
             "target": "/__adx",
             "entrypoint": ["/__adx/usr/local/bin/rrt-runtime"],
+            "image_process_config": image_process_config,
         },
         "env": {
             "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
