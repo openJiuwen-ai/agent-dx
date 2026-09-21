@@ -98,7 +98,7 @@ impl Controller {
             if self.restart_after.is_some_and(|due| Instant::now() >= due) {
                 // A failed cleanup is never permission to start a second runtime.
                 self.cleanup().await?;
-                self.start_attempt(true).await?;
+                self.start_attempt(true, false, None).await?;
             }
         } else if self.record.state == InstanceState::Failed && self.record.resources_held {
             self.cleanup().await?;
@@ -111,6 +111,27 @@ impl Controller {
         self.idle = None;
         let cleanup = self.cleanup().await;
         self.transition(Event::Fail)?;
+        if self.record.spec.sandbox.failover {
+            self.record.restart_pending = false;
+            self.restart_after = None;
+            if let Err(error) = cleanup {
+                self.sync().await?;
+                return Err(error);
+            }
+            let now = crate::checkpoint::now()?;
+            if self
+                .record
+                .checkpoint
+                .as_ref()
+                .is_none_or(|checkpoint| checkpoint.expires_at_unix_seconds <= now)
+            {
+                self.sync().await?;
+                return Err(Error::Unavailable(
+                    "failover recovery point is unavailable".into(),
+                ));
+            }
+            return self.start_attempt(true, true, None).await.map(|_| ());
+        }
         self.record.restart_pending = self
             .record
             .spec

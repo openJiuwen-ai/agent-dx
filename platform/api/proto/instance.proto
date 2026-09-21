@@ -32,6 +32,8 @@ service NodeService {
   rpc DeleteInstance(DeleteInstanceRequest) returns (InstanceResult);
   rpc PauseInstance(PauseInstanceRequest) returns (InstanceResult);
   rpc ResumeInstance(ResumeInstanceRequest) returns (InstanceResult);
+  rpc UpdateNetworkPolicy(UpdateNetworkPolicyRequest) returns (InstanceResult);
+  rpc ReloadInstance(ReloadInstanceRequest) returns (InstanceResult);
   rpc CreateSnapshot(CreateSnapshotRequest) returns (CreateSnapshotResponse);
   rpc CollectSnapshot(CollectSnapshotRequest) returns (CollectSnapshotResponse);
 }
@@ -92,11 +94,34 @@ message PauseInstanceRequest { Assignment assignment = 1; CallerContext caller =
 
 message ResumeInstanceRequest { Assignment assignment = 1; CallerContext caller = 2; string operation_id = 3; uint64 expected_revision = 4; }
 
+message UpdateNetworkPolicyRequest {
+  Assignment assignment = 1;
+  CallerContext caller = 2;
+  string operation_id = 3;
+  uint64 expected_revision = 4;
+  // Absence clears the complete policy and restores unrestricted networking.
+  NetworkPolicy network = 5;
+}
+
+message ReloadInstanceRequest {
+  Assignment assignment = 1;
+  CallerContext caller = 2;
+  string operation_id = 3;
+  uint64 expected_revision = 4;
+}
+
 
 
 // Node-local entry discovery. Every frame is a complete, bounded-lifetime view.
 message WatchNodesRequest {}
-message NodeEndpoint { string node_id = 1; string address = 2; string session_id = 3; }
+message NodeEndpoint {
+  string node_id = 1;
+  string address = 2;
+  string session_id = 3;
+  Resources capacity = 4;
+  Resources allocatable = 5;
+  map<string,string> labels = 6;
+}
 message NodeDirectory { uint64 epoch = 1; repeated NodeEndpoint nodes = 2; uint64 valid_for_millis = 3; }
 message LocalCreateRequest { CreateInstanceRequest create = 1; string node_session_id = 2; }
 message PreparedCreate { InstanceSpec spec = 1; ReusableSnapshot snapshot = 2; }

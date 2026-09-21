@@ -1,0 +1,2 @@
+# Generated patch bundles preserve the upstream source whitespace literally.
+third_party/sandboxd/patches/*.patch -whitespace

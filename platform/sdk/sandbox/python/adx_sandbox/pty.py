@@ -53,10 +53,11 @@ def _normalize_command(command: str | Sequence[str]) -> list[str]:
 
 def _use_tls(connection: ConnectionConfig | None = None) -> bool:
     if connection is not None:
-        return connection.use_tls
-    if os.environ.get("ADX_SERVER_ADDRESS", "").strip():
-        raw = os.environ.get("ADX_TLS", "1")
-        return raw.strip().lower() not in ("0", "false", "no")
+        return (
+            connection.gateway_use_tls
+            if connection.gateway_address is not None
+            else connection.use_tls
+        )
     gateway = os.environ.get("ADX_GATEWAY_ADDRESS", "").strip()
     if gateway:
         raw = os.environ.get("ADX_GATEWAY_TLS", "0")
@@ -65,10 +66,12 @@ def _use_tls(connection: ConnectionConfig | None = None) -> bool:
     return raw.strip().lower() not in ("0", "false", "no")
 
 
-def _pty_server() -> str:
+def _pty_server(connection: ConnectionConfig | None = None) -> str:
+    if connection is not None:
+        return connection.gateway_address or connection.server_address
     return (
-        os.environ.get("ADX_SERVER_ADDRESS", "").strip()
-        or os.environ.get("ADX_GATEWAY_ADDRESS", "").strip()
+        os.environ.get("ADX_GATEWAY_ADDRESS", "").strip()
+        or os.environ.get("ADX_SERVER_ADDRESS", "").strip()
     )
 
 
@@ -189,8 +192,8 @@ class Pty:
             raise ValueError("timeout must be greater than zero")
 
         if self._connection_config is not None:
-            token = self._connection_config.token
-            server = self._connection_config.server_address
+            token = self._connection_config.resolved_token()
+            server = _pty_server(self._connection_config)
         else:
             token = os.environ.get("ADX_TOKEN", "").strip()
             if not token:
@@ -205,7 +208,6 @@ class Pty:
             server=server,
             use_tls=use_tls,
             instance_id=self._instance_id,
-            token=token,
             command=arguments,
             rows=rows,
             cols=cols,
@@ -219,6 +221,7 @@ class Pty:
 
         transport = _PtyConnection(
             uri,
+            token=token,
             ssl_context=_ssl_context(
                 use_tls,
                 self._connection_config.verify_tls if self._connection_config else False,

@@ -33,10 +33,7 @@ impl Default for Config {
         Self {
             runtime_environment: None,
             command: vec!["/usr/local/bin/rrt-runtime".into()],
-            env: HashMap::from([
-                ("RRT_HTTP_ONLY".into(), "1".into()),
-                ("RRT_HTTP_PORT".into(), "50090".into()),
-            ]),
+            env: HashMap::from([("RRT_HTTP_PORT".into(), "50090".into())]),
             cwd: "/".into(),
             rpc_timeout: Duration::from_secs(30),
         }
@@ -439,7 +436,10 @@ pub fn start_request(
             "resource value exceeds sandboxd numeric precision".into(),
         ));
     }
-    if spec.runtime_environment != config.runtime_environment {
+    if !deployment_environment_accepts(
+        spec.runtime_environment.as_ref(),
+        config.runtime_environment.as_ref(),
+    ) {
         return Err(Error::Invalid(
             "instance runtime environment differs from this node deployment".into(),
         ));
@@ -466,6 +466,43 @@ pub fn start_request(
         };
         xpu.entry(kind.into()).or_default().push(d.id);
     }
+    let options = &spec.sandbox;
+    let mut mounts = options
+        .mounts
+        .iter()
+        .map(sandbox_mount)
+        .collect::<Result<Vec<_>>>()?;
+    if options.rootfs.is_some() || !spec.image.is_empty() {
+        mounts.extend(environment.map_or_else(Vec::new, |e| {
+            vec![proto::Mount {
+                r#type: if e.bootstrap.r#type == "image" {
+                    "bind".into()
+                } else {
+                    e.bootstrap.r#type.clone()
+                },
+                target: e.bootstrap.target.clone(),
+                options: if e.bootstrap.r#type == "image" {
+                    vec!["ro".into(), "rbind".into()]
+                } else {
+                    vec!["ro".into()]
+                },
+                source: Some(if e.bootstrap.r#type == "image" {
+                    proto::mount::Source::ImageUrl(e.bootstrap.image.clone())
+                } else {
+                    proto::mount::Source::HostPath(e.bootstrap.root.clone())
+                }),
+            }]
+        }));
+    }
+    if options.inherit_entrypoint {
+        envs.insert(
+            "ADX_IMAGE_PROCESS_CONFIG".into(),
+            "/run/adx/image-process.json".into(),
+        );
+    }
+    let cpu_limit = options.limits.cpu_millis.max(spec.resources.cpu_millis);
+    let memory_limit = options.limits.memory_bytes.max(spec.resources.memory_bytes);
+    let disk_limit = options.limits.disk_bytes.max(spec.resources.disk_bytes);
     Ok(proto::StartRequest {
         xpu_allocations: xpu
             .into_iter()
@@ -479,75 +516,43 @@ pub fn start_request(
             .collect(),
         sandbox_id: String::new(),
         runtime: spec.runtime.clone(),
-        rootfs: Some(
-            if let Some(e) = environment.filter(|_| spec.image.is_empty()) {
-                if e.rootfs.r#type == "image" {
-                    proto::RootfsConfig {
-                        readonly: e.rootfs.readonly,
-                        r#type: proto::RootfsSrcType::Image as i32,
-                        source: Some(proto::rootfs_config::Source::ImageUrl(
-                            e.rootfs.image.clone(),
-                        )),
-                        writable_layer_size_bytes: 0,
-                    }
-                } else {
-                    proto::RootfsConfig {
-                        readonly: e.rootfs.readonly,
-                        r#type: proto::RootfsSrcType::Local as i32,
-                        source: Some(proto::rootfs_config::Source::Path(e.rootfs.path.clone())),
-                        writable_layer_size_bytes: 0,
-                    }
+        rootfs: Some(if let Some(rootfs) = &options.rootfs {
+            sandbox_rootfs(rootfs)?
+        } else if let Some(e) = environment.filter(|_| spec.image.is_empty()) {
+            if e.rootfs.r#type == "image" {
+                proto::RootfsConfig {
+                    readonly: e.rootfs.readonly,
+                    r#type: proto::RootfsSrcType::Image as i32,
+                    source: Some(proto::rootfs_config::Source::ImageUrl(
+                        e.rootfs.image.clone(),
+                    )),
+                    writable_layer_size_bytes: 0,
                 }
             } else {
                 proto::RootfsConfig {
-                    readonly: false,
-                    r#type: proto::RootfsSrcType::Image as i32,
-                    source: Some(proto::rootfs_config::Source::ImageUrl(spec.image.clone())),
+                    readonly: e.rootfs.readonly,
+                    r#type: proto::RootfsSrcType::Local as i32,
+                    source: Some(proto::rootfs_config::Source::Path(e.rootfs.path.clone())),
                     writable_layer_size_bytes: 0,
                 }
-            },
-        ),
-        mounts: if !spec.image.is_empty() {
-            environment
-                .map(|e| {
-                    vec![proto::Mount {
-                        r#type: if e.bootstrap.r#type == "image" {
-                            "bind".into()
-                        } else {
-                            e.bootstrap.r#type.clone()
-                        },
-                        target: e.bootstrap.target.clone(),
-                        options: if e.bootstrap.r#type == "image" {
-                            // OCI image-manager returns a mounted directory.  In an OCI
-                            // runtime spec, the bind operation is selected by the mount
-                            // options; type="bind" alone otherwise reaches runc as a
-                            // plain MS_RDONLY mount and fails with ENODEV.
-                            vec!["ro".into(), "rbind".into()]
-                        } else {
-                            vec!["ro".into()]
-                        },
-                        source: Some(if e.bootstrap.r#type == "image" {
-                            proto::mount::Source::ImageUrl(e.bootstrap.image.clone())
-                        } else {
-                            proto::mount::Source::HostPath(e.bootstrap.root.clone())
-                        }),
-                    }]
-                })
-                .unwrap_or_default()
+            }
         } else {
-            vec![]
-        },
+            proto::RootfsConfig {
+                readonly: false,
+                r#type: proto::RootfsSrcType::Image as i32,
+                source: Some(proto::rootfs_config::Source::ImageUrl(spec.image.clone())),
+                writable_layer_size_bytes: 0,
+            }
+        }),
+        mounts,
         command: environment
             .map(|e| e.bootstrap.entrypoint.clone())
             .unwrap_or_else(|| config.command.clone()),
         cwd: config.cwd.clone(),
         envs,
         resources: HashMap::from([
-            ("CPU".into(), spec.resources.cpu_millis as f64),
-            (
-                "Memory".into(),
-                spec.resources.memory_bytes as f64 / 1_048_576.0,
-            ),
+            ("CPU".into(), cpu_limit as f64),
+            ("Memory".into(), memory_limit as f64 / 1_048_576.0),
         ]),
         labels: HashMap::from([
             ("adx.instance_id".into(), spec.id.clone()),
@@ -555,9 +560,184 @@ pub fn start_request(
             ("adx.runtime_id".into(), runtime_id.into()),
             ("adx.generation".into(), ownership_generation.to_string()),
         ]),
-        writable_layer_limit_bytes: spec.resources.disk_bytes,
+        writable_layer_limit_bytes: disk_limit,
+        extra_config: options.extra_config.clone(),
+        network_policy: options
+            .network
+            .as_ref()
+            .map(|policy| sandbox_network_policy(policy, &options.ports)),
+        inject_entrypoint: if options.inherit_entrypoint {
+            "/run/adx/image-process.json".into()
+        } else {
+            String::new()
+        },
         ..Default::default()
     })
+}
+
+fn deployment_environment_accepts(
+    requested: Option<&adx_core::environment::RuntimeEnvironment>,
+    configured: Option<&adx_core::environment::RuntimeEnvironment>,
+) -> bool {
+    match (requested, configured) {
+        (None, None) => true,
+        (Some(requested), Some(configured)) => {
+            // Instance rootfs settings are an overlay on the trusted node
+            // deployment. The caller may select the runtime and read-only
+            // behavior, but cannot redirect the deployment-owned source,
+            // bootstrap executable, or environment.
+            requested.bootstrap == configured.bootstrap
+                && requested.env == configured.env
+                && requested.rootfs.r#type == configured.rootfs.r#type
+                && requested.rootfs.path == configured.rootfs.path
+                && requested.rootfs.image == configured.rootfs.image
+        }
+        _ => false,
+    }
+}
+
+fn sandbox_s3(value: &adx_core::sandbox::S3Source) -> proto::S3Config {
+    proto::S3Config {
+        endpoint: value.endpoint.clone(),
+        bucket: value.bucket.clone(),
+        object: value.object.clone(),
+        access_key_id: value.access_key_id.clone(),
+        access_key_secret: value.access_key_secret.clone(),
+    }
+}
+
+fn sandbox_rootfs(value: &adx_core::sandbox::Rootfs) -> Result<proto::RootfsConfig> {
+    use adx_core::sandbox::StorageSource;
+    let (kind, source) = match &value.source {
+        StorageSource::Image(value) => (
+            proto::RootfsSrcType::Image,
+            proto::rootfs_config::Source::ImageUrl(value.clone()),
+        ),
+        StorageSource::S3(value) => (
+            proto::RootfsSrcType::S3,
+            proto::rootfs_config::Source::S3Config(sandbox_s3(value)),
+        ),
+        StorageSource::Local(value) => (
+            proto::RootfsSrcType::Local,
+            proto::rootfs_config::Source::Path(value.clone()),
+        ),
+    };
+    Ok(proto::RootfsConfig {
+        readonly: value.readonly,
+        r#type: kind as i32,
+        source: Some(source),
+        writable_layer_size_bytes: 0,
+    })
+}
+
+fn sandbox_mount(value: &adx_core::sandbox::Mount) -> Result<proto::Mount> {
+    use adx_core::sandbox::StorageSource;
+    let source = match &value.source {
+        StorageSource::Image(value) => proto::mount::Source::ImageUrl(value.clone()),
+        StorageSource::S3(value) => proto::mount::Source::S3Config(sandbox_s3(value)),
+        StorageSource::Local(value) => proto::mount::Source::HostPath(value.clone()),
+    };
+    Ok(proto::Mount {
+        r#type: value.kind.clone(),
+        target: value.target.clone(),
+        options: value.options.clone(),
+        source: Some(source),
+    })
+}
+
+fn sandbox_network_policy(
+    value: &adx_core::sandbox::NetworkPolicy,
+    ports: &[u16],
+) -> proto::NetworkPolicy {
+    use adx_core::sandbox as model;
+    let action = |value| match value {
+        model::NetworkAction::Allow => proto::NetworkPolicyAction::Allow as i32,
+        model::NetworkAction::Deny => proto::NetworkPolicyAction::Deny as i32,
+    };
+    let traffic = value.traffic.as_ref().map(|traffic| {
+        let mut rules: Vec<_> = traffic
+            .rules
+            .iter()
+            .map(|rule| proto::TrafficRule {
+                action: action(rule.action),
+                direction: match rule.direction {
+                    model::NetworkDirection::Ingress => proto::NetworkDirection::Ingress as i32,
+                    model::NetworkDirection::Egress => proto::NetworkDirection::Egress as i32,
+                    model::NetworkDirection::Both => proto::NetworkDirection::Both as i32,
+                },
+                protocol: match rule.protocol {
+                    model::NetworkProtocol::Any => proto::NetworkProtocol::Any as i32,
+                    model::NetworkProtocol::Tcp => proto::NetworkProtocol::Tcp as i32,
+                    model::NetworkProtocol::Udp => proto::NetworkProtocol::Udp as i32,
+                    model::NetworkProtocol::Icmp => proto::NetworkProtocol::Icmp as i32,
+                },
+                peer: Some(proto::NetworkEndpoint {
+                    address: rule.peer.address.clone(),
+                    port: rule.peer.port,
+                    cidr: rule.peer.cidr.clone(),
+                    domain: rule.peer.domain.clone(),
+                    port_range: rule.peer.port_range.as_ref().map(|range| proto::PortRange {
+                        first: range.first,
+                        last: range.last,
+                    }),
+                }),
+                sandbox_port: rule.sandbox_port,
+                sandbox_port_range: rule.sandbox_port_range.as_ref().map(|range| {
+                    proto::PortRange {
+                        first: range.first,
+                        last: range.last,
+                    }
+                }),
+                priority: rule.priority,
+            })
+            .collect();
+        // Control traffic and declared public ports remain reachable under a
+        // deny-by-default user policy. UINT32_MAX is reserved by the public
+        // contract for these platform-owned rules.
+        for port in std::iter::once(50090u16).chain(ports.iter().copied()) {
+            rules.push(proto::TrafficRule {
+                action: proto::NetworkPolicyAction::Allow as i32,
+                direction: proto::NetworkDirection::Ingress as i32,
+                protocol: proto::NetworkProtocol::Tcp as i32,
+                peer: Some(proto::NetworkEndpoint::default()),
+                // sandboxd schema v2 forbids the legacy scalar
+                // `sandbox_port`. An exact port is represented as a one-value
+                // range, including platform-owned RRT and published-port
+                // exceptions.
+                sandbox_port_range: Some(proto::PortRange {
+                    first: u32::from(port),
+                    last: u32::from(port),
+                }),
+                priority: u32::MAX,
+                ..Default::default()
+            });
+        }
+        proto::TrafficPolicy {
+            ingress_default_action: action(traffic.ingress_default_action),
+            egress_default_action: action(traffic.egress_default_action),
+            rules,
+            mode: match traffic.mode {
+                model::TrafficMode::Stateless => proto::TrafficPolicyMode::Stateless as i32,
+                model::TrafficMode::Stateful => proto::TrafficPolicyMode::Stateful as i32,
+            },
+            ..Default::default()
+        }
+    });
+    proto::NetworkPolicy {
+        traffic,
+        dns: value.dns.as_ref().map(|dns| proto::DnsPolicy {
+            default_action: action(dns.default_action),
+            rules: dns
+                .rules
+                .iter()
+                .map(|rule| proto::DnsRule {
+                    action: action(rule.action),
+                    pattern: rule.pattern.clone(),
+                })
+                .collect(),
+        }),
+        schema_version: 2,
+    }
 }
 
 #[async_trait]
@@ -718,6 +898,23 @@ impl RuntimeBackend for Sandboxd {
     async fn is_running(&self, runtime_id: &str) -> Result<bool> {
         Sandboxd::is_running(self, runtime_id).await
     }
+    async fn set_network_policy(
+        &self,
+        runtime_id: &str,
+        policy: Option<&adx_core::sandbox::NetworkPolicy>,
+        ports: &[u16],
+    ) -> Result<()> {
+        let id = self.physical_id(runtime_id).await?.ok_or(Error::NotFound)?;
+        self.client
+            .clone()
+            .set_network_policy(self.request(proto::SetNetworkPolicyRequest {
+                sandbox_id: id,
+                network_policy: policy.map(|value| sandbox_network_policy(value, ports)),
+            }))
+            .await
+            .map_err(unavailable)?;
+        Ok(())
+    }
     async fn start(
         &self,
         spec: &InstanceSpec,
@@ -808,7 +1005,11 @@ mod tests {
                 disk_bytes: 5 * 1024 * 1024 * 1024,
             },
             priority: 0,
+            sandbox: Default::default(),
         };
+        let default_request = start_request(&spec, "i-7", 7, &[], &Config::default()).unwrap();
+        assert!(!default_request.envs.contains_key("RRT_HTTP_ONLY"));
+        assert_eq!(default_request.envs["RRT_HTTP_PORT"], "50090");
         let config = Config {
             env: HashMap::from([
                 ("ADX_INSTANCE_ID".into(), "spoofed".into()),

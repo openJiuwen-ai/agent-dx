@@ -174,6 +174,12 @@ impl Api {
                 Err(error) => error_response(error, &request_id, None, None, method != "GET"),
             };
         }
+        if method == "GET" && path == "/api/sandbox/v1/resources" {
+            return match self.clients.nodes().await {
+                Ok(nodes) => plain(StatusCode::OK.as_u16(), resource_view(nodes)),
+                Err(error) => error_response(error, &request_id, None, None, false),
+            };
+        }
         if method == "GET" && path == "/api/instances" {
             let Some(instance_id) = query
                 .get("instance_id")
@@ -309,6 +315,8 @@ impl Api {
                 ("POST", "pause") => Some(Kind::Pause),
                 ("POST", "resume") => Some(Kind::Resume),
                 ("POST", "snapshots") => Some(Kind::Snapshot),
+                ("PUT", "network") => Some(Kind::Network),
+                ("POST", "reload") => Some(Kind::Reload),
                 _ => None,
             };
             if let Some(kind) = kind {
@@ -341,10 +349,7 @@ impl Api {
                     true,
                 );
             }
-            if matches!(
-                (method.as_str(), action),
-                ("POST", "reload" | "invoke") | ("PUT", "network")
-            ) {
+            if matches!((method.as_str(), action), ("POST", "invoke")) {
                 if let Err(e) = Box::pin(self.clients.owner(id, &caller, false)).await {
                     return response(Err(e), &request_id, None, Some(id), false);
                 }
@@ -1025,6 +1030,26 @@ fn route_name(path: &str) -> &'static str {
     }
 }
 
+fn resource_view(nodes: Vec<pb::NodeEndpoint>) -> Value {
+    fn scalar(resources: Option<pb::Resources>) -> Value {
+        let resources = resources.unwrap_or_default();
+        json!({
+            "CPU": resources.cpu_millis,
+            "Memory": resources.memory_bytes / 1_048_576,
+            "Disk": resources.disk_bytes / 1_048_576,
+        })
+    }
+    json!({
+        "items": nodes.into_iter().map(|node| json!({
+            "id": node.node_id,
+            "status": 1,
+            "capacity": scalar(node.capacity),
+            "allocatable": scalar(node.allocatable),
+            "labels": node.labels,
+        })).collect::<Vec<_>>()
+    })
+}
+
 #[cfg(test)]
 mod error_contract_tests {
     use super::*;
@@ -1039,6 +1064,30 @@ mod error_contract_tests {
                 .to_bytes(),
         )
         .expect("JSON error body")
+    }
+
+    #[test]
+    fn resource_view_uses_public_units_and_plain_labels() {
+        let value = resource_view(vec![pb::NodeEndpoint {
+            node_id: "node-a".into(),
+            address: "node-a:17001".into(),
+            session_id: "session-a".into(),
+            capacity: Some(pb::Resources {
+                cpu_millis: 4000,
+                memory_bytes: 8 * 1_048_576,
+                disk_bytes: 20 * 1_048_576,
+            }),
+            allocatable: Some(pb::Resources {
+                cpu_millis: 3000,
+                memory_bytes: 6 * 1_048_576,
+                disk_bytes: 10 * 1_048_576,
+            }),
+            labels: [("arch".into(), "arm64".into())].into_iter().collect(),
+        }]);
+        assert_eq!(value["items"][0]["id"], "node-a");
+        assert_eq!(value["items"][0]["capacity"]["CPU"], 4000);
+        assert_eq!(value["items"][0]["allocatable"]["Memory"], 6);
+        assert_eq!(value["items"][0]["labels"]["arch"], "arm64");
     }
 
     #[tokio::test]

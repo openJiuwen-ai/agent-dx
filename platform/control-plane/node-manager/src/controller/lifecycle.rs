@@ -4,6 +4,72 @@ use adx_core::{CompletedOperation, LifecycleKind, RestorePoint};
 use std::{path::Path, time::Duration};
 
 impl Controller {
+    pub(super) async fn reload(
+        &mut self,
+        operation_id: String,
+        expected_revision: u64,
+    ) -> Result<OperationResult> {
+        if self.replay_operation(&operation_id, expected_revision, LifecycleKind::Reload)? {
+            return self.replay_or_sync().await;
+        }
+        if self.record.state != InstanceState::Running {
+            return Err(Error::Conflict);
+        }
+        let checkpoint = self
+            .record
+            .checkpoint
+            .as_ref()
+            .ok_or_else(|| Error::Unavailable("reload recovery point is unavailable".into()))?;
+        if checkpoint.expires_at_unix_seconds <= now()? {
+            return Err(Error::Invalid("reload recovery point expired".into()));
+        }
+        self.services
+            .checkpoint
+            .as_ref()
+            .ok_or_else(|| Error::Unavailable("checkpoint storage is unavailable".into()))?
+            .store
+            .validate_artifact(&checkpoint.artifact)
+            .await?;
+        self.cleanup().await?;
+        self.transition(Event::Fail)?;
+        self.start_attempt(
+            true,
+            true,
+            Some((operation_id, expected_revision, LifecycleKind::Reload)),
+        )
+        .await
+    }
+
+    pub(super) async fn update_network_policy(
+        &mut self,
+        policy: Option<adx_core::sandbox::NetworkPolicy>,
+        operation_id: String,
+        expected_revision: u64,
+    ) -> Result<OperationResult> {
+        if self.replay_operation(&operation_id, expected_revision, LifecycleKind::Network)? {
+            return self.replay_or_sync().await;
+        }
+        if self.record.state != InstanceState::Running {
+            return Err(Error::Conflict);
+        }
+        if let Some(policy) = &policy {
+            policy.validate()?;
+        }
+        self.services
+            .runtime
+            .set_network_policy(
+                &self.record.runtime_id,
+                policy.as_ref(),
+                &self.record.spec.sandbox.ports,
+            )
+            .await?;
+        self.record.spec.sandbox.network = policy;
+        self.record.revision = self.record.revision.checked_add(1).ok_or(Error::Conflict)?;
+        self.completed(operation_id, expected_revision, LifecycleKind::Network);
+        self.durability = None;
+        self.sync().await
+    }
+
     pub(super) async fn expire_checkpoint(&mut self, now: u64) -> Result<()> {
         let Some(cp) = self
             .record

@@ -45,7 +45,7 @@ _NETWORK_DIRECTIONS = frozenset({"ingress", "egress", "both"})
 _NETWORK_PROTOCOLS = frozenset({"any", "tcp", "udp", "icmp"})
 _TRAFFIC_POLICY_MODES = frozenset({"stateless", "stateful"})
 _MAX_TRAFFIC_RULES = 256
-# UINT32_MAX is reserved for FunctionSystem's control-plane and published-port
+# UINT32_MAX is reserved for ADX control-plane and published-port
 # rules, which must remain effective even when user traffic is default-deny.
 _MAX_USER_RULE_PRIORITY = (1 << 32) - 2
 

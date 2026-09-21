@@ -12,6 +12,8 @@ pub enum Kind {
     Pause,
     Resume,
     Snapshot,
+    Network,
+    Reload,
 }
 impl Kind {
     fn code(self) -> i32 {
@@ -19,6 +21,8 @@ impl Kind {
             Self::Pause => pb::LifecycleKind::Pause,
             Self::Resume => pb::LifecycleKind::Resume,
             Self::Snapshot => pb::LifecycleKind::Snapshot,
+            Self::Network => pb::LifecycleKind::Network,
+            Self::Reload => pb::LifecycleKind::Reload,
             Self::Delete => pb::LifecycleKind::Unspecified,
         }) as i32
     }
@@ -203,6 +207,37 @@ impl Operations {
                     }
                     Err(error) => Err(error),
                 },
+                Kind::Network => {
+                    let network =
+                        crate::contract::network_policy(operation.body.clone())?.map(Into::into);
+                    clients
+                        .rpc(
+                            "api_server.update_network_policy",
+                            node.update_network_policy(trace::inject(
+                                pb::UpdateNetworkPolicyRequest {
+                                    assignment,
+                                    caller: caller_context,
+                                    operation_id: request_id.into(),
+                                    expected_revision: operation.expected,
+                                    network,
+                                },
+                            )),
+                        )
+                        .await
+                }
+                Kind::Reload => {
+                    clients
+                        .rpc(
+                            "api_server.reload",
+                            node.reload_instance(trace::inject(pb::ReloadInstanceRequest {
+                                assignment,
+                                caller: caller_context,
+                                operation_id: request_id.into(),
+                                expected_revision: operation.expected,
+                            })),
+                        )
+                        .await
+                }
             };
             match result {
                 Ok(result) => {
@@ -281,6 +316,8 @@ impl Operations {
                                 .ok_or_else(|| Status::data_loss("invalid snapshot source"))?;
                             snapshot_value(snapshot, caller)?
                         }
+                        Kind::Network => json!({"success": true}),
+                        Kind::Reload => json!({"success": true}),
                     };
                     owner.record = result.record;
                     clients.put_owner(owner).await?;

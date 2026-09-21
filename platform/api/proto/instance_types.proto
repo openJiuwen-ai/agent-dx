@@ -20,6 +20,78 @@ message InstanceSpec {
   SchedulingPolicy scheduling = 7;
   map<string,string> env = 8;
   LifecyclePolicy lifecycle = 9;
+  SandboxOptions sandbox = 12;
+}
+
+message S3Source {
+  string endpoint = 1;
+  string bucket = 2;
+  string object = 3;
+  string access_key_id = 4;
+  string access_key_secret = 5;
+}
+
+message StorageSource {
+  oneof source {
+    string image = 1;
+    S3Source s3 = 2;
+    string local = 3;
+  }
+}
+
+message RootfsSpec { bool readonly = 1; StorageSource source = 2; }
+message MountSpec {
+  string type = 1;
+  string target = 2;
+  repeated string options = 3;
+  StorageSource source = 4;
+}
+
+enum NetworkAction { NETWORK_ACTION_UNSPECIFIED = 0; NETWORK_ACTION_ALLOW = 1; NETWORK_ACTION_DENY = 2; }
+enum NetworkDirection { NETWORK_DIRECTION_UNSPECIFIED = 0; NETWORK_DIRECTION_INGRESS = 1; NETWORK_DIRECTION_EGRESS = 2; NETWORK_DIRECTION_BOTH = 3; }
+enum NetworkProtocol { NETWORK_PROTOCOL_UNSPECIFIED = 0; NETWORK_PROTOCOL_ANY = 1; NETWORK_PROTOCOL_TCP = 2; NETWORK_PROTOCOL_UDP = 3; NETWORK_PROTOCOL_ICMP = 4; }
+enum TrafficMode { TRAFFIC_MODE_UNSPECIFIED = 0; TRAFFIC_MODE_STATELESS = 1; TRAFFIC_MODE_STATEFUL = 2; }
+message PortRange { uint32 first = 1; uint32 last = 2; }
+message NetworkPeer { string address = 1; uint32 port = 2; string cidr = 3; string domain = 4; PortRange port_range = 5; }
+message NetworkRule {
+  NetworkAction action = 1;
+  NetworkDirection direction = 2;
+  NetworkProtocol protocol = 3;
+  NetworkPeer peer = 4;
+  uint32 sandbox_port = 5;
+  PortRange sandbox_port_range = 6;
+  uint32 priority = 7;
+}
+message TrafficPolicy {
+  NetworkAction ingress_default_action = 1;
+  NetworkAction egress_default_action = 2;
+  repeated NetworkRule rules = 3;
+  TrafficMode mode = 4;
+}
+message DnsRule { NetworkAction action = 1; string pattern = 2; }
+message DnsPolicy { NetworkAction default_action = 1; repeated DnsRule rules = 2; }
+message NetworkPolicy { TrafficPolicy traffic = 1; DnsPolicy dns = 2; }
+
+enum DataPlaneSecurityMode {
+  DATA_PLANE_SECURITY_INHERIT = 0;
+  DATA_PLANE_SECURITY_TLS = 1;
+  DATA_PLANE_SECURITY_TLS_TOKEN = 2;
+}
+message DataPlanePolicy {
+  DataPlaneSecurityMode tunnel = 1;
+  DataPlaneSecurityMode port_forward = 2;
+}
+message ResourceLimits { uint64 cpu_millis = 1; uint64 memory_bytes = 2; uint64 disk_bytes = 3; }
+message SandboxOptions {
+  RootfsSpec rootfs = 1;
+  repeated MountSpec mounts = 2;
+  NetworkPolicy network = 3;
+  DataPlanePolicy data_plane = 4;
+  repeated uint32 ports = 5;
+  bool failover = 6;
+  bool inherit_entrypoint = 7;
+  ResourceLimits limits = 8;
+  string extra_config = 9;
 }
 
 message LifecyclePolicy { uint64 idle_timeout_seconds = 1; RestartPolicy restart = 2; }
@@ -130,7 +202,7 @@ message RuntimeIdentity { string instance_id = 1; string runtime_id = 2; uint64 
 
 message RestorePoint { RuntimeIdentity origin = 5; string id = 1; CheckpointArtifact artifact = 2; uint64 expires_at_unix_seconds = 3; string source_runtime_id = 4; }
 
-enum LifecycleKind { LIFECYCLE_KIND_UNSPECIFIED = 0; LIFECYCLE_KIND_PAUSE = 1; LIFECYCLE_KIND_RESUME = 2; LIFECYCLE_KIND_SNAPSHOT = 3; }
+enum LifecycleKind { LIFECYCLE_KIND_UNSPECIFIED = 0; LIFECYCLE_KIND_PAUSE = 1; LIFECYCLE_KIND_RESUME = 2; LIFECYCLE_KIND_SNAPSHOT = 3; LIFECYCLE_KIND_NETWORK = 4; LIFECYCLE_KIND_RELOAD = 5; }
 
 message CompletedOperation { string id = 1; LifecycleKind kind = 2; uint64 expected_revision = 3; }
 

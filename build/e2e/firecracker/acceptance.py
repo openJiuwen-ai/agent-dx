@@ -7,11 +7,17 @@ import xml.etree.ElementTree as ET
 CASES = {
  'sdk': {
   'create through Frontend and execute through Edge',
+  'S3 rootfs and independent execution limits start through sandboxd',
+  'S3 EROFS mount is visible inside the sandbox',
+  'inherited image entrypoint reports structured exit status',
   'pause with persisted recovery point',
   'Node Manager restart while paused',
   'remote orphan GC preserves registered checkpoint',
   'SDK labels peer affinity and ordered weighted placement',
   'resume preserves process memory, PID and binary file',
+  'reload restores the latest recovery point without a cold start',
+  'runtime network policy replacement blocks egress and preserves RRT control',
+  'creation network policy is enforced while the control route stays reachable',
   'explicit delete',
   'reusable snapshot preserves running source',
   'snapshot remains queryable after source deletion',
@@ -24,8 +30,10 @@ CASES = {
   'unexpected backend exit restarts with a fresh execution',
   'Master outage uses SQLite for idle deletion while Redis remains stale',
   'Node Manager restart waits for Master without cleaning an owned runtime',
-  'Master recovery replays journal and reconciles the retained runtime',
+  'Master recovery fences an expired node session and reconciles stale runtimes',
   'expired resource observations close admission and recover without killing instances',
+  'failover restores the latest checkpoint without a cold start',
+  'failover without a checkpoint becomes failed without cold start',
  },
 }
 

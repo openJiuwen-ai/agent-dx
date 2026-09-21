@@ -100,6 +100,30 @@ try:
     assert 'adx_node_reserved_cpu_millis' in stats
     s.kill()
 
+    recovered_from_checkpoint = create(idle_timeout=0, failover=True)
+    recovered_from_checkpoint.files.write('/tmp/failover-state', 'checkpoint-state')
+    checkpoint = recovered_from_checkpoint.pause(ttl_seconds=600, timeout_seconds=120)
+    assert checkpoint.size > 0
+    recovered_from_checkpoint.resume()
+    before_failover = record(recovered_from_checkpoint.id)
+    old = physical(recovered_from_checkpoint.id)
+    assert len(old) == 1, old
+    command([a.sbox,'-a',root/'sandboxd/sandboxd.sock','delete',old[0]])
+    recovered = wait(lambda: (r if (r:=record(recovered_from_checkpoint.id)) and r['state']=='Running' and r['runtime_id']!=before_failover['runtime_id'] else None), 120)
+    assert recovered_from_checkpoint.files.read('/tmp/failover-state') == 'checkpoint-state'
+    passed('failover restores the latest checkpoint without a cold start', instance_id=recovered_from_checkpoint.id, snapshot_id=checkpoint.snapshot_id, old_runtime=before_failover['runtime_id'], new_runtime=recovered['runtime_id'])
+    recovered_from_checkpoint.kill()
+
+    unrecoverable = create(idle_timeout=0, failover=True)
+    old = physical(unrecoverable.id)
+    assert len(old) == 1, old
+    command([a.sbox,'-a',root/'sandboxd/sandboxd.sock','delete',old[0]])
+    failed = wait(lambda: (r if (r:=record(unrecoverable.id)) and r['state']=='Failed' else None), 90)
+    assert not physical(unrecoverable.id)
+    assert not failed['restart_pending']
+    passed('failover without a checkpoint becomes failed without cold start', instance_id=unrecoverable.id)
+    unrecoverable.kill()
+
     keep = create(idle_timeout=0)
     idle = create(idle_timeout=8)
     master_pid = pid('master')
@@ -125,21 +149,30 @@ try:
     assert journaled_delete()
     passed('Node Manager restart waits for Master without cleaning an owned runtime')
     os.kill(master_pid,signal.SIGCONT); stopped.remove(master_pid)
-    wait(lambda:record(idle.id)['state']=='Deleted',90)
+    # The Master clock continues while the process is stopped. Once the node
+    # heartbeat lease expires, the old session and all of its executions are
+    # fenced. The replacement process must discard that session's journal and
+    # clean its retained runtime during authoritative reconciliation.
+    idle_failed = wait(lambda: (r if (r:=record(idle.id)) and r['state']=='Failed' else None),90)
+    keep_failed = wait(lambda: (r if (r:=record(keep.id)) and r['state']=='Failed' else None),90)
     wait(lambda:catalog()['node:node1']['session']['routable'],90)
     def drained():
         with sqlite3.connect(db_path) as db:return db.execute('select count(*) from pending').fetchone()[0]==0
     wait(drained)
-    assert keep.commands.run('printf recovered').stdout.strip()=='recovered'
-    passed('Master recovery replays journal and reconciles the retained runtime')
+    wait(lambda:not physical(keep.id),90)
+    assert not idle_failed['resources_held'] and not keep_failed['resources_held']
+    passed('Master recovery fences an expired node session and reconciles stale runtimes')
+    keep.kill()
+    idle.kill()
 
+    observed = create(idle_timeout=0)
     resource_socket.rename(hidden_socket)
     wait(lambda:not catalog()['node:node1']['node']['available'],30)
-    assert len(physical(keep.id))==1
+    assert len(physical(observed.id))==1
     hidden_socket.rename(resource_socket)
     wait(lambda:catalog()['node:node1']['node']['available'],30)
     passed('expired resource observations close admission and recover without killing instances')
-    keep.kill()
+    observed.kill()
     wait(lambda:all(v.get('result',{}).get('state')=='Deleted' for k,v in catalog().items() if k.startswith('instance:')))
     result['status']='passed'
 except Exception as error:

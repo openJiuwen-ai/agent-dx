@@ -127,8 +127,8 @@ pub fn bash_submit(kw: &BTreeMap<String, Value>) -> Value {
 /// bash_poll(session_id, wait_timeout) → {status, stdout?, stderr?, exit_code?}。
 pub fn bash_poll(kw: &BTreeMap<String, Value>) -> Value {
     let sid = kw_str(kw, "session_id").unwrap_or_default();
-    let s = sessions().lock().unwrap();
-    let session = match s.get(&sid) {
+    let mut s = sessions().lock().unwrap();
+    let session = match s.get_mut(&sid) {
         Some(x) => x,
         None => {
             return map_value(vec![
@@ -157,7 +157,22 @@ pub fn bash_poll(kw: &BTreeMap<String, Value>) -> Value {
         }
         from = pos + marker.len();
     }
-    map_value(vec![("status", Value::from("running"))])
+    match session.child.try_wait() {
+        Ok(Some(status)) => map_value(vec![
+            ("status", Value::from("done")),
+            ("stdout", Value::from(out)),
+            ("stderr", Value::from("")),
+            ("exit_code", Value::from(status.exit_code() as i64)),
+        ]),
+        Ok(None) => map_value(vec![("status", Value::from("running"))]),
+        Err(error) => map_value(vec![
+            ("status", Value::from("error")),
+            (
+                "error",
+                Value::from(format!("failed to inspect session {sid}: {error}")),
+            ),
+        ]),
+    }
 }
 
 /// bash_destroy(session_id) → {error}。
@@ -233,6 +248,33 @@ mod tests {
         assert!(
             stdout.contains("stateful__RRT_PROMPT__ echo __RRT_DONE_$?__"),
             "unexpected shell framing: {stdout:?}"
+        );
+
+        let _ = bash_destroy(&args(&[("session_id", Value::from(session_id.as_str()))]));
+    }
+
+    #[test]
+    fn shell_exit_without_sentinel_returns_terminal_result() {
+        let session_id = format!("exit-test-{}", std::process::id());
+        let init = bash_init(&args(&[
+            ("session_id", Value::from(session_id.as_str())),
+            ("shell", Value::from("/bin/bash")),
+        ]));
+        assert_eq!(field(&init, "error"), Some(&Value::Nil));
+
+        let submit = bash_submit(&args(&[
+            ("session_id", Value::from(session_id.as_str())),
+            ("command", Value::from("printf shell-exited; exit 7")),
+        ]));
+        assert_eq!(field(&submit, "error"), Some(&Value::Nil));
+
+        let result = poll_until_done(&session_id);
+        assert_eq!(field(&result, "exit_code").and_then(Value::as_i64), Some(7));
+        assert!(
+            field(&result, "stdout")
+                .and_then(Value::as_str)
+                .is_some_and(|stdout| stdout.contains("shell-exited")),
+            "unexpected shell result: {result:?}"
         );
 
         let _ = bash_destroy(&args(&[("session_id", Value::from(session_id.as_str()))]));

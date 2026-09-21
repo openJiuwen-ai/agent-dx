@@ -21,6 +21,7 @@ fn spec(id: &str) -> InstanceSpec {
         },
         priority: 0,
         scheduling: Default::default(),
+        sandbox: Default::default(),
     }
 }
 fn node(id: &str) -> Node {
@@ -51,6 +52,48 @@ async fn register(s: &adx_master::storage::Session, id: &str) -> StoredNode {
     s.register(node(id), "127.0.0.1:9000".into(), "127.0.0.1:9001".into())
         .await
         .unwrap()
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn runtime_network_policy_is_the_only_mutable_spec_field() {
+    let rig = common::Redis::new().await;
+    let session = rig.store().await.begin(1).await.unwrap();
+    register(&session, "node").await;
+    let assignment = Assignment {
+        instance_id: "networked".into(),
+        node_id: "node".into(),
+        shard_id: 0,
+        generation: 1,
+        devices: vec![],
+    };
+    session
+        .reserve(spec("networked"), assignment.clone())
+        .await
+        .unwrap();
+    let initial = running(spec("networked"), assignment);
+    session.commit(initial.clone()).await.unwrap();
+
+    let mut updated = initial;
+    updated.spec.sandbox.network = Some(adx_core::sandbox::NetworkPolicy::default());
+    updated.revision = 3;
+    updated.last_operation = Some(adx_core::CompletedOperation {
+        id: "network-1".into(),
+        kind: adx_core::LifecycleKind::Network,
+        expected_revision: 2,
+    });
+    assert_eq!(session.commit(updated.clone()).await.unwrap(), updated);
+    let stored = session.get("networked").await.unwrap();
+    assert_eq!(stored.spec, updated.spec);
+    assert_eq!(stored.result.as_ref().unwrap().spec, updated.spec);
+
+    let mut changed_resources = updated;
+    changed_resources.spec.resources.cpu_millis += 1;
+    changed_resources.revision = 4;
+    assert_eq!(
+        session.commit(changed_resources).await,
+        Err(Error::Conflict)
+    );
 }
 
 #[tokio::test]

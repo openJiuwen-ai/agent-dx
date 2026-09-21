@@ -280,7 +280,9 @@ fn validate_result(r: &InstanceRecord) -> Result<()> {
     }
 }
 fn next_result(old: &StoredInstance, r: &InstanceRecord) -> Result<bool> {
-    if old.spec != r.spec || old.assignment != r.assignment {
+    let mut expected_spec = old.spec.clone();
+    expected_spec.sandbox.network = r.spec.sandbox.network.clone();
+    if expected_spec != r.spec || old.assignment != r.assignment {
         return Err(Error::Conflict);
     }
     validate_result(r)?;
@@ -856,7 +858,14 @@ impl Session {
                     recovery.pending = false;
                 }
             }
+            // Runtime network policy is the only mutable part of an Instance
+            // specification. Persist it with the result so later lifecycle
+            // commits compare against the version already enforced by the
+            // runtime, while every placement and resource field remains
+            // fenced by `next_result` above.
+            stored_instance.spec = result.spec.clone();
             stored_instance.result = Some(result.clone());
+            stored_instance.validate()?;
             header.advance()?;
             if self
                 .store

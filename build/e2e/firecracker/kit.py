@@ -1,13 +1,13 @@
 """Verify an externally built, immutable Firecracker runtime kit before packaging."""
 import hashlib,json
 from pathlib import Path
-REQUIRED={'bin/sandboxd','bin/sbox','bin/checkpoint-restore','bin/firecracker','artifacts/Image','artifacts/initrd.img','tools/virtiofsd','tools/minio','tools/redis-cli'}
+REQUIRED={'bin/sandboxd','bin/sbox','bin/checkpoint-restore','bin/firecracker','artifacts/Image','artifacts/initrd.img','tools/virtiofsd','tools/distill_fs','tools/minio','tools/docker-registry','tools/redis-cli'}
 
 def verify(directory,backend):
  root=Path(directory)
  if root.is_symlink() or (root/'manifest.json').is_symlink():raise ValueError('runtime kit symlink rejected')
  manifest=json.loads((root/'manifest.json').read_text())
- if manifest.get('schema_version')!=1 or manifest.get('target')!=backend['target'] or manifest.get('sandboxd_revision')!=backend['sandboxd_revision']:raise ValueError('runtime kit architecture or sandboxd revision mismatch')
+ if manifest.get('schema_version')!=1 or manifest.get('target')!=backend['target'] or manifest.get('sandboxd_revision')!=backend['sandboxd_revision'] or manifest.get('sandboxd_patches')!=backend.get('sandboxd_patches'):raise ValueError('runtime kit architecture or sandboxd source identity mismatch')
  if set(manifest.get('files',{}))!=REQUIRED:raise ValueError('runtime kit file inventory mismatch')
  for name,expected in manifest['files'].items():
   path=root/name
@@ -19,4 +19,6 @@ def verify(directory,backend):
  for name in ('sandboxd','sbox','redis-cli'):
   prefix='tools/' if name=='redis-cli' else 'bin/'
   if manifest['files'][prefix+name]!=backend['files'][name]:raise ValueError('runtime kit and backend artifact differ: '+name)
+ if manifest['files']['artifacts/initrd.img']!=backend['files']['firecracker-initrd.img']:
+  raise ValueError('runtime kit and backend guest agent differ: initrd.img')
  return manifest

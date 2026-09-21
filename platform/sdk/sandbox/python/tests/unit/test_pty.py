@@ -38,7 +38,6 @@ class PtyTests(unittest.TestCase):
             server="frontend.example:443",
             use_tls=True,
             instance_id="sandbox/1",
-            token="secret",
             command=["/bin/bash", "-lc", "echo hello"],
             rows=24,
             cols=80,
@@ -46,9 +45,10 @@ class PtyTests(unittest.TestCase):
         parsed = urlparse(uri)
         query = parse_qs(parsed.query)
         self.assertEqual(parsed.scheme, "wss")
-        self.assertEqual(parsed.path, "/terminal/ws")
+        self.assertEqual(parsed.path, "/direct/sandbox%2F1/pty")
         self.assertEqual(query["protocol"], ["sandbox.pty.v1"])
         self.assertEqual(query["command"], ["/bin/bash", "-lc", "echo hello"])
+        self.assertNotIn("token", query)
 
     def test_pty_uses_adx_process_configuration(self):
         pty = Pty("sandbox-1")
@@ -66,8 +66,9 @@ class PtyTests(unittest.TestCase):
         seen = {}
 
         class Connection:
-            def __init__(self, uri, **_kwargs):
+            def __init__(self, uri, **kwargs):
                 seen["uri"] = uri
+                seen["token"] = kwargs["token"]
 
             def start(self, _timeout):
                 pass
@@ -89,10 +90,12 @@ class PtyTests(unittest.TestCase):
 
         parsed = urlparse(seen["uri"])
         self.assertEqual(parsed.scheme, "wss")
-        self.assertEqual(parsed.netloc, "frontend.example:443")
-        self.assertEqual(parse_qs(parsed.query)["token"], ["secret"])
+        self.assertEqual(parsed.netloc, "gateway.example:8443")
+        self.assertEqual(parsed.path, "/direct/sandbox-1/pty")
+        self.assertEqual(seen["token"], "secret")
+        self.assertNotIn("token", parse_qs(parsed.query))
 
-    def test_server_address_is_preferred_over_gateway(self):
+    def test_gateway_address_is_preferred_for_data_plane_pty(self):
         with patch.dict(
             "os.environ",
             {
@@ -103,8 +106,8 @@ class PtyTests(unittest.TestCase):
             },
             clear=True,
         ):
-            self.assertEqual(_pty_server(), "frontend:8888")
-            self.assertFalse(_use_tls())
+            self.assertEqual(_pty_server(), "edge:8080")
+            self.assertTrue(_use_tls())
 
 if __name__ == "__main__":
     unittest.main()

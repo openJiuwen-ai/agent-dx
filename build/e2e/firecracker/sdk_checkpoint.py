@@ -8,6 +8,7 @@ import argparse
 import importlib.metadata
 import json
 import os
+import shlex
 from pathlib import Path
 import subprocess
 import time
@@ -18,11 +19,14 @@ p.add_argument('--endpoint', required=True)
 p.add_argument('--token-file', type=Path, required=True)
 p.add_argument('--ca', type=Path, required=True)
 p.add_argument('--image', required=True)
+p.add_argument('--entrypoint-image', required=True)
+p.add_argument('--package', type=Path, default=Path('/opt/adx/package'))
 p.add_argument('--output', type=Path, required=True)
 p.add_argument('--restart-command', nargs='+')
 a = p.parse_args()
 os.environ['SSL_CERT_FILE'] = str(a.ca.resolve())
-from adx_sandbox import Sandbox, ConnectionConfig
+from adx_sandbox import Sandbox, ConnectionConfig, Mount, NetworkPolicy, S3Config
+from s3_client import Client as S3Client
 
 out = a.output.resolve()
 out.mkdir(parents=True, exist_ok=False)
@@ -32,6 +36,8 @@ sandbox = None
 snapshot = None
 clones = []
 buddy = None
+fixtures = []
+fixture_object = '/checkpoints/fixtures/runtime.erofs'
 
 def passed(name, **details):
     print('PASS', name, json.dumps(details), flush=True)
@@ -43,6 +49,89 @@ def command(script):
     return value.stdout.strip()
 
 try:
+    run_root = Path(os.environ['ADX_FC_RUN_ROOT'])
+    rootfs_image = a.package.resolve() / 'runtime/adx-runtime-rootfs.img'
+    assert rootfs_image.is_file(), rootfs_image
+    s3 = S3Client(run_root)
+    s3.request('PUT', fixture_object, rootfs_image.read_bytes())
+    source = S3Config(
+        endpoint='http://127.0.0.1:19090',
+        bucket='checkpoints',
+        object='fixtures/runtime.erofs',
+        access_key=s3.access,
+        secret_key=s3.secret,
+    )
+
+    s3_root = Sandbox(
+        rootfs=source, runtime='firecracker', cpu=500, cpu_limit=1000,
+        memory=512, mem_limit=768, storage_mb=64, storage_limit_mb=128,
+        idle_timeout=0, connection=connection, create_timeout=180)
+    fixtures.append(s3_root)
+    assert s3_root.commands.run('printf s3-root-ready').stdout.strip() == 's3-root-ready'
+    passed('S3 rootfs and independent execution limits start through sandboxd')
+    s3_root.kill(); s3_root.close(); fixtures.remove(s3_root)
+
+    mounted = Sandbox(
+        image=a.image, runtime='firecracker', cpu=500, memory=512,
+        mounts=[Mount(target='/mnt/runtime', type='erofs', s3_config=source)],
+        idle_timeout=0, connection=connection, create_timeout=180)
+    fixtures.append(mounted)
+    mounted_check = mounted.commands.run('test -x /mnt/runtime/usr/local/bin/rrt-runtime')
+    assert mounted_check.exit_code == 0, mounted_check
+    passed('S3 EROFS mount is visible inside the sandbox')
+    mounted.kill(); mounted.close(); fixtures.remove(mounted)
+
+    inherited = Sandbox(
+        image=a.entrypoint_image, runtime='firecracker', cpu=500, memory=512,
+        inherit_entrypoint=True, idle_timeout=0, connection=connection,
+        create_timeout=180)
+    fixtures.append(inherited)
+    assert inherited.wait_entrypoint() == 7
+    entrypoint_info = inherited.entrypoint_exit_info
+    (out/'entrypoint-exit.json').write_text(json.dumps(entrypoint_info, indent=2)+'\n')
+    assert entrypoint_info and entrypoint_info['status_kind'] == 'exited'
+    assert entrypoint_info['exit_code'] == 7
+    assert 'adx-entrypoint-stderr' in entrypoint_info['stderr_tail']
+    passed('inherited image entrypoint reports structured exit status')
+    inherited.kill(); inherited.close(); fixtures.remove(inherited)
+
+    # Exercise the mutable network contract on a fresh execution. A restored
+    # Firecracker snapshot may retain guest ARP/FDB state from its previous TAP;
+    # that backend-specific recovery condition must not turn the policy baseline
+    # into a test of checkpoint networking.
+    networked = Sandbox(
+        image=a.image, runtime='firecracker', cpu=500, memory=512,
+        idle_timeout=0, connection=connection, create_timeout=180)
+    fixtures.append(networked)
+    network_target = os.environ['ADX_FC_EGRESS_PROBE_HOST']
+    network_port = int(os.environ['ADX_FC_EGRESS_PROBE_PORT'])
+    # The Ubuntu test image intentionally contains no curl, wget, nc or
+    # BusyBox. Bash's /dev/tcp support avoids adding a package solely for the
+    # probe while still proving a TCP connection and an HTTP response.
+    network_script = (
+        f"exec 3<>/dev/tcp/{network_target}/{network_port}; "
+        'printf "GET / HTTP/1.0\\r\\nHost: probe\\r\\n\\r\\n" >&3; '
+        'IFS= read -r line <&3; [[ "$line" == HTTP/* ]]')
+    network_probe = f'/usr/bin/timeout 3 /bin/bash -c {shlex.quote(network_script)}'
+    assert networked.commands.run(network_probe).exit_code == 0
+    networked.update_network_policy(NetworkPolicy.block())
+    assert networked.commands.run('printf control-still-ready').stdout.strip() == 'control-still-ready'
+    assert networked.commands.run(network_probe).exit_code != 0
+    networked.update_network_policy(None)
+    assert networked.commands.run(network_probe).exit_code == 0
+    passed('runtime network policy replacement blocks egress and preserves RRT control', target=network_target, port=network_port)
+    networked.kill(); networked.close(); fixtures.remove(networked)
+
+    blocked = Sandbox(
+        image=a.image, runtime='firecracker', cpu=500, memory=512,
+        network=NetworkPolicy.block(), idle_timeout=0, connection=connection,
+        create_timeout=180)
+    fixtures.append(blocked)
+    assert blocked.commands.run('printf creation-policy-ready').stdout.strip() == 'creation-policy-ready'
+    assert blocked.commands.run(network_probe).exit_code != 0
+    passed('creation network policy is enforced while the control route stays reachable', target=network_target, port=network_port)
+    blocked.kill(); blocked.close(); fixtures.remove(blocked)
+
     sandbox = Sandbox(labels={'app':'checkpoint-source'}, image=a.image, runtime='firecracker', cpu=1000, memory=512, idle_timeout=0, node_id=os.environ.get('ADX_E2E_EXPECTED_NODE'), connection=connection, create_timeout=180)
     result['instance_id'] = sandbox.id
     passed('create through Frontend and execute through Edge', output=command("printf checkpoint-ready"))
@@ -58,7 +147,7 @@ try:
     assert paused.sandbox_id == sandbox.id and paused.size > 0
     passed('pause with persisted recovery point', snapshot_id=paused.snapshot_id, size=paused.size, expires_at=paused.expires_at)
     if a.restart_command:
-        subprocess.run(a.restart_command, check=True, timeout=180)
+        subprocess.run([*a.restart_command, sandbox.id], check=True, timeout=180)
         passed('Node Manager restart while paused')
         passed('remote orphan GC preserves registered checkpoint')
     resumed = sandbox.resume()
@@ -69,6 +158,14 @@ try:
     assert command('cat /tmp/counter.pid') == pid
     assert sandbox.files.read('/tmp/checkpoint.bin', format='bytes') == payload
     passed('resume preserves process memory, PID and binary file', before=before, after=after, pid=pid)
+    assert sandbox.reload()
+    time.sleep(1)
+    reloaded = int(command('cat /tmp/counter'))
+    assert reloaded > before
+    assert command('cat /tmp/counter.pid') == pid
+    assert sandbox.files.read('/tmp/checkpoint.bin', format='bytes') == payload
+    passed('reload restores the latest recovery point without a cold start', counter=reloaded, pid=pid)
+
     def affinity(kind, mode, key, value, **extra):
         return {'kind':kind,'affinity':mode,'labelOps':[{'type':0,'labelKey':key,'labelValues':[value]}],**extra}
     buddy = Sandbox(image=a.image, runtime='firecracker', cpu=1000, memory=512,
@@ -115,7 +212,6 @@ try:
     passed('snapshot deletion accepted for artifact collection')
     # Source reference release and physical GC run asynchronously. Prove the
     # remaining clones survive after the shared snapshot has been collected.
-    run_root = Path(os.environ['ADX_FC_RUN_ROOT'])
     redis_env = {**os.environ, 'REDISCLI_AUTH': (run_root/'secrets/redis-key').read_text().strip()}
     deadline = time.monotonic() + 120
     while True:
@@ -151,6 +247,10 @@ except Exception as error:
         except Exception as diagnostic_error:
             print('Network diagnostics incomplete:',diagnostic_error,flush=True)
 finally:
+    for fixture in fixtures:
+        try: fixture.kill()
+        except Exception as error: result['cleanup_error'] = str(error)
+        fixture.close()
     if buddy:
         try: buddy.kill()
         except Exception as error: result["cleanup_error"] = str(error)
@@ -168,6 +268,10 @@ finally:
         except Exception as error:
             result['cleanup_error'] = str(error)
         sandbox.close()
+    try:
+        if 's3' in locals(): s3.request('DELETE', fixture_object)
+    except Exception as error:
+        result['cleanup_error'] = str(error)
     (out/'result.json').write_text(json.dumps(result, indent=2)+'\n')
 print(json.dumps(result), flush=True)
 raise SystemExit(0 if result['status'] == 'passed' and 'cleanup_error' not in result else 1)

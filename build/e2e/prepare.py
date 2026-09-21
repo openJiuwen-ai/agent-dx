@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[2]
 spec = importlib.util.spec_from_file_location('release_package', ROOT/'build/release/package.py')
 package = importlib.util.module_from_spec(spec);spec.loader.exec_module(package)
 BACKEND_BINARIES = ('sandboxd','sbox','runc','runc-shim','sandbox-logger','redis-cli')
+BACKEND_FILES = BACKEND_BINARIES + ('firecracker-initrd.img',)
 
 def sha(path):
     h=hashlib.sha256()
@@ -38,7 +39,10 @@ def main():
     pinned=json.loads((ROOT/'third_party/sandboxd/source.json').read_text())
     if backend['sandboxd_revision'] != pinned['revision'] or backend['target'] != manifest['target']:
         raise ValueError('backend revision or architecture mismatch')
-    for name in BACKEND_BINARIES:
+    patches={entry['path']:entry['sha256'] for entry in pinned.get('patches',[])}
+    if backend.get('sandboxd_patches') != patches or any(sha(ROOT/path)!=digest for path,digest in patches.items()):
+        raise ValueError('backend patch set mismatch')
+    for name in BACKEND_FILES:
         path=a.backend/name
         if path.is_symlink() or sha(path) != backend['files'][name]:raise ValueError('backend integrity mismatch')
     collector=json.loads((ROOT/'build/observability/source.json').read_text())
@@ -48,7 +52,11 @@ def main():
     if a.firecracker_kit:
         from firecracker.kit import verify as verify_kit
         fc_kit=verify_kit(a.firecracker_kit,backend)
-    uid=uuid.uuid4().hex[:12];tags={'node':f'adx-e2e-node:{uid}','rrt':f'adx-e2e-rrt:{uid}'}
+    uid=uuid.uuid4().hex[:12];tags={
+        'node':f'adx-e2e-node:{uid}',
+        'rrt':f'adx-e2e-rrt:{uid}',
+        'entrypoint':f'adx-e2e-entrypoint:{uid}',
+    }
     with tempfile.TemporaryDirectory(prefix='adx-e2e-image-') as d:
         context=Path(d)
         shutil.copytree(a.package,context/'package')
@@ -81,12 +89,19 @@ def main():
             'RUN mkdir -p /__adx && ln -s /usr /__adx/usr && ln -s /bin /__adx/bin '
             '&& ln -s /sbin /__adx/sbin && ln -s /etc /__adx/etc\n'
             'ENTRYPOINT ["/usr/local/bin/rrt-runtime"]\n')
-        for role,base in [('node',a.runtime_base),('rrt',a.rrt_base)]:
+        (context/'Dockerfile.entrypoint').write_text(
+            'ARG BASE\nFROM ${BASE}\n'
+            # The inherited process must outlive Firecracker boot, RRT
+            # readiness and route publication. Exiting during that window is
+            # correctly treated as a failed Instance start.
+            'ENTRYPOINT ["/bin/sh", "-c", "sleep 30; echo adx-entrypoint-stderr >&2; exit 7"]\n')
+        for role,base in [('node',a.runtime_base),('rrt',a.rrt_base),('entrypoint',a.rrt_base)]:
             subprocess.run(['docker','build','--progress=plain','--provenance=false','--build-arg','BASE='+base,'--build-arg','COLLECTOR='+collector_image,'-f',str(context/f'Dockerfile.{role}'),'-t',tags[role],str(context)],stderr=subprocess.STDOUT,check=True,timeout=900)
         images={role:json.loads(subprocess.check_output(['docker','image','inspect',tag]))[0] for role,tag in tags.items()}
         subprocess.run(['docker','save','-o',str(a.output/'images.tar'),*tags.values()],stderr=subprocess.STDOUT,check=True,timeout=600)
         subprocess.run(['docker','save','-o',str(a.output/'rrt.tar'),tags['rrt']],stderr=subprocess.STDOUT,check=True,timeout=300)
-    result={'schema_version':1,'package':manifest,'backend':backend,'image_ids':{k:v['Id'] for k,v in images.items()},'architecture':images['node']['Architecture'],'archive_sha256':sha(a.output/'images.tar'),'rrt_archive_sha256':sha(a.output/'rrt.tar'),'base_images':{'node':a.runtime_base,'rrt':a.rrt_base}}
+        subprocess.run(['docker','save','-o',str(a.output/'entrypoint.tar'),tags['entrypoint']],stderr=subprocess.STDOUT,check=True,timeout=300)
+    result={'schema_version':1,'package':manifest,'backend':backend,'image_ids':{k:v['Id'] for k,v in images.items()},'architecture':images['node']['Architecture'],'archive_sha256':sha(a.output/'images.tar'),'rrt_archive_sha256':sha(a.output/'rrt.tar'),'entrypoint_archive_sha256':sha(a.output/'entrypoint.tar'),'base_images':{'node':a.runtime_base,'rrt':a.rrt_base}}
     result['collector']={**collector,'image':collector_image}
     if fc_kit:result['firecracker_kit']=fc_kit
     (a.output/'bundle.json').write_text(json.dumps(result,indent=2)+'\n')

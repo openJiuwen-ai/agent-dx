@@ -5,12 +5,13 @@ surface. The Rust API Server and Gateway/RRT implementations remain the source
 of truth; changes to a public route must update the matching contract in the
 same change.
 
-- [`sandbox.yaml`](sandbox.yaml) describes the public Sandbox management API
-  served by API Server through Edge and the service-authenticated v2 Sandbox
-  capability used by Agent components.
+- [`sandbox.yaml`](sandbox.yaml) describes the public Sandbox management API,
+  the current schedulable node-resource view used by the Sandbox SDK, and the
+  service-authenticated v2 Sandbox capability used by Agent components. API
+  Server serves these routes through Edge.
 - [`data-plane.yaml`](data-plane.yaml) describes the typed runtime data API
   forwarded by Edge and Node Proxy to RRT: health, invocation, resumable upload,
-  download and command-watch WebSocket setup.
+  download, PTY and command-watch WebSocket setup.
 
 The generic `/{instanceId}/{port}/{path}` and `/tunnel/{instanceId}/...`
 surfaces proxy application-defined protocols. They are routing contracts rather

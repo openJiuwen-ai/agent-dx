@@ -106,6 +106,32 @@ class KubernetesLifecycleTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,'do not match'):
                 self.module.identity(p/'bundle.json',p/'registry.json')
 
+    def test_registry_manifest_requires_all_three_immutable_images(self):
+        import hashlib,json,tempfile
+        with tempfile.TemporaryDirectory() as d:
+            p=Path(d)
+            image_ids={'node':'node-id','rrt':'rrt-id','entrypoint':'entrypoint-id'}
+            bundle={
+                'schema_version':1,'image_ids':image_ids,'architecture':'amd64',
+                'package':{'target':'x86_64-unknown-linux-gnu','commit':'a'*40,'dirty':False},
+            }
+            bundle_path=p/'bundle.json'
+            bundle_path.write_text(json.dumps(bundle))
+            digest=lambda value:'registry.example/'+value+'@sha256:'+hashlib.sha256(value.encode()).hexdigest()
+            registry={
+                'schema_version':1,'bundle_sha256':self.module.common.sha(bundle_path),
+                'image_ids':image_ids,
+                'references':{name:digest(name) for name in image_ids},
+            }
+            registry_path=p/'registry.json';registry_path.write_text(json.dumps(registry))
+            loaded,published=self.module.identity(bundle_path,registry_path)
+            self.assertEqual(loaded,bundle)
+            self.assertEqual(set(published['references']),set(image_ids))
+            del registry['references']['entrypoint']
+            registry_path.write_text(json.dumps(registry))
+            with self.assertRaisesRegex(ValueError,'entrypoint'):
+                self.module.identity(bundle_path,registry_path)
+
     def test_pipeline_deploys_through_kubeconfig_without_docker(self):
         script=(ROOT.parents[1]/'.buildkite/run-e2e.sh').read_text()
         self.assertIn('build/e2e/kubernetes/run.py',script)

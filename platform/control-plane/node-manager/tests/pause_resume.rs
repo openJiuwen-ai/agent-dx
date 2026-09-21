@@ -221,6 +221,7 @@ fn fixture() -> (
         priority: 0,
         env: Default::default(),
         scheduling: Default::default(),
+        sandbox: Default::default(),
     };
     let assignment = Assignment {
         instance_id: spec.id.clone(),
@@ -602,6 +603,113 @@ async fn unexpected_exit_restarts_with_fresh_identity_and_bounded_backoff() {
             .filter(|v| *v == "start")
             .count(),
         starts
+    );
+}
+
+#[tokio::test]
+async fn failover_restores_latest_checkpoint_without_cold_start() {
+    let (_temp, backend, node, mut spec, assignment) = fixture();
+    spec.sandbox.failover = true;
+    let handle = node.instance(spec, assignment).unwrap();
+    let created = handle.create().await.unwrap();
+    let paused = handle.pause(pause(created.record.revision)).await.unwrap();
+    let running = handle.resume(resume(paused.record.revision)).await.unwrap();
+    let starts = backend
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| *event == "start")
+        .count();
+    let restores = backend
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| *event == "restore")
+        .count();
+    backend.running.lock().unwrap().clear();
+    handle.tick().await.unwrap();
+    let recovered = handle.sync().await.unwrap().record;
+    assert_eq!(recovered.state, InstanceState::Running);
+    assert_ne!(recovered.runtime_id, running.record.runtime_id);
+    assert_eq!(recovered.restart_attempts, running.record.restart_attempts);
+    let events = backend.events.lock().unwrap();
+    assert_eq!(
+        events.iter().filter(|event| *event == "start").count(),
+        starts
+    );
+    assert_eq!(
+        events.iter().filter(|event| *event == "restore").count(),
+        restores + 1
+    );
+}
+
+#[tokio::test]
+async fn failover_without_checkpoint_fails_without_cold_start() {
+    let (_temp, backend, node, mut spec, assignment) = fixture();
+    spec.sandbox.failover = true;
+    let handle = node.instance(spec, assignment).unwrap();
+    handle.create().await.unwrap();
+    backend.running.lock().unwrap().clear();
+    assert!(handle.tick().await.is_err());
+    let failed = handle.sync().await.unwrap().record;
+    assert_eq!(failed.state, InstanceState::Failed);
+    assert!(!failed.restart_pending);
+    assert_eq!(
+        backend
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| *event == "start")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn reload_replaces_runtime_from_checkpoint_and_replays_result() {
+    let (_temp, backend, node, spec, assignment) = fixture();
+    let handle = node.instance(spec, assignment).unwrap();
+    let created = handle.create().await.unwrap();
+    let paused = handle.pause(pause(created.record.revision)).await.unwrap();
+    let running = handle.resume(resume(paused.record.revision)).await.unwrap();
+    let restores = backend
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|event| *event == "restore")
+        .count();
+    let reloaded = handle
+        .reload("reload-a".into(), running.record.revision)
+        .await
+        .unwrap();
+    assert_eq!(reloaded.record.state, InstanceState::Running);
+    assert_ne!(reloaded.record.runtime_id, running.record.runtime_id);
+    assert_eq!(
+        reloaded.record.restart_attempts,
+        running.record.restart_attempts
+    );
+    assert_eq!(
+        reloaded.record.last_operation.as_ref().unwrap().kind,
+        adx_core::LifecycleKind::Reload
+    );
+    let replay = handle
+        .reload("reload-a".into(), running.record.revision)
+        .await
+        .unwrap();
+    assert_eq!(replay.record, reloaded.record);
+    assert_eq!(
+        backend
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| *event == "restore")
+            .count(),
+        restores + 1
     );
 }
 

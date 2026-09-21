@@ -9,6 +9,54 @@ ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/'firecracker'))
 
 class FirecrackerEvidenceTests(unittest.TestCase):
+    def test_entrypoint_case_uses_the_rrt_terminal_status_contract(self):
+        source=(ROOT/'firecracker/sdk_checkpoint.py').read_text()
+        self.assertIn("entrypoint_info['status_kind'] == 'exited'",source)
+        self.assertIn("entrypoint_info['exit_code'] == 7",source)
+        self.assertNotIn("entrypoint_info['status_kind'] == 'exit_code'",source)
+
+    def test_paused_restart_targets_the_selected_instance(self):
+        checkpoint=(ROOT/'firecracker/sdk_checkpoint.py').read_text()
+        restart=(ROOT/'firecracker/restart_paused.py').read_text()
+        self.assertIn('[*a.restart_command, sandbox.id]',checkpoint)
+        self.assertIn("key='instance:'+INSTANCE_ID",restart)
+        self.assertNotIn('len(records)==1',restart)
+
+    def test_runtime_network_policy_uses_a_fresh_execution(self):
+        source=(ROOT/'firecracker/sdk_checkpoint.py').read_text()
+        network_case=source.index("networked = Sandbox(")
+        checkpoint_case=source.index("sandbox = Sandbox(labels={'app':'checkpoint-source'}")
+        self.assertLess(network_case,checkpoint_case)
+        self.assertIn('networked.update_network_policy(NetworkPolicy.block())',source)
+        self.assertIn('networked.update_network_policy(None)',source)
+        self.assertIn("os.environ['ADX_FC_EGRESS_PROBE_HOST']",source)
+        self.assertIn('/bin/bash', source)
+        self.assertIn('/dev/tcp/', source)
+        self.assertIn('[[ "$line" == HTTP/* ]]', source)
+        self.assertNotIn('/bin/busybox', source)
+        self.assertNotIn('nc -z', source)
+        fixture=(ROOT/'firecracker/node.py').read_text()
+        self.assertIn("probe_namespace='adx-probe-'+suffix",fixture)
+        self.assertIn("'198.18.0.2/30'",fixture)
+        self.assertIn("'ip','netns','delete',probe_namespace",fixture)
+
+    def test_runtime_environment_uses_local_erofs_for_vm_and_pinned_oci_for_kubernetes(self):
+        import runtime_environment
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d); package=root/'package'; artifact=package/'runtime/adx-runtime-rootfs.img'
+            artifact.parent.mkdir(parents=True);artifact.write_bytes(b'erofs')
+            local=runtime_environment.resolve(package,False,root/'missing')
+            self.assertEqual(local['rootfs']['runtime'],'firecracker')
+            self.assertEqual(local['rootfs']['path'],str(artifact.resolve()))
+            self.assertEqual(local['bootstrap']['root'],str(artifact.resolve()))
+            image=root/'runtime-image';image.write_text('registry.example/adx-runtime@sha256:'+'a'*64)
+            remote=runtime_environment.resolve(package,True,image)
+            self.assertEqual(remote['rootfs']['image'],image.read_text())
+            self.assertEqual(remote['bootstrap']['image'],image.read_text())
+            image.write_text('registry.example/adx-runtime:latest')
+            with self.assertRaisesRegex(RuntimeError,'digest pinned'):
+                runtime_environment.resolve(package,True,image)
+
     def test_missing_or_duplicate_cases_cannot_pass(self):
         import acceptance
         with tempfile.TemporaryDirectory() as d:
@@ -33,11 +81,21 @@ class FirecrackerEvidenceTests(unittest.TestCase):
             root=Path(d);files={}
             for name in kit.REQUIRED:
                 p=root/name;p.parent.mkdir(parents=True,exist_ok=True);p.write_bytes(name.encode());files[name]=hashlib.sha256(p.read_bytes()).hexdigest()
-            backend={'target':'aarch64-unknown-linux-gnu','sandboxd_revision':'pinned','files':{'sandboxd':files['bin/sandboxd'],'sbox':files['bin/sbox'],'redis-cli':files['tools/redis-cli']}}
-            (root/'manifest.json').write_text(json.dumps({'schema_version':1,'target':backend['target'],'sandboxd_revision':'pinned','files':files}))
+            backend={'target':'aarch64-unknown-linux-gnu','sandboxd_revision':'pinned','sandboxd_patches':{'fix.patch':'digest'},'files':{'sandboxd':files['bin/sandboxd'],'sbox':files['bin/sbox'],'redis-cli':files['tools/redis-cli'],'firecracker-initrd.img':files['artifacts/initrd.img']}}
+            (root/'manifest.json').write_text(json.dumps({'schema_version':1,'target':backend['target'],'sandboxd_revision':'pinned','sandboxd_patches':backend['sandboxd_patches'],'files':files}))
             kit.verify(root,backend)
             (root/'artifacts/Image').write_bytes(b'altered')
             with self.assertRaises(ValueError):kit.verify(root,backend)
+
+    def test_kit_rejects_wrong_sandboxd_patch_identity(self):
+        import kit,hashlib
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d);files={}
+            for name in kit.REQUIRED:
+                p=root/name;p.parent.mkdir(parents=True,exist_ok=True);p.write_bytes(name.encode());files[name]=hashlib.sha256(p.read_bytes()).hexdigest()
+            backend={'target':'aarch64-unknown-linux-gnu','sandboxd_revision':'pinned','sandboxd_patches':{'fix.patch':'digest'},'files':{'sandboxd':files['bin/sandboxd'],'sbox':files['bin/sbox'],'redis-cli':files['tools/redis-cli'],'firecracker-initrd.img':files['artifacts/initrd.img']}}
+            (root/'manifest.json').write_text(json.dumps({'schema_version':1,'target':backend['target'],'sandboxd_revision':'pinned','sandboxd_patches':{},'files':files}))
+            with self.assertRaisesRegex(ValueError,'source identity'):kit.verify(root,backend)
 
     def test_complete_evidence_passes_but_cleanup_error_fails(self):
         import acceptance

@@ -1,7 +1,7 @@
 //! Local gRPC/UDS contract tests against the pinned protocol, not sandboxd E2E.
 use adx_core::{InstanceSpec, Resources};
 use adx_node_manager::{
-    sandboxd::{connect_when_ready, proto::*, Config, Sandboxd},
+    sandboxd::{connect_when_ready, proto::*, start_request, Config, Sandboxd},
     RuntimeBackend,
 };
 use std::{
@@ -16,6 +16,7 @@ use tonic::{Request, Response, Status};
 struct Server {
     requests: Arc<Mutex<Vec<String>>>,
     starts: Arc<Mutex<Vec<StartRequest>>>,
+    network_updates: Arc<Mutex<Vec<SetNetworkPolicyRequest>>>,
     unready: Arc<std::sync::atomic::AtomicUsize>,
     running: Arc<Mutex<bool>>,
     xpu: Arc<Mutex<Vec<XpuAllocation>>>,
@@ -32,6 +33,7 @@ impl Default for Server {
         Self {
             requests: Arc::default(),
             starts: Arc::default(),
+            network_updates: Arc::default(),
             unready: Arc::default(),
             running: Arc::default(),
             xpu: Arc::default(),
@@ -173,9 +175,13 @@ impl sandbox_service_server::SandboxService for Server {
     }
     async fn set_network_policy(
         &self,
-        _: Request<SetNetworkPolicyRequest>,
+        request: Request<SetNetworkPolicyRequest>,
     ) -> Result<Response<SetNetworkPolicyResponse>, Status> {
-        Err(Status::unimplemented("unused"))
+        self.network_updates
+            .lock()
+            .unwrap()
+            .push(request.into_inner());
+        Ok(Response::new(SetNetworkPolicyResponse {}))
     }
 }
 struct Harness {
@@ -232,7 +238,162 @@ fn spec() -> InstanceSpec {
             disk_bytes: 1 << 30,
         },
         priority: 0,
+        sandbox: Default::default(),
     }
+}
+
+#[test]
+fn start_maps_public_sandbox_contract_to_backend_protocol() {
+    use adx_core::sandbox as model;
+    let mut spec = spec();
+    spec.sandbox = model::SandboxOptions {
+        rootfs: Some(model::Rootfs {
+            readonly: true,
+            source: model::StorageSource::Image("registry.example/app:v1".into()),
+        }),
+        mounts: vec![model::Mount {
+            kind: "bind".into(),
+            target: "/workspace".into(),
+            options: vec!["ro".into()],
+            source: model::StorageSource::S3(model::S3Source {
+                endpoint: "https://s3.example".into(),
+                bucket: "artifacts".into(),
+                object: "workspace.erofs".into(),
+                access_key_id: "key".into(),
+                access_key_secret: "secret".into(),
+            }),
+        }],
+        network: Some(model::NetworkPolicy {
+            traffic: Some(model::TrafficPolicy {
+                ingress_default_action: model::NetworkAction::Deny,
+                egress_default_action: model::NetworkAction::Allow,
+                rules: vec![],
+                mode: model::TrafficMode::Stateful,
+            }),
+            dns: None,
+        }),
+        ports: vec![8080],
+        inherit_entrypoint: true,
+        limits: model::ResourceLimits {
+            cpu_millis: 1500,
+            memory_bytes: 2 << 30,
+            disk_bytes: 4 << 30,
+        },
+        extra_config: "runtime-option=true".into(),
+        ..Default::default()
+    };
+    let request = start_request(&spec, "i-1", 1, &[], &Config::default()).unwrap();
+    let rootfs = request.rootfs.unwrap();
+    assert_eq!(rootfs.r#type, RootfsSrcType::Image as i32);
+    assert_eq!(
+        rootfs.source,
+        Some(rootfs_config::Source::ImageUrl(
+            "registry.example/app:v1".into()
+        ))
+    );
+    assert_eq!(request.mounts.len(), 1);
+    assert!(matches!(
+        request.mounts[0].source,
+        Some(mount::Source::S3Config(_))
+    ));
+    assert_eq!(request.resources["CPU"], 1500.0);
+    assert_eq!(request.resources["Memory"], 2048.0);
+    assert_eq!(request.writable_layer_limit_bytes, 4 << 30);
+    assert_eq!(request.extra_config, "runtime-option=true");
+    assert_eq!(request.inject_entrypoint, "/run/adx/image-process.json");
+    assert_eq!(
+        request.envs["ADX_IMAGE_PROCESS_CONFIG"],
+        "/run/adx/image-process.json"
+    );
+    let rules = &request.network_policy.unwrap().traffic.unwrap().rules;
+    for port in [50090, 8080] {
+        let rule = rules
+            .iter()
+            .find(|rule| {
+                rule.sandbox_port_range
+                    .as_ref()
+                    .is_some_and(|range| range.first == port && range.last == port)
+            })
+            .expect("platform port must use a schema-v2 exact range");
+        assert_eq!(rule.sandbox_port, 0);
+        assert_eq!(rule.priority, u32::MAX);
+    }
+}
+
+#[test]
+fn start_maps_s3_rootfs_credentials() {
+    use adx_core::sandbox as model;
+    let mut spec = spec();
+    spec.image.clear();
+    spec.sandbox.rootfs = Some(model::Rootfs {
+        readonly: false,
+        source: model::StorageSource::S3(model::S3Source {
+            endpoint: "https://s3.example".into(),
+            bucket: "rootfs".into(),
+            object: "app.erofs".into(),
+            access_key_id: "key".into(),
+            access_key_secret: "secret".into(),
+        }),
+    });
+    let rootfs = start_request(&spec, "i-1", 1, &[], &Config::default())
+        .unwrap()
+        .rootfs
+        .unwrap();
+    let Some(rootfs_config::Source::S3Config(s3)) = rootfs.source else {
+        panic!("S3 rootfs must reach sandboxd");
+    };
+    assert_eq!(s3.bucket, "rootfs");
+    assert_eq!(s3.access_key_id, "key");
+    assert_eq!(s3.access_key_secret, "secret");
+}
+
+#[tokio::test]
+async fn dynamic_network_policy_uses_generated_backend_identity_and_can_clear() {
+    use adx_core::sandbox as model;
+    let server = Server::default();
+    let (adapter, _harness) = connect(server.clone()).await;
+    adapter.start(&spec(), "i-1", 1, &[]).await.unwrap();
+    let policy = model::NetworkPolicy {
+        traffic: Some(model::TrafficPolicy {
+            ingress_default_action: model::NetworkAction::Deny,
+            egress_default_action: model::NetworkAction::Allow,
+            rules: vec![],
+            mode: model::TrafficMode::Stateful,
+        }),
+        dns: None,
+    };
+    adapter
+        .set_network_policy("i-1", Some(&policy), &[8080])
+        .await
+        .unwrap();
+    adapter
+        .set_network_policy("i-1", None, &[8080])
+        .await
+        .unwrap();
+    let updates = server.network_updates.lock().unwrap();
+    assert_eq!(updates.len(), 2);
+    assert_eq!(updates[0].sandbox_id, "generated-backend-id");
+    let rules = &updates[0]
+        .network_policy
+        .as_ref()
+        .unwrap()
+        .traffic
+        .as_ref()
+        .unwrap()
+        .rules;
+    for port in [50090, 8080] {
+        let rule = rules
+            .iter()
+            .find(|rule| {
+                rule.sandbox_port_range
+                    .as_ref()
+                    .is_some_and(|range| range.first == port && range.last == port)
+            })
+            .expect("platform port must use a schema-v2 exact range");
+        assert_eq!(rule.sandbox_port, 0);
+        assert_eq!(rule.priority, u32::MAX);
+    }
+    assert!(updates[1].network_policy.is_none());
 }
 
 #[tokio::test]

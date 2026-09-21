@@ -12,6 +12,7 @@
 //!   reuse dispatch::normalize_sandbox_action + dispatch_runtime_action and return action result JSON.
 //! - `POST /upload?path=/abs/file&type=file|tar`, body is raw binary or a tar stream.
 //! - `GET /download?path=/abs/file&type=file|tar`, response body is raw binary or a tar stream.
+//! - `GET /pty?command=...`, WebSocket carrying PTY bytes and lifecycle frames.
 //! - `GET /healthz` → `{"status":"ok"}`。
 //!
 //! Auth model: RRT is privileged, so token auth is required when RRT_HTTP_TOKEN is set. Requests must carry
@@ -24,7 +25,7 @@
 
 use futures_util::{SinkExt, StreamExt};
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io::SeekFrom;
+use std::io::{Read, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -355,6 +356,9 @@ async fn handle_one_request(
     {
         return handle_command_watch(sock, &head).await;
     }
+    if method == "GET" && route == "/pty" && header_has_token(&head, "upgrade", "websocket") {
+        return handle_pty(sock, &head, &path).await;
+    }
 
     // Ordinary atomic operations are data activity. The long-lived command
     // watch above is deliberately a passive observer and must not prevent idle.
@@ -580,6 +584,144 @@ async fn handle_command_watch(
                     });
                     websocket.send(tokio_tungstenite::tungstenite::Message::Text(response.to_string())).await?;
                 }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn handle_pty(
+    sock: &mut tokio::net::TcpStream,
+    head: &str,
+    raw_path: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let _active = super::activity::enter(super::activity::ActivitySource::DirectHttp);
+    let command: Vec<String> = query_params(raw_path, "command")
+        .into_iter()
+        .filter_map(|value| percent_decode(&value))
+        .collect();
+    if command.is_empty()
+        || command.len() > 256
+        || command
+            .iter()
+            .any(|argument| argument.is_empty() || argument.len() > 64 * 1024)
+    {
+        return write_resp(sock, 400, &err_json("invalid PTY command")).await;
+    }
+    let dimension = |name: &str, default: u16| {
+        query_param(raw_path, name)
+            .and_then(|value| value.parse::<u16>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(default)
+    };
+    let rows = dimension("rows", 24);
+    let cols = dimension("cols", 80);
+    let key = parse_header(head, "sec-websocket-key").ok_or("missing websocket key")?;
+    let accept = tokio_tungstenite::tungstenite::handshake::derive_accept_key(key.as_bytes());
+    sock.write_all(
+        format!(
+            "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+        )
+        .as_bytes(),
+    )
+    .await?;
+    let mut websocket = tokio_tungstenite::WebSocketStream::from_raw_socket(
+        sock,
+        tokio_tungstenite::tungstenite::protocol::Role::Server,
+        None,
+    )
+    .await;
+
+    let pty = portable_pty::native_pty_system();
+    let pair = pty.openpty(portable_pty::PtySize {
+        rows,
+        cols,
+        pixel_width: 0,
+        pixel_height: 0,
+    })?;
+    let mut process = portable_pty::CommandBuilder::new(&command[0]);
+    for argument in &command[1..] {
+        process.arg(argument);
+    }
+    super::child_env::apply_pty(&mut process);
+    let mut child = pair.slave.spawn_command(process)?;
+    let mut killer = child.clone_killer();
+    let mut writer = Some(pair.master.take_writer()?);
+    let mut reader = pair.master.try_clone_reader()?;
+    let master = pair.master;
+    let (output_tx, mut output_rx) = tokio::sync::mpsc::unbounded_channel();
+    std::thread::spawn(move || {
+        let mut buffer = vec![0u8; 16 * 1024];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(size) if output_tx.send(buffer[..size].to_vec()).is_err() => break,
+                Ok(_) => {}
+            }
+        }
+    });
+    static NEXT_PTY: AtomicU64 = AtomicU64::new(1);
+    let session_id = format!(
+        "pty-{}-{}",
+        std::process::id(),
+        NEXT_PTY.fetch_add(1, Ordering::Relaxed)
+    );
+    websocket
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::json!({"version":1,"type":"started","session_id":session_id}).to_string(),
+        ))
+        .await?;
+    let exit = tokio::task::spawn_blocking(move || child.wait());
+    tokio::pin!(exit);
+    loop {
+        tokio::select! {
+            message = websocket.next() => {
+                let Some(message) = message else { let _ = killer.kill(); break; };
+                match message? {
+                    tokio_tungstenite::tungstenite::Message::Binary(bytes) => {
+                        if let Some(writer) = writer.as_mut() {
+                            writer.write_all(&bytes)?;
+                            writer.flush()?;
+                        }
+                    }
+                    tokio_tungstenite::tungstenite::Message::Text(text) if text == "STDIN_EOF" => {
+                        writer.take();
+                    }
+                    tokio_tungstenite::tungstenite::Message::Text(text) if text.starts_with("RESIZE:") => {
+                        let values: Vec<_> = text.split(':').collect();
+                        if values.len() == 3 {
+                            if let (Ok(cols), Ok(rows)) = (values[1].parse::<u16>(), values[2].parse::<u16>()) {
+                                if cols > 0 && rows > 0 {
+                                    master.resize(portable_pty::PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })?;
+                                }
+                            }
+                        }
+                    }
+                    tokio_tungstenite::tungstenite::Message::Ping(payload) => {
+                        websocket.send(tokio_tungstenite::tungstenite::Message::Pong(payload)).await?;
+                    }
+                    tokio_tungstenite::tungstenite::Message::Close(_) => { let _ = killer.kill(); break; }
+                    _ => {}
+                }
+            }
+            Some(output) = output_rx.recv() => {
+                websocket.send(tokio_tungstenite::tungstenite::Message::Binary(output)).await?;
+            }
+            status = &mut exit => {
+                let status = status??;
+                while let Ok(Some(output)) = tokio::time::timeout(
+                        std::time::Duration::from_millis(250),
+                        output_rx.recv(),
+                    )
+                    .await
+                {
+                    websocket.send(tokio_tungstenite::tungstenite::Message::Binary(output)).await?;
+                }
+                websocket.send(tokio_tungstenite::tungstenite::Message::Text(
+                    serde_json::json!({"version":1,"type":"exited","session_id":session_id,"exit_code":status.exit_code()}).to_string()
+                )).await?;
+                websocket.close(None).await?;
+                break;
             }
         }
     }
@@ -1241,16 +1383,17 @@ async fn handle_tar_download(
     super::child_env::apply_tokio(&mut child);
     let mut child = child.spawn()?;
     let mut stdout = child.stdout.take().ok_or("tar stdout unavailable")?;
-    write_binary_headers(sock, 200, "application/x-tar", None).await?;
+    write_chunked_headers(sock, 200, "application/x-tar").await?;
     let mut bytes_sent = 0u64;
     loop {
         let n = stdout.read(tmp).await?;
         if n == 0 {
             break;
         }
-        sock.write_all(&tmp[..n]).await?;
+        write_chunk(sock, &tmp[..n]).await?;
         bytes_sent += n as u64;
     }
+    sock.write_all(b"0\r\n\r\n").await?;
     sock.flush().await?;
     let status = child.wait().await?;
     if !status.success() {
@@ -1265,13 +1408,27 @@ async fn handle_tar_download(
     Ok(())
 }
 
-async fn write_binary_headers(
+async fn write_chunked_headers(
     sock: &mut tokio::net::TcpStream,
     status: u16,
     content_type: &str,
-    content_len: Option<u64>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    write_binary_headers_with_range(sock, status, content_type, content_len, None).await
+    let resp = format!(
+        "HTTP/1.1 {status} OK\r\nContent-Type: {content_type}\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n"
+    );
+    sock.write_all(resp.as_bytes()).await?;
+    Ok(())
+}
+
+async fn write_chunk(
+    sock: &mut tokio::net::TcpStream,
+    bytes: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    sock.write_all(format!("{:X}\r\n", bytes.len()).as_bytes())
+        .await?;
+    sock.write_all(bytes).await?;
+    sock.write_all(b"\r\n").await?;
+    Ok(())
 }
 
 async fn write_binary_headers_with_range(
@@ -1345,6 +1502,21 @@ fn query_param(raw_path: &str, name: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn query_params(raw_path: &str, name: &str) -> Vec<String> {
+    raw_path
+        .split_once('?')
+        .map(|(_, query)| {
+            query
+                .split('&')
+                .filter_map(|pair| {
+                    let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+                    (key == name).then(|| value.to_string())
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn upload_type(raw_path: &str) -> String {
@@ -1561,20 +1733,54 @@ mod tests {
     use futures_util::{SinkExt, StreamExt};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    async fn read_http_response(stream: &mut tokio::net::TcpStream) -> (String, Vec<u8>) {
+    async fn read_http_head(stream: &mut tokio::net::TcpStream) -> String {
         let mut bytes = Vec::new();
         let mut byte = [0u8; 1];
-        let header_end = loop {
+        loop {
             stream.read_exact(&mut byte).await.unwrap();
             bytes.push(byte[0]);
             if bytes.ends_with(b"\r\n\r\n") {
-                break bytes.len();
+                break;
             }
-        };
-        let head = String::from_utf8(bytes[..header_end].to_vec()).unwrap();
+        }
+        String::from_utf8(bytes).unwrap()
+    }
+
+    async fn read_http_response(stream: &mut tokio::net::TcpStream) -> (String, Vec<u8>) {
+        let head = read_http_head(stream).await;
         let content_length = parse_content_length(&head);
         let mut body = vec![0u8; content_length];
         stream.read_exact(&mut body).await.unwrap();
+        (head, body)
+    }
+
+    async fn read_chunked_response(stream: &mut tokio::net::TcpStream) -> (String, Vec<u8>) {
+        let head = read_http_head(stream).await;
+        let mut body = Vec::new();
+        loop {
+            let mut line = Vec::new();
+            let mut byte = [0u8; 1];
+            loop {
+                stream.read_exact(&mut byte).await.unwrap();
+                line.push(byte[0]);
+                if line.ends_with(b"\r\n") {
+                    break;
+                }
+            }
+            let size =
+                usize::from_str_radix(std::str::from_utf8(&line[..line.len() - 2]).unwrap(), 16)
+                    .unwrap();
+            if size == 0 {
+                stream.read_exact(&mut [0u8; 2]).await.unwrap();
+                break;
+            }
+            let offset = body.len();
+            body.resize(offset + size, 0);
+            stream.read_exact(&mut body[offset..]).await.unwrap();
+            let mut delimiter = [0u8; 2];
+            stream.read_exact(&mut delimiter).await.unwrap();
+            assert_eq!(&delimiter, b"\r\n");
+        }
         (head, body)
     }
 
@@ -1638,6 +1844,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http_filesystem_list_preserves_recursive_depth() {
+        let directory = tempfile::tempdir().unwrap();
+        let nested = directory.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        let payload = nested.join("payload.bin");
+        std::fs::write(&payload, b"payload").unwrap();
+
+        let response = invoke_over_http(
+            "file.list",
+            serde_json::json!({"path":directory.path(),"depth":2}),
+        )
+        .await;
+        let paths = response["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["path"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert!(paths.contains(&payload.to_str().unwrap()), "{response}");
+    }
+
+    #[tokio::test]
     async fn json_responses_reuse_one_http_connection() {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
@@ -1660,6 +1888,52 @@ mod tests {
             assert_eq!(body, br#"{"status":"ok"}"#);
         }
 
+        drop(client);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn tar_download_is_chunked_and_connection_remains_reusable() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("payload.txt"), b"tar-roundtrip").unwrap();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            handle_conn(&mut stream, None).await.unwrap();
+        });
+        let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+        let path = directory.path().to_string_lossy().replace('/', "%2F");
+        client
+            .write_all(
+                format!("GET /download?path={path}&type=tar HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let (head, tar) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            read_chunked_response(&mut client),
+        )
+        .await
+        .unwrap();
+        assert!(head.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(head.contains("Transfer-Encoding: chunked\r\n"));
+        assert!(tar
+            .windows(b"payload.txt".len())
+            .any(|v| v == b"payload.txt"));
+        assert!(tar
+            .windows(b"tar-roundtrip".len())
+            .any(|v| v == b"tar-roundtrip"));
+
+        client
+            .write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let (_, body) = read_http_response(&mut client).await;
+        assert_eq!(body, br#"{"status":"ok"}"#);
         drop(client);
         server.await.unwrap();
     }
@@ -1839,6 +2113,59 @@ mod tests {
             .unwrap();
         let replay: serde_json::Value = serde_json::from_str(replay.to_text().unwrap()).unwrap();
         assert_eq!(replay["status"], "SUCCEEDED");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn pty_websocket_streams_output_and_terminal_status() {
+        let listener = bind(0).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = serve_listener(listener, None).await;
+        });
+        let uri = format!(
+            "ws://{address}/pty?rows=24&cols=80&protocol=sandbox.pty.v1&command=%2Fbin%2Fsh&command=-lc&command=sleep%200.2%3B%20printf%20pty-ok"
+        );
+        let (mut websocket, _) = tokio_tungstenite::connect_async(uri).await.unwrap();
+
+        let started = tokio::time::timeout(std::time::Duration::from_secs(5), websocket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let started: serde_json::Value = serde_json::from_str(started.to_text().unwrap()).unwrap();
+        assert_eq!(started["type"], "started");
+        assert_eq!(started["version"], 1);
+        websocket
+            .send(tokio_tungstenite::tungstenite::Message::Text(
+                "RESIZE:100:40".into(),
+            ))
+            .await
+            .unwrap();
+
+        let mut output = Vec::new();
+        let mut exit_code = None;
+        while exit_code.is_none() {
+            let message = tokio::time::timeout(std::time::Duration::from_secs(5), websocket.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            match message {
+                tokio_tungstenite::tungstenite::Message::Binary(bytes) => {
+                    output.extend_from_slice(&bytes);
+                }
+                tokio_tungstenite::tungstenite::Message::Text(text) => {
+                    let event: serde_json::Value = serde_json::from_str(&text).unwrap();
+                    if event["type"] == "exited" {
+                        exit_code = event["exit_code"].as_i64();
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(exit_code, Some(0));
+        assert!(String::from_utf8_lossy(&output).contains("pty-ok"));
         server.abort();
     }
 }

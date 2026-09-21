@@ -31,6 +31,7 @@ fn spec(id: &str) -> InstanceSpec {
             disk_bytes: 0,
         },
         scheduling: Default::default(),
+        sandbox: Default::default(),
     }
 }
 #[test]

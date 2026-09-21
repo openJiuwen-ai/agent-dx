@@ -49,6 +49,31 @@ fn default_rootfs_uses_local_artifact_without_bootstrap_mount() {
 }
 
 #[test]
+fn runtime_and_readonly_overlay_reuses_the_deployment_root_without_bootstrap_mount() {
+    let config = Config {
+        runtime_environment: Some(environment()),
+        ..Default::default()
+    };
+    let mut wanted = spec("");
+    wanted.runtime = "firecracker".into();
+    let rootfs = &mut wanted.runtime_environment.as_mut().unwrap().rootfs;
+    rootfs.runtime = "firecracker".into();
+    rootfs.readonly = true;
+
+    let request = start_request(&wanted, "i-1", 1, &[], &config).unwrap();
+    assert_eq!(request.runtime, "firecracker");
+    let rootfs = request.rootfs.unwrap();
+    assert!(rootfs.readonly);
+    assert_eq!(
+        rootfs.source,
+        Some(proto::rootfs_config::Source::Path(
+            "/opt/adx/runtime/rootfs.img".into()
+        ))
+    );
+    assert!(request.mounts.is_empty());
+}
+
+#[test]
 fn custom_image_mounts_the_same_local_environment_read_only() {
     let config = Config {
         runtime_environment: Some(environment()),
@@ -117,6 +142,35 @@ fn custom_rootfs_mounts_the_oci_runtime_image_read_only() {
 }
 
 #[test]
+fn s3_rootfs_mounts_the_configured_runtime_environment() {
+    use adx_core::sandbox::{Rootfs, S3Source, StorageSource};
+
+    let config = Config {
+        runtime_environment: Some(environment()),
+        ..Default::default()
+    };
+    let mut wanted = spec("");
+    wanted.sandbox.rootfs = Some(Rootfs {
+        readonly: false,
+        source: StorageSource::S3(S3Source {
+            endpoint: "https://s3.example".into(),
+            bucket: "rootfs".into(),
+            object: "application.erofs".into(),
+            access_key_id: "key".into(),
+            access_key_secret: "secret".into(),
+        }),
+    });
+    let request = start_request(&wanted, "i-1", 1, &[], &config).unwrap();
+    assert!(matches!(
+        request.rootfs.unwrap().source,
+        Some(proto::rootfs_config::Source::S3Config(_))
+    ));
+    assert_eq!(request.mounts.len(), 1);
+    assert_eq!(request.mounts[0].target, "/__adx");
+    assert_eq!(request.command, environment().bootstrap.entrypoint);
+}
+
+#[test]
 fn old_or_unconfigured_environment_cannot_mount_arbitrary_host_files() {
     let mut wanted = spec("custom");
     let config = Config {
@@ -125,5 +179,13 @@ fn old_or_unconfigured_environment_cannot_mount_arbitrary_host_files() {
     };
     wanted.runtime_environment.as_mut().unwrap().bootstrap.root = "/etc/other.img".into();
     assert!(start_request(&wanted, "i-1", 1, &[], &config).is_err());
+    let mut source_drift = spec("");
+    source_drift
+        .runtime_environment
+        .as_mut()
+        .unwrap()
+        .rootfs
+        .path = "/etc/other.img".into();
+    assert!(start_request(&source_drift, "i-1", 1, &[], &config).is_err());
     assert!(start_request(&spec("custom"), "i-1", 1, &[], &Config::default()).is_err());
 }

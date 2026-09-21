@@ -20,9 +20,15 @@ with Sandbox(image="python:3.12-slim", cpu=2000, memory=4096) as sandbox:
 
 The new Instance backend supports basic lifecycle, same-node pause/resume, reusable snapshots, grouped placement, idle deletion and restart policy. It requires an image containing the release RRT at the configured command path; generic `python:3.12-slim` below is only an illustrative image name.
 
-SDK surface and server support differ. `inherit_entrypoint`, creation network policy, mounts, extra_config, `failover=True`, independent resource limits, published user ports and per-sandbox data-plane security are rejected by the new backend. `reload()` and the legacy `/invoke` fallback are not implemented there. Runtime policy update models do not establish a configured end-to-end network-policy capability. The sections explicitly marked compatibility require a backend implementing those contracts. See [current HTTP contract](../../../control-plane/api-server/docs/sandbox-lifecycle-api.md).
+The Instance backend supports S3 rootfs, S3/image mounts, entrypoint inheritance,
+creation and runtime network policy, `extra_config`, `failover=True`, independent
+resource limits, and per-sandbox data-plane security. Declared user ports use
+Edge and Node Proxy routing. Public local rootfs paths and host mounts are not a
+tenant-facing contract. `upstream` reverse tunnel uses the published
+`/tunnel/{sandbox}` route; the legacy `/invoke` fallback remains unavailable. See the
+[current HTTP contract](../../../control-plane/api-server/docs/sandbox-lifecycle-api.md).
 
-## Image startup process (compatibility backend only)
+## Image startup process
 
 Set `inherit_entrypoint=True` on a fresh image-backed sandbox to start the
 image's effective `Entrypoint` and `Cmd` as its managed workload:
@@ -46,7 +52,8 @@ There are three deliberately different checkpoint paths:
 | --- | --- | --- | --- |
 | Reusable Snapshot | `create_snapshot()` then `Sandbox.create()` | New Instance identity; shared storage allows fresh placement, local-only pins the source node. | Independent clones from a prepared source. |
 | Pause / resume | `pause()` then `resume()` | Same Instance ID; public resume calls its owning Node Manager. | Stop and resume one logical sandbox. |
-| Compatibility recovery | `failover=True` or `reload()` | Not supported by the new Instance backend. | Requires an external compatible backend. |
+| Failure recovery | `failover=True` | Same Instance and node; restores the latest unexpired checkpoint after unexpected backend exit. | Workloads that must recover execution state rather than cold-start. |
+| Explicit reload | `reload()` | Same Instance; replaces a Running backend from its latest unexpired checkpoint. | Operator-requested reset to a known recovery point. |
 
 The SDK is a client-side validation, request-ID, attempt, and result-shaping
 layer. Node Manager owns lifecycle and checkpoint bytes; Master owns placement, committed state and the snapshot catalog.
@@ -155,9 +162,16 @@ that result is outside the resume success boundary.
 
 Pausing persists bytes through the configured local or S3 store and commits Paused after removing the old execution. A SQLite-only result is not cluster success. Public resume requires the authoritative Paused identity and a valid checkpoint. Failed-node cross-node recovery with a shared checkpoint is a separate Master coordinator path; it is not selected by the public resume call.
 
-## Compatibility recovery methods
+## Recovery methods
 
-`failover` is a constructor field and `Sandbox.reload() -> bool` remains a client method. The new server rejects `failover=True` and does not implement reload. The SDK may turn the resulting reload `SandboxError` into `False`; that does not mean a recovery attempt succeeded. For supported automatic restart and shared-checkpoint node recovery, use the platform lifecycle configuration and inspect the authoritative state.
+`failover=True` restores from the latest unexpired checkpoint after an
+unexpected backend exit on the owning node. If no valid checkpoint exists, the
+Instance becomes Failed and is not recreated from the original image.
+`Sandbox.reload() -> bool` explicitly replaces a Running backend from that same
+recovery point. It returns `True` only after the replacement reaches Running and
+the result is durably published. Automatic restart policy is a separate cold
+restart mechanism. Shared-checkpoint node-failure recovery is coordinated by
+Master and is not selected by either public call.
 
 ## Timeouts, attempts, and errors
 
@@ -208,6 +222,7 @@ POST /api/sandbox/v1/sandboxes                 # create from Snapshot: snapshotI
 POST /api/sandbox/v1/sandboxes/{id}/pause
 POST /api/sandbox/v1/sandboxes/{id}/resume
 POST /api/sandbox/v1/sandboxes/{id}/reload
+PUT  /api/sandbox/v1/sandboxes/{id}/network
 ```
 
 Raw HTTP has intentionally different validation in a few places. A raw
@@ -245,11 +260,33 @@ Sandbox(storage_mb=153600, storage_limit_mb=153600)
 ```
 
 `storage_limit_mb=0` uses `storage_mb`, or the cluster default when
-`storage_mb` is omitted. A nonzero limit cannot be below `storage_mb`. The new backend additionally rejects limits different from the requested allocation.
+`storage_mb` is omitted. A nonzero limit cannot be below `storage_mb`. The
+request controls scheduling while the limit is passed separately to sandboxd's
+writable-layer enforcement.
 
-## Network policy models (compatibility surface)
+## Rootfs and mounts
 
-The SDK retains `NetworkPolicy`, `NetworkRule`, `PortRange` and policy-update helpers for compatible deployments. New Instance creation currently rejects `network_policy`; this monorepo does not claim the former backend's ACL/DNS enforcement or RuntimeRPC fallback behavior. Do not use these helpers as proof of enforced networking in the current platform.
+`rootfs=S3Config(...)` starts from an S3-compatible EROFS root filesystem.
+`Mount` supports image-backed read-only bind mounts and S3-backed bind or EROFS
+mounts. Credentials are sent to the control plane and sandboxd; callers should
+use scoped object-store credentials. RRT is still supplied by the deployment's
+local runtime environment, so a custom rootfs does not need to bake in ADX.
+
+The deployment Runtime Environment is the rootfs baseline. `runtime=` overrides
+only its isolation runtime. `rootfs_readonly=True` or `False` overrides only its
+read-only setting; leaving it as `None` inherits the deployment default. Passing
+`image=` or `rootfs=S3Config(...)` replaces the source atomically while omitted
+runtime/read-only fields continue to inherit. Runtime-only and read-only-only
+overrides keep the baseline source and do not add the bootstrap mount.
+
+## Network policy models
+
+`NetworkPolicy`, `NetworkRule`, and `PortRange` are accepted at creation.
+`update_network_policy(policy)` atomically replaces the complete runtime policy;
+passing `None` clears it. Node Manager reserves the RRT control port and declared
+published ports with the highest rule priority so a user default-deny policy
+cannot cut the control route. User priorities must be in `1..UINT32_MAX-1`.
+Enforcement is provided by sandboxd's network policy implementation.
 
 ## Connection configuration
 
@@ -276,7 +313,9 @@ Sandbox.delete("sandbox-id", connection=connection)
 
 Without a `ConnectionConfig`, the SDK reads `ADX_SERVER_ADDRESS`, `ADX_TOKEN`,
 `ADX_TLS`, `ADX_GATEWAY_ADDRESS`, and `ADX_GATEWAY_TLS`. The gateway address
-defaults to the frontend address for reverse-tunnel, user-port, and PTY routes.
+defaults to the frontend address for reverse-tunnel and user-port routes. PTY
+uses the Edge data-plane route when a gateway address is configured, and falls
+back to the server address for combined deployments.
 
 ## Build and test
 

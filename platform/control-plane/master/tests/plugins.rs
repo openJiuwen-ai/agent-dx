@@ -23,6 +23,7 @@ fn spec(id: &str) -> InstanceSpec {
             disk_bytes: 1,
         },
         priority: 0,
+        sandbox: Default::default(),
     }
 }
 fn node(id: &str, available: bool) -> Node {

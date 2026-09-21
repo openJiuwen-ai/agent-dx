@@ -146,8 +146,15 @@ def _gateway_address(connection: Optional[ConnectionConfig]) -> str:
 
 def _gateway_uses_tls(connection: Optional[ConnectionConfig]) -> bool:
     if connection is not None:
-        return connection.gateway_use_tls
-    return os.environ.get("ADX_GATEWAY_TLS", "0").strip().lower() in (
+        return (
+            connection.gateway_use_tls
+            if connection.gateway_address is not None
+            else connection.use_tls
+        )
+    gateway = os.environ.get("ADX_GATEWAY_ADDRESS", "").strip()
+    flag = "ADX_GATEWAY_TLS" if gateway else "ADX_TLS"
+    default = "0" if gateway else "1"
+    return os.environ.get(flag, default).strip().lower() in (
         "1",
         "true",
         "yes",
@@ -332,6 +339,7 @@ class Sandbox:
         detached: bool = False,
         node_id: Optional[str] = None,
         *,
+        rootfs_readonly: Optional[bool] = None,
         labels: Optional[Dict[str, str]] = None,
         schedule_affinities: Optional[List[Dict[str, Any]]] = None,
         snapshot_id: Optional[str] = None,
@@ -353,6 +361,10 @@ class Sandbox:
         Args:
             image: Container image to use (e.g. ``"python:3.12-slim"``).
             rootfs: S3-compatible EROFS root filesystem configuration.
+            rootfs_readonly: Optional override for the deployment rootfs
+                ``readonly`` default. Omitting it inherits the deployment
+                setting, including when replacing the source with *image* or
+                *rootfs*.
             runtime: Sandbox isolation runtime identifier. Defaults to
                 ``runsc`` and is validated by the runtime layer.
             cpu: CPU scheduling request in milli-cores (default 1000).
@@ -411,6 +423,8 @@ class Sandbox:
             raise TypeError("rootfs must be an S3Config")
         if image is not None and rootfs is not None:
             raise ValueError("image and rootfs are mutually exclusive")
+        if rootfs_readonly is not None and not isinstance(rootfs_readonly, bool):
+            raise TypeError("rootfs_readonly must be a boolean or None")
         if snapshot_id is not None and (
             not isinstance(snapshot_id, str) or not snapshot_id.strip()
         ):
@@ -423,6 +437,8 @@ class Sandbox:
             raise ValueError("inherit_entrypoint requires an image rootfs")
         if inherit_entrypoint and snapshot_id is not None:
             raise ValueError("inherit_entrypoint cannot be combined with snapshot_id")
+        if snapshot_id is not None and rootfs_readonly is not None:
+            raise ValueError("rootfs_readonly cannot be combined with snapshot_id")
         if env is not None and (
             not isinstance(env, Mapping)
             or not all(
@@ -556,7 +572,6 @@ class Sandbox:
             body["rootfs"].update(
                 {
                     "type": "image",
-                    "readonly": False,
                     "imageurl": image,
                 }
             )
@@ -567,6 +582,8 @@ class Sandbox:
                     "storageInfo": rootfs.to_dict(),
                 }
             )
+        if rootfs_readonly is not None:
+            body["rootfs"]["readonly"] = rootfs_readonly
         if name:
             body["name"] = name
         resource_values = {

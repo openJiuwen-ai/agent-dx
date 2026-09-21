@@ -67,6 +67,92 @@ struct Rootfs {
     runtime: String,
     r#type: String,
     imageurl: String,
+    readonly: Option<bool>,
+    path: String,
+    storage_info: Option<S3>,
+}
+#[derive(Clone, Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct S3 {
+    endpoint: String,
+    bucket: String,
+    object: String,
+    access_key: String,
+    secret_key: String,
+}
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct Mount {
+    r#type: String,
+    target: String,
+    options: Vec<String>,
+    #[serde(alias = "imageUrl")]
+    image_url: String,
+    #[serde(alias = "s3Config")]
+    s3_config: Option<S3>,
+    #[serde(alias = "hostPath")]
+    host_path: String,
+}
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct PortRange {
+    first: u32,
+    last: u32,
+}
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct Peer {
+    address: String,
+    port: u32,
+    cidr: String,
+    domain: String,
+    port_range: Option<PortRange>,
+}
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct Rule {
+    action: String,
+    direction: String,
+    protocol: String,
+    peer: Peer,
+    sandbox_port: u32,
+    sandbox_port_range: Option<PortRange>,
+    priority: u32,
+}
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct Traffic {
+    ingress_default_action: String,
+    egress_default_action: String,
+    rules: Vec<Rule>,
+    mode: String,
+}
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct DnsRule {
+    action: String,
+    pattern: String,
+}
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct Dns {
+    default_action: String,
+    rules: Vec<DnsRule>,
+}
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct Network {
+    block_network: bool,
+    dns_blacklist: Vec<String>,
+    schema_version: u32,
+    traffic: Option<Traffic>,
+    dns: Option<Dns>,
+}
+#[derive(Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct DataPlane {
+    tunnel_security_mode: String,
+    port_forward_security_mode: String,
 }
 #[derive(Default, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -98,6 +184,284 @@ fn positive(value: i64, scale: u64) -> Result<u64, Status> {
         .filter(|v| *v <= (1u64 << 53))
         .ok_or_else(|| invalid("invalid resource amount"))
 }
+fn s3(value: S3) -> Result<adx_core::sandbox::S3Source, Status> {
+    let source = adx_core::sandbox::S3Source {
+        endpoint: value.endpoint,
+        bucket: value.bucket,
+        object: value.object,
+        access_key_id: value.access_key,
+        access_key_secret: value.secret_key,
+    };
+    source
+        .validate()
+        .map_err(|error| invalid(&error.to_string()))?;
+    Ok(source)
+}
+
+fn validate_rootfs_object(
+    fields: &serde_json::Map<String, Value>,
+    top_level_image: &str,
+) -> Result<(), Status> {
+    if let Some(runtime) = fields.get("runtime") {
+        if runtime.as_str().is_none_or(|value| value.trim().is_empty()) {
+            return Err(invalid("rootfs runtime must be a non-empty string"));
+        }
+    }
+    if fields
+        .get("readonly")
+        .is_some_and(|value| !value.is_boolean())
+    {
+        return Err(invalid("rootfs readonly must be a boolean"));
+    }
+
+    let source_fields = ["imageurl", "path", "storageInfo"];
+    let has_source = source_fields.iter().any(|key| fields.contains_key(*key));
+    let Some(kind) = fields.get("type") else {
+        if has_source {
+            return Err(invalid("rootfs source fields require type"));
+        }
+        return Ok(());
+    };
+    let kind = kind
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| invalid("rootfs type must be a non-empty string"))?;
+    if !top_level_image.trim().is_empty() {
+        return Err(invalid("image and rootfs source are mutually exclusive"));
+    }
+    let non_empty_string = |key: &str| {
+        fields
+            .get(key)
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
+    };
+    match kind {
+        "image" => {
+            if fields.contains_key("path") || fields.contains_key("storageInfo") {
+                return Err(invalid("image rootfs cannot contain path or storageInfo"));
+            }
+            if !non_empty_string("imageurl") {
+                return Err(invalid("image rootfs requires non-empty imageurl"));
+            }
+        }
+        "s3" => {
+            if fields.contains_key("path") || fields.contains_key("imageurl") {
+                return Err(invalid("S3 rootfs cannot contain path or imageurl"));
+            }
+            if !fields.get("storageInfo").is_some_and(Value::is_object) {
+                return Err(invalid("S3 rootfs requires an object storageInfo"));
+            }
+        }
+        "local" => {
+            if fields.contains_key("imageurl") || fields.contains_key("storageInfo") {
+                return Err(invalid(
+                    "local rootfs cannot contain imageurl or storageInfo",
+                ));
+            }
+            if !non_empty_string("path") {
+                return Err(invalid("local rootfs requires non-empty path"));
+            }
+        }
+        _ => return Err(invalid("unsupported rootfs type")),
+    }
+    Ok(())
+}
+
+fn rootfs(value: Value, top_level_image: &str) -> Result<Rootfs, Status> {
+    let value = match value {
+        Value::Null => return Ok(Rootfs::default()),
+        Value::String(value) if value.trim().starts_with('{') => {
+            serde_json::from_str(&value).map_err(|_| invalid("invalid rootfs"))?
+        }
+        Value::String(value) => {
+            if value.trim().is_empty() || !top_level_image.trim().is_empty() {
+                return Err(invalid("invalid or conflicting rootfs image"));
+            }
+            return Ok(Rootfs {
+                r#type: "image".into(),
+                imageurl: value,
+                ..Default::default()
+            });
+        }
+        value => value,
+    };
+    let fields = value
+        .as_object()
+        .ok_or_else(|| invalid("rootfs overlay must be an object"))?;
+    validate_rootfs_object(fields, top_level_image)?;
+    serde_json::from_value(value).map_err(|_| invalid("invalid rootfs"))
+}
+
+fn storage_source(root: &Rootfs) -> Result<Option<adx_core::sandbox::StorageSource>, Status> {
+    use adx_core::sandbox::StorageSource;
+    match root.r#type.as_str() {
+        "" => Ok(None),
+        "image" => Ok(Some(StorageSource::Image(root.imageurl.clone()))),
+        "s3" => Ok(Some(StorageSource::S3(s3(root
+            .storage_info
+            .clone()
+            .ok_or_else(|| invalid("S3 rootfs storageInfo is required"))?)?))),
+        "local" => Err(invalid("public local rootfs is not allowed")),
+        _ => Err(invalid("unsupported rootfs type")),
+    }
+}
+fn mount(value: Value) -> Result<adx_core::sandbox::Mount, Status> {
+    use adx_core::sandbox::StorageSource;
+    let value: Mount = serde_json::from_value(value).map_err(|_| invalid("invalid mount"))?;
+    let source = match (
+        value.image_url.is_empty(),
+        value.s3_config,
+        value.host_path.is_empty(),
+    ) {
+        (false, None, true) => StorageSource::Image(value.image_url),
+        (true, Some(value), true) => StorageSource::S3(s3(value)?),
+        (true, None, false) => return Err(invalid("public host mounts are not allowed")),
+        _ => return Err(invalid("mount requires exactly one source")),
+    };
+    let result = adx_core::sandbox::Mount {
+        kind: value.r#type,
+        target: value.target,
+        options: value.options,
+        source,
+    };
+    result
+        .validate()
+        .map_err(|error| invalid(&error.to_string()))?;
+    Ok(result)
+}
+fn network_action(value: &str) -> Result<adx_core::sandbox::NetworkAction, Status> {
+    match value {
+        "allow" => Ok(adx_core::sandbox::NetworkAction::Allow),
+        "deny" => Ok(adx_core::sandbox::NetworkAction::Deny),
+        _ => Err(invalid("invalid network action")),
+    }
+}
+fn network_direction(value: &str) -> Result<adx_core::sandbox::NetworkDirection, Status> {
+    match value {
+        "ingress" => Ok(adx_core::sandbox::NetworkDirection::Ingress),
+        "egress" => Ok(adx_core::sandbox::NetworkDirection::Egress),
+        "both" => Ok(adx_core::sandbox::NetworkDirection::Both),
+        _ => Err(invalid("invalid network direction")),
+    }
+}
+fn network_protocol(value: &str) -> Result<adx_core::sandbox::NetworkProtocol, Status> {
+    match value {
+        "any" => Ok(adx_core::sandbox::NetworkProtocol::Any),
+        "tcp" => Ok(adx_core::sandbox::NetworkProtocol::Tcp),
+        "udp" => Ok(adx_core::sandbox::NetworkProtocol::Udp),
+        "icmp" => Ok(adx_core::sandbox::NetworkProtocol::Icmp),
+        _ => Err(invalid("invalid network protocol")),
+    }
+}
+fn port_range(value: PortRange) -> adx_core::sandbox::PortRange {
+    adx_core::sandbox::PortRange {
+        first: value.first,
+        last: value.last,
+    }
+}
+pub(crate) fn network_policy(
+    value: Value,
+) -> Result<Option<adx_core::sandbox::NetworkPolicy>, Status> {
+    use adx_core::sandbox as model;
+    if !active(&value) {
+        return Ok(None);
+    }
+    let value: Network =
+        serde_json::from_value(value).map_err(|_| invalid("invalid network policy"))?;
+    if value.block_network && (!value.dns_blacklist.is_empty() || value.schema_version != 0) {
+        return Err(invalid("legacy network policies cannot be combined"));
+    }
+    let mut policy = model::NetworkPolicy::default();
+    if value.block_network {
+        policy.traffic = Some(model::TrafficPolicy {
+            ingress_default_action: model::NetworkAction::Deny,
+            egress_default_action: model::NetworkAction::Deny,
+            rules: vec![],
+            mode: model::TrafficMode::Stateful,
+        });
+    } else if !value.dns_blacklist.is_empty() {
+        policy.dns = Some(model::DnsPolicy {
+            default_action: model::NetworkAction::Allow,
+            rules: value
+                .dns_blacklist
+                .into_iter()
+                .map(|pattern| model::DnsRule {
+                    action: model::NetworkAction::Deny,
+                    pattern,
+                })
+                .collect(),
+        });
+    } else {
+        if value.schema_version != 2 {
+            return Err(invalid("network schemaVersion must be 2"));
+        }
+        policy.traffic = value
+            .traffic
+            .map(|traffic| {
+                Ok(model::TrafficPolicy {
+                    ingress_default_action: network_action(&traffic.ingress_default_action)?,
+                    egress_default_action: network_action(&traffic.egress_default_action)?,
+                    rules: traffic
+                        .rules
+                        .into_iter()
+                        .map(|rule| {
+                            Ok(model::NetworkRule {
+                                action: network_action(&rule.action)?,
+                                direction: network_direction(&rule.direction)?,
+                                protocol: network_protocol(&rule.protocol)?,
+                                peer: model::NetworkPeer {
+                                    address: rule.peer.address,
+                                    port: rule.peer.port,
+                                    cidr: rule.peer.cidr,
+                                    domain: rule.peer.domain,
+                                    port_range: rule.peer.port_range.map(port_range),
+                                },
+                                sandbox_port: rule.sandbox_port,
+                                sandbox_port_range: rule.sandbox_port_range.map(port_range),
+                                priority: rule.priority,
+                            })
+                        })
+                        .collect::<Result<_, Status>>()?,
+                    mode: match traffic.mode.as_str() {
+                        "stateless" => model::TrafficMode::Stateless,
+                        "stateful" => model::TrafficMode::Stateful,
+                        _ => return Err(invalid("invalid traffic policy mode")),
+                    },
+                })
+            })
+            .transpose()?;
+        policy.dns = value
+            .dns
+            .map(|dns| -> Result<model::DnsPolicy, Status> {
+                Ok(model::DnsPolicy {
+                    default_action: network_action(&dns.default_action)?,
+                    rules: dns
+                        .rules
+                        .into_iter()
+                        .map(|rule| {
+                            Ok(model::DnsRule {
+                                action: network_action(&rule.action)?,
+                                pattern: rule.pattern,
+                            })
+                        })
+                        .collect::<Result<_, Status>>()?,
+                })
+            })
+            .transpose()?;
+    }
+    policy
+        .validate()
+        .map_err(|error| invalid(&error.to_string()))?;
+    Ok(Some(policy))
+}
+fn security(value: &str) -> Result<adx_core::sandbox::DataPlaneSecurityMode, Status> {
+    match value {
+        "" => Ok(adx_core::sandbox::DataPlaneSecurityMode::Inherit),
+        "tls" => Ok(adx_core::sandbox::DataPlaneSecurityMode::Tls),
+        "tls-token" => Ok(adx_core::sandbox::DataPlaneSecurityMode::TlsToken),
+        _ => Err(invalid("invalid data-plane security mode")),
+    }
+}
 pub fn create_spec(body: Value, caller: &pb::CallerContext) -> Result<pb::InstanceSpec, Status> {
     create_spec_with_environment(body, caller, None)
 }
@@ -114,20 +478,8 @@ pub fn create_spec_with_environment(
     if caller.tenant_id.is_empty() {
         return Err(Status::unauthenticated("verified identity required"));
     }
-    let mut root = match r.rootfs {
-        Value::Null => Rootfs::default(),
-        Value::String(s) => {
-            if s.trim().starts_with('{') {
-                serde_json::from_str(&s).map_err(|_| invalid("invalid rootfs"))?
-            } else {
-                Rootfs {
-                    imageurl: s,
-                    ..Default::default()
-                }
-            }
-        }
-        v => serde_json::from_value(v).map_err(|_| invalid("invalid rootfs"))?,
-    };
+    let rootfs_value = std::mem::take(&mut r.rootfs);
+    let mut root = rootfs(rootfs_value, &r.image)?;
     if !r.runtime.is_empty() && !root.runtime.is_empty() && r.runtime != root.runtime {
         return Err(invalid("conflicting runtime selections"));
     }
@@ -137,8 +489,15 @@ pub fn create_spec_with_environment(
     if root.imageurl.is_empty() {
         root.imageurl = r.image;
     }
+    if root.r#type.is_empty() && !root.imageurl.is_empty() {
+        root.r#type = "image".into();
+    }
     let snapshot = (!r.snapshot_id.trim().is_empty()).then(|| r.snapshot_id.trim().to_string());
-    if snapshot.is_none() && environment.is_none() && root.imageurl.trim().is_empty() {
+    if snapshot.is_none()
+        && environment.is_none()
+        && root.imageurl.trim().is_empty()
+        && root.r#type != "s3"
+    {
         return Err(invalid("image required"));
     }
     if snapshot.is_none() && root.runtime.is_empty() {
@@ -196,27 +555,79 @@ pub fn create_spec_with_environment(
             })
         })
         .transpose()?;
-    if r.failover
-        || r.inherit
-        || !r.mounts.is_empty()
-        || !r.extra_config.is_empty()
-        || active(&r.network)
-        || active(&r.data_plane)
-        || !r.ports.is_empty()
-        || (!root.r#type.is_empty() && root.r#type != "image")
-    {
-        return Err(Status::unimplemented(
-            "requested create option is not supported",
-        ));
+    // Forwarded ports do not allocate host ports: Edge and Node Proxy route
+    // authenticated traffic directly to the Instance IP. Keep the public
+    // declaration validated while the originating SDK handle uses it to guard
+    // get_port_url().
+    let ports = validate_ports(&r.ports)?;
+    let cpu_limit = if r.cpu_limit == 0 {
+        cpu
+    } else {
+        positive(r.cpu_limit, 1)?
+    };
+    let memory_limit = if r.mem_limit == 0 {
+        memory
+    } else {
+        positive(r.mem_limit, 1048576)?
+    };
+    let disk_limit = if r.storage_limit_mb == 0 {
+        disk
+    } else {
+        positive(r.storage_limit_mb, 1048576)?
+    };
+    if cpu_limit < cpu || memory_limit < memory || disk_limit < disk {
+        return Err(invalid("resource limits cannot be below requests"));
     }
-    if (r.cpu_limit != 0 && positive(r.cpu_limit, 1)? != cpu)
-        || (r.mem_limit != 0 && positive(r.mem_limit, 1048576)? != memory)
-        || (r.storage_limit_mb != 0 && positive(r.storage_limit_mb, 1048576)? != disk)
-    {
-        return Err(Status::unimplemented(
-            "independent resource limits are not supported",
-        ));
-    }
+    let readonly = root
+        .readonly
+        .or_else(|| environment.map(|value| value.rootfs.readonly))
+        .unwrap_or(false);
+    let rootfs =
+        storage_source(&root)?.map(|source| adx_core::sandbox::Rootfs { readonly, source });
+    let mounts = r
+        .mounts
+        .into_iter()
+        .map(mount)
+        .collect::<Result<Vec<_>, _>>()?;
+    let network = network_policy(r.network)?;
+    let data_plane: DataPlane = if active(&r.data_plane) {
+        serde_json::from_value(r.data_plane)
+            .map_err(|_| invalid("invalid data-plane security policy"))?
+    } else {
+        DataPlane::default()
+    };
+    let data_plane = adx_core::sandbox::DataPlanePolicy {
+        tunnel: security(&data_plane.tunnel_security_mode)?,
+        port_forward: security(&data_plane.port_forward_security_mode)?,
+    };
+    let extra_config = if r.extra_config.is_empty() {
+        String::new()
+    } else {
+        serde_json::to_string(&r.extra_config)
+            .map_err(|_| invalid("invalid sandbox extra_config"))?
+    };
+    let sandbox = adx_core::sandbox::SandboxOptions {
+        rootfs,
+        mounts,
+        network,
+        data_plane,
+        ports,
+        failover: r.failover,
+        inherit_entrypoint: r.inherit,
+        limits: adx_core::sandbox::ResourceLimits {
+            cpu_millis: cpu_limit,
+            memory_bytes: memory_limit,
+            disk_bytes: disk_limit,
+        },
+        extra_config,
+    };
+    sandbox
+        .validate(&adx_core::Resources {
+            cpu_millis: cpu,
+            memory_bytes: memory,
+            disk_bytes: disk,
+        })
+        .map_err(|error| invalid(&error.to_string()))?;
     let mut policy = policy;
     if !r.xpu.is_empty() {
         let parts: Vec<_> = r.xpu.split(':').collect();
@@ -295,12 +706,19 @@ pub fn create_spec_with_environment(
         r.env
             .insert("RRT_TUNNEL_WS_PORT".into(), (port - 1).to_string());
     }
+    let runtime_environment = if snapshot.is_none() {
+        environment.cloned().map(|mut value| {
+            value.rootfs.runtime.clone_from(&root.runtime);
+            if let Some(readonly) = root.readonly {
+                value.rootfs.readonly = readonly;
+            }
+            value.into()
+        })
+    } else {
+        None
+    };
     Ok(pb::InstanceSpec {
-        runtime_environment: if snapshot.is_none() {
-            environment.cloned().map(Into::into)
-        } else {
-            None
-        },
+        runtime_environment,
         id: format!("{}-{}", r.namespace, r.name),
         tenant_id: caller.tenant_id.clone(),
         image: root.imageurl.trim().into(),
@@ -318,7 +736,23 @@ pub fn create_spec_with_environment(
             restart,
         }),
         snapshot_id: snapshot,
+        sandbox: Some(sandbox.into()),
     })
+}
+
+fn validate_ports(ports: &[String]) -> Result<Vec<u16>, Status> {
+    let mut unique = std::collections::BTreeSet::new();
+    for value in ports {
+        let port = value
+            .parse::<u16>()
+            .ok()
+            .filter(|port| *port > 0)
+            .ok_or_else(|| invalid("invalid forwarded port"))?;
+        if !unique.insert(port) {
+            return Err(invalid("duplicate forwarded port"));
+        }
+    }
+    Ok(unique.into_iter().collect())
 }
 fn affinities(
     input: Vec<Affinity>,

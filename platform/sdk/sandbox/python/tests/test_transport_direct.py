@@ -27,7 +27,11 @@ import httpx
 os.environ.setdefault("ADX_SERVER_ADDRESS", "frontend:8889")
 os.environ.setdefault("ADX_TOKEN", "test-token")
 
-from adx_sandbox._transport import SandboxClient, SandboxError  # noqa: E402
+from adx_sandbox._transport import (  # noqa: E402
+    SandboxClient,
+    SandboxError,
+    SandboxHTTPError,
+)
 from adx_sandbox.filesystem import Filesystem  # noqa: E402
 
 
@@ -1218,6 +1222,34 @@ def test_direct_fallback_when_frontend_direct_missing():
     print("ok: direct disables only after four consecutive 404s ->", calls)
 
 
+def test_direct_command_not_found_is_not_treated_as_route_miss():
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        if request.url.path.startswith("/api/sandbox/v1"):
+            raise AssertionError("command not-found must not fall back to lifecycle API")
+        return httpx.Response(
+            404,
+            json={
+                "status": "not_found",
+                "error_code": "COMMAND_NOT_FOUND",
+                "error": "command missing-id not found",
+            },
+        )
+
+    c = _make_client(handler)
+    try:
+        c.invoke("sandbox-demo", "process.get", {"command_id": "missing-id"})
+    except SandboxHTTPError as error:
+        _check(error.status_code == 404, f"unexpected status: {error.status_code}")
+    else:
+        raise AssertionError("structured command not-found was accepted")
+    _check(calls == ["/direct/sandbox-demo/invoke"], f"unexpected fallback: {calls}")
+    _check(c._direct_route_misses == 0, "command not-found is not a route miss")
+    print("ok: structured direct command not-found is preserved")
+
+
 def test_direct_success_resets_route_miss_count():
     direct_statuses = [404, 404, 200, 404, 404, 404, 200]
     direct_calls = 0
@@ -1952,6 +1984,7 @@ if __name__ == "__main__":
     test_direct_connect_error_falls_back()
     test_direct_pool_timeout_retries_then_falls_back()
     test_direct_fallback_when_frontend_direct_missing()
+    test_direct_command_not_found_is_not_treated_as_route_miss()
     test_direct_success_resets_route_miss_count()
     test_direct_binary_upload_success()
     test_files_write_bytes_uses_direct_upload()

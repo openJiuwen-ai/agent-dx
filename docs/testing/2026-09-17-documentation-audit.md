@@ -28,7 +28,7 @@ README 的架构图和目录 HTML 已更新。HTML 从同目录 Markdown 生成�
 ## 仍需明确的实现边界
 
 - Agent CLI/SDK/Executor 仍有旧 FaaS/外部运行时依赖；基础平台 E2E 不证明 Agent 业务闭环。
-- 新后端不支持 `reload()`、创建 `failover=true`、挂载、入口继承、网络策略、独立资源上限、公开用户端口及每实例数据面安全策略；SDK 保留兼容字段不构成服务端承诺。
+- 本条是 2026-09-17 当次基线结论，已被 2026-09-21 的实现取代：当前已接入 `reload()`、`failover=true`、S3 rootfs／mount、入口继承、网络策略、独立资源 limit、每实例数据面安全策略及 `upstream` reverse tunnel；实时状态和实跑边界以 [SDK E2E 覆盖](sdk-e2e-coverage.md) 为准。
 - FC 双克隆网络、GPU/NPU 实卡、完整服务混合负载与长稳仍待验收；K8s FC、x86 克隆对照、模板预热、证书热重载和统一实时 Trace 队列丢弃指标后置。
 - 心跳失效会撤销归属/路由并触发恢复协调，返回节点先清理旧执行；这不构成跨宿主网络分区中旧进程已停止的物理证明。
 

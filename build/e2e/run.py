@@ -16,11 +16,12 @@ import time
 import uuid
 import xml.etree.ElementTree as ET
 
-STANDARD = ('sdk','auth','capacity','placement','local-first','node-failure','restart','stop')
+BASIC = ('sdk','auth','capacity','placement','local-first')
+STANDARD = ('sdk','data-plane','lifecycle','auth','capacity','placement','local-first','node-failure','restart','stop')
 PROFILES = {
     'l0': ('l0','auth'),
     'standalone': STANDARD,
-    'k8s-basic': STANDARD,
+    'k8s-basic': BASIC,
     'full': STANDARD,
 }
 def required_for_profile(profile):
@@ -45,12 +46,47 @@ def verify_bundle(directory):
     if m.get('schema_version') != 1 or sha(directory/'images.tar') != m.get('archive_sha256'):
         raise ValueError('bundle integrity check failed')
     if sha(directory/'rrt.tar') != m.get('rrt_archive_sha256'):raise ValueError('RRT archive integrity check failed')
+    if sha(directory/'entrypoint.tar') != m.get('entrypoint_archive_sha256'):
+        raise ValueError('entrypoint image archive integrity check failed')
     return m
 
 def finish_report(error, cleanup_errors, checks, required=None):
     required=tuple(required or STANDARD)
     missing=[name for name in required if name not in checks]
     return {'status':'passed' if not error and not cleanup_errors and not missing else 'failed','error':error,'cleanup_errors':cleanup_errors,'checks':checks,'required_checks':list(required),'missing_checks':missing}
+
+def sdk_subcases_from_output(output):
+    """Return the last structured SDK case list printed by a scenario."""
+    if not isinstance(output,str):
+        return []
+    for line in reversed(output.splitlines()):
+        try:
+            payload=json.loads(line)
+        except (TypeError,json.JSONDecodeError):
+            continue
+        cases=payload.get('cases') if isinstance(payload,dict) else None
+        if not isinstance(cases,list):
+            continue
+        normalized=[]
+        for case in cases:
+            if not isinstance(case,dict):
+                raise ValueError('invalid SDK subcase result')
+            case_id=case.get('id') or case.get('name')
+            if not isinstance(case_id,str):
+                raise ValueError('invalid SDK subcase result')
+            status=case.get('status')
+            if status is None and isinstance(case.get('passed'),bool):
+                status='passed' if case['passed'] else 'failed'
+            if status not in ('passed','failed'):
+                raise ValueError('invalid SDK subcase status')
+            normalized.append({
+                'id':case_id,
+                'status':status,
+                'seconds':float(case.get('seconds',0)),
+                **({'error':str(case['error'])} if 'error' in case else {}),
+            })
+        return normalized
+    return []
 
 class Run:
     def __init__(self,output):
@@ -136,7 +172,7 @@ class Run:
         self.event('[RUN] ' + name)
         record = {'name': name, 'status': 'failed'}
         try:
-            yield
+            yield record
         except Exception as error:
             record['error'] = self.redact(str(error))
             self.event(f'[FAIL] {name}: {error}')
@@ -199,17 +235,34 @@ class Run:
                 self.helper('node1','postcheck','l0')
                 for node in self.nodes:self.helper(node,'empty',node)
         if 'sdk' in selected:
-            with self.case('sdk', checks):
+            with self.case('sdk', checks) as record:
                 self.event('Create/query instances; verify command stdout/stderr/exit code, binary files and deletion')
                 for node in self.nodes:self.execute(node,'python3','/opt/adx/e2e/telemetry.py','outage-start',node)
-                self.execute('node1','/opt/adx/client/bin/python','-u','/opt/adx/e2e/scenarios.py','sdk',timeout=600)
+                output=self.execute('node1','/opt/adx/client/bin/python','-u','/opt/adx/e2e/scenarios.py','sdk',timeout=600)
+                record['subcases']=sdk_subcases_from_output(output)
                 for node in self.nodes:self.execute(node,'python3','/opt/adx/e2e/telemetry.py','outage-end',node)
                 self.helper('node1','postcheck')
                 for node in self.nodes:self.helper(node,'empty',node)
+                record['subcases'].append({
+                    'id':'sandbox.delete-and-resource-cleanup',
+                    'status':'passed',
+                    'seconds':0,
+                })
+        for scenario, description in (
+            ('data-plane', 'Exercise resource discovery, reattach, commands, files, PTY, forwarded ports and reverse tunnel'),
+            ('lifecycle', 'Exercise detached reattach/delete and idle-timeout reclamation'),
+        ):
+            if scenario in selected:
+                with self.case(scenario, checks) as record:
+                    self.event(description)
+                    output=self.execute('node1','/opt/adx/client/bin/python','-u','/opt/adx/e2e/scenarios.py',scenario,timeout=600)
+                    record['subcases']=sdk_subcases_from_output(output)
+                    for node in self.nodes:self.helper(node,'empty',node)
         for scenario in ('auth','capacity','placement'):
             if scenario in selected:
-                with self.case(scenario, checks):
-                    self.execute('node1','/opt/adx/client/bin/python','-u','/opt/adx/e2e/scenarios.py',scenario,timeout=400)
+                with self.case(scenario, checks) as record:
+                    output=self.execute('node1','/opt/adx/client/bin/python','-u','/opt/adx/e2e/scenarios.py',scenario,timeout=400)
+                    record['subcases']=sdk_subcases_from_output(output)
                     for node in self.nodes:self.helper(node,'empty',node)
         if 'local-first' in selected:
             with self.case('local-first', checks):
@@ -252,6 +305,16 @@ def write_junit(path, report, suite_name='platform-e2e'):
     records={case['name']:case for case in report['cases']}
     for name in report.get('required_checks',STANDARD):
         record=records.get(name)
+        subcases=record.get('subcases',[]) if record else []
+        if record and record['status']=='passed' and subcases:
+            for subcase in subcases:
+                case=ET.SubElement(
+                    suite,'testcase',name=f"{name}/{subcase['id']}",
+                    time=str(subcase.get('seconds',0)),
+                )
+                if subcase['status']!='passed':
+                    ET.SubElement(case,'failure').text=subcase.get('error','case failed')
+            continue
         case=ET.SubElement(suite,'testcase',name=name,time=str(record['seconds'] if record else 0))
         if not record:
             ET.SubElement(case,'skipped').text='Not reached; see acceptance error'

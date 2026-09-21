@@ -35,7 +35,7 @@
 
 ## 公开能力与 Agent 边界
 
-新平台已接通创建、查询、删除、同节点暂停/恢复、可复用快照目录和克隆、空闲删除、重启策略、HTTP/SDK 放置约束及命令/文件数据链路。客户端存在的方法不自动代表服务器支持：`reload()`、创建 `failover=true`、网络策略、挂载、入口继承、独立资源上限、公开用户端口及每实例数据面安全策略尚未接入新后端。
+新平台已接通创建、查询、删除、同节点暂停/恢复、reload、可复用快照目录和克隆、空闲删除、重启策略、`failover=true`、HTTP/SDK 放置约束、S3 rootfs／mount、镜像入口继承、创建及运行期网络策略、独立执行 limit、extra_config、每实例数据面安全策略、鉴权端口转发、`upstream` reverse tunnel 及命令/文件数据链路。公开请求中的本机 rootfs 和 host mount 会被拒绝；节点本地 RRT 运行环境仍由部署配置拥有。旧 `/invoke` 兼容传输不属于新数据链路。
 
 `agent/` 已迁入，目标是通过 Sandbox SDK 使用平台；当前 CLI/SDK/Executor 仍有旧 FaaS/外部运行时依赖。九条 `/api/agent` 路由只是兼容转发入口，未配置 Agent 服务时不可用。当前基础平台 E2E 不证明 Agent 业务闭环。
 

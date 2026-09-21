@@ -130,10 +130,10 @@ async fn sandbox_client_rejects_mismatched_identity_and_never_replays_or_redirec
 
 #[tokio::test]
 async fn sandbox_connect_failure_is_unavailable_even_for_writes() {
-    // Keep the port reserved without listening: a failure definitely precedes HTTP submission.
-    let socket = tokio::net::TcpSocket::new_v4().unwrap();
-    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
-    let url = format!("http://{}", socket.local_addr().unwrap());
+    // Release a listener immediately so the connect is refused before HTTP submission.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
     let client = HttpSandbox::new(&url, TOKEN.into(), Duration::from_secs(1), None, true).unwrap();
     let create: CreateSandbox = serde_json::from_value(serde_json::json!({
         "id":"id", "tenant":"tenant", "execution": {
@@ -141,10 +141,11 @@ async fn sandbox_connect_failure_is_unavailable_even_for_writes() {
             "working_dir":"/", "user":null, "env":{}, "resources":{"cpu_millis":1000,"memory_mib":128}, "service":[]
         }
     })).unwrap();
-    assert!(matches!(
-        client.create(&create).await,
-        Err(SandboxError::Unavailable(_))
-    ));
+    let result = client.create(&create).await;
+    assert!(
+        matches!(result, Err(SandboxError::Unavailable(_))),
+        "unexpected create result: {result:?}"
+    );
     assert!(matches!(
         client.delete("tenant", "id").await,
         Err(SandboxError::Unavailable(_))

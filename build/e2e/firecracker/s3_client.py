@@ -27,5 +27,5 @@ class Client:
             method=method, data=data if method == 'PUT' else None, headers={
                 'Host': host, 'x-amz-date': stamp, 'x-amz-content-sha256': digest,
                 'Authorization': f'AWS4-HMAC-SHA256 Credential={self.access}/{scope}, SignedHeaders={signed}, Signature={signature}'})
-        with urllib.request.urlopen(request, timeout=10) as response:
+        with urllib.request.urlopen(request, timeout=120) as response:
             return response.read()

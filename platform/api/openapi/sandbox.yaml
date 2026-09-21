@@ -8,8 +8,9 @@ info:
   description: |
     Public lifecycle API implemented by the Rust API Server and exposed through
     Edge. ADX uses Instance internally; Sandbox is the public API and SDK model.
-    Ordinary responses use an envelope whose `data` member is base64-encoded
-    JSON. Create can return Server-Sent Events when requested by the client.
+    Lifecycle responses use an envelope whose `data` member is base64-encoded
+    JSON. Resource discovery returns its typed JSON document directly. Create
+    can return Server-Sent Events when requested by the client.
 servers:
   - url: https://{address}
     variables:
@@ -21,11 +22,35 @@ security:
 tags:
   - name: Sandboxes
     description: Public Sandbox lifecycle and current Instance view.
+  - name: Resources
+    description: Current schedulable node capacity exposed to the Sandbox SDK.
   - name: Snapshots
     description: Tenant-scoped reusable checkpoint catalog.
   - name: Agent Sandbox Service
     description: Service-authenticated Sandbox capability used by Agent components.
 paths:
+  /api/sandbox/v1/resources:
+    get:
+      tags: [Resources]
+      operationId: listSandboxResources
+      summary: List the current schedulable node resources
+      description: |
+        Returns the API Server's fresh in-memory node directory. The directory
+        is initialized by a complete Master watch frame and then refreshed by
+        subsequent frames; an expired or unavailable view returns an error
+        instead of stale capacity. CPU is reported in millicores and Memory and
+        Disk in MiB.
+      responses:
+        "200":
+          description: Current node capacity and allocatable resources.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NodeResourceList"
+        "4XX":
+          $ref: "#/components/responses/Error"
+        default:
+          $ref: "#/components/responses/Error"
   /api/sandbox/v1/sandboxes:
     post:
       tags: [Sandboxes]
@@ -165,6 +190,61 @@ paths:
                 allOf:
                   - $ref: "#/components/schemas/Envelope"
                   - $ref: "#/components/schemas/ResumeEnvelopeData"
+        "4XX":
+          $ref: "#/components/responses/Error"
+        default:
+          $ref: "#/components/responses/Error"
+  /api/sandbox/v1/sandboxes/{sandboxId}/reload:
+    post:
+      tags: [Sandboxes]
+      operationId: reloadSandbox
+      summary: Replace a running execution from its latest retained restore point
+      description: |
+        The logical Sandbox ID, node ownership and generation stay unchanged.
+        No image fallback occurs when the restore point is missing or unusable.
+      parameters:
+        - $ref: "#/components/parameters/SandboxId"
+        - $ref: "#/components/parameters/ReloadOperationId"
+      responses:
+        "200":
+          description: The replacement execution is ready, routed and committed.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - $ref: "#/components/schemas/SuccessEnvelopeData"
+        "4XX":
+          $ref: "#/components/responses/Error"
+        default:
+          $ref: "#/components/responses/Error"
+  /api/sandbox/v1/sandboxes/{sandboxId}/network:
+    put:
+      tags: [Sandboxes]
+      operationId: updateSandboxNetworkPolicy
+      summary: Atomically replace the complete runtime network policy
+      description: An empty object clears the policy. The committed Instance specification changes only after sandboxd accepts the replacement.
+      parameters:
+        - $ref: "#/components/parameters/SandboxId"
+        - $ref: "#/components/parameters/NetworkOperationId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: "#/components/schemas/NetworkPolicy"
+                - type: object
+                  maxProperties: 0
+      responses:
+        "200":
+          description: Policy replacement is applied and committed.
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - $ref: "#/components/schemas/SuccessEnvelopeData"
         "4XX":
           $ref: "#/components/responses/Error"
         default:
@@ -385,6 +465,20 @@ components:
       schema:
         type: string
         pattern: "^resume-[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+    ReloadOperationId:
+      name: X-ADX-Request-ID
+      in: header
+      required: true
+      schema:
+        type: string
+        pattern: "^reload-[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+    NetworkOperationId:
+      name: X-ADX-Request-ID
+      in: header
+      required: true
+      schema:
+        type: string
+        pattern: "^network-[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
     SnapshotOperationId:
       name: X-ADX-Request-ID
       in: header
@@ -422,6 +516,37 @@ components:
         application/json:
           schema: {$ref: "#/components/schemas/ServiceSandboxError"}
   schemas:
+    NodeResourceList:
+      type: object
+      additionalProperties: false
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: {$ref: "#/components/schemas/NodeResource"}
+    NodeResource:
+      type: object
+      additionalProperties: false
+      required: [id, status, capacity, allocatable, labels]
+      properties:
+        id: {type: string, minLength: 1}
+        status:
+          type: integer
+          format: int32
+          description: NodeInfo status value; 1 means the node is currently schedulable.
+        capacity: {$ref: "#/components/schemas/NodeScalarResources"}
+        allocatable: {$ref: "#/components/schemas/NodeScalarResources"}
+        labels:
+          type: object
+          additionalProperties: {type: string}
+    NodeScalarResources:
+      type: object
+      additionalProperties: false
+      required: [CPU, Memory, Disk]
+      properties:
+        CPU: {type: number, minimum: 0, description: CPU millicores}
+        Memory: {type: number, minimum: 0, description: Memory MiB}
+        Disk: {type: number, minimum: 0, description: Disk MiB}
     CreateSandboxRequest:
       type: object
       additionalProperties: false
@@ -442,24 +567,66 @@ components:
           minimum: 0
           default: 1000
           description: CPU request in millicores.
+        cpu_limit:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Execution cgroup CPU limit in millicores; zero inherits `cpu`.
         memory:
           type: integer
           format: int64
           minimum: 0
           default: 2048
           description: Memory request in MiB.
+        mem_limit:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Execution cgroup memory limit in MiB; zero inherits `memory`.
         storageMb: {type: integer, format: int64, minimum: 1}
+        storage_limit_mb:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Writable-layer limit in MiB; zero inherits `storageMb`.
         env:
           type: object
           additionalProperties: {type: string}
         labels:
           type: object
           additionalProperties: {type: string}
+        ports:
+          type: array
+          uniqueItems: true
+          description: |
+            User ports declared by the SDK. Edge authorizes the tenant and
+            Instance on every forwarded request; Node Proxy then connects to
+            the declared port on that Instance.
+          items:
+            type: string
+            pattern: "^([1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5])$"
         snapshotId:
           type: string
           description: Tenant-scoped reusable snapshot used to create a new Sandbox.
         idleTimeoutSeconds: {type: integer, format: int64, minimum: 0}
         restartPolicy: {$ref: "#/components/schemas/RestartPolicy"}
+        failover:
+          type: boolean
+          default: false
+          description: Recover an unexpectedly exited execution from its latest retained restore point on the owning node; never cold-starts when the point is absent.
+        inheritEntrypoint:
+          type: boolean
+          default: false
+          description: Run the effective OCI image Entrypoint and Cmd as the RRT-managed workload. Image rootfs only.
+        mounts:
+          type: array
+          items: {$ref: "#/components/schemas/Mount"}
+        network: {$ref: "#/components/schemas/NetworkPolicy"}
+        dataPlane: {$ref: "#/components/schemas/DataPlanePolicy"}
+        extra_config:
+          type: object
+          additionalProperties: true
+          description: Serialized to sandboxd's runtime-specific extra_config field.
         scheduleAffinities:
           type: array
           items: {$ref: "#/components/schemas/ScheduleAffinity"}
@@ -485,8 +652,102 @@ components:
       additionalProperties: false
       properties:
         runtime: {type: string}
-        type: {type: string, enum: [image]}
+        type: {type: string, enum: [image, s3]}
         imageurl: {type: string}
+        readonly:
+          type: boolean
+          description: Optional override; omitted inherits the deployment Runtime Environment default.
+        storageInfo: {$ref: "#/components/schemas/S3Source"}
+    S3Source:
+      type: object
+      additionalProperties: false
+      required: [endpoint, bucket, object]
+      properties:
+        endpoint: {type: string, minLength: 1}
+        bucket: {type: string, minLength: 1}
+        object: {type: string, minLength: 1}
+        accessKey: {type: string}
+        secretKey: {type: string}
+    Mount:
+      type: object
+      additionalProperties: false
+      required: [type, target]
+      properties:
+        type: {type: string, enum: [bind, erofs, tmpfs]}
+        target: {type: string, pattern: "^/"}
+        options: {type: array, items: {type: string, minLength: 1}}
+        image_url: {type: string}
+        s3_config: {$ref: "#/components/schemas/S3Source"}
+    DataPlanePolicy:
+      type: object
+      additionalProperties: false
+      properties:
+        tunnelSecurityMode: {type: string, enum: [tls, tls-token]}
+        portForwardSecurityMode: {type: string, enum: [tls, tls-token]}
+    NetworkPolicy:
+      type: object
+      additionalProperties: false
+      properties:
+        blockNetwork: {type: boolean}
+        dnsBlacklist: {type: array, items: {type: string, minLength: 1}}
+        schemaVersion: {type: integer, const: 2}
+        traffic: {$ref: "#/components/schemas/TrafficPolicy"}
+        dns: {$ref: "#/components/schemas/DnsPolicy"}
+    TrafficPolicy:
+      type: object
+      additionalProperties: false
+      required: [ingressDefaultAction, egressDefaultAction, mode]
+      properties:
+        ingressDefaultAction: {type: string, enum: [allow, deny]}
+        egressDefaultAction: {type: string, enum: [allow, deny]}
+        mode: {type: string, enum: [stateless, stateful]}
+        rules: {type: array, items: {$ref: "#/components/schemas/NetworkRule"}}
+    NetworkRule:
+      type: object
+      additionalProperties: false
+      required: [action, direction, protocol]
+      properties:
+        action: {type: string, enum: [allow, deny]}
+        direction: {type: string, enum: [ingress, egress, both]}
+        protocol: {type: string, enum: [any, tcp, udp, icmp]}
+        peer: {$ref: "#/components/schemas/NetworkPeer"}
+        sandboxPort: {type: integer, minimum: 0, maximum: 65535}
+        sandboxPortRange: {$ref: "#/components/schemas/PortRange"}
+        priority:
+          type: integer
+          minimum: 1
+          maximum: 4294967294
+          description: UINT32_MAX is reserved for ADX control-plane rules.
+    NetworkPeer:
+      type: object
+      additionalProperties: false
+      properties:
+        address: {type: string}
+        port: {type: integer, minimum: 0, maximum: 65535}
+        cidr: {type: string}
+        domain: {type: string}
+        portRange: {$ref: "#/components/schemas/PortRange"}
+    PortRange:
+      type: object
+      additionalProperties: false
+      required: [first, last]
+      properties:
+        first: {type: integer, minimum: 1, maximum: 65535}
+        last: {type: integer, minimum: 1, maximum: 65535}
+    DnsPolicy:
+      type: object
+      additionalProperties: false
+      required: [defaultAction]
+      properties:
+        defaultAction: {type: string, enum: [allow, deny]}
+        rules: {type: array, items: {$ref: "#/components/schemas/DnsRule"}}
+    DnsRule:
+      type: object
+      additionalProperties: false
+      required: [action, pattern]
+      properties:
+        action: {type: string, enum: [allow, deny]}
+        pattern: {type: string, minLength: 1}
     RestartPolicy:
       type: object
       additionalProperties: false
@@ -566,6 +827,12 @@ components:
           description: Compatibility field containing Node ID; there is no FunctionProxy process.
         nodeId: {type: string}
         portMappings: {type: object, additionalProperties: true}
+    SuccessResult:
+      type: object
+      additionalProperties: false
+      required: [success]
+      properties:
+        success: {type: boolean, const: true}
     CreateSnapshotRequest:
       type: object
       additionalProperties: false
@@ -604,6 +871,8 @@ components:
       $ref: "#/components/schemas/EncodedPauseResult"
     ResumeEnvelopeData:
       $ref: "#/components/schemas/EncodedResumeResult"
+    SuccessEnvelopeData:
+      $ref: "#/components/schemas/EncodedSuccessResult"
     CreateSnapshotEnvelopeData:
       $ref: "#/components/schemas/EncodedCreateSnapshotResult"
     SnapshotListEnvelopeData:
@@ -634,6 +903,14 @@ components:
           contentEncoding: base64
           contentMediaType: application/json
           contentSchema: {$ref: "#/components/schemas/ResumeResult"}
+    EncodedSuccessResult:
+      type: object
+      properties:
+        data:
+          type: string
+          contentEncoding: base64
+          contentMediaType: application/json
+          contentSchema: {$ref: "#/components/schemas/SuccessResult"}
     EncodedCreateSnapshotResult:
       type: object
       properties:

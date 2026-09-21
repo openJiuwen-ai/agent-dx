@@ -22,6 +22,7 @@ fn spec(id: &str, tenant: &str, priority: i32) -> InstanceSpec {
         resources: resources(1),
         priority,
         scheduling: Default::default(),
+        sandbox: Default::default(),
     }
 }
 

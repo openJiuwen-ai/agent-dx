@@ -204,6 +204,7 @@ class SDKContractTests(unittest.TestCase):
         self.assertNotIn("runtime", body)
         self.assertEqual(body["rootfs"]["runtime"], "kata")
         self.assertEqual(body["rootfs"]["imageurl"], "ubuntu:22.04")
+        self.assertNotIn("readonly", body["rootfs"])
         self.assertNotIn("image", body)
         self.assertNotIn("cwd", body)
         self.assertNotIn("cwdMode", body)
@@ -211,6 +212,25 @@ class SDKContractTests(unittest.TestCase):
             sandbox._client.calls[-1][2]["cwd"],
             "/workspace",
         )
+
+    def test_rootfs_readonly_is_an_explicit_default_overlay(self):
+        with patch("adx_sandbox.sandbox_api.SandboxClient", _FakeClient):
+            Sandbox(
+                image="ubuntu:22.04",
+                rootfs_readonly=True,
+                detached=True,
+            )
+            self.assertTrue(_FakeClient.created[-1]["rootfs"]["readonly"])
+
+            Sandbox(
+                rootfs=S3Config("endpoint", "bucket", "object"),
+                rootfs_readonly=False,
+                detached=True,
+            )
+            self.assertFalse(_FakeClient.created[-1]["rootfs"]["readonly"])
+
+            with self.assertRaisesRegex(TypeError, "rootfs_readonly"):
+                Sandbox(image="ubuntu:22.04", rootfs_readonly=1)
 
     def test_inherit_entrypoint_is_image_only_and_serialized_when_enabled(self):
         with patch("adx_sandbox.sandbox_api.SandboxClient", _FakeClient):

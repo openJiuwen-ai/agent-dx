@@ -124,6 +124,11 @@ impl ShardScheduler {
     pub fn node_count(&self) -> usize {
         self.nodes.len()
     }
+    pub fn node_resources(&self, id: &str) -> Option<(adx_core::Resources, adx_core::Resources)> {
+        self.nodes
+            .get(id)
+            .map(|state| (state.scalar.capacity(), state.scalar.available()))
+    }
     pub fn restore(&mut self, spec: &InstanceSpec, assignment: &Assignment) -> Result<()> {
         if self.assigned.contains_key(&spec.id) {
             return Err(Error::Conflict);

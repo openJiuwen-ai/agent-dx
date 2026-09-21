@@ -9,6 +9,21 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
+fn security(value: adx_core::sandbox::DataPlaneSecurityMode) -> i32 {
+    match value {
+        // The current deployment default is tls-token. Resolve inheritance at
+        // publication so every Edge sees one authoritative per-instance mode.
+        adx_core::sandbox::DataPlaneSecurityMode::Inherit => {
+            pb::DataPlaneSecurityMode::DataPlaneSecurityTlsToken as i32
+        }
+        adx_core::sandbox::DataPlaneSecurityMode::Tls => {
+            pb::DataPlaneSecurityMode::DataPlaneSecurityTls as i32
+        }
+        adx_core::sandbox::DataPlaneSecurityMode::TlsToken => {
+            pb::DataPlaneSecurityMode::DataPlaneSecurityTlsToken as i32
+        }
+    }
+}
 struct View {
     revision: Option<u64>,
     available: bool,
@@ -69,6 +84,15 @@ impl RoutePublisher {
                     node_proxy_address: r.proxy_address,
                     generation: r.generation,
                     instance_revision: r.instance_revision,
+                    tunnel_security_mode: security(i.spec.sandbox.data_plane.tunnel),
+                    port_forward_security_mode: security(i.spec.sandbox.data_plane.port_forward),
+                    forwarded_ports: i
+                        .spec
+                        .sandbox
+                        .ports
+                        .iter()
+                        .map(|port| u32::from(*port))
+                        .collect(),
                 },
             );
         }

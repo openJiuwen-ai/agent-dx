@@ -215,19 +215,29 @@ pub fn fs_read_chunk(kw: &BTreeMap<String, Value>) -> Value {
 /// fs_list → {entries: [EntryInfo], error}。
 pub fn fs_list(kw: &BTreeMap<String, Value>) -> Value {
     let path = kw_str(kw, "path").unwrap_or_default();
-    match fs::read_dir(&path) {
-        Ok(rd) => {
-            let entries: Vec<Value> = rd
-                .flatten()
-                .map(|e| map_value(entry_fields(&e.path().to_string_lossy())))
-                .collect();
-            map_value(vec![("entries", Value::Array(entries)), ("error", nil())])
-        }
+    let depth = kw_i64(kw, "depth").unwrap_or(1).clamp(1, 64) as usize;
+    let mut entries = Vec::new();
+    match collect_entries(Path::new(&path), depth, &mut entries) {
+        Ok(()) => map_value(vec![("entries", Value::Array(entries)), ("error", nil())]),
         Err(e) => map_value(vec![
             ("entries", Value::Array(vec![])),
             ("error", err(e.to_string())),
         ]),
     }
+}
+
+fn collect_entries(path: &Path, depth: usize, entries: &mut Vec<Value>) -> std::io::Result<()> {
+    let mut children = fs::read_dir(path)?.collect::<Result<Vec<_>, _>>()?;
+    children.sort_by_key(std::fs::DirEntry::file_name);
+    for child in children {
+        let child_path = child.path();
+        let file_type = child.file_type()?;
+        entries.push(map_value(entry_fields(&child_path.to_string_lossy())));
+        if depth > 1 && file_type.is_dir() {
+            collect_entries(&child_path, depth - 1, entries)?;
+        }
+    }
+    Ok(())
 }
 
 /// fs_exists → {exists}。
@@ -290,4 +300,77 @@ pub fn fs_get_info(kw: &BTreeMap<String, Value>) -> Value {
     let mut f = entry_fields(&path);
     f.push(("error", nil()));
     map_value(f)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn args(values: &[(&str, Value)]) -> BTreeMap<String, Value> {
+        values
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), value.clone()))
+            .collect()
+    }
+
+    fn listed_paths(value: &Value) -> Vec<String> {
+        let Value::Map(fields) = value else {
+            panic!("expected map: {value:?}");
+        };
+        let entries = fields
+            .iter()
+            .find_map(|(key, value)| (key.as_str() == Some("entries")).then_some(value));
+        let Some(Value::Array(entries)) = entries else {
+            panic!("expected entries: {value:?}");
+        };
+        entries
+            .iter()
+            .map(|entry| {
+                let Value::Map(fields) = entry else {
+                    panic!("expected entry map: {entry:?}");
+                };
+                fields
+                    .iter()
+                    .find_map(|(key, value)| {
+                        (key.as_str() == Some("path"))
+                            .then(|| value.as_str().expect("path string").to_string())
+                    })
+                    .expect("path field")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn list_honors_requested_depth() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("adx-rrt-fs-list-{}-{suffix}", std::process::id()));
+        let nested = root.join("nested");
+        fs::create_dir_all(&nested).expect("create fixture");
+        fs::write(nested.join("payload.bin"), b"payload").expect("write fixture");
+
+        let shallow = fs_list(&args(&[
+            ("path", Value::from(root.to_string_lossy().as_ref())),
+            ("depth", Value::from(1)),
+        ]));
+        assert_eq!(listed_paths(&shallow), vec![nested.to_string_lossy()]);
+
+        let recursive = fs_list(&args(&[
+            ("path", Value::from(root.to_string_lossy().as_ref())),
+            ("depth", Value::from(2u64)),
+        ]));
+        assert_eq!(
+            listed_paths(&recursive),
+            vec![
+                nested.to_string_lossy().to_string(),
+                nested.join("payload.bin").to_string_lossy().to_string(),
+            ]
+        );
+
+        fs::remove_dir_all(root).expect("remove fixture");
+    }
 }

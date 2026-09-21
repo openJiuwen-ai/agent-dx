@@ -73,6 +73,7 @@ fn protobuf_round_trip_preserves_every_placement_constraint_and_card_identity() 
                 when_unsatisfiable: SpreadMode::ScheduleAnyway,
             }],
         },
+        sandbox: Default::default(),
     };
     let bytes = wire::InstanceSpec::from(spec.clone()).encode_to_vec();
     let decoded = wire::InstanceSpec::decode(bytes.as_slice()).unwrap();

@@ -3,7 +3,8 @@
 The Buildkite gate uses `run.py` here. `manifest.py` defines two node Pods,
 Services, volume/credential references and node placement. The Pods run ADX as
 processes from the unified release. `publish_images.py` runs on the build worker
-and hands immutable registry references to the deployment worker.
+and hands immutable node, RRT and entrypoint-fixture registry references to the
+deployment worker.
 
 ```sh
 # Build stage, after build/e2e/prepare.py. Docker registry authentication is
@@ -23,8 +24,9 @@ python3 build/e2e/kubernetes/run.py \
 Profiles are explicit:
 
 - `--profile l0` runs the minimum public SDK and authentication closure.
-- `--profile k8s-basic` is the default and runs the eight Kubernetes groups.
-- `--profile full` runs the same functional groups and additionally requires
+- `--profile k8s-basic` is the default and runs five bounded groups: `sdk`,
+  `auth`, `capacity`, `placement`, and `local-first`.
+- `--profile full` runs all ten functional, lifecycle and fault groups and additionally requires
   the two platform Pods to be placed on distinct physical workers. Actual Pod
   to worker placement is checked after scheduling and retained as evidence.
 
@@ -122,7 +124,8 @@ on; private registry credentials are mounted read-only and supplied to both
 Kubernetes and sandboxd. No cluster selection or credential material is embedded
 in the source tree.
 
-Eight scenario groups are shared with the local driver. Kubernetes-specific
+Ten scenario groups are shared with the local driver; the selected profile
+controls which groups are required. Kubernetes-specific
 contract tests cover manifests, Secret projection, Service addresses, immutable
 artifact handoff and namespace ownership/cleanup failures. These tests do not
 execute a Kubernetes cluster. Pod readiness alone does not pass the platform
@@ -157,8 +160,9 @@ Each scenario emits RUN, PASS/FAIL and elapsed time. Its child-process output is
 streamed without buffering, including SDK instance IDs, command/file assertions,
 authentication checks, capacity wait/resume, placement rules with expected/actual
 node assignments, and restart recovery checks.
-`case-results.json` retains per-case outcomes and duration; JUnit lists all eight
-scenarios separately, with unexecuted scenarios marked skipped and cleanup
-reported independently. A failed command or timeout still fails the acceptance.
+`case-results.json` retains per-case outcomes and duration; JUnit lists every
+scenario required by the selected profile, with unexecuted required scenarios
+marked skipped and cleanup reported independently. A failed command or timeout
+still fails the acceptance.
 
-The `local-first` case switches only API Server into local-first mode, checks SDK concurrent create/execute/delete and confirmed local-claim evidence, then restores central mode. This case requires newly built artifacts; earlier seven-case runs do not validate it. [Buildkite #30](../../../docs/testing/2026-09-18-runtime-environment-k8s.md) passed the current eight-case OCI profile.
+The `local-first` case switches only API Server into local-first mode, checks SDK concurrent create/execute/delete and confirmed local-claim evidence, then restores central mode. This case requires newly built artifacts; earlier seven-case runs do not validate it. [Buildkite #30](../../../docs/testing/2026-09-18-runtime-environment-k8s.md) passed the previous eight-case OCI profile. The current default basic profile is the bounded five-case gate; `data-plane`, `lifecycle`, `node-failure`, `restart`, and `stop` run under `full` and local `standalone`.

@@ -1,5 +1,7 @@
 use super::{Durability, OperationResult, Services};
-use adx_core::{Assignment, Error, Event, InstanceRecord, InstanceSpec, InstanceState, Result};
+use adx_core::{
+    Assignment, Error, Event, InstanceRecord, InstanceSpec, InstanceState, LifecycleKind, Result,
+};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
@@ -16,6 +18,15 @@ enum Command {
     ),
     Pause(PauseRequest),
     Resume(ResumeRequest),
+    Network {
+        policy: Option<adx_core::sandbox::NetworkPolicy>,
+        operation_id: String,
+        expected_revision: u64,
+    },
+    Reload {
+        operation_id: String,
+        expected_revision: u64,
+    },
     Recover(ResumeRequest),
     Create,
     Clone(Box<adx_core::snapshots::Snapshot>),
@@ -76,6 +87,30 @@ impl InstanceHandle {
     }
     pub async fn resume(&self, request: ResumeRequest) -> Result<OperationResult> {
         self.send(Command::Resume(request)).await
+    }
+    pub async fn update_network_policy(
+        &self,
+        policy: Option<adx_core::sandbox::NetworkPolicy>,
+        operation_id: String,
+        expected_revision: u64,
+    ) -> Result<OperationResult> {
+        self.send(Command::Network {
+            policy,
+            operation_id,
+            expected_revision,
+        })
+        .await
+    }
+    pub async fn reload(
+        &self,
+        operation_id: String,
+        expected_revision: u64,
+    ) -> Result<OperationResult> {
+        self.send(Command::Reload {
+            operation_id,
+            expected_revision,
+        })
+        .await
     }
     pub(crate) async fn recover(&self, request: ResumeRequest) -> Result<OperationResult> {
         self.send(Command::Recover(request)).await
@@ -240,6 +275,8 @@ impl Controller {
         let operation = match &command {
             Command::Pause(_) => "pause",
             Command::Resume(_) => "resume",
+            Command::Network { .. } => "network",
+            Command::Reload { .. } => "reload",
             Command::Recover(_) => "recover",
             Command::Create | Command::Clone(_) => "create",
             Command::Delete => "delete",
@@ -254,6 +291,18 @@ impl Controller {
             | Command::Tick(_) => unreachable!(),
             Command::Pause(request) => self.pause(request).await,
             Command::Resume(request) => self.resume(request).await,
+            Command::Network {
+                policy,
+                operation_id,
+                expected_revision,
+            } => {
+                self.update_network_policy(policy, operation_id, expected_revision)
+                    .await
+            }
+            Command::Reload {
+                operation_id,
+                expected_revision,
+            } => self.reload(operation_id, expected_revision).await,
             Command::Recover(request) => self.recover(request).await,
             Command::Create => self.create().await,
             Command::Clone(snapshot) => self.clone_snapshot(*snapshot).await,
@@ -425,10 +474,15 @@ impl Controller {
                 "snapshot source required before starting".into(),
             ));
         }
-        self.start_attempt(false).await
+        self.start_attempt(false, false, None).await
     }
 
-    async fn start_attempt(&mut self, restart: bool) -> Result<OperationResult> {
+    async fn start_attempt(
+        &mut self,
+        restart: bool,
+        restore_checkpoint: bool,
+        completion: Option<(String, u64, LifecycleKind)>,
+    ) -> Result<OperationResult> {
         let runtime_id = if restart {
             format!(
                 "{}-{}-r{}",
@@ -449,51 +503,59 @@ impl Controller {
         if restart {
             self.record.runtime_id = runtime_id;
             self.record.runtime_ip = None;
-            self.record.restart_attempts = self
-                .record
-                .restart_attempts
-                .checked_add(1)
-                .ok_or(Error::Conflict)?;
+            // restart_attempts belongs to the configured cold-restart policy.
+            // Checkpoint replacement (explicit reload or failover) has its own
+            // recovery contract and must not be rejected by Master as a cold
+            // restart from a non-Failed record.
+            if !restore_checkpoint {
+                self.record.restart_attempts = self
+                    .record
+                    .restart_attempts
+                    .checked_add(1)
+                    .ok_or(Error::Conflict)?;
+            }
         }
         self.held = true;
         self.record.resources_held = true;
         self.transition(Event::Start)?;
         let attempt = timeout(self.services.operation_timeout, async {
-            self.record.runtime_ip = Some(if self.record.spec.snapshot_id.is_some() {
-                let cp = self.record.checkpoint.as_ref().ok_or(Error::Conflict)?;
-                let store = &self
-                    .services
-                    .checkpoint
-                    .as_ref()
-                    .ok_or(Error::Conflict)?
-                    .store;
-                let path = store.materialize(&cp.artifact).await?;
-                // Firecracker reads restore files after the RPC has returned.
-                self.recovery_files = Some(path);
-                self.services
-                    .runtime
-                    .restore_from(
-                        &self.record.spec,
-                        &self.record.runtime_id,
-                        self.record.assignment.generation,
-                        &self.record.assignment.devices,
-                        self.recovery_files
-                            .as_ref()
-                            .expect("recovery file is stored immediately before restore"),
-                        cp.origin.as_ref(),
-                    )
-                    .await?
-            } else {
-                self.services
-                    .runtime
-                    .start(
-                        &self.record.spec,
-                        &self.record.runtime_id,
-                        self.record.assignment.generation,
-                        &self.record.assignment.devices,
-                    )
-                    .await?
-            });
+            self.record.runtime_ip = Some(
+                if restore_checkpoint || self.record.spec.snapshot_id.is_some() {
+                    let cp = self.record.checkpoint.as_ref().ok_or(Error::Conflict)?;
+                    let store = &self
+                        .services
+                        .checkpoint
+                        .as_ref()
+                        .ok_or(Error::Conflict)?
+                        .store;
+                    let path = store.materialize(&cp.artifact).await?;
+                    // Firecracker reads restore files after the RPC has returned.
+                    self.recovery_files = Some(path);
+                    self.services
+                        .runtime
+                        .restore_from(
+                            &self.record.spec,
+                            &self.record.runtime_id,
+                            self.record.assignment.generation,
+                            &self.record.assignment.devices,
+                            self.recovery_files
+                                .as_ref()
+                                .expect("recovery file is stored immediately before restore"),
+                            cp.origin.as_ref(),
+                        )
+                        .await?
+                } else {
+                    self.services
+                        .runtime
+                        .start(
+                            &self.record.spec,
+                            &self.record.runtime_id,
+                            self.record.assignment.generation,
+                            &self.record.assignment.devices,
+                        )
+                        .await?
+                },
+            );
             self.services.readiness.wait_ready(&self.record).await?;
             self.services.routes.activate(&self.record).await
         })
@@ -503,6 +565,7 @@ impl Controller {
             let cleanup = self.cleanup().await;
             self.transition(Event::Fail)?;
             self.record.restart_pending = restart
+                && !restore_checkpoint
                 && self
                     .record
                     .spec
@@ -525,6 +588,9 @@ impl Controller {
             };
         }
         self.transition(Event::Ready)?;
+        if let Some((id, revision, kind)) = completion {
+            self.completed(id, revision, kind);
+        }
         self.record.restart_pending = false;
         self.restart_after = None;
         self.sync().await

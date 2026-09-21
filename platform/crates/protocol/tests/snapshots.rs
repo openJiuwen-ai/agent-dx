@@ -20,6 +20,7 @@ fn snapshot_wire_preserves_template_and_durable_references() {
         scheduling: Default::default(),
         env: Default::default(),
         lifecycle: Default::default(),
+        sandbox: Default::default(),
     };
     let mut record = Snapshot::new(
         "snapshot-1".into(),

@@ -9,7 +9,23 @@ The machine-readable contract is [`sandbox.yaml`](../../../api/openapi/sandbox.y
 Runtime command and file operations use the separate
 [`data-plane.yaml`](../../../api/openapi/data-plane.yaml) contract.
 
-**Support boundary:** the compatibility router accepts a larger schema than the new Instance backend. Network policy, mounts, entrypoint inheritance, extra_config, independent request/limit values, published user ports and per-Instance data-plane security are rejected by `src/contract.rs`. `failover=true` and reload are not implemented; ordinary `/invoke` compatibility transport is also unavailable. Commands/files use Edge → Node Proxy → RRT. Node/Instance placement, idle deletion and restart policy are wired. See [placement](../../../../docs/testing/http-node-placement.md) and [node lifecycle](../../../../docs/testing/node-lifecycle.md).
+**Support boundary:** the API Server maps the Sandbox schema into the typed
+Instance contract. It supports S3 rootfs and mounts, image-backed mounts,
+entrypoint inheritance, `extra_config`, independent resource request/limit
+values, published ports, per-Instance data-plane security, creation/runtime
+network policy, `failover=true`, and reload. Public local rootfs paths and host
+mounts are rejected because node paths are deployment-owned. `upstream` reverse
+tunnel is carried by the create contract; the legacy `/invoke` compatibility
+transport remains unavailable.
+Commands/files use Edge → Node Proxy → RRT. See
+[placement](../../../../docs/testing/http-node-placement.md) and
+[node lifecycle](../../../../docs/testing/node-lifecycle.md).
+
+Rootfs values overlay the deployment Runtime Environment. Omitted fields inherit
+the deployment default; `runtime` and `readonly` replace only those fields, while
+an explicit image or S3 source atomically replaces the source. Node Manager still
+requires the deployment-owned source, bootstrap and environment to match the
+local node when no source replacement was requested.
 
 All ordinary responses use the API Server response envelope:
 
@@ -38,7 +54,8 @@ instead of inferring retry safety from HTTP status or message text. See the
 | Delete reusable snapshot | `DELETE /api/sandbox/v1/snapshots/{snapshotID}` | none | tenant-scoped catalog JSON returned by the Rust Master SnapshotService |
 | Pause | `POST /api/sandbox/v1/sandboxes/{sandboxID}/pause` | `{"ttlSeconds":90000,"timeoutSeconds":300}` | `{"sandboxId":"...","snapshotId":"...","size":8192,"state":"paused","expiresAt":...}` |
 | Resume | `POST /api/sandbox/v1/sandboxes/{sandboxID}/resume` | none | `{"sandboxId":"...","state":"running","routeAddress":"host:port","functionProxyId":"...","nodeId":"...","portMappings":{}}` |
-| Reload (compatibility route only) | `POST /api/sandbox/v1/sandboxes/{sandboxID}/reload` | none | unsupported by the new Instance backend; no successful recovery result |
+| Reload latest recovery point | `POST /api/sandbox/v1/sandboxes/{sandboxID}/reload` | none | `{"success":true}` after a new backend execution reaches Running and is published |
+| Replace network policy | `PUT /api/sandbox/v1/sandboxes/{sandboxID}/network` | complete network policy, or `{}` to clear it | `{"success":true}` after sandboxd accepts the replacement and the operation is published |
 
 `snapshotId` on the normal create route creates a new sandbox from a reusable
 snapshot. The snapshot is reusable; creating from it does not consume it.
@@ -75,7 +92,7 @@ central scheduling. User commands use the separate RRT HTTP data path.
 
 For snapshot creation, omitted/zero resource values inherit the source. Positive CPU/memory/disk values must equal its resource geometry; restoring with larger limits or resizing is rejected. This applies to the new Rust resolver even though the HTTP handler can encode positive overrides.
 
-Public resume uses the owner cache and calls the owning Node Manager; it performs same-node admission. Cross-node recovery of the same ID is the Master's failed-node recovery flow using a valid shared checkpoint, not a promise made by an ordinary resume request. `failover=true` and the compatibility reload route do not select that flow.
+Public resume uses the owner cache and calls the owning Node Manager; it performs same-node admission. Cross-node recovery of the same ID is the Master's failed-node recovery flow using a valid shared checkpoint, not a promise made by an ordinary resume request. `failover=true` enables same-node recovery from the latest unexpired checkpoint after an unexpected backend exit; no checkpoint means Failed and no cold start. Reload explicitly replaces a Running backend from that same latest recovery point.
 
 ## Reusable snapshots
 
@@ -109,6 +126,7 @@ matches the operation. The complete accepted forms are:
 pause-[A-Za-z0-9][A-Za-z0-9._-]{0,127}
 resume-[A-Za-z0-9][A-Za-z0-9._-]{0,127}
 reload-[A-Za-z0-9][A-Za-z0-9._-]{0,127}
+network-[A-Za-z0-9][A-Za-z0-9._-]{0,127}
 snapshot-[A-Za-z0-9][A-Za-z0-9._-]{0,127}
 ```
 
@@ -124,7 +142,7 @@ request under that identity conflicts, as does a named create already in
 flight under another identity. JSON object key order does not change the digest; omission, explicit zero and null are distinct request shapes. The cache is an HTTP create boundary, not a guarantee
 about an unknown network outcome outside API Server.
 
-For pause, resume, reload, and snapshot creation, malformed or missing
+For pause, resume, reload, network replacement, and snapshot creation, malformed or missing
 lifecycle IDs and invalid local input map to `400`; downstream business
 rejection maps to `409`; API Server-to-Node transport failure maps to `503`; and
 malformed/invalid authoritative response data maps to `500`. Reload retains
@@ -179,4 +197,8 @@ Resume requires a matching Running record, completed RRT readiness and Node Prox
 
 Reusable snapshot creation briefly pauses the source, copies its artifact, publishes the catalog and resumes the source. Success requires both the snapshot and resumed source result to be committed. It does not promise uninterrupted source execution. Deleting a referenced snapshot marks it deleting and prevents new references; physical removal follows reference release and backend confirmation.
 
-The reload route retains request validation and error shaping for compatibility; its new backend returns Unimplemented. Do not use it as a recovery command.
+Reload requires a Running Instance with an unexpired checkpoint. Node Manager
+retires and deletes the current backend, restores the same logical Instance as
+a fresh execution, completes RRT readiness and local route binding, then
+publishes Running. A missing or expired checkpoint fails the operation; reload
+never falls back to a cold start.

@@ -23,6 +23,7 @@ fn saved() -> StoredSnapshot {
         },
         priority: 0,
         scheduling: Default::default(),
+        sandbox: Default::default(),
     };
     let node = Node {
         id: "n".into(),

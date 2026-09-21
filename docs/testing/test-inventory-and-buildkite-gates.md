@@ -49,8 +49,15 @@ L0 只证明最核心的用户闭环。它必须使用发布包、安装后的 S
 | 删除 Instance | Redis 终态正确、路由撤销、资源释放、sandboxd inventory 为空 |
 | 环境清理 | 测试进程／容器、临时网络和测试凭证均无残留；清理失败使整轮失败 |
 
-当前八组驱动中的 `sdk` 提供创建、查询、命令、文件和删除主体，`auth` 提供凭证与租户隔离。
+当前十组驱动中的 `sdk` 提供最小创建、查询、命令、文件和删除主体；`data-plane` 独立覆盖
+资源发现、按 ID 重连、可恢复后台命令、文件目录复制、PTY 和端口转发；`lifecycle` 覆盖
+detached 重连／显式删除与空闲回收；`auth` 提供凭证与租户隔离。
 L0 不包含双节点放置、节点失联、跨节点恢复、暂停／快照、性能或长稳。
+
+十组是部署和清理边界，不是功能用例总数。SDK 的 66 个公开操作、构造参数、错误类型以及
+逐项 E2E 状态见 [Sandbox SDK 公开能力与端到端覆盖](sdk-e2e-coverage.md)。`sdk`、
+`data-plane`、`lifecycle` 和 `placement` 会把稳定子用例写入 JUnit，而不再用一个组名掩盖
+组内覆盖数量。
 
 ## 4. Local Standalone：单机真实部署验收
 
@@ -104,6 +111,8 @@ SDK 客户端和两个执行节点通过真实 VM 网络通信。它重跑 L0，
 | 制品交接 | clean commit、release SHA256、SDK 版本、sandboxd revision、镜像 digest 和目标架构一致 |
 | 实际部署 | 独立 namespace、Secret、Service、Pod、镜像拉取、权限和目标 kubeconfig；等待业务就绪而非仅 Pod Ready |
 | L0 | 完整重跑 API Key、创建、查询、命令、文件、删除和物理清理 |
+| `data-plane` | 资源发现、重连、命令 stdin／查询／终止、文件 CRUD／目录复制、PTY 和鉴权端口转发 |
+| `lifecycle` | detached 句柄释放后重连、显式删除，以及空闲超时自动回收 |
 | `capacity` | 两节点资源满载／排队／释放；Master 与 Node Metrics 账本一致 |
 | `placement` | 双节点亲和 OR、反亲和、节点约束、有序／加权偏好和实际归属 |
 | `local-first` | 入口轮转、原子 claim、相同 ID 收敛、冲突拒绝和中心 fallback |
@@ -113,8 +122,9 @@ SDK 客户端和两个执行节点通过真实 VM 网络通信。它重跑 L0，
 | 可观测验收 | 实例数量和资源指标、Gateway 指标、结构化日志、Collector 恢复、完整 Trace 父子链 |
 | 环境清理 | JUnit 无失败／跳过，`missing_checks=[]`、`cleanup_errors=[]`，namespace 删除完成 |
 
-当前 Buildkite 基础 K8s 已执行八组：`sdk`、`auth`、`capacity`、`placement`、`local-first`、
-`node-failure`、`restart`、`stop`。它验证正式制品和跨 Pod 链路，但历史运行的两个 Pod 位于
+当前 `k8s-basic` 要求 `sdk`、`auth`、`capacity`、`placement`、`local-first` 五组；
+`full` 再加入 `data-plane`、`lifecycle`、`node-failure`、`restart`、`stop`。最近一次正式
+Buildkite #30 执行的是此前八组，当前分层需由后续正式构建补充证据。历史运行的两个 Pod 位于
 同一物理 worker，因此跨物理宿主网络和宿主故障仍属于全量验收缺口。
 
 Firecracker checkpoint 使用独立 KVM profile；GPU/NPU 使用具备真实设备的 worker profile。
@@ -146,11 +156,11 @@ Firecracker checkpoint 使用独立 KVM profile；GPU/NPU 使用具备真实设�
 | 层级 | 当前状态 | 主要缺口 |
 |---|---|---|
 | L0 | 已增加独立 `--profile l0`；执行 `l0 + auth`，单独输出 `required_checks`、逐项 JSON 和 JUnit | 仍需在 Buildkite 产生一次正式运行证据 |
-| Standalone | `--profile standalone` 统一本地 Docker 八组；安装示例和 Lima FC 各自有严格结果契约 | 需增加汇总清单，把普通 Linux、安装示例和按需 KVM 结果关联到同一 revision |
+| Standalone | `--profile standalone` 统一本地 Docker 十组；安装示例和 Lima FC 各自有严格结果契约 | 需增加汇总清单，把普通 Linux、安装示例和按需 KVM 结果关联到同一 revision |
 | Multi-VM | 已增加三台机器 inventory 和完成结果校验契约，强制双 worker 实际放置及最终清理 | 尚缺负责生成配置、分发制品和执行场景的完整控制面三 VM 部署器；未进行真实三 VM 验收 |
-| Full Deployment | K8s 已支持 `l0`、`k8s-basic`、`full`；`full` 强制两个 Pod 位于不同物理 worker | 需产生 `full` 正式运行证据；Master/API/Edge 重启、K8s FC、真实 GPU/NPU 仍为独立扩展 profile |
+| Full Deployment | K8s 已支持 `l0`、五组 `k8s-basic` 和十组 `full`；`full` 强制两个 Pod 位于不同物理 worker | 需产生当前分层的正式运行证据；Master/API/Edge 重启、K8s FC、真实 GPU/NPU 仍为独立扩展 profile |
 
-因此当前可以直接形成 Buildkite 门禁的是 UT、L0 和基础 K8s 八组。`full` 的同宿主假绿已被
+因此当前可以直接形成 Buildkite 门禁的是 UT、L0 和基础 K8s 五组。`full` 的同宿主假绿已被
 驱动拒绝，但在实际双 worker 环境跑通前不能宣称完成。Standalone 可作为独立 Linux/KVM
 profile；完整 Multi-VM 在补齐部署器前不能标记为通过。
 
@@ -182,7 +192,7 @@ profile；完整 Multi-VM 在补齐部署器前不能标记为通过。
 | `ST-05` | 已实现 | 日志滚动压缩、Metrics、Trace、Collector 中断恢复 |
 | `ST-FC-01` | 已实现 | KVM 暂停／恢复、可复用快照、克隆和制品清理 |
 | `ST-06` | 计划 | Redis 暂停期间 SQLite 降级日志，恢复后去重补写并恢复生命周期操作 |
-| `ST-07` | 计划 | 空闲超时仅删除；活动刷新阻止误回收，TTL 不参与生命周期 |
+| `ST-07` | 部分已实现 | `standalone`／`full` 已覆盖无活动实例空闲超时删除；活动持续刷新防误回收仍需独立长连接用例 |
 | `ST-08` | 组件前置已实现，E2E 计划 | 实例意外退出后的 Never 清理，以及可配置重启的新 runtime identity、退避上限和最终失败状态；仍需真实 sandboxd 进程故障注入 |
 | `ST-09` | 计划 | Master、API Server、Edge 分别重启后的 epoch、全量目录和路由重同步 |
 | `ST-10` | 计划 | Node Proxy embedded／standalone 使用同一契约和相同用户结果 |
@@ -210,7 +220,7 @@ profile；完整 Multi-VM 在补齐部署器前不能标记为通过。
 |---|---|---|
 | `FD-01` | 已实现 | clean commit、发布包 SHA256、SDK、sandboxd revision 和镜像 digest 一致 |
 | `FD-02` | 已实现 | 独立 namespace 的 L0 全量重跑 |
-| `FD-03` | 已实现 | K8s 基础八组及逐项 JUnit、日志、事件和清理证据 |
+| `FD-03` | 驱动已实现 | K8s 基础五组与完整十组均输出逐项 JUnit、日志、事件和清理证据；等待当前分层的正式 Buildkite 证据 |
 | `FD-04` | 已实现 | Metrics、日志、滚动压缩、Collector 重启与 Trace 父子关系 |
 | `FD-05` | 驱动已实现 | `full` profile 的两个 Pod 必须落在不同物理 worker；等待正式运行证据 |
 | `FD-06` | 计划 | Redis Pod/进程重启和持久卷 AOF 恢复，已提交实例状态不丢失 |
@@ -229,9 +239,11 @@ Buildkite 保留 UT 和 E2E 两条清晰的结果线：
 
 1. **UT gate**：Rust、Agent、Sandbox SDK、驱动器、真实 Redis/mTLS/RRT 组件契约；任何失败阻断。
 2. **L0 E2E gate**：每个提交使用真实发布包部署完整最小平台，执行 L0 全部用例；不能用 mock 后端。
-3. **Full deployment gate**：主分支、合入候选和发布候选执行当前八组 K8s 用例、可观测断言及清理。
+3. **Full deployment gate**：主分支、合入候选和发布候选执行十组 K8s 用例、可观测断言及清理。
 4. **Conditional profiles**：checkpoint/snapshot 变更触发 KVM；设备调度变更触发 GPU/NPU worker。
 5. **Nightly / release**：本地多 VM、跨物理宿主、性能、压力、长稳和重复故障注入。
 
-如果流水线资源允许，当前八组 K8s 场景本身约两分钟，可继续对每个提交执行全量；主要耗时来自
-编译、镜像和部署。即使拆出较快的 L0，也必须保留主分支／发布前的全量实际部署门禁。
+默认每次提交执行五组 `k8s-basic`。完整十组保留在主分支、合入候选和发布前：本地实测中
+`node-failure` 约 33 秒，`lifecycle`、`data-plane`、`stop` 各约 11–14 秒；其中
+`node-failure`、`lifecycle`、`stop` 包含固定等待、故障注入或完整停机。分层只减少基础门禁
+时间，不降低完整实际部署验收范围。

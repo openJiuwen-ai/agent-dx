@@ -34,7 +34,9 @@ def run(connection, image, output):
             changed = Sandbox(name=prefix+'-race', image=image, runtime='runc', cpu=600,
                 memory=512, idle_timeout=0, connection=connection, create_timeout=150)
         except SandboxError as error:
-            assert '409' in str(error), str(error)
+            assert error.code == 'CONFLICT', error.code
+            assert error.retry == 'never', error.retry
+            assert error.outcome == 'not_started', error.outcome
         else:
             instances.append(changed)
             raise AssertionError('changed specification unexpectedly accepted')

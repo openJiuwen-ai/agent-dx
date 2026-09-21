@@ -589,6 +589,7 @@ impl MasterRpc {
         }
         let accepted = state.session.commit(record).await?;
         if let Some(stored) = state.instances.get_mut(&accepted.spec.id) {
+            stored.spec = accepted.spec.clone();
             stored.result = Some(accepted.clone());
             if accepted.state != InstanceState::Paused {
                 if let Some(recovery) = &mut stored.recovery {
@@ -671,15 +672,22 @@ impl pb::master_service_server::MasterService for MasterRpc {
                                             .is_ok()
                                     })
                             })
-                            .map(|n| pb::NodeEndpoint {
-                                node_id: n.node.id.clone(),
-                                address: n.address.clone(),
-                                session_id: n
-                                    .session
-                                    .as_ref()
-                                    .expect("node directory filters entries without a session")
-                                    .id
-                                    .clone(),
+                            .filter_map(|n| {
+                                let (capacity, allocatable) =
+                                    state.scheduler.node_resources(&n.node.id)?;
+                                Some(pb::NodeEndpoint {
+                                    node_id: n.node.id.clone(),
+                                    address: n.address.clone(),
+                                    session_id: n
+                                        .session
+                                        .as_ref()
+                                        .expect("node directory filters entries without a session")
+                                        .id
+                                        .clone(),
+                                    capacity: Some(capacity.into()),
+                                    allocatable: Some(allocatable.into()),
+                                    labels: n.node.labels.clone().into_iter().collect(),
+                                })
                             })
                             .collect(),
                     })

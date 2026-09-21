@@ -15,7 +15,7 @@ import threading
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 _PROTOCOL = "sandbox.pty.v1"
 _PROTOCOL_VERSION = 1
@@ -31,15 +31,11 @@ def _build_pty_uri(
     server: str,
     use_tls: bool,
     instance_id: str,
-    token: str,
     command: Sequence[str],
     rows: int,
     cols: int,
 ) -> str:
     parameters: list[tuple[str, str]] = [
-        ("instance", instance_id),
-        ("tenant_id", "default"),
-        ("token", token),
         ("tty", "true"),
         ("rows", str(rows)),
         ("cols", str(cols)),
@@ -48,7 +44,8 @@ def _build_pty_uri(
     parameters.extend(("command", argument) for argument in command)
     scheme = "wss" if use_tls else "ws"
     authority = server.removeprefix("https://").removeprefix("http://").rstrip("/")
-    return f"{scheme}://{authority}/terminal/ws?{urlencode(parameters)}"
+    instance = quote(instance_id, safe="")
+    return f"{scheme}://{authority}/direct/{instance}/pty?{urlencode(parameters)}"
 
 
 class _PtyConnection:
@@ -56,6 +53,7 @@ class _PtyConnection:
         self,
         uri: str,
         *,
+        token: str,
         ssl_context: Any,
         rows: int,
         cols: int,
@@ -63,6 +61,7 @@ class _PtyConnection:
         on_done: Callable[[], None],
     ) -> None:
         self._uri = uri
+        self._token = token
         self._ssl_context = ssl_context
         self._rows = rows
         self._cols = cols
@@ -180,15 +179,19 @@ class _PtyConnection:
                 pass
 
     async def _run(self) -> None:
-        import websockets
+        import websockets.asyncio.client as ws_client
 
         loop = asyncio.get_running_loop()
         with self._state_lock:
             self._loop = loop
             self._run_task = asyncio.current_task()
         try:
-            async with websockets.connect(
+            async with ws_client.connect(
                 self._uri,
+                additional_headers={
+                    "Authorization": f"Bearer {self._token}",
+                    "X-Auth": self._token,
+                },
                 ssl=self._ssl_context,
                 ping_interval=20,
                 ping_timeout=10,

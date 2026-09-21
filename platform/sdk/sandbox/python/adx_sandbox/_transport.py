@@ -262,10 +262,10 @@ class SandboxClient:
         return sid
 
     def resources(self) -> Dict[str, Any]:
-        """Query the existing global-scheduler JSON resource endpoint."""
+        """Query the public Sandbox node-resource endpoint."""
         resp = self._http.get(
-            f"{self._origin}/global-scheduler/resources",
-            headers={"Type": "json", "Accept": "application/json"},
+            f"{self._base}/resources",
+            headers={"Accept": "application/json"},
             timeout=60,
         )
         if resp.status_code >= 400:
@@ -861,6 +861,16 @@ class SandboxClient:
                 ) from exc
             else:
                 if resp.status_code == 404:
+                    try:
+                        not_found = resp.json()
+                    except ValueError:
+                        not_found = None
+                    if isinstance(not_found, dict) and not_found.get("error_code"):
+                        # RRT uses 404 for an operation-level missing command.
+                        # It is an authoritative result from the resolved
+                        # Instance route, not evidence that /direct is absent.
+                        self._direct_route_misses = 0
+                        raise self._http_error(resp, request_id=request_id)
                     if outcome_unknown:
                         # An earlier attempt may already have executed. Route
                         # disappearance does not make Frontend replay safe.
@@ -1299,9 +1309,14 @@ class SandboxClient:
             payload = {"message": resp.text}
         if not isinstance(payload, dict):
             payload = {"message": str(payload)}
-        detail = payload.get("error")
-        detail = detail if isinstance(detail, dict) else {}
-        message = str(payload.get("message") or detail.get("message") or resp.text)
+        raw_error = payload.get("error")
+        detail = raw_error if isinstance(raw_error, dict) else {}
+        message = str(
+            payload.get("message")
+            or detail.get("message")
+            or (raw_error if isinstance(raw_error, str) else "")
+            or resp.text
+        )
         resolved_request_id = (
             detail.get("requestId")
             or getattr(resp, "headers", {}).get("x-request-id")

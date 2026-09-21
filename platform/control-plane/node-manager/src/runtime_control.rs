@@ -62,22 +62,44 @@ impl RuntimeControlClient {
                 .ok_or_else(|| Error::Invalid("runtime IP is required".into()))?,
             self.port,
         );
-        let mut builder = Request::builder()
-            .method(if body.is_some() {
-                Method::POST
-            } else {
-                Method::GET
-            })
-            .uri(format!("http://{address}/control/v1/{path}"));
-        if let Some(token) = &self.token {
-            builder = builder.header("X-Auth", token);
-        }
-        let request = builder
-            .header("Content-Type", "application/json")
-            .body(Full::new(Bytes::from(body.unwrap_or_default())))
-            .map_err(|_| Error::Invalid("invalid runtime HTTP request".into()))?;
+        let method = if body.is_some() {
+            Method::POST
+        } else {
+            Method::GET
+        };
+        let body = body.unwrap_or_default();
         tokio::time::timeout(self.timeout, async {
-            let response = self.client.request(request).await.map_err(unavailable)?;
+            // Every runtime-control operation is fenced by identity and, for
+            // mutations, an operation ID plus revision. Retrying the identical
+            // request once is therefore safe and closes the result-unknown gap
+            // where the runtime accepted an operation but the HTTP response was
+            // lost while the connection was being retired.
+            let response = {
+                let mut last_error = None;
+                let mut response = None;
+                for _ in 0..2 {
+                    let mut builder = Request::builder()
+                        .method(method.clone())
+                        .uri(format!("http://{address}/control/v1/{path}"));
+                    if let Some(token) = &self.token {
+                        builder = builder.header("X-Auth", token);
+                    }
+                    let request = builder
+                        .header("Content-Type", "application/json")
+                        .body(Full::new(Bytes::copy_from_slice(&body)))
+                        .map_err(|_| Error::Invalid("invalid runtime HTTP request".into()))?;
+                    match self.client.request(request).await {
+                        Ok(value) => {
+                            response = Some(value);
+                            break;
+                        }
+                        Err(error) => last_error = Some(error),
+                    }
+                }
+                response.ok_or_else(|| {
+                    unavailable(last_error.expect("two failed HTTP attempts must retain an error"))
+                })?
+            };
             match response.status() {
                 StatusCode::OK => {}
                 StatusCode::CONFLICT => return Err(Error::Conflict),
@@ -162,4 +184,144 @@ impl RuntimeControlClient {
 }
 fn unavailable(error: impl std::fmt::Display) -> Error {
     Error::Unavailable(format!("runtime HTTP control: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use adx_core::{
+        lifecycle::LifecyclePolicy,
+        runtime::{CheckpointPhase, CheckpointStatus},
+        sandbox::SandboxOptions,
+        scheduling::SchedulingPolicy,
+        Assignment, InstanceSpec, InstanceState, Resources,
+    };
+    use std::{
+        collections::BTreeMap,
+        io::{Read, Write},
+        net::{IpAddr, Ipv4Addr, TcpListener, TcpStream},
+        thread,
+    };
+
+    fn record(port: u16) -> (InstanceRecord, RuntimeControlClient) {
+        let record = InstanceRecord {
+            spec: InstanceSpec {
+                runtime_environment: None,
+                snapshot_id: None,
+                lifecycle: LifecyclePolicy::default(),
+                env: BTreeMap::new(),
+                id: "instance-a".into(),
+                tenant_id: "tenant-a".into(),
+                image: "image-a".into(),
+                runtime: "firecracker".into(),
+                resources: Resources {
+                    cpu_millis: 1,
+                    memory_bytes: 1,
+                    disk_bytes: 1,
+                },
+                priority: 0,
+                scheduling: SchedulingPolicy::default(),
+                sandbox: SandboxOptions::default(),
+            },
+            assignment: Assignment {
+                instance_id: "instance-a".into(),
+                node_id: "node-a".into(),
+                shard_id: 0,
+                generation: 7,
+                devices: vec![],
+            },
+            state: InstanceState::Running,
+            revision: 2,
+            runtime_id: "runtime-a".into(),
+            resources_held: true,
+            runtime_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            checkpoint: None,
+            last_operation: None,
+            restart_attempts: 0,
+            restart_pending: false,
+        };
+        (
+            record,
+            RuntimeControlClient::new(port, Duration::from_secs(5)).unwrap(),
+        )
+    }
+
+    fn read_request(stream: &mut TcpStream) -> Vec<u8> {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut request = Vec::new();
+        let mut chunk = [0; 4096];
+        loop {
+            let count = stream.read(&mut chunk).unwrap();
+            assert!(count > 0, "client closed before sending a complete request");
+            request.extend_from_slice(&chunk[..count]);
+            let Some(header_end) = request.windows(4).position(|value| value == b"\r\n\r\n") else {
+                continue;
+            };
+            let header_end = header_end + 4;
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                })
+                .unwrap_or(0);
+            if request.len() >= header_end + content_length {
+                return request;
+            }
+        }
+    }
+
+    fn request_body(request: &[u8]) -> &[u8] {
+        let start = request
+            .windows(4)
+            .position(|value| value == b"\r\n\r\n")
+            .unwrap()
+            + 4;
+        &request[start..]
+    }
+
+    #[tokio::test]
+    async fn prepare_retries_the_same_fenced_request_after_a_lost_response() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (record, client) = record(port);
+        let expected = RuntimeStatus {
+            identity: RuntimeControlClient::identity(&record),
+            revision: 2,
+            phase: RuntimePhase::Prepared,
+            checkpoint: Some(CheckpointStatus {
+                operation_id: "pause-a".into(),
+                phase: CheckpointPhase::Prepared,
+                error: None,
+            }),
+            active_requests: 0,
+            active_commands: 0,
+            activity_revision: 1,
+        };
+        let encoded = serde_json::to_vec(&expected).unwrap();
+        let server = thread::spawn(move || {
+            let (mut first_stream, _) = listener.accept().unwrap();
+            let first = read_request(&mut first_stream);
+            // Drop the connection after receiving the complete request. The
+            // runtime operation may already have committed at this point.
+            drop(first_stream);
+            let (mut retry, _) = listener.accept().unwrap();
+            let retry_request = read_request(&mut retry);
+            assert_eq!(request_body(&first), request_body(&retry_request));
+            write!(
+                retry,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                encoded.len()
+            )
+            .unwrap();
+            retry.write_all(&encoded).unwrap();
+        });
+        let result = client.prepare(&record, "pause-a", 1).await.unwrap();
+        assert_eq!(result, expected);
+        server.join().unwrap();
+    }
 }

@@ -58,6 +58,7 @@ fn record() -> InstanceRecord {
                 disk_bytes: 1 << 30,
             },
             priority: 0,
+            sandbox: Default::default(),
         },
         assignment: Assignment {
             devices: vec![],

@@ -47,6 +47,7 @@ fn record(generation: u64) -> InstanceRecord {
             runtime: "runsc".into(),
             priority: 0,
             resources: Resources::default(),
+            sandbox: Default::default(),
         },
         assignment: Assignment {
             devices: vec![],

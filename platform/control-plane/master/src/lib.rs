@@ -301,6 +301,10 @@ impl Master {
     pub fn snapshot(&self) -> Arc<Snapshot> {
         self.snapshot.clone()
     }
+    pub fn node_resources(&self, id: &str) -> Option<(adx_core::Resources, adx_core::Resources)> {
+        let shard = *self.node_shards.get(id)?;
+        self.shards.get(shard)?.node_resources(id)
+    }
     pub fn pending(&self, shard: usize) -> Result<usize> {
         self.shards
             .get(shard)

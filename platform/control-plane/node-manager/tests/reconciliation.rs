@@ -118,6 +118,7 @@ fn record(id: &str, state: InstanceState) -> InstanceRecord {
                 disk_bytes: 0,
             },
             priority: 0,
+            sandbox: Default::default(),
         },
         assignment: Assignment {
             instance_id: id.into(),

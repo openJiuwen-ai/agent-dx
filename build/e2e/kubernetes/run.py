@@ -36,8 +36,8 @@ def identity(bundle, registry, commit=None, ci=False):
         raise ValueError('invalid Kubernetes artifact manifest')
     if r.get('bundle_sha256') != common.sha(bundle) or r.get('image_ids') != m['image_ids']:
         raise ValueError('registry images do not match the build bundle')
-    if set(r.get('references', {})) != {'node', 'rrt'}:
-        raise ValueError('both node and RRT images required')
+    if set(r.get('references', {})) != {'node', 'rrt', 'entrypoint'}:
+        raise ValueError('node, RRT and entrypoint test images required')
     for image in r['references'].values():
         if not re.fullmatch(r'[^\s]+@sha256:[0-9a-f]{64}', image):
             raise ValueError('immutable image references required')

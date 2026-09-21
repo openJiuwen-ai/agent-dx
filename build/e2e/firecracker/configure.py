@@ -6,6 +6,8 @@ import pathlib
 import secrets
 import subprocess
 
+from runtime_environment import resolve as resolve_runtime_environment
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -68,7 +70,7 @@ runc = ""
 runc = "/usr/local/bin/runc"
 [plugin.image]
 root = "{R}/image_manager/data"
-distill_fs_bin = "/usr/local/bin/distill_fs"
+distill_fs_bin = "{BASE}/tools/distill_fs"
 oss_template = "{R}/oss.json"
 nydus_template = "{R}/registry.json"
 nydus_suffix = "_nydus_v3"
@@ -107,6 +109,11 @@ if node=='node1':
  ee={**common,'ADX_DATA_PLANE_EDGE_FRONTEND_TLS_BIND':'0.0.0.0:8443','ADX_DATA_PLANE_EDGE_FRONTEND_PLAIN_BIND':'127.0.0.1:8080','ADX_DATA_PLANE_EDGE_FRONTEND_HEALTH_BIND':'127.0.0.1:18080','ADX_DATA_PLANE_EDGE_FRONTEND_TLS_CERT':str(T/'edge.pem'),'ADX_DATA_PLANE_EDGE_FRONTEND_TLS_KEY':str(T/'edge.key'),'ADX_DATA_PLANE_EDGE_FRONTEND_ALLOWED_CLIENT_CIDRS':'127.0.0.1/32','ADX_DATA_PLANE_EDGE_FRONTEND_NODE_TLS_CA':str(T/'ca.pem'),'ADX_DATA_PLANE_EDGE_FRONTEND_NODE_TLS_SERVER_NAME':'localhost','ADX_DATA_PLANE_EDGE_FRONTEND_NODE_TLS_CLIENT_CERT':str(T/'edge.pem'),'ADX_DATA_PLANE_EDGE_FRONTEND_NODE_TLS_CLIENT_KEY':str(T/'edge.key'),'ADX_DATA_PLANE_EDGE_FRONTEND_CONTROL_PLANE_ADDRESS':'127.0.0.1:8888'}
  add('edge','edge',{'tls':tls('edge',{'master':'master'}),'rpc_timeout_seconds':5,'refresh_seconds':1,'auth_cache_seconds':10,'auth_cache_entries':1000},ee)
 d={'schema_version':1,'package_dir':str(BASE/'package'),'state_dir':str(P/'state'),'redis_url':f'redis://:{redis_key.read_text().strip()}@127.0.0.1:6379/','namespace':'acceptance','restart_limit':3,'restart_delay_ms':1000,'stop_timeout_seconds':30,'services':services}
+d['runtime_environment'] = resolve_runtime_environment(
+    BASE / 'package',
+    bool(os.getenv('ADX_E2E_KUBERNETES')),
+    PRIVATE / 'runtime-image',
+)
 (P/'deployment.yaml').write_text(json.dumps(d));(P/'deployment.yaml').chmod(0o600)
 
 print('configured',node,capacity)
