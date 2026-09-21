@@ -181,16 +181,18 @@ class KubernetesRun(common.Run):
                     pass
             for node in reversed(self.nodes):
                 try:
-                    self.helper(node, 'collect', node, timeout=20)
-                    self.kube('-n', self.id, 'cp', node + ':/evidence/.', str(self.output / node), '-c', 'platform', timeout=60)
-                except Exception as e:
-                    errors.append(f'{node} diagnostics: {e}')
-                try:
                     # If the scenario already stopped it, skip the unavailable supervisor.
                     self.execute(node, 'sh', '-c', 'test -f /evidence/stop-' + node + '.json || '
                                  'python3 /opt/adx/e2e/node.py stop ' + node, timeout=180)
                 except Exception as e:
                     errors.append(f'{node} stop: {e}')
+                try:
+                    # Stop writes the final metrics, trace, collection and logging results.
+                    # Copy after it completes so the build summary validates final evidence.
+                    self.helper(node, 'collect', node, timeout=20)
+                    self.kube('-n', self.id, 'cp', node + ':/evidence/.', str(self.output / node), '-c', 'platform', timeout=60)
+                except Exception as e:
+                    errors.append(f'{node} diagnostics: {e}')
             self.kube('delete', 'namespace', self.id, '--wait=true', '--timeout=180s', timeout=200)
             if self.kube('get', 'namespace', self.id, '--ignore-not-found', '-o', 'name').strip():
                 raise RuntimeError('test namespace remains')

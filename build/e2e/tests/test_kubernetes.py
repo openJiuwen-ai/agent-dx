@@ -98,6 +98,25 @@ class KubernetesLifecycleTests(unittest.TestCase):
             self.assertEqual(len(errors),2)
             self.assertEqual([a[3].split(':')[0] for a in calls if len(a)>3 and a[2]=='cp'],['node2','node1'])
 
+    def test_cleanup_stops_services_before_copying_final_evidence(self):
+        import json,tempfile
+        with tempfile.TemporaryDirectory() as d:
+            run=self.module.KubernetesRun(Path(d),Path('/fixture/kubeconfig'))
+            run.namespace_attempted=True;run.namespace_uid='owned';run.nodes=['node1']
+            events=[];deleted=False
+            def kube(*args,**kwargs):
+                nonlocal deleted
+                if args[:2]==('get','namespace'):
+                    return '' if deleted else json.dumps({'metadata':{'uid':'owned','labels':{'adx.e2e.run':run.id}}})
+                if len(args)>2 and args[2]=='cp':events.append('copy')
+                if args[:2]==('delete','namespace'):deleted=True
+                return ''
+            run.kube=kube
+            run.execute=lambda *a,**k:events.append('stop')
+            run.helper=lambda *a,**k:events.append('collect')
+            self.assertEqual(run.cleanup(),[])
+            self.assertEqual(events,['stop','collect','copy'])
+
     def test_registry_manifest_cannot_point_to_another_bundle(self):
         import json,tempfile
         with tempfile.TemporaryDirectory() as d:
