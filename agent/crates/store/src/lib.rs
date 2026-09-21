@@ -8,9 +8,7 @@ use std::{collections::BTreeSet, fmt};
 mod redis_store;
 pub use redis_store::RedisRepository;
 mod state;
-pub use state::{AgentState, Reservation};
-mod membership;
-pub use membership::DispatcherMember;
+pub use state::AgentState;
 #[cfg(feature = "test-memory")]
 mod memory;
 #[cfg(feature = "test-memory")]
@@ -37,7 +35,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub struct Key(String);
 impl Key {
     pub fn new(kind: &str, parts: &[&str]) -> Result<Self> {
-        if !matches!(kind, "template" | "session" | "instance" | "affinity")
+        if !matches!(kind, "template" | "environment")
             || parts.is_empty()
             || parts.iter().any(|s| s.is_empty() || s.len() > 2048)
         {
@@ -50,18 +48,6 @@ impl Key {
     }
     pub fn as_str(&self) -> &str {
         &self.0
-    }
-    pub(crate) fn from_scan(value: &str) -> Result<Self> {
-        let (kind, suffix) = value
-            .split_once(':')
-            .ok_or_else(|| Error::Corrupt("invalid key".into()))?;
-        if !matches!(kind, "template" | "session" | "instance" | "affinity")
-            || suffix.is_empty()
-            || !suffix.bytes().all(|c| c.is_ascii_hexdigit())
-        {
-            return Err(Error::Corrupt("invalid key".into()));
-        }
-        Ok(Self(value.into()))
     }
 }
 
@@ -112,7 +98,7 @@ pub struct Put {
 }
 
 /// Every written key must be checked, and every new revision differs from its predecessor.
-/// Read-only checks fence e.g. Ready -> Deleting against new affinity binding.
+/// Read-only checks fence concurrent product lifecycle changes.
 #[derive(Debug, Clone)]
 pub struct Transaction {
     checks: Vec<Check>,
@@ -166,26 +152,22 @@ impl Transaction {
     }
 }
 
-#[derive(Debug)]
-pub struct Page {
-    pub cursor: u64,
-    pub keys: Vec<Key>,
-}
-
 #[async_trait]
 pub trait Repository: Send + Sync {
     async fn get(&self, key: &Key) -> Result<Option<Record>>;
     /// False means a definite conflict with no writes. Errors may mean unknown outcome.
     async fn commit(&self, transaction: &Transaction) -> Result<bool>;
-    /// Redis SCAN semantics: may return duplicates or empty pages before cursor is zero.
-    async fn scan(&self, kind: &str, cursor: u64, count: u32) -> Result<Page>;
 }
 
-pub(crate) fn validate_scan(kind: &str, count: u32) -> Result<()> {
-    if !matches!(kind, "template" | "session" | "instance" | "affinity")
-        || !(1..=adx_agent_core::limits::SCAN_MAX_COUNT).contains(&count)
-    {
-        return Err(Error::Invalid("invalid scan kind or count".into()));
+impl From<Error> for adx_agent_core::error::Error {
+    fn from(value: Error) -> Self {
+        use Error as E;
+        match value {
+            E::Invalid(s) => Self::Invalid(s),
+            E::Conflict(s) => Self::Conflict(s),
+            E::Unavailable(s) => Self::Unavailable(s),
+            E::OutcomeUnknown(s) => Self::OutcomeUnknown(s),
+            E::Corrupt(_) => Self::Unavailable("invalid stored Agent state".into()),
+        }
     }
-    Ok(())
 }

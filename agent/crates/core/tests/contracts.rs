@@ -43,9 +43,15 @@ fn keys_include_every_scope_component_without_delimiter_collisions() {
 #[test]
 fn isolation_and_reserved_environment_are_not_silently_changed() {
     let mut t: TemplateVersion = serde_json::from_value(template()).unwrap();
-    t.env.insert("ADX_RUNTIME_ID".into(), "forged".into());
-    assert!(t.validate().is_err());
-    t.env.clear();
+    for key in [
+        "ADX_CAPSULE_ID",
+        "ADX_RUNTIME_ID",
+        "ADX_OWNERSHIP_GENERATION",
+    ] {
+        t.env.insert(key.into(), "forged".into());
+        assert!(t.validate().is_err(), "{key} must be owned by the platform");
+        t.env.clear();
+    }
     t.resources.memory_mib = u64::MAX;
     assert!(t.validate().is_err());
 }
@@ -56,8 +62,8 @@ fn internal_response_additions_are_allowed_but_write_specs_remain_strict() {
     assert!(
         serde_json::from_value::<adx_agent_core::sandbox::SandboxObservation>(observation).is_ok()
     );
-    let target = serde_json::json!({"instance_id":"i", "sandbox_id":"s", "tenant":"t", "scope":{"tenant":"t","template":"a","version":"1","session_id":"s"}, "session_generation":"g", "future_field":42});
-    assert!(serde_json::from_value::<adx_agent_core::dispatcher::Target>(target).is_ok());
+    let target = serde_json::json!({"environment":{"sandbox_id":"s", "scope":{"tenant":"t","template":"a","version":"1","environment_id":"e"}, "generation":"g", "phase":"active"}, "service":[], "future_field":42});
+    assert!(serde_json::from_value::<adx_agent_core::activator::Target>(target).is_ok());
     let execution = serde_json::json!({"image":"app", "isolation_runtime":"runc", "entrypoint":[], "working_dir":"/", "user":null, "env":{}, "resources":{"cpu_millis":1,"memory_mib":1}, "service":[], "future_field":42});
     assert!(serde_json::from_value::<adx_agent_core::sandbox::ExecutionSpec>(execution).is_err());
 }

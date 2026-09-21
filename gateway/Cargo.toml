@@ -33,12 +33,11 @@ default = ["activity-client"]
 activity-client = ["dep:prost", "dep:tonic", "dep:tower"]
 etcd-watch = ["dep:etcd-client"]
 mock-e2e = []
-agent-api = ["activity-client", "dep:adx-agent-core", "dep:adx-agent-api", "dep:adx-agent-store"]
+agent-api = ["activity-client", "dep:adx-agent-core", "dep:adx-agent-api"]
 
 [dependencies]
 adx-agent-core = { path = "../agent/crates/core", optional = true }
 adx-agent-api = { path = "../agent/api", optional = true }
-adx-agent-store = { path = "../agent/crates/store", optional = true }
 adx-observability = { path = "../crates/observability" }
 adx-process = { path = "../crates/process" }
 adx-transport = { path = "../crates/transport" }
@@ -76,6 +75,7 @@ tokio-tungstenite = "0.24"
 tokio-stream = { version = "0.1", features = ["net"] }
 
 [dev-dependencies]
+adx-activator = { path = "../agent/activator" }
 adx-agent-store = { path = "../agent/crates/store", features = ["test-memory"] }
 serde-saphyr = { version = "1.3", default-features = false, features = ["deserialize"] }
 tempfile = "3"

@@ -1,31 +1,17 @@
-//! Managed product operations. Dispatchers own allocation and lifecycle coordination.
-use crate::{dispatcher::Dispatch, Error, Result};
-use adx_agent_core::cache::BoundedCache;
-use adx_agent_core::{
-    dispatcher::{ResolveRequest, Target},
-    *,
-};
-use adx_agent_store::AgentState;
-use std::sync::{Arc, Mutex};
+//! Gateway product facade. Redis and Sandbox lifecycle stay behind Activator.
+use crate::{activator::Control, Error, Result};
+use adx_agent_core::{activator::Target, *};
+use std::sync::Arc;
 
 pub struct ManagedService {
-    state: AgentState,
-    dispatcher: Arc<dyn Dispatch>,
-    templates: Mutex<BoundedCache<(String, String, String), TemplateVersion>>,
+    control: Arc<dyn Control>,
 }
 impl ManagedService {
-    pub fn new(state: AgentState, dispatcher: Arc<dyn Dispatch>) -> Self {
-        Self {
-            state,
-            dispatcher,
-            templates: Mutex::new(BoundedCache::new(limits::TEMPLATE_CACHE_ENTRIES)),
-        }
+    pub fn new(control: Arc<dyn Control>) -> Self {
+        Self { control }
     }
     pub async fn publish(&self, tenant: &str, template: &TemplateVersion) -> Result<()> {
-        self.state
-            .publish(tenant, template)
-            .await
-            .map_err(Into::into)
+        self.control.publish(tenant, template).await
     }
     pub async fn template(
         &self,
@@ -33,83 +19,31 @@ impl ManagedService {
         name: &str,
         version: &str,
     ) -> Result<TemplateVersion> {
-        let key = (tenant.to_owned(), name.to_owned(), version.to_owned());
-        if let Some(value) = self
-            .templates
-            .lock()
-            .expect("template cache")
-            .get(&key)
-            .cloned()
-        {
-            return Ok(value);
+        let value = self.control.template(tenant, name, version).await?;
+        if value.name != name || value.version != version {
+            return Err(Error::Unavailable("template identity mismatch".into()));
         }
-        let value = self
-            .state
-            .template(tenant, name, version)
-            .await?
-            .ok_or(Error::NotFound)?;
-        let mut cache = self.templates.lock().expect("template cache");
-        cache.insert(key, value.clone());
+        value.validate().map_err(Error::Invalid)?;
         Ok(value)
     }
-    pub async fn create_session(&self, scope: Scope) -> Result<()> {
-        self.state.create_session(scope).await.map_err(Into::into)
+    pub async fn create_environment(&self, scope: &Scope) -> Result<Environment> {
+        self.control.create_environment(scope).await
     }
-    pub async fn session(&self, scope: &Scope) -> Result<Session> {
-        self.state.session(scope).await?.ok_or(Error::NotFound)
+    pub async fn environment(&self, scope: &Scope) -> Result<Environment> {
+        self.control.environment(scope).await
     }
-    pub async fn instances(&self, scope: &Scope) -> Result<Vec<Instance>> {
-        let session = self.session(scope).await?;
-        let mut instances = vec![];
-        for id in session.instances {
-            if let Some(instance) = self.state.instance(&scope.tenant, &id).await? {
-                if instance.scope != *scope || instance.session_generation != session.generation {
-                    return Err(Error::Unavailable("instance scope mismatch".into()));
-                }
-                instances.push(instance);
-            }
-        }
-        Ok(instances)
+    pub async fn delete_environment(&self, scope: &Scope) -> Result<()> {
+        self.control.delete_environment(scope).await
     }
-    pub async fn release(&self, scope: &Scope) -> Result<()> {
-        self.session(scope).await?;
-        self.dispatcher.release(scope).await
-    }
-    pub async fn instance(&self, scope: &Scope, id: &str) -> Result<Instance> {
-        let session = self.session(scope).await?;
-        let instance = self
-            .state
-            .instance(&scope.tenant, id)
-            .await?
-            .ok_or(Error::NotFound)?;
-        if instance.scope != *scope || instance.session_generation != session.generation {
-            return Err(Error::NotFound);
-        }
-        Ok(instance)
-    }
-    pub async fn release_instance(&self, scope: &Scope, id: &str) -> Result<()> {
-        self.instance(scope, id).await?;
-        self.dispatcher.release_instance(scope, id).await
-    }
-    /// Resolve before touching a user stream. Service is only protocol/port metadata.
+
+    /// Each request validates the service and activates against authoritative product state.
     pub async fn resolve(
         &self,
         scope: &Scope,
-        affinity: Option<String>,
         protocol: Protocol,
         port: Option<u16>,
     ) -> Result<(Target, u16)> {
-        self.resolve_with_cache(scope, affinity, protocol, port, false)
-            .await
-    }
-    pub async fn resolve_with_cache(
-        &self,
-        scope: &Scope,
-        affinity: Option<String>,
-        protocol: Protocol,
-        port: Option<u16>,
-        bypass_cache: bool,
-    ) -> Result<(Target, u16)> {
+        scope.validate().map_err(Error::Invalid)?;
         let template = self
             .template(&scope.tenant, &scope.template, &scope.version)
             .await?;
@@ -124,22 +58,15 @@ impl ManagedService {
                 "service must identify exactly one declared protocol/port".into(),
             ));
         }
-        let target = self
-            .dispatcher
-            .resolve(&ResolveRequest {
-                scope: scope.clone(),
-                affinity_key: affinity,
-                bypass_cache,
-            })
-            .await?;
-        // Dispatcher is the authenticated selection authority. Re-reading Session/Instance
-        // here would turn every cache hit back into Redis traffic. Fixed-ID access has its own checks.
-        if target.scope != *scope
-            || target.tenant != scope.tenant
-            || target.session_generation.is_empty()
+        let target = self.control.activate(scope).await?;
+        if target.environment.scope != *scope
+            || target.environment.phase != EnvironmentPhase::Active
+            || target.environment.generation.is_empty()
+            || target.environment.sandbox_id.is_empty()
+            || target.service != template.service
         {
             return Err(Error::Unavailable(
-                "Dispatcher selected a different Session identity".into(),
+                "Activator target identity or service mismatch".into(),
             ));
         }
         Ok((target, ports[0]))

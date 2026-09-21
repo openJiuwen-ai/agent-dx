@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1440" height="1100" viewBox="0 0 1440 1100" role="img" aria-labelledby="title desc">
   <title id="title">Agent DX architecture</title>
-  <desc id="desc">Agent CLI, SDK and Executor use the public Sandbox SDK as their target platform boundary. API Server embeds Edge by default; Edge sends control traffic to the API loopback listener and data traffic to Node Proxy. Master embeds Global and Shard scheduling, persists Capsule state to Redis and publishes routes. Node Manager owns Capsule lifecycle, controls sandboxd, synchronizes Node Proxy over UDS and cooperates with RRT over HTTP. RRT and the workload run inside a replaceable Runtime. Both embedded pairs support explicit split-process deployment.</desc>
+  <desc id="desc">Gateway Edge hosts the Agent API. Stateless Activators manage Template and Environment metadata in a separate Redis namespace and activate one stable Sandbox through the Gateway Sandbox adapter. Inline lifecycle calls use that adapter directly. User Harness HTTP, WebSocket and SSH traffic follows Edge and Node Proxy. Platform owns Capsule lifecycle and RRT owns the user process. API Server embeds Edge by default; Node Manager embeds Node Proxy. Both pairs support separate processes.</desc>
   <defs>
     <marker id="blue" markerWidth="9" markerHeight="9" refX="8" refY="4" orient="auto"><path d="M0 0L8 4L0 8" fill="none" stroke="#2563eb" stroke-width="1.5"/></marker>
     <marker id="green" markerWidth="9" markerHeight="9" refX="8" refY="4" orient="auto"><path d="M0 0L8 4L0 8" fill="none" stroke="#0d806c" stroke-width="1.5"/></marker>
@@ -23,12 +23,13 @@
 
   <rect x="48" y="120" width="1344" height="116" rx="16" fill="#f1edff" stroke="#ded6f5"/>
   <text x="72" y="146" class="section">PRODUCT &amp; PUBLIC CONTRACT</text>
-  <text x="72" y="179" class="name">Agent CLI / SDK / Executor</text>
-  <text x="72" y="207" class="small">Agent APIs, sessions and orchestration · agent/</text>
-  <path d="M540 182H850" class="support" stroke-dasharray="7 5"/>
-  <text x="691" y="171" text-anchor="middle" class="small">Target dependency via public SDK</text>
-  <text x="888" y="179" class="name">Sandbox SDK</text>
-  <text x="888" y="207" class="small">Public Sandbox contract · adx_sandbox</text>
+  <text x="72" y="179" class="name">Stateless Activator</text>
+  <text x="72" y="207" class="small">Template / Environment · agent/activator</text>
+  <path d="M450 182H535" class="support"/>
+  <text x="565" y="179" class="name">Agent Redis</text>
+  <text x="565" y="207" class="small">Product metadata</text>
+  <text x="888" y="179" class="name">Agent clients / Sandbox SDK</text>
+  <text x="888" y="207" class="small">Public HTTPS APIs / Harness traffic</text>
 
   <rect x="48" y="284" width="300" height="648" rx="16" fill="#edf8f5" stroke="#c8e7de"/>
   <text x="72" y="312" class="section">SHARED ACCESS / GATEWAY</text>
@@ -40,9 +41,9 @@
   <text x="72" y="566" class="small">Master publishes routes.</text>
   <text x="72" y="591" class="small">Data requests use caches</text>
   <text x="72" y="616" class="small">and local binding checks.</text>
-  <text x="72" y="685" class="small">Shared gateway primitives</text>
-  <text x="72" y="710" class="small">can serve Agent endpoints.</text>
-  <text x="72" y="735" class="small">Agent endpoints reuse shared gateway primitives.</text>
+  <text x="72" y="685" class="small">Agent API → Activator</text>
+  <text x="72" y="710" class="small">Inline → Sandbox adapter</text>
+  <text x="72" y="735" class="small">Sandbox adapter → Platform RPC</text>
 
   <rect x="430" y="284" width="398" height="648" rx="16" fill="#eef3ff" stroke="#d0dcf4"/>
   <text x="454" y="312" class="section">CONTROL PLANE / PLATFORM</text>
@@ -77,9 +78,13 @@
   <text x="976" y="757" class="name">sandboxd</text>
   <text x="976" y="782" class="small">External service · runtime execution</text>
   <rect x="954" y="835" width="366" height="77" rx="12" fill="#fff0d4" stroke="#dcc391"/>
-  <text x="976" y="864" class="name">Runtime: RRT + workload</text>
+  <text x="976" y="864" class="name">Runtime: RRT + Harness</text>
   <text x="976" y="891" class="small">Commands / files / ports · HTTP control</text>
 
+  <path d="M180 236V350" class="support"/>
+  <path d="M280 350V236" class="control"/>
+  <text x="96" y="252" class="small">Sandbox API</text>
+  <text x="285" y="278" class="small">Agent API</text>
   <path d="M1182 236V260H60V376H72" class="support"/>
   <text x="648" y="254" class="small">Public HTTPS requests</text>
   <path d="M324 402H454" class="control"/>
@@ -113,6 +118,6 @@
   <text x="72" y="1018" class="small">API Server embeds Edge; Node Manager embeds Node Proxy. Both pairs support explicit split-process deployment. sandboxd remains external.</text>
   <path d="M72 1075H112" class="control"/><text x="124" y="1080" class="small">Control / state</text>
   <path d="M292 1075H332" class="data"/><text x="344" y="1080" class="small">User data</text>
-  <path d="M488 1075H528" class="support" stroke-dasharray="7 5"/><text x="540" y="1080" class="small">Agent integration boundary</text>
+  <path d="M488 1075H528" class="support"/><text x="540" y="1080" class="small">Product / public access</text>
   <text x="1392" y="1080" text-anchor="end" class="small">Single Master · embedded Shards</text>
 </svg>

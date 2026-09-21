@@ -4,11 +4,12 @@
 *{box-sizing:border-box}body{margin:0;background:#f5f8fb;color:#17324d;font:16px/1.8 system-ui,-apple-system,"PingFang SC",sans-serif}main{max-width:1320px;margin:auto;padding:32px}header{padding:16px 0;border-bottom:1px solid #ccdae5}a{color:#146a91;text-underline-offset:4px}.layout{display:grid;grid-template-columns:200px minmax(0,1fr);gap:36px}nav{position:sticky;top:24px;align-self:start;padding-top:32px}nav a{display:block;margin-bottom:14px;font-size:14px}article{min-width:0}h1{font-size:34px;line-height:1.35}h2{margin-top:42px;scroll-margin-top:24px}p{overflow-wrap:anywhere}img{width:100%;height:auto}pre{overflow:auto;background:#17324d;color:#e6eef5;padding:24px;border-radius:12px;font-size:13px;line-height:1.8}code{font-family:ui-monospace,monospace;font-size:.88em}p code,td code{background:#e4edf4;padding:2px 4px;border-radius:4px}.table{overflow:auto}table{border-collapse:collapse;width:100%;background:white;font-size:14px}th,td{text-align:left;padding:12px;border:1px solid #d5e0e8;min-width:140px}th{background:#e6f0f6}button{font:inherit;color:#17324d;background:white;border:1px solid #afc4d2;border-radius:8px;padding:6px 14px;cursor:pointer}header{display:flex;gap:24px;align-items:center;flex-wrap:wrap}footer{margin-top:36px;padding:20px 0;border-top:1px solid #ccdae5;font-size:13px}@media(max-width:760px){main{padding:18px}.layout{display:block}nav{position:static;display:flex;gap:14px;flex-wrap:wrap}h1{font-size:28px}}@media print{nav,header button{display:none}.layout{display:block}main{padding:0}pre{white-space:pre-wrap}body{background:white}h2{break-after:avoid}}
 </style></head><body><main><header><strong>AGENT DX / ARCHITECTURE</strong><a href="repository-layout.md">Markdown 源文档</a><a href="../testing/control-plane-implementation.md">当前实现</a><button onclick="window.print()">打印 / 保存 PDF</button></header>
 <div class="layout"><nav aria-label="文档目录"><a href="#section-1">分层与当前接入状态</a><a href="#section-2">实际目录</a><a href="#section-3">控制面内部模块</a><a href="#section-4">Node Manager / Node Proxy 进程组合</a><a href="#section-5">API Server / Edge 进程组合</a><a href="#section-6">协议与持久化</a><a href="#section-7">构建、部署和验收</a><a href="#section-8">可观测</a></nav><article><h1>Agent DX 当前目录与组件边界</h1>
-<p>核对日期：2026-09-21。此页描述当前源码布局；首次导入记录保留在 <a href="../migration/2026-09-14-import.md">迁移报告</a>。<a href="repository-layout.html">HTML 阅读版</a> 从本文件生成，架构图为仓库内 SVG。</p>
+<p>核对日期：2026-09-22。此页描述当前源码布局；首次导入记录保留在 <a href="../migration/2026-09-14-import.md">迁移报告</a>。<a href="repository-layout.html">HTML 阅读版</a> 从本文件生成，架构图为仓库内 SVG。</p>
 <p><img alt="当前组件与调用方向" src="../../assets/architecture/current-architecture.svg"></p>
 <h2 id="section-1">分层与当前接入状态</h2>
-<div class="table"><table><tr><th>层</th><th>职责</th><th>当前状态</th></tr><tr><td>Agent 产品 <code>agent/</code></td><td>Agent CLI、编程 SDK、会话和执行编排</td><td>已迁入；仍使用旧 FaaS/外部运行时。目标通过 Sandbox SDK 使用平台，业务后端迁移尚未完成</td></tr><tr><td>公开能力 <code>platform/sdk/sandbox</code></td><td>Sandbox 生命周期、命令/文件、快照、放置约束</td><td>Python SDK 已实现；客户端保留字段与新服务端支持范围不同</td></tr><tr><td>执行平台 <code>platform/</code></td><td>通用 Capsule、调度、持久化、节点生命周期、RRT</td><td>Master、Node Manager、本地优先创建及 EROFS/OCI 运行环境已接入；当前基础 K8s 八组已通过</td></tr><tr><td>共享接入 <code>gateway/</code></td><td>Sandbox API Server、Edge、Node Proxy、反向代理与转发</td><td>API Server 默认内嵌 Edge；Node Manager 默认内嵌 Node Proxy；Agent upstream 可按地址配置，业务规则仍归 Agent 层</td></tr></table></div>
-<p>Agent 使用新平台的目标边界是公开 Sandbox SDK，不直接访问平台 Redis/SQLite、内部调度 RPC 或 sandboxd。当前九条 <code>/api/agent</code> 兼容路由只负责认证与转发，需要配置 <code>agent_address</code> 和真正的 Agent 业务服务；默认部署不具备旧 CLI 的 meta_service/FaaS 接口。</p>
+<div class="table"><table><tr><th>层</th><th>职责</th><th>当前状态</th></tr><tr><td>Agent 产品 <code>agent/</code></td><td>Template、Environment、无状态 Activator、inline 适配</td><td>Rust 产品 API 集成在 Gateway Edge；Environment 与稳定逻辑 Sandbox 1:1 绑定，首次访问按需激活</td></tr><tr><td>公开能力 <code>platform/sdk/sandbox</code></td><td>Sandbox 生命周期、命令/文件、快照、放置约束</td><td>Python SDK 已实现；客户端保留字段与新服务端支持范围不同</td></tr><tr><td>执行平台 <code>platform/</code></td><td>通用 Capsule、调度、持久化、节点生命周期、RRT</td><td>Master、Node Manager、本地优先创建及 EROFS/OCI 运行环境已接入；当前基础 K8s 八组已通过</td></tr><tr><td>共享接入 <code>gateway/</code></td><td>Sandbox API Server、Edge、Node Proxy、反向代理与转发</td><td>API Server 默认内嵌 Edge；Node Manager 默认内嵌 Node Proxy；Agent API 装配于 Edge，业务规则归 Agent 层</td></tr></table></div>
+<p>Agent API 在 Gateway Edge 内处理产品请求，通过配置地址访问无状态 Activator。Activator 持久化 Template/Environment，并调用 Gateway 的 Sandbox 能力接口；Sandbox 适配器访问平台。Agent 不直接操作平台 Redis/SQLite 或 sandboxd。inline create/get/kill 直接调用 Sandbox 适配器。用户 Harness 的 HTTP/WS/SSH 经共享数据面转发，业务协议由用户定义。</p>
+<p>API Server 仍保留原有九条 <code>/api/agent</code> 兼容转发路由，由 <code>agent_address</code> 指向外部 Agent 服务；这是平台侧既有入口，不属于当前 Edge Agent API／Activator 链路，本轮保持不变。</p>
 <p>平台内部以 **Capsule + Runtime** 建模。Capsule 是跨节点、暂停恢复和故障接管期间保持不变的逻辑身份，持有期望规格、生命周期、归属和 checkpoint 引用；Runtime 是 sandboxd 在某个节点创建的一次物理执行，具有独立 <code>runtime_id</code>，重启、恢复或接管时可以替换。二者通过 <code>RuntimeIdentity { capsule_id, runtime_id, ownership_generation }</code> 绑定，Node Manager 只允许当前 generation 的 Runtime 对外提供服务。</p>
 <p>公开 Sandbox HTTP/SDK 契约继续使用 <code>/api/instances</code>、<code>instanceId</code> 和 <code>instance_id</code>；API Server 在边界将这些兼容字段映射为 <code>capsule_id</code>。内部 Rust 类型、gRPC、Redis key、SQLite journal 和 Metrics 统一使用 Capsule/Runtime，不保留第二套 Instance 类型别名。</p>
 <h2 id="section-2">实际目录</h2>
@@ -19,10 +20,9 @@
 │   ├── logo/                     # 黑白标志、独立图标和反相版本
 │   └── architecture/             # 系统架构与当前组件调用图
 ├── agent/
-│   ├── cli/ar_cli/                 # Python adx 命令
-│   ├── sdk/python/src/adx/         # Agent 编程 SDK
-│   ├── executor/src/adx/           # Agent Executor
-│   └── tests/                     # Agent 测试及外部运行时替身
+│   ├── api/                       # Gateway 产品入口与 inline 适配
+│   ├── activator/                 # 无状态产品管理与按需激活
+│   └── crates/                    # core 协议模型、store 产品状态；测试随各 crate 放置
 ├── crates/                        # 跨 Gateway / Platform / Runtime 的横切库
 │   ├── error/                     # 稳定错误码、重试与操作结果语义
 │   ├── observability/             # 日志、Metrics、Trace 与进程日志捕获
@@ -54,7 +54,7 @@
 │   │   └── docs/                  # Sandbox HTTP 支持范围
 │   └── src/
 │       ├── common/                # Gateway 内部监听、路由与数据面协议
-│       ├── edge/                  # 路由订阅、认证、连接池、反向代理
+│       ├── edge/                  # Agent/Sandbox 适配、路由订阅、认证、连接池、反向代理
 │       ├── node/                  # NodeProxyService、绑定、活动、转发
 │       └── bin/                   # Edge、Node Proxy、forwarder
 ├── third_party/sandboxd/          # 锁定后端协议、来源与许可证
@@ -87,7 +87,7 @@
 <p>内部 gRPC 按 Capsule、快照、凭证、路由及节点本地控制拆分，详见 <a href="../../platform/api/proto/README.md">协议目录</a>。RRT 用户操作及运行时协作使用 HTTP，类型在 <code>core/src/runtime.rs</code>。</p>
 <p>正常结果经 Master 写 Redis；SQLite 只在提交不可用时保存待补交结果。Journaled 不发布 Edge 路由。节点重启而 Master 不可用时等待对账，不从不完整日志重建目录。快照制品走独立的本地/S3 存储抽象。Redis 使用 <code>capsule:&lt;capsule_id&gt;</code>，SQLite journal 使用 <code>capsule</code> 字段；此次内部 schema 不兼容旧控制状态，升级时需要清空 Redis/SQLite 控制状态并由新版本重新登记。详见 <a href="../testing/node-lifecycle.md">节点契约</a>。</p>
 <h2 id="section-7">构建、部署和验收</h2>
-<p>Rust 共用根 Cargo workspace，Python 独立打包；外部 sandboxd 按其锁定版本构建。<code>adx</code> 是 Agent CLI；<code>adxctl</code> 是平台运维 CLI，支持 validate/render/run/start/status/stop。统一发布包带控制面、Gateway、静态 RRT、Sandbox SDK、EROFS 运行环境和锁定 Redis；可选择外部 Redis，sandboxd 始终由部署环境托管。运行环境也可使用不可变 OCI image；自定义用户镜像从同一环境只读挂载 <code>/__adx</code>。</p>
+<p>Rust 共用根 Cargo workspace，Python 独立打包；外部 sandboxd 按其锁定版本构建。<code>adxctl</code> 是平台运维 CLI，支持 validate/render/run/start/status/stop。统一发布包带控制面、Gateway、静态 RRT、Sandbox SDK、EROFS 运行环境和锁定 Redis；可选择外部 Redis，sandboxd 始终由部署环境托管。运行环境也可使用不可变 OCI image；自定义用户镜像从同一环境只读挂载 <code>/__adx</code>。</p>
 <p>普通进程与 Pod 内都使用相同组件和 supervisor。Buildkite 先构建，再发布不可变镜像，最后独立执行 K8s 八组用例及清理。<a href="../testing/2026-09-18-runtime-environment-k8s.md">Buildkite #30</a> 已验证 Rust API Server、本地优先创建及 OCI default/runtime-only/custom 三种环境路径；两个 Pod 同宿主。本地 FC 与基础 K8s 分开统计，实际未完成项和后置项见 <a href="../testing/control-plane-roadmap.md">路线图</a>。</p>
 <h2 id="section-8">可观测</h2>
 <p>Master/Node Manager 的 Capsule 数、资源预留与使用量，Edge/Node Proxy 的连接、流量与请求指标由各自 <code>/metrics</code> 导出。Trace 由组件 OpenTelemetry SDK 经 OTLP/HTTP 发往外部 Collector；结构化 stdout 由 supervisor 滚动压缩，Collector filelog 采集。Pod 可部署 Collector sidecar，进程环境独立托管。统一实时 Trace 队列丢弃指标已后置，不能与已有导出失败计数混同。</p></article></div>

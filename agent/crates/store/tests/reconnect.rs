@@ -14,7 +14,7 @@ async fn reconnect_without_replaying_unknown_write() {
     )
     .await
     .unwrap();
-    let key = Key::new("instance", &["tenant", "id"]).unwrap();
+    let key = Key::new("environment", &["tenant", "id"]).unwrap();
     let mut admin = redis::Client::open(url)
         .unwrap()
         .get_multiplexed_async_connection()
@@ -29,7 +29,7 @@ async fn reconnect_without_replaying_unknown_write() {
         .query_async(&mut admin)
         .await
         .unwrap();
-    let record = Record::new(&serde_json::json!({"phase":"creating"})).unwrap();
+    let record = Record::new(&serde_json::json!({"phase":"active"})).unwrap();
     let tx = Transaction::new(
         vec![Check {
             key: key.clone(),

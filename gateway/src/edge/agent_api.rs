@@ -1,13 +1,12 @@
 //! Agent transport composition. Management JSON is separate from unchanged data forwarding.
 use adx_agent_api::{
-    dispatcher::DispatcherClient,
+    activator::ActivatorClient,
     managed::ManagedService,
     management::{InlineProfile, InlineService, Options},
     Error,
 };
 use adx_agent_core::{inline::CreateRequest, sandbox::Sandbox, Protocol, Scope, TemplateVersion};
 use adx_agent_core::{limits, transport::RequestProgress};
-use adx_agent_store::{AgentState, RedisRepository};
 use bytes::Bytes;
 use http::{Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full};
@@ -22,7 +21,8 @@ pub enum Mode {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct DispatcherConfig {
+pub struct ActivatorConfig {
+    pub urls: Vec<String>,
     pub token_env: String,
     pub timeout_seconds: u64,
     pub ca_path: Option<String>,
@@ -33,17 +33,15 @@ pub struct DispatcherConfig {
 #[serde(deny_unknown_fields)]
 pub struct AgentConfig {
     pub mode: Mode,
-    pub redis_url: Option<String>,
-    pub namespace: Option<String>,
     pub inline_profiles: Vec<InlineProfile>,
     pub backend_timeout_seconds: u64,
     pub max_inflight: usize,
-    pub dispatcher: Option<DispatcherConfig>,
+    pub activator: Option<ActivatorConfig>,
 }
 pub struct AgentApi {
     pub inline: Arc<InlineService>,
     pub managed: Option<Arc<ManagedService>>,
-    pub dispatcher: Option<Arc<DispatcherClient>>,
+    pub activator: Option<Arc<ActivatorClient>>,
 }
 impl AgentApi {
     pub async fn new(
@@ -58,53 +56,31 @@ impl AgentApi {
                 max_inflight: config.max_inflight,
             },
         )?);
-        let (managed, dispatcher) = match (config.mode, config.dispatcher) {
+        let (managed, activator) = match (config.mode, config.activator) {
             (Mode::InlineOnly, None) => (None, None),
             (Mode::InlineOnly, Some(_)) => {
-                return Err("inline_only cannot configure Dispatcher".into())
+                return Err("inline_only cannot configure Activator".into())
             }
-            (Mode::Both, None) => return Err("both mode requires Dispatcher settings".into()),
+            (Mode::Both, None) => return Err("both mode requires Activator settings".into()),
             (Mode::Both, Some(settings)) => {
-                if Duration::from_secs(settings.timeout_seconds)
-                    <= limits::CREATE_TIMEOUT + limits::DISPATCHER_FINISH_TIMEOUT
-                {
-                    return Err("Dispatcher timeout_seconds must exceed the default creation/Resolve deadline plus 10 seconds (70 seconds); increase it further when configuring a longer creation timeout".into());
-                }
                 let token = std::env::var(&settings.token_env)
-                    .map_err(|_| "Dispatcher token environment variable missing")?;
+                    .map_err(|_| "Activator token environment variable missing")?;
                 let ca = settings.ca_path.map(std::fs::read).transpose()?;
-                let repository = Arc::new(
-                    RedisRepository::connect(
-                        config
-                            .redis_url
-                            .as_deref()
-                            .ok_or("both mode requires redis_url")?,
-                        config
-                            .namespace
-                            .as_deref()
-                            .ok_or("both mode requires namespace")?,
-                        Duration::from_secs(3),
-                    )
-                    .await?,
-                );
-                let dispatcher = Arc::new(DispatcherClient::new(
-                    repository.clone(),
+                let activator = Arc::new(ActivatorClient::new(
+                    settings.urls,
                     token,
                     Duration::from_secs(settings.timeout_seconds),
                     ca.as_deref(),
                     settings.allow_plaintext,
                 )?);
-                let managed = Arc::new(ManagedService::new(
-                    AgentState::new(repository),
-                    dispatcher.clone(),
-                ));
-                (Some(managed), Some(dispatcher))
+                let managed = Arc::new(ManagedService::new(activator.clone()));
+                (Some(managed), Some(activator))
             }
         };
         Ok(Self {
             inline,
             managed,
-            dispatcher,
+            activator,
         })
     }
     pub fn matches(path: &str) -> bool {
@@ -130,10 +106,10 @@ impl AgentApi {
         };
         let progress = RequestProgress::default();
         let budget = if request.uri().path().starts_with("/api/agent/v2/") {
-            self.dispatcher
+            self.activator
                 .as_ref()
                 .map(|client| client.request_budget())
-                .unwrap_or(limits::CREATE_TIMEOUT + limits::DISPATCHER_FINISH_TIMEOUT)
+                .unwrap_or(limits::AGENT_REQUEST_TIMEOUT)
         } else {
             limits::AGENT_REQUEST_TIMEOUT
         };
@@ -261,15 +237,12 @@ fn json_response(
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct SessionInput {}
+struct EnvironmentInput {}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ResolveInput {
     protocol: Protocol,
     port: Option<u16>,
-    affinity_key: Option<String>,
-    #[serde(default)]
-    bypass_cache: bool,
 }
 fn segment(value: &str) -> Result<String, Error> {
     let value = percent_encoding::percent_decode_str(value)
@@ -326,66 +299,41 @@ impl AgentApi {
                 serde_json::json!({"template":managed.template(tenant,&name,&version).await?}),
             );
         }
-        let ["sessions", session, action @ ..] = rest else {
+        let ["environments", environment, action @ ..] = rest else {
             return Err(Error::NotFound);
         };
         let scope = Scope {
             tenant: tenant.into(),
             template: name,
             version,
-            session_id: segment(session)?,
+            environment_id: segment(environment)?,
         };
         scope.validate().map_err(Error::Invalid)?;
         match (parts.method, action) {
             (http::Method::PUT, []) => {
                 let bytes = read_body(body).await?;
                 if !bytes.is_empty() {
-                    serde_json::from_slice::<SessionInput>(&bytes).map_err(|_| {
-                        Error::Invalid("Session creation accepts no options".into())
+                    serde_json::from_slice::<EnvironmentInput>(&bytes).map_err(|_| {
+                        Error::Invalid("Environment creation accepts no options".into())
                     })?;
                 }
                 progress.start_write();
-                managed.create_session(scope.clone()).await?;
-                Ok(serde_json::json!({"session":managed.session(&scope).await?}))
+                Ok(serde_json::json!({"environment":managed.create_environment(&scope).await?}))
             }
             (http::Method::GET, []) => {
-                Ok(serde_json::json!({"session":managed.session(&scope).await?}))
+                Ok(serde_json::json!({"environment":managed.environment(&scope).await?}))
             }
             (http::Method::DELETE, []) => {
                 progress.start_write();
-                managed.release(&scope).await?;
-                match managed.session(&scope).await {
-                    Ok(session) => Ok(serde_json::json!({"status":"deleting","session":session})),
-                    Err(Error::NotFound) => Ok(serde_json::json!({"status":"deleted"})),
-                    Err(error) => Err(error),
-                }
-            }
-            (http::Method::GET, ["instances"]) => {
-                Ok(serde_json::json!({"instances":managed.instances(&scope).await?}))
-            }
-            (http::Method::GET, ["instances", id]) => {
-                Ok(serde_json::json!({"instance":managed.instance(&scope,&segment(id)?).await?}))
-            }
-            (http::Method::DELETE, ["instances", id]) => {
-                let id = segment(id)?;
-                progress.start_write();
-                managed.release_instance(&scope, &id).await?;
-                Ok(serde_json::json!({"status":"release_requested"}))
+                managed.delete_environment(&scope).await?;
+                Ok(serde_json::json!({"status":"deleted"}))
             }
             (http::Method::POST, ["resolve"]) => {
                 let input: ResolveInput = decode_body(body).await?;
-                progress.start_write(); // Resolve may cold-start or bind affinity.
-                let (target, port) = managed
-                    .resolve_with_cache(
-                        &scope,
-                        input.affinity_key,
-                        input.protocol,
-                        input.port,
-                        input.bypass_cache,
-                    )
-                    .await?;
+                progress.start_write(); // Activation can submit a platform create.
+                let (target, port) = managed.resolve(&scope, input.protocol, input.port).await?;
                 Ok(
-                    serde_json::json!({"instance_id":target.instance_id,"sandbox_id":target.sandbox_id,"port":port,"protocol":input.protocol}),
+                    serde_json::json!({"sandbox_id":target.environment.sandbox_id,"port":port,"protocol":input.protocol}),
                 )
             }
             _ => Err(Error::NotFound),
@@ -399,22 +347,19 @@ impl AgentApi {
     pub fn can_retry_data<B>(&self, request: &Request<B>) -> bool {
         request.extensions().get::<SelectionRetry>().is_some()
     }
-    /// Consume retry metadata: each incoming business request can bypass selection once at most.
+    /// Consume retry metadata: each incoming business request can repeat activation once before sending.
     pub async fn retry_data<B>(&self, request: &mut Request<B>) -> Result<bool, Error> {
         let Some(retry) = request.extensions_mut().remove::<SelectionRetry>() else {
             return Ok(false);
         };
         let (target, port) = self
             .managed()?
-            .resolve_with_cache(
-                &retry.scope,
-                retry.affinity,
-                retry.protocol,
-                Some(retry.port),
-                true,
-            )
+            .resolve(&retry.scope, retry.protocol, Some(retry.port))
             .await?;
-        let uri = format!("/{}/{port}/{}", target.sandbox_id, retry.tail_and_query);
+        let uri = format!(
+            "/{}/{port}/{}",
+            target.environment.sandbox_id, retry.tail_and_query
+        );
         *request.uri_mut() = uri
             .parse()
             .map_err(|_| Error::Unavailable("invalid resolved forwarding path".into()))?;
@@ -433,7 +378,7 @@ impl AgentApi {
             .splitn(6, '/');
         let name = segment(parts.next().ok_or(Error::NotFound)?)?;
         let version = segment(parts.next().ok_or(Error::NotFound)?)?;
-        let session_id = segment(parts.next().ok_or(Error::NotFound)?)?;
+        let environment_id = segment(parts.next().ok_or(Error::NotFound)?)?;
         let protocol = match parts.next() {
             Some("http") => Protocol::Http,
             Some("ws") => Protocol::Ws,
@@ -455,26 +400,17 @@ impl AgentApi {
                 "HTTP/WS route does not match the upgrade request".into(),
             ));
         }
-        let affinity = request
-            .headers()
-            .get("x-adx-affinity-key")
-            .map(|v| {
-                v.to_str()
-                    .map(str::to_owned)
-                    .map_err(|_| Error::Invalid("invalid affinity header".into()))
-            })
-            .transpose()?;
         let scope = Scope {
             tenant: tenant.into(),
             template: name,
             version,
-            session_id,
+            environment_id,
         };
         let (target, port) = self
             .managed()?
-            .resolve(&scope, affinity.clone(), protocol, Some(port))
+            .resolve(&scope, protocol, Some(port))
             .await?;
-        let path = format!("/{}/{port}/{tail}", target.sandbox_id);
+        let path = format!("/{}/{port}/{tail}", target.environment.sandbox_id);
         let uri = if let Some(query) = request.uri().query() {
             format!("{path}?{query}")
         } else {
@@ -490,12 +426,10 @@ impl AgentApi {
         };
         request.extensions_mut().insert(SelectionRetry {
             scope,
-            affinity,
             protocol,
             port,
             tail_and_query,
         });
-        request.headers_mut().remove("x-adx-affinity-key");
         Ok(())
     }
 }
@@ -518,7 +452,6 @@ async fn read_body(body: hyper::body::Incoming) -> Result<Bytes, Error> {
 #[derive(Clone)]
 struct SelectionRetry {
     scope: Scope,
-    affinity: Option<String>,
     protocol: Protocol,
     port: u16,
     tail_and_query: String,

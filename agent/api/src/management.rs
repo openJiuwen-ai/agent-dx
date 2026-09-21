@@ -73,11 +73,18 @@ pub struct Created {
     pub instance_id: String,
 }
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InlinePhase {
+    Creating,
+    Ready,
+    Failed,
+}
+#[derive(Debug, Serialize)]
 pub struct Detail {
     pub instance_id: String,
     pub status_code: i32,
     pub status: String,
-    pub phase: InstancePhase,
+    pub phase: InlinePhase,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status_msg: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -211,10 +218,10 @@ impl InlineService {
                 .ok_or(Error::NotFound)?;
         Self::validate_observation(tenant, id, &observed)?;
         let (status_code, status, phase) = match observed.phase {
-            SandboxPhase::Creating => (2, "CREATING", InstancePhase::Creating),
-            SandboxPhase::Running if observed.ready => (3, "RUNNING", InstancePhase::Ready),
-            SandboxPhase::Running => (2, "CREATING", InstancePhase::Creating),
-            SandboxPhase::Failed => (4, "FAILED", InstancePhase::Failed),
+            SandboxPhase::Creating => (2, "CREATING", InlinePhase::Creating),
+            SandboxPhase::Running if observed.ready => (3, "RUNNING", InlinePhase::Ready),
+            SandboxPhase::Running => (2, "CREATING", InlinePhase::Creating),
+            SandboxPhase::Failed => (4, "FAILED", InlinePhase::Failed),
             SandboxPhase::Deleted => return Err(Error::NotFound),
         };
         Ok(Detail {

@@ -28,20 +28,4 @@ impl Repository for MemoryRepository {
         }
         Ok(true)
     }
-    async fn scan(&self, kind: &str, cursor: u64, count: u32) -> Result<Page> {
-        validate_scan(kind, count)?;
-        let records = self.records.lock().await;
-        let keys: Vec<_> = records
-            .keys()
-            .filter(|k| k.as_str().starts_with(&format!("{kind}:")))
-            .collect();
-        let start = usize::try_from(cursor)
-            .unwrap_or(usize::MAX)
-            .min(keys.len());
-        let end = start.saturating_add(count as usize).min(keys.len());
-        Ok(Page {
-            cursor: if end == keys.len() { 0 } else { end as u64 },
-            keys: keys[start..end].iter().map(|k| (*k).clone()).collect(),
-        })
-    }
 }

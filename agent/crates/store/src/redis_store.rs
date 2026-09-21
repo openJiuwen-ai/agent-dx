@@ -31,11 +31,11 @@ struct ConnectionState {
 
 #[derive(Clone)]
 pub struct RedisRepository {
-    pub(crate) client: redis::Client,
+    client: redis::Client,
     connection: std::sync::Arc<tokio::sync::Mutex<ConnectionState>>,
     budget: std::sync::Arc<tokio::sync::Semaphore>,
-    pub(crate) prefix: String,
-    pub(crate) timeout: Duration,
+    prefix: String,
+    timeout: Duration,
 }
 impl RedisRepository {
     pub async fn connect(url: &str, namespace: &str, timeout: Duration) -> Result<Self> {
@@ -79,7 +79,7 @@ impl RedisRepository {
         Ok(repository)
     }
     async fn check_schema(&self) -> Result<()> {
-        const SCHEMA: &str = "session-affinity";
+        const SCHEMA: &str = "environment-v1";
         let key = format!("{}schema", self.prefix);
         let mut set = redis::cmd("SET");
         set.arg(&key).arg(SCHEMA).arg("NX");
@@ -99,7 +99,7 @@ impl RedisRepository {
     }
 
     /// Reconnect for a subsequent call, but NEVER replay a command whose result is unknown.
-    pub(crate) async fn execute<T: redis::FromRedisValue>(
+    async fn execute<T: redis::FromRedisValue>(
         &self,
         command: redis::Cmd,
         write: bool,
@@ -186,26 +186,5 @@ impl Repository for RedisRepository {
                 "unexpected transaction result".into(),
             )),
         }
-    }
-    async fn scan(&self, kind: &str, cursor: u64, count: u32) -> Result<Page> {
-        validate_scan(kind, count)?;
-        let mut command = redis::cmd("SCAN");
-        command
-            .arg(cursor)
-            .arg("MATCH")
-            .arg(format!("{}{kind}:*", self.prefix))
-            .arg("COUNT")
-            .arg(count);
-        let (cursor, keys): (u64, Vec<String>) = self.execute(command, false).await?;
-        let keys = keys
-            .iter()
-            .map(|key| {
-                let local = key
-                    .strip_prefix(&self.prefix)
-                    .ok_or_else(|| Error::Corrupt("scan escaped namespace".into()))?;
-                Key::from_scan(local)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        Ok(Page { cursor, keys })
     }
 }

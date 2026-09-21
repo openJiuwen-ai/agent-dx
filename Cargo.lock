@@ -9,12 +9,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
-name = "adx-agent-api"
+name = "adx-activator"
 version = "0.1.0"
 dependencies = [
  "adx-agent-core",
  "adx-agent-store",
- "adx-dispatcher",
+ "async-trait",
+ "axum",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "adx-agent-api"
+version = "0.1.0"
+dependencies = [
+ "adx-activator",
+ "adx-agent-core",
+ "adx-agent-store",
  "async-trait",
  "axum",
  "reqwest 0.12.28",
@@ -117,23 +131,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
-]
-
-[[package]]
-name = "adx-dispatcher"
-version = "0.1.0"
-dependencies = [
- "adx-agent-core",
- "adx-agent-store",
- "async-trait",
- "axum",
- "futures-util",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "sha2",
- "tokio",
- "uuid",
 ]
 
 [[package]]
@@ -757,6 +754,7 @@ checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
 name = "data-plane-gateway"
 version = "0.1.0"
 dependencies = [
+ "adx-activator",
  "adx-agent-api",
  "adx-agent-core",
  "adx-agent-store",

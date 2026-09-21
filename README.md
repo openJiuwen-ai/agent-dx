@@ -6,7 +6,7 @@
 
 <p align="center"><strong>English</strong> | <a href="README.zh.md">中文</a></p>
 
-Agent DX (**Agent Distributed eXecutor**) is a distributed execution substrate for openJiuwen Agent Runtime. It hosts developer-facing capabilities such as agent registration, invocation, and session management. It also provides a public Sandbox API and SDK, distributed scheduling, isolated execution, traffic routing, runtime operations, checkpoint recovery, and deployment tooling, while keeping the execution backend replaceable.
+Agent DX (**Agent Distributed eXecutor**) is a distributed execution substrate for openJiuwen Agent Runtime. Its Agent layer provides Template and Environment management, with stateless Activators starting user Harnesses on demand for HTTP, WebSocket, and SSH access. It also provides a public Sandbox API and SDK, distributed scheduling, isolated execution, traffic routing, runtime operations, checkpoint recovery, and deployment tooling, while keeping the execution backend replaceable.
 
 <p align="center">
   <a href="#-quick-start">🚀 Quick start</a> ·
@@ -127,6 +127,7 @@ ADX separates stable logical identity from replaceable execution:
 
 | Abstraction | Meaning and boundary |
 |---|---|
+| `Environment` | Agent execution context bound 1:1 to a stable logical Sandbox; managed through stateless Activators |
 | `Sandbox` | Public API and SDK handle presented to applications |
 | `Capsule` | Stable internal identity containing tenant, specification, lifecycle, and desired/observed state |
 | `Runtime` | One concrete sandboxd execution of a Capsule on one node; restart or recovery may replace it |
