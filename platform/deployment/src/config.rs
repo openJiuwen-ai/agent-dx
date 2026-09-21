@@ -383,9 +383,13 @@ impl Deployment {
                 let mode = edge_process_mode(service, edge.is_some())?;
                 if mode == EdgeProcessMode::Embedded {
                     let edge = edge.ok_or("embedded Edge requires an edge service declaration")?;
-                    if service.env.keys().any(|key| edge.env.contains_key(key)) {
+                    if service.env.iter().any(|(key, value)| {
+                        edge.env
+                            .get(key)
+                            .is_some_and(|edge_value| edge_value != value)
+                    }) {
                         return Err(
-                            "embedded Edge and API Server environment keys must be unique".into(),
+                            "embedded Edge and API Server environment values conflict".into()
                         );
                     }
                 }

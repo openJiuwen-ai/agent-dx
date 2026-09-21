@@ -285,6 +285,38 @@ fn edge_api_profile_embeds_edge_in_api_server_by_default() {
 }
 
 #[test]
+fn embedded_edge_accepts_identical_shared_environment_and_rejects_conflicts() {
+    let mut deployment: Deployment = serde_saphyr::from_str(include_str!(
+        "../../../build/config/examples/deployment-edge-api.yaml"
+    ))
+    .unwrap();
+    let api = deployment
+        .services
+        .iter_mut()
+        .find(|service| service.role == Role::ApiServer)
+        .unwrap();
+    api.env.insert("RUST_LOG".into(), "info".into());
+    let edge = deployment
+        .services
+        .iter_mut()
+        .find(|service| service.role == Role::Edge)
+        .unwrap();
+    edge.env.insert("RUST_LOG".into(), "info".into());
+
+    deployment.validate().unwrap();
+
+    deployment
+        .services
+        .iter_mut()
+        .find(|service| service.role == Role::Edge)
+        .unwrap()
+        .env
+        .insert("RUST_LOG".into(), "debug".into());
+    let error = deployment.validate().unwrap_err().to_string();
+    assert!(error.contains("conflict"), "unexpected error: {error}");
+}
+
+#[test]
 fn edge_api_profile_can_render_explicit_standalone_edge() {
     let root = tempfile::tempdir().unwrap();
     let mut deployment: Deployment = serde_saphyr::from_str(include_str!(
