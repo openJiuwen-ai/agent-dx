@@ -158,6 +158,17 @@ class KubernetesLifecycleTests(unittest.TestCase):
         self.assertIn('ADX_E2E_PROFILE:-k8s-basic',script)
         self.assertNotIn('docker ',script)
 
+    def test_pipeline_can_reuse_an_exact_prior_image_build(self):
+        repository=ROOT.parents[1]
+        script=(repository/'.buildkite/run-e2e.sh').read_text()
+        pipeline=(repository/'.buildkite/pipeline.yml').read_text()
+        summary=(repository/'.buildkite/summary.py').read_text()
+        self.assertIn('ADX_E2E_ARTIFACT_BUILD',script)
+        self.assertIn('ADX_E2E_ARTIFACT_COMMIT',script)
+        self.assertIn('--build "$artifact_build"',script)
+        self.assertIn('build.env("ADX_E2E_ARTIFACT_BUILD") == null',pipeline)
+        self.assertIn("os.environ.get('ADX_E2E_ARTIFACT_COMMIT'",summary)
+
     def test_full_profile_requires_two_distinct_physical_workers(self):
         same = [
             {'pod': 'node1', 'host': 'worker-a', 'ip': '10.0.0.1'},

@@ -106,6 +106,14 @@ gate. `full` fails after scheduling when both platform Pods land on the same
 worker. `ADX_E2E_NODE_NAMES` may restrict eligible workers, but the recorded
 actual placement remains the acceptance evidence.
 
+To rerun acceptance against an already published immutable image bundle, set
+both `ADX_E2E_ARTIFACT_BUILD` to the source Buildkite build UUID and
+`ADX_E2E_ARTIFACT_COMMIT` to that bundle's 40-character product commit. The
+release and image jobs are skipped; the E2E job downloads the source build's
+`platform-images` manifests, verifies their bundle digest and product commit,
+and deploys the recorded image digests. A build number or an unpaired commit is
+rejected.
+
 Capacity checks also save Master/Node resource scrapes at allocated, queued and
 released points. The unified supervisor runs with log rotation enabled in both
 Pods. Stop checks decompress the closed gzip files, reject unfinished compression

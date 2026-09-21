@@ -48,7 +48,7 @@ steps:
           hostPath:
             path: /mnt/paas
             type: DirectoryOrCreate
-  if: build.env("ADX_COLLECTOR_SYNC_ONLY") != "1"
+  if: build.env("ADX_COLLECTOR_SYNC_ONLY") != "1" && build.env("ADX_E2E_ARTIFACT_BUILD") == null
 - label: ':cloud: Upload ADX artifacts to OBS'
   key: platform-obs
   depends_on: platform-build
@@ -92,7 +92,7 @@ steps:
                 name: obs-credentials
                 key: SK
                 optional: false
-  if: build.env("ADX_COLLECTOR_SYNC_ONLY") != "1" && build.env("ADX_OBS_UPLOAD") == "1"
+  if: build.env("ADX_COLLECTOR_SYNC_ONLY") != "1" && build.env("ADX_OBS_UPLOAD") == "1" && build.env("ADX_E2E_ARTIFACT_BUILD") == null
 - label: ':docker: Publish ADX images'
   key: platform-images
   depends_on: platform-build
@@ -150,7 +150,7 @@ steps:
         volumes:
         - name: docker-graph
           emptyDir: {}
-  if: build.env("ADX_COLLECTOR_SYNC_ONLY") != "1" && build.env("ADX_BASE_ONLY") != "1"
+  if: build.env("ADX_COLLECTOR_SYNC_ONLY") != "1" && build.env("ADX_BASE_ONLY") != "1" && build.env("ADX_E2E_ARTIFACT_BUILD") == null
 - label: ':kubernetes: Kubernetes E2E (Sandbox SDK)'
   key: platform-e2e
   depends_on: platform-images
@@ -186,7 +186,7 @@ steps:
 - label: ':kubernetes: Firecracker checkpoint + snapshots + faults'
   key: platform-fc-e2e
   if: build.env("ADX_COLLECTOR_SYNC_ONLY") != "1" && build.env("ADX_BASE_ONLY") != "1"
-    && (build.env("ADX_E2E_CHECKPOINT") == "1")
+    && build.env("ADX_E2E_ARTIFACT_BUILD") == null && (build.env("ADX_E2E_CHECKPOINT") == "1")
   depends_on: platform-images
   agents:
     queue: default

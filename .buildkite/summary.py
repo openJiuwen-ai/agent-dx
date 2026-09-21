@@ -129,7 +129,9 @@ def main():
     parser.add_argument('--exit-code', type=int, required=True)
     parser.add_argument('--root', type=Path, default=Path('out/buildkite'))
     args = parser.parse_args()
-    result = collect(args.root, args.stage, args.exit_code, os.environ['BUILDKITE_COMMIT'])
+    commit = (os.environ.get('ADX_E2E_ARTIFACT_COMMIT', os.environ['BUILDKITE_COMMIT'])
+              if args.stage == 'e2e' else os.environ['BUILDKITE_COMMIT'])
+    result = collect(args.root, args.stage, args.exit_code, commit)
     output = args.root / 'summaries'
     output.mkdir(parents=True, exist_ok=True)
     (output / f'{args.stage}.json').write_text(json.dumps(result, indent=2) + '\n')
