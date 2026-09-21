@@ -41,7 +41,8 @@ class ReleaseArchiveTests(unittest.TestCase):
             self.assertTrue((restored/'LICENSE').is_file())
             self.assertTrue((restored/'bin/adx-master').stat().st_mode & 0o111)
             self.assertTrue((restored/'etc/examples/deployment.yaml').is_file())
-            self.assertTrue((restored/'third_party/sandboxd/patches/0001-use-nydus-s3-backend.patch').is_file())
+            self.assertTrue((restored/'third_party/sandboxd/source.json').is_file())
+            self.assertFalse((restored/'third_party/sandboxd/patches').exists())
 
     def test_python_bytecode_does_not_dirty_build_sources(self):
         with tempfile.TemporaryDirectory() as temp:

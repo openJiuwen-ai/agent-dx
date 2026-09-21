@@ -497,7 +497,7 @@ pub fn start_request(
     if options.inherit_entrypoint {
         envs.insert(
             "ADX_IMAGE_PROCESS_CONFIG".into(),
-            "/run/adx/image-process.json".into(),
+            "/etc/adx-image-process.json".into(),
         );
     }
     let cpu_limit = options.limits.cpu_millis.max(spec.resources.cpu_millis);
@@ -567,7 +567,7 @@ pub fn start_request(
             .as_ref()
             .map(|policy| sandbox_network_policy(policy, &options.ports)),
         inject_entrypoint: if options.inherit_entrypoint {
-            "/run/adx/image-process.json".into()
+            "/etc/adx-image-process.json".into()
         } else {
             String::new()
         },

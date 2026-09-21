@@ -8,12 +8,11 @@ spec=importlib.util.spec_from_file_location('backend_builder',Path(__file__).res
 backend=importlib.util.module_from_spec(spec);spec.loader.exec_module(backend)
 
 class ReleaseChecksumTests(unittest.TestCase):
-    def test_firecracker_guest_agent_is_a_content_addressed_backend_artifact(self):
-        self.assertIn('firecracker-initrd', backend.SANDBOXD_BUILD_TARGETS)
-        self.assertEqual(
-            backend.SANDBOXD_OUTPUTS['firecracker-initrd.img'],
-            'initrd.img',
-        )
+    def test_backend_build_does_not_patch_sandboxd(self):
+        pinned=json.loads((backend.ROOT/'third_party/sandboxd/source.json').read_text())
+        self.assertNotIn('patches',pinned)
+        self.assertNotIn('firecracker-initrd',backend.SANDBOXD_BUILD_TARGETS)
+        self.assertNotIn('firecracker-initrd.img',backend.SANDBOXD_OUTPUTS)
 
     def test_blank_lines_comments_and_other_architectures(self):
         digest='a'*64
@@ -23,13 +22,6 @@ class ReleaseChecksumTests(unittest.TestCase):
         for manifest in ('\n','bad  runc.amd64\n',('a'*64+'  runc.amd64\n')*2):
             with self.subTest(manifest=manifest), self.assertRaises(ValueError):
                 backend.release_checksum(manifest,'runc.amd64')
-
-    def test_pinned_patches_are_content_addressed(self):
-        pinned=json.loads((backend.ROOT/'third_party/sandboxd/source.json').read_text())
-        self.assertEqual(
-            backend.pinned_patches(pinned),
-            {entry['path']:entry['sha256'] for entry in pinned['patches']},
-        )
 
     def test_pinned_source_fetch_retries_from_a_clean_directory(self):
         with tempfile.TemporaryDirectory() as tmp:

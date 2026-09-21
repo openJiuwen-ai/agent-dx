@@ -18,14 +18,12 @@ SANDBOXD_BUILD_TARGETS = (
     'release-cli',
     'runc-shim',
     'sandbox-logger',
-    'firecracker-initrd',
 )
 SANDBOXD_OUTPUTS = {
     'sandboxd': 'sandboxd',
     'sbox': 'sbox',
     'runc-shim': 'runc-shim',
     'sandbox-logger': 'sandbox-logger',
-    'firecracker-initrd.img': 'initrd.img',
 }
 def run(args,**kw):return subprocess.check_output(list(map(str,args)),text=True,**kw).strip()
 def sha(p):return hashlib.sha256(p.read_bytes()).hexdigest()
@@ -65,15 +63,6 @@ def fetch_pinned_source(source, repository, revision, *, attempts=3, command=run
             )
             sleeper(delay)
 
-def pinned_patches(pinned):
-    patches={}
-    for entry in pinned.get('patches',[]):
-        path=ROOT/entry['path']
-        if not path.is_file() or sha(path)!=entry['sha256']:
-            raise ValueError('sandboxd patch integrity mismatch: '+entry['path'])
-        patches[entry['path']]=entry['sha256']
-    return patches
-
 def main():
     p=argparse.ArgumentParser();p.add_argument('--output',type=Path,required=True);p.add_argument('--source',type=Path);p.add_argument('--redis-cli',type=Path,required=True);p.add_argument('--jobs',type=int,default=2);a=p.parse_args()
     if platform.system()!='Linux' or a.jobs<1:raise ValueError('native Linux builder and positive jobs required')
@@ -89,10 +78,6 @@ def main():
         if run(['git','-C',source,'rev-parse','HEAD'])!=pinned['revision'] or run(['git','-C',source,'status','--porcelain']):raise ValueError('sandboxd source must match the clean pinned revision')
         for file in pinned['files']:
             if sha(source/file['source'])!=file['sha256']:raise ValueError('sandboxd source integrity mismatch')
-        patches=pinned_patches(pinned)
-        for patch in patches:
-            subprocess.run(['git','-C',source,'apply','--check',ROOT/patch],check=True)
-            subprocess.run(['git','-C',source,'apply',ROOT/patch],check=True)
         env={**os.environ,'GOFLAGS':'-p='+str(a.jobs),'GOMAXPROCS':str(a.jobs)}
         subprocess.run(
             ['make', 'RELEASE_GOARCH='+arch, *SANDBOXD_BUILD_TARGETS],
@@ -117,5 +102,5 @@ def main():
         if '7.2.5' not in run([a.redis_cli.resolve(),'--version']):raise ValueError('Redis CLI version mismatch')
         shutil.copy2(a.redis_cli,a.output/'redis-cli')
         files={p.name:sha(p) for p in a.output.iterdir() if p.is_file()}
-        (a.output/'manifest.json').write_text(json.dumps({'sandboxd_revision':pinned['revision'],'sandboxd_patches':patches,'target':target,'runc_version':versions['RUNC_VERSION'],'files':files},indent=2)+'\n')
+        (a.output/'manifest.json').write_text(json.dumps({'sandboxd_revision':pinned['revision'],'target':target,'runc_version':versions['RUNC_VERSION'],'files':files},indent=2)+'\n')
 if __name__=='__main__':main()
