@@ -114,6 +114,14 @@ release and image jobs are skipped; the E2E job downloads the source build's
 and deploys the recorded image digests. A build number or an unpaired commit is
 rejected.
 
+CI worker prerequisites are changed only by the explicit maintenance mode
+`ADX_K8S_NODE_PREPARE_ONLY=1`. It also requires the exact comma-separated
+`ADX_K8S_PREPARE_NODE_NAMES` and an immutable source image build through
+`ADX_E2E_ARTIFACT_BUILD`. The maintenance Pod is pinned to each named node,
+loads `br_netfilter`, writes the modules-load and sysctl configuration under the
+host `/etc`, verifies `net.bridge.bridge-nf-call-iptables=1`, and then removes
+its isolated namespace. Ordinary builds and E2E runs never mutate host settings.
+
 Capacity checks also save Master/Node resource scrapes at allocated, queued and
 released points. The unified supervisor runs with log rotation enabled in both
 Pods. Stop checks decompress the closed gzip files, reject unfinished compression

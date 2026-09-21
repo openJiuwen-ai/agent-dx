@@ -22,6 +22,15 @@ class ExistingCiCredentialsTests(unittest.TestCase):
         script=(ROOT/'.buildkite/run-e2e.sh').read_text()
         self.assertIn('/var/run/yr-k8s/target/kubeconfig',script)
         self.assertIn('--step platform-images',script)
+    def test_node_preparation_is_explicit_scoped_and_persistent(self):
+        script=(ROOT/'.buildkite/prepare-k8s-node.sh').read_text()
+        pipeline=(ROOT/'.buildkite/pipeline.yml').read_text()
+        self.assertIn('ADX_K8S_PREPARE_NODE_NAMES',script)
+        self.assertIn('nodeName',script)
+        self.assertIn('hostNetwork',script)
+        self.assertIn('modules-load.d/adx-br-netfilter.conf',script)
+        self.assertIn('sysctl.d/99-adx-bridge-netfilter.conf',script)
+        self.assertIn('build.env("ADX_K8S_NODE_PREPARE_ONLY") == "1"',pipeline)
     def test_secret_file_is_private_removed_and_child_failure_is_preserved(self):
         import json,os,subprocess,sys
         env={**os.environ,'SWR_DOCKER_CONFIG_JSON':'{"auths":{"swr.example":{"auth":"fixture"}}}'}
