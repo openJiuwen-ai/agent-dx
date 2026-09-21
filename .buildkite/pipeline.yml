@@ -48,6 +48,50 @@ steps:
             path: /mnt/paas
             type: DirectoryOrCreate
   if: build.env("ADX_COLLECTOR_SYNC_ONLY") != "1"
+- label: ':cloud: Upload ADX artifacts to OBS'
+  key: platform-obs
+  depends_on: platform-build
+  agents:
+    queue: default
+    os: linux
+    arch: amd64
+  command: bash .buildkite/upload-obs.sh
+  timeout_in_minutes: 20
+  artifact_paths:
+  - out/buildkite/obs/**/*
+  - out/buildkite/logs/step-obs.log
+  env:
+    BUILDKITE_AGENT_NAME: agent-stack-k8s
+    ADX_OBS_BUCKET: openyuanrong
+    ADX_OBS_ENDPOINT: obs.cn-southwest-2.myhuaweicloud.com
+  plugins:
+  - kubernetes:
+      podSpec:
+        imagePullSecrets:
+        - name: swr-pull-secret
+        containers:
+        - image: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/compile-ubuntu2004-rust:v20260826_rust1950_musl_x86_64@sha256:13008c86d6ce56422b4591570d3b358a92d6d384100aafa41e04f5556a5d8faf
+          resources:
+            requests:
+              cpu: '1'
+              memory: 2Gi
+            limits:
+              cpu: '2'
+              memory: 4Gi
+          env:
+          - name: OBS_ACCESS_KEY_ID
+            valueFrom:
+              secretKeyRef:
+                name: obs-credentials
+                key: AK
+                optional: false
+          - name: OBS_SECRET_ACCESS_KEY
+            valueFrom:
+              secretKeyRef:
+                name: obs-credentials
+                key: SK
+                optional: false
+  if: build.env("ADX_COLLECTOR_SYNC_ONLY") != "1" && build.env("ADX_OBS_UPLOAD") == "1"
 - label: ':docker: Publish ADX images'
   key: platform-images
   depends_on: platform-build
@@ -105,7 +149,7 @@ steps:
         volumes:
         - name: docker-graph
           emptyDir: {}
-  if: build.env("ADX_COLLECTOR_SYNC_ONLY") != "1"
+  if: build.env("ADX_COLLECTOR_SYNC_ONLY") != "1" && build.env("ADX_BASE_ONLY") != "1"
 - label: ':kubernetes: Kubernetes E2E (Sandbox SDK)'
   key: platform-e2e
   depends_on: platform-images
@@ -137,11 +181,11 @@ steps:
               cpu: '4'
               memory: 8Gi
           env: *id001
-  if: build.env("ADX_COLLECTOR_SYNC_ONLY") != "1"
+  if: build.env("ADX_COLLECTOR_SYNC_ONLY") != "1" && build.env("ADX_BASE_ONLY") != "1"
 - label: ':kubernetes: Firecracker checkpoint + snapshots + faults'
   key: platform-fc-e2e
-  if: build.env("ADX_COLLECTOR_SYNC_ONLY") != "1" && (build.env("ADX_E2E_CHECKPOINT")
-    == "1")
+  if: build.env("ADX_COLLECTOR_SYNC_ONLY") != "1" && build.env("ADX_BASE_ONLY") != "1"
+    && (build.env("ADX_E2E_CHECKPOINT") == "1")
   depends_on: platform-images
   agents:
     queue: default
