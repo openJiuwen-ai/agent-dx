@@ -38,12 +38,13 @@ Stack requests/limits are: release build `4/8 CPU` and `8/16 GiB`, image publish
 `8 CPU / 16 GiB`, and the E2E deployer `2/4 CPU` and `4/8 GiB`. The target
 kubeconfig selects a second cluster where the ADX Pods are deployed.
 
-All three steps use the existing `default` queue with `os=linux`, `arch=amd64`
+All product steps use the existing `default` queue with `os=linux`, `arch=amd64`
 and the Kubernetes plugin. Worker images follow the existing CI profiles:
 
 | Step | Reused worker image |
 |---|---|
 | `platform-build` | `swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/compile-ubuntu2004-rust:v20260826_rust1950_musl_x86_64` |
+| `platform-obs` | same pinned compile image as `platform-build` |
 | `platform-images` | `swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/sandbox-packager:v20260506_kubectl` |
 | `platform-e2e` | `swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/sandbox-deployer:v20260506_kubectl_py39` |
 
@@ -166,6 +167,50 @@ image references and Kubernetes results. The summary links the release archive,
 SHA256, standalone manifest, SDK wheel, build logs, image provenance, result JSON
 and JUnit. It records actual Pod/host placement and distinguishes same-host runs.
 Failures still publish a summary and retain their original exit status.
+
+## OBS artifact publication
+
+Set `ADX_OBS_UPLOAD=1` to add the `platform-obs` step after `platform-build`.
+The step downloads the exact Buildkite artifacts produced by that build, verifies
+the release archive, package manifest and sandboxd backend bundle, and then
+uploads them to Huawei Cloud OBS. It does not rebuild any product binary.
+
+The Kubernetes worker reads `AK` and `SK` from the existing
+`obs-credentials` Secret and exposes them only as `OBS_ACCESS_KEY_ID` and
+`OBS_SECRET_ACCESS_KEY`. Credentials are not passed on argv and are not written
+to Buildkite artifacts. The pipeline pins the destination to bucket
+`openyuanrong` at `obs.cn-southwest-2.myhuaweicloud.com`; changing it requires a
+reviewed pipeline update rather than a per-build override.
+
+The default channel is `daily`:
+
+```text
+adx/daily/<UTC timestamp>-<commit12>/linux/amd64/<artifact>
+```
+
+Set `ADX_OBS_UPLOAD_CHANNEL=release` and either `ADX_RELEASE_VERSION` or a
+Buildkite tag to publish under:
+
+```text
+adx/release/<version>/linux/amd64/<artifact>
+```
+
+Each upload publishes `manifest.json` with the source commit, Buildkite build
+ID, object URL, size and SHA256 for every file. The uploader reads object
+metadata back and rejects an absent object or a size mismatch. The same manifest
+and a compact `urls.txt` are retained under `out/buildkite/obs/`; the manifest
+URL is also stored as Buildkite metadata `obs-manifest-url`.
+
+The current bridge publishes the monolithic release archive, release manifest,
+Sandbox SDK wheel and verified runc backend bundle. When the base-package and
+SDK pipelines are split, each pipeline will invoke the same uploader for its own
+independent artifacts and the final release index will reference those manifests.
+
+For a bounded base-package run, set both `ADX_BASE_ONLY=1` and
+`ADX_OBS_UPLOAD=1`. The pipeline runs `platform-build` and `platform-obs`, while
+the image publication, Kubernetes E2E and Firecracker jobs are skipped. This
+mode validates compilation, unit and contract gates, package assembly, backend
+identity and OBS publication; it is not a Full deployment acceptance result.
 
 ## Firecracker checkpoint profile
 

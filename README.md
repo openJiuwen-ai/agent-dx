@@ -186,3 +186,4 @@ The Sandbox SDK distribution is `adx-sandbox`, its Python import is `adx_sandbox
 - [Logs](docs/testing/log-collection.md)
 - [Distributed tracing](docs/testing/distributed-traces.md)
 - [Rust coding guidelines](docs/development/rust-coding-guidelines.md)
+- [Release pipelines and package layout](docs/development/release-pipelines-and-packaging.md)
