@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/logo/agent-dx-lockup.png" alt="Agent DX" width="560">
+  <img src="assets/logo/agent-dx-lockup-primary.png" alt="Agent DX" width="560">
 </p>
 
 <h3 align="center">openJiuwen Agent Runtime 的分布式执行底座</h3>
@@ -59,17 +59,17 @@ tar -xzf adx-release.tar.gz -C adx-release
 sudo ./adx-release/install.sh
 ```
 
-安装器校验清单、文件摘要和主机架构，将版本写入 `/opt/adx/releases/<commit>` 并原子切换 `/opt/adx/current`。升级会保留 `/opt/adx/config`、`/opt/adx/data` 和 `/opt/adx/run`。
+安装器校验清单、文件摘要和主机架构，将版本写入 `/opt/adx/releases/<commit>` 并原子切换 `/opt/adx/current`。升级会保留 `/opt/adx/config`、`/opt/adx/data` 和 `/opt/adx/run`，同时通过 `/usr/local/bin/adxctl` 提供可直接使用的 `adxctl` 命令。
 
 ## 🔧 快速开始
 
 默认 `standalone` profile 在一台主机启动托管 Redis、Master、内嵌 Node Proxy 的 Node Manager，以及内嵌 Edge 的 API Server。开始前先准备 sandboxd、网络、证书和初始管理员密钥。
 
 ```sh
-sudo /opt/adx/current/bin/adxctl config init --profile standalone
+sudo adxctl config init --profile standalone
 sudoedit /opt/adx/config/deployment.yaml
-sudo /opt/adx/current/bin/adxctl validate
-sudo /opt/adx/current/bin/adxctl run
+sudo adxctl validate
+sudo adxctl run
 ```
 
 在另一终端安装发布包中的 SDK，并连接公开 Gateway：
