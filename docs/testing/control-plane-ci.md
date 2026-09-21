@@ -3,7 +3,7 @@
 当前全部测试资产、分级方式和 Buildkite 阻断建议见
 [ADX 测试分层与 Buildkite 门禁](test-inventory-and-buildkite-gates.md)。
 
-当前正式验证：[Buildkite #30 OCI 运行环境、八组基础 Kubernetes、Metrics、日志与 Trace 验收](2026-09-18-runtime-environment-k8s.md)。它包含 Rust API Server、本地优先创建和自定义镜像 bootstrap；FC 按当前决策继续本地验收。
+当前独立流水线正式验证为 [基础包 #65](https://buildkite.com/agent-dx/agent-dx/builds/65)、[Python SDK #2](https://buildkite.com/agent-dx/agent-dx-python-sdk/builds/2) 与 [Full Test #2](https://buildkite.com/agent-dx/agent-dx-full-test/builds/2)。三者使用同一提交 `14f8f8daa53c642f7a4968c30c1aa86059d0fbb0`；Full 十组全部通过，两个 ADX Node 分别落在 `10.244.128.124` 和 `10.244.128.160`，无缺失用例和清理错误。FC 按当前决策继续本地验收。
 
 开发验证在本地执行，Buildkite 分为基础包、Python SDK 和 Full 三条独立流水线。Full 只消费显式指定的基础包与 SDK build UUID；`build/e2e/prepare.py` 组合并校验验收镜像，`build/e2e/kubernetes/run.py` 在目标 Kubernetes 集群部署、验收、收集并清理。真实 sandboxd、基础包内 RRT 和独立 SDK wheel 均参与执行。流水线复用现有 default/linux/amd64 队列、builder/packager/deployer、目标 kubeconfig 挂载与 SWR Secret，见 [Buildkite 说明](../../.buildkite/README.md)。本地通过不等于远端 Buildkite 已通过。
 
@@ -103,7 +103,7 @@ Full 流水线默认执行十组用例：SDK、数据面、生命周期、认证
 
 ### 接入状态
 
-`.buildkite/README.md` 保存端到端流程约定。基础包、Python SDK 和 Full 是三个独立 Buildkite pipeline；Full 内的 `platform-images` 组合固定候选，`platform-e2e` 部署 Kubernetes。Full 默认执行十组，`k8s-basic` 仅用于显式的有界诊断。运行阶段只使用指定 build UUID 的制品并验证 commit、架构及 SHA256；所选场景和环境清理全部成功后才通过。Buildkite #58 是拆分前十组 Full 的正式证据；独立流水线还需产生新的正式结果。
+`.buildkite/README.md` 保存端到端流程约定。基础包、Python SDK 和 Full 是三个独立 Buildkite pipeline；Full 内的 `platform-images` 组合固定候选，`platform-e2e` 部署 Kubernetes。Full 默认执行十组，`k8s-basic` 仅用于显式的有界诊断。运行阶段只使用指定 build UUID 的制品并验证 commit、架构及 SHA256；所选场景和环境清理全部成功后才通过。基础包 #65、SDK #2 与 Full #2 已完成拆分后的首次正式验证。
 
 本地组件测试继续用于每一步的测试驱动开发；同一套完整 E2E 驱动器也应支持在具备环境的本地机器上复现 Buildkite 失败。
 

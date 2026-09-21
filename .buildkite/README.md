@@ -14,6 +14,13 @@ preparation are isolated in `pipeline-maintenance.yml`. The Full E2E job uses a
 mounted target kubeconfig to create a unique `adx-e2e-*` namespace and deletes
 that namespace when the run finishes.
 
+The first formal split validation used one immutable commit across all three
+pipelines: [base package #65](https://buildkite.com/agent-dx/agent-dx/builds/65),
+[Python SDK #2](https://buildkite.com/agent-dx/agent-dx-python-sdk/builds/2), and
+[Full Test #2](https://buildkite.com/agent-dx/agent-dx-full-test/builds/2).
+Full passed all ten groups on two physical workers with no missing checks or
+cleanup errors.
+
 ## Deployment
 
 | Resource in the test namespace | Processes |
