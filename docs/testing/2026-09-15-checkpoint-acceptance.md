@@ -25,7 +25,7 @@
 | Firecracker fork | `v1.16.1-akernel.3`，`b9a362d1070ee17991e7388d3b53a9ccce25ecca` |
 | virtiofsd | `v1.14.0`，`c2540f8db14caba81c1e37fba23fc7bf2cd7f0dd` |
 | RRT OCI 镜像 | `sha256:c959c0b5ee25751911d362c23b76ec94682a2e632d5772b97ab834ebdd230408` |
-| Sandbox SDK / Redis | `0.10.0` / `7.2.5` |
+| Sandbox SDK / Redis | `0.1.0` / `7.2.5` |
 
 ## 证据位置
 

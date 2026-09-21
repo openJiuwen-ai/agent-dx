@@ -9,7 +9,6 @@
 #   bash build.sh [OUTDIR]   # default OUTDIR=dist
 # Env:
 #   PYTHON        python interpreter to use (default: python3)
-#   BUILD_VERSION package version supplied by the parent adx build
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -20,16 +19,7 @@ cd "${SCRIPT_DIR}"
 rm -rf build ./*.egg-info
 mkdir -p "${OUTDIR}"
 
-# Release pipelines may explicitly override the component VERSION.
-version="${ADX_RELEASE_TAG:-${BUILDKITE_TAG:-${BUILD_VERSION:-${SETUPTOOLS_SCM_PRETEND_VERSION:-}}}}"
-version="${version#refs/tags/}"
-version="${version#v}"
-if [ -n "${version}" ]; then
-	export SETUPTOOLS_SCM_PRETEND_VERSION="${version}"
-	echo "[adx-sandbox] building version ${version} -> ${OUTDIR}"
-else
-	echo "[adx-sandbox] building (version from component VERSION) -> ${OUTDIR}"
-fi
+echo "[adx-sandbox] building version from pyproject.toml -> ${OUTDIR}"
 
 # Prefer the PEP 517 'build' frontend (wheel + sdist); fall back to pip wheel
 # (wheel only) when 'build' is unavailable in the environment.

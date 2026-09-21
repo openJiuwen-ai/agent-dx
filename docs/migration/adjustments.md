@@ -3,7 +3,7 @@
 > 首次导入阶段的历史记录。后续 Rust 控制面、HTTP RRT、统一部署和 K8s 已实施；当前目录和状态见 [架构](../architecture/repository-layout.md) 与 [实施总览](../testing/control-plane-implementation.md)。以下来源、数量和当时边界保留。
 
 - Agent 包与测试目录移动；版本文件的相对路径/源码包包含规则同步调整。
-- Sandbox SDK 采用组件 VERSION，避免继承 Agent 仓的 Git tag；保留发布版本环境变量覆盖。
+- Sandbox SDK 版本由自身 `pyproject.toml` 的 `[project].version` 单一声明，不从仓库标签或发布环境变量推导。
 - Gateway、RRT 加入根 Cargo workspace。根锁文件以 Gateway 原锁为基础补充 RRT 依赖。
 - 协议文件集中到 platform/api/proto/legacy，build.rs/codegen 指向新路径。Frontend go_package 和所有本地 Go import 重写到单模块 internal 目录。
 - Go 按实际调用裁剪：保留 Sandbox HTTP handler、必要编码与实例摘要；删除整个 internal/legacy 和 runtimeapi，通过显式 backend 依赖接入后端。保留 9 条 Agent 路由，认证后透传到宿主注入的 Agent 层处理器。生成代码按脚本重建。
