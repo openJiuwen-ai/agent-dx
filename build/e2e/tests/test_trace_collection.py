@@ -4,6 +4,13 @@ import unittest
 spec=importlib.util.spec_from_file_location('telemetry_trace',Path(__file__).parents[1]/'telemetry.py')
 telemetry=importlib.util.module_from_spec(spec);spec.loader.exec_module(telemetry)
 class TraceCollectionTests(unittest.TestCase):
+    def test_embedded_edge_uses_api_process_log_service(self):
+        self.assertEqual(
+            telemetry.required_log_services('node1'),
+            {'node1','master','api','redis'},
+        )
+        self.assertNotIn('edge',telemetry.required_log_services('node1'))
+
     def test_ids_without_parent_relationship_do_not_prove_queue_propagation(self):
         rows=[{'traceId':'a','spanId':'1','parentSpanId':'0','name':'node.create_capsule','service':'adx-node-manager'},
               {'traceId':'a','spanId':'2','parentSpanId':'1','name':'capsule.queue','service':'adx-node-manager'},
