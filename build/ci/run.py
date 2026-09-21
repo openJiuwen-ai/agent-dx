@@ -18,6 +18,19 @@ ROOT = Path(__file__).resolve().parents[2]
 SUITES = ("harness", "rust", "api-server", "agent", "sandbox-sdk", "interop", "package", "storage", "control-rpc", "api-control")
 
 
+def configure_local_cargo_cache():
+    """Use the repository's shared Rust cache outside Buildkite."""
+    if os.environ.get("CARGO_TARGET_DIR") or os.environ.get("BUILDKITE") == "true":
+        return
+    helper = ROOT / "build/cache/cargo_cache.py"
+    values = json.loads(subprocess.check_output(
+        [sys.executable, str(helper), "--repo", str(ROOT), "env", "--mode", "shared", "--format", "json"],
+        text=True,
+    ))
+    for key, value in values.items():
+        os.environ.setdefault(key, value)
+
+
 def commands_for(suite, output, jobs):
     python = sys.executable
     make = ["make", f"JOBS={jobs}", f"PYTHON={python}"]
@@ -139,6 +152,7 @@ def main():
     if args.jobs < 1 or args.timeout <= 0:
         parser.error("jobs and timeout must be positive")
     os.chdir(ROOT)
+    configure_local_cargo_cache()
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
     output = (args.output or ROOT / "out/ci" / args.suite / run_id).resolve()
     commands = commands_for(args.suite, output, args.jobs)
@@ -154,7 +168,8 @@ def main():
                 "build_url": os.environ.get("BUILDKITE_BUILD_URL"),
                 "image": os.environ.get("ADX_CI_IMAGE"), "jobs": args.jobs,
                 "caches": {key: os.environ.get(key) for key in
-                           ("CARGO_TARGET_DIR", "GOCACHE", "GOMODCACHE", "PIP_CACHE_DIR")}}
+                           ("CARGO_TARGET_DIR", "CARGO_INCREMENTAL", "RUSTC_WRAPPER", "SCCACHE_DIR",
+                            "GOCACHE", "GOMODCACHE", "PIP_CACHE_DIR")}}
     if args.suite in ("storage", "control-rpc", "api-control"):
         binary = shutil.which(os.environ.get("ADX_TEST_REDIS_SERVER", "redis-server"))
         metadata["redis_binary_sha256"] = hashlib.sha256(Path(binary).read_bytes()).hexdigest() if binary else None
