@@ -58,6 +58,7 @@ def main():
   (a.output/'placement.json').write_text(json.dumps({'pod':'fc-node','host':actual['spec']['nodeName'],'ip':actual['status']['podIP'],'deployment':'kubernetes','proxy_mode':a.proxy_mode},indent=2))
   run.event('[RUN] FC/S3 public SDK checkpoint and fault cases')
   run.execute('fc-node','env','ADX_FC_PROXY_MODE='+a.proxy_mode,'ADX_E2E_RRT_IMAGE='+refs['references']['rrt'],
+   'ADX_E2E_ENTRYPOINT_IMAGE='+refs['references']['entrypoint'],
    'ADX_EXPECTED_COMMIT='+m['package']['commit'],'python3','-u','/opt/adx/e2e/firecracker/node.py','/var/lib/adx-fc-test/run',timeout=1500)
  except Exception as e:error=str(e);run.event('[FAIL] '+error)
  finally:

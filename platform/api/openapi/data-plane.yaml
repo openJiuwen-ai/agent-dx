@@ -185,6 +185,57 @@ paths:
           $ref: "#/components/responses/RuntimeError"
         default:
           $ref: "#/components/responses/RuntimeError"
+  /direct/{instanceId}/pty:
+    get:
+      tags: [Commands]
+      operationId: openPty
+      summary: Open an interactive process over a WebSocket
+      description: |
+        Upgrade to WebSocket. Binary client frames are process input and binary
+        server frames are PTY output. JSON text frames report the started and
+        exited lifecycle events; `RESIZE:<cols>:<rows>` and `STDIN_EOF` are
+        client control frames. OpenAPI does not standardize WebSocket frames,
+        so the extension records the complete framing boundary.
+      parameters:
+        - $ref: "#/components/parameters/InstanceId"
+        - name: command
+          in: query
+          required: true
+          description: One repeated query item per argv element.
+          schema: {type: array, minItems: 1, maxItems: 256, items: {type: string, minLength: 1}}
+        - name: rows
+          in: query
+          required: false
+          schema: {type: integer, minimum: 1, maximum: 65535, default: 24}
+        - name: cols
+          in: query
+          required: false
+          schema: {type: integer, minimum: 1, maximum: 65535, default: 80}
+        - name: protocol
+          in: query
+          required: false
+          schema: {type: string, const: sandbox.pty.v1}
+        - name: Upgrade
+          in: header
+          required: true
+          schema: {type: string, const: websocket}
+        - name: Connection
+          in: header
+          required: true
+          schema: {type: string}
+      responses:
+        "101":
+          description: WebSocket protocol switched.
+          x-adx-websocket:
+            upstream: /pty
+            clientBinary: stdin bytes
+            serverBinary: PTY output bytes
+            clientText: ["RESIZE:<cols>:<rows>", "STDIN_EOF"]
+            serverText: JSON lifecycle frames
+        "4XX":
+          $ref: "#/components/responses/RuntimeError"
+        default:
+          $ref: "#/components/responses/RuntimeError"
   /api/sandbox/v1/commands/watch:
     get:
       tags: [Commands]

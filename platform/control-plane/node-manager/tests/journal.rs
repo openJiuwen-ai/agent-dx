@@ -38,6 +38,7 @@ fn record(revision: u64) -> InstanceRecord {
                 disk_bytes: 0,
             },
             priority: 0,
+            sandbox: Default::default(),
         },
         assignment: Assignment {
             instance_id: "i".into(),

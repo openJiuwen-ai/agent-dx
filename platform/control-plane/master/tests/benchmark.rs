@@ -67,6 +67,7 @@ fn run(cache: usize, heterogeneous: bool) -> (Duration, SchedulingStats, Vec<Str
                 disk_bytes: 0,
             },
             scheduling: Default::default(),
+            sandbox: Default::default(),
         };
         m.submit(r).unwrap();
         let a = m.schedule(0).unwrap().unwrap();

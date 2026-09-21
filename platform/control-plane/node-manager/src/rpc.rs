@@ -320,6 +320,79 @@ impl pb::node_service_server::NodeService for NodeRpc {
             })
             .await
     }
+    async fn update_network_policy(
+        &self,
+        request: Request<pb::UpdateNetworkPolicyRequest>,
+    ) -> std::result::Result<Response<pb::InstanceResult>, Status> {
+        let trace = adx_observability::trace::Trace::rpc("node.update_network_policy", &request);
+        trace
+            .run_result(async {
+                if self.peers.authenticate(&request)? != Principal::ApiServer {
+                    return Err(Status::permission_denied(
+                        "validated API Server caller required",
+                    ));
+                }
+                let gate = self.manager.lifecycle_ready.read().await;
+                if !*gate {
+                    return Err(Status::unavailable("node is reconciling"));
+                }
+                let r = request.into_inner();
+                let assignment = r.assignment.clone();
+                let handle = self.owned_handle(assignment, r.caller.as_ref())?;
+                let policy = r
+                    .network
+                    .map(TryInto::try_into)
+                    .transpose()
+                    .map_err(status)?;
+                let result = handle
+                    .update_network_policy(policy, r.operation_id, r.expected_revision)
+                    .await
+                    .map_err(status)?;
+                {
+                    let mut instances = self
+                        .manager
+                        .instances
+                        .lock()
+                        .expect("shared state lock poisoned");
+                    if let Some((spec, owner, _)) = instances.get_mut(&result.record.spec.id) {
+                        if *owner != result.record.assignment {
+                            return Err(Status::failed_precondition("assignment changed"));
+                        }
+                        *spec = result.record.spec.clone();
+                    }
+                }
+                response(result).map_err(status)
+            })
+            .await
+    }
+    async fn reload_instance(
+        &self,
+        request: Request<pb::ReloadInstanceRequest>,
+    ) -> std::result::Result<Response<pb::InstanceResult>, Status> {
+        let trace = adx_observability::trace::Trace::rpc("node.reload_instance", &request);
+        trace
+            .run_result(async {
+                if self.peers.authenticate(&request)? != Principal::ApiServer {
+                    return Err(Status::permission_denied(
+                        "validated API Server caller required",
+                    ));
+                }
+                let gate = self.manager.lifecycle_ready.read().await;
+                if !*gate {
+                    return Err(Status::unavailable("node is reconciling"));
+                }
+                let r = request.into_inner();
+                let handle = self.owned_handle(r.assignment, r.caller.as_ref())?;
+                response(
+                    handle
+                        .reload(r.operation_id, r.expected_revision)
+                        .await
+                        .map_err(status)?,
+                )
+                .map_err(status)
+            })
+            .await
+    }
     async fn delete_instance(
         &self,
         request: Request<pb::DeleteInstanceRequest>,

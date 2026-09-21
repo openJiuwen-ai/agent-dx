@@ -17,6 +17,7 @@ fn spec(id: &str) -> InstanceSpec {
         },
         priority: 0,
         scheduling: SchedulingPolicy::default(),
+        sandbox: Default::default(),
     }
 }
 fn node(id: &str, zone: &str) -> Node {

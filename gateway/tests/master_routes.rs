@@ -10,6 +10,11 @@ fn route(id: &str) -> PublishedRoute {
         node_proxy_address: "127.0.0.1:9000".into(),
         generation: 1,
         instance_revision: 2,
+        tunnel_security_mode:
+            adx_protocol::control::DataPlaneSecurityMode::DataPlaneSecurityTlsToken as i32,
+        port_forward_security_mode:
+            adx_protocol::control::DataPlaneSecurityMode::DataPlaneSecurityTlsToken as i32,
+        forwarded_ports: vec![8080],
     }
 }
 #[test]
@@ -65,6 +70,36 @@ fn full_delta_gap_and_restart_fencing() {
     assert!(store.is_empty());
 }
 
+#[test]
+fn per_instance_security_and_declared_ports_reach_route_cache() {
+    use data_plane_gateway::common::route::{DataPlaneAuthMode, DataPlaneSecurityMode};
+    let store = Arc::new(RouteStore::new());
+    let mut consumer = RouteConsumer::new(store.clone());
+    let mut published = route("tls");
+    published.tunnel_security_mode =
+        adx_protocol::control::DataPlaneSecurityMode::DataPlaneSecurityTls as i32;
+    published.port_forward_security_mode =
+        adx_protocol::control::DataPlaneSecurityMode::DataPlaneSecurityTls as i32;
+    published.forwarded_ports = vec![8080, 9000];
+    consumer
+        .apply(RouteFrame {
+            epoch: 1,
+            revision: 1,
+            reset: true,
+            upserts: vec![published],
+            ..Default::default()
+        })
+        .unwrap();
+    let route = store.get("tls").unwrap();
+    assert_eq!(route.tunnel_security_mode, DataPlaneSecurityMode::Tls);
+    assert_eq!(route.port_forward_security_mode, DataPlaneSecurityMode::Tls);
+    assert_eq!(route.port_forward_routes.len(), 2);
+    assert!(route
+        .port_forward_routes
+        .iter()
+        .all(|route| route.auth_mode == DataPlaneAuthMode::None));
+}
+
 #[tokio::test]
 async fn stream_routes_require_auth_and_missing_cache_never_point_gets() {
     use data_plane_gateway::{
@@ -97,6 +132,36 @@ async fn stream_routes_require_auth_and_missing_cache_never_point_gets() {
         Err(ResolveError::Unavailable(_))
     ));
     assert_eq!(resolver.point_get_total(), 0);
+}
+
+#[tokio::test]
+async fn stream_only_resolver_honors_per_instance_tls_without_token() {
+    use data_plane_gateway::{
+        common::route::DataPlaneAuthMode,
+        edge::{AccessKind, EdgeRouteResolver},
+    };
+    let store = Arc::new(RouteStore::new());
+    let mut consumer = RouteConsumer::new(store.clone());
+    let mut published = route("tls");
+    published.port_forward_security_mode =
+        adx_protocol::control::DataPlaneSecurityMode::DataPlaneSecurityTls as i32;
+    published.forwarded_ports = vec![18082];
+    consumer
+        .apply(RouteFrame {
+            epoch: 1,
+            revision: 1,
+            reset: true,
+            upserts: vec![published],
+            ..Default::default()
+        })
+        .unwrap();
+
+    let resolved = EdgeRouteResolver::new(store)
+        .stream_only()
+        .resolve("tls", 18082, AccessKind::PortForwarding, "request")
+        .await
+        .unwrap();
+    assert_eq!(resolved.port_forward_auth_mode, DataPlaneAuthMode::None);
 }
 #[test]
 fn malformed_delta_is_atomic_and_does_not_replace_good_routes() {

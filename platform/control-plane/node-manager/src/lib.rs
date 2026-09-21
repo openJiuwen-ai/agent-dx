@@ -112,6 +112,17 @@ pub trait RuntimeBackend: Send + Sync {
         devices: &[DeviceAllocation],
     ) -> Result<std::net::IpAddr>;
     async fn is_running(&self, runtime_id: &str) -> Result<bool>;
+    /// Atomically replace the complete runtime network policy. `None` clears it.
+    async fn set_network_policy(
+        &self,
+        _runtime_id: &str,
+        _policy: Option<&adx_core::sandbox::NetworkPolicy>,
+        _ports: &[u16],
+    ) -> Result<()> {
+        Err(Error::Invalid(
+            "runtime does not support network policy updates".into(),
+        ))
+    }
     /// Idempotent. Success means this runtime is confirmed absent and an older
     /// in-flight start cannot materialize it later. Uncertain cleanup is an error.
     async fn remove(&self, runtime_id: &str) -> Result<()>;

@@ -25,6 +25,7 @@ fn placed(id: &str, tenant: &str, labels: &[(&str, &str)]) -> PlacedInstance {
                     .collect(),
                 ..Default::default()
             },
+            sandbox: Default::default(),
         },
     }
 }

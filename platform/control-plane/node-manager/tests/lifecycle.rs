@@ -63,6 +63,20 @@ impl RuntimeBackend for Dependencies {
     async fn remove(&self, _runtime_id: &str) -> Result<()> {
         self.event("remove")
     }
+    async fn set_network_policy(
+        &self,
+        _runtime_id: &str,
+        policy: Option<&adx_core::sandbox::NetworkPolicy>,
+        ports: &[u16],
+    ) -> Result<()> {
+        self.event(if policy.is_some() {
+            "network:set"
+        } else {
+            "network:clear"
+        })?;
+        assert_eq!(ports, [8080]);
+        Ok(())
+    }
 }
 #[async_trait]
 impl Readiness for Dependencies {
@@ -107,6 +121,7 @@ fn spec(id: &str) -> InstanceSpec {
         runtime: "runtime".into(),
         resources: resources(),
         priority: 0,
+        sandbox: Default::default(),
     }
 }
 fn assignment(id: &str) -> Assignment {
@@ -155,6 +170,68 @@ async fn create_publishes_only_after_runtime_readiness_and_route_binding() {
     instance.delete().await.unwrap();
     assert_eq!(deps.events.lock().unwrap().len(), 7);
     assert_eq!(instance.create().await.unwrap_err(), Error::Conflict);
+}
+
+#[tokio::test]
+async fn network_policy_replacement_is_serialized_and_published_idempotently() {
+    use adx_core::sandbox::{NetworkAction, NetworkPolicy, TrafficMode, TrafficPolicy};
+    let deps = Dependencies::new(false);
+    let node = node(&deps);
+    let mut value = spec("network");
+    value.sandbox.ports = vec![8080];
+    let instance = node.instance(value, assignment("network")).unwrap();
+    let created = instance.create().await.unwrap();
+    let policy = NetworkPolicy {
+        traffic: Some(TrafficPolicy {
+            ingress_default_action: NetworkAction::Deny,
+            egress_default_action: NetworkAction::Allow,
+            rules: vec![],
+            mode: TrafficMode::Stateful,
+        }),
+        dns: None,
+    };
+    let updated = instance
+        .update_network_policy(
+            Some(policy.clone()),
+            "network-a".into(),
+            created.record.revision,
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated.record.spec.sandbox.network, Some(policy));
+    assert_eq!(
+        updated.record.last_operation.as_ref().unwrap().id,
+        "network-a"
+    );
+    let replay = instance
+        .update_network_policy(
+            updated.record.spec.sandbox.network.clone(),
+            "network-a".into(),
+            created.record.revision,
+        )
+        .await
+        .unwrap();
+    assert_eq!(replay.record, updated.record);
+    let cleared = instance
+        .update_network_policy(None, "network-b".into(), updated.record.revision)
+        .await
+        .unwrap();
+    assert!(cleared.record.spec.sandbox.network.is_none());
+    let events = deps.events.lock().unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| *event == "network:set")
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| *event == "network:clear")
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]

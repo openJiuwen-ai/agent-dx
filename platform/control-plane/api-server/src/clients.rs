@@ -69,17 +69,15 @@ impl Clients {
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
         });
-        if clients.config.create_mode == crate::config::CreateMode::LocalFirst {
-            let weak = Arc::downgrade(&clients);
-            tokio::spawn(async move {
-                while let Some(clients) = weak.upgrade() {
-                    let _ = clients.watch_directory().await;
-                    clients.directory.lock().await.clear();
-                    drop(clients);
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                }
-            });
-        }
+        let weak = Arc::downgrade(&clients);
+        tokio::spawn(async move {
+            while let Some(clients) = weak.upgrade() {
+                let _ = clients.watch_directory().await;
+                clients.directory.lock().await.clear();
+                drop(clients);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        });
         Ok(clients)
     }
     async fn watch_instances(&self) -> Result<(), Status> {
@@ -151,6 +149,13 @@ impl Clients {
             client.create_instance(trace::inject(request)),
         )
         .await
+    }
+    pub async fn nodes(&self) -> Result<Vec<pb::NodeEndpoint>, Status> {
+        self.directory
+            .lock()
+            .await
+            .snapshot()
+            .ok_or_else(|| Status::unavailable("node directory unavailable"))
     }
     pub async fn master(&self) -> Result<Channel, Status> {
         let address = if let Some(discovery) = &self.discovery {

@@ -3,7 +3,10 @@ use super::{
     auth::{AuthError, AuthenticatedIdentity, CredentialVerifier},
     RouteStore,
 };
-use crate::common::route::{DataPlaneSecurityMode, InstanceStatus, RouteCache, RouteInfo};
+use crate::common::route::{
+    DataPlaneAuthMode, DataPlaneSecurityMode, InstanceStatus, PortForwardRoute, RouteCache,
+    RouteInfo,
+};
 use adx_discovery::RedisDiscovery;
 use adx_protocol::control as pb;
 use adx_protocol::tls::TlsFiles;
@@ -82,6 +85,14 @@ impl RouteConsumer {
         }
         let cache = RouteCache::default();
         for r in next.values() {
+            let tunnel_security_mode = security_mode(r.tunnel_security_mode)?;
+            let port_forward_security_mode = security_mode(r.port_forward_security_mode)?;
+            let auth_mode = match port_forward_security_mode {
+                DataPlaneSecurityMode::TlsToken => DataPlaneAuthMode::Token,
+                DataPlaneSecurityMode::Inherit | DataPlaneSecurityMode::Tls => {
+                    DataPlaneAuthMode::None
+                }
+            };
             cache.put(RouteInfo {
                 instance_id: r.instance_id.clone(),
                 tenant_id: r.tenant_id.clone(),
@@ -92,9 +103,21 @@ impl RouteConsumer {
                     code: 3,
                     ..Default::default()
                 },
-                tunnel_security_mode: DataPlaneSecurityMode::TlsToken,
-                port_forward_security_mode: DataPlaneSecurityMode::TlsToken,
-                port_forward_routes: vec![],
+                tunnel_security_mode,
+                port_forward_security_mode,
+                port_forward_routes: r
+                    .forwarded_ports
+                    .iter()
+                    .map(|port| {
+                        Ok(PortForwardRoute {
+                            target_port: u16::try_from(*port)
+                                .ok()
+                                .filter(|port| *port > 0)
+                                .ok_or("invalid forwarded port")?,
+                            auth_mode,
+                        })
+                    })
+                    .collect::<Result<_, &str>>()?,
             });
         }
         self.store.replace(cache);
@@ -103,6 +126,18 @@ impl RouteConsumer {
         self.cursor = Some((f.epoch, f.revision));
         self.routes = next;
         Ok(())
+    }
+}
+fn security_mode(value: i32) -> Result<DataPlaneSecurityMode, String> {
+    match pb::DataPlaneSecurityMode::try_from(value) {
+        Ok(pb::DataPlaneSecurityMode::DataPlaneSecurityInherit) => {
+            Ok(DataPlaneSecurityMode::Inherit)
+        }
+        Ok(pb::DataPlaneSecurityMode::DataPlaneSecurityTls) => Ok(DataPlaneSecurityMode::Tls),
+        Ok(pb::DataPlaneSecurityMode::DataPlaneSecurityTlsToken) => {
+            Ok(DataPlaneSecurityMode::TlsToken)
+        }
+        Err(_) => Err("invalid data-plane security mode".into()),
     }
 }
 #[derive(Deserialize)]

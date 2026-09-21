@@ -51,6 +51,7 @@ fn submit(
         lifecycle: Default::default(),
         env: Default::default(),
         scheduling: Default::default(),
+        sandbox: Default::default(),
     };
     let shard = master.submit(request.clone()).unwrap();
     assert_eq!(shard, *serial % DOMAINS, "Global must rotate Domains");

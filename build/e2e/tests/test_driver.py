@@ -11,11 +11,21 @@ driver = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(driver)
 
 class AcceptanceGateTests(unittest.TestCase):
+    def test_entrypoint_fixture_outlives_instance_startup(self):
+        source=(ROOT/'prepare.py').read_text()
+        self.assertIn('sleep 30; echo adx-entrypoint-stderr',source)
+        self.assertNotIn('sleep 5; echo adx-entrypoint-stderr',source)
+
     def test_profiles_separate_l0_from_standalone_and_full(self):
         self.assertEqual(driver.required_for_profile('l0'), ('l0', 'auth'))
         self.assertEqual(
             set(driver.required_for_profile('standalone')),
-            {'sdk', 'auth', 'capacity', 'placement', 'local-first', 'node-failure', 'restart', 'stop'},
+            {'sdk', 'data-plane', 'lifecycle', 'auth', 'capacity', 'placement',
+             'local-first', 'node-failure', 'restart', 'stop'},
+        )
+        self.assertEqual(
+            driver.required_for_profile('k8s-basic'),
+            ('sdk', 'auth', 'capacity', 'placement', 'local-first'),
         )
         self.assertEqual(driver.required_for_profile('full'), driver.required_for_profile('standalone'))
         with self.assertRaisesRegex(ValueError, 'unknown E2E profile'):
@@ -25,6 +35,15 @@ class AcceptanceGateTests(unittest.TestCase):
         report = driver.finish_report(None, [], ['l0', 'auth'], driver.required_for_profile('l0'))
         self.assertEqual(report['status'], 'passed')
         self.assertEqual(report['required_checks'], ['l0', 'auth'])
+
+    def test_k8s_basic_excludes_extended_and_fault_scenarios(self):
+        required = driver.required_for_profile('k8s-basic')
+        report = driver.finish_report(None, [], list(required), required)
+        self.assertEqual(report['status'], 'passed')
+        self.assertEqual(report['missing_checks'], [])
+        self.assertTrue(
+            {'data-plane', 'lifecycle', 'node-failure', 'restart', 'stop'}.isdisjoint(required)
+        )
 
     def test_junit_reports_each_required_case_and_cleanup(self):
         report = driver.finish_report(None, [], ['l0'], driver.required_for_profile('l0'))
@@ -37,6 +56,56 @@ class AcceptanceGateTests(unittest.TestCase):
                          ['l0', 'auth', 'cleanup'])
         self.assertEqual(suite.attrib['tests'], '3')
         self.assertEqual(suite.attrib['skipped'], '1')
+
+    def test_sdk_subcases_are_extracted_and_reported_individually(self):
+        output = '\n'.join([
+            'ordinary log output',
+            json.dumps({
+                'status': 'passed',
+                'cases': [
+                    {'id': 'command.foreground', 'status': 'passed', 'seconds': 0.2},
+                    {'id': 'filesystem.copy', 'status': 'passed', 'seconds': 0.4},
+                ],
+            }),
+            '[SCENARIO COMPLETE] data-plane',
+        ])
+        subcases = driver.sdk_subcases_from_output(output)
+        self.assertEqual(
+            [case['id'] for case in subcases],
+            ['command.foreground', 'filesystem.copy'],
+        )
+        report = driver.finish_report(None, [], ['data-plane'], ('data-plane',))
+        report['cases'] = [{
+            'name': 'data-plane',
+            'status': 'passed',
+            'seconds': 1.0,
+            'subcases': subcases,
+        }]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'junit.xml'
+            driver.write_junit(path, report)
+            suite = ET.parse(path).getroot()
+        self.assertEqual(
+            [case.attrib['name'] for case in suite.findall('testcase')],
+            ['data-plane/command.foreground', 'data-plane/filesystem.copy', 'cleanup'],
+        )
+        self.assertEqual(suite.attrib['tests'], '3')
+
+    def test_placement_boolean_cases_are_extracted(self):
+        output = json.dumps({
+            'status': 'passed',
+            'cases': [
+                {'name': 'instance affinity OR', 'passed': True},
+                {'name': 'reverse instance anti-affinity', 'passed': True},
+            ],
+        })
+        self.assertEqual(
+            driver.sdk_subcases_from_output(output),
+            [
+                {'id': 'instance affinity OR', 'status': 'passed', 'seconds': 0.0},
+                {'id': 'reverse instance anti-affinity', 'status': 'passed', 'seconds': 0.0},
+            ],
+        )
 
     def test_cleanup_failure_cannot_pass(self):
         report = driver.finish_report(None, ['container remains'], ['sdk', 'auth', 'capacity', 'restart', 'stop'])
@@ -52,15 +121,28 @@ class AcceptanceGateTests(unittest.TestCase):
         self.assertEqual(driver.finish_report(None, [], ['sdk'])['status'], 'failed')
 
     def test_complete_clean_run_passes(self):
-        self.assertEqual(driver.finish_report(None, [], ['sdk', 'auth', 'capacity', 'placement', 'local-first', 'node-failure', 'restart', 'stop'])['status'], 'passed')
+        self.assertEqual(driver.finish_report(None, [], [
+            'sdk', 'data-plane', 'lifecycle', 'auth', 'capacity', 'placement',
+            'local-first', 'node-failure', 'restart', 'stop'])['status'], 'passed')
+
+    def test_old_eight_scenarios_without_functional_data_plane_cannot_pass(self):
+        report = driver.finish_report(None, [], [
+            'sdk', 'auth', 'capacity', 'placement', 'local-first',
+            'node-failure', 'restart', 'stop'])
+        self.assertEqual(report['status'], 'failed')
+        self.assertEqual(report['missing_checks'], ['data-plane', 'lifecycle'])
 
     def test_missing_node_failure_scenario_cannot_pass(self):
-        report = driver.finish_report(None, [], ['sdk', 'auth', 'capacity', 'placement', 'local-first', 'restart', 'stop'])
+        report = driver.finish_report(None, [], ['sdk', 'data-plane', 'lifecycle',
+                                                'auth', 'capacity', 'placement',
+                                                'local-first', 'restart', 'stop'])
         self.assertEqual(report['status'], 'failed')
         self.assertEqual(report['missing_checks'], ['node-failure'])
 
     def test_old_seven_scenarios_without_local_first_cannot_pass(self):
-        report = driver.finish_report(None, [], ['sdk', 'auth', 'capacity', 'placement', 'node-failure', 'restart', 'stop'])
+        report = driver.finish_report(None, [], ['sdk', 'data-plane', 'lifecycle',
+                                                'auth', 'capacity', 'placement',
+                                                'node-failure', 'restart', 'stop'])
         self.assertEqual(report['status'], 'failed')
         self.assertEqual(report['missing_checks'], ['local-first'])
 
@@ -83,6 +165,26 @@ class AcceptanceGateTests(unittest.TestCase):
             p=Path(d);(p/'images.tar').write_bytes(b'changed')
             (p/'bundle.json').write_text(json.dumps({'schema_version':1,'archive_sha256':'0'*64}))
             with self.assertRaises(ValueError):driver.verify_bundle(p)
+
+    def test_complete_bundle_requires_node_rrt_and_entrypoint_archives(self):
+        with tempfile.TemporaryDirectory() as d:
+            p=Path(d)
+            for name,payload in (
+                ('images.tar',b'node'),('rrt.tar',b'rrt'),
+                ('entrypoint.tar',b'entrypoint'),
+            ):
+                (p/name).write_bytes(payload)
+            manifest={
+                'schema_version':1,
+                'archive_sha256':driver.sha(p/'images.tar'),
+                'rrt_archive_sha256':driver.sha(p/'rrt.tar'),
+                'entrypoint_archive_sha256':driver.sha(p/'entrypoint.tar'),
+            }
+            (p/'bundle.json').write_text(json.dumps(manifest))
+            self.assertEqual(driver.verify_bundle(p),manifest)
+            (p/'entrypoint.tar').write_bytes(b'replaced')
+            with self.assertRaisesRegex(ValueError,'entrypoint'):
+                driver.verify_bundle(p)
 
     def test_makefile_has_separate_local_and_kubernetes_profile_defaults(self):
         makefile = (ROOT.parents[1] / 'Makefile').read_text()

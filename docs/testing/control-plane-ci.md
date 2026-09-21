@@ -84,7 +84,9 @@ export PIP_CACHE_DIR=/your/cache/pip
 
 ### 3. 公共 SDK 执行用例
 
-基础门禁包含八组用例：SDK 创建／命令／文件／删除、API Key 与租户隔离、资源不足与释放后重新调度、双节点放置约束、本地优先创建与同 ID 并发收敛、心跳超时与恢复清理、Node Manager 进程重启、supervisor 停机清理。放置组检查实例亲和 OR、实例反亲和、加权与有序节点偏好、每个 OR 分支的 node_id 约束及反向实例反亲和，并比对实际节点归属。业务操作使用公共 SDK；管理查询、只读状态检查和受控故障注入用于验证内部结果，不替代真实调用链。
+默认 `k8s-basic` 门禁包含五组有界用例：SDK 创建／命令／文件／删除、API Key 与租户隔离、资源不足与释放后重新调度、双节点放置约束，以及本地优先创建与同 ID 并发收敛。放置组检查实例亲和 OR、实例反亲和、加权与有序节点偏好、每个 OR 分支的 node_id 约束及反向实例反亲和，并比对实际节点归属。业务操作使用公共 SDK；管理查询和只读状态检查用于验证内部结果，不替代真实调用链。
+
+完整数据面资源发现／重连／PTY／端口转发、detached／空闲回收生命周期、心跳超时与恢复清理、Node Manager 重启和 supervisor 停机清理放在本地 `standalone` 与 K8s `full`。这些场景包含固定等待、故障注入或完整停机，保留为完整验收门禁，不进入每次提交的基础路径。
 
 容量组新增Metrics核对：实际抓取Master和两个Node Manager，验证满载实例数量/分配量、排队请求及删除后的释放，保存原始指标证据。
 
@@ -100,7 +102,7 @@ export PIP_CACHE_DIR=/your/cache/pip
 
 ### 接入状态
 
-`.buildkite/README.md` 保存端到端流程约定。基础流水线有三个独立步骤：`platform-build` 构建与交接发布包，`platform-images` 发布固定 digest 的节点／RRT 镜像，`platform-e2e` 部署 Kubernetes 并执行八组用例。运行阶段只使用这批制品，验证 commit、架构及 SHA256；八组场景和环境清理全部成功后才通过。当前正式验收及制品身份见本文顶部记录。
+`.buildkite/README.md` 保存端到端流程约定。流水线有三个独立步骤：`platform-build` 构建与交接发布包，`platform-images` 发布固定 digest 的节点／RRT 镜像，`platform-e2e` 部署 Kubernetes。默认 `k8s-basic` 执行五组；主分支、合入候选和发布候选通过 `ADX_E2E_PROFILE=full` 执行十组。运行阶段只使用本次制品并验证 commit、架构及 SHA256；所选场景和环境清理全部成功后才通过。Buildkite #30 保留为此前八组的正式证据；当前分层需产生新的正式结果。
 
 本地组件测试继续用于每一步的测试驱动开发；同一套完整 E2E 驱动器也应支持在具备环境的本地机器上复现 Buildkite 失败。
 

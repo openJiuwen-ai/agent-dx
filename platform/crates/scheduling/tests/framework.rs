@@ -33,6 +33,7 @@ fn request() -> InstanceSpec {
             memory_bytes: 1,
             disk_bytes: 1,
         },
+        sandbox: Default::default(),
     }
 }
 #[test]

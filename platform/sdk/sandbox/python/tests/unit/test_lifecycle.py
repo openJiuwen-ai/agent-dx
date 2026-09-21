@@ -107,6 +107,27 @@ class LifecycleTests(unittest.TestCase):
                 "https://frontend:8888/default-sandbox-1/8080",
             )
 
+    def test_explicit_connection_without_gateway_uses_control_plane_tls(self):
+        sandbox = object.__new__(Sandbox)
+        sandbox._sid = "default-sandbox-1"
+        sandbox._forwarded_ports = {8080}
+        sandbox._connection = ConnectionConfig(
+            server_address="frontend:8443",
+            token="secret",
+            use_tls=True,
+        )
+
+        class Client:
+            @staticmethod
+            def _safe_id(sandbox_id):
+                return sandbox_id
+
+        sandbox._client = Client()
+        self.assertEqual(
+            sandbox.get_port_url(8080),
+            "https://frontend:8443/default-sandbox-1/8080",
+        )
+
     def test_pause_and_resume_are_synchronous_without_public_request_id(self):
         pause = getattr(Sandbox, "pause", None)
         resume = getattr(Sandbox, "resume", None)

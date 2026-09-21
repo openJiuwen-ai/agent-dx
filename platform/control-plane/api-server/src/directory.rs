@@ -40,6 +40,12 @@ impl Directory {
         self.next += 1;
         Some(node)
     }
+    pub fn snapshot(&self) -> Option<Vec<pb::NodeEndpoint>> {
+        if self.valid_until.is_none_or(|t| Instant::now() >= t) {
+            return None;
+        }
+        Some(self.nodes.clone())
+    }
 }
 #[cfg(test)]
 mod tests {
@@ -52,6 +58,7 @@ mod tests {
             node_id: id.into(),
             address: format!("{id}:9000"),
             session_id: "boot".into(),
+            ..Default::default()
         };
         d.update(pb::NodeDirectory {
             epoch: 1,
@@ -59,6 +66,14 @@ mod tests {
             valid_for_millis: 1000,
         })
         .unwrap();
+        assert_eq!(
+            d.snapshot()
+                .unwrap()
+                .into_iter()
+                .map(|node| node.node_id)
+                .collect::<Vec<_>>(),
+            ["a", "b"]
+        );
         assert_eq!(
             (
                 d.select().unwrap().node_id,
@@ -69,6 +84,7 @@ mod tests {
         );
         d.valid_until = Some(Instant::now());
         assert!(d.select().is_none());
+        assert!(d.snapshot().is_none());
         d.update(pb::NodeDirectory {
             epoch: 2,
             nodes: vec![pb::NodeEndpoint {
@@ -81,5 +97,6 @@ mod tests {
         assert_eq!(d.select().unwrap().session_id, "new");
         d.clear();
         assert!(d.select().is_none());
+        assert!(d.snapshot().is_none());
     }
 }

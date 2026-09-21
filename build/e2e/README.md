@@ -33,10 +33,14 @@ python3 build/e2e/run.py --bundle out/e2e/bundle --output out/e2e/run-001
 ```
 
 Use `--profile l0` for the minimum public API/SDK and authentication closure.
-The default `--profile standalone` runs all eight single-host logical two-node
-groups. Both profiles write `required_checks`, per-case results and case-level
-JUnit; a case that was not reached is visible as skipped and prevents the JSON
-result from passing.
+The default `--profile standalone` runs all ten single-host logical two-node
+groups. A group is a deployment and cleanup boundary, not one functional test.
+The SDK, data-plane, lifecycle and placement groups emit stable functional
+subcases, and JUnit reports those subcases individually. Both profiles write
+`required_checks`, per-case results and case-level JUnit; a case that was not
+reached is visible as skipped and prevents the JSON result from passing. The
+public API inventory and uncovered conditional features are tracked in
+[SDK E2E coverage](../../docs/testing/sdk-e2e-coverage.md).
 
 All output directories must be new. Local runs allow dirty packages and image
 tags, recording their actual identities. Buildkite requires the current clean
@@ -53,6 +57,17 @@ Local Docker reproduction requires access to the same bind-mounted paths as the 
   two real instances across two nodes verify query, stdout/stderr/exit code,
   binary file round-trip, explicit deletion, Redis terminal state and released
   resources, and empty sandboxd inventories.
+- `data-plane`: query both schedulable nodes through the installed SDK, create on
+  a selected node, reattach by Instance ID, and exercise foreground/background
+  commands, both handle and collection stdin/EOF, sync and async waits, stable
+  command replay/conflict, typed not-found/timeout results, both kill entry
+  points, filesystem text/binary/depth/directory copy, stateful Shell, interactive
+  PTY input/EOF/resize/state, default TLS+Token forwarded-port traffic, and a
+  per-Instance TLS-only forwarded-port policy.
+- `lifecycle`: close a detached handle, reattach to the same running Instance,
+  delete it explicitly, verify ordinary `close()` preserves the remote Instance,
+  verify context-manager deletion, then require an idle-timeout Instance to be
+  reclaimed without a client-side delete.
 - `auth`: invalid key and another tenant cannot read or delete the instance;
   the owner's instance remains running. An administrator creates, lists and
   revokes a tenant key through HTTPS Edge; tenant management requests are denied,
@@ -85,9 +100,12 @@ are retained as build artifacts/cache; test containers and network are removed.
 
 ## Coverage boundary
 
-The basic case uses runc, `idle_timeout=0`, and no writable-layer quota. It does
-not validate pause/resume, snapshots, Master outage, cross-node recovery, XPU,
-tunnels, mixed-load scheduling or performance. Resource observations read the node's cgroup
+The basic suite uses runc and no writable-layer quota. Most cases disable idle
+reclamation; the dedicated `lifecycle` case enables a six-second timeout. It does
+not validate pause/resume, snapshots, S3 rootfs/mounts, entrypoint inheritance,
+failover, runtime network replacement, Master outage, cross-node recovery, XPU,
+reverse tunnels, mixed-load scheduling or performance. Those runtime-specific
+contracts are assigned to the Firecracker profile. Resource observations read the node's cgroup
 limits and filesystem with infrastructure reservations; this fixture is not
 the production sandboxd collector.
 

@@ -20,6 +20,9 @@ message PublishedRoute {
  string node_proxy_address = 5;
  uint64 generation = 6;
  uint64 instance_revision = 7;
+ DataPlaneSecurityMode tunnel_security_mode = 8;
+ DataPlaneSecurityMode port_forward_security_mode = 9;
+ repeated uint32 forwarded_ports = 10;
 }
 
 message RouteFrame {

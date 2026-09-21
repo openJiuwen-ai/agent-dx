@@ -79,7 +79,7 @@ dependency in the Ubuntu runtime image.
 from the clean current commit. `platform-images` downloads the release archive and verifies its SHA256 before
 restoring the complete directory tree and executable permissions. It downloads
 the verified external backend artifacts,
-creates the verified bundle and publishes the node/RRT images. `registry-images.json` records immutable digest
+creates the verified bundle and publishes the node, RRT and entrypoint-fixture images. `registry-images.json` records immutable digest
 references, source image IDs and the checksum of `bundle.json`.
 
 `platform-e2e` downloads only those JSON manifests and invokes
@@ -87,15 +87,15 @@ references, source image IDs and the checksum of `bundle.json`.
 and immutable references. The target cluster pulls the build's images; neither
 the deployer nor test Pods compile or substitute product binaries.
 
-Mandatory scenarios are SDK create/query/command/file/delete, invalid key and
-tenant isolation, administrator key management through Edge, capacity
-exhaustion/release, six two-node placement rules,
-heartbeat expiry with returning-node cleanup, Node Manager process restart and
-supervisor stop with physical runtime cleanup. Missing scenarios, diagnostic or
-cleanup failures prevent a pass. `result.json`, JUnit, Kubernetes resource/events
-and per-Pod logs are uploaded. Secret bodies travel on stdin and are excluded
-from manifests and evidence; generated API/Redis keys are redacted from collected
-component logs.
+The default basic gate runs SDK create/query/command/file/delete, API-key and
+tenant isolation, capacity exhaustion/release, two-node placement, and
+local-first atomic ownership. The `full` profile additionally runs the broad
+data-plane surface, idle lifecycle reclamation, heartbeat expiry with
+returning-node cleanup, Node Manager restart, and supervisor stop with physical
+runtime cleanup. Missing selected scenarios, diagnostic or cleanup failures
+prevent a pass. `result.json`, JUnit, Kubernetes resource/events and per-Pod logs
+are uploaded. Secret bodies travel on stdin and are excluded from manifests and
+evidence; generated API/Redis keys are redacted from collected component logs.
 
 `ADX_E2E_PROFILE` selects the Kubernetes gate. The default is `k8s-basic`.
 Set it to `l0` for the minimum closure or `full` for the cross-physical-worker
@@ -189,7 +189,7 @@ The existing basic E2E result alone does not count as this profile passing.
 
 `ADX_BACKEND_ARTIFACT_BUILD` 接受 Buildkite build UUID（API 返回的 `id`），不是页面上的递增构建编号。复用制品仍需匹配 sandboxd 提交、目标架构与完整文件摘要；ADX 产品每次从当前提交构建。
 
-The basic acceptance driver also runs an independent `local-first` case: restart API Server with `create_mode=local_first`, verify concurrent public SDK creation, real commands and deletion, require confirmed-claim evidence, then restore central mode. [Buildkite #30](https://buildkite.com/agent-dx/agent-dx/builds/30) passed this eight-case gate with the OCI runtime profile; earlier seven-case builds do not validate this path.
+The basic acceptance driver also runs an independent `local-first` case: restart API Server with `create_mode=local_first`, verify concurrent public SDK creation, real commands and deletion, require confirmed-claim evidence, then restore central mode. The default `k8s-basic` profile contains five bounded cases. The ten-case `full` and local `standalone` profiles carry installed-SDK `data-plane`, `lifecycle` and fault/restart/stop coverage. [Buildkite #30](https://buildkite.com/agent-dx/agent-dx/builds/30) passed the previous eight-case OCI profile; the current profile split requires fresh formal evidence.
 
 ### Local runtime payload tools
 

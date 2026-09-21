@@ -9,17 +9,8 @@ from .types import ConnectionConfig, NodeInfo
 def _resource_values(value: object) -> Mapping[str, float]:
     if not isinstance(value, Mapping):
         return {}
-    resources = value.get("resources")
-    if not isinstance(resources, Mapping):
-        return {}
     result = {}
-    for name, resource in resources.items():
-        if not isinstance(resource, Mapping):
-            continue
-        scalar = resource.get("scalar")
-        if not isinstance(scalar, Mapping):
-            continue
-        raw_value = scalar.get("value")
+    for name, raw_value in value.items():
         if isinstance(raw_value, (int, float)) and not isinstance(raw_value, bool):
             result[str(name)] = float(raw_value)
     return result
@@ -28,16 +19,7 @@ def _resource_values(value: object) -> Mapping[str, float]:
 def _node_labels(value: object) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
         return {}
-    result = {}
-    for name, counter in value.items():
-        if not isinstance(counter, Mapping):
-            continue
-        items = counter.get("items")
-        if not isinstance(items, Mapping):
-            continue
-        keys = [str(item) for item in items]
-        result[str(name)] = keys[0] if len(keys) == 1 else dict(items)
-    return result
+    return {str(name): item for name, item in value.items()}
 
 
 def _coerce_node(node_id: str, item: Mapping[str, object]) -> NodeInfo:
@@ -52,7 +34,7 @@ def _coerce_node(node_id: str, item: Mapping[str, object]) -> NodeInfo:
             status=int(raw_status),
             capacity=_resource_values(item.get("capacity")),
             allocatable=_resource_values(item.get("allocatable")),
-            labels=_node_labels(item.get("nodeLabels")),
+            labels=_node_labels(item.get("labels")),
         )
     except Exception as exc:
         raise ValueError(f"invalid node item: {item!r}") from exc
@@ -79,11 +61,9 @@ def resources(
         client.close()
 
     items: Iterable[tuple[object, object]] = []
-    resource = payload.get("resource") if isinstance(payload, dict) else None
-    if isinstance(resource, Mapping):
-        fragments = resource.get("fragment")
-        if isinstance(fragments, Mapping):
-            items = fragments.items()
+    raw_items = payload.get("items") if isinstance(payload, dict) else None
+    if isinstance(raw_items, list):
+        items = ((item.get("id", ""), item) for item in raw_items if isinstance(item, Mapping))
 
     return [
         _coerce_node(str(node_id), item)

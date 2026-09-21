@@ -15,16 +15,34 @@ event('[SCENARIO] '+sys.argv[1])
 if sys.argv[1]=='l0':
     subprocess.run([sys.executable,'-u','/opt/adx/e2e/sdk_smoke.py','--endpoint','127.0.0.1:8443','--token-file',str(S/'api-key'),'--ca',str(S/'tls/ca.pem'),'--image',image,'--output',str(E/'l0')],check=True)
 elif sys.argv[1]=='sdk':
+    sdk_cases=[]
     if Path('/opt/adx/package/runtime/adx-runtime-rootfs.img').is_file():
         from runtime_environment import run
-        run(connection,image,E/'runtime-environment-result.json')
+        runtime_result=E/'runtime-environment-result.json'
+        run(connection,image,runtime_result)
+        runtime_payload=json.loads(runtime_result.read_text())
+        sdk_cases.extend({
+            'id':'runtime-environment.'+check['mode'],
+            'status':'passed',
+            'seconds':0,
+        } for check in runtime_payload['checks'])
     subprocess.run([sys.executable,'-u','/opt/adx/e2e/sdk_smoke.py','--endpoint','127.0.0.1:8443','--token-file',str(S/'api-key'),'--ca',str(S/'tls/ca.pem'),'--image',image,'--output',str(E/'sdk')],check=True)
+    sdk_cases.extend(json.loads((E/'sdk/sdk-result.json').read_text())['cases'])
+    print(json.dumps({'status':'passed','cases':sdk_cases}),flush=True)
+elif sys.argv[1]=='data-plane':
+    from functional_data_plane import run
+    run(connection,image,E/'data-plane-result.json',S/'tls/ca.pem')
+elif sys.argv[1]=='lifecycle':
+    from functional_lifecycle import run
+    run(connection,image,E/'lifecycle-result.json')
 elif sys.argv[1]=='local-first':
     from local_first import run
     run(connection,image,E/'local-first-result.json')
 elif sys.argv[1]=='placement':
     from placement import run
-    run(connection,image,E/'placement-result.json')
+    placement_result=E/'placement-result.json'
+    run(connection,image,placement_result)
+    print(json.dumps(json.loads(placement_result.read_text())),flush=True)
 elif sys.argv[1]=='auth':
     from adx_sandbox import PermissionDenied, SandboxError
     s=Sandbox(image=image,runtime='runc',cpu=500,memory=512,idle_timeout=0,connection=connection,create_timeout=150)

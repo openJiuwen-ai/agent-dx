@@ -9,7 +9,9 @@ use adx_node_manager::{
 use adx_protocol::{control as pb, tls::TlsFiles};
 use adx_service_runtime::{read_config, shutdown};
 use serde::Deserialize;
-use std::{collections::HashMap, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap, future::Future, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration,
+};
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Config {
@@ -82,9 +84,46 @@ async fn sample(
     timeout: Duration,
 ) -> adx_core::Result<(adx_node_manager::resources::Observation, Duration)> {
     if matches!(source, ResourceSource::Sandboxd { .. }) {
-        runtime.check_health().await?;
+        tokio::time::timeout(timeout, runtime.check_health())
+            .await
+            .map_err(|_| {
+                adx_core::Error::Unavailable("sandboxd health check timed out".into())
+            })??;
     }
     source.sample(timeout).await
+}
+
+async fn bounded_rpc<T>(
+    timeout: Duration,
+    future: impl Future<Output = Result<T, tonic::Status>>,
+) -> Result<T, tonic::Status> {
+    tokio::time::timeout(timeout, future)
+        .await
+        .map_err(|_| tonic::Status::deadline_exceeded("control-plane RPC deadline exceeded"))?
+}
+
+async fn register_node(
+    master: &mut pb::master_service_client::MasterServiceClient<tonic::transport::Channel>,
+    registration: pb::RegisterNodeRequest,
+    timeout: Duration,
+) -> Result<tonic::Response<pb::RegisterNodeResponse>, tonic::Status> {
+    let mut request = tonic::Request::new(registration);
+    request.set_timeout(timeout);
+    bounded_rpc(timeout, master.register_node(request)).await
+}
+
+async fn inspect_node(
+    master: &mut pb::master_service_client::MasterServiceClient<tonic::transport::Channel>,
+    node_id: &str,
+    session_id: &str,
+    timeout: Duration,
+) -> Result<tonic::Response<pb::InspectNodeResponse>, tonic::Status> {
+    let mut request = tonic::Request::new(pb::InspectNodeRequest {
+        node_id: node_id.into(),
+        session_id: session_id.into(),
+    });
+    request.set_timeout(timeout);
+    bounded_rpc(timeout, master.inspect_node(request)).await
 }
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -190,7 +229,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let mut master = pb::master_service_client::MasterServiceClient::new(channel);
     let mut env = config.rrt_env;
-    env.insert("RRT_HTTP_ONLY".into(), "1".into());
     env.insert("RRT_HTTP_PORT".into(), config.rrt_port.to_string());
     let token = env.get("RRT_HTTP_TOKEN").cloned();
     let runtime_config = RuntimeConfig {
@@ -322,6 +360,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let report = async {
         let mut last = registration.clone();
         let mut valid_until = tokio::time::Instant::now() + valid;
+        // Resource/backend observation is not on the heartbeat critical path.
+        // Bound each attempt to one reporting period so a busy or restarting
+        // sandboxd closes admission after `valid_until` without causing Master
+        // to expire the node session and fence otherwise healthy instances.
+        let sample_timeout = timeout.min(Duration::from_secs(config.report_interval_seconds));
         let mut interval =
             tokio::time::interval(Duration::from_secs(config.report_interval_seconds));
         let mut reconciled = false;
@@ -355,7 +398,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 reconciled = false;
             }
             let mut r = last.clone();
-            if let Ok((o, valid)) = sample(&source, &runtime, timeout).await {
+            if let Ok((o, valid)) = sample(&source, &runtime, sample_timeout).await {
                 valid_until = tokio::time::Instant::now() + valid;
                 manager.update_capacity(o.capacity, valid)?;
                 manager.update_devices(o.devices.clone(), valid)?;
@@ -387,14 +430,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 manager.pause_lifecycle().await;
             }
             last = r.clone();
-            match master.register_node(r).await {
+            match register_node(&mut master, r, timeout).await {
                 Ok(_) if !reconciled => {
-                    let catalog = master
-                        .inspect_node(pb::InspectNodeRequest {
-                            node_id: config.node_id.clone(),
-                            session_id: session_id.clone(),
-                        })
-                        .await;
+                    let catalog =
+                        inspect_node(&mut master, &config.node_id, &session_id, timeout).await;
                     match catalog {
                         Ok(snapshot) => {
                             let mut catalog = snapshot.into_inner();
@@ -413,15 +452,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                                 // Replay may change executions and checkpoint ownership. Fetch
                                 // both Instance and snapshot records from the same fresh catalog.
-                                catalog = match master
-                                    .inspect_node(pb::InspectNodeRequest {
-                                        node_id: config.node_id.clone(),
-                                        session_id: session_id.clone(),
-                                    })
-                                    .await
+                                catalog = match inspect_node(
+                                    &mut master,
+                                    &config.node_id,
+                                    &session_id,
+                                    timeout,
+                                )
+                                .await
                                 {
                                     Ok(snapshot) => snapshot.into_inner(),
-                                    Err(_) => continue,
+                                    Err(error) => {
+                                        adx_observability::warn!(
+                                            "fresh node catalog unavailable after journal recovery: {error}"
+                                        );
+                                        continue;
+                                    }
                                 };
                             }
                             let records = catalog
@@ -456,7 +501,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                     _ = interval.tick() => {
                                         last.heartbeat_sequence = last.heartbeat_sequence.checked_add(1).ok_or("heartbeat sequence exhausted")?;
-                                        if master.register_node(last.clone()).await.is_err() {
+                                        if register_node(&mut master, last.clone(), timeout).await.is_err() {
                                             // Cancellation leaves the gate closed. Accepted controller
                                             // work completes independently and retries on the next catalog.
                                             break;
@@ -560,4 +605,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         proxy.shutdown().await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn bounded_rpc_releases_a_stalled_heartbeat() {
+        let result = bounded_rpc(
+            Duration::from_millis(10),
+            std::future::pending::<Result<(), tonic::Status>>(),
+        )
+        .await;
+
+        assert_eq!(result.unwrap_err().code(), tonic::Code::DeadlineExceeded);
+    }
 }

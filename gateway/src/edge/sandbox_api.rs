@@ -482,6 +482,7 @@ fn to_platform(
         snapshot_id: None,
         // Preinstalled profiles use the node deployment without a runtime environment.
         runtime_environment: None,
+        sandbox: None,
     })
 }
 #[async_trait]

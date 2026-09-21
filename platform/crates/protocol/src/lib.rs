@@ -7,6 +7,7 @@ pub mod control {
 
 pub use adx_core::valid_runtime_id;
 use adx_core::{Error, Result};
+mod sandbox;
 mod scheduling;
 
 impl From<adx_core::Resources> for control::Resources {
@@ -48,6 +49,11 @@ impl TryFrom<control::InstanceSpec> for adx_core::InstanceSpec {
                 .map(TryInto::try_into)
                 .transpose()?
                 .unwrap_or_default(),
+            sandbox: value
+                .sandbox
+                .map(TryInto::try_into)
+                .transpose()?
+                .unwrap_or_default(),
         };
         spec.validate()?;
         Ok(spec)
@@ -68,6 +74,7 @@ impl From<adx_core::InstanceSpec> for control::InstanceSpec {
             resources: Some(value.resources.into()),
             priority: value.priority,
             scheduling: Some(value.scheduling.into()),
+            sandbox: Some(value.sandbox.into()),
         }
     }
 }
@@ -143,6 +150,7 @@ mod tests {
                 disk_bytes: u64::MAX,
             },
             priority: -10,
+            sandbox: Default::default(),
         };
         let bytes = control::InstanceSpec::from(value.clone()).encode_to_vec();
         let decoded = control::InstanceSpec::decode(bytes.as_slice()).unwrap();
@@ -313,6 +321,8 @@ impl From<adx_core::CompletedOperation> for control::CompletedOperation {
                 adx_core::LifecycleKind::Pause => 1,
                 adx_core::LifecycleKind::Resume => 2,
                 adx_core::LifecycleKind::Snapshot => 3,
+                adx_core::LifecycleKind::Network => 4,
+                adx_core::LifecycleKind::Reload => 5,
             },
         }
     }
@@ -330,6 +340,8 @@ impl TryFrom<control::CompletedOperation> for adx_core::CompletedOperation {
                 1 => adx_core::LifecycleKind::Pause,
                 2 => adx_core::LifecycleKind::Resume,
                 3 => adx_core::LifecycleKind::Snapshot,
+                4 => adx_core::LifecycleKind::Network,
+                5 => adx_core::LifecycleKind::Reload,
                 _ => return Err(Error::Invalid("invalid lifecycle kind".into())),
             },
         })

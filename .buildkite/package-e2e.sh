@@ -42,7 +42,7 @@ if [[ -z ${ADX_COLLECTOR_IMAGE:-} ]]; then
   fi
 fi
 docker pull "$ADX_COLLECTOR_IMAGE"
-echo "--- :docker: Build node and RRT images"
+echo "--- :docker: Build node, RRT and entrypoint fixture images"
 fc_args=()
 if [[ ${ADX_E2E_CHECKPOINT:-0} == 1 ]]; then
   if [[ -n ${ADX_FC_KIT_ARTIFACT_BUILD:-} ]]; then

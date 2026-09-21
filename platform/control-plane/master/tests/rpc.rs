@@ -110,6 +110,7 @@ fn spec(id: &str) -> InstanceSpec {
         },
         priority: 0,
         scheduling: Default::default(),
+        sandbox: Default::default(),
     }
 }
 fn caller() -> Option<pb::CallerContext> {

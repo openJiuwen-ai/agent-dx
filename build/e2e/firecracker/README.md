@@ -9,22 +9,22 @@
 - `package/`：经过 `build/release/package.py verify` 验证的统一发布包。
 - `client/bin/python`：已安装该包 Sandbox SDK 的 Python 环境。
 - `e2e/`：本目录所属的 `build/e2e`，以及 `rpc_certificates.py`、发布包验证器 `package.py`。
-- `tools/minio`、`tools/redis-cli`；本地 OCI tar 模式另需 `tools/docker-registry` 和 `rrt.tar`。
+- `tools/minio`、`tools/redis-cli`、`tools/distill_fs`；本地 OCI tar 模式另需 `tools/docker-registry`、`rrt.tar` 和用于入口继承验收的 `entrypoint.tar`。
 
-外部执行后端在 `/opt/adx-fc/bin/{sandboxd,sbox,checkpoint-restore,firecracker}`，内核和 initrd 在 `/opt/adx-fc/artifacts/`。virtiofsd 在基目录 `tools/`。测试使用新建的显式运行目录，固定监听端口因此每个 Pod/VM 同时运行一套；不在已有业务节点直接执行。
+外部执行后端在 `/opt/adx-fc/bin/{sandboxd,sbox,checkpoint-restore,firecracker}`，内核和 initrd 在 `/opt/adx-fc/artifacts/`。virtiofsd 与 `distill_fs` 在基目录 `tools/`；后者是 S3/OCI rootfs 和 EROFS mount 的实际读取后端，缺失时验收必须在部署前失败。测试使用新建的显式运行目录，固定监听端口因此每个 Pod/VM 同时运行一套；不在已有业务节点直接执行。
 
 ```sh
 sudo env ADX_FC_BASE=/opt/adx ADX_FC_PROXY_MODE=embedded \
   python3 -u /opt/adx/e2e/firecracker/node.py /var/lib/adx-fc-test/run
 ```
 
-`ADX_FC_PROXY_MODE` 支持 `embedded` 或 `standalone`。`ADX_E2E_RRT_IMAGE` 指定已发布 RRT 镜像；省略时从 `rrt.tar` 启动本机测试仓库。S3、Redis和API测试凭证每次随机生成，配置及密钥不进入公开证据。`collect.py` 只导出证据与组件日志并替换已知测试密钥。
+`ADX_FC_PROXY_MODE` 支持 `embedded` 或 `standalone`。`ADX_E2E_RRT_IMAGE` 和 `ADX_E2E_ENTRYPOINT_IMAGE` 可指定已发布的 RRT／入口测试镜像；省略时分别从 `rrt.tar` 和 `entrypoint.tar` 启动本机测试仓库。S3、Redis和API测试凭证每次随机生成，配置及密钥不进入公开证据。`collect.py` 只导出证据与组件日志并替换已知测试密钥。
 
 ## Kubernetes 与 Buildkite
 
-`kubernetes.py` 创建带唯一名称/标签的 namespace，部署一个选定 KVM worker 上的特权 Pod，执行相同18项SDK/生命周期用例（包含可复用快照创建、双克隆身份及文件隔离、源实例删除后查询，以及确认源快照回收后的克隆暂停恢复），保存部署命令、Pod/宿主信息、逐用例日志、结果JSON、JUnit、S3/Redis/实例清理证据。清理检查 namespace UID 与标签；不会删除替换后的 namespace。一个Pod不证明跨节点恢复。
+`kubernetes.py` 创建带唯一名称/标签的 namespace，部署一个选定 KVM worker 上的特权 Pod，执行与本地相同的26项SDK/生命周期用例。除原有 checkpoint、双克隆和故障场景外，当前集合还要求 S3 rootfs、S3 EROFS mount、独立执行 limit、镜像入口继承、reload、创建/运行期网络策略，以及有/无 checkpoint 的 failover。它保存部署命令、Pod/宿主信息、逐用例日志、结果JSON、JUnit、S3/Redis/实例清理证据。清理检查 namespace UID 与标签；不会删除替换后的 namespace。一个Pod不证明跨节点恢复。
 
-镜像由 `build/e2e/prepare.py --firecracker-kit <dir>` 在当前 ADX 发布包上组合。外部 kit 必须包含 `kit.py` 定义的全部文件，`manifest.json` 包含 `schema_version: 1`、`target`、`sandboxd_revision` 和文件相对路径到SHA256的 `files` 映射。sandboxd、sbox和redis-cli还必须与同次backend制品摘要一致。内核、VMM、checkpoint-restore、virtiofsd与MinIO由kit供应流程准备，此仓库不会在运行节点临时编译或下载浮动版本。
+镜像由 `build/e2e/prepare.py --firecracker-kit <dir>` 在当前 ADX 发布包上组合。外部 kit 必须包含 `kit.py` 定义的全部文件，`manifest.json` 包含 `schema_version: 1`、`target`、`sandboxd_revision`、`sandboxd_patches` 和文件相对路径到SHA256的 `files` 映射。revision 与补丁摘要共同标识实际 sandboxd 源码；sandboxd、sbox、redis-cli 和 Firecracker guest `initrd.img` 必须与同次 backend 制品摘要一致。这样，涉及 guest agent 的补丁不会只更新 host 进程而遗漏 microVM 内的执行代码。内核、VMM、checkpoint-restore、virtiofsd、distill_fs、MinIO 与测试用 OCI registry 均由kit供应流程准备，此仓库不会在运行节点临时编译或下载浮动版本。
 
 启用独立 `platform-fc-e2e` 步骤需要：
 
@@ -59,6 +59,10 @@ package-v16 / Lima r20 已通过全部17项和最终清理，证据 `out/ci/paus
 
 
 当前18项必需用例包含公共SDK设置实例标签、实例硬亲和OR、节点顺序偏好和加权实例反亲和的创建及执行。该用例在单节点上证明SDK→Frontend→Master→Node Manager→真实Firecracker的接线；两个候选节点之间的评分选择、租户隔离和反向反亲和由Rust定向测试验证，不能由单节点FC用例代替。
+
+当前代码把严格集合扩展为26项。Lima ARM64 r16 的SDK组19/19通过；r17、r18使用更新后的组件包，均先通过S3 rootfs、S3 EROFS mount、独立执行limit、入口继承、创建及运行期网络策略等前16项，再在双克隆写入阶段遇到Node Proxy 504。生命周期隔离验收另行验证有／无checkpoint的failover和节点故障契约。上述拆分结果证明新增能力实际经过sandboxd/Firecracker，但不能替代同一次26/26严格验收；完整门禁仍需修复ARM FC双克隆网络问题后重跑并生成新的JUnit和全量清理证据。
+
+Lima ARM64 lifecycle r24 的7项故障用例全部通过：backend异常重启、有／无checkpoint的failover、Master不可用时SQLite降级、Node Manager等待Master、心跳过期后的旧会话隔离清理，以及资源观测过期门禁。外层清理确认6个实例全部Deleted且释放资源，runtime inventory、本地checkpoint、S3业务对象、测试进程和network namespace均无残留。证据位于`out/ci/sdk-capability-fc-20260920/fc-lifecycle-r24/`。
 
 ## 双节点归属转移
 

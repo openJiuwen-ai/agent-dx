@@ -45,6 +45,15 @@ def assemble(binary_dir, redis, wheel, output, commit, dirty, target, profile):
     for component in ("redis", "sandboxd"):
         for name in ("source.json", "LICENSE"):
             inputs[f"third_party/{component}/{name}"] = ROOT / "third_party" / component / name
+    sandboxd_source = json.loads((ROOT / "third_party/sandboxd/source.json").read_text())
+    for patch in sandboxd_source.get("patches", []):
+        relative = Path(patch["path"])
+        if relative.is_absolute() or ".." in relative.parts or relative.parts[:3] != ("third_party", "sandboxd", "patches"):
+            raise ValueError("invalid sandboxd patch path")
+        source = ROOT / relative
+        if sha(source) != patch["sha256"]:
+            raise ValueError("sandboxd patch integrity mismatch")
+        inputs[relative.as_posix()] = source
     inputs["LICENSE"] = ROOT / "LICENSE"
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".adx-package-", dir=output.parent) as temp:

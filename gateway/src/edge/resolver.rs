@@ -186,11 +186,7 @@ impl EdgeRouteResolver {
         let target = route
             .connect_target(target_port, request_id)
             .ok_or(ResolveError::MissingEndpoint)?;
-        let port_forward_auth_mode = if self.stream_only {
-            DataPlaneAuthMode::Token
-        } else {
-            route.port_forward_auth_mode(target_port)
-        };
+        let port_forward_auth_mode = route.port_forward_auth_mode(target_port);
         Ok(RouteHandle {
             access_kind,
             node_proxy_address: route.node_proxy_address,
@@ -202,8 +198,8 @@ impl EdgeRouteResolver {
     }
 }
 
-// FunctionSystem's existing RUNNING status code is retained; this module does
-// not create another state machine or rewrite status messages.
+// The control-plane RUNNING status is the only connectable state. This module
+// consumes that state and does not create a second lifecycle state machine.
 fn is_connectable(status: &InstanceStatus) -> bool {
     status.code == 3
 }

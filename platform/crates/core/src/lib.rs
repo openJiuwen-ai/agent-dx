@@ -9,6 +9,7 @@ pub use checkpoint::{
     valid_runtime_id, CheckpointArtifact, CompletedOperation, LifecycleKind, RestorePoint,
 };
 pub mod runtime;
+pub mod sandbox;
 pub mod scheduling;
 
 use serde::{Deserialize, Serialize};
@@ -87,6 +88,8 @@ pub struct InstanceSpec {
     pub priority: i32,
     #[serde(default)]
     pub scheduling: scheduling::SchedulingPolicy,
+    #[serde(default)]
+    pub sandbox: sandbox::SandboxOptions,
 }
 
 impl InstanceSpec {
@@ -102,14 +105,15 @@ impl InstanceSpec {
         }
         if let Some(environment) = &self.runtime_environment {
             environment.validate()?;
-        } else if self.image.trim().is_empty() {
+        } else if self.image.trim().is_empty() && self.sandbox.rootfs.is_none() {
             return Err(Error::Invalid(
                 "image or runtime environment is required".into(),
             ));
         }
         self.lifecycle.validate()?;
         self.resources.validate()?;
-        self.scheduling.validate()
+        self.scheduling.validate()?;
+        self.sandbox.validate(&self.resources)
     }
 }
 

@@ -2,6 +2,68 @@ use adx_core::{Assignment, InstanceRecord, InstanceSpec, InstanceState, Resource
 use adx_protocol::control;
 
 #[test]
+fn sandbox_options_roundtrip_preserves_backend_contract() {
+    use adx_core::sandbox as model;
+
+    let options = model::SandboxOptions {
+        rootfs: Some(model::Rootfs {
+            readonly: true,
+            source: model::StorageSource::S3(model::S3Source {
+                endpoint: "https://s3.example".into(),
+                bucket: "rootfs".into(),
+                object: "application.erofs".into(),
+                access_key_id: "key".into(),
+                access_key_secret: "secret".into(),
+            }),
+        }),
+        mounts: vec![model::Mount {
+            kind: "bind".into(),
+            target: "/workspace".into(),
+            options: vec!["ro".into()],
+            source: model::StorageSource::Image("registry.example/tools:v1".into()),
+        }],
+        network: Some(model::NetworkPolicy {
+            traffic: Some(model::TrafficPolicy {
+                ingress_default_action: model::NetworkAction::Deny,
+                egress_default_action: model::NetworkAction::Allow,
+                rules: vec![model::NetworkRule {
+                    action: model::NetworkAction::Allow,
+                    direction: model::NetworkDirection::Ingress,
+                    protocol: model::NetworkProtocol::Tcp,
+                    peer: Default::default(),
+                    sandbox_port: 8080,
+                    sandbox_port_range: None,
+                    priority: 100,
+                }],
+                mode: model::TrafficMode::Stateful,
+            }),
+            dns: Some(model::DnsPolicy {
+                default_action: model::NetworkAction::Allow,
+                rules: vec![model::DnsRule {
+                    action: model::NetworkAction::Deny,
+                    pattern: "blocked.example".into(),
+                }],
+            }),
+        }),
+        data_plane: model::DataPlanePolicy {
+            tunnel: model::DataPlaneSecurityMode::Tls,
+            port_forward: model::DataPlaneSecurityMode::TlsToken,
+        },
+        ports: vec![8080],
+        failover: true,
+        inherit_entrypoint: false,
+        limits: model::ResourceLimits {
+            cpu_millis: 1500,
+            memory_bytes: 2 << 30,
+            disk_bytes: 4 << 30,
+        },
+        extra_config: r#"{"networkStack":"netstack"}"#.into(),
+    };
+    let wire: control::SandboxOptions = options.clone().into();
+    assert_eq!(model::SandboxOptions::try_from(wire).unwrap(), options);
+}
+
+#[test]
 fn runtime_environment_roundtrip_preserves_oci_source() {
     let environment: adx_core::environment::RuntimeEnvironment =
         serde_json::from_value(serde_json::json!({
@@ -39,6 +101,7 @@ fn record_roundtrip_preserves_identity_state_and_ownership() {
         },
         priority: 0,
         scheduling: Default::default(),
+    sandbox: Default::default(),
     };
     let r = InstanceRecord {
         restart_attempts: 0,

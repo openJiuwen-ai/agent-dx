@@ -19,6 +19,7 @@ fn request(id: &str, tenant: &str) -> InstanceSpec {
         lifecycle: Default::default(),
         env: Default::default(),
         scheduling: Default::default(),
+        sandbox: Default::default(),
     }
 }
 fn node(available: bool) -> Node {

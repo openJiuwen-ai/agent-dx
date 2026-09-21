@@ -27,7 +27,7 @@ API Server 通过 `InstanceDirectoryService.WatchInstances` 维护完整的内�
 
 沿用既有 Sandbox URL、请求／响应封装和 SSE 行为。认证接受 SDK 的 `X-Auth`、`X-Auth-Token` 与 Bearer；调用者不能通过请求体或 `X-Tenant-Id` 自报租户。当前适配镜像、隔离 runtime、CPU、内存、磁盘、GPU/NPU 整卡、环境变量和 Instance ID。CPU 使用 millicores、HTTP 内存 MiB 转成内部字节；环境随 Spec 持久化和下发，执行身份及节点部署参数由 sandboxd 适配器最后覆盖。
 
-公开 JSON 直接转换为 `adx.control.v1` 的 Instance 类型；协议按 Instance、快照、凭证和路由职责拆分。已接通暂停／恢复、快照、空闲回收、重启策略和 HTTP 亲和策略翻译。网络策略、挂载、入口继承、extra_config、独立资源上限、公开端口发布、每实例安全模式、reload 及创建 failover=true 明确拒绝；相等的资源 request/limit 可兼容。用户命令仍走 RRT HTTP 数据接口。Agent 路由保留，配置 Agent 服务地址时转发给上层 Agent 服务；未配置时返回暂不可用。
+公开 JSON 直接转换为 `adx.control.v1` 的 Instance 类型；协议按 Instance、快照、凭证和路由职责拆分。已接通暂停／恢复、reload、可复用快照、空闲回收、重启策略、failover、HTTP 亲和策略、S3 rootfs／mount、镜像入口继承、创建及运行期网络策略、独立 request/limit、extra_config、每实例数据面安全模式、鉴权端口转发和 `upstream` reverse tunnel。公开 API 拒绝本机 rootfs 与 host mount，防止客户端把节点路径作为租户契约；它们只属于部署拥有的本地运行环境。旧 `/invoke` 兼容传输仍未接入；用户命令走 RRT HTTP 数据接口。Agent 路由保留，配置 Agent 服务地址时转发给上层 Agent 服务；未配置时返回暂不可用。
 
 ## 认证
 

@@ -8,16 +8,53 @@ import subprocess
 import sys
 import tempfile
 import time
+import types
 import unittest
+from unittest import mock
+import urllib.error
 import xml.etree.ElementTree as ET
 
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location('live_driver', ROOT / 'run.py')
 driver = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(driver)
+functional_spec = importlib.util.spec_from_file_location(
+    'functional_data_plane', ROOT / 'functional_data_plane.py'
+)
+functional_data_plane = importlib.util.module_from_spec(functional_spec)
+sdk_stub = types.ModuleType('adx_sandbox')
+for exported in (
+    'CommandConflict', 'CommandNotFound', 'CommandStatus', 'CommandWaitTimeout',
+    'DataPlaneSecurityPolicy', 'Sandbox', 'resources',
+):
+    setattr(sdk_stub, exported, object)
+with mock.patch.dict(sys.modules, {'adx_sandbox': sdk_stub}):
+    functional_spec.loader.exec_module(functional_data_plane)
 
 
 class LiveOutputTests(unittest.TestCase):
+    def test_forwarded_port_auth_denial_is_not_retried_as_readiness(self):
+        class Sandbox:
+            @staticmethod
+            def get_port_url(port):
+                return f'https://localhost:{port}'
+
+            @staticmethod
+            def get_port_auth_headers():
+                return {}
+
+        denied = urllib.error.HTTPError(
+            'https://localhost:18081', 401, 'Unauthorized', {}, None
+        )
+        with mock.patch.object(
+            functional_data_plane.ssl, 'create_default_context', return_value=object()
+        ), mock.patch.object(
+            functional_data_plane.urllib.request, 'urlopen', side_effect=denied
+        ) as request, self.assertRaises(urllib.error.HTTPError) as raised:
+            functional_data_plane._fetch_forwarded(Sandbox(), Path('/unused'))
+        self.assertEqual(raised.exception.code, 401)
+        request.assert_called_once()
+
     def test_child_output_is_visible_before_child_exits(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -68,8 +105,9 @@ class LiveOutputTests(unittest.TestCase):
             console = io.StringIO()
             with contextlib.redirect_stdout(console), self.assertRaisesRegex(RuntimeError, 'capacity assertion'):
                 run.scenarios(checks)
-            self.assertEqual(checks, ['sdk', 'auth'])
-            self.assertEqual([r['status'] for r in run.case_results], ['passed', 'passed', 'failed'])
+            self.assertEqual(checks, ['sdk', 'data-plane', 'lifecycle', 'auth'])
+            self.assertEqual([r['status'] for r in run.case_results],
+                             ['passed', 'passed', 'passed', 'passed', 'failed'])
             self.assertIn('[RUN] capacity', console.getvalue())
             self.assertIn('[FAIL] capacity', console.getvalue())
             self.assertNotIn('[PASS] capacity', console.getvalue())
@@ -85,6 +123,6 @@ class LiveOutputTests(unittest.TestCase):
                       'error': 'auth failed', 'cleanup_errors': ['namespace remains']}
             module.write_junit(path, report)
             suite = ET.parse(path).getroot()
-            self.assertEqual(suite.attrib, {'name': 'platform-kubernetes-e2e', 'tests': '9', 'failures': '2', 'skipped': '6'})
+            self.assertEqual(suite.attrib, {'name': 'platform-kubernetes-e2e', 'tests': '11', 'failures': '2', 'skipped': '8'})
             self.assertIsNotNone(suite.find("testcase[@name='auth']/failure"))
             self.assertIsNotNone(suite.find("testcase[@name='cleanup']/failure"))

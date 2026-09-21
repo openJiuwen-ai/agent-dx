@@ -18,6 +18,7 @@ fn request(id: &str) -> InstanceSpec {
         },
         priority: 0,
         scheduling: Default::default(),
+        sandbox: Default::default(),
     }
 }
 fn term(key: &str, value: &str, weight: u32) -> WeightedSelector {

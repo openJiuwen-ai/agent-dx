@@ -38,6 +38,7 @@ fn spec(i: usize) -> InstanceSpec {
             disk_bytes: 0,
         },
         scheduling: Default::default(),
+        sandbox: Default::default(),
     }
 }
 fn master(cache: usize, capacity: u64) -> Master {

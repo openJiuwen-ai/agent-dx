@@ -25,6 +25,7 @@ fn spec(id: &str) -> InstanceSpec {
             disk_bytes: 0,
         },
         scheduling: Default::default(),
+        sandbox: Default::default(),
     }
 }
 fn node(id: &str) -> Node {
