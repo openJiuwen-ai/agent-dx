@@ -150,11 +150,11 @@ def trace_records():
 
 def check_trace_links(rows):
     index={(s['traceId'],s['spanId']):s for s in rows}
-    executions=[s for s in rows if s['name']=='instance.execute']
-    assert executions,'instance execution spans missing'
+    executions=[s for s in rows if s['name']=='capsule.execute']
+    assert executions,'capsule execution spans missing'
     for span in executions:
         parent=index.get((span['traceId'],span.get('parentSpanId')))
-        assert parent and parent['name']=='instance.queue','queue parent missing or belongs to another trace'
+        assert parent and parent['name']=='capsule.queue','queue parent missing or belongs to another trace'
     return len(executions)
 
 def validate_traces(node):
@@ -165,13 +165,13 @@ def validate_traces(node):
     assert any(s['name']=='rrt.http' and s.get('parentSpanId','').strip('0') for s in rows),'RRT did not receive data request context'
     trace_ids=[]
     if node=='node1':
-        names={'edge.http','api_server.http','master.create_instance','node.create_instance','instance.queue','instance.execute','master.commit_instance'}
+        names={'edge.http','api_server.http','master.create_capsule','node.create_capsule','capsule.queue','capsule.execute','master.commit_capsule'}
         groups={}
         for span in rows:groups.setdefault(span['traceId'],set()).add(span['name'])
         trace_ids=[key for key,value in groups.items() if names <= value]
         assert trace_ids,'no complete Edge/API/Master/Node/state-commit creation trace'
-        assert any(s['name']=='node.delete_instance' for s in rows),'delete trace missing'
-    result={'status':'passed','span_count':len(rows),'services':sorted(services),'instance_executions':count,'complete_create_trace_ids':trace_ids,'rrt_context_received':True}
+        assert any(s['name']=='node.delete_capsule' for s in rows),'delete trace missing'
+    result={'status':'passed','span_count':len(rows),'services':sorted(services),'capsule_executions':count,'complete_create_trace_ids':trace_ids,'rrt_context_received':True}
     (E/f'traces-{node}.json').write_text(json.dumps(result,indent=2))
     print(f'[TRACE PASS] {node}: {len(rows)} spans; {count} queue/execution parent links; RRT context received',flush=True)
 
