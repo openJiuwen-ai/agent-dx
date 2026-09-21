@@ -59,36 +59,42 @@ ADX 将稳定的逻辑单元与可替换的物理执行分开：**Capsule** 是�
 
 ## 部署
 
-ADX 使用同一发布包按配置启动不同角色。部署环境需要准备 Linux 主机、独立运行的 sandboxd、组件证书、初始管理员 API Key、Capsule 网络，以及与主机架构一致的 `/opt/adx` 发布包。`adxctl` 读取一份仅描述**当前主机**的 YAML，默认路径是 `/etc/adx/deployment.yaml`；它负责校验、渲染和托管进程，不用于创建 Capsule。
+ADX 使用同一发布包按配置启动不同角色。部署环境需要准备 Linux 主机、独立运行的 sandboxd、组件证书、初始管理员 API Key 和 Capsule 网络。下载与主机架构一致的 release tar 包后执行：
+
+```sh
+mkdir adx-release && tar -xzf adx-release.tar.gz -C adx-release
+sudo ./adx-release/install.sh
+```
+
+安装器校验清单、文件摘要和主机架构，将版本写入 `/opt/adx/releases/<commit>` 并原子切换 `/opt/adx/current`。持久配置、数据和运行状态分别位于 `/opt/adx/config`、`/opt/adx/data`、`/opt/adx/run`，升级不会覆盖。`adxctl` 默认读取仅描述**当前主机**的 `/opt/adx/config/deployment.yaml`；它负责校验、渲染和托管进程，不用于创建 Capsule。
 
 ### 单机部署：由 ADX 托管 Redis
 
 默认 `standalone` profile 在一台主机启动 Redis、Master、内嵌 Node Proxy 的 Node Manager，以及内嵌 Edge 的 API Server。sandboxd 仍由部署环境独立托管。
 
 ```sh
-sudo install -d -m 0700 /etc/adx /etc/adx/tls /etc/adx/secrets /var/lib/adx /run/adx
-sudo /opt/adx/bin/adxctl config init --profile standalone
+sudo /opt/adx/current/bin/adxctl config init --profile standalone
 
 # 编辑证书、初始密钥、sandboxd socket、Capsule CIDR 和磁盘路径。
-sudo /opt/adx/bin/adxctl validate
-sudo /opt/adx/bin/adxctl render --output /run/adx/config-review
-sudo /opt/adx/bin/adxctl run
+sudo /opt/adx/current/bin/adxctl validate
+sudo /opt/adx/current/bin/adxctl render --output /opt/adx/run/config-review
+sudo /opt/adx/current/bin/adxctl run
 ```
 
 `run` 在前台运行 supervisor，生产环境应由 systemd 或 Pod 托管。另一个终端可查询和停止整个本机部署：
 
 ```sh
-sudo /opt/adx/bin/adxctl status
-sudo /opt/adx/bin/adxctl stop
+sudo /opt/adx/current/bin/adxctl status
+sudo /opt/adx/current/bin/adxctl stop
 ```
 
 ### 单机部署：使用外置 Redis
 
 ```sh
-sudo /opt/adx/bin/adxctl config init --profile standalone-external-redis
-sudoedit /etc/adx/deployment.yaml   # 设置实际 redis_url 和 namespace
-sudo /opt/adx/bin/adxctl validate
-sudo /opt/adx/bin/adxctl run
+sudo /opt/adx/current/bin/adxctl config init --profile standalone-external-redis
+sudoedit /opt/adx/config/deployment.yaml   # 设置实际 redis_url 和 namespace
+sudo /opt/adx/current/bin/adxctl validate
+sudo /opt/adx/current/bin/adxctl run
 ```
 
 外置 Redis 不由 `adxctl status`、重启预算或 `stop` 管理。所有组件必须使用同一个持久化 Redis 和 namespace。
@@ -99,16 +105,16 @@ sudo /opt/adx/bin/adxctl run
 
 ```sh
 # 控制节点：Master；如需本机托管 Redis，在完整 YAML 中增加 redis 角色。
-sudo /opt/adx/bin/adxctl config init --profile master
+sudo /opt/adx/current/bin/adxctl config init --profile master
 
 # 每个 Worker：Node Manager，默认同进程运行 Node Proxy。
-sudo /opt/adx/bin/adxctl config init --profile node
+sudo /opt/adx/current/bin/adxctl config init --profile node
 
 # 接入节点：默认由 API Server 内嵌 Edge。
-sudo /opt/adx/bin/adxctl config init --profile edge-api
+sudo /opt/adx/current/bin/adxctl config init --profile edge-api
 ```
 
-每台主机都要修改自己的 `/etc/adx/deployment.yaml`，使用相同的 `redis_url`、`namespace` 和匹配的 mTLS 信任关系；每个 Worker 配置唯一 `node_id` 以及其他节点可访问的控制面和 Proxy 地址。推荐按 Redis → Master → Workers → API Server（含 Edge）的顺序启动。只有显式设置 `proxy_mode: standalone` 或 `edge_mode: standalone` 时，对应组件才作为独立进程部署。
+每台主机都要修改自己的 `/opt/adx/config/deployment.yaml`，使用相同的 `redis_url`、`namespace` 和匹配的 mTLS 信任关系；每个 Worker 配置唯一 `node_id` 以及其他节点可访问的控制面和 Proxy 地址。推荐按 Redis → Master → Workers → API Server（含 Edge）的顺序启动。只有显式设置 `proxy_mode: standalone` 或 `edge_mode: standalone` 时，对应组件才作为独立进程部署。
 
 YAML 字符串字段支持 `${VAR}` 和 `${VAR:-default}`。可用 `adxctl config dump` 检查环境变量和 profile 合并后的完整配置。Kubernetes 中仍运行这些进程，由 Pod 管理 `adxctl run`、证书、Redis 连接和 sandboxd 依赖。
 
@@ -120,7 +126,7 @@ YAML 字符串字段支持 `${VAR}` 和 `${VAR:-default}`。可用 `adxctl confi
 
 ```sh
 python3 -m venv /opt/adx-client
-/opt/adx-client/bin/python -m pip install /opt/adx/sdk/adx_sandbox-*.whl
+/opt/adx-client/bin/python -m pip install /opt/adx/current/sdk/adx_sandbox-*.whl
 
 export ADX_SERVER_ADDRESS=adx.example.com:8443
 export ADX_GATEWAY_ADDRESS=adx.example.com:8443

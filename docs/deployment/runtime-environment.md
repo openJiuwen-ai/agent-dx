@@ -8,12 +8,12 @@
     "rootfs": {
       "runtime_class": "runsc",
       "type": "local",
-      "path": "/opt/adx/runtime/adx-runtime-rootfs.img",
+      "path": "/opt/adx/current/runtime/adx-runtime-rootfs.img",
       "readonly": false
     },
     "bootstrap": {
       "type": "erofs",
-      "root": "/opt/adx/runtime/adx-runtime-rootfs.img",
+      "root": "/opt/adx/current/runtime/adx-runtime-rootfs.img",
       "target": "/__adx",
       "entrypoint": ["/__adx/usr/local/bin/rrt-runtime"],
       "image_process_config": "/etc/adx-image-process.json"

@@ -2,7 +2,7 @@
 
 `adxctl` 是 ADX 统一发布包的本机进程部署工具。它读取一份 YAML 部署文件，生成本机各组件的最终配置，并以前台 supervisor 方式启动这些组件。它不创建 Capsule，也不调用 Sandbox API。
 
-一份部署 YAML 只描述**当前主机**。单机部署可以在一份文件中包含所有角色；多机部署时，每台主机使用自己的文件，各文件通过相同的 `redis_url` 和 `namespace` 加入同一集群。`adxctl` 默认读取 `/etc/adx/deployment.yaml`，也可用全局 `-c/--config` 或 `ADX_DEPLOYMENT_CONFIG` 选择其他文件。它只接受 `.yaml` 或 `.yml`，不接受 JSON 部署文件。
+一份部署 YAML 只描述**当前主机**。单机部署可以在一份文件中包含所有角色；多机部署时，每台主机使用自己的文件，各文件通过相同的 `redis_url` 和 `namespace` 加入同一集群。`adxctl` 默认读取 `/opt/adx/config/deployment.yaml`，也可用全局 `-c/--config` 或 `ADX_DEPLOYMENT_CONFIG` 选择其他文件。它只接受 `.yaml` 或 `.yml`，不接受 JSON 部署文件。
 
 ## 组件名
 
@@ -23,34 +23,34 @@ sandboxd 不属于上述角色，始终由部署环境独立启动。RRT 位于�
 
 ```sh
 # 首次生成默认单机配置：全角色＋adxctl 托管的本地 Redis
-sudo /opt/adx/bin/adxctl config init
+sudo /opt/adx/current/bin/adxctl config init
 
 # 查看模板但不写文件；profile 还支持 standalone-external-redis/master/node/edge-api
-/opt/adx/bin/adxctl config template --profile node
+/opt/adx/current/bin/adxctl config template --profile node
 
 # 正式部署可生成只引用内置 profile 的精简文件
-sudo /opt/adx/bin/adxctl config init --profile node --compact
+sudo /opt/adx/current/bin/adxctl config init --profile node --compact
 export ADX_NODE_ID=worker-a
 
 # 展示环境变量与覆盖项合并后的完整有效配置
-sudo /opt/adx/bin/adxctl config dump
+sudo /opt/adx/current/bin/adxctl config dump
 
-# 编辑生成的 /etc/adx/deployment.yaml 后检查，不启动进程
-sudo /opt/adx/bin/adxctl validate
+# 编辑生成的 /opt/adx/config/deployment.yaml 后检查，不启动进程
+sudo /opt/adx/current/bin/adxctl validate
 
 # 生成最终组件配置，供上线前审查；输出目录必须不存在
-sudo /opt/adx/bin/adxctl render \
-  --output /run/adx/config-review
+sudo /opt/adx/current/bin/adxctl render \
+  --output /opt/adx/run/config-review
 
 # 前台启动 supervisor；start 是 run 的别名
-sudo /opt/adx/bin/adxctl run
+sudo /opt/adx/current/bin/adxctl run
 
 # 以下命令在另一个终端执行，读取同一份默认配置
-sudo /opt/adx/bin/adxctl status
-sudo /opt/adx/bin/adxctl stop
+sudo /opt/adx/current/bin/adxctl status
+sudo /opt/adx/current/bin/adxctl stop
 
 # 非默认位置可在所有子命令前后传入，也可设置 ADX_DEPLOYMENT_CONFIG
-/opt/adx/bin/adxctl -c /srv/adx/node.yaml validate
+/opt/adx/current/bin/adxctl -c /srv/adx/node.yaml validate
 ```
 
 `config init` 默认选择 `standalone` profile，即单机全角色并托管本地 Redis。它创建父目录并以 `0600` 写入完整模板；增加 `--compact` 时只写入 `schema_version` 和 `profile`，运行时再合并内置默认值。目标已存在时会失败，只有显式增加 `--force` 才覆盖。其他 profile 如下：
@@ -77,8 +77,8 @@ sudo /opt/adx/bin/adxctl stop
 
 ```yaml
 schema_version: 1
-package_dir: /opt/adx
-state_dir: /run/adx/control
+package_dir: /opt/adx/current
+state_dir: /opt/adx/run/control
 redis_url: redis://127.0.0.1:6379/
 namespace: adx
 restart_limit: 3
@@ -109,7 +109,7 @@ services: []
 schema_version: 1
 profile: node
 
-state_dir: "${ADX_STATE_DIR:-/run/adx/node}"
+state_dir: "${ADX_STATE_DIR:-/opt/adx/run/node}"
 redis_url: "${ADX_REDIS_URL}"
 namespace: "${ADX_NAMESPACE:-adx}"
 
@@ -122,7 +122,7 @@ service_overrides:
       node_id: "${ADX_NODE_ID}"
       advertised_address: "${ADX_NODE_ADDRESS}"
       tls:
-        certificate: "${ADX_NODE_CERT:-/etc/adx/tls/node-1.pem}"
+        certificate: "${ADX_NODE_CERT:-/opt/adx/config/tls/node-1.pem}"
     env:
       ADX_DATA_PLANE_NODE_PROXY_BIND: "${ADX_PROXY_BIND:-0.0.0.0:19002}"
 ```
@@ -146,8 +146,8 @@ service_overrides:
 部署环境不同但结构相同时，可在任意 YAML 字符串值中引用环境变量：
 
 ```yaml
-package_dir: "${ADX_PACKAGE_DIR:-/opt/adx}"
-state_dir: "${ADX_STATE_DIR:-/run/adx/control}"
+package_dir: "${ADX_PACKAGE_DIR:-/opt/adx/current}"
+state_dir: "${ADX_STATE_DIR:-/opt/adx/run/control}"
 redis_url: "${ADX_REDIS_URL}"
 namespace: "${ADX_NAMESPACE:-adx}"
 services:
@@ -172,15 +172,14 @@ services:
 
 ### 使用 `adxctl` 托管 Redis
 
-发布包提供完整示例 [deployment-standalone-managed-redis.yaml](../../build/config/examples/deployment-standalone-managed-redis.yaml)。其中包含 `redis` 角色，Redis 只监听 `127.0.0.1:6379`，数据写入 `/var/lib/adx/redis`，使用 AOF `everysec`。
+发布包提供完整示例 [deployment-standalone-managed-redis.yaml](../../build/config/examples/deployment-standalone-managed-redis.yaml)。其中包含 `redis` 角色，Redis 只监听 `127.0.0.1:6379`，数据写入 `/opt/adx/data/redis`，使用 AOF `everysec`。
 
 ```sh
-sudo install -d -m 0700 /etc/adx /run/adx /var/lib/adx/redis
-sudo /opt/adx/bin/adxctl config init
+sudo /opt/adx/current/bin/adxctl config init
 
 # 修改证书路径、监听地址、Capsule CIDR、sandboxd socket 和磁盘路径后执行
-sudo /opt/adx/bin/adxctl validate
-sudo /opt/adx/bin/adxctl run
+sudo /opt/adx/current/bin/adxctl validate
+sudo /opt/adx/current/bin/adxctl run
 ```
 
 supervisor 按 Redis → Master → Node Manager（含内嵌 Proxy）→ API Server（含内嵌 Edge）的顺序拉起进程。启动顺序不替代业务就绪检查；应等待节点完成 Master 对账和 Node Proxy 全量绑定同步，再使用 SDK 创建实例。显式分进程时，独立 Node Proxy 会在 Node Manager 前启动，独立 Edge 会在 API Server 后启动。
@@ -206,11 +205,11 @@ supervisor 按 Redis → Master → Node Manager（含内嵌 Proxy）→ API Ser
 使用 `master` profile，其中只包含 `master` 角色：
 
 ```sh
-sudo /opt/adx/bin/adxctl config init --profile master
-sudo vi /etc/adx/deployment.yaml
+sudo /opt/adx/current/bin/adxctl config init --profile master
+sudo vi /opt/adx/config/deployment.yaml
 # 修改 redis_url、advertised_address、TLS peers 和 bootstrap key 路径
-sudo /opt/adx/bin/adxctl validate
-sudo /opt/adx/bin/adxctl run
+sudo /opt/adx/current/bin/adxctl validate
+sudo /opt/adx/current/bin/adxctl run
 ```
 
 `listen` 是 Master 本机监听地址；`advertised_address` 必须是 Node Manager、API Server 和 Edge 可访问的 mTLS 地址。Master 会将该地址带 TTL 写入共享 Redis。`tls.peers` 必须登记实际 API Server、Edge 和所有 `node:<node_id>` 的叶证书 DER。
@@ -222,12 +221,12 @@ sudo /opt/adx/bin/adxctl run
 每个 Worker 使用 `node` profile，默认只启动 `node-manager` 进程，并在其中嵌入 Node Proxy：
 
 ```sh
-sudo /opt/adx/bin/adxctl config init --profile node
-sudo vi /etc/adx/deployment.yaml
+sudo /opt/adx/current/bin/adxctl config init --profile node
+sudo vi /opt/adx/config/deployment.yaml
 # 设置唯一 node_id、可达的 advertised_address/proxy_address、Redis、证书和网络 CIDR
 # 确认外部 sandboxd 已创建 /run/sandboxd/sandboxd.sock
-sudo /opt/adx/bin/adxctl validate
-sudo /opt/adx/bin/adxctl run
+sudo /opt/adx/current/bin/adxctl validate
+sudo /opt/adx/current/bin/adxctl run
 ```
 
 每个节点的 `node_id` 必须唯一，并与 Master `tls.peers` 中的 `node:<node_id>` 对应。`advertised_address` 是控制 RPC 地址，`proxy_address` 是 Edge 连接的数据面地址。内嵌 Node Proxy 的 `ADX_DATA_PLANE_*` 配置位于 `node-manager.env`；其中 `ADX_DATA_PLANE_ALLOWED_TARGET_CIDRS` 必须覆盖 sandboxd 实际分配的 Capsule 网段。
@@ -241,11 +240,11 @@ sandboxd 仍由节点部署环境单独管理。`adxctl stop` 只停止 ADX 进�
 使用 `edge-api` profile。部署文件保留 `api-server` 和 `edge` 两个逻辑角色，默认只启动一个 `adx-api-server` 进程：
 
 ```sh
-sudo /opt/adx/bin/adxctl config init --profile edge-api
-sudo vi /etc/adx/deployment.yaml
+sudo /opt/adx/current/bin/adxctl config init --profile edge-api
+sudo vi /opt/adx/config/deployment.yaml
 # 设置共享 Redis、Edge 公网证书、允许的客户端 CIDR 和对外监听地址
-sudo /opt/adx/bin/adxctl validate
-sudo /opt/adx/bin/adxctl run
+sudo /opt/adx/current/bin/adxctl validate
+sudo /opt/adx/current/bin/adxctl run
 ```
 
 API Frontend 对应 `role: "api-server"` 和 `adx-api-server`。示例将 API 监听绑定到 `127.0.0.1:8888` 并启用 `loopback_http`。`role: "edge"` 提供 Edge 的控制配置和 `ADX_DATA_PLANE_*` 环境；默认由 `adxctl render` 合并进 API Server 进程。Edge 对外监听 `0.0.0.0:8443`，将 Sandbox 控制请求转发到同进程的 API 回环监听，并按 Master 路由把实例数据请求转发到目标 Node Proxy。

@@ -11,7 +11,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub const DEFAULT_CONFIG_PATH: &str = "/etc/adx/deployment.yaml";
+pub const DEFAULT_CONFIG_PATH: &str = "/opt/adx/config/deployment.yaml";
 pub use crate::config::Profile as ConfigProfile;
 
 /// Deploy and supervise ADX control-plane and data-plane services.

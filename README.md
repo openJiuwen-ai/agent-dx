@@ -60,36 +60,42 @@ The compatibility HTTP and SDK contracts still expose names such as `instanceId`
 
 ## Deployment
 
-The same ADX release package can start different roles by configuration. The deployment environment must provide a Linux host, separately managed sandboxd, component certificates, an initial administrator API Key, Capsule networking, and an architecture-matching release installed at `/opt/adx`. `adxctl` reads one YAML file describing the **current host**, by default `/etc/adx/deployment.yaml`. It validates, renders, and supervises processes; it does not create Capsules.
+The same ADX release package can start different roles by configuration. The deployment environment must provide a Linux host, separately managed sandboxd, component certificates, an initial administrator API Key, and Capsule networking. Extract the architecture-matching tar package into a new directory and run its verified installer:
+
+```sh
+mkdir adx-release && tar -xzf adx-release.tar.gz -C adx-release
+sudo ./adx-release/install.sh
+```
+
+The installer verifies the manifest, file digests and host architecture, installs the release under `/opt/adx/releases/<commit>`, and atomically switches `/opt/adx/current`. It creates the persistent `/opt/adx/config`, `/opt/adx/data`, and `/opt/adx/run` roots without overwriting their contents. Reinstalling the same release requires `--replace`. `adxctl config init` creates `/opt/adx/config/deployment.yaml`; `adxctl` then validates, renders, and supervises the roles described for the **current host**. It does not create Capsules.
 
 ### Standalone with ADX-managed Redis
 
 The default `standalone` profile starts Redis, Master, Node Manager with embedded Node Proxy, and API Server with embedded Edge on one host. sandboxd remains independently managed by the deployment environment.
 
 ```sh
-sudo install -d -m 0700 /etc/adx /etc/adx/tls /etc/adx/secrets /var/lib/adx /run/adx
-sudo /opt/adx/bin/adxctl config init --profile standalone
+sudo /opt/adx/current/bin/adxctl config init --profile standalone
 
 # Edit certificates, the bootstrap key, sandboxd socket, Capsule CIDR, and disk paths.
-sudo /opt/adx/bin/adxctl validate
-sudo /opt/adx/bin/adxctl render --output /run/adx/config-review
-sudo /opt/adx/bin/adxctl run
+sudo /opt/adx/current/bin/adxctl validate
+sudo /opt/adx/current/bin/adxctl render --output /opt/adx/run/config-review
+sudo /opt/adx/current/bin/adxctl run
 ```
 
 `run` keeps the supervisor in the foreground; production deployments should let systemd or the Pod supervise it. In another terminal, inspect or stop the host deployment:
 
 ```sh
-sudo /opt/adx/bin/adxctl status
-sudo /opt/adx/bin/adxctl stop
+sudo /opt/adx/current/bin/adxctl status
+sudo /opt/adx/current/bin/adxctl stop
 ```
 
 ### Standalone with external Redis
 
 ```sh
-sudo /opt/adx/bin/adxctl config init --profile standalone-external-redis
-sudoedit /etc/adx/deployment.yaml   # Set the real redis_url and namespace.
-sudo /opt/adx/bin/adxctl validate
-sudo /opt/adx/bin/adxctl run
+sudo /opt/adx/current/bin/adxctl config init --profile standalone-external-redis
+sudoedit /opt/adx/config/deployment.yaml   # Set the real redis_url and namespace.
+sudo /opt/adx/current/bin/adxctl validate
+sudo /opt/adx/current/bin/adxctl run
 ```
 
 External Redis is outside `adxctl status`, restart budgets, and `stop`. Every component must use the same persistent Redis and namespace.
@@ -100,16 +106,16 @@ Generate an independent configuration on the control host, every worker, and the
 
 ```sh
 # Control host: Master. Add a redis role to the full YAML if this host manages Redis.
-sudo /opt/adx/bin/adxctl config init --profile master
+sudo /opt/adx/current/bin/adxctl config init --profile master
 
 # Every worker: Node Manager with embedded Node Proxy by default.
-sudo /opt/adx/bin/adxctl config init --profile node
+sudo /opt/adx/current/bin/adxctl config init --profile node
 
 # Ingress host: API Server with embedded Edge by default.
-sudo /opt/adx/bin/adxctl config init --profile edge-api
+sudo /opt/adx/current/bin/adxctl config init --profile edge-api
 ```
 
-Edit `/etc/adx/deployment.yaml` on each host. All files use the same `redis_url`, `namespace`, and matching mTLS trust; each worker needs a unique `node_id` and reachable control and proxy addresses. Start Redis → Master → workers → API Server (including Edge). Node Proxy and Edge become separate processes only when `proxy_mode: standalone` or `edge_mode: standalone` is selected explicitly.
+Edit `/opt/adx/config/deployment.yaml` on each host. All files use the same `redis_url`, `namespace`, and matching mTLS trust; each worker needs a unique `node_id` and reachable control and proxy addresses. Start Redis → Master → workers → API Server (including Edge). Node Proxy and Edge become separate processes only when `proxy_mode: standalone` or `edge_mode: standalone` is selected explicitly.
 
 YAML string values support `${VAR}` and `${VAR:-default}`. Use `adxctl config dump` to inspect the fully merged profile, environment, and host overrides. Kubernetes runs the same processes in Pods while the deployment environment provides `adxctl run`, certificates, Redis connectivity, and sandboxd.
 
@@ -121,7 +127,7 @@ The release package contains the `adx-sandbox` wheel under `sdk/`. After the dep
 
 ```sh
 python3 -m venv /opt/adx-client
-/opt/adx-client/bin/python -m pip install /opt/adx/sdk/adx_sandbox-*.whl
+/opt/adx-client/bin/python -m pip install /opt/adx/current/sdk/adx_sandbox-*.whl
 
 export ADX_SERVER_ADDRESS=adx.example.com:8443
 export ADX_GATEWAY_ADDRESS=adx.example.com:8443

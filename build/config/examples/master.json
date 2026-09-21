@@ -6,19 +6,19 @@
   "placement": "pack",
   "rpc_timeout_seconds": 30,
   "tls": {
-    "ca": "/etc/adx/tls/ca.pem",
-    "certificate": "/etc/adx/tls/master.pem",
-    "private_key": "/etc/adx/tls/master.key",
+    "ca": "/opt/adx/config/tls/ca.pem",
+    "certificate": "/opt/adx/config/tls/master.pem",
+    "private_key": "/opt/adx/config/tls/master.key",
     "server_name": "adx.internal",
     "peers": {
-      "api-server": "/etc/adx/tls/api-server.der",
-      "node:node-1": "/etc/adx/tls/node-1.der",
-      "edge": "/etc/adx/tls/edge.der"
+      "api-server": "/opt/adx/config/tls/api-server.der",
+      "node:node-1": "/opt/adx/config/tls/node-1.der",
+      "edge": "/opt/adx/config/tls/edge.der"
     }
   },
   "bootstrap_credentials": [
     {
-      "key_file": "/etc/adx/secrets/admin-key",
+      "key_file": "/opt/adx/config/secrets/admin-key",
       "tenant_id": "admin",
       "administrator": true,
       "expires_at_unix_seconds": 0

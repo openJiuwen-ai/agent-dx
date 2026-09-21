@@ -22,7 +22,7 @@ Node Manager 的 `capsule_operation_completed` 事件记录 capsule_id、generat
 | `ADX_COLLECTOR_STATE` | Collector 文件读取位置和发送队列的持久化目录 |
 | `ADX_OTLP_ENDPOINT` | 实际日志后端的 OTLP/HTTP 基地址，Exporter 追加 `/v1/logs` |
 
-3. 由部署环境启动 Collector：`otelcol-contrib --config=/etc/adx/collector.json`。样例以 OTLP JSON 编码发送；生产后端需要支持该编码。按后端要求补充 TLS CA、客户端证书或认证扩展，凭证从受保护配置读取。
+3. 由部署环境启动 Collector：`otelcol-contrib --config=/opt/adx/config/collector.json`。样例以 OTLP JSON 编码发送；生产后端需要支持该编码。按后端要求补充 TLS CA、客户端证书或认证扩展，凭证从受保护配置读取。
 
 建议 Supervisor 的配置起点：
 

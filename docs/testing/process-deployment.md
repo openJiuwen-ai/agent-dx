@@ -31,7 +31,7 @@ adxctl stop
 
 `start` 与 `run` 相同，前台运行 supervisor，适合直接作为服务或 Pod 的入口进程。状态查询反映子进程 PID、重启次数和失败标记，**不等同于平台业务就绪**。同一 `state_dir` 只允许一个 supervisor，命令经当前进程的 UDS 执行，不读取 PID 文件后盲目 kill。
 
-默认配置路径为 `/etc/adx/deployment.yaml`；可通过全局 `-c/--config` 或 `ADX_DEPLOYMENT_CONFIG` 修改。`config init` 默认生成带本地托管 Redis 的 standalone 配置，并支持 `standalone-external-redis`、`master`、`node` 和 `edge-api` profile。统一配置示例位于 `build/config/examples/`。`services` 选择本机角色；同一包可以部署 Master 主机或工作节点。每个服务的原有细节放在 `config` 和 `env` 中；公共 Redis／namespace 和管理 socket 由 CLI 注入。当前校验覆盖部署结构、公共字段、Redis 和 socket 等约束；TLS 文件、资源观测及其他组件细节仍由对应服务执行最终校验。
+默认配置路径为 `/opt/adx/config/deployment.yaml`；可通过全局 `-c/--config` 或 `ADX_DEPLOYMENT_CONFIG` 修改。`config init` 默认生成带本地托管 Redis 的 standalone 配置，并支持 `standalone-external-redis`、`master`、`node` 和 `edge-api` profile。统一配置示例位于 `build/config/examples/`。`services` 选择本机角色；同一包可以部署 Master 主机或工作节点。每个服务的原有细节放在 `config` 和 `env` 中；公共 Redis／namespace 和管理 socket 由 CLI 注入。当前校验覆盖部署结构、公共字段、Redis 和 socket 等约束；TLS 文件、资源观测及其他组件细节仍由对应服务执行最终校验。
 
 配置目录权限为 0700、生成文件和管理 socket 为 0600。日志在 `state_dir/logs/<service-id>.log`；状态响应不返回环境变量或配置正文。统一部署的 `logging` 可启用 Supervisor 输出接管、大小/时间滚动、gzip 压缩及历史保留；见[日志配置与故障契约](log-rotation.md)。
 
@@ -60,7 +60,7 @@ sandboxd 始终由部署环境独立托管，角色枚举不允许 supervisor �
   "config": {
     "bind": "127.0.0.1",
     "port": 6379,
-    "data_dir": "/var/lib/adx/redis",
+    "data_dir": "/opt/adx/data/redis",
     "appendfsync": "everysec"
   }
 }

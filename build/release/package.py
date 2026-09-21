@@ -28,6 +28,7 @@ def assemble(binary_dir, redis, wheel, output, commit, dirty, target, profile):
     elif runtime_root.is_file():
         inputs["runtime/adx-runtime-rootfs.img"] = runtime_root
     inputs["bin/redis-server"] = redis
+    inputs["install.sh"] = ROOT / "build/release/install.sh"
     if not wheel.name.startswith("adx_sandbox-") or wheel.suffix != ".whl":
         raise ValueError("an adx_sandbox wheel is required")
     inputs[f"sdk/{wheel.name}"] = wheel
@@ -63,7 +64,7 @@ def assemble(binary_dir, redis, wheel, output, commit, dirty, target, profile):
             dest = stage / name
             dest.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, dest)
-            if name.startswith(("bin/", "runtime/")):
+            if name.startswith(("bin/", "runtime/")) or name == "install.sh":
                 dest.chmod(0o755)
         manifest = {"schema_version": 1, "commit": commit, "dirty": dirty,
                     "target": target, "profile": profile, "redis_version": "7.2.5",
@@ -78,7 +79,11 @@ def verify(directory):
     if manifest.get("schema_version") != 1 or not isinstance(manifest.get("files"), dict):
         raise ValueError("invalid package manifest")
     expected = set(manifest["files"])
-    required = {f"bin/{b}" for b in BINARIES} | {"bin/redis-server", "runtime/rrt-runtime"}
+    required = {f"bin/{b}" for b in BINARIES} | {
+        "bin/redis-server",
+        "install.sh",
+        "runtime/rrt-runtime",
+    }
     if manifest.get("profile") == "release" and "linux" in manifest.get("target", ""):
         required.add("runtime/adx-runtime-rootfs.img")
     if not required.issubset(expected) or not any(n.startswith("sdk/adx_sandbox-") and n.endswith(".whl") for n in expected):

@@ -1,8 +1,8 @@
 {
   "listen": "0.0.0.0:8443",
-  "ca": "/etc/adx/tls/ca.pem",
-  "certificate": "/etc/adx/tls/api-server.pem",
-  "private_key": "/etc/adx/tls/api-server.key",
+  "ca": "/opt/adx/config/tls/ca.pem",
+  "certificate": "/opt/adx/config/tls/api-server.pem",
+  "private_key": "/opt/adx/config/tls/api-server.key",
   "server_name": "adx.internal",
   "rpc_timeout_seconds": 90,
   "cache_entries": 10000,

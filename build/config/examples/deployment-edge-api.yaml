@@ -1,6 +1,6 @@
 schema_version: 1
-package_dir: /opt/adx
-state_dir: /run/adx/ingress
+package_dir: /opt/adx/current
+state_dir: /opt/adx/run/ingress
 redis_url: redis://redis.internal:6379/
 namespace: adx
 restart_limit: 3
@@ -11,9 +11,9 @@ services:
     role: api-server
     config:
       listen: 127.0.0.1:8888
-      ca: /etc/adx/tls/ca.pem
-      certificate: /etc/adx/tls/api-server.pem
-      private_key: /etc/adx/tls/api-server.key
+      ca: /opt/adx/config/tls/ca.pem
+      certificate: /opt/adx/config/tls/api-server.pem
+      private_key: /opt/adx/config/tls/api-server.key
       server_name: adx.internal
       rpc_timeout_seconds: 90
       cache_entries: 10000
@@ -24,12 +24,12 @@ services:
     role: edge
     config:
       tls:
-        ca: /etc/adx/tls/ca.pem
-        certificate: /etc/adx/tls/edge.pem
-        private_key: /etc/adx/tls/edge.key
+        ca: /opt/adx/config/tls/ca.pem
+        certificate: /opt/adx/config/tls/edge.pem
+        private_key: /opt/adx/config/tls/edge.key
         server_name: adx.internal
         peers:
-          master: /etc/adx/tls/master.der
+          master: /opt/adx/config/tls/master.der
       rpc_timeout_seconds: 5
       refresh_seconds: 2
       auth_cache_seconds: 10
@@ -37,15 +37,15 @@ services:
     env:
       ADX_DATA_PLANE_EDGE_FRONTEND_CONTROL_PLANE_ROUTES: exact:/,exact:/healthz,prefix:/api/instances,prefix:/api/sandbox,prefix:/api/admin/v1/keys
       ADX_DATA_PLANE_EDGE_FRONTEND_TLS_BIND: 0.0.0.0:8443
-      ADX_DATA_PLANE_EDGE_FRONTEND_TLS_CERT: /etc/adx/tls/edge-public.pem
-      ADX_DATA_PLANE_EDGE_FRONTEND_TLS_KEY: /etc/adx/tls/edge-public.key
+      ADX_DATA_PLANE_EDGE_FRONTEND_TLS_CERT: /opt/adx/config/tls/edge-public.pem
+      ADX_DATA_PLANE_EDGE_FRONTEND_TLS_KEY: /opt/adx/config/tls/edge-public.key
       ADX_DATA_PLANE_EDGE_FRONTEND_ALLOWED_CLIENT_CIDRS: 127.0.0.1/32
       ADX_DATA_PLANE_EDGE_FRONTEND_CONTROL_PLANE_ADDRESS: 127.0.0.1:8888
       ADX_DATA_PLANE_EDGE_FRONTEND_NODE_SECURITY_MODE: mtls
-      ADX_DATA_PLANE_EDGE_FRONTEND_NODE_TLS_CA: /etc/adx/tls/ca.pem
+      ADX_DATA_PLANE_EDGE_FRONTEND_NODE_TLS_CA: /opt/adx/config/tls/ca.pem
       ADX_DATA_PLANE_EDGE_FRONTEND_NODE_TLS_SERVER_NAME: adx.internal
-      ADX_DATA_PLANE_EDGE_FRONTEND_NODE_TLS_CLIENT_CERT: /etc/adx/tls/edge.pem
-      ADX_DATA_PLANE_EDGE_FRONTEND_NODE_TLS_CLIENT_KEY: /etc/adx/tls/edge.key
+      ADX_DATA_PLANE_EDGE_FRONTEND_NODE_TLS_CLIENT_CERT: /opt/adx/config/tls/edge.pem
+      ADX_DATA_PLANE_EDGE_FRONTEND_NODE_TLS_CLIENT_KEY: /opt/adx/config/tls/edge.key
 logging:
   enabled: true
   max_file_bytes: 104857600
@@ -58,11 +58,11 @@ environment:
   rootfs:
     runtime_class: runsc
     type: local
-    path: /opt/adx/runtime/adx-runtime-rootfs.img
+    path: /opt/adx/current/runtime/adx-runtime-rootfs.img
     readonly: false
   bootstrap:
     type: erofs
-    root: /opt/adx/runtime/adx-runtime-rootfs.img
+    root: /opt/adx/current/runtime/adx-runtime-rootfs.img
     target: /__adx
     entrypoint:
       - /__adx/usr/local/bin/rrt-runtime
