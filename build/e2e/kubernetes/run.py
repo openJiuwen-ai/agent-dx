@@ -229,7 +229,8 @@ def main():
         try:
             if not a.kubeconfig.is_file():
                 raise ValueError('target kubeconfig does not exist')
-            m, published = identity(a.bundle, a.registry_images, os.getenv('BUILDKITE_COMMIT'), bool(os.getenv('BUILDKITE')))
+            expected_commit = os.getenv('ADX_E2E_ARTIFACT_COMMIT', os.getenv('BUILDKITE_COMMIT'))
+            m, published = identity(a.bundle, a.registry_images, expected_commit, bool(os.getenv('BUILDKITE')))
             (output / 'bundle.json').write_text(json.dumps(m, indent=2))
             (output / 'registry-images.json').write_text(json.dumps(published, indent=2))
             user_image = m['base_images']['rrt']
