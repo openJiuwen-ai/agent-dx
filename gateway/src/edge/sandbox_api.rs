@@ -151,7 +151,11 @@ impl PlatformSandbox {
                 _ => SandboxPhase::Creating,
             },
             ready: false,
-            runtime_id: (!record.runtime_id.is_empty()).then(|| record.runtime_id.clone()),
+            runtime_id: record
+                .runtime
+                .as_ref()
+                .filter(|runtime| !runtime.id.is_empty())
+                .map(|runtime| runtime.id.clone()),
             message: None,
         };
         if result.phase != SandboxPhase::Running {
@@ -346,7 +350,7 @@ fn connect_target(record: &pb::CapsuleRecord, port: u16) -> Result<ConnectTarget
     Ok(ConnectTarget {
         instance_id: spec.id.clone(),
         workload_id: runtime.id.clone(),
-        target_ip: record
+        target_ip: runtime
             .ip
             .parse()
             .map_err(|_| SandboxError::Unavailable("runtime address unavailable".into()))?,
@@ -934,8 +938,10 @@ mod tests {
                 generation: 1,
                 devices: vec![],
             }),
-            runtime_id: "sandbox-id-1".into(),
-            runtime_ip: "10.1.1.2".into(),
+            runtime: Some(pb::Runtime {
+                id: "sandbox-id-1".into(),
+                ip: "10.1.1.2".into(),
+            }),
             ..Default::default()
         };
         validate_record(Some(&record), "tenant", "sandbox-id").unwrap();
@@ -944,7 +950,7 @@ mod tests {
             connect_target(&record, 8080).unwrap().workload_id,
             "sandbox-id-1"
         );
-        record.runtime_id = "sandbox-id-2".into();
+        record.runtime.as_mut().unwrap().id = "sandbox-id-2".into();
         assert!(connect_target(&record, 8080).is_err());
     }
     struct Fake;
