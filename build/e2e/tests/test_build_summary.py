@@ -22,7 +22,7 @@ def write(root, name, value):
 
 
 class BuildSummaryTests(unittest.TestCase):
-    def test_cumulative_artifacts_and_actual_placement(self):
+    def test_independent_pipeline_summaries_and_actual_placement(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             write(root, 'release-manifest.json', {'target': 'linux-test', 'profile': 'release',
@@ -31,19 +31,19 @@ class BuildSummaryTests(unittest.TestCase):
             (root / 'sdk').mkdir()
             (root / 'sdk/adx_sandbox-test.whl').write_bytes(b'wheel fixture')
             release = summary.collect(root, 'release', 0, COMMIT)
-            write(root, 'summaries/release.json', release)
+            self.assertEqual(set(release['stages']), {'release'})
+            self.assertIn('artifact://out/buildkite/adx-release.tar.gz', summary.render(release))
             write(root, 'bundle/bundle.json', {'base_images': {}, 'backend': {'sandboxd_revision': 'b' * 40}})
             write(root, 'bundle/registry-images.json', {'references': {'node': 'registry/node@sha256:' + 'c' * 64}})
             images = summary.collect(root, 'images', 0, COMMIT)
+            self.assertEqual(set(images['stages']), {'images'})
             write(root, 'summaries/images.json', images)
             write(root, 'acceptance/result.json', {'status': 'passed', 'checks': ['sdk', 'auth', 'capacity', 'restart', 'stop'],
                                                   'cleanup_errors': [], 'missing_checks': [], 'error': None})
             write(root, 'acceptance/placement.json', [{'pod': n, 'host': 'worker-a', 'ip': '10.0.0.1'} for n in ['node1', 'node2']])
             final = summary.collect(root, 'e2e', 0, COMMIT)
             text = summary.render(final)
-            self.assertEqual(set(final['stages']), {'release', 'images', 'e2e'})
-            self.assertIn('artifact://out/buildkite/adx-release.tar.gz', text)
-            self.assertIn('artifact://out/buildkite/sdk/adx_sandbox-test.whl', text)
+            self.assertEqual(set(final['stages']), {'images', 'e2e'})
             self.assertIn('registry/node@sha256:', text)
             self.assertIn('同一宿主节点', text)
             self.assertIn('auth, capacity, restart, stop', text)
@@ -51,6 +51,14 @@ class BuildSummaryTests(unittest.TestCase):
                 summary.collect(root, 'e2e', 0, 'd' * 40)
             (root / 'acceptance/result.json').unlink()
             with self.assertRaisesRegex(ValueError, 'evidence missing'):
+                summary.collect(root, 'e2e', 0, COMMIT)
+
+    def test_e2e_still_requires_image_summary(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            write(root, 'acceptance/result.json', {'status': 'passed', 'checks': [],
+                                                   'cleanup_errors': [], 'missing_checks': []})
+            with self.assertRaisesRegex(ValueError, 'previous stage summary missing'):
                 summary.collect(root, 'e2e', 0, COMMIT)
 
     def test_collector_summary_requires_both_nodes(self):

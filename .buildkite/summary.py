@@ -21,7 +21,10 @@ def code(value):
 
 
 def collect(root, stage, exit_code, commit):
-    previous = {'images': 'release', 'e2e': 'images'}.get(stage)
+    # Base packaging and Full acceptance are independent Buildkite pipelines.
+    # The Full image stage therefore starts its own summary, while the E2E job
+    # still consumes and extends the image provenance from its preceding job.
+    previous = {'e2e': 'images'}.get(stage)
     result = read(root / 'summaries' / f'{previous}.json') if previous else None
     if result and result['commit'] != commit:
         raise ValueError('summary belongs to a different commit')
