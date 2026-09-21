@@ -9,7 +9,9 @@ import platform
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
+import time
 ROOT=Path(__file__).resolve().parents[2]
 SANDBOXD_BUILD_TARGETS = (
     'release-binary',
@@ -43,6 +45,26 @@ def download(url, output):
     subprocess.run(['curl','--fail','--location','--retry','3',
                     '--connect-timeout','20','--max-time','300',url,'-o',str(output)],check=True)
 
+def fetch_pinned_source(source, repository, revision, *, attempts=3, command=run, sleeper=time.sleep):
+    if attempts<1:raise ValueError('positive fetch attempts required')
+    for attempt in range(1,attempts+1):
+        shutil.rmtree(source,ignore_errors=True)
+        try:
+            command(['git','init',source])
+            command(['git','-C',source,'remote','add','origin',repository])
+            command(['git','-C',source,'fetch','--depth=1','origin',revision])
+            command(['git','-C',source,'checkout','--detach','FETCH_HEAD'])
+            return
+        except subprocess.CalledProcessError:
+            if attempt==attempts:raise
+            delay=2**(attempt-1)
+            print(
+                f'sandboxd source fetch attempt {attempt}/{attempts} failed; retrying in {delay}s',
+                file=sys.stderr,
+                flush=True,
+            )
+            sleeper(delay)
+
 def pinned_patches(pinned):
     patches={}
     for entry in pinned.get('patches',[]):
@@ -63,7 +85,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix='adx-sandboxd-build-') as tmp:
         source=a.source.resolve() if a.source else Path(tmp)/'source'
         if a.source is None:
-            run(['git','init',source]);run(['git','-C',source,'remote','add','origin',pinned['repository']]);run(['git','-C',source,'fetch','--depth=1','origin',pinned['revision']]);run(['git','-C',source,'checkout','--detach','FETCH_HEAD'])
+            fetch_pinned_source(source,pinned['repository'],pinned['revision'])
         if run(['git','-C',source,'rev-parse','HEAD'])!=pinned['revision'] or run(['git','-C',source,'status','--porcelain']):raise ValueError('sandboxd source must match the clean pinned revision')
         for file in pinned['files']:
             if sha(source/file['source'])!=file['sha256']:raise ValueError('sandboxd source integrity mismatch')
