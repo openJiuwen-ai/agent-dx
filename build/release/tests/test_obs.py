@@ -1,12 +1,15 @@
 import importlib.util
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
 
 
 SPEC = importlib.util.spec_from_file_location(
-    "adx_obs", Path(__file__).resolve().parents[1] / "obs.py"
+    "adx_obs", Path(__file__).resolve().parents[1] / "obs_upload.py"
 )
 obs = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(obs)
@@ -51,6 +54,61 @@ class Client:
 
 
 class ObsTests(unittest.TestCase):
+    def test_cli_imports_external_obs_sdk_instead_of_uploader_module(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "obs.py").write_text(
+                """\
+import os
+
+class Body:
+    def __init__(self, length=0):
+        self.contentLength = length
+
+class Response:
+    def __init__(self, status=200, length=0):
+        self.status = status
+        self.body = Body(length)
+
+class ObsClient:
+    def __init__(self, **_kwargs):
+        self.sizes = {}
+    def putFile(self, bucket, key, path):
+        self.sizes[(bucket, key)] = os.path.getsize(path)
+        return Response()
+    def getObjectMetadata(self, bucket, key):
+        return Response(200, self.sizes[(bucket, key)])
+    def close(self):
+        pass
+"""
+            )
+            artifact = root / "adx-platform.tar.zst"
+            artifact.write_bytes(b"platform")
+            output = root / "manifest.json"
+            env = dict(os.environ)
+            env.update({
+                "PYTHONPATH": str(root),
+                "OBS_ACCESS_KEY_ID": "fixture-ak",
+                "OBS_SECRET_ACCESS_KEY": "fixture-sk",
+            })
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(Path(obs.__file__)),
+                    "--output", str(output),
+                    "--arch", "amd64",
+                    "--timestamp", "20260921123045",
+                    "--commit", "d" * 40,
+                    str(artifact),
+                ],
+                capture_output=True,
+                text=True,
+                env=env,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(output.read_text())["artifacts"][0]["name"], artifact.name)
+
     def test_daily_upload_uses_adx_namespace_and_publishes_verified_manifest(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
