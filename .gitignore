@@ -34,6 +34,7 @@ env/
 # Monorepo build products
 /target/
 /out/
+/.adx-cache/
 .venv/
 **/__pycache__/
 **/*.egg-info/

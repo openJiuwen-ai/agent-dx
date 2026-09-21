@@ -1,10 +1,12 @@
 """Local checks preserve failures and their diagnostic evidence."""
 import importlib.util
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 SCRIPT = Path(__file__).resolve().parents[1] / "run.py"
 
@@ -63,6 +65,40 @@ class RunnerTests(unittest.TestCase):
     def test_empty_suite_is_rejected(self):
         with self.assertRaises(ValueError):
             self.execute([])
+
+    def test_explicit_cargo_target_is_preserved(self):
+        previous = os.environ.get("CARGO_TARGET_DIR")
+        os.environ["CARGO_TARGET_DIR"] = "/tmp/explicit-cargo-target"
+        try:
+            self.runner.configure_local_cargo_cache()
+            self.assertEqual(os.environ["CARGO_TARGET_DIR"], "/tmp/explicit-cargo-target")
+        finally:
+            if previous is None:
+                os.environ.pop("CARGO_TARGET_DIR", None)
+            else:
+                os.environ["CARGO_TARGET_DIR"] = previous
+
+    def test_local_runner_loads_shared_cache_environment(self):
+        keys = ("CARGO_TARGET_DIR", "CARGO_INCREMENTAL", "SCCACHE_DIR", "BUILDKITE")
+        previous = {key: os.environ.get(key) for key in keys}
+        for key in keys:
+            os.environ.pop(key, None)
+        values = {
+            "CARGO_TARGET_DIR": "/tmp/shared-cargo-target",
+            "CARGO_INCREMENTAL": "0",
+            "SCCACHE_DIR": "/tmp/shared-sccache",
+        }
+        try:
+            with mock.patch.object(self.runner.subprocess, "check_output", return_value=json.dumps(values)):
+                self.runner.configure_local_cargo_cache()
+            for key, value in values.items():
+                self.assertEqual(os.environ[key], value)
+        finally:
+            for key in keys:
+                if previous[key] is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = previous[key]
 
 
 if __name__ == "__main__":
