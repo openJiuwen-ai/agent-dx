@@ -62,7 +62,7 @@ echo "--- :cloud: Upload ADX artifacts to Huawei Cloud OBS"
   echo "OBS Python SDK is unavailable in $python" >&2
   exit 1
 }
-"$python" build/release/obs.py \
+"$python" build/release/obs_upload.py \
   --output "$output/manifest.json" \
   --channel "$channel" \
   "${version_args[@]}" \
