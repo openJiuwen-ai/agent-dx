@@ -94,7 +94,7 @@ SDK 客户端和两个执行节点通过真实 VM 网络通信。它重跑 L0，
 | 跨节点数据链路 | Edge → 对应 Node Proxy → RRT 的命令、文件和路由结果正确 |
 | worker 失联 | 心跳过期后实例失效、路由撤销、健康 worker 继续服务；返回节点先清理旧后端再开放准入 |
 | worker 进程重启 | 新 node session、实例对账、旧 session fencing，未失效 Instance 仍可查询和执行 |
-| 控制面重启 | Redis 权威状态恢复、API Server／Edge 重新全量同步、旧 epoch 不能继续写入 |
+| 控制面重启 | Redis 权威状态恢复、API Server 内嵌 Edge 重新全量同步、旧 epoch 不能继续写入 |
 | 跨节点 checkpoint | 仅在 VM 均有 KVM 时验证共享 checkpoint、同 Instance ID 新 generation、旧节点清理 |
 | 有序停机 | 先 worker、后控制面；删除结果提交成功，三台 VM 无后端和路由残留 |
 
@@ -194,7 +194,7 @@ profile；完整 Multi-VM 在补齐部署器前不能标记为通过。
 | `ST-06` | 计划 | Redis 暂停期间 SQLite 降级日志，恢复后去重补写并恢复生命周期操作 |
 | `ST-07` | 部分已实现 | `standalone`／`full` 已覆盖无活动实例空闲超时删除；活动持续刷新防误回收仍需独立长连接用例 |
 | `ST-08` | 组件前置已实现，E2E 计划 | 实例意外退出后的 Never 清理，以及可配置重启的新 runtime identity、退避上限和最终失败状态；仍需真实 sandboxd 进程故障注入 |
-| `ST-09` | 计划 | Master、API Server、Edge 分别重启后的 epoch、全量目录和路由重同步 |
+| `ST-09` | 计划 | Master 与 API Server（含 Edge）分别重启后的 epoch、全量目录和路由重同步；分进程模式另验独立 Edge |
 | `ST-10` | 计划 | Node Proxy embedded／standalone 使用同一契约和相同用户结果 |
 | `ST-11` | 组件前置已实现，E2E 计划 | sandboxd daemon 重启且 runtime 保留时重连并接管原 backend，不产生第二次 Start；仍需真实 daemon 重启与资源采集过期证据 |
 | `ST-12` | 组件前置已实现，E2E 计划 | Node Manager 对账清理期间再次退出；新进程重读权威目录和 runtime inventory，完成幂等清理前保持关闭准入 |
@@ -210,7 +210,7 @@ profile；完整 Multi-VM 在补齐部署器前不能标记为通过。
 | `MV-05` | 计划 | Edge 经目标 Node Proxy/RRT 的跨 VM 命令与文件路径 |
 | `MV-06` | 计划 | worker 心跳过期使实例失效并撤路由；返回 worker 清理旧后端再准入 |
 | `MV-07` | 计划 | worker 进程重启、session fencing 和权威对账 |
-| `MV-08` | 计划 | Master/API/Edge 重启，Redis 恢复及 API Server 全量目录重同步 |
+| `MV-08` | 计划 | Master/API Server（含 Edge）重启，Redis 恢复及 API Server 全量目录与 Edge 路由重同步 |
 | `MV-FC-01` | 条件计划 | 两个 KVM worker 间共享 checkpoint 恢复，同 ID 新 generation 且旧节点清理 |
 | `MV-09` | 契约已固化 | worker 先于控制节点停止，两个 backend inventory 和路由目录最终为空 |
 

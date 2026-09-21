@@ -10,7 +10,7 @@ Agent DX is an execution platform for agents and isolated Instances. It provides
 
 Agent applications use the public Sandbox SDK to create and operate Instances. Gateway terminates external traffic and separates control requests from data requests. API Server authenticates callers and serves the Sandbox HTTP API. Master owns cluster state, scheduling, node health, route publication, credentials, and snapshot metadata. Node Manager performs final local admission and serializes the lifecycle of every Instance. Node Proxy forwards data traffic to RRT inside the selected Instance.
 
-Redis is the authoritative cluster store and discovery backend. Node Manager uses a local SQLite journal only when cluster-state submission is temporarily unavailable. sandboxd is managed by the deployment environment and provides the execution backend. Node Manager embeds Node Proxy by default and also supports an explicit split-process deployment.
+Redis is the authoritative cluster store and discovery backend. Node Manager uses a local SQLite journal only when cluster-state submission is temporarily unavailable. sandboxd is managed by the deployment environment and provides the execution backend. API Server embeds Edge by default, and Node Manager embeds Node Proxy by default; both pairs retain an explicit split-process deployment.
 
 ## Core abstractions
 
@@ -34,10 +34,10 @@ The fixed layering is: Agent/application → Sandbox SDK/HTTP API → API Server
 | Directory | Responsibility |
 |---|---|
 | `agent/` | Agent APIs, sessions, dispatch, and execution orchestration |
-| `gateway/` | Edge entrypoint, Node Proxy, routing, and forwarding |
-| `platform/control-plane/api-server/` | Sandbox HTTP API, authentication, ownership cache, and Instance RPC clients |
-| `platform/control-plane/master/` | Cluster state, scheduling shards, Redis persistence, routes, credentials, and snapshots |
-| `platform/control-plane/node-manager/` | Local admission, Instance lifecycle, sandboxd integration, checkpoints, and outage journal |
+| `gateway/` | Public Sandbox API Server, Edge entrypoint, Node Proxy, routing, and forwarding |
+| `gateway/api-server/` | Sandbox HTTP API, authentication, ownership cache, and Instance RPC clients; embeds Edge by default |
+| `platform/master/` | Cluster state, scheduling shards, Redis persistence, routes, credentials, and snapshots |
+| `platform/node-manager/` | Local admission, Instance lifecycle, sandboxd integration, checkpoints, and outage journal |
 | `platform/runtime/rrt/` | Instance-local command, file, terminal, activity, and recovery operations |
 | `platform/sdk/sandbox/python/` | Public Python Sandbox SDK |
 | `platform/api/proto/` | Internal Instance, node, route, credential, and snapshot contracts |
@@ -60,7 +60,7 @@ The same ADX release package can start different roles by configuration. The dep
 
 ### Standalone with ADX-managed Redis
 
-The default `standalone` profile starts Redis, Master, Node Manager with embedded Node Proxy, API Server, and Edge on one host. sandboxd remains independently managed by the deployment environment.
+The default `standalone` profile starts Redis, Master, Node Manager with embedded Node Proxy, and API Server with embedded Edge on one host. sandboxd remains independently managed by the deployment environment.
 
 ```sh
 sudo install -d -m 0700 /etc/adx /etc/adx/tls /etc/adx/secrets /var/lib/adx /run/adx
@@ -101,11 +101,11 @@ sudo /opt/adx/bin/adxctl config init --profile master
 # Every worker: Node Manager with embedded Node Proxy by default.
 sudo /opt/adx/bin/adxctl config init --profile node
 
-# Ingress host: API Server + Edge.
+# Ingress host: API Server with embedded Edge by default.
 sudo /opt/adx/bin/adxctl config init --profile edge-api
 ```
 
-Edit `/etc/adx/deployment.yaml` on each host. All files use the same `redis_url`, `namespace`, and matching mTLS trust; each worker needs a unique `node_id` and reachable control and proxy addresses. Start Redis → Master → workers → API Server/Edge. Node Proxy becomes a separate process only when `proxy_mode: standalone` is selected explicitly.
+Edit `/etc/adx/deployment.yaml` on each host. All files use the same `redis_url`, `namespace`, and matching mTLS trust; each worker needs a unique `node_id` and reachable control and proxy addresses. Start Redis → Master → workers → API Server (including Edge). Node Proxy and Edge become separate processes only when `proxy_mode: standalone` or `edge_mode: standalone` is selected explicitly.
 
 YAML string values support `${VAR}` and `${VAR:-default}`. Use `adxctl config dump` to inspect the fully merged profile, environment, and host overrides. Kubernetes runs the same processes in Pods while the deployment environment provides `adxctl run`, certificates, Redis connectivity, and sandboxd.
 
@@ -146,7 +146,7 @@ finally:
     sandbox.kill()
 ```
 
-The image must be supported by the configured sandboxd and ADX Runtime Environment. Applications that avoid process-global environment variables can construct `ConnectionConfig` explicitly. See the [Sandbox Python SDK](platform/sdk/sandbox/python/README.md) for pause/resume, reusable snapshots, placement, and retry semantics, and the [Sandbox API](platform/control-plane/api-server/docs/sandbox-lifecycle-api.md) for raw HTTP paths and payloads. Agent applications start from the [Agent guide](agent/README.md) and use the same Sandbox SDK underneath.
+The image must be supported by the configured sandboxd and ADX Runtime Environment. Applications that avoid process-global environment variables can construct `ConnectionConfig` explicitly. See the [Sandbox Python SDK](platform/sdk/sandbox/python/README.md) for pause/resume, reusable snapshots, placement, and retry semantics, and the [Sandbox API](gateway/api-server/docs/sandbox-lifecycle-api.md) for raw HTTP paths and payloads. Agent applications start from the [Agent guide](agent/README.md) and use the same Sandbox SDK underneath.
 
 ## Build and test
 
@@ -173,7 +173,7 @@ The Sandbox SDK distribution is `adx-sandbox`, its Python import is `adx_sandbox
 
 - [Architecture and repository layout](docs/architecture/repository-layout.md)
 - [Agent usage](agent/README.md)
-- [Sandbox API](platform/control-plane/api-server/docs/sandbox-lifecycle-api.md)
+- [Sandbox API](gateway/api-server/docs/sandbox-lifecycle-api.md)
 - [Sandbox OpenAPI](platform/api/openapi/sandbox.yaml)
 - [Data-plane OpenAPI](platform/api/openapi/data-plane.yaml)
 - [Sandbox Python SDK](platform/sdk/sandbox/python/README.md)

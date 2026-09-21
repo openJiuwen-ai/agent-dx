@@ -1,6 +1,6 @@
 # Service configuration examples
 
-`deployment.yaml` is the unified `adxctl` input; JSON deployment input is not supported. `adxctl config init` creates `/etc/adx/deployment.yaml` from the managed-Redis standalone template by default. Add `--compact` to write a versioned profile reference and use `service_overrides` for host-specific differences; `adxctl config dump` prints the fully resolved YAML. Use `--profile standalone-external-redis`, `master`, `node`, or `edge-api` for the other topologies. The individual JSON files describe generated service entrypoints rather than the operator-facing deployment format. Replace addresses and absolute certificate paths for your deployment. Master, Node Manager and API Server use `--config /absolute/path/config.json`. Edge uses `ADX_EDGE_CONTROL_CONFIG=/absolute/path/edge-control.json` alongside its listener and data-path environment settings.
+`deployment.yaml` is the unified `adxctl` input; JSON deployment input is not supported. `adxctl config init` creates `/etc/adx/deployment.yaml` from the managed-Redis standalone template by default. Add `--compact` to write a versioned profile reference and use `service_overrides` for host-specific differences; `adxctl config dump` prints the fully resolved YAML. Use `--profile standalone-external-redis`, `master`, `node`, or `edge-api` for the other topologies. The individual JSON files describe generated service entrypoints rather than the operator-facing deployment format. Replace addresses and absolute certificate paths for your deployment. Master, Node Manager and API Server use `--config /absolute/path/config.json`. In the default mode API Server embeds Edge and receives its listener environment; explicit `edge_mode: standalone` renders the Edge control JSON and starts `adx-edge-frontend` separately.
 
 Shipped deployment examples:
 
@@ -12,7 +12,7 @@ Shipped deployment examples:
 | `deployment-node.yaml` | One Worker's Node Manager with embedded Node Proxy | Shared external Redis |
 | `deployment-edge-api.yaml` | Edge and API Server ingress host | Shared external Redis |
 
-See the [`adxctl` deployment guide](../../../docs/deployment/adxctl.md) for exact commands, role boundaries and split-host startup order. `adx-api-server` is the current control-plane Frontend; `adx-edge-frontend` is the separate Edge binary.
+See the [`adxctl` deployment guide](../../../docs/deployment/adxctl.md) for exact commands, role boundaries and split-host startup order. `adx-api-server` is the current control-plane Frontend and hosts Edge by default; `adx-edge-frontend` remains available for explicit process isolation.
 
 String values in deployment YAML may use `${VAR}` or `${VAR:-default}`. Expansion happens after YAML parsing, so environment values remain scalar strings and cannot inject mappings or lists. Missing variables without defaults fail configuration loading. Numeric and boolean fields remain native YAML values rather than implicitly converting environment strings.
 

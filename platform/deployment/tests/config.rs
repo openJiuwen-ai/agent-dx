@@ -250,6 +250,67 @@ fn every_minimal_profile_resolves_to_its_expected_roles() {
         );
     }
 }
+
+#[test]
+fn edge_api_profile_embeds_edge_in_api_server_by_default() {
+    let root = tempfile::tempdir().unwrap();
+    let mut deployment: Deployment = serde_saphyr::from_str(include_str!(
+        "../../../build/config/examples/deployment-edge-api.yaml"
+    ))
+    .unwrap();
+    deployment.package_dir = root.path().join("package");
+    deployment.state_dir = root.path().join("state");
+
+    let output = root.path().join("embedded-edge");
+    let processes = deployment.render(&output).unwrap();
+    assert_eq!(processes.len(), 1);
+    let api = &processes[0];
+    assert_eq!(api.role, Role::ApiServer);
+    assert_eq!(api.binary.file_name().unwrap(), "adx-api-server");
+    assert_eq!(
+        api.env
+            .get("ADX_DATA_PLANE_EDGE_FRONTEND_TLS_BIND")
+            .map(String::as_str),
+        Some("0.0.0.0:8443")
+    );
+    let config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(output.join("api-server.json")).unwrap()).unwrap();
+    assert_eq!(config["edge_mode"], "embedded");
+    assert_eq!(config["edge_control"]["namespace"], "adx");
+    assert_eq!(
+        config["edge_control"]["tls"]["certificate"],
+        "/etc/adx/tls/edge.pem"
+    );
+    assert!(!output.join("edge.json").exists());
+}
+
+#[test]
+fn edge_api_profile_can_render_explicit_standalone_edge() {
+    let root = tempfile::tempdir().unwrap();
+    let mut deployment: Deployment = serde_saphyr::from_str(include_str!(
+        "../../../build/config/examples/deployment-edge-api.yaml"
+    ))
+    .unwrap();
+    deployment.package_dir = root.path().join("package");
+    deployment.state_dir = root.path().join("state");
+    deployment
+        .services
+        .iter_mut()
+        .find(|service| service.role == Role::ApiServer)
+        .unwrap()
+        .config["edge_mode"] = json!("standalone");
+
+    let processes = deployment
+        .render(&root.path().join("standalone-edge"))
+        .unwrap();
+    assert_eq!(processes.len(), 2);
+    assert!(processes
+        .iter()
+        .any(|process| process.binary.file_name().unwrap() == "adx-api-server"));
+    assert!(processes
+        .iter()
+        .any(|process| process.binary.file_name().unwrap() == "adx-edge-frontend"));
+}
 #[test]
 fn roles_order_common_discovery_and_private_configuration() {
     let root = tempfile::tempdir().unwrap();
@@ -564,7 +625,6 @@ fn unified_deployment_renders_control_and_data_plane_services() {
 
     let expected = std::collections::BTreeMap::from([
         ("api", "adx-api-server".to_owned()),
-        ("edge", "adx-edge-frontend".to_owned()),
         ("master", "adx-master".to_owned()),
         ("node", "adx-node-manager".to_owned()),
         ("proxy", "adx-node-proxy".to_owned()),

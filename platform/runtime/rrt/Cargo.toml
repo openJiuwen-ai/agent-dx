@@ -42,4 +42,4 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 tempfile = "3"
 
 [dev-dependencies]
-adx-node-manager = { path = "../../control-plane/node-manager" }
+adx-node-manager = { path = "../../node-manager" }

@@ -10,15 +10,15 @@
 | `platform/crates/protocol` / `platform/api/proto` | Instance gRPC、身份检查、类型转换；Node Proxy 绑定/活动协议 | 协议按职责拆分；RRT 使用 HTTP |
 | `platform/crates/service-runtime` | 服务进程统一的类型化 `--config`、安全 JSON 配置读取与退出信号 | 不承载 TLS、协议或组件业务配置 |
 | `platform/crates/scheduling` | 静态 Filter/Score、Pack/Spread、整卡、节点/实例亲和与反亲和、增量快照与索引 | 拓扑规则存在于内部类型和库；不是公开 HTTP 已验收能力 |
-| `platform/control-plane/master` | Global 轮转、同进程 Shard 队列与选点、自动分片、Redis、认证、路由/快照目录、节点失效与跨节点恢复协调 | 单 Master；无 scaler、抢占或租户配额；未分配队列仅在内存 |
-| `platform/control-plane/node-manager` | 每 Instance 串行任务、准入、暂停/恢复/删除、空闲删除、可配置重启、资源采集、对账 | 普通生命周期由节点决定；SQLite 是提交故障降级日志 |
+| `platform/master` | Global 轮转、同进程 Shard 队列与选点、自动分片、Redis、认证、路由/快照目录、节点失效与跨节点恢复协调 | 单 Master；无 scaler、抢占或租户配额；未分配队列仅在内存 |
+| `platform/node-manager` | 每 Instance 串行任务、准入、暂停/恢复/删除、空闲删除、可配置重启、资源采集、对账 | 普通生命周期由节点决定；SQLite 是提交故障降级日志 |
 | 同上 `sandboxd.rs` / `runtime_control.rs` | RuntimeBackend、Start/Stats/checkpoint/restore、RRT HTTP 准备与身份校验 | sandboxd 自行生成物理 ID；平台 Instance ID 与后端 ID 分开 |
 | 同上 `checkpoint.rs` / `checkpoint/` | 本地/S3 存储抽象、下载缓存、引用保护、过期和孤儿制品回收 | local-only 制品只在源节点可用；模板预热后置 |
 | 同上 `routes.rs` / `proxy.rs` | 本机绑定、全量同步、代理重启重放、活动接收；默认嵌入 NodeProxyService | 省略 `proxy_mode` 即 `embedded`；显式 `standalone` 保留分进程；两种模式使用同一 UDS 控制契约 |
-| `platform/control-plane/api-server` | Rust HTTPS 服务、API Key 缓存、版本化实例目录订阅、生命周期和快照适配、管理员密钥接口 | [支持范围](api-server.md)；Agent 路由需要另配业务服务 |
-| `gateway` | Edge Redis 发现与 gRPC 路由订阅、认证、转发；Node Proxy 绑定复核与数据转发 | 数据请求不进入生命周期队列；Edge 路由仅内存缓存 |
+| `gateway/api-server` | Rust HTTPS 服务、API Key 缓存、版本化实例目录订阅、生命周期和快照适配、管理员密钥接口；默认托管 Edge 服务 | [支持范围](api-server.md)；Agent 路由需要另配业务服务 |
+| `gateway` | 可复用 Edge 服务、Redis 发现与 gRPC 路由订阅、认证、转发；Node Proxy 绑定复核与数据转发 | 数据请求不进入生命周期队列；Edge 路由仅内存缓存；显式分进程复用同一实现 |
 | `platform/runtime/rrt` | 命令、文件、Shell/PTY、命令观察、HTTP 运行时协作 | 恢复时更新身份/认证、退役旧连接并重建监听 |
-| `platform/deployment` | Rust `adxctl`、统一 YAML 配置、supervisor、清理后停止 | 默认由 Node Manager 同进程托管 Node Proxy；显式分进程仍使用同一发布包；sandboxd 由部署环境托管 |
+| `platform/deployment` | Rust `adxctl`、统一 YAML 配置、supervisor、清理后停止 | API Server 默认内嵌 Edge，Node Manager 默认内嵌 Node Proxy；显式分进程仍使用同一发布包；sandboxd 由部署环境托管 |
 | `platform/crates/observability` 与各组件埋点 | Trace 上下文/采样/OTLP、Metrics、结构化日志；supervisor 滚动压缩 | Collector 是外部采集组件；实时队列丢弃指标后置 |
 
 ## 生命周期与提交

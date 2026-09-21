@@ -3,7 +3,7 @@ use crate::auth::{Peers, Principal};
 use serde::Deserialize;
 use std::{collections::BTreeMap, path::PathBuf};
 use tonic::transport::{Certificate, ClientTlsConfig, Identity, ServerTlsConfig};
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TlsFiles {
     pub ca: PathBuf,

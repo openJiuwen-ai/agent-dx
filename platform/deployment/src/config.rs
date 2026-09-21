@@ -81,7 +81,7 @@ pub enum Profile {
     Master,
     /// Node Manager and Node Proxy worker host.
     Node,
-    /// Co-located Edge and API Server ingress host.
+    /// API Server ingress host with embedded Edge by default.
     EdgeApi,
 }
 
@@ -251,6 +251,23 @@ pub struct Process {
     pub env: BTreeMap<String, String>,
     pub admin_socket: Option<PathBuf>,
 }
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EdgeProcessMode {
+    Embedded,
+    Standalone,
+}
+
+fn edge_process_mode(service: &Service, edge_declared: bool) -> Result<EdgeProcessMode> {
+    match service.config.get("edge_mode") {
+        None if edge_declared => Ok(EdgeProcessMode::Embedded),
+        None => Ok(EdgeProcessMode::Standalone),
+        Some(Value::String(mode)) if mode == "embedded" => Ok(EdgeProcessMode::Embedded),
+        Some(Value::String(mode)) if mode == "standalone" => Ok(EdgeProcessMode::Standalone),
+        _ => Err("edge_mode must be standalone or embedded".into()),
+    }
+}
+
 impl Deployment {
     pub fn load(path: &Path) -> Result<Self> {
         if !matches!(
@@ -310,6 +327,23 @@ impl Deployment {
         let mut proxy_owners = BTreeSet::new();
         let mut has_embedded_proxy = false;
         let mut has_standalone_proxy_service = false;
+        let edge_count = self
+            .services
+            .iter()
+            .filter(|service| service.role == Role::Edge)
+            .count();
+        let api_count = self
+            .services
+            .iter()
+            .filter(|service| service.role == Role::ApiServer)
+            .count();
+        if edge_count > 1 || api_count > 1 {
+            return Err("at most one API Server and Edge per deployment".into());
+        }
+        let edge = self
+            .services
+            .iter()
+            .find(|service| service.role == Role::Edge);
         for service in &self.services {
             if service.id.is_empty()
                 || !service
@@ -344,6 +378,17 @@ impl Deployment {
                 return Err(
                     "Sandbox API discovery poll_seconds must be between 1 and 86400".into(),
                 );
+            }
+            if service.role == Role::ApiServer {
+                let mode = edge_process_mode(service, edge.is_some())?;
+                if mode == EdgeProcessMode::Embedded {
+                    let edge = edge.ok_or("embedded Edge requires an edge service declaration")?;
+                    if service.env.keys().any(|key| edge.env.contains_key(key)) {
+                        return Err(
+                            "embedded Edge and API Server environment keys must be unique".into(),
+                        );
+                    }
+                }
             }
             if service.env.iter().any(|(key, value)| {
                 key.is_empty() || key.contains(['=', '\0']) || value.contains('\0')
@@ -428,7 +473,21 @@ impl Deployment {
         fs::create_dir(output_directory)?;
         fs::set_permissions(output_directory, fs::Permissions::from_mode(0o700))?;
         let mut processes = Vec::new();
+        let edge = self
+            .services
+            .iter()
+            .find(|service| service.role == Role::Edge);
+        let embedded_edge = self
+            .services
+            .iter()
+            .find(|service| service.role == Role::ApiServer)
+            .map(|api| edge_process_mode(api, edge.is_some()))
+            .transpose()?
+            == Some(EdgeProcessMode::Embedded);
         for service in &self.services {
+            if embedded_edge && service.role == Role::Edge {
+                continue;
+            }
             let mut config = if service.config.is_null() {
                 Value::Object(Map::new())
             } else {
@@ -485,6 +544,30 @@ impl Deployment {
                         discovery
                             .entry("poll_seconds".to_owned())
                             .or_insert(Value::from(5));
+                        if embedded_edge {
+                            let edge = edge.ok_or("embedded Edge configuration missing")?;
+                            let mut control = if edge.config.is_null() {
+                                Value::Object(Map::new())
+                            } else {
+                                edge.config.clone()
+                            };
+                            let control_fields = config_object_mut(&mut control)?;
+                            control_fields.insert(
+                                "redis_url".to_owned(),
+                                Value::String(self.redis_url.clone()),
+                            );
+                            control_fields.insert(
+                                "namespace".to_owned(),
+                                Value::String(self.namespace.clone()),
+                            );
+                            fields.insert("edge_mode".to_owned(), Value::String("embedded".into()));
+                            fields.insert("edge_control".to_owned(), control);
+                            environment.extend(edge.env.clone());
+                        } else {
+                            fields
+                                .insert("edge_mode".to_owned(), Value::String("standalone".into()));
+                            fields.remove("edge_control");
+                        }
                     }
                     if service.role == Role::NodeManager {
                         let socket = self.admin_path(service);

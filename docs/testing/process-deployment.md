@@ -11,7 +11,7 @@
 | `platform/deployment/src/cli.rs` | 类型化子命令和参数；`start` 是 `run` 的兼容别名 |
 | `platform/deployment/src/config.rs` | 部署 schema、控制面/数据面角色与公共参数校验，生成组件配置、Redis AOF 配置和 Node 管理 socket 地址 |
 | `platform/deployment/src/supervisor.rs` | 单部署文件锁、受保护的控制 UDS、子进程组、日志、有限次数重启、状态查询和停止顺序 |
-| `node-manager/src/admin.rs` | 本机已管理 Instance 的停止清理；保持 Node Manager 的生命周期所有权 |
+| `platform/node-manager/src/admin.rs` | 本机已管理 Instance 的停止清理；保持 Node Manager 的生命周期所有权 |
 | `node.proto / NodeAdminService` | 仅在本机受保护 UDS 服务的 Drain RPC，不挂到 Node TCP 服务 |
 | `build/release/build.sh` | 原生 release 构建、SDK wheel 构建、统一包组装 |
 | `build/release/package.py` | 输入制品完整性检查、Redis 版本检查、清单与 SHA256、已展开目录复核 |
@@ -37,7 +37,7 @@ adxctl stop
 
 ## 进程和停止契约
 
-默认启动顺序为 Redis → Master → Node Manager（含内嵌 Proxy）→ API Server → Edge。显式分进程时，独立 Node Proxy 在 Node Manager 前启动。该顺序只安排进程拉起；组件通过已有发现和对账握手达到就绪。异常退出按配置延迟重启，超过本次 supervisor 生命周期的预算后标记失败，其他角色保持运行；不会假装故障组件已就绪。初次 spawn 失败同样进入有限重试。
+默认启动顺序为 Redis → Master → Node Manager（含内嵌 Proxy）→ API Server（含内嵌 Edge）。显式分进程时，独立 Node Proxy 在 Node Manager 前启动，独立 Edge 在 API Server 后启动。该顺序只安排进程拉起；组件通过已有发现和对账握手达到就绪。异常退出按配置延迟重启，超过本次 supervisor 生命周期的预算后标记失败，其他角色保持运行；不会假装故障组件已就绪。初次 spawn 失败同样进入有限重试。
 
 显式 `stop` 和 supervisor 收到 SIGTERM／SIGINT 都执行：
 
@@ -47,7 +47,7 @@ adxctl stop
 
 Node Manager 未完成权威对账时，不能用空内存目录宣称清理完成。清理开始后保持 draining；失败可再次执行。作用域是本机已接收并管理的 Instance，不执行远端节点排空或迁移。完整 E2E 还需覆盖停止与 Master 在途分配之间的竞争。
 
-sandboxd 始终由部署环境独立托管，角色枚举不允许 supervisor 拉起它。RRT 随包交付到 `runtime/`，须进入实际实例环境；不会被当成宿主公共服务启动。现已接通 `proxy_mode` 的共进程／分进程装配，配置与验证边界见 [进程模式](node-proxy-process-modes.md)。
+sandboxd 始终由部署环境独立托管，角色枚举不允许 supervisor 拉起它。RRT 随包交付到 `runtime/`，须进入实际实例环境；不会被当成宿主公共服务启动。Node Proxy 和 Edge 均支持默认共进程及显式分进程，见 [Node Proxy 进程模式](node-proxy-process-modes.md)与 [Edge 进程模式](api-edge-process-modes.md)。
 
 ## Redis
 

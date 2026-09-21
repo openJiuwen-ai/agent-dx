@@ -11,11 +11,12 @@ description = "ADX public HTTP API and instance ownership cache"
 workspace = true
 
 [dependencies]
-adx-core = { path = "../../crates/core" }
-adx-protocol = { path = "../../crates/protocol" }
-adx-service-runtime = { path = "../../crates/service-runtime" }
-adx-discovery = { path = "../../crates/discovery" }
-adx-observability = { path = "../../crates/observability" }
+adx-core = { path = "../../platform/crates/core" }
+adx-protocol = { path = "../../platform/crates/protocol" }
+adx-service-runtime = { path = "../../platform/crates/service-runtime" }
+adx-discovery = { path = "../../platform/crates/discovery" }
+adx-observability = { path = "../../platform/crates/observability" }
+data-plane-gateway = { path = ".." }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }

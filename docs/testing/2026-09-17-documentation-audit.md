@@ -13,11 +13,11 @@
 | 主题 | 修订后的契约 | 核对入口 |
 |---|---|---|
 | 分层与目录 | Global 轮转、同进程 Domain 调度、Node Manager 生命周期；共享 Gateway；Agent 的 Sandbox SDK 适配仍有缺口 | [当前目录与架构](../architecture/repository-layout.md)、[Agent 入口](../../agent/README.md) |
-| SQLite | 正常提交走 Master/Redis；JournalSink 在提交故障时写本地降级日志，Journaled 不等于集群发布成功 | [JournalSink](../../platform/control-plane/node-manager/src/journal.rs)、[节点契约](node-lifecycle.md) |
+| SQLite | 正常提交走 Master/Redis；JournalSink 在提交故障时写本地降级日志，Journaled 不等于集群发布成功 | [JournalSink](../../platform/node-manager/src/journal.rs)、[节点契约](node-lifecycle.md) |
 | HTTP/SDK | 暂停/恢复、快照及放置已接通；客户端保留的方法与字段不自动代表后端支持 | `../../platform/control-plane/sandbox-api/controlbackend/create.go`（当次基线源码）、`../../platform/control-plane/sandbox-api/controlbackend/backend.go`（当次基线源码） |
-| 恢复与克隆 | 公开 resume 直达原归属节点；故障跨节点恢复由 Master 协调；快照克隆显式指定的资源规格须匹配模板 | `../../platform/control-plane/sandbox-api/controlbackend/checkpoint.go`（当次基线源码）、[克隆规则](../../platform/control-plane/master/src/rpc/cloning.rs) |
-| 失败与路由 | 使用当前 Rust Edge 状态与错误映射；删除旧 Sandbox Router 的 FATAL/OOM/410 和 etcd 监听说明 | [Edge 请求处理](../../gateway/src/edge/server.rs)、[失败语义](../../platform/control-plane/api-server/docs/sandbox-runtime-failure.md) |
-| 调度 | Filter/Score 含分组亲和规则；拓扑仍存在内部库中，未作为公开 HTTP 验收能力；部分调优参数只有 Rust 配置接口 | [调度库](../../platform/crates/scheduling/README.md)、[服务配置](../../platform/control-plane/master/src/bin/adx-master.rs) |
+| 恢复与克隆 | 公开 resume 直达原归属节点；故障跨节点恢复由 Master 协调；快照克隆显式指定的资源规格须匹配模板 | `../../platform/control-plane/sandbox-api/controlbackend/checkpoint.go`（当次基线源码）、[克隆规则](../../platform/master/src/rpc/cloning.rs) |
+| 失败与路由 | 使用当前 Rust Edge 状态与错误映射；删除旧 Sandbox Router 的 FATAL/OOM/410 和 etcd 监听说明 | [Edge 请求处理](../../gateway/src/edge/server.rs)、[失败语义](../../gateway/api-server/docs/sandbox-runtime-failure.md) |
+| 调度 | Filter/Score 含分组亲和规则；拓扑仍存在内部库中，未作为公开 HTTP 验收能力；部分调优参数只有 Rust 配置接口 | [调度库](../../platform/crates/scheduling/README.md)、[服务配置](../../platform/master/src/bin/adx-master.rs) |
 | RRT | HTTP 控制协作已接入完整暂停恢复；恢复身份支持同归属代次推进执行版本；Status 含 activity_revision | [HTTP 契约](../../platform/api/http/runtime-control.md)、[身份类型](../../platform/crates/core/src/runtime.rs) |
 | 日志与指标 | Edge/Node Proxy 已有日志、Metrics、Trace；文件压缩可配置；实例终态数量是 Gauge；实例用量标签当前无单独开关 | [Gateway 日志](../../gateway/src/common/logging.rs)、[可观测说明](observability-logging-plan.md) |
 | 部署与工具 | 资源源支持 auto/sandboxd；证书启动加载；supervisor 清理实例后停止；修正无效 Gateway 命令及 Agent 构建目录 | [配置示例](../../build/config/examples/README.md)、[进程部署](process-deployment.md) |
@@ -124,8 +124,8 @@ git diff --check
 | [platform/api/http/runtime-control.md](../../platform/api/http/runtime-control.md) | 当前说明／源码与入口 |
 | [platform/api/proto/README.md](../../platform/api/proto/README.md) | 当前说明／源码与入口 |
 | `../../platform/control-plane/sandbox-api/README.md`（当次基线源码） | 当前说明／源码与入口 |
-| [platform/control-plane/api-server/docs/sandbox-lifecycle-api.md](../../platform/control-plane/api-server/docs/sandbox-lifecycle-api.md) | 当前说明／源码与入口 |
-| [platform/control-plane/api-server/docs/sandbox-runtime-failure.md](../../platform/control-plane/api-server/docs/sandbox-runtime-failure.md) | 当前说明／源码与入口 |
+| [gateway/api-server/docs/sandbox-lifecycle-api.md](../../gateway/api-server/docs/sandbox-lifecycle-api.md) | 当前说明／源码与入口 |
+| [gateway/api-server/docs/sandbox-runtime-failure.md](../../gateway/api-server/docs/sandbox-runtime-failure.md) | 当前说明／源码与入口 |
 | [platform/crates/scheduling/README.md](../../platform/crates/scheduling/README.md) | 当前说明／源码与入口 |
 | [platform/runtime/rrt/README.md](../../platform/runtime/rrt/README.md) | 当前说明／源码与入口 |
 | [platform/sdk/sandbox/README.md](../../platform/sdk/sandbox/README.md) | 当前说明／源码与入口 |

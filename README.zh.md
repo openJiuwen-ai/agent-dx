@@ -10,7 +10,7 @@ Agent DX 是面向 Agent 与隔离 Instance 的执行平台。仓库统一提供
 
 Agent 应用通过公开 Sandbox SDK 创建和操作 Instance。Gateway 承接外部流量，并分离控制请求与数据请求。API Server 认证调用方并提供 Sandbox HTTP API。Master 管理集群状态、调度、节点健康、路由发布、凭证和快照元数据。Node Manager 完成本机最终准入，并串行管理每个 Instance 的生命周期。Node Proxy 将数据请求转发到目标 Instance 内的 RRT。
 
-Redis 是集群状态和服务发现的权威后端。集群状态暂时无法提交时，Node Manager 使用本地 SQLite 日志记录待同步结果。sandboxd 由部署环境管理，提供执行后端。Node Manager 默认内嵌 Node Proxy，也支持显式分进程部署。
+Redis 是集群状态和服务发现的权威后端。集群状态暂时无法提交时，Node Manager 使用本地 SQLite 日志记录待同步结果。sandboxd 由部署环境管理，提供执行后端。API Server 默认内嵌 Edge，Node Manager 默认内嵌 Node Proxy；两组组件都支持显式分进程部署。
 
 ## 核心抽象
 
@@ -34,10 +34,10 @@ ADX 内部统一使用 **Instance** 表达受管执行单元；**Sandbox** 只�
 | 目录 | 职责 |
 |---|---|
 | `agent/` | Agent API、会话、任务分发和执行编排 |
-| `gateway/` | Edge 接入、Node Proxy、路由和转发 |
-| `platform/control-plane/api-server/` | Sandbox HTTP API、认证、归属缓存和 Instance RPC 客户端 |
-| `platform/control-plane/master/` | 集群状态、调度 Shard、Redis 持久化、路由、凭证和快照 |
-| `platform/control-plane/node-manager/` | 本机准入、Instance 生命周期、sandboxd、Checkpoint 和降级日志 |
+| `gateway/` | Sandbox API Server、Edge 接入、Node Proxy、路由和转发 |
+| `gateway/api-server/` | Sandbox HTTP API、认证、归属缓存和 Instance RPC 客户端；默认内嵌 Edge |
+| `platform/master/` | 集群状态、调度 Shard、Redis 持久化、路由、凭证和快照 |
+| `platform/node-manager/` | 本机准入、Instance 生命周期、sandboxd、Checkpoint 和降级日志 |
 | `platform/runtime/rrt/` | Instance 内命令、文件、终端、活动统计和恢复操作 |
 | `platform/sdk/sandbox/python/` | 公开 Python Sandbox SDK |
 | `platform/api/proto/` | Instance、节点、路由、凭证和快照内部协议 |
@@ -60,7 +60,7 @@ ADX 使用同一发布包按配置启动不同角色。部署环境需要准备 
 
 ### 单机部署：由 ADX 托管 Redis
 
-默认 `standalone` profile 在一台主机启动 Redis、Master、内嵌 Node Proxy 的 Node Manager、API Server 和 Edge。sandboxd 仍由部署环境独立托管。
+默认 `standalone` profile 在一台主机启动 Redis、Master、内嵌 Node Proxy 的 Node Manager，以及内嵌 Edge 的 API Server。sandboxd 仍由部署环境独立托管。
 
 ```sh
 sudo install -d -m 0700 /etc/adx /etc/adx/tls /etc/adx/secrets /var/lib/adx /run/adx
@@ -101,11 +101,11 @@ sudo /opt/adx/bin/adxctl config init --profile master
 # 每个 Worker：Node Manager，默认同进程运行 Node Proxy。
 sudo /opt/adx/bin/adxctl config init --profile node
 
-# 接入节点：API Server + Edge。
+# 接入节点：默认由 API Server 内嵌 Edge。
 sudo /opt/adx/bin/adxctl config init --profile edge-api
 ```
 
-每台主机都要修改自己的 `/etc/adx/deployment.yaml`，使用相同的 `redis_url`、`namespace` 和匹配的 mTLS 信任关系；每个 Worker 配置唯一 `node_id` 以及其他节点可访问的控制面和 Proxy 地址。推荐按 Redis → Master → Workers → API Server／Edge 的顺序启动。Node Proxy 只有在显式设置 `proxy_mode: standalone` 时才作为独立进程部署。
+每台主机都要修改自己的 `/etc/adx/deployment.yaml`，使用相同的 `redis_url`、`namespace` 和匹配的 mTLS 信任关系；每个 Worker 配置唯一 `node_id` 以及其他节点可访问的控制面和 Proxy 地址。推荐按 Redis → Master → Workers → API Server（含 Edge）的顺序启动。只有显式设置 `proxy_mode: standalone` 或 `edge_mode: standalone` 时，对应组件才作为独立进程部署。
 
 YAML 字符串字段支持 `${VAR}` 和 `${VAR:-default}`。可用 `adxctl config dump` 检查环境变量和 profile 合并后的完整配置。Kubernetes 中仍运行这些进程，由 Pod 管理 `adxctl run`、证书、Redis 连接和 sandboxd 依赖。
 
@@ -146,7 +146,7 @@ finally:
     sandbox.kill()
 ```
 
-镜像必须能由当前 sandboxd 和 ADX Runtime Environment 启动。需要避免进程级环境变量时，应用可以显式构造 `ConnectionConfig`。暂停／恢复、可复用快照、资源约束和错误重试语义见 [Sandbox Python SDK](platform/sdk/sandbox/python/README.md)；直接调用 HTTP 的路径与请求格式见 [Sandbox API](platform/control-plane/api-server/docs/sandbox-lifecycle-api.md)。Agent 应用从 [Agent 使用指南](agent/README.md)进入，其底层仍使用同一 Sandbox SDK。
+镜像必须能由当前 sandboxd 和 ADX Runtime Environment 启动。需要避免进程级环境变量时，应用可以显式构造 `ConnectionConfig`。暂停／恢复、可复用快照、资源约束和错误重试语义见 [Sandbox Python SDK](platform/sdk/sandbox/python/README.md)；直接调用 HTTP 的路径与请求格式见 [Sandbox API](gateway/api-server/docs/sandbox-lifecycle-api.md)。Agent 应用从 [Agent 使用指南](agent/README.md)进入，其底层仍使用同一 Sandbox SDK。
 
 ## 构建与测试
 
@@ -173,7 +173,7 @@ Sandbox SDK 分发名为 `adx-sandbox`，Python 导入名为 `adx_sandbox`，命
 
 - [架构与目录规划](docs/architecture/repository-layout.md)
 - [Agent 使用](agent/README.md)
-- [Sandbox API](platform/control-plane/api-server/docs/sandbox-lifecycle-api.md)
+- [Sandbox API](gateway/api-server/docs/sandbox-lifecycle-api.md)
 - [Sandbox OpenAPI](platform/api/openapi/sandbox.yaml)
 - [数据面 OpenAPI](platform/api/openapi/data-plane.yaml)
 - [Sandbox Python SDK](platform/sdk/sandbox/python/README.md)

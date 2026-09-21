@@ -5,9 +5,9 @@ surface. It describes the HTTP contract implemented by the API Server; snapshot
 catalog state, checkpoint bytes, and scheduler decisions are owned by the
 Rust Master (catalog, placement, Redis) and Node Manager (lifecycle and execution).
 
-The machine-readable contract is [`sandbox.yaml`](../../../api/openapi/sandbox.yaml).
+The machine-readable contract is [`sandbox.yaml`](../../../platform/api/openapi/sandbox.yaml).
 Runtime command and file operations use the separate
-[`data-plane.yaml`](../../../api/openapi/data-plane.yaml) contract.
+[`data-plane.yaml`](../../../platform/api/openapi/data-plane.yaml) contract.
 
 **Support boundary:** the API Server maps the Sandbox schema into the typed
 Instance contract. It supports S3 rootfs and mounts, image-backed mounts,
@@ -18,8 +18,8 @@ mounts are rejected because node paths are deployment-owned. `upstream` reverse
 tunnel is carried by the create contract; the legacy `/invoke` compatibility
 transport remains unavailable.
 Commands/files use Edge → Node Proxy → RRT. See
-[placement](../../../../docs/testing/http-node-placement.md) and
-[node lifecycle](../../../../docs/testing/node-lifecycle.md).
+[placement](../../../docs/testing/http-node-placement.md) and
+[node lifecycle](../../../docs/testing/node-lifecycle.md).
 
 Rootfs values overlay the deployment Runtime Environment. Omitted fields inherit
 the deployment default; `runtime` and `readonly` replace only those fields, while
@@ -41,7 +41,7 @@ Error responses retain the numeric `code` for envelope compatibility and add
 a stable `error` object containing `code`, `retry`, `outcome`, `requestId`, and
 the available operation/instance identities. Clients must follow those fields
 instead of inferring retry safety from HTTP status or message text. See the
-[management-plane error contract](../../../api/http/error-contract.md).
+[management-plane error contract](../../../platform/api/http/error-contract.md).
 
 ## Routes
 
@@ -59,7 +59,7 @@ instead of inferring retry safety from HTTP status or message text. See the
 
 `snapshotId` on the normal create route creates a new sandbox from a reusable
 snapshot. The snapshot is reusable; creating from it does not consume it.
-The Rust Master resolves the tenant-scoped Ready snapshot, protects it with a restore reference and applies compatible template fields. A local-only artifact pins the clone to the source node; shared storage permits normal scheduling. A deleting snapshot admits only an already-held reference. Explicit image, runtime and scalar resource geometry must match the snapshot; omitted resources inherit. Clones receive independent Instance/backend identities and artifact copies. See [snapshot storage](../../../../docs/testing/snapshot-storage.md).
+The Rust Master resolves the tenant-scoped Ready snapshot, protects it with a restore reference and applies compatible template fields. A local-only artifact pins the clone to the source node; shared storage permits normal scheduling. A deleting snapshot admits only an already-held reference. Explicit image, runtime and scalar resource geometry must match the snapshot; omitted resources inherit. Clones receive independent Instance/backend identities and artifact copies. See [snapshot storage](../../../docs/testing/snapshot-storage.md).
 
 Create uses the ordinary `X-Request-Id` header. It is optional: when absent,
 API Server derives the request ID from the trace ID, echoes it as `X-Request-Id`,

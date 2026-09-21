@@ -96,10 +96,10 @@ ADX 更新平均耗时按本轮 QPS 的倒数计算；旧侧直接输出总耗�
 
 ## 实现与验证
 
-- [比较程序](../../platform/control-plane/master/examples/compare.rs)：负载、邮箱、报告确认和正确性断言。
+- [比较程序](../../platform/master/examples/compare.rs)：负载、邮箱、报告确认和正确性断言。
 - [比较驱动](../../build/ci/compare_schedulers.py)：交替执行、预热、原始日志、指标提取和中位数汇总。
-- [Master 重试入口](../../platform/control-plane/master/src/lib.rs) 与 [Shard 排队／候选选择](../../platform/control-plane/master/src/shard.rs)：拒绝后释放精确 assignment 并重新排队。调用方必须确认节点未执行或已清理；不是迁移运行中实例的接口。
-- [重试回归测试](../../platform/control-plane/master/tests/retry.rs)：过期 generation、重复拒绝、资源释放、候选缓存复用、请求之间的排除列表隔离。
+- [Master 重试入口](../../platform/master/src/lib.rs) 与 [Shard 排队／候选选择](../../platform/master/src/shard.rs)：拒绝后释放精确 assignment 并重新排队。调用方必须确认节点未执行或已清理；不是迁移运行中实例的接口。
+- [重试回归测试](../../platform/master/tests/retry.rs)：过期 generation、重复拒绝、资源释放、候选缓存复用、请求之间的排除列表隔离。
 
 本轮 `adx-master`、`adx-scheduling`、`adx-core` 定向测试 **51 通过、0 失败、1 个性能用例忽略**；三个 crate 的 `--all-targets -D warnings` Clippy 通过。Linux Release 构建通过，最终比较矩阵全部通过。没有重跑整个 workspace 或完整平台 E2E。
 

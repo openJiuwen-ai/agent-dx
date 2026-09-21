@@ -26,7 +26,7 @@ resource limits, and per-sandbox data-plane security. Declared user ports use
 Edge and Node Proxy routing. Public local rootfs paths and host mounts are not a
 tenant-facing contract. `upstream` reverse tunnel uses the published
 `/tunnel/{sandbox}` route; the legacy `/invoke` fallback remains unavailable. See the
-[current HTTP contract](../../../control-plane/api-server/docs/sandbox-lifecycle-api.md).
+[current HTTP contract](../../../../gateway/api-server/docs/sandbox-lifecycle-api.md).
 
 ## Image startup process
 
@@ -213,7 +213,7 @@ other programming/shape exceptions.
 
 ### SDK versus raw HTTP
 
-These are SDK semantics, not a substitute for the [frontend REST contract](../../../control-plane/api-server/docs/sandbox-lifecycle-api.md).
+These are SDK semantics, not a substitute for the [frontend REST contract](../../../../gateway/api-server/docs/sandbox-lifecycle-api.md).
 The SDK uses these paths internally:
 
 ```text

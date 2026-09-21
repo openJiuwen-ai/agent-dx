@@ -68,8 +68,8 @@ Full 流水线消费不可变制品，不得从源码重新编译或替换二进
 7. `package-smoke-{arch}`
    - 只使用前面步骤上传的 Platform、RRT 和 runc Runtime Pack，不读取 Cargo target
      或工作区内的临时二进制。
-   - 在单节点真实 Linux 环境启动 Redis、Master、API Server、Edge、Node Manager、
-     Node Proxy、sandboxd 和包内 RRT。
+   - 在单节点真实 Linux 环境启动 Redis、Master、内嵌 Edge 的 API Server、内嵌
+     Node Proxy 的 Node Manager、sandboxd 和包内 RRT。
    - 验证服务就绪、API Key 鉴权、Instance 创建/查询、RRT 命令、文件读写、显式删除、
      资源释放和 sandboxd inventory 清空。
    - 用例必须有界，不包含 checkpoint、节点失联、进程重启、日志滚动等待和多节点放置。
@@ -107,7 +107,8 @@ logs/、junit/
 ```
 
 平台包对所有角色保持一致，通过每台主机自己的 YAML profile 启动 Master、Node、
-API Server、Edge 或 Standalone，避免按角色维护多套二进制包。
+API Server（默认内嵌 Edge）或 Standalone，避免按角色维护多套二进制包；独立 Edge
+二进制仍在同一平台包中供显式分进程配置使用。
 
 基础出包的 `source-gate` 负责单元、契约和静态检查，`package-smoke` 负责验证刚生成
 制品的最小真实闭环。它证明基础包可安装、可启动和可完成一次 Instance 生命周期，

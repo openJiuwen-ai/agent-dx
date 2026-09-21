@@ -10,9 +10,9 @@
 |---|---|
 | `schedule_snapshot.*` 的不可变单元、增量发布及查询索引 | [snapshot.rs](../../platform/crates/scheduling/src/snapshot.rs)：`im::OrdMap/OrdSet` 共享树节点；节点、实例、租户、标签、反亲和索引只更新受影响路径。旧版本可继续只读。节点 ID 查找不再线性扫描 |
 | 查询上下文复用 | [query.rs](../../platform/crates/scheduling/src/query.rs)：每请求准备一次匹配结果，多个候选和 Filter/Score 共用；按租户/精确标签中最小集合筛选，NotIn/DoesNotExist 等表达式仍按原语义复核 |
-| `schedule_queue_actor.cpp` 的 256 请求 / 10 ms 有界轮次 | [master/lib.rs](../../platform/control-plane/master/src/lib.rs)：`schedule_round` 在请求之间检查预算；固定基准快照根，轮内每次预留增量进入后续请求视图。到界返回给调用者处理心跳、更新等事件 |
-| `RequestMutationJournal` 与预分配增量对账 | [journal.rs](../../platform/control-plane/master/src/journal.rs)：按序号直接读取新增区间，合并重复节点；缓存刷新该节点的当前可分配量，避免重复扣减；游标过旧时重建候选 |
-| `SchedulingInputSignature` / `SupportsSemanticAggregation` | [shard.rs](../../platform/control-plane/master/src/shard.rs)：按 CPU、内存、镜像和 runtime 聚合计算。仅框架内置 profile、默认空策略、零磁盘请求且无既有反向硬反亲和时启用。自定义插件即使用内置同名也不启用 |
+| `schedule_queue_actor.cpp` 的 256 请求 / 10 ms 有界轮次 | [master/lib.rs](../../platform/master/src/lib.rs)：`schedule_round` 在请求之间检查预算；固定基准快照根，轮内每次预留增量进入后续请求视图。到界返回给调用者处理心跳、更新等事件 |
+| `RequestMutationJournal` 与预分配增量对账 | [journal.rs](../../platform/master/src/journal.rs)：按序号直接读取新增区间，合并重复节点；缓存刷新该节点的当前可分配量，避免重复扣减；游标过旧时重建候选 |
+| `SchedulingInputSignature` / `SupportsSemanticAggregation` | [shard.rs](../../platform/master/src/shard.rs)：按 CPU、内存、镜像和 runtime 聚合计算。仅框架内置 profile、默认空策略、零磁盘请求且无既有反向硬反亲和时启用。自定义插件即使用内置同名也不启用 |
 | `SelectFeasible` 候选复用 | 排序候选集按上述签名复用；资源预留、释放和状态变化后，仅重新评估变化节点并更新排序。Pack/Spread 与未启用复用时逐次结果一致；没有重复使用旧分数 |
 | 发布完成后再唤醒等待调度 | Master 先更新快照及变更序列，再合并唤醒事件。包括只有维护状态变化的上报；停滞队列等待新事件，不自行忙循环 |
 

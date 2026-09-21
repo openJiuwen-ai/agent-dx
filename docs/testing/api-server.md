@@ -37,7 +37,7 @@ API Server 通过 `InstanceDirectoryService.WatchInstances` 维护完整的内�
 
 ## 服务装配
 
-三个进程均使用 `--config /path/to/config.json`，未知配置项拒绝。配置示例见 `build/config/examples/`，文件路径按进程工作目录解释。API Server 默认使用 HTTPS；`loopback_http=true` 仅允许字面回环地址供同机 Edge 转发。内部 gRPC 客户端校验配置的 CA 与服务端名称。
+Master、Node Manager 和 API Server 均使用 `--config /path/to/config.json`，未知配置项拒绝。配置示例见 `build/config/examples/`，文件路径按进程工作目录解释。API Server 默认内嵌 Edge；API 监听使用 HTTPS，或以 `loopback_http=true` 限制在字面回环地址供 Edge 转发。内部 gRPC 客户端校验配置的 CA 与服务端名称。显式 `edge_mode=standalone` 才启动独立 `adx-edge-frontend`。
 
 Master 在绑定监听地址后开启一次 Redis Session，恢复调度目录，装配 MasterService 与 AuthService。
 

@@ -73,6 +73,6 @@ Python SDK 对结构化错误抛出 `SandboxHTTPError`，并公开 `status_code`
 
 实现位置：
 
-- API Server 分类与序列化：`platform/control-plane/api-server/src/errors.rs`、`src/http.rs`
+- API Server 分类与序列化：`gateway/api-server/src/errors.rs`、`src/http.rs`
 - Python SDK 解析：`platform/sdk/sandbox/python/adx_sandbox/_transport.py`
 - 系统可靠性验收：`docs/testing/system-reliability-gates.md`
