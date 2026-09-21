@@ -1,7 +1,7 @@
+use adx_process::resource::raise_nofile_soft_limit_from_env;
 use bytes::Bytes;
 use data_plane_gateway::client::{connect_edge, ConnectClientConfig, EdgeTlsConfig};
 use data_plane_gateway::common::protocol::ConnectTarget;
-use data_plane_gateway::common::resource::raise_nofile_soft_limit_from_env;
 use data_plane_gateway::edge::connector::H2ConnectStream;
 use data_plane_gateway::edge::{AccessKind, DataPlaneL4Connector, H2PoolConfig};
 use http::{header, Method, Request, Uri};
@@ -88,7 +88,7 @@ impl AsyncWrite for NodeStream {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    data_plane_gateway::common::install_crypto_provider();
+    adx_transport::install_crypto_provider();
     raise_nofile_soft_limit_from_env()?;
     let mut args = env::args().skip(1);
     match args.next().as_deref() {

@@ -10,6 +10,10 @@ description = "Shared ADX tracing, metrics, and logging support"
 workspace = true
 
 [dependencies]
+adx-core = { path = "../../platform/crates/core" }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 opentelemetry = { version = "0.31", default-features = false, features = ["trace", "futures"] }
@@ -19,4 +23,6 @@ tonic = { version = "0.12", default-features = false, features = ["codegen"] }
 http = "1"
 [dev-dependencies]
 opentelemetry_sdk = { version = "0.31", features = ["testing"] }
+serde_json = "1"
+tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }

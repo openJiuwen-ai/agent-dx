@@ -34,6 +34,7 @@ The fixed layering is: Agent/application → Sandbox SDK/HTTP API → API Server
 | Directory | Responsibility |
 |---|---|
 | `agent/` | Agent APIs, sessions, dispatch, and execution orchestration |
+| `crates/` | Product-wide error semantics, observability, process bootstrap, and transport support |
 | `gateway/` | Public Sandbox API Server, Edge entrypoint, Node Proxy, routing, and forwarding |
 | `gateway/api-server/` | Sandbox HTTP API, authentication, ownership cache, and Instance RPC clients; embeds Edge by default |
 | `platform/master/` | Cluster state, scheduling shards, Redis persistence, routes, credentials, and snapshots |

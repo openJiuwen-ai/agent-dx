@@ -2,6 +2,8 @@ use clap::Parser;
 use serde::de::DeserializeOwned;
 use std::{error::Error, path::PathBuf};
 
+pub mod resource;
+
 /// Common command-line arguments accepted by ADX service processes.
 #[derive(Debug, Parser, PartialEq, Eq)]
 #[command(disable_version_flag = true)]
@@ -24,21 +26,25 @@ pub fn read_config_file<T: DeserializeOwned>(path: &std::path::Path) -> Result<T
 }
 
 /// Wait until the process receives its supported shutdown signal.
-pub async fn shutdown() {
+pub async fn shutdown_signal() -> std::io::Result<()> {
     #[cfg(unix)]
     {
         let mut terminate =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("install SIGTERM handler");
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = terminate.recv() => {}
+            result = tokio::signal::ctrl_c() => result,
+            _ = terminate.recv() => Ok(()),
         }
     }
     #[cfg(not(unix))]
     {
-        let _ = tokio::signal::ctrl_c().await;
+        tokio::signal::ctrl_c().await
     }
+}
+
+/// Convenience wrapper for service loops that do not report signal setup errors.
+pub async fn shutdown() {
+    let _ = shutdown_signal().await;
 }
 
 #[cfg(test)]

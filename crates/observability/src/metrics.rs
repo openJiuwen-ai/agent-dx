@@ -1,5 +1,5 @@
 //! Read-only Prometheus exposition of allocation ledgers (not runtime usage).
-use crate::{
+use adx_core::{
     scheduling::{DeviceKind, DeviceLedger},
     ResourceLedger,
 };
@@ -113,7 +113,7 @@ pub fn resources(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scheduling::{Device, DeviceAllocation, DeviceRequest};
+    use adx_core::scheduling::{Device, DeviceAllocation, DeviceRequest};
     #[test]
     fn missing_and_unhealthy_devices_keep_reservations_and_escape_models() {
         let mut ledger = DeviceLedger::default();

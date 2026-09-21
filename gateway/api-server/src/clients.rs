@@ -1,6 +1,7 @@
 use crate::{config::Config, instance_directory::InstanceDirectory, ownership::Cache};
 use adx_observability::trace;
 use adx_protocol::control as pb;
+use adx_transport::tls::grpc_client_config;
 use sha2::{Digest, Sha256};
 use std::{
     future::Future,
@@ -9,7 +10,7 @@ use std::{
 };
 use tokio::sync::Mutex;
 use tonic::{
-    transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity},
+    transport::{Channel, ClientTlsConfig, Endpoint},
     Response, Status,
 };
 
@@ -26,13 +27,12 @@ pub struct Clients {
 impl Clients {
     pub fn new(config: Config) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
         config.validate()?;
-        let tls = ClientTlsConfig::new()
-            .ca_certificate(Certificate::from_pem(std::fs::read(&config.ca)?))
-            .identity(Identity::from_pem(
-                std::fs::read(&config.certificate)?,
-                std::fs::read(&config.private_key)?,
-            ))
-            .domain_name(&config.server_name);
+        let tls = grpc_client_config(
+            &config.ca,
+            &config.certificate,
+            &config.private_key,
+            &config.server_name,
+        )?;
         let discovery = config
             .discovery
             .as_ref()

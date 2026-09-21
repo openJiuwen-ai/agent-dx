@@ -2186,7 +2186,7 @@ mod tests {
     }
 
     fn ingress_test_acceptor() -> TlsAcceptor {
-        crate::common::install_crypto_provider();
+        adx_transport::install_crypto_provider();
         let certs = rustls_pemfile::certs(
             &mut &include_bytes!("../../tests/fixtures/ingress-cert.pem")[..],
         )
@@ -2307,7 +2307,7 @@ mod tests {
         if std::env::var_os(CHILD_ENV).is_some() {
             // Use the real logger and file writers, including the independent
             // access/audit layer. A separate process isolates global tracing.
-            let guard = crate::common::logging::init("edge-frontend", true).unwrap();
+            let guard = adx_observability::logging::init("edge-frontend", true).unwrap();
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()

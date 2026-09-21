@@ -96,7 +96,7 @@ impl ShardScheduler {
     }
     pub fn metrics(
         &self,
-        out: &mut adx_core::metrics::Text,
+        out: &mut adx_observability::metrics::Text,
         shard: usize,
         unavailable: &BTreeSet<String>,
     ) {
@@ -110,7 +110,7 @@ impl ShardScheduler {
             let labels = [("shard_id", shard.to_string()), ("node_id", id.clone())];
             let accepting = state.node.available && !unavailable.contains(id);
             out.gauge("adx_master_node_schedulable", &labels, u64::from(accepting));
-            adx_core::metrics::resources(
+            adx_observability::metrics::resources(
                 out,
                 "adx_master_node",
                 &labels,

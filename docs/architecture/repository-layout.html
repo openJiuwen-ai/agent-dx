@@ -18,6 +18,11 @@
 │   ├── sdk/python/src/adx/         # Agent 编程 SDK
 │   ├── executor/src/adx/           # Agent Executor
 │   └── tests/                     # Agent 测试及外部运行时替身
+├── crates/                        # 跨 Gateway / Platform / Runtime 的横切库
+│   ├── error/                     # 稳定错误码、重试与操作结果语义
+│   ├── observability/             # 日志、Metrics、Trace 与进程日志捕获
+│   ├── process/                   # 进程配置、退出信号和宿主资源准备
+│   └── transport/                 # TLS、请求上下文和 deadline 传播
 ├── platform/
 │   ├── master/                    # Rust Master；Global + 内嵌 Shard
 │   ├── node-manager/              # Rust 本机生命周期和后端/存储适配
@@ -25,9 +30,7 @@
 │   │   ├── core/                  # Instance、资源、恢复点、调度纯类型
 │   │   ├── protocol/              # gRPC 生成、转换与组件身份
 │   │   ├── discovery/             # Redis 服务地址发现
-│   │   ├── service-runtime/       # 服务参数、配置读取与退出信号
-│   │   ├── scheduling/            # Filter / Score、快照与查询索引
-│   │   └── observability/         # Trace 初始化、传播与导出
+│   │   └── scheduling/            # Filter / Score、快照与查询索引
 │   ├── api/
 │   │   ├── proto/instance.proto   # Master / Node 管理服务
 │   │   ├── proto/instance_types.proto # Instance / 资源 / 调度类型
@@ -45,7 +48,7 @@
 │   │   ├── tests/                 # HTTP 契约与校验
 │   │   └── docs/                  # Sandbox HTTP 支持范围
 │   └── src/
-│       ├── common/                # 传输元数据、日志、资源与关闭辅助
+│       ├── common/                # Gateway 内部监听、路由与数据面协议
 │       ├── edge/                  # 路由订阅、认证、连接池、反向代理
 │       ├── node/                  # NodeProxyService、绑定、活动、转发
 │       └── bin/                   # Edge、Node Proxy、forwarder
@@ -66,7 +69,7 @@
 <p>此树只展示主要已存在路径。语言构建输出与测试证据放在 <code>out/</code> 或显式外部缓存，<code>build/</code> 保存源码脚本。运行时数据库、日志与 checkpoint 使用部署配置的数据目录。</p>
 <h2 id="section-3">控制面内部模块</h2>
 <div class="table"><table><tr><th>组件</th><th>现有主要模块</th><th>职责</th></tr><tr><td>Master</td><td><code>lib.rs</code>、<code>shard.rs</code>、<code>queue.rs</code>、<code>journal.rs</code></td><td>Global 轮转、Shard 内存队列、预留、增量调度视图；租户间轮转，租户内优先级/FIFO</td></tr><tr><td>Master</td><td><code>storage.rs</code>、<code>storage/</code>、<code>rpc.rs</code>、<code>rpc/</code></td><td>Redis 条件提交、原子归属、目录、节点失效、快照克隆、共享恢复协调；不执行节点普通生命周期</td></tr><tr><td>Master</td><td><code>auth.rs</code>、<code>routes.rs</code>、<code>metrics.rs</code></td><td>API Key 摘要、路由发布、集群指标</td></tr><tr><td>Node Manager</td><td><code>controller.rs</code>、<code>controller/{lifecycle,monitor,snapshots}.rs</code></td><td>每 Instance 串行任务、暂停/恢复/删除、空闲回收与重启</td></tr><tr><td>Node Manager</td><td><code>sandboxd.rs</code>、<code>runtime_control.rs</code>、<code>readiness.rs</code></td><td>RuntimeBackend 适配；本地 EROFS／OCI image 环境；RRT HTTP 协作与就绪</td></tr><tr><td>Node Manager</td><td><code>checkpoint.rs</code>、<code>checkpoint/</code></td><td>可扩展 CheckpointStore、本地/S3、缓存引用和远端孤儿回收</td></tr><tr><td>Node Manager</td><td><code>journal.rs</code>、<code>reconciliation.rs</code></td><td>SQLite 故障降级日志与 Master 权威目录对账</td></tr><tr><td>Node Manager</td><td><code>resources.rs</code>、<code>routes.rs</code>、<code>activity.rs</code>、<code>proxy.rs</code></td><td>容量源/准入、绑定同步、活动采集、代理进程组合</td></tr><tr><td>Rust API Server</td><td><code>contract.rs</code>、<code>http.rs</code>、<code>clients.rs</code>、<code>operations.rs</code></td><td>HTTP 兼容字段到 Instance RPC；认证、版本化实例目录订阅、入口节点轮转、直达节点、快照目录</td></tr></table></div>
-<p><code>core</code> 不依赖 Redis/SQLite/tonic/sandboxd 客户端；<code>protocol</code> 不承载调度或状态机。Node Manager 可依赖 Gateway 的 node 库，Gateway 不依赖 Master/Node Manager 业务实现。Shard 当前与 Master 同进程。</p>
+<p><code>core</code> 不依赖 Redis/SQLite/tonic/sandboxd 客户端；<code>protocol</code> 不承载调度、状态机、证书文件读取或 TLS 构建。稳定错误语义、可观测、服务进程支持和传输机制位于根级 <code>crates/</code>。Node Manager 可依赖 Gateway 的 node 库，Gateway 不依赖 Master/Node Manager 业务实现。Shard 当前与 Master 同进程。</p>
 <p>默认创建经 Global 轮转进入 Shard Filter/Score。启用 <code>create_mode=local_first</code> 时，API Server 轮转可用入口节点，Node Manager 用同一 Admission 暂留资源，Master 原子确认唯一归属并同步中心账本；本地不满足时使用同一 Instance ID 回退 Shard。Master 向 API Server 首次全量、后续增量发布保留的实例目录，包括用于幂等生命周期结果的终态记录；已有实例操作命中本地目录后直达 Node Manager。</p>
 <h2 id="section-4">Node Manager / Node Proxy 进程组合</h2>
 <div class="table"><table><tr><th>模式</th><th>配置与装配</th><th>共同契约</th></tr><tr><td>embedded（默认）</td><td>Node Manager 省略 <code>proxy_mode</code> 或配置 <code>proxy_mode=embedded</code>，托管同一 NodeProxyService；Proxy 环境项放到 node-manager 服务</td><td>仍走同一 UDS 和完整绑定同步，不绕过版本/身份检查</td></tr><tr><td>standalone</td><td>两个 supervisor 服务；Node Manager 显式配置 <code>proxy_mode=standalone</code></td><td>Node Manager 经受保护 UDS 控制 NodeProxyService</td></tr></table></div>

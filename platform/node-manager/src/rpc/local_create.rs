@@ -1,4 +1,5 @@
 use super::*;
+use adx_transport::deadline::remaining;
 use pb::claim_instance_response::Outcome;
 impl NodeRpc {
     /// Retry only idle, unconfirmed holds. HTTP callers may have disappeared;
@@ -245,13 +246,6 @@ impl NodeRpc {
                 Status::unavailable("forwarded creation result unknown; retry same Instance ID")
             })?
     }
-}
-
-fn remaining(deadline: tokio::time::Instant, cap: Duration) -> Option<Duration> {
-    let remaining = deadline
-        .checked_duration_since(tokio::time::Instant::now())
-        .filter(|remaining| !remaining.is_zero())?;
-    Some(remaining.min(cap))
 }
 
 #[cfg(test)]

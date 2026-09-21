@@ -69,8 +69,8 @@ impl Master {
     pub(crate) fn metrics_excluding(
         &self,
         unavailable: &BTreeSet<String>,
-    ) -> adx_core::metrics::Text {
-        let mut text = adx_core::metrics::Text::default();
+    ) -> adx_observability::metrics::Text {
+        let mut text = adx_observability::metrics::Text::default();
         for (id, shard) in self.shards.iter().enumerate() {
             shard.metrics(&mut text, id, unavailable);
         }

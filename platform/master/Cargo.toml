@@ -11,7 +11,8 @@ description = "ADX persistent control-plane state and shard scheduling service"
 workspace = true
 
 [dependencies]
-adx-observability = { path = "../crates/observability" }
+adx-observability = { path = "../../crates/observability" }
+adx-transport = { path = "../../crates/transport" }
 hyper-util = { version = "0.1", features = ["tokio"] }
 hyper = { version = "1", features = ["server", "http1"] }
 http-body-util = "0.1"
@@ -22,7 +23,7 @@ adx-discovery = { path = "../crates/discovery" }
 tokio-stream = { version = "0.1", features = ["net"] }
 sha2 = "0.10"
 adx-protocol = { path = "../crates/protocol" }
-adx-service-runtime = { path = "../crates/service-runtime" }
+adx-process = { path = "../../crates/process" }
 tonic = { version = "0.12", features = ["tls"] }
 adx-core = { path = "../crates/core" }
 adx-scheduling = { path = "../crates/scheduling" }

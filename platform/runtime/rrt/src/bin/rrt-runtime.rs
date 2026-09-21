@@ -12,8 +12,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Fork-based warm starts hold here until the child is ready. Refresh the
     // restored environment before constructing Tokio or reading runtime args.
     rrt_daemon::startup::prepare_runtime_environment()?;
-    let _trace = adx_observability::trace::init("adx-rrt")
-        .map_err(|e| -> Box<dyn std::error::Error> { e })?;
+    let _logging_guard = adx_observability::logging::init("adx-rrt", false)?;
     build_runtime()?.block_on(run())
 }
 

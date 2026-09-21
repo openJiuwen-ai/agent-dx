@@ -8,7 +8,8 @@ use adx_agent_core::{
     transport::{service_origin, validate_service_token, RequestProgress, ServiceAuth},
 };
 use adx_discovery::RedisDiscovery;
-use adx_protocol::{control as pb, tls::TlsFiles};
+use adx_protocol::control as pb;
+use adx_transport::tls::TlsFiles;
 use async_trait::async_trait;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};

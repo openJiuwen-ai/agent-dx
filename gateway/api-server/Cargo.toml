@@ -13,9 +13,11 @@ workspace = true
 [dependencies]
 adx-core = { path = "../../platform/crates/core" }
 adx-protocol = { path = "../../platform/crates/protocol" }
-adx-service-runtime = { path = "../../platform/crates/service-runtime" }
+adx-error = { path = "../../crates/error" }
+adx-process = { path = "../../crates/process" }
+adx-transport = { path = "../../crates/transport" }
 adx-discovery = { path = "../../platform/crates/discovery" }
-adx-observability = { path = "../../platform/crates/observability" }
+adx-observability = { path = "../../crates/observability" }
 data-plane-gateway = { path = ".." }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -33,6 +35,3 @@ percent-encoding = "2"
 futures-util = "0.3"
 tokio-stream = "0.1"
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "stream"] }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-rustls-pemfile = "2"
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
