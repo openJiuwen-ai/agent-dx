@@ -2,7 +2,7 @@
 
 核对日期：2026-09-21。此页描述当前源码布局；首次导入记录保留在 [迁移报告](../migration/2026-09-14-import.md)。[HTML 阅读版](repository-layout.html) 从本文件生成，架构图为仓库内 SVG。
 
-![当前组件与调用方向](current-architecture.svg)
+![当前组件与调用方向](../../assets/architecture/current-architecture.svg)
 
 ## 分层与当前接入状态
 
@@ -25,6 +25,9 @@ Agent 使用新平台的目标边界是公开 Sandbox SDK，不直接访问平�
 agent-dx/
 ├── Cargo.toml / Cargo.lock / rust-toolchain.toml
 ├── Makefile / build.sh / VERSION / pytest.ini
+├── assets/                       # Logo、设计语言与架构图的统一来源
+│   ├── logo/                     # 黑白标志、独立图标和反相版本
+│   └── architecture/             # 系统架构与当前组件调用图
 ├── agent/
 │   ├── cli/ar_cli/                 # Python adx 命令
 │   ├── sdk/python/src/adx/         # Agent 编程 SDK

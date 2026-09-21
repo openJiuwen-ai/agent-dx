@@ -69,7 +69,7 @@ git diff --check
 | [build/e2e/example/README.md](../../build/e2e/example/README.md) | 当前说明／源码与入口 |
 | [build/e2e/firecracker/README.md](../../build/e2e/firecracker/README.md) | 当前说明／源码与入口 |
 | [build/e2e/kubernetes/README.md](../../build/e2e/kubernetes/README.md) | 当前说明／源码与入口 |
-| [docs/architecture/current-architecture.svg](../architecture/current-architecture.svg) | 页面／结构与内容同步 |
+| [assets/architecture/current-architecture.svg](../../assets/architecture/current-architecture.svg) | 页面／结构与内容同步 |
 | [docs/architecture/repository-layout.html](../architecture/repository-layout.html) | 页面／结构与内容同步 |
 | [docs/architecture/repository-layout.md](../architecture/repository-layout.md) | 当前说明／源码与入口 |
 | [docs/deployment/standalone.md](../deployment/standalone.md) | 当前说明／源码与入口 |

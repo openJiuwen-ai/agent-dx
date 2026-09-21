@@ -1,128 +1,78 @@
-[English](README.md) | **中文**
+<p align="center">
+  <img src="assets/logo/agent-dx-lockup.png" alt="Agent DX" width="560">
+</p>
 
-# Agent DX
+<h3 align="center">openJiuwen Agent Runtime 的分布式执行底座</h3>
 
-Agent DX 是面向 Agent 与隔离 Capsule 的执行平台。仓库统一提供 Sandbox API 与 SDK、分布式调度、节点本地生命周期管理、共享流量入口、运行时操作、Checkpoint 恢复和部署工具。
+<p align="center"><a href="README.md">English</a> | <strong>中文</strong></p>
 
-![Agent DX 架构](docs/architecture/images/agent-dx.svg)
+Agent DX（**Agent Distributed eXecutor**）是 openJiuwen Agent Runtime 的一种分布式执行底座，用于承载 Agent 注册、调用、会话管理等开发者工具。同时提供公开 Sandbox API 与 SDK、分布式调度、隔离执行、流量路由、运行时操作、Checkpoint 恢复与部署工具，并保持执行后端可替换。
 
-## 架构
+<p align="center">
+  <a href="#-快速开始">🚀 快速开始</a> ·
+  <a href="docs/architecture/repository-layout.md">📐 架构</a> ·
+  <a href="platform/sdk/sandbox/python/README.md">📦 Sandbox SDK</a> ·
+  <a href="docs/deployment/adxctl.md">⚙️ 部署</a> ·
+  <a href="docs/testing/control-plane-ci.md">✅ 测试门禁</a>
+</p>
 
-Agent 应用通过公开 Sandbox SDK 创建和操作 Capsule。Gateway 承接外部流量，并分离控制请求与数据请求。API Server 认证调用方并提供 Sandbox HTTP API。Master 管理集群状态、调度、节点健康、路由发布、凭证和快照元数据。Node Manager 完成本机最终准入，并串行管理每个 Capsule 的生命周期。Node Proxy 将数据请求转发到目标 Runtime 内的 RRT。
+## 🎯 何时使用 Agent DX
 
-Redis 是集群状态和服务发现的权威后端。集群状态暂时无法提交时，Node Manager 使用本地 SQLite 日志记录待同步结果。sandboxd 由部署环境管理，提供执行后端。API Server 默认内嵌 Edge，Node Manager 默认内嵌 Node Proxy；两组组件都支持显式分进程部署。
-
-## 核心抽象
-
-ADX 将稳定的逻辑单元与可替换的物理执行分开：**Capsule** 是内部受管身份，**Runtime** 是 Capsule 在某个节点上的一次具体执行；**Sandbox** 保持为对外 API 和 SDK 的产品接口。Agent Distributed Executor 位于平台之上，通过 Sandbox SDK 使用 Capsule 能力，不参与平台内部调度和生命周期状态机。
-
-| 抽象 | 所属层 | 含义与边界 |
+| 目标 | 部署方式 | 所需条件 |
 |---|---|---|
-| `Agent` / `Session` | Agent 层 | 面向 Agent 的任务、会话、亲和和执行编排；只通过公开 Sandbox SDK 使用平台 |
-| `Sandbox` | 公开接口层 | 用户持有的 API/SDK 句柄；一次创建映射到一个 Capsule，不作为内部调度对象 |
-| `Capsule` | 管控面 | 稳定的内部身份，包含租户、规格和期望／实际状态；创建、暂停、恢复和删除都围绕它收敛 |
-| `Runtime` | 节点执行层 | sandboxd 创建的一次具体执行，包含 `runtime_id` 和可选 IP；重启、恢复、reload 或跨节点接管可以替换 Runtime，但保持 Capsule ID |
-| `Assignment` | 调度层 | Capsule 的权威归属，记录节点、设备和 `generation`；新一代归属会隔离迟到的旧执行 |
-| `Shard` | Master 调度层 | Master 内的调度分区。Global 只轮转选择 Shard，Shard 负责排队、Filter／Score 和节点选择 |
-| `Node` | 节点层 | 一次 Node Manager 注册会话及其容量、设备和健康状态；Node Manager 执行最终本机准入 |
-| `EnvironmentSpec` | 执行层 | RRT、启动命令和本地 EROFS／OCI 内容进入 Capsule 的方式；`runtime_class` 选择 sandboxd 的运行时驱动 |
-| `Route` / `Binding` | 数据面 | Master 发布版本化 Capsule 归属，Edge 缓存路由，Node Proxy 在转发前复核本机绑定 |
-| `Restore Point` / `Snapshot` | 恢复层 | 暂停恢复点保留原 Capsule ID；可复用 Snapshot 用于创建新的 Capsule，制品可落本地或对象存储 |
-| `Request ID` / `Operation ID` | 可靠性契约 | 标识一次逻辑写操作，用于重试、去重、结果查询和故障对账；超时不自动等价于失败 |
+| 为单个 Agent 服务增加隔离命令、文件、终端和端口操作 | 单机部署 | 一台 Linux 主机、独立托管的 sandboxd、ADX 发布包和 Capsule 网络 |
+| 让多个 Agent 服务共享跨机器执行资源 | 按角色多机部署 | 持久化 Redis、一个 Master 部署、一个或多个 Worker 部署和可访问的 Gateway |
+| 以可重复验收方式运行生产形态集群 | Kubernetes | Linux Worker、持久化 Redis、组件证书、Worker 上的 sandboxd 和 ADX Kubernetes E2E 配置 |
+| 暂停、恢复、克隆或接管长时间任务 | 单机或分布式 | 支持 Checkpoint 的运行时，以及本地或 S3 兼容 Checkpoint 存储 |
+| 调度加速卡工作负载 | 分布式 | Worker 上报 GPU/NPU 清单，Sandbox 规格申请匹配设备 |
 
-调用分层固定为：Agent／业务应用 → Sandbox SDK／HTTP API → API Server → Master／ShardScheduler 或本地优先 Node Manager → sandboxd；运行时数据请求走 Edge → Node Proxy → Runtime 内 RRT，不进入控制面生命周期队列。
+## 🧩 Agent DX 在技术栈中的位置
 
-兼容 HTTP 与 SDK 契约继续保留 `instanceId`、`instance_id` 和 `/api/instances` 等外部字段。API Server 在边界把它们转换为 Capsule ID；内部 Rust 类型、gRPC、持久化键、指标和运行身份统一使用 Capsule 命名。
+| 层 | 负责内容 | 与 Agent DX 的关系 |
+|---|---|---|
+| Agent 框架或业务应用 | Prompt、工具、会话、任务逻辑和业务策略 | 调用公开 Sandbox SDK 或 HTTP API，不进入平台调度或生命周期状态机 |
+| Agent DX | 认证、放置、Capsule 状态、路由、恢复和可观测 | 在多个节点和执行后端之上提供统一分布式执行契约 |
+| sandboxd | 运行时创建、隔离、网络和 Checkpoint 原语 | 作为每个 Worker 上的外部服务，由 Node Manager 的运行时驱动调用 |
+| Runtime 内的 RRT | 命令、文件、终端、端口、活动统计和恢复协作 | Edge 与 Node Proxy 完成归属和 generation 校验后转发数据请求 |
+| Redis 与对象存储 | 权威集群元数据和可选共享 Checkpoint 制品 | Redis 保存控制状态与服务发现；对象存储支持跨节点访问 Checkpoint |
 
-| 目录 | 职责 |
-|---|---|
-| `agent/` | Agent API、会话、任务分发和执行编排 |
-| `gateway/` | Sandbox API Server、Edge 接入、Node Proxy、路由和转发 |
-| `gateway/api-server/` | Sandbox HTTP API、认证、归属缓存和 Capsule RPC 客户端；默认内嵌 Edge |
-| `platform/master/` | 集群状态、调度 Shard、Redis 持久化、路由、凭证和快照 |
-| `platform/node-manager/` | 本机准入、Capsule 生命周期、sandboxd、Checkpoint 和降级日志 |
-| `platform/runtime/rrt/` | Capsule 内命令、文件、终端、活动统计和恢复操作 |
-| `platform/sdk/sandbox/python/` | 公开 Python Sandbox SDK |
-| `platform/api/proto/` | Capsule、节点、路由、凭证和快照内部协议 |
-| `platform/deployment/` | `adxctl`、配置生成、进程托管和停机清理 |
-| `build/` 与 `.buildkite/` | 构建、打包、发布和端到端验证工具 |
+## 🔄 工作流程
 
-## 能力
+![Agent DX 架构](assets/architecture/agent-dx.svg)
 
-- Capsule 创建、查询、删除、暂停、恢复、快照和基于快照的克隆。
-- 中心调度与本地优先创建，支持 CPU、内存、磁盘、GPU/NPU 整卡、标签、亲和约束和偏好评分。
-- API Key 管理员与租户认证；内部服务支持可配置 mTLS。
-- Master 向 Edge 发布带版本的路由，Node Manager 与 Node Proxy 同步本机绑定。
-- 节点对账、Capsule 重启策略、空闲删除、Checkpoint 恢复、本地与 S3 兼容快照存储，以及引用感知的制品清理。
-- Prometheus 指标、OpenTelemetry Trace、结构化日志、日志滚动、gzip 压缩和外部 Collector 对接。
-- 支持托管 Redis 或外置 Redis 的进程部署，以及 Kubernetes 端到端部署方案。
+| 步骤 | 发生的事情 | 所在模块 |
+|---|---|---|
+| 1 · 接入 | 调用方认证后，通过统一公开契约创建或操作 Sandbox。 | `gateway/api-server/`、`platform/sdk/sandbox/python/` |
+| 2 · 放置 | API Server 使用本地优先准入或提交 Master。Master 在 Shard 间轮转，Shard 负责排队、过滤、评分和节点预留。 | `platform/master/`、`platform/crates/scheduling/` |
+| 3 · 运行 | Node Manager 完成本机最终准入、串行管理 Capsule 生命周期，并调用 sandboxd 创建带 RRT 的 Runtime。 | `platform/node-manager/`、`third_party/sandboxd/`、`platform/runtime/rrt/` |
+| 4 · 操作与恢复 | Edge 把数据请求路由到归属 Node Proxy。版本化归属隔离旧 Runtime；暂停、恢复、快照、重启策略和对账在故障后收敛状态。 | `gateway/`、`platform/node-manager/`、Redis、Checkpoint 存储 |
 
-## 部署
+API Server 默认内嵌 Edge，Node Manager 默认内嵌 Node Proxy；显式拆分进程时仍复用同一套契约。
 
-ADX 使用同一发布包按配置启动不同角色。部署环境需要准备 Linux 主机、独立运行的 sandboxd、组件证书、初始管理员 API Key 和 Capsule 网络。下载与主机架构一致的 release tar 包后执行：
+## 📦 安装
+
+ADX 发布包面向 Linux，包含控制面与数据面二进制、RRT、Python Sandbox SDK 和可选的托管 Redis 二进制。sandboxd 由部署环境独立托管，版本固定在 [`third_party/sandboxd/source.json`](third_party/sandboxd/source.json)。
 
 ```sh
-mkdir adx-release && tar -xzf adx-release.tar.gz -C adx-release
+mkdir adx-release
+tar -xzf adx-release.tar.gz -C adx-release
 sudo ./adx-release/install.sh
 ```
 
-安装器校验清单、文件摘要和主机架构，将版本写入 `/opt/adx/releases/<commit>` 并原子切换 `/opt/adx/current`。持久配置、数据和运行状态分别位于 `/opt/adx/config`、`/opt/adx/data`、`/opt/adx/run`，升级不会覆盖。`adxctl` 默认读取仅描述**当前主机**的 `/opt/adx/config/deployment.yaml`；它负责校验、渲染和托管进程，不用于创建 Capsule。
+安装器校验清单、文件摘要和主机架构，将版本写入 `/opt/adx/releases/<commit>` 并原子切换 `/opt/adx/current`。升级会保留 `/opt/adx/config`、`/opt/adx/data` 和 `/opt/adx/run`。
 
-### 单机部署：由 ADX 托管 Redis
+## 🔧 快速开始
 
-默认 `standalone` profile 在一台主机启动 Redis、Master、内嵌 Node Proxy 的 Node Manager，以及内嵌 Edge 的 API Server。sandboxd 仍由部署环境独立托管。
+默认 `standalone` profile 在一台主机启动托管 Redis、Master、内嵌 Node Proxy 的 Node Manager，以及内嵌 Edge 的 API Server。开始前先准备 sandboxd、网络、证书和初始管理员密钥。
 
 ```sh
 sudo /opt/adx/current/bin/adxctl config init --profile standalone
-
-# 编辑证书、初始密钥、sandboxd socket、Capsule CIDR 和磁盘路径。
-sudo /opt/adx/current/bin/adxctl validate
-sudo /opt/adx/current/bin/adxctl render --output /opt/adx/run/config-review
-sudo /opt/adx/current/bin/adxctl run
-```
-
-`run` 在前台运行 supervisor，生产环境应由 systemd 或 Pod 托管。另一个终端可查询和停止整个本机部署：
-
-```sh
-sudo /opt/adx/current/bin/adxctl status
-sudo /opt/adx/current/bin/adxctl stop
-```
-
-### 单机部署：使用外置 Redis
-
-```sh
-sudo /opt/adx/current/bin/adxctl config init --profile standalone-external-redis
-sudoedit /opt/adx/config/deployment.yaml   # 设置实际 redis_url 和 namespace
+sudoedit /opt/adx/config/deployment.yaml
 sudo /opt/adx/current/bin/adxctl validate
 sudo /opt/adx/current/bin/adxctl run
 ```
 
-外置 Redis 不由 `adxctl status`、重启预算或 `stop` 管理。所有组件必须使用同一个持久化 Redis 和 namespace。
-
-### 多主机按角色部署
-
-控制节点、每个 Worker 和接入节点分别生成自己的配置，不能把多个节点写进同一份 YAML：
-
-```sh
-# 控制节点：Master；如需本机托管 Redis，在完整 YAML 中增加 redis 角色。
-sudo /opt/adx/current/bin/adxctl config init --profile master
-
-# 每个 Worker：Node Manager，默认同进程运行 Node Proxy。
-sudo /opt/adx/current/bin/adxctl config init --profile node
-
-# 接入节点：默认由 API Server 内嵌 Edge。
-sudo /opt/adx/current/bin/adxctl config init --profile edge-api
-```
-
-每台主机都要修改自己的 `/opt/adx/config/deployment.yaml`，使用相同的 `redis_url`、`namespace` 和匹配的 mTLS 信任关系；每个 Worker 配置唯一 `node_id` 以及其他节点可访问的控制面和 Proxy 地址。推荐按 Redis → Master → Workers → API Server（含 Edge）的顺序启动。只有显式设置 `proxy_mode: standalone` 或 `edge_mode: standalone` 时，对应组件才作为独立进程部署。
-
-YAML 字符串字段支持 `${VAR}` 和 `${VAR:-default}`。可用 `adxctl config dump` 检查环境变量和 profile 合并后的完整配置。Kubernetes 中仍运行这些进程，由 Pod 管理 `adxctl run`、证书、Redis 连接和 sandboxd 依赖。
-
-完整字段、证书、Redis、网络和运行环境见 [`adxctl` 指南](docs/deployment/adxctl.md)、[单机部署](docs/deployment/standalone.md)、[配置示例](build/config/examples/README.md)和[运行环境](docs/deployment/runtime-environment.md)。
-
-## 使用
-
-发布包在 `sdk/` 中包含 `adx-sandbox` wheel。部署就绪后，安装 SDK，并将外部入口和 API Key 传给客户端：
+在另一终端安装发布包中的 SDK，并连接公开 Gateway：
 
 ```sh
 python3 -m venv /opt/adx-client
@@ -136,7 +86,7 @@ export ADX_GATEWAY_TLS=1
 export ADX_SANDBOX_IMAGE=python:3.12-slim
 ```
 
-创建 Capsule、通过 RRT 执行命令，并显式删除：
+创建 Sandbox，通过 RRT 执行命令，然后显式删除：
 
 ```python
 import os
@@ -155,43 +105,82 @@ finally:
     sandbox.kill()
 ```
 
-镜像必须能由当前 sandboxd 和 ADX Runtime Environment 启动。需要避免进程级环境变量时，应用可以显式构造 `ConnectionConfig`。暂停／恢复、可复用快照、资源约束和错误重试语义见 [Sandbox Python SDK](platform/sdk/sandbox/python/README.md)；直接调用 HTTP 的路径与请求格式见 [Sandbox API](gateway/api-server/docs/sandbox-lifecycle-api.md)。Agent 应用从 [Agent 使用指南](agent/README.md)进入，其底层仍使用同一 Sandbox SDK。
+镜像必须由当前 sandboxd 和 [ADX Runtime Environment](docs/deployment/runtime-environment.md) 支持。暂停恢复、可复用快照、放置约束、挂载、网络、数据面安全和重试语义见 [Sandbox SDK 指南](platform/sdk/sandbox/python/README.md)。
 
-## 构建与测试
+## 🏗️ 部署组合
 
-根目录 Cargo workspace 包含平台和 Agent 组件，Python 包独立构建。构建产物写入 `out/` 或配置的外部缓存。
+| 拓扑 | `adxctl` profile | 本机进程 |
+|---|---|---|
+| 单机托管 Redis | `standalone` | Redis、Master、Node Manager + Node Proxy、API Server + Edge |
+| 单机外置 Redis | `standalone-external-redis` | Master、Node Manager + Node Proxy、API Server + Edge |
+| 控制节点 | `master` | Master；Redis 可独立部署，也可加入完整 YAML |
+| Worker 节点 | `node` | 默认 Node Manager + Node Proxy |
+| 接入节点 | `edge-api` | 默认 API Server + Edge |
+
+每台主机使用独立的 `/opt/adx/config/deployment.yaml`。集群成员共享 Redis URL、namespace 和 mTLS 信任；每个 Worker 使用唯一 `node_id` 和可访问的控制、代理地址。启动顺序为 Redis → Master → Worker → API Server。仅在确实需要分进程时设置 `proxy_mode: standalone` 或 `edge_mode: standalone`。
+
+YAML 字符串支持 `${VAR}` 与 `${VAR:-default}`。使用 `adxctl config dump` 查看合并后的 profile 和主机覆盖。完整字段与证书说明见 [`adxctl` 参考](docs/deployment/adxctl.md)、[单机部署指南](docs/deployment/standalone.md)和[配置示例](build/config/examples/README.md)。
+
+## 📐 核心抽象
+
+ADX 将稳定逻辑身份与可替换物理执行分开：
+
+| 抽象 | 含义与边界 |
+|---|---|
+| `Sandbox` | 面向应用的公开 API 与 SDK 句柄 |
+| `Capsule` | 稳定内部身份，包含租户、规格、生命周期和期望／实际状态 |
+| `Runtime` | Capsule 在一个节点上的一次 sandboxd 执行；重启或恢复可替换 Runtime |
+| `Assignment` | 带 `generation` 的权威节点和设备归属，用于隔离迟到的旧执行 |
+| `Route` / `Binding` | 发布到 Edge 的版本化归属，以及 Node Proxy 转发前的本机复核 |
+| `Restore Point` / `Snapshot` | 恢复点保留 Capsule ID；可复用 Snapshot 创建新的 Capsule |
+| `Request ID` / `Operation ID` | 用于重试、去重、结果查询和对账的一次逻辑写身份 |
+
+固定控制链路为 Agent／应用 → Sandbox SDK／HTTP API → API Server → Master／Shard 调度器或本地优先 Node Manager → sandboxd。运行时数据请求走 Edge → Node Proxy → RRT，不进入生命周期队列。`instanceId`、`instance_id` 和 `/api/instances` 等兼容字段只在公开边界转换；内部 Rust 类型、RPC、持久化键、指标和运行身份统一使用 Capsule 命名。
+
+## ✨ 能力
+
+- Capsule 创建、查询、删除、暂停、恢复、可复用快照和基于快照的克隆。
+- 中心调度与本地优先创建，支持 CPU、内存、磁盘、GPU/NPU 设备、标签、亲和约束和偏好评分。
+- API Key 管理员／租户身份和可配置内部 mTLS。
+- 版本化路由发布与同步本机绑定检查。
+- 节点对账、重启策略、空闲删除、Checkpoint 恢复、本地／S3 兼容存储和引用感知制品清理。
+- Prometheus Metrics、OpenTelemetry Trace、结构化日志、滚动、gzip 压缩和外部 Collector 对接。
+- 托管或外置 Redis 的进程部署，以及 Kubernetes 端到端部署配置。
+
+## 🛠️ 开发与测试
+
+根 Cargo workspace 包含平台和 Agent 组件；Python 包独立构建。构建产物放在 `out/` 或显式配置的外部缓存。
 
 ```sh
 make help
 make rust-check
-
 cargo test --locked --workspace --all-features -j 2
 make agent-test
 PYTHONPATH=platform/sdk/sandbox/python \
   python -m pytest -q -c platform/sdk/sandbox/pytest.ini \
   platform/sdk/sandbox/python/tests
-
 make package PYTHON=/path/to/venv/bin/python
 ```
 
-使用 `python3 build/ci/run.py <suite>` 运行组件与集成测试。端到端门禁使用安装后的发布制品、公开 Sandbox SDK、Redis、Gateway、控制面、sandboxd 和 RRT。环境要求和门禁定义参见[控制面 CI](docs/testing/control-plane-ci.md)与 [Kubernetes E2E](build/e2e/kubernetes/README.md)。
+组件与集成测试使用 `python3 build/ci/run.py <suite>`。端到端门禁使用已安装发布包、公开 Sandbox SDK、Redis、Gateway、控制面、sandboxd 和 RRT。环境要求与门禁定义见[控制面 CI](docs/testing/control-plane-ci.md)和 [Kubernetes E2E 指南](build/e2e/kubernetes/README.md)。
 
-Sandbox SDK 分发名为 `adx-sandbox`，Python 导入名为 `adx_sandbox`，命令行为 `adx-sandbox`。ADX 环境变量使用 `ADX_` 前缀，内部品牌 HTTP Header 使用 `X-ADX-`。
+SDK 发布名为 `adx-sandbox`，Python 导入名为 `adx_sandbox`，CLI 为 `adx-sandbox`。ADX 环境变量使用 `ADX_` 前缀，内部品牌 HTTP 头使用 `X-ADX-`。
 
-## 文档
+## 📚 深入了解
 
-- [架构与目录规划](docs/architecture/repository-layout.md)
+- [架构与仓库目录](docs/architecture/repository-layout.md)
 - [Agent 使用](agent/README.md)
-- [Sandbox API](gateway/api-server/docs/sandbox-lifecycle-api.md)
-- [Sandbox OpenAPI](platform/api/openapi/sandbox.yaml)
+- [Sandbox API](gateway/api-server/docs/sandbox-lifecycle-api.md)与 [OpenAPI](platform/api/openapi/sandbox.yaml)
 - [数据面 OpenAPI](platform/api/openapi/data-plane.yaml)
 - [Sandbox Python SDK](platform/sdk/sandbox/python/README.md)
-- [部署配置示例](build/config/examples/README.md)
-- [节点生命周期与资源采集](docs/testing/node-lifecycle.md)
+- [部署配置](docs/deployment/adxctl.md)与[配置示例](build/config/examples/README.md)
+- [调度](docs/testing/scheduling-performance.md)、[节点生命周期](docs/testing/node-lifecycle.md)与[路由发布](docs/testing/route-publication.md)
 - [Checkpoint 与快照存储](docs/testing/snapshot-storage.md)
-- [调度](docs/testing/scheduling-performance.md)
-- [路由发布](docs/testing/route-publication.md)
-- [指标](docs/testing/capsule-resource-metrics.md)
-- [日志](docs/testing/log-collection.md)
-- [分布式 Trace](docs/testing/distributed-traces.md)
-- [Rust 编码规范](docs/development/rust-coding-guidelines.md)
+- [Metrics](docs/testing/capsule-resource-metrics.md)、[日志](docs/testing/log-collection.md)与[分布式 Trace](docs/testing/distributed-traces.md)
+- [Rust 编程规范](docs/development/rust-coding-guidelines.md)
+- [发布流水线与软件包布局](docs/development/release-pipelines-and-packaging.md)
+- [品牌与架构资源](assets/README.md)
+
+## 许可证
+
+Agent DX 使用 [Apache License 2.0](LICENSE)。

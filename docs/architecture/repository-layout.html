@@ -5,7 +5,7 @@
 </style></head><body><main><header><strong>AGENT DX / ARCHITECTURE</strong><a href="repository-layout.md">Markdown 源文档</a><a href="../testing/control-plane-implementation.md">当前实现</a><button onclick="window.print()">打印 / 保存 PDF</button></header>
 <div class="layout"><nav aria-label="文档目录"><a href="#section-1">分层与当前接入状态</a><a href="#section-2">实际目录</a><a href="#section-3">控制面内部模块</a><a href="#section-4">Node Manager / Node Proxy 进程组合</a><a href="#section-5">API Server / Edge 进程组合</a><a href="#section-6">协议与持久化</a><a href="#section-7">构建、部署和验收</a><a href="#section-8">可观测</a></nav><article><h1>Agent DX 当前目录与组件边界</h1>
 <p>核对日期：2026-09-21。此页描述当前源码布局；首次导入记录保留在 <a href="../migration/2026-09-14-import.md">迁移报告</a>。<a href="repository-layout.html">HTML 阅读版</a> 从本文件生成，架构图为仓库内 SVG。</p>
-<p><img alt="当前组件与调用方向" src="current-architecture.svg"></p>
+<p><img alt="当前组件与调用方向" src="../../assets/architecture/current-architecture.svg"></p>
 <h2 id="section-1">分层与当前接入状态</h2>
 <div class="table"><table><tr><th>层</th><th>职责</th><th>当前状态</th></tr><tr><td>Agent 产品 <code>agent/</code></td><td>Agent CLI、编程 SDK、会话和执行编排</td><td>已迁入；仍使用旧 FaaS/外部运行时。目标通过 Sandbox SDK 使用平台，业务后端迁移尚未完成</td></tr><tr><td>公开能力 <code>platform/sdk/sandbox</code></td><td>Sandbox 生命周期、命令/文件、快照、放置约束</td><td>Python SDK 已实现；客户端保留字段与新服务端支持范围不同</td></tr><tr><td>执行平台 <code>platform/</code></td><td>通用 Capsule、调度、持久化、节点生命周期、RRT</td><td>Master、Node Manager、本地优先创建及 EROFS/OCI 运行环境已接入；当前基础 K8s 八组已通过</td></tr><tr><td>共享接入 <code>gateway/</code></td><td>Sandbox API Server、Edge、Node Proxy、反向代理与转发</td><td>API Server 默认内嵌 Edge；Node Manager 默认内嵌 Node Proxy；Agent upstream 可按地址配置，业务规则仍归 Agent 层</td></tr></table></div>
 <p>Agent 使用新平台的目标边界是公开 Sandbox SDK，不直接访问平台 Redis/SQLite、内部调度 RPC 或 sandboxd。当前九条 <code>/api/agent</code> 兼容路由只负责认证与转发，需要配置 <code>agent_address</code> 和真正的 Agent 业务服务；默认部署不具备旧 CLI 的 meta_service/FaaS 接口。</p>
@@ -15,6 +15,9 @@
 <pre><code>agent-dx/
 ├── Cargo.toml / Cargo.lock / rust-toolchain.toml
 ├── Makefile / build.sh / VERSION / pytest.ini
+├── assets/                       # Logo、设计语言与架构图的统一来源
+│   ├── logo/                     # 黑白标志、独立图标和反相版本
+│   └── architecture/             # 系统架构与当前组件调用图
 ├── agent/
 │   ├── cli/ar_cli/                 # Python adx 命令
 │   ├── sdk/python/src/adx/         # Agent 编程 SDK
