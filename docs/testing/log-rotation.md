@@ -29,7 +29,7 @@ Supervisor 接管子进程 stdout/stderr，通过专用读取线程写文件；�
 
 正常停止或子进程重启会先收尾输出和后台压缩，再交出最终日志状态。由组件自行写入的其他文件不在这个通道内；部署环境应采集这里的文件，避免再对相同文件执行外部 rename/logrotate。
 
-Edge/Node Proxy 已有组件文件日志开关。统一 Supervisor 部署建议保持 `ADX_DATA_PLANE_LOG_STDOUT=true`（组件默认值），不设置 `ADX_DATA_PLANE_LOG_DIR`，由 Supervisor 管理文件。默认共进程时 Proxy 输出归入 Node Manager 的服务日志；显式分进程时才单独生成 Node Proxy 的 Supervisor 日志。如果另行开启组件文件日志，必须使用不同目录，并单独配置其保留策略；不要让两个写入方操作同一个日志文件。
+Edge/Node Proxy 已有组件文件日志开关。统一 Supervisor 部署建议保持 `ADX_DATA_PLANE_LOG_STDOUT=true`（组件默认值），不设置 `ADX_DATA_PLANE_LOG_DIR`，由 Supervisor 管理文件。默认共进程时，Edge 输出归入 API Server 的服务日志，Proxy 输出归入 Node Manager 的服务日志；显式分进程时才分别生成 Edge 或 Node Proxy 的 Supervisor 日志。如果另行开启组件文件日志，必须使用不同目录，并单独配置其保留策略；不要让两个写入方操作同一个日志文件。
 
 ## 故障与可观测边界
 

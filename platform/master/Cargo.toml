@@ -11,21 +11,21 @@ description = "ADX persistent control-plane state and shard scheduling service"
 workspace = true
 
 [dependencies]
-adx-observability = { path = "../../crates/observability" }
+adx-observability = { path = "../crates/observability" }
 hyper-util = { version = "0.1", features = ["tokio"] }
 hyper = { version = "1", features = ["server", "http1"] }
 http-body-util = "0.1"
 bytes = "1"
 uuid = { version = "1", features = ["v4"] }
 futures-util = "0.3"
-adx-discovery = { path = "../../crates/discovery" }
+adx-discovery = { path = "../crates/discovery" }
 tokio-stream = { version = "0.1", features = ["net"] }
 sha2 = "0.10"
-adx-protocol = { path = "../../crates/protocol" }
-adx-service-runtime = { path = "../../crates/service-runtime" }
+adx-protocol = { path = "../crates/protocol" }
+adx-service-runtime = { path = "../crates/service-runtime" }
 tonic = { version = "0.12", features = ["tls"] }
-adx-core = { path = "../../crates/core" }
-adx-scheduling = { path = "../../crates/scheduling" }
+adx-core = { path = "../crates/core" }
+adx-scheduling = { path = "../crates/scheduling" }
 redis = { version = "1.7", default-features = false, features = ["tokio-comp"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -33,7 +33,7 @@ tokio = { version = "1", features = ["rt", "sync", "macros", "time", "process"] 
 
 [dev-dependencies]
 object_store = { version = "0.14", default-features = false, features = ["aws-base", "reqwest", "ring"] }
-data-plane-gateway = { path = "../../../gateway", features = ["mock-e2e"] }
+data-plane-gateway = { path = "../../gateway", features = ["mock-e2e"] }
 adx-node-manager = { path = "../node-manager" }
 async-trait = "0.1"
 tempfile = "3"

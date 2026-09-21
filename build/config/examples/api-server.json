@@ -8,6 +8,7 @@
   "cache_entries": 10000,
   "auth_cache_ttl_seconds": 10,
   "agent_address": "",
+  "edge_mode": "standalone",
   "discovery": {
     "redis_url": "redis://127.0.0.1:6379/",
     "namespace": "adx",

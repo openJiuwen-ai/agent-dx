@@ -140,7 +140,7 @@ fn security_mode(value: i32) -> Result<DataPlaneSecurityMode, String> {
         Err(_) => Err("invalid data-plane security mode".into()),
     }
 }
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ControlConfig {
     pub redis_url: String,

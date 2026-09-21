@@ -25,8 +25,8 @@ Do not expect `SANDBOX_EXITED`, `SANDBOX_RECOVERING`, a 410 OOM envelope or ten-
 
 ## Recovery and SDK boundary
 
-Master heartbeats mark lost node executions invalid; the returning Node Manager reconciles and cleans them before admission. Valid shared checkpoint recovery is a separate coordinator path. Missing/local-only checkpoints cannot produce cross-node recovery. See [node failure](../../../../docs/testing/node-failure-takeover.md).
+Master heartbeats mark lost node executions invalid; the returning Node Manager reconciles and cleans them before admission. Valid shared checkpoint recovery is a separate coordinator path. Missing/local-only checkpoints cannot produce cross-node recovery. See [node failure](../../../docs/testing/node-failure-takeover.md).
 
 The Python SDK retains its transport retry/error handling and surfaces response bodies. A 404 may trigger its compatibility invoke fallback, but the Rust API Server does not implement that legacy invocation transport: command and file operations need the Edge → Node Proxy → RRT data path. Client retry behavior is not proof of automatic instance recovery.
 
-Gateway tests (`gateway/tests/master_routes.rs`, `mock_e2e.rs`), SDK transport tests and real basic [K8s acceptance](../../../../docs/testing/2026-09-17-observability-k8s.md) cover different layers. The basic K8s run validates heartbeat failure and returning-node cleanup; it does not validate OOM classification or cross-host network partition isolation.
+Gateway tests (`gateway/tests/master_routes.rs`, `mock_e2e.rs`), SDK transport tests and real basic [K8s acceptance](../../../docs/testing/2026-09-17-observability-k8s.md) cover different layers. The basic K8s run validates heartbeat failure and returning-node cleanup; it does not validate OOM classification or cross-host network partition isolation.

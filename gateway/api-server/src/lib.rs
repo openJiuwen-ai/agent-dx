@@ -3,6 +3,7 @@
 pub mod clients;
 pub mod config;
 pub mod contract;
+pub mod edge;
 pub mod errors;
 pub mod http;
 pub mod operations;

@@ -5,7 +5,7 @@ members = [
     "agent/crates/store",
     "agent/dispatcher",
     "agent/api",
-    "platform/control-plane/api-server",
+    "gateway/api-server",
     "gateway",
     "platform/runtime/rrt",
     "platform/crates/core",
@@ -14,9 +14,9 @@ members = [
     "platform/crates/protocol",
     "platform/crates/discovery",
     "platform/crates/service-runtime",
-    "platform/control-plane/master",
+    "platform/master",
     "platform/deployment",
-    "platform/control-plane/node-manager",
+    "platform/node-manager",
 ]
 
 [workspace.package]

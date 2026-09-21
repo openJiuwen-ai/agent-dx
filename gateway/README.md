@@ -1,6 +1,9 @@
-# Rust Data Plane Gateway
+# Rust Gateway
 
-This crate contains the reusable Edge-to-Node data plane gateway. Its core
+`gateway/` owns shared ingress. The nested [`api-server`](api-server/README.md)
+crate serves the public Sandbox control API and embeds Edge by default. The
+root `data-plane-gateway` crate contains the reusable Edge-to-Node data plane
+gateway and the standalone `adx-edge-frontend` fallback. Its core
 CONNECT protocol identifies a workload and target endpoint; sandbox routing is
 the first adapter, not part of the generic relay contract:
 
@@ -15,7 +18,7 @@ The typed public Edge → Node Proxy → RRT operations are defined by the
 Generic port forwarding and reverse tunnels carry application-defined protocols
 and remain outside that typed API.
 
-The default `activity-client` feature builds the managed Edge and Node Proxy entrypoints. Edge requires `ADX_EDGE_CONTROL_CONFIG` pointing to [edge-control.json](../build/config/examples/edge-control.json). Master must map the Edge client certificate to the `edge` role. Public listener TLS and Edge-to-Node security remain separate settings. The optional `etcd-watch` library and legacy test fixtures are retained separately; the managed Edge entrypoint uses the new Master route service.
+The default `activity-client` feature builds the managed Edge and Node Proxy entrypoints. Embedded and standalone Edge both use `edge::EdgeFrontendService`; only the owning process changes. Standalone Edge requires `ADX_EDGE_CONTROL_CONFIG` pointing to [edge-control.json](../build/config/examples/edge-control.json). Master must map the Edge client certificate to the `edge` role. Public listener TLS and Edge-to-Node security remain separate settings. The optional `etcd-watch` library and legacy test fixtures are retained separately; the managed Edge entrypoint uses the new Master route service.
 
 The gateway is a member of the root Cargo workspace. Run from repository root:
 

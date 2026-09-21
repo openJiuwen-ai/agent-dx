@@ -12,15 +12,15 @@ build = "build.rs"
 workspace = true
 
 [dependencies]
-adx-observability = { path = "../../crates/observability" }
-data-plane-gateway = { path = "../../../gateway" }
+adx-observability = { path = "../crates/observability" }
+data-plane-gateway = { path = "../../gateway" }
 uuid = { version = "1", features = ["v4"] }
-adx-discovery = { path = "../../crates/discovery" }
+adx-discovery = { path = "../crates/discovery" }
 serde = { version = "1", features = ["derive"] }
 tokio-stream = { version = "0.1", features = ["net"] }
-adx-core = { path = "../../crates/core" }
-adx-protocol = { path = "../../crates/protocol" }
-adx-service-runtime = { path = "../../crates/service-runtime" }
+adx-core = { path = "../crates/core" }
+adx-protocol = { path = "../crates/protocol" }
+adx-service-runtime = { path = "../crates/service-runtime" }
 async-trait = "0.1"
 tokio = { version = "1", features = ["rt", "sync", "macros", "time"] }
 tonic = "0.12"

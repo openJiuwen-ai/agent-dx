@@ -11,11 +11,11 @@
 | `master` | `adx-master` | 控制节点 | 持久化状态、全局轮转、Shard 调度、节点心跳与路由发布 |
 | `node-manager` | `adx-node-manager` | 每个工作节点 | 本机资源准入、Instance 生命周期、sandboxd 与恢复；默认同时嵌入 Node Proxy |
 | `node-proxy` | `adx-node-proxy` | 显式选择分进程时 | 数据面绑定和到 Instance RRT 的转发 |
-| `api-server` | `adx-api-server` | 接入节点，通常与 Edge 同机 | 用户 API Key、Sandbox HTTP API、归属缓存和生命周期转发 |
-| `edge` | `adx-edge-frontend` | 接入节点 | 对外 TLS、控制请求转发以及到 Node Proxy 的数据连接 |
+| `api-server` | `adx-api-server` | 接入节点，默认内嵌 Edge | 用户 API Key、Sandbox HTTP API、归属缓存和生命周期转发 |
+| `edge` | 内嵌时无独立进程；分进程时为 `adx-edge-frontend` | 接入节点 | 对外 TLS、控制请求转发以及到 Node Proxy 的数据连接 |
 | `redis` | `redis-server` | 可选，仅一个主机 | 由 `adxctl` 托管的 Redis 7.2.5 和 AOF |
 
-当前没有 `adx-frontend` 二进制。原控制面 Frontend 已重写并命名为 `adx-api-server`；`adx-edge-frontend` 是 Edge，两个组件职责不同。推荐将两者部署在同一接入节点，API Server 只监听回环地址，由 Edge 对外提供 HTTPS。
+当前没有 `adx-frontend` 二进制。原控制面 Frontend 已重写并命名为 `adx-api-server`。API Server 默认在同一进程中托管 Edge，两个模块仍保持独立监听与 TLS 身份；显式设置 `edge_mode: standalone` 时才启动 `adx-edge-frontend`。API Server 只监听回环地址，由 Edge 对外提供 HTTPS。
 
 sandboxd 不属于上述角色，始终由部署环境独立启动。RRT 位于发布包 `runtime/`，进入 Instance 环境运行，也不是宿主机服务。
 
@@ -57,11 +57,11 @@ sudo /opt/adx/bin/adxctl stop
 
 | profile | 生成的本机角色 |
 | --- | --- |
-| `standalone` | Redis、Master、Node Manager（内嵌 Node Proxy）、API Server、Edge |
-| `standalone-external-redis` | 单机全角色，不托管 Redis |
+| `standalone` | Redis、Master、Node Manager（内嵌 Node Proxy）、API Server（内嵌 Edge） |
+| `standalone-external-redis` | 单机全角色，不托管 Redis；API Server 仍默认内嵌 Edge |
 | `master` | Master |
 | `node` | Node Manager（内嵌 Node Proxy） |
-| `edge-api` | API Server、Edge |
+| `edge-api` | API Server（默认内嵌 Edge；可显式拆分） |
 
 `validate` 负责部署结构、路径、角色、Redis 和 socket 约束。组件证书内容、端口占用、sandboxd、Redis 连通性及服务自身字段由 `run` 和真实请求继续验证。
 
@@ -168,7 +168,7 @@ services:
 
 ## 单机 standalone 部署
 
-单机部署在一台 Linux 主机上运行 Master、Node Manager（内嵌 Node Proxy）、API Server 和 Edge。主机还必须先准备 sandboxd、证书、初始管理员密钥以及 Instance 网络。
+单机部署在一台 Linux 主机上运行 Master、Node Manager（内嵌 Node Proxy）和 API Server（内嵌 Edge）。主机还必须先准备 sandboxd、证书、初始管理员密钥以及 Instance 网络。
 
 ### 使用 `adxctl` 托管 Redis
 
@@ -183,7 +183,7 @@ sudo /opt/adx/bin/adxctl validate
 sudo /opt/adx/bin/adxctl run
 ```
 
-supervisor 按 Redis → Master → Node Manager（含内嵌 Proxy）→ API Server → Edge 的顺序拉起进程。启动顺序不替代业务就绪检查；应等待节点完成 Master 对账和 Node Proxy 全量绑定同步，再使用 SDK 创建实例。显式分进程时，独立 Node Proxy 会在 Node Manager 前启动。
+supervisor 按 Redis → Master → Node Manager（含内嵌 Proxy）→ API Server（含内嵌 Edge）的顺序拉起进程。启动顺序不替代业务就绪检查；应等待节点完成 Master 对账和 Node Proxy 全量绑定同步，再使用 SDK 创建实例。显式分进程时，独立 Node Proxy 会在 Node Manager 前启动，独立 Edge 会在 API Server 后启动。
 
 ### 使用外置 Redis
 
@@ -236,9 +236,9 @@ sudo /opt/adx/bin/adxctl run
 
 sandboxd 仍由节点部署环境单独管理。`adxctl stop` 只停止 ADX 进程，完成 Instance 清理后不会停止 sandboxd。
 
-### 3. Edge 与 API Frontend 接入节点
+### 3. API Server 与 Edge 接入节点
 
-使用 `edge-api` profile，包含 `api-server` 和 `edge`：
+使用 `edge-api` profile。部署文件保留 `api-server` 和 `edge` 两个逻辑角色，默认只启动一个 `adx-api-server` 进程：
 
 ```sh
 sudo /opt/adx/bin/adxctl config init --profile edge-api
@@ -248,7 +248,9 @@ sudo /opt/adx/bin/adxctl validate
 sudo /opt/adx/bin/adxctl run
 ```
 
-API Frontend 对应 `role: "api-server"` 和 `adx-api-server`。示例将其绑定到 `127.0.0.1:8888` 并启用 `loopback_http`。Edge 对应 `role: "edge"` 和 `adx-edge-frontend`，对外监听 `0.0.0.0:8443`，将 Sandbox 控制请求转发到本机 API Server，并按 Master 路由把实例数据请求转发到目标 Node Proxy。
+API Frontend 对应 `role: "api-server"` 和 `adx-api-server`。示例将 API 监听绑定到 `127.0.0.1:8888` 并启用 `loopback_http`。`role: "edge"` 提供 Edge 的控制配置和 `ADX_DATA_PLANE_*` 环境；默认由 `adxctl render` 合并进 API Server 进程。Edge 对外监听 `0.0.0.0:8443`，将 Sandbox 控制请求转发到同进程的 API 回环监听，并按 Master 路由把实例数据请求转发到目标 Node Proxy。
+
+需要独立故障域、日志或资源限制时，在 `api-server.config` 中设置 `edge_mode: standalone`。此时渲染结果包含 `adx-api-server` 与 `adx-edge-frontend` 两个进程，但继续使用相同的 Edge 服务实现、端口和证书配置。默认模式下不要手工启动 `adx-edge-frontend`，否则会争用 Edge 监听端口。
 
 当前受支持的部署要求 Edge 与 API Server 同机：Edge 到 API Server 的控制请求使用回环 HTTP，API Server 的 `loopback_http` 也拒绝非回环监听。`deployment-edge-api.yaml` 因此把两者放在同一份本机清单中。若后续需要分开部署，必须先为 Edge 的 API Server 上游连接补齐 HTTPS 和服务端身份校验，不能直接将当前回环地址替换为远端 IP。
 
@@ -257,7 +259,7 @@ API Frontend 对应 `role: "api-server"` 和 `adx-api-server`。示例将其绑�
 1. Redis。
 2. Master，确认 `adxctl status` 中进程存活并已发布发现地址。
 3. 各 Worker，确认 Node Manager 完成对账并上报资源。
-4. API Server 与 Edge。
+4. API Server（默认同时启动 Edge；显式分进程时再启动独立 Edge）。
 5. 使用公开 SDK 完成创建、执行命令、删除的业务就绪检查。
 
 组件发现允许稍后收敛，但上述顺序能提供更清晰的首次部署日志。所有主机必须使用同一构建的发布包、同一 `redis_url`、同一 `namespace` 和相互匹配的证书身份。

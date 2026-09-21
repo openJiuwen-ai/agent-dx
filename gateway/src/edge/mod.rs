@@ -11,6 +11,8 @@ pub mod route_store;
 #[cfg(feature = "etcd-watch")]
 pub mod route_watch;
 pub mod server;
+#[cfg(feature = "activity-client")]
+pub mod service;
 
 pub use auth::{AuthError, EdgeAuthenticator};
 pub use connector::DataPlaneL4Connector;
@@ -25,6 +27,8 @@ pub use server::{
     parse_static_routes, CommandWatchConfig, EdgeFrontend, EdgeOpenError, IngressSecurity,
     StaticRoute,
 };
+#[cfg(feature = "activity-client")]
+pub use service::EdgeFrontendService;
 
 #[cfg(feature = "agent-api")]
 pub mod sandbox_api;

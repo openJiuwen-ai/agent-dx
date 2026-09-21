@@ -1,6 +1,6 @@
 # Agent DX 当前目录与组件边界
 
-核对日期：2026-09-18。此页描述当前源码布局；首次导入记录保留在 [迁移报告](../migration/2026-09-14-import.md)。[HTML 阅读版](repository-layout.html) 从本文件生成，架构图为仓库内 SVG。
+核对日期：2026-09-21。此页描述当前源码布局；首次导入记录保留在 [迁移报告](../migration/2026-09-14-import.md)。[HTML 阅读版](repository-layout.html) 从本文件生成，架构图为仓库内 SVG。
 
 ![当前组件与调用方向](current-architecture.svg)
 
@@ -10,8 +10,8 @@
 |---|---|---|
 | Agent 产品 `agent/` | Agent CLI、编程 SDK、会话和执行编排 | 已迁入；仍使用旧 FaaS/外部运行时。目标通过 Sandbox SDK 使用平台，业务后端迁移尚未完成 |
 | 公开能力 `platform/sdk/sandbox` | Sandbox 生命周期、命令/文件、快照、放置约束 | Python SDK 已实现；客户端保留字段与新服务端支持范围不同 |
-| 执行平台 `platform/` | 通用 Instance、调度、持久化、节点生命周期、RRT | Rust API Server、本地优先创建及 EROFS/OCI 运行环境已接入；当前基础 K8s 八组已通过 |
-| 共享接入 `gateway/` | Edge、Node Proxy、反向代理与转发 | 独立 Rust crate、多二进制；Agent upstream 可按地址配置，业务规则仍归 Agent 层 |
+| 执行平台 `platform/` | 通用 Instance、调度、持久化、节点生命周期、RRT | Master、Node Manager、本地优先创建及 EROFS/OCI 运行环境已接入；当前基础 K8s 八组已通过 |
+| 共享接入 `gateway/` | Sandbox API Server、Edge、Node Proxy、反向代理与转发 | API Server 默认内嵌 Edge；Node Manager 默认内嵌 Node Proxy；Agent upstream 可按地址配置，业务规则仍归 Agent 层 |
 
 Agent 使用新平台的目标边界是公开 Sandbox SDK，不直接访问平台 Redis/SQLite、内部调度 RPC 或 sandboxd。当前九条 `/api/agent` 兼容路由只负责认证与转发，需要配置 `agent_address` 和真正的 Agent 业务服务；默认部署不具备旧 CLI 的 meta_service/FaaS 接口。
 
@@ -27,13 +27,8 @@ agent-dx/
 │   ├── executor/src/adx/           # Agent Executor
 │   └── tests/                     # Agent 测试及外部运行时替身
 ├── platform/
-│   ├── control-plane/
-│   │   ├── master/                # Rust Master；Global + 内嵌 Shard
-│   │   ├── node-manager/          # Rust 本机生命周期和后端/存储适配
-│   │   └── api-server/            # Rust HTTP、认证缓存和 Instance RPC
-│   │       ├── src/               # contract、http、clients、operations
-│   │       ├── tests/             # HTTP 契约与校验
-│   │       └── docs/              # Sandbox HTTP 支持范围
+│   ├── master/                    # Rust Master；Global + 内嵌 Shard
+│   ├── node-manager/              # Rust 本机生命周期和后端/存储适配
 │   ├── crates/
 │   │   ├── core/                  # Instance、资源、恢复点、调度纯类型
 │   │   ├── protocol/              # gRPC 生成、转换与组件身份
@@ -52,11 +47,16 @@ agent-dx/
 │   ├── runtime/rrt/               # HTTP 运行时与 checkpoint 协作
 │   ├── deployment/                # 统一 adxctl / supervisor；管理控制面和数据面进程
 │   └── sdk/sandbox/python/        # adx-sandbox / adx_sandbox
-├── gateway/src/
-│   ├── common/                    # 传输元数据、日志、资源与关闭辅助
-│   ├── edge/                      # 路由订阅、认证、连接池、反向代理
-│   ├── node/                      # NodeProxyService、绑定、活动、转发
-│   └── bin/                       # Edge、Node Proxy、forwarder
+├── gateway/
+│   ├── api-server/                # Rust HTTP、认证缓存和 Instance RPC
+│   │   ├── src/                   # contract、http、clients、operations
+│   │   ├── tests/                 # HTTP 契约与校验
+│   │   └── docs/                  # Sandbox HTTP 支持范围
+│   └── src/
+│       ├── common/                # 传输元数据、日志、资源与关闭辅助
+│       ├── edge/                  # 路由订阅、认证、连接池、反向代理
+│       ├── node/                  # NodeProxyService、绑定、活动、转发
+│       └── bin/                   # Edge、Node Proxy、forwarder
 ├── third_party/sandboxd/          # 锁定后端协议、来源与许可证
 ├── build/
 │   ├── ci/ / images/              # 本地检查、镜像配方
@@ -102,9 +102,18 @@ agent-dx/
 
 Proxy 首次启动关闭实例准入，Node Manager 完成权威对账与全量绑定同步后开放。数据请求直接进入 Node Proxy，不经过 Instance 生命周期队列。共进程共享进程和 Tokio 执行器，故障域与分进程不同。详见 [模式配置与验证](../testing/node-proxy-process-modes.md)。
 
+## API Server / Edge 进程组合
+
+| 模式 | 配置与装配 | 共同契约 |
+|---|---|---|
+| embedded（默认） | 部署文件保留 `api-server` 与 `edge` 两个逻辑角色；API Server 省略 `edge_mode` 或配置 `edge_mode=embedded`，渲染为一个 `adx-api-server` 进程 | API 与 Edge 保持各自监听端口、TLS 身份、路由订阅和认证缓存；Edge 控制请求仍转发到 API 回环监听 |
+| standalone | API Server 显式配置 `edge_mode=standalone`，Supervisor 启动 `adx-api-server` 与 `adx-edge-frontend` | 两种模式复用同一 `EdgeFrontendService`，不复制路由或转发实现 |
+
+默认共进程时，Edge 监听绑定失败会阻止 API Server 就绪，运行期监听异常会使整个进程退出并由 Supervisor 重启。详见 [模式配置与验证](../testing/api-edge-process-modes.md)。
+
 ## 协议与持久化
 
-公开 HTTP 路由和请求响应由 Rust HTTP handler 定义，SDK 调用公开契约。目前没有仓库维护的 `sandbox.yaml` 或已接入的 OpenAPI 自动生成流水线。参考 [HTTP 文档](../../platform/control-plane/api-server/docs/sandbox-lifecycle-api.md)。
+公开 HTTP 路由和请求响应由 Rust HTTP handler 定义，SDK 调用公开契约。目前没有仓库维护的 `sandbox.yaml` 或已接入的 OpenAPI 自动生成流水线。参考 [HTTP 文档](../../gateway/api-server/docs/sandbox-lifecycle-api.md)。
 
 内部 gRPC 按 Instance、快照、凭证、路由及节点本地控制拆分，详见 [协议目录](../../platform/api/proto/README.md)。RRT 用户操作及运行时协作使用 HTTP，类型在 `core/src/runtime.rs`。
 

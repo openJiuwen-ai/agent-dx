@@ -1,17 +1,10 @@
 #![cfg(feature = "activity-client")]
 
-use data_plane_gateway::common::resource::raise_nofile_soft_limit_from_env;
-use data_plane_gateway::common::shutdown::shutdown_signal;
-use data_plane_gateway::config::EdgeFrontendConfig;
-use data_plane_gateway::edge::{
-    CommandWatchConfig, DataPlaneL4Connector, EdgeAuthenticator, EdgeFrontend, EdgeRouteResolver,
-    RouteStore,
+use data_plane_gateway::{
+    common::{resource::raise_nofile_soft_limit_from_env, shutdown::shutdown_signal},
+    config::EdgeFrontendConfig,
+    edge::{master_routes::ControlConfig, EdgeFrontendService},
 };
-use std::sync::Arc;
-use std::{fs::File, io::BufReader};
-use tokio::net::TcpListener;
-use tokio::sync::watch;
-use tokio_rustls::TlsAcceptor;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -19,162 +12,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _logging_guard = data_plane_gateway::common::logging::init("edge-frontend", true)?;
     let nofile_soft_limit = raise_nofile_soft_limit_from_env()?;
     tracing::info!(nofile_soft_limit, "Edge Frontend FD limit configured");
-    run(EdgeFrontendConfig::from_env()?).await
-}
-
-async fn run(config: EdgeFrontendConfig) -> Result<(), Box<dyn std::error::Error>> {
-    #[cfg(not(feature = "agent-api"))]
-    if std::env::var_os("ADX_SANDBOX_CONFIG").is_some()
-        || std::env::var_os("ADX_AGENT_CONFIG").is_some()
-    {
-        return Err("ADX_SANDBOX_CONFIG requires a Gateway built with --features agent-api".into());
-    }
-    let tls_listener = TcpListener::bind(config.tls_bind).await?;
-    let plain_listener = TcpListener::bind(config.plain_bind).await?;
-    let health_listener = TcpListener::bind(config.health_bind).await?;
-    let store = Arc::new(RouteStore::new());
-    let route_changes = store.subscribe();
     let path = std::env::var("ADX_EDGE_CONTROL_CONFIG")
         .map_err(|_| "ADX_EDGE_CONTROL_CONFIG is required")?;
-    let input = std::fs::read(path)?;
-    let control: data_plane_gateway::edge::master_routes::ControlConfig =
-        serde_json::from_slice(&input)?;
-    let watcher =
-        Arc::new(data_plane_gateway::edge::master_routes::MasterConnection::new(control)?);
-    let resolver = Arc::new(EdgeRouteResolver::new(store.clone()).stream_only());
-    let connector = DataPlaneL4Connector::new(config.h2_pool_config()?);
-    let authenticator = EdgeAuthenticator::with_verifier(watcher.clone());
-    #[cfg(feature = "agent-api")]
-    let sandbox_api = if let Ok(path) = std::env::var("ADX_SANDBOX_CONFIG") {
-        use data_plane_gateway::edge::sandbox_api::{PlatformSandbox, SandboxApi, SandboxConfig};
-        let settings: SandboxConfig = serde_json::from_slice(&std::fs::read(path)?)
-            .map_err(|_| "invalid Sandbox configuration")?;
-        let backend = Arc::new(PlatformSandbox::new(
-            settings,
-            connector.clone(),
-            std::env::var("ADX_SANDBOX_RRT_TOKEN")?,
-        )?);
-        Some(Arc::new(SandboxApi::new(
-            backend,
-            &std::env::var("ADX_SANDBOX_SERVICE_TOKEN")?,
-        )?))
-    } else {
-        None
-    };
-    #[cfg(feature = "agent-api")]
-    let agent_api = if let Ok(path) = std::env::var("ADX_AGENT_CONFIG") {
-        use data_plane_gateway::edge::agent_api::{AgentApi, AgentConfig};
-        let config: AgentConfig = serde_json::from_slice(&std::fs::read(path)?)
-            .map_err(|_| "invalid Agent configuration")?;
-        let sandbox = sandbox_api
-            .as_ref()
-            .ok_or("Agent APIs require ADX_SANDBOX_CONFIG")?;
-        Some(Arc::new(
-            AgentApi::new(config, sandbox.backend.clone()).await?,
-        ))
-    } else {
-        None
-    };
-    let gateway = EdgeFrontend::new(
-        resolver,
-        connector,
-        authenticator,
-        config.default_direct_port,
-        config.default_tunnel_port,
-        config.frontend_address.clone(),
-        config.control_plane_routes.clone(),
-    )
-    .with_backend_http_pool_config(config.backend_http_pool_config())
-    .with_reverse_proxy_config(config.reverse_proxy.clone())
-    .with_proxy_routes(config.proxy_routes.clone())
-    .with_command_watch_config(CommandWatchConfig {
-        max_subscriptions_per_connection: config.command_watch_max_subscriptions,
-        queue_capacity: config.command_watch_queue_capacity,
-        max_frame_bytes: config.command_watch_max_frame_bytes,
-        ping_interval: config.command_watch_ping_interval,
-    })
-    .with_client_acl(
-        config.allowed_client_networks.clone(),
-        config.allow_any_client,
-    );
-    #[cfg(feature = "agent-api")]
-    let gateway = if let Some(api) = sandbox_api {
-        gateway.with_sandbox_api(api)
-    } else {
-        gateway
-    };
-    #[cfg(feature = "agent-api")]
-    let gateway = if let Some(api) = &agent_api {
-        gateway.with_agent_api(api.clone())
-    } else {
-        gateway
-    };
-    let gateway = Arc::new(gateway);
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    #[cfg(feature = "agent-api")]
-    let dispatcher_task = agent_api
-        .as_ref()
-        .and_then(|api| api.dispatcher.as_ref())
-        .map(|client| tokio::spawn(client.clone().run(shutdown_rx.clone())));
-    let watcher_task = tokio::spawn(watcher.run(store));
-    let route_reconciler_task = tokio::spawn(gateway.clone().run_route_reconciler(route_changes));
-    let tls_acceptor = load_tls_acceptor(&config.tls_cert, &config.tls_key)?;
-    let tls_task = tokio::spawn(gateway.clone().serve_http_tls(
-        tls_listener,
-        tls_acceptor,
-        shutdown_rx.clone(),
-    ));
-    let plain_task = tokio::spawn(
-        gateway
-            .clone()
-            .serve_http(plain_listener, shutdown_rx.clone()),
-    );
-    let health_task = tokio::spawn(
-        gateway
-            .clone()
-            .serve_health(health_listener, shutdown_rx.clone()),
-    );
-    tracing::info!(
-        tls = %config.tls_bind,
-        plain = %config.plain_bind,
-        frontend = %config.frontend_address,
-        health = %config.health_bind,
-        "Data Plane Edge Frontend serving"
-    );
-
-    shutdown_signal().await?;
-    gateway.start_drain();
-    let _ = shutdown_tx.send(true);
-    let deadline = tokio::time::Instant::now() + config.drain_timeout;
-    while gateway.active_sessions() > 0 && tokio::time::Instant::now() < deadline {
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-    #[cfg(feature = "agent-api")]
-    if let Some(task) = dispatcher_task {
-        task.abort();
-    }
-    watcher_task.abort();
-    route_reconciler_task.abort();
-    tls_task.await??;
-    plain_task.await??;
-    health_task.await??;
-    Ok(())
+    let control: ControlConfig = serde_json::from_slice(&std::fs::read(path)?)?;
+    EdgeFrontendService::bind(EdgeFrontendConfig::from_env()?, control)
+        .await
+        .map_err(local_error)?
+        .serve(async {
+            if let Err(error) = shutdown_signal().await {
+                tracing::warn!(%error, "Edge shutdown signal failed");
+            }
+        })
+        .await
+        .map_err(local_error)
 }
 
-fn load_tls_acceptor(
-    cert_path: &str,
-    key_path: &str,
-) -> Result<TlsAcceptor, Box<dyn std::error::Error>> {
-    let mut cert_reader = BufReader::new(File::open(cert_path)?);
-    let certs = rustls_pemfile::certs(&mut cert_reader).collect::<Result<Vec<_>, _>>()?;
-    if certs.is_empty() {
-        return Err("Edge TLS certificate file is empty".into());
-    }
-    let mut key_reader = BufReader::new(File::open(key_path)?);
-    let key = rustls_pemfile::private_key(&mut key_reader)?.ok_or("Edge TLS key is empty")?;
-    let mut config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)?;
-    config.alpn_protocols = vec![b"http/1.1".to_vec()];
-    Ok(TlsAcceptor::from(Arc::new(config)))
+fn local_error(error: Box<dyn std::error::Error + Send + Sync>) -> Box<dyn std::error::Error> {
+    std::io::Error::other(error.to_string()).into()
 }

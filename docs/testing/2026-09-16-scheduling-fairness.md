@@ -17,7 +17,7 @@
 
 ## 混合负载
 
-`platform/control-plane/master/examples/mixed_load.rs` 调用真实 Master/Domain 调度模块及其唤醒队列。4个Domain、8个逻辑节点、8个租户，混合CPU/内存/磁盘需求和三个优先级；每波维护一个节点后恢复，在已有请求积压和资源占用期间继续注入新请求，实例按不同保留周期释放资源。
+`platform/master/examples/mixed_load.rs` 调用真实 Master/Domain 调度模块及其唤醒队列。4个Domain、8个逻辑节点、8个租户，混合CPU/内存/磁盘需求和三个优先级；每波维护一个节点后恢复，在已有请求积压和资源占用期间继续注入新请求，实例按不同保留周期释放资源。
 
 每档1000波、132000个请求，Pack/Spread与缓存开关四档共528000个请求。独立资源账本检查每次分配不超卖；每波最终 pending/live 均为0；每个租户每档完成16500个请求。缓存开关的完整分配与等待tick序列SHA256一致。
 

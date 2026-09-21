@@ -18,6 +18,13 @@ pub enum CreateMode {
     Central,
     LocalFirst,
 }
+#[derive(Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EdgeMode {
+    #[default]
+    Embedded,
+    Standalone,
+}
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -40,6 +47,10 @@ pub struct Config {
     pub auth_cache_ttl_seconds: u64,
     #[serde(default)]
     pub agent_address: String,
+    #[serde(default)]
+    pub edge_mode: EdgeMode,
+    #[serde(default)]
+    pub edge_control: Option<data_plane_gateway::edge::master_routes::ControlConfig>,
 }
 impl Config {
     pub fn validate(&self) -> Result<(), Box<dyn std::error::Error>> {
@@ -57,6 +68,13 @@ impl Config {
         }
         if self.loopback_http && !self.listen.ip().is_loopback() {
             return Err("loopback_http requires literal loopback listen address".into());
+        }
+        match (self.edge_mode, self.edge_control.is_some()) {
+            (EdgeMode::Embedded, false) => return Err("embedded Edge requires edge_control".into()),
+            (EdgeMode::Standalone, true) => {
+                return Err("standalone Edge must not configure edge_control".into())
+            }
+            _ => {}
         }
         if !self.agent_address.is_empty() {
             let url = url::Url::parse(&self.agent_address)?;

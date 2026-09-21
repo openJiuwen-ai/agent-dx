@@ -3,8 +3,8 @@
 ## Boundaries
 
 - `agent/` owns Agent APIs, sessions and execution orchestration. Target platform access goes through the public Sandbox SDK.
-- `platform/` owns Instance execution, the Sandbox API/SDK and RRT.
-- `gateway/` owns shared entrypoints, routing and node forwarding; it does not own Instance lifecycle.
+- `platform/` owns Instance scheduling and execution, the Sandbox SDK, Master, Node Manager and RRT.
+- `gateway/` owns the public Sandbox API Server, shared entrypoints, routing and node forwarding; it does not own Instance lifecycle.
 - Sandbox SDK uses adx-sandbox / adx_sandbox / ADX_ naming. Owned Agent namespaces use adx, Gateway commands use adx-, and config/headers use ADX. External runtime dependencies require functional replacement, not fabricated import renames. `docs/migration/sources.json` records exact provenance.
 - Keep the Rust API Server small: public HTTP types, validation and direct Instance RPC clients. Preserve Sandbox and Agent entrypoints. Do not reintroduce the removed runtime SDK, function/Job packages or metadata watchers to satisfy a helper import. Agent business logic belongs under `agent/`.
 

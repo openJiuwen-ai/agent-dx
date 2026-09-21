@@ -1,6 +1,6 @@
 # 单机进程部署
 
-本文使用统一发布包在一台 Linux 主机上部署 Master、Node Manager（默认内嵌 Node Proxy）、API Server 和 Edge。入口是 HTTPS Edge；API Server 的 HTTP 监听只绑定本机回环地址，内部 RPC 与 Edge→Node Proxy 使用 mTLS。`adxctl` 的命令语义、按角色拆分部署、内置／外置 Redis 配置见独立的 [`adxctl` 部署指南](adxctl.md)。
+本文使用统一发布包在一台 Linux 主机上部署 Master、Node Manager（默认内嵌 Node Proxy）和 API Server（默认内嵌 Edge）。入口是 HTTPS Edge；API Server 的 HTTP 监听只绑定本机回环地址，内部 RPC 与 Edge→Node Proxy 使用 mTLS。`adxctl` 的命令语义、按角色拆分部署、内置／外置 Redis 配置见独立的 [`adxctl` 部署指南](adxctl.md)。
 
 ## 准备与安装
 

@@ -6,8 +6,8 @@
 
 | 模块 | 当前实现 |
 |---|---|
-| `platform/control-plane/master/src/rpc.rs` | 注册、创建、查询、结果提交；协调内存调度与 Redis，持久化分配后才派发 |
-| `platform/control-plane/node-manager/src/rpc.rs` | NodeService 适配、API Server 直达删除、MasterStateSink 客户端 |
+| `platform/master/src/rpc.rs` | 注册、创建、查询、结果提交；协调内存调度与 Redis，持久化分配后才派发 |
+| `platform/node-manager/src/rpc.rs` | NodeService 适配、API Server 直达删除、MasterStateSink 客户端 |
 | `platform/crates/protocol/src/auth.rs` | 从 TLS 对端证书识别 Master、API Server、具体 Node；校验可信 API Server 的租户上下文 |
 | `platform/crates/protocol/src/lib.rs` | InstanceRecord 编解码校验、错误映射；保留公共协议边界 |
 | `platform/api/proto/instance.proto` | 增加可信 CallerContext、节点代理地址、查询结果中的 Node Manager 地址 |
@@ -76,7 +76,7 @@ cargo test --locked -p adx-master -p adx-node-manager -p adx-protocol -p adx-cor
 
 `control-rpc` 每轮生成有效期两天的独立 CA 和测试证书，启动独立 Redis 目录／Socket，然后使用正式服务实现运行协作测试。缺少 Redis 或 openssl 时失败，不切换模拟网络，也不以忽略用例作为通过。
 
-[RPC 协作测试](../../platform/control-plane/master/tests/rpc.rs) 覆盖：
+[RPC 协作测试](../../platform/master/tests/rpc.rs) 覆盖：
 
 - 运行时 Start 入口直接查询真实 Redis，确认 Assignment 已提交；并发相同创建只启动一次。
 - 真实 mTLS 的 Node / API Server / Master 角色隔离、未知证书拒绝、跨租户读写拒绝、过期 Assignment 拒绝。

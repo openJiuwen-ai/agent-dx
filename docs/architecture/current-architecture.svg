@@ -1,9 +1,9 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1120 840" role="img" aria-labelledby="title desc">
-<title id="title">ADX 当前组件架构</title><desc id="desc">Agent 目标经 Sandbox SDK 接入，当前尚未迁移；控制链路经过 Rust API Server、Master 与 Node Manager，数据链路经过 Edge、默认嵌入 Node Manager 的 Node Proxy 与 RRT。Redis 持久化与 SQLite 降级分开。</desc>
+<title id="title">ADX 当前组件架构</title><desc id="desc">Agent 目标经 Sandbox SDK 接入，当前尚未迁移；API Server 默认内嵌 Edge，Node Manager 默认内嵌 Node Proxy。控制链路经过 API Server、Master 与 Node Manager，数据链路经过 Edge、Node Proxy 与 RRT。Redis 持久化与 SQLite 降级分开。</desc>
 <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10Z" fill="#516b83"/></marker></defs>
 <style>text{font-family:system-ui,-apple-system,'PingFang SC',sans-serif;fill:#17324d} .head{font-size:20px;font-weight:650}.body{font-size:15px}.small{font-size:13px;fill:#526b7c}.edge{fill:none;stroke:#516b83;stroke-width:2;marker-end:url(#arrow)}.box{stroke:#b7ccd9;stroke-width:1.5;rx:12}</style>
 <rect width="1120" height="840" fill="#f5f8fb" rx="18"/>
-<text x="32" y="38" class="head">Agent DX · 当前组件与调用方向</text><text x="32" y="63" class="small">2026-09-20 ｜ 实线：已接通；虚线：Agent 平台接入目标</text>
+<text x="32" y="38" class="head">Agent DX · 当前组件与调用方向</text><text x="32" y="63" class="small">2026-09-21 ｜ 实线：已接通；虚线：Agent 平台接入目标</text>
 <rect x="32" y="90" width="490" height="93" class="box" fill="#fff1db"/>
 <text x="50" y="120" class="head">Agent CLI / SDK / Executor</text>
 <text x="50" y="146" class="body">仍依赖旧 FaaS / 外部运行时，平台接入尚未完成</text>
@@ -21,7 +21,7 @@
 <text x="50" y="256" class="head">Rust API Server</text>
 <text x="50" y="282" class="body">HTTP 适配、身份和归属缓存</text>
 <path d="M654 260H462" class="edge"/>
-<text x="487" y="250" class="small">生命周期 HTTP</text>
+<text x="477" y="250" class="small">默认同进程 · 回环 HTTP</text>
 <rect x="32" y="354" width="426" height="108" class="box" fill="#e6f4ef"/>
 <text x="50" y="384" class="head">Master · 单进程</text>
 <text x="50" y="410" class="body">Global 轮转 → Shard Filter / Score</text>

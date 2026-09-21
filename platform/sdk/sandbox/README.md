@@ -51,7 +51,7 @@ All language SDKs should keep the same user-facing concepts:
 
 All language SDKs should target the current frontend HTTP/WS contract instead
 of exposing runtime-internal ports to users. The detailed platform reference is
-maintained in the [Go HTTP reference](../../control-plane/api-server/docs/sandbox-lifecycle-api.md). That reference distinguishes retained client options from the new server's supported capabilities.
+maintained in the [Go HTTP reference](../../../gateway/api-server/docs/sandbox-lifecycle-api.md). That reference distinguishes retained client options from the new server's supported capabilities.
 
 ### Environment and auth
 

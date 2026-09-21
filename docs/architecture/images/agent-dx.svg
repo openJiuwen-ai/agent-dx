@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1440" height="1100" viewBox="0 0 1440 1100" role="img" aria-labelledby="title desc">
   <title id="title">Agent DX architecture</title>
-  <desc id="desc">Agent CLI, SDK and Executor use the public Sandbox SDK as their target platform boundary. Edge sends control traffic to API Server and data traffic to Node Proxy. Master embeds Global and Shard scheduling, persists to Redis and publishes routes. Node Manager owns Instance lifecycle, controls sandboxd, synchronizes Node Proxy over UDS and cooperates with RRT over HTTP. RRT runs inside each Instance. Node Manager embeds Node Proxy by default and supports split-process deployment.</desc>
+  <desc id="desc">Agent CLI, SDK and Executor use the public Sandbox SDK as their target platform boundary. API Server embeds Edge by default; Edge sends control traffic to the API loopback listener and data traffic to Node Proxy. Master embeds Global and Shard scheduling, persists to Redis and publishes routes. Node Manager owns Instance lifecycle, controls sandboxd, synchronizes Node Proxy over UDS and cooperates with RRT over HTTP. RRT runs inside each Instance. Both embedded pairs support explicit split-process deployment.</desc>
   <defs>
     <marker id="blue" markerWidth="9" markerHeight="9" refX="8" refY="4" orient="auto"><path d="M0 0L8 4L0 8" fill="none" stroke="#2563eb" stroke-width="1.5"/></marker>
     <marker id="green" markerWidth="9" markerHeight="9" refX="8" refY="4" orient="auto"><path d="M0 0L8 4L0 8" fill="none" stroke="#0d806c" stroke-width="1.5"/></marker>
@@ -83,7 +83,7 @@
   <path d="M1182 236V260H60V376H72" class="support"/>
   <text x="648" y="254" class="small">Public HTTPS requests</text>
   <path d="M324 402H454" class="control"/>
-  <text x="387" y="390" text-anchor="middle" class="label">HTTP</text>
+  <text x="387" y="390" text-anchor="middle" class="label">Loopback HTTP · one process</text>
   <path d="M324 364H380V332H1370V404H1320" class="data"/>
   <text x="857" y="326" text-anchor="middle" class="dataLabel">Data: HTTP/2 CONNECT</text>
   <path d="M629 458V520" class="control"/>
@@ -110,7 +110,7 @@
 
   <rect x="48" y="958" width="1344" height="96" rx="14" fill="#e8edf3"/>
   <text x="72" y="990" class="body" font-weight="600">Deployment: adxctl supervisor + unified release · native processes or processes inside Kubernetes Pods</text>
-  <text x="72" y="1018" class="small">sandboxd is hosted independently. RRT runs inside Instances. Node Manager embeds Node Proxy by default and supports split-process deployment.</text>
+  <text x="72" y="1018" class="small">API Server embeds Edge; Node Manager embeds Node Proxy. Both pairs support explicit split-process deployment. sandboxd remains external.</text>
   <path d="M72 1075H112" class="control"/><text x="124" y="1080" class="small">Control / state</text>
   <path d="M292 1075H332" class="data"/><text x="344" y="1080" class="small">User data</text>
   <path d="M488 1075H528" class="support" stroke-dasharray="7 5"/><text x="540" y="1080" class="small">Agent integration boundary</text>

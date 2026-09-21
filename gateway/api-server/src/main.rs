@@ -1,4 +1,9 @@
-use adx_api_server::{clients::Clients, config::Config, http::Api};
+use adx_api_server::{
+    clients::Clients,
+    config::{Config, EdgeMode},
+    edge::EmbeddedEdge,
+    http::Api,
+};
 use adx_service_runtime::{read_config, shutdown};
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
@@ -31,14 +36,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(TlsAcceptor::from(Arc::new(tls)))
     };
     let listener = TcpListener::bind(config.listen).await?;
+    let mut embedded_edge = if config.edge_mode == EdgeMode::Embedded {
+        Some(
+            EmbeddedEdge::start(
+                config
+                    .edge_control
+                    .clone()
+                    .ok_or("embedded Edge control configuration missing")?,
+            )
+            .await
+            .map_err(local_error)?,
+        )
+    } else {
+        None
+    };
     adx_observability::info!(address=%listener.local_addr()?,"adx-api-server listening");
     let (stop, receiver) = watch::channel(false);
     let mut tasks = JoinSet::new();
     let shutdown = shutdown();
     tokio::pin!(shutdown);
+    let mut edge_failure = None;
     loop {
         tokio::select! {
             _ = &mut shutdown => break,
+            result = async {
+                match embedded_edge.as_mut() {
+                    Some(edge) => edge.failed().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                edge_failure = Some(result.err().map_or_else(
+                    || "embedded Edge stopped".to_owned(),
+                    |error| error.to_string(),
+                ));
+                break;
+            }
             Some(result) = tasks.join_next(), if !tasks.is_empty() => {
                 if let Err(error) = result {
                     adx_observability::warn!(%error, "API connection task failed");
@@ -82,8 +114,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tasks.abort_all();
         while tasks.join_next().await.is_some() {}
     }
+    if let Some(edge) = embedded_edge {
+        if edge_failure.is_none() {
+            edge.shutdown().await.map_err(local_error)?;
+        }
+    }
+    if let Some(error) = edge_failure {
+        return Err(error.into());
+    }
     Ok(())
 }
+
+fn local_error(error: Box<dyn std::error::Error + Send + Sync>) -> Box<dyn std::error::Error> {
+    std::io::Error::other(error.to_string()).into()
+}
+
 async fn serve<T>(stream: T, api: Arc<Api>, mut stop: watch::Receiver<bool>)
 where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
