@@ -2,6 +2,7 @@
 """Buildkite Kubernetes acceptance, sharing business scenarios with local E2E."""
 import argparse
 import base64
+import hashlib
 import importlib.util
 import json
 import ipaddress
@@ -9,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import shutil
 import signal
 import subprocess
 import sys
@@ -27,6 +29,30 @@ def validate_physical_placement(placement, required):
     hosts={item['host'] for item in placement}
     if required and len(hosts) < 2:
         raise RuntimeError('full profile requires two distinct Kubernetes workers')
+
+
+def source_commit():
+    commit = os.getenv('BUILDKITE_COMMIT')
+    if commit is None:
+        commit = subprocess.check_output(
+            ['git', '-C', str(ROOT), 'rev-parse', 'HEAD'], text=True,
+        ).strip()
+    if not re.fullmatch(r'[0-9a-f]{40}', commit):
+        raise ValueError('test harness commit must be a 40-character Git commit')
+    return commit
+
+
+def stage_harness(destination):
+    shutil.copytree(
+        ROOT / 'build/e2e', destination,
+        ignore=shutil.ignore_patterns('__pycache__', 'tests', '*.pyc'),
+    )
+    shutil.copy2(ROOT / 'build/ci/rpc_certificates.py', destination / 'rpc_certificates.py')
+    shutil.copy2(ROOT / 'build/release/package.py', destination / 'package.py')
+    files = {}
+    for path in sorted(item for item in destination.rglob('*') if item.is_file()):
+        files[str(path.relative_to(destination))] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return files
 
 
 def identity(bundle, registry, commit=None, ci=False):
@@ -78,6 +104,7 @@ class KubernetesRun(common.Run):
             self.kubectl += ['--context', context]
         self.namespace_uid = None
         self.namespace_attempted = False
+        self.harness = None
 
     def kube(self, *args, timeout=180):
         return self.command([*self.kubectl, *args], timeout, stream=not any(
@@ -99,7 +126,36 @@ class KubernetesRun(common.Run):
     def execute(self, node, *args, timeout=180):
         return self.kube('-n', self.id, 'exec', node, '-c', 'platform', '--', *args, timeout=timeout)
 
-    def deploy(self, m, refs, data, registry_auth=None, node_names=(), require_distinct_workers=False):
+    def sync_harness(self, commit, product_commit=None):
+        with tempfile.TemporaryDirectory(prefix='adx-e2e-harness-') as directory:
+            harness = Path(directory) / 'e2e'
+            files = stage_harness(harness)
+            self.harness = {
+                'schema_version': 1,
+                'commit': commit,
+                'product_commit': product_commit,
+                'files': files,
+            }
+            manifest = json.dumps(self.harness, indent=2) + '\n'
+            (harness / 'harness.json').write_text(manifest)
+            (self.output / 'harness.json').write_text(manifest)
+            self.event('[DEPLOY] Syncing E2E harness commit=' + commit)
+            verify = (
+                "import hashlib,json,pathlib;"
+                "root=pathlib.Path('/opt/adx/e2e');"
+                "manifest=json.loads((root/'harness.json').read_text());"
+                "bad=[name for name,digest in manifest['files'].items() "
+                "if hashlib.sha256((root/name).read_bytes()).hexdigest()!=digest];"
+                "assert not bad,bad"
+            )
+            for node in self.nodes:
+                self.kube('-n', self.id, 'cp', str(harness) + '/.',
+                          node + ':/opt/adx/e2e', '-c', 'platform', timeout=60)
+                self.execute(node, 'python3', '-c', verify, timeout=30)
+            self.event('[PASS] Current E2E harness synchronized and verified')
+
+    def deploy(self, m, refs, data, registry_auth=None, node_names=(), require_distinct_workers=False,
+               harness_commit=None):
         print('--- Kubernetes deployment', flush=True)
         self.event('[DEPLOY] namespace=' + self.id + '; eligible nodes=' + ','.join(node_names))
         # Check credentials/connectivity before creating any test resource.
@@ -136,6 +192,7 @@ class KubernetesRun(common.Run):
         print('Kubernetes placement: ' + json.dumps(placement), flush=True)
         edge_pod = next(p for p in pods if p['metadata']['name'] == 'node1')
         edge_ip = str(ipaddress.ip_address(edge_pod['status']['podIP']))
+        self.sync_harness(harness_commit or source_commit(), m['package']['commit'])
         self.event('[DEPLOY] Checking OCI runtime and bridge netfilter prerequisites')
         for node in self.nodes:
             self.execute(node, 'python3', '-u', '/opt/adx/e2e/preflight.py',
@@ -238,7 +295,7 @@ def main():
                 raise ValueError('immutable custom user image required')
             data = credentials(Path(private), user_image, published['references']['rrt'])
             run.deploy(m, published['references'], data, a.registry_auth, a.node_name,
-                       require_distinct_workers=a.profile == 'full')
+                       require_distinct_workers=a.profile == 'full', harness_commit=source_commit())
             run.scenarios(checks,required)
         except Exception as e:
             error = f'{type(e).__name__}: {e}'
@@ -248,7 +305,8 @@ def main():
                 signal.signal(sig, signal.SIG_IGN)
             cleanup_errors = run.cleanup()
     report = common.finish_report(error, cleanup_errors, checks,required)
-    report.update(run_id=run.id, deployment='kubernetes', profile=a.profile, cases=run.case_results)
+    report.update(run_id=run.id, deployment='kubernetes', profile=a.profile,
+                  harness=run.harness, cases=run.case_results)
     (output / 'result.json').write_text(json.dumps(report, indent=2) + '\n')
     write_junit(output / 'junit.xml', report)
     print('--- Kubernetes acceptance result', flush=True)
