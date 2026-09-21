@@ -19,6 +19,7 @@ impl From<RuntimeEnvironment> for pb::RuntimeEnvironment {
                 target: v.bootstrap.target,
                 entrypoint: v.bootstrap.entrypoint,
                 image: v.bootstrap.image,
+                image_process_config: v.bootstrap.image_process_config,
             }),
             env: v.env.into_iter().collect(),
         }
@@ -47,6 +48,11 @@ impl TryFrom<pb::RuntimeEnvironment> for RuntimeEnvironment {
                 image: b.image,
                 target: b.target,
                 entrypoint: b.entrypoint,
+                image_process_config: if b.image_process_config.is_empty() {
+                    adx_core::environment::DEFAULT_IMAGE_PROCESS_CONFIG.into()
+                } else {
+                    b.image_process_config
+                },
             },
             env: v.env.into_iter().collect(),
         };

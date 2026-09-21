@@ -22,6 +22,7 @@ fn environment(
             image: bootstrap_image.into(),
             target: "/__adx".into(),
             entrypoint: vec!["/__adx/usr/local/bin/rrt-runtime".into()],
+            image_process_config: "/etc/adx-image-process.json".into(),
         },
         env: Default::default(),
     }
@@ -73,4 +74,18 @@ fn rejects_mixed_or_different_runtime_sources() {
     ] {
         assert!(value.validate().is_err());
     }
+}
+
+#[test]
+fn rejects_relative_image_process_config_path() {
+    let mut value = environment(
+        "local",
+        "/opt/adx/runtime.img",
+        "",
+        "erofs",
+        "/opt/adx/runtime.img",
+        "",
+    );
+    value.bootstrap.image_process_config = "run/image-process.json".into();
+    assert!(value.validate().is_err());
 }

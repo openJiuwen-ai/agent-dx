@@ -1,4 +1,8 @@
-use adx_core::{environment::RuntimeEnvironment, InstanceSpec};
+use adx_core::{
+    environment::RuntimeEnvironment,
+    sandbox::{Rootfs, StorageSource},
+    InstanceSpec,
+};
 use adx_node_manager::sandboxd::{proto, start_request, Config};
 use serde_json::json;
 
@@ -6,7 +10,8 @@ fn environment() -> RuntimeEnvironment {
     serde_json::from_value(json!({
         "rootfs":{"runtime":"runsc","type":"local","path":"/opt/adx/runtime/rootfs.img","readonly":false},
         "bootstrap":{"type":"erofs","root":"/opt/adx/runtime/rootfs.img","target":"/__adx",
-            "entrypoint":["/__adx/usr/local/bin/rrt-runtime"]},
+            "entrypoint":["/__adx/usr/local/bin/rrt-runtime"],
+            "image_process_config":"/etc/adx/custom-image-process.json"},
         "env":{"PLATFORM_VALUE":"configured"}
     })).unwrap()
 }
@@ -14,7 +19,8 @@ fn image_environment() -> RuntimeEnvironment {
     serde_json::from_value(json!({
         "rootfs":{"runtime":"runc","type":"image","image":"registry.local/adx-runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","readonly":false},
         "bootstrap":{"type":"image","image":"registry.local/adx-runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","target":"/__adx",
-            "entrypoint":["/__adx/usr/local/bin/rrt-runtime"]},
+            "entrypoint":["/__adx/usr/local/bin/rrt-runtime"],
+            "image_process_config":"/etc/adx/custom-image-process.json"},
         "env":{"PLATFORM_VALUE":"configured"}
     })).unwrap()
 }
@@ -79,7 +85,14 @@ fn custom_image_mounts_the_same_local_environment_read_only() {
         runtime_environment: Some(environment()),
         ..Default::default()
     };
-    let r = start_request(&spec("ubuntu:24.04"), "i-1", 1, &[], &config).unwrap();
+    let mut wanted = spec("ubuntu:24.04");
+    wanted.image.clear();
+    wanted.sandbox.rootfs = Some(Rootfs {
+        readonly: false,
+        source: StorageSource::Image("ubuntu:24.04".into()),
+    });
+    wanted.sandbox.inherit_entrypoint = true;
+    let r = start_request(&wanted, "i-1", 1, &[], &config).unwrap();
     assert_eq!(
         r.rootfs.unwrap().source,
         Some(proto::rootfs_config::Source::ImageUrl(
@@ -96,6 +109,11 @@ fn custom_image_mounts_the_same_local_environment_read_only() {
         Some(proto::mount::Source::HostPath(environment().bootstrap.root))
     );
     assert_eq!(r.envs["PLATFORM_VALUE"], "configured");
+    assert_eq!(
+        r.envs["ADX_IMAGE_PROCESS_CONFIG"],
+        "/etc/adx/custom-image-process.json"
+    );
+    assert_eq!(r.inject_entrypoint, "/etc/adx/custom-image-process.json");
 }
 
 #[test]

@@ -66,5 +66,6 @@ runtime_environment:
     target: /__adx
     entrypoint:
       - /__adx/usr/local/bin/rrt-runtime
+    image_process_config: /etc/adx-image-process.json
   env:
     PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
