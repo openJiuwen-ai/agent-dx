@@ -212,4 +212,11 @@ message RuntimeEnvironment {
   map<string,string> env = 3;
 }
 message RuntimeRootfs { string runtime = 1; string type = 2; string path = 3; bool readonly = 4; string image = 5; }
-message RuntimeBootstrap { string type = 1; string root = 2; string target = 3; repeated string entrypoint = 4; string image = 5; }
+message RuntimeBootstrap {
+  string type = 1;
+  string root = 2;
+  string target = 3;
+  repeated string entrypoint = 4;
+  string image = 5;
+  string image_process_config = 6;
+}

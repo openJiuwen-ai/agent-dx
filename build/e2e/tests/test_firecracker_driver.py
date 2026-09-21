@@ -45,14 +45,19 @@ class FirecrackerEvidenceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             root=Path(d); package=root/'package'; artifact=package/'runtime/adx-runtime-rootfs.img'
             artifact.parent.mkdir(parents=True);artifact.write_bytes(b'erofs')
-            local=runtime_environment.resolve(package,False,root/'missing')
+            custom='/etc/adx/custom-image-process.json'
+            local=runtime_environment.resolve(package,False,root/'missing',custom)
             self.assertEqual(local['rootfs']['runtime'],'firecracker')
             self.assertEqual(local['rootfs']['path'],str(artifact.resolve()))
             self.assertEqual(local['bootstrap']['root'],str(artifact.resolve()))
+            self.assertEqual(local['bootstrap']['image_process_config'],custom)
             image=root/'runtime-image';image.write_text('registry.example/adx-runtime@sha256:'+'a'*64)
-            remote=runtime_environment.resolve(package,True,image)
+            remote=runtime_environment.resolve(package,True,image,custom)
             self.assertEqual(remote['rootfs']['image'],image.read_text())
             self.assertEqual(remote['bootstrap']['image'],image.read_text())
+            self.assertEqual(remote['bootstrap']['image_process_config'],custom)
+            with self.assertRaisesRegex(RuntimeError,'must be absolute'):
+                runtime_environment.resolve(package,False,root/'missing','etc/relative.json')
             image.write_text('registry.example/adx-runtime:latest')
             with self.assertRaisesRegex(RuntimeError,'digest pinned'):
                 runtime_environment.resolve(package,True,image)
@@ -81,21 +86,11 @@ class FirecrackerEvidenceTests(unittest.TestCase):
             root=Path(d);files={}
             for name in kit.REQUIRED:
                 p=root/name;p.parent.mkdir(parents=True,exist_ok=True);p.write_bytes(name.encode());files[name]=hashlib.sha256(p.read_bytes()).hexdigest()
-            backend={'target':'aarch64-unknown-linux-gnu','sandboxd_revision':'pinned','sandboxd_patches':{'fix.patch':'digest'},'files':{'sandboxd':files['bin/sandboxd'],'sbox':files['bin/sbox'],'redis-cli':files['tools/redis-cli'],'firecracker-initrd.img':files['artifacts/initrd.img']}}
-            (root/'manifest.json').write_text(json.dumps({'schema_version':1,'target':backend['target'],'sandboxd_revision':'pinned','sandboxd_patches':backend['sandboxd_patches'],'files':files}))
+            backend={'target':'aarch64-unknown-linux-gnu','sandboxd_revision':'pinned','files':{'sandboxd':files['bin/sandboxd'],'sbox':files['bin/sbox'],'redis-cli':files['tools/redis-cli']}}
+            (root/'manifest.json').write_text(json.dumps({'schema_version':1,'target':backend['target'],'sandboxd_revision':'pinned','files':files}))
             kit.verify(root,backend)
             (root/'artifacts/Image').write_bytes(b'altered')
             with self.assertRaises(ValueError):kit.verify(root,backend)
-
-    def test_kit_rejects_wrong_sandboxd_patch_identity(self):
-        import kit,hashlib
-        with tempfile.TemporaryDirectory() as d:
-            root=Path(d);files={}
-            for name in kit.REQUIRED:
-                p=root/name;p.parent.mkdir(parents=True,exist_ok=True);p.write_bytes(name.encode());files[name]=hashlib.sha256(p.read_bytes()).hexdigest()
-            backend={'target':'aarch64-unknown-linux-gnu','sandboxd_revision':'pinned','sandboxd_patches':{'fix.patch':'digest'},'files':{'sandboxd':files['bin/sandboxd'],'sbox':files['bin/sbox'],'redis-cli':files['tools/redis-cli'],'firecracker-initrd.img':files['artifacts/initrd.img']}}
-            (root/'manifest.json').write_text(json.dumps({'schema_version':1,'target':backend['target'],'sandboxd_revision':'pinned','sandboxd_patches':{},'files':files}))
-            with self.assertRaisesRegex(ValueError,'source identity'):kit.verify(root,backend)
 
     def test_complete_evidence_passes_but_cleanup_error_fails(self):
         import acceptance

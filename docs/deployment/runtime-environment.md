@@ -15,7 +15,8 @@
       "type": "erofs",
       "root": "/opt/adx/runtime/adx-runtime-rootfs.img",
       "target": "/__adx",
-      "entrypoint": ["/__adx/usr/local/bin/rrt-runtime"]
+      "entrypoint": ["/__adx/usr/local/bin/rrt-runtime"],
+      "image_process_config": "/etc/adx-image-process.json"
     },
     "env": {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}
   }
@@ -37,7 +38,8 @@ OCI 配置使用同一个 digest 引用作为默认 rootfs 和自定义镜像的
       "type": "image",
       "image": "registry.example/adx-runtime@sha256:...",
       "target": "/__adx",
-      "entrypoint": ["/__adx/usr/local/bin/rrt-runtime"]
+      "entrypoint": ["/__adx/usr/local/bin/rrt-runtime"],
+      "image_process_config": "/etc/adx-image-process.json"
     },
     "env": {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}
   }
@@ -45,6 +47,8 @@ OCI 配置使用同一个 digest 引用作为默认 rootfs 和自定义镜像的
 ```
 
 `adxctl` 校验配置结构并向 API Server 和 Node Manager 下发同一配置。OCI 运行环境必须使用完整 `@sha256:` 摘要，避免不同节点或重启前后解析到不同内容。EROFS 模式下，Node Manager 启动时检查文件存在且具有 EROFS 格式标识；OCI 模式由 sandboxd 按 image digest 拉取、校验并缓存。配置修改后重启组件生效。启动入口使用 argv 数组，不进行隐式 shell 拼接。
+
+`bootstrap.image_process_config` 是 guest 内的 entrypoint 元数据路径，默认配置为 `/etc/adx-image-process.json`。启用 `inherit_entrypoint` 时，Node Manager 将同一个配置值写入现有 sandboxd `StartRequest.inject_entrypoint` 字段和 RRT 的 `ADX_IMAGE_PROCESS_CONFIG`。该值必须是规范的绝对路径。
 
 | 请求 | 行为 |
 |---|---|

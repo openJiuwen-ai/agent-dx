@@ -9,21 +9,21 @@ import platform
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
+import time
 ROOT=Path(__file__).resolve().parents[2]
 SANDBOXD_BUILD_TARGETS = (
     'release-binary',
     'release-cli',
     'runc-shim',
     'sandbox-logger',
-    'firecracker-initrd',
 )
 SANDBOXD_OUTPUTS = {
     'sandboxd': 'sandboxd',
     'sbox': 'sbox',
     'runc-shim': 'runc-shim',
     'sandbox-logger': 'sandbox-logger',
-    'firecracker-initrd.img': 'initrd.img',
 }
 def run(args,**kw):return subprocess.check_output(list(map(str,args)),text=True,**kw).strip()
 def sha(p):return hashlib.sha256(p.read_bytes()).hexdigest()
@@ -43,14 +43,25 @@ def download(url, output):
     subprocess.run(['curl','--fail','--location','--retry','3',
                     '--connect-timeout','20','--max-time','300',url,'-o',str(output)],check=True)
 
-def pinned_patches(pinned):
-    patches={}
-    for entry in pinned.get('patches',[]):
-        path=ROOT/entry['path']
-        if not path.is_file() or sha(path)!=entry['sha256']:
-            raise ValueError('sandboxd patch integrity mismatch: '+entry['path'])
-        patches[entry['path']]=entry['sha256']
-    return patches
+def fetch_pinned_source(source, repository, revision, *, attempts=3, command=run, sleeper=time.sleep):
+    if attempts<1:raise ValueError('positive fetch attempts required')
+    for attempt in range(1,attempts+1):
+        shutil.rmtree(source,ignore_errors=True)
+        try:
+            command(['git','init',source])
+            command(['git','-C',source,'remote','add','origin',repository])
+            command(['git','-C',source,'fetch','--depth=1','origin',revision])
+            command(['git','-C',source,'checkout','--detach','FETCH_HEAD'])
+            return
+        except subprocess.CalledProcessError:
+            if attempt==attempts:raise
+            delay=2**(attempt-1)
+            print(
+                f'sandboxd source fetch attempt {attempt}/{attempts} failed; retrying in {delay}s',
+                file=sys.stderr,
+                flush=True,
+            )
+            sleeper(delay)
 
 def main():
     p=argparse.ArgumentParser();p.add_argument('--output',type=Path,required=True);p.add_argument('--source',type=Path);p.add_argument('--redis-cli',type=Path,required=True);p.add_argument('--jobs',type=int,default=2);a=p.parse_args()
@@ -63,14 +74,10 @@ def main():
     with tempfile.TemporaryDirectory(prefix='adx-sandboxd-build-') as tmp:
         source=a.source.resolve() if a.source else Path(tmp)/'source'
         if a.source is None:
-            run(['git','init',source]);run(['git','-C',source,'remote','add','origin',pinned['repository']]);run(['git','-C',source,'fetch','--depth=1','origin',pinned['revision']]);run(['git','-C',source,'checkout','--detach','FETCH_HEAD'])
+            fetch_pinned_source(source,pinned['repository'],pinned['revision'])
         if run(['git','-C',source,'rev-parse','HEAD'])!=pinned['revision'] or run(['git','-C',source,'status','--porcelain']):raise ValueError('sandboxd source must match the clean pinned revision')
         for file in pinned['files']:
             if sha(source/file['source'])!=file['sha256']:raise ValueError('sandboxd source integrity mismatch')
-        patches=pinned_patches(pinned)
-        for patch in patches:
-            subprocess.run(['git','-C',source,'apply','--check',ROOT/patch],check=True)
-            subprocess.run(['git','-C',source,'apply',ROOT/patch],check=True)
         env={**os.environ,'GOFLAGS':'-p='+str(a.jobs),'GOMAXPROCS':str(a.jobs)}
         subprocess.run(
             ['make', 'RELEASE_GOARCH='+arch, *SANDBOXD_BUILD_TARGETS],
@@ -95,5 +102,5 @@ def main():
         if '7.2.5' not in run([a.redis_cli.resolve(),'--version']):raise ValueError('Redis CLI version mismatch')
         shutil.copy2(a.redis_cli,a.output/'redis-cli')
         files={p.name:sha(p) for p in a.output.iterdir() if p.is_file()}
-        (a.output/'manifest.json').write_text(json.dumps({'sandboxd_revision':pinned['revision'],'sandboxd_patches':patches,'target':target,'runc_version':versions['RUNC_VERSION'],'files':files},indent=2)+'\n')
+        (a.output/'manifest.json').write_text(json.dumps({'sandboxd_revision':pinned['revision'],'target':target,'runc_version':versions['RUNC_VERSION'],'files':files},indent=2)+'\n')
 if __name__=='__main__':main()

@@ -16,12 +16,11 @@ class BackendCacheTests(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
         self.root=Path(self.tmp.name)
-        for name in cached.BACKEND_FILES:(self.root/name).write_bytes(name.encode())
+        for name in cached.BACKEND_BINARIES:(self.root/name).write_bytes(name.encode())
         pinned=json.loads((cached.ROOT/'third_party/sandboxd/source.json').read_text())
         self.manifest={'sandboxd_revision':pinned['revision'],
-                       'sandboxd_patches':cached.expected_patches(pinned),
                        'target':'x86_64-unknown-linux-gnu',
-                       'files':{name:cached.sha(self.root/name) for name in cached.BACKEND_FILES}}
+                       'files':{name:cached.sha(self.root/name) for name in cached.BACKEND_BINARIES}}
         self.save()
     def save(self):(self.root/'manifest.json').write_text(json.dumps(self.manifest))
     def test_verified_pinned_artifacts_are_accepted(self):
@@ -36,6 +35,3 @@ class BackendCacheTests(unittest.TestCase):
     def test_incomplete_artifact_set_is_rejected(self):
         del self.manifest['files']['runc'];self.save()
         with self.assertRaisesRegex(ValueError,'file set'):cached.verify(self.root,self.manifest['target'])
-    def test_wrong_patch_set_is_rejected(self):
-        self.manifest['sandboxd_patches']={};self.save()
-        with self.assertRaisesRegex(ValueError,'patch set'):cached.verify(self.root,self.manifest['target'])

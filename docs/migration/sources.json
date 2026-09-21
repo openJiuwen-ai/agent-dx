@@ -25,8 +25,8 @@
       "commit": "d5fde0371911d50855a4cce8b2ee6cff9833515e",
       "source": "python",
       "target": "platform/sdk/sandbox/python",
-      "version": "0.10.0",
-      "version_note": "Untagged source pin; preserves setuptools_scm fallback; release override supported",
+      "version": "0.1.0",
+      "version_note": "Imported source pin; ADX releases declare the SDK version in pyproject.toml",
       "tree": "d4b6d234e9b05b51f762ed8a890d8ad77536f3ed"
     }
   ],

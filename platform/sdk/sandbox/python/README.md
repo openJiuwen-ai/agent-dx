@@ -326,10 +326,10 @@ PYTHON=python3 bash build.sh /tmp/adx-sandbox-dist
 PYTHONPATH=. python3 -m unittest discover -s tests/unit
 ```
 
-The parent adx build passes `BUILD_VERSION` so this wheel has the same
-version as the control-plane component wheels. Standalone release builds may
-set it explicitly, for example `BUILD_VERSION=0.10.0`; an
-`ADX_RELEASE_TAG`/`BUILDKITE_TAG` still takes precedence.
+The SDK version is defined once in `pyproject.toml`, matching the AKernel SDK
+packaging model. Change `[project].version` when publishing a new SDK release;
+the build does not infer or override it from repository tags or environment
+variables.
 
 From the monorepo root, the SDK wrapper does the same:
 
