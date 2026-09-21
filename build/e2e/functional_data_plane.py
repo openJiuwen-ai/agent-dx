@@ -12,17 +12,6 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from adx_sandbox import (
-    CommandConflict,
-    CommandNotFound,
-    CommandStatus,
-    CommandWaitTimeout,
-    DataPlaneSecurityPolicy,
-    Sandbox,
-    resources,
-)
-
-
 PORT = 18081
 TLS_PORT = 18082
 EXPECTED_BODY = "ADX-FORWARDED-PORT-OK"
@@ -78,6 +67,20 @@ def _fetch_forwarded(sandbox, ca_path, port=PORT, authenticated=True):
 
 
 def run(connection, image, output, ca_path):
+    # Keep module-level protocol helpers dependency-free so the CI driver
+    # contract suite does not depend on an installed public SDK. The real
+    # functional case runs inside the packaged client environment and imports
+    # the SDK at execution time.
+    from adx_sandbox import (
+        CommandConflict,
+        CommandNotFound,
+        CommandStatus,
+        CommandWaitTimeout,
+        DataPlaneSecurityPolicy,
+        Sandbox,
+        resources,
+    )
+
     checks = {}
     cases = []
     sandbox = None
