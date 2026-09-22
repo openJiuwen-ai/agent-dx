@@ -25,8 +25,6 @@ pub struct EdgeFrontendService {
     watcher: Arc<MasterConnection>,
     store: Arc<RouteStore>,
     route_changes: broadcast::Receiver<RouteChange>,
-    #[cfg(feature = "agent-api")]
-    agent_api: Option<Arc<super::agent_api::AgentApi>>,
 }
 
 impl EdgeFrontendService {
@@ -59,12 +57,8 @@ impl EdgeFrontendService {
             let settings: SandboxConfig = serde_json::from_slice(&std::fs::read(path)?)
                 .map_err(|_| "invalid Sandbox configuration")?;
             let backend = Arc::new(
-                PlatformSandbox::new(
-                    settings,
-                    connector.clone(),
-                    std::env::var("ADX_SANDBOX_RRT_TOKEN")?,
-                )
-                .map_err(send_error)?,
+                PlatformSandbox::new(settings, std::env::var("ADX_SANDBOX_RRT_TOKEN")?)
+                    .map_err(send_error)?,
             );
             Some(Arc::new(SandboxApi::new(
                 backend,
@@ -133,8 +127,6 @@ impl EdgeFrontendService {
             watcher,
             store,
             route_changes,
-            #[cfg(feature = "agent-api")]
-            agent_api,
         })
     }
 
@@ -152,15 +144,8 @@ impl EdgeFrontendService {
             watcher,
             store,
             route_changes,
-            #[cfg(feature = "agent-api")]
-            agent_api,
         } = self;
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        #[cfg(feature = "agent-api")]
-        let dispatcher_task = agent_api
-            .as_ref()
-            .and_then(|api| api.dispatcher.as_ref())
-            .map(|client| tokio::spawn(client.clone().run(shutdown_rx.clone())));
         let watcher_task = tokio::spawn(watcher.run(store));
         let route_reconciler_task =
             tokio::spawn(gateway.clone().run_route_reconciler(route_changes));
@@ -206,10 +191,6 @@ impl EdgeFrontendService {
         let deadline = tokio::time::Instant::now() + config.drain_timeout;
         while gateway.active_sessions() > 0 && tokio::time::Instant::now() < deadline {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-        #[cfg(feature = "agent-api")]
-        if let Some(task) = dispatcher_task {
-            task.abort();
         }
         watcher_task.abort();
         route_reconciler_task.abort();

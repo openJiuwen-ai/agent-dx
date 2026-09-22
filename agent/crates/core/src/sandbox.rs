@@ -1,4 +1,4 @@
-//! General Sandbox capability boundary shared by Gateway adapters and Dispatcher clients.
+//! General Sandbox capability boundary shared by Gateway adapters and Activator clients.
 //! Contains no Master/Node Manager identities, Platform storage keys or business invoke protocol.
 use crate::{Resources, Service, TemplateVersion, ValidationResult};
 use async_trait::async_trait;

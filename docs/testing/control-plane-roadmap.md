@@ -21,7 +21,7 @@
 
 阶段 2 已完成本地验收：Lima r7 的 checkpoint 与节点生命周期共 10 项真实 Firecracker 用例通过，141 项 Rust/Redis/HTTP 定向测试、138 项 SDK 单测和 Go 检查通过。契约及证据见 [节点生命周期与降级](node-lifecycle.md)。阶段 3 已完成本地快照与存储验收；阶段4已完成本地故障恢复验收，阶段6已完成本地部署收口验收，阶段7按本轮基础K8s范围完成正式验收，阶段5尚未全部验收完成。本地验收与 Kubernetes Buildkite 分开记录。
 
-阶段 5、6 包含既有实现的补齐与验收，不意味着这些组件需要从头重写。平台控制面不提供函数／Actor／FaaS、抢占、成组调度、租户配额或 Master 弹性池。拓扑分布不作为本期扩展目标；当前内部类型/规则仍存在，公开 HTTP 未暴露。Agent 子树仍保留旧 FaaS 后端依赖，业务迁移单列于 [实现边界](control-plane-implementation.md)。
+阶段 5、6 包含既有实现的补齐与验收，不意味着这些组件需要从头重写。平台控制面不提供函数／Actor／FaaS、抢占、成组调度、租户配额或 Master 弹性池。拓扑分布不作为本期扩展目标；当前内部类型/规则仍存在，公开 HTTP 未暴露。Agent 的 Template/Environment 与 Activator 属于产品层，当前能力与验证限制单列于 [实现边界](control-plane-implementation.md)。
 
 
 当前推进记录（2026-09-16）：

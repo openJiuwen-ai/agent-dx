@@ -1,20 +1,22 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1120 840" role="img" aria-labelledby="title desc">
-<title id="title">ADX 当前组件架构</title><desc id="desc">Agent 目标经 Sandbox SDK 接入，当前尚未迁移；API Server 默认内嵌 Edge，Node Manager 默认内嵌 Node Proxy。控制链路经过 API Server、Master 与 Node Manager，数据链路经过 Edge、Node Proxy 与 RRT。Redis 持久化与 SQLite 降级分开。</desc>
+<title id="title">ADX 当前组件架构</title><desc id="desc">Gateway Edge 装配 Agent API。无状态 Activator 保存 Template/Environment 到独立 Redis 命名空间，通过 Gateway Sandbox 适配器按稳定身份创建实例。inline 直接调用适配器。用户 Harness 通过共享 HTTP/WS/SSH 转发访问。Platform 管 Capsule 生命周期，RRT 管用户进程。API Server 与 Edge、Node Manager 与 Node Proxy 均支持共进程或拆分部署。</desc>
 <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10Z" fill="#516b83"/></marker></defs>
 <style>text{font-family:system-ui,-apple-system,'PingFang SC',sans-serif;fill:#17324d} .head{font-size:20px;font-weight:650}.body{font-size:15px}.small{font-size:13px;fill:#526b7c}.edge{fill:none;stroke:#516b83;stroke-width:2;marker-end:url(#arrow)}.box{stroke:#b7ccd9;stroke-width:1.5;rx:12}</style>
 <rect width="1120" height="840" fill="#f5f8fb" rx="18"/>
-<text x="32" y="38" class="head">Agent DX · 当前组件与调用方向</text><text x="32" y="63" class="small">2026-09-21 ｜ 实线：已接通；虚线：Agent 平台接入目标</text>
+<text x="32" y="38" class="head">Agent DX · 当前组件与调用方向</text><text x="32" y="63" class="small">2026-09-22 ｜ Agent 产品状态与 Platform 生命周期分离</text>
 <rect x="32" y="90" width="490" height="93" class="box" fill="#fff1db"/>
-<text x="50" y="120" class="head">Agent CLI / SDK / Executor</text>
-<text x="50" y="146" class="body">仍依赖旧 FaaS / 外部运行时，平台接入尚未完成</text>
+<text x="50" y="120" class="head">无状态 Activator</text>
+<text x="50" y="146" class="body">Template / Environment · 独立 Redis 产品状态</text>
 <rect x="654" y="90" width="432" height="93" class="box" fill="#e6f4ef"/>
-<text x="672" y="120" class="head">Sandbox Python SDK</text>
-<text x="672" y="146" class="body">公开生命周期、快照、命令与文件</text>
-<path d="M522 136H650" class="edge" stroke-dasharray="7 5"/>
-<text x="536" y="125" class="small">目标使用 SDK</text>
+<text x="672" y="120" class="head">Agent 客户端 / Sandbox SDK</text>
+<text x="672" y="146" class="body">产品管理 / HTTP / WS / SSH / Sandbox API</text>
+<path d="M654 260H578V136H522" class="edge"/>
+<text x="534" y="194" class="small">Agent API</text>
+<path d="M200 183V207H760V226" class="edge"/>
+<text x="275" y="201" class="small">调用 Sandbox 适配器</text>
 <rect x="654" y="226" width="432" height="82" class="box" fill="#e8f0fc"/>
 <text x="672" y="256" class="head">Edge · 共享接入</text>
-<text x="672" y="282" class="body">API 转发 / API Key 缓存 / 路由订阅</text>
+<text x="672" y="282" class="body">Agent API / Sandbox 适配 / 认证 / 共享转发</text>
 <path d="M870 183V222" class="edge"/>
 <text x="885" y="208" class="small">HTTPS</text>
 <rect x="32" y="226" width="426" height="82" class="box" fill="#e8f0fc"/>
@@ -45,7 +47,7 @@
 <path d="M100 462V530" class="edge" marker-start="url(#arrow)"/>
 <text x="113" y="510" class="small">分配 ↓ / 结果提交 ↑</text>
 <path d="M70 308H16V592H28" class="edge"/>
-<text x="32" y="526" class="small">已有实例直达</text>
+<text x="24" y="490" class="small">已有实例直达</text>
 <rect x="654" y="534" width="432" height="116" class="box" fill="#e8f0fc"/>
 <text x="672" y="564" class="head">Node Proxy</text>
 <text x="672" y="590" class="body">本机绑定复核 / 数据转发 / 活动上报</text>
@@ -61,7 +63,7 @@
 <text x="295" y="728" class="head">SQLite / 本地 / S3</text>
 <text x="295" y="754" class="body">降级日志 / checkpoint 制品</text>
 <rect x="654" y="698" width="432" height="95" class="box" fill="#e8f0fc"/>
-<text x="672" y="728" class="head">Runtime · RRT + workload</text>
+<text x="672" y="728" class="head">Runtime · RRT + Harness</text>
 <text x="672" y="754" class="body">命令 / 文件 / HTTP 恢复协作</text>
 <path d="M136 650V694" class="edge"/>
 <text x="146" y="678" class="small">后端 RPC</text>

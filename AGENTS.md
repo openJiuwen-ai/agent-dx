@@ -2,7 +2,7 @@
 
 ## Boundaries
 
-- `agent/` owns Agent APIs, sessions and execution orchestration. Target platform access goes through the public Sandbox SDK.
+- `agent/` owns Template/Environment APIs and stateless Activators. Platform lifecycle access goes through the Sandbox capability interface; user Harness traffic uses shared Gateway forwarding.
 - `platform/` owns Instance scheduling and execution, the Sandbox SDK, Master, Node Manager and RRT.
 - `gateway/` owns the public Sandbox API Server, shared entrypoints, routing and node forwarding; it does not own Instance lifecycle.
 - Root `crates/` owns product-wide error semantics, observability, process bootstrap support and transport mechanics. Platform domain models, protocol, scheduling and discovery remain under `platform/crates/`.

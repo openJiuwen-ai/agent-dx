@@ -18,7 +18,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 case "${1:-}" in
-  '') exec "${CARGO:-cargo}" build --locked -p adx-agent-core -p adx-agent-store -p adx-dispatcher -p adx-agent-api -p data-plane-gateway --features data-plane-gateway/agent-api -j "${JOBS:-2}" ;;
+  '') exec "${CARGO:-cargo}" build --locked -p adx-agent-core -p adx-agent-store -p adx-activator -p adx-agent-api -p data-plane-gateway -p adx-api-server --features data-plane-gateway/agent-api -j "${JOBS:-2}" ;;
   -t) exec make agent-test ;;
   -h|--help) echo '用法：bash build.sh [-t|-h]；默认构建 Rust Agent，-t 执行组件测试。Sandbox SDK 打包使用 make package。' ;;
   *) echo '旧 Agent Python 打包入口已删除；使用 make package 打包 Sandbox SDK。' >&2; exit 2 ;;
