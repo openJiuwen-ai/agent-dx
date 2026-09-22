@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "platform": "linux/amd64",
+  "distribution": {
+    "id": "ubuntu",
+    "version": "20.04"
+  },
+  "source_image": "swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/compile-ubuntu2004-rust:v20260826_rust1950_musl_x86_64@sha256:13008c86d6ce56422b4591570d3b358a92d6d384100aafa41e04f5556a5d8faf",
+  "repository": "swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/adx-build",
+  "ci_image": "swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/adx-build@sha256:ad9edff0b7cd2d907648a772109ad516e5da7b7b8762f08fd8653979a1e2cb67",
+  "rust": "1.95.0",
+  "go": "1.25.5",
+  "redis": "7.2.5",
+  "erofs_utils": "1.8.10"
+}

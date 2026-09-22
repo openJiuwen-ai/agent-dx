@@ -21,8 +21,12 @@ Full 流水线消费不可变制品，不得从源码重新编译或替换二进
 对应 Buildkite 实体已经建立为 `agent-dx`、`agent-dx-python-sdk` 和
 `agent-dx-full-test`。
 
-现阶段 `build/release/build.sh` 仍同时编译 Rust 平台、RRT 和 Python SDK，兼容的一体化
-`adx-release.tar.gz` 仍包含 SDK wheel。独立 SDK 流水线输出的 wheel、sdist 与
+基础出包流水线现在将 Platform、Gateway、RRT 和 source gate 放在四个并行步骤中。
+三个编译步骤使用独立 Cargo target，输出带提交、目标平台和逐文件 SHA256 的组件
+归档；`platform-build` 只下载、校验并组装这些归档，不重复编译。聚合后的
+`build-manifest.json` 绑定组件清单、基础包、sandboxd backend 和兼容 SDK wheel。
+
+现阶段兼容的一体化 `adx-release.tar.gz` 仍包含 RRT 和 SDK wheel。独立 SDK 流水线输出的 wheel、sdist 与
 `sdk-candidate.json` 是 Full 验收的 SDK 输入；Full 不使用基础包内的 wheel。继续拆分
 Platform、RRT 和 Runtime Pack 的归档属于后续包结构改造，不能把当前一体包描述成已经
 完成拆分。
@@ -53,6 +57,10 @@ Buildkite pipeline slug 为 `agent-dx`，配置入口为
 - 手动构建：允许指定提交和目标架构，禁止从 dirty tree 发布。
 
 ### 步骤
+
+当前已落地的是 Linux AMD64 的 `build-platform`、`build-gateway`、`build-rrt`、
+`source-gate` 和 `platform-build` 组装链路。下面列出的多架构独立候选、package smoke、
+SBOM 和最终 `release.json` 是目标状态，不能作为当前流水线已经提供的能力。
 
 1. `source-gate`
    - 校验提交身份和干净工作树。
@@ -354,8 +362,9 @@ chart 只组织现有进程、Secret、Service、持久卷和外部 sandboxd Run
 
 ## 实施顺序
 
-1. 先把 `build/release/build.sh` 拆成 Platform 与 RRT 两个独立组装结果，同时拆出
-   SDK build，并升级 package manifest schema。
+1. 已把基础构建拆为 Platform、Gateway、RRT 三个组件归档，并由独立组装步骤生成
+   当前兼容基础包和 `build-manifest.json`；下一步拆成 Platform 与 RRT 两个正式候选，
+   同时升级 package manifest schema。
 2. 已新增三份 pipeline YAML；`.buildkite/pipeline.yml` 只负责按 pipeline slug 动态
    上传 package、sdk 或 full 配置。
 3. 已增加 SDK 候选清单校验器，并让 Full 显式消费基础包和 SDK build UUID；继续增加

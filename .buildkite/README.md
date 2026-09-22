@@ -49,8 +49,10 @@ requests from node1 enter Edge over TLS and traverse the real control/data paths
 These are Buildkite execution-cluster resources. They are independent of the
 two-worker target-cluster requirements documented in the
 [Kubernetes E2E README](../build/e2e/kubernetes/README.md). The current Agent
-Stack requests/limits are: release build `4/8 CPU` and `8/16 GiB`, image publish
-`8 CPU / 16 GiB`, and the E2E deployer `2/4 CPU` and `4/8 GiB`. The target
+Stack requests/limits are: each Platform/Gateway/RRT/source-gate compiler
+`4/8 CPU` and `8/16 GiB`, package assembly and OBS publication `1/2 CPU` and
+`2/4 GiB`, image publish `8 CPU / 16 GiB`, and the E2E deployer `2/4 CPU` and
+`4/8 GiB`. The target
 kubeconfig selects a second cluster where the ADX Pods are deployed.
 
 All product steps use the existing `default` queue with `os=linux`, `arch=amd64`
@@ -58,8 +60,8 @@ and the Kubernetes plugin. Worker images follow the existing CI profiles:
 
 | Step | Reused worker image |
 |---|---|
-| `platform-build` | `swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/compile-ubuntu2004-rust:v20260826_rust1950_musl_x86_64` |
-| `platform-obs` | same pinned compile image as `platform-build` |
+| `build-platform` / `build-gateway` / `build-rrt` / `source-gate` | immutable `ci_image` digest in `build/images/build-environment.json` |
+| `platform-build` / `platform-obs` | same immutable ADX build image |
 | `sdk-package` / `platform-images` | `swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/sandbox-packager:v20260506_kubectl` |
 | `platform-e2e` | `swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/sandbox-deployer:v20260506_kubectl_py39` |
 
@@ -83,7 +85,10 @@ uploaded artifacts. ADX images default to the existing SWR organization under
 ADX build inputs remain explicit: the root Rust toolchain, Go/protobuf/Python
 build tools, matching `ADX_REDIS_SERVER` / `ADX_REDIS_CLI` 7.2.5 binaries, and
 `ADX_E2E_RUNTIME_BASE` / `ADX_E2E_RRT_BASE` digest-pinned runtime bases. Reusing
-worker images does not change the product's toolchain or dependency pins. The bootstrap prepares pinned Go and Redis dependencies in the worker cache.
+worker images does not change the product's toolchain or dependency pins. The
+digest-pinned ADX build image already contains Rust 1.95.0, Go 1.25.5, Redis
+7.2.5, musl, erofs-utils 1.8.10 and the Python build dependencies. Bootstrap
+verifies these pins and fails instead of downloading or compiling missing tools.
 `GOROOT` is set together with `PATH` so the worker's preinstalled Go cannot mix
 standard libraries with the selected compiler. The bundled Redis uses the same
 libc/plain transport build as local acceptance, avoiding a host OpenSSL ABI
@@ -91,8 +96,15 @@ dependency in the Ubuntu runtime image.
 
 ## Artifact handoff and acceptance
 
-`platform-build` constructs the ADX base package from the clean current commit.
-It downloads the pinned external sandboxd backend artifact selected by
+`build-platform`, `build-gateway` and `build-rrt` compile in parallel with
+separate target directories, while `source-gate` runs the source and unit-test
+gate. Each compile step uploads a component archive and manifest. After all four
+steps pass, `platform-build` verifies those immutable handoff artifacts and
+assembles the ADX base package without recompiling them. `build-manifest.json`
+binds the source commit, component manifests, release archive, backend bundle
+and compatibility SDK copy by SHA256.
+
+The assembly step downloads the pinned external sandboxd backend artifact selected by
 `ADX_BACKEND_ARTIFACT_BUILD` and verifies its revision, target and complete file
 digests. `sdk-package` independently tests the public SDK on Python 3.12, creates
 one wheel and one sdist, installs the wheel in a source-free virtual environment,
@@ -173,20 +185,26 @@ and [PodSpec configuration](https://buildkite.com/docs/agent/self-hosted/agent-s
 
 构建会在复用的 worker 中按版本和 SHA256 准备 Go 1.25.5、Redis 7.2.5。基础流水线直接下载并校验固定的 sandboxd 后端产物，不访问 GitHub 重建；只有显式取消 `ADX_BACKEND_ARTIFACT_BUILD` 时才进入源码构建维护路径。未指定基础镜像时，打包步骤按仓库 Dockerfile 构建并发布测试基础镜像，再用 registry digest 构建节点与 RRT 镜像。`ADX_REDIS_SERVER` / `ADX_REDIS_CLI` 和 `ADX_E2E_RUNTIME_BASE` / `ADX_E2E_RRT_BASE` 可显式覆盖。
 
-## Rust image and Cargo cache
+## ADX build image and Cargo cache
 
-The Rust worker uses the existing Rust 1.95.0 image pinned by registry digest.
-CI selects its preinstalled `stable` toolchain and disables automatic toolchain
-installation; bootstrap verifies the actual version against `rust-toolchain.toml`.
-The same numeric pin applies to local builds.
+`build/images/build-environment.json` is the source of truth for the immutable
+Linux AMD64 build-image digest. Regular package jobs run through
+`.buildkite/run-build-container.sh` and never install build dependencies at job
+time. Set `ADX_BUILD_IMAGE_SYNC_ONLY=1` on the base pipeline to dispatch the
+maintenance job that builds the Ubuntu 20.04 recipe, pushes the immutable image,
+verifies it by digest and records `out/buildkite/build-image/result.json`. A
+mutable `buildcache` tag may seed BuildKit cache only; product jobs always use
+the recorded digest.
 
 `.buildkite/setup-cargo.sh` restores the image's rsproxy sparse source settings in
 the persistent ADX Cargo home, including Git dependency caching.
 It exports `CARGO_HOME` from `ADX_CARGO_HOME` inside the build process so image
-profile initialization cannot silently redirect downloads back to `/root/.cargo`. Both registry/git
-downloads and release compilation outputs survive job Pods under `/mnt/paas`.
-The release target cache is separated by architecture and toolchain; the build
-step is serialized so package assembly cannot copy another job's binaries.
+profile initialization cannot silently redirect downloads back to `/root/.cargo`.
+Registry and Git downloads survive job Pods under `/mnt/paas`. Platform,
+Gateway, RRT and source-gate use separate target directories by architecture and
+toolchain, so they can run concurrently without copying another job's outputs.
+Package assembly consumes only uploaded component archives; it does not read a
+compiler job's Cargo target directory.
 An existing sccache from the shared worker cache is reused when available, and
 Cargo cache locations/source selection are recorded in `bootstrap.log`.
 
@@ -210,7 +228,8 @@ is grouped by phase. `pipefail` preserves command failures through `tee`.
 Toolchain setup stays in the current shell so exported cache paths reach builds.
 
 Package and Full stages update the `adx-build-summary` annotation and upload
-their Markdown/JSON summaries. The SDK pipeline publishes its candidate,
+their Markdown/JSON summaries. The package summary links the build manifest as
+well as the release and backend artifacts. The SDK pipeline publishes its candidate,
 JUnit and install-smoke evidence as independent artifacts. Full summaries link
 image provenance, result JSON and JUnit, record actual Pod/host placement and
 distinguish same-host runs.
@@ -220,7 +239,7 @@ Failures still publish a summary and retain their original exit status.
 
 Set `ADX_OBS_UPLOAD=1` to add the `platform-obs` step after `platform-build`.
 The step downloads the exact Buildkite artifacts produced by that build, verifies
-the release archive, package manifest and sandboxd backend bundle, and then
+the release archive, package manifest, build manifest and sandboxd backend bundle, and then
 uploads them to Huawei Cloud OBS. It does not rebuild any product binary.
 
 The Kubernetes worker reads `AK` and `SK` from the existing
@@ -281,9 +300,8 @@ The basic acceptance driver also runs an independent `local-first` case: restart
 
 ### Local runtime payload tools
 
-The Ubuntu 20.04 worker uses cached erofs-utils 1.8.10 built from pinned commit
-`51b5939b5f783221310d25146e6a2019ba8129b6`. `build/runtime/erofs-tools.sh` verifies
-the source archive SHA256 before compiling native tools under `ADX_TOOL_CACHE`.
+The immutable Ubuntu 20.04 ADX build image provides erofs-utils 1.8.10 built
+from pinned commit `51b5939b5f783221310d25146e6a2019ba8129b6`.
 Both `mkfs.erofs` and `fsck.erofs` are required; the distribution's 1.0 package
 lacks the checker. The runtime payload stays uncompressed and disables inline
 data; the tools are build dependencies and are not included in the release.

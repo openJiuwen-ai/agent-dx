@@ -46,7 +46,10 @@ def resources(namespace, image, architecture, registry_auth=False, node_names=()
         }
         spec = {
             'restartPolicy': 'Never', 'automountServiceAccountToken': False,
-            'terminationGracePeriodSeconds': 90,
+            # cleanup() has already stopped ADX and copied final evidence before
+            # deleting the namespace. Keep only a short kubelet grace period for
+            # the independently hosted fixture processes.
+            'terminationGracePeriodSeconds': 15,
             'nodeSelector': {'kubernetes.io/os': 'linux', 'kubernetes.io/arch': architecture},
             'containers': [container, {
                 'name':'collector','image':image,'imagePullPolicy':'IfNotPresent',

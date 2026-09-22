@@ -14,6 +14,12 @@ class IndependentPipelineTests(unittest.TestCase):
         full = (ROOT / '.buildkite/pipeline-full.yml').read_text()
 
         self.assertIn('key: platform-build', package)
+        for key in ('build-platform', 'build-gateway', 'build-rrt', 'source-gate'):
+            self.assertIn(f'key: {key}', package)
+        self.assertIn(
+            'depends_on: [build-platform, build-gateway, build-rrt, source-gate]',
+            package,
+        )
         self.assertNotIn('key: platform-e2e', package)
         self.assertNotIn('key: sdk-package', package)
 
@@ -41,6 +47,8 @@ class IndependentPipelineTests(unittest.TestCase):
         script = (ROOT / '.buildkite/package-e2e.sh').read_text()
         self.assertIn('ADX_BASE_PACKAGE_BUILD_ID', script)
         self.assertIn('ADX_SDK_BUILD_ID', script)
+        self.assertIn('out/buildkite/build-manifest.json', script)
+        self.assertIn('out/buildkite/backend.tar.gz', script)
         self.assertIn('--sdk-wheel', script)
         self.assertIn('--sdk-candidate', script)
 

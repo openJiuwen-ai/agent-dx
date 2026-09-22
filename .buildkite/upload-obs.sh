@@ -16,7 +16,8 @@ echo "--- :arrow_down: Download verified build artifacts"
 buildkite-agent artifact download 'out/buildkite/adx-release.tar.gz' . --step platform-build
 buildkite-agent artifact download 'out/buildkite/adx-release.tar.gz.sha256' . --step platform-build
 buildkite-agent artifact download 'out/buildkite/release-manifest.json' . --step platform-build
-buildkite-agent artifact download 'out/buildkite/backend/*' . --step platform-build
+buildkite-agent artifact download 'out/buildkite/build-manifest.json' . --step platform-build
+buildkite-agent artifact download 'out/buildkite/backend.tar.gz' . --step platform-build
 
 (cd out/buildkite && sha256sum --check adx-release.tar.gz.sha256)
 python=${OBS_PYTHON:-/opt/buildtools/python3.9/bin/python3}
@@ -25,14 +26,27 @@ verify_dir=$(mktemp -d out/buildkite/obs-package-check.XXXXXX)
 trap 'rm -rf "$verify_dir"' EXIT
 tar -xzf out/buildkite/adx-release.tar.gz -C "$verify_dir"
 "$python" build/release/package.py verify "$verify_dir"
-rm -rf "$verify_dir"
+mkdir -p out/buildkite/backend
+tar -xzf out/buildkite/backend.tar.gz -C out/buildkite/backend
 "$python" build/e2e/verify_backend.py \
   --directory out/buildkite/backend \
   --target x86_64-unknown-linux-gnu
+base_wheels=("$verify_dir"/sdk/adx_sandbox-*.whl)
+[[ ${#base_wheels[@]} == 1 && -f ${base_wheels[0]} ]] || { echo 'base package SDK wheel is missing' >&2; exit 1; }
+"$python" build/release/component.py verify-build \
+  --manifest out/buildkite/build-manifest.json \
+  --commit "$BUILDKITE_COMMIT" \
+  --target x86_64-unknown-linux-gnu \
+  --package-manifest "$verify_dir/manifest.json" \
+  --release-archive out/buildkite/adx-release.tar.gz \
+  --wheel "${base_wheels[0]}" \
+  --backend-manifest out/buildkite/backend/manifest.json \
+  --backend-archive out/buildkite/backend.tar.gz
+rm -rf "$verify_dir"
 
 commit_short=${BUILDKITE_COMMIT:0:12}
 runtime_archive="$output/adx-runtime-runc-${commit_short}-linux-amd64.tar.gz"
-tar -czf "$runtime_archive" -C out/buildkite/backend .
+cp out/buildkite/backend.tar.gz "$runtime_archive"
 sha256sum "$runtime_archive" > "$runtime_archive.sha256"
 
 channel=${ADX_OBS_UPLOAD_CHANNEL:-daily}
@@ -50,10 +64,11 @@ artifacts=(
   out/buildkite/adx-release.tar.gz
   out/buildkite/adx-release.tar.gz.sha256
   out/buildkite/release-manifest.json
+  out/buildkite/build-manifest.json
   "$runtime_archive"
   "$runtime_archive.sha256"
 )
-[[ ${#artifacts[@]} -eq 5 ]] || { echo 'base package artifact set is incomplete' >&2; exit 1; }
+[[ ${#artifacts[@]} -eq 6 ]] || { echo 'base package artifact set is incomplete' >&2; exit 1; }
 
 echo "--- :cloud: Upload ADX artifacts to Huawei Cloud OBS"
 "$python" -c 'from obs import ObsClient' >/dev/null 2>&1 || {
