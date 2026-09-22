@@ -10,6 +10,7 @@ static COMMANDS: AtomicI64 = AtomicI64::new(0);
 #[derive(Clone, Copy)]
 pub(crate) enum ActivitySource {
     DirectHttp,
+    Checkpoint,
     Tunnel,
 }
 #[must_use]

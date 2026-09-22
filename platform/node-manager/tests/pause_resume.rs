@@ -25,6 +25,9 @@ struct Backend {
     fail_abort: Mutex<bool>,
     fail_remove: Mutex<bool>,
     checkpoint_leaves_running: Mutex<bool>,
+    workload_request: Mutex<Option<String>>,
+    fail_workload_checkpoint: Mutex<bool>,
+    workload_prepared: Mutex<bool>,
 }
 impl Backend {
     fn event(&self, e: &str) {
@@ -84,6 +87,15 @@ impl RuntimeDriver for Backend {
         }
         Ok(())
     }
+    async fn checkpoint_running(&self, id: &str, path: &Path, _: Duration) -> Result<()> {
+        self.event("checkpoint-running");
+        assert!(self.running.lock().unwrap().contains(id));
+        if *self.fail_workload_checkpoint.lock().unwrap() {
+            return Err(Error::Unavailable("reply lost".into()));
+        }
+        std::fs::write(path.join("memory"), b"actual saved memory").unwrap();
+        Ok(())
+    }
     async fn restore_from(
         &self,
         spec: &CapsuleSpec,
@@ -125,6 +137,47 @@ impl RuntimeDriver for Backend {
 }
 #[async_trait]
 impl CheckpointCooperation for Backend {
+    async fn workload_status(
+        &self,
+        record: &CapsuleRecord,
+    ) -> Result<Option<adx_core::runtime::RuntimeStatus>> {
+        Ok(self.workload_request.lock().unwrap().clone().map(|id| {
+            adx_core::runtime::RuntimeStatus {
+                identity: adx_node_manager::runtime_control::RuntimeControlClient::identity(record),
+                revision: 1,
+                phase: adx_core::runtime::RuntimePhase::Running,
+                checkpoint: self.workload_prepared.lock().unwrap().then(|| {
+                    adx_core::runtime::CheckpointStatus {
+                        operation_id: id.clone(),
+                        phase: adx_core::runtime::CheckpointPhase::Prepared,
+                        error: None,
+                    }
+                }),
+                requested_checkpoint: Some(id),
+                active_requests: 1,
+                active_commands: 0,
+                activity_revision: 1,
+            }
+        }))
+    }
+    async fn resumed(&self, _: &CapsuleRecord, _: &str) -> Result<()> {
+        self.event("handoff");
+        Ok(())
+    }
+    async fn finish_workload(
+        &self,
+        _: &CapsuleRecord,
+        _: &str,
+        error: Option<String>,
+    ) -> Result<()> {
+        self.event(if error.is_none() {
+            "checkpoint-ack"
+        } else {
+            "checkpoint-error"
+        });
+        self.workload_request.lock().unwrap().take();
+        Ok(())
+    }
     async fn prepare(&self, _: &CapsuleRecord, _: &str) -> Result<()> {
         self.event("prepare");
         if *self.fail_prepare.lock().unwrap() {
@@ -1212,4 +1265,111 @@ async fn recovery_retries_publication_without_repeating_backend_restore() {
     let events = backend.events.lock().unwrap();
     assert_eq!(events.iter().filter(|e| *e == "restore").count(), 1);
     assert!(!events.iter().any(|e| e == "start"));
+}
+
+#[tokio::test]
+async fn workload_checkpoint_keeps_execution_and_commits_before_acknowledging() {
+    let (_temp, backend, node, mut spec, assignment) = fixture();
+    spec.sandbox.failover = true;
+    let handle = node.capsule(spec, assignment).unwrap();
+    let created = handle.create().await.unwrap();
+    *backend.workload_request.lock().unwrap() = Some("workload-a".into());
+    *backend.unavailable_commit.lock().unwrap() = true;
+    assert!(handle.tick().await.is_err());
+    assert!(!backend
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|e| e == "checkpoint-ack"));
+    *backend.unavailable_commit.lock().unwrap() = false;
+    handle.tick().await.unwrap();
+    let record = handle.sync().await.unwrap().record;
+    assert_eq!(record.state, CapsuleState::Running);
+    assert_eq!(record.runtime, created.record.runtime);
+    assert_eq!(node.used(), record.spec.resources);
+    assert_eq!(record.checkpoint.as_ref().unwrap().id, "workload-a");
+    assert_eq!(
+        record.checkpoint.as_ref().unwrap().artifact.storage,
+        "local"
+    );
+    let events = backend.events.lock().unwrap().clone();
+    assert_eq!(
+        events.iter().filter(|e| *e == "checkpoint-running").count(),
+        1
+    );
+    assert!(!events
+        .iter()
+        .any(|e| e == "remove" || e == "restore" || e == "retire"));
+    let ack = events.iter().position(|e| e == "checkpoint-ack").unwrap();
+    assert_eq!(events[ack - 1], "commit:Running");
+    // Existing failover consumes this anonymous recovery point.
+    backend.running.lock().unwrap().clear();
+    handle.tick().await.unwrap();
+    assert_ne!(
+        handle.sync().await.unwrap().record.runtime,
+        created.record.runtime
+    );
+}
+
+#[tokio::test]
+async fn workload_checkpoint_unknown_backend_result_is_not_reexecuted() {
+    let (_temp, backend, node, spec, assignment) = fixture();
+    let handle = node.capsule(spec, assignment).unwrap();
+    handle.create().await.unwrap();
+    *backend.workload_request.lock().unwrap() = Some("workload-fail".into());
+    *backend.fail_workload_checkpoint.lock().unwrap() = true;
+    assert!(handle.tick().await.is_err());
+    let failed = handle.sync().await.unwrap().record;
+    assert_eq!(failed.state, CapsuleState::Failed);
+    assert!(failed.checkpoint.is_none());
+    handle.tick().await.unwrap();
+    let events = backend.events.lock().unwrap();
+    assert_eq!(
+        events.iter().filter(|e| *e == "checkpoint-running").count(),
+        1
+    );
+    assert!(!events.iter().any(|e| e == "checkpoint-ack"));
+    assert_eq!(node.used(), Resources::default());
+}
+
+#[tokio::test]
+async fn restart_retires_uncommitted_workload_checkpoint_without_recapture() {
+    let (temp, backend, node, spec, assignment) = fixture();
+    let created = node
+        .capsule(spec.clone(), assignment.clone())
+        .unwrap()
+        .create()
+        .await
+        .unwrap();
+    *backend.workload_request.lock().unwrap() = Some("interrupted".into());
+    *backend.workload_prepared.lock().unwrap() = true;
+    let restarted = NodeManager::new(
+        "node".into(),
+        backend.clone(),
+        backend.clone(),
+        backend.clone(),
+        backend.clone(),
+    )
+    .with_checkpointing(
+        Arc::new(LocalCheckpointStore::new(temp.path().into()).unwrap()),
+        backend.clone(),
+    )
+    .unwrap();
+    restarted.reconcile(vec![created.record]).await.unwrap();
+    let record = restarted
+        .capsule(spec, assignment)
+        .unwrap()
+        .sync()
+        .await
+        .unwrap()
+        .record;
+    assert_eq!(record.state, CapsuleState::Failed);
+    assert!(backend.running.lock().unwrap().is_empty());
+    assert!(!backend
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|e| e == "checkpoint-running" || e == "checkpoint-ack"));
 }

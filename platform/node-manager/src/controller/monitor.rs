@@ -35,6 +35,9 @@ impl Controller {
                     .metrics
                     .record(&self.record.spec.id, &self.record.runtime.id, usage);
             }
+            if self.workload_checkpoint().await? {
+                return Ok(());
+            }
             let runtime_activity = if self.record.spec.lifecycle.idle_timeout_seconds > 0
                 || self.services.health_failure_threshold.is_some()
             {

@@ -123,6 +123,24 @@ impl RuntimeControlClient {
     pub async fn status(&self, record: &CapsuleRecord) -> Result<RuntimeStatus> {
         self.request(record, "status", None).await
     }
+    pub async fn finish_checkpoint(
+        &self,
+        record: &CapsuleRecord,
+        operation_id: &str,
+        error: Option<String>,
+    ) -> Result<RuntimeStatus> {
+        let request = FinishWorkloadCheckpoint {
+            identity: Self::identity(record),
+            operation_id: operation_id.into(),
+            error,
+        };
+        self.request(
+            record,
+            "checkpoint/finish",
+            Some(serde_json::to_vec(&request).map_err(unavailable)?),
+        )
+        .await
+    }
     /// Prepared acknowledges the runtime barrier only. The caller must then invoke
     /// the execution backend and persist checkpoint artifacts/metadata separately.
     pub async fn prepare(
@@ -293,6 +311,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let (record, client) = record(port);
         let expected = RuntimeStatus {
+            requested_checkpoint: None,
             identity: RuntimeControlClient::identity(&record),
             revision: 2,
             phase: RuntimePhase::Prepared,

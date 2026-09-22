@@ -14,6 +14,7 @@ sandboxd Start 环境包含 `ADX_CAPSULE_ID`、`ADX_RUNTIME_ID`、`ADX_OWNERSHIP
   "revision": 1,
   "phase": "running",
   "checkpoint": null,
+  "requested_checkpoint": null,
   "active_requests": 0,
   "active_commands": 0,
   "activity_revision": 0
@@ -48,3 +49,48 @@ Prepared 仅证明实例内的 handoff 准备完成，不代表 checkpoint 制�
 节点需使用目标执行记录查询状态，只有身份和阶段匹配后才能绑定目标路由。RRT 不向 Master 注册，不负责迁移归属，也不直接发布 Edge 路由。
 
 完整暂停/恢复、sandboxd checkpoint、本地/S3 和 Redis 提交已接入产品流程，并有 [本地 FC 验收](../../../docs/testing/control-plane-roadmap.md)。`control_http.rs` 的真实客户端/进程与 FIFO 通知测试仅证明协议行为。正式 K8s FC 后置，不能由基础 K8s 通过推导。
+
+## Workload-local checkpoint
+
+When Node Manager has checkpoint storage configured it supplies
+`ADX_RRT_CONTROL_SOCKET_PATH=/run/adx`. The operator may override the directory
+through `rrt_env`; AKernel uses `/run/akernel`. RRT binds `rrt.sock` there. The
+socket belongs to the Capsule filesystem and is not mounted from the host.
+
+```sh
+curl --fail-with-body --unix-socket /run/adx/rrt.sock \
+  -X POST http://localhost/checkpoint
+```
+
+This creates an anonymous **local recovery point**, retaining the same running
+runtime, allocation and route. It does not create a reusable snapshot catalog
+entry. The point replaces the previous point, follows Capsule cleanup, and is
+consumed by reload or same-node failover. It cannot recover a lost node.
+
+RRT serializes local requests and exposes the pending operation ID in
+`GET /control/v1/status` as `requested_checkpoint`. Node Manager reads it during
+its lifecycle monitoring cycle, checks execution identity, prepares the handoff,
+and calls sandboxd Checkpoint with `leave_running=true` (capture timeout 300s).
+The existing HTTP cooperation channel carries this exchange; it requires no
+outbound control-plane credential in the guest.
+
+After backend success and the matching `resumed` handoff, Node Manager retains
+the artifact locally and commits the Running record. Only then does it send
+`POST /control/v1/checkpoint/finish` with `identity`, `operation_id`, and nullable
+`error`. RRT requires the matching identity, pending ID and successful handoff
+before returning `200 {"status":"completed"}` to the Unix caller. A repeated
+identical finish is idempotent. Concurrent local requests return 409; unsupported
+runtime or failed work returns 503 with an error body. Other paths/methods return
+404/405. This operation is exposed only on the Unix listener.
+
+A lost commit or finish response is retried without invoking Checkpoint again.
+A Journaled result leaves the caller pending until cluster publication succeeds.
+A client disconnect does not cancel accepted work. A restored runtime discards
+its inherited source request, refreshes identity and rearms the Unix listener.
+Backend result uncertainty is never translated into success or a second capture;
+Node Manager retires the uncertain execution. External pause/snapshot requests
+cannot prepare a different operation while a local request is pending.
+
+On Node Manager restart, a prepared workload request without a matching committed
+recovery point is retired during reconciliation before routes become ready. A
+committed point survives and its completion acknowledgement may be retried.

@@ -105,6 +105,7 @@ impl Runtime {
             .env("RRT_TUNNEL_HTTP_PORT", tunnel_port.to_string())
             .env("RRT_HTTP_PORT", port.to_string())
             .env("RRT_HTTP_TOKEN", "before")
+            .env("ADX_RRT_CONTROL_SOCKET_PATH", temp.path())
             .env("ADX_ENV_FILE", temp.path().join("env"))
             .env("ADX_CHECKPOINT_HANDOFF_FILE", &fifo)
             .stdout(Stdio::from(log.try_clone().unwrap()))
@@ -304,4 +305,142 @@ async fn same_owner_restore_accepts_new_execution_and_rejects_source_control_ide
     .await
     .unwrap();
     assert!(restored.status(&record(1)).await.is_err());
+}
+
+async fn local_checkpoint(path: std::path::PathBuf) -> String {
+    let mut stream = tokio::net::UnixStream::connect(path).await.unwrap();
+    stream
+        .write_all(b"POST /checkpoint HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n")
+        .await
+        .unwrap();
+    let mut response = String::new();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        stream.read_to_string(&mut response),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    response
+}
+#[tokio::test]
+async fn unix_checkpoint_requires_handoff_and_node_ack_and_rejects_concurrency() {
+    let mut runtime = Runtime::start().await;
+    let client = runtime.client("before");
+    let request = tokio::spawn(local_checkpoint(runtime.temp.path().join("rrt.sock")));
+    let id = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(id) = client
+                .status(&record(1))
+                .await
+                .unwrap()
+                .requested_checkpoint
+            {
+                break id;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(local_checkpoint(runtime.temp.path().join("rrt.sock"))
+        .await
+        .starts_with("HTTP/1.1 409"));
+    let status = client.status(&record(1)).await.unwrap();
+    client
+        .prepare(&record(1), &id, status.revision)
+        .await
+        .unwrap();
+    runtime.handoff(
+        "ADX_CAPSULE_ID=i\nADX_RUNTIME_ID=i-1\nADX_OWNERSHIP_GENERATION=1\n",
+        "resume",
+    );
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while client.status(&record(1)).await.unwrap().phase != RuntimePhase::Running {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!request.is_finished());
+    client
+        .finish_checkpoint(&record(1), &id, None)
+        .await
+        .unwrap();
+    let response = request.await.unwrap();
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(response.contains(r#"{"status":"completed"}"#));
+    // ACK replay is harmless; a later request must not be completed by this ACK.
+    client
+        .finish_checkpoint(&record(1), &id, None)
+        .await
+        .unwrap();
+    let next = tokio::spawn(local_checkpoint(runtime.temp.path().join("rrt.sock")));
+    let next_id = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(id) = client
+                .status(&record(1))
+                .await
+                .unwrap()
+                .requested_checkpoint
+            {
+                break id;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(client
+        .finish_checkpoint(&record(1), &id, None)
+        .await
+        .is_err());
+    client
+        .finish_checkpoint(&record(1), &next_id, Some("backend unavailable".into()))
+        .await
+        .unwrap();
+    assert!(next.await.unwrap().starts_with("HTTP/1.1 503"));
+}
+
+#[tokio::test]
+async fn unix_checkpoint_listener_rearms_after_restore() {
+    let mut runtime = Runtime::start().await;
+    runtime
+        .client("before")
+        .prepare(&record(1), "external", 1)
+        .await
+        .unwrap();
+    runtime.handoff(
+        "ADX_CAPSULE_ID=i\nADX_RUNTIME_ID=i-2\nADX_OWNERSHIP_GENERATION=2\nRRT_HTTP_TOKEN=after\n",
+        "restore",
+    );
+    let client = runtime.client("after");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while client.status(&record(2)).await.is_err() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let request = tokio::spawn(local_checkpoint(runtime.temp.path().join("rrt.sock")));
+    let id = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(id) = client
+                .status(&record(2))
+                .await
+                .unwrap()
+                .requested_checkpoint
+            {
+                break id;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    client
+        .finish_checkpoint(&record(2), &id, Some("test rejection".into()))
+        .await
+        .unwrap();
+    assert!(request.await.unwrap().starts_with("HTTP/1.1 503"));
 }

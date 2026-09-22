@@ -264,3 +264,83 @@ async fn clone_handoff_rebinds_identity_and_rejects_source_requests() {
         .await
         .is_err());
 }
+
+#[tokio::test]
+async fn workload_checkpoint_waits_for_handoff_and_durable_completion() {
+    use adx_core::runtime::FinishWorkloadCheckpoint;
+    let (tx, rx) = oneshot::channel();
+    let control = Controller::new(
+        identity(),
+        Arc::new(Hooks {
+            read: Mutex::new(Some(rx)),
+            opens: AtomicUsize::new(0),
+        }),
+    )
+    .unwrap();
+    let pending = {
+        let control = control.clone();
+        tokio::spawn(async move { control.request_checkpoint("local-a".into()).await })
+    };
+    tokio::task::yield_now().await;
+    assert_eq!(
+        control.status().requested_checkpoint.as_deref(),
+        Some("local-a")
+    );
+    assert!(control.request_checkpoint("local-b".into()).await.is_err());
+    let finish = FinishWorkloadCheckpoint {
+        identity: identity(),
+        operation_id: "local-a".into(),
+        error: None,
+    };
+    assert!(control.finish_checkpoint(finish.clone()).is_err());
+    control
+        .prepare(PrepareCheckpoint {
+            identity: identity(),
+            operation_id: "local-a".into(),
+            expected_revision: control.status().revision,
+        })
+        .await
+        .unwrap();
+    tx.send(HandoffOutcome::Resume).unwrap();
+    let mut changes = control.subscribe();
+    while control.status().phase != RuntimePhase::Running {
+        changes.changed().await.unwrap();
+    }
+    assert!(
+        !pending.is_finished(),
+        "handoff alone is not persistence acknowledgement"
+    );
+    control.finish_checkpoint(finish.clone()).unwrap();
+    pending.await.unwrap().unwrap();
+    control.finish_checkpoint(finish).unwrap();
+    assert!(control.status().requested_checkpoint.is_none());
+}
+
+#[tokio::test]
+async fn restored_runtime_discards_workload_request() {
+    let (tx, rx) = oneshot::channel();
+    let control = Controller::new(
+        identity(),
+        Arc::new(Hooks {
+            read: Mutex::new(Some(rx)),
+            opens: AtomicUsize::new(0),
+        }),
+    )
+    .unwrap();
+    let pending = {
+        let control = control.clone();
+        tokio::spawn(async move { control.request_checkpoint("source".into()).await })
+    };
+    tokio::task::yield_now().await;
+    control
+        .prepare(PrepareCheckpoint {
+            identity: identity(),
+            operation_id: "source".into(),
+            expected_revision: control.status().revision,
+        })
+        .await
+        .unwrap();
+    tx.send(HandoffOutcome::Restore).unwrap();
+    assert!(pending.await.unwrap().is_err());
+    assert!(control.status().requested_checkpoint.is_none());
+}

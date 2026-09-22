@@ -16,3 +16,10 @@ Checkpoint restore validates the new execution identity, refreshes child environ
 RRT no longer compiles protobuf or connects to POSIX/RuntimeRPC services. User operations and control status use HTTP. Checkpoint artifact persistence and Capsule lifecycle remain Node Manager responsibilities.
 
 Run `cargo test --locked -p rrt-daemon`. `control_http.rs` starts the real runtime and uses the Node Manager HTTP client with a FIFO handoff fixture. It covers protocol/recovery behavior; it does not execute a real sandboxd checkpoint.
+
+With checkpoint storage configured, Node Manager enables the workload-local
+`POST /checkpoint` Unix HTTP listener at `/run/adx/rrt.sock`. Override its directory
+with `rrt_env.ADX_RRT_CONTROL_SOCKET_PATH` (AKernel uses `/run/akernel`). This keeps
+the runtime running and produces a lifecycle-bound local recovery point for
+reload/failover. A success response requires backend handoff and Node Manager's
+persistent result acknowledgement. See the [runtime control contract](../../api/http/runtime-control.md#workload-local-checkpoint).

@@ -418,7 +418,7 @@ async fn handle_one_request(
 
 async fn control_response(method: &str, path: &str, body: &[u8]) -> CachedResponse {
     use adx_core::{
-        runtime::{AbortCheckpoint, PrepareCheckpoint},
+        runtime::{AbortCheckpoint, FinishWorkloadCheckpoint, PrepareCheckpoint},
         Error,
     };
     let Some(controller) = super::control::current() else {
@@ -429,6 +429,12 @@ async fn control_response(method: &str, path: &str, body: &[u8]) -> CachedRespon
     };
     let result = match (method, path) {
         ("GET", "/control/v1/status") => Ok(controller.status()),
+        ("POST", "/control/v1/checkpoint/finish") => {
+            match serde_json::from_slice::<FinishWorkloadCheckpoint>(body) {
+                Ok(request) => controller.finish_checkpoint(request),
+                Err(error) => Err(Error::Invalid(error.to_string())),
+            }
+        }
         ("POST", "/control/v1/checkpoint/prepare") => {
             match serde_json::from_slice::<PrepareCheckpoint>(body) {
                 Ok(request) => controller.prepare(request).await,

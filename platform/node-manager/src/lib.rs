@@ -67,6 +67,17 @@ pub trait RuntimeDriver: Send + Sync {
     ) -> Result<()> {
         Err(Error::Invalid("runtime does not support checkpoint".into()))
     }
+    /// Capture a local recovery point while keeping the same execution alive.
+    async fn checkpoint_running(
+        &self,
+        _runtime_id: &str,
+        _path: &std::path::Path,
+        _timeout: Duration,
+    ) -> Result<()> {
+        Err(Error::Invalid(
+            "runtime does not support running checkpoint".into(),
+        ))
+    }
     async fn restore(
         &self,
         _spec: &CapsuleSpec,
