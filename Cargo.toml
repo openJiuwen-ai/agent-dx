@@ -3,7 +3,7 @@ resolver = "2"
 members = [
     "agent/crates/core",
     "agent/crates/store",
-    "agent/dispatcher",
+    "agent/activator",
     "agent/api",
     "gateway/api-server",
     "gateway",

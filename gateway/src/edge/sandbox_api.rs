@@ -1,7 +1,5 @@
 //! General Sandbox capability adapter. Platform remains the lifecycle authority.
 //! Agent callers and external Sandbox requests share this exact implementation.
-use super::DataPlaneL4Connector;
-use crate::common::protocol::ConnectTarget;
 use adx_agent_core::sandbox::*;
 use adx_agent_core::{
     limits,
@@ -13,7 +11,6 @@ use adx_transport::tls::TlsFiles;
 use async_trait::async_trait;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
-use hyper_util::rt::TokioIo;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
@@ -21,8 +18,6 @@ use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 
 type Result<T> = std::result::Result<T, SandboxError>;
 const EXECUTION_HASH: &str = "ADX_AGENT_EXECUTION_HASH";
-const SERVICE_PORTS: &str = "ADX_AGENT_SERVICE_PORTS";
-const HAS_ENTRYPOINT: &str = "ADX_AGENT_HAS_ENTRYPOINT";
 pub const PATH: &str = "/api/sandbox/v2/instances";
 
 #[derive(Debug, Clone, Deserialize)]
@@ -42,7 +37,7 @@ pub struct PreinstalledProfile {
 pub struct SandboxConfig {
     pub redis_url: String,
     pub platform_namespace: String,
-    /// Must carry the existing Platform Frontend role, not the Edge role certificate.
+    /// Must carry the existing Platform API Server role, not the Edge role certificate.
     pub frontend_tls: TlsFiles,
     pub rpc_timeout_seconds: u64,
     pub preinstalled_profiles: Vec<PreinstalledProfile>,
@@ -52,7 +47,6 @@ pub struct PlatformSandbox {
     discovery: RedisDiscovery,
     tls: ClientTlsConfig,
     timeout: Duration,
-    connector: DataPlaneL4Connector,
     profiles: Vec<PreinstalledProfile>,
     rrt_token: String,
     master: tokio::sync::Mutex<Option<Channel>>,
@@ -60,7 +54,6 @@ pub struct PlatformSandbox {
 impl PlatformSandbox {
     pub fn new(
         config: SandboxConfig,
-        connector: DataPlaneL4Connector,
         rrt_token: String,
     ) -> std::result::Result<Self, Box<dyn std::error::Error>> {
         if config.rpc_timeout_seconds == 0 || config.rpc_timeout_seconds > 60 {
@@ -74,7 +67,6 @@ impl PlatformSandbox {
             discovery: RedisDiscovery::new(&config.redis_url, &config.platform_namespace, timeout)?,
             tls,
             timeout,
-            connector,
             profiles: config.preinstalled_profiles,
             rrt_token,
             master: tokio::sync::Mutex::new(None),
@@ -133,170 +125,37 @@ impl PlatformSandbox {
             }
         }
     }
-    async fn observation(
-        &self,
-        record: pb::CapsuleRecord,
-        node_proxy: &str,
-    ) -> Result<SandboxObservation> {
+    fn observation(record: pb::CapsuleRecord) -> Result<SandboxObservation> {
         let spec = record.spec.as_ref().ok_or_else(|| {
             SandboxError::Unavailable("Platform returned no specification".into())
         })?;
-        let mut result = SandboxObservation {
+        let phase = match pb::CapsuleState::try_from(record.state).ok() {
+            Some(pb::CapsuleState::Running) => SandboxPhase::Running,
+            Some(pb::CapsuleState::Deleted) => SandboxPhase::Deleted,
+            Some(pb::CapsuleState::Failed) => SandboxPhase::Failed,
+            Some(pb::CapsuleState::Pending | pb::CapsuleState::Starting) => SandboxPhase::Creating,
+            _ => {
+                return Err(SandboxError::Unavailable(
+                    "Sandbox is not routable; inspect Platform lifecycle state".into(),
+                ))
+            }
+        };
+        Ok(SandboxObservation {
             id: spec.id.clone(),
             tenant: spec.tenant_id.clone(),
-            phase: match pb::CapsuleState::try_from(record.state).ok() {
-                Some(pb::CapsuleState::Running) => SandboxPhase::Running,
-                Some(pb::CapsuleState::Deleted) => SandboxPhase::Deleted,
-                Some(pb::CapsuleState::Failed) => SandboxPhase::Failed,
-                _ => SandboxPhase::Creating,
-            },
-            ready: false,
+            phase,
+            // ADX currently assumes Platform Running means service-ready. The current Platform
+            // contract only guarantees runtime allocation/IP; readiness is a Platform gap.
+            ready: phase == SandboxPhase::Running,
             runtime_id: record
                 .runtime
-                .as_ref()
-                .filter(|runtime| !runtime.id.is_empty())
-                .map(|runtime| runtime.id.clone()),
+                .map(|runtime| runtime.id)
+                .filter(|id| !id.is_empty()),
             message: None,
-        };
-        if result.phase != SandboxPhase::Running {
-            return Ok(result);
-        }
-        match tokio::time::timeout(self.timeout, self.runtime_ready(&record, node_proxy)).await {
-            Ok(Ok(true)) => result.ready = true,
-            Ok(Ok(false)) => {
-                result.message = Some("waiting for RRT or declared service ports".into())
-            }
-            Ok(Err(error)) => {
-                result.phase = SandboxPhase::Failed;
-                result.message = Some(error);
-            }
-            Err(_) => result.message = Some("runtime readiness observation timed out".into()),
-        }
-        Ok(result)
-    }
-    async fn runtime_ready(
-        &self,
-        record: &pb::CapsuleRecord,
-        node_proxy: &str,
-    ) -> std::result::Result<bool, String> {
-        let spec = record.spec.as_ref().ok_or("missing specification")?;
-        let port = spec
-            .env
-            .get("RRT_HTTP_PORT")
-            .and_then(|p| p.parse::<u16>().ok())
-            .filter(|p| *p != 0)
-            .ok_or("RRT readiness metadata missing")?;
-        let entrypoint = spec
-            .env
-            .get(HAS_ENTRYPOINT)
-            .ok_or("entrypoint metadata missing")?
-            == "true";
-        let response = match self
-            .runtime_request(record, node_proxy, port, entrypoint)
-            .await
-        {
-            Ok(value) => value,
-            Err(_) => return Ok(false), // Transport absence during startup is not a confirmed process failure.
-        };
-        if entrypoint {
-            match response.get("status").and_then(|v| v.as_str()) {
-                Some("running") => (),
-                Some("error") => {
-                    return Err(response
-                        .get("message")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("RRT entrypoint error")
-                        .into())
-                }
-                _ => return Err(format!("RRT entrypoint is not running: {}", response)),
-            }
-        } else if response.get("status").and_then(|v| v.as_str()) != Some("ok") {
-            return Ok(false);
-        }
-        let ports: Vec<u16> = serde_json::from_str(
-            spec.env
-                .get(SERVICE_PORTS)
-                .ok_or("service metadata missing")?,
-        )
-        .map_err(|_| "invalid service metadata")?;
-        for port in ports {
-            let (_stop, cancelled) = tokio::sync::watch::channel(false);
-            let target = connect_target(record, port).map_err(|e| e.to_string())?;
-            if self
-                .connector
-                .connect_stream_with_activity(node_proxy, &target, cancelled, true)
-                .await
-                .is_err()
-            {
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    }
-    async fn runtime_request(
-        &self,
-        record: &pb::CapsuleRecord,
-        node_proxy: &str,
-        port: u16,
-        entrypoint: bool,
-    ) -> Result<serde_json::Value> {
-        let (_stop, cancelled) = tokio::sync::watch::channel(false);
-        let target = connect_target(record, port)?;
-        let stream = self
-            .connector
-            .connect_stream_with_activity(node_proxy, &target, cancelled, true)
-            .await
-            .map_err(|_| SandboxError::Unavailable("RRT stream unavailable".into()))?;
-        let (mut client, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
-            .await
-            .map_err(|_| SandboxError::Unavailable("RRT HTTP handshake failed".into()))?;
-        let task = tokio::spawn(async move {
-            let _ = connection.await;
-        });
-        struct Abort(tokio::task::JoinHandle<()>);
-        impl Drop for Abort {
-            fn drop(&mut self) {
-                self.0.abort();
-            }
-        }
-        let _guard = Abort(task);
-        let mut request = http::Request::builder()
-            .method(if entrypoint { "POST" } else { "GET" })
-            .uri(if entrypoint { "/invoke" } else { "/healthz" })
-            .header("host", "rrt")
-            .header("content-type", "application/json");
-        if entrypoint {
-            let token = record
-                .spec
-                .as_ref()
-                .and_then(|s| s.env.get("RRT_HTTP_TOKEN"))
-                .ok_or_else(|| SandboxError::Unavailable("RRT token missing".into()))?;
-            request = request.header("x-auth", token);
-        }
-        let body = if entrypoint {
-            Bytes::from_static(b"{\"action\":\"entrypoint.poll\",\"args\":{\"wait_timeout\":0}}")
-        } else {
-            Bytes::new()
-        };
-        let request = request
-            .body(Full::new(body))
-            .map_err(|_| SandboxError::Unavailable("RRT request encoding failed".into()))?;
-        let response = client
-            .send_request(request)
-            .await
-            .map_err(|_| SandboxError::Unavailable("RRT request failed".into()))?;
-        if response.status() != http::StatusCode::OK {
-            return Err(SandboxError::Unavailable("RRT status unavailable".into()));
-        }
-        let body = http_body_util::Limited::new(response.into_body(), limits::RRT_RESPONSE_BYTES)
-            .collect()
-            .await
-            .map_err(|_| SandboxError::Unavailable("RRT response invalid or too large".into()))?
-            .to_bytes();
-        serde_json::from_slice(&body)
-            .map_err(|_| SandboxError::Unavailable("invalid RRT status JSON".into()))
+        })
     }
 }
+
 fn caller(tenant: &str) -> pb::CallerContext {
     pb::CallerContext {
         tenant_id: tenant.into(),
@@ -330,33 +189,6 @@ fn validate_record(record: Option<&pb::CapsuleRecord>, tenant: &str, id: &str) -
         ));
     }
     Ok(())
-}
-fn connect_target(record: &pb::CapsuleRecord, port: u16) -> Result<ConnectTarget> {
-    let spec = record
-        .spec
-        .as_ref()
-        .ok_or_else(|| SandboxError::Unavailable("missing specification".into()))?;
-    let assignment = record
-        .assignment
-        .as_ref()
-        .ok_or_else(|| SandboxError::Unavailable("missing assignment".into()))?;
-    let runtime = record
-        .runtime
-        .as_ref()
-        .ok_or_else(|| SandboxError::Unavailable("missing runtime".into()))?;
-    if !adx_protocol::valid_runtime_id(&spec.id, assignment.generation, &runtime.id) {
-        return Err(SandboxError::Unavailable("invalid runtime identity".into()));
-    }
-    Ok(ConnectTarget {
-        instance_id: spec.id.clone(),
-        workload_id: runtime.id.clone(),
-        target_ip: runtime
-            .ip
-            .parse()
-            .map_err(|_| SandboxError::Unavailable("runtime address unavailable".into()))?,
-        target_port: port,
-        request_id: uuid::Uuid::new_v4().to_string(),
-    })
 }
 fn transient(status: &tonic::Status) -> bool {
     matches!(
@@ -457,21 +289,6 @@ fn to_platform(
     }
     env.insert("RRT_HTTP_TOKEN".into(), rrt_token.into());
     env.insert("RRT_HTTP_PORT".into(), profile.rrt_port.to_string());
-    env.insert(
-        HAS_ENTRYPOINT.into(),
-        (!execution.entrypoint.is_empty()).to_string(),
-    );
-    let ports: Vec<_> = execution
-        .service
-        .iter()
-        .map(|s| s.port)
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    env.insert(
-        SERVICE_PORTS.into(),
-        serde_json::to_string(&ports).expect("ports serialization"),
-    );
     let hash = Sha256::digest(serde_json::to_vec(execution).expect("execution serialization"));
     env.insert(EXECUTION_HASH.into(), format!("{hash:x}"));
     Ok(pb::CapsuleSpec {
@@ -514,17 +331,7 @@ impl Sandbox for PlatformSandbox {
             Ok(response) => {
                 let response = response.into_inner();
                 validate_record(response.record.as_ref(), &request.tenant, &request.id)?;
-                // Read the current assignment and proxy address; a failed observation never repeats create.
-                self.get(&request.tenant, &request.id)
-                    .await
-                    .map_err(|_| {
-                        SandboxError::OutcomeUnknown(
-                            "create accepted but current Sandbox state is unavailable".into(),
-                        )
-                    })?
-                    .ok_or_else(|| {
-                        SandboxError::OutcomeUnknown("created Sandbox not yet queryable".into())
-                    })
+                Self::observation(response.record.expect("validated record"))
             }
             Err(status) => {
                 if transient(&status) {
@@ -538,18 +345,13 @@ impl Sandbox for PlatformSandbox {
         let Some(response) = self.inspect(tenant, id).await? else {
             return Ok(None);
         };
-        self.observation(
-            response.record.expect("validated record"),
-            &response.node_proxy_address,
-        )
-        .await
-        .map(Some)
+        Self::observation(response.record.expect("validated record")).map(Some)
     }
     async fn delete(&self, tenant: &str, id: &str) -> Result<SandboxObservation> {
         let response=self.inspect(tenant,id).await?.ok_or_else(||SandboxError::OutcomeUnknown("Sandbox is absent; Platform provides no tombstone for a never-observed create, so deletion is not confirmed".into()))?;
         let record = response.record.expect("validated record");
         if record.state == pb::CapsuleState::Deleted as i32 {
-            return self.observation(record, &response.node_proxy_address).await;
+            return Self::observation(record);
         }
         let assignment = record
             .assignment
@@ -578,7 +380,7 @@ impl Sandbox for PlatformSandbox {
                 "deletion not yet published by Platform".into(),
             ));
         }
-        self.observation(record, &response.node_proxy_address).await
+        Self::observation(record)
     }
 }
 
@@ -739,6 +541,7 @@ fn json_response<T: serde::Serialize>(
 mod tests {
     use super::*;
     use adx_agent_core::{Protocol, Resources, Service};
+    use hyper_util::rt::TokioIo;
     #[test]
     fn platform_authorization_errors_preserve_tenant_privacy_and_write_uncertainty() {
         for write in [false, true] {
@@ -818,8 +621,6 @@ mod tests {
             mapped.env["ADX_IMAGE_PROCESS_CONFIG"],
             "/etc/adx/start.json"
         );
-        assert_eq!(mapped.env[SERVICE_PORTS], "[8080]");
-        assert_eq!(mapped.env[HAS_ENTRYPOINT], "true");
         let mut other = request.clone();
         other.execution.service.push(Service {
             protocol: Protocol::Ssh,
@@ -829,8 +630,6 @@ mod tests {
             mapped.env[EXECUTION_HASH],
             to_platform(&other, &[profile()], "test-token").unwrap().env[EXECUTION_HASH]
         );
-        assert!(mapped.scheduling.is_none());
-        assert!(mapped.lifecycle.is_none());
     }
     #[test]
     fn startup_intent_cannot_be_silently_replaced_by_a_preset() {
@@ -928,7 +727,34 @@ mod tests {
         ));
     }
     #[test]
-    fn response_identity_and_generation_are_checked() {
+    fn platform_state_controls_sandbox_availability() {
+        for (state, ready, phase) in [
+            (pb::CapsuleState::Running, true, SandboxPhase::Running),
+            (pb::CapsuleState::Starting, false, SandboxPhase::Creating),
+            (pb::CapsuleState::Failed, false, SandboxPhase::Failed),
+            (pb::CapsuleState::Deleted, false, SandboxPhase::Deleted),
+        ] {
+            let record = pb::CapsuleRecord {
+                spec: Some(to_platform(&request(), &[profile()], "token").unwrap()),
+                state: state as i32,
+                ..Default::default()
+            };
+            let observed = PlatformSandbox::observation(record).unwrap();
+            assert_eq!(observed.phase, phase);
+            assert_eq!(observed.ready, ready);
+        }
+        let paused = pb::CapsuleRecord {
+            spec: Some(to_platform(&request(), &[profile()], "token").unwrap()),
+            state: pb::CapsuleState::Paused as i32,
+            ..Default::default()
+        };
+        assert!(matches!(
+            PlatformSandbox::observation(paused),
+            Err(SandboxError::Unavailable(_))
+        ));
+    }
+    #[test]
+    fn response_identity_matches_the_requested_tenant_and_sandbox() {
         let mut record = pb::CapsuleRecord {
             spec: Some(to_platform(&request(), &[profile()], "token").unwrap()),
             assignment: Some(pb::Assignment {
@@ -946,12 +772,8 @@ mod tests {
         };
         validate_record(Some(&record), "tenant", "sandbox-id").unwrap();
         assert!(validate_record(Some(&record), "another-tenant", "sandbox-id").is_err());
-        assert_eq!(
-            connect_target(&record, 8080).unwrap().workload_id,
-            "sandbox-id-1"
-        );
-        record.runtime.as_mut().unwrap().id = "sandbox-id-2".into();
-        assert!(connect_target(&record, 8080).is_err());
+        record.assignment.as_mut().unwrap().capsule_id = "wrong-id".into();
+        assert!(validate_record(Some(&record), "tenant", "sandbox-id").is_err());
     }
     struct Fake;
     #[async_trait]

@@ -16,124 +16,113 @@ fn create(key: Key, value: serde_json::Value) -> Transaction {
 }
 
 async fn contracts(a: &dyn Repository, b: &dyn Repository) {
-    let instance = Key::new("instance", &["tenant", "i"]).unwrap();
-    let affinity = Key::new("affinity", &["tenant", "ctx", "s"]).unwrap();
-    let session = Key::new("session", &["tenant", "ctx"]).unwrap();
+    let template = Key::new("template", &["tenant", "i"]).unwrap();
+    let environment = Key::new("environment", &["tenant", "ctx", "s"]).unwrap();
+    let another_environment = Key::new("environment", &["tenant", "ctx"]).unwrap();
     assert!(a
         .commit(&create(
-            instance.clone(),
+            template.clone(),
             json!({"phase":"ready","large":u64::MAX})
         ))
         .await
         .unwrap());
-    let before = a.get(&instance).await.unwrap().unwrap();
-    let bind = |id: &str| {
+    let before = a.get(&template).await.unwrap().unwrap();
+    let insert = |id: &str| {
         Transaction::new(
             vec![
                 Check {
-                    key: instance.clone(),
+                    key: template.clone(),
                     expected: Some(before.revision.clone()),
                 },
                 Check {
-                    key: affinity.clone(),
+                    key: environment.clone(),
                     expected: None,
                 },
             ],
             vec![Put {
-                key: affinity.clone(),
-                record: Record::new(&json!({"instance":id})).unwrap(),
+                key: environment.clone(),
+                record: Record::new(&json!({"template":id})).unwrap(),
             }],
         )
         .unwrap()
     };
-    let left = bind("left");
-    let right = bind("right");
+    let left = insert("left");
+    let right = insert("right");
     let (x, y) = tokio::join!(a.commit(&left), b.commit(&right));
     assert_ne!(x.unwrap(), y.unwrap());
     assert_eq!(
-        a.get(&affinity).await.unwrap(),
-        b.get(&affinity).await.unwrap()
+        a.get(&environment).await.unwrap(),
+        b.get(&environment).await.unwrap()
     );
     assert_eq!(
-        a.get(&instance).await.unwrap().unwrap().value["large"],
+        a.get(&template).await.unwrap().unwrap().value["large"],
         json!(u64::MAX)
     );
 
     let deleting = Record::new(&json!({"phase":"deleting"})).unwrap();
     let tx = Transaction::new(
         vec![Check {
-            key: instance.clone(),
+            key: template.clone(),
             expected: Some(before.revision.clone()),
         }],
         vec![Put {
-            key: instance.clone(),
+            key: template.clone(),
             record: deleting,
         }],
     )
     .unwrap();
     assert!(a.commit(&tx).await.unwrap());
-    // A stale candidate revision must prevent ALL writes, including a new Session record.
+    // A stale candidate revision must prevent ALL writes, including a new Environment record.
     let stale = Transaction::new(
         vec![
             Check {
-                key: instance,
+                key: template,
                 expected: Some(before.revision),
             },
             Check {
-                key: session.clone(),
+                key: another_environment.clone(),
                 expected: None,
             },
         ],
         vec![Put {
-            key: session.clone(),
+            key: another_environment.clone(),
             record: Record::new(&json!({"phase":"active"})).unwrap(),
         }],
     )
     .unwrap();
     assert!(!b.commit(&stale).await.unwrap());
-    assert!(a.get(&session).await.unwrap().is_none());
-    let mut cursor = 0;
-    let mut found = false;
-    loop {
-        let page = a.scan("affinity", cursor, 1).await.unwrap();
-        found |= page.keys.contains(&affinity);
-        cursor = page.cursor;
-        if cursor == 0 {
-            break;
-        }
-    }
-    assert!(found);
-    let prior = a.get(&affinity).await.unwrap().unwrap();
+    assert!(a.get(&another_environment).await.unwrap().is_none());
+    let prior = a.get(&environment).await.unwrap().unwrap();
     let removal = Transaction::with_deletes(
         vec![Check {
-            key: affinity.clone(),
+            key: environment.clone(),
             expected: Some(prior.revision.clone()),
         }],
         vec![],
-        vec![affinity.clone()],
+        vec![environment.clone()],
     )
     .unwrap();
     assert!(b.commit(&removal).await.unwrap());
-    assert!(a.get(&affinity).await.unwrap().is_none());
+    assert!(a.get(&environment).await.unwrap().is_none());
     assert!(a
         .commit(&create(
-            affinity.clone(),
-            json!({"instance":"new-lifecycle"})
+            environment.clone(),
+            json!({"template":"new-lifecycle"})
         ))
         .await
         .unwrap());
     assert!(!b.commit(&removal).await.unwrap());
     assert_eq!(
-        a.get(&affinity).await.unwrap().unwrap().value["instance"],
+        a.get(&environment).await.unwrap().unwrap().value["template"],
         "new-lifecycle"
     );
     assert!(Transaction::with_deletes(
         vec![Check {
-            key: affinity.clone(),
+            key: environment.clone(),
             expected: None
         }],
         vec![],
-        vec![affinity]
+        vec![environment]
     )
     .is_err());
 }
@@ -161,12 +150,16 @@ async fn two_independent_redis_clients() {
     let other = RedisRepository::connect(&url, &format!("{namespace}-other"), timeout)
         .await
         .unwrap();
-    assert!(other.scan("instance", 0, 10).await.unwrap().keys.is_empty());
+    assert!(other
+        .get(&Key::new("template", &["tenant", "i"]).unwrap())
+        .await
+        .unwrap()
+        .is_none());
 }
 
 #[test]
 fn writes_require_unique_checks_and_fresh_revisions() {
-    let key = Key::new("instance", &["t", "i"]).unwrap();
+    let key = Key::new("template", &["t", "i"]).unwrap();
     let record = Record::new(&json!({})).unwrap();
     assert!(Transaction::new(
         vec![Check {
@@ -212,7 +205,7 @@ async fn concurrent_namespace_initialization_preserves_current_state() {
     let ns = format!("initialize-{}", uuid::Uuid::new_v4());
     let client = redis::Client::open(url.clone()).unwrap();
     let mut connection = client.get_multiplexed_async_connection().await.unwrap();
-    let key = format!("adx:v2:{ns}:instance:seed");
+    let key = format!("adx:v2:{ns}:template:seed");
     redis::cmd("SET")
         .arg(&key)
         .arg("preserved")
@@ -236,5 +229,5 @@ async fn concurrent_namespace_initialization_preserves_current_state() {
         .query_async(&mut connection)
         .await
         .unwrap();
-    assert_eq!(marker, "session-affinity");
+    assert_eq!(marker, "environment-v1");
 }

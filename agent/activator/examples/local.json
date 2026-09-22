@@ -1,0 +1,9 @@
+{
+  "listen": "127.0.0.1:8091",
+  "redis_url": "redis://127.0.0.1:6379/0",
+  "namespace": "adx-environment-local",
+  "sandbox_url": "http://127.0.0.1:8080",
+  "allow_plaintext_transport": true,
+  "sandbox_ca_file": null,
+  "request_timeout_seconds": 60
+}

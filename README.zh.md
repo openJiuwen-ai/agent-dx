@@ -6,7 +6,7 @@
 
 <p align="center"><a href="README.md">English</a> | <strong>中文</strong></p>
 
-Agent DX（**Agent Distributed eXecutor**）是 openJiuwen Agent Runtime 的一种分布式执行底座，用于承载 Agent 注册、调用、会话管理等开发者工具。同时提供公开 Sandbox API 与 SDK、分布式调度、隔离执行、流量路由、运行时操作、Checkpoint 恢复与部署工具，并保持执行后端可替换。
+Agent DX（**Agent Distributed eXecutor**）是 openJiuwen Agent Runtime 的一种分布式执行底座，Agent 层提供 Template 与 Environment 管理，由无状态 Activator 按需启动用户 Harness，支持 HTTP、WebSocket 和 SSH 访问。同时提供公开 Sandbox API 与 SDK、分布式调度、隔离执行、流量路由、运行时操作、Checkpoint 恢复与部署工具，并保持执行后端可替换。
 
 <p align="center">
   <a href="#-快速开始">🚀 快速开始</a> ·
@@ -127,6 +127,7 @@ ADX 将稳定逻辑身份与可替换物理执行分开：
 
 | 抽象 | 含义与边界 |
 |---|---|
+| `Environment` | Agent 执行上下文，与稳定逻辑 Sandbox 1:1 绑定，由无状态 Activator 管理 |
 | `Sandbox` | 面向应用的公开 API 与 SDK 句柄 |
 | `Capsule` | 稳定内部身份，包含租户、规格、生命周期和期望／实际状态 |
 | `Runtime` | Capsule 在一个节点上的一次 sandboxd 执行；重启或恢复可替换 Runtime |
