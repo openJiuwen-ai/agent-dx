@@ -1,17 +1,34 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=77.0.3"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "adx-sandbox"
 version = "0.1.0"
 description = "Python SDK for Agent DX sandboxes with RRT HTTP and reverse-tunnel transport"
+readme = "README.md"
 requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 dependencies = [
     "httpx>=0.24",
     "idna>=3,<4",
     "websockets>=13.0",
 ]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+
+[project.urls]
+Repository = "https://gitcode.com/openJiuwen/agent-dx"
+Documentation = "https://gitcode.com/openJiuwen/agent-dx/blob/refactor/platform/sdk/sandbox/python/README.md"
 
 [project.scripts]
 adx-sandbox = "adx_sandbox.cli:main"

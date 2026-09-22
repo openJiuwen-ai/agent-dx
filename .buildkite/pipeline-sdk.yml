@@ -77,3 +77,57 @@ steps:
           - name: OBS_SECRET_ACCESS_KEY
             valueFrom:
               secretKeyRef: {name: obs-credentials, key: SK, optional: false}
+
+- label: ':pypi: Publish ADX Sandbox SDK'
+  key: sdk-pypi
+  depends_on: sdk-package
+  if: build.env("ADX_SDK_PYPI_UPLOAD") == "1" && build.tag != null
+  agents:
+    queue: default
+    os: linux
+    arch: amd64
+  concurrency: 1
+  concurrency_group: adx/sdk-pypi
+  command: bash .buildkite/step.sh sdk-pypi bash .buildkite/publish-sdk-pypi.sh
+  timeout_in_minutes: 15
+  artifact_paths:
+  - out/buildkite/sdk-publish/**/*
+  - out/buildkite/logs/step-sdk-pypi.log
+  env:
+    BUILDKITE_AGENT_NAME: agent-stack-k8s
+    PIP_CACHE_DIR: /mnt/paas/build-cache/adx/pip
+  plugins:
+  - kubernetes:
+      podSpec:
+        imagePullSecrets:
+        - name: swr-pull-secret
+        containers:
+        - image: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/adx-build@sha256:ad9edff0b7cd2d907648a772109ad516e5da7b7b8762f08fd8653979a1e2cb67
+          volumeMounts:
+          - name: build-cache
+            mountPath: /mnt/paas
+          resources:
+            requests:
+              cpu: '1'
+              memory: 2Gi
+            limits:
+              cpu: '2'
+              memory: 4Gi
+          env:
+          - name: ADX_SANDBOX_PYPI_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: adx-pypi-credentials
+                key: sandbox-pypi-token
+                optional: true
+          - name: ADX_SANDBOX_TEST_PYPI_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: adx-pypi-credentials
+                key: sandbox-testpypi-token
+                optional: true
+        volumes:
+        - name: build-cache
+          hostPath:
+            path: /mnt/paas
+            type: DirectoryOrCreate

@@ -1,11 +1,12 @@
 # ADX Buildkite pipelines
 
-ADX uses three independent Buildkite pipelines backed by one repository:
+ADX uses four independent Buildkite pipelines backed by one repository:
 
 | Buildkite pipeline | Configuration | Responsibility |
 |---|---|---|
 | `agent-dx` | `pipeline-package.yml` | Rust/platform checks, base package and optional OBS publication |
-| `agent-dx-python-sdk` | `pipeline-sdk.yml` | Python SDK tests, wheel/sdist, clean install smoke and optional OBS publication |
+| `agent-dx-python-sdk` | `pipeline-sdk.yml` | Python SDK tests, wheel/sdist, clean install smoke and optional OBS/PyPI publication |
+| `agent-dx-admin` | `pipeline-admin.yml` | `adxadmin` tests, wheel/sdist, clean install smoke and optional PyPI/TestPyPI publication |
 | `agent-dx-full-test` | `pipeline-full.yml` | Compose exact base/SDK candidates and run the ten-group Kubernetes Full gate |
 
 `.buildkite/pipeline.yml` only dispatches by `BUILDKITE_PIPELINE_SLUG`; it does
@@ -22,6 +23,75 @@ The current formal validation used commit
 The optimized base build completed in 3 minutes 30 seconds, compared with
 7 minutes 11 seconds for the previous serial #65 build. Full passed all ten
 groups on two physical workers with no missing checks or cleanup errors.
+The `agent-dx-admin` configuration was added later and is not part of that
+historical three-pipeline validation record.
+
+Create a Buildkite pipeline named `agent-dx-admin` against the same repository
+and keep the default configuration path `.buildkite/pipeline.yml`; the selector
+dispatches that slug to `pipeline-admin.yml`. Set the pipeline default
+`ADX_ADMIN_PYPI_UPLOAD=0`. A release build must be created from the exact
+`adxadmin-v<version>` Git tag and explicitly override the upload variable to
+`1`; set `ADX_ADMIN_PYPI_REPOSITORY=testpypi` for a rehearsal.
+
+## Optional PyPI publication
+
+`admin-package` always runs the `adxadmin` unit and release tests, builds one
+wheel and one sdist with `python -m build`, checks both with Twine, installs the
+wheel in a source-free virtual environment and writes `admin-candidate.json`.
+The candidate records the exact commit, Buildkite build ID and SHA256 of both
+files.
+
+`admin-pypi` is omitted unless the build explicitly sets
+`ADX_ADMIN_PYPI_UPLOAD=1`. It accepts `ADX_ADMIN_PYPI_REPOSITORY=pypi` (the
+default) or `testpypi`, and only publishes a build whose tag exactly matches
+`adxadmin-v<package-version>`. The step consumes the candidate from
+`admin-package`, never rebuilds it, and does not use `--skip-existing`. After
+upload, it reads the selected index JSON API and verifies the exact filenames
+and SHA256 values before writing `out/buildkite/admin-publish/publish.json`.
+
+The existing `sdk-package` step follows the same candidate contract for
+`adx-sandbox`. `sdk-pypi` is omitted unless `ADX_SDK_PYPI_UPLOAD=1` on an exact
+`sdk-v<package-version>` tag. `ADX_SDK_PYPI_REPOSITORY` selects `pypi` (the
+default) or `testpypi`; successful readback is written to
+`out/buildkite/sdk-publish/publish.json`. OBS upload remains independent and is
+still controlled by `ADX_OBS_UPLOAD`.
+
+The Kubernetes execution namespace must contain this Secret:
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: adx-pypi-credentials
+type: Opaque
+stringData:
+  admin-pypi-token: pypi-...
+  admin-testpypi-token: pypi-...
+  sandbox-pypi-token: pypi-...
+  sandbox-testpypi-token: pypi-...
+```
+
+The four entries are optional independently; a selected package and repository
+fails closed when its token is absent. Buildkite passes the selected token as
+`TWINE_PASSWORD`, with username `__token__`; credentials do not enter argv or
+artifacts. Because PyPI does not currently list Buildkite as a Trusted
+Publishing provider, this pipeline uses a project-scoped API token. The first
+upload of a previously nonexistent project may require an account-scoped token;
+rotate it immediately to a project-scoped token after the project exists.
+
+Create or update the Secret from protected local files, avoiding token values
+in shell history or command arguments:
+
+```sh
+umask 077
+# Write each token to the corresponding file without committing the files.
+kubectl -n <buildkite-agent-namespace> create secret generic adx-pypi-credentials \
+  --from-file=admin-pypi-token=/secure/adxadmin-pypi.token \
+  --from-file=admin-testpypi-token=/secure/adxadmin-testpypi.token \
+  --from-file=sandbox-pypi-token=/secure/adx-sandbox-pypi.token \
+  --from-file=sandbox-testpypi-token=/secure/adx-sandbox-testpypi.token \
+  --dry-run=client -o yaml | kubectl apply -f -
+```
 
 ## Deployment
 

@@ -25,6 +25,17 @@ PYTHON=python3.12 bash tools/admin/build.sh out/wheels
 `adxadmin` 独立发布，不进入 Linux 平台包；服务器安装 `adxctl` 不会额外安装 Python
 或管理客户端。
 
+正式发布后可直接从 PyPI 安装：
+
+```sh
+pipx install adxadmin==0.1.0
+```
+
+仓库中的 `agent-dx-admin` Buildkite 流水线始终构建并校验 wheel 与 sdist，但默认不上传。
+只有版本标签与 `pyproject.toml` 完全一致，且构建显式设置
+`ADX_ADMIN_PYPI_UPLOAD=1` 时才会执行 PyPI/TestPyPI 发布。具体变量、Secret 和制品回读
+契约见 [Buildkite 说明](../../.buildkite/README.md#optional-pypi-publication)。
+
 ## 连接配置
 
 生产入口必须使用 HTTPS。私有 CA、管理员 Key 和超时可以通过参数配置：

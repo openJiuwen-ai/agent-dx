@@ -8,5 +8,6 @@ adxadmin key create --tenant team-a
 adxadmin key list --tenant team-a
 ```
 
-See the repository [administration guide](../../docs/deployment/adxadmin.md) for
-connection, credential, output and retry semantics.
+See the
+[administration guide](https://gitcode.com/openJiuwen/agent-dx/blob/refactor/docs/deployment/adxadmin.md)
+for connection, credential, output and retry semantics.
