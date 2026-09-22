@@ -27,7 +27,7 @@ RUST_POLICY_PACKAGES := -p adx-api-server -p adx-deployment -p adx-master \
 	-p adx-node-manager -p adx-core -p adx-discovery -p adx-observability \
 	-p adx-protocol -p adx-scheduling
 
-.PHONY: help cargo-cache-info cargo-cache-env cargo-cache-isolated-env generate build test rust-check rust-test scheduler-bench python-test agent-test sandbox-sdk-test package ci data-plane-gateway data-plane-gateway-dev data-plane-gateway-ut
+.PHONY: help cargo-cache-info cargo-cache-env cargo-cache-isolated-env generate build test rust-check rust-test scheduler-bench python-test agent-test sandbox-sdk-test admin-test package ci data-plane-gateway data-plane-gateway-dev data-plane-gateway-ut
 help:
 	@echo 'generate | build | test | package | ci SUITE=<suite>; tests: rust-check rust-test scheduler-bench python-test; cache: cargo-cache-info cargo-cache-env cargo-cache-isolated-env'
 cargo-cache-info:
@@ -48,17 +48,20 @@ rust-test:
 	$(CARGO) test --locked --workspace --all-features -j $(JOBS) -- --test-threads=$(JOBS)
 scheduler-bench:
 	$(CARGO) test --locked --release -p adx-master --test benchmark -j $(JOBS) -- --ignored --nocapture
-python-test: sandbox-sdk-test
+python-test: sandbox-sdk-test admin-test
 agent-test:
 	$(CARGO) test --locked -p adx-agent-core -p adx-agent-store -p adx-agent-api -p adx-activator --features adx-agent-store/test-memory -j $(JOBS) -- --test-threads=$(JOBS)
 	$(CARGO) test --locked -p data-plane-gateway --features agent-api --lib -j $(JOBS) -- --test-threads=$(JOBS)
 sandbox-sdk-test:
 	PYTHONPATH=platform/sdk/sandbox/python $(PYTHON) -m pytest -q -c platform/sdk/sandbox/pytest.ini platform/sdk/sandbox/python/tests $(PYTEST_ARGS)
+admin-test:
+	PYTHONPATH=tools/admin/src $(PYTHON) -m unittest discover -s tools/admin/tests -p 'test_*.py'
 ci:
 	$(PYTHON) build/ci/run.py $(SUITE) --jobs $(JOBS)
 test: rust-check rust-test python-test
 package:
 	PYTHON='$(PYTHON)' bash platform/sdk/sandbox/python/build.sh '$(OUT)/wheels'
+	PYTHON='$(PYTHON)' bash tools/admin/build.sh '$(OUT)/wheels'
 data-plane-gateway:
 	$(CARGO) build --locked -p data-plane-gateway --all-features --release -j $(JOBS)
 data-plane-gateway-dev:

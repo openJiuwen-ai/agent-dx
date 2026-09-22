@@ -13,6 +13,7 @@ Agent DX（**Agent Distributed eXecutor**）是 openJiuwen Agent Runtime 的一�
   <a href="docs/architecture/repository-layout.md">📐 架构</a> ·
   <a href="platform/sdk/sandbox/python/README.md">📦 Sandbox SDK</a> ·
   <a href="docs/deployment/adxctl.md">⚙️ 部署</a> ·
+  <a href="docs/deployment/adxadmin.md">🔐 管理</a> ·
   <a href="docs/testing/control-plane-ci.md">✅ 测试门禁</a>
 </p>
 
@@ -59,7 +60,7 @@ tar -xzf adx-release.tar.gz -C adx-release
 sudo ./adx-release/install.sh
 ```
 
-安装器校验清单、文件摘要和主机架构，将版本写入 `/opt/adx/releases/<commit>` 并原子切换 `/opt/adx/current`。升级会保留 `/opt/adx/config`、`/opt/adx/data` 和 `/opt/adx/run`，同时通过 `/usr/local/bin/adxctl` 提供可直接使用的 `adxctl` 命令。
+安装器校验清单、文件摘要和主机架构，将版本写入 `/opt/adx/releases/<commit>` 并原子切换 `/opt/adx/current`。升级会保留 `/opt/adx/config`、`/opt/adx/data` 和 `/opt/adx/run`，同时通过 `/usr/local/bin` 提供 `adxctl` 命令。
 
 ## 🔧 快速开始
 
@@ -71,6 +72,18 @@ sudoedit /opt/adx/config/deployment.yaml
 sudo adxctl validate
 sudo adxctl run
 ```
+
+在管理员工作站安装平台无关的 wheel，然后通过公开 HTTPS API 创建首个租户 Key：
+
+```sh
+pipx install ./adxadmin-0.1.0-py3-none-any.whl
+export ADX_ENDPOINT=https://adx.example.com:8443
+export ADX_CA_FILE=$HOME/.config/adx/public-ca.pem
+export ADX_ADMIN_TOKEN_FILE=$HOME/.config/adx/admin.key
+adxadmin key create --tenant example
+```
+
+查询、分页、吊销、JSON 输出和错误语义见 [`adxadmin` 指南](docs/deployment/adxadmin.md)。
 
 在另一终端安装发布包中的 SDK，并连接公开 Gateway：
 
@@ -179,6 +192,7 @@ SDK 发布名为 `adx-sandbox`，Python 导入名为 `adx_sandbox`，CLI 为 `ad
 - [数据面 OpenAPI](platform/api/openapi/data-plane.yaml)
 - [Sandbox Python SDK](platform/sdk/sandbox/python/README.md)
 - [部署配置](docs/deployment/adxctl.md)与[配置示例](build/config/examples/README.md)
+- [远程集群管理](docs/deployment/adxadmin.md)与 [API Key 管理](docs/testing/api-key-management.md)
 - [调度](docs/testing/scheduling-performance.md)、[节点生命周期](docs/testing/node-lifecycle.md)与[路由发布](docs/testing/route-publication.md)
 - [Checkpoint 与快照存储](docs/testing/snapshot-storage.md)
 - [Metrics](docs/testing/capsule-resource-metrics.md)、[日志](docs/testing/log-collection.md)与[分布式 Trace](docs/testing/distributed-traces.md)
