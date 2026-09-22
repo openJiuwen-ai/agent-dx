@@ -22,7 +22,7 @@
 | agent | 原 Agent 测试集 | 日志、JUnit XML |
 | sandbox-sdk | 完整离线 SDK 测试集 | 日志、JUnit XML |
 | interop | SDK → 真实 RRT → 测试 HTTP upstream 的 Socket 互操作 | 构建与进程测试日志 |
-| package | 四个 Python 包生成 wheel 和 sdist | 8 个制品及 SHA256 |
+| package | Python SDK 与 `adxadmin` 分别生成 wheel 和 sdist | 安装包及 SHA256 |
 
 Socket 测试只覆盖部分数据链路；Agent 测试包含外部运行时桩。上述结果属于本地组件/协作验证，完整平台验收遵循下面的 E2E 契约。
 

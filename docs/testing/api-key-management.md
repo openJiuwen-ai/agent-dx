@@ -10,6 +10,11 @@ Master 在 Redis 中保存密钥 SHA256 摘要、租户及可选到期时间。�
 
 所有管理接口要求管理员身份，且响应设为 `Cache-Control: no-store`。租户不能创建、查询或吊销密钥；请求中的 `administrator` 等未知字段被拒绝。内部 `CredentialService` 仅接受 mTLS 验证的 API Server，并再次检查管理员上下文。Edge 只能调用密钥验证服务。
 
+面向管理员的 [`adxadmin`](../deployment/adxadmin.md) 已封装上述三个 HTTP 接口。它从
+`0600` Key 文件读取管理员凭证，只连接公开 HTTPS 入口，创建密钥时默认写入新的
+标准输出，也可通过 `--output-file` 写入新的 `0600` 文件；创建请求不自动重试。
+`adxctl` 继续只负责本机部署与进程监督。
+
 ## 持久化和失联
 
 - 明文使用两个随机 UUID v4 拼接并添加 `adx_` 前缀，仅存在于创建响应中，Redis 不保存明文。创建调用不自动重试；如果响应丢失，可按租户查询并吊销不再需要的记录，再创建新密钥。

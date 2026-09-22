@@ -14,6 +14,9 @@ python3 -u -m unittest discover -s build/e2e/tests -v \
 echo "--- :test_tube: Release tooling tests"
 python3 -u -m unittest discover -s build/release/tests -v \
   2>&1 | tee out/buildkite/logs/release-tests.log
+echo "--- :key: adxadmin tests"
+PYTHONPATH=tools/admin/src python3 -u -m unittest discover -s tools/admin/tests -v \
+  2>&1 | tee out/buildkite/logs/adxadmin-tests.log
 echo "--- :rust: Rust guideline gate"
 make rust-check JOBS="${JOBS:-4}" \
   2>&1 | tee out/buildkite/logs/rust-check.log

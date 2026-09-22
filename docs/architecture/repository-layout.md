@@ -68,6 +68,8 @@ agent-dx/
 │       ├── edge/                  # Agent/Sandbox 适配、路由订阅、认证、连接池、反向代理
 │       ├── node/                  # NodeProxyService、绑定、活动、转发
 │       └── bin/                   # Edge、Node Proxy、forwarder
+├── tools/
+│   └── admin/                     # adxadmin Python wheel；经公开 HTTPS 管理租户 API Key
 ├── third_party/sandboxd/          # 锁定后端协议、来源与许可证
 ├── build/
 │   ├── ci/ / images/              # 本地检查、镜像配方
@@ -132,7 +134,7 @@ Proxy 首次启动关闭 Capsule 准入，Node Manager 完成权威对账与全�
 
 ## 构建、部署和验收
 
-Rust 共用根 Cargo workspace，Python 独立打包；外部 sandboxd 按其锁定版本构建。`adxctl` 是平台运维 CLI，支持 validate/render/run/start/status/stop。统一发布包带控制面、Gateway、静态 RRT、Sandbox SDK、EROFS 运行环境和锁定 Redis；可选择外部 Redis，sandboxd 始终由部署环境托管。运行环境也可使用不可变 OCI image；自定义用户镜像从同一环境只读挂载 `/__adx`。
+Rust 共用根 Cargo workspace，Python 工具独立打包；外部 sandboxd 按其锁定版本构建。`adxctl` 是平台运维 CLI，支持 validate/render/run/start/status/stop；`adxadmin` 是只访问公开 HTTPS API 的平台无关 Python 管理 CLI。统一平台包带控制面、Gateway、`adxctl`、静态 RRT、Sandbox SDK、EROFS 运行环境和锁定 Redis；`adxadmin` 以独立 wheel 发布。平台可选择外部 Redis，sandboxd 始终由部署环境托管。运行环境也可使用不可变 OCI image；自定义用户镜像从同一环境只读挂载 `/__adx`。
 
 普通进程与 Pod 内都使用相同组件和 supervisor。Buildkite 先构建，再发布不可变镜像，最后独立执行 K8s 八组用例及清理。[Buildkite #30](../testing/2026-09-18-runtime-environment-k8s.md) 已验证 Rust API Server、本地优先创建及 OCI default/runtime-only/custom 三种环境路径；两个 Pod 同宿主。本地 FC 与基础 K8s 分开统计，实际未完成项和后置项见 [路线图](../testing/control-plane-roadmap.md)。
 

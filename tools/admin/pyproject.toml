@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "adxadmin"
+version = "0.1.0"
+description = "Remote administration client for Agent DX"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+dependencies = ["httpx>=0.24,<1"]
+
+[project.scripts]
+adxadmin = "adxadmin.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+adxadmin = ["py.typed"]

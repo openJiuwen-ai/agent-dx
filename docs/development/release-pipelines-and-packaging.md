@@ -68,7 +68,7 @@ SBOM 和最终 `release.json` 是目标状态，不能作为当前流水线已�
    - 不执行长时间的集群、故障注入和 checkpoint E2E。
 2. `platform-build-{amd64,arm64}`
    - 使用固定 Rust/Go/Redis 工具链和持久 Cargo/sccache 缓存。
-   - 每个架构只编译一次 ADX 控制面、Gateway 和 `adxctl`。
+   - 每个架构只编译一次 ADX 控制面、Gateway 和 `adxctl`；平台无关的 `adxadmin` wheel 不进入原生编译。
 3. `rrt-build-{amd64,arm64}`
    - 独立构建静态 `rrt-runtime`、本地 EROFS payload 和 RRT OCI 镜像。
    - RRT 镜像只复制已验证二进制，不在 Dockerfile 中重新编译。
@@ -130,7 +130,8 @@ API Server（默认内嵌 Edge）或 Standalone，避免按角色维护多套二
 基础出包的 `source-gate` 负责单元、契约和静态检查，`package-smoke` 负责验证刚生成
 制品的最小真实闭环。它证明基础包可安装、可启动和可完成一次 Capsule 生命周期，
 但不替代 Full 流水线中的公共 SDK、多节点、故障和恢复验收。只有前述门禁通过的
-候选才允许进入 OBS；上传步骤失败时，该候选不具备可发布状态。
+候选才允许进入 OBS；上传步骤失败时，该候选不具备可发布状态。`source-gate` 同时
+运行 `adxadmin` 的快速 HTTP/CLI 契约测试，但管理工具 wheel 仍按独立制品构建。
 
 ## 流水线二：ADX Python SDK Package
 
@@ -281,7 +282,14 @@ Runtime Pack 与平台包分开，是因为 runc 与 Firecracker 的宿主权限
 标准 wheel/sdist 是唯一 SDK 发布物。平台包不再复制一份可能过期的 wheel；离线包
 可以携带 `packages/python/` 下由 `release.json` 指定的 wheel。
 
-### 5. 部署与离线包
+### 5. 管理工具包
+
+`adxadmin` 使用独立版本的纯 Python wheel/sdist，面向管理员工作站而非集群节点。源码
+入口为 `tools/admin/`，`tools/admin/build.sh` 生成
+`adxadmin-<version>-py3-none-any.whl`。平台原生包不包含该工具；离线包可以携带选定
+版本的 wheel。
+
+### 6. 部署与离线包
 
 ```text
 adx-offline-<release-version>-linux-<arch>.tar.zst
@@ -290,6 +298,7 @@ adx-offline-<release-version>-linux-<arch>.tar.zst
 ├── packages/rrt.tar.zst
 ├── packages/runtime-runc.tar.zst
 ├── packages/python/adx_sandbox-*.whl
+├── packages/python/adxadmin-*.whl
 ├── deploy/process/              # YAML profiles、systemd 模板
 ├── deploy/kubernetes/           # Helm chart，仅渲染现有进程/Pod，不增加 Operator
 ├── install.sh

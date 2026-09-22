@@ -13,6 +13,7 @@ Agent DX (**Agent Distributed eXecutor**) is a distributed execution substrate f
   <a href="docs/architecture/repository-layout.md">📐 Architecture</a> ·
   <a href="platform/sdk/sandbox/python/README.md">📦 Sandbox SDK</a> ·
   <a href="docs/deployment/adxctl.md">⚙️ Deployment</a> ·
+  <a href="docs/deployment/adxadmin.md">🔐 Administration</a> ·
   <a href="docs/testing/control-plane-ci.md">✅ Test gates</a>
 </p>
 
@@ -71,6 +72,20 @@ sudoedit /opt/adx/config/deployment.yaml
 sudo adxctl validate
 sudo adxctl run
 ```
+
+Install the platform-independent administrator wheel on an operator workstation,
+then create the first tenant Key through the public HTTPS API:
+
+```sh
+pipx install ./adxadmin-0.1.0-py3-none-any.whl
+export ADX_ENDPOINT=https://adx.example.com:8443
+export ADX_CA_FILE=$HOME/.config/adx/public-ca.pem
+export ADX_ADMIN_TOKEN_FILE=$HOME/.config/adx/admin.key
+adxadmin key create --tenant example
+```
+
+See the [`adxadmin` guide](docs/deployment/adxadmin.md) for listing, pagination,
+revocation, JSON output, and the error contract.
 
 In another terminal, install the packaged SDK and point it at the public Gateway:
 
@@ -180,6 +195,7 @@ The SDK distribution is `adx-sandbox`, its Python import is `adx_sandbox`, and i
 - [Data-plane OpenAPI](platform/api/openapi/data-plane.yaml)
 - [Sandbox Python SDK](platform/sdk/sandbox/python/README.md)
 - [Deployment configuration](docs/deployment/adxctl.md) and [examples](build/config/examples/README.md)
+- [Remote cluster administration](docs/deployment/adxadmin.md) and [API Key management](docs/testing/api-key-management.md)
 - [Scheduling](docs/testing/scheduling-performance.md), [node lifecycle](docs/testing/node-lifecycle.md), and [route publication](docs/testing/route-publication.md)
 - [Checkpoint and snapshot storage](docs/testing/snapshot-storage.md)
 - [Metrics](docs/testing/capsule-resource-metrics.md), [logs](docs/testing/log-collection.md), and [distributed tracing](docs/testing/distributed-traces.md)
