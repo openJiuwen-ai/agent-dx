@@ -32,7 +32,22 @@ impl std::error::Error for Error {}
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Key(String);
+pub struct Key(String, Option<Index>);
+
+/// Derived ordered index; updated with its records in the same transaction.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Index(String);
+impl Index {
+    pub fn environments(tenant: &str, template: &str, version: &str) -> Result<Self> {
+        for value in [tenant, template, version] {
+            adx_agent_core::identifier(value, "index scope").map_err(Error::Invalid)?;
+        }
+        Ok(Self(format!(
+            "environments:{}",
+            adx_agent_core::encode_key(&[tenant, template, version])
+        )))
+    }
+}
 impl Key {
     pub fn new(kind: &str, parts: &[&str]) -> Result<Self> {
         if !matches!(kind, "template" | "environment")
@@ -41,10 +56,15 @@ impl Key {
         {
             return Err(Error::Invalid("invalid record key".into()));
         }
-        Ok(Self(format!(
-            "{kind}:{}",
-            adx_agent_core::encode_key(parts)
-        )))
+        let index = if kind == "environment" && parts.len() == 4 {
+            Some(Index::environments(parts[0], parts[1], parts[2])?)
+        } else {
+            None
+        };
+        Ok(Self(
+            format!("{kind}:{}", adx_agent_core::encode_key(parts)),
+            index,
+        ))
     }
     pub fn as_str(&self) -> &str {
         &self.0
@@ -157,6 +177,13 @@ pub trait Repository: Send + Sync {
     async fn get(&self, key: &Key) -> Result<Option<Record>>;
     /// False means a definite conflict with no writes. Errors may mean unknown outcome.
     async fn commit(&self, transaction: &Transaction) -> Result<bool>;
+    /// Exclusive lexicographic cursor. Reads at most `limit` records from one index.
+    async fn page(
+        &self,
+        index: &Index,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<(String, Record)>>;
 }
 
 impl From<Error> for adx_agent_core::error::Error {

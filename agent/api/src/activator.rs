@@ -1,4 +1,5 @@
-//! Configured service addresses; no registry, owner or Redis dependency.
+//! Product control boundary and its remote HTTP implementation.
+use crate::request::RequestContext;
 use crate::{Error, Result};
 use adx_agent_core::{activator::*, transport, Environment, Scope, TemplateVersion};
 use async_trait::async_trait;
@@ -10,12 +11,33 @@ use std::{
 
 #[async_trait]
 pub trait Control: Send + Sync {
-    async fn publish(&self, tenant: &str, template: &TemplateVersion) -> Result<()>;
-    async fn template(&self, tenant: &str, name: &str, version: &str) -> Result<TemplateVersion>;
-    async fn create_environment(&self, scope: &Scope) -> Result<Environment>;
-    async fn environment(&self, scope: &Scope) -> Result<Environment>;
-    async fn delete_environment(&self, scope: &Scope) -> Result<()>;
-    async fn activate(&self, scope: &Scope) -> Result<Target>;
+    async fn publish(
+        &self,
+        ctx: &RequestContext,
+        tenant: &str,
+        template: &TemplateVersion,
+    ) -> Result<()>;
+    async fn template(
+        &self,
+        ctx: &RequestContext,
+        tenant: &str,
+        name: &str,
+        version: &str,
+    ) -> Result<TemplateVersion>;
+    async fn create_environment(&self, ctx: &RequestContext, scope: &Scope) -> Result<Environment>;
+    async fn environment(&self, ctx: &RequestContext, scope: &Scope) -> Result<Environment>;
+    async fn list_environments(
+        &self,
+        ctx: &RequestContext,
+        query: &EnvironmentList,
+    ) -> Result<EnvironmentPage>;
+    async fn delete_environment(&self, ctx: &RequestContext, scope: &Scope) -> Result<()>;
+    async fn activate(
+        &self,
+        ctx: &RequestContext,
+        scope: &Scope,
+        expected_generation: Option<&str>,
+    ) -> Result<Target>;
 }
 
 pub struct ActivatorClient {
@@ -64,18 +86,22 @@ impl ActivatorClient {
             next: AtomicUsize::new(0),
         })
     }
-    pub fn request_budget(&self) -> Duration {
-        self.timeout
-    }
     async fn request<T: Serialize + Sync, R: DeserializeOwned>(
         &self,
+        ctx: &RequestContext,
         path: &str,
         body: &T,
         writes: bool,
     ) -> Result<R> {
-        let deadline = tokio::time::Instant::now() + self.timeout;
-        let wall_deadline = adx_agent_core::unix_time_millis()
-            .saturating_add(self.timeout.as_millis().min(u64::MAX as u128) as u64);
+        let deadline = ctx
+            .deadline()
+            .min(tokio::time::Instant::now() + self.timeout);
+        let wall_deadline = adx_agent_core::unix_time_millis().saturating_add(
+            deadline
+                .saturating_duration_since(tokio::time::Instant::now())
+                .as_millis()
+                .min(u64::MAX as u128) as u64,
+        );
         let start = self.next.fetch_add(1, Ordering::Relaxed);
         // Only a connection failure proves the write was not sent. All attempts share one budget.
         for offset in 0..self.urls.len().min(2) {
@@ -86,6 +112,9 @@ impl ActivatorClient {
                 ));
             }
             let url = &self.urls[start.wrapping_add(offset) % self.urls.len()];
+            if writes {
+                ctx.start_write();
+            }
             let response = self
                 .client
                 .post(format!("{url}/internal/adx/v1/{path}"))
@@ -127,7 +156,7 @@ impl ActivatorClient {
         Err(Error::Unavailable("Activator unavailable".into()))
     }
 }
-fn uncertain(writes: bool, message: &str) -> Error {
+pub(crate) fn uncertain(writes: bool, message: &str) -> Error {
     if writes {
         Error::OutcomeUnknown(message.into())
     } else {
@@ -136,8 +165,14 @@ fn uncertain(writes: bool, message: &str) -> Error {
 }
 #[async_trait]
 impl Control for ActivatorClient {
-    async fn publish(&self, tenant: &str, template: &TemplateVersion) -> Result<()> {
+    async fn publish(
+        &self,
+        ctx: &RequestContext,
+        tenant: &str,
+        template: &TemplateVersion,
+    ) -> Result<()> {
         self.request(
+            ctx,
             "templates/publish",
             &PublishRequest {
                 tenant: tenant.into(),
@@ -147,8 +182,15 @@ impl Control for ActivatorClient {
         )
         .await
     }
-    async fn template(&self, tenant: &str, name: &str, version: &str) -> Result<TemplateVersion> {
+    async fn template(
+        &self,
+        ctx: &RequestContext,
+        tenant: &str,
+        name: &str,
+        version: &str,
+    ) -> Result<TemplateVersion> {
         self.request(
+            ctx,
             "templates/get",
             &TemplateRequest {
                 tenant: tenant.into(),
@@ -159,8 +201,9 @@ impl Control for ActivatorClient {
         )
         .await
     }
-    async fn create_environment(&self, scope: &Scope) -> Result<Environment> {
+    async fn create_environment(&self, ctx: &RequestContext, scope: &Scope) -> Result<Environment> {
         self.request(
+            ctx,
             "environments/create",
             &ScopeRequest {
                 scope: scope.clone(),
@@ -169,8 +212,9 @@ impl Control for ActivatorClient {
         )
         .await
     }
-    async fn environment(&self, scope: &Scope) -> Result<Environment> {
+    async fn environment(&self, ctx: &RequestContext, scope: &Scope) -> Result<Environment> {
         self.request(
+            ctx,
             "environments/get",
             &ScopeRequest {
                 scope: scope.clone(),
@@ -179,8 +223,16 @@ impl Control for ActivatorClient {
         )
         .await
     }
-    async fn delete_environment(&self, scope: &Scope) -> Result<()> {
+    async fn list_environments(
+        &self,
+        ctx: &RequestContext,
+        query: &EnvironmentList,
+    ) -> Result<EnvironmentPage> {
+        self.request(ctx, "environments/list", query, false).await
+    }
+    async fn delete_environment(&self, ctx: &RequestContext, scope: &Scope) -> Result<()> {
         self.request(
+            ctx,
             "environments/delete",
             &ScopeRequest {
                 scope: scope.clone(),
@@ -189,11 +241,18 @@ impl Control for ActivatorClient {
         )
         .await
     }
-    async fn activate(&self, scope: &Scope) -> Result<Target> {
+    async fn activate(
+        &self,
+        ctx: &RequestContext,
+        scope: &Scope,
+        expected_generation: Option<&str>,
+    ) -> Result<Target> {
         self.request(
+            ctx,
             "environments/activate",
-            &ScopeRequest {
+            &ActivationRequest {
                 scope: scope.clone(),
+                expected_generation: expected_generation.map(str::to_owned),
             },
             true,
         )

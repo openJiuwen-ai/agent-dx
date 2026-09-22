@@ -228,7 +228,9 @@ pub fn parse_static_routes(value: &str) -> Result<Vec<StaticRoute>, String> {
 #[derive(Clone)]
 pub struct EdgeFrontend {
     #[cfg(feature = "agent-api")]
-    agent_api: Option<Arc<super::agent_api::AgentApi>>,
+    pub(super) agent_api: Option<Arc<super::agent_api::AgentApi>>,
+    #[cfg(feature = "agent-api")]
+    inline_api: Option<Arc<super::inline_api::InlineApi>>,
     #[cfg(feature = "agent-api")]
     sandbox_api: Option<Arc<super::sandbox_api::SandboxApi>>,
     resolver: Arc<EdgeRouteResolver>,
@@ -267,6 +269,8 @@ impl EdgeFrontend {
             #[cfg(feature = "agent-api")]
             agent_api: None,
             #[cfg(feature = "agent-api")]
+            inline_api: None,
+            #[cfg(feature = "agent-api")]
             sandbox_api: None,
             resolver,
             connector,
@@ -294,6 +298,12 @@ impl EdgeFrontend {
     #[cfg(feature = "agent-api")]
     pub fn with_agent_api(mut self, api: Arc<super::agent_api::AgentApi>) -> Self {
         self.agent_api = Some(api);
+        self
+    }
+
+    #[cfg(feature = "agent-api")]
+    pub fn with_inline_api(mut self, api: Arc<super::inline_api::InlineApi>) -> Self {
+        self.inline_api = Some(api);
         self
     }
 
@@ -366,7 +376,7 @@ impl EdgeFrontend {
         self.http_pool.metrics()
     }
 
-    async fn resolve_route(
+    pub(super) async fn resolve_route(
         &self,
         instance_id: &str,
         target_port: u16,
@@ -398,7 +408,10 @@ impl EdgeFrontend {
             .map_err(EdgeOpenError::Connect)
     }
 
-    async fn open_authorized_stream(&self, route: RouteHandle) -> io::Result<EdgeStream> {
+    pub(super) async fn open_authorized_stream(
+        &self,
+        route: RouteHandle,
+    ) -> io::Result<EdgeStream> {
         self.open_authorized_stream_with_activity(route, false)
             .await
     }
@@ -711,10 +724,41 @@ impl EdgeFrontend {
             .err();
         #[cfg(not(feature = "agent-api"))]
         let agent_data_error: Option<Response<ProxyBody>> = None;
+        #[cfg(feature = "agent-api")]
+        let environment_notice = request
+            .extensions()
+            .get::<super::agent_access::EnvironmentNotice>()
+            .cloned();
+        #[cfg(feature = "agent-api")]
+        let agent_forward = environment_notice.is_some()
+            || request
+                .extensions()
+                .get::<super::agent_access::InlineForward>()
+                .is_some();
+        #[cfg(not(feature = "agent-api"))]
+        let agent_forward = false;
         let response = if let Some(response) = agent_data_error {
             response
+        } else if agent_forward {
+            // A selected Sandbox is already a data-plane target. Its ID must never
+            // be interpreted again as a public management or configured proxy path.
+            self.proxy_direct(request, ingress_security).await
         } else {
             match request.uri().path() {
+                #[cfg(feature = "agent-api")]
+                path if super::inline_api::InlineApi::matches(path)
+                    && self.inline_api.is_some() =>
+                {
+                    if ingress_security == IngressSecurity::Plaintext {
+                        tls_required()
+                    } else {
+                        self.inline_api
+                            .as_ref()
+                            .expect("matched configured inline API")
+                            .management(request)
+                            .await
+                    }
+                }
                 #[cfg(feature = "agent-api")]
                 path if super::agent_api::AgentApi::matches(path) && self.agent_api.is_some() => {
                     if ingress_security == IngressSecurity::Plaintext {
@@ -791,6 +835,14 @@ impl EdgeFrontend {
                 _ => self.proxy_direct(request, ingress_security).await,
             }
         };
+        #[cfg(feature = "agent-api")]
+        let response = {
+            let mut response = response;
+            if let Some(notice) = environment_notice {
+                notice.apply(response.headers_mut());
+            }
+            response
+        };
         let status = response.status();
         let duration_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
         self.request_metrics.observe(status, duration_us);
@@ -837,31 +889,65 @@ impl EdgeFrontend {
         request: &mut Request<B>,
         ingress_security: IngressSecurity,
     ) -> Result<(), Response<ProxyBody>> {
-        if let Some(api) = &self.agent_api {
-            if super::agent_api::AgentApi::matches_data(request.uri().path()) {
-                if ingress_security == IngressSecurity::Plaintext {
-                    return Err(tls_required());
-                }
-                let identity = match self
-                    .authenticator
-                    .authenticate_request_identity_with_policy(request, true)
-                    .await
+        use super::agent_access::{AccessRequest, InlineForward};
+        use adx_agent_core::target::Target;
+        let Some(access) = AccessRequest::parse(request)
+            .map_err(|error| super::agent_response::error_response(error, None))?
+        else {
+            return Ok(());
+        };
+        if ingress_security == IngressSecurity::Plaintext {
+            return Err(tls_required());
+        }
+        if let Target::Instance(id) = &access.target {
+            let api = self
+                .inline_api
+                .as_ref()
+                .ok_or_else(|| response_text(StatusCode::NOT_FOUND, "inline access is disabled"))?;
+            let identity = api
+                .authenticate_data(request)
+                .await
+                .map_err(|_| response_text(StatusCode::UNAUTHORIZED, "authentication failed"))?;
+            let port = access.port.unwrap_or(18092);
+            *request.uri_mut() = format!("/{id}/{port}{}", access.backend_uri)
+                .parse()
+                .map_err(|_| response_text(StatusCode::BAD_REQUEST, "invalid instance target"))?;
+            if access.protocol == adx_agent_core::Protocol::Http {
+                request.headers_mut().remove(header::AUTHORIZATION);
+                if request
+                    .headers()
+                    .get("x-forwarded-proto")
+                    .is_none_or(|v| v.is_empty())
                 {
-                    Ok(identity) if !identity.tenant_id.is_empty() => identity,
-                    Ok(_) => {
-                        return Err(response_text(
-                            StatusCode::UNAUTHORIZED,
-                            "tenant authentication required",
-                        ))
-                    }
-                    Err(error) => return Err(response_text(error.status(), &error.to_string())),
-                };
-                let tenant = identity.tenant_id.clone();
-                request.extensions_mut().insert(identity);
-                api.prepare_data(request, &tenant)
-                    .await
-                    .map_err(|error| super::agent_api::error_response(error, None))?;
+                    request
+                        .headers_mut()
+                        .insert("x-forwarded-proto", http::HeaderValue::from_static("https"));
+                }
             }
+            request.extensions_mut().insert(identity);
+            request.extensions_mut().insert(InlineForward {
+                backend_uri: access.backend_uri,
+            });
+        } else {
+            let api = self.agent_api.as_ref().ok_or_else(|| {
+                response_text(StatusCode::NOT_FOUND, "managed access is disabled")
+            })?;
+            let identity = self
+                .authenticator
+                .authenticate_request_identity_with_policy(request, true)
+                .await
+                .map_err(|error| response_text(error.status(), &error.to_string()))?;
+            if identity.tenant_id.is_empty() {
+                return Err(response_text(
+                    StatusCode::UNAUTHORIZED,
+                    "tenant authentication required",
+                ));
+            }
+            let tenant = identity.tenant_id.clone();
+            request.extensions_mut().insert(identity);
+            api.prepare_data(request, &tenant, access)
+                .await
+                .map_err(|error| super::agent_response::error_response(error, None))?;
         }
         Ok(())
     }
@@ -1372,7 +1458,7 @@ impl EdgeFrontend {
                             continue;
                         }
                         Ok(false) => return response,
-                        Err(error) => return super::agent_api::error_response(error, None),
+                        Err(error) => return super::agent_response::error_response(error, None),
                     }
                 }
             }
@@ -1401,6 +1487,15 @@ impl EdgeFrontend {
                 ));
             }
         }
+        #[cfg(feature = "agent-api")]
+        let inline_forward = request
+            .extensions()
+            .get::<super::agent_access::InlineForward>()
+            .cloned();
+        #[cfg(feature = "agent-api")]
+        let legacy = inline_forward.is_some();
+        #[cfg(not(feature = "agent-api"))]
+        let legacy = false;
         let request_id = header_string(&request, "x-request-id");
         let route = match self
             .resolve_route(
@@ -1412,7 +1507,16 @@ impl EdgeFrontend {
             .await
         {
             Ok(route) => route,
-            Err(error) => return Err((error_response(error), request)),
+            Err(error) => {
+                return Err((
+                    if legacy {
+                        inline_forward_error(error)
+                    } else {
+                        error_response(error)
+                    },
+                    request,
+                ))
+            }
         };
         let auth_required = self.auth_required(parsed.access_kind, &route);
         if ingress_security == IngressSecurity::Plaintext && auth_required {
@@ -1430,6 +1534,11 @@ impl EdgeFrontend {
                 Err(error) => return Ok(plain(error.status(), &error.to_string())),
             }
         };
+        let tenant_id = if legacy && tenant_id == "0" {
+            route.tenant_id.clone()
+        } else {
+            tenant_id
+        };
         let query = request
             .uri()
             .query()
@@ -1444,17 +1553,32 @@ impl EdgeFrontend {
             .parse()
             .expect("stripped route path is a valid origin-form URI");
         *request.uri_mut() = uri;
-        request.headers_mut().remove(H_INSTANCE_ID);
-        request.headers_mut().remove(H_WORKLOAD_ID);
-        request.headers_mut().remove(H_TARGET_IP);
-        request.headers_mut().remove(H_TARGET_PORT);
-        request.headers_mut().remove("x-auth");
-        request.headers_mut().remove(header::AUTHORIZATION);
+        if !legacy {
+            request.headers_mut().remove(H_INSTANCE_ID);
+            request.headers_mut().remove(H_WORKLOAD_ID);
+            request.headers_mut().remove(H_TARGET_IP);
+            request.headers_mut().remove(H_TARGET_PORT);
+            request.headers_mut().remove("x-auth");
+            request.headers_mut().remove(header::AUTHORIZATION);
+        }
+        #[cfg(feature = "agent-api")]
+        if let Some(forward) = inline_forward {
+            *request.uri_mut() = forward.backend_uri;
+        }
         let upgrade_requested = request.headers().contains_key(header::UPGRADE);
         if upgrade_requested {
             let stream = match self.open_resolved_stream(route, &tenant_id).await {
                 Ok(stream) => stream,
-                Err(error) => return Err((error_response(error), request)),
+                Err(error) => {
+                    return Err((
+                        if legacy {
+                            inline_forward_error(error)
+                        } else {
+                            error_response(error)
+                        },
+                        request,
+                    ))
+                }
             };
             let cancelled = stream.cancelled.clone();
             return Ok(proxy_http(request, stream, "sandbox", Some(cancelled)).await);
@@ -2112,6 +2236,16 @@ fn strip_token_query(query: &str) -> String {
                 .filter(|(name, _)| !name.eq_ignore_ascii_case("token")),
         )
         .finish()
+}
+
+fn inline_forward_error(error: EdgeOpenError) -> Response<ProxyBody> {
+    let status = match error {
+        EdgeOpenError::Forbidden => StatusCode::FORBIDDEN,
+        EdgeOpenError::Auth(_) => StatusCode::UNAUTHORIZED,
+        EdgeOpenError::Resolve(ResolveError::CapsuleStatus { .. }) => StatusCode::CONFLICT,
+        _ => StatusCode::BAD_GATEWAY,
+    };
+    plain(status, &error.to_string())
 }
 
 fn error_response(error: EdgeOpenError) -> Response<ProxyBody> {

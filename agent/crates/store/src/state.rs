@@ -1,7 +1,15 @@
 //! Product metadata transactions. Sandbox lifecycle belongs to Platform.
 use crate::*;
+use adx_agent_core::activator::{EnvironmentList, EnvironmentPage};
 use adx_agent_core::{limits, Environment, EnvironmentPhase, Scope, TemplateVersion};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use std::sync::Arc;
+
+#[derive(Serialize, Deserialize)]
+struct PageCursor {
+    scope: [String; 3],
+    after: String,
+}
 
 #[derive(Clone)]
 pub struct AgentState {
@@ -81,6 +89,71 @@ impl AgentState {
             .await?
             .map(|r| r.decode())
             .transpose()
+    }
+    pub async fn list_environments(&self, query: &EnvironmentList) -> Result<EnvironmentPage> {
+        query.validate().map_err(Error::Invalid)?;
+        let index = Index::environments(&query.tenant, &query.template, &query.version)?;
+        let scope = [
+            query.tenant.clone(),
+            query.template.clone(),
+            query.version.clone(),
+        ];
+        let after = query
+            .page_token
+            .as_ref()
+            .map(|raw| {
+                let bytes = URL_SAFE_NO_PAD
+                    .decode(raw)
+                    .map_err(|_| Error::Invalid("invalid page token".into()))?;
+                let token: PageCursor = serde_json::from_slice(&bytes)
+                    .map_err(|_| Error::Invalid("invalid page token".into()))?;
+                if token.scope != scope || !token.after.starts_with("environment:") {
+                    return Err(Error::Invalid(
+                        "page token does not match query scope".into(),
+                    ));
+                }
+                Ok(token.after)
+            })
+            .transpose()?;
+        let mut records = self
+            .store
+            .page(&index, after.as_deref(), query.page_size + 1)
+            .await?;
+        let has_next = records.len() > query.page_size;
+        records.truncate(query.page_size);
+        let next_page_token = if has_next {
+            records
+                .last()
+                .map(|(key, _)| {
+                    serde_json::to_vec(&PageCursor {
+                        scope,
+                        after: key.clone(),
+                    })
+                    .map(|bytes| URL_SAFE_NO_PAD.encode(bytes))
+                    .map_err(|e| Error::Invalid(e.to_string()))
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        let environments = records
+            .into_iter()
+            .map(|(key, record)| {
+                let value: Environment = record.decode()?;
+                if value.scope.tenant != query.tenant
+                    || value.scope.template != query.template
+                    || value.scope.version != query.version
+                    || environment_key(&value.scope)?.as_str() != key
+                {
+                    return Err(Error::Corrupt("Environment index scope mismatch".into()));
+                }
+                Ok(value)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(EnvironmentPage {
+            environments,
+            next_page_token,
+        })
     }
     /// Commit one stable Sandbox identity before any activation side effect.
     pub async fn create_environment(&self, scope: Scope) -> Result<Environment> {

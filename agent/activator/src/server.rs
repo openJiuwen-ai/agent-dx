@@ -81,6 +81,7 @@ pub fn router(activator: Arc<Activator>, token: &str, timeout: Duration) -> Resu
         .route("/internal/adx/v1/templates/get", post(template))
         .route("/internal/adx/v1/environments/create", post(create))
         .route("/internal/adx/v1/environments/get", post(environment))
+        .route("/internal/adx/v1/environments/list", post(environments))
         .route("/internal/adx/v1/environments/delete", post(delete))
         .route("/internal/adx/v1/environments/activate", post(activate))
         .layer(DefaultBodyLimit::max(limits::HTTP_JSON_BYTES))
@@ -123,6 +124,12 @@ async fn environment(State(s): State<Service>, Json(r): Json<ScopeRequest>) -> R
         Err(e) => failure(e),
     }
 }
+async fn environments(State(s): State<Service>, Json(r): Json<EnvironmentList>) -> Response {
+    match s.activator.list_environments(&r).await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => failure(e),
+    }
+}
 async fn delete(
     State(s): State<Service>,
     axum::Extension(p): axum::Extension<Arc<RequestProgress>>,
@@ -137,10 +144,14 @@ async fn delete(
 async fn activate(
     State(s): State<Service>,
     axum::Extension(p): axum::Extension<Arc<RequestProgress>>,
-    Json(r): Json<ScopeRequest>,
+    Json(r): Json<ActivationRequest>,
 ) -> Response {
     p.start_write();
-    match s.activator.activate(&r.scope).await {
+    match s
+        .activator
+        .activate(&r.scope, r.expected_generation.as_deref())
+        .await
+    {
         Ok(v) => Json(v).into_response(),
         Err(e) => failure(e),
     }
