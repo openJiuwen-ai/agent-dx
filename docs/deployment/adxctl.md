@@ -17,7 +17,7 @@ release 安装器默认创建 `/usr/local/bin/adxctl -> /opt/adx/current/bin/adx
 | `edge` | 内嵌时无独立进程；分进程时为 `adx-edge-frontend` | 接入节点 | 对外 TLS、控制请求转发以及到 Node Proxy 的数据连接 |
 | `redis` | `redis-server` | 可选，仅一个主机 | 由 `adxctl` 托管的 Redis 7.2.5 和 AOF |
 
-当前没有 `adx-frontend` 二进制。原控制面 Frontend 已重写并命名为 `adx-api-server`。API Server 默认在同一进程中托管 Edge，两个模块仍保持独立监听与 TLS 身份；显式设置 `edge_mode: standalone` 时才启动 `adx-edge-frontend`。API Server 只监听回环地址，由 Edge 对外提供 HTTPS。
+当前没有 `adx-frontend` 二进制。原控制面 Frontend 已重写并命名为 `adx-api-server`。API Server 默认在同一进程中托管 Edge，两个模块仍保持独立监听，默认使用各自的 TLS 身份；显式设置 `edge_mode: standalone` 时才启动 `adx-edge-frontend`。API Server 只监听回环地址，由 Edge 对外提供 HTTPS。
 
 sandboxd 不属于上述角色，始终由部署环境独立启动。RRT 位于发布包 `runtime/`，进入 Capsule 环境运行，也不是宿主机服务。
 
@@ -214,7 +214,7 @@ sudo adxctl validate
 sudo adxctl run
 ```
 
-`listen` 是 Master 本机监听地址；`advertised_address` 必须是 Node Manager、API Server 和 Edge 可访问的 mTLS 地址。Master 会将该地址带 TTL 写入共享 Redis。`tls.peers` 必须登记实际 API Server、Edge 和所有 `node:<node_id>` 的叶证书 DER。
+`listen` 是 Master 本机监听地址；`advertised_address` 必须是 Node Manager、API Server 和 Edge 可访问的地址（默认 mTLS 使用 `https://`，network 模式使用 `http://`）。Master 会将该地址带 TTL 写入共享 Redis。mTLS 模式的 `tls.peers` 必须登记实际 API Server、Edge 和所有 `node:<node_id>` 的叶证书 DER。
 
 若 Redis 也由控制节点托管，可在该文件的 `services` 开头增加 `redis` 角色。多机访问时 Redis 不能只绑定回环地址；非回环监听必须配置绝对路径 `password_file`，并将带 URL 编码凭证的同一个 `redis_url` 配置到所有主机。
 
@@ -263,7 +263,7 @@ API Frontend 对应 `role: "api-server"` 和 `adx-api-server`。示例将 API �
 4. API Server（默认同时启动 Edge；显式分进程时再启动独立 Edge）。
 5. 使用公开 SDK 完成创建、执行命令、删除的业务就绪检查。
 
-组件发现允许稍后收敛，但上述顺序能提供更清晰的首次部署日志。所有主机必须使用同一构建的发布包、同一 `redis_url`、同一 `namespace` 和相互匹配的证书身份。
+组件发现允许稍后收敛，但上述顺序能提供更清晰的首次部署日志。所有主机必须使用同一构建的发布包、同一 `redis_url`、同一 `namespace` 和一致的内部通信模式；mTLS 模式还需要相互匹配的证书身份。
 
 ## 状态、故障与配置更新
 
@@ -287,3 +287,26 @@ API Frontend 对应 `role: "api-server"` 和 `adx-api-server`。示例将 API �
 配置和证书在组件启动时读取。`adxctl` 当前没有 `restart` 或热重载子命令。完整 `stop` 会删除本机 Capsule，因此不应用它进行需要保留实例的普通证书轮换；此类维护由部署环境按组件重启，并等待 Node Manager 对账和路由重新同步。
 
 完整的单机依赖、证书和 SDK 业务就绪步骤见[单机进程部署](standalone.md)，运行环境见[本地 EROFS 与 OCI](runtime-environment.md)。
+
+### 内部通信使用 network 模式
+
+Profile 部署可显式设置 `internal_security: network`：
+
+```yaml
+schema_version: 1
+profile: standalone
+internal_security: network
+```
+
+这会将 Master、Node Manager、API Server 和 Edge 的内部 gRPC，以及
+Edge → Node Proxy 数据链路改为明文；组件角色和节点 ID 由请求声明，依赖部署网络隔离，
+不再通过证书认证。节点会话、实例归属、租户权限和 API Key 校验仍然执行。
+对外 Edge HTTPS 证书和监听保持不变。省略该配置仍使用 mTLS，连接失败不会自动降级。
+
+使用完整 `services` 配置时，Master、Node Manager、Edge 的 `config.tls` 设置为
+`{mode: network}`，API Server 设置 `config.internal_security: network`；Master
+公布 `http://` 地址。Edge 和 Node Proxy 设置
+`ADX_DATA_PLANE_EDGE_FRONTEND_NODE_SECURITY_MODE=network`，并移除内部
+`ADX_DATA_PLANE_EDGE_FRONTEND_NODE_TLS_*`、`ADX_DATA_PLANE_NODE_PROXY_TLS_*`
+及 `ADX_DATA_PLANE_NODE_PROXY_MTLS_CLIENT_CA` 环境项；对外 HTTPS 配置保留。
+同一条内部链路的两端必须使用一致模式。

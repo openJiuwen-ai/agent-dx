@@ -54,7 +54,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "spread" => Placement::Spread,
         _ => return Err("placement must be pack or spread".into()),
     };
-    let (server_tls, client_tls, peers) = config.tls.load()?;
+    let (server_tls, client_tls, peers) =
+        config.tls.load_rpc(adx_protocol::auth::Principal::Master)?;
     let timeout = Duration::from_secs(config.rpc_timeout_seconds);
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
     let store = RedisStore::connect(&config.redis_url, &config.namespace, timeout).await?;
@@ -135,8 +136,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     adx_observability::info!("adx-master listening on {}", listener.local_addr()?);
-    let server = tonic::transport::Server::builder()
-        .tls_config(server_tls)?
+    let mut builder = tonic::transport::Server::builder();
+    if let Some(tls) = server_tls {
+        builder = builder.tls_config(tls)?;
+    }
+    let server = builder
         .add_service(pb::snapshot_service_server::SnapshotServiceServer::new(
             rpc.clone(),
         ))

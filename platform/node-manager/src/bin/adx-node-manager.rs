@@ -104,7 +104,7 @@ async fn bounded_rpc<T>(
 }
 
 async fn register_node(
-    master: &mut pb::master_service_client::MasterServiceClient<tonic::transport::Channel>,
+    master: &mut pb::master_service_client::MasterServiceClient<adx_transport::rpc::RpcChannel>,
     registration: pb::RegisterNodeRequest,
     timeout: Duration,
 ) -> Result<tonic::Response<pb::RegisterNodeResponse>, tonic::Status> {
@@ -114,7 +114,7 @@ async fn register_node(
 }
 
 async fn inspect_node(
-    master: &mut pb::master_service_client::MasterServiceClient<tonic::transport::Channel>,
+    master: &mut pb::master_service_client::MasterServiceClient<adx_transport::rpc::RpcChannel>,
     node_id: &str,
     session_id: &str,
     timeout: Duration,
@@ -150,7 +150,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .as_ref()
         .map(|p| PressureGate::new(p.thresholds.clone()))
         .transpose()?;
-    let (server_tls, client_tls, peers) = config.tls.load()?;
+    let (server_tls, client_tls, peers) = config
+        .tls
+        .load_rpc(adx_protocol::auth::Principal::Node(config.node_id.clone()))?;
     let timeout = Duration::from_secs(config.rpc_timeout_seconds);
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
     let discovery = match (&config.master_address, &config.discovery) {
@@ -182,12 +184,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     let channel_for =
-        |address: String| -> Result<tonic::transport::Channel, Box<dyn std::error::Error>> {
-            Ok(tonic::transport::Endpoint::from_shared(address)?
-                .tls_config(client_tls.clone())?
-                .connect_timeout(timeout)
-                .timeout(timeout)
-                .connect_lazy())
+        |address: String| -> Result<adx_transport::rpc::RpcChannel, Box<dyn std::error::Error>> {
+            Ok(client_tls.wrap(
+                client_tls
+                    .endpoint(&address)?
+                    .connect_timeout(timeout)
+                    .timeout(timeout)
+                    .connect_lazy(),
+            ))
         };
     let channel = channel_for(endpoint.clone())?;
     let session_id = uuid::Uuid::new_v4().to_string();
@@ -198,7 +202,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         timeout
     };
     let sink = Arc::new(
-        MasterStateSink::new(channel.clone(), commit_timeout)?.with_session(session_id.clone()),
+        MasterStateSink::with_rpc_channel(channel.clone(), commit_timeout)?
+            .with_session(session_id.clone()),
     );
     let journal = config.degradation_journal.map(|path| {
         Arc::new(adx_node_manager::journal::JournalSink::new(
@@ -334,8 +339,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             node_rpc.retry_local_claims().await;
         }
     };
-    let server = tonic::transport::Server::builder()
-        .tls_config(server_tls)?
+    let mut builder = tonic::transport::Server::builder();
+    if let Some(tls) = server_tls {
+        builder = builder.tls_config(tls)?;
+    }
+    let server = builder
         .add_service(pb::node_service_server::NodeServiceServer::new(
             node_rpc.clone(),
         ))

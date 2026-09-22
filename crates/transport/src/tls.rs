@@ -7,10 +7,17 @@ use tonic::transport::{Certificate, ClientTlsConfig, Identity, ServerTlsConfig};
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TlsFiles {
+    #[serde(default)]
+    pub mode: crate::rpc::SecurityMode,
+    #[serde(default)]
     pub ca: PathBuf,
+    #[serde(default)]
     pub certificate: PathBuf,
+    #[serde(default)]
     pub private_key: PathBuf,
+    #[serde(default)]
     pub server_name: String,
+    #[serde(default)]
     pub peers: BTreeMap<String, PathBuf>,
 }
 
@@ -78,6 +85,22 @@ pub fn http_server_acceptor(
     Ok(TlsAcceptor::from(Arc::new(config)))
 }
 impl TlsFiles {
+    pub fn load_rpc(
+        &self,
+        principal: Principal,
+    ) -> Result<(Option<ServerTlsConfig>, crate::rpc::RpcClient, Peers), Box<dyn std::error::Error>>
+    {
+        if self.mode == crate::rpc::SecurityMode::Network {
+            return Ok((
+                None,
+                crate::rpc::RpcClient::network(principal),
+                Peers::network(),
+            ));
+        }
+        let (server, client, peers) = self.load()?;
+        Ok((Some(server), client.into(), peers))
+    }
+
     pub fn load(
         &self,
     ) -> Result<(ServerTlsConfig, ClientTlsConfig, Peers), Box<dyn std::error::Error>> {

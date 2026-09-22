@@ -9,6 +9,7 @@ use crate::common::route::{
 };
 use adx_discovery::RedisDiscovery;
 use adx_protocol::control as pb;
+use adx_transport::rpc::{RpcChannel, RpcClient};
 use adx_transport::tls::TlsFiles;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -17,7 +18,6 @@ use std::{
     sync::{Arc, Mutex, RwLock},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 
 pub struct RouteConsumer {
     store: Arc<RouteStore>,
@@ -157,8 +157,8 @@ struct Cached {
 }
 pub struct MasterConnection {
     discovery: RedisDiscovery,
-    tls: ClientTlsConfig,
-    channel: RwLock<Option<Channel>>,
+    tls: RpcClient,
+    channel: RwLock<Option<RpcChannel>>,
     timeout: Duration,
     refresh: Duration,
     cache: Mutex<HashMap<Vec<u8>, Cached>>,
@@ -175,7 +175,7 @@ impl MasterConnection {
         if c.rpc_timeout_seconds == 0 || c.refresh_seconds == 0 || c.auth_cache_entries == 0 {
             return Err("positive control intervals and cache budget required".into());
         }
-        let (_, tls, _) = c.tls.load()?;
+        let (_, tls, _) = c.tls.load_rpc(adx_protocol::auth::Principal::Edge)?;
         let timeout = Duration::from_secs(c.rpc_timeout_seconds);
         Ok(Self {
             discovery: RedisDiscovery::new(&c.redis_url, &c.namespace, timeout)?,
@@ -204,11 +204,13 @@ impl MasterConnection {
         consumer: &mut RouteConsumer,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let endpoint = self.discovery.lookup().await?;
-        let channel = Endpoint::from_shared(endpoint.address.clone())?
-            .tls_config(self.tls.clone())?
+        let channel = self
+            .tls
+            .endpoint(&endpoint.address)?
             .connect_timeout(self.timeout)
             .connect()
             .await?;
+        let channel = self.tls.wrap(channel);
         *self.channel.write().unwrap() = Some(channel.clone());
         let mut client = pb::route_service_client::RouteServiceClient::new(channel)
             .max_decoding_message_size(64 * 1024 * 1024);

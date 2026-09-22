@@ -85,10 +85,11 @@ impl MasterRpc {
                 if session.get_snapshot(&snapshot.id).await? != snapshot {
                     return Err(Error::Conflict);
                 }
-                let channel = Endpoint::from_shared(format!("https://{address}"))
+                let channel = self
+                    .0
+                    .node_tls
+                    .endpoint(&address)
                     .map_err(|_| Error::Invalid("invalid node address".into()))?
-                    .tls_config(self.0.node_tls.clone())
-                    .map_err(|_| Error::Invalid("invalid node TLS configuration".into()))?
                     .connect_timeout(self.0.timeout)
                     .timeout(self.0.timeout)
                     .connect()
@@ -96,16 +97,17 @@ impl MasterRpc {
                     .map_err(|_| {
                         Error::Unavailable("snapshot collector node unavailable".into())
                     })?;
-                let ack = pb::node_service_client::NodeServiceClient::new(channel)
-                    .collect_snapshot(pb::CollectSnapshotRequest {
-                        snapshot: Some(snapshot.clone().try_into()?),
-                        node_session_id,
-                    })
-                    .await
-                    .map_err(|_| {
-                        Error::Unavailable("snapshot artifact deletion incomplete".into())
-                    })?
-                    .into_inner();
+                let ack =
+                    pb::node_service_client::NodeServiceClient::new(self.0.node_tls.wrap(channel))
+                        .collect_snapshot(pb::CollectSnapshotRequest {
+                            snapshot: Some(snapshot.clone().try_into()?),
+                            node_session_id,
+                        })
+                        .await
+                        .map_err(|_| {
+                            Error::Unavailable("snapshot artifact deletion incomplete".into())
+                        })?
+                        .into_inner();
                 if ack.snapshot_id != snapshot.id || ack.revision != snapshot.revision {
                     return Err(Error::Conflict);
                 }

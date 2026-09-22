@@ -18,7 +18,7 @@ impl MasterEndpoint {
             .map_err(|_| Error::Invalid("invalid Master endpoint".into()))?;
         if self.schema != 1
             || self.epoch == 0
-            || uri.scheme_str() != Some("https")
+            || !matches!(uri.scheme_str(), Some("https" | "http"))
             || uri
                 .authority()
                 .is_none_or(|a| a.port_u16().is_none_or(|p| p == 0))
@@ -26,7 +26,7 @@ impl MasterEndpoint {
             || uri.path_and_query().is_some_and(|p| p.as_str() != "/")
         {
             return Err(Error::Invalid(
-                "versioned HTTPS Master endpoint required".into(),
+                "versioned HTTP(S) Master endpoint required".into(),
             ));
         }
         Ok(())
@@ -118,9 +118,9 @@ impl RedisDiscovery {
 mod tests {
     use super::*;
     #[test]
-    fn validates_versioned_tls_endpoint_and_namespace() {
+    fn validates_versioned_rpc_endpoint_and_namespace() {
         for address in [
-            "http://host:1",
+            "ftp://host:1",
             "https://user@host:1",
             "https://host:1/path",
             "https://host:1/?x=1",
@@ -138,6 +138,13 @@ mod tests {
             schema: 1,
             epoch: 1,
             address: "https://host:123".into()
+        }
+        .validate()
+        .is_ok());
+        assert!(MasterEndpoint {
+            schema: 1,
+            epoch: 1,
+            address: "http://host:123".into()
         }
         .validate()
         .is_ok());

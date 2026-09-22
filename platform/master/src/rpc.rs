@@ -1,4 +1,5 @@
 //! Async RPC coordination around the synchronous scheduler and Redis repository.
+use adx_transport::rpc::RpcClient;
 mod claims;
 mod cloning;
 mod metrics;
@@ -19,10 +20,7 @@ use std::{
     time::Duration,
 };
 use tokio::sync::{Mutex, Notify};
-use tonic::{
-    transport::{ClientTlsConfig, Endpoint},
-    Request, Response, Status,
-};
+use tonic::{transport::Endpoint, Request, Response, Status};
 
 struct LiveNode {
     expired: bool,
@@ -170,7 +168,7 @@ struct Inner {
     state: Mutex<State>,
     changed: Notify,
     peers: Peers,
-    node_tls: ClientTlsConfig,
+    node_tls: RpcClient,
     timeout: Duration,
     heartbeat_timeout: Duration,
 }
@@ -192,7 +190,7 @@ impl MasterRpc {
         session: Session,
         placement: Placement,
         peers: Peers,
-        node_tls: ClientTlsConfig,
+        node_tls: impl Into<RpcClient>,
         timeout: Duration,
     ) -> Result<Self> {
         Self::with_heartbeat_timeout(
@@ -209,7 +207,7 @@ impl MasterRpc {
         session: Session,
         placement: Placement,
         peers: Peers,
-        node_tls: ClientTlsConfig,
+        node_tls: impl Into<RpcClient>,
         timeout: Duration,
         heartbeat_timeout: Duration,
     ) -> Result<Self> {
@@ -275,7 +273,7 @@ impl MasterRpc {
             }),
             changed: Notify::new(),
             peers,
-            node_tls,
+            node_tls: node_tls.into(),
             timeout,
             heartbeat_timeout,
         })))
@@ -319,14 +317,15 @@ impl MasterRpc {
             }
             live.session.clone()
         };
-        let endpoint = Endpoint::from_shared(format!("https://{}", r.node_address))
-            .ok()?
-            .tls_config(self.0.node_tls.clone())
+        let endpoint = self
+            .0
+            .node_tls
+            .endpoint(&r.node_address)
             .ok()?
             .connect_timeout(self.0.timeout)
             .timeout(self.0.timeout);
         let channel = endpoint.connect().await.ok()?;
-        let actual = pb::node_service_client::NodeServiceClient::new(channel)
+        let actual = pb::node_service_client::NodeServiceClient::new(self.0.node_tls.wrap(channel))
             .get_session(pb::GetNodeSessionRequest {})
             .await
             .ok()?
@@ -453,10 +452,11 @@ impl MasterRpc {
                     None => None,
                 };
                 drop(state);
-                let endpoint = Endpoint::from_shared(format!("https://{}", node.address))
+                let endpoint = self
+                    .0
+                    .node_tls
+                    .endpoint(&node.address)
                     .map_err(|_| Status::invalid_argument("invalid node address"))?
-                    .tls_config(self.0.node_tls.clone())
-                    .map_err(|_| Status::internal("invalid node TLS configuration"))?
                     .connect_timeout(self.0.timeout)
                     .timeout(self.0.timeout);
                 let channel = endpoint
@@ -474,9 +474,11 @@ impl MasterRpc {
                     spec: Some(spec.clone().into()),
                     assignment: Some(stored.assignment.clone().try_into().map_err(status)?),
                 };
-                let result = match pb::node_service_client::NodeServiceClient::new(channel)
-                    .create_capsule(adx_observability::trace::inject(request))
-                    .await
+                let result = match pb::node_service_client::NodeServiceClient::new(
+                    self.0.node_tls.wrap(channel),
+                )
+                .create_capsule(adx_observability::trace::inject(request))
+                .await
                 {
                     Ok(result) => result.into_inner(),
                     Err(error) if error.code() == tonic::Code::ResourceExhausted => {
