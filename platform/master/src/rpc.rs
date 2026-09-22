@@ -707,23 +707,26 @@ impl pb::master_service_server::MasterService for MasterRpc {
         &self,
         request: Request<pb::LocalCapsuleCreateRequest>,
     ) -> std::result::Result<Response<pb::PreparedCapsule>, Status> {
-        let Principal::Node(node) = self.0.peers.authenticate(&request)? else {
-            return Err(Status::permission_denied("Node Manager required"));
-        };
-        self.prepare_local(&node, request.into_inner())
-            .await
-            .map(Response::new)
+        let principal = self.0.peers.authenticate(&request)?;
+        let request = request.into_inner();
+        let node = principal
+            .authorized_node(&request.node_id)
+            .ok_or_else(|| Status::permission_denied("Node Manager identity mismatch"))?
+            .to_owned();
+        self.prepare_local(&node, request).await.map(Response::new)
     }
     async fn claim_capsule(
         &self,
         request: Request<pb::ClaimCapsuleRequest>,
     ) -> std::result::Result<Response<pb::ClaimCapsuleResponse>, Status> {
         let trace = adx_observability::trace::Trace::rpc("master.claim_capsule", &request);
-        let Principal::Node(node) = self.0.peers.authenticate(&request)? else {
-            return Err(Status::permission_denied("Node Manager required"));
-        };
+        let principal = self.0.peers.authenticate(&request)?;
         let service = self.clone();
         let request = request.into_inner();
+        let node = principal
+            .authorized_node(&request.node_id)
+            .ok_or_else(|| Status::permission_denied("Node Manager identity mismatch"))?
+            .to_owned();
         tokio::spawn(
             trace.run(async move { service.claim_local(node, request).await.map(Response::new) }),
         )
@@ -735,10 +738,12 @@ impl pb::master_service_server::MasterService for MasterRpc {
         request: Request<pb::LocalCapsuleCreateRequest>,
     ) -> std::result::Result<Response<pb::CapsuleResult>, Status> {
         let trace = adx_observability::trace::Trace::rpc("master.forward_create", &request);
-        let Principal::Node(node) = self.0.peers.authenticate(&request)? else {
-            return Err(Status::permission_denied("Node Manager required"));
-        };
+        let principal = self.0.peers.authenticate(&request)?;
         let request = request.into_inner();
+        let node = principal
+            .authorized_node(&request.node_id)
+            .ok_or_else(|| Status::permission_denied("Node Manager identity mismatch"))?
+            .to_owned();
         let schedule_timeout = scheduling_timeout(
             request
                 .create
@@ -772,7 +777,7 @@ impl pb::master_service_server::MasterService for MasterRpc {
             .run_result(async {
                 let principal = self.0.peers.authenticate(&request)?;
                 let r = request.into_inner();
-                if principal != Principal::Node(r.node_id.clone()) {
+                if principal.authorized_node(&r.node_id).is_none() {
                     return Err(Status::permission_denied("node identity mismatch"));
                 }
                 let mut state = self.0.state.lock().await;
@@ -853,7 +858,7 @@ impl pb::master_service_server::MasterService for MasterRpc {
             .run_result(async {
                 let principal = self.0.peers.authenticate(&request)?;
                 let r = request.into_inner();
-                if principal != Principal::Node(r.node_id.clone()) {
+                if principal.authorized_node(&r.node_id).is_none() {
                     return Err(Status::permission_denied(
                         "node identity does not match certificate",
                     ));
@@ -1042,7 +1047,10 @@ impl pb::master_service_server::MasterService for MasterRpc {
                 let stored = state.session.get(&r.capsule_id).await.map_err(status)?;
                 match principal {
                     Principal::ApiServer => tenant(r.caller.as_ref(), &stored.spec.tenant_id)?,
-                    Principal::Node(ref id) if id == &stored.assignment.node_id => (),
+                    principal
+                        if principal
+                            .authorized_node(&stored.assignment.node_id)
+                            .is_some() => {}
                     _ => {
                         return Err(Status::permission_denied(
                             "caller may not read this capsule",
@@ -1076,7 +1084,10 @@ impl pb::master_service_server::MasterService for MasterRpc {
                     .ok_or_else(|| Status::invalid_argument("record required"))?
                     .try_into()
                     .map_err(status)?;
-                if principal != Principal::Node(record.assignment.node_id.clone()) {
+                if principal
+                    .authorized_node(&record.assignment.node_id)
+                    .is_none()
+                {
                     return Err(Status::permission_denied("only owning node may commit"));
                 }
                 let service = self.clone();

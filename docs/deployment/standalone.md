@@ -42,7 +42,7 @@ sudo adxctl config init
 | `tls/public-ca.pem` | SDK 及管理客户端信任的对外 HTTPS CA，可与内部 CA 不同 |
 | `secrets/admin-key` | 初始管理员 API Key 明文文件，仅由 Master 初始化读取 |
 
-以上文件相对 `/opt/adx/config`。私钥和 API Key 权限设为 0600，目录设为 0700，并允许对应服务用户读取。部署环境可用 `openssl x509 -in component.pem -outform DER -out component.der` 从叶证书生成 DER；`peers` 映射检查叶证书字节，因此只更新 PEM 不足以完成内部身份轮换。`node:node-1` 必须与 Node Manager 的 `node_id` 一致。
+以上文件相对 `/opt/adx/config`。私钥和 API Key 权限设为 0600，目录设为 0700，并允许对应服务用户读取。部署环境可用 `openssl x509 -in component.pem -outform DER -out component.der` 从叶证书生成 DER；`peers` 映射检查叶证书字节，因此只更新 PEM 不足以完成内部身份轮换。独立节点证书使用 `node:<node_id>`，并且必须与 Node Manager 的 `node_id` 一致。Kubernetes DaemonSet 等由部署系统统一管理节点证书的场景可以配置 `node-pool`；Node Manager 会在注册、本地创建和归属确认请求中携带具体 `node_id`，Master 仍按该 ID 维护独立节点会话和资源账本。不要在不同信任域之间共享同一个节点池证书。
 
 用密码学随机数生成初始管理员 API Key 并写入受保护文件。配置只引用路径。Master 保存摘要；用管理员接口创建租户密钥，见 [API Key 管理](../testing/api-key-management.md)。正常业务客户端使用租户密钥。
 

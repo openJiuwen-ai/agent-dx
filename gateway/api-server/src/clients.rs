@@ -126,6 +126,7 @@ impl Clients {
                 let mut request = trace::inject(pb::LocalCapsuleCreateRequest {
                     create: Some(request),
                     node_session_id: node.session_id,
+                    node_id: node.node_id,
                 });
                 request.set_timeout(budget);
                 let result = self

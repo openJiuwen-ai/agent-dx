@@ -14,6 +14,19 @@ pub struct TlsFiles {
     pub peers: BTreeMap<String, PathBuf>,
 }
 
+fn peer_principal(role: &str) -> Result<Principal, &'static str> {
+    match role {
+        "master" => Ok(Principal::Master),
+        "api-server" => Ok(Principal::ApiServer),
+        "edge" => Ok(Principal::Edge),
+        "node-pool" => Ok(Principal::NodePool),
+        value if value.starts_with("node:") && value.len() > 5 => {
+            Ok(Principal::Node(value[5..].into()))
+        }
+        _ => Err("invalid TLS peer role"),
+    }
+}
+
 pub fn grpc_client_config(
     ca: impl Into<PathBuf>,
     certificate: impl Into<PathBuf>,
@@ -91,15 +104,7 @@ impl TlsFiles {
         );
         let mut peers = Vec::new();
         for (role, path) in &self.peers {
-            let principal = match role.as_str() {
-                "master" => Principal::Master,
-                "api-server" => Principal::ApiServer,
-                "edge" => Principal::Edge,
-                value if value.starts_with("node:") && value.len() > 5 => {
-                    Principal::Node(value[5..].into())
-                }
-                _ => return Err("invalid TLS peer role".into()),
-            };
+            let principal = peer_principal(role)?;
             peers.push((std::fs::read(path)?, principal));
         }
         if peers.is_empty() {
@@ -118,5 +123,22 @@ impl TlsFiles {
             client,
             Peers::new(peers),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::peer_principal;
+    use adx_protocol::auth::Principal;
+
+    #[test]
+    fn parses_exact_and_pool_node_roles() {
+        assert_eq!(
+            peer_principal("node:a").unwrap(),
+            Principal::Node("a".into())
+        );
+        assert_eq!(peer_principal("node-pool").unwrap(), Principal::NodePool);
+        assert!(peer_principal("node:").is_err());
+        assert!(peer_principal("node").is_err());
     }
 }

@@ -34,6 +34,7 @@ impl NodeRpc {
                     create_timeout_seconds: 90,
                 }),
                 node_session_id: self.session_id.clone(),
+                node_id: self.manager.node_id.clone(),
             };
             let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
             if let Err(error) = self.create_local(request, deadline).await {
@@ -44,12 +45,13 @@ impl NodeRpc {
 
     pub(super) async fn create_local(
         &self,
-        request: pb::LocalCapsuleCreateRequest,
+        mut request: pb::LocalCapsuleCreateRequest,
         deadline: tokio::time::Instant,
     ) -> std::result::Result<Response<pb::CapsuleResult>, Status> {
         if request.node_session_id != self.session_id {
             return Err(Status::failed_precondition("entry node session changed"));
         }
+        request.node_id.clone_from(&self.manager.node_id);
         let raw = request
             .create
             .as_ref()
@@ -120,6 +122,7 @@ impl NodeRpc {
                 .into_iter()
                 .map(Into::into)
                 .collect(),
+            node_id: self.manager.node_id.clone(),
         };
         let mut answer = Err(Status::unavailable("claim unavailable"));
         for _ in 0..2 {

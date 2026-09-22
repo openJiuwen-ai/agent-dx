@@ -123,9 +123,21 @@ message NodeEndpoint {
   map<string,string> labels = 6;
 }
 message NodeDirectory { uint64 epoch = 1; repeated NodeEndpoint nodes = 2; uint64 valid_for_millis = 3; }
-message LocalCapsuleCreateRequest { CreateCapsuleRequest create = 1; string node_session_id = 2; }
+message LocalCapsuleCreateRequest {
+  CreateCapsuleRequest create = 1;
+  string node_session_id = 2;
+  // Concrete entry node. Required when the caller uses a node-pool certificate.
+  string node_id = 3;
+}
 message PreparedCapsule { CapsuleSpec spec = 1; ReusableSnapshot snapshot = 2; }
-message ClaimCapsuleRequest { CapsuleSpec spec = 1; CallerContext caller = 2; string node_session_id = 3; repeated DeviceAllocation devices = 4; }
+message ClaimCapsuleRequest {
+  CapsuleSpec spec = 1;
+  CallerContext caller = 2;
+  string node_session_id = 3;
+  repeated DeviceAllocation devices = 4;
+  // Concrete claimant. Required when the caller uses a node-pool certificate.
+  string node_id = 5;
+}
 message ClaimCapsuleResponse {
   oneof outcome {
     StartAssignedCapsuleRequest owned = 1;

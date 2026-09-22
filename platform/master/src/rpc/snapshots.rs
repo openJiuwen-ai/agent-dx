@@ -138,25 +138,20 @@ impl pb::snapshot_service_server::SnapshotService for MasterRpc {
         trace
             .run_result(async {
                 let principal = self.0.peers.authenticate(&request)?;
-                let Principal::Node(node_id) = principal else {
-                    return Err(Status::permission_denied(
-                        "only source nodes publish snapshots",
-                    ));
-                };
                 let r = request.into_inner();
                 let snapshot: Snapshot = r
                     .snapshot
                     .ok_or_else(|| Status::invalid_argument("snapshot required"))?
                     .try_into()
                     .map_err(status)?;
-                if snapshot.source_node_id != node_id {
-                    return Err(Status::permission_denied("snapshot source node mismatch"));
-                }
+                let node_id = principal
+                    .authorized_node(&snapshot.source_node_id)
+                    .ok_or_else(|| Status::permission_denied("snapshot source node mismatch"))?;
                 let state = self.0.state.lock().await;
                 state.healthy().map_err(status)?;
                 let live = state
                     .live
-                    .get(&node_id)
+                    .get(node_id)
                     .ok_or_else(|| Status::failed_precondition("source node must register"))?;
                 if live.session != r.node_session_id
                     || !live.inspected
@@ -239,9 +234,9 @@ impl pb::snapshot_service_server::SnapshotService for MasterRpc {
                 let r = request.into_inner();
                 let state = self.0.state.lock().await;
                 state.healthy().map_err(status)?;
-                match &principal {
-                    Principal::ApiServer => (),
-                    Principal::Node(id) => {
+                let snapshot = state.session.get_snapshot(&r.id).await.map_err(status)?;
+                match principal.authorized_node(&snapshot.source_node_id) {
+                    Some(id) => {
                         let live = state
                             .live
                             .get(id)
@@ -256,19 +251,15 @@ impl pb::snapshot_service_server::SnapshotService for MasterRpc {
                             ));
                         }
                     }
-                    _ => {
+                    None if principal != Principal::ApiServer => {
                         return Err(Status::permission_denied(
                             "Frontend or source node identity required",
                         ))
                     }
+                    None => (),
                 }
-                let snapshot = state.session.get_snapshot(&r.id).await.map_err(status)?;
-                match principal {
-                    Principal::ApiServer => {
-                        tenant(r.caller.as_ref(), &snapshot.template.tenant_id)?
-                    }
-                    Principal::Node(id) if id == snapshot.source_node_id => (),
-                    _ => return Err(Status::permission_denied("snapshot source node mismatch")),
+                if principal == Principal::ApiServer {
+                    tenant(r.caller.as_ref(), &snapshot.template.tenant_id)?;
                 }
                 if snapshot.state == SnapshotState::Deleted {
                     return Err(Status::not_found("snapshot deleted"));

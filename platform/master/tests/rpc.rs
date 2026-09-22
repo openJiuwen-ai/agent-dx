@@ -2231,6 +2231,7 @@ async fn snapshot_gc_waits_for_node_ack_and_recovers_from_lost_ack() {
         .create_local_capsule(pb::LocalCapsuleCreateRequest {
             create: Some(request.clone()),
             node_session_id: "gc-boot".into(),
+            node_id: String::new(),
         })
         .await
         .unwrap()
@@ -2278,6 +2279,7 @@ async fn snapshot_gc_waits_for_node_ack_and_recovers_from_lost_ack() {
             .create_local_capsule(pb::LocalCapsuleCreateRequest {
                 create: Some(request.clone()),
                 node_session_id: "gc-boot".into(),
+                node_id: String::new(),
             })
             .await
             .unwrap()

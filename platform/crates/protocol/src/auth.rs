@@ -9,6 +9,23 @@ pub enum Principal {
     ApiServer,
     Edge,
     Node(String),
+    /// A deployment-managed certificate shared by a set of Node Managers.
+    /// The concrete node remains explicit in every node-originated request.
+    NodePool,
+}
+impl Principal {
+    /// Resolve the concrete node authorized by this mTLS identity.
+    ///
+    /// Exact node certificates may omit the request node for compatibility.
+    /// Pool certificates always require a non-empty request node so callers do
+    /// not silently collapse a multi-node deployment onto one identity.
+    pub fn authorized_node<'a>(&'a self, requested: &'a str) -> Option<&'a str> {
+        match self {
+            Self::Node(bound) if requested.is_empty() || requested == bound => Some(bound),
+            Self::NodePool if !requested.trim().is_empty() => Some(requested),
+            _ => None,
+        }
+    }
 }
 #[derive(Clone, Default)]
 pub struct Peers(Arc<BTreeMap<Vec<u8>, Principal>>);

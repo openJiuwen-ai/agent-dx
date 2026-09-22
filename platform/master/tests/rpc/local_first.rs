@@ -4,8 +4,8 @@ fn local_peers() -> Peers {
         [
             ("master", Principal::Master),
             ("api-server", Principal::ApiServer),
-            ("node", Principal::Node("a".into())),
-            ("edge", Principal::Node("b".into())),
+            ("node", Principal::NodePool),
+            ("edge", Principal::NodePool),
         ]
         .map(|(cert, role)| (file(&format!("{cert}.der")), role)),
     )
@@ -156,6 +156,7 @@ impl Rig {
         pb::LocalCapsuleCreateRequest {
             create: Some(create(id)),
             node_session_id: format!("boot-{}", if index == 0 { "a" } else { "b" }),
+            node_id: if index == 0 { "a" } else { "b" }.into(),
         }
     }
     async fn delete(&mut self, record: &pb::CapsuleRecord) {
@@ -398,6 +399,7 @@ async fn claim_rpc_auth_session_directory_and_real_delayed_redis_write() {
         caller: caller(),
         node_session_id: "boot-a".into(),
         devices: vec![],
+        node_id: "a".into(),
     };
     assert_eq!(
         rig.master
