@@ -15,6 +15,7 @@ class KubernetesDeploymentTests(unittest.TestCase):
         for pod in pods:
             self.assertEqual(pod['metadata']['namespace'],'adx-e2e-test')
             spec=pod['spec'];self.assertFalse(spec['automountServiceAccountToken'])
+            self.assertEqual(spec['terminationGracePeriodSeconds'],15)
             self.assertNotIn('hostNetwork',spec);self.assertNotIn('hostPID',spec)
             self.assertEqual(spec['nodeSelector']['kubernetes.io/arch'],'amd64')
             self.assertTrue(spec['containers'][0]['securityContext']['privileged'])

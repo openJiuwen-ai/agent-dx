@@ -12,7 +12,24 @@ buildkite-agent artifact download 'out/buildkite/adx-release.tar.gz.sha256' . --
 (cd out/buildkite && sha256sum --check adx-release.tar.gz.sha256)
 mkdir -p out/buildkite/package
 tar -xzf out/buildkite/adx-release.tar.gz -C out/buildkite/package
-buildkite-agent artifact download 'out/buildkite/backend/*' . --step platform-build --build "$ADX_BASE_PACKAGE_BUILD_ID"
+buildkite-agent artifact download 'out/buildkite/build-manifest.json' . --step platform-build --build "$ADX_BASE_PACKAGE_BUILD_ID"
+buildkite-agent artifact download 'out/buildkite/backend.tar.gz' . --step platform-build --build "$ADX_BASE_PACKAGE_BUILD_ID"
+mkdir -p out/buildkite/backend
+tar -xzf out/buildkite/backend.tar.gz -C out/buildkite/backend
+python3 build/e2e/verify_backend.py \
+  --directory out/buildkite/backend \
+  --target x86_64-unknown-linux-gnu
+base_wheels=(out/buildkite/package/sdk/adx_sandbox-*.whl)
+[[ ${#base_wheels[@]} == 1 && -f ${base_wheels[0]} ]] || { echo 'base package SDK wheel is missing' >&2; exit 1; }
+python3 build/release/component.py verify-build \
+  --manifest out/buildkite/build-manifest.json \
+  --commit "$BUILDKITE_COMMIT" \
+  --target x86_64-unknown-linux-gnu \
+  --package-manifest out/buildkite/package/manifest.json \
+  --release-archive out/buildkite/adx-release.tar.gz \
+  --wheel "${base_wheels[0]}" \
+  --backend-manifest out/buildkite/backend/manifest.json \
+  --backend-archive out/buildkite/backend.tar.gz
 echo "--- :python: Verify independent Sandbox SDK handoff"
 buildkite-agent artifact download 'out/buildkite/sdk/sdk-candidate.json' . --step sdk-package --build "$ADX_SDK_BUILD_ID"
 buildkite-agent artifact download 'out/buildkite/sdk/adx_sandbox-*.whl' . --step sdk-package --build "$ADX_SDK_BUILD_ID"

@@ -34,13 +34,17 @@ def collect(root, stage, exit_code, commit):
     result['stages'][stage] = {'status': 'passed' if exit_code == 0 else 'failed', 'exit_code': exit_code}
     if stage == 'release':
         manifest = read(root / 'release-manifest.json')
+        build_manifest = read(root / 'build-manifest.json')
         archive = root / 'adx-release.tar.gz'
-        if manifest and archive.is_file():
+        if manifest and build_manifest and archive.is_file():
+            if build_manifest.get('commit') != commit:
+                raise ValueError('build manifest belongs to a different commit')
             digest = hashlib.sha256()
             with archive.open('rb') as source:
                 for chunk in iter(lambda: source.read(1024 * 1024), b''):
                     digest.update(chunk)
-            result['release'] = {'manifest': manifest, 'bytes': archive.stat().st_size,
+            result['release'] = {'manifest': manifest, 'build_manifest': build_manifest,
+                                 'bytes': archive.stat().st_size,
                                  'sha256': digest.hexdigest(),
                                  'sdk': sorted(p.name for p in (root / 'sdk').glob('*.whl'))}
         if exit_code == 0 and not result.get('release'):
@@ -84,7 +88,8 @@ def render(result):
         lines += ['', '### 发布包', '',
                   link('下载统一发布包', 'adx-release.tar.gz') + ' · ' +
                   link('SHA256 文件', 'adx-release.tar.gz.sha256') + ' · ' +
-                  link('文件清单及校验值', 'release-manifest.json'), '',
+                  link('包内文件清单', 'release-manifest.json') + ' · ' +
+                  link('构建汇总清单', 'build-manifest.json'), '',
                   f"平台：{code(manifest['target'])}；配置：{code(manifest['profile'])}；大小：{release['bytes'] / 1048576:.1f} MiB", '',
                   'SHA256：' + code(release['sha256']), '',
                   '组件：' + ', '.join(code(Path(p).name) for p in manifest['files'] if p.startswith(('bin/', 'runtime/')))]

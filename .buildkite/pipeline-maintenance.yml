@@ -42,3 +42,58 @@ steps:
           resources:
             requests: {cpu: '1', memory: 1Gi}
             limits: {cpu: '2', memory: 2Gi}
+- label: ':docker: Build Ubuntu 20.04 ADX build environment'
+  key: build-image-sync
+  agents:
+    queue: default
+    os: linux
+    arch: amd64
+  command: python3 .buildkite/with_registry.py --docker -- bash .buildkite/sync-build-image.sh
+  timeout_in_minutes: 45
+  env:
+    BUILDKITE_AGENT_NAME: agent-stack-k8s
+  artifact_paths:
+  - out/buildkite/build-image/result.json
+  - out/buildkite/build-image/dockerd.log
+  plugins:
+  - kubernetes:
+      podSpec:
+        imagePullSecrets:
+        - name: swr-pull-secret
+        containers:
+        - image: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/sandbox-packager:v20260506_kubectl
+          securityContext:
+            privileged: true
+          volumeMounts:
+          - name: docker-graph
+            mountPath: /var/lib/docker
+          resources:
+            requests:
+              cpu: '8'
+              memory: 16Gi
+            limits:
+              cpu: '8'
+              memory: 16Gi
+          env:
+          - name: SWR_USERNAME
+            valueFrom:
+              secretKeyRef:
+                name: swr-credentials
+                key: username
+                optional: true
+          - name: SWR_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: swr-credentials
+                key: password
+                optional: true
+          - name: SWR_DOCKER_CONFIG_JSON
+            valueFrom:
+              secretKeyRef:
+                name: swr-pull-secret
+                key: .dockerconfigjson
+                optional: true
+        volumes:
+        - name: docker-graph
+          emptyDir: {}
+  if: build.env("ADX_BUILD_IMAGE_SYNC_ONLY") == "1" && build.env("ADX_COLLECTOR_SYNC_ONLY") != "1"

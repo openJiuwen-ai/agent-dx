@@ -9,10 +9,11 @@ export RUSTUP_AUTO_INSTALL=0
 expected=$(sed -n 's/^channel = "\([^"]*\)"/\1/p' rust-toolchain.toml)
 actual=$(rustc --version | awk '{print $2}')
 [[ "$actual" == "$expected" ]] || { echo "Rust image version mismatch: expected $expected, found $actual" >&2; return 1; }
-# The shared compile image provides the pinned compiler and targets but does not
-# guarantee developer components. Make the source gate explicit and idempotent
-# instead of discovering a missing rustfmt or Clippy after other bootstrap work.
-rustup component add rustfmt clippy --toolchain "$RUSTUP_TOOLCHAIN"
+# Build images carry every required component. CI must fail on image drift
+# instead of mutating the toolchain or reaching the network during bootstrap.
+installed=$(rustup component list --installed --toolchain "$RUSTUP_TOOLCHAIN")
+grep -q '^rustfmt-' <<<"$installed" || { echo 'Rust image is missing rustfmt' >&2; return 1; }
+grep -q '^clippy-' <<<"$installed" || { echo 'Rust image is missing Clippy' >&2; return 1; }
 mkdir -p "$CARGO_HOME" "$CARGO_TARGET_DIR"
 # CARGO_HOME overrides otherwise hide the source configuration baked in the image.
 cat > "$CARGO_HOME/config.toml.tmp.$$" <<'CONFIG'

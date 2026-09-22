@@ -1,50 +1,146 @@
 steps:
-- label: ':package: Build ADX base package'
-  key: platform-build
+- label: ':rust: Compile Platform'
+  key: build-platform
   agents:
     queue: default
     os: linux
     arch: amd64
   concurrency: 1
-  concurrency_group: adx/release-amd64
-  command: bash .buildkite/step.sh release bash .buildkite/build-e2e.sh
-  timeout_in_minutes: 60
+  concurrency_group: adx/build-platform-amd64
+  command: bash .buildkite/step.sh build-platform bash .buildkite/build-component.sh platform
+  timeout_in_minutes: 45
   artifact_paths:
   - out/buildkite/logs/**/*
-  - out/buildkite/adx-release.tar.gz
-  - out/buildkite/adx-release.tar.gz.sha256
-  - out/buildkite/backend/**/*
-  - out/buildkite/release-manifest.json
+  - out/buildkite/components/platform.tar.gz
   env:
     BUILDKITE_AGENT_NAME: agent-stack-k8s
     ADX_CARGO_HOME: /mnt/paas/build-cache/adx/cargo-home
     CARGO_HOME: /mnt/paas/build-cache/adx/cargo-home
-    CARGO_TARGET_DIR: /mnt/paas/build-cache/adx/cargo-target/amd64-rust1950
+    CARGO_TARGET_DIR: /mnt/paas/build-cache/adx/cargo-target/platform-amd64-rust1950
     RUSTUP_TOOLCHAIN: stable
     RUSTUP_AUTO_INSTALL: '0'
     GOCACHE: /mnt/paas/build-cache/adx/go-build/amd64
     GOMODCACHE: /mnt/paas/build-cache/adx/go-mod
-    ADX_BACKEND_ARTIFACT_BUILD: 01a0ad6d-9629-4da8-903b-3f8bd1ddc992
-  plugins:
+  plugins: &adx-build-plugins
   - kubernetes:
       podSpec:
         imagePullSecrets:
         - name: swr-pull-secret
         containers:
-        - image: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/compile-ubuntu2004-rust:v20260826_rust1950_musl_x86_64@sha256:13008c86d6ce56422b4591570d3b358a92d6d384100aafa41e04f5556a5d8faf
+        - image: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/adx-build@sha256:ad9edff0b7cd2d907648a772109ad516e5da7b7b8762f08fd8653979a1e2cb67
           volumeMounts:
           - name: build-cache
             mountPath: /mnt/paas
           resources:
-            requests: {cpu: '4', memory: 8Gi}
-            limits: {cpu: '8', memory: 16Gi}
+            requests:
+              cpu: '4'
+              memory: 8Gi
+            limits:
+              cpu: '8'
+              memory: 16Gi
         volumes:
         - name: build-cache
-          hostPath: {path: /mnt/paas, type: DirectoryOrCreate}
-- label: ':cloud: Upload ADX base artifacts to OBS'
+          hostPath:
+            path: /mnt/paas
+            type: DirectoryOrCreate
+- label: ':rust: Compile Gateway'
+  key: build-gateway
+  agents:
+    queue: default
+    os: linux
+    arch: amd64
+  concurrency: 1
+  concurrency_group: adx/build-gateway-amd64
+  command: bash .buildkite/step.sh build-gateway bash .buildkite/build-component.sh gateway
+  timeout_in_minutes: 45
+  artifact_paths:
+  - out/buildkite/logs/**/*
+  - out/buildkite/components/gateway.tar.gz
+  env:
+    BUILDKITE_AGENT_NAME: agent-stack-k8s
+    ADX_CARGO_HOME: /mnt/paas/build-cache/adx/cargo-home
+    CARGO_HOME: /mnt/paas/build-cache/adx/cargo-home
+    CARGO_TARGET_DIR: /mnt/paas/build-cache/adx/cargo-target/gateway-amd64-rust1950
+    RUSTUP_TOOLCHAIN: stable
+    RUSTUP_AUTO_INSTALL: '0'
+    GOCACHE: /mnt/paas/build-cache/adx/go-build/amd64
+    GOMODCACHE: /mnt/paas/build-cache/adx/go-mod
+  plugins: *adx-build-plugins
+- label: ':rust: Compile RRT'
+  key: build-rrt
+  agents:
+    queue: default
+    os: linux
+    arch: amd64
+  concurrency: 1
+  concurrency_group: adx/build-rrt-amd64
+  command: bash .buildkite/step.sh build-rrt bash .buildkite/build-component.sh rrt
+  timeout_in_minutes: 30
+  artifact_paths:
+  - out/buildkite/logs/**/*
+  - out/buildkite/components/rrt.tar.gz
+  env:
+    BUILDKITE_AGENT_NAME: agent-stack-k8s
+    ADX_CARGO_HOME: /mnt/paas/build-cache/adx/cargo-home
+    CARGO_HOME: /mnt/paas/build-cache/adx/cargo-home
+    CARGO_TARGET_DIR: /mnt/paas/build-cache/adx/cargo-target/rrt-amd64-rust1950
+    RUSTUP_TOOLCHAIN: stable
+    RUSTUP_AUTO_INSTALL: '0'
+    GOCACHE: /mnt/paas/build-cache/adx/go-build/amd64
+    GOMODCACHE: /mnt/paas/build-cache/adx/go-mod
+  plugins: *adx-build-plugins
+- label: ':test_tube: Source and Rust gate'
+  key: source-gate
+  agents:
+    queue: default
+    os: linux
+    arch: amd64
+  concurrency: 1
+  concurrency_group: adx/source-gate-amd64
+  command: bash .buildkite/step.sh source-gate bash .buildkite/source-gate.sh
+  timeout_in_minutes: 60
+  artifact_paths:
+  - out/buildkite/logs/**/*
+  env:
+    BUILDKITE_AGENT_NAME: agent-stack-k8s
+    ADX_CARGO_HOME: /mnt/paas/build-cache/adx/cargo-home
+    CARGO_HOME: /mnt/paas/build-cache/adx/cargo-home
+    CARGO_TARGET_DIR: /mnt/paas/build-cache/adx/cargo-target/source-gate-amd64-rust1950
+    RUSTUP_TOOLCHAIN: stable
+    RUSTUP_AUTO_INSTALL: '0'
+    GOCACHE: /mnt/paas/build-cache/adx/go-build/amd64
+    GOMODCACHE: /mnt/paas/build-cache/adx/go-mod
+  plugins: *adx-build-plugins
+- label: ':package: Assemble ADX base package'
+  key: platform-build
+  depends_on: [build-platform, build-gateway, build-rrt, source-gate]
+  agents:
+    queue: default
+    os: linux
+    arch: amd64
+  command: bash .buildkite/step.sh release bash .buildkite/package-components.sh
+  timeout_in_minutes: 20
+  artifact_paths:
+  - out/buildkite/logs/**/*
+  - out/buildkite/adx-release.tar.gz
+  - out/buildkite/adx-release.tar.gz.sha256
+  - out/buildkite/backend.tar.gz
+  - out/buildkite/release-manifest.json
+  - out/buildkite/build-manifest.json
+  env:
+    BUILDKITE_AGENT_NAME: agent-stack-k8s
+    ADX_CARGO_HOME: /mnt/paas/build-cache/adx/cargo-home
+    CARGO_HOME: /mnt/paas/build-cache/adx/cargo-home
+    CARGO_TARGET_DIR: /mnt/paas/build-cache/adx/cargo-target/package-amd64-rust1950
+    RUSTUP_TOOLCHAIN: stable
+    RUSTUP_AUTO_INSTALL: '0'
+    GOCACHE: /mnt/paas/build-cache/adx/go-build/amd64
+    GOMODCACHE: /mnt/paas/build-cache/adx/go-mod
+    ADX_BACKEND_ARTIFACT_BUILD: 01a0ad6d-9629-4da8-903b-3f8bd1ddc992
+  plugins: *adx-build-plugins
+- label: ':cloud: Upload ADX artifacts to OBS'
   key: platform-obs
   depends_on: platform-build
-  if: build.env("ADX_OBS_UPLOAD") == "1"
   agents:
     queue: default
     os: linux
@@ -64,14 +160,25 @@ steps:
         imagePullSecrets:
         - name: swr-pull-secret
         containers:
-        - image: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/compile-ubuntu2004-rust:v20260826_rust1950_musl_x86_64@sha256:13008c86d6ce56422b4591570d3b358a92d6d384100aafa41e04f5556a5d8faf
+        - image: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/adx-build@sha256:ad9edff0b7cd2d907648a772109ad516e5da7b7b8762f08fd8653979a1e2cb67
           resources:
-            requests: {cpu: '1', memory: 2Gi}
-            limits: {cpu: '2', memory: 4Gi}
+            requests:
+              cpu: '1'
+              memory: 2Gi
+            limits:
+              cpu: '2'
+              memory: 4Gi
           env:
           - name: OBS_ACCESS_KEY_ID
             valueFrom:
-              secretKeyRef: {name: obs-credentials, key: AK, optional: false}
+              secretKeyRef:
+                name: obs-credentials
+                key: AK
+                optional: false
           - name: OBS_SECRET_ACCESS_KEY
             valueFrom:
-              secretKeyRef: {name: obs-credentials, key: SK, optional: false}
+              secretKeyRef:
+                name: obs-credentials
+                key: SK
+                optional: false
+  if: build.env("ADX_OBS_UPLOAD") == "1"
