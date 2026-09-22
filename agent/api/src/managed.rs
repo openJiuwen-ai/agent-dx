@@ -1,6 +1,7 @@
-//! Gateway product facade. Redis and Sandbox lifecycle stay behind Activator.
+//! Gateway product facade. Redis and Sandbox access stay behind local or remote Activator.
+use crate::request::RequestContext;
 use crate::{activator::Control, Error, Result};
-use adx_agent_core::{activator::Target, *};
+use adx_agent_core::{activator::Target, target::Target as AccessTarget, *};
 use std::sync::Arc;
 
 pub struct ManagedService {
@@ -10,55 +11,129 @@ impl ManagedService {
     pub fn new(control: Arc<dyn Control>) -> Self {
         Self { control }
     }
-    pub async fn publish(&self, tenant: &str, template: &TemplateVersion) -> Result<()> {
-        self.control.publish(tenant, template).await
+    /// Select an Environment identity without creating product or Sandbox state.
+    /// Returns Invalid for an inline target or invalid scope components.
+    pub fn environment_scope(tenant: &str, target: &AccessTarget) -> Result<Scope> {
+        let (name, version, id) = match target {
+            AccessTarget::Template { name, version } => {
+                (name, version, uuid::Uuid::new_v4().to_string())
+            }
+            AccessTarget::Environment { name, version, id } => (name, version, id.clone()),
+            AccessTarget::Instance(_) => {
+                return Err(Error::Invalid(
+                    "instance requires inline authentication".into(),
+                ))
+            }
+        };
+        let scope = Scope {
+            tenant: tenant.into(),
+            template: name.clone(),
+            version: version.clone(),
+            environment_id: id,
+        };
+        scope.validate().map_err(Error::Invalid)?;
+        Ok(scope)
+    }
+    /// Select a declared service port before activation.
+    /// Returns Invalid when the protocol and optional port do not identify exactly one service.
+    pub fn select_service(
+        template: &TemplateVersion,
+        protocol: Protocol,
+        port: Option<u16>,
+    ) -> Result<u16> {
+        let mut ports = template
+            .service
+            .iter()
+            .filter(|s| s.protocol == protocol && port.is_none_or(|p| p == s.port))
+            .map(|s| s.port);
+        match (ports.next(), ports.next()) {
+            (Some(port), None) => Ok(port),
+            _ => Err(Error::Invalid(
+                "service must identify exactly one declared protocol/port".into(),
+            )),
+        }
+    }
+    pub async fn publish(
+        &self,
+        ctx: &RequestContext,
+        tenant: &str,
+        template: &TemplateVersion,
+    ) -> Result<()> {
+        self.control.publish(ctx, tenant, template).await
     }
     pub async fn template(
         &self,
+        ctx: &RequestContext,
         tenant: &str,
         name: &str,
         version: &str,
     ) -> Result<TemplateVersion> {
-        let value = self.control.template(tenant, name, version).await?;
+        let value = self.control.template(ctx, tenant, name, version).await?;
         if value.name != name || value.version != version {
             return Err(Error::Unavailable("template identity mismatch".into()));
         }
         value.validate().map_err(Error::Invalid)?;
         Ok(value)
     }
-    pub async fn create_environment(&self, scope: &Scope) -> Result<Environment> {
-        self.control.create_environment(scope).await
+    pub async fn create_environment(
+        &self,
+        ctx: &RequestContext,
+        scope: &Scope,
+    ) -> Result<Environment> {
+        self.control.create_environment(ctx, scope).await
     }
-    pub async fn environment(&self, scope: &Scope) -> Result<Environment> {
-        self.control.environment(scope).await
+    pub async fn environment(&self, ctx: &RequestContext, scope: &Scope) -> Result<Environment> {
+        self.control.environment(ctx, scope).await
     }
-    pub async fn delete_environment(&self, scope: &Scope) -> Result<()> {
-        self.control.delete_environment(scope).await
+    pub async fn list_environments(
+        &self,
+        ctx: &RequestContext,
+        query: &activator::EnvironmentList,
+    ) -> Result<activator::EnvironmentPage> {
+        query.validate().map_err(Error::Invalid)?;
+        self.control.list_environments(ctx, query).await
+    }
+    pub async fn delete_environment(&self, ctx: &RequestContext, scope: &Scope) -> Result<()> {
+        self.control.delete_environment(ctx, scope).await
     }
 
     /// Each request validates the service and activates against authoritative product state.
     pub async fn resolve(
         &self,
+        ctx: &RequestContext,
         scope: &Scope,
         protocol: Protocol,
         port: Option<u16>,
     ) -> Result<(Target, u16)> {
+        self.resolve_generation(ctx, scope, protocol, port, None)
+            .await
+    }
+    /// A retry of the same incoming request must not start a new lifecycle after deletion.
+    pub async fn retry_resolve(
+        &self,
+        ctx: &RequestContext,
+        scope: &Scope,
+        protocol: Protocol,
+        port: u16,
+        generation: &str,
+    ) -> Result<(Target, u16)> {
+        self.resolve_generation(ctx, scope, protocol, Some(port), Some(generation))
+            .await
+    }
+    async fn resolve_generation(
+        &self,
+        ctx: &RequestContext,
+        scope: &Scope,
+        protocol: Protocol,
+        port: Option<u16>,
+        generation: Option<&str>,
+    ) -> Result<(Target, u16)> {
         scope.validate().map_err(Error::Invalid)?;
         let template = self
-            .template(&scope.tenant, &scope.template, &scope.version)
+            .template(ctx, &scope.tenant, &scope.template, &scope.version)
             .await?;
-        let ports: Vec<_> = template
-            .service
-            .iter()
-            .filter(|s| s.protocol == protocol && port.is_none_or(|p| p == s.port))
-            .map(|s| s.port)
-            .collect();
-        if ports.len() != 1 {
-            return Err(Error::Invalid(
-                "service must identify exactly one declared protocol/port".into(),
-            ));
-        }
-        let target = self.control.activate(scope).await?;
+        let port = Self::select_service(&template, protocol, port)?;
+        let target = self.control.activate(ctx, scope, generation).await?;
         if target.environment.scope != *scope
             || target.environment.phase != EnvironmentPhase::Active
             || target.environment.generation.is_empty()
@@ -69,6 +144,6 @@ impl ManagedService {
                 "Activator target identity or service mismatch".into(),
             ));
         }
-        Ok((target, ports[0]))
+        Ok((target, port))
     }
 }

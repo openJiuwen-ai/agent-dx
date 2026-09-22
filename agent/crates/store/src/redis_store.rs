@@ -5,9 +5,15 @@ use std::time::Duration;
 // Validate all preconditions before mutation. Values remain opaque JSON strings;
 // only the revision string is decoded, so application u64 fields never pass through Lua numbers.
 const CAS: &str = r#"
-for i, key in ipairs(KEYS) do
+local count = tonumber(ARGV[1])
+for i = count + 1, #KEYS do
+  local kind = redis.call('TYPE', KEYS[i]).ok
+  if kind ~= 'none' and kind ~= 'zset' then return redis.error_reply('invalid index type') end
+end
+for i = 1, count do
+  local key = KEYS[i]
   local current = redis.call('GET', key)
-  local expected = ARGV[(i-1)*2+1]
+  local expected = ARGV[(i-1)*3+2]
   if expected == '' then
     if current then return 0 end
   else
@@ -16,12 +22,31 @@ for i, key in ipairs(KEYS) do
     if decoded.revision ~= expected then return 0 end
   end
 end
-for i, key in ipairs(KEYS) do
-  local replacement = ARGV[(i-1)*2+2]
-  if replacement == '#delete' then redis.call('DEL', key)
-  elseif replacement ~= '' then redis.call('SET', key, replacement) end
+for i = 1, count do
+  local key = KEYS[i]
+  local replacement = ARGV[(i-1)*3+3]
+  local index = tonumber(ARGV[(i-1)*3+4])
+  if replacement == '#delete' then
+    redis.call('DEL', key)
+    if index > 0 then redis.call('ZREM', KEYS[index], key) end
+  elseif replacement ~= '' then
+    redis.call('SET', key, replacement)
+    if index > 0 then redis.call('ZADD', KEYS[index], 0, key) end
+  end
 end
 return 1
+"#;
+
+const PAGE: &str = r#"
+local members = redis.call('ZRANGEBYLEX', KEYS[1], ARGV[1], '+', 'LIMIT', 0, ARGV[2])
+local result = {}
+for _, key in ipairs(members) do
+  local value = redis.call('GET', key)
+  if not value then return redis.error_reply('missing Environment index member') end
+  table.insert(result, key)
+  table.insert(result, value)
+end
+return result
 "#;
 
 struct ConnectionState {
@@ -79,7 +104,7 @@ impl RedisRepository {
         Ok(repository)
     }
     async fn check_schema(&self) -> Result<()> {
-        const SCHEMA: &str = "environment-v1";
+        const SCHEMA: &str = "environment-index-v1";
         let key = format!("{}schema", self.prefix);
         let mut set = redis::cmd("SET");
         set.arg(&key).arg(SCHEMA).arg("NX");
@@ -159,11 +184,22 @@ impl Repository for RedisRepository {
             .transpose()
     }
     async fn commit(&self, tx: &Transaction) -> Result<bool> {
+        let indexes: Vec<_> = tx
+            .checks
+            .iter()
+            .filter_map(|c| c.key.1.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
         let mut command = redis::cmd("EVAL");
-        command.arg(CAS).arg(tx.checks.len());
+        command.arg(CAS).arg(tx.checks.len() + indexes.len());
         for check in &tx.checks {
             command.arg(self.key(&check.key));
         }
+        for index in &indexes {
+            command.arg(format!("{}{}", self.prefix, index.0));
+        }
+        command.arg(tx.checks.len());
         for check in &tx.checks {
             command.arg(check.expected.as_ref().map_or("", Revision::as_str));
             match tx.puts.iter().find(|put| put.key == check.key) {
@@ -177,6 +213,14 @@ impl Repository for RedisRepository {
                     ""
                 }),
             };
+            command.arg(
+                check
+                    .key
+                    .1
+                    .as_ref()
+                    .and_then(|index| indexes.iter().position(|i| i == index))
+                    .map_or(0, |i| tx.checks.len() + i + 1),
+            );
         }
         let result: i64 = self.execute(command, true).await?;
         match result {
@@ -186,5 +230,34 @@ impl Repository for RedisRepository {
                 "unexpected transaction result".into(),
             )),
         }
+    }
+    async fn page(
+        &self,
+        index: &Index,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<(String, Record)>> {
+        let mut command = redis::cmd("EVAL");
+        command
+            .arg(PAGE)
+            .arg(1)
+            .arg(format!("{}{}", self.prefix, index.0))
+            .arg(after.map_or_else(|| "-".to_owned(), |v| format!("({}{v}", self.prefix)))
+            .arg(limit);
+        let values: Vec<String> = self.execute(command, false).await?;
+        if !values.len().is_multiple_of(2) {
+            return Err(Error::Corrupt("invalid Environment page response".into()));
+        }
+        values
+            .chunks_exact(2)
+            .map(|pair| {
+                let key = pair[0]
+                    .strip_prefix(&self.prefix)
+                    .ok_or_else(|| Error::Corrupt("invalid Environment index member".into()))?;
+                let record =
+                    serde_json::from_str(&pair[1]).map_err(|e| Error::Corrupt(e.to_string()))?;
+                Ok((key.to_owned(), record))
+            })
+            .collect()
     }
 }
