@@ -310,3 +310,29 @@ Edge → Node Proxy 数据链路改为明文；组件角色和节点 ID 由请�
 `ADX_DATA_PLANE_EDGE_FRONTEND_NODE_TLS_*`、`ADX_DATA_PLANE_NODE_PROXY_TLS_*`
 及 `ADX_DATA_PLANE_NODE_PROXY_MTLS_CLIENT_CA` 环境项；对外 HTTPS 配置保留。
 同一条内部链路的两端必须使用一致模式。
+
+### 管理员 Key 的生成、读取与轮换
+
+Key 由部署者生成并写入受保护文件，Master 继续通过
+`bootstrap_credentials[].key_file` 读取。配置和渲染结果只包含文件路径。
+例如首次部署时生成密钥（已有文件应复用，不要在每次启动时重新生成）：
+
+```sh
+install -d -m 0700 /opt/adx/config/secrets
+(umask 077; set -C; openssl rand -hex 32 > /opt/adx/config/secrets/admin-key)
+```
+
+Master 启动时将配置中的管理员 Key 视为完整目标集合，并在 Redis 中原子更新：
+新增 Key 生效、移出的管理员 Key 记录永久撤销标记，租户 Key 保留。
+至少配置一个未过期的有效管理员 Key。重复 Key、已撤销 Key、无效文件或
+与租户 Key 冲突的配置会导致启动失败，不能通过恢复旧文件重新启用撤销的 Key。
+这适用于升级前已登记的管理员 Key，不需要另行迁移目录。
+
+轮换时先准备新的权限为 0600 的密钥文件，原子替换原 `key_file`，再重启
+Master；仅修改文件不会触发热重载。部署者从新文件读取 Key 更新客户端，
+不要把内容写入服务日志。需要分阶段切换时，先同时配置两个 Key，重启后
+更新客户端，再移除旧 Key 并再次重启。保留 Redis 数据。
+
+API Server 和 Edge 的既有认证缓存可能继续接受旧 Key 直到缓存到期；默认
+示例为 10 秒，在途认证另受 RPC 超时限制。轮换不撤销已建立的长连接。
+初始管理员 Key 不由租户 Key 删除接口管理，而由上述部署配置集合管理。

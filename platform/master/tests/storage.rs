@@ -402,7 +402,7 @@ async fn discovery_expires_and_rejects_superseded_master() {
         .await
         .is_err());
     assert!(second
-        .advertise("test", "http://127.0.0.1:9200", Duration::from_secs(5))
+        .advertise("test", "http://127.0.0.1:9200/path", Duration::from_secs(5))
         .await
         .is_err());
 }
@@ -909,3 +909,6 @@ async fn recovery_never_uses_missing_local_or_expired_checkpoint() {
         assert_eq!(before.result.unwrap().state, CapsuleState::Failed);
     }
 }
+
+#[path = "storage/admin_keys.rs"]
+mod admin_keys;

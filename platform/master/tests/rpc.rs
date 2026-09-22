@@ -776,7 +776,13 @@ async fn master_process_loads_configuration_and_restores_bootstrap_credentials()
     });
     let path = directory.path().join("master.json");
     std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
-    for index in 0..2 {
+    for index in 0..3 {
+        let active_key = if index == 2 {
+            "master-rotated-key-".repeat(3)
+        } else {
+            key.clone()
+        };
+        std::fs::write(&key_file, &active_key).unwrap();
         let log = std::fs::File::create(
             PathBuf::from(std::env::var("ADX_TEST_EVIDENCE").unwrap())
                 .join(format!("master-process-{index}.log")),
@@ -820,7 +826,7 @@ async fn master_process_loads_configuration_and_restores_bootstrap_credentials()
         let mut auth = pb::auth_service_client::AuthServiceClient::new(connection.clone());
         let credential = auth
             .verify_api_key(pb::VerifyApiKeyRequest {
-                api_key: key.clone(),
+                api_key: active_key,
             })
             .await
             .unwrap()
@@ -832,6 +838,17 @@ async fn master_process_loads_configuration_and_restores_bootstrap_credentials()
                 administrator: true
             }
         );
+        if index == 2 {
+            assert_eq!(
+                auth.verify_api_key(pb::VerifyApiKeyRequest {
+                    api_key: key.clone()
+                })
+                .await
+                .unwrap_err()
+                .code(),
+                tonic::Code::Unauthenticated
+            );
+        }
         let mut keys = pb::credential_service_client::CredentialServiceClient::new(connection);
         let page = keys
             .list_tenant_keys(pb::ListTenantKeysRequest {
