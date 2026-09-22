@@ -138,6 +138,8 @@ struct ProfileDeployment {
     schema_version: u32,
     profile: Profile,
     #[serde(default)]
+    internal_security: Option<adx_protocol::auth::SecurityMode>,
+    #[serde(default)]
     package_dir: Option<PathBuf>,
     #[serde(default)]
     state_dir: Option<PathBuf>,
@@ -689,6 +691,44 @@ fn resolve_profile(input: ProfileDeployment) -> Result<Deployment> {
             merge_value(&mut service.config, config);
         }
         service.env.extend(patch.env);
+    }
+    if input.internal_security == Some(adx_protocol::auth::SecurityMode::Network) {
+        for service in &mut deployment.services {
+            let Some(config) = service.config.as_object_mut() else {
+                continue;
+            };
+            if matches!(service.role, Role::Master | Role::NodeManager | Role::Edge) {
+                config.insert("tls".into(), serde_json::json!({"mode": "network"}));
+            }
+            if service.role == Role::ApiServer {
+                config.insert("internal_security".into(), serde_json::json!("network"));
+                // Certificate/key can still serve a separately configured public API listener.
+                if config.get("loopback_http").and_then(Value::as_bool) == Some(true) {
+                    for key in ["ca", "certificate", "private_key", "server_name"] {
+                        config.remove(key);
+                    }
+                }
+            }
+            if service.role == Role::Master {
+                if let Some(Value::String(address)) = config.get_mut("advertised_address") {
+                    *address = address.replacen("https://", "http://", 1);
+                }
+            }
+            if matches!(
+                service.role,
+                Role::Edge | Role::NodeManager | Role::NodeProxy
+            ) {
+                service.env.insert(
+                    "ADX_DATA_PLANE_EDGE_FRONTEND_NODE_SECURITY_MODE".into(),
+                    "network".into(),
+                );
+                service.env.retain(|key, _| {
+                    !key.starts_with("ADX_DATA_PLANE_EDGE_FRONTEND_NODE_TLS_")
+                        && !key.starts_with("ADX_DATA_PLANE_NODE_PROXY_TLS_")
+                        && key != "ADX_DATA_PLANE_NODE_PROXY_MTLS_CLIENT_CA"
+                });
+            }
+        }
     }
     Ok(deployment)
 }

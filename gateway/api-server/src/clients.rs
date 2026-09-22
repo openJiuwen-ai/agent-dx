@@ -1,6 +1,7 @@
 use crate::{capsule_directory::CapsuleDirectory, config::Config, ownership::Cache};
 use adx_observability::trace;
 use adx_protocol::control as pb;
+use adx_transport::rpc::{RpcChannel, RpcClient, SecurityMode};
 use adx_transport::tls::grpc_client_config;
 use sha2::{Digest, Sha256};
 use std::{
@@ -9,30 +10,32 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::Mutex;
-use tonic::{
-    transport::{Channel, ClientTlsConfig, Endpoint},
-    Response, Status,
-};
+use tonic::{Response, Status};
 
 pub struct Clients {
     pub config: Config,
     directory: Mutex<crate::directory::Directory>,
-    tls: ClientTlsConfig,
+    tls: RpcClient,
     discovery: Option<adx_discovery::RedisDiscovery>,
     endpoint: Mutex<Cache<(), String>>,
-    channels: Mutex<Cache<String, Channel>>,
+    channels: Mutex<Cache<String, RpcChannel>>,
     auth: Mutex<Cache<[u8; 32], pb::CallerContext>>,
     capsules: Mutex<CapsuleDirectory>,
 }
 impl Clients {
     pub fn new(config: Config) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
         config.validate()?;
-        let tls = grpc_client_config(
-            &config.ca,
-            &config.certificate,
-            &config.private_key,
-            &config.server_name,
-        )?;
+        let tls = if config.internal_security == SecurityMode::Network {
+            RpcClient::network(adx_protocol::auth::Principal::ApiServer)
+        } else {
+            grpc_client_config(
+                &config.ca,
+                &config.certificate,
+                &config.private_key,
+                &config.server_name,
+            )?
+            .into()
+        };
         let discovery = config
             .discovery
             .as_ref()
@@ -156,7 +159,7 @@ impl Clients {
             .snapshot()
             .ok_or_else(|| Status::unavailable("node directory unavailable"))
     }
-    pub async fn master(&self) -> Result<Channel, Status> {
+    pub async fn master(&self) -> Result<RpcChannel, Status> {
         let address = if let Some(discovery) = &self.discovery {
             let cached = self.endpoint.lock().await.get(&());
             if let Some(v) = cached {
@@ -184,26 +187,22 @@ impl Clients {
         };
         self.channel(&address).await
     }
-    pub async fn channel(&self, address: &str) -> Result<Channel, Status> {
-        let address = if address.contains("://") {
-            address.to_string()
-        } else {
-            format!("https://{address}")
-        };
-        if !address.starts_with("https://") {
-            return Err(Status::unavailable("internal RPC requires TLS"));
-        }
+    pub async fn channel(&self, address: &str) -> Result<RpcChannel, Status> {
         let mut channels = self.channels.lock().await;
-        if let Some(v) = channels.get(&address) {
+        if let Some(v) = channels.get(&address.to_owned()) {
             return Ok(v);
         }
-        let endpoint = Endpoint::from_shared(address.clone())
-            .map_err(|_| Status::unavailable("invalid RPC endpoint"))?
-            .tls_config(self.tls.clone())
-            .map_err(|_| Status::unavailable("invalid RPC TLS configuration"))?
+        let endpoint = self
+            .tls
+            .endpoint(address)
+            .map_err(|_| Status::unavailable("invalid RPC endpoint or security mode"))?
             .connect_timeout(self.config.timeout());
-        let channel = endpoint.connect_lazy();
-        channels.insert(address, channel.clone(), Duration::from_secs(3600));
+        let channel = self.tls.wrap(endpoint.connect_lazy());
+        channels.insert(
+            address.to_owned(),
+            channel.clone(),
+            Duration::from_secs(3600),
+        );
         Ok(channel)
     }
     pub async fn rpc<T>(

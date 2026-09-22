@@ -1,4 +1,5 @@
 //! Node RPC adaptation; CapsuleHandle remains the lifecycle owner.
+use adx_transport::rpc::{authenticated_channel, RpcChannel};
 mod local_create;
 use crate::{Durability, NodeManager, StateSink};
 use adx_core::{CapsuleRecord, Error, Result};
@@ -428,14 +429,18 @@ impl pb::node_service_server::NodeService for NodeRpc {
 
 #[derive(Clone)]
 pub struct MasterStateSink {
-    snapshots: Arc<std::sync::RwLock<pb::snapshot_service_client::SnapshotServiceClient<Channel>>>,
-    client: Arc<std::sync::RwLock<pb::master_service_client::MasterServiceClient<Channel>>>,
+    snapshots:
+        Arc<std::sync::RwLock<pb::snapshot_service_client::SnapshotServiceClient<RpcChannel>>>,
+    client: Arc<std::sync::RwLock<pb::master_service_client::MasterServiceClient<RpcChannel>>>,
     session_id: String,
     timeout: Duration,
 }
 impl MasterStateSink {
     /// Channel carries the node's deployment-provided client certificate.
     pub fn new(channel: Channel, timeout: Duration) -> Result<Self> {
+        Self::with_rpc_channel(authenticated_channel(channel), timeout)
+    }
+    pub fn with_rpc_channel(channel: RpcChannel, timeout: Duration) -> Result<Self> {
         if timeout.is_zero() {
             return Err(Error::Invalid("RPC timeout must be positive".into()));
         }
@@ -454,7 +459,7 @@ impl MasterStateSink {
         self.session_id = session_id;
         self
     }
-    pub fn reconnect(&self, channel: Channel) {
+    pub fn reconnect(&self, channel: RpcChannel) {
         *self.snapshots.write().expect("shared state lock poisoned") =
             pb::snapshot_service_client::SnapshotServiceClient::new(channel.clone());
         *self.client.write().expect("shared state lock poisoned") =

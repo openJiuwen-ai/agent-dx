@@ -1520,14 +1520,18 @@ async fn published_routes_drive_real_gateway_streams_and_reconnect_to_new_master
         generation: 1,
         devices: vec![],
     };
+    let mut routed_spec = spec("routed");
+    routed_spec.sandbox.ports = vec![target_port];
+    routed_spec.sandbox.data_plane.port_forward =
+        adx_core::sandbox::DataPlaneSecurityMode::TlsToken;
     session
-        .reserve(spec("routed"), assignment.clone())
+        .reserve(routed_spec.clone(), assignment.clone())
         .await
         .unwrap();
     let mut record = CapsuleRecord {
         restart_attempts: 0,
         restart_pending: false,
-        spec: spec("routed"),
+        spec: routed_spec,
         assignment,
         state: CapsuleState::Running,
         revision: 2,
@@ -2717,3 +2721,6 @@ async fn shared_checkpoint_moves_to_new_node_and_old_node_cleans_without_deletin
 
 #[path = "rpc/local_first.rs"]
 mod local_first;
+
+#[path = "rpc/network.rs"]
+mod network;

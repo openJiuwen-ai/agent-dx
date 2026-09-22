@@ -38,9 +38,15 @@ pub struct Config {
     #[serde(default)]
     pub master_address: String,
     pub discovery: Option<Discovery>,
+    #[serde(default)]
+    pub internal_security: adx_transport::rpc::SecurityMode,
+    #[serde(default)]
     pub ca: PathBuf,
+    #[serde(default)]
     pub certificate: PathBuf,
+    #[serde(default)]
     pub private_key: PathBuf,
+    #[serde(default)]
     pub server_name: String,
     pub rpc_timeout_seconds: u64,
     pub cache_entries: usize,
@@ -58,7 +64,8 @@ impl Config {
             e.validate()?;
         }
         if self.master_address.is_empty() == self.discovery.is_none()
-            || self.server_name.is_empty()
+            || (self.internal_security == adx_transport::rpc::SecurityMode::Mtls
+                && self.server_name.is_empty())
             || self.rpc_timeout_seconds == 0
             || self.auth_cache_ttl_seconds == 0
             || self.cache_entries == 0

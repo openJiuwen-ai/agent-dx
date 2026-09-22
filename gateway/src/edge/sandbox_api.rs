@@ -3,10 +3,11 @@
 use adx_agent_core::sandbox::*;
 use adx_agent_core::{
     limits,
-    transport::{service_origin, validate_service_token, RequestProgress, ServiceAuth},
+    transport::{validate_service_token, RequestProgress, ServiceAuth},
 };
 use adx_discovery::RedisDiscovery;
 use adx_protocol::control as pb;
+use adx_transport::rpc::{RpcChannel, RpcClient};
 use adx_transport::tls::TlsFiles;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -14,7 +15,6 @@ use http_body_util::{BodyExt, Full};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeSet, sync::Arc, time::Duration};
-use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 
 type Result<T> = std::result::Result<T, SandboxError>;
 const EXECUTION_HASH: &str = "ADX_AGENT_EXECUTION_HASH";
@@ -45,11 +45,11 @@ pub struct SandboxConfig {
 
 pub struct PlatformSandbox {
     discovery: RedisDiscovery,
-    tls: ClientTlsConfig,
+    tls: RpcClient,
     timeout: Duration,
     profiles: Vec<PreinstalledProfile>,
     rrt_token: String,
-    master: tokio::sync::Mutex<Option<Channel>>,
+    master: tokio::sync::Mutex<Option<RpcChannel>>,
 }
 impl PlatformSandbox {
     pub fn new(
@@ -61,7 +61,9 @@ impl PlatformSandbox {
         }
         validate_service_token(&rrt_token)?;
         validate_profiles(&config.preinstalled_profiles)?;
-        let (_, tls, _) = config.frontend_tls.load()?;
+        let (_, tls, _) = config
+            .frontend_tls
+            .load_rpc(adx_protocol::auth::Principal::ApiServer)?;
         let timeout = Duration::from_secs(config.rpc_timeout_seconds);
         Ok(Self {
             discovery: RedisDiscovery::new(&config.redis_url, &config.platform_namespace, timeout)?,
@@ -72,19 +74,20 @@ impl PlatformSandbox {
             master: tokio::sync::Mutex::new(None),
         })
     }
-    async fn connect(&self, address: String) -> Result<Channel> {
-        service_origin(&address, false).map_err(SandboxError::Unavailable)?;
-        Endpoint::from_shared(address)
-            .map_err(|_| SandboxError::Unavailable("invalid Platform endpoint".into()))?
-            .tls_config(self.tls.clone())
-            .map_err(|_| SandboxError::Unavailable("Platform TLS configuration failed".into()))?
+    async fn connect(&self, address: String) -> Result<RpcChannel> {
+        self.tls
+            .endpoint(&address)
+            .map_err(|_| {
+                SandboxError::Unavailable("invalid Platform endpoint or security mode".into())
+            })?
             .connect_timeout(self.timeout)
             .timeout(self.timeout)
             .connect()
             .await
+            .map(|channel| self.tls.wrap(channel))
             .map_err(|_| SandboxError::Unavailable("Platform connection unavailable".into()))
     }
-    async fn master(&self) -> Result<Channel> {
+    async fn master(&self) -> Result<RpcChannel> {
         let mut cached = self.master.lock().await;
         if let Some(channel) = cached.as_ref() {
             return Ok(channel.clone());

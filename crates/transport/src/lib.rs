@@ -2,6 +2,7 @@
 
 pub mod deadline;
 pub mod request;
+pub mod rpc;
 pub mod tls;
 
 /// Select Ring explicitly when the workspace dependency graph contains more

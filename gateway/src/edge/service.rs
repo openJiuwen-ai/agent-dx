@@ -335,6 +335,7 @@ mod tests {
             redis_url: "redis://127.0.0.1:1/".into(),
             namespace: "edge-service-test".into(),
             tls: TlsFiles {
+                mode: Default::default(),
                 ca: certificate.clone(),
                 certificate: certificate.clone(),
                 private_key,

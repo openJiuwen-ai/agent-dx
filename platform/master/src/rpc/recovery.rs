@@ -67,9 +67,10 @@ impl MasterRpc {
             work
         };
         let results = stream::iter(work.into_iter().map(|(node, record)| async move {
-            let endpoint = Endpoint::from_shared(format!("https://{}", node.address))
-                .map_err(|_| Error::Conflict)?
-                .tls_config(self.0.node_tls.clone())
+            let endpoint = self
+                .0
+                .node_tls
+                .endpoint(&node.address)
                 .map_err(|_| Error::Conflict)?
                 .connect_timeout(self.0.timeout)
                 .timeout(self.0.timeout);
@@ -78,14 +79,15 @@ impl MasterRpc {
                 .await
                 .map_err(|_| Error::Unavailable("recovery node unavailable".into()))?;
             let session = node.session.ok_or(Error::Conflict)?.id;
-            let response = pb::node_service_client::NodeServiceClient::new(channel)
-                .recover_capsule(pb::RecoverCapsuleRequest {
-                    record: Some(record.try_into()?),
-                    node_session_id: session.clone(),
-                })
-                .await
-                .map_err(adx_protocol::dependency_status)?
-                .into_inner();
+            let response =
+                pb::node_service_client::NodeServiceClient::new(self.0.node_tls.wrap(channel))
+                    .recover_capsule(pb::RecoverCapsuleRequest {
+                        record: Some(record.try_into()?),
+                        node_session_id: session.clone(),
+                    })
+                    .await
+                    .map_err(adx_protocol::dependency_status)?
+                    .into_inner();
             if response.durability != pb::Durability::Published as i32 {
                 return Err(Error::Unavailable(
                     "recovery result publication pending".into(),

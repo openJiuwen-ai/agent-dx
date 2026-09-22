@@ -731,3 +731,55 @@ fn common_oci_environment_is_rendered_to_node_and_api() {
         assert_eq!(rendered_config["environment"]["bootstrap"]["image"], image);
     }
 }
+
+#[test]
+fn network_profile_removes_internal_certificates_but_keeps_public_https() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("deployment.yaml");
+    std::fs::write(
+        &path,
+        "schema_version: 1\nprofile: standalone\ninternal_security: network\n",
+    )
+    .unwrap();
+    let deployment = Deployment::load(&path).unwrap();
+    let master = deployment
+        .services
+        .iter()
+        .find(|s| s.role == Role::Master)
+        .unwrap();
+    assert_eq!(master.config["tls"], json!({"mode": "network"}));
+    assert!(master.config["advertised_address"]
+        .as_str()
+        .unwrap()
+        .starts_with("http://"));
+    let node = deployment
+        .services
+        .iter()
+        .find(|s| s.role == Role::NodeManager)
+        .unwrap();
+    assert_eq!(node.config["tls"], json!({"mode": "network"}));
+    assert!(!node.env.contains_key("ADX_DATA_PLANE_NODE_PROXY_TLS_KEY"));
+    let api = deployment
+        .services
+        .iter()
+        .find(|s| s.role == Role::ApiServer)
+        .unwrap();
+    assert_eq!(api.config["internal_security"], "network");
+    assert!(api.config.get("certificate").is_none());
+    let edge = deployment
+        .services
+        .iter()
+        .find(|s| s.role == Role::Edge)
+        .unwrap();
+    assert_eq!(edge.config["tls"], json!({"mode": "network"}));
+    assert_eq!(
+        edge.env["ADX_DATA_PLANE_EDGE_FRONTEND_NODE_SECURITY_MODE"],
+        "network"
+    );
+    assert!(edge
+        .env
+        .contains_key("ADX_DATA_PLANE_EDGE_FRONTEND_TLS_CERT"));
+    assert!(edge
+        .env
+        .contains_key("ADX_DATA_PLANE_EDGE_FRONTEND_TLS_KEY"));
+}
