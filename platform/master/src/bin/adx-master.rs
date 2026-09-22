@@ -60,11 +60,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
     let store = RedisStore::connect(&config.redis_url, &config.namespace, timeout).await?;
     let session = store.begin(config.scheduler_shards).await?;
+    let mut administrators = Vec::new();
+    let mut tenants = Vec::new();
     for credential in config.bootstrap_credentials {
         let key = std::fs::read_to_string(credential.key_file)?;
-        session
-            .bootstrap_credential(key.trim(), &credential.credential)
-            .await?;
+        let entry = (key.trim().to_owned(), credential.credential);
+        if entry.1.administrator {
+            administrators.push(entry);
+        } else {
+            tenants.push(entry);
+        }
+    }
+    session.reconcile_administrators(&administrators).await?;
+    for (key, credential) in tenants {
+        session.bootstrap_credential(&key, &credential).await?;
     }
     let auth = AuthRpc::new(session.clone(), peers.clone());
     let routes = adx_master::routes::RoutePublisher::new(session.clone(), peers.clone());
