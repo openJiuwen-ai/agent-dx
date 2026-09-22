@@ -9,6 +9,7 @@ use tokio::time::timeout;
 mod lifecycle;
 mod monitor;
 mod snapshots;
+mod workload_checkpoint;
 use super::checkpoint::{PauseRequest, ResumeRequest};
 
 enum Command {
@@ -354,6 +355,10 @@ impl Controller {
                 .is_running(&self.record.runtime.id)
                 .await?
         {
+            self.reconcile_workload_checkpoint().await?;
+            if self.record.state == CapsuleState::Failed {
+                return self.sync().await;
+            }
             if self.recovery_files.is_none() {
                 if let (Some(cp), Some(services)) =
                     (&self.record.checkpoint, &self.services.checkpoint)
@@ -450,6 +455,10 @@ impl Controller {
         }
         if let (Some(cp), Some(services)) = (&self.record.checkpoint, &self.services.checkpoint) {
             services.store.committed(&cp.artifact).await?;
+        }
+        // A restored backend may still map an older recovery point. Keep it until stop.
+        if self.recovery_files.is_some() {
+            return Ok(());
         }
         while let Some(artifact) = self.obsolete_checkpoints.last() {
             self.services

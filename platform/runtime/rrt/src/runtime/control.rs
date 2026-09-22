@@ -31,6 +31,8 @@ struct State {
     status: RuntimeStatus,
     prepare: Option<PrepareCheckpoint>,
     reader_running: bool,
+    workload_reply: Option<watch::Sender<Option<std::result::Result<(), String>>>>,
+    workload_finished: Option<FinishWorkloadCheckpoint>,
 }
 pub struct Controller {
     state: Mutex<State>,
@@ -56,16 +58,82 @@ impl Controller {
                     revision: 1,
                     phase: RuntimePhase::Running,
                     checkpoint: None,
+                    requested_checkpoint: None,
                     active_requests: 0,
                     active_commands: 0,
                     activity_revision: 1,
                 },
                 prepare: None,
                 reader_running: false,
+                workload_reply: None,
+                workload_finished: None,
             }),
             hooks,
             changed,
         }))
+    }
+    /// Only the local Unix listener calls this. A disconnected caller does not cancel it.
+    /// Concurrent workload requests or an active checkpoint return Conflict.
+    pub async fn request_checkpoint(&self, operation_id: String) -> Result<()> {
+        if operation_id.is_empty() || operation_id.len() > 128 {
+            return Err(Error::Invalid("invalid checkpoint operation id".into()));
+        }
+        let mut reply = {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| Error::Unavailable("runtime state poisoned".into()))?;
+            if state.status.phase != RuntimePhase::Running || state.workload_reply.is_some() {
+                return Err(Error::Conflict);
+            }
+            let (sender, reply) = watch::channel(None);
+            state.status.requested_checkpoint = Some(operation_id);
+            state.workload_reply = Some(sender);
+            state.workload_finished = None;
+            self.publish(&mut state);
+            reply
+        };
+        loop {
+            if let Some(result) = reply.borrow_and_update().clone() {
+                return result.map_err(Error::Unavailable);
+            }
+            reply
+                .changed()
+                .await
+                .map_err(|_| Error::Unavailable("checkpoint request retired".into()))?;
+        }
+    }
+    /// A successful ACK requires the matching backend handoff. Duplicate ACKs are idempotent.
+    pub fn finish_checkpoint(&self, request: FinishWorkloadCheckpoint) -> Result<RuntimeStatus> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| Error::Unavailable("runtime state poisoned".into()))?;
+        if state.status.identity != request.identity {
+            return Err(Error::Conflict);
+        }
+        if state.workload_finished.as_ref() == Some(&request) {
+            return Ok(state.status.clone());
+        }
+        if state.status.requested_checkpoint.as_deref() != Some(&request.operation_id) {
+            return Err(Error::Conflict);
+        }
+        if request.error.is_none()
+            && (state.status.phase != RuntimePhase::Running
+                || state.status.checkpoint.as_ref().is_none_or(|cp| {
+                    cp.operation_id != request.operation_id || cp.phase != CheckpointPhase::Resumed
+                }))
+        {
+            return Err(Error::Conflict);
+        }
+        let result = request.error.clone().map_or(Ok(()), Err);
+        if let Some(reply) = state.workload_reply.take() {
+            reply.send_replace(Some(result));
+        }
+        state.status.requested_checkpoint = None;
+        state.workload_finished = Some(request);
+        self.publish(&mut state);
+        Ok(state.status.clone())
     }
     pub fn status(&self) -> RuntimeStatus {
         let mut status = self.state.lock().unwrap().status.clone();
@@ -89,6 +157,14 @@ impl Controller {
         let mut changes = self.subscribe();
         {
             let mut state = self.state.lock().unwrap();
+            if state
+                .status
+                .requested_checkpoint
+                .as_ref()
+                .is_some_and(|id| id != &request.operation_id)
+            {
+                return Err(Error::Conflict);
+            }
             if request.identity != state.status.identity {
                 return Err(Error::Conflict);
             }
@@ -195,6 +271,13 @@ impl Controller {
                 return;
             }
             if matches!(outcome, Ok(HandoffOutcome::Restore)) {
+                if let Some(reply) = state.workload_reply.take() {
+                    reply.send_replace(Some(Err(
+                        "source checkpoint request retired on restore".into()
+                    )));
+                }
+                state.status.requested_checkpoint = None;
+                state.workload_finished = None;
                 state.status.phase = RuntimePhase::Restoring;
                 self.publish(&mut state);
             }

@@ -81,6 +81,9 @@ pub struct RuntimeStatus {
     pub revision: u64,
     pub phase: RuntimePhase,
     pub checkpoint: Option<CheckpointStatus>,
+    /// Workload-originated request, consumed only by the owning Node Manager.
+    #[serde(default)]
+    pub requested_checkpoint: Option<String>,
     pub active_requests: u64,
     pub active_commands: u64,
     /// Changes on request/command entry and exit, including bursts between polls.
@@ -136,4 +139,14 @@ impl RuntimeRestore {
             Some(_) => Err(Error::Conflict),
         }
     }
+}
+
+/// Node acknowledgement after the local recovery point is committed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinishWorkloadCheckpoint {
+    pub identity: RuntimeIdentity,
+    pub operation_id: String,
+    /// A failure wakes the workload without asserting that a checkpoint exists.
+    pub error: Option<String>,
 }

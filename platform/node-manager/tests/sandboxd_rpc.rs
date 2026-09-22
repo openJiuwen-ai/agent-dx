@@ -137,7 +137,10 @@ impl sandbox_service_server::SandboxService for Server {
     ) -> Result<Response<CheckpointResponse>, Status> {
         let r = request.into_inner();
         assert_eq!(r.id, "generated-backend-id");
-        assert!(!r.leave_running);
+        self.requests
+            .lock()
+            .unwrap()
+            .push(format!("checkpoint:leave_running={}", r.leave_running));
         assert_eq!(r.timeout_seconds, 60);
         assert_eq!(r.snapshot_type, "Full");
         std::fs::write(
@@ -145,7 +148,7 @@ impl sandbox_service_server::SandboxService for Server {
             b"state",
         )
         .unwrap();
-        *self.running.lock().unwrap() = false;
+        *self.running.lock().unwrap() = r.leave_running;
         Ok(Response::new(CheckpointResponse {}))
     }
     async fn wait(&self, _: Request<WaitRequest>) -> Result<Response<WaitResponse>, Status> {
@@ -653,13 +656,19 @@ async fn checkpoint_uses_physical_id_and_restore_generates_new_backend_id_with_f
     let server = Server::default();
     let starts = server.starts.clone();
     server.release.add_permits(1);
-    let (adapter, _harness) = connect(server).await;
+    let (adapter, _harness) = connect(server.clone()).await;
     adapter.start(&spec(), "i-1", 1, &[]).await.unwrap();
     let checkpoint = tempfile::tempdir().unwrap();
     adapter
         .checkpoint("i-1", checkpoint.path(), Duration::from_secs(60))
         .await
         .unwrap();
+    assert!(server
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|r| r == "checkpoint:leave_running=false"));
     adapter.remove("i-1").await.unwrap();
     adapter
         .restore(&spec(), "i-1-r5", 1, &[], checkpoint.path())
@@ -721,4 +730,23 @@ async fn node_startup_waits_when_sandboxd_socket_appears_late() {
         .unwrap()
         .unwrap();
     server.abort();
+}
+
+#[tokio::test]
+async fn workload_checkpoint_keeps_backend_running() {
+    let server = Server::default();
+    let (adapter, _harness) = connect(server.clone()).await;
+    adapter.start(&spec(), "i-1", 1, &[]).await.unwrap();
+    let checkpoint = tempfile::tempdir().unwrap();
+    adapter
+        .checkpoint_running("i-1", checkpoint.path(), Duration::from_secs(60))
+        .await
+        .unwrap();
+    assert!(adapter.is_running("i-1").await.unwrap());
+    assert!(server
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|r| r == "checkpoint:leave_running=true"));
 }

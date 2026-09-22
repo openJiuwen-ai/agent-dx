@@ -24,6 +24,7 @@ macro_rules! rrt_error {
 
 mod activity;
 mod bash;
+mod checkpoint_socket;
 pub(crate) mod child_env;
 mod cmd;
 mod codec;
@@ -102,6 +103,7 @@ fn identity_from(
     Ok(Some(identity))
 }
 struct RuntimeHooks {
+    checkpoint: Option<Arc<checkpoint_socket::CheckpointSocket>>,
     http: httpserver::HttpServerControl,
     tunnel: Option<tunnel::TunnelServerControl>,
     port: u16,
@@ -159,6 +161,9 @@ impl control::CheckpointHooks for RuntimeHooks {
             self.http.update_token(token.clone())?;
         }
         self.http.rearm()?;
+        if let Some(checkpoint) = &self.checkpoint {
+            checkpoint.rearm()?;
+        }
         if let Some(tunnel) = &self.tunnel {
             tunnel.rearm().map_err(std::io::Error::other)?;
         }
@@ -182,11 +187,29 @@ async fn boot(
     } else {
         None
     };
+    let checkpoint = match std::env::var_os("ADX_RRT_CONTROL_SOCKET_PATH").filter(|v| !v.is_empty())
+    {
+        Some(directory) => {
+            if identity.is_none() {
+                return Err("checkpoint socket requires runtime identity".into());
+            }
+            let (socket, ready) =
+                checkpoint_socket::CheckpointSocket::bind(std::path::Path::new(&directory)).await?;
+            readiness.push(ready);
+            Some(socket)
+        }
+        None => None,
+    };
     for ready in &readiness {
         wait_for_runtime_ready(ready.clone()).await?;
     }
     entrypoint::complete_create().map_err(|failure| std::io::Error::other(failure.message))?;
-    let hooks = Arc::new(RuntimeHooks { http, tunnel, port });
+    let hooks = Arc::new(RuntimeHooks {
+        http,
+        tunnel,
+        port,
+        checkpoint,
+    });
     if let Some(identity) = identity {
         control::install(control::Controller::new(identity, hooks.clone())?)?;
     }

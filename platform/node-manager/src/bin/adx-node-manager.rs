@@ -212,6 +212,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let mut master = pb::master_service_client::MasterServiceClient::new(channel);
     let mut env = config.rrt_env;
+    if config.checkpoint_dir.is_some() || config.checkpoint_storage.is_some() {
+        env.entry("ADX_RRT_CONTROL_SOCKET_PATH".into())
+            .or_insert_with(|| "/run/adx".into());
+    } else if env
+        .get("ADX_RRT_CONTROL_SOCKET_PATH")
+        .is_some_and(|v| !v.is_empty())
+    {
+        return Err("checkpoint socket requires checkpoint storage".into());
+    }
     env.insert("RRT_HTTP_PORT".into(), config.rrt_port.to_string());
     let token = env.get("RRT_HTTP_TOKEN").cloned();
     let runtime_config = RuntimeConfig {

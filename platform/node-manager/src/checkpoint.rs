@@ -61,12 +61,65 @@ pub(crate) fn validate_operation(id: &str, revision: u64) -> Result<()> {
 }
 #[async_trait]
 pub trait CheckpointCooperation: Send + Sync {
+    async fn workload_status(
+        &self,
+        _record: &CapsuleRecord,
+    ) -> Result<Option<adx_core::runtime::RuntimeStatus>> {
+        Ok(None)
+    }
+    async fn finish_workload(
+        &self,
+        _record: &CapsuleRecord,
+        _id: &str,
+        _error: Option<String>,
+    ) -> Result<()> {
+        Err(Error::Unavailable(
+            "workload checkpoint acknowledgement unsupported".into(),
+        ))
+    }
+    async fn resumed(&self, _record: &CapsuleRecord, _id: &str) -> Result<()> {
+        Err(Error::Unavailable(
+            "checkpoint handoff observation unsupported".into(),
+        ))
+    }
     async fn prepare(&self, record: &CapsuleRecord, operation_id: &str) -> Result<()>;
     /// Caller guarantees backend checkpoint has not been invoked.
     async fn abort_unstarted(&self, record: &CapsuleRecord, operation_id: &str) -> Result<()>;
 }
 #[async_trait]
 impl CheckpointCooperation for crate::runtime_control::RuntimeControlClient {
+    async fn workload_status(
+        &self,
+        record: &CapsuleRecord,
+    ) -> Result<Option<adx_core::runtime::RuntimeStatus>> {
+        let status = self.status(record).await?;
+        Ok(status.requested_checkpoint.is_some().then_some(status))
+    }
+    async fn finish_workload(
+        &self,
+        record: &CapsuleRecord,
+        id: &str,
+        error: Option<String>,
+    ) -> Result<()> {
+        self.finish_checkpoint(record, id, error).await.map(|_| ())
+    }
+    async fn resumed(&self, record: &CapsuleRecord, id: &str) -> Result<()> {
+        use adx_core::runtime::{CheckpointPhase, RuntimePhase};
+        loop {
+            let status = self.status(record).await?;
+            let cp = status.checkpoint.as_ref().ok_or(Error::Conflict)?;
+            if cp.operation_id != id {
+                return Err(Error::Conflict);
+            }
+            if status.phase == RuntimePhase::Running && cp.phase == CheckpointPhase::Resumed {
+                return Ok(());
+            }
+            if status.phase == RuntimePhase::Failed || cp.phase == CheckpointPhase::Failed {
+                return Err(Error::Unavailable("checkpoint handoff failed".into()));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
     async fn prepare(&self, record: &CapsuleRecord, id: &str) -> Result<()> {
         let status = self.status(record).await?;
         self.prepare(record, id, status.revision).await.map(|_| ())
@@ -84,7 +137,7 @@ pub trait CheckpointStore: Send + Sync {
     async fn allocate(&self) -> Result<PathBuf>;
     /// Discard a local staging directory after its execution has stopped.
     async fn discard_staged(&self, staged: &Path) -> Result<()>;
-    /// Preserve a complete local recovery point for upload failure rollback.
+    /// Preserve a complete local recovery point for running capture or upload rollback.
     async fn retain_staged(&self, staged: &Path) -> Result<CheckpointArtifact>;
     /// Complete storage durability (including upload for a remote backend).
     async fn publish(&self, staged: &Path) -> Result<CheckpointArtifact>;

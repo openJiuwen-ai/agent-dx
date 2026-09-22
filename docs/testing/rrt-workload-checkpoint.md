@@ -1,0 +1,46 @@
+# Workload checkpoint validation
+
+`POST /checkpoint` on the RRT Unix socket creates a local recovery point while
+keeping the original runtime alive. It is independent of the reusable Snapshot
+API and the stopping pause operation.
+
+Focused regression commands:
+
+```sh
+cargo test -p rrt-daemon --test control --test control_http
+cargo test -p adx-node-manager --test pause_resume --test sandboxd_rpc
+```
+
+The RRT tests use a real process, TCP control requests, Unix socket requests and
+a FIFO backend handoff fixture. They cover concurrent request rejection, waiting
+for durable acknowledgement after handoff, stale/repeated acknowledgements,
+error replies and listener rearming after restore. Controller tests cover pending
+request retirement when execution identity changes.
+
+Node Manager tests cover `leave_running=true`, stable execution/route/allocation,
+local artifact registration, commit retry without repeated capture, failure
+without false success, restart cleanup of an uncommitted capture, and use of the
+new point by failover.
+
+## Verified evidence (2026-09-22)
+
+- RRT control/HTTP: 12 passed; Node Manager pause/resume and sandboxd RPC: 46 passed.
+- Workspace Clippy (all targets/features, warnings denied), formatting and docs checks passed.
+- AKernel SDK: 253 passed; Ruff, mypy and deployment-script checks passed.
+- Linux x86_64 standalone with AKernel's gVisor backend: 6 integration cases passed,
+  1 OCI case skipped because no custom image was specified.
+- `test_internal_checkpoint_reload_and_reverse_tunnel` exercised the actual Unix
+  request, live-source continuation, reload, checkpoint-era file contents and
+  restored reverse-tunnel traffic. Task containers were removed afterward.
+
+The validation image was `akernel-adx-validation:rrt-checkpoint`, ID
+`sha256:6a9dee3bf0e3c7e74f655811ea8ebda0f2eadfab216ea1ae9c064264ad171434`.
+It layered this change's debug-built, stripped Node Manager and RRT over the
+AKernel validation image based on Buildkite #71. AKernel's existing EROFS rootfs
+was repacked with the new RRT; sandboxd was unchanged. This is not a released
+ADX package, and AKernel's checked-in #71 artifact pin still needs a later release
+update. Firecracker and Kubernetes were not run in this validation.
+
+Logs are kept under `out/ci/rrt-checkpoint/`; the real-run log is
+`akernel-e2e.log`. The remote original is
+`/var/log/akernel-rrt-checkpoint-e2e-final-20260922.log`.

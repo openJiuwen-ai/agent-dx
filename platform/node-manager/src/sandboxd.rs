@@ -766,56 +766,17 @@ impl RuntimeDriver for Sandboxd {
         }
     }
     async fn checkpoint(&self, runtime_id: &str, path: &Path, duration: Duration) -> Result<()> {
-        if !path.is_absolute() || duration.is_zero() {
-            return Err(Error::Invalid(
-                "absolute checkpoint directory and positive timeout required".into(),
-            ));
-        }
-        let mut state = self.cell(runtime_id).lock_owned().await;
-        if matches!(*state, StartState::Uncertain) {
-            return Err(unavailable("execution outcome requires reconciliation"));
-        }
-        let id = self.physical_id(runtime_id).await?.ok_or(Error::NotFound)?;
-        let mut request = Request::new(proto::CheckpointRequest {
-            id,
-            checkpoint_dir: path
-                .to_str()
-                .ok_or_else(|| Error::Invalid("checkpoint path is not UTF-8".into()))?
-                .into(),
-            timeout_seconds: duration
-                .as_secs()
-                .try_into()
-                .map_err(|_| Error::Invalid("checkpoint timeout overflow".into()))?,
-            compress: false,
-            leave_running: false,
-            snapshot_type: "Full".into(),
-        });
-        request.set_timeout(duration + self.config.rpc_timeout);
-        let mut client = self.client.clone();
-        // Retain the operation guard on caller cancellation, as with Start.
-        *state = StartState::Uncertain;
-        tokio::spawn(async move {
-            match client.checkpoint(request).await {
-                Ok(_) => {
-                    *state = StartState::Settled;
-                    Ok(())
-                }
-                Err(error) => {
-                    if matches!(
-                        error.code(),
-                        Code::InvalidArgument
-                            | Code::Unimplemented
-                            | Code::PermissionDenied
-                            | Code::Unauthenticated
-                    ) {
-                        *state = StartState::Settled;
-                    }
-                    Err(unavailable(error))
-                }
-            }
-        })
-        .await
-        .map_err(unavailable)?
+        self.capture_checkpoint(runtime_id, path, duration, false)
+            .await
+    }
+    async fn checkpoint_running(
+        &self,
+        runtime_id: &str,
+        path: &Path,
+        duration: Duration,
+    ) -> Result<()> {
+        self.capture_checkpoint(runtime_id, path, duration, true)
+            .await
     }
     async fn restore(
         &self,
@@ -965,6 +926,67 @@ impl RuntimeDriver for Sandboxd {
             .remove(runtime_id);
         *state = StartState::Idle;
         Ok(())
+    }
+}
+
+impl Sandboxd {
+    async fn capture_checkpoint(
+        &self,
+        runtime_id: &str,
+        path: &Path,
+        duration: Duration,
+        leave_running: bool,
+    ) -> Result<()> {
+        if !path.is_absolute() || duration.is_zero() {
+            return Err(Error::Invalid(
+                "absolute checkpoint directory and positive timeout required".into(),
+            ));
+        }
+        let mut state = self.cell(runtime_id).lock_owned().await;
+        if matches!(*state, StartState::Uncertain) {
+            return Err(unavailable("execution outcome requires reconciliation"));
+        }
+        let id = self.physical_id(runtime_id).await?.ok_or(Error::NotFound)?;
+        let mut request = Request::new(proto::CheckpointRequest {
+            id,
+            checkpoint_dir: path
+                .to_str()
+                .ok_or_else(|| Error::Invalid("checkpoint path is not UTF-8".into()))?
+                .into(),
+            timeout_seconds: duration
+                .as_secs()
+                .try_into()
+                .map_err(|_| Error::Invalid("checkpoint timeout overflow".into()))?,
+            compress: false,
+            leave_running,
+            snapshot_type: "Full".into(),
+        });
+        request.set_timeout(duration + self.config.rpc_timeout);
+        let mut client = self.client.clone();
+        // Retain the operation guard on caller cancellation, as with Start.
+        *state = StartState::Uncertain;
+        tokio::spawn(async move {
+            match client.checkpoint(request).await {
+                Ok(_) => {
+                    *state = StartState::Settled;
+                    Ok(())
+                }
+                Err(error) => {
+                    if matches!(
+                        error.code(),
+                        Code::InvalidArgument
+                            | Code::Unimplemented
+                            | Code::PermissionDenied
+                            | Code::Unauthenticated
+                    ) {
+                        *state = StartState::Settled;
+                    }
+                    Err(unavailable(error))
+                }
+            }
+        })
+        .await
+        .map_err(unavailable)?
     }
 }
 
