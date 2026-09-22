@@ -86,11 +86,13 @@ class ComponentManifestTests(unittest.TestCase):
 
             build_manifest = root / "build-manifest.json"
             build_manifest.write_text(json.dumps(manifest))
+            extracted_package_manifest = root / "manifest.json"
+            extracted_package_manifest.write_bytes(package_manifest.read_bytes())
             verified = component.verify_build_manifest(
                 manifest_path=build_manifest,
                 commit="b" * 40,
                 target="x86_64-unknown-linux-gnu",
-                package_manifest=package_manifest,
+                package_manifest=extracted_package_manifest,
                 release_archive=release,
                 wheel=wheel,
                 backend_manifest=backend_manifest,
@@ -104,7 +106,7 @@ class ComponentManifestTests(unittest.TestCase):
                     manifest_path=build_manifest,
                     commit="b" * 40,
                     target="x86_64-unknown-linux-gnu",
-                    package_manifest=package_manifest,
+                    package_manifest=extracted_package_manifest,
                     release_archive=release,
                     wheel=wheel,
                     backend_manifest=backend_manifest,

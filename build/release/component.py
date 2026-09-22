@@ -137,11 +137,12 @@ def create_build_manifest(
     }
 
 
-def _verify_artifact(record, path, label):
+def _verify_artifact(record, path, label, recorded_name=None):
     path = Path(path)
     if not isinstance(record, dict):
         raise ValueError(f"{label} record is missing")
-    if record.get("name") != path.name or record.get("sha256") != sha256(path):
+    expected_name = recorded_name or path.name
+    if record.get("name") != expected_name or record.get("sha256") != sha256(path):
         raise ValueError(f"{label} artifact integrity check failed")
 
 
@@ -170,7 +171,12 @@ def verify_build_manifest(
         digest = record.get("manifest_sha256", "")
         if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
             raise ValueError(f"{name} component manifest digest is invalid")
-    _verify_artifact(manifest.get("package", {}).get("manifest"), package_manifest, "package manifest")
+    _verify_artifact(
+        manifest.get("package", {}).get("manifest"),
+        package_manifest,
+        "package manifest",
+        recorded_name="release-manifest.json",
+    )
     _verify_artifact(manifest.get("package", {}).get("archive"), release_archive, "release archive")
     _verify_artifact(manifest.get("sdk"), wheel, "SDK wheel")
     _verify_artifact(manifest.get("backend", {}).get("manifest"), backend_manifest, "backend manifest")
