@@ -26,7 +26,7 @@ resource limits, and per-sandbox data-plane security. Declared user ports use
 Edge and Node Proxy routing. Public local rootfs paths and host mounts are not a
 tenant-facing contract. `upstream` reverse tunnel uses the published
 `/tunnel/{sandbox}` route; the legacy `/invoke` fallback remains unavailable. See the
-[current HTTP contract](../../../../gateway/api-server/docs/sandbox-lifecycle-api.md).
+[current HTTP contract](https://gitcode.com/openJiuwen/agent-dx/blob/refactor/gateway/api-server/docs/sandbox-lifecycle-api.md).
 
 ## Image startup process
 
@@ -121,9 +121,9 @@ clone = Sandbox.create(
 )
 ```
 
-The new Master inherits omitted image/runtime/scalar resources and validates explicit values against the source geometry. It does not resize a restored VM. Environment overrides and placement constraints are carried into the new Capsule; local-only snapshots require the source node. Shared snapshots use normal scheduling. The source briefly pauses during snapshot creation and resumes before success. A reusable snapshot is not consumed by cloning; deletion blocks new references and waits for existing references to be released. See [storage and cloning](../../../../docs/testing/snapshot-storage.md).
+The new Master inherits omitted image/runtime/scalar resources and validates explicit values against the source geometry. It does not resize a restored VM. Environment overrides and placement constraints are carried into the new Capsule; local-only snapshots require the source node. Shared snapshots use normal scheduling. The source briefly pauses during snapshot creation and resumes before success. A reusable snapshot is not consumed by cloning; deletion blocks new references and waits for existing references to be released. See [storage and cloning](https://gitcode.com/openJiuwen/agent-dx/blob/refactor/docs/testing/snapshot-storage.md).
 
-Later dual-clone FC runs exposed a network failure, tracked in the [investigation](../../../../docs/testing/2026-09-16-fc-clone-network.md); successful earlier batches do not close that issue.
+Later dual-clone FC runs exposed a network failure, tracked in the [investigation](https://gitcode.com/openJiuwen/agent-dx/blob/refactor/docs/testing/2026-09-16-fc-clone-network.md); successful earlier batches do not close that issue.
 
 ## Pause and resume
 
@@ -203,7 +203,7 @@ attempt rules intentionally differ by operation:
 
 Structured server failures raise `SandboxHTTPError`, whose `code`, `retry`,
 `outcome`, `request_id`, `operation_id`, and `instance_id` fields implement the
-[management error contract](../../../api/http/error-contract.md). Transport
+[management error contract](https://gitcode.com/openJiuwen/agent-dx/blob/refactor/platform/api/http/error-contract.md). Transport
 failures with an uncertain write result surface the same fields on
 `SandboxError`. Other malformed typed-result
 shapes can instead surface `ValueError` or `TypeError` while values are
@@ -213,7 +213,7 @@ other programming/shape exceptions.
 
 ### SDK versus raw HTTP
 
-These are SDK semantics, not a substitute for the [frontend REST contract](../../../../gateway/api-server/docs/sandbox-lifecycle-api.md).
+These are SDK semantics, not a substitute for the [frontend REST contract](https://gitcode.com/openJiuwen/agent-dx/blob/refactor/gateway/api-server/docs/sandbox-lifecycle-api.md).
 The SDK uses these paths internally:
 
 ```text
@@ -409,6 +409,6 @@ does not terminate the remote command.
 platform's grouped node and same-tenant instance placement rules. Conditions
 use the public `scheduleAffinities` shape with `kind`, `affinity`, `labelOps`,
 optional `weight` and `preferredPriority`. `node_id` remains a hard requirement
-when combined with alternatives. See [placement rules](../../../../docs/testing/http-node-placement.md)
+when combined with alternatives. See [placement rules](https://gitcode.com/openJiuwen/agent-dx/blob/refactor/docs/testing/http-node-placement.md)
 for the matching, ranking and label contracts. Caller-provided option lists are
 copied before the SDK adds a node constraint.

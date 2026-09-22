@@ -2,8 +2,8 @@
 
 ## 目标
 
-ADX 使用三条职责单一的 Buildkite 流水线：基础出包、Python Sandbox SDK 出包、
-Full 端到端验收。基础出包流水线同时生成相互独立的 Platform 包、RRT 包和 Runtime
+ADX 使用四条职责单一的 Buildkite 流水线：基础出包、Python Sandbox SDK 出包、
+Python 管理工具出包和 Full 端到端验收。基础出包流水线同时生成相互独立的 Platform 包、RRT 包和 Runtime
 Pack；RRT 不进入 Platform 包，但不单独占用一条流水线。构建只发生在前两条流水线；
 Full 流水线消费不可变制品，不得从源码重新编译或替换二进制。
 
@@ -13,13 +13,13 @@ Full 流水线消费不可变制品，不得从源码重新编译或替换二进
 
 ## 当前实现与调整边界
 
-当前仓库已经提供三个独立配置入口：基础出包使用
+当前仓库已经提供四个独立配置入口：基础出包使用
 `.buildkite/pipeline-package.yml`，Python SDK 出包使用
-`.buildkite/pipeline-sdk.yml`，Full 验收使用 `.buildkite/pipeline-full.yml`。
+`.buildkite/pipeline-sdk.yml`，管理工具出包使用 `.buildkite/pipeline-admin.yml`，Full 验收使用 `.buildkite/pipeline-full.yml`。
 `.buildkite/pipeline.yml` 只根据 Buildkite pipeline slug 分派配置。Full 组合阶段要求显式
 传入基础包与 SDK 的 Buildkite build UUID，并校验提交、候选清单和文件 SHA256。
-对应 Buildkite 实体已经建立为 `agent-dx`、`agent-dx-python-sdk` 和
-`agent-dx-full-test`。
+已经完成远端验证的 Buildkite 实体为 `agent-dx`、`agent-dx-python-sdk` 和
+`agent-dx-full-test`；`agent-dx-admin` 需要按仓库配置新建独立实体后执行首次验证。
 
 基础出包流水线现在将 Platform、Gateway、RRT 和 source gate 放在四个并行步骤中。
 三个编译步骤使用独立 Cargo target，输出带提交、目标平台和逐文件 SHA256 的组件
@@ -157,7 +157,10 @@ Buildkite pipeline slug 为 `agent-dx-python-sdk`，配置入口为
 5. `sdk-candidate-index`
    - 输出版本、提交、Python 范围、公开协议版本、文件 SHA256 和 build ID。
 6. `sdk-publish`
-   - 仅正式标签且发布凭据可用时执行；先上传暂存索引，通过回读安装后再提升。
+   - `ADX_SDK_PYPI_UPLOAD=1` 且标签严格匹配 `sdk-v<version>` 时才执行；
+     `ADX_SDK_PYPI_REPOSITORY` 可选择 PyPI 或 TestPyPI。
+   - 只上传 `sdk-package` 生成并校验的 wheel/sdist，上传后按文件名和 SHA256 回读索引；
+     OBS 发布仍由独立的 `ADX_OBS_UPLOAD` 控制。
 
 ### 产物
 
@@ -172,7 +175,23 @@ logs/、junit/
 SDK wheel 不再隐式跟随平台版本。一个 ADX release 通过 `release.json` 明确选择已经
 验证过的 SDK 版本，允许 SDK 修订版本独立发布。
 
-## 流水线三：ADX Full Acceptance
+## 流水线三：ADX Admin Package
+
+Buildkite pipeline slug 为 `agent-dx-admin`，配置入口为
+`.buildkite/pipeline-admin.yml`。`admin-package` 在每次构建中运行 Python 单测和发布契约
+测试，使用 `python -m build` 生成一个通用 wheel 和一个 sdist，执行 `twine check`，并
+在无源码路径的新虚拟环境中安装 wheel。`admin-candidate.json` 记录版本、提交、build ID
+及两个文件的 SHA256。
+
+上传是可选动作。默认没有发布步骤；只有 `ADX_ADMIN_PYPI_UPLOAD=1` 时才运行
+`admin-pypi`。`ADX_ADMIN_PYPI_REPOSITORY` 可设为 `testpypi` 或 `pypi`，省略时选择
+正式 PyPI。发布还要求标签严格为 `adxadmin-v<version>`，从 Kubernetes Secret
+`adx-pypi-credentials` 读取对应 API Token。发布步骤只消费 `admin-package` 的不可变
+候选，不重新构建，也不跳过已存在版本；上传后通过索引 JSON API 核对完整文件集合和
+SHA256。这样普通提交、PR 和未显式开启上传的标签构建都只留下可审查制品，不修改包
+索引。
+
+## 流水线四：ADX Full Acceptance
 
 Buildkite pipeline slug 为 `agent-dx-full-test`，配置入口为
 `.buildkite/pipeline-full.yml`。

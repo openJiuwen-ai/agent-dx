@@ -5,7 +5,7 @@
 
 当前独立流水线正式验证为 [基础包 #68](https://buildkite.com/agent-dx/agent-dx/builds/68)、[Python SDK #4](https://buildkite.com/agent-dx/agent-dx-python-sdk/builds/4) 与 [Full Test #4](https://buildkite.com/agent-dx/agent-dx-full-test/builds/4)。三者使用同一提交 `a4798032e96a602bd58cc13c1312cd01e67effb3`；固定构建镜像、三组件并行编译、source gate、制品清单和只组装不重编译的交接均已实际执行。Full 十组全部通过，两个 ADX Node 分别落在 `10.244.128.124` 和 `10.244.128.160`，无缺失用例和清理错误。FC 按当前决策继续本地验收。
 
-开发验证在本地执行，Buildkite 分为基础包、Python SDK 和 Full 三条独立流水线。基础包在固定摘要的 ADX 构建镜像中并行编译 Platform、Gateway 和 RRT，同时执行 source gate；组装步骤只消费通过清单和 SHA256 校验的组件归档，并输出 `build-manifest.json`。Full 只消费显式指定的基础包与 SDK build UUID；`build/e2e/prepare.py` 组合并校验验收镜像，`build/e2e/kubernetes/run.py` 在目标 Kubernetes 集群部署、验收、收集并清理。真实 sandboxd、基础包内 RRT 和独立 SDK wheel 均参与执行。流水线复用现有 default/linux/amd64 队列、builder/packager/deployer、目标 kubeconfig 挂载与 SWR Secret，见 [Buildkite 说明](../../.buildkite/README.md)。本地通过不等于远端 Buildkite 已通过。
+开发验证在本地执行，Buildkite 配置分为基础包、Python SDK、Python 管理工具和 Full 四条独立流水线。基础包在固定摘要的 ADX 构建镜像中并行编译 Platform、Gateway 和 RRT，同时执行 source gate；组装步骤只消费通过清单和 SHA256 校验的组件归档，并输出 `build-manifest.json`。`agent-dx-admin` 独立构建 `adxadmin` wheel/sdist，默认不上传 PyPI。Full 只消费显式指定的基础包与 SDK build UUID；`build/e2e/prepare.py` 组合并校验验收镜像，`build/e2e/kubernetes/run.py` 在目标 Kubernetes 集群部署、验收、收集并清理。真实 sandboxd、基础包内 RRT 和独立 SDK wheel 均参与执行。流水线复用现有 default/linux/amd64 队列、builder/packager/deployer、目标 kubeconfig挂载与 SWR Secret，见 [Buildkite 说明](../../.buildkite/README.md)。本地通过不等于远端 Buildkite 已通过。
 
 ## 本地开发验证
 
@@ -103,7 +103,7 @@ Full 流水线默认执行十组用例：SDK、数据面、生命周期、认证
 
 ### 接入状态
 
-`.buildkite/README.md` 保存端到端流程约定。基础包、Python SDK 和 Full 是三个独立 Buildkite pipeline；基础包包含并行组件编译、source gate、组件清单校验和只组装不重编译的 `platform-build`。Full 内的 `platform-images` 组合固定候选，`platform-e2e` 部署 Kubernetes。Full 默认执行十组，`k8s-basic` 仅用于显式的有界诊断。运行阶段只使用指定 build UUID 的制品并验证 commit、架构及 SHA256；所选场景和环境清理全部成功后才通过。基础包 #68、SDK #4 与 Full #4 已完成该实现的正式验证。
+`.buildkite/README.md` 保存端到端流程约定。基础包、Python SDK、Python 管理工具和 Full 是四个独立 Buildkite pipeline 配置；基础包包含并行组件编译、source gate、组件清单校验和只组装不重编译的 `platform-build`。管理工具流水线始终构建并校验制品，上传需显式开启。Full 内的 `platform-images` 组合固定候选，`platform-e2e` 部署 Kubernetes。Full 默认执行十组，`k8s-basic` 仅用于显式的有界诊断。运行阶段只使用指定 build UUID 的制品并验证 commit、架构及 SHA256；所选场景和环境清理全部成功后才通过。基础包 #68、SDK #4 与 Full #4 已完成该实现的正式验证；新增管理工具流水线尚未形成远端验证记录。
 
 本地组件测试继续用于每一步的测试驱动开发；同一套完整 E2E 驱动器也应支持在具备环境的本地机器上复现 Buildkite 失败。
 

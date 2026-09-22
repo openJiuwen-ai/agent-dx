@@ -1,0 +1,94 @@
+steps:
+- label: ':python: Test and package adxadmin'
+  key: admin-package
+  agents:
+    queue: default
+    os: linux
+    arch: amd64
+  concurrency: 1
+  concurrency_group: adx/admin-package
+  command: bash .buildkite/step.sh admin-package bash build/admin/ci.sh
+  timeout_in_minutes: 20
+  artifact_paths:
+  - out/buildkite/admin/**/*
+  - out/buildkite/logs/admin-*.log
+  - out/buildkite/logs/step-admin-package.log
+  env:
+    BUILDKITE_AGENT_NAME: agent-stack-k8s
+    PIP_CACHE_DIR: /mnt/paas/build-cache/adx/pip
+  plugins: &adx-admin-plugins
+  - kubernetes:
+      podSpec:
+        imagePullSecrets:
+        - name: swr-pull-secret
+        containers:
+        - image: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/adx-build@sha256:ad9edff0b7cd2d907648a772109ad516e5da7b7b8762f08fd8653979a1e2cb67
+          volumeMounts:
+          - name: build-cache
+            mountPath: /mnt/paas
+          resources:
+            requests:
+              cpu: '1'
+              memory: 2Gi
+            limits:
+              cpu: '2'
+              memory: 4Gi
+        volumes:
+        - name: build-cache
+          hostPath:
+            path: /mnt/paas
+            type: DirectoryOrCreate
+
+- label: ':pypi: Publish adxadmin'
+  key: admin-pypi
+  depends_on: admin-package
+  if: build.env("ADX_ADMIN_PYPI_UPLOAD") == "1" && build.tag != null
+  agents:
+    queue: default
+    os: linux
+    arch: amd64
+  concurrency: 1
+  concurrency_group: adx/admin-pypi
+  command: bash .buildkite/step.sh admin-pypi bash .buildkite/publish-admin-pypi.sh
+  timeout_in_minutes: 15
+  artifact_paths:
+  - out/buildkite/admin-publish/**/*
+  - out/buildkite/logs/step-admin-pypi.log
+  env:
+    BUILDKITE_AGENT_NAME: agent-stack-k8s
+    PIP_CACHE_DIR: /mnt/paas/build-cache/adx/pip
+  plugins:
+  - kubernetes:
+      podSpec:
+        imagePullSecrets:
+        - name: swr-pull-secret
+        containers:
+        - image: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/adx-build@sha256:ad9edff0b7cd2d907648a772109ad516e5da7b7b8762f08fd8653979a1e2cb67
+          volumeMounts:
+          - name: build-cache
+            mountPath: /mnt/paas
+          resources:
+            requests:
+              cpu: '1'
+              memory: 2Gi
+            limits:
+              cpu: '2'
+              memory: 4Gi
+          env:
+          - name: ADX_ADMIN_PYPI_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: adx-pypi-credentials
+                key: admin-pypi-token
+                optional: true
+          - name: ADX_ADMIN_TEST_PYPI_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: adx-pypi-credentials
+                key: admin-testpypi-token
+                optional: true
+        volumes:
+        - name: build-cache
+          hostPath:
+            path: /mnt/paas
+            type: DirectoryOrCreate

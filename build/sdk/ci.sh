@@ -16,11 +16,13 @@ PY
 
 python3 -m venv /tmp/adx-sdk-build
 source /tmp/adx-sdk-build/bin/activate
-python -m pip install --disable-pip-version-check 'build==1.2.2.post1' 'pytest>=8,<9'
+python -m pip install --disable-pip-version-check 'build==1.4.4' 'twine==6.2.0' 'pytest>=8,<9'
 python -m pip install --disable-pip-version-check -e platform/sdk/sandbox/python
 
 echo '--- :test_tube: Sandbox SDK tests'
 python build/sdk/test_candidate.py 2>&1 | tee out/buildkite/logs/sdk-candidate-tests.log
+python -m unittest discover -s build/python -p 'test_*.py' -v \
+  2>&1 | tee out/buildkite/logs/sdk-release-tests.log
 PYTHONPATH=platform/sdk/sandbox/python python -m pytest -q \
   -c platform/sdk/sandbox/pytest.ini platform/sdk/sandbox/python/tests \
   --junitxml="$output/junit.xml" 2>&1 | tee out/buildkite/logs/sdk-tests.log
@@ -28,6 +30,8 @@ PYTHONPATH=platform/sdk/sandbox/python python -m pytest -q \
 echo '--- :package: Build wheel and source distribution'
 python -m build --wheel --sdist --outdir "$output" platform/sdk/sandbox/python \
   2>&1 | tee out/buildkite/logs/sdk-build.log
+python -m twine check "$output"/*.whl "$output"/*.tar.gz \
+  2>&1 | tee out/buildkite/logs/sdk-twine-check.log
 python build/sdk/candidate.py --directory "$output" --commit "$BUILDKITE_COMMIT" \
   --build-id "${BUILDKITE_BUILD_ID:-local}" | tee out/buildkite/logs/sdk-candidate.log
 

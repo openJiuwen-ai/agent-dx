@@ -11,6 +11,7 @@ class IndependentPipelineTests(unittest.TestCase):
     def test_product_pipelines_have_separate_configs_and_steps(self):
         package = (ROOT / '.buildkite/pipeline-package.yml').read_text()
         sdk = (ROOT / '.buildkite/pipeline-sdk.yml').read_text()
+        admin = (ROOT / '.buildkite/pipeline-admin.yml').read_text()
         full = (ROOT / '.buildkite/pipeline-full.yml').read_text()
 
         self.assertIn('key: platform-build', package)
@@ -24,8 +25,16 @@ class IndependentPipelineTests(unittest.TestCase):
         self.assertNotIn('key: sdk-package', package)
 
         self.assertIn('key: sdk-package', sdk)
+        self.assertIn('key: sdk-pypi', sdk)
+        self.assertIn('ADX_SDK_PYPI_UPLOAD', sdk)
         self.assertNotIn('key: platform-build', sdk)
         self.assertNotIn('key: platform-e2e', sdk)
+
+        self.assertIn('key: admin-package', admin)
+        self.assertIn('key: admin-pypi', admin)
+        self.assertIn('ADX_ADMIN_PYPI_UPLOAD', admin)
+        self.assertNotIn('key: platform-build', admin)
+        self.assertNotIn('key: sdk-package', admin)
 
         self.assertIn('key: platform-images', full)
         self.assertIn('key: platform-e2e', full)
@@ -41,7 +50,29 @@ class IndependentPipelineTests(unittest.TestCase):
         self.assertIn('pipeline-sdk.yml', selector)
         self.assertIn('agent-dx-full-test', selector)
         self.assertIn('pipeline-full.yml', selector)
+        self.assertIn('agent-dx-admin', selector)
+        self.assertIn('pipeline-admin.yml', selector)
         self.assertIn('pipeline-package.yml', selector)
+
+    def test_admin_publish_is_explicit_and_verifies_the_index(self):
+        pipeline = (ROOT / '.buildkite/pipeline-admin.yml').read_text()
+        publisher = (ROOT / '.buildkite/publish-admin-pypi.sh').read_text()
+        self.assertIn('build.env("ADX_ADMIN_PYPI_UPLOAD") == "1"', pipeline)
+        self.assertIn('build.tag != null', pipeline)
+        self.assertIn('adxadmin-v${version}', publisher)
+        self.assertIn('TWINE_PASSWORD', publisher)
+        self.assertIn('build/python/verify_index.py', publisher)
+        self.assertNotIn('--skip-existing', publisher)
+
+    def test_sdk_publish_is_explicit_and_verifies_the_index(self):
+        pipeline = (ROOT / '.buildkite/pipeline-sdk.yml').read_text()
+        publisher = (ROOT / '.buildkite/publish-sdk-pypi.sh').read_text()
+        self.assertIn('build.env("ADX_SDK_PYPI_UPLOAD") == "1"', pipeline)
+        self.assertIn('build.tag != null', pipeline)
+        self.assertIn('sdk-v${version}', publisher)
+        self.assertIn('TWINE_PASSWORD', publisher)
+        self.assertIn('build/python/verify_index.py', publisher)
+        self.assertNotIn('--skip-existing', publisher)
 
     def test_full_image_build_requires_explicit_base_and_sdk_builds(self):
         script = (ROOT / '.buildkite/package-e2e.sh').read_text()
