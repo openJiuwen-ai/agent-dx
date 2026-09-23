@@ -7,13 +7,21 @@ set -euo pipefail
 [[ $(git rev-parse HEAD) == "$BUILDKITE_COMMIT" ]]
 mkdir -p out/buildkite/logs
 echo "--- :package: Verify release artifact handoff"
-buildkite-agent artifact download 'out/buildkite/adx-release.tar.gz' . --step platform-build --build "$ADX_BASE_PACKAGE_BUILD_ID"
-buildkite-agent artifact download 'out/buildkite/adx-release.tar.gz.sha256' . --step platform-build --build "$ADX_BASE_PACKAGE_BUILD_ID"
+case "${ADX_BASE_ARTIFACT_TRANSPORT:-buildkite}" in
+  obs)
+    source .buildkite/obs-python.sh
+    BUILDKITE_BUILD_ID="$ADX_BASE_PACKAGE_BUILD_ID" "$OBS_PYTHON" build/release/ci_transfer.py download release out/buildkite
+    ;;
+  buildkite)
+    for artifact in adx-release.tar.gz adx-release.tar.gz.sha256 build-manifest.json backend.tar.gz; do
+      buildkite-agent artifact download "out/buildkite/$artifact" . --step platform-build --build "$ADX_BASE_PACKAGE_BUILD_ID"
+    done
+    ;;
+  *) echo 'ADX_BASE_ARTIFACT_TRANSPORT must be obs or buildkite' >&2; exit 2 ;;
+esac
 (cd out/buildkite && sha256sum --check adx-release.tar.gz.sha256)
 mkdir -p out/buildkite/package
 tar -xzf out/buildkite/adx-release.tar.gz -C out/buildkite/package
-buildkite-agent artifact download 'out/buildkite/build-manifest.json' . --step platform-build --build "$ADX_BASE_PACKAGE_BUILD_ID"
-buildkite-agent artifact download 'out/buildkite/backend.tar.gz' . --step platform-build --build "$ADX_BASE_PACKAGE_BUILD_ID"
 mkdir -p out/buildkite/backend
 tar -xzf out/buildkite/backend.tar.gz -C out/buildkite/backend
 python3 build/e2e/verify_backend.py \

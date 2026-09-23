@@ -1,0 +1,120 @@
+steps:
+- label: ':python: Test and package adxadmin'
+  key: admin-package
+  agents:
+    queue: default
+    os: linux
+    arch: amd64
+  concurrency: 1
+  concurrency_group: adx/admin-package
+  command: python3 .buildkite/with_registry.py --docker -- bash .buildkite/step.sh admin-package bash .buildkite/build-sdk.sh
+    admin
+  timeout_in_minutes: 30
+  artifact_paths:
+  - out/buildkite/admin/**/*
+  - out/buildkite/logs/admin-*.log
+  - out/buildkite/logs/step-admin-package.log
+  - out/buildkite/logs/sdk-dockerd.log
+  env:
+    BUILDKITE_AGENT_NAME: agent-stack-k8s
+    ADX_SDK_TEST_IMAGE: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/adx-e2e@sha256:c310ebf3f56c846d21744640a899d52e16a98b5442ca39402a3132010c722c4a
+  plugins:
+  - kubernetes:
+      podSpec:
+        imagePullSecrets:
+        - name: swr-pull-secret
+        containers:
+        - image: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/sandbox-packager:v20260506_kubectl
+          securityContext:
+            privileged: true
+          volumeMounts:
+          - name: docker-graph
+            mountPath: /var/lib/docker
+          - name: build-cache
+            mountPath: /mnt/paas
+          resources:
+            requests:
+              cpu: '2'
+              memory: 4Gi
+            limits:
+              cpu: '4'
+              memory: 8Gi
+          env:
+          - name: SWR_USERNAME
+            valueFrom:
+              secretKeyRef:
+                name: swr-credentials
+                key: username
+                optional: true
+          - name: SWR_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: swr-credentials
+                key: password
+                optional: true
+          - name: SWR_DOCKER_CONFIG_JSON
+            valueFrom:
+              secretKeyRef:
+                name: swr-pull-secret
+                key: .dockerconfigjson
+                optional: true
+        volumes:
+        - name: docker-graph
+          emptyDir: {}
+        - name: build-cache
+          hostPath:
+            path: /mnt/paas
+            type: DirectoryOrCreate
+- label: ':pypi: Publish adxadmin'
+  key: admin-pypi
+  depends_on: admin-package
+  if: build.env("ADX_ADMIN_PYPI_UPLOAD") == "1" && build.tag != null
+  agents:
+    queue: default
+    os: linux
+    arch: amd64
+  concurrency: 1
+  concurrency_group: adx/admin-pypi
+  command: bash .buildkite/step.sh admin-pypi bash .buildkite/publish-admin-pypi.sh
+  timeout_in_minutes: 15
+  artifact_paths:
+  - out/buildkite/admin-publish/**/*
+  - out/buildkite/logs/step-admin-pypi.log
+  env:
+    BUILDKITE_AGENT_NAME: agent-stack-k8s
+    PIP_CACHE_DIR: /mnt/paas/build-cache/adx/pip
+  plugins:
+  - kubernetes:
+      podSpec:
+        imagePullSecrets:
+        - name: swr-pull-secret
+        containers:
+        - image: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/adx-e2e@sha256:c310ebf3f56c846d21744640a899d52e16a98b5442ca39402a3132010c722c4a
+          volumeMounts:
+          - name: build-cache
+            mountPath: /mnt/paas
+          resources:
+            requests:
+              cpu: '1'
+              memory: 2Gi
+            limits:
+              cpu: '2'
+              memory: 4Gi
+          env:
+          - name: ADX_ADMIN_PYPI_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: adx-pypi-credentials
+                key: admin-pypi-token
+                optional: true
+          - name: ADX_ADMIN_TEST_PYPI_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: adx-pypi-credentials
+                key: admin-testpypi-token
+                optional: true
+        volumes:
+        - name: build-cache
+          hostPath:
+            path: /mnt/paas
+            type: DirectoryOrCreate

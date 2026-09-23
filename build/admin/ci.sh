@@ -20,7 +20,7 @@ mkdir -p "$output" "$logs"
   --cache-dir "${PIP_CACHE_DIR:-/tmp/adx-pip-cache}" \
   'build==1.4.4' 'twine==6.2.0' 'httpx==0.28.1' \
   'setuptools==82.0.1' 'wheel==0.48.0' \
-  > "$logs/admin-bootstrap.log" 2>&1
+  2>&1 | tee "$logs/admin-bootstrap.log"
 
 "$venv/bin/python" -m unittest discover -s tools/admin/tests -p 'test_*.py' -v \
   2>&1 | tee "$logs/admin-tests.log"
@@ -39,7 +39,7 @@ mkdir -p "$output" "$logs"
 "$python" -m venv "$install_venv"
 "$install_venv/bin/python" -m pip install --disable-pip-version-check \
   --cache-dir "${PIP_CACHE_DIR:-/tmp/adx-pip-cache}" "$output"/*.whl \
-  > "$logs/admin-install.log" 2>&1
+  2>&1 | tee "$logs/admin-install.log"
 (
   cd "${TMPDIR:-/tmp}"
   "$install_venv/bin/python" -c 'import importlib.metadata; assert importlib.metadata.version("adxadmin")'

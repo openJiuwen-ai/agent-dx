@@ -59,6 +59,8 @@ fi
 timestamp=${ADX_OBS_UPLOAD_TIMESTAMP:-$(date -u '+%Y%m%d%H%M%S')}
 
 artifacts=(
+  out/buildkite/adx-execd.tar.gz
+  out/buildkite/adx-execd.tar.gz.sha256
   out/buildkite/adx-release.tar.gz
   out/buildkite/adx-release.tar.gz.sha256
   out/buildkite/release-manifest.json
@@ -67,6 +69,7 @@ artifacts=(
   "$runtime_archive.sha256"
 )
 python3 build/admin/candidate.py --verify --directory out/buildkite/admin
+artifacts+=(out/buildkite/sdk/*.whl out/buildkite/sdk/*.tar.gz out/buildkite/sdk/sdk-candidate.json)
 artifacts+=(out/buildkite/admin/*.whl out/buildkite/admin/*.tar.gz out/buildkite/admin/admin-candidate.json)
 
 echo "--- :cloud: Upload ADX artifacts to Huawei Cloud OBS"

@@ -36,6 +36,10 @@ for component in platform gateway execd; do
     --target "$ADX_RELEASE_TARGET"
   find "out/buildkite/components/$component" -maxdepth 1 -type f \
     ! -name manifest.json -exec chmod 0755 {} \;
+  if [[ $component == execd ]]; then
+    cp "out/buildkite/components/$component.tar.gz" out/buildkite/adx-execd.tar.gz
+    (cd out/buildkite && sha256sum adx-execd.tar.gz > adx-execd.tar.gz.sha256)
+  fi
   rm "out/buildkite/components/$component.tar.gz"
 done
 
@@ -46,9 +50,17 @@ for component in platform gateway execd; do
     ! -name manifest.json -exec cp {} "$stage/" \;
 done
 
-echo "--- :python: Build Sandbox SDK wheel"
-PYTHON=python3 bash platform/sdk/sandbox/python/build.sh "$stage/sdk"
-wheel=("$stage"/sdk/adx_sandbox-*.whl)
+echo "--- :python: Consume tested Sandbox SDK candidate"
+buildkite-agent artifact download 'out/buildkite/sdk/*' . --step sdk-package
+python3 build/sdk/candidate.py --verify --directory out/buildkite/sdk
+python3 - <<'CHECK'
+import json, os
+from pathlib import Path
+candidate = json.loads(Path('out/buildkite/sdk/sdk-candidate.json').read_text())
+if candidate['commit'] != os.environ['BUILDKITE_COMMIT'] or candidate['build_id'] != os.environ['BUILDKITE_BUILD_ID']:
+    raise SystemExit('SDK candidate belongs to another build')
+CHECK
+wheel=(out/buildkite/sdk/adx_sandbox-*.whl)
 [[ ${#wheel[@]} == 1 && -f ${wheel[0]} ]]
 
 echo "--- :package: Assemble unified ADX release"
@@ -67,7 +79,7 @@ bash "$ADX_RELEASE_OUTPUT/install.sh" --prefix "$install_root/adx" --bin-dir "$i
 tar -czf out/buildkite/adx-release.tar.gz -C "$ADX_RELEASE_OUTPUT" .
 (cd out/buildkite && sha256sum adx-release.tar.gz > adx-release.tar.gz.sha256)
 cp "$ADX_RELEASE_OUTPUT/manifest.json" out/buildkite/release-manifest.json
-cp "$ADX_RELEASE_OUTPUT"/sdk/*.whl out/buildkite/sdk/
+
 
 echo "--- :package: Verify pinned sandboxd backend artifacts"
 if [[ -n ${ADX_BACKEND_ARTIFACT_BUILD:-} ]]; then
@@ -113,3 +125,8 @@ CHECK
 
 # Upload these local bytes; never re-download the assembled archives.
 bash .buildkite/upload-obs.sh
+
+if [[ ${ADX_ARTIFACT_TRANSPORT:-obs} == obs ]]; then
+  source .buildkite/obs-python.sh
+  "$OBS_PYTHON" build/release/ci_transfer.py upload release     out/buildkite/adx-release.tar.gz out/buildkite/adx-release.tar.gz.sha256     out/buildkite/build-manifest.json out/buildkite/backend.tar.gz
+fi

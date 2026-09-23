@@ -13,7 +13,7 @@ class IndependentPipelineTests(unittest.TestCase):
     def test_product_pipelines_have_separate_configs_and_steps(self):
         package = (ROOT / '.buildkite/pipeline-package.yml').read_text()
         sdk = (ROOT / '.buildkite/pipeline-sdk.yml').read_text()
-        admin = package
+        admin = (ROOT / '.buildkite/pipeline-admin.yml').read_text()
         full = (ROOT / '.buildkite/pipeline-full.yml').read_text()
 
         self.assertIn('key: platform-build', package)
@@ -21,9 +21,9 @@ class IndependentPipelineTests(unittest.TestCase):
             self.assertIn(f'key: {key}', package)
         steps = {step['key']: step for step in yaml.safe_load(package)['steps']}
         self.assertEqual(set(steps['platform-build']['depends_on']),
-                         {'build-platform', 'build-gateway', 'build-execd', 'source-gate', 'admin-package'})
-        self.assertNotIn('key: platform-e2e', package)
-        self.assertNotIn('key: sdk-package', package)
+                         {'build-platform', 'build-gateway', 'build-execd', 'source-gate', 'admin-package', 'sdk-package'})
+        self.assertIn('key: platform-e2e', package)
+        self.assertIn('key: sdk-package', package)
 
         self.assertIn('key: sdk-package', sdk)
         self.assertIn('key: sdk-pypi', sdk)
@@ -53,7 +53,7 @@ class IndependentPipelineTests(unittest.TestCase):
         self.assertIn('.buildkite/build-sdk.sh admin', admin['command'])
         self.assertNotIn('admin-gate', steps)
         self.assertNotIn('platform-obs', steps)
-        self.assertEqual(steps['admin-pypi']['depends_on'], 'platform-build')
+        self.assertEqual(steps['admin-pypi']['depends_on'], 'platform-e2e')
         self.assertNotIn('artifact download', (ROOT / '.buildkite/upload-obs.sh').read_text())
         self.assertIn('bash .buildkite/upload-obs.sh', (ROOT / '.buildkite/package-components.sh').read_text())
 
@@ -65,8 +65,8 @@ class IndependentPipelineTests(unittest.TestCase):
         self.assertIn('pipeline-sdk.yml', selector)
         self.assertIn('agent-dx-full-test', selector)
         self.assertIn('pipeline-full.yml', selector)
-        self.assertNotIn('agent-dx-admin', selector)
-        self.assertFalse((ROOT / '.buildkite/pipeline-admin.yml').exists())
+        self.assertIn('agent-dx-admin', selector)
+        self.assertTrue((ROOT / '.buildkite/pipeline-admin.yml').exists())
         self.assertIn('pipeline-package.yml', selector)
 
     def test_admin_publish_is_explicit_and_verifies_the_index(self):
