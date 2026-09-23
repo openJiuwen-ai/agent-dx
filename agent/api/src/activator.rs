@@ -1,44 +1,12 @@
-//! Product control boundary and its remote HTTP implementation.
+//! HTTP client for the independent Activator service.
 use crate::request::RequestContext;
 use crate::{Error, Result};
 use adx_agent_core::{activator::*, transport, Environment, Scope, TemplateVersion};
-use async_trait::async_trait;
 use serde::{de::DeserializeOwned, Serialize};
 use std::{
     sync::atomic::{AtomicUsize, Ordering},
     time::Duration,
 };
-
-#[async_trait]
-pub trait Control: Send + Sync {
-    async fn publish(
-        &self,
-        ctx: &RequestContext,
-        tenant: &str,
-        template: &TemplateVersion,
-    ) -> Result<()>;
-    async fn template(
-        &self,
-        ctx: &RequestContext,
-        tenant: &str,
-        name: &str,
-        version: &str,
-    ) -> Result<TemplateVersion>;
-    async fn create_environment(&self, ctx: &RequestContext, scope: &Scope) -> Result<Environment>;
-    async fn environment(&self, ctx: &RequestContext, scope: &Scope) -> Result<Environment>;
-    async fn list_environments(
-        &self,
-        ctx: &RequestContext,
-        query: &EnvironmentList,
-    ) -> Result<EnvironmentPage>;
-    async fn delete_environment(&self, ctx: &RequestContext, scope: &Scope) -> Result<()>;
-    async fn activate(
-        &self,
-        ctx: &RequestContext,
-        scope: &Scope,
-        expected_generation: Option<&str>,
-    ) -> Result<Target>;
-}
 
 pub struct ActivatorClient {
     urls: Vec<String>,
@@ -163,9 +131,8 @@ pub(crate) fn uncertain(writes: bool, message: &str) -> Error {
         Error::Unavailable(message.into())
     }
 }
-#[async_trait]
-impl Control for ActivatorClient {
-    async fn publish(
+impl ActivatorClient {
+    pub async fn publish(
         &self,
         ctx: &RequestContext,
         tenant: &str,
@@ -182,7 +149,7 @@ impl Control for ActivatorClient {
         )
         .await
     }
-    async fn template(
+    pub async fn template(
         &self,
         ctx: &RequestContext,
         tenant: &str,
@@ -201,18 +168,7 @@ impl Control for ActivatorClient {
         )
         .await
     }
-    async fn create_environment(&self, ctx: &RequestContext, scope: &Scope) -> Result<Environment> {
-        self.request(
-            ctx,
-            "environments/create",
-            &ScopeRequest {
-                scope: scope.clone(),
-            },
-            true,
-        )
-        .await
-    }
-    async fn environment(&self, ctx: &RequestContext, scope: &Scope) -> Result<Environment> {
+    pub async fn environment(&self, ctx: &RequestContext, scope: &Scope) -> Result<Environment> {
         self.request(
             ctx,
             "environments/get",
@@ -223,14 +179,14 @@ impl Control for ActivatorClient {
         )
         .await
     }
-    async fn list_environments(
+    pub async fn list_environments(
         &self,
         ctx: &RequestContext,
         query: &EnvironmentList,
     ) -> Result<EnvironmentPage> {
         self.request(ctx, "environments/list", query, false).await
     }
-    async fn delete_environment(&self, ctx: &RequestContext, scope: &Scope) -> Result<()> {
+    pub async fn delete_environment(&self, ctx: &RequestContext, scope: &Scope) -> Result<()> {
         self.request(
             ctx,
             "environments/delete",
@@ -241,7 +197,7 @@ impl Control for ActivatorClient {
         )
         .await
     }
-    async fn activate(
+    pub async fn activate(
         &self,
         ctx: &RequestContext,
         scope: &Scope,

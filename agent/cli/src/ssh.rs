@@ -83,7 +83,7 @@ pub fn arguments(
         "-o".into(),
         "PreferredAuthentications=publickey".into(),
         "-o".into(),
-        "ControlCoordinator=no".into(),
+        "ControlMaster=no".into(),
         "-o".into(),
         "ControlPath=none".into(),
         "-o".into(),
@@ -173,6 +173,9 @@ mod tests {
         assert!(args
             .windows(2)
             .any(|v| v[0] == "-i" && v[1] == "/tmp/my key"));
+        assert!(args
+            .windows(2)
+            .any(|v| v[0] == "-o" && v[1] == "ControlMaster=no"));
         assert_eq!(args.last().unwrap(), "localhost");
     }
     #[test]

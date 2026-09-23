@@ -17,6 +17,23 @@ use adx_agent_store::{AgentState, MemoryRepository};
 struct Backend(Mutex<std::collections::HashMap<(String, String), SandboxObservation>>);
 #[async_trait::async_trait]
 impl Sandbox for Backend {
+    async fn list(&self, tenant: &str) -> Result<Vec<SandboxInfo>, SandboxError> {
+        Ok(self
+            .0
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|v| v.tenant == tenant && v.phase == SandboxPhase::Running)
+            .cloned()
+            .map(|observation| SandboxInfo {
+                observation,
+                node_ip: None,
+                sandbox_ip: None,
+                execution: None,
+            })
+            .collect())
+    }
+
     async fn create(&self, r: &CreateSandbox) -> Result<SandboxObservation, SandboxError> {
         let observed = SandboxObservation {
             id: r.id.clone(),
@@ -323,7 +340,11 @@ async fn inline_sandbox_identity_is_preserved_for_http_ws_and_connect() {
     let request: CreateRequest = serde_json::from_value(input()).unwrap();
     let id = api
         .service
-        .create("tenant", request)
+        .create(
+            &adx_agent_api::request::RequestContext::new(std::time::Duration::from_secs(60)),
+            "tenant",
+            request,
+        )
         .await
         .unwrap()
         .instance_id;
@@ -360,56 +381,46 @@ async fn inline_sandbox_identity_is_preserved_for_http_ws_and_connect() {
     api.service.kill("tenant", &id).await.unwrap();
 }
 
-fn local_control(inner: adx_activator::Activator) -> adx_agent_api::local::LocalControl {
-    adx_agent_api::local::LocalControl::new(Arc::new(inner))
+async fn remote_control(
+    inner: adx_activator::Activator,
+) -> adx_agent_api::activator::ActivatorClient {
+    let token = "gateway-test-activator-token-at-least-32-bytes";
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let timeout = adx_agent_core::limits::AGENT_REQUEST_TIMEOUT;
+    let app = adx_activator::server::router(Arc::new(inner), token, timeout).unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    adx_agent_api::activator::ActivatorClient::new(vec![url], token.into(), timeout, None, true)
+        .unwrap()
 }
 fn control_context() -> adx_agent_api::request::RequestContext {
     adx_agent_api::request::RequestContext::new(adx_agent_core::limits::AGENT_REQUEST_TIMEOUT)
 }
 
 #[tokio::test]
-async fn agent_configuration_selects_mode_and_checks_startup_dependencies() {
+async fn agent_configuration_builds_client_and_validates_deadline() {
     use crate::ingress::agent_api::AgentConfig;
-    let config: AgentConfig = serde_json::from_value(serde_json::json!({
-        "embedded": {"redis_url":"redis://127.0.0.1:1", "namespace":"test"}
-    }))
-    .unwrap();
-    assert!(matches!(
-        config.mode,
-        crate::ingress::agent_api::ActivatorMode::Embedded
-    ));
-    assert_eq!(config.timeout_seconds, 60);
-    let error = AgentApi::new(config, None).await.err().unwrap();
-    assert!(error.to_string().contains("requires ADX_SANDBOX_CONFIG"));
-
     let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", closed.local_addr().unwrap());
     drop(closed);
-    // Use an existing process variable as a test-only service credential, without mutating env.
-    let config: AgentConfig = serde_json::from_value(serde_json::json!({
-        "mode":"remote", "timeout_seconds":1,
-        "remote":{"urls":[url], "token_env":"PATH", "allow_plaintext":true}
-    }))
-    .unwrap();
-    let api = AgentApi::new(config, None).await.unwrap();
-    assert_eq!(api.request_timeout, std::time::Duration::from_secs(1));
+    // Read an existing test process variable without mutating global environment.
+    let settings = serde_json::json!({
+        "activator":{"urls":[url], "token_env":"PATH", "allow_plaintext":true}
+    });
+    let config: AgentConfig = serde_json::from_value(settings.clone()).unwrap();
+    assert_eq!(config.timeout_seconds, 60);
+    let api = AgentApi::new(config).unwrap();
     assert!(matches!(
         api.managed
             .template(&control_context(), "tenant", "demo", "1")
             .await,
         Err(adx_agent_api::Error::Unavailable(_))
     ));
-
-    for value in [
-        serde_json::json!({"mode":"remote", "embedded":{"redis_url":"redis://127.0.0.1", "namespace":"test"}}),
-        serde_json::json!({"timeout_seconds":0, "embedded":{"redis_url":"redis://127.0.0.1", "namespace":"test"}}),
-        serde_json::json!({"timeout_seconds":u64::MAX, "embedded":{"redis_url":"redis://127.0.0.1", "namespace":"test"}}),
-    ] {
+    for timeout in [0, u64::MAX] {
+        let mut value = settings.clone();
+        value["timeout_seconds"] = serde_json::json!(timeout);
         let config = serde_json::from_value(value).unwrap();
-        let error = AgentApi::new(config, Some(Arc::new(Backend::default())))
-            .await
-            .err()
-            .unwrap();
+        let error = AgentApi::new(config).err().unwrap();
         assert!(matches!(
             error.downcast_ref::<adx_agent_api::Error>(),
             Some(adx_agent_api::Error::Invalid(_))
@@ -419,23 +430,33 @@ async fn agent_configuration_selects_mode_and_checks_startup_dependencies() {
 
 #[tokio::test]
 #[ignore = "requires ADX_AGENT_TEST_REDIS_URL pointing to a disposable Redis"]
-async fn embedded_agent_startup_and_shared_redis_activation() {
+async fn independent_activators_share_redis_identity() {
     let redis_url = std::env::var("ADX_AGENT_TEST_REDIS_URL").unwrap();
-    let namespace = format!("embedded-{}", uuid::Uuid::new_v4());
-    let settings = serde_json::json!({"embedded":{"redis_url":redis_url,"namespace":namespace}});
+    let namespace = format!("remote-{}", uuid::Uuid::new_v4());
     let backend = Arc::new(Backend::default());
-    let a = AgentApi::new(
-        serde_json::from_value(settings.clone()).unwrap(),
-        Some(backend.clone()),
-    )
-    .await
-    .unwrap();
-    let b = AgentApi::new(
-        serde_json::from_value(settings).unwrap(),
-        Some(backend.clone()),
-    )
-    .await
-    .unwrap();
+    let mut clients = Vec::new();
+    for _ in 0..2 {
+        let store = adx_agent_store::RedisRepository::connect(
+            &redis_url,
+            &namespace,
+            std::time::Duration::from_secs(3),
+        )
+        .await
+        .unwrap();
+        let client = remote_control(adx_activator::Activator::new(
+            AgentState::new(Arc::new(store)),
+            backend.clone(),
+        ))
+        .await;
+        clients.push(AgentApi {
+            managed: Arc::new(adx_agent_api::managed::ManagedService::new(Arc::new(
+                client,
+            ))),
+            request_timeout: adx_agent_core::limits::AGENT_REQUEST_TIMEOUT,
+        });
+    }
+    let a = &clients[0];
+    let b = &clients[1];
     let template = serde_json::from_value(serde_json::json!({"name":"demo","version":"1","image":"app:1","isolation_runtime":"runc","entrypoint":["/start"],"resources":{"cpu_millis":1000,"memory_mib":512},"service":[{"protocol":"http","port":8080}]})).unwrap();
     a.managed
         .publish(&control_context(), "tenant", &template)
@@ -482,10 +503,13 @@ async fn embedded_agent_startup_and_shared_redis_activation() {
 #[tokio::test]
 async fn managed_environment_management_and_protocol_forwarding() {
     let (gateway, _) = fixture().await;
-    let control = Arc::new(local_control(adx_activator::Activator::new(
-        AgentState::new(Arc::new(MemoryRepository::default())),
-        Arc::new(Backend::default()),
-    )));
+    let control = Arc::new(
+        remote_control(adx_activator::Activator::new(
+            AgentState::new(Arc::new(MemoryRepository::default())),
+            Arc::new(Backend::default()),
+        ))
+        .await,
+    );
     let api = Arc::new(AgentApi {
         managed: Arc::new(adx_agent_api::managed::ManagedService::new(control)),
         request_timeout: adx_agent_core::limits::AGENT_REQUEST_TIMEOUT,
@@ -511,12 +535,21 @@ async fn managed_environment_management_and_protocol_forwarding() {
     assert_eq!(response.status(), StatusCode::OK);
     json(response).await;
     let path = "/api/agent/v2/templates/demo/versions/1/environments/env";
+    let mut traffic = Request::builder()
+        .uri("/agent/http/path?target=urn:adx:environment:demo:1:env&port=8080")
+        .header("authorization", "Bearer tenant")
+        .body(())
+        .unwrap();
+    gateway
+        .prepare_agent_data(&mut traffic, IngressSecurity::Tls)
+        .await
+        .unwrap();
     let response = sender
         .send_request(request(
-            "PUT",
+            "GET",
             path,
             "tenant",
-            "create",
+            "query",
             serde_json::json!({}),
         ))
         .await
@@ -640,7 +673,11 @@ async fn uuid_platform_routes_keep_their_existing_access_policy() {
     // Even an actual Agent ID must not shadow a literal Platform route.
     let id = api
         .service
-        .create("tenant", serde_json::from_value(input()).unwrap())
+        .create(
+            &adx_agent_api::request::RequestContext::new(std::time::Duration::from_secs(60)),
+            "tenant",
+            serde_json::from_value(input()).unwrap(),
+        )
         .await
         .unwrap()
         .instance_id;
@@ -725,10 +762,13 @@ async fn only_managed_data_entrypoint_resolves_and_reuses_authenticated_identity
     state.publish("tenant", &template).await.unwrap();
     state.create_environment(scope.clone()).await.unwrap();
     let id = state.environment(&scope).await.unwrap().unwrap().sandbox_id;
-    let control = Arc::new(local_control(adx_activator::Activator::new(
-        state.clone(),
-        Arc::new(Backend::default()),
-    )));
+    let control = Arc::new(
+        remote_control(adx_activator::Activator::new(
+            state.clone(),
+            Arc::new(Backend::default()),
+        ))
+        .await,
+    );
     gateway = gateway.with_agent_api(Arc::new(AgentApi {
         managed: Arc::new(adx_agent_api::managed::ManagedService::new(control)),
         request_timeout: adx_agent_core::limits::AGENT_REQUEST_TIMEOUT,
@@ -832,7 +872,11 @@ async fn inline_only_create_and_kill() {
     let api = InlineApi::new(config, Arc::new(Backend::default())).unwrap();
     let created = api
         .service
-        .create("tenant", serde_json::from_value(input()).unwrap())
+        .create(
+            &adx_agent_api::request::RequestContext::new(std::time::Duration::from_secs(60)),
+            "tenant",
+            serde_json::from_value(input()).unwrap(),
+        )
         .await
         .unwrap();
     api.service
@@ -844,10 +888,13 @@ async fn inline_only_create_and_kill() {
 #[tokio::test]
 async fn inline_accepts_frontend_credentials_independently_of_managed_api_keys() {
     let (gateway, _) = fixture().await;
-    let control = Arc::new(local_control(adx_activator::Activator::new(
-        AgentState::new(Arc::new(MemoryRepository::default())),
-        Arc::new(Backend::default()),
-    )));
+    let control = Arc::new(
+        remote_control(adx_activator::Activator::new(
+            AgentState::new(Arc::new(MemoryRepository::default())),
+            Arc::new(Backend::default()),
+        ))
+        .await,
+    );
     let gateway = Arc::new(
         Arc::try_unwrap(gateway)
             .ok()
@@ -1020,10 +1067,11 @@ async fn common_http_entry_selects_inline_or_environment_without_auth_fallback()
     state.publish("tenant", &template).await.unwrap();
     let api = Arc::new(AgentApi {
         managed: Arc::new(adx_agent_api::managed::ManagedService::new(Arc::new(
-            local_control(adx_activator::Activator::new(
+            remote_control(adx_activator::Activator::new(
                 state.clone(),
                 Arc::new(Backend::default()),
-            )),
+            ))
+            .await,
         ))),
         request_timeout: adx_agent_core::limits::AGENT_REQUEST_TIMEOUT,
     });
@@ -1222,10 +1270,11 @@ async fn unified_access_forwards_payloads_and_returns_environment_headers() {
     }
     let api = Arc::new(AgentApi {
         managed: Arc::new(adx_agent_api::managed::ManagedService::new(Arc::new(
-            local_control(adx_activator::Activator::new(
+            remote_control(adx_activator::Activator::new(
                 state,
                 Arc::new(Backend::default()),
-            )),
+            ))
+            .await,
         ))),
         request_timeout: adx_agent_core::limits::AGENT_REQUEST_TIMEOUT,
     });
@@ -1330,17 +1379,18 @@ async fn unified_access_forwards_payloads_and_returns_environment_headers() {
 #[path = "ssh/terminal_tests.rs"]
 mod ssh_terminal;
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn managed_http_and_ws_activation_are_bounded_by_the_entry_deadline() {
     let state = AgentState::new(Arc::new(MemoryRepository::default()));
     let template = serde_json::from_value(serde_json::json!({"name":"demo","version":"1","image":"app:1","isolation_runtime":"runc","entrypoint":["/start"],"resources":{"cpu_millis":1000,"memory_mib":512},"service":[{"protocol":"http","port":8080},{"protocol":"ws","port":8080}]})).unwrap();
     state.publish("tenant", &template).await.unwrap();
     let api = AgentApi {
         managed: Arc::new(adx_agent_api::managed::ManagedService::new(Arc::new(
-            local_control(adx_activator::Activator::new(
+            remote_control(adx_activator::Activator::new(
                 state,
                 Arc::new(StalledSandbox),
-            )),
+            ))
+            .await,
         ))),
         request_timeout: std::time::Duration::from_secs(1),
     };
@@ -1360,21 +1410,25 @@ async fn managed_http_and_ws_activation_are_bounded_by_the_entry_deadline() {
             api.prepare_data(&mut request, "tenant", access).await,
             Err(adx_agent_api::Error::OutcomeUnknown(_))
         ));
-        assert_eq!(started.elapsed(), std::time::Duration::from_secs(1));
+        assert!(
+            (std::time::Duration::from_millis(900)..std::time::Duration::from_secs(3))
+                .contains(&started.elapsed())
+        );
     }
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn managed_target_retry_uses_the_original_deadline() {
     let state = AgentState::new(Arc::new(MemoryRepository::default()));
     let template = serde_json::from_value(serde_json::json!({"name":"demo","version":"1","image":"app:1","isolation_runtime":"runc","entrypoint":["/start"],"resources":{"cpu_millis":1000,"memory_mib":512},"service":[{"protocol":"http","port":8080}]})).unwrap();
     state.publish("tenant", &template).await.unwrap();
     let api = AgentApi {
         managed: Arc::new(adx_agent_api::managed::ManagedService::new(Arc::new(
-            local_control(adx_activator::Activator::new(
+            remote_control(adx_activator::Activator::new(
                 state,
                 Arc::new(Backend::default()),
-            )),
+            ))
+            .await,
         ))),
         request_timeout: std::time::Duration::from_secs(1),
     };
@@ -1395,4 +1449,229 @@ async fn managed_target_retry_uses_the_original_deadline() {
         Err(adx_agent_api::Error::Unavailable(_))
     ));
     assert_eq!(request.uri(), &selected);
+}
+
+#[cfg(feature = "mock-e2e")]
+struct RuntimeBackend {
+    inner: Backend,
+    port: u16,
+}
+#[cfg(feature = "mock-e2e")]
+#[async_trait::async_trait]
+impl Sandbox for RuntimeBackend {
+    async fn create(&self, request: &CreateSandbox) -> Result<SandboxObservation, SandboxError> {
+        self.inner.create(request).await
+    }
+    async fn get(
+        &self,
+        tenant: &str,
+        id: &str,
+    ) -> Result<Option<SandboxObservation>, SandboxError> {
+        self.inner.get(tenant, id).await
+    }
+    async fn delete(&self, tenant: &str, id: &str) -> Result<SandboxObservation, SandboxError> {
+        self.inner.delete(tenant, id).await
+    }
+    async fn list(&self, tenant: &str) -> Result<Vec<SandboxInfo>, SandboxError> {
+        self.inner.list(tenant).await
+    }
+    async fn runtime(&self, tenant: &str, id: &str) -> Result<SandboxRuntime, SandboxError> {
+        self.inner
+            .get(tenant, id)
+            .await?
+            .ok_or(SandboxError::NotFound)?;
+        Ok(SandboxRuntime {
+            port: self.port,
+            token: "runtime-only-secret".into(),
+        })
+    }
+}
+
+#[cfg(feature = "mock-e2e")]
+#[tokio::test]
+async fn inline_runtime_operations_use_authorized_node_tunnel_and_original_wire_contract() {
+    use crate::{common::protocol::GatewayPolicy, node::Relay};
+    use serde_json::json as value;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let payload = Arc::new(Mutex::new(Vec::new()));
+    let uploaded = payload.clone();
+    let runtime = tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let uploaded = uploaded.clone();
+            tokio::spawn(async move {
+                let _ = hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(stream), service_fn(move |request: Request<Incoming>| {
+                    let uploaded = uploaded.clone();
+                    async move {
+                        assert_eq!(request.headers()["x-auth"], "runtime-only-secret");
+                        assert_eq!(request.headers()["x-trace-id"], "operation-trace");
+                        let uri = request.uri().clone();
+                        if uri.path() == "/download" {
+                            assert_eq!(request.headers()["range"], "bytes=1-3");
+                            return Ok::<_, Infallible>(Response::builder().status(206).header("content-range","bytes 1-3/5").body(Full::new(Bytes::from_static(b"ell"))).unwrap());
+                        }
+                        let body = request.into_body().collect().await.unwrap().to_bytes();
+                        let result = match uri.path() {
+                            "/invoke" => {
+                                let input: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                                match input["action"].as_str().unwrap() {
+                                    "cmd_run" => { assert_eq!(input["args"]["cmd"], "exec 'printf' 'hello'"); value!({"exit_code":0,"stdout":"hello","stderr":""}) },
+                                    "fs_list" => { assert_eq!(input["args"]["depth"],2); value!({"error":null,"entries":[{"name":"f","path":"/tmp/f","type":"file","size":5,"modified_time":0.0}]}) },
+                                    "fs_get_info" => value!({"size":5,"error":null}),
+                                    "fs_make_dir" => value!({"created":true,"error":null}),
+                                    other => panic!("unexpected action {other}"),
+                                }
+                            }
+                            "/upload" => { uploaded.lock().unwrap().extend_from_slice(&body); value!({"error":null,"committed":false,"bytes_written":body.len()}) },
+                            "/upload/commit" => { assert_eq!(*uploaded.lock().unwrap(), b"hello"); value!({"error":null,"committed":true,"size":5}) },
+                            other => panic!("unexpected runtime path {other}"),
+                        };
+                        Ok(Response::new(Full::new(Bytes::from(result.to_string()))))
+                    }
+                })).await;
+            });
+        }
+    });
+    let node = Arc::new(
+        Relay::new(GatewayPolicy::for_local_mock(vec!["127.0.0.0/8"
+            .parse()
+            .unwrap()]))
+        .with_route_enforcement(),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let node_task = {
+        let node = node.clone();
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let node = node.clone();
+                tokio::spawn(async move {
+                    let _ = node.serve_h2(stream).await;
+                });
+            }
+        })
+    };
+    let (gateway, api, routes) = fixture_with_backend(Arc::new(RuntimeBackend {
+        inner: Backend::default(),
+        port,
+    }))
+    .await;
+    let id = api
+        .service
+        .create(
+            &adx_agent_api::request::RequestContext::new(std::time::Duration::from_secs(60)),
+            "tenant",
+            serde_json::from_value(input()).unwrap(),
+        )
+        .await
+        .unwrap()
+        .instance_id;
+    let route: crate::common::route::RouteInfo = serde_json::from_value(value!({"instanceID":id,"instanceStatus":{"code":3},"tenantID":"tenant","sandboxID":"runtime","sandboxIP":"127.0.0.1","nodeProxyAddress":address.to_string()})).unwrap();
+    node.activate_route(
+        route.instance_id.clone(),
+        route.sandbox_id.clone(),
+        route.sandbox_ip.parse().unwrap(),
+    )
+    .await;
+    routes.put(route);
+    let (mut sender, server, client) = connection(gateway, IngressSecurity::Tls).await;
+    let listed = sender
+        .send_request(request("GET", "/api/agent", "tenant", "list", value!(null)))
+        .await
+        .unwrap();
+    assert_eq!(json(listed).await["instances"][0]["instance_id"], id);
+    let other = sender
+        .send_request(request("GET", "/api/agent", "other", "list", value!(null)))
+        .await
+        .unwrap();
+    assert_eq!(json(other).await["instances"], value!([]));
+    for (method, suffix, body, expected) in [
+        (
+            "POST",
+            "exec",
+            value!({"command":["printf","hello"],"timeout":2}),
+            value!({"returncode":0,"stdout":"hello","stderr":""}),
+        ),
+        (
+            "POST",
+            "files/mkdir?path=/tmp/new&recursive=true",
+            value!(null),
+            value!({"success":true,"path":"/tmp/new","created":true}),
+        ),
+    ] {
+        let response = sender
+            .send_request(request(
+                method,
+                &format!("/api/agent/{id}/{suffix}"),
+                "tenant",
+                "operation-trace",
+                body,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(json(response).await, expected);
+    }
+    let response = sender
+        .send_request(request(
+            "GET",
+            &format!("/api/agent/{id}/files/list?path=/tmp&recursive=true&max_depth=2"),
+            "tenant",
+            "operation-trace",
+            value!(null),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(json(response).await["items"][0]["path"], "/tmp/f");
+    let mut download = request(
+        "GET",
+        &format!("/api/agent/{id}/files/download?path=/tmp/f"),
+        "tenant",
+        "operation-trace",
+        value!(null),
+    );
+    download
+        .headers_mut()
+        .insert("range", "bytes=1-3".parse().unwrap());
+    let response = sender.send_request(download).await.unwrap();
+    assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(response.headers()["content-range"], "bytes 1-3/5");
+    assert_eq!(response.collect().await.unwrap().to_bytes(), "ell");
+    let mut upload = request(
+        "POST",
+        &format!("/api/agent/{id}/files/upload"),
+        "tenant",
+        "operation-trace",
+        value!(null),
+    );
+    upload.headers_mut().insert(
+        "content-type",
+        "multipart/form-data; boundary=BOUND".parse().unwrap(),
+    );
+    *upload.body_mut() = Full::new(Bytes::from_static(b"--BOUND\r\nContent-Disposition: form-data; name=\"path\"\r\n\r\n/tmp/f\r\n--BOUND\r\nContent-Disposition: form-data; name=\"file\"; filename=\"f\"\r\n\r\nhello\r\n--BOUND--\r\n"));
+    let response = sender.send_request(upload).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        json(response).await,
+        value!({"success":true,"path":"/tmp/f","size":5})
+    );
+    let denied = sender
+        .send_request(request(
+            "POST",
+            &format!("/api/agent/{id}/exec"),
+            "other",
+            "operation-trace",
+            value!({"command":"echo secret"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::NOT_FOUND);
+    json(denied).await;
+    server.abort();
+    client.abort();
+    node_task.abort();
+    runtime.abort();
 }

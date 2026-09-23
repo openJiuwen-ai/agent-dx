@@ -49,3 +49,6 @@ pub mod ssh;
 
 #[cfg(feature = "agent-api")]
 mod agent_response;
+
+#[cfg(feature = "agent-api")]
+mod inline_runtime;
