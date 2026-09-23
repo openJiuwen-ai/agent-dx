@@ -2,6 +2,7 @@
 use std::time::Duration;
 
 pub const IDENTIFIER_BYTES: usize = 512;
+pub const ENVIRONMENT_PAGE_SIZE: usize = 100;
 pub const SERVICE_TOKEN_MIN_BYTES: usize = 32;
 pub const HTTP_JSON_BYTES: usize = 1024 * 1024;
 pub const CAS_ATTEMPTS: usize = 32;

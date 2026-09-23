@@ -35,3 +35,17 @@ pub mod sandbox_api;
 
 #[cfg(feature = "agent-api")]
 pub mod agent_api;
+
+#[cfg(feature = "agent-api")]
+pub mod inline_api;
+#[cfg(feature = "agent-api")]
+mod inline_auth;
+
+#[cfg(feature = "agent-api")]
+mod agent_access;
+
+#[cfg(feature = "agent-api")]
+pub mod ssh;
+
+#[cfg(feature = "agent-api")]
+mod agent_response;

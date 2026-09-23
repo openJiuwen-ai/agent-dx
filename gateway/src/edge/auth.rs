@@ -315,7 +315,7 @@ fn now_unix_seconds() -> i64 {
         .as_secs() as i64
 }
 
-async fn validate_with_iam(
+pub(super) async fn validate_with_iam(
     iam_address: &str,
     token: &str,
     request_id: &str,

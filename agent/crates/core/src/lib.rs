@@ -7,6 +7,7 @@ pub mod error;
 pub mod inline;
 pub mod limits;
 pub mod sandbox;
+pub mod target;
 pub mod transport;
 
 pub type ValidationResult = Result<(), String>;

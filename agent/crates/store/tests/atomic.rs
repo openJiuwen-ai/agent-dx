@@ -229,5 +229,5 @@ async fn concurrent_namespace_initialization_preserves_current_state() {
         .query_async(&mut connection)
         .await
         .unwrap();
-    assert_eq!(marker, "environment-v1");
+    assert_eq!(marker, "environment-index-v1");
 }
