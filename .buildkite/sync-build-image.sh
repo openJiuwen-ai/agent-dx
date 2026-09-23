@@ -2,8 +2,21 @@
 set -euo pipefail
 : "${BUILDKITE_COMMIT:?Buildkite revision required}"
 
-config=build/images/build-environment.json
-output=out/buildkite/build-image
+case "${1:-rust}" in
+  rust)
+    config=build/images/build-environment.json
+    output=out/buildkite/build-image
+    recipe_file=build/images/Dockerfile.ci
+    verifier=/usr/local/bin/adx-verify-build-image
+    ;;
+  python)
+    config=build/images/python-environment.json
+    output=out/buildkite/python-build-image
+    recipe_file=build/images/Dockerfile.python
+    verifier=/usr/local/bin/adx-verify-python-image
+    ;;
+  *) echo 'unknown image kind' >&2; exit 2 ;;
+esac
 mkdir -p "$output"
 daemon_pid=''
 cleanup() {
@@ -46,13 +59,13 @@ platform=${values[2]}
 tag="$repository:${BUILDKITE_COMMIT:0:12}"
 cache_tag="$repository:buildcache"
 verify_image() {
-  docker run --rm --platform "$platform" "$1" /usr/local/bin/adx-verify-build-image
+  docker run --rm --platform "$platform" "$1" "$verifier"
 }
 
 docker pull "$cache_tag" >/dev/null 2>&1 || true
 docker build --progress=plain --provenance=false --platform "$platform" \
   --build-arg BUILDKIT_INLINE_CACHE=1 --cache-from "$cache_tag" \
-  --build-arg "BASE=$source_image" -f build/images/Dockerfile.ci -t "$tag" .
+  --build-arg "BASE=$source_image" -f "$recipe_file" -t "$tag" .
 verify_image "$tag"
 docker push "$tag"
 docker tag "$tag" "$cache_tag"
@@ -64,7 +77,7 @@ docker image rm "$tag" >/dev/null
 docker pull "$published"
 verify_image "$published"
 
-recipe_sha256=$(sha256sum build/images/Dockerfile.ci | awk '{print $1}')
+recipe_sha256=$(sha256sum "$recipe_file" | awk '{print $1}')
 python3 - "$output/result.json" "$source_image" "$published" "$platform" "$recipe_sha256" <<'PY'
 import json, os, sys
 path, source, published, platform, recipe = sys.argv[1:]

@@ -10,7 +10,7 @@ case "${ADX_ARTIFACT_TRANSPORT:-obs}" in
   *) echo 'ADX_ARTIFACT_TRANSPORT must be obs or buildkite' >&2; exit 2 ;;
 esac
 
-if [[ ${ADX_COLLECTOR_SYNC_ONLY:-0} == 1 || ${ADX_K8S_NODE_PREPARE_ONLY:-0} == 1 || ${ADX_BUILD_IMAGE_SYNC_ONLY:-0} == 1 ]]; then
+if [[ ${ADX_PYTHON_IMAGE_SYNC_ONLY:-0} == 1 || ${ADX_COLLECTOR_SYNC_ONLY:-0} == 1 || ${ADX_K8S_NODE_PREPARE_ONLY:-0} == 1 || ${ADX_BUILD_IMAGE_SYNC_ONLY:-0} == 1 ]]; then
   file=.buildkite/pipeline-maintenance.yml
 else
   case "${BUILDKITE_PIPELINE_SLUG:-agent-dx}" in

@@ -293,7 +293,8 @@ steps:
   - out/buildkite/backend.tar.gz
   - out/buildkite/release-manifest.json
   - out/buildkite/build-manifest.json
-  - out/buildkite/obs/**/*
+  - out/buildkite/obs/*.json
+  - out/buildkite/obs/urls.txt
   - out/buildkite/admin/**/*
   - out/buildkite/adx-execd.tar.gz
   - out/buildkite/adx-execd.tar.gz.sha256

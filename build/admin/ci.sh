@@ -4,6 +4,7 @@ set -euo pipefail
 : "${BUILDKITE_COMMIT:?Buildkite revision required}"
 root=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$root"
+source .buildkite/python-env.sh
 # The outer build-sdk.sh runner validates the clean, exact checkout.
 
 output=out/buildkite/admin

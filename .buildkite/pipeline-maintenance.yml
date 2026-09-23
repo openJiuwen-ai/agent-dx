@@ -2,46 +2,77 @@ steps:
 - label: ':docker: Mirror pinned OpenTelemetry Collector to SWR'
   key: collector-sync
   if: build.env("ADX_COLLECTOR_SYNC_ONLY") == "1"
-  agents: {queue: default, os: linux, arch: amd64}
+  agents:
+    queue: default
+    os: linux
+    arch: amd64
   command: python3 .buildkite/with_registry.py --docker -- bash .buildkite/sync-collector.sh
   timeout_in_minutes: 30
   env:
     ADX_E2E_IMAGE_REPOSITORY: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/adx-e2e
-  artifact_paths: [out/buildkite/collector-sync/**/*]
+  artifact_paths:
+  - out/buildkite/collector-sync/**/*
   plugins:
   - kubernetes:
       podSpec:
-        imagePullSecrets: [{name: swr-pull-secret}]
+        imagePullSecrets:
+        - name: swr-pull-secret
         containers:
         - image: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/sandbox-packager:v20260506_kubectl
-          securityContext: {privileged: true}
-          volumeMounts: [{name: docker-graph, mountPath: /var/lib/docker}]
+          securityContext:
+            privileged: true
+          volumeMounts:
+          - name: docker-graph
+            mountPath: /var/lib/docker
           env:
           - name: SWR_USERNAME
-            valueFrom: {secretKeyRef: {name: swr-credentials, key: username, optional: true}}
+            valueFrom:
+              secretKeyRef:
+                name: swr-credentials
+                key: username
+                optional: true
           - name: SWR_PASSWORD
-            valueFrom: {secretKeyRef: {name: swr-credentials, key: password, optional: true}}
+            valueFrom:
+              secretKeyRef:
+                name: swr-credentials
+                key: password
+                optional: true
           - name: SWR_DOCKER_CONFIG_JSON
-            valueFrom: {secretKeyRef: {name: swr-pull-secret, key: .dockerconfigjson, optional: true}}
-        volumes: [{name: docker-graph, emptyDir: {}}]
+            valueFrom:
+              secretKeyRef:
+                name: swr-pull-secret
+                key: .dockerconfigjson
+                optional: true
+        volumes:
+        - name: docker-graph
+          emptyDir: {}
 - label: ':wrench: Prepare ADX Kubernetes worker prerequisites'
   key: platform-node-prepare
   if: build.env("ADX_K8S_NODE_PREPARE_ONLY") == "1"
-  agents: {queue: default, os: linux, arch: amd64}
+  agents:
+    queue: default
+    os: linux
+    arch: amd64
   command: python3 .buildkite/with_registry.py -- bash .buildkite/prepare-k8s-node.sh
   timeout_in_minutes: 10
-  artifact_paths: [out/buildkite/node-prepare/**/*]
+  artifact_paths:
+  - out/buildkite/node-prepare/**/*
   env:
     ADX_KUBECONFIG: /var/run/yr-k8s/target/kubeconfig
   plugins:
   - kubernetes:
       podSpec:
-        imagePullSecrets: [{name: swr-pull-secret}]
+        imagePullSecrets:
+        - name: swr-pull-secret
         containers:
         - image: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/sandbox-deployer:v20260506_kubectl_py39
           resources:
-            requests: {cpu: '1', memory: 1Gi}
-            limits: {cpu: '2', memory: 2Gi}
+            requests:
+              cpu: '1'
+              memory: 1Gi
+            limits:
+              cpu: '2'
+              memory: 2Gi
 - label: ':docker: Build Ubuntu 20.04 ADX build environment'
   key: build-image-sync
   agents:
@@ -97,3 +128,57 @@ steps:
         - name: docker-graph
           emptyDir: {}
   if: build.env("ADX_BUILD_IMAGE_SYNC_ONLY") == "1" && build.env("ADX_COLLECTOR_SYNC_ONLY") != "1"
+- label: ':python: Build cached Python package environment'
+  key: python-image-sync
+  agents:
+    queue: default
+    os: linux
+    arch: amd64
+  command: python3 .buildkite/with_registry.py --docker -- bash .buildkite/sync-build-image.sh python
+  timeout_in_minutes: 45
+  env:
+    BUILDKITE_AGENT_NAME: agent-stack-k8s
+  artifact_paths:
+  - out/buildkite/python-build-image/**/*
+  plugins:
+  - kubernetes:
+      podSpec:
+        imagePullSecrets:
+        - name: swr-pull-secret
+        containers:
+        - image: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/sandbox-packager:v20260506_kubectl
+          securityContext:
+            privileged: true
+          volumeMounts:
+          - name: docker-graph
+            mountPath: /var/lib/docker
+          resources:
+            requests:
+              cpu: '8'
+              memory: 16Gi
+            limits:
+              cpu: '8'
+              memory: 16Gi
+          env:
+          - name: SWR_USERNAME
+            valueFrom:
+              secretKeyRef:
+                name: swr-credentials
+                key: username
+                optional: true
+          - name: SWR_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: swr-credentials
+                key: password
+                optional: true
+          - name: SWR_DOCKER_CONFIG_JSON
+            valueFrom:
+              secretKeyRef:
+                name: swr-pull-secret
+                key: .dockerconfigjson
+                optional: true
+        volumes:
+        - name: docker-graph
+          emptyDir: {}
+  if: build.env("ADX_PYTHON_IMAGE_SYNC_ONLY") == "1"
