@@ -1,11 +1,12 @@
 # ADX Buildkite pipelines
 
-ADX uses three independent Buildkite pipelines backed by one repository:
+ADX uses four Buildkite pipelines backed by one repository:
 
 | Buildkite pipeline | Configuration | Responsibility |
 |---|---|---|
-| `agent-dx` | `pipeline-package.yml` | Per-component UT and packaging, adxadmin wheel/sdist, assembly/install smoke, optional OBS and adxadmin PyPI publication |
+| `agent-dx` | `pipeline-package.yml` | Platform/Execd/SDK/adxadmin UT and packages, install smoke, real Kubernetes L0, optional OBS and PyPI publication |
 | `agent-dx-python-sdk` | `pipeline-sdk.yml` | Python SDK tests, wheel/sdist, clean install smoke and optional OBS/PyPI publication |
+| `agent-dx-admin` | `pipeline-admin.yml` | Standalone adxadmin UT, wheel/sdist, install smoke and optional PyPI publication |
 | `agent-dx-full-test` | `pipeline-full.yml` | Compose exact base/SDK candidates and run the ten-group Kubernetes Full gate |
 
 `.buildkite/pipeline.yml` only dispatches by `BUILDKITE_PIPELINE_SLUG`; it does
@@ -34,10 +35,10 @@ Set these variables on a Buildkite build or in that pipeline's environment setti
 | `ADX_RELEASE_VERSION` | tag-derived | OBS release path version |
 | `ADX_OBS_BUCKET` / `ADX_OBS_ENDPOINT` | `openyuanrong` / `obs.cn-southwest-2.myhuaweicloud.com` | OBS intermediate transport and final publication destination |
 | `ADX_ARTIFACT_TRANSPORT` | `obs` | Base components: `obs` staging or explicit `buildkite` transport |
-| `ADX_ADMIN_PYPI_UPLOAD` | `0` | Base: `1` enables adxadmin publication, exact `adxadmin-v<version>` tag required |
-| `ADX_ADMIN_PYPI_REPOSITORY` | `pypi` | Base: `pypi` or `testpypi` |
-| `ADX_SDK_PYPI_UPLOAD` | `0` | SDK: `1` enables Sandbox SDK publication, exact `sdk-v<version>` tag required |
-| `ADX_SDK_PYPI_REPOSITORY` | `pypi` | SDK: `pypi` or `testpypi` |
+| `ADX_ADMIN_PYPI_UPLOAD` | `0` | Base/admin: `1` enables adxadmin publication, exact `adxadmin-v<version>` tag required |
+| `ADX_ADMIN_PYPI_REPOSITORY` | `pypi` | Base/admin: `pypi` or `testpypi` |
+| `ADX_SDK_PYPI_UPLOAD` | `0` | Base/SDK: `1` enables Sandbox SDK publication, exact `sdk-v<version>` tag required |
+| `ADX_SDK_PYPI_REPOSITORY` | `pypi` | Base/SDK: `pypi` or `testpypi` |
 | `ADX_BASE_PACKAGE_BUILD_ID` / `ADX_SDK_BUILD_ID` | required | Full: exact input candidates; Full never publishes Python packages |
 
 Boolean controls accept only `0` or `1`. Component transport is independent of
@@ -66,6 +67,38 @@ by release steps. Execd and the SDK remain in the unified release archive.
 Set `ADX_OBS_UPLOAD=1` to upload verified local outputs at the end of
 `platform-build`, including adxadmin candidates. The same job publishes
 `out/buildkite/obs/manifest.json` and URLs without downloading the assembled package again.
+
+## Base artifact set and L0 gate
+
+The base pipeline retains all these downloadable outputs:
+
+- `adx-release.tar.gz`: installable package, including the tested SDK wheel.
+- `adx-execd.tar.gz`: independent Execd binary, runtime EROFS filesystem and component manifest; a separate SHA256 file is provided.
+- `backend.tar.gz`: pinned sandboxd/runc dependency bundle, distinct from Execd.
+- `sdk/`: Sandbox SDK wheel, sdist, candidate and test evidence.
+- `admin/`: adxadmin wheel, sdist, candidate and install evidence.
+
+Execd also remains in the unified installer bundle. Its independent archive is
+published as a final artifact, not just an intermediate component transfer.
+OBS upload includes the independent Execd archive and both Python distributions.
+
+After assembly, `platform-images` reuses the Full image composition code and
+`platform-e2e` runs **`l0`** against a real isolated Kubernetes deployment:
+create/query, command stdout/stderr/exit code, binary file roundtrip, deletion,
+authentication/tenant boundaries, and namespace cleanup. Fault/restart suites
+remain in the independent Full pipeline. Base PyPI steps depend on the successful
+L0 job. OBS uploads are candidate publication during assembly: an uploaded URL
+alone does not establish a passed L0 build. Check the final Buildkite verdict.
+
+L0 image composition downloads the base candidate once through OBS staging by
+default. Full keeps explicit base/SDK build IDs and its existing Buildkite input
+transport; `ADX_BASE_ARTIFACT_TRANSPORT=obs` can consume a new build's staged base
+candidate while that temporary prefix is retained.
+
+The independent SDK and admin pipelines are convenient ways to build just one
+Python package. They share exactly the same package/test scripts with the base
+pipeline; they are not prerequisites for a base build. For `agent-dx-admin`, use
+this repository and `.buildkite/pipeline.yml` as the configuration entrypoint.
 
 ## Optional PyPI publication
 
@@ -208,15 +241,16 @@ Gateway owns API Server, routing and Agent crate tests; Execd owns runtime tests
 The test partition is checked against Cargo workspace membership. Explicitly
 ignored integration tests still require their dedicated environments; this is
 not the Full E2E gate. `source-gate` owns fmt/Clippy and CI/release tooling checks.
-`admin-package` produces tested Python artifacts in parallel.
+`admin-package` and `sdk-package` produce tested Python artifacts in parallel.
 
-After all five jobs pass, `platform-build` downloads each component archive once
+The base SDK step reuses the independent SDK pipeline command and produces a
+tested wheel/sdist candidate. After all six jobs pass, `platform-build` downloads each component archive once
 through the selected transport, validates the component manifest, assembles the
 release, and runs installation/help smoke checks in a temporary directory.
 Optional OBS publication uses these local outputs directly. Buildkite still
 retains final base/backend archives for downstream Full runs and manual downloads;
 intermediate component archives use OBS by default. `build-manifest.json` binds
-the commit, component manifests, base archive, backend bundle and convenience SDK
+the commit, component manifests, base archive, backend bundle and tested SDK
 copy. `admin-candidate.json` independently binds the same commit/build and Python artifacts.
 
 The assembly step downloads the pinned external sandboxd backend artifact selected by
@@ -225,9 +259,9 @@ digests. `sdk-package` independently tests the public SDK on Python 3.12, create
 one wheel and one sdist, installs the wheel in a source-free virtual environment,
 and publishes `sdk-candidate.json` with commit, version and SHA256 values.
 
-The current base archive still carries a convenience copy of the SDK wheel for
-standalone installation compatibility. That copy is not the SDK candidate and
-is never selected by Full. Full installs only the wheel named and hashed by the
+The base archive includes the tested SDK wheel produced by its `sdk-package`
+step. Full uses the explicitly selected SDK build candidate and installs only
+the wheel named and hashed by the
 independent `sdk-package` candidate.
 
 The Full pipeline requires `ADX_BASE_PACKAGE_BUILD_ID` and `ADX_SDK_BUILD_ID`.

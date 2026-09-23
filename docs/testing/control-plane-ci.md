@@ -5,7 +5,7 @@
 
 当前独立流水线正式验证为 [基础包 #68](https://buildkite.com/agent-dx/agent-dx/builds/68)、[Python SDK #4](https://buildkite.com/agent-dx/agent-dx-python-sdk/builds/4) 与 [Full Test #4](https://buildkite.com/agent-dx/agent-dx-full-test/builds/4)。三者使用同一提交 `a4798032e96a602bd58cc13c1312cd01e67effb3`；固定构建镜像、三组件并行编译、source gate、制品清单和只组装不重编译的交接均已实际执行。Full 十组全部通过，两个 ADX Node 分别落在 `10.244.128.124` 和 `10.244.128.160`，无缺失用例和清理错误。FC 按当前决策继续本地验收。
 
-开发验证在本地执行，Buildkite 配置分为基础包（含 adxadmin）、Python SDK 和 Full 三条独立流水线。基础包在固定摘要的 ADX 构建镜像中并行执行 Platform、Gateway 和 Execd 各自的 UT 与编译，同时执行 source gate；组装步骤只消费通过清单和 SHA256 校验的组件归档，并输出 `build-manifest.json`。基础流水线的 `admin-package` 构建 `adxadmin` wheel/sdist 并执行单测和安装检查，默认不上传 PyPI。Full 只消费显式指定的基础包与 SDK build UUID；`build/e2e/prepare.py` 组合并校验验收镜像，`build/e2e/kubernetes/run.py` 在目标 Kubernetes 集群部署、验收、收集并清理。真实 sandboxd、基础包内 Execd 和独立 SDK wheel 均参与执行。流水线复用现有 default/linux/amd64 队列、builder/packager/deployer、目标 kubeconfig挂载与 SWR Secret，见 [Buildkite 说明](../../.buildkite/README.md)。本地通过不等于远端 Buildkite 已通过。
+开发验证在本地执行，Buildkite 配置分为基础包（含 SDK、adxadmin、K8s L0）、SDK 独立出包、adxadmin 独立出包和 Full 四条流水线。基础包在固定摘要的 ADX 构建镜像中并行执行 Platform、Gateway 和 Execd 各自的 UT 与编译，同时执行 source gate；组装步骤只消费通过清单和 SHA256 校验的组件归档，并输出 `build-manifest.json`。基础流水线的 `admin-package` 构建 `adxadmin` wheel/sdist 并执行单测和安装检查，默认不上传 PyPI。Full 只消费显式指定的基础包与 SDK build UUID；`build/e2e/prepare.py` 组合并校验验收镜像，`build/e2e/kubernetes/run.py` 在目标 Kubernetes 集群部署、验收、收集并清理。真实 sandboxd、基础包内 Execd 和独立 SDK wheel 均参与执行。流水线复用现有 default/linux/amd64 队列、builder/packager/deployer、目标 kubeconfig挂载与 SWR Secret，见 [Buildkite 说明](../../.buildkite/README.md)。本地通过不等于远端 Buildkite 已通过。
 
 ## 本地开发验证
 

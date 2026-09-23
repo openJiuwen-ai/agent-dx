@@ -55,6 +55,20 @@ class BuildSummaryTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'evidence missing'):
                 summary.collect(root, 'e2e', 0, COMMIT)
 
+    def test_base_image_stage_preserves_release_artifact_summary(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            release = {'commit': COMMIT, 'stages': {'release': {'status': 'passed', 'exit_code': 0}},
+                       'release': {'fixture': True}}
+            write(root, 'summaries/release.json', release)
+            write(root, 'bundle/bundle.json', {'base_images': {}, 'backend': {'sandboxd_revision': 'b' * 40}})
+            write(root, 'bundle/registry-images.json', {'references': {}})
+            result = summary.collect(root, 'images', 0, COMMIT)
+            self.assertEqual(result['release'], release['release'])
+            self.assertEqual(set(result['stages']), {'release', 'images'})
+            with self.assertRaisesRegex(ValueError, 'different commit'):
+                summary.collect(root, 'images', 0, 'd' * 40)
+
     def test_e2e_still_requires_image_summary(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

@@ -16,6 +16,7 @@ else
   case "${BUILDKITE_PIPELINE_SLUG:-agent-dx}" in
     agent-dx) file=.buildkite/pipeline-package.yml ;;
     agent-dx-python-sdk) file=.buildkite/pipeline-sdk.yml ;;
+    agent-dx-admin) file=.buildkite/pipeline-admin.yml ;;
     agent-dx-full-test) file=.buildkite/pipeline-full.yml ;;
     *) echo "unsupported ADX Buildkite pipeline: ${BUILDKITE_PIPELINE_SLUG:-unset}" >&2; exit 2 ;;
   esac

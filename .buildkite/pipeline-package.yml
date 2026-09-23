@@ -208,6 +208,69 @@ steps:
           hostPath:
             path: /mnt/paas
             type: DirectoryOrCreate
+- label: ':python: Test and package ADX Sandbox SDK'
+  key: sdk-package
+  agents:
+    queue: default
+    os: linux
+    arch: amd64
+  concurrency: 1
+  concurrency_group: adx/sdk-package
+  command: python3 .buildkite/with_registry.py --docker -- bash .buildkite/build-sdk.sh
+  timeout_in_minutes: 30
+  artifact_paths:
+  - out/buildkite/sdk/**/*
+  - out/buildkite/logs/sdk-*.log
+  env:
+    BUILDKITE_AGENT_NAME: agent-stack-k8s
+    ADX_SDK_TEST_IMAGE: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/adx-e2e@sha256:c310ebf3f56c846d21744640a899d52e16a98b5442ca39402a3132010c722c4a
+  plugins:
+  - kubernetes:
+      podSpec:
+        imagePullSecrets:
+        - name: swr-pull-secret
+        containers:
+        - image: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/sandbox-packager:v20260506_kubectl
+          securityContext:
+            privileged: true
+          volumeMounts:
+          - name: docker-graph
+            mountPath: /var/lib/docker
+          - name: build-cache
+            mountPath: /mnt/paas
+          resources:
+            requests:
+              cpu: '2'
+              memory: 4Gi
+            limits:
+              cpu: '4'
+              memory: 8Gi
+          env:
+          - name: SWR_USERNAME
+            valueFrom:
+              secretKeyRef:
+                name: swr-credentials
+                key: username
+                optional: true
+          - name: SWR_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: swr-credentials
+                key: password
+                optional: true
+          - name: SWR_DOCKER_CONFIG_JSON
+            valueFrom:
+              secretKeyRef:
+                name: swr-pull-secret
+                key: .dockerconfigjson
+                optional: true
+        volumes:
+        - name: docker-graph
+          emptyDir: {}
+        - name: build-cache
+          hostPath:
+            path: /mnt/paas
+            type: DirectoryOrCreate
 - label: ':package: Assemble and optionally publish ADX base package'
   key: platform-build
   depends_on:
@@ -216,6 +279,7 @@ steps:
   - build-execd
   - source-gate
   - admin-package
+  - sdk-package
   agents:
     queue: default
     os: linux
@@ -231,6 +295,9 @@ steps:
   - out/buildkite/build-manifest.json
   - out/buildkite/obs/**/*
   - out/buildkite/admin/**/*
+  - out/buildkite/adx-execd.tar.gz
+  - out/buildkite/adx-execd.tar.gz.sha256
+  - out/buildkite/sdk/**/*
   env:
     BUILDKITE_AGENT_NAME: agent-stack-k8s
     ADX_CARGO_HOME: /mnt/paas/build-cache/adx/cargo-home
@@ -242,9 +309,126 @@ steps:
     GOMODCACHE: /mnt/paas/build-cache/adx/go-mod
     ADX_BACKEND_ARTIFACT_BUILD: 01a0ad6d-9629-4da8-903b-3f8bd1ddc992
   plugins: *id001
+- label: ':docker: Compose L0 smoke images'
+  key: platform-images
+  agents:
+    queue: default
+    os: linux
+    arch: amd64
+  command: bash .buildkite/step.sh images python3 .buildkite/with_registry.py --docker -- bash .buildkite/package-smoke.sh
+  timeout_in_minutes: 40
+  env:
+    BUILDKITE_AGENT_NAME: agent-stack-k8s
+    ADX_E2E_IMAGE_REPOSITORY: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/adx-e2e
+  artifact_paths:
+  - out/buildkite/logs/**/*
+  - out/buildkite/bundle/*.json
+  plugins:
+  - kubernetes:
+      podSpec:
+        imagePullSecrets:
+        - name: swr-pull-secret
+        containers:
+        - image: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/sandbox-packager:v20260506_kubectl
+          securityContext:
+            privileged: true
+          volumeMounts:
+          - name: docker-graph
+            mountPath: /var/lib/docker
+          resources:
+            requests:
+              cpu: '8'
+              memory: 16Gi
+            limits:
+              cpu: '8'
+              memory: 16Gi
+          env:
+          - name: SWR_USERNAME
+            valueFrom:
+              secretKeyRef:
+                name: swr-credentials
+                key: username
+                optional: true
+          - name: SWR_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: swr-credentials
+                key: password
+                optional: true
+          - name: SWR_DOCKER_CONFIG_JSON
+            valueFrom:
+              secretKeyRef:
+                name: swr-pull-secret
+                key: .dockerconfigjson
+                optional: true
+          - name: OBS_ACCESS_KEY_ID
+            valueFrom:
+              secretKeyRef:
+                name: obs-credentials
+                key: AK
+                optional: true
+          - name: OBS_SECRET_ACCESS_KEY
+            valueFrom:
+              secretKeyRef:
+                name: obs-credentials
+                key: SK
+                optional: true
+        volumes:
+        - name: docker-graph
+          emptyDir: {}
+  depends_on: platform-build
+- label: ':kubernetes: L0 SDK and authentication smoke'
+  key: platform-e2e
+  depends_on: platform-images
+  agents:
+    queue: default
+    os: linux
+    arch: amd64
+  command: bash .buildkite/step.sh e2e python3 .buildkite/with_registry.py -- bash .buildkite/run-e2e.sh
+  timeout_in_minutes: 30
+  artifact_paths:
+  - out/buildkite/acceptance/**/*
+  - out/buildkite/logs/**/*
+  env:
+    BUILDKITE_AGENT_NAME: agent-stack-k8s
+    ADX_KUBECONFIG: /var/run/yr-k8s/target/kubeconfig
+    ADX_E2E_PROFILE: l0
+  plugins:
+  - kubernetes:
+      podSpec:
+        imagePullSecrets:
+        - name: swr-pull-secret
+        containers:
+        - image: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/sandbox-deployer:v20260506_kubectl_py39
+          resources:
+            requests:
+              cpu: '2'
+              memory: 4Gi
+            limits:
+              cpu: '4'
+              memory: 8Gi
+          env:
+          - name: SWR_USERNAME
+            valueFrom:
+              secretKeyRef:
+                name: swr-credentials
+                key: username
+                optional: true
+          - name: SWR_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: swr-credentials
+                key: password
+                optional: true
+          - name: SWR_DOCKER_CONFIG_JSON
+            valueFrom:
+              secretKeyRef:
+                name: swr-pull-secret
+                key: .dockerconfigjson
+                optional: true
 - label: ':pypi: Publish adxadmin'
   key: admin-pypi
-  depends_on: platform-build
+  depends_on: platform-e2e
   if: build.env("ADX_ADMIN_PYPI_UPLOAD") == "1" && build.tag != null
   agents:
     queue: default
@@ -289,6 +473,59 @@ steps:
               secretKeyRef:
                 name: adx-pypi-credentials
                 key: admin-testpypi-token
+                optional: true
+        volumes:
+        - name: build-cache
+          hostPath:
+            path: /mnt/paas
+            type: DirectoryOrCreate
+- label: ':pypi: Publish ADX Sandbox SDK'
+  key: sdk-pypi
+  depends_on: platform-e2e
+  if: build.env("ADX_SDK_PYPI_UPLOAD") == "1" && build.tag != null
+  agents:
+    queue: default
+    os: linux
+    arch: amd64
+  concurrency: 1
+  concurrency_group: adx/sdk-pypi
+  command: bash .buildkite/step.sh sdk-pypi bash .buildkite/publish-sdk-pypi.sh
+  timeout_in_minutes: 15
+  artifact_paths:
+  - out/buildkite/sdk-publish/**/*
+  - out/buildkite/logs/step-sdk-pypi.log
+  env:
+    BUILDKITE_AGENT_NAME: agent-stack-k8s
+    PIP_CACHE_DIR: /mnt/paas/build-cache/adx/pip
+  plugins:
+  - kubernetes:
+      podSpec:
+        imagePullSecrets:
+        - name: swr-pull-secret
+        containers:
+        - image: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/adx-e2e@sha256:c310ebf3f56c846d21744640a899d52e16a98b5442ca39402a3132010c722c4a
+          volumeMounts:
+          - name: build-cache
+            mountPath: /mnt/paas
+          resources:
+            requests:
+              cpu: '1'
+              memory: 2Gi
+            limits:
+              cpu: '2'
+              memory: 4Gi
+          env:
+          - name: ADX_SANDBOX_PYPI_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: adx-pypi-credentials
+                key: sandbox-pypi-token
+                optional: true
+          - name: ADX_SANDBOX_TEST_PYPI_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: adx-pypi-credentials
+                key: sandbox-testpypi-token
                 optional: true
         volumes:
         - name: build-cache

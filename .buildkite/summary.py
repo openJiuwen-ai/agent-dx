@@ -25,6 +25,8 @@ def collect(root, stage, exit_code, commit):
     # The Full image stage therefore starts its own summary, while the E2E job
     # still consumes and extends the image provenance from its preceding job.
     previous = {'e2e': 'images'}.get(stage)
+    if stage == 'images' and (root / 'summaries/release.json').is_file():
+        previous = 'release'
     result = read(root / 'summaries' / f'{previous}.json') if previous else None
     if result and result['commit'] != commit:
         raise ValueError('summary belongs to a different commit')
@@ -47,6 +49,10 @@ def collect(root, stage, exit_code, commit):
                                  'bytes': archive.stat().st_size,
                                  'sha256': digest.hexdigest(),
                                  'sdk': sorted(p.name for p in (root / 'sdk').glob('*.whl'))}
+        if result.get('release'):
+            result['release']['admin'] = sorted(p.name for p in (root / 'admin').glob('adxadmin-*') if p.suffix == '.whl' or p.name.endswith('.tar.gz'))
+            result['release']['execd'] = (root / 'adx-execd.tar.gz').is_file()
+            result['release']['sdk_source'] = sorted(p.name for p in (root / 'sdk').glob('*.tar.gz'))
         if exit_code == 0 and not result.get('release'):
             raise ValueError('release artifacts missing')
     elif stage == 'images':
@@ -95,6 +101,12 @@ def render(result):
                   '组件：' + ', '.join(code(Path(p).name) for p in manifest['files'] if p.startswith(('bin/', 'runtime/')))]
         if release['sdk']:
             lines += ['', 'SDK：' + ' · '.join(link(name, 'sdk/' + name) for name in release['sdk'])]
+        if release.get('sdk_source'):
+            lines += ['', 'SDK sdist：' + ' · '.join(link(name, 'sdk/' + name) for name in release['sdk_source'])]
+        if release.get('admin'):
+            lines += ['', 'adxadmin：' + ' · '.join(link(name, 'admin/' + name) for name in release['admin'])]
+        if release.get('execd'):
+            lines += ['', link('独立 Execd 包', 'adx-execd.tar.gz') + ' · ' + link('Execd SHA256', 'adx-execd.tar.gz.sha256')]
     images = result.get('images')
     if images:
         lines += ['', '### 镜像', '', '| 镜像 | 拉取地址（固定 digest） |', '|---|---|']

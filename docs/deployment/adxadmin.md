@@ -31,7 +31,7 @@ PYTHON=python3.12 bash tools/admin/build.sh out/wheels
 pipx install adxadmin==0.1.0
 ```
 
-仓库中的 `agent-dx` 基础出包流水线的 `admin-package` 步骤始终构建并校验 wheel 与 sdist，但默认不上传。
+基础流水线 `agent-dx` 与独立流水线 `agent-dx-admin` 共享 `admin-package` 步骤始终构建并校验 wheel 与 sdist，但默认不上传。
 只有版本标签与 `pyproject.toml` 完全一致，且构建显式设置
 `ADX_ADMIN_PYPI_UPLOAD=1` 时才会执行 PyPI/TestPyPI 发布。具体变量、Secret 和制品回读
 契约见 [Buildkite 说明](../../.buildkite/README.md#optional-pypi-publication)。

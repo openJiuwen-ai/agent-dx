@@ -47,3 +47,27 @@ class PipelineContracts(unittest.TestCase):
                                 env=dict(os.environ, ADX_ARTIFACT_TRANSPORT='invalid'),
                                 capture_output=True, text=True)
         self.assertEqual(result.returncode, 2)
+
+    def test_base_retains_sdk_execd_and_real_l0(self):
+        import yaml
+        pipeline = yaml.safe_load((ROOT / '.buildkite/pipeline-package.yml').read_text())
+        steps = {step['key']: step for step in pipeline['steps']}
+        self.assertIn('sdk-package', steps)
+        self.assertIn('sdk-package', steps['platform-build']['depends_on'])
+        self.assertEqual(steps['platform-e2e']['env']['ADX_E2E_PROFILE'], 'l0')
+        self.assertEqual(steps['platform-images']['depends_on'], 'platform-build')
+        self.assertIn('out/buildkite/adx-execd.tar.gz', steps['platform-build']['artifact_paths'])
+        self.assertEqual(steps['admin-pypi']['depends_on'], 'platform-e2e')
+        self.assertEqual(steps['sdk-pypi']['depends_on'], 'platform-e2e')
+        self.assertTrue((ROOT / '.buildkite/pipeline-admin.yml').exists())
+        assemble = (ROOT / '.buildkite/package-components.sh').read_text()
+        self.assertNotIn('platform/sdk/sandbox/python/build.sh', assemble)
+        self.assertIn('--step sdk-package', assemble)
+
+
+    def test_python_build_commands_are_shared_by_base_and_independent_pipelines(self):
+        import yaml
+        base = {s['key']: s for s in yaml.safe_load((ROOT / '.buildkite/pipeline-package.yml').read_text())['steps']}
+        for package in ('sdk', 'admin'):
+            single = yaml.safe_load((ROOT / f'.buildkite/pipeline-{package}.yml').read_text())['steps'][0]
+            self.assertEqual(base[package + '-package']['command'], single['command'])
