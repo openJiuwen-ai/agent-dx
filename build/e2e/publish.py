@@ -19,7 +19,7 @@ def blob(repo, data):
     with request(location,'PUT',data,{'Content-Type':'application/octet-stream'}):pass
     return digest
 
-def publish(archive, repository='adx-rrt', tag='acceptance'):
+def publish(archive, repository='adx-execd', tag='acceptance'):
     if not repository or '/' in repository or not tag:
         raise ValueError('simple repository and tag are required')
     repo='/v2/'+repository
@@ -45,7 +45,7 @@ def publish(archive, repository='adx-rrt', tag='acceptance'):
         if digest!='sha256:'+hashlib.sha256(body).hexdigest():raise ValueError('registry manifest digest mismatch')
         return digest
 if __name__=='__main__':
-    digest=publish('/rrt.tar')
-    Path('/secrets/image').write_text('127.0.0.1:5000/adx-rrt@'+digest)
-    Path('/evidence/rrt-image.json').write_text(json.dumps({'registry_digest':digest}))
-    print('RRT manifest uploaded and verified',digest)
+    digest=publish('/execd.tar')
+    Path('/secrets/image').write_text('127.0.0.1:5000/adx-execd@'+digest)
+    Path('/evidence/execd-image.json').write_text(json.dumps({'registry_digest':digest}))
+    print('EXECD manifest uploaded and verified',digest)

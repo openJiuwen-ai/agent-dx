@@ -1,5 +1,7 @@
 # 日志与Trace正式Kubernetes验收
 
+> 历史记录：命令、组件和产物名称对应当时版本；当前命名见 [组件命名](../architecture/naming.md)。
+
 [Buildkite #21](https://buildkite.com/agent-dx/agent-dx/builds/21) 的编译、镜像发布、独立Kubernetes E2E全部通过。验收提交为 `b3145d6d43d04c06dbc85a91928d441814111d87`，发布包dirty=false，release manifest、bundle与镜像引用身份一致。
 
 ## 部署与用例

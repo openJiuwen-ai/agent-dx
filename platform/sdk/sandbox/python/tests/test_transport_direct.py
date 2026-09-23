@@ -1672,13 +1672,13 @@ def test_direct_entry_uses_server_and_ignores_plain_gateway_entry():
         )
     }
     try:
-        os.environ["ADX_SERVER_ADDRESS"] = "edge-tls:8443"
+        os.environ["ADX_SERVER_ADDRESS"] = "ingress-tls:8443"
         os.environ["ADX_TLS"] = "1"
-        os.environ["ADX_GATEWAY_ADDRESS"] = "edge-plain:8080"
+        os.environ["ADX_GATEWAY_ADDRESS"] = "ingress-plain:8080"
         os.environ["ADX_GATEWAY_TLS"] = "0"
         client = SandboxClient(token="test-token")
         _check(
-            client._direct_base == "https://edge-tls:8443/direct",
+            client._direct_base == "https://ingress-tls:8443/direct",
             f"plain gateway leaked into direct entry: {client._direct_base}",
         )
         client.close()
@@ -1706,7 +1706,7 @@ def test_reverse_tunnel_url_uses_gateway_tunnel_alias():
 
     class FakeClient:
         direct_enabled = True
-        rrt_port = 50090
+        execd_port = 50090
         token = "test-token"
 
         def create(self, body):
@@ -1766,16 +1766,16 @@ def test_reverse_tunnel_url_uses_gateway_tunnel_alias():
     _check(seen["token"] is None, "plaintext tunnel should not carry token by default")
     _check(
         seen["create_ports"] is None,
-        f"SDK should not request RRT/tunnel control ports, got {seen['create_ports']}",
+        f"SDK should not request EXECD/tunnel control ports, got {seen['create_ports']}",
     )
     _check(
         seen["create_tunnel"] == {"enabled": True, "proxyPort": 8766},
         f"SDK should ask frontend for tunnel declaratively, got {seen.get('create_tunnel')}",
     )
     _check(
-        "RRT_TUNNEL_WS_PORT" not in seen["create_env"]
-        and "RRT_TUNNEL_HTTP_PORT" not in seen["create_env"],
-        f"SDK must not set RRT tunnel envs, got {seen['create_env']}",
+        "EXECD_TUNNEL_WS_PORT" not in seen["create_env"]
+        and "EXECD_TUNNEL_HTTP_PORT" not in seen["create_env"],
+        f"SDK must not set EXECD tunnel envs, got {seen['create_env']}",
     )
     print("ok: reverse tunnel URL uses gateway alias and hides control port ->", seen["url"])
 
@@ -1795,7 +1795,7 @@ def test_reverse_tunnel_uses_frontend_returned_tunnel_metadata():
 
     class FakeClient:
         direct_enabled = True
-        rrt_port = 50090
+        execd_port = 50090
         token = "test-token"
 
         def create_info(self, body):
@@ -1852,7 +1852,7 @@ def test_reverse_tunnel_uses_frontend_returned_tunnel_metadata():
 
     _check(seen["url"] == "ws://router:8080/tunnel/frontend-returned", f"returned tunnel url mismatch: {seen['url']}")
     _check(seen["create_ports"] is None, f"SDK leaked control ports: {seen['create_ports']}")
-    _check(seen["create_env"] == {"USER_ENV": "ok"}, f"SDK should not set RRT envs: {seen['create_env']}")
+    _check(seen["create_env"] == {"USER_ENV": "ok"}, f"SDK should not set EXECD envs: {seen['create_env']}")
     _check(
         seen["create_tunnel"] == {"enabled": True, "proxyPort": 9876},
         f"declarative tunnel mismatch: {seen['create_tunnel']}",

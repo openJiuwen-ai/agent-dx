@@ -1,4 +1,4 @@
-use super::server::NodeProxy;
+use super::server::Relay;
 use crate::common::listener::accept_with_backoff;
 use bytes::Bytes;
 use http::{Request, Response, StatusCode};
@@ -13,7 +13,7 @@ use tokio::net::TcpListener;
 use tokio::sync::watch;
 
 pub async fn serve_health(
-    gateway: Arc<NodeProxy>,
+    gateway: Arc<Relay>,
     listener: TcpListener,
     mut shutdown: watch::Receiver<bool>,
 ) -> io::Result<()> {
@@ -41,7 +41,7 @@ pub async fn serve_health(
 }
 
 async fn health_response(
-    gateway: Arc<NodeProxy>,
+    gateway: Arc<Relay>,
     request: Request<Incoming>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     let (status, body) = match request.uri().path() {
@@ -53,7 +53,7 @@ async fn health_response(
             (
                 StatusCode::OK,
                 format!(
-                    "data_plane_node_proxy_ready {}\ndata_plane_node_proxy_active_streams {}\ndata_plane_node_proxy_max_streams {}\ndata_plane_node_proxy_connect_total {}\ndata_plane_node_proxy_connect_errors {}\ndata_plane_node_proxy_completed_streams {}\ndata_plane_node_proxy_bytes_up {}\ndata_plane_node_proxy_bytes_down {}\ndata_plane_node_proxy_route_mismatch_total {}\ndata_plane_node_proxy_forbidden_target_total {}\ndata_plane_node_proxy_overload_rejections_total {}\n",
+                    "data_plane_relay_ready {}\ndata_plane_relay_active_streams {}\ndata_plane_relay_max_streams {}\ndata_plane_relay_connect_total {}\ndata_plane_relay_connect_errors {}\ndata_plane_relay_completed_streams {}\ndata_plane_relay_bytes_up {}\ndata_plane_relay_bytes_down {}\ndata_plane_relay_route_mismatch_total {}\ndata_plane_relay_forbidden_target_total {}\ndata_plane_relay_overload_rejections_total {}\n",
                     usize::from(gateway.ready()),
                     gateway.active_streams(),
                     gateway.max_active_streams(),

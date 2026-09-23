@@ -1,8 +1,8 @@
-//! Capsule, runtime, and resource contracts shared by the control plane.
+//! Environment, runtime, and resource contracts shared by the control plane.
 
 pub mod checkpoint;
-pub mod environment;
 pub mod lifecycle;
+pub mod runtime_profile;
 pub mod snapshots;
 pub use checkpoint::{
     valid_runtime_id, CheckpointArtifact, CompletedOperation, LifecycleKind, RestorePoint,
@@ -70,9 +70,9 @@ impl Resources {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CapsuleSpec {
+pub struct EnvironmentSpec {
     #[serde(default)]
-    pub environment: Option<environment::EnvironmentSpec>,
+    pub runtime_profile: Option<runtime_profile::RuntimeProfile>,
     #[serde(default)]
     pub snapshot_id: Option<String>,
     #[serde(default)]
@@ -91,7 +91,7 @@ pub struct CapsuleSpec {
     pub sandbox: sandbox::SandboxOptions,
 }
 
-impl CapsuleSpec {
+impl EnvironmentSpec {
     pub fn validate(&self) -> Result<()> {
         for (name, value) in [
             ("id", &self.id),
@@ -102,7 +102,7 @@ impl CapsuleSpec {
                 return Err(Error::Invalid(format!("{name} is required")));
             }
         }
-        if let Some(environment) = &self.environment {
+        if let Some(environment) = &self.runtime_profile {
             environment.validate()?;
         } else if self.image.trim().is_empty() && self.sandbox.rootfs.is_none() {
             return Err(Error::Invalid(
@@ -183,7 +183,7 @@ impl ResourceLedger {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum CapsuleState {
+pub enum EnvironmentState {
     Pending,
     Starting,
     Running,
@@ -208,10 +208,10 @@ pub enum Event {
     Fail,
 }
 
-impl CapsuleState {
+impl EnvironmentState {
     /// Pure transition rules; only the node controller applies these events.
     pub fn apply(self, event: Event) -> Result<Self> {
-        use CapsuleState::*;
+        use EnvironmentState::*;
         use Event::*;
         match (self, event) {
             (Pending | Failed, Start) => Ok(Starting),
@@ -233,16 +233,15 @@ impl CapsuleState {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Assignment {
-    pub capsule_id: String,
+    pub environment_id: String,
     pub node_id: String,
-    #[serde(alias = "domain_id")]
     pub shard_id: usize,
     pub generation: u64,
     #[serde(default)]
     pub devices: Vec<scheduling::DeviceAllocation>,
 }
 
-/// One concrete node-local realization of a Capsule.
+/// One concrete node-local realization of an Environment.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Runtime {
     pub id: String,
@@ -250,14 +249,14 @@ pub struct Runtime {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CapsuleRecord {
+pub struct EnvironmentRecord {
     #[serde(default)]
     pub restart_attempts: u32,
     #[serde(default)]
     pub restart_pending: bool,
-    pub spec: CapsuleSpec,
+    pub spec: EnvironmentSpec,
     pub assignment: Assignment,
-    pub state: CapsuleState,
+    pub state: EnvironmentState,
     pub revision: u64,
     pub runtime: Runtime,
     /// Failed does not imply cleanup. Keep capacity reserved while this is true.
@@ -302,16 +301,16 @@ mod tests {
     #[test]
     fn lifecycle_cannot_publish_running_before_start_or_revive_deleted() {
         assert_eq!(
-            CapsuleState::Pending.apply(Event::Ready),
+            EnvironmentState::Pending.apply(Event::Ready),
             Err(Error::Conflict)
         );
         assert_eq!(
-            CapsuleState::Deleted.apply(Event::Start),
+            EnvironmentState::Deleted.apply(Event::Start),
             Err(Error::Conflict)
         );
         assert_eq!(
-            CapsuleState::Starting.apply(Event::Ready),
-            Ok(CapsuleState::Running)
+            EnvironmentState::Starting.apply(Event::Ready),
+            Ok(EnvironmentState::Running)
         );
     }
 }

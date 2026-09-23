@@ -69,7 +69,7 @@ def main():
     elif action=='postcheck':
         result_name=node or 'sdk'
         c=catalog();r=json.loads((E/result_name/'sdk-result.json').read_text());assert r['status']=='passed'
-        records=[json.loads(c['capsule:'+i]) for i in r['instances']]
+        records=[json.loads(c['environment:'+i]) for i in r['instances']]
         assignments={record['assignment']['node_id'] for record in records}
         assert assignments and assignments <= {'node1','node2'}
         if result_name=='sdk':assert assignments=={'node1','node2'}
@@ -79,23 +79,23 @@ def main():
     elif action=='sessions':
         (E/'previous-sessions.json').write_text(json.dumps({n['node']['id']:n['session']['id'] for n in nodes()}))
     elif action=='freeze':
-        current=supervisor('status');manager=next(s for s in current['services'] if s['role']=='node-manager')
+        current=supervisor('status');manager=next(s for s in current['services'] if s['role']=='adxlet')
         assert manager['pid'] and len(backend())==1
         (P/'frozen-manager.pid').write_text(str(manager['pid']))
         os.kill(manager['pid'],signal.SIGSTOP)
-        print('Node Manager heartbeat suspended; runtime remains externally hosted',flush=True)
+        print('Adxlet heartbeat suspended; runtime remains externally hosted',flush=True)
     elif action=='thaw':
         path=P/'frozen-manager.pid'
         if path.exists():
             pid=int(path.read_text());current=supervisor('status')
-            assert any(s['role']=='node-manager' and s['pid']==pid for s in current['services'])
+            assert any(s['role']=='adxlet' and s['pid']==pid for s in current['services'])
             os.kill(pid,signal.SIGCONT);path.unlink()
-            print('Node Manager resumed; waiting for authoritative cleanup',flush=True)
+            print('Adxlet resumed; waiting for authoritative cleanup',flush=True)
     elif action=='failure-observed':
         end=time.monotonic()+65
         while True:
             c=catalog();live=json.loads((E/'live-instances.json').read_text())
-            records=[json.loads(c['capsule:'+sid]) for sid in live]
+            records=[json.loads(c['environment:'+sid]) for sid in live]
             failed=[r for r in records if r['assignment']['node_id']=='node2']
             healthy=[r for r in records if r['assignment']['node_id']=='node1']
             assert len(failed)==len(healthy)==1
@@ -112,7 +112,7 @@ def main():
     elif action=='create-mode':
         assert node in ('central','local_first')
         current=supervisor('status')
-        api=next(s for s in current['services'] if s['role']=='api-server')
+        api=next(s for s in current['services'] if s['role']=='apiserver')
         pid=api['pid'];assert pid
         args=Path(f'/proc/{pid}/cmdline').read_bytes().decode().split('\0')
         path=Path(args[args.index('--config')+1])
@@ -130,7 +130,7 @@ def main():
             'Authorization':'Bearer '+(S/'api-key').read_text().strip(),
         })
         while True:
-            api=next(s for s in supervisor('status')['services'] if s['role']=='api-server')
+            api=next(s for s in supervisor('status')['services'] if s['role']=='apiserver')
             if api['pid'] and api['pid']!=pid:
                 try:
                     with urllib.request.urlopen(request,context=context,timeout=1) as response:
@@ -144,12 +144,12 @@ def main():
     elif action=='restart':
         before=backend();assert len(before)==1
         (E/f'backend-before-{node}.json').write_text(json.dumps(before))
-        current=supervisor('status');manager=[s for s in current['services'] if s['role']=='node-manager'];assert len(manager)==1 and manager[0]['pid']
+        current=supervisor('status');manager=[s for s in current['services'] if s['role']=='adxlet'];assert len(manager)==1 and manager[0]['pid']
         os.kill(manager[0]['pid'],signal.SIGKILL)
     elif action=='unchanged':
         after=backend()
         (E/f'backend-after-{node}.json').write_text(json.dumps(after))
-        assert after==json.loads((E/f'backend-before-{node}.json').read_text()), 'backend identity changed across Node Manager restart'
+        assert after==json.loads((E/f'backend-before-{node}.json').read_text()), 'backend identity changed across Adxlet restart'
     elif action=='stop':
         subprocess.run(['python3',str(H/'telemetry.py'),'metrics',node],check=True)
         stopped=supervisor('stop');assert stopped['ok'];collect(node)

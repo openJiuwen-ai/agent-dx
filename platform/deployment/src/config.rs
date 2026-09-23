@@ -12,32 +12,33 @@ use std::{
 #[serde(rename_all = "kebab-case")]
 pub enum Role {
     Redis,
-    Master,
-    NodeProxy,
-    NodeManager,
+    Coordinator,
+    Relay,
+    Adxlet,
+    #[serde(rename = "apiserver")]
     ApiServer,
-    Edge,
+    Ingress,
 }
 impl Role {
     pub fn name(self) -> &'static str {
         match self {
             Self::Redis => "redis",
-            Self::Master => "master",
-            Self::NodeProxy => "node-proxy",
-            Self::NodeManager => "node-manager",
-            Self::ApiServer => "api-server",
-            Self::Edge => "edge",
+            Self::Coordinator => "coordinator",
+            Self::Relay => "relay",
+            Self::Adxlet => "adxlet",
+            Self::ApiServer => "apiserver",
+            Self::Ingress => "ingress",
         }
     }
 
     pub fn binary(self) -> &'static str {
         match self {
             Self::Redis => "redis-server",
-            Self::Master => "adx-master",
-            Self::NodeManager => "adx-node-manager",
-            Self::NodeProxy => "adx-node-proxy",
-            Self::ApiServer => "adx-api-server",
-            Self::Edge => "adx-edge-frontend",
+            Self::Coordinator => "adx-coordinator",
+            Self::Adxlet => "adxlet",
+            Self::Relay => "adx-relay",
+            Self::ApiServer => "adx-apiserver",
+            Self::Ingress => "adx-ingress",
         }
     }
 }
@@ -55,7 +56,7 @@ pub struct Service {
 #[serde(deny_unknown_fields)]
 pub struct Deployment {
     #[serde(default)]
-    pub environment: Option<adx_core::environment::EnvironmentSpec>,
+    pub runtime_profile: Option<adx_core::runtime_profile::RuntimeProfile>,
     #[serde(default)]
     pub logging: crate::logging::Policy,
     pub schema_version: u32,
@@ -77,12 +78,12 @@ pub enum Profile {
     Standalone,
     /// Single host connected to an external Redis.
     StandaloneExternalRedis,
-    /// Master-only control host.
-    Master,
-    /// Node Manager and Node Proxy worker host.
+    /// Coordinator-only control host.
+    Coordinator,
+    /// Adxlet and Relay worker host.
     Node,
-    /// API Server ingress host with embedded Edge by default.
-    EdgeApi,
+    /// API Server ingress host with embedded Ingress by default.
+    IngressApi,
 }
 
 impl Profile {
@@ -90,9 +91,9 @@ impl Profile {
         match self {
             Self::Standalone => "standalone",
             Self::StandaloneExternalRedis => "standalone-external-redis",
-            Self::Master => "master",
+            Self::Coordinator => "coordinator",
             Self::Node => "node",
-            Self::EdgeApi => "edge-api",
+            Self::IngressApi => "ingress-api",
         }
     }
 
@@ -104,10 +105,12 @@ impl Profile {
             Self::StandaloneExternalRedis => {
                 include_str!("../../../build/config/examples/deployment.yaml")
             }
-            Self::Master => include_str!("../../../build/config/examples/deployment-master.yaml"),
+            Self::Coordinator => {
+                include_str!("../../../build/config/examples/deployment-coordinator.yaml")
+            }
             Self::Node => include_str!("../../../build/config/examples/deployment-node.yaml"),
-            Self::EdgeApi => {
-                include_str!("../../../build/config/examples/deployment-edge-api.yaml")
+            Self::IngressApi => {
+                include_str!("../../../build/config/examples/deployment-ingress-api.yaml")
             }
         }
     }
@@ -118,16 +121,16 @@ impl Profile {
             Self::StandaloneExternalRedis => {
                 "schema_version: 1\nprofile: standalone-external-redis\n"
             }
-            Self::Master => "schema_version: 1\nprofile: master\n",
+            Self::Coordinator => "schema_version: 1\nprofile: coordinator\n",
             Self::Node => concat!(
                 "schema_version: 1\n",
                 "profile: node\n",
                 "service_overrides:\n",
-                "  node-manager:\n",
+                "  adxlet:\n",
                 "    config:\n",
                 "      node_id: \"${ADX_NODE_ID}\"\n",
             ),
-            Self::EdgeApi => "schema_version: 1\nprofile: edge-api\n",
+            Self::IngressApi => "schema_version: 1\nprofile: ingress-api\n",
         }
     }
 }
@@ -156,7 +159,7 @@ struct ProfileDeployment {
     #[serde(default)]
     logging: Option<Value>,
     #[serde(default)]
-    environment: Option<Value>,
+    runtime_profile: Option<Value>,
     #[serde(default)]
     service_overrides: BTreeMap<Role, ServiceOverride>,
 }
@@ -255,18 +258,18 @@ pub struct Process {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum EdgeProcessMode {
+enum IngressProcessMode {
     Embedded,
     Standalone,
 }
 
-fn edge_process_mode(service: &Service, edge_declared: bool) -> Result<EdgeProcessMode> {
-    match service.config.get("edge_mode") {
-        None if edge_declared => Ok(EdgeProcessMode::Embedded),
-        None => Ok(EdgeProcessMode::Standalone),
-        Some(Value::String(mode)) if mode == "embedded" => Ok(EdgeProcessMode::Embedded),
-        Some(Value::String(mode)) if mode == "standalone" => Ok(EdgeProcessMode::Standalone),
-        _ => Err("edge_mode must be standalone or embedded".into()),
+fn ingress_process_mode(service: &Service, ingress_declared: bool) -> Result<IngressProcessMode> {
+    match service.config.get("ingress_mode") {
+        None if ingress_declared => Ok(IngressProcessMode::Embedded),
+        None => Ok(IngressProcessMode::Standalone),
+        Some(Value::String(mode)) if mode == "embedded" => Ok(IngressProcessMode::Embedded),
+        Some(Value::String(mode)) if mode == "standalone" => Ok(IngressProcessMode::Standalone),
+        _ => Err("ingress_mode must be standalone or embedded".into()),
     }
 }
 
@@ -300,7 +303,7 @@ impl Deployment {
     }
     pub fn validate(&self) -> Result<()> {
         self.logging.validate()?;
-        if let Some(environment) = &self.environment {
+        if let Some(environment) = &self.runtime_profile {
             environment.validate()?;
         }
         if self.schema_version != 1
@@ -329,23 +332,23 @@ impl Deployment {
         let mut proxy_owners = BTreeSet::new();
         let mut has_embedded_proxy = false;
         let mut has_standalone_proxy_service = false;
-        let edge_count = self
+        let ingress_count = self
             .services
             .iter()
-            .filter(|service| service.role == Role::Edge)
+            .filter(|service| service.role == Role::Ingress)
             .count();
         let api_count = self
             .services
             .iter()
             .filter(|service| service.role == Role::ApiServer)
             .count();
-        if edge_count > 1 || api_count > 1 {
-            return Err("at most one API Server and Edge per deployment".into());
+        if ingress_count > 1 || api_count > 1 {
+            return Err("at most one API Server and Ingress per deployment".into());
         }
-        let edge = self
+        let ingress = self
             .services
             .iter()
-            .find(|service| service.role == Role::Edge);
+            .find(|service| service.role == Role::Ingress);
         for service in &self.services {
             if service.id.is_empty()
                 || !service
@@ -382,16 +385,18 @@ impl Deployment {
                 );
             }
             if service.role == Role::ApiServer {
-                let mode = edge_process_mode(service, edge.is_some())?;
-                if mode == EdgeProcessMode::Embedded {
-                    let edge = edge.ok_or("embedded Edge requires an edge service declaration")?;
+                let mode = ingress_process_mode(service, ingress.is_some())?;
+                if mode == IngressProcessMode::Embedded {
+                    let ingress = ingress
+                        .ok_or("embedded Ingress requires an ingress service declaration")?;
                     if service.env.iter().any(|(key, value)| {
-                        edge.env
+                        ingress
+                            .env
                             .get(key)
-                            .is_some_and(|edge_value| edge_value != value)
+                            .is_some_and(|ingress_value| ingress_value != value)
                     }) {
                         return Err(
-                            "embedded Edge and API Server environment values conflict".into()
+                            "embedded Ingress and API Server environment values conflict".into(),
                         );
                     }
                 }
@@ -401,7 +406,7 @@ impl Deployment {
             }) {
                 return Err("invalid environment entry".into());
             }
-            let proxy_is_embedded = if service.role == Role::NodeManager {
+            let proxy_is_embedded = if service.role == Role::Adxlet {
                 match service.config.get("proxy_mode") {
                     None => true,
                     Some(Value::String(mode)) if mode == "standalone" => false,
@@ -412,19 +417,19 @@ impl Deployment {
                 false
             };
             has_embedded_proxy |= proxy_is_embedded;
-            has_standalone_proxy_service |= service.role == Role::NodeProxy;
-            if service.role == Role::NodeProxy || proxy_is_embedded {
+            has_standalone_proxy_service |= service.role == Role::Relay;
+            if service.role == Role::Relay || proxy_is_embedded {
                 let control_directory = service
                     .env
-                    .get("ADX_DATA_PLANE_NODE_PROXY_ACTIVITY_UDS_DIR")
+                    .get("ADX_DATA_PLANE_RELAY_ACTIVITY_UDS_DIR")
                     .filter(|directory| !directory.is_empty())
-                    .ok_or("Node Proxy control directory required")?;
+                    .ok_or("Relay control directory required")?;
                 let socket = Path::new(control_directory).join("route.sock");
                 if !socket.is_absolute()
                     || socket.as_os_str().len() > 100
                     || !proxy_owners.insert(socket.clone())
                 {
-                    return Err("unique absolute Node Proxy control socket required".into());
+                    return Err("unique absolute Relay control socket required".into());
                 }
                 if proxy_is_embedded
                     && service
@@ -440,7 +445,7 @@ impl Deployment {
             if service.role == Role::Redis {
                 RedisConfig::parse(&service.config)?;
             }
-            if service.role == Role::NodeManager {
+            if service.role == Role::Adxlet {
                 let admin_socket = self.admin_path(service);
                 if admin_socket.as_os_str().len() > 100 || !sockets.insert(admin_socket) {
                     return Err("unique short node admin socket paths required".into());
@@ -457,10 +462,7 @@ impl Deployment {
             return Err("at most one managed Redis per deployment".into());
         }
         if has_embedded_proxy && has_standalone_proxy_service {
-            return Err(
-                "embedded Node Proxy cannot be combined with a standalone node-proxy service"
-                    .into(),
-            );
+            return Err("embedded Relay cannot be combined with a standalone relay service".into());
         }
         Ok(())
     }
@@ -479,19 +481,19 @@ impl Deployment {
         fs::create_dir(output_directory)?;
         fs::set_permissions(output_directory, fs::Permissions::from_mode(0o700))?;
         let mut processes = Vec::new();
-        let edge = self
+        let ingress = self
             .services
             .iter()
-            .find(|service| service.role == Role::Edge);
-        let embedded_edge = self
+            .find(|service| service.role == Role::Ingress);
+        let embedded_ingress = self
             .services
             .iter()
             .find(|service| service.role == Role::ApiServer)
-            .map(|api| edge_process_mode(api, edge.is_some()))
+            .map(|api| ingress_process_mode(api, ingress.is_some()))
             .transpose()?
-            == Some(EdgeProcessMode::Embedded);
+            == Some(IngressProcessMode::Embedded);
         for service in &self.services {
-            if embedded_edge && service.role == Role::Edge {
+            if embedded_ingress && service.role == Role::Ingress {
                 continue;
             }
             let mut config = if service.config.is_null() {
@@ -512,7 +514,7 @@ impl Deployment {
             ));
             let mut redis_config_text = None;
             let arguments = match service.role {
-                Role::Master => {
+                Role::Coordinator => {
                     let fields = config_object_mut(&mut config)?;
                     fields.insert(
                         "redis_url".to_owned(),
@@ -524,12 +526,15 @@ impl Deployment {
                     );
                     vec!["--config".into(), config_path.display().to_string()]
                 }
-                Role::NodeManager | Role::ApiServer => {
+                Role::Adxlet | Role::ApiServer => {
                     let fields = config_object_mut(&mut config)?;
-                    if let Some(environment) = &self.environment {
-                        fields.insert("environment".to_owned(), serde_json::to_value(environment)?);
+                    if let Some(environment) = &self.runtime_profile {
+                        fields.insert(
+                            "runtime_profile".to_owned(),
+                            serde_json::to_value(environment)?,
+                        );
                     }
-                    fields.remove("master_address");
+                    fields.remove("coordinator_address");
                     let discovery = fields
                         .entry("discovery".to_owned())
                         .or_insert_with(|| Value::Object(Map::new()))
@@ -547,12 +552,13 @@ impl Deployment {
                         discovery
                             .entry("poll_seconds".to_owned())
                             .or_insert(Value::from(5));
-                        if embedded_edge {
-                            let edge = edge.ok_or("embedded Edge configuration missing")?;
-                            let mut control = if edge.config.is_null() {
+                        if embedded_ingress {
+                            let ingress =
+                                ingress.ok_or("embedded Ingress configuration missing")?;
+                            let mut control = if ingress.config.is_null() {
                                 Value::Object(Map::new())
                             } else {
-                                edge.config.clone()
+                                ingress.config.clone()
                             };
                             let control_fields = config_object_mut(&mut control)?;
                             control_fields.insert(
@@ -563,23 +569,28 @@ impl Deployment {
                                 "namespace".to_owned(),
                                 Value::String(self.namespace.clone()),
                             );
-                            fields.insert("edge_mode".to_owned(), Value::String("embedded".into()));
-                            fields.insert("edge_control".to_owned(), control);
-                            environment.extend(edge.env.clone());
+                            fields.insert(
+                                "ingress_mode".to_owned(),
+                                Value::String("embedded".into()),
+                            );
+                            fields.insert("ingress_control".to_owned(), control);
+                            environment.extend(ingress.env.clone());
                         } else {
-                            fields
-                                .insert("edge_mode".to_owned(), Value::String("standalone".into()));
-                            fields.remove("edge_control");
+                            fields.insert(
+                                "ingress_mode".to_owned(),
+                                Value::String("standalone".into()),
+                            );
+                            fields.remove("ingress_control");
                         }
                     }
-                    if service.role == Role::NodeManager {
+                    if service.role == Role::Adxlet {
                         let socket = self.admin_path(service);
                         fields.insert("admin_socket".to_owned(), serde_json::to_value(&socket)?);
                         admin_socket = Some(socket);
                     }
                     vec!["--config".into(), config_path.display().to_string()]
                 }
-                Role::Edge => {
+                Role::Ingress => {
                     let fields = config_object_mut(&mut config)?;
                     fields.insert(
                         "redis_url".to_owned(),
@@ -590,14 +601,14 @@ impl Deployment {
                         Value::String(self.namespace.clone()),
                     );
                     environment.insert(
-                        "ADX_EDGE_CONTROL_CONFIG".into(),
+                        "ADX_INGRESS_CONTROL_CONFIG".into(),
                         config_path.display().to_string(),
                     );
                     vec![]
                 }
-                Role::NodeProxy => {
-                    if !environment.contains_key("ADX_DATA_PLANE_NODE_PROXY_ACTIVITY_UDS_DIR") {
-                        return Err("Node Proxy requires its control socket directory".into());
+                Role::Relay => {
+                    if !environment.contains_key("ADX_DATA_PLANE_RELAY_ACTIVITY_UDS_DIR") {
+                        return Err("Relay requires its control socket directory".into());
                     }
                     vec![]
                 }
@@ -630,15 +641,13 @@ fn resolve_profile(input: ProfileDeployment) -> Result<Deployment> {
     if input.profile == Profile::Node
         && input
             .service_overrides
-            .get(&Role::NodeManager)
+            .get(&Role::Adxlet)
             .and_then(|patch| patch.config.as_ref())
             .and_then(|config| config.get("node_id"))
             .and_then(Value::as_str)
             .is_none_or(str::is_empty)
     {
-        return Err(
-            "node profile requires config.node_id in the local node-manager override".into(),
-        );
+        return Err("node profile requires config.node_id in the local adxlet override".into());
     }
     let mut deployment: Deployment = serde_saphyr::from_str(input.profile.template())
         .map_err(|error| format!("invalid built-in deployment profile: {error}"))?;
@@ -670,10 +679,10 @@ fn resolve_profile(input: ProfileDeployment) -> Result<Deployment> {
         deployment.logging = serde_json::from_value(logging)
             .map_err(|error| format!("invalid logging override: {error}"))?;
     }
-    if let Some(patch) = input.environment {
-        let mut environment = serde_json::to_value(&deployment.environment)?;
+    if let Some(patch) = input.runtime_profile {
+        let mut environment = serde_json::to_value(&deployment.runtime_profile)?;
         merge_value(&mut environment, patch);
-        deployment.environment = serde_json::from_value(environment)
+        deployment.runtime_profile = serde_json::from_value(environment)
             .map_err(|error| format!("invalid environment override: {error}"))?;
     }
     for (role, patch) in input.service_overrides {
@@ -697,7 +706,10 @@ fn resolve_profile(input: ProfileDeployment) -> Result<Deployment> {
             let Some(config) = service.config.as_object_mut() else {
                 continue;
             };
-            if matches!(service.role, Role::Master | Role::NodeManager | Role::Edge) {
+            if matches!(
+                service.role,
+                Role::Coordinator | Role::Adxlet | Role::Ingress
+            ) {
                 config.insert("tls".into(), serde_json::json!({"mode": "network"}));
             }
             if service.role == Role::ApiServer {
@@ -709,23 +721,20 @@ fn resolve_profile(input: ProfileDeployment) -> Result<Deployment> {
                     }
                 }
             }
-            if service.role == Role::Master {
+            if service.role == Role::Coordinator {
                 if let Some(Value::String(address)) = config.get_mut("advertised_address") {
                     *address = address.replacen("https://", "http://", 1);
                 }
             }
-            if matches!(
-                service.role,
-                Role::Edge | Role::NodeManager | Role::NodeProxy
-            ) {
+            if matches!(service.role, Role::Ingress | Role::Adxlet | Role::Relay) {
                 service.env.insert(
-                    "ADX_DATA_PLANE_EDGE_FRONTEND_NODE_SECURITY_MODE".into(),
+                    "ADX_DATA_PLANE_INGRESS_NODE_SECURITY_MODE".into(),
                     "network".into(),
                 );
                 service.env.retain(|key, _| {
-                    !key.starts_with("ADX_DATA_PLANE_EDGE_FRONTEND_NODE_TLS_")
-                        && !key.starts_with("ADX_DATA_PLANE_NODE_PROXY_TLS_")
-                        && key != "ADX_DATA_PLANE_NODE_PROXY_MTLS_CLIENT_CA"
+                    !key.starts_with("ADX_DATA_PLANE_INGRESS_NODE_TLS_")
+                        && !key.starts_with("ADX_DATA_PLANE_RELAY_TLS_")
+                        && key != "ADX_DATA_PLANE_RELAY_MTLS_CLIENT_CA"
                 });
             }
         }

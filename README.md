@@ -21,8 +21,8 @@ Agent DX (**Agent Distributed eXecutor**) is a distributed execution substrate f
 
 | Your goal | Deployment path | What you need |
 |---|---|---|
-| Add isolated command, file, terminal, and port operations to one agent service | Standalone | One Linux host, separately managed sandboxd, an ADX release package, and Capsule networking |
-| Share execution capacity across agent services and machines | Split-host roles | Persistent Redis, one Master deployment, one or more worker deployments, and a reachable Gateway |
+| Add isolated command, file, terminal, and port operations to one agent service | Standalone | One Linux host, separately managed sandboxd, an ADX release package, and Environment networking |
+| Share execution capacity across agent services and machines | Split-host roles | Persistent Redis, one Coordinator deployment, one or more worker deployments, and a reachable Gateway |
 | Run a production-style cluster with repeatable acceptance | Kubernetes | Linux workers, persistent Redis, component certificates, sandboxd on worker nodes, and the ADX Kubernetes E2E profile |
 | Pause, resume, clone, or recover long-running work | Standalone or distributed | A checkpoint-capable runtime plus local or S3-compatible checkpoint storage |
 | Schedule accelerator workloads | Distributed | GPU/NPU inventory from workers and matching device requests in the Sandbox specification |
@@ -32,9 +32,9 @@ Agent DX (**Agent Distributed eXecutor**) is a distributed execution substrate f
 | Layer | Owns | Agent DX relationship |
 |---|---|---|
 | Agent framework or application | Prompts, tools, sessions, task logic, and business policy | Calls the public Sandbox SDK or HTTP API; it does not enter platform scheduling or lifecycle state machines |
-| Agent DX | Authentication, placement, Capsule state, routing, recovery, and observability | Provides one distributed execution contract across nodes and execution backends |
-| sandboxd | Runtime creation, isolation, networking, and checkpoint primitives | Runs as an external service on each worker and is accessed through the Node Manager runtime driver |
-| RRT inside the Runtime | Commands, files, terminals, ports, activity, and runtime recovery cooperation | Receives data traffic through Edge and Node Proxy after ownership and generation checks |
+| Agent DX | Authentication, placement, Environment state, routing, recovery, and observability | Provides one distributed execution contract across nodes and execution backends |
+| sandboxd | Runtime creation, isolation, networking, and checkpoint primitives | Runs as an external service on each worker and is accessed through the adxlet runtime driver |
+| Execd inside the Runtime | Commands, files, terminals, ports, activity, and runtime recovery cooperation | Receives data traffic through Ingress and Relay after ownership and generation checks |
 | Redis and object storage | Authoritative cluster metadata and optional shared checkpoint bytes | Redis stores control state and discovery; object storage enables cross-node checkpoint access |
 
 ## 🔄 How it works
@@ -43,16 +43,16 @@ Agent DX (**Agent Distributed eXecutor**) is a distributed execution substrate f
 
 | Step | What happens | Where it lives |
 |---|---|---|
-| 1 · Access | A caller authenticates and creates or operates a Sandbox through one public contract. | `gateway/api-server/`, `platform/sdk/sandbox/python/` |
-| 2 · Place | API Server uses local-first admission or sends the request to Master. Master rotates across Shards; each Shard queues, filters, scores, and reserves a node. | `platform/master/`, `platform/crates/scheduling/` |
-| 3 · Run | Node Manager performs final local admission, serializes the Capsule lifecycle, and asks sandboxd to create a Runtime with RRT. | `platform/node-manager/`, `third_party/sandboxd/`, `platform/runtime/rrt/` |
-| 4 · Operate and recover | Edge routes data to the owning Node Proxy. Versioned ownership fences old Runtimes; pause, resume, snapshots, restart policy, and reconciliation converge state after failures. | `gateway/`, `platform/node-manager/`, Redis, checkpoint storage |
+| 1 · Access | A caller authenticates and creates or operates a Sandbox through one public contract. | `gateway/apiserver/`, `platform/sdk/sandbox/python/` |
+| 2 · Place | API Server uses local-first admission or sends the request to Coordinator. Coordinator rotates across Shards; each Shard queues, filters, scores, and reserves a node. | `platform/coordinator/`, `platform/crates/scheduling/` |
+| 3 · Run | adxlet performs final local admission, serializes the Environment lifecycle, and asks sandboxd to create a Runtime with Execd. | `platform/adxlet/`, `third_party/sandboxd/`, `platform/runtime/execd/` |
+| 4 · Operate and recover | Ingress routes data to the owning Relay. Versioned ownership fences old Runtimes; pause, resume, snapshots, restart policy, and reconciliation converge state after failures. | `gateway/`, `platform/adxlet/`, Redis, checkpoint storage |
 
-API Server embeds Edge by default, and Node Manager embeds Node Proxy by default. Both pairs keep the same contracts when configured as separate processes.
+API Server embeds Ingress by default, and adxlet embeds Relay by default. Both pairs keep the same contracts when configured as separate processes.
 
 ## 📦 Installation
 
-ADX release packages target Linux and contain control/data-plane binaries, RRT, the Python Sandbox SDK, and an optional managed Redis binary. sandboxd remains independently managed and is pinned by [`third_party/sandboxd/source.json`](third_party/sandboxd/source.json).
+ADX release packages target Linux and contain control/data-plane binaries, Execd, the Python Sandbox SDK, and an optional managed Redis binary. sandboxd remains independently managed and is pinned by [`third_party/sandboxd/source.json`](third_party/sandboxd/source.json).
 
 ```sh
 mkdir adx-release
@@ -64,7 +64,7 @@ The installer verifies the manifest, file digests, and host architecture. It ins
 
 ## 🔧 Quick start
 
-The default `standalone` profile starts managed Redis, Master, Node Manager with embedded Node Proxy, and API Server with embedded Edge on one host. Prepare sandboxd, networking, certificates, and the initial administrator key first.
+The default `standalone` profile starts managed Redis, Coordinator, adxlet with embedded Relay, and API Server with embedded Ingress on one host. Prepare sandboxd, networking, certificates, and the initial administrator key first.
 
 ```sh
 sudo adxctl config init --profile standalone
@@ -101,7 +101,7 @@ export ADX_GATEWAY_TLS=1
 export ADX_SANDBOX_IMAGE=python:3.12-slim
 ```
 
-Create a Sandbox, execute through RRT, and delete it explicitly:
+Create a Sandbox, execute through Execd, and delete it explicitly:
 
 ```python
 import os
@@ -126,13 +126,13 @@ The image must be supported by the configured sandboxd and [ADX Runtime Environm
 
 | Topology | `adxctl` profile | Processes on this host |
 |---|---|---|
-| Standalone with managed Redis | `standalone` | Redis, Master, Node Manager + Node Proxy, API Server + Edge |
-| Standalone with external Redis | `standalone-external-redis` | Master, Node Manager + Node Proxy, API Server + Edge |
-| Control host | `master` | Master; Redis may be managed separately or added to the full YAML |
-| Worker host | `node` | Node Manager + Node Proxy by default |
-| Ingress host | `edge-api` | API Server + Edge by default |
+| Standalone with managed Redis | `standalone` | Redis, Coordinator, adxlet + Relay, API Server + Ingress |
+| Standalone with external Redis | `standalone-external-redis` | Coordinator, adxlet + Relay, API Server + Ingress |
+| Control host | `coordinator` | Coordinator; Redis may be managed separately or added to the full YAML |
+| Worker host | `node` | adxlet + Relay by default |
+| Ingress host | `ingress-api` | API Server + Ingress by default |
 
-Every host has its own `/opt/adx/config/deployment.yaml`. Cluster members share the Redis URL, namespace, and mTLS trust. Every worker has a unique `node_id` and reachable control and proxy addresses. Start Redis → Master → workers → API Server. Set `proxy_mode: standalone` or `edge_mode: standalone` only when those components need separate processes.
+Every host has its own `/opt/adx/config/deployment.yaml`. Cluster members share the Redis URL, namespace, and mTLS trust. Every worker has a unique `node_id` and reachable control and proxy addresses. Start Redis → Coordinator → workers → API Server. Set `proxy_mode: standalone` or `ingress_mode: standalone` only when those components need separate processes.
 
 YAML string values support `${VAR}` and `${VAR:-default}`. Use `adxctl config dump` to inspect the fully resolved profile and host overrides. Complete fields and certificates are documented in the [`adxctl` reference](docs/deployment/adxctl.md), [standalone guide](docs/deployment/standalone.md), and [configuration examples](build/config/examples/README.md).
 
@@ -142,20 +142,23 @@ ADX separates stable logical identity from replaceable execution:
 
 | Abstraction | Meaning and boundary |
 |---|---|
-| `Environment` | Agent execution context bound 1:1 to a stable logical Sandbox; managed through stateless Activators |
+| Agent `Environment` | Agent execution context bound 1:1 to a stable logical Sandbox; managed through stateless Activators |
 | `Sandbox` | Public API and SDK handle presented to applications |
-| `Capsule` | Stable internal identity containing tenant, specification, lifecycle, and desired/observed state |
-| `Runtime` | One concrete sandboxd execution of a Capsule on one node; restart or recovery may replace it |
+| Platform `Environment` | Stable internal identity containing tenant, specification, lifecycle, and desired/observed state |
+| `RuntimeProfile` | Deployment-owned rootfs, bootstrap and startup variables; configuration rather than a running Environment |
+| `Runtime` | One concrete sandboxd execution of an Environment on one node; restart or recovery may replace it |
 | `Assignment` | Authoritative node and device ownership with a `generation` that fences late old execution |
-| `Route` / `Binding` | Versioned ownership published to Edge and rechecked locally by Node Proxy before forwarding |
-| `Restore Point` / `Snapshot` | A restore point keeps the Capsule ID; a reusable Snapshot creates a new Capsule |
+| `Route` / `Binding` | Versioned ownership published to Ingress and rechecked locally by Relay before forwarding |
+| `Restore Point` / `Snapshot` | A restore point keeps the Environment ID; a reusable Snapshot creates a new Environment |
 | `Request ID` / `Operation ID` | One logical write identity for retry, deduplication, result lookup, and reconciliation |
 
-The fixed control path is Agent/application → Sandbox SDK/HTTP API → API Server → Master/Shard scheduler or local-first Node Manager → sandboxd. Runtime traffic follows Edge → Node Proxy → RRT and does not enter lifecycle queues. Compatibility fields such as `instanceId`, `instance_id`, and `/api/instances` are translated at the public boundary; internal Rust types, RPCs, persistence keys, metrics, and runtime identity use Capsule terminology.
+The fixed control path is Agent/application → Sandbox SDK/HTTP API → API Server → Coordinator/Shard scheduler or local-first adxlet → sandboxd. Runtime traffic follows Ingress → Relay → Execd and does not enter lifecycle queues. Compatibility fields such as `instanceId`, `instance_id`, and `/api/instances` are translated at the public boundary; internal Rust types, RPCs, persistence keys, metrics, and runtime identity use Environment terminology.
+
+[Component names and abstractions](docs/architecture/naming.md).
 
 ## ✨ Capabilities
 
-- Capsule creation, query, deletion, pause, resume, reusable snapshots, and snapshot-based cloning.
+- Environment creation, query, deletion, pause, resume, reusable snapshots, and snapshot-based cloning.
 - Central and local-first creation with CPU, memory, disk, GPU/NPU device, label, affinity, and preference constraints.
 - API Key administrator and tenant identities plus configurable internal mTLS.
 - Versioned route publication and synchronized local binding checks.
@@ -178,7 +181,7 @@ PYTHONPATH=platform/sdk/sandbox/python \
 make package PYTHON=/path/to/venv/bin/python
 ```
 
-Run component and integration suites with `python3 build/ci/run.py <suite>`. End-to-end gates use installed release artifacts, the public Sandbox SDK, Redis, Gateway, the control plane, sandboxd, and RRT. Environment requirements and gate definitions are in [control-plane CI](docs/testing/control-plane-ci.md) and the [Kubernetes E2E guide](build/e2e/kubernetes/README.md).
+Run component and integration suites with `python3 build/ci/run.py <suite>`. End-to-end gates use installed release artifacts, the public Sandbox SDK, Redis, Gateway, the control plane, sandboxd, and Execd. Environment requirements and gate definitions are in [control-plane CI](docs/testing/control-plane-ci.md) and the [Kubernetes E2E guide](build/e2e/kubernetes/README.md).
 
 Buildkite uses independent `agent-dx`, `agent-dx-python-sdk`, `agent-dx-admin`,
 and `agent-dx-full-test` pipelines. The SDK and admin pipelines always build and
@@ -193,14 +196,14 @@ The SDK distribution is `adx-sandbox`, its Python import is `adx_sandbox`, and i
 
 - [Architecture and repository layout](docs/architecture/repository-layout.md)
 - [Agent usage](agent/README.md)
-- [Sandbox API](gateway/api-server/docs/sandbox-lifecycle-api.md) and [OpenAPI](platform/api/openapi/sandbox.yaml)
+- [Sandbox API](gateway/apiserver/docs/sandbox-lifecycle-api.md) and [OpenAPI](platform/api/openapi/sandbox.yaml)
 - [Data-plane OpenAPI](platform/api/openapi/data-plane.yaml)
 - [Sandbox Python SDK](platform/sdk/sandbox/python/README.md)
 - [Deployment configuration](docs/deployment/adxctl.md) and [examples](build/config/examples/README.md)
 - [Remote cluster administration](docs/deployment/adxadmin.md) and [API Key management](docs/testing/api-key-management.md)
 - [Scheduling](docs/testing/scheduling-performance.md), [node lifecycle](docs/testing/node-lifecycle.md), and [route publication](docs/testing/route-publication.md)
 - [Checkpoint and snapshot storage](docs/testing/snapshot-storage.md)
-- [Metrics](docs/testing/capsule-resource-metrics.md), [logs](docs/testing/log-collection.md), and [distributed tracing](docs/testing/distributed-traces.md)
+- [Metrics](docs/testing/environment-resource-metrics.md), [logs](docs/testing/log-collection.md), and [distributed tracing](docs/testing/distributed-traces.md)
 - [Rust coding guidelines](docs/development/rust-coding-guidelines.md)
 - [Release pipelines and package layout](docs/development/release-pipelines-and-packaging.md)
 - [Brand and architecture assets](assets/README.md)

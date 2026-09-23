@@ -2,7 +2,7 @@
 
 UT 与 E2E 分开管理：UT 按代码模块运行；E2E 按业务闭环和部署拓扑逐级扩展。
 
-跨层级的错误、Deadline、sandboxd、Node Manager 和节点故障契约见[系统可靠性门禁](system-reliability-gates.md)。这些场景按所需拓扑分别进入 Standalone、Multi-VM 和 Full Deployment，不能只用组件测试宣称完成。
+跨层级的错误、Deadline、sandboxd、adxlet 和节点故障契约见[系统可靠性门禁](system-reliability-gates.md)。这些场景按所需拓扑分别进入 Standalone、Multi-VM 和 Full Deployment，不能只用组件测试宣称完成。
 
 ## 1. UT 不纳入 E2E 层级
 
@@ -11,9 +11,9 @@ UT 包含 Rust workspace、Agent、Sandbox SDK、构建驱动器，以及使用�
 
 | UT 类别 | 当前规模／入口 | 作用 |
 |---|---|---|
-| Rust | 404 个静态测试定义；`cargo test --workspace --all-features` | API Server、Master、Node Manager、RRT、Gateway、CLI 和公共 crates |
+| Rust | 404 个静态测试定义；`cargo test --workspace --all-features` | API Server、Coordinator、adxlet、Execd、Gateway、CLI 和公共 crates |
 | Python | 528 个静态测试定义 | Agent、Sandbox SDK、构建和测试驱动器 |
-| 状态与 RPC 契约 | `storage`、`control-rpc`、`api-control`、`interop` suite | Redis/AOF、mTLS、进程 RPC 和 RRT Socket 协作 |
+| 状态与 RPC 契约 | `storage`、`control-rpc`、`api-control`、`interop` suite | Redis/AOF、mTLS、进程 RPC 和 Execd Socket 协作 |
 
 这些测试都应进入 Buildkite 的代码门禁，但报告为 `UT / component tests`，不使用 L0、
 Standalone、多 VM 或全量部署 E2E 的通过结论。
@@ -36,17 +36,17 @@ Standalone 通过替代多 VM，也不能用多 VM 通过替代正式 K8s／目�
 ## 3. L0：最小真实端到端用例
 
 L0 只证明最核心的用户闭环。它必须使用发布包、安装后的 Sandbox SDK、真实 Redis、真实
-控制面／Gateway、真实 sandboxd 和真实 RRT；允许所有组件位于一个测试宿主。
+控制面／Gateway、真实 sandboxd 和真实 Execd；允许所有组件位于一个测试宿主。
 
 | L0 用例 | 必须断言 |
 |---|---|
-| 部署就绪 | Master 可发现、Node 注册并完成对账、容量有效、路由和本机绑定同步完成 |
+| 部署就绪 | Coordinator 可发现、Node 注册并完成对账、容量有效、路由和本机绑定同步完成 |
 | API Key | 有效 Key 可访问；无效 Key 和跨租户访问被拒绝 |
-| 创建 Capsule | 经公共 SDK 创建，sandboxd 后端真实运行，RRT 就绪，状态和路由已提交 |
-| 查询 Capsule | `get/list` 返回正确租户、状态、资源和执行归属 |
-| 执行命令 | 真实经过 Edge → Node Proxy → RRT，校验 stdout、stderr 和退出码 |
+| 创建 Environment | 经公共 SDK 创建，sandboxd 后端真实运行，Execd 就绪，状态和路由已提交 |
+| 查询 Environment | `get/list` 返回正确租户、状态、资源和执行归属 |
+| 执行命令 | 真实经过 Ingress → Relay → Execd，校验 stdout、stderr 和退出码 |
 | 文件操作 | 二进制写入和读回一致，不能只验证 HTTP 状态码 |
-| 删除 Capsule | Redis 终态正确、路由撤销、资源释放、sandboxd inventory 为空 |
+| 删除 Environment | Redis 终态正确、路由撤销、资源释放、sandboxd inventory 为空 |
 | 环境清理 | 测试进程／容器、临时网络和测试凭证均无残留；清理失败使整轮失败 |
 
 当前十组驱动中的 `sdk` 提供最小创建、查询、命令、文件和删除主体；`data-plane` 独立覆盖
@@ -68,12 +68,12 @@ Standalone 在一台 Linux 主机或一台 Lima KVM VM 上，以进程方式运�
 |---|---|
 | `adxctl validate/render/start/status/stop` | 验证统一配置、supervisor、进程重启预算和停机清理 |
 | 发布包安装示例 | 从干净发布包和 wheel 启动，配置及制品哈希固定 |
-| 运行环境 | 本地 EROFS、OCI 默认 runtime、runtime-only、自定义镜像只读挂载 RRT |
-| Node Proxy 组合 | embedded 和 standalone 两种模式遵守同一绑定／路由契约 |
+| 运行环境 | 本地 EROFS、OCI 默认 runtime、runtime-only、自定义镜像只读挂载 Execd |
+| Relay 组合 | embedded 和 standalone 两种模式遵守同一绑定／路由契约 |
 | 单机容量 | 资源满载不超分、等待请求在释放后继续、账本和 Metrics 一致 |
-| Node Manager 重启 | 新 session 完成权威对账；已运行后端身份和 SDK 操作保持正确 |
+| adxlet 重启 | 新 session 完成权威对账；已运行后端身份和 SDK 操作保持正确 |
 | 日志与可观测 | Metrics、结构化日志、滚动压缩、Collector 中断恢复、Trace 链路 |
-| supervisor stop | 删除本机 Capsule 后退出；独立 sandboxd 仍可响应且 inventory 为空 |
+| supervisor stop | 删除本机 Environment 后退出；独立 sandboxd 仍可响应且 inventory 为空 |
 | Firecracker 生命周期 | 在 KVM 主机验证暂停／恢复、可复用快照、双克隆、对象存储和残留回收 |
 
 仓库的本地 Docker 双容器驱动仍属于 Standalone 级：它能在单宿主上模拟两个逻辑节点，
@@ -88,14 +88,14 @@ SDK 客户端和两个执行节点通过真实 VM 网络通信。它重跑 L0，
 | Multi-VM 用例 | 必须断言 |
 |---|---|
 | 三 VM 部署与发现 | 唯一机器／节点身份、自动 Shard 归属、跨 VM Redis/RPC/mTLS、双方容量和路由就绪 |
-| 双 worker 放置 | 两个 worker 都实际承载 Capsule；保存平台归属和 sandboxd 后端证据 |
+| 双 worker 放置 | 两个 worker 都实际承载 Environment；保存平台归属和 sandboxd 后端证据 |
 | 容量与调度 | 两节点满载、排队、释放唤醒；Pack/Spread 配置；亲和／反亲和和节点偏好 |
 | Local-first | API Server 入口轮转、本机准入、同 ID 并发收敛、冲突规格拒绝、中心 fallback 不重复计账 |
-| 跨节点数据链路 | Edge → 对应 Node Proxy → RRT 的命令、文件和路由结果正确 |
+| 跨节点数据链路 | Ingress → 对应 Relay → Execd 的命令、文件和路由结果正确 |
 | worker 失联 | 心跳过期后实例失效、路由撤销、健康 worker 继续服务；返回节点先清理旧后端再开放准入 |
-| worker 进程重启 | 新 node session、实例对账、旧 session fencing，未失效 Capsule 仍可查询和执行 |
-| 控制面重启 | Redis 权威状态恢复、API Server 内嵌 Edge 重新全量同步、旧 epoch 不能继续写入 |
-| 跨节点 checkpoint | 仅在 VM 均有 KVM 时验证共享 checkpoint、同 Capsule ID 新 generation、旧节点清理 |
+| worker 进程重启 | 新 node session、实例对账、旧 session fencing，未失效 Environment 仍可查询和执行 |
+| 控制面重启 | Redis 权威状态恢复、API Server 内嵌 Ingress 重新全量同步、旧 epoch 不能继续写入 |
+| 跨节点 checkpoint | 仅在 VM 均有 KVM 时验证共享 checkpoint、同 Environment ID 新 generation、旧节点清理 |
 | 有序停机 | 先 worker、后控制面；删除结果提交成功，三台 VM 无后端和路由残留 |
 
 三台 VM 即使位于同一台 Mac 上，也只能证明 guest 网络和进程隔离；不能作为物理宿主故障证据。
@@ -103,7 +103,7 @@ SDK 客户端和两个执行节点通过真实 VM 网络通信。它重跑 L0，
 
 ## 6. Full Deployment Acceptance：全量实际部署验证
 
-全量验收使用正式 Buildkite 构建的 release、SDK wheel、不可变 Node/RRT 镜像和固定外部依赖，
+全量验收使用正式 Buildkite 构建的 release、SDK wheel、不可变 Node/Execd 镜像和固定外部依赖，
 部署到目标 Kubernetes／准生产环境。运行节点不编译代码，也不借用开发机文件。
 
 | 全量验收用例组 | 内容 |
@@ -113,11 +113,11 @@ SDK 客户端和两个执行节点通过真实 VM 网络通信。它重跑 L0，
 | L0 | 完整重跑 API Key、创建、查询、命令、文件、删除和物理清理 |
 | `data-plane` | 资源发现、重连、命令 stdin／查询／终止、文件 CRUD／目录复制、PTY 和鉴权端口转发 |
 | `lifecycle` | detached 句柄释放后重连、显式删除，以及空闲超时自动回收 |
-| `capacity` | 两节点资源满载／排队／释放；Master 与 Node Metrics 账本一致 |
+| `capacity` | 两节点资源满载／排队／释放；Coordinator 与 Node Metrics 账本一致 |
 | `placement` | 双节点亲和 OR、反亲和、节点约束、有序／加权偏好和实际归属 |
 | `local-first` | 入口轮转、原子 claim、相同 ID 收敛、冲突拒绝和中心 fallback |
 | `node-failure` | 心跳失效、实例／路由撤销、健康节点可用、恢复节点清理后重新准入 |
-| `restart` | Node Manager 重启和权威对账；必要时增加 Master/API/Edge 重启 |
+| `restart` | adxlet 重启和权威对账；必要时增加 Coordinator/API/Ingress 重启 |
 | `stop` | supervisor 清理、sandboxd 独立托管、日志滚动压缩和最终后端清空 |
 | 可观测验收 | 实例数量和资源指标、Gateway 指标、结构化日志、Collector 恢复、完整 Trace 父子链 |
 | 环境清理 | JUnit 无失败／跳过，`missing_checks=[]`、`cleanup_errors=[]`，namespace 删除完成 |
@@ -140,11 +140,11 @@ Firecracker checkpoint 使用独立 KVM profile；GPU/NPU 使用具备真实设�
 | 发布包／CLI／进程托管 |  | ✓ | ✓ | ✓ |
 | EROFS／OCI／自定义镜像 |  | ✓ | 按部署配置 | ✓ |
 | 容量排队与释放 |  | ✓ | 扩展为双节点 | ✓ |
-| Node Manager 重启对账 |  | ✓ | 扩展为独立 worker | ✓ |
+| adxlet 重启对账 |  | ✓ | 扩展为独立 worker | ✓ |
 | 双节点放置／亲和／偏好 |  | 逻辑节点复现 | ✓ | ✓ |
 | Local-first／原子归属 |  | 逻辑节点复现 | ✓ | ✓ |
 | 节点失联／返回清理 |  | 进程级复现 | ✓ | ✓ |
-| Master/API/Edge 重启同步 |  | 可验证 | ✓ | ✓ |
+| Coordinator/API/Ingress 重启同步 |  | 可验证 | ✓ | ✓ |
 | Metrics／日志／Trace |  | ✓ | 跨节点扩展 | ✓ |
 | FC 暂停／快照／克隆 |  | KVM Standalone | 可选 KVM | 独立 KVM profile |
 | 跨节点 checkpoint |  |  | KVM Multi-VM | 独立 KVM profile |
@@ -158,7 +158,7 @@ Firecracker checkpoint 使用独立 KVM profile；GPU/NPU 使用具备真实设�
 | L0 | 已增加独立 `--profile l0`；执行 `l0 + auth`，单独输出 `required_checks`、逐项 JSON 和 JUnit | 仍需在 Buildkite 产生一次正式运行证据 |
 | Standalone | `--profile standalone` 统一本地 Docker 十组；安装示例和 Lima FC 各自有严格结果契约 | 需增加汇总清单，把普通 Linux、安装示例和按需 KVM 结果关联到同一 revision |
 | Multi-VM | 已增加三台机器 inventory 和完成结果校验契约，强制双 worker 实际放置及最终清理 | 尚缺负责生成配置、分发制品和执行场景的完整控制面三 VM 部署器；未进行真实三 VM 验收 |
-| Full Deployment | K8s 已支持 `l0`、五组 `k8s-basic` 和十组 `full`；`full` 强制两个 Pod 位于不同物理 worker | 需产生当前分层的正式运行证据；Master/API/Edge 重启、K8s FC、真实 GPU/NPU 仍为独立扩展 profile |
+| Full Deployment | K8s 已支持 `l0`、五组 `k8s-basic` 和十组 `full`；`full` 强制两个 Pod 位于不同物理 worker | 需产生当前分层的正式运行证据；Coordinator/API/Ingress 重启、K8s FC、真实 GPU/NPU 仍为独立扩展 profile |
 
 因此当前可以直接形成 Buildkite 门禁的是 UT、L0 和基础 K8s 五组。`full` 的同宿主假绿已被
 驱动拒绝，但在实际双 worker 环境跑通前不能宣称完成。Standalone 可作为独立 Linux/KVM
@@ -174,30 +174,30 @@ profile；完整 Multi-VM 在补齐部署器前不能标记为通过。
 
 | ID | 状态 | 用例与通过条件 |
 |---|---|---|
-| `L0-01` | 已实现 | 部署业务就绪：Master、节点容量、路由和本机绑定均可用 |
+| `L0-01` | 已实现 | 部署业务就绪：Coordinator、节点容量、路由和本机绑定均可用 |
 | `L0-02` | 已实现 | 有效／无效 API Key、跨租户拒绝、管理员密钥管理及缓存过期 |
-| `L0-03` | 已实现 | 公共 SDK 创建和查询，真实 sandboxd/RRT 后端运行 |
+| `L0-03` | 已实现 | 公共 SDK 创建和查询，真实 sandboxd/Execd 后端运行 |
 | `L0-04` | 已实现 | 命令 stdout、stderr、退出码及二进制文件往返 |
 | `L0-05` | 已实现 | 显式删除后 Redis 终态、路由、资源及 sandboxd inventory 全部清理 |
-| `L0-06` | 组件前置已实现，E2E 计划 | SDK 对断流、正常 EOF 无 final 和结构化 unknown 均以同一 Request／Capsule 身份重试；原子 claim 保证唯一后端。仍需在真实代理断流下核对 SDK、Redis 和 sandboxd inventory |
+| `L0-06` | 组件前置已实现，E2E 计划 | SDK 对断流、正常 EOF 无 final 和结构化 unknown 均以同一 Request／Environment 身份重试；原子 claim 保证唯一后端。仍需在真实代理断流下核对 SDK、Redis 和 sandboxd inventory |
 
 ### 9.2 Local Standalone
 
 | ID | 状态 | 用例与通过条件 |
 |---|---|---|
 | `ST-01` | 已实现 | 发布包 verify、配置 validate/render、五角色启动和 stop 清理 |
-| `ST-02` | 已实现 | EROFS、OCI、runtime-only、自定义镜像挂载内置 RRT |
+| `ST-02` | 已实现 | EROFS、OCI、runtime-only、自定义镜像挂载内置 Execd |
 | `ST-03` | 已实现 | 容量用尽、内存队列、释放唤醒和资源 Metrics 一致 |
-| `ST-04` | 已实现 | Node Manager 新 session 对账，已运行后端身份不变 |
+| `ST-04` | 已实现 | adxlet 新 session 对账，已运行后端身份不变 |
 | `ST-05` | 已实现 | 日志滚动压缩、Metrics、Trace、Collector 中断恢复 |
 | `ST-FC-01` | 已实现 | KVM 暂停／恢复、可复用快照、克隆和制品清理 |
 | `ST-06` | 计划 | Redis 暂停期间 SQLite 降级日志，恢复后去重补写并恢复生命周期操作 |
 | `ST-07` | 部分已实现 | `standalone`／`full` 已覆盖无活动实例空闲超时删除；活动持续刷新防误回收仍需独立长连接用例 |
 | `ST-08` | 组件前置已实现，E2E 计划 | 实例意外退出后的 Never 清理，以及可配置重启的新 runtime identity、退避上限和最终失败状态；仍需真实 sandboxd 进程故障注入 |
-| `ST-09` | 计划 | Master 与 API Server（含 Edge）分别重启后的 epoch、全量目录和路由重同步；分进程模式另验独立 Edge |
-| `ST-10` | 计划 | Node Proxy embedded／standalone 使用同一契约和相同用户结果 |
+| `ST-09` | 计划 | Coordinator 与 API Server（含 Ingress）分别重启后的 epoch、全量目录和路由重同步；分进程模式另验独立 Ingress |
+| `ST-10` | 计划 | Relay embedded／standalone 使用同一契约和相同用户结果 |
 | `ST-11` | 组件前置已实现，E2E 计划 | sandboxd daemon 重启且 runtime 保留时重连并接管原 backend，不产生第二次 Start；仍需真实 daemon 重启与资源采集过期证据 |
-| `ST-12` | 组件前置已实现，E2E 计划 | Node Manager 对账清理期间再次退出；新进程重读权威目录和 runtime inventory，完成幂等清理前保持关闭准入 |
+| `ST-12` | 组件前置已实现，E2E 计划 | adxlet 对账清理期间再次退出；新进程重读权威目录和 runtime inventory，完成幂等清理前保持关闭准入 |
 
 ### 9.3 Local Multi-VM
 
@@ -207,10 +207,10 @@ profile；完整 Multi-VM 在补齐部署器前不能标记为通过。
 | `MV-02` | 契约已固化 | 实例实际落到两个 worker，保存平台 assignment 与各自 sandboxd inventory |
 | `MV-03` | 计划 | 双 worker 总容量、排队、释放唤醒及 Pack/Spread 配置 |
 | `MV-04` | 计划 | Local-first 入口轮转、原子归属、冲突拒绝及中心 fallback 不重复计账 |
-| `MV-05` | 计划 | Edge 经目标 Node Proxy/RRT 的跨 VM 命令与文件路径 |
+| `MV-05` | 计划 | Ingress 经目标 Relay/Execd 的跨 VM 命令与文件路径 |
 | `MV-06` | 计划 | worker 心跳过期使实例失效并撤路由；返回 worker 清理旧后端再准入 |
 | `MV-07` | 计划 | worker 进程重启、session fencing 和权威对账 |
-| `MV-08` | 计划 | Master/API Server（含 Edge）重启，Redis 恢复及 API Server 全量目录与 Edge 路由重同步 |
+| `MV-08` | 计划 | Coordinator/API Server（含 Ingress）重启，Redis 恢复及 API Server 全量目录与 Ingress 路由重同步 |
 | `MV-FC-01` | 条件计划 | 两个 KVM worker 间共享 checkpoint 恢复，同 ID 新 generation 且旧节点清理 |
 | `MV-09` | 契约已固化 | worker 先于控制节点停止，两个 backend inventory 和路由目录最终为空 |
 
@@ -224,7 +224,7 @@ profile；完整 Multi-VM 在补齐部署器前不能标记为通过。
 | `FD-04` | 已实现 | Metrics、日志、滚动压缩、Collector 重启与 Trace 父子关系 |
 | `FD-05` | 驱动已实现 | `full` profile 的两个 Pod 必须落在不同物理 worker；等待正式运行证据 |
 | `FD-06` | 计划 | Redis Pod/进程重启和持久卷 AOF 恢复，已提交实例状态不丢失 |
-| `FD-07` | 计划 | Master/API/Edge 独立故障与恢复，服务入口和目录重新收敛 |
+| `FD-07` | 计划 | Coordinator/API/Ingress 独立故障与恢复，服务入口和目录重新收敛 |
 | `FD-08` | 计划 | worker 网络分区、心跳失效、返回清理与健康 worker 连续可用 |
 | `FD-FC-01` | 条件计划 | KVM worker 的 Firecracker pause/resume/snapshot profile |
 | `FD-XPU-01` | 条件计划 | 真实 GPU/NPU 整卡发现、过滤、分配、释放和故障清理 |
@@ -237,7 +237,7 @@ worker 时把 `FD-05` 设为合入门槛；Multi-VM、FC、XPU 和长稳按 nigh
 
 Buildkite 保留 UT 和 E2E 两条清晰的结果线：
 
-1. **UT gate**：Rust、Agent、Sandbox SDK、驱动器、真实 Redis/mTLS/RRT 组件契约；任何失败阻断。
+1. **UT gate**：Rust、Agent、Sandbox SDK、驱动器、真实 Redis/mTLS/Execd 组件契约；任何失败阻断。
 2. **L0 E2E gate**：每个提交使用真实发布包部署完整最小平台，执行 L0 全部用例；不能用 mock 后端。
 3. **Full deployment gate**：主分支、合入候选和发布候选执行十组 K8s 用例、可观测断言及清理。
 4. **Conditional profiles**：checkpoint/snapshot 变更触发 KVM；设备调度变更触发 GPU/NPU worker。

@@ -1,7 +1,7 @@
 # `adxadmin` 集群管理工具
 
-`adxadmin` 是运行在管理员工作站、运维机或 CI 中的 Python 客户端。它只通过 Edge/API
-Server 的公开 HTTPS API 管理 ADX，不读取部署 YAML，不连接 Redis，也不调用 Master
+`adxadmin` 是运行在管理员工作站、运维机或 CI 中的 Python 客户端。它只通过 Ingress/API
+Server 的公开 HTTPS API 管理 ADX，不读取部署 YAML，不连接 Redis，也不调用 Coordinator
 内部 gRPC。主机进程部署仍由 [`adxctl`](adxctl.md) 负责，Sandbox 业务操作仍由
 `adx-sandbox` 或 Python SDK 负责。
 
@@ -111,7 +111,7 @@ adxadmin --output json key list --tenant team-a
 adxadmin key revoke <64-character-key-id>
 ```
 
-服务端吊销后，API Server 与 Edge 已缓存的身份仍可能使用到各自认证缓存 TTL 到期。
+服务端吊销后，API Server 与 Ingress 已缓存的身份仍可能使用到各自认证缓存 TTL 到期。
 CLI 不直接清理服务端缓存。
 
 ## 错误与自动化

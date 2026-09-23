@@ -1,12 +1,12 @@
 //! Persistent indexes: publication clones tree roots; writes copy only changed paths.
 use crate::Node;
-use adx_core::{scheduling::LabelSelector, CapsuleSpec};
+use adx_core::{scheduling::LabelSelector, EnvironmentSpec};
 use im::{OrdMap, OrdSet};
 use std::sync::Arc;
 
 #[derive(Clone)]
-pub struct PlacedCapsule {
-    pub spec: CapsuleSpec,
+pub struct PlacedEnvironment {
+    pub spec: EnvironmentSpec,
     pub node_id: String,
 }
 
@@ -14,7 +14,7 @@ pub struct PlacedCapsule {
 pub struct Snapshot {
     pub revision: u64,
     pub(crate) nodes: OrdMap<String, Arc<Node>>,
-    pub(crate) capsules: OrdMap<String, Arc<PlacedCapsule>>,
+    pub(crate) environments: OrdMap<String, Arc<PlacedEnvironment>>,
     tenants: OrdMap<String, OrdSet<String>>,
     labels: OrdMap<(String, String, String), OrdSet<String>>,
     pub(crate) reverse_anti: OrdSet<String>,
@@ -23,8 +23,8 @@ impl Snapshot {
     pub fn nodes(&self) -> &OrdMap<String, Arc<Node>> {
         &self.nodes
     }
-    pub fn capsules(&self) -> &OrdMap<String, Arc<PlacedCapsule>> {
-        &self.capsules
+    pub fn environments(&self) -> &OrdMap<String, Arc<PlacedEnvironment>> {
+        &self.environments
     }
     pub fn node(&self, id: &str) -> Option<&Node> {
         self.nodes.get(id).map(AsRef::as_ref)
@@ -33,7 +33,7 @@ impl Snapshot {
         self.nodes.insert(node.id.clone(), Arc::new(node));
         self.revision += 1;
     }
-    pub fn place(&mut self, placement: PlacedCapsule) {
+    pub fn place(&mut self, placement: PlacedEnvironment) {
         let id = placement.spec.id.clone();
         self.remove_indexes(&id);
         let spec = &placement.spec;
@@ -49,16 +49,18 @@ impl Snapshot {
         }
         if !spec.scheduling.required_anti_affinity.is_empty()
             || spec.scheduling.placement_groups.iter().any(|g| {
-                g.target == adx_core::scheduling::PlacementTarget::Capsule && g.required && g.anti
+                g.target == adx_core::scheduling::PlacementTarget::Environment
+                    && g.required
+                    && g.anti
             })
         {
             self.reverse_anti.insert(id.clone());
         }
-        self.capsules.insert(id, Arc::new(placement));
+        self.environments.insert(id, Arc::new(placement));
         self.revision += 1;
     }
     fn remove_indexes(&mut self, id: &str) {
-        if let Some(p) = self.capsules.remove(id) {
+        if let Some(p) = self.environments.remove(id) {
             let tenant = &p.spec.tenant_id;
             if let Some(ids) = self.tenants.get_mut(tenant) {
                 ids.remove(id);
@@ -89,7 +91,7 @@ impl Snapshot {
         &'a self,
         tenant: &str,
         selector: &'a LabelSelector,
-    ) -> impl Iterator<Item = &'a PlacedCapsule> {
+    ) -> impl Iterator<Item = &'a PlacedEnvironment> {
         let mut ids = self.tenants.get(tenant);
         for (key, value) in &selector.match_labels {
             let Some(index) = self
@@ -105,7 +107,7 @@ impl Snapshot {
         }
         ids.into_iter()
             .flat_map(|ids| ids.iter())
-            .filter_map(|id| self.capsules.get(id))
+            .filter_map(|id| self.environments.get(id))
             .filter(move |p| selector.matches(&p.spec.scheduling.labels))
             .map(AsRef::as_ref)
     }

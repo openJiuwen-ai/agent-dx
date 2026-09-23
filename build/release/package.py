@@ -10,7 +10,7 @@ import subprocess
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
-BINARIES = ("adxctl", "adx-master", "adx-node-manager", "adx-api-server", "adx-edge-frontend", "adx-node-proxy", "adx-data-plane-forward")
+BINARIES = ("adxctl", "adx-coordinator", "adxlet", "adx-apiserver", "adx-ingress", "adx-relay", "adx-data-plane-forward")
 
 def sha(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -19,7 +19,7 @@ def assemble(binary_dir, redis, wheel, output, commit, dirty, target, profile):
     if output.exists():
         raise ValueError("output already exists")
     inputs = {f"bin/{name}": binary_dir / name for name in BINARIES}
-    inputs["runtime/rrt-runtime"] = binary_dir / "rrt-runtime"
+    inputs["runtime/adx-execd"] = binary_dir / "adx-execd"
     # Native Linux release builder supplies the EROFS payload. Debug/native macOS
     # packages retain binary-only development support.
     runtime_root = binary_dir / "adx-runtime-rootfs.img"
@@ -82,7 +82,7 @@ def verify(directory):
     required = {f"bin/{b}" for b in BINARIES} | {
         "bin/redis-server",
         "install.sh",
-        "runtime/rrt-runtime",
+        "runtime/adx-execd",
     }
     if manifest.get("profile") == "release" and "linux" in manifest.get("target", ""):
         required.add("runtime/adx-runtime-rootfs.img")

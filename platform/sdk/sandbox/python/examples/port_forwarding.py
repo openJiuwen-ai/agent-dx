@@ -24,7 +24,7 @@ from adx_sandbox import Sandbox
 PORT = 8080
 EXPECTED_BODY = "ROUTER-PF-OK-808"
 
-# RRT/minimal images do not guarantee python3/nc/node inside the sandbox.
+# EXECD/minimal images do not guarantee python3/nc/node inside the sandbox.
 # Perl + Socket is available in the CI images and is enough for a tiny HTTP
 # server that validates the fixed Traefik router -> frontend sandboxRouter path:
 #   http://<gateway>/<safeID>/<port>

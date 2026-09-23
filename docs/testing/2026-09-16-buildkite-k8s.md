@@ -1,5 +1,7 @@
 # Buildkite #15 基础 Kubernetes 验收
 
+> 历史记录：命令、组件和产物名称对应当时版本；当前命名见 [组件命名](../architecture/naming.md)。
+
 > 当次验收/调查记录：版本、数字及未覆盖范围仅适用于文中批次；当前实现与状态见 [实施总览](control-plane-implementation.md) 和 [阶段路线图](control-plane-roadmap.md)。
 
 2026-09-16，[Buildkite #15](https://buildkite.com/agent-dx/agent-dx/builds/15) 的构建、镜像发布与独立 Kubernetes E2E 三个步骤全部通过。按本轮决策，正式流水线运行基础 K8s 七组；Firecracker 继续本地验收，`ADX_E2E_CHECKPOINT=0`。

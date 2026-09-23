@@ -1,5 +1,5 @@
 //! General Sandbox capability boundary shared by Gateway adapters and Activator clients.
-//! Contains no Master/Node Manager identities, Platform storage keys or business invoke protocol.
+//! Contains no Coordinator/Adxlet identities, Platform storage keys or business invoke protocol.
 use crate::{Resources, Service, TemplateVersion, ValidationResult};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 pub struct ExecutionSpec {
     pub image: String,
     pub isolation_runtime: String,
-    /// Empty only for an inline base sandbox which runs RRT without a user process.
+    /// Empty only for an inline base sandbox which runs EXECD without a user process.
     pub entrypoint: Vec<String>,
     pub working_dir: String,
     pub user: Option<String>,
@@ -40,7 +40,7 @@ impl ExecutionSpec {
             image: self.image.clone(),
             isolation_runtime: self.isolation_runtime.clone(),
             entrypoint: if self.entrypoint.is_empty() {
-                vec!["rrt-idle".into()]
+                vec!["execd-idle".into()]
             } else {
                 self.entrypoint.clone()
             },

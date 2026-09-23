@@ -6,7 +6,7 @@ import pathlib
 import secrets
 import subprocess
 
-from fc_environment_spec import resolve as resolve_environment_spec
+from fc_runtime_profile import resolve as resolve_runtime_profile
 
 
 def parse_args():
@@ -95,21 +95,21 @@ def add(service_id, role, config=None, env=None):
 if node=='node1':
  (P/'redis').mkdir(exist_ok=True)
  add('redis','redis',{'bind':'0.0.0.0','port':6379,'data_dir':str(P/'redis'),'appendfsync':'always','password_file':str(redis_key)})
- add('master','master',{'listen':'0.0.0.0:17000','advertised_address':'https://127.0.0.1:17000','scheduler_shards':1,'placement':'spread','rpc_timeout_seconds':120,'tls':tls('master',{'api-server':'api-server','edge':'edge','node:node1':'node','node:node2':'node2'}),'bootstrap_credentials':[{'key_file':str(key),'tenant_id':'e2e','administrator':False,'expires_at_unix_seconds':0},{'key_file':str(other),'tenant_id':'e2e-other','administrator':False,'expires_at_unix_seconds':0}]})
-edge_peer=os.getenv('ADX_E2E_EDGE_IP')
-edge_cidrs=(edge_peer+('/128' if ':' in edge_peer else '/32')+',127.0.0.1/32') if edge_peer else '127.0.0.1/32'
-common={'ADX_DATA_PLANE_EDGE_FRONTEND_NODE_SECURITY_MODE':'mtls','RUST_LOG':'info'}
-np={**common,'ADX_DATA_PLANE_NODE_PROXY_BIND':'0.0.0.0:18443','ADX_DATA_PLANE_NODE_PROXY_HEALTH_BIND':'127.0.0.1:19443','ADX_DATA_PLANE_ALLOWED_TARGET_CIDRS':f'10.231.{16 if node=="node1" else 32}.0/20','ADX_DATA_PLANE_ALLOWED_EDGE_CIDRS':edge_cidrs,'ADX_DATA_PLANE_NODE_PROXY_TLS_CERT':str(T/('node.pem' if node=='node1' else 'node2.pem')),'ADX_DATA_PLANE_NODE_PROXY_TLS_KEY':str(T/('node.key' if node=='node1' else 'node2.key')),'ADX_DATA_PLANE_NODE_PROXY_MTLS_CLIENT_CA':str(T/'ca.pem'),'ADX_DATA_PLANE_NODE_PROXY_ACTIVITY_UDS_DIR':str(P/'proxy')}
-add('proxy','node-proxy',env=np)
+ add('coordinator','coordinator',{'listen':'0.0.0.0:17000','advertised_address':'https://127.0.0.1:17000','scheduler_shards':1,'placement':'spread','rpc_timeout_seconds':120,'tls':tls('coordinator',{'apiserver':'apiserver','ingress':'ingress','node:node1':'node','node:node2':'node2'}),'bootstrap_credentials':[{'key_file':str(key),'tenant_id':'e2e','administrator':False,'expires_at_unix_seconds':0},{'key_file':str(other),'tenant_id':'e2e-other','administrator':False,'expires_at_unix_seconds':0}]})
+ingress_peer=os.getenv('ADX_E2E_INGRESS_IP')
+ingress_cidrs=(ingress_peer+('/128' if ':' in ingress_peer else '/32')+',127.0.0.1/32') if ingress_peer else '127.0.0.1/32'
+common={'ADX_DATA_PLANE_INGRESS_NODE_SECURITY_MODE':'mtls','RUST_LOG':'info'}
+np={**common,'ADX_DATA_PLANE_RELAY_BIND':'0.0.0.0:18443','ADX_DATA_PLANE_RELAY_HEALTH_BIND':'127.0.0.1:19443','ADX_DATA_PLANE_ALLOWED_TARGET_CIDRS':f'10.231.{16 if node=="node1" else 32}.0/20','ADX_DATA_PLANE_ALLOWED_INGRESS_CIDRS':ingress_cidrs,'ADX_DATA_PLANE_RELAY_TLS_CERT':str(T/('node.pem' if node=='node1' else 'node2.pem')),'ADX_DATA_PLANE_RELAY_TLS_KEY':str(T/('node.key' if node=='node1' else 'node2.key')),'ADX_DATA_PLANE_RELAY_MTLS_CLIENT_CA':str(T/'ca.pem'),'ADX_DATA_PLANE_RELAY_ACTIVITY_UDS_DIR':str(P/'proxy')}
+add('proxy','relay',env=np)
 host=os.getenv('ADX_E2E_NODE_IP') or ('127.0.0.1' if node=='node1' else 'node2')
 if ':' in host: host='['+host+']'
-add(node,'node-manager',{'node_id':node,'listen':'0.0.0.0:17001','advertised_address':f'{host}:17001','proxy_address':f'{host}:18443','tls':tls('node' if node=='node1' else 'node2',{'master':'master','api-server':'api-server'}),'sandboxd_socket':str(R/'sandboxd.sock'),'proxy_socket':str(P/'proxy/route.sock'),'resource_source':{'kind':'sandboxd','socket':str(P/'resource.sock'),'valid_for_seconds':6},'degradation_journal':str(P/'degraded/results.sqlite'),'metrics_listen':'127.0.0.1:17003','checkpoint_dir':str(P/'checkpoints'),'report_interval_seconds':2,'rpc_timeout_seconds':20,'rrt_port':50090,'rrt_command':['/usr/local/bin/rrt-runtime'],'rrt_env':{}})
+add(node,'adxlet',{'node_id':node,'listen':'0.0.0.0:17001','advertised_address':f'{host}:17001','proxy_address':f'{host}:18443','tls':tls('node' if node=='node1' else 'node2',{'coordinator':'coordinator','apiserver':'apiserver'}),'sandboxd_socket':str(R/'sandboxd.sock'),'proxy_socket':str(P/'proxy/route.sock'),'resource_source':{'kind':'sandboxd','socket':str(P/'resource.sock'),'valid_for_seconds':6},'degradation_journal':str(P/'degraded/results.sqlite'),'metrics_listen':'127.0.0.1:17003','checkpoint_dir':str(P/'checkpoints'),'report_interval_seconds':2,'rpc_timeout_seconds':20,'execd_port':50090,'execd_command':['/usr/local/bin/adx-execd'],'execd_env':{}})
 if node=='node1':
- add('api','api-server',{'listen':'127.0.0.1:8888','loopback_http':True,'discovery':{'poll_seconds':1},'ca':str(T/'ca.pem'),'certificate':str(T/'api-server.pem'),'private_key':str(T/'api-server.key'),'server_name':'localhost','rpc_timeout_seconds':120,'cache_entries':1000,'auth_cache_ttl_seconds':10})
- ee={**common,'ADX_DATA_PLANE_EDGE_FRONTEND_TLS_BIND':'0.0.0.0:8443','ADX_DATA_PLANE_EDGE_FRONTEND_PLAIN_BIND':'127.0.0.1:8080','ADX_DATA_PLANE_EDGE_FRONTEND_HEALTH_BIND':'127.0.0.1:18080','ADX_DATA_PLANE_EDGE_FRONTEND_TLS_CERT':str(T/'edge.pem'),'ADX_DATA_PLANE_EDGE_FRONTEND_TLS_KEY':str(T/'edge.key'),'ADX_DATA_PLANE_EDGE_FRONTEND_ALLOWED_CLIENT_CIDRS':'127.0.0.1/32','ADX_DATA_PLANE_EDGE_FRONTEND_NODE_TLS_CA':str(T/'ca.pem'),'ADX_DATA_PLANE_EDGE_FRONTEND_NODE_TLS_SERVER_NAME':'localhost','ADX_DATA_PLANE_EDGE_FRONTEND_NODE_TLS_CLIENT_CERT':str(T/'edge.pem'),'ADX_DATA_PLANE_EDGE_FRONTEND_NODE_TLS_CLIENT_KEY':str(T/'edge.key'),'ADX_DATA_PLANE_EDGE_FRONTEND_CONTROL_PLANE_ADDRESS':'127.0.0.1:8888'}
- add('edge','edge',{'tls':tls('edge',{'master':'master'}),'rpc_timeout_seconds':5,'refresh_seconds':1,'auth_cache_seconds':10,'auth_cache_entries':1000},ee)
+ add('api','apiserver',{'listen':'127.0.0.1:8888','loopback_http':True,'discovery':{'poll_seconds':1},'ca':str(T/'ca.pem'),'certificate':str(T/'apiserver.pem'),'private_key':str(T/'apiserver.key'),'server_name':'localhost','rpc_timeout_seconds':120,'cache_entries':1000,'auth_cache_ttl_seconds':10})
+ ee={**common,'ADX_DATA_PLANE_INGRESS_TLS_BIND':'0.0.0.0:8443','ADX_DATA_PLANE_INGRESS_PLAIN_BIND':'127.0.0.1:8080','ADX_DATA_PLANE_INGRESS_HEALTH_BIND':'127.0.0.1:18080','ADX_DATA_PLANE_INGRESS_TLS_CERT':str(T/'ingress.pem'),'ADX_DATA_PLANE_INGRESS_TLS_KEY':str(T/'ingress.key'),'ADX_DATA_PLANE_INGRESS_ALLOWED_CLIENT_CIDRS':'127.0.0.1/32','ADX_DATA_PLANE_INGRESS_NODE_TLS_CA':str(T/'ca.pem'),'ADX_DATA_PLANE_INGRESS_NODE_TLS_SERVER_NAME':'localhost','ADX_DATA_PLANE_INGRESS_NODE_TLS_CLIENT_CERT':str(T/'ingress.pem'),'ADX_DATA_PLANE_INGRESS_NODE_TLS_CLIENT_KEY':str(T/'ingress.key'),'ADX_DATA_PLANE_INGRESS_CONTROL_PLANE_ADDRESS':'127.0.0.1:8888'}
+ add('ingress','ingress',{'tls':tls('ingress',{'coordinator':'coordinator'}),'rpc_timeout_seconds':5,'refresh_seconds':1,'auth_cache_seconds':10,'auth_cache_entries':1000},ee)
 d={'schema_version':1,'package_dir':str(BASE/'package'),'state_dir':str(P/'state'),'redis_url':f'redis://:{redis_key.read_text().strip()}@127.0.0.1:6379/','namespace':'acceptance','restart_limit':3,'restart_delay_ms':1000,'stop_timeout_seconds':30,'services':services}
-d['environment'] = resolve_environment_spec(
+d['runtime_profile'] = resolve_runtime_profile(
     BASE / 'package',
     bool(os.getenv('ADX_E2E_KUBERNETES')),
     PRIVATE / 'runtime-image',
@@ -147,7 +147,7 @@ firecracker = "/opt/adx-fc/bin/firecracker"
 config_path=RUN/'deployment.yaml'
 deployment=json.loads(config_path.read_text())
 for service in deployment['services']:
- if service['role']=='node-manager':
+ if service['role']=='adxlet':
   c=service['config']; c.pop('checkpoint_dir',None)
   c['checkpoint_storage']={'kind':'s3','alias':'shared','bucket':'checkpoints','region':'us-east-1','endpoint':'http://127.0.0.1:19090','allow_http':True,'prefix':'adx','root':str(RUN/'checkpoints'),'cache_budget_bytes':4*1024**3}
   c['checkpoint_gc']={'enabled':True,'min_age_seconds':0,'interval_seconds':1,'max_artifacts':100}
@@ -156,23 +156,23 @@ config_path.write_text(json.dumps(deployment,indent=2))
 
 if os.environ.get('ADX_FC_PROXY_MODE','embedded') == 'embedded':
  deployment=json.loads(config_path.read_text())
- proxy=next(s for s in deployment['services'] if s['role']=='node-proxy')
- node=next(s for s in deployment['services'] if s['role']=='node-manager')
+ proxy=next(s for s in deployment['services'] if s['role']=='relay')
+ node=next(s for s in deployment['services'] if s['role']=='adxlet')
  node['env'].update(proxy['env'])
  node['config']['proxy_mode']='embedded'
- deployment['services']=[s for s in deployment['services'] if s['role']!='node-proxy']
+ deployment['services']=[s for s in deployment['services'] if s['role']!='relay']
  config_path.write_text(json.dumps(deployment,indent=2))
- print('embedded Node Proxy enabled in Node Manager',flush=True)
+ print('embedded Relay enabled in Adxlet',flush=True)
 else:
  deployment=json.loads(config_path.read_text())
- node=next(s for s in deployment['services'] if s['role']=='node-manager')
+ node=next(s for s in deployment['services'] if s['role']=='adxlet')
  node['config']['proxy_mode']='standalone'
  config_path.write_text(json.dumps(deployment,indent=2))
- print('standalone Node Proxy explicitly enabled',flush=True)
+ print('standalone Relay explicitly enabled',flush=True)
 run = RUN
 
 d = json.loads((run / 'deployment.yaml').read_text())
 allowed = {'node_id', 'listen', 'proxy_mode', 'proxy_socket', 'proxy_address', 'checkpoint_storage', 'checkpoint_gc'}
-result = {'schema_version': d['schema_version'], 'package_dir': d['package_dir'], 'state_dir': d['state_dir'], 'environment': d['environment'], 'services': [
+result = {'schema_version': d['schema_version'], 'package_dir': d['package_dir'], 'state_dir': d['state_dir'], 'runtime_profile': d['runtime_profile'], 'services': [
     {'id': s['id'], 'role': s['role'], 'config': {k: v for k, v in s.get('config', {}).items() if k in allowed}, 'environment_names': sorted(s.get('env', {}))} for s in d['services']]}
 (EVIDENCE/'deployment-final.json').write_text(json.dumps(result, indent=2))

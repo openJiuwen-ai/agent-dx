@@ -3,8 +3,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::env::set_var("PROTOC", protoc_bin_vendored::protoc_bin_path()?);
     }
     for file in [
-        "capsule.proto",
-        "capsule_types.proto",
+        "environment.proto",
+        "environment_types.proto",
         "snapshot.proto",
         "credentials.proto",
         "routes.proto",
@@ -12,9 +12,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("cargo:rerun-if-changed=../../api/proto/{file}");
     }
     tonic_build::configure()
-        .boxed(".adx.control.v1.ClaimCapsuleResponse.outcome.owned")
-        .boxed(".adx.control.v1.ClaimCapsuleResponse.outcome.existing")
-        .compile_protos(&["../../api/proto/capsule.proto"], &["../../api/proto"])?;
+        .boxed(".adx.control.v1.ClaimEnvironmentResponse.outcome.owned")
+        .boxed(".adx.control.v1.ClaimEnvironmentResponse.outcome.existing")
+        .compile_protos(&["../../api/proto/environment.proto"], &["../../api/proto"])?;
     println!("cargo:rerun-if-changed=../../api/proto/node.proto");
     tonic_build::configure()
         .compile_protos(&["../../api/proto/node.proto"], &["../../api/proto"])?;

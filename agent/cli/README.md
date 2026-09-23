@@ -7,7 +7,7 @@ cargo build --locked -p adx-cli --bin adx
 cargo install --locked --path agent/cli
 ```
 
-管理命令的租户 API Key 由平台管理员通过 `/api/admin/v1/keys` 签发，CLI 不签发密钥、不自行指定租户，也不连接 Redis、Master 或 Activator。租户身份由 Gateway 验证凭据后确定。
+管理命令的租户 API Key 由平台管理员通过 `/api/admin/v1/keys` 签发，CLI 不签发密钥、不自行指定租户，也不连接 Redis、Coordinator 或 Activator。租户身份由 Gateway 验证凭据后确定。
 
 ```sh
 export ADX_SERVER_ADDRESS=https://gateway.example.com:8443
@@ -73,4 +73,4 @@ adx ssh --template assistant --version 1 --env demo --port 22
 
 SSH 参数用例覆盖显式/自动 Environment、身份文件路径及 IPv6 地址。Gateway 组件另用原生 OpenSSH 验证终端 stdout 的 ID/URN 与退出码。
 
-2026-09-22 另行完成容器内真实 Platform、Redis、RRT 和用户镜像验证：CLI 模板发布/读取、Environment 三页查询和跨 Gateway 查询/删除、已有 Environment SSH、自动生成 ID 后同 ID 重连均通过，终端输出与后端退出码正确。首次冷启动仍可能遇到平台就绪或路由发布延迟，需要按上文使用原 ID 重试；该结果不是多机或 Kubernetes 验收。完整范围和限制见 [Agent 验证说明](../README.md#验证)。
+2026-09-22 另行完成容器内真实 Platform、Redis、EXECD 和用户镜像验证：CLI 模板发布/读取、Environment 三页查询和跨 Gateway 查询/删除、已有 Environment SSH、自动生成 ID 后同 ID 重连均通过，终端输出与后端退出码正确。首次冷启动仍可能遇到平台就绪或路由发布延迟，需要按上文使用原 ID 重试；该结果不是多机或 Kubernetes 验收。完整范围和限制见 [Agent 验证说明](../README.md#验证)。

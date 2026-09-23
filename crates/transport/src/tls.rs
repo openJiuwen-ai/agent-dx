@@ -115,9 +115,9 @@ impl TlsFiles {
         let mut peers = Vec::new();
         for (role, path) in &self.peers {
             let principal = match role.as_str() {
-                "master" => Principal::Master,
-                "api-server" => Principal::ApiServer,
-                "edge" => Principal::Edge,
+                "coordinator" => Principal::Coordinator,
+                "apiserver" => Principal::ApiServer,
+                "ingress" => Principal::Ingress,
                 value if value.starts_with("node:") && value.len() > 5 => {
                     Principal::Node(value[5..].into())
                 }

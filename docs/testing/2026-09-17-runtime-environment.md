@@ -1,5 +1,7 @@
 # 本地运行环境与 RRT PID 1 验证
 
+> 历史记录：命令、组件和产物名称对应当时版本；当前命名见 [组件命名](../architecture/naming.md)。
+
 工作树 `fix/atomic-instance-claim`，本地功能验证基于 `d467c2cfc90c182111b209241843270b809c4b8c` 加本轮修改，使用原生 Linux ARM64 release 制品；manifest 明确记录 `dirty: true`。正式 K8s 构建、镜像及环境兼容性结果另见下文；Firecracker 本轮未运行。
 
 ## 行为

@@ -1,8 +1,8 @@
 # Activator
 
-Activator 为无状态产品控制模块，默认嵌入 Gateway Edge，也可作为 `adx-activator` 进程独立运行。多个副本连接相同 ADX Redis namespace，通过条件写提交唯一 Environment 身份，再调用通用 Sandbox 接口。无成员注册、选主、所有权或恢复扫描。
+Activator 为无状态产品控制模块，默认嵌入 Gateway Ingress，也可作为 `adx-activator` 进程独立运行。多个副本连接相同 ADX Redis namespace，通过条件写提交唯一 Environment 身份，再调用通用 Sandbox 接口。无成员注册、选主、所有权或恢复扫描。
 
-内嵌模式通过 `agent/api` 的 LocalControl 直接调用本库，并注入本地 PlatformSandbox；不启动本模块的 HTTP server，不读取 `ADX_ACTIVATOR_CONFIG` 或 Activator 服务令牌。共享 Edge 装配覆盖独立 Edge 与 API Server 内嵌 Edge。配置见 [Agent 部署说明](../README.md#部署)。产品业务和状态归属不因共进程改变。
+内嵌模式通过 `agent/api` 的 LocalControl 直接调用本库，并注入本地 PlatformSandbox；不启动本模块的 HTTP server，不读取 `ADX_ACTIVATOR_CONFIG` 或 Activator 服务令牌。共享 Ingress 装配覆盖独立 Ingress 与 API Server 内嵌 Ingress。配置见 [Agent 部署说明](../README.md#部署)。产品业务和状态归属不因共进程改变。
 
 独立进程启动读取 `ADX_ACTIVATOR_CONFIG` 指向的 JSON，示例见 [local.json](examples/local.json)。服务凭据为 `ADX_ACTIVATOR_SERVICE_TOKEN` 与 `ADX_SANDBOX_SERVICE_TOKEN`，均不写入示例配置。当前进程监听 HTTP，要求显式允许内网明文；生产须置于 TLS 服务代理后并限制访问。
 

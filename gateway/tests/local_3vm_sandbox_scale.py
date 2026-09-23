@@ -22,7 +22,7 @@ import time
 from collections import defaultdict
 from pathlib import Path
 
-from local_3vm_perf import MASTER, REMOTE_ROOT, TOKEN, WORKER, Runner, sha256_line
+from local_3vm_perf import COORDINATOR, REMOTE_ROOT, TOKEN, WORKER, Runner, sha256_line
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -52,54 +52,54 @@ class SandboxScaleRunner(Runner):
         self.preflight()
         if not self.benchmark.is_file():
             raise RuntimeError(f"host benchmark does not exist: {self.benchmark}")
-        self.ca_path.write_text(self.remote(MASTER, f"cat {REMOTE_ROOT}/ca.crt"))
+        self.ca_path.write_text(self.remote(COORDINATOR, f"cat {REMOTE_ROOT}/ca.crt"))
         subprocess.run(
             [self.limactl, "copy", str(self.ca_path), f"{WORKER}:{REMOTE_ROOT}/ca.crt"],
             text=True,
             check=True,
         )
-        self.restart_edge_for_load()
+        self.restart_ingress_for_load()
         self.prepare_request_targets(100)
         self.collect_metrics("before-scale")
         hashes = sha256_line(self.benchmark)
         with (self.evidence / "release-sha256.txt").open("a") as stream:
             stream.write(hashes)
 
-    def restart_edge_for_load(self):
+    def restart_ingress_for_load(self):
         # The functional E2E deliberately uses a 1 MiB rotation threshold to
         # prove rotation. A request ceiling test keeps audit logging enabled,
         # but uses a production-like threshold so rotation itself is not the
         # dominant CPU and I/O workload.
         command = f"""
 set -e
-kill $(cat {REMOTE_ROOT}/edge-frontend.pid) 2>/dev/null || true
+kill $(cat {REMOTE_ROOT}/ingress-frontend.pid) 2>/dev/null || true
 for attempt in $(seq 1 100); do
-  if ! kill -0 $(cat {REMOTE_ROOT}/edge-frontend.pid) 2>/dev/null; then
+  if ! kill -0 $(cat {REMOTE_ROOT}/ingress-frontend.pid) 2>/dev/null; then
     break
   fi
   sleep 0.05
 done
 nohup env \\
-  ADX_DATA_PLANE_EDGE_FRONTEND_ETCD_ENDPOINTS=http://{self.master_ip}:2379 \\
-  ADX_DATA_PLANE_EDGE_FRONTEND_TLS_BIND=0.0.0.0:8443 \\
-  ADX_DATA_PLANE_EDGE_FRONTEND_PLAIN_BIND=0.0.0.0:8080 \\
-  ADX_DATA_PLANE_EDGE_FRONTEND_HEALTH_BIND=0.0.0.0:18080 \\
-  ADX_DATA_PLANE_EDGE_FRONTEND_CONTROL_PLANE_ADDRESS=127.0.0.1:18888 \\
-  ADX_DATA_PLANE_EDGE_FRONTEND_CONTROL_PLANE_ROUTES=exact:/control.txt \\
-  ADX_DATA_PLANE_EDGE_FRONTEND_TLS_CERT={REMOTE_ROOT}/edge.crt \\
-  ADX_DATA_PLANE_EDGE_FRONTEND_TLS_KEY={REMOTE_ROOT}/edge.key \\
-  ADX_DATA_PLANE_EDGE_FRONTEND_NODE_SECURITY_MODE=network \\
-  ADX_DATA_PLANE_EDGE_FRONTEND_ALLOWED_CLIENT_CIDRS=127.0.0.0/8,192.168.104.0/24 \\
-  ADX_DATA_PLANE_EDGE_FRONTEND_VALIDATE_IAM=false \\
-  ADX_DATA_PLANE_EDGE_FRONTEND_DIRECT_PORT=18080 \\
+  ADX_DATA_PLANE_INGRESS_ETCD_ENDPOINTS=http://{self.coordinator_ip}:2379 \\
+  ADX_DATA_PLANE_INGRESS_TLS_BIND=0.0.0.0:8443 \\
+  ADX_DATA_PLANE_INGRESS_PLAIN_BIND=0.0.0.0:8080 \\
+  ADX_DATA_PLANE_INGRESS_HEALTH_BIND=0.0.0.0:18080 \\
+  ADX_DATA_PLANE_INGRESS_CONTROL_PLANE_ADDRESS=127.0.0.1:18888 \\
+  ADX_DATA_PLANE_INGRESS_CONTROL_PLANE_ROUTES=exact:/control.txt \\
+  ADX_DATA_PLANE_INGRESS_TLS_CERT={REMOTE_ROOT}/ingress.crt \\
+  ADX_DATA_PLANE_INGRESS_TLS_KEY={REMOTE_ROOT}/ingress.key \\
+  ADX_DATA_PLANE_INGRESS_NODE_SECURITY_MODE=network \\
+  ADX_DATA_PLANE_INGRESS_ALLOWED_CLIENT_CIDRS=127.0.0.0/8,192.168.104.0/24 \\
+  ADX_DATA_PLANE_INGRESS_VALIDATE_IAM=false \\
+  ADX_DATA_PLANE_INGRESS_DIRECT_PORT=18080 \\
   ADX_DATA_PLANE_LOG_DIR={REMOTE_ROOT}/logs \\
   ADX_DATA_PLANE_LOG_MAX_SIZE_MB=64 \\
   ADX_DATA_PLANE_LOG_MAX_FILES=4 \\
   ADX_DATA_PLANE_LOG_STDOUT=false \\
-  ADX_DATA_PLANE_EDGE_FRONTEND_ACCESS_LOG_ENABLED={self.access_log_enabled} \\
+  ADX_DATA_PLANE_INGRESS_ACCESS_LOG_ENABLED={self.access_log_enabled} \\
   RUST_LOG=info \\
-  {REMOTE_ROOT}/bin/adx-edge-frontend >{REMOTE_ROOT}/logs/edge-launcher.log 2>&1 &
-echo $! >{REMOTE_ROOT}/edge-frontend.pid
+  {REMOTE_ROOT}/bin/adx-ingress >{REMOTE_ROOT}/logs/ingress-launcher.log 2>&1 &
+echo $! >{REMOTE_ROOT}/ingress-frontend.pid
 ready=0
 for attempt in $(seq 1 600); do
   if curl -fsS http://127.0.0.1:18080/readyz >/dev/null; then
@@ -110,7 +110,7 @@ for attempt in $(seq 1 600); do
 done
 test "$ready" -eq 1
 """
-        self.remote(MASTER, command)
+        self.remote(COORDINATOR, command)
 
     def scale_cases(self):
         cases = set()
@@ -131,9 +131,9 @@ test "$ready" -eq 1
         arguments = [
             f"{REMOTE_ROOT}/bin/relay_perf",
             "bench-http-tls",
-            f"{self.master_ip}:8443",
+            f"{self.coordinator_ip}:8443",
             f"{REMOTE_ROOT}/ca.crt",
-            self.master_ip,
+            self.coordinator_ip,
             TOKEN,
             "/direct/perf-sandbox-{target}/bytes/128",
             str(targets),
@@ -187,10 +187,10 @@ test "$ready" -eq 1
         command = f"""
 idle=0
 for attempt in $(seq 1 200); do
-  edge=$(curl -fsS http://127.0.0.1:18080/metrics | awk '/backend_http_idle_connections / {{print $2}}')
-  node1=$(curl -fsS http://{self.worker_ip}:18443/metrics | awk '/node_proxy_active_streams / {{print $2}}')
-  node2=$(curl -fsS http://{self.worker2_ip}:18443/metrics | awk '/node_proxy_active_streams / {{print $2}}')
-  if test "${{edge:-1}}" -eq 0 && test "${{node1:-1}}" -eq 0 && test "${{node2:-1}}" -eq 0; then
+  ingress=$(curl -fsS http://127.0.0.1:18080/metrics | awk '/backend_http_idle_connections / {{print $2}}')
+  node1=$(curl -fsS http://{self.worker_ip}:18443/metrics | awk '/relay_active_streams / {{print $2}}')
+  node2=$(curl -fsS http://{self.worker2_ip}:18443/metrics | awk '/relay_active_streams / {{print $2}}')
+  if test "${{ingress:-1}}" -eq 0 && test "${{node1:-1}}" -eq 0 && test "${{node2:-1}}" -eq 0; then
     idle=1
     break
   fi
@@ -198,7 +198,7 @@ for attempt in $(seq 1 200); do
 done
 test "$idle" -eq 1
 """
-        self.remote(MASTER, command)
+        self.remote(COORDINATOR, command)
 
     def run(self):
         self.prepare()

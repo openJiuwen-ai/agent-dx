@@ -1,14 +1,14 @@
 # 组件日志采集
 
-组件输出由 Supervisor 写入文件；部署环境运行 OpenTelemetry Collector Contrib，通过 filelog 读取并用 OTLP/HTTP 发送给日志后端。Collector 是独立部署服务，配置样例在 `build/observability/collector.json`，镜像版本和摘要在 `build/observability/source.json`。目前接入托管组件的文件日志；adxctl 自身诊断由启动它的终端、systemd 或 Pod 日志通道采集。实例内用户 stdout/stderr 继续使用 RRT/sandboxd 的通道。
+组件输出由 Supervisor 写入文件；部署环境运行 OpenTelemetry Collector Contrib，通过 filelog 读取并用 OTLP/HTTP 发送给日志后端。Collector 是独立部署服务，配置样例在 `build/observability/collector.json`，镜像版本和摘要在 `build/observability/source.json`。目前接入托管组件的文件日志；adxctl 自身诊断由启动它的终端、systemd 或 Pod 日志通道采集。实例内用户 stdout/stderr 继续使用 Execd/sandboxd 的通道。
 
 ## 组件与字段
 
-在部署配置的每个服务 `env` 中设置 `ADX_LOG_FORMAT=json`。Master、Node Manager、Edge、Node Proxy、转发进程和 API Server 支持此开关，默认保持 text。默认共进程部署中，Edge 与 API Server 共享 `api-server` 服务日志，Node Proxy 与 Node Manager 共享 `node-manager` 服务日志；显式分进程时才分别产生 `edge` 或 `node-proxy` 服务日志。Rust 日志支持 `RUST_LOG` 级别过滤。Gateway 使用 JSON 时保持 `ADX_DATA_PLANE_LOG_DIR` 未配置，由 Supervisor 接管 stdout；现有 access/audit 开关仍有效。
+在部署配置的每个服务 `env` 中设置 `ADX_LOG_FORMAT=json`。Coordinator、adxlet、Ingress、Relay、转发进程和 API Server 支持此开关，默认保持 text。默认共进程部署中，Ingress 与 API Server 共享 `apiserver` 服务日志，Relay 与 adxlet 共享 `adxlet` 服务日志；显式分进程时才分别产生 `ingress` 或 `relay` 服务日志。Rust 日志支持 `RUST_LOG` 级别过滤。Gateway 使用 JSON 时保持 `ADX_DATA_PLANE_LOG_DIR` 未配置，由 Supervisor 接管 stdout；现有 access/audit 开关仍有效。
 
 Rust 输出包括时间、级别、target 和 fields；Rust API Server 输出时间、级别、event 和 HTTP 路由模板、方法、状态、耗时。Collector 将日志解析为结构化 body，并附加 `service.name`（Supervisor 服务 ID）、`adx.node.id` 和文件路径。Redis 等纯文本仍可采集，保留原文。
 
-Node Manager 的 `capsule_operation_completed` 事件记录 capsule_id、generation、revision 和操作返回时的状态。API 请求日志只记录路由模板，不记录 URL 查询参数、Authorization、正文和用户文件。开启Trace后，API请求日志包含Trace ID与Span ID，Node Manager操作完成日志记录traceparent；接线与采样配置见[跨组件Trace](distributed-traces.md)。
+adxlet 的 `environment_operation_completed` 事件记录 environment_id、generation、revision 和操作返回时的状态。API 请求日志只记录路由模板，不记录 URL 查询参数、Authorization、正文和用户文件。开启Trace后，API请求日志包含Trace ID与Span ID，adxlet操作完成日志记录traceparent；接线与采样配置见[跨组件Trace](distributed-traces.md)。
 
 ## 进程部署
 
@@ -58,6 +58,6 @@ Collector 自身指标使用独立的 `127.0.0.1:18888/metrics`，避开 Sandbox
 
 ## Metrics 与验证
 
-Master/Node Manager 的实例及资源指标继续通过 `/metrics` 抓取。Edge 与 Node Proxy 已有 `/metrics`，包括请求/连接/流量/错误/路由等；无需重复实现。可使用 `build/observability/prometheus.json` 中的四类目标配置，替换地址后由部署环境抓取。不同来源的资源视图不要直接相加。
+Coordinator/adxlet 的实例及资源指标继续通过 `/metrics` 抓取。Ingress 与 Relay 已有 `/metrics`，包括请求/连接/流量/错误/路由等；无需重复实现。可使用 `build/observability/prometheus.json` 中的四类目标配置，替换地址后由部署环境抓取。不同来源的资源视图不要直接相加。
 
 本轮验收包括：完整行滚动、超长行后恢复、延迟压缩和保留、HTTP 请求敏感字段省略；将后端置为 503 时完成真实双节点创建/执行/删除，随后抓取 Gateway 指标并接收组件日志；注入 OTLP 后端 503、滚动文件、重启 Collector，以 40 条唯一记录验证该受控场景的读取位置和持久化队列恢复。最终结果以验收报告为准。

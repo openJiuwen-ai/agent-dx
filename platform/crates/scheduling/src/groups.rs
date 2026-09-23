@@ -1,13 +1,13 @@
 use crate::query::Prepared;
 use crate::{Candidate, Filter, Score, MAX_SCORE};
-use adx_core::{scheduling::PlacementTarget, CapsuleSpec, Result};
+use adx_core::{scheduling::PlacementTarget, EnvironmentSpec, Result};
 use std::borrow::Cow;
-fn prepared<'a>(r: &CapsuleSpec, c: &'a Candidate<'_>) -> Cow<'a, Prepared> {
+fn prepared<'a>(r: &EnvironmentSpec, c: &'a Candidate<'_>) -> Cow<'a, Prepared> {
     c.prepared
         .map(Cow::Borrowed)
         .unwrap_or_else(|| Cow::Owned(Prepared::new(r, c.snapshot)))
 }
-fn matching(r: &CapsuleSpec, c: &Candidate<'_>, q: &Prepared, index: usize) -> Vec<bool> {
+fn matching(r: &EnvironmentSpec, c: &Candidate<'_>, q: &Prepared, index: usize) -> Vec<bool> {
     let group = &r.scheduling.placement_groups[index];
     group
         .terms
@@ -15,7 +15,7 @@ fn matching(r: &CapsuleSpec, c: &Candidate<'_>, q: &Prepared, index: usize) -> V
         .enumerate()
         .map(|(i, term)| match group.target {
             PlacementTarget::Node => term.selector.matches(&c.node.labels),
-            PlacementTarget::Capsule => q.groups[index][i].contains(&c.node.id),
+            PlacementTarget::Environment => q.groups[index][i].contains(&c.node.id),
         })
         .collect()
 }
@@ -24,7 +24,7 @@ impl Filter for Required {
     fn name(&self) -> &'static str {
         "placement-groups"
     }
-    fn filter(&self, r: &CapsuleSpec, c: &Candidate<'_>) -> Result<bool> {
+    fn filter(&self, r: &EnvironmentSpec, c: &Candidate<'_>) -> Result<bool> {
         let q = prepared(r, c);
         if q.reverse_group_nodes.contains(&c.node.id) {
             return Ok(false);
@@ -42,7 +42,7 @@ impl Filter for Required {
                     return Ok(false);
                 }
             } else if !found {
-                let bootstrap = g.target == PlacementTarget::Capsule
+                let bootstrap = g.target == PlacementTarget::Environment
                     && q.groups[i].iter().all(|peers| peers.is_empty())
                     && g.terms
                         .iter()
@@ -60,7 +60,7 @@ impl Score for Preference {
     fn name(&self) -> &'static str {
         "placement-group-preference"
     }
-    fn score(&self, r: &CapsuleSpec, c: &Candidate<'_>) -> Result<u32> {
+    fn score(&self, r: &EnvironmentSpec, c: &Candidate<'_>) -> Result<u32> {
         let q = prepared(r, c);
         let mut sum = 0u64;
         let mut count = 0u64;

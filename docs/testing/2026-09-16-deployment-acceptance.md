@@ -1,5 +1,7 @@
 # 部署接线与公开密钥管理验收
 
+> 历史记录：命令、组件和产物名称对应当时版本；当前命名见 [组件命名](../architecture/naming.md)。
+
 > 当次验收/调查记录：版本、数字及未覆盖范围仅适用于文中批次；当前实现与状态见 [实施总览](control-plane-implementation.md) 和 [阶段路线图](control-plane-roadmap.md)。
 
 后续已完成 package-v22 的整份安装示例启动复验，见[完整安装示例验收](2026-09-16-installed-example.md)。以下保留 package-v18 当次证据及范围。

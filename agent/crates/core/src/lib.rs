@@ -149,13 +149,13 @@ impl TemplateVersion {
             if matches!(
                 key.as_str(),
                 "ADX_AGENT_EXECUTION_HASH"
-                    | "ADX_CAPSULE_ID"
+                    | "ADX_ENVIRONMENT_ID"
                     | "ADX_RUNTIME_ID"
                     | "ADX_OWNERSHIP_GENERATION"
                     | "ADX_IMAGE_PROCESS_CONFIG"
-                    | "RRT_HTTP_TOKEN"
-                    | "RRT_HTTP_PORT"
-                    | "RRT_HTTP_ONLY"
+                    | "EXECD_HTTP_TOKEN"
+                    | "EXECD_HTTP_PORT"
+                    | "EXECD_HTTP_ONLY"
             ) {
                 return Err(format!("{key} is reserved for the platform"));
             }

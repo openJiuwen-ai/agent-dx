@@ -107,10 +107,10 @@ def run(connection, image, output):
             node_id='node1',
             connection=connection,
             create_timeout=150,
-        ) as context_capsule:
-            context_id = context_capsule.id
+        ) as context_environment:
+            context_id = context_environment.id
             remaining.add(context_id)
-            assert context_capsule.is_running()
+            assert context_environment.is_running()
         remaining.remove(context_id)
         _wait_deleted(context_id, connection)
         passed('lifecycle.context-manager-deletes', started)

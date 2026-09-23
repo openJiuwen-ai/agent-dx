@@ -9,7 +9,7 @@ ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/'firecracker'))
 
 class FirecrackerEvidenceTests(unittest.TestCase):
-    def test_entrypoint_case_uses_the_rrt_terminal_status_contract(self):
+    def test_entrypoint_case_uses_the_execd_terminal_status_contract(self):
         source=(ROOT/'firecracker/sdk_checkpoint.py').read_text()
         self.assertIn("entrypoint_info['status_kind'] == 'exited'",source)
         self.assertIn("entrypoint_info['exit_code'] == 7",source)
@@ -19,7 +19,7 @@ class FirecrackerEvidenceTests(unittest.TestCase):
         checkpoint=(ROOT/'firecracker/sdk_checkpoint.py').read_text()
         restart=(ROOT/'firecracker/restart_paused.py').read_text()
         self.assertIn('[*a.restart_command, sandbox.id]',checkpoint)
-        self.assertIn("key='capsule:'+INSTANCE_ID",restart)
+        self.assertIn("key='environment:'+INSTANCE_ID",restart)
         self.assertNotIn('len(records)==1',restart)
 
     def test_runtime_network_policy_uses_a_fresh_execution(self):
@@ -40,27 +40,27 @@ class FirecrackerEvidenceTests(unittest.TestCase):
         self.assertIn("'198.18.0.2/30'",fixture)
         self.assertIn("'ip','netns','delete',probe_namespace",fixture)
 
-    def test_environment_spec_uses_local_erofs_for_vm_and_pinned_oci_for_kubernetes(self):
-        import fc_environment_spec
+    def test_runtime_profile_uses_local_erofs_for_vm_and_pinned_oci_for_kubernetes(self):
+        import fc_runtime_profile
         with tempfile.TemporaryDirectory() as d:
             root=Path(d); package=root/'package'; artifact=package/'runtime/adx-runtime-rootfs.img'
             artifact.parent.mkdir(parents=True);artifact.write_bytes(b'erofs')
             custom='/etc/adx/custom-image-process.json'
-            local=fc_environment_spec.resolve(package,False,root/'missing',custom)
+            local=fc_runtime_profile.resolve(package,False,root/'missing',custom)
             self.assertEqual(local['rootfs']['runtime_class'],'firecracker')
             self.assertEqual(local['rootfs']['path'],str(artifact.resolve()))
             self.assertEqual(local['bootstrap']['root'],str(artifact.resolve()))
             self.assertEqual(local['bootstrap']['image_process_config'],custom)
             image=root/'runtime-image';image.write_text('registry.example/adx-runtime@sha256:'+'a'*64)
-            remote=fc_environment_spec.resolve(package,True,image,custom)
+            remote=fc_runtime_profile.resolve(package,True,image,custom)
             self.assertEqual(remote['rootfs']['image'],image.read_text())
             self.assertEqual(remote['bootstrap']['image'],image.read_text())
             self.assertEqual(remote['bootstrap']['image_process_config'],custom)
             with self.assertRaisesRegex(RuntimeError,'must be absolute'):
-                fc_environment_spec.resolve(package,False,root/'missing','etc/relative.json')
+                fc_runtime_profile.resolve(package,False,root/'missing','etc/relative.json')
             image.write_text('registry.example/adx-runtime:latest')
             with self.assertRaisesRegex(RuntimeError,'digest pinned'):
-                fc_environment_spec.resolve(package,True,image)
+                fc_runtime_profile.resolve(package,True,image)
 
     def test_missing_or_duplicate_cases_cannot_pass(self):
         import acceptance
@@ -102,7 +102,7 @@ class FirecrackerEvidenceTests(unittest.TestCase):
             (root/'sdk/snapshot-collected-before-clone-resume.json').write_text(json.dumps({'snapshot_id':'saved','state':'Deleted','references':[]}))
             (root/'orphan-gc.json').write_text(json.dumps({**{k:True for k in ('passed','current_session_preserved','retired_session_removed','foreign_preserved','unmarked_preserved')},'registered_checkpoint_preserved':'saved'}))
             (root/'snapshots-final.json').write_text(json.dumps({'saved':{'state':'Deleted','references':[]}}))
-            (root/'catalog-final.json').write_text(json.dumps({'capsule:a':{'result':{'state':'Deleted','resources_held':False}}}))
+            (root/'catalog-final.json').write_text(json.dumps({'environment:a':{'result':{'state':'Deleted','resources_held':False}}}))
             (root/'s3-final.xml').write_text('<ListBucketResult />');(root/'inventory-final.txt').write_text('ID STATUS\n')
             self.assertEqual(len(acceptance.verify(root)),sum(map(len,acceptance.CASES.values())))
             (root/'result.json').write_text(json.dumps({'status':'passed','stop_error':'failed'}))

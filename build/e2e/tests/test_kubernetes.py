@@ -50,8 +50,8 @@ class KubernetesDeploymentTests(unittest.TestCase):
         self.assertEqual(volume['emptyDir']['medium'],'Memory')
     def test_service_dns_matches_platform_configuration(self):
         services={r['metadata']['name']:r for r in self.resources() if r['kind']=='Service'}
-        self.assertEqual(set(services),{'master','node2'})
-        ports={p['port'] for p in services['master']['spec']['ports']}
+        self.assertEqual(set(services),{'coordinator','node2'})
+        ports={p['port'] for p in services['coordinator']['spec']['ports']}
         self.assertTrue({6379,17000,17001,18443,8443}.issubset(ports))
     def test_namespace_and_image_must_be_explicit(self):
         for namespace,image in [('default','registry.example/node@sha256:'+'a'*64),('adx-e2e-test','node:latest')]:
@@ -130,7 +130,7 @@ class KubernetesLifecycleTests(unittest.TestCase):
         import hashlib,json,tempfile
         with tempfile.TemporaryDirectory() as d:
             p=Path(d)
-            image_ids={'node':'node-id','rrt':'rrt-id','entrypoint':'entrypoint-id'}
+            image_ids={'node':'node-id','execd':'execd-id','entrypoint':'entrypoint-id'}
             bundle={
                 'schema_version':1,'image_ids':image_ids,'architecture':'amd64',
                 'package':{'target':'x86_64-unknown-linux-gnu','commit':'a'*40,'dirty':False},
@@ -210,7 +210,7 @@ class KubernetesLifecycleTests(unittest.TestCase):
         import base64,tempfile
         with tempfile.TemporaryDirectory() as d:
             data=self.module.credentials(Path(d),'registry.example/user@sha256:'+'b'*64,
-                                         'registry.example/rrt@sha256:'+'c'*64)
+                                         'registry.example/execd@sha256:'+'c'*64)
             objects=k8s.resources('adx-e2e-test','registry.example/node@sha256:'+'a'*64,'amd64')
             pod=next(o for o in objects if o['kind']=='Pod')
             secret=next(v['secret'] for v in pod['spec']['volumes'] if v['name']=='credentials')
@@ -220,7 +220,7 @@ class KubernetesLifecycleTests(unittest.TestCase):
             self.assertNotEqual(data['admin-key'],data['api-key'])
             self.assertNotIn('ca.key',data)
             self.assertEqual(base64.b64decode(data['image']).decode(),'registry.example/user@sha256:'+'b'*64)
-            self.assertEqual(base64.b64decode(data['runtime-image']).decode(),'registry.example/rrt@sha256:'+'c'*64)
+            self.assertEqual(base64.b64decode(data['runtime-image']).decode(),'registry.example/execd@sha256:'+'c'*64)
 
 class HostPrerequisiteTests(unittest.TestCase):
     def test_missing_kernel_capabilities_fail_before_services_start(self):

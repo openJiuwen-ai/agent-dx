@@ -5,7 +5,7 @@ use std::net::IpAddr;
 use std::sync::{Arc, RwLock};
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
-pub struct CapsuleStatus {
+pub struct EnvironmentStatus {
     #[serde(rename = "code", default)]
     pub code: i32,
     #[serde(rename = "exitCode", default)]
@@ -23,13 +23,13 @@ pub struct RouteInfo {
     #[serde(rename = "instanceID", default)]
     pub instance_id: String,
     #[serde(rename = "instanceStatus", default)]
-    pub capsule_status: CapsuleStatus,
+    pub environment_status: EnvironmentStatus,
     #[serde(rename = "tenantID", default)]
     pub tenant_id: String,
     #[serde(rename = "sandboxID", default)]
     pub sandbox_id: String,
     #[serde(rename = "nodeProxyAddress", default)]
-    pub node_proxy_address: String,
+    pub relay_address: String,
     #[serde(rename = "sandboxIP", default)]
     pub sandbox_ip: String,
     #[serde(
@@ -148,7 +148,7 @@ impl RouteInfo {
             .unwrap_or_default()
     }
 
-    /// Build the node CONNECT metadata for any TCP port selected by the Edge
+    /// Build the node CONNECT metadata for any TCP port selected by the Ingress
     /// policy. The route itself supplies the sandbox identity and sandbox IP;
     /// sandboxd does not need to know the application protocol or port list.
     pub fn connect_target(
@@ -291,12 +291,12 @@ pub fn is_full_route_key(key: &str) -> bool {
 mod tests {
     use super::*;
     #[test]
-    fn route_keeps_capsule_status_and_endpoint() {
+    fn route_keeps_environment_status_and_endpoint() {
         let route: RouteInfo = serde_json::from_str(r#"{"instanceID":"i","instanceStatus":{"code":3,"msg":"ok"},"sandboxID":"s","nodeProxyAddress":"gw:8443","sandboxIP":"10.0.0.2"}"#).unwrap();
         let cache = RouteCache::default();
         cache.put(route.clone());
         assert_eq!(cache.get("i").unwrap().sandbox_ip, "10.0.0.2");
-        assert_eq!(cache.get("i").unwrap().capsule_status.code, 3);
+        assert_eq!(cache.get("i").unwrap().environment_status.code, 3);
     }
 
     #[test]
@@ -324,7 +324,7 @@ mod tests {
     fn cache_resolves_raw_and_safe_instance_ids() {
         let mut route: RouteInfo =
             serde_json::from_str(r#"{"instanceID":"user@host/f.v_1","sandboxID":"s"}"#).unwrap();
-        route.capsule_status.code = 3;
+        route.environment_status.code = 3;
         let cache = RouteCache::default();
         cache.put(route);
         assert_eq!(

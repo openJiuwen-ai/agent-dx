@@ -9,8 +9,8 @@
     "private_key": "/opt/adx/config/tls/node-1.key",
     "server_name": "adx.internal",
     "peers": {
-      "master": "/opt/adx/config/tls/master.der",
-      "api-server": "/opt/adx/config/tls/api-server.der"
+      "coordinator": "/opt/adx/config/tls/coordinator.der",
+      "apiserver": "/opt/adx/config/tls/apiserver.der"
     }
   },
   "sandboxd_socket": "/run/sandboxd/sandboxd.sock",
@@ -18,8 +18,8 @@
   "proxy_socket": "/opt/adx/run/route.sock",
   "report_interval_seconds": 5,
   "rpc_timeout_seconds": 30,
-  "rrt_port": 50090,
-  "rrt_env": {},
+  "execd_port": 50090,
+  "execd_env": {},
   "discovery": {
     "redis_url": "redis://127.0.0.1:6379/",
     "namespace": "adx"
@@ -48,7 +48,7 @@
     "interval_seconds": 300,
     "max_artifacts": 100
   },
-  "environment": {
+  "runtime_profile": {
     "rootfs": {
       "runtime_class": "runsc",
       "type": "local",
@@ -60,7 +60,7 @@
       "root": "/opt/adx/current/runtime/adx-runtime-rootfs.img",
       "target": "/__adx",
       "entrypoint": [
-        "/__adx/usr/local/bin/rrt-runtime"
+        "/__adx/usr/local/bin/adx-execd"
       ],
       "image_process_config": "/etc/adx-image-process.json"
     },

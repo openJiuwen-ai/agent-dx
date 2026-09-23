@@ -62,8 +62,8 @@ def identity(bundle, registry, commit=None, ci=False):
         raise ValueError('invalid Kubernetes artifact manifest')
     if r.get('bundle_sha256') != common.sha(bundle) or r.get('image_ids') != m['image_ids']:
         raise ValueError('registry images do not match the build bundle')
-    if set(r.get('references', {})) != {'node', 'rrt', 'entrypoint'}:
-        raise ValueError('node, RRT and entrypoint test images required')
+    if set(r.get('references', {})) != {'node', 'execd', 'entrypoint'}:
+        raise ValueError('node, EXECD and entrypoint test images required')
     for image in r['references'].values():
         if not re.fullmatch(r'[^\s]+@sha256:[0-9a-f]{64}', image):
             raise ValueError('immutable image references required')
@@ -190,8 +190,8 @@ class KubernetesRun(common.Run):
         validate_physical_placement(placement, require_distinct_workers)
         (self.output / 'placement.json').write_text(json.dumps(placement, indent=2) + '\n')
         print('Kubernetes placement: ' + json.dumps(placement), flush=True)
-        edge_pod = next(p for p in pods if p['metadata']['name'] == 'node1')
-        edge_ip = str(ipaddress.ip_address(edge_pod['status']['podIP']))
+        ingress_pod = next(p for p in pods if p['metadata']['name'] == 'node1')
+        ingress_ip = str(ipaddress.ip_address(ingress_pod['status']['podIP']))
         self.sync_harness(harness_commit or source_commit(), m['package']['commit'])
         self.event('[DEPLOY] Checking OCI runtime and bridge netfilter prerequisites')
         for node in self.nodes:
@@ -199,7 +199,7 @@ class KubernetesRun(common.Run):
                          '--runtime-source', 'image')
         self.event('[DEPLOY] Configuring nodes and starting sandboxd')
         for node in self.nodes:
-            self.execute(node, 'env', 'ADX_E2E_EDGE_IP=' + edge_ip,
+            self.execute(node, 'env', 'ADX_E2E_INGRESS_IP=' + ingress_ip,
                          'python3', '/opt/adx/e2e/node.py', 'setup', node)
             self.execute(node, 'sh', '-c', 'python3 /opt/adx/e2e/node.py services ' + node +
                          ' > /evidence/services-' + node + '.log 2>&1 &')
@@ -209,7 +209,7 @@ class KubernetesRun(common.Run):
             self.execute(node, 'sh', '-c', '/opt/adx/package/bin/adxctl run --config /tmp/adx-e2e/deployment.yaml'
                          ' > /evidence/supervisor-' + node + '.log 2>&1 &')
         # Pod Ready only means the fixture is available; platform readiness is a separate gate.
-        self.event('[DEPLOY] Waiting for Master registration, reconciliation and routes')
+        self.event('[DEPLOY] Waiting for Coordinator registration, reconciliation and routes')
         self.helper('node1', 'ready', timeout=150)
         self.event('[PASS] Kubernetes deployment and platform readiness')
         self.kube('-n', self.id, 'get', 'pods', '-o', 'wide')
@@ -290,10 +290,10 @@ def main():
             m, published = identity(a.bundle, a.registry_images, expected_commit, bool(os.getenv('BUILDKITE')))
             (output / 'bundle.json').write_text(json.dumps(m, indent=2))
             (output / 'registry-images.json').write_text(json.dumps(published, indent=2))
-            user_image = m['base_images']['rrt']
+            user_image = m['base_images']['execd']
             if not re.fullmatch(r'[^\s]+@sha256:[0-9a-f]{64}', user_image):
                 raise ValueError('immutable custom user image required')
-            data = credentials(Path(private), user_image, published['references']['rrt'])
+            data = credentials(Path(private), user_image, published['references']['execd'])
             run.deploy(m, published['references'], data, a.registry_auth, a.node_name,
                        require_distinct_workers=a.profile == 'full', harness_commit=source_commit())
             run.scenarios(checks,required)

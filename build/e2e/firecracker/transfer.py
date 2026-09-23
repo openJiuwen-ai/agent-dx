@@ -41,7 +41,7 @@ def main():
     def call(args,**kw):return subprocess.run(list(map(str,args)),env=env,check=True,**kw)
     call(['python3',base/'e2e/package.py','verify',base/'package'])
     shutil.copyfile(base/'package/manifest.json',evidence/'package-manifest.json')
-    (evidence/'runtime-hashes.json').write_text(json.dumps({str(p):hashlib.file_digest(p.open('rb'),'sha256').hexdigest() for p in [Path('/opt/adx-fc/bin/sandboxd'),Path('/opt/adx-fc/bin/firecracker'),base/'package/runtime/rrt-runtime']},indent=2))
+    (evidence/'runtime-hashes.json').write_text(json.dumps({str(p):hashlib.file_digest(p.open('rb'),'sha256').hexdigest() for p in [Path('/opt/adx-fc/bin/sandboxd'),Path('/opt/adx-fc/bin/firecracker'),base/'package/runtime/adx-execd']},indent=2))
     tag=hashlib.sha256(str(root).encode()).hexdigest()[:6]
     bridge='axt'+tag
     namespaces={n:'axt-'+tag+'-'+n for n in ADDRESSES}
@@ -73,7 +73,7 @@ def main():
             ns=namespaces[node];call(['ip','netns','add',ns]);created_namespaces.append(ns)
             hostdev=f'ax{tag}{i}';peer=f'ay{tag}{i}'
             call(['ip','link','add',hostdev,'type','veth','peer','name',peer])
-            call(['ip','link','set',hostdev,'master',bridge]);call(['ip','link','set',hostdev,'up'])
+            call(['ip','link','set',hostdev,'coordinator',bridge]);call(['ip','link','set',hostdev,'up'])
             call(['ip','link','set',peer,'netns',ns])
             for args in (['link','set','lo','up'],['link','set',peer,'name','eth0'],['addr','add',address+'/24','dev','eth0'],['link','set','eth0','up'],['route','add','default','via',HOST]):
                 call(['ip','-n',ns,*args])
@@ -87,9 +87,9 @@ def main():
         spawn('registry',['docker-registry','serve',root/'registry.yaml'])
         sys.path.insert(0,str(base/'e2e'))
         import publish
-        digest=publish.publish(str(base/'rrt.tar'))
-        image=f'{HOST}:5000/adx-rrt@{digest}'
-        (evidence/'rrt-image.json').write_text(json.dumps({'image':image}))
+        digest=publish.publish(str(base/'execd.tar'))
+        image=f'{HOST}:5000/adx-execd@{digest}'
+        (evidence/'execd-image.json').write_text(json.dumps({'image':image}))
         spawn('control',[base/'package/bin/adxctl','run','--config',root/'deployment.yaml'])
         for node,ns in namespaces.items():
             folder=root/node

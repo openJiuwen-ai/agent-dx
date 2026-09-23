@@ -1,6 +1,6 @@
 # 调度优化迁移与验证
 
-本轮以 `feature/distribute_env` 超仓提交 `f3d3d52029be361a895acd775ef939008a37a3dd` 固定的 FunctionSystem 子仓提交 `7cb717dc27778954773c3745ab7fca4c77912377` 为对照，迁移调度热路径优化。Global 只轮转选择 Shard；Shard 与 Master 同进程，负责实际调度；Node Manager 保留本机最终准入。
+本轮以 `feature/distribute_env` 超仓提交 `f3d3d52029be361a895acd775ef939008a37a3dd` 固定的 FunctionSystem 子仓提交 `7cb717dc27778954773c3745ab7fca4c77912377` 为对照，迁移调度热路径优化。Global 只轮转选择 Shard；Shard 与 Coordinator 同进程，负责实际调度；adxlet 保留本机最终准入。
 
 拓扑分布不作为本轮扩展或性能验收目标。现有节点/实例亲和、反亲和、GPU/NPU 整卡规则参与回归，纯标量快路径不会绕过这些规则。
 
@@ -10,13 +10,13 @@
 |---|---|
 | `schedule_snapshot.*` 的不可变单元、增量发布及查询索引 | [snapshot.rs](../../platform/crates/scheduling/src/snapshot.rs)：`im::OrdMap/OrdSet` 共享树节点；节点、实例、租户、标签、反亲和索引只更新受影响路径。旧版本可继续只读。节点 ID 查找不再线性扫描 |
 | 查询上下文复用 | [query.rs](../../platform/crates/scheduling/src/query.rs)：每请求准备一次匹配结果，多个候选和 Filter/Score 共用；按租户/精确标签中最小集合筛选，NotIn/DoesNotExist 等表达式仍按原语义复核 |
-| `schedule_queue_actor.cpp` 的 256 请求 / 10 ms 有界轮次 | [master/lib.rs](../../platform/master/src/lib.rs)：`schedule_round` 在请求之间检查预算；固定基准快照根，轮内每次预留增量进入后续请求视图。到界返回给调用者处理心跳、更新等事件 |
-| `RequestMutationJournal` 与预分配增量对账 | [journal.rs](../../platform/master/src/journal.rs)：按序号直接读取新增区间，合并重复节点；缓存刷新该节点的当前可分配量，避免重复扣减；游标过旧时重建候选 |
-| `SchedulingInputSignature` / `SupportsSemanticAggregation` | [shard.rs](../../platform/master/src/shard.rs)：按 CPU、内存、镜像和 runtime 聚合计算。仅框架内置 profile、默认空策略、零磁盘请求且无既有反向硬反亲和时启用。自定义插件即使用内置同名也不启用 |
+| `schedule_queue_actor.cpp` 的 256 请求 / 10 ms 有界轮次 | [coordinator/lib.rs](../../platform/coordinator/src/lib.rs)：`schedule_round` 在请求之间检查预算；固定基准快照根，轮内每次预留增量进入后续请求视图。到界返回给调用者处理心跳、更新等事件 |
+| `RequestMutationJournal` 与预分配增量对账 | [journal.rs](../../platform/coordinator/src/journal.rs)：按序号直接读取新增区间，合并重复节点；缓存刷新该节点的当前可分配量，避免重复扣减；游标过旧时重建候选 |
+| `SchedulingInputSignature` / `SupportsSemanticAggregation` | [shard.rs](../../platform/coordinator/src/shard.rs)：按 CPU、内存、镜像和 runtime 聚合计算。仅框架内置 profile、默认空策略、零磁盘请求且无既有反向硬反亲和时启用。自定义插件即使用内置同名也不启用 |
 | `SelectFeasible` 候选复用 | 排序候选集按上述签名复用；资源预留、释放和状态变化后，仅重新评估变化节点并更新排序。Pack/Spread 与未启用复用时逐次结果一致；没有重复使用旧分数 |
-| 发布完成后再唤醒等待调度 | Master 先更新快照及变更序列，再合并唤醒事件。包括只有维护状态变化的上报；停滞队列等待新事件，不自行忙循环 |
+| 发布完成后再唤醒等待调度 | Coordinator 先更新快照及变更序列，再合并唤醒事件。包括只有维护状态变化的上报；停滞队列等待新事件，不自行忙循环 |
 
-资源账本不再在每次分配时完整克隆：Shard 先预留标量，再预留卡，卡预留失败撤回本次标量预留。设备忙闲索引随分配/释放更新，不遍历全部实例重建。Node Manager 的最终本机复核不变。
+资源账本不再在每次分配时完整克隆：Shard 先预留标量，再预留卡，卡预留失败撤回本次标量预留。设备忙闲索引随分配/释放更新，不遍历全部实例重建。adxlet 的最终本机复核不变。
 
 ## 请求顺序与失败契约
 
@@ -28,11 +28,11 @@
 
 典型事件循环：取 `take_ready_shard()`，调用 `schedule_round`，派发其已完成分配，再处理错误。只有资源变化、请求到达或预算用尽且还有工作时继续唤醒。插件错误交给调用者退避处理。一个插件调用和一个请求的候选扫描不会被强行抢占，因此 10 ms 是协作预算，不是实时硬截止。
 
-`MutationJournal` 是进程内缓存变更日志，不是 Redis/SQLite 持久化日志。Master 直接拥有内存账本及预留增量，不再搬入旧实现的异步镜像账本/确认协议；恢复持久化状态后才能开放调度仍是服务接线要求。
+`MutationJournal` 是进程内缓存变更日志，不是 Redis/SQLite 持久化日志。Coordinator 直接拥有内存账本及预留增量，不再搬入旧实现的异步镜像账本/确认协议；恢复持久化状态后才能开放调度仍是服务接线要求。
 
 ## 配置
 
-通过 `Master::with_config` 或 `Master::with_framework_config` 传入 `SchedulerConfig`：
+通过 `Coordinator::with_config` 或 `Coordinator::with_framework_config` 传入 `SchedulerConfig`：
 
 | 字段 | 默认值 | 含义 |
 |---|---:|---|
@@ -41,13 +41,13 @@
 | `candidate_cache_entries` | 32 | 每 Shard 最多保存的计算签名；超限按进入顺序淘汰，0 关闭复用 |
 | `mutation_history` | 65,536 | 有界变更日志条数；溢出后消费者重建 |
 
-请求数、时间和日志容量须大于零。这些调优项当前只通过 Rust 配置接口设置；Master 服务 JSON 暴露 `scheduler_shards` 与 `placement`，未暴露上述 SchedulerConfig 调优字段。
+请求数、时间和日志容量须大于零。这些调优项当前只通过 Rust 配置接口设置；Coordinator 服务 JSON 暴露 `scheduler_shards` 与 `placement`，未暴露上述 SchedulerConfig 调优字段。
 
 ## 自动验证入口
 
 ```sh
-cargo test --locked -p adx-master -p adx-scheduling -p adx-core -p adx-protocol -p adx-node-manager -j2
-cargo clippy --locked -p adx-master -p adx-scheduling -p adx-core -p adx-protocol -p adx-node-manager --all-targets -j2 -- -D warnings
+cargo test --locked -p adx-coordinator -p adx-scheduling -p adx-core -p adx-protocol -p adxlet -j2
+cargo clippy --locked -p adx-coordinator -p adx-scheduling -p adx-core -p adx-protocol -p adxlet --all-targets -j2 -- -D warnings
 make scheduler-bench JOBS=2
 ```
 
@@ -81,6 +81,6 @@ TDD 红灯日志 `/tmp/adx-scheduler-optimization-red.log`：先确认缺少 `Sc
 
 完整模式对照、重试／更新成本、制品摘要、运行命令及日志见 [Linux 基线比较报告](scheduling-baseline-comparison.md)。旧侧执行文件与分支内历史报告的 SHA256 一致，但没有重新编译当前分支 HEAD。两侧上报应用职责不同，测试属于进程内调度与消息队列闭环，没有覆盖完整平台服务。
 
-为完成冲突重试比较，新增 `Master::retry`：节点明确拒绝执行或确认清理后，释放精确代次的旧分配并重新排队；请求保留失败节点排除列表。重试沿用共享候选排序，仅在选择时跳过当前请求拒绝的节点，避免全量扫描退化，也不影响其他请求使用同一节点。定向测试覆盖过期代次和资源回收。
+为完成冲突重试比较，新增 `Coordinator::retry`：节点明确拒绝执行或确认清理后，释放精确代次的旧分配并重新排队；请求保留失败节点排除列表。重试沿用共享候选排序，仅在选择时跳过当前请求拒绝的节点，避免全量扫描退化，也不影响其他请求使用同一节点。定向测试覆盖过期代次和资源回收。
 
 后续 2026-09-16 的源码复测见 [基线复测](2026-09-16-scheduling-recheck.md) 与 [条件组接线后复测](2026-09-16-placement-groups-recheck.md)；这些历史微基准不代表完整当前服务性能。

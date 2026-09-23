@@ -1,13 +1,13 @@
 use adx_core::runtime::{RuntimeIdentity, RuntimeRestore};
 fn identity(id: &str, generation: u64) -> RuntimeIdentity {
     RuntimeIdentity {
-        capsule_id: id.into(),
+        environment_id: id.into(),
         runtime_id: format!("{id}-{generation}"),
         ownership_generation: generation,
     }
 }
 #[test]
-fn clone_requires_exact_checkpoint_origin_and_a_new_capsule() {
+fn clone_requires_exact_checkpoint_origin_and_a_new_environment() {
     let source = identity("source", 9);
     let target = identity("clone", 1);
     assert!(target.validate_restore_from(&source).is_err());
@@ -44,16 +44,16 @@ fn clone_requires_exact_checkpoint_origin_and_a_new_capsule() {
 }
 
 #[test]
-fn explicit_origin_allows_same_capsule_only_at_a_new_generation() {
+fn explicit_origin_allows_same_environment_only_at_a_new_generation() {
     use adx_core::runtime::{RuntimeIdentity, RuntimeRestore};
     let source = RuntimeIdentity {
-        capsule_id: "i".into(),
+        environment_id: "i".into(),
         runtime_id: "i-1".into(),
         ownership_generation: 1,
     };
     let mut restore = RuntimeRestore {
         target: RuntimeIdentity {
-            capsule_id: "i".into(),
+            environment_id: "i".into(),
             runtime_id: "i-2-r2".into(),
             ownership_generation: 2,
         },

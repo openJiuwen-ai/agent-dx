@@ -3,15 +3,15 @@
 <title>ADX 当前目录与架构</title><style>
 *{box-sizing:border-box}body{margin:0;background:#f5f8fb;color:#17324d;font:16px/1.8 system-ui,-apple-system,"PingFang SC",sans-serif}main{max-width:1320px;margin:auto;padding:32px}header{padding:16px 0;border-bottom:1px solid #ccdae5}a{color:#146a91;text-underline-offset:4px}.layout{display:grid;grid-template-columns:200px minmax(0,1fr);gap:36px}nav{position:sticky;top:24px;align-self:start;padding-top:32px}nav a{display:block;margin-bottom:14px;font-size:14px}article{min-width:0}h1{font-size:34px;line-height:1.35}h2{margin-top:42px;scroll-margin-top:24px}p{overflow-wrap:anywhere}img{width:100%;height:auto}pre{overflow:auto;background:#17324d;color:#e6eef5;padding:24px;border-radius:12px;font-size:13px;line-height:1.8}code{font-family:ui-monospace,monospace;font-size:.88em}p code,td code{background:#e4edf4;padding:2px 4px;border-radius:4px}.table{overflow:auto}table{border-collapse:collapse;width:100%;background:white;font-size:14px}th,td{text-align:left;padding:12px;border:1px solid #d5e0e8;min-width:140px}th{background:#e6f0f6}button{font:inherit;color:#17324d;background:white;border:1px solid #afc4d2;border-radius:8px;padding:6px 14px;cursor:pointer}header{display:flex;gap:24px;align-items:center;flex-wrap:wrap}footer{margin-top:36px;padding:20px 0;border-top:1px solid #ccdae5;font-size:13px}@media(max-width:760px){main{padding:18px}.layout{display:block}nav{position:static;display:flex;gap:14px;flex-wrap:wrap}h1{font-size:28px}}@media print{nav,header button{display:none}.layout{display:block}main{padding:0}pre{white-space:pre-wrap}body{background:white}h2{break-after:avoid}}
 </style></head><body><main><header><strong>AGENT DX / ARCHITECTURE</strong><a href="repository-layout.md">Markdown 源文档</a><a href="../testing/control-plane-implementation.md">当前实现</a><button onclick="window.print()">打印 / 保存 PDF</button></header>
-<div class="layout"><nav aria-label="文档目录"><a href="#section-1">分层与当前接入状态</a><a href="#section-2">实际目录</a><a href="#section-3">控制面内部模块</a><a href="#section-4">Node Manager / Node Proxy 进程组合</a><a href="#section-5">API Server / Edge 进程组合</a><a href="#section-6">协议与持久化</a><a href="#section-7">构建、部署和验收</a><a href="#section-8">可观测</a></nav><article><h1>Agent DX 当前目录与组件边界</h1>
-<p>核对日期：2026-09-22。此页描述当前源码布局；首次导入记录保留在 <a href="../migration/2026-09-14-import.md">迁移报告</a>。<a href="repository-layout.html">HTML 阅读版</a> 从本文件生成，架构图为仓库内 SVG。</p>
+<div class="layout"><nav aria-label="文档目录"><a href="#section-1">分层与当前接入状态</a><a href="#section-2">实际目录</a><a href="#section-3">控制面内部模块</a><a href="#section-4">adxlet / Relay 进程组合</a><a href="#section-5">API Server / Ingress 进程组合</a><a href="#section-6">协议与持久化</a><a href="#section-7">构建、部署和验收</a><a href="#section-8">可观测</a></nav><article><h1>Agent DX 当前目录与组件边界</h1>
+<p>核对日期：2026-09-23。此页描述当前源码布局；首次导入记录保留在 <a href="../migration/2026-09-14-import.md">迁移报告</a>。<a href="repository-layout.html">HTML 阅读版</a> 从本文件生成，架构图为仓库内 SVG。</p>
 <p><img alt="当前组件与调用方向" src="../../assets/architecture/current-architecture.svg"></p>
 <h2 id="section-1">分层与当前接入状态</h2>
-<div class="table"><table><tr><th>层</th><th>职责</th><th>当前状态</th></tr><tr><td>Agent 产品 <code>agent/</code></td><td>Template、Environment、无状态 Activator、inline 适配</td><td>Rust 产品 API 集成在 Gateway Edge；Environment 与稳定逻辑 Sandbox 1:1 绑定，首次访问按需激活</td></tr><tr><td>公开能力 <code>platform/sdk/sandbox</code></td><td>Sandbox 生命周期、命令/文件、快照、放置约束</td><td>Python SDK 已实现；客户端保留字段与新服务端支持范围不同</td></tr><tr><td>执行平台 <code>platform/</code></td><td>通用 Capsule、调度、持久化、节点生命周期、RRT</td><td>Master、Node Manager、本地优先创建及 EROFS/OCI 运行环境已接入；当前基础 K8s 八组已通过</td></tr><tr><td>共享接入 <code>gateway/</code></td><td>Sandbox API Server、Edge、Node Proxy、反向代理与转发</td><td>API Server 默认内嵌 Edge；Node Manager 默认内嵌 Node Proxy；Agent API 装配于 Edge，业务规则归 Agent 层</td></tr></table></div>
-<p>Agent API 在 Gateway Edge 内处理产品请求，默认通过 LocalControl 调用同进程无状态 Activator，也可配置 remote 访问独立 Activator。Activator 持久化 Template/Environment；内嵌模式直接调用本地 Sandbox trait，独立模式调用 Gateway Sandbox HTTP 接口，均由 Sandbox 适配器访问平台。Agent 不直接操作平台 Redis/SQLite 或 sandboxd。inline create/get/kill 直接调用 Sandbox 适配器。用户 Harness 的 HTTP/WS/SSH 经共享数据面转发，业务协议由用户定义。</p>
-<p>API Server 仍保留原有九条 <code>/api/agent</code> 兼容转发路由，由 <code>agent_address</code> 指向外部 Agent 服务；这是平台侧既有入口，不属于当前 Edge Agent API／Activator 链路，本轮保持不变。</p>
-<p>平台内部以 **Capsule + Runtime** 建模。Capsule 是跨节点、暂停恢复和故障接管期间保持不变的逻辑身份，持有期望规格、生命周期、归属和 checkpoint 引用；Runtime 是 sandboxd 在某个节点创建的一次物理执行，具有独立 <code>runtime_id</code>，重启、恢复或接管时可以替换。二者通过 <code>RuntimeIdentity { capsule_id, runtime_id, ownership_generation }</code> 绑定，Node Manager 只允许当前 generation 的 Runtime 对外提供服务。</p>
-<p>公开 Sandbox HTTP/SDK 契约继续使用 <code>/api/instances</code>、<code>instanceId</code> 和 <code>instance_id</code>；API Server 在边界将这些兼容字段映射为 <code>capsule_id</code>。内部 Rust 类型、gRPC、Redis key、SQLite journal 和 Metrics 统一使用 Capsule/Runtime，不保留第二套 Instance 类型别名。</p>
+<div class="table"><table><tr><th>层</th><th>职责</th><th>当前状态</th></tr><tr><td>Agent 产品 <code>agent/</code></td><td>Template、Environment、无状态 Activator、inline 适配</td><td>Rust 产品 API 集成在 Gateway Ingress；Environment 与稳定逻辑 Sandbox 1:1 绑定，首次访问按需激活</td></tr><tr><td>公开能力 <code>platform/sdk/sandbox</code></td><td>Sandbox 生命周期、命令/文件、快照、放置约束</td><td>Python SDK 已实现；客户端保留字段与新服务端支持范围不同</td></tr><tr><td>执行平台 <code>platform/</code></td><td>通用 Environment、调度、持久化、节点生命周期、Execd</td><td>Coordinator、adxlet、本地优先创建及 EROFS/OCI 运行环境已接入；沿用已有实现；本次验证见 <a href="../testing/environment-naming.md">命名调整记录</a></td></tr><tr><td>共享接入 <code>gateway/</code></td><td>Sandbox API Server、Ingress、Relay、反向代理与转发</td><td>API Server 默认内嵌 Ingress；adxlet 默认内嵌 Relay；Agent API 装配于 Ingress，业务规则归 Agent 层</td></tr></table></div>
+<p>Agent API 在 Gateway Ingress 内处理产品请求，默认通过 LocalControl 调用同进程无状态 Activator，也可配置 remote 访问独立 Activator。Activator 持久化 Template/Environment；内嵌模式直接调用本地 Sandbox trait，独立模式调用 Gateway Sandbox HTTP 接口，均由 Sandbox 适配器访问平台。Agent 不直接操作平台 Redis/SQLite 或 sandboxd。inline create/get/kill 直接调用 Sandbox 适配器。用户 Harness 的 HTTP/WS/SSH 经共享数据面转发，业务协议由用户定义。</p>
+<p>API Server 仍保留原有九条 <code>/api/agent</code> 兼容转发路由，由 <code>agent_address</code> 指向外部 Agent 服务；这是平台侧既有入口，不属于当前 Ingress Agent API／Activator 链路，本轮保持不变。</p>
+<p>平台内部以 **Environment + Runtime** 建模。Environment 是跨节点、暂停恢复和故障接管期间保持不变的逻辑身份，持有期望规格、生命周期、归属和 checkpoint 引用；Runtime 是 sandboxd 在某个节点创建的一次物理执行，具有独立 <code>runtime_id</code>，重启、恢复或接管时可以替换。二者通过 <code>RuntimeIdentity { environment_id, runtime_id, ownership_generation }</code> 绑定，adxlet 只允许当前 generation 的 Runtime 对外提供服务。</p>
+<p>公开 Sandbox HTTP/SDK 契约继续使用 <code>/api/instances</code>、<code>instanceId</code> 和 <code>instance_id</code>；API Server 在边界将这些兼容字段映射为 <code>environment_id</code>。内部 Rust 类型、gRPC、持久化字段与 Metrics 统一使用 Environment/Runtime。详见 <a href="naming.md">命名与抽象</a>。</p>
 <h2 id="section-2">实际目录</h2>
 <pre><code>agent-dx/
 ├── Cargo.toml / Cargo.lock / rust-toolchain.toml
@@ -29,41 +29,41 @@
 │   ├── process/                   # 进程配置、退出信号和宿主资源准备
 │   └── transport/                 # TLS、请求上下文和 deadline 传播
 ├── platform/
-│   ├── master/                    # Rust Master；Global + 内嵌 Shard
-│   ├── node-manager/              # Rust 本机生命周期和后端/存储适配
+│   ├── coordinator/              # Rust Coordinator；Global + 内嵌 Shard
+│   ├── adxlet/                   # Rust 本机生命周期和后端/存储适配
 │   ├── crates/
-│   │   ├── core/                  # Capsule、资源、恢复点、调度纯类型
+│   │   ├── core/                  # Environment、资源、恢复点、调度纯类型
 │   │   ├── protocol/              # gRPC 生成、转换与组件身份
 │   │   ├── discovery/             # Redis 服务地址发现
 │   │   └── scheduling/            # Filter / Score、快照与查询索引
 │   ├── api/
-│   │   ├── proto/capsule.proto   # Master / Node 管理服务
-│   │   ├── proto/capsule_types.proto # Capsule / 资源 / 调度类型
+│   │   ├── proto/environment.proto   # Coordinator / Node 管理服务
+│   │   ├── proto/environment_types.proto # Environment / 资源 / 调度类型
 │   │   ├── proto/snapshot.proto   # 快照目录与引用
 │   │   ├── proto/credentials.proto # 认证和密钥管理
 │   │   ├── proto/routes.proto     # 路由发布
-│   │   ├── proto/node.proto       # Node Proxy 绑定与活动
+│   │   ├── proto/node.proto       # Relay 绑定与活动
 │   │   └── http/runtime-control.md
-│   ├── runtime/rrt/               # HTTP 运行时与 checkpoint 协作
+│   ├── runtime/execd/            # HTTP 运行时与 checkpoint 协作
 │   ├── deployment/                # 统一 adxctl / supervisor；管理控制面和数据面进程
 │   └── sdk/sandbox/python/        # adx-sandbox / adx_sandbox
 ├── gateway/
-│   ├── api-server/                # Rust HTTP、认证缓存和 Capsule RPC
+│   ├── apiserver/                # Rust HTTP、认证缓存和 Environment RPC
 │   │   ├── src/                   # contract、http、clients、operations
 │   │   ├── tests/                 # HTTP 契约与校验
 │   │   └── docs/                  # Sandbox HTTP 支持范围
 │   └── src/
 │       ├── common/                # Gateway 内部监听、路由与数据面协议
-│       ├── edge/                  # Agent/Sandbox 适配、路由订阅、认证、连接池、反向代理
-│       ├── node/                  # NodeProxyService、绑定、活动、转发
-│       └── bin/                   # Edge、Node Proxy、forwarder
+│       ├── ingress/               # Agent/Sandbox 适配、路由订阅、认证、连接池、反向代理
+│       ├── node/                  # RelayService、绑定、活动、转发
+│       └── bin/                   # Ingress、Relay、forwarder
 ├── tools/
 │   └── admin/                     # adxadmin Python wheel；经公开 HTTPS 管理租户 API Key
 ├── third_party/sandboxd/          # 锁定后端协议、来源与许可证
 ├── build/
 │   ├── ci/ / images/              # 本地检查、镜像配方
 │   ├── config/examples/           # 统一部署 YAML 和按角色示例
-│   ├── release/                   # 二进制、RRT、SDK、Redis 汇总与验证
+│   ├── release/                   # 二进制、Execd、SDK、Redis 汇总与验证
 │   ├── e2e/                       # 本地 Docker 公共 SDK 验收
 │   │   ├── kubernetes/            # 基础 K8s 部署、证据与清理
 │   │   ├── firecracker/           # 本地 FC；可选 K8s FC 驱动
@@ -75,22 +75,22 @@
 └── docs/                          # 架构、部署、契约、验收和迁移记录</code></pre>
 <p>此树只展示主要已存在路径。语言构建输出与测试证据放在 <code>out/</code> 或显式外部缓存，<code>build/</code> 保存源码脚本。运行时数据库、日志与 checkpoint 使用部署配置的数据目录。</p>
 <h2 id="section-3">控制面内部模块</h2>
-<div class="table"><table><tr><th>组件</th><th>现有主要模块</th><th>职责</th></tr><tr><td>Master</td><td><code>lib.rs</code>、<code>shard.rs</code>、<code>queue.rs</code>、<code>journal.rs</code></td><td>Global 轮转、Shard 内存队列、预留、增量调度视图；租户间轮转，租户内优先级/FIFO</td></tr><tr><td>Master</td><td><code>storage.rs</code>、<code>storage/</code>、<code>rpc.rs</code>、<code>rpc/</code></td><td>Redis 条件提交、原子归属、目录、节点失效、快照克隆、共享恢复协调；不执行节点普通生命周期</td></tr><tr><td>Master</td><td><code>auth.rs</code>、<code>routes.rs</code>、<code>metrics.rs</code></td><td>API Key 摘要、路由发布、集群指标</td></tr><tr><td>Node Manager</td><td><code>controller.rs</code>、<code>controller/{lifecycle,monitor,snapshots}.rs</code></td><td>每 Capsule 串行任务、暂停/恢复/删除、空闲回收与重启</td></tr><tr><td>Node Manager</td><td><code>sandboxd.rs</code>、<code>runtime_control.rs</code>、<code>readiness.rs</code></td><td>RuntimeDriver 适配；本地 EROFS／OCI image 环境；RRT HTTP 协作与就绪</td></tr><tr><td>Node Manager</td><td><code>checkpoint.rs</code>、<code>checkpoint/</code></td><td>可扩展 CheckpointStore、本地/S3、缓存引用和远端孤儿回收</td></tr><tr><td>Node Manager</td><td><code>journal.rs</code>、<code>reconciliation.rs</code></td><td>SQLite 故障降级日志与 Master 权威目录对账</td></tr><tr><td>Node Manager</td><td><code>resources.rs</code>、<code>routes.rs</code>、<code>activity.rs</code>、<code>proxy.rs</code></td><td>容量源/准入、绑定同步、活动采集、代理进程组合</td></tr><tr><td>Rust API Server</td><td><code>contract.rs</code>、<code>http.rs</code>、<code>clients.rs</code>、<code>operations.rs</code></td><td>HTTP 兼容字段到 Capsule RPC；认证、版本化 Capsule 目录订阅、入口节点轮转、直达节点、快照目录</td></tr></table></div>
-<p><code>core</code> 不依赖 Redis/SQLite/tonic/sandboxd 客户端；<code>protocol</code> 不承载调度、状态机、证书文件读取或 TLS 构建。稳定错误语义、可观测、服务进程支持和传输机制位于根级 <code>crates/</code>。Node Manager 可依赖 Gateway 的 node 库，Gateway 不依赖 Master/Node Manager 业务实现。Shard 当前与 Master 同进程。</p>
-<p>默认创建经 Global 轮转进入 Shard Filter/Score。启用 <code>create_mode=local_first</code> 时，API Server 轮转可用入口节点，Node Manager 用同一 Admission 暂留资源，Master 原子确认唯一归属并同步中心账本；本地不满足时使用同一 Capsule ID 回退 Shard。Master 向 API Server 首次全量、后续增量发布 Capsule 目录，包括用于幂等生命周期结果的终态记录；已有 Capsule 操作命中本地目录后直达 Node Manager。</p>
-<h2 id="section-4">Node Manager / Node Proxy 进程组合</h2>
-<div class="table"><table><tr><th>模式</th><th>配置与装配</th><th>共同契约</th></tr><tr><td>embedded（默认）</td><td>Node Manager 省略 <code>proxy_mode</code> 或配置 <code>proxy_mode=embedded</code>，托管同一 NodeProxyService；Proxy 环境项放到 node-manager 服务</td><td>仍走同一 UDS 和完整绑定同步，不绕过版本/身份检查</td></tr><tr><td>standalone</td><td>两个 supervisor 服务；Node Manager 显式配置 <code>proxy_mode=standalone</code></td><td>Node Manager 经受保护 UDS 控制 NodeProxyService</td></tr></table></div>
-<p>Proxy 首次启动关闭 Capsule 准入，Node Manager 完成权威对账与全量绑定同步后开放。数据请求直接进入 Node Proxy，不经过 Capsule 生命周期队列。共进程共享进程和 Tokio 执行器，故障域与分进程不同。详见 <a href="../testing/node-proxy-process-modes.md">模式配置与验证</a>。</p>
-<h2 id="section-5">API Server / Edge 进程组合</h2>
-<div class="table"><table><tr><th>模式</th><th>配置与装配</th><th>共同契约</th></tr><tr><td>embedded（默认）</td><td>部署文件保留 <code>api-server</code> 与 <code>edge</code> 两个逻辑角色；API Server 省略 <code>edge_mode</code> 或配置 <code>edge_mode=embedded</code>，渲染为一个 <code>adx-api-server</code> 进程</td><td>API 与 Edge 保持各自监听端口、TLS 身份、路由订阅和认证缓存；Edge 控制请求仍转发到 API 回环监听</td></tr><tr><td>standalone</td><td>API Server 显式配置 <code>edge_mode=standalone</code>，Supervisor 启动 <code>adx-api-server</code> 与 <code>adx-edge-frontend</code></td><td>两种模式复用同一 <code>EdgeFrontendService</code>，不复制路由或转发实现</td></tr></table></div>
-<p>默认共进程时，Edge 监听绑定失败会阻止 API Server 就绪，运行期监听异常会使整个进程退出并由 Supervisor 重启。详见 <a href="../testing/api-edge-process-modes.md">模式配置与验证</a>。</p>
+<div class="table"><table><tr><th>组件</th><th>现有主要模块</th><th>职责</th></tr><tr><td>Coordinator</td><td><code>lib.rs</code>、<code>shard.rs</code>、<code>queue.rs</code>、<code>journal.rs</code></td><td>Global 轮转、Shard 内存队列、预留、增量调度视图；租户间轮转，租户内优先级/FIFO</td></tr><tr><td>Coordinator</td><td><code>storage.rs</code>、<code>storage/</code>、<code>rpc.rs</code>、<code>rpc/</code></td><td>Redis 条件提交、原子归属、目录、节点失效、快照克隆、共享恢复协调；不执行节点普通生命周期</td></tr><tr><td>Coordinator</td><td><code>auth.rs</code>、<code>routes.rs</code>、<code>metrics.rs</code></td><td>API Key 摘要、路由发布、集群指标</td></tr><tr><td>adxlet</td><td><code>controller.rs</code>、<code>controller/{lifecycle,monitor,snapshots}.rs</code></td><td>每 Environment 串行任务、暂停/恢复/删除、空闲回收与重启</td></tr><tr><td>adxlet</td><td><code>sandboxd.rs</code>、<code>runtime_control.rs</code>、<code>readiness.rs</code></td><td>RuntimeDriver 适配；本地 EROFS／OCI image 环境；Execd HTTP 协作与就绪</td></tr><tr><td>adxlet</td><td><code>checkpoint.rs</code>、<code>checkpoint/</code></td><td>可扩展 CheckpointStore、本地/S3、缓存引用和远端孤儿回收</td></tr><tr><td>adxlet</td><td><code>journal.rs</code>、<code>reconciliation.rs</code></td><td>SQLite 故障降级日志与 Coordinator 权威目录对账</td></tr><tr><td>adxlet</td><td><code>resources.rs</code>、<code>routes.rs</code>、<code>activity.rs</code>、<code>proxy.rs</code></td><td>容量源/准入、绑定同步、活动采集、代理进程组合</td></tr><tr><td>Rust API Server</td><td><code>contract.rs</code>、<code>http.rs</code>、<code>clients.rs</code>、<code>operations.rs</code></td><td>HTTP 兼容字段到 Environment RPC；认证、版本化 Environment 目录订阅、入口节点轮转、直达节点、快照目录</td></tr></table></div>
+<p><code>core</code> 不依赖 Redis/SQLite/tonic/sandboxd 客户端；<code>protocol</code> 不承载调度、状态机、证书文件读取或 TLS 构建。稳定错误语义、可观测、服务进程支持和传输机制位于根级 <code>crates/</code>。adxlet 可依赖 Gateway 的 node 库，Gateway 不依赖 Coordinator/adxlet 业务实现。Shard 当前与 Coordinator 同进程。</p>
+<p>默认创建经 Global 轮转进入 Shard Filter/Score。启用 <code>create_mode=local_first</code> 时，API Server 轮转可用入口节点，adxlet 用同一 Admission 暂留资源，Coordinator 原子确认唯一归属并同步中心账本；本地不满足时使用同一 Environment ID 回退 Shard。Coordinator 向 API Server 首次全量、后续增量发布 Environment 目录，包括用于幂等生命周期结果的终态记录；已有 Environment 操作命中本地目录后直达 adxlet。</p>
+<h2 id="section-4">adxlet / Relay 进程组合</h2>
+<div class="table"><table><tr><th>模式</th><th>配置与装配</th><th>共同契约</th></tr><tr><td>embedded（默认）</td><td>adxlet 省略 <code>proxy_mode</code> 或配置 <code>proxy_mode=embedded</code>，托管同一 RelayService；Proxy 环境项放到 adxlet 服务</td><td>仍走同一 UDS 和完整绑定同步，不绕过版本/身份检查</td></tr><tr><td>standalone</td><td>两个 supervisor 服务；adxlet 显式配置 <code>proxy_mode=standalone</code></td><td>adxlet 经受保护 UDS 控制 RelayService</td></tr></table></div>
+<p>Proxy 首次启动关闭 Environment 准入，adxlet 完成权威对账与全量绑定同步后开放。数据请求直接进入 Relay，不经过 Environment 生命周期队列。共进程共享进程和 Tokio 执行器，故障域与分进程不同。详见 <a href="../testing/relay-process-modes.md">模式配置与验证</a>。</p>
+<h2 id="section-5">API Server / Ingress 进程组合</h2>
+<div class="table"><table><tr><th>模式</th><th>配置与装配</th><th>共同契约</th></tr><tr><td>embedded（默认）</td><td>部署文件保留 <code>apiserver</code> 与 <code>ingress</code> 两个逻辑角色；API Server 省略 <code>ingress_mode</code> 或配置 <code>ingress_mode=embedded</code>，渲染为一个 <code>adx-apiserver</code> 进程</td><td>API 与 Ingress 保持各自监听端口、TLS 身份、路由订阅和认证缓存；Ingress 控制请求仍转发到 API 回环监听</td></tr><tr><td>standalone</td><td>API Server 显式配置 <code>ingress_mode=standalone</code>，Supervisor 启动 <code>adx-apiserver</code> 与 <code>adx-ingress</code></td><td>两种模式复用同一 <code>IngressService</code>，不复制路由或转发实现</td></tr></table></div>
+<p>默认共进程时，Ingress 监听绑定失败会阻止 API Server 就绪，运行期监听异常会使整个进程退出并由 Supervisor 重启。详见 <a href="../testing/api-ingress-process-modes.md">模式配置与验证</a>。</p>
 <h2 id="section-6">协议与持久化</h2>
-<p>公开 HTTP 路由和请求响应由 Rust HTTP handler 实现，SDK 调用公开契约；<code>platform/api/openapi/sandbox.yaml</code> 与 <code>data-plane.yaml</code> 记录当前公开接口，但尚未用于生成服务端代码。参考 <a href="../../gateway/api-server/docs/sandbox-lifecycle-api.md">HTTP 文档</a>。</p>
-<p>内部 gRPC 按 Capsule、快照、凭证、路由及节点本地控制拆分，详见 <a href="../../platform/api/proto/README.md">协议目录</a>。RRT 用户操作及运行时协作使用 HTTP，类型在 <code>core/src/runtime.rs</code>。</p>
-<p>正常结果经 Master 写 Redis；SQLite 只在提交不可用时保存待补交结果。Journaled 不发布 Edge 路由。节点重启而 Master 不可用时等待对账，不从不完整日志重建目录。快照制品走独立的本地/S3 存储抽象。Redis 使用 <code>capsule:&lt;capsule_id&gt;</code>，SQLite journal 使用 <code>capsule</code> 字段；此次内部 schema 不兼容旧控制状态，升级时需要清空 Redis/SQLite 控制状态并由新版本重新登记。详见 <a href="../testing/node-lifecycle.md">节点契约</a>。</p>
+<p>公开 HTTP 路由和请求响应由 Rust HTTP handler 实现，SDK 调用公开契约；<code>platform/api/openapi/sandbox.yaml</code> 与 <code>data-plane.yaml</code> 记录当前公开接口，但尚未用于生成服务端代码。参考 <a href="../../gateway/apiserver/docs/sandbox-lifecycle-api.md">HTTP 文档</a>。</p>
+<p>内部 gRPC 按 Environment、快照、凭证、路由及节点本地控制拆分，详见 <a href="../../platform/api/proto/README.md">协议目录</a>。Execd 用户操作及运行时协作使用 HTTP，类型在 <code>core/src/runtime.rs</code>。</p>
+<p>正常结果经 Coordinator 写 Redis；SQLite 只在提交不可用时保存待补交结果。Journaled 不发布 Ingress 路由。节点重启而 Coordinator 不可用时等待对账，不从不完整日志重建目录。快照制品走独立的本地/S3 存储抽象。Redis 使用 <code>environment:&lt;environment_id&gt;</code>，SQLite journal 使用 <code>environment</code> 字段；此次内部 schema 不兼容旧控制状态，升级时需要清空 Redis/SQLite 控制状态并由新版本重新登记。详见 <a href="../testing/node-lifecycle.md">节点契约</a>。</p>
 <h2 id="section-7">构建、部署和验收</h2>
-<p>Rust 共用根 Cargo workspace，Python 工具独立打包；外部 sandboxd 按其锁定版本构建。<code>adxctl</code> 是平台运维 CLI，支持 validate/render/run/start/status/stop；<code>adxadmin</code> 是只访问公开 HTTPS API 的平台无关 Python 管理 CLI。统一平台包带控制面、Gateway、<code>adxctl</code>、静态 RRT、Sandbox SDK、EROFS 运行环境和锁定 Redis；<code>adxadmin</code> 以独立 wheel 发布。平台可选择外部 Redis，sandboxd 始终由部署环境托管。运行环境也可使用不可变 OCI image；自定义用户镜像从同一环境只读挂载 <code>/__adx</code>。</p>
+<p>Rust 共用根 Cargo workspace，Python 工具独立打包；外部 sandboxd 按其锁定版本构建。<code>adxctl</code> 是平台运维 CLI，支持 validate/render/run/start/status/stop；<code>adxadmin</code> 是只访问公开 HTTPS API 的平台无关 Python 管理 CLI。统一平台包带控制面、Gateway、<code>adxctl</code>、静态 Execd、Sandbox SDK、EROFS 运行环境和锁定 Redis；<code>adxadmin</code> 以独立 wheel 发布。平台可选择外部 Redis，sandboxd 始终由部署环境托管。运行环境也可使用不可变 OCI image；自定义用户镜像从同一环境只读挂载 <code>/__adx</code>。</p>
 <p>普通进程与 Pod 内都使用相同组件和 supervisor。Buildkite 先构建，再发布不可变镜像，最后独立执行 K8s 八组用例及清理。<a href="../testing/2026-09-18-runtime-environment-k8s.md">Buildkite #30</a> 已验证 Rust API Server、本地优先创建及 OCI default/runtime-only/custom 三种环境路径；两个 Pod 同宿主。本地 FC 与基础 K8s 分开统计，实际未完成项和后置项见 <a href="../testing/control-plane-roadmap.md">路线图</a>。</p>
 <h2 id="section-8">可观测</h2>
-<p>Master/Node Manager 的 Capsule 数、资源预留与使用量，Edge/Node Proxy 的连接、流量与请求指标由各自 <code>/metrics</code> 导出。Trace 由组件 OpenTelemetry SDK 经 OTLP/HTTP 发往外部 Collector；结构化 stdout 由 supervisor 滚动压缩，Collector filelog 采集。Pod 可部署 Collector sidecar，进程环境独立托管。统一实时 Trace 队列丢弃指标已后置，不能与已有导出失败计数混同。</p></article></div>
+<p>Coordinator/adxlet 的 Environment 数、资源预留与使用量，Ingress/Relay 的连接、流量与请求指标由各自 <code>/metrics</code> 导出。Trace 由组件 OpenTelemetry SDK 经 OTLP/HTTP 发往外部 Collector；结构化 stdout 由 supervisor 滚动压缩，Collector filelog 采集。Pod 可部署 Collector sidecar，进程环境独立托管。统一实时 Trace 队列丢弃指标已后置，不能与已有导出失败计数混同。</p></article></div>
 <footer>由 build/docs/render_architecture.py 从 repository-layout.md 生成；更新 Markdown 后重新生成。验收结果与源码能力分别记录。</footer></main></body></html>

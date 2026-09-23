@@ -1,5 +1,5 @@
 //! Generated transport contracts and validated conversions, without services.
-mod environment;
+mod runtime_profile;
 mod snapshots;
 pub mod control {
     tonic::include_proto!("adx.control.v1");
@@ -20,14 +20,14 @@ impl From<adx_core::Resources> for control::Resources {
     }
 }
 
-impl TryFrom<control::CapsuleSpec> for adx_core::CapsuleSpec {
+impl TryFrom<control::EnvironmentSpec> for adx_core::EnvironmentSpec {
     type Error = Error;
-    fn try_from(value: control::CapsuleSpec) -> Result<Self> {
+    fn try_from(value: control::EnvironmentSpec) -> Result<Self> {
         let resources = value
             .resources
             .ok_or_else(|| Error::Invalid("resources are required".into()))?;
         let spec = Self {
-            environment: value.environment.map(TryInto::try_into).transpose()?,
+            runtime_profile: value.runtime_profile.map(TryInto::try_into).transpose()?,
             snapshot_id: value.snapshot_id,
             lifecycle: value.lifecycle.map(Into::into).unwrap_or_default(),
             env: value.env.into_iter().collect(),
@@ -57,10 +57,10 @@ impl TryFrom<control::CapsuleSpec> for adx_core::CapsuleSpec {
     }
 }
 
-impl From<adx_core::CapsuleSpec> for control::CapsuleSpec {
-    fn from(value: adx_core::CapsuleSpec) -> Self {
+impl From<adx_core::EnvironmentSpec> for control::EnvironmentSpec {
+    fn from(value: adx_core::EnvironmentSpec) -> Self {
         Self {
-            environment: value.environment.map(Into::into),
+            runtime_profile: value.runtime_profile.map(Into::into),
             snapshot_id: value.snapshot_id,
             lifecycle: Some(value.lifecycle.into()),
             env: value.env.into_iter().collect(),
@@ -79,12 +79,12 @@ impl From<adx_core::CapsuleSpec> for control::CapsuleSpec {
 impl TryFrom<control::Assignment> for adx_core::Assignment {
     type Error = Error;
     fn try_from(value: control::Assignment) -> Result<Self> {
-        if value.capsule_id.trim().is_empty()
+        if value.environment_id.trim().is_empty()
             || value.node_id.trim().is_empty()
             || value.generation == 0
         {
             return Err(Error::Invalid(
-                "assignment requires capsule, node and generation".into(),
+                "assignment requires environment, node and generation".into(),
             ));
         }
         let devices: Vec<adx_core::scheduling::DeviceAllocation> = value
@@ -95,7 +95,7 @@ impl TryFrom<control::Assignment> for adx_core::Assignment {
         adx_core::scheduling::validate_allocations(&devices)?;
         Ok(Self {
             devices,
-            capsule_id: value.capsule_id,
+            environment_id: value.environment_id,
             node_id: value.node_id,
             shard_id: value.shard_id as usize,
             generation: value.generation,
@@ -109,7 +109,7 @@ impl TryFrom<adx_core::Assignment> for control::Assignment {
         adx_core::scheduling::validate_allocations(&value.devices)?;
         Ok(Self {
             devices: value.devices.into_iter().map(Into::into).collect(),
-            capsule_id: value.capsule_id,
+            environment_id: value.environment_id,
             node_id: value.node_id,
             shard_id: u32::try_from(value.shard_id)
                 .map_err(|_| Error::Invalid("shard id overflow".into()))?,
@@ -125,14 +125,14 @@ mod tests {
 
     #[test]
     fn missing_resources_and_zero_generation_are_rejected() {
-        assert!(adx_core::CapsuleSpec::try_from(control::CapsuleSpec::default()).is_err());
+        assert!(adx_core::EnvironmentSpec::try_from(control::EnvironmentSpec::default()).is_err());
         assert!(adx_core::Assignment::try_from(control::Assignment::default()).is_err());
     }
 
     #[test]
-    fn capsule_spec_round_trip_preserves_units_and_priority() {
-        let value = adx_core::CapsuleSpec {
-            environment: None,
+    fn environment_spec_round_trip_preserves_units_and_priority() {
+        let value = adx_core::EnvironmentSpec {
+            runtime_profile: None,
             snapshot_id: None,
             lifecycle: Default::default(),
             env: Default::default(),
@@ -149,23 +149,23 @@ mod tests {
             priority: -10,
             sandbox: Default::default(),
         };
-        let bytes = control::CapsuleSpec::from(value.clone()).encode_to_vec();
-        let decoded = control::CapsuleSpec::decode(bytes.as_slice()).unwrap();
-        assert_eq!(adx_core::CapsuleSpec::try_from(decoded).unwrap(), value);
+        let bytes = control::EnvironmentSpec::from(value.clone()).encode_to_vec();
+        let decoded = control::EnvironmentSpec::decode(bytes.as_slice()).unwrap();
+        assert_eq!(adx_core::EnvironmentSpec::try_from(decoded).unwrap(), value);
     }
 }
 
 /// Node-local binding and activity contracts.
-pub mod node_proxy {
+pub mod relay {
     tonic::include_proto!("adx.node.v1");
 }
 
 pub mod auth;
 
-impl TryFrom<control::CapsuleRecord> for adx_core::CapsuleRecord {
+impl TryFrom<control::EnvironmentRecord> for adx_core::EnvironmentRecord {
     type Error = Error;
-    fn try_from(v: control::CapsuleRecord) -> Result<Self> {
-        let spec: adx_core::CapsuleSpec = v
+    fn try_from(v: control::EnvironmentRecord) -> Result<Self> {
+        let spec: adx_core::EnvironmentSpec = v
             .spec
             .ok_or_else(|| Error::Invalid("spec required".into()))?
             .try_into()?;
@@ -173,24 +173,24 @@ impl TryFrom<control::CapsuleRecord> for adx_core::CapsuleRecord {
             .assignment
             .ok_or_else(|| Error::Invalid("assignment required".into()))?
             .try_into()?;
-        if spec.id != assignment.capsule_id {
+        if spec.id != assignment.environment_id {
             return Err(Error::Conflict);
         }
         adx_core::scheduling::validate_device_assignment(
             &spec.scheduling.devices,
             &assignment.devices,
         )?;
-        let state = match control::CapsuleState::try_from(v.state) {
-            Ok(control::CapsuleState::Pending) => adx_core::CapsuleState::Pending,
-            Ok(control::CapsuleState::Starting) => adx_core::CapsuleState::Starting,
-            Ok(control::CapsuleState::Running) => adx_core::CapsuleState::Running,
-            Ok(control::CapsuleState::Deleting) => adx_core::CapsuleState::Deleting,
-            Ok(control::CapsuleState::Deleted) => adx_core::CapsuleState::Deleted,
-            Ok(control::CapsuleState::Pausing) => adx_core::CapsuleState::Pausing,
-            Ok(control::CapsuleState::Paused) => adx_core::CapsuleState::Paused,
-            Ok(control::CapsuleState::Resuming) => adx_core::CapsuleState::Resuming,
-            Ok(control::CapsuleState::Failed) => adx_core::CapsuleState::Failed,
-            _ => return Err(Error::Invalid("unknown capsule state".into())),
+        let state = match control::EnvironmentState::try_from(v.state) {
+            Ok(control::EnvironmentState::Pending) => adx_core::EnvironmentState::Pending,
+            Ok(control::EnvironmentState::Starting) => adx_core::EnvironmentState::Starting,
+            Ok(control::EnvironmentState::Running) => adx_core::EnvironmentState::Running,
+            Ok(control::EnvironmentState::Deleting) => adx_core::EnvironmentState::Deleting,
+            Ok(control::EnvironmentState::Deleted) => adx_core::EnvironmentState::Deleted,
+            Ok(control::EnvironmentState::Pausing) => adx_core::EnvironmentState::Pausing,
+            Ok(control::EnvironmentState::Paused) => adx_core::EnvironmentState::Paused,
+            Ok(control::EnvironmentState::Resuming) => adx_core::EnvironmentState::Resuming,
+            Ok(control::EnvironmentState::Failed) => adx_core::EnvironmentState::Failed,
+            _ => return Err(Error::Invalid("unknown environment state".into())),
         };
         let runtime = v
             .runtime
@@ -222,19 +222,19 @@ impl TryFrom<control::CapsuleRecord> for adx_core::CapsuleRecord {
         })
     }
 }
-impl TryFrom<adx_core::CapsuleRecord> for control::CapsuleRecord {
+impl TryFrom<adx_core::EnvironmentRecord> for control::EnvironmentRecord {
     type Error = Error;
-    fn try_from(v: adx_core::CapsuleRecord) -> Result<Self> {
+    fn try_from(v: adx_core::EnvironmentRecord) -> Result<Self> {
         let state = match v.state {
-            adx_core::CapsuleState::Pending => control::CapsuleState::Pending,
-            adx_core::CapsuleState::Starting => control::CapsuleState::Starting,
-            adx_core::CapsuleState::Running => control::CapsuleState::Running,
-            adx_core::CapsuleState::Deleting => control::CapsuleState::Deleting,
-            adx_core::CapsuleState::Deleted => control::CapsuleState::Deleted,
-            adx_core::CapsuleState::Pausing => control::CapsuleState::Pausing,
-            adx_core::CapsuleState::Paused => control::CapsuleState::Paused,
-            adx_core::CapsuleState::Resuming => control::CapsuleState::Resuming,
-            adx_core::CapsuleState::Failed => control::CapsuleState::Failed,
+            adx_core::EnvironmentState::Pending => control::EnvironmentState::Pending,
+            adx_core::EnvironmentState::Starting => control::EnvironmentState::Starting,
+            adx_core::EnvironmentState::Running => control::EnvironmentState::Running,
+            adx_core::EnvironmentState::Deleting => control::EnvironmentState::Deleting,
+            adx_core::EnvironmentState::Deleted => control::EnvironmentState::Deleted,
+            adx_core::EnvironmentState::Pausing => control::EnvironmentState::Pausing,
+            adx_core::EnvironmentState::Paused => control::EnvironmentState::Paused,
+            adx_core::EnvironmentState::Resuming => control::EnvironmentState::Resuming,
+            adx_core::EnvironmentState::Failed => control::EnvironmentState::Failed,
         };
         Ok(Self {
             spec: Some(v.spec.into()),
@@ -257,7 +257,7 @@ pub fn status(error: adx_core::Error) -> tonic::Status {
     match error {
         Error::Invalid(message) => tonic::Status::invalid_argument(message),
         Error::Conflict => tonic::Status::failed_precondition("identity or version conflict"),
-        Error::NotFound => tonic::Status::not_found("capsule or node not found"),
+        Error::NotFound => tonic::Status::not_found("environment or node not found"),
         Error::NoCapacity => tonic::Status::resource_exhausted("capacity unavailable"),
         Error::Unavailable(message) => tonic::Status::unavailable(message),
     }
@@ -379,7 +379,7 @@ impl From<adx_core::lifecycle::LifecyclePolicy> for control::LifecyclePolicy {
 impl From<adx_core::runtime::RuntimeIdentity> for control::RuntimeIdentity {
     fn from(v: adx_core::runtime::RuntimeIdentity) -> Self {
         Self {
-            capsule_id: v.capsule_id,
+            environment_id: v.environment_id,
             runtime_id: v.runtime_id,
             ownership_generation: v.ownership_generation,
         }
@@ -389,7 +389,7 @@ impl TryFrom<control::RuntimeIdentity> for adx_core::runtime::RuntimeIdentity {
     type Error = Error;
     fn try_from(v: control::RuntimeIdentity) -> Result<Self> {
         let identity = Self {
-            capsule_id: v.capsule_id,
+            environment_id: v.environment_id,
             runtime_id: v.runtime_id,
             ownership_generation: v.ownership_generation,
         };

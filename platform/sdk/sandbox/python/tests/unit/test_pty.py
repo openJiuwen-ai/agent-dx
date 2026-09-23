@@ -100,13 +100,13 @@ class PtyTests(unittest.TestCase):
             "os.environ",
             {
                 "ADX_SERVER_ADDRESS": "frontend:8888",
-                "ADX_GATEWAY_ADDRESS": "edge:8080",
+                "ADX_GATEWAY_ADDRESS": "ingress:8080",
                 "ADX_TLS": "0",
                 "ADX_GATEWAY_TLS": "1",
             },
             clear=True,
         ):
-            self.assertEqual(_pty_server(), "edge:8080")
+            self.assertEqual(_pty_server(), "ingress:8080")
             self.assertTrue(_use_tls())
 
 if __name__ == "__main__":

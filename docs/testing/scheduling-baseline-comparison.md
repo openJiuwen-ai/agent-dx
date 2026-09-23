@@ -39,7 +39,7 @@
 
 旧 `no_aggregate` 关闭聚合，`relaxed` 使用其候选聚合路径、relaxed 参数 32。ADX `cache=0` 关闭候选复用，`cache=32` 最多保存 32 个计算签名。两者的参数含义和扫描策略不同；它们分别是各自实现的关闭/开启模式。
 
-ADX 测试驱动通过 `std::sync::mpsc` 向单线程发送命令，调用真实 `Master::submit/schedule_round/register/retry/release`。旧测试通过原有 Actor/ResourceView 路径运行。**ADD 语义存在实现差异**：旧侧应用实例资源上报并完成镜像账本协调；ADX 已在分配时登记占用，ADD 只确认该分配，DELETE 调用真实释放。闭环结果衡量各自职责下的实现成本，不是同一套资源上报协议的替换实验。
+ADX 测试驱动通过 `std::sync::mpsc` 向单线程发送命令，调用真实 `Coordinator::submit/schedule_round/register/retry/release`。旧测试通过原有 Actor/ResourceView 路径运行。**ADD 语义存在实现差异**：旧侧应用实例资源上报并完成镜像账本协调；ADX 已在分配时登记占用，ADD 只确认该分配，DELETE 调用真实释放。闭环结果衡量各自职责下的实现成本，不是同一套资源上报协议的替换实验。
 
 更新用例同样以中性变化触发发布：旧侧修改不参与请求的 noise 资源，ADX 修改 `report_seq` 标签。两者都不改变本轮请求的可行节点，但不能把结果当作相同资源序列化或相同更新算法的成本。
 
@@ -96,12 +96,12 @@ ADX 更新平均耗时按本轮 QPS 的倒数计算；旧侧直接输出总耗�
 
 ## 实现与验证
 
-- [比较程序](../../platform/master/examples/compare.rs)：负载、邮箱、报告确认和正确性断言。
+- [比较程序](../../platform/coordinator/examples/compare.rs)：负载、邮箱、报告确认和正确性断言。
 - [比较驱动](../../build/ci/compare_schedulers.py)：交替执行、预热、原始日志、指标提取和中位数汇总。
-- [Master 重试入口](../../platform/master/src/lib.rs) 与 [Shard 排队／候选选择](../../platform/master/src/shard.rs)：拒绝后释放精确 assignment 并重新排队。调用方必须确认节点未执行或已清理；不是迁移运行中实例的接口。
-- [重试回归测试](../../platform/master/tests/retry.rs)：过期 generation、重复拒绝、资源释放、候选缓存复用、请求之间的排除列表隔离。
+- [Coordinator 重试入口](../../platform/coordinator/src/lib.rs) 与 [Shard 排队／候选选择](../../platform/coordinator/src/shard.rs)：拒绝后释放精确 assignment 并重新排队。调用方必须确认节点未执行或已清理；不是迁移运行中实例的接口。
+- [重试回归测试](../../platform/coordinator/tests/retry.rs)：过期 generation、重复拒绝、资源释放、候选缓存复用、请求之间的排除列表隔离。
 
-本轮 `adx-master`、`adx-scheduling`、`adx-core` 定向测试 **51 通过、0 失败、1 个性能用例忽略**；三个 crate 的 `--all-targets -D warnings` Clippy 通过。Linux Release 构建通过，最终比较矩阵全部通过。没有重跑整个 workspace 或完整平台 E2E。
+本轮 `adx-coordinator`、`adx-scheduling`、`adx-core` 定向测试 **51 通过、0 失败、1 个性能用例忽略**；三个 crate 的 `--all-targets -D warnings` Clippy 通过。Linux Release 构建通过，最终比较矩阵全部通过。没有重跑整个 workspace 或完整平台 E2E。
 
 ## 复现与证据
 
@@ -134,4 +134,4 @@ python3 build/ci/compare_schedulers.py \
 
 纯 Filter/Score 放置内核没有旧侧同口径配对测量，不能从 mailbox 延迟中扣算出来。本轮也没有比较 GPU/NPU、亲和混合负载、多 Shard 并行、公平性压力或长时间运行。拓扑分布不纳入本轮目标。
 
-完整平台的 Master RPC、Redis 写入、Node Manager 准入、真实 sandboxd 启动和资源报告仍需在服务链路接通后，通过 Buildkite 创建—执行—删除验收；当前驱动不能替代该流水线。
+完整平台的 Coordinator RPC、Redis 写入、adxlet 准入、真实 sandboxd 启动和资源报告仍需在服务链路接通后，通过 Buildkite 创建—执行—删除验收；当前驱动不能替代该流水线。

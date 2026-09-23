@@ -9,9 +9,9 @@ ADDRESSES = {'node1':'10.240.0.11','node2':'10.240.0.12'}
 def configure(root):
     root = Path(root)
     original = json.loads((root/'deployment.yaml').read_text())
-    template = next(s for s in original['services'] if s['role']=='node-manager')
+    template = next(s for s in original['services'] if s['role']=='adxlet')
     if template['config'].get('proxy_mode') != 'embedded':
-        raise ValueError('transfer fixture requires embedded Node Proxy')
+        raise ValueError('transfer fixture requires embedded Relay')
     for name, address in ADDRESSES.items():
         folder = root/name
         folder.mkdir()
@@ -31,9 +31,9 @@ def configure(root):
         c['checkpoint_storage']['endpoint'] = f'http://{HOST}:19090'
         c['checkpoint_gc']['min_age_seconds'] = 3600
         env = service['env']
-        env['ADX_DATA_PLANE_NODE_PROXY_TLS_CERT'] = c['tls']['certificate']
-        env['ADX_DATA_PLANE_NODE_PROXY_TLS_KEY'] = c['tls']['private_key']
-        env['ADX_DATA_PLANE_ALLOWED_EDGE_CIDRS'] = f'{HOST}/32'
+        env['ADX_DATA_PLANE_RELAY_TLS_CERT'] = c['tls']['certificate']
+        env['ADX_DATA_PLANE_RELAY_TLS_KEY'] = c['tls']['private_key']
+        env['ADX_DATA_PLANE_ALLOWED_INGRESS_CIDRS'] = f'{HOST}/32'
         env['ADX_DATA_PLANE_ALLOWED_TARGET_CIDRS'] = f'10.231.{16 if name=="node1" else 32}.0/20'
         d = {**original, 'state_dir':str(folder/'state'), 'services':[service],
              'redis_url':original['redis_url'].replace('127.0.0.1',HOST)}
@@ -47,8 +47,8 @@ def configure(root):
         text=text.replace('cgroup_root_name = "/adx-fc-',f'cgroup_root_name = "/{name}-adx-fc-')
         (backend/'config.toml').write_text(text)
     control = copy.deepcopy(original)
-    control['services'] = [s for s in control['services'] if s['role'] not in ('node-manager','node-proxy')]
-    master = next(s for s in control['services'] if s['role']=='master')['config']
-    master.update(advertised_address=f'https://{HOST}:17000', heartbeat_timeout_seconds=12)
+    control['services'] = [s for s in control['services'] if s['role'] not in ('adxlet','relay')]
+    coordinator = next(s for s in control['services'] if s['role']=='coordinator')['config']
+    coordinator.update(advertised_address=f'https://{HOST}:17000', heartbeat_timeout_seconds=12)
     (root/'deployment.yaml').write_text(json.dumps(control,indent=2))
     path=root/'registry.yaml';path.write_text(path.read_text().replace('127.0.0.1:5000','0.0.0.0:5000'))

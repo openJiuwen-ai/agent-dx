@@ -53,7 +53,7 @@ def _fetch_forwarded(sandbox, ca_path, port=PORT, authenticated=True):
             with urllib.request.urlopen(request, context=context, timeout=5) as response:
                 return response.read().decode()
         except urllib.error.HTTPError as error:
-            # Authentication failures are a terminal response from a ready Edge.
+            # Authentication failures are a terminal response from a ready Ingress.
             # Retrying them hides the policy result and turns the negative check
             # into a misleading readiness timeout.
             if error.code in (401, 403):
@@ -107,7 +107,7 @@ def run(connection, image, output, ca_path):
         assert {'node1', 'node2'}.issubset(by_id), by_id
         for node_id in ('node1', 'node2'):
             node = by_id[node_id]
-            assert node.status == 1, node
+            assert node.status == 0, node  # Public resources contract: 0 is accepting allocations.
             assert all(node.capacity.get(name, 0) > 0 for name in ('CPU', 'Memory', 'Disk'))
             assert all(
                 0 <= node.allocatable.get(name, -1) <= node.capacity[name]

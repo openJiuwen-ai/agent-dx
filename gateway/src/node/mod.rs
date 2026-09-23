@@ -11,9 +11,9 @@ pub use activity::{ActivityBatch, ActivitySnapshot, ActivityTracker};
 pub use health::serve_health;
 #[cfg(feature = "activity-client")]
 pub use route_control::{bind_route_control, serve_route_control};
-pub use server::{serve_connection, NodeProxy};
+pub use server::{serve_connection, Relay};
 
 #[cfg(feature = "activity-client")]
 pub mod service;
 #[cfg(feature = "activity-client")]
-pub use service::NodeProxyService;
+pub use service::RelayService;

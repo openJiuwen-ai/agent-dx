@@ -1,9 +1,9 @@
 use adx_process::resource::raise_nofile_soft_limit_from_env;
 use bytes::Bytes;
-use data_plane_gateway::client::{connect_edge, ConnectClientConfig, EdgeTlsConfig};
+use data_plane_gateway::client::{connect_ingress, ConnectClientConfig, IngressTlsConfig};
 use data_plane_gateway::common::protocol::ConnectTarget;
-use data_plane_gateway::edge::connector::H2ConnectStream;
-use data_plane_gateway::edge::{AccessKind, DataPlaneL4Connector, H2PoolConfig};
+use data_plane_gateway::ingress::connector::H2ConnectStream;
+use data_plane_gateway::ingress::{AccessKind, DataPlaneL4Connector, H2PoolConfig};
 use http::{header, Method, Request, Uri};
 use http_body_util::{BodyExt, Empty, Full};
 use hyper::service::service_fn;
@@ -39,11 +39,11 @@ enum Path {
         node: String,
         target: ConnectTarget,
     },
-    Edge {
-        edge: String,
+    Ingress {
+        ingress: String,
         instance: String,
         target_port: u16,
-        tls: Option<EdgeTlsConfig>,
+        tls: Option<IngressTlsConfig>,
     },
 }
 
@@ -108,7 +108,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             run_benchmark(Path::Direct { target }, options).await?;
         }
         Some("bench-node") => {
-            let node = required(&mut args, "Node Proxy address")?;
+            let node = required(&mut args, "Relay address")?;
             let target_ip = required(&mut args, "target IP")?.parse()?;
             let target_port = required(&mut args, "target port")?.parse()?;
             let options = BenchOptions::parse(&mut args)?;
@@ -128,14 +128,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
             .await?;
         }
-        Some("bench-edge") => {
-            let edge = required(&mut args, "Edge Frontend address")?;
+        Some("bench-ingress") => {
+            let ingress = required(&mut args, "Ingress address")?;
             let instance = required(&mut args, "instance ID")?;
             let target_port = required(&mut args, "target port")?.parse()?;
             let options = BenchOptions::parse(&mut args)?;
             run_benchmark(
-                Path::Edge {
-                    edge,
+                Path::Ingress {
+                    ingress,
                     instance,
                     target_port,
                     tls: None,
@@ -144,16 +144,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
             .await?;
         }
-        Some("bench-edge-tls") => {
-            let edge = required(&mut args, "Edge Frontend address")?;
+        Some("bench-ingress-tls") => {
+            let ingress = required(&mut args, "Ingress address")?;
             let instance = required(&mut args, "instance ID")?;
             let target_port = required(&mut args, "target port")?.parse()?;
             let ca_path = required(&mut args, "CA certificate path")?;
             let server_name = required(&mut args, "TLS server name")?;
             let options = BenchOptions::parse(&mut args)?;
             run_benchmark(
-                Path::Edge {
-                    edge,
+                Path::Ingress {
+                    ingress,
                     instance,
                     target_port,
                     tls: Some(load_tls(&ca_path, server_name)?),
@@ -163,7 +163,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await?;
         }
         Some("bench-http-tls") => {
-            let edge = required(&mut args, "Edge address")?;
+            let ingress = required(&mut args, "Ingress address")?;
             let ca_path = required(&mut args, "CA certificate path")?;
             let server_name = required(&mut args, "TLS server name")?;
             let token = required(&mut args, "bearer token")?;
@@ -174,7 +174,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let warmup = required(&mut args, "warmup requests per connection")?.parse()?;
             ensure_done(&mut args)?;
             run_http_benchmark(
-                edge,
+                ingress,
                 load_tls(&ca_path, server_name)?,
                 token,
                 path_template,
@@ -272,8 +272,8 @@ async fn run_http_server(bind: &str) -> io::Result<()> {
 
 #[allow(clippy::too_many_arguments)]
 async fn run_http_benchmark(
-    edge: String,
-    tls: EdgeTlsConfig,
+    ingress: String,
+    tls: IngressTlsConfig,
     token: String,
     path_template: String,
     targets: usize,
@@ -304,7 +304,7 @@ async fn run_http_benchmark(
     let base = requests / concurrency;
     let remainder = requests % concurrency;
     for worker_index in 0..concurrency {
-        let edge = edge.clone();
+        let ingress = ingress.clone();
         let tls = tls.clone();
         let token = token.clone();
         let path_template = path_template.clone();
@@ -313,7 +313,7 @@ async fn run_http_benchmark(
         let count = base + usize::from(worker_index < remainder);
         tasks.spawn(async move {
             let warmup_permit = warmup_admission.acquire_owned().await.unwrap();
-            let (mut sender, connection) = open_http_connection(&edge, &tls).await?;
+            let (mut sender, connection) = open_http_connection(&ingress, &tls).await?;
             tokio::spawn(async move {
                 if let Err(error) = connection.await {
                     tracing::debug!(%error, "HTTP load-generator connection closed");
@@ -362,7 +362,7 @@ async fn run_http_benchmark(
     println!(
         "{}",
         serde_json::json!({
-            "path": "edge-http-tls",
+            "path": "ingress-http-tls",
             "requests": samples.len(),
             "concurrency": concurrency,
             "connection_count": concurrency,
@@ -391,10 +391,10 @@ type HttpConnection = hyper::client::conn::http1::Connection<
 >;
 
 async fn open_http_connection(
-    edge: &str,
-    tls: &EdgeTlsConfig,
+    ingress: &str,
+    tls: &IngressTlsConfig,
 ) -> io::Result<(HttpSender, HttpConnection)> {
-    let tcp = TcpStream::connect(edge).await?;
+    let tcp = TcpStream::connect(ingress).await?;
     tcp.set_nodelay(true)?;
     let server_name = ServerName::try_from(tls.server_name.clone())
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
@@ -616,14 +616,14 @@ async fn open(path: &Path) -> io::Result<BoxIo> {
                 _cancel: cancel,
             }))
         }
-        Path::Edge {
-            edge,
+        Path::Ingress {
+            ingress,
             instance,
             target_port,
             tls,
         } => Ok(Box::new(
-            connect_edge(ConnectClientConfig {
-                edge_address: edge.clone(),
+            connect_ingress(ConnectClientConfig {
+                ingress_address: ingress.clone(),
                 instance_id: instance.clone(),
                 target_port: *target_port,
                 access_kind: AccessKind::PortForwarding,
@@ -647,8 +647,8 @@ fn path_name(path: &Path) -> &'static str {
     match path {
         Path::Direct { .. } => "direct-tcp",
         Path::Node { .. } => "node-h2",
-        Path::Edge { tls: None, .. } => "edge-node",
-        Path::Edge { tls: Some(_), .. } => "edge-tls-node",
+        Path::Ingress { tls: None, .. } => "ingress-node",
+        Path::Ingress { tls: Some(_), .. } => "ingress-tls-node",
     }
 }
 
@@ -675,10 +675,10 @@ fn ensure_done(args: &mut impl Iterator<Item = String>) -> Result<(), Box<dyn st
 }
 
 fn usage() -> &'static str {
-    "usage:\n  relay_perf server <bind>\n  relay_perf http-server <bind>\n  relay_perf bench-direct <target> <upload|download> <bytes> <iterations> <concurrency>\n  relay_perf bench-node <node> <target-ip> <target-port> <upload|download> <bytes> <iterations> <concurrency>\n  relay_perf bench-edge <edge> <instance> <target-port> <upload|download> <bytes> <iterations> <concurrency>\n  relay_perf bench-edge-tls <edge> <instance> <target-port> <ca-path> <server-name> <upload|download> <bytes> <iterations> <concurrency>\n  relay_perf bench-http-tls <edge> <ca-path> <server-name> <token> <path-template-with-{target}> <targets> <requests> <concurrency> <warmup>"
+    "usage:\n  relay_perf server <bind>\n  relay_perf http-server <bind>\n  relay_perf bench-direct <target> <upload|download> <bytes> <iterations> <concurrency>\n  relay_perf bench-node <node> <target-ip> <target-port> <upload|download> <bytes> <iterations> <concurrency>\n  relay_perf bench-ingress <ingress> <instance> <target-port> <upload|download> <bytes> <iterations> <concurrency>\n  relay_perf bench-ingress-tls <ingress> <instance> <target-port> <ca-path> <server-name> <upload|download> <bytes> <iterations> <concurrency>\n  relay_perf bench-http-tls <ingress> <ca-path> <server-name> <token> <path-template-with-{target}> <targets> <requests> <concurrency> <warmup>"
 }
 
-fn load_tls(ca_path: &str, server_name: String) -> io::Result<EdgeTlsConfig> {
+fn load_tls(ca_path: &str, server_name: String) -> io::Result<IngressTlsConfig> {
     let mut roots = rustls::RootCertStore::empty();
     let mut reader = BufReader::new(File::open(ca_path)?);
     let certificates = rustls_pemfile::certs(&mut reader)
@@ -695,7 +695,7 @@ fn load_tls(ca_path: &str, server_name: String) -> io::Result<EdgeTlsConfig> {
             .add(certificate)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     }
-    Ok(EdgeTlsConfig {
+    Ok(IngressTlsConfig {
         client: Arc::new(
             rustls::ClientConfig::builder()
                 .with_root_certificates(roots)

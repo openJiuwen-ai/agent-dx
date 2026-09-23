@@ -15,10 +15,10 @@ class IndependentPipelineTests(unittest.TestCase):
         full = (ROOT / '.buildkite/pipeline-full.yml').read_text()
 
         self.assertIn('key: platform-build', package)
-        for key in ('build-platform', 'build-gateway', 'build-rrt', 'source-gate'):
+        for key in ('build-platform', 'build-gateway', 'build-execd', 'source-gate'):
             self.assertIn(f'key: {key}', package)
         self.assertIn(
-            'depends_on: [build-platform, build-gateway, build-rrt, source-gate]',
+            'depends_on: [build-platform, build-gateway, build-execd, source-gate]',
             package,
         )
         self.assertNotIn('key: platform-e2e', package)

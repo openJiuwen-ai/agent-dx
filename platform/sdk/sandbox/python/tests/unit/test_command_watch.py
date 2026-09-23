@@ -8,7 +8,7 @@ from adx_sandbox.types import ConnectionConfig
 def _manager() -> _CommandWaitManager:
     return _CommandWaitManager(
         ConnectionConfig(
-            server_address="edge.example:443",
+            server_address="ingress.example:443",
             token="token",
             use_tls=True,
         )

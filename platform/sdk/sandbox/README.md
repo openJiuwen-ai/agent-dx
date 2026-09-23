@@ -51,7 +51,7 @@ All language SDKs should keep the same user-facing concepts:
 
 All language SDKs should target the current frontend HTTP/WS contract instead
 of exposing runtime-internal ports to users. The detailed platform reference is
-maintained in the [Go HTTP reference](../../../gateway/api-server/docs/sandbox-lifecycle-api.md). That reference distinguishes retained client options from the new server's supported capabilities.
+maintained in the [Go HTTP reference](../../../gateway/apiserver/docs/sandbox-lifecycle-api.md). That reference distinguishes retained client options from the new server's supported capabilities.
 
 ### Environment and auth
 
@@ -85,8 +85,8 @@ Base path: `/api/sandbox/v1/sandboxes` on `ADX_SERVER_ADDRESS`.
 `tunnel`, and the
 optional per-sandbox `dataPlane` security policy. Python exposes the latter as
 `DataPlaneSecurityPolicy`; the client model accepts `tls` and `tls-token`, but per-sandbox policy is rejected by the new control backend. Direct remains TLS with authentication. Mounts, extra_config, public ports and independent limits in the retained schema are also not supported by this server.
-Frontend owns internal RRT port environment injection (`RRT_HTTP_PORT`,
-`RRT_TUNNEL_WS_PORT`, `RRT_TUNNEL_HTTP_PORT`); SDK callers should request
+Frontend owns internal EXECD port environment injection (`EXECD_HTTP_PORT`,
+`EXECD_TUNNEL_WS_PORT`, `EXECD_TUNNEL_HTTP_PORT`); SDK callers should request
 features declaratively instead of setting those ports.
 
 Create and schedule timeouts use seconds. The create timeout covers scheduling,
@@ -100,17 +100,17 @@ covered.
 
 ### Direct data plane
 
-Commands/files use Edge `/direct` → Node Proxy → RRT. Edge authenticates and strips public credentials before node forwarding. The SDK retains a legacy `/invoke` fallback, but the new Go backend rejects that transport; it is not a second working data path.
+Commands/files use Ingress `/direct` → Relay → EXECD. Ingress authenticates and strips public credentials before node forwarding. The SDK retains a legacy `/invoke` fallback, but the new Go backend rejects that transport; it is not a second working data path.
 
 | Method | Path | Body / query | Use |
 | --- | --- | --- | --- |
 | `POST` | `/direct/{safeID}/invoke` | `{"action": string, "args": object}` | low-latency command/fs/shell action invoke |
-| `GET` | `/direct/{safeID}/healthz` | none | RRT health probe |
+| `GET` | `/direct/{safeID}/healthz` | none | EXECD health probe |
 | `POST` | `/direct/{safeID}/upload?path=<abs>&type=file|tar` | raw bytes or tar stream | binary upload / directory upload |
 | `GET` | `/direct/{safeID}/download?path=<abs>&type=file|tar` | none | binary download / directory download |
 
 `safeID` is the router-safe form of `sandboxID`. The old explicit-port form
-`/direct/{safeID}/{rrtPort}/...` is a frontend compatibility alias only; new
+`/direct/{safeID}/{execdPort}/...` is a frontend compatibility alias only; new
 SDKs should not expose it.
 
 ### Tunnel and user ports

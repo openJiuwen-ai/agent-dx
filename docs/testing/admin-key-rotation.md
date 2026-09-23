@@ -1,6 +1,6 @@
 # Administrator key rotation
 
-The deployment generates and persists the initial key. Master reads `key_file`
+The deployment generates and persists the initial key. Coordinator reads `key_file`
 at startup and atomically reconciles the complete configured administrator set
 in Redis. Removed administrator keys receive persistent revocation tombstones.
 Tenant keys are preserved. Duplicate, expired, revoked, empty or conflicting
@@ -15,17 +15,17 @@ for retrieval, restart and staged-transition behavior.
 
 - RED: the new storage tests failed to compile before `reconcile_administrators`
   existed. Logs: `out/ci/admin-key/red.log`.
-- Master normal suite: 53 passed, 50 ignored.
+- Coordinator normal suite: 53 passed, 50 ignored.
 - Linux real Redis storage suite: 26 passed, including replacement, idempotent
   retries, tenant preservation, revoked-key reuse rejection,
-  fencing of old Master sessions, invalid sets and multiple administrators.
-- Linux RPC suite: 20 passed. The Master process test starts with a key, restarts
+  fencing of old Coordinator sessions, invalid sets and multiple administrators.
+- Linux RPC suite: 20 passed. The Coordinator process test starts with a key, restarts
   with the same key, replaces the file and restarts again; the new key succeeds
   and the old key returns `Unauthenticated`.
 - Optional API Server subprocess branches of the RPC suite were not run
-  (`ADX_TEST_API_SERVER` unset); full public-path evidence is recorded below.
+  (`ADX_TEST_APISERVER` unset); full public-path evidence is recorded below.
 - Workspace Clippy with all targets/features and `-D warnings`: passed.
-- Logs: `out/ci/admin-key/master.log`, `linux.log`, `clippy.log`.
+- Logs: `out/ci/admin-key/coordinator.log`, `linux.log`, `clippy.log`.
 
 These tests use isolated Redis instances. Process restarts retain Redis state;
 this round does not establish Redis crash/AOF recovery behavior for rotation.

@@ -1,4 +1,4 @@
-"""Real SDK -> Edge -> local-first API -> Node -> sandboxd/RRT acceptance."""
+"""Real SDK -> Ingress -> local-first API -> Node -> sandboxd/EXECD acceptance."""
 from concurrent.futures import ThreadPoolExecutor
 import json
 import gzip
@@ -16,7 +16,7 @@ def run(connection, image, output):
         return Sandbox(name=name, image=image, runtime='runc', cpu=500, memory=512,
                        idle_timeout=0, connection=connection, create_timeout=150, **extra)
     def record(instance):
-        return json.loads(catalog()['capsule:' + instance.id])
+        return json.loads(catalog()['environment:' + instance.id])
     try:
         first = create(prefix + '-a'); instances.append(first)
         second = create(prefix + '-b'); instances.append(second)
@@ -49,12 +49,12 @@ def run(connection, image, output):
         end=time.monotonic()+10
         while True:
             claimed=set()
-            for path in Path('/tmp/adx-e2e/state/logs').glob('master*.log*'):
+            for path in Path('/tmp/adx-e2e/state/logs').glob('coordinator*.log*'):
                 if path.name.endswith('.tmp'):continue
                 try:
                     data=gzip.decompress(path.read_bytes()) if path.suffix=='.gz' else path.read_bytes()
                     for line in data.decode(errors='replace').splitlines():
-                        if 'local_capsule_claim' in line:
+                        if 'local_environment_claim' in line:
                             claimed.update(identity for identity in expected if identity in line)
                 except (FileNotFoundError,EOFError,OSError):continue
             if claimed==expected:break
@@ -63,7 +63,7 @@ def run(connection, image, output):
         output.write_text(json.dumps({'status':'passed','local_claims':sorted(claimed),'entry_owners':owners,
             'unique_instances':3,'duplicate_converged':True,'conflict_rejected':True,
             'commands_passed':3,'assignments':[r['assignment'] for r in records]},indent=2))
-        print('PASS local-first: two-node rotation, same-ID convergence, conflict and three real RRT commands',flush=True)
+        print('PASS local-first: two-node rotation, same-ID convergence, conflict and three real EXECD commands',flush=True)
     finally:
         removed=set()
         for instance in instances:

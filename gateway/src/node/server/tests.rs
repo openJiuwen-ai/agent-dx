@@ -15,7 +15,7 @@ struct Link {
     client_task: JoinHandle<Result<(), h2::Error>>,
     bridge: JoinHandle<()>,
     drop_to_node: Arc<AtomicBool>,
-    drop_to_edge: Arc<AtomicBool>,
+    drop_to_ingress: Arc<AtomicBool>,
 }
 
 impl Drop for Link {
@@ -43,13 +43,13 @@ where
     let _ = writer.shutdown().await;
 }
 
-async fn link(node: NodeProxy) -> Link {
+async fn link(node: Relay) -> Link {
     let (client_io, left) = tokio::io::duplex(65536);
     let (right, node_io) = tokio::io::duplex(65536);
     let drop_to_node = Arc::new(AtomicBool::new(false));
-    let drop_to_edge = Arc::new(AtomicBool::new(false));
+    let drop_to_ingress = Arc::new(AtomicBool::new(false));
     let incoming = drop_to_node.clone();
-    let outgoing = drop_to_edge.clone();
+    let outgoing = drop_to_ingress.clone();
     let bridge = tokio::spawn(async move {
         let (lr, lw) = tokio::io::split(left);
         let (rr, rw) = tokio::io::split(right);
@@ -73,7 +73,7 @@ async fn link(node: NodeProxy) -> Link {
         client_task,
         bridge,
         drop_to_node,
-        drop_to_edge,
+        drop_to_ingress,
     }
 }
 
@@ -97,13 +97,13 @@ async fn open_stream(
     (send, response.into_body())
 }
 
-fn gateway() -> NodeProxy {
-    NodeProxy::new(GatewayPolicy::for_local_mock(vec!["127.0.0.0/8"
+fn gateway() -> Relay {
+    Relay::new(GatewayPolicy::for_local_mock(vec!["127.0.0.0/8"
         .parse()
         .unwrap()]))
 }
 
-async fn wait_active(node: &NodeProxy, expected: usize) {
+async fn wait_active(node: &Relay, expected: usize) {
     timeout(TEST_TIMEOUT, async {
         while node.active_streams() != expected {
             tokio::task::yield_now().await;
@@ -125,7 +125,7 @@ async fn blackhole(input: bool, output: bool) {
     let (mut healthy_backend, _) = listener.accept().await.unwrap();
     assert_eq!(node.active_streams(), 2);
     dead.drop_to_node.store(input, Ordering::SeqCst);
-    dead.drop_to_edge.store(output, Ordering::SeqCst);
+    dead.drop_to_ingress.store(output, Ordering::SeqCst);
     let result = timeout(TEST_TIMEOUT, &mut dead.node_task)
         .await
         .expect("Node did not detect a silent H2 peer")

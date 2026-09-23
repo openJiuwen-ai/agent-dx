@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1440" height="1100" viewBox="0 0 1440 1100" role="img" aria-labelledby="title desc">
   <title id="title">Agent DX architecture</title>
-  <desc id="desc">Gateway Edge hosts the Agent API. Stateless Activators manage Template and Environment metadata in a separate Redis namespace and activate one stable Sandbox through the Gateway Sandbox adapter. Inline lifecycle calls use that adapter directly. User Harness HTTP, WebSocket and SSH traffic follows Edge and Node Proxy. Platform owns Capsule lifecycle and RRT owns the user process. API Server embeds Edge by default; Node Manager embeds Node Proxy. Both pairs support separate processes.</desc>
+  <desc id="desc">Gateway Ingress hosts the Agent API. Stateless Activators manage Template and Environment metadata in a separate Redis namespace and activate one stable Sandbox through the Gateway Sandbox adapter. Inline lifecycle calls use that adapter directly. User Harness HTTP, WebSocket and SSH traffic follows Ingress and Relay. Platform owns Environment lifecycle and Execd owns the user process. API Server embeds Ingress by default; adxlet embeds Relay. Both pairs support separate processes.</desc>
   <defs>
     <marker id="blue" markerWidth="9" markerHeight="9" refX="8" refY="4" orient="auto"><path d="M0 0L8 4L0 8" fill="none" stroke="#2563eb" stroke-width="1.5"/></marker>
     <marker id="green" markerWidth="9" markerHeight="9" refX="8" refY="4" orient="auto"><path d="M0 0L8 4L0 8" fill="none" stroke="#0d806c" stroke-width="1.5"/></marker>
@@ -18,7 +18,7 @@
   </defs>
   <rect width="1440" height="1100" rx="20" fill="#f8fafc"/>
   <text x="48" y="60" class="title">Agent DX</text>
-  <text x="48" y="90" class="body" fill="#52647b">Agent product · shared access · Capsule execution platform</text>
+  <text x="48" y="90" class="body" fill="#52647b">Agent product · shared access · Environment execution platform</text>
   <text x="1392" y="62" text-anchor="end" class="small">SYSTEM ARCHITECTURE</text>
 
   <rect x="48" y="120" width="1344" height="116" rx="16" fill="#f1edff" stroke="#ded6f5"/>
@@ -34,11 +34,11 @@
   <rect x="48" y="284" width="300" height="648" rx="16" fill="#edf8f5" stroke="#c8e7de"/>
   <text x="72" y="312" class="section">SHARED ACCESS / GATEWAY</text>
   <rect x="72" y="350" width="252" height="156" rx="12" fill="white" stroke="#97cfbe"/>
-  <text x="94" y="386" class="name">Edge</text>
+  <text x="94" y="386" class="name">Ingress</text>
   <text x="94" y="415" class="body">HTTPS / API Key</text>
   <text x="94" y="442" class="body">Route &amp; auth caches</text>
   <text x="94" y="470" class="small">Control + data entrypoint</text>
-  <text x="72" y="566" class="small">Master publishes routes.</text>
+  <text x="72" y="566" class="small">Coordinator publishes routes.</text>
   <text x="72" y="591" class="small">Data requests use caches</text>
   <text x="72" y="616" class="small">and local binding checks.</text>
   <text x="72" y="685" class="small">Agent API → Activator</text>
@@ -52,7 +52,7 @@
   <text x="476" y="411" class="body">Sandbox HTTP API · ownership cache</text>
   <text x="476" y="437" class="small">API Key verification / tenant context</text>
   <rect x="454" y="520" width="350" height="205" rx="12" fill="white" stroke="#b5c9f0"/>
-  <text x="476" y="555" class="name">Master</text>
+  <text x="476" y="555" class="name">Coordinator</text>
   <text x="476" y="583" class="body">Global: round-robin across shards</text>
   <rect x="476" y="600" width="306" height="72" rx="8" fill="#eef3ff"/>
   <text x="490" y="627" class="body" font-weight="600">Shard scheduling (in process)</text>
@@ -60,25 +60,25 @@
   <text x="476" y="700" class="small">Node registry · results · route publication</text>
   <rect x="454" y="799" width="350" height="103" rx="12" fill="white" stroke="#b5c9f0"/>
   <text x="476" y="833" class="name">Redis</text>
-  <text x="476" y="860" class="body">Cluster state + Master discovery</text>
+  <text x="476" y="860" class="body">Cluster state + Coordinator discovery</text>
   <text x="476" y="884" class="small">Single instance · persistent disk · AOF</text>
 
   <rect x="930" y="284" width="462" height="648" rx="16" fill="#fff7e9" stroke="#efddbc"/>
   <text x="954" y="312" class="section">WORKER NODE</text>
   <rect x="954" y="350" width="366" height="108" rx="12" fill="white" stroke="#dcc391"/>
-  <text x="976" y="384" class="name">Node Proxy</text>
+  <text x="976" y="384" class="name">Relay</text>
   <text x="976" y="411" class="body">Local binding / generation checks</text>
   <text x="976" y="437" class="small">HTTP/2 CONNECT → target TCP</text>
   <rect x="954" y="536" width="366" height="133" rx="12" fill="white" stroke="#dcc391"/>
-  <text x="976" y="573" class="name">Node Manager</text>
-  <text x="976" y="602" class="body">Capsule lifecycle · local admission</text>
+  <text x="976" y="573" class="name">adxlet</text>
+  <text x="976" y="602" class="body">Environment lifecycle · local admission</text>
   <text x="976" y="629" class="body">RuntimeDriver · reconcile</text>
-  <text x="976" y="652" class="small">StateSink → Master → Redis</text>
+  <text x="976" y="652" class="small">StateSink → Coordinator → Redis</text>
   <rect x="954" y="728" width="366" height="68" rx="12" fill="white" stroke="#dcc391"/>
   <text x="976" y="757" class="name">sandboxd</text>
   <text x="976" y="782" class="small">External service · runtime execution</text>
   <rect x="954" y="835" width="366" height="77" rx="12" fill="#fff0d4" stroke="#dcc391"/>
-  <text x="976" y="864" class="name">Runtime: RRT + Harness</text>
+  <text x="976" y="864" class="name">Runtime: Execd + Harness</text>
   <text x="976" y="891" class="small">Commands / files / ports · HTTP control</text>
 
   <path d="M180 236V350" class="support"/>
@@ -107,7 +107,7 @@
   <text x="1150" y="820" class="small">Starts runtime</text>
   <path d="M1320 427H1346V873H1320" class="data"/>
   <path d="M954 623H922V873H954" class="control"/>
-  <text x="909" y="862" class="label" transform="rotate(-90 909 862)">RRT HTTP control</text>
+  <text x="909" y="862" class="label" transform="rotate(-90 909 862)">Execd HTTP control</text>
   <path d="M629 725V799" class="control"/>
   <text x="641" y="767" class="label">Persist / discover</text>
   <path d="M454 693H394V481H324" class="control"/>
@@ -115,9 +115,9 @@
 
   <rect x="48" y="958" width="1344" height="96" rx="14" fill="#e8edf3"/>
   <text x="72" y="990" class="body" font-weight="600">Deployment: adxctl supervisor + unified release · native processes or processes inside Kubernetes Pods</text>
-  <text x="72" y="1018" class="small">API Server embeds Edge; Node Manager embeds Node Proxy. Both pairs support explicit split-process deployment. sandboxd remains external.</text>
+  <text x="72" y="1018" class="small">API Server embeds Ingress; adxlet embeds Relay. Both pairs support explicit split-process deployment. sandboxd remains external.</text>
   <path d="M72 1075H112" class="control"/><text x="124" y="1080" class="small">Control / state</text>
   <path d="M292 1075H332" class="data"/><text x="344" y="1080" class="small">User data</text>
   <path d="M488 1075H528" class="support"/><text x="540" y="1080" class="small">Product / public access</text>
-  <text x="1392" y="1080" text-anchor="end" class="small">Single Master · embedded Shards</text>
+  <text x="1392" y="1080" text-anchor="end" class="small">Single Coordinator · embedded Shards</text>
 </svg>

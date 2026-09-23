@@ -8,16 +8,16 @@ import subprocess
 from pathlib import Path
 
 
-COMPONENTS = ("platform", "gateway", "rrt")
+COMPONENTS = ("platform", "gateway", "execd")
 REQUIRED_FILES = {
-    "platform": {"adxctl", "adx-master", "adx-node-manager"},
+    "platform": {"adxctl", "adx-coordinator", "adxlet"},
     "gateway": {
-        "adx-api-server",
-        "adx-edge-frontend",
-        "adx-node-proxy",
+        "adx-apiserver",
+        "adx-ingress",
+        "adx-relay",
         "adx-data-plane-forward",
     },
-    "rrt": {"rrt-runtime", "adx-runtime-rootfs.img"},
+    "execd": {"adx-execd", "adx-runtime-rootfs.img"},
 }
 
 

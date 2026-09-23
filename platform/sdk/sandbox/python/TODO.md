@@ -9,7 +9,7 @@ usage, and backend requirements.
 The Python SDK supports:
 
 - Sandbox lifecycle: create, delete/kill, detached flag, pause/resume and reusable snapshot APIs.
-- Node and same-tenant Capsule placement via labels and schedule_affinities.
+- Node and same-tenant Environment placement via labels and schedule_affinities.
 - Filesystem operations: write/read/exists/list/make_dir/stat/rename/remove,
   resumable file upload/download, directory tar upload/download.
 - Command execution: sync commands, long-timeout poll path, background process,
@@ -74,4 +74,4 @@ The native transport must provide:
 Before making it the default, run the full SDK example suite and compare
 correctness, latency, throughput, connection count, and CPU usage against
 HTTPX on standalone and multi-node CCE. Keep these results separate from the
-raw Edge data-plane acceptance benchmark.
+raw Ingress data-plane acceptance benchmark.

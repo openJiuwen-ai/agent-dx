@@ -95,14 +95,14 @@ class AcceptanceGateTests(unittest.TestCase):
         output = json.dumps({
             'status': 'passed',
             'cases': [
-                {'name': 'capsule affinity OR', 'passed': True},
+                {'name': 'environment affinity OR', 'passed': True},
                 {'name': 'reverse instance anti-affinity', 'passed': True},
             ],
         })
         self.assertEqual(
             driver.sdk_subcases_from_output(output),
             [
-                {'id': 'capsule affinity OR', 'status': 'passed', 'seconds': 0.0},
+                {'id': 'environment affinity OR', 'status': 'passed', 'seconds': 0.0},
                 {'id': 'reverse instance anti-affinity', 'status': 'passed', 'seconds': 0.0},
             ],
         )
@@ -166,18 +166,18 @@ class AcceptanceGateTests(unittest.TestCase):
             (p/'bundle.json').write_text(json.dumps({'schema_version':1,'archive_sha256':'0'*64}))
             with self.assertRaises(ValueError):driver.verify_bundle(p)
 
-    def test_complete_bundle_requires_node_rrt_and_entrypoint_archives(self):
+    def test_complete_bundle_requires_node_execd_and_entrypoint_archives(self):
         with tempfile.TemporaryDirectory() as d:
             p=Path(d)
             for name,payload in (
-                ('images.tar',b'node'),('rrt.tar',b'rrt'),
+                ('images.tar',b'node'),('execd.tar',b'execd'),
                 ('entrypoint.tar',b'entrypoint'),
             ):
                 (p/name).write_bytes(payload)
             manifest={
                 'schema_version':1,
                 'archive_sha256':driver.sha(p/'images.tar'),
-                'rrt_archive_sha256':driver.sha(p/'rrt.tar'),
+                'execd_archive_sha256':driver.sha(p/'execd.tar'),
                 'entrypoint_archive_sha256':driver.sha(p/'entrypoint.tar'),
             }
             (p/'bundle.json').write_text(json.dumps(manifest))

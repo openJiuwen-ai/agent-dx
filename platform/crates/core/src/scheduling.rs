@@ -157,13 +157,13 @@ pub struct TopologySpread {
     pub min_domains: u32,
     pub when_unsatisfiable: SpreadMode,
 }
-/// A bounded OR group. Capsule selectors match one same-tenant peer on the
+/// A bounded OR group. Environment selectors match one same-tenant peer on the
 /// candidate node; the scheduler includes pending placements in that snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PlacementTarget {
     Node,
-    Capsule,
+    Environment,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

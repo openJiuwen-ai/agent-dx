@@ -1,6 +1,6 @@
 """Live AKernel-compatibility regression for the adx sandbox layer.
 
-The test requires a deployed Frontend, RRT sandbox runtime, and an image already
+The test requires a deployed Frontend, EXECD sandbox runtime, and an image already
 available to the node-side container runtime. It validates the public SDK
 contract together with the Frontend wire path, including resource discovery,
 required NODE_ID affinity, command/file direct access, real PTY WebSocket

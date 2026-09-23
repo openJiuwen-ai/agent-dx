@@ -1,60 +1,60 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1120 840" role="img" aria-labelledby="title desc">
-<title id="title">ADX 当前组件架构</title><desc id="desc">Gateway Edge 装配 Agent API。无状态 Activator 保存 Template/Environment 到独立 Redis 命名空间，通过 Gateway Sandbox 适配器按稳定身份创建实例。inline 直接调用适配器。用户 Harness 通过共享 HTTP/WS/SSH 转发访问。Platform 管 Capsule 生命周期，RRT 管用户进程。API Server 与 Edge、Node Manager 与 Node Proxy 均支持共进程或拆分部署。</desc>
+<title id="title">ADX 当前组件架构</title><desc id="desc">Gateway Ingress 装配 Agent API。无状态 Activator 保存 Template/Environment 到独立 Redis 命名空间，通过 Gateway Sandbox 适配器按稳定身份创建实例。inline 直接调用适配器。用户 Harness 通过共享 HTTP/WS/SSH 转发访问。Platform 管 Environment 生命周期，Execd 管用户进程。API Server 与 Ingress、adxlet 与 Relay 均支持共进程或拆分部署。</desc>
 <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10Z" fill="#516b83"/></marker></defs>
-<style>text{font-family:system-ui,-apple-system,'PingFang SC',sans-serif;fill:#17324d} .head{font-size:20px;font-weight:650}.body{font-size:15px}.small{font-size:13px;fill:#526b7c}.edge{fill:none;stroke:#516b83;stroke-width:2;marker-end:url(#arrow)}.box{stroke:#b7ccd9;stroke-width:1.5;rx:12}</style>
+<style>text{font-family:system-ui,-apple-system,'PingFang SC',sans-serif;fill:#17324d} .head{font-size:20px;font-weight:650}.body{font-size:15px}.small{font-size:13px;fill:#526b7c}.ingress{fill:none;stroke:#516b83;stroke-width:2;marker-end:url(#arrow)}.box{stroke:#b7ccd9;stroke-width:1.5;rx:12}</style>
 <rect width="1120" height="840" fill="#f5f8fb" rx="18"/>
-<text x="32" y="38" class="head">Agent DX · 当前组件与调用方向</text><text x="32" y="63" class="small">2026-09-22 ｜ Agent 产品状态与 Platform 生命周期分离</text>
+<text x="32" y="38" class="head">Agent DX · 当前组件与调用方向</text><text x="32" y="63" class="small">2026-09-23 ｜ Agent 产品状态与 Platform 生命周期分离</text>
 <rect x="32" y="90" width="490" height="93" class="box" fill="#fff1db"/>
 <text x="50" y="120" class="head">无状态 Activator</text>
 <text x="50" y="146" class="body">Template / Environment · 独立 Redis 产品状态</text>
 <rect x="654" y="90" width="432" height="93" class="box" fill="#e6f4ef"/>
 <text x="672" y="120" class="head">Agent 客户端 / Sandbox SDK</text>
 <text x="672" y="146" class="body">产品管理 / HTTP / WS / SSH / Sandbox API</text>
-<path d="M654 260H578V136H522" class="edge"/>
+<path d="M654 260H578V136H522" class="ingress"/>
 <text x="534" y="194" class="small">Agent API</text>
-<path d="M200 183V207H760V226" class="edge"/>
+<path d="M200 183V207H760V226" class="ingress"/>
 <text x="275" y="201" class="small">调用 Sandbox 适配器</text>
 <rect x="654" y="226" width="432" height="82" class="box" fill="#e8f0fc"/>
-<text x="672" y="256" class="head">Edge · 共享接入</text>
+<text x="672" y="256" class="head">Ingress · 共享接入</text>
 <text x="672" y="282" class="body">Agent API / Sandbox 适配 / 认证 / 共享转发</text>
-<path d="M870 183V222" class="edge"/>
+<path d="M870 183V222" class="ingress"/>
 <text x="885" y="208" class="small">HTTPS</text>
 <rect x="32" y="226" width="426" height="82" class="box" fill="#e8f0fc"/>
 <text x="50" y="256" class="head">Rust API Server</text>
 <text x="50" y="282" class="body">HTTP 适配、身份和归属缓存</text>
-<path d="M654 260H462" class="edge"/>
+<path d="M654 260H462" class="ingress"/>
 <text x="477" y="250" class="small">默认同进程 · 回环 HTTP</text>
 <rect x="32" y="354" width="426" height="108" class="box" fill="#e6f4ef"/>
-<text x="50" y="384" class="head">Master · 单进程</text>
+<text x="50" y="384" class="head">Coordinator · 单进程</text>
 <text x="50" y="410" class="body">Global 轮转 → Shard Filter / Score</text>
 <text x="50" y="433" class="body">目录、认证、节点失效与恢复协调</text>
-<path d="M160 308V350" class="edge"/>
+<path d="M160 308V350" class="ingress"/>
 <text x="172" y="335" class="small">创建 / 查询</text>
 <rect x="540" y="354" width="220" height="108" class="box" fill="#fff"/>
 <text x="558" y="384" class="head">Redis</text>
 <text x="558" y="410" class="body">集群状态 / 发现</text>
 <text x="558" y="433" class="body">快照目录 / API Key</text>
-<path d="M458 391H536" class="edge"/>
+<path d="M458 391H536" class="ingress"/>
 <text x="466" y="382" class="small">条件提交</text>
-<path d="M395 354V329H704V308" class="edge"/>
+<path d="M395 354V329H704V308" class="ingress"/>
 <text x="443" y="322" class="small">已提交路由 gRPC</text>
 <rect x="20" y="512" width="1078" height="154" rx="16" fill="none" stroke="#7895a8" stroke-width="1.5" stroke-dasharray="7 5"/>
-<text x="32" y="529" class="small">Worker：默认一个 Node Manager 进程；可显式拆分 Proxy</text>
+<text x="32" y="529" class="small">Worker：默认一个 adxlet 进程；可显式拆分 Relay</text>
 <rect x="32" y="534" width="426" height="116" class="box" fill="#e6f4ef"/>
-<text x="50" y="564" class="head">Node Manager</text>
-<text x="50" y="590" class="body">Local 准入 / 每 Capsule 串行状态机</text>
+<text x="50" y="564" class="head">adxlet</text>
+<text x="50" y="590" class="body">Local 准入 / 每 Environment 串行状态机</text>
 <text x="50" y="613" class="body">资源采集 / RuntimeDriver / 制品存储</text>
-<path d="M100 462V530" class="edge" marker-start="url(#arrow)"/>
+<path d="M100 462V530" class="ingress" marker-start="url(#arrow)"/>
 <text x="113" y="510" class="small">分配 ↓ / 结果提交 ↑</text>
-<path d="M70 308H16V592H28" class="edge"/>
+<path d="M70 308H16V592H28" class="ingress"/>
 <text x="24" y="490" class="small">已有实例直达</text>
 <rect x="654" y="534" width="432" height="116" class="box" fill="#e8f0fc"/>
-<text x="672" y="564" class="head">Node Proxy</text>
+<text x="672" y="564" class="head">Relay</text>
 <text x="672" y="590" class="body">本机绑定复核 / 数据转发 / 活动上报</text>
-<text x="672" y="613" class="body">默认嵌入 Node Manager；可显式 standalone</text>
-<path d="M870 308V530" class="edge"/>
+<text x="672" y="613" class="body">默认嵌入 adxlet；可显式 standalone</text>
+<path d="M870 308V530" class="ingress"/>
 <text x="884" y="495" class="small">H2 CONNECT 数据</text>
-<path d="M654 573H462" class="edge" marker-start="url(#arrow)"/>
+<path d="M654 573H462" class="ingress" marker-start="url(#arrow)"/>
 <text x="473" y="562" class="small">UDS 绑定 / 活动</text>
 <rect x="32" y="698" width="215" height="95" class="box" fill="#fff"/>
 <text x="50" y="728" class="head">sandboxd</text>
@@ -63,14 +63,14 @@
 <text x="295" y="728" class="head">SQLite / 本地 / S3</text>
 <text x="295" y="754" class="body">降级日志 / checkpoint 制品</text>
 <rect x="654" y="698" width="432" height="95" class="box" fill="#e8f0fc"/>
-<text x="672" y="728" class="head">Runtime · RRT + Harness</text>
+<text x="672" y="728" class="head">Runtime · Execd + Harness</text>
 <text x="672" y="754" class="body">命令 / 文件 / HTTP 恢复协作</text>
-<path d="M136 650V694" class="edge"/>
+<path d="M136 650V694" class="ingress"/>
 <text x="146" y="678" class="small">后端 RPC</text>
-<path d="M393 650V694" class="edge"/>
+<path d="M393 650V694" class="ingress"/>
 <text x="402" y="678" class="small">降级与存储</text>
-<path d="M870 650V694" class="edge"/>
+<path d="M870 650V694" class="ingress"/>
 <text x="883" y="678" class="small">HTTP 数据</text>
-<path d="M458 624H617V742H650" class="edge"/>
-<text x="464" y="615" class="small">RRT HTTP 控制</text>
-<text x="32" y="822" class="small">各组件导出 Metrics / Trace / 日志；部署环境运行 Collector。数据请求不经过 Capsule 生命周期队列。</text></svg>
+<path d="M458 624H617V742H650" class="ingress"/>
+<text x="464" y="615" class="small">Execd HTTP 控制</text>
+<text x="32" y="822" class="small">各组件导出 Metrics / Trace / 日志；部署环境运行 Collector。数据请求不经过 Environment 生命周期队列。</text></svg>

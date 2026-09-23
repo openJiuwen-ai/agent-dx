@@ -204,11 +204,11 @@ mod client {
                 let request = proto::ActivitySnapshot {
                     proxy_session_id: batch.proxy_session_id,
                     sequence: batch.sequence,
-                    capsules: batch
+                    environments: batch
                         .activities
                         .into_iter()
-                        .map(|entry| proto::CapsuleActivity {
-                            capsule_id: entry.instance_id,
+                        .map(|entry| proto::EnvironmentActivity {
+                            environment_id: entry.instance_id,
                             active_streams: entry.active_stream_count,
                         })
                         .collect(),
@@ -223,7 +223,7 @@ mod client {
                 + if client.is_some() {
                     interval
                 } else {
-                    // Startup reports may be rejected until Node Manager has
+                    // Startup reports may be rejected until Adxlet has
                     // registered the proxy session. Retry promptly without touching
                     // the TCP data plane or discarding the local snapshot.
                     DISCONNECTED_RETRY_DELAY.min(interval)

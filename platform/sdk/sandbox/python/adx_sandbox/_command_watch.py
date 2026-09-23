@@ -233,7 +233,7 @@ class _CommandWaitManager:
                             ready = True
                             continue
                         if not ready:
-                            raise RuntimeError("edge sent command state before protocol negotiation")
+                            raise RuntimeError("ingress sent command state before protocol negotiation")
                         key = (str(state.get("sandboxId", "")), str(state.get("commandId", "")))
                         if state.get("status") == "REJECTED":
                             self._notify(key, str(state.get("error", "command watch rejected")))

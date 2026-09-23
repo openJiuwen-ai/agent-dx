@@ -2,19 +2,19 @@
 
 Date: 2026-09-22.
 
-`internal_security: network` is an explicit profile setting. Master, Node
-Manager, API Server and Edge use plaintext internal RPC; Edge-to-Node Proxy
+`internal_security: network` is an explicit profile setting. Coordinator, Node
+Manager, API Server and Ingress use plaintext internal RPC; Ingress-to-Relay
 forwarding uses the existing network transport. Component roles and node IDs
 are caller declarations on the deployment network, not authenticated identities.
-Node sessions, capsule ownership, tenant checks and API key verification remain.
+Node sessions, environment ownership, tenant checks and API key verification remain.
 The default is mTLS; clients reject an endpoint with the wrong scheme instead
-of falling back. Public Edge HTTPS configuration is unchanged.
+of falling back. Public Ingress HTTPS configuration is unchanged.
 
 ## Automated checks
 
 - RED: the new network identity tests failed before `Peers::network` existed.
 - Protocol, transport, discovery and deployment tests: 58 passed.
-- API Server, Master and Node Manager normal tests: 203 passed, 48 ignored.
+- API Server, Coordinator and adxlet normal tests: 203 passed, 48 ignored.
 - Workspace/all-targets check and all-features Clippy with `-D warnings`: passed.
 - Formatting and documentation checks: passed.
 
@@ -30,8 +30,8 @@ isolation. Existing mTLS route publication, lifecycle and recovery cases passed.
 The route fixture explicitly publishes its token-protected target port.
 
 Log: `out/ci/internal-network/linux-rpc-final.log`. Optional API Server HTTPS
-subprocess/Python branches were not run because `ADX_TEST_API_SERVER` was unset;
-the real API/Edge path is covered by the standalone runs below.
+subprocess/Python branches were not run because `ADX_TEST_APISERVER` was unset;
+the real API/Ingress path is covered by the standalone runs below.
 
 ## Real standalone validation
 

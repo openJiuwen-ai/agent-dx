@@ -1,4 +1,4 @@
-"""Public HTTPS key-management acceptance through Edge; never log key material."""
+"""Public HTTPS key-management acceptance through Ingress; never log key material."""
 import ssl
 import time
 import httpx
@@ -12,7 +12,7 @@ def check_management(secrets, event):
                       verify=ssl.create_default_context(cafile=str(secrets/'tls/ca.pem')),
                       timeout=20) as client:
         assert client.get(path,headers=tenant).status_code==403, 'tenant could access key management'
-        event('Checking administrator create/list/revoke through HTTPS Edge')
+        event('Checking administrator create/list/revoke through HTTPS Ingress')
         response=client.post(path,headers=headers,json={'tenantId':'e2e-managed'})
         assert response.status_code==201, ('key create HTTP status',response.status_code)
         created=response.json();key_id=created['key']['id']
@@ -40,5 +40,5 @@ def check_management(secrets, event):
         finally:
             if not revoked:
                 assert client.delete(path+'/'+key_id,headers=headers).status_code==204, 'key cleanup failed'
-    event('PASS: key management via Edge, tenant denial and cache-bounded revocation')
+    event('PASS: key management via Ingress, tenant denial and cache-bounded revocation')
     return {'status':'passed','created_listed_revoked':True,'tenant_denied':True,'revocation_observed':True}

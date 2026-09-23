@@ -1,4 +1,4 @@
-"""TunnelClient: WebSocket-based reverse tunnel for RRT sandboxes.
+"""TunnelClient: WebSocket-based reverse tunnel for EXECD sandboxes.
 
 Connects to the sandbox's tunnel WebSocket port through the sandbox
 router (or frontend gateway) and proxies HTTP and application WebSocket
@@ -12,7 +12,7 @@ Architecture:
          | WS via router/gateway
          v
   [Sandbox]
-    rrt-runtime tunnel server (Port A:8765 WS, Port B:8766 HTTP)
+    adx-execd tunnel server (Port A:8765 WS, Port B:8766 HTTP)
     sandbox code → http://127.0.0.1:8766 → WS → local upstream
 """
 
@@ -201,7 +201,7 @@ class TunnelClient:
         # These process-local knobs are optional. Current sandbox creation does
         # not need to inject them: both peers advertise defaults and negotiate
         # the lower value. Operators can override them independently when the
-        # TunnelClient and rrt-runtime processes need tighter limits.
+        # TunnelClient and adx-execd processes need tighter limits.
         self._max_body_size = _positive_int_env(
             "ADX_TUNNEL_MAX_BODY_SIZE",
             DEFAULT_MAX_BODY_BYTES,
@@ -522,9 +522,9 @@ class TunnelClient:
             yield client
 
     async def _proxy_loop(self, ws, http_ssl_context=None) -> None:
-        """Relay rrt tunnel frames to/from the upstream HTTP service.
+        """Relay execd tunnel frames to/from the upstream HTTP service.
 
-        RRT's tunnel server (Port A) keeps metadata and small bodies in JSON
+        EXECD's tunnel server (Port A) keeps metadata and small bodies in JSON
         text frames. After V2 hello negotiation, large HTTP bodies and binary
         WebSocket messages use bounded raw binary envelopes. ``ping`` frames
         are answered with ``pong`` (heartbeat), and HTTP forwarding is capped

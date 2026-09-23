@@ -1,16 +1,16 @@
-//! RRT HTTP control payloads; lifecycle decisions remain in Node Manager.
+//! EXECD HTTP control payloads; lifecycle decisions remain in Adxlet.
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeIdentity {
-    pub capsule_id: String,
+    pub environment_id: String,
     pub runtime_id: String,
     pub ownership_generation: u64,
 }
 impl RuntimeIdentity {
     pub fn validate_restore_from(&self, previous: &Self) -> Result<()> {
         self.validate()?;
-        if self.capsule_id != previous.capsule_id
+        if self.environment_id != previous.environment_id
             || self.ownership_generation < previous.ownership_generation
         {
             return Err(Error::Conflict);
@@ -22,7 +22,10 @@ impl RuntimeIdentity {
             return Ok(());
         }
         let version = |identity: &Self| -> Option<u64> {
-            let base = format!("{}-{}", identity.capsule_id, identity.ownership_generation);
+            let base = format!(
+                "{}-{}",
+                identity.environment_id, identity.ownership_generation
+            );
             if identity.runtime_id == base {
                 Some(0)
             } else {
@@ -39,12 +42,12 @@ impl RuntimeIdentity {
         }
     }
     pub fn validate(&self) -> Result<()> {
-        if self.capsule_id.trim().is_empty()
+        if self.environment_id.trim().is_empty()
             || self.runtime_id.trim().is_empty()
             || self.ownership_generation == 0
         {
             return Err(Error::Invalid(
-                "runtime requires explicit capsule, execution and ownership generation".into(),
+                "runtime requires explicit environment, execution and ownership generation".into(),
             ));
         }
         Ok(())
@@ -81,7 +84,7 @@ pub struct RuntimeStatus {
     pub revision: u64,
     pub phase: RuntimePhase,
     pub checkpoint: Option<CheckpointStatus>,
-    /// Workload-originated request, consumed only by the owning Node Manager.
+    /// Workload-originated request, consumed only by the owning Adxlet.
     #[serde(default)]
     pub requested_checkpoint: Option<String>,
     pub active_requests: u64,
@@ -121,15 +124,15 @@ impl RuntimeRestore {
             None => self.target.validate_restore_from(previous),
             Some(origin)
                 if origin == previous
-                    && (self.target.capsule_id != previous.capsule_id
+                    && (self.target.environment_id != previous.environment_id
                         || self.target.ownership_generation > previous.ownership_generation)
                     && crate::valid_runtime_id(
-                        &self.target.capsule_id,
+                        &self.target.environment_id,
                         self.target.ownership_generation,
                         &self.target.runtime_id,
                     )
                     && crate::valid_runtime_id(
-                        &origin.capsule_id,
+                        &origin.environment_id,
                         origin.ownership_generation,
                         &origin.runtime_id,
                     ) =>

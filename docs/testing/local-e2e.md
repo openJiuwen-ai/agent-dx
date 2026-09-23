@@ -3,14 +3,14 @@
 > Historical local/driver integration record. Counts and unavailable-CI statements below refer to those batches. The current driver has seven groups; hosted K8s has since passed [Buildkite #21](2026-09-17-observability-k8s.md). Use [current instructions](../../build/e2e/README.md) for reproduction.
 
 The local Linux ARM64 environment runs two isolated Docker nodes. Each node runs
-real sandboxd (PR #56, `efc201531d7e2e9d69505da151eb66084b61eebf`), Node Manager
-and Node Proxy. Node 1 also hosts Redis 7.2.5, Master with an embedded Shard,
-Sandbox API and Edge. ADX processes are launched from the unified release package
+real sandboxd (PR #56, `efc201531d7e2e9d69505da151eb66084b61eebf`), adxlet
+and Relay. Node 1 also hosts Redis 7.2.5, Coordinator with an embedded Shard,
+Sandbox API and Ingress. ADX processes are launched from the unified release package
 by `adxctl`; sandboxd is independently hosted. The SDK is installed from a wheel.
 
-Control requests enter Edge over verified TLS, then use the co-located API Server
-loopback HTTP listener. API Server/Master/Node RPC and Edge/Node Proxy use mTLS.
-Commands and files traverse Edge → Node Proxy → the real RRT inside a runc
+Control requests enter Ingress over verified TLS, then use the co-located API Server
+loopback HTTP listener. API Server/Coordinator/Node RPC and Ingress/Relay use mTLS.
+Commands and files traverse Ingress → Relay → the real Execd inside a runc
 instance. The test registry is local and separate from the platform data path.
 
 Resource observations read each Linux container's cgroup CPU/memory limits and
@@ -34,7 +34,7 @@ Buildkite result.
 | Actual placement and persistent deletion | node1 + node2; both Deleted and resources released | `sdk-query/catalog-after-delete.json` |
 | Physical runtime cleanup | both sandboxd lists empty after SDK deletion | `sandboxd-after-sdk-node{1,2}.txt` |
 | Stop with live instances | two new running instances removed; both supervisors stopped; independent sandboxd empty | `stop-test.log`, `sandboxd-before-stop-node{1,2}.txt`, `sandboxd-after-stop-node{1,2}.txt` |
-| Node Manager regression | 44 passed, 0 failed, 0 ignored | `sandboxd-adapter.log` |
+| adxlet regression | 44 passed, 0 failed, 0 ignored | `sandboxd-adapter.log` |
 | CLI regression | 7 passed | `redis-auth-cli.log` |
 | Go regression and vet | 208 passed | `go-query-tests.jsonl`, `frontend-query.log` |
 | Linux ARM64 release package integrity | passed | `package/manifest.json` |
@@ -46,35 +46,35 @@ benchmark. Earlier failed attempts remain in separate evidence directories.
 
 The adapter leaves `StartRequest.sandbox_id` empty. It associates the returned
 `StartResponse.id` with the platform execution ID. List, Stats and Delete use the
-returned backend ID; RRT control and routing retain the platform execution ID.
-The labels `adx.capsule_id`, `adx.tenant_id`, `adx.runtime_id` and
+returned backend ID; Execd control and routing retain the platform execution ID.
+The labels `adx.environment_id`, `adx.tenant_id`, `adx.runtime_id` and
 `adx.generation` allow a new adapter process to recover that association.
 
 Evidence for this change is separate under `out/ci/backend-generated-id/`.
 `source-manifest.json` records the changed source and runtime binary hashes;
-`green.log` records 46 passing Node Manager tests and the Linux ARM64 build.
+`green.log` records 46 passing adxlet tests and the Linux ARM64 build.
 The contract tests cover generated IDs, mapping recovery on restart, and cleanup
 of an uncommitted runtime discovered by its labels.
 
 The updated binary passed the real two-node SDK flow (`sdk/sdk-result.json`,
 `e2e-resumed.log`). A second pair of live instances survived termination and
-supervisor restart of both Node Managers: backend IDs were unchanged and the
+supervisor restart of both adxlets: backend IDs were unchanged and the
 installed SDK could query and execute commands on the original instances
 (`restart-result.json`, `backend-before-node{1,2}.txt`,
 `backend-after-node{1,2}.txt`). Subsequent `adxctl stop` removed both instances;
 each independently hosted sandboxd reported an empty list (`restart.log`,
-`sandboxd-after-stop-node{1,2}.txt`). This validates Node Manager process restart,
+`sandboxd-after-stop-node{1,2}.txt`). This validates adxlet process restart,
 not cross-node recovery or a Buildkite run.
 
 ## Findings fixed during integration
 
-- API Server has a loopback-only HTTP option for Edge's existing control forwarder.
+- API Server has a loopback-only HTTP option for Ingress's existing control forwarder.
   Internal RPC retains mTLS; public HTTPS remains the default.
 - Managed Redis supports a password file and requires one for non-loopback binds.
 - The sandboxd adapter leaves `StartRequest.sandbox_id` empty and records
   `StartResponse.id` as the backend ID for List/Stats/Delete. Platform execution
   IDs remain independent. Managed labels rebuild the mapping during inventory
-  or cleanup after Node Manager restart.
+  or cleanup after adxlet restart.
 - Explicit Start argument/authentication rejection permits cleanup; ambiguous
   transport failure still retains resources until reconciliation.
 - API Server restores the SDK's filtered `GET /api/instances?instance_id=...`
@@ -102,7 +102,7 @@ The tracked `build/e2e/prepare.py` and `build/e2e/run.py` now reproduce the full
 platform from a portable image bundle, without mounting the product checkout
 into the nodes. On Linux ARM64, the bundle built from the verified package above
 passed all five mandatory scenarios: SDK create/command/file/delete, API Key and
-tenant isolation, full-capacity waiting followed by rescheduling, Node Manager
+tenant isolation, full-capacity waiting followed by rescheduling, adxlet
 restart, and supervisor stop. Both test containers and the isolated network were
 removed with no cleanup error.
 
@@ -125,7 +125,7 @@ pinned backend binaries, checking their hashes before image preparation.
 ## Kubernetes pipeline integration
 
 Buildkite deployment now uses `build/e2e/kubernetes/run.py`: publish immutable
-node/RRT image references, create an isolated target namespace, start two node
+node/Execd image references, create an isolated target namespace, start two node
 Pods and Services, run the shared SDK scenarios, collect diagnostics and verify
 namespace cleanup. The local Docker driver remains a development regression tool.
 

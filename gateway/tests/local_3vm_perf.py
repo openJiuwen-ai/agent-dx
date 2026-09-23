@@ -27,7 +27,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 REMOTE_ROOT = "/tmp/adx-data-plane-3vm"
-MASTER = "adx-master"
+COORDINATOR = "adx-coordinator"
 WORKER = "adx-worker-1"
 WORKER2 = "adx-worker-2"
 TOKEN = "e30.eyJzdWIiOiJtb2NrLXRlbmFudCIsImV4cCI6MH0.signature"
@@ -85,10 +85,10 @@ class Runner:
         (self.evidence / "raw").mkdir(exist_ok=True)
         self.commands = []
         self.rows = []
-        self.master_ip = self.remote(MASTER, "hostname -I | awk '{print $1}'").strip()
+        self.coordinator_ip = self.remote(COORDINATOR, "hostname -I | awk '{print $1}'").strip()
         self.worker_ip = self.remote(WORKER, "hostname -I | awk '{print $1}'").strip()
         self.worker2_ip = self.remote(WORKER2, "hostname -I | awk '{print $1}'").strip()
-        self.bypass = f"127.0.0.1,localhost,{self.master_ip},{self.worker_ip},{self.worker2_ip}"
+        self.bypass = f"127.0.0.1,localhost,{self.coordinator_ip},{self.worker_ip},{self.worker2_ip}"
 
     def remote(self, node, command, check=True):
         bypass = getattr(self, "bypass", "127.0.0.1,localhost")
@@ -113,16 +113,16 @@ class Runner:
 
     def start_samplers(self, case_id):
         specs = {
-            MASTER: [("edge", f"{REMOTE_ROOT}/edge-frontend.pid")],
+            COORDINATOR: [("ingress", f"{REMOTE_ROOT}/ingress-frontend.pid")],
             WORKER: [
-                ("node", f"{REMOTE_ROOT}/node-proxy.pid"),
+                ("node", f"{REMOTE_ROOT}/relay.pid"),
                 ("direct_relay", f"{REMOTE_ROOT}/direct-relay-perf.pid"),
                 ("sandbox_relay", f"{REMOTE_ROOT}/sandbox-relay-perf.pid"),
                 ("direct_http", f"{REMOTE_ROOT}/direct-http.pid"),
                 ("sandbox_http", f"{REMOTE_ROOT}/sandbox-http.pid"),
             ],
             WORKER2: [
-                ("node", f"{REMOTE_ROOT}/node-proxy.pid"),
+                ("node", f"{REMOTE_ROOT}/relay.pid"),
                 ("sandbox_http", f"{REMOTE_ROOT}/sandbox-http.pid"),
             ],
         }
@@ -143,7 +143,7 @@ class Runner:
 
     def stop_samplers(self, case_id):
         summaries = {}
-        for node in (MASTER, WORKER, WORKER2):
+        for node in (COORDINATOR, WORKER, WORKER2):
             prefix = f"{REMOTE_ROOT}/results/resources/{case_id}-{node}"
             command = (
                 f"touch {prefix}.stop; "
@@ -158,7 +158,7 @@ class Runner:
         if resource:
             self.start_samplers(case_id)
         started = time.time_ns()
-        result = self.remote(MASTER, command, check=False)
+        result = self.remote(COORDINATOR, command, check=False)
         ended = time.time_ns()
         resources = self.stop_samplers(case_id) if resource else {}
         (self.evidence / "raw" / f"{case_id}.log").write_text(result)
@@ -177,12 +177,12 @@ class Runner:
             return f"{binary} bench-direct {self.worker_ip}:19000 {tail}"
         if case.path == "node":
             return f"{binary} bench-node {self.worker_ip}:8443 10.88.1.2 19001 {tail}"
-        if case.path == "edge-plain":
-            return f"{binary} bench-edge 127.0.0.1:8080 vm-sandbox-1 19001 {tail}"
-        if case.path == "edge-tls":
+        if case.path == "ingress-plain":
+            return f"{binary} bench-ingress 127.0.0.1:8080 vm-sandbox-1 19001 {tail}"
+        if case.path == "ingress-tls":
             return (
-                f"{binary} bench-edge-tls 127.0.0.1:8443 vm-sandbox-1 19001 "
-                f"{REMOTE_ROOT}/ca.crt adx-edge.local {tail}"
+                f"{binary} bench-ingress-tls 127.0.0.1:8443 vm-sandbox-1 19001 "
+                f"{REMOTE_ROOT}/ca.crt adx-ingress.local {tail}"
             )
         raise ValueError(case.path)
 
@@ -245,9 +245,9 @@ class Runner:
         total = 0
         for address in (self.worker_ip, self.worker2_ip):
             output = self.remote(
-                MASTER,
+                COORDINATOR,
                 f"curl -fsS http://{address}:18443/metrics | "
-                "awk '/data_plane_node_proxy_connect_total / {print $2}'",
+                "awk '/data_plane_relay_connect_total / {print $2}'",
             )
             total += int(output.strip())
         return total
@@ -344,16 +344,16 @@ class Runner:
                 f"{REMOTE_ROOT}/bin/etcdctl --endpoints=http://127.0.0.1:2379 put "
                 f"/adx/route/business/adxk/{instance} {shlex.quote(route)} >/dev/null"
             )
-        self.run_remote(MASTER, "; ".join(commands))
+        self.run_remote(COORDINATOR, "; ".join(commands))
         self.run_remote(
-            MASTER,
+            COORDINATOR,
             "for attempt in $(seq 1 100); do "
             "entries=$(curl -fsS http://127.0.0.1:18080/metrics | "
             "awk '/route_cache_entries / {print $2}'); "
             f"test \"${{entries:-0}}\" -ge {count + 2} && exit 0; sleep 0.1; done; exit 1",
         )
         self.run_remote(
-            MASTER,
+            COORDINATOR,
             f"curl -fsS http://{self.worker_ip}:18082/bytes/128 >/dev/null; "
             f"curl -fsS --cacert {REMOTE_ROOT}/ca.crt -H 'Authorization: Bearer {TOKEN}' "
             "https://127.0.0.1:8443/direct/perf-sandbox-0000/bytes/128 >/dev/null",
@@ -366,18 +366,18 @@ class Runner:
             "curl -fsS http://127.0.0.1:18080/readyz >/dev/null",
             f"curl -fsS http://{self.worker_ip}:18443/readyz >/dev/null",
         ]
-        self.run_remote(MASTER, "; ".join(checks))
+        self.run_remote(COORDINATOR, "; ".join(checks))
         topology = {
-            "nodes": {"master": MASTER, "worker": WORKER},
+            "nodes": {"coordinator": COORDINATOR, "worker": WORKER},
             "addresses": {
-                "master": self.master_ip,
+                "coordinator": self.coordinator_ip,
                 "worker": self.worker_ip,
                 "worker2": self.worker2_ip,
             },
-            "architecture": self.remote(MASTER, "uname -m").strip(),
-            "kernel": self.remote(MASTER, "uname -r").strip(),
-            "cpu_per_vm": self.remote(MASTER, "nproc").strip(),
-            "memory": self.remote(MASTER, "awk '/MemTotal/ {print $2}' /proc/meminfo").strip(),
+            "architecture": self.remote(COORDINATOR, "uname -m").strip(),
+            "kernel": self.remote(COORDINATOR, "uname -r").strip(),
+            "cpu_per_vm": self.remote(COORDINATOR, "nproc").strip(),
+            "memory": self.remote(COORDINATOR, "awk '/MemTotal/ {print $2}' /proc/meminfo").strip(),
         }
         (self.evidence / "topology.json").write_text(json.dumps(topology, indent=2) + "\n")
         source = subprocess.run(
@@ -388,19 +388,19 @@ class Runner:
         ).stdout.strip()
         (self.evidence / "source-identity.txt").write_text(f"HEAD={head}\n{source}")
         binaries = (
-            REPO_ROOT / "build/output/data_plane/bin/adx-edge-frontend",
-            REPO_ROOT / "build/output/data_plane/bin/adx-node-proxy",
+            REPO_ROOT / "build/output/data_plane/bin/adx-ingress",
+            REPO_ROOT / "build/output/data_plane/bin/adx-relay",
             REPO_ROOT / ".adx-cache/data-plane-gateway-perf/bin/relay_perf",
         )
         hashes = "".join(sha256_line(path) for path in binaries)
         (self.evidence / "release-sha256.txt").write_text(hashes)
 
     def collect_metrics(self, suffix):
-        (self.evidence / f"edge-metrics-{suffix}.txt").write_text(
-            self.remote(MASTER, "curl -fsS http://127.0.0.1:18080/metrics")
+        (self.evidence / f"ingress-metrics-{suffix}.txt").write_text(
+            self.remote(COORDINATOR, "curl -fsS http://127.0.0.1:18080/metrics")
         )
         (self.evidence / f"node-metrics-{suffix}.txt").write_text(
-            self.remote(MASTER, f"curl -fsS http://{self.worker_ip}:18443/metrics")
+            self.remote(COORDINATOR, f"curl -fsS http://{self.worker_ip}:18443/metrics")
         )
 
     def run(self):
@@ -411,7 +411,7 @@ class Runner:
             for item in os.environ.get("ADX_DATA_PLANE_PERF_FAMILIES", "raw,http").split(",")
             if item.strip()
         }
-        paths = ["direct", "node", "edge-plain", "edge-tls"]
+        paths = ["direct", "node", "ingress-plain", "ingress-tls"]
         raw_cases = []
         for concurrency, iterations in ((1, 300), (8, 600)):
             raw_cases.extend(RawCase(path, "download", 0, iterations, concurrency) for path in paths)
@@ -442,12 +442,12 @@ class Runner:
                     self.run_raw_case(round_number, case)
             if "http" in families:
                 for concurrency, requests in ((1, 500), (8, 1000)):
-                    for variant in ("direct", "edge-tls"):
+                    for variant in ("direct", "ingress-tls"):
                         self.run_http_case(
                             round_number, HttpCase(variant, "small.txt", requests, concurrency)
                         )
                 for concurrency, requests in ((1, 4), (8, 16)):
-                    for variant in ("direct", "edge-tls"):
+                    for variant in ("direct", "ingress-tls"):
                         self.run_http_case(
                             round_number, HttpCase(variant, "blob.bin", requests, concurrency, resource=True)
                         )
@@ -464,7 +464,7 @@ class Runner:
                         for targets in (1, 10, 100):
                             cases.append(
                                 RequestCase(
-                                    "edge-tls",
+                                    "ingress-tls",
                                     body_size,
                                     requests,
                                     concurrency,

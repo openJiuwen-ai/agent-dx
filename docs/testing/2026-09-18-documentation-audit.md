@@ -1,5 +1,7 @@
 # 文档与当前实现核对（2026-09-18）
 
+> 历史记录：命令、组件和产物名称对应当时版本；当前命名见 [组件命名](../architecture/naming.md)。
+
 源码基线为 `363e44f1b28f1a792a4b9935c5bd27034fba9926`。本次按受版本管理的源码、配置、
 构建脚本和 [Buildkite #30](2026-09-18-runtime-environment-k8s.md) 产物核对当前说明；历史报告
 保留当时提交、成功和失败事实，并在会影响当前判断的位置补充后续结果。
@@ -20,7 +22,7 @@
 ## 本次修订
 
 - API Server 文档改为 Master 实例目录首次全量、后续增量订阅；普通生命周期查询不再描述为 TTL 缓存未命中后逐项查询。
-- 新增 [实例目录订阅验收](2026-09-18-capsule-directory.md)，记录全量/增量、断档重同步、终态幂等和真实 Redis/mTLS/HTTPS 验证边界。
+- 新增 [实例目录订阅验收](2026-09-18-environment-directory.md)，记录全量/增量、断档重同步、终态幂等和真实 Redis/mTLS/HTTPS 验证边界。
 - 当前架构 SVG 沿用最初版式，仅将 Go Sandbox API／Domain 命名更新为 Rust API Server／Shard；本地优先创建和 EROFS／OCI 等实现细节保留在目录正文。
 - 根中英文 README、Buildkite 和 Kubernetes E2E 指南更新到 #30、八组及 OCI worker 前置条件。
 - 运行环境部署说明补齐 EROFS/OCI 双路径和 OCI 递归只读 bind 语义。

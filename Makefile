@@ -23,8 +23,8 @@ OUT ?= $(CURDIR)/out
 PYTEST_ARGS ?=
 E2E_PROFILE ?= standalone
 K8S_E2E_PROFILE ?= k8s-basic
-RUST_POLICY_PACKAGES := -p adx-api-server -p adx-deployment -p adx-master \
-	-p adx-node-manager -p adx-core -p adx-discovery -p adx-observability \
+RUST_POLICY_PACKAGES := -p adx-apiserver -p adx-deployment -p adx-coordinator \
+	-p adxlet -p adx-core -p adx-discovery -p adx-observability \
 	-p adx-protocol -p adx-scheduling
 
 .PHONY: help cargo-cache-info cargo-cache-env cargo-cache-isolated-env generate build test rust-check rust-test scheduler-bench python-test agent-test sandbox-sdk-test admin-test package ci data-plane-gateway data-plane-gateway-dev data-plane-gateway-ut
@@ -47,7 +47,7 @@ rust-check:
 rust-test:
 	$(CARGO) test --locked --workspace --all-features -j $(JOBS) -- --test-threads=$(JOBS)
 scheduler-bench:
-	$(CARGO) test --locked --release -p adx-master --test benchmark -j $(JOBS) -- --ignored --nocapture
+	$(CARGO) test --locked --release -p adx-coordinator --test benchmark -j $(JOBS) -- --ignored --nocapture
 python-test: sandbox-sdk-test admin-test
 agent-test:
 	$(CARGO) test --locked -p adx-agent-core -p adx-agent-store -p adx-agent-api -p adx-activator -p adx-cli --features adx-agent-store/test-memory -j $(JOBS) -- --test-threads=$(JOBS)

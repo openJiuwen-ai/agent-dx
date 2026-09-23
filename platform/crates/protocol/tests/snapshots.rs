@@ -1,11 +1,11 @@
 use adx_core::{
     snapshots::{Reference, Snapshot},
-    CapsuleSpec, CheckpointArtifact, Resources,
+    CheckpointArtifact, EnvironmentSpec, Resources,
 };
 #[test]
 fn snapshot_wire_preserves_template_and_durable_references() {
-    let spec = CapsuleSpec {
-        environment: None,
+    let spec = EnvironmentSpec {
+        runtime_profile: None,
         snapshot_id: None,
         id: "source".into(),
         tenant_id: "tenant".into(),

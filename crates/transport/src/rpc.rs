@@ -15,9 +15,9 @@ impl Interceptor for Caller {
     fn call(&mut self, mut request: Request<()>) -> Result<Request<()>, Status> {
         if let Some(principal) = &self.0 {
             let role = match principal {
-                Principal::Master => "master",
-                Principal::ApiServer => "api-server",
-                Principal::Edge => "edge",
+                Principal::Coordinator => "coordinator",
+                Principal::ApiServer => "apiserver",
+                Principal::Ingress => "ingress",
                 Principal::Node(id) => {
                     request.metadata_mut().insert_bin(
                         "adx-node-id-bin",

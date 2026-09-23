@@ -37,7 +37,7 @@ for _ in range(100):
         break
     time.sleep(.05)
 else:
-    raise AssertionError('Rust API Server Capsule directory did not synchronize')
+    raise AssertionError('Rust API Server Environment directory did not synchronize')
 for invalid_key in ('z' * 40, 'c' * 40):
     code, _ = call('DELETE', '/api/sandbox/absent', key=invalid_key)
     assert code == 401, code
@@ -61,7 +61,7 @@ code, body = call('POST', '/api/sandbox/v1/sandboxes/t-http-case/pause', {}, ext
 assert code == 409, (code, body)
 print('Public HTTPS create, credential/tenant checks, repeated delete, pause on deleted instance rejected')
 
-# Real HTTPS -> authenticated API Server -> mTLS Master -> Redis key lifecycle.
+# Real HTTPS -> authenticated API Server -> mTLS Coordinator -> Redis key lifecycle.
 admin = 'd' * 40
 code, current = call('GET', '/api/sandbox/v1/resources')
 assert code == 200 and current['items'][0]['status'] == 0, (code, current)
@@ -120,7 +120,7 @@ assert code == 400, code
 print('Public HTTPS tenant key creation, admin-only listing/revocation, repeated revoke, cache expiry and invalid expiry passed')
 
 
-# Public affinity groups traverse HTTP -> Capsule RPC -> Master -> Redis. Backend
+# Public affinity groups traverse HTTP -> Environment RPC -> Coordinator -> Redis. Backend
 # execution remains the RPC fixture; multi-node decisions have native tests.
 def create_placement(name, labels=None, affinities=None):
     code, body = call('POST','/api/sandbox/v1/sandboxes', {

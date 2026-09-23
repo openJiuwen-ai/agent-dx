@@ -4,7 +4,7 @@ This directory defines the result contract for one control VM and two worker
 VMs. It does not provision machines. The deployment adapter must install one
 verified release on all three machines, generate topology-specific mTLS
 configuration, start external sandboxd on both workers, and run the public SDK
-through the control VM's Edge endpoint.
+through the control VM's Ingress endpoint.
 
 The inventory must record three unique machine IDs, hostnames and addresses,
 plus the clean source commit, release SHA256 and target. A passing result must

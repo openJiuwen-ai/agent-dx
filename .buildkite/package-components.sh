@@ -20,14 +20,14 @@ download_component() {
     --step "build-$component"
 }
 pids=()
-for component in platform gateway rrt; do
+for component in platform gateway execd; do
   download_component "$component" &
   pids+=("$!")
 done
 for pid in "${pids[@]}"; do
   wait "$pid"
 done
-for component in platform gateway rrt; do
+for component in platform gateway execd; do
   mkdir "out/buildkite/components/$component"
   tar -xzf "out/buildkite/components/$component.tar.gz" \
     -C "out/buildkite/components/$component"
@@ -43,7 +43,7 @@ done
 
 stage=$(mktemp -d "${TMPDIR:-/tmp}/adx-components.XXXXXX")
 trap 'rm -rf "$stage"' EXIT
-for component in platform gateway rrt; do
+for component in platform gateway execd; do
   find "out/buildkite/components/$component" -maxdepth 1 -type f \
     ! -name manifest.json -exec cp {} "$stage/" \;
 done

@@ -67,15 +67,15 @@ if manifest.get("schema_version") != 1 or not isinstance(files, dict):
 expected = set(files)
 required = {
     "bin/adxctl",
-    "bin/adx-master",
-    "bin/adx-node-manager",
-    "bin/adx-api-server",
-    "bin/adx-edge-frontend",
-    "bin/adx-node-proxy",
+    "bin/adx-coordinator",
+    "bin/adxlet",
+    "bin/adx-apiserver",
+    "bin/adx-ingress",
+    "bin/adx-relay",
     "bin/adx-data-plane-forward",
     "bin/redis-server",
     "install.sh",
-    "runtime/rrt-runtime",
+    "runtime/adx-execd",
 }
 if manifest.get("profile") == "release" and "linux" in manifest.get("target", ""):
     required.add("runtime/adx-runtime-rootfs.img")

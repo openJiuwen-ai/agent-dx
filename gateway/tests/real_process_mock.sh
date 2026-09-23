@@ -49,20 +49,20 @@ etcd_port=$(free_port)
 target_port=$(free_port)
 node_port=$(free_port)
 node_health_port=$(free_port)
-edge_tls_port=$(free_port)
-edge_plain_port=$(free_port)
-edge_health_port=$(free_port)
+ingress_tls_port=$(free_port)
+ingress_plain_port=$(free_port)
+ingress_health_port=$(free_port)
 forward_port=$(free_port)
 mock_token='e30.eyJzdWIiOiJtb2NrLXRlbmFudCIsImV4cCI6MH0.signature'
 
-cat >"${mock_dir}/edge-cert.conf" <<'EOF'
+cat >"${mock_dir}/ingress-cert.conf" <<'EOF'
 [req]
 distinguished_name = subject
 prompt = no
 [subject]
 CN = 127.0.0.1
 EOF
-cat >"${mock_dir}/edge-cert.ext" <<'EOF'
+cat >"${mock_dir}/ingress-cert.ext" <<'EOF'
 [extensions]
 subjectAltName = IP:127.0.0.1
 basicConstraints = critical,CA:FALSE
@@ -71,12 +71,12 @@ extendedKeyUsage = serverAuth
 EOF
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=adx-mock-ca \
     -keyout "${mock_dir}/ca.key" -out "${mock_dir}/ca.crt" >/dev/null 2>&1
-openssl req -new -newkey rsa:2048 -nodes -config "${mock_dir}/edge-cert.conf" \
-    -keyout "${mock_dir}/edge.key" -out "${mock_dir}/edge.csr" >/dev/null 2>&1
-openssl x509 -req -days 1 -in "${mock_dir}/edge.csr" \
+openssl req -new -newkey rsa:2048 -nodes -config "${mock_dir}/ingress-cert.conf" \
+    -keyout "${mock_dir}/ingress.key" -out "${mock_dir}/ingress.csr" >/dev/null 2>&1
+openssl x509 -req -days 1 -in "${mock_dir}/ingress.csr" \
     -CA "${mock_dir}/ca.crt" -CAkey "${mock_dir}/ca.key" -CAcreateserial \
-    -extfile "${mock_dir}/edge-cert.ext" -extensions extensions \
-    -out "${mock_dir}/edge.crt" >/dev/null 2>&1
+    -extfile "${mock_dir}/ingress-cert.ext" -extensions extensions \
+    -out "${mock_dir}/ingress.crt" >/dev/null 2>&1
 
 printf '%s\n' 'gateway-real-process-ok' > "${mock_dir}/index.html"
 python3 -m http.server "${target_port}" --bind 0.0.0.0 --directory "${mock_dir}" \
@@ -166,17 +166,17 @@ for attempt in $(seq 1 100); do
     sleep 0.1
 done
 
-ADX_DATA_PLANE_NODE_PROXY_BIND="127.0.0.1:${node_port}" \
-ADX_DATA_PLANE_NODE_PROXY_ADVERTISE_ADDRESS="127.0.0.1:${node_port}" \
-ADX_DATA_PLANE_NODE_PROXY_HEALTH_BIND="127.0.0.1:${node_health_port}" \
+ADX_DATA_PLANE_RELAY_BIND="127.0.0.1:${node_port}" \
+ADX_DATA_PLANE_RELAY_ADVERTISE_ADDRESS="127.0.0.1:${node_port}" \
+ADX_DATA_PLANE_RELAY_HEALTH_BIND="127.0.0.1:${node_health_port}" \
 ADX_DATA_PLANE_ALLOWED_TARGET_CIDRS="${host_ip}/32" \
-ADX_DATA_PLANE_ALLOWED_EDGE_CIDRS="127.0.0.1/32" \
-ADX_DATA_PLANE_EDGE_FRONTEND_NODE_SECURITY_MODE=network \
+ADX_DATA_PLANE_ALLOWED_INGRESS_CIDRS="127.0.0.1/32" \
+ADX_DATA_PLANE_INGRESS_NODE_SECURITY_MODE=network \
 ADX_DATA_PLANE_LOG_DIR="${service_log_dir}" \
 ADX_DATA_PLANE_LOG_MAX_SIZE_MB=1 \
 ADX_DATA_PLANE_LOG_MAX_FILES=2 \
 ADX_DATA_PLANE_LOG_STDOUT=false \
-"${bin_dir}/adx-node-proxy" >"${mock_dir}/node.log" 2>&1 &
+"${bin_dir}/adx-relay" >"${mock_dir}/node.log" 2>&1 &
 pids+=("$!")
 wait_http_status "http://127.0.0.1:${node_health_port}/readyz" 200
 
@@ -185,51 +185,51 @@ running_route=$(printf '{"instanceID":"mock-instance","instanceStatus":{"code":3
 docker exec "${container_name}" /usr/local/bin/etcdctl \
     --endpoints=http://127.0.0.1:2379 put "${route_key}" "${running_route}" >/dev/null
 
-ADX_DATA_PLANE_EDGE_FRONTEND_ETCD_ENDPOINTS="http://127.0.0.1:${etcd_port}" \
-ADX_DATA_PLANE_EDGE_FRONTEND_TLS_BIND="127.0.0.1:${edge_tls_port}" \
-ADX_DATA_PLANE_EDGE_FRONTEND_PLAIN_BIND="127.0.0.1:${edge_plain_port}" \
-ADX_DATA_PLANE_EDGE_FRONTEND_HEALTH_BIND="127.0.0.1:${edge_health_port}" \
-ADX_DATA_PLANE_EDGE_FRONTEND_CONTROL_PLANE_ADDRESS="${host_ip}:${target_port}" \
-ADX_DATA_PLANE_EDGE_FRONTEND_TLS_CERT="${mock_dir}/edge.crt" \
-ADX_DATA_PLANE_EDGE_FRONTEND_TLS_KEY="${mock_dir}/edge.key" \
-ADX_DATA_PLANE_EDGE_FRONTEND_NODE_SECURITY_MODE=network \
-ADX_DATA_PLANE_EDGE_FRONTEND_ALLOWED_CLIENT_CIDRS="127.0.0.1/32" \
-ADX_DATA_PLANE_EDGE_FRONTEND_VALIDATE_IAM=0 \
-ADX_DATA_PLANE_EDGE_FRONTEND_DIRECT_PORT="${target_port}" \
+ADX_DATA_PLANE_INGRESS_ETCD_ENDPOINTS="http://127.0.0.1:${etcd_port}" \
+ADX_DATA_PLANE_INGRESS_TLS_BIND="127.0.0.1:${ingress_tls_port}" \
+ADX_DATA_PLANE_INGRESS_PLAIN_BIND="127.0.0.1:${ingress_plain_port}" \
+ADX_DATA_PLANE_INGRESS_HEALTH_BIND="127.0.0.1:${ingress_health_port}" \
+ADX_DATA_PLANE_INGRESS_CONTROL_PLANE_ADDRESS="${host_ip}:${target_port}" \
+ADX_DATA_PLANE_INGRESS_TLS_CERT="${mock_dir}/ingress.crt" \
+ADX_DATA_PLANE_INGRESS_TLS_KEY="${mock_dir}/ingress.key" \
+ADX_DATA_PLANE_INGRESS_NODE_SECURITY_MODE=network \
+ADX_DATA_PLANE_INGRESS_ALLOWED_CLIENT_CIDRS="127.0.0.1/32" \
+ADX_DATA_PLANE_INGRESS_VALIDATE_IAM=0 \
+ADX_DATA_PLANE_INGRESS_DIRECT_PORT="${target_port}" \
 ADX_DATA_PLANE_LOG_DIR="${service_log_dir}" \
 ADX_DATA_PLANE_LOG_MAX_SIZE_MB=1 \
 ADX_DATA_PLANE_LOG_MAX_FILES=2 \
 ADX_DATA_PLANE_LOG_STDOUT=false \
-ADX_DATA_PLANE_EDGE_FRONTEND_ACCESS_LOG_ENABLED=true \
-"${bin_dir}/adx-edge-frontend" >"${mock_dir}/edge.log" 2>&1 &
+ADX_DATA_PLANE_INGRESS_ACCESS_LOG_ENABLED=true \
+"${bin_dir}/adx-ingress" >"${mock_dir}/ingress.log" 2>&1 &
 pids+=("$!")
-if ! wait_http_status "http://127.0.0.1:${edge_health_port}/readyz" 200; then
-    tail -n 120 "${mock_dir}/edge.log" >&2 || true
+if ! wait_http_status "http://127.0.0.1:${ingress_health_port}/readyz" 200; then
+    tail -n 120 "${mock_dir}/ingress.log" >&2 || true
     exit 1
 fi
 
 plain_direct_status=$(curl -sS -o /dev/null -w '%{http_code}' \
-    "http://127.0.0.1:${edge_plain_port}/direct/mock-instance/index.html")
+    "http://127.0.0.1:${ingress_plain_port}/direct/mock-instance/index.html")
 [[ ${plain_direct_status} == 426 ]]
 
 plain_control_status=$(curl -sS -o /dev/null -w '%{http_code}' \
-    "http://127.0.0.1:${edge_plain_port}/")
+    "http://127.0.0.1:${ingress_plain_port}/")
 [[ ${plain_control_status} == 426 ]]
 
 control_response=$(printf 'GET / HTTP/1.1\r\nHost: public.example.test\r\nConnection: close\r\n\r\n' | \
-    openssl s_client -quiet -connect "127.0.0.1:${edge_tls_port}" \
+    openssl s_client -quiet -connect "127.0.0.1:${ingress_tls_port}" \
         -CAfile "${mock_dir}/ca.crt" -verify_return_error 2>/dev/null)
 [[ ${control_response} == *"HTTP/1.1 200"* ]]
 [[ ${control_response} == *gateway-real-process-ok* ]]
 
 tls_direct_without_token=$(printf 'GET /direct/mock-instance/index.html HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n' | \
-    openssl s_client -quiet -connect "127.0.0.1:${edge_tls_port}" \
+    openssl s_client -quiet -connect "127.0.0.1:${ingress_tls_port}" \
         -CAfile "${mock_dir}/ca.crt" -verify_return_error 2>/dev/null || true)
 [[ ${tls_direct_without_token} == *"HTTP/1.1 401"* ]]
 
 direct_response=$(printf 'GET /direct/mock-instance/index.html HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer %s\r\nConnection: close\r\n\r\n' \
     "${mock_token}" | openssl s_client -quiet \
-    -connect "127.0.0.1:${edge_tls_port}" -CAfile "${mock_dir}/ca.crt" \
+    -connect "127.0.0.1:${ingress_tls_port}" -CAfile "${mock_dir}/ca.crt" \
     -verify_return_error 2>/dev/null)
 [[ ${direct_response} == *"HTTP/1.1 200"* ]]
 [[ ${direct_response} == *gateway-real-process-ok* ]]
@@ -264,7 +264,7 @@ open(output, "w").write("sdk-multiplex-watch-ok\n")
 time.sleep(2)
 PY
 PYTHONPATH="${repo_root}/platform/sdk/sandbox/python" uv run --with httpx --with websockets \
-    python "${mock_dir}/command_watch_client.py" 127.0.0.1 "${edge_tls_port}" \
+    python "${mock_dir}/command_watch_client.py" 127.0.0.1 "${ingress_tls_port}" \
     "${mock_token}" "${mock_dir}/command-watch-client.ok" \
     >"${mock_dir}/command-watch-client.log" 2>&1 &
 pids+=("$!")
@@ -277,21 +277,21 @@ for attempt in $(seq 1 100); do
     fi
     sleep 0.1
 done
-watch_metrics=$(curl -sS "http://127.0.0.1:${edge_health_port}/metrics")
-[[ ${watch_metrics} == *"data_plane_edge_frontend_active_sessions 1"* ]]
+watch_metrics=$(curl -sS "http://127.0.0.1:${ingress_health_port}/metrics")
+[[ ${watch_metrics} == *"data_plane_ingress_active_sessions 1"* ]]
 [[ ${watch_metrics} == *"command_watch_connections 1"* ]]
 [[ ${watch_metrics} == *"command_watch_subscriptions 2"* ]]
 [[ ${watch_metrics} == *"command_watch_sandboxes 1"* ]]
 [[ ${watch_metrics} == *"command_watch_downstream_streams 1"* ]]
 
 "${bin_dir}/adx-data-plane-forward" \
-    port-forward "127.0.0.1:${edge_plain_port}" mock-instance \
+    port-forward "127.0.0.1:${ingress_plain_port}" mock-instance \
     "${target_port}" "127.0.0.1:${forward_port}" \
     >"${mock_dir}/forward.log" 2>&1 &
 pids+=("$!")
 if ! wait_http_status "http://127.0.0.1:${forward_port}/index.html" 200; then
     tail -n 120 "${mock_dir}/forward.log" >&2 || true
-    tail -n 120 "${mock_dir}/edge.log" >&2 || true
+    tail -n 120 "${mock_dir}/ingress.log" >&2 || true
     exit 1
 fi
 
@@ -300,12 +300,12 @@ docker exec "${container_name}" /usr/local/bin/etcdctl \
     --endpoints=http://127.0.0.1:2379 put "${route_key}" "${token_route}" >/dev/null
 for attempt in $(seq 1 100); do
     plain_status=$(curl -sS -o /dev/null -w '%{http_code}' \
-        "http://127.0.0.1:${edge_plain_port}/mock-instance/${target_port}/index.html" || true)
+        "http://127.0.0.1:${ingress_plain_port}/mock-instance/${target_port}/index.html" || true)
     if [[ ${plain_status} == 426 ]]; then
         break
     fi
     if [[ ${attempt} == 100 ]]; then
-        echo "Edge did not apply the target-port authentication policy" >&2
+        echo "Ingress did not apply the target-port authentication policy" >&2
         exit 1
     fi
     sleep 0.1
@@ -313,13 +313,13 @@ done
 
 tls_port_without_token=$(printf 'GET /mock-instance/%s/index.html HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n' \
     "${target_port}" | openssl s_client -quiet \
-    -connect "127.0.0.1:${edge_tls_port}" -CAfile "${mock_dir}/ca.crt" \
+    -connect "127.0.0.1:${ingress_tls_port}" -CAfile "${mock_dir}/ca.crt" \
     -verify_return_error 2>/dev/null || true)
 [[ ${tls_port_without_token} == *"HTTP/1.1 401"* ]]
 
 tls_port_with_token=$(printf 'GET /mock-instance/%s/index.html HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer %s\r\nConnection: close\r\n\r\n' \
     "${target_port}" "${mock_token}" | openssl s_client -quiet \
-    -connect "127.0.0.1:${edge_tls_port}" -CAfile "${mock_dir}/ca.crt" \
+    -connect "127.0.0.1:${ingress_tls_port}" -CAfile "${mock_dir}/ca.crt" \
     -verify_return_error 2>/dev/null)
 [[ ${tls_port_with_token} == *"HTTP/1.1 200"* ]]
 
@@ -332,39 +332,39 @@ docker exec "${container_name}" /usr/local/bin/etcdctl \
 for attempt in $(seq 1 100); do
     status_response=$(printf 'GET /direct/mock-instance/index.html HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer %s\r\nConnection: close\r\n\r\n' \
         "${mock_token}" | openssl s_client -quiet \
-        -connect "127.0.0.1:${edge_tls_port}" -CAfile "${mock_dir}/ca.crt" \
+        -connect "127.0.0.1:${ingress_tls_port}" -CAfile "${mock_dir}/ca.crt" \
         -verify_return_error 2>/dev/null || true)
     if [[ ${status_response} == *"HTTP/1.1 409"* ]] && [[ ${status_response} == *"mock sandbox stopped"* ]]; then
         break
     fi
     if [[ ${attempt} == 100 ]]; then
-        echo "Edge did not apply the watched instance status" >&2
+        echo "Ingress did not apply the watched instance status" >&2
         exit 1
     fi
     sleep 0.1
 done
 
 for attempt in $(seq 1 50); do
-    if grep -q 'event="request"' "${service_log_dir}/edge-frontend-access.log" 2>/dev/null &&
-       grep -q 'event="stream_close"' "${service_log_dir}/edge-frontend-access.log" 2>/dev/null; then
+    if grep -q 'event="request"' "${service_log_dir}/ingress-frontend-access.log" 2>/dev/null &&
+       grep -q 'event="stream_close"' "${service_log_dir}/ingress-frontend-access.log" 2>/dev/null; then
         break
     fi
     if [[ ${attempt} == 50 ]]; then
-        echo "Edge access log did not contain request and stream-close audit records" >&2
-        tail -n 120 "${service_log_dir}/edge-frontend-access.log" >&2 || true
+        echo "Ingress access log did not contain request and stream-close audit records" >&2
+        tail -n 120 "${service_log_dir}/ingress-frontend-access.log" >&2 || true
         exit 1
     fi
     sleep 0.1
 done
-[[ -s "${service_log_dir}/edge-frontend.log" ]]
-[[ -s "${service_log_dir}/node-proxy.log" ]]
-if grep -Eq 'adx_(access|audit)' "${service_log_dir}/edge-frontend.log"; then
-    echo "Edge access/audit record was duplicated into the service log" >&2
+[[ -s "${service_log_dir}/ingress-frontend.log" ]]
+[[ -s "${service_log_dir}/relay.log" ]]
+if grep -Eq 'adx_(access|audit)' "${service_log_dir}/ingress-frontend.log"; then
+    echo "Ingress access/audit record was duplicated into the service log" >&2
     exit 1
 fi
-if grep -Fq "${mock_token}" "${service_log_dir}/edge-frontend-access.log"; then
-    echo "Edge access log leaked the bearer token" >&2
+if grep -Fq "${mock_token}" "${service_log_dir}/ingress-frontend-access.log"; then
+    echo "Ingress access log leaked the bearer token" >&2
     exit 1
 fi
 
-echo "real process mock passed: etcd watch, multiplexed command WSS, passive Edge-to-Node watch stream, TLS/plain policy, static control proxy, per-port auth, Node Proxy CONNECT, status propagation, access/audit logging"
+echo "real process mock passed: etcd watch, multiplexed command WSS, passive Ingress-to-Node watch stream, TLS/plain policy, static control proxy, per-port auth, Relay CONNECT, status propagation, access/audit logging"

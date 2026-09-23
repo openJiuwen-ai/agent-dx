@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "ADX edge, node proxy, and data-plane forwarding services"
+description = "ADX ingress, node proxy, and data-plane forwarding services"
 
 [lints]
 workspace = true
@@ -15,13 +15,13 @@ name = "data_plane_gateway"
 path = "src/lib.rs"
 
 [[bin]]
-name = "adx-node-proxy"
-path = "src/bin/node_proxy.rs"
+name = "adx-relay"
+path = "src/bin/relay.rs"
 required-features = ["activity-client"]
 
 [[bin]]
-name = "adx-edge-frontend"
-path = "src/bin/edge_frontend.rs"
+name = "adx-ingress"
+path = "src/bin/ingress.rs"
 required-features = ["activity-client"]
 
 [[bin]]

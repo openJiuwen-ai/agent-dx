@@ -2,7 +2,7 @@
 import asyncio
 async def handle(r,w):
  try:
-  rr,ww=await asyncio.open_connection('master',5000)
+  rr,ww=await asyncio.open_connection('coordinator',5000)
   async def copy(a,b):
    try:
     while data:=await a.read(65536):b.write(data);await b.drain()

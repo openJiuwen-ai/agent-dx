@@ -3,13 +3,13 @@
 use base64::Engine;
 use data_plane_gateway::common::protocol::{ConnectTarget, GatewayPolicy};
 use data_plane_gateway::common::route::{
-    CapsuleStatus, DataPlaneAuthMode, PortForwardRoute, RouteInfo,
+    DataPlaneAuthMode, EnvironmentStatus, PortForwardRoute, RouteInfo,
 };
-use data_plane_gateway::edge::{
-    AccessKind, DataPlaneL4Connector, EdgeAuthenticator, EdgeFrontend, EdgeRouteResolver,
-    H2PoolConfig, RouteStore,
+use data_plane_gateway::ingress::{
+    AccessKind, DataPlaneL4Connector, H2PoolConfig, Ingress, IngressAuthenticator,
+    IngressRouteResolver, RouteStore,
 };
-use data_plane_gateway::node::NodeProxy;
+use data_plane_gateway::node::Relay;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
@@ -25,7 +25,7 @@ async fn mock_full_data_plane_protocol_matrix() {
     let node_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let node_address = node_listener.local_addr().unwrap();
     let node = Arc::new(
-        NodeProxy::new(GatewayPolicy::for_local_mock(vec!["127.0.0.0/8"
+        Relay::new(GatewayPolicy::for_local_mock(vec!["127.0.0.0/8"
             .parse()
             .unwrap()]))
         .with_route_enforcement(),
@@ -46,13 +46,13 @@ async fn mock_full_data_plane_protocol_matrix() {
     let store = Arc::new(RouteStore::new());
     let route = RouteInfo {
         instance_id: "instance-a".into(),
-        capsule_status: CapsuleStatus {
+        environment_status: EnvironmentStatus {
             code: 3,
             ..Default::default()
         },
         tenant_id: "tenant-a".into(),
         sandbox_id: "sandbox-a".into(),
-        node_proxy_address: node_address.to_string(),
+        relay_address: node_address.to_string(),
         sandbox_ip: "127.0.0.1".into(),
         tunnel_security_mode: Default::default(),
         port_forward_security_mode: Default::default(),
@@ -65,7 +65,7 @@ async fn mock_full_data_plane_protocol_matrix() {
     )
     .await;
     store.put(route.clone());
-    let resolver = Arc::new(EdgeRouteResolver::new(store.clone()));
+    let resolver = Arc::new(IngressRouteResolver::new(store.clone()));
     let connector = DataPlaneL4Connector::new(H2PoolConfig {
         connections_per_node: 1,
         max_connections_per_node: 2,
@@ -74,68 +74,80 @@ async fn mock_full_data_plane_protocol_matrix() {
     });
     let node_connector = connector.clone();
     let gateway = Arc::new(
-        EdgeFrontend::new(
+        Ingress::new(
             resolver,
             connector,
-            EdgeAuthenticator::new(true, false, "", Duration::from_secs(30)).unwrap(),
+            IngressAuthenticator::new(true, false, "", Duration::from_secs(30)).unwrap(),
             http_target.port(),
             8765,
             http_target.to_string(),
-            data_plane_gateway::edge::parse_static_routes("exact:/healthz").unwrap(),
+            data_plane_gateway::ingress::parse_static_routes("exact:/healthz").unwrap(),
         )
         .with_client_acl(Vec::new(), true),
     );
-    let edge_http = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let edge_http_address = edge_http.local_addr().unwrap();
-    let edge_health = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let edge_health_address = edge_health.local_addr().unwrap();
+    let ingress_http = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ingress_http_address = ingress_http.local_addr().unwrap();
+    let ingress_health = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ingress_health_address = ingress_health.local_addr().unwrap();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let route_reconciler_task =
         tokio::spawn(gateway.clone().run_route_reconciler(store.subscribe()));
-    let edge_http_task = tokio::spawn(gateway.clone().serve_http(edge_http, shutdown_rx.clone()));
-    let edge_health_task = tokio::spawn(gateway.clone().serve_health(edge_health, shutdown_rx));
+    let ingress_http_task = tokio::spawn(
+        gateway
+            .clone()
+            .serve_http(ingress_http, shutdown_rx.clone()),
+    );
+    let ingress_health_task =
+        tokio::spawn(gateway.clone().serve_health(ingress_health, shutdown_rx));
 
-    assert_not_ready(edge_health_address).await;
+    assert_not_ready(ingress_health_address).await;
     store.set_ready(true);
-    assert_ready(edge_health_address).await;
-    assert_direct_requires_tls(edge_http_address).await;
-    assert_plaintext_rejects_credentials(edge_http_address, http_target.port()).await;
-    assert_optional_port_forwarding_without_token(edge_http_address, http_target.port()).await;
+    assert_ready(ingress_health_address).await;
+    assert_direct_requires_tls(ingress_http_address).await;
+    assert_plaintext_rejects_credentials(ingress_http_address, http_target.port()).await;
+    assert_optional_port_forwarding_without_token(ingress_http_address, http_target.port()).await;
     assert_eq!(seen_paths.recv().await.unwrap().path, "/anonymous");
     assert_sandbox_port_forward_security_override(
-        edge_http_address,
+        ingress_http_address,
         http_target.port(),
         &store,
         &route,
     )
     .await;
-    assert_port_forward_http(edge_http_address, http_target.port()).await;
+    assert_port_forward_http(ingress_http_address, http_target.port()).await;
     let seen = seen_paths.recv().await.unwrap();
     assert_eq!(seen.path, "/hello?x=1");
     assert!(!seen.has_authorization);
     assert!(!seen.has_x_auth);
     assert_http_keepalive_reuse(
-        edge_http_address,
+        ingress_http_address,
         http_target.port(),
         &mut seen_paths,
         &http_accepts,
     )
     .await;
     assert!(gateway.backend_http_pool_metrics().reused_total >= 2);
-    assert_websocket_upgrade(edge_http_address, http_target.port()).await;
+    assert_websocket_upgrade(ingress_http_address, http_target.port()).await;
     assert_eq!(seen_paths.recv().await.unwrap().path, "/socket");
-    assert_http_connect(edge_http_address, echo_target.port()).await;
+    assert_http_connect(ingress_http_address, echo_target.port()).await;
     for access_kind in [
         AccessKind::Tunnel,
         AccessKind::PortForwarding,
         AccessKind::Ssh,
     ] {
-        assert_connect(edge_http_address, echo_target.port(), access_kind).await;
+        assert_connect(ingress_http_address, echo_target.port(), access_kind).await;
     }
-    assert_route_change_closes_stream(edge_http_address, echo_target.port(), &store, &route).await;
-    assert_capsule_status_is_preserved(edge_http_address, http_target.port(), &store, &route).await;
-    assert_missing_route_is_404(edge_http_address, http_target.port(), &store, &route).await;
-    assert_unlistened_port_is_502(edge_http_address).await;
+    assert_route_change_closes_stream(ingress_http_address, echo_target.port(), &store, &route)
+        .await;
+    assert_environment_status_is_preserved(
+        ingress_http_address,
+        http_target.port(),
+        &store,
+        &route,
+    )
+    .await;
+    assert_missing_route_is_404(ingress_http_address, http_target.port(), &store, &route).await;
+    assert_unlistened_port_is_502(ingress_http_address).await;
     assert_node_route_retirement(&node_connector, &node, node_address, echo_target).await;
     assert_eq!(gateway.physical_connections(), 1);
     assert_node_drain(&node_connector, &node, node_address, echo_target).await;
@@ -146,11 +158,11 @@ async fn mock_full_data_plane_protocol_matrix() {
         }
     })
     .await
-    .expect("node streams did not drain after edge clients closed");
+    .expect("node streams did not drain after ingress clients closed");
     assert_eq!(node.active_streams(), 0);
     let _ = shutdown_tx.send(true);
-    edge_http_task.await.unwrap().unwrap();
-    edge_health_task.await.unwrap().unwrap();
+    ingress_http_task.await.unwrap().unwrap();
+    ingress_health_task.await.unwrap().unwrap();
     route_reconciler_task.abort();
     node_task.abort();
     http_target_task.abort();
@@ -159,7 +171,7 @@ async fn mock_full_data_plane_protocol_matrix() {
 
 async fn assert_node_drain(
     connector: &DataPlaneL4Connector,
-    gateway: &NodeProxy,
+    gateway: &Relay,
     node: std::net::SocketAddr,
     target: std::net::SocketAddr,
 ) {
@@ -209,7 +221,7 @@ async fn assert_node_drain(
 
 async fn assert_node_route_retirement(
     connector: &DataPlaneL4Connector,
-    gateway: &NodeProxy,
+    gateway: &Relay,
     node: std::net::SocketAddr,
     target: std::net::SocketAddr,
 ) {
@@ -272,29 +284,29 @@ async fn assert_node_route_retirement(
         .unwrap();
 }
 
-async fn assert_not_ready(edge: std::net::SocketAddr) {
+async fn assert_not_ready(ingress: std::net::SocketAddr) {
     let response = raw_http(
-        edge,
-        "GET /readyz HTTP/1.1\r\nHost: edge\r\nConnection: close\r\n\r\n",
+        ingress,
+        "GET /readyz HTTP/1.1\r\nHost: ingress\r\nConnection: close\r\n\r\n",
     )
     .await;
     assert!(response.starts_with("HTTP/1.1 503"), "{response}");
 }
 
-async fn assert_ready(edge: std::net::SocketAddr) {
+async fn assert_ready(ingress: std::net::SocketAddr) {
     let response = raw_http(
-        edge,
-        "GET /readyz HTTP/1.1\r\nHost: edge\r\nConnection: close\r\n\r\n",
+        ingress,
+        "GET /readyz HTTP/1.1\r\nHost: ingress\r\nConnection: close\r\n\r\n",
     )
     .await;
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
 }
 
-async fn assert_port_forward_http(edge: std::net::SocketAddr, port: u16) {
+async fn assert_port_forward_http(ingress: std::net::SocketAddr, port: u16) {
     let response = raw_http(
-        edge,
+        ingress,
         &format!(
-            "GET /instance-a/{port}/hello?x=1 HTTP/1.1\r\nHost: edge\r\nConnection: close\r\n\r\n"
+            "GET /instance-a/{port}/hello?x=1 HTTP/1.1\r\nHost: ingress\r\nConnection: close\r\n\r\n"
         ),
     )
     .await;
@@ -303,7 +315,7 @@ async fn assert_port_forward_http(edge: std::net::SocketAddr, port: u16) {
 }
 
 async fn assert_http_keepalive_reuse(
-    edge: std::net::SocketAddr,
+    ingress: std::net::SocketAddr,
     port: u16,
     seen: &mut mpsc::Receiver<SeenRequest>,
     accepts: &AtomicUsize,
@@ -314,9 +326,9 @@ async fn assert_http_keepalive_reuse(
     let before = accepts.load(Ordering::Relaxed);
     for path in ["reuse-a", "reuse-b"] {
         let response = raw_http(
-            edge,
+            ingress,
             &format!(
-                "GET /instance-a/{port}/{path} HTTP/1.1\r\nHost: edge\r\nConnection: close\r\n\r\n"
+                "GET /instance-a/{port}/{path} HTTP/1.1\r\nHost: ingress\r\nConnection: close\r\n\r\n"
             ),
         )
         .await;
@@ -329,20 +341,20 @@ async fn assert_http_keepalive_reuse(
     );
 }
 
-async fn assert_direct_requires_tls(edge: std::net::SocketAddr) {
+async fn assert_direct_requires_tls(ingress: std::net::SocketAddr) {
     let response = raw_http(
-        edge,
-        "GET /direct/instance-a/hello HTTP/1.1\r\nHost: edge\r\nConnection: close\r\n\r\n",
+        ingress,
+        "GET /direct/instance-a/hello HTTP/1.1\r\nHost: ingress\r\nConnection: close\r\n\r\n",
     )
     .await;
     assert!(response.starts_with("HTTP/1.1 426"), "{response}");
 }
 
-async fn assert_plaintext_rejects_credentials(edge: std::net::SocketAddr, port: u16) {
+async fn assert_plaintext_rejects_credentials(ingress: std::net::SocketAddr, port: u16) {
     let response = raw_http(
-        edge,
+        ingress,
         &format!(
-            "GET /instance-a/{port}/hello HTTP/1.1\r\nHost: edge\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
+            "GET /instance-a/{port}/hello HTTP/1.1\r\nHost: ingress\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
             jwt("tenant-a")
         ),
     )
@@ -350,11 +362,11 @@ async fn assert_plaintext_rejects_credentials(edge: std::net::SocketAddr, port: 
     assert!(response.starts_with("HTTP/1.1 400"), "{response}");
 }
 
-async fn assert_optional_port_forwarding_without_token(edge: std::net::SocketAddr, port: u16) {
+async fn assert_optional_port_forwarding_without_token(ingress: std::net::SocketAddr, port: u16) {
     let response = raw_http(
-        edge,
+        ingress,
         &format!(
-            "GET /instance-a/{port}/anonymous HTTP/1.1\r\nHost: edge\r\nConnection: close\r\n\r\n"
+            "GET /instance-a/{port}/anonymous HTTP/1.1\r\nHost: ingress\r\nConnection: close\r\n\r\n"
         ),
     )
     .await;
@@ -362,7 +374,7 @@ async fn assert_optional_port_forwarding_without_token(edge: std::net::SocketAdd
 }
 
 async fn assert_sandbox_port_forward_security_override(
-    edge: std::net::SocketAddr,
+    ingress: std::net::SocketAddr,
     port: u16,
     store: &RouteStore,
     route: &RouteInfo,
@@ -375,9 +387,9 @@ async fn assert_sandbox_port_forward_security_override(
     store.put(required);
 
     let anonymous = raw_http(
-        edge,
+        ingress,
         &format!(
-            "GET /instance-a/{port}/sandbox-policy HTTP/1.1\r\nHost: edge\r\nConnection: close\r\n\r\n"
+            "GET /instance-a/{port}/sandbox-policy HTTP/1.1\r\nHost: ingress\r\nConnection: close\r\n\r\n"
         ),
     )
     .await;
@@ -386,12 +398,12 @@ async fn assert_sandbox_port_forward_security_override(
 }
 
 async fn assert_route_change_closes_stream(
-    edge: std::net::SocketAddr,
+    ingress: std::net::SocketAddr,
     port: u16,
     store: &RouteStore,
     route: &RouteInfo,
 ) {
-    let mut stream = open_connect(edge, port, AccessKind::Ssh).await;
+    let mut stream = open_connect(ingress, port, AccessKind::Ssh).await;
     stream.write_all(b"before-route-delete").await.unwrap();
     let mut echoed = vec![0; "before-route-delete".len()];
     stream.read_exact(&mut echoed).await.unwrap();
@@ -409,17 +421,17 @@ async fn assert_route_change_closes_stream(
     .await
     .expect("deleted route stream was not closed");
     store.put(route.clone());
-    assert_connect(edge, port, AccessKind::Ssh).await;
+    assert_connect(ingress, port, AccessKind::Ssh).await;
 }
 
-async fn assert_capsule_status_is_preserved(
-    edge: std::net::SocketAddr,
+async fn assert_environment_status_is_preserved(
+    ingress: std::net::SocketAddr,
     port: u16,
     store: &RouteStore,
     route: &RouteInfo,
 ) {
     let mut failed = route.clone();
-    failed.capsule_status = CapsuleStatus {
+    failed.environment_status = EnvironmentStatus {
         code: 5,
         exit_code: 137,
         msg: "sandbox crashed".into(),
@@ -428,9 +440,9 @@ async fn assert_capsule_status_is_preserved(
     };
     store.put(failed);
     let response = raw_http(
-        edge,
+        ingress,
         &format!(
-            "GET /instance-a/{port}/hello HTTP/1.1\r\nHost: edge\r\nConnection: close\r\n\r\n"
+            "GET /instance-a/{port}/hello HTTP/1.1\r\nHost: ingress\r\nConnection: close\r\n\r\n"
         ),
     )
     .await;
@@ -442,16 +454,16 @@ async fn assert_capsule_status_is_preserved(
 }
 
 async fn assert_missing_route_is_404(
-    edge: std::net::SocketAddr,
+    ingress: std::net::SocketAddr,
     port: u16,
     store: &RouteStore,
     route: &RouteInfo,
 ) {
     store.delete("instance-a");
     let response = raw_http(
-        edge,
+        ingress,
         &format!(
-            "GET /instance-a/{port}/hello HTTP/1.1\r\nHost: edge\r\nConnection: close\r\n\r\n"
+            "GET /instance-a/{port}/hello HTTP/1.1\r\nHost: ingress\r\nConnection: close\r\n\r\n"
         ),
     )
     .await;
@@ -459,24 +471,24 @@ async fn assert_missing_route_is_404(
     store.put(route.clone());
 }
 
-async fn assert_unlistened_port_is_502(edge: std::net::SocketAddr) {
+async fn assert_unlistened_port_is_502(ingress: std::net::SocketAddr) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     drop(listener);
     let response = raw_http(
-        edge,
-        &format!("GET /instance-a/{port}/ HTTP/1.1\r\nHost: edge\r\nConnection: close\r\n\r\n"),
+        ingress,
+        &format!("GET /instance-a/{port}/ HTTP/1.1\r\nHost: ingress\r\nConnection: close\r\n\r\n"),
     )
     .await;
     assert!(response.starts_with("HTTP/1.1 502"), "{response}");
 }
 
-async fn assert_websocket_upgrade(edge: std::net::SocketAddr, port: u16) {
-    let mut stream = TcpStream::connect(edge).await.unwrap();
+async fn assert_websocket_upgrade(ingress: std::net::SocketAddr, port: u16) {
+    let mut stream = TcpStream::connect(ingress).await.unwrap();
     stream
         .write_all(
             format!(
-                "GET /tunnel/instance-a/{port}/socket HTTP/1.1\r\nHost: edge\r\nConnection: Upgrade\r\nUpgrade: mock\r\n\r\n"
+                "GET /tunnel/instance-a/{port}/socket HTTP/1.1\r\nHost: ingress\r\nConnection: Upgrade\r\nUpgrade: mock\r\n\r\n"
             )
             .as_bytes(),
         )
@@ -490,24 +502,28 @@ async fn assert_websocket_upgrade(edge: std::net::SocketAddr, port: u16) {
     assert_eq!(echoed, b"websocket-bytes");
 }
 
-async fn assert_http_connect(edge: std::net::SocketAddr, port: u16) {
-    let mut stream = open_connect(edge, port, AccessKind::PortForwarding).await;
+async fn assert_http_connect(ingress: std::net::SocketAddr, port: u16) {
+    let mut stream = open_connect(ingress, port, AccessKind::PortForwarding).await;
     stream.write_all(b"connect-bytes").await.unwrap();
     let mut echoed = vec![0; "connect-bytes".len()];
     stream.read_exact(&mut echoed).await.unwrap();
     assert_eq!(echoed, b"connect-bytes");
 }
 
-async fn assert_connect(edge: std::net::SocketAddr, port: u16, access_kind: AccessKind) {
-    let mut stream = open_connect(edge, port, access_kind).await;
+async fn assert_connect(ingress: std::net::SocketAddr, port: u16, access_kind: AccessKind) {
+    let mut stream = open_connect(ingress, port, access_kind).await;
     stream.write_all(b"l4-bytes").await.unwrap();
     let mut echoed = vec![0; "l4-bytes".len()];
     stream.read_exact(&mut echoed).await.unwrap();
     assert_eq!(echoed, b"l4-bytes");
 }
 
-async fn open_connect(edge: std::net::SocketAddr, port: u16, access_kind: AccessKind) -> TcpStream {
-    let mut stream = TcpStream::connect(edge).await.unwrap();
+async fn open_connect(
+    ingress: std::net::SocketAddr,
+    port: u16,
+    access_kind: AccessKind,
+) -> TcpStream {
+    let mut stream = TcpStream::connect(ingress).await.unwrap();
     stream
         .write_all(
             format!(
@@ -529,8 +545,8 @@ fn jwt(tenant: &str) -> String {
     format!("e30.{payload}.signature")
 }
 
-async fn raw_http(edge: std::net::SocketAddr, request: &str) -> String {
-    let mut stream = TcpStream::connect(edge).await.unwrap();
+async fn raw_http(ingress: std::net::SocketAddr, request: &str) -> String {
+    let mut stream = TcpStream::connect(ingress).await.unwrap();
     stream.write_all(request.as_bytes()).await.unwrap();
     let mut response = Vec::new();
     stream.read_to_end(&mut response).await.unwrap();
@@ -671,7 +687,7 @@ async fn assert_half_closed_route_cancel(websocket: bool) {
         }
     });
     let node = Arc::new(
-        NodeProxy::new(GatewayPolicy::for_local_mock(vec!["127.0.0.0/8"
+        Relay::new(GatewayPolicy::for_local_mock(vec!["127.0.0.0/8"
             .parse()
             .unwrap()]))
         .with_route_enforcement(),
@@ -694,13 +710,13 @@ async fn assert_half_closed_route_cancel(websocket: bool) {
             .await;
         store.put(RouteInfo {
             instance_id: id.into(),
-            capsule_status: CapsuleStatus {
+            environment_status: EnvironmentStatus {
                 code: 3,
                 ..Default::default()
             },
             sandbox_id: id.into(),
             sandbox_ip: backend_address.ip().to_string(),
-            node_proxy_address: node_address.to_string(),
+            relay_address: node_address.to_string(),
             tenant_id: String::new(),
             tunnel_security_mode: Default::default(),
             port_forward_security_mode: Default::default(),
@@ -708,15 +724,15 @@ async fn assert_half_closed_route_cancel(websocket: bool) {
         });
     }
     store.set_ready(true);
-    let edge = Arc::new(
-        EdgeFrontend::new(
-            Arc::new(EdgeRouteResolver::new(store.clone())),
+    let ingress = Arc::new(
+        Ingress::new(
+            Arc::new(IngressRouteResolver::new(store.clone())),
             DataPlaneL4Connector::new(H2PoolConfig {
                 connections_per_node: 1,
                 max_connections_per_node: 1,
                 ..Default::default()
             }),
-            EdgeAuthenticator::new(true, false, "", Duration::from_secs(30)).unwrap(),
+            IngressAuthenticator::new(true, false, "", Duration::from_secs(30)).unwrap(),
             backend_address.port(),
             8765,
             backend_address.to_string(),
@@ -725,16 +741,16 @@ async fn assert_half_closed_route_cancel(websocket: bool) {
         .with_client_acl(Vec::new(), true),
     );
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let edge_address = listener.local_addr().unwrap();
+    let ingress_address = listener.local_addr().unwrap();
     let (_shutdown, shutdown) = watch::channel(false);
-    let reconciler = tokio::spawn(edge.clone().run_route_reconciler(store.subscribe()));
-    let edge_task = tokio::spawn(edge.clone().serve_http(listener, shutdown));
+    let reconciler = tokio::spawn(ingress.clone().run_route_reconciler(store.subscribe()));
+    let ingress_task = tokio::spawn(ingress.clone().serve_http(listener, shutdown));
     let mut clients = Vec::new();
     for id in ["instance-a", "instance-b"] {
-        let mut client = TcpStream::connect(edge_address).await.unwrap();
+        let mut client = TcpStream::connect(ingress_address).await.unwrap();
         let port = backend_address.port();
         let request = if websocket {
-            format!("GET /{id}/{port}/ws HTTP/1.1\r\nHost: edge\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
+            format!("GET /{id}/{port}/ws HTTP/1.1\r\nHost: ingress\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
         } else {
             format!("CONNECT {id}:{port} HTTP/1.1\r\nHost: {id}:{port}\r\nX-Adx-Access-Kind: port-forwarding\r\n\r\n")
         };
@@ -756,8 +772,8 @@ async fn assert_half_closed_route_cancel(websocket: bool) {
         assert_eq!(data, b"ready");
         clients.push(client);
     }
-    assert_eq!(edge.active_sessions(), 2);
-    assert_eq!(edge.physical_connections(), 1);
+    assert_eq!(ingress.active_sessions(), 2);
+    assert_eq!(ingress.physical_connections(), 1);
     // A normal upstream FIN preserves the client's writable direction.
     for (client, byte) in clients.iter_mut().zip(*b"ab") {
         client.write_all(&[byte]).await.unwrap();
@@ -770,7 +786,7 @@ async fn assert_half_closed_route_cancel(websocket: bool) {
     }
     store.delete("instance-a");
     timeout(Duration::from_secs(3), async {
-        while edge.active_sessions() != 1 || node.active_streams() != 1 {
+        while ingress.active_sessions() != 1 || node.active_streams() != 1 {
             sleep(Duration::from_millis(10)).await;
         }
     })
@@ -785,17 +801,17 @@ async fn assert_half_closed_route_cancel(websocket: bool) {
             .unwrap(),
         Some(b'c')
     );
-    assert_eq!(edge.physical_connections(), 1);
+    assert_eq!(ingress.physical_connections(), 1);
     store.delete("instance-b");
     timeout(Duration::from_secs(3), async {
-        while edge.active_sessions() != 0 || node.active_streams() != 0 {
+        while ingress.active_sessions() != 0 || node.active_streams() != 0 {
             sleep(Duration::from_millis(10)).await;
         }
     })
     .await
     .expect("second route cancellation retained a half-closed session");
     drop(clients);
-    edge_task.abort();
+    ingress_task.abort();
     reconciler.abort();
     node_task.abort();
     backend_task.abort();
