@@ -4,6 +4,7 @@ set -euo pipefail
 : "${BUILDKITE_COMMIT:?Buildkite revision required}"
 root=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$root"
+source .buildkite/python-env.sh
 output=out/buildkite/sdk
 mkdir -p "$output" out/buildkite/logs
 

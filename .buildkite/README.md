@@ -458,3 +458,19 @@ some worker kernels register the driver but reject block-backed mounts. The
 Kubernetes acceptance profile uses the digest-pinned OCI EXECD image instead and
 therefore checks bridge networking without requiring EROFS; standalone tests
 continue to exercise the packaged EROFS source.
+
+## Python dependency image
+
+`ADX_PYTHON_IMAGE_SYNC_ONLY=1` selects the maintenance job that builds
+`build/images/Dockerfile.python`. Its base image and SWR repository are recorded
+in `build/images/python-environment.json`. The recipe downloads the pinned tools
+and runtime dependencies from `python-requirements.txt` into an offline wheelhouse,
+then verifies a clean, network-free installation before and after registry push.
+Pin the published digest in the Python package/publish jobs after that gate passes.
+
+When the wheelhouse is present, `python-env.sh` checks its recipe against the
+checkout and sets `PIP_NO_INDEX=1` and `PIP_FIND_LINKS`; a stale recipe fails with a
+rebuild instruction. Package and install-smoke virtualenvs remain isolated.
+The Docker runner mounts the same persistent pip directory that it passes as
+`PIP_CACHE_DIR`; `PIP_INDEX_URL`, `PIP_EXTRA_INDEX_URL` and `PIP_DEFAULT_TIMEOUT`
+are forwarded when configured, for runs using an image without a wheelhouse.

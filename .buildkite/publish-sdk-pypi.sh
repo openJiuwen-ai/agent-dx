@@ -10,6 +10,7 @@ esac
 : "${BUILDKITE_BUILD_ID:?Buildkite build ID required}"
 root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$root"
+source .buildkite/python-env.sh
 output=out/buildkite/sdk
 publish_output=out/buildkite/sdk-publish
 logs=out/buildkite/logs

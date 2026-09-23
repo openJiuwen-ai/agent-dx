@@ -1,0 +1,11 @@
+ARG BASE
+FROM ${BASE}
+ARG PIP_INDEX_URL=https://repo.huaweicloud.com/repository/pypi/simple
+COPY build/images/python-requirements.txt /opt/adx-python-wheels/requirements.txt
+RUN python3 -m venv /tmp/wheel-builder \
+    && /tmp/wheel-builder/bin/python -m pip download --only-binary=:all: --disable-pip-version-check \
+       --dest /opt/adx-python-wheels -r /opt/adx-python-wheels/requirements.txt \
+    && rm -rf /tmp/wheel-builder
+COPY .buildkite/verify-python-image.sh /usr/local/bin/adx-verify-python-image
+RUN chmod 0755 /usr/local/bin/adx-verify-python-image && /usr/local/bin/adx-verify-python-image
+WORKDIR /workspace

@@ -31,7 +31,11 @@ if ! docker info >/dev/null 2>&1; then
 fi
 docker info >/dev/null
 docker pull "$ADX_SDK_TEST_IMAGE"
-docker run --rm \
+python_env=(-e PIP_CACHE_DIR=/root/.cache/pip)
+for name in PIP_INDEX_URL PIP_EXTRA_INDEX_URL PIP_DEFAULT_TIMEOUT; do
+  if [[ -n ${!name:-} ]]; then python_env+=(-e "$name"); fi
+done
+docker run --rm "${python_env[@]}" \
   -e BUILDKITE_COMMIT -e BUILDKITE_BUILD_ID \
   -v "$PWD:/workspace" -v /mnt/paas/build-cache/adx/pip:/root/.cache/pip \
   -w /workspace "$ADX_SDK_TEST_IMAGE" bash "build/$package/ci.sh"
