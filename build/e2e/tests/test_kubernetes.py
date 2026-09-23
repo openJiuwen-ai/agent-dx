@@ -118,6 +118,25 @@ class KubernetesLifecycleTests(unittest.TestCase):
             self.assertEqual(run.cleanup(),[])
             self.assertEqual(events,['stop','collect','copy'])
 
+    def test_l0_cleanup_selects_basic_stop_and_keeps_namespace_removal(self):
+        import json,tempfile
+        with tempfile.TemporaryDirectory() as d:
+            run=self.module.KubernetesRun(Path(d),Path('/fixture/kubeconfig'),profile='l0')
+            run.namespace_attempted=True;run.namespace_uid='owned';run.nodes=['node1']
+            calls=[];deleted=False
+            def kube(*args,**kwargs):
+                nonlocal deleted
+                if args[:2]==('get','namespace'):
+                    return '' if deleted else json.dumps({'metadata':{'uid':'owned','labels':{'adx.e2e.run':run.id}}})
+                if args[:2]==('delete','namespace'):deleted=True
+                return ''
+            run.kube=kube
+            run.execute=lambda *a,**k:calls.append(a)
+            run.helper=lambda *a,**k:None
+            self.assertEqual(run.cleanup(),[])
+            self.assertTrue(deleted)
+            self.assertIn('node.py cleanup node1', calls[0][-1])
+
     def test_registry_manifest_cannot_point_to_another_bundle(self):
         import json,tempfile
         with tempfile.TemporaryDirectory() as d:

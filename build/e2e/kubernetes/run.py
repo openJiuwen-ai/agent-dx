@@ -97,7 +97,7 @@ def credentials(directory, image, runtime_image):
 
 
 class KubernetesRun(common.Run):
-    def __init__(self, output, kubeconfig, context=None):
+    def __init__(self, output, kubeconfig, context=None, profile="k8s-basic"):
         super().__init__(output)
         self.kubectl = ['kubectl', '--kubeconfig', str(kubeconfig.resolve())]
         if context:
@@ -105,6 +105,7 @@ class KubernetesRun(common.Run):
         self.namespace_uid = None
         self.namespace_attempted = False
         self.harness = None
+        self.profile = profile
 
     def kube(self, *args, timeout=180):
         return self.command([*self.kubectl, *args], timeout, stream=not any(
@@ -239,8 +240,9 @@ class KubernetesRun(common.Run):
             for node in reversed(self.nodes):
                 try:
                     # If the scenario already stopped it, skip the unavailable supervisor.
+                    action = 'cleanup' if self.profile == 'l0' else 'stop'
                     self.execute(node, 'sh', '-c', 'test -f /evidence/stop-' + node + '.json || '
-                                 'python3 /opt/adx/e2e/node.py stop ' + node, timeout=180)
+                                 'python3 /opt/adx/e2e/node.py ' + action + ' ' + node, timeout=180)
                 except Exception as e:
                     errors.append(f'{node} stop: {e}')
                 try:
@@ -275,7 +277,7 @@ def main():
     a = p.parse_args()
     output = a.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
-    run = KubernetesRun(output, a.kubeconfig, a.context)
+    run = KubernetesRun(output, a.kubeconfig, a.context, a.profile)
     checks = [];required=common.required_for_profile(a.profile)
     error = None
     def cancel(signum, frame):

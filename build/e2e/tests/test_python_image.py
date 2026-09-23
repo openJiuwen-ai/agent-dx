@@ -1,4 +1,5 @@
 import os
+import json
 from pathlib import Path
 import subprocess
 import tempfile
@@ -8,6 +9,20 @@ ROOT = Path(__file__).resolve().parents[3]
 
 
 class PythonImageTests(unittest.TestCase):
+    def test_package_and_publish_jobs_share_verified_wheelhouse_digest(self):
+        import yaml
+        config = json.loads((ROOT / 'build/images/python-environment.json').read_text())
+        image = config['ci_image']
+        self.assertTrue(image.startswith(config['repository'] + '@sha256:'))
+        for name in ('package', 'sdk', 'admin'):
+            pipeline = yaml.safe_load((ROOT / f'.buildkite/pipeline-{name}.yml').read_text())
+            for step in pipeline['steps']:
+                if step.get('key') in ('sdk-package', 'admin-package'):
+                    self.assertEqual(step['env']['ADX_SDK_TEST_IMAGE'], image)
+                if step.get('key') in ('sdk-pypi', 'admin-pypi'):
+                    containers = step['plugins'][0]['kubernetes']['podSpec']['containers']
+                    self.assertEqual(containers[0]['image'], image)
+
     def test_offline_wheelhouse_is_selected_and_stale_recipe_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             wheels = Path(tmp)

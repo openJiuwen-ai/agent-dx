@@ -160,7 +160,7 @@ steps:
   - out/buildkite/logs/sdk-dockerd.log
   env:
     BUILDKITE_AGENT_NAME: agent-stack-k8s
-    ADX_SDK_TEST_IMAGE: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/adx-e2e@sha256:c310ebf3f56c846d21744640a899d52e16a98b5442ca39402a3132010c722c4a
+    ADX_SDK_TEST_IMAGE: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/adx-python-build@sha256:12afbd81cde9ec5931c9db8aaf955720fdfd1e1e267545a44430ce79a4d81854
   plugins:
   - kubernetes:
       podSpec:
@@ -223,7 +223,7 @@ steps:
   - out/buildkite/logs/sdk-*.log
   env:
     BUILDKITE_AGENT_NAME: agent-stack-k8s
-    ADX_SDK_TEST_IMAGE: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/adx-e2e@sha256:c310ebf3f56c846d21744640a899d52e16a98b5442ca39402a3132010c722c4a
+    ADX_SDK_TEST_IMAGE: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/adx-python-build@sha256:12afbd81cde9ec5931c9db8aaf955720fdfd1e1e267545a44430ce79a4d81854
   plugins:
   - kubernetes:
       podSpec:
@@ -451,7 +451,7 @@ steps:
         imagePullSecrets:
         - name: swr-pull-secret
         containers:
-        - image: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/adx-e2e@sha256:c310ebf3f56c846d21744640a899d52e16a98b5442ca39402a3132010c722c4a
+        - image: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/adx-python-build@sha256:12afbd81cde9ec5931c9db8aaf955720fdfd1e1e267545a44430ce79a4d81854
           volumeMounts:
           - name: build-cache
             mountPath: /mnt/paas
@@ -504,7 +504,7 @@ steps:
         imagePullSecrets:
         - name: swr-pull-secret
         containers:
-        - image: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/adx-e2e@sha256:c310ebf3f56c846d21744640a899d52e16a98b5442ca39402a3132010c722c4a
+        - image: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/adx-python-build@sha256:12afbd81cde9ec5931c9db8aaf955720fdfd1e1e267545a44430ce79a4d81854
           volumeMounts:
           - name: build-cache
             mountPath: /mnt/paas

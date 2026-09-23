@@ -89,6 +89,20 @@ class BuildSummaryTests(unittest.TestCase):
                     write(root,f'acceptance/{node}/{kind}-{node}.json',{'status':'passed'})
             self.assertEqual(summary.collect(root,'e2e',0,COMMIT)['e2e']['collection']['node2']['collection']['status'],'passed')
 
+    def test_l0_requires_business_and_cleanup_but_not_collector_fault_injection(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            write(root, 'summaries/images.json', {'commit': COMMIT, 'stages': {},
+                  'images': {'collector': {'version': 'test'}}})
+            report = {'profile': 'l0', 'status': 'passed', 'checks': ['l0', 'auth'],
+                      'cleanup_errors': [], 'missing_checks': []}
+            write(root, 'acceptance/result.json', report)
+            self.assertEqual(summary.collect(root, 'e2e', 0, COMMIT)['e2e']['report'], report)
+            report['cleanup_errors'] = ['backend remains']
+            write(root, 'acceptance/result.json', report)
+            with self.assertRaisesRegex(ValueError, 'acceptance evidence'):
+                summary.collect(root, 'e2e', 0, COMMIT)
+
     def test_streaming_preserves_failure_and_publishes_failure_summary(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

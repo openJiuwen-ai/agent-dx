@@ -2,5 +2,6 @@
   "schema_version": 1,
   "platform": "linux/amd64",
   "source_image": "swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/adx-e2e@sha256:c310ebf3f56c846d21744640a899d52e16a98b5442ca39402a3132010c722c4a",
-  "repository": "swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/adx-python-build"
+  "repository": "swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/adx-python-build",
+  "ci_image": "swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/adx-python-build@sha256:12afbd81cde9ec5931c9db8aaf955720fdfd1e1e267545a44430ce79a4d81854"
 }

@@ -89,6 +89,9 @@ authentication/tenant boundaries, and namespace cleanup. Fault/restart suites
 remain in the independent Full pipeline. Base PyPI steps depend on the successful
 L0 job. OBS uploads are candidate publication during assembly: an uploaded URL
 alone does not establish a passed L0 build. Check the final Buildkite verdict.
+L0 cleanup stops services, verifies an empty backend and deletes the test namespace.
+Collector outage/restart, complete trace and log rotation assertions remain in
+the broader profiles; L0 does not require their fault-injection evidence.
 
 L0 image composition downloads the base candidate once through OBS staging by
 default. Full keeps explicit base/SDK build IDs and its existing Buildkite input
@@ -466,7 +469,8 @@ continue to exercise the packaged EROFS source.
 in `build/images/python-environment.json`. The recipe downloads the pinned tools
 and runtime dependencies from `python-requirements.txt` into an offline wheelhouse,
 then verifies a clean, network-free installation before and after registry push.
-Pin the published digest in the Python package/publish jobs after that gate passes.
+The package and publish jobs use the verified digest recorded as `ci_image` in
+that JSON. Update it and the pipeline pins together after rebuilding the image.
 
 When the wheelhouse is present, `python-env.sh` checks its recipe against the
 checkout and sets `PIP_NO_INDEX=1` and `PIP_FIND_LINKS`; a stale recipe fails with a
