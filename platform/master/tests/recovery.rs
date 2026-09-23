@@ -65,6 +65,7 @@ fn saved() -> StoredSnapshot {
                 address: "127.0.0.1:9000".into(),
                 proxy_address: "127.0.0.1:9001".into(),
                 session: None,
+                scheduling_paused: false,
             },
         )]
         .into(),

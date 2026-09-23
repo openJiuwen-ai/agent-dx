@@ -173,6 +173,67 @@ impl Rig {
 
 #[tokio::test]
 #[ignore = "requires real Redis and generated mTLS certificates"]
+async fn operator_pause_keeps_node_visible_but_removes_it_from_admission() {
+    let mut rig = Rig::new().await;
+    assert!(rig.claimants[0]
+        .get_scheduling_queue(pb::GetSchedulingQueueRequest {})
+        .await
+        .is_ok());
+    let paused = rig.claimants[0]
+        .set_node_scheduling(pb::SetNodeSchedulingRequest {
+            node_id: "a".into(),
+            accepting_allocations: false,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!paused.accepting_allocations);
+    let mut directory = rig
+        .master
+        .watch_nodes(pb::WatchNodesRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    let frame = directory.message().await.unwrap().unwrap();
+    assert_eq!(frame.nodes.len(), 2);
+    assert!(
+        !frame
+            .nodes
+            .iter()
+            .find(|node| node.node_id == "a")
+            .unwrap()
+            .accepting_allocations
+    );
+    assert!(
+        frame
+            .nodes
+            .iter()
+            .find(|node| node.node_id == "b")
+            .unwrap()
+            .accepting_allocations
+    );
+
+    let resumed = rig.claimants[0]
+        .set_node_scheduling(pb::SetNodeSchedulingRequest {
+            node_id: "a".into(),
+            accepting_allocations: true,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(resumed.accepting_allocations);
+    let next = directory.message().await.unwrap().unwrap();
+    assert!(
+        next.nodes
+            .iter()
+            .find(|node| node.node_id == "a")
+            .unwrap()
+            .accepting_allocations
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires real Redis and generated mTLS certificates"]
 async fn capsule_directory_streams_full_then_incremental_ownership() {
     let mut rig = Rig::new().await;
     let mut directory = pb::capsule_directory_service_client::CapsuleDirectoryServiceClient::new(
@@ -636,7 +697,8 @@ async fn local_first_https_directory_round_robin_and_concurrent_creation() {
         "create_mode": "local_first", "ca": tls.join("ca.pem"),
         "certificate": tls.join("api-server.pem"), "private_key": tls.join("api-server.key"),
         "server_name": "localhost", "rpc_timeout_seconds": 5,
-        "cache_entries": 128, "auth_cache_ttl_seconds": 1
+        "cache_entries": 128, "auth_cache_ttl_seconds": 1,
+        "edge_mode": "standalone"
     });
     let path = directory.path().join("api.json");
     std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
@@ -650,7 +712,7 @@ async fn local_first_https_directory_round_robin_and_concurrent_creation() {
         .spawn()
         .unwrap();
     let script =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../build/ci/local_first_http.py");
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../build/ci/local_first_http.py");
     let result = tokio::process::Command::new("python3")
         .arg(script)
         .env("ADX_TEST_API_ENDPOINT", format!("https://{address}"))

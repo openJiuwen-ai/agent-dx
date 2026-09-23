@@ -663,20 +663,21 @@ impl pb::master_service_server::MasterService for MasterRpc {
                             .nodes
                             .values()
                             .filter(|n| {
-                                n.node.available
-                                    && n.session.as_ref().is_some_and(|session| {
-                                        state
-                                            .live_claimant(
-                                                &n.node.id,
-                                                &session.id,
-                                                service.0.heartbeat_timeout,
-                                            )
-                                            .is_ok()
-                                    })
+                                n.session.as_ref().is_some_and(|session| {
+                                    state
+                                        .live_claimant(
+                                            &n.node.id,
+                                            &session.id,
+                                            service.0.heartbeat_timeout,
+                                        )
+                                        .is_ok()
+                                })
                             })
                             .filter_map(|n| {
                                 let (capacity, allocatable) =
                                     state.scheduler.node_resources(&n.node.id)?;
+                                let (capacity_devices, allocatable_devices) =
+                                    state.scheduler.node_devices(&n.node.id)?;
                                 Some(pb::NodeEndpoint {
                                     node_id: n.node.id.clone(),
                                     address: n.address.clone(),
@@ -689,6 +690,15 @@ impl pb::master_service_server::MasterService for MasterRpc {
                                     capacity: Some(capacity.into()),
                                     allocatable: Some(allocatable.into()),
                                     labels: n.node.labels.clone().into_iter().collect(),
+                                    accepting_allocations: n.node.available,
+                                    capacity_devices: capacity_devices
+                                        .into_iter()
+                                        .map(Into::into)
+                                        .collect(),
+                                    allocatable_devices: allocatable_devices
+                                        .into_iter()
+                                        .map(Into::into)
+                                        .collect(),
                                 })
                             })
                             .collect(),
@@ -704,6 +714,69 @@ impl pb::master_service_server::MasterService for MasterRpc {
         Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
             rx,
         )))
+    }
+    async fn get_scheduling_queue(
+        &self,
+        _request: Request<pb::GetSchedulingQueueRequest>,
+    ) -> std::result::Result<Response<pb::GetSchedulingQueueResponse>, Status> {
+        let state = self.0.state.lock().await;
+        state.healthy().map_err(status)?;
+        let capsules = state
+            .scheduler
+            .pending_requests()
+            .into_iter()
+            .take(10_000)
+            .map(|request| pb::PendingCapsule {
+                spec: Some(request.spec.into()),
+                enqueue_time_millis: request.enqueue_time_millis,
+            })
+            .collect();
+        Ok(Response::new(pb::GetSchedulingQueueResponse { capsules }))
+    }
+    async fn set_node_scheduling(
+        &self,
+        request: Request<pb::SetNodeSchedulingRequest>,
+    ) -> std::result::Result<Response<pb::NodeSchedulingState>, Status> {
+        let r = request.into_inner();
+        if r.node_id.trim().is_empty() {
+            return Err(Status::invalid_argument("node_id required"));
+        }
+        let mut state = self.0.state.lock().await;
+        state.recover_claim_write().await.map_err(status)?;
+        state.healthy().map_err(status)?;
+        let locally_accepting = state
+            .live
+            .get(&r.node_id)
+            .filter(|live| !live.expired && live.last_seen.elapsed() < self.0.heartbeat_timeout)
+            .is_some_and(|live| live.report.accepting_allocations && !live.report.reconciling);
+        let saved = state
+            .session
+            .set_node_scheduling(
+                &r.node_id,
+                !r.accepting_allocations,
+                r.accepting_allocations && locally_accepting,
+            )
+            .await
+            .map_err(status)?;
+        let shard = match state.scheduler.register(saved.node.clone()) {
+            Ok(shard) => shard,
+            Err(error) => {
+                state.needs_recovery = true;
+                self.0.changed.notify_waiters();
+                return Err(status(error));
+            }
+        };
+        if shard != saved.shard_id {
+            state.needs_recovery = true;
+            self.0.changed.notify_waiters();
+            return Err(Status::internal("node shard mismatch; recovery required"));
+        }
+        state.nodes.insert(r.node_id.clone(), saved);
+        self.0.changed.notify_waiters();
+        Ok(Response::new(pb::NodeSchedulingState {
+            node_id: r.node_id,
+            accepting_allocations: r.accepting_allocations,
+        }))
     }
     async fn prepare_create(
         &self,
@@ -953,7 +1026,10 @@ impl pb::master_service_server::MasterService for MasterRpc {
                             return Err(status(error));
                         }
                     };
-                    let shard = state.scheduler.register(node).map_err(status)?;
+                    let shard = state
+                        .scheduler
+                        .register(saved.node.clone())
+                        .map_err(status)?;
                     if shard != saved.shard_id {
                         state.needs_recovery = true;
                         return Err(Status::internal("node shard mismatch; recovery required"));

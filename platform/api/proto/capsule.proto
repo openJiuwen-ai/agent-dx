@@ -10,6 +10,8 @@ import public "routes.proto";
 
 service MasterService {
   rpc WatchNodes(WatchNodesRequest) returns (stream NodeDirectory);
+  rpc GetSchedulingQueue(GetSchedulingQueueRequest) returns (GetSchedulingQueueResponse);
+  rpc SetNodeScheduling(SetNodeSchedulingRequest) returns (NodeSchedulingState);
   rpc PrepareCreate(LocalCapsuleCreateRequest) returns (PreparedCapsule);
   rpc ClaimCapsule(ClaimCapsuleRequest) returns (ClaimCapsuleResponse);
   rpc ForwardCreate(LocalCapsuleCreateRequest) returns (CapsuleResult);
@@ -121,8 +123,20 @@ message NodeEndpoint {
   Resources capacity = 4;
   Resources allocatable = 5;
   map<string,string> labels = 6;
+  bool accepting_allocations = 7;
+  repeated Device capacity_devices = 8;
+  repeated Device allocatable_devices = 9;
 }
 message NodeDirectory { uint64 epoch = 1; repeated NodeEndpoint nodes = 2; uint64 valid_for_millis = 3; }
+message GetSchedulingQueueRequest {}
+message PendingCapsule { CapsuleSpec spec = 1; uint64 enqueue_time_millis = 2; }
+message GetSchedulingQueueResponse { repeated PendingCapsule capsules = 1; }
+message SetNodeSchedulingRequest {
+  string node_id = 1;
+  bool accepting_allocations = 2;
+  reserved 3;
+}
+message NodeSchedulingState { string node_id = 1; bool accepting_allocations = 2; }
 message LocalCapsuleCreateRequest { CreateCapsuleRequest create = 1; string node_session_id = 2; }
 message PreparedCapsule { CapsuleSpec spec = 1; ReusableSnapshot snapshot = 2; }
 message ClaimCapsuleRequest { CapsuleSpec spec = 1; CallerContext caller = 2; string node_session_id = 3; repeated DeviceAllocation devices = 4; }

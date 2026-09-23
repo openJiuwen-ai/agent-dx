@@ -75,6 +75,9 @@ pub struct StoredNode {
     pub proxy_address: String,
     #[serde(default)]
     pub session: Option<NodeSession>,
+    /// Administrative admission override. Heartbeats cannot clear it.
+    #[serde(default)]
+    pub scheduling_paused: bool,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Recovery {
@@ -625,7 +628,7 @@ impl Session {
     }
     pub async fn register_session(
         &self,
-        node: Node,
+        mut node: Node,
         address: String,
         proxy_address: String,
         session: Option<NodeSession>,
@@ -639,8 +642,12 @@ impl Session {
             let [header_value, node_value] =
                 self.store.fields([HEADER.into(), field.clone()]).await?;
             let mut header = self.header(&header_value)?;
-            let shard = if let Some(node_value) = &node_value {
-                decode::<StoredNode>(node_value)?.shard_id
+            let previous = node_value
+                .as_deref()
+                .map(decode::<StoredNode>)
+                .transpose()?;
+            let (shard, scheduling_paused) = if let Some(previous) = &previous {
+                (previous.shard_id, previous.scheduling_paused)
             } else {
                 let current = self.snapshot().await?;
                 if current.revision != header.revision {
@@ -655,14 +662,18 @@ impl Session {
                     .min_by_key(|shard| counts[*shard])
                     .expect("nonempty shards");
                 header.next_node_shard = (shard + 1) % header.shards;
-                shard
+                (shard, false)
             };
+            if scheduling_paused {
+                node.available = false;
+            }
             let record = StoredNode {
                 node: node.clone(),
                 shard_id: shard,
                 address: address.clone(),
                 proxy_address: proxy_address.clone(),
                 session: session.clone(),
+                scheduling_paused,
             };
             let encoded = encode(&record)?;
             if node_value.as_ref() == Some(&encoded) {
@@ -685,6 +696,48 @@ impl Session {
         }
         Err(Error::Unavailable(
             "concurrent node registration; retry request".into(),
+        ))
+    }
+
+    /// Persist an operator admission override without changing node ownership or session.
+    pub async fn set_node_scheduling(
+        &self,
+        id: &str,
+        paused: bool,
+        available: bool,
+    ) -> Result<StoredNode> {
+        if id.trim().is_empty() {
+            return Err(Error::Invalid("node id required".into()));
+        }
+        let field = format!("node:{id}");
+        for _ in 0..ATTEMPTS {
+            let [header_value, node_value] =
+                self.store.fields([HEADER.into(), field.clone()]).await?;
+            let mut header = self.header(&header_value)?;
+            let mut record: StoredNode = decode(node_value.as_deref().ok_or(Error::NotFound)?)?;
+            let available = available && !paused;
+            if record.scheduling_paused == paused && record.node.available == available {
+                return Ok(record);
+            }
+            record.scheduling_paused = paused;
+            record.node.available = available;
+            header.advance()?;
+            if self
+                .store
+                .cas(
+                    header_value
+                        .as_deref()
+                        .expect("validated control header is present"),
+                    &header,
+                    Some((&field, encode(&record)?)),
+                )
+                .await?
+            {
+                return Ok(record);
+            }
+        }
+        Err(Error::Unavailable(
+            "concurrent node scheduling update; retry request".into(),
         ))
     }
     /// Persist a scheduler-selected assignment before sending it to the node.

@@ -58,6 +58,34 @@ async fn register(s: &adx_master::storage::Session, id: &str) -> StoredNode {
 
 #[tokio::test]
 #[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn administrative_scheduling_pause_survives_node_heartbeats() {
+    let rig = common::Redis::new().await;
+    let session = rig.store().await.begin(1).await.unwrap();
+    let registered = register(&session, "node").await;
+    assert!(registered.node.available);
+    assert!(!registered.scheduling_paused);
+
+    let paused = session
+        .set_node_scheduling("node", true, false)
+        .await
+        .unwrap();
+    assert!(paused.scheduling_paused);
+    assert!(!paused.node.available);
+
+    let heartbeat = register(&session, "node").await;
+    assert!(heartbeat.scheduling_paused);
+    assert!(!heartbeat.node.available);
+
+    let resumed = session
+        .set_node_scheduling("node", false, true)
+        .await
+        .unwrap();
+    assert!(!resumed.scheduling_paused);
+    assert!(resumed.node.available);
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
 async fn runtime_network_policy_is_the_only_mutable_spec_field() {
     let rig = common::Redis::new().await;
     let session = rig.store().await.begin(1).await.unwrap();

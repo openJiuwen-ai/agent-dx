@@ -96,6 +96,16 @@ resubscribes for a new full frame. Normal lifecycle lookups use this local
 directory. `MasterService.GetCapsule` remains a targeted read-after-write and
 uncertain-result recovery operation.
 
+`MasterService.WatchNodes` publishes every live node with an explicit
+`accepting_allocations` bit. API Server keeps the complete view for resource
+queries and only rotates accepting nodes as local-first creation entries.
+`GetSchedulingQueue` exposes the bounded in-memory ShardScheduler wait view,
+while `SetNodeScheduling` persists an administrative pause that blocks new
+assignments without changing existing Capsule ownership. These internal RPCs
+do not carry an end-user identity or restrict the internal component caller;
+administrator authorization is enforced once at the public HTTP boundary, and
+trusted internal controllers can call Master directly.
+
 `RouteService.WatchRoutes` is restricted to the `edge` mTLS identity. Each stream
 begins with a full `RouteFrame` (`reset=true`); subsequent frames specify the
 exact `base_revision`. Epoch identifies the Master storage session. A gap,

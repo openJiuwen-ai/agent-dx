@@ -21,7 +21,7 @@ use std::{
     collections::HashMap,
     convert::Infallible,
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{mpsc, Mutex};
 use tonic::{Code, Status};
@@ -179,6 +179,67 @@ impl Api {
             return match self.clients.nodes().await {
                 Ok(nodes) => plain(StatusCode::OK.as_u16(), resource_view(nodes)),
                 Err(error) => error_response(error, &request_id, None, None, false),
+            };
+        }
+        if method == "GET" && path == "/global-scheduler/resources" {
+            return match self.clients.nodes().await {
+                Ok(nodes) => plain(
+                    StatusCode::OK.as_u16(),
+                    legacy_resource_view(nodes, &request_id),
+                ),
+                Err(error) => error_response(error, &request_id, None, None, false),
+            };
+        }
+        if method == "GET" && path == "/global-scheduler/scheduling_queue" {
+            if !caller.administrator {
+                return error_response(
+                    Status::permission_denied("administrator required"),
+                    &request_id,
+                    None,
+                    None,
+                    false,
+                );
+            }
+            return match self.clients.scheduling_queue().await {
+                Ok(queue) => plain(StatusCode::OK.as_u16(), scheduling_queue_view(queue)),
+                Err(error) => error_response(error, &request_id, None, None, false),
+            };
+        }
+        if matches!(method.as_str(), "POST" | "DELETE")
+            && path == "/global-scheduler/node/localschedulingstatus"
+        {
+            if !caller.administrator {
+                return error_response(
+                    Status::permission_denied("administrator required"),
+                    &request_id,
+                    None,
+                    None,
+                    true,
+                );
+            }
+            let Some(node_id) = query
+                .get("node_id")
+                .filter(|node_id| !node_id.trim().is_empty())
+                .cloned()
+            else {
+                return error_response(
+                    Status::invalid_argument("node_id required"),
+                    &request_id,
+                    None,
+                    None,
+                    true,
+                );
+            };
+            let accepting = method == "DELETE";
+            return match self.clients.set_node_scheduling(node_id, accepting).await {
+                Ok(_) => plain(
+                    StatusCode::OK.as_u16(),
+                    json!({
+                        "status": if accepting { "normal" } else { "evicting" },
+                        "message": "success",
+                    }),
+                ),
+                Err(error) => error_response(error, &request_id, None, None, true),
             };
         }
         if method == "GET" && path == "/api/instances" {
@@ -1018,7 +1079,9 @@ fn agent_route(method: &str, path: &str) -> bool {
         )
 }
 fn route_name(path: &str) -> &'static str {
-    if path.starts_with("/api/admin/") {
+    if path.starts_with("/global-scheduler/") {
+        "/global-scheduler/*"
+    } else if path.starts_with("/api/admin/") {
         "/api/admin/*"
     } else if path.starts_with("/api/agent") {
         "/api/agent/*"
@@ -1032,23 +1095,174 @@ fn route_name(path: &str) -> &'static str {
 }
 
 fn resource_view(nodes: Vec<pb::NodeEndpoint>) -> Value {
-    fn scalar(resources: Option<pb::Resources>) -> Value {
+    fn resources(resources: Option<pb::Resources>, devices: &[pb::Device]) -> Value {
         let resources = resources.unwrap_or_default();
-        json!({
-            "CPU": resources.cpu_millis,
-            "Memory": resources.memory_bytes / 1_048_576,
-            "Disk": resources.disk_bytes / 1_048_576,
-        })
+        let mut values = serde_json::Map::from_iter([
+            ("CPU".into(), json!(resources.cpu_millis)),
+            ("Memory".into(), json!(resources.memory_bytes / 1_048_576)),
+            ("Disk".into(), json!(resources.disk_bytes / 1_048_576)),
+        ]);
+        for (name, count) in device_counts(devices) {
+            values.insert(name, json!(count));
+        }
+        Value::Object(values)
     }
     json!({
         "items": nodes.into_iter().map(|node| json!({
             "id": node.node_id,
-            "status": 1,
-            "capacity": scalar(node.capacity),
-            "allocatable": scalar(node.allocatable),
+            "status": if node.accepting_allocations { 0 } else { 1 },
+            "capacity": resources(node.capacity, &node.capacity_devices),
+            "allocatable": resources(node.allocatable, &node.allocatable_devices),
             "labels": node.labels,
         })).collect::<Vec<_>>()
     })
+}
+
+fn legacy_resource_view(nodes: Vec<pb::NodeEndpoint>, request_id: &str) -> Value {
+    fn resources(resources: Option<pb::Resources>, devices: &[pb::Device]) -> Value {
+        let resources = resources.unwrap_or_default();
+        let mut values = serde_json::Map::from_iter([
+            (
+                "CPU".into(),
+                json!({"scalar": {"value": resources.cpu_millis}}),
+            ),
+            (
+                "Memory".into(),
+                json!({"scalar": {"value": resources.memory_bytes / 1_048_576}}),
+            ),
+            (
+                "Disk".into(),
+                json!({"scalar": {"value": resources.disk_bytes / 1_048_576}}),
+            ),
+        ]);
+        for (name, count) in device_counts(devices) {
+            values.insert(
+                name,
+                json!({"vectors": {"values": {"count": {"vectors": {
+                    "cards": {"values": [count]}
+                }}}}}),
+            );
+        }
+        json!({"resources": values})
+    }
+    fn add(total: &mut pb::Resources, value: &Option<pb::Resources>) {
+        if let Some(value) = value {
+            total.cpu_millis = total.cpu_millis.saturating_add(value.cpu_millis);
+            total.memory_bytes = total.memory_bytes.saturating_add(value.memory_bytes);
+            total.disk_bytes = total.disk_bytes.saturating_add(value.disk_bytes);
+        }
+    }
+    let mut capacity = pb::Resources::default();
+    let mut allocatable = pb::Resources::default();
+    let mut capacity_devices = Vec::new();
+    let mut allocatable_devices = Vec::new();
+    let fragments = nodes
+        .into_iter()
+        .map(|node| {
+            add(&mut capacity, &node.capacity);
+            add(&mut allocatable, &node.allocatable);
+            capacity_devices.extend(node.capacity_devices.clone());
+            allocatable_devices.extend(node.allocatable_devices.clone());
+            let labels = node
+                .labels
+                .into_iter()
+                .map(|(name, value)| {
+                    let items = serde_json::Map::from_iter([(value, json!(1))]);
+                    (name, json!({"items": items}))
+                })
+                .collect::<serde_json::Map<_, _>>();
+            let id = node.node_id;
+            let unit = json!({
+                "id": id.clone(),
+                "capacity": resources(node.capacity, &node.capacity_devices),
+                "allocatable": resources(node.allocatable, &node.allocatable_devices),
+                "nodeLabels": labels,
+                "status": if node.accepting_allocations { 0 } else { 1 },
+            });
+            (id, unit)
+        })
+        .collect::<serde_json::Map<_, _>>();
+    json!({
+        "requestID": request_id,
+        "resource": {
+            "id": "adx-cluster",
+            "capacity": resources(Some(capacity), &capacity_devices),
+            "allocatable": resources(Some(allocatable), &allocatable_devices),
+            "fragment": fragments,
+            "status": 0,
+        }
+    })
+}
+
+fn device_counts(devices: &[pb::Device]) -> std::collections::BTreeMap<String, u64> {
+    let mut counts = std::collections::BTreeMap::new();
+    for device in devices {
+        let kind = match pb::DeviceKind::try_from(device.kind) {
+            Ok(pb::DeviceKind::Gpu) => "GPU",
+            Ok(pb::DeviceKind::Npu) => "NPU",
+            _ => continue,
+        };
+        let name = if device.model.is_empty() {
+            kind.to_string()
+        } else {
+            format!("{kind}/{}", device.model)
+        };
+        *counts.entry(name).or_default() += 1;
+    }
+    counts
+}
+
+fn scheduling_queue_view(queue: pb::GetSchedulingQueueResponse) -> Value {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX);
+    let instance_infos = queue
+        .capsules
+        .into_iter()
+        .filter_map(|pending| {
+            let spec = pending.spec?;
+            let resources = spec.resources.unwrap_or_default();
+            let mut public_resources = serde_json::Map::from_iter([
+                ("cpu".into(), json!(format!("{}m", resources.cpu_millis))),
+                (
+                    "memory".into(),
+                    json!(format!("{}Mi", resources.memory_bytes / 1_048_576)),
+                ),
+                (
+                    "Disk".into(),
+                    json!(format!("{}Mi", resources.disk_bytes / 1_048_576)),
+                ),
+            ]);
+            if let Some(scheduling) = spec.scheduling {
+                let mut gpu = 0u64;
+                let mut npu = 0u64;
+                for device in scheduling.devices {
+                    match pb::DeviceKind::try_from(device.kind).ok()? {
+                        pb::DeviceKind::Gpu => gpu += u64::from(device.count),
+                        pb::DeviceKind::Npu => npu += u64::from(device.count),
+                        pb::DeviceKind::Unspecified => return None,
+                    }
+                }
+                if gpu > 0 {
+                    public_resources.insert("GPU".into(), json!(gpu.to_string()));
+                }
+                if npu > 0 {
+                    public_resources.insert("NPU".into(), json!(npu.to_string()));
+                }
+            }
+            Some(json!({
+                "instanceID": spec.id,
+                "requestID": spec.id,
+                "resources": public_resources,
+                "enqueueTimeMs": pending.enqueue_time_millis.to_string(),
+                "waitDurationMs": now.saturating_sub(pending.enqueue_time_millis).to_string(),
+            }))
+        })
+        .collect::<Vec<_>>();
+    json!({"count": instance_infos.len(), "instanceInfos": instance_infos})
 }
 
 #[cfg(test)]
@@ -1084,11 +1298,108 @@ mod error_contract_tests {
                 disk_bytes: 10 * 1_048_576,
             }),
             labels: [("arch".into(), "arm64".into())].into_iter().collect(),
+            accepting_allocations: true,
+            capacity_devices: vec![pb::Device {
+                id: 0,
+                kind: pb::DeviceKind::Gpu.into(),
+                model: "A100".into(),
+                healthy: true,
+            }],
+            allocatable_devices: vec![pb::Device {
+                id: 0,
+                kind: pb::DeviceKind::Gpu.into(),
+                model: "A100".into(),
+                healthy: true,
+            }],
         }]);
         assert_eq!(value["items"][0]["id"], "node-a");
         assert_eq!(value["items"][0]["capacity"]["CPU"], 4000);
         assert_eq!(value["items"][0]["allocatable"]["Memory"], 6);
         assert_eq!(value["items"][0]["labels"]["arch"], "arm64");
+        assert_eq!(value["items"][0]["status"], 0);
+        assert_eq!(value["items"][0]["capacity"]["GPU/A100"], 1);
+    }
+
+    #[test]
+    fn legacy_resource_view_exposes_fragment_units_and_aggregate_capacity() {
+        let node = |id: &str, accepting_allocations: bool| pb::NodeEndpoint {
+            node_id: id.into(),
+            capacity: Some(pb::Resources {
+                cpu_millis: 2000,
+                memory_bytes: 4096 * 1_048_576,
+                disk_bytes: 1024 * 1_048_576,
+            }),
+            allocatable: Some(pb::Resources {
+                cpu_millis: 1000,
+                memory_bytes: 2048 * 1_048_576,
+                disk_bytes: 512 * 1_048_576,
+            }),
+            labels: [("HOST_IP".into(), format!("10.0.0.{id}"))]
+                .into_iter()
+                .collect(),
+            accepting_allocations,
+            capacity_devices: vec![pb::Device {
+                id: id.parse().unwrap(),
+                kind: pb::DeviceKind::Npu.into(),
+                model: "910B".into(),
+                healthy: true,
+            }],
+            allocatable_devices: vec![pb::Device {
+                id: id.parse().unwrap(),
+                kind: pb::DeviceKind::Npu.into(),
+                model: "910B".into(),
+                healthy: true,
+            }],
+            ..Default::default()
+        };
+        let value = legacy_resource_view(vec![node("1", true), node("2", false)], "req");
+        assert_eq!(value["requestID"], "req");
+        assert_eq!(
+            value["resource"]["capacity"]["resources"]["CPU"]["scalar"]["value"],
+            4000
+        );
+        assert_eq!(value["resource"]["fragment"]["1"]["status"], 0);
+        assert_eq!(value["resource"]["fragment"]["2"]["status"], 1);
+        assert_eq!(
+            value["resource"]["allocatable"]["resources"]["NPU/910B"]["vectors"]["values"]["count"]
+                ["vectors"]["cards"]["values"][0],
+            2
+        );
+        assert_eq!(
+            value["resource"]["fragment"]["1"]["nodeLabels"]["HOST_IP"]["items"]["10.0.0.1"],
+            1
+        );
+    }
+
+    #[test]
+    fn scheduling_queue_view_preserves_legacy_shape_and_device_totals() {
+        let value = scheduling_queue_view(pb::GetSchedulingQueueResponse {
+            capsules: vec![pb::PendingCapsule {
+                spec: Some(pb::CapsuleSpec {
+                    id: "capsule-a".into(),
+                    resources: Some(pb::Resources {
+                        cpu_millis: 2000,
+                        memory_bytes: 4096 * 1_048_576,
+                        disk_bytes: 1024 * 1_048_576,
+                    }),
+                    scheduling: Some(pb::SchedulingPolicy {
+                        devices: vec![pb::DeviceRequest {
+                            kind: pb::DeviceKind::Gpu.into(),
+                            model: None,
+                            count: 2,
+                        }],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                enqueue_time_millis: 1,
+            }],
+        });
+        assert_eq!(value["count"], 1);
+        assert_eq!(value["instanceInfos"][0]["instanceID"], "capsule-a");
+        assert_eq!(value["instanceInfos"][0]["requestID"], "capsule-a");
+        assert_eq!(value["instanceInfos"][0]["resources"]["cpu"], "2000m");
+        assert_eq!(value["instanceInfos"][0]["resources"]["GPU"], "2");
     }
 
     #[tokio::test]

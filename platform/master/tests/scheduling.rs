@@ -98,6 +98,17 @@ fn tenant_round_robin_with_priority_and_fifo_inside_tenant() {
 }
 
 #[test]
+fn pending_requests_expose_identity_and_enqueue_time_without_dequeueing() {
+    let mut master = Master::new(1, Placement::Pack).unwrap();
+    master.submit(spec("waiting", "tenant", 3)).unwrap();
+    let pending = master.pending_requests();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].spec.id, "waiting");
+    assert!(pending[0].enqueue_time_millis > 0);
+    assert_eq!(master.pending(0).unwrap(), 1);
+}
+
+#[test]
 fn duplicate_submission_is_idempotent_but_changed_spec_conflicts() {
     let mut master = Master::new(1, Placement::Pack).unwrap();
     master.register(node("n1", 2)).unwrap();

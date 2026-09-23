@@ -4,6 +4,22 @@ Rust public management HTTP service, binary `adx-api-server`, in the root Cargo 
 
 Requests are converted directly to the generated Capsule RPC types. There is no Go adapter, function payload, generic Signal dispatch or legacy protobuf dependency. Public Sandbox paths and base64 JSON response envelopes remain compatible with the Sandbox SDK. Existing `functionProxyId` in a resume response is a public compatibility field containing the node ID.
 
+The API Server also owns the legacy-compatible scheduler HTTP paths while
+Master owns their state and decisions. `/global-scheduler/resources` reads the
+watched in-memory node directory and renders the legacy `resource.fragment`
+shape; `/api/sandbox/v1/resources` keeps the ADX `items` shape. Administrator-only
+`/global-scheduler/scheduling_queue` reads the bounded, memory-only central
+wait queue. `POST /global-scheduler/node/localschedulingstatus?node_id=...`
+pauses new allocation to a node and `DELETE` removes that pause. Existing
+Capsules keep running. The pause is persisted by Master and is not cleared by
+Node Manager heartbeats; local pressure or reconciliation can still keep a
+resumed node closed.
+API Server performs the administrator check before either internal RPC. Master
+does not repeat user or component authorization so trusted internal controllers
+can use the same operations directly.
+Both resource shapes include CPU millicores, Memory/Disk MiB and whole-card
+`GPU/<model>` or `NPU/<model>` capacity and allocatable counts.
+
 ## Modules
 
 | Module | Responsibility |
