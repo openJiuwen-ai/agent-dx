@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-case "${ADX_OBS_UPLOAD:-0}" in
+case "${ADX_OBS_UPLOAD:-1}" in
   0) echo 'OBS publication disabled (ADX_OBS_UPLOAD=0)'; exit 0 ;;
   1) ;;
   *) echo 'ADX_OBS_UPLOAD must be 0 or 1' >&2; exit 2 ;;

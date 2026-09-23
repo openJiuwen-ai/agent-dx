@@ -271,7 +271,7 @@ steps:
           hostPath:
             path: /mnt/paas
             type: DirectoryOrCreate
-- label: ':package: Assemble and optionally publish ADX base package'
+- label: ':package: Assemble and publish ADX base package'
   key: platform-build
   depends_on:
   - build-platform
@@ -310,6 +310,34 @@ steps:
     GOMODCACHE: /mnt/paas/build-cache/adx/go-mod
     ADX_BACKEND_ARTIFACT_BUILD: 01a0ad6d-9629-4da8-903b-3f8bd1ddc992
   plugins: *id001
+- label: ':page_facing_up: Artifact manifest'
+  key: artifact-manifest
+  depends_on: platform-build
+  agents:
+    queue: default
+    os: linux
+    arch: amd64
+  command: bash .buildkite/step.sh manifest bash .buildkite/artifact-manifest.sh
+  timeout_in_minutes: 5
+  artifact_paths:
+  - out/buildkite/index.html
+  - out/buildkite/logs/step-manifest.log
+  env:
+    BUILDKITE_AGENT_NAME: agent-stack-k8s
+  plugins:
+  - kubernetes:
+      podSpec:
+        imagePullSecrets:
+        - name: swr-pull-secret
+        containers:
+        - image: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/sandbox-deployer:v20260506_kubectl_py39
+          resources:
+            requests:
+              cpu: '1'
+              memory: 1Gi
+            limits:
+              cpu: '2'
+              memory: 2Gi
 - label: ':docker: Compose L0 smoke images'
   key: platform-images
   agents:

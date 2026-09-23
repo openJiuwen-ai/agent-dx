@@ -25,13 +25,16 @@ adxadmin 复用 SDK 的 Python 3.12 容器执行器，不使用 Rust 构建镜�
 
 组件中间产物默认经 OBS `adx/ci/<build UUID>/<commit>/<component>/` 传递，校验身份和
 SHA256 后组装。`ADX_ARTIFACT_TRANSPORT=buildkite` 可切回 Buildkite 传递。
-组装、临时目录安装检查和可选 OBS 上传都在 `platform-build` 内完成，上传直接使用本地
+组装、临时目录安装检查和默认 OBS 上传都在 `platform-build` 内完成，上传直接使用本地
 字节，不再下载整包。最终基础包、独立 `adx-execd.tar.gz`、backend、SDK 和 adxadmin 仍存为 Buildkite artifact。
+独立的 `artifact-manifest` 步骤校验 OBS manifest 的提交与 build ID，并将包含全部制品链接、
+大小和 SHA256 的 `out/buildkite/index.html` 上传到 Buildkite Artifacts。
 基础线随后复用镜像组合与 K8s 驱动，执行 `l0` SDK/auth 及清理门禁；Full 仍单独运行全量用例。
 基础线的可选 PyPI 发布必须等待 L0 通过。OBS 上传是组装后的候选产物发布，不能仅凭 URL 判断 L0 已通过。
 `build-manifest.json` 绑定基础包各组成；`admin-candidate.json` 单独绑定同提交、同 build 的 Python 包。
 
-发布开关默认关闭：`ADX_OBS_UPLOAD=1` 控制基础包/SDK 的正式 OBS 上传；
+基础包默认正式上传 OBS，可设 `ADX_OBS_UPLOAD=0` 关闭；独立 SDK 流水线默认不上传，
+需要 `ADX_OBS_UPLOAD=1` 显式开启。
 `ADX_ADMIN_PYPI_UPLOAD=1` 与 `ADX_SDK_PYPI_UPLOAD=1` 分别控制管理工具和 SDK 的 PyPI
 发布，还需对应版本标签、凭据。仓库选择由各自 `*_PYPI_REPOSITORY=pypi|testpypi` 指定。
 OBS 中间传递与正式上传是两个独立控制；完全不用 OBS 时选择 `buildkite` 且关闭上传。

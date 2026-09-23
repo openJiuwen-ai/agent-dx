@@ -11,8 +11,7 @@ ROOT = Path(__file__).resolve().parents[3]
 
 class PipelineContracts(unittest.TestCase):
     def test_publication_is_disabled_without_explicit_flag(self):
-        for script, flag in [('upload-obs.sh', 'ADX_OBS_UPLOAD'),
-                             ('upload-sdk-obs.sh', 'ADX_OBS_UPLOAD'),
+        for script, flag in [('upload-sdk-obs.sh', 'ADX_OBS_UPLOAD'),
                              ('publish-admin-pypi.sh', 'ADX_ADMIN_PYPI_UPLOAD'),
                              ('publish-sdk-pypi.sh', 'ADX_SDK_PYPI_UPLOAD')]:
             for value in (None, '0', 'bad'):
@@ -22,6 +21,29 @@ class PipelineContracts(unittest.TestCase):
                 result = subprocess.run(['bash', str(ROOT / '.buildkite' / script)],
                                         env=env, capture_output=True, text=True)
                 self.assertEqual(result.returncode, 2 if value == 'bad' else 0, result.stderr)
+
+    def test_base_obs_publication_defaults_on_and_index_is_independent_step(self):
+        script = ROOT / '.buildkite/upload-obs.sh'
+        self.assertIn('${ADX_OBS_UPLOAD:-1}', script.read_text())
+        for value, expected in [('0', 0), ('bad', 2)]:
+            result = subprocess.run(['bash', str(script)],
+                                    env={'PATH': os.environ['PATH'], 'ADX_OBS_UPLOAD': value},
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, expected, result.stderr)
+
+        result = subprocess.run(['bash', str(script)],
+                                env={'PATH': os.environ['PATH']},
+                                capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Buildkite revision required', result.stderr)
+
+        import yaml
+        pipeline = yaml.safe_load((ROOT / '.buildkite/pipeline-package.yml').read_text())
+        steps = {step['key']: step for step in pipeline['steps']}
+        index = steps['artifact-manifest']
+        self.assertEqual(index['depends_on'], 'platform-build')
+        self.assertIn('out/buildkite/index.html', index['artifact_paths'])
+        self.assertIn('.buildkite/artifact-manifest.sh', index['command'])
 
     def test_component_test_partition_covers_workspace_once(self):
         workspace = (ROOT / 'Cargo.toml').read_text().split('[workspace.package]')[0]
