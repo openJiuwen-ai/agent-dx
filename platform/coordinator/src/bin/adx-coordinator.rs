@@ -4,6 +4,7 @@ use adx_coordinator::{
     storage::RedisStore,
     Placement,
 };
+use adx_core::Error;
 use adx_process::{read_config, shutdown};
 use adx_protocol::control as pb;
 use adx_transport::tls::TlsFiles;
@@ -59,8 +60,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .load_rpc(adx_protocol::auth::Principal::Coordinator)?;
     let timeout = Duration::from_secs(config.rpc_timeout_seconds);
     let listener = tokio::net::TcpListener::bind(config.listen).await?;
-    let store = RedisStore::connect(&config.redis_url, &config.namespace, timeout).await?;
-    let session = store.begin(config.scheduler_shards).await?;
+    let session = loop {
+        let result = match RedisStore::connect(&config.redis_url, &config.namespace, timeout).await
+        {
+            Ok(store) => store.begin(config.scheduler_shards).await,
+            Err(error) => Err(error),
+        };
+        match result {
+            Ok(session) => break session,
+            Err(Error::Unavailable(message)) => {
+                adx_observability::warn!("Coordinator storage recovery unavailable: {message}");
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(5)) => {},
+                    _ = shutdown() => return Ok(()),
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+    };
     let mut administrators = Vec::new();
     let mut tenants = Vec::new();
     for credential in config.bootstrap_credentials {

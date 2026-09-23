@@ -308,6 +308,161 @@ async fn missing_or_future_schema_is_not_silently_reinitialized() {
     assert!(still_exists);
 }
 
+fn legacy_capsule_json(record: &adx_coordinator::storage::StoredEnvironment) -> String {
+    fn rename(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(fields) => {
+                if let Some(id) = fields.remove("environment_id") {
+                    fields.insert("capsule_id".into(), id);
+                }
+                if let Some(profile) = fields.remove("runtime_profile") {
+                    fields.insert("environment".into(), profile);
+                }
+                for nested in fields.values_mut() {
+                    rename(nested);
+                }
+            }
+            serde_json::Value::Array(items) => items.iter_mut().for_each(rename),
+            _ => {}
+        }
+    }
+    let mut value = serde_json::to_value(record).unwrap();
+    rename(&mut value);
+    value.to_string()
+}
+
+#[tokio::test]
+#[ignore = "requires real Redis; build/ci/run.py storage"]
+async fn startup_atomically_preserves_deleted_legacy_capsule_identity() {
+    let rig = common::Redis::new().await;
+    let db = rig.store().await;
+    let first = db.begin(1).await.unwrap();
+    register(&first, "node").await;
+    let mut old_spec = spec("old-deleted");
+    old_spec.runtime_profile = Some(adx_core::runtime_profile::RuntimeProfile {
+        rootfs: adx_core::runtime_profile::Rootfs {
+            runtime_class: "runc".into(),
+            r#type: "local".into(),
+            path: "/opt/adx/image/rootfs.erofs".into(),
+            image: String::new(),
+            readonly: true,
+        },
+        bootstrap: adx_core::runtime_profile::Bootstrap {
+            r#type: "erofs".into(),
+            root: "/opt/adx/image/rootfs.erofs".into(),
+            image: String::new(),
+            target: "/opt/adx/runtime".into(),
+            entrypoint: vec!["/opt/adx/runtime/rrt".into()],
+            image_process_config: "/etc/adx-image-process.json".into(),
+        },
+        env: Default::default(),
+    });
+    let assignment = Assignment {
+        environment_id: "old-deleted".into(),
+        node_id: "node".into(),
+        shard_id: 0,
+        generation: 1,
+        devices: vec![],
+    };
+    let saved = first
+        .reserve(old_spec.clone(), assignment.clone())
+        .await
+        .unwrap();
+    let mut deleted = running(old_spec.clone(), assignment);
+    deleted.state = EnvironmentState::Deleted;
+    deleted.resources_held = false;
+    deleted.revision = 4;
+    first.commit(deleted).await.unwrap();
+
+    let client = redis::Client::open(rig.url.as_str()).unwrap();
+    let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+    let key = "adx:{test}:control:v1";
+    let old = first.get("old-deleted").await.unwrap();
+    let _: () = redis::pipe()
+        .atomic()
+        .cmd("HSET")
+        .arg(key)
+        .arg("capsule:old-deleted")
+        .arg(legacy_capsule_json(&old))
+        .ignore()
+        .cmd("HDEL")
+        .arg(key)
+        .arg("environment:old-deleted")
+        .ignore()
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+
+    let next = db.begin(1).await.unwrap();
+    let migrated = next.get("old-deleted").await.unwrap();
+    assert_eq!(migrated, old);
+    assert!(next.snapshot().await.unwrap().routes().unwrap().is_empty());
+    assert_eq!(next.reserve(old_spec, saved.assignment).await.unwrap(), old);
+    let fields: Vec<String> = redis::cmd("HKEYS")
+        .arg(key)
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert!(!fields.iter().any(|field| field == "capsule:old-deleted"));
+    assert!(fields
+        .iter()
+        .any(|field| field == "environment:old-deleted"));
+    assert_eq!(
+        db.begin(1).await.unwrap().get("old-deleted").await.unwrap(),
+        old
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires real Redis; build/ci/run.py storage"]
+async fn startup_does_not_discard_live_legacy_capsule() {
+    let rig = common::Redis::new().await;
+    let db = rig.store().await;
+    let first = db.begin(1).await.unwrap();
+    register(&first, "node").await;
+    let assignment = Assignment {
+        environment_id: "old-running".into(),
+        node_id: "node".into(),
+        shard_id: 0,
+        generation: 1,
+        devices: vec![],
+    };
+    first
+        .reserve(spec("old-running"), assignment.clone())
+        .await
+        .unwrap();
+    first
+        .commit(running(spec("old-running"), assignment))
+        .await
+        .unwrap();
+    let old = first.get("old-running").await.unwrap();
+    let client = redis::Client::open(rig.url.as_str()).unwrap();
+    let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+    let key = "adx:{test}:control:v1";
+    let _: () = redis::pipe()
+        .atomic()
+        .cmd("HSET")
+        .arg(key)
+        .arg("capsule:old-running")
+        .arg(legacy_capsule_json(&old))
+        .ignore()
+        .cmd("HDEL")
+        .arg(key)
+        .arg("environment:old-running")
+        .ignore()
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert!(matches!(db.begin(1).await, Err(Error::Unavailable(_))));
+    let value: String = redis::cmd("HGET")
+        .arg(key)
+        .arg("capsule:old-running")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(value, legacy_capsule_json(&old));
+}
+
 #[tokio::test]
 #[ignore = "requires real Redis; build/ci/run.py storage"]
 async fn rejected_assignment_can_be_replaced_without_accepting_its_late_result() {
