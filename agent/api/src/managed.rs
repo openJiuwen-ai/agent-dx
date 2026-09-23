@@ -1,14 +1,14 @@
 //! Gateway product facade. Product state and Sandbox lifecycle stay behind the independent Activator.
 use crate::request::RequestContext;
-use crate::{activator::ActivatorClient, Error, Result};
+use crate::{activator::Control, Error, Result};
 use adx_agent_core::{activator::Target, target::Target as AccessTarget, *};
 use std::sync::Arc;
 
 pub struct ManagedService {
-    control: Arc<ActivatorClient>,
+    control: Arc<dyn Control>,
 }
 impl ManagedService {
-    pub fn new(control: Arc<ActivatorClient>) -> Self {
+    pub fn new(control: Arc<dyn Control>) -> Self {
         Self { control }
     }
     /// Select an Environment identity without creating product or Sandbox state.

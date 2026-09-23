@@ -1,7 +1,13 @@
 //! Agent transport composition. Management JSON is separate from unchanged data forwarding.
 use adx_agent_api::request::RequestContext;
-use adx_agent_api::{activator::ActivatorClient, managed::ManagedService, Error};
+use adx_agent_api::{
+    activator::{ActivatorClient, Control},
+    local::LocalControl,
+    managed::ManagedService,
+    Error,
+};
 use adx_agent_core::limits;
+use adx_agent_core::sandbox::Sandbox;
 use adx_agent_core::{Protocol, Scope, TemplateVersion};
 use bytes::Bytes;
 use http::{Request, Response};
@@ -28,7 +34,15 @@ fn default_timeout_seconds() -> u64 {
 pub struct AgentConfig {
     #[serde(default = "default_timeout_seconds")]
     pub timeout_seconds: u64,
-    pub activator: ActivatorConfig,
+    pub activator: Option<ActivatorConfig>,
+    pub embedded: Option<EmbeddedActivatorConfig>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EmbeddedActivatorConfig {
+    pub redis_url: String,
+    pub namespace: String,
 }
 pub struct AgentApi {
     pub managed: Arc<ManagedService>,
@@ -48,7 +62,12 @@ impl AgentApi {
                 Error::Invalid("Agent timeout must be positive and representable".into()).into(),
             );
         }
-        let settings = config.activator;
+        let settings = config
+            .activator
+            .ok_or_else(|| Error::Invalid("independent Activator configuration required".into()))?;
+        if config.embedded.is_some() {
+            return Err(Error::Invalid("configure exactly one Activator mode".into()).into());
+        }
         let token = std::env::var(&settings.token_env)
             .map_err(|_| Error::Invalid("Activator token environment variable missing".into()))?;
         let ca = settings.ca_path.map(std::fs::read).transpose()?;
@@ -62,6 +81,32 @@ impl AgentApi {
         Ok(Self {
             managed: Arc::new(ManagedService::new(control)),
             request_timeout,
+        })
+    }
+
+    /// Bind an embedded Activator directly to the API Server's Sandbox service.
+    pub async fn new_embedded(
+        config: AgentConfig,
+        sandbox: Arc<dyn Sandbox>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        if config.activator.is_some() {
+            return Err(Error::Invalid("configure exactly one Activator mode".into()).into());
+        }
+        let settings = config
+            .embedded
+            .ok_or_else(|| Error::Invalid("embedded Activator configuration required".into()))?;
+        let timeout = Duration::from_secs(config.timeout_seconds);
+        if timeout.is_zero() || tokio::time::Instant::now().checked_add(timeout).is_none() {
+            return Err(
+                Error::Invalid("Agent timeout must be positive and representable".into()).into(),
+            );
+        }
+        let control: Arc<dyn Control> = Arc::new(
+            LocalControl::connect(&settings.redis_url, &settings.namespace, sandbox).await?,
+        );
+        Ok(Self {
+            managed: Arc::new(ManagedService::new(control)),
+            request_timeout: timeout,
         })
     }
     pub fn matches(path: &str) -> bool {

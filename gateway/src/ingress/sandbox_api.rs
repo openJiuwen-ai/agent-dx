@@ -45,6 +45,36 @@ pub struct SandboxConfig {
     pub preinstalled_profiles: Vec<PreinstalledProfile>,
 }
 
+/// Validates Agent execution and maps it to the platform Environment contract.
+/// The API Server uses this without constructing a second lifecycle client.
+pub struct EnvironmentRequestMapper {
+    profiles: Vec<PreinstalledProfile>,
+    execd_token: String,
+}
+
+impl EnvironmentRequestMapper {
+    pub fn new(profiles: Vec<PreinstalledProfile>, execd_token: String) -> Result<Self> {
+        validate_service_token(&execd_token).map_err(SandboxError::Invalid)?;
+        validate_profiles(&profiles)?;
+        Ok(Self {
+            profiles,
+            execd_token,
+        })
+    }
+
+    pub fn validate_execution(&self, execution: &ExecutionSpec) -> Result<()> {
+        matching_profile(execution, &self.profiles).map(|_| ())
+    }
+
+    pub fn environment_spec(&self, request: &CreateSandbox) -> Result<pb::EnvironmentSpec> {
+        to_platform(request, &self.profiles, &self.execd_token)
+    }
+
+    pub fn observation(record: pb::EnvironmentRecord) -> Result<SandboxObservation> {
+        PlatformSandbox::observation(record)
+    }
+}
+
 pub struct PlatformSandbox {
     discovery: RedisDiscovery,
     tls: RpcClient,

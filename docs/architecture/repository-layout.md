@@ -13,7 +13,7 @@
 | 执行平台 `platform/` | 通用 Environment、调度、持久化、节点生命周期、Execd | Coordinator、adxlet、本地优先创建及 EROFS/OCI 运行环境已接入；沿用已有实现；本次验证见 [命名调整记录](../testing/environment-naming.md) |
 | 共享接入 `gateway/` | Sandbox API Server、Ingress、Relay、反向代理与转发 | API Server 默认内嵌 Ingress；adxlet 默认内嵌 Relay；Agent API 装配于 Ingress，业务规则归 Agent 层 |
 
-Agent API 在 Gateway Ingress 内处理产品请求，通过 ActivatorClient 调用独立无状态 Activator。Activator 持久化 Template/Environment，并通过 Gateway Sandbox HTTP 接口访问平台。Gateway 不连接 ADX 状态 Redis；Agent 不直接操作平台 Redis/SQLite 或 sandboxd。inline 生命周期和 exec/files 直接适配 Sandbox/Execd，独立于 Activator。用户 Harness 的 HTTP/WS/SSH 经共享数据面转发，业务协议由用户定义。
+Agent API 在 Gateway Ingress 内处理产品请求。独立模式通过 ActivatorClient 调用 Activator，后者通过 Gateway Sandbox HTTP 接口访问平台；API Server 内嵌模式通过 LocalControl 调用同进程 Activator，后者直接复用 API Server 的 Sandbox 应用服务。两种模式的 Template/Environment 产品状态均由 Activator 管理并存入 Redis。Agent 不直接操作平台 Redis/SQLite 或 sandboxd。inline 生命周期和 exec/files 直接适配 Sandbox/Execd，独立于 Activator。用户 Harness 的 HTTP/WS/SSH 经共享数据面转发，业务协议由用户定义。
 
 API Server 仍保留原有九条 `/api/agent` 兼容转发路由，由 `agent_address` 指向外部 Agent 服务；这是平台侧既有入口，不属于当前 Ingress Agent API／Activator 链路，本轮保持不变。
 

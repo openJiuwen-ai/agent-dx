@@ -1,13 +1,13 @@
 # Agent-DX v2
 
-Agent 层使用 Rust，产品 API 嵌入统一 Gateway。无状态 Activator 独立部署，可运行多个副本。
+Agent 层使用 Rust，产品 API 嵌入统一 Gateway。Activator 可独立部署，也可与 API Server 和 Ingress 共进程；多个副本使用相同产品状态命名空间。
 
 | 目录 | 职责 |
 | --- | --- |
 | `crates/core` | 产品类型、协议、Sandbox 能力边界及通用校验 |
 | `crates/store` | Template/Environment 元数据、Redis 原子条件写；内存实现仅供测试 |
 | `activator` | 产品管理与稳定身份激活，调用 Sandbox 接口，无后台健康/恢复扫描 |
-| `api` | inline 规格适配、Activator HTTP 客户端、Environment 身份选择、服务选择 |
+| `api` | inline 规格适配、Activator HTTP 客户端或本地模块调用、Environment 身份选择、服务选择 |
 | `cli` | Rust 用户命令行 `adx`；Template 发布/查询、Environment 分页查询/删除、HTTP 流式调用、SSH 交互终端 |
 
 Environment 对应一个稳定逻辑 Sandbox ID。指定 Environment 的首次访问会幂等创建元数据，再激活 Sandbox；多副本复用同一身份。无效模板或未声明的 service 不创建 Environment。Sandbox 状态、健康、暂停/恢复与运行载体 0–1 由 Platform 保证。产品删除确认后，新访问可以重建同名 Environment，generation 隔离旧生命周期。
@@ -26,16 +26,16 @@ cargo build --locked -p data-plane-gateway -p adx-apiserver --features data-plan
 
 Gateway 保留独立 Ingress 与 API Server 内嵌 Ingress 两种部署形态，共用进程装配代码。构建时为承载 Ingress 的二进制启用 `data-plane-gateway/agent-api`。两套公开接口可以分别启用，路由、配置与认证分开：
 
-- `ADX_AGENT_CONFIG` 指向 v2 配置文件，配置独立 Activator 的访问地址。受管管理和 HTTP/WS 数据入口使用 Platform API Key。
+- `ADX_AGENT_CONFIG` 指向 v2 配置文件，选择独立 Activator 地址或嵌入式 Activator 的 Redis 命名空间。受管管理和 HTTP/WS 数据入口使用 Platform API Key。
 - `ADX_INLINE_CONFIG` 指向 inline 兼容配置文件；装配 create/get/list/kill 和 exec/files 管理接口，使用独立 JWT/IAM 认证，并要求 `ADX_SANDBOX_CONFIG` 提供 Sandbox 能力。
 
-另行构建并启动无状态 `adx-activator` 进程；多个副本连接相同 ADX Redis namespace，并通过 Sandbox HTTP 接口访问平台。
+选择独立模式时，另行构建并启动无状态 `adx-activator` 进程；多个副本连接相同 ADX Redis namespace，并通过 Sandbox HTTP 接口访问平台。嵌入式模式由 API Server 将同一 Sandbox 业务服务以 Rust 模块接口交给 Activator，受管 Agent 请求无需内部 HTTP/RPC 回环。
 
 ```sh
 cargo build --locked -p adx-activator --bin adx-activator
 ```
 
-Gateway 配置如下。组件间令牌从环境变量读取；受管 Agent 入口本身不要求本机装配 Sandbox API，能力提供方由 Activator 的 `sandbox_url` 指定。启用 inline 时仍需本地 Sandbox 配置。
+独立模式 Gateway 配置如下。组件间令牌从环境变量读取；受管 Agent 入口本身不要求本机装配 Sandbox API，能力提供方由 Activator 的 `sandbox_url` 指定。启用 inline 时仍需本地 Sandbox 配置。
 
 ```json
 {
@@ -49,9 +49,23 @@ Gateway 配置如下。组件间令牌从环境变量读取；受管 Agent 入�
 }
 ```
 
+API Server 内嵌 Ingress 时，也可将 `ADX_AGENT_CONFIG` 配成嵌入式模式；`ADX_SANDBOX_CONFIG` 提供预装 profile，`ADX_SANDBOX_EXECD_TOKEN` 供创建规格映射，Activator 产品状态仍存于指定 Redis namespace：
+
+```json
+{
+  "timeout_seconds": 60,
+  "embedded": {
+    "redis_url": "redis://127.0.0.1:6379",
+    "namespace": "adx-agent"
+  }
+}
+```
+
+`activator` 与 `embedded` 只能配置一个。独立 Ingress 不持有 API Server 的业务服务，应使用独立 Activator 模式。
+
 `timeout_seconds` 默认 60 秒且必须为正，由入口确定一次绝对 deadline。管理面在鉴权后统一处理 trace、请求读取、业务调用和 JSON 响应；HTTP/WS 目标激活的模板查询、激活和内部目标重试共用同一期限。客户端将剩余预算传给 Activator，地址重选不重置期限。纯读超时返回 Unavailable，可能写入的操作超时返回 OutcomeUnknown，重试使用原身份；已到期的内部重试直接拒绝。网络连接及 Sandbox 后端配置上限只能缩短剩余预算。创建的内部 `deadline_unix_ms` 只随请求传输，不进入执行规格或 Redis；它从入口经 Activator/Sandbox 传递到 Platform RPC；发现 Coordinator、读取请求和上游查询已消耗的时间不会重新补回。内部 Sandbox HTTP 入口默认上限同为 60 秒；inline 仍受 `backend_timeout_seconds` 上限约束，Platform RPC 受 `rpc_timeout_seconds` 上限约束。激活期限不覆盖建立后的 HTTP 响应流、WS 或 SSH 会话；SSH 模板校验、身份提示和后端握手共用 SSH 连接期限。
 
-Gateway 不缓存 Template 或 Target，查询和获取目标均调用 Activator。Gateway 通过 ActivatorClient 调用独立 Activator，不连接 ADX 状态 Redis。Activator 持有产品状态并调用 Sandbox 接口；Platform 自身的 Redis 发现不受影响。Activator 部署见 [进程说明](activator/README.md)，状态保证见 [存储说明](crates/store/README.md)。
+Gateway 不缓存 Template 或 Target，查询和获取目标均调用 Activator。独立模式经 ActivatorClient 调用独立进程；嵌入式模式经 LocalControl 调用同进程 Activator 并连接产品状态 Redis。Activator 持有产品状态并调用 Sandbox 接口；Platform 自身的 Redis 发现不受影响。独立进程部署见 [进程说明](activator/README.md)，状态保证见 [存储说明](crates/store/README.md)。
 
 inline 完整配置示例：
 

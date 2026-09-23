@@ -2,11 +2,43 @@
 use crate::request::RequestContext;
 use crate::{Error, Result};
 use adx_agent_core::{activator::*, transport, Environment, Scope, TemplateVersion};
+use async_trait::async_trait;
 use serde::{de::DeserializeOwned, Serialize};
 use std::{
     sync::atomic::{AtomicUsize, Ordering},
     time::Duration,
 };
+
+/// Product operations shared by the independent HTTP client and embedded Activator.
+#[async_trait]
+pub trait Control: Send + Sync {
+    async fn publish(
+        &self,
+        ctx: &RequestContext,
+        tenant: &str,
+        template: &TemplateVersion,
+    ) -> Result<()>;
+    async fn template(
+        &self,
+        ctx: &RequestContext,
+        tenant: &str,
+        name: &str,
+        version: &str,
+    ) -> Result<TemplateVersion>;
+    async fn environment(&self, ctx: &RequestContext, scope: &Scope) -> Result<Environment>;
+    async fn list_environments(
+        &self,
+        ctx: &RequestContext,
+        query: &EnvironmentList,
+    ) -> Result<EnvironmentPage>;
+    async fn delete_environment(&self, ctx: &RequestContext, scope: &Scope) -> Result<()>;
+    async fn activate(
+        &self,
+        ctx: &RequestContext,
+        scope: &Scope,
+        expected_generation: Option<&str>,
+    ) -> Result<Target>;
+}
 
 pub struct ActivatorClient {
     urls: Vec<String>,
@@ -122,6 +154,48 @@ impl ActivatorClient {
                 .map_err(|_| uncertain(writes, "invalid Activator response"));
         }
         Err(Error::Unavailable("Activator unavailable".into()))
+    }
+}
+
+#[async_trait]
+impl Control for ActivatorClient {
+    async fn publish(
+        &self,
+        ctx: &RequestContext,
+        tenant: &str,
+        template: &TemplateVersion,
+    ) -> Result<()> {
+        ActivatorClient::publish(self, ctx, tenant, template).await
+    }
+    async fn template(
+        &self,
+        ctx: &RequestContext,
+        tenant: &str,
+        name: &str,
+        version: &str,
+    ) -> Result<TemplateVersion> {
+        ActivatorClient::template(self, ctx, tenant, name, version).await
+    }
+    async fn environment(&self, ctx: &RequestContext, scope: &Scope) -> Result<Environment> {
+        ActivatorClient::environment(self, ctx, scope).await
+    }
+    async fn list_environments(
+        &self,
+        ctx: &RequestContext,
+        query: &EnvironmentList,
+    ) -> Result<EnvironmentPage> {
+        ActivatorClient::list_environments(self, ctx, query).await
+    }
+    async fn delete_environment(&self, ctx: &RequestContext, scope: &Scope) -> Result<()> {
+        ActivatorClient::delete_environment(self, ctx, scope).await
+    }
+    async fn activate(
+        &self,
+        ctx: &RequestContext,
+        scope: &Scope,
+        expected_generation: Option<&str>,
+    ) -> Result<Target> {
+        ActivatorClient::activate(self, ctx, scope, expected_generation).await
     }
 }
 pub(crate) fn uncertain(writes: bool, message: &str) -> Error {

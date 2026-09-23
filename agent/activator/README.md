@@ -1,8 +1,8 @@
 # Activator
 
-Activator 为独立部署的无状态产品控制进程 `adx-activator`。多个副本连接相同 ADX Redis namespace，通过条件写提交唯一 Environment 身份，再调用 Gateway 的通用 Sandbox HTTP 接口。无成员注册、选主、所有权或恢复扫描。
+Activator 是无状态产品控制模块，可作为独立进程 `adx-activator`，也可嵌入 API Server 所在进程。多个副本连接相同 ADX Redis namespace，通过条件写提交唯一 Environment 身份。独立模式调用 Gateway 的通用 Sandbox HTTP 接口；嵌入式模式直接调用 API Server 的 Sandbox 应用服务。无成员注册、选主、所有权或恢复扫描。
 
-Gateway 通过 `agent/api` 的 ActivatorClient 发起 HTTP 请求。公开认证与业务流量转发留在 Gateway；Activator 管理 Template/Environment 状态。配置见 [Agent 部署说明](../README.md#部署)。
+Gateway 在独立模式通过 ActivatorClient 发起 HTTP 请求，在嵌入式模式通过 LocalControl 直接调用 Activator。公开认证与业务流量转发留在 Gateway；Activator 管理 Template/Environment 状态。配置见 [Agent 部署说明](../README.md#部署)。
 
 独立进程启动读取 `ADX_ACTIVATOR_CONFIG` 指向的 JSON，示例见 [local.json](examples/local.json)。服务凭据为 `ADX_ACTIVATOR_SERVICE_TOKEN` 与 `ADX_SANDBOX_SERVICE_TOKEN`，均不写入示例配置。当前进程监听 HTTP，要求显式允许内网明文；生产须置于 TLS 服务代理后并限制访问。
 

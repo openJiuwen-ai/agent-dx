@@ -4,6 +4,8 @@ Rust public management HTTP service, binary `adx-apiserver`, in the root Cargo w
 
 Requests are converted directly to the generated Environment RPC types. There is no Go adapter, function payload, generic Signal dispatch or legacy protobuf dependency. Public Sandbox paths and base64 JSON response envelopes remain compatible with the Sandbox SDK. Existing `functionProxyId` in a resume response is a public compatibility field containing the node ID.
 
+Sandbox lifecycle behavior is owned by `sandbox_service::SandboxService`. The HTTP adapter parses the public REST contract and delegates create/delete/pause/resume operations to that service. When Ingress and Agent Activator are embedded, `ActivatorSandboxAdapter` implements the Agent `Sandbox` contract over the same application-service `Arc`; Activator calls it as a Rust module without HTTP loopback or an internal RPC. Standalone Ingress keeps its separately configured platform adapter for its Sandbox and inline endpoints.
+
 The API Server also owns the legacy-compatible scheduler HTTP paths while
 Coordinator owns their state and decisions. `/global-scheduler/resources` reads the
 watched in-memory node directory and renders the legacy `resource.fragment`
@@ -25,7 +27,9 @@ Both resource shapes include CPU millicores, Memory/Disk MiB and whole-card
 | Module | Responsibility |
 |---|---|
 | `contract.rs` | Typed public JSON validation, resources, environment and affinity conversion |
-| `http.rs` | Routes, JSON/SSE responses, create replay handling, Agent streaming forwarding |
+| `http.rs` | REST routes, authentication boundary, JSON/SSE responses and Agent compatibility forwarding |
+| `sandbox_service.rs` | Sandbox lifecycle semantics, create replay handling and durable-result checks |
+| `activator.rs` | In-process Agent `Sandbox` adapter over the API Server application service |
 | `clients.rs` | mTLS RPC clients, Redis discovery, API Key validation and ownership reads |
 | `ownership.rs` | Bounded LRU caches with fixed expiration |
 | `operations.rs` | Pause/resume/delete/snapshot, pinned assignment/revision, durable-result validation |
@@ -42,6 +46,6 @@ The unified deployment role is `apiserver`. It embeds Ingress by default while p
 
 The API always uses the verified tenant, not tenant fields supplied in a request. Existing-instance operations use the local ownership cache; misses query Coordinator. A retry preserves the original assignment and lifecycle revision, and rejects a changed ownership generation. Only Published results are acknowledged as successful; SQLite Journaled results remain unavailable until publication.
 
-Agent endpoints forward to `agent_address` when configured and preserve streaming responses. Agent resource authorization and business behavior belong to the Agent service. No Agent runtime is embedded here.
+The API Server's legacy `/api/agent` compatibility routes forward to `agent_address` when configured and preserve streaming responses. The separate Agent v2 entrypoint in embedded Ingress may call an in-process Activator; Agent authorization and product rules remain in the Agent layer.
 
 See [HTTP contract](docs/sandbox-lifecycle-api.md), [failure behavior](docs/sandbox-runtime-failure.md), [deployment](../../docs/testing/process-deployment.md), and [Rust migration status](../../docs/testing/rust-apiserver.md).
