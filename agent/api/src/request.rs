@@ -23,6 +23,13 @@ impl RequestContext {
     pub fn deadline(&self) -> Instant {
         self.deadline
     }
+    /// Convert the unspent monotonic budget for a downstream service call.
+    pub fn deadline_unix_ms(&self) -> u64 {
+        adx_agent_core::transport::capped_deadline(
+            None,
+            self.deadline.saturating_duration_since(Instant::now()),
+        )
+    }
     pub fn start_write(&self) {
         self.progress.start_write();
     }

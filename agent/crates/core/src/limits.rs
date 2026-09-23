@@ -9,5 +9,5 @@ pub const CAS_ATTEMPTS: usize = 32;
 pub const TRANSACTION_CHECKS: usize = 128;
 pub const REDIS_MAX_INFLIGHT: usize = 4096;
 pub const AGENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
-pub const SANDBOX_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+pub const SANDBOX_REQUEST_TIMEOUT: Duration = AGENT_REQUEST_TIMEOUT;
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);

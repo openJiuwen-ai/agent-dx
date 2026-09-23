@@ -16,6 +16,8 @@ pub enum SandboxType {
 pub struct Rootfs {
     pub imageurl: String,
     #[serde(default)]
+    pub workdir: Option<String>,
+    #[serde(default)]
     pub user: Option<String>,
     #[serde(default)]
     pub ports: Vec<String>,
@@ -198,6 +200,13 @@ impl CreateRequest {
             return Err("docker requires rootfs.imageurl".into());
         }
         if let Some(rootfs) = &spec.rootfs {
+            if rootfs
+                .workdir
+                .as_deref()
+                .is_some_and(|p| !p.is_empty() && !absolute(p))
+            {
+                return Err("rootfs.workdir must be absolute without parent traversal".into());
+            }
             if rootfs.imageurl.contains('\0')
                 || rootfs.user.as_ref().is_some_and(|u| u.contains('\0'))
             {

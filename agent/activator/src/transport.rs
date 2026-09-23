@@ -14,6 +14,7 @@ pub struct HttpSandbox {
     client: Client,
     base: Url,
     token: String,
+    timeout: Duration,
 }
 impl HttpSandbox {
     pub fn new(
@@ -46,6 +47,7 @@ impl HttpSandbox {
                 .map_err(|_| SandboxError::Invalid("HTTP client initialization failed".into()))?,
             base,
             token,
+            timeout,
         })
     }
     async fn request(
@@ -71,7 +73,17 @@ impl HttpSandbox {
         url.query_pairs_mut().append_pair("tenant", tenant);
         let mut request = self.client.request(method, url).bearer_auth(&self.token);
         if let Some(payload) = payload {
-            request = request.json(payload);
+            let mut payload = payload.clone();
+            let deadline =
+                adx_agent_core::transport::capped_deadline(payload.deadline_unix_ms, self.timeout);
+            let remaining = adx_agent_core::transport::remaining_time(deadline);
+            if remaining.is_zero() {
+                return Err(SandboxError::Unavailable(
+                    "Sandbox create deadline expired before submission".into(),
+                ));
+            }
+            payload.deadline_unix_ms = Some(deadline);
+            request = request.timeout(remaining).json(&payload);
         }
         let uncertain = || {
             if read {

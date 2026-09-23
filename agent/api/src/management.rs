@@ -35,6 +35,12 @@ impl InlineProfile {
                 == r.runtime_spec.rootfs.as_ref().map(|v| v.imageurl.as_str())
             && self.request_user.as_ref()
                 == r.runtime_spec.rootfs.as_ref().and_then(|v| v.user.as_ref())
+            && r.runtime_spec
+                .rootfs
+                .as_ref()
+                .and_then(|rootfs| rootfs.workdir.as_deref())
+                .filter(|v| !v.is_empty())
+                .is_none_or(|cwd| cwd == self.working_dir)
             && self.preinstalled_workspace == r.workspace
             && self.preinstalled_mounts == r.mounts
     }
@@ -89,6 +95,18 @@ pub struct Detail {
     pub status_msg: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sandbox_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node_ip: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sandbox_ip: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sandbox_type: Option<SandboxType>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rootfs: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub env_vars: Option<std::collections::BTreeMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resources: Option<serde_json::Value>,
 }
 impl InlineService {
     pub fn new(sandbox: Arc<dyn Sandbox>, options: Options) -> Result<Self> {
@@ -147,7 +165,12 @@ impl InlineService {
             .try_acquire()
             .map_err(|_| Error::Unavailable("inline Sandbox capacity busy".into()))
     }
-    pub async fn create(&self, tenant: &str, request: CreateRequest) -> Result<Created> {
+    pub async fn create(
+        &self,
+        ctx: &crate::request::RequestContext,
+        tenant: &str,
+        request: CreateRequest,
+    ) -> Result<Created> {
         identifier(tenant, "tenant").map_err(Error::Invalid)?;
         request.validate().map_err(Error::Invalid)?;
         if request
@@ -172,26 +195,41 @@ impl InlineService {
         self.sandbox.validate_execution(&execution)?;
         let _slot = self.slot()?;
         // The public UUID is the actual Sandbox ID. No ADX alias or durable admission exists.
-        let id = uuid::Uuid::new_v4().to_string();
+        let canonical = format!(
+            "yuanrong-agent-instance:v1|{}:{}{}:{}",
+            request.namespace.len(),
+            request.namespace,
+            request.name.len(),
+            request.name
+        );
+        let id = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, canonical.as_bytes()).to_string();
+        let deadline =
+            transport::capped_deadline(Some(ctx.deadline_unix_ms()), self.options.backend_timeout);
+        let remaining = transport::remaining_time(deadline);
+        if remaining.is_zero() {
+            return Err(Error::Unavailable(
+                "Sandbox create deadline expired before submission".into(),
+            ));
+        }
         let request = CreateSandbox {
+            deadline_unix_ms: Some(deadline),
             id: id.clone(),
             tenant: tenant.into(),
             execution,
         };
-        let observed =
-            tokio::time::timeout(self.options.backend_timeout, self.sandbox.create(&request))
-                .await
-                .map_err(|_| {
-                    Error::OutcomeUnknown(format!(
-                        "Sandbox create timed out for instance {id}; inspect this ID"
-                    ))
-                })?
-                .map_err(|error| match error {
-                    SandboxError::OutcomeUnknown(message) => {
-                        Error::OutcomeUnknown(format!("instance {id}: {message}"))
-                    }
-                    other => other.into(),
-                })?;
+        let observed = tokio::time::timeout(remaining, self.sandbox.create(&request))
+            .await
+            .map_err(|_| {
+                Error::OutcomeUnknown(format!(
+                    "Sandbox create timed out for instance {id}; inspect this ID"
+                ))
+            })?
+            .map_err(|error| match error {
+                SandboxError::OutcomeUnknown(message) => {
+                    Error::OutcomeUnknown(format!("instance {id}: {message}"))
+                }
+                other => other.into(),
+            })?;
         Self::validate_observation(tenant, &id, &observed).map_err(|_| {
             Error::OutcomeUnknown(format!(
                 "Sandbox create returned mismatched identity for instance {id}"
@@ -211,12 +249,24 @@ impl InlineService {
     pub async fn get(&self, tenant: &str, id: &str) -> Result<Detail> {
         Self::validate_identity(tenant, id)?;
         let _slot = self.slot()?;
-        let observed =
-            tokio::time::timeout(self.options.backend_timeout, self.sandbox.get(tenant, id))
-                .await
-                .map_err(|_| Error::Unavailable("Sandbox query timed out".into()))??
-                .ok_or(Error::NotFound)?;
+        let observed = tokio::time::timeout(
+            self.options.backend_timeout,
+            self.sandbox.describe(tenant, id),
+        )
+        .await
+        .map_err(|_| Error::Unavailable("Sandbox query timed out".into()))??
+        .ok_or(Error::NotFound)?;
+        let info = observed;
+        let observed = info.observation;
         Self::validate_observation(tenant, id, &observed)?;
+        let profile = info.execution.as_ref().and_then(|execution| {
+            self.options.profiles.iter().find(|profile| {
+                profile.image == execution.image
+                    && profile.isolation_runtime == execution.isolation_runtime
+                    && profile.working_dir == execution.working_dir
+                    && profile.request_user == execution.user
+            })
+        });
         let (status_code, status, phase) = match observed.phase {
             SandboxPhase::Creating => (2, "CREATING", InlinePhase::Creating),
             SandboxPhase::Running if observed.ready => (3, "RUNNING", InlinePhase::Ready),
@@ -231,7 +281,26 @@ impl InlineService {
             phase,
             status_msg: observed.message,
             sandbox_id: observed.runtime_id,
+            node_ip: info.node_ip, sandbox_ip: info.sandbox_ip,
+            sandbox_type: profile.map(|p| p.sandbox_type.clone()),
+            rootfs: info.execution.as_ref().map(|execution| serde_json::json!({"imageurl":execution.image,"workdir":execution.working_dir,"user":execution.user})),
+            env_vars: info.execution.as_ref().map(|execution| execution.env.clone()),
+            resources: info.execution.as_ref().map(|execution| serde_json::json!({"CPU":execution.resources.cpu_millis,"Memory":execution.resources.memory_mib})),
         })
+    }
+    pub async fn list(&self, tenant: &str) -> Result<Vec<serde_json::Value>> {
+        identifier(tenant, "tenant").map_err(Error::Invalid)?;
+        let _slot = self.slot()?;
+        let values = self.sandbox.list(tenant).await?;
+        values.into_iter().map(|info| {
+            Self::validate_observation(tenant, &info.observation.id, &info.observation)?;
+            let profile = info.execution.as_ref().and_then(|execution| self.options.profiles.iter().find(|profile| profile.image == execution.image && profile.isolation_runtime == execution.isolation_runtime));
+            Ok(serde_json::json!({"instance_id":info.observation.id,"node_ip":info.node_ip,"sandbox_ip":info.sandbox_ip,"sandbox_type":profile.map(|p| &p.sandbox_type)}))
+        }).collect()
+    }
+    pub async fn runtime(&self, tenant: &str, id: &str) -> Result<SandboxRuntime> {
+        Self::validate_identity(tenant, id)?;
+        self.sandbox.runtime(tenant, id).await.map_err(Into::into)
     }
     pub async fn kill(&self, tenant: &str, id: &str) -> Result<()> {
         Self::validate_identity(tenant, id)?;
