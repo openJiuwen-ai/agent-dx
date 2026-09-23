@@ -3,6 +3,8 @@ from pathlib import Path
 import tempfile
 import unittest
 
+import yaml
+
 
 ROOT = Path(__file__).resolve().parents[3]
 
@@ -18,7 +20,7 @@ class IndependentPipelineTests(unittest.TestCase):
         for key in ('build-platform', 'build-gateway', 'build-execd', 'source-gate'):
             self.assertIn(f'key: {key}', package)
         self.assertIn(
-            'depends_on: [build-platform, build-gateway, build-execd, source-gate]',
+            'depends_on: [build-platform, build-gateway, build-execd, source-gate, admin-gate]',
             package,
         )
         self.assertNotIn('key: platform-e2e', package)
@@ -41,6 +43,18 @@ class IndependentPipelineTests(unittest.TestCase):
         self.assertIn('ADX_E2E_PROFILE: full', full)
         self.assertNotIn('key: platform-build', full)
         self.assertNotIn('key: sdk-package', full)
+
+    def test_admin_gate_uses_sdk_python_image_and_blocks_assembly(self):
+        package = yaml.safe_load((ROOT / '.buildkite/pipeline-package.yml').read_text())
+        steps = {step['key']: step for step in package['steps']}
+        sdk = yaml.safe_load((ROOT / '.buildkite/pipeline-sdk.yml').read_text())
+        python_image = sdk['steps'][0]['env']['ADX_SDK_TEST_IMAGE']
+        admin = steps['admin-gate']
+        self.assertEqual(admin['plugins'][0]['kubernetes']['podSpec']['containers'][0]['image'],
+                         python_image)
+        self.assertIn('admin-gate', steps['platform-build']['depends_on'])
+        self.assertIn('build/admin/test.sh', admin['command'])
+        self.assertNotIn('tools/admin/tests', (ROOT / '.buildkite/source-gate.sh').read_text())
 
     def test_default_entrypoint_dispatches_by_buildkite_pipeline_slug(self):
         pipeline = (ROOT / '.buildkite/pipeline.yml').read_text()

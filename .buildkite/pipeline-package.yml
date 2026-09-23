@@ -111,9 +111,40 @@ steps:
     GOCACHE: /mnt/paas/build-cache/adx/go-build/amd64
     GOMODCACHE: /mnt/paas/build-cache/adx/go-mod
   plugins: *adx-build-plugins
+- label: ':key: adxadmin Python tests'
+  key: admin-gate
+  agents:
+    queue: default
+    os: linux
+    arch: amd64
+  command: bash .buildkite/step.sh admin-gate bash build/admin/test.sh
+  timeout_in_minutes: 10
+  artifact_paths:
+  - out/buildkite/logs/step-admin-gate.log
+  env:
+    BUILDKITE_AGENT_NAME: agent-stack-k8s
+    PIP_CACHE_DIR: /mnt/paas/build-cache/adx/pip
+  plugins:
+  - kubernetes:
+      podSpec:
+        imagePullSecrets:
+        - name: swr-pull-secret
+        containers:
+        - image: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/adx-e2e@sha256:c310ebf3f56c846d21744640a899d52e16a98b5442ca39402a3132010c722c4a
+          volumeMounts:
+          - name: build-cache
+            mountPath: /mnt/paas
+          resources:
+            requests: {cpu: '1', memory: 1Gi}
+            limits: {cpu: '2', memory: 2Gi}
+        volumes:
+        - name: build-cache
+          hostPath:
+            path: /mnt/paas
+            type: DirectoryOrCreate
 - label: ':package: Assemble ADX base package'
   key: platform-build
-  depends_on: [build-platform, build-gateway, build-execd, source-gate]
+  depends_on: [build-platform, build-gateway, build-execd, source-gate, admin-gate]
   agents:
     queue: default
     os: linux

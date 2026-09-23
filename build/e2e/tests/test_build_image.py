@@ -70,7 +70,7 @@ class BuildImageContractTests(unittest.TestCase):
         for key in ('build-platform', 'build-gateway', 'build-execd',
                     'source-gate', 'platform-build'):
             self.assertIn('key: ' + key, pipeline)
-        self.assertIn('depends_on: [build-platform, build-gateway, build-execd, source-gate]', pipeline)
+        self.assertIn('depends_on: [build-platform, build-gateway, build-execd, source-gate, admin-gate]', pipeline)
         self.assertIn('out/buildkite/build-manifest.json', pipeline)
         for component in ('platform', 'gateway', 'execd'):
             self.assertIn(f'out/buildkite/components/{component}.tar.gz', pipeline)

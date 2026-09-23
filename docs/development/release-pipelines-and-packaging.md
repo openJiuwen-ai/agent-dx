@@ -22,6 +22,8 @@ Full 流水线消费不可变制品，不得从源码重新编译或替换二进
 `agent-dx-full-test`；`agent-dx-admin` 需要按仓库配置新建独立实体后执行首次验证。
 
 基础出包流水线现在将 Platform、Gateway、Execd 和 source gate 放在四个并行步骤中。
+另有独立 `admin-gate` 使用 Python 3.12 镜像运行 adxadmin 单测，安装固定 httpx 依赖；
+不再借用 Rust 构建镜像中的 Python 3.9。两个测试门禁均阻断组装和 OBS 上传。
 三个编译步骤使用独立 Cargo target，输出带提交、目标平台和逐文件 SHA256 的组件
 归档；`platform-build` 只下载、校验并组装这些归档，不重复编译。聚合后的
 `build-manifest.json` 绑定组件清单、基础包、sandboxd backend 和兼容 SDK wheel。
