@@ -7,6 +7,8 @@ import secrets
 import shutil
 import socket
 import subprocess
+import re
+from cgroup_limits import v2_directory
 
 
 def parse_args():
@@ -33,6 +35,8 @@ if not other.exists(): other.write_text(secrets.token_hex(32)); other.chmod(0o60
 admin=PRIVATE/'admin-key'
 if not admin.exists(): admin.write_text(secrets.token_hex(32)); admin.chmod(0o600)
 def tls(n,peers):return {'ca':str(T/'ca.pem'),'certificate':str(T/f'{n}.pem'),'private_key':str(T/f'{n}.key'),'server_name':'localhost','peers':{k:str(T/f'{v}.der') for k,v in peers.items()}}
+cgroup_root=os.getenv('ADX_E2E_CGROUP_ROOT',f'adx-e2e-{node}')
+if not re.fullmatch(r'adx-e2e-[A-Za-z0-9_-]+',cgroup_root):raise ValueError('invalid test cgroup root')
 R=P/'sandboxd'; R.mkdir(exist_ok=True)
 for f,data in [('oss.json',{'oss':{},'type':'oss'}),('registry.json',{'registry':{'scheme':'https' if os.getenv('ADX_E2E_KUBERNETES') else 'http','skip_verify':False if os.getenv('ADX_E2E_KUBERNETES') else True},'type':'registry'}),('oss_auths.json',{}),('registry_auths.json',{'auths':{}})]: (R/f).write_text(json.dumps(data))
 registry_auth=pathlib.Path('/registry-auth/.dockerconfigjson')
@@ -49,7 +53,7 @@ disable_cgroup = false
 cpu_limit_mode = "quota"
 cgroup_cache_size = 1
 interface_cache_size = 2
-cgroup_root_name = "/adx-e2e-{node}"
+cgroup_root_name = "/{cgroup_root}"
 max_instance_num = 8
 pids_max = 256
 [plugin.runtime]
@@ -80,6 +84,7 @@ cgroup_memory_limit = "0"
 import os
 cg=pathlib.Path('/sys/fs/cgroup')
 if (cg/'cgroup.controllers').exists():
+ cg=v2_directory(cg,pathlib.Path('/proc/self/cgroup').read_text())
  quota,period=(cg/'cpu.max').read_text().split()
  cpus=int(quota)*1000//int(period) if quota!='max' else os.cpu_count()*1000
  limit=(cg/'memory.max').read_text().strip()
@@ -101,38 +106,38 @@ def add(service_id, role, config=None, env=None):
 if node=='node1':
  (P/'redis').mkdir(exist_ok=True)
  add('redis','redis',{'bind':'0.0.0.0','port':6379,'data_dir':str(P/'redis'),'appendfsync':'always','password_file':str(redis_key)})
- add('master','master',{'listen':'0.0.0.0:17000','metrics_listen':'127.0.0.1:17090','advertised_address':'https://master:17000','scheduler_shards':1,'placement':'spread','rpc_timeout_seconds':120,'tls':tls('master',{'api-server':'api-server','edge':'edge','node:node1':'node','node:node2':'node2'}),'bootstrap_credentials':[{'key_file':str(admin),'tenant_id':'admin','administrator':True,'expires_at_unix_seconds':0},{'key_file':str(key),'tenant_id':'e2e','administrator':False,'expires_at_unix_seconds':0},{'key_file':str(other),'tenant_id':'e2e-other','administrator':False,'expires_at_unix_seconds':0}]})
-edge_peer=os.getenv('ADX_E2E_EDGE_IP')
-edge_cidrs=(edge_peer+('/128' if ':' in edge_peer else '/32')+',127.0.0.1/32') if edge_peer else '172.16.0.0/12,127.0.0.1/32'
-common={'ADX_DATA_PLANE_EDGE_FRONTEND_NODE_SECURITY_MODE':'mtls','RUST_LOG':'info','ADX_LOG_FORMAT':'json'}
-np={**common,'ADX_DATA_PLANE_NODE_PROXY_BIND':'0.0.0.0:18443','ADX_DATA_PLANE_NODE_PROXY_HEALTH_BIND':'127.0.0.1:19443','ADX_DATA_PLANE_ALLOWED_TARGET_CIDRS':f'10.231.{16 if node=="node1" else 32}.0/20','ADX_DATA_PLANE_ALLOWED_EDGE_CIDRS':edge_cidrs,'ADX_DATA_PLANE_NODE_PROXY_TLS_CERT':str(T/('node.pem' if node=='node1' else 'node2.pem')),'ADX_DATA_PLANE_NODE_PROXY_TLS_KEY':str(T/('node.key' if node=='node1' else 'node2.key')),'ADX_DATA_PLANE_NODE_PROXY_MTLS_CLIENT_CA':str(T/'ca.pem'),'ADX_DATA_PLANE_NODE_PROXY_ACTIVITY_UDS_DIR':str(P/'proxy')}
-host=os.getenv('ADX_E2E_NODE_IP') or ('master' if node=='node1' else 'node2')
+ add('coordinator','coordinator',{'listen':'0.0.0.0:17000','metrics_listen':'127.0.0.1:17090','advertised_address':'https://coordinator:17000','scheduler_shards':1,'placement':'spread','rpc_timeout_seconds':120,'tls':tls('coordinator',{'apiserver':'apiserver','ingress':'ingress','node:node1':'node','node:node2':'node2'}),'bootstrap_credentials':[{'key_file':str(admin),'tenant_id':'admin','administrator':True,'expires_at_unix_seconds':0},{'key_file':str(key),'tenant_id':'e2e','administrator':False,'expires_at_unix_seconds':0},{'key_file':str(other),'tenant_id':'e2e-other','administrator':False,'expires_at_unix_seconds':0}]})
+ingress_peer=os.getenv('ADX_E2E_INGRESS_IP')
+ingress_cidrs=(ingress_peer+('/128' if ':' in ingress_peer else '/32')+',127.0.0.1/32') if ingress_peer else '172.16.0.0/12,127.0.0.1/32'
+common={'ADX_DATA_PLANE_INGRESS_NODE_SECURITY_MODE':'mtls','RUST_LOG':'info','ADX_LOG_FORMAT':'json'}
+np={**common,'ADX_DATA_PLANE_RELAY_BIND':'0.0.0.0:18443','ADX_DATA_PLANE_RELAY_HEALTH_BIND':'127.0.0.1:19443','ADX_DATA_PLANE_ALLOWED_TARGET_CIDRS':f'10.231.{16 if node=="node1" else 32}.0/20','ADX_DATA_PLANE_ALLOWED_INGRESS_CIDRS':ingress_cidrs,'ADX_DATA_PLANE_RELAY_TLS_CERT':str(T/('node.pem' if node=='node1' else 'node2.pem')),'ADX_DATA_PLANE_RELAY_TLS_KEY':str(T/('node.key' if node=='node1' else 'node2.key')),'ADX_DATA_PLANE_RELAY_MTLS_CLIENT_CA':str(T/'ca.pem'),'ADX_DATA_PLANE_RELAY_ACTIVITY_UDS_DIR':str(P/'proxy')}
+host=os.getenv('ADX_E2E_NODE_IP') or ('coordinator' if node=='node1' else 'node2')
 if ':' in host: host='['+host+']'
-add(node,'node-manager',{'node_id':node,'listen':'0.0.0.0:17001','metrics_listen':'0.0.0.0:17091','advertised_address':f'{host}:17001','proxy_address':f'{host}:18443','tls':tls('node' if node=='node1' else 'node2',{'master':'master','api-server':'api-server'}),'sandboxd_socket':str(R/'sandboxd.sock'),'proxy_socket':str(P/'proxy/route.sock'),'capacity_file':str(P/'capacity.json'),'report_interval_seconds':2,'rpc_timeout_seconds':120,'rrt_port':50090,'rrt_command':['/usr/local/bin/rrt-runtime'],'rrt_env':{'ADX_TRACE_ENABLED':'true','OTEL_EXPORTER_OTLP_TRACES_ENDPOINT':f'http://{socket.gethostbyname(host)}:14317/v1/traces','OTEL_BSP_SCHEDULE_DELAY':'200'}},np)
+add(node,'adxlet',{'node_id':node,'listen':'0.0.0.0:17001','metrics_listen':'0.0.0.0:17091','advertised_address':f'{host}:17001','proxy_address':f'{host}:18443','tls':tls('node' if node=='node1' else 'node2',{'coordinator':'coordinator','apiserver':'apiserver'}),'sandboxd_socket':str(R/'sandboxd.sock'),'proxy_socket':str(P/'proxy/route.sock'),'capacity_file':str(P/'capacity.json'),'report_interval_seconds':2,'rpc_timeout_seconds':120,'execd_port':50090,'execd_command':['/usr/local/bin/adx-execd'],'execd_env':{'ADX_TRACE_ENABLED':'true','OTEL_EXPORTER_OTLP_TRACES_ENDPOINT':f'http://{socket.gethostbyname(host)}:14317/v1/traces','OTEL_BSP_SCHEDULE_DELAY':'200'}},np)
 if node=='node1':
- add('api','api-server',{'listen':'127.0.0.1:8888','loopback_http':True,'discovery':{'poll_seconds':1},'ca':str(T/'ca.pem'),'certificate':str(T/'api-server.pem'),'private_key':str(T/'api-server.key'),'server_name':'localhost','rpc_timeout_seconds':120,'cache_entries':1000,'auth_cache_ttl_seconds':10})
- ee={**common,'ADX_DATA_PLANE_EDGE_FRONTEND_TLS_BIND':'0.0.0.0:8443','ADX_DATA_PLANE_EDGE_FRONTEND_PLAIN_BIND':'127.0.0.1:8080','ADX_DATA_PLANE_EDGE_FRONTEND_HEALTH_BIND':'127.0.0.1:18080','ADX_DATA_PLANE_EDGE_FRONTEND_TLS_CERT':str(T/'edge.pem'),'ADX_DATA_PLANE_EDGE_FRONTEND_TLS_KEY':str(T/'edge.key'),'ADX_DATA_PLANE_EDGE_FRONTEND_ALLOWED_CLIENT_CIDRS':'127.0.0.1/32','ADX_DATA_PLANE_EDGE_FRONTEND_NODE_TLS_CA':str(T/'ca.pem'),'ADX_DATA_PLANE_EDGE_FRONTEND_NODE_TLS_SERVER_NAME':'localhost','ADX_DATA_PLANE_EDGE_FRONTEND_NODE_TLS_CLIENT_CERT':str(T/'edge.pem'),'ADX_DATA_PLANE_EDGE_FRONTEND_NODE_TLS_CLIENT_KEY':str(T/'edge.key'),'ADX_DATA_PLANE_EDGE_FRONTEND_CONTROL_PLANE_ADDRESS':'127.0.0.1:8888'}
- add('edge','edge',{'tls':tls('edge',{'master':'master'}),'rpc_timeout_seconds':5,'refresh_seconds':1,'auth_cache_seconds':10,'auth_cache_entries':1000},ee)
+ add('api','apiserver',{'listen':'127.0.0.1:8888','loopback_http':True,'discovery':{'poll_seconds':1},'ca':str(T/'ca.pem'),'certificate':str(T/'apiserver.pem'),'private_key':str(T/'apiserver.key'),'server_name':'localhost','rpc_timeout_seconds':120,'cache_entries':1000,'auth_cache_ttl_seconds':10})
+ ee={**common,'ADX_DATA_PLANE_INGRESS_TLS_BIND':'0.0.0.0:8443','ADX_DATA_PLANE_INGRESS_PLAIN_BIND':'127.0.0.1:8080','ADX_DATA_PLANE_INGRESS_HEALTH_BIND':'127.0.0.1:18080','ADX_DATA_PLANE_INGRESS_TLS_CERT':str(T/'ingress.pem'),'ADX_DATA_PLANE_INGRESS_TLS_KEY':str(T/'ingress.key'),'ADX_DATA_PLANE_INGRESS_ALLOWED_CLIENT_CIDRS':'127.0.0.1/32','ADX_DATA_PLANE_INGRESS_NODE_TLS_CA':str(T/'ca.pem'),'ADX_DATA_PLANE_INGRESS_NODE_TLS_SERVER_NAME':'localhost','ADX_DATA_PLANE_INGRESS_NODE_TLS_CLIENT_CERT':str(T/'ingress.pem'),'ADX_DATA_PLANE_INGRESS_NODE_TLS_CLIENT_KEY':str(T/'ingress.key'),'ADX_DATA_PLANE_INGRESS_CONTROL_PLANE_ADDRESS':'127.0.0.1:8888'}
+ add('ingress','ingress',{'tls':tls('ingress',{'coordinator':'coordinator'}),'rpc_timeout_seconds':5,'refresh_seconds':1,'auth_cache_seconds':10,'auth_cache_entries':1000},ee)
 for service in services:
  service.setdefault('env',{}).update({'ADX_LOG_FORMAT':'json','ADX_TRACE_ENABLED':'true','OTEL_EXPORTER_OTLP_TRACES_ENDPOINT':'http://127.0.0.1:14317/v1/traces','OTEL_BSP_SCHEDULE_DELAY':'200'})
-d={'schema_version':1,'logging':{'enabled':True,'max_file_bytes':4096,'rotate_seconds':1,'compress':True,'line_records':True,'max_record_bytes':65536,'compress_after_seconds':15,'max_files':100,'max_age_seconds':3600,'max_total_bytes':1048576},'package_dir':str(BASE/'package'),'state_dir':str(P/'state'),'redis_url':f'redis://:{redis_key.read_text().strip()}@master:6379/','namespace':'acceptance','restart_limit':3,'restart_delay_ms':1000,'stop_timeout_seconds':30,'services':services}
+d={'schema_version':1,'logging':{'enabled':True,'max_file_bytes':4096,'rotate_seconds':1,'compress':True,'line_records':True,'max_record_bytes':65536,'compress_after_seconds':15,'max_files':100,'max_age_seconds':3600,'max_total_bytes':1048576},'package_dir':str(BASE/'package'),'state_dir':str(P/'state'),'redis_url':f'redis://:{redis_key.read_text().strip()}@coordinator:6379/','namespace':'acceptance','restart_limit':3,'restart_delay_ms':1000,'stop_timeout_seconds':30,'services':services}
 runtime_artifact=BASE/'package/runtime/adx-runtime-rootfs.img'
 runtime_image=PRIVATE/'runtime-image'
 if os.getenv('ADX_E2E_KUBERNETES'):
  if not runtime_image.is_file(): raise RuntimeError('Kubernetes OCI runtime image is missing')
  image=runtime_image.read_text().strip()
  if '@sha256:' not in image: raise RuntimeError('Kubernetes OCI runtime image must be digest pinned')
- d['environment']={
+ d['runtime_profile']={
   'rootfs':{'runtime_class':'runc','type':'image','image':image,'readonly':False},
   'bootstrap':{'type':'image','image':image,'target':'/__adx',
-    'entrypoint':['/__adx/usr/local/bin/rrt-runtime']},
+    'entrypoint':['/__adx/usr/local/bin/adx-execd']},
   'env':{'PATH':'/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'}}
 elif runtime_artifact.is_file():
- d['environment']={
+ d['runtime_profile']={
   'rootfs':{'runtime_class':'runc','type':'local','path':str(runtime_artifact),'readonly':False},
   'bootstrap':{'type':'erofs','root':str(runtime_artifact),'target':'/__adx',
-    'entrypoint':['/__adx/usr/local/bin/rrt-runtime']},
+    'entrypoint':['/__adx/usr/local/bin/adx-execd']},
   'env':{'PATH':'/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'}}
 (P/'deployment.yaml').write_text(json.dumps(d));(P/'deployment.yaml').chmod(0o600)
-(EVIDENCE/f'deployment-{node}.json').write_text(json.dumps({**d,'redis_url':'redis://:REDACTED@master:6379/'},indent=2))
+(EVIDENCE/f'deployment-{node}.json').write_text(json.dumps({**d,'redis_url':'redis://:REDACTED@coordinator:6379/'},indent=2))
 print('configured',node,capacity)

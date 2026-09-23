@@ -2,7 +2,7 @@
 
 Small file operations use Frontend invoke actions. Binary file and directory
 copy paths prefer the ``/direct`` route so large payloads avoid JSON
-envelopes. The RRT direct route is a published sandbox target and remains
+envelopes. The EXECD direct route is a published sandbox target and remains
 available under a block-network policy; invoke chunks remain the bounded
 fallback for transport failures.
 """
@@ -224,7 +224,7 @@ class Filesystem:
         return result["created"]
 
     def get_info(self, path: str) -> EntryInfo:
-        # RRT's normalize_sandbox_action accepts file.stat / file.info /
+        # EXECD's normalize_sandbox_action accepts file.stat / file.info /
         # fs.get_info — NOT file.get_info. Use file.stat. (Verified via E2E.)
         result = _check(
             self._invoke("file.stat", path=path),

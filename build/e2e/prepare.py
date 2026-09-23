@@ -41,7 +41,7 @@ def main():
     p=argparse.ArgumentParser()
     for name in ('package','backend','sdk-wheel','sdk-candidate','output'):
         p.add_argument('--'+name,type=Path,required=True)
-    p.add_argument('--runtime-base',required=True);p.add_argument('--rrt-base',required=True)
+    p.add_argument('--runtime-base',required=True);p.add_argument('--execd-base',required=True)
     p.add_argument('--firecracker-kit',type=Path)
     a=p.parse_args();a.output.mkdir(parents=True,exist_ok=False)
     manifest=package.verify(a.package)
@@ -50,7 +50,7 @@ def main():
     if os.getenv('BUILDKITE'):
         if manifest['dirty'] or manifest['commit'] != expected_commit:
             raise ValueError('CI requires a clean package from the current commit')
-        if any('@sha256:' not in x for x in (a.runtime_base,a.rrt_base)):
+        if any('@sha256:' not in x for x in (a.runtime_base,a.execd_base)):
             raise ValueError('CI base images must be digest pinned')
     backend=json.loads((a.backend/'manifest.json').read_text())
     pinned=json.loads((ROOT/'third_party/sandboxd/source.json').read_text())
@@ -68,7 +68,7 @@ def main():
         fc_kit=verify_kit(a.firecracker_kit,backend)
     uid=uuid.uuid4().hex[:12];tags={
         'node':f'adx-e2e-node:{uid}',
-        'rrt':f'adx-e2e-rrt:{uid}',
+        'execd':f'adx-e2e-execd:{uid}',
         'entrypoint':f'adx-e2e-entrypoint:{uid}',
     }
     with tempfile.TemporaryDirectory(prefix='adx-e2e-image-') as d:
@@ -81,7 +81,7 @@ def main():
         for name in package.BINARIES:
             (context/'package/bin'/name).chmod(0o755)
         (context/'package/bin/redis-server').chmod(0o755)
-        (context/'package/runtime/rrt-runtime').chmod(0o755)
+        (context/'package/runtime/adx-execd').chmod(0o755)
         (context/'backend').mkdir()
         for name in BACKEND_BINARIES:
             shutil.copy2(a.backend/name,context/'backend'/name)
@@ -100,25 +100,25 @@ def main():
         if fc_kit:
             with (context/'Dockerfile.node').open('a') as dockerfile:
                 dockerfile.write('COPY fc-kit /opt/adx-fc\nCOPY fc-kit/tools /opt/adx/tools\n')
-        (context/'Dockerfile.rrt').write_text(
+        (context/'Dockerfile.execd').write_text(
             'ARG BASE\nFROM ${BASE}\n'
-            'COPY package/runtime/rrt-runtime /usr/local/bin/rrt-runtime\n'
+            'COPY package/runtime/adx-execd /usr/local/bin/adx-execd\n'
             'RUN mkdir -p /__adx && ln -s /usr /__adx/usr && ln -s /bin /__adx/bin '
             '&& ln -s /sbin /__adx/sbin && ln -s /etc /__adx/etc\n'
-            'ENTRYPOINT ["/usr/local/bin/rrt-runtime"]\n')
+            'ENTRYPOINT ["/usr/local/bin/adx-execd"]\n')
         (context/'Dockerfile.entrypoint').write_text(
             'ARG BASE\nFROM ${BASE}\n'
-            # The inherited process must outlive Firecracker boot, RRT
+            # The inherited process must outlive Firecracker boot, EXECD
             # readiness and route publication. Exiting during that window is
-            # correctly treated as a failed Capsule start.
+            # correctly treated as a failed Environment start.
             'ENTRYPOINT ["/bin/sh", "-c", "sleep 30; echo adx-entrypoint-stderr >&2; exit 7"]\n')
-        for role,base in [('node',a.runtime_base),('rrt',a.rrt_base),('entrypoint',a.rrt_base)]:
+        for role,base in [('node',a.runtime_base),('execd',a.execd_base),('entrypoint',a.execd_base)]:
             subprocess.run(['docker','build','--progress=plain','--provenance=false','--build-arg','BASE='+base,'--build-arg','COLLECTOR='+collector_image,'-f',str(context/f'Dockerfile.{role}'),'-t',tags[role],str(context)],stderr=subprocess.STDOUT,check=True,timeout=900)
         images={role:json.loads(subprocess.check_output(['docker','image','inspect',tag]))[0] for role,tag in tags.items()}
         subprocess.run(['docker','save','-o',str(a.output/'images.tar'),*tags.values()],stderr=subprocess.STDOUT,check=True,timeout=600)
-        subprocess.run(['docker','save','-o',str(a.output/'rrt.tar'),tags['rrt']],stderr=subprocess.STDOUT,check=True,timeout=300)
+        subprocess.run(['docker','save','-o',str(a.output/'execd.tar'),tags['execd']],stderr=subprocess.STDOUT,check=True,timeout=300)
         subprocess.run(['docker','save','-o',str(a.output/'entrypoint.tar'),tags['entrypoint']],stderr=subprocess.STDOUT,check=True,timeout=300)
-    result={'schema_version':1,'package':manifest,'sdk':sdk,'backend':backend,'image_ids':{k:v['Id'] for k,v in images.items()},'architecture':images['node']['Architecture'],'archive_sha256':sha(a.output/'images.tar'),'rrt_archive_sha256':sha(a.output/'rrt.tar'),'entrypoint_archive_sha256':sha(a.output/'entrypoint.tar'),'base_images':{'node':a.runtime_base,'rrt':a.rrt_base}}
+    result={'schema_version':1,'package':manifest,'sdk':sdk,'backend':backend,'image_ids':{k:v['Id'] for k,v in images.items()},'architecture':images['node']['Architecture'],'archive_sha256':sha(a.output/'images.tar'),'execd_archive_sha256':sha(a.output/'execd.tar'),'entrypoint_archive_sha256':sha(a.output/'entrypoint.tar'),'base_images':{'node':a.runtime_base,'execd':a.execd_base}}
     result['collector']={**collector,'image':collector_image}
     if fc_kit:result['firecracker_kit']=fc_kit
     (a.output/'bundle.json').write_text(json.dumps(result,indent=2)+'\n')

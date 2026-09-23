@@ -12,7 +12,7 @@ class PackageTests(unittest.TestCase):
     def test_complete_package_verifies_and_tampering_fails(self):
         with tempfile.TemporaryDirectory() as t:
             root=Path(t); binaries=root/"bin";binaries.mkdir()
-            for name in pkg.BINARIES+("rrt-runtime",):
+            for name in pkg.BINARIES+("adx-execd",):
                 (binaries/name).write_bytes(b"fixture")
             (binaries/"adxctl").write_text("#!/bin/sh\nexit 0\n")
             redis=root/"redis";redis.write_text("#!/bin/sh\necho 'Redis server v=7.2.5 sha=fixture'\n");redis.chmod(0o700)
@@ -34,7 +34,7 @@ class PackageTests(unittest.TestCase):
     def test_installer_verifies_and_installs_without_overwriting_host_state(self):
         with tempfile.TemporaryDirectory() as t:
             root=Path(t); binaries=root/"bin";binaries.mkdir()
-            for name in pkg.BINARIES+("rrt-runtime",):
+            for name in pkg.BINARIES+("adx-execd",):
                 (binaries/name).write_bytes(b"fixture")
             (binaries/"adxctl").write_text("#!/bin/sh\nexit 0\n")
             redis=root/"redis";redis.write_text("#!/bin/sh\necho 'Redis server v=7.2.5 sha=fixture'\n");redis.chmod(0o700)

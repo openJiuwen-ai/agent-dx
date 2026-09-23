@@ -1,4 +1,4 @@
-use adx_core::{CapsuleSpec, Error, Resources, Result};
+use adx_core::{EnvironmentSpec, Error, Resources, Result};
 use adx_scheduling::{
     Candidate, Filter, Framework, Node, Placement, Score, WeightedScore, MAX_SCORE,
 };
@@ -9,16 +9,16 @@ impl Score for Constant {
     fn name(&self) -> &'static str {
         self.0
     }
-    fn score(&self, _: &CapsuleSpec, _: &Candidate<'_>) -> Result<u32> {
+    fn score(&self, _: &EnvironmentSpec, _: &Candidate<'_>) -> Result<u32> {
         Ok(self.1)
     }
 }
 fn weighted(name: &'static str, value: u32, weight: u32) -> WeightedScore {
     WeightedScore::new(Arc::new(Constant(name, value)), weight).unwrap()
 }
-fn request() -> CapsuleSpec {
-    CapsuleSpec {
-        environment: None,
+fn request() -> EnvironmentSpec {
+    EnvironmentSpec {
+        runtime_profile: None,
         snapshot_id: None,
         lifecycle: Default::default(),
         env: Default::default(),
@@ -79,7 +79,7 @@ fn builtin_profile_exposes_actual_static_registration() {
             "device-fit",
             "node-affinity",
             "placement-groups",
-            "capsule-affinity",
+            "environment-affinity",
             "topology-spread"
         ]
     );
@@ -89,7 +89,7 @@ fn builtin_profile_exposes_actual_static_registration() {
             ("placement-group-preference", 1),
             ("resource-balance", 1),
             ("node-preference", 1),
-            ("capsule-preference", 1),
+            ("environment-preference", 1),
             ("topology-preference", 1)
         ]
     );
@@ -99,7 +99,7 @@ impl Filter for FailingFilter {
     fn name(&self) -> &'static str {
         "failing"
     }
-    fn filter(&self, _: &CapsuleSpec, _: &Candidate<'_>) -> Result<bool> {
+    fn filter(&self, _: &EnvironmentSpec, _: &Candidate<'_>) -> Result<bool> {
         Err(Error::Unavailable("filter observation missing".into()))
     }
 }

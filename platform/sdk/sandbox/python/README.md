@@ -18,15 +18,15 @@ with Sandbox(image="python:3.12-slim", cpu=2000, memory=4096) as sandbox:
 
 ## Server compatibility
 
-The new Capsule backend supports basic lifecycle, same-node pause/resume, reusable snapshots, grouped placement, idle deletion and restart policy. It requires an image containing the release RRT at the configured command path; generic `python:3.12-slim` below is only an illustrative image name.
+The new Environment backend supports basic lifecycle, same-node pause/resume, reusable snapshots, grouped placement, idle deletion and restart policy. It requires an image containing the release EXECD at the configured command path; generic `python:3.12-slim` below is only an illustrative image name.
 
-The Capsule backend supports S3 rootfs, S3/image mounts, entrypoint inheritance,
+The Environment backend supports S3 rootfs, S3/image mounts, entrypoint inheritance,
 creation and runtime network policy, `extra_config`, `failover=True`, independent
 resource limits, and per-sandbox data-plane security. Declared user ports use
-Edge and Node Proxy routing. Public local rootfs paths and host mounts are not a
+Ingress and Relay routing. Public local rootfs paths and host mounts are not a
 tenant-facing contract. `upstream` reverse tunnel uses the published
 `/tunnel/{sandbox}` route; the legacy `/invoke` fallback remains unavailable. See the
-[current HTTP contract](https://gitcode.com/openJiuwen/agent-dx/blob/refactor/gateway/api-server/docs/sandbox-lifecycle-api.md).
+[current HTTP contract](https://gitcode.com/openJiuwen/agent-dx/blob/refactor/gateway/apiserver/docs/sandbox-lifecycle-api.md).
 
 ## Image startup process
 
@@ -50,13 +50,13 @@ There are three deliberately different checkpoint paths:
 
 | Path | Public SDK API | Artifact and placement | When to use it |
 | --- | --- | --- | --- |
-| Reusable Snapshot | `create_snapshot()` then `Sandbox.create()` | New Capsule identity; shared storage allows fresh placement, local-only pins the source node. | Independent clones from a prepared source. |
-| Pause / resume | `pause()` then `resume()` | Same Capsule ID; public resume calls its owning Node Manager. | Stop and resume one logical sandbox. |
-| Failure recovery | `failover=True` | Same Capsule and node; restores the latest unexpired checkpoint after unexpected backend exit. | Workloads that must recover execution state rather than cold-start. |
-| Explicit reload | `reload()` | Same Capsule; replaces a Running backend from its latest unexpired checkpoint. | Operator-requested reset to a known recovery point. |
+| Reusable Snapshot | `create_snapshot()` then `Sandbox.create()` | New Environment identity; shared storage allows fresh placement, local-only pins the source node. | Independent clones from a prepared source. |
+| Pause / resume | `pause()` then `resume()` | Same Environment ID; public resume calls its owning Adxlet. | Stop and resume one logical sandbox. |
+| Failure recovery | `failover=True` | Same Environment and node; restores the latest unexpired checkpoint after unexpected backend exit. | Workloads that must recover execution state rather than cold-start. |
+| Explicit reload | `reload()` | Same Environment; replaces a Running backend from its latest unexpired checkpoint. | Operator-requested reset to a known recovery point. |
 
 The SDK is a client-side validation, request-ID, attempt, and result-shaping
-layer. Node Manager owns lifecycle and checkpoint bytes; Master owns placement, committed state and the snapshot catalog.
+layer. Adxlet owns lifecycle and checkpoint bytes; Coordinator owns placement, committed state and the snapshot catalog.
 
 ## Reusable Snapshots
 
@@ -121,7 +121,7 @@ clone = Sandbox.create(
 )
 ```
 
-The new Master inherits omitted image/runtime/scalar resources and validates explicit values against the source geometry. It does not resize a restored VM. Environment overrides and placement constraints are carried into the new Capsule; local-only snapshots require the source node. Shared snapshots use normal scheduling. The source briefly pauses during snapshot creation and resumes before success. A reusable snapshot is not consumed by cloning; deletion blocks new references and waits for existing references to be released. See [storage and cloning](https://gitcode.com/openJiuwen/agent-dx/blob/refactor/docs/testing/snapshot-storage.md).
+The new Coordinator inherits omitted image/runtime/scalar resources and validates explicit values against the source geometry. It does not resize a restored VM. Environment overrides and placement constraints are carried into the new Environment; local-only snapshots require the source node. Shared snapshots use normal scheduling. The source briefly pauses during snapshot creation and resumes before success. A reusable snapshot is not consumed by cloning; deletion blocks new references and waits for existing references to be released. See [storage and cloning](https://gitcode.com/openJiuwen/agent-dx/blob/refactor/docs/testing/snapshot-storage.md).
 
 Later dual-clone FC runs exposed a network failure, tracked in the [investigation](https://gitcode.com/openJiuwen/agent-dx/blob/refactor/docs/testing/2026-09-16-fc-clone-network.md); successful earlier batches do not close that issue.
 
@@ -160,18 +160,18 @@ requires the response to identify this sandbox, report `"running"`, and
 include a route address and function-proxy ID. Resume performs local admission on the owning node, restores the checkpoint, rearms the runtime listener and commits Running. Route-cache convergence after
 that result is outside the resume success boundary.
 
-Pausing persists bytes through the configured local or S3 store and commits Paused after removing the old execution. A SQLite-only result is not cluster success. Public resume requires the authoritative Paused identity and a valid checkpoint. Failed-node cross-node recovery with a shared checkpoint is a separate Master coordinator path; it is not selected by the public resume call.
+Pausing persists bytes through the configured local or S3 store and commits Paused after removing the old execution. A SQLite-only result is not cluster success. Public resume requires the authoritative Paused identity and a valid checkpoint. Failed-node cross-node recovery with a shared checkpoint is a separate Coordinator coordinator path; it is not selected by the public resume call.
 
 ## Recovery methods
 
 `failover=True` restores from the latest unexpired checkpoint after an
 unexpected backend exit on the owning node. If no valid checkpoint exists, the
-Capsule becomes Failed and is not recreated from the original image.
+Environment becomes Failed and is not recreated from the original image.
 `Sandbox.reload() -> bool` explicitly replaces a Running backend from that same
 recovery point. It returns `True` only after the replacement reaches Running and
 the result is durably published. Automatic restart policy is a separate cold
 restart mechanism. Shared-checkpoint node-failure recovery is coordinated by
-Master and is not selected by either public call.
+Coordinator and is not selected by either public call.
 
 ## Timeouts, attempts, and errors
 
@@ -198,7 +198,7 @@ attempt rules intentionally differ by operation:
 - Create from Snapshot uses the normal create policy with up to three attempts
   and one `create-*` identity. When the caller omits `name`, the SDK derives a
   stable name from that identity, so another API Server replica receives the
-  same Capsule ID. An uncertain result must still be queried or retried with
+  same Environment ID. An uncertain result must still be queried or retried with
   the same identity.
 
 Structured server failures raise `SandboxHTTPError`, whose `code`, `retry`,
@@ -213,7 +213,7 @@ other programming/shape exceptions.
 
 ### SDK versus raw HTTP
 
-These are SDK semantics, not a substitute for the [frontend REST contract](https://gitcode.com/openJiuwen/agent-dx/blob/refactor/gateway/api-server/docs/sandbox-lifecycle-api.md).
+These are SDK semantics, not a substitute for the [frontend REST contract](https://gitcode.com/openJiuwen/agent-dx/blob/refactor/gateway/apiserver/docs/sandbox-lifecycle-api.md).
 The SDK uses these paths internally:
 
 ```text
@@ -238,7 +238,7 @@ handlers define no body fields. Raw HTTP requires a pattern-valid
 `X-ADX-Request-ID` header;
 the SDK generates that header internally.
 
-Internal signal/POSIX/runtime SDK APIs are not part of this package or the new Capsule protocol.
+Internal signal/POSIX/runtime SDK APIs are not part of this package or the new Environment protocol.
 
 ## Other create options
 
@@ -251,7 +251,7 @@ Sandbox(xpu="gpu::1")  # any GPU model
 ```
 
 The SDK currently accepts one whole-device `gpu` request with a positive count.
-An empty model leaves the scheduler to select a model. The public SDK `xpu` parser currently accepts GPU only; internal Capsule RPC also supports NPU. Real GPU/NPU execution is a separate pending validation gate.
+An empty model leaves the scheduler to select a model. The public SDK `xpu` parser currently accepts GPU only; internal Environment RPC also supports NPU. Real GPU/NPU execution is a separate pending validation gate.
 
 Temporary writable storage is specified in MiB:
 
@@ -269,7 +269,7 @@ writable-layer enforcement.
 `rootfs=S3Config(...)` starts from an S3-compatible EROFS root filesystem.
 `Mount` supports image-backed read-only bind mounts and S3-backed bind or EROFS
 mounts. Credentials are sent to the control plane and sandboxd; callers should
-use scoped object-store credentials. RRT is still supplied by the deployment's
+use scoped object-store credentials. EXECD is still supplied by the deployment's
 local runtime environment, so a custom rootfs does not need to bake in ADX.
 
 The deployment Runtime Environment is the rootfs baseline. `runtime=` overrides
@@ -283,7 +283,7 @@ overrides keep the baseline source and do not add the bootstrap mount.
 
 `NetworkPolicy`, `NetworkRule`, and `PortRange` are accepted at creation.
 `update_network_policy(policy)` atomically replaces the complete runtime policy;
-passing `None` clears it. Node Manager reserves the RRT control port and declared
+passing `None` clears it. Adxlet reserves the EXECD control port and declared
 published ports with the highest rule priority so a user default-deny policy
 cannot cut the control route. User priorities must be in `1..UINT32_MAX-1`.
 Enforcement is provided by sandboxd's network policy implementation.
@@ -314,7 +314,7 @@ Sandbox.delete("sandbox-id", connection=connection)
 Without a `ConnectionConfig`, the SDK reads `ADX_SERVER_ADDRESS`, `ADX_TOKEN`,
 `ADX_TLS`, `ADX_GATEWAY_ADDRESS`, and `ADX_GATEWAY_TLS`. The gateway address
 defaults to the frontend address for reverse-tunnel and user-port routes. PTY
-uses the Edge data-plane route when a gateway address is configured, and falls
+uses the Ingress data-plane route when a gateway address is configured, and falls
 back to the server address for combined deployments.
 
 ## Build and test
@@ -341,7 +341,7 @@ Live K8S/frontend checks also need `ADX_SERVER_ADDRESS`,
 `ADX_GATEWAY_ADDRESS`, and a valid token:
 
 ```bash
-PYTHONPATH=. python3 tests/e2e_rrt_direct.py
+PYTHONPATH=. python3 tests/e2e_execd_direct.py
 PYTHONPATH=. python3 examples/reverse_tunnel.py
 ```
 
@@ -399,7 +399,7 @@ result = command.wait()
 
 `wait()` and `wait_async()` use one hidden multiplexed WebSocket per connection
 context as a notification channel. The final result is always read back from
-RRT's authoritative command registry. A local wait timeout or client restart
+EXECD's authoritative command registry. A local wait timeout or client restart
 does not terminate the remote command.
 
 

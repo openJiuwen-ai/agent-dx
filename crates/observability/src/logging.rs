@@ -41,7 +41,7 @@ impl LoggingGuard {
 
 pub fn init(
     component: &str,
-    edge_component: bool,
+    ingress_component: bool,
 ) -> Result<LoggingGuard, Box<dyn std::error::Error>> {
     let config = LoggingConfig::from_env()?;
     let trace = crate::trace::init(component).map_err(|e| -> Box<dyn std::error::Error> { e })?;
@@ -49,8 +49,8 @@ pub fn init(
         if config.directory.is_some() {
             return Err("JSON logging uses stdout; leave ADX_DATA_PLANE_LOG_DIR unset".into());
         }
-        let access = config.edge_access_log;
-        let audit = config.edge_audit_log;
+        let access = config.ingress_access_log;
+        let audit = config.ingress_audit_log;
         let stdout = config.stdout;
         tracing_subscriber::registry()
             .with(
@@ -61,7 +61,7 @@ pub fn init(
                     .with_filter(filter_fn(move |metadata| {
                         stdout
                             && include_general_log_target(
-                                edge_component,
+                                ingress_component,
                                 true,
                                 access,
                                 audit,
@@ -77,8 +77,8 @@ pub fn init(
         });
     }
     let mut workers = Vec::new();
-    let edge_access_enabled = edge_component && config.edge_access_log;
-    let edge_audit_enabled = edge_component && config.edge_audit_log;
+    let ingress_access_enabled = ingress_component && config.ingress_access_log;
+    let ingress_audit_enabled = ingress_component && config.ingress_audit_log;
     let file_writer = if let Some(directory) = config.directory.as_ref() {
         let (writer, worker) = AsyncRollingWriter::new(
             directory.join(format!("{component}.log")),
@@ -93,10 +93,10 @@ pub fn init(
     } else {
         None
     };
-    let access_writer = if edge_access_enabled || edge_audit_enabled {
+    let access_writer = if ingress_access_enabled || ingress_audit_enabled {
         if let Some(directory) = config.directory.as_ref() {
             let (writer, worker) = AsyncRollingWriter::new(
-                directory.join("edge-frontend-access.log"),
+                directory.join("ingress-frontend-access.log"),
                 config.max_size_bytes,
                 config.max_files,
                 config.queue_capacity,
@@ -112,16 +112,16 @@ pub fn init(
         None
     };
     let access_in_general_log =
-        (edge_access_enabled || edge_audit_enabled) && access_writer.is_none();
+        (ingress_access_enabled || ingress_audit_enabled) && access_writer.is_none();
     let stdout_layer = config.stdout.then(|| {
         tracing_subscriber::fmt::layer()
             .with_target(true)
             .with_filter(filter_fn(move |metadata| {
                 include_general_log_target(
-                    edge_component,
+                    ingress_component,
                     access_in_general_log,
-                    edge_access_enabled,
-                    edge_audit_enabled,
+                    ingress_access_enabled,
+                    ingress_audit_enabled,
                     metadata.target(),
                 )
             }))
@@ -134,10 +134,10 @@ pub fn init(
             .with_writer(writer)
             .with_filter(filter_fn(move |metadata| {
                 include_general_log_target(
-                    edge_component,
+                    ingress_component,
                     access_in_general_log,
-                    edge_access_enabled,
-                    edge_audit_enabled,
+                    ingress_access_enabled,
+                    ingress_audit_enabled,
                     metadata.target(),
                 )
             }))
@@ -150,8 +150,8 @@ pub fn init(
             .with_target(true)
             .with_writer(writer)
             .with_filter(filter_fn(move |metadata| {
-                (matches!(metadata.target(), "adx_access") && edge_access_enabled)
-                    || (matches!(metadata.target(), "adx_audit") && edge_audit_enabled)
+                (matches!(metadata.target(), "adx_access") && ingress_access_enabled)
+                    || (matches!(metadata.target(), "adx_audit") && ingress_audit_enabled)
             }))
     });
     tracing_subscriber::registry()
@@ -166,18 +166,18 @@ pub fn init(
 }
 
 fn include_general_log_target(
-    edge_component: bool,
+    ingress_component: bool,
     access_in_general_log: bool,
-    edge_access_enabled: bool,
-    edge_audit_enabled: bool,
+    ingress_access_enabled: bool,
+    ingress_audit_enabled: bool,
     target: &str,
 ) -> bool {
-    if !edge_component {
+    if !ingress_component {
         return true;
     }
     match target {
-        "adx_access" => edge_access_enabled && access_in_general_log,
-        "adx_audit" => edge_audit_enabled && access_in_general_log,
+        "adx_access" => ingress_access_enabled && access_in_general_log,
+        "adx_audit" => ingress_audit_enabled && access_in_general_log,
         _ => true,
     }
 }
@@ -192,8 +192,8 @@ struct LoggingConfig {
     max_size_bytes: u64,
     max_files: usize,
     stdout: bool,
-    edge_access_log: bool,
-    edge_audit_log: bool,
+    ingress_access_log: bool,
+    ingress_audit_log: bool,
     queue_capacity: usize,
     flush_interval: Duration,
     compression: LogCompression,
@@ -235,8 +235,8 @@ impl LoggingConfig {
                 .ok_or("ADX_DATA_PLANE_LOG_MAX_SIZE_MB is too large")?,
             max_files: usize::try_from(max_files)?,
             stdout: parse_bool("ADX_DATA_PLANE_LOG_STDOUT", true)?,
-            edge_access_log: parse_bool("ADX_DATA_PLANE_EDGE_FRONTEND_ACCESS_LOG_ENABLED", true)?,
-            edge_audit_log: parse_bool("ADX_DATA_PLANE_EDGE_FRONTEND_AUDIT_LOG_ENABLED", true)?,
+            ingress_access_log: parse_bool("ADX_DATA_PLANE_INGRESS_ACCESS_LOG_ENABLED", true)?,
+            ingress_audit_log: parse_bool("ADX_DATA_PLANE_INGRESS_AUDIT_LOG_ENABLED", true)?,
             queue_capacity: usize::try_from(queue_capacity)?,
             flush_interval: Duration::from_millis(flush_interval_ms),
             compression: parse_compression()?,
@@ -846,7 +846,7 @@ mod tests {
     #[test]
     fn size_rotation_keeps_a_bounded_number_of_files() {
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("node-proxy.log");
+        let path = directory.path().join("relay.log");
         let (writer, mut guard) = AsyncRollingWriter::new(
             path.clone(),
             32,
@@ -873,7 +873,7 @@ mod tests {
     #[test]
     fn gzip_rotation_compresses_in_background_and_keeps_a_bounded_history() {
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("edge-frontend-access.log");
+        let path = directory.path().join("ingress-frontend-access.log");
         let (writer, mut guard) = AsyncRollingWriter::new(
             path.clone(),
             32,
@@ -903,7 +903,7 @@ mod tests {
     #[test]
     fn gzip_startup_migrates_legacy_plain_rotations() {
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("edge-frontend.log");
+        let path = directory.path().join("ingress-frontend.log");
         fs::write(rotated_path(&path, 1), b"newer").unwrap();
         fs::write(rotated_path(&path, 2), b"older").unwrap();
 
@@ -927,8 +927,8 @@ mod tests {
     #[test]
     fn gzip_failure_retains_the_uncompressed_staging_file() {
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("node-proxy.log");
-        let staging = directory.path().join("node-proxy.log.rotate.test");
+        let path = directory.path().join("relay.log");
+        let staging = directory.path().join("relay.log.rotate.test");
         fs::write(&staging, b"must-not-be-lost").unwrap();
         fs::create_dir(compressed_rotated_path(&path, 2)).unwrap();
 
@@ -945,7 +945,7 @@ mod tests {
     #[test]
     fn shutdown_drains_queued_records() {
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("edge-frontend-access.log");
+        let path = directory.path().join("ingress-frontend-access.log");
         let (writer, mut guard) = AsyncRollingWriter::new(
             path.clone(),
             1024 * 1024,
@@ -969,7 +969,7 @@ mod tests {
     #[test]
     fn worker_flushes_records_on_the_configured_interval() {
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("edge-frontend-access.log");
+        let path = directory.path().join("ingress-frontend-access.log");
         let (writer, mut guard) = AsyncRollingWriter::new(
             path.clone(),
             1024 * 1024,
@@ -1050,7 +1050,7 @@ mod tests {
             false,
             false,
             true,
-            "adx_edge_frontend"
+            "adx_ingress"
         ));
         assert!(include_general_log_target(
             false,

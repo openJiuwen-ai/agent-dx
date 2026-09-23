@@ -10,7 +10,7 @@ reused from an earlier Buildkite build.
 The Buildkite gate uses `run.py` here. `manifest.py` defines two node Pods,
 Services, volume/credential references and node placement. The Pods run ADX as
 processes from the unified release. `publish_images.py` runs on the build worker
-and hands immutable node, RRT and entrypoint-fixture registry references to the
+and hands immutable node, EXECD and entrypoint-fixture registry references to the
 deployment worker.
 
 ```sh
@@ -93,9 +93,9 @@ successful real read-only mount.
 
 The CNI must carry Pod traffic between the two physical workers. The fixture
 publishes Services for ports `6379`, `17000`, `17001`, `18443` and `8443`, and
-uses Pod IPs for Node Manager and Node Proxy addresses. Network policy or host
+uses Pod IPs for Adxlet and Relay addresses. Network policy or host
 firewall rules must allow this test-namespace traffic. Workers need registry
-access to all digest-pinned Node, RRT and Collector images.
+access to all digest-pinned Node, EXECD and Collector images.
 
 The kubeconfig identity must be allowed to create, read and delete the isolated
 Namespace and to manage Pods, Services and Secrets within it. It also needs Pod
@@ -113,7 +113,7 @@ The Firecracker profile uses a separate Pod and is not part of base `full`:
 | Pod resources | request and limit both `4 CPU / 6 GiB` |
 | Host device | `/dev/kvm` mounted as a character-device `hostPath` |
 | KVM contract | ioctl API version 12 |
-| Other | privileged Pod and architecture-matched Firecracker kit, release and RRT image |
+| Other | privileged Pod and architecture-matched Firecracker kit, release and EXECD image |
 
 If base `full` and Firecracker run concurrently, use two 4C/8G ordinary workers
 plus one 8C/16G KVM worker. A smaller two-worker cluster is possible only when

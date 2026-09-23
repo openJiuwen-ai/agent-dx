@@ -233,8 +233,8 @@ class SandboxClient:
         # Required /direct traffic always shares ADX_SERVER_ADDRESS + ADX_TLS.
         # ADX_GATEWAY_ADDRESS is intentionally not consulted here: it can point
         # at the optional plaintext tunnel/port-forward listener.
-        self._rrt_port = int(
-            os.environ.get("ADX_RRT_PORT", "50090").strip() or "50090"
+        self._execd_port = int(
+            os.environ.get("ADX_EXECD_PORT", "50090").strip() or "50090"
         )
         self._direct_enabled = True
         # A 404 falls back immediately for the current invoke. Only a sustained
@@ -795,7 +795,7 @@ class SandboxClient:
     ) -> "tuple[Dict[str, Any], bool]":
         """Try the /direct path. Returns ``(result, fell_back)``.
 
-        All attempts for one logical action reuse ``request_id``. RRT deduplicates
+        All attempts for one logical action reuse ``request_id``. EXECD deduplicates
         direct requests by that id, so a retry can wait for or replay the first
         execution instead of repeating a side effect. ``fell_back=True`` is
         returned only after connect/pool failures (known not sent) are exhausted,
@@ -803,7 +803,7 @@ class SandboxClient:
         exhausted unknown-outcome failure is surfaced to the caller and is never
         replayed through the Frontend invoke path.
 
-        Unlike Frontend invoke, the RRT HTTP server returns raw result JSON (no
+        Unlike Frontend invoke, the EXECD HTTP server returns raw result JSON (no
         base64 ``BuildJobResponse`` envelope); action-level errors live inside
         that object (HTTP 200).
         """
@@ -866,9 +866,9 @@ class SandboxClient:
                     except ValueError:
                         not_found = None
                     if isinstance(not_found, dict) and not_found.get("error_code"):
-                        # RRT uses 404 for an operation-level missing command.
+                        # EXECD uses 404 for an operation-level missing command.
                         # It is an authoritative result from the resolved
-                        # Capsule route, not evidence that /direct is absent.
+                        # Environment route, not evidence that /direct is absent.
                         self._direct_route_misses = 0
                         raise self._http_error(resp, request_id=request_id)
                     if outcome_unknown:
@@ -939,7 +939,7 @@ class SandboxClient:
             time.sleep(backoff)
 
         if last_failure_safe and not outcome_unknown and last_error is not None:
-            # Every attempt failed before request bytes could reach RRT.
+            # Every attempt failed before request bytes could reach EXECD.
             self._direct_disabled = True
             return {}, True
         detail = last_error or "invoke deadline exhausted"
@@ -1259,7 +1259,7 @@ class SandboxClient:
 
     @property
     def direct_enabled(self) -> bool:
-        """Whether RRT direct invoke first tries the /direct route."""
+        """Whether EXECD direct invoke first tries the /direct route."""
         return self._direct_enabled
 
     def set_direct_enabled(self, enabled: bool) -> None:
@@ -1271,9 +1271,9 @@ class SandboxClient:
             self._direct_disabled = True
 
     @property
-    def rrt_port(self) -> int:
-        """Internal RRT HTTP container port requested during sandbox create."""
-        return self._rrt_port
+    def execd_port(self) -> int:
+        """Internal EXECD HTTP container port requested during sandbox create."""
+        return self._execd_port
 
     @staticmethod
     def _new_request_id(prefix: str) -> str:

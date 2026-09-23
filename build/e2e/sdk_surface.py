@@ -72,7 +72,7 @@ OPERATION_CASES = {
     'Sandbox.pause': ('pause with persisted recovery point',),
     'Sandbox.resume': ('resume preserves process memory, PID and binary file',),
     'Sandbox.reload': ('reload restores the latest recovery point without a cold start',),
-    'Sandbox.update_network_policy': ('runtime network policy replacement blocks egress and preserves RRT control',),
+    'Sandbox.update_network_policy': ('runtime network policy replacement blocks egress and preserves EXECD control',),
     'Sandbox.close': ('lifecycle.attached-close-preserves-instance',),
     'Sandbox.kill': ('lifecycle.attached-close-preserves-instance',),
     'Sandbox.delete': ('lifecycle.detached-close-reattach-delete',),

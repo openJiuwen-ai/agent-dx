@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct LifecyclePolicy {
-    /// Zero disables idle deletion; this is not a Capsule maximum lifetime.
+    /// Zero disables idle deletion; this is not a Environment maximum lifetime.
     pub idle_timeout_seconds: u64,
     pub restart: Option<RestartPolicy>,
 }

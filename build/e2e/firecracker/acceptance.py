@@ -6,17 +6,17 @@ import xml.etree.ElementTree as ET
 
 CASES = {
  'sdk': {
-  'create through Frontend and execute through Edge',
+  'create through Frontend and execute through Ingress',
   'S3 rootfs and independent execution limits start through sandboxd',
   'S3 EROFS mount is visible inside the sandbox',
   'inherited image entrypoint reports structured exit status',
   'pause with persisted recovery point',
-  'Node Manager restart while paused',
+  'Adxlet restart while paused',
   'remote orphan GC preserves registered checkpoint',
   'SDK labels peer affinity and ordered weighted placement',
   'resume preserves process memory, PID and binary file',
   'reload restores the latest recovery point without a cold start',
-  'runtime network policy replacement blocks egress and preserves RRT control',
+  'runtime network policy replacement blocks egress and preserves EXECD control',
   'creation network policy is enforced while the control route stays reachable',
   'explicit delete',
   'reusable snapshot preserves running source',
@@ -28,9 +28,9 @@ CASES = {
  },
  'lifecycle': {
   'unexpected backend exit restarts with a fresh execution',
-  'Master outage uses SQLite for idle deletion while Redis remains stale',
-  'Node Manager restart waits for Master without cleaning an owned runtime',
-  'Master recovery fences an expired node session and reconciles stale runtimes',
+  'Coordinator outage uses SQLite for idle deletion while Redis remains stale',
+  'Adxlet restart waits for Coordinator without cleaning an owned runtime',
+  'Coordinator recovery fences an expired node session and reconciles stale runtimes',
   'expired resource observations close admission and recover without killing instances',
   'failover restores the latest checkpoint without a cold start',
   'failover without a checkpoint becomes failed without cold start',
@@ -51,7 +51,7 @@ def verify(root):
  orphan=json.loads((root/'orphan-gc.json').read_text())
  if any(orphan.get(k) is not True for k in ('passed','current_session_preserved','retired_session_removed','foreign_preserved','unmarked_preserved')) or not orphan.get('registered_checkpoint_preserved'): raise ValueError('orphan GC preservation evidence missing')
  catalog=json.loads((root/'catalog-final.json').read_text())
- if not catalog or any(r.get('result',{}).get('state')!='Deleted' or r['result'].get('resources_held') is not False for r in catalog.values()): raise ValueError('Capsule cleanup incomplete')
+ if not catalog or any(r.get('result',{}).get('state')!='Deleted' or r['result'].get('resources_held') is not False for r in catalog.values()): raise ValueError('Environment cleanup incomplete')
  snapshots=json.loads((root/'snapshots-final.json').read_text())
  if not snapshots or any(s.get('state')!='Deleted' or s.get('references') for s in snapshots.values()): raise ValueError('Snapshot cleanup incomplete')
  if ET.fromstring((root/'s3-final.xml').read_text()).findall('{*}Contents'): raise ValueError('S3 objects remain')

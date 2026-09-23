@@ -7,8 +7,8 @@ restart_limit: 3
 restart_delay_ms: 1000
 stop_timeout_seconds: 90
 services:
-  - id: node-manager
-    role: node-manager
+  - id: adxlet
+    role: adxlet
     config:
       node_id: node-1
       listen: 0.0.0.0:19001
@@ -20,14 +20,14 @@ services:
         private_key: /opt/adx/config/tls/node-1.key
         server_name: adx.internal
         peers:
-          master: /opt/adx/config/tls/master.der
-          api-server: /opt/adx/config/tls/api-server.der
+          coordinator: /opt/adx/config/tls/coordinator.der
+          apiserver: /opt/adx/config/tls/apiserver.der
       sandboxd_socket: /run/sandboxd/sandboxd.sock
       proxy_socket: /opt/adx/run/node/route.sock
       report_interval_seconds: 5
       rpc_timeout_seconds: 30
-      rrt_port: 50090
-      rrt_env: {}
+      execd_port: 50090
+      execd_env: {}
       checkpoint_dir: /opt/adx/data/checkpoints
       resource_source:
         kind: auto
@@ -36,15 +36,15 @@ services:
       degradation_journal: /opt/adx/data/degraded/results.sqlite
       metrics_listen: 127.0.0.1:19091
     env:
-      ADX_DATA_PLANE_NODE_PROXY_ACTIVITY_UDS_DIR: /opt/adx/run/node
-      ADX_DATA_PLANE_NODE_PROXY_BIND: 0.0.0.0:19002
-      ADX_DATA_PLANE_NODE_PROXY_ADVERTISE_ADDRESS: node-1.internal:19002
+      ADX_DATA_PLANE_RELAY_ACTIVITY_UDS_DIR: /opt/adx/run/node
+      ADX_DATA_PLANE_RELAY_BIND: 0.0.0.0:19002
+      ADX_DATA_PLANE_RELAY_ADVERTISE_ADDRESS: node-1.internal:19002
       ADX_DATA_PLANE_ALLOWED_TARGET_CIDRS: 10.88.0.0/16
-      ADX_DATA_PLANE_ALLOWED_EDGE_CIDRS: 127.0.0.1/32
-      ADX_DATA_PLANE_EDGE_FRONTEND_NODE_SECURITY_MODE: mtls
-      ADX_DATA_PLANE_NODE_PROXY_TLS_CERT: /opt/adx/config/tls/node-1.pem
-      ADX_DATA_PLANE_NODE_PROXY_TLS_KEY: /opt/adx/config/tls/node-1.key
-      ADX_DATA_PLANE_NODE_PROXY_MTLS_CLIENT_CA: /opt/adx/config/tls/ca.pem
+      ADX_DATA_PLANE_ALLOWED_INGRESS_CIDRS: 127.0.0.1/32
+      ADX_DATA_PLANE_INGRESS_NODE_SECURITY_MODE: mtls
+      ADX_DATA_PLANE_RELAY_TLS_CERT: /opt/adx/config/tls/node-1.pem
+      ADX_DATA_PLANE_RELAY_TLS_KEY: /opt/adx/config/tls/node-1.key
+      ADX_DATA_PLANE_RELAY_MTLS_CLIENT_CA: /opt/adx/config/tls/ca.pem
 logging:
   enabled: true
   max_file_bytes: 104857600
@@ -53,7 +53,7 @@ logging:
   max_files: 5
   max_age_seconds: 604800
   max_total_bytes: 1073741824
-environment:
+runtime_profile:
   rootfs:
     runtime_class: runsc
     type: local
@@ -64,7 +64,7 @@ environment:
     root: /opt/adx/current/runtime/adx-runtime-rootfs.img
     target: /__adx
     entrypoint:
-      - /__adx/usr/local/bin/rrt-runtime
+      - /__adx/usr/local/bin/adx-execd
     image_process_config: /etc/adx-image-process.json
   env:
     PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin

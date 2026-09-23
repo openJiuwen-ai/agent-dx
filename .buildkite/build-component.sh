@@ -20,27 +20,27 @@ case "$component" in
   platform)
     echo "--- :rust: Compile Platform"
     cargo build --locked --release -j "$jobs" \
-      -p adx-deployment -p adx-master -p adx-node-manager --bins
-    for binary in adxctl adx-master adx-node-manager; do
+      -p adx-deployment -p adx-coordinator -p adxlet --bins
+    for binary in adxctl adx-coordinator adxlet; do
       cp "$CARGO_TARGET_DIR/release/$binary" "$output/$binary"
     done
     ;;
   gateway)
     echo "--- :rust: Compile Gateway"
     cargo build --locked --release -j "$jobs" \
-      -p adx-api-server -p data-plane-gateway --bins
-    for binary in adx-api-server adx-edge-frontend adx-node-proxy adx-data-plane-forward; do
+      -p adx-apiserver -p data-plane-gateway --bins
+    for binary in adx-apiserver adx-ingress adx-relay adx-data-plane-forward; do
       cp "$CARGO_TARGET_DIR/release/$binary" "$output/$binary"
     done
     ;;
-  rrt)
-    echo "--- :rust: Compile static RRT and runtime filesystem"
+  execd)
+    echo "--- :rust: Compile static EXECD and runtime filesystem"
     musl_target=x86_64-unknown-linux-musl
     cargo build --locked --release --target "$musl_target" -j "$jobs" \
-      -p rrt-daemon --bin rrt-runtime
-    cp "$CARGO_TARGET_DIR/$musl_target/release/rrt-runtime" "$output/rrt-runtime"
+      -p adx-execd --bin adx-execd
+    cp "$CARGO_TARGET_DIR/$musl_target/release/adx-execd" "$output/adx-execd"
     python3 build/runtime/rootfs.py \
-      --binary "$output/rrt-runtime" \
+      --binary "$output/adx-execd" \
       --output "$output/adx-runtime-rootfs.img"
     ;;
   *)

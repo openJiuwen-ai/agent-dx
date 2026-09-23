@@ -66,24 +66,24 @@ steps:
     GOCACHE: /mnt/paas/build-cache/adx/go-build/amd64
     GOMODCACHE: /mnt/paas/build-cache/adx/go-mod
   plugins: *adx-build-plugins
-- label: ':rust: Compile RRT'
-  key: build-rrt
+- label: ':rust: Compile EXECD'
+  key: build-execd
   agents:
     queue: default
     os: linux
     arch: amd64
   concurrency: 1
-  concurrency_group: adx/build-rrt-amd64
-  command: bash .buildkite/step.sh build-rrt bash .buildkite/build-component.sh rrt
+  concurrency_group: adx/build-execd-amd64
+  command: bash .buildkite/step.sh build-execd bash .buildkite/build-component.sh execd
   timeout_in_minutes: 30
   artifact_paths:
   - out/buildkite/logs/**/*
-  - out/buildkite/components/rrt.tar.gz
+  - out/buildkite/components/execd.tar.gz
   env:
     BUILDKITE_AGENT_NAME: agent-stack-k8s
     ADX_CARGO_HOME: /mnt/paas/build-cache/adx/cargo-home
     CARGO_HOME: /mnt/paas/build-cache/adx/cargo-home
-    CARGO_TARGET_DIR: /mnt/paas/build-cache/adx/cargo-target/rrt-amd64-rust1950
+    CARGO_TARGET_DIR: /mnt/paas/build-cache/adx/cargo-target/execd-amd64-rust1950
     RUSTUP_TOOLCHAIN: stable
     RUSTUP_AUTO_INSTALL: '0'
     GOCACHE: /mnt/paas/build-cache/adx/go-build/amd64
@@ -113,7 +113,7 @@ steps:
   plugins: *adx-build-plugins
 - label: ':package: Assemble ADX base package'
   key: platform-build
-  depends_on: [build-platform, build-gateway, build-rrt, source-gate]
+  depends_on: [build-platform, build-gateway, build-execd, source-gate]
   agents:
     queue: default
     os: linux

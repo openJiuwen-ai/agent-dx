@@ -84,12 +84,12 @@ mod tests {
     fn reads_typed_configuration() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("service.json");
-        std::fs::write(&path, br#"{"name":"master"}"#).unwrap();
+        std::fs::write(&path, br#"{"name":"coordinator"}"#).unwrap();
 
         assert_eq!(
             read_config_file::<Config>(&path).unwrap(),
             Config {
-                name: "master".into()
+                name: "coordinator".into()
             }
         );
     }

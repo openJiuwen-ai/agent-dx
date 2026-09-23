@@ -9,7 +9,7 @@
 - `package/`：经过 `build/release/package.py verify` 验证的统一发布包。
 - `client/bin/python`：已安装该包 Sandbox SDK 的 Python 环境。
 - `e2e/`：本目录所属的 `build/e2e`，以及 `rpc_certificates.py`、发布包验证器 `package.py`。
-- `tools/minio`、`tools/redis-cli`、`tools/distill_fs`；本地 OCI tar 模式另需 `tools/docker-registry`、`rrt.tar` 和用于入口继承验收的 `entrypoint.tar`。
+- `tools/minio`、`tools/redis-cli`、`tools/distill_fs`；本地 OCI tar 模式另需 `tools/docker-registry`、`execd.tar` 和用于入口继承验收的 `entrypoint.tar`。
 
 外部执行后端在 `/opt/adx-fc/bin/{sandboxd,sbox,checkpoint-restore,firecracker}`，内核和 initrd 在 `/opt/adx-fc/artifacts/`。virtiofsd 与 `distill_fs` 在基目录 `tools/`；后者是 S3/OCI rootfs 和 EROFS mount 的实际读取后端，缺失时验收必须在部署前失败。测试使用新建的显式运行目录，固定监听端口因此每个 Pod/VM 同时运行一套；不在已有业务节点直接执行。
 
@@ -18,7 +18,7 @@ sudo env ADX_FC_BASE=/opt/adx ADX_FC_PROXY_MODE=embedded \
   python3 -u /opt/adx/e2e/firecracker/node.py /var/lib/adx-fc-test/run
 ```
 
-`ADX_FC_PROXY_MODE` 支持 `embedded` 或 `standalone`。`ADX_E2E_RRT_IMAGE` 和 `ADX_E2E_ENTRYPOINT_IMAGE` 可指定已发布的 RRT／入口测试镜像；省略时分别从 `rrt.tar` 和 `entrypoint.tar` 启动本机测试仓库。S3、Redis和API测试凭证每次随机生成，配置及密钥不进入公开证据。`collect.py` 只导出证据与组件日志并替换已知测试密钥。
+`ADX_FC_PROXY_MODE` 支持 `embedded` 或 `standalone`。`ADX_E2E_EXECD_IMAGE` 和 `ADX_E2E_ENTRYPOINT_IMAGE` 可指定已发布的 EXECD／入口测试镜像；省略时分别从 `execd.tar` 和 `entrypoint.tar` 启动本机测试仓库。S3、Redis和API测试凭证每次随机生成，配置及密钥不进入公开证据。`collect.py` 只导出证据与组件日志并替换已知测试密钥。
 
 ## Kubernetes 与 Buildkite
 
@@ -46,26 +46,26 @@ sudo env ADX_FC_BASE=/opt/adx ADX_FC_PROXY_MODE=embedded \
 package-v13 / Lima r16再次通过13项；本轮同时修复SDK在 `verify_tls=True` 时向 `wss://` 传入 `ssl=None` 的问题。真实TLS Socket认证订阅回归已加入本地 `interop` 套件，r16全量日志不再出现该连接错误或command-watch不可用回退。
 
 
-当前驱动增加三项克隆场景，必需集合共16项：公共 SDK 从同一快照创建两个新 Capsule，不传镜像/runtime/资源以验证继承，检查 PID/内存计数及可写文件隔离；删除源快照后等待 Redis 目录进入 Deleted 且无引用，再分别暂停、恢复和删除克隆。`sdk/snapshot-collected-before-clone-resume.json` 记录回收顺序，严格验收器要求该证据存在。生命周期操作全部经过公共 SDK；只读 Redis 查询用作清理时序的测试观测。
+当前驱动增加三项克隆场景，必需集合共16项：公共 SDK 从同一快照创建两个新 Environment，不传镜像/runtime/资源以验证继承，检查 PID/内存计数及可写文件隔离；删除源快照后等待 Redis 目录进入 Deleted 且无引用，再分别暂停、恢复和删除克隆。`sdk/snapshot-collected-before-clone-resume.json` 记录回收顺序，严格验收器要求该证据存在。生命周期操作全部经过公共 SDK；只读 Redis 查询用作清理时序的测试观测。
 
 package-v15/Lima r18 已通过16项及全部最终清理，严格时序证据已验证；该记录不表示目标Kubernetes已执行。
 
 
-当前必需集合增加远端残留回收验证，共17项。暂停成功后，从真实制品读取上传归属标记，注入同会话的半成品文件，并验证当前会话期间保留；杀死 Node Manager 后，等待新会话完成 Redis 权威对账，确认旧会话残留被删除、已登记暂停点仍可恢复、其他节点及无标记对象仍保留。注入的是存储残留，实际 S3 删除、节点重启、checkpoint 恢复均由生产组件执行。测试专用 `checkpoint_gc` 使用零保留期和一秒周期，生产默认仍为24小时和5分钟。逐项证据为 `orphan-gc.json`。
+当前必需集合增加远端残留回收验证，共17项。暂停成功后，从真实制品读取上传归属标记，注入同会话的半成品文件，并验证当前会话期间保留；杀死 Adxlet 后，等待新会话完成 Redis 权威对账，确认旧会话残留被删除、已登记暂停点仍可恢复、其他节点及无标记对象仍保留。注入的是存储残留，实际 S3 删除、节点重启、checkpoint 恢复均由生产组件执行。测试专用 `checkpoint_gc` 使用零保留期和一秒周期，生产默认仍为24小时和5分钟。逐项证据为 `orphan-gc.json`。
 
 测试 VM 的 MinIO 在停止前可能尚未完成其内部 `.minio.sys/tmp/.trash` 回收。S3 最终清单为空证明业务对象已删除，不代表后台垃圾已归还磁盘；反复运行前需要检查可用空间。只可在确认测试服务已停止、证据已保留后清理该次运行的内部垃圾目录，不能删除仍在服务的 MinIO 数据目录。
 
 package-v16 / Lima r20 已通过全部17项和最终清理，证据 `out/ci/pause-resume/fc-r20/evidence/`；r19磁盘水位失败保留在独立日志中。目标Kubernetes仍待正式运行。
 
 
-当前18项必需用例包含公共SDK设置实例标签、实例硬亲和OR、节点顺序偏好和加权实例反亲和的创建及执行。该用例在单节点上证明SDK→Frontend→Master→Node Manager→真实Firecracker的接线；两个候选节点之间的评分选择、租户隔离和反向反亲和由Rust定向测试验证，不能由单节点FC用例代替。
+当前18项必需用例包含公共SDK设置实例标签、实例硬亲和OR、节点顺序偏好和加权实例反亲和的创建及执行。该用例在单节点上证明SDK→Frontend→Coordinator→Adxlet→真实Firecracker的接线；两个候选节点之间的评分选择、租户隔离和反向反亲和由Rust定向测试验证，不能由单节点FC用例代替。
 
-当前代码把严格集合扩展为26项。Lima ARM64 r16 的SDK组19/19通过；r17、r18使用更新后的组件包，均先通过S3 rootfs、S3 EROFS mount、独立执行limit、入口继承、创建及运行期网络策略等前16项，再在双克隆写入阶段遇到Node Proxy 504。生命周期隔离验收另行验证有／无checkpoint的failover和节点故障契约。上述拆分结果证明新增能力实际经过sandboxd/Firecracker，但不能替代同一次26/26严格验收；完整门禁仍需修复ARM FC双克隆网络问题后重跑并生成新的JUnit和全量清理证据。
+当前代码把严格集合扩展为26项。Lima ARM64 r16 的SDK组19/19通过；r17、r18使用更新后的组件包，均先通过S3 rootfs、S3 EROFS mount、独立执行limit、入口继承、创建及运行期网络策略等前16项，再在双克隆写入阶段遇到Relay 504。生命周期隔离验收另行验证有／无checkpoint的failover和节点故障契约。上述拆分结果证明新增能力实际经过sandboxd/Firecracker，但不能替代同一次26/26严格验收；完整门禁仍需修复ARM FC双克隆网络问题后重跑并生成新的JUnit和全量清理证据。
 
-Lima ARM64 lifecycle r24 的7项故障用例全部通过：backend异常重启、有／无checkpoint的failover、Master不可用时SQLite降级、Node Manager等待Master、心跳过期后的旧会话隔离清理，以及资源观测过期门禁。外层清理确认6个实例全部Deleted且释放资源，runtime inventory、本地checkpoint、S3业务对象、测试进程和network namespace均无残留。证据位于`out/ci/sdk-capability-fc-20260920/fc-lifecycle-r24/`。
+Lima ARM64 lifecycle r24 的7项故障用例全部通过：backend异常重启、有／无checkpoint的failover、Coordinator不可用时SQLite降级、Adxlet等待Coordinator、心跳过期后的旧会话隔离清理，以及资源观测过期门禁。外层清理确认6个实例全部Deleted且释放资源，runtime inventory、本地checkpoint、S3业务对象、测试进程和network namespace均无残留。证据位于`out/ci/sdk-capability-fc-20260920/fc-lifecycle-r24/`。
 
 ## 双节点归属转移
 
-`transfer.py` 在专用KVM主机上使用两套网络命名空间与独立sandboxd验证共享checkpoint跨节点恢复。`ADX_TRANSFER_INTERRUPT_MASTER=1` 注入恢复计划落盘后、执行调用前的Master重启。package-v21/Lima r4六项通过，含同ID新代次、PID/内存/文件保留、旧节点清理与最终无残留，见 [运行说明及证据](../../../docs/testing/firecracker-cross-node.md)。此驱动尚未接入正式Kubernetes步骤。
+`transfer.py` 在专用KVM主机上使用两套网络命名空间与独立sandboxd验证共享checkpoint跨节点恢复。`ADX_TRANSFER_INTERRUPT_COORDINATOR=1` 注入恢复计划落盘后、执行调用前的Coordinator重启。package-v21/Lima r4六项通过，含同ID新代次、PID/内存/文件保留、旧节点清理与最终无残留，见 [运行说明及证据](../../../docs/testing/firecracker-cross-node.md)。此驱动尚未接入正式Kubernetes步骤。
 
-`ADX_TRANSFER_INTERRUPT_NODE=1` 在backend已Running、Redis仍未提交时重启目标Node Manager，检查旧backend清理后同代次重新恢复。package-v21/Lima r5六项及中断证据全部通过，52项驱动回归通过。
+`ADX_TRANSFER_INTERRUPT_NODE=1` 在backend已Running、Redis仍未提交时重启目标Adxlet，检查旧backend清理后同代次重新恢复。package-v21/Lima r5六项及中断证据全部通过，52项驱动回归通过。

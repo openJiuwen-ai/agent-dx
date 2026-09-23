@@ -6,17 +6,17 @@ use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 
-pub const EDGE_FRONTEND_ETCD_ENDPOINTS_ENV: &str = "ADX_DATA_PLANE_EDGE_FRONTEND_ETCD_ENDPOINTS";
+pub const INGRESS_ETCD_ENDPOINTS_ENV: &str = "ADX_DATA_PLANE_INGRESS_ETCD_ENDPOINTS";
 pub const DEFAULT_CONTROL_PLANE_ROUTES: &str = "exact:/,exact:/healthz,prefix:/terminal,prefix:/api/instances,prefix:/api/admin/v1/keys,prefix:/api/jobs,prefix:/api/sandbox,prefix:/functions,prefix:/api-docs,prefix:/admin/v1/functions,prefix:/serverless/v1/functions,prefix:/serverless/v1/stream,prefix:/serverless/v1/componentshealth,prefix:/serverless/v1/posix,prefix:/frontend/v1/instance,prefix:/datasystem/v1,prefix:/serverless/v2,prefix:/app/v1,prefix:/client/v1/lease,prefix:/invocations,prefix:/global-scheduler";
 
-/// Strongly typed process configuration for the Edge Frontend.
+/// Strongly typed process configuration for the Ingress.
 ///
 /// adx's TOML configuration remains the deployment source of truth. The
 /// launcher renders the values into the child process environment; this type
 /// centralizes parsing and validation so binaries do not scatter `env::var`
 /// calls throughout startup code.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EdgeFrontendConfig {
+pub struct IngressConfig {
     pub etcd_endpoints: Vec<String>,
     pub tls_bind: SocketAddr,
     pub plain_bind: SocketAddr,
@@ -24,15 +24,15 @@ pub struct EdgeFrontendConfig {
     pub tls_cert: String,
     pub tls_key: String,
     pub frontend_address: String,
-    pub reverse_proxy: crate::edge::ReverseProxyConfig,
-    pub proxy_routes: Vec<crate::edge::ProxyRoute>,
-    pub control_plane_routes: Vec<crate::edge::StaticRoute>,
+    pub reverse_proxy: crate::ingress::ReverseProxyConfig,
+    pub proxy_routes: Vec<crate::ingress::ProxyRoute>,
+    pub control_plane_routes: Vec<crate::ingress::StaticRoute>,
     pub validate_iam: bool,
     pub iam_address: String,
     pub auth_cache_ttl: Duration,
     pub default_direct_port: u16,
     pub default_tunnel_port: u16,
-    pub node_security_mode: EdgeNodeSecurityMode,
+    pub node_security_mode: IngressNodeSecurityMode,
     pub node_tls_ca: String,
     pub node_tls_server_name: String,
     pub node_tls_client_cert: String,
@@ -61,26 +61,26 @@ pub struct EdgeFrontendConfig {
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ConfigError {
-    #[error("{EDGE_FRONTEND_ETCD_ENDPOINTS_ENV} is not set")]
+    #[error("{INGRESS_ETCD_ENDPOINTS_ENV} is not set")]
     MissingEtcdEndpoints,
-    #[error("{EDGE_FRONTEND_ETCD_ENDPOINTS_ENV} must contain at least one etcd endpoint")]
+    #[error("{INGRESS_ETCD_ENDPOINTS_ENV} must contain at least one etcd endpoint")]
     EmptyEtcdEndpoints,
-    #[error("{EDGE_FRONTEND_ETCD_ENDPOINTS_ENV} contains non-Unicode data")]
+    #[error("{INGRESS_ETCD_ENDPOINTS_ENV} contains non-Unicode data")]
     InvalidEtcdEndpoints,
-    #[error("invalid Edge Frontend configuration: {0}")]
+    #[error("invalid Ingress configuration: {0}")]
     Invalid(String),
 }
 
 #[derive(Debug, Clone)]
-pub struct NodeProxyConfig {
+pub struct RelayConfig {
     pub bind: SocketAddr,
     pub advertise_address: String,
     pub health_bind: SocketAddr,
     pub allowed_target_networks: Vec<ipnet::IpNet>,
-    pub allowed_edge_networks: Vec<ipnet::IpNet>,
-    pub allow_any_edge: bool,
+    pub allowed_ingress_networks: Vec<ipnet::IpNet>,
+    pub allow_any_ingress: bool,
     pub max_streams: usize,
-    pub edge_security_mode: EdgeNodeSecurityMode,
+    pub ingress_security_mode: IngressNodeSecurityMode,
     pub tls_cert: String,
     pub tls_key: String,
     pub mtls_client_ca: String,
@@ -91,12 +91,12 @@ pub struct NodeProxyConfig {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EdgeNodeSecurityMode {
+pub enum IngressNodeSecurityMode {
     Network,
     Mtls,
 }
 
-impl std::str::FromStr for EdgeNodeSecurityMode {
+impl std::str::FromStr for IngressNodeSecurityMode {
     type Err = String;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
@@ -108,65 +108,62 @@ impl std::str::FromStr for EdgeNodeSecurityMode {
     }
 }
 
-impl NodeProxyConfig {
+impl RelayConfig {
     pub fn from_env() -> Result<Self, ConfigError> {
-        let bind = parse_env("ADX_DATA_PLANE_NODE_PROXY_BIND", "0.0.0.0:8443")?;
+        let bind = parse_env("ADX_DATA_PLANE_RELAY_BIND", "0.0.0.0:8443")?;
         let advertise_address =
-            env::var("ADX_DATA_PLANE_NODE_PROXY_ADVERTISE_ADDRESS").unwrap_or_default();
-        let health_bind = parse_env("ADX_DATA_PLANE_NODE_PROXY_HEALTH_BIND", "127.0.0.1:18443")?;
+            env::var("ADX_DATA_PLANE_RELAY_ADVERTISE_ADDRESS").unwrap_or_default();
+        let health_bind = parse_env("ADX_DATA_PLANE_RELAY_HEALTH_BIND", "127.0.0.1:18443")?;
         let allowed_target_networks = parse_cidrs("ADX_DATA_PLANE_ALLOWED_TARGET_CIDRS", true)?;
-        let allowed_edge_networks = parse_cidrs("ADX_DATA_PLANE_ALLOWED_EDGE_CIDRS", false)?;
-        let allow_any_edge = parse_bool_env("ADX_DATA_PLANE_NODE_PROXY_ALLOW_ANY_EDGE", false)?;
-        if allowed_edge_networks.is_empty() && !allow_any_edge {
+        let allowed_ingress_networks = parse_cidrs("ADX_DATA_PLANE_ALLOWED_INGRESS_CIDRS", false)?;
+        let allow_any_ingress = parse_bool_env("ADX_DATA_PLANE_RELAY_ALLOW_ANY_INGRESS", false)?;
+        if allowed_ingress_networks.is_empty() && !allow_any_ingress {
             return Err(ConfigError::Invalid(
-                "Node Proxy requires ADX_DATA_PLANE_ALLOWED_EDGE_CIDRS unless unrestricted development access is explicitly enabled".into(),
+                "Relay requires ADX_DATA_PLANE_ALLOWED_INGRESS_CIDRS unless unrestricted development access is explicitly enabled".into(),
             ));
         }
-        let configured_max_streams = parse_env("ADX_DATA_PLANE_NODE_PROXY_MAX_STREAMS", "0")?;
+        let configured_max_streams = parse_env("ADX_DATA_PLANE_RELAY_MAX_STREAMS", "0")?;
         let max_streams = if configured_max_streams == 0 {
             fd_based_stream_budget()?
         } else {
             configured_max_streams
         };
-        let edge_security_mode =
-            parse_env("ADX_DATA_PLANE_EDGE_FRONTEND_NODE_SECURITY_MODE", "network")?;
-        let tls_cert = env::var("ADX_DATA_PLANE_NODE_PROXY_TLS_CERT").unwrap_or_default();
-        let tls_key = env::var("ADX_DATA_PLANE_NODE_PROXY_TLS_KEY").unwrap_or_default();
-        let mtls_client_ca =
-            env::var("ADX_DATA_PLANE_NODE_PROXY_MTLS_CLIENT_CA").unwrap_or_default();
-        match edge_security_mode {
-            EdgeNodeSecurityMode::Mtls
+        let ingress_security_mode =
+            parse_env("ADX_DATA_PLANE_INGRESS_NODE_SECURITY_MODE", "network")?;
+        let tls_cert = env::var("ADX_DATA_PLANE_RELAY_TLS_CERT").unwrap_or_default();
+        let tls_key = env::var("ADX_DATA_PLANE_RELAY_TLS_KEY").unwrap_or_default();
+        let mtls_client_ca = env::var("ADX_DATA_PLANE_RELAY_MTLS_CLIENT_CA").unwrap_or_default();
+        match ingress_security_mode {
+            IngressNodeSecurityMode::Mtls
                 if tls_cert.is_empty() || tls_key.is_empty() || mtls_client_ca.is_empty() =>
             {
                 return Err(ConfigError::Invalid(
-                    "Node Proxy mTLS mode requires the server certificate, key, and Edge client CA"
+                    "Relay mTLS mode requires the server certificate, key, and Ingress client CA"
                         .into(),
                 ));
             }
             _ => {}
         }
-        let activity_uds_dir = env::var("ADX_DATA_PLANE_NODE_PROXY_ACTIVITY_UDS_DIR")
+        let activity_uds_dir = env::var("ADX_DATA_PLANE_RELAY_ACTIVITY_UDS_DIR")
             .ok()
             .filter(|value| !value.trim().is_empty());
         let activity_interval = Duration::from_secs(parse_env(
-            "ADX_DATA_PLANE_NODE_PROXY_ACTIVITY_INTERVAL_SEC",
+            "ADX_DATA_PLANE_RELAY_ACTIVITY_INTERVAL_SEC",
             "30",
         )?);
         let gateway_epoch =
-            env::var("ADX_DATA_PLANE_NODE_PROXY_EPOCH").unwrap_or_else(|_| default_gateway_epoch());
-        let drain_timeout = Duration::from_secs(parse_env(
-            "ADX_DATA_PLANE_NODE_PROXY_DRAIN_TIMEOUT_SEC",
-            "30",
-        )?);
+            env::var("ADX_DATA_PLANE_RELAY_EPOCH").unwrap_or_else(|_| default_gateway_epoch());
+        let drain_timeout =
+            Duration::from_secs(parse_env("ADX_DATA_PLANE_RELAY_DRAIN_TIMEOUT_SEC", "30")?);
         Ok(Self {
             bind,
             advertise_address,
             health_bind,
             allowed_target_networks,
-            allowed_edge_networks,
-            allow_any_edge,
+            allowed_ingress_networks,
+            allow_any_ingress,
             max_streams,
-            edge_security_mode,
+            ingress_security_mode,
             tls_cert,
             tls_key,
             mtls_client_ca,
@@ -178,52 +175,49 @@ impl NodeProxyConfig {
     }
 
     pub fn peer_allowed(&self, peer: std::net::IpAddr) -> bool {
-        self.allow_any_edge
+        self.allow_any_ingress
             || self
-                .allowed_edge_networks
+                .allowed_ingress_networks
                 .iter()
                 .any(|network| network.contains(&peer))
     }
 }
 
-impl EdgeFrontendConfig {
+impl IngressConfig {
     pub fn from_env() -> Result<Self, ConfigError> {
         let etcd_endpoints = Vec::new();
-        let tls_bind = parse_env("ADX_DATA_PLANE_EDGE_FRONTEND_TLS_BIND", "0.0.0.0:8443")?;
-        let plain_bind = parse_env("ADX_DATA_PLANE_EDGE_FRONTEND_PLAIN_BIND", "0.0.0.0:8080")?;
-        let health_bind = parse_env(
-            "ADX_DATA_PLANE_EDGE_FRONTEND_HEALTH_BIND",
-            "127.0.0.1:18080",
-        )?;
-        let tls_cert = env::var("ADX_DATA_PLANE_EDGE_FRONTEND_TLS_CERT").unwrap_or_default();
-        let tls_key = env::var("ADX_DATA_PLANE_EDGE_FRONTEND_TLS_KEY").unwrap_or_default();
+        let tls_bind = parse_env("ADX_DATA_PLANE_INGRESS_TLS_BIND", "0.0.0.0:8443")?;
+        let plain_bind = parse_env("ADX_DATA_PLANE_INGRESS_PLAIN_BIND", "0.0.0.0:8080")?;
+        let health_bind = parse_env("ADX_DATA_PLANE_INGRESS_HEALTH_BIND", "127.0.0.1:18080")?;
+        let tls_cert = env::var("ADX_DATA_PLANE_INGRESS_TLS_CERT").unwrap_or_default();
+        let tls_key = env::var("ADX_DATA_PLANE_INGRESS_TLS_KEY").unwrap_or_default();
         if tls_cert.is_empty() || tls_key.is_empty() {
             return Err(ConfigError::Invalid(
-                "Edge TLS listener requires a certificate and key".into(),
+                "Ingress TLS listener requires a certificate and key".into(),
             ));
         }
-        let frontend_address = env::var("ADX_DATA_PLANE_EDGE_FRONTEND_CONTROL_PLANE_ADDRESS")
+        let frontend_address = env::var("ADX_DATA_PLANE_INGRESS_CONTROL_PLANE_ADDRESS")
             .unwrap_or_else(|_| "127.0.0.1:8888".into());
         if frontend_address.trim().is_empty() {
             return Err(ConfigError::Invalid(
-                "Edge Frontend upstream address is required".into(),
+                "Ingress upstream address is required".into(),
             ));
         }
-        let control_plane_routes = crate::edge::parse_static_routes(
-            &env::var("ADX_DATA_PLANE_EDGE_FRONTEND_CONTROL_PLANE_ROUTES")
+        let control_plane_routes = crate::ingress::parse_static_routes(
+            &env::var("ADX_DATA_PLANE_INGRESS_CONTROL_PLANE_ROUTES")
                 .unwrap_or_else(|_| DEFAULT_CONTROL_PLANE_ROUTES.into()),
         )
         .map_err(|error| {
             ConfigError::Invalid(format!(
-                "ADX_DATA_PLANE_EDGE_FRONTEND_CONTROL_PLANE_ROUTES: {error}"
+                "ADX_DATA_PLANE_INGRESS_CONTROL_PLANE_ROUTES: {error}"
             ))
         })?;
-        let proxy_routes = match env::var("ADX_DATA_PLANE_EDGE_FRONTEND_PROXY_ROUTES_FILE") {
+        let proxy_routes = match env::var("ADX_DATA_PLANE_INGRESS_PROXY_ROUTES_FILE") {
             Ok(path) => {
                 let input = std::fs::read_to_string(path).map_err(|error| {
                     ConfigError::Invalid(format!("read proxy routes file: {error}"))
                 })?;
-                crate::edge::parse_proxy_routes(&input).map_err(ConfigError::Invalid)?
+                crate::ingress::parse_proxy_routes(&input).map_err(ConfigError::Invalid)?
             }
             Err(env::VarError::NotPresent) => Vec::new(),
             Err(error) => return Err(ConfigError::Invalid(format!("proxy routes file: {error}"))),
@@ -231,55 +225,52 @@ impl EdgeFrontendConfig {
         let validate_iam = false;
         let iam_address = String::new();
         let auth_cache_ttl = Duration::from_secs(parse_env(
-            "ADX_DATA_PLANE_EDGE_FRONTEND_AUTH_CACHE_TTL_SEC",
+            "ADX_DATA_PLANE_INGRESS_AUTH_CACHE_TTL_SEC",
             "30",
         )?);
-        let default_direct_port = parse_env("ADX_DATA_PLANE_EDGE_FRONTEND_DIRECT_PORT", "50090")?;
-        let default_tunnel_port = parse_env("ADX_DATA_PLANE_EDGE_FRONTEND_TUNNEL_PORT", "8765")?;
-        let node_security_mode =
-            parse_env("ADX_DATA_PLANE_EDGE_FRONTEND_NODE_SECURITY_MODE", "network")?;
-        let node_tls_ca = env::var("ADX_DATA_PLANE_EDGE_FRONTEND_NODE_TLS_CA").unwrap_or_default();
+        let default_direct_port = parse_env("ADX_DATA_PLANE_INGRESS_DIRECT_PORT", "50090")?;
+        let default_tunnel_port = parse_env("ADX_DATA_PLANE_INGRESS_TUNNEL_PORT", "8765")?;
+        let node_security_mode = parse_env("ADX_DATA_PLANE_INGRESS_NODE_SECURITY_MODE", "network")?;
+        let node_tls_ca = env::var("ADX_DATA_PLANE_INGRESS_NODE_TLS_CA").unwrap_or_default();
         let node_tls_server_name =
-            env::var("ADX_DATA_PLANE_EDGE_FRONTEND_NODE_TLS_SERVER_NAME").unwrap_or_default();
+            env::var("ADX_DATA_PLANE_INGRESS_NODE_TLS_SERVER_NAME").unwrap_or_default();
         let node_tls_client_cert =
-            env::var("ADX_DATA_PLANE_EDGE_FRONTEND_NODE_TLS_CLIENT_CERT").unwrap_or_default();
+            env::var("ADX_DATA_PLANE_INGRESS_NODE_TLS_CLIENT_CERT").unwrap_or_default();
         let node_tls_client_key =
-            env::var("ADX_DATA_PLANE_EDGE_FRONTEND_NODE_TLS_CLIENT_KEY").unwrap_or_default();
+            env::var("ADX_DATA_PLANE_INGRESS_NODE_TLS_CLIENT_KEY").unwrap_or_default();
         match node_security_mode {
-            EdgeNodeSecurityMode::Mtls
+            IngressNodeSecurityMode::Mtls
                 if node_tls_ca.is_empty()
                     || node_tls_server_name.is_empty()
                     || node_tls_client_cert.is_empty()
                     || node_tls_client_key.is_empty() =>
             {
                 return Err(ConfigError::Invalid(
-                    "Edge mTLS mode requires the Node Proxy CA/server name and Edge client certificate/key"
+                    "Ingress mTLS mode requires the Relay CA/server name and Ingress client certificate/key"
                         .into(),
                 ));
             }
             _ => {}
         }
         let connections_per_node =
-            parse_env("ADX_DATA_PLANE_EDGE_FRONTEND_H2_CONNECTIONS_PER_NODE", "2")?;
-        let max_connections_per_node = parse_env(
-            "ADX_DATA_PLANE_EDGE_FRONTEND_H2_MAX_CONNECTIONS_PER_NODE",
-            "4",
-        )?;
+            parse_env("ADX_DATA_PLANE_INGRESS_H2_CONNECTIONS_PER_NODE", "2")?;
+        let max_connections_per_node =
+            parse_env("ADX_DATA_PLANE_INGRESS_H2_MAX_CONNECTIONS_PER_NODE", "4")?;
         if connections_per_node == 0 || max_connections_per_node < connections_per_node {
             return Err(ConfigError::Invalid(
                 "H2 connection counts must be non-zero and max must be >= initial count".into(),
             ));
         }
         let backend_http_max_connections_per_endpoint = parse_env(
-            "ADX_DATA_PLANE_EDGE_FRONTEND_BACKEND_HTTP_MAX_CONNECTIONS_PER_ENDPOINT",
+            "ADX_DATA_PLANE_INGRESS_BACKEND_HTTP_MAX_CONNECTIONS_PER_ENDPOINT",
             "64",
         )?;
         let backend_http_max_idle_connections = parse_env(
-            "ADX_DATA_PLANE_EDGE_FRONTEND_BACKEND_HTTP_MAX_IDLE_CONNECTIONS",
+            "ADX_DATA_PLANE_INGRESS_BACKEND_HTTP_MAX_IDLE_CONNECTIONS",
             "1024",
         )?;
         let backend_http_max_idle_connections_per_endpoint = parse_env(
-            "ADX_DATA_PLANE_EDGE_FRONTEND_BACKEND_HTTP_MAX_IDLE_CONNECTIONS_PER_ENDPOINT",
+            "ADX_DATA_PLANE_INGRESS_BACKEND_HTTP_MAX_IDLE_CONNECTIONS_PER_ENDPOINT",
             "64",
         )?;
         if backend_http_max_connections_per_endpoint == 0
@@ -293,11 +284,11 @@ impl EdgeFrontendConfig {
             ));
         }
         let backend_http_idle_timeout = Duration::from_secs(parse_env(
-            "ADX_DATA_PLANE_EDGE_FRONTEND_BACKEND_HTTP_IDLE_TIMEOUT_SEC",
+            "ADX_DATA_PLANE_INGRESS_BACKEND_HTTP_IDLE_TIMEOUT_SEC",
             "5",
         )?);
         let backend_http_acquire_timeout = Duration::from_millis(parse_env(
-            "ADX_DATA_PLANE_EDGE_FRONTEND_BACKEND_HTTP_ACQUIRE_TIMEOUT_MS",
+            "ADX_DATA_PLANE_INGRESS_BACKEND_HTTP_ACQUIRE_TIMEOUT_MS",
             "3000",
         )?);
         if backend_http_idle_timeout.is_zero() || backend_http_acquire_timeout.is_zero() {
@@ -305,17 +296,17 @@ impl EdgeFrontendConfig {
                 "backend HTTP pool timeouts must be non-zero".into(),
             ));
         }
-        let reverse_proxy = crate::edge::ReverseProxyConfig {
+        let reverse_proxy = crate::ingress::ReverseProxyConfig {
             max_idle_connections: parse_env(
-                "ADX_DATA_PLANE_EDGE_FRONTEND_PROXY_MAX_IDLE_CONNECTIONS",
+                "ADX_DATA_PLANE_INGRESS_PROXY_MAX_IDLE_CONNECTIONS",
                 "512",
             )?,
             idle_timeout: Duration::from_secs(parse_env(
-                "ADX_DATA_PLANE_EDGE_FRONTEND_PROXY_IDLE_TIMEOUT_SEC",
+                "ADX_DATA_PLANE_INGRESS_PROXY_IDLE_TIMEOUT_SEC",
                 "30",
             )?),
             connect_timeout: Duration::from_secs(parse_env(
-                "ADX_DATA_PLANE_EDGE_FRONTEND_PROXY_CONNECT_TIMEOUT_SEC",
+                "ADX_DATA_PLANE_INGRESS_PROXY_CONNECT_TIMEOUT_SEC",
                 "5",
             )?),
         };
@@ -324,17 +315,14 @@ impl EdgeFrontendConfig {
                 "reverse proxy HTTP timeouts must be non-zero".into(),
             ));
         }
-        let drain_timeout = Duration::from_secs(parse_env(
-            "ADX_DATA_PLANE_EDGE_FRONTEND_DRAIN_TIMEOUT_SEC",
-            "30",
-        )?);
+        let drain_timeout =
+            Duration::from_secs(parse_env("ADX_DATA_PLANE_INGRESS_DRAIN_TIMEOUT_SEC", "30")?);
         let allowed_client_networks =
-            parse_cidrs("ADX_DATA_PLANE_EDGE_FRONTEND_ALLOWED_CLIENT_CIDRS", false)?;
-        let allow_any_client =
-            parse_bool_env("ADX_DATA_PLANE_EDGE_FRONTEND_ALLOW_ANY_CLIENT", false)?;
+            parse_cidrs("ADX_DATA_PLANE_INGRESS_ALLOWED_CLIENT_CIDRS", false)?;
+        let allow_any_client = parse_bool_env("ADX_DATA_PLANE_INGRESS_ALLOW_ANY_CLIENT", false)?;
         if allowed_client_networks.is_empty() && !allow_any_client {
             return Err(ConfigError::Invalid(
-                "Edge requires ADX_DATA_PLANE_EDGE_FRONTEND_ALLOWED_CLIENT_CIDRS unless unrestricted development access is explicitly enabled".into(),
+                "Ingress requires ADX_DATA_PLANE_INGRESS_ALLOWED_CLIENT_CIDRS unless unrestricted development access is explicitly enabled".into(),
             ));
         }
         let command_watch_max_subscriptions =
@@ -353,17 +341,13 @@ impl EdgeFrontendConfig {
                 "command watch limits and ping interval must be non-zero".into(),
             ));
         }
-        let etcd_tls_ca = env::var("ADX_DATA_PLANE_EDGE_FRONTEND_ETCD_TLS_CA").unwrap_or_default();
-        let etcd_tls_cert =
-            env::var("ADX_DATA_PLANE_EDGE_FRONTEND_ETCD_TLS_CERT").unwrap_or_default();
-        let etcd_tls_key =
-            env::var("ADX_DATA_PLANE_EDGE_FRONTEND_ETCD_TLS_KEY").unwrap_or_default();
+        let etcd_tls_ca = env::var("ADX_DATA_PLANE_INGRESS_ETCD_TLS_CA").unwrap_or_default();
+        let etcd_tls_cert = env::var("ADX_DATA_PLANE_INGRESS_ETCD_TLS_CERT").unwrap_or_default();
+        let etcd_tls_key = env::var("ADX_DATA_PLANE_INGRESS_ETCD_TLS_KEY").unwrap_or_default();
         let etcd_tls_domain =
-            env::var("ADX_DATA_PLANE_EDGE_FRONTEND_ETCD_TLS_DOMAIN").unwrap_or_default();
-        let etcd_username =
-            env::var("ADX_DATA_PLANE_EDGE_FRONTEND_ETCD_USERNAME").unwrap_or_default();
-        let etcd_password =
-            env::var("ADX_DATA_PLANE_EDGE_FRONTEND_ETCD_PASSWORD").unwrap_or_default();
+            env::var("ADX_DATA_PLANE_INGRESS_ETCD_TLS_DOMAIN").unwrap_or_default();
+        let etcd_username = env::var("ADX_DATA_PLANE_INGRESS_ETCD_USERNAME").unwrap_or_default();
+        let etcd_password = env::var("ADX_DATA_PLANE_INGRESS_ETCD_PASSWORD").unwrap_or_default();
         if etcd_tls_cert.is_empty() != etcd_tls_key.is_empty() {
             return Err(ConfigError::Invalid(
                 "etcd TLS client certificate and key must be configured together".into(),
@@ -432,8 +416,8 @@ impl EdgeFrontendConfig {
         Ok(etcd_endpoints)
     }
 
-    pub fn h2_pool_config(&self) -> Result<crate::edge::H2PoolConfig, ConfigError> {
-        let tls_config = if self.node_security_mode == EdgeNodeSecurityMode::Mtls {
+    pub fn h2_pool_config(&self) -> Result<crate::ingress::H2PoolConfig, ConfigError> {
+        let tls_config = if self.node_security_mode == IngressNodeSecurityMode::Mtls {
             let mut roots = rustls::RootCertStore::empty();
             let mut reader = BufReader::new(
                 File::open(&self.node_tls_ca)
@@ -455,46 +439,44 @@ impl EdgeFrontendConfig {
             let builder = rustls::ClientConfig::builder().with_root_certificates(roots);
             let mut cert_reader =
                 BufReader::new(File::open(&self.node_tls_client_cert).map_err(|error| {
-                    ConfigError::Invalid(format!("open Node Proxy TLS client certificate: {error}"))
+                    ConfigError::Invalid(format!("open Relay TLS client certificate: {error}"))
                 })?);
             let certificates = rustls_pemfile::certs(&mut cert_reader)
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|error| {
-                    ConfigError::Invalid(format!("read Node Proxy TLS client certificate: {error}"))
+                    ConfigError::Invalid(format!("read Relay TLS client certificate: {error}"))
                 })?;
             let mut key_reader =
                 BufReader::new(File::open(&self.node_tls_client_key).map_err(|error| {
-                    ConfigError::Invalid(format!("open Node Proxy TLS client key: {error}"))
+                    ConfigError::Invalid(format!("open Relay TLS client key: {error}"))
                 })?);
             let key = rustls_pemfile::private_key(&mut key_reader)
                 .map_err(|error| {
-                    ConfigError::Invalid(format!("read Node Proxy TLS client key: {error}"))
+                    ConfigError::Invalid(format!("read Relay TLS client key: {error}"))
                 })?
-                .ok_or_else(|| ConfigError::Invalid("Node Proxy TLS client key is empty".into()))?;
+                .ok_or_else(|| ConfigError::Invalid("Relay TLS client key is empty".into()))?;
             let mut config = builder
                 .with_client_auth_cert(certificates, key)
                 .map_err(|error| {
-                    ConfigError::Invalid(format!(
-                        "configure Node Proxy TLS client identity: {error}"
-                    ))
+                    ConfigError::Invalid(format!("configure Relay TLS client identity: {error}"))
                 })?;
             config.alpn_protocols = vec![b"h2".to_vec()];
             Some(Arc::new(config))
         } else {
             None
         };
-        Ok(crate::edge::H2PoolConfig {
+        Ok(crate::ingress::H2PoolConfig {
             connections_per_node: self.connections_per_node,
             max_connections_per_node: self.max_connections_per_node,
             tls_config,
-            tls_server_name: (self.node_security_mode == EdgeNodeSecurityMode::Mtls)
+            tls_server_name: (self.node_security_mode == IngressNodeSecurityMode::Mtls)
                 .then(|| self.node_tls_server_name.clone()),
             ..Default::default()
         })
     }
 
-    pub fn backend_http_pool_config(&self) -> crate::edge::http_pool::BackendHttpPoolConfig {
-        crate::edge::http_pool::BackendHttpPoolConfig {
+    pub fn backend_http_pool_config(&self) -> crate::ingress::http_pool::BackendHttpPoolConfig {
+        crate::ingress::http_pool::BackendHttpPoolConfig {
             max_connections_per_endpoint: self.backend_http_max_connections_per_endpoint,
             max_idle_connections: self.backend_http_max_idle_connections,
             max_idle_connections_per_endpoint: self.backend_http_max_idle_connections_per_endpoint,
@@ -625,7 +607,7 @@ mod tests {
     #[test]
     fn parses_and_normalizes_etcd_endpoints() {
         let endpoints =
-            EdgeFrontendConfig::parse_etcd_endpoints(" http://etcd-1:2379, ,https://etcd-2:2379 ")
+            IngressConfig::parse_etcd_endpoints(" http://etcd-1:2379, ,https://etcd-2:2379 ")
                 .unwrap();
         assert_eq!(endpoints, vec!["http://etcd-1:2379", "https://etcd-2:2379"]);
     }
@@ -633,21 +615,21 @@ mod tests {
     #[test]
     fn rejects_an_empty_endpoint_list() {
         assert_eq!(
-            EdgeFrontendConfig::parse_etcd_endpoints(" , ").unwrap_err(),
+            IngressConfig::parse_etcd_endpoints(" , ").unwrap_err(),
             ConfigError::EmptyEtcdEndpoints
         );
     }
 
     #[test]
-    fn edge_node_security_modes_are_network_or_mtls() {
+    fn ingress_node_security_modes_are_network_or_mtls() {
         assert_eq!(
-            "network".parse::<EdgeNodeSecurityMode>().unwrap(),
-            EdgeNodeSecurityMode::Network
+            "network".parse::<IngressNodeSecurityMode>().unwrap(),
+            IngressNodeSecurityMode::Network
         );
         assert_eq!(
-            "mtls".parse::<EdgeNodeSecurityMode>().unwrap(),
-            EdgeNodeSecurityMode::Mtls
+            "mtls".parse::<IngressNodeSecurityMode>().unwrap(),
+            IngressNodeSecurityMode::Mtls
         );
-        assert!("token".parse::<EdgeNodeSecurityMode>().is_err());
+        assert!("token".parse::<IngressNodeSecurityMode>().is_err());
     }
 }

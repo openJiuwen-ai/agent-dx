@@ -1,9 +1,9 @@
-use adx_core::{scheduling::*, CapsuleSpec, Resources};
-use adx_scheduling::{Candidate, Framework, Node, PlacedCapsule, Placement, Snapshot};
+use adx_core::{scheduling::*, EnvironmentSpec, Resources};
+use adx_scheduling::{Candidate, Framework, Node, PlacedEnvironment, Placement, Snapshot};
 use std::collections::BTreeMap;
-fn request(id: &str) -> CapsuleSpec {
-    CapsuleSpec {
-        environment: None,
+fn request(id: &str) -> EnvironmentSpec {
+    EnvironmentSpec {
+        runtime_profile: None,
         snapshot_id: None,
         lifecycle: Default::default(),
         env: Default::default(),
@@ -30,7 +30,7 @@ fn term(key: &str, value: &str, weight: u32) -> WeightedSelector {
         weight,
     }
 }
-fn selected(r: &CapsuleSpec, s: &Snapshot) -> Option<String> {
+fn selected(r: &EnvironmentSpec, s: &Snapshot) -> Option<String> {
     Framework::builtin(Placement::Spread)
         .select(
             r,
@@ -63,13 +63,13 @@ fn peer_groups_preserve_or_tenants_pending_placements_and_reverse_exclusion() {
     }
     let mut peer = request("peer");
     peer.scheduling.labels.insert("app".into(), "db".into());
-    s.place(PlacedCapsule {
+    s.place(PlacedEnvironment {
         spec: peer,
         node_id: "b".into(),
     });
     let mut r = request("client");
     r.scheduling.placement_groups.push(PlacementGroup {
-        target: PlacementTarget::Capsule,
+        target: PlacementTarget::Environment,
         terms: vec![term("app", "missing", 1), term("app", "db", 1)],
         required: true,
         anti: false,
@@ -81,7 +81,7 @@ fn peer_groups_preserve_or_tenants_pending_placements_and_reverse_exclusion() {
     r.tenant_id = "t".into();
     r.scheduling.placement_groups[0].anti = true;
     assert_eq!(selected(&r, &s).as_deref(), Some("a"));
-    s.place(PlacedCapsule {
+    s.place(PlacedEnvironment {
         spec: r,
         node_id: "a".into(),
     });

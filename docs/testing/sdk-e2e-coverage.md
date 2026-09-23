@@ -29,17 +29,17 @@ E2E case ID；静态测试会在 SDK 新增、删除或漏登记公开成员时�
 
 普通 runc Standalone 负责其中 55 个操作；KVM Firecracker profile 负责其余 11 个操作，包括
 checkpoint/snapshot、入口继承、reload 和运行期网络策略。这里的“覆盖”要求
-请求真实经过 API Server、Gateway、Node Manager、sandboxd 和 RRT；SDK 单测不计入此表。
+请求真实经过 API Server、Gateway、adxlet、sandboxd 和 Execd；SDK 单测不计入此表。
 
 ### Reverse tunnel 集成
 
-`Sandbox(upstream=...)` 创建请求携带 tunnel 配置，API Server 写入 RRT tunnel 端口，Edge 将
-`/tunnel/{instance}` 解析为 8765，Node Proxy 复核实例绑定后连接 RRT，SDK `TunnelClient` 再把
-请求转给本机 upstream。Node Manager 不得给生产 RRT 注入隔离测试专用的
-`RRT_HTTP_ONLY=1`，否则 RRT 只启动命令／文件 HTTP listener，tunnel 握手会在 Edge 返回 502。
+`Sandbox(upstream=...)` 创建请求携带 tunnel 配置，API Server 写入 Execd tunnel 端口，Ingress 将
+`/tunnel/{instance}` 解析为 8765，Relay 复核实例绑定后连接 Execd，SDK `TunnelClient` 再把
+请求转给本机 upstream。adxlet 不得给生产 Execd 注入隔离测试专用的
+`EXECD_HTTP_ONLY=1`，否则 Execd 只启动命令／文件 HTTP listener，tunnel 握手会在 Ingress 返回 502。
 
 Standalone r11 的 `reverse-tunnel.sdk-upstream-roundtrip` 从 Sandbox 内访问
-`get_tunnel_url()`，经过 RRT、Node Proxy、Edge 和 SDK TunnelClient 到达 SDK 进程中的真实 HTTP
+`get_tunnel_url()`，经过 Execd、Relay、Ingress 和 SDK TunnelClient 到达 SDK 进程中的真实 HTTP
 upstream，并校验响应体和路径。该项不是客户端序列化单测。
 
 ## 构造能力
@@ -56,7 +56,7 @@ upstream，并校验响应体和路径。该项不是客户端序列化单测。
 | storage_mb | FC 用例验证独立 request/limit 可下发并启动 | 仍需写满边界、超限及回收 E2E |
 | S3 rootfs、S3 EROFS mount、failover、inherit_entrypoint、network、独立 request/limit | 本地 KVM 已逐项实跑；r16 SDK 19/19，r17/r18 在已更新 package 上连续通过前 16 项后才触发已知双克隆网络故障 | 继续修复 ARM FC 双克隆网络问题并取得同一次 26/26 严格验收 |
 | data_plane_security | Standalone r4 已通过每实例纯 TLS 与默认 TLS+Token 对照 | 增加非法安全模式和证书轮换场景 |
-| extra_config | API→Capsule→sandboxd 请求契约测试已覆盖 | 具体键的含义由 sandboxd/runtime 定义；按实际 runtime 增加语义 E2E |
+| extra_config | API→Environment→sandboxd 请求契约测试已覆盖 | 具体键的含义由 sandboxd/runtime 定义；按实际 runtime 增加语义 E2E |
 | upstream | Standalone r11 实跑通过 | 增加断线期间在途请求续传和大响应的部署形态 E2E |
 
 ## 错误类型
@@ -65,10 +65,10 @@ upstream，并校验响应体和路径。该项不是客户端序列化单测。
 |---|---|
 | `SandboxNotFound`、`PermissionDenied` | 已覆盖 |
 | `CommandConflict`、`CommandNotFound`、`CommandWaitTimeout` | 已覆盖 |
-| `CommandSubmissionError` | 需要真实“请求已到 RRT、响应被切断”故障注入 |
+| `CommandSubmissionError` | 需要真实“请求已到 Execd、响应被切断”故障注入 |
 | `CommandUnavailable` | 需要 command watch 中断且查询暂不可用的故障注入 |
 | `CommandExpired` | 需要可配置结果保留期及过期清理场景 |
-| `UnsupportedFeature` | 需要旧／不完整 RRT capability fixture，不进入基础门禁 |
+| `UnsupportedFeature` | 需要旧／不完整 Execd capability fixture，不进入基础门禁 |
 | `ResourceExhausted` | 需要命令并发额度耗尽场景；实例容量排队不能替代它 |
 
 ## 当前可执行子用例
@@ -84,7 +84,7 @@ Standalone 的 JUnit 数量因此由运行环境决定，不能继续把“10 �
 
 2026-09-20 的本地 runc Standalone r4 完整回归实际展开为 40 条 JUnit 用例，0 失败、0 跳过：
 `sdk` 7 条、`data-plane` 16 条、`lifecycle` 4 条、`placement` 6 条，认证、容量、本地优先、
-节点故障、Node Manager 重启、停机清理各 1 条，再加 1 条全局残留清理检查。结构化结果位于
+节点故障、adxlet 重启、停机清理各 1 条，再加 1 条全局残留清理检查。结构化结果位于
 `out/ci/sdk-capability-fc-20260920/standalone-run-r4/result.json`，
 JUnit 位于同目录 `junit.xml`。
 
@@ -106,7 +106,7 @@ Standalone 负责的公开操作数为 55。
 完整门禁仍需修复双克隆网络问题后重跑。
 
 生命周期隔离套件 r24 另有 7/7 通过及完整清理证据，覆盖有／无 checkpoint 的 failover、
-Master 不可用时 SQLite 降级、Node Manager 重启等待、心跳过期后的旧会话隔离清理，以及资源
+Coordinator 不可用时 SQLite 降级、adxlet 重启等待、心跳过期后的旧会话隔离清理，以及资源
 观测过期门禁；证据位于 `out/ci/sdk-capability-fc-20260920/fc-lifecycle-r24/`。该套件没有运行
 双克隆，不能用来覆盖上述 26/26 缺口。
 

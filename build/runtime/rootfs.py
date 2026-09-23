@@ -23,7 +23,7 @@ def build(binary, output, busybox=Path('/usr/bin/busybox')):
         root = Path(temporary)
         for name in ('usr/bin', 'usr/local/bin', 'bin', 'sbin', 'etc', 'tmp', 'var/tmp', 'root', 'home', 'proc', 'sys', 'dev', '__adx'):
             (root/name).mkdir(parents=True, exist_ok=True)
-        for source, target in ((binary,'usr/local/bin/rrt-runtime'), (busybox,'bin/busybox')):
+        for source, target in ((binary,'usr/local/bin/adx-execd'), (busybox,'bin/busybox')):
             shutil.copyfile(source,root/target); (root/target).chmod(0o755)
         for app in subprocess.check_output([str(busybox), '--list'],text=True).splitlines():
             if app != 'busybox': (root/'bin'/app).symlink_to('busybox')

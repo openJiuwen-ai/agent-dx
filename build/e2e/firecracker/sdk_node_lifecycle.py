@@ -44,10 +44,10 @@ def command(args):
 
 def catalog():
     value = json.loads(command([a.tools/'redis-cli','--json','HGETALL','adx:{acceptance}:control:v1']))
-    return {k:json.loads(v) for k,v in value.items() if k.startswith(('capsule:','node:'))}
+    return {k:json.loads(v) for k,v in value.items() if k.startswith(('environment:','node:'))}
 
 def record(id):
-    return catalog().get('capsule:'+id,{}).get('result')
+    return catalog().get('environment:'+id,{}).get('result')
 
 def services():
     return json.loads(command([a.package/'bin/adxctl','status','--config',root/'deployment.yaml']))['services']
@@ -79,7 +79,7 @@ def create(**kwargs):
     return s
 
 def physical(id):
-    lines = command([a.sbox,'-a',root/'sandboxd/sandboxd.sock','list','--label','adx.capsule_id='+id]).splitlines()
+    lines = command([a.sbox,'-a',root/'sandboxd/sandboxd.sock','list','--label','adx.environment_id='+id]).splitlines()
     return [line.split()[0] for line in lines[1:] if line.strip()]
 
 try:
@@ -94,7 +94,7 @@ try:
     passed('unexpected backend exit restarts with a fresh execution', instance_id=s.id, old_runtime=first['runtime_id'], new_runtime=restarted['runtime_id'])
     def sampled_stats():
         text = urllib.request.urlopen('http://127.0.0.1:17003/metrics',timeout=5).read().decode()
-        return text if 'adx_capsule_memory_usage_bytes' in text and s.id in text else None
+        return text if 'adx_environment_memory_usage_bytes' in text and s.id in text else None
     stats = wait(sampled_stats, 30)
     (out/'metrics.txt').write_text(stats)
     assert 'adx_node_reserved_cpu_millis' in stats
@@ -126,8 +126,8 @@ try:
 
     keep = create(idle_timeout=0)
     idle = create(idle_timeout=8)
-    master_pid = pid('master')
-    os.kill(master_pid,signal.SIGSTOP); stopped.add(master_pid)
+    coordinator_pid = pid('coordinator')
+    os.kill(coordinator_pid,signal.SIGSTOP); stopped.add(coordinator_pid)
     db_path = root/'degraded/results.sqlite'
     def journaled_delete():
         if not db_path.exists(): return False
@@ -137,19 +137,19 @@ try:
     assert record(idle.id)['state']=='Running', 'Redis should still contain the pre-outage record'
     assert not physical(idle.id), 'idle backend was not cleaned locally'
     (out/'journaled-delete.json').write_text(json.dumps(deleted,indent=2))
-    passed('Master outage uses SQLite for idle deletion while Redis remains stale', instance_id=idle.id)
+    passed('Coordinator outage uses SQLite for idle deletion while Redis remains stale', instance_id=idle.id)
 
-    node_pid = pid('node-manager')
+    node_pid = pid('adxlet')
     kept_runtime = record(keep.id)['runtime_id']
     os.kill(node_pid,signal.SIGKILL)
-    wait(lambda:pid('node-manager') != node_pid,30)
+    wait(lambda:pid('adxlet') != node_pid,30)
     time.sleep(4)
     assert len(physical(keep.id))==1
     assert record(keep.id)['runtime_id']==kept_runtime
     assert journaled_delete()
-    passed('Node Manager restart waits for Master without cleaning an owned runtime')
-    os.kill(master_pid,signal.SIGCONT); stopped.remove(master_pid)
-    # The Master clock continues while the process is stopped. Once the node
+    passed('Adxlet restart waits for Coordinator without cleaning an owned runtime')
+    os.kill(coordinator_pid,signal.SIGCONT); stopped.remove(coordinator_pid)
+    # The Coordinator clock continues while the process is stopped. Once the node
     # heartbeat lease expires, the old session and all of its executions are
     # fenced. The replacement process must discard that session's journal and
     # clean its retained runtime during authoritative reconciliation.
@@ -161,7 +161,7 @@ try:
     wait(drained)
     wait(lambda:not physical(keep.id),90)
     assert not idle_failed['resources_held'] and not keep_failed['resources_held']
-    passed('Master recovery fences an expired node session and reconciles stale runtimes')
+    passed('Coordinator recovery fences an expired node session and reconciles stale runtimes')
     keep.kill()
     idle.kill()
 
@@ -173,7 +173,7 @@ try:
     wait(lambda:catalog()['node:node1']['node']['available'],30)
     passed('expired resource observations close admission and recover without killing instances')
     observed.kill()
-    wait(lambda:all(v.get('result',{}).get('state')=='Deleted' for k,v in catalog().items() if k.startswith('capsule:')))
+    wait(lambda:all(v.get('result',{}).get('state')=='Deleted' for k,v in catalog().items() if k.startswith('environment:')))
     result['status']='passed'
 except Exception as error:
     result['error']=f'{type(error).__name__}: {error}'

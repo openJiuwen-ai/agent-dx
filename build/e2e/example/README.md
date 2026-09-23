@@ -14,7 +14,7 @@ for two sequential Firecracker instances.
 Stage a directory outside the installation paths, with:
 
 - `package/`: verified release package for the host architecture;
-- `rrt.tar`: OCI image archive containing the same package's RRT;
+- `execd.tar`: OCI image archive containing the same package's EXECD;
 - `client/`: Python virtualenv containing Sandbox SDK dependencies; the driver
   installs the package wheel offline into it;
 - `tools/`: `docker-registry`, `redis-cli` and `virtiofsd`;
@@ -36,7 +36,7 @@ sudo env ADX_EXAMPLE_BASE=/opt/adx-example \
 
 The run directory must be new. `export/evidence/result.json` requires all six
 cases: CLI validation/rendering, five live roles and automatic resource
-observation, administrator-created tenant key through HTTPS Edge, SDK command
+observation, administrator-created tenant key through HTTPS Ingress, SDK command
 and binary file round-trip, explicit deletion, and supervisor stop deleting a
 remaining instance. Redis terminal state, empty backend inventory, independent
 sandboxd/Redis survival after platform stop and clean fixture shutdown are

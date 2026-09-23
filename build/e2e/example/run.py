@@ -54,7 +54,7 @@ try:
     def openssl(*args):call(['openssl',*args],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
     openssl('req','-x509','-newkey','rsa:2048','-nodes','-keyout',tls/'ca.key','-out',tls/'ca.pem','-days','2','-subj','/CN=ADX example test CA')
     extensions=ROOT/'extensions.cnf';extensions.write_text('basicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth,clientAuth\nsubjectAltName=DNS:adx.internal,DNS:localhost,IP:127.0.0.1\n')
-    for name in ('master','node-1','api-server','edge','edge-public'):
+    for name in ('coordinator','node-1','apiserver','ingress','ingress-public'):
         openssl('req','-newkey','rsa:2048','-nodes','-keyout',tls/(name+'.key'),'-out',ROOT/(name+'.csr'),'-subj','/CN=ADX example '+name)
         openssl('x509','-req','-in',ROOT/(name+'.csr'),'-CA',tls/'ca.pem','-CAkey',tls/'ca.key','-CAcreateserial','-out',tls/(name+'.pem'),'-days','2','-extfile',extensions)
         openssl('x509','-in',tls/(name+'.pem'),'-outform','DER','-out',tls/(name+'.der'))
@@ -68,7 +68,7 @@ try:
     backend.write_text(backend.read_text().replace('10.231.16.0/20','10.88.0.0/16'))
     registry=spawn('registry',['docker-registry','serve',preparation/'registry.yaml'])
     sys.path.insert(0,str(BASE/'e2e'));import publish
-    image='127.0.0.1:5000/adx-rrt@'+publish.publish(str(BASE/'rrt.tar'))
+    image='127.0.0.1:5000/adx-execd@'+publish.publish(str(BASE/'execd.tar'))
     (E/'image.json').write_text(json.dumps({'image':image}))
     redis=spawn('external-redis',['/opt/adx/current/bin/redis-server','--bind','127.0.0.1','--port','6379','--appendonly','yes','--appendfsync','always','--dir',preparation/'redis','--save',''])
     wait(lambda:output(['redis-cli','ping'])=='PONG\n')
@@ -99,7 +99,7 @@ try:
     event(3);event(4)
     assert len(inventory())==1
     call(cli('stop'),timeout=120);supervisor.wait(timeout=30)
-    records={k:v for k,v in catalog().items() if k.startswith('capsule:')}
+    records={k:v for k,v in catalog().items() if k.startswith('environment:')}
     assert len(records)==2 and all(r['result']['state']=='Deleted' and not r['result']['resources_held'] for r in records.values())
     result['backend_count']=len(inventory());assert result['backend_count']==0
     result['external_dependencies_alive_after_stop']=redis.poll() is None and sandboxd.poll() is None

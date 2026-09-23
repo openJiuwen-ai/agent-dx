@@ -15,7 +15,7 @@ import time
 import uuid
 
 ROOT = Path(__file__).resolve().parents[2]
-SUITES = ("harness", "rust", "api-server", "agent", "sandbox-sdk", "interop", "package", "storage", "control-rpc", "api-control")
+SUITES = ("harness", "rust", "apiserver", "agent", "sandbox-sdk", "interop", "package", "storage", "control-rpc", "api-control")
 
 
 def configure_local_cargo_cache():
@@ -40,24 +40,24 @@ def commands_for(suite, output, jobs):
         cargo = os.environ.get("CARGO", "cargo")
         return [[cargo, "--version"], make + ["rust-check", "rust-test"]]
     if suite in ("control-rpc", "api-control"):
-        if suite == "api-control" and (not Path(os.environ.get("ADX_TEST_API_SERVER", "")).is_file() or not os.access(os.environ.get("ADX_TEST_API_SERVER", ""), os.X_OK)):
-            raise ValueError("api-control requires ADX_TEST_API_SERVER executable")
+        if suite == "api-control" and (not Path(os.environ.get("ADX_TEST_APISERVER", "")).is_file() or not os.access(os.environ.get("ADX_TEST_APISERVER", ""), os.X_OK)):
+            raise ValueError("api-control requires ADX_TEST_APISERVER executable")
         cargo = os.environ.get("CARGO", "cargo")
         redis = os.environ.get("ADX_TEST_REDIS_SERVER", "redis-server")
         return [[redis, "--version"],
                 [python, "build/ci/rpc_certificates.py", str(output / "tls")],
                 ["env", f"ADX_TEST_REDIS_SERVER={redis}", f"ADX_TEST_TLS_DIR={output / 'tls'}", f"ADX_TEST_EVIDENCE={output}",
-                 cargo, "test", "--locked", "-p", "adx-master", "--test", "rpc",
+                 cargo, "test", "--locked", "-p", "adx-coordinator", "--test", "rpc",
                  "-j", str(jobs), "--", "--ignored", "--nocapture"]]
     if suite == "storage":
         cargo = os.environ.get("CARGO", "cargo")
         redis = os.environ.get("ADX_TEST_REDIS_SERVER", "redis-server")
         return [[redis, "--version"],
                 ["env", f"ADX_TEST_REDIS_SERVER={redis}", f"ADX_TEST_EVIDENCE={output}",
-                 cargo, "test", "--locked", "-p", "adx-master", "--test", "storage",
+                 cargo, "test", "--locked", "-p", "adx-coordinator", "--test", "storage",
                  "-j", str(jobs), "--", "--ignored", "--nocapture"]]
-    if suite == "api-server":
-        return [[os.environ.get("CARGO", "cargo"), "test", "--locked", "-p", "adx-api-server", "-j", str(jobs)]]
+    if suite == "apiserver":
+        return [[os.environ.get("CARGO", "cargo"), "test", "--locked", "-p", "adx-apiserver", "-j", str(jobs)]]
     if suite == "agent":
         return [make + ["agent-test"]]
     if suite == "sandbox-sdk":
@@ -65,11 +65,11 @@ def commands_for(suite, output, jobs):
     if suite == "interop":
         cargo = os.environ.get("CARGO", "cargo")
         target = Path(os.environ.get("CARGO_TARGET_DIR", ROOT / "target")).resolve()
-        return [[cargo, "build", "--locked", "-p", "rrt-daemon", "--bin", "rrt-runtime", "-j", str(jobs)],
+        return [[cargo, "build", "--locked", "-p", "adx-execd", "--bin", "adx-execd", "-j", str(jobs)],
                 ["env", "ADX_TUNNEL_PROTOCOL_VERSION=2", "ADX_TUNNEL_FAST_PATH_BODY_BYTES=65536",
-                 f"RRT_RUNTIME={target / 'debug/rrt-runtime'}",
+                 f"EXECD_RUNTIME={target / 'debug/adx-execd'}",
                  f"PYTHONPATH={ROOT / 'platform/sdk/sandbox/python'}", python,
-                 "platform/runtime/rrt/tests/tunnel_interop.py"],
+                 "platform/runtime/execd/tests/tunnel_interop.py"],
                 [python, "build/ci/rpc_certificates.py", str(output / "tls")],
                 ["env", f"PYTHONPATH={ROOT / 'platform/sdk/sandbox/python'}", python,
                  "build/ci/command_watch_tls.py", "--tls", str(output / "tls")]]
@@ -174,8 +174,8 @@ def main():
         binary = shutil.which(os.environ.get("ADX_TEST_REDIS_SERVER", "redis-server"))
         metadata["redis_binary_sha256"] = hashlib.sha256(Path(binary).read_bytes()).hexdigest() if binary else None
     if args.suite == "api-control":
-        binary = Path(os.environ["ADX_TEST_API_SERVER"])
-        metadata["api_server_binary_sha256"] = hashlib.sha256(binary.read_bytes()).hexdigest()
+        binary = Path(os.environ["ADX_TEST_APISERVER"])
+        metadata["apiserver_binary_sha256"] = hashlib.sha256(binary.read_bytes()).hexdigest()
     def interrupt(*_):
         raise KeyboardInterrupt
 

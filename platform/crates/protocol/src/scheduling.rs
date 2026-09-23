@@ -305,7 +305,7 @@ impl TryFrom<wire::PlacementGroup> for model::PlacementGroup {
         let group = Self {
             target: match wire::PlacementTarget::try_from(v.target).ok() {
                 Some(wire::PlacementTarget::Node) => model::PlacementTarget::Node,
-                Some(wire::PlacementTarget::Capsule) => model::PlacementTarget::Capsule,
+                Some(wire::PlacementTarget::Environment) => model::PlacementTarget::Environment,
                 _ => return Err(Error::Invalid("invalid placement target".into())),
             },
             terms: decode(v.terms)?,
@@ -322,7 +322,7 @@ impl From<model::PlacementGroup> for wire::PlacementGroup {
         Self {
             target: match v.target {
                 model::PlacementTarget::Node => wire::PlacementTarget::Node as i32,
-                model::PlacementTarget::Capsule => wire::PlacementTarget::Capsule as i32,
+                model::PlacementTarget::Environment => wire::PlacementTarget::Environment as i32,
             },
             terms: encode(v.terms),
             required: v.required,

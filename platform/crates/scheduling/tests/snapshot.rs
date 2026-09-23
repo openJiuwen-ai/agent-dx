@@ -1,10 +1,10 @@
-use adx_core::{scheduling::*, CapsuleSpec, Resources};
-use adx_scheduling::{PlacedCapsule, Snapshot};
-fn placed(id: &str, tenant: &str, labels: &[(&str, &str)]) -> PlacedCapsule {
-    PlacedCapsule {
+use adx_core::{scheduling::*, EnvironmentSpec, Resources};
+use adx_scheduling::{PlacedEnvironment, Snapshot};
+fn placed(id: &str, tenant: &str, labels: &[(&str, &str)]) -> PlacedEnvironment {
+    PlacedEnvironment {
         node_id: "n".into(),
-        spec: CapsuleSpec {
-            environment: None,
+        spec: EnvironmentSpec {
+            runtime_profile: None,
             snapshot_id: None,
             lifecycle: Default::default(),
             env: Default::default(),
@@ -70,7 +70,7 @@ fn indexes_match_full_scan_across_replacement_release_and_negative_selectors() {
                     .map(|p| p.spec.id.clone())
                     .collect();
                 let scan: Vec<_> = snapshot
-                    .capsules()
+                    .environments()
                     .values()
                     .filter(|p| {
                         p.spec.tenant_id == tenant && selector.matches(&p.spec.scheduling.labels)
@@ -81,6 +81,6 @@ fn indexes_match_full_scan_across_replacement_release_and_negative_selectors() {
             }
         }
     }
-    assert_eq!(old.capsules().len(), 200);
-    assert_eq!(s.capsules().len(), 100);
+    assert_eq!(old.environments().len(), 200);
+    assert_eq!(s.environments().len(), 100);
 }

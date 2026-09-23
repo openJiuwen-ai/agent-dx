@@ -39,7 +39,7 @@ class ComponentManifestTests(unittest.TestCase):
             self.assertEqual(set(manifest["files"]), component.REQUIRED_FILES["platform"])
             self.assertEqual(component.verify_manifest(root), manifest)
 
-            (root / "adx-master").write_bytes(b"tampered")
+            (root / "adx-coordinator").write_bytes(b"tampered")
             with self.assertRaises(ValueError):
                 component.verify_manifest(root)
 
@@ -78,7 +78,7 @@ class ComponentManifestTests(unittest.TestCase):
                 backend_archive=backend_archive,
             )
 
-            self.assertEqual(set(manifest["components"]), {"platform", "gateway", "rrt"})
+            self.assertEqual(set(manifest["components"]), {"platform", "gateway", "execd"})
             self.assertEqual(manifest["package"]["archive"]["name"], release.name)
             self.assertEqual(manifest["sdk"]["name"], wheel.name)
             self.assertEqual(manifest["backend"]["manifest"]["name"], backend_manifest.name)
@@ -117,7 +117,7 @@ class ComponentManifestTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             components = root / "components"
-            for index, name in enumerate(("platform", "gateway", "rrt")):
+            for index, name in enumerate(("platform", "gateway", "execd")):
                 directory = self.write_component(components, name)
                 component.create_manifest(
                     component=name,

@@ -26,7 +26,7 @@ class BuildSummaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             write(root, 'release-manifest.json', {'target': 'linux-test', 'profile': 'release',
-                                                 'files': {'bin/adx-master': 'digest'}})
+                                                 'files': {'bin/adx-coordinator': 'digest'}})
             write(root, 'build-manifest.json', {'commit': COMMIT, 'components': {}})
             (root / 'adx-release.tar.gz').write_bytes(b'archive fixture')
             (root / 'sdk').mkdir()

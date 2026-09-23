@@ -1,7 +1,7 @@
-//! One service lifecycle for standalone and embedded Node Proxy deployment.
-use super::{bind_route_control, serve_health, ActivityTracker, NodeProxy};
+//! One service lifecycle for standalone and embedded Relay deployment.
+use super::{bind_route_control, serve_health, ActivityTracker, Relay};
 use crate::common::{listener::accept_with_backoff, protocol::GatewayPolicy};
-use crate::config::{EdgeNodeSecurityMode, NodeProxyConfig};
+use crate::config::{IngressNodeSecurityMode, RelayConfig};
 use std::{future::Future, path::PathBuf, sync::Arc};
 use tokio::{
     net::{TcpListener, UnixListener},
@@ -11,28 +11,28 @@ use tokio::{
 use tokio_rustls::TlsAcceptor;
 type ServiceError = Box<dyn std::error::Error + Send + Sync>;
 
-pub struct NodeProxyService {
-    config: NodeProxyConfig,
+pub struct RelayService {
+    config: RelayConfig,
     listener: TcpListener,
     health: TcpListener,
     route: UnixListener,
-    gateway: Arc<NodeProxy>,
+    gateway: Arc<Relay>,
     tracker: Arc<ActivityTracker>,
     tls: Option<Arc<TlsAcceptor>>,
 }
-impl NodeProxyService {
+impl RelayService {
     /// Bind every listener before the owner advertises readiness. Bindings start
-    /// unavailable and only the Node Manager's complete sync opens admission.
-    pub async fn bind(config: NodeProxyConfig) -> Result<Self, ServiceError> {
+    /// unavailable and only the Adxlet's complete sync opens admission.
+    pub async fn bind(config: RelayConfig) -> Result<Self, ServiceError> {
         adx_transport::install_crypto_provider();
         let dir = config
             .activity_uds_dir
             .as_ref()
             .filter(|p| !p.is_empty())
-            .ok_or("Node Proxy control socket directory required")?;
-        let tls = if config.edge_security_mode == EdgeNodeSecurityMode::Mtls {
+            .ok_or("Relay control socket directory required")?;
+        let tls = if config.ingress_security_mode == IngressNodeSecurityMode::Mtls {
             if config.mtls_client_ca.is_empty() {
-                return Err("Node Proxy mTLS client CA required".into());
+                return Err("Relay mTLS client CA required".into());
             }
             Some(Arc::new(load_tls_acceptor(
                 &config.tls_cert,
@@ -53,7 +53,7 @@ impl NodeProxyService {
         .await?;
         let tracker = Arc::new(ActivityTracker::new(config.gateway_epoch.clone()));
         let gateway = Arc::new(
-            NodeProxy::new(GatewayPolicy::new(config.allowed_target_networks.clone()))
+            Relay::new(GatewayPolicy::new(config.allowed_target_networks.clone()))
                 .with_max_active_streams(config.max_streams)
                 .with_activity_tracker(tracker.clone())
                 .with_route_enforcement(),
@@ -102,7 +102,7 @@ impl NodeProxyService {
             Ok(())
         });
         let path = std::path::Path::new(config.activity_uds_dir.as_ref().unwrap())
-            .join("node-manager.sock")
+            .join("adxlet.sock")
             .to_string_lossy()
             .into_owned();
         let mut activity_stop = stop.subscribe();
@@ -112,17 +112,17 @@ impl NodeProxyService {
         });
         let mut connections = JoinSet::new();
         tokio::pin!(shutdown);
-        tracing::info!(bind=%listener.local_addr()?,health=%config.health_bind,"Node Proxy serving");
+        tracing::info!(bind=%listener.local_addr()?,health=%config.health_bind,"Relay serving");
         let failure = loop {
             tokio::select! {
                 _=&mut shutdown=>break None,
-                ended=services.join_next()=>break Some(format!("Node Proxy background service stopped: {ended:?}")),
+                ended=services.join_next()=>break Some(format!("Relay background service stopped: {ended:?}")),
                 // Reap finished connection tasks while the service is running.
                 _=connections.join_next(),if !connections.is_empty()=>{},
                 (stream,peer)=accept_with_backoff(&listener,"node-h2")=>{
                     if !config.peer_allowed(peer.ip()) {
-                        tracing::warn!(target: "adx_audit", event="edge_acl", decision="deny", %peer,
-                            reason="source_outside_allowed_cidrs", "Node Proxy peer denied");
+                        tracing::warn!(target: "adx_audit", event="ingress_acl", decision="deny", %peer,
+                            reason="source_outside_allowed_cidrs", "Relay peer denied");
                         continue
                     }
                     let gateway=gateway.clone();let tls=tls.clone();
@@ -130,11 +130,11 @@ impl NodeProxyService {
                         let result=match tls {
                             Some(acceptor)=>match acceptor.accept(stream).await {
                                 Ok(stream)=>gateway.serve_h2(stream).await,
-                                Err(error)=>{tracing::debug!(%peer,%error,"Node Proxy TLS handshake rejected");return;}
+                                Err(error)=>{tracing::debug!(%peer,%error,"Relay TLS handshake rejected");return;}
                             },
                             None=>gateway.serve_h2(stream).await,
                         };
-                        if let Err(error)=result{tracing::debug!(%peer,%error,"Node Proxy H2 connection closed");}
+                        if let Err(error)=result{tracing::debug!(%peer,%error,"Relay H2 connection closed");}
                     });
                 }
             }

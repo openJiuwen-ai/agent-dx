@@ -1,5 +1,7 @@
 # 当前管控面调度基线复测（2026-09-16）
 
+> 历史记录：命令、组件和产物名称对应当时版本；当前命名见 [组件命名](../architecture/naming.md)。
+
 > 当次验收/调查记录：版本、数字及未覆盖范围仅适用于文中批次；当前实现与状态见 [实施总览](control-plane-implementation.md) 和 [阶段路线图](control-plane-roadmap.md)。
 
 使用当前工作树重新编译 ADX compare，与已保存的历史 FunctionSystem 基准二进制在同一个 Linux ARM64 容器内顺序交替执行。1 轮预热、7 轮正式测量、6 类场景全部通过，所有放置正确性、报告成功与最终实例排空断言通过。

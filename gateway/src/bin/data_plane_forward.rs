@@ -1,7 +1,7 @@
 use adx_process::resource::raise_nofile_soft_limit_from_env;
-use data_plane_gateway::client::{connect_edge, ConnectClientConfig, EdgeTlsConfig};
+use data_plane_gateway::client::{connect_ingress, ConnectClientConfig, IngressTlsConfig};
 use data_plane_gateway::common::listener::accept_with_backoff;
-use data_plane_gateway::edge::AccessKind;
+use data_plane_gateway::ingress::AccessKind;
 use rustls::pki_types::ServerName;
 use std::fs::File;
 use std::io::{self, BufReader};
@@ -42,7 +42,7 @@ impl ForwardConfig {
     fn from_args(args: impl Iterator<Item = String>) -> Result<Self, io::Error> {
         let mut config =
             Self::from_args_with_token(args, std::env::var("ADX_TOKEN").unwrap_or_default())?;
-        config.connect.tls = tls_from_env(&config.connect.edge_address)?;
+        config.connect.tls = tls_from_env(&config.connect.ingress_address)?;
         Ok(config)
     }
 
@@ -50,9 +50,9 @@ impl ForwardConfig {
         mut args: impl Iterator<Item = String>,
         bearer_token: String,
     ) -> Result<Self, io::Error> {
-        let usage = "usage:\n  adx-data-plane-forward connect <edge-host:port> <instance-id> <target-port> [tunnel|port-forwarding|ssh]\n  adx-data-plane-forward port-forward <edge-host:port> <instance-id> <target-port> [listen-host:port]\noptional env: ADX_TOKEN, ADX_DATA_PLANE_FORWARD_TLS_CA, ADX_DATA_PLANE_FORWARD_TLS_SERVER_NAME";
+        let usage = "usage:\n  adx-data-plane-forward connect <ingress-host:port> <instance-id> <target-port> [tunnel|port-forwarding|ssh]\n  adx-data-plane-forward port-forward <ingress-host:port> <instance-id> <target-port> [listen-host:port]\noptional env: ADX_TOKEN, ADX_DATA_PLANE_FORWARD_TLS_CA, ADX_DATA_PLANE_FORWARD_TLS_SERVER_NAME";
         let command = args.next().ok_or_else(|| invalid(usage))?;
-        let edge_address = args.next().ok_or_else(|| invalid(usage))?;
+        let ingress_address = args.next().ok_or_else(|| invalid(usage))?;
         let instance_id = args.next().ok_or_else(|| invalid(usage))?;
         let target_port = args
             .next()
@@ -81,14 +81,14 @@ impl ForwardConfig {
         };
         if args.next().is_some()
             || instance_id.trim().is_empty()
-            || edge_address.trim().is_empty()
+            || ingress_address.trim().is_empty()
             || access_kind == AccessKind::Direct
         {
             return Err(invalid(usage));
         }
         Ok(Self {
             connect: ConnectClientConfig {
-                edge_address,
+                ingress_address,
                 instance_id,
                 target_port,
                 access_kind,
@@ -105,7 +105,7 @@ async fn serve_local(config: ForwardConfig, address: &str) -> io::Result<()> {
     let listener = TcpListener::bind(address).await?;
     tracing::info!(
         listen = %listener.local_addr()?,
-        edge = %config.connect.edge_address,
+        ingress = %config.connect.ingress_address,
         instance = %config.connect.instance_id,
         port = config.connect.target_port,
         "local Data Plane port-forward ready"
@@ -123,10 +123,10 @@ async fn serve_local(config: ForwardConfig, address: &str) -> io::Result<()> {
 }
 
 async fn forward_local(mut local: TcpStream, config: ConnectClientConfig) -> io::Result<()> {
-    let mut edge = connect_edge(config).await?;
+    let mut ingress = connect_ingress(config).await?;
     tokio::io::copy_bidirectional_with_sizes(
         &mut local,
-        &mut edge,
+        &mut ingress,
         L4_COPY_BUFFER_SIZE,
         L4_COPY_BUFFER_SIZE,
     )
@@ -139,10 +139,10 @@ async fn forward_stdio(config: ForwardConfig) -> io::Result<()> {
         input: tokio::io::stdin(),
         output: tokio::io::stdout(),
     };
-    let mut edge = connect_edge(config.connect).await?;
+    let mut ingress = connect_ingress(config.connect).await?;
     tokio::io::copy_bidirectional_with_sizes(
         &mut stdio,
-        &mut edge,
+        &mut ingress,
         L4_COPY_BUFFER_SIZE,
         L4_COPY_BUFFER_SIZE,
     )
@@ -189,7 +189,7 @@ impl AsyncWrite for StdioStream {
     }
 }
 
-fn tls_from_env(edge_address: &str) -> io::Result<Option<EdgeTlsConfig>> {
+fn tls_from_env(ingress_address: &str) -> io::Result<Option<IngressTlsConfig>> {
     let ca_path = std::env::var("ADX_DATA_PLANE_FORWARD_TLS_CA").unwrap_or_default();
     if ca_path.trim().is_empty() {
         return Ok(None);
@@ -198,22 +198,22 @@ fn tls_from_env(edge_address: &str) -> io::Result<Option<EdgeTlsConfig>> {
     let mut reader = BufReader::new(File::open(ca_path.trim())?);
     let certificates = rustls_pemfile::certs(&mut reader)
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| invalid(&format!("read Edge TLS CA: {error}")))?;
+        .map_err(|error| invalid(&format!("read Ingress TLS CA: {error}")))?;
     if certificates.is_empty() {
-        return Err(invalid("Edge TLS CA contains no certificates"));
+        return Err(invalid("Ingress TLS CA contains no certificates"));
     }
     for certificate in certificates {
         roots
             .add(certificate)
-            .map_err(|error| invalid(&format!("add Edge TLS CA: {error}")))?;
+            .map_err(|error| invalid(&format!("add Ingress TLS CA: {error}")))?;
     }
     let server_name = std::env::var("ADX_DATA_PLANE_FORWARD_TLS_SERVER_NAME")
         .ok()
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| edge_host(edge_address));
+        .unwrap_or_else(|| ingress_host(ingress_address));
     ServerName::try_from(server_name.clone())
-        .map_err(|error| invalid(&format!("invalid Edge TLS server name: {error}")))?;
-    Ok(Some(EdgeTlsConfig {
+        .map_err(|error| invalid(&format!("invalid Ingress TLS server name: {error}")))?;
+    Ok(Some(IngressTlsConfig {
         client: Arc::new(
             rustls::ClientConfig::builder()
                 .with_root_certificates(roots)
@@ -223,7 +223,7 @@ fn tls_from_env(edge_address: &str) -> io::Result<Option<EdgeTlsConfig>> {
     }))
 }
 
-fn edge_host(address: &str) -> String {
+fn ingress_host(address: &str) -> String {
     address
         .parse::<http::uri::Authority>()
         .map(|authority| authority.host().to_owned())

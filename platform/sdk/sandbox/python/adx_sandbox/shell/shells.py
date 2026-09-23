@@ -29,7 +29,7 @@ class Shells:
         shell: str = "/bin/bash",
         timeout: int = 60,
     ) -> Shell:
-        """Create a new persistent shell session (RRT ``bash_init``)."""
+        """Create a new persistent shell session (EXECD ``bash_init``)."""
         self._counter += 1
         session_id = f"sh_{self._counter}"
 

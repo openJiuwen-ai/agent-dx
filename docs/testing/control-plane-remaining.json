@@ -36,7 +36,7 @@
     "title": "Standalone 与正式部署韧性扩展",
     "stage": "7",
     "status": "pending",
-    "detail": "Redis/SQLite 降级、空闲删除、实例自动重启、Master/API/Edge 独立重启及 Redis AOF/PV 恢复尚未形成统一 E2E 门禁。",
+    "detail": "Redis/SQLite 降级、空闲删除、实例自动重启、Coordinator/API/Ingress 独立重启及 Redis AOF/PV 恢复尚未形成统一 E2E 门禁。",
     "gate": "按 ST-06..10 和 FD-06..08 增加真实故障用例，保存客户端、权威状态和物理后端三类证据。"
   },
   {
@@ -84,7 +84,7 @@
     "title": "跨组件 Trace 关联与导出",
     "stage": "8",
     "status": "complete",
-    "detail": "本地与Buildkite #21正式K8s通过；3273个Span、1098组queue→execute父子关系、9条完整创建Trace和两节点RRT远端上下文已验证。实时队列丢弃指标单列。",
+    "detail": "本地与Buildkite #21正式K8s通过；3273个Span、1098组queue→execute父子关系、9条完整创建Trace和两节点EXECD远端上下文已验证。实时队列丢弃指标单列。",
     "gate": "真实创建→执行→删除串联Trace及日志；验证并发上下文隔离、采样、导出故障与敏感字段。"
   },
   {
@@ -92,7 +92,7 @@
     "title": "Trace统一实时队列丢弃指标",
     "stage": "8",
     "status": "deferred",
-    "detail": "按用户决定后置，不作为本期阶段8验收阻塞项。Master/Node Manager已有导出成功及失败Span计数；统一实时队列满丢弃指标尚未实现。",
+    "detail": "按用户决定后置，不作为本期阶段8验收阻塞项。Coordinator/Adxlet已有导出成功及失败Span计数；统一实时队列满丢弃指标尚未实现。",
     "gate": "各组件按明确口径区分导出失败与队列满丢弃，队列压满故障测试和实际指标抓取通过。"
   },
   {
@@ -144,7 +144,7 @@
     "gate": "有实际需求后再规划模板目标数量、节点预算与补充回收。"
   },
   {
-    "id": "rust-api-server",
+    "id": "rust-apiserver",
     "title": "Rust API Server 与调度 Shard 迁移",
     "stage": "10",
     "status": "complete",
@@ -156,7 +156,7 @@
     "title": "本地优先创建：正式K8s验收",
     "stage": "11",
     "status": "complete",
-    "detail": "组件、Redis、RPC/HTTPS及Clippy通过；真实sandboxd/runc/RRT本地双节点8组通过。提交363e44f的Buildkite #30从干净源码构建正式制品，K8s八组、原子claim、命令、删除及清理全部通过。",
+    "detail": "组件、Redis、RPC/HTTPS及Clippy通过；真实sandboxd/runc/EXECD本地双节点8组通过。提交363e44f的Buildkite #30从干净源码构建正式制品，K8s八组、原子claim、命令、删除及清理全部通过。",
     "gate": "从已提交代码构建正式制品，运行K8s基础8组（含local-first），核对唯一归属、命令、删除、claim日志与清理。"
   },
   {
@@ -164,7 +164,7 @@
     "title": "本地运行环境：FC验证",
     "stage": "12",
     "status": "pending",
-    "detail": "静态RRT、EROFS本地/自定义镜像路径、PID1回收及真实runc双节点8组通过；提交363e44f的Buildkite #30已使用OCI完成三种运行环境路径和K8s八组。Firecracker新入口与快照恢复尚未复验。",
+    "detail": "静态EXECD、EROFS本地/自定义镜像路径、PID1回收及真实runc双节点8组通过；提交363e44f的Buildkite #30已使用OCI完成三种运行环境路径和K8s八组。Firecracker新入口与快照恢复尚未复验。",
     "gate": "在本地KVM环境验证新的EROFS/OCI入口、Firecracker创建及快照恢复，单独保留证据；正式K8s FC仍暂缓。"
   }
 ]

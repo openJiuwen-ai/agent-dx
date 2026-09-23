@@ -1,7 +1,7 @@
-use adx_protocol::node_proxy::{self as pb, node_proxy_service_client::NodeProxyServiceClient};
+use adx_protocol::relay::{self as pb, relay_service_client::RelayServiceClient};
 use data_plane_gateway::{
-    config::{EdgeNodeSecurityMode, NodeProxyConfig},
-    node::NodeProxyService,
+    config::{IngressNodeSecurityMode, RelayConfig},
+    node::RelayService,
 };
 use hyper_util::rt::TokioIo;
 use std::time::Duration;
@@ -14,15 +14,15 @@ async fn shared_node_service_requires_sync_and_closes_owned_listeners() {
         .prefix("adx-node-")
         .tempdir_in("/tmp")
         .unwrap();
-    let config = NodeProxyConfig {
+    let config = RelayConfig {
         bind: "127.0.0.1:0".parse().unwrap(),
         advertise_address: String::new(),
         health_bind: "127.0.0.1:0".parse().unwrap(),
         allowed_target_networks: vec!["127.0.0.0/8".parse().unwrap()],
-        allowed_edge_networks: vec!["127.0.0.0/8".parse().unwrap()],
-        allow_any_edge: false,
+        allowed_ingress_networks: vec!["127.0.0.0/8".parse().unwrap()],
+        allow_any_ingress: false,
         max_streams: 32,
-        edge_security_mode: EdgeNodeSecurityMode::Network,
+        ingress_security_mode: IngressNodeSecurityMode::Network,
         tls_cert: String::new(),
         tls_key: String::new(),
         mtls_client_ca: String::new(),
@@ -31,7 +31,7 @@ async fn shared_node_service_requires_sync_and_closes_owned_listeners() {
         gateway_epoch: "test".into(),
         drain_timeout: Duration::from_millis(10),
     };
-    let service = NodeProxyService::bind(config).await.unwrap();
+    let service = RelayService::bind(config).await.unwrap();
     let address = service.local_addr().unwrap();
     let (stop, done) = tokio::sync::oneshot::channel();
     let task = tokio::spawn(service.serve(async {
@@ -50,7 +50,7 @@ async fn shared_node_service_requires_sync_and_closes_owned_listeners() {
         }))
         .await
         .unwrap();
-    let mut client = NodeProxyServiceClient::new(channel);
+    let mut client = RelayServiceClient::new(channel);
     let state = client
         .get_binding_state(pb::GetBindingStateRequest {})
         .await

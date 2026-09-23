@@ -1,5 +1,7 @@
 # 导入适配
 
+> 历史记录：命令、组件和产物名称对应当时版本；当前命名见 [组件命名](../architecture/naming.md)。
+
 > 首次导入阶段的历史记录。后续 Rust 控制面、HTTP RRT、统一部署和 K8s 已实施；当前目录和状态见 [架构](../architecture/repository-layout.md) 与 [实施总览](../testing/control-plane-implementation.md)。以下来源、数量和当时边界保留。
 
 - Agent 包与测试目录移动；版本文件的相对路径/源码包包含规则同步调整。

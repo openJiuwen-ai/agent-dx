@@ -1,18 +1,18 @@
 # 可观测与日志能力规划
 
-2026-09-16新增需求，状态：首批Capsule 资源 Metrics与日志滚动压缩已验收；组件日志采集和Trace已通过本地双节点及Buildkite #21正式K8s验收，见[报告](2026-09-17-observability-k8s.md)。内部以Capsule为统计对象。
+2026-09-16新增需求，状态：首批Environment 资源 Metrics与日志滚动压缩已验收；组件日志采集和Trace已通过本地双节点及Buildkite #21正式K8s验收，见[报告](2026-09-17-observability-k8s.md)。内部以Environment为统计对象。
 
 ## 当前基础
 
-- `platform/node-manager/src/metrics.rs` 已提供 `/metrics`：实例CPU累计用量、内存用量/限额、采样年龄，以及节点准入状态、已预留CPU/内存/磁盘。
+- `platform/adxlet/src/metrics.rs` 已提供 `/metrics`：实例CPU累计用量、内存用量/限额、采样年龄，以及节点准入状态、已预留CPU/内存/磁盘。
 - `platform/deployment/src/supervisor.rs` 通过可配置的输出接管实现文件大小/时间滚动、后台gzip及历史保留，见[日志契约](log-rotation.md)，本地与基础K8s已验收。
-- Edge / Node Proxy 已有 `/metrics` 和日志初始化/过滤；本轮复用这些能力并补真实抓取与结构化采集验收。
+- Ingress / Relay 已有 `/metrics` 和日志初始化/过滤；本轮复用这些能力并补真实抓取与结构化采集验收。
 - 组件采集配置与契约见[日志采集](log-collection.md)。
 - 当前本期 Metrics、组件日志与 Trace 已分别验收；SDK 事务根 Span、用户进程内 Span、任意长时间中断等不在已通过范围。
 
 ## 阶段8A：实例数量与资源分配Metrics（优先）
 
-首批已通过本地与Buildkite #17基础K8s验收，见[验收报告](2026-09-16-metrics-acceptance.md)；指标与配置见[Capsule 资源 Metrics](capsule-resource-metrics.md)。实卡验证仍按阶段5待办推进。
+首批已通过本地与Buildkite #17基础K8s验收，见[验收报告](2026-09-16-metrics-acceptance.md)；指标与配置见[Environment 资源 Metrics](environment-resource-metrics.md)。实卡验证仍按阶段5待办推进。
 
 | 范围 | 规划指标与口径 |
 | --- | --- |
@@ -20,18 +20,18 @@
 | 资源容量 | CPU、内存、磁盘的可分配上限；GPU/NPU按类型和型号统计整卡数量 |
 | 资源分配 | 同时覆盖待启动预留和运行实例占用，以资源账本为准；暂停是否释放资源按实际持有记录统计 |
 | 可用资源 | 根据容量与账本计算，容量下降造成的超额占用单独可见；维护/失联节点标识不可调度，不视为空闲容量 |
-| 状态可信度 | 节点可达性、资源采集年龄、数据是否过期；Master与节点对账差异可诊断 |
+| 状态可信度 | 节点可达性、资源采集年龄、数据是否过期；Coordinator与节点对账差异可诊断 |
 
-职责：Master提供集群/Shard调度目录及资源分配视图；Node Manager提供本机账本、准入状态和实际使用量。两个视图分开命名，聚合时避免重复累加。资源“分配量”与CPU/内存“实际用量”明确区分。
+职责：Coordinator提供集群/Shard调度目录及资源分配视图；adxlet提供本机账本、准入状态和实际使用量。两个视图分开命名，聚合时避免重复累加。资源“分配量”与CPU/内存“实际用量”明确区分。
 
-聚合指标标签为节点、域、状态、资源类型及设备型号。当前 `adx_capsule_*` 使用量指标带 Capsule/runtime ID，尚无独立明细开关；采集端可按需要过滤。名称、单位和标签以 [指标清单](capsule-resource-metrics.md) 为准。
+聚合指标标签为节点、域、状态、资源类型及设备型号。当前 `adx_environment_*` 使用量指标带 Environment/runtime ID，尚无独立明细开关；采集端可按需要过滤。名称、单位和标签以 [指标清单](environment-resource-metrics.md) 为准。
 
 验收：先用状态转换及账本测试验证创建、排队、预留、暂停、恢复、删除、重启与失联不重复计数；再在真实部署中采集指标，与API/资源账本核对。GPU/NPU计数规则可先做组件验证，实际卡分配仍需带卡环境。
 
 ## 阶段8B：日志采集与Trace
 
-- 统一组件日志结构：时间、级别、组件/节点、操作及错误码；按需带Capsule ID、请求ID、Trace ID与Span ID。
-- 明确组件运行日志与实例stdout/stderr的来源、路径及归属；复用sandboxd/RRT既有实例日志通道，不假定Supervisor掌握guest内部日志文件。
+- 统一组件日志结构：时间、级别、组件/节点、操作及错误码；按需带Environment ID、请求ID、Trace ID与Span ID。
+- 明确组件运行日志与实例stdout/stderr的来源、路径及归属；复用sandboxd/EXECD既有实例日志通道，不假定Supervisor掌握guest内部日志文件。
 - 提供进程部署及Pod部署的采集配置与示例。部署环境负责采集和存储，产品提供标准输出/文件、指标端点及Trace导出能力；外部采集后端选型另行确定。
 - Trace覆盖创建调度、节点执行、状态提交及数据面请求；补齐HTTP/gRPC上下文透传、关键阶段埋点、可配置采样和导出。后台恢复等异步操作保留关联。
 - 日志与Trace不写API Key等凭证或默认采集用户代码、文件正文；导出队列有界，采集端失联不阻塞实例生命周期，暴露导出失败计数；统一实时队列丢弃指标按用户决定后置。
@@ -40,17 +40,17 @@
 
 ### 阶段8B的模块落点与首轮测试
 
-`crates/observability` 已接入OpenTelemetry并统一承载组件日志、Metrics、Trace及supervisor进程日志捕获；HTTP/gRPC、Master创建/提交任务、Node Manager每实例队列、Gateway和RRT HTTP均已接线。CapsuleHandle通过命令封装显式携带Span，标准Future上下文只在poll期间附着。组件与真实采集证据见[本地Trace验收](2026-09-16-trace-acceptance.md)。
+`crates/observability` 已接入OpenTelemetry并统一承载组件日志、Metrics、Trace及supervisor进程日志捕获；HTTP/gRPC、Coordinator创建/提交任务、adxlet每实例队列、Gateway和EXECD HTTP均已接线。EnvironmentHandle通过命令封装显式携带Span，标准Future上下文只在poll期间附着。组件与真实采集证据见[本地Trace验收](2026-09-16-trace-acceptance.md)。
 
 Trace配置与当前接线见[跨组件Trace](distributed-traces.md)。下表列出模块职责，真实采集验收单独记录：
 
 | 当前模块 | 职责 |
 | --- | --- |
 | `crates/observability/src/logging.rs` | 统一组件日志初始化、过滤、滚动与压缩；共进程共享一个subscriber和Trace provider。 |
-| Sandbox API的HTTP入口与`controlbackend` | 将请求关联上下文带入Master及Node RPC；缓存命中后的直达路径也携带上下文。 |
-| Master的RPC入口与Shard队列 | 串联准入、排队、放置、分配结果；区分排队耗时与实际执行耗时。 |
-| Node Manager的`rpc.rs`与`controller.rs` | RPC接收上下文后，在每实例串行任务的命令封装中显式携带；执行、状态提交及响应关联到同一操作。 |
-| Gateway到RRT的HTTP路径 | 关联路由选择、本机转发与实例执行，避免仅打通控制请求而遗漏数据面。 |
+| Sandbox API的HTTP入口与`controlbackend` | 将请求关联上下文带入Coordinator及Node RPC；缓存命中后的直达路径也携带上下文。 |
+| Coordinator的RPC入口与Shard队列 | 串联准入、排队、放置、分配结果；区分排队耗时与实际执行耗时。 |
+| adxlet的`rpc.rs`与`controller.rs` | RPC接收上下文后，在每实例串行任务的命令封装中显式携带；执行、状态提交及响应关联到同一操作。 |
+| Gateway到EXECD的HTTP路径 | 关联路由选择、本机转发与实例执行，避免仅打通控制请求而遗漏数据面。 |
 | `crates/observability/src/capture.rs` | Supervisor复用的子进程输出捕获、滚动与压缩，不从文本反推业务Span。 |
 
 首轮RED测试应覆盖RPC进入后经过实例异步队列仍能关联的路径：两个不同请求交错到达不同实例、同一实例串行执行时，不能串用上下文；排队、取消、错误返回后结束对应Span。再接真实创建→执行→删除采集验收，并验证采样关闭、字段脱敏、导出端不可用时的有界队列及失败统计。已有Metrics在该阶段保持可用，逐步补导出健康度。
@@ -69,4 +69,4 @@ Trace配置与当前接线见[跨组件Trace](distributed-traces.md)。下表列
 
 ## 交付与状态维护
 
-交付指标清单、采集与部署说明、统一日志配置、测试与验收报告。进度页独立事项来自 `control-plane-remaining.json`，阶段8按本期范围完成（组件日志和Trace本地与正式K8s已通过，统一实时队列丢弃指标后置），阶段9已完成本地与基础K8s验收；首批Metrics事项已标记完成。导出失败计数已接入Master和Node Manager；各语言统一的实时队列丢弃计数已列为后置事项。
+交付指标清单、采集与部署说明、统一日志配置、测试与验收报告。进度页独立事项来自 `control-plane-remaining.json`，阶段8按本期范围完成（组件日志和Trace本地与正式K8s已通过，统一实时队列丢弃指标后置），阶段9已完成本地与基础K8s验收；首批Metrics事项已标记完成。导出失败计数已接入Coordinator和adxlet；各语言统一的实时队列丢弃计数已列为后置事项。

@@ -2,7 +2,7 @@ use adx_deployment::{
     config::Deployment,
     supervisor::{self, Request},
 };
-use adx_protocol::node_proxy as pb;
+use adx_protocol::relay as pb;
 use serde_json::json;
 use std::{
     os::unix::fs::PermissionsExt,
@@ -56,9 +56,10 @@ async fn restart_budget_lock_and_scoped_stop() {
         .tempdir_in("/tmp")
         .unwrap();
     let root = temp_directory.path();
-    install_test_binary(root, "adx-master", "#!/bin/sh\nexit 1\n");
-    install_test_binary(root, "adx-api-server", "#!/bin/sh\nexec sleep 100\n");
-    let services = json!([{"id":"master","role":"master"},{"id":"api","role":"api-server"}]);
+    install_test_binary(root, "adx-coordinator", "#!/bin/sh\nexit 1\n");
+    install_test_binary(root, "adx-apiserver", "#!/bin/sh\nexec sleep 100\n");
+    let services =
+        json!([{"id":"coordinator","role":"coordinator"},{"id":"api","role":"apiserver"}]);
     let deployment = test_deployment(root, services.clone());
     let state_directory = deployment.state_dir.clone();
     let supervisor_task = tokio::spawn(supervisor::run(deployment));
@@ -69,9 +70,12 @@ async fn restart_budget_lock_and_scoped_stop() {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let status = wait_until_ready(&state_directory).await;
-            let master = service_status(&status, "master");
-            if master.get("failed") == Some(&serde_json::Value::Bool(true)) {
-                assert_eq!(master.get("restarts"), Some(&serde_json::Value::from(2)));
+            let coordinator = service_status(&status, "coordinator");
+            if coordinator.get("failed") == Some(&serde_json::Value::Bool(true)) {
+                assert_eq!(
+                    coordinator.get("restarts"),
+                    Some(&serde_json::Value::from(2))
+                );
                 assert!(service_status(&status, "api")
                     .get("pid")
                     .is_some_and(serde_json::Value::is_number));
@@ -99,23 +103,23 @@ impl pb::node_admin_service_server::NodeAdminService for NodeAdmin {
             return Err(tonic::Status::unavailable("commit failed"));
         }
         Ok(tonic::Response::new(pb::DrainResponse {
-            deleted_capsules: 1,
+            deleted_environments: 1,
         }))
     }
 }
 #[tokio::test]
-async fn failed_capsule_cleanup_keeps_dependencies_running_then_retries() {
+async fn failed_environment_cleanup_keeps_dependencies_running_then_retries() {
     let temp_directory = tempfile::Builder::new()
         .prefix("adx-p-")
         .tempdir_in("/tmp")
         .unwrap();
     let root = temp_directory.path();
-    for binary_name in ["adx-master", "adx-node-manager"] {
+    for binary_name in ["adx-coordinator", "adxlet"] {
         install_test_binary(root, binary_name, "#!/bin/sh\nexec sleep 100\n");
     }
     let deployment = test_deployment(
         root,
-        json!([{"id":"master","role":"master"},{"id":"node","role":"node-manager","config":{"proxy_mode":"standalone"}}]),
+        json!([{"id":"coordinator","role":"coordinator"},{"id":"node","role":"adxlet","config":{"proxy_mode":"standalone"}}]),
     );
     let state_directory = deployment.state_dir.clone();
     std::fs::create_dir_all(&state_directory).unwrap();
@@ -155,9 +159,11 @@ async fn supervisor_drains_rotated_logs_on_stop() {
         .tempdir_in("/tmp")
         .unwrap();
     let root = temp_directory.path();
-    install_test_binary(root,"adx-master","#!/bin/sh\ni=1; while [ $i -le 120 ]; do printf 'entry-%s\\n' \"$i\"; i=$((i+1)); done\nexec sleep 100\n");
-    let mut deployment =
-        test_deployment(root, json!([{"id":"master","role":"master","config":{}}]));
+    install_test_binary(root,"adx-coordinator","#!/bin/sh\ni=1; while [ $i -le 120 ]; do printf 'entry-%s\\n' \"$i\"; i=$((i+1)); done\nexec sleep 100\n");
+    let mut deployment = test_deployment(
+        root,
+        json!([{"id":"coordinator","role":"coordinator","config":{}}]),
+    );
     deployment.logging.enabled = true;
     deployment.logging.max_file_bytes = 64;
     deployment.logging.max_files = 100;
@@ -195,7 +201,7 @@ async fn supervisor_drains_rotated_logs_on_stop() {
             .read_to_end(&mut content)
             .unwrap();
     }
-    content.extend(std::fs::read(state_directory.join("logs/master.log")).unwrap());
+    content.extend(std::fs::read(state_directory.join("logs/coordinator.log")).unwrap());
     let expected = (1..=120)
         .map(|sequence| format!("entry-{sequence}\n"))
         .collect::<String>();

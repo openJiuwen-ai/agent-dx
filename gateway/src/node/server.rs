@@ -23,7 +23,7 @@ const H2_MAX_FRAME_SIZE: u32 = 64 * 1024;
 const ROUTE_SHARD_COUNT: usize = 64;
 
 #[derive(Clone)]
-pub struct NodeProxy {
+pub struct Relay {
     pub policy: GatewayPolicy,
     pub connect_timeout: Duration,
     route_shards: Arc<Vec<RwLock<HashMap<RouteKey, RouteBinding>>>>,
@@ -73,7 +73,7 @@ struct RouteBinding {
     revision_tx: watch::Sender<u64>,
 }
 
-impl NodeProxy {
+impl Relay {
     pub fn new(policy: GatewayPolicy) -> Self {
         Self {
             policy,
@@ -290,7 +290,7 @@ impl NodeProxy {
         connection_closed: watch::Receiver<()>,
     ) {
         let trace = adx_observability::trace::Trace::remote(
-            "node-proxy.connect",
+            "relay.connect",
             request
                 .headers()
                 .get("traceparent")
@@ -350,7 +350,7 @@ impl NodeProxy {
                 target_ip = %target.target_ip,
                 target_port = target.target_port,
                 reason = %error,
-                "Node Proxy target denied"
+                "Relay target denied"
             );
             send_error(&mut respond, status_for_protocol_error(&error));
             return;
@@ -451,7 +451,7 @@ impl NodeProxy {
                 bytes_up,
                 bytes_down,
                 %error,
-                "Node Proxy relay closed with an error"
+                "Relay relay closed with an error"
             );
         }
         self.metrics
@@ -560,7 +560,7 @@ fn status_for_protocol_error(error: &ProtocolError) -> StatusCode {
     }
 }
 
-pub async fn serve_connection<T>(gateway: NodeProxy, io: T) -> Result<(), h2::Error>
+pub async fn serve_connection<T>(gateway: Relay, io: T) -> Result<(), h2::Error>
 where
     T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {

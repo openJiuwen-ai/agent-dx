@@ -1,17 +1,17 @@
 syntax = "proto3";
 package adx.node.v1;
 
-// Node Manager is the only writer. Shared-process deployments implement this
+// Adxlet is the only writer. Shared-process deployments implement this
 // contract directly; separate processes use a protected local gRPC endpoint.
-service NodeProxyService {
+service RelayService {
   rpc GetBindingState(GetBindingStateRequest) returns (BindingState);
   rpc BeginBindings(BindingState) returns (BindingState);
   rpc ReplaceBindings(BindingSnapshot) returns (BindingState);
   rpc UpdateBinding(UpdateBindingRequest) returns (UpdateBindingResponse);
-  rpc GetCapsuleActivity(GetCapsuleActivityRequest) returns (CapsuleActivityState);
+  rpc GetEnvironmentActivity(GetEnvironmentActivityRequest) returns (EnvironmentActivityState);
 }
-message GetCapsuleActivityRequest { string capsule_id = 1; string runtime_id = 2; }
-message CapsuleActivityState { string proxy_session_id = 1; uint64 activity_revision = 2; uint64 active_streams = 3; }
+message GetEnvironmentActivityRequest { string environment_id = 1; string runtime_id = 2; }
+message EnvironmentActivityState { string proxy_session_id = 1; uint64 activity_revision = 2; uint64 active_streams = 3; }
 message RuntimeTarget {
   string runtime_id = 1;
   string ip = 2;
@@ -23,9 +23,9 @@ message BindingSnapshot { string proxy_session_id = 1; uint64 sync_epoch = 2; re
 message UpdateBindingRequest {
   string proxy_session_id = 6;
   uint64 sync_epoch = 7;
-  string capsule_id = 1;
+  string environment_id = 1;
   // Ordered lexicographically by (ownership_generation, binding_revision).
-  // The generation comes from the durable Capsule assignment.
+  // The generation comes from the durable Environment assignment.
   uint64 ownership_generation = 2;
   uint64 binding_revision = 3;
   oneof binding {
@@ -45,16 +45,16 @@ message UpdateBindingResponse {
 service NodeActivityService {
   rpc ReportSnapshot(ActivitySnapshot) returns (ActivityAcknowledgement);
 }
-// A complete snapshot for a registered proxy session. An omitted Capsule has
+// A complete snapshot for a registered proxy session. An omitted Environment has
 // zero active streams. The receiver validates the session and discards earlier
-// sequences. This is observation only; Node Manager owns idle/lifecycle policy.
+// sequences. This is observation only; Adxlet owns idle/lifecycle policy.
 message ActivitySnapshot {
   string proxy_session_id = 1;
   uint64 sequence = 2;
-  repeated CapsuleActivity capsules = 3;
+  repeated EnvironmentActivity environments = 3;
 }
-message CapsuleActivity {
-  string capsule_id = 1;
+message EnvironmentActivity {
+  string environment_id = 1;
   uint64 active_streams = 2;
 }
 message ActivityAcknowledgement { uint64 accepted_sequence = 1; }
@@ -62,4 +62,4 @@ message ActivityAcknowledgement { uint64 accepted_sequence = 1; }
 // Supervisor-only local endpoint, served on a protected UDS, never on Node TCP.
 service NodeAdminService { rpc Drain(DrainRequest) returns (DrainResponse); }
 message DrainRequest {}
-message DrainResponse { uint64 deleted_capsules = 1; }
+message DrainResponse { uint64 deleted_environments = 1; }

@@ -1,4 +1,4 @@
-use super::NodeProxy;
+use super::Relay;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::os::unix::fs::PermissionsExt;
@@ -13,17 +13,17 @@ pub mod proto {
     tonic::include_proto!("adx.node.v1");
 }
 use proto::{
-    node_proxy_service_server::{NodeProxyService, NodeProxyServiceServer},
+    relay_service_server::{RelayService, RelayServiceServer},
     update_binding_request::Binding,
     UpdateBindingRequest, UpdateBindingResponse,
 };
 
-/// One shared handler per local proxy, also usable by an embedded Node Manager.
+/// One shared handler per local proxy, also usable by an embedded Adxlet.
 /// Tombstones survive for this process lifetime; startup must reconcile before
 /// opening data-plane admission. A fresh proxy UUID fences delayed RPCs after
-/// restart; Node Manager supplies the complete catalog before admission opens.
+/// restart; Adxlet supplies the complete catalog before admission opens.
 pub struct BindingService {
-    proxy: Arc<NodeProxy>,
+    proxy: Arc<Relay>,
     session: String,
     state: Mutex<Bindings>,
 }
@@ -36,7 +36,7 @@ struct Bindings {
     snapshot: Option<proto::BindingSnapshot>,
 }
 impl BindingService {
-    pub fn new(proxy: Arc<NodeProxy>) -> Self {
+    pub fn new(proxy: Arc<Relay>) -> Self {
         proxy.set_bindings_ready(false);
         Self {
             proxy,
@@ -101,20 +101,20 @@ impl BindingService {
             if binding.proxy_session_id != self.session
                 || binding.sync_epoch != s.epoch
                 || next
-                    .insert(binding.capsule_id.clone(), binding.clone())
+                    .insert(binding.environment_id.clone(), binding.clone())
                     .is_some()
             {
                 return Err(Status::invalid_argument(
                     "duplicate binding or session mismatch",
                 ));
             }
-            check_version(s.versions.get(&binding.capsule_id), binding)?;
+            check_version(s.versions.get(&binding.environment_id), binding)?;
         }
         // Preserve negative knowledge for identities omitted from this authoritative snapshot.
         for (id, old) in &s.versions {
             next.entry(id.clone())
                 .or_insert_with(|| UpdateBindingRequest {
-                    capsule_id: id.clone(),
+                    environment_id: id.clone(),
                     ownership_generation: old.ownership_generation,
                     binding_revision: u64::MAX,
                     binding: Some(Binding::Retired(proto::Retired {})),
@@ -126,7 +126,7 @@ impl BindingService {
             if let Some(Binding::Active(target)) = &binding.binding {
                 self.proxy
                     .activate_route(
-                        binding.capsule_id.clone(),
+                        binding.environment_id.clone(),
                         target.runtime_id.clone(),
                         target.ip.parse().unwrap(),
                     )
@@ -150,8 +150,8 @@ impl BindingService {
                 "complete binding synchronization required",
             ));
         }
-        check_version(s.versions.get(&request.capsule_id), &request)?;
-        if let Some(previous) = s.versions.get(&request.capsule_id) {
+        check_version(s.versions.get(&request.environment_id), &request)?;
+        if let Some(previous) = s.versions.get(&request.environment_id) {
             if previous.ownership_generation == request.ownership_generation
                 && previous.binding_revision == request.binding_revision
             {
@@ -159,27 +159,28 @@ impl BindingService {
             }
             if let Some(Binding::Active(old)) = &previous.binding {
                 self.proxy
-                    .retire_route(request.capsule_id.clone(), old.runtime_id.clone())
+                    .retire_route(request.environment_id.clone(), old.runtime_id.clone())
                     .await;
             }
         }
         if let Some(Binding::Active(target)) = &request.binding {
             self.proxy
                 .activate_route(
-                    request.capsule_id.clone(),
+                    request.environment_id.clone(),
                     target.runtime_id.clone(),
                     target.ip.parse().unwrap(),
                 )
                 .await;
         }
         let response = ack(&request);
-        s.versions.insert(request.capsule_id.clone(), request);
+        s.versions.insert(request.environment_id.clone(), request);
         Ok(response)
     }
 }
 #[allow(clippy::result_large_err)]
 fn validate(r: &UpdateBindingRequest) -> Result<(), Status> {
-    if r.capsule_id.trim().is_empty() || r.ownership_generation == 0 || r.binding_revision == 0 {
+    if r.environment_id.trim().is_empty() || r.ownership_generation == 0 || r.binding_revision == 0
+    {
         return Err(Status::invalid_argument("versioned binding required"));
     }
     match &r.binding {
@@ -215,16 +216,16 @@ fn ack(request: &UpdateBindingRequest) -> UpdateBindingResponse {
     }
 }
 #[tonic::async_trait]
-impl NodeProxyService for BindingService {
-    async fn get_capsule_activity(
+impl RelayService for BindingService {
+    async fn get_environment_activity(
         &self,
-        request: Request<proto::GetCapsuleActivityRequest>,
-    ) -> Result<Response<proto::CapsuleActivityState>, Status> {
+        request: Request<proto::GetEnvironmentActivityRequest>,
+    ) -> Result<Response<proto::EnvironmentActivityState>, Status> {
         let r = request.into_inner();
         let state = self.state.lock().await;
         let binding = state
             .versions
-            .get(&r.capsule_id)
+            .get(&r.environment_id)
             .and_then(|v| v.binding.as_ref());
         if !state.ready
             || !matches!(binding, Some(Binding::Active(target)) if target.runtime_id == r.runtime_id)
@@ -233,11 +234,11 @@ impl NodeProxyService for BindingService {
                 "activity requires current execution binding",
             ));
         }
-        let (activity_revision, active_streams) = self
-            .proxy
-            .instance_activity(&r.capsule_id)
-            .ok_or_else(|| Status::unavailable("activity tracking disabled"))?;
-        Ok(Response::new(proto::CapsuleActivityState {
+        let (activity_revision, active_streams) =
+            self.proxy
+                .instance_activity(&r.environment_id)
+                .ok_or_else(|| Status::unavailable("activity tracking disabled"))?;
+        Ok(Response::new(proto::EnvironmentActivityState {
             proxy_session_id: self.session.clone(),
             activity_revision,
             active_streams,
@@ -293,21 +294,18 @@ pub async fn bind_route_control(uds_path: &str) -> std::io::Result<UnixListener>
     Ok(listener)
 }
 
-pub async fn serve_route_control(
-    proxy: Arc<NodeProxy>,
-    listener: UnixListener,
-) -> std::io::Result<()> {
+pub async fn serve_route_control(proxy: Arc<Relay>, listener: UnixListener) -> std::io::Result<()> {
     serve_route_control_until(proxy, listener, std::future::pending()).await
 }
 
 pub async fn serve_route_control_until(
-    proxy: Arc<NodeProxy>,
+    proxy: Arc<Relay>,
     listener: UnixListener,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
     tonic::transport::Server::builder()
         .add_service(
-            NodeProxyServiceServer::new(BindingService::new(proxy))
+            RelayServiceServer::new(BindingService::new(proxy))
                 .max_decoding_message_size(64 * 1024 * 1024),
         )
         .serve_with_incoming_shutdown(UnixListenerStream::new(listener), shutdown)

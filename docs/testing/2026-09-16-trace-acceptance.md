@@ -1,5 +1,7 @@
 # Trace 本地验收
 
+> 历史记录：命令、组件和产物名称对应当时版本；当前命名见 [组件命名](../architecture/naming.md)。
+
 > 当次验收/调查记录：版本、数字及未覆盖范围仅适用于文中批次；当前实现与状态见 [实施总览](control-plane-implementation.md) 和 [阶段路线图](control-plane-roadmap.md)。
 
 本轮接入 OpenTelemetry、W3C HTTP/gRPC 上下文、Master 独立任务、Node Manager 每实例队列、Gateway 和 RRT HTTP。配置及语义边界见[跨组件Trace](distributed-traces.md)。

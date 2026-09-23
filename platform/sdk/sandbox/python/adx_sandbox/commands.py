@@ -461,7 +461,7 @@ class Commands:
                 except SandboxHTTPError as error:
                     if error.status_code != 400 or error.payload.get("error_code") != "COMMAND_NOT_RUNNING":
                         raise
-                    # RRT may reach its execution deadline before the local
+                    # EXECD may reach its execution deadline before the local
                     # wait expires. Return that authoritative terminal result.
                     return handle.wait(0)
                 return CommandResult(
@@ -484,7 +484,7 @@ class Commands:
                     time.sleep(retry_delay)
 
     def get(self, command_id: str) -> CommandHandle:
-        """Read an existing RRT command record and return its handle."""
+        """Read an existing EXECD command record and return its handle."""
         increment("command_get_total")
         stable_id = _validate_command_id(command_id)
         self._require_recovery_capability(stable_id)

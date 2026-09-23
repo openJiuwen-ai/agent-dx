@@ -6,9 +6,9 @@ info:
     name: Apache-2.0
     identifier: Apache-2.0
   description: |
-    Typed runtime operations exposed by Edge at `/direct/{instanceId}`. Edge
-    resolves the Capsule route, Node Proxy verifies the current Runtime binding,
-    and RRT executes the operation inside that Runtime. These calls bypass lifecycle and
+    Typed runtime operations exposed by Ingress at `/direct/{instanceId}`. Ingress
+    resolves the Environment route, Relay verifies the current Runtime binding,
+    and EXECD executes the operation inside that Runtime. These calls bypass lifecycle and
     scheduling queues.
 
     Generic application port forwarding and reverse tunnels transport arbitrary
@@ -23,7 +23,7 @@ security:
   - xAuth: []
 tags:
   - name: Runtime
-    description: Typed operations executed by RRT inside a Sandbox Runtime.
+    description: Typed operations executed by EXECD inside a Sandbox Runtime.
   - name: Files
     description: Streaming and resumable file transfer.
   - name: Commands
@@ -33,12 +33,12 @@ paths:
     get:
       tags: [Runtime]
       operationId: runtimeHealth
-      summary: Check whether the target RRT listener is reachable
+      summary: Check whether the target EXECD listener is reachable
       parameters:
         - $ref: "#/components/parameters/InstanceId"
       responses:
         "200":
-          description: RRT is ready.
+          description: EXECD is ready.
           content:
             application/json:
               schema:
@@ -57,7 +57,7 @@ paths:
       operationId: invokeRuntimeAction
       summary: Invoke a process, shell or file action inside the Sandbox Runtime
       description: |
-        `action` selects an RRT operation. Mutating calls should carry one
+        `action` selects an EXECD operation. Mutating calls should carry one
         `X-ADX-Request-ID`; retry an unknown result with the same ID.
       parameters:
         - $ref: "#/components/parameters/InstanceId"
@@ -268,7 +268,7 @@ components:
     bearerAuth:
       type: http
       scheme: bearer
-      description: Tenant or administrator API Key validated at Edge.
+      description: Tenant or administrator API Key validated at Ingress.
     xAuth:
       type: apiKey
       in: header
@@ -319,7 +319,7 @@ components:
       schema: {type: integer, format: int64, minimum: 0}
   responses:
     RuntimeError:
-      description: Gateway routing, authorization or RRT operation error.
+      description: Gateway routing, authorization or EXECD operation error.
       content:
         application/json:
           schema: {$ref: "#/components/schemas/RuntimeError"}

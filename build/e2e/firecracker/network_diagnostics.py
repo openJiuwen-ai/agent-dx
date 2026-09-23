@@ -19,7 +19,7 @@ try:
     catalog=json.loads(subprocess.check_output([str(base/'tools/redis-cli'),'--json','HGETALL','adx:{acceptance}:control:v1'],env=env,text=True,timeout=3))
     probes=[]
     for key,value in catalog.items():
-        if not key.startswith('capsule:'):continue
+        if not key.startswith('environment:'):continue
         record=json.loads(value);state=record.get('result',{});ip=state.get('runtime_ip')
         if state.get('state')!='Running' or not ip:continue
         probe={'instance':key,'runtime_id':state.get('runtime_id'),'ip':ip,'tcp':[]}

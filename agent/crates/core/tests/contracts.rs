@@ -44,7 +44,7 @@ fn keys_include_every_scope_component_without_delimiter_collisions() {
 fn isolation_and_reserved_environment_are_not_silently_changed() {
     let mut t: TemplateVersion = serde_json::from_value(template()).unwrap();
     for key in [
-        "ADX_CAPSULE_ID",
+        "ADX_ENVIRONMENT_ID",
         "ADX_RUNTIME_ID",
         "ADX_OWNERSHIP_GENERATION",
     ] {

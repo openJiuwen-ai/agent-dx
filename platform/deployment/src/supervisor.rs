@@ -2,7 +2,7 @@ use crate::{
     config::{Deployment, Process},
     Result,
 };
-use adx_protocol::node_proxy as pb;
+use adx_protocol::relay as pb;
 use hyper_util::rt::TokioIo;
 use serde_json::{json, Value};
 use std::{
@@ -203,7 +203,7 @@ async fn drain(path: PathBuf, timeout: Duration) -> Result<()> {
     Ok(())
 }
 async fn stop(children: &mut [ManagedService], timeout: Duration) -> Result<()> {
-    // All node cleanup must succeed while Master, Redis and local proxies remain alive.
+    // All node cleanup must succeed while Coordinator, Redis and local proxies remain alive.
     for service in children.iter_mut() {
         if let Some(path) = &service.config.admin_socket {
             if service
@@ -215,7 +215,7 @@ async fn stop(children: &mut [ManagedService], timeout: Duration) -> Result<()> 
                 .is_some()
                 || service.child.is_none()
             {
-                return Err("Node Manager unavailable for cleanup".into());
+                return Err("Adxlet unavailable for cleanup".into());
             }
             drain(path.clone(), timeout).await?;
         }

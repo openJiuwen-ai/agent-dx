@@ -1,5 +1,7 @@
 # 组件日志滚动与压缩验收
 
+> 历史记录：命令、组件和产物名称对应当时版本；当前命名见 [组件命名](../architecture/naming.md)。
+
 > 当次验收/调查记录：版本、数字及未覆盖范围仅适用于文中批次；当前实现与状态见 [实施总览](control-plane-implementation.md) 和 [阶段路线图](control-plane-roadmap.md)。
 
 功能提交 `3985f4b791f4e241e01e061f3174e1c895b2c12e`，分支 `ci/control-plane-k8s-20260916`。配置、保留范围及失败行为见[日志契约](log-rotation.md)。

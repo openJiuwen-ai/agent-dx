@@ -106,11 +106,11 @@ def run():
 
 def metrics(node):
     endpoints={'proxy':'http://127.0.0.1:19443/metrics'}
-    if node=='node1':endpoints['edge']='http://127.0.0.1:18080/metrics'
+    if node=='node1':endpoints['ingress']='http://127.0.0.1:18080/metrics'
     result={}
     for name,url in endpoints.items():
         with urllib.request.urlopen(url,timeout=5) as response:text=response.read().decode()
-        prefix='data_plane_node_proxy_' if name=='proxy' else 'data_plane_edge_frontend_'
+        prefix='data_plane_relay_' if name=='proxy' else 'data_plane_ingress_'
         assert prefix+'ready 1' in text
         metric=prefix+('connect_total' if name=='proxy' else 'http_requests_total')
         assert float(next(line.split()[-1] for line in text.splitlines() if line.startswith(metric+' ')))>0
@@ -150,35 +150,35 @@ def trace_records():
 
 def check_trace_links(rows):
     index={(s['traceId'],s['spanId']):s for s in rows}
-    executions=[s for s in rows if s['name']=='capsule.execute']
-    assert executions,'capsule execution spans missing'
+    executions=[s for s in rows if s['name']=='environment.execute']
+    assert executions,'environment execution spans missing'
     for span in executions:
         parent=index.get((span['traceId'],span.get('parentSpanId')))
-        assert parent and parent['name']=='capsule.queue','queue parent missing or belongs to another trace'
+        assert parent and parent['name']=='environment.queue','queue parent missing or belongs to another trace'
     return len(executions)
 
 def required_log_services(node):
     services={node}
-    if node=='node1':services|={'master','api','redis'}
+    if node=='node1':services|={'coordinator','api','redis'}
     return services
 
 def validate_traces(node):
     rows=trace_records()
     count=check_trace_links(rows)
     services={s['service'] for s in rows}
-    assert 'adx-node-manager' in services,services
-    assert any(s['name']=='rrt.http' and s.get('parentSpanId','').strip('0') for s in rows),'RRT did not receive data request context'
+    assert 'adxlet' in services,services
+    assert any(s['name']=='execd.http' and s.get('parentSpanId','').strip('0') for s in rows),'EXECD did not receive data request context'
     trace_ids=[]
     if node=='node1':
-        names={'edge.http','api_server.http','master.create_capsule','node.create_capsule','capsule.queue','capsule.execute','master.commit_capsule'}
+        names={'ingress.http','apiserver.http','coordinator.create_environment','node.create_environment','environment.queue','environment.execute','coordinator.commit_environment'}
         groups={}
         for span in rows:groups.setdefault(span['traceId'],set()).add(span['name'])
         trace_ids=[key for key,value in groups.items() if names <= value]
-        assert trace_ids,'no complete Edge/API/Master/Node/state-commit creation trace'
-        assert any(s['name']=='node.delete_capsule' for s in rows),'delete trace missing'
-    result={'status':'passed','span_count':len(rows),'services':sorted(services),'capsule_executions':count,'complete_create_trace_ids':trace_ids,'rrt_context_received':True}
+        assert trace_ids,'no complete Ingress/API/Coordinator/Node/state-commit creation trace'
+        assert any(s['name']=='node.delete_environment' for s in rows),'delete trace missing'
+    result={'status':'passed','span_count':len(rows),'services':sorted(services),'environment_executions':count,'complete_create_trace_ids':trace_ids,'execd_context_received':True}
     (E/f'traces-{node}.json').write_text(json.dumps(result,indent=2))
-    print(f'[TRACE PASS] {node}: {len(rows)} spans; {count} queue/execution parent links; RRT context received',flush=True)
+    print(f'[TRACE PASS] {node}: {len(rows)} spans; {count} queue/execution parent links; EXECD context received',flush=True)
 
 
 def validate(node):
@@ -209,7 +209,7 @@ def validate(node):
     assert required <= services, (required,services)
     structured={a.get('service.name') for a,b in rows if isinstance(b,dict) and ('level' in b or 'fields' in b)}
     assert required-{'redis'} <= structured, (required,structured)
-    states={b.get('fields',{}).get('state') for _,b in rows if isinstance(b,dict) and b.get('fields',{}).get('event')=='capsule_operation_completed'}
+    states={b.get('fields',{}).get('state') for _,b in rows if isinstance(b,dict) and b.get('fields',{}).get('event')=='environment_operation_completed'}
     assert 'Running' in states and 'Deleted' in states, states
     assert not (D/'collector-secret-leak').exists(),'credential leaked into log pipeline'
     assert json.loads((D/'business-outage.json').read_text())['sdk_lifecycle_passed']

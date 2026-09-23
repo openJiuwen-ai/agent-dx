@@ -1,4 +1,4 @@
-"""Sandbox API for adx, backed by frontend sandbox v1 and RRT.
+"""Sandbox API for adx, backed by frontend sandbox v1 and EXECD.
 
 Sandbox lifecycle is server-side and reached through the frontend HTTP control
 plane. Commands, filesystem operations, shell sessions, direct file transfer,
@@ -624,7 +624,7 @@ class Sandbox:
             body["lifecycle"] = "detached"
         if upstream is not None:
             # Frontend derives the WebSocket port as proxyPort - 1, owns both
-            # forwarded ports and RRT_TUNNEL_* env injection, then returns a
+            # forwarded ports and EXECD_TUNNEL_* env injection, then returns a
             # stable /tunnel/{safeID} URL path.
             body["tunnel"] = {"enabled": True, "proxyPort": proxy_port}
 
@@ -637,7 +637,7 @@ class Sandbox:
         self._entrypoint_exit_info: Optional[Dict[str, Any]] = None
 
         # ── ports: user port_forwardings only ─────────────────────────────
-        # Frontend owns RRT_HTTP_PORT=50090 and its sandbox network mapping for
+        # Frontend owns EXECD_HTTP_PORT=50090 and its sandbox network mapping for
         # /direct. SDK callers should not expose that internal control port.
         if connection is None:
             self._client = SandboxClient(connection=connection) if connection is not None else SandboxClient()
@@ -857,7 +857,7 @@ class Sandbox:
         return f"{scheme}://{gateway}/{safe_id}/{port}"
 
     def get_port_auth_headers(self) -> Dict[str, str]:
-        """Return gateway authentication headers compatible with Frontend and Edge.
+        """Return gateway authentication headers compatible with Frontend and Ingress.
 
         Deployments with anonymous port-forwarding can omit this header. When
         the gateway policy requires authentication, or when callers want tenant

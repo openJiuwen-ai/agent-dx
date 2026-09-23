@@ -25,7 +25,7 @@ class ReleaseArchiveTests(unittest.TestCase):
     def test_artifact_roundtrip_preserves_manifest_nested_files_and_modes(self):
         with tempfile.TemporaryDirectory() as temp:
             root=Path(temp);bins=root/'bins';bins.mkdir()
-            for name in (*package.BINARIES,'rrt-runtime','adx-runtime-rootfs.img'):
+            for name in (*package.BINARIES,'adx-execd','adx-runtime-rootfs.img'):
                 path=bins/name;path.write_bytes(b'fixture binary');path.chmod(0o755)
             redis=root/'redis-server';redis.write_text('#!/bin/sh\necho "Redis server v=7.2.5 fixture"\n');redis.chmod(0o755)
             wheel=root/'adx_sandbox-0.1.0-py3-none-any.whl';wheel.write_bytes(b'fixture wheel')
@@ -40,7 +40,7 @@ class ReleaseArchiveTests(unittest.TestCase):
             self.assertTrue((restored/'manifest.json').is_file())
             self.assertTrue((restored/'LICENSE').is_file())
             self.assertTrue((restored/'install.sh').stat().st_mode & 0o111)
-            self.assertTrue((restored/'bin/adx-master').stat().st_mode & 0o111)
+            self.assertTrue((restored/'bin/adx-coordinator').stat().st_mode & 0o111)
             self.assertTrue((restored/'etc/examples/deployment.yaml').is_file())
             self.assertTrue((restored/'third_party/sandboxd/source.json').is_file())
             self.assertFalse((restored/'third_party/sandboxd/patches').exists())

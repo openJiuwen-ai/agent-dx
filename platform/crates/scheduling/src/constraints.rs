@@ -1,9 +1,9 @@
 //! Hard and soft placement rules over one coherent cluster snapshot.
 use crate::query::{PeerMatches, Prepared};
 use crate::{Candidate, Filter, Score, MAX_SCORE};
-use adx_core::{scheduling::*, CapsuleSpec, Result};
+use adx_core::{scheduling::*, EnvironmentSpec, Result};
 use std::borrow::Cow;
-fn prepared<'a>(r: &CapsuleSpec, c: &'a Candidate<'_>) -> Cow<'a, Prepared> {
+fn prepared<'a>(r: &EnvironmentSpec, c: &'a Candidate<'_>) -> Cow<'a, Prepared> {
     match c.prepared {
         Some(p) => Cow::Borrowed(p),
         None => Cow::Owned(Prepared::new(r, c.snapshot)),
@@ -21,7 +21,7 @@ impl Filter for DeviceFit {
     fn name(&self) -> &'static str {
         "device-fit"
     }
-    fn filter(&self, r: &CapsuleSpec, c: &Candidate<'_>) -> Result<bool> {
+    fn filter(&self, r: &EnvironmentSpec, c: &Candidate<'_>) -> Result<bool> {
         match select_devices(&r.scheduling.devices, c.devices) {
             Ok(_) => Ok(true),
             Err(adx_core::Error::NoCapacity) => Ok(false),
@@ -34,16 +34,16 @@ impl Filter for NodeAffinity {
     fn name(&self) -> &'static str {
         "node-affinity"
     }
-    fn filter(&self, r: &CapsuleSpec, c: &Candidate<'_>) -> Result<bool> {
+    fn filter(&self, r: &EnvironmentSpec, c: &Candidate<'_>) -> Result<bool> {
         Ok(r.scheduling.matches_node(&c.node.labels))
     }
 }
-pub struct CapsuleAffinity;
-impl Filter for CapsuleAffinity {
+pub struct EnvironmentAffinity;
+impl Filter for EnvironmentAffinity {
     fn name(&self) -> &'static str {
-        "capsule-affinity"
+        "environment-affinity"
     }
-    fn filter(&self, r: &CapsuleSpec, c: &Candidate<'_>) -> Result<bool> {
+    fn filter(&self, r: &EnvironmentSpec, c: &Candidate<'_>) -> Result<bool> {
         let q = prepared(r, c);
         for (term, peers) in r.scheduling.required_affinity.iter().zip(&q.required) {
             if !c.node.labels.contains_key(&term.topology_key) {
@@ -79,7 +79,7 @@ impl Filter for Topology {
     fn name(&self) -> &'static str {
         "topology-spread"
     }
-    fn filter(&self, r: &CapsuleSpec, c: &Candidate<'_>) -> Result<bool> {
+    fn filter(&self, r: &EnvironmentSpec, c: &Candidate<'_>) -> Result<bool> {
         let q = prepared(r, c);
         for (t, counts) in r
             .scheduling
@@ -126,7 +126,7 @@ impl Score for NodePreference {
     fn name(&self) -> &'static str {
         "node-preference"
     }
-    fn score(&self, r: &CapsuleSpec, c: &Candidate<'_>) -> Result<u32> {
+    fn score(&self, r: &EnvironmentSpec, c: &Candidate<'_>) -> Result<u32> {
         Ok(normalized(
             r.scheduling
                 .preferred_node
@@ -135,12 +135,12 @@ impl Score for NodePreference {
         ))
     }
 }
-pub struct CapsulePreference;
-impl Score for CapsulePreference {
+pub struct EnvironmentPreference;
+impl Score for EnvironmentPreference {
     fn name(&self) -> &'static str {
-        "capsule-preference"
+        "environment-preference"
     }
-    fn score(&self, r: &CapsuleSpec, c: &Candidate<'_>) -> Result<u32> {
+    fn score(&self, r: &EnvironmentSpec, c: &Candidate<'_>) -> Result<u32> {
         let q = prepared(r, c);
         Ok(normalized(
             r.scheduling
@@ -169,7 +169,7 @@ impl Score for TopologyPreference {
     fn name(&self) -> &'static str {
         "topology-preference"
     }
-    fn score(&self, r: &CapsuleSpec, c: &Candidate<'_>) -> Result<u32> {
+    fn score(&self, r: &EnvironmentSpec, c: &Candidate<'_>) -> Result<u32> {
         let q = prepared(r, c);
         let mut total = 0u128;
         let mut terms = 0u128;

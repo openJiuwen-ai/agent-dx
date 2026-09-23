@@ -51,14 +51,14 @@ docker run --rm --platform "$platform" \
         cargo --config '\''source.crates-io.replace-with="rsproxy-sparse"'\'' \
             --config '\''source.rsproxy-sparse.registry="sparse+https://rsproxy.cn/index/"'\'' \
             build --locked -p data-plane-gateway --release --all-features --bins --target '"$target"'
-        for binary in adx-node-proxy adx-edge-frontend adx-data-plane-forward; do
+        for binary in adx-relay adx-ingress adx-data-plane-forward; do
             strip "/target/'"$target"'/release/${binary}"
             install -m 0755 "/target/'"$target"'/release/${binary}" "/out/${binary}"
         done
-        gateway/scripts/verify-static-linux.sh /out/adx-node-proxy /out/adx-edge-frontend /out/adx-data-plane-forward
+        gateway/scripts/verify-static-linux.sh /out/adx-relay /out/adx-ingress /out/adx-data-plane-forward
     '
 
 "${script_dir}/verify-static-linux.sh" \
-    "${output_dir}/adx-node-proxy" \
-    "${output_dir}/adx-edge-frontend" \
+    "${output_dir}/adx-relay" \
+    "${output_dir}/adx-ingress" \
     "${output_dir}/adx-data-plane-forward"

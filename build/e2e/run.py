@@ -45,7 +45,7 @@ def verify_bundle(directory):
     m=json.loads((directory/'bundle.json').read_text())
     if m.get('schema_version') != 1 or sha(directory/'images.tar') != m.get('archive_sha256'):
         raise ValueError('bundle integrity check failed')
-    if sha(directory/'rrt.tar') != m.get('rrt_archive_sha256'):raise ValueError('RRT archive integrity check failed')
+    if sha(directory/'execd.tar') != m.get('execd_archive_sha256'):raise ValueError('EXECD archive integrity check failed')
     if sha(directory/'entrypoint.tar') != m.get('entrypoint_archive_sha256'):
         raise ValueError('entrypoint image archive integrity check failed')
     return m
@@ -88,8 +88,21 @@ def sdk_subcases_from_output(output):
         return normalized
     return []
 
+def cleanup_cgroup(root):
+    """Remove only empty cgroups after all test-owned container processes exit."""
+    if not root.exists():
+        return
+    for directory in sorted((p for p in root.rglob('*') if p.is_dir()),
+                            key=lambda p: len(p.parts), reverse=True):
+        directory.rmdir()
+    root.rmdir()
+
+
 class Run:
-    def __init__(self,output):
+    def __init__(self,output,cgroupns='private'):
+        if cgroupns not in ('private', 'host'):
+            raise ValueError('cgroupns must be private or host')
+        self.cgroupns=cgroupns
         self.output=output;self.id='adx-e2e-'+uuid.uuid4().hex[:12]
         self.nodes=[];self.network=False;self.commands=0
         self.redactions=set();self.case_results=[]
@@ -199,6 +212,8 @@ class Run:
                 self.docker('rm','-f',self.id+'-'+node,timeout=45)
                 remaining=self.docker('ps','-a','--filter','name=^/'+self.id+'-'+node+'$','--format','{{.ID}}')
                 if remaining.strip():raise RuntimeError('container remains')
+                if self.cgroupns == 'host':
+                    cleanup_cgroup(Path('/sys/fs/cgroup') / (self.id+'-'+node))
             except Exception as e:errors.append(f'{node}: {e}')
         if self.network:
             try:
@@ -217,8 +232,8 @@ class Run:
         self.docker('network','create','--label','adx.e2e.run='+self.id,self.id);self.network=True
         for node in ('node1','node2'):
             name=self.id+'-'+node;self.nodes.append(node)
-            args=['run','-d','--name',name,'--label','adx.e2e.run='+self.id,'--network',self.id,'--network-alias','master' if node=='node1' else 'node2','--privileged','--cgroupns=private','--cpus=3','--memory=4g','--tmpfs','/tmp/adx-e2e/sandboxd/image_manager:size=1g','-v',f'{secrets}:/secrets','-v',f'{self.output}:/evidence']
-            args+=['-v',f'{bundle / "rrt.tar"}:/rrt.tar:ro']
+            args=['run','-d','--name',name,'--label','adx.e2e.run='+self.id,'--network',self.id,'--network-alias','coordinator' if node=='node1' else 'node2','--privileged','--cgroupns='+self.cgroupns,'-e','ADX_E2E_CGROUP_ROOT='+name,'--cpus=3','--memory=4g','--tmpfs','/tmp/adx-e2e/sandboxd/image_manager:size=1g','-v',f'{secrets}:/secrets','-v',f'{self.output}:/evidence']
+            args+=['-v',f'{bundle / "execd.tar"}:/execd.tar:ro']
             self.docker(*args,m['image_ids']['node'])
             self.helper(node,'setup',node)
             self.execute(node,'sh','-c','python3 /opt/adx/e2e/node.py services '+node+' > /evidence/services-'+node+'.log 2>&1 &')
@@ -286,7 +301,7 @@ class Run:
                 for node in self.nodes:self.helper(node,'empty',node)
         if 'restart' in selected:
             with self.case('restart', checks):
-                self.event('Create live instances and record backend IDs before restarting Node Managers')
+                self.event('Create live instances and record backend IDs before restarting Adxlets')
                 self.execute('node1','/opt/adx/client/bin/python','-u','/opt/adx/e2e/scenarios.py','create',timeout=300)
                 self.helper('node1','sessions')
                 for node in self.nodes:self.helper(node,'restart',node)
@@ -331,9 +346,9 @@ def write_junit(path, report, suite_name='platform-e2e'):
     ET.ElementTree(suite).write(path,encoding='utf-8',xml_declaration=True)
 
 def main():
-    p=argparse.ArgumentParser();p.add_argument('--bundle',type=Path,required=True);p.add_argument('--output',type=Path,required=True);p.add_argument('--profile',choices=('l0','standalone'),default='standalone');a=p.parse_args()
+    p=argparse.ArgumentParser();p.add_argument('--bundle',type=Path,required=True);p.add_argument('--output',type=Path,required=True);p.add_argument('--profile',choices=('l0','standalone'),default='standalone');p.add_argument('--cgroupns',choices=('private','host'),default='private');a=p.parse_args()
     out=a.output.resolve();out.mkdir(parents=True,exist_ok=False)
-    run=Run(out);error=None;checks=[];m=None;required=required_for_profile(a.profile)
+    run=Run(out,cgroupns=a.cgroupns);error=None;checks=[];m=None;required=required_for_profile(a.profile)
     def cancel(signum,frame):raise InterruptedError(f'canceled by signal {signum}')
     for s in (signal.SIGTERM,signal.SIGINT):signal.signal(s,cancel)
     with tempfile.TemporaryDirectory(prefix='adx-e2e-secrets-') as private:
@@ -349,7 +364,7 @@ def main():
             signal.signal(signal.SIGTERM,signal.SIG_IGN)
             signal.signal(signal.SIGINT,signal.SIG_IGN)
             errors=run.cleanup()
-    report=finish_report(error,errors,checks,required);report.update(run_id=run.id,deployment='local-docker',profile=a.profile,cases=run.case_results)
+    report=finish_report(error,errors,checks,required);report.update(run_id=run.id,deployment='local-docker',profile=a.profile,cgroupns=a.cgroupns,cases=run.case_results)
     (out/'result.json').write_text(json.dumps(report,indent=2)+'\n')
     write_junit(out/'junit.xml',report)
     print(json.dumps(report));return 0 if report['status']=='passed' else 1

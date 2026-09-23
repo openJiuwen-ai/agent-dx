@@ -1,5 +1,7 @@
 # 本地优先创建：真实双节点端到端验收
 
+> 历史记录：命令、组件和产物名称对应当时版本；当前命名见 [组件命名](../architecture/naming.md)。
+
 2026-09-17，`fix/atomic-instance-claim` 未提交工作树，基础提交 `6b2d30bea266629a79a0ce6ced46648b7146494e`。
 
 本机 Docker Desktop 原生 Linux ARM64 环境，两个隔离节点运行当前源码重新构建的 release 制品；安装发布包内的 Sandbox SDK，经 Edge → Rust API Server → Node Manager/Master 创建真实 sandboxd/runc 实例，命令经过 Edge → Node Proxy → 实例内 RRT。

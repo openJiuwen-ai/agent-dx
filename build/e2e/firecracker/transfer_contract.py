@@ -4,7 +4,7 @@ CASES = (
     'node failure restores same instance on another node',
     'restored memory PID and files preserved',
     'returning source cleans old execution',
-    'master restart preserves recovered execution',
+    'coordinator restart preserves recovered execution',
     'explicit delete releases both nodes',
 )
 
@@ -30,7 +30,7 @@ def verify(result):
         fault = result.get('mid_recovery_restart', {})
         if (fault.get('plan_preserved') is not True
                 or fault.get('epoch_after', 0) <= fault.get('epoch_before', 0)):
-            raise ValueError('missing in-flight Master restart evidence')
+            raise ValueError('missing in-flight Coordinator restart evidence')
     cases = result.get('cases', [])
     if (result.get('status') != 'passed' or result.get('cleanup_errors') != []
             or result.get('inventories') != {'node1':0,'node2':0}

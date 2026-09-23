@@ -13,7 +13,7 @@ def resources(namespace, image, architecture, registry_auth=False, node_names=()
     if any(not re.fullmatch(r"[a-z0-9][a-z0-9.-]{0,251}[a-z0-9]|[a-z0-9]", name) for name in node_names):
         raise ValueError("invalid target node name")
     objects = []
-    for node, service in [('node1', 'master'), ('node2', 'node2')]:
+    for node, service in [('node1', 'coordinator'), ('node2', 'node2')]:
         labels = {LABEL: namespace, 'adx.e2e.node': node}
         volumes = [
             {'name': 'state', 'emptyDir': {}},
@@ -29,7 +29,7 @@ def resources(namespace, image, architecture, registry_auth=False, node_names=()
         ]
         # Secret keys cannot contain slashes; project certificate files into tls/.
         certificates = ['ca.pem']
-        for name in ('master', 'node', 'node2', 'api-server', 'edge'):
+        for name in ('coordinator', 'node', 'node2', 'apiserver', 'ingress'):
             certificates += [name + ext for ext in ('.pem', '.key', '.der')]
         volumes[-1]['secret']['items'] = [
             {'key': name, 'path': 'tls/' + name} for name in certificates

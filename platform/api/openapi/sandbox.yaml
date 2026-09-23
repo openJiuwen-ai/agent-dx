@@ -7,8 +7,8 @@ info:
     identifier: Apache-2.0
   description: |
     Public lifecycle API implemented by the Rust API Server and exposed through
-    Edge. ADX uses Capsule and Runtime internally; Sandbox is the public API
-    and SDK model. Compatibility fields such as instanceId map to capsule_id at
+    Ingress. ADX uses Environment and Runtime internally; Sandbox is the public API
+    and SDK model. Compatibility fields such as instanceId map to environment_id at
     the API Server boundary.
     Lifecycle responses use an envelope whose `data` member is base64-encoded
     JSON. Resource discovery returns its typed JSON document directly. Create
@@ -50,7 +50,7 @@ paths:
       tags: [Scheduler compatibility]
       operationId: listLegacySchedulingQueue
       summary: List requests waiting in the in-memory ShardScheduler queues
-      description: Administrator only. Assigned Capsules are not included.
+      description: Administrator only. Assigned Environments are not included.
       responses:
         "200":
           description: Bounded waiting-request view.
@@ -68,7 +68,7 @@ paths:
       tags: [Scheduler compatibility]
       operationId: pauseNodeScheduling
       summary: Stop new scheduling to one node
-      description: Administrator only. Existing Capsules continue running.
+      description: Administrator only. Existing Environments continue running.
       responses:
         "200":
           description: Node admission is administratively paused.
@@ -96,7 +96,7 @@ paths:
       description: |
         Returns the API Server's fresh in-memory node directory, including
         online nodes whose new-allocation admission is paused. The directory
-        is initialized by a complete Master watch frame and then refreshed by
+        is initialized by a complete Coordinator watch frame and then refreshed by
         subsequent frames; an expired or unavailable view returns an error
         instead of stale capacity. CPU is reported in millicores and Memory and
         Disk in MiB.
@@ -243,7 +243,7 @@ paths:
         - $ref: "#/components/parameters/ResumeOperationId"
       responses:
         "200":
-          description: The Sandbox Capsule is running and its local Runtime route is bound.
+          description: The Sandbox Environment is running and its local Runtime route is bound.
           content:
             application/json:
               schema:
@@ -283,7 +283,7 @@ paths:
       tags: [Sandboxes]
       operationId: updateSandboxNetworkPolicy
       summary: Atomically replace the complete runtime network policy
-      description: An empty object clears the policy. The committed Capsule specification changes only after sandboxd accepts the replacement Runtime.
+      description: An empty object clears the policy. The committed Environment specification changes only after sandboxd accepts the replacement Runtime.
       parameters:
         - $ref: "#/components/parameters/SandboxId"
         - $ref: "#/components/parameters/NetworkOperationId"
@@ -674,7 +674,7 @@ components:
             required: [instanceID, requestID, resources, enqueueTimeMs, waitDurationMs]
             properties:
               instanceID: {type: string}
-              requestID: {type: string, description: Same stable Capsule ID because ADX has no second scheduling-request identity.}
+              requestID: {type: string, description: Same stable Environment ID because ADX has no second scheduling-request identity.}
               resources:
                 type: object
                 additionalProperties: {oneOf: [{type: string}, {type: number}]}
@@ -732,8 +732,8 @@ components:
           type: array
           uniqueItems: true
           description: |
-            User ports declared by the SDK. Edge authorizes the tenant and
-            Capsule on every forwarded request; Node Proxy then connects to
+            User ports declared by the SDK. Ingress authorizes the tenant and
+            Environment on every forwarded request; Relay then connects to
             the declared port on its current Runtime.
           items:
             type: string
@@ -750,7 +750,7 @@ components:
         inheritEntrypoint:
           type: boolean
           default: false
-          description: Run the effective OCI image Entrypoint and Cmd as the RRT-managed workload. Image rootfs only.
+          description: Run the effective OCI image Entrypoint and Cmd as the EXECD-managed workload. Image rootfs only.
         mounts:
           type: array
           items: {$ref: "#/components/schemas/Mount"}

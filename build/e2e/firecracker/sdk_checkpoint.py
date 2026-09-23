@@ -2,7 +2,7 @@
 """Public installed-SDK pause/resume acceptance against a real Firecracker ADX node.
 
 No mock backend or direct lifecycle RPC is used. The optional restart command is
-an explicit test fixture hook; it must restart only the selected Node Manager.
+an explicit test fixture hook; it must restart only the selected Adxlet.
 """
 import argparse
 import importlib.metadata
@@ -76,7 +76,7 @@ try:
         mounts=[Mount(target='/mnt/runtime', type='erofs', s3_config=source)],
         idle_timeout=0, connection=connection, create_timeout=180)
     fixtures.append(mounted)
-    mounted_check = mounted.commands.run('test -x /mnt/runtime/usr/local/bin/rrt-runtime')
+    mounted_check = mounted.commands.run('test -x /mnt/runtime/usr/local/bin/adx-execd')
     assert mounted_check.exit_code == 0, mounted_check
     passed('S3 EROFS mount is visible inside the sandbox')
     mounted.kill(); mounted.close(); fixtures.remove(mounted)
@@ -119,7 +119,7 @@ try:
     assert networked.commands.run(network_probe).exit_code != 0
     networked.update_network_policy(None)
     assert networked.commands.run(network_probe).exit_code == 0
-    passed('runtime network policy replacement blocks egress and preserves RRT control', target=network_target, port=network_port)
+    passed('runtime network policy replacement blocks egress and preserves EXECD control', target=network_target, port=network_port)
     networked.kill(); networked.close(); fixtures.remove(networked)
 
     blocked = Sandbox(
@@ -134,7 +134,7 @@ try:
 
     sandbox = Sandbox(labels={'app':'checkpoint-source'}, image=a.image, runtime='firecracker', cpu=1000, memory=512, idle_timeout=0, node_id=os.environ.get('ADX_E2E_EXPECTED_NODE'), connection=connection, create_timeout=180)
     result['instance_id'] = sandbox.id
-    passed('create through Frontend and execute through Edge', output=command("printf checkpoint-ready"))
+    passed('create through Frontend and execute through Ingress', output=command("printf checkpoint-ready"))
     # A detached process carries a shell variable across the checkpoint. Its PID
     # and counter prove that resume did not just cold-start the original image.
     command("sh -c 'echo $$ >/tmp/counter.pid; n=0; while :; do n=$((n+1)); echo $n >/tmp/counter; sleep 0.1; done' >/tmp/counter.log 2>&1 </dev/null &")
@@ -148,7 +148,7 @@ try:
     passed('pause with persisted recovery point', snapshot_id=paused.snapshot_id, size=paused.size, expires_at=paused.expires_at)
     if a.restart_command:
         subprocess.run([*a.restart_command, sandbox.id], check=True, timeout=180)
-        passed('Node Manager restart while paused')
+        passed('Adxlet restart while paused')
         passed('remote orphan GC preserves registered checkpoint')
     resumed = sandbox.resume()
     assert resumed.sandbox_id == sandbox.id

@@ -739,7 +739,7 @@ class SDKContractTests(unittest.TestCase):
                 )
         self.assertEqual(_FakeClient.created, [])
 
-    def test_commands_list_reads_rrt_running_field(self):
+    def test_commands_list_reads_execd_running_field(self):
         client = _FakeClient()
         processes = Commands(client, "sandbox-1").list()
         self.assertEqual(processes[0].command, "sleep 1")
@@ -987,7 +987,7 @@ class SDKContractTests(unittest.TestCase):
             patch("adx_sandbox.sandbox_api.SandboxClient", _FakeClient),
             patch.dict(
                 "os.environ",
-                {"ADX_GATEWAY_ADDRESS": "edge.example:443", "ADX_GATEWAY_TLS": "1"},
+                {"ADX_GATEWAY_ADDRESS": "ingress.example:443", "ADX_GATEWAY_TLS": "1"},
             ),
         ):
             sandbox = Sandbox(
@@ -997,7 +997,7 @@ class SDKContractTests(unittest.TestCase):
             )
             self.assertEqual(
                 sandbox.get_port_url(8080),
-                "https://edge.example:443/sandbox-1/8080",
+                "https://ingress.example:443/sandbox-1/8080",
             )
             self.assertEqual(
                 sandbox.get_port_auth_headers(),
@@ -1053,12 +1053,12 @@ class SDKContractTests(unittest.TestCase):
         self.assertEqual(_FakeClient.created, [])
 
     def test_shell_clean_output_preserves_output_without_trailing_newline(self):
-        raw = "printf $SDK_E2E\r\nstateful__RRT_PROMPT__ echo __RRT_DONE_$?__\r\n"
+        raw = "printf $SDK_E2E\r\nstateful__EXECD_PROMPT__ echo __EXECD_DONE_$?__\r\n"
 
         self.assertEqual(Shell._clean_output(raw), "stateful")
 
     def test_shell_clean_output_removes_reserved_prompt_after_newline(self):
-        raw = "pwd\r\n/tmp\r\n__RRT_PROMPT__ echo __RRT_DONE_$?__\r\n"
+        raw = "pwd\r\n/tmp\r\n__EXECD_PROMPT__ echo __EXECD_DONE_$?__\r\n"
 
         self.assertEqual(Shell._clean_output(raw), "/tmp")
 

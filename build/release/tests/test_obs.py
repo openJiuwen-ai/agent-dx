@@ -150,8 +150,8 @@ class ObsClient:
 
     def test_release_requires_version_and_uses_immutable_version_path(self):
         with tempfile.TemporaryDirectory() as temp:
-            artifact = Path(temp) / "adx-rrt.tar.zst"
-            artifact.write_bytes(b"rrt")
+            artifact = Path(temp) / "adx-execd.tar.zst"
+            artifact.write_bytes(b"execd")
             with self.assertRaisesRegex(ValueError, "version"):
                 obs.plan(
                     [artifact], "release", None, "linux", "arm64",
@@ -163,7 +163,7 @@ class ObsClient:
             )
             self.assertEqual(
                 manifest["artifacts"][0]["object"],
-                "adx/release/0.2.0-rc.1/linux/arm64/adx-rrt.tar.zst",
+                "adx/release/0.2.0-rc.1/linux/arm64/adx-execd.tar.zst",
             )
 
     def test_rejects_symlinks_duplicate_names_and_failed_upload(self):

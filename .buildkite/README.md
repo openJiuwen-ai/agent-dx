@@ -97,11 +97,11 @@ kubectl -n <buildkite-agent-namespace> create secret generic adx-pypi-credential
 
 | Resource in the test namespace | Processes |
 |---|---|
-| `node1` Pod | Redis, Master with embedded Shard, Sandbox API, Edge, Node Manager, Node Proxy, independently hosted sandboxd |
-| `node2` Pod | Node Manager, Node Proxy, independently hosted sandboxd |
-| `master` / `node2` Services | Service addresses for Redis, Master and Edge; nodes advertise their Pod IPs for RPC/forwarding |
+| `node1` Pod | Redis, Coordinator with embedded Shard, Sandbox API, Ingress, Adxlet, Relay, independently hosted sandboxd |
+| `node2` Pod | Adxlet, Relay, independently hosted sandboxd |
+| `coordinator` / `node2` Services | Service addresses for Redis, Coordinator and Ingress; nodes advertise their Pod IPs for RPC/forwarding |
 | `adx-test-credentials` Secret | Short-lived test certificates and API/Redis keys |
-| `adx-test-registry` Secret, when configured | Pod image pulls and sandboxd RRT image pulls |
+| `adx-test-registry` Secret, when configured | Pod image pulls and sandboxd EXECD image pulls |
 
 Each node Pod runs the unified package through `adxctl`. sandboxd is started by
 the test fixture, outside the product supervisor. Node containers are privileged
@@ -114,14 +114,14 @@ this does not establish physical-host fault isolation.
 
 Kubernetes Pod Ready is only the first deployment check. Acceptance waits for
 both ADX nodes to register, reconcile and become available/routable. Public SDK
-requests from node1 enter Edge over TLS and traverse the real control/data paths.
+requests from node1 enter Ingress over TLS and traverse the real control/data paths.
 
 ## Existing CI infrastructure
 
 These are Buildkite execution-cluster resources. They are independent of the
 two-worker target-cluster requirements documented in the
 [Kubernetes E2E README](../build/e2e/kubernetes/README.md). The current Agent
-Stack requests/limits are: each Platform/Gateway/RRT/source-gate compiler
+Stack requests/limits are: each Platform/Gateway/EXECD/source-gate compiler
 `4/8 CPU` and `8/16 GiB`, package assembly and OBS publication `1/2 CPU` and
 `2/4 GiB`, image publish `8 CPU / 16 GiB`, and the E2E deployer `2/4 CPU` and
 `4/8 GiB`. The target
@@ -132,7 +132,7 @@ and the Kubernetes plugin. Worker images follow the existing CI profiles:
 
 | Step | Reused worker image |
 |---|---|
-| `build-platform` / `build-gateway` / `build-rrt` / `source-gate` | immutable `ci_image` digest in `build/images/build-environment.json` |
+| `build-platform` / `build-gateway` / `build-execd` / `source-gate` | immutable `ci_image` digest in `build/images/build-environment.json` |
 | `platform-build` / `platform-obs` | same immutable ADX build image |
 | `sdk-package` / `platform-images` | `swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/sandbox-packager:v20260506_kubectl` |
 | `platform-e2e` | `swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/sandbox-deployer:v20260506_kubectl_py39` |
@@ -156,7 +156,7 @@ uploaded artifacts. ADX images default to the existing SWR organization under
 
 ADX build inputs remain explicit: the root Rust toolchain, Go/protobuf/Python
 build tools, matching `ADX_REDIS_SERVER` / `ADX_REDIS_CLI` 7.2.5 binaries, and
-`ADX_E2E_RUNTIME_BASE` / `ADX_E2E_RRT_BASE` digest-pinned runtime bases. Reusing
+`ADX_E2E_RUNTIME_BASE` / `ADX_E2E_EXECD_BASE` digest-pinned runtime bases. Reusing
 worker images does not change the product's toolchain or dependency pins. The
 digest-pinned ADX build image already contains Rust 1.95.0, Go 1.25.5, Redis
 7.2.5, musl, erofs-utils 1.8.10 and the Python build dependencies. Bootstrap
@@ -168,7 +168,7 @@ dependency in the Ubuntu runtime image.
 
 ## Artifact handoff and acceptance
 
-`build-platform`, `build-gateway` and `build-rrt` compile in parallel with
+`build-platform`, `build-gateway` and `build-execd` compile in parallel with
 separate target directories, while `source-gate` runs the source and unit-test
 gate. Each compile step uploads a component archive and manifest. After all four
 steps pass, `platform-build` verifies those immutable handoff artifacts and
@@ -191,7 +191,7 @@ The Full pipeline requires `ADX_BASE_PACKAGE_BUILD_ID` and `ADX_SDK_BUILD_ID`.
 `platform-images` downloads both immutable candidates by Buildkite build UUID,
 verifies their commits and digests, restores the base package tree and injects
 the independently built SDK wheel into the test image. It then publishes the
-node, RRT and entrypoint-fixture images. `registry-images.json` records immutable digest
+node, EXECD and entrypoint-fixture images. `registry-images.json` records immutable digest
 references, source image IDs and the checksum of `bundle.json`.
 
 `platform-e2e` downloads only those JSON manifests and invokes
@@ -235,14 +235,14 @@ loads `br_netfilter`, writes the modules-load and sysctl configuration under the
 host `/etc`, verifies `net.bridge.bridge-nf-call-iptables=1`, and then removes
 its isolated namespace. Ordinary builds and E2E runs never mutate host settings.
 
-Capacity checks also save Master/Node resource scrapes at allocated, queued and
+Capacity checks also save Coordinator/Node resource scrapes at allocated, queued and
 released points. The unified supervisor runs with log rotation enabled in both
 Pods. Stop checks decompress the closed gzip files, reject unfinished compression
 and reported log I/O failures, and save `logging-node1.json` / `logging-node2.json`.
 The E2E log includes `[METRICS PASS]` and `[LOGGING PASS]` evidence.
 
 Cleanup validates namespace ownership label and UID, stops nodes in reverse
-order while Master is still present, deletes the namespace and confirms absence.
+order while Coordinator is still present, deletes the namespace and confirms absence.
 A replaced/unowned namespace is never deleted. A host/job SIGKILL can interrupt
 cleanup; the recorded run ID and namespace label identify only that run's
 resources for recovery, and a missing result cannot count as passed.
@@ -255,7 +255,7 @@ available separately for development reproduction in [build/e2e](../build/e2e/RE
 Buildkite syntax follows the official [Agent Stack execution](https://buildkite.com/docs/agent/self-hosted/agent-stack-k8s/running-builds)
 and [PodSpec configuration](https://buildkite.com/docs/agent/self-hosted/agent-stack-k8s/podspec).
 
-构建会在复用的 worker 中按版本和 SHA256 准备 Go 1.25.5、Redis 7.2.5。基础流水线直接下载并校验固定的 sandboxd 后端产物，不访问 GitHub 重建；只有显式取消 `ADX_BACKEND_ARTIFACT_BUILD` 时才进入源码构建维护路径。未指定基础镜像时，打包步骤按仓库 Dockerfile 构建并发布测试基础镜像，再用 registry digest 构建节点与 RRT 镜像。`ADX_REDIS_SERVER` / `ADX_REDIS_CLI` 和 `ADX_E2E_RUNTIME_BASE` / `ADX_E2E_RRT_BASE` 可显式覆盖。
+构建会在复用的 worker 中按版本和 SHA256 准备 Go 1.25.5、Redis 7.2.5。基础流水线直接下载并校验固定的 sandboxd 后端产物，不访问 GitHub 重建；只有显式取消 `ADX_BACKEND_ARTIFACT_BUILD` 时才进入源码构建维护路径。未指定基础镜像时，打包步骤按仓库 Dockerfile 构建并发布测试基础镜像，再用 registry digest 构建节点与 EXECD 镜像。`ADX_REDIS_SERVER` / `ADX_REDIS_CLI` 和 `ADX_E2E_RUNTIME_BASE` / `ADX_E2E_EXECD_BASE` 可显式覆盖。
 
 ## ADX build image and Cargo cache
 
@@ -273,7 +273,7 @@ the persistent ADX Cargo home, including Git dependency caching.
 It exports `CARGO_HOME` from `ADX_CARGO_HOME` inside the build process so image
 profile initialization cannot silently redirect downloads back to `/root/.cargo`.
 Registry and Git downloads survive job Pods under `/mnt/paas`. Platform,
-Gateway, RRT and source-gate use separate target directories by architecture and
+Gateway, EXECD and source-gate use separate target directories by architecture and
 toolchain, so they can run concurrently without copying another job's outputs.
 Package assembly consumes only uploaded component archives; it does not read a
 compiler job's Cargo target directory.
@@ -356,7 +356,7 @@ an isolated Kubernetes Pod and publishes deployment, per-case, JUnit and cleanup
 evidence. See [runtime kit and invocation](../build/e2e/firecracker/README.md).
 The existing basic E2E result alone does not count as this profile passing.
 
-组件日志采集验收复用现有 Edge/Node Proxy 指标端点，并通过真实 OpenTelemetry Collector 接收结构化组件日志。stop 组包含后端 503、文件滚动与 Collector 重启，控制台输出 `[METRICS PASS]` / `[COLLECTION PASS]`；产物含 `gateway-metrics-node*.json`、`collection-node*.json`、`collected-logs.jsonl` 和 `collector-process.log`。部署及保证边界见 `docs/testing/log-collection.md`。Trace验收输出 `[TRACE PASS]`，保存 `traces-node*.json` 与 `collected-traces.jsonl`，检查完整创建链路和实例队列父子关系；配置见 `docs/testing/distributed-traces.md`。
+组件日志采集验收复用现有 Ingress/Relay 指标端点，并通过真实 OpenTelemetry Collector 接收结构化组件日志。stop 组包含后端 503、文件滚动与 Collector 重启，控制台输出 `[METRICS PASS]` / `[COLLECTION PASS]`；产物含 `gateway-metrics-node*.json`、`collection-node*.json`、`collected-logs.jsonl` 和 `collector-process.log`。部署及保证边界见 `docs/testing/log-collection.md`。Trace验收输出 `[TRACE PASS]`，保存 `traces-node*.json` 与 `collected-traces.jsonl`，检查完整创建链路和实例队列父子关系；配置见 `docs/testing/distributed-traces.md`。
 
 ### Collector 镜像同步
 
@@ -380,6 +380,6 @@ data; the tools are build dependencies and are not included in the release.
 EROFS deployments preflight the packaged payload through a read-only loop
 mount. Listing `erofs` in `/proc/filesystems` alone is insufficient because
 some worker kernels register the driver but reject block-backed mounts. The
-Kubernetes acceptance profile uses the digest-pinned OCI RRT image instead and
+Kubernetes acceptance profile uses the digest-pinned OCI EXECD image instead and
 therefore checks bridge networking without requiring EROFS; standalone tests
 continue to exercise the packaged EROFS source.

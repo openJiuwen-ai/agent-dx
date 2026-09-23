@@ -16,8 +16,8 @@ python3 build/dev/progress.py serve
 
 ```bash
 python3 build/dev/progress.py run --stage 1 --job node-tests \
-  --label 'Node Manager 单测' --log out/dev/progress/node-tests.log \
-  -- cargo test -p adx-node-manager -j 2
+  --label 'adxlet 单测' --log out/dev/progress/node-tests.log \
+  -- cargo test -p adxlet -j 2
 ```
 
 同一 job ID 展示最近一次运行，日志追加保留。不同任务使用不同 ID 和日志文件。命令参数、环境变量和日志正文不会被放入页面状态；测试本身的输出仍应遵守项目凭证脱敏要求。页面只提供首页与状态接口，不提供任意文件浏览或执行命令接口。

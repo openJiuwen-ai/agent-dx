@@ -7,8 +7,8 @@ restart_limit: 3
 restart_delay_ms: 1000
 stop_timeout_seconds: 90
 services:
-  - id: master
-    role: master
+  - id: coordinator
+    role: coordinator
     config:
       listen: 0.0.0.0:19000
       scheduler_shards: 1
@@ -16,13 +16,13 @@ services:
       rpc_timeout_seconds: 30
       tls:
         ca: /opt/adx/config/tls/ca.pem
-        certificate: /opt/adx/config/tls/master.pem
-        private_key: /opt/adx/config/tls/master.key
+        certificate: /opt/adx/config/tls/coordinator.pem
+        private_key: /opt/adx/config/tls/coordinator.key
         server_name: adx.internal
         peers:
-          api-server: /opt/adx/config/tls/api-server.der
+          apiserver: /opt/adx/config/tls/apiserver.der
           node:node-1: /opt/adx/config/tls/node-1.der
-          edge: /opt/adx/config/tls/edge.der
+          ingress: /opt/adx/config/tls/ingress.der
       bootstrap_credentials:
         - key_file: /opt/adx/config/secrets/admin-key
           tenant_id: admin
@@ -32,8 +32,8 @@ services:
       heartbeat_timeout_seconds: 30
       discovery_ttl_seconds: 15
       metrics_listen: 127.0.0.1:19090
-  - id: node-manager
-    role: node-manager
+  - id: adxlet
+    role: adxlet
     config:
       node_id: node-1
       listen: 0.0.0.0:19001
@@ -45,14 +45,14 @@ services:
         private_key: /opt/adx/config/tls/node-1.key
         server_name: adx.internal
         peers:
-          master: /opt/adx/config/tls/master.der
-          api-server: /opt/adx/config/tls/api-server.der
+          coordinator: /opt/adx/config/tls/coordinator.der
+          apiserver: /opt/adx/config/tls/apiserver.der
       sandboxd_socket: /run/sandboxd/sandboxd.sock
       proxy_socket: /opt/adx/run/node/route.sock
       report_interval_seconds: 5
       rpc_timeout_seconds: 30
-      rrt_port: 50090
-      rrt_env: {}
+      execd_port: 50090
+      execd_env: {}
       checkpoint_dir: /opt/adx/data/checkpoints
       resource_source:
         kind: auto
@@ -61,54 +61,54 @@ services:
       degradation_journal: /opt/adx/data/degraded/results.sqlite
       metrics_listen: 127.0.0.1:19091
     env:
-      ADX_DATA_PLANE_NODE_PROXY_ACTIVITY_UDS_DIR: /opt/adx/run/node
-      ADX_DATA_PLANE_NODE_PROXY_BIND: 0.0.0.0:19002
-      ADX_DATA_PLANE_NODE_PROXY_ADVERTISE_ADDRESS: 127.0.0.1:19002
+      ADX_DATA_PLANE_RELAY_ACTIVITY_UDS_DIR: /opt/adx/run/node
+      ADX_DATA_PLANE_RELAY_BIND: 0.0.0.0:19002
+      ADX_DATA_PLANE_RELAY_ADVERTISE_ADDRESS: 127.0.0.1:19002
       ADX_DATA_PLANE_ALLOWED_TARGET_CIDRS: 10.88.0.0/16
-      ADX_DATA_PLANE_ALLOWED_EDGE_CIDRS: 127.0.0.1/32
-      ADX_DATA_PLANE_EDGE_FRONTEND_NODE_SECURITY_MODE: mtls
-      ADX_DATA_PLANE_NODE_PROXY_TLS_CERT: /opt/adx/config/tls/node-1.pem
-      ADX_DATA_PLANE_NODE_PROXY_TLS_KEY: /opt/adx/config/tls/node-1.key
-      ADX_DATA_PLANE_NODE_PROXY_MTLS_CLIENT_CA: /opt/adx/config/tls/ca.pem
-  - id: api-server
-    role: api-server
+      ADX_DATA_PLANE_ALLOWED_INGRESS_CIDRS: 127.0.0.1/32
+      ADX_DATA_PLANE_INGRESS_NODE_SECURITY_MODE: mtls
+      ADX_DATA_PLANE_RELAY_TLS_CERT: /opt/adx/config/tls/node-1.pem
+      ADX_DATA_PLANE_RELAY_TLS_KEY: /opt/adx/config/tls/node-1.key
+      ADX_DATA_PLANE_RELAY_MTLS_CLIENT_CA: /opt/adx/config/tls/ca.pem
+  - id: apiserver
+    role: apiserver
     config:
       listen: 127.0.0.1:8888
       ca: /opt/adx/config/tls/ca.pem
-      certificate: /opt/adx/config/tls/api-server.pem
-      private_key: /opt/adx/config/tls/api-server.key
+      certificate: /opt/adx/config/tls/apiserver.pem
+      private_key: /opt/adx/config/tls/apiserver.key
       server_name: adx.internal
       rpc_timeout_seconds: 90
       cache_entries: 10000
       auth_cache_ttl_seconds: 10
       agent_address: ''
       loopback_http: true
-  - id: edge
-    role: edge
+  - id: ingress
+    role: ingress
     config:
       tls:
         ca: /opt/adx/config/tls/ca.pem
-        certificate: /opt/adx/config/tls/edge.pem
-        private_key: /opt/adx/config/tls/edge.key
+        certificate: /opt/adx/config/tls/ingress.pem
+        private_key: /opt/adx/config/tls/ingress.key
         server_name: adx.internal
         peers:
-          master: /opt/adx/config/tls/master.der
+          coordinator: /opt/adx/config/tls/coordinator.der
       rpc_timeout_seconds: 5
       refresh_seconds: 2
       auth_cache_seconds: 10
       auth_cache_entries: 4096
     env:
-      ADX_DATA_PLANE_EDGE_FRONTEND_CONTROL_PLANE_ROUTES: exact:/,exact:/healthz,prefix:/api/instances,prefix:/api/sandbox,prefix:/api/admin/v1/keys
-      ADX_DATA_PLANE_EDGE_FRONTEND_TLS_BIND: 0.0.0.0:8443
-      ADX_DATA_PLANE_EDGE_FRONTEND_TLS_CERT: /opt/adx/config/tls/edge-public.pem
-      ADX_DATA_PLANE_EDGE_FRONTEND_TLS_KEY: /opt/adx/config/tls/edge-public.key
-      ADX_DATA_PLANE_EDGE_FRONTEND_ALLOWED_CLIENT_CIDRS: 127.0.0.1/32
-      ADX_DATA_PLANE_EDGE_FRONTEND_CONTROL_PLANE_ADDRESS: 127.0.0.1:8888
-      ADX_DATA_PLANE_EDGE_FRONTEND_NODE_SECURITY_MODE: mtls
-      ADX_DATA_PLANE_EDGE_FRONTEND_NODE_TLS_CA: /opt/adx/config/tls/ca.pem
-      ADX_DATA_PLANE_EDGE_FRONTEND_NODE_TLS_SERVER_NAME: adx.internal
-      ADX_DATA_PLANE_EDGE_FRONTEND_NODE_TLS_CLIENT_CERT: /opt/adx/config/tls/edge.pem
-      ADX_DATA_PLANE_EDGE_FRONTEND_NODE_TLS_CLIENT_KEY: /opt/adx/config/tls/edge.key
+      ADX_DATA_PLANE_INGRESS_CONTROL_PLANE_ROUTES: exact:/,exact:/healthz,prefix:/api/instances,prefix:/api/sandbox,prefix:/api/admin/v1/keys
+      ADX_DATA_PLANE_INGRESS_TLS_BIND: 0.0.0.0:8443
+      ADX_DATA_PLANE_INGRESS_TLS_CERT: /opt/adx/config/tls/ingress-public.pem
+      ADX_DATA_PLANE_INGRESS_TLS_KEY: /opt/adx/config/tls/ingress-public.key
+      ADX_DATA_PLANE_INGRESS_ALLOWED_CLIENT_CIDRS: 127.0.0.1/32
+      ADX_DATA_PLANE_INGRESS_CONTROL_PLANE_ADDRESS: 127.0.0.1:8888
+      ADX_DATA_PLANE_INGRESS_NODE_SECURITY_MODE: mtls
+      ADX_DATA_PLANE_INGRESS_NODE_TLS_CA: /opt/adx/config/tls/ca.pem
+      ADX_DATA_PLANE_INGRESS_NODE_TLS_SERVER_NAME: adx.internal
+      ADX_DATA_PLANE_INGRESS_NODE_TLS_CLIENT_CERT: /opt/adx/config/tls/ingress.pem
+      ADX_DATA_PLANE_INGRESS_NODE_TLS_CLIENT_KEY: /opt/adx/config/tls/ingress.key
 logging:
   enabled: true
   max_file_bytes: 104857600
@@ -117,7 +117,7 @@ logging:
   max_files: 5
   max_age_seconds: 604800
   max_total_bytes: 1073741824
-environment:
+runtime_profile:
   rootfs:
     runtime_class: runsc
     type: local
@@ -128,7 +128,7 @@ environment:
     root: /opt/adx/current/runtime/adx-runtime-rootfs.img
     target: /__adx
     entrypoint:
-      - /__adx/usr/local/bin/rrt-runtime
+      - /__adx/usr/local/bin/adx-execd
     image_process_config: /etc/adx-image-process.json
   env:
     PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin

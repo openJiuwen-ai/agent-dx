@@ -64,7 +64,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "adx-api-server"
+name = "adx-apiserver"
 version = "0.1.0"
 dependencies = [
  "adx-core",
@@ -107,6 +107,37 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "url",
+]
+
+[[package]]
+name = "adx-coordinator"
+version = "0.1.0"
+dependencies = [
+ "adx-core",
+ "adx-discovery",
+ "adx-observability",
+ "adx-process",
+ "adx-protocol",
+ "adx-scheduling",
+ "adx-transport",
+ "adxlet",
+ "async-trait",
+ "bytes",
+ "data-plane-gateway",
+ "futures-util",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "object_store",
+ "redis",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tonic 0.12.3",
+ "uuid",
 ]
 
 [[package]]
@@ -159,69 +190,31 @@ dependencies = [
 ]
 
 [[package]]
-name = "adx-master"
+name = "adx-execd"
 version = "0.1.0"
 dependencies = [
  "adx-core",
- "adx-discovery",
- "adx-node-manager",
  "adx-observability",
- "adx-process",
- "adx-protocol",
- "adx-scheduling",
- "adx-transport",
- "async-trait",
+ "adxlet",
+ "base64 0.22.1",
  "bytes",
- "data-plane-gateway",
- "futures-util",
- "http-body-util",
- "hyper",
- "hyper-util",
- "object_store",
- "redis",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tempfile",
- "tokio",
- "tokio-stream",
- "tonic 0.12.3",
- "uuid",
-]
-
-[[package]]
-name = "adx-node-manager"
-version = "0.1.0"
-dependencies = [
- "adx-core",
- "adx-discovery",
- "adx-observability",
- "adx-process",
- "adx-protocol",
- "adx-transport",
- "async-trait",
- "bytes",
- "data-plane-gateway",
  "futures-util",
  "http-body-util",
  "hyper",
  "hyper-util",
  "libc",
- "object_store",
- "prost 0.13.5",
- "protoc-bin-vendored",
- "reqwest 0.13.5",
- "rusqlite",
+ "portable-pty",
+ "rmp",
+ "rmp-serde",
+ "rmpv",
  "serde",
+ "serde-pickle",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
  "tokio",
  "tokio-stream",
- "tonic 0.12.3",
- "tonic-build",
- "tower 0.5.3",
- "uuid",
+ "tokio-tungstenite",
 ]
 
 [[package]]
@@ -291,6 +284,41 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tonic 0.12.3",
+ "uuid",
+]
+
+[[package]]
+name = "adxlet"
+version = "0.1.0"
+dependencies = [
+ "adx-core",
+ "adx-discovery",
+ "adx-observability",
+ "adx-process",
+ "adx-protocol",
+ "adx-transport",
+ "async-trait",
+ "bytes",
+ "data-plane-gateway",
+ "futures-util",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "libc",
+ "object_store",
+ "prost 0.13.5",
+ "protoc-bin-vendored",
+ "reqwest 0.13.5",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tonic 0.12.3",
+ "tonic-build",
+ "tower 0.5.3",
  "uuid",
 ]
 
@@ -3277,34 +3305,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7a4e1d4b9b938a26d2996af33229f0ca0956c652c1375067f0b45291c1df8417"
 dependencies = [
  "rmp",
-]
-
-[[package]]
-name = "rrt-daemon"
-version = "0.1.0"
-dependencies = [
- "adx-core",
- "adx-node-manager",
- "adx-observability",
- "base64 0.22.1",
- "bytes",
- "futures-util",
- "http-body-util",
- "hyper",
- "hyper-util",
- "libc",
- "portable-pty",
- "rmp",
- "rmp-serde",
- "rmpv",
- "serde",
- "serde-pickle",
- "serde_json",
- "sha2 0.10.9",
- "tempfile",
- "tokio",
- "tokio-stream",
- "tokio-tungstenite",
 ]
 
 [[package]]

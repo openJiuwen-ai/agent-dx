@@ -1,21 +1,21 @@
-//! Redis holds a renewable Master endpoint, never capsule ownership decisions.
+//! Redis holds a renewable Coordinator endpoint, never environment ownership decisions.
 use adx_core::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::Mutex;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct MasterEndpoint {
+pub struct CoordinatorEndpoint {
     pub schema: u32,
     pub epoch: u64,
     pub address: String,
 }
-impl MasterEndpoint {
+impl CoordinatorEndpoint {
     pub fn validate(&self) -> Result<()> {
         let uri: http::Uri = self
             .address
             .parse()
-            .map_err(|_| Error::Invalid("invalid Master endpoint".into()))?;
+            .map_err(|_| Error::Invalid("invalid Coordinator endpoint".into()))?;
         if self.schema != 1
             || self.epoch == 0
             || !matches!(uri.scheme_str(), Some("https" | "http"))
@@ -26,7 +26,7 @@ impl MasterEndpoint {
             || uri.path_and_query().is_some_and(|p| p.as_str() != "/")
         {
             return Err(Error::Invalid(
-                "versioned HTTP(S) Master endpoint required".into(),
+                "versioned HTTP(S) Coordinator endpoint required".into(),
             ));
         }
         Ok(())
@@ -42,7 +42,7 @@ pub fn keys(namespace: &str) -> Result<(String, String)> {
         return Err(Error::Invalid("invalid Redis namespace".into()));
     }
     Ok((
-        format!("adx:{{{namespace}}}:master:v1"),
+        format!("adx:{{{namespace}}}:coordinator:v1"),
         format!("adx:{{{namespace}}}:control:v1"),
     ))
 }
@@ -67,7 +67,7 @@ impl RedisDiscovery {
             timeout,
         })
     }
-    pub async fn lookup(&self) -> Result<MasterEndpoint> {
+    pub async fn lookup(&self) -> Result<CoordinatorEndpoint> {
         let (key, control) = keys(&self.namespace)?;
         let operation = async {
             let mut guard = self.connection.lock().await;
@@ -91,15 +91,17 @@ impl RedisDiscovery {
             Ok(Ok(v)) => v,
             _ => {
                 *self.connection.lock().await = None;
-                return Err(Error::Unavailable("Master discovery unavailable".into()));
+                return Err(Error::Unavailable(
+                    "Coordinator discovery unavailable".into(),
+                ));
             }
         };
         if values.len() != 2 {
             return Err(Error::Unavailable("invalid discovery response".into()));
         }
         let value = values[0].as_deref().ok_or(Error::NotFound)?;
-        let endpoint: MasterEndpoint = serde_json::from_str(value)
-            .map_err(|_| Error::Unavailable("invalid Master discovery record".into()))?;
+        let endpoint: CoordinatorEndpoint = serde_json::from_str(value)
+            .map_err(|_| Error::Unavailable("invalid Coordinator discovery record".into()))?;
         endpoint.validate()?;
         #[derive(Deserialize)]
         struct Header {
@@ -126,7 +128,7 @@ mod tests {
             "https://host:1/?x=1",
             "bad",
         ] {
-            assert!(MasterEndpoint {
+            assert!(CoordinatorEndpoint {
                 schema: 1,
                 epoch: 1,
                 address: address.into()
@@ -134,14 +136,14 @@ mod tests {
             .validate()
             .is_err());
         }
-        assert!(MasterEndpoint {
+        assert!(CoordinatorEndpoint {
             schema: 1,
             epoch: 1,
             address: "https://host:123".into()
         }
         .validate()
         .is_ok());
-        assert!(MasterEndpoint {
+        assert!(CoordinatorEndpoint {
             schema: 1,
             epoch: 1,
             address: "http://host:123".into()

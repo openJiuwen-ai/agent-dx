@@ -336,7 +336,7 @@ def test_fork_replaces_inherited_pool_and_socket(monkeypatch):
 
 
 @pytest.mark.parametrize("auth_header", ["X-Auth", "Authorization"])
-def test_direct_requests_work_with_legacy_and_edge_auth_servers(monkeypatch, auth_header):
+def test_direct_requests_work_with_legacy_and_ingress_auth_servers(monkeypatch, auth_header):
     class AuthHandler(_EchoHandler):
         def do_GET(self):
             expected = "sandbox-token" if auth_header == "X-Auth" else "Bearer sandbox-token"

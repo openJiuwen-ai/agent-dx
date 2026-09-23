@@ -15,9 +15,9 @@ pub enum SecurityMode {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Principal {
-    Master,
+    Coordinator,
     ApiServer,
-    Edge,
+    Ingress,
     Node(String),
 }
 #[derive(Clone, Default)]
@@ -54,9 +54,9 @@ impl Peers {
                 .get("adx-component")
                 .and_then(|v| v.to_str().ok())
             {
-                Some("master") => Ok(Principal::Master),
-                Some("api-server") => Ok(Principal::ApiServer),
-                Some("edge") => Ok(Principal::Edge),
+                Some("coordinator") => Ok(Principal::Coordinator),
+                Some("apiserver") => Ok(Principal::ApiServer),
+                Some("ingress") => Ok(Principal::Ingress),
                 Some("node") => {
                     let id = request
                         .metadata()
@@ -92,7 +92,7 @@ pub fn tenant(caller: Option<&CallerContext>, owner: &str) -> Result<(), Status>
     }
     if !caller.administrator && caller.tenant_id != owner {
         return Err(Status::permission_denied(
-            "capsule belongs to another tenant",
+            "environment belongs to another tenant",
         ));
     }
     Ok(())

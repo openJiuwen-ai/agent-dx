@@ -1,5 +1,5 @@
 use crate::common::protocol::{H_ACCESS_KIND, H_REQUEST_ID};
-use crate::edge::AccessKind;
+use crate::ingress::AccessKind;
 use bytes::Bytes;
 use http::{header, Method, Request, Uri};
 use http_body_util::{BodyExt, Empty};
@@ -21,20 +21,20 @@ impl<T> AsyncIo for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
 type BoxedIo = Box<dyn AsyncIo>;
 
 #[derive(Clone)]
-pub struct EdgeTlsConfig {
+pub struct IngressTlsConfig {
     pub client: Arc<rustls::ClientConfig>,
     pub server_name: String,
 }
 
 #[derive(Clone)]
 pub struct ConnectClientConfig {
-    pub edge_address: String,
+    pub ingress_address: String,
     pub instance_id: String,
     pub target_port: u16,
     pub access_kind: AccessKind,
     pub bearer_token: String,
     pub request_id: String,
-    pub tls: Option<EdgeTlsConfig>,
+    pub tls: Option<IngressTlsConfig>,
 }
 
 impl ConnectClientConfig {
@@ -50,20 +50,20 @@ impl ConnectClientConfig {
     }
 }
 
-/// Open a standards-based HTTP/1.1 CONNECT tunnel to Edge.
+/// Open a standards-based HTTP/1.1 CONNECT tunnel to Ingress.
 ///
-/// The returned stream carries only the target TCP bytes. Edge is responsible
-/// for resolving the logical instance authority to the owning Node Proxy.
-pub async fn connect_edge(config: ConnectClientConfig) -> io::Result<TokioIo<Upgraded>> {
+/// The returned stream carries only the target TCP bytes. Ingress is responsible
+/// for resolving the logical instance authority to the owning Relay.
+pub async fn connect_ingress(config: ConnectClientConfig) -> io::Result<TokioIo<Upgraded>> {
     if config.tls.is_none() && !config.bearer_token.trim().is_empty() {
         return Err(invalid(
-            "bearer tokens are not allowed on the plaintext Edge listener",
+            "bearer tokens are not allowed on the plaintext Ingress listener",
         ));
     }
-    let tcp = TcpStream::connect(&config.edge_address).await?;
+    let tcp = TcpStream::connect(&config.ingress_address).await?;
     let io: BoxedIo = if let Some(tls) = config.tls.clone() {
         let server_name = ServerName::try_from(tls.server_name)
-            .map_err(|error| invalid(&format!("invalid Edge TLS server name: {error}")))?;
+            .map_err(|error| invalid(&format!("invalid Ingress TLS server name: {error}")))?;
         Box::new(
             TlsConnector::from(tls.client)
                 .connect(server_name, tcp)
@@ -77,7 +77,7 @@ pub async fn connect_edge(config: ConnectClientConfig) -> io::Result<TokioIo<Upg
     let (mut sender, connection) = http1::handshake(TokioIo::new(io)).await.map_err(other)?;
     tokio::spawn(async move {
         if let Err(error) = connection.with_upgrades().await {
-            tracing::debug!(%error, "Edge CONNECT client connection closed");
+            tracing::debug!(%error, "Ingress CONNECT client connection closed");
         }
     });
 
@@ -113,7 +113,7 @@ pub async fn connect_edge(config: ConnectClientConfig) -> io::Result<TokioIo<Upg
         let message = String::from_utf8_lossy(body);
         return Err(io::Error::new(
             status_error_kind(status),
-            format!("Edge CONNECT failed with {status}: {message}"),
+            format!("Ingress CONNECT failed with {status}: {message}"),
         ));
     }
     hyper::upgrade::on(&mut response)
@@ -151,7 +151,7 @@ mod tests {
     #[test]
     fn logical_instance_and_port_form_connect_authority() {
         let config = ConnectClientConfig {
-            edge_address: "127.0.0.1:8080".into(),
+            ingress_address: "127.0.0.1:8080".into(),
             instance_id: "instance-a".into(),
             target_port: 22,
             access_kind: AccessKind::Ssh,

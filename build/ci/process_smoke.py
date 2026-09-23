@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Real Redis/Master supervision check. No Capsule or platform E2E claim."""
+"""Real Redis/Coordinator supervision check. No Environment or platform E2E claim."""
 import argparse
 import json
 import os
@@ -26,7 +26,7 @@ def wait(fn):
     raise TimeoutError('process condition not satisfied')
 def endpoint(port_number):
     with socket.create_connection(('127.0.0.1',port_number),timeout=1) as s:
-        key=b'adx:{process-smoke}:master:v1'
+        key=b'adx:{process-smoke}:coordinator:v1'
         s.sendall(b'*2\r\n$3\r\nGET\r\n$'+str(len(key)).encode()+b'\r\n'+key+b'\r\n')
         stream=s.makefile('rb');header=stream.readline()
         if not header.startswith(b'$') or int(header[1:])<0:return None
@@ -36,15 +36,15 @@ def main():
     package=a.package.resolve();out=a.output.resolve();out.mkdir(parents=True,exist_ok=False)
     subprocess.run([sys.executable,str(ROOT/'build/release/package.py'),'verify',str(package)],check=True)
     subprocess.run([sys.executable,str(ROOT/'build/ci/rpc_certificates.py'),str(out/'tls')],check=True)
-    tls=out/'tls';result={'status':'failed','scope':'real Redis and Master supervision','instance_e2e':False}
+    tls=out/'tls';result={'status':'failed','scope':'real Redis and Coordinator supervision','instance_e2e':False}
     try:
         with tempfile.TemporaryDirectory(prefix='adx-proc-',dir='/tmp') as t:
-            root=Path(t);redis_port=port();master_port=port()
+            root=Path(t);redis_port=port();coordinator_port=port()
             data=out/'redis';data.mkdir()
 
             d={'schema_version':1,'package_dir':str(package),'state_dir':str(root/'state'),'redis_url':f'redis://127.0.0.1:{redis_port}/','namespace':'process-smoke','restart_limit':4,'restart_delay_ms':200,'stop_timeout_seconds':5,'services':[
                 {'id':'redis','role':'redis','config':{'bind':'127.0.0.1','port':redis_port,'data_dir':str(data),'appendfsync':'always'}},
-                {'id':'master','role':'master','config':{'listen':f'127.0.0.1:{master_port}','advertised_address':f'https://127.0.0.1:{master_port}','scheduler_shards':1,'placement':'pack','rpc_timeout_seconds':2,'tls':{'ca':str(tls/'ca.pem'),'certificate':str(tls/'master.pem'),'private_key':str(tls/'master.key'),'server_name':'localhost','peers':{'api-server':str(tls/'api-server.der')}},'bootstrap_credentials':[]}}]}
+                {'id':'coordinator','role':'coordinator','config':{'listen':f'127.0.0.1:{coordinator_port}','advertised_address':f'https://127.0.0.1:{coordinator_port}','scheduler_shards':1,'placement':'pack','rpc_timeout_seconds':2,'tls':{'ca':str(tls/'ca.pem'),'certificate':str(tls/'coordinator.pem'),'private_key':str(tls/'coordinator.key'),'server_name':'localhost','peers':{'apiserver':str(tls/'apiserver.der')}},'bootstrap_credentials':[]}}]}
             config=root/'deployment.yaml';config.write_text(json.dumps(d));config.chmod(0o600)
             command=[str(package/'bin/adxctl')]
             def control(action):
@@ -52,12 +52,12 @@ def main():
             with (out/'supervisor.log').open('w') as log:
                 process=subprocess.Popen(command+['run','--config',str(config)],stdout=log,stderr=subprocess.STDOUT)
                 try:
-                    first=wait(lambda:endpoint(redis_port));before=control('status');master=next(s for s in before['services'] if s['id']=='master')
+                    first=wait(lambda:endpoint(redis_port));before=control('status');coordinator=next(s for s in before['services'] if s['id']=='coordinator')
                     # This PID is a currently owned child reported by this run's supervisor.
-                    os.kill(master['pid'],signal.SIGKILL)
+                    os.kill(coordinator['pid'],signal.SIGKILL)
                     recovered=wait(lambda:(v if v and v['epoch']>first['epoch'] else None) if (v:=endpoint(redis_port)) is not None else None)
-                    after=control('status');new=next(s for s in after['services'] if s['id']=='master')
-                    assert new['pid']!=master['pid'] and new['restarts']>master['restarts']
+                    after=control('status');new=next(s for s in after['services'] if s['id']=='coordinator')
+                    assert new['pid']!=coordinator['pid'] and new['restarts']>coordinator['restarts']
                     control('stop');assert process.wait(timeout=10)==0
                     result.update(status='passed',initial_epoch=first['epoch'],recovered_epoch=recovered['epoch'],restarts=new['restarts'],clean_stop=True)
                 finally:

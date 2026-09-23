@@ -17,7 +17,7 @@ if sys.argv[1]=='l0':
 elif sys.argv[1]=='sdk':
     sdk_cases=[]
     if Path('/opt/adx/package/runtime/adx-runtime-rootfs.img').is_file():
-        from environment_spec import run
+        from runtime_profile import run
         runtime_result=E/'runtime-environment-result.json'
         run(connection,image,runtime_result)
         runtime_payload=json.loads(runtime_result.read_text())
@@ -77,7 +77,7 @@ elif sys.argv[1]=='capacity':
         event('Filling node1 and node2 resource capacity')
         instances=[create(),create()]
         event('Capacity holders: '+', '.join(s.id for s in instances))
-        records=[json.loads(v) for k,v in catalog().items() if k.startswith('capsule:')]
+        records=[json.loads(v) for k,v in catalog().items() if k.startswith('environment:')]
         held=[r for r in records if r.get('result') and r['result']['resources_held']]
         assert len(held)==2 and {r['assignment']['node_id'] for r in held}=={'node1','node2'}
         check_metrics('allocated',running=2,reserved=4000,pending=0)
@@ -120,7 +120,7 @@ elif sys.argv[1]=='failure-cleanup':
     for sid in json.loads((E/'live-instances.json').read_text()):Sandbox.delete(sid,connection=connection)
     records=catalog()
     for sid in json.loads((E/'live-instances.json').read_text()):
-        result=json.loads(records['capsule:'+sid])['result']
+        result=json.loads(records['environment:'+sid])['result']
         assert result['state']=='Deleted' and not result['resources_held']
     (E/'node-failure-result.json').write_text(json.dumps({'status':'passed',**observed,'reconnected_backend_empty':True,'cleanup_committed':True},indent=2))
     event('PASS: reconnected node cleaned old execution; healthy instance still executes; final deletion committed')

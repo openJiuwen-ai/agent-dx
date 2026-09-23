@@ -11,13 +11,13 @@ restart_limit: 2
 restart_delay_ms: 1000
 stop_timeout_seconds: 30
 services:
-  - id: master
-    role: master
+  - id: coordinator
+    role: coordinator
     config: {}
 "#;
 
 fn test_deployment(root: &std::path::Path) -> Deployment {
-    serde_json::from_value(json!({"schema_version":1,"package_dir":root,"state_dir":root,"redis_url":"redis://localhost:6379/","namespace":"test","restart_limit":2,"restart_delay_ms":20,"stop_timeout_seconds":3,"services":[{"id":"node","role":"node-manager","config":{"discovery":{"namespace":"wrong"},"proxy_socket":root.join("route.sock")},"env":{"ADX_DATA_PLANE_NODE_PROXY_ACTIVITY_UDS_DIR":root}},{"id":"master","role":"master","config":{}}]})).unwrap()
+    serde_json::from_value(json!({"schema_version":1,"package_dir":root,"state_dir":root,"redis_url":"redis://localhost:6379/","namespace":"test","restart_limit":2,"restart_delay_ms":20,"stop_timeout_seconds":3,"services":[{"id":"node","role":"adxlet","config":{"discovery":{"namespace":"wrong"},"proxy_socket":root.join("route.sock")},"env":{"ADX_DATA_PLANE_RELAY_ACTIVITY_UDS_DIR":root}},{"id":"coordinator","role":"coordinator","config":{}}]})).unwrap()
 }
 
 #[test]
@@ -107,13 +107,13 @@ namespace: profile-test
 logging:
   max_files: 9
 service_overrides:
-  node-manager:
+  adxlet:
     config:
       node_id: custom-node
       tls:
         certificate: /etc/adx/tls/custom-node.pem
     env:
-      ADX_DATA_PLANE_NODE_PROXY_BIND: 192.0.2.10:19002
+      ADX_DATA_PLANE_RELAY_BIND: 192.0.2.10:19002
 "#,
     )
     .unwrap();
@@ -131,9 +131,9 @@ service_overrides:
     let node = deployment
         .services
         .iter()
-        .find(|service| service.role == Role::NodeManager)
+        .find(|service| service.role == Role::Adxlet)
         .unwrap();
-    assert_eq!(node.role, Role::NodeManager);
+    assert_eq!(node.role, Role::Adxlet);
     assert_eq!(node.config["node_id"], "custom-node");
     assert_eq!(node.config["listen"], "0.0.0.0:19001");
     assert_eq!(node.config["tls"]["ca"], "/opt/adx/config/tls/ca.pem");
@@ -141,13 +141,10 @@ service_overrides:
         node.config["tls"]["certificate"],
         "/etc/adx/tls/custom-node.pem"
     );
-    assert_eq!(
-        node.env["ADX_DATA_PLANE_NODE_PROXY_BIND"],
-        "192.0.2.10:19002"
-    );
+    assert_eq!(node.env["ADX_DATA_PLANE_RELAY_BIND"], "192.0.2.10:19002");
     assert!(node
         .env
-        .contains_key("ADX_DATA_PLANE_NODE_PROXY_ACTIVITY_UDS_DIR"));
+        .contains_key("ADX_DATA_PLANE_RELAY_ACTIVITY_UDS_DIR"));
 
     let effective_path = root.path().join("effective.yaml");
     std::fs::write(&effective_path, deployment.effective_yaml().unwrap()).unwrap();
@@ -164,7 +161,7 @@ fn profile_configuration_rejects_unknown_roles_and_full_service_lists() {
             "unknown-role.yaml",
             r#"
 schema_version: 1
-profile: master
+profile: coordinator
 service_overrides:
   redis:
     config: {}
@@ -175,7 +172,7 @@ service_overrides:
             "mixed-mode.yaml",
             r#"
 schema_version: 1
-profile: master
+profile: coordinator
 services: []
 "#,
             "unknown field",
@@ -214,24 +211,29 @@ fn every_minimal_profile_resolves_to_its_expected_roles() {
             "",
             vec![
                 Role::Redis,
-                Role::Master,
-                Role::NodeManager,
+                Role::Coordinator,
+                Role::Adxlet,
                 Role::ApiServer,
-                Role::Edge,
+                Role::Ingress,
             ],
         ),
         (
             "standalone-external-redis",
             "",
-            vec![Role::Master, Role::NodeManager, Role::ApiServer, Role::Edge],
+            vec![
+                Role::Coordinator,
+                Role::Adxlet,
+                Role::ApiServer,
+                Role::Ingress,
+            ],
         ),
-        ("master", "", vec![Role::Master]),
+        ("coordinator", "", vec![Role::Coordinator]),
         (
             "node",
-            "service_overrides:\n  node-manager:\n    config:\n      node_id: worker-a\n",
-            vec![Role::NodeManager],
+            "service_overrides:\n  adxlet:\n    config:\n      node_id: worker-a\n",
+            vec![Role::Adxlet],
         ),
-        ("edge-api", "", vec![Role::ApiServer, Role::Edge]),
+        ("ingress-api", "", vec![Role::ApiServer, Role::Ingress]),
     ] {
         let path = root.path().join(format!("{profile}.yaml"));
         std::fs::write(
@@ -252,42 +254,42 @@ fn every_minimal_profile_resolves_to_its_expected_roles() {
 }
 
 #[test]
-fn edge_api_profile_embeds_edge_in_api_server_by_default() {
+fn ingress_api_profile_embeds_ingress_in_apiserver_by_default() {
     let root = tempfile::tempdir().unwrap();
     let mut deployment: Deployment = serde_saphyr::from_str(include_str!(
-        "../../../build/config/examples/deployment-edge-api.yaml"
+        "../../../build/config/examples/deployment-ingress-api.yaml"
     ))
     .unwrap();
     deployment.package_dir = root.path().join("package");
     deployment.state_dir = root.path().join("state");
 
-    let output = root.path().join("embedded-edge");
+    let output = root.path().join("embedded-ingress");
     let processes = deployment.render(&output).unwrap();
     assert_eq!(processes.len(), 1);
     let api = &processes[0];
     assert_eq!(api.role, Role::ApiServer);
-    assert_eq!(api.binary.file_name().unwrap(), "adx-api-server");
+    assert_eq!(api.binary.file_name().unwrap(), "adx-apiserver");
     assert_eq!(
         api.env
-            .get("ADX_DATA_PLANE_EDGE_FRONTEND_TLS_BIND")
+            .get("ADX_DATA_PLANE_INGRESS_TLS_BIND")
             .map(String::as_str),
         Some("0.0.0.0:8443")
     );
     let config: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(output.join("api-server.json")).unwrap()).unwrap();
-    assert_eq!(config["edge_mode"], "embedded");
-    assert_eq!(config["edge_control"]["namespace"], "adx");
+        serde_json::from_slice(&std::fs::read(output.join("apiserver.json")).unwrap()).unwrap();
+    assert_eq!(config["ingress_mode"], "embedded");
+    assert_eq!(config["ingress_control"]["namespace"], "adx");
     assert_eq!(
-        config["edge_control"]["tls"]["certificate"],
-        "/opt/adx/config/tls/edge.pem"
+        config["ingress_control"]["tls"]["certificate"],
+        "/opt/adx/config/tls/ingress.pem"
     );
-    assert!(!output.join("edge.json").exists());
+    assert!(!output.join("ingress.json").exists());
 }
 
 #[test]
-fn embedded_edge_accepts_identical_shared_environment_and_rejects_conflicts() {
+fn embedded_ingress_accepts_identical_shared_environment_and_rejects_conflicts() {
     let mut deployment: Deployment = serde_saphyr::from_str(include_str!(
-        "../../../build/config/examples/deployment-edge-api.yaml"
+        "../../../build/config/examples/deployment-ingress-api.yaml"
     ))
     .unwrap();
     let api = deployment
@@ -296,19 +298,19 @@ fn embedded_edge_accepts_identical_shared_environment_and_rejects_conflicts() {
         .find(|service| service.role == Role::ApiServer)
         .unwrap();
     api.env.insert("RUST_LOG".into(), "info".into());
-    let edge = deployment
+    let ingress = deployment
         .services
         .iter_mut()
-        .find(|service| service.role == Role::Edge)
+        .find(|service| service.role == Role::Ingress)
         .unwrap();
-    edge.env.insert("RUST_LOG".into(), "info".into());
+    ingress.env.insert("RUST_LOG".into(), "info".into());
 
     deployment.validate().unwrap();
 
     deployment
         .services
         .iter_mut()
-        .find(|service| service.role == Role::Edge)
+        .find(|service| service.role == Role::Ingress)
         .unwrap()
         .env
         .insert("RUST_LOG".into(), "debug".into());
@@ -317,10 +319,10 @@ fn embedded_edge_accepts_identical_shared_environment_and_rejects_conflicts() {
 }
 
 #[test]
-fn edge_api_profile_can_render_explicit_standalone_edge() {
+fn ingress_api_profile_can_render_explicit_standalone_ingress() {
     let root = tempfile::tempdir().unwrap();
     let mut deployment: Deployment = serde_saphyr::from_str(include_str!(
-        "../../../build/config/examples/deployment-edge-api.yaml"
+        "../../../build/config/examples/deployment-ingress-api.yaml"
     ))
     .unwrap();
     deployment.package_dir = root.path().join("package");
@@ -330,18 +332,18 @@ fn edge_api_profile_can_render_explicit_standalone_edge() {
         .iter_mut()
         .find(|service| service.role == Role::ApiServer)
         .unwrap()
-        .config["edge_mode"] = json!("standalone");
+        .config["ingress_mode"] = json!("standalone");
 
     let processes = deployment
-        .render(&root.path().join("standalone-edge"))
+        .render(&root.path().join("standalone-ingress"))
         .unwrap();
     assert_eq!(processes.len(), 2);
     assert!(processes
         .iter()
-        .any(|process| process.binary.file_name().unwrap() == "adx-api-server"));
+        .any(|process| process.binary.file_name().unwrap() == "adx-apiserver"));
     assert!(processes
         .iter()
-        .any(|process| process.binary.file_name().unwrap() == "adx-edge-frontend"));
+        .any(|process| process.binary.file_name().unwrap() == "adx-ingress"));
 }
 #[test]
 fn roles_order_common_discovery_and_private_configuration() {
@@ -351,7 +353,7 @@ fn roles_order_common_discovery_and_private_configuration() {
     let processes = deployment.render(&output_directory).unwrap();
     assert_eq!(
         processes.first().map(|process| process.role),
-        Some(Role::Master)
+        Some(Role::Coordinator)
     );
     let node: serde_json::Value =
         serde_json::from_slice(&std::fs::read(output_directory.join("node.json")).unwrap())
@@ -379,14 +381,14 @@ fn invalid_or_duplicate_ids_and_unknown_roles_fail() {
     let node_id = deployment
         .services
         .iter()
-        .find(|service| service.role == Role::NodeManager)
+        .find(|service| service.role == Role::Adxlet)
         .unwrap()
         .id
         .clone();
     deployment
         .services
         .iter_mut()
-        .find(|service| service.role == Role::Master)
+        .find(|service| service.role == Role::Coordinator)
         .unwrap()
         .id
         .clone_from(&node_id);
@@ -394,7 +396,7 @@ fn invalid_or_duplicate_ids_and_unknown_roles_fail() {
     deployment
         .services
         .iter_mut()
-        .find(|service| service.role == Role::Master)
+        .find(|service| service.role == Role::Coordinator)
         .unwrap()
         .id = "../escape".into();
     assert!(deployment.validate().is_err());
@@ -408,14 +410,14 @@ fn malformed_discovery_and_unbounded_timeouts_are_rejected() {
     deployment
         .services
         .iter_mut()
-        .find(|service| service.role == Role::NodeManager)
+        .find(|service| service.role == Role::Adxlet)
         .unwrap()
         .config["discovery"] = json!("invalid");
     assert!(deployment.validate().is_err());
     deployment
         .services
         .iter_mut()
-        .find(|service| service.role == Role::NodeManager)
+        .find(|service| service.role == Role::Adxlet)
         .unwrap()
         .config["discovery"] = json!({});
     deployment.stop_timeout_seconds = u64::MAX;
@@ -469,15 +471,15 @@ fn embedded_proxy_has_one_socket_owner_and_matches_control_path() {
     let node = deployment
         .services
         .iter_mut()
-        .find(|service| service.role == Role::NodeManager)
+        .find(|service| service.role == Role::Adxlet)
         .unwrap();
     node.config["proxy_socket"] = json!(proxy_directory.join("route.sock"));
     node.env.insert(
-        "ADX_DATA_PLANE_NODE_PROXY_ACTIVITY_UDS_DIR".into(),
+        "ADX_DATA_PLANE_RELAY_ACTIVITY_UDS_DIR".into(),
         proxy_directory.to_string_lossy().into_owned(),
     );
     deployment.validate().unwrap();
-    deployment.services.push(serde_json::from_value(json!({"id":"proxy","role":"node-proxy","config":{},"env":{"ADX_DATA_PLANE_NODE_PROXY_ACTIVITY_UDS_DIR":proxy_directory}})).unwrap());
+    deployment.services.push(serde_json::from_value(json!({"id":"proxy","role":"relay","config":{},"env":{"ADX_DATA_PLANE_RELAY_ACTIVITY_UDS_DIR":proxy_directory}})).unwrap());
     assert!(
         deployment.validate().is_err(),
         "two services cannot own the same binding socket"
@@ -486,7 +488,7 @@ fn embedded_proxy_has_one_socket_owner_and_matches_control_path() {
     let node = deployment
         .services
         .iter_mut()
-        .find(|service| service.role == Role::NodeManager)
+        .find(|service| service.role == Role::Adxlet)
         .unwrap();
     node.config["proxy_socket"] = json!(root.path().join("different.sock"));
     assert!(
@@ -496,7 +498,7 @@ fn embedded_proxy_has_one_socket_owner_and_matches_control_path() {
     deployment
         .services
         .iter_mut()
-        .find(|service| service.role == Role::NodeManager)
+        .find(|service| service.role == Role::Adxlet)
         .unwrap()
         .config["proxy_mode"] = json!("invalid");
     assert!(deployment.validate().is_err());
@@ -509,27 +511,23 @@ fn standalone_proxy_is_an_explicit_two_process_deployment() {
     let node = deployment
         .services
         .iter_mut()
-        .find(|service| service.role == Role::NodeManager)
+        .find(|service| service.role == Role::Adxlet)
         .unwrap();
     node.config["proxy_mode"] = json!("standalone");
     node.env.clear();
     deployment.services.push(
         serde_json::from_value(json!({
-            "id": "node-proxy",
-            "role": "node-proxy",
-            "env": {"ADX_DATA_PLANE_NODE_PROXY_ACTIVITY_UDS_DIR": root.path()}
+            "id": "relay",
+            "role": "relay",
+            "env": {"ADX_DATA_PLANE_RELAY_ACTIVITY_UDS_DIR": root.path()}
         }))
         .unwrap(),
     );
 
     deployment.validate().unwrap();
     let processes = deployment.render(&root.path().join("standalone")).unwrap();
-    assert!(processes
-        .iter()
-        .any(|process| process.role == Role::NodeProxy));
-    assert!(processes
-        .iter()
-        .any(|process| process.role == Role::NodeManager));
+    assert!(processes.iter().any(|process| process.role == Role::Relay));
+    assert!(processes.iter().any(|process| process.role == Role::Adxlet));
 }
 
 #[test]
@@ -539,15 +537,15 @@ fn default_embedded_mode_rejects_a_second_proxy_process() {
     let other = root.path().join("other-proxy");
     deployment.services.push(
         serde_json::from_value(json!({
-            "id": "node-proxy",
-            "role": "node-proxy",
-            "env": {"ADX_DATA_PLANE_NODE_PROXY_ACTIVITY_UDS_DIR": other}
+            "id": "relay",
+            "role": "relay",
+            "env": {"ADX_DATA_PLANE_RELAY_ACTIVITY_UDS_DIR": other}
         }))
         .unwrap(),
     );
 
     let error = deployment.validate().unwrap_err().to_string();
-    assert!(error.contains("embedded Node Proxy cannot be combined"));
+    assert!(error.contains("embedded Relay cannot be combined"));
 }
 
 #[test]
@@ -560,19 +558,19 @@ fn sandbox_api_discovery_defaults_and_overrides_are_usable() {
     deployment.state_dir = root.path().to_owned();
     deployment.render(&root.path().join("defaults")).unwrap();
     let generated: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(root.path().join("defaults/api-server.json")).unwrap(),
+        &std::fs::read(root.path().join("defaults/apiserver.json")).unwrap(),
     )
     .unwrap();
     assert_eq!(generated["discovery"]["poll_seconds"], 5);
-    let api_server = deployment
+    let apiserver = deployment
         .services
         .iter_mut()
         .find(|service| service.role == Role::ApiServer)
         .unwrap();
-    api_server.config["discovery"] = json!({"poll_seconds": 2});
+    apiserver.config["discovery"] = json!({"poll_seconds": 2});
     deployment.render(&root.path().join("override")).unwrap();
     let generated: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(root.path().join("override/api-server.json")).unwrap(),
+        &std::fs::read(root.path().join("override/apiserver.json")).unwrap(),
     )
     .unwrap();
     assert_eq!(generated["discovery"]["poll_seconds"], 2);
@@ -592,8 +590,8 @@ fn metrics_endpoints_are_preserved_by_deployment_rendering() {
     let root = tempfile::tempdir().unwrap();
     let mut deployment = test_deployment(root.path());
     for (role, address) in [
-        (Role::NodeManager, "127.0.0.1:19091"),
-        (Role::Master, "127.0.0.1:19090"),
+        (Role::Adxlet, "127.0.0.1:19091"),
+        (Role::Coordinator, "127.0.0.1:19090"),
     ] {
         deployment
             .services
@@ -604,7 +602,7 @@ fn metrics_endpoints_are_preserved_by_deployment_rendering() {
     }
     let output_directory = root.path().join("metrics-config");
     deployment.render(&output_directory).unwrap();
-    for (id, port) in [("node", 19091), ("master", 19090)] {
+    for (id, port) in [("node", 19091), ("coordinator", 19090)] {
         let config: serde_json::Value = serde_json::from_slice(
             &std::fs::read(output_directory.join(format!("{id}.json"))).unwrap(),
         )
@@ -617,21 +615,21 @@ fn metrics_endpoints_are_preserved_by_deployment_rendering() {
 fn unified_deployment_renders_control_and_data_plane_services() {
     let root = tempfile::tempdir().unwrap();
     let mut deployment = test_deployment(root.path());
-    let proxy_directory = root.path().join("node-proxy");
+    let proxy_directory = root.path().join("relay");
     deployment.services = serde_json::from_value(json!([
-        {"id":"master","role":"master"},
-        {"id":"api","role":"api-server"},
-        {"id":"edge","role":"edge"},
+        {"id":"coordinator","role":"coordinator"},
+        {"id":"api","role":"apiserver"},
+        {"id":"ingress","role":"ingress"},
         {
             "id":"proxy",
-            "role":"node-proxy",
+            "role":"relay",
             "env": {
-                "ADX_DATA_PLANE_NODE_PROXY_ACTIVITY_UDS_DIR": proxy_directory
+                "ADX_DATA_PLANE_RELAY_ACTIVITY_UDS_DIR": proxy_directory
             }
         },
         {
             "id":"node",
-            "role":"node-manager",
+            "role":"adxlet",
             "config":{"proxy_mode":"standalone"}
         }
     ]))
@@ -656,17 +654,17 @@ fn unified_deployment_renders_control_and_data_plane_services() {
         .collect::<std::collections::BTreeMap<_, _>>();
 
     let expected = std::collections::BTreeMap::from([
-        ("api", "adx-api-server".to_owned()),
-        ("master", "adx-master".to_owned()),
-        ("node", "adx-node-manager".to_owned()),
-        ("proxy", "adx-node-proxy".to_owned()),
+        ("api", "adx-apiserver".to_owned()),
+        ("coordinator", "adx-coordinator".to_owned()),
+        ("node", "adxlet".to_owned()),
+        ("proxy", "adx-relay".to_owned()),
     ]);
     assert_eq!(binaries, expected);
 }
 
 #[test]
 fn deployment_accepts_bounded_log_rotation_policy() {
-    let deployment: Deployment = serde_json::from_value(json!({"schema_version":1,"package_dir":"/tmp/package","state_dir":"/tmp/state","redis_url":"redis://localhost:6379/","namespace":"test","restart_limit":2,"restart_delay_ms":20,"stop_timeout_seconds":3,"services":[{"id":"master","role":"master","config":{}}],"logging":{"enabled":true,"max_file_bytes":1024,"rotate_seconds":60,"compress":true,"max_files":4,"max_age_seconds":3600,"max_total_bytes":8192}})).unwrap();
+    let deployment: Deployment = serde_json::from_value(json!({"schema_version":1,"package_dir":"/tmp/package","state_dir":"/tmp/state","redis_url":"redis://localhost:6379/","namespace":"test","restart_limit":2,"restart_delay_ms":20,"stop_timeout_seconds":3,"services":[{"id":"coordinator","role":"coordinator","config":{}}],"logging":{"enabled":true,"max_file_bytes":1024,"rotate_seconds":60,"compress":true,"max_files":4,"max_age_seconds":3600,"max_total_bytes":8192}})).unwrap();
     deployment.validate().unwrap();
 }
 
@@ -675,9 +673,9 @@ fn shipped_role_deployment_examples_are_valid() {
     let examples = [
         include_str!("../../../build/config/examples/deployment.yaml"),
         include_str!("../../../build/config/examples/deployment-standalone-managed-redis.yaml"),
-        include_str!("../../../build/config/examples/deployment-master.yaml"),
+        include_str!("../../../build/config/examples/deployment-coordinator.yaml"),
         include_str!("../../../build/config/examples/deployment-node.yaml"),
-        include_str!("../../../build/config/examples/deployment-edge-api.yaml"),
+        include_str!("../../../build/config/examples/deployment-ingress-api.yaml"),
     ];
 
     for example in examples {
@@ -690,12 +688,12 @@ fn shipped_role_deployment_examples_are_valid() {
 fn common_environment_is_rendered_to_node_and_api() {
     let root = tempfile::tempdir().unwrap();
     let environment = json!({"rootfs":{"runtime_class":"runsc","type":"local","path":"/opt/adx/root.img","readonly":false},
-       "bootstrap":{"type":"erofs","root":"/opt/adx/root.img","target":"/__adx","entrypoint":["/__adx/usr/local/bin/rrt-runtime"]}});
+       "bootstrap":{"type":"erofs","root":"/opt/adx/root.img","target":"/__adx","entrypoint":["/__adx/usr/local/bin/adx-execd"]}});
     let mut deployment = test_deployment(root.path());
-    deployment.environment = Some(serde_json::from_value(environment).unwrap());
+    deployment.runtime_profile = Some(serde_json::from_value(environment).unwrap());
     deployment
         .services
-        .push(serde_json::from_value(json!({"id":"api","role":"api-server","config":{}})).unwrap());
+        .push(serde_json::from_value(json!({"id":"api","role":"apiserver","config":{}})).unwrap());
     let output_directory = root.path().join("env-config");
     deployment.render(&output_directory).unwrap();
     for role in ["node", "api"] {
@@ -703,9 +701,9 @@ fn common_environment_is_rendered_to_node_and_api() {
             &std::fs::read(output_directory.join(format!("{role}.json"))).unwrap(),
         )
         .unwrap();
-        let actual: adx_core::environment::EnvironmentSpec =
-            serde_json::from_value(rendered_config["environment"].clone()).unwrap();
-        assert_eq!(Some(actual), deployment.environment);
+        let actual: adx_core::runtime_profile::RuntimeProfile =
+            serde_json::from_value(rendered_config["runtime_profile"].clone()).unwrap();
+        assert_eq!(Some(actual), deployment.runtime_profile);
     }
 }
 
@@ -714,12 +712,12 @@ fn common_oci_environment_is_rendered_to_node_and_api() {
     let root = tempfile::tempdir().unwrap();
     let image = "registry.local/adx-runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     let environment = json!({"rootfs":{"runtime_class":"runc","type":"image","image":image,"readonly":false},
-       "bootstrap":{"type":"image","image":image,"target":"/__adx","entrypoint":["/__adx/usr/local/bin/rrt-runtime"]}});
+       "bootstrap":{"type":"image","image":image,"target":"/__adx","entrypoint":["/__adx/usr/local/bin/adx-execd"]}});
     let mut deployment = test_deployment(root.path());
-    deployment.environment = Some(serde_json::from_value(environment).unwrap());
+    deployment.runtime_profile = Some(serde_json::from_value(environment).unwrap());
     deployment
         .services
-        .push(serde_json::from_value(json!({"id":"api","role":"api-server","config":{}})).unwrap());
+        .push(serde_json::from_value(json!({"id":"api","role":"apiserver","config":{}})).unwrap());
     let output_directory = root.path().join("oci-env-config");
     deployment.render(&output_directory).unwrap();
     for role in ["node", "api"] {
@@ -727,8 +725,11 @@ fn common_oci_environment_is_rendered_to_node_and_api() {
             &std::fs::read(output_directory.join(format!("{role}.json"))).unwrap(),
         )
         .unwrap();
-        assert_eq!(rendered_config["environment"]["rootfs"]["image"], image);
-        assert_eq!(rendered_config["environment"]["bootstrap"]["image"], image);
+        assert_eq!(rendered_config["runtime_profile"]["rootfs"]["image"], image);
+        assert_eq!(
+            rendered_config["runtime_profile"]["bootstrap"]["image"],
+            image
+        );
     }
 }
 
@@ -742,23 +743,23 @@ fn network_profile_removes_internal_certificates_but_keeps_public_https() {
     )
     .unwrap();
     let deployment = Deployment::load(&path).unwrap();
-    let master = deployment
+    let coordinator = deployment
         .services
         .iter()
-        .find(|s| s.role == Role::Master)
+        .find(|s| s.role == Role::Coordinator)
         .unwrap();
-    assert_eq!(master.config["tls"], json!({"mode": "network"}));
-    assert!(master.config["advertised_address"]
+    assert_eq!(coordinator.config["tls"], json!({"mode": "network"}));
+    assert!(coordinator.config["advertised_address"]
         .as_str()
         .unwrap()
         .starts_with("http://"));
     let node = deployment
         .services
         .iter()
-        .find(|s| s.role == Role::NodeManager)
+        .find(|s| s.role == Role::Adxlet)
         .unwrap();
     assert_eq!(node.config["tls"], json!({"mode": "network"}));
-    assert!(!node.env.contains_key("ADX_DATA_PLANE_NODE_PROXY_TLS_KEY"));
+    assert!(!node.env.contains_key("ADX_DATA_PLANE_RELAY_TLS_KEY"));
     let api = deployment
         .services
         .iter()
@@ -766,20 +767,16 @@ fn network_profile_removes_internal_certificates_but_keeps_public_https() {
         .unwrap();
     assert_eq!(api.config["internal_security"], "network");
     assert!(api.config.get("certificate").is_none());
-    let edge = deployment
+    let ingress = deployment
         .services
         .iter()
-        .find(|s| s.role == Role::Edge)
+        .find(|s| s.role == Role::Ingress)
         .unwrap();
-    assert_eq!(edge.config["tls"], json!({"mode": "network"}));
+    assert_eq!(ingress.config["tls"], json!({"mode": "network"}));
     assert_eq!(
-        edge.env["ADX_DATA_PLANE_EDGE_FRONTEND_NODE_SECURITY_MODE"],
+        ingress.env["ADX_DATA_PLANE_INGRESS_NODE_SECURITY_MODE"],
         "network"
     );
-    assert!(edge
-        .env
-        .contains_key("ADX_DATA_PLANE_EDGE_FRONTEND_TLS_CERT"));
-    assert!(edge
-        .env
-        .contains_key("ADX_DATA_PLANE_EDGE_FRONTEND_TLS_KEY"));
+    assert!(ingress.env.contains_key("ADX_DATA_PLANE_INGRESS_TLS_CERT"));
+    assert!(ingress.env.contains_key("ADX_DATA_PLANE_INGRESS_TLS_KEY"));
 }

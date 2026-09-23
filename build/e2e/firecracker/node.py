@@ -59,18 +59,18 @@ try:
  import urllib.request
  wait(lambda:urllib.request.urlopen('http://127.0.0.1:19090/minio/health/ready',timeout=2).status==200)
  subprocess.run(['python3',str(BASE/'e2e/firecracker/s3_probe.py'),str(RUN),'--create'],env=env,check=True)
- image=os.environ.get('ADX_E2E_RRT_IMAGE')
+ image=os.environ.get('ADX_E2E_EXECD_IMAGE')
  entrypoint_image=os.environ.get('ADX_E2E_ENTRYPOINT_IMAGE')
  if not image:
   registry=spawn('registry',['docker-registry','serve',RUN/'registry.yaml'])
   sys.path.insert(0,str(BASE/'e2e'))
   import publish
-  digest=publish.publish(str(BASE/'rrt.tar'))
-  image='127.0.0.1:5000/adx-rrt@'+digest
+  digest=publish.publish(str(BASE/'execd.tar'))
+  image='127.0.0.1:5000/adx-execd@'+digest
   entrypoint_digest=publish.publish(str(BASE/'entrypoint.tar'),'adx-entrypoint')
   entrypoint_image='127.0.0.1:5000/adx-entrypoint@'+entrypoint_digest
  if not entrypoint_image: raise ValueError('entrypoint test image is required')
- (E/'rrt-image.json').write_text(json.dumps({'image':image}))
+ (E/'execd-image.json').write_text(json.dumps({'image':image}))
  (E/'entrypoint-image.json').write_text(json.dumps({'image':entrypoint_image}))
  sandboxd=spawn('sandboxd',['sandboxd','--root',RUN/'sandboxd/root','--config',RUN/'sandboxd/config.toml','--socket',RUN/'sandboxd/sandboxd.sock','--http-address','127.0.0.1:18081','--pprof-address','127.0.0.1:16061','--log-file',E/'sandboxd-service.log'])
  wait(lambda:(RUN/'sandboxd/sandboxd.sock').exists())
@@ -92,7 +92,7 @@ try:
    (E/'snapshots-final.json').write_text(json.dumps(snapshots,indent=2)); return True
   return False
  wait(snapshots_collected)
- saved={k:json.loads(v) for k,v in catalog().items() if k.startswith('capsule:')}
+ saved={k:json.loads(v) for k,v in catalog().items() if k.startswith('environment:')}
  (E/'catalog-final.json').write_text(json.dumps(saved,indent=2))
  assert saved and all(i['result']['state']=='Deleted' and not i['result']['resources_held'] for i in saved.values()),saved
  inventory=run(['sbox','-a',RUN/'sandboxd/sandboxd.sock','list'])

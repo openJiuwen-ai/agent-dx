@@ -1,0 +1,31 @@
+{
+  "listen": "0.0.0.0:19000",
+  "redis_url": "redis://127.0.0.1:6379/",
+  "namespace": "adx",
+  "scheduler_shards": 1,
+  "placement": "pack",
+  "rpc_timeout_seconds": 30,
+  "tls": {
+    "ca": "/opt/adx/config/tls/ca.pem",
+    "certificate": "/opt/adx/config/tls/coordinator.pem",
+    "private_key": "/opt/adx/config/tls/coordinator.key",
+    "server_name": "adx.internal",
+    "peers": {
+      "apiserver": "/opt/adx/config/tls/apiserver.der",
+      "node:node-1": "/opt/adx/config/tls/node-1.der",
+      "ingress": "/opt/adx/config/tls/ingress.der"
+    }
+  },
+  "bootstrap_credentials": [
+    {
+      "key_file": "/opt/adx/config/secrets/admin-key",
+      "tenant_id": "admin",
+      "administrator": true,
+      "expires_at_unix_seconds": 0
+    }
+  ],
+  "advertised_address": "https://coordinator:19000",
+  "heartbeat_timeout_seconds": 30,
+  "discovery_ttl_seconds": 15,
+  "metrics_listen": "127.0.0.1:19090"
+}

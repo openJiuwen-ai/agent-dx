@@ -83,7 +83,7 @@ pub fn arguments(
         "-o".into(),
         "PreferredAuthentications=publickey".into(),
         "-o".into(),
-        "ControlMaster=no".into(),
+        "ControlCoordinator=no".into(),
         "-o".into(),
         "ControlPath=none".into(),
         "-o".into(),

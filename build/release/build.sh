@@ -19,17 +19,17 @@ case "$host" in
 esac
 stage=$(mktemp -d "${TMPDIR:-/tmp}/adx-build.XXXXXX")
 trap 'rm -rf "$stage"' EXIT
-echo "--- :rust: Compile control plane, gateway and RRT"
-cargo build --locked --release -j "$JOBS" -p adx-api-server -p adx-deployment -p adx-master -p adx-node-manager -p data-plane-gateway -p rrt-daemon --bins
-for name in adx-api-server adxctl adx-master adx-node-manager adx-edge-frontend adx-node-proxy adx-data-plane-forward rrt-runtime; do
+echo "--- :rust: Compile control plane, gateway and EXECD"
+cargo build --locked --release -j "$JOBS" -p adx-apiserver -p adx-deployment -p adx-coordinator -p adxlet -p data-plane-gateway -p adx-execd --bins
+for name in adx-apiserver adxctl adx-coordinator adxlet adx-ingress adx-relay adx-data-plane-forward adx-execd; do
  cp "$CARGO_TARGET_DIR/release/$name" "$stage/$name"
 done
 if [[ "$host" == *-linux-gnu ]]; then
   musl_target="${host%-gnu}-musl"
-  echo "--- :package: Static RRT and local EROFS runtime"
-  cargo build --locked --release --target "$musl_target" -j "$JOBS" -p rrt-daemon --bin rrt-runtime
-  cp "$CARGO_TARGET_DIR/$musl_target/release/rrt-runtime" "$stage/rrt-runtime"
-  "$PYTHON" build/runtime/rootfs.py --binary "$stage/rrt-runtime" --output "$stage/adx-runtime-rootfs.img"
+  echo "--- :package: Static EXECD and local EROFS runtime"
+  cargo build --locked --release --target "$musl_target" -j "$JOBS" -p adx-execd --bin adx-execd
+  cp "$CARGO_TARGET_DIR/$musl_target/release/adx-execd" "$stage/adx-execd"
+  "$PYTHON" build/runtime/rootfs.py --binary "$stage/adx-execd" --output "$stage/adx-runtime-rootfs.img"
 fi
 echo "--- :python: Build Sandbox SDK wheel"
 PYTHON="$PYTHON" bash platform/sdk/sandbox/python/build.sh "$stage/sdk"

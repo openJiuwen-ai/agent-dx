@@ -3,12 +3,12 @@
 ## 目标
 
 ADX 使用四条职责单一的 Buildkite 流水线：基础出包、Python Sandbox SDK 出包、
-Python 管理工具出包和 Full 端到端验收。基础出包流水线同时生成相互独立的 Platform 包、RRT 包和 Runtime
-Pack；RRT 不进入 Platform 包，但不单独占用一条流水线。构建只发生在前两条流水线；
+Python 管理工具出包和 Full 端到端验收。基础出包流水线同时生成相互独立的 Platform 包、Execd 包和 Runtime
+Pack；Execd 不进入 Platform 包，但不单独占用一条流水线。构建只发生在前两条流水线；
 Full 流水线消费不可变制品，不得从源码重新编译或替换二进制。
 
-最终发布由一个机器可读的 `release.json` 串联平台包、RRT、SDK、运行后端包、OCI
-镜像和部署包。进程部署与 Kubernetes 部署使用相同的二进制和版本关系。RRT 是
+最终发布由一个机器可读的 `release.json` 串联平台包、Execd、SDK、运行后端包、OCI
+镜像和部署包。进程部署与 Kubernetes 部署使用相同的二进制和版本关系。Execd 是
 独立的数据面运行时产品，不是 Platform Package 内的目录或附属二进制。
 
 ## 当前实现与调整边界
@@ -21,26 +21,26 @@ Full 流水线消费不可变制品，不得从源码重新编译或替换二进
 已经完成远端验证的 Buildkite 实体为 `agent-dx`、`agent-dx-python-sdk` 和
 `agent-dx-full-test`；`agent-dx-admin` 需要按仓库配置新建独立实体后执行首次验证。
 
-基础出包流水线现在将 Platform、Gateway、RRT 和 source gate 放在四个并行步骤中。
+基础出包流水线现在将 Platform、Gateway、Execd 和 source gate 放在四个并行步骤中。
 三个编译步骤使用独立 Cargo target，输出带提交、目标平台和逐文件 SHA256 的组件
 归档；`platform-build` 只下载、校验并组装这些归档，不重复编译。聚合后的
 `build-manifest.json` 绑定组件清单、基础包、sandboxd backend 和兼容 SDK wheel。
 
-现阶段兼容的一体化 `adx-release.tar.gz` 仍包含 RRT 和 SDK wheel。独立 SDK 流水线输出的 wheel、sdist 与
+现阶段兼容的一体化 `adx-release.tar.gz` 仍包含 Execd 和 SDK wheel。独立 SDK 流水线输出的 wheel、sdist 与
 `sdk-candidate.json` 是 Full 验收的 SDK 输入；Full 不使用基础包内的 wheel。继续拆分
-Platform、RRT 和 Runtime Pack 的归档属于后续包结构改造，不能把当前一体包描述成已经
+Platform、Execd 和 Runtime Pack 的归档属于后续包结构改造，不能把当前一体包描述成已经
 完成拆分。
 
 目标边界：
 
-- Platform 包不再包含 RRT 或 Python SDK，也不把 RRT payload 或 wheel 当作平台包
+- Platform 包不再包含 Execd 或 Python SDK，也不把 Execd payload 或 wheel 当作平台包
   完整性的必需文件。
-- 同一条基础出包流水线独立组装 RRT 静态二进制、EROFS payload 和 OCI 镜像，输出
-  单独的 RRT 版本、归档与候选清单。
+- 同一条基础出包流水线独立组装 Execd 静态二进制、EROFS payload 和 OCI 镜像，输出
+  单独的 Execd 版本、归档与候选清单。
 - Python SDK 独立测试、定版和发布。
 - sandboxd、runc、Firecracker 等执行后端进入独立 Runtime Pack；它们仍由部署环境
   托管，不并入 `adxctl` 的控制面进程监督范围。
-- Full 流水线下载平台、RRT、SDK、Runtime Pack 和镜像清单，核对关联关系后部署测试。
+- Full 流水线下载平台、Execd、SDK、Runtime Pack 和镜像清单，核对关联关系后部署测试。
 - 面向用户的一键离线包在 Full 流水线开始前组合，并使用同一份包完成安装验收；
   Full 通过后只提升已有字节，不重新打包。
 
@@ -58,7 +58,7 @@ Buildkite pipeline slug 为 `agent-dx`，配置入口为
 
 ### 步骤
 
-当前已落地的是 Linux AMD64 的 `build-platform`、`build-gateway`、`build-rrt`、
+当前已落地的是 Linux AMD64 的 `build-platform`、`build-gateway`、`build-execd`、
 `source-gate` 和 `platform-build` 组装链路。下面列出的多架构独立候选、package smoke、
 SBOM 和最终 `release.json` 是目标状态，不能作为当前流水线已经提供的能力。
 
@@ -69,10 +69,10 @@ SBOM 和最终 `release.json` 是目标状态，不能作为当前流水线已�
 2. `platform-build-{amd64,arm64}`
    - 使用固定 Rust/Go/Redis 工具链和持久 Cargo/sccache 缓存。
    - 每个架构只编译一次 ADX 控制面、Gateway 和 `adxctl`；平台无关的 `adxadmin` wheel 不进入原生编译。
-3. `rrt-build-{amd64,arm64}`
-   - 独立构建静态 `rrt-runtime`、本地 EROFS payload 和 RRT OCI 镜像。
-   - RRT 镜像只复制已验证二进制，不在 Dockerfile 中重新编译。
-   - 输出 RRT 协议版本、二进制/payload SHA256 和镜像 digest。
+3. `execd-build-{amd64,arm64}`
+   - 独立构建静态 `adx-execd`、本地 EROFS payload 和 Execd OCI 镜像。
+   - Execd 镜像只复制已验证二进制，不在 Dockerfile 中重新编译。
+   - 输出 Execd 协议版本、二进制/payload SHA256 和镜像 digest。
 4. `runtime-pack-{backend}-{arch}`
    - 从 `third_party/*/source.json` 指定的提交和补丁构建 sandboxd 与后端依赖。
    - 首期提供 `runc`；Firecracker 使用独立 KVM Runtime Pack。
@@ -83,11 +83,11 @@ SBOM 和最终 `release.json` 是目标状态，不能作为当前流水线已�
    - 只从已经验证的平台包制作控制面、Node 和 Gateway 镜像，不在 Dockerfile 中重新编译。
    - 输出不可变 digest、基础镜像 digest 和平台包 SHA256 的关联清单。
 7. `package-smoke-{arch}`
-   - 只使用前面步骤上传的 Platform、RRT 和 runc Runtime Pack，不读取 Cargo target
+   - 只使用前面步骤上传的 Platform、Execd 和 runc Runtime Pack，不读取 Cargo target
      或工作区内的临时二进制。
-   - 在单节点真实 Linux 环境启动 Redis、Master、内嵌 Edge 的 API Server、内嵌
-     Node Proxy 的 Node Manager、sandboxd 和包内 RRT。
-   - 验证服务就绪、API Key 鉴权、Capsule 创建/查询、RRT 命令、文件读写、显式删除、
+   - 在单节点真实 Linux 环境启动 Redis、Coordinator、内嵌 Ingress 的 API Server、内嵌
+     Relay 的 adxlet、sandboxd 和包内 Execd。
+   - 验证服务就绪、API Key 鉴权、Environment 创建/查询、Execd 命令、文件读写、显式删除、
      资源释放和 sandboxd inventory 清空。
    - 用例必须有界，不包含 checkpoint、节点失联、进程重启、日志滚动等待和多节点放置。
    - 使用仓库内固定的轻量 HTTP/数据面 smoke client，不临时构建或发布 Python SDK；
@@ -95,7 +95,7 @@ SBOM 和最终 `release.json` 是目标状态，不能作为当前流水线已�
    - 输出 JUnit、逐用例日志、组件日志、包/镜像身份、最终 inventory 和清理结果；
      缺失用例、跳过或清理失败均阻止候选生成。
 8. `candidate-index`
-   - 分别输出 `platform-candidate.json`、`rrt-candidate.json` 和 Runtime Pack 清单。
+   - 分别输出 `platform-candidate.json`、`execd-candidate.json` 和 Runtime Pack 清单。
    - 汇总清单记录提交、版本、架构、全部 SHA256/digest、兼容范围和同一个 Buildkite
      build ID，但不把三个归档重新合并。
 9. `obs-publish-{arch}`
@@ -110,25 +110,25 @@ SBOM 和最终 `release.json` 是目标状态，不能作为当前流水线已�
 ```text
 adx-platform-<version>-linux-<arch>.tar.zst
 adx-platform-<version>-linux-<arch>.tar.zst.sha256
-adx-rrt-<rrt-version>-linux-<arch>.tar.zst
-adx-rrt-<rrt-version>-rootfs-<arch>.erofs
+adx-execd-<execd-version>-linux-<arch>.tar.zst
+adx-execd-<execd-version>-rootfs-<arch>.erofs
 adx-runtime-runc-<runtime-version>-linux-<arch>.tar.zst
 adx-runtime-firecracker-<runtime-version>-linux-<arch>.tar.zst   # KVM 候选
 platform-candidate.json
-rrt-candidate.json
+execd-candidate.json
 platform-sbom.spdx.json
-rrt-sbom.spdx.json
+execd-sbom.spdx.json
 platform-images.json                                            # 全部使用 digest
-rrt-images.json
+execd-images.json
 logs/、junit/
 ```
 
-平台包对所有角色保持一致，通过每台主机自己的 YAML profile 启动 Master、Node、
-API Server（默认内嵌 Edge）或 Standalone，避免按角色维护多套二进制包；独立 Edge
+平台包对所有角色保持一致，通过每台主机自己的 YAML profile 启动 Coordinator、Node、
+API Server（默认内嵌 Ingress）或 Standalone，避免按角色维护多套二进制包；独立 Ingress
 二进制仍在同一平台包中供显式分进程配置使用。
 
 基础出包的 `source-gate` 负责单元、契约和静态检查，`package-smoke` 负责验证刚生成
-制品的最小真实闭环。它证明基础包可安装、可启动和可完成一次 Capsule 生命周期，
+制品的最小真实闭环。它证明基础包可安装、可启动和可完成一次 Environment 生命周期，
 但不替代 Full 流水线中的公共 SDK、多节点、故障和恢复验收。只有前述门禁通过的
 候选才允许进入 OBS；上传步骤失败时，该候选不具备可发布状态。`source-gate` 同时
 运行 `adxadmin` 的快速 HTTP/CLI 契约测试，但管理工具 wheel 仍按独立制品构建。
@@ -200,7 +200,7 @@ Buildkite pipeline slug 为 `agent-dx-full-test`，配置入口为
 
 输入必须是：
 
-- `ADX_BASE_PACKAGE_BUILD_ID`（同一构建中的 Platform、RRT 和 Runtime Pack）
+- `ADX_BASE_PACKAGE_BUILD_ID`（同一构建中的 Platform、Execd 和 Runtime Pack）
 - `ADX_SDK_BUILD_ID`
 - 目标架构和目标部署环境
 - 可选的 `ADX_FIRECRACKER_RUNTIME_BUILD_ID`
@@ -212,11 +212,11 @@ Buildkite pipeline slug 为 `agent-dx-full-test`，配置入口为
 ### 步骤
 
 1. `resolve-candidate`
-   - 从基础出包 build 下载相互独立的 Platform、RRT、Runtime Pack 清单和归档，
+   - 从基础出包 build 下载相互独立的 Platform、Execd、Runtime Pack 清单和归档，
      再下载 SDK 候选，核对提交、协议版本、兼容范围、架构和 SHA256。
    - 生成唯一 `release.json`，不允许用“最新”标签补齐缺失输入。
 2. `compose-offline-bundle`
-   - 将平台包、RRT 包、SDK、默认 runc Runtime Pack、部署模板和安装器组合成离线包。
+   - 将平台包、Execd 包、SDK、默认 runc Runtime Pack、部署模板和安装器组合成离线包。
    - 立即执行完整解包校验；后续用例使用这份离线包。
 3. `fresh-install`
    - 在干净 Linux 环境执行一键安装，验证目录权限、systemd/前台启动入口、
@@ -226,7 +226,7 @@ Buildkite pipeline slug 为 `agent-dx-full-test`，配置入口为
    - 覆盖 SDK、认证、容量、放置、本地优先、数据面、生命周期、节点故障、重启和停止。
    - `full` 要求两个 ADX Node Pod 位于不同物理 worker；保存实际 placement。
 5. `standalone-full`
-   - 使用同一离线包完成真实 sandboxd/RRT 的进程部署验收。
+   - 使用同一离线包完成真实 sandboxd/Execd 的进程部署验收。
    - 长耗时、日志滚动、Collector 重启和完整停机放在这里，不进入基础出包门禁。
 6. `firecracker-full`（条件步骤）
    - 只在明确标记的 KVM worker 上运行 pause/resume、snapshot、clone 和故障恢复。
@@ -246,7 +246,7 @@ Full 流水线建议每日和发版候选执行。每次提交的快速门禁只
 adx-platform-<version>-linux-<arch>/
 ├── bin/                         # 所有角色和 adxctl
 ├── etc/
-│   ├── profiles/                # standalone/master/node/edge-api
+│   ├── profiles/                # standalone/coordinator/node/ingress-api
 │   ├── examples/
 │   └── systemd/
 ├── install/
@@ -263,11 +263,11 @@ adx-platform-<version>-linux-<arch>/
 `/opt/adx/current`；`/opt/adx/config`、`/opt/adx/data` 和 `/opt/adx/run` 永远不放进
 release 目录，升级不得覆盖用户配置和状态。回滚只切换 `current` 并重启对应服务。
 
-### 2. RRT 包
+### 2. Execd 包
 
 ```text
-adx-rrt-<rrt-version>-linux-<arch>/
-├── bin/rrt-runtime
+adx-execd-<execd-version>-linux-<arch>/
+├── bin/adx-execd
 ├── payload/adx-runtime-rootfs.img
 ├── config/capabilities.json
 ├── manifest.json
@@ -275,8 +275,8 @@ adx-rrt-<rrt-version>-linux-<arch>/
 └── sbom.spdx.json
 ```
 
-RRT 包安装到 `/opt/adx/rrt/<rrt-version>`，由 `release.json` 选择当前受测版本。
-Platform 升级不隐式替换 RRT；安装器在切换版本前校验 Platform/RRT 协议兼容范围。
+Execd 包安装到 `/opt/adx/execd/<execd-version>`，由 `release.json` 选择当前受测版本。
+Platform 升级不隐式替换 Execd；安装器在切换版本前校验 Platform/Execd 协议兼容范围。
 
 ### 3. Runtime Pack
 
@@ -314,7 +314,7 @@ Runtime Pack 与平台包分开，是因为 runc 与 Firecracker 的宿主权限
 adx-offline-<release-version>-linux-<arch>.tar.zst
 ├── release.json
 ├── packages/platform.tar.zst
-├── packages/rrt.tar.zst
+├── packages/execd.tar.zst
 ├── packages/runtime-runc.tar.zst
 ├── packages/python/adx_sandbox-*.whl
 ├── packages/python/adxadmin-*.whl
@@ -336,10 +336,10 @@ adx-offline-<release-version>-linux-<arch>.tar.zst
   "release": "0.2.0",
   "commit": "<40-hex>",
   "platform": {"version": "0.2.0", "target": "linux-amd64", "sha256": "..."},
-  "rrt": {"version": "0.2.3", "protocol": 1, "sha256": "..."},
+  "execd": {"version": "0.2.3", "protocol": 1, "sha256": "..."},
   "sdk": {"name": "adx-sandbox", "version": "0.2.1", "sha256": "..."},
   "runtime": {"backend": "runc", "version": "sandboxd-efc2015.1", "sha256": "..."},
-  "images": {"node": "registry/adx-node@sha256:...", "rrt": "registry/adx-rrt@sha256:..."}
+  "images": {"node": "registry/adx-node@sha256:...", "execd": "registry/adx-execd@sha256:..."}
 }
 ```
 
@@ -376,27 +376,27 @@ chart 只组织现有进程、Secret、Service、持久卷和外部 sandboxd Run
 
 ## 版本与发布规则
 
-- Platform 使用 `vX.Y.Z`，RRT 使用独立版本字段，SDK 使用独立 `sdk-vX.Y.Z`，
-  Runtime Pack 使用后端提交和补丁集派生的不可变版本。Platform 与 RRT 可在同一次
+- Platform 使用 `vX.Y.Z`，Execd 使用独立版本字段，SDK 使用独立 `sdk-vX.Y.Z`，
+  Runtime Pack 使用后端提交和补丁集派生的不可变版本。Platform 与 Execd 可在同一次
   基础出包构建中生成，但必须是两个独立归档和两个独立 manifest。
-- `release.json` 才定义一次 ADX 产品发布中 Platform、RRT、SDK 和 Runtime Pack 的
+- `release.json` 才定义一次 ADX 产品发布中 Platform、Execd、SDK 和 Runtime Pack 的
   受测组合。
 - 候选构建、Full 测试和正式发布使用同一份字节；正式发布只复制或提升制品。
 - 所有归档提供 SHA256、SBOM、来源提交和 Buildkite build ID；后续可增加签名，校验
   流程预留签名字段。
-- Platform OCI 镜像由已验证平台包构建，RRT OCI 镜像由已验证 RRT 包构建；各自必须
+- Platform OCI 镜像由已验证平台包构建，Execd OCI 镜像由已验证 Execd 包构建；各自必须
   在清单中反向记录来源包 SHA256。
 - `latest` 只作为人类便利标签，不进入安装、测试或发布清单。
 
 ## 实施顺序
 
-1. 已把基础构建拆为 Platform、Gateway、RRT 三个组件归档，并由独立组装步骤生成
-   当前兼容基础包和 `build-manifest.json`；下一步拆成 Platform 与 RRT 两个正式候选，
+1. 已把基础构建拆为 Platform、Gateway、Execd 三个组件归档，并由独立组装步骤生成
+   当前兼容基础包和 `build-manifest.json`；下一步拆成 Platform 与 Execd 两个正式候选，
    同时升级 package manifest schema。
 2. 已新增三份 pipeline YAML；`.buildkite/pipeline.yml` 只负责按 pipeline slug 动态
    上传 package、sdk 或 full 配置。
 3. 已增加 SDK 候选清单校验器，并让 Full 显式消费基础包和 SDK build UUID；继续增加
-   完整 `release.json`，并拆分 Platform、RRT 与 Runtime Pack 候选清单。
+   完整 `release.json`，并拆分 Platform、Execd 与 Runtime Pack 候选清单。
 4. 完成版本化安装目录、`install.sh` 和 fresh-install 测试。
 5. 增加 `adxctl deploy` 与 systemd 模板，再提供离线包。
 6. 最后增加 Helm chart；复用经过 Full 验证的镜像 digest 和同一份 release 清单。

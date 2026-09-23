@@ -1,6 +1,6 @@
 //! Request-scoped precomputation, shared by every Filter/Score candidate.
 use crate::Snapshot;
-use adx_core::{scheduling::*, CapsuleSpec};
+use adx_core::{scheduling::*, EnvironmentSpec};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Default)]
@@ -21,7 +21,7 @@ pub struct Prepared {
     pub spread: Vec<BTreeMap<String, u64>>,
 }
 impl Prepared {
-    pub fn new(r: &CapsuleSpec, snapshot: &Snapshot) -> Self {
+    pub fn new(r: &EnvironmentSpec, snapshot: &Snapshot) -> Self {
         let peers = |term: &PeerTerm| {
             let mut result = PeerMatches::default();
             let tenants = if term.tenants.is_empty() {
@@ -85,10 +85,10 @@ impl Prepared {
             })
             .collect();
         for id in &snapshot.reverse_anti {
-            let p = &snapshot.capsules[id];
+            let p = &snapshot.environments[id];
             if p.spec.tenant_id == r.tenant_id
                 && p.spec.scheduling.placement_groups.iter().any(|g| {
-                    g.target == PlacementTarget::Capsule
+                    g.target == PlacementTarget::Environment
                         && g.required
                         && g.anti
                         && g.terms

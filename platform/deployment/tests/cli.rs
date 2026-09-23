@@ -167,7 +167,7 @@ async fn initializes_a_compact_profile_that_resolves_to_the_full_deployment() {
             "schema_version: 1\n",
             "profile: node\n",
             "service_overrides:\n",
-            "  node-manager:\n",
+            "  adxlet:\n",
             "    config:\n",
             "      node_id: \"${ADX_NODE_ID}\"\n",
         )
@@ -176,11 +176,11 @@ async fn initializes_a_compact_profile_that_resolves_to_the_full_deployment() {
     let deployment = adx_deployment::config::Deployment::load(&path).unwrap();
     assert_eq!(deployment.services.len(), 1);
     let node = deployment.services.first().unwrap();
-    assert_eq!(node.role, Role::NodeManager);
+    assert_eq!(node.role, Role::Adxlet);
     assert_eq!(node.config["node_id"], "worker-test");
     assert!(node
         .env
-        .contains_key("ADX_DATA_PLANE_NODE_PROXY_ACTIVITY_UDS_DIR"));
+        .contains_key("ADX_DATA_PLANE_RELAY_ACTIVITY_UDS_DIR"));
 }
 
 #[tokio::test]

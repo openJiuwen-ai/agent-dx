@@ -1,5 +1,7 @@
 # OCI 运行环境与本地优先创建 K8s 验收
 
+> 历史记录：命令、组件和产物名称对应当时版本；当前命名见 [组件命名](../architecture/naming.md)。
+
 2026-09-18，[Buildkite #30](https://buildkite.com/agent-dx/agent-dx/builds/30) 对提交
 `363e44f1b28f1a792a4b9935c5bd27034fba9926` 完成正式 Kubernetes 验收。`platform-build`、
 `platform-images` 和 `platform-e2e` 三个步骤全部通过；发布清单记录 `dirty=false` 和

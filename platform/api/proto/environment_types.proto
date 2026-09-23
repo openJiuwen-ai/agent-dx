@@ -1,0 +1,224 @@
+syntax = "proto3";
+
+package adx.control.v1;
+
+message Resources {
+  uint64 cpu_millis = 1;
+  uint64 memory_bytes = 2;
+  uint64 disk_bytes = 3;
+}
+
+message EnvironmentSpec {
+  RuntimeProfile runtime_profile = 11;
+  optional string snapshot_id = 10;
+  string id = 1;
+  string tenant_id = 2;
+  string image = 3;
+  string runtime_class = 4;
+  Resources resources = 5;
+  int32 priority = 6;
+  SchedulingPolicy scheduling = 7;
+  map<string,string> env = 8;
+  LifecyclePolicy lifecycle = 9;
+  SandboxOptions sandbox = 12;
+}
+
+message S3Source {
+  string endpoint = 1;
+  string bucket = 2;
+  string object = 3;
+  string access_key_id = 4;
+  string access_key_secret = 5;
+}
+
+message StorageSource {
+  oneof source {
+    string image = 1;
+    S3Source s3 = 2;
+    string local = 3;
+  }
+}
+
+message RootfsSpec { bool readonly = 1; StorageSource source = 2; }
+message MountSpec {
+  string type = 1;
+  string target = 2;
+  repeated string options = 3;
+  StorageSource source = 4;
+}
+
+enum NetworkAction { NETWORK_ACTION_UNSPECIFIED = 0; NETWORK_ACTION_ALLOW = 1; NETWORK_ACTION_DENY = 2; }
+enum NetworkDirection { NETWORK_DIRECTION_UNSPECIFIED = 0; NETWORK_DIRECTION_INGRESS = 1; NETWORK_DIRECTION_EGRESS = 2; NETWORK_DIRECTION_BOTH = 3; }
+enum NetworkProtocol { NETWORK_PROTOCOL_UNSPECIFIED = 0; NETWORK_PROTOCOL_ANY = 1; NETWORK_PROTOCOL_TCP = 2; NETWORK_PROTOCOL_UDP = 3; NETWORK_PROTOCOL_ICMP = 4; }
+enum TrafficMode { TRAFFIC_MODE_UNSPECIFIED = 0; TRAFFIC_MODE_STATELESS = 1; TRAFFIC_MODE_STATEFUL = 2; }
+message PortRange { uint32 first = 1; uint32 last = 2; }
+message NetworkPeer { string address = 1; uint32 port = 2; string cidr = 3; string domain = 4; PortRange port_range = 5; }
+message NetworkRule {
+  NetworkAction action = 1;
+  NetworkDirection direction = 2;
+  NetworkProtocol protocol = 3;
+  NetworkPeer peer = 4;
+  uint32 sandbox_port = 5;
+  PortRange sandbox_port_range = 6;
+  uint32 priority = 7;
+}
+message TrafficPolicy {
+  NetworkAction ingress_default_action = 1;
+  NetworkAction egress_default_action = 2;
+  repeated NetworkRule rules = 3;
+  TrafficMode mode = 4;
+}
+message DnsRule { NetworkAction action = 1; string pattern = 2; }
+message DnsPolicy { NetworkAction default_action = 1; repeated DnsRule rules = 2; }
+message NetworkPolicy { TrafficPolicy traffic = 1; DnsPolicy dns = 2; }
+
+enum DataPlaneSecurityMode {
+  DATA_PLANE_SECURITY_INHERIT = 0;
+  DATA_PLANE_SECURITY_TLS = 1;
+  DATA_PLANE_SECURITY_TLS_TOKEN = 2;
+}
+message DataPlanePolicy {
+  DataPlaneSecurityMode tunnel = 1;
+  DataPlaneSecurityMode port_forward = 2;
+}
+message ResourceLimits { uint64 cpu_millis = 1; uint64 memory_bytes = 2; uint64 disk_bytes = 3; }
+message SandboxOptions {
+  RootfsSpec rootfs = 1;
+  repeated MountSpec mounts = 2;
+  NetworkPolicy network = 3;
+  DataPlanePolicy data_plane = 4;
+  repeated uint32 ports = 5;
+  bool failover = 6;
+  bool inherit_entrypoint = 7;
+  ResourceLimits limits = 8;
+  string extra_config = 9;
+}
+
+message LifecyclePolicy { uint64 idle_timeout_seconds = 1; RestartPolicy restart = 2; }
+
+message RestartPolicy { uint32 max_attempts = 1; uint64 initial_backoff_seconds = 2; uint64 max_backoff_seconds = 3; }
+
+message Assignment {
+  string environment_id = 1;
+  string node_id = 2;
+  uint32 shard_id = 3;
+  // Generation is allocated durably by Coordinator before a real backend is started.
+  // Persisted ownership and execution fencing must survive process restarts.
+  uint64 generation = 4;
+  repeated DeviceAllocation devices = 5;
+}
+
+enum EnvironmentState {
+  ENVIRONMENT_STATE_UNSPECIFIED = 0;
+  ENVIRONMENT_STATE_PENDING = 1;
+  ENVIRONMENT_STATE_STARTING = 2;
+  ENVIRONMENT_STATE_RUNNING = 3;
+  ENVIRONMENT_STATE_DELETING = 4;
+  ENVIRONMENT_STATE_DELETED = 5;
+  ENVIRONMENT_STATE_FAILED = 6;
+  ENVIRONMENT_STATE_PAUSING = 7;
+  ENVIRONMENT_STATE_PAUSED = 8;
+  ENVIRONMENT_STATE_RESUMING = 9;
+}
+
+message EnvironmentRecord {
+  EnvironmentSpec spec = 1;
+  Assignment assignment = 2;
+  EnvironmentState state = 3;
+  uint64 revision = 4;
+  Runtime runtime = 5;
+  // Failed does not imply the backend is absent or its capacity can be reused.
+  bool resources_held = 6;
+  reserved 7;
+  RestorePoint checkpoint = 8;
+  CompletedOperation last_operation = 9;
+  uint32 restart_attempts = 10;
+  bool restart_pending = 11;
+}
+
+message Runtime { string id = 1; string ip = 2; }
+
+enum Durability {
+  DURABILITY_UNSPECIFIED = 0;
+  DURABILITY_PUBLISHED = 1;
+  DURABILITY_JOURNALED = 2;
+}
+
+message EnvironmentResult {
+  EnvironmentRecord record = 1;
+  Durability durability = 2;
+}
+
+message CallerContext { string tenant_id = 1; bool administrator = 2; }
+
+enum DeviceKind { DEVICE_KIND_UNSPECIFIED = 0; DEVICE_KIND_GPU = 1; DEVICE_KIND_NPU = 2; }
+
+message Device { uint32 id = 1; DeviceKind kind = 2; string model = 3; bool healthy = 4; }
+
+message DeviceRequest { DeviceKind kind = 1; optional string model = 2; uint32 count = 3; }
+
+message DeviceAllocation { uint32 id = 1; DeviceKind kind = 2; string model = 3; }
+
+enum SelectorOp { SELECTOR_OP_UNSPECIFIED = 0; SELECTOR_OP_IN = 1; SELECTOR_OP_NOT_IN = 2; SELECTOR_OP_EXISTS = 3; SELECTOR_OP_DOES_NOT_EXIST = 4; SELECTOR_OP_GT = 5; SELECTOR_OP_LT = 6; }
+
+message LabelRequirement { string key = 1; SelectorOp op = 2; repeated string values = 3; }
+
+message LabelSelector { map<string,string> match_labels = 1; repeated LabelRequirement expressions = 2; }
+
+message WeightedSelector { LabelSelector selector = 1; uint32 weight = 2; }
+
+message PeerTerm { LabelSelector selector = 1; string topology_key = 2; repeated string tenants = 3; }
+
+message WeightedPeer { PeerTerm term = 1; uint32 weight = 2; }
+
+enum SpreadMode { SPREAD_MODE_UNSPECIFIED = 0; SPREAD_MODE_DO_NOT_SCHEDULE = 1; SPREAD_MODE_SCHEDULE_ANYWAY = 2; }
+
+message TopologySpread { string topology_key = 1; LabelSelector selector = 2; uint32 max_skew = 3; uint32 min_domains = 4; SpreadMode when_unsatisfiable = 5; }
+
+enum PlacementTarget { PLACEMENT_TARGET_UNSPECIFIED = 0; PLACEMENT_TARGET_NODE = 1; PLACEMENT_TARGET_ENVIRONMENT = 2; }
+
+message PlacementGroup {
+  PlacementTarget target = 1;
+  repeated WeightedSelector terms = 2;
+  bool required = 3;
+  bool anti = 4;
+  bool ordered = 5;
+}
+
+message SchedulingPolicy {
+  map<string,string> labels = 1;
+  repeated DeviceRequest devices = 2;
+  repeated LabelSelector required_node = 3;
+  repeated WeightedSelector preferred_node = 4;
+  repeated PeerTerm required_affinity = 5;
+  repeated PeerTerm required_anti_affinity = 6;
+  repeated WeightedPeer preferred_affinity = 7;
+  repeated WeightedPeer preferred_anti_affinity = 8;
+  repeated TopologySpread topology_spread = 9;
+  repeated PlacementGroup placement_groups = 10;
+}
+
+message CheckpointArtifact { string storage = 1; string location = 2; uint64 size_bytes = 3; }
+
+message RuntimeIdentity { string environment_id = 1; string runtime_id = 2; uint64 ownership_generation = 3; }
+
+message RestorePoint { RuntimeIdentity origin = 5; string id = 1; CheckpointArtifact artifact = 2; uint64 expires_at_unix_seconds = 3; string source_runtime_id = 4; }
+
+enum LifecycleKind { LIFECYCLE_KIND_UNSPECIFIED = 0; LIFECYCLE_KIND_PAUSE = 1; LIFECYCLE_KIND_RESUME = 2; LIFECYCLE_KIND_SNAPSHOT = 3; LIFECYCLE_KIND_NETWORK = 4; LIFECYCLE_KIND_RELOAD = 5; }
+
+message CompletedOperation { string id = 1; LifecycleKind kind = 2; uint64 expected_revision = 3; }
+
+message RuntimeProfile {
+  RuntimeRootfs rootfs = 1;
+  RuntimeBootstrap bootstrap = 2;
+  map<string,string> env = 3;
+}
+message RuntimeRootfs { string runtime_class = 1; string type = 2; string path = 3; bool readonly = 4; string image = 5; }
+message RuntimeBootstrap {
+  string type = 1;
+  string root = 2;
+  string target = 3;
+  repeated string entrypoint = 4;
+  string image = 5;
+  string image_process_config = 6;
+}

@@ -1,6 +1,6 @@
 """Acceptance for the installed, unmodified complete deployment example."""
 CASES=('validate and render installed example','all five example roles ready with auto resources',
-       'administrator creates tenant key through HTTPS Edge','SDK command and binary file round trip',
+       'administrator creates tenant key through HTTPS Ingress','SDK command and binary file round trip',
        'explicit instance deletion','supervisor stop deletes remaining instance')
 def verify(result):
     if (result.get('status')!='passed' or result.get('profile')!='standalone'

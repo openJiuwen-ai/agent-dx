@@ -41,7 +41,7 @@ for _ in range(100):
         time.sleep(.05)
 else:
     raise AssertionError('API Server did not listen')
-# Readiness requires both the Capsule directory and the local-first node view.
+# Readiness requires both the Environment directory and the local-first node view.
 for _ in range(100):
     if call('DELETE', '/api/sandbox/absent')[0] == 404:
         break
