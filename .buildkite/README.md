@@ -4,7 +4,7 @@ ADX uses four Buildkite pipelines backed by one repository:
 
 | Buildkite pipeline | Configuration | Responsibility |
 |---|---|---|
-| `agent-dx` | `pipeline-package.yml` | Platform/Execd/SDK/adxadmin UT and packages, install smoke, real Kubernetes L0, optional OBS and PyPI publication |
+| `agent-dx` | `pipeline-package.yml` | Platform/Execd/SDK/adxadmin UT and packages, install smoke, real Kubernetes L0, default OBS upload and optional PyPI publication |
 | `agent-dx-python-sdk` | `pipeline-sdk.yml` | Python SDK tests, wheel/sdist, clean install smoke and optional OBS/PyPI publication |
 | `agent-dx-admin` | `pipeline-admin.yml` | Standalone adxadmin UT, wheel/sdist, install smoke and optional PyPI publication |
 | `agent-dx-full-test` | `pipeline-full.yml` | Compose exact base/SDK candidates and run the ten-group Kubernetes Full gate |
@@ -25,12 +25,12 @@ The optimized base build completed in 3 minutes 30 seconds, compared with
 groups on two physical workers with no missing checks or cleanup errors.
 ## Pipeline controls
 
-Publication is opt-in; ordinary builds retain candidates without publishing to a package index.
+Base builds publish verified candidates to OBS by default. PyPI publication remains opt-in.
 Set these variables on a Buildkite build or in that pipeline's environment settings.
 
 | Variable | Default | Applies to / responsibility |
 |---|---|---|
-| `ADX_OBS_UPLOAD` | `0` | Base/SDK: `1` publishes final artifacts to OBS |
+| `ADX_OBS_UPLOAD` | base `1`, SDK `0` | `0` disables OBS upload for the selected pipeline |
 | `ADX_OBS_UPLOAD_CHANNEL` | `daily` | Base/SDK: `daily` or `release` |
 | `ADX_RELEASE_VERSION` | tag-derived | OBS release path version |
 | `ADX_OBS_BUCKET` / `ADX_OBS_ENDPOINT` | `openyuanrong` / `obs.cn-southwest-2.myhuaweicloud.com` | OBS intermediate transport and final publication destination |
@@ -42,9 +42,9 @@ Set these variables on a Buildkite build or in that pipeline's environment setti
 | `ADX_BASE_PACKAGE_BUILD_ID` / `ADX_SDK_BUILD_ID` | required | Full: exact input candidates; Full never publishes Python packages |
 
 Boolean controls accept only `0` or `1`. Component transport is independent of
-formal publication: `ADX_OBS_UPLOAD=0` still permits intermediate OBS transfers
+final publication: `ADX_OBS_UPLOAD=0` still permits intermediate OBS transfers
 when `ADX_ARTIFACT_TRANSPORT=obs`. To build without OBS, select `buildkite` and
-leave `ADX_OBS_UPLOAD=0`. Missing OBS credentials or corrupt files fail the job;
+set `ADX_OBS_UPLOAD=0`. Missing OBS credentials or corrupt files fail the job;
 there is no silent transport fallback. Temporary artifacts use
 `adx/ci/<build UUID>/<commit>/<component>/`, with commit/build/group and SHA256
 checked before extraction. Configure bucket retention for this temporary prefix
@@ -64,9 +64,13 @@ The base package ships `adxctl`, `adx-coordinator`, `adxlet`, `adx-apiserver`
 and Redis. Ingress runs inside API Server; Relay runs inside adxlet. Separate
 Ingress/Relay executables and the debug forwarder are not compiled or archived
 by release steps. Execd and the SDK remain in the unified release archive.
-Set `ADX_OBS_UPLOAD=1` to upload verified local outputs at the end of
-`platform-build`, including adxadmin candidates. The same job publishes
+By default, `platform-build` uploads verified local outputs, including
+adxadmin candidates. The same job publishes
 `out/buildkite/obs/manifest.json` and URLs without downloading the assembled package again.
+The independent `artifact-manifest` step reads this manifest and uploads
+`out/buildkite/index.html` to Buildkite Artifacts with links, sizes and SHA256
+for every OBS object. Set `ADX_OBS_UPLOAD=0` to skip final OBS publication;
+the index then links to the Buildkite artifact list.
 
 ## Base artifact set and L0 gate
 
@@ -389,7 +393,8 @@ Failures still publish a summary and retain their original exit status.
 
 ## OBS artifact publication
 
-Set `ADX_OBS_UPLOAD=1` to publish final artifacts from the base assembly job.
+The base assembly job publishes final artifacts by default. Set
+`ADX_OBS_UPLOAD=0` to disable this publication for a build.
 The local release archive, package manifest, build manifest, admin candidate and
 sandboxd backend bundle are verified before upload. No product binary is rebuilt.
 
@@ -417,11 +422,14 @@ ID, object URL, size and SHA256 for every file. The uploader reads object
 metadata back and rejects an absent object or a size mismatch. The same manifest
 and a compact `urls.txt` are retained under `out/buildkite/obs/`; the manifest
 URL is also stored as Buildkite metadata `obs-manifest-url`.
+The following `artifact-manifest` step validates the manifest's commit and
+Buildkite build ID before generating `out/buildkite/index.html`. Its HTML is a
+Buildkite artifact, with OBS links for each file and the manifest itself.
 
 The base pipeline uploads the release archive, release manifest and verified
 runc Runtime Pack. The SDK pipeline's `sdk-obs` step separately verifies and
-uploads its wheel, sdist and `sdk-candidate.json`. Set `ADX_OBS_UPLOAD=1` on the
-pipeline that owns the candidate. Neither upload result is a Full deployment
+uploads its wheel, sdist and `sdk-candidate.json`. The standalone SDK pipeline
+still requires `ADX_OBS_UPLOAD=1`. Neither upload result is a Full deployment
 acceptance verdict; Full consumes the two exact Buildkite build UUIDs.
 
 ## Firecracker checkpoint profile
