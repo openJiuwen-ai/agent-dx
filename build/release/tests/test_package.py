@@ -24,6 +24,29 @@ class PackageTests(unittest.TestCase):
             (out/"bin/adxctl").write_bytes(b"changed")
             with self.assertRaises(ValueError):pkg.verify(out)
             with self.assertRaises(ValueError):pkg.assemble(binaries,redis,wheel,out,"a"*40,True,"test-fixture","debug")
+    def test_embedded_package_excludes_split_process_binaries(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            binaries = root / "bin"
+            binaries.mkdir()
+            embedded = {"adxctl", "adx-coordinator", "adxlet", "adx-apiserver"}
+            split = {"adx-ingress", "adx-relay", "adx-data-plane-forward"}
+            for name in embedded | split | {"adx-execd"}:
+                (binaries / name).write_bytes(b"fixture")
+            redis = root / "redis"
+            redis.write_text("#!/bin/sh\necho 'Redis server v=7.2.5 sha=fixture'\n")
+            redis.chmod(0o700)
+            wheel = root / "adx_sandbox-1-py3-none-any.whl"
+            wheel.write_bytes(b"fixture")
+            output = root / "package"
+            manifest = pkg.assemble(binaries, redis, wheel, output, "a" * 40,
+                                    True, "test-fixture", "debug")
+            self.assertEqual({p.name for p in (output / "bin").iterdir()},
+                             embedded | {"redis-server"})
+            for name in split:
+                self.assertNotIn(f"bin/{name}", manifest["files"])
+            pkg.verify(output)
+
     def test_missing_artifact_never_creates_package(self):
         with tempfile.TemporaryDirectory() as t:
             root=Path(t);out=root/"package"

@@ -1,5 +1,7 @@
 # adxlet 与 Relay 进程模式
 
+当前发布包只提供默认共进程部署：`adx-apiserver` 内嵌 Ingress，`adxlet` 内嵌 Relay。独立 `adx-ingress`、`adx-relay` 和 `adx-data-plane-forward` 不随包发布；分进程能力保留在源码中，使用时需自行构建对应二进制。
+
 `gateway::node::RelayService` 统一持有数据监听、健康监听、绑定控制服务和连接任务。`adx-relay` 直接托管该服务；adxlet 通过 `proxy_mode` 选择是否在本进程托管它。
 
 ## 共进程（默认）
