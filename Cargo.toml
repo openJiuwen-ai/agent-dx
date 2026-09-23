@@ -5,6 +5,7 @@ members = [
     "agent/crates/store",
     "agent/activator",
     "agent/api",
+    "agent/cli",
     "gateway/api-server",
     "gateway",
     "crates/error",

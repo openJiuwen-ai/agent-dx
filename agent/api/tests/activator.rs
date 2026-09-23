@@ -1,5 +1,10 @@
 use adx_activator::Activator;
-use adx_agent_api::{activator::ActivatorClient, managed::ManagedService, Error};
+use adx_agent_api::{
+    activator::{ActivatorClient, Control},
+    local::LocalControl,
+    managed::ManagedService,
+    Error,
+};
 use adx_agent_core::{sandbox::*, *};
 use adx_agent_store::{AgentState, MemoryRepository};
 use std::{
@@ -9,6 +14,9 @@ use std::{
     },
     time::Duration,
 };
+fn context() -> adx_agent_api::request::RequestContext {
+    adx_agent_api::request::RequestContext::new(Duration::from_secs(3))
+}
 const TOKEN: &str = "test-activator-token-at-least-32-bytes";
 struct Backend(AtomicUsize);
 #[async_trait::async_trait]
@@ -47,6 +55,7 @@ async fn authenticated_services_observe_environment_deletion_and_recreation() {
     ));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
+    let local = Arc::new(LocalControl::new(activator.clone()));
     let app = adx_activator::server::router(activator, TOKEN, Duration::from_secs(3)).unwrap();
     let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -63,39 +72,83 @@ async fn authenticated_services_observe_environment_deletion_and_recreation() {
         .unwrap(),
     );
     let service = ManagedService::new(client.clone());
-    let other_gateway = ManagedService::new(client.clone());
+    let other_gateway = ManagedService::new(local.clone());
     let template:TemplateVersion=serde_json::from_value(serde_json::json!({"name":"app","version":"1","image":"app:1","isolation_runtime":"runc","entrypoint":["/start"],"resources":{"cpu_millis":1000,"memory_mib":512},"service":[{"protocol":"http","port":8080}]})).unwrap();
-    service.publish("tenant", &template).await.unwrap();
+    other_gateway
+        .publish(&context(), "tenant", &template)
+        .await
+        .unwrap();
+    service
+        .publish(&context(), "tenant", &template)
+        .await
+        .unwrap();
     let scope = Scope {
         tenant: "tenant".into(),
         template: "app".into(),
         version: "1".into(),
         environment_id: "env".into(),
     };
-    let env = service.create_environment(&scope).await.unwrap();
     assert!(matches!(
-        service.resolve(&scope, Protocol::Ssh, None).await,
+        service
+            .resolve(&context(), &scope, Protocol::Ssh, None)
+            .await,
         Err(Error::Invalid(_))
     ));
     assert_eq!(backend.0.load(Ordering::SeqCst), 0);
-    let first = service.resolve(&scope, Protocol::Http, None).await.unwrap();
+    assert!(matches!(
+        service.environment(&context(), &scope).await,
+        Err(Error::NotFound)
+    ));
+    let first = service
+        .resolve(&context(), &scope, Protocol::Http, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        local.create_environment(&context(), &scope).await.unwrap(),
+        first.0.environment
+    );
+    let page = other_gateway
+        .list_environments(
+            &context(),
+            &activator::EnvironmentList {
+                tenant: "tenant".into(),
+                template: "app".into(),
+                version: "1".into(),
+                page_size: 10,
+                page_token: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.environments, vec![first.0.environment.clone()]);
+    let env = service.environment(&context(), &scope).await.unwrap();
     let other_target = other_gateway
-        .resolve(&scope, Protocol::Http, None)
+        .resolve(&context(), &scope, Protocol::Http, None)
         .await
         .unwrap();
     assert_eq!(first, other_target);
     assert_eq!(first.0.environment, env);
-    other_gateway.delete_environment(&scope).await.unwrap();
-    assert!(matches!(
-        service.resolve(&scope, Protocol::Http, None).await,
-        Err(Error::NotFound)
-    ));
-    let fresh = other_gateway.create_environment(&scope).await.unwrap();
+    other_gateway
+        .delete_environment(&context(), &scope)
+        .await
+        .unwrap();
+    let fresh = service
+        .resolve(&context(), &scope, Protocol::Http, None)
+        .await
+        .unwrap()
+        .0
+        .environment;
     assert_ne!(fresh.generation, env.generation);
     assert_ne!(fresh.sandbox_id, env.sandbox_id);
+    assert!(matches!(
+        local
+            .activate(&context(), &scope, Some(&env.generation))
+            .await,
+        Err(Error::Conflict(_))
+    ));
     assert_eq!(
         service
-            .resolve(&scope, Protocol::Http, None)
+            .resolve(&context(), &scope, Protocol::Http, None)
             .await
             .unwrap()
             .0

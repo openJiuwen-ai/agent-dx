@@ -89,6 +89,14 @@ async fn deletion_cas_retry_cannot_delete_recreated_environment() {
         async fn get(&self, k: &Key) -> Result<Option<Record>> {
             self.inner.get(k).await
         }
+        async fn page(
+            &self,
+            index: &Index,
+            after: Option<&str>,
+            limit: usize,
+        ) -> Result<Vec<(String, Record)>> {
+            self.inner.page(index, after, limit).await
+        }
         async fn commit(&self, t: &Transaction) -> Result<bool> {
             if self.pause.swap(false, Ordering::SeqCst) {
                 self.entered.notify_one();
@@ -124,4 +132,108 @@ async fn deletion_cas_retry_cannot_delete_recreated_environment() {
     repo.resume.notify_one();
     assert!(matches!(deleting.await.unwrap(), Err(Error::Conflict(_))));
     assert_eq!(state.environment(&scope).await.unwrap().unwrap(), fresh);
+}
+
+async fn environment_pages(repo: Arc<dyn Repository>) {
+    use adx_agent_core::activator::EnvironmentList;
+    let state = AgentState::new(repo);
+    let template = serde_json::from_value(serde_json::json!({"name":"app","version":"1","image":"app:1","isolation_runtime":"runc","entrypoint":["/start"],"resources":{"cpu_millis":1000,"memory_mib":512}})).unwrap();
+    for tenant in ["a", "b"] {
+        state.publish(tenant, &template).await.unwrap();
+        for id in ["one", "two", "three"] {
+            state
+                .create_environment(Scope {
+                    tenant: tenant.into(),
+                    template: "app".into(),
+                    version: "1".into(),
+                    environment_id: id.into(),
+                })
+                .await
+                .unwrap();
+        }
+    }
+    let query = EnvironmentList {
+        tenant: "a".into(),
+        template: "app".into(),
+        version: "1".into(),
+        page_size: 2,
+        page_token: None,
+    };
+    let first = state.list_environments(&query).await.unwrap();
+    assert_eq!(first.environments.len(), 2);
+    assert!(first.environments.iter().all(|e| e.scope.tenant == "a"));
+    let mut next = EnvironmentList {
+        page_token: first.next_page_token.clone(),
+        ..query.clone()
+    };
+    let last = state.list_environments(&next).await.unwrap();
+    assert_eq!(last.environments.len(), 1);
+    assert!(last.next_page_token.is_none());
+    assert!(!first.environments.contains(&last.environments[0]));
+    next.tenant = "b".into();
+    assert!(matches!(
+        state.list_environments(&next).await,
+        Err(Error::Invalid(_))
+    ));
+    let deleting = state
+        .begin_delete(&first.environments[0].scope)
+        .await
+        .unwrap();
+    let full = EnvironmentList {
+        page_size: 50,
+        ..query.clone()
+    };
+    assert!(state
+        .list_environments(&full)
+        .await
+        .unwrap()
+        .environments
+        .contains(&deleting));
+    state.finish_delete(&deleting).await.unwrap();
+    let remaining = state.list_environments(&full).await.unwrap();
+    assert_eq!(remaining.environments.len(), 2);
+    let fresh = state
+        .create_environment(deleting.scope.clone())
+        .await
+        .unwrap();
+    state.finish_delete(&deleting).await.unwrap();
+    assert!(state
+        .list_environments(&full)
+        .await
+        .unwrap()
+        .environments
+        .contains(&fresh));
+    assert!(state
+        .list_environments(&EnvironmentList {
+            page_token: Some("invalid".into()),
+            ..query.clone()
+        })
+        .await
+        .is_err());
+    assert!(state
+        .list_environments(&EnvironmentList {
+            page_size: 0,
+            ..query
+        })
+        .await
+        .is_err());
+}
+
+#[cfg(feature = "test-memory")]
+#[tokio::test]
+async fn memory_environment_pagination() {
+    environment_pages(Arc::new(MemoryRepository::default())).await;
+}
+
+#[tokio::test]
+#[ignore = "requires ADX_AGENT_TEST_REDIS_URL for a disposable real Redis"]
+async fn redis_environment_pagination() {
+    let url = std::env::var("ADX_AGENT_TEST_REDIS_URL").unwrap();
+    let namespace = format!("pages-{}", uuid::Uuid::new_v4());
+    environment_pages(Arc::new(
+        RedisRepository::connect(&url, &namespace, std::time::Duration::from_secs(3))
+            .await
+            .unwrap(),
+    ))
+    .await;
 }

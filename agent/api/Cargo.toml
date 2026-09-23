@@ -13,13 +13,14 @@ workspace = true
 async-trait = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 adx-agent-core = { path = "../crates/core" }
+adx-activator = { path = "../activator" }
+adx-agent-store = { path = "../crates/store" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["sync", "time", "macros"] }
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
-adx-activator = { path = "../activator" }
 axum = { version = "0.7", default-features = false, features = ["http1", "json", "tokio"] }
 adx-agent-store = { path = "../crates/store", features = ["test-memory"] }
 async-trait = "0.1"

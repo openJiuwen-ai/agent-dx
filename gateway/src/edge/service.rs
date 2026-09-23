@@ -25,6 +25,8 @@ pub struct EdgeFrontendService {
     watcher: Arc<MasterConnection>,
     store: Arc<RouteStore>,
     route_changes: broadcast::Receiver<RouteChange>,
+    #[cfg(feature = "agent-api")]
+    ssh: Option<super::ssh::SshListener>,
 }
 
 impl EdgeFrontendService {
@@ -36,9 +38,11 @@ impl EdgeFrontendService {
         #[cfg(not(feature = "agent-api"))]
         if std::env::var_os("ADX_SANDBOX_CONFIG").is_some()
             || std::env::var_os("ADX_AGENT_CONFIG").is_some()
+            || std::env::var_os("ADX_INLINE_CONFIG").is_some()
+            || std::env::var_os("ADX_SSH_CONFIG").is_some()
         {
             return Err(
-                "ADX_SANDBOX_CONFIG requires a Gateway built with --features agent-api".into(),
+                "Sandbox, Agent, inline and SSH configuration require a Gateway built with --features agent-api".into(),
             );
         }
         let tls_listener = TcpListener::bind(config.tls_bind).await?;
@@ -72,13 +76,23 @@ impl EdgeFrontendService {
             use super::agent_api::{AgentApi, AgentConfig};
             let settings: AgentConfig = serde_json::from_slice(&std::fs::read(path)?)
                 .map_err(|_| "invalid Agent configuration")?;
+            let backend = sandbox_api.as_ref().map(|api| api.backend.clone());
+            Some(Arc::new(
+                AgentApi::new(settings, backend).await.map_err(send_error)?,
+            ))
+        } else {
+            None
+        };
+        #[cfg(feature = "agent-api")]
+        let inline_api = if let Ok(path) = std::env::var("ADX_INLINE_CONFIG") {
+            use super::inline_api::{InlineApi, InlineConfig};
+            let settings: InlineConfig = serde_json::from_slice(&std::fs::read(path)?)
+                .map_err(|_| "invalid inline compatibility configuration")?;
             let sandbox = sandbox_api
                 .as_ref()
-                .ok_or("Agent APIs require ADX_SANDBOX_CONFIG")?;
+                .ok_or("inline APIs require ADX_SANDBOX_CONFIG")?;
             Some(Arc::new(
-                AgentApi::new(settings, sandbox.backend.clone())
-                    .await
-                    .map_err(send_error)?,
+                InlineApi::new(settings, sandbox.backend.clone()).map_err(send_error)?,
             ))
         } else {
             None
@@ -117,13 +131,30 @@ impl EdgeFrontendService {
         } else {
             gateway
         };
+        #[cfg(feature = "agent-api")]
+        let gateway = if let Some(api) = &inline_api {
+            gateway.with_inline_api(api.clone())
+        } else {
+            gateway
+        };
+        let gateway = Arc::new(gateway);
+        #[cfg(feature = "agent-api")]
+        let ssh = if let Ok(path) = std::env::var("ADX_SSH_CONFIG") {
+            let settings = serde_json::from_slice(&std::fs::read(path)?)
+                .map_err(|_| "invalid SSH configuration")?;
+            Some(super::ssh::SshListener::bind(settings, gateway.clone()).await?)
+        } else {
+            None
+        };
         Ok(Self {
+            #[cfg(feature = "agent-api")]
+            ssh,
             config,
             tls_listener,
             plain_listener,
             health_listener,
             tls_acceptor,
-            gateway: Arc::new(gateway),
+            gateway,
             watcher,
             store,
             route_changes,
@@ -144,12 +175,23 @@ impl EdgeFrontendService {
             watcher,
             store,
             route_changes,
+            #[cfg(feature = "agent-api")]
+            ssh,
         } = self;
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let watcher_task = tokio::spawn(watcher.run(store));
         let route_reconciler_task =
             tokio::spawn(gateway.clone().run_route_reconciler(route_changes));
         let mut listeners = JoinSet::new();
+        #[cfg(feature = "agent-api")]
+        if let Some(ssh) = ssh {
+            let shutdown = shutdown_rx.clone();
+            listeners.spawn(async move {
+                ssh.serve(shutdown)
+                    .await
+                    .map_err(|error| Box::new(error) as ServiceError)
+            });
+        }
         let gateway_for_tls = gateway.clone();
         let shutdown_for_tls = shutdown_rx.clone();
         listeners.spawn(async move {

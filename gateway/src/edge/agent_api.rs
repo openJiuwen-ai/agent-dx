@@ -1,238 +1,129 @@
 //! Agent transport composition. Management JSON is separate from unchanged data forwarding.
+use adx_agent_api::request::RequestContext;
 use adx_agent_api::{
-    activator::ActivatorClient,
+    activator::{ActivatorClient, Control},
+    local::LocalControl,
     managed::ManagedService,
-    management::{InlineProfile, InlineService, Options},
     Error,
 };
-use adx_agent_core::{inline::CreateRequest, sandbox::Sandbox, Protocol, Scope, TemplateVersion};
-use adx_agent_core::{limits, transport::RequestProgress};
+use adx_agent_core::limits;
+use adx_agent_core::{sandbox::Sandbox, Protocol, Scope, TemplateVersion};
 use bytes::Bytes;
-use http::{Request, Response, StatusCode};
-use http_body_util::{BodyExt, Full};
+use http::{Request, Response};
+use http_body_util::BodyExt;
 use serde::Deserialize;
 use std::{sync::Arc, time::Duration};
 
 #[derive(Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Mode {
-    InlineOnly,
-    Both,
-}
-#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ActivatorConfig {
+pub struct RemoteActivatorConfig {
     pub urls: Vec<String>,
     pub token_env: String,
-    pub timeout_seconds: u64,
     pub ca_path: Option<String>,
     #[serde(default)]
     pub allow_plaintext: bool,
 }
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivatorMode {
+    #[default]
+    Embedded,
+    Remote,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EmbeddedActivatorConfig {
+    pub redis_url: String,
+    pub namespace: String,
+}
+
+fn default_timeout_seconds() -> u64 {
+    limits::AGENT_REQUEST_TIMEOUT.as_secs()
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentConfig {
-    pub mode: Mode,
-    pub inline_profiles: Vec<InlineProfile>,
-    pub backend_timeout_seconds: u64,
-    pub max_inflight: usize,
-    pub activator: Option<ActivatorConfig>,
+    #[serde(default)]
+    pub mode: ActivatorMode,
+    #[serde(default = "default_timeout_seconds")]
+    pub timeout_seconds: u64,
+    pub embedded: Option<EmbeddedActivatorConfig>,
+    pub remote: Option<RemoteActivatorConfig>,
 }
 pub struct AgentApi {
-    pub inline: Arc<InlineService>,
-    pub managed: Option<Arc<ManagedService>>,
-    pub activator: Option<Arc<ActivatorClient>>,
+    pub managed: Arc<ManagedService>,
+    pub request_timeout: Duration,
 }
 impl AgentApi {
+    /// Assemble local or remote control. Embedded mode requires the local Sandbox capability.
+    /// Configuration and Redis startup failures prevent Edge readiness.
     pub async fn new(
         config: AgentConfig,
-        sandbox: Arc<dyn Sandbox>,
+        sandbox: Option<Arc<dyn Sandbox>>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let inline = Arc::new(InlineService::new(
-            sandbox,
-            Options {
-                profiles: config.inline_profiles,
-                backend_timeout: Duration::from_secs(config.backend_timeout_seconds),
-                max_inflight: config.max_inflight,
-            },
-        )?);
-        let (managed, activator) = match (config.mode, config.activator) {
-            (Mode::InlineOnly, None) => (None, None),
-            (Mode::InlineOnly, Some(_)) => {
-                return Err("inline_only cannot configure Activator".into())
+        let request_timeout = Duration::from_secs(config.timeout_seconds);
+        if request_timeout.is_zero()
+            || tokio::time::Instant::now()
+                .checked_add(request_timeout)
+                .is_none()
+        {
+            return Err(
+                Error::Invalid("Agent timeout must be positive and representable".into()).into(),
+            );
+        }
+        let control: Arc<dyn Control> = match (config.mode, config.embedded, config.remote) {
+            (ActivatorMode::Embedded, Some(settings), None) => {
+                let sandbox = sandbox.ok_or_else(|| {
+                    Error::Invalid("embedded Activator requires ADX_SANDBOX_CONFIG".into())
+                })?;
+                Arc::new(
+                    LocalControl::connect(&settings.redis_url, &settings.namespace, sandbox)
+                        .await?,
+                )
             }
-            (Mode::Both, None) => return Err("both mode requires Activator settings".into()),
-            (Mode::Both, Some(settings)) => {
-                let token = std::env::var(&settings.token_env)
-                    .map_err(|_| "Activator token environment variable missing")?;
+            (ActivatorMode::Remote, None, Some(settings)) => {
+                let token = std::env::var(&settings.token_env).map_err(|_| {
+                    Error::Invalid("Activator token environment variable missing".into())
+                })?;
                 let ca = settings.ca_path.map(std::fs::read).transpose()?;
-                let activator = Arc::new(ActivatorClient::new(
+                Arc::new(ActivatorClient::new(
                     settings.urls,
                     token,
-                    Duration::from_secs(settings.timeout_seconds),
+                    request_timeout,
                     ca.as_deref(),
                     settings.allow_plaintext,
-                )?);
-                let managed = Arc::new(ManagedService::new(activator.clone()));
-                (Some(managed), Some(activator))
+                )?)
+            }
+            _ => {
+                return Err(Error::Invalid(
+                    "configure exactly the selected Activator mode: embedded or remote".into(),
+                )
+                .into())
             }
         };
         Ok(Self {
-            inline,
-            managed,
-            activator,
+            managed: Arc::new(ManagedService::new(control)),
+            request_timeout,
         })
     }
     pub fn matches(path: &str) -> bool {
-        path == "/api/agent" || path.starts_with("/api/agent/")
+        path == "/api/agent/v2" || path.starts_with("/api/agent/v2/")
     }
     pub async fn management(
         &self,
         request: Request<hyper::body::Incoming>,
         tenant: &str,
     ) -> Response<super::server::ProxyBody> {
-        let trace = match request.headers().get("x-trace-id") {
-            Some(value) => match value.to_str() {
-                Ok(v)
-                    if !v.trim().is_empty()
-                        && v.len() <= limits::IDENTIFIER_BYTES
-                        && !v.chars().any(char::is_control) =>
-                {
-                    v.to_owned()
-                }
-                _ => return error_response(Error::Invalid("invalid X-Trace-Id".into()), None),
-            },
-            None => uuid::Uuid::new_v4().to_string(),
-        };
-        let progress = RequestProgress::default();
-        let budget = if request.uri().path().starts_with("/api/agent/v2/") {
-            self.activator
-                .as_ref()
-                .map(|client| client.request_budget())
-                .unwrap_or(limits::AGENT_REQUEST_TIMEOUT)
-        } else {
-            limits::AGENT_REQUEST_TIMEOUT
-        };
-        let result =
-            tokio::time::timeout(budget, self.management_inner(request, tenant, &progress))
-                .await
-                .unwrap_or_else(|_| {
-                    Err(if progress.may_have_written() {
-                        Error::OutcomeUnknown(
-                            "Agent operation timed out; inspect the original identity".into(),
-                        )
-                    } else {
-                        Error::Unavailable("Agent read or request admission timed out".into())
-                    })
-                });
-        match result {
-            Ok(value) => json_response(StatusCode::OK, &value, Some(&trace)),
-            Err(error) => error_response(error, Some(&trace)),
-        }
-    }
-    async fn management_inner(
-        &self,
-        request: Request<hyper::body::Incoming>,
-        tenant: &str,
-        progress: &RequestProgress,
-    ) -> Result<serde_json::Value, Error> {
-        if request.uri().path().starts_with("/api/agent/v2/") {
-            return self.managed_management(request, tenant, progress).await;
-        }
-        let (parts, body) = request.into_parts();
-        let suffix = parts
-            .uri
-            .path()
-            .strip_prefix("/api/agent")
-            .ok_or(Error::NotFound)?;
-        let id = if suffix.is_empty() {
-            None
-        } else {
-            Some(
-                suffix
-                    .strip_prefix('/')
-                    .filter(|s| uuid::Uuid::parse_str(s).is_ok())
-                    .ok_or(Error::NotFound)?,
-            )
-        };
-        if parts.uri.query().is_some() {
-            return Err(Error::Invalid(
-                "inline management does not accept query parameters".into(),
-            ));
-        }
-        match (parts.method, id) {
-            (http::Method::POST, None) => {
-                let raw = http_body_util::Limited::new(body, limits::HTTP_JSON_BYTES)
-                    .collect()
-                    .await
-                    .map_err(|_| {
-                        Error::Invalid("invalid or oversized Agent create request".into())
-                    })?
-                    .to_bytes();
-                let request: CreateRequest = serde_json::from_slice(&raw).map_err(|_| {
-                    Error::Invalid("invalid report-backed inline create JSON".into())
-                })?;
-                progress.start_write();
-                Ok(
-                    serde_json::to_value(self.inline.create(tenant, request).await?)
-                        .expect("created response"),
-                )
-            }
-            (http::Method::GET, Some(id)) => {
-                Ok(serde_json::json!({"code":200,"instance":self.inline.get(tenant,id).await?}))
-            }
-            (http::Method::DELETE, Some(id)) => {
-                progress.start_write();
-                self.inline.kill(tenant, id).await?;
-                Ok(serde_json::json!({"code":200,"status":"deleted"}))
-            }
-            _ => Err(Error::NotFound),
-        }
-    }
-}
-pub(super) fn error_response(
-    error: Error,
-    trace: Option<&str>,
-) -> Response<super::server::ProxyBody> {
-    let status = match &error {
-        Error::Invalid(_) => StatusCode::BAD_REQUEST,
-        Error::Unsupported(_) => StatusCode::NOT_IMPLEMENTED,
-        Error::NotFound => StatusCode::NOT_FOUND,
-        Error::Conflict(_) => StatusCode::CONFLICT,
-        Error::NotReady(_) | Error::Unavailable(_) | Error::OutcomeUnknown(_) => {
-            StatusCode::SERVICE_UNAVAILABLE
-        }
-    };
-    json_response(
-        status,
-        &serde_json::json!({"code":status.as_u16(),"message":error.to_string(),"error":error}),
-        trace,
-    )
-}
-fn json_response(
-    status: StatusCode,
-    value: &serde_json::Value,
-    trace: Option<&str>,
-) -> Response<super::server::ProxyBody> {
-    let mut response = Response::builder()
-        .status(status)
-        .header("content-type", "application/json");
-    if let Some(trace) = trace {
-        response = response.header("x-trace-id", trace);
-    }
-    response
-        .body(
-            Full::new(Bytes::from(
-                serde_json::to_vec(value).expect("Agent response"),
-            ))
-            .map_err(
-                |never: std::convert::Infallible| -> Box<dyn std::error::Error + Send + Sync> {
-                    match never {}
-                },
-            )
-            .boxed_unsync(),
+        super::agent_response::management(
+            request,
+            self.request_timeout,
+            |request, ctx| async move { self.managed_management(request, tenant, &ctx).await },
         )
-        .expect("validated Agent response")
+        .await
+    }
 }
 
 #[derive(Deserialize)]
@@ -258,23 +149,13 @@ fn segment(value: &str) -> Result<String, Error> {
     Ok(value)
 }
 impl AgentApi {
-    fn managed(&self) -> Result<&ManagedService, Error> {
-        self.managed
-            .as_deref()
-            .ok_or_else(|| Error::Unavailable("managed Agent mode is disabled".into()))
-    }
     async fn managed_management(
         &self,
         request: Request<hyper::body::Incoming>,
         tenant: &str,
-        progress: &RequestProgress,
+        ctx: &RequestContext,
     ) -> Result<serde_json::Value, Error> {
         let (parts, body) = request.into_parts();
-        if parts.uri.query().is_some() {
-            return Err(Error::Invalid(
-                "managed APIs do not accept query parameters".into(),
-            ));
-        }
         let path: Vec<_> = parts
             .uri
             .path()
@@ -282,11 +163,21 @@ impl AgentApi {
             .ok_or(Error::NotFound)?
             .split('/')
             .collect();
-        let managed = self.managed()?;
+        let listing = parts.method == http::Method::GET
+            && matches!(
+                path.as_slice(),
+                ["templates", _, "versions", _, "environments"]
+            );
+        if !listing && parts.uri.query().is_some() {
+            return Err(Error::Invalid(
+                "this managed API does not accept query parameters".into(),
+            ));
+        }
+        let managed = &self.managed;
         if path == ["templates"] && parts.method == http::Method::POST {
             let input: TemplateVersion = decode_body(body).await?;
-            progress.start_write();
-            managed.publish(tenant, &input).await?;
+
+            managed.publish(ctx, tenant, &input).await?;
             return Ok(serde_json::json!({"template":input}));
         }
         let ["templates", name, "versions", version, rest @ ..] = path.as_slice() else {
@@ -294,9 +185,37 @@ impl AgentApi {
         };
         let name = segment(name)?;
         let version = segment(version)?;
+        if rest == ["environments"] && parts.method == http::Method::GET {
+            let mut query = adx_agent_core::activator::EnvironmentList {
+                tenant: tenant.into(),
+                template: name,
+                version,
+                page_size: adx_agent_core::activator::default_page_size(),
+                page_token: None,
+            };
+            let mut seen = std::collections::BTreeSet::new();
+            for (key, value) in
+                url::form_urlencoded::parse(parts.uri.query().unwrap_or("").as_bytes())
+            {
+                if !seen.insert(key.to_string()) {
+                    return Err(Error::Invalid("duplicate pagination parameter".into()));
+                }
+                match key.as_ref() {
+                    "page_size" => {
+                        query.page_size = value
+                            .parse()
+                            .map_err(|_| Error::Invalid("invalid page_size".into()))?
+                    }
+                    "page_token" => query.page_token = Some(value.into_owned()),
+                    _ => return Err(Error::Invalid("unknown pagination parameter".into())),
+                }
+            }
+            return serde_json::to_value(managed.list_environments(ctx, &query).await?)
+                .map_err(|_| Error::Unavailable("Environment page serialization failed".into()));
+        }
         if rest.is_empty() && parts.method == http::Method::GET {
             return Ok(
-                serde_json::json!({"template":managed.template(tenant,&name,&version).await?}),
+                serde_json::json!({"template":managed.template(ctx, tenant,&name,&version).await?}),
             );
         }
         let ["environments", environment, action @ ..] = rest else {
@@ -317,30 +236,30 @@ impl AgentApi {
                         Error::Invalid("Environment creation accepts no options".into())
                     })?;
                 }
-                progress.start_write();
-                Ok(serde_json::json!({"environment":managed.create_environment(&scope).await?}))
+
+                Ok(
+                    serde_json::json!({"environment":managed.create_environment(ctx, &scope).await?}),
+                )
             }
             (http::Method::GET, []) => {
-                Ok(serde_json::json!({"environment":managed.environment(&scope).await?}))
+                Ok(serde_json::json!({"environment":managed.environment(ctx, &scope).await?}))
             }
             (http::Method::DELETE, []) => {
-                progress.start_write();
-                managed.delete_environment(&scope).await?;
+                managed.delete_environment(ctx, &scope).await?;
                 Ok(serde_json::json!({"status":"deleted"}))
             }
             (http::Method::POST, ["resolve"]) => {
                 let input: ResolveInput = decode_body(body).await?;
-                progress.start_write(); // Activation can submit a platform create.
-                let (target, port) = managed.resolve(&scope, input.protocol, input.port).await?;
+
+                let (target, port) = managed
+                    .resolve(ctx, &scope, input.protocol, input.port)
+                    .await?;
                 Ok(
                     serde_json::json!({"sandbox_id":target.environment.sandbox_id,"port":port,"protocol":input.protocol}),
                 )
             }
             _ => Err(Error::NotFound),
         }
-    }
-    pub fn matches_data(path: &str) -> bool {
-        path.starts_with("/agent/v2/")
     }
     /// Rewrite a managed HTTP/WS request into the existing fixed Sandbox forwarding path.
     /// SSH clients use the resolve endpoint then the existing Sandbox-ID CONNECT/tunnel interface.
@@ -352,9 +271,15 @@ impl AgentApi {
         let Some(retry) = request.extensions_mut().remove::<SelectionRetry>() else {
             return Ok(false);
         };
-        let (target, port) = self
-            .managed()?
-            .resolve(&retry.scope, retry.protocol, Some(retry.port))
+        let (target, port) = retry
+            .context
+            .run(self.managed.retry_resolve(
+                &retry.context,
+                &retry.scope,
+                retry.protocol,
+                retry.port,
+                &retry.generation,
+            ))
             .await?;
         let uri = format!(
             "/{}/{port}/{}",
@@ -365,74 +290,45 @@ impl AgentApi {
             .map_err(|_| Error::Unavailable("invalid resolved forwarding path".into()))?;
         Ok(true)
     }
-    pub async fn prepare_data<B>(
+    pub(super) async fn prepare_data<B>(
         &self,
         request: &mut Request<B>,
         tenant: &str,
+        access: super::agent_access::AccessRequest,
     ) -> Result<(), Error> {
-        let mut parts = request
-            .uri()
-            .path()
-            .strip_prefix("/agent/v2/")
-            .ok_or(Error::NotFound)?
-            .splitn(6, '/');
-        let name = segment(parts.next().ok_or(Error::NotFound)?)?;
-        let version = segment(parts.next().ok_or(Error::NotFound)?)?;
-        let environment_id = segment(parts.next().ok_or(Error::NotFound)?)?;
-        let protocol = match parts.next() {
-            Some("http") => Protocol::Http,
-            Some("ws") => Protocol::Ws,
-            _ => return Err(Error::NotFound),
-        };
-        let port = parts
-            .next()
-            .and_then(|p| p.parse::<u16>().ok())
-            .filter(|p| *p > 0)
-            .ok_or_else(|| Error::Invalid("invalid service port".into()))?;
-        let tail = parts.next().unwrap_or("").to_owned();
-        let websocket = request
-            .headers()
-            .get("upgrade")
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
-        if websocket != (protocol == Protocol::Ws) {
-            return Err(Error::Invalid(
-                "HTTP/WS route does not match the upgrade request".into(),
-            ));
-        }
-        let scope = Scope {
-            tenant: tenant.into(),
-            template: name,
-            version,
-            environment_id,
-        };
-        let (target, port) = self
-            .managed()?
-            .resolve(&scope, protocol, Some(port))
+        let scope = ManagedService::environment_scope(tenant, &access.target)?;
+        let notice = super::agent_access::EnvironmentNotice::new(&scope)?;
+        request.extensions_mut().insert(notice);
+        let context = Arc::new(RequestContext::new(self.request_timeout));
+        let (target, port) = context
+            .run(
+                self.managed
+                    .resolve(&context, &scope, access.protocol, access.port),
+            )
             .await?;
-        let path = format!("/{}/{port}/{tail}", target.environment.sandbox_id);
-        let uri = if let Some(query) = request.uri().query() {
-            format!("{path}?{query}")
-        } else {
-            path
-        };
-        *request.uri_mut() = uri
-            .parse()
-            .map_err(|_| Error::Unavailable("invalid resolved forwarding path".into()))?;
-        let tail_and_query = if let Some(query) = request.uri().query() {
-            format!("{tail}?{query}")
-        } else {
-            tail
-        };
+        let backend_uri = access.backend_uri.to_string();
+        let tail_and_query = backend_uri
+            .strip_prefix('/')
+            .unwrap_or(&backend_uri)
+            .to_owned();
+        *request.uri_mut() = format!(
+            "/{}/{port}/{}",
+            target.environment.sandbox_id, tail_and_query
+        )
+        .parse()
+        .map_err(|_| Error::Unavailable("invalid resolved forwarding path".into()))?;
         request.extensions_mut().insert(SelectionRetry {
+            context,
+            generation: target.environment.generation,
             scope,
-            protocol,
+            protocol: access.protocol,
             port,
             tail_and_query,
         });
         Ok(())
     }
 }
+
 async fn decode_body<T: serde::de::DeserializeOwned>(
     body: hyper::body::Incoming,
 ) -> Result<T, Error> {
@@ -451,6 +347,8 @@ async fn read_body(body: hyper::body::Incoming) -> Result<Bytes, Error> {
 
 #[derive(Clone)]
 struct SelectionRetry {
+    context: Arc<RequestContext>,
+    generation: String,
     scope: Scope,
     protocol: Protocol,
     port: u16,

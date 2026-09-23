@@ -37,6 +37,15 @@ impl Activator {
     pub async fn environment(&self, scope: &Scope) -> Result<Environment> {
         self.state.environment(scope).await?.ok_or(Error::NotFound)
     }
+    pub async fn list_environments(
+        &self,
+        query: &adx_agent_core::activator::EnvironmentList,
+    ) -> Result<adx_agent_core::activator::EnvironmentPage> {
+        query.validate().map_err(Error::Invalid)?;
+        self.template(&query.tenant, &query.template, &query.version)
+            .await?;
+        Ok(self.state.list_environments(query).await?)
+    }
     fn validate_observation(
         environment: &Environment,
         observed: &SandboxObservation,
@@ -48,14 +57,31 @@ impl Activator {
         }
         Ok(())
     }
-    pub async fn activate(&self, scope: &Scope) -> Result<Target> {
-        let environment = self.environment(scope).await?;
-        if environment.phase != EnvironmentPhase::Active {
-            return Err(Error::Conflict("environment is deleting".into()));
-        }
+    pub async fn activate(
+        &self,
+        scope: &Scope,
+        expected_generation: Option<&str>,
+    ) -> Result<Target> {
         let template = self
             .template(&scope.tenant, &scope.template, &scope.version)
             .await?;
+        let environment = match self.state.environment(scope).await? {
+            Some(environment) => environment,
+            None if expected_generation.is_some() => {
+                return Err(Error::Conflict(
+                    "selected Environment no longer exists".into(),
+                ))
+            }
+            None => self.create_environment(scope.clone()).await?,
+        };
+        if expected_generation.is_some_and(|generation| generation != environment.generation) {
+            return Err(Error::Conflict(
+                "selected Environment lifecycle changed".into(),
+            ));
+        }
+        if environment.phase != EnvironmentPhase::Active {
+            return Err(Error::Conflict("environment is deleting".into()));
+        }
         let observed = match self
             .sandbox
             .get(&scope.tenant, &environment.sandbox_id)

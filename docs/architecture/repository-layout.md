@@ -13,7 +13,7 @@
 | 执行平台 `platform/` | 通用 Capsule、调度、持久化、节点生命周期、RRT | Master、Node Manager、本地优先创建及 EROFS/OCI 运行环境已接入；当前基础 K8s 八组已通过 |
 | 共享接入 `gateway/` | Sandbox API Server、Edge、Node Proxy、反向代理与转发 | API Server 默认内嵌 Edge；Node Manager 默认内嵌 Node Proxy；Agent API 装配于 Edge，业务规则归 Agent 层 |
 
-Agent API 在 Gateway Edge 内处理产品请求，通过配置地址访问无状态 Activator。Activator 持久化 Template/Environment，并调用 Gateway 的 Sandbox 能力接口；Sandbox 适配器访问平台。Agent 不直接操作平台 Redis/SQLite 或 sandboxd。inline create/get/kill 直接调用 Sandbox 适配器。用户 Harness 的 HTTP/WS/SSH 经共享数据面转发，业务协议由用户定义。
+Agent API 在 Gateway Edge 内处理产品请求，默认通过 LocalControl 调用同进程无状态 Activator，也可配置 remote 访问独立 Activator。Activator 持久化 Template/Environment；内嵌模式直接调用本地 Sandbox trait，独立模式调用 Gateway Sandbox HTTP 接口，均由 Sandbox 适配器访问平台。Agent 不直接操作平台 Redis/SQLite 或 sandboxd。inline create/get/kill 直接调用 Sandbox 适配器。用户 Harness 的 HTTP/WS/SSH 经共享数据面转发，业务协议由用户定义。
 
 API Server 仍保留原有九条 `/api/agent` 兼容转发路由，由 `agent_address` 指向外部 Agent 服务；这是平台侧既有入口，不属于当前 Edge Agent API／Activator 链路，本轮保持不变。
 
