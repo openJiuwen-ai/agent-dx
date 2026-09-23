@@ -150,16 +150,17 @@ def main():
         after=backend()
         (E/f'backend-after-{node}.json').write_text(json.dumps(after))
         assert after==json.loads((E/f'backend-before-{node}.json').read_text()), 'backend identity changed across Adxlet restart'
-    elif action=='stop':
-        subprocess.run(['python3',str(H/'telemetry.py'),'metrics',node],check=True)
+    elif action in ('stop','cleanup'):
+        if action=='stop':subprocess.run(['python3',str(H/'telemetry.py'),'metrics',node],check=True)
         stopped=supervisor('stop');assert stopped['ok'];collect(node)
-        subprocess.run(['python3',str(H/'telemetry.py'),'validate',node],check=True)
-        logs=list((P/'state/logs').glob('*.gz'));assert logs,'no compressed component logs'
-        assert not list((P/'state/logs').glob('*.tmp')),'incomplete compression after stop'
-        for path in logs:gzip.decompress(path.read_bytes())
-        health=[s['logging'] for s in stopped['services']];assert all(h is not None and h['error'] is None and h['failed_bytes']==0 for h in health),health
-        (E/f'logging-{node}.json').write_text(json.dumps({'status':'passed','gzip_files':len(logs),'no_temporary_files':True,'services':stopped['services']},indent=2))
-        print(f'[LOGGING PASS] {node}: {len(logs)} gzip archives, all readable; no I/O loss or temporary residue',flush=True)
+        if action=='stop':
+            subprocess.run(['python3',str(H/'telemetry.py'),'validate',node],check=True)
+            logs=list((P/'state/logs').glob('*.gz'));assert logs,'no compressed component logs'
+            assert not list((P/'state/logs').glob('*.tmp')),'incomplete compression after stop'
+            for path in logs:gzip.decompress(path.read_bytes())
+            health=[s['logging'] for s in stopped['services']];assert all(h is not None and h['error'] is None and h['failed_bytes']==0 for h in health),health
+            (E/f'logging-{node}.json').write_text(json.dumps({'status':'passed','gzip_files':len(logs),'no_temporary_files':True,'services':stopped['services']},indent=2))
+            print(f'[LOGGING PASS] {node}: {len(logs)} gzip archives, all readable; no I/O loss or temporary residue',flush=True)
         # sandboxd is independent of the supervisor and still responds here.
         assert not backend()
         os.kill(int((P/'sandboxd.pid').read_text()),signal.SIGTERM)
@@ -170,6 +171,6 @@ def main():
         (E/f'backend-empty-{node}.json').write_text(json.dumps({'empty':True}))
     elif action=='collect':collect(node)
     else:raise ValueError('unknown action')
-    if action=='stop':(E/f'stop-{node}.json').write_text(json.dumps({'ok':True,'backend_empty':True}))
+    if action in ('stop','cleanup'):(E/f'stop-{node}.json').write_text(json.dumps({'ok':True,'backend_empty':True}))
     print(action,node,'passed',flush=True)
 if __name__=='__main__':main()
