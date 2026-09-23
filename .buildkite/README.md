@@ -33,6 +33,14 @@ dispatches that slug to `pipeline-admin.yml`. Set the pipeline default
 `adxadmin-v<version>` Git tag and explicitly override the upload variable to
 `1`; set `ADX_ADMIN_PYPI_REPOSITORY=testpypi` for a rehearsal.
 
+## Python test environment
+
+The base pipeline's `admin-gate` runs adxadmin tests in the digest-pinned Python
+3.12 SDK runtime image, with an isolated virtual environment and `httpx==0.28.1`.
+It blocks package assembly alongside `source-gate`. The Rust builder's Python
+3.9 remains responsible for build tooling; it does not run adxadmin, which
+requires Python 3.10 or newer.
+
 ## Base package deployment mode
 
 The base package ships `adxctl`, `adx-coordinator`, `adxlet`, `adx-apiserver`
