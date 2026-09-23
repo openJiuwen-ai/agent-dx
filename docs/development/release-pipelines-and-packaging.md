@@ -2,8 +2,7 @@
 
 ## 目标
 
-ADX 使用四条职责单一的 Buildkite 流水线：基础出包、Python Sandbox SDK 出包、
-Python 管理工具出包和 Full 端到端验收。基础出包流水线同时生成相互独立的 Platform 包、Execd 包和 Runtime
+ADX 使用三条职责单一的 Buildkite 流水线：基础出包（含 adxadmin）、Python Sandbox SDK 出包和 Full 端到端验收。基础出包流水线同时生成相互独立的 Platform 包、Execd 包和 Runtime
 Pack；Execd 不进入 Platform 包，但不单独占用一条流水线。构建只发生在前两条流水线；
 Full 流水线消费不可变制品，不得从源码重新编译或替换二进制。
 
@@ -13,20 +12,28 @@ Full 流水线消费不可变制品，不得从源码重新编译或替换二进
 
 ## 当前实现与调整边界
 
-当前仓库已经提供四个独立配置入口：基础出包使用
-`.buildkite/pipeline-package.yml`，Python SDK 出包使用
-`.buildkite/pipeline-sdk.yml`，管理工具出包使用 `.buildkite/pipeline-admin.yml`，Full 验收使用 `.buildkite/pipeline-full.yml`。
-`.buildkite/pipeline.yml` 只根据 Buildkite pipeline slug 分派配置。Full 组合阶段要求显式
-传入基础包与 SDK 的 Buildkite build UUID，并校验提交、候选清单和文件 SHA256。
-已经完成远端验证的 Buildkite 实体为 `agent-dx`、`agent-dx-python-sdk` 和
-`agent-dx-full-test`；`agent-dx-admin` 需要按仓库配置新建独立实体后执行首次验证。
+当前仓库提供三个独立配置入口：基础出包使用 `.buildkite/pipeline-package.yml`，
+Python SDK 使用 `.buildkite/pipeline-sdk.yml`，Full 验收使用 `.buildkite/pipeline-full.yml`。
+入口 `.buildkite/pipeline.yml` 按 pipeline slug 分派。Full 显式指定基础包与 SDK build UUID，
+核对提交、候选清单和 SHA256，只消费制品，不重编译产品。
 
-基础出包流水线现在将 Platform、Gateway、Execd 和 source gate 放在四个并行步骤中。
-另有独立 `admin-gate` 使用 Python 3.12 镜像运行 adxadmin 单测，安装固定 httpx 依赖；
-不再借用 Rust 构建镜像中的 Python 3.9。两个测试门禁均阻断组装和 OBS 上传。
-三个编译步骤使用独立 Cargo target，输出带提交、目标平台和逐文件 SHA256 的组件
-归档；`platform-build` 只下载、校验并组装这些归档，不重复编译。聚合后的
-`build-manifest.json` 绑定组件清单、基础包、sandboxd backend 和兼容 SDK wheel。
+基础出包包含五个并行门禁：Platform、Gateway、Execd 各自先运行 UT 再编译出包，
+adxadmin 运行 UT、wheel/sdist 构建及安装检查，source gate 检查 fmt/Clippy 和构建脚本。
+公共 Rust crate 测试归 Platform，Agent crate 测试归 Gateway，分组测试检查整个 workspace
+没有漏项或重复。被显式忽略的环境依赖测试仍由专项验收负责，不计为本轮 UT 已通过。
+adxadmin 复用 SDK 的 Python 3.12 容器执行器，不使用 Rust 构建镜像的 Python 3.9。
+
+组件中间产物默认经 OBS `adx/ci/<build UUID>/<commit>/<component>/` 传递，校验身份和
+SHA256 后组装。`ADX_ARTIFACT_TRANSPORT=buildkite` 可切回 Buildkite 传递。
+组装、临时目录安装检查和可选 OBS 上传都在 `platform-build` 内完成，上传直接使用本地
+字节，不再下载整包。最终基础包和 backend 仍存为 Buildkite artifact，供 Full 使用。
+`build-manifest.json` 绑定基础包各组成；`admin-candidate.json` 单独绑定同提交、同 build 的 Python 包。
+
+发布开关默认关闭：`ADX_OBS_UPLOAD=1` 控制基础包/SDK 的正式 OBS 上传；
+`ADX_ADMIN_PYPI_UPLOAD=1` 与 `ADX_SDK_PYPI_UPLOAD=1` 分别控制管理工具和 SDK 的 PyPI
+发布，还需对应版本标签、凭据。仓库选择由各自 `*_PYPI_REPOSITORY=pypi|testpypi` 指定。
+OBS 中间传递与正式上传是两个独立控制；完全不用 OBS 时选择 `buildkite` 且关闭上传。
+参数默认值、Secret 和路径见 [Buildkite 说明](../../.buildkite/README.md#pipeline-controls)。
 
 现阶段兼容的一体化 `adx-release.tar.gz` 仍包含 Execd 和 SDK wheel。独立 SDK 流水线输出的 wheel、sdist 与
 `sdk-candidate.json` 是 Full 验收的 SDK 输入；Full 不使用基础包内的 wheel。继续拆分
@@ -61,7 +68,7 @@ Buildkite pipeline slug 为 `agent-dx`，配置入口为
 ### 步骤
 
 当前已落地的是 Linux AMD64 的 `build-platform`、`build-gateway`、`build-execd`、
-`source-gate` 和 `platform-build` 组装链路。下面列出的多架构独立候选、package smoke、
+`admin-package`、`source-gate` 和 `platform-build` 组装链路。下面列出的多架构独立候选、package smoke、
 SBOM 和最终 `release.json` 是目标状态，不能作为当前流水线已经提供的能力。
 
 1. `source-gate`
@@ -178,10 +185,9 @@ logs/、junit/
 SDK wheel 不再隐式跟随平台版本。一个 ADX release 通过 `release.json` 明确选择已经
 验证过的 SDK 版本，允许 SDK 修订版本独立发布。
 
-## 流水线三：ADX Admin Package
+## 基础出包中的 adxadmin
 
-Buildkite pipeline slug 为 `agent-dx-admin`，配置入口为
-`.buildkite/pipeline-admin.yml`。`admin-package` 在每次构建中运行 Python 单测和发布契约
+复用 `agent-dx` 的 `.buildkite/pipeline-package.yml`。`admin-package` 在每次构建中运行 Python 单测和发布契约
 测试，使用 `python -m build` 生成一个通用 wheel 和一个 sdist，执行 `twine check`，并
 在无源码路径的新虚拟环境中安装 wheel。`admin-candidate.json` 记录版本、提交、build ID
 及两个文件的 SHA256。
@@ -194,7 +200,7 @@ Buildkite pipeline slug 为 `agent-dx-admin`，配置入口为
 SHA256。这样普通提交、PR 和未显式开启上传的标签构建都只留下可审查制品，不修改包
 索引。
 
-## 流水线四：ADX Full Acceptance
+## 流水线三：ADX Full Acceptance
 
 Buildkite pipeline slug 为 `agent-dx-full-test`，配置入口为
 `.buildkite/pipeline-full.yml`。

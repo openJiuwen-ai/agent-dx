@@ -6,7 +6,9 @@ set -euo pipefail
 [[ "$ADX_SDK_TEST_IMAGE" == *@sha256:* ]] || { echo 'SDK test image must be digest pinned' >&2; exit 1; }
 [[ -z $(git status --porcelain) ]] || { echo 'clean checkout required' >&2; exit 1; }
 [[ $(git rev-parse HEAD) == "$BUILDKITE_COMMIT" ]]
-rm -rf out/buildkite/sdk
+package=${1:-sdk}
+[[ $package == sdk || $package == admin ]] || { echo "unknown Python package" >&2; exit 2; }
+rm -rf "out/buildkite/$package"
 mkdir -p out/buildkite/logs /mnt/paas/build-cache/adx/pip
 
 daemon_pid=''
@@ -32,4 +34,4 @@ docker pull "$ADX_SDK_TEST_IMAGE"
 docker run --rm \
   -e BUILDKITE_COMMIT -e BUILDKITE_BUILD_ID \
   -v "$PWD:/workspace" -v /mnt/paas/build-cache/adx/pip:/root/.cache/pip \
-  -w /workspace "$ADX_SDK_TEST_IMAGE" bash build/sdk/ci.sh
+  -w /workspace "$ADX_SDK_TEST_IMAGE" bash "build/$package/ci.sh"

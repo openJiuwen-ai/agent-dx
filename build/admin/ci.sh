@@ -4,8 +4,7 @@ set -euo pipefail
 : "${BUILDKITE_COMMIT:?Buildkite revision required}"
 root=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$root"
-[[ -z $(git status --porcelain) ]] || { echo 'clean checkout required' >&2; exit 1; }
-[[ $(git rev-parse HEAD) == "$BUILDKITE_COMMIT" ]] || { echo 'checkout differs from Buildkite revision' >&2; exit 1; }
+# The outer build-sdk.sh runner validates the clean, exact checkout.
 
 output=out/buildkite/admin
 logs=out/buildkite/logs

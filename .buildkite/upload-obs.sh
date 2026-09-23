@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
+case "${ADX_OBS_UPLOAD:-0}" in
+  0) echo 'OBS publication disabled (ADX_OBS_UPLOAD=0)'; exit 0 ;;
+  1) ;;
+  *) echo 'ADX_OBS_UPLOAD must be 0 or 1' >&2; exit 2 ;;
+esac
 
 : "${BUILDKITE_COMMIT:?Buildkite revision required}"
 : "${BUILDKITE_BUILD_ID:?Buildkite build ID required}"
@@ -7,17 +12,10 @@ set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$root"
 output=out/buildkite/obs
-rm -rf "$output" out/buildkite/backend
+rm -rf "$output"
 mkdir -p "$output" out/buildkite/logs
 
 exec > >(tee out/buildkite/logs/step-obs.log) 2>&1
-
-echo "--- :arrow_down: Download verified build artifacts"
-buildkite-agent artifact download 'out/buildkite/adx-release.tar.gz' . --step platform-build
-buildkite-agent artifact download 'out/buildkite/adx-release.tar.gz.sha256' . --step platform-build
-buildkite-agent artifact download 'out/buildkite/release-manifest.json' . --step platform-build
-buildkite-agent artifact download 'out/buildkite/build-manifest.json' . --step platform-build
-buildkite-agent artifact download 'out/buildkite/backend.tar.gz' . --step platform-build
 
 (cd out/buildkite && sha256sum --check adx-release.tar.gz.sha256)
 python=${OBS_PYTHON:-/opt/buildtools/python3.9/bin/python3}
@@ -68,7 +66,8 @@ artifacts=(
   "$runtime_archive"
   "$runtime_archive.sha256"
 )
-[[ ${#artifacts[@]} -eq 6 ]] || { echo 'base package artifact set is incomplete' >&2; exit 1; }
+python3 build/admin/candidate.py --verify --directory out/buildkite/admin
+artifacts+=(out/buildkite/admin/*.whl out/buildkite/admin/*.tar.gz out/buildkite/admin/admin-candidate.json)
 
 echo "--- :cloud: Upload ADX artifacts to Huawei Cloud OBS"
 "$python" -c 'from obs import ObsClient' >/dev/null 2>&1 || {
