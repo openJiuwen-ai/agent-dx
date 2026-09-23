@@ -16,7 +16,8 @@ grep -q '^rustfmt-' <<<"$installed" || { echo 'Rust image is missing rustfmt' >&
 grep -q '^clippy-' <<<"$installed" || { echo 'Rust image is missing Clippy' >&2; return 1; }
 mkdir -p "$CARGO_HOME" "$CARGO_TARGET_DIR"
 # CARGO_HOME overrides otherwise hide the source configuration baked in the image.
-cat > "$CARGO_HOME/config.toml.tmp.$$" <<'CONFIG'
+config_tmp=$(mktemp "$CARGO_HOME/config.toml.tmp.XXXXXXXX")
+cat > "$config_tmp" <<'CONFIG'
 [source.crates-io]
 replace-with = "rsproxy-sparse"
 [source.rsproxy-sparse]
@@ -24,7 +25,7 @@ registry = "sparse+https://rsproxy.cn/index/"
 [net]
 git-fetch-with-cli = true
 CONFIG
-mv "$CARGO_HOME/config.toml.tmp.$$" "$CARGO_HOME/config.toml"
+mv "$config_tmp" "$CARGO_HOME/config.toml"
 export CARGO_INCREMENTAL=0
 export SCCACHE_DIR=${SCCACHE_DIR:-/mnt/paas/build-cache/adx/sccache}
 export SCCACHE_CACHE_SIZE=${SCCACHE_CACHE_SIZE:-20G}
