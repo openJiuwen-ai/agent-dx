@@ -73,10 +73,7 @@ impl IngressService {
             use super::agent_api::{AgentApi, AgentConfig};
             let settings: AgentConfig = serde_json::from_slice(&std::fs::read(path)?)
                 .map_err(|_| "invalid Agent configuration")?;
-            let backend = sandbox_api.as_ref().map(|api| api.backend.clone());
-            Some(Arc::new(
-                AgentApi::new(settings, backend).await.map_err(send_error)?,
-            ))
+            Some(Arc::new(AgentApi::new(settings).map_err(send_error)?))
         } else {
             None
         };

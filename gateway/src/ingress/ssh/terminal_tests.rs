@@ -232,7 +232,7 @@ async fn terminal_case(native: bool) {
     state.publish("tenant", &template).await.unwrap();
     let api = Arc::new(AgentApi {
         managed: Arc::new(adx_agent_api::managed::ManagedService::new(Arc::new(
-            local_control(adx_activator::Activator::new(state.clone(), sandbox)),
+            remote_control(adx_activator::Activator::new(state.clone(), sandbox)).await,
         ))),
         request_timeout: adx_agent_core::limits::AGENT_REQUEST_TIMEOUT,
     });

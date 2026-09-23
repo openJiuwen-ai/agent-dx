@@ -108,3 +108,55 @@ async fn lost_http_reply_is_unknown_only_for_writes() {
         peer.await.unwrap();
     }
 }
+
+#[tokio::test]
+async fn sandbox_create_uses_the_callers_remaining_deadline() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let received = Arc::new(std::sync::Mutex::new(None));
+    let count = calls.clone();
+    let seen = received.clone();
+    let (url, task) = serve(Router::new().route(
+        "/api/sandbox/v2/instances",
+        axum::routing::post(move |Json(body): Json<serde_json::Value>| {
+            let count = count.clone();
+            let seen = seen.clone();
+            async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                *seen.lock().unwrap() = Some(body);
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                axum::http::StatusCode::SERVICE_UNAVAILABLE
+            }
+        }),
+    ))
+    .await;
+    let client = HttpSandbox::new(&url, TOKEN.into(), Duration::from_secs(5), None, true).unwrap();
+    let deadline = adx_agent_core::unix_time_millis() + 250;
+    let body = serde_json::json!({
+        "id":"id", "tenant":"tenant", "deadline_unix_ms":deadline, "execution": {
+            "image":"app:1", "isolation_runtime":"runc", "entrypoint":["/app/start"],
+            "working_dir":"/", "user":null, "env":{}, "resources":{"cpu_millis":1000,"memory_mib":128}, "service":[]
+        }
+    });
+    let create: CreateSandbox = serde_json::from_value(body.clone()).unwrap();
+    let started = std::time::Instant::now();
+    assert!(matches!(
+        client.create(&create).await,
+        Err(SandboxError::OutcomeUnknown(_))
+    ));
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        received.lock().unwrap().as_ref().unwrap()["deadline_unix_ms"],
+        deadline
+    );
+    let mut expired = body;
+    expired["deadline_unix_ms"] =
+        serde_json::json!(adx_agent_core::unix_time_millis().saturating_sub(1));
+    let expired: CreateSandbox = serde_json::from_value(expired).unwrap();
+    assert!(matches!(
+        client.create(&expired).await,
+        Err(SandboxError::Unavailable(_))
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    task.abort();
+}

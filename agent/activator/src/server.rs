@@ -40,22 +40,22 @@ async fn authorize(State(s): State<Service>, request: Request, next: Next) -> Re
     ) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    let remaining = match request.headers().get(DEADLINE_HEADER) {
+    let caller_deadline = match request.headers().get(DEADLINE_HEADER) {
         Some(value) => match value.to_str().ok().and_then(|v| v.parse::<u64>().ok()) {
-            Some(deadline) => {
-                Duration::from_millis(deadline.saturating_sub(adx_agent_core::unix_time_millis()))
-                    .min(s.timeout)
-            }
+            Some(deadline) => Some(deadline),
             None => return failure(Error::Invalid("invalid request deadline".into())),
         },
-        None => s.timeout,
+        None => None,
     };
+    let deadline = adx_agent_core::transport::capped_deadline(caller_deadline, s.timeout);
+    let remaining = adx_agent_core::transport::remaining_time(deadline);
     if remaining.is_zero() {
         return failure(Error::Unavailable("request deadline expired".into()));
     }
     let progress = Arc::new(RequestProgress::default());
     let mut request = request;
     request.extensions_mut().insert(progress.clone());
+    request.extensions_mut().insert(deadline);
     match tokio::time::timeout(remaining, next.run(request)).await {
         Ok(response) => response,
         Err(_) => failure(if progress.may_have_written() {
@@ -79,7 +79,6 @@ pub fn router(activator: Arc<Activator>, token: &str, timeout: Duration) -> Resu
     Ok(Router::new()
         .route("/internal/adx/v1/templates/publish", post(publish))
         .route("/internal/adx/v1/templates/get", post(template))
-        .route("/internal/adx/v1/environments/create", post(create))
         .route("/internal/adx/v1/environments/get", post(environment))
         .route("/internal/adx/v1/environments/list", post(environments))
         .route("/internal/adx/v1/environments/delete", post(delete))
@@ -103,17 +102,6 @@ async fn publish(
 }
 async fn template(State(s): State<Service>, Json(r): Json<TemplateRequest>) -> Response {
     match s.activator.template(&r.tenant, &r.name, &r.version).await {
-        Ok(v) => Json(v).into_response(),
-        Err(e) => failure(e),
-    }
-}
-async fn create(
-    State(s): State<Service>,
-    axum::Extension(p): axum::Extension<Arc<RequestProgress>>,
-    Json(r): Json<ScopeRequest>,
-) -> Response {
-    p.start_write();
-    match s.activator.create_environment(r.scope).await {
         Ok(v) => Json(v).into_response(),
         Err(e) => failure(e),
     }
@@ -144,12 +132,13 @@ async fn delete(
 async fn activate(
     State(s): State<Service>,
     axum::Extension(p): axum::Extension<Arc<RequestProgress>>,
+    axum::Extension(deadline): axum::Extension<u64>,
     Json(r): Json<ActivationRequest>,
 ) -> Response {
     p.start_write();
     match s
         .activator
-        .activate(&r.scope, r.expected_generation.as_deref())
+        .activate(&r.scope, r.expected_generation.as_deref(), deadline)
         .await
     {
         Ok(v) => Json(v).into_response(),

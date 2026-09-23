@@ -1,6 +1,6 @@
 # ADX 用户命令行
 
-`adx` 使用 Rust，通过公开 Gateway 接口访问 Agent 资源。当前实现管理命令和 SSH 交互终端；HTTP CLI 仍待实施，HTTP/WS 的 URN 入口已由 Gateway 提供。
+`adx` 使用 Rust，通过公开 Gateway 接口访问 Agent 资源。当前实现管理命令、Harness HTTP 流式调用和 SSH 交互终端。
 
 ```sh
 cargo build --locked -p adx-cli --bin adx
@@ -19,9 +19,26 @@ adx --token-file /run/secrets/adx-token env get demo --template assistant --vers
 adx --token-file /run/secrets/adx-token env delete demo --template assistant --version 1
 ```
 
-`template.json` 使用 [Agent Template](../README.md) 的 `name/version/image/isolation_runtime/entrypoint/resources/service` 配置。发布的模板版本不可变；查询和列举 Environment 不激活 Sandbox，删除会调用服务端删除流程。指定 ID 的 Environment 创建由HTTP/WS/SSH 访问流量或 resolve 请求触发，CLI 不提供显式创建命令。
+`template.json` 使用 [Agent Template](../README.md) 的 `name/version/image/isolation_runtime/entrypoint/resources/service` 配置。发布的模板版本不可变；查询和列举 Environment 不激活 Sandbox，删除会调用服务端删除流程。指定 ID 的 Environment 创建由 HTTP/WS/SSH 访问流量或 resolve 请求触发，CLI 不提供显式创建命令。
 
 `env list` 每次仅请求一页，返回 `environments` 和 `next_page_token`。后续页传 `--page-token`；默认页大小 50，上限 100。同一 token 只能用于同一租户、模板和版本。列表反映 ADX 元数据，不表示实时 Sandbox 健康状态；并发更新时不保证快照。
+
+## HTTP 调用
+
+```sh
+adx http --template assistant --version 1 --path /chat --method POST \
+  --header 'Content-Type: application/json' --data '{"message":"hello"}'
+adx http --template assistant --version 1 --env demo --port 8080 \
+  --path '/chat?stream=true' --method POST --data-file request.json
+# --data-file - 从 stdin 流式读取；也可直接 GET /health
+adx http --template assistant --version 1 --env demo --path /health
+```
+
+CLI 使用 `/agent/http` 和管理命令相同的租户 API Key。`--path` 为 Harness 路径，可带业务 query；不能覆盖 target、instance、port 或认证 query。`--header` 可重复，凭据、Host 和传输控制 Header 由 CLI 管理；`--data` 与 `--data-file` 二选一。文件及 stdin 请求体流式读取，HTTP/SSE 响应逐块写入 stdout。
+
+服务端返回 Environment ID/URN 时，CLI 先在 stdout 打印 `Environment: ...` 与 `Target: ...`，随后输出原始响应体。两行通知也可能出现在失败响应前，表示身份已确定，不表示创建成功。需要纯二进制内容时应直接使用 HTTP 客户端读取响应头和正文；CLI 的 stdout 包含身份提示。
+
+`--timeout-seconds` 限制请求发送到收到响应头的等待时间，不截断已建立的响应流。Ctrl-C 关闭客户端连接，不能保证 Harness 业务已取消；CLI 不自动重试业务请求或跟随重定向。HTTP 非 2xx 的正文仍输出到 stdout，错误摘要输出到 stderr 并以非零状态退出。重试时使用服务端返回的 `--env`，不要重新省略它。`--output` 只控制管理命令的 JSON 展示，HTTP 保持上述流式输出。
 
 ## 配置
 
@@ -65,7 +82,7 @@ adx ssh --template assistant --version 1 --env demo --port 22
 
 当前冷启动可能先返回创建结果未知，或在平台报告 Running 后短暂遇到路由尚未发布。收到 ID 后连接失败时，使用 `adx env get` 查询，并在再次连接时显式传入 `--env <返回的ID>`；不要再次省略 `--env`，否则会生成另一个 Environment。CLI 不自动重试 SSH 连接。
 
-仅提供交互式 shell，stdin 必须是终端；不接收远程命令，不提供 SFTP、inline 或 port-forward 命令。CLI 构造路由用户名后直接启动 OpenSSH，保留终端输入、窗口调整和后端退出码，不先发送 HTTP resolve，也不做连接复用或自动重连。`--output json` 和 HTTP 凭据/超时参数只用于管理命令，不改变 SSH 终端。
+仅提供交互式 shell，stdin 必须是终端；不接收远程命令，不提供 SFTP、inline 或 port-forward 命令。CLI 构造路由用户名后直接启动 OpenSSH，保留终端输入、窗口调整和后端退出码，不先发送 HTTP resolve，也不做连接复用或自动重连。`--output json` 只控制管理命令输出；HTTP 凭据和超时参数用于管理及 HTTP 请求，不改变 SSH 终端。
 
 ## 验证范围
 
@@ -73,4 +90,6 @@ adx ssh --template assistant --version 1 --env demo --port 22
 
 SSH 参数用例覆盖显式/自动 Environment、身份文件路径及 IPv6 地址。Gateway 组件另用原生 OpenSSH 验证终端 stdout 的 ID/URN 与退出码。
 
-2026-09-22 另行完成容器内真实 Platform、Redis、EXECD 和用户镜像验证：CLI 模板发布/读取、Environment 三页查询和跨 Gateway 查询/删除、已有 Environment SSH、自动生成 ID 后同 ID 重连均通过，终端输出与后端退出码正确。首次冷启动仍可能遇到平台就绪或路由发布延迟，需要按上文使用原 ID 重试；该结果不是多机或 Kubernetes 验收。完整范围和限制见 [Agent 验证说明](../README.md#验证)。
+2026-09-22 的真实容器验证覆盖 CLI 模板发布/读取、Environment 三页查询和跨 Gateway 查询/删除、已有 Environment SSH、自动生成 ID 后同 ID 重连，终端输出与后端退出码正确。2026-09-23 的 `3141e27` 另行通过 HTTP CLI 的自动 Environment 通知、原 ID 重试及 Harness 正文输出，整体 19 项端到端检查通过。上述验证在本次上游命名调整合并前完成；组件测试另覆盖流式响应、文件/stdin 请求体和 Ctrl-C 退出。
+
+首次冷启动仍可能遇到平台就绪或路由发布延迟，需要按上文使用原 ID 重试；这些结果不是多机或 Kubernetes 验收。完整范围和限制见 [Agent 验证说明](../README.md#验证)。

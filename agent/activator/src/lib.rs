@@ -31,9 +31,6 @@ impl Activator {
             .await?
             .ok_or(Error::NotFound)
     }
-    pub async fn create_environment(&self, scope: Scope) -> Result<Environment> {
-        Ok(self.state.create_environment(scope).await?)
-    }
     pub async fn environment(&self, scope: &Scope) -> Result<Environment> {
         self.state.environment(scope).await?.ok_or(Error::NotFound)
     }
@@ -61,6 +58,7 @@ impl Activator {
         &self,
         scope: &Scope,
         expected_generation: Option<&str>,
+        deadline_unix_ms: u64,
     ) -> Result<Target> {
         let template = self
             .template(&scope.tenant, &scope.template, &scope.version)
@@ -72,7 +70,7 @@ impl Activator {
                     "selected Environment no longer exists".into(),
                 ))
             }
-            None => self.create_environment(scope.clone()).await?,
+            None => self.state.create_environment(scope.clone()).await?,
         };
         if expected_generation.is_some_and(|generation| generation != environment.generation) {
             return Err(Error::Conflict(
@@ -94,6 +92,7 @@ impl Activator {
                         id: environment.sandbox_id.clone(),
                         tenant: scope.tenant.clone(),
                         execution: (&template).into(),
+                        deadline_unix_ms: Some(deadline_unix_ms),
                     })
                     .await?
             }

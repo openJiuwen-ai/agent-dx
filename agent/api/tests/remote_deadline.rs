@@ -1,5 +1,5 @@
 use adx_activator::Activator;
-use adx_agent_api::{activator::Control, local::LocalControl, Error};
+use adx_agent_api::{activator::ActivatorClient, Error};
 use adx_agent_core::{sandbox::*, Scope, TemplateVersion};
 use adx_agent_store::{AgentState, Index, Key, MemoryRepository, Record, Repository, Transaction};
 use std::{sync::Arc, time::Duration};
@@ -50,12 +50,13 @@ fn template() -> TemplateVersion {
 fn context() -> adx_agent_api::request::RequestContext {
     adx_agent_api::request::RequestContext::new(Duration::from_secs(1))
 }
-#[tokio::test(start_paused = true)]
-async fn caller_deadline_distinguishes_local_reads_and_possible_writes() {
-    let control = LocalControl::new(Arc::new(Activator::new(
+#[tokio::test]
+async fn caller_deadline_distinguishes_remote_reads_and_possible_writes() {
+    let control = remote_control(Activator::new(
         AgentState::new(Arc::new(StalledStore)),
         Arc::new(StalledSandbox),
-    )));
+    ))
+    .await;
     let ctx = context();
     assert!(matches!(
         ctx.run(control.template(&ctx, "tenant", "app", "1")).await,
@@ -72,14 +73,11 @@ async fn caller_deadline_distinguishes_local_reads_and_possible_writes() {
         Err(Error::OutcomeUnknown(_))
     ));
 }
-#[tokio::test(start_paused = true)]
-async fn timed_out_activation_keeps_identity_for_another_local_replica() {
+#[tokio::test]
+async fn timed_out_activation_keeps_identity_for_another_replica() {
     let state = AgentState::new(Arc::new(MemoryRepository::default()));
-    let a = LocalControl::new(Arc::new(Activator::new(
-        state.clone(),
-        Arc::new(StalledSandbox),
-    )));
-    let b = LocalControl::new(Arc::new(Activator::new(state, Arc::new(StalledSandbox))));
+    let a = remote_control(Activator::new(state.clone(), Arc::new(StalledSandbox))).await;
+    let b = remote_control(Activator::new(state, Arc::new(StalledSandbox))).await;
     a.publish(&context(), "tenant", &template()).await.unwrap();
     let ctx = context();
     assert!(matches!(
@@ -102,4 +100,63 @@ async fn timed_out_activation_keeps_identity_for_another_local_replica() {
         b.environment(&context(), &scope()).await.unwrap().phase,
         adx_agent_core::EnvironmentPhase::Deleting
     );
+}
+
+async fn remote_control(activator: Activator) -> ActivatorClient {
+    let token = "deadline-test-service-token-at-least-32-bytes";
+    let timeout = Duration::from_secs(3);
+    let app = adx_activator::server::router(Arc::new(activator), token, timeout).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    ActivatorClient::new(vec![url], token.into(), timeout, None, true).unwrap()
+}
+
+#[tokio::test]
+async fn remote_activation_passes_the_original_deadline_to_sandbox_create() {
+    struct ObserveDeadline(std::sync::Mutex<Option<u64>>);
+    #[async_trait::async_trait]
+    impl Sandbox for ObserveDeadline {
+        async fn create(
+            &self,
+            request: &CreateSandbox,
+        ) -> Result<SandboxObservation, SandboxError> {
+            *self.0.lock().unwrap() = request.deadline_unix_ms;
+            Ok(SandboxObservation {
+                id: request.id.clone(),
+                tenant: request.tenant.clone(),
+                phase: SandboxPhase::Running,
+                ready: true,
+                runtime_id: None,
+                message: None,
+            })
+        }
+        async fn get(&self, _: &str, _: &str) -> Result<Option<SandboxObservation>, SandboxError> {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            Ok(None)
+        }
+        async fn delete(&self, _: &str, _: &str) -> Result<SandboxObservation, SandboxError> {
+            Err(SandboxError::NotFound)
+        }
+    }
+    let backend = Arc::new(ObserveDeadline(std::sync::Mutex::new(None)));
+    let client = remote_control(Activator::new(
+        AgentState::new(Arc::new(MemoryRepository::default())),
+        backend.clone(),
+    ))
+    .await;
+    client
+        .publish(&context(), "tenant", &template())
+        .await
+        .unwrap();
+    let ctx = context();
+    let original = ctx.deadline_unix_ms();
+    let target = client.activate(&ctx, &scope(), None).await.unwrap();
+    assert_eq!(target.environment.scope, scope());
+    let received = backend.0.lock().unwrap().unwrap();
+    assert!(
+        received <= original + 2,
+        "deadline was extended: {received} > {original}"
+    );
+    assert!(received >= original.saturating_sub(10));
 }

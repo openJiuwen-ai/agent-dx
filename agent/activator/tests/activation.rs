@@ -80,14 +80,22 @@ async fn replicas_and_unknown_outcomes_keep_the_committed_identity() {
     let a = Activator::new(state.clone(), platform.clone());
     let b = Activator::new(state.clone(), platform.clone());
     a.publish("tenant", &template()).await.unwrap();
-    let original = a.create_environment(scope("e")).await.unwrap();
     platform.lose_create_response.store(true, Ordering::SeqCst);
     assert!(matches!(
-        a.activate(&scope("e"), None).await,
+        a.activate(
+            &scope("e"),
+            None,
+            adx_agent_core::unix_time_millis() + 60_000
+        )
+        .await,
         Err(Error::OutcomeUnknown(_))
     ));
+    let original = a.environment(&scope("e")).await.unwrap();
     let e = scope("e");
-    let (x, y) = tokio::join!(a.activate(&e, None), b.activate(&e, None));
+    let (x, y) = tokio::join!(
+        a.activate(&e, None, adx_agent_core::unix_time_millis() + 60_000),
+        b.activate(&e, None, adx_agent_core::unix_time_millis() + 60_000)
+    );
     assert_eq!(x.unwrap(), y.unwrap());
     assert_eq!(b.environment(&scope("e")).await.unwrap(), original);
     assert_eq!(platform.observations.lock().unwrap().len(), 1);
@@ -97,14 +105,34 @@ async fn replicas_and_unknown_outcomes_keep_the_committed_identity() {
         Err(Error::OutcomeUnknown(_))
     ));
     assert!(matches!(
-        a.activate(&scope("e"), None).await,
+        a.activate(
+            &scope("e"),
+            None,
+            adx_agent_core::unix_time_millis() + 60_000
+        )
+        .await,
         Err(Error::Conflict(_))
     ));
     a.delete_environment(&scope("e")).await.unwrap();
-    let fresh = b.create_environment(scope("e")).await.unwrap();
+    let fresh = b
+        .activate(
+            &scope("e"),
+            None,
+            adx_agent_core::unix_time_millis() + 60_000,
+        )
+        .await
+        .unwrap()
+        .environment;
     assert_ne!(fresh.sandbox_id, original.sandbox_id);
     assert_eq!(
-        a.activate(&scope("e"), None).await.unwrap().environment,
+        a.activate(
+            &scope("e"),
+            None,
+            adx_agent_core::unix_time_millis() + 60_000
+        )
+        .await
+        .unwrap()
+        .environment,
         fresh
     );
 }
@@ -114,18 +142,15 @@ async fn independent_environments_and_platform_readiness() {
     let platform = Arc::new(Platform::default());
     let service = Activator::new(state.clone(), platform.clone());
     service.publish("tenant", &template()).await.unwrap();
-    let (x, y) = tokio::join!(
-        service.create_environment(scope("a")),
-        service.create_environment(scope("b"))
-    );
-    let x = x.unwrap();
-    let y = y.unwrap();
-    assert_ne!(x.sandbox_id, y.sandbox_id);
     let sa = scope("a");
     let sb = scope("b");
-    let (a, b) = tokio::join!(service.activate(&sa, None), service.activate(&sb, None));
-    a.unwrap();
-    b.unwrap();
+    let (a, b) = tokio::join!(
+        service.activate(&sa, None, adx_agent_core::unix_time_millis() + 60_000),
+        service.activate(&sb, None, adx_agent_core::unix_time_millis() + 60_000)
+    );
+    let x = a.unwrap().environment;
+    let y = b.unwrap().environment;
+    assert_ne!(x.sandbox_id, y.sandbox_id);
     platform
         .observations
         .lock()
@@ -134,7 +159,13 @@ async fn independent_environments_and_platform_readiness() {
         .unwrap()
         .ready = false;
     assert!(matches!(
-        service.activate(&scope("a"), None).await,
+        service
+            .activate(
+                &scope("a"),
+                None,
+                adx_agent_core::unix_time_millis() + 60_000
+            )
+            .await,
         Err(Error::NotReady(_))
     ));
     assert_eq!(service.environment(&scope("a")).await.unwrap(), x);
@@ -143,7 +174,9 @@ async fn independent_environments_and_platform_readiness() {
         ..scope("a")
     };
     assert!(matches!(
-        service.activate(&other, None).await,
+        service
+            .activate(&other, None, adx_agent_core::unix_time_millis() + 60_000)
+            .await,
         Err(Error::NotFound)
     ));
 }
@@ -156,12 +189,18 @@ async fn first_traffic_creates_one_environment_across_activators() {
     let b = Activator::new(state.clone(), platform.clone());
     a.publish("tenant", &template()).await.unwrap();
     let scope = scope("traffic");
-    let (left, right) = tokio::join!(a.activate(&scope, None), b.activate(&scope, None));
+    let (left, right) = tokio::join!(
+        a.activate(&scope, None, adx_agent_core::unix_time_millis() + 60_000),
+        b.activate(&scope, None, adx_agent_core::unix_time_millis() + 60_000)
+    );
     let first = left.unwrap();
     assert_eq!(first, right.unwrap());
     assert_eq!(platform.observations.lock().unwrap().len(), 1);
     a.delete_environment(&scope).await.unwrap();
-    let recreated = b.activate(&scope, None).await.unwrap();
+    let recreated = b
+        .activate(&scope, None, adx_agent_core::unix_time_millis() + 60_000)
+        .await
+        .unwrap();
     assert_ne!(
         first.environment.generation,
         recreated.environment.generation
@@ -175,11 +214,18 @@ async fn delayed_retry_cannot_recreate_or_select_another_generation() {
     let activator = Activator::new(state, platform.clone());
     activator.publish("tenant", &template()).await.unwrap();
     let scope = scope("retry");
-    let first = activator.activate(&scope, None).await.unwrap();
+    let first = activator
+        .activate(&scope, None, adx_agent_core::unix_time_millis() + 60_000)
+        .await
+        .unwrap();
     activator.delete_environment(&scope).await.unwrap();
     assert!(matches!(
         activator
-            .activate(&scope, Some(&first.environment.generation))
+            .activate(
+                &scope,
+                Some(&first.environment.generation),
+                adx_agent_core::unix_time_millis() + 60_000
+            )
             .await,
         Err(Error::Conflict(_))
     ));
@@ -187,16 +233,27 @@ async fn delayed_retry_cannot_recreate_or_select_another_generation() {
         activator.environment(&scope).await,
         Err(Error::NotFound)
     ));
-    let fresh = activator.activate(&scope, None).await.unwrap();
+    let fresh = activator
+        .activate(&scope, None, adx_agent_core::unix_time_millis() + 60_000)
+        .await
+        .unwrap();
     assert!(matches!(
         activator
-            .activate(&scope, Some(&first.environment.generation))
+            .activate(
+                &scope,
+                Some(&first.environment.generation),
+                adx_agent_core::unix_time_millis() + 60_000
+            )
             .await,
         Err(Error::Conflict(_))
     ));
     assert_eq!(
         activator
-            .activate(&scope, Some(&fresh.environment.generation))
+            .activate(
+                &scope,
+                Some(&fresh.environment.generation),
+                adx_agent_core::unix_time_millis() + 60_000
+            )
             .await
             .unwrap(),
         fresh
