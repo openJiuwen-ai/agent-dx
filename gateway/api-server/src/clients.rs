@@ -159,6 +159,29 @@ impl Clients {
             .snapshot()
             .ok_or_else(|| Status::unavailable("node directory unavailable"))
     }
+    pub async fn scheduling_queue(&self) -> Result<pb::GetSchedulingQueueResponse, Status> {
+        let mut client = pb::master_service_client::MasterServiceClient::new(self.master().await?);
+        self.rpc(
+            "api_server.get_scheduling_queue",
+            client.get_scheduling_queue(trace::inject(pb::GetSchedulingQueueRequest {})),
+        )
+        .await
+    }
+    pub async fn set_node_scheduling(
+        &self,
+        node_id: String,
+        accepting_allocations: bool,
+    ) -> Result<pb::NodeSchedulingState, Status> {
+        let mut client = pb::master_service_client::MasterServiceClient::new(self.master().await?);
+        self.rpc(
+            "api_server.set_node_scheduling",
+            client.set_node_scheduling(trace::inject(pb::SetNodeSchedulingRequest {
+                node_id,
+                accepting_allocations,
+            })),
+        )
+        .await
+    }
     pub async fn master(&self) -> Result<RpcChannel, Status> {
         let address = if let Some(discovery) = &self.discovery {
             let cached = self.endpoint.lock().await.get(&());

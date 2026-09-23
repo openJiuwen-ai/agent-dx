@@ -686,7 +686,7 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
         let agent_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let agent_address = agent_listener.local_addr().unwrap();
         drop(agent_listener);
-        let config = serde_json::json!({"agent_address":format!("http://{agent_address}"),"listen":address.to_string(),"discovery":{"redis_url":redis.url,"namespace":"test","poll_seconds":1},"ca":tls.join("ca.pem"),"certificate":tls.join("api-server.pem"),"private_key":tls.join("api-server.key"),"server_name":"localhost","rpc_timeout_seconds":3,"cache_entries":128,"auth_cache_ttl_seconds":1});
+        let config = serde_json::json!({"agent_address":format!("http://{agent_address}"),"listen":address.to_string(),"discovery":{"redis_url":redis.url,"namespace":"test","poll_seconds":1},"ca":tls.join("ca.pem"),"certificate":tls.join("api-server.pem"),"private_key":tls.join("api-server.key"),"server_name":"localhost","rpc_timeout_seconds":3,"cache_entries":128,"auth_cache_ttl_seconds":1,"edge_mode":"standalone"});
         let path = directory.path().join("api.json");
         std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
         let evidence = PathBuf::from(std::env::var("ADX_TEST_EVIDENCE").unwrap());
@@ -698,8 +698,7 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
             .kill_on_drop(true)
             .spawn()
             .unwrap();
-        let script =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../build/ci/api_http.py");
+        let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../build/ci/api_http.py");
         let result = tokio::process::Command::new("python3")
             .arg(script)
             .env("ADX_TEST_API_ENDPOINT", format!("https://{address}"))

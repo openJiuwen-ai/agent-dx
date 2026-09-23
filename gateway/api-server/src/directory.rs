@@ -32,13 +32,26 @@ impl Directory {
         Ok(())
     }
     pub fn select(&mut self) -> Option<pb::NodeEndpoint> {
-        if self.valid_until.is_none_or(|t| Instant::now() >= t) || self.nodes.is_empty() {
+        if self.valid_until.is_none_or(|t| Instant::now() >= t) {
             return None;
         }
-        self.next %= self.nodes.len();
-        let node = self.nodes[self.next].clone();
+        let available = self
+            .nodes
+            .iter()
+            .filter(|node| node.accepting_allocations)
+            .count();
+        if available == 0 {
+            return None;
+        }
+        self.next %= available;
+        let node = self
+            .nodes
+            .iter()
+            .filter(|node| node.accepting_allocations)
+            .nth(self.next)
+            .cloned();
         self.next += 1;
-        Some(node)
+        node
     }
     pub fn snapshot(&self) -> Option<Vec<pb::NodeEndpoint>> {
         if self.valid_until.is_none_or(|t| Instant::now() >= t) {
@@ -58,6 +71,7 @@ mod tests {
             node_id: id.into(),
             address: format!("{id}:9000"),
             session_id: "boot".into(),
+            accepting_allocations: true,
             ..Default::default()
         };
         d.update(pb::NodeDirectory {
@@ -95,6 +109,20 @@ mod tests {
         })
         .unwrap();
         assert_eq!(d.select().unwrap().session_id, "new");
+        d.update(pb::NodeDirectory {
+            epoch: 3,
+            nodes: vec![
+                pb::NodeEndpoint {
+                    accepting_allocations: false,
+                    ..node("paused")
+                },
+                node("ready"),
+            ],
+            valid_for_millis: 1000,
+        })
+        .unwrap();
+        assert_eq!(d.snapshot().unwrap().len(), 2);
+        assert_eq!(d.select().unwrap().node_id, "ready");
         d.clear();
         assert!(d.select().is_none());
         assert!(d.snapshot().is_none());

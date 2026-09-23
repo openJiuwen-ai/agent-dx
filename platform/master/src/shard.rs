@@ -129,6 +129,14 @@ impl ShardScheduler {
             .get(id)
             .map(|state| (state.scalar.capacity(), state.scalar.available()))
     }
+    pub fn node_devices(&self, id: &str) -> Option<(Vec<Device>, Vec<Device>)> {
+        self.nodes.get(id).map(|state| {
+            (
+                state.devices.inventory().to_vec(),
+                state.free_devices.clone(),
+            )
+        })
+    }
     pub fn restore(&mut self, spec: &CapsuleSpec, assignment: &Assignment) -> Result<()> {
         if self.assigned.contains_key(&spec.id) {
             return Err(Error::Conflict);
@@ -237,14 +245,14 @@ impl ShardScheduler {
             self.deferred_arrivals = true;
             &mut self.deferred
         };
-        queue.restore(Entry {
-            sequence: self.sequence,
-            spec: request,
-        });
+        queue.restore(Entry::new(self.sequence, request));
         self.sequence = self
             .sequence
             .checked_add(1)
             .expect("queue sequence exhausted");
+    }
+    pub(crate) fn pending_requests(&self) -> impl Iterator<Item = &Entry> {
+        self.queue.entries().chain(self.deferred.entries())
     }
     fn select(
         &mut self,

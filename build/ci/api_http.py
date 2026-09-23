@@ -63,6 +63,35 @@ print('Public HTTPS create, credential/tenant checks, repeated delete, pause on 
 
 # Real HTTPS -> authenticated API Server -> mTLS Master -> Redis key lifecycle.
 admin = 'd' * 40
+code, current = call('GET', '/api/sandbox/v1/resources')
+assert code == 200 and current['items'][0]['status'] == 0, (code, current)
+code, compatible = call('GET', '/global-scheduler/resources')
+assert code == 200, (code, compatible)
+fragment = compatible['resource']['fragment']['node']
+assert fragment['status'] == 0 and fragment['capacity']['resources']['CPU']['scalar']['value'] > 0, compatible
+assert call('GET', '/global-scheduler/scheduling_queue')[0] == 403
+code, waiting = call('GET', '/global-scheduler/scheduling_queue', key=admin)
+assert code == 200 and waiting == {'count': 0, 'instanceInfos': []}, (code, waiting)
+code, state = call('POST', '/global-scheduler/node/localschedulingstatus?node_id=node', key=admin)
+assert code == 200 and state == {'status': 'evicting', 'message': 'success'}, (code, state)
+for _ in range(40):
+    code, paused = call('GET', '/global-scheduler/resources', key=admin)
+    if code == 200 and paused['resource']['fragment']['node']['status'] == 1:
+        break
+    time.sleep(.05)
+else:
+    raise AssertionError(('paused node did not remain in the resource directory', code, paused))
+code, state = call('DELETE', '/global-scheduler/node/localschedulingstatus?node_id=node', key=admin)
+assert code == 200 and state == {'status': 'normal', 'message': 'success'}, (code, state)
+for _ in range(40):
+    code, resumed = call('GET', '/global-scheduler/resources', key=admin)
+    if code == 200 and resumed['resource']['fragment']['node']['status'] == 0:
+        break
+    time.sleep(.05)
+else:
+    raise AssertionError(('resumed node did not reopen admission', code, resumed))
+print('Scheduler resource alias, admin queue query and persistent node pause/resume passed')
+
 code, _ = call('POST', '/api/admin/v1/keys', {'tenantId': 'managed'})
 assert code == 403, code
 code, body = call('POST', '/api/admin/v1/keys', {'tenantId': 'managed'}, key=admin)

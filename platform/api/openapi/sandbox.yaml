@@ -25,26 +25,84 @@ tags:
   - name: Sandboxes
     description: Public Sandbox lifecycle and current execution view.
   - name: Resources
-    description: Current schedulable node capacity exposed to the Sandbox SDK.
+    description: Current online node capacity and admission status exposed to the Sandbox SDK.
+  - name: Scheduler compatibility
+    description: Administrator compatibility surface for established scheduler operations.
   - name: Snapshots
     description: Tenant-scoped reusable checkpoint catalog.
   - name: Agent Sandbox Service
     description: Service-authenticated Sandbox capability used by Agent components.
 paths:
+  /global-scheduler/resources:
+    get:
+      tags: [Scheduler compatibility]
+      operationId: listLegacySchedulerResources
+      summary: List online node resources using the legacy-compatible path
+      responses:
+        "200":
+          description: Current node capacity, allocatable resources and admission status.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/LegacyResourceResponse"}
+        default: {$ref: "#/components/responses/Error"}
+  /global-scheduler/scheduling_queue:
+    get:
+      tags: [Scheduler compatibility]
+      operationId: listLegacySchedulingQueue
+      summary: List requests waiting in the in-memory ShardScheduler queues
+      description: Administrator only. Assigned Capsules are not included.
+      responses:
+        "200":
+          description: Bounded waiting-request view.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/SchedulingQueue"}
+        default: {$ref: "#/components/responses/Error"}
+  /global-scheduler/node/localschedulingstatus:
+    parameters:
+      - name: node_id
+        in: query
+        required: true
+        schema: {type: string, minLength: 1}
+    post:
+      tags: [Scheduler compatibility]
+      operationId: pauseNodeScheduling
+      summary: Stop new scheduling to one node
+      description: Administrator only. Existing Capsules continue running.
+      responses:
+        "200":
+          description: Node admission is administratively paused.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/NodeSchedulingStatus"}
+        default: {$ref: "#/components/responses/Error"}
+    delete:
+      tags: [Scheduler compatibility]
+      operationId: resumeNodeScheduling
+      summary: Remove the administrative scheduling pause from one node
+      description: Administrator only. Local pressure and reconciliation can still keep admission closed.
+      responses:
+        "200":
+          description: Administrative pause is removed.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/NodeSchedulingStatus"}
+        default: {$ref: "#/components/responses/Error"}
   /api/sandbox/v1/resources:
     get:
       tags: [Resources]
       operationId: listSandboxResources
-      summary: List the current schedulable node resources
+      summary: List current online node resources and admission status
       description: |
-        Returns the API Server's fresh in-memory node directory. The directory
+        Returns the API Server's fresh in-memory node directory, including
+        online nodes whose new-allocation admission is paused. The directory
         is initialized by a complete Master watch frame and then refreshed by
         subsequent frames; an expired or unavailable view returns an error
         instead of stale capacity. CPU is reported in millicores and Memory and
         Disk in MiB.
       responses:
         "200":
-          description: Current node capacity and allocatable resources.
+          description: Current node capacity, allocatable resources and admission status.
           content:
             application/json:
               schema:
@@ -535,7 +593,7 @@ components:
         status:
           type: integer
           format: int32
-          description: NodeInfo status value; 1 means the node is currently schedulable.
+          description: Legacy UnitStatus compatibility value; 0 is normal and 1 is evicting/not accepting new allocations.
         capacity: {$ref: "#/components/schemas/NodeScalarResources"}
         allocatable: {$ref: "#/components/schemas/NodeScalarResources"}
         labels:
@@ -543,12 +601,85 @@ components:
           additionalProperties: {type: string}
     NodeScalarResources:
       type: object
-      additionalProperties: false
+      additionalProperties: {type: number, minimum: 0}
       required: [CPU, Memory, Disk]
       properties:
         CPU: {type: number, minimum: 0, description: CPU millicores}
         Memory: {type: number, minimum: 0, description: Memory MiB}
         Disk: {type: number, minimum: 0, description: Disk MiB}
+    NodeSchedulingStatus:
+      type: object
+      additionalProperties: false
+      required: [status, message]
+      properties:
+        status: {type: string, enum: [normal, evicting]}
+        message: {type: string}
+    LegacyResourceResponse:
+      type: object
+      additionalProperties: false
+      required: [requestID, resource]
+      properties:
+        requestID: {type: string}
+        resource: {$ref: "#/components/schemas/LegacyResourceUnit"}
+    LegacyResourceUnit:
+      type: object
+      required: [id, capacity, allocatable, status]
+      properties:
+        id: {type: string}
+        capacity: {$ref: "#/components/schemas/LegacyResources"}
+        allocatable: {$ref: "#/components/schemas/LegacyResources"}
+        status: {type: integer, description: 0 is normal and 1 is evicting.}
+        fragment:
+          type: object
+          additionalProperties: {$ref: "#/components/schemas/LegacyResourceUnit"}
+        nodeLabels:
+          type: object
+          additionalProperties:
+            type: object
+            required: [items]
+            properties:
+              items:
+                type: object
+                additionalProperties: {type: integer}
+    LegacyResources:
+      type: object
+      additionalProperties: false
+      required: [resources]
+      properties:
+        resources:
+          type: object
+          additionalProperties:
+            type: object
+            properties:
+              scalar:
+                type: object
+                required: [value]
+                properties:
+                  value: {type: number, minimum: 0}
+              vectors:
+                type: object
+                description: Legacy-compatible whole-card count vector for GPU/NPU resources.
+    SchedulingQueue:
+      type: object
+      additionalProperties: false
+      required: [count, instanceInfos]
+      properties:
+        count: {type: integer, minimum: 0}
+        instanceInfos:
+          type: array
+          maxItems: 10000
+          items:
+            type: object
+            additionalProperties: false
+            required: [instanceID, requestID, resources, enqueueTimeMs, waitDurationMs]
+            properties:
+              instanceID: {type: string}
+              requestID: {type: string, description: Same stable Capsule ID because ADX has no second scheduling-request identity.}
+              resources:
+                type: object
+                additionalProperties: {oneOf: [{type: string}, {type: number}]}
+              enqueueTimeMs: {type: string, pattern: "^[0-9]+$"}
+              waitDurationMs: {type: string, pattern: "^[0-9]+$"}
     CreateSandboxRequest:
       type: object
       additionalProperties: false

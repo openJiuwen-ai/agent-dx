@@ -62,6 +62,12 @@ pub struct Master {
     retired: BTreeSet<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingRequest {
+    pub spec: CapsuleSpec,
+    pub enqueue_time_millis: u64,
+}
+
 impl Master {
     pub fn metrics(&self) -> String {
         self.metrics_excluding(&BTreeSet::new()).finish()
@@ -305,11 +311,38 @@ impl Master {
         let shard = *self.node_shards.get(id)?;
         self.shards.get(shard)?.node_resources(id)
     }
+    pub fn node_devices(
+        &self,
+        id: &str,
+    ) -> Option<(
+        Vec<adx_core::scheduling::Device>,
+        Vec<adx_core::scheduling::Device>,
+    )> {
+        let shard = *self.node_shards.get(id)?;
+        self.shards.get(shard)?.node_devices(id)
+    }
     pub fn pending(&self, shard: usize) -> Result<usize> {
         self.shards
             .get(shard)
             .map(ShardScheduler::pending)
             .ok_or(Error::NotFound)
+    }
+    pub fn pending_requests(&self) -> Vec<PendingRequest> {
+        let mut requests = self
+            .shards
+            .iter()
+            .flat_map(ShardScheduler::pending_requests)
+            .map(|entry| PendingRequest {
+                spec: entry.spec.clone(),
+                enqueue_time_millis: entry.enqueue_time_millis,
+            })
+            .collect::<Vec<_>>();
+        requests.sort_by(|left, right| {
+            left.enqueue_time_millis
+                .cmp(&right.enqueue_time_millis)
+                .then_with(|| left.spec.id.cmp(&right.spec.id))
+        });
+        requests
     }
     pub fn stats(&self, shard: usize) -> Result<SchedulingStats> {
         self.shards
