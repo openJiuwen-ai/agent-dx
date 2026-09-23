@@ -1,4 +1,6 @@
+use adx_agent_core::sandbox::Sandbox;
 use adx_apiserver::{
+    activator::ActivatorSandboxAdapter,
     clients::Clients,
     config::{Config, IngressMode},
     http::Api,
@@ -6,6 +8,7 @@ use adx_apiserver::{
 };
 use adx_process::{read_config, shutdown};
 use adx_transport::tls::http_server_acceptor;
+use data_plane_gateway::ingress::sandbox_api::{EnvironmentRequestMapper, SandboxConfig};
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use std::{sync::Arc, time::Duration};
@@ -35,12 +38,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let listener = TcpListener::bind(config.listen).await?;
     let mut embedded_ingress = if config.ingress_mode == IngressMode::Embedded {
+        let sandbox_service = embedded_sandbox_service(&api)?;
         Some(
             EmbeddedIngress::start(
                 config
                     .ingress_control
                     .clone()
                     .ok_or("embedded Ingress control configuration missing")?,
+                sandbox_service,
             )
             .await
             .map_err(local_error)?,
@@ -121,6 +126,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err(error.into());
     }
     Ok(())
+}
+
+fn embedded_sandbox_service(
+    api: &Arc<Api>,
+) -> Result<Option<Arc<dyn Sandbox>>, Box<dyn std::error::Error>> {
+    let Ok(path) = std::env::var("ADX_SANDBOX_CONFIG") else {
+        return Ok(None);
+    };
+    let settings: SandboxConfig = serde_json::from_slice(&std::fs::read(path)?)
+        .map_err(|_| "invalid Sandbox configuration")?;
+    let mapper = EnvironmentRequestMapper::new(
+        settings.preinstalled_profiles,
+        std::env::var("ADX_SANDBOX_EXECD_TOKEN")?,
+    )
+    .map_err(|error| std::io::Error::other(error.to_string()))?;
+    Ok(Some(ActivatorSandboxAdapter::new(
+        api.sandbox_service.clone(),
+        mapper,
+    )))
 }
 
 fn local_error(error: Box<dyn std::error::Error + Send + Sync>) -> Box<dyn std::error::Error> {

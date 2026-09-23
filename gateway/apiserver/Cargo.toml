@@ -12,13 +12,15 @@ workspace = true
 
 [dependencies]
 adx-core = { path = "../../platform/crates/core" }
+adx-agent-core = { path = "../../agent/crates/core" }
 adx-protocol = { path = "../../platform/crates/protocol" }
 adx-error = { path = "../../crates/error" }
 adx-process = { path = "../../crates/process" }
 adx-transport = { path = "../../crates/transport" }
 adx-discovery = { path = "../../platform/crates/discovery" }
 adx-observability = { path = "../../crates/observability" }
-data-plane-gateway = { path = ".." }
+data-plane-gateway = { path = "..", features = ["agent-api"] }
+async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }

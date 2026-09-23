@@ -13,6 +13,11 @@ use tokio::{
 };
 use tokio_rustls::TlsAcceptor;
 
+#[cfg(feature = "agent-api")]
+type SandboxOverride = Option<Arc<dyn adx_agent_core::sandbox::Sandbox>>;
+#[cfg(not(feature = "agent-api"))]
+type SandboxOverride = ();
+
 pub type ServiceError = Box<dyn std::error::Error + Send + Sync>;
 
 pub struct IngressService {
@@ -32,6 +37,30 @@ pub struct IngressService {
 impl IngressService {
     /// Bind all public listeners before the owning process reports readiness.
     pub async fn bind(config: IngressConfig, control: ControlConfig) -> Result<Self, ServiceError> {
+        #[cfg(feature = "agent-api")]
+        let injected = None;
+        #[cfg(not(feature = "agent-api"))]
+        let injected = ();
+        Self::bind_inner(config, control, injected).await
+    }
+
+    /// Use the embedding API Server's Sandbox application service for Agent lifecycle calls.
+    #[cfg(feature = "agent-api")]
+    pub async fn bind_with_sandbox_service(
+        config: IngressConfig,
+        control: ControlConfig,
+        service: Arc<dyn adx_agent_core::sandbox::Sandbox>,
+    ) -> Result<Self, ServiceError> {
+        Self::bind_inner(config, control, Some(service)).await
+    }
+
+    async fn bind_inner(
+        config: IngressConfig,
+        control: ControlConfig,
+        injected: SandboxOverride,
+    ) -> Result<Self, ServiceError> {
+        #[cfg(not(feature = "agent-api"))]
+        let _ = injected;
         #[cfg(not(feature = "agent-api"))]
         if std::env::var_os("ADX_SANDBOX_CONFIG").is_some()
             || std::env::var_os("ADX_AGENT_CONFIG").is_some()
@@ -73,7 +102,19 @@ impl IngressService {
             use super::agent_api::{AgentApi, AgentConfig};
             let settings: AgentConfig = serde_json::from_slice(&std::fs::read(path)?)
                 .map_err(|_| "invalid Agent configuration")?;
-            Some(Arc::new(AgentApi::new(settings).map_err(send_error)?))
+            let api = if settings.embedded.is_some() {
+                AgentApi::new_embedded(
+                    settings,
+                    injected
+                        .clone()
+                        .ok_or("embedded Activator requires a Sandbox service")?,
+                )
+                .await
+                .map_err(send_error)?
+            } else {
+                AgentApi::new(settings).map_err(send_error)?
+            };
+            Some(Arc::new(api))
         } else {
             None
         };

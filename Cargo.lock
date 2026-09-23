@@ -68,6 +68,7 @@ dependencies = [
 name = "adx-apiserver"
 version = "0.1.0"
 dependencies = [
+ "adx-agent-core",
  "adx-core",
  "adx-discovery",
  "adx-error",
@@ -75,6 +76,7 @@ dependencies = [
  "adx-process",
  "adx-protocol",
  "adx-transport",
+ "async-trait",
  "base64 0.22.1",
  "bytes",
  "data-plane-gateway",

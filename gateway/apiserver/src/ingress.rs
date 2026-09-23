@@ -1,9 +1,11 @@
 //! Optional in-process Ingress using the same service as the standalone binary.
+use adx_agent_core::sandbox::Sandbox;
 use adx_process::resource::raise_nofile_soft_limit_from_env;
 use data_plane_gateway::{
     config::IngressConfig,
     ingress::{coordinator_routes::ControlConfig, IngressService},
 };
+use std::sync::Arc;
 use tokio::{sync::oneshot, task::JoinHandle};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -14,10 +16,19 @@ pub struct EmbeddedIngress {
 }
 
 impl EmbeddedIngress {
-    pub async fn start(control: ControlConfig) -> Result<Self> {
+    pub async fn start(
+        control: ControlConfig,
+        sandbox_service: Option<Arc<dyn Sandbox>>,
+    ) -> Result<Self> {
         let nofile_soft_limit = raise_nofile_soft_limit_from_env()?;
         adx_observability::info!(nofile_soft_limit, "embedded Ingress FD limit configured");
-        let service = IngressService::bind(IngressConfig::from_env()?, control).await?;
+        let config = IngressConfig::from_env()?;
+        let service = match sandbox_service {
+            Some(service) => {
+                IngressService::bind_with_sandbox_service(config, control, service).await?
+            }
+            None => IngressService::bind(config, control).await?,
+        };
         let (stop, stopped) = oneshot::channel();
         let task = tokio::spawn(async move {
             service
