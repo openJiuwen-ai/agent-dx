@@ -67,6 +67,9 @@ pub struct CreateSandbox {
     pub id: String,
     pub tenant: String,
     pub execution: ExecutionSpec,
+    /// Request metadata, not part of sandbox identity or execution specification.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline_unix_ms: Option<u64>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -103,8 +106,43 @@ impl std::fmt::Display for SandboxError {
 }
 impl std::error::Error for SandboxError {}
 
+/// Platform-owned description; optional fields are unavailable, never synthesized state.
+#[derive(Debug, Clone)]
+pub struct SandboxInfo {
+    pub observation: SandboxObservation,
+    pub node_ip: Option<String>,
+    pub sandbox_ip: Option<String>,
+    pub execution: Option<ExecutionSpec>,
+}
+/// Privileged in-process connection parameters. Never serialize or return to a public caller.
+pub struct SandboxRuntime {
+    pub port: u16,
+    pub token: String,
+}
+
 #[async_trait]
 pub trait Sandbox: Send + Sync {
+    async fn describe(&self, tenant: &str, id: &str) -> Result<Option<SandboxInfo>, SandboxError> {
+        Ok(self.get(tenant, id).await?.map(|observation| SandboxInfo {
+            observation,
+            node_ip: None,
+            sandbox_ip: None,
+            execution: None,
+        }))
+    }
+    /// A fresh, tenant-filtered Platform directory; no ADX instance index is maintained.
+    async fn list(&self, _tenant: &str) -> Result<Vec<SandboxInfo>, SandboxError> {
+        Err(SandboxError::Unsupported(
+            "Sandbox directory unavailable".into(),
+        ))
+    }
+    /// Only for the trusted Gateway inline adapter, after tenant authorization.
+    async fn runtime(&self, _tenant: &str, _id: &str) -> Result<SandboxRuntime, SandboxError> {
+        Err(SandboxError::Unsupported(
+            "Sandbox runtime access unavailable".into(),
+        ))
+    }
+
     /// Local admission validation only; implementations may reject deployment
     /// capabilities before any state or execution is created.
     fn validate_execution(&self, execution: &ExecutionSpec) -> Result<(), SandboxError> {

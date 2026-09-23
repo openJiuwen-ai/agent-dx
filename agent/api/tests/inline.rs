@@ -118,7 +118,14 @@ fn service(backend: Arc<Backend>) -> Arc<InlineService> {
 async fn inline_uses_sandbox_identity_and_survives_adapter_replacement_without_store() {
     let backend = Arc::new(Backend::default());
     let first = service(backend.clone());
-    let created = first.create("tenant", request()).await.unwrap();
+    let created = first
+        .create(
+            &adx_agent_api::request::RequestContext::new(std::time::Duration::from_secs(60)),
+            "tenant",
+            request(),
+        )
+        .await
+        .unwrap();
     assert!(uuid::Uuid::parse_str(&created.instance_id).is_ok());
     assert_eq!(backend.creates.load(Ordering::SeqCst), 1);
     assert!(backend
@@ -149,7 +156,17 @@ async fn create_returns_success_after_sandbox_acceptance() {
     let service = service(backend.clone());
     let task = tokio::spawn({
         let service = service.clone();
-        async move { service.create("tenant", request()).await }
+        async move {
+            service
+                .create(
+                    &adx_agent_api::request::RequestContext::new(std::time::Duration::from_secs(
+                        60,
+                    )),
+                    "tenant",
+                    request(),
+                )
+                .await
+        }
     });
     backend.create_entered.notified().await;
     assert!(!task.is_finished());
@@ -163,7 +180,14 @@ async fn lost_reply_reports_original_id_without_retrying_create() {
     let backend = Arc::new(Backend::default());
     backend.lose_create_response.store(true, Ordering::SeqCst);
     let first = service(backend.clone());
-    let error = first.create("tenant", request()).await.unwrap_err();
+    let error = first
+        .create(
+            &adx_agent_api::request::RequestContext::new(std::time::Duration::from_secs(60)),
+            "tenant",
+            request(),
+        )
+        .await
+        .unwrap_err();
     let id = backend
         .instances
         .lock()
@@ -188,7 +212,15 @@ async fn lost_reply_reports_original_id_without_retrying_create() {
 async fn delete_requires_sandbox_confirmation_and_can_be_retried() {
     let backend = Arc::new(Backend::default());
     let first = service(backend.clone());
-    let id = first.create("tenant", request()).await.unwrap().instance_id;
+    let id = first
+        .create(
+            &adx_agent_api::request::RequestContext::new(std::time::Duration::from_secs(60)),
+            "tenant",
+            request(),
+        )
+        .await
+        .unwrap()
+        .instance_id;
     backend.unknown_delete.store(true, Ordering::SeqCst);
     assert!(matches!(
         first.kill("tenant", &id).await,
@@ -206,7 +238,13 @@ async fn create_timeout_reports_unknown_outcome() {
     backend.pause_create.store(true, Ordering::SeqCst);
     let service = service(backend.clone());
     assert!(matches!(
-        service.create("tenant", request()).await,
+        service
+            .create(
+                &adx_agent_api::request::RequestContext::new(std::time::Duration::from_secs(60)),
+                "tenant",
+                request()
+            )
+            .await,
         Err(Error::OutcomeUnknown(_))
     ));
     assert_eq!(backend.creates.load(Ordering::SeqCst), 1);
@@ -216,7 +254,14 @@ async fn create_timeout_reports_unknown_outcome() {
 async fn invalid_identity_is_rejected_before_backend_operations() {
     let backend = Arc::new(Backend::default());
     let service = service(backend.clone());
-    assert!(service.create("", request()).await.is_err());
+    assert!(service
+        .create(
+            &adx_agent_api::request::RequestContext::new(std::time::Duration::from_secs(60)),
+            "",
+            request()
+        )
+        .await
+        .is_err());
     assert!(service.kill("tenant", "adx-managed-id").await.is_err());
     assert_eq!(backend.creates.load(Ordering::SeqCst), 0);
     assert_eq!(backend.deletes.load(Ordering::SeqCst), 0);
@@ -227,7 +272,11 @@ async fn delete_waits_for_backend_confirmation() {
     let backend = Arc::new(Backend::default());
     let service = service(backend.clone());
     let id = service
-        .create("tenant", request())
+        .create(
+            &adx_agent_api::request::RequestContext::new(std::time::Duration::from_secs(60)),
+            "tenant",
+            request(),
+        )
         .await
         .unwrap()
         .instance_id;
@@ -245,4 +294,32 @@ async fn delete_waits_for_backend_confirmation() {
         service.get("tenant", &id).await,
         Err(Error::NotFound)
     ));
+}
+
+#[tokio::test]
+async fn repeated_inline_create_reuses_frontend_name_identity_across_gateways() {
+    let backend = Arc::new(Backend::default());
+    let left = service(backend.clone());
+    let right = service(backend.clone());
+    let mut input = request();
+    input.runtime_spec.rootfs.as_mut().unwrap().workdir = Some("/".into());
+    let first = left
+        .create(
+            &adx_agent_api::request::RequestContext::new(std::time::Duration::from_secs(60)),
+            "tenant",
+            input,
+        )
+        .await
+        .unwrap();
+    let second = right
+        .create(
+            &adx_agent_api::request::RequestContext::new(std::time::Duration::from_secs(60)),
+            "tenant",
+            request(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.instance_id, second.instance_id);
+    assert_eq!(first.instance_id, "b5b6de24-58be-5299-8f05-7a188fdbf88d");
+    assert_eq!(backend.instances.lock().await.len(), 1);
 }

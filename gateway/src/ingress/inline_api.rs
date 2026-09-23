@@ -57,6 +57,7 @@ impl InlineApi {
     pub async fn management(
         &self,
         request: Request<hyper::body::Incoming>,
+        gateway: &super::server::Ingress,
     ) -> Response<super::server::ProxyBody> {
         let tenant = match self.auth.authenticate_management(&request).await {
             Ok(tenant) => tenant,
@@ -68,6 +69,9 @@ impl InlineApi {
                 )
             }
         };
+        if super::inline_runtime::matches(request.uri().path()) {
+            return super::inline_runtime::handle(request, &tenant, &self.service, gateway).await;
+        }
         super::agent_response::management(
             request,
             limits::AGENT_REQUEST_TIMEOUT,
@@ -116,10 +120,14 @@ impl InlineApi {
                 })?;
                 ctx.start_write();
                 Ok(
-                    serde_json::to_value(self.service.create(tenant, request).await?).map_err(
-                        |_| Error::Unavailable("inline response serialization failed".into()),
-                    )?,
+                    serde_json::to_value(self.service.create(ctx, tenant, request).await?)
+                        .map_err(|_| {
+                            Error::Unavailable("inline response serialization failed".into())
+                        })?,
                 )
+            }
+            (http::Method::GET, None) => {
+                Ok(serde_json::json!({"code":200,"instances":self.service.list(tenant).await?}))
             }
             (http::Method::GET, Some(id)) => {
                 Ok(serde_json::json!({"code":200,"instance":self.service.get(tenant,id).await?}))

@@ -1,13 +1,8 @@
 //! Agent transport composition. Management JSON is separate from unchanged data forwarding.
 use adx_agent_api::request::RequestContext;
-use adx_agent_api::{
-    activator::{ActivatorClient, Control},
-    local::LocalControl,
-    managed::ManagedService,
-    Error,
-};
+use adx_agent_api::{activator::ActivatorClient, managed::ManagedService, Error};
 use adx_agent_core::limits;
-use adx_agent_core::{sandbox::Sandbox, Protocol, Scope, TemplateVersion};
+use adx_agent_core::{Protocol, Scope, TemplateVersion};
 use bytes::Bytes;
 use http::{Request, Response};
 use http_body_util::BodyExt;
@@ -16,27 +11,12 @@ use std::{sync::Arc, time::Duration};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct RemoteActivatorConfig {
+pub struct ActivatorConfig {
     pub urls: Vec<String>,
     pub token_env: String,
     pub ca_path: Option<String>,
     #[serde(default)]
     pub allow_plaintext: bool,
-}
-
-#[derive(Default, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ActivatorMode {
-    #[default]
-    Embedded,
-    Remote,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct EmbeddedActivatorConfig {
-    pub redis_url: String,
-    pub namespace: String,
 }
 
 fn default_timeout_seconds() -> u64 {
@@ -46,24 +26,18 @@ fn default_timeout_seconds() -> u64 {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentConfig {
-    #[serde(default)]
-    pub mode: ActivatorMode,
     #[serde(default = "default_timeout_seconds")]
     pub timeout_seconds: u64,
-    pub embedded: Option<EmbeddedActivatorConfig>,
-    pub remote: Option<RemoteActivatorConfig>,
+    pub activator: ActivatorConfig,
 }
 pub struct AgentApi {
     pub managed: Arc<ManagedService>,
     pub request_timeout: Duration,
 }
 impl AgentApi {
-    /// Assemble local or remote control. Embedded mode requires the local Sandbox capability.
-    /// Configuration and Redis startup failures prevent Ingress readiness.
-    pub async fn new(
-        config: AgentConfig,
-        sandbox: Option<Arc<dyn Sandbox>>,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    /// Configure the independent Activator client. Invalid credentials, TLS or deadlines
+    /// fail startup; service availability is reported by individual requests.
+    pub fn new(config: AgentConfig) -> Result<Self, Box<dyn std::error::Error>> {
         let request_timeout = Duration::from_secs(config.timeout_seconds);
         if request_timeout.is_zero()
             || tokio::time::Instant::now()
@@ -74,36 +48,17 @@ impl AgentApi {
                 Error::Invalid("Agent timeout must be positive and representable".into()).into(),
             );
         }
-        let control: Arc<dyn Control> = match (config.mode, config.embedded, config.remote) {
-            (ActivatorMode::Embedded, Some(settings), None) => {
-                let sandbox = sandbox.ok_or_else(|| {
-                    Error::Invalid("embedded Activator requires ADX_SANDBOX_CONFIG".into())
-                })?;
-                Arc::new(
-                    LocalControl::connect(&settings.redis_url, &settings.namespace, sandbox)
-                        .await?,
-                )
-            }
-            (ActivatorMode::Remote, None, Some(settings)) => {
-                let token = std::env::var(&settings.token_env).map_err(|_| {
-                    Error::Invalid("Activator token environment variable missing".into())
-                })?;
-                let ca = settings.ca_path.map(std::fs::read).transpose()?;
-                Arc::new(ActivatorClient::new(
-                    settings.urls,
-                    token,
-                    request_timeout,
-                    ca.as_deref(),
-                    settings.allow_plaintext,
-                )?)
-            }
-            _ => {
-                return Err(Error::Invalid(
-                    "configure exactly the selected Activator mode: embedded or remote".into(),
-                )
-                .into())
-            }
-        };
+        let settings = config.activator;
+        let token = std::env::var(&settings.token_env)
+            .map_err(|_| Error::Invalid("Activator token environment variable missing".into()))?;
+        let ca = settings.ca_path.map(std::fs::read).transpose()?;
+        let control = Arc::new(ActivatorClient::new(
+            settings.urls,
+            token,
+            request_timeout,
+            ca.as_deref(),
+            settings.allow_plaintext,
+        )?);
         Ok(Self {
             managed: Arc::new(ManagedService::new(control)),
             request_timeout,
@@ -126,9 +81,6 @@ impl AgentApi {
     }
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct EnvironmentInput {}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ResolveInput {
@@ -229,18 +181,6 @@ impl AgentApi {
         };
         scope.validate().map_err(Error::Invalid)?;
         match (parts.method, action) {
-            (http::Method::PUT, []) => {
-                let bytes = read_body(body).await?;
-                if !bytes.is_empty() {
-                    serde_json::from_slice::<EnvironmentInput>(&bytes).map_err(|_| {
-                        Error::Invalid("Environment creation accepts no options".into())
-                    })?;
-                }
-
-                Ok(
-                    serde_json::json!({"environment":managed.create_environment(ctx, &scope).await?}),
-                )
-            }
             (http::Method::GET, []) => {
                 Ok(serde_json::json!({"environment":managed.environment(ctx, &scope).await?}))
             }

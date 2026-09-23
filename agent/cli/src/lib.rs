@@ -1,4 +1,5 @@
 //! ADX user CLI: public Gateway management APIs, configuration and command output.
+pub mod http;
 pub mod ssh;
 
 use adx_agent_core::{activator::default_page_size, limits, TemplateVersion};
@@ -55,6 +56,8 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// 通过 Gateway 调用 Harness HTTP 服务，响应正文按块输出。
+    Http(http::HttpArgs),
     /// 通过 Gateway 进入交互式 SSH 终端。
     Ssh(ssh::SshArgs),
     /// 发布或查询不可变模板版本。
@@ -241,10 +244,15 @@ impl Configuration {
         )
     }
     fn client(&self) -> Result<reqwest::Client> {
+        self.client_with_timeout(true)
+    }
+    fn client_with_timeout(&self, total_timeout: bool) -> Result<reqwest::Client> {
         let mut builder = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(limits::CONNECT_TIMEOUT.min(self.timeout))
-            .timeout(self.timeout);
+            .connect_timeout(limits::CONNECT_TIMEOUT.min(self.timeout));
+        if total_timeout {
+            builder = builder.timeout(self.timeout);
+        }
         if let Some(path) = &self.ca {
             let certificate = reqwest::Certificate::from_pem(&std::fs::read(path)?)
                 .map_err(|_| Error::Invalid("无效的 CA PEM 文件".into()))?;
@@ -286,6 +294,7 @@ fn route(endpoint: &Url, segments: &[&str]) -> Result<Url> {
 pub async fn execute(command: &Command, config: &Configuration) -> Result<CommandResult> {
     let mut body = None;
     let (method, url) = match command {
+        Command::Http(_) => return Err(Error::Invalid("HTTP 使用流式输出入口".into())),
         Command::Ssh(_) => return Err(Error::Invalid("SSH 使用交互终端入口".into())),
         Command::Template {
             command: TemplateCommand::Publish { file },

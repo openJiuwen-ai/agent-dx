@@ -1,14 +1,14 @@
-//! Gateway product facade. Redis and Sandbox access stay behind local or remote Activator.
+//! Gateway product facade. Product state and Sandbox lifecycle stay behind the independent Activator.
 use crate::request::RequestContext;
-use crate::{activator::Control, Error, Result};
+use crate::{activator::ActivatorClient, Error, Result};
 use adx_agent_core::{activator::Target, target::Target as AccessTarget, *};
 use std::sync::Arc;
 
 pub struct ManagedService {
-    control: Arc<dyn Control>,
+    control: Arc<ActivatorClient>,
 }
 impl ManagedService {
-    pub fn new(control: Arc<dyn Control>) -> Self {
+    pub fn new(control: Arc<ActivatorClient>) -> Self {
         Self { control }
     }
     /// Select an Environment identity without creating product or Sandbox state.
@@ -74,13 +74,6 @@ impl ManagedService {
         }
         value.validate().map_err(Error::Invalid)?;
         Ok(value)
-    }
-    pub async fn create_environment(
-        &self,
-        ctx: &RequestContext,
-        scope: &Scope,
-    ) -> Result<Environment> {
-        self.control.create_environment(ctx, scope).await
     }
     pub async fn environment(&self, ctx: &RequestContext, scope: &Scope) -> Result<Environment> {
         self.control.environment(ctx, scope).await

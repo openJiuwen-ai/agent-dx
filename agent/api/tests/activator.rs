@@ -1,10 +1,5 @@
 use adx_activator::Activator;
-use adx_agent_api::{
-    activator::{ActivatorClient, Control},
-    local::LocalControl,
-    managed::ManagedService,
-    Error,
-};
+use adx_agent_api::{activator::ActivatorClient, managed::ManagedService, Error};
 use adx_agent_core::{sandbox::*, *};
 use adx_agent_store::{AgentState, MemoryRepository};
 use std::{
@@ -55,7 +50,6 @@ async fn authenticated_services_observe_environment_deletion_and_recreation() {
     ));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
-    let local = Arc::new(LocalControl::new(activator.clone()));
     let app = adx_activator::server::router(activator, TOKEN, Duration::from_secs(3)).unwrap();
     let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -72,7 +66,17 @@ async fn authenticated_services_observe_environment_deletion_and_recreation() {
         .unwrap(),
     );
     let service = ManagedService::new(client.clone());
-    let other_gateway = ManagedService::new(local.clone());
+    let other_client = Arc::new(
+        ActivatorClient::new(
+            vec![url.clone()],
+            TOKEN.into(),
+            Duration::from_secs(2),
+            None,
+            true,
+        )
+        .unwrap(),
+    );
+    let other_gateway = ManagedService::new(other_client.clone());
     let template:TemplateVersion=serde_json::from_value(serde_json::json!({"name":"app","version":"1","image":"app:1","isolation_runtime":"runc","entrypoint":["/start"],"resources":{"cpu_millis":1000,"memory_mib":512},"service":[{"protocol":"http","port":8080}]})).unwrap();
     other_gateway
         .publish(&context(), "tenant", &template)
@@ -104,7 +108,11 @@ async fn authenticated_services_observe_environment_deletion_and_recreation() {
         .await
         .unwrap();
     assert_eq!(
-        local.create_environment(&context(), &scope).await.unwrap(),
+        other_client
+            .activate(&context(), &scope, None)
+            .await
+            .unwrap()
+            .environment,
         first.0.environment
     );
     let page = other_gateway
@@ -141,7 +149,7 @@ async fn authenticated_services_observe_environment_deletion_and_recreation() {
     assert_ne!(fresh.generation, env.generation);
     assert_ne!(fresh.sandbox_id, env.sandbox_id);
     assert!(matches!(
-        local
+        other_client
             .activate(&context(), &scope, Some(&env.generation))
             .await,
         Err(Error::Conflict(_))

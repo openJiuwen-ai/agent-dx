@@ -47,6 +47,19 @@ pub fn service_origin(address: &str, allow_http: bool) -> Result<url::Url, Strin
     Ok(url)
 }
 
+/// Absolute cross-process deadline. Clocks on service hosts must be synchronized.
+/// A local cap may shorten the caller's budget, never extend it.
+pub fn capped_deadline(deadline_unix_ms: Option<u64>, cap: std::time::Duration) -> u64 {
+    let local = crate::unix_time_millis()
+        .saturating_add(u64::try_from(cap.as_millis()).unwrap_or(u64::MAX));
+    deadline_unix_ms.map_or(local, |deadline| deadline.min(local))
+}
+
+/// Remaining time before an absolute deadline; zero means admission must stop.
+pub fn remaining_time(deadline_unix_ms: u64) -> std::time::Duration {
+    std::time::Duration::from_millis(deadline_unix_ms.saturating_sub(crate::unix_time_millis()))
+}
+
 /// Records entry into a potentially mutating service call. Reading/parsing a request
 /// is not a write. This is conservative, not evidence that a write actually committed.
 #[derive(Default)]

@@ -3,7 +3,9 @@
 use adx_agent_core::sandbox::*;
 use adx_agent_core::{
     limits,
-    transport::{validate_service_token, RequestProgress, ServiceAuth},
+    transport::{
+        capped_deadline, remaining_time, validate_service_token, RequestProgress, ServiceAuth,
+    },
 };
 use adx_discovery::RedisDiscovery;
 use adx_protocol::control as pb;
@@ -128,6 +130,71 @@ impl PlatformSandbox {
                 Err(rpc_error(status, false))
             }
         }
+    }
+    fn information(
+        profiles: &[PreinstalledProfile],
+        response: pb::GetEnvironmentResponse,
+    ) -> Result<SandboxInfo> {
+        let record = response
+            .record
+            .ok_or_else(|| SandboxError::Unavailable("missing Platform record".into()))?;
+        let spec = record
+            .spec
+            .as_ref()
+            .ok_or_else(|| SandboxError::Unavailable("missing Platform spec".into()))?;
+        let mut matching = profiles.iter().filter(|profile| {
+            profile.image == spec.image
+                && profile.isolation_runtime == spec.runtime_class
+                && profile.config_path.as_ref() == spec.env.get("ADX_IMAGE_PROCESS_CONFIG")
+                && spec.env.get("EXECD_HTTP_PORT") == Some(&profile.execd_port.to_string())
+        });
+        let profile = matching.next().filter(|_| matching.next().is_none());
+        let execution = profile.and_then(|profile| {
+            let resources = spec.resources.as_ref()?;
+            let execution = ExecutionSpec {
+                image: spec.image.clone(),
+                isolation_runtime: spec.runtime_class.clone(),
+                entrypoint: profile.entrypoint.clone(),
+                working_dir: profile.working_dir.clone(),
+                user: profile.user.clone(),
+                env: spec
+                    .env
+                    .iter()
+                    .filter(|(key, _)| {
+                        !matches!(
+                            key.as_str(),
+                            "EXECD_HTTP_TOKEN"
+                                | "EXECD_HTTP_PORT"
+                                | "ADX_IMAGE_PROCESS_CONFIG"
+                                | EXECUTION_HASH
+                        )
+                    })
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+                resources: adx_agent_core::Resources {
+                    cpu_millis: resources.cpu_millis,
+                    memory_mib: resources.memory_bytes / (1024 * 1024),
+                },
+                service: vec![],
+            };
+            Some(execution)
+        });
+        let node_ip = response
+            .node_address
+            .parse::<std::net::SocketAddr>()
+            .ok()
+            .map(|address| address.ip().to_string());
+        let sandbox_ip = record
+            .runtime
+            .as_ref()
+            .map(|runtime| runtime.ip.clone())
+            .filter(|ip| !ip.is_empty());
+        Ok(SandboxInfo {
+            observation: Self::observation(record)?,
+            node_ip,
+            sandbox_ip,
+            execution,
+        })
     }
     fn observation(record: pb::EnvironmentRecord) -> Result<SandboxObservation> {
         let spec = record.spec.as_ref().ok_or_else(|| {
@@ -319,23 +386,114 @@ fn to_platform(
 }
 #[async_trait]
 impl Sandbox for PlatformSandbox {
+    async fn describe(&self, tenant: &str, id: &str) -> Result<Option<SandboxInfo>> {
+        self.inspect(tenant, id)
+            .await?
+            .map(|value| Self::information(&self.profiles, value))
+            .transpose()
+    }
+    async fn list(&self, tenant: &str) -> Result<Vec<SandboxInfo>> {
+        validate_identity(tenant, "list")?;
+        let mut client =
+            pb::environment_directory_service_client::EnvironmentDirectoryServiceClient::new(
+                self.coordinator().await?,
+            )
+            .max_decoding_message_size(64 * 1024 * 1024);
+        let frame = tokio::time::timeout(self.timeout, async {
+            let mut stream = client
+                .watch_environments(pb::WatchEnvironmentsRequest {})
+                .await
+                .map_err(|s| rpc_error(s, false))?
+                .into_inner();
+            stream
+                .message()
+                .await
+                .map_err(|s| rpc_error(s, false))?
+                .ok_or_else(|| {
+                    SandboxError::Unavailable("Platform directory closed before snapshot".into())
+                })
+        })
+        .await
+        .map_err(|_| SandboxError::Unavailable("Platform directory timed out".into()))??;
+        if !frame.reset || frame.base_revision != 0 || frame.epoch == 0 || frame.revision == 0 {
+            return Err(SandboxError::Unavailable(
+                "invalid initial Platform directory snapshot".into(),
+            ));
+        }
+        frame
+            .upserts
+            .into_iter()
+            .filter(|entry| {
+                entry.record.as_ref().is_some_and(|record| {
+                    record.state == pb::EnvironmentState::Running as i32
+                        && record.spec.as_ref().is_some_and(|spec| {
+                            spec.tenant_id == tenant && spec.env.contains_key(EXECUTION_HASH)
+                        })
+                })
+            })
+            .map(|entry| {
+                Self::information(
+                    &self.profiles,
+                    pb::GetEnvironmentResponse {
+                        record: entry.record,
+                        node_address: entry.node_address,
+                        relay_address: entry.relay_address,
+                    },
+                )
+            })
+            .collect()
+    }
+    async fn runtime(&self, tenant: &str, id: &str) -> Result<SandboxRuntime> {
+        let response = self
+            .inspect(tenant, id)
+            .await?
+            .ok_or(SandboxError::NotFound)?;
+        let record = response
+            .record
+            .ok_or_else(|| SandboxError::Unavailable("missing Platform record".into()))?;
+        if record.state != pb::EnvironmentState::Running as i32 {
+            return Err(SandboxError::Conflict("Sandbox is not running".into()));
+        }
+        let spec = record
+            .spec
+            .ok_or_else(|| SandboxError::Unavailable("missing Platform spec".into()))?;
+        let port = spec
+            .env
+            .get("EXECD_HTTP_PORT")
+            .and_then(|port| port.parse::<u16>().ok())
+            .filter(|port| *port > 0)
+            .ok_or_else(|| SandboxError::Unsupported("Sandbox has no Execd HTTP port".into()))?;
+        let token = spec
+            .env
+            .get("EXECD_HTTP_TOKEN")
+            .filter(|token| validate_service_token(token).is_ok())
+            .ok_or_else(|| {
+                SandboxError::Unavailable("Sandbox runtime credential unavailable".into())
+            })?
+            .clone();
+        Ok(SandboxRuntime { port, token })
+    }
+
     fn validate_execution(&self, execution: &ExecutionSpec) -> Result<()> {
         matching_profile(execution, &self.profiles).map(|_| ())
     }
     async fn create(&self, request: &CreateSandbox) -> Result<SandboxObservation> {
         let spec = to_platform(request, &self.profiles, &self.execd_token)?;
-        let mut client = pb::coordinator_service_client::CoordinatorServiceClient::new(
-            self.coordinator().await?,
-        );
-        match client
-            .create_environment(pb::CreateEnvironmentRequest {
-                spec: Some(spec),
-                caller: Some(caller(&request.tenant)),
-                schedule_timeout_seconds: 30,
-                create_timeout_seconds: 90,
-            })
+        let deadline = capped_deadline(request.deadline_unix_ms, self.timeout);
+        let remaining = remaining_time(deadline);
+        if remaining.is_zero() {
+            return Err(SandboxError::Unavailable(
+                "Sandbox create deadline expired before discovery".into(),
+            ));
+        }
+        let channel = tokio::time::timeout(remaining, self.coordinator())
             .await
-        {
+            .map_err(|_| {
+                SandboxError::Unavailable("Coordinator discovery exceeded create deadline".into())
+            })??;
+        let mut client = pb::coordinator_service_client::CoordinatorServiceClient::new(channel);
+        let rpc = create_rpc(spec, &request.tenant, remaining_time(deadline))?;
+        match client.create_environment(rpc).await {
             Ok(response) => {
                 let response = response.into_inner();
                 validate_record(response.record.as_ref(), &request.tenant, &request.id)?;
@@ -392,6 +550,31 @@ impl Sandbox for PlatformSandbox {
     }
 }
 
+/// Coordinator currently consumes only the scheduling field on assigned creates. Send the
+/// same remaining budget in both fields and in gRPC metadata; Node lifecycle work may
+/// still finish after a lost response (see Platform gaps).
+fn create_rpc(
+    spec: pb::EnvironmentSpec,
+    tenant: &str,
+    remaining: Duration,
+) -> Result<tonic::Request<pb::CreateEnvironmentRequest>> {
+    // Platform interprets zero seconds as a fresh default budget. Never send zero.
+    let seconds = remaining.as_secs();
+    if seconds == 0 {
+        return Err(SandboxError::Unavailable(
+            "insufficient create budget before submission".into(),
+        ));
+    }
+    let mut request = tonic::Request::new(pb::CreateEnvironmentRequest {
+        spec: Some(spec),
+        caller: Some(caller(tenant)),
+        schedule_timeout_seconds: seconds,
+        create_timeout_seconds: seconds,
+    });
+    request.set_timeout(remaining);
+    Ok(request)
+}
+
 /// Transport/authentication only; implementation is also callable in-process by Agent APIs.
 pub struct SandboxApi {
     pub backend: Arc<dyn Sandbox>,
@@ -423,9 +606,10 @@ impl SandboxApi {
         authenticated_tenant: Option<&str>,
     ) -> http::Response<super::server::ProxyBody> {
         let progress = RequestProgress::default();
+        let deadline = capped_deadline(None, limits::SANDBOX_REQUEST_TIMEOUT);
         let response = match tokio::time::timeout(
             limits::SANDBOX_REQUEST_TIMEOUT,
-            self.dispatch(request, authenticated_tenant, &progress),
+            self.dispatch(request, authenticated_tenant, &progress, deadline),
         )
         .await
         {
@@ -460,6 +644,7 @@ impl SandboxApi {
         request: http::Request<hyper::body::Incoming>,
         authenticated_tenant: Option<&str>,
         progress: &RequestProgress,
+        deadline: u64,
     ) -> Result<Option<SandboxObservation>> {
         let (parts, body) = request.into_parts();
         let pairs: Vec<_> = url::form_urlencoded::parse(parts.uri.query().unwrap_or("").as_bytes())
@@ -504,15 +689,34 @@ impl SandboxApi {
                         SandboxError::Invalid("invalid or oversized Sandbox request".into())
                     })?
                     .to_bytes();
-                let request: CreateSandbox = serde_json::from_slice(&bytes)
+                let mut request: CreateSandbox = serde_json::from_slice(&bytes)
                     .map_err(|_| SandboxError::Invalid("invalid Sandbox create JSON".into()))?;
                 if &request.tenant != tenant {
                     return Err(SandboxError::Invalid(
                         "body and query tenant disagree".into(),
                     ));
                 }
+                request.deadline_unix_ms = Some(
+                    request
+                        .deadline_unix_ms
+                        .map_or(deadline, |caller| caller.min(deadline)),
+                );
+                let remaining =
+                    remaining_time(request.deadline_unix_ms.expect("deadline assigned above"));
+                if remaining.is_zero() {
+                    return Err(SandboxError::Unavailable(
+                        "Sandbox create deadline expired before submission".into(),
+                    ));
+                }
                 progress.start_write();
-                self.backend.create(&request).await.map(Some)
+                tokio::time::timeout(remaining, self.backend.create(&request))
+                    .await
+                    .map_err(|_| {
+                        SandboxError::OutcomeUnknown(
+                            "Sandbox create response timed out; inspect the original ID".into(),
+                        )
+                    })?
+                    .map(Some)
             }
             (http::Method::GET, Some(id)) => self.backend.get(tenant, &id).await,
             (http::Method::DELETE, Some(id)) => {
@@ -550,6 +754,21 @@ mod tests {
     use super::*;
     use adx_agent_core::{Protocol, Resources, Service};
     use hyper_util::rt::TokioIo;
+    #[test]
+    fn create_rpc_forwards_remaining_budget_and_identity() {
+        let spec = to_platform(&request(), &[profile()], "test-token").unwrap();
+        let rpc = create_rpc(spec.clone(), "tenant", Duration::from_millis(12_500)).unwrap();
+        assert!(rpc.metadata().get("grpc-timeout").is_some());
+        let payload = rpc.into_inner();
+        assert_eq!(payload.schedule_timeout_seconds, 12);
+        assert_eq!(payload.create_timeout_seconds, 12);
+        assert_eq!(payload.spec.unwrap().id, "sandbox-id");
+        assert_eq!(payload.caller.unwrap().tenant_id, "tenant");
+        assert!(matches!(
+            create_rpc(spec, "tenant", Duration::from_millis(999)),
+            Err(SandboxError::Unavailable(_))
+        ));
+    }
     #[test]
     fn platform_authorization_errors_preserve_tenant_privacy_and_write_uncertainty() {
         for write in [false, true] {
@@ -591,6 +810,7 @@ mod tests {
     fn request() -> CreateSandbox {
         let p = profile();
         CreateSandbox {
+            deadline_unix_ms: None,
             id: "sandbox-id".into(),
             tenant: "tenant".into(),
             execution: ExecutionSpec {
@@ -638,6 +858,40 @@ mod tests {
             mapped.env[EXECUTION_HASH],
             to_platform(&other, &[profile()], "test-token").unwrap().env[EXECUTION_HASH]
         );
+    }
+    #[test]
+    fn platform_description_preserves_runtime_identity_and_public_configuration() {
+        let mut create = request();
+        create
+            .execution
+            .env
+            .insert("APP_MODE".into(), "test".into());
+        let spec = to_platform(&create, &[profile()], "runtime-secret").unwrap();
+        let info = PlatformSandbox::information(
+            &[profile()],
+            pb::GetEnvironmentResponse {
+                record: Some(pb::EnvironmentRecord {
+                    spec: Some(spec),
+                    state: pb::EnvironmentState::Running as i32,
+                    runtime: Some(pb::Runtime {
+                        id: "container-1".into(),
+                        ip: "10.0.0.2".into(),
+                    }),
+                    ..Default::default()
+                }),
+                node_address: "10.0.0.1:9000".into(),
+                relay_address: "10.0.0.1:9443".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(info.observation.id, create.id);
+        assert_eq!(info.observation.runtime_id.as_deref(), Some("container-1"));
+        assert_eq!(info.node_ip.as_deref(), Some("10.0.0.1"));
+        assert_eq!(info.sandbox_ip.as_deref(), Some("10.0.0.2"));
+        let execution = info.execution.unwrap();
+        assert_eq!(execution.env, create.execution.env);
+        assert_eq!(execution.entrypoint, create.execution.entrypoint);
+        assert_eq!(execution.resources, create.execution.resources);
     }
     #[test]
     fn startup_intent_cannot_be_silently_replaced_by_a_preset() {
@@ -730,7 +984,15 @@ mod tests {
             "rootfs":{"imageurl":profile().image},"cmds":[["/unsupported"]]}
         })).unwrap();
         assert!(matches!(
-            service.create("tenant", request.clone()).await,
+            service
+                .create(
+                    &adx_agent_api::request::RequestContext::new(std::time::Duration::from_secs(
+                        60
+                    )),
+                    "tenant",
+                    request.clone()
+                )
+                .await,
             Err(adx_agent_api::Error::Unsupported(_))
         ));
     }

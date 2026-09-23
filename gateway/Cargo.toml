@@ -33,9 +33,10 @@ default = ["activity-client"]
 activity-client = ["dep:prost", "dep:tonic", "dep:tower"]
 etcd-watch = ["dep:etcd-client"]
 mock-e2e = []
-agent-api = ["activity-client", "dep:adx-agent-core", "dep:adx-agent-api", "dep:russh"]
+agent-api = ["activity-client", "dep:adx-agent-core", "dep:adx-agent-api", "dep:russh", "dep:multer"]
 
 [dependencies]
+multer = { version = "3", optional = true }
 russh = { version = "0.63.3", default-features = false, features = ["ring"], optional = true }
 adx-agent-core = { path = "../agent/crates/core", optional = true }
 adx-agent-api = { path = "../agent/api", optional = true }
@@ -76,6 +77,7 @@ tokio-tungstenite = "0.24"
 tokio-stream = { version = "0.1", features = ["net"] }
 
 [dev-dependencies]
+axum = { version = "0.7", default-features = false, features = ["http1", "json", "tokio"] }
 rand = "0.10"
 adx-activator = { path = "../agent/activator" }
 adx-agent-store = { path = "../agent/crates/store", features = ["test-memory"] }

@@ -51,7 +51,7 @@ async fn a_definite_local_error_before_deadline_is_preserved() {
 
 #[tokio::test]
 async fn remote_calls_propagate_the_remaining_request_budget() {
-    use adx_agent_api::activator::{ActivatorClient, Control};
+    use adx_agent_api::activator::ActivatorClient;
     use axum::{http::HeaderMap, routing::post, Json, Router};
     use std::sync::{Arc, Mutex};
     let deadlines = Arc::new(Mutex::new(Vec::<u64>::new()));

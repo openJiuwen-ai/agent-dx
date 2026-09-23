@@ -545,7 +545,11 @@ impl Ingress {
         }
     }
 
-    fn authorize(&self, route: &RouteHandle, tenant_id: &str) -> Result<(), IngressOpenError> {
+    pub(super) fn authorize(
+        &self,
+        route: &RouteHandle,
+        tenant_id: &str,
+    ) -> Result<(), IngressOpenError> {
         if tenant_id.is_empty() {
             return Ok(());
         }
@@ -755,7 +759,7 @@ impl Ingress {
                         self.inline_api
                             .as_ref()
                             .expect("matched configured inline API")
-                            .management(request)
+                            .management(request, &self)
                             .await
                     }
                 }
