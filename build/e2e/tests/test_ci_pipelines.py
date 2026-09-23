@@ -13,16 +13,15 @@ class IndependentPipelineTests(unittest.TestCase):
     def test_product_pipelines_have_separate_configs_and_steps(self):
         package = (ROOT / '.buildkite/pipeline-package.yml').read_text()
         sdk = (ROOT / '.buildkite/pipeline-sdk.yml').read_text()
-        admin = (ROOT / '.buildkite/pipeline-admin.yml').read_text()
+        admin = package
         full = (ROOT / '.buildkite/pipeline-full.yml').read_text()
 
         self.assertIn('key: platform-build', package)
         for key in ('build-platform', 'build-gateway', 'build-execd', 'source-gate'):
             self.assertIn(f'key: {key}', package)
-        self.assertIn(
-            'depends_on: [build-platform, build-gateway, build-execd, source-gate, admin-gate]',
-            package,
-        )
+        steps = {step['key']: step for step in yaml.safe_load(package)['steps']}
+        self.assertEqual(set(steps['platform-build']['depends_on']),
+                         {'build-platform', 'build-gateway', 'build-execd', 'source-gate', 'admin-package'})
         self.assertNotIn('key: platform-e2e', package)
         self.assertNotIn('key: sdk-package', package)
 
@@ -35,7 +34,6 @@ class IndependentPipelineTests(unittest.TestCase):
         self.assertIn('key: admin-package', admin)
         self.assertIn('key: admin-pypi', admin)
         self.assertIn('ADX_ADMIN_PYPI_UPLOAD', admin)
-        self.assertNotIn('key: platform-build', admin)
         self.assertNotIn('key: sdk-package', admin)
 
         self.assertIn('key: platform-images', full)
@@ -44,17 +42,20 @@ class IndependentPipelineTests(unittest.TestCase):
         self.assertNotIn('key: platform-build', full)
         self.assertNotIn('key: sdk-package', full)
 
-    def test_admin_gate_uses_sdk_python_image_and_blocks_assembly(self):
+    def test_admin_package_uses_sdk_runner_and_blocks_assembly(self):
         package = yaml.safe_load((ROOT / '.buildkite/pipeline-package.yml').read_text())
         steps = {step['key']: step for step in package['steps']}
         sdk = yaml.safe_load((ROOT / '.buildkite/pipeline-sdk.yml').read_text())
         python_image = sdk['steps'][0]['env']['ADX_SDK_TEST_IMAGE']
-        admin = steps['admin-gate']
-        self.assertEqual(admin['plugins'][0]['kubernetes']['podSpec']['containers'][0]['image'],
-                         python_image)
-        self.assertIn('admin-gate', steps['platform-build']['depends_on'])
-        self.assertIn('build/admin/test.sh', admin['command'])
-        self.assertNotIn('tools/admin/tests', (ROOT / '.buildkite/source-gate.sh').read_text())
+        admin = steps['admin-package']
+        self.assertEqual(admin['env']['ADX_SDK_TEST_IMAGE'], python_image)
+        self.assertIn('admin-package', steps['platform-build']['depends_on'])
+        self.assertIn('.buildkite/build-sdk.sh admin', admin['command'])
+        self.assertNotIn('admin-gate', steps)
+        self.assertNotIn('platform-obs', steps)
+        self.assertEqual(steps['admin-pypi']['depends_on'], 'platform-build')
+        self.assertNotIn('artifact download', (ROOT / '.buildkite/upload-obs.sh').read_text())
+        self.assertIn('bash .buildkite/upload-obs.sh', (ROOT / '.buildkite/package-components.sh').read_text())
 
     def test_default_entrypoint_dispatches_by_buildkite_pipeline_slug(self):
         pipeline = (ROOT / '.buildkite/pipeline.yml').read_text()
@@ -64,12 +65,12 @@ class IndependentPipelineTests(unittest.TestCase):
         self.assertIn('pipeline-sdk.yml', selector)
         self.assertIn('agent-dx-full-test', selector)
         self.assertIn('pipeline-full.yml', selector)
-        self.assertIn('agent-dx-admin', selector)
-        self.assertIn('pipeline-admin.yml', selector)
+        self.assertNotIn('agent-dx-admin', selector)
+        self.assertFalse((ROOT / '.buildkite/pipeline-admin.yml').exists())
         self.assertIn('pipeline-package.yml', selector)
 
     def test_admin_publish_is_explicit_and_verifies_the_index(self):
-        pipeline = (ROOT / '.buildkite/pipeline-admin.yml').read_text()
+        pipeline = (ROOT / '.buildkite/pipeline-package.yml').read_text()
         publisher = (ROOT / '.buildkite/publish-admin-pypi.sh').read_text()
         self.assertIn('build.env("ADX_ADMIN_PYPI_UPLOAD") == "1"', pipeline)
         self.assertIn('build.tag != null', pipeline)

@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
+case "${ADX_ADMIN_PYPI_UPLOAD:-0}" in
+  0) echo 'PyPI publication disabled (ADX_ADMIN_PYPI_UPLOAD=0)'; exit 0 ;;
+  1) ;;
+  *) echo 'ADX_ADMIN_PYPI_UPLOAD must be 0 or 1' >&2; exit 2 ;;
+esac
 
 : "${BUILDKITE_COMMIT:?Buildkite revision required}"
 : "${BUILDKITE_BUILD_ID:?Buildkite build ID required}"

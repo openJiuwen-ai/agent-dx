@@ -16,6 +16,8 @@ rm -rf "$output"
 mkdir -p "$output"
 jobs=${JOBS:-4}
 
+bash .buildkite/component-tests.sh "$component"
+
 case "$component" in
   platform)
     echo "--- :rust: Compile Platform"
@@ -55,3 +57,5 @@ python3 build/release/component.py create \
   --commit "$BUILDKITE_COMMIT" \
   --target "$ADX_RELEASE_TARGET"
 tar -czf "out/buildkite/components/$component.tar.gz" -C "$output" .
+
+bash .buildkite/component-transfer.sh upload "$component"

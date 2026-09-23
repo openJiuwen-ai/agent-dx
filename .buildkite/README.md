@@ -1,12 +1,11 @@
 # ADX Buildkite pipelines
 
-ADX uses four independent Buildkite pipelines backed by one repository:
+ADX uses three independent Buildkite pipelines backed by one repository:
 
 | Buildkite pipeline | Configuration | Responsibility |
 |---|---|---|
-| `agent-dx` | `pipeline-package.yml` | Rust/platform checks, base package and optional OBS publication |
+| `agent-dx` | `pipeline-package.yml` | Per-component UT and packaging, adxadmin wheel/sdist, assembly/install smoke, optional OBS and adxadmin PyPI publication |
 | `agent-dx-python-sdk` | `pipeline-sdk.yml` | Python SDK tests, wheel/sdist, clean install smoke and optional OBS/PyPI publication |
-| `agent-dx-admin` | `pipeline-admin.yml` | `adxadmin` tests, wheel/sdist, clean install smoke and optional PyPI/TestPyPI publication |
 | `agent-dx-full-test` | `pipeline-full.yml` | Compose exact base/SDK candidates and run the ten-group Kubernetes Full gate |
 
 `.buildkite/pipeline.yml` only dispatches by `BUILDKITE_PIPELINE_SLUG`; it does
@@ -23,23 +22,40 @@ The current formal validation used commit
 The optimized base build completed in 3 minutes 30 seconds, compared with
 7 minutes 11 seconds for the previous serial #65 build. Full passed all ten
 groups on two physical workers with no missing checks or cleanup errors.
-The `agent-dx-admin` configuration was added later and is not part of that
-historical three-pipeline validation record.
+## Pipeline controls
 
-Create a Buildkite pipeline named `agent-dx-admin` against the same repository
-and keep the default configuration path `.buildkite/pipeline.yml`; the selector
-dispatches that slug to `pipeline-admin.yml`. Set the pipeline default
-`ADX_ADMIN_PYPI_UPLOAD=0`. A release build must be created from the exact
-`adxadmin-v<version>` Git tag and explicitly override the upload variable to
-`1`; set `ADX_ADMIN_PYPI_REPOSITORY=testpypi` for a rehearsal.
+Publication is opt-in; ordinary builds retain candidates without publishing to a package index.
+Set these variables on a Buildkite build or in that pipeline's environment settings.
+
+| Variable | Default | Applies to / responsibility |
+|---|---|---|
+| `ADX_OBS_UPLOAD` | `0` | Base/SDK: `1` publishes final artifacts to OBS |
+| `ADX_OBS_UPLOAD_CHANNEL` | `daily` | Base/SDK: `daily` or `release` |
+| `ADX_RELEASE_VERSION` | tag-derived | OBS release path version |
+| `ADX_OBS_BUCKET` / `ADX_OBS_ENDPOINT` | `openyuanrong` / `obs.cn-southwest-2.myhuaweicloud.com` | OBS intermediate transport and final publication destination |
+| `ADX_ARTIFACT_TRANSPORT` | `obs` | Base components: `obs` staging or explicit `buildkite` transport |
+| `ADX_ADMIN_PYPI_UPLOAD` | `0` | Base: `1` enables adxadmin publication, exact `adxadmin-v<version>` tag required |
+| `ADX_ADMIN_PYPI_REPOSITORY` | `pypi` | Base: `pypi` or `testpypi` |
+| `ADX_SDK_PYPI_UPLOAD` | `0` | SDK: `1` enables Sandbox SDK publication, exact `sdk-v<version>` tag required |
+| `ADX_SDK_PYPI_REPOSITORY` | `pypi` | SDK: `pypi` or `testpypi` |
+| `ADX_BASE_PACKAGE_BUILD_ID` / `ADX_SDK_BUILD_ID` | required | Full: exact input candidates; Full never publishes Python packages |
+
+Boolean controls accept only `0` or `1`. Component transport is independent of
+formal publication: `ADX_OBS_UPLOAD=0` still permits intermediate OBS transfers
+when `ADX_ARTIFACT_TRANSPORT=obs`. To build without OBS, select `buildkite` and
+leave `ADX_OBS_UPLOAD=0`. Missing OBS credentials or corrupt files fail the job;
+there is no silent transport fallback. Temporary artifacts use
+`adx/ci/<build UUID>/<commit>/<component>/`, with commit/build/group and SHA256
+checked before extraction. Configure bucket retention for this temporary prefix
+separately from `adx/daily/` and `adx/release/`.
 
 ## Python test environment
 
-The base pipeline's `admin-gate` runs adxadmin tests in the digest-pinned Python
-3.12 SDK runtime image, with an isolated virtual environment and `httpx==0.28.1`.
-It blocks package assembly alongside `source-gate`. The Rust builder's Python
-3.9 remains responsible for build tooling; it does not run adxadmin, which
-requires Python 3.10 or newer.
+The base pipeline's `admin-package` uses the same outer Docker runner as the SDK
+pipeline, with the digest-pinned Python 3.12 image. It runs UT, builds wheel/sdist,
+checks them with Twine and performs a clean installation smoke test. The outer
+runner verifies the exact clean Git checkout. The Python image does not need Git.
+Rust build tooling continues to use the builder's Python 3.9.
 
 ## Base package deployment mode
 
@@ -47,9 +63,9 @@ The base package ships `adxctl`, `adx-coordinator`, `adxlet`, `adx-apiserver`
 and Redis. Ingress runs inside API Server; Relay runs inside adxlet. Separate
 Ingress/Relay executables and the debug forwarder are not compiled or archived
 by release steps. Execd and the SDK remain in the unified release archive.
-Set `ADX_OBS_UPLOAD=1` when triggering the base pipeline to enable the dependent
-`platform-obs` job. It verifies the assembled archive and build manifest before
-uploading artifacts and publishing `out/buildkite/obs/manifest.json` and URLs.
+Set `ADX_OBS_UPLOAD=1` to upload verified local outputs at the end of
+`platform-build`, including adxadmin candidates. The same job publishes
+`out/buildkite/obs/manifest.json` and URLs without downloading the assembled package again.
 
 ## Optional PyPI publication
 
@@ -151,8 +167,8 @@ and the Kubernetes plugin. Worker images follow the existing CI profiles:
 | Step | Reused worker image |
 |---|---|
 | `build-platform` / `build-gateway` / `build-execd` / `source-gate` | immutable `ci_image` digest in `build/images/build-environment.json` |
-| `platform-build` / `platform-obs` | same immutable ADX build image |
-| `sdk-package` / `platform-images` | `swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/sandbox-packager:v20260506_kubectl` |
+| `platform-build` | same immutable ADX build image |
+| `admin-package` / `sdk-package` / `platform-images` | `swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/sandbox-packager:v20260506_kubectl` |
 | `platform-e2e` | `swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/sandbox-deployer:v20260506_kubectl_py39` |
 
 The builder reuses `/mnt/paas` with ADX cache subdirectories. The packager uses
@@ -186,13 +202,22 @@ dependency in the Ubuntu runtime image.
 
 ## Artifact handoff and acceptance
 
-`build-platform`, `build-gateway` and `build-execd` compile in parallel with
-separate target directories, while `source-gate` runs the source and unit-test
-gate. Each compile step uploads a component archive and manifest. After all four
-steps pass, `platform-build` verifies those immutable handoff artifacts and
-assembles the ADX base package without recompiling them. `build-manifest.json`
-binds the source commit, component manifests, release archive, backend bundle
-and compatibility SDK copy by SHA256.
+`build-platform`, `build-gateway` and `build-execd` each run their tests before
+compiling and packaging. Platform owns shared platform/common crate tests;
+Gateway owns API Server, routing and Agent crate tests; Execd owns runtime tests.
+The test partition is checked against Cargo workspace membership. Explicitly
+ignored integration tests still require their dedicated environments; this is
+not the Full E2E gate. `source-gate` owns fmt/Clippy and CI/release tooling checks.
+`admin-package` produces tested Python artifacts in parallel.
+
+After all five jobs pass, `platform-build` downloads each component archive once
+through the selected transport, validates the component manifest, assembles the
+release, and runs installation/help smoke checks in a temporary directory.
+Optional OBS publication uses these local outputs directly. Buildkite still
+retains final base/backend archives for downstream Full runs and manual downloads;
+intermediate component archives use OBS by default. `build-manifest.json` binds
+the commit, component manifests, base archive, backend bundle and convenience SDK
+copy. `admin-candidate.json` independently binds the same commit/build and Python artifacts.
 
 The assembly step downloads the pinned external sandboxd backend artifact selected by
 `ADX_BACKEND_ARTIFACT_BUILD` and verifies its revision, target and complete file
@@ -327,17 +352,15 @@ Failures still publish a summary and retain their original exit status.
 
 ## OBS artifact publication
 
-Set `ADX_OBS_UPLOAD=1` to add the `platform-obs` step after `platform-build`.
-The step downloads the exact Buildkite artifacts produced by that build, verifies
-the release archive, package manifest, build manifest and sandboxd backend bundle, and then
-uploads them to Huawei Cloud OBS. It does not rebuild any product binary.
+Set `ADX_OBS_UPLOAD=1` to publish final artifacts from the base assembly job.
+The local release archive, package manifest, build manifest, admin candidate and
+sandboxd backend bundle are verified before upload. No product binary is rebuilt.
 
-The Kubernetes worker reads `AK` and `SK` from the existing
-`obs-credentials` Secret and exposes them only as `OBS_ACCESS_KEY_ID` and
-`OBS_SECRET_ACCESS_KEY`. Credentials are not passed on argv and are not written
-to Buildkite artifacts. The pipeline pins the destination to bucket
-`openyuanrong` at `obs.cn-southwest-2.myhuaweicloud.com`; changing it requires a
-reviewed pipeline update rather than a per-build override.
+Workers read `AK` and `SK` from the `obs-credentials` Secret into
+`OBS_ACCESS_KEY_ID` and `OBS_SECRET_ACCESS_KEY`. The secret is optional at Pod
+creation so Buildkite-only builds can run; selecting OBS without credentials fails
+explicitly. Credentials are never passed on argv or written to artifacts.
+`ADX_OBS_BUCKET` and `ADX_OBS_ENDPOINT` override the documented defaults.
 
 The default channel is `daily`:
 

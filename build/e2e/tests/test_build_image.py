@@ -65,15 +65,16 @@ class BuildImageContractTests(unittest.TestCase):
                     build_image_steps.append(step['key'])
         self.assertTrue({
             'build-platform', 'build-gateway', 'build-execd', 'source-gate',
-            'platform-build', 'platform-obs',
+            'platform-build',
         }.issubset(build_image_steps))
         for key in ('build-platform', 'build-gateway', 'build-execd',
                     'source-gate', 'platform-build'):
             self.assertIn('key: ' + key, pipeline)
-        self.assertIn('depends_on: [build-platform, build-gateway, build-execd, source-gate, admin-gate]', pipeline)
+        assembly = next(step for step in steps if step['key'] == 'platform-build')
+        self.assertIn('admin-package', assembly['depends_on'])
         self.assertIn('out/buildkite/build-manifest.json', pipeline)
         for component in ('platform', 'gateway', 'execd'):
-            self.assertIn(f'out/buildkite/components/{component}.tar.gz', pipeline)
+            self.assertIn(f'key: build-{component}', pipeline)
         component_build = (ROOT / '.buildkite/build-component.sh').read_text()
         component_package = (ROOT / '.buildkite/package-components.sh').read_text()
         self.assertIn('tar -czf "out/buildkite/components/$component.tar.gz"', component_build)
@@ -82,9 +83,9 @@ class BuildImageContractTests(unittest.TestCase):
         self.assertIn('out/buildkite/backend.tar.gz', pipeline)
         self.assertIn('tar -czf out/buildkite/backend.tar.gz', component_package)
         obs = (ROOT / '.buildkite/upload-obs.sh').read_text()
-        self.assertIn("artifact download 'out/buildkite/build-manifest.json'", obs)
+        self.assertNotIn("artifact download", obs)
         self.assertIn('out/buildkite/build-manifest.json', obs)
-        self.assertIn("artifact download 'out/buildkite/backend.tar.gz'", obs)
+        self.assertIn('out/buildkite/backend.tar.gz', obs)
         local = (ROOT / '.buildkite/run-build-container.sh').read_text()
         self.assertIn("config['ci_image']", local)
         self.assertIn('--platform "$platform"', local)

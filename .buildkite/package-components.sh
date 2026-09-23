@@ -15,9 +15,7 @@ mkdir -p out/buildkite/logs out/buildkite/sdk out/buildkite/components
 echo "--- :arrow_down: Download and verify component artifacts"
 download_component() {
   local component=$1
-  buildkite-agent artifact download \
-    "out/buildkite/components/$component.tar.gz" . \
-    --step "build-$component"
+  bash .buildkite/component-transfer.sh download "$component"
 }
 pids=()
 for component in platform gateway execd; do
@@ -61,6 +59,11 @@ python3 build/release/package.py assemble \
   --target "$ADX_RELEASE_TARGET" \
   --profile release \
   --output "$ADX_RELEASE_OUTPUT"
+echo "--- :test_tube: Install assembled release in an isolated prefix"
+install_root=$(mktemp -d "$stage/install.XXXXXX")
+bash "$ADX_RELEASE_OUTPUT/install.sh" --prefix "$install_root/adx" --bin-dir "$install_root/bin"
+"$install_root/bin/adxctl" --help > out/buildkite/logs/install-smoke.log
+
 tar -czf out/buildkite/adx-release.tar.gz -C "$ADX_RELEASE_OUTPUT" .
 (cd out/buildkite && sha256sum adx-release.tar.gz > adx-release.tar.gz.sha256)
 cp "$ADX_RELEASE_OUTPUT/manifest.json" out/buildkite/release-manifest.json
@@ -96,3 +99,17 @@ python3 build/release/component.py aggregate \
   --backend-manifest out/buildkite/backend/manifest.json \
   --backend-archive out/buildkite/backend.tar.gz \
   --output out/buildkite/build-manifest.json
+
+# adxadmin is an independent Python artifact produced by this base build.
+buildkite-agent artifact download 'out/buildkite/admin/*' . --step admin-package
+python3 build/admin/candidate.py --verify --directory out/buildkite/admin
+python3 - <<'CHECK'
+import json, os
+from pathlib import Path
+candidate = json.loads(Path('out/buildkite/admin/admin-candidate.json').read_text())
+assert candidate['commit'] == os.environ['BUILDKITE_COMMIT'], 'admin commit mismatch'
+assert candidate['build_id'] == os.environ['BUILDKITE_BUILD_ID'], 'admin build mismatch'
+CHECK
+
+# Upload these local bytes; never re-download the assembled archives.
+bash .buildkite/upload-obs.sh
