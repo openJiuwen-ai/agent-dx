@@ -52,7 +52,7 @@ API Server 默认内嵌 Ingress，adxlet 默认内嵌 Relay；显式拆分进程
 
 ## 📦 安装
 
-ADX 发布包面向 Linux，包含控制面与数据面二进制、Execd、Python Sandbox SDK 和可选的托管 Redis 二进制。sandboxd 由部署环境独立托管，版本固定在 [`third_party/sandboxd/source.json`](third_party/sandboxd/source.json)。
+ADX 发布包面向 Linux，提供 `adx-coordinator`、`adxlet`（内嵌 Relay）、`adx-apiserver`（内嵌 Ingress）、`adxctl`、Execd、Python Sandbox SDK 和托管 Redis 二进制；独立 Ingress/Relay 与调试转发程序不随包发布。sandboxd 由部署环境独立托管，版本固定在 [`third_party/sandboxd/source.json`](third_party/sandboxd/source.json)。
 
 ```sh
 mkdir adx-release

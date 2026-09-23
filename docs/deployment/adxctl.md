@@ -1,5 +1,7 @@
 # `adxctl` 部署指南
 
+当前发布包只提供默认共进程部署：`adx-apiserver` 内嵌 Ingress，`adxlet` 内嵌 Relay。独立 `adx-ingress`、`adx-relay` 和 `adx-data-plane-forward` 不随包发布；分进程能力保留在源码中，使用时需自行构建对应二进制。
+
 `adxctl` 是 ADX 统一发布包的本机进程部署工具。它读取一份 YAML 部署文件，生成本机各组件的最终配置，并以前台 supervisor 方式启动这些组件。它不创建 Environment，也不调用 Sandbox API；集群 API Key 等远程管理操作使用独立的 [`adxadmin`](adxadmin.md)。
 
 release 安装器默认创建 `/usr/local/bin/adxctl -> /opt/adx/current/bin/adxctl`。因此日常命令直接使用 `adxctl`；切换 `/opt/adx/current` 后，命令自动指向新版本。安装器不会把其他内部服务二进制加入系统 `PATH`。

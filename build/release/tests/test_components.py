@@ -12,6 +12,19 @@ SPEC.loader.exec_module(component)
 
 
 class ComponentManifestTests(unittest.TestCase):
+    def test_gateway_component_contains_only_embedded_apiserver(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "adx-apiserver").write_bytes(b"fixture")
+            manifest = component.create_manifest("gateway", root, "a" * 40,
+                                                 "x86_64-unknown-linux-gnu")
+            self.assertEqual(set(manifest["files"]), {"adx-apiserver"})
+            component.verify_manifest(root)
+            (root / "adx-ingress").write_bytes(b"unexpected")
+            with self.assertRaises(ValueError):
+                component.create_manifest("gateway", root, "a" * 40,
+                                          "x86_64-unknown-linux-gnu")
+
     @staticmethod
     def write_component(root, name):
         directory = root / name

@@ -33,6 +33,16 @@ dispatches that slug to `pipeline-admin.yml`. Set the pipeline default
 `adxadmin-v<version>` Git tag and explicitly override the upload variable to
 `1`; set `ADX_ADMIN_PYPI_REPOSITORY=testpypi` for a rehearsal.
 
+## Base package deployment mode
+
+The base package ships `adxctl`, `adx-coordinator`, `adxlet`, `adx-apiserver`
+and Redis. Ingress runs inside API Server; Relay runs inside adxlet. Separate
+Ingress/Relay executables and the debug forwarder are not compiled or archived
+by release steps. Execd and the SDK remain in the unified release archive.
+Set `ADX_OBS_UPLOAD=1` when triggering the base pipeline to enable the dependent
+`platform-obs` job. It verifies the assembled archive and build manifest before
+uploading artifacts and publishing `out/buildkite/obs/manifest.json` and URLs.
+
 ## Optional PyPI publication
 
 `admin-package` always runs the `adxadmin` unit and release tests, builds one

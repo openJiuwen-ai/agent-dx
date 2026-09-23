@@ -12,7 +12,7 @@ Shipped deployment examples:
 | `deployment-node.yaml` | One Worker's Adxlet with embedded Relay | Shared external Redis |
 | `deployment-ingress-api.yaml` | Ingress and API Server ingress host | Shared external Redis |
 
-See the [`adxctl` deployment guide](../../../docs/deployment/adxctl.md) for exact commands, role boundaries and split-host startup order. `adx-apiserver` is the current control-plane Frontend and hosts Ingress by default; `adx-ingress` remains available for explicit process isolation.
+See the [`adxctl` deployment guide](../../../docs/deployment/adxctl.md) for exact commands, role boundaries and split-host startup order. `adx-apiserver` is the current control-plane Frontend and hosts Ingress by default; explicit process isolation requires building `adx-ingress` from source; it is not shipped in the release package.
 
 String values in deployment YAML may use `${VAR}` or `${VAR:-default}`. Expansion happens after YAML parsing, so environment values remain scalar strings and cannot inject mappings or lists. Missing variables without defaults fail configuration loading. Numeric and boolean fields remain native YAML values rather than implicitly converting environment strings.
 

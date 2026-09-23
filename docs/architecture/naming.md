@@ -1,5 +1,7 @@
 # 组件命名与 Environment 抽象
 
+当前发布包只提供默认共进程部署：`adx-apiserver` 内嵌 Ingress，`adxlet` 内嵌 Relay。独立 `adx-ingress`、`adx-relay` 和 `adx-data-plane-forward` 不随包发布；分进程能力保留在源码中，使用时需自行构建对应二进制。
+
 本文对应 `community/refactor` 基础上的命名调整。组件代码、启动命令、部署角色、内部 RPC、存储字段和测试使用下表中的名称。
 
 ## 进程与目录

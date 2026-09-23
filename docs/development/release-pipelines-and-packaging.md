@@ -123,9 +123,10 @@ execd-images.json
 logs/、junit/
 ```
 
-平台包对所有角色保持一致，通过每台主机自己的 YAML profile 启动 Coordinator、Node、
-API Server（默认内嵌 Ingress）或 Standalone，避免按角色维护多套二进制包；独立 Ingress
-二进制仍在同一平台包中供显式分进程配置使用。
+当前发布包只提供默认共进程部署：`adx-apiserver` 内嵌 Ingress，`adxlet` 内嵌 Relay。独立 `adx-ingress`、`adx-relay` 和 `adx-data-plane-forward` 不随包发布；分进程能力保留在源码中，使用时需自行构建对应二进制。
+
+平台包的 `bin/` 为 `adxctl`、`adx-coordinator`、`adxlet`、`adx-apiserver` 和
+`redis-server`；一体化归档继续包含 `runtime/adx-execd`、EROFS payload 与 SDK。
 
 基础出包的 `source-gate` 负责单元、契约和静态检查，`package-smoke` 负责验证刚生成
 制品的最小真实闭环。它证明基础包可安装、可启动和可完成一次 Environment 生命周期，
@@ -244,7 +245,7 @@ Full 流水线建议每日和发版候选执行。每次提交的快速门禁只
 
 ```text
 adx-platform-<version>-linux-<arch>/
-├── bin/                         # 所有角色和 adxctl
+├── bin/                         # 共进程入口、adxctl 和 Redis
 ├── etc/
 │   ├── profiles/                # standalone/coordinator/node/ingress-api
 │   ├── examples/
