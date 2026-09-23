@@ -37,7 +37,7 @@
 
 ## 写入与恢复契约
 
-1. **Coordinator 启动**：`RedisStore::begin(scheduler_shards)` 增加持久化 epoch，返回 Session；加载目录并通过 `Coordinator::restore` 重建调度状态。缺少头部、未知 schema、域数量不兼容、非法归属或重复卡占用会阻止恢复。不会把损坏的数据目录重新初始化为空集群。
+1. **Coordinator 启动**：`RedisStore::begin(scheduler_shards)` 增加持久化 epoch，返回 Session；加载目录并通过 `Coordinator::restore` 重建调度状态。旧 `capsule:<id>` 记录只有在已删除、未占资源、无待恢复操作和恢复点时才原子改写为 `environment:<id>`，保留终态 ID；新旧字段共存或旧记录仍可能运行时不自动丢弃。缺少头部、未知 schema、域数量不兼容、非法归属或重复卡占用也会阻止恢复。暂不可用时进程保持运行但不开放服务，每 5 秒重试并记录原因；不会把损坏目录重新初始化为空集群。
 2. **节点注册**：首次按节点数量最少的域分配，并列时轮转；已有节点保留 shard_id。节点地址与资源更新也通过条件提交。恢复到内存后的所有节点暂时关闭新调度，重新注册后才参与选点。
 3. **首次分配**：调度内核产生 Assignment；`Session::reserve` 持久化后才能向节点派发。请求仍在等待资源时不写 Redis，重启后由客户端重试。不能把仅有的内存分配当作可执行的持久化授权。
 4. **节点结果**：adxlet 完成本机操作后提交结果，Coordinator 核验 EnvironmentSpec、完整 Assignment、实例 revision 和占用一致性，再调用 `Session::commit`。普通生命周期操作没有新增一轮 Coordinator 操作意图登记。Running 才进入路由视图；Failed/Deleted 移除路由。
@@ -55,6 +55,8 @@
 | Redis 不可用／超时 | 返回 Unavailable，清除失效连接；后续调用重新连接，不在传输层盲目重放写入 |
 | 写入已应用但响应丢失 | 调用方以相同实例身份和结果重试；通过读取现值与条件提交判定结果 |
 | Coordinator 重启 | 保留原 Assignment/generation 和资源占用，新分配从持久化 generation 下限继续 |
+| 旧版本已删除的 `capsule:*` 记录 | 启动时校验终态和资源释放条件，原子迁移为 `environment:*`，保留 ID 与代次；失败或结果未知时重读并重试 |
+| 旧版本仍可能运行的记录或未知字段 | 不忽略、不自动删除；Coordinator 保持未就绪并重试，需先完成明确的数据迁移或处理 |
 | 资源容量缩小／卡暂时消失 | 保留原占用；可分配资源不足时继续拒绝新请求，不擦除历史占用 |
 | 未分配的内存等待队列 | 不恢复，由客户端重试 |
 | 本地降级日志 | 由 adxlet 的 SQLite 降级包装实现；底层 Redis/RPC 返回 Unavailable 本身不等于 Journaled |
@@ -82,6 +84,7 @@ cargo clippy --locked -p adx-coordinator -p adx-core -p adx-scheduling --all-tar
 - 大于 2^53 的 generation 不丢精度；计数器到达上限时停止分配，不回绕。
 - AOF 写入后 SIGKILL Redis、重新启动，复用原 Session 重连并读取相同结果。
 - 缺失 header 和未知 schema 不触发空库初始化；原节点数据保持。
+- 已删除且不占资源的旧 `capsule:*` 记录自动原子迁移并保留 ID；仍在运行的旧记录不被清理。
 - 拒绝后的分配替换、旧结果拒绝、运行中结果不可被该接口接管。
 - 容量缩小、设备暂时缺失与恢复后的占用保持，以及重复物理卡归属导致恢复失败。
 

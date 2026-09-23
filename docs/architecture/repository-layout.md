@@ -130,7 +130,7 @@ Proxy 首次启动关闭 Environment 准入，adxlet 完成权威对账与全量
 
 内部 gRPC 按 Environment、快照、凭证、路由及节点本地控制拆分，详见 [协议目录](../../platform/api/proto/README.md)。Execd 用户操作及运行时协作使用 HTTP，类型在 `core/src/runtime.rs`。
 
-正常结果经 Coordinator 写 Redis；SQLite 只在提交不可用时保存待补交结果。Journaled 不发布 Ingress 路由。节点重启而 Coordinator 不可用时等待对账，不从不完整日志重建目录。快照制品走独立的本地/S3 存储抽象。Redis 使用 `environment:<environment_id>`，SQLite journal 使用 `environment` 字段；此次内部 schema 不兼容旧控制状态，升级时需要清空 Redis/SQLite 控制状态并由新版本重新登记。详见 [节点契约](../testing/node-lifecycle.md)。
+正常结果经 Coordinator 写 Redis；SQLite 只在提交不可用时保存待补交结果。Journaled 不发布 Ingress 路由。节点重启而 Coordinator 不可用时等待对账，不从不完整日志重建目录。快照制品走独立的本地/S3 存储抽象。Redis 使用 `environment:<environment_id>`，SQLite journal 使用 `environment` 字段；Coordinator 启动时仅将已删除且不占资源的旧 `capsule:*` 记录原子迁移为 `environment:*`。其他旧控制状态和节点 SQLite journal 不能据此视为兼容，升级前需要单独评估和迁移。详见 [持久化契约](../testing/coordinator-storage.md)和[节点契约](../testing/node-lifecycle.md)。
 
 ## 构建、部署和验收
 

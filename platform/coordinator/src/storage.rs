@@ -29,6 +29,19 @@ else
 end
 return 1
 "#;
+const MIGRATE_DELETED_CAPSULES: &str = r#"
+if redis.call('HGET', KEYS[1], 'header') ~= ARGV[1] then return 0 end
+for i = 3, #ARGV, 4 do
+  if redis.call('HGET', KEYS[1], ARGV[i]) ~= ARGV[i + 1]
+    or redis.call('HEXISTS', KEYS[1], ARGV[i + 2]) ~= 0 then return 0 end
+end
+for i = 3, #ARGV, 4 do
+  redis.call('HSET', KEYS[1], ARGV[i + 2], ARGV[i + 3])
+  redis.call('HDEL', KEYS[1], ARGV[i])
+end
+redis.call('HSET', KEYS[1], 'header', ARGV[2])
+return 1
+"#;
 const ATTEMPTS: usize = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -431,6 +444,27 @@ impl RedisStore {
         let applied: u8 = self.query(cmd).await?;
         Ok(applied == 1)
     }
+    async fn migrate_deleted_capsules(
+        &self,
+        expected: &str,
+        header: &Header,
+        replacements: &[(String, String, String, String)],
+    ) -> Result<bool> {
+        let mut cmd = redis::cmd("EVAL");
+        cmd.arg(MIGRATE_DELETED_CAPSULES)
+            .arg(1)
+            .arg(&self.key)
+            .arg(expected)
+            .arg(encode(header)?);
+        for (old_field, old_value, new_field, new_value) in replacements {
+            cmd.arg(old_field)
+                .arg(old_value)
+                .arg(new_field)
+                .arg(new_value);
+        }
+        let applied: u8 = self.query(cmd).await?;
+        Ok(applied == 1)
+    }
     /// Called once per Coordinator startup, never on a Redis reconnect. A new epoch
     /// rejects old Coordinator writes; this is fencing, not leader election or HA.
     pub async fn begin(&self, shards: usize) -> Result<Session> {
@@ -440,6 +474,7 @@ impl RedisStore {
         for _ in 0..ATTEMPTS {
             let raw = self.raw().await?;
             let old = raw.get(HEADER).map(String::as_str).unwrap_or("");
+            let mut replacements = Vec::new();
             let mut h = if raw.is_empty() {
                 Header {
                     schema: 1,
@@ -455,12 +490,39 @@ impl RedisStore {
                 if h.shards != shards {
                     return Err(Error::Conflict);
                 }
-                snapshot(&raw)?.validate()?;
+                let mut normalized = raw.clone();
+                for (field, value) in raw.iter().filter(|(key, _)| key.starts_with("capsule:")) {
+                    let id = field.trim_start_matches("capsule:");
+                    let record = legacy_deleted_capsule(id, value)?;
+                    let new_field = format!("environment:{id}");
+                    if normalized.contains_key(&new_field) {
+                        return Err(Error::Unavailable(
+                            "conflicting legacy control identity".into(),
+                        ));
+                    }
+                    let new_value = encode(&record)?;
+                    normalized.remove(field);
+                    normalized.insert(new_field.clone(), new_value.clone());
+                    replacements.push((field.clone(), value.clone(), new_field, new_value));
+                }
+                if replacements.is_empty() {
+                    snapshot(&normalized)?;
+                } else {
+                    snapshot(&normalized).map_err(|_| {
+                        Error::Unavailable("legacy control snapshot incompatible".into())
+                    })?;
+                }
                 h.epoch = h.epoch.checked_add(1).ok_or(Error::Conflict)?;
                 h
             };
             h.advance()?;
-            if self.cas(old, &h, None).await? {
+            let applied = if replacements.is_empty() {
+                self.cas(old, &h, None).await?
+            } else {
+                self.migrate_deleted_capsules(old, &h, &replacements)
+                    .await?
+            };
+            if applied {
                 return Ok(Session {
                     store: self.clone(),
                     epoch: h.epoch,
@@ -471,6 +533,71 @@ impl RedisStore {
             "concurrent control writes; retry request".into(),
         ))
     }
+}
+
+fn legacy_deleted_capsule(id: &str, encoded: &str) -> Result<StoredEnvironment> {
+    let mut value: serde_json::Value = decode(encoded)?;
+    let result = value
+        .get("result")
+        .ok_or_else(|| Error::Unavailable("unsupported legacy control record".into()))?;
+    if result.get("state").and_then(serde_json::Value::as_str) != Some("Deleted")
+        || result
+            .get("resources_held")
+            .and_then(serde_json::Value::as_bool)
+            != Some(false)
+        || result
+            .get("restart_pending")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        || result.get("checkpoint").is_some_and(|v| !v.is_null())
+        || value.get("recovery").is_some_and(|v| !v.is_null())
+    {
+        return Err(Error::Unavailable(
+            "legacy control record requires explicit recovery".into(),
+        ));
+    }
+    fn rename_spec(value: &mut serde_json::Value) -> Result<()> {
+        let fields = value
+            .as_object_mut()
+            .ok_or_else(|| Error::Unavailable("corrupt legacy control record".into()))?;
+        if fields.contains_key("runtime_profile") {
+            return Err(Error::Unavailable(
+                "ambiguous legacy runtime profile".into(),
+            ));
+        }
+        if let Some(profile) = fields.remove("environment") {
+            fields.insert("runtime_profile".into(), profile);
+        }
+        Ok(())
+    }
+    fn rename_assignment(value: &mut serde_json::Value) -> Result<()> {
+        let fields = value
+            .as_object_mut()
+            .ok_or_else(|| Error::Unavailable("corrupt legacy assignment".into()))?;
+        if fields.contains_key("environment_id") {
+            return Err(Error::Unavailable("ambiguous legacy assignment".into()));
+        }
+        let old_id = fields
+            .remove("capsule_id")
+            .ok_or_else(|| Error::Unavailable("corrupt legacy assignment".into()))?;
+        fields.insert("environment_id".into(), old_id);
+        Ok(())
+    }
+    rename_spec(&mut value["spec"])?;
+    rename_assignment(&mut value["assignment"])?;
+    rename_spec(&mut value["result"]["spec"])?;
+    rename_assignment(&mut value["result"]["assignment"])?;
+    let record: StoredEnvironment = serde_json::from_value(value)
+        .map_err(|_| Error::Unavailable("corrupt legacy control record".into()))?;
+    record
+        .validate()
+        .map_err(|_| Error::Unavailable("corrupt legacy control record".into()))?;
+    if record.spec.id != id {
+        return Err(Error::Unavailable(
+            "legacy control identity mismatch".into(),
+        ));
+    }
+    Ok(record)
 }
 fn snapshot(raw: &BTreeMap<String, String>) -> Result<StoredSnapshot> {
     let h: Header = decode(
