@@ -134,6 +134,13 @@ Local Docker reproduction requires access to the same bind-mounted paths as the 
   fixture keeps Ingress embedded in API Server.
   Require an unchanged Coordinator epoch, persisted ownership and backend IDs,
   restored HTTPS API, public SDK file/command access and final resource release.
+- `runtime-affinity` (targeted heterogeneous-runtime case): requires one live
+  node to advertise `runsc` through sandboxd and the other live node not to.
+  Create with the public SDK without specifying a node, then check the
+  persisted assignment, runtime class, command execution and resource release.
+  The default two-node fixture configures only `runc` and therefore fails this
+  case at its inventory precondition; provision an actual `runsc` backend and
+  compatible OCI image before selecting it with `--profile full --case runtime-affinity`.
 - `stop`: independently create a live instance pinned to each node, verify both
   backend inventories are occupied and exercise each forwarded port. A separate
   instance on each node is deleted to emit the required lifecycle log and trace. It also

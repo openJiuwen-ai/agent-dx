@@ -18,7 +18,7 @@ import xml.etree.ElementTree as ET
 
 BASIC = ('sdk','auth','capacity','placement','local-first')
 STANDARD = ('sdk','data-plane','lifecycle','auth','capacity','placement','local-first','node-failure','sandboxd-restart','restart','stop')
-OPTIONAL_FAULTS = ('redis-restart','coordinator-restart','apiserver-restart','ingress-restart')
+OPTIONAL_CASES = ('redis-restart','coordinator-restart','apiserver-restart','ingress-restart','runtime-affinity')
 PROFILES = {
     'l0': ('l0','auth'),
     'standalone': STANDARD,
@@ -35,7 +35,7 @@ def selected_checks(profile, case=None):
     required=required_for_profile(profile)
     if case is None:
         return required
-    if profile in ('standalone','full') and case in OPTIONAL_FAULTS:
+    if profile in ('standalone','full') and case in OPTIONAL_CASES:
         return (case,)
     if case not in required:
         raise ValueError(f'{case} is not in E2E profile {profile}')
@@ -306,6 +306,12 @@ class Run:
                     output=self.execute('node1','/opt/adx/client/bin/python','-u','/opt/adx/e2e/scenarios.py',scenario,timeout=400)
                     record['subcases']=sdk_subcases_from_output(output)
                     for node in self.nodes:self.helper(node,'empty',node)
+        if 'runtime-affinity' in selected:
+            with self.case('runtime-affinity', checks) as record:
+                output=self.execute('node1','/opt/adx/client/bin/python','-u',
+                                    '/opt/adx/e2e/scenarios.py','runtime-affinity',timeout=300)
+                record['subcases']=sdk_subcases_from_output(output)
+                for node in self.nodes:self.helper(node,'empty',node)
         if 'local-first' in selected:
             with self.case('local-first', checks):
                 self.helper('node1','create-mode','local_first')

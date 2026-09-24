@@ -44,6 +44,11 @@ elif sys.argv[1]=='placement':
     placement_result=E/'placement-result.json'
     run(connection,image,placement_result)
     print(json.dumps(json.loads(placement_result.read_text())),flush=True)
+elif sys.argv[1]=='runtime-affinity':
+    from runtime_affinity import run
+    result=E/'runtime-affinity-result.json'
+    run(connection,image,result)
+    print(json.dumps(json.loads(result.read_text())),flush=True)
 elif sys.argv[1]=='auth':
     from adx_sandbox import PermissionDenied, SandboxError
     s=Sandbox(image=image,runtime='runc',cpu=500,memory=512,idle_timeout=0,connection=connection,create_timeout=150)

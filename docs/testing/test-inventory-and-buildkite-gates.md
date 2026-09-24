@@ -231,6 +231,7 @@ profile；完整 Multi-VM 在补齐部署器前不能标记为通过。
 | `FD-07` | Coordinator／API Server 已验证，Ingress 待新包复验 | [Full #19](https://buildkite.com/agent-dx/agent-dx-full-test/builds/19) 通过 Coordinator 重启，[Full #20](https://buildkite.com/agent-dx/agent-dx-full-test/builds/20) 通过 API Server 重启；均核对原归属／后端和公开 SDK 文件、命令。[Full #21](https://buildkite.com/agent-dx/agent-dx-full-test/builds/21) 因默认共进程 fixture 无独立 Ingress PID，在故障注入前失败；[Full #24](https://buildkite.com/agent-dx/agent-dx-full-test/builds/24) 改用分进程 fixture 后发现复用的旧产品包未携带 `adx-ingress`，启动阶段失败，故障注入未执行。发布包和构建配方现已补入分进程二进制，待新产物复验；持续网络分区仍待独立用例 |
 | `FD-08` | 计划 | worker 网络分区、心跳失效、返回清理与健康 worker 连续可用 |
 | `FD-09` | 已验证 | [Full #23](https://buildkite.com/agent-dx/agent-dx-full-test/builds/23) 的 `data-plane` 定向用例通过 Host 子域名端口转发：`<instance-id>-18081.example.test` 携带鉴权后到达实例的嵌套路径，缺少 Token 被拒绝；用例 28.859 秒，清理错误为 0 |
+| `FD-10` | 用例已实现，异构环境未验证 | 定向 `runtime-affinity` 要求两个节点真实上报不同的 sandboxd runtime inventory；通过公开 SDK 请求 `runsc` 且不指定节点，核对唯一支持节点上的归属、命令执行和资源释放。当前 runc-only fixture 无法使该用例通过，不能将负向拒绝测试充当正向亲和证据 |
 | `FD-FC-01` | 条件计划 | KVM worker 的 Firecracker pause/resume/snapshot profile |
 | `FD-XPU-01` | 条件计划 | 真实 GPU/NPU 整卡发现、过滤、分配、释放和故障清理 |
 | `FD-SOAK-01` | Nightly | 创建／执行／删除循环及反复节点故障，持续 1–24 小时无资源增长 |

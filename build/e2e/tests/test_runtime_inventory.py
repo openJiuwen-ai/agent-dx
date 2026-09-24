@@ -68,6 +68,22 @@ class RuntimeInventoryTests(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "held|assigned"):
             runtime_inventory.require_unassigned_create(current, "default-rejected")
 
+    def test_heterogeneous_runtime_requires_one_live_capable_node(self):
+        current = records(first=("runc",), second=("runc", "runsc"))
+        self.assertEqual(runtime_inventory.require_unique_runtime_node(current, "runsc"), "node2")
+        with self.assertRaisesRegex(AssertionError, "exactly one"):
+            runtime_inventory.require_unique_runtime_node(records(), "runsc")
+        with self.assertRaisesRegex(AssertionError, "exactly one"):
+            runtime_inventory.require_unique_runtime_node(
+                records(first=("runc", "runsc"), second=("runc", "runsc")), "runsc"
+            )
+        current["node:node2"] = json.dumps({
+            "node": {"id": "node2", "available": False, "runtime_classes": ["runsc"]},
+            "session": {"routable": True},
+        })
+        with self.assertRaisesRegex(AssertionError, "available"):
+            runtime_inventory.require_unique_runtime_node(current, "runsc")
+
 
 if __name__ == "__main__":
     unittest.main()
