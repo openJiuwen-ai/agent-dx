@@ -164,6 +164,25 @@ python3 build/e2e/multivm/node_preferences.py \
 
 This case has not yet passed on real VMs.
 
+`runtime_affinity.py` tests the runtime-fit rule merged into `refactor` on
+a heterogeneous deployment. Both workers must report live sandboxd runtime
+inventories, and exactly one must advertise `runsc`. The case creates an
+unpinned public SDK Sandbox with `runtime='runsc'`, then checks persisted
+ownership, the sole physical backend, command execution and cleanup. It
+fails its preflight before creating anything on a runc-only deployment.
+
+```sh
+python3 build/e2e/multivm/runtime_affinity.py \
+  --inventory out/e2e/3vm/inventory.json \
+  --endpoint control.example:8443 \
+  --token-file /path/to/tenant-key \
+  --ca /path/to/ingress-ca.pem \
+  --image registry.example/team/rrt@sha256:DIGEST \
+  --output out/e2e/3vm/runtime-affinity
+```
+
+This case has not yet passed on heterogeneous real VMs.
+
 `worker_restart.py` covers the quick-restart portion of `MV-07`: it kills only
 worker 2's adxlet child, lets `adxctl` restart it, and checks that the new
 node session reattaches the same sandboxd backend and assignment generation
@@ -303,5 +322,6 @@ After applying central Spread, call the same runner with the same `--output`
 and `--case placement-spread`; after applying local-first use
 `--case local-first`. For a split-process profile, select
 `--case ingress-restart` after its separate Ingress has started. Run
-`--case stop --confirm-dedicated` last, against the
+`--case runtime-affinity` only on a heterogeneous profile with one runsc
+worker. Select `--case stop --confirm-dedicated` last, against the
 chosen final deployment. All cases remain unverified on real three-VM hosts.

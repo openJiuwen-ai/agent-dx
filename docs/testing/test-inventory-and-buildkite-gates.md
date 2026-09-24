@@ -161,7 +161,7 @@ Firecracker checkpoint 使用独立 KVM profile；GPU/NPU 使用具备真实设�
 |---|---|---|
 | L0 | 独立 `--profile l0` 执行 `l0 + auth`，输出 `required_checks`、逐项 JSON 和 JUnit；Buildkite 基础包 #87 已通过 | 后续提交仍需持续执行门禁 |
 | Standalone | `--profile standalone` 统一本地 Docker 十一组；安装示例和 Lima FC 各自有严格结果契约 | 需增加汇总清单，把普通 Linux、安装示例和按需 KVM 结果关联到同一 revision |
-| Multi-VM | 三 VM inventory 与结果契约、公开 SDK 放置/数据链路、容量队列、Pack/Spread、节点偏好、local-first、worker 与控制节点故障、独立 Ingress 重启及有序停机定向用例已提供；`suite.py` 为跨配置分批执行提供共享三小时预算和失败汇总 | 尚缺生成配置、分发制品及完整 `contract.REQUIRED` 结果的三 VM 部署器；旧 session fencing 与 KVM checkpoint 仍有专项缺口；未进行真实三 VM 验收 |
+| Multi-VM | 三 VM inventory 与结果契约、公开 SDK 放置/数据链路、容量队列、Pack/Spread、节点偏好、异构 runtime、local-first、worker 与控制节点故障、独立 Ingress 重启及有序停机定向用例已提供；`suite.py` 为跨配置分批执行提供共享三小时预算和失败汇总 | 尚缺生成配置、分发制品及完整 `contract.REQUIRED` 结果的三 VM 部署器；旧 session fencing 与 KVM checkpoint 仍有专项缺口；未进行真实三 VM 验收 |
 | Full Deployment | K8s 已支持 `l0`、五组 `k8s-basic` 和十一组 `full`；`full` 强制两个 Pod 位于不同物理 worker | Full #17 在不同 worker 同次通过十一组、JUnit 45 项和资源清理；异构 runtime、K8s FC 和真实 GPU/NPU 仍需独立环境 |
 
 因此当前可以直接形成 Buildkite 门禁的是 UT、L0、基础 K8s 五组和 Full 十一组。`full` 的同宿主假绿已被
@@ -231,7 +231,7 @@ profile；完整 Multi-VM 在补齐部署器前不能标记为通过。
 | `FD-07` | Coordinator／API Server 已验证，Ingress 待新包复验 | [Full #19](https://buildkite.com/agent-dx/agent-dx-full-test/builds/19) 通过 Coordinator 重启，[Full #20](https://buildkite.com/agent-dx/agent-dx-full-test/builds/20) 通过 API Server 重启；均核对原归属／后端和公开 SDK 文件、命令。[Full #21](https://buildkite.com/agent-dx/agent-dx-full-test/builds/21) 因默认共进程 fixture 无独立 Ingress PID，在故障注入前失败；[Full #24](https://buildkite.com/agent-dx/agent-dx-full-test/builds/24) 改用分进程 fixture 后发现复用的旧产品包未携带 `adx-ingress`，启动阶段失败，故障注入未执行。发布包和构建配方现已补入分进程二进制，待新产物复验；持续网络分区仍待独立用例 |
 | `FD-08` | 定向用例已实现，待实测 | `network-partition` 在 node2 Pod／容器网络命名空间阻断到 Coordinator 的 TCP 流量，要求防火墙计数非零、心跳失效及旧实例撤路由；隔离期 node1 继续执行和创建，解除后 node2 清理旧后端再准入。正式双物理 worker 尚未运行该用例 |
 | `FD-09` | 已验证 | [Full #23](https://buildkite.com/agent-dx/agent-dx-full-test/builds/23) 的 `data-plane` 定向用例通过 Host 子域名端口转发：`<instance-id>-18081.example.test` 携带鉴权后到达实例的嵌套路径，缺少 Token 被拒绝；用例 28.859 秒，清理错误为 0 |
-| `FD-10` | 用例已实现，异构环境未验证 | 定向 `runtime-affinity` 要求两个节点真实上报不同的 sandboxd runtime inventory；通过公开 SDK 请求 `runsc` 且不指定节点，核对唯一支持节点上的归属、命令执行和资源释放。当前 runc-only fixture 无法使该用例通过，不能将负向拒绝测试充当正向亲和证据 |
+| `FD-10` | 本地及三 VM 定向用例已实现，异构环境未验证 | 两种运行方式均要求两个节点真实上报不同的 sandboxd runtime inventory；通过公开 SDK 请求 `runsc` 且不指定节点，核对唯一支持节点上的归属、物理后端、命令执行和资源释放。当前 runc-only fixture 无法使该用例通过，不能将负向拒绝测试充当正向亲和证据 |
 | `FD-FC-01` | 条件计划 | KVM worker 的 Firecracker pause/resume/snapshot profile |
 | `FD-XPU-01` | 条件计划 | 真实 GPU/NPU 整卡发现、过滤、分配、释放和故障清理 |
 | `FD-SOAK-01` | Nightly | 创建／执行／删除循环及反复节点故障，持续 1–24 小时无资源增长 |
