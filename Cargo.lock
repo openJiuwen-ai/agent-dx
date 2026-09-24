@@ -163,6 +163,7 @@ dependencies = [
  "flate2",
  "hyper-util",
  "libc",
+ "redis",
  "serde",
  "serde-saphyr",
  "serde_json",

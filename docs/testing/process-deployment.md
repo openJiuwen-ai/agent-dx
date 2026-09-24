@@ -72,7 +72,7 @@ CLI 创建配置指定的数据目录，生成 `appendonly yes` 的 Redis 配置
 
 ```text
 package/
-├── bin/             adxctl、adx-coordinator、adxlet、adx-apiserver、redis-server、redis-cli
+├── bin/             adxctl、adx-inspect、adx-coordinator、adxlet、adx-apiserver、redis-server、redis-cli
 ├── runtime/         adx-execd、Linux release 的 runtime rootfs 镜像
 ├── sdk/             adx_sandbox wheel
 ├── etc/examples/    部署与组件配置示例

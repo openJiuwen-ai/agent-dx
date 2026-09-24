@@ -6,6 +6,8 @@
 
 release 安装器默认创建 `/usr/local/bin/adxctl -> /opt/adx/current/bin/adxctl`。因此日常命令直接使用 `adxctl`；切换 `/opt/adx/current` 后，命令自动指向新版本。安装器不会把其他内部服务二进制加入系统 `PATH`。发布包还包含与 Redis Server 同为 7.2.5 的 `/opt/adx/current/bin/redis-cli`，供部署者进入 Coordinator 容器后检查 Redis；它不会自动连接或认证，使用时应从部署环境获取地址和凭证。
 
+只读检查 ADX 持久化目录可使用发布包内的 [`adx-inspect`](adx-inspect.md)。它复用部署 YAML 的 Redis 连接信息，提供节点、Environment 和快照查询。
+
 一份部署 YAML 只描述**当前主机**。单机部署可以在一份文件中包含所有角色；多机部署时，每台主机使用自己的文件，各文件通过相同的 `redis_url` 和 `namespace` 加入同一集群。`adxctl` 默认读取 `/opt/adx/config/deployment.yaml`，也可用全局 `-c/--config` 或 `ADX_DEPLOYMENT_CONFIG` 选择其他文件。它只接受 `.yaml` 或 `.yml`，不接受 JSON 部署文件。
 
 ## 组件名

@@ -76,6 +76,7 @@ echo "--- :test_tube: Install assembled release in an isolated prefix"
 install_root=$(mktemp -d "$stage/install.XXXXXX")
 bash "$ADX_RELEASE_OUTPUT/install.sh" --prefix "$install_root/adx" --bin-dir "$install_root/bin"
 "$install_root/bin/adxctl" --help > out/buildkite/logs/install-smoke.log
+"$install_root/adx/current/bin/adx-inspect" --help >> out/buildkite/logs/install-smoke.log
 
 tar -czf out/buildkite/adx-release.tar.gz -C "$ADX_RELEASE_OUTPUT" .
 (cd out/buildkite && sha256sum adx-release.tar.gz > adx-release.tar.gz.sha256)
