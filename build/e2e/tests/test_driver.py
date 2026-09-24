@@ -95,15 +95,19 @@ class AcceptanceGateTests(unittest.TestCase):
         output = json.dumps({
             'status': 'passed',
             'cases': [
+                {'name': 'sandboxd runtime inventory', 'passed': True},
                 {'name': 'environment affinity OR', 'passed': True},
                 {'name': 'reverse instance anti-affinity', 'passed': True},
+                {'name': 'unavailable runtime stays unassigned', 'passed': True},
             ],
         })
         self.assertEqual(
             driver.sdk_subcases_from_output(output),
             [
+                {'id': 'sandboxd runtime inventory', 'status': 'passed', 'seconds': 0.0},
                 {'id': 'environment affinity OR', 'status': 'passed', 'seconds': 0.0},
                 {'id': 'reverse instance anti-affinity', 'status': 'passed', 'seconds': 0.0},
+                {'id': 'unavailable runtime stays unassigned', 'status': 'passed', 'seconds': 0.0},
             ],
         )
 
