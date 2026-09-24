@@ -143,6 +143,7 @@ def result_from_state(state, timestamp):
     return {'schema_version': 1, 'scope': 'selected-cases',
             'inventory_sha256': state['inventory_sha256'],
             'budget_seconds': state['budget_seconds'],
+            'budget_scope': state['scope'],
             'runtime_seconds': state['runtime_seconds'],
             'wall_elapsed_seconds': wall_elapsed,
             'remaining_seconds': max(0, min(state['budget_seconds'] - state['runtime_seconds'],
@@ -181,9 +182,12 @@ def run_plan(config, execute=execute_subprocess, now=time.time):
             raise ValueError('suite inventory differs from the existing budget')
         if state.get('budget_seconds') != config.budget_seconds:
             raise ValueError('suite budget differs from the existing budget')
+        if state.get('scope') not in ('deployment-and-cases', 'cases-only'):
+            raise ValueError('suite budget scope is invalid')
     else:
         state = {'schema_version': 2, 'inventory_sha256': digest,
                  'budget_seconds': config.budget_seconds,
+                 'scope': 'cases-only',
                  'started_at': now(), 'finished_at': None,
                  'runtime_seconds': 0, 'cases': [], 'active': None}
     if state.get('active'):

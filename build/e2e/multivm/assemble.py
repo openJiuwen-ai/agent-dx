@@ -206,6 +206,8 @@ def assemble(inventory, root):
     duration = state.get('runtime_seconds')
     started_at = state.get('started_at')
     finished_at = state.get('finished_at')
+    if state.get('scope') != 'deployment-and-cases':
+        errors.append('three-hour deployment and case budget was not started before deployment')
     if state.get('schema_version') != 2 or state.get('inventory_sha256') != digest \
             or not isinstance(budget, int) or not 0 < budget <= MAX_BUDGET_SECONDS \
             or not isinstance(duration, (int, float)) or not 0 <= duration <= budget \

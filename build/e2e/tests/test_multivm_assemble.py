@@ -59,6 +59,7 @@ def full_evidence(root, inv):
                'ingress-restart', 'stop']
     state = {'schema_version': 2, 'inventory_sha256': inventory_digest(inv),
              'budget_seconds': 10800, 'runtime_seconds': len(ordered),
+             'scope': 'deployment-and-cases',
              'started_at': 1000, 'finished_at': 1000 + len(ordered),
              'active': None,
              'cases': [{'case': name, 'status': 'passed', 'seconds': 1}
@@ -194,6 +195,17 @@ class AssembleTests(unittest.TestCase):
             result = assemble(inv, root)
             self.assertEqual(result['status'], 'failed')
             self.assertTrue(any('wall' in error for error in result['errors']))
+
+    def test_case_only_budget_cannot_prove_full_deployment_under_three_hours(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            inv = inventory()
+            state = full_evidence(root, inv)
+            state['scope'] = 'cases-only'
+            (root / 'budget-state.json').write_text(json.dumps(state))
+            result = assemble(inv, root)
+            self.assertEqual(result['status'], 'failed')
+            self.assertTrue(any('deployment' in error for error in result['errors']))
 
     def test_reused_session_cannot_count_as_worker_restart(self):
         with tempfile.TemporaryDirectory() as directory:

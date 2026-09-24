@@ -127,6 +127,7 @@ class SuiteTests(unittest.TestCase):
             config.output.mkdir()
             state = {'schema_version': 2, 'inventory_sha256': None,
                      'budget_seconds': config.budget_seconds, 'runtime_seconds': 5,
+                     'scope': 'cases-only',
                      'started_at': 1, 'finished_at': None,
                      'cases': [], 'active': {'case': 'sdk', 'started_at': 1,
                                               'log': str(config.output / 'sdk/case.log')}}
