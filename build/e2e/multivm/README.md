@@ -142,3 +142,27 @@ python3 build/e2e/multivm/worker_restart.py \
 
 The old-session write-fencing assertion is not in this SDK subset; it needs
 a protocol-level stale-session probe before `MV-07` is fully covered.
+
+`local_first.py` covers `MV-04` on a dedicated three-VM deployment whose
+API Server uses `create_mode: local_first`. It checks entry rotation, same-ID
+concurrent claim convergence, conflicting specification rejection, actual
+backend placement, Coordinator claim-log evidence, a constrained request with
+an explicit Adxlet forward event into central scheduling, and exactly-once CPU
+reservation in the scheduler ledger. The control inventory entry may set
+`coordinator_log_dir` (default `/opt/adx/run/control/logs`). Each worker
+may set `adxlet_log_dir` (default `/opt/adx/run/node/logs`). Keep those log
+directories for the duration of the run. Worker 1 needs at least 1,000
+millicores of available CPU; worker 2 needs at least 2,000. No other client
+should allocate during the test.
+
+```sh
+python3 build/e2e/multivm/local_first.py \
+  --inventory out/e2e/3vm/inventory.json \
+  --endpoint control.example:8443 \
+  --token-file /path/to/tenant-key \
+  --ca /path/to/ingress-ca.pem \
+  --image registry.example/team/rrt@sha256:DIGEST \
+  --output out/e2e/3vm/local-first
+```
+
+This is a runnable case, not evidence that it has passed on real VMs.
