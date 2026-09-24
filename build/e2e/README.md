@@ -112,7 +112,8 @@ Local Docker reproduction requires access to the same bind-mounted paths as the 
   and completed reconciliation, prove backend IDs are unchanged, then query and
   execute on the original instances.
 - `stop`: independently create a live instance pinned to each node, verify both
-  backend inventories are occupied and exercise each forwarded port. It also
+  backend inventories are occupied and exercise each forwarded port. A separate
+  instance on each node is deleted to emit the required lifecycle log and trace. It also
   generates the Collector outage/recovery evidence required by its own metrics
   and log assertions. Then it stops each product supervisor, requires physical
   deletion, verifies independently hosted sandboxd still answers, and stops it.

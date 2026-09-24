@@ -202,8 +202,12 @@ def validate(node):
     wait(lambda:int((P/'collector-starts').read_text())>previous,'collector restart not completed')
     (P/'sink-paused').unlink()
     wait(lambda:len(received())>=40,'buffered logs not recovered',60)
-    time.sleep(2)
     counts=collections.Counter(received());assert counts==collections.Counter(range(40)),dict(counts)
+    def operation_states():
+        return {b.get('fields',{}).get('state') for _,b in records()
+                if isinstance(b,dict) and b.get('fields',{}).get('event')=='environment_operation_completed'}
+    wait(lambda:{'Running','Deleted'} <= operation_states(),
+         f'Running and Deleted operation logs were not exported: {operation_states()}',15)
     rows=records();services={a.get('service.name') for a,_ in rows}
     required=required_log_services(node)
     assert required <= services, (required,services)
