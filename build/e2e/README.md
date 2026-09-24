@@ -52,6 +52,9 @@ subcases, and JUnit reports those subcases individually. Both profiles write
 reached is visible as skipped and prevents the JSON result from passing. The
 public API inventory and uncovered conditional features are tracked in
 [SDK E2E coverage](../../docs/testing/sdk-e2e-coverage.md).
+For a focused diagnostic, add `--case stop` (or another case from the selected
+profile). The result is labeled `profile: targeted`, records `source_profile`
+and `selected_case`, and cannot be cited as a complete profile pass.
 
 All output directories must be new. Local runs allow dirty packages and image
 tags, recording their actual identities. Buildkite requires the current clean
@@ -108,8 +111,10 @@ Local Docker reproduction requires access to the same bind-mounted paths as the 
 - `restart`: terminate only Adxlet processes, wait for fresh node sessions
   and completed reconciliation, prove backend IDs are unchanged, then query and
   execute on the original instances.
-- `stop`: stop each product supervisor with live instances, require physical
-  deletion, verify independently hosted sandboxd still answers, then stop it.
+- `stop`: independently create a live instance pinned to each node, verify both
+  backend inventories are occupied, stop each product supervisor, require
+  physical deletion, verify independently hosted sandboxd still answers, then
+  stop it. This case has no dependency on a preceding `restart` case.
 
 The runner produces `result.json`, `junit.xml`, package/image identity, SDK
 results, node catalogs and component logs. Generated keys/certificates use a

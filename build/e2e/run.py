@@ -30,6 +30,14 @@ def required_for_profile(profile):
     except KeyError as error:
         raise ValueError('unknown E2E profile: '+profile) from error
 
+def selected_checks(profile, case=None):
+    required=required_for_profile(profile)
+    if case is None:
+        return required
+    if case not in required:
+        raise ValueError(f'{case} is not in E2E profile {profile}')
+    return (case,)
+
 def sha(path):
     h=hashlib.sha256()
     with path.open('rb') as f:
@@ -329,7 +337,9 @@ class Run:
                 self.execute('node1','/opt/adx/client/bin/python','-u','/opt/adx/e2e/scenarios.py','recovered',timeout=90)
         if 'stop' in selected:
             with self.case('stop', checks):
-                self.event('Stop node2 then node1; verify physical backend instances are empty')
+                self.event('Create live backends on both nodes, stop services, and verify physical cleanup')
+                self.execute('node1','/opt/adx/client/bin/python','-u','/opt/adx/e2e/scenarios.py','create-stop',timeout=300)
+                for node in self.nodes:self.helper(node,'occupied',node)
                 for node in reversed(self.nodes):
                     self.helper(node,'stop',node,timeout=180)
                     self.helper(node,'empty',node)
@@ -365,9 +375,9 @@ def write_junit(path, report, suite_name='platform-e2e'):
     ET.ElementTree(suite).write(path,encoding='utf-8',xml_declaration=True)
 
 def main():
-    p=argparse.ArgumentParser();p.add_argument('--bundle',type=Path,required=True);p.add_argument('--output',type=Path,required=True);p.add_argument('--profile',choices=('l0','standalone'),default='standalone');p.add_argument('--cgroupns',choices=('private','host'),default='private');a=p.parse_args()
+    p=argparse.ArgumentParser();p.add_argument('--bundle',type=Path,required=True);p.add_argument('--output',type=Path,required=True);p.add_argument('--profile',choices=('l0','standalone'),default='standalone');p.add_argument('--case',help='run one case as a targeted diagnostic, not a profile gate');p.add_argument('--cgroupns',choices=('private','host'),default='private');a=p.parse_args()
     out=a.output.resolve();out.mkdir(parents=True,exist_ok=False)
-    run=Run(out,cgroupns=a.cgroupns);error=None;checks=[];m=None;required=required_for_profile(a.profile)
+    run=Run(out,cgroupns=a.cgroupns);error=None;checks=[];m=None;required=selected_checks(a.profile,a.case)
     def cancel(signum,frame):raise InterruptedError(f'canceled by signal {signum}')
     for s in (signal.SIGTERM,signal.SIGINT):signal.signal(s,cancel)
     with tempfile.TemporaryDirectory(prefix='adx-e2e-secrets-') as private:
@@ -383,7 +393,7 @@ def main():
             signal.signal(signal.SIGTERM,signal.SIG_IGN)
             signal.signal(signal.SIGINT,signal.SIG_IGN)
             errors=run.cleanup()
-    report=finish_report(error,errors,checks,required);report.update(run_id=run.id,deployment='local-docker',profile=a.profile,cgroupns=a.cgroupns,cases=run.case_results)
+    report=finish_report(error,errors,checks,required);report.update(run_id=run.id,deployment='local-docker',profile='targeted' if a.case else a.profile,source_profile=a.profile,selected_case=a.case,cgroupns=a.cgroupns,cases=run.case_results)
     (out/'result.json').write_text(json.dumps(report,indent=2)+'\n')
     write_junit(out/'junit.xml',report)
     print(json.dumps(report));return 0 if report['status']=='passed' else 1

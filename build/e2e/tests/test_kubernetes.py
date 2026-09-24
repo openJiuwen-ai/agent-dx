@@ -212,6 +212,14 @@ class KubernetesLifecycleTests(unittest.TestCase):
         self.assertIn('build.env("ADX_E2E_ARTIFACT_BUILD") == null',pipeline)
         self.assertIn("os.environ.get('ADX_E2E_ARTIFACT_COMMIT'",summary)
 
+    def test_targeted_case_requires_reused_product_and_is_reported_separately(self):
+        script=(ROOT.parents[1]/'.buildkite/run-e2e.sh').read_text()
+        runner=(ROOT/'kubernetes/run.py').read_text()
+        self.assertIn('ADX_E2E_TARGET_CASE',script)
+        self.assertIn('targeted E2E requires an exact reused image build',script)
+        self.assertIn("profile='targeted' if a.case else a.profile",runner)
+        self.assertIn('selected_case=a.case',runner)
+
     def test_reused_product_image_receives_current_test_harness(self):
         import json,tempfile
         with tempfile.TemporaryDirectory() as d:

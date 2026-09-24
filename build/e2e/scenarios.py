@@ -100,11 +100,12 @@ elif sys.argv[1]=='capacity':
     finally:
         for s in instances:s.kill();s.close()
     check_metrics('released',running=0,reserved=0,pending=0)
-elif sys.argv[1] in ('create','create-marker'):
+elif sys.argv[1] in ('create','create-marker','create-stop'):
     instances=[]
     try:
-        for _ in range(2):
-            s=Sandbox(image=image,runtime='runc',cpu=500,memory=512,idle_timeout=0,connection=connection,create_timeout=150)
+        for index in range(2):
+            options={'node_id':f'node{index+1}'} if sys.argv[1]=='create-stop' else {}
+            s=Sandbox(image=image,runtime='runc',cpu=500,memory=512,idle_timeout=0,connection=connection,create_timeout=150,**options)
             instances.append(s);assert s.is_running()
             if sys.argv[1]=='create-marker':
                 deadline=time.monotonic()+10
@@ -118,7 +119,7 @@ elif sys.argv[1] in ('create','create-marker'):
                         retries+=1
                         time.sleep(.2)
                 event('Marker written after route synchronization; retries='+str(retries))
-            event('Created instance for restart check: '+s.id)
+            event('Created live instance: '+s.id)
         (E/'live-instances.json').write_text(json.dumps([s.id for s in instances]))
     finally:
         for s in instances:s.close()

@@ -7,7 +7,7 @@ ADX uses four Buildkite pipelines backed by one repository:
 | `agent-dx` | `pipeline-package.yml` | Platform/Execd/SDK/adxadmin UT and packages, install smoke, real Kubernetes L0, default OBS upload and optional PyPI publication |
 | `agent-dx-python-sdk` | `pipeline-sdk.yml` | Python SDK tests, wheel/sdist, clean install smoke and optional OBS/PyPI publication |
 | `agent-dx-admin` | `pipeline-admin.yml` | Standalone adxadmin UT, wheel/sdist, install smoke and optional PyPI publication |
-| `agent-dx-full-test` | `pipeline-full.yml` | Compose exact base/SDK candidates and run the ten-group Kubernetes Full gate |
+| `agent-dx-full-test` | `pipeline-full.yml` | Compose exact base/SDK candidates and run the eleven-group Kubernetes Full gate |
 
 `.buildkite/pipeline.yml` only dispatches by `BUILDKITE_PIPELINE_SLUG`; it does
 not contain product build or test jobs. Collector mirroring and target-node
@@ -293,6 +293,12 @@ prevent a pass. `result.json`, JUnit, Kubernetes resource/events and per-Pod log
 are uploaded. Secret bodies travel on stdin and are excluded from manifests and
 evidence; generated API/Redis keys are redacted from collected component logs.
 
+For a bounded follow-up on one case, reuse an exact `ADX_E2E_ARTIFACT_BUILD`
+and set `ADX_E2E_TARGET_CASE` to a case in the `full` profile. The case runner
+still deploys and cleans up two physical workers but reports `profile: targeted`
+with `source_profile` and `selected_case`. This result is diagnostic evidence,
+not a Full gate pass. The normal pipeline leaves `ADX_E2E_TARGET_CASE` unset.
+
 The Full pipeline sets `ADX_E2E_PROFILE=full`. Direct local driver runs may still
 select `l0` or `k8s-basic` for bounded diagnosis. Full fails after scheduling
 when both platform Pods land on the same
@@ -454,7 +460,7 @@ The existing basic E2E result alone does not count as this profile passing.
 
 `ADX_BACKEND_ARTIFACT_BUILD` 接受 Buildkite build UUID（API 返回的 `id`），不是页面上的递增构建编号。复用制品仍需匹配 sandboxd 提交、目标架构与完整文件摘要；ADX 产品每次从当前提交构建。
 
-The basic acceptance driver also runs an independent `local-first` case: restart API Server with `create_mode=local_first`, verify concurrent public SDK creation, real commands and deletion, require confirmed-claim evidence, then restore central mode. The default `k8s-basic` profile contains five bounded cases. The ten-case `full` and local `standalone` profiles carry installed-SDK `data-plane`, `lifecycle` and fault/restart/stop coverage. [Buildkite #30](https://buildkite.com/agent-dx/agent-dx/builds/30) passed the previous eight-case OCI profile; the current profile split requires fresh formal evidence.
+The basic acceptance driver also runs an independent `local-first` case: restart API Server with `create_mode=local_first`, verify concurrent public SDK creation, real commands and deletion, require confirmed-claim evidence, then restore central mode. The default `k8s-basic` profile contains five bounded cases. The eleven-case `full` and local `standalone` profiles carry installed-SDK `data-plane`, `lifecycle` and fault/restart/stop coverage. [Buildkite #30](https://buildkite.com/agent-dx/agent-dx/builds/30) passed the previous eight-case OCI profile; the current profile split requires fresh formal evidence.
 
 ### Local runtime payload tools
 

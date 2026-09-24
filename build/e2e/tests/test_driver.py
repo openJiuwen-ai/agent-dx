@@ -31,6 +31,12 @@ class AcceptanceGateTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'unknown E2E profile'):
             driver.required_for_profile('unknown')
 
+    def test_targeted_case_is_explicit_and_within_its_profile(self):
+        self.assertEqual(driver.selected_checks('full', 'stop'), ('stop',))
+        self.assertEqual(driver.selected_checks('full', None), driver.STANDARD)
+        with self.assertRaisesRegex(ValueError, 'not in E2E profile'):
+            driver.selected_checks('l0', 'stop')
+
     def test_l0_report_only_requires_l0_cases(self):
         report = driver.finish_report(None, [], ['l0', 'auth'], driver.required_for_profile('l0'))
         self.assertEqual(report['status'], 'passed')
@@ -147,6 +153,26 @@ class AcceptanceGateTests(unittest.TestCase):
                 ('execute', 'node1', 'cleanup-live'),
                 ('helper', 'node1', 'empty'),
                 ('helper', 'node2', 'empty'),
+            ])
+
+    def test_stop_creates_its_own_live_backends(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = driver.Run(Path(directory))
+            run.nodes = ['node1', 'node2']
+            calls = []
+            run.execute = lambda node, *args, **kwargs: calls.append(('execute', node, args[-1])) or ''
+            run.helper = lambda node, *args, **kwargs: calls.append(('helper', node, args[0])) or ''
+            checks = []
+            run.scenarios(checks, ('stop',))
+            self.assertEqual(checks, ['stop'])
+            self.assertEqual(calls, [
+                ('execute', 'node1', 'create-stop'),
+                ('helper', 'node1', 'occupied'),
+                ('helper', 'node2', 'occupied'),
+                ('helper', 'node2', 'stop'),
+                ('helper', 'node2', 'empty'),
+                ('helper', 'node1', 'stop'),
+                ('helper', 'node1', 'empty'),
             ])
 
     def test_old_eight_scenarios_without_functional_data_plane_cannot_pass(self):
