@@ -34,7 +34,7 @@
 | 门禁 | 场景 | 通过条件 | 当前状态 |
 |---|---|---|---|
 | SD-01 | sandboxd 晚于 adxlet 启动 | adxlet 持续等待；不注册、不准入；sandboxd 就绪后才开始对账和服务 | 已有 UDS 定向测试 |
-| SD-02 | daemon 重启且 runtime 保留 | 已有实例不误判退出；资源观测过期后关闭新准入，连接恢复后对账并重新开放 | pinned gRPC/UDS 契约测试已覆盖 daemon 连接重建后按标签找回 backend 且不重复 Start；资源门控和真实 daemon 重启仍待 E2E |
+| SD-02 | daemon 重启且 runtime 保留 | 已有实例不误判退出；资源观测过期后关闭新准入，连接恢复后对账并重新开放 | pinned gRPC/UDS 契约测试覆盖按标签找回 backend 且不重复 Start；[Full #17](https://buildkite.com/agent-dx/agent-dx-full-test/builds/17) 已对两节点真实 daemon 注入 `SIGKILL`，验证原 backend ID 保留及 SDK 恢复。资源观测超过有效期时关闭新准入、采集恢复后重新开放仍待故障注入 E2E |
 | SD-03 | daemon 重启且 runtime 丢失，Never | 实例进入 Failed、撤路由、释放资源，不自动冷启动 | 已有对账组件测试验证 Failed、撤路由、资源释放且 RuntimeDriver::start 不会被调用；待真实 daemon 重启 E2E |
 | SD-04 | daemon 重启且 runtime 丢失，自动重启 | 遵守重试上限与退避，新 backend 使用同一 Environment ID 和有效 generation | 已有生命周期组件测试验证新 runtime identity、退避和重试上限；需加入正式进程门禁 |
 
