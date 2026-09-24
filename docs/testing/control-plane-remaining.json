@@ -80,6 +80,14 @@
     "gate": "在真实 standalone/full 部署执行 --case relay-standalone，确认两节点独立进程证据、SDK 数据面全部子项及最终清理。"
   },
   {
+    "id": "runtime-exit-policy",
+    "title": "真实后端意外退出与有界重启",
+    "stage": "7",
+    "status": "pending",
+    "detail": "新增 runtime-exit 定向用例：真实 sandboxd backend 删除后验证 Never 终态、配置有界重启的新 runtime identity、第三次退出后的重试上限及资源释放。正式进程用例尚未执行；daemon 重启且 runtime 丢失的组合故障仍需另行验证。",
+    "gate": "在真实 standalone/full 部署执行 --case runtime-exit，保存 SDK、Redis assignment/result、sandboxd inventory 和清理证据。"
+  },
+  {
     "id": "service-soak",
     "title": "真实服务混合负载与长稳",
     "stage": "5",
