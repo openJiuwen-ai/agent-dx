@@ -353,11 +353,27 @@ Without `--route-probe`, `stop.py` remains a narrower shutdown subset and
 cannot supply `final_state.published_routes` for full `result.json`. This
 case has not yet passed on real VMs.
 
+After confirming the three dedicated VM identities and release digest, start
+the non-resettable budget **before installing or configuring the first profile**:
+
+```sh
+python3 build/e2e/multivm/budget.py \
+  --inventory out/e2e/3vm/inventory.json \
+  --output out/e2e/3vm/suite \
+  --budget-seconds 10800
+```
+
+This writes `budget-state.json` exclusively. Re-running the command cannot
+reset its start time. The inventory and output directory must remain the same
+for every profile. Without this explicit start, `suite.py` can run selected
+cases with a cases-only budget, but `assemble.py` cannot mark the complete
+three-VM deployment acceptance as passed.
+
 `suite.py` runs selected cases against an already deployed profile. It writes
 each case's complete `case.log` and JSON result, plus a resumable
-`budget-state.json` and `suite-result.json`. The default shared budget is
-10,800 seconds (three hours) from the first suite invocation, including failed
-cases and time spent switching deployment profiles between invocations. A case has
+`budget-state.json` and `suite-result.json`. With the explicit start, the
+shared budget is 10,800 seconds (three hours), including deployment, failed
+cases and time spent switching profiles. A case has
 its own smaller timeout; on failure the remaining selected cases continue,
 so failure diagnosis and regression can happen after the coverage pass.
 The budget file is bound to the inventory digest and can be reused across
@@ -414,6 +430,7 @@ python3 build/e2e/multivm/verify.py \
   --result out/e2e/3vm/suite/result.json
 ```
 
-Prepare the release, Linux test-only RPC probes and initial deployment profile
-before starting the shared budget. VM provisioning before the first suite
-invocation remains outside the budget; subsequent profile switching is counted.
+Prepare the verified release, three-VM inventory and Linux test-only RPC probes
+before starting the shared budget. Start it before deploying the initial
+profile, then install and run every profile within that window. VM provisioning
+before the inventory is fixed is outside the acceptance clock.
