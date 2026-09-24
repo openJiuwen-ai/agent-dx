@@ -54,8 +54,35 @@ def stop_services(machine, remote=ssh, wait=wait_until):
     return pids
 
 
+def run_route_probe(executable, control):
+    address = control.get('coordinator_rpc_address')
+    if not isinstance(address, str) or not address:
+        raise ValueError('control inventory needs coordinator_rpc_address for route probing')
+    command = [str(executable), address]
+    tls = control.get('route_probe_tls')
+    if tls is not None:
+        if not isinstance(tls, dict) or any(not tls.get(key)
+                                            for key in ('ca', 'cert', 'key', 'server_name')):
+            raise ValueError('route_probe_tls needs ca, cert, key and server_name')
+        command.extend(str(tls[key]) for key in ('ca', 'cert', 'key', 'server_name'))
+    completed = subprocess.run(command, capture_output=True, text=True,
+                               timeout=30, check=False)
+    if completed.returncode != 0:
+        raise AssertionError('route snapshot RPC probe failed: ' + completed.stderr[-1000:])
+    try:
+        result = json.loads(completed.stdout)
+    except ValueError as error:
+        raise AssertionError('route snapshot RPC probe returned invalid JSON') from error
+    if result.get('status') != 'passed' or result.get('reset') is not True \
+            or not isinstance(result.get('published_routes'), int) \
+            or result['published_routes'] < 0 \
+            or not isinstance(result.get('revision'), int):
+        raise AssertionError(f'route snapshot RPC probe returned invalid evidence: {result}')
+    return result
+
+
 def run_stop(inventory, connection, image, socket, output, dedicated=False,
-             sandbox_factory=None, remote=ssh, wait=wait_until):
+             sandbox_factory=None, remote=ssh, wait=wait_until, route_probe=None):
     if not dedicated:
         raise ValueError('stop acceptance requires explicit dedicated-VM confirmation')
     verify_inventory(inventory)
@@ -123,6 +150,20 @@ def run_stop(inventory, connection, image, socket, output, dedicated=False,
                     raise AssertionError('surviving worker did not continue serving')
             report['checks'].append(stopped_worker['role'] + '-drained-and-route-withdrawn')
 
+        report['final_state'] = {
+            'backend_instances': {
+                worker['role']: len(backend_inventory(worker, socket, remote))
+                for worker in workers
+            },
+        }
+        if route_probe is not None:
+            snapshot = wait(
+                lambda: (result if result['published_routes'] == 0 else None)
+                if (result := route_probe(control)) else None,
+                'published routes remain after worker shutdown', 30)
+            report['route_snapshot'] = snapshot
+            report['final_state']['published_routes'] = snapshot['published_routes']
+            report['checks'].append('published-route-catalog-empty')
         report['stopped_pids_control'] = stop_services(control, remote, wait)
         report['stop_order'].append('control')
         report['checks'].append('control-stopped-last')
@@ -160,7 +201,11 @@ def main():
     parser.add_argument('--socket', default='/run/sandboxd/sandboxd.sock')
     parser.add_argument('--output', required=True, type=Path)
     parser.add_argument('--confirm-dedicated', action='store_true', required=True)
+    parser.add_argument('--route-probe', type=Path)
     args = parser.parse_args()
+    if args.route_probe and (not args.route_probe.is_file()
+                             or not os.access(args.route_probe, os.X_OK)):
+        parser.error('--route-probe must name a built route_snapshot_probe executable')
     os.environ['SSL_CERT_FILE'] = str(args.ca.resolve())
     from adx_sandbox import ConnectionConfig
     connection = ConnectionConfig(
@@ -168,7 +213,9 @@ def main():
         use_tls=True, verify_tls=True,
     )
     report = run_stop(json.loads(args.inventory.read_text()), connection,
-                      args.image, args.socket, args.output, dedicated=args.confirm_dedicated)
+                      args.image, args.socket, args.output, dedicated=args.confirm_dedicated,
+                      route_probe=(lambda control: run_route_probe(args.route_probe, control))
+                      if args.route_probe else None)
     print(json.dumps({'status': report['status'], 'checks': report['checks']}), flush=True)
 
 

@@ -132,8 +132,9 @@ class SuiteTests(unittest.TestCase):
             config.session_probe = destination / 'probe'
             self.assertEqual(case_command(config, 'session-fence', destination)[-2:],
                              ['--session-probe', str(config.session_probe)])
-            self.assertEqual(case_command(config, 'stop', destination)[-1],
-                             '--confirm-dedicated')
+            config.route_probe = destination / 'route-probe'
+            self.assertEqual(case_command(config, 'stop', destination)[-3:],
+                             ['--confirm-dedicated', '--route-probe', str(config.route_probe)])
 
     def test_session_fence_requires_executable_probe(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -155,3 +156,15 @@ class SuiteTests(unittest.TestCase):
             self.assertEqual(result['status'], 'passed')
             self.assertEqual(calls, [('auth', 300)])
             self.assertTrue((config.output / 'auth' / 'auth-result.json').is_file())
+
+    def test_stop_route_probe_must_be_executable_when_configured(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(directory, ('stop',), dedicated=True)
+            config.route_probe = Path(directory) / 'probe'
+            execute, calls = self.executor()
+            with self.assertRaisesRegex(ValueError, 'route-probe'):
+                run_plan(config, execute=execute)
+            config.route_probe.write_text('not executable')
+            with self.assertRaisesRegex(ValueError, 'route-probe'):
+                run_plan(config, execute=execute)
+            self.assertFalse(calls)

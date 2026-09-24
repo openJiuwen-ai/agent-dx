@@ -4,8 +4,9 @@ import subprocess
 import tempfile
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
-from build.e2e.multivm.stop import run_stop
+from build.e2e.multivm.stop import run_route_probe, run_stop
 from build.e2e.tests.test_multivm_local_first import inventory
 
 
@@ -16,7 +17,7 @@ class StopTests(unittest.TestCase):
                 run_stop(inventory(), object(), 'image', '/run/sandboxd/sandboxd.sock',
                          Path(directory))
 
-    def exercise(self, route_leak=False):
+    def exercise(self, route_leak=False, published_routes=0):
         state = {'owners': {}, 'stopped': set(), 'order': [], 'deleted': set()}
 
         class Sandbox:
@@ -82,27 +83,55 @@ class StopTests(unittest.TestCase):
                 raise AssertionError(message)
             return result
 
+        def route_probe(_control):
+            self.assertEqual(state['order'], ['worker-2', 'worker-1'])
+            return {'status': 'passed', 'reset': True,
+                    'published_routes': published_routes, 'revision': 5}
+
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory)
-            if route_leak:
-                with self.assertRaisesRegex(AssertionError, 'remained routable'):
+            if route_leak or published_routes:
+                expected = 'remained routable' if route_leak else 'published routes remain'
+                with self.assertRaisesRegex(AssertionError, expected):
                     run_stop(inventory(), object(), 'image', '/run/sandboxd/sandboxd.sock',
                              output, dedicated=True, sandbox_factory=Sandbox,
-                             remote=remote, wait=wait)
-                self.assertEqual(state['order'], ['worker-2'])
-                self.assertEqual(state['deleted'], {'sandbox-node1'})
+                             remote=remote, wait=wait, route_probe=route_probe)
+                self.assertEqual(state['order'], ['worker-2'] if route_leak else
+                                 ['worker-2', 'worker-1'])
+                if route_leak:
+                    self.assertEqual(state['deleted'], {'sandbox-node1'})
                 self.assertEqual(json.loads((output / 'stop-result.json').read_text())['status'],
                                  'failed')
             else:
                 report = run_stop(inventory(), object(), 'image', '/run/sandboxd/sandboxd.sock',
                                   output, dedicated=True, sandbox_factory=Sandbox,
-                                  remote=remote, wait=wait)
+                                  remote=remote, wait=wait, route_probe=route_probe)
                 self.assertEqual(report['status'], 'passed')
                 self.assertEqual(state['order'], ['worker-2', 'worker-1', 'control'])
                 self.assertEqual(len(report['instances']), 2)
+                self.assertEqual(report['final_state'], {
+                    'backend_instances': {'worker-1': 0, 'worker-2': 0},
+                    'published_routes': 0,
+                })
 
     def test_stops_workers_before_control_and_cleans_backends(self):
         self.exercise()
 
     def test_route_leak_aborts_and_cleans_remaining_owned_instance(self):
         self.exercise(route_leak=True)
+
+    def test_published_route_leak_aborts_before_control_stop(self):
+        self.exercise(published_routes=1)
+
+    def test_route_probe_requires_full_snapshot(self):
+        control = {'coordinator_rpc_address': 'control:19000'}
+        valid = {'status': 'passed', 'reset': True, 'revision': 5,
+                 'published_routes': 0}
+        with patch('build.e2e.multivm.stop.subprocess.run') as command:
+            command.return_value = SimpleNamespace(returncode=0, stdout=json.dumps(valid),
+                                                   stderr='')
+            self.assertEqual(run_route_probe('/tmp/probe', control), valid)
+            self.assertEqual(command.call_args.args[0], ['/tmp/probe', 'control:19000'])
+            command.return_value.stdout = json.dumps({**valid, 'reset': False})
+            with self.assertRaisesRegex(AssertionError, 'invalid evidence'):
+                run_route_probe('/tmp/probe', control)

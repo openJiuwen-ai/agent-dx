@@ -322,7 +322,20 @@ inventories to be empty before creating its own Sandboxes. It stops worker 2,
 then worker 1, then the control VM through each supervisor. After each worker
 stop it checks the backend inventory, persisted deletion, route withdrawal,
 and continued service on any remaining worker. Run this only after all other
-three-VM cases; the deployment will be stopped at the end.
+three-VM cases; the deployment will be stopped at the end. To record the
+complete result contract's published-route count, build the test-only RPC
+reader for the Linux client before the timed run:
+
+```sh
+cargo build -p adx-coordinator --example route_snapshot_probe
+```
+
+The control inventory entry needs `coordinator_rpc_address`. When internal
+RPC uses mTLS, set `route_probe_tls` on that entry with `ca`, `cert`, `key`
+and `server_name` paths on the client; this certificate must authenticate
+as Ingress. The probe reads a full Coordinator publication snapshot after
+both workers have drained and before stopping control. The per-instance
+public route withdrawal checks still run after each worker stop.
 
 ```sh
 python3 build/e2e/multivm/stop.py \
@@ -332,10 +345,13 @@ python3 build/e2e/multivm/stop.py \
   --ca /path/to/ingress-ca.pem \
   --image registry.example/team/rrt@sha256:DIGEST \
   --output out/e2e/3vm/stop \
-  --confirm-dedicated
+  --confirm-dedicated \
+  --route-probe target/debug/examples/route_snapshot_probe
 ```
 
-This case has not yet passed on real VMs.
+Without `--route-probe`, `stop.py` remains a narrower shutdown subset and
+cannot supply `final_state.published_routes` for full `result.json`. This
+case has not yet passed on real VMs.
 
 `suite.py` runs selected cases against an already deployed profile. It writes
 each case's complete `case.log` and JSON result, plus a resumable
@@ -375,5 +391,5 @@ and `--case placement-spread`; after applying local-first use
 `--case runtime-affinity` only on a heterogeneous profile with one runsc
 worker. Select `--case session-fence --session-probe PATH` for the old-session
 RPC assertion after the quick-restart subset. Select
-`--case stop --confirm-dedicated` last, against the
+`--case stop --confirm-dedicated --route-probe PATH` last, against the
 chosen final deployment. All cases remain unverified on real three-VM hosts.

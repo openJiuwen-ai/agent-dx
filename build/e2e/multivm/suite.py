@@ -62,6 +62,7 @@ class RunConfig:
     budget_seconds: int = MAX_BUDGET_SECONDS
     confirm_dedicated: bool = False
     session_probe: Optional[Path] = None
+    route_probe: Optional[Path] = None
 
 
 def write_json(path, value):
@@ -89,6 +90,8 @@ def case_command(config, case, destination):
         command += ['--session-probe', str(config.session_probe)]
     elif case == 'stop':
         command.append('--confirm-dedicated')
+        if config.route_probe is not None:
+            command += ['--route-probe', str(config.route_probe)]
     return command
 
 
@@ -160,6 +163,10 @@ def run_plan(config, execute=execute_subprocess, now=time.time):
             and (config.session_probe is None or not config.session_probe.is_file()
                  or not os.access(config.session_probe, os.X_OK)):
         raise ValueError('session-fence requires a built --session-probe executable')
+    if 'stop' in config.cases and config.route_probe is not None \
+            and (not config.route_probe.is_file()
+                 or not os.access(config.route_probe, os.X_OK)):
+        raise ValueError('--route-probe must name a built executable')
     config.output.mkdir(parents=True, exist_ok=True)
     state_path = config.output / 'budget-state.json'
     digest = inventory_digest(config.inventory)
@@ -253,6 +260,7 @@ def main():
     parser.add_argument('--budget-seconds', type=int, default=MAX_BUDGET_SECONDS)
     parser.add_argument('--confirm-dedicated', action='store_true')
     parser.add_argument('--session-probe', type=Path)
+    parser.add_argument('--route-probe', type=Path)
     args = parser.parse_args()
     if 'sdk' in args.cases and not args.release:
         parser.error('--case sdk requires --release')
@@ -266,6 +274,7 @@ def main():
         cases=tuple(args.cases), budget_seconds=args.budget_seconds,
         confirm_dedicated=args.confirm_dedicated,
         session_probe=args.session_probe,
+        route_probe=args.route_probe,
     )
     config.output.mkdir(parents=True, exist_ok=True)
     with (config.output / 'suite.lock').open('w') as lock:
