@@ -234,3 +234,39 @@ python3 build/e2e/multivm/stop.py \
 ```
 
 This case has not yet passed on real VMs.
+
+`suite.py` runs selected cases against an already deployed profile. It writes
+each case's complete `case.log` and JSON result, plus a resumable
+`budget-state.json` and `suite-result.json`. The default shared case-runtime
+budget is 10,800 seconds (three hours), including failed cases. A case has
+its own smaller timeout; on failure the remaining selected cases continue,
+so failure diagnosis and regression can happen after the coverage pass.
+The budget file is bound to the inventory digest and can be reused across
+separate central Pack, central Spread and local-first deployments. An
+interrupted runner records the in-flight time before resuming and refuses to
+start another case while the previous process group is still live.
+`stop` must be selected last with `--confirm-dedicated` and should only run
+after the other profiles have finished. The runner reports selected-case
+results; it does not claim the complete `contract.REQUIRED` result until
+all checks and deployment evidence have been assembled and verified.
+
+For example, on a central Pack deployment:
+
+```sh
+python3 build/e2e/multivm/suite.py \
+  --inventory out/e2e/3vm/inventory.json \
+  --endpoint control.example:8443 \
+  --token-file /path/to/tenant-key \
+  --admin-token-file /path/to/admin-key \
+  --ca /path/to/ingress-ca.pem \
+  --release /path/to/adx-release.tar.gz \
+  --image registry.example/team/rrt@sha256:DIGEST \
+  --output out/e2e/3vm/suite \
+  --case sdk --case capacity --case placement-pack \
+  --case worker-failure --case worker-restart --case control-restart
+```
+
+After applying central Spread, call the same runner with the same `--output`
+and `--case placement-spread`; after applying local-first use
+`--case local-first`. Run `--case stop --confirm-dedicated` last, against the
+chosen final deployment. All cases remain unverified on real three-VM hosts.
