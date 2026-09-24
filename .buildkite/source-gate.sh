@@ -9,7 +9,8 @@ source .buildkite/bootstrap-build.sh
 mkdir -p out/buildkite/logs
 
 echo "--- :test_tube: CI driver tests"
-python3 -u -m unittest discover -s build/e2e/tests -v \
+PYTHONPATH="$PWD/build${PYTHONPATH:+:$PYTHONPATH}" \
+  python3 -u -m unittest discover -s build/e2e/tests -v \
   2>&1 | tee out/buildkite/logs/driver-tests.log
 echo "--- :test_tube: Release tooling tests"
 python3 -u -m unittest discover -s build/release/tests -v \

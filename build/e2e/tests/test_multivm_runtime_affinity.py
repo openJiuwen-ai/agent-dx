@@ -4,8 +4,8 @@ import tempfile
 from types import SimpleNamespace
 import unittest
 
-from build.e2e.multivm.runtime_affinity import run_runtime_affinity
-from build.e2e.tests.test_multivm_local_first import inventory
+from e2e.multivm.runtime_affinity import run_runtime_affinity
+from e2e.tests.test_multivm_local_first import inventory
 
 
 class RuntimeAffinityTests(unittest.TestCase):

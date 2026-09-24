@@ -4,8 +4,8 @@ import tempfile
 from types import SimpleNamespace
 import unittest
 
-from build.e2e.multivm.placement_policy import run_placement_policy
-from build.e2e.tests.test_multivm_local_first import inventory
+from e2e.multivm.placement_policy import run_placement_policy
+from e2e.tests.test_multivm_local_first import inventory
 
 
 class PlacementPolicyTests(unittest.TestCase):
