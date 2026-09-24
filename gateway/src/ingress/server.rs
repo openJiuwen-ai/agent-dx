@@ -3,7 +3,7 @@ use super::connector::{DataPlaneL4Connector, H2ConnectStream};
 use super::http_pool::{
     BackendHttpPool, BackendHttpPoolConfig, BackendHttpPoolError, BackendHttpPoolKey,
 };
-use super::path::parse_direct_path;
+use super::path::{parse_direct_path, parse_port_host_route, ParsedDirectPath};
 use super::resolver::{AccessKind, IngressRouteResolver, ResolveError, RouteHandle};
 use super::reverse_proxy::{ProxyRoute, ReverseProxy, ReverseProxyConfig};
 use crate::common::listener::accept_with_backoff;
@@ -239,6 +239,7 @@ pub struct Ingress {
     authenticator: IngressAuthenticator,
     default_direct_port: u16,
     default_tunnel_port: u16,
+    port_host_domain: Option<String>,
     frontend_address: String,
     reverse_proxy: ReverseProxy,
     proxy_routes: Arc<Vec<ProxyRoute>>,
@@ -278,6 +279,7 @@ impl Ingress {
             authenticator,
             default_direct_port,
             default_tunnel_port,
+            port_host_domain: None,
             frontend_address: frontend_address.into(),
             reverse_proxy: ReverseProxy::new(ReverseProxyConfig::default()),
             proxy_routes: Arc::new(Vec::new()),
@@ -331,6 +333,11 @@ impl Ingress {
 
     pub fn with_proxy_routes(mut self, routes: Vec<ProxyRoute>) -> Self {
         self.proxy_routes = Arc::new(routes);
+        self
+    }
+
+    pub fn with_port_host_domain(mut self, domain: Option<String>) -> Self {
+        self.port_host_domain = domain;
         self
     }
 
@@ -719,13 +726,17 @@ impl Ingress {
         let method = request.method().to_string();
         let path = request.uri().path().to_owned();
         let (access_kind, instance_id, target_port) = self.access_fields(&request);
+        let host_route = self.port_host_route(&request).is_some();
         adx_observability::trace::attribute("instance.id", instance_id.clone());
         adx_observability::trace::attribute("http.request.method", method.clone());
         #[cfg(feature = "agent-api")]
-        let agent_data_error = self
-            .prepare_agent_data(&mut request, ingress_security)
-            .await
-            .err();
+        let agent_data_error = if host_route {
+            None
+        } else {
+            self.prepare_agent_data(&mut request, ingress_security)
+                .await
+                .err()
+        };
         #[cfg(not(feature = "agent-api"))]
         let agent_data_error: Option<Response<ProxyBody>> = None;
         #[cfg(feature = "agent-api")]
@@ -743,7 +754,7 @@ impl Ingress {
         let agent_forward = false;
         let response = if let Some(response) = agent_data_error {
             response
-        } else if agent_forward {
+        } else if host_route || agent_forward {
             // A selected Sandbox is already a data-plane target. Its ID must never
             // be interpreted again as a public management or configured proxy path.
             self.proxy_direct(request, ingress_security).await
@@ -972,25 +983,51 @@ impl Ingress {
                 target.map(|value| value.1).unwrap_or_default(),
             );
         }
+        if let Some(parsed) = self.port_host_route(request) {
+            return (
+                parsed.access_kind.as_str(),
+                parsed.instance_id,
+                parsed.target_port,
+            );
+        }
         if self.application_route(request).is_some() {
             return ("reverse-proxy", String::new(), 0);
         }
         if self.is_control_plane_path(request.uri().path()) {
             return ("control-plane", String::new(), 0);
         }
-        parse_direct_path(
-            request.uri().path(),
-            self.default_direct_port,
-            self.default_tunnel_port,
-        )
-        .map(|parsed| {
-            (
-                parsed.access_kind.as_str(),
-                parsed.instance_id,
-                parsed.target_port,
+        self.direct_route(request)
+            .map(|parsed| {
+                (
+                    parsed.access_kind.as_str(),
+                    parsed.instance_id,
+                    parsed.target_port,
+                )
+            })
+            .unwrap_or(("unmatched", String::new(), 0))
+    }
+
+    fn port_host_route<B>(&self, request: &Request<B>) -> Option<ParsedDirectPath> {
+        if request.method() == http::Method::CONNECT {
+            return None;
+        }
+        let domain = self.port_host_domain.as_deref()?;
+        let host = request
+            .headers()
+            .get(header::HOST)
+            .and_then(|value| value.to_str().ok())
+            .or_else(|| request.uri().authority().map(http::uri::Authority::as_str))?;
+        parse_port_host_route(host, request.uri().path(), domain)
+    }
+
+    fn direct_route<B>(&self, request: &Request<B>) -> Option<ParsedDirectPath> {
+        self.port_host_route(request).or_else(|| {
+            parse_direct_path(
+                request.uri().path(),
+                self.default_direct_port,
+                self.default_tunnel_port,
             )
         })
-        .unwrap_or(("unmatched", String::new(), 0))
     }
 
     fn is_control_plane_path(&self, path: &str) -> bool {
@@ -1473,11 +1510,7 @@ impl Ingress {
         mut request: Request<Incoming>,
         ingress_security: IngressSecurity,
     ) -> Result<Response<ProxyBody>, (Response<ProxyBody>, Request<Incoming>)> {
-        let Some(parsed) = parse_direct_path(
-            request.uri().path(),
-            self.default_direct_port,
-            self.default_tunnel_port,
-        ) else {
+        let Some(parsed) = self.direct_route(&request) else {
             return Ok(plain(StatusCode::NOT_FOUND, "route not found"));
         };
         if ingress_security == IngressSecurity::Plaintext {
