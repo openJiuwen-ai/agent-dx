@@ -101,14 +101,16 @@ Local Docker reproduction requires access to the same bind-mounted paths as the 
   entry-node rotation, concurrent same-name creation converging to one Environment,
   conflicting specifications rejected, real EXECD commands, and physical cleanup.
   Require Coordinator local-claim logs, then restore the central deployment mode.
-- `node-failure`: suspend node2 Adxlet heartbeats while its runtime remains
-  independently hosted; require persisted invalidation, resume the same process,
+- `node-failure`: pin one running backend to each node, then suspend node2
+  Adxlet heartbeats while its runtime remains independently hosted. Require
+  persisted invalidation, resume the same process,
   require backend cleanup before readiness, and prove node1 remains executable.
-- `sandboxd-restart`: create live instances, crash each independently hosted
-  sandboxd daemon with `SIGKILL` and restart it. Require unchanged backend IDs
-  and readable instance files,
+- `sandboxd-restart`: pin one backend to each node, crash each independently
+  hosted sandboxd daemon with `SIGKILL` and restart it. Require unchanged
+  backend IDs and readable instance files,
   then delete the instances and verify resource release.
-- `restart`: terminate only Adxlet processes, wait for fresh node sessions
+- `restart`: pin one backend to each node, terminate only Adxlet processes,
+  wait for fresh node sessions
   and completed reconciliation, prove backend IDs are unchanged, then query and
   execute on the original instances.
 - `stop`: independently create a live instance pinned to each node, verify both

@@ -104,7 +104,10 @@ elif sys.argv[1] in ('create','create-marker','create-stop'):
     instances=[]
     try:
         for index in range(2):
-            options={'node_id':f'node{index+1}','port_forwardings':[18081]} if sys.argv[1]=='create-stop' else {}
+            # Fault cases require one actual backend on each node. Placement
+            # policy itself is exercised independently by the placement group.
+            options={'node_id':f'node{index+1}'}
+            if sys.argv[1]=='create-stop':options['port_forwardings']=[18081]
             s=Sandbox(image=image,runtime='runc',cpu=500,memory=512,idle_timeout=0,connection=connection,create_timeout=150,**options)
             instances.append(s);assert s.is_running()
             if sys.argv[1]=='create-stop':
