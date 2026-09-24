@@ -10,7 +10,7 @@
 |---|---|---|---|
 | ERR-01 | 稳定错误映射 | Invalid、Auth、Permission、NotFound、Conflict、NoCapacity、Unavailable、Deadline、OutcomeUnknown、DataLoss、Internal 的 HTTP/gRPC/SDK 映射一致 | API Server 已逐类校验 HTTP 状态、稳定码、retry、outcome 和操作身份；SDK 结构化解析已有契约测试；完整进程 E2E 待补 |
 | ERR-02 | 可重试分类 | 稳定业务冲突不重试；临时不可用按退避；结果未知只以同一 request/operation/instance 身份重试 | SDK 已覆盖 terminal final 不重试、structured unknown final 同身份重试和重试耗尽；真实断流 E2E 待补 |
-| ERR-03 | 创建应答丢失 | Node 已启动但响应被切断；重试收敛到同一 backend 和 generation | SDK 已覆盖 accepted 后连接报错及正常 EOF 无 final，两类情况均复用 Request ID 和稳定 Environment 名称；原子 claim 有唯一 backend 组件测试；待真实代理断流 E2E |
+| ERR-03 | 创建应答丢失 | Node 已启动但响应被切断；重试收敛到同一 backend 和 generation | SDK 已覆盖 accepted 后连接报错及正常 EOF 无 final，两类情况均复用 Request ID 和稳定 Environment 名称；原子 claim 有唯一 backend 组件测试；`create-response-cut` 定向用例已接入真实 TLS 代理、Redis 与 sandboxd，待正式部署运行 |
 | ERR-04 | 查询空结果 | 结果未知后的 404 不触发换 ID 或第二次 Start | SDK 稳定 Environment ID、同身份重试与原子 claim 已有测试；待真实代理断流后查询 E2E |
 
 ## Deadline 契约

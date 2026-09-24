@@ -30,6 +30,36 @@ class AcceptanceGateTests(unittest.TestCase):
                          ('sqlite-fallback',))
         self.assertEqual(driver.setup_environment('runtime-exit'), ())
 
+    def test_create_response_cut_is_targeted_full_fault_case(self):
+        self.assertEqual(driver.selected_checks('full', 'create-response-cut'),
+                         ('create-response-cut',))
+        self.assertEqual(driver.setup_environment('create-response-cut'), ())
+        with self.assertRaisesRegex(ValueError, 'not in E2E profile'):
+            driver.selected_checks('l0', 'create-response-cut')
+
+    def test_create_response_cut_runs_installed_sdk_and_checks_both_nodes_empty(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = driver.Run(Path(directory))
+            run.nodes = ['node1', 'node2']
+            calls = []
+            run.execute = lambda node, *args, **_kwargs: (
+                calls.append(('execute', node, args[-1]))
+                or json.dumps({'cases': [{'id': 'reliability.create-final-response-cut',
+                                          'status': 'passed'}]})
+            )
+            run.helper = lambda node, *args, **_kwargs: calls.append(
+                ('helper', node, args[0]))
+            checks = []
+            run.scenarios(checks, ('create-response-cut',))
+            self.assertEqual(checks, ['create-response-cut'])
+            self.assertEqual(calls, [
+                ('execute', 'node1', 'create-response-cut'),
+                ('helper', 'node1', 'empty'),
+                ('helper', 'node2', 'empty'),
+            ])
+            self.assertEqual(run.case_results[0]['subcases'][0]['id'],
+                             'reliability.create-final-response-cut')
+
     def test_entrypoint_fixture_outlives_instance_startup(self):
         source=(ROOT/'prepare.py').read_text()
         self.assertIn('sleep 30; echo adx-entrypoint-stderr',source)
