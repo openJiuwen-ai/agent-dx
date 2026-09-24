@@ -18,7 +18,7 @@ import xml.etree.ElementTree as ET
 
 BASIC = ('sdk','auth','capacity','placement','local-first')
 STANDARD = ('sdk','data-plane','lifecycle','auth','capacity','placement','local-first','node-failure','sandboxd-restart','restart','stop')
-OPTIONAL_CASES = ('redis-restart','coordinator-restart','apiserver-restart','ingress-restart','runtime-affinity','idle-active','relay-standalone','runtime-exit','sqlite-fallback','create-response-cut')
+OPTIONAL_CASES = ('redis-restart','coordinator-restart','apiserver-restart','ingress-restart','runtime-affinity','idle-active','relay-standalone','runtime-exit','sqlite-fallback','create-response-cut','resource-stale')
 PROFILES = {
     'l0': ('l0','auth'),
     'standalone': STANDARD,
@@ -355,6 +355,22 @@ class Run:
             with self.case('create-response-cut', checks) as record:
                 output=self.execute('node1','/opt/adx/client/bin/python','-u',
                                     '/opt/adx/e2e/scenarios.py','create-response-cut',timeout=300)
+                record['subcases']=sdk_subcases_from_output(output)
+                for node in self.nodes:self.helper(node,'empty',node)
+        if 'resource-stale' in selected:
+            with self.case('resource-stale', checks) as record:
+                self.execute('node1','/opt/adx/client/bin/python','-u',
+                             '/opt/adx/e2e/scenarios.py','resource-create',timeout=300)
+                self.helper('node1','observer-freeze',timeout=15)
+                try:
+                    self.helper('node1','resource-stale',timeout=35)
+                    self.execute('node1','/opt/adx/client/bin/python','-u',
+                                 '/opt/adx/e2e/scenarios.py','resource-rejected',timeout=70)
+                finally:
+                    self.helper('node1','observer-resume',timeout=15)
+                self.helper('node1','resource-fresh',timeout=35)
+                output=self.execute('node1','/opt/adx/client/bin/python','-u',
+                                    '/opt/adx/e2e/scenarios.py','resource-verify',timeout=180)
                 record['subcases']=sdk_subcases_from_output(output)
                 for node in self.nodes:self.helper(node,'empty',node)
         if 'local-first' in selected:
