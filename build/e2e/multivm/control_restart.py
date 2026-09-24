@@ -20,6 +20,7 @@ else:
 
 
 ROLES = ('coordinator', 'apiserver', 'redis')
+OPTIONAL_ROLES = ('ingress',)
 
 
 def control_status(control, remote=ssh):
@@ -67,8 +68,12 @@ def route_ready(sandboxes):
 
 
 def run_control_restarts(inventory, connection, image, socket, output,
-                         sandbox_factory=None, remote=ssh, wait=wait_until):
+                         sandbox_factory=None, remote=ssh, wait=wait_until, roles=None):
     verify_inventory(inventory)
+    roles = ROLES if roles is None else tuple(roles)
+    if not roles or len(set(roles)) != len(roles) \
+            or any(role not in ROLES + OPTIONAL_ROLES for role in roles):
+        raise ValueError('select distinct supervised control roles')
     if sandbox_factory is None:
         from adx_sandbox import Sandbox
         sandbox_factory = Sandbox
@@ -86,7 +91,7 @@ def run_control_restarts(inventory, connection, image, socket, output,
 
     try:
         report['machines'] = verify_machines(inventory, remote)
-        for role in ROLES:
+        for role in roles:
             service_pid(control, role, remote)
         epoch = summary(control, remote)['epoch']
         report['checks'].append('managed-control-services-ready')
@@ -115,7 +120,7 @@ def run_control_restarts(inventory, connection, image, socket, output,
             raise AssertionError('initial workers or SDK routes are unavailable')
         report['checks'].append('both-workers-running')
 
-        for role in ROLES:
+        for role in roles:
             old_pid = service_pid(control, role, remote)
             old_epoch = epoch
             remote(control, 'sudo', '-n', 'kill', '-KILL', str(old_pid))
@@ -132,8 +137,8 @@ def run_control_restarts(inventory, connection, image, socket, output,
                     return None
                 if role == 'coordinator' and new_epoch <= old_epoch:
                     return None
-                if role == 'apiserver' and new_epoch != old_epoch:
-                    raise AssertionError('Coordinator epoch changed during API Server restart')
+                if role in ('apiserver', 'ingress') and new_epoch != old_epoch:
+                    raise AssertionError(f'Coordinator epoch changed during {role} restart')
                 return new_pid, new_epoch
 
             new_pid, epoch = wait(restarted, f'{role} did not restart and restore control state', 90)
@@ -203,6 +208,8 @@ def main():
     parser.add_argument('--image', required=True)
     parser.add_argument('--socket', default='/run/sandboxd/sandboxd.sock')
     parser.add_argument('--output', required=True, type=Path)
+    parser.add_argument('--role', dest='roles', action='append',
+                        choices=ROLES + OPTIONAL_ROLES)
     args = parser.parse_args()
     os.environ['SSL_CERT_FILE'] = str(args.ca.resolve())
     from adx_sandbox import ConnectionConfig
@@ -211,7 +218,7 @@ def main():
         use_tls=True, verify_tls=True,
     )
     report = run_control_restarts(json.loads(args.inventory.read_text()), connection,
-                                  args.image, args.socket, args.output)
+                                  args.image, args.socket, args.output, roles=args.roles)
     print(json.dumps({'status': report['status'], 'checks': report['checks']}), flush=True)
 
 

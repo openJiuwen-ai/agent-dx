@@ -10,9 +10,11 @@ from build.e2e.tests.test_multivm_local_first import inventory
 
 
 class ControlRestartTests(unittest.TestCase):
-    def exercise(self, change_owner=False, duplicate_backend=False):
+    def exercise(self, change_owner=False, duplicate_backend=False, roles=None):
         state = {'epoch': 1, 'pids': {'coordinator': 10, 'apiserver': 11, 'redis': 12},
                  'instances': {}, 'deleted': set(), 'restarts': [], 'outage': 0}
+        if roles == ('ingress',):
+            state['pids']['ingress'] = 13
 
         class Sandbox:
             def __init__(self, *, node_id, **_options):
@@ -92,15 +94,16 @@ class ControlRestartTests(unittest.TestCase):
                 with self.assertRaisesRegex(AssertionError, expected):
                     run_control_restarts(inventory(), object(), 'image',
                                          '/run/sandboxd/sandboxd.sock', output,
-                                         Sandbox, remote, wait)
+                                         Sandbox, remote, wait, roles=roles)
                 self.assertEqual(json.loads((output / 'control-restart-result.json').read_text())['status'],
                                  'failed')
             else:
                 report = run_control_restarts(inventory(), object(), 'image',
                                               '/run/sandboxd/sandboxd.sock', output,
-                                              Sandbox, remote, wait)
+                                              Sandbox, remote, wait, roles=roles)
                 self.assertEqual(report['status'], 'passed')
-                self.assertEqual(state['restarts'], ['coordinator', 'apiserver', 'redis'])
+                self.assertEqual(state['restarts'],
+                                 list(roles or ('coordinator', 'apiserver', 'redis')))
                 self.assertEqual(len(report['instances']), 2)
         self.assertEqual(state['deleted'], set(state['instances']))
 
@@ -112,3 +115,6 @@ class ControlRestartTests(unittest.TestCase):
 
     def test_duplicate_backend_fails_and_cleans_owned_instances(self):
         self.exercise(duplicate_backend=True)
+
+    def test_separate_ingress_restart_restores_public_routes(self):
+        self.exercise(roles=('ingress',))

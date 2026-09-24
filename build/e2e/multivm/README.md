@@ -229,8 +229,23 @@ python3 build/e2e/multivm/control_restart.py \
   --output out/e2e/3vm/control-restart
 ```
 
-This case has not yet passed on three real VMs. A separate Ingress process
-needs its own restart acceptance in the split-process profile.
+For a split-process control deployment, restart the independently supervised
+Ingress with the same ownership, backend, file and public SDK route checks.
+The case requires `adxctl status` to report a distinct `ingress` process;
+the default embedded profile cannot satisfy this preflight.
+
+```sh
+python3 build/e2e/multivm/control_restart.py \
+  --inventory out/e2e/3vm/inventory.json \
+  --endpoint control.example:8443 \
+  --token-file /path/to/tenant-key \
+  --ca /path/to/ingress-ca.pem \
+  --image registry.example/team/rrt@sha256:DIGEST \
+  --output out/e2e/3vm/ingress-restart \
+  --role ingress
+```
+
+Neither deployment profile has passed this case on three real VMs yet.
 
 `stop.py` is the final destructive `MV-09` case for dedicated VMs. It refuses
 to run without `--confirm-dedicated` and requires both worker sandboxd
@@ -286,5 +301,7 @@ python3 build/e2e/multivm/suite.py \
 
 After applying central Spread, call the same runner with the same `--output`
 and `--case placement-spread`; after applying local-first use
-`--case local-first`. Run `--case stop --confirm-dedicated` last, against the
+`--case local-first`. For a split-process profile, select
+`--case ingress-restart` after its separate Ingress has started. Run
+`--case stop --confirm-dedicated` last, against the
 chosen final deployment. All cases remain unverified on real three-VM hosts.
