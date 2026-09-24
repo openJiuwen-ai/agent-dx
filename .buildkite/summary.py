@@ -70,7 +70,8 @@ def collect(root, stage, exit_code, commit):
             node: {kind: read(root / 'acceptance' / node / f'{kind}-{node}.json')
                    for kind in ('collection', 'gateway-metrics', 'traces')}
             for node in ('node1', 'node2')}
-        if exit_code == 0 and result.get('images', {}).get('collector') and (report or {}).get('profile') != 'l0':
+        if (exit_code == 0 and result.get('images', {}).get('collector')
+                and 'stop' in (report or {}).get('required_checks', [])):
             if not all(e and e.get('status') == 'passed'
                        for node in result['e2e']['collection'].values() for e in node.values()):
                 raise ValueError('Collector and Gateway metrics evidence missing or failed')

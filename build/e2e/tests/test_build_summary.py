@@ -81,13 +81,25 @@ class BuildSummaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root=Path(temp)
             write(root, 'summaries/images.json', {'commit':COMMIT,'stages':{},'images':{'collector':{'version':'test'}}})
-            write(root, 'acceptance/result.json', {'status':'passed','cleanup_errors':[],'missing_checks':[]})
+            write(root, 'acceptance/result.json', {'status':'passed','required_checks':['stop'],
+                                                   'cleanup_errors':[],'missing_checks':[]})
             with self.assertRaisesRegex(ValueError,'Collector'):
                 summary.collect(root,'e2e',0,COMMIT)
             for node in ('node1','node2'):
                 for kind in ('collection','gateway-metrics','traces'):
                     write(root,f'acceptance/{node}/{kind}-{node}.json',{'status':'passed'})
             self.assertEqual(summary.collect(root,'e2e',0,COMMIT)['e2e']['collection']['node2']['collection']['status'],'passed')
+
+    def test_targeted_restart_does_not_require_stop_collector_evidence(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp)
+            write(root,'summaries/images.json',{'commit':COMMIT,'stages':{},
+                  'images':{'collector':{'version':'test'}}})
+            report={'profile':'targeted','source_profile':'full','selected_case':'restart',
+                    'status':'passed','checks':['restart'],'required_checks':['restart'],
+                    'cleanup_errors':[],'missing_checks':[]}
+            write(root,'acceptance/result.json',report)
+            self.assertEqual(summary.collect(root,'e2e',0,COMMIT)['e2e']['report'],report)
 
     def test_l0_requires_business_and_cleanup_but_not_collector_fault_injection(self):
         with tempfile.TemporaryDirectory() as temp:
