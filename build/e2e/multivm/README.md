@@ -365,8 +365,7 @@ interrupted runner records the in-flight time before resuming and refuses to
 start another case while the previous process group is still live.
 `stop` must be selected last with `--confirm-dedicated` and should only run
 after the other profiles have finished. The runner reports selected-case
-results; it does not claim the complete `contract.REQUIRED` result until
-all checks and deployment evidence have been assembled and verified.
+results; it does not claim the complete `contract.REQUIRED` result on its own.
 
 For example, on a central Pack deployment:
 
@@ -393,3 +392,27 @@ worker. Select `--case session-fence --session-probe PATH` for the old-session
 RPC assertion after the quick-restart subset. Select
 `--case stop --confirm-dedicated --route-probe PATH` last, against the
 chosen final deployment. All cases remain unverified on real three-VM hosts.
+
+After `stop`, assemble the complete result from the same suite output. The
+assembler requires `sdk`, `auth`, `capacity`, both placement policies,
+`node-preferences`, `local-first`, `worker-failure`, `worker-restart`,
+`session-fence`, `control-restart`, `ingress-restart`, and `stop`. It checks
+each case's actual assertions, release and VM identities, physical placement,
+the three-hour case-runtime ledger, and the final backend and published-route
+counts. If `runtime-affinity` was selected, its heterogeneous inventory and
+physical placement report must also pass validation. Missing or failed cases
+produce a failed `result.json` with explicit
+gaps; a subset report cannot be promoted to full acceptance.
+
+```sh
+python3 build/e2e/multivm/assemble.py \
+  --inventory out/e2e/3vm/inventory.json \
+  --suite-output out/e2e/3vm/suite
+python3 build/e2e/multivm/verify.py \
+  --inventory out/e2e/3vm/inventory.json \
+  --result out/e2e/3vm/suite/result.json
+```
+
+Prepare the release, Linux test-only RPC probes and deployment profiles
+before starting the shared case-runtime budget. VM provisioning and profile
+switching are not yet automated or included in that runtime ledger.
