@@ -7,9 +7,10 @@ the Pods are ready, the current Git commit's runtime harness is copied to
 preflight, sandboxd setup, or ADX startup. This also applies when the bundle is
 reused from an earlier Buildkite build.
 
-The Buildkite gate uses `run.py` here. `manifest.py` defines two node Pods,
-Services, volume/credential references and node placement. The Pods run ADX as
-processes from the unified release. `publish_images.py` runs on the build worker
+The Buildkite gate uses `run.py` here. `manifest.py` defines two ADX node Pods,
+Services, volume/credential references and node placement. The targeted Redis
+PVC case adds a third Pod. The ADX Pods run processes from the unified release.
+`publish_images.py` runs on the build worker
 and hands immutable node, EXECD and entrypoint-fixture registry references to the
 deployment worker.
 
@@ -99,9 +100,10 @@ access to all digest-pinned Node, EXECD and Collector images.
 
 The kubeconfig identity must be allowed to create, read and delete the isolated
 Namespace and to manage Pods, Services and Secrets within it. It also needs Pod
-exec/copy access and permission to read Pods, namespace state and Events for
-evidence collection and cleanup. A job that cannot confirm namespace deletion
-does not pass.
+exec/copy and log access, plus permission to read Pods, namespace state and
+Events for evidence collection and cleanup. The Redis PVC case additionally
+requires PVC create/read/delete access. A job that cannot confirm namespace
+deletion does not pass.
 
 ### Conditional profiles
 
@@ -121,9 +123,34 @@ one worker has enough spare capacity for both the base and 4C/6G FC Pods.
 
 GPU/NPU acceptance is not currently executable through this manifest. It will
 require device-capable workers, matching drivers/firmware, sandboxd device
-discovery and Pod device exposure. Redis persistent-volume recovery and network
-partition tests likewise need a StorageClass/PVC and controlled fault-injection
-facility; none of these are implied by a passing base `full` result.
+discovery and Pod device exposure. Network partition tests require controlled
+fault injection; neither they nor persistent-volume recovery are implied by a
+passing base `full` result.
+
+The targeted `redis-pod-restart` case needs a dynamically provisioned
+`ReadWriteOnce` StorageClass, a 1 GiB PVC and permission to manage PVCs. It
+starts Redis in a separate Pod using the packaged `redis-server` and a
+secret-mounted ACL. It creates live instances on both ADX workers, replaces
+only the Redis Pod, then requires the Pod UID to change while the PVC UID,
+committed ownership, backend IDs and public SDK file/command behavior remain
+intact. Redis uses AOF with `appendfsync always`; namespace cleanup also
+deletes the PVC. This case does not run in the default `full` profile.
+
+```sh
+python3 build/e2e/kubernetes/run.py \
+  --bundle out/buildkite/bundle/bundle.json \
+  --registry-images out/buildkite/bundle/registry-images.json \
+  --kubeconfig /path/to/target-kubeconfig \
+  --profile full --case redis-pod-restart \
+  --redis-storage-class fast-rwo \
+  --output out/e2e/redis-pod-restart-001
+```
+
+In Buildkite, set `ADX_E2E_TARGET_CASE=redis-pod-restart` and
+`ADX_E2E_REDIS_STORAGE_CLASS` to the target class, alongside the exact reused
+artifact build and commit required for every targeted case. The case is not
+verified on a real cluster until its JUnit result, Pod/PVC identities, Redis
+AOF evidence and two-worker backend inventory are retained.
 
 Every invocation requires a new evidence directory and creates a unique test
 namespace. Target images must be digest pinned. Registry TLS verification is

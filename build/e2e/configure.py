@@ -28,6 +28,8 @@ if not T.exists():
  (T/'node2.key').chmod(0o600)
 redis_key=PRIVATE/'redis-key'
 if not redis_key.exists(): redis_key.write_text(secrets.token_hex(32)); redis_key.chmod(0o600)
+redis_host=os.getenv('ADX_E2E_REDIS_HOST','coordinator')
+if not re.fullmatch(r'[a-z0-9][a-z0-9.-]*',redis_host):raise ValueError('invalid E2E Redis host')
 key=PRIVATE/'api-key'
 if not key.exists(): key.write_text(secrets.token_hex(32)); key.chmod(0o600)
 other=PRIVATE/'other-key'
@@ -107,8 +109,9 @@ journal_flag=os.getenv('ADX_E2E_SQLITE_FALLBACK','0')
 if journal_flag not in ('0','1'):raise ValueError('invalid E2E SQLite fallback mode')
 use_journal=journal_flag=='1'
 if node=='node1':
- (P/'redis').mkdir(exist_ok=True)
- add('redis','redis',{'bind':'0.0.0.0','port':6379,'data_dir':str(P/'redis'),'appendfsync':'always','password_file':str(redis_key)})
+ if redis_host=='coordinator':
+  (P/'redis').mkdir(exist_ok=True)
+  add('redis','redis',{'bind':'0.0.0.0','port':6379,'data_dir':str(P/'redis'),'appendfsync':'always','password_file':str(redis_key)})
  coordinator_config={'listen':'0.0.0.0:17000','metrics_listen':'127.0.0.1:17090','advertised_address':'https://coordinator:17000','scheduler_shards':1,'placement':'spread','rpc_timeout_seconds':120,'tls':tls('coordinator',{'apiserver':'apiserver','ingress':'ingress','node:node1':'node','node:node2':'node2'}),'bootstrap_credentials':[{'key_file':str(admin),'tenant_id':'admin','administrator':True,'expires_at_unix_seconds':0},{'key_file':str(key),'tenant_id':'e2e','administrator':False,'expires_at_unix_seconds':0},{'key_file':str(other),'tenant_id':'e2e-other','administrator':False,'expires_at_unix_seconds':0}]}
  if use_journal:coordinator_config['heartbeat_timeout_seconds']=90
  add('coordinator','coordinator',coordinator_config)
@@ -135,7 +138,7 @@ if node=='node1':
  add('ingress','ingress',{'tls':tls('ingress',{'coordinator':'coordinator'}),'rpc_timeout_seconds':5,'refresh_seconds':1,'auth_cache_seconds':10,'auth_cache_entries':1000},ee)
 for service in services:
  service.setdefault('env',{}).update({'ADX_LOG_FORMAT':'json','ADX_TRACE_ENABLED':'true','OTEL_EXPORTER_OTLP_TRACES_ENDPOINT':'http://127.0.0.1:14317/v1/traces','OTEL_BSP_SCHEDULE_DELAY':'200'})
-d={'schema_version':1,'logging':{'enabled':True,'max_file_bytes':4096,'rotate_seconds':1,'compress':True,'line_records':True,'max_record_bytes':65536,'compress_after_seconds':1,'max_files':100,'max_age_seconds':3600,'max_total_bytes':1048576},'package_dir':str(BASE/'package'),'state_dir':str(P/'state'),'redis_url':f'redis://:{redis_key.read_text().strip()}@coordinator:6379/','namespace':'acceptance','restart_limit':3,'restart_delay_ms':1000,'stop_timeout_seconds':30,'services':services}
+d={'schema_version':1,'logging':{'enabled':True,'max_file_bytes':4096,'rotate_seconds':1,'compress':True,'line_records':True,'max_record_bytes':65536,'compress_after_seconds':1,'max_files':100,'max_age_seconds':3600,'max_total_bytes':1048576},'package_dir':str(BASE/'package'),'state_dir':str(P/'state'),'redis_url':f'redis://:{redis_key.read_text().strip()}@{redis_host}:6379/','namespace':'acceptance','restart_limit':3,'restart_delay_ms':1000,'stop_timeout_seconds':30,'services':services}
 runtime_artifact=BASE/'package/runtime/adx-runtime-rootfs.img'
 runtime_image=PRIVATE/'runtime-image'
 if os.getenv('ADX_E2E_KUBERNETES'):
@@ -154,5 +157,5 @@ elif runtime_artifact.is_file():
     'entrypoint':['/__adx/usr/local/bin/adx-execd']},
   'env':{'PATH':'/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'}}
 (P/'deployment.yaml').write_text(json.dumps(d));(P/'deployment.yaml').chmod(0o600)
-(EVIDENCE/f'deployment-{node}.json').write_text(json.dumps({**d,'redis_url':'redis://:REDACTED@coordinator:6379/'},indent=2))
+(EVIDENCE/f'deployment-{node}.json').write_text(json.dumps({**d,'redis_url':f'redis://:REDACTED@{redis_host}:6379/'},indent=2))
 print('configured',node,capacity)

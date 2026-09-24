@@ -17,7 +17,8 @@ P=Path('/tmp/adx-e2e');E=Path('/evidence');S=Path('/secrets');A=Path('/opt/adx')
 def command(args,timeout=180):return subprocess.check_output(list(map(str,args)),text=True,timeout=timeout)
 def catalog():
     env={**os.environ,'REDISCLI_AUTH':(S/'redis-key').read_text().strip()}
-    return json.loads(subprocess.check_output(['redis-cli','--json','HGETALL','adx:{acceptance}:control:v1'],env=env,text=True,timeout=5))
+    host=os.getenv('ADX_E2E_REDIS_HOST','coordinator')
+    return json.loads(subprocess.check_output(['redis-cli','-h',host,'--json','HGETALL','adx:{acceptance}:control:v1'],env=env,text=True,timeout=5))
 def nodes():
     c=catalog();return [json.loads(c['node:'+node]) for node in ('node1','node2')]
 def backend():
@@ -90,7 +91,8 @@ def validated_gateway_recovery(before,after,ids):
     return {'coordinator_epoch':old_epoch,'ownership':ownership}
 def redis_info():
     env={**os.environ,'REDISCLI_AUTH':(S/'redis-key').read_text().strip()}
-    lines=subprocess.check_output(['redis-cli','--raw','INFO','persistence'],env=env,text=True,timeout=5).splitlines()
+    host=os.getenv('ADX_E2E_REDIS_HOST','coordinator')
+    lines=subprocess.check_output(['redis-cli','-h',host,'--raw','INFO','persistence'],env=env,text=True,timeout=5).splitlines()
     return dict(line.split(':',1) for line in lines if ':' in line)
 def collect(node):
     dest=E/f'logs-{node}';dest.mkdir(exist_ok=True)
@@ -423,6 +425,35 @@ def main():
     elif action=='capture-backend':
         before=backend();assert len(before)==1
         (E/f'backend-before-{node}.json').write_text(json.dumps(before))
+    elif action=='redis-pod-before':
+        ids=json.loads((E/'live-instances.json').read_text())
+        ownership=persisted_ownership(catalog(),ids)
+        info=redis_info()
+        assert info.get('aof_enabled','').strip()=='1','persistent Redis AOF is not enabled'
+        (E/'redis-pod-before.json').write_text(json.dumps({
+            'instance_ids':ids,'ownership':ownership,
+            'aof_current_size':int(info['aof_current_size']),
+        },indent=2))
+    elif action=='redis-pod-after':
+        before=json.loads((E/'redis-pod-before.json').read_text())
+        deadline=time.monotonic()+30
+        last_error='Redis AOF state has not loaded'
+        while True:
+            try:
+                ownership=persisted_ownership(catalog(),before['instance_ids'])
+                info=redis_info()
+                assert info.get('aof_enabled','').strip()=='1','persistent Redis AOF is not enabled'
+                assert ownership==before['ownership'],(before['ownership'],ownership)
+                (E/'redis-pod-after.json').write_text(json.dumps({
+                    'instance_ids':before['instance_ids'],
+                    'ownership_before':before['ownership'],'ownership_after':ownership,
+                    'aof_current_size':int(info['aof_current_size']),
+                },indent=2))
+                break
+            except (OSError,subprocess.SubprocessError,KeyError,ValueError,AssertionError) as error:
+                last_error=str(error)
+            if time.monotonic()>deadline:raise TimeoutError('Redis Pod recovery did not preserve ownership: '+last_error)
+            time.sleep(.2)
     elif action=='redis-restart':
         ids=json.loads((E/'live-instances.json').read_text())
         before=persisted_ownership(catalog(),ids)
