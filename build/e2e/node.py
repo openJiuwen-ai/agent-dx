@@ -103,6 +103,31 @@ def main():
             except (KeyError,ValueError,subprocess.SubprocessError):pass
             if time.monotonic()>end:raise TimeoutError('both nodes did not become ready')
             time.sleep(1)
+    elif action=='relay-separate':
+        import urllib.error
+        import urllib.request
+        deployment=json.loads((P/'deployment.yaml').read_text())
+        manager_config=next(s['config'] for s in deployment['services'] if s['role']=='adxlet')
+        assert manager_config['proxy_mode']=='standalone',manager_config['proxy_mode']
+        current=supervisor('status')['services']
+        manager=[s for s in current if s['role']=='adxlet']
+        relay=[s for s in current if s['role']=='relay']
+        assert len(manager)==len(relay)==1 and manager[0]['pid'] and relay[0]['pid'],current
+        assert manager[0]['pid']!=relay[0]['pid'],current
+        binary=(Path('/proc')/str(relay[0]['pid'])/'exe').resolve()
+        assert binary.name=='adx-relay',binary
+        deadline=time.monotonic()+30
+        while True:
+            try:
+                with urllib.request.urlopen('http://127.0.0.1:19443/readyz',timeout=2) as response:
+                    if response.status==200:break
+            except (OSError,urllib.error.URLError):pass
+            if time.monotonic()>deadline:raise TimeoutError('standalone Relay did not become ready')
+            time.sleep(.2)
+        evidence={'node_id':node,'manager_pid':manager[0]['pid'],
+                  'relay_pid':relay[0]['pid'],'relay_binary':str(binary)}
+        (E/f'relay-separate-{node}.json').write_text(json.dumps(evidence,indent=2))
+        print('PASS standalone Relay: '+node,flush=True)
     elif action=='postcheck':
         result_name=node or 'sdk'
         c=catalog();r=json.loads((E/result_name/'sdk-result.json').read_text());assert r['status']=='passed'

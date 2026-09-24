@@ -146,6 +146,12 @@ Local Docker reproduction requires access to the same bind-mounted paths as the 
   and its allocation survive the active request, then close the client and
   require idle reclamation and resource release. Run with
   `--profile full --case idle-active`; it is outside the default basic gate.
+- `relay-standalone` (targeted process-layout case): render a separate
+  `adx-relay` service on both nodes and confirm each Relay has its own PID and
+  a ready health endpoint. Then run the same public SDK command, file, port
+  forwarding and reverse-tunnel checks as the embedded Relay data-plane case.
+  Select it with `--profile full --case relay-standalone`; it requires a bundle
+  containing `adx-relay`.
 - `stop`: independently create a live instance pinned to each node, verify both
   backend inventories are occupied and exercise each forwarded port. A separate
   instance on each node is deleted to emit the required lifecycle log and trace. It also

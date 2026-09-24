@@ -72,6 +72,14 @@
     "gate": "在真实 standalone/full 部署执行 --case idle-active，保留请求时长、请求结束前 Running 状态、结束后 Deleted 状态和资源释放证据。"
   },
   {
+    "id": "standalone-relay-parity",
+    "title": "Relay 共进程与分进程用户结果一致",
+    "stage": "7",
+    "status": "pending",
+    "detail": "默认 embedded Relay 的数据面用例已验证；新增 relay-standalone 定向用例在两节点启动独立 Relay，确认进程、健康端点并复用公开 SDK 数据面检查。尚未用携带 adx-relay 的新发布包实际运行。",
+    "gate": "在真实 standalone/full 部署执行 --case relay-standalone，确认两节点独立进程证据、SDK 数据面全部子项及最终清理。"
+  },
+  {
     "id": "service-soak",
     "title": "真实服务混合负载与长稳",
     "stage": "5",
