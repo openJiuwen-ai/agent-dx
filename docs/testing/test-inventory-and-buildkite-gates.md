@@ -126,8 +126,10 @@ SDK 客户端和两个执行节点通过真实 VM 网络通信。它重跑 L0，
 当前 `k8s-basic` 要求 `sdk`、`auth`、`capacity`、`placement`、`local-first` 五组；
 `full` 再加入 `data-plane`、`lifecycle`、`node-failure`、`sandboxd-restart`、`restart`、`stop`。
 Buildkite Full #6 在两个不同物理 worker 上通过此前十组；新增第十一组后，Full #10 的
-`sandboxd-restart` 已通过，后续 `restart` 失败，完整十一组仍未通过。定向用例以
-`profile: targeted` 单独报告，不能替代 Full 门禁。
+`sandboxd-restart` 已通过。Full #13 定向 `stop` 和 Full #16 定向 `restart` 均通过，
+包括最终清理；完整十一组仍未在同一次 Full 运行中通过。定向用例以
+`profile: targeted` 单独报告，不能替代 Full 门禁。当前 K8s 两节点只报告 `runc`，
+验证了不支持的 runtime 不分配；异构 runtime 的正向亲和还需单独环境验收。
 
 Firecracker checkpoint 使用独立 KVM profile；GPU/NPU 使用具备真实设备的 worker profile。
 缺少对应环境时应报告未执行，不能通过 mock 或 skip 把全量结果置为绿色。
@@ -160,7 +162,7 @@ Firecracker checkpoint 使用独立 KVM profile；GPU/NPU 使用具备真实设�
 | L0 | 独立 `--profile l0` 执行 `l0 + auth`，输出 `required_checks`、逐项 JSON 和 JUnit；Buildkite 基础包 #87 已通过 | 后续提交仍需持续执行门禁 |
 | Standalone | `--profile standalone` 统一本地 Docker 十一组；安装示例和 Lima FC 各自有严格结果契约 | 需增加汇总清单，把普通 Linux、安装示例和按需 KVM 结果关联到同一 revision |
 | Multi-VM | 已增加三台机器 inventory 和完成结果校验契约，强制双 worker 实际放置及最终清理 | 尚缺负责生成配置、分发制品和执行场景的完整控制面三 VM 部署器；未进行真实三 VM 验收 |
-| Full Deployment | K8s 已支持 `l0`、五组 `k8s-basic` 和十一组 `full`；`full` 强制两个 Pod 位于不同物理 worker | 十组已在 Full #6 跨两个物理 worker 通过；新增 sandboxd 故障组后的十一组尚未全通过，K8s FC 和真实 GPU/NPU 仍是独立扩展 profile |
+| Full Deployment | K8s 已支持 `l0`、五组 `k8s-basic` 和十一组 `full`；`full` 强制两个 Pod 位于不同物理 worker | 十组已在 Full #6 跨两个物理 worker 通过；第十一组与 `restart`、`stop` 已分别定向通过，但十一组尚未同次全通过。异构 runtime、K8s FC 和真实 GPU/NPU 仍需独立环境 |
 
 因此当前可以直接形成 Buildkite 门禁的是 UT、L0 和基础 K8s 五组。`full` 的同宿主假绿已被
 驱动拒绝；此前十组已在双 worker 通过，新增第十一组后的完整门禁尚未通过。Standalone 可作为独立 Linux/KVM
