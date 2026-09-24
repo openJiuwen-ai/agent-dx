@@ -39,6 +39,7 @@ object_store = { version = "0.14", default-features = false, features = ["aws-ba
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
 futures-util = "0.3"
 sha2 = "0.10"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
 [build-dependencies]
 protoc-bin-vendored = "3"

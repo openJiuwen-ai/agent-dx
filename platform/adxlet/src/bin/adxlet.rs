@@ -6,12 +6,18 @@ use adxlet::{
     readiness::ExecdReadiness,
     routes::UdsRoutes,
     rpc::{CoordinatorStateSink, NodeRpc},
+    runtime_logs::{RuntimeLogPolicy, RuntimeLogs},
     sandboxd::{connect_when_ready, Config as RuntimeConfig, Sandboxd},
-    Adxlet,
+    Adxlet, RuntimeDriver,
 };
 use serde::Deserialize;
 use std::{
-    collections::HashMap, future::Future, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration,
+    collections::{HashMap, HashSet},
+    future::Future,
+    net::SocketAddr,
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
 };
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -30,6 +36,8 @@ struct Config {
     #[serde(default)]
     admin_socket: Option<PathBuf>,
     sandboxd_socket: PathBuf,
+    #[serde(default)]
+    runtime_logs: RuntimeLogPolicy,
     proxy_socket: PathBuf,
     #[serde(default)]
     proxy_mode: adxlet::proxy::ProxyMode,
@@ -134,6 +142,7 @@ async fn inspect_node(
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config: Config = read_config()?;
     config.checkpoint_gc.validate()?;
+    let runtime_logs = RuntimeLogs::new(config.runtime_logs.clone())?;
     // Embedded Proxy and Adxlet share this process-wide subscriber and
     // tracer provider; standalone Proxy initializes the same library itself.
     let _logging_guard = adx_observability::logging::init("adxlet", false)?;
@@ -235,6 +244,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         env,
         cwd: "/".into(),
         rpc_timeout: timeout,
+        runtime_logs: Some(config.runtime_logs.clone()),
     };
     let runtime = Arc::new(tokio::select! {
         result = connect_when_ready(
@@ -584,6 +594,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     };
+    let log_gc = async {
+        let mut interval =
+            tokio::time::interval(Duration::from_secs(runtime_logs.interval_seconds()));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let active: HashSet<String> = match runtime.inventory().await {
+                Ok(inventory) => inventory.into_iter().map(|item| item.runtime_id).collect(),
+                Err(error) => {
+                    adx_observability::warn!(
+                        "runtime log GC skipped; sandboxd inventory unavailable: {error}"
+                    );
+                    continue;
+                }
+            };
+            let logs = runtime_logs.clone();
+            match tokio::task::spawn_blocking(move || {
+                logs.collect(&active, std::time::SystemTime::now())
+            })
+            .await
+            {
+                Ok(Ok(_)) => (),
+                Ok(Err(error)) => adx_observability::warn!("runtime log GC failed: {error}"),
+                Err(error) => adx_observability::warn!("runtime log GC task failed: {error}"),
+            }
+        }
+    };
     adx_observability::info!("adxlet RPC listener ready");
     let proxy_failure = async {
         match &mut embedded {
@@ -599,6 +636,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ = claim_retries => {}
         _ = monitoring => {}
         _ = expiry => {}
+        _ = log_gc => {}
         result = admin => result.map_err(|error| -> Box<dyn std::error::Error> { error })?,
         _ = shutdown() => {}
     }

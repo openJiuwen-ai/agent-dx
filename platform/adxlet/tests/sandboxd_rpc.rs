@@ -211,6 +211,10 @@ async fn connect(server: Server) -> (Sandboxd, Harness) {
         socket,
         Config {
             rpc_timeout: Duration::from_secs(2),
+            runtime_logs: Some(adxlet::runtime_logs::RuntimeLogPolicy {
+                directory: directory.path().join("runtime-logs"),
+                ..Default::default()
+            }),
             ..Default::default()
         },
     )
@@ -401,7 +405,8 @@ async fn dynamic_network_policy_uses_generated_backend_identity_and_can_clear() 
 
 #[tokio::test]
 async fn deleted_id_not_found_confirms_absence() {
-    let (adapter, _server) = connect(Server::default()).await;
+    let server = Server::default();
+    let (adapter, _server) = connect(server.clone()).await;
     assert_eq!(
         adapter
             .start(&spec(), "i-1", 1, &[])
@@ -411,6 +416,11 @@ async fn deleted_id_not_found_confirms_absence() {
         "10.0.0.2"
     );
     assert!(adapter.is_running("i-1").await.unwrap());
+    {
+        let starts = server.starts.lock().unwrap();
+        assert!(starts[0].stdout.ends_with("/runtime-logs/i-1.out"));
+        assert!(starts[0].stderr.ends_with("/runtime-logs/i-1.err"));
+    }
     assert_eq!(adapter.stats("i-1").await.unwrap().memory_usage_bytes, 123);
     adapter.remove("i-1").await.unwrap();
     assert!(!adapter.is_running("i-1").await.unwrap());

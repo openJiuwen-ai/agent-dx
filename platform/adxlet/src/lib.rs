@@ -15,6 +15,7 @@ pub mod resources;
 pub mod routes;
 pub mod rpc;
 pub mod runtime_control;
+pub mod runtime_logs;
 pub mod sandboxd;
 
 use adx_core::scheduling::{validate_device_assignment, Device, DeviceAllocation, DeviceLedger};

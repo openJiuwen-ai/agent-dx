@@ -67,3 +67,5 @@ contains a secret. Components use that URL for both storage and discovery.
 Coordinator and Adxlet examples enable loopback `metrics_listen` on ports 19090 and 19091. See [instance and resource metrics](../../../docs/testing/environment-resource-metrics.md) for metric definitions and external collection.
 
 部署示例已启用组件日志滚动与 gzip 压缩，所有历史保留限制按组件计算。配置和异常处理见[组件日志滚动与压缩](../../../docs/testing/log-rotation.md)。
+
+Adxlet 的 `runtime_logs.directory` 独立于 Supervisor 的组件日志。单机和节点示例都将它设为对应 `state_dir/logs/runtime`，以便 Collector 样例从 `$ADX_LOG_DIR/runtime` 采集 `.out/.err`。已终止 runtime 日志保留 24 小时、至多 50 对，并受 1 GiB 总预算限制；运行中文件的后端限制见 [Runtime 日志](../../../docs/testing/runtime-logs.md)。
