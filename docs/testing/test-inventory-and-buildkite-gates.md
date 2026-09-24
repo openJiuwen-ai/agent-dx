@@ -201,7 +201,7 @@ profile；完整 Multi-VM 在补齐部署器前不能标记为通过。
 | `ST-09` | K8s 定向验证中 | Coordinator 与 API Server（含 Ingress）分别重启后的 epoch、全量目录和路由重同步；独立 Ingress 使用分进程 fixture，单机部署仍需验证 |
 | `ST-10` | 分进程用例已实现，待实测 | 定向 `relay-standalone` 为两个节点分别启动独立 `adx-relay`，核对进程 PID、实际可执行文件与健康端点，再复用 embedded 模式通过的数据面 SDK 命令、文件、端口转发和反向隧道用例；新发布包上的真实结果待验证 |
 | `ST-11` | daemon 重启已验证，采集过期定向用例待实测 | [Full #17](https://buildkite.com/agent-dx/agent-dx-full-test/builds/17) 对两节点独立 sandboxd 注入 `SIGKILL` 并重启，核对运行中 backend ID 不变、公开 SDK 可查询及继续执行命令；`sandboxd-restart` 用例 5.065 秒通过。新增 `resource-stale` 定向用例：暂停节点资源采集直到样本过期，要求保持已运行 backend 和节点 session、关闭新准入，恢复后重新开放并通过公开 SDK 创建和清理；正式部署尚未运行 |
-| `ST-12` | 组件前置已实现，E2E 计划 | adxlet 对账清理期间再次退出；新进程重读权威目录和 runtime inventory，完成幂等清理前保持关闭准入 |
+| `ST-12` | 定向用例已实现，待实测 | `reconcile-crash` 使 node2 心跳过期并产生旧 backend；暂挂其 runc init，在 sandboxd Delete 发出 TERM、节点保持关闭准入时杀掉 Adxlet。随后恢复 init，要求新 Adxlet 换 session、从权威目录清理旧 backend 后恢复准入；node1 原实例继续执行，最终释放资源。真实 standalone/full 尚未运行 |
 
 ### 9.3 Local Multi-VM
 

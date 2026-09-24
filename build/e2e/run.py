@@ -18,7 +18,7 @@ import xml.etree.ElementTree as ET
 
 BASIC = ('sdk','auth','capacity','placement','local-first')
 STANDARD = ('sdk','data-plane','lifecycle','auth','capacity','placement','local-first','node-failure','sandboxd-restart','restart','stop')
-OPTIONAL_CASES = ('redis-restart','coordinator-restart','apiserver-restart','ingress-restart','runtime-affinity','idle-active','relay-standalone','runtime-exit','sqlite-fallback','create-response-cut','resource-stale','network-partition')
+OPTIONAL_CASES = ('redis-restart','coordinator-restart','apiserver-restart','ingress-restart','runtime-affinity','idle-active','relay-standalone','runtime-exit','sqlite-fallback','create-response-cut','resource-stale','network-partition','reconcile-crash')
 PROFILES = {
     'l0': ('l0','auth'),
     'standalone': STANDARD,
@@ -410,6 +410,27 @@ class Run:
                 self.helper('node2','empty','node2')
                 self.execute('node1','/opt/adx/client/bin/python','-u',
                              '/opt/adx/e2e/scenarios.py','network-cleanup',timeout=90)
+                for node in self.nodes:self.helper(node,'empty',node)
+        if 'reconcile-crash' in selected:
+            with self.case('reconcile-crash', checks):
+                self.execute('node1','/opt/adx/client/bin/python','-u',
+                             '/opt/adx/e2e/scenarios.py','create',timeout=300)
+                self.helper('node2','freeze','node2',timeout=15)
+                manager_frozen=True
+                try:
+                    self.helper('node1','failure-observed',timeout=75)
+                    self.helper('node2','freeze-stale-runtime',timeout=15)
+                    self.helper('node2','thaw','node2',timeout=15)
+                    manager_frozen=False
+                    self.helper('node2','reconcile-delete-blocked',timeout=25)
+                finally:
+                    try:
+                        if manager_frozen:self.helper('node2','thaw','node2',timeout=15)
+                    finally:
+                        self.helper('node2','thaw-stale-runtime',timeout=15)
+                self.helper('node2','reconcile-recovered',timeout=90)
+                self.execute('node1','/opt/adx/client/bin/python','-u',
+                             '/opt/adx/e2e/scenarios.py','failure-cleanup',timeout=90)
                 for node in self.nodes:self.helper(node,'empty',node)
         if 'sandboxd-restart' in selected:
             with self.case('sandboxd-restart', checks):

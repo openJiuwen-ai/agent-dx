@@ -15,6 +15,88 @@ spec.loader.exec_module(node)
 
 
 class SandboxdRestartTests(unittest.TestCase):
+    def test_reconciliation_barrier_requires_stopped_runtime_and_pending_term(self):
+        pending=1 << (signal.SIGTERM - 1)
+        status=f'State:\tT (stopped)\nSigPnd:\t{pending:016x}\nShdPnd:\t0000000000000000\n'
+        self.assertTrue(node.stopped_with_pending_signal(status,signal.SIGTERM))
+        self.assertFalse(node.stopped_with_pending_signal(
+            status.replace('T (stopped)','S (sleeping)'),signal.SIGTERM))
+        self.assertFalse(node.stopped_with_pending_signal(
+            status.replace(f'{pending:016x}','0000000000000000'),signal.SIGTERM))
+
+    def test_reconciliation_crash_waits_for_physical_delete_signal(self):
+        pending=1 << (signal.SIGTERM - 1)
+        status=f'State:\tT (stopped)\nSigPnd:\t{pending:016x}\nShdPnd:\t0000000000000000\n'
+        records={
+            'node:node2':json.dumps({'node':{'available':False},
+                                     'session':{'id':'old-session','routable':False}}),
+            'environment:env-1':json.dumps({
+                'spec':{'id':'env-1'},'assignment':{'node_id':'node2'},
+                'invalidated':True,'result':{'state':'Failed','resources_held':False},
+            }),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            (root/'frozen-stale-runtime.json').write_text(json.dumps({
+                'runtime_id':'runtime-1','pid':4321,'start_ticks':100,
+            }))
+            killed=[]
+            with mock.patch.object(node,'P',root),mock.patch.object(node,'E',root), \
+                 mock.patch.object(node,'catalog',return_value=records), \
+                 mock.patch.object(node,'backend',return_value=['runtime-1']), \
+                 mock.patch.object(node,'supervisor',return_value={
+                     'services':[{'role':'adxlet','pid':1234}],
+                 }),mock.patch.object(node,'process_status',return_value=status), \
+                 mock.patch.object(node,'process_start_ticks',return_value=100), \
+                 mock.patch.object(node.os,'kill',side_effect=lambda *args:killed.append(args)), \
+                 mock.patch.object(sys,'argv',['node.py','reconcile-delete-blocked','node2']):
+                node.main()
+            self.assertEqual(killed,[(1234,signal.SIGKILL)])
+            evidence=json.loads((root/'reconcile-delete-blocked.json').read_text())
+            self.assertTrue(evidence['delete_signal_pending'])
+            self.assertTrue(evidence['admission_closed'])
+            self.assertEqual(evidence['failed_id'],'env-1')
+
+    def test_reconciliation_recovery_rejects_admission_before_cleanup(self):
+        records={
+            'node:node2':json.dumps({'node':{'available':True},
+                                     'session':{'id':'new-session','routable':True}}),
+            'environment:env-1':json.dumps({
+                'invalidated':True,'result':{'state':'Failed','resources_held':False},
+            }),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            (root/'reconcile-delete-blocked.json').write_text(json.dumps({
+                'failed_id':'env-1','old_manager_pid':1234,'old_session_id':'old-session',
+            }))
+            with mock.patch.object(node,'P',root),mock.patch.object(node,'E',root), \
+                 mock.patch.object(node,'catalog',return_value=records), \
+                 mock.patch.object(node,'backend',return_value=['stale-backend']), \
+                 mock.patch.object(node,'supervisor',return_value={
+                     'services':[{'role':'adxlet','pid':5678}],
+                 }),mock.patch.object(sys,'argv',['node.py','reconcile-recovered','node2']):
+                with self.assertRaisesRegex(AssertionError,'reopened admission'):
+                    node.main()
+
+    def test_stale_runtime_thaw_does_not_signal_a_reused_pid(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            marker=root/'frozen-stale-runtime.json'
+            marker.write_text(json.dumps({'pid':4321,'start_ticks':100}))
+            with mock.patch.object(node,'P',root), \
+                 mock.patch.object(node,'process_start_ticks',return_value=101), \
+                 mock.patch.object(node.os,'kill') as kill:
+                node.thaw_stale_runtime()
+                kill.assert_not_called()
+            self.assertFalse(marker.exists())
+            marker.write_text(json.dumps({'pid':4321,'start_ticks':100}))
+            with mock.patch.object(node,'P',root), \
+                 mock.patch.object(node,'process_start_ticks',return_value=100), \
+                 mock.patch.object(node.os,'kill') as kill:
+                node.thaw_stale_runtime()
+                kill.assert_called_once_with(4321,signal.SIGCONT)
+
     def test_gateway_role_restart_keeps_epoch_and_live_ownership(self):
         def snapshot(epoch, generation=7):
             return {

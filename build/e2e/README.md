@@ -194,6 +194,14 @@ Local Docker reproduction requires access to the same bind-mounted paths as the 
   node1. Verify the firewall counter recorded blocked packets, remove the
   rule, then require node2 to clean its old backend before final deletion.
   Select with `--profile full --case network-partition`.
+- `reconcile-crash` (targeted process fault): expire node2 while its sandboxd
+  backend remains, then stop that backend's runc init so physical Delete waits
+  after sending TERM. Kill Adxlet only after the pending signal proves cleanup
+  began and the node remains closed to admission. Resume the init process;
+  the replacement Adxlet must use a new session, remove the stale backend and
+  reopen admission. Verify node1 still executes and delete both records.
+  Select with `--profile full --case reconcile-crash`; this requires Linux
+  `/proc` and the pinned runc backend, and is outside the default Full gate.
 - `stop`: independently create a live instance pinned to each node, verify both
   backend inventories are occupied and exercise each forwarded port. A separate
   instance on each node is deleted to emit the required lifecycle log and trace. It also

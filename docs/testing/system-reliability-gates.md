@@ -44,7 +44,7 @@
 |---|---|---|---|
 | NM-01 | 心跳期限内进程重启 | 新 session 完成权威对账并保留有效 backend；对账完成前不准入 | 已有本地 E2E |
 | NM-02 | 超过心跳期限后进程返回 | 旧实例已经失效；返回节点清理旧执行与绑定后才重新准入 | 已有本地 E2E |
-| NM-03 | 对账期间再次崩溃 | 再次启动继续从 Redis 权威状态收敛，不复活旧 generation | 已有中断物理清理后新 adxlet 重读 inventory、重复幂等删除并保持准入关闭的组件测试；待真实进程故障注入 E2E |
+| NM-03 | 对账期间再次崩溃 | 再次启动继续从 Redis 权威状态收敛，不复活旧 generation | 已有中断物理清理后新 adxlet 重读 inventory、重复幂等删除并保持准入关闭的组件测试；新增 `reconcile-crash` 定向 E2E：失联后暂挂旧 runc init，确认 sandboxd Delete 的 TERM 已待处理且准入关闭，再杀掉对账中的 Adxlet，恢复 init 并要求新进程清理旧 backend、换 session 后准入。真实部署待实测 |
 | NODE-01 | 节点故障且无 checkpoint | Failed、撤路由，不从镜像冷启动 | 已有组件覆盖；`network-partition` 定向用例已覆盖真实网络隔离期间的失效和公开入口拒绝，待双物理 worker 实测及多 VM 门禁 |
 | NODE-02 | 共享 checkpoint | 跨节点恢复同一 Environment ID，generation 递增，旧执行不能复活 | 已有本地 FC 覆盖，待多 VM 门禁 |
 | NODE-03 | local-only checkpoint | 明确恢复失败，不在其他节点创建空白实例 | 已有组件覆盖，待多 VM 门禁 |

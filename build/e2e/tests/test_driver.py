@@ -120,6 +120,32 @@ class AcceptanceGateTests(unittest.TestCase):
                 ('helper', 'node2', 'empty'),
             ])
 
+    def test_reconciliation_crash_retries_stale_backend_cleanup(self):
+        self.assertEqual(driver.selected_checks('full', 'reconcile-crash'),
+                         ('reconcile-crash',))
+        with tempfile.TemporaryDirectory() as directory:
+            run=driver.Run(Path(directory))
+            run.nodes=['node1','node2']
+            calls=[]
+            run.execute=lambda node,*args,**kwargs:calls.append(('execute',node,args[-1])) or ''
+            run.helper=lambda node,*args,**kwargs:calls.append(('helper',node,args[0]))
+            checks=[]
+            run.scenarios(checks,('reconcile-crash',))
+            self.assertEqual(checks,['reconcile-crash'])
+            self.assertEqual(calls,[
+                ('execute','node1','create'),
+                ('helper','node2','freeze'),
+                ('helper','node1','failure-observed'),
+                ('helper','node2','freeze-stale-runtime'),
+                ('helper','node2','thaw'),
+                ('helper','node2','reconcile-delete-blocked'),
+                ('helper','node2','thaw-stale-runtime'),
+                ('helper','node2','reconcile-recovered'),
+                ('execute','node1','failure-cleanup'),
+                ('helper','node1','empty'),
+                ('helper','node2','empty'),
+            ])
+
     def test_entrypoint_fixture_outlives_instance_startup(self):
         source=(ROOT/'prepare.py').read_text()
         self.assertIn('sleep 30; echo adx-entrypoint-stderr',source)

@@ -94,6 +94,30 @@ def redis_info():
     host=os.getenv('ADX_E2E_REDIS_HOST','coordinator')
     lines=subprocess.check_output(['redis-cli','-h',host,'--raw','INFO','persistence'],env=env,text=True,timeout=5).splitlines()
     return dict(line.split(':',1) for line in lines if ':' in line)
+def stopped_with_pending_signal(status, signum):
+    fields=dict(line.split(':',1) for line in status.splitlines() if ':' in line)
+    state=fields.get('State','').strip()
+    mask=1 << (signum-1)
+    return state.startswith(('T ', 't ')) and any(
+        int(fields.get(key,'0').strip(),16) & mask
+        for key in ('SigPnd','ShdPnd')
+    )
+def process_status(pid):
+    return (Path('/proc')/str(pid)/'status').read_text()
+def process_start_ticks(pid):
+    # Field 22 is stable across PID reuse; the command field may contain spaces.
+    return int((Path('/proc')/str(pid)/'stat').read_text().rsplit(') ',1)[1].split()[19])
+def stale_runtime_marker():
+    return P/'frozen-stale-runtime.json'
+def thaw_stale_runtime():
+    marker=stale_runtime_marker()
+    if not marker.exists():return
+    runtime=json.loads(marker.read_text())
+    try:
+        if process_start_ticks(runtime['pid'])==runtime['start_ticks']:
+            os.kill(runtime['pid'],signal.SIGCONT)
+    except (FileNotFoundError,ProcessLookupError):pass
+    marker.unlink()
 def collect(node):
     dest=E/f'logs-{node}';dest.mkdir(exist_ok=True)
     secrets=[p.read_bytes().strip() for p in S.glob('*key') if p.is_file()]
@@ -341,6 +365,98 @@ def main():
             assert any(s['role']=='adxlet' and s['pid']==pid for s in current['services'])
             os.kill(pid,signal.SIGCONT);path.unlink()
             print('Adxlet resumed; waiting for authoritative cleanup',flush=True)
+    elif action=='freeze-stale-runtime':
+        assert node=='node2','stale runtime fault targets node2 only'
+        marker=stale_runtime_marker()
+        assert not marker.exists(),'stale runtime is already frozen'
+        runtimes=backend();assert len(runtimes)==1,runtimes
+        runtime_id=runtimes[0]
+        state=json.loads(command(['runc','--root',P/'sandboxd/runc','state',runtime_id],timeout=5))
+        assert state['id']==runtime_id and state['status']=='running',state
+        pid=state['pid'];assert isinstance(pid,int) and pid>1,state
+        marker.write_text(json.dumps({
+            'runtime_id':runtime_id,'pid':pid,'start_ticks':process_start_ticks(pid),
+        }))
+        os.kill(pid,signal.SIGSTOP)
+        deadline=time.monotonic()+5
+        while True:
+            status=process_status(pid)
+            if status.split('State:',1)[1].strip().startswith(('T ', 't ')):break
+            if time.monotonic()>deadline:raise TimeoutError('stale runc init did not stop')
+            time.sleep(.1)
+        print('Stale runc init suspended before Adxlet reconciliation',flush=True)
+    elif action=='thaw-stale-runtime':
+        thaw_stale_runtime()
+    elif action=='reconcile-delete-blocked':
+        assert node=='node2','interrupted reconciliation targets node2 only'
+        runtime=json.loads(stale_runtime_marker().read_text())
+        deadline=time.monotonic()+18
+        last='waiting for sandboxd Delete to send SIGTERM'
+        while True:
+            try:
+                records=catalog()
+                runtimes=backend()
+                failed_id,available,routable=returning_node_status(records,runtimes)
+                record=json.loads(records['node:node2'])
+                service=next(s for s in supervisor('status')['services'] if s['role']=='adxlet')
+                assert process_start_ticks(runtime['pid'])==runtime['start_ticks'], \
+                    'stale runc init PID was replaced before cleanup'
+                status=process_status(runtime['pid'])
+                failed=json.loads(records['environment:'+failed_id])
+                if (service['pid'] and not routable and not available
+                        and failed.get('invalidated') and failed['result']['state']=='Failed'
+                        and runtime['runtime_id'] in runtimes
+                        and stopped_with_pending_signal(status,signal.SIGTERM)):
+                    evidence={'old_manager_pid':service['pid'],
+                              'old_session_id':record['session']['id'],
+                              'failed_id':failed_id,
+                              'runtime_id':runtime['runtime_id'],
+                              'runtime_pid':runtime['pid'],
+                              'delete_signal_pending':True,
+                              'admission_closed':not record['node']['available']}
+                    assert evidence['admission_closed'],'node admitted while cleanup was blocked'
+                    (E/'reconcile-delete-blocked.json').write_text(json.dumps(evidence,indent=2))
+                    os.kill(service['pid'],signal.SIGKILL)
+                    print('Adxlet killed while sandboxd Delete waited for stopped runc init',flush=True)
+                    break
+                last={'session':record['session'],'runtime_status':status.splitlines()[2:5]}
+            except (OSError,KeyError,ValueError,subprocess.SubprocessError) as error:
+                last=str(error)
+            if time.monotonic()>deadline:raise TimeoutError(f'reconciliation did not enter physical cleanup: {last}')
+            time.sleep(.1)
+    elif action=='reconcile-recovered':
+        assert node=='node2','reconciliation recovery targets node2 only'
+        before=json.loads((E/'reconcile-delete-blocked.json').read_text())
+        deadline=time.monotonic()+80
+        last='new Adxlet has not reconciled the stale runtime'
+        while True:
+            try:
+                service=next(s for s in supervisor('status')['services'] if s['role']=='adxlet')
+                records=catalog()
+                node_record=json.loads(records['node:node2'])
+                session=node_record['session']
+                failed=json.loads(records['environment:'+before['failed_id']])
+                runtimes=backend()
+                assert not node_record['node']['available'] or not runtimes, \
+                    'node reopened admission before stale backend cleanup'
+                if (service['pid'] and service['pid']!=before['old_manager_pid']
+                        and session['id']!=before['old_session_id']
+                        and node_record['node']['available'] and session['routable']
+                        and not runtimes
+                        and failed.get('invalidated') and failed['result']['state']=='Failed'
+                        and not failed['result']['resources_held']):
+                    (E/'reconcile-recovered.json').write_text(json.dumps({
+                        **before,'new_manager_pid':service['pid'],
+                        'new_session_id':session['id'],'stale_backend_empty':True,
+                        'admission_reopened':True,
+                    },indent=2))
+                    print('PASS second Adxlet restart completed stale backend cleanup',flush=True)
+                    break
+                last={'manager_pid':service['pid'],'session':session,'backend':runtimes}
+            except (OSError,KeyError,ValueError,subprocess.SubprocessError) as error:
+                last=str(error)
+            if time.monotonic()>deadline:raise TimeoutError(f'Adxlet did not finish interrupted reconciliation: {last}')
+            time.sleep(.2)
     elif action=='failure-observed':
         end=time.monotonic()+65
         while True:
@@ -575,6 +691,7 @@ def main():
         (E/f'backend-occupied-{node}.json').write_text(json.dumps(current))
     elif action in ('stop','cleanup'):
         stop_errors=[]
+        thaw_stale_runtime()
         partition=P/'network-partition.ip'
         if partition.exists():
             try:heal_partition(partition,require_packets=False)

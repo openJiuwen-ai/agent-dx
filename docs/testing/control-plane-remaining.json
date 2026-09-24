@@ -4,7 +4,7 @@
     "title": "系统错误、超时与故障可靠性门禁",
     "stage": "13",
     "status": "pending",
-    "detail": "已修正local-first预算边界、中心队列独立超时和sandboxd晚启动等待；稳定错误映射、SDK accepted/no-final及structured unknown同身份重试、runtime丢失Never和对账中断重启已有组件门禁。Full #17已在两节点验证sandboxd daemon SIGKILL重启且保留原backend；真实进程代理断流、资源采集过期定向用例已实现、待实测，对账二次崩溃及Multi-VM故障门禁仍待补齐。",
+    "detail": "已修正local-first预算边界、中心队列独立超时和sandboxd晚启动等待；稳定错误映射、SDK accepted/no-final及structured unknown同身份重试、runtime丢失Never和对账中断重启已有组件门禁。Full #17已在两节点验证sandboxd daemon SIGKILL重启且保留原backend；真实进程代理断流、资源采集过期和对账二次崩溃定向用例已实现、待实测，Multi-VM故障门禁仍待补齐。",
     "gate": "ERR-01..04、TIME-01..05、SD-01..04、NM-01..03和NODE-01..04按system-reliability-gates.md完成对应拓扑E2E并保存客户端、Redis、路由和物理backend证据。"
   },
   {
