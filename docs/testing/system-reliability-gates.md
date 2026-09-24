@@ -34,7 +34,7 @@
 | 门禁 | 场景 | 通过条件 | 当前状态 |
 |---|---|---|---|
 | SD-01 | sandboxd 晚于 adxlet 启动 | adxlet 持续等待；不注册、不准入；sandboxd 就绪后才开始对账和服务 | 已有 UDS 定向测试 |
-| SD-02 | daemon 重启且 runtime 保留 | 已有实例不误判退出；资源观测过期后关闭新准入，连接恢复后对账并重新开放 | pinned gRPC/UDS 契约测试覆盖按标签找回 backend 且不重复 Start；[Full #17](https://buildkite.com/agent-dx/agent-dx-full-test/builds/17) 已对两节点真实 daemon 注入 `SIGKILL`，验证原 backend ID 保留及 SDK 恢复。资源观测超过有效期时关闭新准入、采集恢复后重新开放仍待故障注入 E2E |
+| SD-02 | daemon 重启且 runtime 保留 | 已有实例不误判退出；资源观测过期后关闭新准入，连接恢复后对账并重新开放 | pinned gRPC/UDS 契约测试覆盖按标签找回 backend 且不重复 Start；[Full #17](https://buildkite.com/agent-dx/agent-dx-full-test/builds/17) 已对两节点真实 daemon 注入 `SIGKILL`，验证原 backend ID 保留及 SDK 恢复。独立 `resource-stale` 用例已通过采集进程暂停覆盖观测过期与恢复，待正式部署实测；与 daemon 重启的组合故障仍待独立注入 |
 | SD-03 | daemon 重启且 runtime 丢失，Never | 实例进入 Failed、撤路由、释放资源，不自动冷启动 | 对账组件测试已验证该行为；定向 `runtime-exit` 已覆盖真实 backend 消失后的 Never 结果，尚未执行正式进程验收。daemon 自身重启并丢失 runtime 的组合仍待独立注入 |
 | SD-04 | daemon 重启且 runtime 丢失，自动重启 | 遵守重试上限与退避，新 backend 使用同一 Environment ID 和有效 generation | 生命周期组件测试覆盖退避和上限；定向 `runtime-exit` 已覆盖真实 backend 连续消失与新执行身份，尚未执行正式进程验收。daemon 自身重启并丢失 runtime 的组合仍待独立注入 |
 

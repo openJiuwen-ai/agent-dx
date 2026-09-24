@@ -83,6 +83,7 @@ def main():
             jobs += [['docker-registry','serve',str(H/'registry.yaml')]] if node=='node1' else [['python3',str(H/'registry-relay.py')]]
         if not os.getenv('ADX_E2E_KUBERNETES'):jobs.append(['python3',str(H/'telemetry.py'),'run'])
         children=[subprocess.Popen(c) for c in jobs]
+        (P/'observer.pid').write_text(str(children[0].pid))
         (P/'sandboxd.pid').write_text(str(children[1].pid))
         while True:
             for index, child in enumerate(children):
@@ -146,6 +147,20 @@ def main():
         pid=services[0]['pid'];marker.write_text(str(pid))
         os.kill(pid,signal.SIGSTOP)
         print('Coordinator suspended while managed Redis remains available',flush=True)
+    elif action=='observer-freeze':
+        marker=P/'frozen-observer.pid'
+        assert not marker.exists(),'resource observer already suspended'
+        pid=int((P/'observer.pid').read_text())
+        os.kill(pid,0)
+        marker.write_text(str(pid))
+        os.kill(pid,signal.SIGSTOP)
+        print('Resource observer suspended without stopping adxlet heartbeats',flush=True)
+    elif action=='observer-resume':
+        marker=P/'frozen-observer.pid'
+        assert marker.is_file(),'resource observer suspension marker missing'
+        os.kill(int(marker.read_text()),signal.SIGCONT)
+        marker.unlink()
+        print('Resource observer resumed',flush=True)
     elif action=='coordinator-resume':
         marker=P/'frozen-coordinator.pid'
         assert marker.is_file(),'Coordinator suspension marker missing'
@@ -215,6 +230,42 @@ def main():
             except (OSError,sqlite3.Error,KeyError,ValueError,subprocess.SubprocessError) as error:
                 last=str(error)
             if time.monotonic()>deadline:raise TimeoutError(f'SQLite replay missing: {last}')
+            time.sleep(.5)
+    elif action in ('resource-stale','resource-fresh'):
+        live=json.loads((E/'resource-live.json').read_text())
+        expect_available=action=='resource-fresh'
+        started=time.monotonic()
+        deadline=started+30
+        last=None
+        while True:
+            try:
+                records=catalog()
+                node1=json.loads(records['node:node1'])
+                node2=json.loads(records['node:node2'])
+                result=json.loads(records['environment:'+live['instance_id']])['result']
+                backends=labeled_backend(live['instance_id'])
+                if node1['node']['available']==expect_available \
+                        and node1['session']['routable'] \
+                        and node1['session']['id']==live['session_id'] \
+                        and node2['node']['available'] \
+                        and result['state']=='Running' \
+                        and result['runtime_id']==live['runtime_id'] \
+                        and backends==[live['backend']]:
+                    evidence={'node1_available':expect_available,'node2_available':True,
+                              'session_id':live['session_id'],'instance_id':live['instance_id'],
+                              'backend':live['backend'],
+                              'seconds':round(time.monotonic()-started,3)}
+                    (E/f'{action}.json').write_text(json.dumps(evidence,indent=2))
+                    print('PASS resource observation '+action,flush=True)
+                    break
+                last={'node1_available':node1['node']['available'],
+                      'node1_routable':node1['session']['routable'],
+                      'node2_available':node2['node']['available'],
+                      'session_id':node1['session']['id'],
+                      'runtime_id':result['runtime_id'],'backends':backends}
+            except (OSError,KeyError,ValueError,subprocess.SubprocessError) as error:
+                last=str(error)
+            if time.monotonic()>deadline:raise TimeoutError(f'{action} not observed: {last}')
             time.sleep(.5)
     elif action=='postcheck':
         result_name=node or 'sdk'
@@ -420,6 +471,11 @@ def main():
         (E/f'backend-occupied-{node}.json').write_text(json.dumps(current))
     elif action in ('stop','cleanup'):
         stop_errors=[]
+        observer=P/'frozen-observer.pid'
+        if observer.exists():
+            try:os.kill(int(observer.read_text()),signal.SIGCONT)
+            except ProcessLookupError:pass
+            observer.unlink()
         marker=P/'frozen-coordinator.pid'
         if marker.exists():
             try:os.kill(int(marker.read_text()),signal.SIGCONT)

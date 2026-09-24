@@ -60,6 +60,35 @@ class AcceptanceGateTests(unittest.TestCase):
             self.assertEqual(run.case_results[0]['subcases'][0]['id'],
                              'reliability.create-final-response-cut')
 
+    def test_resource_stale_closes_admission_until_observer_recovers(self):
+        self.assertEqual(driver.selected_checks('full', 'resource-stale'),
+                         ('resource-stale',))
+        with tempfile.TemporaryDirectory() as directory:
+            run = driver.Run(Path(directory))
+            run.nodes = ['node1', 'node2']
+            calls = []
+            run.execute = lambda node, *args, **_kwargs: (
+                calls.append(('execute', node, args[-1]))
+                or json.dumps({'cases': [{'id': 'reliability.resource-stale-admission',
+                                          'status': 'passed'}]})
+            )
+            run.helper = lambda node, *args, **_kwargs: calls.append(
+                ('helper', node, args[0]))
+            checks = []
+            run.scenarios(checks, ('resource-stale',))
+            self.assertEqual(checks, ['resource-stale'])
+            self.assertEqual(calls, [
+                ('execute', 'node1', 'resource-create'),
+                ('helper', 'node1', 'observer-freeze'),
+                ('helper', 'node1', 'resource-stale'),
+                ('execute', 'node1', 'resource-rejected'),
+                ('helper', 'node1', 'observer-resume'),
+                ('helper', 'node1', 'resource-fresh'),
+                ('execute', 'node1', 'resource-verify'),
+                ('helper', 'node1', 'empty'),
+                ('helper', 'node2', 'empty'),
+            ])
+
     def test_entrypoint_fixture_outlives_instance_startup(self):
         source=(ROOT/'prepare.py').read_text()
         self.assertIn('sleep 30; echo adx-entrypoint-stderr',source)

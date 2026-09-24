@@ -174,6 +174,13 @@ Local Docker reproduction requires access to the same bind-mounted paths as the 
   retry with the same request ID and name; the final generation and backend
   must remain unchanged, and the instance must execute and delete normally.
   Select with `--profile full --case create-response-cut`.
+- `resource-stale` (targeted observation-expiry case): pause only node1's
+  resource observer so its 10-second capacity sample expires while adxlet,
+  Coordinator and existing backends continue. Require node1 to close new
+  admission without losing its routable session; a node1-pinned SDK create
+  must time out without a new allocation. Resume observation, require node1
+  to reopen admission in the same session, create and execute a new instance,
+  then delete both. Select with `--profile full --case resource-stale`.
 - `stop`: independently create a live instance pinned to each node, verify both
   backend inventories are occupied and exercise each forwarded port. A separate
   instance on each node is deleted to emit the required lifecycle log and trace. It also

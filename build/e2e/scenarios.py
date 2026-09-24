@@ -71,6 +71,17 @@ elif sys.argv[1]=='create-response-cut':
     from create_response_cut import run
     report=run(connection,image,E/'create-response-cut-result.json',S)
     print(json.dumps(report),flush=True)
+elif sys.argv[1]=='resource-create':
+    from resource_stale import create
+    create(connection,image,E/'resource-live.json')
+    print('Created retained instance before resource observation expiry',flush=True)
+elif sys.argv[1]=='resource-rejected':
+    from resource_stale import rejected
+    print(json.dumps(rejected(connection,image,E)),flush=True)
+elif sys.argv[1]=='resource-verify':
+    from resource_stale import verify
+    report=verify(connection,image,E,E/'resource-stale-result.json')
+    print(json.dumps(report),flush=True)
 elif sys.argv[1]=='auth':
     from adx_sandbox import PermissionDenied, SandboxError
     s=Sandbox(image=image,runtime='runc',cpu=500,memory=512,idle_timeout=0,connection=connection,create_timeout=150)
