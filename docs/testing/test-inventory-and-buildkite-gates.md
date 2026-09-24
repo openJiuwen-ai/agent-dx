@@ -228,7 +228,7 @@ profile；完整 Multi-VM 在补齐部署器前不能标记为通过。
 | `FD-04` | 已实现 | Metrics、日志、滚动压缩、Collector 重启与 Trace 父子关系 |
 | `FD-05` | 已验证 | `full` profile 的两个 Pod 必须落在不同物理 worker；Full #6 分别运行于 `10.244.128.124` 和 `10.244.128.160` |
 | `FD-06` | 同 Pod 重启已验证，跨 Pod 待验证 | [Full #18](https://buildkite.com/agent-dx/agent-dx-full-test/builds/18) 定向运行 `redis-restart`：`SIGKILL` 托管 Redis 后由 supervisor 重启，AOF 开启，双节点实例归属和代次、后端 ID、文件及命令保持一致，删除后资源释放；持久卷跨 Pod 恢复仍待独立用例 |
-| `FD-07` | 计划 | Coordinator/API/Ingress 独立故障与恢复，服务入口和目录重新收敛 |
+| `FD-07` | Coordinator 定向驱动已实现，待运行 | `coordinator-restart` 验证新 epoch、双节点原归属／后端、公共 SDK 查询与执行；API/Ingress 独立故障与恢复仍待补齐 |
 | `FD-08` | 计划 | worker 网络分区、心跳失效、返回清理与健康 worker 连续可用 |
 | `FD-FC-01` | 条件计划 | KVM worker 的 Firecracker pause/resume/snapshot profile |
 | `FD-XPU-01` | 条件计划 | 真实 GPU/NPU 整卡发现、过滤、分配、释放和故障清理 |
