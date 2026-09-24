@@ -28,8 +28,9 @@ class ReleaseArchiveTests(unittest.TestCase):
             for name in (*package.BINARIES,'adx-execd','adx-runtime-rootfs.img'):
                 path=bins/name;path.write_bytes(b'fixture binary');path.chmod(0o755)
             redis=root/'redis-server';redis.write_text('#!/bin/sh\necho "Redis server v=7.2.5 fixture"\n');redis.chmod(0o755)
+            redis_cli=root/'redis-cli';redis_cli.write_text('#!/bin/sh\necho "redis-cli 7.2.5"\n');redis_cli.chmod(0o755)
             wheel=root/'adx_sandbox-0.1.0-py3-none-any.whl';wheel.write_bytes(b'fixture wheel')
-            built=root/'built';package.assemble(bins,redis,wheel,built,'a'*40,False,'x86_64-unknown-linux-gnu','release')
+            built=root/'built';package.assemble(bins,redis,redis_cli,wheel,built,'a'*40,False,'x86_64-unknown-linux-gnu','release')
             archive=root/'adx-release.tar.gz'
             subprocess.run(['tar','-czf',archive,'-C',built,'.'],check=True)
             # A fresh job receives only a normal non-executable archive file.
@@ -41,6 +42,7 @@ class ReleaseArchiveTests(unittest.TestCase):
             self.assertTrue((restored/'LICENSE').is_file())
             self.assertTrue((restored/'install.sh').stat().st_mode & 0o111)
             self.assertTrue((restored/'bin/adx-coordinator').stat().st_mode & 0o111)
+            self.assertTrue((restored/'bin/redis-cli').stat().st_mode & 0o111)
             self.assertTrue((restored/'etc/examples/deployment.yaml').is_file())
             self.assertTrue((restored/'third_party/sandboxd/source.json').is_file())
             self.assertFalse((restored/'third_party/sandboxd/patches').exists())

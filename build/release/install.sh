@@ -71,6 +71,7 @@ required = {
     "bin/adxlet",
     "bin/adx-apiserver",
     "bin/redis-server",
+    "bin/redis-cli",
     "install.sh",
     "runtime/adx-execd",
 }
