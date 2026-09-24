@@ -18,7 +18,7 @@ import xml.etree.ElementTree as ET
 
 BASIC = ('sdk','auth','capacity','placement','local-first')
 STANDARD = ('sdk','data-plane','lifecycle','auth','capacity','placement','local-first','node-failure','sandboxd-restart','restart','stop')
-OPTIONAL_CASES = ('redis-restart','coordinator-restart','apiserver-restart','ingress-restart','runtime-affinity','idle-active','relay-standalone','runtime-exit','sqlite-fallback','create-response-cut','resource-stale')
+OPTIONAL_CASES = ('redis-restart','coordinator-restart','apiserver-restart','ingress-restart','runtime-affinity','idle-active','relay-standalone','runtime-exit','sqlite-fallback','create-response-cut','resource-stale','network-partition')
 PROFILES = {
     'l0': ('l0','auth'),
     'standalone': STANDARD,
@@ -392,6 +392,24 @@ class Run:
                 self.helper('node1','ready',timeout=150)
                 self.helper('node2','empty','node2')
                 self.execute('node1','/opt/adx/client/bin/python','-u','/opt/adx/e2e/scenarios.py','failure-cleanup',timeout=90)
+                for node in self.nodes:self.helper(node,'empty',node)
+        if 'network-partition' in selected:
+            with self.case('network-partition', checks) as record:
+                self.execute('node1','/opt/adx/client/bin/python','-u',
+                             '/opt/adx/e2e/scenarios.py','create',timeout=300)
+                self.helper('node2','network-partition','node2',timeout=15)
+                try:
+                    self.helper('node1','failure-observed',timeout=75)
+                    output=self.execute('node1','/opt/adx/client/bin/python','-u',
+                                        '/opt/adx/e2e/scenarios.py','partition-observed',timeout=45)
+                    record['subcases']=sdk_subcases_from_output(output)
+                finally:
+                    self.helper('node2','network-heal','node2',timeout=15)
+                self.helper('node2','network-recovery','node2',timeout=90)
+                self.helper('node1','ready',timeout=150)
+                self.helper('node2','empty','node2')
+                self.execute('node1','/opt/adx/client/bin/python','-u',
+                             '/opt/adx/e2e/scenarios.py','network-cleanup',timeout=90)
                 for node in self.nodes:self.helper(node,'empty',node)
         if 'sandboxd-restart' in selected:
             with self.case('sandboxd-restart', checks):

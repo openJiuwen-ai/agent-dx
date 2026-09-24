@@ -82,6 +82,10 @@ elif sys.argv[1]=='resource-verify':
     from resource_stale import verify
     report=verify(connection,image,E,E/'resource-stale-result.json')
     print(json.dumps(report),flush=True)
+elif sys.argv[1]=='partition-observed':
+    from network_partition import run
+    report=run(connection,image,E,S,E/'network-partition-observed.json')
+    print(json.dumps(report),flush=True)
 elif sys.argv[1]=='auth':
     from adx_sandbox import PermissionDenied, SandboxError
     s=Sandbox(image=image,runtime='runc',cpu=500,memory=512,idle_timeout=0,connection=connection,create_timeout=150)
@@ -174,7 +178,7 @@ elif sys.argv[1] in ('create','create-marker','create-stop'):
         (E/'live-instances.json').write_text(json.dumps([s.id for s in instances]))
     finally:
         for s in instances:s.close()
-elif sys.argv[1]=='failure-cleanup':
+elif sys.argv[1] in ('failure-cleanup','network-cleanup'):
     from node import catalog
     observed=json.loads((E/'node-failure-observed.json').read_text())
     healthy=Sandbox.from_id(observed['healthy_id'],connection=connection)
@@ -187,7 +191,8 @@ elif sys.argv[1]=='failure-cleanup':
     for sid in json.loads((E/'live-instances.json').read_text()):
         result=json.loads(records['environment:'+sid])['result']
         assert result['state']=='Deleted' and not result['resources_held']
-    (E/'node-failure-result.json').write_text(json.dumps({'status':'passed',**observed,'reconnected_backend_empty':True,'cleanup_committed':True},indent=2))
+    result_name='network-partition-result.json' if sys.argv[1]=='network-cleanup' else 'node-failure-result.json'
+    (E/result_name).write_text(json.dumps({'status':'passed',**observed,'reconnected_backend_empty':True,'cleanup_committed':True},indent=2))
     event('PASS: reconnected node cleaned old execution; healthy instance still executes; final deletion committed')
 elif sys.argv[1] in ('cleanup-live','cleanup-live-redis','cleanup-live-control','cleanup-live-gateway'):
     from node import catalog

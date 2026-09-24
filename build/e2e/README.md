@@ -181,6 +181,13 @@ Local Docker reproduction requires access to the same bind-mounted paths as the 
   must time out without a new allocation. Resume observation, require node1
   to reopen admission in the same session, create and execute a new instance,
   then delete both. Select with `--profile full --case resource-stale`.
+- `network-partition` (targeted two-worker fault): block node2's TCP traffic to
+  Coordinator with a container-local firewall rule while keeping sandboxd and
+  the Relay running. Require heartbeat invalidation, public Ingress route
+  rejection for the failed instance, and continued SDK command and create on
+  node1. Verify the firewall counter recorded blocked packets, remove the
+  rule, then require node2 to clean its old backend before final deletion.
+  Select with `--profile full --case network-partition`.
 - `stop`: independently create a live instance pinned to each node, verify both
   backend inventories are occupied and exercise each forwarded port. A separate
   instance on each node is deleted to emit the required lifecycle log and trace. It also
