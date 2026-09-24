@@ -97,3 +97,28 @@ python3 build/e2e/multivm/worker_failure.py \
 This produces `worker-failure-result.json`. It is the `MV-06` subset, not the
 complete Multi-VM result contract. Run `sdk_accept.py` first with the same
 inventory and release archive.
+
+`capacity_queue.py` covers the resource-exhaustion and queue-wakeup portion
+of `MV-03`. It measures each worker's current allocatable CPU through the
+public SDK, reserves that amount with one pinned Sandbox per worker, confirms
+an additional create appears in the Coordinator's admin-only waiting queue,
+releases one holder, then requires the queued create to run on that worker.
+It verifies the final persisted resource state and physical backend cleanup.
+Run it only on dedicated workers with at least 500 millicores and 512 MiB
+currently allocatable on each. The `--admin-token-file` is separate from the
+tenant token and must have administrator permission. The deployment Ingress
+configuration must route `/global-scheduler/` to API Server.
+
+```sh
+python3 build/e2e/multivm/capacity_queue.py \
+  --inventory out/e2e/3vm/inventory.json \
+  --endpoint control.example:8443 \
+  --token-file /path/to/tenant-key \
+  --admin-token-file /path/to/admin-key \
+  --ca /path/to/ingress-ca.pem \
+  --image registry.example/team/rrt@sha256:DIGEST \
+  --output out/e2e/3vm/capacity
+```
+
+Pack/Spread configuration and preference scoring remain separate `MV-03`
+checks; `capacity-queue-result.json` alone is not a full `MV-03` pass.
