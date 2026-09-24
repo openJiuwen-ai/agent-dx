@@ -213,6 +213,7 @@ fn project(kind: Kind, record: &Value) -> Value {
             "proxy_address": at(record, "/proxy_address"),
             "capacity": at(record, "/node/capacity"),
             "available": at(record, "/node/available"),
+            "runtime_classes": at(record, "/node/runtime_classes"),
             "device_count": record.pointer("/node/devices").and_then(Value::as_array).map_or(0, Vec::len),
             "scheduling_paused": at(record, "/scheduling_paused"),
             "session": at(record, "/session"),
@@ -253,6 +254,20 @@ fn project(kind: Kind, record: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn node_view_exposes_runtime_inventory_for_placement_checks() {
+        let record = json!({
+            "node": {"id": "node-1", "available": true,
+                     "runtime_classes": ["runc", "runsc"],
+                     "labels": {"private": "secret"}},
+            "session": {"id": "session-1", "routable": true},
+        });
+        let view = project(Kind::Node, &record);
+        assert_eq!(view["id"], "node-1");
+        assert_eq!(view["runtime_classes"], json!(["runc", "runsc"]));
+        assert!(!view.to_string().contains("secret"));
+    }
 
     #[test]
     fn environment_view_omits_user_configuration_and_checkpoint_location() {

@@ -22,4 +22,4 @@ kubectl -n akernel exec deployment/akernel-adx-coordinator -- \
   environment list --cursor 42 --count 50
 ```
 
-`get` 输出经过筛选：不展示用户环境变量、快照制品位置和 Redis 凭证。尚未提交执行结果的 Environment 显示 `Pending`。命令仅发送 `HGET`、`HLEN`、`HSCAN`；不会修改 Redis，也不会通过全量 Hash 查询遍历主账本。输出是 JSON，适合配合 `jq` 排查。它用于诊断已持久化的状态，不代替用户 API 或实时运行状态探测。需要检查原始字段时，发布包另有 `bin/redis-cli`，应按部署环境的权限要求使用。
+`get` 输出经过筛选：不展示用户环境变量、快照制品位置和 Redis 凭证。`node get` 输出扁平的 `id`、`available`、`runtime_classes` 和 `session` 等字段；`runtime_classes` 是节点通过 sandboxd 上报后持久化的 runtime 清单。尚未提交执行结果的 Environment 显示 `Pending`。命令仅发送 `HGET`、`HLEN`、`HSCAN`；不会修改 Redis，也不会通过全量 Hash 查询遍历主账本。输出是 JSON，适合配合 `jq` 排查。它用于诊断已持久化的状态，不代替用户 API 或实时运行状态探测。需要检查原始字段时，发布包另有 `bin/redis-cli`，应按部署环境的权限要求使用。
