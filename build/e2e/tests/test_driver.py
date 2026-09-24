@@ -160,13 +160,17 @@ class AcceptanceGateTests(unittest.TestCase):
             run = driver.Run(Path(directory))
             run.nodes = ['node1', 'node2']
             calls = []
-            run.execute = lambda node, *args, **kwargs: calls.append(('execute', node, args[-1])) or ''
+            run.execute = lambda node, *args, **kwargs: calls.append(('execute', node, args[-2] if args[-2] in ('outage-start','outage-end') else args[-1])) or ''
             run.helper = lambda node, *args, **kwargs: calls.append(('helper', node, args[0])) or ''
             checks = []
             run.scenarios(checks, ('stop',))
             self.assertEqual(checks, ['stop'])
             self.assertEqual(calls, [
+                ('execute', 'node1', 'outage-start'),
+                ('execute', 'node2', 'outage-start'),
                 ('execute', 'node1', 'create-stop'),
+                ('execute', 'node1', 'outage-end'),
+                ('execute', 'node2', 'outage-end'),
                 ('helper', 'node1', 'occupied'),
                 ('helper', 'node2', 'occupied'),
                 ('helper', 'node2', 'stop'),

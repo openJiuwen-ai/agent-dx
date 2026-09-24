@@ -104,9 +104,13 @@ elif sys.argv[1] in ('create','create-marker','create-stop'):
     instances=[]
     try:
         for index in range(2):
-            options={'node_id':f'node{index+1}'} if sys.argv[1]=='create-stop' else {}
+            options={'node_id':f'node{index+1}','port_forwardings':[18081]} if sys.argv[1]=='create-stop' else {}
             s=Sandbox(image=image,runtime='runc',cpu=500,memory=512,idle_timeout=0,connection=connection,create_timeout=150,**options)
             instances.append(s);assert s.is_running()
+            if sys.argv[1]=='create-stop':
+                from functional_data_plane import SERVER_COMMAND, EXPECTED_BODY, _fetch_forwarded
+                s.commands.run(SERVER_COMMAND,background=True,command_id=f'stop-http-{index}')
+                assert _fetch_forwarded(s,S/'tls/ca.pem')==EXPECTED_BODY
             if sys.argv[1]=='create-marker':
                 deadline=time.monotonic()+10
                 retries=0
