@@ -41,6 +41,9 @@ def selected_checks(profile, case=None):
         raise ValueError(f'{case} is not in E2E profile {profile}')
     return (case,)
 
+def setup_environment(selected_case):
+    return ('ADX_E2E_INGRESS_MODE=standalone',) if selected_case == 'ingress-restart' else ()
+
 def sha(path):
     h=hashlib.sha256()
     with path.open('rb') as f:
@@ -110,10 +113,11 @@ def cleanup_cgroup(root):
 
 
 class Run:
-    def __init__(self,output,cgroupns='private'):
+    def __init__(self,output,cgroupns='private',selected_case=None):
         if cgroupns not in ('private', 'host'):
             raise ValueError('cgroupns must be private or host')
         self.cgroupns=cgroupns
+        self.selected_case=selected_case
         self.output=output;self.id='adx-e2e-'+uuid.uuid4().hex[:12]
         self.nodes=[];self.network=False;self.commands=0
         self.redactions=set();self.case_results=[]
@@ -248,7 +252,8 @@ class Run:
             args=['run','-d','--name',name,'--label','adx.e2e.run='+self.id,'--network',self.id,'--network-alias','coordinator' if node=='node1' else 'node2','--privileged','--cgroupns='+self.cgroupns,'-e','ADX_E2E_CGROUP_ROOT='+name,'--cpus=3','--memory=4g','--tmpfs','/tmp/adx-e2e/sandboxd/image_manager:size=1g','-v',f'{secrets}:/secrets','-v',f'{self.output}:/evidence']
             args+=['-v',f'{bundle / "execd.tar"}:/execd.tar:ro']
             self.docker(*args,m['image_ids']['node'])
-            self.helper(node,'setup',node)
+            self.execute(node,'env',*setup_environment(self.selected_case),
+                         'python3','/opt/adx/e2e/node.py','setup',node)
             self.execute(node,'sh','-c','python3 /opt/adx/e2e/node.py services '+node+' > /evidence/services-'+node+'.log 2>&1 &')
         self.execute('node1','python3','/opt/adx/e2e/publish.py',timeout=300)
         for node in self.nodes:
@@ -419,7 +424,7 @@ def write_junit(path, report, suite_name='platform-e2e'):
 def main():
     p=argparse.ArgumentParser();p.add_argument('--bundle',type=Path,required=True);p.add_argument('--output',type=Path,required=True);p.add_argument('--profile',choices=('l0','standalone'),default='standalone');p.add_argument('--case',help='run one case as a targeted diagnostic, not a profile gate');p.add_argument('--cgroupns',choices=('private','host'),default='private');a=p.parse_args()
     out=a.output.resolve();out.mkdir(parents=True,exist_ok=False)
-    run=Run(out,cgroupns=a.cgroupns);error=None;checks=[];m=None;required=selected_checks(a.profile,a.case)
+    run=Run(out,cgroupns=a.cgroupns,selected_case=a.case);error=None;checks=[];m=None;required=selected_checks(a.profile,a.case)
     def cancel(signum,frame):raise InterruptedError(f'canceled by signal {signum}')
     for s in (signal.SIGTERM,signal.SIGINT):signal.signal(s,cancel)
     with tempfile.TemporaryDirectory(prefix='adx-e2e-secrets-') as private:

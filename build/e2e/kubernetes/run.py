@@ -107,6 +107,7 @@ class KubernetesRun(common.Run):
         self.namespace_attempted = False
         self.harness = None
         self.profile = profile
+        self.selected_case = selected_case
         self.stop_evidence = 'stop' in common.selected_checks(profile, selected_case)
 
     def kube(self, *args, timeout=180):
@@ -206,6 +207,7 @@ class KubernetesRun(common.Run):
         self.event('[DEPLOY] Configuring nodes and starting sandboxd')
         for node in self.nodes:
             self.execute(node, 'env', 'ADX_E2E_INGRESS_IP=' + ingress_ip,
+                         *common.setup_environment(self.selected_case),
                          'python3', '/opt/adx/e2e/node.py', 'setup', node)
             self.execute(node, 'sh', '-c', 'python3 /opt/adx/e2e/node.py services ' + node +
                          ' > /evidence/services-' + node + '.log 2>&1 &')

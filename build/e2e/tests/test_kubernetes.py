@@ -63,6 +63,11 @@ class KubernetesLifecycleTests(unittest.TestCase):
         spec=importlib.util.spec_from_file_location('k8s_run',ROOT/'kubernetes/run.py')
         cls.module=importlib.util.module_from_spec(spec);spec.loader.exec_module(cls.module)
 
+    def test_ingress_restart_selects_independent_process_at_setup(self):
+        runner=(ROOT/'kubernetes/run.py').read_text()
+        self.assertIn("*common.setup_environment(self.selected_case)",runner)
+        self.assertIn("self.selected_case = selected_case",runner)
+
     def test_sdk_result_is_read_from_pod_before_evidence_copy(self):
         import json,tempfile
         with tempfile.TemporaryDirectory() as d:
