@@ -50,7 +50,27 @@ async fn authenticated_services_observe_environment_deletion_and_recreation() {
     ));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
-    let app = adx_activator::server::router(activator, TOKEN, Duration::from_secs(3)).unwrap();
+    let template_calls = Arc::new(AtomicUsize::new(0));
+    let activate_calls = Arc::new(AtomicUsize::new(0));
+    let tc = template_calls.clone();
+    let ac = activate_calls.clone();
+    let app = adx_activator::server::router(activator, TOKEN, Duration::from_secs(3))
+        .unwrap()
+        .layer(axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let tc = tc.clone();
+                let ac = ac.clone();
+                async move {
+                    if request.uri().path().ends_with("templates/get") {
+                        tc.fetch_add(1, Ordering::SeqCst);
+                    }
+                    if request.uri().path().ends_with("environments/activate") {
+                        ac.fetch_add(1, Ordering::SeqCst);
+                    }
+                    next.run(request).await
+                }
+            },
+        ));
     let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let down = format!("http://{}", closed.local_addr().unwrap());
@@ -107,6 +127,25 @@ async fn authenticated_services_observe_environment_deletion_and_recreation() {
         .resolve(&context(), &scope, Protocol::Http, None)
         .await
         .unwrap();
+    template_calls.store(0, Ordering::SeqCst);
+    activate_calls.store(0, Ordering::SeqCst);
+    assert_eq!(
+        service
+            .resolve(&context(), &scope, Protocol::Http, None)
+            .await
+            .unwrap(),
+        first
+    );
+    assert_eq!(
+        template_calls.load(Ordering::SeqCst),
+        0,
+        "warm Gateway must reuse its template"
+    );
+    assert_eq!(
+        activate_calls.load(Ordering::SeqCst),
+        1,
+        "warm resolve is exactly one Activator RPC"
+    );
     assert_eq!(
         other_client
             .activate(&context(), &scope, None)

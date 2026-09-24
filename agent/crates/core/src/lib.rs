@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub mod activator;
+pub mod cache;
 pub mod error;
 pub mod inline;
 pub mod limits;
@@ -187,3 +188,5 @@ pub struct Environment {
     /// Product deletion intent only; Sandbox runtime state belongs to Platform.
     pub phase: EnvironmentPhase,
 }
+
+pub mod discovery;

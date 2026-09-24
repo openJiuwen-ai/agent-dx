@@ -16,10 +16,13 @@ dependencies = [
  "adx-agent-store",
  "async-trait",
  "axum",
+ "hashlink",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
  "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -32,10 +35,12 @@ dependencies = [
  "async-trait",
  "axum",
  "chrono",
+ "redis",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
  "tokio",
+ "tracing",
  "uuid",
 ]
 

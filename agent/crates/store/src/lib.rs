@@ -198,3 +198,5 @@ impl From<Error> for adx_agent_core::error::Error {
         }
     }
 }
+
+pub mod discovery;

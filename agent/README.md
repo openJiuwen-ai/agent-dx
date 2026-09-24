@@ -14,7 +14,7 @@ Environment 对应一个稳定逻辑 Sandbox ID。指定 Environment 的首次�
 
 公开 API、认证、路由和连接实现位于 Gateway。HTTP/WS/SSH 通过普通方法调用 Agent 的 `ManagedService`，共用 Environment 身份选择和 service 唯一匹配规则；身份选择本身不创建元数据或 Sandbox。HTTP 响应头、SSH 终端提示与协议转发仍由 Gateway 处理。
 
-Gateway 对同一次请求的内部重试固定首次选定的 generation。删除或同名重建后，旧请求的重试返回冲突，不触发重建或选择新的生命周期。
+Gateway 对同一次 HTTP/WS 请求的内部重试固定首次选定的 generation，并强制绕过 Activator 的成功激活缓存。删除或同名重建后，旧请求的重试返回冲突，不触发重建或选择新的生命周期。
 
 用户 Harness 由 Execd 启动，自行定义业务接口。HTTP/WS/SSH 保持透明转发，不限制业务并发。inline create/get/list/kill 和 exec/files 是独立的旧协议适配入口，直接适配 Sandbox，独立于 v2 管理接口、Environment、Activator 和 ADX Redis。
 
@@ -65,7 +65,35 @@ API Server 内嵌 Ingress 时，也可将 `ADX_AGENT_CONFIG` 配成嵌入式模�
 
 `timeout_seconds` 默认 60 秒且必须为正，由入口确定一次绝对 deadline。管理面在鉴权后统一处理 trace、请求读取、业务调用和 JSON 响应；HTTP/WS 目标激活的模板查询、激活和内部目标重试共用同一期限。客户端将剩余预算传给 Activator，地址重选不重置期限。纯读超时返回 Unavailable，可能写入的操作超时返回 OutcomeUnknown，重试使用原身份；已到期的内部重试直接拒绝。网络连接及 Sandbox 后端配置上限只能缩短剩余预算。创建的内部 `deadline_unix_ms` 只随请求传输，不进入执行规格或 Redis；它从入口经 Activator/Sandbox 传递到 Platform RPC；发现 Coordinator、读取请求和上游查询已消耗的时间不会重新补回。内部 Sandbox HTTP 入口默认上限同为 60 秒；inline 仍受 `backend_timeout_seconds` 上限约束，Platform RPC 受 `rpc_timeout_seconds` 上限约束。激活期限不覆盖建立后的 HTTP 响应流、WS 或 SSH 会话；SSH 模板校验、身份提示和后端握手共用 SSH 连接期限。
 
-Gateway 不缓存 Template 或 Target，查询和获取目标均调用 Activator。独立模式经 ActivatorClient 调用独立进程；嵌入式模式经 LocalControl 调用同进程 Activator 并连接产品状态 Redis。Activator 持有产品状态并调用 Sandbox 接口；Platform 自身的 Redis 发现不受影响。独立进程部署见 [进程说明](activator/README.md)，状态保证见 [存储说明](crates/store/README.md)。
+Gateway 与 Activator 都缓存不可变模板，按 tenant/name/version 隔离，各最多 1024 条；同键在途读取合并，缺失和失败不缓存。Gateway 不缓存 Env/Target，每次解析都调用 Activator。Activator 的 Env 成功绑定采用 LRU，默认容量 200000，滑动 TTL 为 18000 秒（5 小时）；热命中直接返回并续期，不读 Redis、不调用 Sandbox API。TTL 只在请求访问时检查，没有 Env 后台刷新或过期扫描；容量淘汰、闲置过期、重启和 bypass 会引起回源。缓存是派生状态，实际连通性由 Gateway/Relay 校验；删除中的并发请求允许成功或失败。Activator 部署与缓存内存测量见 [进程说明](activator/README.md)，权威状态保证见 [存储说明](crates/store/README.md)。
+
+独立模式经 ActivatorClient 调用远程进程；嵌入式模式经 LocalControl 调用同进程 Activator，复用上述缓存及 bypass 语义。嵌入式 Activator 使用默认 200000 条、5 小时配置，当前没有独立的缓存配置入口。
+
+### Activator 发现与 Env 亲和路由
+
+静态 `activator.urls` 中的每个地址必须直达一个实例，不能是随机负载均衡到多个实例的地址。动态部署可以用 `activator.discovery` 替代 `urls`，两者互斥：
+
+```json
+{
+  "timeout_seconds": 60,
+  "activator": {
+    "discovery": {
+      "redis_url": "redis://redis.internal:6379/0",
+      "namespace": "adx-production",
+      "refresh_seconds": 5
+    },
+    "token_env": "ADX_ACTIVATOR_SERVICE_TOKEN",
+    "ca_path": "/etc/adx/ca.pem",
+    "allow_plaintext": false
+  }
+}
+```
+
+Activator 在相同 Redis namespace 注册实例 ID 和可直达地址。Gateway 启动后立即异步读取成员列表，默认随后约每 5 秒刷新（±20% 抖动），`refresh_seconds` 范围 1–300。请求仅使用本地快照，不同步查 Redis。刷新失败保留上次快照；成功读取空列表则停止选路；首次尚无列表时受管请求返回 Unavailable。Gateway 仅使用 Store 的注册发现客户端，不读取或修改 Template/Environment 元数据。
+
+完整 Env scope（tenant/template/version/environment_id）按固定 SHA-256 Rendezvous Hash 排序实例。所有 Gateway 使用相同成员集合时选择相同实例，成员顺序不影响结果；静态模式用规范化地址作实例 ID。resolve、bypass、单 Env 查询和删除使用相同选择规则，generation 不参与选路。成员变更只重新分配受影响的 Env；短暂列表差异允许重复缓存，身份隔离仍由权威元数据和 generation 保证。只有连接失败且请求未发送时才尝试排名第二的实例，共用原 deadline，最多两个地址；响应超时或结果未知不自动重放。无单个 Env 的模板管理/列表请求仍轮询实例。
+
+注册发现与 Env 亲和用于独立 Activator 模式；嵌入式模式直接调用本进程 Activator，不注册成员、不做跨进程选路，也不保证相同 Env 总是落到同一个进程；多个 API Server 可能各自缓存同一 Env。注册发现不改变 Platform 的发现机制，也不增加 Env 生命周期控制器。独立模式全热解析为 **1 次 Gateway→Activator、0 次 Agent Redis、0 次 Sandbox API**；后台成员刷新与实例续租单独计费，不属于单次解析访问。
 
 inline 完整配置示例：
 
@@ -94,7 +122,15 @@ inline 另提供 `POST /api/agent/{id}/exec`、`POST .../files/upload`、`GET ..
 
 create 的真实 Sandbox ID 采用原 Frontend namespace/name UUIDv5 规则，重试和跨 Gateway 调用保持同一 ID。列表读取 Platform 目录首帧快照后关闭订阅，不新增 ADX 索引或常驻 watch；按认证租户筛选 Running 的 ADX 实例。详情由平台记录及匹配的预装 profile 组成，不返回内部 Execd 凭据；无法还原的旧字段不伪造。
 
-受管接口使用 `/api/agent/v2/templates/{name}/versions/{version}/environments/{id}`，GET/DELETE 对应查询和删除；Environment 由访问流量触发创建。`POST .../{id}/resolve` 接受 `{protocol, port?}`。HTTP/WS 通过下面的统一入口触发激活；共享转发使用真实 Sandbox ID。
+受管接口使用 `/api/agent/v2/templates/{name}/versions/{version}/environments/{id}`，GET/DELETE 对应查询和删除；Environment 由访问流量触发创建。`POST .../{id}/resolve` 接受 `{protocol, port?, bypasscache?}`；`bypasscache` 为布尔值，默认 false。true 强制当前 Activator 读取 Redis Environment 并查询 Sandbox，跳过 Env 成功绑定，不绕过不可变模板缓存、租户/service 校验或 generation 隔离。平台刷新失败、不就绪或请求被取消后，本次绑定不作为成功缓存保留；较早的在途响应不能覆盖更新的刷新结果。其他 Activator 的本地缓存不接收失效广播；普通热调用可能继续返回旧绑定，目标失效通过 Gateway 发送前 bypass 重试修正。重试固定原 generation，同名重建不会使原请求切换到新环境。
+
+例如强制刷新 HTTP 目标：
+
+```json
+{"protocol": "http", "port": 8080, "bypasscache": true}
+```
+
+该参数仅属于 resolve 的 JSON 请求和内部激活请求，不作为 `/agent/http`、`/agent/ws` 的路由 query 参数。HTTP/WS 在业务请求尚未发送时的既有一次目标重试自动携带 bypasscache=true；不会重放结果未知的业务请求。HTTP/WS 通过下面的统一入口触发激活；共享转发使用真实 Sandbox ID。
 
 `GET /api/agent/v2/templates/{name}/versions/{version}/environments` 返回 `environments` 和 `next_page_token`。可传 `page_size`（默认 50，范围 1–100）和 `page_token`；token 绑定认证租户、模板与版本。列表仅返回产品元数据，包含删除中的记录，不查询平台健康状态；并发创建/删除期间不保证分页快照。模板不存在时返回 404。
 
@@ -161,9 +197,19 @@ Template 的 service 声明 HTTP/WS/SSH 协议及端口，例如 `[{"protocol":"
 
 ## 验证
 
+缓存改动接入上游 `9d75a6c` 后，`make agent-test JOBS=2` 为 163 项通过、11 项默认忽略，API Server lib 测试 18 项通过；两者合计 181 项通过。新增 LocalControl 回归先确认 bypass 被忽略会失败，再验证透传后热命中、强制回源失败失效及恢复通过；这 3 项 local 测试已包含在 Agent 总数中。`make rust-check JOBS=2` 的格式、全 workspace 严格 Clippy 和既定 unwrap 检查全部通过。独立模式保留 Env 亲和，内嵌模式仅本地调用，没有 Env 稳定选路。日志在本地 `out/env-cache-pr-validation/`；集成后未重新执行真实 Platform 端到端或性能压测，以下数据保留原始构建边界。
+
+2026-09-24，缓存与 Env 亲和路由改动通过 `make agent-test JOBS=2`（160 项通过、11 项默认忽略）及 `make rust-check JOBS=2`（全 workspace 格式、all-targets/all-features 严格 Clippy 和 unwrap 策略检查）。另行使用一次性 Redis 执行 9 项去重专项用例，覆盖 Store 条件写/重连、注册租约过期与 incarnation 隔离、Gateway 发现变化/失败保留快照，以及心跳续租/退出注销，全部通过。全热零 Redis/零 Sandbox API、Gateway 单次 Activator RPC、滑动 TTL、LRU、bypass 与 generation 隔离由组件测试验证。该阶段完整日志保存在本地 `out/env-affinity-validation/`。默认容量随后调整为 200000，5 小时滑动 TTL 不变；8 项缓存聚焦用例通过，真实 LRU 的 20 万条样例 RSS 增量约 167.1 MiB，测量口径见 Activator 文档。
+
+同日在接入上游 `9d75a6c` 前，基于 `4d822f6` 加缓存改动的 release 构建完成真实 Platform 端到端验证：一轮 16/16 项通过；重复一轮 12/16 项通过，4 项受同一个 Sandbox 冷启动终态 Failed 影响。两轮缓存专项均 5/5 通过：热 resolve 的 Sandbox/Redis 元数据访问为零，bypass 每次 1 次 Sandbox GET 和 2 次 Env 读取，同名重建固定 generation，以及 Activator 故障切换/租约过期/重新加入均符合契约。现场再次观察到 Harness HTTP 200 而 Execd 控制端点超时，冷启动可靠性不能按全通过报告，边界见 [平台缺口](PLATFORM_GAPS.md)。证据在本地 `out/env-cache-baseline-20260924/`；这是单节点真实容器验证，不是多机或 Kubernetes 集群验收。文档检查仍有两处既有 `agentostesting/810` 报告的 JSON 示例错误，新配置示例及文档链接通过检查。
+
+同一 release 构建的稳态负载基线使用单节点 4 CPU/6 GiB、独立负载端 2 CPU/2 GiB、8 个真实 Env、两个 Activator。10 个阶段均零错误：32 并发热 resolve 约 31283 次/秒、p95 1.34 ms；同并发 bypass 约 4434 次/秒、p95 23.03 ms。128 并发热 resolve 两次约 30252/30315 次/秒，512 并发约 28292 次/秒、p95 41.09 ms。1024 条 WebSocket 全部建立，10 Hz/连接的 echo 负载约 9891 消息/秒、p95 18.85 ms。热路径的 Sandbox API 调用均为零。32 并发 HTTP 短连接约 1410 次/秒，但负载端已接近 2 核上限；所有数字是此配置基线，不是集群极限，未覆盖 20 万活跃 Env 或长期淘汰压力。原始数据及完整口径在本地 `out/env-cache-baseline-20260924/report.md` 和 `real4/performance.json`。容量调整后的 `make rust-check JOBS=2` 也已通过。
+
+同日新 Env 创建补测（镜像已缓存，并发 2）为 4/8 最终成功、4/8 Platform 启动超时；首响应 7 次 503、1 次 502，成功就绪耗时 2.922–118.884 秒，8 个 Env 最终删除均成功。补测已把夹具的 sandboxd 实例上限从 8 调为 32，排除了此前被 8 个预热 Env 占满的配置限制；本轮仍有真实启动超时，不能按冷启动可靠性通过报告。补测前 8 个预热候选中另有 3 个启动失败，全部失败证据保留。测试容器/网络已清理，补测清理错误为零。
+
 合并上游 `e295f89` 后，Activator、Agent API、CLI、Agent core、Gateway 与 API Server 的聚焦测试共 199 项通过、2 项默认忽略；另行执行原生 OpenSSH 用例并通过，验证终端 ID/URN 输出和退出码。CLI 参数测试覆盖 OpenSSH 的固定 `ControlMaster` 选项。全 workspace 格式与全 targets/features 严格 Clippy 通过，提交文档检查通过。这轮为组件与原生客户端 socket 验证，未重跑完整 Platform 端到端或真实 Redis 专项；完整日志在本地 `out/pr27-rebase-20260923/`。
 
-2026-09-23，合并上游组件命名调整前的 `3141e27` 完成以下验证：Agent API、Activator、CLI、Agent core 与 Gateway 聚焦测试 167 项通过、2 项忽略；workspace 格式及全 targets/features 严格 Clippy 通过。双独立 Activator 与真实 Redis 的集成覆盖包含在下述端到端验证中。拟提交文档及补丁检查通过；工作区文档检查另报告两处用户自验报告中的非标准 JSON 示例，这些报告不在提交范围内。生产依赖检查确认 Agent API 仅通过 HTTP 客户端调用 Activator，Activator/Store 只作为该 crate 的测试依赖。
+2026-09-23，合并上游组件命名调整前的 `3141e27` 完成以下验证：Agent API、Activator、CLI、Agent core 与 Gateway 聚焦测试 167 项通过、2 项忽略；workspace 格式及全 targets/features 严格 Clippy 通过。双独立 Activator 与真实 Redis 的集成覆盖包含在下述端到端验证中。拟提交文档及补丁检查通过；工作区文档检查另报告两处用户自验报告中的非标准 JSON 示例，这些报告不在提交范围内。当时的生产依赖检查确认 Agent API 仅通过 HTTP 客户端调用 Activator；当前新增 Store 的注册发现客户端依赖，元数据访问仍在 Activator。
 
 上述提交的真实容器验证使用两个 Gateway Edge（现名 Ingress）、两个独立 Activator 进程和真实 Redis/Platform/RRT，两个 Activator 的 readiness 均为 204。19 项端到端检查全部通过，覆盖模板与 Environment 管理、自动 ID 回传、跨 Gateway 身份复用、HTTP/WS/SSH、Rust HTTP/SSH CLI、租户隔离，以及 inline create/get/list/kill、exec、mkdir、上传提交、下载 Range 和文件列表。
 
