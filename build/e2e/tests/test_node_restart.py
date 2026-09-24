@@ -1,6 +1,7 @@
 import importlib.util
 import json
 from pathlib import Path
+import signal
 import sys
 import tempfile
 import unittest
@@ -22,6 +23,7 @@ class SandboxdRestartTests(unittest.TestCase):
 
             def terminate(pid, signum):
                 self.assertEqual(pid, 101)
+                self.assertEqual(signum, signal.SIGKILL)
                 (root / 'sandboxd.pid').write_text('202')
 
             with mock.patch.object(node, 'P', root), mock.patch.object(node, 'E', root), \
@@ -42,6 +44,7 @@ class SandboxdRestartTests(unittest.TestCase):
             (root / 'sandboxd.pid').write_text('101')
 
             def terminate(pid, signum):
+                self.assertEqual(signum, signal.SIGKILL)
                 (root / 'sandboxd.pid').write_text('202')
 
             with mock.patch.object(node, 'P', root), mock.patch.object(node, 'E', root), \

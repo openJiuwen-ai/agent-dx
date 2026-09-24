@@ -159,7 +159,7 @@ def main():
         previous_pid=int((P/'sandboxd.pid').read_text())
         marker=P/'restart-sandboxd-request'
         marker.touch()
-        os.kill(previous_pid,signal.SIGTERM)
+        os.kill(previous_pid,signal.SIGKILL)
         deadline=time.monotonic()+65
         last_after=None
         while True:
