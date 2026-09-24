@@ -22,6 +22,19 @@ def backend():
     lines=command(['sbox','-a',P/'sandboxd/sandboxd.sock','list']).splitlines()
     return sorted(line.split()[0] for line in lines[1:] if line.strip())
 def supervisor(action):return json.loads(command([A/'package/bin/adxctl',action,'--config',P/'deployment.yaml']))
+def persisted_ownership(records,ids):
+    ownership={}
+    for sid in ids:
+        record=json.loads(records['environment:'+sid])
+        result=record['result']
+        assert result['state']=='Running' and result['resources_held'],sid
+        assignment=record['assignment']
+        ownership[sid]={'node_id':assignment['node_id'],'generation':assignment['generation']}
+    return ownership
+def redis_info():
+    env={**os.environ,'REDISCLI_AUTH':(S/'redis-key').read_text().strip()}
+    lines=subprocess.check_output(['redis-cli','--raw','INFO','persistence'],env=env,text=True,timeout=5).splitlines()
+    return dict(line.split(':',1) for line in lines if ':' in line)
 def collect(node):
     dest=E/f'logs-{node}';dest.mkdir(exist_ok=True)
     secrets=[p.read_bytes().strip() for p in S.glob('*key') if p.is_file()]
@@ -154,6 +167,35 @@ def main():
         (E/f'backend-before-{node}.json').write_text(json.dumps(before))
         current=supervisor('status');manager=[s for s in current['services'] if s['role']=='adxlet'];assert len(manager)==1 and manager[0]['pid']
         os.kill(manager[0]['pid'],signal.SIGKILL)
+    elif action=='capture-backend':
+        before=backend();assert len(before)==1
+        (E/f'backend-before-{node}.json').write_text(json.dumps(before))
+    elif action=='redis-restart':
+        ids=json.loads((E/'live-instances.json').read_text())
+        before=persisted_ownership(catalog(),ids)
+        assert redis_info().get('aof_enabled','').strip()=='1','Redis AOF is not enabled'
+        services=[s for s in supervisor('status')['services'] if s['role']=='redis']
+        assert len(services)==1 and services[0]['pid'],'supervised Redis is unavailable'
+        previous_pid=services[0]['pid']
+        os.kill(previous_pid,signal.SIGKILL)
+        deadline=time.monotonic()+60
+        while True:
+            try:
+                services=[s for s in supervisor('status')['services'] if s['role']=='redis']
+                current_pid=services[0]['pid']
+                if current_pid and current_pid!=previous_pid:
+                    after=persisted_ownership(catalog(),ids)
+                    assert after==before,(before,after)
+                    assert redis_info().get('aof_enabled','').strip()=='1'
+                    (E/'redis-restart.json').write_text(json.dumps({
+                        'previous_pid':previous_pid,'pid':current_pid,
+                        'ownership_before':before,'ownership_after':after,
+                        'aof_enabled':True,
+                    },indent=2))
+                    break
+            except (OSError,subprocess.SubprocessError,IndexError,KeyError,ValueError):pass
+            if time.monotonic()>deadline:raise TimeoutError('AOF Redis restart did not preserve instance ownership')
+            time.sleep(.2)
     elif action=='restart-sandboxd':
         before=backend();assert len(before)==1
         previous_pid=int((P/'sandboxd.pid').read_text())

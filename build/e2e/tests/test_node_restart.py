@@ -15,6 +15,16 @@ spec.loader.exec_module(node)
 
 
 class SandboxdRestartTests(unittest.TestCase):
+    def test_redis_recovery_evidence_requires_running_held_ownership(self):
+        record={'result':{'state':'Running','resources_held':True},
+                'assignment':{'node_id':'node2','generation':7}}
+        records={'environment:env-1':json.dumps(record)}
+        self.assertEqual(node.persisted_ownership(records,['env-1']),
+                         {'env-1':{'node_id':'node2','generation':7}})
+        record['result']['resources_held']=False
+        with self.assertRaises(AssertionError):
+            node.persisted_ownership({'environment:env-1':json.dumps(record)},['env-1'])
+
     def test_backend_identity_can_converge_after_daemon_becomes_ready(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
