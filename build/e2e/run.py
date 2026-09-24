@@ -18,7 +18,7 @@ import xml.etree.ElementTree as ET
 
 BASIC = ('sdk','auth','capacity','placement','local-first')
 STANDARD = ('sdk','data-plane','lifecycle','auth','capacity','placement','local-first','node-failure','sandboxd-restart','restart','stop')
-OPTIONAL_CASES = ('redis-restart','coordinator-restart','apiserver-restart','ingress-restart','runtime-affinity','idle-active','relay-standalone','runtime-exit')
+OPTIONAL_CASES = ('redis-restart','coordinator-restart','apiserver-restart','ingress-restart','runtime-affinity','idle-active','relay-standalone','runtime-exit','sqlite-fallback')
 PROFILES = {
     'l0': ('l0','auth'),
     'standalone': STANDARD,
@@ -46,6 +46,8 @@ def setup_environment(selected_case):
         return ('ADX_E2E_INGRESS_MODE=standalone',)
     if selected_case == 'relay-standalone':
         return ('ADX_E2E_RELAY_MODE=standalone',)
+    if selected_case == 'sqlite-fallback':
+        return ('ADX_E2E_SQLITE_FALLBACK=1',)
     return ()
 
 def sha(path):
@@ -333,6 +335,20 @@ class Run:
             with self.case('runtime-exit', checks) as record:
                 output=self.execute('node1','/opt/adx/client/bin/python','-u',
                                     '/opt/adx/e2e/scenarios.py','runtime-exit',timeout=360)
+                record['subcases']=sdk_subcases_from_output(output)
+                for node in self.nodes:self.helper(node,'empty',node)
+        if 'sqlite-fallback' in selected:
+            with self.case('sqlite-fallback', checks) as record:
+                self.execute('node1','/opt/adx/client/bin/python','-u',
+                             '/opt/adx/e2e/scenarios.py','sqlite-create',timeout=300)
+                self.helper('node1','coordinator-suspend',timeout=15)
+                try:
+                    self.helper('node1','sqlite-journaled',timeout=65)
+                finally:
+                    self.helper('node1','coordinator-resume',timeout=15)
+                self.helper('node1','sqlite-reconciled',timeout=90)
+                output=self.execute('node1','/opt/adx/client/bin/python','-u',
+                                    '/opt/adx/e2e/scenarios.py','sqlite-verify',timeout=90)
                 record['subcases']=sdk_subcases_from_output(output)
                 for node in self.nodes:self.helper(node,'empty',node)
         if 'local-first' in selected:

@@ -59,6 +59,14 @@ elif sys.argv[1]=='runtime-exit':
     result=E/'runtime-exit-result.json'
     run(connection,image,result)
     print(json.dumps(json.loads(result.read_text())),flush=True)
+elif sys.argv[1]=='sqlite-create':
+    from sqlite_fallback import create
+    create(connection,image,E/'sqlite-live.json')
+    print('Created retained and idle instances before Coordinator suspension',flush=True)
+elif sys.argv[1]=='sqlite-verify':
+    from sqlite_fallback import verify
+    report=verify(connection,E,E/'sqlite-fallback-result.json')
+    print(json.dumps(report),flush=True)
 elif sys.argv[1]=='auth':
     from adx_sandbox import PermissionDenied, SandboxError
     s=Sandbox(image=image,runtime='runc',cpu=500,memory=512,idle_timeout=0,connection=connection,create_timeout=150)

@@ -159,6 +159,14 @@ Local Docker reproduction requires access to the same bind-mounted paths as the 
   Check the persisted assignment, retry count, physical backend inventory,
   public SDK command access and final cleanup. Select with
   `--profile full --case runtime-exit`.
+- `sqlite-fallback` (targeted Coordinator outage case): enable the adxlet
+  degradation journal only for this fixture, create a retained and an idle
+  Sandbox, then suspend Coordinator while managed Redis remains available.
+  Require the idle backend to be deleted with a durable SQLite pending record
+  while Redis still has the old Running result. Resume Coordinator before the
+  extended heartbeat deadline; require journal replay, Redis Deleted state,
+  an empty pending table and the retained Sandbox serving a new SDK command
+  with its original backend. Select with `--profile full --case sqlite-fallback`.
 - `stop`: independently create a live instance pinned to each node, verify both
   backend inventories are occupied and exercise each forwarded port. A separate
   instance on each node is deleted to emit the required lifecycle log and trace. It also

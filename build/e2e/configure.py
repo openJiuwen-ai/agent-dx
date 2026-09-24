@@ -103,10 +103,15 @@ def add(service_id, role, config=None, env=None):
   'config': {} if config is None else config,
   'env': {} if env is None else env,
  })
+journal_flag=os.getenv('ADX_E2E_SQLITE_FALLBACK','0')
+if journal_flag not in ('0','1'):raise ValueError('invalid E2E SQLite fallback mode')
+use_journal=journal_flag=='1'
 if node=='node1':
  (P/'redis').mkdir(exist_ok=True)
  add('redis','redis',{'bind':'0.0.0.0','port':6379,'data_dir':str(P/'redis'),'appendfsync':'always','password_file':str(redis_key)})
- add('coordinator','coordinator',{'listen':'0.0.0.0:17000','metrics_listen':'127.0.0.1:17090','advertised_address':'https://coordinator:17000','scheduler_shards':1,'placement':'spread','rpc_timeout_seconds':120,'tls':tls('coordinator',{'apiserver':'apiserver','ingress':'ingress','node:node1':'node','node:node2':'node2'}),'bootstrap_credentials':[{'key_file':str(admin),'tenant_id':'admin','administrator':True,'expires_at_unix_seconds':0},{'key_file':str(key),'tenant_id':'e2e','administrator':False,'expires_at_unix_seconds':0},{'key_file':str(other),'tenant_id':'e2e-other','administrator':False,'expires_at_unix_seconds':0}]})
+ coordinator_config={'listen':'0.0.0.0:17000','metrics_listen':'127.0.0.1:17090','advertised_address':'https://coordinator:17000','scheduler_shards':1,'placement':'spread','rpc_timeout_seconds':120,'tls':tls('coordinator',{'apiserver':'apiserver','ingress':'ingress','node:node1':'node','node:node2':'node2'}),'bootstrap_credentials':[{'key_file':str(admin),'tenant_id':'admin','administrator':True,'expires_at_unix_seconds':0},{'key_file':str(key),'tenant_id':'e2e','administrator':False,'expires_at_unix_seconds':0},{'key_file':str(other),'tenant_id':'e2e-other','administrator':False,'expires_at_unix_seconds':0}]}
+ if use_journal:coordinator_config['heartbeat_timeout_seconds']=90
+ add('coordinator','coordinator',coordinator_config)
 ingress_peer=os.getenv('ADX_E2E_INGRESS_IP')
 ingress_cidrs=(ingress_peer+('/128' if ':' in ingress_peer else '/32')+',127.0.0.1/32') if ingress_peer else '172.16.0.0/12,127.0.0.1/32'
 common={'ADX_DATA_PLANE_INGRESS_NODE_SECURITY_MODE':'mtls','RUST_LOG':'info','ADX_LOG_FORMAT':'json'}
@@ -115,7 +120,11 @@ host=os.getenv('ADX_E2E_NODE_IP') or ('coordinator' if node=='node1' else 'node2
 if ':' in host: host='['+host+']'
 relay_mode=os.getenv('ADX_E2E_RELAY_MODE','embedded')
 if relay_mode not in ('embedded','standalone'):raise ValueError('invalid E2E Relay mode')
-add(node,'adxlet',{'node_id':node,'listen':'0.0.0.0:17001','metrics_listen':'0.0.0.0:17091','advertised_address':f'{host}:17001','proxy_address':f'{host}:18443','proxy_mode':relay_mode,'tls':tls('node' if node=='node1' else 'node2',{'coordinator':'coordinator','apiserver':'apiserver'}),'sandboxd_socket':str(R/'sandboxd.sock'),'proxy_socket':str(P/'proxy/route.sock'),'capacity_file':str(P/'capacity.json'),'report_interval_seconds':2,'rpc_timeout_seconds':120,'execd_port':50090,'execd_command':['/usr/local/bin/adx-execd'],'execd_env':{'ADX_TRACE_ENABLED':'true','OTEL_EXPORTER_OTLP_TRACES_ENDPOINT':f'http://{socket.gethostbyname(host)}:14317/v1/traces','OTEL_BSP_SCHEDULE_DELAY':'200'}},np)
+node_config={'node_id':node,'listen':'0.0.0.0:17001','metrics_listen':'0.0.0.0:17091','advertised_address':f'{host}:17001','proxy_address':f'{host}:18443','proxy_mode':relay_mode,'tls':tls('node' if node=='node1' else 'node2',{'coordinator':'coordinator','apiserver':'apiserver'}),'sandboxd_socket':str(R/'sandboxd.sock'),'proxy_socket':str(P/'proxy/route.sock'),'capacity_file':str(P/'capacity.json'),'report_interval_seconds':2,'rpc_timeout_seconds':120,'execd_port':50090,'execd_command':['/usr/local/bin/adx-execd'],'execd_env':{'ADX_TRACE_ENABLED':'true','OTEL_EXPORTER_OTLP_TRACES_ENDPOINT':f'http://{socket.gethostbyname(host)}:14317/v1/traces','OTEL_BSP_SCHEDULE_DELAY':'200'}}
+if use_journal:
+ node_config['degradation_journal']=str(P/'degraded/results.sqlite')
+ node_config['rpc_timeout_seconds']=30
+add(node,'adxlet',node_config,np)
 if relay_mode=='standalone':add('relay','relay',{},np)
 if node=='node1':
  ingress_mode=os.getenv('ADX_E2E_INGRESS_MODE','embedded')

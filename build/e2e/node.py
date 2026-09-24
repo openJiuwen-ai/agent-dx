@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 import time
@@ -21,6 +22,15 @@ def nodes():
 def backend():
     lines=command(['sbox','-a',P/'sandboxd/sandboxd.sock','list']).splitlines()
     return sorted(line.split()[0] for line in lines[1:] if line.strip())
+def labeled_backend(instance_id):
+    lines=command(['sbox','-a',P/'sandboxd/sandboxd.sock','list',
+                   '--label','adx.environment_id='+instance_id]).splitlines()
+    return sorted(line.split()[0] for line in lines[1:] if line.strip())
+def journal_pending():
+    path=P/'degraded/results.sqlite'
+    if not path.is_file():return None
+    with sqlite3.connect('file:'+str(path)+'?mode=ro',uri=True,timeout=2) as db:
+        return [json.loads(payload) for (payload,) in db.execute('SELECT payload FROM pending ORDER BY sequence')]
 def supervisor(action):return json.loads(command([A/'package/bin/adxctl',action,'--config',P/'deployment.yaml']))
 def persisted_ownership(records,ids):
     ownership={}
@@ -128,6 +138,84 @@ def main():
                   'relay_pid':relay[0]['pid'],'relay_binary':str(binary)}
         (E/f'relay-separate-{node}.json').write_text(json.dumps(evidence,indent=2))
         print('PASS standalone Relay: '+node,flush=True)
+    elif action=='coordinator-suspend':
+        marker=P/'frozen-coordinator.pid'
+        assert not marker.exists(),'Coordinator already suspended'
+        services=[s for s in supervisor('status')['services'] if s['role']=='coordinator']
+        assert len(services)==1 and services[0]['pid'],services
+        pid=services[0]['pid'];marker.write_text(str(pid))
+        os.kill(pid,signal.SIGSTOP)
+        print('Coordinator suspended while managed Redis remains available',flush=True)
+    elif action=='coordinator-resume':
+        marker=P/'frozen-coordinator.pid'
+        assert marker.is_file(),'Coordinator suspension marker missing'
+        os.kill(int(marker.read_text()),signal.SIGCONT)
+        marker.unlink()
+        print('Coordinator resumed for journal reconciliation',flush=True)
+    elif action=='sqlite-journaled':
+        live=json.loads((E/'sqlite-live.json').read_text())
+        started=time.monotonic()
+        deadline=time.monotonic()+55
+        last=None
+        while True:
+            try:
+                pending=journal_pending()
+                local=next((r for r in pending or [] if r['spec']['id']==live['idle_id']
+                            and r['state']=='Deleted'),None)
+                records=catalog()
+                idle=json.loads(records['environment:'+live['idle_id']])['result']
+                keep=json.loads(records['environment:'+live['keep_id']])['result']
+                keep_backend=labeled_backend(live['keep_id'])
+                idle_backend=labeled_backend(live['idle_id'])
+                if local and idle['state']=='Running' and keep['state']=='Running' \
+                        and len(keep_backend)==1 and not idle_backend:
+                    evidence={'idle_id':live['idle_id'],'keep_id':live['keep_id'],
+                              'journal_state':local['state'],'redis_idle_state':idle['state'],
+                              'keep_runtime_id':keep['runtime_id'],
+                              'keep_backend':keep_backend[0],'idle_backend':idle_backend,
+                              'pending_records':len(pending),
+                              'seconds':round(time.monotonic()-started,3)}
+                    (E/'sqlite-journaled.json').write_text(json.dumps(evidence,indent=2))
+                    print('PASS local SQLite journaled idle deletion during Coordinator outage',flush=True)
+                    break
+                last={'pending':len(pending or []),'idle':idle['state'],'keep':keep['state'],
+                      'keep_backend':keep_backend,'idle_backend':idle_backend}
+            except (OSError,sqlite3.Error,KeyError,ValueError,subprocess.SubprocessError) as error:
+                last=str(error)
+            if time.monotonic()>deadline:raise TimeoutError(f'SQLite fallback missing: {last}')
+            time.sleep(.5)
+    elif action=='sqlite-reconciled':
+        before=json.loads((E/'sqlite-journaled.json').read_text())
+        started=time.monotonic()
+        deadline=time.monotonic()+85
+        last=None
+        while True:
+            try:
+                pending=journal_pending()
+                records=catalog()
+                idle=json.loads(records['environment:'+before['idle_id']])['result']
+                keep=json.loads(records['environment:'+before['keep_id']])['result']
+                session=json.loads(records['node:node1'])['session']
+                keep_backend=labeled_backend(before['keep_id'])
+                idle_backend=labeled_backend(before['idle_id'])
+                if pending==[] and idle['state']=='Deleted' and not idle['resources_held'] \
+                        and keep['state']=='Running' and keep['runtime_id']==before['keep_runtime_id'] \
+                        and keep_backend==[before['keep_backend']] and not idle_backend \
+                        and session['routable']:
+                    evidence={'idle_state':idle['state'],'idle_resources_held':False,
+                              'keep_runtime_id':keep['runtime_id'],'keep_backend':keep_backend,
+                              'pending_records':0,'node_routable':True,
+                              'seconds':round(time.monotonic()-started,3)}
+                    (E/'sqlite-reconciled.json').write_text(json.dumps(evidence,indent=2))
+                    print('PASS SQLite journal replay and retained backend after recovery',flush=True)
+                    break
+                last={'pending':None if pending is None else len(pending),'idle':idle['state'],
+                      'keep':keep['state'],'session':session.get('routable'),
+                      'keep_backend':keep_backend,'idle_backend':idle_backend}
+            except (OSError,sqlite3.Error,KeyError,ValueError,subprocess.SubprocessError) as error:
+                last=str(error)
+            if time.monotonic()>deadline:raise TimeoutError(f'SQLite replay missing: {last}')
+            time.sleep(.5)
     elif action=='postcheck':
         result_name=node or 'sdk'
         c=catalog();r=json.loads((E/result_name/'sdk-result.json').read_text());assert r['status']=='passed'
@@ -332,6 +420,11 @@ def main():
         (E/f'backend-occupied-{node}.json').write_text(json.dumps(current))
     elif action in ('stop','cleanup'):
         stop_errors=[]
+        marker=P/'frozen-coordinator.pid'
+        if marker.exists():
+            try:os.kill(int(marker.read_text()),signal.SIGCONT)
+            except ProcessLookupError:pass
+            marker.unlink()
         if action=='stop':
             try:subprocess.run(['python3',str(H/'telemetry.py'),'metrics',node],check=True)
             except (AssertionError,subprocess.CalledProcessError) as error:stop_errors.append(str(error))
