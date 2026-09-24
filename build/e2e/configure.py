@@ -120,7 +120,7 @@ if node=='node1':
  add('ingress','ingress',{'tls':tls('ingress',{'coordinator':'coordinator'}),'rpc_timeout_seconds':5,'refresh_seconds':1,'auth_cache_seconds':10,'auth_cache_entries':1000},ee)
 for service in services:
  service.setdefault('env',{}).update({'ADX_LOG_FORMAT':'json','ADX_TRACE_ENABLED':'true','OTEL_EXPORTER_OTLP_TRACES_ENDPOINT':'http://127.0.0.1:14317/v1/traces','OTEL_BSP_SCHEDULE_DELAY':'200'})
-d={'schema_version':1,'logging':{'enabled':True,'max_file_bytes':4096,'rotate_seconds':1,'compress':True,'line_records':True,'max_record_bytes':65536,'compress_after_seconds':15,'max_files':100,'max_age_seconds':3600,'max_total_bytes':1048576},'package_dir':str(BASE/'package'),'state_dir':str(P/'state'),'redis_url':f'redis://:{redis_key.read_text().strip()}@coordinator:6379/','namespace':'acceptance','restart_limit':3,'restart_delay_ms':1000,'stop_timeout_seconds':30,'services':services}
+d={'schema_version':1,'logging':{'enabled':True,'max_file_bytes':4096,'rotate_seconds':1,'compress':True,'line_records':True,'max_record_bytes':65536,'compress_after_seconds':1,'max_files':100,'max_age_seconds':3600,'max_total_bytes':1048576},'package_dir':str(BASE/'package'),'state_dir':str(P/'state'),'redis_url':f'redis://:{redis_key.read_text().strip()}@coordinator:6379/','namespace':'acceptance','restart_limit':3,'restart_delay_ms':1000,'stop_timeout_seconds':30,'services':services}
 runtime_artifact=BASE/'package/runtime/adx-runtime-rootfs.img'
 runtime_image=PRIVATE/'runtime-image'
 if os.getenv('ADX_E2E_KUBERNETES'):
