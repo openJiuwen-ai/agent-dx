@@ -63,6 +63,29 @@ class KubernetesLifecycleTests(unittest.TestCase):
         spec=importlib.util.spec_from_file_location('k8s_run',ROOT/'kubernetes/run.py')
         cls.module=importlib.util.module_from_spec(spec);spec.loader.exec_module(cls.module)
 
+    def test_sdk_result_is_read_from_pod_before_evidence_copy(self):
+        import json,tempfile
+        with tempfile.TemporaryDirectory() as d:
+            run=self.module.KubernetesRun(Path(d),Path('/fixture/kubeconfig'))
+            run.nodes=['node1','node2']
+            calls=[]
+            def execute(node,*args,**kwargs):
+                calls.append((node,args))
+                if args[-1]=='/evidence/sdk/sdk-result.json':
+                    return json.dumps({'instances':['capsule-1']})
+                if '/opt/adx/e2e/runtime_logs.py' in args:
+                    return json.dumps({'runtime_ids':['capsule-1-backend']})
+                if 'sdk' in args:
+                    return json.dumps({'cases':[{'id':'sandbox.create-query-two-nodes','status':'passed','seconds':0}]})
+                return ''
+            run.execute=execute
+            run.helper=lambda *args,**kwargs: ''
+            checks=[]
+            run.scenarios(checks,('sdk',))
+            self.assertEqual(checks,['sdk'])
+            self.assertIn(('node1',('cat','/evidence/sdk/sdk-result.json')),calls)
+            self.assertFalse((Path(d)/'sdk/sdk-result.json').exists())
+
     def test_cleanup_never_deletes_replaced_namespace(self):
         import json,tempfile
         with tempfile.TemporaryDirectory() as d:

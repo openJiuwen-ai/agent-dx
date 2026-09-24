@@ -202,6 +202,8 @@ class Run:
     def docker(self,*args,timeout=180):return self.command(['docker',*args],timeout)
     def execute(self,node,*args,timeout=180):return self.docker('exec',self.id+'-'+node,*args,timeout=timeout)
     def helper(self,node,*args,timeout=180):return self.execute(node,'python3','-u','/opt/adx/e2e/node.py',*args,timeout=timeout)
+    def sdk_instances(self):
+        return json.loads((self.output/'sdk/sdk-result.json').read_text())['instances']
     def cleanup(self):
         errors=[]
         for node in reversed(self.nodes):
@@ -255,7 +257,7 @@ class Run:
                 for node in self.nodes:self.execute(node,'python3','/opt/adx/e2e/telemetry.py','outage-start',node)
                 output=self.execute('node1','/opt/adx/client/bin/python','-u','/opt/adx/e2e/scenarios.py','sdk',timeout=600)
                 record['subcases']=sdk_subcases_from_output(output)
-                instances=json.loads((self.output/'sdk/sdk-result.json').read_text())['instances']
+                instances=self.sdk_instances()
                 runtime_ids=set()
                 for node in self.nodes:
                     observed=json.loads(self.execute(node,'python3','/opt/adx/e2e/runtime_logs.py',*instances))

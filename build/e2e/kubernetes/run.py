@@ -127,6 +127,9 @@ class KubernetesRun(common.Run):
     def execute(self, node, *args, timeout=180):
         return self.kube('-n', self.id, 'exec', node, '-c', 'platform', '--', *args, timeout=timeout)
 
+    def sdk_instances(self):
+        return json.loads(self.execute('node1', 'cat', '/evidence/sdk/sdk-result.json'))['instances']
+
     def sync_harness(self, commit, product_commit=None):
         with tempfile.TemporaryDirectory(prefix='adx-e2e-harness-') as directory:
             harness = Path(directory) / 'e2e'
