@@ -47,4 +47,7 @@ if [[ -n ${ADX_E2E_NODE_NAMES:-} ]]; then
   IFS=',' read -r -a node_names <<< "$ADX_E2E_NODE_NAMES"
   for node in "${node_names[@]}"; do args+=(--node-name "$node"); done
 fi
+if [[ -n ${ADX_E2E_REDIS_STORAGE_CLASS:-} ]]; then
+  args+=(--redis-storage-class "$ADX_E2E_REDIS_STORAGE_CLASS")
+fi
 python3 -u build/e2e/kubernetes/run.py "${args[@]}"

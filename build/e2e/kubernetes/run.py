@@ -87,18 +87,31 @@ def credentials(directory, image, runtime_image):
         path = directory / name
         path.write_text(secrets.token_hex(32))
         path.chmod(0o600)
+    (directory / 'redis-acl').write_text(
+        'user default on >' + (directory / 'redis-key').read_text() + ' ~* &* +@all\n'
+    )
+    (directory / 'redis-acl').chmod(0o600)
     (directory / 'image').write_text(image)
     (directory / 'runtime-image').write_text(runtime_image)
     data = {p.name: base64.b64encode(p.read_bytes()).decode() for p in tls.iterdir()
             if p.suffix in ('.pem', '.key', '.der') and p.name != 'ca.key'}
     data.update({name: base64.b64encode((directory / name).read_bytes()).decode()
-                 for name in ('api-key', 'other-key', 'admin-key', 'redis-key', 'image', 'runtime-image')})
+                 for name in ('api-key', 'other-key', 'admin-key', 'redis-key', 'redis-acl',
+                              'image', 'runtime-image')})
     return data
+
+
+def selected_checks(profile, selected_case):
+    if selected_case == 'redis-pod-restart':
+        if profile != 'full':
+            raise ValueError('redis-pod-restart requires the full Kubernetes profile')
+        return ('redis-pod-restart',)
+    return common.selected_checks(profile, selected_case)
 
 
 class KubernetesRun(common.Run):
     def __init__(self, output, kubeconfig, context=None, profile="k8s-basic",
-                 selected_case=None):
+                 selected_case=None, redis_storage_class=None):
         super().__init__(output)
         self.kubectl = ['kubectl', '--kubeconfig', str(kubeconfig.resolve())]
         if context:
@@ -108,7 +121,9 @@ class KubernetesRun(common.Run):
         self.harness = None
         self.profile = profile
         self.selected_case = selected_case
-        self.stop_evidence = 'stop' in common.selected_checks(profile, selected_case)
+        self.redis_storage_class = redis_storage_class
+        self.redis_pod_manifest = None
+        self.stop_evidence = 'stop' in selected_checks(profile, selected_case)
 
     def kube(self, *args, timeout=180):
         return self.command([*self.kubectl, *args], timeout, stream=not any(
@@ -181,20 +196,25 @@ class KubernetesRun(common.Run):
             self.apply({'apiVersion': 'v1', 'kind': 'Secret', 'type': 'kubernetes.io/dockerconfigjson',
                         'metadata': {'name': 'adx-test-registry', 'namespace': self.id},
                         'data': {'.dockerconfigjson': base64.b64encode(registry_auth.read_bytes()).decode()}})
-        objects = resources(self.id, refs['node'], m['architecture'], registry_auth is not None, node_names)
+        objects = resources(self.id, refs['node'], m['architecture'], registry_auth is not None,
+                            node_names, self.redis_storage_class)
         # Public manifest contains Secret references, never Secret contents.
         (self.output / 'resources.json').write_text(json.dumps({'apiVersion': 'v1', 'kind': 'List', 'items': objects}, indent=2))
         for obj in objects:
             self.apply(obj)
-            if obj['kind'] == 'Pod':
+            if obj['kind'] == 'Pod' and obj['metadata']['name'] in ('node1', 'node2'):
                 self.nodes.append(obj['metadata']['name'])
+            if obj['kind'] == 'Pod' and obj['metadata']['name'] == 'redis':
+                self.redis_pod_manifest = obj
         self.kube('-n', self.id, 'get', 'pods', '-o', 'wide')
         self.event('[DEPLOY] Waiting for Pod readiness and image pulls')
         self.kube('-n', self.id, 'wait', 'pod', '--all', '--for=condition=Ready', '--timeout=300s', timeout=320)
         pods = json.loads(self.kube('-n', self.id, 'get', 'pods', '-o', 'json'))['items']
         placement = [{'pod': p['metadata']['name'], 'host': p['spec']['nodeName'],
                       'ip': p['status']['podIP']} for p in pods]
-        validate_physical_placement(placement, require_distinct_workers)
+        validate_physical_placement(
+            [item for item in placement if item['pod'] in self.nodes], require_distinct_workers,
+        )
         (self.output / 'placement.json').write_text(json.dumps(placement, indent=2) + '\n')
         print('Kubernetes placement: ' + json.dumps(placement), flush=True)
         ingress_pod = next(p for p in pods if p['metadata']['name'] == 'node1')
@@ -221,6 +241,54 @@ class KubernetesRun(common.Run):
         self.helper('node1', 'ready', timeout=150)
         self.event('[PASS] Kubernetes deployment and platform readiness')
         self.kube('-n', self.id, 'get', 'pods', '-o', 'wide')
+
+    def restart_redis_pod(self):
+        if self.redis_pod_manifest is None:
+            raise ValueError('persistent Redis Pod is not deployed')
+        old = json.loads(self.kube('-n', self.id, 'get', 'pod', 'redis', '-o', 'json'))
+        claim = json.loads(self.kube('-n', self.id, 'get', 'pvc', 'redis-data', '-o', 'json'))
+        pod_uid = old['metadata']['uid']
+        claim_uid = claim['metadata']['uid']
+        (self.output / 'redis-pod-before.log').write_text(
+            self.kube('-n', self.id, 'logs', 'redis', '-c', 'redis', timeout=20)
+        )
+        self.kube('-n', self.id, 'delete', 'pod', 'redis', '--wait=true',
+                  '--timeout=180s', timeout=200)
+        self.apply(self.redis_pod_manifest)
+        self.kube('-n', self.id, 'wait', 'pod/redis', '--for=condition=Ready',
+                  '--timeout=300s', timeout=320)
+        new = json.loads(self.kube('-n', self.id, 'get', 'pod', 'redis', '-o', 'json'))
+        retained = json.loads(self.kube('-n', self.id, 'get', 'pvc', 'redis-data', '-o', 'json'))
+        assert new['metadata']['uid'] != pod_uid, 'Redis Pod was not replaced'
+        assert retained['metadata']['uid'] == claim_uid, 'Redis PVC identity changed'
+        evidence = {'pod_before': pod_uid, 'pod_after': new['metadata']['uid'],
+                    'pvc_uid': claim_uid}
+        (self.output / 'redis-pod-identity.json').write_text(json.dumps(evidence, indent=2) + '\n')
+        return evidence
+
+    def scenarios(self, checks, required):
+        if required != ('redis-pod-restart',):
+            return super().scenarios(checks, required)
+        with self.case('redis-pod-restart', checks) as record:
+            self.event('Create live instances on both workers, replace only the Redis Pod, '
+                       'and verify PVC, ownership, backend identities and public SDK access')
+            self.execute('node1', '/opt/adx/client/bin/python', '-u',
+                         '/opt/adx/e2e/scenarios.py', 'create-marker', timeout=300)
+            for node in self.nodes:
+                self.helper(node, 'capture-backend', node)
+            self.helper('node1', 'redis-pod-before', timeout=20)
+            self.restart_redis_pod()
+            self.helper('node1', 'ready', timeout=150)
+            self.helper('node1', 'redis-pod-after', timeout=45)
+            for node in self.nodes:
+                self.helper(node, 'unchanged', node)
+            output = self.execute('node1', '/opt/adx/client/bin/python', '-u',
+                                  '/opt/adx/e2e/scenarios.py', 'recovered-marker', timeout=90)
+            record['subcases'] = common.sdk_subcases_from_output(output)
+            self.execute('node1', '/opt/adx/client/bin/python', '-u',
+                         '/opt/adx/e2e/scenarios.py', 'cleanup-live-redis', timeout=90)
+            for node in self.nodes:
+                self.helper(node, 'empty', node)
 
     def cleanup(self):
         print('--- Kubernetes cleanup', flush=True)
@@ -259,6 +327,13 @@ class KubernetesRun(common.Run):
                     self.kube('-n', self.id, 'cp', node + ':/evidence/.', str(self.output / node), '-c', 'platform', timeout=60)
                 except Exception as e:
                     errors.append(f'{node} diagnostics: {e}')
+            if self.redis_pod_manifest is not None:
+                try:
+                    (self.output / 'redis-pod-after.log').write_text(
+                        self.kube('-n', self.id, 'logs', 'redis', '-c', 'redis', timeout=20)
+                    )
+                except Exception as e:
+                    errors.append(f'redis diagnostics: {e}')
             self.kube('delete', 'namespace', self.id, '--wait=true', '--timeout=180s', timeout=200)
             if self.kube('get', 'namespace', self.id, '--ignore-not-found', '-o', 'name').strip():
                 raise RuntimeError('test namespace remains')
@@ -282,11 +357,19 @@ def main():
     p.add_argument('--registry-auth', type=Path)
     p.add_argument('--profile', choices=('l0','k8s-basic','full'), default='k8s-basic')
     p.add_argument('--case', help='run one case as a targeted diagnostic, not a Full gate')
+    p.add_argument('--redis-storage-class',
+                   help='StorageClass for the targeted Redis Pod/PVC recovery case')
     a = p.parse_args()
+    required=selected_checks(a.profile,a.case)
+    if a.case == 'redis-pod-restart' and not a.redis_storage_class:
+        p.error('--case redis-pod-restart requires --redis-storage-class')
+    if a.redis_storage_class and a.case != 'redis-pod-restart':
+        p.error('--redis-storage-class is only used by --case redis-pod-restart')
     output = a.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
-    checks = [];required=common.selected_checks(a.profile,a.case)
-    run = KubernetesRun(output, a.kubeconfig, a.context, a.profile, a.case)
+    checks = []
+    run = KubernetesRun(output, a.kubeconfig, a.context, a.profile, a.case,
+                        a.redis_storage_class if a.case == 'redis-pod-restart' else None)
     error = None
     def cancel(signum, frame):
         raise InterruptedError(f'canceled by signal {signum}')

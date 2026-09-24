@@ -57,6 +57,30 @@ class KubernetesDeploymentTests(unittest.TestCase):
         for namespace,image in [('default','registry.example/node@sha256:'+'a'*64),('adx-e2e-test','node:latest')]:
             with self.assertRaises(ValueError):k8s.resources(namespace,image,'amd64',False)
 
+    def test_persistent_redis_uses_dedicated_pod_and_pvc(self):
+        objects=k8s.resources('adx-e2e-test','registry.example/node@sha256:'+'a'*64,
+                              'amd64',redis_storage_class='fast-rwo')
+        by_kind_name={(o['kind'],o['metadata']['name']):o for o in objects}
+        claim=by_kind_name['PersistentVolumeClaim','redis-data']
+        self.assertEqual(claim['spec']['storageClassName'],'fast-rwo')
+        self.assertEqual(claim['spec']['accessModes'],['ReadWriteOnce'])
+        redis=by_kind_name['Pod','redis']
+        self.assertEqual(redis['spec']['volumes'][0]['persistentVolumeClaim']['claimName'],'redis-data')
+        self.assertEqual(redis['spec']['containers'][0]['command'],['/opt/adx/package/bin/redis-server'])
+        self.assertIn('/secrets/redis.acl',redis['spec']['containers'][0]['args'])
+        self.assertEqual(by_kind_name['Service','redis']['spec']['selector'],redis['metadata']['labels'])
+        nodes=[by_kind_name['Pod',name] for name in ('node1','node2')]
+        for pod in nodes:
+            env={entry['name']:entry['value'] for entry in pod['spec']['containers'][0]['env']
+                 if 'value' in entry}
+            self.assertEqual(env['ADX_E2E_REDIS_HOST'],'redis')
+            self.assertNotIn('redis-data',{v['name'] for v in pod['spec']['volumes']})
+
+    def test_persistent_redis_requires_valid_storage_class(self):
+        with self.assertRaisesRegex(ValueError,'storage class'):
+            k8s.resources('adx-e2e-test','registry.example/node@sha256:'+'a'*64,
+                          'amd64',redis_storage_class='not/valid')
+
 class KubernetesLifecycleTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -67,6 +91,66 @@ class KubernetesLifecycleTests(unittest.TestCase):
         runner=(ROOT/'kubernetes/run.py').read_text()
         self.assertIn("*common.setup_environment(self.selected_case)",runner)
         self.assertIn("self.selected_case = selected_case",runner)
+
+    def test_redis_pod_restart_recreates_only_redis_and_retains_claim(self):
+        import json,tempfile
+        with tempfile.TemporaryDirectory() as d:
+            run=self.module.KubernetesRun(Path(d),Path('/fixture/kubeconfig'),
+                                          profile='full',selected_case='redis-pod-restart')
+            run.redis_pod_manifest={'kind':'Pod','metadata':{'name':'redis','namespace':run.id}}
+            events=[]
+            def kube(*args,**kwargs):
+                events.append(args)
+                if args[-4:]==('get','pod','redis','-o'):
+                    raise AssertionError('unexpected query shape')
+                if args[2:5]==('get','pod','redis'):
+                    count=sum(call[2:5]==('get','pod','redis') for call in events)
+                    return json.dumps({'metadata':{'uid':'old' if count==1 else 'new'}})
+                if args[2:5]==('get','pvc','redis-data'):
+                    return json.dumps({'metadata':{'uid':'same-pvc'}})
+                return ''
+            run.kube=kube
+            run.apply=lambda obj:events.append(('apply',obj['kind'],obj['metadata']['name']))
+            result=run.restart_redis_pod()
+            self.assertEqual(result,{'pod_before':'old','pod_after':'new','pvc_uid':'same-pvc'})
+            self.assertIn(('apply','Pod','redis'),events)
+            self.assertTrue(any(call[2:5]==('delete','pod','redis') for call in events
+                                if len(call)>=5 and call[0]!='apply'))
+            self.assertFalse(any(call[2:5]==('delete','pod','node1') for call in events
+                                 if len(call)>=5 and call[0]!='apply'))
+
+    def test_redis_pod_case_checks_live_backend_and_public_sdk_after_replacement(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            run=self.module.KubernetesRun(Path(d),Path('/fixture/kubeconfig'),
+                                          profile='full',selected_case='redis-pod-restart')
+            run.nodes=['node1','node2']
+            events=[]
+            def execute(node,*args,**kwargs):
+                events.append(('execute',node,args[-1]))
+                if args[-1]=='recovered-marker':
+                    return '{"cases":[{"id":"sdk-route-restored","status":"passed"}]}'
+                return ''
+            run.execute=execute
+            run.helper=lambda node,*args,**kwargs:events.append(('helper',node,args[0]))
+            run.restart_redis_pod=lambda:events.append(('replace','redis'))
+            checks=[]
+            run.scenarios(checks,('redis-pod-restart',))
+            self.assertEqual(checks,['redis-pod-restart'])
+            self.assertEqual(run.case_results[0]['subcases'][0]['id'],'sdk-route-restored')
+            self.assertLess(events.index(('helper','node1','redis-pod-before')),
+                            events.index(('replace','redis')))
+            self.assertLess(events.index(('replace','redis')),
+                            events.index(('helper','node1','redis-pod-after')))
+            self.assertIn(('helper','node2','unchanged'),events)
+            self.assertIn(('execute','node1','recovered-marker'),events)
+            self.assertIn(('execute','node1','cleanup-live-redis'),events)
+
+    def test_redis_pod_case_is_kubernetes_full_only(self):
+        self.assertEqual(self.module.selected_checks('full','redis-pod-restart'),
+                         ('redis-pod-restart',))
+        with self.assertRaisesRegex(ValueError,'full Kubernetes'):
+            self.module.selected_checks('k8s-basic','redis-pod-restart')
 
     def test_sdk_result_is_read_from_pod_before_evidence_copy(self):
         import json,tempfile
@@ -296,6 +380,9 @@ class KubernetesLifecycleTests(unittest.TestCase):
             self.assertNotIn('ca.key',data)
             self.assertEqual(base64.b64decode(data['image']).decode(),'registry.example/user@sha256:'+'b'*64)
             self.assertEqual(base64.b64decode(data['runtime-image']).decode(),'registry.example/execd@sha256:'+'c'*64)
+            password=base64.b64decode(data['redis-key']).decode()
+            self.assertEqual(base64.b64decode(data['redis-acl']).decode(),
+                             f'user default on >{password} ~* &* +@all\n')
 
 class HostPrerequisiteTests(unittest.TestCase):
     def test_missing_kernel_capabilities_fail_before_services_start(self):

@@ -123,6 +123,12 @@ Local Docker reproduction requires access to the same bind-mounted paths as the 
   backend IDs, readable instance files, executable commands and final release.
   Select it explicitly with `--profile full --case redis-restart`; it does not
   extend the default eleven-group Full gate.
+- `redis-pod-restart` (Kubernetes-only targeted fault case): run AOF Redis in
+  its own Pod backed by a PVC, keep one backend on each worker, replace the
+  Redis Pod and verify the same PVC, assignments, generations and backend IDs.
+  Public SDK file and command access must recover before final deletion. This
+  requires `--redis-storage-class`; see `kubernetes/README.md`. The local Docker
+  driver does not offer this case.
 - `coordinator-restart` (targeted fault case): keep one live backend on each
   node while the supervised Coordinator is killed and restarted. Require a new
   Redis epoch, unchanged committed ownership and backend IDs, both nodes
