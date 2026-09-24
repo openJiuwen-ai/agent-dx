@@ -101,8 +101,9 @@ Local Docker reproduction requires access to the same bind-mounted paths as the 
 - `node-failure`: suspend node2 Adxlet heartbeats while its runtime remains
   independently hosted; require persisted invalidation, resume the same process,
   require backend cleanup before readiness, and prove node1 remains executable.
-- `sandboxd-restart`: create live instances, restart each independently hosted
-  sandboxd process, require unchanged backend IDs and readable instance files,
+- `sandboxd-restart`: create live instances, crash each independently hosted
+  sandboxd daemon with `SIGKILL` and restart it. Require unchanged backend IDs
+  and readable instance files,
   then delete the instances and verify resource release.
 - `restart`: terminate only Adxlet processes, wait for fresh node sessions
   and completed reconciliation, prove backend IDs are unchanged, then query and
