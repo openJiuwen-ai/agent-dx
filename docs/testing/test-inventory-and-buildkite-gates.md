@@ -183,7 +183,7 @@ profile；完整 Multi-VM 在补齐部署器前不能标记为通过。
 | `L0-03` | 已实现 | 公共 SDK 创建和查询，真实 sandboxd/Execd 后端运行 |
 | `L0-04` | 已实现 | 命令 stdout、stderr、退出码及二进制文件往返 |
 | `L0-05` | 已实现 | 显式删除后 Redis 终态、路由、资源及 sandboxd inventory 全部清理 |
-| `L0-06` | 组件前置已实现，E2E 计划 | SDK 对断流、正常 EOF 无 final 和结构化 unknown 均以同一 Request／Environment 身份重试；原子 claim 保证唯一后端。仍需在真实代理断流下核对 SDK、Redis 和 sandboxd inventory |
+| `L0-06` | 定向用例已实现，待实测 | `create-response-cut` 用真实 TLS 代理在首个 Running final 已生成后切断下游，要求 SDK 同 Request ID／名称重试、Redis generation 和 sandboxd backend 不变，并完成命令与清理。结构化 unknown 与正常 EOF 无 final 已有 SDK 契约测试；完整场景尚未纳入每次提交的 L0 门禁 |
 
 ### 9.2 Local Standalone
 

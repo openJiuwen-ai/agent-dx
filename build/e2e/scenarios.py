@@ -67,6 +67,10 @@ elif sys.argv[1]=='sqlite-verify':
     from sqlite_fallback import verify
     report=verify(connection,E,E/'sqlite-fallback-result.json')
     print(json.dumps(report),flush=True)
+elif sys.argv[1]=='create-response-cut':
+    from create_response_cut import run
+    report=run(connection,image,E/'create-response-cut-result.json',S)
+    print(json.dumps(report),flush=True)
 elif sys.argv[1]=='auth':
     from adx_sandbox import PermissionDenied, SandboxError
     s=Sandbox(image=image,runtime='runc',cpu=500,memory=512,idle_timeout=0,connection=connection,create_timeout=150)

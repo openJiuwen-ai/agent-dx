@@ -167,6 +167,13 @@ Local Docker reproduction requires access to the same bind-mounted paths as the 
   extended heartbeat deadline; require journal replay, Redis Deleted state,
   an empty pending table and the retained Sandbox serving a new SDK command
   with its original backend. Select with `--profile full --case sqlite-fallback`.
+- `create-response-cut` (targeted lost-acknowledgment case): a TLS proxy reads
+  the first successful create final event from the real Ingress, verifies the
+  Redis assignment and physical sandboxd backend, then closes the downstream
+  connection without delivering that event. The installed Sandbox SDK must
+  retry with the same request ID and name; the final generation and backend
+  must remain unchanged, and the instance must execute and delete normally.
+  Select with `--profile full --case create-response-cut`.
 - `stop`: independently create a live instance pinned to each node, verify both
   backend inventories are occupied and exercise each forwarded port. A separate
   instance on each node is deleted to emit the required lifecycle log and trace. It also
