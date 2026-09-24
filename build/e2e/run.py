@@ -18,7 +18,7 @@ import xml.etree.ElementTree as ET
 
 BASIC = ('sdk','auth','capacity','placement','local-first')
 STANDARD = ('sdk','data-plane','lifecycle','auth','capacity','placement','local-first','node-failure','sandboxd-restart','restart','stop')
-OPTIONAL_FAULTS = ('redis-restart','coordinator-restart')
+OPTIONAL_FAULTS = ('redis-restart','coordinator-restart','apiserver-restart','ingress-restart')
 PROFILES = {
     'l0': ('l0','auth'),
     'standalone': STANDARD,
@@ -359,6 +359,17 @@ class Run:
                 for node in self.nodes:self.helper(node,'unchanged',node)
                 self.execute('node1','/opt/adx/client/bin/python','-u','/opt/adx/e2e/scenarios.py','recovered-marker',timeout=90)
                 self.execute('node1','/opt/adx/client/bin/python','-u','/opt/adx/e2e/scenarios.py','cleanup-live-control',timeout=90)
+                for node in self.nodes:self.helper(node,'empty',node)
+        for scenario,role in (('apiserver-restart','apiserver'),('ingress-restart','ingress')):
+            if scenario not in selected:continue
+            with self.case(scenario, checks):
+                self.event('Create pinned instances, restart '+role+' and verify public SDK routing')
+                self.execute('node1','/opt/adx/client/bin/python','-u','/opt/adx/e2e/scenarios.py','create-marker',timeout=300)
+                for node in self.nodes:self.helper(node,'capture-backend',node)
+                self.helper('node1','gateway-restart',role,timeout=90)
+                for node in self.nodes:self.helper(node,'unchanged',node)
+                self.execute('node1','/opt/adx/client/bin/python','-u','/opt/adx/e2e/scenarios.py','recovered-marker',timeout=90)
+                self.execute('node1','/opt/adx/client/bin/python','-u','/opt/adx/e2e/scenarios.py','cleanup-live-gateway',role,timeout=90)
                 for node in self.nodes:self.helper(node,'empty',node)
         if 'stop' in selected:
             with self.case('stop', checks):

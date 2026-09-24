@@ -124,6 +124,10 @@ Local Docker reproduction requires access to the same bind-mounted paths as the 
   Redis epoch, unchanged committed ownership and backend IDs, both nodes
   routable, and public SDK file/command access before final deletion. Select it
   with `--profile full --case coordinator-restart`.
+- `apiserver-restart` and `ingress-restart` (targeted fault cases): restart each
+  supervised public-entry role separately while two instances remain live.
+  Require an unchanged Coordinator epoch, persisted ownership and backend IDs,
+  restored HTTPS API, public SDK file/command access and final resource release.
 - `stop`: independently create a live instance pinned to each node, verify both
   backend inventories are occupied and exercise each forwarded port. A separate
   instance on each node is deleted to emit the required lifecycle log and trace. It also

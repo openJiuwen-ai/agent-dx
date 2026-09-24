@@ -15,6 +15,24 @@ spec.loader.exec_module(node)
 
 
 class SandboxdRestartTests(unittest.TestCase):
+    def test_gateway_role_restart_keeps_epoch_and_live_ownership(self):
+        def snapshot(epoch, generation=7):
+            return {
+                'header':json.dumps({'epoch':epoch}),
+                'environment:env-1':json.dumps({
+                    'result':{'state':'Running','resources_held':True},
+                    'assignment':{'node_id':'node1','generation':generation},
+                }),
+            }
+        before=snapshot(4)
+        self.assertEqual(node.validated_gateway_recovery(before,snapshot(4),['env-1']),
+                         {'coordinator_epoch':4,
+                          'ownership':{'env-1':{'node_id':'node1','generation':7}}})
+        with self.assertRaises(AssertionError):
+            node.validated_gateway_recovery(before,snapshot(5),['env-1'])
+        with self.assertRaises(AssertionError):
+            node.validated_gateway_recovery(before,snapshot(4,generation=8),['env-1'])
+
     def test_coordinator_restart_requires_new_epoch_and_preserved_ownership(self):
         def snapshot(epoch, *, node='node1', routable=True):
             return {

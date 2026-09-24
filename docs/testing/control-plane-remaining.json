@@ -36,7 +36,7 @@
     "title": "Standalone 与正式部署韧性扩展",
     "stage": "7",
     "status": "pending",
-    "detail": "Buildkite Full #18 已定向验证托管 Redis 的 SIGKILL 重启与 AOF 开启后双节点实例归属、代次、后端和命令保持一致；持久卷跨 Pod 恢复、SQLite 降级、实例自动重启及 Coordinator/API/Ingress 独立重启仍缺 E2E 证据。空闲删除已有独立验收。",
+    "detail": "Buildkite Full #18 已验证托管 Redis 的 SIGKILL 重启与 AOF 状态；Full #19 已验证 Coordinator 新 epoch、双节点归属／后端及公开 SDK 恢复。API Server 与 Ingress 独立重启驱动已实现，持久卷跨 Pod 恢复、SQLite 降级、实例自动重启仍缺 E2E 证据。空闲删除已有独立验收。",
     "gate": "按 ST-06..10 和 FD-06..08 增加真实故障用例，保存客户端、权威状态和物理后端三类证据。"
   },
   {

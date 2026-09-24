@@ -41,6 +41,12 @@ def validated_coordinator_recovery(before,after,ids):
         record=json.loads(after['node:'+node_id])
         assert record['node']['available'] and record['session']['routable'],node_id
     return {'epoch_before':old_epoch,'epoch_after':new_epoch,'ownership':ownership}
+def validated_gateway_recovery(before,after,ids):
+    old_epoch=json.loads(before['header'])['epoch']
+    assert json.loads(after['header'])['epoch']==old_epoch,'Coordinator epoch changed during gateway restart'
+    ownership=persisted_ownership(before,ids)
+    assert persisted_ownership(after,ids)==ownership,'instance ownership changed during gateway restart'
+    return {'coordinator_epoch':old_epoch,'ownership':ownership}
 def redis_info():
     env={**os.environ,'REDISCLI_AUTH':(S/'redis-key').read_text().strip()}
     lines=subprocess.check_output(['redis-cli','--raw','INFO','persistence'],env=env,text=True,timeout=5).splitlines()
@@ -230,6 +236,42 @@ def main():
                 last_error=str(error)
             if time.monotonic()>deadline:
                 raise TimeoutError('Coordinator restart did not reconcile: '+last_error)
+            time.sleep(.2)
+    elif action=='gateway-restart':
+        assert node in ('apiserver','ingress'),node
+        import ssl
+        import urllib.error
+        import urllib.request
+        ids=json.loads((E/'live-instances.json').read_text())
+        before=catalog()
+        persisted_ownership(before,ids)
+        services=[s for s in supervisor('status')['services'] if s['role']==node]
+        assert len(services)==1 and services[0]['pid'],node+' is unavailable'
+        previous_pid=services[0]['pid']
+        os.kill(previous_pid,signal.SIGKILL)
+        context=ssl.create_default_context(cafile=str(S/'tls/ca.pem'))
+        request=urllib.request.Request('https://127.0.0.1:8443/api/sandbox/v1/resources',headers={
+            'Authorization':'Bearer '+(S/'api-key').read_text().strip(),
+        })
+        deadline=time.monotonic()+60
+        last_error='new process not yet available'
+        while True:
+            try:
+                services=[s for s in supervisor('status')['services'] if s['role']==node]
+                current_pid=services[0]['pid']
+                if current_pid and current_pid!=previous_pid:
+                    evidence=validated_gateway_recovery(before,catalog(),ids)
+                    with urllib.request.urlopen(request,context=context,timeout=2) as response:
+                        assert response.status==200,response.status
+                    (E/f'{node}-restart.json').write_text(json.dumps({
+                        'previous_pid':previous_pid,'pid':current_pid,
+                        'public_api_ready':True,**evidence,
+                    },indent=2))
+                    break
+            except (OSError,subprocess.SubprocessError,IndexError,KeyError,ValueError,AssertionError,urllib.error.URLError) as error:
+                last_error=str(error)
+            if time.monotonic()>deadline:
+                raise TimeoutError(node+' restart did not restore public API: '+last_error)
             time.sleep(.2)
     elif action=='restart-sandboxd':
         before=backend();assert len(before)==1
