@@ -100,7 +100,7 @@ services:
       auth_cache_seconds: 10
       auth_cache_entries: 4096
     env:
-      ADX_DATA_PLANE_INGRESS_CONTROL_PLANE_ROUTES: exact:/,exact:/healthz,prefix:/api/instances,prefix:/api/sandbox,prefix:/api/admin/v1/keys
+      ADX_DATA_PLANE_INGRESS_CONTROL_PLANE_ROUTES: exact:/,exact:/healthz,prefix:/api/instances,prefix:/api/sandbox,prefix:/api/admin/v1/keys,prefix:/global-scheduler
       ADX_DATA_PLANE_INGRESS_TLS_BIND: 0.0.0.0:8443
       ADX_DATA_PLANE_INGRESS_TLS_CERT: /opt/adx/config/tls/ingress-public.pem
       ADX_DATA_PLANE_INGRESS_TLS_KEY: /opt/adx/config/tls/ingress-public.key
