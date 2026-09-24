@@ -100,6 +100,10 @@ class LiveOutputTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             run = driver.Run(Path(temp)); checks = []
             def execute(*args, **kwargs):
+                if 'sdk' in args:
+                    result = run.output / 'sdk/sdk-result.json'
+                    result.parent.mkdir(parents=True, exist_ok=True)
+                    result.write_text(json.dumps({'instances': []}))
                 if 'capacity' in args: raise RuntimeError('capacity assertion failed')
             run.execute = execute
             console = io.StringIO()
