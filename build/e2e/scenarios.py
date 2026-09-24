@@ -151,7 +151,7 @@ elif sys.argv[1]=='failure-cleanup':
         assert result['state']=='Deleted' and not result['resources_held']
     (E/'node-failure-result.json').write_text(json.dumps({'status':'passed',**observed,'reconnected_backend_empty':True,'cleanup_committed':True},indent=2))
     event('PASS: reconnected node cleaned old execution; healthy instance still executes; final deletion committed')
-elif sys.argv[1] in ('cleanup-live','cleanup-live-redis','cleanup-live-control'):
+elif sys.argv[1] in ('cleanup-live','cleanup-live-redis','cleanup-live-control','cleanup-live-gateway'):
     from node import catalog
     ids=json.loads((E/'live-instances.json').read_text())
     for sid in ids:Sandbox.delete(sid,connection=connection)
@@ -163,7 +163,10 @@ elif sys.argv[1] in ('cleanup-live','cleanup-live-redis','cleanup-live-control')
         'cleanup-live':'sandboxd-restart-result.json',
         'cleanup-live-redis':'redis-restart-cleanup.json',
         'cleanup-live-control':'coordinator-restart-cleanup.json',
-    }[sys.argv[1]]
+    }.get(sys.argv[1])
+    if result_name is None:
+        assert sys.argv[2] in ('apiserver','ingress')
+        result_name=sys.argv[2]+'-restart-cleanup.json'
     (E/result_name).write_text(json.dumps({'status':'passed','instance_ids':ids,'resources_released':True},indent=2))
 elif sys.argv[1] in ('recovered','recovered-marker'):
     checks=[]
