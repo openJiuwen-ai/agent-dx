@@ -122,3 +122,23 @@ python3 build/e2e/multivm/capacity_queue.py \
 
 Pack/Spread configuration and preference scoring remain separate `MV-03`
 checks; `capacity-queue-result.json` alone is not a full `MV-03` pass.
+
+`worker_restart.py` covers the quick-restart portion of `MV-07`: it kills only
+worker 2's adxlet child, lets `adxctl` restart it, and checks that the new
+node session reattaches the same sandboxd backend and assignment generation
+while both Sandboxes continue serving. Its reattachment budget is 25 seconds,
+below the default 30-second heartbeat expiry. Run it on dedicated VMs where
+the worker 2 SSH account has non-interactive `sudo -n kill` permission.
+
+```sh
+python3 build/e2e/multivm/worker_restart.py \
+  --inventory out/e2e/3vm/inventory.json \
+  --endpoint control.example:8443 \
+  --token-file /path/to/tenant-key \
+  --ca /path/to/ingress-ca.pem \
+  --image registry.example/team/rrt@sha256:DIGEST \
+  --output out/e2e/3vm/worker-restart
+```
+
+The old-session write-fencing assertion is not in this SDK subset; it needs
+a protocol-level stale-session probe before `MV-07` is fully covered.
