@@ -216,7 +216,7 @@ profile；完整 Multi-VM 在补齐部署器前不能标记为通过。
 | `MV-07` | 快速重启子集已有，未实机执行 | worker 进程重启、原 backend/归属代数保持和新 session 对账；旧 session 写入隔离仍待协议级探针 |
 | `MV-08` | 默认共进程定向用例已有，未实机执行 | Coordinator/API Server（含嵌入式 Ingress）及托管 Redis 逐个重启；双 worker 原归属、generation、后端、文件与公开 SDK 路由保持可用。独立 Ingress 进程仍待单独用例 |
 | `MV-FC-01` | 条件计划 | 两个 KVM worker 间共享 checkpoint 恢复，同 ID 新 generation 且旧节点清理 |
-| `MV-09` | 契约已固化 | worker 先于控制节点停止，两个 backend inventory 和路由目录最终为空 |
+| `MV-09` | 定向用例已有，未实机执行 | 专用环境明确确认后，worker-2、worker-1、控制节点依次停止；各 worker 后端为空、持久化归属删除、旧路由不可达，剩余 worker 在停机前仍可服务 |
 
 ### 9.4 Full Deployment
 

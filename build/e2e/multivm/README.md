@@ -190,3 +190,24 @@ python3 build/e2e/multivm/control_restart.py \
 
 This case has not yet passed on three real VMs. A separate Ingress process
 needs its own restart acceptance in the split-process profile.
+
+`stop.py` is the final destructive `MV-09` case for dedicated VMs. It refuses
+to run without `--confirm-dedicated` and requires both worker sandboxd
+inventories to be empty before creating its own Sandboxes. It stops worker 2,
+then worker 1, then the control VM through each supervisor. After each worker
+stop it checks the backend inventory, persisted deletion, route withdrawal,
+and continued service on any remaining worker. Run this only after all other
+three-VM cases; the deployment will be stopped at the end.
+
+```sh
+python3 build/e2e/multivm/stop.py \
+  --inventory out/e2e/3vm/inventory.json \
+  --endpoint control.example:8443 \
+  --token-file /path/to/tenant-key \
+  --ca /path/to/ingress-ca.pem \
+  --image registry.example/team/rrt@sha256:DIGEST \
+  --output out/e2e/3vm/stop \
+  --confirm-dedicated
+```
+
+This case has not yet passed on real VMs.
