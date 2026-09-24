@@ -89,6 +89,37 @@ class AcceptanceGateTests(unittest.TestCase):
                 ('helper', 'node2', 'empty'),
             ])
 
+    def test_network_partition_heals_before_reconnected_backend_cleanup(self):
+        self.assertEqual(driver.selected_checks('full', 'network-partition'),
+                         ('network-partition',))
+        with tempfile.TemporaryDirectory() as directory:
+            run = driver.Run(Path(directory))
+            run.nodes = ['node1', 'node2']
+            calls = []
+            run.execute = lambda node, *args, **_kwargs: (
+                calls.append(('execute', node, args[-1]))
+                or json.dumps({'cases': [{'id': 'reliability.partition-route-withdrawal',
+                                          'status': 'passed'}]})
+            )
+            run.helper = lambda node, *args, **_kwargs: calls.append(
+                ('helper', node, args[0]))
+            checks = []
+            run.scenarios(checks, ('network-partition',))
+            self.assertEqual(checks, ['network-partition'])
+            self.assertEqual(calls, [
+                ('execute', 'node1', 'create'),
+                ('helper', 'node2', 'network-partition'),
+                ('helper', 'node1', 'failure-observed'),
+                ('execute', 'node1', 'partition-observed'),
+                ('helper', 'node2', 'network-heal'),
+                ('helper', 'node2', 'network-recovery'),
+                ('helper', 'node1', 'ready'),
+                ('helper', 'node2', 'empty'),
+                ('execute', 'node1', 'network-cleanup'),
+                ('helper', 'node1', 'empty'),
+                ('helper', 'node2', 'empty'),
+            ])
+
     def test_entrypoint_fixture_outlives_instance_startup(self):
         source=(ROOT/'prepare.py').read_text()
         self.assertIn('sleep 30; echo adx-entrypoint-stderr',source)

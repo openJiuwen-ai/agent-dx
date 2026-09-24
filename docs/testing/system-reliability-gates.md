@@ -45,9 +45,9 @@
 | NM-01 | 心跳期限内进程重启 | 新 session 完成权威对账并保留有效 backend；对账完成前不准入 | 已有本地 E2E |
 | NM-02 | 超过心跳期限后进程返回 | 旧实例已经失效；返回节点清理旧执行与绑定后才重新准入 | 已有本地 E2E |
 | NM-03 | 对账期间再次崩溃 | 再次启动继续从 Redis 权威状态收敛，不复活旧 generation | 已有中断物理清理后新 adxlet 重读 inventory、重复幂等删除并保持准入关闭的组件测试；待真实进程故障注入 E2E |
-| NODE-01 | 节点故障且无 checkpoint | Failed、撤路由，不从镜像冷启动 | 已有组件覆盖，待多 VM 门禁 |
+| NODE-01 | 节点故障且无 checkpoint | Failed、撤路由，不从镜像冷启动 | 已有组件覆盖；`network-partition` 定向用例已覆盖真实网络隔离期间的失效和公开入口拒绝，待双物理 worker 实测及多 VM 门禁 |
 | NODE-02 | 共享 checkpoint | 跨节点恢复同一 Environment ID，generation 递增，旧执行不能复活 | 已有本地 FC 覆盖，待多 VM 门禁 |
 | NODE-03 | local-only checkpoint | 明确恢复失败，不在其他节点创建空白实例 | 已有组件覆盖，待多 VM 门禁 |
-| NODE-04 | 原节点迟到返回 | 清理旧执行后才开放准入，旧提交和旧路由全部拒绝 | 已有本地 E2E |
+| NODE-04 | 原节点迟到返回 | 清理旧执行后才开放准入，旧提交和旧路由全部拒绝 | 已有本地进程失联 E2E；`network-partition` 定向用例进一步检查恢复节点的旧 backend 清理和准入顺序，待正式部署实测 |
 
 上述未完成项进入 Standalone、Multi-VM 和 Full Deployment 的故障扩展组。正式门禁不能用 mock、单元测试或跳过用例替代真实进程、网络、Redis 与执行后端证据。

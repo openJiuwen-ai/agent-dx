@@ -36,7 +36,7 @@
     "title": "Standalone 与正式部署韧性扩展",
     "stage": "7",
     "status": "pending",
-    "detail": "Buildkite Full #18 已验证托管 Redis SIGKILL 重启；Full #19 验证 Coordinator 新 epoch 与公开 SDK 恢复；Full #20 验证 API Server 重启。Full #21 的 Ingress 用例因默认共进程 fixture 无独立 Ingress PID 而失败；Full #24 改分进程后，旧产品包缺少 adx-ingress，启动阶段失败。构建和发布配方已补独立二进制，待新产物复验。SQLite 降级与实例自动重启已有定向用例，尚未真实运行；持久卷跨 Pod 恢复仍缺用例。",
+    "detail": "Buildkite Full #18 已验证托管 Redis SIGKILL 重启；Full #19 验证 Coordinator 新 epoch 与公开 SDK 恢复；Full #20 验证 API Server 重启。Full #21 的 Ingress 用例因默认共进程 fixture 无独立 Ingress PID 而失败；Full #24 改分进程后，旧产品包缺少 adx-ingress，启动阶段失败。构建和发布配方已补独立二进制，待新产物复验。SQLite 降级、实例自动重启及真实节点网络隔离已有定向用例，尚未真实运行；持久卷跨 Pod 恢复仍缺用例。",
     "gate": "按 ST-06..10 和 FD-06..08 增加真实故障用例，保存客户端、权威状态和物理后端三类证据。"
   },
   {

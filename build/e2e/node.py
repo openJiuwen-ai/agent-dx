@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import shutil
 import signal
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -31,6 +32,36 @@ def journal_pending():
     if not path.is_file():return None
     with sqlite3.connect('file:'+str(path)+'?mode=ro',uri=True,timeout=2) as db:
         return [json.loads(payload) for (payload,) in db.execute('SELECT payload FROM pending ORDER BY sequence')]
+def partition_rule(address):
+    return ['-p','tcp','-d',address,'--dport','17000',
+            '-m','comment','--comment','adx-e2e-network-partition','-j','DROP']
+def heal_partition(marker, require_packets):
+    address=marker.read_text().strip()
+    rules=subprocess.check_output(['iptables-save','-c'],text=True,timeout=5)
+    matching=[line for line in rules.splitlines()
+              if 'adx-e2e-network-partition' in line and '--dport 17000' in line
+              and address in line]
+    assert len(matching)==1,matching
+    counters=matching[0].split(']',1)[0].lstrip('[').split(':',1)
+    packets=int(counters[0])
+    subprocess.run(['iptables','-D','OUTPUT',*partition_rule(address)],check=True,timeout=5)
+    marker.unlink()
+    if require_packets:assert packets>0,'partition rule blocked no Coordinator packets'
+    return {'coordinator_ip':address,'blocked_packets':packets}
+def returning_node_status(records,current):
+    failed=[]
+    for key,value in records.items():
+        if not key.startswith('environment:'):continue
+        record=json.loads(value)
+        if (record.get('assignment') or {}).get('node_id')=='node2' \
+                and record.get('invalidated'):
+            failed.append(record)
+    assert len(failed)==1,failed
+    node_record=json.loads(records['node:node2'])
+    available=node_record['node']['available']
+    if available and current:
+        raise AssertionError('node reopened admission before stale backend cleanup')
+    return failed[0]['spec']['id'],available,node_record['session']['routable']
 def supervisor(action):return json.loads(command([A/'package/bin/adxctl',action,'--config',P/'deployment.yaml']))
 def persisted_ownership(records,ids):
     ownership={}
@@ -161,6 +192,22 @@ def main():
         os.kill(int(marker.read_text()),signal.SIGCONT)
         marker.unlink()
         print('Resource observer resumed',flush=True)
+    elif action=='network-partition':
+        assert node=='node2','network fault targets node2 only'
+        marker=P/'network-partition.ip'
+        assert not marker.exists(),'network partition already active'
+        address=socket.gethostbyname('coordinator')
+        subprocess.run(['iptables','-I','OUTPUT','1',*partition_rule(address)],
+                       check=True,timeout=5)
+        marker.write_text(address+'\n')
+        print('Node2 Coordinator traffic blocked at the network boundary',flush=True)
+    elif action=='network-heal':
+        assert node=='node2','network recovery targets node2 only'
+        marker=P/'network-partition.ip'
+        assert marker.is_file(),'network partition marker missing'
+        evidence=heal_partition(marker,require_packets=True)
+        (E/'network-partition-rule.json').write_text(json.dumps(evidence,indent=2)+'\n')
+        print('PASS Coordinator network partition had blocked packets and was removed',flush=True)
     elif action=='coordinator-resume':
         marker=P/'frozen-coordinator.pid'
         assert marker.is_file(),'Coordinator suspension marker missing'
@@ -305,11 +352,37 @@ def main():
                 assert failed[0]['result']['state']=='Failed' and not failed[0]['result']['resources_held']
                 assert not node_record['node']['available'] and not node_record['session']['routable']
                 assert healthy[0]['result']['state']=='Running'
-                (E/'node-failure-observed.json').write_text(json.dumps({'failed_id':failed[0]['spec']['id'],'healthy_id':healthy[0]['spec']['id'],'invalidated':True,'node_unavailable':True,'route_unpublished':True},indent=2))
+                assert not labeled_backend(failed[0]['spec']['id']), \
+                    'failed instance was recreated on the healthy node'
+                (E/'node-failure-observed.json').write_text(json.dumps({'failed_id':failed[0]['spec']['id'],'healthy_id':healthy[0]['spec']['id'],'invalidated':True,'node_unavailable':True,'route_unpublished':True,'not_rescheduled':True},indent=2))
                 print('PASS: heartbeat timeout invalidated old execution; healthy node unaffected',flush=True)
                 break
             if time.monotonic()>end:raise TimeoutError('expired execution was not invalidated')
             time.sleep(.5)
+    elif action=='network-recovery':
+        assert node=='node2','network recovery proof targets node2'
+        started=time.monotonic()
+        deadline=started+85
+        last=None
+        while True:
+            try:
+                records=catalog()
+                current=backend()
+                failed_id,available,routable=returning_node_status(records,current)
+                old_backend=labeled_backend(failed_id)
+                if available and routable and not old_backend and not current:
+                    evidence={'node_id':'node2','failed_id':failed_id,
+                              'available_after_cleanup':True,'backend_empty':True,
+                              'seconds':round(time.monotonic()-started,3)}
+                    (E/'network-recovery.json').write_text(json.dumps(evidence,indent=2)+'\n')
+                    print('PASS returning node cleaned old execution before admission',flush=True)
+                    break
+                last={'available':available,'routable':routable,
+                      'old_backend':old_backend,'current':current}
+            except (KeyError,ValueError,subprocess.SubprocessError) as error:
+                last=str(error)
+            if time.monotonic()>deadline:raise TimeoutError(f'network recovery missing: {last}')
+            time.sleep(.2)
     elif action=='create-mode':
         assert node in ('central','local_first')
         current=supervisor('status')
@@ -471,6 +544,10 @@ def main():
         (E/f'backend-occupied-{node}.json').write_text(json.dumps(current))
     elif action in ('stop','cleanup'):
         stop_errors=[]
+        partition=P/'network-partition.ip'
+        if partition.exists():
+            try:heal_partition(partition,require_packets=False)
+            except (AssertionError,OSError,subprocess.SubprocessError):pass
         observer=P/'frozen-observer.pid'
         if observer.exists():
             try:os.kill(int(observer.read_text()),signal.SIGCONT)
