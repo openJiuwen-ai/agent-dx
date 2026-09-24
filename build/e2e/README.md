@@ -141,6 +141,11 @@ Local Docker reproduction requires access to the same bind-mounted paths as the 
   The default two-node fixture configures only `runc` and therefore fails this
   case at its inventory precondition; provision an actual `runsc` backend and
   compatible OCI image before selecting it with `--profile full --case runtime-affinity`.
+- `idle-active` (targeted activity case): hold a foreground SDK command request
+  open for 12 seconds with a six-second idle timeout. Verify that the instance
+  and its allocation survive the active request, then close the client and
+  require idle reclamation and resource release. Run with
+  `--profile full --case idle-active`; it is outside the default basic gate.
 - `stop`: independently create a live instance pinned to each node, verify both
   backend inventories are occupied and exercise each forwarded port. A separate
   instance on each node is deleted to emit the required lifecycle log and trace. It also

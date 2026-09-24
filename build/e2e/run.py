@@ -18,7 +18,7 @@ import xml.etree.ElementTree as ET
 
 BASIC = ('sdk','auth','capacity','placement','local-first')
 STANDARD = ('sdk','data-plane','lifecycle','auth','capacity','placement','local-first','node-failure','sandboxd-restart','restart','stop')
-OPTIONAL_CASES = ('redis-restart','coordinator-restart','apiserver-restart','ingress-restart','runtime-affinity')
+OPTIONAL_CASES = ('redis-restart','coordinator-restart','apiserver-restart','ingress-restart','runtime-affinity','idle-active')
 PROFILES = {
     'l0': ('l0','auth'),
     'standalone': STANDARD,
@@ -310,6 +310,12 @@ class Run:
             with self.case('runtime-affinity', checks) as record:
                 output=self.execute('node1','/opt/adx/client/bin/python','-u',
                                     '/opt/adx/e2e/scenarios.py','runtime-affinity',timeout=300)
+                record['subcases']=sdk_subcases_from_output(output)
+                for node in self.nodes:self.helper(node,'empty',node)
+        if 'idle-active' in selected:
+            with self.case('idle-active', checks) as record:
+                output=self.execute('node1','/opt/adx/client/bin/python','-u',
+                                    '/opt/adx/e2e/scenarios.py','idle-active',timeout=240)
                 record['subcases']=sdk_subcases_from_output(output)
                 for node in self.nodes:self.helper(node,'empty',node)
         if 'local-first' in selected:

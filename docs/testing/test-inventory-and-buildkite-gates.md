@@ -196,7 +196,7 @@ profile；完整 Multi-VM 在补齐部署器前不能标记为通过。
 | `ST-05` | 已实现 | 日志滚动压缩、Metrics、Trace、Collector 中断恢复 |
 | `ST-FC-01` | 已实现 | KVM 暂停／恢复、可复用快照、克隆和制品清理 |
 | `ST-06` | 计划 | Redis 暂停期间 SQLite 降级日志，恢复后去重补写并恢复生命周期操作 |
-| `ST-07` | 客户端退出已验证 | `standalone`／`full` 覆盖无活动实例空闲删除；[Full #22](https://buildkite.com/agent-dx/agent-dx-full-test/builds/22) 验证独立 SDK 客户端进程退出、120 秒后台命令仍运行时由 6 秒空闲策略先行删除（子项 13.491 秒）；活动持续刷新防误回收仍需独立长连接用例 |
+| `ST-07` | 客户端退出已验证，活动请求用例待实测 | `standalone`／`full` 覆盖无活动实例空闲删除；[Full #22](https://buildkite.com/agent-dx/agent-dx-full-test/builds/22) 验证独立 SDK 客户端进程退出、120 秒后台命令仍运行时由 6 秒空闲策略先行删除（子项 13.491 秒）。定向 `idle-active` 用例已加入：前台请求跨越空闲阈值仍保持运行，结束后空闲删除并释放资源；尚未在真实部署执行 |
 | `ST-08` | 组件前置已实现，E2E 计划 | 实例意外退出后的 Never 清理，以及可配置重启的新 runtime identity、退避上限和最终失败状态；仍需真实 sandboxd 进程故障注入 |
 | `ST-09` | K8s 定向验证中 | Coordinator 与 API Server（含 Ingress）分别重启后的 epoch、全量目录和路由重同步；独立 Ingress 使用分进程 fixture，单机部署仍需验证 |
 | `ST-10` | 计划 | Relay embedded／standalone 使用同一契约和相同用户结果 |
