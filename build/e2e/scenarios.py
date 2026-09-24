@@ -5,9 +5,10 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 E=Path('/evidence');S=Path('/secrets')
 os.environ['SSL_CERT_FILE']=str(S/'tls/ca.pem')
-from adx_sandbox import Sandbox,ConnectionConfig
+from adx_sandbox import Sandbox,ConnectionConfig,SandboxError
 connection=ConnectionConfig(server_address='127.0.0.1:8443',token=(S/'api-key').read_text().strip(),use_tls=True,verify_tls=True)
 image=(S/'image').read_text().strip()
 def event(message):print(message,flush=True)
@@ -99,13 +100,24 @@ elif sys.argv[1]=='capacity':
     finally:
         for s in instances:s.kill();s.close()
     check_metrics('released',running=0,reserved=0,pending=0)
-elif sys.argv[1]=='create':
+elif sys.argv[1] in ('create','create-marker'):
     instances=[]
     try:
         for _ in range(2):
             s=Sandbox(image=image,runtime='runc',cpu=500,memory=512,idle_timeout=0,connection=connection,create_timeout=150)
             instances.append(s);assert s.is_running()
-            s.files.write('/tmp/adx-e2e-restart-marker',s.id)
+            if sys.argv[1]=='create-marker':
+                deadline=time.monotonic()+10
+                retries=0
+                while True:
+                    try:
+                        s.files.write('/tmp/adx-e2e-restart-marker',s.id)
+                        break
+                    except SandboxError as error:
+                        if 'route point-get is temporarily unavailable' not in str(error) or time.monotonic()>deadline:raise
+                        retries+=1
+                        time.sleep(.2)
+                event('Marker written after route synchronization; retries='+str(retries))
             event('Created instance for restart check: '+s.id)
         (E/'live-instances.json').write_text(json.dumps([s.id for s in instances]))
     finally:
@@ -134,7 +146,7 @@ elif sys.argv[1]=='cleanup-live':
         result=json.loads(records['environment:'+sid])['result']
         assert result['state']=='Deleted' and not result['resources_held'],sid
     (E/'sandboxd-restart-result.json').write_text(json.dumps({'status':'passed','instance_ids':ids,'resources_released':True},indent=2))
-elif sys.argv[1]=='recovered':
+elif sys.argv[1] in ('recovered','recovered-marker'):
     checks=[]
     for sid in json.loads((E/'live-instances.json').read_text()):
         s=Sandbox.from_id(sid,connection=connection)
@@ -142,8 +154,8 @@ elif sys.argv[1]=='recovered':
             assert s.is_running()
             r=s.commands.run("printf 'recovered-generated-id'")
             assert r.stdout=='recovered-generated-id' and r.exit_code==0
-            assert s.files.read('/tmp/adx-e2e-restart-marker')==sid
-            checks.append({'id':sid,'query':True,'command':True,'file':True})
+            if sys.argv[1]=='recovered-marker':assert s.files.read('/tmp/adx-e2e-restart-marker')==sid
+            checks.append({'id':sid,'query':True,'command':True,'file':sys.argv[1]=='recovered-marker'})
             event('PASS: preserved instance '+sid+' is queryable and executes commands after restart')
         finally:s.close()
     (E/'restart-result.json').write_text(json.dumps({'status':'passed','checks':checks},indent=2))

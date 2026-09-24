@@ -140,10 +140,10 @@ class AcceptanceGateTests(unittest.TestCase):
             run.scenarios(checks, ('sandboxd-restart',))
             self.assertEqual(checks, ['sandboxd-restart'])
             self.assertEqual(calls, [
-                ('execute', 'node1', 'create'),
+                ('execute', 'node1', 'create-marker'),
                 ('helper', 'node1', 'restart-sandboxd'),
                 ('helper', 'node2', 'restart-sandboxd'),
-                ('execute', 'node1', 'recovered'),
+                ('execute', 'node1', 'recovered-marker'),
                 ('execute', 'node1', 'cleanup-live'),
                 ('helper', 'node1', 'empty'),
                 ('helper', 'node2', 'empty'),
