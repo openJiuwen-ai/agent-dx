@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import subprocess
 import time
 
 if __package__:
@@ -38,8 +39,39 @@ def restarted_state(control, worker, instance_id, old_pid, old_session,
             'generation': old_generation}
 
 
+def run_session_probe(executable, control, worker, instance_id, old_session, new_session):
+    address = control.get('coordinator_rpc_address')
+    if not isinstance(address, str) or not address:
+        raise ValueError('control inventory needs coordinator_rpc_address for session fencing')
+    command = [str(executable), address, worker['node_id'], instance_id,
+               old_session, new_session]
+    tls = control.get('session_probe_tls')
+    if tls is not None:
+        if not isinstance(tls, dict) or any(not tls.get(key)
+                                            for key in ('ca', 'cert', 'key', 'server_name')):
+            raise ValueError('session_probe_tls needs ca, cert, key and server_name')
+        command.extend(str(tls[key]) for key in ('ca', 'cert', 'key', 'server_name'))
+    completed = subprocess.run(command, capture_output=True, text=True,
+                               timeout=30, check=False)
+    if completed.returncode != 0:
+        raise AssertionError('stale-session RPC probe failed: ' + completed.stderr[-1000:])
+    try:
+        result = json.loads(completed.stdout)
+    except ValueError as error:
+        raise AssertionError('stale-session RPC probe returned invalid JSON') from error
+    if result.get('status') != 'passed' \
+            or result.get('grpc_code') != 'FailedPrecondition' \
+            or result.get('record_unchanged') is not True \
+            or result.get('node_id') != worker['node_id'] \
+            or result.get('instance_id') != instance_id \
+            or result.get('old_session') != old_session \
+            or result.get('new_session') != new_session:
+        raise AssertionError(f'stale-session RPC probe did not prove fencing: {result}')
+    return result
+
+
 def run_restart(inventory, connection, image, socket, output,
-                sandbox_factory=None, remote=ssh, wait=wait_until):
+                sandbox_factory=None, remote=ssh, wait=wait_until, probe=None):
     verify_inventory(inventory)
     if sandbox_factory is None:
         from adx_sandbox import Sandbox
@@ -83,6 +115,14 @@ def run_restart(inventory, connection, image, socket, output,
                                     socket, remote),
             'adxlet did not restart and reattach before heartbeat expiry', 25)
         report['checks'].append('new-session-same-backend-and-generation')
+        if probe is not None:
+            fencing = probe(control, restarted, affected.id,
+                            old_session, report['restart']['new_session'])
+            if fencing.get('status') != 'passed' \
+                    or fencing.get('grpc_code') != 'FailedPrecondition':
+                raise AssertionError('stale-session probe did not prove fencing')
+            report['fencing'] = fencing
+            report['checks'].append('old-session-commit-rejected')
         for sandbox in handles:
             result = sandbox.commands.run('printf after-restart')
             if result.exit_code != 0 or result.stdout != 'after-restart':
@@ -136,7 +176,11 @@ def main():
     parser.add_argument('--image', required=True)
     parser.add_argument('--socket', default='/run/sandboxd/sandboxd.sock')
     parser.add_argument('--output', required=True, type=Path)
+    parser.add_argument('--session-probe', type=Path)
     args = parser.parse_args()
+    if args.session_probe and (not args.session_probe.is_file()
+                               or not os.access(args.session_probe, os.X_OK)):
+        parser.error('--session-probe must name a built stale_session_probe executable')
     os.environ['SSL_CERT_FILE'] = str(args.ca.resolve())
     from adx_sandbox import ConnectionConfig
     connection = ConnectionConfig(
@@ -144,7 +188,9 @@ def main():
         use_tls=True, verify_tls=True,
     )
     result = run_restart(json.loads(args.inventory.read_text()), connection,
-                         args.image, args.socket, args.output)
+                         args.image, args.socket, args.output,
+                         probe=(lambda *probe_args: run_session_probe(args.session_probe, *probe_args))
+                         if args.session_probe else None)
     print(json.dumps({'status': result['status'], 'checks': result['checks']}), flush=True)
 
 

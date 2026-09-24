@@ -200,8 +200,37 @@ python3 build/e2e/multivm/worker_restart.py \
   --output out/e2e/3vm/worker-restart
 ```
 
-The old-session write-fencing assertion is not in this SDK subset; it needs
-a protocol-level stale-session probe before `MV-07` is fully covered.
+For the old-session write-fencing check, build the test-only Coordinator RPC
+probe for the client machine's Linux target before starting the three-hour
+suite budget:
+
+```sh
+cargo build -p adx-coordinator --example stale_session_probe
+```
+
+Set `coordinator_rpc_address` on the control machine inventory entry to the
+Coordinator RPC address reachable from the test client. If internal RPC uses
+mTLS, also set `session_probe_tls` on that entry with `ca`, `cert`, `key` and
+`server_name`; the certificate must authenticate as worker 2's Node identity.
+The file paths refer to files on the test client. For a deployment without
+internal mTLS, leave `session_probe_tls` unset. Then run the dedicated case:
+
+```sh
+python3 build/e2e/multivm/suite.py \
+  --inventory out/e2e/3vm/inventory.json \
+  --endpoint control.example:8443 \
+  --token-file /path/to/tenant-key \
+  --ca /path/to/ingress-ca.pem \
+  --image registry.example/team/rrt@sha256:DIGEST \
+  --output out/e2e/3vm/suite \
+  --case session-fence \
+  --session-probe target/debug/examples/stale_session_probe
+```
+
+The case repeats quick worker replacement, then sends `CommitEnvironment`
+with the retired Node session. It requires `FailedPrecondition` and an
+unchanged persisted record while both instances still serve. This case has
+not yet run on three real VMs.
 
 `local_first.py` covers `MV-04` on a dedicated three-VM deployment whose
 API Server uses `create_mode: local_first`. It checks entry rotation, same-ID
@@ -323,5 +352,7 @@ and `--case placement-spread`; after applying local-first use
 `--case local-first`. For a split-process profile, select
 `--case ingress-restart` after its separate Ingress has started. Run
 `--case runtime-affinity` only on a heterogeneous profile with one runsc
-worker. Select `--case stop --confirm-dedicated` last, against the
+worker. Select `--case session-fence --session-probe PATH` for the old-session
+RPC assertion after the quick-restart subset. Select
+`--case stop --confirm-dedicated` last, against the
 chosen final deployment. All cases remain unverified on real three-VM hosts.

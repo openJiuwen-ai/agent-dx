@@ -128,5 +128,20 @@ class SuiteTests(unittest.TestCase):
                              ['--role', 'ingress'])
             self.assertTrue(case_command(config, 'runtime-affinity', destination)[2]
                             .endswith('runtime_affinity.py'))
+            config.session_probe = destination / 'probe'
+            self.assertEqual(case_command(config, 'session-fence', destination)[-2:],
+                             ['--session-probe', str(config.session_probe)])
             self.assertEqual(case_command(config, 'stop', destination)[-1],
                              '--confirm-dedicated')
+
+    def test_session_fence_requires_executable_probe(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(directory, ('session-fence',))
+            execute, calls = self.executor()
+            with self.assertRaisesRegex(ValueError, 'session-probe'):
+                run_plan(config, execute=execute)
+            config.session_probe = Path(directory) / 'probe'
+            config.session_probe.write_text('not executable')
+            with self.assertRaisesRegex(ValueError, 'session-probe'):
+                run_plan(config, execute=execute)
+            self.assertFalse(calls)

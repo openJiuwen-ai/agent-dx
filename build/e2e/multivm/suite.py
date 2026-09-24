@@ -12,6 +12,7 @@ import signal
 import subprocess
 import sys
 import time
+from typing import Optional
 
 if __package__:
     from .contract import inventory_digest, verify_inventory
@@ -36,6 +37,7 @@ CASES = {
     'local-first': Case('local_first.py', 'local-first-result.json', 600),
     'worker-failure': Case('worker_failure.py', 'worker-failure-result.json', 480),
     'worker-restart': Case('worker_restart.py', 'worker-restart-result.json', 360),
+    'session-fence': Case('worker_restart.py', 'worker-restart-result.json', 360),
     'control-restart': Case('control_restart.py', 'control-restart-result.json', 600),
     'ingress-restart': Case('control_restart.py', 'control-restart-result.json', 300),
     'stop': Case('stop.py', 'stop-result.json', 480),
@@ -58,6 +60,7 @@ class RunConfig:
     cases: tuple[str, ...]
     budget_seconds: int = MAX_BUDGET_SECONDS
     confirm_dedicated: bool = False
+    session_probe: Optional[Path] = None
 
 
 def write_json(path, value):
@@ -81,6 +84,8 @@ def case_command(config, case, destination):
         command += ['--placement', case.removeprefix('placement-')]
     elif case == 'ingress-restart':
         command += ['--role', 'ingress']
+    elif case == 'session-fence':
+        command += ['--session-probe', str(config.session_probe)]
     elif case == 'stop':
         command.append('--confirm-dedicated')
     return command
@@ -150,6 +155,10 @@ def run_plan(config, execute=execute_subprocess, now=time.time):
         raise ValueError('destructive stop case must be last')
     if 'stop' in config.cases and not config.confirm_dedicated:
         raise ValueError('stop requires explicit dedicated-VM confirmation')
+    if 'session-fence' in config.cases \
+            and (config.session_probe is None or not config.session_probe.is_file()
+                 or not os.access(config.session_probe, os.X_OK)):
+        raise ValueError('session-fence requires a built --session-probe executable')
     config.output.mkdir(parents=True, exist_ok=True)
     state_path = config.output / 'budget-state.json'
     digest = inventory_digest(config.inventory)
@@ -242,6 +251,7 @@ def main():
     parser.add_argument('--case', dest='cases', action='append', choices=tuple(CASES), required=True)
     parser.add_argument('--budget-seconds', type=int, default=MAX_BUDGET_SECONDS)
     parser.add_argument('--confirm-dedicated', action='store_true')
+    parser.add_argument('--session-probe', type=Path)
     args = parser.parse_args()
     if 'sdk' in args.cases and not args.release:
         parser.error('--case sdk requires --release')
@@ -254,6 +264,7 @@ def main():
         image=args.image, release=args.release or Path(''), socket=args.socket,
         cases=tuple(args.cases), budget_seconds=args.budget_seconds,
         confirm_dedicated=args.confirm_dedicated,
+        session_probe=args.session_probe,
     )
     config.output.mkdir(parents=True, exist_ok=True)
     with (config.output / 'suite.lock').open('w') as lock:
