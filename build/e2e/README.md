@@ -79,7 +79,8 @@ Local Docker reproduction requires access to the same bind-mounted paths as the 
   commands, both handle and collection stdin/EOF, sync and async waits, stable
   command replay/conflict, typed not-found/timeout results, both kill entry
   points, filesystem text/binary/depth/directory copy, stateful Shell, interactive
-  PTY input/EOF/resize/state, default TLS+Token forwarded-port traffic, and a
+  PTY input/EOF/resize/state, default TLS+Token forwarded-port traffic,
+  authenticated Host-subdomain port forwarding, and a
   per-Environment TLS-only forwarded-port policy, and an SDK reverse-tunnel upstream
   round trip.
 - `lifecycle`: close a detached handle, reattach to the same running Environment,

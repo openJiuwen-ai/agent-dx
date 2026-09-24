@@ -45,6 +45,22 @@ def _fetch_forwarded(sandbox, ca_path, port=PORT, authenticated=True):
         sandbox.get_port_url(port),
         headers=sandbox.get_port_auth_headers() if authenticated else {},
     )
+    return _fetch_request(request, ca_path)
+
+
+def _fetch_host_forwarded(sandbox, ca_path, port=PORT, authenticated=True):
+    gateway = urllib.parse.urlsplit(sandbox.get_port_url(port))
+    request = urllib.request.Request(
+        f'{gateway.scheme}://{gateway.netloc}/functional/host?x=1',
+        headers={
+            'Host': f'{sandbox.id}-{port}.example.test',
+            **(sandbox.get_port_auth_headers() if authenticated else {}),
+        },
+    )
+    return _fetch_request(request, ca_path)
+
+
+def _fetch_request(request, ca_path):
     context = ssl.create_default_context(cafile=str(ca_path))
     deadline = time.monotonic() + 45
     last_error = None
@@ -348,6 +364,17 @@ def run(connection, image, output, ca_path):
         assert _fetch_forwarded(sandbox, ca_path) == EXPECTED_BODY
         checks['forwarded_port'] = True
         passed('port-forward.tls-token-route', started)
+
+        started = begin('port-forward.host-subdomain-route')
+        try:
+            _fetch_host_forwarded(sandbox, ca_path, authenticated=False)
+        except urllib.error.HTTPError as error:
+            assert error.code in (401, 403), error
+        else:
+            raise AssertionError('Host forwarded port accepted a request without a token')
+        assert _fetch_host_forwarded(sandbox, ca_path) == EXPECTED_BODY
+        checks['host_subdomain_forwarding'] = True
+        passed('port-forward.host-subdomain-route', started)
 
         started = begin('port-forward.per-instance-tls-route')
         security_sandbox = Sandbox(
