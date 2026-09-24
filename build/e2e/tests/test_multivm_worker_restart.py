@@ -3,8 +3,9 @@ from pathlib import Path
 import tempfile
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
-from build.e2e.multivm.worker_restart import run_restart
+from build.e2e.multivm.worker_restart import run_restart, run_session_probe
 
 
 def inventory():
@@ -24,8 +25,18 @@ def inventory():
 
 
 class WorkerRestartTests(unittest.TestCase):
-    def exercise(self, replacement_backend=False):
-        state = {'live': {}, 'restarted': False, 'signals': []}
+    def exercise(self, replacement_backend=False, fence=False, fence_fail=False,
+                 invalid_probe=False):
+        state = {'live': {}, 'restarted': False, 'signals': [], 'probe_calls': []}
+
+        def probe(_control, worker, instance_id, old_session, new_session):
+            state['probe_calls'].append((worker['node_id'], instance_id,
+                                         old_session, new_session))
+            if fence_fail:
+                raise AssertionError('old session commit was accepted')
+            if invalid_probe:
+                return {'status': 'failed', 'grpc_code': 'OK'}
+            return {'status': 'passed', 'grpc_code': 'FailedPrecondition'}
 
         class Sandbox:
             def __init__(self, *, node_id, **_options):
@@ -84,14 +95,26 @@ class WorkerRestartTests(unittest.TestCase):
             if replacement_backend:
                 with self.assertRaisesRegex(AssertionError, 'changed instance ownership or backend'):
                     run_restart(inventory(), object(), 'image', '/run/sandboxd/sandboxd.sock',
-                                output, Sandbox, remote, wait)
+                                output, Sandbox, remote, wait, probe=probe if fence else None)
+                self.assertEqual(json.loads((output / 'worker-restart-result.json').read_text())['status'], 'failed')
+            elif fence_fail or invalid_probe:
+                expected = 'old session commit was accepted' if fence_fail else 'did not prove fencing'
+                with self.assertRaisesRegex(AssertionError, expected):
+                    run_restart(inventory(), object(), 'image', '/run/sandboxd/sandboxd.sock',
+                                output, Sandbox, remote, wait, probe=probe)
                 self.assertEqual(json.loads((output / 'worker-restart-result.json').read_text())['status'], 'failed')
             else:
                 report = run_restart(inventory(), object(), 'image', '/run/sandboxd/sandboxd.sock',
-                                     output, Sandbox, remote, wait)
+                                     output, Sandbox, remote, wait, probe=probe if fence else None)
                 self.assertEqual(report['status'], 'passed')
                 self.assertEqual(report['restart']['new_session'], 'new')
                 self.assertEqual(report['restart']['old_pid'], 234)
+                if fence:
+                    self.assertEqual(report['fencing']['grpc_code'], 'FailedPrecondition')
+                    self.assertIn('old-session-commit-rejected', report['checks'])
+            if fence:
+                self.assertEqual(state['probe_calls'],
+                                 [('node2', 'sandbox-node2', 'old', 'new')])
         self.assertEqual(state['signals'], ['TERM'])
         self.assertFalse(state['live'])
 
@@ -100,3 +123,32 @@ class WorkerRestartTests(unittest.TestCase):
 
     def test_replaced_backend_is_not_accepted_as_reattachment(self):
         self.exercise(replacement_backend=True)
+
+    def test_old_session_commit_is_rejected_after_quick_replacement(self):
+        self.exercise(fence=True)
+
+    def test_accepted_old_session_commit_fails_and_cleans(self):
+        self.exercise(fence=True, fence_fail=True)
+
+    def test_probe_must_report_rejection_to_pass(self):
+        self.exercise(fence=True, invalid_probe=True)
+
+    def test_probe_requires_failed_precondition_and_unchanged_record(self):
+        control = {'coordinator_rpc_address': 'control:19000'}
+        worker = {'node_id': 'node2'}
+        valid = {'status': 'passed', 'grpc_code': 'FailedPrecondition',
+                 'record_unchanged': True, 'node_id': 'node2',
+                 'instance_id': 'sandbox-node2', 'old_session': 'old',
+                 'new_session': 'new'}
+        with patch('build.e2e.multivm.worker_restart.subprocess.run') as command:
+            command.return_value = SimpleNamespace(returncode=0, stdout=json.dumps(valid),
+                                                   stderr='')
+            self.assertEqual(run_session_probe('/tmp/probe', control, worker,
+                                               'sandbox-node2', 'old', 'new'), valid)
+            self.assertEqual(command.call_args.args[0],
+                             ['/tmp/probe', 'control:19000', 'node2',
+                              'sandbox-node2', 'old', 'new'])
+            command.return_value.stdout = json.dumps({**valid, 'record_unchanged': False})
+            with self.assertRaisesRegex(AssertionError, 'did not prove fencing'):
+                run_session_probe('/tmp/probe', control, worker,
+                                  'sandbox-node2', 'old', 'new')

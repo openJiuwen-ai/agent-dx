@@ -213,7 +213,7 @@ profile；完整 Multi-VM 在补齐部署器前不能标记为通过。
 | `MV-04` | 定向用例已有，未实机执行 | Local-first 入口轮转、原子归属、冲突拒绝、真实本地 claim 证据及中心 fallback 不重复计账 |
 | `MV-05` | SDK 子集已有，未实机执行 | Ingress 经目标 Relay/Execd 的跨 VM 命令与文件路径 |
 | `MV-06` | 故障子集已有，未实机执行 | worker 心跳过期使实例失效并撤路由；返回 worker 清理旧后端、换会话后再准入，健康 worker 继续执行 |
-| `MV-07` | 快速重启子集已有，未实机执行 | worker 进程重启、原 backend/归属代数保持和新 session 对账；旧 session 写入隔离仍待协议级探针 |
+| `MV-07` | 快速重启与旧会话隔离定向用例已有，未实机执行 | worker 进程重启、原 backend/归属代数保持和新 session 对账；`session-fence` 以旧 session 调用真实 Coordinator `CommitEnvironment`，要求 `FailedPrecondition`、持久化记录不变且两个实例继续服务 |
 | `MV-08` | 共进程与独立 Ingress 定向用例已有，未实机执行 | Coordinator/API Server（含嵌入式 Ingress）及托管 Redis 逐个重启；独立 Ingress 另在分进程配置下重启。双 worker 原归属、generation、后端、文件与公开 SDK 路由保持可用 |
 | `MV-FC-01` | 条件计划 | 两个 KVM worker 间共享 checkpoint 恢复，同 ID 新 generation 且旧节点清理 |
 | `MV-09` | 定向用例已有，未实机执行 | 专用环境明确确认后，worker-2、worker-1、控制节点依次停止；各 worker 后端为空、持久化归属删除、旧路由不可达，剩余 worker 在停机前仍可服务 |
