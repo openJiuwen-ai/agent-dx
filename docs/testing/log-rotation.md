@@ -1,6 +1,6 @@
 # 组件日志滚动与压缩
 
-统一部署配置的 `logging` 控制 Supervisor 管理的各组件 stdout/stderr 文件日志。进程部署和 Pod 内运行使用同一套实现；由部署环境管理的 sandboxd，以及 guest 内实例日志，仍由实际日志生产方负责。结构化日志、Trace 和外部采集已接通，见 [日志采集](log-collection.md) 与 [Trace](distributed-traces.md)。
+统一部署配置的 `logging` 控制 Supervisor 管理的各组件 stdout/stderr 文件日志。进程部署和 Pod 内运行使用同一套实现；sandboxd 自身由部署环境管理，runtime stdout/stderr 使用独立的 [Runtime 日志](runtime-logs.md) 契约。结构化日志、Trace 和外部采集见 [日志采集](log-collection.md) 与 [Trace](distributed-traces.md)。
 
 ## 配置
 

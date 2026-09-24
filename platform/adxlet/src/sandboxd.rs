@@ -26,6 +26,7 @@ pub struct Config {
     pub env: HashMap<String, String>,
     pub cwd: String,
     pub rpc_timeout: Duration,
+    pub runtime_logs: Option<crate::runtime_logs::RuntimeLogPolicy>,
 }
 
 impl Default for Config {
@@ -36,6 +37,7 @@ impl Default for Config {
             env: HashMap::from([("EXECD_HTTP_PORT".into(), "50090".into())]),
             cwd: "/".into(),
             rpc_timeout: Duration::from_secs(30),
+            runtime_logs: None,
         }
     }
 }
@@ -122,6 +124,12 @@ impl Sandboxd {
                     return Err(Error::Invalid("runtime artifact is not EROFS".into()));
                 }
             }
+        }
+        if let Some(policy) = &config.runtime_logs {
+            policy
+                .validate()
+                .map_err(|error| Error::Invalid(error.to_string()))?;
+            crate::runtime_logs::RuntimeLogs::new(policy.clone()).map_err(unavailable)?;
         }
         let channel = Endpoint::from_static("http://localhost")
             .connect_timeout(config.rpc_timeout)
@@ -507,6 +515,16 @@ pub fn start_request(
     let cpu_limit = options.limits.cpu_millis.max(spec.resources.cpu_millis);
     let memory_limit = options.limits.memory_bytes.max(spec.resources.memory_bytes);
     let disk_limit = options.limits.disk_bytes.max(spec.resources.disk_bytes);
+    let (stdout, stderr) = config
+        .runtime_logs
+        .as_ref()
+        .map(|policy| {
+            policy
+                .paths(runtime_id)
+                .map_err(|error| Error::Invalid(error.to_string()))
+        })
+        .transpose()?
+        .unwrap_or_default();
     Ok(proto::StartRequest {
         xpu_allocations: xpu
             .into_iter()
@@ -554,6 +572,8 @@ pub fn start_request(
             .unwrap_or_else(|| config.command.clone()),
         cwd: config.cwd.clone(),
         envs,
+        stdout,
+        stderr,
         resources: HashMap::from([
             ("CPU".into(), cpu_limit as f64),
             ("Memory".into(), memory_limit as f64 / 1_048_576.0),

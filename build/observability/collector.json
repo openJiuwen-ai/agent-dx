@@ -48,6 +48,34 @@
         }
       ]
     },
+    "filelog/runtime": {
+      "include": [
+        "${env:ADX_LOG_DIR}/runtime/*.out",
+        "${env:ADX_LOG_DIR}/runtime/*.err"
+      ],
+      "start_at": "beginning",
+      "storage": "file_storage",
+      "poll_interval": "100ms",
+      "include_file_name": true,
+      "include_file_path": true,
+      "max_log_size": "1MiB",
+      "fingerprint_size": "128",
+      "retry_on_failure": {
+        "enabled": true,
+        "max_elapsed_time": "0s"
+      },
+      "resource": {
+        "adx.node.id": "${env:ADX_NODE_ID}",
+        "service.name": "adx-runtime"
+      },
+      "operators": [
+        {
+          "type": "regex_parser",
+          "parse_from": "attributes[\"log.file.name\"]",
+          "regex": "^(?P<runtime_id>.+)\\.(?P<stream>out|err)$"
+        }
+      ]
+    },
     "otlp": {
       "protocols": {
         "http": {
@@ -109,7 +137,8 @@
     "pipelines": {
       "logs": {
         "receivers": [
-          "filelog/adx"
+          "filelog/adx",
+          "filelog/runtime"
         ],
         "processors": [
           "memory_limiter",

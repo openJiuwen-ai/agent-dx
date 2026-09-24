@@ -304,6 +304,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "data-plane-gateway",
+ "flate2",
  "futures-util",
  "http-body-util",
  "hyper",

@@ -48,6 +48,8 @@ services:
           coordinator: /opt/adx/config/tls/coordinator.der
           apiserver: /opt/adx/config/tls/apiserver.der
       sandboxd_socket: /run/sandboxd/sandboxd.sock
+      runtime_logs:
+        directory: /opt/adx/run/control/logs/runtime
       proxy_socket: /opt/adx/run/node/route.sock
       report_interval_seconds: 5
       rpc_timeout_seconds: 30

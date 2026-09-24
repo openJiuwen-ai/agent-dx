@@ -1,6 +1,6 @@
 # 组件日志采集
 
-组件输出由 Supervisor 写入文件；部署环境运行 OpenTelemetry Collector Contrib，通过 filelog 读取并用 OTLP/HTTP 发送给日志后端。Collector 是独立部署服务，配置样例在 `build/observability/collector.json`，镜像版本和摘要在 `build/observability/source.json`。目前接入托管组件的文件日志；adxctl 自身诊断由启动它的终端、systemd 或 Pod 日志通道采集。实例内用户 stdout/stderr 继续使用 Execd/sandboxd 的通道。
+组件输出由 Supervisor 写入文件；部署环境运行 OpenTelemetry Collector Contrib，通过 filelog 读取并用 OTLP/HTTP 发送给日志后端。Collector 是独立部署服务，配置样例在 `build/observability/collector.json`，镜像版本和摘要在 `build/observability/source.json`。样例接入托管组件日志与节点 runtime 的 `.out/.err`；后者的路径、压缩及回收见 [Runtime 日志](runtime-logs.md)。adxctl 自身诊断由启动它的终端、systemd 或 Pod 日志通道采集。
 
 ## 组件与字段
 
@@ -23,6 +23,8 @@ adxlet 的 `environment_operation_completed` 事件记录 environment_id、gener
 | `ADX_OTLP_ENDPOINT` | 实际日志后端的 OTLP/HTTP 基地址，Exporter 追加 `/v1/logs` |
 
 3. 由部署环境启动 Collector：`otelcol-contrib --config=/opt/adx/config/collector.json`。样例以 OTLP JSON 编码发送；生产后端需要支持该编码。按后端要求补充 TLS CA、客户端证书或认证扩展，凭证从受保护配置读取。
+
+Collector 样例的 `filelog/runtime` 从 `$ADX_LOG_DIR/runtime` 读取当前 `.out/.err`。将 adxlet `runtime_logs.directory` 配到同一路径；若部署环境使用另一日志根目录，应同步调整 Collector 配置或挂载。压缩后的 `.gz` 不在实时读取范围内。
 
 建议 Supervisor 的配置起点：
 

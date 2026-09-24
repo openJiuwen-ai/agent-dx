@@ -163,7 +163,7 @@ The fixed control path is Agent/application → Sandbox SDK/HTTP API → API Ser
 - API Key administrator and tenant identities plus configurable internal mTLS.
 - Versioned route publication and synchronized local binding checks.
 - Node reconciliation, restart policy, idle deletion, checkpoint recovery, local/S3-compatible storage, and reference-aware artifact cleanup.
-- Prometheus metrics, OpenTelemetry traces, structured logs, rotation, gzip compression, and external Collector integration.
+- Prometheus metrics, OpenTelemetry traces, structured component logs, and external Collector integration. Node runtime stdout/stderr is redirected to per-runtime files with terminated-log compression and GC.
 - Process deployment with managed or external Redis and Kubernetes end-to-end deployment profiles.
 
 ## 🛠️ Development and test
@@ -203,6 +203,7 @@ The SDK distribution is `adx-sandbox`, its Python import is `adx_sandbox`, and i
 - [Remote cluster administration](docs/deployment/adxadmin.md) and [API Key management](docs/testing/api-key-management.md)
 - [Scheduling](docs/testing/scheduling-performance.md), [node lifecycle](docs/testing/node-lifecycle.md), and [route publication](docs/testing/route-publication.md)
 - [Checkpoint and snapshot storage](docs/testing/snapshot-storage.md)
+- [Runtime stdout/stderr and retention](docs/testing/runtime-logs.md)
 - [Metrics](docs/testing/environment-resource-metrics.md), [logs](docs/testing/log-collection.md), and [distributed tracing](docs/testing/distributed-traces.md)
 - [Rust coding guidelines](docs/development/rust-coding-guidelines.md)
 - [Release pipelines and package layout](docs/development/release-pipelines-and-packaging.md)

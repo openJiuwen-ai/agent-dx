@@ -14,6 +14,9 @@
     }
   },
   "sandboxd_socket": "/run/sandboxd/sandboxd.sock",
+  "runtime_logs": {
+    "directory": "/opt/adx/logs/runtime"
+  },
   "proxy_mode": "standalone",
   "proxy_socket": "/opt/adx/run/route.sock",
   "report_interval_seconds": 5,
