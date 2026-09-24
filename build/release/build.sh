@@ -3,6 +3,7 @@ set -euo pipefail
 # Linux release builder. sandboxd is supplied independently by the runtime environment.
 : "${CARGO_TARGET_DIR:?set persistent Cargo cache}"
 : "${ADX_REDIS_SERVER:?provide pinned Redis 7.2.5 binary}"
+: "${ADX_REDIS_CLI:?provide matching Redis 7.2.5 CLI binary}"
 : "${ADX_RELEASE_TARGET:?set artifact target triple}"
 : "${ADX_RELEASE_OUTPUT:?set new output package directory}"
 JOBS=${JOBS:-2}
@@ -35,4 +36,4 @@ echo "--- :python: Build Sandbox SDK wheel"
 PYTHON="$PYTHON" bash platform/sdk/sandbox/python/build.sh "$stage/sdk"
 wheel=("$stage"/sdk/adx_sandbox-*.whl)
 [[ ${#wheel[@]} == 1 && -f "${wheel[0]}" ]]
-"$PYTHON" build/release/package.py assemble --binary-dir "$stage" --redis "$ADX_REDIS_SERVER" --wheel "${wheel[0]}" --target "$ADX_RELEASE_TARGET" --profile release --output "$ADX_RELEASE_OUTPUT"
+"$PYTHON" build/release/package.py assemble --binary-dir "$stage" --redis "$ADX_REDIS_SERVER" --redis-cli "$ADX_REDIS_CLI" --wheel "${wheel[0]}" --target "$ADX_RELEASE_TARGET" --profile release --output "$ADX_RELEASE_OUTPUT"

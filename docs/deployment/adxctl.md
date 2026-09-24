@@ -4,7 +4,7 @@
 
 `adxctl` 是 ADX 统一发布包的本机进程部署工具。它读取一份 YAML 部署文件，生成本机各组件的最终配置，并以前台 supervisor 方式启动这些组件。它不创建 Environment，也不调用 Sandbox API；集群 API Key 等远程管理操作使用独立的 [`adxadmin`](adxadmin.md)。
 
-release 安装器默认创建 `/usr/local/bin/adxctl -> /opt/adx/current/bin/adxctl`。因此日常命令直接使用 `adxctl`；切换 `/opt/adx/current` 后，命令自动指向新版本。安装器不会把其他内部服务二进制加入系统 `PATH`。
+release 安装器默认创建 `/usr/local/bin/adxctl -> /opt/adx/current/bin/adxctl`。因此日常命令直接使用 `adxctl`；切换 `/opt/adx/current` 后，命令自动指向新版本。安装器不会把其他内部服务二进制加入系统 `PATH`。发布包还包含与 Redis Server 同为 7.2.5 的 `/opt/adx/current/bin/redis-cli`，供部署者进入 Coordinator 容器后检查 Redis；它不会自动连接或认证，使用时应从部署环境获取地址和凭证。
 
 一份部署 YAML 只描述**当前主机**。单机部署可以在一份文件中包含所有角色；多机部署时，每台主机使用自己的文件，各文件通过相同的 `redis_url` 和 `namespace` 加入同一集群。`adxctl` 默认读取 `/opt/adx/config/deployment.yaml`，也可用全局 `-c/--config` 或 `ADX_DEPLOYMENT_CONFIG` 选择其他文件。它只接受 `.yaml` 或 `.yml`，不接受 JSON 部署文件。
 

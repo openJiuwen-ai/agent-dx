@@ -67,6 +67,7 @@ echo "--- :package: Assemble unified ADX release"
 python3 build/release/package.py assemble \
   --binary-dir "$stage" \
   --redis "$ADX_REDIS_SERVER" \
+  --redis-cli "$ADX_REDIS_CLI" \
   --wheel "${wheel[0]}" \
   --target "$ADX_RELEASE_TARGET" \
   --profile release \

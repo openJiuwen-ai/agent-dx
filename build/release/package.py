@@ -15,7 +15,7 @@ BINARIES = ("adxctl", "adx-coordinator", "adxlet", "adx-apiserver")
 def sha(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
-def assemble(binary_dir, redis, wheel, output, commit, dirty, target, profile):
+def assemble(binary_dir, redis, redis_cli, wheel, output, commit, dirty, target, profile):
     if output.exists():
         raise ValueError("output already exists")
     inputs = {f"bin/{name}": binary_dir / name for name in BINARIES}
@@ -28,6 +28,7 @@ def assemble(binary_dir, redis, wheel, output, commit, dirty, target, profile):
     elif runtime_root.is_file():
         inputs["runtime/adx-runtime-rootfs.img"] = runtime_root
     inputs["bin/redis-server"] = redis
+    inputs["bin/redis-cli"] = redis_cli
     inputs["install.sh"] = ROOT / "build/release/install.sh"
     if not wheel.name.startswith("adx_sandbox-") or wheel.suffix != ".whl":
         raise ValueError("an adx_sandbox wheel is required")
@@ -40,6 +41,9 @@ def assemble(binary_dir, redis, wheel, output, commit, dirty, target, profile):
     version = subprocess.check_output([str(redis.resolve()), "--version"], text=True)
     if "v=7.2.5 " not in version:
         raise ValueError("Redis version differs from pinned 7.2.5")
+    cli_version = subprocess.check_output([str(redis_cli.resolve()), "--version"], text=True)
+    if cli_version.strip() != "redis-cli 7.2.5":
+        raise ValueError("Redis CLI version differs from pinned 7.2.5")
     for path in (ROOT / "build/config/examples").iterdir():
         if path.is_file():
             inputs[f"etc/examples/{path.name}"] = path
@@ -81,6 +85,7 @@ def verify(directory):
     expected = set(manifest["files"])
     required = {f"bin/{b}" for b in BINARIES} | {
         "bin/redis-server",
+        "bin/redis-cli",
         "install.sh",
         "runtime/adx-execd",
     }
@@ -106,7 +111,7 @@ def main():
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command", required=True)
     p = sub.add_parser("assemble")
-    for arg in ("binary-dir", "redis", "wheel", "output"):
+    for arg in ("binary-dir", "redis", "redis-cli", "wheel", "output"):
         p.add_argument("--" + arg, type=Path, required=True)
     p.add_argument("--target", required=True)
     p.add_argument("--profile", choices=("debug", "release"), required=True)
@@ -124,7 +129,7 @@ def main():
                 raise ValueError("CI checkout differs from the requested commit")
             if dirty:
                 raise ValueError("CI source checkout changed during build:\n" + status)
-        assemble(args.binary_dir, args.redis, args.wheel, args.output, commit, dirty, args.target, args.profile)
+        assemble(args.binary_dir, args.redis, args.redis_cli, args.wheel, args.output, commit, dirty, args.target, args.profile)
     print("package verified")
 
 if __name__ == "__main__":

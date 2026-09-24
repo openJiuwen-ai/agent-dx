@@ -16,14 +16,17 @@ class PackageTests(unittest.TestCase):
                 (binaries/name).write_bytes(b"fixture")
             (binaries/"adxctl").write_text("#!/bin/sh\nexit 0\n")
             redis=root/"redis";redis.write_text("#!/bin/sh\necho 'Redis server v=7.2.5 sha=fixture'\n");redis.chmod(0o700)
+            redis_cli=root/"redis-cli";redis_cli.write_text("#!/bin/sh\necho 'redis-cli 7.2.5'\n");redis_cli.chmod(0o700)
             wheel=root/"adx_sandbox-1-py3-none-any.whl";wheel.write_bytes(b"fixture wheel")
             out=root/"package"
-            m=pkg.assemble(binaries,redis,wheel,out,"a"*40,True,"test-fixture","debug")
+            m=pkg.assemble(binaries,redis,redis_cli,wheel,out,"a"*40,True,"test-fixture","debug")
             self.assertTrue(m["dirty"]);pkg.verify(out)
+            self.assertIn("bin/redis-cli", m["files"])
+            self.assertTrue((out/"bin/redis-cli").stat().st_mode & 0o111)
             self.assertTrue((out/"install.sh").stat().st_mode & 0o111)
             (out/"bin/adxctl").write_bytes(b"changed")
             with self.assertRaises(ValueError):pkg.verify(out)
-            with self.assertRaises(ValueError):pkg.assemble(binaries,redis,wheel,out,"a"*40,True,"test-fixture","debug")
+            with self.assertRaises(ValueError):pkg.assemble(binaries,redis,redis_cli,wheel,out,"a"*40,True,"test-fixture","debug")
     def test_embedded_package_excludes_split_process_binaries(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -36,13 +39,16 @@ class PackageTests(unittest.TestCase):
             redis = root / "redis"
             redis.write_text("#!/bin/sh\necho 'Redis server v=7.2.5 sha=fixture'\n")
             redis.chmod(0o700)
+            redis_cli = root / "redis-cli"
+            redis_cli.write_text("#!/bin/sh\necho 'redis-cli 7.2.5'\n")
+            redis_cli.chmod(0o700)
             wheel = root / "adx_sandbox-1-py3-none-any.whl"
             wheel.write_bytes(b"fixture")
             output = root / "package"
-            manifest = pkg.assemble(binaries, redis, wheel, output, "a" * 40,
+            manifest = pkg.assemble(binaries, redis, redis_cli, wheel, output, "a" * 40,
                                     True, "test-fixture", "debug")
             self.assertEqual({p.name for p in (output / "bin").iterdir()},
-                             embedded | {"redis-server"})
+                             embedded | {"redis-server", "redis-cli"})
             for name in split:
                 self.assertNotIn(f"bin/{name}", manifest["files"])
             pkg.verify(output)
@@ -50,7 +56,7 @@ class PackageTests(unittest.TestCase):
     def test_missing_artifact_never_creates_package(self):
         with tempfile.TemporaryDirectory() as t:
             root=Path(t);out=root/"package"
-            with self.assertRaises(ValueError):pkg.assemble(root,root/"redis",root/"adx_sandbox-1.whl",out,"a"*40,True,"fixture","debug")
+            with self.assertRaises(ValueError):pkg.assemble(root,root/"redis",root/"redis-cli",root/"adx_sandbox-1.whl",out,"a"*40,True,"fixture","debug")
             self.assertFalse(out.exists())
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "installer targets Linux hosts")
@@ -61,10 +67,11 @@ class PackageTests(unittest.TestCase):
                 (binaries/name).write_bytes(b"fixture")
             (binaries/"adxctl").write_text("#!/bin/sh\nexit 0\n")
             redis=root/"redis";redis.write_text("#!/bin/sh\necho 'Redis server v=7.2.5 sha=fixture'\n");redis.chmod(0o700)
+            redis_cli=root/"redis-cli";redis_cli.write_text("#!/bin/sh\necho 'redis-cli 7.2.5'\n");redis_cli.chmod(0o700)
             wheel=root/"adx_sandbox-1-py3-none-any.whl";wheel.write_bytes(b"fixture wheel")
             package=root/"package"
             target=f"{platform.machine()}-unknown-linux-gnu"
-            pkg.assemble(binaries,redis,wheel,package,"a"*40,False,target,"debug")
+            pkg.assemble(binaries,redis,redis_cli,wheel,package,"a"*40,False,target,"debug")
             prefix=root/"opt/adx"
             bin_dir=root/"usr/local/bin"
             command=[str(package/"install.sh"),"--prefix",str(prefix),"--bin-dir",str(bin_dir)]
@@ -78,13 +85,14 @@ class PackageTests(unittest.TestCase):
             release=prefix/"releases"/("a"*40)
             self.assertEqual((prefix/"current").resolve(),release)
             self.assertEqual((bin_dir/"adxctl").resolve(),release/"bin/adxctl")
+            self.assertEqual(subprocess.check_output([release/"bin/redis-cli", "--version"], text=True).strip(), "redis-cli 7.2.5")
             self.assertEqual(subprocess.run([bin_dir/"adxctl"]).returncode,0)
             pkg.verify(release)
             config=prefix/"config/deployment.yaml";config.write_text("user config\n")
             state=prefix/"data/user-state";state.write_text("user state\n")
             runtime=prefix/"run/supervisor.sock";runtime.write_text("runtime state\n")
             upgraded_package=root/"upgraded-package"
-            pkg.assemble(binaries,redis,wheel,upgraded_package,"b"*40,False,target,"debug")
+            pkg.assemble(binaries,redis,redis_cli,wheel,upgraded_package,"b"*40,False,target,"debug")
             upgraded_command=[str(upgraded_package/"install.sh"),"--prefix",str(prefix),"--bin-dir",str(bin_dir)]
             upgraded=subprocess.run(upgraded_command,text=True,capture_output=True)
             self.assertEqual(upgraded.returncode,0,upgraded.stderr)

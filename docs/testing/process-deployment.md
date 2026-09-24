@@ -72,8 +72,8 @@ CLI 创建配置指定的数据目录，生成 `appendonly yes` 的 Redis 配置
 
 ```text
 package/
-├── bin/             adxctl、Coordinator、adxlet、Sandbox API、Ingress、Relay、forwarder、Redis
-├── runtime/         adx-execd
+├── bin/             adxctl、adx-coordinator、adxlet、adx-apiserver、redis-server、redis-cli
+├── runtime/         adx-execd、Linux release 的 runtime rootfs 镜像
 ├── sdk/             adx_sandbox wheel
 ├── etc/examples/    部署与组件配置示例
 ├── third_party/     Redis／sandboxd 来源与许可证
@@ -81,7 +81,7 @@ package/
 └── manifest.json    commit、dirty、target、profile、文件 SHA256
 ```
 
-`build/release/build.sh` 从当前源码构建原生 release 制品，显式要求 Cargo 缓存、目标架构、Redis 二进制和新输出目录。部署阶段只使用已构建包。`package.py assemble` 也可组装显式提供的开发制品，并按实际 profile 标注；不能将 debug 包当成 Linux release 验收。
+`build/release/build.sh` 从当前源码构建原生 release 制品，显式要求 Cargo 缓存、目标架构、同为 7.2.5 的 Redis Server 与 CLI 二进制，以及新输出目录。部署阶段只使用已构建包。`package.py assemble` 也可组装显式提供的开发制品，并按实际 profile 标注；不能将 debug 包当成 Linux release 验收。
 
 `package.py verify <directory>` 校验完整文件集合和哈希，拒绝缺失、额外文件、符号链接及内容变更。哈希用于与受信制品清单核对，本身不是签名或源码构建证明。真实 Buildkite 仍需从干净检出构建并交接这一批制品。
 
