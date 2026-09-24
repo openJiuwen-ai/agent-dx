@@ -97,7 +97,8 @@ def credentials(directory, image, runtime_image):
 
 
 class KubernetesRun(common.Run):
-    def __init__(self, output, kubeconfig, context=None, profile="k8s-basic"):
+    def __init__(self, output, kubeconfig, context=None, profile="k8s-basic",
+                 selected_case=None):
         super().__init__(output)
         self.kubectl = ['kubectl', '--kubeconfig', str(kubeconfig.resolve())]
         if context:
@@ -106,6 +107,7 @@ class KubernetesRun(common.Run):
         self.namespace_attempted = False
         self.harness = None
         self.profile = profile
+        self.stop_evidence = 'stop' in common.selected_checks(profile, selected_case)
 
     def kube(self, *args, timeout=180):
         return self.command([*self.kubectl, *args], timeout, stream=not any(
@@ -243,14 +245,14 @@ class KubernetesRun(common.Run):
             for node in reversed(self.nodes):
                 try:
                     # If the scenario already stopped it, skip the unavailable supervisor.
-                    action = 'cleanup' if self.profile == 'l0' else 'stop'
+                    action = 'stop' if self.stop_evidence else 'cleanup'
                     self.execute(node, 'sh', '-c', 'test -f /evidence/stop-' + node + '.json || '
                                  'python3 /opt/adx/e2e/node.py ' + action + ' ' + node, timeout=180)
                 except Exception as e:
                     errors.append(f'{node} stop: {e}')
                 try:
-                    # Stop writes the final metrics, trace, collection and logging results.
-                    # Copy after it completes so the build summary validates final evidence.
+                    # The selected stop case writes final observability evidence.
+                    # Always copy after teardown so the summary sees final diagnostics.
                     self.helper(node, 'collect', node, timeout=20)
                     self.kube('-n', self.id, 'cp', node + ':/evidence/.', str(self.output / node), '-c', 'platform', timeout=60)
                 except Exception as e:
@@ -281,8 +283,8 @@ def main():
     a = p.parse_args()
     output = a.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
-    run = KubernetesRun(output, a.kubeconfig, a.context, a.profile)
     checks = [];required=common.selected_checks(a.profile,a.case)
+    run = KubernetesRun(output, a.kubeconfig, a.context, a.profile, a.case)
     error = None
     def cancel(signum, frame):
         raise InterruptedError(f'canceled by signal {signum}')

@@ -103,7 +103,7 @@ class KubernetesLifecycleTests(unittest.TestCase):
     def test_failed_stop_still_deletes_owned_namespace_and_fails_cleanup(self):
         import json,tempfile
         with tempfile.TemporaryDirectory() as d:
-            run=self.module.KubernetesRun(Path(d),Path('/fixture/kubeconfig'))
+            run=self.module.KubernetesRun(Path(d),Path('/fixture/kubeconfig'),profile='full')
             run.namespace_attempted=True;run.namespace_uid='owned';run.nodes=['node1','node2']
             calls=[];deleted=False
             def kube(*args,**kwargs):
@@ -121,6 +121,26 @@ class KubernetesLifecycleTests(unittest.TestCase):
             self.assertTrue(deleted)
             self.assertEqual(len(errors),2)
             self.assertEqual([a[3].split(':')[0] for a in calls if len(a)>3 and a[2]=='cp'],['node2','node1'])
+
+    def test_targeted_restart_uses_basic_cleanup_without_stop_evidence(self):
+        import json,tempfile
+        with tempfile.TemporaryDirectory() as d:
+            run=self.module.KubernetesRun(Path(d),Path('/fixture/kubeconfig'),
+                                          profile='full',selected_case='restart')
+            run.namespace_attempted=True;run.namespace_uid='owned';run.nodes=['node1']
+            calls=[];deleted=False
+            def kube(*args,**kwargs):
+                nonlocal deleted
+                if args[:2]==('get','namespace'):
+                    return '' if deleted else json.dumps({'metadata':{'uid':'owned','labels':{'adx.e2e.run':run.id}}})
+                if args[:2]==('delete','namespace'):deleted=True
+                return ''
+            run.kube=kube
+            run.execute=lambda *args,**kwargs:calls.append(args)
+            run.helper=lambda *args,**kwargs:None
+            self.assertEqual(run.cleanup(),[])
+            self.assertTrue(deleted)
+            self.assertIn('node.py cleanup node1',calls[0][-1])
 
     def test_cleanup_stops_services_before_copying_final_evidence(self):
         import json,tempfile
