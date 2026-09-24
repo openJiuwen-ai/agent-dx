@@ -19,3 +19,5 @@ runtime_logs:
 每轮清理前先取得 sandboxd 实例清单。清单失败时不执行回收；仍在清单中的 runtime 日志不会清理。首次确认不在清单时将终止时间持久化到同目录的 `.terminated.json`。已终止日志最多保留 24 小时、50 对、压缩后合计 1 GiB；任一限制触发时从最早终止的 runtime 开始删除。运行中的日志不计入这些限额，目录空间需要单独监控。
 
 **当前没有安全的运行中轮转。** sandboxd 的 runsc 路径以 `O_TRUNC` 打开日志并保持文件描述符；从外部 `copytruncate` 后继续写入会从旧偏移产生稀疏空洞。Firecracker 与 runsc 的写入方式也不同。要给运行中日志设置硬上限，需要 sandboxd 支持重新打开文件或提供独立的流式日志输出；在此之前不要对这些文件使用外部 logrotate。终止后的压缩与回收不依赖该能力。
+
+standalone 的 `sdk` 验收使用真实 sandboxd 创建两个实例，随后在两个节点检查每个实例对应的 `<runtime-id>.out` 和 `<runtime-id>.err` 成对存在，结果记为 `runtime.host-stdout-stderr` 子用例。此项验证重定向链路；终止后压缩、24 小时和数量上限由 `platform/adxlet/tests/runtime_logs.rs` 验证。

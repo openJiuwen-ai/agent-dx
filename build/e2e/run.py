@@ -255,6 +255,15 @@ class Run:
                 for node in self.nodes:self.execute(node,'python3','/opt/adx/e2e/telemetry.py','outage-start',node)
                 output=self.execute('node1','/opt/adx/client/bin/python','-u','/opt/adx/e2e/scenarios.py','sdk',timeout=600)
                 record['subcases']=sdk_subcases_from_output(output)
+                instances=json.loads((self.output/'sdk/sdk-result.json').read_text())['instances']
+                runtime_ids=set()
+                for node in self.nodes:
+                    observed=json.loads(self.execute(node,'python3','/opt/adx/e2e/runtime_logs.py',*instances))
+                    runtime_ids.update(observed['runtime_ids'])
+                if not all(any(runtime_id.startswith(instance_id+'-') for runtime_id in runtime_ids)
+                           for instance_id in instances):
+                    raise AssertionError('sandboxd runtime stdout/stderr files missing')
+                record['subcases'].append({'id':'runtime.host-stdout-stderr','status':'passed','seconds':0})
                 for node in self.nodes:self.execute(node,'python3','/opt/adx/e2e/telemetry.py','outage-end',node)
                 self.helper('node1','postcheck')
                 for node in self.nodes:self.helper(node,'empty',node)
