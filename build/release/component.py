@@ -11,7 +11,7 @@ from pathlib import Path
 COMPONENTS = ("platform", "gateway", "execd")
 REQUIRED_FILES = {
     "platform": {"adxctl", "adx-inspect", "adx-coordinator", "adxlet"},
-    "gateway": {"adx-apiserver"},
+    "gateway": {"adx-apiserver", "adx-ingress", "adx-relay"},
     "execd": {"adx-execd", "adx-runtime-rootfs.img"},
 }
 

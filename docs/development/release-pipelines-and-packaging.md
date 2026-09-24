@@ -137,7 +137,7 @@ execd-images.json
 logs/、junit/
 ```
 
-当前发布包只提供默认共进程部署：`adx-apiserver` 内嵌 Ingress，`adxlet` 内嵌 Relay。独立 `adx-ingress`、`adx-relay` 和 `adx-data-plane-forward` 不随包发布；分进程能力保留在源码中，使用时需自行构建对应二进制。
+当前发布包默认共进程部署：`adx-apiserver` 内嵌 Ingress，`adxlet` 内嵌 Relay；同时提供 `adx-ingress` 和 `adx-relay`，供显式分进程部署。调试用 `adx-data-plane-forward` 不随包发布。
 
 平台包的 `bin/` 为 `adxctl`、`adx-coordinator`、`adxlet`、`adx-apiserver` 和
 `redis-server`；一体化归档继续包含 `runtime/adx-execd`、EROFS payload 与 SDK。
