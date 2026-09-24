@@ -33,7 +33,7 @@ Profiles are explicit:
 - `--profile l0` runs the minimum public SDK and authentication closure.
 - `--profile k8s-basic` is the default and runs five bounded groups: `sdk`,
   `auth`, `capacity`, `placement`, and `local-first`.
-- `--profile full` runs all ten functional, lifecycle and fault groups and additionally requires
+- `--profile full` runs all eleven functional, lifecycle and fault groups and additionally requires
   the two platform Pods to be placed on distinct physical workers. Actual Pod
   to worker placement is checked after scheduling and retained as evidence.
 
@@ -172,4 +172,4 @@ scenario required by the selected profile, with unexecuted required scenarios
 marked skipped and cleanup reported independently. A failed command or timeout
 still fails the acceptance.
 
-The `local-first` case switches only API Server into local-first mode, checks SDK concurrent create/execute/delete and confirmed local-claim evidence, then restores central mode. This case requires newly built artifacts; earlier seven-case runs do not validate it. [Buildkite #30](../../../docs/testing/2026-09-18-runtime-environment-k8s.md) passed the previous eight-case OCI profile. The current default basic profile is the bounded five-case gate; `data-plane`, `lifecycle`, `node-failure`, `restart`, and `stop` run under `full` and local `standalone`.
+The `local-first` case switches only API Server into local-first mode, checks SDK concurrent create/execute/delete and confirmed local-claim evidence, then restores central mode. This case requires newly built artifacts; earlier seven-case runs do not validate it. [Buildkite #30](../../../docs/testing/2026-09-18-runtime-environment-k8s.md) passed the previous eight-case OCI profile. The current default basic profile is the bounded five-case gate; `data-plane`, `lifecycle`, `node-failure`, `sandboxd-restart`, `restart`, and `stop` run under `full` and local `standalone`.
