@@ -105,10 +105,11 @@ async fn replicas_and_unknown_outcomes_keep_the_committed_identity() {
         Err(Error::OutcomeUnknown(_))
     ));
     assert!(matches!(
-        a.activate(
+        a.activate_with_cache(
             &scope("e"),
             None,
-            adx_agent_core::unix_time_millis() + 60_000
+            adx_agent_core::unix_time_millis() + 60_000,
+            true,
         )
         .await,
         Err(Error::Conflict(_))
@@ -160,10 +161,11 @@ async fn independent_environments_and_platform_readiness() {
         .ready = false;
     assert!(matches!(
         service
-            .activate(
+            .activate_with_cache(
                 &scope("a"),
                 None,
-                adx_agent_core::unix_time_millis() + 60_000
+                adx_agent_core::unix_time_millis() + 60_000,
+                true,
             )
             .await,
         Err(Error::NotReady(_))
@@ -198,7 +200,12 @@ async fn first_traffic_creates_one_environment_across_activators() {
     assert_eq!(platform.observations.lock().unwrap().len(), 1);
     a.delete_environment(&scope).await.unwrap();
     let recreated = b
-        .activate(&scope, None, adx_agent_core::unix_time_millis() + 60_000)
+        .activate_with_cache(
+            &scope,
+            None,
+            adx_agent_core::unix_time_millis() + 60_000,
+            true,
+        )
         .await
         .unwrap();
     assert_ne!(

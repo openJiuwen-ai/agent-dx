@@ -10,6 +10,7 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+tracing = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 adx-agent-core = { path = "../crates/core" }
 adx-activator = { path = "../activator" }
@@ -23,6 +24,7 @@ uuid = { version = "1", features = ["v4", "v5"] }
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 
 [dev-dependencies]
+redis = { version = "1.7", default-features = false, features = ["tokio-comp"] }
 adx-activator = { path = "../activator" }
 axum = { version = "0.7", default-features = false, features = ["http1", "json", "tokio"] }
 adx-agent-store = { path = "../crates/store", features = ["test-memory"] }

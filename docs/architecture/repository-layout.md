@@ -1,6 +1,6 @@
 # Agent DX 当前目录与组件边界
 
-核对日期：2026-09-23。此页描述当前源码布局；首次导入记录保留在 [迁移报告](../migration/2026-09-14-import.md)。[HTML 阅读版](repository-layout.html) 从本文件生成，架构图为仓库内 SVG。
+核对日期：2026-09-24。此页描述当前源码布局；首次导入记录保留在 [迁移报告](../migration/2026-09-14-import.md)。[HTML 阅读版](repository-layout.html) 从本文件生成，架构图为仓库内 SVG。
 
 ![当前组件与调用方向](../../assets/architecture/current-architecture.svg)
 
@@ -13,7 +13,9 @@
 | 执行平台 `platform/` | 通用 Environment、调度、持久化、节点生命周期、Execd | Coordinator、adxlet、本地优先创建及 EROFS/OCI 运行环境已接入；沿用已有实现；本次验证见 [命名调整记录](../testing/environment-naming.md) |
 | 共享接入 `gateway/` | Sandbox API Server、Ingress、Relay、反向代理与转发 | API Server 默认内嵌 Ingress；adxlet 默认内嵌 Relay；Agent API 装配于 Ingress，业务规则归 Agent 层 |
 
-Agent API 在 Gateway Ingress 内处理产品请求。独立模式通过 ActivatorClient 调用 Activator，后者通过 Gateway Sandbox HTTP 接口访问平台；API Server 内嵌模式通过 LocalControl 调用同进程 Activator，后者直接复用 API Server 的 Sandbox 应用服务。两种模式的 Template/Environment 产品状态均由 Activator 管理并存入 Redis。Agent 不直接操作平台 Redis/SQLite 或 sandboxd。inline 生命周期和 exec/files 直接适配 Sandbox/Execd，独立于 Activator。用户 Harness 的 HTTP/WS/SSH 经共享数据面转发，业务协议由用户定义。
+Agent API 在 Gateway Ingress 内处理产品请求。独立模式通过 ActivatorClient 调用远程 Activator，后者经 Gateway Sandbox HTTP 接口访问平台；API Server 内嵌模式通过 LocalControl 调用同进程 Activator，直接复用 Sandbox 应用服务。两种模式均由 Activator 持久化 Template/Environment。Gateway 与 Activator 均缓存不可变模板；Activator 的 Env 成功绑定采用有界 LRU，默认 200000 条、5 小时滑动 TTL，请求命中续期，过期检查只随请求发生。独立模式全热解析只有一次 Activator RPC，嵌入式模式仅本地调用，不访问 Agent Redis 或 Sandbox API。bypass 在查询权威状态前失效旧绑定，HTTP/WS 的发送前目标重试自动启用并固定 generation；删除中的并发请求允许成功或失败，缓存不代表实时健康。
+
+独立 Activator 模式下，Gateway 按完整 Env scope 做 Rendezvous Hash 亲和路由；静态直达实例列表和 Redis 注册发现二选一。启用发现时，Activator 默认每 5 秒续租 15 秒成员租约，Gateway 约每 5 秒刷新本地列表；请求路径不访问注册目录。Gateway 只读取独立注册键，Template/Environment 权威元数据仍仅由 Activator 访问。成员变化和故障转移只改变缓存归属，不迁移 Sandbox，不新增生命周期控制器。Agent 不直接操作平台 Redis/SQLite 或 sandboxd。inline 生命周期和 exec/files 直接适配 Sandbox/Execd，独立于 Activator。用户 Harness 的 HTTP/WS/SSH 经共享数据面转发，业务协议由用户定义。
 
 API Server 仍保留原有九条 `/api/agent` 兼容转发路由，由 `agent_address` 指向外部 Agent 服务；这是平台侧既有入口，不属于当前 Ingress Agent API／Activator 链路，本轮保持不变。
 

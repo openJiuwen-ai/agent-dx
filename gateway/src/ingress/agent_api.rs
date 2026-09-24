@@ -18,7 +18,9 @@ use std::{sync::Arc, time::Duration};
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ActivatorConfig {
+    #[serde(default)]
     pub urls: Vec<String>,
+    pub discovery: Option<adx_agent_api::discovery::DiscoveryConfig>,
     pub token_env: String,
     pub ca_path: Option<String>,
     #[serde(default)]
@@ -71,13 +73,30 @@ impl AgentApi {
         let token = std::env::var(&settings.token_env)
             .map_err(|_| Error::Invalid("Activator token environment variable missing".into()))?;
         let ca = settings.ca_path.map(std::fs::read).transpose()?;
-        let control = Arc::new(ActivatorClient::new(
-            settings.urls,
-            token,
-            request_timeout,
-            ca.as_deref(),
-            settings.allow_plaintext,
-        )?);
+        let control = Arc::new(match settings.discovery {
+            Some(discovery) => {
+                if !settings.urls.is_empty() {
+                    return Err(Error::Invalid(
+                        "configure either activator.urls or discovery".into(),
+                    )
+                    .into());
+                }
+                ActivatorClient::with_discovery(
+                    discovery,
+                    token,
+                    request_timeout,
+                    ca.as_deref(),
+                    settings.allow_plaintext,
+                )?
+            }
+            None => ActivatorClient::new(
+                settings.urls,
+                token,
+                request_timeout,
+                ca.as_deref(),
+                settings.allow_plaintext,
+            )?,
+        });
         Ok(Self {
             managed: Arc::new(ManagedService::new(control)),
             request_timeout,
@@ -131,6 +150,8 @@ impl AgentApi {
 struct ResolveInput {
     protocol: Protocol,
     port: Option<u16>,
+    #[serde(default, rename = "bypasscache")]
+    bypass_cache: bool,
 }
 fn segment(value: &str) -> Result<String, Error> {
     let value = percent_encoding::percent_decode_str(value)
@@ -237,7 +258,7 @@ impl AgentApi {
                 let input: ResolveInput = decode_body(body).await?;
 
                 let (target, port) = managed
-                    .resolve(ctx, &scope, input.protocol, input.port)
+                    .resolve_with_cache(ctx, &scope, input.protocol, input.port, input.bypass_cache)
                     .await?;
                 Ok(
                     serde_json::json!({"sandbox_id":target.environment.sandbox_id,"port":port,"protocol":input.protocol}),
