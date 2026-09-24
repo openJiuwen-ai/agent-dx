@@ -143,8 +143,26 @@ python3 build/e2e/multivm/placement_policy.py \
 
 Repeat with a separately deployed `spread` configuration and matching
 `--placement spread`. `capacity-queue-result.json` and both placement results
-are separate evidence; none has yet passed on three real VMs. Node preference
-scoring remains a separate `MV-03` check.
+are separate evidence; none has yet passed on three real VMs.
+
+`node_preferences.py` extends `MV-03` on a central deployment. It pins one
+labelled anchor to each worker, then checks weighted and ordered node
+preferences, Environment affinity OR, anti-affinity, and an explicit node
+constraint combined with OR conditions. Each public SDK result is checked
+against the persisted assignment, the single physical sandboxd backend and
+a real command. It deletes its own instances and verifies terminal cleanup.
+
+```sh
+python3 build/e2e/multivm/node_preferences.py \
+  --inventory out/e2e/3vm/inventory.json \
+  --endpoint control.example:8443 \
+  --token-file /path/to/tenant-key \
+  --ca /path/to/ingress-ca.pem \
+  --image registry.example/team/rrt@sha256:DIGEST \
+  --output out/e2e/3vm/node-preferences
+```
+
+This case has not yet passed on real VMs.
 
 `worker_restart.py` covers the quick-restart portion of `MV-07`: it kills only
 worker 2's adxlet child, lets `adxctl` restart it, and checks that the new
@@ -262,7 +280,7 @@ python3 build/e2e/multivm/suite.py \
   --release /path/to/adx-release.tar.gz \
   --image registry.example/team/rrt@sha256:DIGEST \
   --output out/e2e/3vm/suite \
-  --case sdk --case capacity --case placement-pack \
+  --case sdk --case capacity --case placement-pack --case node-preferences \
   --case worker-failure --case worker-restart --case control-restart
 ```
 
