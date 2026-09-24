@@ -88,8 +88,12 @@ Local Docker reproduction requires access to the same bind-mounted paths as the 
   waits, then release capacity and require that request to become executable.
 - `placement`: use the public SDK on two nodes to verify environment affinity OR,
   instance anti-affinity, weighted and ordered node preferences, node ID
-  constraints on every OR branch, and reverse instance anti-affinity; verify
-  actual assignments, execute a command and check physical cleanup.
+  constraints on every OR branch, and reverse instance anti-affinity. Require
+  both nodes to report their live `runc`-only sandboxd runtime inventories;
+  requesting `runsc` on node1 must expire in the central scheduling queue
+  without an assignment or held resources. Verify actual assignments, execute
+  a command and check physical cleanup. A separate heterogeneous-runtime E2E
+  requires nodes with different sandboxd inventories.
 - `local-first`: restart API Server with `create_mode: "local_first"`, verify
   entry-node rotation, concurrent same-name creation converging to one Environment,
   conflicting specifications rejected, real EXECD commands, and physical cleanup.

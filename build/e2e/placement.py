@@ -1,7 +1,10 @@
 """Installed SDK placement acceptance; Redis is read only for observed assignments."""
 import json
-from adx_sandbox import Sandbox
+import uuid
+
+from adx_sandbox import Sandbox, SandboxError
 from node import catalog
+from runtime_inventory import require_runc_only_inventory, require_unassigned_create
 
 
 def run(connection, image, output):
@@ -28,6 +31,9 @@ def run(connection, image, output):
         report['cases'].append({'name':name,'expected_node':expected,'actual_node':actual,'instance_id':sandbox.id,'passed':True})
         print('[PLACEMENT PASS]',name,'node='+actual,flush=True)
     try:
+        inventories=require_runc_only_inventory(catalog())
+        report['cases'].append({'name':'sandboxd runtime inventory','runtime_classes':inventories,'passed':True})
+        print('[PLACEMENT PASS] sandboxd runtime inventory '+json.dumps(inventories,sort_keys=True),flush=True)
         left=create(node_id='node1',labels={'peer':'left'})
         right=create(node_id='node2',labels={'peer':'right'})
         assert (assigned(left),assigned(right))==('node1','node2')
@@ -41,6 +47,22 @@ def run(connection, image, output):
         assert assigned(guard)=='node1'
         # Prefer node1 to prove that the existing peer's required anti-affinity wins.
         verify('reverse instance anti-affinity','node2',labels={'future':'yes'},schedule_affinities=[condition(0,0,'NODE_ID','node1',weight=1000)])
+        rejected_name='runtime-rejected-'+uuid.uuid4().hex[:12]
+        rejected_id='default-'+rejected_name
+        print('[PLACEMENT RUN] unavailable runtime stays unassigned',flush=True)
+        try:
+            unexpected=Sandbox(name=rejected_name,image=image,runtime='runsc',node_id='node1',
+                               cpu=250,memory=256,idle_timeout=0,connection=connection,
+                               schedule_timeout=3,create_timeout=40)
+        except SandboxError as error:
+            assert 'central scheduling queue deadline exceeded' in str(error),str(error)
+        else:
+            handles.append(unexpected);report['instances'].append(unexpected.id)
+            raise AssertionError('runsc was assigned to a runc-only node')
+        require_unassigned_create(catalog(),rejected_id)
+        report['cases'].append({'name':'unavailable runtime stays unassigned','runtime':'runsc',
+                                'node_id':'node1','passed':True})
+        print('[PLACEMENT PASS] unavailable runtime stays unassigned',flush=True)
         report['status']='passed'
     except Exception as error:
         report['error']=str(error)
