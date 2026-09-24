@@ -64,6 +64,14 @@
     "gate": "提供兼容的 runsc 二进制与 OCI 测试镜像，在异构双节点上运行 --profile full --case runtime-affinity，保存实际 inventory、assignment、执行与清理证据。"
   },
   {
+    "id": "idle-active-request",
+    "title": "活动客户端请求跨越空闲阈值",
+    "stage": "7",
+    "status": "pending",
+    "detail": "独立客户端退出后仍有后台命令的空闲回收已在 Full #22 验证。新增定向 idle-active 用例覆盖相反条件：前台 SDK 请求持续超过空闲阈值时实例不得被回收，结束后才允许空闲删除；真实部署尚未执行。",
+    "gate": "在真实 standalone/full 部署执行 --case idle-active，保留请求时长、请求结束前 Running 状态、结束后 Deleted 状态和资源释放证据。"
+  },
+  {
     "id": "service-soak",
     "title": "真实服务混合负载与长稳",
     "stage": "5",
