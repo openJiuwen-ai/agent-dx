@@ -27,16 +27,16 @@
     "id": "e2e-full-cross-worker",
     "title": "Full K8s 跨物理 worker 验收",
     "stage": "7",
-    "status": "pending",
-    "detail": "full profile 已在部署后强制检查两个平台 Pod 位于不同 Kubernetes worker；历史 Buildkite #30 为同宿主 k8s-basic。",
-    "gate": "在至少两个可用物理 worker 上运行 full profile，八组、可观测、逐项 JUnit、物理 placement 和 namespace 清理全部通过。"
+    "status": "complete",
+    "detail": "Buildkite Full #17 在两个不同物理 worker 同次通过 11 组、JUnit 45 项、可观测与最终资源和 namespace 清理；两个 Pod 分别位于 10.244.128.124 和 10.244.128.160。",
+    "gate": "在至少两个可用物理 worker 上运行 full profile，十一组、可观测、逐项 JUnit、物理 placement 和 namespace 清理全部通过。"
   },
   {
     "id": "e2e-resilience-expansion",
     "title": "Standalone 与正式部署韧性扩展",
     "stage": "7",
     "status": "pending",
-    "detail": "Redis/SQLite 降级、空闲删除、实例自动重启、Coordinator/API/Ingress 独立重启及 Redis AOF/PV 恢复尚未形成统一 E2E 门禁。",
+    "detail": "Buildkite Full #18 已定向验证托管 Redis 的 SIGKILL 重启与 AOF 开启后双节点实例归属、代次、后端和命令保持一致；持久卷跨 Pod 恢复、SQLite 降级、实例自动重启及 Coordinator/API/Ingress 独立重启仍缺 E2E 证据。空闲删除已有独立验收。",
     "gate": "按 ST-06..10 和 FD-06..08 增加真实故障用例，保存客户端、权威状态和物理后端三类证据。"
   },
   {
