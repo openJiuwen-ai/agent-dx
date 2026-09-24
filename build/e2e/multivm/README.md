@@ -120,8 +120,31 @@ python3 build/e2e/multivm/capacity_queue.py \
   --output out/e2e/3vm/capacity
 ```
 
-Pack/Spread configuration and preference scoring remain separate `MV-03`
-checks; `capacity-queue-result.json` alone is not a full `MV-03` pass.
+`placement_policy.py` checks the Pack/Spread part of `MV-03` through two
+unpinned public SDK creates and persisted/physical placement. Run it twice,
+once against a deployment with Coordinator `placement: pack` and once after
+deploying `placement: spread`. API Server must use central create mode; a
+local-first entry bypasses global scoring. The case checks the resolved
+deployment configuration and rejects nodes whose initial free-resource
+fractions differ enough to make the two-request expectation ambiguous. Each
+worker needs at least 1,000 millicores and 1,024 MiB free. The test releases
+both Sandboxes and checks persisted deletion and resource/backend cleanup.
+
+```sh
+python3 build/e2e/multivm/placement_policy.py \
+  --inventory out/e2e/3vm/inventory.json \
+  --endpoint control.example:8443 \
+  --token-file /path/to/tenant-key \
+  --ca /path/to/ingress-ca.pem \
+  --image registry.example/team/rrt@sha256:DIGEST \
+  --placement pack \
+  --output out/e2e/3vm/placement-pack
+```
+
+Repeat with a separately deployed `spread` configuration and matching
+`--placement spread`. `capacity-queue-result.json` and both placement results
+are separate evidence; none has yet passed on three real VMs. Node preference
+scoring remains a separate `MV-03` check.
 
 `worker_restart.py` covers the quick-restart portion of `MV-07`: it kills only
 worker 2's adxlet child, lets `adxctl` restart it, and checks that the new
