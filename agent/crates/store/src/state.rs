@@ -1,9 +1,14 @@
 //! Product metadata transactions. Sandbox lifecycle belongs to Platform.
 use crate::*;
 use adx_agent_core::activator::{EnvironmentList, EnvironmentPage};
+use adx_agent_core::cache::BoundedCache;
 use adx_agent_core::{limits, Environment, EnvironmentPhase, Scope, TemplateVersion};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use std::sync::Arc;
+use tokio::sync::{Mutex, OnceCell};
+
+const TEMPLATE_CACHE_ENTRIES: usize = 1024;
+type TemplateCell = Arc<OnceCell<TemplateVersion>>;
 
 #[derive(Serialize, Deserialize)]
 struct PageCursor {
@@ -14,6 +19,7 @@ struct PageCursor {
 #[derive(Clone)]
 pub struct AgentState {
     store: Arc<dyn Repository>,
+    templates: Arc<Mutex<BoundedCache<Key, TemplateCell>>>,
 }
 pub(crate) fn environment_key(scope: &Scope) -> Result<Key> {
     scope.validate().map_err(Error::Invalid)?;
@@ -41,7 +47,10 @@ fn put<T: Serialize>(key: &Key, value: &T) -> Result<Put> {
 }
 impl AgentState {
     pub fn new(store: Arc<dyn Repository>) -> Self {
-        Self { store }
+        Self {
+            store,
+            templates: Arc::new(Mutex::new(BoundedCache::new(TEMPLATE_CACHE_ENTRIES))),
+        }
     }
     pub async fn publish(&self, tenant: &str, template: &TemplateVersion) -> Result<()> {
         adx_agent_core::identifier(tenant, "tenant").map_err(Error::Invalid)?;
@@ -77,11 +86,31 @@ impl AgentState {
         name: &str,
         version: &str,
     ) -> Result<Option<TemplateVersion>> {
-        self.store
-            .get(&Key::new("template", &[tenant, name, version])?)
-            .await?
-            .map(|r| r.decode())
-            .transpose()
+        let key = Key::new("template", &[tenant, name, version])?;
+        let cell = {
+            let mut templates = self.templates.lock().await;
+            match templates.get(&key) {
+                Some(cell) => cell.clone(),
+                None => {
+                    let cell = Arc::new(OnceCell::new());
+                    templates.insert(key.clone(), cell.clone());
+                    cell
+                }
+            }
+        };
+        // Only immutable published values are retained. Missing/error results leave the cell
+        // empty, so a later publication or recovered repository can be observed immediately.
+        match cell
+            .get_or_try_init(|| async {
+                let record = self.store.get(&key).await.map_err(Some)?;
+                record.ok_or(None)?.decode().map_err(Some)
+            })
+            .await
+        {
+            Ok(template) => Ok(Some(template.clone())),
+            Err(None) => Ok(None),
+            Err(Some(error)) => Err(error),
+        }
     }
     pub async fn environment(&self, scope: &Scope) -> Result<Option<Environment>> {
         self.store

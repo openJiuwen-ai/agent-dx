@@ -138,7 +138,12 @@ async fn activate(
     p.start_write();
     match s
         .activator
-        .activate(&r.scope, r.expected_generation.as_deref(), deadline)
+        .activate_with_cache(
+            &r.scope,
+            r.expected_generation.as_deref(),
+            deadline,
+            r.bypass_cache,
+        )
         .await
     {
         Ok(v) => Json(v).into_response(),

@@ -9,5 +9,11 @@
   "env_cache": {
     "capacity": 200000,
     "idle_seconds": 18000
+  },
+  "registration": {
+    "instance_id": "activator-local-1",
+    "advertise_url": "http://127.0.0.1:8091",
+    "lease_seconds": 15,
+    "heartbeat_seconds": 5
   }
 }

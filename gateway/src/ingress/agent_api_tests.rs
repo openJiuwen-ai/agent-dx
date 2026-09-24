@@ -14,7 +14,10 @@ use adx_agent_core::{
 use adx_agent_store::{AgentState, MemoryRepository};
 
 #[derive(Default)]
-struct Backend(Mutex<std::collections::HashMap<(String, String), SandboxObservation>>);
+struct Backend(
+    Mutex<std::collections::HashMap<(String, String), SandboxObservation>>,
+    std::sync::atomic::AtomicUsize,
+);
 #[async_trait::async_trait]
 impl Sandbox for Backend {
     async fn list(&self, tenant: &str) -> Result<Vec<SandboxInfo>, SandboxError> {
@@ -54,6 +57,7 @@ impl Sandbox for Backend {
         tenant: &str,
         id: &str,
     ) -> Result<Option<SandboxObservation>, SandboxError> {
+        self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let entries = self.0.lock().unwrap();
         let observed = entries.get(&(tenant.into(), id.into())).cloned();
         if observed.is_none() && entries.keys().any(|(_, instance)| instance == id) {
@@ -503,10 +507,11 @@ async fn independent_activators_share_redis_identity() {
 #[tokio::test]
 async fn managed_environment_management_and_protocol_forwarding() {
     let (gateway, _) = fixture().await;
+    let backend = Arc::new(Backend::default());
     let control = Arc::new(
         remote_control(adx_activator::Activator::new(
             AgentState::new(Arc::new(MemoryRepository::default())),
-            Arc::new(Backend::default()),
+            backend.clone(),
         ))
         .await,
     );
@@ -608,6 +613,40 @@ async fn managed_environment_management_and_protocol_forwarding() {
     let resolved = json(response).await;
     assert_eq!(resolved["sandbox_id"], id);
     assert_eq!(resolved["port"], 22);
+    assert_eq!(
+        backend.1.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "default resolve reuses successful activation"
+    );
+    let response = sender
+        .send_request(request(
+            "POST",
+            &format!("{path}/resolve"),
+            "tenant",
+            "refresh",
+            serde_json::json!({"protocol":"http", "bypasscache":true}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(json(response).await["sandbox_id"], id);
+    assert_eq!(
+        backend.1.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "public bypasscache reaches Sandbox GET"
+    );
+    let response = sender
+        .send_request(request(
+            "POST",
+            &format!("{path}/resolve"),
+            "tenant",
+            "invalid-refresh",
+            serde_json::json!({"protocol":"http", "bypasscache":"true"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    json(response).await;
     for protocol in ["http", "ws"] {
         let mut builder = Request::builder()
             .uri(format!(
@@ -623,7 +662,13 @@ async fn managed_environment_management_and_protocol_forwarding() {
             .await
             .unwrap();
         assert_eq!(data.uri().to_string(), format!("/{id}/8080/path?q=1"));
+        let before = backend.1.load(std::sync::atomic::Ordering::SeqCst);
         assert!(api.retry_data(&mut data).await.unwrap());
+        assert_eq!(
+            backend.1.load(std::sync::atomic::Ordering::SeqCst),
+            before + 1,
+            "managed retry bypasses activation cache"
+        );
         assert!(!api.retry_data(&mut data).await.unwrap());
     }
     let mut pending = Request::builder()

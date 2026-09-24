@@ -1,15 +1,22 @@
-//! Gateway product facade. Product state and Sandbox lifecycle stay behind the independent Activator.
+//! Gateway product facade. Product state and Sandbox lifecycle stay behind the Activator.
 use crate::request::RequestContext;
 use crate::{activator::Control, Error, Result};
+use adx_agent_core::cache::BoundedCache;
 use adx_agent_core::{activator::Target, target::Target as AccessTarget, *};
 use std::sync::Arc;
+use tokio::sync::{Mutex, OnceCell};
+type TemplateKey = (String, String, String);
 
 pub struct ManagedService {
     control: Arc<dyn Control>,
+    templates: Mutex<BoundedCache<TemplateKey, Arc<OnceCell<TemplateVersion>>>>,
 }
 impl ManagedService {
     pub fn new(control: Arc<dyn Control>) -> Self {
-        Self { control }
+        Self {
+            control,
+            templates: Mutex::new(BoundedCache::new(1024)),
+        }
     }
     /// Select an Environment identity without creating product or Sandbox state.
     /// Returns Invalid for an inline target or invalid scope components.
@@ -68,13 +75,35 @@ impl ManagedService {
         name: &str,
         version: &str,
     ) -> Result<TemplateVersion> {
-        let value = self.control.template(ctx, tenant, name, version).await?;
-        if value.name != name || value.version != version {
-            return Err(Error::Unavailable("template identity mismatch".into()));
+        for value in [tenant, name, version] {
+            identifier(value, "template scope").map_err(Error::Invalid)?;
         }
-        value.validate().map_err(Error::Invalid)?;
-        Ok(value)
+        ctx.run(async {
+            let key = (tenant.to_owned(), name.to_owned(), version.to_owned());
+            let cell = {
+                let mut templates = self.templates.lock().await;
+                if let Some(cell) = templates.get(&key) {
+                    cell.clone()
+                } else {
+                    let cell = Arc::new(OnceCell::new());
+                    templates.insert(key, cell.clone());
+                    cell
+                }
+            };
+            cell.get_or_try_init(|| async {
+                let value = self.control.template(ctx, tenant, name, version).await?;
+                if value.name != name || value.version != version {
+                    return Err(Error::Unavailable("template identity mismatch".into()));
+                }
+                value.validate().map_err(Error::Invalid)?;
+                Ok(value)
+            })
+            .await
+            .cloned()
+        })
+        .await
     }
+
     pub async fn environment(&self, ctx: &RequestContext, scope: &Scope) -> Result<Environment> {
         self.control.environment(ctx, scope).await
     }
@@ -90,7 +119,7 @@ impl ManagedService {
         self.control.delete_environment(ctx, scope).await
     }
 
-    /// Each request validates the service and activates against authoritative product state.
+    /// Each request validates the service; the Activator may reuse a cached Env binding.
     pub async fn resolve(
         &self,
         ctx: &RequestContext,
@@ -98,7 +127,19 @@ impl ManagedService {
         protocol: Protocol,
         port: Option<u16>,
     ) -> Result<(Target, u16)> {
-        self.resolve_generation(ctx, scope, protocol, port, None)
+        self.resolve_with_cache(ctx, scope, protocol, port, false)
+            .await
+    }
+    /// Resolve with an explicit successful-binding cache bypass; immutable templates stay cached.
+    pub async fn resolve_with_cache(
+        &self,
+        ctx: &RequestContext,
+        scope: &Scope,
+        protocol: Protocol,
+        port: Option<u16>,
+        bypass_cache: bool,
+    ) -> Result<(Target, u16)> {
+        self.resolve_generation(ctx, scope, protocol, port, None, bypass_cache)
             .await
     }
     /// A retry of the same incoming request must not start a new lifecycle after deletion.
@@ -110,7 +151,7 @@ impl ManagedService {
         port: u16,
         generation: &str,
     ) -> Result<(Target, u16)> {
-        self.resolve_generation(ctx, scope, protocol, Some(port), Some(generation))
+        self.resolve_generation(ctx, scope, protocol, Some(port), Some(generation), true)
             .await
     }
     async fn resolve_generation(
@@ -120,13 +161,17 @@ impl ManagedService {
         protocol: Protocol,
         port: Option<u16>,
         generation: Option<&str>,
+        bypass_cache: bool,
     ) -> Result<(Target, u16)> {
         scope.validate().map_err(Error::Invalid)?;
         let template = self
             .template(ctx, &scope.tenant, &scope.template, &scope.version)
             .await?;
         let port = Self::select_service(&template, protocol, port)?;
-        let target = self.control.activate(ctx, scope, generation).await?;
+        let target = self
+            .control
+            .activate_with_cache(ctx, scope, generation, bypass_cache)
+            .await?;
         if target.environment.scope != *scope
             || target.environment.phase != EnvironmentPhase::Active
             || target.environment.generation.is_empty()
