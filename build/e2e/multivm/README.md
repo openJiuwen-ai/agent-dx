@@ -73,3 +73,27 @@ command/file transport. Deployment, scheduler capacity/queue, local-first,
 fault recovery, route-catalog inspection and ordered service shutdown still
 require their own executable checks before `verify.py` can report full
 Multi-VM acceptance. The SDK subset does not stop the shared services.
+
+`worker_failure.py` exercises heartbeat expiry and returning-worker cleanup.
+Run it only on dedicated test VMs after the SDK subset passes. The configured
+SSH account on worker 2 needs non-interactive `sudo -n kill` permission. The
+script stops only the adxlet process with `SIGSTOP` and always sends `SIGCONT`
+on its failure path. It asserts that an initially working route is invalidated,
+worker 1 continues serving, worker 2 clears the stale sandboxd backend before
+readmission with a new session, and a fresh pinned Sandbox works on worker 2.
+Its wait budgets are 90 seconds for heartbeat expiry and 90 seconds for
+reconciliation, plus creation and cleanup time.
+
+```sh
+python3 build/e2e/multivm/worker_failure.py \
+  --inventory out/e2e/3vm/inventory.json \
+  --endpoint control.example:8443 \
+  --token-file /path/to/tenant-key \
+  --ca /path/to/ingress-ca.pem \
+  --image registry.example/team/rrt@sha256:DIGEST \
+  --output out/e2e/3vm/worker-failure
+```
+
+This produces `worker-failure-result.json`. It is the `MV-06` subset, not the
+complete Multi-VM result contract. Run `sdk_accept.py` first with the same
+inventory and release archive.
