@@ -21,7 +21,7 @@ class AcceptanceGateTests(unittest.TestCase):
         self.assertEqual(
             set(driver.required_for_profile('standalone')),
             {'sdk', 'data-plane', 'lifecycle', 'auth', 'capacity', 'placement',
-             'local-first', 'node-failure', 'restart', 'stop'},
+             'local-first', 'node-failure', 'sandboxd-restart', 'restart', 'stop'},
         )
         self.assertEqual(
             driver.required_for_profile('k8s-basic'),
@@ -42,7 +42,7 @@ class AcceptanceGateTests(unittest.TestCase):
         self.assertEqual(report['status'], 'passed')
         self.assertEqual(report['missing_checks'], [])
         self.assertTrue(
-            {'data-plane', 'lifecycle', 'node-failure', 'restart', 'stop'}.isdisjoint(required)
+            {'data-plane', 'lifecycle', 'node-failure', 'sandboxd-restart', 'restart', 'stop'}.isdisjoint(required)
         )
 
     def test_junit_reports_each_required_case_and_cleanup(self):
@@ -127,26 +127,46 @@ class AcceptanceGateTests(unittest.TestCase):
     def test_complete_clean_run_passes(self):
         self.assertEqual(driver.finish_report(None, [], [
             'sdk', 'data-plane', 'lifecycle', 'auth', 'capacity', 'placement',
-            'local-first', 'node-failure', 'restart', 'stop'])['status'], 'passed')
+            'local-first', 'node-failure', 'sandboxd-restart', 'restart', 'stop'])['status'], 'passed')
+
+    def test_sandboxd_restart_checks_existing_instances_before_cleanup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = driver.Run(Path(directory))
+            run.nodes = ['node1', 'node2']
+            calls = []
+            run.execute = lambda node, *args, **kwargs: calls.append(('execute', node, args[-1])) or ''
+            run.helper = lambda node, *args, **kwargs: calls.append(('helper', node, args[0])) or ''
+            checks = []
+            run.scenarios(checks, ('sandboxd-restart',))
+            self.assertEqual(checks, ['sandboxd-restart'])
+            self.assertEqual(calls, [
+                ('execute', 'node1', 'create'),
+                ('helper', 'node1', 'restart-sandboxd'),
+                ('helper', 'node2', 'restart-sandboxd'),
+                ('execute', 'node1', 'recovered'),
+                ('execute', 'node1', 'cleanup-live'),
+                ('helper', 'node1', 'empty'),
+                ('helper', 'node2', 'empty'),
+            ])
 
     def test_old_eight_scenarios_without_functional_data_plane_cannot_pass(self):
         report = driver.finish_report(None, [], [
             'sdk', 'auth', 'capacity', 'placement', 'local-first',
-            'node-failure', 'restart', 'stop'])
+            'node-failure', 'sandboxd-restart', 'restart', 'stop'])
         self.assertEqual(report['status'], 'failed')
         self.assertEqual(report['missing_checks'], ['data-plane', 'lifecycle'])
 
     def test_missing_node_failure_scenario_cannot_pass(self):
         report = driver.finish_report(None, [], ['sdk', 'data-plane', 'lifecycle',
                                                 'auth', 'capacity', 'placement',
-                                                'local-first', 'restart', 'stop'])
+                                                'local-first', 'sandboxd-restart', 'restart', 'stop'])
         self.assertEqual(report['status'], 'failed')
         self.assertEqual(report['missing_checks'], ['node-failure'])
 
     def test_old_seven_scenarios_without_local_first_cannot_pass(self):
         report = driver.finish_report(None, [], ['sdk', 'data-plane', 'lifecycle',
                                                 'auth', 'capacity', 'placement',
-                                                'node-failure', 'restart', 'stop'])
+                                                'node-failure', 'sandboxd-restart', 'restart', 'stop'])
         self.assertEqual(report['status'], 'failed')
         self.assertEqual(report['missing_checks'], ['local-first'])
 

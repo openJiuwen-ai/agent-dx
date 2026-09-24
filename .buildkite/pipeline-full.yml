@@ -39,7 +39,7 @@ steps:
               secretKeyRef: {name: swr-pull-secret, key: .dockerconfigjson, optional: true}
         volumes:
         - {name: docker-graph, emptyDir: {}}
-- label: ':kubernetes: ADX Full acceptance (10 groups)'
+- label: ':kubernetes: ADX Full acceptance (11 groups)'
   key: platform-e2e
   depends_on: platform-images
   agents:

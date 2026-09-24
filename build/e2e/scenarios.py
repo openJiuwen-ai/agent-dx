@@ -105,6 +105,7 @@ elif sys.argv[1]=='create':
         for _ in range(2):
             s=Sandbox(image=image,runtime='runc',cpu=500,memory=512,idle_timeout=0,connection=connection,create_timeout=150)
             instances.append(s);assert s.is_running()
+            s.files.write('/tmp/adx-e2e-restart-marker',s.id)
             event('Created instance for restart check: '+s.id)
         (E/'live-instances.json').write_text(json.dumps([s.id for s in instances]))
     finally:
@@ -124,6 +125,15 @@ elif sys.argv[1]=='failure-cleanup':
         assert result['state']=='Deleted' and not result['resources_held']
     (E/'node-failure-result.json').write_text(json.dumps({'status':'passed',**observed,'reconnected_backend_empty':True,'cleanup_committed':True},indent=2))
     event('PASS: reconnected node cleaned old execution; healthy instance still executes; final deletion committed')
+elif sys.argv[1]=='cleanup-live':
+    from node import catalog
+    ids=json.loads((E/'live-instances.json').read_text())
+    for sid in ids:Sandbox.delete(sid,connection=connection)
+    records=catalog()
+    for sid in ids:
+        result=json.loads(records['environment:'+sid])['result']
+        assert result['state']=='Deleted' and not result['resources_held'],sid
+    (E/'sandboxd-restart-result.json').write_text(json.dumps({'status':'passed','instance_ids':ids,'resources_released':True},indent=2))
 elif sys.argv[1]=='recovered':
     checks=[]
     for sid in json.loads((E/'live-instances.json').read_text()):
@@ -132,7 +142,8 @@ elif sys.argv[1]=='recovered':
             assert s.is_running()
             r=s.commands.run("printf 'recovered-generated-id'")
             assert r.stdout=='recovered-generated-id' and r.exit_code==0
-            checks.append({'id':sid,'query':True,'command':True})
+            assert s.files.read('/tmp/adx-e2e-restart-marker')==sid
+            checks.append({'id':sid,'query':True,'command':True,'file':True})
             event('PASS: preserved instance '+sid+' is queryable and executes commands after restart')
         finally:s.close()
     (E/'restart-result.json').write_text(json.dumps({'status':'passed','checks':checks},indent=2))

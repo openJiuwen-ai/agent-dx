@@ -17,7 +17,7 @@ import uuid
 import xml.etree.ElementTree as ET
 
 BASIC = ('sdk','auth','capacity','placement','local-first')
-STANDARD = ('sdk','data-plane','lifecycle','auth','capacity','placement','local-first','node-failure','restart','stop')
+STANDARD = ('sdk','data-plane','lifecycle','auth','capacity','placement','local-first','node-failure','sandboxd-restart','restart','stop')
 PROFILES = {
     'l0': ('l0','auth'),
     'standalone': STANDARD,
@@ -309,6 +309,14 @@ class Run:
                 self.helper('node1','ready',timeout=150)
                 self.helper('node2','empty','node2')
                 self.execute('node1','/opt/adx/client/bin/python','-u','/opt/adx/e2e/scenarios.py','failure-cleanup',timeout=90)
+                for node in self.nodes:self.helper(node,'empty',node)
+        if 'sandboxd-restart' in selected:
+            with self.case('sandboxd-restart', checks):
+                self.event('Create live instances, restart sandboxd, and verify identities and file contents')
+                self.execute('node1','/opt/adx/client/bin/python','-u','/opt/adx/e2e/scenarios.py','create',timeout=300)
+                for node in self.nodes:self.helper(node,'restart-sandboxd',node,timeout=90)
+                self.execute('node1','/opt/adx/client/bin/python','-u','/opt/adx/e2e/scenarios.py','recovered',timeout=90)
+                self.execute('node1','/opt/adx/client/bin/python','-u','/opt/adx/e2e/scenarios.py','cleanup-live',timeout=90)
                 for node in self.nodes:self.helper(node,'empty',node)
         if 'restart' in selected:
             with self.case('restart', checks):

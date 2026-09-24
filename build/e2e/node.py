@@ -46,7 +46,15 @@ def main():
         children=[subprocess.Popen(c) for c in jobs]
         (P/'sandboxd.pid').write_text(str(children[1].pid))
         while True:
-            if any(c.poll() is not None for c in children):raise RuntimeError('fixture service exited')
+            for index, child in enumerate(children):
+                if child.poll() is None:continue
+                marker=P/'restart-sandboxd-request'
+                if index==1 and marker.exists():
+                    children[1]=subprocess.Popen(jobs[1])
+                    (P/'sandboxd.pid').write_text(str(children[1].pid))
+                    marker.unlink()
+                    continue
+                raise RuntimeError('fixture service exited')
             time.sleep(1)
     elif action=='backend-ready':
         end=time.monotonic()+30
@@ -146,6 +154,27 @@ def main():
         (E/f'backend-before-{node}.json').write_text(json.dumps(before))
         current=supervisor('status');manager=[s for s in current['services'] if s['role']=='adxlet'];assert len(manager)==1 and manager[0]['pid']
         os.kill(manager[0]['pid'],signal.SIGKILL)
+    elif action=='restart-sandboxd':
+        before=backend();assert len(before)==1
+        previous_pid=int((P/'sandboxd.pid').read_text())
+        marker=P/'restart-sandboxd-request'
+        marker.touch()
+        os.kill(previous_pid,signal.SIGTERM)
+        deadline=time.monotonic()+65
+        while True:
+            try:
+                current_pid=int((P/'sandboxd.pid').read_text())
+                if current_pid!=previous_pid:
+                    after=backend()
+                    assert after==before,'backend identity changed across sandboxd restart'
+                    (E/f'sandboxd-restart-{node}.json').write_text(json.dumps({
+                        'previous_pid':previous_pid,'pid':current_pid,
+                        'backend_ids_before':before,'backend_ids_after':after,
+                    },indent=2))
+                    break
+            except (OSError,subprocess.SubprocessError):pass
+            if time.monotonic()>deadline:raise TimeoutError('sandboxd did not restart with existing backend IDs')
+            time.sleep(.2)
     elif action=='unchanged':
         after=backend()
         (E/f'backend-after-{node}.json').write_text(json.dumps(after))

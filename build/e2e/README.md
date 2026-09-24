@@ -44,7 +44,7 @@ uses a unique sandboxd cgroup root per node. Cleanup removes those empty groups
 after the test containers exit and reports failure if they remain occupied.
 
 Use `--profile l0` for the minimum public API/SDK and authentication closure.
-The default `--profile standalone` runs all ten single-host logical two-node
+The default `--profile standalone` runs all eleven single-host logical two-node
 groups. A group is a deployment and cleanup boundary, not one functional test.
 The SDK, data-plane, lifecycle and placement groups emit stable functional
 subcases, and JUnit reports those subcases individually. Both profiles write
@@ -101,6 +101,9 @@ Local Docker reproduction requires access to the same bind-mounted paths as the 
 - `node-failure`: suspend node2 Adxlet heartbeats while its runtime remains
   independently hosted; require persisted invalidation, resume the same process,
   require backend cleanup before readiness, and prove node1 remains executable.
+- `sandboxd-restart`: create live instances, restart each independently hosted
+  sandboxd process, require unchanged backend IDs and readable instance files,
+  then delete the instances and verify resource release.
 - `restart`: terminate only Adxlet processes, wait for fresh node sessions
   and completed reconciliation, prove backend IDs are unchanged, then query and
   execute on the original instances.
