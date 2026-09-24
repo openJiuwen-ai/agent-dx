@@ -196,7 +196,7 @@ profile；完整 Multi-VM 在补齐部署器前不能标记为通过。
 | `ST-05` | 已实现 | 日志滚动压缩、Metrics、Trace、Collector 中断恢复 |
 | `ST-FC-01` | 已实现 | KVM 暂停／恢复、可复用快照、克隆和制品清理 |
 | `ST-06` | 计划 | Redis 暂停期间 SQLite 降级日志，恢复后去重补写并恢复生命周期操作 |
-| `ST-07` | 部分已实现 | `standalone`／`full` 已覆盖无活动实例空闲超时删除；活动持续刷新防误回收仍需独立长连接用例 |
+| `ST-07` | 后台命令用例已实现，待运行 | `standalone`／`full` 已覆盖无活动实例空闲超时删除；新增独立 SDK 客户端进程退出、120 秒后台命令仍运行时的空闲删除断言；活动持续刷新防误回收仍需独立长连接用例 |
 | `ST-08` | 组件前置已实现，E2E 计划 | 实例意外退出后的 Never 清理，以及可配置重启的新 runtime identity、退避上限和最终失败状态；仍需真实 sandboxd 进程故障注入 |
 | `ST-09` | 计划 | Coordinator 与 API Server（含 Ingress）分别重启后的 epoch、全量目录和路由重同步；分进程模式另验独立 Ingress |
 | `ST-10` | 计划 | Relay embedded／standalone 使用同一契约和相同用户结果 |
@@ -228,7 +228,7 @@ profile；完整 Multi-VM 在补齐部署器前不能标记为通过。
 | `FD-04` | 已实现 | Metrics、日志、滚动压缩、Collector 重启与 Trace 父子关系 |
 | `FD-05` | 已验证 | `full` profile 的两个 Pod 必须落在不同物理 worker；Full #6 分别运行于 `10.244.128.124` 和 `10.244.128.160` |
 | `FD-06` | 同 Pod 重启已验证，跨 Pod 待验证 | [Full #18](https://buildkite.com/agent-dx/agent-dx-full-test/builds/18) 定向运行 `redis-restart`：`SIGKILL` 托管 Redis 后由 supervisor 重启，AOF 开启，双节点实例归属和代次、后端 ID、文件及命令保持一致，删除后资源释放；持久卷跨 Pod 恢复仍待独立用例 |
-| `FD-07` | Coordinator 重启已验证，入口两项待运行 | [Full #19](https://buildkite.com/agent-dx/agent-dx-full-test/builds/19) 定向 `coordinator-restart` 验证新 epoch、双节点原归属／后端及公开 SDK 文件、命令；`apiserver-restart` 与 `ingress-restart` 驱动已实现，需分别运行；持续网络分区仍待独立用例 |
+| `FD-07` | Coordinator／API Server 已验证，Ingress 失败待集中定位 | [Full #19](https://buildkite.com/agent-dx/agent-dx-full-test/builds/19) 通过 Coordinator 重启，[Full #20](https://buildkite.com/agent-dx/agent-dx-full-test/builds/20) 通过 API Server 重启；均核对原归属／后端和公开 SDK 文件、命令。[Full #21](https://buildkite.com/agent-dx/agent-dx-full-test/builds/21) 在注入故障前报 `ingress is unavailable`，需核对 fixture 进程角色；持续网络分区仍待独立用例 |
 | `FD-08` | 计划 | worker 网络分区、心跳失效、返回清理与健康 worker 连续可用 |
 | `FD-FC-01` | 条件计划 | KVM worker 的 Firecracker pause/resume/snapshot profile |
 | `FD-XPU-01` | 条件计划 | 真实 GPU/NPU 整卡发现、过滤、分配、释放和故障清理 |

@@ -2,6 +2,8 @@
 """Installed SDK acceptance for ordinary instance lifecycle behavior."""
 import json
 from pathlib import Path
+import subprocess
+import sys
 import time
 
 from adx_sandbox import Sandbox, SandboxNotFound
@@ -134,6 +136,28 @@ def run(connection, image, output):
         remaining.remove(idle_id)
         checks['idle_timeout_reclamation'] = idle_id
         passed('lifecycle.idle-timeout-reclaims', started)
+
+        started = begin('lifecycle.idle-with-background-command-after-client-exit')
+        child_evidence = Path(output).parent / 'idle-background-client.json'
+        subprocess.run(
+            [sys.executable, '/opt/adx/e2e/idle_background_client.py', image, str(child_evidence)],
+            check=True,
+            timeout=180,
+        )
+        child = json.loads(child_evidence.read_text())
+        background_id = child['instance_id']
+        remaining.add(background_id)
+        assert child['command_running_before_exit']
+        # The separate SDK process has exited, but its 120-second command has
+        # not. The 90-second wait proves idle cleanup does not wait for it.
+        _wait_deleted(background_id, connection, timeout=90)
+        remaining.remove(background_id)
+        from node import catalog
+        record = json.loads(catalog()['environment:' + background_id])
+        assert record['result']['state'] == 'Deleted'
+        assert not record['result']['resources_held']
+        checks['idle_background_client_exit'] = background_id
+        passed('lifecycle.idle-with-background-command-after-client-exit', started)
 
         result = {'status': 'passed', 'checks': checks, 'cases': cases}
         Path(output).write_text(json.dumps(result, indent=2) + '\n')

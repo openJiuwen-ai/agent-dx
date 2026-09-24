@@ -55,6 +55,9 @@ public API inventory and uncovered conditional features are tracked in
 For a focused diagnostic, add `--case stop` (or another case from the selected
 profile). The result is labeled `profile: targeted`, records `source_profile`
 and `selected_case`, and cannot be cited as a complete profile pass.
+The `lifecycle` group also starts a 120-second background command from a
+separate SDK process, lets that client exit, and requires the six-second idle
+policy to delete the instance before the command can finish naturally.
 
 All output directories must be new. Local runs allow dirty packages and image
 tags, recording their actual identities. Buildkite requires the current clean
