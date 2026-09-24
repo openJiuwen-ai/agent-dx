@@ -182,6 +182,10 @@ def main():
         after=backend()
         (E/f'backend-after-{node}.json').write_text(json.dumps(after))
         assert after==json.loads((E/f'backend-before-{node}.json').read_text()), 'backend identity changed across Adxlet restart'
+    elif action=='occupied':
+        current=backend()
+        assert current, f'{node} has no running backend before stop'
+        (E/f'backend-occupied-{node}.json').write_text(json.dumps(current))
     elif action in ('stop','cleanup'):
         if action=='stop':subprocess.run(['python3',str(H/'telemetry.py'),'metrics',node],check=True)
         stopped=supervisor('stop');assert stopped['ok'];collect(node)

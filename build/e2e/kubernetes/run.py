@@ -277,11 +277,12 @@ def main():
     p.add_argument('--node-name', action='append', default=[], help='eligible Kubernetes node; repeat for a pool')
     p.add_argument('--registry-auth', type=Path)
     p.add_argument('--profile', choices=('l0','k8s-basic','full'), default='k8s-basic')
+    p.add_argument('--case', help='run one case as a targeted diagnostic, not a Full gate')
     a = p.parse_args()
     output = a.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
     run = KubernetesRun(output, a.kubeconfig, a.context, a.profile)
-    checks = [];required=common.required_for_profile(a.profile)
+    checks = [];required=common.selected_checks(a.profile,a.case)
     error = None
     def cancel(signum, frame):
         raise InterruptedError(f'canceled by signal {signum}')
@@ -310,7 +311,8 @@ def main():
                 signal.signal(sig, signal.SIG_IGN)
             cleanup_errors = run.cleanup()
     report = common.finish_report(error, cleanup_errors, checks,required)
-    report.update(run_id=run.id, deployment='kubernetes', profile=a.profile,
+    report.update(run_id=run.id, deployment='kubernetes', profile='targeted' if a.case else a.profile,
+                  source_profile=a.profile, selected_case=a.case,
                   harness=run.harness, cases=run.case_results)
     (output / 'result.json').write_text(json.dumps(report, indent=2) + '\n')
     write_junit(output / 'junit.xml', report)
