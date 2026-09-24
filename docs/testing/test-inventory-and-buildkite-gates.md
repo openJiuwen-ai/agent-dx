@@ -224,10 +224,10 @@ profile；完整 Multi-VM 在补齐部署器前不能标记为通过。
 |---|---|---|
 | `FD-01` | 已实现 | clean commit、发布包 SHA256、SDK、sandboxd revision 和镜像 digest 一致 |
 | `FD-02` | 已实现 | 独立 namespace 的 L0 全量重跑 |
-| `FD-03` | 驱动已实现 | K8s 基础五组与完整十一组均输出逐项 JUnit、日志、事件和清理证据；新十一组 Full 仍需正式通过 |
+| `FD-03` | 已验证 | K8s 基础五组与完整十一组均输出逐项 JUnit、日志、事件和清理证据；Full #17 同次通过十一组 |
 | `FD-04` | 已实现 | Metrics、日志、滚动压缩、Collector 重启与 Trace 父子关系 |
 | `FD-05` | 已验证 | `full` profile 的两个 Pod 必须落在不同物理 worker；Full #6 分别运行于 `10.244.128.124` 和 `10.244.128.160` |
-| `FD-06` | 计划 | Redis Pod/进程重启和持久卷 AOF 恢复，已提交实例状态不丢失 |
+| `FD-06` | 定向驱动已实现，待运行 | `redis-restart` 在隔离 K8s fixture 中崩溃重启托管 Redis，校验 AOF、已提交归属和代次、后端 ID 与命令能力；持久卷跨 Pod 恢复仍待独立用例 |
 | `FD-07` | 计划 | Coordinator/API/Ingress 独立故障与恢复，服务入口和目录重新收敛 |
 | `FD-08` | 计划 | worker 网络分区、心跳失效、返回清理与健康 worker 连续可用 |
 | `FD-FC-01` | 条件计划 | KVM worker 的 Firecracker pause/resume/snapshot profile |

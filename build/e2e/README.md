@@ -113,6 +113,12 @@ Local Docker reproduction requires access to the same bind-mounted paths as the 
   wait for fresh node sessions
   and completed reconciliation, prove backend IDs are unchanged, then query and
   execute on the original instances.
+- `redis-restart` (targeted fault case): pin one backend to each node, confirm
+  AOF is enabled, crash supervised Redis with `SIGKILL`, and verify restarted
+  Redis retains both persisted assignments and generations. Require unchanged
+  backend IDs, readable instance files, executable commands and final release.
+  Select it explicitly with `--profile full --case redis-restart`; it does not
+  extend the default eleven-group Full gate.
 - `stop`: independently create a live instance pinned to each node, verify both
   backend inventories are occupied and exercise each forwarded port. A separate
   instance on each node is deleted to emit the required lifecycle log and trace. It also

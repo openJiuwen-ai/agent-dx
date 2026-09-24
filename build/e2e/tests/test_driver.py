@@ -33,9 +33,12 @@ class AcceptanceGateTests(unittest.TestCase):
 
     def test_targeted_case_is_explicit_and_within_its_profile(self):
         self.assertEqual(driver.selected_checks('full', 'stop'), ('stop',))
+        self.assertEqual(driver.selected_checks('full', 'redis-restart'), ('redis-restart',))
         self.assertEqual(driver.selected_checks('full', None), driver.STANDARD)
         with self.assertRaisesRegex(ValueError, 'not in E2E profile'):
             driver.selected_checks('l0', 'stop')
+        with self.assertRaisesRegex(ValueError, 'not in E2E profile'):
+            driver.selected_checks('k8s-basic', 'redis-restart')
 
     def test_l0_report_only_requires_l0_cases(self):
         report = driver.finish_report(None, [], ['l0', 'auth'], driver.required_for_profile('l0'))

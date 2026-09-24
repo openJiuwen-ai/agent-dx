@@ -18,6 +18,7 @@ import xml.etree.ElementTree as ET
 
 BASIC = ('sdk','auth','capacity','placement','local-first')
 STANDARD = ('sdk','data-plane','lifecycle','auth','capacity','placement','local-first','node-failure','sandboxd-restart','restart','stop')
+OPTIONAL_FAULTS = ('redis-restart',)
 PROFILES = {
     'l0': ('l0','auth'),
     'standalone': STANDARD,
@@ -34,6 +35,8 @@ def selected_checks(profile, case=None):
     required=required_for_profile(profile)
     if case is None:
         return required
+    if profile in ('standalone','full') and case in OPTIONAL_FAULTS:
+        return (case,)
     if case not in required:
         raise ValueError(f'{case} is not in E2E profile {profile}')
     return (case,)
@@ -335,6 +338,17 @@ class Run:
                 self.helper('node1','ready','restart',timeout=150)
                 for node in self.nodes:self.helper(node,'unchanged',node)
                 self.execute('node1','/opt/adx/client/bin/python','-u','/opt/adx/e2e/scenarios.py','recovered',timeout=90)
+        if 'redis-restart' in selected:
+            with self.case('redis-restart', checks):
+                self.event('Create pinned instances, crash AOF Redis and verify ownership and backends')
+                self.execute('node1','/opt/adx/client/bin/python','-u','/opt/adx/e2e/scenarios.py','create-marker',timeout=300)
+                for node in self.nodes:self.helper(node,'capture-backend',node)
+                self.helper('node1','redis-restart','node1',timeout=90)
+                self.helper('node1','ready',timeout=150)
+                for node in self.nodes:self.helper(node,'unchanged',node)
+                self.execute('node1','/opt/adx/client/bin/python','-u','/opt/adx/e2e/scenarios.py','recovered-marker',timeout=90)
+                self.execute('node1','/opt/adx/client/bin/python','-u','/opt/adx/e2e/scenarios.py','cleanup-live-redis',timeout=90)
+                for node in self.nodes:self.helper(node,'empty',node)
         if 'stop' in selected:
             with self.case('stop', checks):
                 self.event('Create live backends on both nodes, stop services, and verify physical cleanup')
