@@ -204,11 +204,19 @@ def assemble(inventory, root):
         errors.append('suite budget-state.json is missing or invalid')
     budget = state.get('budget_seconds')
     duration = state.get('runtime_seconds')
-    if state.get('schema_version') != 1 or state.get('inventory_sha256') != digest \
+    started_at = state.get('started_at')
+    finished_at = state.get('finished_at')
+    if state.get('schema_version') != 2 or state.get('inventory_sha256') != digest \
             or not isinstance(budget, int) or not 0 < budget <= MAX_BUDGET_SECONDS \
             or not isinstance(duration, (int, float)) or not 0 <= duration <= budget \
             or state.get('active'):
         errors.append('suite inventory or three-hour budget evidence is invalid')
+    if not isinstance(started_at, (int, float)) \
+            or not isinstance(finished_at, (int, float)) \
+            or finished_at < started_at \
+            or not isinstance(budget, int) \
+            or finished_at - started_at > budget:
+        errors.append('suite wall-clock budget evidence exceeds three hours or is missing')
     records = state.get('cases', [])
     if not isinstance(records, list):
         records = []
@@ -263,7 +271,11 @@ def assemble(inventory, root):
         'schema_version': 1, 'profile': 'multi-vm', 'deployment': 'process',
         'required_checks': list(REQUIRED), 'checks': checks, 'missing_checks': missing,
         'inventory_sha256': digest, 'budget_seconds': budget,
-        'runtime_seconds': duration, 'placement': placements,
+        'runtime_seconds': duration,
+        'wall_elapsed_seconds': finished_at - started_at
+        if isinstance(started_at, (int, float)) and isinstance(finished_at, (int, float))
+        else None,
+        'placement': placements,
         'final_state': final, 'case_evidence': evidence,
         'status': 'failed' if errors or missing else 'passed',
         'cleanup_errors': [], 'errors': errors,

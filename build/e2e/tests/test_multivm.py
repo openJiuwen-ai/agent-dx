@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location('multivm_contract', ROOT / 'multivm/contract.py')
 contract = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(contract)
-from build.e2e.multivm.sdk_accept import inspect_release, run_acceptance
+from e2e.multivm.sdk_accept import inspect_release, run_acceptance
 
 
 def inventory():

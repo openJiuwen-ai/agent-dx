@@ -9,7 +9,9 @@ mkdir -p out/buildkite/logs
 echo "--- :gear: Toolchain and persistent caches"
 source .buildkite/bootstrap-build.sh > >(tee out/buildkite/logs/bootstrap.log) 2>&1
 echo "--- :test_tube: CI driver tests"
-python3 -u -m unittest discover -s build/e2e/tests -v 2>&1 | tee out/buildkite/logs/driver-tests.log
+PYTHONPATH="$PWD/build${PYTHONPATH:+:$PYTHONPATH}" \
+  python3 -u -m unittest discover -s build/e2e/tests -v \
+  2>&1 | tee out/buildkite/logs/driver-tests.log
 echo "--- :test_tube: Release tooling tests"
 python3 -u -m unittest discover -s build/release/tests -v 2>&1 | tee out/buildkite/logs/release-tests.log
 echo "--- :rust: Rust guideline gate"

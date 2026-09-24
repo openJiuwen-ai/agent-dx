@@ -136,14 +136,17 @@ def active_process_group(log):
         return False
 
 
-def result_from_state(state):
+def result_from_state(state, timestamp):
     records = state['cases']
     failed = [record['case'] for record in records if record['status'] != 'passed']
+    wall_elapsed = max(0, timestamp - state['started_at'])
     return {'schema_version': 1, 'scope': 'selected-cases',
             'inventory_sha256': state['inventory_sha256'],
             'budget_seconds': state['budget_seconds'],
             'runtime_seconds': state['runtime_seconds'],
-            'remaining_seconds': max(0, state['budget_seconds'] - state['runtime_seconds']),
+            'wall_elapsed_seconds': wall_elapsed,
+            'remaining_seconds': max(0, min(state['budget_seconds'] - state['runtime_seconds'],
+                                            state['budget_seconds'] - wall_elapsed)),
             'status': 'failed' if failed else 'passed',
             'failed_cases': failed, 'cases': records}
 
@@ -172,15 +175,16 @@ def run_plan(config, execute=execute_subprocess, now=time.time):
     digest = inventory_digest(config.inventory)
     if state_path.exists():
         state = json.loads(state_path.read_text())
-        if state.get('schema_version') != 1:
+        if state.get('schema_version') != 2:
             raise ValueError('unsupported suite budget state')
         if state.get('inventory_sha256') != digest:
             raise ValueError('suite inventory differs from the existing budget')
         if state.get('budget_seconds') != config.budget_seconds:
             raise ValueError('suite budget differs from the existing budget')
     else:
-        state = {'schema_version': 1, 'inventory_sha256': digest,
+        state = {'schema_version': 2, 'inventory_sha256': digest,
                  'budget_seconds': config.budget_seconds,
+                 'started_at': now(), 'finished_at': None,
                  'runtime_seconds': 0, 'cases': [], 'active': None}
     if state.get('active'):
         active = state['active']
@@ -192,6 +196,7 @@ def run_plan(config, execute=execute_subprocess, now=time.time):
         state['cases'].append({'case': active['case'], 'status': 'interrupted',
                                'seconds': elapsed, 'log': active['log']})
         state['active'] = None
+        state['finished_at'] = now()
         write_json(state_path, state)
     seen = {record['case'] for record in state['cases']}
     if 'stop' in seen:
@@ -199,10 +204,12 @@ def run_plan(config, execute=execute_subprocess, now=time.time):
     if seen.intersection(config.cases):
         raise ValueError('case already recorded in this budget; use a new suite for regression')
     for case in config.cases:
-        remaining = max(0, config.budget_seconds - state['runtime_seconds'])
+        remaining = max(0, min(config.budget_seconds - state['runtime_seconds'],
+                               state['started_at'] + config.budget_seconds - now()))
         if remaining <= 0:
             state['cases'].append({'case': case, 'status': 'not-run-budget-exhausted',
                                    'seconds': 0})
+            state['finished_at'] = now()
             write_json(state_path, state)
             continue
         definition = CASES[case]
@@ -227,7 +234,9 @@ def run_plan(config, execute=execute_subprocess, now=time.time):
             report = json.loads(report_path.read_text())
         except (OSError, ValueError):
             report = None
+        finished_at = now()
         passed = code == 0 and not timed_out and elapsed <= timeout \
+            and finished_at <= state['started_at'] + config.budget_seconds \
             and isinstance(report, dict) \
             and report.get('status') == 'passed' and not report.get('cleanup_errors') \
             and not report.get('error')
@@ -236,11 +245,14 @@ def run_plan(config, execute=execute_subprocess, now=time.time):
                   'log': str(log), 'report': str(report_path) if report else None}
         if execution_error:
             record['error'] = execution_error
+        if finished_at > state['started_at'] + config.budget_seconds:
+            record['error'] = 'three-hour wall-clock budget exceeded'
         state['cases'].append(record)
         state['active'] = None
+        state['finished_at'] = finished_at
         write_json(state_path, state)
         print(f"[{'PASS' if passed else 'FAIL'}] {case} {elapsed:.1f}s", flush=True)
-    result = result_from_state(state)
+    result = result_from_state(state, now())
     write_json(config.output / 'suite-result.json', result)
     return result
 

@@ -5,8 +5,8 @@ import tempfile
 from types import SimpleNamespace
 import unittest
 
-from build.e2e.multivm.control_restart import run_control_restarts
-from build.e2e.tests.test_multivm_local_first import inventory
+from e2e.multivm.control_restart import run_control_restarts
+from e2e.tests.test_multivm_local_first import inventory
 
 
 class ControlRestartTests(unittest.TestCase):

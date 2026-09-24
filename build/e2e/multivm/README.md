@@ -355,8 +355,9 @@ case has not yet passed on real VMs.
 
 `suite.py` runs selected cases against an already deployed profile. It writes
 each case's complete `case.log` and JSON result, plus a resumable
-`budget-state.json` and `suite-result.json`. The default shared case-runtime
-budget is 10,800 seconds (three hours), including failed cases. A case has
+`budget-state.json` and `suite-result.json`. The default shared budget is
+10,800 seconds (three hours) from the first suite invocation, including failed
+cases and time spent switching deployment profiles between invocations. A case has
 its own smaller timeout; on failure the remaining selected cases continue,
 so failure diagnosis and regression can happen after the coverage pass.
 The budget file is bound to the inventory digest and can be reused across
@@ -398,7 +399,7 @@ assembler requires `sdk`, `auth`, `capacity`, both placement policies,
 `node-preferences`, `local-first`, `worker-failure`, `worker-restart`,
 `session-fence`, `control-restart`, `ingress-restart`, and `stop`. It checks
 each case's actual assertions, release and VM identities, physical placement,
-the three-hour case-runtime ledger, and the final backend and published-route
+the three-hour case-runtime and wall-clock ledgers, and the final backend and published-route
 counts. If `runtime-affinity` was selected, its heterogeneous inventory and
 physical placement report must also pass validation. Missing or failed cases
 produce a failed `result.json` with explicit
@@ -413,6 +414,6 @@ python3 build/e2e/multivm/verify.py \
   --result out/e2e/3vm/suite/result.json
 ```
 
-Prepare the release, Linux test-only RPC probes and deployment profiles
-before starting the shared case-runtime budget. VM provisioning and profile
-switching are not yet automated or included in that runtime ledger.
+Prepare the release, Linux test-only RPC probes and initial deployment profile
+before starting the shared budget. VM provisioning before the first suite
+invocation remains outside the budget; subsequent profile switching is counted.

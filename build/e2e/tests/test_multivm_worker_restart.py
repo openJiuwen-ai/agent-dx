@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from build.e2e.multivm.worker_restart import run_restart, run_session_probe
+from e2e.multivm.worker_restart import run_restart, run_session_probe
 
 
 def inventory():
@@ -140,7 +140,7 @@ class WorkerRestartTests(unittest.TestCase):
                  'record_unchanged': True, 'node_id': 'node2',
                  'instance_id': 'sandbox-node2', 'old_session': 'old',
                  'new_session': 'new'}
-        with patch('build.e2e.multivm.worker_restart.subprocess.run') as command:
+        with patch('e2e.multivm.worker_restart.subprocess.run') as command:
             command.return_value = SimpleNamespace(returncode=0, stdout=json.dumps(valid),
                                                    stderr='')
             self.assertEqual(run_session_probe('/tmp/probe', control, worker,

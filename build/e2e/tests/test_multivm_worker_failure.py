@@ -4,7 +4,7 @@ import tempfile
 from types import SimpleNamespace
 import unittest
 
-from build.e2e.multivm.worker_failure import run_failure
+from e2e.multivm.worker_failure import run_failure
 
 
 def inventory():

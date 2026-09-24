@@ -6,8 +6,8 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from build.e2e.multivm.stop import run_route_probe, run_stop
-from build.e2e.tests.test_multivm_local_first import inventory
+from e2e.multivm.stop import run_route_probe, run_stop
+from e2e.tests.test_multivm_local_first import inventory
 
 
 class StopTests(unittest.TestCase):
@@ -127,7 +127,7 @@ class StopTests(unittest.TestCase):
         control = {'coordinator_rpc_address': 'control:19000'}
         valid = {'status': 'passed', 'reset': True, 'revision': 5,
                  'published_routes': 0}
-        with patch('build.e2e.multivm.stop.subprocess.run') as command:
+        with patch('e2e.multivm.stop.subprocess.run') as command:
             command.return_value = SimpleNamespace(returncode=0, stdout=json.dumps(valid),
                                                    stderr='')
             self.assertEqual(run_route_probe('/tmp/probe', control), valid)

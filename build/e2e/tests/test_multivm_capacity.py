@@ -5,7 +5,7 @@ import threading
 from types import SimpleNamespace
 import unittest
 
-from build.e2e.multivm.capacity_queue import run_capacity
+from e2e.multivm.capacity_queue import run_capacity
 
 
 def inventory():

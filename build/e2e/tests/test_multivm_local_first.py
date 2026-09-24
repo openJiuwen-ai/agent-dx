@@ -5,7 +5,7 @@ import threading
 from types import SimpleNamespace
 import unittest
 
-from build.e2e.multivm.local_first import run_local_first
+from e2e.multivm.local_first import run_local_first
 
 
 def inventory():
