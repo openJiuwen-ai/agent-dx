@@ -1,4 +1,5 @@
 import inspect
+import gc
 import os
 import unittest
 from unittest.mock import patch
@@ -326,6 +327,40 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(sandbox._client.deleted, ["sandbox-1"])
         self.assertEqual(sandbox._client.close_count, 1)
 
+    def test_garbage_collection_does_not_delete_remote_sandbox(self):
+        sandbox = object.__new__(Sandbox)
+        sandbox._detached = False
+        sandbox._tunnel_client = None
+        sandbox._shells = _Shells()
+        sandbox._pty = _PTY()
+        client = _CloseTracker()
+        sandbox._client = client
+        sandbox._sid = "sandbox-1"
+        sandbox._closed = False
+        del sandbox
+        gc.collect()
+        self.assertEqual(client.deleted, [])
+
+    def test_context_exit_preserves_original_exception(self):
+        sandbox = object.__new__(Sandbox)
+        sandbox._detached = False
+        sandbox._tunnel_client = None
+        sandbox._shells = _Shells()
+        sandbox._pty = _PTY()
+        sandbox._sid = "sandbox-1"
+        sandbox._closed = False
+
+        class FailingDelete(_CloseTracker):
+            def delete(self, _sandbox_id):
+                raise RuntimeError("delete failed")
+
+        client = FailingDelete()
+        sandbox._client = client
+        with self.assertRaisesRegex(ValueError, "body failed"):
+            with sandbox:
+                raise ValueError("body failed")
+        self.assertTrue(client.closed)
+
     def test_tunnel_start_failure_rolls_back_created_sandbox(self):
         tracker = _CloseTracker()
 
@@ -349,8 +384,9 @@ class LifecycleTests(unittest.TestCase):
                 return sandbox_id
 
         class Tunnel:
-            def __init__(self, _target, token=None):
+            def __init__(self, _target, token=None, sandbox_id=None):
                 self.token = token
+                self.sandbox_id = sandbox_id
 
             def start(self, _url, timeout=60):
                 return False
@@ -400,8 +436,9 @@ class LifecycleTests(unittest.TestCase):
                 return sandbox_id
 
         class Tunnel:
-            def __init__(self, _target, token=None):
+            def __init__(self, _target, token=None, sandbox_id=None):
                 seen["token"] = token
+                seen["sandbox_id"] = sandbox_id
 
             def start(self, url, timeout=60):
                 seen["url"] = url
@@ -431,6 +468,7 @@ class LifecycleTests(unittest.TestCase):
 
         self.assertEqual(seen["url"], "wss://gateway.example:8443/tunnel/sandbox-1")
         self.assertEqual(seen["token"], "secret")
+        self.assertEqual(seen["sandbox_id"], "sandbox-1")
 
     def test_update_network_policy_replaces_and_clears_policy(self):
         class Client(_CloseTracker):

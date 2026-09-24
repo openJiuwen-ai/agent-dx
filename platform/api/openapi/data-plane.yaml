@@ -59,6 +59,11 @@ paths:
       description: |
         `action` selects an EXECD operation. Mutating calls should carry one
         `X-ADX-Request-ID`; retry an unknown result with the same ID.
+        `process.wait` returns HTTP 200 with `status: running`,
+        `error_code: WAIT_TIMEOUT` and no `exit_code` when only its wait deadline
+        expires; the command keeps running. `process.kill` returns HTTP 200 with
+        `killed: false` when the command is absent or already exited. Other
+        operation errors retain their normal error status.
       parameters:
         - $ref: "#/components/parameters/InstanceId"
         - $ref: "#/components/parameters/OperationId"

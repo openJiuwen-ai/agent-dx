@@ -13,6 +13,19 @@ use std::{
     time::Duration,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+async fn connect_tunnel(
+    port: u16,
+) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
+    let mut request = format!("ws://127.0.0.1:{port}")
+        .into_client_request()
+        .unwrap();
+    request
+        .headers_mut()
+        .insert("X-Sandbox-ID", "i".parse().unwrap());
+    tokio_tungstenite::connect_async(request).await.unwrap().0
+}
 
 struct Runtime {
     child: Child,
@@ -188,10 +201,7 @@ async fn real_http_client_prepares_retries_aborts_and_refreshes_restored_identit
     assert!(client.status(&record(2)).await.is_err());
     let initial = client.status(&record(1)).await.unwrap();
     assert_eq!((initial.active_requests, initial.active_commands), (0, 0));
-    let (mut old_tunnel, _) =
-        tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{}", runtime.ws_port))
-            .await
-            .unwrap();
+    let mut old_tunnel = connect_tunnel(runtime.ws_port).await;
     let prepared = client
         .prepare(&record(1), "a", initial.revision)
         .await
@@ -244,10 +254,7 @@ async fn real_http_client_prepares_retries_aborts_and_refreshes_restored_identit
     })
     .await
     .expect("inherited tunnel connection must retire");
-    let (_new_tunnel, _) =
-        tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{}", runtime.ws_port))
-            .await
-            .unwrap();
+    let _new_tunnel = connect_tunnel(runtime.ws_port).await;
     assert_eq!(
         restored.checkpoint.unwrap().phase,
         CheckpointPhase::Restored

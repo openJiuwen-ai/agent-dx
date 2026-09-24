@@ -64,7 +64,7 @@ upstream，并校验响应体和路径。该项不是客户端序列化单测。
 | 错误 | 当前 E2E |
 |---|---|
 | `SandboxNotFound`、`PermissionDenied` | 已覆盖 |
-| `CommandConflict`、`CommandNotFound`、`CommandWaitTimeout` | 已覆盖 |
+| `CommandConflict`、`CommandNotFound`、等待超时返回 `RUNNING`／`WAIT_TIMEOUT`、重复 kill 返回 `False` | SDK 单测覆盖；端到端覆盖以对应运行记录为准 |
 | `CommandSubmissionError` | 需要真实“请求已到 Execd、响应被切断”故障注入 |
 | `CommandUnavailable` | 需要 command watch 中断且查询暂不可用的故障注入 |
 | `CommandExpired` | 需要可配置结果保留期及过期清理场景 |

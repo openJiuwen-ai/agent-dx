@@ -688,7 +688,9 @@ class Sandbox:
                 # Only carry the JWT over a TLS tunnel. Plaintext mode is for
                 # auth-disabled local/dev frontends.
                 tunnel_token = self._client.token if tls else None
-                self._tunnel_client = TunnelClient(upstream, token=tunnel_token)
+                self._tunnel_client = TunnelClient(
+                    upstream, token=tunnel_token, sandbox_id=self._sid
+                )
                 logger.info(
                     "Starting TunnelClient: sandbox_id=%s name=%s url=%s "
                     "timeout=%.1fs",
@@ -1132,11 +1134,11 @@ class Sandbox:
     def __enter__(self):
         return self
 
-    def __exit__(self, *exc):
-        self.kill()
-
-    def __del__(self):
-        try:
+    def __exit__(self, exc_type, exc_value, traceback):
+        if exc_type is None:
             self.kill()
-        except Exception:
-            pass
+        else:
+            try:
+                self.kill()
+            except Exception as cleanup_error:
+                logger.warning("sandbox context cleanup failed: %s", cleanup_error)

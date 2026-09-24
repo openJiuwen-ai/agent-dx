@@ -1,16 +1,18 @@
-"""Command waits stop on client closure and pace failed requests."""
+"""Command wait and kill results preserve recoverable runtime semantics."""
 
+import asyncio
 import threading
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import httpx
 import pytest
 
 from adx_sandbox import _http_pool, commands
+from adx_sandbox import _command_watch
 from adx_sandbox._http_pool import SandboxClientClosedError
 from adx_sandbox._transport import SandboxClient, SandboxError, SandboxHTTPError
-from adx_sandbox.commands import CommandHandle, Commands
+from adx_sandbox.commands import CommandHandle, CommandWaitTimeout, Commands
 from adx_sandbox.types import CommandResult, CommandStatus
 
 
@@ -87,8 +89,7 @@ def test_long_command_client_closed_exits_without_retry_or_kill(clock, running, 
 
 @pytest.mark.parametrize("error", [
     httpx.ReadTimeout("timeout"), httpx.ConnectError("reset"),
-    SandboxError("gateway unavailable"), RuntimeError("request failed"),
-    ValueError("bad data"),
+    SandboxError("gateway unavailable", retry="after_backoff"),
 ])
 def test_wait_error_retries_then_returns_result(clock, running, error):
     collection, handle = running
@@ -100,12 +101,31 @@ def test_wait_error_retries_then_returns_result(clock, running, error):
     handle.kill.assert_not_called()
 
 
+@pytest.mark.parametrize("error", [
+    SandboxError("sandbox exited", code="SANDBOX_EXITED", retry="never", request_id="req-1"),
+    SandboxError("sandbox exited", code="SANDBOX_EXITED", retry="after_backoff", request_id="req-3"),
+    SandboxHTTPError(409, {}, "scheduling failed", code="SCHEDULE_FAILED", retry="never"),
+    SandboxHTTPError(403, {}, "forbidden", request_id="req-2"),
+    RuntimeError("unexpected response"),
+    ValueError("bad data"),
+])
+def test_terminal_wait_error_is_not_retried_or_replaced(clock, running, error):
+    collection, handle = running
+    handle.wait.side_effect = error
+    with pytest.raises(type(error)) as raised:
+        collection._run_with_poll("sleep 60", None, None, 60)
+    assert raised.value is error
+    handle.wait.assert_called_once()
+    handle.kill.assert_not_called()
+    assert clock.sleeps == []
+
+
 def test_persistent_failure_is_paced_within_deadline(clock, running):
     collection, handle = running
 
     def wait(_timeout):
         clock.now += 0.1
-        raise RuntimeError("request failed")
+        raise httpx.ReadTimeout("request failed")
 
     handle.wait.side_effect = wait
     result = collection._run_with_poll("sleep 60", None, None, 3)
@@ -121,7 +141,7 @@ def test_failure_after_deadline_does_not_delay(clock, running):
 
     def wait(_timeout):
         clock.now += 3
-        raise RuntimeError("request failed")
+        raise httpx.ReadTimeout("request failed")
 
     handle.wait.side_effect = wait
     result = collection._run_with_poll("sleep 60", None, None, 3)
@@ -134,10 +154,128 @@ def test_failure_after_deadline_does_not_delay(clock, running):
 def test_wait_timeout_continues_waiting(clock, running):
     collection, handle = running
     expected = CommandResult("done", "", 0)
-    handle.wait.side_effect = [TimeoutError("still running"), expected]
+    handle.wait.side_effect = [
+        CommandResult("", "", None, status=CommandStatus.RUNNING, error_code="WAIT_TIMEOUT"),
+        expected,
+    ]
     assert collection._run_with_poll("sleep 60", None, None, 60) is expected
     assert clock.sleeps == []
     handle.kill.assert_not_called()
+
+
+def test_http_wait_timeout_returns_running_result():
+    client = Mock(spec=SandboxClient)
+    client._connection = None
+    client.invoke.side_effect = [
+        {"command_id": "cmd-42", "status": "running"},
+        SandboxHTTPError(
+            400,
+            {"status": "running", "error_code": "WAIT_TIMEOUT", "error": "still running"},
+            "still running",
+        ),
+    ]
+
+    result = CommandHandle("cmd-42", client, "sandbox").wait(timeout=2)
+
+    assert result.status == CommandStatus.RUNNING
+    assert result.error_code == "WAIT_TIMEOUT"
+    assert result.error_message == "still running"
+    assert result.exit_code is None
+
+
+def test_http_wait_timeout_body_is_normalized_when_transport_returns_it():
+    client = Mock(spec=SandboxClient)
+    client._connection = None
+    client.invoke.side_effect = [
+        {"command_id": "cmd-42", "status": "running"},
+        {"status": "running", "error_code": "WAIT_TIMEOUT", "error": "still running"},
+    ]
+    result = CommandHandle("cmd-42", client, "sandbox").wait(timeout=2)
+    assert result.status == CommandStatus.RUNNING
+    assert result.error_code == "WAIT_TIMEOUT"
+    assert result.error_message == "still running"
+
+
+def test_watched_wait_timeout_returns_running_result(monkeypatch):
+    client = Mock(spec=SandboxClient)
+    client._connection = object()
+    client.invoke.return_value = {"command_id": "cmd-42", "status": "running"}
+    manager = Mock()
+    manager.wait.side_effect = CommandWaitTimeout("sandbox", "cmd-42", 2)
+    monkeypatch.setattr(_command_watch, "manager_for", lambda _connection: manager)
+
+    result = CommandHandle("cmd-42", client, "sandbox").wait(timeout=2)
+
+    assert result.status == CommandStatus.RUNNING
+    assert result.error_code == "WAIT_TIMEOUT"
+    manager.wait.assert_called_once_with("sandbox", "cmd-42", 2)
+
+
+def test_async_watched_wait_timeout_returns_running_result(monkeypatch):
+    client = Mock(spec=SandboxClient)
+    client._connection = object()
+    client.invoke.return_value = {"command_id": "cmd-42", "status": "running"}
+    manager = Mock()
+    manager.wait_async = AsyncMock(side_effect=CommandWaitTimeout("sandbox", "cmd-42", 2))
+    monkeypatch.setattr(_command_watch, "manager_for", lambda _connection: manager)
+
+    result = asyncio.run(CommandHandle("cmd-42", client, "sandbox").wait_async(timeout=2))
+
+    assert result.status == CommandStatus.RUNNING
+    assert result.error_code == "WAIT_TIMEOUT"
+    manager.wait_async.assert_awaited_once_with("sandbox", "cmd-42", 2)
+
+
+@pytest.mark.parametrize("entry_point", ["handle", "collection"])
+@pytest.mark.parametrize("status,code", [(404, "COMMAND_NOT_FOUND"), (400, "COMMAND_NOT_RUNNING")])
+def test_kill_missing_or_finished_command_returns_false(entry_point, status, code):
+    client = Mock(spec=SandboxClient)
+    client.invoke.side_effect = SandboxHTTPError(status, {"error_code": code}, code)
+    if entry_point == "handle":
+        killed = CommandHandle("cmd-42", client, "sandbox").kill()
+    else:
+        killed = Commands(client, "sandbox").kill("cmd-42")
+    assert killed is False
+
+
+def test_kill_unexpected_runtime_failure_still_raises():
+    client = Mock(spec=SandboxClient)
+    client.invoke.side_effect = SandboxHTTPError(
+        400, {"error_code": "SIGNAL_FAILED"}, "signal failed"
+    )
+    with pytest.raises(SandboxHTTPError):
+        CommandHandle("cmd-42", client, "sandbox").kill()
+
+
+def test_kill_noop_body_returns_false_but_other_error_body_raises():
+    client = Mock(spec=SandboxClient)
+    client.invoke.return_value = {
+        "killed": False, "error_code": "COMMAND_NOT_RUNNING", "error": "already finished"
+    }
+    handle = CommandHandle("cmd-42", client, "sandbox")
+    assert handle.kill() is False
+
+    client.invoke.return_value = {
+        "killed": False, "error_code": "SIGNAL_FAILED", "error": "signal failed"
+    }
+    with pytest.raises(SandboxError, match="signal failed"):
+        handle.kill()
+
+
+def test_local_deadline_after_noop_kill_returns_authoritative_result(clock, running):
+    collection, handle = running
+    terminal = CommandResult("done", "", 0, status=CommandStatus.SUCCEEDED)
+
+    def wait(timeout):
+        if timeout:
+            clock.now += 3
+            return CommandResult("", "", None, status=CommandStatus.RUNNING, error_code="WAIT_TIMEOUT")
+        return terminal
+
+    handle.wait.side_effect = wait
+    handle.kill.return_value = False
+    assert collection._run_with_poll("sleep 3", None, None, 3) is terminal
+    handle.kill.assert_called_once_with()
 
 
 @pytest.mark.parametrize("terminal", [

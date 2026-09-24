@@ -232,13 +232,18 @@ async fn handle_conn(
         if sock.peek(&mut first).await? == 0 {
             return Ok(());
         }
-        handle_one_request(sock, token.clone()).await?;
+        let mut close_after_response = false;
+        handle_one_request(sock, token.clone(), &mut close_after_response).await?;
+        if close_after_response {
+            return Ok(());
+        }
     }
 }
 
 async fn handle_one_request(
     sock: &mut tokio::net::TcpStream,
     token: Option<String>,
+    close_after_response: &mut bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Read until the header terminator (\r\n\r\n). Bodies support Content-Length or chunked encoding.
     let mut buf = Vec::with_capacity(4096);
@@ -381,7 +386,11 @@ async fn handle_one_request(
         .await;
     }
     if method == "GET" && route == "/download" {
-        return handle_download(sock, &path, &head, &mut tmp, trace_id.as_str()).await;
+        // Binary file responses advertise Connection: close. Tar downloads
+        // and ordinary error responses remain reusable.
+        *close_after_response =
+            handle_download(sock, &path, &head, &mut tmp, trace_id.as_str()).await?;
+        return Ok(());
     }
 
     if !(method == "POST" && route == "/invoke") {
@@ -1292,22 +1301,27 @@ async fn handle_download(
     head: &str,
     tmp: &mut [u8],
     trace_id: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<bool, Box<dyn std::error::Error>> {
     let path = match query_param(raw_path, "path").and_then(|p| percent_decode(&p)) {
         Some(p) if !p.is_empty() => p,
-        _ => return write_resp(sock, 400, "{\"error\":\"missing path\"}").await,
+        _ => {
+            return write_resp(sock, 400, "{\"error\":\"missing path\"}")
+                .await
+                .map(|_| false)
+        }
     };
     match upload_type(raw_path).as_str() {
-        "tar" => handle_tar_download(sock, &path, tmp, trace_id).await,
-        "file" | "" => handle_file_download(sock, &path, head, tmp, trace_id).await,
-        other => {
-            write_resp(
-                sock,
-                400,
-                &err_json(&format!("unsupported download type: {other}")),
-            )
+        "tar" => handle_tar_download(sock, &path, tmp, trace_id)
             .await
-        }
+            .map(|_| false),
+        "file" | "" => handle_file_download(sock, &path, head, tmp, trace_id).await,
+        other => write_resp(
+            sock,
+            400,
+            &err_json(&format!("unsupported download type: {other}")),
+        )
+        .await
+        .map(|_| false),
     }
 }
 
@@ -1317,11 +1331,15 @@ async fn handle_file_download(
     head: &str,
     tmp: &mut [u8],
     trace_id: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<bool, Box<dyn std::error::Error>> {
     let started = Instant::now();
     let meta = match std::fs::metadata(path) {
         Ok(m) if m.is_file() => m,
-        _ => return write_resp(sock, 404, &err_json("file not found")).await,
+        _ => {
+            return write_resp(sock, 404, &err_json("file not found"))
+                .await
+                .map(|_| false)
+        }
     };
     let total = meta.len();
     let range = parse_range_header(head, total);
@@ -1362,7 +1380,7 @@ async fn handle_file_download(
         started.elapsed().as_millis(),
         trace_id
     );
-    Ok(())
+    Ok(true)
 }
 
 async fn handle_tar_download(
@@ -1871,6 +1889,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn command_wait_deadline_and_missing_kill_are_http_successes() {
+        let command_id = format!("http-wait-deadline-{}", std::process::id());
+        let start = std::collections::BTreeMap::from([
+            (
+                "command_id".to_string(),
+                rmpv::Value::from(command_id.clone()),
+            ),
+            ("cmd".to_string(), rmpv::Value::from("sleep 5")),
+        ]);
+        super::super::cmd::cmd_start(&start);
+        let lookup = std::collections::BTreeMap::from([
+            (
+                "command_id".to_string(),
+                rmpv::Value::from(command_id.clone()),
+            ),
+            ("timeout".to_string(), rmpv::Value::from(0)),
+        ]);
+        let wait = invoke_over_http(
+            "process.wait",
+            serde_json::json!({"command_id": command_id, "timeout": 0}),
+        )
+        .await;
+        let _ = super::super::cmd::cmd_kill(&lookup);
+        assert_eq!(wait["status"], "running");
+        assert_eq!(wait["error_code"], "WAIT_TIMEOUT");
+
+        let kill = invoke_over_http(
+            "process.kill",
+            serde_json::json!({"command_id": format!("http-missing-kill-{}", std::process::id())}),
+        )
+        .await;
+        assert_eq!(kill["status"], "NOT_FOUND");
+        assert_eq!(kill["killed"], false);
+    }
+
+    #[tokio::test]
     async fn json_responses_reuse_one_http_connection() {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
@@ -1894,6 +1948,42 @@ mod tests {
         }
 
         drop(client);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn binary_file_download_closes_connection_after_body() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("payload.bin");
+        std::fs::write(&file, [0, 1, 255, 0]).unwrap();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            handle_conn(&mut stream, None).await.unwrap();
+        });
+        let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+        let path = file.to_string_lossy().replace('/', "%2F");
+        client
+            .write_all(
+                format!("GET /download?path={path}&type=file HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let (head, body) = read_http_response(&mut client).await;
+        assert!(head.contains("Connection: close\r\n"));
+        assert_eq!(body, [0, 1, 255, 0]);
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), client.read(&mut byte))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
         server.await.unwrap();
     }
 

@@ -10,11 +10,12 @@ import random
 import re
 import time
 import uuid
+import httpx
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Union
 
 from ._http_pool import SandboxClientClosedError
-from ._transport import SandboxClient, SandboxHTTPError
+from ._transport import SandboxClient, SandboxError, SandboxHTTPError
 from ._command_metrics import increment, observe_wait
 from .types import CommandInfo, CommandResult, CommandStatus
 
@@ -164,6 +165,39 @@ def _result(snapshot: dict) -> CommandResult:
     )
 
 
+def _wait_timeout_result(snapshot: dict) -> CommandResult:
+    """A wait deadline leaves the remote command running and recoverable."""
+    timeout_snapshot = dict(snapshot)
+    timeout_snapshot["status"] = "RUNNING"
+    timeout_snapshot["error_code"] = "WAIT_TIMEOUT"
+    timeout_snapshot["error_message"] = str(
+        timeout_snapshot.get("error")
+        or timeout_snapshot.get("error_message")
+        or "command wait timed out"
+    )
+    timeout_snapshot.pop("exit_code", None)
+    return _result(timeout_snapshot)
+
+
+def _kill_command(client: SandboxClient, sandbox_id: str, key: dict) -> bool:
+    try:
+        response = client.invoke(sandbox_id, "process.kill", key)
+    except SandboxHTTPError as error:
+        if error.status_code in (400, 404) and error.payload.get("error_code") in (
+            "COMMAND_NOT_FOUND",
+            "COMMAND_NOT_RUNNING",
+        ):
+            return False
+        raise
+    if response.get("error_code") in ("COMMAND_NOT_FOUND", "COMMAND_NOT_RUNNING"):
+        return False
+    if response.get("error"):
+        raise SandboxError(
+            str(response["error"]), request_id=getattr(response, "request_id", None)
+        )
+    return bool(response["killed"])
+
+
 def _info(snapshot: dict) -> CommandInfo:
     if "status" in snapshot:
         status_text = str(snapshot["status"]).upper()
@@ -247,6 +281,7 @@ class CommandHandle:
         return self._snapshot().status
 
     def wait(self, timeout: Optional[float] = None) -> CommandResult:
+        """Observe completion; a wait deadline returns a RUNNING timeout result."""
         increment("command_wait_total")
         started = time.monotonic()
         try:
@@ -254,17 +289,27 @@ class CommandHandle:
             if str(snapshot.get("status", "")).upper() in ("PENDING", "RUNNING"):
                 connection = getattr(self._client, "_connection", None)
                 if connection is None:
-                    snapshot = self._client.invoke(
-                        self._sid,
-                        "process.wait",
-                        {"command_id": self.command_id, "timeout": timeout},
-                        timeout=-1 if timeout is None else max(1, int(timeout) + 1),
-                    )
+                    try:
+                        snapshot = self._client.invoke(
+                            self._sid,
+                            "process.wait",
+                            {"command_id": self.command_id, "timeout": timeout},
+                            timeout=-1 if timeout is None else max(1, int(timeout) + 1),
+                        )
+                    except SandboxHTTPError as error:
+                        if error.status_code == 400 and error.payload.get("error_code") == "WAIT_TIMEOUT":
+                            return _wait_timeout_result(error.payload)
+                        raise
                 else:
                     from ._command_watch import manager_for
 
-                    manager_for(connection).wait(self._sid, self.command_id, timeout)
+                    try:
+                        manager_for(connection).wait(self._sid, self.command_id, timeout)
+                    except CommandWaitTimeout:
+                        return _wait_timeout_result(snapshot)
                     snapshot = self._raw_snapshot()
+                if snapshot.get("error_code") == "WAIT_TIMEOUT":
+                    return _wait_timeout_result(snapshot)
             return _result(snapshot)
         finally:
             observe_wait(time.monotonic() - started)
@@ -286,19 +331,21 @@ class CommandHandle:
             if str(snapshot.get("status", "")).upper() in ("PENDING", "RUNNING"):
                 from ._command_watch import manager_for
 
-                await manager_for(connection).wait_async(
-                    self._sid, self.command_id, timeout
-                )
+                try:
+                    await manager_for(connection).wait_async(
+                        self._sid, self.command_id, timeout
+                    )
+                except CommandWaitTimeout:
+                    return _wait_timeout_result(snapshot)
                 snapshot = await asyncio.to_thread(self._raw_snapshot)
             return _result(snapshot)
         finally:
             observe_wait(time.monotonic() - started)
 
     def kill(self) -> bool:
-        return bool(
-            self._client.invoke(
-                self._sid, "process.kill", {"command_id": self.command_id}
-            )["killed"]
+        """Return whether a live command was signalled (False if absent or finished)."""
+        return _kill_command(
+            self._client, self._sid, {"command_id": self.command_id}
         )
 
     def send_stdin(self, data: str, eof: bool = False) -> None:
@@ -457,12 +504,14 @@ class Commands:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 try:
-                    handle.kill()
+                    killed = handle.kill()
                 except SandboxHTTPError as error:
                     if error.status_code != 400 or error.payload.get("error_code") != "COMMAND_NOT_RUNNING":
                         raise
                     # EXECD may reach its execution deadline before the local
                     # wait expires. Return that authoritative terminal result.
+                    return handle.wait(0)
+                if not killed:
                     return handle.wait(0)
                 return CommandResult(
                     "",
@@ -472,12 +521,21 @@ class Commands:
                 )
             wait = min(_POLL_INTERVAL * (0.7 + random.random() * 0.6), remaining)
             try:
-                return handle.wait(wait)
+                result = handle.wait(wait)
+                if result.error_code == "WAIT_TIMEOUT" and result.status == CommandStatus.RUNNING:
+                    continue
+                return result
             except SandboxClientClosedError:
                 raise
             except TimeoutError:
                 continue
-            except Exception as error:
+            except (httpx.TransportError, SandboxError) as error:
+                if isinstance(error, SandboxError):
+                    if error.outcome == "terminal" or error.code in (
+                        "SANDBOX_EXITED", "SCHEDULE_FAILED", "SANDBOX_SCHEDULE_FAILED",
+                        "SCHEDULING_FAILED", "INSTANCE_FAILED"
+                    ) or error.retry not in ("after_backoff", "same_operation"):
+                        raise
                 logger.warning("command wait failed (command_id=%s): %s", handle.id, error)
                 retry_delay = min(_POLL_RETRY_DELAY, deadline - time.monotonic())
                 if retry_delay > 0:
@@ -499,8 +557,9 @@ class Commands:
         return [_info(item) for item in processes if isinstance(item, dict)]
 
     def kill(self, command: Union[str, int]) -> bool:
+        """Return whether a live command was signalled (False if absent or finished)."""
         key = {"command_id": command} if isinstance(command, str) else {"pid": command}
-        return bool(self._client.invoke(self._sid, "process.kill", key)["killed"])
+        return _kill_command(self._client, self._sid, key)
 
     def send_stdin(self, command: Union[str, int], data: str, eof: bool = False) -> None:
         key = {"command_id": command} if isinstance(command, str) else {"pid": command}

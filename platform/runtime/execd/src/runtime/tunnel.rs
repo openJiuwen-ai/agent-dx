@@ -829,6 +829,8 @@ fn headers_within_limits(headers: &HeaderList) -> bool {
 
 // ───────────────────────── shared state ─────────────────────────
 struct State {
+    /// Immutable identity for this listener generation, including restored clones.
+    expected_environment_id: Option<String>,
     /// Maximum wait for one reverse-tunnel HTTP exchange.
     http_timeout: Duration,
     /// Outbound bounded channel and generation of the active TunnelClient WS.
@@ -860,6 +862,7 @@ struct State {
 impl Default for State {
     fn default() -> Self {
         Self {
+            expected_environment_id: None,
             http_timeout: configured_http_timeout(),
             active_client: Mutex::new(None),
             pending_http: Mutex::new(HashMap::new()),
@@ -1635,7 +1638,12 @@ impl TunnelServerControl {
             })?;
         let porta = TcpListener::from_std(self.inner.porta.try_clone()?)?;
         let portb = TcpListener::from_std(self.inner.portb.try_clone()?)?;
-        let state = Arc::new(State::default());
+        let state = Arc::new(State {
+            expected_environment_id: std::env::var("ADX_ENVIRONMENT_ID")
+                .ok()
+                .filter(|id| !id.is_empty()),
+            ..State::default()
+        });
         let generation = self.inner.generation.load(Ordering::Relaxed) + 1;
         self.inner.generation.store(generation, Ordering::Release);
         let _ = self.inner.ready_tx.send(super::RuntimeReadyState::Ready);
@@ -1716,15 +1724,42 @@ async fn accept_port_a(listener: TcpListener, state: Arc<State>) {
     }
 }
 
+// Tungstenite's handshake callback must return its by-value HTTP response.
+#[expect(
+    clippy::result_large_err,
+    reason = "tungstenite requires a by-value ErrorResponse"
+)]
 async fn handle_client(stream: TcpStream, state: Arc<State>) -> Result<(), String> {
     if super::control::current().is_some_and(|controller| {
         controller.status().phase != adx_core::runtime::RuntimePhase::Running
     }) {
         return Err("runtime checkpoint transition in progress".into());
     }
-    let ws = tokio_tungstenite::accept_async(stream)
-        .await
-        .map_err(|e| format!("ws accept: {e}"))?;
+    let expected_id = state.expected_environment_id.clone();
+    let ws = tokio_tungstenite::accept_hdr_async(
+        stream,
+        move |request: &tokio_tungstenite::tungstenite::handshake::server::Request,
+              response: tokio_tungstenite::tungstenite::handshake::server::Response| {
+            if expected_id.as_deref().is_some_and(|id| {
+                request
+                    .headers()
+                    .get("x-sandbox-id")
+                    .and_then(|value| value.to_str().ok())
+                    != Some(id)
+            }) {
+                let mut rejection =
+                    tokio_tungstenite::tungstenite::handshake::server::ErrorResponse::new(Some(
+                        "sandbox identity mismatch".into(),
+                    ));
+                *rejection.status_mut() =
+                    tokio_tungstenite::tungstenite::http::StatusCode::CONFLICT;
+                return Err(rejection);
+            }
+            Ok(response)
+        },
+    )
+    .await
+    .map_err(|e| format!("ws accept: {e}"))?;
     let (mut sink, mut rx_ws) = ws.split();
     let _active = super::activity::enter(super::activity::ActivitySource::Tunnel);
     let (tx, mut rx) = mpsc::channel::<OutboundMessage>(OUTBOUND_QUEUE_FRAMES);
@@ -3401,6 +3436,58 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_tungstenite::connect_async;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    #[tokio::test]
+    async fn tunnel_rejects_wrong_identity_before_replacing_active_client() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let state = Arc::new(State {
+            expected_environment_id: Some("sandbox-a".into()),
+            ..State::default()
+        });
+        let server_state = state.clone();
+        let server = tokio::spawn(async move {
+            for _ in 0..3 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let state = server_state.clone();
+                tokio::spawn(async move {
+                    let _ = handle_client(stream, state).await;
+                });
+            }
+        });
+        let url = format!("ws://{address}/");
+        let missing = connect_async(url.clone()).await.unwrap_err();
+        assert!(
+            matches!(missing, tokio_tungstenite::tungstenite::Error::Http(response) if response.status() == tokio_tungstenite::tungstenite::http::StatusCode::CONFLICT)
+        );
+        assert_eq!(state.active_client_generation(), None);
+
+        let mut correct = url.clone().into_client_request().unwrap();
+        correct
+            .headers_mut()
+            .insert("X-Sandbox-ID", HeaderValue::from_static("sandbox-a"));
+        let (_active, _) = connect_async(correct).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while state.active_client_generation().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let generation = state.active_client_generation();
+
+        let mut wrong = url.into_client_request().unwrap();
+        wrong
+            .headers_mut()
+            .insert("X-Sandbox-ID", HeaderValue::from_static("sandbox-b"));
+        let rejected = connect_async(wrong).await.unwrap_err();
+        assert!(
+            matches!(rejected, tokio_tungstenite::tungstenite::Error::Http(response) if response.status() == tokio_tungstenite::tungstenite::http::StatusCode::CONFLICT)
+        );
+        assert_eq!(state.active_client_generation(), generation);
+        server.await.unwrap();
+    }
 
     #[test]
     fn http_headers_decode_legacy_maps_and_preserve_ordered_duplicates() {
