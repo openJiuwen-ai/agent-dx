@@ -166,3 +166,35 @@ async fn runtime_exit_during_probe_is_not_ready() {
     let (port, _server, _) = serve(r#"{"identity":{"environment_id":"i","runtime_id":"i-1","ownership_generation":1},"revision":1,"phase":"running","checkpoint":null,"active_requests":0,"active_commands":0}"#, Some(runtime.clone())).await;
     assert!(checker(runtime, port).wait_ready(&record()).await.is_err());
 }
+
+#[tokio::test]
+async fn detached_background_command_does_not_keep_idle_activity_open() {
+    let (port, _server, _) = serve(
+        r#"{"identity":{"environment_id":"i","runtime_id":"i-1","ownership_generation":1},"revision":1,"phase":"running","checkpoint":null,"active_requests":0,"active_commands":1,"activity_revision":7}"#,
+        None,
+    )
+    .await;
+    assert_eq!(
+        checker(runtime(true), port)
+            .activity(&record())
+            .await
+            .unwrap(),
+        (7, 0)
+    );
+}
+
+#[tokio::test]
+async fn active_client_request_still_blocks_idle_activity() {
+    let (port, _server, _) = serve(
+        r#"{"identity":{"environment_id":"i","runtime_id":"i-1","ownership_generation":1},"revision":1,"phase":"running","checkpoint":null,"active_requests":1,"active_commands":1,"activity_revision":8}"#,
+        None,
+    )
+    .await;
+    assert_eq!(
+        checker(runtime(true), port)
+            .activity(&record())
+            .await
+            .unwrap(),
+        (8, 1)
+    );
+}

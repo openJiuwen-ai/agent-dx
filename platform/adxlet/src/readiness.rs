@@ -63,12 +63,10 @@ impl Readiness for ExecdReadiness {
         if status.phase != RuntimePhase::Running || status.activity_revision == 0 {
             return Err(unavailable("runtime activity observation is not ready"));
         }
-        Ok((
-            status.activity_revision,
-            status
-                .active_requests
-                .saturating_add(status.active_commands),
-        ))
+        // A detached background command belongs to the runtime, not to a live
+        // client. Its start still advances activity_revision, but it must not
+        // indefinitely prevent an otherwise idle capsule from being reaped.
+        Ok((status.activity_revision, status.active_requests))
     }
     async fn wait_ready(&self, record: &EnvironmentRecord) -> Result<()> {
         tokio::time::timeout(self.ready_timeout, async {

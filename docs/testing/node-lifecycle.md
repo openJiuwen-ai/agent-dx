@@ -6,7 +6,7 @@ adxlet 拥有实例串行状态机。Coordinator 提供归属校验、Redis 持�
 
 `EnvironmentSpec.lifecycle` 包含 `idle_timeout_seconds` 和可选 `restart`。HTTP 保留 `idleTimeoutSeconds`，新增 `restartPolicy`；Python SDK 支持 `RestartPolicy(max_attempts=3, initial_backoff_seconds=1, max_backoff_seconds=30)`。
 
-- 空闲超时为 0 时不回收。启用后，运行实例的 Execd 请求／命令计数与 Relay 流计数必须同时为 0，且活动版本在整个空闲窗口内未改变。采样失败或活动版本改变会重置窗口。adxlet 执行删除。
+- 空闲超时为 0 时不回收。启用后，运行实例的 Execd 活跃客户端请求数与 Relay 流计数必须同时为 0，且活动版本在整个空闲窗口内未改变。后台命令仍计入 Execd 状态与活动版本，但客户端退出后不会仅因命令仍运行而阻止回收。采样失败或活动版本改变会重置窗口。adxlet 执行删除。
 - RuntimeDriver 确认执行退出后，节点先退役路由、确认旧执行清理，再标记 Failed。启用重启时，按照指数退避和累计重试上限重新申请本机资源，并分配新的执行 ID，Environment ID 与归属代次保持。
 - `restart_attempts` 和 `restart_pending` 随实例结果写入 Redis／降级日志。进程重启不重置次数。显式删除取消重启。清理未确认时保留资源，禁止启动替代执行。
 - 可配置 `execd_health_failure_threshold`；省略时不以健康探测失败触发重启。连续失败达到阈值后，仍须先确认旧执行清理。健康检查只覆盖 Execd。
