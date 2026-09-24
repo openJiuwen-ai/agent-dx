@@ -40,8 +40,8 @@ class RuntimeAffinityTests(unittest.TestCase):
             if command[:5] == ('/opt/adx/current/bin/adx-inspect', '-c',
                                 '/opt/adx/config/deployment.yaml', 'node', 'get'):
                 node_id = command[5]
-                return json.dumps({'node': {'id': node_id, 'available': True,
-                                            'runtime_classes': classes[node_id]},
+                return json.dumps({'id': node_id, 'available': True,
+                                   'runtime_classes': classes[node_id],
                                    'session': {'routable': True}})
             if command[:5] == ('/opt/adx/current/bin/adx-inspect', '-c',
                                 '/opt/adx/config/deployment.yaml', 'environment', 'get'):
