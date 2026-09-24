@@ -231,6 +231,15 @@ impl NodeRpc {
         request: pb::LocalEnvironmentCreateRequest,
         deadline: tokio::time::Instant,
     ) -> std::result::Result<Response<pb::EnvironmentResult>, Status> {
+        if let Some(spec) = request
+            .create
+            .as_ref()
+            .and_then(|create| create.spec.as_ref())
+        {
+            adx_observability::info!(event="local_environment_fallback",
+                environment_id=%spec.id, node_id=%self.manager.node_id,
+                "entry node forwarded create to central scheduling");
+        }
         let mut client = sink
             .client
             .read()

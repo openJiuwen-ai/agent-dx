@@ -210,7 +210,7 @@ profile；完整 Multi-VM 在补齐部署器前不能标记为通过。
 | `MV-01` | 契约已固化 | 三个唯一 machine ID，控制节点和两个 worker 完成跨 VM mTLS/Redis/RPC 就绪 |
 | `MV-02` | SDK 子集已有，未实机执行 | 实例实际落到两个 worker，保存 `adx-inspect` 的持久化 assignment 与各自 sandboxd inventory |
 | `MV-03` | 容量/队列子集已有，未实机执行 | 双 worker 总容量、排队、释放唤醒及 Pack/Spread 配置；后者尚待补 |
-| `MV-04` | 计划 | Local-first 入口轮转、原子归属、冲突拒绝及中心 fallback 不重复计账 |
+| `MV-04` | 定向用例已有，未实机执行 | Local-first 入口轮转、原子归属、冲突拒绝、真实本地 claim 证据及中心 fallback 不重复计账 |
 | `MV-05` | SDK 子集已有，未实机执行 | Ingress 经目标 Relay/Execd 的跨 VM 命令与文件路径 |
 | `MV-06` | 故障子集已有，未实机执行 | worker 心跳过期使实例失效并撤路由；返回 worker 清理旧后端、换会话后再准入，健康 worker 继续执行 |
 | `MV-07` | 快速重启子集已有，未实机执行 | worker 进程重启、原 backend/归属代数保持和新 session 对账；旧 session 写入隔离仍待协议级探针 |
