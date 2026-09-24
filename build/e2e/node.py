@@ -161,19 +161,22 @@ def main():
         marker.touch()
         os.kill(previous_pid,signal.SIGTERM)
         deadline=time.monotonic()+65
+        last_after=None
         while True:
             try:
                 current_pid=int((P/'sandboxd.pid').read_text())
                 if current_pid!=previous_pid:
                     after=backend()
-                    assert after==before,'backend identity changed across sandboxd restart'
-                    (E/f'sandboxd-restart-{node}.json').write_text(json.dumps({
-                        'previous_pid':previous_pid,'pid':current_pid,
-                        'backend_ids_before':before,'backend_ids_after':after,
-                    },indent=2))
-                    break
+                    last_after=after
+                    if after==before:
+                        (E/f'sandboxd-restart-{node}.json').write_text(json.dumps({
+                            'previous_pid':previous_pid,'pid':current_pid,
+                            'backend_ids_before':before,'backend_ids_after':after,
+                        },indent=2))
+                        break
             except (OSError,subprocess.SubprocessError):pass
-            if time.monotonic()>deadline:raise TimeoutError('sandboxd did not restart with existing backend IDs')
+            if time.monotonic()>deadline:
+                raise TimeoutError(f'sandboxd backend IDs did not converge: before={before!r}, after={last_after!r}')
             time.sleep(.2)
     elif action=='unchanged':
         after=backend()
