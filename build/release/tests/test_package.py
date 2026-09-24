@@ -9,6 +9,9 @@ s = importlib.util.spec_from_file_location("package", Path(__file__).resolve().p
 pkg = importlib.util.module_from_spec(s)
 s.loader.exec_module(pkg)
 class PackageTests(unittest.TestCase):
+    def test_inspector_is_part_of_the_platform_release(self):
+        self.assertIn("adx-inspect", pkg.BINARIES)
+
     def test_complete_package_verifies_and_tampering_fails(self):
         with tempfile.TemporaryDirectory() as t:
             root=Path(t); binaries=root/"bin";binaries.mkdir()
@@ -32,7 +35,7 @@ class PackageTests(unittest.TestCase):
             root = Path(temporary)
             binaries = root / "bin"
             binaries.mkdir()
-            embedded = {"adxctl", "adx-coordinator", "adxlet", "adx-apiserver"}
+            embedded = {"adxctl", "adx-inspect", "adx-coordinator", "adxlet", "adx-apiserver"}
             split = {"adx-ingress", "adx-relay", "adx-data-plane-forward"}
             for name in embedded | split | {"adx-execd"}:
                 (binaries / name).write_bytes(b"fixture")

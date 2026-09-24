@@ -23,7 +23,7 @@ case "$component" in
     echo "--- :rust: Compile Platform"
     cargo build --locked --release -j "$jobs" \
       -p adx-deployment -p adx-coordinator -p adxlet --bins
-    for binary in adxctl adx-coordinator adxlet; do
+    for binary in adxctl adx-inspect adx-coordinator adxlet; do
       cp "$CARGO_TARGET_DIR/release/$binary" "$output/$binary"
     done
     ;;

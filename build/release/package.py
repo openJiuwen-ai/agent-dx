@@ -10,7 +10,7 @@ import subprocess
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
-BINARIES = ("adxctl", "adx-coordinator", "adxlet", "adx-apiserver")
+BINARIES = ("adxctl", "adx-inspect", "adx-coordinator", "adxlet", "adx-apiserver")
 
 def sha(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()

@@ -52,7 +52,7 @@ API Server embeds Ingress by default, and adxlet embeds Relay by default. Both p
 
 ## 📦 Installation
 
-ADX release packages target Linux and contain `adx-coordinator`, `adxlet` (embedded Relay), `adx-apiserver` (embedded Ingress), `adxctl`, Execd, the Python Sandbox SDK, and managed Redis. Standalone Ingress/Relay and the debug forwarder are source-build options, not shipped binaries. sandboxd remains independently managed and is pinned by [`third_party/sandboxd/source.json`](third_party/sandboxd/source.json).
+ADX release packages target Linux and contain `adx-coordinator`, `adxlet` (embedded Relay), `adx-apiserver` (embedded Ingress), `adxctl`, the read-only [`adx-inspect`](docs/deployment/adx-inspect.md), Execd, the Python Sandbox SDK, and managed Redis with `redis-cli`. Standalone Ingress/Relay and the debug forwarder are source-build options, not shipped binaries. sandboxd remains independently managed and is pinned by [`third_party/sandboxd/source.json`](third_party/sandboxd/source.json).
 
 ```sh
 mkdir adx-release

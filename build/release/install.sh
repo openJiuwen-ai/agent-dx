@@ -67,6 +67,7 @@ if manifest.get("schema_version") != 1 or not isinstance(files, dict):
 expected = set(files)
 required = {
     "bin/adxctl",
+    "bin/adx-inspect",
     "bin/adx-coordinator",
     "bin/adxlet",
     "bin/adx-apiserver",
