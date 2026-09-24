@@ -29,6 +29,7 @@ class Case:
 
 CASES = {
     'sdk': Case('sdk_accept.py', 'sdk-accept-result.json', 360),
+    'auth': Case('auth_accept.py', 'auth-result.json', 300),
     'capacity': Case('capacity_queue.py', 'capacity-queue-result.json', 540),
     'placement-pack': Case('placement_policy.py', 'placement-pack-result.json', 300),
     'placement-spread': Case('placement_policy.py', 'placement-spread-result.json', 300),
@@ -78,7 +79,7 @@ def case_command(config, case, destination):
                '--output', str(destination)]
     if case == 'sdk':
         command += ['--release', str(config.release)]
-    elif case == 'capacity':
+    elif case in ('auth', 'capacity'):
         command += ['--admin-token-file', str(config.admin_token_file)]
     elif case.startswith('placement-'):
         command += ['--placement', case.removeprefix('placement-')]
@@ -255,8 +256,8 @@ def main():
     args = parser.parse_args()
     if 'sdk' in args.cases and not args.release:
         parser.error('--case sdk requires --release')
-    if 'capacity' in args.cases and not args.admin_token_file:
-        parser.error('--case capacity requires --admin-token-file')
+    if ('capacity' in args.cases or 'auth' in args.cases) and not args.admin_token_file:
+        parser.error('--case auth and --case capacity require --admin-token-file')
     config = RunConfig(
         inventory=json.loads(args.inventory.read_text()), inventory_path=args.inventory,
         output=args.output, endpoint=args.endpoint, token_file=args.token_file,

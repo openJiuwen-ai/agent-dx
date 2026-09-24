@@ -121,6 +121,7 @@ class SuiteTests(unittest.TestCase):
             config = self.config(directory, ('sdk',))
             destination = config.output / 'sdk'
             self.assertIn('--release', case_command(config, 'sdk', destination))
+            self.assertIn('--admin-token-file', case_command(config, 'auth', destination))
             self.assertIn('--admin-token-file', case_command(config, 'capacity', destination))
             self.assertEqual(case_command(config, 'placement-spread', destination)[-2:],
                              ['--placement', 'spread'])
@@ -145,3 +146,12 @@ class SuiteTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'session-probe'):
                 run_plan(config, execute=execute)
             self.assertFalse(calls)
+
+    def test_auth_uses_shared_budget_and_saves_its_report(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = self.config(directory, ('auth',))
+            execute, calls = self.executor()
+            result = run_plan(config, execute=execute)
+            self.assertEqual(result['status'], 'passed')
+            self.assertEqual(calls, [('auth', 300)])
+            self.assertTrue((config.output / 'auth' / 'auth-result.json').is_file())
