@@ -124,5 +124,7 @@ class SuiteTests(unittest.TestCase):
             self.assertIn('--admin-token-file', case_command(config, 'capacity', destination))
             self.assertEqual(case_command(config, 'placement-spread', destination)[-2:],
                              ['--placement', 'spread'])
+            self.assertEqual(case_command(config, 'ingress-restart', destination)[-2:],
+                             ['--role', 'ingress'])
             self.assertEqual(case_command(config, 'stop', destination)[-1],
                              '--confirm-dedicated')

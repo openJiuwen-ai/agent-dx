@@ -36,6 +36,7 @@ CASES = {
     'worker-failure': Case('worker_failure.py', 'worker-failure-result.json', 480),
     'worker-restart': Case('worker_restart.py', 'worker-restart-result.json', 360),
     'control-restart': Case('control_restart.py', 'control-restart-result.json', 600),
+    'ingress-restart': Case('control_restart.py', 'control-restart-result.json', 300),
     'stop': Case('stop.py', 'stop-result.json', 480),
 }
 MAX_BUDGET_SECONDS = 3 * 60 * 60
@@ -77,6 +78,8 @@ def case_command(config, case, destination):
         command += ['--admin-token-file', str(config.admin_token_file)]
     elif case.startswith('placement-'):
         command += ['--placement', case.removeprefix('placement-')]
+    elif case == 'ingress-restart':
+        command += ['--role', 'ingress']
     elif case == 'stop':
         command.append('--confirm-dedicated')
     return command
