@@ -74,6 +74,27 @@ fault recovery, route-catalog inspection and ordered service shutdown still
 require their own executable checks before `verify.py` can report full
 Multi-VM acceptance. The SDK subset does not stop the shared services.
 
+`auth_accept.py` extends the L0 check across the public HTTPS Ingress. It
+requires the administrator key in addition to the owner tenant key. The case
+creates a temporary key for another tenant, verifies that invalid and
+cross-tenant keys cannot read or delete the owner's Sandbox, verifies the
+administrator-only key API, revokes the temporary key and waits for cached
+authentication to expire. The report contains no key material. Run it before
+fault injection on a deployed three-VM environment:
+
+```sh
+python3 build/e2e/multivm/auth_accept.py \
+  --inventory out/e2e/3vm/inventory.json \
+  --endpoint control.example:8443 \
+  --token-file /path/to/tenant-key \
+  --admin-token-file /path/to/admin-key \
+  --ca /path/to/ingress-ca.pem \
+  --image registry.example/team/rrt@sha256:DIGEST \
+  --output out/e2e/3vm/auth
+```
+
+Its result is `auth-result.json`; the case has not yet run on real VMs.
+
 `worker_failure.py` exercises heartbeat expiry and returning-worker cleanup.
 Run it only on dedicated test VMs after the SDK subset passes. The configured
 SSH account on worker 2 needs non-interactive `sudo -n kill` permission. The
@@ -343,7 +364,7 @@ python3 build/e2e/multivm/suite.py \
   --release /path/to/adx-release.tar.gz \
   --image registry.example/team/rrt@sha256:DIGEST \
   --output out/e2e/3vm/suite \
-  --case sdk --case capacity --case placement-pack --case node-preferences \
+  --case sdk --case auth --case capacity --case placement-pack --case node-preferences \
   --case worker-failure --case worker-restart --case control-restart
 ```
 
