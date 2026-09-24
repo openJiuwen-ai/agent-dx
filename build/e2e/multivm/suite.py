@@ -31,6 +31,7 @@ CASES = {
     'capacity': Case('capacity_queue.py', 'capacity-queue-result.json', 540),
     'placement-pack': Case('placement_policy.py', 'placement-pack-result.json', 300),
     'placement-spread': Case('placement_policy.py', 'placement-spread-result.json', 300),
+    'node-preferences': Case('node_preferences.py', 'node-preferences-result.json', 420),
     'local-first': Case('local_first.py', 'local-first-result.json', 600),
     'worker-failure': Case('worker_failure.py', 'worker-failure-result.json', 480),
     'worker-restart': Case('worker_restart.py', 'worker-restart-result.json', 360),

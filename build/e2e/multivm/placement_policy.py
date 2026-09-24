@@ -26,7 +26,7 @@ def configured_policy(control, remote=ssh):
     policies = re.findall(r'(?m)^\s+placement:\s*[\'"]?(pack|spread)[\'"]?\s*$', rendered)
     if len(policies) != 1:
         raise AssertionError(f'expected exactly one configured placement policy, got {policies}')
-    modes = re.findall(r'(?m)^\s+create_mode:\s*[\'"]?(central|local_first)[\'"]?\s*$',
+    modes = re.findall(r'(?m)^\s+create_mode:\s*[\'"]?([^\s\'"]+)[\'"]?\s*$',
                        rendered)
     if modes and modes != ['central']:
         raise AssertionError('Pack/Spread acceptance requires central create mode')

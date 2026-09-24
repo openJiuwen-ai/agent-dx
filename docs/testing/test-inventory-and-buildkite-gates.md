@@ -161,7 +161,7 @@ Firecracker checkpoint 使用独立 KVM profile；GPU/NPU 使用具备真实设�
 |---|---|---|
 | L0 | 独立 `--profile l0` 执行 `l0 + auth`，输出 `required_checks`、逐项 JSON 和 JUnit；Buildkite 基础包 #87 已通过 | 后续提交仍需持续执行门禁 |
 | Standalone | `--profile standalone` 统一本地 Docker 十一组；安装示例和 Lima FC 各自有严格结果契约 | 需增加汇总清单，把普通 Linux、安装示例和按需 KVM 结果关联到同一 revision |
-| Multi-VM | 三 VM inventory 与结果契约、公开 SDK 放置/数据链路、容量队列、Pack/Spread、local-first、worker 与控制节点故障及有序停机定向用例已提供；`suite.py` 为跨配置分批执行提供共享三小时预算和失败汇总 | 尚缺生成配置、分发制品及完整 `contract.REQUIRED` 结果的三 VM 部署器；节点偏好、旧 session fencing、独立 Ingress 与 KVM checkpoint 仍有专项缺口；未进行真实三 VM 验收 |
+| Multi-VM | 三 VM inventory 与结果契约、公开 SDK 放置/数据链路、容量队列、Pack/Spread、节点偏好、local-first、worker 与控制节点故障及有序停机定向用例已提供；`suite.py` 为跨配置分批执行提供共享三小时预算和失败汇总 | 尚缺生成配置、分发制品及完整 `contract.REQUIRED` 结果的三 VM 部署器；旧 session fencing、独立 Ingress 与 KVM checkpoint 仍有专项缺口；未进行真实三 VM 验收 |
 | Full Deployment | K8s 已支持 `l0`、五组 `k8s-basic` 和十一组 `full`；`full` 强制两个 Pod 位于不同物理 worker | Full #17 在不同 worker 同次通过十一组、JUnit 45 项和资源清理；异构 runtime、K8s FC 和真实 GPU/NPU 仍需独立环境 |
 
 因此当前可以直接形成 Buildkite 门禁的是 UT、L0、基础 K8s 五组和 Full 十一组。`full` 的同宿主假绿已被
@@ -209,7 +209,7 @@ profile；完整 Multi-VM 在补齐部署器前不能标记为通过。
 |---|---|---|
 | `MV-01` | 契约已固化 | 三个唯一 machine ID，控制节点和两个 worker 完成跨 VM mTLS/Redis/RPC 就绪 |
 | `MV-02` | SDK 子集已有，未实机执行 | 实例实际落到两个 worker，保存 `adx-inspect` 的持久化 assignment 与各自 sandboxd inventory |
-| `MV-03` | 容量/队列及 Pack/Spread 定向用例已有，未实机执行 | 双 worker 总容量、排队和释放唤醒；在两个独立 central 配置中分别验证 Pack 同节点、Spread 分节点。节点偏好评分仍待补 |
+| `MV-03` | 容量/队列、Pack/Spread 和节点偏好定向用例已有，未实机执行 | 双 worker 总容量、排队和释放唤醒；在两个独立 central 配置中分别验证 Pack 同节点、Spread 分节点；另验证加权／有序偏好及亲和／反亲和的持久化和物理归属 |
 | `MV-04` | 定向用例已有，未实机执行 | Local-first 入口轮转、原子归属、冲突拒绝、真实本地 claim 证据及中心 fallback 不重复计账 |
 | `MV-05` | SDK 子集已有，未实机执行 | Ingress 经目标 Relay/Execd 的跨 VM 命令与文件路径 |
 | `MV-06` | 故障子集已有，未实机执行 | worker 心跳过期使实例失效并撤路由；返回 worker 清理旧后端、换会话后再准入，健康 worker 继续执行 |
