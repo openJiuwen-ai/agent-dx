@@ -166,3 +166,27 @@ python3 build/e2e/multivm/local_first.py \
 ```
 
 This is a runnable case, not evidence that it has passed on real VMs.
+
+`control_restart.py` covers the default embedded-Ingress `MV-08` profile on a
+pre-provisioned control VM with supervised Coordinator, API Server, and managed
+Redis. It keeps one Sandbox on each worker while killing and restarting those
+three child processes in turn. Each restart must preserve persisted ownership,
+generation, physical backend IDs, file contents, and public SDK commands.
+Coordinator restart must advance the epoch; API Server restart must not. After
+each restart, both workers must again be routable. The test removes its two
+Sandboxes and verifies persisted release and physical cleanup. It requires
+the supervisor to restart each child within 90 seconds and does not stop the
+control VM or the whole deployment.
+
+```sh
+python3 build/e2e/multivm/control_restart.py \
+  --inventory out/e2e/3vm/inventory.json \
+  --endpoint control.example:8443 \
+  --token-file /path/to/tenant-key \
+  --ca /path/to/ingress-ca.pem \
+  --image registry.example/team/rrt@sha256:DIGEST \
+  --output out/e2e/3vm/control-restart
+```
+
+This case has not yet passed on three real VMs. A separate Ingress process
+needs its own restart acceptance in the split-process profile.
