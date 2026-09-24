@@ -17,6 +17,12 @@ class AcceptanceGateTests(unittest.TestCase):
         self.assertEqual(driver.setup_environment('apiserver-restart'), ())
         self.assertEqual(driver.setup_environment(None), ())
 
+    def test_standalone_relay_case_uses_separate_node_processes(self):
+        self.assertEqual(driver.setup_environment('relay-standalone'),
+                         ('ADX_E2E_RELAY_MODE=standalone',))
+        self.assertEqual(driver.selected_checks('full', 'relay-standalone'),
+                         ('relay-standalone',))
+
     def test_entrypoint_fixture_outlives_instance_startup(self):
         source=(ROOT/'prepare.py').read_text()
         self.assertIn('sleep 30; echo adx-entrypoint-stderr',source)

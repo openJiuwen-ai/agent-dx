@@ -18,7 +18,7 @@ import xml.etree.ElementTree as ET
 
 BASIC = ('sdk','auth','capacity','placement','local-first')
 STANDARD = ('sdk','data-plane','lifecycle','auth','capacity','placement','local-first','node-failure','sandboxd-restart','restart','stop')
-OPTIONAL_CASES = ('redis-restart','coordinator-restart','apiserver-restart','ingress-restart','runtime-affinity','idle-active')
+OPTIONAL_CASES = ('redis-restart','coordinator-restart','apiserver-restart','ingress-restart','runtime-affinity','idle-active','relay-standalone')
 PROFILES = {
     'l0': ('l0','auth'),
     'standalone': STANDARD,
@@ -42,7 +42,11 @@ def selected_checks(profile, case=None):
     return (case,)
 
 def setup_environment(selected_case):
-    return ('ADX_E2E_INGRESS_MODE=standalone',) if selected_case == 'ingress-restart' else ()
+    if selected_case == 'ingress-restart':
+        return ('ADX_E2E_INGRESS_MODE=standalone',)
+    if selected_case == 'relay-standalone':
+        return ('ADX_E2E_RELAY_MODE=standalone',)
+    return ()
 
 def sha(path):
     h=hashlib.sha256()
@@ -316,6 +320,13 @@ class Run:
             with self.case('idle-active', checks) as record:
                 output=self.execute('node1','/opt/adx/client/bin/python','-u',
                                     '/opt/adx/e2e/scenarios.py','idle-active',timeout=240)
+                record['subcases']=sdk_subcases_from_output(output)
+                for node in self.nodes:self.helper(node,'empty',node)
+        if 'relay-standalone' in selected:
+            with self.case('relay-standalone', checks) as record:
+                for node in self.nodes:self.helper(node,'relay-separate',node)
+                output=self.execute('node1','/opt/adx/client/bin/python','-u',
+                                    '/opt/adx/e2e/scenarios.py','data-plane',timeout=600)
                 record['subcases']=sdk_subcases_from_output(output)
                 for node in self.nodes:self.helper(node,'empty',node)
         if 'local-first' in selected:
