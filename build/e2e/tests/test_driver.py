@@ -51,6 +51,7 @@ class AcceptanceGateTests(unittest.TestCase):
         self.assertEqual(driver.selected_checks('full', 'ingress-restart'), ('ingress-restart',))
         self.assertEqual(driver.selected_checks('full', 'runtime-affinity'), ('runtime-affinity',))
         self.assertEqual(driver.selected_checks('full', 'idle-active'), ('idle-active',))
+        self.assertEqual(driver.selected_checks('full', 'runtime-exit'), ('runtime-exit',))
         self.assertEqual(driver.selected_checks('full', None), driver.STANDARD)
         with self.assertRaisesRegex(ValueError, 'not in E2E profile'):
             driver.selected_checks('l0', 'stop')

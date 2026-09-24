@@ -152,6 +152,13 @@ Local Docker reproduction requires access to the same bind-mounted paths as the 
   forwarding and reverse-tunnel checks as the embedded Relay data-plane case.
   Select it with `--profile full --case relay-standalone`; it requires a bundle
   containing `adx-relay`.
+- `runtime-exit` (targeted sandboxd fault case): delete a real runc backend
+  beneath a live SDK Sandbox. Verify that the default Never policy becomes
+  Failed without a replacement, then verify a policy with two retries creates
+  two distinct runtime identities and reaches Failed after the third loss.
+  Check the persisted assignment, retry count, physical backend inventory,
+  public SDK command access and final cleanup. Select with
+  `--profile full --case runtime-exit`.
 - `stop`: independently create a live instance pinned to each node, verify both
   backend inventories are occupied and exercise each forwarded port. A separate
   instance on each node is deleted to emit the required lifecycle log and trace. It also
