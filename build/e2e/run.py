@@ -338,7 +338,13 @@ class Run:
         if 'stop' in selected:
             with self.case('stop', checks):
                 self.event('Create live backends on both nodes, stop services, and verify physical cleanup')
-                self.execute('node1','/opt/adx/client/bin/python','-u','/opt/adx/e2e/scenarios.py','create-stop',timeout=300)
+                for node in self.nodes:
+                    self.execute(node,'python3','/opt/adx/e2e/telemetry.py','outage-start',node)
+                try:
+                    self.execute('node1','/opt/adx/client/bin/python','-u','/opt/adx/e2e/scenarios.py','create-stop',timeout=300)
+                finally:
+                    for node in self.nodes:
+                        self.execute(node,'python3','/opt/adx/e2e/telemetry.py','outage-end',node)
                 for node in self.nodes:self.helper(node,'occupied',node)
                 for node in reversed(self.nodes):
                     self.helper(node,'stop',node,timeout=180)

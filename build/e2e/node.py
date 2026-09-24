@@ -187,16 +187,22 @@ def main():
         assert current, f'{node} has no running backend before stop'
         (E/f'backend-occupied-{node}.json').write_text(json.dumps(current))
     elif action in ('stop','cleanup'):
-        if action=='stop':subprocess.run(['python3',str(H/'telemetry.py'),'metrics',node],check=True)
+        stop_errors=[]
+        if action=='stop':
+            try:subprocess.run(['python3',str(H/'telemetry.py'),'metrics',node],check=True)
+            except (AssertionError,subprocess.CalledProcessError) as error:stop_errors.append(str(error))
         stopped=supervisor('stop');assert stopped['ok'];collect(node)
         if action=='stop':
-            subprocess.run(['python3',str(H/'telemetry.py'),'validate',node],check=True)
-            logs=list((P/'state/logs').glob('*.gz'));assert logs,'no compressed component logs'
-            assert not list((P/'state/logs').glob('*.tmp')),'incomplete compression after stop'
-            for path in logs:gzip.decompress(path.read_bytes())
-            health=[s['logging'] for s in stopped['services']];assert all(h is not None and h['error'] is None and h['failed_bytes']==0 for h in health),health
-            (E/f'logging-{node}.json').write_text(json.dumps({'status':'passed','gzip_files':len(logs),'no_temporary_files':True,'services':stopped['services']},indent=2))
-            print(f'[LOGGING PASS] {node}: {len(logs)} gzip archives, all readable; no I/O loss or temporary residue',flush=True)
+            try:subprocess.run(['python3',str(H/'telemetry.py'),'validate',node],check=True)
+            except (AssertionError,subprocess.CalledProcessError) as error:stop_errors.append(str(error))
+            try:
+                logs=list((P/'state/logs').glob('*.gz'));assert logs,'no compressed component logs'
+                assert not list((P/'state/logs').glob('*.tmp')),'incomplete compression after stop'
+                for path in logs:gzip.decompress(path.read_bytes())
+                health=[s['logging'] for s in stopped['services']];assert all(h is not None and h['error'] is None and h['failed_bytes']==0 for h in health),health
+                (E/f'logging-{node}.json').write_text(json.dumps({'status':'passed','gzip_files':len(logs),'no_temporary_files':True,'services':stopped['services']},indent=2))
+                print(f'[LOGGING PASS] {node}: {len(logs)} gzip archives, all readable; no I/O loss or temporary residue',flush=True)
+            except (AssertionError,EOFError,OSError) as error:stop_errors.append(str(error))
         # sandboxd is independent of the supervisor and still responds here.
         assert not backend()
         os.kill(int((P/'sandboxd.pid').read_text()),signal.SIGTERM)
@@ -208,5 +214,6 @@ def main():
     elif action=='collect':collect(node)
     else:raise ValueError('unknown action')
     if action in ('stop','cleanup'):(E/f'stop-{node}.json').write_text(json.dumps({'ok':True,'backend_empty':True}))
+    if action=='stop' and stop_errors:raise AssertionError('; '.join(stop_errors))
     print(action,node,'passed',flush=True)
 if __name__=='__main__':main()
