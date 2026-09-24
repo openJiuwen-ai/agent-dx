@@ -5,5 +5,9 @@
   "sandbox_url": "http://127.0.0.1:8080",
   "allow_plaintext_transport": true,
   "sandbox_ca_file": null,
-  "request_timeout_seconds": 60
+  "request_timeout_seconds": 60,
+  "env_cache": {
+    "capacity": 200000,
+    "idle_seconds": 18000
+  }
 }

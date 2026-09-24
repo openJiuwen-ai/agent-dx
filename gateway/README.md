@@ -13,6 +13,14 @@ the first adapter, not part of the generic relay contract:
   SSH and port-forwarding adapters.
 * `IngressRouteResolver` reads the shared in-memory `RouteStore`. The production Ingress discovers Coordinator through Redis, receives an initial full route snapshot followed by gRPC deltas, and verifies API keys through Coordinator with a bounded short-lived cache.
 
+With `agent-api`, managed Agent requests cache immutable templates. In standalone
+Activator mode, Env operations use deterministic rendezvous hashing over individual
+instance URLs or Redis membership discovery; discovery refresh runs in the
+background and requests use a local member snapshot. Embedded Activator mode calls
+the local module without cross-instance Env affinity. Both modes share Env caching
+and explicit bypass semantics. See the
+[Agent deployment and cache contract](../agent/README.md#activator-发现与-env-亲和路由).
+
 The typed public Ingress → Relay → EXECD operations are defined by the
 [`data-plane.yaml`](../platform/api/openapi/data-plane.yaml) OpenAPI contract.
 Generic port forwarding and reverse tunnels carry application-defined protocols

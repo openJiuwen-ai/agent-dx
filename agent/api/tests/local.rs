@@ -103,3 +103,82 @@ async fn timed_out_activation_keeps_identity_for_another_local_replica() {
         adx_agent_core::EnvironmentPhase::Deleting
     );
 }
+
+#[derive(Default)]
+struct ReadySandbox {
+    record: std::sync::Mutex<Option<SandboxObservation>>,
+    unavailable: std::sync::atomic::AtomicBool,
+}
+#[async_trait::async_trait]
+impl Sandbox for ReadySandbox {
+    async fn create(&self, r: &CreateSandbox) -> Result<SandboxObservation, SandboxError> {
+        let observation = SandboxObservation {
+            id: r.id.clone(),
+            tenant: r.tenant.clone(),
+            phase: SandboxPhase::Running,
+            ready: true,
+            runtime_id: None,
+            message: None,
+        };
+        *self.record.lock().unwrap() = Some(observation.clone());
+        Ok(observation)
+    }
+    async fn get(&self, _: &str, _: &str) -> Result<Option<SandboxObservation>, SandboxError> {
+        if self.unavailable.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(SandboxError::Unavailable("test backend unavailable".into()));
+        }
+        Ok(self.record.lock().unwrap().clone())
+    }
+    async fn delete(&self, _: &str, _: &str) -> Result<SandboxObservation, SandboxError> {
+        Err(SandboxError::Unsupported("unused by this test".into()))
+    }
+}
+
+#[tokio::test]
+async fn embedded_resolve_bypass_invalidates_warm_binding_before_backend_failure() {
+    use adx_agent_api::managed::ManagedService;
+    use adx_agent_core::Protocol;
+    use std::sync::atomic::Ordering;
+    let backend = Arc::new(ReadySandbox::default());
+    let control = Arc::new(LocalControl::new(Arc::new(Activator::new(
+        AgentState::new(Arc::new(MemoryRepository::default())),
+        backend.clone(),
+    ))));
+    control
+        .publish(&context(), "tenant", &template())
+        .await
+        .unwrap();
+    let managed = ManagedService::new(control);
+    let original = managed
+        .resolve(&context(), &scope(), Protocol::Http, None)
+        .await
+        .unwrap();
+    backend.unavailable.store(true, Ordering::SeqCst);
+    assert_eq!(
+        managed
+            .resolve(&context(), &scope(), Protocol::Http, None)
+            .await
+            .unwrap(),
+        original
+    );
+    assert!(matches!(
+        managed
+            .resolve_with_cache(&context(), &scope(), Protocol::Http, None, true)
+            .await,
+        Err(Error::Unavailable(_))
+    ));
+    assert!(matches!(
+        managed
+            .resolve(&context(), &scope(), Protocol::Http, None)
+            .await,
+        Err(Error::Unavailable(_))
+    ));
+    backend.unavailable.store(false, Ordering::SeqCst);
+    assert_eq!(
+        managed
+            .resolve(&context(), &scope(), Protocol::Http, None)
+            .await
+            .unwrap(),
+        original
+    );
+}

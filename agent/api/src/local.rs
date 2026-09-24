@@ -72,9 +72,24 @@ impl Control for LocalControl {
         scope: &Scope,
         expected_generation: Option<&str>,
     ) -> Result<Target> {
+        self.activate_with_cache(ctx, scope, expected_generation, false)
+            .await
+    }
+    async fn activate_with_cache(
+        &self,
+        ctx: &RequestContext,
+        scope: &Scope,
+        expected_generation: Option<&str>,
+        bypass_cache: bool,
+    ) -> Result<Target> {
         ctx.start_write();
         self.activator
-            .activate(scope, expected_generation, ctx.deadline_unix_ms())
+            .activate_with_cache(
+                scope,
+                expected_generation,
+                ctx.deadline_unix_ms(),
+                bypass_cache,
+            )
             .await
     }
 }

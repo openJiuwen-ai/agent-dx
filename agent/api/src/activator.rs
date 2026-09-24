@@ -1,11 +1,16 @@
 //! HTTP client for the independent Activator service.
+use crate::discovery::{validate_members, DiscoveryConfig};
 use crate::request::RequestContext;
 use crate::{Error, Result};
+use adx_agent_core::discovery::{ranked_endpoints, ActivatorEndpoint};
 use adx_agent_core::{activator::*, transport, Environment, Scope, TemplateVersion};
 use async_trait::async_trait;
 use serde::{de::DeserializeOwned, Serialize};
 use std::{
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, RwLock,
+    },
     time::Duration,
 };
 
@@ -38,14 +43,30 @@ pub trait Control: Send + Sync {
         scope: &Scope,
         expected_generation: Option<&str>,
     ) -> Result<Target>;
+    /// Refresh a cached binding when requested; immutable template caching is unchanged.
+    async fn activate_with_cache(
+        &self,
+        ctx: &RequestContext,
+        scope: &Scope,
+        expected_generation: Option<&str>,
+        bypass_cache: bool,
+    ) -> Result<Target>;
 }
 
 pub struct ActivatorClient {
-    urls: Vec<String>,
+    endpoints: Arc<RwLock<Vec<ActivatorEndpoint>>>,
+    discovery_task: Option<tokio::task::JoinHandle<()>>,
     token: String,
     client: reqwest::Client,
     timeout: Duration,
     next: AtomicUsize,
+}
+impl Drop for ActivatorClient {
+    fn drop(&mut self) {
+        if let Some(task) = &self.discovery_task {
+            task.abort();
+        }
+    }
 }
 impl ActivatorClient {
     pub fn new(
@@ -55,8 +76,35 @@ impl ActivatorClient {
         ca: Option<&[u8]>,
         allow_plaintext: bool,
     ) -> Result<Self> {
+        Self::build(urls, token, timeout, ca, allow_plaintext, None)
+    }
+    /// Start asynchronous discovery; requests return Unavailable until a nonempty snapshot exists.
+    pub fn with_discovery(
+        config: DiscoveryConfig,
+        token: String,
+        timeout: Duration,
+        ca: Option<&[u8]>,
+        allow_plaintext: bool,
+    ) -> Result<Self> {
+        Self::build(
+            Vec::new(),
+            token,
+            timeout,
+            ca,
+            allow_plaintext,
+            Some(config),
+        )
+    }
+    fn build(
+        urls: Vec<String>,
+        token: String,
+        timeout: Duration,
+        ca: Option<&[u8]>,
+        allow_plaintext: bool,
+        discovery: Option<DiscoveryConfig>,
+    ) -> Result<Self> {
         transport::validate_service_token(&token).map_err(Error::Invalid)?;
-        if urls.is_empty() || timeout.is_zero() {
+        if (urls.is_empty() && discovery.is_none()) || timeout.is_zero() {
             return Err(Error::Invalid(
                 "Activator addresses and positive timeout required".into(),
             ));
@@ -78,8 +126,21 @@ impl ActivatorClient {
             );
         }
         let client = builder.build().map_err(|e| Error::Invalid(e.to_string()))?;
+        let endpoints = Arc::new(RwLock::new(validate_members(
+            urls.into_iter()
+                .map(|url| ActivatorEndpoint {
+                    id: url.clone(),
+                    url,
+                })
+                .collect(),
+            allow_plaintext,
+        )?));
+        let discovery_task = discovery
+            .map(|config| crate::discovery::start(config, endpoints.clone(), allow_plaintext))
+            .transpose()?;
         Ok(Self {
-            urls,
+            endpoints,
+            discovery_task,
             token,
             client,
             timeout,
@@ -92,7 +153,24 @@ impl ActivatorClient {
         path: &str,
         body: &T,
         writes: bool,
+        scope: Option<&Scope>,
     ) -> Result<R> {
+        let endpoints = self
+            .endpoints
+            .read()
+            .map_err(|_| Error::Unavailable("Activator membership lock unavailable".into()))?
+            .clone();
+        let endpoints = if let Some(scope) = scope {
+            scope.validate().map_err(Error::Invalid)?;
+            ranked_endpoints(scope, &endpoints)
+        } else {
+            let mut endpoints = endpoints;
+            if !endpoints.is_empty() {
+                let offset = self.next.fetch_add(1, Ordering::Relaxed) % endpoints.len();
+                endpoints.rotate_left(offset);
+            }
+            endpoints
+        };
         let deadline = ctx
             .deadline()
             .min(tokio::time::Instant::now() + self.timeout);
@@ -102,16 +180,15 @@ impl ActivatorClient {
                 .as_millis()
                 .min(u64::MAX as u128) as u64,
         );
-        let start = self.next.fetch_add(1, Ordering::Relaxed);
         // Only a connection failure proves the write was not sent. All attempts share one budget.
-        for offset in 0..self.urls.len().min(2) {
+        for (offset, endpoint) in endpoints.iter().take(2).enumerate() {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
                 return Err(Error::Unavailable(
                     "Activator connection deadline expired".into(),
                 ));
             }
-            let url = &self.urls[start.wrapping_add(offset) % self.urls.len()];
+            let url = &endpoint.url;
             if writes {
                 ctx.start_write();
             }
@@ -127,7 +204,7 @@ impl ActivatorClient {
             let mut response = match response {
                 Ok(response) => response,
                 Err(e) if e.is_connect() => {
-                    if offset + 1 < self.urls.len().min(2) {
+                    if offset + 1 < endpoints.len().min(2) {
                         continue;
                     }
                     return Err(Error::Unavailable("Activator connection failed".into()));
@@ -197,6 +274,16 @@ impl Control for ActivatorClient {
     ) -> Result<Target> {
         ActivatorClient::activate(self, ctx, scope, expected_generation).await
     }
+    async fn activate_with_cache(
+        &self,
+        ctx: &RequestContext,
+        scope: &Scope,
+        expected_generation: Option<&str>,
+        bypass_cache: bool,
+    ) -> Result<Target> {
+        ActivatorClient::activate_with_cache(self, ctx, scope, expected_generation, bypass_cache)
+            .await
+    }
 }
 pub(crate) fn uncertain(writes: bool, message: &str) -> Error {
     if writes {
@@ -220,6 +307,7 @@ impl ActivatorClient {
                 template: template.clone(),
             },
             true,
+            None,
         )
         .await
     }
@@ -239,6 +327,7 @@ impl ActivatorClient {
                 version: version.into(),
             },
             false,
+            None,
         )
         .await
     }
@@ -250,6 +339,7 @@ impl ActivatorClient {
                 scope: scope.clone(),
             },
             false,
+            Some(scope),
         )
         .await
     }
@@ -258,7 +348,8 @@ impl ActivatorClient {
         ctx: &RequestContext,
         query: &EnvironmentList,
     ) -> Result<EnvironmentPage> {
-        self.request(ctx, "environments/list", query, false).await
+        self.request(ctx, "environments/list", query, false, None)
+            .await
     }
     pub async fn delete_environment(&self, ctx: &RequestContext, scope: &Scope) -> Result<()> {
         self.request(
@@ -268,6 +359,7 @@ impl ActivatorClient {
                 scope: scope.clone(),
             },
             true,
+            Some(scope),
         )
         .await
     }
@@ -277,14 +369,27 @@ impl ActivatorClient {
         scope: &Scope,
         expected_generation: Option<&str>,
     ) -> Result<Target> {
+        self.activate_with_cache(ctx, scope, expected_generation, false)
+            .await
+    }
+    /// Bypass successful activation bindings while retaining immutable template reuse.
+    pub async fn activate_with_cache(
+        &self,
+        ctx: &RequestContext,
+        scope: &Scope,
+        expected_generation: Option<&str>,
+        bypass_cache: bool,
+    ) -> Result<Target> {
         self.request(
             ctx,
             "environments/activate",
             &ActivationRequest {
                 scope: scope.clone(),
                 expected_generation: expected_generation.map(str::to_owned),
+                bypass_cache,
             },
             true,
+            Some(scope),
         )
         .await
     }

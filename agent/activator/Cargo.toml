@@ -10,6 +10,9 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+hashlink = "0.12.2"
+uuid = { version = "1", features = ["v4"] }
+tracing = "0.1"
 adx-agent-core = { path = "../crates/core" }
 adx-agent-store = { path = "../crates/store" }
 async-trait = "0.1"

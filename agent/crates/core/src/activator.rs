@@ -15,6 +15,9 @@ pub struct ActivationRequest {
     /// Internal retry stays within the Environment selected by this incoming request.
     #[serde(default)]
     pub expected_generation: Option<String>,
+    /// Force a Sandbox observation even if this Activator already activated this generation.
+    #[serde(default, rename = "bypasscache")]
+    pub bypass_cache: bool,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

@@ -1,4 +1,9 @@
-use adx_activator::{server, transport::HttpSandbox, Activator};
+use adx_activator::{
+    registration::{RegistrationConfig, RegistrationLease},
+    server,
+    transport::HttpSandbox,
+    Activator, CacheSettings,
+};
 use adx_agent_store::{AgentState, RedisRepository};
 use serde::Deserialize;
 use std::{net::SocketAddr, sync::Arc, time::Duration};
@@ -13,6 +18,9 @@ struct Settings {
     allow_plaintext_transport: bool,
     sandbox_ca_file: Option<String>,
     request_timeout_seconds: u64,
+    #[serde(default)]
+    env_cache: CacheSettings,
+    registration: Option<RegistrationConfig>,
 }
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -41,15 +49,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await?,
     );
-    let activator = Arc::new(Activator::new(AgentState::new(store), sandbox));
+    let activator = Arc::new(Activator::with_cache(
+        AgentState::new(store),
+        sandbox,
+        settings.env_cache,
+    )?);
     let app = server::router(
         activator,
         &std::env::var("ADX_ACTIVATOR_SERVICE_TOKEN")?,
         timeout,
     )?;
     let listener = tokio::net::TcpListener::bind(settings.listen).await?;
+    let registration = match settings.registration {
+        Some(config) => Some(
+            RegistrationLease::start(
+                adx_agent_store::discovery::RedisRegistry::new(
+                    &settings.redis_url,
+                    &settings.namespace,
+                    Duration::from_secs(3),
+                )?,
+                config,
+                settings.allow_plaintext_transport,
+            )
+            .await?,
+        ),
+        None => None,
+    };
     axum::serve(listener, app)
-        .with_graceful_shutdown(async {
+        .with_graceful_shutdown(async move {
             #[cfg(unix)]
             {
                 let mut signal =
@@ -60,6 +87,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             #[cfg(not(unix))]
             {
                 let _ = tokio::signal::ctrl_c().await;
+            }
+            if let Some(registration) = registration {
+                if let Err(error) = registration.shutdown().await {
+                    tracing::warn!(%error, "Activator unregister failed; lease will expire");
+                }
             }
         })
         .await?;

@@ -72,6 +72,17 @@ impl RedisRepository {
         timeout: Duration,
         inflight: usize,
     ) -> Result<Self> {
+        let repository = Self::lazy(url, namespace, timeout, inflight)?;
+        repository.check_schema().await?;
+        Ok(repository)
+    }
+    /// Discovery uses a separate lazy connection without touching product schema or metadata.
+    pub(crate) fn lazy(
+        url: &str,
+        namespace: &str,
+        timeout: Duration,
+        inflight: usize,
+    ) -> Result<Self> {
         if namespace.is_empty()
             || namespace.len() > 128
             || timeout.is_zero()
@@ -86,22 +97,16 @@ impl RedisRepository {
         }
         let client =
             redis::Client::open(url).map_err(|_| Error::Invalid("invalid Redis URL".into()))?;
-        let connection = tokio::time::timeout(timeout, client.get_multiplexed_async_connection())
-            .await
-            .map_err(|_| Error::Unavailable("Redis connection timed out".into()))?
-            .map_err(|_| Error::Unavailable("Redis connection failed".into()))?;
-        let repository = Self {
+        Ok(Self {
             client,
             connection: std::sync::Arc::new(tokio::sync::Mutex::new(ConnectionState {
                 generation: 0,
-                connection: Some(connection),
+                connection: None,
             })),
             budget: std::sync::Arc::new(tokio::sync::Semaphore::new(inflight)),
             prefix: format!("adx:v2:{namespace}:"),
             timeout,
-        };
-        repository.check_schema().await?;
-        Ok(repository)
+        })
     }
     async fn check_schema(&self) -> Result<()> {
         const SCHEMA: &str = "environment-index-v1";
@@ -124,7 +129,7 @@ impl RedisRepository {
     }
 
     /// Reconnect for a subsequent call, but NEVER replay a command whose result is unknown.
-    async fn execute<T: redis::FromRedisValue>(
+    pub(crate) async fn execute<T: redis::FromRedisValue>(
         &self,
         command: redis::Cmd,
         write: bool,
