@@ -28,6 +28,13 @@ fn spec(id: &str) -> EnvironmentSpec {
 }
 fn node(id: &str, available: bool) -> Node {
     Node {
+        runtime_classes: vec![
+            "runsc".into(),
+            "runc".into(),
+            "firecracker".into(),
+            "r".into(),
+            "test-runtime".into(),
+        ],
         labels: Default::default(),
         devices: vec![],
         id: id.into(),

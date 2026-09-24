@@ -92,6 +92,28 @@ pub async fn connect_when_ready(
 }
 
 impl Sandboxd {
+    /// Discover live execution backends through sandboxd's Unix socket.
+    pub async fn available_runtime_classes(&self) -> Result<Vec<String>> {
+        let response = self
+            .client
+            .clone()
+            .list_available_runtimes(self.request(proto::ListAvailableRuntimesRequest {}))
+            .await
+            .map_err(unavailable)?
+            .into_inner();
+        let mut classes = response.runtime_classes;
+        classes.extend(
+            response
+                .runtimes
+                .into_iter()
+                .map(|runtime| runtime.runtime_class),
+        );
+        classes.retain(|class| !class.trim().is_empty());
+        classes.sort();
+        classes.dedup();
+        Ok(classes)
+    }
+
     pub async fn connect(path: PathBuf, config: Config) -> Result<Self> {
         if (config.command.is_empty() && config.runtime_profile.is_none())
             || config.rpc_timeout.is_zero()

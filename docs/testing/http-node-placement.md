@@ -2,6 +2,8 @@
 
 SDK 的 `node_id` 现在通过既有 `scheduleAffinities` JSON 进入新的 `EnvironmentSpec.scheduling.required_node`。adxlet 可在配置中设置 `labels`；Coordinator 在注册节点时根据经过认证的节点 ID 写入 `NODE_ID`，拒绝用其他值伪造该标签。
 
+adxlet 每次心跳通过 sandboxd Unix socket 的 `ListAvailableRuntimes` 查询实际可用的 runtime class，并单独上报给 Coordinator。`runtime-fit` 会过滤不支持请求 `runtime_class` 的节点；本地优先创建也在原有 Admission 账本上检查同一能力列表。查询失败时本节点停止新准入，已有运行实例不受影响；能力恢复后随心跳重新开放。运行时能力不从部署者自定义节点标签推断。
+
 ```json
 {
   "labels": {

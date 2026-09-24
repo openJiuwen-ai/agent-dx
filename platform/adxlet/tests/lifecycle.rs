@@ -641,6 +641,11 @@ async fn accepted_environment_operations_keep_request_context_after_caller_cance
 async fn local_reservations_share_one_hold_and_transfer_to_one_controller() {
     let deps = Dependencies::new(false);
     let manager = Arc::new(node(&deps));
+    manager.update_runtime_classes(vec!["runc".into()]).unwrap();
+    assert!(manager.reserve_local(&spec("a")).is_err());
+    manager
+        .update_runtime_classes(vec![spec("a").runtime_class])
+        .unwrap();
     let a = manager.reserve_local(&spec("a")).unwrap();
     let b = manager.reserve_local(&spec("a")).unwrap();
     assert_eq!(a.token, b.token);

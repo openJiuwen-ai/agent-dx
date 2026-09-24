@@ -10,11 +10,11 @@
 | `src/lib.rs` | Filter/Score interfaces, immutable cluster snapshot, profile validation, weighted selection |
 | `src/plugins.rs` | NodeAvailable, ResourceFit, ResourceBalance(Pack/Spread) |
 | `src/groups.rs` | Public node/Environment condition groups, reverse anti-affinity, weighted/ordered preferences |
-| `src/constraints.rs` | DeviceFit, NodeAffinity, EnvironmentAffinity, Topology; NodePreference, EnvironmentPreference, TopologyPreference |
+| `src/constraints.rs` | RuntimeFit, DeviceFit, NodeAffinity, EnvironmentAffinity, Topology; NodePreference, EnvironmentPreference, TopologyPreference |
 | `coordinator/src/shard.rs` | Queue ownership, framework call, atomic scalar/card reservation and release |
 | `adxlet` | Fresh inventory check, local scalar/card reservation, sandboxd device mapping and confirmed cleanup |
 
-Default filters, in order: `node-available → resource-fit → device-fit → node-affinity → placement-groups → environment-affinity → topology-spread`. These hard filters apply to every profile. Default scores: placement-group preference, resource balance, node preference, Environment preference and topology preference, each with weight 1.
+Default filters, in order: `node-available → resource-fit → runtime-fit → device-fit → node-affinity → placement-groups → environment-affinity → topology-spread`. These hard filters apply to every profile. Default scores: placement-group preference, resource balance, node preference, Environment preference and topology preference, each with weight 1.
 
 `Coordinator::new(shard_count, placement)` installs that profile. `Framework::new(additional_filters, weighted_scores)` / `Coordinator::with_framework` allow static Rust composition. Only eligible candidates are scored. Scores must be in `0..=MAX_SCORE` (3,000,000). Higher weighted sums win; ties use ascending node ID. Empty scoring configuration uses node ID and therefore disables soft preferences. Invalid names/weights/scores are rejected. Plugins must not mutate reservations or perform blocking network requests. Errors preserve queued work and do not consume capacity.
 

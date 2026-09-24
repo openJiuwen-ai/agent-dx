@@ -293,6 +293,7 @@ impl TryFrom<wire::RegisterNodeRequest> for model::Node {
             available: v.accepting_allocations,
             labels: v.labels.into_iter().collect(),
             devices: decode(v.devices)?,
+            runtime_classes: v.runtime_classes,
         };
         node.validate()?;
         Ok(node)

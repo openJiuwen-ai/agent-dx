@@ -353,6 +353,13 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
     let mut node_coordinator =
         pb::coordinator_service_client::CoordinatorServiceClient::new(channel(ma, "node").await);
     let mut register = pb::RegisterNodeRequest {
+        runtime_classes: vec![
+            "runsc".into(),
+            "runc".into(),
+            "firecracker".into(),
+            "r".into(),
+            "test-runtime".into(),
+        ],
         session_id: "boot-1".into(),
         heartbeat_sequence: 1,
         reconciling: true,
@@ -1562,6 +1569,13 @@ async fn published_routes_drive_real_gateway_streams_and_reconnect_to_new_coordi
     session
         .register(
             adx_coordinator::Node {
+                runtime_classes: vec![
+                    "runsc".into(),
+                    "runc".into(),
+                    "firecracker".into(),
+                    "r".into(),
+                    "test-runtime".into(),
+                ],
                 id: "node".into(),
                 capacity: spec("routed").resources,
                 available: true,
@@ -2136,6 +2150,13 @@ async fn snapshot_gc_waits_for_node_ack_and_recovers_from_lost_ack() {
     let mut client =
         pb::coordinator_service_client::CoordinatorServiceClient::new(channel(ma, "node").await);
     let mut report = pb::RegisterNodeRequest {
+        runtime_classes: vec![
+            "runsc".into(),
+            "runc".into(),
+            "firecracker".into(),
+            "r".into(),
+            "test-runtime".into(),
+        ],
         node_id: "node".into(),
         session_id: "gc-boot".into(),
         heartbeat_sequence: 1,
@@ -2606,6 +2627,13 @@ async fn shared_checkpoint_moves_to_new_node_and_old_node_cleans_without_deletin
         ..Default::default()
     };
     let mut target_report = pb::RegisterNodeRequest {
+        runtime_classes: vec![
+            "runsc".into(),
+            "runc".into(),
+            "firecracker".into(),
+            "r".into(),
+            "test-runtime".into(),
+        ],
         node_id: "target".into(),
         node_address: na.to_string(),
         proxy_address: "target:9002".into(),

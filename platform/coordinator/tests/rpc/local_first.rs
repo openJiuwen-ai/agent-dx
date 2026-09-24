@@ -108,6 +108,13 @@ impl Rig {
             let mut coordinator =
                 pb::coordinator_service_client::CoordinatorServiceClient::new(client);
             let mut register = pb::RegisterNodeRequest {
+                runtime_classes: vec![
+                    "runsc".into(),
+                    "runc".into(),
+                    "firecracker".into(),
+                    "r".into(),
+                    "test-runtime".into(),
+                ],
                 node_id: id.into(),
                 node_address: na.to_string(),
                 proxy_address: "127.0.0.1:9999".into(),
@@ -674,6 +681,13 @@ async fn local_first_https_directory_round_robin_and_concurrent_creation() {
         let node = &rig.session.snapshot().await.unwrap().nodes[if i == 0 { "a" } else { "b" }];
         rig.claimants[i]
             .register_node(pb::RegisterNodeRequest {
+                runtime_classes: vec![
+                    "runsc".into(),
+                    "runc".into(),
+                    "firecracker".into(),
+                    "r".into(),
+                    "test-runtime".into(),
+                ],
                 node_id: node.node.id.clone(),
                 node_address: node.address.clone(),
                 proxy_address: node.proxy_address.clone(),

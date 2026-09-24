@@ -19,6 +19,13 @@ fn capacity() -> Resources {
 }
 fn node(index: usize, available: bool) -> Node {
     Node {
+        runtime_classes: vec![
+            "runsc".into(),
+            "runc".into(),
+            "firecracker".into(),
+            "r".into(),
+            "test-runtime".into(),
+        ],
         id: format!("n{index}"),
         capacity: capacity(),
         available,

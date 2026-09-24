@@ -10,6 +10,13 @@ use std::{
 const NODES: usize = 1000;
 fn node(i: usize, capacity: u64, revision: usize) -> Node {
     Node {
+        runtime_classes: vec![
+            "runsc".into(),
+            "runc".into(),
+            "firecracker".into(),
+            "r".into(),
+            "test-runtime".into(),
+        ],
         id: format!("unit-{i}"),
         capacity: Resources {
             cpu_millis: 300 * capacity,

@@ -29,6 +29,15 @@ impl Filter for DeviceFit {
         }
     }
 }
+pub struct RuntimeFit;
+impl Filter for RuntimeFit {
+    fn name(&self) -> &'static str {
+        "runtime-fit"
+    }
+    fn filter(&self, r: &EnvironmentSpec, c: &Candidate<'_>) -> Result<bool> {
+        Ok(c.node.runtime_classes.contains(&r.runtime_class))
+    }
+}
 pub struct NodeAffinity;
 impl Filter for NodeAffinity {
     fn name(&self) -> &'static str {

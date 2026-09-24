@@ -136,6 +136,13 @@ fn unknown_enums_missing_selectors_and_duplicate_cards_are_rejected() {
 #[test]
 fn registration_preserves_inventory_and_labels() {
     let node = Node::try_from(wire::RegisterNodeRequest {
+        runtime_classes: vec![
+            "runsc".into(),
+            "runc".into(),
+            "firecracker".into(),
+            "r".into(),
+            "test-runtime".into(),
+        ],
         session_id: String::new(),
         heartbeat_sequence: 0,
         reconciling: false,
@@ -158,5 +165,6 @@ fn registration_preserves_inventory_and_labels() {
     })
     .unwrap();
     assert_eq!(node.labels["zone"], "z");
+    assert!(node.runtime_classes.contains(&"runsc".to_string()));
     assert_eq!(node.devices[0].kind, DeviceKind::Npu);
 }

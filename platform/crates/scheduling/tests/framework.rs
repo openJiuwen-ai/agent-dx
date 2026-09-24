@@ -48,6 +48,13 @@ fn invalid_profiles_and_out_of_range_scores_are_rejected() {
     let framework = Framework::new(vec![], vec![weighted("bad", MAX_SCORE + 1, 1)]).unwrap();
     let request = request();
     let node = Node {
+        runtime_classes: vec![
+            "runsc".into(),
+            "runc".into(),
+            "firecracker".into(),
+            "r".into(),
+            "test-runtime".into(),
+        ],
         labels: Default::default(),
         devices: vec![],
         id: "n".into(),
@@ -76,6 +83,7 @@ fn builtin_profile_exposes_actual_static_registration() {
         [
             "node-available",
             "resource-fit",
+            "runtime-fit",
             "device-fit",
             "node-affinity",
             "placement-groups",
@@ -94,6 +102,40 @@ fn builtin_profile_exposes_actual_static_registration() {
         ]
     );
 }
+#[test]
+fn runtime_filter_rejects_unsupported_or_unreported_backend() {
+    let request = request();
+    let mut node = Node {
+        id: "n".into(),
+        capacity: request.resources,
+        available: true,
+        labels: Default::default(),
+        devices: vec![],
+        runtime_classes: vec!["runc".into()],
+    };
+    let snapshot = Default::default();
+    let framework = Framework::builtin(Placement::Pack);
+    let select = |node: &Node| {
+        framework
+            .select(
+                &request,
+                [Candidate {
+                    node,
+                    available: node.capacity,
+                    devices: &[],
+                    snapshot: &snapshot,
+                    prepared: None,
+                }],
+            )
+            .unwrap()
+            .is_some()
+    };
+    assert!(!select(&node));
+    node.runtime_classes = vec![];
+    assert!(!select(&node));
+    node.runtime_classes = vec!["runsc".into()];
+    assert!(select(&node));
+}
 struct FailingFilter;
 impl Filter for FailingFilter {
     fn name(&self) -> &'static str {
@@ -107,6 +149,13 @@ impl Filter for FailingFilter {
 fn filter_failure_is_an_error_not_an_eligible_candidate() {
     let request = request();
     let node = Node {
+        runtime_classes: vec![
+            "runsc".into(),
+            "runc".into(),
+            "firecracker".into(),
+            "r".into(),
+            "test-runtime".into(),
+        ],
         labels: Default::default(),
         devices: vec![],
         id: "n".into(),
@@ -134,6 +183,13 @@ fn high_weights_accumulate_without_wrapping_and_zero_disk_is_supported() {
     let mut request = request();
     request.resources.disk_bytes = 0;
     let node = Node {
+        runtime_classes: vec![
+            "runsc".into(),
+            "runc".into(),
+            "firecracker".into(),
+            "r".into(),
+            "test-runtime".into(),
+        ],
         labels: Default::default(),
         devices: vec![],
         id: "n".into(),

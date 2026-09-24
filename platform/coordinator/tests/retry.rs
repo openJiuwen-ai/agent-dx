@@ -25,6 +25,13 @@ fn rejected_allocation_retries_another_node_without_leaking_or_overwriting_a_new
     let mut m = Coordinator::new(1, Placement::Pack).unwrap();
     for id in ["a", "b"] {
         m.register(Node {
+            runtime_classes: vec![
+                "runsc".into(),
+                "runc".into(),
+                "firecracker".into(),
+                "r".into(),
+                "test-runtime".into(),
+            ],
             id: id.into(),
             capacity: spec().resources,
             available: true,
