@@ -23,6 +23,13 @@ class AcceptanceGateTests(unittest.TestCase):
         self.assertEqual(driver.selected_checks('full', 'relay-standalone'),
                          ('relay-standalone',))
 
+    def test_sqlite_fallback_enables_only_its_fault_fixture(self):
+        self.assertEqual(driver.setup_environment('sqlite-fallback'),
+                         ('ADX_E2E_SQLITE_FALLBACK=1',))
+        self.assertEqual(driver.selected_checks('full', 'sqlite-fallback'),
+                         ('sqlite-fallback',))
+        self.assertEqual(driver.setup_environment('runtime-exit'), ())
+
     def test_entrypoint_fixture_outlives_instance_startup(self):
         source=(ROOT/'prepare.py').read_text()
         self.assertIn('sleep 30; echo adx-entrypoint-stderr',source)
