@@ -60,10 +60,11 @@ Rust build tooling continues to use the builder's Python 3.9.
 
 ## Base package deployment mode
 
-The base package ships `adxctl`, `adx-coordinator`, `adxlet`, `adx-apiserver`
-and Redis. Ingress runs inside API Server; Relay runs inside adxlet. Separate
-Ingress/Relay executables and the debug forwarder are not compiled or archived
-by release steps. Execd and the SDK remain in the unified release archive.
+The base package ships `adxctl`, `adx-coordinator`, `adxlet`, `adx-apiserver`,
+`adx-ingress`, `adx-relay` and Redis. Ingress runs inside API Server and Relay
+inside adxlet by default; the two standalone binaries support explicit split
+process deployments. The debug forwarder remains source-built. Execd and the
+SDK remain in the unified release archive.
 By default, `platform-build` uploads verified local outputs, including
 adxadmin candidates. The same job publishes
 `out/buildkite/obs/manifest.json` and URLs without downloading the assembled package again.

@@ -71,6 +71,8 @@ required = {
     "bin/adx-coordinator",
     "bin/adxlet",
     "bin/adx-apiserver",
+    "bin/adx-ingress",
+    "bin/adx-relay",
     "bin/redis-server",
     "bin/redis-cli",
     "install.sh",

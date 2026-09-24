@@ -31,7 +31,9 @@ case "$component" in
     echo "--- :rust: Compile Gateway"
     cargo build --locked --release -j "$jobs" \
       -p adx-apiserver --bin adx-apiserver
-    for binary in adx-apiserver; do
+    cargo build --locked --release -j "$jobs" \
+      -p data-plane-gateway --features agent-api --bin adx-ingress --bin adx-relay
+    for binary in adx-apiserver adx-ingress adx-relay; do
       cp "$CARGO_TARGET_DIR/release/$binary" "$output/$binary"
     done
     ;;

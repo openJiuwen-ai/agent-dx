@@ -130,6 +130,8 @@ Local Docker reproduction requires access to the same bind-mounted paths as the 
   with `--profile full --case coordinator-restart`.
 - `apiserver-restart` and `ingress-restart` (targeted fault cases): restart each
   supervised public-entry role separately while two instances remain live.
+  The Ingress case explicitly renders `ingress_mode: standalone`; the default
+  fixture keeps Ingress embedded in API Server.
   Require an unchanged Coordinator epoch, persisted ownership and backend IDs,
   restored HTTPS API, public SDK file/command access and final resource release.
 - `stop`: independently create a live instance pinned to each node, verify both
