@@ -33,6 +33,34 @@ with mock.patch.dict(sys.modules, {'adx_sandbox': sdk_stub}):
 
 
 class LiveOutputTests(unittest.TestCase):
+    def test_host_forward_uses_instance_subdomain_and_preserves_guest_path(self):
+        class Sandbox:
+            id = 'default-sandbox-123'
+
+            @staticmethod
+            def get_port_url(port):
+                return f'https://127.0.0.1:8443/default-sandbox-123/{port}'
+
+            @staticmethod
+            def get_port_auth_headers():
+                return {'Authorization': 'Bearer test-token'}
+
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = b'forwarded'
+        with mock.patch.object(
+            functional_data_plane.ssl, 'create_default_context', return_value=object()
+        ), mock.patch.object(
+            functional_data_plane.urllib.request, 'urlopen', return_value=response
+        ) as opener:
+            self.assertEqual(functional_data_plane._fetch_host_forwarded(
+                Sandbox(), Path('/unused'), port=18081
+            ), 'forwarded')
+        request = opener.call_args.args[0]
+        self.assertEqual(request.full_url, 'https://127.0.0.1:8443/functional/host?x=1')
+        self.assertEqual(request.get_header('Host'),
+                         'default-sandbox-123-18081.example.test')
+        self.assertEqual(request.get_header('Authorization'), 'Bearer test-token')
+
     def test_forwarded_port_auth_denial_is_not_retried_as_readiness(self):
         class Sandbox:
             @staticmethod
