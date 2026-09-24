@@ -213,7 +213,7 @@ profile；完整 Multi-VM 在补齐部署器前不能标记为通过。
 | `MV-04` | 计划 | Local-first 入口轮转、原子归属、冲突拒绝及中心 fallback 不重复计账 |
 | `MV-05` | SDK 子集已有，未实机执行 | Ingress 经目标 Relay/Execd 的跨 VM 命令与文件路径 |
 | `MV-06` | 故障子集已有，未实机执行 | worker 心跳过期使实例失效并撤路由；返回 worker 清理旧后端、换会话后再准入，健康 worker 继续执行 |
-| `MV-07` | 计划 | worker 进程重启、session fencing 和权威对账 |
+| `MV-07` | 快速重启子集已有，未实机执行 | worker 进程重启、原 backend/归属代数保持和新 session 对账；旧 session 写入隔离仍待协议级探针 |
 | `MV-08` | 计划 | Coordinator/API Server（含 Ingress）重启，Redis 恢复及 API Server 全量目录与 Ingress 路由重同步 |
 | `MV-FC-01` | 条件计划 | 两个 KVM worker 间共享 checkpoint 恢复，同 ID 新 generation 且旧节点清理 |
 | `MV-09` | 契约已固化 | worker 先于控制节点停止，两个 backend inventory 和路由目录最终为空 |
