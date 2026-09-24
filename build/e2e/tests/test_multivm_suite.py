@@ -126,5 +126,7 @@ class SuiteTests(unittest.TestCase):
                              ['--placement', 'spread'])
             self.assertEqual(case_command(config, 'ingress-restart', destination)[-2:],
                              ['--role', 'ingress'])
+            self.assertTrue(case_command(config, 'runtime-affinity', destination)[2]
+                            .endswith('runtime_affinity.py'))
             self.assertEqual(case_command(config, 'stop', destination)[-1],
                              '--confirm-dedicated')
