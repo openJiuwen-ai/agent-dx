@@ -119,6 +119,11 @@ Local Docker reproduction requires access to the same bind-mounted paths as the 
   backend IDs, readable instance files, executable commands and final release.
   Select it explicitly with `--profile full --case redis-restart`; it does not
   extend the default eleven-group Full gate.
+- `coordinator-restart` (targeted fault case): keep one live backend on each
+  node while the supervised Coordinator is killed and restarted. Require a new
+  Redis epoch, unchanged committed ownership and backend IDs, both nodes
+  routable, and public SDK file/command access before final deletion. Select it
+  with `--profile full --case coordinator-restart`.
 - `stop`: independently create a live instance pinned to each node, verify both
   backend inventories are occupied and exercise each forwarded port. A separate
   instance on each node is deleted to emit the required lifecycle log and trace. It also
@@ -139,7 +144,7 @@ are retained as build artifacts/cache; test containers and network are removed.
 The basic suite uses runc and no writable-layer quota. Most cases disable idle
 reclamation; the dedicated `lifecycle` case enables a six-second timeout. It does
 not validate pause/resume, snapshots, S3 rootfs/mounts, entrypoint inheritance,
-failover, runtime network replacement, Coordinator outage, cross-node recovery, XPU,
+failover, runtime network replacement, prolonged Coordinator outage, cross-node recovery, XPU,
 mixed-load scheduling or performance. Those runtime-specific
 contracts are assigned to the Firecracker profile. Resource observations read the node's cgroup
 limits and filesystem with infrastructure reservations; this fixture is not

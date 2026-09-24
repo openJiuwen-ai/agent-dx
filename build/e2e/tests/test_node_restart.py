@@ -15,6 +15,28 @@ spec.loader.exec_module(node)
 
 
 class SandboxdRestartTests(unittest.TestCase):
+    def test_coordinator_restart_requires_new_epoch_and_preserved_ownership(self):
+        def snapshot(epoch, *, node='node1', routable=True):
+            return {
+                'header': json.dumps({'epoch':epoch}),
+                'environment:env-1': json.dumps({
+                    'result':{'state':'Running','resources_held':True},
+                    'assignment':{'node_id':node,'generation':7},
+                }),
+                'node:node1':json.dumps({'node':{'available':True},'session':{'routable':routable}}),
+                'node:node2':json.dumps({'node':{'available':True},'session':{'routable':True}}),
+            }
+        before=snapshot(4)
+        self.assertEqual(node.validated_coordinator_recovery(before,snapshot(5),['env-1']),
+                         {'epoch_before':4,'epoch_after':5,
+                          'ownership':{'env-1':{'node_id':'node1','generation':7}}})
+        with self.assertRaises(AssertionError):
+            node.validated_coordinator_recovery(before,snapshot(4),['env-1'])
+        with self.assertRaises(AssertionError):
+            node.validated_coordinator_recovery(before,snapshot(5,node='node2'),['env-1'])
+        with self.assertRaises(AssertionError):
+            node.validated_coordinator_recovery(before,snapshot(5,routable=False),['env-1'])
+
     def test_redis_recovery_evidence_requires_running_held_ownership(self):
         record={'result':{'state':'Running','resources_held':True},
                 'assignment':{'node_id':'node2','generation':7}}

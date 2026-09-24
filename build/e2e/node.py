@@ -31,6 +31,16 @@ def persisted_ownership(records,ids):
         assignment=record['assignment']
         ownership[sid]={'node_id':assignment['node_id'],'generation':assignment['generation']}
     return ownership
+def validated_coordinator_recovery(before,after,ids):
+    old_epoch=json.loads(before['header'])['epoch']
+    new_epoch=json.loads(after['header'])['epoch']
+    assert new_epoch>old_epoch,(old_epoch,new_epoch)
+    ownership=persisted_ownership(before,ids)
+    assert persisted_ownership(after,ids)==ownership,'instance ownership changed across Coordinator restart'
+    for node_id in ('node1','node2'):
+        record=json.loads(after['node:'+node_id])
+        assert record['node']['available'] and record['session']['routable'],node_id
+    return {'epoch_before':old_epoch,'epoch_after':new_epoch,'ownership':ownership}
 def redis_info():
     env={**os.environ,'REDISCLI_AUTH':(S/'redis-key').read_text().strip()}
     lines=subprocess.check_output(['redis-cli','--raw','INFO','persistence'],env=env,text=True,timeout=5).splitlines()
@@ -195,6 +205,31 @@ def main():
                     break
             except (OSError,subprocess.SubprocessError,IndexError,KeyError,ValueError):pass
             if time.monotonic()>deadline:raise TimeoutError('AOF Redis restart did not preserve instance ownership')
+            time.sleep(.2)
+    elif action=='coordinator-restart':
+        ids=json.loads((E/'live-instances.json').read_text())
+        before=catalog()
+        persisted_ownership(before,ids)
+        services=[s for s in supervisor('status')['services'] if s['role']=='coordinator']
+        assert len(services)==1 and services[0]['pid'],'supervised Coordinator is unavailable'
+        previous_pid=services[0]['pid']
+        os.kill(previous_pid,signal.SIGKILL)
+        deadline=time.monotonic()+60
+        last_error='new Coordinator process not yet available'
+        while True:
+            try:
+                services=[s for s in supervisor('status')['services'] if s['role']=='coordinator']
+                current_pid=services[0]['pid']
+                if current_pid and current_pid!=previous_pid:
+                    evidence=validated_coordinator_recovery(before,catalog(),ids)
+                    (E/'coordinator-restart.json').write_text(json.dumps({
+                        'previous_pid':previous_pid,'pid':current_pid,**evidence,
+                    },indent=2))
+                    break
+            except (OSError,subprocess.SubprocessError,IndexError,KeyError,ValueError,AssertionError) as error:
+                last_error=str(error)
+            if time.monotonic()>deadline:
+                raise TimeoutError('Coordinator restart did not reconcile: '+last_error)
             time.sleep(.2)
     elif action=='restart-sandboxd':
         before=backend();assert len(before)==1
