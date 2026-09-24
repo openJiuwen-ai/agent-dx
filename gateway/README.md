@@ -72,11 +72,18 @@ provide equivalent sandbox-veth/host-firewall isolation before enabling
 `ADX_DATA_PLANE_RELAY_ALLOW_ANY_INGRESS=1` /
 `ADX_DATA_PLANE_INGRESS_ALLOW_ANY_CLIENT=1` remain development-only ACL escapes.
 Ingress has separate TLS and plaintext listeners. Direct is accepted only on the
-TLS listener and always requires a user token. The generic relay supports anonymous tunnel and port-forwarding/SSH routes. The managed Coordinator route resolver forces token authentication for port-forwarding/SSH; such routes require TLS. The new control backend does not publish user ports. A `portForwardRoutes` entry can
+TLS listener and always requires a user token. The generic relay supports anonymous tunnel and port-forwarding/SSH routes. The managed Coordinator route resolver forces token authentication for port-forwarding/SSH; such routes require TLS. A published `portForwardRoutes` entry can
 require a token for one target port; that port is then rejected on the plaintext
 listener and authenticated on the TLS listener. Plaintext requests carrying
 `Authorization`, `X-Auth`, or a token query parameter are rejected so credentials
 cannot accidentally cross the clear-text entrypoint.
+When `ADX_DATA_PLANE_INGRESS_PORT_HOST_DOMAIN=example.com` is set, the HTTP
+port-forwarding route also accepts `Host: <instance-id>-<port>.example.com` and
+passes the complete request path and query to the instance. A matching Host
+route takes precedence over management and configured proxy paths. Unrelated
+Hosts retain the existing path routing. Deployments serving this form to
+browsers need wildcard DNS and a TLS certificate covering the subdomains; the
+Ingress still applies the same route publication and authentication checks.
 Frontend is not a data-plane hop. Ingress removes credentials before opening Node
 streams, so user API Keys never reach Node or the workload.
 
@@ -321,6 +328,6 @@ the reusable VMs are stopped. Evidence is retained under
 
 For the current public Sandbox SDK platform acceptance, use [build/e2e](../build/e2e/README.md). The old full-cluster AIO harness was not imported and is not a runnable command in this repository.
 
-The relay library supports tunnel, SSH and configured user-port forwarding; that does not imply the new control plane publishes user ports. Current public create rejects user-port publication and per-Environment data-plane security overrides. Generic reverse-proxy routes can forward Agent traffic to a separately supplied service; they do not implement the Agent backend.
+The relay library supports tunnel, SSH and configured user-port forwarding. Public create validates forwarded ports and data-plane security settings, and Coordinator publishes the resulting routes. Generic reverse-proxy routes can forward Agent traffic to a separately supplied service; they do not implement the Agent backend.
 
 For current production logging, use [structured collection](../docs/testing/log-collection.md) and [supervisor rotation](../docs/testing/log-rotation.md). Gateway's optional own file writer above is an alternative sink; the unified JSON collection deployment leaves it disabled to avoid double writing. Trace propagation and export are implemented in Ingress and Relay, see [distributed traces](../docs/testing/distributed-traces.md).

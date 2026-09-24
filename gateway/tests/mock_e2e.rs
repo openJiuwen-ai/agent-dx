@@ -83,6 +83,7 @@ async fn mock_full_data_plane_protocol_matrix() {
             http_target.to_string(),
             data_plane_gateway::ingress::parse_static_routes("exact:/healthz").unwrap(),
         )
+        .with_port_host_domain(Some("example.test".into()))
         .with_client_acl(Vec::new(), true),
     );
     let ingress_http = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -119,6 +120,8 @@ async fn mock_full_data_plane_protocol_matrix() {
     assert_eq!(seen.path, "/hello?x=1");
     assert!(!seen.has_authorization);
     assert!(!seen.has_x_auth);
+    assert_port_host_forward(ingress_http_address, http_target.port()).await;
+    assert_eq!(seen_paths.recv().await.unwrap().path, "/api/host?x=1");
     assert_http_keepalive_reuse(
         ingress_http_address,
         http_target.port(),
@@ -307,6 +310,18 @@ async fn assert_port_forward_http(ingress: std::net::SocketAddr, port: u16) {
         ingress,
         &format!(
             "GET /instance-a/{port}/hello?x=1 HTTP/1.1\r\nHost: ingress\r\nConnection: close\r\n\r\n"
+        ),
+    )
+    .await;
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(response.ends_with("pong"), "{response}");
+}
+
+async fn assert_port_host_forward(ingress: std::net::SocketAddr, port: u16) {
+    let response = raw_http(
+        ingress,
+        &format!(
+            "GET /api/host?x=1 HTTP/1.1\r\nHost: instance-a-{port}.example.test\r\nConnection: close\r\n\r\n"
         ),
     )
     .await;

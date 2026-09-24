@@ -32,6 +32,7 @@ pub struct IngressConfig {
     pub auth_cache_ttl: Duration,
     pub default_direct_port: u16,
     pub default_tunnel_port: u16,
+    pub port_host_domain: Option<String>,
     pub node_security_mode: IngressNodeSecurityMode,
     pub node_tls_ca: String,
     pub node_tls_server_name: String,
@@ -230,6 +231,22 @@ impl IngressConfig {
         )?);
         let default_direct_port = parse_env("ADX_DATA_PLANE_INGRESS_DIRECT_PORT", "50090")?;
         let default_tunnel_port = parse_env("ADX_DATA_PLANE_INGRESS_TUNNEL_PORT", "8765")?;
+        let port_host_domain = match env::var("ADX_DATA_PLANE_INGRESS_PORT_HOST_DOMAIN") {
+            Ok(value) => {
+                let domain = value.trim().trim_end_matches('.').to_ascii_lowercase();
+                if domain.is_empty()
+                    || domain.len() > 253
+                    || !domain.split('.').all(valid_dns_label)
+                {
+                    return Err(ConfigError::Invalid(
+                        "ADX_DATA_PLANE_INGRESS_PORT_HOST_DOMAIN must be a DNS domain".into(),
+                    ));
+                }
+                Some(domain)
+            }
+            Err(env::VarError::NotPresent) => None,
+            Err(error) => return Err(ConfigError::Invalid(format!("port host domain: {error}"))),
+        };
         let node_security_mode = parse_env("ADX_DATA_PLANE_INGRESS_NODE_SECURITY_MODE", "network")?;
         let node_tls_ca = env::var("ADX_DATA_PLANE_INGRESS_NODE_TLS_CA").unwrap_or_default();
         let node_tls_server_name =
@@ -374,6 +391,7 @@ impl IngressConfig {
             auth_cache_ttl,
             default_direct_port,
             default_tunnel_port,
+            port_host_domain,
             node_security_mode,
             node_tls_ca,
             node_tls_server_name,
@@ -575,6 +593,22 @@ fn default_gateway_epoch() -> String {
         .unwrap_or_default()
         .as_nanos()
         .to_string()
+}
+
+fn valid_dns_label(label: &str) -> bool {
+    !label.is_empty()
+        && label.len() <= 63
+        && label
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        && label
+            .bytes()
+            .last()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric())
+        && label
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
 }
 
 fn fd_based_stream_budget() -> Result<usize, ConfigError> {

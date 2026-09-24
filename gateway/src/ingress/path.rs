@@ -62,6 +62,48 @@ pub fn parse_direct_path(
     })
 }
 
+/// Resolve a forwarded port from `<environment-id>-<port>.<domain>`.
+/// The caller supplies the configured domain, so unrelated Host headers never
+/// become environment identities.
+pub fn parse_port_host_route(host: &str, path: &str, domain: &str) -> Option<ParsedDirectPath> {
+    if domain.is_empty() || !path.starts_with('/') {
+        return None;
+    }
+    let authority = host.parse::<http::uri::Authority>().ok()?;
+    let hostname = authority.host().trim_end_matches('.').to_ascii_lowercase();
+    let suffix = format!(".{}", domain.to_ascii_lowercase());
+    let label = hostname.strip_suffix(&suffix)?;
+    if label.len() > 63 {
+        return None;
+    }
+    let (instance_id, port) = label.rsplit_once('-')?;
+    if !valid_dns_label(instance_id) {
+        return None;
+    }
+    let target_port = port.parse::<u16>().ok().filter(|port| *port != 0)?;
+    Some(ParsedDirectPath {
+        instance_id: instance_id.to_owned(),
+        target_port,
+        stripped_path: path.to_owned(),
+        access_kind: AccessKind::PortForwarding,
+    })
+}
+
+fn valid_dns_label(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric())
+        && value
+            .chars()
+            .last()
+            .is_some_and(|c| c.is_ascii_alphanumeric())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
+
 fn normalize_alias_path(rest: &str, default_port: u16) -> Option<String> {
     if rest.is_empty() || default_port == 0 {
         return None;
@@ -106,5 +148,33 @@ mod tests {
             }
         );
         assert!(parse_direct_path("/direct/", 50090, 8765).is_none());
+    }
+
+    #[test]
+    fn host_subdomain_routes_preserve_the_guest_path() {
+        assert_eq!(
+            parse_port_host_route(
+                "default-sandbox-123-18081.example.test:8080",
+                "/nested/hello",
+                "example.test",
+            ),
+            Some(ParsedDirectPath {
+                instance_id: "default-sandbox-123".into(),
+                target_port: 18081,
+                stripped_path: "/nested/hello".into(),
+                access_kind: AccessKind::PortForwarding,
+            })
+        );
+        assert!(parse_port_host_route("other.example.test", "/", "example.test").is_none());
+        assert!(
+            parse_port_host_route("default-sandbox-123-0.example.test", "/", "example.test")
+                .is_none()
+        );
+        assert!(parse_port_host_route(
+            "default-sandbox-123-18081.badexample.test",
+            "/",
+            "example.test"
+        )
+        .is_none());
     }
 }

@@ -60,7 +60,7 @@ impl IngressService {
         injected: SandboxOverride,
     ) -> Result<Self, ServiceError> {
         #[cfg(not(feature = "agent-api"))]
-        let _ = injected;
+        let () = injected;
         #[cfg(not(feature = "agent-api"))]
         if std::env::var_os("ADX_SANDBOX_CONFIG").is_some()
             || std::env::var_os("ADX_AGENT_CONFIG").is_some()
@@ -141,6 +141,7 @@ impl IngressService {
             config.frontend_address.clone(),
             config.control_plane_routes.clone(),
         )
+        .with_port_host_domain(config.port_host_domain.clone())
         .with_backend_http_pool_config(config.backend_http_pool_config())
         .with_reverse_proxy_config(config.reverse_proxy.clone())
         .with_proxy_routes(config.proxy_routes.clone())
@@ -340,6 +341,7 @@ mod tests {
             auth_cache_ttl: Duration::from_secs(1),
             default_direct_port: 50_090,
             default_tunnel_port: 8_765,
+            port_host_domain: None,
             node_security_mode: IngressNodeSecurityMode::Network,
             node_tls_ca: String::new(),
             node_tls_server_name: String::new(),
