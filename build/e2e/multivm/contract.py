@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 import hashlib
 import json
+import ipaddress
 
 REQUIRED = (
     'l0',
@@ -39,6 +40,19 @@ def verify_inventory(inventory):
         values = [machine.get(field) for machine in machines]
         if any(not isinstance(value, str) or not value for value in values) or len(set(values)) != 3:
             raise ValueError(field + ' must be present and unique on all three machines')
+    for machine in machines:
+        try:
+            ipaddress.ip_address(machine['address'])
+        except ValueError as error:
+            raise ValueError('machine address must be an assigned IP address') from error
+        target = machine.get('ssh_target')
+        if not isinstance(target, str) or not target or target.startswith('-') or any(c.isspace() for c in target):
+            raise ValueError('every machine requires a safe ssh_target')
+        if machine['role'] != 'control' and not machine.get('node_id'):
+            raise ValueError('each worker requires a node_id')
+    node_ids = [machine['node_id'] for machine in machines if machine['role'] != 'control']
+    if len(set(node_ids)) != 2:
+        raise ValueError('worker node_id values must be unique')
     artifacts = inventory.get('artifacts', {})
     if not re.fullmatch(r'[0-9a-f]{40}', artifacts.get('commit', '')):
         raise ValueError('a full source commit is required')
