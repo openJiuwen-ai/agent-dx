@@ -947,6 +947,11 @@ class SandboxClient:
             "direct invoke outcome is unknown after "
             f"{attempts} attempts (requestId={request_id}): {detail}",
             request_id=request_id,
+            code="OUTCOME_UNKNOWN",
+            retry="same_operation",
+            outcome="unknown",
+            operation_id=request_id,
+            instance_id=sandbox_id,
         ) from last_error
 
     @staticmethod

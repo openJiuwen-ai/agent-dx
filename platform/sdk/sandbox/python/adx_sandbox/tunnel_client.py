@@ -186,6 +186,8 @@ class TunnelClient:
         token: Optional[str] = None,
         ping_interval: float = _PING_INTERVAL,
         ping_timeout: float = _PING_TIMEOUT,
+        *,
+        sandbox_id: Optional[str] = None,
     ):
         if ping_interval <= 0:
             raise ValueError("ping_interval must be greater than zero")
@@ -193,6 +195,7 @@ class TunnelClient:
             raise ValueError("ping_timeout must be greater than zero")
         self._upstream = upstream
         self._token = token
+        self._sandbox_id = sandbox_id
         self._ping_interval = ping_interval
         self._ping_timeout = ping_timeout
         self._protocol_version = _positive_int_env(
@@ -381,6 +384,8 @@ class TunnelClient:
             connected_at = None
             try:
                 _extra_headers = {}
+                if self._sandbox_id:
+                    _extra_headers["X-Sandbox-ID"] = self._sandbox_id
                 connect_url = tunnel_ws_url
                 if self._token:
                     _extra_headers["Authorization"] = f"Bearer {self._token}"

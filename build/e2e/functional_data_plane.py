@@ -75,7 +75,6 @@ def run(connection, image, output, ca_path):
         CommandConflict,
         CommandNotFound,
         CommandStatus,
-        CommandWaitTimeout,
         DataPlaneSecurityPolicy,
         Sandbox,
         resources,
@@ -207,12 +206,9 @@ def run(connection, image, output, ca_path):
         waiting = sandbox.commands.run(
             'sleep 120', background=True, command_id='functional-wait-timeout'
         )
-        try:
-            waiting.wait(timeout=0.05)
-        except CommandWaitTimeout:
-            pass
-        else:
-            raise AssertionError('command wait did not enforce its timeout')
+        timeout_result = waiting.wait(timeout=0.05)
+        assert timeout_result.status == CommandStatus.RUNNING
+        assert timeout_result.error_code == 'WAIT_TIMEOUT'
         assert waiting.kill()
         assert waiting.wait(timeout=20).status == CommandStatus.KILLED
         passed('command.not-found-and-wait-timeout', started)

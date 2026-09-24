@@ -1729,9 +1729,10 @@ def test_reverse_tunnel_url_uses_gateway_tunnel_alias():
             return original_client._safe_id(sandbox_id)
 
     class FakeTunnelClient:
-        def __init__(self, upstream, token=None):
+        def __init__(self, upstream, token=None, *, sandbox_id=None):
             seen["upstream"] = upstream
             seen["token"] = token
+            seen["sandbox_id"] = sandbox_id
 
         def start(self, url, timeout=60):
             seen["url"] = url
@@ -1821,8 +1822,9 @@ def test_reverse_tunnel_uses_frontend_returned_tunnel_metadata():
             return original_client._safe_id(sandbox_id)
 
     class FakeTunnelClient:
-        def __init__(self, upstream, token=None):
+        def __init__(self, upstream, token=None, *, sandbox_id=None):
             seen["token"] = token
+            seen["sandbox_id"] = sandbox_id
 
         def start(self, url, timeout=60):
             seen["url"] = url

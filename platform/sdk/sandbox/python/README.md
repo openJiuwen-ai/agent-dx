@@ -15,6 +15,9 @@ with Sandbox(image="python:3.12-slim", cpu=2000, memory=4096) as sandbox:
 
 `close()` releases local SDK resources and leaves the remote sandbox alive.
 `kill()` deletes a non-detached remote sandbox as well.
+The context manager explicitly calls `kill()` on exit; garbage collection does
+not make a remote delete request. If the block raises, its original exception
+remains visible even when cleanup also fails.
 
 ## Server compatibility
 
@@ -399,8 +402,14 @@ result = command.wait()
 
 `wait()` and `wait_async()` use one hidden multiplexed WebSocket per connection
 context as a notification channel. The final result is always read back from
-EXECD's authoritative command registry. A local wait timeout or client restart
-does not terminate the remote command.
+EXECD's authoritative command registry. When the wait deadline expires, they
+return `CommandResult(status=RUNNING, error_code="WAIT_TIMEOUT")`; the remote
+command remains active and the handle can wait again. A client restart also
+does not terminate the remote command. `CommandHandle.kill()` and
+`sandbox.commands.kill()` return `False` when the command is absent or already
+finished, and still raise on other execution or transport failures.
+Long-running command polling retries connection failures and errors marked
+retryable by the server. Terminal errors keep their original error and request ID.
 
 
 ### Placement
