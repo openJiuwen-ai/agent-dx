@@ -56,6 +56,14 @@
     "gate": "在带卡节点验证设备发现、整卡分配、卡号传递、实际执行及释放。"
   },
   {
+    "id": "heterogeneous-runtime-affinity",
+    "title": "异构 Runtime 正向亲和 E2E",
+    "stage": "7",
+    "status": "pending",
+    "detail": "runc-only 双节点正式用例已验证不支持 runsc 时不产生分配；定向 runtime-affinity 用例已加入，要求真实 sandboxd inventory 只有一个节点支持 runsc，并通过公开 SDK 验证实际创建、归属、命令和清理。当前 fixture 尚未提供 runsc 后端，未完成端到端运行。",
+    "gate": "提供兼容的 runsc 二进制与 OCI 测试镜像，在异构双节点上运行 --profile full --case runtime-affinity，保存实际 inventory、assignment、执行与清理证据。"
+  },
+  {
     "id": "service-soak",
     "title": "真实服务混合负载与长稳",
     "stage": "5",
