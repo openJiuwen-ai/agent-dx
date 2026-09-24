@@ -228,6 +228,14 @@ async fn connect(server: Server) -> (Sandboxd, Harness) {
         },
     )
 }
+#[tokio::test]
+async fn discovers_runtime_classes_from_sandboxd_uds() {
+    let (adapter, _server) = connect(Server::default()).await;
+    assert_eq!(
+        adapter.available_runtime_classes().await.unwrap(),
+        ["runsc"]
+    );
+}
 fn spec() -> EnvironmentSpec {
     EnvironmentSpec {
         runtime_profile: None,

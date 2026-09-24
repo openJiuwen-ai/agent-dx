@@ -191,12 +191,17 @@ pub(crate) struct Admission {
     valid_until: Option<Instant>,
     maintenance: bool,
     pressure: bool,
+    runtime_classes: Option<std::collections::BTreeSet<String>>,
 }
 
 impl Admission {
     fn reserve(&mut self, id: &str, spec: &EnvironmentSpec, assignment: &Assignment) -> Result<()> {
         if self.maintenance
             || self.pressure
+            || self
+                .runtime_classes
+                .as_ref()
+                .is_some_and(|classes| !classes.contains(&spec.runtime_class))
             || self.valid_until.is_none_or(|until| Instant::now() >= until)
             || (!spec.scheduling.devices.is_empty()
                 && self
@@ -273,6 +278,7 @@ impl Adxlet {
                     valid_until: None,
                     maintenance: false,
                     pressure: false,
+                    runtime_classes: None,
                 })),
                 operation_timeout: Duration::from_secs(30),
                 checkpoint: None,
@@ -346,6 +352,22 @@ impl Adxlet {
         Ok(())
     }
 
+    /// Replace the live sandboxd runtime inventory used by local admission.
+    pub fn update_runtime_classes(&self, classes: Vec<String>) -> Result<()> {
+        let mut available = std::collections::BTreeSet::new();
+        for class in classes {
+            if class.trim().is_empty() || !available.insert(class) {
+                return Err(Error::Invalid("invalid or duplicate runtime class".into()));
+            }
+        }
+        self.services
+            .admission
+            .lock()
+            .expect("shared state lock poisoned")
+            .runtime_classes = Some(available);
+        Ok(())
+    }
+
     /// Refresh physical inventory without erasing allocations, including cards
     /// that disappeared or became unhealthy while an execution still holds them.
     pub fn update_devices(&self, devices: Vec<Device>, valid_for: Duration) -> Result<()> {
@@ -403,6 +425,10 @@ impl Adxlet {
             .expect("shared state lock poisoned");
         !admission.maintenance
             && !admission.pressure
+            && admission
+                .runtime_classes
+                .as_ref()
+                .is_none_or(|classes| !classes.is_empty())
             && admission
                 .valid_until
                 .is_some_and(|until| Instant::now() < until)

@@ -50,6 +50,13 @@ fn peer_groups_preserve_or_tenants_pending_placements_and_reverse_exclusion() {
     let mut s = Snapshot::default();
     for id in ["a", "b"] {
         s.update_node(Node {
+            runtime_classes: vec![
+                "runsc".into(),
+                "runc".into(),
+                "firecracker".into(),
+                "r".into(),
+                "test-runtime".into(),
+            ],
             id: id.into(),
             devices: vec![],
             capacity: Resources {
@@ -103,6 +110,13 @@ fn ordered_group_uses_first_match_and_weights_apply_only_in_weighted_mode() {
         ),
     ] {
         s.update_node(Node {
+            runtime_classes: vec![
+                "runsc".into(),
+                "runc".into(),
+                "firecracker".into(),
+                "r".into(),
+                "test-runtime".into(),
+            ],
             id: id.into(),
             devices: vec![],
             capacity: Resources {

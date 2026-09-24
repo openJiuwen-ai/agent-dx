@@ -22,6 +22,13 @@ fn spec(id: &str) -> EnvironmentSpec {
 }
 fn node(id: &str, zone: &str) -> Node {
     Node {
+        runtime_classes: vec![
+            "runsc".into(),
+            "runc".into(),
+            "firecracker".into(),
+            "r".into(),
+            "test-runtime".into(),
+        ],
         id: id.into(),
         capacity: Resources {
             cpu_millis: 100,
@@ -62,6 +69,22 @@ fn queue_deadline_can_cancel_only_an_unassigned_request() {
     let assignment = coordinator.schedule(0).unwrap().unwrap();
     assert!(!coordinator.cancel_pending("assigned"));
     coordinator.release(&assignment).unwrap();
+}
+
+#[test]
+fn central_scheduler_places_only_on_reported_runtime_class() {
+    let mut coordinator = Coordinator::new(1, Placement::Pack).unwrap();
+    let mut runsc = node("runsc-node", "z");
+    runsc.runtime_classes = vec!["runsc".into()];
+    let mut runc = node("runc-node", "z");
+    runc.runtime_classes = vec!["runc".into()];
+    coordinator.register(runsc).unwrap();
+    coordinator.register(runc).unwrap();
+    coordinator.submit(spec("runtime-choice")).unwrap();
+    assert_eq!(
+        coordinator.schedule(0).unwrap().unwrap().node_id,
+        "runsc-node"
+    );
 }
 
 #[test]

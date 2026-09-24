@@ -26,6 +26,13 @@ fn saved() -> StoredSnapshot {
         sandbox: Default::default(),
     };
     let node = Node {
+        runtime_classes: vec![
+            "runsc".into(),
+            "runc".into(),
+            "firecracker".into(),
+            "r".into(),
+            "test-runtime".into(),
+        ],
         id: "n".into(),
         capacity: Resources {
             cpu_millis: 50,

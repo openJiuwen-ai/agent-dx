@@ -37,13 +37,25 @@ pub struct Node {
     pub labels: BTreeMap<String, String>,
     #[serde(default)]
     pub devices: Vec<Device>,
+    /// Runtime classes reported by the local sandboxd service.
+    #[serde(default)]
+    pub runtime_classes: Vec<String>,
 }
 impl Node {
     pub fn validate(&self) -> Result<()> {
         nonempty(&self.id)?;
         self.capacity.validate()?;
         validate_labels(&self.labels)?;
-        validate_inventory(&self.devices)
+        validate_inventory(&self.devices)?;
+        let mut seen = BTreeSet::new();
+        if self
+            .runtime_classes
+            .iter()
+            .any(|class| class.trim().is_empty() || !seen.insert(class.as_str()))
+        {
+            return Err(Error::Invalid("invalid or duplicate runtime class".into()));
+        }
+        Ok(())
     }
 }
 

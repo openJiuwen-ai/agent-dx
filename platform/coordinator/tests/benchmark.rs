@@ -14,6 +14,13 @@ fn run(cache: usize, heterogeneous: bool) -> (Duration, SchedulingStats, Vec<Str
     let mut m = Coordinator::with_config(1, Placement::Spread, config).unwrap();
     for i in 0..128 {
         m.register(Node {
+            runtime_classes: vec![
+                "runsc".into(),
+                "runc".into(),
+                "firecracker".into(),
+                "r".into(),
+                "test-runtime".into(),
+            ],
             id: format!("n{i:03}"),
             capacity: Resources {
                 cpu_millis: 1000,
@@ -35,6 +42,13 @@ fn run(cache: usize, heterogeneous: bool) -> (Duration, SchedulingStats, Vec<Str
         }
         if heterogeneous && i % 16 == 0 {
             m.register(Node {
+                runtime_classes: vec![
+                    "runsc".into(),
+                    "runc".into(),
+                    "firecracker".into(),
+                    "r".into(),
+                    "test-runtime".into(),
+                ],
                 id: format!("n{:03}", (i / 16) % 128),
                 capacity: Resources {
                     cpu_millis: 800 + i % 201,

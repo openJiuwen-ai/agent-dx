@@ -337,6 +337,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         session_id: session_id.clone(),
         heartbeat_sequence: 0,
         reconciling: true,
+        runtime_classes: vec![],
     };
     // Bind before registration so dispatch cannot race an unbound address.
     let node_rpc = NodeRpc::new(manager.clone(), peers, session_id.clone())
@@ -410,6 +411,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 reconciled = false;
             }
             let mut r = last.clone();
+            // A failed capability refresh closes new admission, but existing
+            // executions and the heartbeat continue for reconciliation.
+            r.runtime_classes =
+                match tokio::time::timeout(sample_timeout, runtime.available_runtime_classes())
+                    .await
+                {
+                    Ok(Ok(classes)) => classes,
+                    _ => vec![],
+                };
+            manager.update_runtime_classes(r.runtime_classes.clone())?;
             if let Ok((o, valid)) = sample(&source, &runtime, sample_timeout).await {
                 valid_until = tokio::time::Instant::now() + valid;
                 manager.update_capacity(o.capacity, valid)?;

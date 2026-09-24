@@ -30,6 +30,14 @@ fn spec(id: &str) -> EnvironmentSpec {
 }
 fn node(id: &str) -> Node {
     Node {
+        runtime_classes: vec![
+            "runsc".into(),
+            "runc".into(),
+            "firecracker".into(),
+            "r".into(),
+            "test-runtime".into(),
+            "other".into(),
+        ],
         id: id.into(),
         capacity: Resources {
             cpu_millis: 100,

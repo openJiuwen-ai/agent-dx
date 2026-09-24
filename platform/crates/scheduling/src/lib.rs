@@ -90,6 +90,7 @@ impl Framework {
         let mut filters: Vec<Arc<dyn Filter>> = vec![
             Arc::new(plugins::NodeAvailable),
             Arc::new(plugins::ResourceFit),
+            Arc::new(constraints::RuntimeFit),
             Arc::new(constraints::DeviceFit),
             Arc::new(constraints::NodeAffinity),
             Arc::new(groups::Required),

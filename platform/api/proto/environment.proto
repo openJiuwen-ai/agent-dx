@@ -57,6 +57,7 @@ message RegisterNodeRequest {
   string session_id = 8; // Unique for one Adxlet process lifetime.
   uint64 heartbeat_sequence = 9;
   bool reconciling = 10;
+  repeated string runtime_classes = 11; // Available classes discovered through sandboxd's UDS.
 
 }
 
