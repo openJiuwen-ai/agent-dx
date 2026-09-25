@@ -249,6 +249,12 @@ Local Docker reproduction requires access to the same bind-mounted paths as the 
   A fresh healthy client then starts the same command ID exactly once, and
   Redis assignment, backend and cleanup are checked. Select with
   `--profile full --case command-unsupported-feature`.
+- `sqlite-node-restart` (targeted compound outage): after an idle deletion is
+  durably pending in node1's SQLite journal while Coordinator is suspended,
+  restart node1's Adxlet before resuming Coordinator. Require a new process
+  with the same live backend and pending delete, then replay the journal and
+  check the public SDK, Redis and physical cleanup. Select with
+  `--profile full --case sqlite-node-restart`.
 - `command-registry-capacity` (targeted Execd admission limit): only node1's
   Execd receives a one-record registry limit. Keep one background command
   running, require a second stable command ID to return `ResourceExhausted`,

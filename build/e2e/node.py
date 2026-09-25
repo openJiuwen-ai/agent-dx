@@ -99,6 +99,25 @@ def validated_adxlet_restart(before,status,record):
     return {'node_id':before['node_id'],'pid_before':before['pid'],
             'pid_after':services[0]['pid'],'session_before':before['session_id'],
             'session_after':record['session']['id']}
+def validated_sqlite_node_restart(before,status,records,pending,current_backend,journaled):
+    services=[s for s in status['services'] if s['role']=='adxlet']
+    assert len(services)==1 and services[0]['pid'] and services[0]['pid']!=before['pid'], \
+        'Adxlet did not restart while Coordinator was suspended'
+    assert current_backend==[journaled['keep_backend']], \
+        'live backend changed while Coordinator was suspended'
+    assert pending is not None and len(pending)==1 \
+        and pending[0]['spec']['id']==journaled['idle_id'] \
+        and pending[0]['state']=='Deleted', \
+        'SQLite pending delete was lost or duplicated on Adxlet restart'
+    keep=json.loads(records['environment:'+journaled['keep_id']])
+    idle=json.loads(records['environment:'+journaled['idle_id']])
+    assert keep['result']['state']=='Running' and idle['result']['state']=='Running', \
+        'Redis changed while Coordinator was suspended'
+    assert persisted_runtime_id(keep)==journaled['keep_runtime_id'], \
+        'live runtime changed while Coordinator was suspended'
+    return {'pid_before':before['pid'],'pid_after':services[0]['pid'],
+            'session_before':before['session_id'],'pending_records':len(pending),
+            'keep_backend':current_backend[0],'redis_idle_state':idle['result']['state']}
 def redis_info():
     env={**os.environ,'REDISCLI_AUTH':(S/'redis-key').read_text().strip()}
     host=os.getenv('ADX_E2E_REDIS_HOST','coordinator')
@@ -282,6 +301,27 @@ def main():
                 last=str(error)
             if time.monotonic()>deadline:raise TimeoutError(f'SQLite fallback missing: {last}')
             time.sleep(.5)
+    elif action=='sqlite-after-restart':
+        before=json.loads((E/'adxlet-before-node1.json').read_text())
+        journaled=json.loads((E/'sqlite-journaled.json').read_text())
+        started=time.monotonic()
+        deadline=started+25
+        last='replacement Adxlet has not restored the pending journal'
+        while True:
+            try:
+                evidence=validated_sqlite_node_restart(
+                    before,supervisor('status'),catalog(),journal_pending(),
+                    backend(),journaled)
+                evidence['seconds']=round(time.monotonic()-started,3)
+                (E/'sqlite-after-restart.json').write_text(json.dumps(evidence,indent=2))
+                print('PASS pending SQLite delete and live backend survived Adxlet restart',flush=True)
+                break
+            except (OSError,sqlite3.Error,KeyError,ValueError,subprocess.SubprocessError,
+                    AssertionError) as error:
+                last=str(error)
+            if time.monotonic()>deadline:
+                raise TimeoutError('SQLite restart did not preserve pending state: '+last)
+            time.sleep(.2)
     elif action=='sqlite-reconciled':
         before=json.loads((E/'sqlite-journaled.json').read_text())
         started=time.monotonic()

@@ -195,7 +195,7 @@ profile；完整 Multi-VM 在补齐部署器前不能标记为通过。
 | `ST-04` | 已实现 | adxlet 新 session 对账，已运行后端身份不变 |
 | `ST-05` | 已实现 | 日志滚动压缩、Metrics、Trace、Collector 中断恢复 |
 | `ST-FC-01` | 已实现 | KVM 暂停／恢复、可复用快照、克隆和制品清理 |
-| `ST-06` | 正式 K8s 定向验证通过 | [Full #41](https://buildkite.com/agent-dx/agent-dx-full-test/builds/41) 的 `sqlite-fallback` 暂停 Coordinator、保持 Redis 可读，验证空闲实例本地删除写入 SQLite pending、Redis 暂时保留旧 Running 结果；心跳期限内恢复后 pending 清空、Redis 收敛为 Deleted，另一个实例保留原 backend 并可继续执行 SDK 命令。节点自身重启且 Coordinator 仍不可用的组合故障仍需独立 E2E |
+| `ST-06` | 基础故障已验证；组合故障用例已实现，待正式部署运行 | [Full #41](https://buildkite.com/agent-dx/agent-dx-full-test/builds/41) 的 `sqlite-fallback` 暂停 Coordinator、保持 Redis 可读，验证空闲实例本地删除写入 SQLite pending、Redis 暂时保留旧 Running 结果；心跳期限内恢复后 pending 清空、Redis 收敛为 Deleted，另一个实例保留原 backend 并可继续执行 SDK 命令。新增 `sqlite-node-restart` 在 Coordinator 恢复前重启 Adxlet，检查待同步删除和原后端保留，随后再完成对账与物理清理 |
 | `ST-07` | 两种空闲行为均已验证 | [Full #22](https://buildkite.com/agent-dx/agent-dx-full-test/builds/22) 验证独立 SDK 客户端退出、后台命令仍运行时空闲回收；[Full #29](https://buildkite.com/agent-dx/agent-dx-full-test/builds/29) 验证前台请求跨越空闲阈值仍保持运行，结束后空闲删除并释放资源 |
 | `ST-08` | 正式 K8s 定向验证通过 | [Full #39](https://buildkite.com/agent-dx/agent-dx-full-test/builds/39) 通过真实 sandboxd 删除运行中 backend：默认 Never 进入 Failed 且无新执行；配置两次重启时每次产生新 runtime identity、继续提供命令能力，第三次退出后达到重试上限并释放资源。退避精确时序另有组件测试 |
 | `ST-09` | 正式 K8s 定向验证通过 | [Full #37](https://buildkite.com/agent-dx/agent-dx-full-test/builds/37)、[#38](https://buildkite.com/agent-dx/agent-dx-full-test/builds/38)、[#27](https://buildkite.com/agent-dx/agent-dx-full-test/builds/27) 分别验证 Coordinator、API Server、分进程 Ingress 重启后的 epoch、目录和路由重同步；单机进程部署仍需单独验证 |

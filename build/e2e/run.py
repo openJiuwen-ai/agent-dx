@@ -19,7 +19,7 @@ import xml.etree.ElementTree as ET
 
 BASIC = ('sdk','auth','capacity','placement','local-first')
 STANDARD = ('sdk','data-plane','lifecycle','auth','capacity','placement','local-first','node-failure','sandboxd-restart','restart','stop')
-OPTIONAL_CASES = ('redis-restart','coordinator-restart','coordinator-adxlet-restart','apiserver-restart','ingress-restart','runtime-affinity','idle-active','relay-standalone','runtime-exit','sandboxd-runtime-loss','sqlite-fallback','create-response-cut','create-unknown-query','command-response-cut','command-watch-unavailable','command-unsupported-feature','command-registry-capacity','upload-response-cut','download-response-cut','schedule-deadline','resource-stale','network-partition','reconcile-crash','mixed-soak')
+OPTIONAL_CASES = ('redis-restart','coordinator-restart','coordinator-adxlet-restart','apiserver-restart','ingress-restart','runtime-affinity','idle-active','relay-standalone','runtime-exit','sandboxd-runtime-loss','sqlite-fallback','sqlite-node-restart','create-response-cut','create-unknown-query','command-response-cut','command-watch-unavailable','command-unsupported-feature','command-registry-capacity','upload-response-cut','download-response-cut','schedule-deadline','resource-stale','network-partition','reconcile-crash','mixed-soak')
 PROFILES = {
     'l0': ('l0','auth'),
     'standalone': STANDARD,
@@ -47,7 +47,7 @@ def setup_environment(selected_case):
         return ('ADX_E2E_INGRESS_MODE=standalone',)
     if selected_case == 'relay-standalone':
         return ('ADX_E2E_RELAY_MODE=standalone',)
-    if selected_case == 'sqlite-fallback':
+    if selected_case in ('sqlite-fallback','sqlite-node-restart'):
         return ('ADX_E2E_SQLITE_FALLBACK=1',)
     if selected_case == 'runtime-affinity':
         return ('ADX_E2E_RUNSC_NODE=node2',)
@@ -363,6 +363,22 @@ class Run:
                 self.helper('node1','sqlite-reconciled',timeout=90)
                 output=self.execute('node1','/opt/adx/client/bin/python','-u',
                                     '/opt/adx/e2e/scenarios.py','sqlite-verify',timeout=90)
+                record['subcases']=sdk_subcases_from_output(output)
+                for node in self.nodes:self.helper(node,'empty',node)
+        if 'sqlite-node-restart' in selected:
+            with self.case('sqlite-node-restart', checks) as record:
+                self.execute('node1','/opt/adx/client/bin/python','-u',
+                             '/opt/adx/e2e/scenarios.py','sqlite-create',timeout=300)
+                self.helper('node1','coordinator-suspend',timeout=15)
+                try:
+                    self.helper('node1','sqlite-journaled',timeout=65)
+                    self.helper('node1','restart','node1',timeout=15)
+                    self.helper('node1','sqlite-after-restart',timeout=30)
+                finally:
+                    self.helper('node1','coordinator-resume',timeout=15)
+                self.helper('node1','sqlite-reconciled',timeout=90)
+                output=self.execute('node1','/opt/adx/client/bin/python','-u',
+                                    '/opt/adx/e2e/scenarios.py','sqlite-verify-restart',timeout=90)
                 record['subcases']=sdk_subcases_from_output(output)
                 for node in self.nodes:self.helper(node,'empty',node)
         if 'create-response-cut' in selected:

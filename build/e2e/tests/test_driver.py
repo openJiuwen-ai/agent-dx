@@ -96,6 +96,38 @@ class AcceptanceGateTests(unittest.TestCase):
                          ('sqlite-fallback',))
         self.assertEqual(driver.setup_environment('runtime-exit'), ())
 
+    def test_sqlite_node_restart_retains_pending_record_during_control_outage(self):
+        self.assertEqual(driver.setup_environment('sqlite-node-restart'),
+                         ('ADX_E2E_SQLITE_FALLBACK=1',))
+        self.assertEqual(driver.selected_checks('full', 'sqlite-node-restart'),
+                         ('sqlite-node-restart',))
+        with tempfile.TemporaryDirectory() as directory:
+            run = driver.Run(Path(directory))
+            run.nodes = ['node1', 'node2']
+            calls = []
+            run.execute = lambda node, *args, **_kwargs: (
+                calls.append(('execute', node, args[-1]))
+                or json.dumps({'cases': [{'id': 'reliability.sqlite-node-restart',
+                                          'status': 'passed'}]})
+            )
+            run.helper = lambda node, *args, **_kwargs: calls.append(
+                ('helper', node, args[0]))
+            checks = []
+            run.scenarios(checks, ('sqlite-node-restart',))
+            self.assertEqual(checks, ['sqlite-node-restart'])
+            self.assertEqual(calls, [
+                ('execute', 'node1', 'sqlite-create'),
+                ('helper', 'node1', 'coordinator-suspend'),
+                ('helper', 'node1', 'sqlite-journaled'),
+                ('helper', 'node1', 'restart'),
+                ('helper', 'node1', 'sqlite-after-restart'),
+                ('helper', 'node1', 'coordinator-resume'),
+                ('helper', 'node1', 'sqlite-reconciled'),
+                ('execute', 'node1', 'sqlite-verify-restart'),
+                ('helper', 'node1', 'empty'),
+                ('helper', 'node2', 'empty'),
+            ])
+
     def test_create_response_cut_is_targeted_full_fault_case(self):
         self.assertEqual(driver.selected_checks('full', 'create-response-cut'),
                          ('create-response-cut',))
