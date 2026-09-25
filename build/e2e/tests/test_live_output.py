@@ -1,9 +1,12 @@
 import contextlib
+import http.client
 import importlib.util
 import io
 import json
 import os
 from pathlib import Path
+import shlex
+import socket
 import subprocess
 import sys
 import tempfile
@@ -33,6 +36,37 @@ with mock.patch.dict(sys.modules, {'adx_sandbox': sdk_stub}):
 
 
 class LiveOutputTests(unittest.TestCase):
+    def test_forwarded_server_distinguishes_host_path_from_default_path(self):
+        with socket.socket() as listener:
+            listener.bind(('127.0.0.1', 0))
+            port = listener.getsockname()[1]
+        command = functional_data_plane.SERVER_COMMAND.replace(
+            str(functional_data_plane.PORT), str(port))
+        server = subprocess.Popen(shlex.split(command), stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.PIPE)
+        try:
+            deadline = time.monotonic() + 3
+            while True:
+                try:
+                    client = http.client.HTTPConnection('127.0.0.1', port, timeout=1)
+                    client.request('GET', '/')
+                    default = client.getresponse().read().decode()
+                    client.close()
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise
+                    time.sleep(.05)
+            client = http.client.HTTPConnection('127.0.0.1', port, timeout=1)
+            client.request('GET', '/functional/host?x=1')
+            host = client.getresponse().read().decode()
+            client.close()
+            self.assertEqual(default, functional_data_plane.EXPECTED_BODY)
+            self.assertEqual(host, functional_data_plane.HOST_EXPECTED_BODY)
+        finally:
+            server.terminate()
+            server.communicate(timeout=2)
+
     def test_host_forward_uses_instance_subdomain_and_preserves_guest_path(self):
         class Sandbox:
             id = 'default-sandbox-123'
