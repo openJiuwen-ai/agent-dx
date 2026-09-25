@@ -18,7 +18,7 @@ import xml.etree.ElementTree as ET
 
 BASIC = ('sdk','auth','capacity','placement','local-first')
 STANDARD = ('sdk','data-plane','lifecycle','auth','capacity','placement','local-first','node-failure','sandboxd-restart','restart','stop')
-OPTIONAL_CASES = ('redis-restart','coordinator-restart','apiserver-restart','ingress-restart','runtime-affinity','idle-active','relay-standalone','runtime-exit','sqlite-fallback','create-response-cut','resource-stale','network-partition','reconcile-crash','mixed-soak')
+OPTIONAL_CASES = ('redis-restart','coordinator-restart','apiserver-restart','ingress-restart','runtime-affinity','idle-active','relay-standalone','runtime-exit','sandboxd-runtime-loss','sqlite-fallback','create-response-cut','resource-stale','network-partition','reconcile-crash','mixed-soak')
 PROFILES = {
     'l0': ('l0','auth'),
     'standalone': STANDARD,
@@ -448,6 +448,21 @@ class Run:
                 for node in self.nodes:self.helper(node,'restart-sandboxd',node,timeout=90)
                 self.execute('node1','/opt/adx/client/bin/python','-u','/opt/adx/e2e/scenarios.py','recovered-marker',timeout=90)
                 self.execute('node1','/opt/adx/client/bin/python','-u','/opt/adx/e2e/scenarios.py','cleanup-live',timeout=90)
+                for node in self.nodes:self.helper(node,'empty',node)
+        if 'sandboxd-runtime-loss' in selected:
+            with self.case('sandboxd-runtime-loss', checks) as record:
+                for policy in ('never', 'restart'):
+                    self.execute('node1','/opt/adx/client/bin/python','-u',
+                                 '/opt/adx/e2e/scenarios.py','loss-create-'+policy,timeout=300)
+                    self.helper('node1','freeze','node1',timeout=15)
+                    try:
+                        self.helper('node1','restart-sandboxd-lost','node1',policy,timeout=90)
+                    finally:
+                        self.helper('node1','thaw','node1',timeout=15)
+                    output=self.execute('node1','/opt/adx/client/bin/python','-u',
+                                        '/opt/adx/e2e/scenarios.py','loss-verify-'+policy,timeout=180)
+                    if policy=='restart':
+                        record['subcases']=sdk_subcases_from_output(output)
                 for node in self.nodes:self.helper(node,'empty',node)
         if 'restart' in selected:
             with self.case('restart', checks):

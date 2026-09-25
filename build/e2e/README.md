@@ -192,6 +192,14 @@ Local Docker reproduction requires access to the same bind-mounted paths as the 
   Check the persisted assignment, retry count, physical backend inventory,
   public SDK command access and final cleanup. Select with
   `--profile full --case runtime-exit`.
+- `sandboxd-runtime-loss` (targeted combined daemon/backend fault): create one
+  pinned Sandbox, pause adxlet briefly, remove the runtime through sandboxd,
+  restart the sandboxd daemon, then resume adxlet. Repeat for the default Never
+  policy and a two-attempt restart policy. Require Never to reach Failed with
+  resources released, and the restart policy to run a new backend under the
+  original assignment. Verify a public SDK command, final deletion and empty
+  physical backend inventory. Select with
+  `--profile full --case sandboxd-runtime-loss`.
 - `sqlite-fallback` (targeted Coordinator outage case): enable the adxlet
   degradation journal only for this fixture, create a retained and an idle
   Sandbox, then suspend Coordinator while managed Redis remains available.

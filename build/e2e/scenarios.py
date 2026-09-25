@@ -63,6 +63,12 @@ elif sys.argv[1]=='runtime-exit':
     result=E/'runtime-exit-result.json'
     run(connection,image,result)
     print(json.dumps(json.loads(result.read_text())),flush=True)
+elif sys.argv[1].startswith('loss-create-'):
+    from sandboxd_runtime_loss import create
+    print(json.dumps(create(connection,image,E,sys.argv[1].removeprefix('loss-create-'))),flush=True)
+elif sys.argv[1].startswith('loss-verify-'):
+    from sandboxd_runtime_loss import verify
+    print(json.dumps(verify(connection,E,sys.argv[1].removeprefix('loss-verify-'))),flush=True)
 elif sys.argv[1]=='sqlite-create':
     from sqlite_fallback import create
     create(connection,image,E/'sqlite-live.json')

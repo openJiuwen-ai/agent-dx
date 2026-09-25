@@ -67,9 +67,9 @@
     "id": "heterogeneous-runtime-affinity",
     "title": "异构 Runtime 正向亲和 E2E",
     "stage": "7",
-    "status": "pending",
-    "detail": "runc-only 双节点正式用例已验证不支持runsc时不产生分配；定向runtime-affinity用例要求真实sandboxd inventory只有一个节点支持runsc，并通过公开SDK验证实际创建、归属、命令和清理。镜像构建已支持可选runsc ELF架构与SHA校验，定向部署只在node2启用。AKernel本地runtime-versions.env已有release-20260817.0-akernel.1的x86_64 runsc URL与SHA512 pin；其与当前ADX backend包的兼容性及真实正向E2E尚未验证。",
-    "gate": "用ADX_E2E_RUNSC_URL和ADX_E2E_RUNSC_SHA512指定AKernel已锁定的x86_64 runsc，校验匹配backend与OCI测试镜像，构建异构测试镜像并运行--profile full --case runtime-affinity，保存实际inventory、assignment、执行与清理证据。"
+    "status": "complete",
+    "detail": "Buildkite Full #50 基于产品提交0b936fd、驱动提交2a94c0d，使用区域镜像摘要b414ef41b5ff固定runsc并校验二进制SHA512；真实K8s双worker中node1只支持runc、node2支持runc+runsc。公开SDK创建的实例分配到node2，实际runsc执行命令，删除后状态为Deleted且资源释放；双节点物理backend清空，missing_checks与cleanup_errors均为空。证据在out/ci/multivm-coverage-0925/full50-verdict.json及full50-evidence/。",
+    "gate": "用摘要固定的runsc区域镜像和独立SHA512校验构建异构测试镜像，在正式K8s运行--profile full --case runtime-affinity，保存实际inventory、assignment、执行与清理证据。"
   },
   {
     "id": "idle-active-request",
@@ -107,9 +107,17 @@
     "id": "service-soak",
     "title": "真实服务混合负载与长稳",
     "stage": "5",
-    "status": "pending",
-    "detail": "52.8万请求覆盖调度模块，Buildkite #30 K8s 八组覆盖基础流程。已增加可选mixed-soak端到端场景，持续300秒在双节点并行执行命令/文件往返和实例创建删除，并记录错误及延迟分位；253项E2E驱动单测通过，真实服务负载尚未执行。",
+    "status": "complete",
+    "detail": "Buildkite Full #51 在不同物理worker运行330.329秒，公开SDK完成1531次命令、1531次文件往返、265次创建和265次删除，6项子检查、最终backend清空及namespace清理均通过，业务错误为零。命令/文件/创建/删除p99分别为558.956/45.127/234.522/166.187毫秒。工作负载指定node1/node2目标，但未逐实例读回实际归属；日志有345条最终恢复的路由缓存503重试，发布时效另列待办。证据在out/ci/multivm-coverage-0925/full51-evidence/。",
     "gate": "在正式两worker部署运行--case mixed-soak，要求至少300秒、40次命令和文件、5次创建与删除、零错误及物理清理；保存操作量、延迟和最终资源证据。"
+  },
+  {
+    "id": "route-publication-latency",
+    "title": "提交后路由发布时效",
+    "stage": "7",
+    "status": "pending",
+    "detail": "Full #51 的300秒混合负载业务无失败，但日志有345条新实例首次访问时的路由缓存503重试。当前Coordinator周期刷新可能使已提交Running实例晚于创建响应对Ingress可见；需要按先前决定保留有界合并效果，将已提交状态变化触发发布，并采集创建结果至可路由的延迟分位。",
+    "gate": "先用测试固定提交后及时发布、短窗口合并与持续写入不无限推迟的契约；在真实双worker负载下验证路由可见延迟和无业务错误，并保存Ingress缓存与提交时间证据。"
   },
   {
     "id": "instance-resource-metrics",
