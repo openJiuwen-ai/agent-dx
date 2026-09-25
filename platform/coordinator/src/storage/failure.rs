@@ -84,6 +84,7 @@ impl Session {
                 command.arg(field).arg(value);
             }
             if self.store.query::<u8>(command).await? == 1 {
+                self.store.notify_committed_revision(header.revision);
                 return Ok(saved);
             }
         }

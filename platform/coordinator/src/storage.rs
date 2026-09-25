@@ -14,7 +14,10 @@ use adx_core::{
 use redis::{aio::MultiplexedConnection, FromRedisValue};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
-use tokio::{sync::Mutex, time::timeout};
+use tokio::{
+    sync::{watch, Mutex},
+    time::timeout,
+};
 
 const HEADER: &str = "header";
 const CAS: &str = r#"
@@ -355,6 +358,7 @@ struct Connection {
     client: redis::Client,
     current: Mutex<Option<MultiplexedConnection>>,
     timeout: Duration,
+    committed_revision: watch::Sender<u64>,
 }
 #[derive(Clone)]
 pub struct RedisStore {
@@ -362,6 +366,12 @@ pub struct RedisStore {
     key: String,
 }
 impl RedisStore {
+    fn notify_committed_revision(&self, revision: u64) {
+        self.connection
+            .committed_revision
+            .send_modify(|current| *current = (*current).max(revision));
+    }
+
     pub async fn connect(url: &str, namespace: &str, duration: Duration) -> Result<Self> {
         if duration.is_zero()
             || namespace.is_empty()
@@ -380,6 +390,7 @@ impl RedisStore {
                 client,
                 current: Mutex::new(None),
                 timeout: duration,
+                committed_revision: watch::channel(0).0,
             }),
             key: format!("adx:{{{namespace}}}:control:v1"),
         };
@@ -442,6 +453,9 @@ impl RedisStore {
             cmd.arg(name).arg(value);
         }
         let applied: u8 = self.query(cmd).await?;
+        if applied == 1 {
+            self.notify_committed_revision(header.revision);
+        }
         Ok(applied == 1)
     }
     async fn migrate_deleted_capsules(
@@ -630,6 +644,10 @@ pub struct Session {
     epoch: u64,
 }
 impl Session {
+    pub(crate) fn committed_revisions(&self) -> watch::Receiver<u64> {
+        self.store.connection.committed_revision.subscribe()
+    }
+
     pub async fn revision(&self) -> Result<u64> {
         let [header_value] = self.store.fields([HEADER.into()]).await?;
         Ok(self.header(&header_value)?.revision)
