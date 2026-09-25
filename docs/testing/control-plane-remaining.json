@@ -4,15 +4,15 @@
     "title": "系统错误、超时与故障可靠性门禁",
     "stage": "13",
     "status": "pending",
-    "detail": "已修正local-first预算边界、中心队列独立超时和sandboxd晚启动等待；稳定错误映射、SDK accepted/no-final及structured unknown同身份重试、runtime丢失Never和对账中断重启已有组件门禁。Full #17已在两节点验证sandboxd daemon SIGKILL重启且保留原backend；真实进程代理断流、资源采集过期和对账二次崩溃定向用例已实现、待实测，Multi-VM故障门禁仍待补齐。",
+    "detail": "已修正local-first预算边界、中心队列独立超时和sandboxd晚启动等待；稳定错误映射及SDK同身份重试已有组件门禁。Full #17验证sandboxd daemon重启；Full #42验证真实TLS代理断流，#40验证资源采集过期，#43验证对账中断重启，#31验证双物理worker网络隔离。完整三VM故障门禁、Redis PVC跨Pod恢复和FC专项仍待补齐。",
     "gate": "ERR-01..04、TIME-01..05、SD-01..04、NM-01..03和NODE-01..04按system-reliability-gates.md完成对应拓扑E2E并保存客户端、Redis、路由和物理backend证据。"
   },
   {
     "id": "e2e-l0-ci-evidence",
     "title": "L0 独立 Buildkite 门禁证据",
     "stage": "7",
-    "status": "pending",
-    "detail": "驱动已支持独立 l0 profile、required_checks 和逐项 JUnit；尚未在正式 Buildkite revision 上生成一次独立 L0 结果。",
+    "status": "complete",
+    "detail": "Buildkite基础包#90在提交7551acb4上通过独立l0 profile；required_checks为l0和auth，均passed，missing_checks和cleanup_errors均为空，逐项JUnit和制品身份已保存。",
     "gate": "提交当前驱动后运行 L0，确认公共 SDK、认证、清理及制品身份全部通过并上传证据。"
   },
   {
@@ -28,7 +28,7 @@
     "title": "Full K8s 跨物理 worker 验收",
     "stage": "7",
     "status": "complete",
-    "detail": "Buildkite Full #17 在两个不同物理 worker 同次通过 11 组、JUnit 45 项、可观测与最终资源和 namespace 清理；两个 Pod 分别位于 10.244.128.124 和 10.244.128.160。",
+    "detail": "Buildkite Full #26 在两个不同物理 worker 同次通过11组、39个功能子项、JUnit 47项、可观测与最终资源和namespace清理；两个Pod分别位于10.244.128.124和10.244.128.160。",
     "gate": "在至少两个可用物理 worker 上运行 full profile，十一组、可观测、逐项 JUnit、物理 placement 和 namespace 清理全部通过。"
   },
   {
@@ -36,7 +36,7 @@
     "title": "Standalone 与正式部署韧性扩展",
     "stage": "7",
     "status": "pending",
-    "detail": "Buildkite Full #18 已验证托管 Redis SIGKILL 重启；Full #19 验证 Coordinator 新 epoch 与公开 SDK 恢复；Full #20 验证 API Server 重启。Full #21 的 Ingress 用例因默认共进程 fixture 无独立 Ingress PID 而失败；Full #24 改分进程后，旧产品包缺少 adx-ingress，启动阶段失败。构建和发布配方已补独立二进制，待新产物复验。SQLite 降级、实例自动重启、真实节点网络隔离及 Redis PVC 跨 Pod 恢复已有定向用例，尚未真实运行。",
+    "detail": "Buildkite Full #27、#33、#36至#43验证分进程Ingress/Relay、托管Redis、Coordinator/API Server重启、实例自动重启、采集过期、SQLite降级、代理断流和对账二次崩溃；#31验证真实双worker网络隔离。目标用例最终回归全部通过，missing_checks与cleanup_errors均为空。Redis PVC跨Pod恢复仍待具备动态StorageClass的集群。",
     "gate": "按 ST-06..10 和 FD-06..08 增加真实故障用例，保存客户端、权威状态和物理后端三类证据。"
   },
   {
@@ -67,32 +67,32 @@
     "id": "idle-active-request",
     "title": "活动客户端请求跨越空闲阈值",
     "stage": "7",
-    "status": "pending",
-    "detail": "独立客户端退出后仍有后台命令的空闲回收已在 Full #22 验证。新增定向 idle-active 用例覆盖相反条件：前台 SDK 请求持续超过空闲阈值时实例不得被回收，结束后才允许空闲删除；真实部署尚未执行。",
+    "status": "complete",
+    "detail": "Full #22验证独立客户端退出后后台命令仍运行时空闲回收；Full #29验证前台SDK请求跨越空闲阈值时不回收，结束后删除并释放资源。",
     "gate": "在真实 standalone/full 部署执行 --case idle-active，保留请求时长、请求结束前 Running 状态、结束后 Deleted 状态和资源释放证据。"
   },
   {
     "id": "standalone-relay-parity",
     "title": "Relay 共进程与分进程用户结果一致",
     "stage": "7",
-    "status": "pending",
-    "detail": "默认 embedded Relay 的数据面用例已验证；新增 relay-standalone 定向用例在两节点启动独立 Relay，确认进程、健康端点并复用公开 SDK 数据面检查。尚未用携带 adx-relay 的新发布包实际运行。",
+    "status": "complete",
+    "detail": "默认embedded Relay与Full #33分进程Relay均已通过；#33验证两节点独立进程、健康端点及公开SDK数据面18个子项，最终资源清理通过。单机进程部署仍可单独复验。",
     "gate": "在真实 standalone/full 部署执行 --case relay-standalone，确认两节点独立进程证据、SDK 数据面全部子项及最终清理。"
   },
   {
     "id": "runtime-exit-policy",
     "title": "真实后端意外退出与有界重启",
     "stage": "7",
-    "status": "pending",
-    "detail": "新增 runtime-exit 定向用例：真实 sandboxd backend 删除后验证 Never 终态、配置有界重启的新 runtime identity、第三次退出后的重试上限及资源释放。正式进程用例尚未执行；daemon 重启且 runtime 丢失的组合故障仍需另行验证。",
+    "status": "complete",
+    "detail": "Full #39通过真实sandboxd backend删除验证Never终态、有界重启的新runtime identity、第三次退出后的重试上限和资源释放。daemon重启且runtime丢失的组合故障仍需另行验证。",
     "gate": "在真实 standalone/full 部署执行 --case runtime-exit，保存 SDK、Redis assignment/result、sandboxd inventory 和清理证据。"
   },
   {
     "id": "sqlite-fallback-e2e",
     "title": "Coordinator 故障时 SQLite 降级与恢复",
     "stage": "7",
-    "status": "pending",
-    "detail": "新增 sqlite-fallback 定向用例：在心跳期限内暂停 Coordinator，验证空闲本地删除写入 SQLite、Redis 暂时保持旧状态；恢复后 pending 清空、Redis 收敛、存活 backend 身份不变并可继续执行 SDK 命令。正式部署尚未运行。",
+    "status": "complete",
+    "detail": "Full #41在心跳期限内暂停Coordinator，验证空闲本地删除写入SQLite、Redis暂时保持旧状态；恢复后pending清空、Redis收敛，存活backend身份不变并可继续执行SDK命令。节点自身重启且Coordinator持续不可用的组合故障仍待专项覆盖。",
     "gate": "在真实 standalone/full 部署执行 --case sqlite-fallback，保存 SQLite pending、Redis 前后状态、物理后端及公开 SDK 证据。"
   },
   {

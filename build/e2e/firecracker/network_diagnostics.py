@@ -6,6 +6,7 @@ import socket
 import subprocess
 import sys
 import time
+from runtime_record import runtime_id, runtime_ip
 run = pathlib.Path(sys.argv[1])
 base = pathlib.Path(os.environ.get('ADX_FC_BASE','/opt/adx'))
 result = {'captured_at':time.time()}
@@ -20,9 +21,9 @@ try:
     probes=[]
     for key,value in catalog.items():
         if not key.startswith('environment:'):continue
-        record=json.loads(value);state=record.get('result',{});ip=state.get('runtime_ip')
+        record=json.loads(value);state=record.get('result',{});ip=runtime_ip(state)
         if state.get('state')!='Running' or not ip:continue
-        probe={'instance':key,'runtime_id':state.get('runtime_id'),'ip':ip,'tcp':[]}
+        probe={'instance':key,'runtime_id':runtime_id(state),'ip':ip,'tcp':[]}
         for _ in range(3):
             start=time.monotonic()
             try:

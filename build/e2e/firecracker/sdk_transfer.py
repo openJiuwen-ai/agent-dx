@@ -3,6 +3,7 @@
 import json, os, pathlib, signal, subprocess, sys, time
 from transfer_contract import CASES, recovered
 from transfer_config import ADDRESSES
+from runtime_record import runtime_id
 root=pathlib.Path(sys.argv[1]); image=sys.argv[2]
 base=pathlib.Path(os.environ['ADX_FC_BASE']); output=root/'evidence/sdk-transfer.json'
 os.environ['SSL_CERT_FILE']=str(root/'secrets/tls/ca.pem')
@@ -111,11 +112,11 @@ try:
     assert len(inventory(target))==1
     subprocess.run(['python3',str(base/'e2e/firecracker/s3_probe.py'),str(root),'--artifact',new['result']['checkpoint']['artifact']['location']],env=env,check=True)
     passed(3,source_inventory=inventory(source),target_inventory=inventory(target))
-    old_runtime=new['result']['runtime_id']; coordinator_pid=pid(root,'coordinator'); coordinator_epoch=catalog()['header']['epoch']
+    old_runtime=runtime_id(new['result']); coordinator_pid=pid(root,'coordinator'); coordinator_epoch=catalog()['header']['epoch']
     os.kill(coordinator_pid,signal.SIGKILL)
     wait(lambda: catalog()['header']['epoch']>coordinator_epoch and all(catalog()['node:'+n]['session']['routable'] for n in ('node1','node2')))
     same=catalog()['environment:'+sandbox.id]
-    assert same['assignment']==new['assignment'] and same['result']['runtime_id']==old_runtime
+    assert same['assignment']==new['assignment'] and runtime_id(same['result'])==old_runtime
     assert command('cat /tmp/counter.pid')==saved_pid
     passed(4,generation=same['assignment']['generation'],runtime_id=old_runtime)
     sandbox.kill();sandbox.close();sandbox=None
