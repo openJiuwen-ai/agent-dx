@@ -42,7 +42,7 @@
 
 | 门禁 | 场景 | 通过条件 | 当前状态 |
 |---|---|---|---|
-| NM-01 | 心跳期限内进程重启 | 新 session 完成权威对账并保留有效 backend；对账完成前不准入 | 已有本地 E2E |
+| NM-01 | 心跳期限内进程重启 | 新 session 完成权威对账并保留有效 backend；对账完成前不准入 | 已有本地 E2E；[Full #55](https://buildkite.com/agent-dx/agent-dx-full-test/builds/55) 在双物理 worker 上同时重启 Coordinator 与 node2 Adxlet，记录 node2 PID 110→202、session 更换、Coordinator epoch 1→2，原归属及 backend 不变，公开 SDK 查询、命令、文件和清理通过；本次未单独注入对账期间的新准入请求 |
 | NM-02 | 超过心跳期限后进程返回 | 旧实例已经失效；返回节点清理旧执行与绑定后才重新准入 | 已有本地 E2E |
 | NM-03 | 对账期间再次崩溃 | 再次启动继续从 Redis 权威状态收敛，不复活旧 generation | 已有中断物理清理后新 adxlet 重读 inventory、重复幂等删除并保持准入关闭的组件测试；[Full #43](https://buildkite.com/agent-dx/agent-dx-full-test/builds/43) 在双物理 worker 真实注入失联、runc init 暂挂、对账中 Adxlet 崩溃，随后验证换 session、清理旧 backend 再准入 |
 | NODE-01 | 节点故障且无 checkpoint | Failed、撤路由，不从镜像冷启动 | 已有组件覆盖；[Full #31](https://buildkite.com/agent-dx/agent-dx-full-test/builds/31) 在双物理 worker 网络隔离期间验证失效和公开入口拒绝。完整三 VM 门禁仍待执行 |
