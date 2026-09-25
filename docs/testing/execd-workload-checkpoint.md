@@ -1,8 +1,12 @@
 # Workload checkpoint validation
 
-`POST /checkpoint` on the Execd Unix socket creates a local recovery point while
-keeping the original runtime alive. It is independent of the reusable Snapshot
-API and the stopping pause operation.
+`POST /checkpoint` on the Execd Unix socket creates a recovery point while
+keeping the original runtime alive. It uses the adxlet checkpoint store: local
+configuration produces a local-only point, while S3 configuration publishes a
+shared point before acknowledging the request. An upload failure is reported to
+the runtime without advertising a local-only point as a successful shared
+checkpoint. The operation is independent of the reusable Snapshot API and the
+stopping pause operation.
 
 Focused regression commands:
 
@@ -18,7 +22,7 @@ error replies and listener rearming after restore. Controller tests cover pendin
 request retirement when execution identity changes.
 
 adxlet tests cover `leave_running=true`, stable execution/route/allocation,
-local artifact registration, commit retry without repeated capture, failure
+configured-store artifact registration, commit retry without repeated capture, failure
 without false success, restart cleanup of an uncommitted capture, and use of the
 new point by failover.
 
