@@ -18,6 +18,8 @@
 | [Base #92](https://buildkite.com/agent-dx/agent-dx/builds/92) | 提交触发路由发布的新包完成构建和 K8s L0；L0/认证 2/2 通过、`cleanup_errors=0`、命名空间删除。产品提交为 `0338b2c8362b476ade3408ae6430e05edc118a60`。 |
 | [Full #63](https://buildkite.com/agent-dx/agent-dx-full-test/builds/63) | 新包的混合负载用例尚未运行：镜像构建通过，但双节点限定生成了 Kubernetes 不接受的单个 `metadata.name In` 多值字段选择器，Pod 创建被拒绝。没有实际节点放置；清理正常。已在测试部署脚本中把每个候选节点改为单值 OR 条件，并用回归用例验证，仍需重新跑 Full。 |
 
+修正后的两个单值 OR 条件还通过了 cn-north-4 Kubernetes API 的 server dry-run（`out/ci/route-event-full63-selector-apiserver.log`），没有创建 Pod。此结果只证明该 API Server 接受清单语法，不证明 Full 测试集群已完成部署或混合负载验收。
+
 上述证据的构建判定、原始日志和验收产物位于 `out/ci/multivm-coverage-0925/`。该目录不随 Git 提交；Buildkite 构建页面保存相应运行产物。
 
 尚待完成：独立一控两工作节点的三 VM 控制面验收；本地 Firecracker 双克隆网络定位；真实 GPU/NPU 设备验收。路由提交到 Ingress 的发布延迟已记录为独立待办，本轮混合负载通过不能将其视为完成。
