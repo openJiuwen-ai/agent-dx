@@ -317,6 +317,11 @@ digest before preflight or service startup. This keeps the product binaries and
 images fixed at the selected artifact commit while allowing a newer test commit
 to repair or extend acceptance logic. `result.json` and `harness.json` record
 both identities. A build number or an unpaired commit is rejected.
+The build summary records the current Full pipeline checkout as `commit`, the
+bundle's verified package commit as `product_commit`, and, when reusing images
+from another build, that image build's checkout as `image_build_commit`. The
+E2E report must identify the current harness and the same product commit as
+the downloaded image bundle.
 
 CI worker prerequisites are changed only by the explicit maintenance mode
 `ADX_K8S_NODE_PREPARE_ONLY=1`. It also requires the exact comma-separated

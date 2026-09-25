@@ -20,7 +20,7 @@ def code(value):
     return '<code>' + html.escape(str(value)) + '</code>'
 
 
-def collect(root, stage, exit_code, commit):
+def collect(root, stage, exit_code, commit, artifact_build=None):
     # Base packaging and Full acceptance are independent Buildkite pipelines.
     # The Full image stage therefore starts its own summary, while the E2E job
     # still consumes and extends the image provenance from its preceding job.
@@ -29,7 +29,10 @@ def collect(root, stage, exit_code, commit):
         previous = 'release'
     result = read(root / 'summaries' / f'{previous}.json') if previous else None
     if result and result['commit'] != commit:
-        raise ValueError('summary belongs to a different commit')
+        if stage != 'e2e' or not artifact_build:
+            raise ValueError('summary belongs to a different commit')
+        result['image_build_commit'] = result['commit']
+        result['commit'] = commit
     if previous and not result and exit_code == 0:
         raise ValueError('previous stage summary missing')
     result = result or {'commit': commit, 'stages': {}}
@@ -59,12 +62,27 @@ def collect(root, stage, exit_code, commit):
         bundle = read(root / 'bundle/bundle.json')
         registry = read(root / 'bundle/registry-images.json')
         if bundle and registry:
+            product_commit = bundle.get('package', {}).get('commit')
+            if product_commit:
+                result['product_commit'] = product_commit
             result['images'] = {'references': registry['references'], 'base_images': bundle['base_images'],
                                 'backend': bundle['backend']['sandboxd_revision'], 'collector': bundle.get('collector')}
         if exit_code == 0 and not result.get('images'):
             raise ValueError('published image references missing')
     elif stage == 'e2e':
         report = read(root / 'acceptance/result.json')
+        bundle = read(root / 'bundle/bundle.json')
+        bundle_commit = (bundle or {}).get('package', {}).get('commit')
+        if bundle_commit:
+            if result.get('product_commit') and result['product_commit'] != bundle_commit:
+                raise ValueError('image summary product commit differs from the image bundle')
+            result['product_commit'] = bundle_commit
+        if report and result.get('product_commit'):
+            harness = report.get('harness') or {}
+            if harness.get('commit') != commit:
+                raise ValueError('acceptance harness commit differs from this build')
+            if harness.get('product_commit') != result['product_commit']:
+                raise ValueError('acceptance product commit differs from the image bundle')
         result['e2e'] = {'report': report, 'placement': read(root / 'acceptance/placement.json') or []}
         result['e2e']['collection'] = {
             node: {kind: read(root / 'acceptance' / node / f'{kind}-{node}.json')
@@ -84,6 +102,11 @@ def collect(root, stage, exit_code, commit):
 def render(result):
     lines = ['## ADX 构建与产物汇总', '', '提交：' + code(result['commit']), '',
              '| 阶段 | 状态 | 完整日志 |', '|---|---|---|']
+    product_commit = result.get('product_commit')
+    if product_commit and product_commit != result['commit']:
+        lines[3:3] = ['产品产物提交：' + code(product_commit), '']
+    if result.get('image_build_commit'):
+        lines[3:3] = ['镜像构建提交：' + code(result['image_build_commit']), '']
     for stage, name in [('release', '编译与发布包'), ('images', '镜像构建与推送'), ('e2e', 'Kubernetes E2E')]:
         state = result['stages'].get(stage)
         if state:
@@ -150,9 +173,9 @@ def main():
     parser.add_argument('--exit-code', type=int, required=True)
     parser.add_argument('--root', type=Path, default=Path('out/buildkite'))
     args = parser.parse_args()
-    commit = (os.environ.get('ADX_E2E_ARTIFACT_COMMIT', os.environ['BUILDKITE_COMMIT'])
-              if args.stage == 'e2e' else os.environ['BUILDKITE_COMMIT'])
-    result = collect(args.root, args.stage, args.exit_code, commit)
+    commit = os.environ['BUILDKITE_COMMIT']
+    result = collect(args.root, args.stage, args.exit_code, commit,
+                     artifact_build=os.environ.get('ADX_E2E_ARTIFACT_BUILD'))
     output = args.root / 'summaries'
     output.mkdir(parents=True, exist_ok=True)
     (output / f'{args.stage}.json').write_text(json.dumps(result, indent=2) + '\n')

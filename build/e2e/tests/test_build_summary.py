@@ -13,6 +13,7 @@ spec = importlib.util.spec_from_file_location('ci_summary', ROOT / '.buildkite/s
 summary = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(summary)
 COMMIT = 'a' * 40
+PRODUCT_COMMIT = 'b' * 40
 
 
 def write(root, name, value):
@@ -22,6 +23,74 @@ def write(root, name, value):
 
 
 class BuildSummaryTests(unittest.TestCase):
+    def test_full_summary_keeps_harness_and_product_commits_distinct(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            write(root, 'bundle/bundle.json', {
+                'package': {'commit': PRODUCT_COMMIT},
+                'base_images': {},
+                'backend': {'sandboxd_revision': 'c' * 40},
+            })
+            write(root, 'bundle/registry-images.json', {'references': {'node': 'node@sha256:' + 'd' * 64}})
+            images = summary.collect(root, 'images', 0, COMMIT)
+            self.assertEqual(images['commit'], COMMIT)
+            self.assertEqual(images['product_commit'], PRODUCT_COMMIT)
+            write(root, 'summaries/images.json', images)
+            report = {
+                'status': 'passed', 'checks': ['redis-pod-restart'],
+                'cleanup_errors': [], 'missing_checks': [], 'error': None,
+                'harness': {'commit': COMMIT, 'product_commit': PRODUCT_COMMIT},
+            }
+            write(root, 'acceptance/result.json', report)
+            final = summary.collect(root, 'e2e', 0, COMMIT)
+            self.assertEqual(final['product_commit'], PRODUCT_COMMIT)
+            self.assertIn(PRODUCT_COMMIT, summary.render(final))
+            process = subprocess.run(
+                [sys.executable, str(ROOT / '.buildkite/summary.py'), '--stage', 'e2e',
+                 '--exit-code', '0', '--root', str(root)],
+                env={**os.environ, 'BUILDKITE_COMMIT': COMMIT,
+                     'ADX_E2E_ARTIFACT_COMMIT': PRODUCT_COMMIT},
+                text=True, capture_output=True,
+            )
+            self.assertEqual(process.returncode, 0, process.stderr)
+            self.assertEqual(json.loads((root / 'summaries/e2e.json').read_text())['commit'], COMMIT)
+            report['harness']['product_commit'] = 'e' * 40
+            write(root, 'acceptance/result.json', report)
+            with self.assertRaisesRegex(ValueError, 'product commit'):
+                summary.collect(root, 'e2e', 0, COMMIT)
+
+    def test_reused_images_record_source_build_without_changing_product_identity(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source_commit = 'c' * 40
+            write(root, 'summaries/images.json', {
+                'commit': source_commit, 'stages': {'images': {'status': 'passed', 'exit_code': 0}},
+                'images': {'references': {}, 'backend': 'd' * 40, 'collector': None},
+            })
+            write(root, 'bundle/bundle.json', {'package': {'commit': PRODUCT_COMMIT}})
+            write(root, 'acceptance/result.json', {
+                'status': 'passed', 'checks': ['redis-pod-restart'],
+                'cleanup_errors': [], 'missing_checks': [], 'error': None,
+                'harness': {'commit': COMMIT, 'product_commit': PRODUCT_COMMIT},
+            })
+            with self.assertRaisesRegex(ValueError, 'different commit'):
+                summary.collect(root, 'e2e', 0, COMMIT)
+            result = summary.collect(root, 'e2e', 0, COMMIT, artifact_build='source-build-id')
+            self.assertEqual(result['commit'], COMMIT)
+            self.assertEqual(result['image_build_commit'], source_commit)
+            self.assertEqual(result['product_commit'], PRODUCT_COMMIT)
+            self.assertIn(source_commit, summary.render(result))
+            process = subprocess.run(
+                [sys.executable, str(ROOT / '.buildkite/summary.py'), '--stage', 'e2e',
+                 '--exit-code', '0', '--root', str(root)],
+                env={**os.environ, 'BUILDKITE_COMMIT': COMMIT,
+                     'ADX_E2E_ARTIFACT_BUILD': 'source-build-id',
+                     'ADX_E2E_ARTIFACT_COMMIT': PRODUCT_COMMIT},
+                text=True, capture_output=True,
+            )
+            self.assertEqual(process.returncode, 0, process.stderr)
+            self.assertEqual(json.loads((root / 'summaries/e2e.json').read_text()), result)
+
     def test_independent_pipeline_summaries_and_actual_placement(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

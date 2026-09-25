@@ -354,7 +354,8 @@ class KubernetesLifecycleTests(unittest.TestCase):
         self.assertIn('ADX_E2E_ARTIFACT_COMMIT',script)
         self.assertIn('--build "$artifact_build"',script)
         self.assertIn('build.env("ADX_E2E_ARTIFACT_BUILD") == null',pipeline)
-        self.assertIn("os.environ.get('ADX_E2E_ARTIFACT_COMMIT'",summary)
+        self.assertIn("commit = os.environ['BUILDKITE_COMMIT']",summary)
+        self.assertIn("harness.get('product_commit')",summary)
 
     def test_targeted_case_uses_fresh_or_reused_images_and_is_reported_separately(self):
         script=(ROOT.parents[1]/'.buildkite/run-e2e.sh').read_text()
