@@ -20,6 +20,14 @@ and `error_code=WAIT_TIMEOUT`; it does not stop the command. `process.kill`
 returns HTTP 200 with `killed=false` for a missing or already exited command.
 An actual signal failure remains an error.
 
+Finished command results are retained for `EXECD_COMMAND_RESULT_TTL_SECS`
+(default 3600). After that, an explicit command ID returns `status=EXPIRED`
+instead of `COMMAND_NOT_FOUND`. A repeated `process.start` with that ID returns
+HTTP 410 `COMMAND_EXPIRED` and cannot run the command again while its tombstone
+is retained. Tombstones are bounded by `EXECD_COMMAND_EXPIRED_MAX_RECORDS`
+(default 4096) and `EXECD_COMMAND_EXPIRED_TTL_SECS` (default 3600); after that
+window, EXECD can no longer distinguish the ID from one never submitted.
+
 Adxlet supplies `ADX_ENVIRONMENT_ID`, `ADX_RUNTIME_ID` and `ADX_OWNERSHIP_GENERATION` through sandboxd. Runtime cooperation uses the same HTTP listener: identity-aware status, checkpoint preparation and confirmed-unstarted abort. See the [HTTP contract](../../api/http/runtime-control.md).
 
 Checkpoint restore validates the new execution identity, refreshes child environment and HTTP credentials, retires inherited connections, and rearms HTTP/tunnel listeners before reporting Running. Missing or stale restored identity leaves the runtime unavailable. Backend handoff uses `/proc/gvisor/checkpoint` or `ADX_CHECKPOINT_HANDOFF_FILE`; the restored environment comes from `/proc/gvisor/spec_environ` or `ADX_ENV_FILE`.

@@ -428,6 +428,13 @@ class Commands:
             try:
                 response = self._client.invoke(self._sid, "process.start", request)
             except SandboxHTTPError as error:
+                if error.status_code == 410 and error.payload.get("error_code") == "COMMAND_EXPIRED":
+                    raise CommandExpired(
+                        str(error.payload.get("error", error)),
+                        sandbox_id=self._sid,
+                        command_id=stable_id,
+                        request_id=error.request_id,
+                    ) from error
                 if error.status_code == 409:
                     raise CommandConflict(
                         str(error.payload.get("error", error)),
@@ -460,6 +467,13 @@ class Commands:
                 ) from error
             if response.get("error"):
                 error_code = str(response.get("error_code", ""))
+                if error_code == "COMMAND_EXPIRED":
+                    raise CommandExpired(
+                        str(response["error"]),
+                        sandbox_id=self._sid,
+                        command_id=stable_id,
+                        request_id=getattr(response, "request_id", None),
+                    )
                 if error_code == "COMMAND_CONFLICT":
                     raise CommandConflict(
                         str(response["error"]),

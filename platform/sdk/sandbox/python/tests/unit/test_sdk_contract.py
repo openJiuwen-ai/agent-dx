@@ -20,6 +20,7 @@ from adx_sandbox import (
 )
 from adx_sandbox.commands import (
     CommandConflict,
+    CommandExpired,
     CommandHandle,
     CommandNotFound,
     CommandSubmissionError,
@@ -834,6 +835,27 @@ class SDKContractTests(unittest.TestCase):
         self.assertEqual(missing.exception.sandbox_id, "sandbox-1")
         self.assertEqual(missing.exception.command_id, "missing-id")
         self.assertEqual(missing.exception.request_id, "request-missing")
+
+    def test_expired_command_cannot_be_started_again(self):
+        class _ExpiredClient(_FakeClient):
+            def invoke(self, sandbox_id, action, args, **kwargs):
+                if action == "process.get":
+                    return {"command_id": args["command_id"], "status": "EXPIRED"}
+                if action == "process.start":
+                    raise SandboxHTTPError(
+                        410, {"error": "command result expired", "error_code": "COMMAND_EXPIRED"},
+                        "command result expired", request_id="request-expired",
+                    )
+                return super().invoke(sandbox_id, action, args, **kwargs)
+
+        commands = Commands(_ExpiredClient(), "sandbox-1")
+        with self.assertRaises(CommandExpired) as lookup:
+            commands.get("expired-id")
+        self.assertEqual(lookup.exception.command_id, "expired-id")
+        with self.assertRaises(CommandExpired) as restarted:
+            commands.run("true", background=True, command_id="expired-id")
+        self.assertEqual(restarted.exception.command_id, "expired-id")
+        self.assertEqual(restarted.exception.request_id, "request-expired")
 
     def test_sandbox_from_id_does_not_create_or_delete_remote(self):
         with patch("adx_sandbox.sandbox_api.SandboxClient", _FakeClient):
