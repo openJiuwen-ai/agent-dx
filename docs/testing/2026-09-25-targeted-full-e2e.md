@@ -30,4 +30,6 @@
 
 AKernel 使用 ADX 后端的当前 E2E 源码有 59 个 `test_` 方法。本轮对源码、逐方法日志及故障 runner 摘要核对后，56 个至少在一个隔离制品上通过；S3 EROFS rootfs 和只读挂载两个用例实跑但在 sandboxd 镜像 daemon 启动阶段失败，未进入文件断言；GPU 可见性用例因 cn-north-4 的五个节点均未上报 GPU/NPU 而跳过。56 项是跨 #97/#100 及定向回归的覆盖数，不是同一最新版一次运行的通过数。ADX 公共 SDK 的 GPU/NPU 真实设备验收入口独立放在 [`build/e2e/device/`](../../build/e2e/device/README.md)，目前只有无硬件的脚本流程检查，不能计为设备验收。
 
+这 59 项仅统计 `unittest` 方法。AKernel runner 还调用 `storage-quota`、`network-policy-matrix`、`custom-image`、`dockerfile` 四组独立示例脚本；它们不能并入 56/59 的方法计数，也不能因未出现在方法清单中而重跑。2026-09-25 的 `remote-full/cases/summary.json` 记录四组均通过，分别耗时 1.466、31.801、2.417、38.559 秒，Redis 审计为 `cluster_clean=true`、`no-new-held`。日志中分别有写满 256 MiB 根文件系统触发 `No space left on device`、网络策略阻断/放行/替换、OCI 镜像启动和 Dockerfile 直接启动的断言结果。这是另一批制品的历史通过证据，仍不能拼接成当前版本一次完整 Full 通过。
+
 两条 S3 用例使用 MinIO 构造测试对象；前台组件探针在 `type=s3` 下读取成功，在当前 sandboxd 使用的 `type=oss` 下报网络错误。该现象只说明当前 MinIO fixture 未验证 OSS 路径，不能据此判断真实 OSS 服务的兼容性。待取得已授权的真实 OSS 测试桶后仅回归这两项；不会为了改变结果重跑整套已通过的功能用例。三小时预算审计量测 6046.697 秒，另对未精确计时的运行保守预留 3960 秒，规划占用 10006.697/10800 秒；这不是历史精确总耗时。明细留在本地 `out/ci/targeted-full-suite-0925/budget-audit.json`，下一次定向运行最多 600 秒。
