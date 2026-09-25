@@ -1,4 +1,4 @@
-"""Lose real Execd command-start replies and recover by stable command ID."""
+"""Inject command start, Watch, and capability faults at the SDK entry."""
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -12,18 +12,20 @@ from urllib.request import HTTPSHandler, ProxyHandler, Request, build_opener
 
 
 class CommandResponseCutProxy:
-    """Forward commands to the real Ingress, then cut successful start replies."""
+    """Forward to real Ingress with configurable command response faults."""
 
     def __init__(self, upstream, *, certificate=None, private_key=None, ca=None,
-                 cut_start=True, reject_watch=False):
+                 cut_start=True, reject_watch=False, strip_watch_capability=False):
         self.upstream = upstream.rstrip('/')
         self.certificate = certificate
         self.private_key = private_key
         self.ca = ca
         self.cut_start = cut_start
         self.reject_watch = reject_watch
+        self.strip_watch_capability = strip_watch_capability
         self.cut_attempts = []
         self.start_attempts = []
+        self.capability_attempts = []
         self.watch_attempts = 0
         self._lock = threading.Lock()
         self._server = None
@@ -77,6 +79,16 @@ class CommandResponseCutProxy:
                 start = None
                 if self.command == 'POST' and self.path.startswith('/direct/'):
                     submitted = json.loads(body)
+                    if submitted.get('action') == 'process.capabilities' and status == 200:
+                        capability_response = json.loads(payload)
+                        with proxy._lock:
+                            proxy.capability_attempts.append(dict(capability_response))
+                        if proxy.strip_watch_capability:
+                            capability_response['capabilities'] = [
+                                capability for capability in capability_response['capabilities']
+                                if capability != 'multiplexed-command-watch'
+                            ]
+                            payload = json.dumps(capability_response).encode()
                     if submitted.get('action') == 'process.start':
                         start = submitted
                         with proxy._lock:

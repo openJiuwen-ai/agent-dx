@@ -19,7 +19,7 @@ import xml.etree.ElementTree as ET
 
 BASIC = ('sdk','auth','capacity','placement','local-first')
 STANDARD = ('sdk','data-plane','lifecycle','auth','capacity','placement','local-first','node-failure','sandboxd-restart','restart','stop')
-OPTIONAL_CASES = ('redis-restart','coordinator-restart','coordinator-adxlet-restart','apiserver-restart','ingress-restart','runtime-affinity','idle-active','relay-standalone','runtime-exit','sandboxd-runtime-loss','sqlite-fallback','create-response-cut','create-unknown-query','command-response-cut','command-watch-unavailable','command-registry-capacity','upload-response-cut','download-response-cut','schedule-deadline','resource-stale','network-partition','reconcile-crash','mixed-soak')
+OPTIONAL_CASES = ('redis-restart','coordinator-restart','coordinator-adxlet-restart','apiserver-restart','ingress-restart','runtime-affinity','idle-active','relay-standalone','runtime-exit','sandboxd-runtime-loss','sqlite-fallback','create-response-cut','create-unknown-query','command-response-cut','command-watch-unavailable','command-unsupported-feature','command-registry-capacity','upload-response-cut','download-response-cut','schedule-deadline','resource-stale','network-partition','reconcile-crash','mixed-soak')
 PROFILES = {
     'l0': ('l0','auth'),
     'standalone': STANDARD,
@@ -387,6 +387,12 @@ class Run:
             with self.case('command-watch-unavailable', checks) as record:
                 output=self.execute('node1','/opt/adx/client/bin/python','-u',
                                     '/opt/adx/e2e/scenarios.py','command-watch-unavailable',timeout=300)
+                record['subcases']=sdk_subcases_from_output(output)
+                for node in self.nodes:self.helper(node,'empty',node)
+        if 'command-unsupported-feature' in selected:
+            with self.case('command-unsupported-feature', checks) as record:
+                output=self.execute('node1','/opt/adx/client/bin/python','-u',
+                                    '/opt/adx/e2e/scenarios.py','command-unsupported-feature',timeout=300)
                 record['subcases']=sdk_subcases_from_output(output)
                 for node in self.nodes:self.helper(node,'empty',node)
         if 'command-registry-capacity' in selected:
