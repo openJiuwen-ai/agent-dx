@@ -113,9 +113,10 @@ def resources(namespace, image, architecture, registry_auth=False, node_names=()
         }
         if node_names:
             spec["affinity"]["nodeAffinity"] = {
-                "requiredDuringSchedulingIgnoredDuringExecution": {"nodeSelectorTerms": [{
-                    "matchFields": [{"key": "metadata.name", "operator": "In", "values": list(node_names)}]
-                }]}}
+                "requiredDuringSchedulingIgnoredDuringExecution": {"nodeSelectorTerms": [
+                    {"matchFields": [{"key": "metadata.name", "operator": "In", "values": [name]}]}
+                    for name in node_names
+                ]}}
         if registry_auth:
             spec['imagePullSecrets'] = [{'name': 'adx-test-registry'}]
             volumes.append({'name': 'registry-auth', 'secret': {'secretName': 'adx-test-registry'}})
