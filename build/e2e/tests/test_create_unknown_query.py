@@ -44,7 +44,7 @@ class CreateUnknownQueryTests(unittest.TestCase):
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         spec = importlib.util.spec_from_file_location(
-            'build.e2e.create_unknown_query', ROOT / 'create_unknown_query.py')
+            'e2e.create_unknown_query', ROOT / 'create_unknown_query.py')
         module = importlib.util.module_from_spec(spec)
         try:
             spec.loader.exec_module(module)
