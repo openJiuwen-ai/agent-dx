@@ -126,6 +126,29 @@ class AcceptanceGateTests(unittest.TestCase):
             self.assertEqual(run.case_results[0]['subcases'][0]['id'],
                              'reliability.create-final-response-cut')
 
+    def test_unknown_query_404_is_targeted_full_case_with_physical_cleanup(self):
+        self.assertEqual(driver.selected_checks('full', 'create-unknown-query'),
+                         ('create-unknown-query',))
+        with tempfile.TemporaryDirectory() as directory:
+            run = driver.Run(Path(directory))
+            run.nodes = ['node1', 'node2']
+            calls = []
+            run.execute = lambda node, *args, **_kwargs: (
+                calls.append(('execute', node, args[-1]))
+                or json.dumps({'cases': [{'id': 'reliability.unknown-query-404-same-create',
+                                          'status': 'passed'}]})
+            )
+            run.helper = lambda node, *args, **_kwargs: calls.append(
+                ('helper', node, args[0]))
+            checks = []
+            run.scenarios(checks, ('create-unknown-query',))
+            self.assertEqual(checks, ['create-unknown-query'])
+            self.assertEqual(calls, [
+                ('execute', 'node1', 'create-unknown-query'),
+                ('helper', 'node1', 'empty'),
+                ('helper', 'node2', 'empty'),
+            ])
+
     def test_resource_stale_closes_admission_until_observer_recovers(self):
         self.assertEqual(driver.selected_checks('full', 'resource-stale'),
                          ('resource-stale',))

@@ -159,10 +159,10 @@ Firecracker checkpoint 使用独立 KVM profile；GPU/NPU 使用具备真实设�
 
 | 层级 | 当前状态 | 主要缺口 |
 |---|---|---|
-| L0 | 独立 `--profile l0` 执行 `l0 + auth`，输出 `required_checks`、逐项 JSON 和 JUnit；Buildkite 基础包 #87 已通过 | 后续提交仍需持续执行门禁 |
+| L0 | 独立 `--profile l0` 执行 `l0 + auth`，输出 `required_checks`、逐项 JSON 和 JUnit；Buildkite 基础包 #92 已通过 | 后续提交仍需持续执行门禁 |
 | Standalone | `--profile standalone` 统一本地 Docker 十一组；安装示例和 Lima FC 各自有严格结果契约 | 需增加汇总清单，把普通 Linux、安装示例和按需 KVM 结果关联到同一 revision |
 | Multi-VM | 三 VM inventory 与结果契约、公开 SDK 放置/数据链路和鉴权、容量队列、Pack/Spread、节点偏好、异构 runtime、local-first、worker 与控制节点故障、旧 session 写隔离、独立 Ingress 重启及有序停机定向用例已提供；`budget.py` 在首次部署前锁定三小时墙钟预算，`suite.py` 跨配置共享预算，`assemble.py` 要求部署与用例全程计时才允许完整通过 | 尚缺生成配置和分发制品的三 VM 部署器；固定 inventory 之前的 VM 准备时间不计入预算；KVM checkpoint 仍有专项缺口；未进行真实三 VM 验收 |
-| Full Deployment | K8s 已支持 `l0`、五组 `k8s-basic` 和十一组 `full`；`full` 强制两个 Pod 位于不同物理 worker | [Full #26](https://buildkite.com/agent-dx/agent-dx-full-test/builds/26) 在不同 worker 同次通过十一组、39 个功能子项、JUnit 47 项和资源清理；异构 runtime、K8s FC 和真实 GPU/NPU 仍需独立环境 |
+| Full Deployment | K8s 已支持 `l0`、五组 `k8s-basic` 和十一组 `full`；`full` 强制两个 Pod 位于不同物理 worker | [Full #26](https://buildkite.com/agent-dx/agent-dx-full-test/builds/26) 在不同 worker 同次通过十一组、39 个功能子项、JUnit 47 项和资源清理；异构 runtime 已由 Full #50 验证，K8s FC 和真实 GPU/NPU 仍需独立环境 |
 
 因此当前可以直接形成 Buildkite 门禁的是 UT、L0、基础 K8s 五组和 Full 十一组。`full` 的同宿主假绿已被
 驱动拒绝；Full #17 已在双 worker 同次通过十一组。Standalone 可作为独立 Linux/KVM
@@ -227,11 +227,12 @@ profile；完整 Multi-VM 在补齐部署器前不能标记为通过。
 | `FD-03` | 已验证 | K8s 基础五组与完整十一组均输出逐项 JUnit、日志、事件和清理证据；Full #17 同次通过十一组 |
 | `FD-04` | 已实现 | Metrics、日志、滚动压缩、Collector 重启与 Trace 父子关系 |
 | `FD-05` | 已验证 | `full` profile 的两个 Pod 必须落在不同物理 worker；Full #6 分别运行于 `10.244.128.124` 和 `10.244.128.160` |
-| `FD-06` | 同 Pod 重启已验证；跨 Pod 用例已实现、待实测 | [Full #18](https://buildkite.com/agent-dx/agent-dx-full-test/builds/18) 定向运行 `redis-restart`：`SIGKILL` 托管 Redis 后由 supervisor 重启，AOF 开启，双节点实例归属和代次、后端 ID、文件及命令保持一致，删除后资源释放。新增 K8s 专用 `redis-pod-restart`：Redis 独立 Pod 与 PVC，两个 worker 继续运行；替换 Redis Pod 后核对新 Pod UID、同一 PVC UID、AOF、归属／代次、后端 ID、公开 SDK 文件与命令及最终资源释放。该用例尚无真实集群结果 |
+| `FD-06` | 同 Pod 与独立 Redis Pod 重启均已验证 | [Full #18](https://buildkite.com/agent-dx/agent-dx-full-test/builds/18) 验证托管 Redis 重启。[Full #48](https://buildkite.com/agent-dx/agent-dx-full-test/builds/48) 验证独立 Redis Pod/PVC 重建：新 Pod UID、原 PVC UID、AOF 恢复、双 worker 原实例归属与 backend 不变，公开 SDK 文件、命令和删除通过 |
 | `FD-07` | 正式 K8s 定向验证通过 | [Full #37](https://buildkite.com/agent-dx/agent-dx-full-test/builds/37)、[#38](https://buildkite.com/agent-dx/agent-dx-full-test/builds/38)、[#27](https://buildkite.com/agent-dx/agent-dx-full-test/builds/27) 分别验证 Coordinator、API Server 与独立 Ingress 重启后原归属／后端和公开 SDK 路由；持续网络分区另见 `FD-08` |
 | `FD-08` | 正式双物理 worker 定向验证通过 | [Full #31](https://buildkite.com/agent-dx/agent-dx-full-test/builds/31) 的 `network-partition` 在 node2 网络命名空间阻断到 Coordinator 的 TCP 流量，防火墙计数非零、心跳失效且旧实例撤路由；隔离期间 node1 继续执行和创建，解除后 node2 清理旧后端再准入。两个 Pod 分别位于 `10.244.128.124` 和 `10.244.128.160` |
 | `FD-09` | 已验证 | [Full #23](https://buildkite.com/agent-dx/agent-dx-full-test/builds/23) 的 `data-plane` 定向用例通过 Host 子域名端口转发：`<instance-id>-18081.example.test` 携带鉴权后到达实例的嵌套路径，缺少 Token 被拒绝；用例 28.859 秒，清理错误为 0 |
-| `FD-10` | 本地及三 VM 定向用例已实现，异构环境未验证 | 两种运行方式均要求两个节点真实上报不同的 sandboxd runtime inventory；通过公开 SDK 请求 `runsc` 且不指定节点，核对唯一支持节点上的归属、物理后端、命令执行和资源释放。镜像构建现可用带 SHA256 和架构校验的可选 `runsc` 二进制，定向部署仅在 node2 启用；实际异构部署尚未运行，不能将 runc-only 负向拒绝测试充当正向亲和证据 |
+| `FD-10` | K8s 异构 runtime 已验证；三 VM 未实机执行 | [Full #50](https://buildkite.com/agent-dx/agent-dx-full-test/builds/50) 在 node1 仅支持 runc、node2 支持 runc/runsc 的双 worker 上，经公开 SDK 不指定节点创建 runsc 实例，核对 node2 归属、实际 runsc 执行、命令和释放；可选 runsc 二进制由摘要及 SHA512 固定。三 VM 定向用例仍待独立环境执行 |
+| `FD-11` | 用例已实现，待正式部署运行 | `create-unknown-query` 经真实 TLS 代理断开首个创建应答；独立公共 SDK 查询暂时返回 404 后放行在途写入，要求 SDK 使用同一 Request ID／名称重试，Redis generation 与物理 backend 唯一，命令和删除通过 |
 | `FD-FC-01` | 条件计划 | KVM worker 的 Firecracker pause/resume/snapshot profile |
 | `FD-XPU-01` | 条件计划 | 真实 GPU/NPU 整卡发现、过滤、分配、释放和故障清理 |
 | `FD-SOAK-01` | Nightly | 创建／执行／删除循环及反复节点故障，持续 1–24 小时无资源增长 |
