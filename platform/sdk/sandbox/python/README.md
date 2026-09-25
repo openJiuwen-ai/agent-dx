@@ -248,16 +248,19 @@ Internal signal/POSIX/runtime SDK APIs are not part of this package or the new E
 
 ## Other create options
 
-Request whole GPUs with `type:model:count`:
+Request one kind of whole device with `type:model:count`:
 
 ```python
 Sandbox(xpu="gpu:l20:1")
 Sandbox(xpu="gpu:h100:2")
 Sandbox(xpu="gpu::1")  # any GPU model
+Sandbox(xpu="npu:ascend910b4:1")
 ```
 
-The SDK currently accepts one whole-device `gpu` request with a positive count.
-An empty model leaves the scheduler to select a model. The public SDK `xpu` parser currently accepts GPU only; internal Environment RPC also supports NPU. Real GPU/NPU execution is a separate pending validation gate.
+The SDK accepts one `gpu` or `npu` request with a positive whole-device count.
+An empty model leaves the scheduler to select a model. Real device execution
+requires a suitable worker and is a separate pending validation gate; see the
+[whole-device acceptance](../../../../build/e2e/device/README.md).
 
 Temporary writable storage is specified in MiB:
 
