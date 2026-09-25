@@ -76,8 +76,19 @@ docker pull "$ADX_COLLECTOR_IMAGE"
 echo "--- :docker: Build node, EXECD and entrypoint fixture images"
 fc_args=()
 runtime_args=()
-if [[ -n ${ADX_E2E_RUNSC_URL:-} ]]; then
-  [[ -z ${ADX_E2E_RUNSC_BIN:-} ]] || { echo 'choose either a local runsc binary or a release URL' >&2; exit 2; }
+runsc_sources=0
+for source in ADX_E2E_RUNSC_IMAGE ADX_E2E_RUNSC_URL ADX_E2E_RUNSC_BIN; do
+  [[ -z ${!source:-} ]] || ((runsc_sources+=1))
+done
+(( runsc_sources <= 1 )) || { echo 'choose one runsc image, release URL, or local binary' >&2; exit 2; }
+if [[ -n ${ADX_E2E_RUNSC_IMAGE:-} ]]; then
+  : "${ADX_E2E_RUNSC_SHA512:?a pinned runsc SHA512 is required for images}"
+  export ADX_E2E_RUNSC_BIN="$PWD/out/buildkite/runtime/runsc"
+  export ADX_E2E_RUNSC_SHA256
+  ADX_E2E_RUNSC_SHA256=$(python3 build/e2e/runsc_image.py \
+    --image "$ADX_E2E_RUNSC_IMAGE" --sha512 "$ADX_E2E_RUNSC_SHA512" \
+    --output "$ADX_E2E_RUNSC_BIN")
+elif [[ -n ${ADX_E2E_RUNSC_URL:-} ]]; then
   : "${ADX_E2E_RUNSC_SHA512:?a pinned runsc SHA512 is required for downloads}"
   [[ $ADX_E2E_RUNSC_URL == https://* && $ADX_E2E_RUNSC_SHA512 =~ ^[0-9a-fA-F]{128}$ ]] || {
     echo 'runsc download requires an HTTPS URL and a 128-digit SHA512' >&2; exit 2;

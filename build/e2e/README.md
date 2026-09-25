@@ -149,8 +149,12 @@ Local Docker reproduction requires access to the same bind-mounted paths as the 
   bundle, pass `--runsc-bin /path/to/native/runsc` to `prepare.py`; its ELF
   architecture is checked against the release and its SHA256 is recorded in
   `bundle.json`. In Buildkite, set `ADX_E2E_RUNSC_BIN` and the independently
-  checked `ADX_E2E_RUNSC_SHA256`, or set an HTTPS `ADX_E2E_RUNSC_URL` and its
-  pinned `ADX_E2E_RUNSC_SHA512` for the image-build step. Select
+  checked `ADX_E2E_RUNSC_SHA256`, set an HTTPS `ADX_E2E_RUNSC_URL` and its
+  pinned `ADX_E2E_RUNSC_SHA512`, or set an immutable
+  `ADX_E2E_RUNSC_IMAGE=registry/repository@sha256:<digest>` and the binary's
+  `ADX_E2E_RUNSC_SHA512`. The image path extracts `/runsc` from a regional OCI
+  image, verifies the binary, and avoids downloading it from GitHub on each CI
+  worker. Set exactly one of the three sources. Select
   `--profile full --case runtime-affinity`; the driver enables `runsc` only
   on node2 and requires live inventory, unpinned SDK creation, physical
   placement, command execution and cleanup. The OCI test image must support
