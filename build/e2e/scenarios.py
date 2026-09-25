@@ -85,6 +85,10 @@ elif sys.argv[1]=='create-unknown-query':
     from create_unknown_query import run
     report=run(connection,image,E/'create-unknown-query-result.json',S)
     print(json.dumps(report),flush=True)
+elif sys.argv[1]=='command-response-cut':
+    from command_response_cut import run
+    report=run(connection,image,E/'command-response-cut-result.json',S)
+    print(json.dumps(report),flush=True)
 elif sys.argv[1]=='schedule-deadline':
     from schedule_deadline import run
     report=run(connection,image,E/'schedule-deadline-result.json',S/'tls/ca.pem')

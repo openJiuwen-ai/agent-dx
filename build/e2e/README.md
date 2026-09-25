@@ -229,6 +229,13 @@ Local Docker reproduction requires access to the same bind-mounted paths as the 
   receives 404. The proxy then completes the original write and releases the
   retry; require one Redis assignment, one physical backend, a working command
   and full cleanup. Select with `--profile full --case create-unknown-query`.
+- `command-response-cut` (targeted unknown command submission): after creating
+  a real runc Sandbox, a TLS proxy forwards each `process.start` to Execd and
+  discards its successful response. The installed SDK must return
+  `CommandSubmissionError` with the stable command and request IDs. A new SDK
+  client recovers the result by command ID; a marker written by the command
+  must appear exactly once. Redis assignment, physical backend and final
+  cleanup are checked. Select with `--profile full --case command-response-cut`.
 - `schedule-deadline` (targeted center-queue timeout): require both workers to
   advertise only runc, request runsc on node1 with a three-second schedule
   timeout, observe the request in the admin queue, and require an outcome-unknown

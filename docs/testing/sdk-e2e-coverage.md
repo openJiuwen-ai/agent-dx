@@ -65,7 +65,7 @@ upstream，并校验响应体和路径。该项不是客户端序列化单测。
 |---|---|
 | `SandboxNotFound`、`PermissionDenied` | 已覆盖 |
 | `CommandConflict`、`CommandNotFound`、等待超时返回 `RUNNING`／`WAIT_TIMEOUT`、重复 kill 返回 `False` | SDK 单测覆盖；端到端覆盖以对应运行记录为准 |
-| `CommandSubmissionError` | 需要真实“请求已到 Execd、响应被切断”故障注入 |
+| `CommandSubmissionError` | 已增加 `command-response-cut` 定向 Full 用例：真实 `process.start` 成功应答被 TLS 代理切断，新 SDK 客户端以稳定命令 ID 查询结果并检查副作用仅一次；正式部署运行待完成 |
 | `CommandUnavailable` | 需要 command watch 中断且查询暂不可用的故障注入 |
 | `CommandExpired` | 需要可配置结果保留期及过期清理场景 |
 | `UnsupportedFeature` | 需要旧／不完整 Execd capability fixture，不进入基础门禁 |
