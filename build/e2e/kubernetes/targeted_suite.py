@@ -92,8 +92,9 @@ def run_suite(cases, output, shared_args, budget_seconds, *, execute=execute_cas
             stopped = True
             break
         destination = output / case
-        destination.mkdir()
-        log = destination / 'case.log'
+        # The child owns creation of its output directory and rejects one that
+        # already exists. Keep the streaming log beside it until it exits.
+        log = output / (case + '.log')
         timeout = min(case_timeout_seconds, remaining - CLEANUP_RESERVE_SECONDS)
         command = [sys.executable, '-u', str(HERE / 'run.py'), *shared_args,
                    '--profile', 'full', '--case', case, '--output', str(destination)]
@@ -103,6 +104,9 @@ def run_suite(cases, output, shared_args, budget_seconds, *, execute=execute_cas
         except Exception as error:
             exit_code, timed_out = 1, False
             errors.append(f'{case}: driver failed: {type(error).__name__}: {error}')
+        destination.mkdir(exist_ok=True)
+        if log.is_file():
+            log.replace(destination / 'case.log')
         child = _read_json(destination / 'result.json')
         if not isinstance(child, dict):
             child = None
