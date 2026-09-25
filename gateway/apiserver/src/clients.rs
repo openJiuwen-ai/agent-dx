@@ -10,7 +10,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::Mutex;
-use tonic::{Response, Status};
+use tonic::{Code, Response, Status};
 
 pub struct Clients {
     pub config: Config,
@@ -333,6 +333,13 @@ impl Clients {
         self.put_owner(v.clone()).await?;
         Ok(v)
     }
+    pub async fn visible_environments(
+        &self,
+        caller: &pb::CallerContext,
+    ) -> Result<Vec<pb::GetEnvironmentResponse>, Status> {
+        let entries = self.environments.lock().await.list()?;
+        filter_visible(entries, caller)
+    }
     pub async fn put_owner(&self, value: pb::GetEnvironmentResponse) -> Result<(), Status> {
         self.environments.lock().await.put(value)
     }
@@ -367,4 +374,64 @@ pub fn authorize(
         ));
     }
     Ok(())
+}
+
+fn filter_visible(
+    entries: Vec<pb::GetEnvironmentResponse>,
+    caller: &pb::CallerContext,
+) -> Result<Vec<pb::GetEnvironmentResponse>, Status> {
+    let mut visible = Vec::new();
+    for entry in entries {
+        match authorize(caller, entry.record.as_ref()) {
+            Ok(()) => visible.push(entry),
+            Err(error) if error.code() == Code::PermissionDenied => (),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(visible)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn owned(id: &str, tenant: &str) -> pb::GetEnvironmentResponse {
+        pb::GetEnvironmentResponse {
+            record: Some(pb::EnvironmentRecord {
+                spec: Some(pb::EnvironmentSpec {
+                    id: id.into(),
+                    tenant_id: tenant.into(),
+                    ..Default::default()
+                }),
+                assignment: Some(pb::Assignment {
+                    environment_id: id.into(),
+                    node_id: "node".into(),
+                    generation: 1,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn list_excludes_other_tenants_and_administrator_sees_all() {
+        let entries = vec![owned("one", "tenant-one"), owned("two", "tenant-two")];
+        let tenant = pb::CallerContext {
+            tenant_id: "tenant-one".into(),
+            ..Default::default()
+        };
+        let listed = filter_visible(entries.clone(), &tenant).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0].record.as_ref().unwrap().spec.as_ref().unwrap().id,
+            "one"
+        );
+        let admin = pb::CallerContext {
+            administrator: true,
+            ..tenant
+        };
+        assert_eq!(filter_visible(entries, &admin).unwrap().len(), 2);
+    }
 }

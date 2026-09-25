@@ -88,6 +88,15 @@ impl EnvironmentDirectory {
             .ok_or_else(|| Status::not_found("instance not found"))
     }
 
+    pub fn list(&self) -> Result<Vec<pb::GetEnvironmentResponse>, Status> {
+        if self.epoch.is_none() {
+            return Err(Status::unavailable(
+                "environment directory not synchronized",
+            ));
+        }
+        Ok(self.entries.values().cloned().collect())
+    }
+
     pub fn put(&mut self, value: pb::GetEnvironmentResponse) -> Result<(), Status> {
         let published = pb::PublishedEnvironment {
             record: value.record,
@@ -294,5 +303,49 @@ mod tests {
         let record = directory.get("one").unwrap().record.unwrap();
         assert_eq!(record.assignment.unwrap().generation, 2);
         assert_eq!(record.revision, 4);
+    }
+
+    #[test]
+    fn synchronized_list_uses_the_current_directory_only() {
+        let mut directory = EnvironmentDirectory::default();
+        assert_eq!(
+            directory.list().unwrap_err().code(),
+            tonic::Code::Unavailable
+        );
+        directory
+            .update(frame(
+                7,
+                10,
+                0,
+                true,
+                vec![entry("two", 1, 1), entry("one", 1, 1)],
+                vec![],
+            ))
+            .unwrap();
+        let listed = directory.list().unwrap();
+        let ids: Vec<_> = listed
+            .iter()
+            .map(|value| {
+                value
+                    .record
+                    .as_ref()
+                    .unwrap()
+                    .spec
+                    .as_ref()
+                    .unwrap()
+                    .id
+                    .as_str()
+            })
+            .collect();
+        assert_eq!(ids, ["one", "two"]);
+        directory
+            .update(frame(7, 11, 10, false, vec![], vec!["one"]))
+            .unwrap();
+        assert_eq!(directory.list().unwrap().len(), 1);
+        directory.clear();
+        assert_eq!(
+            directory.list().unwrap_err().code(),
+            tonic::Code::Unavailable
+        );
     }
 }

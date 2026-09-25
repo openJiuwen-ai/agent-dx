@@ -163,24 +163,23 @@ paths:
   /api/instances:
     get:
       tags: [Sandboxes]
-      operationId: getSandbox
-      summary: Read the current execution view for one Sandbox
+      operationId: listSandboxes
+      summary: List caller-visible Sandboxes, or inspect one by ID
+      description: Returns the synchronized in-memory directory. Without instance_id, only instances belonging to the caller's tenant are listed; administrators can see every tenant. Tombstones are omitted.
       parameters:
         - name: instance_id
           in: query
-          required: true
+          required: false
           schema:
             type: string
             minLength: 1
       responses:
         "200":
-          description: Single-item compatibility array containing the Sandbox view.
+          description: Array of Sandbox views. With instance_id, contains exactly one view.
           content:
             application/json:
               schema:
                 type: array
-                minItems: 1
-                maxItems: 1
                 items:
                   $ref: "#/components/schemas/InstanceView"
         "4XX":
