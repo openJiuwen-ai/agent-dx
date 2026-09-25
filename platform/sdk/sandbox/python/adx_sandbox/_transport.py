@@ -74,9 +74,16 @@ class SandboxNotFound(SandboxError):
 
 
 class PermissionDenied(SandboxError):
-    def __init__(self, sandbox_id: str, message: Optional[str] = None):
+    def __init__(
+        self,
+        sandbox_id: str,
+        message: Optional[str] = None,
+        *,
+        request_id: Optional[str] = None,
+    ):
         super().__init__(
             message or f"permission denied for sandbox {sandbox_id}",
+            request_id=request_id,
             code="PERMISSION_DENIED",
             retry="never",
             outcome="not_started",
@@ -474,6 +481,8 @@ class SandboxClient:
                 # Treat 404 as a successful idempotent teardown.
                 if resp.status_code in (200, 202, 204, 404):
                     return
+                if resp.status_code == 403:
+                    raise PermissionDenied(sandbox_id, request_id=request_id)
                 if resp.status_code not in _RETRYABLE_GATEWAY_STATUS_CODES:
                     raise self._http_error(resp, request_id=request_id)
                 error = self._http_error(resp, request_id=request_id)

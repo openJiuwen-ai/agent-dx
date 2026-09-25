@@ -203,6 +203,9 @@ attempt rules intentionally differ by operation:
   stable name from that identity, so another API Server replica receives the
   same Environment ID. An uncertain result must still be queried or retried with
   the same identity.
+- `Sandbox.delete()` treats HTTP 404 as an idempotent success. HTTP 403 raises
+  `PermissionDenied` with the request ID and is not retried; transient transport
+  or gateway failures retain one request ID across bounded retries.
 
 Structured server failures raise `SandboxHTTPError`, whose `code`, `retry`,
 `outcome`, `request_id`, `operation_id`, and `instance_id` fields implement the

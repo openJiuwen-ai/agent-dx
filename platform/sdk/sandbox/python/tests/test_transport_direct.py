@@ -28,6 +28,7 @@ os.environ.setdefault("ADX_SERVER_ADDRESS", "frontend:8889")
 os.environ.setdefault("ADX_TOKEN", "test-token")
 
 from adx_sandbox._transport import (  # noqa: E402
+    PermissionDenied,
     SandboxClient,
     SandboxError,
     SandboxHTTPError,
@@ -587,6 +588,28 @@ def test_delete_does_not_retry_non_transient_http_error():
 
     _check(len(attempts) == 1, f"non-transient delete was retried: {attempts}")
     print("ok: delete does not retry non-transient HTTP errors")
+
+
+def test_delete_403_raises_permission_denied_without_retry():
+    attempts = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(request.headers.get("X-Request-Id"))
+        return httpx.Response(
+            403,
+            json={"error": {"code": "PERMISSION_DENIED", "message": "other tenant"}},
+        )
+
+    c = _make_client(handler)
+    try:
+        c.delete("default-other-tenant")
+    except PermissionDenied as error:
+        _check(error.sandbox_id == "default-other-tenant", "wrong denied sandbox")
+        _check(error.request_id == attempts[0], "permission denial lost request id")
+    else:
+        raise AssertionError("cross-tenant delete must raise PermissionDenied")
+
+    _check(len(attempts) == 1, f"permission denial was retried: {attempts}")
 
 
 def test_delete_transport_retries_are_bounded_and_contextual():
@@ -1976,6 +1999,10 @@ if __name__ == "__main__":
     test_sandbox_create_timeout_validation()
     test_pause_and_resume_retry_with_one_internal_request_id_per_call()
     test_pause_rejects_snapshot_identity_not_owned_by_internal_request()
+    test_delete_retries_transport_and_gateway_failures_with_stable_request_id()
+    test_delete_does_not_retry_non_transient_http_error()
+    test_delete_403_raises_permission_denied_without_retry()
+    test_delete_transport_retries_are_bounded_and_contextual()
     test_direct_success_no_fallback()
     test_direct_503_retries_with_same_request_id()
     test_direct_read_timeout_retries_with_same_request_id()
