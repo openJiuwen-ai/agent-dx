@@ -4,7 +4,7 @@
     "title": "系统错误、超时与故障可靠性门禁",
     "stage": "13",
     "status": "pending",
-    "detail": "已修正local-first预算边界、中心队列独立超时和sandboxd晚启动等待；稳定错误映射及SDK同身份重试已有组件门禁。Full #17验证sandboxd daemon重启；Full #42验证真实TLS代理断流，#40验证资源采集过期，#43验证对账中断重启，#31验证双物理worker网络隔离。Full #46验证Redis PVC和AOF恢复后发现Coordinator无法解除写入恢复状态，删除返回503；已补真实Redis回归用例，正式制品E2E复验待执行。完整三VM故障门禁和FC专项仍待补齐。",
+    "detail": "已修正local-first预算边界、中心队列独立超时和sandboxd晚启动等待；稳定错误映射及SDK同身份重试已有组件门禁。Full #17验证sandboxd daemon重启；Full #42验证真实TLS代理断流，#40验证资源采集过期，#43验证对账中断重启，#31验证双物理worker网络隔离。Full #46验证Redis PVC和AOF恢复后发现Coordinator无法解除写入恢复状态，删除返回503；提交0b936fd补真实Redis回归用例且22项RPC通过，基础包#91的构建及K8s L0通过；正式制品的Redis故障E2E复验待执行。完整三VM故障门禁和FC专项仍待补齐。",
     "gate": "ERR-01..04、TIME-01..05、SD-01..04、NM-01..03和NODE-01..04按system-reliability-gates.md完成对应拓扑E2E并保存客户端、Redis、路由和物理backend证据。"
   },
   {
@@ -12,7 +12,7 @@
     "title": "L0 独立 Buildkite 门禁证据",
     "stage": "7",
     "status": "complete",
-    "detail": "Buildkite基础包#90在提交7551acb4上通过独立l0 profile；required_checks为l0和auth，均passed，missing_checks和cleanup_errors均为空，逐项JUnit和制品身份已保存。",
+    "detail": "Buildkite基础包#91在提交0b936fd8上通过独立l0 profile；required_checks为l0和auth，均passed，missing_checks和cleanup_errors均为空，逐项结果及制品身份已保存。",
     "gate": "提交当前驱动后运行 L0，确认公共 SDK、认证、清理及制品身份全部通过并上传证据。"
   },
   {
