@@ -240,6 +240,7 @@ profile；完整 Multi-VM 在补齐部署器前不能标记为通过。
 | `FD-16` | 用例已实现，待正式部署运行 | `download-response-cut` 在文件下载的首个 200 应答仅发送部分字节后断开，要求 SDK 保留 `.part` 并使用实际已写入偏移的 Range 续传；最终 SHA256 一致，归属／backend 不变且最终清理完成 |
 | `FD-17` | 用例已实现，待正式部署运行 | `command-watch-unavailable` 仅拒绝真实命令 Watch 握手，HTTP 查询保持可用；SDK 重连预算耗尽后返回 `CommandUnavailable` 和原 Sandbox／命令 ID，新客户端查询并终止同一命令，确认未重复启动、归属／backend 不变及最终清理完成 |
 | `FD-18` | 用例已实现，待正式部署运行 | `command-unsupported-feature` 从真实 Execd capability 应答移除 Watch 能力，要求 SDK 返回 `UnsupportedFeature` 且没有发出 `process.start`；健康客户端以相同命令 ID 执行一次，归属／backend 不变且最终清理完成 |
+| `FD-19` | 用例已接入，当前产品语义预期红灯 | `command-expiry` 只在 node1 配置一秒 Execd 结果 TTL；从未存在的 ID 必须返回 `CommandNotFound`，终态记录到期必须返回 `CommandExpired`，同时保持原归属／backend 并完成清理。现有 Execd 对过期记录仅返回 `COMMAND_NOT_FOUND`，待产品修复后再执行正式回归，不进入默认门禁 |
 | `FD-FC-01` | 条件计划 | KVM worker 的 Firecracker pause/resume/snapshot profile |
 | `FD-XPU-01` | 条件计划 | 真实 GPU/NPU 整卡发现、过滤、分配、释放和故障清理 |
 | `FD-SOAK-01` | Nightly | 创建／执行／删除循环及反复节点故障，持续 1–24 小时无资源增长 |

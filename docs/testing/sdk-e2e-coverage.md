@@ -72,7 +72,7 @@ upstream，并校验响应体和路径。该项不是客户端序列化单测。
 | `CommandConflict`、`CommandNotFound`、等待超时返回 `RUNNING`／`WAIT_TIMEOUT`、重复 kill 返回 `False` | SDK 单测覆盖；端到端覆盖以对应运行记录为准 |
 | `CommandSubmissionError` | 已增加 `command-response-cut` 定向 Full 用例：真实 `process.start` 成功应答被 TLS 代理切断，新 SDK 客户端以稳定命令 ID 查询结果并检查副作用仅一次；正式部署运行待完成 |
 | `CommandUnavailable` | 已增加 `command-watch-unavailable` 定向 Full 用例：仅拒绝真实 Watch 握手、保留 HTTP 查询，30 秒重连预算耗尽后 SDK 返回原 Sandbox／命令 ID；新客户端查询并终止同一命令，归属、后端和清理受检。用例已实现，正式部署运行待完成；Watch 与查询同时不可用仍待覆盖 |
-| `CommandExpired` | Execd 已支持配置结果 TTL，但过期后删除记录并返回 `COMMAND_NOT_FOUND`，当前 SDK 只能映射为 `CommandNotFound`；若要求区分过期，须先补 Execd 过期语义及对应 E2E |
+| `CommandExpired` | 已增加独立 `command-expiry` Full 用例，以一秒结果 TTL 区分从未存在的命令与终态过期命令；当前 Execd 清理后返回 `COMMAND_NOT_FOUND`，因此此用例预期红灯且不在默认门禁。后续需补 Execd 过期语义、SDK 映射并实跑回归 |
 | `UnsupportedFeature` | 已增加 `command-unsupported-feature` 定向 Full 用例：真实 Execd 的 capability 应答由 TLS 代理删去 Watch 能力，SDK 须在 `process.start` 前拒绝；健康客户端再以相同命令 ID 成功执行。用例已实现，正式部署运行待完成；真实旧版 Execd 的兼容部署另行验证 |
 | `ResourceExhausted` | 已增加 `command-registry-capacity` 定向 Full 用例：node1 Execd 的 registry 上限设为 1，运行中的命令占满后第二个稳定命令 ID 被拒，释放后以原 ID 成功且副作用一次；正式部署运行待完成。实例容量排队不替代此用例 |
 

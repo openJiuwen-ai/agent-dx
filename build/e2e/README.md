@@ -249,6 +249,13 @@ Local Docker reproduction requires access to the same bind-mounted paths as the 
   A fresh healthy client then starts the same command ID exactly once, and
   Redis assignment, backend and cleanup are checked. Select with
   `--profile full --case command-unsupported-feature`.
+- `command-expiry` (known red until the expired-result contract is implemented):
+  node1's Execd uses a one-second command-result TTL. The installed SDK must
+  distinguish a never-seen command (`CommandNotFound`) from a completed command
+  whose record expired (`CommandExpired`), then prove the Sandbox still runs and
+  cleans up. Execd currently deletes the expired record and reports
+  `COMMAND_NOT_FOUND`, so this targeted case is not a passing gate yet. Select
+  with `--profile full --case command-expiry` when working on that contract.
 - `sqlite-node-restart` (targeted compound outage): after an idle deletion is
   durably pending in node1's SQLite journal while Coordinator is suspended,
   restart node1's Adxlet before resuming Coordinator. Require a new process

@@ -19,7 +19,7 @@ import xml.etree.ElementTree as ET
 
 BASIC = ('sdk','auth','capacity','placement','local-first')
 STANDARD = ('sdk','data-plane','lifecycle','auth','capacity','placement','local-first','node-failure','sandboxd-restart','restart','stop')
-OPTIONAL_CASES = ('redis-restart','coordinator-restart','coordinator-adxlet-restart','apiserver-restart','ingress-restart','runtime-affinity','idle-active','relay-standalone','runtime-exit','sandboxd-runtime-loss','sqlite-fallback','sqlite-node-restart','create-response-cut','create-unknown-query','command-response-cut','command-watch-unavailable','command-unsupported-feature','command-registry-capacity','upload-response-cut','download-response-cut','schedule-deadline','resource-stale','network-partition','reconcile-crash','mixed-soak')
+OPTIONAL_CASES = ('redis-restart','coordinator-restart','coordinator-adxlet-restart','apiserver-restart','ingress-restart','runtime-affinity','idle-active','relay-standalone','runtime-exit','sandboxd-runtime-loss','sqlite-fallback','sqlite-node-restart','create-response-cut','create-unknown-query','command-response-cut','command-watch-unavailable','command-unsupported-feature','command-registry-capacity','command-expiry','upload-response-cut','download-response-cut','schedule-deadline','resource-stale','network-partition','reconcile-crash','mixed-soak')
 PROFILES = {
     'l0': ('l0','auth'),
     'standalone': STANDARD,
@@ -53,6 +53,8 @@ def setup_environment(selected_case):
         return ('ADX_E2E_RUNSC_NODE=node2',)
     if selected_case == 'command-registry-capacity':
         return ('ADX_E2E_COMMAND_REGISTRY_MAX_RECORDS=1',)
+    if selected_case == 'command-expiry':
+        return ('ADX_E2E_COMMAND_RESULT_TTL_SECS=1',)
     return ()
 
 def sha(path):
@@ -415,6 +417,12 @@ class Run:
             with self.case('command-registry-capacity', checks) as record:
                 output=self.execute('node1','/opt/adx/client/bin/python','-u',
                                     '/opt/adx/e2e/scenarios.py','command-registry-capacity',timeout=240)
+                record['subcases']=sdk_subcases_from_output(output)
+                for node in self.nodes:self.helper(node,'empty',node)
+        if 'command-expiry' in selected:
+            with self.case('command-expiry', checks) as record:
+                output=self.execute('node1','/opt/adx/client/bin/python','-u',
+                                    '/opt/adx/e2e/scenarios.py','command-expiry',timeout=240)
                 record['subcases']=sdk_subcases_from_output(output)
                 for node in self.nodes:self.helper(node,'empty',node)
         if 'upload-response-cut' in selected:

@@ -255,6 +255,32 @@ class AcceptanceGateTests(unittest.TestCase):
                 ('helper', 'node2', 'empty'),
             ])
 
+    def test_command_expiry_is_isolated_to_targeted_full_case(self):
+        self.assertEqual(driver.selected_checks('full', 'command-expiry'),
+                         ('command-expiry',))
+        self.assertEqual(driver.setup_environment('command-expiry'),
+                         ('ADX_E2E_COMMAND_RESULT_TTL_SECS=1',))
+        self.assertEqual(driver.setup_environment('sdk'), ())
+        with tempfile.TemporaryDirectory() as directory:
+            run = driver.Run(Path(directory))
+            run.nodes = ['node1', 'node2']
+            calls = []
+            run.execute = lambda node, *args, **_kwargs: (
+                calls.append(('execute', node, args[-1]))
+                or json.dumps({'cases': [{'id': 'command.expired-result',
+                                          'status': 'passed'}]})
+            )
+            run.helper = lambda node, *args, **_kwargs: calls.append(
+                ('helper', node, args[0]))
+            checks = []
+            run.scenarios(checks, ('command-expiry',))
+            self.assertEqual(checks, ['command-expiry'])
+            self.assertEqual(calls, [
+                ('execute', 'node1', 'command-expiry'),
+                ('helper', 'node1', 'empty'),
+                ('helper', 'node2', 'empty'),
+            ])
+
     def test_upload_response_cut_is_targeted_full_case_with_physical_cleanup(self):
         self.assertEqual(driver.selected_checks('full', 'upload-response-cut'),
                          ('upload-response-cut',))
