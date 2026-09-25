@@ -21,6 +21,23 @@ def _wait(predicate, seconds=90):
     raise TimeoutError('sandboxd runtime-loss result did not converge')
 
 
+def _attach_after_restart(instance_id, connection, seconds=5):
+    """Bound the API Server directory lag after Redis reports Running."""
+    deadline = time.monotonic() + seconds
+    while True:
+        try:
+            return Sandbox.from_id(instance_id, connection=connection)
+        except RuntimeError as error:
+            if str(error) != f'sandbox {instance_id} is not running: failed':
+                raise
+            if time.monotonic() >= deadline:
+                raise AssertionError(
+                    'Redis reports the restarted sandbox Running, but API Server '
+                    f'still reports Failed after {seconds}s: {instance_id}'
+                ) from error
+            time.sleep(.2)
+
+
 def create(connection, image, evidence, policy):
     assert policy in ('never', 'restart'), policy
     options = {}
@@ -86,14 +103,17 @@ def verify(connection, evidence, secrets, policy):
             assert record['assignment'] == before['assignment']
             backends = labeled_backend(instance_id)
             assert len(backends) == 1 and backends[0] != before['backend_id'], backends
-            sandbox = Sandbox.from_id(instance_id, connection=connection)
+            visibility_started = time.monotonic()
+            sandbox = _attach_after_restart(instance_id, connection)
+            api_visibility_seconds = round(time.monotonic() - visibility_started, 3)
             try:
                 command = sandbox.commands.run('printf after-daemon-loss')
                 assert command.exit_code == 0 and command.stdout == 'after-daemon-loss'
             finally:
                 sandbox.close()
             case_id = 'reliability.daemon-loss-restart'
-            extra = {'backend_id': backends[0], 'restart_attempts': 1}
+            extra = {'backend_id': backends[0], 'restart_attempts': 1,
+                     'api_visibility_seconds': api_visibility_seconds}
         Sandbox.delete(instance_id, connection=connection)
         deleted = True
         _wait(lambda: (
