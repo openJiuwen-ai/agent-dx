@@ -43,7 +43,7 @@ if registry_auth.exists(): (R/'registry_auths.json').write_bytes(registry_auth.r
 (R/'config.toml').write_text(f'''rootDir = "{R}/root"
 storeDir = "{R}/store"
 [plugin.network]
-ip_range = "10.231.{16 if node=='node1' else 32}.0/20"
+ip_range = "10.231.{16 if node=='node1' else 32}.1/20"
 nat_backend = "iptables"
 enable_local_dnat = true
 enable_network_acl = true

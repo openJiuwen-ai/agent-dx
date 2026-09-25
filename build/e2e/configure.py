@@ -9,6 +9,7 @@ import socket
 import subprocess
 import re
 from cgroup_limits import v2_directory
+from network_config import sandboxd_gateway_range
 
 
 def parse_args():
@@ -53,7 +54,7 @@ if registry_auth.exists(): (R/'registry_auths.json').write_bytes(registry_auth.r
 (R/'config.toml').write_text(f'''rootDir = "{R}/root"
 storeDir = "{R}/store"
 [plugin.network]
-ip_range = "10.231.{16 if node=='node1' else 32}.0/20"
+ip_range = "{sandboxd_gateway_range(node)}"
 nat_backend = "iptables"
 enable_local_dnat = true
 enable_network_acl = true
