@@ -7,10 +7,11 @@ import uuid
 from command_response_cut import CommandResponseCutProxy
 
 
-def run(connection, image, output, secrets):
+def run(connection, image, output, secrets, *, query_unavailable=False):
     from adx_sandbox import (
         CommandStatus, CommandUnavailable, ConnectionConfig, Sandbox,
     )
+    from adx_sandbox._transport import SandboxHTTPError
     from functional_lifecycle import _wait_deleted
     from node import catalog, labeled_backend
 
@@ -26,6 +27,7 @@ def run(connection, image, output, secrets):
         'https://127.0.0.1:8443', certificate=secrets / 'tls/ingress.pem',
         private_key=secrets / 'tls/ingress.key', ca=secrets / 'tls/ca.pem',
         cut_start=False, reject_watch=True,
+        reject_get_on_watch=query_unavailable,
     )
     try:
         sandbox = Sandbox(
@@ -56,7 +58,16 @@ def run(connection, image, output, secrets):
                 assert 'command watch unavailable' in str(error), error
             else:
                 raise AssertionError('SDK did not report the exhausted Watch reconnect budget')
-            assert handle.poll() == CommandStatus.RUNNING
+            if query_unavailable:
+                try:
+                    handle.poll()
+                except SandboxHTTPError as error:
+                    assert error.status_code == 503, error
+                else:
+                    raise AssertionError('command query remained available after Watch outage')
+                assert proxy.rejected_get_attempts > 0
+            else:
+                assert handle.poll() == CommandStatus.RUNNING
             assert proxy.watch_attempts > 0, proxy.watch_attempts
             assert len(proxy.start_attempts) == 1, proxy.start_attempts
             assert proxy.start_attempts[0]['command_id'] == command_id
@@ -85,11 +96,14 @@ def run(connection, image, output, secrets):
 
         report['status'] = 'passed'
         report['cases'].append({
-            'id': 'reliability.command-watch-unavailable', 'status': 'passed',
+            'id': ('reliability.command-watch-query-unavailable'
+                   if query_unavailable else 'reliability.command-watch-unavailable'),
+            'status': 'passed',
             'seconds': round(time.monotonic() - started, 3),
             'instance_id': sandbox.id,
             'command_id': command_id,
             'watch_attempts': proxy.watch_attempts,
+            'rejected_get_attempts': proxy.rejected_get_attempts,
             'start_attempts': len(proxy.start_attempts),
             'backend': backend[0],
         })
@@ -112,5 +126,6 @@ def run(connection, image, output, secrets):
         if report['cleanup_errors']:
             report['status'] = 'failed'
         report['watch_attempts'] = proxy.watch_attempts
+        report['rejected_get_attempts'] = proxy.rejected_get_attempts
         report['start_attempts'] = proxy.start_attempts
         output.write_text(json.dumps(report, indent=2) + '\n')

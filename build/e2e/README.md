@@ -243,6 +243,12 @@ Local Docker reproduction requires access to the same bind-mounted paths as the 
   finds and terminates that same command. Redis generation, physical backend
   and final cleanup are checked. Select with
   `--profile full --case command-watch-unavailable`.
+- `command-watch-query-unavailable` (targeted observation and query outage):
+  after the real command starts, the TLS proxy rejects both Watch and
+  `process.get`. The SDK retains the stable command identity while observation
+  fails; a fresh healthy client finds and terminates the same command. Redis
+  generation, physical backend and cleanup are checked. Select with
+  `--profile full --case command-watch-query-unavailable`.
 - `command-unsupported-feature` (targeted capability negotiation): a TLS proxy
   removes the Watch capability from Execd's real capability response. The
   installed SDK must return `UnsupportedFeature` before sending `process.start`.

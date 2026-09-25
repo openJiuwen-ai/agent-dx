@@ -120,6 +120,55 @@ class CommandResponseCutTests(unittest.TestCase):
             upstream.server_close()
             thread.join(timeout=2)
 
+    def test_query_can_fail_after_command_start_while_watch_is_unavailable(self):
+        class Upstream(BaseHTTPRequestHandler):
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+                payload = json.dumps({'status': 'RUNNING'} if body['action'] == 'process.get'
+                                     else {'pid': 42}).encode()
+                self.send_response(200)
+                self.send_header('Content-Length', str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *_args):
+                pass
+
+        upstream = ThreadingHTTPServer(('127.0.0.1', 0), Upstream)
+        thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+        thread.start()
+        spec = importlib.util.spec_from_file_location(
+            'command_response_cut', ROOT / 'command_response_cut.py')
+        module = importlib.util.module_from_spec(spec)
+        try:
+            spec.loader.exec_module(module)
+            with module.CommandResponseCutProxy(
+                f'http://127.0.0.1:{upstream.server_port}',
+                cut_start=False, reject_watch=True, reject_get_on_watch=True,
+            ) as proxy:
+                url = f'http://127.0.0.1:{proxy.port}/direct/example/invoke'
+                def invoke(action):
+                    return Request(url, data=json.dumps({
+                        'action': action, 'args': {'command_id': 'stable-command'},
+                    }).encode())
+
+                with urlopen(invoke('process.start'), timeout=5) as response:
+                    self.assertEqual(json.load(response)['pid'], 42)
+                with urlopen(invoke('process.get'), timeout=5) as response:
+                    self.assertEqual(json.load(response)['status'], 'RUNNING')
+                with self.assertRaisesRegex(Exception, '503'):
+                    urlopen(f'http://127.0.0.1:{proxy.port}/api/sandbox/v1/commands/watch',
+                            timeout=5)
+                with self.assertRaisesRegex(Exception, '503'):
+                    urlopen(invoke('process.get'), timeout=5)
+                self.assertEqual(proxy.rejected_get_attempts, 1)
+                self.assertEqual(proxy.watch_attempts, 1)
+                self.assertEqual(len(proxy.start_attempts), 1)
+        finally:
+            upstream.shutdown()
+            upstream.server_close()
+            thread.join(timeout=2)
+
     def test_start_is_forwarded_with_same_identity_but_each_response_is_lost(self):
         received = []
 

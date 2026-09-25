@@ -356,6 +356,31 @@ class AcceptanceGateTests(unittest.TestCase):
                 ('helper', 'node2', 'empty'),
             ])
 
+    def test_command_watch_and_query_outage_is_targeted_full_case(self):
+        case = 'command-watch-query-unavailable'
+        self.assertEqual(driver.selected_checks('full', case), (case,))
+        with self.assertRaisesRegex(ValueError, 'not in E2E profile'):
+            driver.selected_checks('l0', case)
+        with tempfile.TemporaryDirectory() as directory:
+            run = driver.Run(Path(directory))
+            run.nodes = ['node1', 'node2']
+            calls = []
+            run.execute = lambda node, *args, **_kwargs: (
+                calls.append(('execute', node, args[-1]))
+                or json.dumps({'cases': [{'id': 'reliability.' + case,
+                                          'status': 'passed'}]})
+            )
+            run.helper = lambda node, *args, **_kwargs: calls.append(
+                ('helper', node, args[0]))
+            checks = []
+            run.scenarios(checks, (case,))
+            self.assertEqual(checks, [case])
+            self.assertEqual(calls, [
+                ('execute', 'node1', case),
+                ('helper', 'node1', 'empty'),
+                ('helper', 'node2', 'empty'),
+            ])
+
     def test_command_unsupported_feature_is_targeted_full_case_with_physical_cleanup(self):
         self.assertEqual(driver.selected_checks('full', 'command-unsupported-feature'),
                          ('command-unsupported-feature',))
