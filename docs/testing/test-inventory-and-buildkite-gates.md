@@ -237,6 +237,7 @@ profile；完整 Multi-VM 在补齐部署器前不能标记为通过。
 | `FD-13` | 用例已实现，待正式部署运行 | `command-response-cut` 将真实 Execd 的三次成功 `process.start` 应答在 SDK 侧切断，要求请求 ID／命令 ID 保持一致；新 SDK 客户端按命令 ID 找回结果，命令副作用只发生一次，Redis 归属与物理 backend 不变且最终清理完成 |
 | `FD-14` | 用例已实现，待正式部署运行 | `command-registry-capacity` 仅把 node1 Execd 的命令记录上限设为 1，运行命令占满时第二个稳定命令 ID 获得 `ResourceExhausted`；释放占用后以原 ID 成功，副作用一次，归属／backend 不变且最终清理完成 |
 | `FD-15` | 用例已实现，待正式部署运行 | `upload-response-cut` 在 Execd 已提交第一个二进制文件块后切断 SDK 应答，要求 SDK 查询实际上传偏移并沿同一上传 ID 继续，最终文件 SHA256 完全一致，归属／backend 不变且最终清理完成 |
+| `FD-16` | 用例已实现，待正式部署运行 | `download-response-cut` 在文件下载的首个 200 应答仅发送部分字节后断开，要求 SDK 保留 `.part` 并使用实际已写入偏移的 Range 续传；最终 SHA256 一致，归属／backend 不变且最终清理完成 |
 | `FD-FC-01` | 条件计划 | KVM worker 的 Firecracker pause/resume/snapshot profile |
 | `FD-XPU-01` | 条件计划 | 真实 GPU/NPU 整卡发现、过滤、分配、释放和故障清理 |
 | `FD-SOAK-01` | Nightly | 创建／执行／删除循环及反复节点故障，持续 1–24 小时无资源增长 |

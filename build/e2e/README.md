@@ -248,6 +248,12 @@ Local Docker reproduction requires access to the same bind-mounted paths as the 
   with the same upload ID from that offset. A fresh SDK client downloads the
   committed file and checks its SHA256; Redis assignment, physical backend and
   final cleanup are checked. Select with `--profile full --case upload-response-cut`.
+- `download-response-cut` (targeted ranged download): an existing file is
+  downloaded through a TLS proxy that returns only the first part of a 200
+  response, then closes the connection. The installed SDK must preserve its
+  `.part` file and issue a Range request for the remaining bytes. The completed
+  SHA256, Redis assignment, physical backend and cleanup are checked. Select
+  with `--profile full --case download-response-cut`.
 - `schedule-deadline` (targeted center-queue timeout): require both workers to
   advertise only runc, request runsc on node1 with a three-second schedule
   timeout, observe the request in the admin queue, and require an outcome-unknown
