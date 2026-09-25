@@ -91,6 +91,14 @@ def validated_gateway_recovery(before,after,ids):
     ownership=persisted_ownership(before,ids)
     assert persisted_ownership(after,ids)==ownership,'instance ownership changed during gateway restart'
     return {'coordinator_epoch':old_epoch,'ownership':ownership}
+def validated_adxlet_restart(before,status,record):
+    services=[s for s in status['services'] if s['role']=='adxlet']
+    assert len(services)==1 and services[0]['pid'] and services[0]['pid']!=before['pid']
+    assert record['node']['available'] and record['session']['routable']
+    assert record['session']['id']!=before['session_id']
+    return {'node_id':before['node_id'],'pid_before':before['pid'],
+            'pid_after':services[0]['pid'],'session_before':before['session_id'],
+            'session_after':record['session']['id']}
 def redis_info():
     env={**os.environ,'REDISCLI_AUTH':(S/'redis-key').read_text().strip()}
     host=os.getenv('ADX_E2E_REDIS_HOST','coordinator')
@@ -539,7 +547,26 @@ def main():
         before=backend();assert len(before)==1
         (E/f'backend-before-{node}.json').write_text(json.dumps(before))
         current=supervisor('status');manager=[s for s in current['services'] if s['role']=='adxlet'];assert len(manager)==1 and manager[0]['pid']
+        record=json.loads(catalog()['node:'+node])
+        (E/f'adxlet-before-{node}.json').write_text(json.dumps({
+            'node_id':node,'pid':manager[0]['pid'],'session_id':record['session']['id'],
+        },indent=2))
         os.kill(manager[0]['pid'],signal.SIGKILL)
+    elif action=='adxlet-session-changed':
+        before=json.loads((E/f'adxlet-before-{node}.json').read_text())
+        deadline=time.monotonic()+75
+        last_error='replacement process/session not ready'
+        while True:
+            try:
+                record=json.loads(catalog()['node:'+node])
+                evidence=validated_adxlet_restart(before,supervisor('status'),record)
+                (E/f'adxlet-after-{node}.json').write_text(json.dumps(evidence,indent=2))
+                break
+            except (OSError,subprocess.SubprocessError,KeyError,ValueError,AssertionError) as error:
+                last_error=str(error)
+            if time.monotonic()>deadline:
+                raise TimeoutError('Adxlet PID/session did not advance: '+last_error)
+            time.sleep(.2)
     elif action=='capture-backend':
         before=backend();assert len(before)==1
         (E/f'backend-before-{node}.json').write_text(json.dumps(before))

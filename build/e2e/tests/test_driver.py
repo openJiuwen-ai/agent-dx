@@ -34,6 +34,7 @@ class AcceptanceGateTests(unittest.TestCase):
             })
             self.assertEqual(calls[5:], [
                 ('helper', 'node1', 'ready'),
+                ('helper', 'node2', 'adxlet-session-changed'),
                 ('helper', 'node1', 'unchanged'),
                 ('helper', 'node2', 'unchanged'),
                 ('execute', 'node1', 'recovered-marker'),

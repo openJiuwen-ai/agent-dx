@@ -509,6 +509,7 @@ class Run:
                     worker.result()
                     control.result()
                 self.helper('node1','ready',timeout=150)
+                self.helper('node2','adxlet-session-changed','node2',timeout=90)
                 for node in self.nodes:self.helper(node,'unchanged',node)
                 self.execute('node1','/opt/adx/client/bin/python','-u',
                              '/opt/adx/e2e/scenarios.py','recovered-marker',timeout=90)
