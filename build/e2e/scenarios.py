@@ -104,6 +104,11 @@ elif sys.argv[1]=='command-watch-unavailable':
     from command_watch_unavailable import run
     report=run(connection,image,E/'command-watch-unavailable-result.json',S)
     print(json.dumps(report),flush=True)
+elif sys.argv[1]=='command-watch-query-unavailable':
+    from command_watch_unavailable import run
+    report=run(connection,image,E/'command-watch-query-unavailable-result.json',S,
+               query_unavailable=True)
+    print(json.dumps(report),flush=True)
 elif sys.argv[1]=='command-unsupported-feature':
     from command_unsupported_feature import run
     report=run(connection,image,E/'command-unsupported-feature-result.json',S)

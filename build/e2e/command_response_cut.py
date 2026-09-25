@@ -15,18 +15,23 @@ class CommandResponseCutProxy:
     """Forward to real Ingress with configurable command response faults."""
 
     def __init__(self, upstream, *, certificate=None, private_key=None, ca=None,
-                 cut_start=True, reject_watch=False, strip_watch_capability=False):
+                 cut_start=True, reject_watch=False, reject_get=False,
+                 reject_get_on_watch=False,
+                 strip_watch_capability=False):
         self.upstream = upstream.rstrip('/')
         self.certificate = certificate
         self.private_key = private_key
         self.ca = ca
         self.cut_start = cut_start
         self.reject_watch = reject_watch
+        self.reject_get = reject_get
+        self.reject_get_on_watch = reject_get_on_watch
         self.strip_watch_capability = strip_watch_capability
         self.cut_attempts = []
         self.start_attempts = []
         self.capability_attempts = []
         self.watch_attempts = 0
+        self.rejected_get_attempts = 0
         self._lock = threading.Lock()
         self._server = None
         self._thread = None
@@ -44,6 +49,8 @@ class CommandResponseCutProxy:
                         and self.path.startswith('/api/sandbox/v1/commands/watch')):
                     with proxy._lock:
                         proxy.watch_attempts += 1
+                        if proxy.reject_get_on_watch:
+                            proxy.reject_get = True
                     self.send_error(503, 'command watch unavailable')
                     return
                 self._forward()
@@ -54,6 +61,13 @@ class CommandResponseCutProxy:
             def _forward(self):
                 body = (self.rfile.read(int(self.headers['Content-Length']))
                         if self.command == 'POST' else None)
+                if (body is not None and self.path.startswith('/direct/')
+                        and json.loads(body).get('action') == 'process.get'
+                        and proxy.reject_get):
+                    with proxy._lock:
+                        proxy.rejected_get_attempts += 1
+                    self.send_error(503, 'command query unavailable')
+                    return
                 headers = {
                     key: value for key, value in self.headers.items()
                     if key.lower() not in ('host', 'connection', 'content-length',
