@@ -197,6 +197,32 @@ class AcceptanceGateTests(unittest.TestCase):
                 ('helper', 'node2', 'empty'),
             ])
 
+    def test_command_registry_capacity_is_isolated_to_targeted_full_case(self):
+        self.assertEqual(driver.selected_checks('full', 'command-registry-capacity'),
+                         ('command-registry-capacity',))
+        self.assertEqual(driver.setup_environment('command-registry-capacity'),
+                         ('ADX_E2E_COMMAND_REGISTRY_MAX_RECORDS=1',))
+        self.assertEqual(driver.setup_environment('sdk'), ())
+        with tempfile.TemporaryDirectory() as directory:
+            run = driver.Run(Path(directory))
+            run.nodes = ['node1', 'node2']
+            calls = []
+            run.execute = lambda node, *args, **_kwargs: (
+                calls.append(('execute', node, args[-1]))
+                or json.dumps({'cases': [{'id': 'command.registry-capacity',
+                                          'status': 'passed'}]})
+            )
+            run.helper = lambda node, *args, **_kwargs: calls.append(
+                ('helper', node, args[0]))
+            checks = []
+            run.scenarios(checks, ('command-registry-capacity',))
+            self.assertEqual(checks, ['command-registry-capacity'])
+            self.assertEqual(calls, [
+                ('execute', 'node1', 'command-registry-capacity'),
+                ('helper', 'node1', 'empty'),
+                ('helper', 'node2', 'empty'),
+            ])
+
     def test_resource_stale_closes_admission_until_observer_recovers(self):
         self.assertEqual(driver.selected_checks('full', 'resource-stale'),
                          ('resource-stale',))
