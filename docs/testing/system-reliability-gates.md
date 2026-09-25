@@ -25,7 +25,7 @@
 |---|---|---|---|
 | TIME-01 | Local-first 本地命中 | 不出现 45s 本地加 45s 中心的预算切分；不调用中心队列 | 已有定向测试，待 E2E 时序证据 |
 | TIME-02 | Local-first 本地不满足 | Node 明确 fallback 后才进入中心队列，中心单独使用 schedule timeout | 已实现，待 E2E 时序证据 |
-| TIME-03 | 中心队列耗尽 | 尚未形成 Assignment 时原子移出内存队列并释放快照引用，返回 DeadlineExceeded 并提示同 ID 重试；已形成 Assignment 时不取消 | 已实现并有真实 Redis/mTLS 测试，待公共 SDK E2E 时序证据 |
+| TIME-03 | 中心队列耗尽 | 尚未形成 Assignment 时原子移出内存队列并释放快照引用，返回 DeadlineExceeded 并提示同 ID 重试；已形成 Assignment 时不取消 | 已有真实 Redis/mTLS 组件测试；`schedule-deadline` 已加入定向 Full，用公共 SDK、管理员队列 API、Redis 和双节点物理清理核对超时前后状态，正式部署运行待完成。快照引用释放与已形成 Assignment 后不取消仍由组件测试覆盖 |
 | TIME-04 | 分阶段 deadline | 调度、启动、Execd ready、持久化分别耗尽；下游 deadline 不增长 | 待 E2E |
 | TIME-05 | 上游超时后的结果 | 最终结果可由同一 request/instance 查询，物理 backend 唯一 | 部分组件覆盖，待 E2E |
 

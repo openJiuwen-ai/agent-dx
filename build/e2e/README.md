@@ -229,6 +229,12 @@ Local Docker reproduction requires access to the same bind-mounted paths as the 
   receives 404. The proxy then completes the original write and releases the
   retry; require one Redis assignment, one physical backend, a working command
   and full cleanup. Select with `--profile full --case create-unknown-query`.
+- `schedule-deadline` (targeted center-queue timeout): require both workers to
+  advertise only runc, request runsc on node1 with a three-second schedule
+  timeout, observe the request in the admin queue, and require an outcome-unknown
+  same-operation error after the queue deadline. The request must leave the
+  queue without an assignment or held resources; both workers must have empty
+  physical backend inventories. Select with `--profile full --case schedule-deadline`.
 - `resource-stale` (targeted observation-expiry case): pause only node1's
   resource observer so its 10-second capacity sample expires while adxlet,
   Coordinator and existing backends continue. Require node1 to close new

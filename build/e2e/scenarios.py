@@ -85,6 +85,10 @@ elif sys.argv[1]=='create-unknown-query':
     from create_unknown_query import run
     report=run(connection,image,E/'create-unknown-query-result.json',S)
     print(json.dumps(report),flush=True)
+elif sys.argv[1]=='schedule-deadline':
+    from schedule_deadline import run
+    report=run(connection,image,E/'schedule-deadline-result.json',S/'tls/ca.pem')
+    print(json.dumps(report),flush=True)
 elif sys.argv[1]=='resource-create':
     from resource_stale import create
     create(connection,image,E/'resource-live.json')
