@@ -109,6 +109,23 @@ def selected_checks(profile, selected_case):
     return common.selected_checks(profile, selected_case)
 
 
+def default_redis_storage_class(value):
+    """Choose one cluster-default dynamic class before creating test resources."""
+    classes = value.get('items') if isinstance(value, dict) else None
+    if not isinstance(classes, list):
+        raise ValueError('Kubernetes StorageClass list is invalid')
+    defaults = [item['metadata']['name'] for item in classes
+                if item.get('provisioner') not in (None, 'kubernetes.io/no-provisioner')
+                and item.get('metadata', {}).get('annotations', {}).get(
+                    'storageclass.kubernetes.io/is-default-class',
+                    item.get('metadata', {}).get('annotations', {}).get(
+                        'storageclass.beta.kubernetes.io/is-default-class', 'false')) == 'true']
+    if len(defaults) != 1:
+        raise ValueError('redis-pod-restart requires one default dynamic StorageClass '
+                         'or an explicit --redis-storage-class')
+    return defaults[0]
+
+
 class KubernetesRun(common.Run):
     def __init__(self, output, kubeconfig, context=None, profile="k8s-basic",
                  selected_case=None, redis_storage_class=None):
@@ -182,6 +199,14 @@ class KubernetesRun(common.Run):
         self.event('[DEPLOY] namespace=' + self.id + '; eligible nodes=' + ','.join(node_names))
         # Check credentials/connectivity before creating any test resource.
         self.kube('version', '-o', 'json', timeout=30)
+        if self.selected_case == 'redis-pod-restart' and self.redis_storage_class is None:
+            classes = json.loads(self.kube('get', 'storageclasses', '-o', 'json', timeout=30))
+            self.redis_storage_class = default_redis_storage_class(classes)
+        if self.redis_storage_class is not None:
+            (self.output / 'redis-storage-class.json').write_text(
+                json.dumps({'name': self.redis_storage_class}, indent=2) + '\n'
+            )
+            self.event('[DEPLOY] Redis StorageClass=' + self.redis_storage_class)
         self.namespace_attempted = True
         self.apply({'apiVersion': 'v1', 'kind': 'Namespace', 'metadata': {
             'name': self.id, 'labels': {LABEL: self.id, 'pod-security.kubernetes.io/enforce': 'privileged'}}})
@@ -361,8 +386,6 @@ def main():
                    help='StorageClass for the targeted Redis Pod/PVC recovery case')
     a = p.parse_args()
     required=selected_checks(a.profile,a.case)
-    if a.case == 'redis-pod-restart' and not a.redis_storage_class:
-        p.error('--case redis-pod-restart requires --redis-storage-class')
     if a.redis_storage_class and a.case != 'redis-pod-restart':
         p.error('--redis-storage-class is only used by --case redis-pod-restart')
     output = a.output.resolve()
