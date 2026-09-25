@@ -120,6 +120,27 @@ class IndependentPipelineTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'SDK artifact'):
                 module.verify_sdk(wheel, candidate, 'a' * 40)
 
+    def test_optional_runsc_binary_must_match_release_architecture(self):
+        spec = importlib.util.spec_from_file_location(
+            'e2e_prepare', ROOT / 'build/e2e/prepare.py'
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as directory:
+            runsc = Path(directory) / 'runsc'
+            elf = bytearray(64)
+            elf[:6] = b'\x7fELF\x02\x01'
+            elf[18:20] = (62).to_bytes(2, 'little')
+            runsc.write_bytes(elf)
+            runsc.chmod(0o755)
+            self.assertEqual(module.verify_runsc(runsc, 'x86_64-unknown-linux-gnu'),
+                             module.sha(runsc))
+            with self.assertRaisesRegex(ValueError, 'architecture'):
+                module.verify_runsc(runsc, 'aarch64-unknown-linux-gnu')
+            runsc.write_bytes(b'not-an-ELF')
+            with self.assertRaisesRegex(ValueError, 'ELF'):
+                module.verify_runsc(runsc, 'x86_64-unknown-linux-gnu')
+
 
 if __name__ == '__main__':
     unittest.main()

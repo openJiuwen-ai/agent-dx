@@ -40,6 +40,13 @@ def tls(n,peers):return {'ca':str(T/'ca.pem'),'certificate':str(T/f'{n}.pem'),'p
 cgroup_root=os.getenv('ADX_E2E_CGROUP_ROOT',f'adx-e2e-{node}')
 if not re.fullmatch(r'adx-e2e-[A-Za-z0-9_-]+',cgroup_root):raise ValueError('invalid test cgroup root')
 R=P/'sandboxd'; R.mkdir(exist_ok=True)
+runsc_node=os.getenv('ADX_E2E_RUNSC_NODE','')
+if runsc_node not in ('','node1','node2'):raise ValueError('invalid E2E runsc node')
+runsc_enabled=runsc_node==node
+if runsc_enabled and not pathlib.Path('/usr/local/bin/runsc').is_file():
+ raise RuntimeError('selected heterogeneous runtime worker has no runsc binary')
+runsc_basic='runsc = ""\n' if runsc_enabled else ''
+runsc_binary='runsc = "/usr/local/bin/runsc"\n' if runsc_enabled else ''
 for f,data in [('oss.json',{'oss':{},'type':'oss'}),('registry.json',{'registry':{'scheme':'https' if os.getenv('ADX_E2E_KUBERNETES') else 'http','skip_verify':False if os.getenv('ADX_E2E_KUBERNETES') else True},'type':'registry'}),('oss_auths.json',{}),('registry_auths.json',{'auths':{}})]: (R/f).write_text(json.dumps(data))
 registry_auth=pathlib.Path('/registry-auth/.dockerconfigjson')
 if registry_auth.exists(): (R/'registry_auths.json').write_bytes(registry_auth.read_bytes()); (R/'registry_auths.json').chmod(0o600)
@@ -69,8 +76,10 @@ state_root = "{R}/runc"
 shim_binary = "/usr/local/bin/runc-shim"
 [plugin.runtime.basic_spec]
 runc = ""
+{runsc_basic}
 [plugin.runtime.runtime_binary]
 runc = "/usr/local/bin/runc"
+{runsc_binary}
 [plugin.image]
 root = "{R}/image_manager/data"
 distill_fs_bin = "/usr/local/bin/distill_fs"

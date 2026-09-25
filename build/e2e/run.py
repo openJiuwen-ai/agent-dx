@@ -48,6 +48,8 @@ def setup_environment(selected_case):
         return ('ADX_E2E_RELAY_MODE=standalone',)
     if selected_case == 'sqlite-fallback':
         return ('ADX_E2E_SQLITE_FALLBACK=1',)
+    if selected_case == 'runtime-affinity':
+        return ('ADX_E2E_RUNSC_NODE=node2',)
     return ()
 
 def sha(path):

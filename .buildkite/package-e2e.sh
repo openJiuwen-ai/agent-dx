@@ -75,6 +75,12 @@ fi
 docker pull "$ADX_COLLECTOR_IMAGE"
 echo "--- :docker: Build node, EXECD and entrypoint fixture images"
 fc_args=()
+runtime_args=()
+if [[ -n ${ADX_E2E_RUNSC_BIN:-} ]]; then
+  : "${ADX_E2E_RUNSC_SHA256:?a pinned runsc SHA256 is required}"
+  printf '%s  %s\n' "$ADX_E2E_RUNSC_SHA256" "$ADX_E2E_RUNSC_BIN" | sha256sum --check -
+  runtime_args=(--runsc-bin "$ADX_E2E_RUNSC_BIN")
+fi
 if [[ ${ADX_E2E_CHECKPOINT:-0} == 1 ]]; then
   if [[ -n ${ADX_FC_KIT_ARTIFACT_BUILD:-} ]]; then
     buildkite-agent artifact download 'out/buildkite/firecracker-kit/**/*' . --build "$ADX_FC_KIT_ARTIFACT_BUILD"
@@ -86,6 +92,6 @@ fi
 python3 -u build/e2e/prepare.py --package out/buildkite/package --backend out/buildkite/backend \
   --sdk-wheel "${sdk_wheels[0]}" --sdk-candidate out/buildkite/sdk/sdk-candidate.json \
   --runtime-base "$ADX_E2E_RUNTIME_BASE" --execd-base "$ADX_E2E_EXECD_BASE" \
-  --output out/buildkite/bundle "${fc_args[@]}" 2>&1 | tee out/buildkite/logs/prepare.log
+  --output out/buildkite/bundle "${fc_args[@]}" "${runtime_args[@]}" 2>&1 | tee out/buildkite/logs/prepare.log
 echo "--- :docker: Push immutable image references"
 python3 -u build/e2e/kubernetes/publish_images.py --bundle out/buildkite/bundle --repository "$ADX_E2E_IMAGE_REPOSITORY" 2>&1 | tee out/buildkite/logs/publish-images.log

@@ -60,8 +60,8 @@
     "title": "异构 Runtime 正向亲和 E2E",
     "stage": "7",
     "status": "pending",
-    "detail": "runc-only 双节点正式用例已验证不支持 runsc 时不产生分配；定向 runtime-affinity 用例已加入，要求真实 sandboxd inventory 只有一个节点支持 runsc，并通过公开 SDK 验证实际创建、归属、命令和清理。当前 fixture 尚未提供 runsc 后端，未完成端到端运行。",
-    "gate": "提供兼容的 runsc 二进制与 OCI 测试镜像，在异构双节点上运行 --profile full --case runtime-affinity，保存实际 inventory、assignment、执行与清理证据。"
+    "detail": "runc-only 双节点正式用例已验证不支持runsc时不产生分配；定向runtime-affinity用例要求真实sandboxd inventory只有一个节点支持runsc，并通过公开SDK验证实际创建、归属、命令和清理。镜像构建已支持可选runsc ELF架构与SHA256校验，定向部署只在node2启用；仍缺匹配x86发布包的runsc二进制和真实正向E2E结果。",
+    "gate": "提供兼容的x86 runsc二进制及其SHA256与OCI测试镜像，构建异构测试镜像并运行--profile full --case runtime-affinity，保存实际inventory、assignment、执行与清理证据。"
   },
   {
     "id": "idle-active-request",
