@@ -18,6 +18,40 @@ SPEC.loader.exec_module(NODE)
 
 
 class SqliteFallbackOracleTests(unittest.TestCase):
+    def test_restarted_node_keeps_pending_delete_and_original_live_backend(self):
+        before = {'pid': 101, 'session_id': 'old-session'}
+        status = {'services': [{'role': 'adxlet', 'pid': 202}]}
+        journaled = {
+            'keep_id': 'live', 'idle_id': 'idle',
+            'keep_backend': 'runtime-live', 'keep_runtime_id': 'runtime-live',
+        }
+        records = {
+            'environment:live': json.dumps({
+                'runtime': {'id': 'runtime-live'},
+                'result': {'state': 'Running'},
+            }),
+            'environment:idle': json.dumps({'result': {'state': 'Running'}}),
+        }
+        pending = [{'spec': {'id': 'idle'}, 'state': 'Deleted'}]
+        evidence = NODE.validated_sqlite_node_restart(
+            before, status, records, pending, ['runtime-live'], journaled,
+        )
+        self.assertEqual(evidence['pid_before'], 101)
+        self.assertEqual(evidence['pid_after'], 202)
+        self.assertEqual(evidence['pending_records'], 1)
+        with self.assertRaisesRegex(AssertionError, 'backend'):
+            NODE.validated_sqlite_node_restart(
+                before, status, records, pending, [], journaled,
+            )
+        with self.assertRaisesRegex(AssertionError, 'pending'):
+            NODE.validated_sqlite_node_restart(
+                before, status, records, [], ['runtime-live'], journaled,
+            )
+        with self.assertRaisesRegex(AssertionError, 'duplicated'):
+            NODE.validated_sqlite_node_restart(
+                before, status, records, pending * 2, ['runtime-live'], journaled,
+            )
+
     def test_unopened_healthy_journal_is_not_required(self):
         with tempfile.TemporaryDirectory() as directory:
             old = NODE.P

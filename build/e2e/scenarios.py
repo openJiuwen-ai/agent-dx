@@ -77,6 +77,17 @@ elif sys.argv[1]=='sqlite-verify':
     from sqlite_fallback import verify
     report=verify(connection,E,E/'sqlite-fallback-result.json')
     print(json.dumps(report),flush=True)
+elif sys.argv[1]=='sqlite-verify-restart':
+    from sqlite_fallback import verify
+    result_path=E/'sqlite-node-restart-result.json'
+    report=verify(connection,E,result_path)
+    restarted=json.loads((E/'sqlite-after-restart.json').read_text())
+    report['cases'].append({
+        'id':'reliability.sqlite-node-restart','status':'passed',
+        'seconds':restarted['seconds'],
+    })
+    result_path.write_text(json.dumps(report,indent=2)+'\n')
+    print(json.dumps(report),flush=True)
 elif sys.argv[1]=='create-response-cut':
     from create_response_cut import run
     report=run(connection,image,E/'create-response-cut-result.json',S)
