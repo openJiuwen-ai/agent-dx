@@ -144,9 +144,16 @@ Local Docker reproduction requires access to the same bind-mounted paths as the 
   node to advertise `runsc` through sandboxd and the other live node not to.
   Create with the public SDK without specifying a node, then check the
   persisted assignment, runtime class, command execution and resource release.
-  The default two-node fixture configures only `runc` and therefore fails this
-  case at its inventory precondition; provision an actual `runsc` backend and
-  compatible OCI image before selecting it with `--profile full --case runtime-affinity`.
+  The default two-node fixture configures only `runc`. To build a heterogeneous
+  bundle, pass `--runsc-bin /path/to/native/runsc` to `prepare.py`; its ELF
+  architecture is checked against the release and its SHA256 is recorded in
+  `bundle.json`. In Buildkite, set `ADX_E2E_RUNSC_BIN` and the independently
+  checked `ADX_E2E_RUNSC_SHA256` for the image-build step. Select
+  `--profile full --case runtime-affinity`; the driver enables `runsc` only
+  on node2 and requires live inventory, unpinned SDK creation, physical
+  placement, command execution and cleanup. The OCI test image must support
+  the selected `runsc` binary. This case remains unverified until it passes
+  on an actual heterogeneous deployment.
 - `idle-active` (targeted activity case): hold a foreground SDK command request
   open for 12 seconds with a six-second idle timeout. Verify that the instance
   and its allocation survive the active request, then close the client and

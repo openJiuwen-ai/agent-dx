@@ -156,6 +156,10 @@ class AcceptanceGateTests(unittest.TestCase):
         self.assertIn('sleep 30; echo adx-entrypoint-stderr',source)
         self.assertNotIn('sleep 5; echo adx-entrypoint-stderr',source)
 
+    def test_runtime_affinity_uses_one_heterogeneous_worker(self):
+        self.assertEqual(driver.setup_environment('runtime-affinity'),
+                         ('ADX_E2E_RUNSC_NODE=node2',))
+
     def test_profiles_separate_l0_from_standalone_and_full(self):
         self.assertEqual(driver.required_for_profile('l0'), ('l0', 'auth'))
         self.assertEqual(

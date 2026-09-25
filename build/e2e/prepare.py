@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import tempfile
 import uuid
@@ -37,14 +38,34 @@ def verify_sdk(wheel, candidate_path, expected_commit):
         raise ValueError('invalid SDK wheel name')
     return candidate
 
+
+def verify_runsc(binary, target):
+    """Pin an optional native runsc used only by the heterogeneous E2E case."""
+    machines = {'x86_64-unknown-linux-gnu': 62,
+                'aarch64-unknown-linux-gnu': 183}
+    if target not in machines:
+        raise ValueError('unsupported release architecture')
+    if binary.is_symlink() or not binary.is_file() or not binary.stat().st_mode & stat.S_IXUSR:
+        raise ValueError('runsc must be a regular executable file')
+    with binary.open('rb') as stream:
+        header = stream.read(20)
+    if len(header) != 20 or header[:6] != b'\x7fELF\x02\x01':
+        raise ValueError('runsc must be a little-endian ELF64 binary')
+    if int.from_bytes(header[18:20], 'little') != machines[target]:
+        raise ValueError('runsc architecture differs from the release')
+    return sha(binary)
+
 def main():
     p=argparse.ArgumentParser()
     for name in ('package','backend','sdk-wheel','sdk-candidate','output'):
         p.add_argument('--'+name,type=Path,required=True)
     p.add_argument('--runtime-base',required=True);p.add_argument('--execd-base',required=True)
     p.add_argument('--firecracker-kit',type=Path)
+    p.add_argument('--runsc-bin',type=Path,
+                   help='optional verified native runsc for the heterogeneous runtime E2E')
     a=p.parse_args();a.output.mkdir(parents=True,exist_ok=False)
     manifest=package.verify(a.package)
+    runsc_sha256 = verify_runsc(a.runsc_bin, manifest['target']) if a.runsc_bin else None
     expected_commit=os.getenv('ADX_E2E_ARTIFACT_COMMIT',os.getenv('BUILDKITE_COMMIT',manifest['commit']))
     sdk=verify_sdk(a.sdk_wheel,a.sdk_candidate,expected_commit)
     if os.getenv('BUILDKITE'):
@@ -86,6 +107,9 @@ def main():
         for name in BACKEND_BINARIES:
             shutil.copy2(a.backend/name,context/'backend'/name)
             (context/'backend'/name).chmod(0o755)
+        if a.runsc_bin:
+            shutil.copy2(a.runsc_bin, context/'runsc')
+            (context/'runsc').chmod(0o755)
         shutil.copytree(ROOT/'build/observability',context/'observability')
         shutil.copytree(ROOT/'build/e2e',context/'e2e',ignore=shutil.ignore_patterns('__pycache__','tests'))
         shutil.copy2(ROOT/'build/ci/rpc_certificates.py',context/'e2e/rpc_certificates.py')
@@ -97,6 +121,9 @@ def main():
                 if not name.startswith('artifacts/'):output.chmod(0o755)
             (context/'fc-kit/manifest.json').write_text(json.dumps(fc_kit,indent=2))
         (context/'Dockerfile.node').write_text('ARG BASE\nARG COLLECTOR\nFROM ${COLLECTOR} AS collector\nFROM ${BASE}\nCOPY --from=collector /otelcol-contrib /usr/local/bin/otelcol-contrib\nCOPY observability /opt/adx/observability\nCOPY package /opt/adx/package\nCOPY sdk /opt/adx/sdk\nCOPY backend /usr/local/bin\nCOPY e2e /opt/adx/e2e\nRUN python3 -m venv /opt/adx/client && /opt/adx/client/bin/pip install /opt/adx/sdk/*.whl\nWORKDIR /opt/adx\nCMD ["sleep", "infinity"]\n')
+        if a.runsc_bin:
+            with (context/'Dockerfile.node').open('a') as dockerfile:
+                dockerfile.write('COPY runsc /usr/local/bin/runsc\n')
         if fc_kit:
             with (context/'Dockerfile.node').open('a') as dockerfile:
                 dockerfile.write('COPY fc-kit /opt/adx-fc\nCOPY fc-kit/tools /opt/adx/tools\n')
@@ -120,6 +147,7 @@ def main():
         subprocess.run(['docker','save','-o',str(a.output/'entrypoint.tar'),tags['entrypoint']],stderr=subprocess.STDOUT,check=True,timeout=300)
     result={'schema_version':1,'package':manifest,'sdk':sdk,'backend':backend,'image_ids':{k:v['Id'] for k,v in images.items()},'architecture':images['node']['Architecture'],'archive_sha256':sha(a.output/'images.tar'),'execd_archive_sha256':sha(a.output/'execd.tar'),'entrypoint_archive_sha256':sha(a.output/'entrypoint.tar'),'base_images':{'node':a.runtime_base,'execd':a.execd_base}}
     result['collector']={**collector,'image':collector_image}
+    if runsc_sha256:result['runsc']={'sha256':runsc_sha256,'target':manifest['target']}
     if fc_kit:result['firecracker_kit']=fc_kit
     (a.output/'bundle.json').write_text(json.dumps(result,indent=2)+'\n')
     print('E2E bundle prepared:',a.output)

@@ -231,7 +231,7 @@ profile；完整 Multi-VM 在补齐部署器前不能标记为通过。
 | `FD-07` | 正式 K8s 定向验证通过 | [Full #37](https://buildkite.com/agent-dx/agent-dx-full-test/builds/37)、[#38](https://buildkite.com/agent-dx/agent-dx-full-test/builds/38)、[#27](https://buildkite.com/agent-dx/agent-dx-full-test/builds/27) 分别验证 Coordinator、API Server 与独立 Ingress 重启后原归属／后端和公开 SDK 路由；持续网络分区另见 `FD-08` |
 | `FD-08` | 正式双物理 worker 定向验证通过 | [Full #31](https://buildkite.com/agent-dx/agent-dx-full-test/builds/31) 的 `network-partition` 在 node2 网络命名空间阻断到 Coordinator 的 TCP 流量，防火墙计数非零、心跳失效且旧实例撤路由；隔离期间 node1 继续执行和创建，解除后 node2 清理旧后端再准入。两个 Pod 分别位于 `10.244.128.124` 和 `10.244.128.160` |
 | `FD-09` | 已验证 | [Full #23](https://buildkite.com/agent-dx/agent-dx-full-test/builds/23) 的 `data-plane` 定向用例通过 Host 子域名端口转发：`<instance-id>-18081.example.test` 携带鉴权后到达实例的嵌套路径，缺少 Token 被拒绝；用例 28.859 秒，清理错误为 0 |
-| `FD-10` | 本地及三 VM 定向用例已实现，异构环境未验证 | 两种运行方式均要求两个节点真实上报不同的 sandboxd runtime inventory；通过公开 SDK 请求 `runsc` 且不指定节点，核对唯一支持节点上的归属、物理后端、命令执行和资源释放。当前 runc-only fixture 无法使该用例通过，不能将负向拒绝测试充当正向亲和证据 |
+| `FD-10` | 本地及三 VM 定向用例已实现，异构环境未验证 | 两种运行方式均要求两个节点真实上报不同的 sandboxd runtime inventory；通过公开 SDK 请求 `runsc` 且不指定节点，核对唯一支持节点上的归属、物理后端、命令执行和资源释放。镜像构建现可用带 SHA256 和架构校验的可选 `runsc` 二进制，定向部署仅在 node2 启用；实际异构部署尚未运行，不能将 runc-only 负向拒绝测试充当正向亲和证据 |
 | `FD-FC-01` | 条件计划 | KVM worker 的 Firecracker pause/resume/snapshot profile |
 | `FD-XPU-01` | 条件计划 | 真实 GPU/NPU 整卡发现、过滤、分配、释放和故障清理 |
 | `FD-SOAK-01` | Nightly | 创建／执行／删除循环及反复节点故障，持续 1–24 小时无资源增长 |
