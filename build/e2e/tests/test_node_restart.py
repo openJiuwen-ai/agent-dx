@@ -15,6 +15,25 @@ spec.loader.exec_module(node)
 
 
 class SandboxdRestartTests(unittest.TestCase):
+    def test_adxlet_restart_evidence_requires_new_pid_and_session(self):
+        before={'node_id':'node2','pid':123,'session_id':'old'}
+        after={'services':[{'role':'adxlet','pid':456}]}
+        record={'node':{'available':True},'session':{'id':'new','routable':True}}
+        evidence=node.validated_adxlet_restart(before,after,record)
+        self.assertEqual(evidence['pid_before'],123)
+        self.assertEqual(evidence['pid_after'],456)
+        self.assertEqual(evidence['session_before'],'old')
+        self.assertEqual(evidence['session_after'],'new')
+        with self.assertRaises(AssertionError):
+            node.validated_adxlet_restart(before,
+                {'services':[{'role':'adxlet','pid':123}]},record)
+        with self.assertRaises(AssertionError):
+            node.validated_adxlet_restart(before,after,
+                {'node':{'available':True},'session':{'id':'old','routable':True}})
+        with self.assertRaises(AssertionError):
+            node.validated_adxlet_restart(before,after,
+                {'node':{'available':False},'session':{'id':'new','routable':False}})
+
     def test_persisted_runtime_identity_uses_environment_record_runtime(self):
         result = {'state': 'Running', 'runtime': {'id': 'capsule-1-runtime-1'}}
         self.assertEqual(node.persisted_runtime_id(result), 'capsule-1-runtime-1')
