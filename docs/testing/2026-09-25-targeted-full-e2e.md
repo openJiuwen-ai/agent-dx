@@ -23,3 +23,11 @@
 上述证据的构建判定、原始日志和验收产物位于 `out/ci/multivm-coverage-0925/`。该目录不随 Git 提交；Buildkite 构建页面保存相应运行产物。
 
 尚待完成：独立一控两工作节点的三 VM 控制面验收；本地 Firecracker 双克隆网络定位；真实 GPU/NPU 设备验收。路由提交到 Ingress 的发布延迟已记录为独立待办，本轮混合负载通过不能将其视为完成。
+
+## 2026-09-26 功能覆盖复核
+
+[Full #65](https://buildkite.com/agent-dx/agent-dx-full-test/builds/65) 在提交 `e7269c0` 的隔离双物理 worker 部署中通过全部 11 组，清理错误为零；此前通过的基础、Standalone 与 x86 KVM Firecracker 独立套件不因本轮覆盖复核而重跑。这些结果不代表后续新提交已经完成同一套 Full 验收。
+
+AKernel 使用 ADX 后端的当前 E2E 源码有 59 个 `test_` 方法。本轮对源码、逐方法日志及故障 runner 摘要核对后，56 个至少在一个隔离制品上通过；S3 EROFS rootfs 和只读挂载两个用例实跑但在 sandboxd 镜像 daemon 启动阶段失败，未进入文件断言；GPU 可见性用例因 cn-north-4 的五个节点均未上报 GPU/NPU 而跳过。56 项是跨 #97/#100 及定向回归的覆盖数，不是同一最新版一次运行的通过数。ADX 公共 SDK 的 GPU/NPU 真实设备验收入口独立放在 [`build/e2e/device/`](../../build/e2e/device/README.md)，目前只有无硬件的脚本流程检查，不能计为设备验收。
+
+两条 S3 用例使用 MinIO 构造测试对象；前台组件探针在 `type=s3` 下读取成功，在当前 sandboxd 使用的 `type=oss` 下报网络错误。该现象只说明当前 MinIO fixture 未验证 OSS 路径，不能据此判断真实 OSS 服务的兼容性。待取得已授权的真实 OSS 测试桶后仅回归这两项；不会为了改变结果重跑整套已通过的功能用例。三小时预算审计量测 6046.697 秒，另对未精确计时的运行保守预留 3960 秒，规划占用 10006.697/10800 秒；这不是历史精确总耗时。明细留在本地 `out/ci/targeted-full-suite-0925/budget-audit.json`，下一次定向运行最多 600 秒。
