@@ -22,14 +22,19 @@ CHUNK_SIZE = 64 * 1024
 class UploadResponseCutProxy:
     """Forward binary chunks, cutting only the first successful chunk reply."""
 
-    def __init__(self, upstream, *, certificate=None, private_key=None, ca=None):
+    def __init__(self, upstream, *, certificate=None, private_key=None, ca=None,
+                 cut_upload=True, download_cut_bytes=None):
         self.upstream = upstream.rstrip('/')
         self.certificate = certificate
         self.private_key = private_key
         self.ca = ca
+        self.cut_upload = cut_upload
+        self.download_cut_bytes = download_cut_bytes
         self.cut_chunk = None
+        self.cut_download = None
         self.chunks = []
         self.status_offsets = []
+        self.download_attempts = []
         self._lock = threading.Lock()
         self._server = None
         self._thread = None
@@ -72,6 +77,7 @@ class UploadResponseCutProxy:
                     status = response.status
                     content_type = response.headers.get(
                         'Content-Type', 'application/octet-stream')
+                    content_range = response.headers.get('Content-Range')
 
                 parsed_url = urlsplit(self.path)
                 params = parse_qs(parsed_url.query)
@@ -90,7 +96,7 @@ class UploadResponseCutProxy:
                     }
                     with proxy._lock:
                         proxy.chunks.append(chunk)
-                        if proxy.cut_chunk is None and status == 200:
+                        if proxy.cut_upload and proxy.cut_chunk is None and status == 200:
                             result = json.loads(payload)
                             if not result.get('error'):
                                 proxy.cut_chunk = {
@@ -109,9 +115,42 @@ class UploadResponseCutProxy:
                         self.connection.close()
                         return
 
+                if (self.command == 'GET'
+                        and parsed_url.path.endswith('/download')
+                        and params.get('type') == ['file']):
+                    range_header = self.headers.get('Range')
+                    attempt = {
+                        'range': range_header, 'status': status,
+                        'size': len(payload),
+                    }
+                    with proxy._lock:
+                        proxy.download_attempts.append(attempt)
+                        cut_download = (proxy.download_cut_bytes is not None
+                                        and proxy.cut_download is None
+                                        and range_header is None
+                                        and status == 200
+                                        and len(payload) > proxy.download_cut_bytes)
+                        if cut_download:
+                            proxy.cut_download = {
+                                **attempt, 'bytes_sent': proxy.download_cut_bytes,
+                            }
+                    if cut_download:
+                        self.send_response(status)
+                        self.send_header('Content-Type', content_type)
+                        self.send_header('Content-Length', str(len(payload)))
+                        self.end_headers()
+                        self.wfile.write(payload[:proxy.download_cut_bytes])
+                        self.wfile.flush()
+                        self.close_connection = True
+                        self.connection.shutdown(socket.SHUT_RDWR)
+                        self.connection.close()
+                        return
+
                 self.send_response(status)
                 self.send_header('Content-Type', content_type)
                 self.send_header('Content-Length', str(len(payload)))
+                if content_range is not None:
+                    self.send_header('Content-Range', content_range)
                 self.end_headers()
                 self.wfile.write(payload)
 

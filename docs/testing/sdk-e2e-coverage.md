@@ -31,8 +31,9 @@ E2E case ID；静态测试会在 SDK 新增、删除或漏登记公开成员时�
 checkpoint/snapshot、入口继承、reload 和运行期网络策略。这里的“覆盖”要求
 请求真实经过 API Server、Gateway、adxlet、sandboxd 和 Execd；SDK 单测不计入此表。
 
-文件传输故障另有 `upload-response-cut` 定向 Full 用例：代理切断 Execd 已写入首块后的应答，
-SDK 查询实际偏移并沿同一上传 ID 继续，最后由新客户端下载并比较 SHA256。该用例已接入驱动，
+文件传输故障另有两个定向 Full 用例：`upload-response-cut` 在 Execd 已写入首块后切断应答，
+SDK 查询实际偏移并沿同一上传 ID 继续；`download-response-cut` 在首个文件响应只返回部分字节后
+断开，SDK 保留 `.part` 文件并用 Range 续传。两者都以最终 SHA256 校验完整性，已接入驱动，
 正式部署运行待完成。
 
 ### Reverse tunnel 集成
