@@ -182,6 +182,49 @@ impl Rig {
 
 #[tokio::test]
 #[ignore = "requires real Redis and generated mTLS certificates"]
+async fn redis_restart_recovers_scheduler_after_failed_node_heartbeat() {
+    let mut rig = Rig::new().await;
+    let stored = rig.session.snapshot().await.unwrap();
+    let node = &stored.nodes["a"];
+    let heartbeat = pb::RegisterNodeRequest {
+        runtime_classes: vec!["runsc".into(), "runc".into()],
+        node_id: "a".into(),
+        node_address: node.address.clone(),
+        proxy_address: node.proxy_address.clone(),
+        capacity: Some(node.node.capacity.into()),
+        accepting_allocations: true,
+        labels: Default::default(),
+        devices: vec![],
+        session_id: "boot-a".into(),
+        heartbeat_sequence: 3,
+        reconciling: false,
+    };
+    rig._redis.crash();
+    let error = rig.claimants[0]
+        .register_node(heartbeat.clone())
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::Unavailable);
+    rig._redis.start().await;
+
+    let recovered = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if rig.rpc.expire_nodes().await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert!(
+        recovered.is_ok(),
+        "scheduler did not recover after Redis restarted"
+    );
+    rig.claimants[0].register_node(heartbeat).await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires real Redis and generated mTLS certificates"]
 async fn operator_pause_keeps_node_visible_but_removes_it_from_admission() {
     let mut rig = Rig::new().await;
     assert!(rig.claimants[0]

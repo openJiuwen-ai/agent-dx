@@ -4,7 +4,7 @@
     "title": "系统错误、超时与故障可靠性门禁",
     "stage": "13",
     "status": "pending",
-    "detail": "已修正local-first预算边界、中心队列独立超时和sandboxd晚启动等待；稳定错误映射及SDK同身份重试已有组件门禁。Full #17验证sandboxd daemon重启；Full #42验证真实TLS代理断流，#40验证资源采集过期，#43验证对账中断重启，#31验证双物理worker网络隔离。完整三VM故障门禁、Redis PVC跨Pod恢复和FC专项仍待补齐。",
+    "detail": "已修正local-first预算边界、中心队列独立超时和sandboxd晚启动等待；稳定错误映射及SDK同身份重试已有组件门禁。Full #17验证sandboxd daemon重启；Full #42验证真实TLS代理断流，#40验证资源采集过期，#43验证对账中断重启，#31验证双物理worker网络隔离。Full #46验证Redis PVC和AOF恢复后发现Coordinator无法解除写入恢复状态，删除返回503；已补真实Redis回归用例，正式制品E2E复验待执行。完整三VM故障门禁和FC专项仍待补齐。",
     "gate": "ERR-01..04、TIME-01..05、SD-01..04、NM-01..03和NODE-01..04按system-reliability-gates.md完成对应拓扑E2E并保存客户端、Redis、路由和物理backend证据。"
   },
   {
@@ -32,11 +32,19 @@
     "gate": "在至少两个可用物理 worker 上运行 full profile，十一组、可观测、逐项 JUnit、物理 placement 和 namespace 清理全部通过。"
   },
   {
+    "id": "cn4-akernel-functional-smoke",
+    "title": "cn-north-4 现有 AKernel 部署功能冒烟",
+    "stage": "7",
+    "status": "complete",
+    "detail": "2026-09-25通过现有akernel命名空间的ADX入口运行公开Python SDK：创建runsc Sandbox、执行命令并删除；证据在out/ci/multivm-coverage-0925/cn4-smoke-result.json。此项不代表独立ADX Full部署或故障注入已通过。",
+    "gate": "在现有部署使用公开SDK完成创建、命令和删除，并确认请求对应同一Sandbox ID。"
+  },
+  {
     "id": "e2e-resilience-expansion",
     "title": "Standalone 与正式部署韧性扩展",
     "stage": "7",
     "status": "pending",
-    "detail": "Buildkite Full #27、#33、#36至#43验证分进程Ingress/Relay、托管Redis、Coordinator/API Server重启、实例自动重启、采集过期、SQLite降级、代理断流和对账二次崩溃；#31验证真实双worker网络隔离。目标用例最终回归全部通过，missing_checks与cleanup_errors均为空。Redis PVC跨Pod恢复仍待具备动态StorageClass的集群。",
+    "detail": "Buildkite Full #27、#33、#36至#43验证分进程Ingress/Relay、托管Redis、Coordinator/API Server重启、实例自动重启、采集过期、SQLite降级、代理断流和对账二次崩溃；#31验证真实双worker网络隔离。以上目标用例最终回归全部通过。Full #46使用动态StorageClass csi-disk-topology完成Redis PVC重建、AOF与双节点SDK读写恢复，但最终删除503且cleanup_errors非空；修复后需用新正式制品复验。",
     "gate": "按 ST-06..10 和 FD-06..08 增加真实故障用例，保存客户端、权威状态和物理后端三类证据。"
   },
   {

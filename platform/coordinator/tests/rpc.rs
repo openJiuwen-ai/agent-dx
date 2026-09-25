@@ -1210,6 +1210,7 @@ async fn node_restart_before_expiry_requires_new_session_at_registered_endpoint(
     );
     let mut report = pb::RegisterNodeRequest {
         node_id: "node".into(),
+        runtime_classes: vec!["runc".into()],
         node_address: na.to_string(),
         proxy_address: "127.0.0.1:9999".into(),
         capacity: Some(spec("held").resources.into()),
