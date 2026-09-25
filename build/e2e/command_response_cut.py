@@ -14,12 +14,17 @@ from urllib.request import HTTPSHandler, ProxyHandler, Request, build_opener
 class CommandResponseCutProxy:
     """Forward commands to the real Ingress, then cut successful start replies."""
 
-    def __init__(self, upstream, *, certificate=None, private_key=None, ca=None):
+    def __init__(self, upstream, *, certificate=None, private_key=None, ca=None,
+                 cut_start=True, reject_watch=False):
         self.upstream = upstream.rstrip('/')
         self.certificate = certificate
         self.private_key = private_key
         self.ca = ca
+        self.cut_start = cut_start
+        self.reject_watch = reject_watch
         self.cut_attempts = []
+        self.start_attempts = []
+        self.watch_attempts = 0
         self._lock = threading.Lock()
         self._server = None
         self._thread = None
@@ -33,6 +38,12 @@ class CommandResponseCutProxy:
 
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self):
+                if (proxy.reject_watch
+                        and self.path.startswith('/api/sandbox/v1/commands/watch')):
+                    with proxy._lock:
+                        proxy.watch_attempts += 1
+                    self.send_error(503, 'command watch unavailable')
+                    return
                 self._forward()
 
             def do_POST(self):
@@ -68,7 +79,12 @@ class CommandResponseCutProxy:
                     submitted = json.loads(body)
                     if submitted.get('action') == 'process.start':
                         start = submitted
-                if start is not None and status == 200:
+                        with proxy._lock:
+                            proxy.start_attempts.append({
+                                'request_id': self.headers.get('X-ADX-Request-ID'),
+                                'command_id': start['args']['command_id'],
+                            })
+                if proxy.cut_start and start is not None and status == 200:
                     result = json.loads(payload)
                     if not result.get('error'):
                         attempt = {
