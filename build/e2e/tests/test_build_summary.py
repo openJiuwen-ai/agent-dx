@@ -91,6 +91,26 @@ class BuildSummaryTests(unittest.TestCase):
             self.assertEqual(process.returncode, 0, process.stderr)
             self.assertEqual(json.loads((root / 'summaries/e2e.json').read_text()), result)
 
+    def test_failed_campaign_without_first_case_still_publishes_summary(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            write(root, 'summaries/images.json', {
+                'commit': COMMIT, 'stages': {'images': {'status': 'passed', 'exit_code': 0}},
+                'images': {'references': {}, 'collector': None},
+                'product_commit': PRODUCT_COMMIT,
+            })
+            write(root, 'bundle/bundle.json', {'package': {'commit': PRODUCT_COMMIT}})
+            report = {'status': 'failed', 'profile': 'targeted-suite',
+                      'checks': [], 'missing_checks': ['command-response-cut'],
+                      'cleanup_errors': [], 'error': 'driver returned no result',
+                      'harness': None}
+            write(root, 'acceptance/result.json', report)
+            result = summary.collect(root, 'e2e', 1, COMMIT)
+            self.assertEqual(result['e2e']['report'], report)
+            self.assertEqual(result['stages']['e2e']['status'], 'failed')
+            with self.assertRaisesRegex(ValueError, 'harness identity'):
+                summary.collect(root, 'e2e', 0, COMMIT)
+
     def test_independent_pipeline_summaries_and_actual_placement(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

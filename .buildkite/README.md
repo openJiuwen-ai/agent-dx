@@ -300,6 +300,21 @@ still deploys and cleans up two physical workers but reports `profile: targeted`
 with `source_profile` and `selected_case`. This result is diagnostic evidence,
 not a Full gate pass. The normal pipeline leaves `ADX_E2E_TARGET_CASE` unset.
 
+For a failure-collecting campaign, set `ADX_E2E_TARGET_CASES` to distinct Full
+case names separated by commas, and reuse one immutable bundle with
+`ADX_E2E_ARTIFACT_BUILD` and `ADX_E2E_ARTIFACT_COMMIT`. Each case gets its own
+Kubernetes namespace, `case.log`, `result.json`, JUnit and cleanup check under
+`out/buildkite/acceptance/<case>/`. The aggregate `result.json` and JUnit at
+`out/buildkite/acceptance/` show passed, failed and unrun cases. A product
+failure with verified cleanup does not hide later cases; missing evidence,
+cleanup failure or timeout stops the campaign before another namespace starts.
+The Buildkite campaign defaults to 7200 seconds and accepts 660–7800 seconds
+via `ADX_E2E_BUDGET_SECONDS`; the E2E job has a 135-minute timeout. Together
+with the preceding image job's 40-minute limit, the CI execution budget is at
+most 175 minutes. The direct `targeted_suite.py` runner accepts at most three
+hours. Both reserve ten minutes for interrupted-driver cleanup. A targeted
+campaign is diagnostic and does not replace the ordinary Full gate.
+
 The Full pipeline sets `ADX_E2E_PROFILE=full`. Direct local driver runs may still
 select `l0` or `k8s-basic` for bounded diagnosis. Full fails after scheduling
 when both platform Pods land on the same
