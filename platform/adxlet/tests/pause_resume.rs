@@ -558,6 +558,46 @@ impl adxlet::checkpoint::CheckpointStore for UnavailablePublication {
         self.0.remove(a).await
     }
 }
+
+struct SharedPublication {
+    local: LocalCheckpointStore,
+    backend: Arc<Backend>,
+}
+#[async_trait]
+impl adxlet::checkpoint::CheckpointStore for SharedPublication {
+    async fn allocate(&self) -> Result<std::path::PathBuf> {
+        self.local.allocate().await
+    }
+    async fn discard_staged(&self, path: &Path) -> Result<()> {
+        self.local.discard_staged(path).await
+    }
+    async fn retain_staged(&self, path: &Path) -> Result<adx_core::CheckpointArtifact> {
+        self.local.publish(path).await
+    }
+    async fn publish(&self, path: &Path) -> Result<adx_core::CheckpointArtifact> {
+        self.backend.event("checkpoint-publish");
+        let mut artifact = self.local.publish(path).await?;
+        artifact.storage = "shared".into();
+        Ok(artifact)
+    }
+    async fn materialize(
+        &self,
+        artifact: &adx_core::CheckpointArtifact,
+    ) -> Result<adxlet::checkpoint::MaterializedCheckpoint> {
+        let mut local = artifact.clone();
+        local.storage = "local".into();
+        self.local.materialize(&local).await
+    }
+    async fn remove(&self, artifact: &adx_core::CheckpointArtifact) -> Result<()> {
+        let mut local = artifact.clone();
+        local.storage = "local".into();
+        self.local.remove(&local).await
+    }
+    async fn committed(&self, _: &adx_core::CheckpointArtifact) -> Result<()> {
+        self.backend.event("checkpoint-store-committed");
+        Ok(())
+    }
+}
 #[tokio::test]
 async fn failed_publication_restores_local_staging_and_reports_pause_failure() {
     let (temp, backend, _node, spec, assignment) = fixture();
@@ -1342,6 +1382,90 @@ async fn workload_checkpoint_keeps_execution_and_commits_before_acknowledging() 
         handle.sync().await.unwrap().record.runtime,
         created.record.runtime
     );
+}
+
+#[tokio::test]
+async fn workload_checkpoint_uses_configured_shared_store_before_acknowledging() {
+    let (temp, backend, _node, mut spec, assignment) = fixture();
+    spec.sandbox.failover = true;
+    let node = Adxlet::new(
+        "node".into(),
+        backend.clone(),
+        backend.clone(),
+        backend.clone(),
+        backend.clone(),
+    )
+    .with_checkpointing(
+        Arc::new(SharedPublication {
+            local: LocalCheckpointStore::new(temp.path().into()).unwrap(),
+            backend: backend.clone(),
+        }),
+        backend.clone(),
+    )
+    .unwrap();
+    node.update_capacity(spec.resources, Duration::from_secs(300))
+        .unwrap();
+    let handle = node.environment(spec, assignment).unwrap();
+    let running = handle.create().await.unwrap();
+    *backend.workload_request.lock().unwrap() = Some("shared-workload".into());
+    handle.tick().await.unwrap();
+    let record = handle.sync().await.unwrap().record;
+    assert_eq!(record.runtime, running.record.runtime);
+    assert_eq!(record.state, EnvironmentState::Running);
+    assert_eq!(record.checkpoint.unwrap().artifact.storage, "shared");
+    let events = backend.events.lock().unwrap();
+    let published = events
+        .iter()
+        .position(|event| event == "checkpoint-publish")
+        .unwrap();
+    let committed = events
+        .iter()
+        .enumerate()
+        .find(|(index, event)| *index > published && event.as_str() == "commit:Running")
+        .map(|(index, _)| index)
+        .unwrap();
+    let cleaned = events
+        .iter()
+        .position(|event| event == "checkpoint-store-committed")
+        .unwrap();
+    let acknowledged = events
+        .iter()
+        .position(|event| event == "checkpoint-ack")
+        .unwrap();
+    assert!(published < committed && committed < cleaned && cleaned < acknowledged);
+}
+
+#[tokio::test]
+async fn workload_checkpoint_rejects_unavailable_shared_publication() {
+    let (temp, backend, _node, mut spec, assignment) = fixture();
+    spec.sandbox.failover = true;
+    let node = Adxlet::new(
+        "node".into(),
+        backend.clone(),
+        backend.clone(),
+        backend.clone(),
+        backend.clone(),
+    )
+    .with_checkpointing(
+        Arc::new(UnavailablePublication(
+            LocalCheckpointStore::new(temp.path().into()).unwrap(),
+        )),
+        backend.clone(),
+    )
+    .unwrap();
+    node.update_capacity(spec.resources, Duration::from_secs(300))
+        .unwrap();
+    let handle = node.environment(spec, assignment).unwrap();
+    let running = handle.create().await.unwrap();
+    *backend.workload_request.lock().unwrap() = Some("failed-upload".into());
+    assert!(handle.tick().await.is_err());
+    let record = handle.sync().await.unwrap().record;
+    assert_eq!(record.state, EnvironmentState::Running);
+    assert_eq!(record.runtime, running.record.runtime);
+    assert!(record.checkpoint.is_none());
+    let events = backend.events.lock().unwrap();
+    assert!(events.iter().any(|event| event == "checkpoint-error"));
+    assert!(!events.iter().any(|event| event == "checkpoint-ack"));
 }
 
 #[tokio::test]

@@ -1,4 +1,4 @@
-//! Runtime-originated local recovery points; serialized with all lifecycle work.
+//! Runtime-originated recovery points; serialized with all lifecycle work.
 use super::Controller;
 use crate::Durability;
 use adx_core::{runtime::RuntimePhase, Error, Event, RestorePoint, Result};
@@ -169,7 +169,7 @@ impl Controller {
             services.store.discard_staged(&staged).await?;
             return Err(error);
         }
-        let artifact = match services.store.retain_staged(&staged).await {
+        let artifact = match services.store.publish(&staged).await {
             Ok(artifact) => artifact,
             Err(error) => {
                 services
