@@ -8,7 +8,7 @@ import tempfile
 import types
 from unittest.mock import patch
 
-from e2e.mixed_soak import evaluate, exercise, run
+from e2e.mixed_soak import evaluate, exercise, run, verify_assignment
 from e2e import run as driver
 
 
@@ -35,11 +35,19 @@ class FakeSandbox:
 
 
 class MixedSoakTests(unittest.TestCase):
+    def test_each_created_sandbox_must_have_the_requested_assignment(self):
+        records = {'environment:sid': json.dumps({'assignment': {'node_id': 'node2'}})}
+        self.assertEqual(verify_assignment('sid', 'node2', lambda: records), 'node2')
+        with self.assertRaisesRegex(AssertionError, 'node assignment'):
+            verify_assignment('sid', 'node1', lambda: records)
+
     def test_failed_live_operation_still_closes_every_created_sandbox(self):
         instances = []
 
         class FailingSandbox:
             def __init__(self, **_kwargs):
+                self.id = 'sid-' + str(len(instances))
+                self.node_id = _kwargs['node_id']
                 self.killed = False
                 self.closed = False
                 self.commands = self
@@ -56,9 +64,14 @@ class MixedSoakTests(unittest.TestCase):
 
         fake_sdk = types.ModuleType('adx_sandbox')
         fake_sdk.Sandbox = FailingSandbox
+        fake_node = types.ModuleType('node')
+        fake_node.catalog = lambda: {
+            'environment:' + item.id: json.dumps({'assignment': {'node_id': item.node_id}})
+            for item in instances
+        }
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / 'result.json'
-            with patch.dict(sys.modules, {'adx_sandbox': fake_sdk}):
+            with patch.dict(sys.modules, {'adx_sandbox': fake_sdk, 'node': fake_node}):
                 with self.assertRaisesRegex(AssertionError, 'mixed-load acceptance failed'):
                     run(object(), 'image', output, seconds=1)
             report = json.loads(output.read_text())
