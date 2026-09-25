@@ -115,5 +115,12 @@ Coordinator 不可用时 SQLite 降级、adxlet 重启等待、心跳过期后�
 观测过期门禁；证据位于 `out/ci/sdk-capability-fc-20260920/fc-lifecycle-r24/`。该套件没有运行
 双克隆，不能用来覆盖上述 26/26 缺口。
 
-仍需优先增加的功能 E2E：活动续期、调度超时、文件传输断点恢复、命令提交
-结果未知、command watch 断线恢复、快照分页／过期／引用删除，以及真实 storage/XPU profile。
+已实现、尚待正式部署验证的定向 Full 用例包括：活动期间不触发空闲回收、中心调度
+deadline、上传和下载应答断开后的同身份续传、命令提交应答断开后的结果查询、Watch
+握手持续不可用、命令结果过期、命令 registry 容量、未知创建结果以及 SQLite 降级与
+Adxlet 重启。`command-expiry` 当前为已知预期红灯；以上用例均不能因为驱动测试通过
+就标记为端到端通过。定向批次入口可在同一不可变制品上逐项部署、清理，并在三小时
+上限内汇总失败，见 `.buildkite/README.md`。
+
+仍需补充：Watch 与查询同时不可用、真实旧版 Execd 能力协商、快照分页／过期／引用删除，
+以及真实 storage/XPU profile。Firecracker 双克隆问题和多 VM 实机验收继续单列。

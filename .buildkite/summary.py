@@ -79,10 +79,14 @@ def collect(root, stage, exit_code, commit, artifact_build=None):
             result['product_commit'] = bundle_commit
         if report and result.get('product_commit'):
             harness = report.get('harness') or {}
-            if harness.get('commit') != commit:
-                raise ValueError('acceptance harness commit differs from this build')
-            if harness.get('product_commit') != result['product_commit']:
-                raise ValueError('acceptance product commit differs from the image bundle')
+            if not harness:
+                if exit_code == 0:
+                    raise ValueError('acceptance harness identity missing')
+            else:
+                if harness.get('commit') != commit:
+                    raise ValueError('acceptance harness commit differs from this build')
+                if harness.get('product_commit') != result['product_commit']:
+                    raise ValueError('acceptance product commit differs from the image bundle')
         result['e2e'] = {'report': report, 'placement': read(root / 'acceptance/placement.json') or []}
         result['e2e']['collection'] = {
             node: {kind: read(root / 'acceptance' / node / f'{kind}-{node}.json')

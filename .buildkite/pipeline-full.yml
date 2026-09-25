@@ -47,7 +47,7 @@ steps:
     os: linux
     arch: amd64
   command: bash .buildkite/step.sh e2e python3 .buildkite/with_registry.py -- bash .buildkite/run-e2e.sh
-  timeout_in_minutes: 30
+  timeout_in_minutes: 135
   artifact_paths:
   - out/buildkite/acceptance/**/*
   - out/buildkite/logs/**/*
