@@ -14,6 +14,37 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class RuntimeLossTests(unittest.TestCase):
+    def test_restart_rechecks_api_directory_after_redis_is_running(self):
+        calls = []
+        expected = object()
+
+        def from_id(instance_id, connection):
+            calls.append(instance_id)
+            if len(calls) == 1:
+                raise RuntimeError(f'sandbox {instance_id} is not running: failed')
+            return expected
+
+        modules = {
+            'adx_sandbox': types.SimpleNamespace(
+                RestartPolicy=object,
+                Sandbox=types.SimpleNamespace(from_id=from_id),
+            ),
+            'node': types.SimpleNamespace(
+                catalog=lambda: {}, labeled_backend=lambda _id: [],
+                persisted_runtime_id=lambda result: result['runtime']['id'],
+            ),
+        }
+        with patch.dict(sys.modules, modules):
+            spec = importlib.util.spec_from_file_location(
+                'runtime_loss_api_directory_case', ROOT / 'sandboxd_runtime_loss.py')
+            scenario = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(scenario)
+            with patch.object(scenario.time, 'sleep'):
+                actual = scenario._attach_after_restart('instance-1', object())
+
+        self.assertIs(actual, expected)
+        self.assertEqual(calls, ['instance-1', 'instance-1'])
+
     def test_never_policy_checks_route_withdrawal_before_delete(self):
         instance_id = 'instance-1'
         assignment = {'node_id': 'node1', 'generation': 1}
