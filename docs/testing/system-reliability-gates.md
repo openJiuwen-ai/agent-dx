@@ -35,8 +35,8 @@
 |---|---|---|---|
 | SD-01 | sandboxd 晚于 adxlet 启动 | adxlet 持续等待；不注册、不准入；sandboxd 就绪后才开始对账和服务 | 已有 UDS 定向测试 |
 | SD-02 | daemon 重启且 runtime 保留 | 已有实例不误判退出；资源观测过期后关闭新准入，连接恢复后对账并重新开放 | pinned gRPC/UDS 契约测试覆盖按标签找回 backend 且不重复 Start；[Full #17](https://buildkite.com/agent-dx/agent-dx-full-test/builds/17) 对两节点 daemon 注入 `SIGKILL`，验证原 backend ID 保留及 SDK 恢复；[Full #40](https://buildkite.com/agent-dx/agent-dx-full-test/builds/40) 验证资源采集进程暂停时观测过期、关闭新准入和恢复。两种故障同时发生仍待独立注入 |
-| SD-03 | daemon 重启且 runtime 丢失，Never | 实例进入 Failed、撤路由、释放资源，不自动冷启动 | [Full #52](https://buildkite.com/agent-dx/agent-dx-full-test/builds/52) 冻结 adxlet 后经 sandboxd 删除 runtime，并强制重启 daemon；旧 backend 未恢复，原归属保持，Redis Failed 且资源释放，最终物理清理通过；入口撤路由仍需单独端到端断言 |
-| SD-04 | daemon 重启且 runtime 丢失，自动重启 | 遵守重试上限与退避，新 backend 使用同一 Environment ID 和有效 generation | [Full #52](https://buildkite.com/agent-dx/agent-dx-full-test/builds/52) 验证 daemon PID 变化、旧 backend 丢失、同归属新 backend、Running/restart_attempts=1 和 SDK 命令；[Full #39](https://buildkite.com/agent-dx/agent-dx-full-test/builds/39) 已验证后续连续退出时的重试上限与退避，最终资源清理通过 |
+| SD-03 | daemon 重启且 runtime 丢失，Never | 实例进入 Failed、撤路由、释放资源，不自动冷启动 | [Full #57](https://buildkite.com/agent-dx/agent-dx-full-test/builds/57) 冻结 adxlet 后经 sandboxd 删除 runtime 并强制重启 daemon；旧 backend 未恢复，原归属保持，Redis Failed 且资源释放。删除前公开 Ingress `/direct` 返回路由缓存中不存在的 HTTP 503；最终物理清理通过 |
+| SD-04 | daemon 重启且 runtime 丢失，自动重启 | 遵守重试上限与退避，新 backend 使用同一 Environment ID 和有效 generation | [Full #57](https://buildkite.com/agent-dx/agent-dx-full-test/builds/57) 验证 daemon PID 变化、旧 backend 丢失、同归属新 backend、Running/restart_attempts=1 和 SDK 命令；Redis Running 到 API Server 可查询的本次延迟为 0.023 秒，测试上限为 5 秒。[Full #39](https://buildkite.com/agent-dx/agent-dx-full-test/builds/39) 已验证后续连续退出时的重试上限与退避，最终资源清理通过 |
 
 ## adxlet 与节点故障
 
