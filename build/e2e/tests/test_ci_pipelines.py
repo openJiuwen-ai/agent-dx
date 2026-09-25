@@ -99,6 +99,8 @@ class IndependentPipelineTests(unittest.TestCase):
         self.assertIn('--sdk-candidate', script)
         self.assertIn('ADX_E2E_ARTIFACT_COMMIT:-$BUILDKITE_COMMIT', script)
         self.assertIn('ADX_E2E_RUNSC_URL', script)
+        self.assertIn('ADX_E2E_RUNSC_IMAGE', script)
+        self.assertIn('build/e2e/runsc_image.py', script)
         self.assertIn('sha512sum --check', script)
 
     def test_e2e_bundle_records_independent_sdk_candidate(self):
