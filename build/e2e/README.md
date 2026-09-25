@@ -242,6 +242,12 @@ Local Docker reproduction requires access to the same bind-mounted paths as the 
   then terminate the holder and retry the rejected ID. Its side effect must
   occur exactly once; Redis assignment, backend and physical cleanup are
   checked. Select with `--profile full --case command-registry-capacity`.
+- `upload-response-cut` (targeted resumable file transfer): a TLS proxy forwards
+  the first binary upload chunk to Execd, waits for its committed offset, then
+  discards the response. The installed SDK must query upload status and continue
+  with the same upload ID from that offset. A fresh SDK client downloads the
+  committed file and checks its SHA256; Redis assignment, physical backend and
+  final cleanup are checked. Select with `--profile full --case upload-response-cut`.
 - `schedule-deadline` (targeted center-queue timeout): require both workers to
   advertise only runc, request runsc on node1 with a three-second schedule
   timeout, observe the request in the admin queue, and require an outcome-unknown
