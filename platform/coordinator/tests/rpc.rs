@@ -1639,6 +1639,10 @@ async fn published_routes_drive_real_gateway_streams_and_reconnect_to_new_coordi
             .await
             .unwrap();
     }));
+    // A committed result must reach subscribers before the long safety refresh.
+    tasks
+        .0
+        .push(tokio::spawn(publisher.clone().run(Duration::from_secs(10))));
     session
         .advertise("test", &format!("https://{ma}"), Duration::from_secs(30))
         .await
@@ -1713,8 +1717,7 @@ async fn published_routes_drive_real_gateway_streams_and_reconnect_to_new_coordi
     record.revision = 3;
     session.commit(record.clone()).await.unwrap();
     let revision = session.revision().await.unwrap();
-    publisher.refresh().await.unwrap();
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(Duration::from_secs(1), async {
         while store.watch_revision() < revision as i64 {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }

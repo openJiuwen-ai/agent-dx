@@ -153,8 +153,20 @@ impl RoutePublisher {
     }
     pub async fn run(self, interval: Duration) {
         let mut tick = tokio::time::interval(interval);
+        let mut committed = self.session.committed_revisions();
         loop {
-            tick.tick().await;
+            tokio::select! {
+                _ = tick.tick() => {},
+                changed = committed.changed() => {
+                    if changed.is_err() {
+                        continue;
+                    }
+                    // Coalesce nearby commits without postponing publication
+                    // indefinitely when writes remain continuous.
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    committed.borrow_and_update();
+                }
+            }
             if self.refresh().await.is_err() {
                 tracing_unavailable();
             }
