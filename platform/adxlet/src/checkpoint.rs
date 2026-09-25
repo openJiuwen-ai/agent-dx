@@ -411,6 +411,7 @@ impl StorageConfig {
                 root,
                 cache_budget_bytes,
             } => {
+                adx_transport::install_crypto_provider();
                 let mut builder = object_store::aws::AmazonS3Builder::from_env()
                     .with_bucket_name(bucket)
                     .with_region(region)
