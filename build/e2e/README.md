@@ -236,6 +236,12 @@ Local Docker reproduction requires access to the same bind-mounted paths as the 
   client recovers the result by command ID; a marker written by the command
   must appear exactly once. Redis assignment, physical backend and final
   cleanup are checked. Select with `--profile full --case command-response-cut`.
+- `command-registry-capacity` (targeted Execd admission limit): only node1's
+  Execd receives a one-record registry limit. Keep one background command
+  running, require a second stable command ID to return `ResourceExhausted`,
+  then terminate the holder and retry the rejected ID. Its side effect must
+  occur exactly once; Redis assignment, backend and physical cleanup are
+  checked. Select with `--profile full --case command-registry-capacity`.
 - `schedule-deadline` (targeted center-queue timeout): require both workers to
   advertise only runc, request runsc on node1 with a three-second schedule
   timeout, observe the request in the admin queue, and require an outcome-unknown

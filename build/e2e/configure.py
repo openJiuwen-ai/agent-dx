@@ -133,6 +133,12 @@ if ':' in host: host='['+host+']'
 relay_mode=os.getenv('ADX_E2E_RELAY_MODE','embedded')
 if relay_mode not in ('embedded','standalone'):raise ValueError('invalid E2E Relay mode')
 node_config={'node_id':node,'listen':'0.0.0.0:17001','metrics_listen':'0.0.0.0:17091','advertised_address':f'{host}:17001','proxy_address':f'{host}:18443','proxy_mode':relay_mode,'tls':tls('node' if node=='node1' else 'node2',{'coordinator':'coordinator','apiserver':'apiserver'}),'sandboxd_socket':str(R/'sandboxd.sock'),'proxy_socket':str(P/'proxy/route.sock'),'capacity_file':str(P/'capacity.json'),'report_interval_seconds':2,'rpc_timeout_seconds':120,'execd_port':50090,'execd_command':['/usr/local/bin/adx-execd'],'execd_env':{'ADX_TRACE_ENABLED':'true','OTEL_EXPORTER_OTLP_TRACES_ENDPOINT':f'http://{socket.gethostbyname(host)}:14317/v1/traces','OTEL_BSP_SCHEDULE_DELAY':'200'}}
+registry_max_records=os.getenv('ADX_E2E_COMMAND_REGISTRY_MAX_RECORDS','')
+if registry_max_records:
+ if not registry_max_records.isdecimal() or int(registry_max_records)<1:
+  raise ValueError('invalid E2E command registry record limit')
+ if node=='node1':
+  node_config['execd_env']['EXECD_COMMAND_REGISTRY_MAX_RECORDS']=registry_max_records
 if use_journal:
  node_config['degradation_journal']=str(P/'degraded/results.sqlite')
  node_config['rpc_timeout_seconds']=30

@@ -67,9 +67,9 @@ upstream，并校验响应体和路径。该项不是客户端序列化单测。
 | `CommandConflict`、`CommandNotFound`、等待超时返回 `RUNNING`／`WAIT_TIMEOUT`、重复 kill 返回 `False` | SDK 单测覆盖；端到端覆盖以对应运行记录为准 |
 | `CommandSubmissionError` | 已增加 `command-response-cut` 定向 Full 用例：真实 `process.start` 成功应答被 TLS 代理切断，新 SDK 客户端以稳定命令 ID 查询结果并检查副作用仅一次；正式部署运行待完成 |
 | `CommandUnavailable` | 需要 command watch 中断且查询暂不可用的故障注入 |
-| `CommandExpired` | 需要可配置结果保留期及过期清理场景 |
+| `CommandExpired` | Execd 已支持配置结果 TTL，但过期后删除记录并返回 `COMMAND_NOT_FOUND`，当前 SDK 只能映射为 `CommandNotFound`；若要求区分过期，须先补 Execd 过期语义及对应 E2E |
 | `UnsupportedFeature` | 需要旧／不完整 Execd capability fixture，不进入基础门禁 |
-| `ResourceExhausted` | 需要命令并发额度耗尽场景；实例容量排队不能替代它 |
+| `ResourceExhausted` | 已增加 `command-registry-capacity` 定向 Full 用例：node1 Execd 的 registry 上限设为 1，运行中的命令占满后第二个稳定命令 ID 被拒，释放后以原 ID 成功且副作用一次；正式部署运行待完成。实例容量排队不替代此用例 |
 
 ## 当前可执行子用例
 
