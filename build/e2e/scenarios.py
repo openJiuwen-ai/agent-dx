@@ -89,6 +89,10 @@ elif sys.argv[1]=='command-response-cut':
     from command_response_cut import run
     report=run(connection,image,E/'command-response-cut-result.json',S)
     print(json.dumps(report),flush=True)
+elif sys.argv[1]=='command-watch-unavailable':
+    from command_watch_unavailable import run
+    report=run(connection,image,E/'command-watch-unavailable-result.json',S)
+    print(json.dumps(report),flush=True)
 elif sys.argv[1]=='command-registry-capacity':
     from command_registry_capacity import run
     report=run(connection,image,E/'command-registry-capacity-result.json')

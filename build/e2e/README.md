@@ -236,6 +236,13 @@ Local Docker reproduction requires access to the same bind-mounted paths as the 
   client recovers the result by command ID; a marker written by the command
   must appear exactly once. Redis assignment, physical backend and final
   cleanup are checked. Select with `--profile full --case command-response-cut`.
+- `command-watch-unavailable` (targeted command observation outage): a TLS proxy
+  rejects only the command Watch handshake while normal HTTP queries remain
+  available. The installed SDK starts one real background command and returns
+  `CommandUnavailable` after its reconnect budget; a fresh healthy SDK client
+  finds and terminates that same command. Redis generation, physical backend
+  and final cleanup are checked. Select with
+  `--profile full --case command-watch-unavailable`.
 - `command-registry-capacity` (targeted Execd admission limit): only node1's
   Execd receives a one-record registry limit. Keep one background command
   running, require a second stable command ID to return `ResourceExhausted`,
