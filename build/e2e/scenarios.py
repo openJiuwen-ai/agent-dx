@@ -112,6 +112,10 @@ elif sys.argv[1]=='command-registry-capacity':
     from command_registry_capacity import run
     report=run(connection,image,E/'command-registry-capacity-result.json')
     print(json.dumps(report),flush=True)
+elif sys.argv[1]=='command-expiry':
+    from command_expiry import run
+    report=run(connection,image,E/'command-expiry-result.json')
+    print(json.dumps(report),flush=True)
 elif sys.argv[1]=='upload-response-cut':
     from upload_response_cut import run
     report=run(connection,image,E/'upload-response-cut-result.json',S)

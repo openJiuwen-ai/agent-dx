@@ -139,6 +139,12 @@ if registry_max_records:
   raise ValueError('invalid E2E command registry record limit')
  if node=='node1':
   node_config['execd_env']['EXECD_COMMAND_REGISTRY_MAX_RECORDS']=registry_max_records
+result_ttl=os.getenv('ADX_E2E_COMMAND_RESULT_TTL_SECS','')
+if result_ttl:
+ if not result_ttl.isdecimal() or int(result_ttl)<1:
+  raise ValueError('invalid E2E command result TTL')
+ if node=='node1':
+  node_config['execd_env']['EXECD_COMMAND_RESULT_TTL_SECS']=result_ttl
 if use_journal:
  node_config['degradation_journal']=str(P/'degraded/results.sqlite')
  node_config['rpc_timeout_seconds']=30
