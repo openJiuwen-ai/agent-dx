@@ -232,60 +232,37 @@ impl Api {
             };
         }
         if method == "GET" && path == "/api/instances" {
-            let Some(instance_id) = query
+            if let Some(instance_id) = query
                 .get("instance_id")
                 .filter(|value| !value.trim().is_empty())
-            else {
-                return error_response(
-                    Status::invalid_argument("instance_id required"),
-                    &request_id,
-                    None,
-                    None,
-                    false,
-                );
-            };
-            return match Box::pin(self.clients.owner(instance_id, &caller, false)).await {
-                Ok(owner) => {
-                    let Some(record) = owner.record else {
-                        return error_response(
-                            Status::unavailable("environment directory returned no record"),
-                            &request_id,
-                            None,
-                            Some(instance_id),
-                            false,
-                        );
-                    };
-                    if record.state == pb::EnvironmentState::Deleted as i32 {
-                        return error_response(
-                            Status::not_found("instance not found"),
-                            &request_id,
-                            None,
-                            Some(instance_id),
-                            false,
-                        );
+            {
+                return match Box::pin(self.clients.owner(instance_id, &caller, false)).await {
+                    Ok(owner) => match instance_view(owner) {
+                        Ok(view) => plain(200, json!([view])),
+                        Err(error) => {
+                            error_response(error, &request_id, None, Some(instance_id), false)
+                        }
+                    },
+                    Err(error) => {
+                        error_response(error, &request_id, None, Some(instance_id), false)
                     }
-                    let Some(spec) = record.spec else {
-                        return error_response(
-                            Status::data_loss("environment record returned no spec"),
-                            &request_id,
-                            None,
-                            Some(instance_id),
-                            false,
-                        );
-                    };
-                    let resource = spec.resources.unwrap_or_default();
-                    plain(
-                        200,
-                        json!([{
-                            "id": instance_id,
-                            "status": state(record.state),
-                            "required_cpu": resource.cpu_millis,
-                            "required_mem": resource.memory_bytes / 1048576,
-                            "image": spec.image,
-                        }]),
-                    )
+                };
+            }
+            return match self.clients.visible_environments(&caller).await {
+                Ok(owners) => {
+                    let mut views = Vec::new();
+                    for owner in owners {
+                        match instance_view(owner) {
+                            Ok(view) => views.push(view),
+                            Err(error) if error.code() == Code::NotFound => (),
+                            Err(error) => {
+                                return error_response(error, &request_id, None, None, false);
+                            }
+                        }
+                    }
+                    plain(200, json!(views))
                 }
-                Err(error) => error_response(error, &request_id, None, Some(instance_id), false),
+                Err(error) => error_response(error, &request_id, None, None, false),
             };
         }
         let mut input = match body(request.into_body(), 1048576).await {
@@ -862,6 +839,25 @@ fn status_code(error: &Status) -> u16 {
         Code::DeadlineExceeded => 504,
         _ => 500,
     }
+}
+fn instance_view(owner: pb::GetEnvironmentResponse) -> Result<Value, Status> {
+    let record = owner
+        .record
+        .ok_or_else(|| Status::data_loss("environment directory returned no record"))?;
+    if record.state == pb::EnvironmentState::Deleted as i32 {
+        return Err(Status::not_found("instance not found"));
+    }
+    let spec = record
+        .spec
+        .ok_or_else(|| Status::data_loss("environment record returned no spec"))?;
+    let resource = spec.resources.unwrap_or_default();
+    Ok(json!({
+        "id": spec.id,
+        "status": state(record.state),
+        "required_cpu": resource.cpu_millis,
+        "required_mem": resource.memory_bytes / 1048576,
+        "image": spec.image,
+    }))
 }
 fn state(value: i32) -> &'static str {
     match pb::EnvironmentState::try_from(value) {
