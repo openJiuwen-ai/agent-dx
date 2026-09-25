@@ -81,6 +81,23 @@ class KubernetesDeploymentTests(unittest.TestCase):
             k8s.resources('adx-e2e-test','registry.example/node@sha256:'+'a'*64,
                           'amd64',redis_storage_class='not/valid')
 
+    def test_default_storage_class_requires_one_dynamic_default(self):
+        import importlib.util
+        spec=importlib.util.spec_from_file_location('k8s_run',ROOT/'kubernetes/run.py')
+        module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+        dynamic={'metadata':{'name':'csi-default','annotations':{
+            'storageclass.kubernetes.io/is-default-class':'true'}},
+            'provisioner':'csi.example.test'}
+        self.assertEqual(module.default_redis_storage_class({'items':[dynamic]}),
+                         'csi-default')
+        with self.assertRaisesRegex(ValueError,'default dynamic StorageClass'):
+            module.default_redis_storage_class({'items':[]})
+        with self.assertRaisesRegex(ValueError,'default dynamic StorageClass'):
+            module.default_redis_storage_class({'items':[dynamic,dynamic]})
+        static={**dynamic,'provisioner':'kubernetes.io/no-provisioner'}
+        with self.assertRaisesRegex(ValueError,'default dynamic StorageClass'):
+            module.default_redis_storage_class({'items':[static]})
+
 class KubernetesLifecycleTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

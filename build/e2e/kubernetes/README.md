@@ -129,6 +129,9 @@ passing base `full` result.
 
 The targeted `redis-pod-restart` case needs a dynamically provisioned
 `ReadWriteOnce` StorageClass, a 1 GiB PVC and permission to manage PVCs. It
+uses the cluster's unique default dynamic class unless
+`--redis-storage-class` explicitly selects one. Class discovery happens before
+the test namespace is created and requires read access to StorageClasses. It
 starts Redis in a separate Pod using the packaged `redis-server` and a
 secret-mounted ACL. It creates live instances on both ADX workers, replaces
 only the Redis Pod, then requires the Pod UID to change while the PVC UID,
@@ -146,8 +149,8 @@ python3 build/e2e/kubernetes/run.py \
   --output out/e2e/redis-pod-restart-001
 ```
 
-In Buildkite, set `ADX_E2E_TARGET_CASE=redis-pod-restart` and
-`ADX_E2E_REDIS_STORAGE_CLASS` to the target class, alongside the exact reused
+In Buildkite, set `ADX_E2E_TARGET_CASE=redis-pod-restart` and optionally
+`ADX_E2E_REDIS_STORAGE_CLASS` to override the cluster default, alongside the exact reused
 artifact build and commit required for every targeted case. The case is not
 verified on a real cluster until its JUnit result, Pod/PVC identities, Redis
 AOF evidence and two-worker backend inventory are retained.
