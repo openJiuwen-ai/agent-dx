@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Deploy an immutable bundle into two isolated nodes; fail on any residual resource."""
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import hashlib
 import json
@@ -18,7 +19,7 @@ import xml.etree.ElementTree as ET
 
 BASIC = ('sdk','auth','capacity','placement','local-first')
 STANDARD = ('sdk','data-plane','lifecycle','auth','capacity','placement','local-first','node-failure','sandboxd-restart','restart','stop')
-OPTIONAL_CASES = ('redis-restart','coordinator-restart','apiserver-restart','ingress-restart','runtime-affinity','idle-active','relay-standalone','runtime-exit','sandboxd-runtime-loss','sqlite-fallback','create-response-cut','resource-stale','network-partition','reconcile-crash','mixed-soak')
+OPTIONAL_CASES = ('redis-restart','coordinator-restart','coordinator-adxlet-restart','apiserver-restart','ingress-restart','runtime-affinity','idle-active','relay-standalone','runtime-exit','sandboxd-runtime-loss','sqlite-fallback','create-response-cut','resource-stale','network-partition','reconcile-crash','mixed-soak')
 PROFILES = {
     'l0': ('l0','auth'),
     'standalone': STANDARD,
@@ -128,6 +129,7 @@ class Run:
         self.selected_case=selected_case
         self.output=output;self.id='adx-e2e-'+uuid.uuid4().hex[:12]
         self.nodes=[];self.network=False;self.commands=0
+        self.command_lock=threading.Lock()
         self.redactions=set();self.case_results=[]
     def event(self, message):
         print(time.strftime('%H:%M:%S', time.gmtime()) + ' ' + self.redact(message), flush=True)
@@ -138,8 +140,9 @@ class Run:
         return text
 
     def command(self, args, timeout=180, *, input_data=None, stream=True, label=None):
-        self.commands += 1
-        log = self.output / f'{self.commands:03d}.log'
+        with self.command_lock:
+            self.commands += 1
+            log = self.output / f'{self.commands:03d}.log'
         args = list(map(str, args))
         name = label or shlex.join(args)
         self.event(f'[EXEC {log.name}] {name}')
@@ -494,6 +497,23 @@ class Run:
                 for node in self.nodes:self.helper(node,'unchanged',node)
                 self.execute('node1','/opt/adx/client/bin/python','-u','/opt/adx/e2e/scenarios.py','recovered-marker',timeout=90)
                 self.execute('node1','/opt/adx/client/bin/python','-u','/opt/adx/e2e/scenarios.py','cleanup-live-control',timeout=90)
+                for node in self.nodes:self.helper(node,'empty',node)
+        if 'coordinator-adxlet-restart' in selected:
+            with self.case('coordinator-adxlet-restart', checks):
+                self.execute('node1','/opt/adx/client/bin/python','-u',
+                             '/opt/adx/e2e/scenarios.py','create-marker',timeout=300)
+                for node in self.nodes:self.helper(node,'capture-backend',node)
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    control=pool.submit(self.helper,'node1','coordinator-restart','node1',timeout=90)
+                    worker=pool.submit(self.helper,'node2','restart','node2',timeout=30)
+                    worker.result()
+                    control.result()
+                self.helper('node1','ready',timeout=150)
+                for node in self.nodes:self.helper(node,'unchanged',node)
+                self.execute('node1','/opt/adx/client/bin/python','-u',
+                             '/opt/adx/e2e/scenarios.py','recovered-marker',timeout=90)
+                self.execute('node1','/opt/adx/client/bin/python','-u',
+                             '/opt/adx/e2e/scenarios.py','cleanup-live-control',timeout=90)
                 for node in self.nodes:self.helper(node,'empty',node)
         for scenario,role in (('apiserver-restart','apiserver'),('ingress-restart','ingress')):
             if scenario not in selected:continue
