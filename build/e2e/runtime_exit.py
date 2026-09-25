@@ -6,7 +6,7 @@ import subprocess
 import time
 
 from adx_sandbox import RestartPolicy, Sandbox
-from node import catalog
+from node import catalog, persisted_runtime_id
 
 
 SOCKET = Path("/tmp/adx-e2e/sandboxd/sandboxd.sock")
@@ -67,7 +67,7 @@ def run(connection, image, output):
         ))
         assert not failed["restart_pending"], failed
         assert not _backend_ids(never.id), old_backend
-        assert not never.is_running(), "Never policy restarted an exited backend"
+        _wait(lambda: not never.is_running(), timeout=15)
         report["cases"].append({
             "id": "lifecycle.runtime-exit-never", "status": "passed",
             "seconds": round(time.monotonic() - started, 3),
@@ -81,7 +81,7 @@ def run(connection, image, output):
         original_assignment = _record(restarted.id)["assignment"]
         attempts = []
         for attempt in (1, 2):
-            previous = _record(restarted.id)["result"]["runtime_id"]
+            previous = persisted_runtime_id(_record(restarted.id)["result"])
             old_backend = _delete_backend(restarted.id)
             _wait(lambda: (
                 r if (r := _record(restarted.id)["result"])["state"] == "Failed"
@@ -89,7 +89,7 @@ def run(connection, image, output):
             ))
             running = _wait(lambda: (
                 r if (r := _record(restarted.id)["result"])["state"] == "Running"
-                and r["runtime_id"] != previous and r["restart_attempts"] == attempt else None
+                and persisted_runtime_id(r) != previous and r["restart_attempts"] == attempt else None
             ))
             record = _record(restarted.id)
             assert record["assignment"] == original_assignment, record["assignment"]
@@ -97,7 +97,7 @@ def run(connection, image, output):
             assert len(identities) == 1 and identities[0] != old_backend, identities
             command = restarted.commands.run("printf runtime-restarted")
             assert command.exit_code == 0 and command.stdout == "runtime-restarted", command
-            attempts.append({"attempt": attempt, "runtime_id": running["runtime_id"],
+            attempts.append({"attempt": attempt, "runtime_id": persisted_runtime_id(running),
                              "backend_id": identities[0]})
         _delete_backend(restarted.id)
         exhausted = _wait(lambda: (
@@ -106,7 +106,7 @@ def run(connection, image, output):
         ))
         assert exhausted["restart_attempts"] == 2, exhausted
         assert not _backend_ids(restarted.id), restarted.id
-        assert not restarted.is_running(), "exhausted restart policy left a running backend"
+        _wait(lambda: not restarted.is_running(), timeout=15)
         report["cases"].append({
             "id": "lifecycle.runtime-exit-bounded-restart", "status": "passed",
             "seconds": round(time.monotonic() - started, 3),

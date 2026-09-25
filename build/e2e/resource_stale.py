@@ -6,7 +6,7 @@ import uuid
 
 from adx_sandbox import Sandbox, SandboxError
 from functional_lifecycle import _wait_deleted
-from node import backend, catalog, labeled_backend
+from node import backend, catalog, labeled_backend, persisted_runtime_id
 
 
 def create(connection, image, output):
@@ -27,7 +27,7 @@ def create(connection, image, output):
         output.write_text(json.dumps({
             'instance_id': sandbox.id,
             'session_id': node['session']['id'],
-            'runtime_id': record['result']['runtime_id'],
+            'runtime_id': persisted_runtime_id(record['result']),
             'backend': backends[0],
         }) + '\n')
     except Exception:

@@ -128,7 +128,12 @@ class AcceptanceGateTests(unittest.TestCase):
             run.nodes=['node1','node2']
             calls=[]
             run.execute=lambda node,*args,**kwargs:calls.append(('execute',node,args[-1])) or ''
-            run.helper=lambda node,*args,**kwargs:calls.append(('helper',node,args[0]))
+            def helper(node,*args,**kwargs):
+                if args[0] in ('freeze-stale-runtime', 'thaw-stale-runtime',
+                               'reconcile-delete-blocked', 'reconcile-recovered'):
+                    self.assertEqual(args[1:], ('node2',))
+                calls.append(('helper',node,args[0]))
+            run.helper=helper
             checks=[]
             run.scenarios(checks,('reconcile-crash',))
             self.assertEqual(checks,['reconcile-crash'])
