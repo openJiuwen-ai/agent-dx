@@ -4,7 +4,7 @@
     "title": "系统错误、超时与故障可靠性门禁",
     "stage": "13",
     "status": "pending",
-    "detail": "已修正local-first预算边界、中心队列独立超时和sandboxd晚启动等待；稳定错误映射及SDK同身份重试已有组件门禁。Full #17验证sandboxd daemon重启；Full #42验证真实TLS代理断流，#40验证资源采集过期，#43验证对账中断重启，#31验证双物理worker网络隔离。提交0b936fd补真实Redis回归用例且22项RPC通过，基础包#91的构建及K8s L0通过；Full #48使用该产品制品通过独立Redis Pod/PVC重启、AOF和双worker原实例读写/删除，最终无清理残留。完整三VM故障门禁和FC专项仍待补齐。",
+    "detail": "已修正local-first预算边界、中心队列独立超时和sandboxd晚启动等待；稳定错误映射及SDK同身份重试已有组件门禁。Full #17验证sandboxd daemon重启；#42验证真实TLS代理断流，#40验证资源采集过期，#43验证对账中断重启，#31验证双物理worker网络隔离；#52验证daemon重启同时丢失runtime后的Never与自动重启两种策略，旧/新backend、Redis状态和SDK命令均通过。提交0b936fd补真实Redis回归用例且22项RPC通过，基础包#91构建及K8s L0通过；Full #48通过独立Redis Pod/PVC重启、AOF和双worker原实例读写/删除。完整三VM故障门禁和FC专项仍待补齐。",
     "gate": "ERR-01..04、TIME-01..05、SD-01..04、NM-01..03和NODE-01..04按system-reliability-gates.md完成对应拓扑E2E并保存客户端、Redis、路由和物理backend证据。"
   },
   {
@@ -44,7 +44,7 @@
     "title": "Standalone 与正式部署韧性扩展",
     "stage": "7",
     "status": "pending",
-    "detail": "Buildkite Full #27、#33、#36至#43验证分进程Ingress/Relay、托管Redis、Coordinator/API Server重启、实例自动重启、采集过期、SQLite降级、代理断流和对账二次崩溃；#31验证真实双worker网络隔离。Full #48用基础包#91及已验明镜像在动态StorageClass csi-disk-topology完成Redis PVC重建、AOF、双节点原实例SDK读写及删除；PVC UID不变、Pod UID变化，missing_checks=[]且cleanup_errors=[]。节点与Coordinator组合故障仍需专项证据。",
+    "detail": "Buildkite Full #27、#33、#36至#43验证分进程Ingress/Relay、托管Redis、Coordinator/API Server重启、实例自动重启、采集过期、SQLite降级、代理断流和对账二次崩溃；#31验证真实双worker网络隔离。Full #48用基础包#91及已验明镜像在动态StorageClass csi-disk-topology完成Redis PVC重建、AOF、双节点原实例SDK读写及删除；PVC UID不变、Pod UID变化。Full #52通过sandboxd daemon重启同时丢失runtime的Never/Restart策略，最终双节点backend为空且cleanup_errors=[]。节点与Coordinator组合故障仍需专项证据。",
     "gate": "补齐ST-06..10和FD-06..08其余真实故障证据，并核对每项的归属、路由、物理backend和最终清理。"
   },
   {
@@ -108,7 +108,7 @@
     "title": "真实服务混合负载与长稳",
     "stage": "5",
     "status": "complete",
-    "detail": "Buildkite Full #51 在不同物理worker运行330.329秒，公开SDK完成1531次命令、1531次文件往返、265次创建和265次删除，6项子检查、最终backend清空及namespace清理均通过，业务错误为零。命令/文件/创建/删除p99分别为558.956/45.127/234.522/166.187毫秒。工作负载指定node1/node2目标，但未逐实例读回实际归属；日志有345条最终恢复的路由缓存503重试，发布时效另列待办。证据在out/ci/multivm-coverage-0925/full51-evidence/。",
+    "detail": "Buildkite Full #53 在不同物理worker运行330.321秒，公开SDK完成1515次命令、1515次文件往返、267次创建和267次删除，6项子检查、最终backend清空及namespace清理均通过，业务错误为零。每个实例从Coordinator读回实际归属：node1为134个、node2为133个，与创建总数一致。命令/文件/创建/删除p99分别为544.023/45.286/274.171/161.486毫秒。日志有293条最终恢复的路由缓存503重试，发布时效另列待办。证据在out/ci/multivm-coverage-0925/full53-evidence/。",
     "gate": "在正式两worker部署运行--case mixed-soak，要求至少300秒、40次命令和文件、5次创建与删除、零错误及物理清理；保存操作量、延迟和最终资源证据。"
   },
   {
@@ -116,7 +116,7 @@
     "title": "提交后路由发布时效",
     "stage": "7",
     "status": "pending",
-    "detail": "Full #51 的300秒混合负载业务无失败，但日志有345条新实例首次访问时的路由缓存503重试。当前Coordinator周期刷新可能使已提交Running实例晚于创建响应对Ingress可见；需要按先前决定保留有界合并效果，将已提交状态变化触发发布，并采集创建结果至可路由的延迟分位。",
+    "detail": "Full #51、#53 的300秒混合负载业务均无失败，但分别有345和293条新实例首次访问时的路由缓存503重试。当前Coordinator周期刷新可能使已提交Running实例晚于创建响应对Ingress可见；需要按先前决定保留有界合并效果，将已提交状态变化触发发布，并采集创建结果至可路由的延迟分位。",
     "gate": "先用测试固定提交后及时发布、短窗口合并与持续写入不无限推迟的契约；在真实双worker负载下验证路由可见延迟和无业务错误，并保存Ingress缓存与提交时间证据。"
   },
   {
