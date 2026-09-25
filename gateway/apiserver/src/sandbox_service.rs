@@ -1,7 +1,6 @@
 //! Sandbox application service shared by HTTP and in-process callers.
 use crate::{
     clients::{authorize, Clients},
-    config::CreateMode,
     contract,
     operations::{Kind, Operations},
 };
@@ -122,15 +121,39 @@ impl SandboxService {
         if let Some(result) = &operation.result {
             return result.clone();
         }
-        {
+        let competing_create = {
             let mut names = self.names.lock().await;
             if let Some(existing) = names.get(&operation.spec.id) {
-                if existing != &create_key && self.clients.config.create_mode == CreateMode::Central
-                {
-                    return Err(Status::already_exists("environment create in progress"));
+                if existing != &create_key {
+                    Some(existing.clone())
+                } else {
+                    None
+                }
+            } else {
+                names.insert(operation.spec.id.clone(), create_key.clone());
+                None
+            }
+        };
+        if let Some(competing_key) = competing_create {
+            let other = self.creates.lock().await.get(&competing_key).cloned();
+            if let Some(other) = other {
+                let other = other.lock().await;
+                if !matches_spec(&operation.spec, &other.spec) {
+                    return Err(Status::already_exists(
+                        "environment create in progress with different arguments",
+                    ));
                 }
             }
-            names.insert(operation.spec.id.clone(), create_key.clone());
+            let result = self
+                .reuse_existing(&operation.spec, &input, request_id, caller)
+                .await;
+            if !result.as_ref().is_err_and(|error| {
+                matches!(error.code(), Code::Unavailable | Code::DeadlineExceeded)
+            }) {
+                operation.result = Some(result.clone());
+            }
+            operation.touched = Instant::now();
+            return result;
         }
         let result = self
             .perform_create(&operation.spec, &input, request_id, caller)
@@ -154,12 +177,15 @@ impl SandboxService {
         request_id: &str,
         caller: &pb::CallerContext,
     ) -> Result<Value, Status> {
-        if self.clients.config.create_mode == CreateMode::Central {
-            match self.clients.owner(&spec.id, caller, false).await {
-                Ok(_) => return Err(Status::already_exists("environment already exists")),
-                Err(error) if error.code() == Code::NotFound => {}
-                Err(error) => return Err(error),
+        match self.clients.owner(&spec.id, caller, false).await {
+            Ok(owner) => {
+                let record = owner
+                    .record
+                    .ok_or_else(|| Status::data_loss("environment directory returned no record"))?;
+                return existing_running_response(spec, input, request_id, &record);
             }
+            Err(error) if error.code() == Code::NotFound => {}
+            Err(error) => return Err(error),
         }
 
         let timeouts = contract::create_timeouts(input)?;
@@ -180,47 +206,82 @@ impl SandboxService {
         let record = result
             .record
             .ok_or_else(|| Status::unavailable("create returned no environment record"))?;
-        let confirmed_spec = record
-            .spec
-            .as_ref()
-            .ok_or_else(|| Status::unavailable("create returned no environment spec"))?;
-        if record.state != pb::EnvironmentState::Running as i32
-            || result.durability != pb::Durability::Published as i32
-            || !matches_spec(spec, confirmed_spec)
-        {
+        if result.durability != pb::Durability::Published as i32 {
             return Err(Status::unavailable("create is not durably confirmed"));
         }
+        let response = existing_running_response(spec, input, request_id, &record)?;
 
         // Close the read-after-create window without making ordinary lifecycle
         // requests query Coordinator. The versioned stream remains the steady-state path.
-        self.clients.owner(&confirmed_spec.id, caller, true).await?;
-        let mut response = json!({
-            "sandboxId": confirmed_spec.id,
-            "instanceId": confirmed_spec.id,
-            "status": "running",
-            "requestId": request_id,
-        });
-        if input.pointer("/tunnel/enabled").and_then(Value::as_bool) == Some(true) {
-            let port = confirmed_spec
-                .env
-                .get("EXECD_TUNNEL_HTTP_PORT")
-                .and_then(|port| port.parse::<u16>().ok())
-                .unwrap_or(8766);
-            let safe_id = confirmed_spec
-                .id
-                .replace('@', "-at-")
-                .replace(['/', '.', '_'], "-");
-            let path = format!("/tunnel/{safe_id}");
-            response["tunnel"] = json!({
-                "url": path,
-                "path": path,
-                "wsPath": path,
-                "proxyUrl": format!("http://127.0.0.1:{port}"),
-                "proxyPort": port,
-            });
-        }
+        self.clients.owner(&spec.id, caller, true).await?;
         Ok(response)
     }
+
+    async fn reuse_existing(
+        &self,
+        spec: &pb::EnvironmentSpec,
+        input: &Value,
+        request_id: &str,
+        caller: &pb::CallerContext,
+    ) -> Result<Value, Status> {
+        let owner = match self.clients.owner(&spec.id, caller, false).await {
+            Ok(owner) => owner,
+            Err(error) if error.code() == Code::NotFound => {
+                self.clients.owner(&spec.id, caller, true).await?
+            }
+            Err(error) => return Err(error),
+        };
+        let record = owner
+            .record
+            .ok_or_else(|| Status::data_loss("environment directory returned no record"))?;
+        existing_running_response(spec, input, request_id, &record)
+    }
+}
+
+fn existing_running_response(
+    spec: &pb::EnvironmentSpec,
+    input: &Value,
+    request_id: &str,
+    record: &pb::EnvironmentRecord,
+) -> Result<Value, Status> {
+    let confirmed_spec = record
+        .spec
+        .as_ref()
+        .ok_or_else(|| Status::data_loss("environment record returned no spec"))?;
+    if !matches_spec(spec, confirmed_spec) {
+        return Err(Status::already_exists(
+            "environment already exists with different arguments",
+        ));
+    }
+    if record.state != pb::EnvironmentState::Running as i32 {
+        return Err(Status::unavailable("environment create is not yet running"));
+    }
+    let mut response = json!({
+        "sandboxId": confirmed_spec.id,
+        "instanceId": confirmed_spec.id,
+        "status": "running",
+        "requestId": request_id,
+    });
+    if input.pointer("/tunnel/enabled").and_then(Value::as_bool) == Some(true) {
+        let port = confirmed_spec
+            .env
+            .get("EXECD_TUNNEL_HTTP_PORT")
+            .and_then(|port| port.parse::<u16>().ok())
+            .unwrap_or(8766);
+        let safe_id = confirmed_spec
+            .id
+            .replace('@', "-at-")
+            .replace(['/', '.', '_'], "-");
+        let path = format!("/tunnel/{safe_id}");
+        response["tunnel"] = json!({
+            "url": path,
+            "path": path,
+            "wsPath": path,
+            "proxyUrl": format!("http://127.0.0.1:{port}"),
+            "proxyPort": port,
+        });
+    }
+    Ok(response)
 }
 
 fn matches_spec(want: &pb::EnvironmentSpec, got: &pb::EnvironmentSpec) -> bool {
@@ -250,4 +311,44 @@ fn matches_spec(want: &pb::EnvironmentSpec, got: &pb::EnvironmentSpec) -> bool {
             .all(|(key, value)| got.env.get(key) == Some(value))
         && want.priority == got.priority
         && want.lifecycle == got.lifecycle
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn existing_running_name_converges_only_for_identical_spec() {
+        let spec = pb::EnvironmentSpec {
+            id: "tenant-worker".into(),
+            tenant_id: "tenant".into(),
+            runtime_class: "runsc".into(),
+            ..Default::default()
+        };
+        let record = pb::EnvironmentRecord {
+            spec: Some(spec.clone()),
+            state: pb::EnvironmentState::Running as i32,
+            ..Default::default()
+        };
+        let response = existing_running_response(&spec, &json!({}), "create-a", &record).unwrap();
+        assert_eq!(response["instanceId"], "tenant-worker");
+        assert_eq!(response["requestId"], "create-a");
+
+        let mut different = spec.clone();
+        different.runtime_class = "firecracker".into();
+        assert_eq!(
+            existing_running_response(&different, &json!({}), "create-b", &record)
+                .unwrap_err()
+                .code(),
+            Code::AlreadyExists
+        );
+        let mut pending = record;
+        pending.state = pb::EnvironmentState::Starting as i32;
+        assert_eq!(
+            existing_running_response(&spec, &json!({}), "create-c", &pending)
+                .unwrap_err()
+                .code(),
+            Code::Unavailable
+        );
+    }
 }

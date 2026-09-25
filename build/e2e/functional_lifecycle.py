@@ -5,6 +5,7 @@ from pathlib import Path
 import subprocess
 import sys
 import time
+import uuid
 
 from adx_sandbox import Sandbox, SandboxNotFound
 
@@ -70,6 +71,43 @@ def run(connection, image, output):
         _wait_deleted(detached_id, connection)
         checks['detached_reattach_and_delete'] = detached_id
         passed('lifecycle.detached-close-reattach-delete', started)
+
+        started = begin('lifecycle.named-create-reuses-running-owner')
+        name = f'e2e-named-{uuid.uuid4().hex[:12]}'
+        first = Sandbox(
+            name=name,
+            image=image,
+            runtime='runc',
+            cpu=500,
+            memory=512,
+            idle_timeout=0,
+            detached=True,
+            connection=connection,
+            create_timeout=150,
+        )
+        named_id = first.id
+        remaining.add(named_id)
+        first.close()
+        reopened = Sandbox(
+            name=name,
+            image=image,
+            runtime='runc',
+            cpu=500,
+            memory=512,
+            idle_timeout=0,
+            detached=True,
+            connection=connection,
+            create_timeout=150,
+        )
+        try:
+            assert reopened.id == named_id
+            assert reopened.commands.run("printf 'same-owner'").stdout == 'same-owner'
+        finally:
+            reopened.close()
+        Sandbox.delete(named_id, connection=connection)
+        remaining.remove(named_id)
+        _wait_deleted(named_id, connection)
+        passed('lifecycle.named-create-reuses-running-owner', started)
 
         started = begin('lifecycle.attached-close-preserves-instance')
         attached = Sandbox(
