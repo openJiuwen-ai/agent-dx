@@ -57,7 +57,7 @@ upstream，并校验响应体和路径。该项不是客户端序列化单测。
 | idle timeout、detached、close/kill/context manager | 已覆盖 | 增加活动续期防误回收 |
 | port forwarding + 默认 `tls-token` | 已覆盖；Standalone r4 同时通过默认 TLS+Token 和每实例纯 TLS | 增加显式拒绝错误字段断言 |
 | snapshot_id、restart_policy | FC 覆盖 | 快照分页、过期和被引用时延迟删除 |
-| xpu | 仅校验和调度 UT | 需要真实 GPU/NPU worker |
+| xpu | 仅校验和调度 UT；独立真实设备用例见 `build/e2e/device/`，尚无 GPU/NPU 实跑结果 | 需要真实 GPU/NPU worker |
 | storage_mb | FC 用例验证独立 request/limit 可下发并启动 | 仍需写满边界、超限及回收 E2E |
 | S3 rootfs、S3 EROFS mount、failover、inherit_entrypoint、network、独立 request/limit | 本地 KVM 已逐项实跑；r16 SDK 19/19，r17/r18 在已更新 package 上连续通过前 16 项后才触发已知双克隆网络故障 | 继续修复 ARM FC 双克隆网络问题并取得同一次 26/26 严格验收 |
 | data_plane_security | Standalone r4 已通过每实例纯 TLS 与默认 TLS+Token 对照 | 增加非法安全模式和证书轮换场景 |
