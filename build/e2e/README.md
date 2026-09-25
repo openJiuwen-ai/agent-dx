@@ -170,8 +170,10 @@ Local Docker reproduction requires access to the same bind-mounted paths as the 
   nodes for 300 seconds. Two concurrent workers exercise command and binary
   file round trips on the retained Sandboxes. Require at least 40 commands and
   file round trips, five creations and deletions, zero operation errors, and
-  physical backend cleanup on both nodes. Record operation counts and
-  p50/p95/p99/max latency in `mixed-soak-result.json`. Select it with
+  physical backend cleanup on both nodes. Read back the authoritative node
+  assignment for every created Sandbox and record verified counts per node.
+  Record operation counts and p50/p95/p99/max latency in
+  `mixed-soak-result.json`. Select it with
   `--profile full --case mixed-soak` or `--profile standalone --case mixed-soak`;
   it is excluded from the fast default gate.
 - `idle-active` (targeted activity case): hold a foreground SDK command request

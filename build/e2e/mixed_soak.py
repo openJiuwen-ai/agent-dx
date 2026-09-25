@@ -11,6 +11,18 @@ import time
 MINIMUM_OPERATIONS = {'command': 40, 'file': 40, 'create': 5, 'delete': 5}
 
 
+def verify_assignment(instance_id, expected_node, catalog):
+    """Read authoritative ownership for every Sandbox counted by the load test."""
+    record = json.loads(catalog()['environment:' + instance_id])
+    actual = record['assignment']['node_id']
+    if actual != expected_node:
+        raise AssertionError(
+            f'node assignment differs from requested target: {instance_id} '
+            f'expected={expected_node} actual={actual}'
+        )
+    return actual
+
+
 def exercise(sandbox, marker):
     """Prove a command and a binary file round trip on one live sandbox."""
     if not re.fullmatch(r'[a-z0-9-]+', marker):
@@ -68,6 +80,7 @@ def evaluate(samples, errors, elapsed, minimum_seconds):
 def run(connection, image, output, seconds=300):
     """Keep two pinned sandboxes active while a third worker creates and deletes."""
     from adx_sandbox import Sandbox
+    from node import catalog
 
     if not 1 <= seconds <= 900:
         raise ValueError('mixed-load duration must be between 1 and 900 seconds')
@@ -77,6 +90,7 @@ def run(connection, image, output, seconds=300):
     stop = threading.Event()
     anchors = []
     started = None
+    verified_placements = {'node1': 0, 'node2': 0}
 
     def record(name, milliseconds):
         with lock:
@@ -92,6 +106,16 @@ def run(connection, image, output, seconds=300):
         sandbox = Sandbox(image=image, runtime='runc', node_id=node,
                           cpu=250, memory=256, idle_timeout=0,
                           connection=connection, create_timeout=150)
+        try:
+            verify_assignment(sandbox.id, node, catalog)
+        except Exception:
+            try:
+                sandbox.kill()
+            finally:
+                sandbox.close()
+            raise
+        with lock:
+            verified_placements[node] += 1
         record('create', (time.monotonic() - begin) * 1000)
         return sandbox
 
@@ -160,6 +184,7 @@ def run(connection, image, output, seconds=300):
                 fail(error)
         elapsed = time.monotonic() - started if started is not None else 0
         report = evaluate(samples, errors, elapsed, seconds)
+        report['verified_placements'] = verified_placements
         output.write_text(json.dumps(report, indent=2) + '\n')
     if report['status'] != 'passed':
         raise AssertionError('mixed-load acceptance failed: ' + str(report['errors']))
