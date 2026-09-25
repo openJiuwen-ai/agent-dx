@@ -223,6 +223,12 @@ Local Docker reproduction requires access to the same bind-mounted paths as the 
   retry with the same request ID and name; the final generation and backend
   must remain unchanged, and the instance must execute and delete normally.
   Select with `--profile full --case create-response-cut`.
+- `create-unknown-query` (targeted transient-404 case): a TLS proxy drops the
+  first create response before forwarding its write. The installed SDK keeps
+  the original request ID and name while an independent public SDK lookup
+  receives 404. The proxy then completes the original write and releases the
+  retry; require one Redis assignment, one physical backend, a working command
+  and full cleanup. Select with `--profile full --case create-unknown-query`.
 - `resource-stale` (targeted observation-expiry case): pause only node1's
   resource observer so its 10-second capacity sample expires while adxlet,
   Coordinator and existing backends continue. Require node1 to close new

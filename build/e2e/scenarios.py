@@ -81,6 +81,10 @@ elif sys.argv[1]=='create-response-cut':
     from create_response_cut import run
     report=run(connection,image,E/'create-response-cut-result.json',S)
     print(json.dumps(report),flush=True)
+elif sys.argv[1]=='create-unknown-query':
+    from create_unknown_query import run
+    report=run(connection,image,E/'create-unknown-query-result.json',S)
+    print(json.dumps(report),flush=True)
 elif sys.argv[1]=='resource-create':
     from resource_stale import create
     create(connection,image,E/'resource-live.json')
