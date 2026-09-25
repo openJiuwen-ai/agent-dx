@@ -246,6 +246,8 @@ profile；完整 Multi-VM 在补齐部署器前不能标记为通过。
 | `FD-FC-01` | 条件计划 | KVM worker 的 Firecracker pause/resume/snapshot profile |
 | `FD-XPU-01` | 条件计划 | 真实 GPU/NPU 整卡发现、过滤、分配、释放和故障清理 |
 | `FD-SOAK-01` | Nightly | 创建／执行／删除循环及反复节点故障，持续 1–24 小时无资源增长 |
+| `FD-PERF-01` | 用例已实现，待正式部署运行 | `load-performance` 以公开 SDK 在双物理 worker 上持续 90 秒执行命令、二进制文件与实例创建／删除，保存每类操作数、吞吐、P50/P95/P99 和最大延迟，不对未指定规格的集群设固定时延阈值 |
+| `FD-PRESS-01` | 用例已实现，待正式部署运行 | `load-pressure` 用两个 2000m CPU 实例占满节点，再并发提交八个 2000m 请求；先证明八项全部进入中心队列且账本不超分，释放占用后核对全部独立归属、命令和物理清理 |
 
 `FD-11..21` 在 [2026-09-25 cn-north-4 定向部署](2026-09-25-cn-north-4-targeted-reliability.md) 使用基础包 #95 的同一产品提交运行，11/11 通过，JUnit 14/14；这是定向批次，不等于同次执行完整 Full 十一组。
 

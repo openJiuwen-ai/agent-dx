@@ -53,6 +53,14 @@ elif sys.argv[1]=='mixed-soak':
     from mixed_soak import run
     result=E/'mixed-soak-result.json'
     print(json.dumps(run(connection,image,result)),flush=True)
+elif sys.argv[1]=='load-performance':
+    from load.performance import run
+    result=E/'load-performance-result.json'
+    print(json.dumps(run(connection,image,result)),flush=True)
+elif sys.argv[1]=='load-pressure':
+    from load.pressure import run
+    result=E/'load-pressure-result.json'
+    print(json.dumps(run(connection,image,result,S/'tls/ca.pem',S/'admin-key')),flush=True)
 elif sys.argv[1]=='idle-active':
     from idle_active import run
     result=E/'idle-active-result.json'

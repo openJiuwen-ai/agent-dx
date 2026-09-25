@@ -160,6 +160,10 @@ AOF evidence and two-worker backend inventory are retained.
 The optional `--profile full --case mixed-soak` runs a five-minute public SDK
 load on both workers and records per-operation counts, latency percentiles,
 errors and final physical cleanup. It does not run in the default Full gate.
+The Full-only `load-performance` and `load-pressure` cases record a bounded
+throughput/latency sample and concurrent queue saturation respectively. Their
+contract and shared three-hour suite budget are described in
+[load acceptance](../load/README.md).
 
 Every invocation requires a new evidence directory and creates a unique test
 namespace. Target images must be digest pinned. Registry TLS verification is
