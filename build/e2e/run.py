@@ -419,16 +419,16 @@ class Run:
                 manager_frozen=True
                 try:
                     self.helper('node1','failure-observed',timeout=75)
-                    self.helper('node2','freeze-stale-runtime',timeout=15)
+                    self.helper('node2','freeze-stale-runtime','node2',timeout=15)
                     self.helper('node2','thaw','node2',timeout=15)
                     manager_frozen=False
-                    self.helper('node2','reconcile-delete-blocked',timeout=25)
+                    self.helper('node2','reconcile-delete-blocked','node2',timeout=25)
                 finally:
                     try:
                         if manager_frozen:self.helper('node2','thaw','node2',timeout=15)
                     finally:
-                        self.helper('node2','thaw-stale-runtime',timeout=15)
-                self.helper('node2','reconcile-recovered',timeout=90)
+                        self.helper('node2','thaw-stale-runtime','node2',timeout=15)
+                self.helper('node2','reconcile-recovered','node2',timeout=90)
                 self.execute('node1','/opt/adx/client/bin/python','-u',
                              '/opt/adx/e2e/scenarios.py','failure-cleanup',timeout=90)
                 for node in self.nodes:self.helper(node,'empty',node)

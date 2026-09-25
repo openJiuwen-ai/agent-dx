@@ -15,6 +15,12 @@ spec.loader.exec_module(node)
 
 
 class SandboxdRestartTests(unittest.TestCase):
+    def test_persisted_runtime_identity_uses_environment_record_runtime(self):
+        result = {'state': 'Running', 'runtime': {'id': 'capsule-1-runtime-1'}}
+        self.assertEqual(node.persisted_runtime_id(result), 'capsule-1-runtime-1')
+        with self.assertRaises(KeyError):
+            node.persisted_runtime_id({'state': 'Running', 'runtime_id': 'old-shape'})
+
     def test_reconciliation_barrier_requires_stopped_runtime_and_pending_term(self):
         pending=1 << (signal.SIGTERM - 1)
         status=f'State:\tT (stopped)\nSigPnd:\t{pending:016x}\nShdPnd:\t0000000000000000\n'

@@ -15,7 +15,8 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class RuntimeExitScenarioTests(unittest.TestCase):
     def fixture(self, *, reuse_identity=False):
-        state = {"records": {}, "backends": {}, "deleted": [], "commands": []}
+        state = {"records": {}, "backends": {}, "deleted": [], "commands": [],
+                 "stale_status_reads": {}}
 
         class Sandbox:
             def __init__(self, **options):
@@ -24,7 +25,7 @@ class RuntimeExitScenarioTests(unittest.TestCase):
                 state["records"][self.id] = {
                     "result": {"state": "Running", "resources_held": True,
                                "restart_pending": False, "restart_attempts": 0,
-                               "runtime_id": self.id + "-runtime-0"},
+                               "runtime": {"id": self.id + "-runtime-0"}},
                     "assignment": {"node_id": "node1", "generation": 1},
                     "policy": options.get("restart_policy"),
                 }
@@ -35,6 +36,9 @@ class RuntimeExitScenarioTests(unittest.TestCase):
                 return types.SimpleNamespace(exit_code=0, stdout=command.removeprefix("printf "))
 
             def is_running(self):
+                if state["stale_status_reads"].get(self.id, 0):
+                    state["stale_status_reads"][self.id] -= 1
+                    return True
                 return state["records"][self.id]["result"]["state"] == "Running"
 
             def kill(self):
@@ -48,7 +52,9 @@ class RuntimeExitScenarioTests(unittest.TestCase):
         modules = {
             "adx_sandbox": types.SimpleNamespace(Sandbox=Sandbox,
                                                   RestartPolicy=lambda **options: options),
-            "node": types.SimpleNamespace(catalog=lambda: {}),
+            "node": types.SimpleNamespace(
+                catalog=lambda: {},
+                persisted_runtime_id=lambda result: result["runtime"]["id"]),
         }
         spec = importlib.util.spec_from_file_location("runtime_exit_case", ROOT / "runtime_exit.py")
         scenario = importlib.util.module_from_spec(spec)
@@ -69,6 +75,7 @@ class RuntimeExitScenarioTests(unittest.TestCase):
             result["restart_pending"] = bool(record["policy"] and result["restart_attempts"] < 2)
             if not result["restart_pending"]:
                 result["resources_held"] = False
+                state["stale_status_reads"][instance_id] = 1
             return old
 
         def wait(predicate, **_options):
@@ -81,8 +88,8 @@ class RuntimeExitScenarioTests(unittest.TestCase):
                     attempt = result["restart_attempts"] + 1
                     result.update(state="Running", restart_pending=False,
                                   restart_attempts=attempt,
-                                  runtime_id=(result["runtime_id"] if reuse_identity
-                                              else instance_id + f"-runtime-{attempt}"))
+                                  runtime={"id": (result["runtime"]["id"] if reuse_identity
+                                          else instance_id + f"-runtime-{attempt}")})
                     state["backends"][instance_id] = [instance_id + f"-backend-{attempt}"]
             value = predicate()
             if not value:

@@ -36,7 +36,7 @@ class ResourceStaleScenarioTests(unittest.TestCase):
                 backends[self.id] = 'backend-' + self.id
                 records['environment:' + self.id] = {
                     'assignment': {'node_id': 'node1'},
-                    'result': {'state': 'Running', 'runtime_id': 'runtime-' + self.id,
+                    'result': {'state': 'Running', 'runtime': {'id': 'runtime-' + self.id},
                                'resources_held': True},
                 }
 
@@ -69,6 +69,7 @@ class ResourceStaleScenarioTests(unittest.TestCase):
                 backend=lambda: sorted(backends.values()),
                 labeled_backend=lambda instance_id: (
                     [backends[instance_id]] if instance_id in backends else []),
+                persisted_runtime_id=lambda result: result['runtime']['id'],
             ),
         }
         spec = importlib.util.spec_from_file_location('resource_stale_case',

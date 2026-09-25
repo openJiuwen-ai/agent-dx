@@ -123,7 +123,7 @@ def run(connection, image, output, secrets):
     """Prove a lost committed response converges through the installed public SDK."""
     from adx_sandbox import ConnectionConfig, Sandbox
     from functional_lifecycle import _wait_deleted
-    from node import catalog, labeled_backend
+    from node import catalog, labeled_backend, persisted_runtime_id
 
     started = time.monotonic()
     name = 'response-cut-' + uuid.uuid4().hex
@@ -143,7 +143,7 @@ def run(connection, image, output, secrets):
         return {
             'instance_id': sid,
             'generation': record['assignment']['generation'],
-            'runtime_id': result['runtime_id'],
+            'runtime_id': persisted_runtime_id(result),
             'backend': backends[0],
         }
 
@@ -178,7 +178,7 @@ def run(connection, image, output, secrets):
 
         record = json.loads(catalog()['environment:' + instance_id])
         assert record['assignment']['generation'] == first['generation'], record['assignment']
-        assert record['result']['runtime_id'] == first['runtime_id'], record['result']
+        assert persisted_runtime_id(record['result']) == first['runtime_id'], record['result']
         assert labeled_backend(instance_id) == [first['backend']]
         attached = Sandbox.from_id(instance_id, connection=connection)
         try:

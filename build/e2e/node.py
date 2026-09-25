@@ -19,6 +19,8 @@ def catalog():
     env={**os.environ,'REDISCLI_AUTH':(S/'redis-key').read_text().strip()}
     host=os.getenv('ADX_E2E_REDIS_HOST','coordinator')
     return json.loads(subprocess.check_output(['redis-cli','-h',host,'--json','HGETALL','adx:{acceptance}:control:v1'],env=env,text=True,timeout=5))
+def persisted_runtime_id(result):
+    return result['runtime']['id']
 def nodes():
     c=catalog();return [json.loads(c['node:'+node]) for node in ('node1','node2')]
 def backend():
@@ -259,7 +261,7 @@ def main():
                         and len(keep_backend)==1 and not idle_backend:
                     evidence={'idle_id':live['idle_id'],'keep_id':live['keep_id'],
                               'journal_state':local['state'],'redis_idle_state':idle['state'],
-                              'keep_runtime_id':keep['runtime_id'],
+                              'keep_runtime_id':persisted_runtime_id(keep),
                               'keep_backend':keep_backend[0],'idle_backend':idle_backend,
                               'pending_records':len(pending),
                               'seconds':round(time.monotonic()-started,3)}
@@ -287,11 +289,11 @@ def main():
                 keep_backend=labeled_backend(before['keep_id'])
                 idle_backend=labeled_backend(before['idle_id'])
                 if pending==[] and idle['state']=='Deleted' and not idle['resources_held'] \
-                        and keep['state']=='Running' and keep['runtime_id']==before['keep_runtime_id'] \
+                        and keep['state']=='Running' and persisted_runtime_id(keep)==before['keep_runtime_id'] \
                         and keep_backend==[before['keep_backend']] and not idle_backend \
                         and session['routable']:
                     evidence={'idle_state':idle['state'],'idle_resources_held':False,
-                              'keep_runtime_id':keep['runtime_id'],'keep_backend':keep_backend,
+                              'keep_runtime_id':persisted_runtime_id(keep),'keep_backend':keep_backend,
                               'pending_records':0,'node_routable':True,
                               'seconds':round(time.monotonic()-started,3)}
                     (E/'sqlite-reconciled.json').write_text(json.dumps(evidence,indent=2))
@@ -322,7 +324,7 @@ def main():
                         and node1['session']['id']==live['session_id'] \
                         and node2['node']['available'] \
                         and result['state']=='Running' \
-                        and result['runtime_id']==live['runtime_id'] \
+                        and persisted_runtime_id(result)==live['runtime_id'] \
                         and backends==[live['backend']]:
                     evidence={'node1_available':expect_available,'node2_available':True,
                               'session_id':live['session_id'],'instance_id':live['instance_id'],
@@ -335,7 +337,7 @@ def main():
                       'node1_routable':node1['session']['routable'],
                       'node2_available':node2['node']['available'],
                       'session_id':node1['session']['id'],
-                      'runtime_id':result['runtime_id'],'backends':backends}
+                      'runtime_id':persisted_runtime_id(result),'backends':backends}
             except (OSError,KeyError,ValueError,subprocess.SubprocessError) as error:
                 last=str(error)
             if time.monotonic()>deadline:raise TimeoutError(f'{action} not observed: {last}')
