@@ -15,6 +15,8 @@
 | [Full #60](https://buildkite.com/agent-dx/agent-dx-full-test/builds/60) | 前台 SDK 命令跨越 6 秒空闲阈值仍继续运行，完成后实例才被空闲删除；结果为 29.661 秒通过，资源释放和最终清理完成。后台命令在客户端退出后的空闲回收另由生命周期组验证。 |
 | [Full #61](https://buildkite.com/agent-dx/agent-dx-full-test/builds/61) | 加严 Host 转发的上游路径断言后，数据面 18/18 再次通过。匿名访问被拒绝；带令牌请求经 Host 子域名到达后端，后端仅在收到 `/functional/host?x=1` 时返回独立标记 `ADX-HOST-PATH-OK`。两端 backend 清空且命名空间删除。 |
 | [Full #62](https://buildkite.com/agent-dx/agent-dx-full-test/builds/62) | 生命周期 5/5 子项通过。独立 SDK 客户端启动 120 秒后台命令后退出，实例在命令自然结束前约 14.802 秒被空闲回收；Redis 终态 Deleted、资源释放、双节点 backend 和命名空间清理均通过。与 #60 合起来覆盖“活动请求不能误回收”和“客户端退出后应回收”。 |
+| [Base #92](https://buildkite.com/agent-dx/agent-dx/builds/92) | 提交触发路由发布的新包完成构建和 K8s L0；L0/认证 2/2 通过、`cleanup_errors=0`、命名空间删除。产品提交为 `0338b2c8362b476ade3408ae6430e05edc118a60`。 |
+| [Full #63](https://buildkite.com/agent-dx/agent-dx-full-test/builds/63) | 新包的混合负载用例尚未运行：镜像构建通过，但双节点限定生成了 Kubernetes 不接受的单个 `metadata.name In` 多值字段选择器，Pod 创建被拒绝。没有实际节点放置；清理正常。已在测试部署脚本中把每个候选节点改为单值 OR 条件，并用回归用例验证，仍需重新跑 Full。 |
 
 上述证据的构建判定、原始日志和验收产物位于 `out/ci/multivm-coverage-0925/`。该目录不随 Git 提交；Buildkite 构建页面保存相应运行产物。
 

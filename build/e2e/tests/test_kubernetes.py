@@ -37,7 +37,9 @@ class KubernetesDeploymentTests(unittest.TestCase):
         for pod in (o for o in objects if o['kind']=='Pod'):
             spec=pod['spec']
             terms=spec['affinity']['nodeAffinity']['requiredDuringSchedulingIgnoredDuringExecution']['nodeSelectorTerms']
-            self.assertEqual(terms[0]['matchFields'][0],{'key':'metadata.name','operator':'In','values':['worker-a','worker-b']})
+            self.assertEqual(terms,[
+                {'matchFields':[{'key':'metadata.name','operator':'In','values':[name]}]}
+                for name in ('worker-a','worker-b')])
             self.assertEqual(spec['nodeSelector']['kubernetes.io/arch'],'amd64')
             self.assertNotIn('nodeName',spec)
 
