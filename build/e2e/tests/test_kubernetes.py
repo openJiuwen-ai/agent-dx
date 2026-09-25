@@ -98,6 +98,24 @@ class KubernetesDeploymentTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'default dynamic StorageClass'):
             module.default_redis_storage_class({'items':[static]})
 
+    def test_storage_class_inventory_records_only_selection_fields(self):
+        import importlib.util
+        spec=importlib.util.spec_from_file_location('k8s_run',ROOT/'kubernetes/run.py')
+        module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+        inventory=module.storage_class_inventory({'items':[
+            {'metadata':{'name':'disk-b','annotations':{'secret.example/token':'private'}},
+             'provisioner':'csi.example/disk','volumeBindingMode':'WaitForFirstConsumer',
+             'reclaimPolicy':'Delete'},
+            {'metadata':{'name':'local-a'},'provisioner':'kubernetes.io/no-provisioner'}]})
+        self.assertEqual(inventory,[
+            {'name':'disk-b','provisioner':'csi.example/disk',
+             'volume_binding_mode':'WaitForFirstConsumer','reclaim_policy':'Delete',
+             'default':False,'dynamic':True},
+            {'name':'local-a','provisioner':'kubernetes.io/no-provisioner',
+             'volume_binding_mode':None,'reclaim_policy':None,
+             'default':False,'dynamic':False}])
+        self.assertNotIn('private',str(inventory))
+
 class KubernetesLifecycleTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
