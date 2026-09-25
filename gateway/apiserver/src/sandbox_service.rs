@@ -267,12 +267,17 @@ fn existing_running_response(
             .env
             .get("EXECD_TUNNEL_HTTP_PORT")
             .and_then(|port| port.parse::<u16>().ok())
+            .filter(|port| *port > 1)
             .unwrap_or(8766);
         let safe_id = confirmed_spec
             .id
             .replace('@', "-at-")
             .replace(['/', '.', '_'], "-");
-        let path = format!("/tunnel/{safe_id}");
+        let path = if port == 8766 {
+            format!("/tunnel/{safe_id}")
+        } else {
+            format!("/tunnel/{safe_id}/{}", port - 1)
+        };
         response["tunnel"] = json!({
             "url": path,
             "path": path,
@@ -350,5 +355,29 @@ mod tests {
                 .code(),
             Code::Unavailable
         );
+    }
+
+    #[test]
+    fn custom_reverse_tunnel_port_is_encoded_in_public_path() {
+        let mut spec = pb::EnvironmentSpec {
+            id: "tenant-worker".into(),
+            tenant_id: "tenant".into(),
+            ..Default::default()
+        };
+        spec.env
+            .insert("EXECD_TUNNEL_HTTP_PORT".into(), "18766".into());
+        let record = pb::EnvironmentRecord {
+            spec: Some(spec.clone()),
+            state: pb::EnvironmentState::Running as i32,
+            ..Default::default()
+        };
+        let response = existing_running_response(
+            &spec,
+            &json!({"tunnel":{"enabled":true,"proxyPort":18766}}),
+            "create-a",
+            &record,
+        )
+        .unwrap();
+        assert_eq!(response["tunnel"]["path"], "/tunnel/tenant-worker/18765");
     }
 }
