@@ -33,7 +33,9 @@ class TargetedSuiteTests(unittest.TestCase):
         def execute(case, command, log, timeout, deadline):
             calls.append((case, command, timeout, deadline))
             clock.value += 30
-            output = log.parent
+            output = Path(command[-1])
+            self.assertFalse(output.exists())
+            output.mkdir()
             status = 'failed' if case == 'command-expiry' else 'passed'
             (output / 'result.json').write_text(json.dumps({
                 'status': status, 'harness': {'commit': 'a' * 40},
@@ -68,7 +70,10 @@ class TargetedSuiteTests(unittest.TestCase):
         def execute(case, _command, log, _timeout, _deadline):
             calls.append(case)
             clock.value += 10
-            (log.parent / 'result.json').write_text(json.dumps({
+            output = Path(_command[-1])
+            self.assertFalse(output.exists())
+            output.mkdir()
+            (output / 'result.json').write_text(json.dumps({
                 'status': 'failed', 'harness': {'commit': 'a' * 40},
                 'checks': [], 'cleanup_errors': ['namespace remains'],
                 'error': 'cleanup failed', 'cases': [],
@@ -92,7 +97,10 @@ class TargetedSuiteTests(unittest.TestCase):
         def execute(case, _command, log, _timeout, _deadline):
             calls.append(case)
             clock.value += 200
-            (log.parent / 'result.json').write_text(json.dumps({
+            output = Path(_command[-1])
+            self.assertFalse(output.exists())
+            output.mkdir()
+            (output / 'result.json').write_text(json.dumps({
                 'status': 'passed', 'harness': {'commit': 'a' * 40},
                 'checks': [case], 'cleanup_errors': [], 'error': None,
                 'cases': [{'name': case, 'status': 'passed', 'seconds': 200}],
@@ -138,7 +146,10 @@ class TargetedSuiteTests(unittest.TestCase):
 
         def execute(case, _command, log, _timeout, _deadline):
             calls.append(case)
-            (log.parent / 'result.json').write_text(json.dumps({
+            output = Path(_command[-1])
+            self.assertFalse(output.exists())
+            output.mkdir()
+            (output / 'result.json').write_text(json.dumps({
                 'status': 'failed', 'harness': {'commit': 'a' * 40},
                 'checks': [], 'cleanup_errors': [], 'error': 'interrupted', 'cases': [],
             }))
