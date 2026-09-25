@@ -195,7 +195,7 @@ profile；完整 Multi-VM 在补齐部署器前不能标记为通过。
 | `ST-04` | 已实现 | adxlet 新 session 对账，已运行后端身份不变 |
 | `ST-05` | 已实现 | 日志滚动压缩、Metrics、Trace、Collector 中断恢复 |
 | `ST-FC-01` | 已实现 | KVM 暂停／恢复、可复用快照、克隆和制品清理 |
-| `ST-06` | 基础故障已验证；组合故障用例已实现，待正式部署运行 | [Full #41](https://buildkite.com/agent-dx/agent-dx-full-test/builds/41) 的 `sqlite-fallback` 暂停 Coordinator、保持 Redis 可读，验证空闲实例本地删除写入 SQLite pending、Redis 暂时保留旧 Running 结果；心跳期限内恢复后 pending 清空、Redis 收敛为 Deleted，另一个实例保留原 backend 并可继续执行 SDK 命令。新增 `sqlite-node-restart` 在 Coordinator 恢复前重启 Adxlet，检查待同步删除和原后端保留，随后再完成对账与物理清理 |
+| `ST-06` | 组合故障在 K8s 双 worker 验证通过；Standalone 尚待运行 | [Full #41](https://buildkite.com/agent-dx/agent-dx-full-test/builds/41) 的 `sqlite-fallback` 暂停 Coordinator、保持 Redis 可读，验证空闲实例本地删除写入 SQLite pending、Redis 暂时保留旧 Running 结果；心跳期限内恢复后 pending 清空、Redis 收敛为 Deleted，另一个实例保留原 backend 并可继续执行 SDK 命令。`sqlite-node-restart` 在 [cn-north-4 定向部署](2026-09-25-cn-north-4-targeted-reliability.md) 通过：Coordinator 恢复前重启 Adxlet，随后完成对账与物理清理 |
 | `ST-07` | 两种空闲行为均已验证 | [Full #22](https://buildkite.com/agent-dx/agent-dx-full-test/builds/22) 验证独立 SDK 客户端退出、后台命令仍运行时空闲回收；[Full #29](https://buildkite.com/agent-dx/agent-dx-full-test/builds/29) 验证前台请求跨越空闲阈值仍保持运行，结束后空闲删除并释放资源 |
 | `ST-08` | 正式 K8s 定向验证通过 | [Full #39](https://buildkite.com/agent-dx/agent-dx-full-test/builds/39) 通过真实 sandboxd 删除运行中 backend：默认 Never 进入 Failed 且无新执行；配置两次重启时每次产生新 runtime identity、继续提供命令能力，第三次退出后达到重试上限并释放资源。退避精确时序另有组件测试 |
 | `ST-09` | 正式 K8s 定向验证通过 | [Full #37](https://buildkite.com/agent-dx/agent-dx-full-test/builds/37)、[#38](https://buildkite.com/agent-dx/agent-dx-full-test/builds/38)、[#27](https://buildkite.com/agent-dx/agent-dx-full-test/builds/27) 分别验证 Coordinator、API Server、分进程 Ingress 重启后的 epoch、目录和路由重同步；单机进程部署仍需单独验证 |
@@ -232,18 +232,22 @@ profile；完整 Multi-VM 在补齐部署器前不能标记为通过。
 | `FD-08` | 正式双物理 worker 定向验证通过 | [Full #31](https://buildkite.com/agent-dx/agent-dx-full-test/builds/31) 的 `network-partition` 在 node2 网络命名空间阻断到 Coordinator 的 TCP 流量，防火墙计数非零、心跳失效且旧实例撤路由；隔离期间 node1 继续执行和创建，解除后 node2 清理旧后端再准入。两个 Pod 分别位于 `10.244.128.124` 和 `10.244.128.160` |
 | `FD-09` | 已验证 | [Full #23](https://buildkite.com/agent-dx/agent-dx-full-test/builds/23) 的 `data-plane` 定向用例通过 Host 子域名端口转发：`<instance-id>-18081.example.test` 携带鉴权后到达实例的嵌套路径，缺少 Token 被拒绝；用例 28.859 秒，清理错误为 0 |
 | `FD-10` | K8s 异构 runtime 已验证；三 VM 未实机执行 | [Full #50](https://buildkite.com/agent-dx/agent-dx-full-test/builds/50) 在 node1 仅支持 runc、node2 支持 runc/runsc 的双 worker 上，经公开 SDK 不指定节点创建 runsc 实例，核对 node2 归属、实际 runsc 执行、命令和释放；可选 runsc 二进制由摘要及 SHA512 固定。三 VM 定向用例仍待独立环境执行 |
-| `FD-11` | 用例已实现，待正式部署运行 | `create-unknown-query` 经真实 TLS 代理断开首个创建应答；独立公共 SDK 查询暂时返回 404 后放行在途写入，要求 SDK 使用同一 Request ID／名称重试，Redis generation 与物理 backend 唯一，命令和删除通过 |
-| `FD-12` | 用例已实现，待正式部署运行 | `schedule-deadline` 在两个 runc-only worker 上请求不可调度的 runsc，要求请求出现于管理员中心队列，三秒调度期限后以同一实例身份返回结构化结果未知、队列清空、Redis 无分配／资源占用且双节点无物理 backend |
-| `FD-13` | 用例已实现，待正式部署运行 | `command-response-cut` 将真实 Execd 的三次成功 `process.start` 应答在 SDK 侧切断，要求请求 ID／命令 ID 保持一致；新 SDK 客户端按命令 ID 找回结果，命令副作用只发生一次，Redis 归属与物理 backend 不变且最终清理完成 |
-| `FD-14` | 用例已实现，待正式部署运行 | `command-registry-capacity` 仅把 node1 Execd 的命令记录上限设为 1，运行命令占满时第二个稳定命令 ID 获得 `ResourceExhausted`；释放占用后以原 ID 成功，副作用一次，归属／backend 不变且最终清理完成 |
-| `FD-15` | 用例已实现，待正式部署运行 | `upload-response-cut` 在 Execd 已提交第一个二进制文件块后切断 SDK 应答，要求 SDK 查询实际上传偏移并沿同一上传 ID 继续，最终文件 SHA256 完全一致，归属／backend 不变且最终清理完成 |
-| `FD-16` | 用例已实现，待正式部署运行 | `download-response-cut` 在文件下载的首个 200 应答仅发送部分字节后断开，要求 SDK 保留 `.part` 并使用实际已写入偏移的 Range 续传；最终 SHA256 一致，归属／backend 不变且最终清理完成 |
-| `FD-17` | 用例已实现，待正式部署运行 | `command-watch-unavailable` 仅拒绝真实命令 Watch 握手，HTTP 查询保持可用；SDK 重连预算耗尽后返回 `CommandUnavailable` 和原 Sandbox／命令 ID，新客户端查询并终止同一命令，确认未重复启动、归属／backend 不变及最终清理完成 |
-| `FD-18` | 用例已实现，待正式部署运行 | `command-unsupported-feature` 从真实 Execd capability 应答移除 Watch 能力，要求 SDK 返回 `UnsupportedFeature` 且没有发出 `process.start`；健康客户端以相同命令 ID 执行一次，归属／backend 不变且最终清理完成 |
-| `FD-19` | 用例已接入，当前产品语义预期红灯 | `command-expiry` 只在 node1 配置一秒 Execd 结果 TTL；从未存在的 ID 必须返回 `CommandNotFound`，终态记录到期必须返回 `CommandExpired`，同时保持原归属／backend 并完成清理。现有 Execd 对过期记录仅返回 `COMMAND_NOT_FOUND`，待产品修复后再执行正式回归，不进入默认门禁 |
+| `FD-11` | cn-north-4 双 worker 定向通过 | `create-unknown-query` 经真实 TLS 代理断开首个创建应答；独立公共 SDK 查询暂时返回 404 后放行在途写入，要求 SDK 使用同一 Request ID／名称重试，Redis generation 与物理 backend 唯一，命令和删除通过 |
+| `FD-12` | cn-north-4 双 worker 定向通过 | `schedule-deadline` 在两个 runc-only worker 上请求不可调度的 runsc，要求请求出现于管理员中心队列，三秒调度期限后以同一实例身份返回结构化结果未知、队列清空、Redis 无分配／资源占用且双节点无物理 backend |
+| `FD-13` | cn-north-4 双 worker 定向通过 | `command-response-cut` 将真实 Execd 的三次成功 `process.start` 应答在 SDK 侧切断，要求请求 ID／命令 ID 保持一致；新 SDK 客户端按命令 ID 找回结果，命令副作用只发生一次，Redis 归属与物理 backend 不变且最终清理完成 |
+| `FD-14` | cn-north-4 双 worker 定向通过 | `command-registry-capacity` 仅把 node1 Execd 的命令记录上限设为 1，运行命令占满时第二个稳定命令 ID 获得 `ResourceExhausted`；释放占用后以原 ID 成功，副作用一次，归属／backend 不变且最终清理完成 |
+| `FD-15` | cn-north-4 双 worker 定向通过 | `upload-response-cut` 在 Execd 已提交第一个二进制文件块后切断 SDK 应答，要求 SDK 查询实际上传偏移并沿同一上传 ID 继续，最终文件 SHA256 完全一致，归属／backend 不变且最终清理完成 |
+| `FD-16` | cn-north-4 双 worker 定向通过 | `download-response-cut` 在文件下载的首个 200 应答仅发送部分字节后断开，要求 SDK 保留 `.part` 并使用实际已写入偏移的 Range 续传；最终 SHA256 一致，归属／backend 不变且最终清理完成 |
+| `FD-17` | cn-north-4 双 worker 定向通过 | `command-watch-unavailable` 仅拒绝真实命令 Watch 握手，HTTP 查询保持可用；SDK 重连预算耗尽后返回 `CommandUnavailable` 和原 Sandbox／命令 ID，新客户端查询并终止同一命令，确认未重复启动、归属／backend 不变及最终清理完成 |
+| `FD-18` | cn-north-4 双 worker 定向通过 | `command-unsupported-feature` 从真实 Execd capability 应答移除 Watch 能力，要求 SDK 返回 `UnsupportedFeature` 且没有发出 `process.start`；健康客户端以相同命令 ID 执行一次，归属／backend 不变且最终清理完成 |
+| `FD-19` | cn-north-4 双 worker 定向通过 | `command-expiry` 只在 node1 配置一秒 Execd 结果 TTL；从未存在的 ID 必须返回 `CommandNotFound`，终态记录到期必须返回 `CommandExpired`，同时保持原归属／backend 并完成清理。此前旧 Execd 的 `COMMAND_NOT_FOUND` 红灯已修复并在正式部署回归通过 |
+| `FD-20` | cn-north-4 双 worker 定向通过 | `command-watch-query-unavailable` 同时拒绝 Watch 与 `process.get`，要求 SDK 返回携带原命令身份的结构化结果未知；恢复查询后找回原命令，不得重复启动 |
+| `FD-21` | cn-north-4 双 worker 定向通过 | `sqlite-node-restart` 在 Coordinator 暂停、SQLite 有待同步删除时重启 Adxlet，恢复后与 Redis 对账并清理物理后端 |
 | `FD-FC-01` | 条件计划 | KVM worker 的 Firecracker pause/resume/snapshot profile |
 | `FD-XPU-01` | 条件计划 | 真实 GPU/NPU 整卡发现、过滤、分配、释放和故障清理 |
 | `FD-SOAK-01` | Nightly | 创建／执行／删除循环及反复节点故障，持续 1–24 小时无资源增长 |
+
+`FD-11..21` 在 [2026-09-25 cn-north-4 定向部署](2026-09-25-cn-north-4-targeted-reliability.md) 使用基础包 #95 的同一产品提交运行，11/11 通过，JUnit 14/14；这是定向批次，不等于同次执行完整 Full 十一组。
 
 本轮正式定向测试在 2026-09-24 23:15:14 UTC 创建首个构建、2026-09-25 00:47:20 UTC 完成最后一个构建，墙钟约 1 小时 32 分。Full #27–#38 的 12 个场景首次运行 7 个通过、5 个失败；统一修正测试驱动对嵌套 `runtime.id`、API 缓存收敛及 node2 故障参数的断言后，Full #39–#43 对失败的 5 个场景逐项回归通过。回归沿用同一不可变产品制品 `7551acb4`，测试驱动为 `d4452816`；所有通过结果均无缺失检查或清理错误。此轮不包括需要异构 runsc 节点、动态 StorageClass、KVM 或实卡的条件性用例。
 

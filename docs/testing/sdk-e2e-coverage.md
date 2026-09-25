@@ -33,8 +33,8 @@ checkpoint/snapshot、入口继承、reload 和运行期网络策略。这里的
 
 文件传输故障另有两个定向 Full 用例：`upload-response-cut` 在 Execd 已写入首块后切断应答，
 SDK 查询实际偏移并沿同一上传 ID 继续；`download-response-cut` 在首个文件响应只返回部分字节后
-断开，SDK 保留 `.part` 文件并用 Range 续传。两者都以最终 SHA256 校验完整性，已接入驱动，
-正式部署运行待完成。
+断开，SDK 保留 `.part` 文件并用 Range 续传。两者都以最终 SHA256 校验完整性；
+2026-09-25 在 cn-north-4 的双物理 worker 定向部署中通过。
 
 ### Reverse tunnel 集成
 
@@ -71,8 +71,8 @@ upstream，并校验响应体和路径。该项不是客户端序列化单测。
 | `SandboxNotFound`、`PermissionDenied` | 已覆盖 |
 | `CommandConflict`、`CommandNotFound`、等待超时返回 `RUNNING`／`WAIT_TIMEOUT`、重复 kill 返回 `False` | SDK 单测覆盖；端到端覆盖以对应运行记录为准 |
 | `CommandSubmissionError` | `command-response-cut` 在 cn-north-4 双 worker 定向 Full 实跑通过：真实 `process.start` 应答被 TLS 代理切断，新 SDK 客户端以稳定命令 ID 查询结果并检查副作用仅一次；见本轮测试报告 |
-| `CommandUnavailable` | `command-watch-unavailable` 在本轮双 worker 定向 Full 通过。新增 `command-watch-query-unavailable` 同时拒绝 Watch 与 `process.get`，已修正结果未知断言，正式部署仍待运行 |
-| `CommandExpired` | `command-expiry` 在本轮 Full 验证到现有 Execd 返回 `COMMAND_NOT_FOUND` 的红灯。已补终态过期标识、有界过期 ID 记录和 SDK 映射，Rust／SDK 单测通过；正式部署回归仍待运行 |
+| `CommandUnavailable` | `command-watch-unavailable` 和 `command-watch-query-unavailable` 均在 cn-north-4 双 worker 定向部署通过；后一项同时拒绝 Watch 与 `process.get`，验证结构化结果未知 |
+| `CommandExpired` | `command-expiry` 先在旧 Execd 上复现过期记录错误地返回 `COMMAND_NOT_FOUND`；修复后在 cn-north-4 双 worker 定向部署通过，从未存在与已过期的命令 ID 分别返回 `CommandNotFound` 和 `CommandExpired` |
 | `UnsupportedFeature` | `command-unsupported-feature` 在本轮双 worker 定向 Full 通过：真实 Execd 的 capability 应答由 TLS 代理删去 Watch 能力，SDK 在 `process.start` 前拒绝；健康客户端再以相同命令 ID 成功执行。真实旧版 Execd 的兼容部署另行验证 |
 | `ResourceExhausted` | `command-registry-capacity` 在本轮双 worker 定向 Full 通过：node1 Execd 的 registry 上限设为 1，运行中的命令占满后第二个稳定命令 ID 被拒，释放后以原 ID 成功且副作用一次。实例容量排队不替代此用例 |
 
@@ -115,12 +115,13 @@ Coordinator 不可用时 SQLite 降级、adxlet 重启等待、心跳过期后�
 观测过期门禁；证据位于 `out/ci/sdk-capability-fc-20260920/fc-lifecycle-r24/`。该套件没有运行
 双克隆，不能用来覆盖上述 26/26 缺口。
 
-已实现、尚待正式部署验证的定向 Full 用例包括：活动期间不触发空闲回收、中心调度
-deadline、上传和下载应答断开后的同身份续传、命令提交应答断开后的结果查询、Watch
-握手持续不可用、命令结果过期、命令 registry 容量、未知创建结果以及 SQLite 降级与
-Adxlet 重启。`command-expiry` 当前为已知预期红灯；以上用例均不能因为驱动测试通过
-就标记为端到端通过。定向批次入口可在同一不可变制品上逐项部署、清理，并在三小时
-上限内汇总失败，见 `.buildkite/README.md`。
+2026-09-25 的 cn-north-4 定向部署使用基础包
+[Buildkite #95](https://buildkite.com/agent-dx/agent-dx/builds/95) 的同一不可变产品提交
+`16298a4612f58edaf85bbcfcbd4c647c6287373b`，11 项场景全部通过，JUnit 14/14、无缺失检查和清理错误；
+两个测试 Pod 分别落在 `192.168.10.48`、`192.168.10.192`。包含创建结果未知、中心调度
+deadline、命令提交／Watch／查询故障、registry 容量、能力协商、命令过期、文件上传／下载
+断流和 SQLite 降级期间 Adxlet 重启。具体场景与证据见
+[定向部署记录](2026-09-25-cn-north-4-targeted-reliability.md)。此结果不代表同次运行了完整 Full 十一组。
 
-仍需补充：Watch 与查询同时不可用、真实旧版 Execd 能力协商、快照分页／过期／引用删除，
-以及真实 storage/XPU profile。Firecracker 双克隆问题和多 VM 实机验收继续单列。
+仍需补充：真实旧版 Execd 能力协商、快照分页／过期／引用删除、真实 storage/XPU profile，
+以及活动期间不触发空闲回收的独立故障注入。Firecracker 双克隆问题和多 VM 实机验收继续单列。

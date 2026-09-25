@@ -4,7 +4,7 @@
     "title": "系统错误、超时与故障可靠性门禁",
     "stage": "13",
     "status": "pending",
-    "detail": "已修正local-first预算边界、中心队列独立超时和sandboxd晚启动等待；稳定错误映射及SDK同身份重试已有组件门禁。Full #17验证sandboxd daemon重启；#42验证真实TLS代理断流，#40验证资源采集过期，#43验证对账中断重启，#31验证双物理worker网络隔离；#57验证daemon重启同时丢失runtime后的Never与自动重启两种策略，包括删除前公开Ingress路由撤销、旧/新backend、Redis状态、SDK命令和最终清理。提交0b936fd补真实Redis回归用例且22项RPC通过，基础包#91构建及K8s L0通过；Full #48通过独立Redis Pod/PVC重启、AOF和双worker原实例读写/删除。已新增create-unknown-query、schedule-deadline、command-response-cut、command-watch-unavailable、command-unsupported-feature、command-registry-capacity、upload-response-cut和download-response-cut八项定向Full用例，另新增Coordinator暂停期间Adxlet重启的sqlite-node-restart组合用例；这些通过快速代理、调度和驱动测试，正式部署尚未运行。command-expiry预期红灯用例已接入，等待Execd过期语义修复。完整三VM故障门禁和FC专项仍待补齐。",
+    "detail": "已修正local-first预算边界、中心队列独立超时和sandboxd晚启动等待；稳定错误映射及SDK同身份重试已有组件门禁。Full #17验证sandboxd daemon重启；#42验证真实TLS代理断流，#40验证资源采集过期，#43验证对账中断重启，#31验证双物理worker网络隔离；#57验证daemon重启同时丢失runtime后的Never与自动重启两种策略，包括删除前公开Ingress路由撤销、旧/新backend、Redis状态、SDK命令和最终清理。提交0b936fd补真实Redis回归用例且22项RPC通过，基础包#91构建及K8s L0通过；Full #48通过独立Redis Pod/PVC重启、AOF和双worker原实例读写/删除。2026-09-25使用基础包#95的提交16298a4在cn-north-4双物理worker正式部署运行11项定向故障用例，11/11通过、JUnit 14/14、无缺失检查和清理错误；覆盖创建结果未知、中心调度超时、命令提交与Watch故障、命令过期、文件断流和SQLite降级期间Adxlet重启。Execd过期命令与从未存在命令的错误语义已修复并实跑验证。完整三VM故障门禁和FC专项仍待补齐。",
     "gate": "ERR-01..04、TIME-01..05、SD-01..04、NM-01..03和NODE-01..04按system-reliability-gates.md完成对应拓扑E2E并保存客户端、Redis、路由和物理backend证据。"
   },
   {
