@@ -3,9 +3,12 @@
 import unittest
 import json
 from pathlib import Path
+import sys
 import tempfile
+import types
+from unittest.mock import patch
 
-from e2e.mixed_soak import evaluate, exercise
+from e2e.mixed_soak import evaluate, exercise, run
 from e2e import run as driver
 
 
@@ -32,6 +35,38 @@ class FakeSandbox:
 
 
 class MixedSoakTests(unittest.TestCase):
+    def test_failed_live_operation_still_closes_every_created_sandbox(self):
+        instances = []
+
+        class FailingSandbox:
+            def __init__(self, **_kwargs):
+                self.killed = False
+                self.closed = False
+                self.commands = self
+                instances.append(self)
+
+            def run(self, _command):
+                raise RuntimeError('command unavailable')
+
+            def kill(self):
+                self.killed = True
+
+            def close(self):
+                self.closed = True
+
+        fake_sdk = types.ModuleType('adx_sandbox')
+        fake_sdk.Sandbox = FailingSandbox
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / 'result.json'
+            with patch.dict(sys.modules, {'adx_sandbox': fake_sdk}):
+                with self.assertRaisesRegex(AssertionError, 'mixed-load acceptance failed'):
+                    run(object(), 'image', output, seconds=1)
+            report = json.loads(output.read_text())
+            self.assertEqual(report['status'], 'failed')
+            self.assertIn('command unavailable', report['errors'][0])
+            self.assertGreaterEqual(len(instances), 2)
+            self.assertTrue(all(item.killed and item.closed for item in instances))
+
     def test_soak_is_an_opt_in_full_and_standalone_case(self):
         self.assertEqual(driver.selected_checks('full', 'mixed-soak'), ('mixed-soak',))
         self.assertEqual(driver.selected_checks('standalone', 'mixed-soak'), ('mixed-soak',))
