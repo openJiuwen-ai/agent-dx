@@ -659,6 +659,36 @@ def main():
             if time.monotonic()>deadline:
                 raise TimeoutError(node+' restart did not restore public API: '+last_error)
             time.sleep(.2)
+    elif action=='restart-sandboxd-lost':
+        policy=sys.argv[3] if len(sys.argv)>3 else ''
+        assert policy in ('never','restart'),policy
+        frozen=P/'frozen-manager.pid'
+        assert frozen.exists(),'Adxlet must be frozen before removing its runtime'
+        before=backend();assert len(before)==1,before
+        previous_pid=int((P/'sandboxd.pid').read_text())
+        command(['sbox','-a',P/'sandboxd/sandboxd.sock','delete',before[0]],timeout=30)
+        assert not backend(),'removed runtime is still present before daemon restart'
+        marker=P/'restart-sandboxd-request'
+        marker.touch()
+        os.kill(previous_pid,signal.SIGKILL)
+        deadline=time.monotonic()+65
+        last_error='replacement daemon not yet available'
+        while True:
+            try:
+                current_pid=int((P/'sandboxd.pid').read_text())
+                if current_pid!=previous_pid:
+                    after=backend()
+                    assert not after,after
+                    (E/f'sandboxd-runtime-loss-{node}-{policy}.json').write_text(json.dumps({
+                        'previous_pid':previous_pid,'pid':current_pid,
+                        'backend_ids_before':before,'backend_ids_after':after,
+                    },indent=2))
+                    break
+            except (OSError,subprocess.SubprocessError,AssertionError) as error:
+                last_error=str(error)
+            if time.monotonic()>deadline:
+                raise TimeoutError('sandboxd runtime loss did not converge: '+last_error)
+            time.sleep(.2)
     elif action=='restart-sandboxd':
         before=backend();assert len(before)==1
         previous_pid=int((P/'sandboxd.pid').read_text())

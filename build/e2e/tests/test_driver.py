@@ -11,6 +11,40 @@ driver = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(driver)
 
 class AcceptanceGateTests(unittest.TestCase):
+    def test_sandboxd_lost_runtime_is_targeted_two_policy_fault(self):
+        self.assertEqual(driver.selected_checks('full', 'sandboxd-runtime-loss'),
+                         ('sandboxd-runtime-loss',))
+        with tempfile.TemporaryDirectory() as directory:
+            run = driver.Run(Path(directory))
+            run.nodes = ['node1', 'node2']
+            calls = []
+            run.execute = lambda node, *args, **_kwargs: (
+                calls.append(('execute', node, args[-1]))
+                or json.dumps({'cases': [{'id': 'reliability.daemon-loss-never',
+                                          'status': 'passed'},
+                                         {'id': 'reliability.daemon-loss-restart',
+                                          'status': 'passed'}]})
+            )
+            run.helper = lambda node, *args, **_kwargs: calls.append(
+                ('helper', node, args[0]))
+            checks = []
+            run.scenarios(checks, ('sandboxd-runtime-loss',))
+            self.assertEqual(checks, ['sandboxd-runtime-loss'])
+            self.assertEqual(calls, [
+                ('execute', 'node1', 'loss-create-never'),
+                ('helper', 'node1', 'freeze'),
+                ('helper', 'node1', 'restart-sandboxd-lost'),
+                ('helper', 'node1', 'thaw'),
+                ('execute', 'node1', 'loss-verify-never'),
+                ('execute', 'node1', 'loss-create-restart'),
+                ('helper', 'node1', 'freeze'),
+                ('helper', 'node1', 'restart-sandboxd-lost'),
+                ('helper', 'node1', 'thaw'),
+                ('execute', 'node1', 'loss-verify-restart'),
+                ('helper', 'node1', 'empty'),
+                ('helper', 'node2', 'empty'),
+            ])
+
     def test_only_independent_ingress_restart_uses_standalone_fixture(self):
         self.assertEqual(driver.setup_environment('ingress-restart'),
                          ('ADX_E2E_INGRESS_MODE=standalone',))
