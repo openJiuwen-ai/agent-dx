@@ -14,6 +14,54 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class CommandResponseCutTests(unittest.TestCase):
+    def test_capability_filter_preserves_other_real_advertised_features(self):
+        class Upstream(BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers['Content-Length']))
+                payload = json.dumps({
+                    'protocol_version': 1,
+                    'capabilities': [
+                        'stable-command-id', 'recoverable-command-result',
+                        'multiplexed-command-watch',
+                    ],
+                }).encode()
+                self.send_response(200)
+                self.send_header('Content-Length', str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *_args):
+                pass
+
+        upstream = ThreadingHTTPServer(('127.0.0.1', 0), Upstream)
+        thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+        thread.start()
+        spec = importlib.util.spec_from_file_location(
+            'command_response_cut', ROOT / 'command_response_cut.py')
+        module = importlib.util.module_from_spec(spec)
+        try:
+            spec.loader.exec_module(module)
+            with module.CommandResponseCutProxy(
+                f'http://127.0.0.1:{upstream.server_port}',
+                cut_start=False, strip_watch_capability=True,
+            ) as proxy:
+                request = Request(
+                    f'http://127.0.0.1:{proxy.port}/direct/example/invoke',
+                    data=json.dumps({
+                        'action': 'process.capabilities', 'args': {},
+                    }).encode(),
+                )
+                with urlopen(request, timeout=5) as response:
+                    self.assertEqual(json.load(response)['capabilities'], [
+                        'stable-command-id', 'recoverable-command-result',
+                    ])
+                self.assertEqual(len(proxy.capability_attempts), 1)
+                self.assertEqual(proxy.start_attempts, [])
+        finally:
+            upstream.shutdown()
+            upstream.server_close()
+            thread.join(timeout=2)
+
     def test_watch_can_fail_while_normal_http_query_stays_available(self):
         class Upstream(BaseHTTPRequestHandler):
             def do_GET(self):

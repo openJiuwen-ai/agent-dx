@@ -243,6 +243,12 @@ Local Docker reproduction requires access to the same bind-mounted paths as the 
   finds and terminates that same command. Redis generation, physical backend
   and final cleanup are checked. Select with
   `--profile full --case command-watch-unavailable`.
+- `command-unsupported-feature` (targeted capability negotiation): a TLS proxy
+  removes the Watch capability from Execd's real capability response. The
+  installed SDK must return `UnsupportedFeature` before sending `process.start`.
+  A fresh healthy client then starts the same command ID exactly once, and
+  Redis assignment, backend and cleanup are checked. Select with
+  `--profile full --case command-unsupported-feature`.
 - `command-registry-capacity` (targeted Execd admission limit): only node1's
   Execd receives a one-record registry limit. Keep one background command
   running, require a second stable command ID to return `ResourceExhausted`,
