@@ -184,6 +184,13 @@ impl Rig {
 #[ignore = "requires real Redis and generated mTLS certificates"]
 async fn redis_restart_recovers_scheduler_after_failed_node_heartbeat() {
     let mut rig = Rig::new().await;
+    let created = rig.nodes[0]
+        .create_local_environment(Rig::request("redis-recovery", 0))
+        .await
+        .unwrap()
+        .into_inner()
+        .record
+        .unwrap();
     let stored = rig.session.snapshot().await.unwrap();
     let node = &stored.nodes["a"];
     let heartbeat = pb::RegisterNodeRequest {
@@ -221,6 +228,8 @@ async fn redis_restart_recovers_scheduler_after_failed_node_heartbeat() {
         "scheduler did not recover after Redis restarted"
     );
     rig.claimants[0].register_node(heartbeat).await.unwrap();
+    rig.delete(&created).await;
+    assert_eq!(rig.backends[0].removed.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
