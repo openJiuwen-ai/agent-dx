@@ -14,11 +14,12 @@ if [[ -n $artifact_build ]]; then
     echo 'ADX_E2E_ARTIFACT_COMMIT must be the 40-character product commit' >&2
     exit 1
   }
-elif [[ -n $artifact_commit ]]; then
-  echo 'ADX_E2E_ARTIFACT_COMMIT requires ADX_E2E_ARTIFACT_BUILD' >&2
-  exit 1
 else
-  artifact_commit=$BUILDKITE_COMMIT
+  artifact_commit=${artifact_commit:-$BUILDKITE_COMMIT}
+  [[ $artifact_commit =~ ^[0-9a-f]{40}$ ]] || {
+    echo 'ADX_E2E_ARTIFACT_COMMIT must be the 40-character product commit' >&2
+    exit 1
+  }
 fi
 export ADX_E2E_ARTIFACT_COMMIT=$artifact_commit
 download_image_artifact() {
@@ -34,7 +35,6 @@ download_image_artifact 'out/buildkite/bundle/*.json'
 args=(--bundle out/buildkite/bundle/bundle.json --registry-images out/buildkite/bundle/registry-images.json --kubeconfig "$ADX_KUBECONFIG" --output out/buildkite/acceptance)
 args+=(--profile "${ADX_E2E_PROFILE:-k8s-basic}")
 if [[ -n ${ADX_E2E_TARGET_CASE:-} ]]; then
-  [[ -n $artifact_build ]] || { echo 'targeted E2E requires an exact reused image build' >&2; exit 1; }
   args+=(--case "$ADX_E2E_TARGET_CASE")
 fi
 if [[ -n ${ADX_E2E_REGISTRY_AUTH_FILE:-} && -f "$ADX_E2E_REGISTRY_AUTH_FILE" ]]; then
