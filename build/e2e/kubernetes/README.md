@@ -78,6 +78,8 @@ The base OCI profile requires:
 - `br_netfilter` with
   `/proc/sys/net/bridge/bridge-nf-call-iptables` equal to `1`;
 - working network namespaces, bridge networking, iptables and nested runc;
+- a sandboxd bridge gateway configured as a host address (`.1`) within each
+  fixture subnet, so runc can install the default route in its network namespace;
 - cross-worker Pod networking, cluster DNS and Service routing;
 - a container runtime that permits the above operations inside the privileged
   platform Pod.
