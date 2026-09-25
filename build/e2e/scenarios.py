@@ -131,7 +131,7 @@ elif sys.argv[1]=='download-response-cut':
     print(json.dumps(report),flush=True)
 elif sys.argv[1]=='schedule-deadline':
     from schedule_deadline import run
-    report=run(connection,image,E/'schedule-deadline-result.json',S/'tls/ca.pem')
+    report=run(connection,image,E/'schedule-deadline-result.json',S/'tls/ca.pem',S/'admin-key')
     print(json.dumps(report),flush=True)
 elif sys.argv[1]=='resource-create':
     from resource_stale import create
