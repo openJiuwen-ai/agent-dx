@@ -54,7 +54,7 @@ def create(connection, image, evidence, policy):
         sandbox.close()
 
 
-def verify(connection, evidence, policy):
+def verify(connection, evidence, secrets, policy):
     assert policy in ('never', 'restart'), policy
     before = json.loads((evidence / ('loss-' + policy + '-created.json')).read_text())
     fault = json.loads((evidence / ('sandboxd-runtime-loss-node1-' + policy + '.json')).read_text())
@@ -73,8 +73,10 @@ def verify(connection, evidence, policy):
             assert record['assignment'] == before['assignment']
             assert not record['result']['restart_pending']
             assert not labeled_backend(instance_id)
+            from network_partition import withdrawn_route
+            route = withdrawn_route(instance_id, secrets)
             case_id = 'reliability.daemon-loss-never'
-            extra = {'terminal_state': 'Failed'}
+            extra = {'terminal_state': 'Failed', 'route': route}
         else:
             record = _wait(lambda: (
                 record if (record := _record(instance_id))['result']['state'] == 'Running'
