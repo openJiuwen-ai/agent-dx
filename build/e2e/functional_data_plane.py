@@ -15,8 +15,9 @@ import urllib.request
 PORT = 18081
 TLS_PORT = 18082
 EXPECTED_BODY = "ADX-FORWARDED-PORT-OK"
+HOST_EXPECTED_BODY = "ADX-HOST-PATH-OK"
 TUNNEL_BODY = "ADX-REVERSE-TUNNEL-OK"
-SERVER_COMMAND = rf'''perl -MSocket -e '$|=1; socket(S,PF_INET,SOCK_STREAM,getprotobyname("tcp")); setsockopt(S,SOL_SOCKET,SO_REUSEADDR,1); bind(S,sockaddr_in({PORT},INADDR_ANY)) or die $!; listen(S,10); while(accept(C,S)){{ print C "HTTP/1.1 200 OK\r\nContent-Length: {len(EXPECTED_BODY)}\r\nConnection: close\r\n\r\n{EXPECTED_BODY}"; close C; }}' '''
+SERVER_COMMAND = rf'''perl -MSocket -e '$|=1; socket(S,PF_INET,SOCK_STREAM,getprotobyname("tcp")); setsockopt(S,SOL_SOCKET,SO_REUSEADDR,1); bind(S,sockaddr_in({PORT},INADDR_ANY)) or die $!; listen(S,10); while(accept(C,S)){{ $request=<C>; $body=index($request,"/functional/host?x=1")>=0?"{HOST_EXPECTED_BODY}":"{EXPECTED_BODY}"; print C "HTTP/1.1 200 OK\r\nContent-Length: ".length($body)."\r\nConnection: close\r\n\r\n".$body; close C; }}' '''
 
 
 class _TunnelUpstream(http.server.BaseHTTPRequestHandler):
@@ -372,7 +373,7 @@ def run(connection, image, output, ca_path):
             assert error.code in (401, 403), error
         else:
             raise AssertionError('Host forwarded port accepted a request without a token')
-        assert _fetch_host_forwarded(sandbox, ca_path) == EXPECTED_BODY
+        assert _fetch_host_forwarded(sandbox, ca_path) == HOST_EXPECTED_BODY
         checks['host_subdomain_forwarding'] = True
         passed('port-forward.host-subdomain-route', started)
 
