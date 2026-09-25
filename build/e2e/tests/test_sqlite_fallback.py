@@ -27,8 +27,7 @@ class SqliteFallbackOracleTests(unittest.TestCase):
         }
         records = {
             'environment:live': json.dumps({
-                'runtime': {'id': 'runtime-live'},
-                'result': {'state': 'Running'},
+                'result': {'state': 'Running', 'runtime': {'id': 'runtime-live'}},
             }),
             'environment:idle': json.dumps({'result': {'state': 'Running'}}),
         }

@@ -9,9 +9,8 @@ from command_response_cut import CommandResponseCutProxy
 
 def run(connection, image, output, secrets, *, query_unavailable=False):
     from adx_sandbox import (
-        CommandStatus, CommandUnavailable, ConnectionConfig, Sandbox,
+        CommandStatus, CommandUnavailable, ConnectionConfig, Sandbox, SandboxError,
     )
-    from adx_sandbox._transport import SandboxHTTPError
     from functional_lifecycle import _wait_deleted
     from node import catalog, labeled_backend
 
@@ -61,8 +60,10 @@ def run(connection, image, output, secrets, *, query_unavailable=False):
             if query_unavailable:
                 try:
                     handle.poll()
-                except SandboxHTTPError as error:
-                    assert error.status_code == 503, error
+                except SandboxError as error:
+                    assert error.code == 'OUTCOME_UNKNOWN', error
+                    assert error.retry == 'same_operation', error
+                    assert error.instance_id == sandbox.id, error
                 else:
                     raise AssertionError('command query remained available after Watch outage')
                 assert proxy.rejected_get_attempts > 0

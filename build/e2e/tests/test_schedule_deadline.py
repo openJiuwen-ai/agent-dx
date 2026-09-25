@@ -45,7 +45,9 @@ class ScheduleDeadlineTests(unittest.TestCase):
             for node in ('node1', 'node2')
         }
 
-        def queue_reader(*_args):
+        def queue_reader(endpoint, token, _ca):
+            self.assertEqual(endpoint, 'test:8443')
+            self.assertEqual(token, 'admin-token')
             state['queries'] += 1
             return {'default-' + state['options']['name']} if state['pending'] else set()
 
@@ -60,11 +62,14 @@ class ScheduleDeadlineTests(unittest.TestCase):
         with patch.dict(sys.modules, modules):
             spec.loader.exec_module(scenario)
 
-        connection = types.SimpleNamespace(server_address='test:8443', token='admin')
+        connection = types.SimpleNamespace(server_address='test:8443', token='tenant-token')
         with tempfile.TemporaryDirectory() as directory:
-            output = Path(directory) / 'deadline.json'
-            result = scenario.run(connection, 'test-image', output, Path(directory) / 'ca.pem',
-                                  queue_reader=queue_reader)
+            root = Path(directory)
+            output = root / 'deadline.json'
+            admin_key = root / 'admin-key'
+            admin_key.write_text('admin-token\n')
+            result = scenario.run(connection, 'test-image', output, root / 'ca.pem',
+                                  admin_key, queue_reader=queue_reader)
             persisted = json.loads(output.read_text())
         self.assertEqual(result, persisted)
         self.assertEqual(result['status'], 'passed')

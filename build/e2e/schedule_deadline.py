@@ -27,7 +27,7 @@ def pending_ids(endpoint, token, ca):
     return {item['instanceID'] for item in entries}
 
 
-def run(connection, image, output, ca, *, queue_reader=pending_ids,
+def run(connection, image, output, ca, admin_key, *, queue_reader=pending_ids,
         clock=time.monotonic, sleep=time.sleep):
     """Use the installed SDK while observing the admin queue and Redis catalog."""
     require_runc_only_inventory(catalog())
@@ -36,6 +36,7 @@ def run(connection, image, output, ca, *, queue_reader=pending_ids,
     report = {'status': 'failed', 'cases': [], 'cleanup_errors': [],
               'queue_observed': False, 'queue_drained': False,
               'instance_id': instance_id}
+    admin_token = admin_key.read_text().strip()
     started = clock()
 
     def create():
@@ -52,7 +53,7 @@ def run(connection, image, output, ca, *, queue_reader=pending_ids,
                 probe_deadline = clock() + 20
                 while clock() < probe_deadline:
                     if instance_id in queue_reader(connection.server_address,
-                                                   connection.token, ca):
+                                                   admin_token, ca):
                         report['queue_observed'] = True
                         break
                     if future.done():
@@ -97,7 +98,7 @@ def run(connection, image, output, ca, *, queue_reader=pending_ids,
         drain_deadline = clock() + 10
         while clock() < drain_deadline:
             if instance_id not in queue_reader(connection.server_address,
-                                               connection.token, ca):
+                                               admin_token, ca):
                 report['queue_drained'] = True
                 break
             sleep(.1)

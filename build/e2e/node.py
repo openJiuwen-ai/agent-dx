@@ -113,7 +113,7 @@ def validated_sqlite_node_restart(before,status,records,pending,current_backend,
     idle=json.loads(records['environment:'+journaled['idle_id']])
     assert keep['result']['state']=='Running' and idle['result']['state']=='Running', \
         'Redis changed while Coordinator was suspended'
-    assert persisted_runtime_id(keep)==journaled['keep_runtime_id'], \
+    assert persisted_runtime_id(keep['result'])==journaled['keep_runtime_id'], \
         'live runtime changed while Coordinator was suspended'
     return {'pid_before':before['pid'],'pid_after':services[0]['pid'],
             'session_before':before['session_id'],'pending_records':len(pending),

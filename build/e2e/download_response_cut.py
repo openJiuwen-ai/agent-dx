@@ -8,6 +8,7 @@ import time
 import uuid
 
 from upload_response_cut import CHUNK_SIZE, UploadResponseCutProxy
+from route_ready import wait_for_route
 
 
 def run(connection, image, output, secrets):
@@ -36,6 +37,7 @@ def run(connection, image, output, secrets):
         initial = json.loads(catalog()['environment:' + sandbox.id])
         backend = labeled_backend(sandbox.id)
         assert len(backend) == 1, backend
+        wait_for_route(sandbox)
 
         with tempfile.TemporaryDirectory(prefix='adx-download-cut-') as directory:
             source = Path(directory) / 'source.bin'

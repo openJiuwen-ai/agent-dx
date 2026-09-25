@@ -174,6 +174,7 @@ class UploadResponseCutProxy:
 
 def run(connection, image, output, secrets):
     """Use the installed SDK with real Execd and verify the final file digest."""
+    from route_ready import wait_for_route
     from adx_sandbox import ConnectionConfig, Sandbox
     from functional_lifecycle import _wait_deleted
     from node import catalog, labeled_backend
@@ -199,6 +200,7 @@ def run(connection, image, output, secrets):
         initial = json.loads(catalog()['environment:' + sandbox.id])
         backend = labeled_backend(sandbox.id)
         assert len(backend) == 1, backend
+        wait_for_route(sandbox)
 
         with tempfile.TemporaryDirectory(prefix='adx-upload-cut-') as directory:
             source = Path(directory) / 'source.bin'
