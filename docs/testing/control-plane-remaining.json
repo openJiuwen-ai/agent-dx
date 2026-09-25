@@ -72,11 +72,27 @@
     "gate": "用摘要固定的runsc区域镜像和独立SHA512校验构建异构测试镜像，在正式K8s运行--profile full --case runtime-affinity，保存实际inventory、assignment、执行与清理证据。"
   },
   {
+    "id": "host-port-forwarding",
+    "title": "Host 子域名端口转发 E2E",
+    "stage": "7",
+    "status": "complete",
+    "detail": "Full #61以公开SDK在真实双worker K8s执行数据面18/18子项。Host子域名请求未带令牌被拒绝，带令牌后上游仅在收到/functional/host?x=1时返回独立标记ADX-HOST-PATH-OK，因此同时验证Host选路和路径透传；双节点最终backend为空，missing_checks与cleanup_errors均为空。",
+    "gate": "通过公开Ingress的Host子域名访问转发端口，验证匿名拒绝、带令牌成功及上游收到原始路径，并完成物理backend与命名空间清理。"
+  },
+  {
+    "id": "node-affinity-placement",
+    "title": "节点与实例亲和放置 E2E",
+    "stage": "7",
+    "status": "complete",
+    "detail": "Full #59在两个物理worker通过放置8/8子项，逐项核对节点/实例亲和与反亲和、加权和有序偏好、node_id约束的实际归属；不可用runsc保持未分配。公开SDK命令、资源释放、双节点backend及命名空间清理通过。",
+    "gate": "在真实双worker上用公开SDK验证亲和/反亲和及偏好规则，将每个实例的权威assignment与预期节点对照，并检查资源释放和最终清理。"
+  },
+  {
     "id": "idle-active-request",
     "title": "活动客户端请求跨越空闲阈值",
     "stage": "7",
     "status": "complete",
-    "detail": "Full #22验证独立客户端退出后后台命令仍运行时空闲回收；Full #29验证前台SDK请求跨越空闲阈值时不回收，结束后删除并释放资源。",
+    "detail": "Full #60使用当前固定产品包验证前台SDK请求跨越6秒空闲阈值时不回收，结束后删除并释放资源。Full #62的生命周期5/5子项通过：独立客户端启动120秒后台命令后退出，实例在命令自然结束前约14.8秒被空闲回收，终态Deleted且resources_held=false。两次验收的双节点backend与命名空间均已清理。",
     "gate": "在真实 standalone/full 部署执行 --case idle-active，保留请求时长、请求结束前 Running 状态、结束后 Deleted 状态和资源释放证据。"
   },
   {
@@ -92,7 +108,7 @@
     "title": "真实后端意外退出与有界重启",
     "stage": "7",
     "status": "complete",
-    "detail": "Full #39通过真实sandboxd backend删除验证Never终态、有界重启的新runtime identity、第三次退出后的重试上限和资源释放。daemon重启且runtime丢失的组合故障仍需另行验证。",
+    "detail": "Full #39通过真实sandboxd backend删除验证Never终态、有界重启的新runtime identity、第三次退出后的重试上限和资源释放。daemon重启且runtime丢失的组合故障已由Full #57的Never/Restart两项通过，含公开路由撤销、SDK命令和物理清理。",
     "gate": "在真实 standalone/full 部署执行 --case runtime-exit，保存 SDK、Redis assignment/result、sandboxd inventory 和清理证据。"
   },
   {
