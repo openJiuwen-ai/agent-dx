@@ -49,6 +49,10 @@ elif sys.argv[1]=='runtime-affinity':
     result=E/'runtime-affinity-result.json'
     run(connection,image,result)
     print(json.dumps(json.loads(result.read_text())),flush=True)
+elif sys.argv[1]=='mixed-soak':
+    from mixed_soak import run
+    result=E/'mixed-soak-result.json'
+    print(json.dumps(run(connection,image,result)),flush=True)
 elif sys.argv[1]=='idle-active':
     from idle_active import run
     result=E/'idle-active-result.json'

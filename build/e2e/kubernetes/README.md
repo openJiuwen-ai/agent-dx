@@ -155,6 +155,10 @@ artifact build and commit required for every targeted case. The case is not
 verified on a real cluster until its JUnit result, Pod/PVC identities, Redis
 AOF evidence and two-worker backend inventory are retained.
 
+The optional `--profile full --case mixed-soak` runs a five-minute public SDK
+load on both workers and records per-operation counts, latency percentiles,
+errors and final physical cleanup. It does not run in the default Full gate.
+
 Every invocation requires a new evidence directory and creates a unique test
 namespace. Target images must be digest pinned. Registry TLS verification is
 on; private registry credentials are mounted read-only and supplied to both
