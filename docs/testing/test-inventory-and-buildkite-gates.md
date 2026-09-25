@@ -162,7 +162,7 @@ Firecracker checkpoint 使用独立 KVM profile；GPU/NPU 使用具备真实设�
 | L0 | 独立 `--profile l0` 执行 `l0 + auth`，输出 `required_checks`、逐项 JSON 和 JUnit；Buildkite 基础包 #87 已通过 | 后续提交仍需持续执行门禁 |
 | Standalone | `--profile standalone` 统一本地 Docker 十一组；安装示例和 Lima FC 各自有严格结果契约 | 需增加汇总清单，把普通 Linux、安装示例和按需 KVM 结果关联到同一 revision |
 | Multi-VM | 三 VM inventory 与结果契约、公开 SDK 放置/数据链路和鉴权、容量队列、Pack/Spread、节点偏好、异构 runtime、local-first、worker 与控制节点故障、旧 session 写隔离、独立 Ingress 重启及有序停机定向用例已提供；`budget.py` 在首次部署前锁定三小时墙钟预算，`suite.py` 跨配置共享预算，`assemble.py` 要求部署与用例全程计时才允许完整通过 | 尚缺生成配置和分发制品的三 VM 部署器；固定 inventory 之前的 VM 准备时间不计入预算；KVM checkpoint 仍有专项缺口；未进行真实三 VM 验收 |
-| Full Deployment | K8s 已支持 `l0`、五组 `k8s-basic` 和十一组 `full`；`full` 强制两个 Pod 位于不同物理 worker | Full #17 在不同 worker 同次通过十一组、JUnit 45 项和资源清理；异构 runtime、K8s FC 和真实 GPU/NPU 仍需独立环境 |
+| Full Deployment | K8s 已支持 `l0`、五组 `k8s-basic` 和十一组 `full`；`full` 强制两个 Pod 位于不同物理 worker | [Full #26](https://buildkite.com/agent-dx/agent-dx-full-test/builds/26) 在不同 worker 同次通过十一组、39 个功能子项、JUnit 47 项和资源清理；异构 runtime、K8s FC 和真实 GPU/NPU 仍需独立环境 |
 
 因此当前可以直接形成 Buildkite 门禁的是 UT、L0、基础 K8s 五组和 Full 十一组。`full` 的同宿主假绿已被
 驱动拒绝；Full #17 已在双 worker 同次通过十一组。Standalone 可作为独立 Linux/KVM
@@ -183,7 +183,7 @@ profile；完整 Multi-VM 在补齐部署器前不能标记为通过。
 | `L0-03` | 已实现 | 公共 SDK 创建和查询，真实 sandboxd/Execd 后端运行 |
 | `L0-04` | 已实现 | 命令 stdout、stderr、退出码及二进制文件往返 |
 | `L0-05` | 已实现 | 显式删除后 Redis 终态、路由、资源及 sandboxd inventory 全部清理 |
-| `L0-06` | 定向用例已实现，待实测 | `create-response-cut` 用真实 TLS 代理在首个 Running final 已生成后切断下游，要求 SDK 同 Request ID／名称重试、Redis generation 和 sandboxd backend 不变，并完成命令与清理。结构化 unknown 与正常 EOF 无 final 已有 SDK 契约测试；完整场景尚未纳入每次提交的 L0 门禁 |
+| `L0-06` | 正式 K8s 定向验证通过，尚未纳入每次提交门禁 | [Full #42](https://buildkite.com/agent-dx/agent-dx-full-test/builds/42) 的 `create-response-cut` 用真实 TLS 代理在首个 Running final 已生成后切断下游；同 Request ID／名称重试、Redis generation 和 sandboxd backend 不变，命令与清理通过。结构化 unknown 与正常 EOF 无 final 另有 SDK 契约测试 |
 
 ### 9.2 Local Standalone
 
@@ -195,13 +195,13 @@ profile；完整 Multi-VM 在补齐部署器前不能标记为通过。
 | `ST-04` | 已实现 | adxlet 新 session 对账，已运行后端身份不变 |
 | `ST-05` | 已实现 | 日志滚动压缩、Metrics、Trace、Collector 中断恢复 |
 | `ST-FC-01` | 已实现 | KVM 暂停／恢复、可复用快照、克隆和制品清理 |
-| `ST-06` | 定向用例已实现，待实测 | `sqlite-fallback` 暂停 Coordinator、保持 Redis 可读，验证空闲实例本地删除写入 SQLite pending、Redis 暂时保留旧 Running 结果；心跳期限内恢复后要求 pending 清空、Redis 收敛为 Deleted，另一个存活实例保留原 backend 并继续执行 SDK 命令。节点自身重启且 Coordinator 仍不可用的组合故障仍需独立 E2E |
-| `ST-07` | 客户端退出已验证，活动请求用例待实测 | `standalone`／`full` 覆盖无活动实例空闲删除；[Full #22](https://buildkite.com/agent-dx/agent-dx-full-test/builds/22) 验证独立 SDK 客户端进程退出、120 秒后台命令仍运行时由 6 秒空闲策略先行删除（子项 13.491 秒）。定向 `idle-active` 用例已加入：前台请求跨越空闲阈值仍保持运行，结束后空闲删除并释放资源；尚未在真实部署执行 |
-| `ST-08` | 定向用例已实现，待实测 | `runtime-exit` 通过真实 sandboxd 删除运行中 backend：默认 Never 进入 Failed 且无新执行；配置两次重启时每次产生新 runtime identity、继续提供命令能力，第三次退出后达到重试上限并释放资源。退避精确时序已有组件测试，正式进程用例待新包运行 |
-| `ST-09` | K8s 定向验证中 | Coordinator 与 API Server（含 Ingress）分别重启后的 epoch、全量目录和路由重同步；独立 Ingress 使用分进程 fixture，单机部署仍需验证 |
-| `ST-10` | 分进程用例已实现，待实测 | 定向 `relay-standalone` 为两个节点分别启动独立 `adx-relay`，核对进程 PID、实际可执行文件与健康端点，再复用 embedded 模式通过的数据面 SDK 命令、文件、端口转发和反向隧道用例；新发布包上的真实结果待验证 |
-| `ST-11` | daemon 重启已验证，采集过期定向用例待实测 | [Full #17](https://buildkite.com/agent-dx/agent-dx-full-test/builds/17) 对两节点独立 sandboxd 注入 `SIGKILL` 并重启，核对运行中 backend ID 不变、公开 SDK 可查询及继续执行命令；`sandboxd-restart` 用例 5.065 秒通过。新增 `resource-stale` 定向用例：暂停节点资源采集直到样本过期，要求保持已运行 backend 和节点 session、关闭新准入，恢复后重新开放并通过公开 SDK 创建和清理；正式部署尚未运行 |
-| `ST-12` | 定向用例已实现，待实测 | `reconcile-crash` 使 node2 心跳过期并产生旧 backend；暂挂其 runc init，在 sandboxd Delete 发出 TERM、节点保持关闭准入时杀掉 Adxlet。随后恢复 init，要求新 Adxlet 换 session、从权威目录清理旧 backend 后恢复准入；node1 原实例继续执行，最终释放资源。真实 standalone/full 尚未运行 |
+| `ST-06` | 正式 K8s 定向验证通过 | [Full #41](https://buildkite.com/agent-dx/agent-dx-full-test/builds/41) 的 `sqlite-fallback` 暂停 Coordinator、保持 Redis 可读，验证空闲实例本地删除写入 SQLite pending、Redis 暂时保留旧 Running 结果；心跳期限内恢复后 pending 清空、Redis 收敛为 Deleted，另一个实例保留原 backend 并可继续执行 SDK 命令。节点自身重启且 Coordinator 仍不可用的组合故障仍需独立 E2E |
+| `ST-07` | 两种空闲行为均已验证 | [Full #22](https://buildkite.com/agent-dx/agent-dx-full-test/builds/22) 验证独立 SDK 客户端退出、后台命令仍运行时空闲回收；[Full #29](https://buildkite.com/agent-dx/agent-dx-full-test/builds/29) 验证前台请求跨越空闲阈值仍保持运行，结束后空闲删除并释放资源 |
+| `ST-08` | 正式 K8s 定向验证通过 | [Full #39](https://buildkite.com/agent-dx/agent-dx-full-test/builds/39) 通过真实 sandboxd 删除运行中 backend：默认 Never 进入 Failed 且无新执行；配置两次重启时每次产生新 runtime identity、继续提供命令能力，第三次退出后达到重试上限并释放资源。退避精确时序另有组件测试 |
+| `ST-09` | 正式 K8s 定向验证通过 | [Full #37](https://buildkite.com/agent-dx/agent-dx-full-test/builds/37)、[#38](https://buildkite.com/agent-dx/agent-dx-full-test/builds/38)、[#27](https://buildkite.com/agent-dx/agent-dx-full-test/builds/27) 分别验证 Coordinator、API Server、分进程 Ingress 重启后的 epoch、目录和路由重同步；单机进程部署仍需单独验证 |
+| `ST-10` | 正式 K8s 定向验证通过 | [Full #33](https://buildkite.com/agent-dx/agent-dx-full-test/builds/33) 的 `relay-standalone` 为两个节点分别启动独立 `adx-relay`，核对进程 PID、实际可执行文件与健康端点，并通过数据面 SDK 命令、文件、端口转发和反向隧道等 18 个子项；单机进程部署仍需单独验证 |
+| `ST-11` | daemon 重启与采集过期均已验证 | [Full #17](https://buildkite.com/agent-dx/agent-dx-full-test/builds/17) 验证 sandboxd daemon `SIGKILL` 重启时原 backend 保留；[Full #40](https://buildkite.com/agent-dx/agent-dx-full-test/builds/40) 的 `resource-stale` 验证样本过期后保持已运行 backend 和节点 session、关闭新准入，采集恢复后重新开放并通过公开 SDK 创建和清理 |
+| `ST-12` | 正式 K8s 定向验证通过 | [Full #43](https://buildkite.com/agent-dx/agent-dx-full-test/builds/43) 的 `reconcile-crash` 使 node2 心跳过期并产生旧 backend；暂挂其 runc init，在 sandboxd Delete 发出 TERM、节点关闭准入时杀掉 Adxlet。恢复 init 后新 Adxlet 换 session、清理旧 backend 再恢复准入；node1 原实例继续执行，最终释放资源 |
 
 ### 9.3 Local Multi-VM
 
@@ -228,13 +228,15 @@ profile；完整 Multi-VM 在补齐部署器前不能标记为通过。
 | `FD-04` | 已实现 | Metrics、日志、滚动压缩、Collector 重启与 Trace 父子关系 |
 | `FD-05` | 已验证 | `full` profile 的两个 Pod 必须落在不同物理 worker；Full #6 分别运行于 `10.244.128.124` 和 `10.244.128.160` |
 | `FD-06` | 同 Pod 重启已验证；跨 Pod 用例已实现、待实测 | [Full #18](https://buildkite.com/agent-dx/agent-dx-full-test/builds/18) 定向运行 `redis-restart`：`SIGKILL` 托管 Redis 后由 supervisor 重启，AOF 开启，双节点实例归属和代次、后端 ID、文件及命令保持一致，删除后资源释放。新增 K8s 专用 `redis-pod-restart`：Redis 独立 Pod 与 PVC，两个 worker 继续运行；替换 Redis Pod 后核对新 Pod UID、同一 PVC UID、AOF、归属／代次、后端 ID、公开 SDK 文件与命令及最终资源释放。该用例尚无真实集群结果 |
-| `FD-07` | Coordinator／API Server 已验证，Ingress 待新包复验 | [Full #19](https://buildkite.com/agent-dx/agent-dx-full-test/builds/19) 通过 Coordinator 重启，[Full #20](https://buildkite.com/agent-dx/agent-dx-full-test/builds/20) 通过 API Server 重启；均核对原归属／后端和公开 SDK 文件、命令。[Full #21](https://buildkite.com/agent-dx/agent-dx-full-test/builds/21) 因默认共进程 fixture 无独立 Ingress PID，在故障注入前失败；[Full #24](https://buildkite.com/agent-dx/agent-dx-full-test/builds/24) 改用分进程 fixture 后发现复用的旧产品包未携带 `adx-ingress`，启动阶段失败，故障注入未执行。发布包和构建配方现已补入分进程二进制，待新产物复验；持续网络分区仍待独立用例 |
-| `FD-08` | 定向用例已实现，待实测 | `network-partition` 在 node2 Pod／容器网络命名空间阻断到 Coordinator 的 TCP 流量，要求防火墙计数非零、心跳失效及旧实例撤路由；隔离期 node1 继续执行和创建，解除后 node2 清理旧后端再准入。正式双物理 worker 尚未运行该用例 |
+| `FD-07` | 正式 K8s 定向验证通过 | [Full #37](https://buildkite.com/agent-dx/agent-dx-full-test/builds/37)、[#38](https://buildkite.com/agent-dx/agent-dx-full-test/builds/38)、[#27](https://buildkite.com/agent-dx/agent-dx-full-test/builds/27) 分别验证 Coordinator、API Server 与独立 Ingress 重启后原归属／后端和公开 SDK 路由；持续网络分区另见 `FD-08` |
+| `FD-08` | 正式双物理 worker 定向验证通过 | [Full #31](https://buildkite.com/agent-dx/agent-dx-full-test/builds/31) 的 `network-partition` 在 node2 网络命名空间阻断到 Coordinator 的 TCP 流量，防火墙计数非零、心跳失效且旧实例撤路由；隔离期间 node1 继续执行和创建，解除后 node2 清理旧后端再准入。两个 Pod 分别位于 `10.244.128.124` 和 `10.244.128.160` |
 | `FD-09` | 已验证 | [Full #23](https://buildkite.com/agent-dx/agent-dx-full-test/builds/23) 的 `data-plane` 定向用例通过 Host 子域名端口转发：`<instance-id>-18081.example.test` 携带鉴权后到达实例的嵌套路径，缺少 Token 被拒绝；用例 28.859 秒，清理错误为 0 |
 | `FD-10` | 本地及三 VM 定向用例已实现，异构环境未验证 | 两种运行方式均要求两个节点真实上报不同的 sandboxd runtime inventory；通过公开 SDK 请求 `runsc` 且不指定节点，核对唯一支持节点上的归属、物理后端、命令执行和资源释放。当前 runc-only fixture 无法使该用例通过，不能将负向拒绝测试充当正向亲和证据 |
 | `FD-FC-01` | 条件计划 | KVM worker 的 Firecracker pause/resume/snapshot profile |
 | `FD-XPU-01` | 条件计划 | 真实 GPU/NPU 整卡发现、过滤、分配、释放和故障清理 |
 | `FD-SOAK-01` | Nightly | 创建／执行／删除循环及反复节点故障，持续 1–24 小时无资源增长 |
+
+本轮正式定向测试在 2026-09-24 23:15:14 UTC 创建首个构建、2026-09-25 00:47:20 UTC 完成最后一个构建，墙钟约 1 小时 32 分。Full #27–#38 的 12 个场景首次运行 7 个通过、5 个失败；统一修正测试驱动对嵌套 `runtime.id`、API 缓存收敛及 node2 故障参数的断言后，Full #39–#43 对失败的 5 个场景逐项回归通过。回归沿用同一不可变产品制品 `7551acb4`，测试驱动为 `d4452816`；所有通过结果均无缺失检查或清理错误。此轮不包括需要异构 runsc 节点、动态 StorageClass、KVM 或实卡的条件性用例。
 
 推荐执行频率：每次提交运行 `L0-01..05`；主分支运行 `ST-01..05` 和 `FD-01..04`；具备双物理
 worker 时把 `FD-05` 设为合入门槛；Multi-VM、FC、XPU 和长稳按 nightly、相关路径变更及发布候选触发。

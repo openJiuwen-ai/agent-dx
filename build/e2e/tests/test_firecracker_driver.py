@@ -9,6 +9,14 @@ ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/'firecracker'))
 
 class FirecrackerEvidenceTests(unittest.TestCase):
+    def test_fault_oracles_read_the_nested_runtime_record(self):
+        from runtime_record import runtime_id, runtime_ip
+        record = {'state': 'Running', 'runtime': {'id': 'backend-1', 'ip': '10.0.0.8'}}
+        self.assertEqual(runtime_id(record), 'backend-1')
+        self.assertEqual(runtime_ip(record), '10.0.0.8')
+        with self.assertRaises(KeyError):
+            runtime_id({'state': 'Running', 'runtime_id': 'legacy-backend'})
+
     def test_entrypoint_case_uses_the_execd_terminal_status_contract(self):
         source=(ROOT/'firecracker/sdk_checkpoint.py').read_text()
         self.assertIn("entrypoint_info['status_kind'] == 'exited'",source)

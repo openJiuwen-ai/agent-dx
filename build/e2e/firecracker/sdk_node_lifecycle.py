@@ -14,6 +14,7 @@ import subprocess
 import time
 import traceback
 import urllib.request
+from runtime_record import runtime_id
 
 p = argparse.ArgumentParser()
 p.add_argument('--run-root', required=True, type=Path)
@@ -88,10 +89,10 @@ try:
     old = physical(s.id)
     assert len(old) == 1, old
     command([a.sbox,'-a',root/'sandboxd/sandboxd.sock','delete',old[0]])
-    restarted = wait(lambda: (r if (r:=record(s.id)) and r['state']=='Running' and r['runtime_id']!=first['runtime_id'] else None))
+    restarted = wait(lambda: (r if (r:=record(s.id)) and r['state']=='Running' and runtime_id(r)!=runtime_id(first) else None))
     assert restarted['restart_attempts'] == 1
     assert s.commands.run('printf restarted').stdout.strip() == 'restarted'
-    passed('unexpected backend exit restarts with a fresh execution', instance_id=s.id, old_runtime=first['runtime_id'], new_runtime=restarted['runtime_id'])
+    passed('unexpected backend exit restarts with a fresh execution', instance_id=s.id, old_runtime=runtime_id(first), new_runtime=runtime_id(restarted))
     def sampled_stats():
         text = urllib.request.urlopen('http://127.0.0.1:17003/metrics',timeout=5).read().decode()
         return text if 'adx_environment_memory_usage_bytes' in text and s.id in text else None
@@ -109,9 +110,9 @@ try:
     old = physical(recovered_from_checkpoint.id)
     assert len(old) == 1, old
     command([a.sbox,'-a',root/'sandboxd/sandboxd.sock','delete',old[0]])
-    recovered = wait(lambda: (r if (r:=record(recovered_from_checkpoint.id)) and r['state']=='Running' and r['runtime_id']!=before_failover['runtime_id'] else None), 120)
+    recovered = wait(lambda: (r if (r:=record(recovered_from_checkpoint.id)) and r['state']=='Running' and runtime_id(r)!=runtime_id(before_failover) else None), 120)
     assert recovered_from_checkpoint.files.read('/tmp/failover-state') == 'checkpoint-state'
-    passed('failover restores the latest checkpoint without a cold start', instance_id=recovered_from_checkpoint.id, snapshot_id=checkpoint.snapshot_id, old_runtime=before_failover['runtime_id'], new_runtime=recovered['runtime_id'])
+    passed('failover restores the latest checkpoint without a cold start', instance_id=recovered_from_checkpoint.id, snapshot_id=checkpoint.snapshot_id, old_runtime=runtime_id(before_failover), new_runtime=runtime_id(recovered))
     recovered_from_checkpoint.kill()
 
     unrecoverable = create(idle_timeout=0, failover=True)
@@ -140,12 +141,12 @@ try:
     passed('Coordinator outage uses SQLite for idle deletion while Redis remains stale', instance_id=idle.id)
 
     node_pid = pid('adxlet')
-    kept_runtime = record(keep.id)['runtime_id']
+    kept_runtime = runtime_id(record(keep.id))
     os.kill(node_pid,signal.SIGKILL)
     wait(lambda:pid('adxlet') != node_pid,30)
     time.sleep(4)
     assert len(physical(keep.id))==1
-    assert record(keep.id)['runtime_id']==kept_runtime
+    assert runtime_id(record(keep.id))==kept_runtime
     assert journaled_delete()
     passed('Adxlet restart waits for Coordinator without cleaning an owned runtime')
     os.kill(coordinator_pid,signal.SIGCONT); stopped.remove(coordinator_pid)
