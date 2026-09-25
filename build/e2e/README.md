@@ -149,12 +149,18 @@ Local Docker reproduction requires access to the same bind-mounted paths as the 
   bundle, pass `--runsc-bin /path/to/native/runsc` to `prepare.py`; its ELF
   architecture is checked against the release and its SHA256 is recorded in
   `bundle.json`. In Buildkite, set `ADX_E2E_RUNSC_BIN` and the independently
-  checked `ADX_E2E_RUNSC_SHA256` for the image-build step. Select
+  checked `ADX_E2E_RUNSC_SHA256`, or set an HTTPS `ADX_E2E_RUNSC_URL` and its
+  pinned `ADX_E2E_RUNSC_SHA512` for the image-build step. Select
   `--profile full --case runtime-affinity`; the driver enables `runsc` only
   on node2 and requires live inventory, unpinned SDK creation, physical
   placement, command execution and cleanup. The OCI test image must support
   the selected `runsc` binary. This case remains unverified until it passes
   on an actual heterogeneous deployment.
+  For a targeted Buildkite run with newly composed images, set the exact
+  `ADX_BASE_PACKAGE_BUILD_ID`, `ADX_SDK_BUILD_ID` and
+  `ADX_E2E_ARTIFACT_COMMIT` of the verified product alongside
+  `ADX_E2E_TARGET_CASE=runtime-affinity`; the harness commit may differ from
+  the product commit, and both identities are recorded.
 - `idle-active` (targeted activity case): hold a foreground SDK command request
   open for 12 seconds with a six-second idle timeout. Verify that the instance
   and its allocation survive the active request, then close the client and

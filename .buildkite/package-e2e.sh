@@ -31,7 +31,7 @@ base_wheels=(out/buildkite/package/sdk/adx_sandbox-*.whl)
 [[ ${#base_wheels[@]} == 1 && -f ${base_wheels[0]} ]] || { echo 'base package SDK wheel is missing' >&2; exit 1; }
 python3 build/release/component.py verify-build \
   --manifest out/buildkite/build-manifest.json \
-  --commit "$BUILDKITE_COMMIT" \
+  --commit "${ADX_E2E_ARTIFACT_COMMIT:-$BUILDKITE_COMMIT}" \
   --target x86_64-unknown-linux-gnu \
   --package-manifest out/buildkite/package/manifest.json \
   --release-archive out/buildkite/adx-release.tar.gz \
@@ -76,6 +76,20 @@ docker pull "$ADX_COLLECTOR_IMAGE"
 echo "--- :docker: Build node, EXECD and entrypoint fixture images"
 fc_args=()
 runtime_args=()
+if [[ -n ${ADX_E2E_RUNSC_URL:-} ]]; then
+  [[ -z ${ADX_E2E_RUNSC_BIN:-} ]] || { echo 'choose either a local runsc binary or a release URL' >&2; exit 2; }
+  : "${ADX_E2E_RUNSC_SHA512:?a pinned runsc SHA512 is required for downloads}"
+  [[ $ADX_E2E_RUNSC_URL == https://* && $ADX_E2E_RUNSC_SHA512 =~ ^[0-9a-fA-F]{128}$ ]] || {
+    echo 'runsc download requires an HTTPS URL and a 128-digit SHA512' >&2; exit 2;
+  }
+  mkdir -p out/buildkite/runtime
+  export ADX_E2E_RUNSC_BIN="$PWD/out/buildkite/runtime/runsc"
+  curl -fSL --retry 3 --retry-delay 2 --max-time 300 "$ADX_E2E_RUNSC_URL" -o "$ADX_E2E_RUNSC_BIN"
+  printf '%s  %s\n' "$ADX_E2E_RUNSC_SHA512" "$ADX_E2E_RUNSC_BIN" | sha512sum --check -
+  chmod 0755 "$ADX_E2E_RUNSC_BIN"
+  export ADX_E2E_RUNSC_SHA256
+  ADX_E2E_RUNSC_SHA256=$(sha256sum "$ADX_E2E_RUNSC_BIN" | cut -d' ' -f1)
+fi
 if [[ -n ${ADX_E2E_RUNSC_BIN:-} ]]; then
   : "${ADX_E2E_RUNSC_SHA256:?a pinned runsc SHA256 is required}"
   printf '%s  %s\n' "$ADX_E2E_RUNSC_SHA256" "$ADX_E2E_RUNSC_BIN" | sha256sum --check -

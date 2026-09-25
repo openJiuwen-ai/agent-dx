@@ -97,6 +97,9 @@ class IndependentPipelineTests(unittest.TestCase):
         self.assertIn('out/buildkite/backend.tar.gz', script)
         self.assertIn('--sdk-wheel', script)
         self.assertIn('--sdk-candidate', script)
+        self.assertIn('ADX_E2E_ARTIFACT_COMMIT:-$BUILDKITE_COMMIT', script)
+        self.assertIn('ADX_E2E_RUNSC_URL', script)
+        self.assertIn('sha512sum --check', script)
 
     def test_e2e_bundle_records_independent_sdk_candidate(self):
         spec = importlib.util.spec_from_file_location(
