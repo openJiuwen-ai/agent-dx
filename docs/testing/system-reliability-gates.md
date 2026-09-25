@@ -9,7 +9,7 @@
 | 门禁 | 场景 | 通过条件 | 当前状态 |
 |---|---|---|---|
 | ERR-01 | 稳定错误映射 | Invalid、Auth、Permission、NotFound、Conflict、NoCapacity、Unavailable、Deadline、OutcomeUnknown、DataLoss、Internal 的 HTTP/gRPC/SDK 映射一致 | API Server 已逐类校验 HTTP 状态、稳定码、retry、outcome 和操作身份；SDK 结构化解析已有契约测试；完整进程 E2E 待补 |
-| ERR-02 | 可重试分类 | 稳定业务冲突不重试；临时不可用按退避；结果未知只以同一 request/operation/instance 身份重试 | SDK 已覆盖 terminal final 不重试、structured unknown final 同身份重试和重试耗尽；真实断流 E2E 待补 |
+| ERR-02 | 可重试分类 | 稳定业务冲突不重试；临时不可用按退避；结果未知只以同一 request/operation/instance 身份重试 | SDK 已覆盖 terminal final 不重试、structured unknown final 同身份重试和重试耗尽；创建真实断流见 Full #42。`command-response-cut` 已增加真实 Execd 成功提交后切断三次应答、同 Request ID 重试和新客户端查询原命令的定向用例，正式部署运行待完成 |
 | ERR-03 | 创建应答丢失 | Node 已启动但响应被切断；重试收敛到同一 backend 和 generation | SDK 已覆盖 accepted 后连接报错及正常 EOF 无 final，两类情况均复用 Request ID 和稳定 Environment 名称；[Full #42](https://buildkite.com/agent-dx/agent-dx-full-test/builds/42) 用真实 TLS 代理切断首个 Running 应答，验证 Redis generation 和 sandboxd backend 不变及公开 SDK 重试成功 |
 | ERR-04 | 查询空结果 | 结果未知后的 404 不触发换 ID 或第二次 Start | SDK 稳定 Environment ID、同身份重试与原子 claim 已有测试；`create-unknown-query` 已加入定向 Full：代理断开首个创建应答、真实公共查询暂时返回 404 后放行原请求，核对相同 Request ID、单一归属和物理 backend；正式部署运行待完成 |
 

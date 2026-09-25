@@ -4,7 +4,7 @@
     "title": "系统错误、超时与故障可靠性门禁",
     "stage": "13",
     "status": "pending",
-    "detail": "已修正local-first预算边界、中心队列独立超时和sandboxd晚启动等待；稳定错误映射及SDK同身份重试已有组件门禁。Full #17验证sandboxd daemon重启；#42验证真实TLS代理断流，#40验证资源采集过期，#43验证对账中断重启，#31验证双物理worker网络隔离；#57验证daemon重启同时丢失runtime后的Never与自动重启两种策略，包括删除前公开Ingress路由撤销、旧/新backend、Redis状态、SDK命令和最终清理。提交0b936fd补真实Redis回归用例且22项RPC通过，基础包#91构建及K8s L0通过；Full #48通过独立Redis Pod/PVC重启、AOF和双worker原实例读写/删除。已新增create-unknown-query和schedule-deadline两项定向Full用例，快速代理、调度和驱动测试通过，正式部署尚未运行。完整三VM故障门禁和FC专项仍待补齐。",
+    "detail": "已修正local-first预算边界、中心队列独立超时和sandboxd晚启动等待；稳定错误映射及SDK同身份重试已有组件门禁。Full #17验证sandboxd daemon重启；#42验证真实TLS代理断流，#40验证资源采集过期，#43验证对账中断重启，#31验证双物理worker网络隔离；#57验证daemon重启同时丢失runtime后的Never与自动重启两种策略，包括删除前公开Ingress路由撤销、旧/新backend、Redis状态、SDK命令和最终清理。提交0b936fd补真实Redis回归用例且22项RPC通过，基础包#91构建及K8s L0通过；Full #48通过独立Redis Pod/PVC重启、AOF和双worker原实例读写/删除。已新增create-unknown-query、schedule-deadline和command-response-cut三项定向Full用例，快速代理、调度和驱动测试通过，正式部署尚未运行。完整三VM故障门禁和FC专项仍待补齐。",
     "gate": "ERR-01..04、TIME-01..05、SD-01..04、NM-01..03和NODE-01..04按system-reliability-gates.md完成对应拓扑E2E并保存客户端、Redis、路由和物理backend证据。"
   },
   {
