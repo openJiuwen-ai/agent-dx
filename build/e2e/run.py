@@ -20,6 +20,7 @@ import xml.etree.ElementTree as ET
 BASIC = ('sdk','auth','capacity','placement','local-first')
 STANDARD = ('sdk','data-plane','lifecycle','auth','capacity','placement','local-first','node-failure','sandboxd-restart','restart','stop')
 OPTIONAL_CASES = ('redis-restart','coordinator-restart','coordinator-adxlet-restart','apiserver-restart','ingress-restart','runtime-affinity','idle-active','relay-standalone','runtime-exit','sandboxd-runtime-loss','sqlite-fallback','sqlite-node-restart','create-response-cut','create-unknown-query','command-response-cut','command-watch-unavailable','command-watch-query-unavailable','command-unsupported-feature','command-registry-capacity','command-expiry','upload-response-cut','download-response-cut','schedule-deadline','resource-stale','network-partition','reconcile-crash','mixed-soak')
+FULL_ONLY_CASES = ('load-performance', 'load-pressure')
 PROFILES = {
     'l0': ('l0','auth'),
     'standalone': STANDARD,
@@ -36,6 +37,8 @@ def selected_checks(profile, case=None):
     required=required_for_profile(profile)
     if case is None:
         return required
+    if profile == 'full' and case in FULL_ONLY_CASES:
+        return (case,)
     if profile in ('standalone','full') and case in OPTIONAL_CASES:
         return (case,)
     if case not in required:
@@ -334,6 +337,13 @@ class Run:
                                     '/opt/adx/e2e/scenarios.py','mixed-soak',timeout=750)
                 record['subcases']=sdk_subcases_from_output(output)
                 for node in self.nodes:self.helper(node,'empty',node)
+        for scenario, timeout in (('load-performance', 300), ('load-pressure', 420)):
+            if scenario in selected:
+                with self.case(scenario, checks) as record:
+                    output=self.execute('node1','/opt/adx/client/bin/python','-u',
+                                        '/opt/adx/e2e/scenarios.py',scenario,timeout=timeout)
+                    record['subcases']=sdk_subcases_from_output(output)
+                    for node in self.nodes:self.helper(node,'empty',node)
         if 'idle-active' in selected:
             with self.case('idle-active', checks) as record:
                 output=self.execute('node1','/opt/adx/client/bin/python','-u',
