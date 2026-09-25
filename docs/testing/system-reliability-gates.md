@@ -9,9 +9,9 @@
 | 门禁 | 场景 | 通过条件 | 当前状态 |
 |---|---|---|---|
 | ERR-01 | 稳定错误映射 | Invalid、Auth、Permission、NotFound、Conflict、NoCapacity、Unavailable、Deadline、OutcomeUnknown、DataLoss、Internal 的 HTTP/gRPC/SDK 映射一致 | API Server 已逐类校验 HTTP 状态、稳定码、retry、outcome 和操作身份；SDK 结构化解析已有契约测试；完整进程 E2E 待补 |
-| ERR-02 | 可重试分类 | 稳定业务冲突不重试；临时不可用按退避；结果未知只以同一 request/operation/instance 身份重试 | SDK 已覆盖 terminal final 不重试、structured unknown final 同身份重试和重试耗尽；创建真实断流见 Full #42。`command-response-cut` 已增加真实 Execd 成功提交后切断三次应答、同 Request ID 重试和新客户端查询原命令的定向用例，正式部署运行待完成 |
+| ERR-02 | 可重试分类 | 稳定业务冲突不重试；临时不可用按退避；结果未知只以同一 request/operation/instance 身份重试 | SDK 已覆盖 terminal final 不重试、structured unknown final 同身份重试和重试耗尽；创建真实断流见 Full #42。`command-response-cut` 在 [cn-north-4 定向部署](2026-09-25-cn-north-4-targeted-reliability.md) 通过：真实 Execd 成功提交后切断三次应答，同 Request ID 重试并由新客户端查询原命令；完整错误码矩阵仍待跨进程 E2E |
 | ERR-03 | 创建应答丢失 | Node 已启动但响应被切断；重试收敛到同一 backend 和 generation | SDK 已覆盖 accepted 后连接报错及正常 EOF 无 final，两类情况均复用 Request ID 和稳定 Environment 名称；[Full #42](https://buildkite.com/agent-dx/agent-dx-full-test/builds/42) 用真实 TLS 代理切断首个 Running 应答，验证 Redis generation 和 sandboxd backend 不变及公开 SDK 重试成功 |
-| ERR-04 | 查询空结果 | 结果未知后的 404 不触发换 ID 或第二次 Start | SDK 稳定 Environment ID、同身份重试与原子 claim 已有测试；`create-unknown-query` 已加入定向 Full：代理断开首个创建应答、真实公共查询暂时返回 404 后放行原请求，核对相同 Request ID、单一归属和物理 backend；正式部署运行待完成 |
+| ERR-04 | 查询空结果 | 结果未知后的 404 不触发换 ID 或第二次 Start | SDK 稳定 Environment ID、同身份重试与原子 claim 已有测试；`create-unknown-query` 在 [cn-north-4 定向部署](2026-09-25-cn-north-4-targeted-reliability.md) 通过：代理断开首个创建应答、公共查询暂时返回 404 后放行原请求，相同 Request ID 收敛到单一归属和物理 backend |
 
 ## Deadline 契约
 
@@ -25,7 +25,7 @@
 |---|---|---|---|
 | TIME-01 | Local-first 本地命中 | 不出现 45s 本地加 45s 中心的预算切分；不调用中心队列 | 已有定向测试，待 E2E 时序证据 |
 | TIME-02 | Local-first 本地不满足 | Node 明确 fallback 后才进入中心队列，中心单独使用 schedule timeout | 已实现，待 E2E 时序证据 |
-| TIME-03 | 中心队列耗尽 | 尚未形成 Assignment 时原子移出内存队列并释放快照引用，返回 DeadlineExceeded 并提示同 ID 重试；已形成 Assignment 时不取消 | 已有真实 Redis/mTLS 组件测试；`schedule-deadline` 已加入定向 Full，用公共 SDK、管理员队列 API、Redis 和双节点物理清理核对超时前后状态，正式部署运行待完成。快照引用释放与已形成 Assignment 后不取消仍由组件测试覆盖 |
+| TIME-03 | 中心队列耗尽 | 尚未形成 Assignment 时原子移出内存队列并释放快照引用，返回 DeadlineExceeded 并提示同 ID 重试；已形成 Assignment 时不取消 | 已有真实 Redis/mTLS 组件测试；`schedule-deadline` 在 [cn-north-4 定向部署](2026-09-25-cn-north-4-targeted-reliability.md) 通过公共 SDK、管理员队列 API、Redis 和双节点物理清理核对超时前后状态。快照引用释放与已形成 Assignment 后不取消仍由组件测试覆盖 |
 | TIME-04 | 分阶段 deadline | 调度、启动、Execd ready、持久化分别耗尽；下游 deadline 不增长 | 待 E2E |
 | TIME-05 | 上游超时后的结果 | 最终结果可由同一 request/instance 查询，物理 backend 唯一 | 部分组件覆盖，待 E2E |
 
@@ -42,7 +42,7 @@
 
 | 门禁 | 场景 | 通过条件 | 当前状态 |
 |---|---|---|---|
-| NM-01 | 心跳期限内进程重启 | 新 session 完成权威对账并保留有效 backend；对账完成前不准入 | 已有本地 E2E；[Full #55](https://buildkite.com/agent-dx/agent-dx-full-test/builds/55) 在双物理 worker 上同时重启 Coordinator 与 node2 Adxlet，记录 node2 PID 110→202、session 更换、Coordinator epoch 1→2，原归属及 backend 不变，公开 SDK 查询、命令、文件和清理通过；新增 `sqlite-node-restart` 在 Coordinator 暂停、SQLite 有待同步删除时重启 Adxlet，检查日志和仍运行后端，正式部署运行待完成；对账期间新准入仍需独立注入 |
+| NM-01 | 心跳期限内进程重启 | 新 session 完成权威对账并保留有效 backend；对账完成前不准入 | 已有本地 E2E；[Full #55](https://buildkite.com/agent-dx/agent-dx-full-test/builds/55) 在双物理 worker 上同时重启 Coordinator 与 node2 Adxlet，记录 node2 PID 110→202、session 更换、Coordinator epoch 1→2，原归属及 backend 不变，公开 SDK 查询、命令、文件和清理通过；`sqlite-node-restart` 在 [cn-north-4 定向部署](2026-09-25-cn-north-4-targeted-reliability.md) 通过，覆盖 Coordinator 暂停、SQLite 待同步删除期间重启 Adxlet；对账期间新准入仍需独立注入 |
 | NM-02 | 超过心跳期限后进程返回 | 旧实例已经失效；返回节点清理旧执行与绑定后才重新准入 | 已有本地 E2E |
 | NM-03 | 对账期间再次崩溃 | 再次启动继续从 Redis 权威状态收敛，不复活旧 generation | 已有中断物理清理后新 adxlet 重读 inventory、重复幂等删除并保持准入关闭的组件测试；[Full #43](https://buildkite.com/agent-dx/agent-dx-full-test/builds/43) 在双物理 worker 真实注入失联、runc init 暂挂、对账中 Adxlet 崩溃，随后验证换 session、清理旧 backend 再准入 |
 | NODE-01 | 节点故障且无 checkpoint | Failed、撤路由，不从镜像冷启动 | 已有组件覆盖；[Full #31](https://buildkite.com/agent-dx/agent-dx-full-test/builds/31) 在双物理 worker 网络隔离期间验证失效和公开入口拒绝。完整三 VM 门禁仍待执行 |
