@@ -37,7 +37,6 @@ struct State {
     environments: BTreeMap<String, StoredEnvironment>,
     nodes: BTreeMap<String, StoredNode>,
     needs_recovery: bool,
-    claim_recovery: bool,
     placement: Placement,
     recovery_cursor: Option<String>,
     live: BTreeMap<String, LiveNode>,
@@ -149,9 +148,8 @@ impl State {
                 Err(Error::Conflict) => {
                     // Rebuild the whole precomputed round after a competing owner
                     // or generation wins. Only uncommitted work is requeued.
-                    self.claim_recovery = true;
                     self.needs_recovery = true;
-                    self.recover_claim_write().await?;
+                    self.recover_authoritative_state().await?;
                     return Ok(true);
                 }
                 Err(error) => {
@@ -265,7 +263,6 @@ impl CoordinatorRpc {
                 environments: saved.environments,
                 nodes: saved.nodes,
                 needs_recovery: false,
-                claim_recovery: false,
                 placement,
                 recovery_cursor: None,
                 live: BTreeMap::new(),
@@ -283,7 +280,7 @@ impl CoordinatorRpc {
     /// Invalidate expired executions and their routes before admitting a returning node.
     pub async fn expire_nodes(&self) -> Result<usize> {
         let mut state = self.0.state.lock().await;
-        state.recover_claim_write().await?;
+        state.recover_authoritative_state().await?;
         state.healthy()?;
         let ids: Vec<_> = state
             .nodes
@@ -346,7 +343,7 @@ impl CoordinatorRpc {
             tokio::pin!(changed);
             changed.as_mut().enable();
             let mut state = self.0.state.lock().await;
-            state.recover_claim_write().await.map_err(status)?;
+            state.recover_authoritative_state().await.map_err(status)?;
             state.healthy().map_err(status)?;
             if schedule_deadline.is_some_and(|deadline| {
                 tokio::time::Instant::now() >= deadline && !state.specs.contains_key(&spec.id)
@@ -576,7 +573,7 @@ impl CoordinatorRpc {
         session_id: String,
     ) -> Result<EnvironmentRecord> {
         let mut state = self.0.state.lock().await;
-        state.recover_claim_write().await?;
+        state.recover_authoritative_state().await?;
         state.healthy()?;
         let id = &record.assignment.node_id;
         if state.overdue(id, self.0.heartbeat_timeout) {
@@ -750,7 +747,7 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
             return Err(Status::invalid_argument("node_id required"));
         }
         let mut state = self.0.state.lock().await;
-        state.recover_claim_write().await.map_err(status)?;
+        state.recover_authoritative_state().await.map_err(status)?;
         state.healthy().map_err(status)?;
         let locally_accepting = state
             .live
@@ -859,7 +856,7 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
                     return Err(Status::permission_denied("node identity mismatch"));
                 }
                 let mut state = self.0.state.lock().await;
-                state.recover_claim_write().await.map_err(status)?;
+                state.recover_authoritative_state().await.map_err(status)?;
                 state.healthy().map_err(status)?;
                 let live = state.live.get(&r.node_id).ok_or_else(|| {
                     Status::failed_precondition("register node before reconciliation")
@@ -964,7 +961,7 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
                 tokio::spawn(async move {
                     let predecessor = service.replacement_predecessor(&r).await;
                     let mut state = service.0.state.lock().await;
-                    state.recover_claim_write().await.map_err(status)?;
+                    state.recover_authoritative_state().await.map_err(status)?;
                     state.healthy().map_err(status)?;
                     if state
                         .retired_sessions
@@ -1096,7 +1093,7 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
                 tenant(r.caller.as_ref(), &raw.tenant_id)?;
                 let spec = {
                     let mut state = self.0.state.lock().await;
-                    state.recover_claim_write().await.map_err(status)?;
+                    state.recover_authoritative_state().await.map_err(status)?;
                     state.healthy().map_err(status)?;
                     cloning::normalize(&state.session, raw)
                         .await

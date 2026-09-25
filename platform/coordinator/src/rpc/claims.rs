@@ -5,8 +5,8 @@ use adx_core::snapshots::Reference;
 use pb::claim_environment_response::Outcome;
 
 impl State {
-    pub(super) async fn recover_claim_write(&mut self) -> Result<()> {
-        if !self.claim_recovery {
+    pub(super) async fn recover_authoritative_state(&mut self) -> Result<()> {
+        if !self.needs_recovery {
             return Ok(());
         }
         // The failed writer has returned. Advancing the header prevents its last
@@ -41,7 +41,6 @@ impl State {
         for (id, record) in &self.environments {
             self.specs.insert(id.clone(), record.spec.clone());
         }
-        self.claim_recovery = false;
         self.needs_recovery = false;
         Ok(())
     }
@@ -54,7 +53,6 @@ impl State {
         };
         if let Err(error) = synchronized {
             self.needs_recovery = true;
-            self.claim_recovery = true;
             return Err(error);
         }
         self.scheduler.generation = self.scheduler.generation.max(record.assignment.generation);
@@ -125,7 +123,7 @@ impl CoordinatorRpc {
             .ok_or_else(|| Status::invalid_argument("spec required"))?;
         tenant(create.caller.as_ref(), &raw.tenant_id)?;
         let mut state = self.0.state.lock().await;
-        state.recover_claim_write().await.map_err(status)?;
+        state.recover_authoritative_state().await.map_err(status)?;
         state.healthy().map_err(status)?;
         state
             .live_claimant(node, &request.node_session_id, self.0.heartbeat_timeout)
@@ -172,7 +170,7 @@ impl CoordinatorRpc {
                 .map_err(status)?,
         };
         let mut state = self.0.state.lock().await;
-        state.recover_claim_write().await.map_err(status)?;
+        state.recover_authoritative_state().await.map_err(status)?;
         state.healthy().map_err(status)?;
         state
             .live_claimant(&node, &candidate.node_session_id, self.0.heartbeat_timeout)
@@ -235,7 +233,6 @@ impl CoordinatorRpc {
         let outcome = match state.session.claim(spec.clone(), &candidate).await {
             Ok(outcome) => outcome,
             Err(e @ Error::Unavailable(_)) => {
-                state.claim_recovery = true;
                 state.needs_recovery = true;
                 self.0.changed.notify_waiters();
                 return Err(status(e));
