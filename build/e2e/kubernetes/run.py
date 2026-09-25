@@ -126,6 +126,28 @@ def default_redis_storage_class(value):
     return defaults[0]
 
 
+def storage_class_inventory(value):
+    """Record public selection fields without copying arbitrary annotations."""
+    classes = value.get('items') if isinstance(value, dict) else None
+    if not isinstance(classes, list):
+        raise ValueError('Kubernetes StorageClass list is invalid')
+    inventory = []
+    for item in classes:
+        metadata = item.get('metadata', {})
+        annotations = metadata.get('annotations', {})
+        provisioner = item.get('provisioner')
+        inventory.append({
+            'name': metadata.get('name'),
+            'provisioner': provisioner,
+            'volume_binding_mode': item.get('volumeBindingMode'),
+            'reclaim_policy': item.get('reclaimPolicy'),
+            'default': annotations.get('storageclass.kubernetes.io/is-default-class',
+                                       annotations.get('storageclass.beta.kubernetes.io/is-default-class')) == 'true',
+            'dynamic': provisioner not in (None, 'kubernetes.io/no-provisioner'),
+        })
+    return sorted(inventory, key=lambda item: item['name'] or '')
+
+
 class KubernetesRun(common.Run):
     def __init__(self, output, kubeconfig, context=None, profile="k8s-basic",
                  selected_case=None, redis_storage_class=None):
@@ -201,6 +223,9 @@ class KubernetesRun(common.Run):
         self.kube('version', '-o', 'json', timeout=30)
         if self.selected_case == 'redis-pod-restart' and self.redis_storage_class is None:
             classes = json.loads(self.kube('get', 'storageclasses', '-o', 'json', timeout=30))
+            (self.output / 'storage-classes.json').write_text(
+                json.dumps(storage_class_inventory(classes), indent=2) + '\n'
+            )
             self.redis_storage_class = default_redis_storage_class(classes)
         if self.redis_storage_class is not None:
             (self.output / 'redis-storage-class.json').write_text(
