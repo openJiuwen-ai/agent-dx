@@ -202,6 +202,12 @@ Local Docker reproduction requires access to the same bind-mounted paths as the 
   original assignment. Verify a public SDK command, final deletion and empty
   physical backend inventory. Select with
   `--profile full --case sandboxd-runtime-loss`.
+- `coordinator-adxlet-restart` (targeted combined process fault): retain one
+  Sandbox per node, then kill Coordinator and node2 adxlet concurrently under
+  their supervisor. Require a new Coordinator epoch and adxlet session, unchanged
+  Redis ownership and physical backend identities, restored public SDK command
+  and file access, and final deletion. Select with
+  `--profile full --case coordinator-adxlet-restart`.
 - `sqlite-fallback` (targeted Coordinator outage case): enable the adxlet
   degradation journal only for this fixture, create a retained and an idle
   Sandbox, then suspend Coordinator while managed Redis remains available.

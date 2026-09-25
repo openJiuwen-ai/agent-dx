@@ -11,6 +11,37 @@ driver = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(driver)
 
 class AcceptanceGateTests(unittest.TestCase):
+    def test_coordinator_and_adxlet_restart_together_preserve_both_backends(self):
+        self.assertEqual(driver.selected_checks('full', 'coordinator-adxlet-restart'),
+                         ('coordinator-adxlet-restart',))
+        with tempfile.TemporaryDirectory() as directory:
+            run = driver.Run(Path(directory))
+            run.nodes = ['node1', 'node2']
+            calls = []
+            run.execute = lambda node, *args, **_kwargs: calls.append(
+                ('execute', node, args[-1]))
+            run.helper = lambda node, *args, **_kwargs: calls.append(
+                ('helper', node, args[0]))
+            checks = []
+            run.scenarios(checks, ('coordinator-adxlet-restart',))
+            self.assertEqual(checks, ['coordinator-adxlet-restart'])
+            self.assertEqual(calls[0], ('execute', 'node1', 'create-marker'))
+            self.assertEqual(calls[1:3], [('helper', 'node1', 'capture-backend'),
+                                          ('helper', 'node2', 'capture-backend')])
+            self.assertEqual(set(calls[3:5]), {
+                ('helper', 'node1', 'coordinator-restart'),
+                ('helper', 'node2', 'restart'),
+            })
+            self.assertEqual(calls[5:], [
+                ('helper', 'node1', 'ready'),
+                ('helper', 'node1', 'unchanged'),
+                ('helper', 'node2', 'unchanged'),
+                ('execute', 'node1', 'recovered-marker'),
+                ('execute', 'node1', 'cleanup-live-control'),
+                ('helper', 'node1', 'empty'),
+                ('helper', 'node2', 'empty'),
+            ])
+
     def test_sandboxd_lost_runtime_is_targeted_two_policy_fault(self):
         self.assertEqual(driver.selected_checks('full', 'sandboxd-runtime-loss'),
                          ('sandboxd-runtime-loss',))
