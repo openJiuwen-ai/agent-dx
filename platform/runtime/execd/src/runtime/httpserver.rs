@@ -770,6 +770,7 @@ async fn execute_invoke(
             } else {
                 match error_code {
                     "COMMAND_NOT_FOUND" => 404,
+                    "COMMAND_EXPIRED" => 410,
                     "COMMAND_CONFLICT" => 409,
                     "RESOURCE_EXHAUSTED" => 429,
                     "UNSUPPORTED_FEATURE" => 501,
@@ -1495,6 +1496,7 @@ async fn write_resp(
         401 => "Unauthorized",
         404 => "Not Found",
         409 => "Conflict",
+        410 => "Gone",
         429 => "Too Many Requests",
         501 => "Not Implemented",
         431 => "Request Header Fields Too Large",

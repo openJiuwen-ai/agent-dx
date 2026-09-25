@@ -16,6 +16,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_OUTPUT_LIMIT_BYTES: usize = 4 * 1024 * 1024;
 const DEFAULT_RESULT_TTL_SECS: u64 = 3600;
+const DEFAULT_EXPIRED_TOMBSTONE_TTL_SECS: u64 = 3600;
+const DEFAULT_EXPIRED_TOMBSTONE_MAX_RECORDS: usize = 4096;
 const DEFAULT_REGISTRY_MAX_RECORDS: usize = 4096;
 const DEFAULT_REGISTRY_MAX_BYTES: usize = 256 * 1024 * 1024;
 const DEFAULT_REGISTRY_HIGH_WATERMARK_BYTES: usize = 192 * 1024 * 1024;
@@ -83,6 +85,7 @@ struct Reader {
 
 struct CommandRecord {
     command_id: String,
+    explicit_id: bool,
     request_fingerprint: String,
     pid: i64,
     cmd: String,
@@ -127,6 +130,67 @@ fn commands() -> &'static Mutex<HashMap<String, CommandRecord>> {
     COMMANDS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn expired_commands() -> &'static Mutex<HashMap<String, u64>> {
+    static EXPIRED: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+    EXPIRED.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn remember_expired(command_id: &str, now: u64) {
+    let mut expired = expired_commands().lock().unwrap();
+    expired.retain(|_, until| *until > now);
+    let limit = env_usize(
+        "EXECD_COMMAND_EXPIRED_MAX_RECORDS",
+        DEFAULT_EXPIRED_TOMBSTONE_MAX_RECORDS,
+    );
+    if expired.len() >= limit {
+        if let Some(oldest) = expired
+            .iter()
+            .min_by_key(|(_, until)| *until)
+            .map(|(id, _)| id.clone())
+        {
+            expired.remove(&oldest);
+        }
+    }
+    let ttl = env_u64(
+        "EXECD_COMMAND_EXPIRED_TTL_SECS",
+        DEFAULT_EXPIRED_TOMBSTONE_TTL_SECS,
+    );
+    expired.insert(
+        command_id.to_owned(),
+        now.saturating_add(ttl.saturating_mul(1000)),
+    );
+}
+
+fn is_expired(command_id: &str) -> bool {
+    expired_commands()
+        .lock()
+        .unwrap()
+        .get(command_id)
+        .is_some_and(|until| *until > now_ms())
+}
+
+fn missing_command(kw: &BTreeMap<String, Value>) -> Value {
+    if command_id(kw).as_deref().is_some_and(is_expired) {
+        return map_value(vec![
+            ("status", Value::from("EXPIRED")),
+            ("error_code", nil()),
+            ("error", nil()),
+        ]);
+    }
+    map_value(vec![
+        (
+            "status",
+            Value::from(if kw.contains_key("command_id") {
+                "not_found"
+            } else {
+                "error"
+            }),
+        ),
+        ("error_code", Value::from("COMMAND_NOT_FOUND")),
+        ("error", Value::from(not_found(kw))),
+    ])
+}
+
 fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
         .ok()
@@ -154,14 +218,18 @@ fn cleanup_expired(records: &mut HashMap<String, CommandRecord>) {
     let now = now_ms();
     let ttl_ms = env_u64("EXECD_COMMAND_RESULT_TTL_SECS", DEFAULT_RESULT_TTL_SECS) * 1000;
     let before = records.len();
-    records.retain(|_, record| {
-        record
+    records.retain(|id, record| {
+        let retain = record
             .exit
             .finished_at_ms
             .lock()
             .unwrap()
             .map(|finished| now.saturating_sub(finished) < ttl_ms)
-            .unwrap_or(true)
+            .unwrap_or(true);
+        if !retain && record.explicit_id {
+            remember_expired(id, now);
+        }
+        retain
     });
     COMMAND_RECORD_EXPIRED.fetch_add((before - records.len()) as u64, Ordering::Relaxed);
 }
@@ -263,7 +331,9 @@ fn make_room(records: &mut HashMap<String, CommandRecord>) -> bool {
             .map(|(id, _)| id);
         match oldest_terminal {
             Some(id) => {
-                records.remove(&id);
+                if records.remove(&id).is_some_and(|record| record.explicit_id) {
+                    remember_expired(&id, now_ms());
+                }
             }
             None => return false,
         }
@@ -594,6 +664,17 @@ pub fn cmd_start(kw: &BTreeMap<String, Value>) -> Value {
             ("error", nil()),
         ]);
     }
+    if is_expired(&command_id) {
+        return map_value(vec![
+            ("command_id", Value::from(command_id)),
+            ("pid", Value::from(-1i64)),
+            ("error_code", Value::from("COMMAND_EXPIRED")),
+            (
+                "error",
+                Value::from("command result expired; command_id cannot be reused"),
+            ),
+        ]);
+    }
     if !make_room(&mut records) {
         return map_value(vec![
             ("command_id", Value::from(command_id)),
@@ -612,6 +693,7 @@ pub fn cmd_start(kw: &BTreeMap<String, Value>) -> Value {
         command_id.clone(),
         CommandRecord {
             command_id: command_id.clone(),
+            explicit_id: !legacy,
             request_fingerprint: fingerprint,
             pid: -1,
             cmd: cmd.clone(),
@@ -766,18 +848,7 @@ pub fn cmd_get(kw: &BTreeMap<String, Value>) -> Value {
     match snapshot {
         Some(record) if !kw.contains_key("command_id") => legacy_record_value(&record, true),
         Some(record) => record_value(&record, true),
-        None => map_value(vec![
-            (
-                "status",
-                Value::from(if kw.contains_key("command_id") {
-                    "not_found"
-                } else {
-                    "error"
-                }),
-            ),
-            ("error_code", Value::from("COMMAND_NOT_FOUND")),
-            ("error", Value::from(not_found(kw))),
-        ]),
+        None => missing_command(kw),
     }
 }
 
@@ -789,20 +860,7 @@ pub fn cmd_wait(kw: &BTreeMap<String, Value>) -> Value {
             .and_then(|key| records.get(&key).map(|record| Arc::clone(&record.exit)))
         {
             Some(exit) => exit,
-            None => {
-                return map_value(vec![
-                    (
-                        "status",
-                        Value::from(if kw.contains_key("command_id") {
-                            "not_found"
-                        } else {
-                            "error"
-                        }),
-                    ),
-                    ("error_code", Value::from("COMMAND_NOT_FOUND")),
-                    ("error", Value::from(not_found(kw))),
-                ])
-            }
+            None => return missing_command(kw),
         }
     };
     if wait_exit(&exit, timeout).is_none() {
@@ -824,20 +882,7 @@ pub fn cmd_poll(kw: &BTreeMap<String, Value>) -> Value {
             .and_then(|key| records.get(&key).map(|record| Arc::clone(&record.exit)))
         {
             Some(exit) => exit,
-            None => {
-                return map_value(vec![
-                    (
-                        "status",
-                        Value::from(if kw.contains_key("command_id") {
-                            "not_found"
-                        } else {
-                            "error"
-                        }),
-                    ),
-                    ("error_code", Value::from("COMMAND_NOT_FOUND")),
-                    ("error", Value::from(not_found(kw))),
-                ])
-            }
+            None => return missing_command(kw),
         }
     };
     let _ = wait_exit(&exit, Some(Duration::from_secs_f64(wait_timeout)));
@@ -932,7 +977,14 @@ pub fn watch_snapshot(command_ids: &[String]) -> Vec<Value> {
                 .unwrap_or_else(|| {
                     map_value(vec![
                         ("command_id", Value::from(command_id.clone())),
-                        ("status", Value::from("NOT_FOUND")),
+                        (
+                            "status",
+                            Value::from(if is_expired(command_id) {
+                                "EXPIRED"
+                            } else {
+                                "NOT_FOUND"
+                            }),
+                        ),
                         ("state_version", Value::from(0u64)),
                     ])
                 })
@@ -1207,6 +1259,37 @@ mod tests {
         assert_eq!(field(&result, "status").as_str(), Some("SUCCEEDED"));
         assert_eq!(field(&result, "stdout").as_str(), Some("recovered"));
         assert_eq!(field(&result, "exit_code").as_i64(), Some(0));
+    }
+
+    #[test]
+    fn expired_command_is_distinct_from_missing_and_cannot_restart() {
+        let id = format!("test-expired-{}", now_ms());
+        let request = args(&id, "printf expired");
+        let started = cmd_start(&request);
+        assert!(field(&started, "error").is_nil());
+        let lookup = BTreeMap::from([("command_id".to_string(), Value::from(id.clone()))]);
+        assert_eq!(
+            field(&cmd_wait(&lookup), "status").as_str(),
+            Some("SUCCEEDED")
+        );
+        {
+            let records = commands().lock().unwrap();
+            let record = records.get(&id).unwrap();
+            let ttl = env_u64("EXECD_COMMAND_RESULT_TTL_SECS", DEFAULT_RESULT_TTL_SECS);
+            *record.exit.finished_at_ms.lock().unwrap() =
+                Some(now_ms().saturating_sub(ttl.saturating_mul(1000) + 1));
+        }
+        let expired = cmd_get(&lookup);
+        assert_eq!(field(&expired, "status").as_str(), Some("EXPIRED"));
+        assert_eq!(
+            field(&cmd_start(&request), "error_code").as_str(),
+            Some("COMMAND_EXPIRED")
+        );
+        let missing = cmd_get(&BTreeMap::from([(
+            "command_id".to_string(),
+            Value::from(format!("{id}-never-seen")),
+        )]));
+        assert_eq!(field(&missing, "status").as_str(), Some("not_found"));
     }
 
     #[test]
