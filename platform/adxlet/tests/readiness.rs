@@ -140,7 +140,7 @@ async fn requires_runtime_and_valid_execd_response() {
         .await
         .unwrap();
     assert_eq!(requests.load(Ordering::SeqCst), 1);
-    assert_eq!(runtime.checks.load(Ordering::SeqCst), 2);
+    assert_eq!(runtime.checks.load(Ordering::SeqCst), 1);
 }
 #[tokio::test]
 async fn an_http_200_without_execd_status_is_not_ready() {
@@ -152,13 +152,25 @@ async fn an_http_200_without_execd_status_is_not_ready() {
     assert!(requests.load(Ordering::SeqCst) > 1);
 }
 #[tokio::test]
-async fn exited_runtime_does_not_probe_or_publish_ready() {
+async fn exited_runtime_does_not_publish_ready() {
     let (port, _server, requests) = serve(r#"{"identity":{"environment_id":"i","runtime_id":"i-1","ownership_generation":1},"revision":1,"phase":"running","checkpoint":null,"active_requests":0,"active_commands":0}"#, None).await;
     assert!(checker(runtime(false), port)
         .wait_ready(&record())
         .await
         .is_err());
-    assert_eq!(requests.load(Ordering::SeqCst), 0);
+    assert!(requests.load(Ordering::SeqCst) > 1);
+}
+
+#[tokio::test]
+async fn failed_execd_probes_do_not_poll_the_backend() {
+    let runtime = runtime(true);
+    let (port, _server, requests) = serve(r#"{"status":"starting"}"#, None).await;
+    assert!(checker(runtime.clone(), port)
+        .wait_ready(&record())
+        .await
+        .is_err());
+    assert!(requests.load(Ordering::SeqCst) > 1);
+    assert_eq!(runtime.checks.load(Ordering::SeqCst), 0);
 }
 #[tokio::test]
 async fn runtime_exit_during_probe_is_not_ready() {
