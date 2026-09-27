@@ -68,17 +68,17 @@ impl RuntimeControlClient {
         } else {
             Method::GET
         };
+        let attempts = if body.is_some() { 2 } else { 1 };
         let body = body.unwrap_or_default();
         tokio::time::timeout(self.timeout, async {
-            // Every runtime-control operation is fenced by identity and, for
-            // mutations, an operation ID plus revision. Retrying the identical
-            // request once is therefore safe and closes the result-unknown gap
-            // where the runtime accepted an operation but the HTTP response was
-            // lost while the connection was being retired.
+            // Mutations are fenced by identity, operation ID and revision. Retrying
+            // the identical mutation once closes a lost-response gap. Status is
+            // retried by its caller's readiness loop so one failed probe does not
+            // double the connection storm while many runtimes are booting.
             let response = {
                 let mut last_error = None;
                 let mut response = None;
-                for _ in 0..2 {
+                for _ in 0..attempts {
                     let mut builder = Request::builder()
                         .method(method.clone())
                         .uri(format!("http://{address}/control/v1/{path}"));
@@ -98,7 +98,11 @@ impl RuntimeControlClient {
                     }
                 }
                 response.ok_or_else(|| {
-                    unavailable(last_error.expect("two failed HTTP attempts must retain an error"))
+                    unavailable(
+                        last_error
+                            .map(|error| error.to_string())
+                            .unwrap_or_else(|| "runtime request was not attempted".into()),
+                    )
                 })?
             };
             match response.status() {
@@ -220,6 +224,7 @@ mod tests {
         io::{Read, Write},
         net::{IpAddr, Ipv4Addr, TcpListener, TcpStream},
         thread,
+        time::Instant,
     };
 
     fn record(port: u16) -> (EnvironmentRecord, RuntimeControlClient) {
@@ -344,6 +349,31 @@ mod tests {
         });
         let result = client.prepare(&record, "pause-a", 1).await.unwrap();
         assert_eq!(result, expected);
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn status_leaves_transport_retry_to_the_readiness_loop() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (record, client) = record(port);
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_request(&mut stream);
+            drop(stream);
+            listener.set_nonblocking(true).unwrap();
+            let deadline = Instant::now() + Duration::from_millis(100);
+            while Instant::now() < deadline {
+                match listener.accept() {
+                    Ok(_) => panic!("status retried a failed transport request"),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("status retry observation failed: {error}"),
+                }
+            }
+        });
+        assert!(client.status(&record).await.is_err());
         server.join().unwrap();
     }
 }
