@@ -1,7 +1,6 @@
 # 节点本地优先创建与原子归属确认
 
-核对日期：2026-09-17。创建链路已接入 API Server、adxlet 和 Coordinator。
-当前改动位于 `fix/atomic-instance-claim`，基于 `6b2d30b`；正式 K8s 验收结果不沿用该基线的成功记录。
+核对日期：2026-09-28。创建链路已接入 API Server、adxlet 和 Coordinator。
 
 ## 开启方式与调度语义
 
@@ -26,8 +25,8 @@ API Server：WatchNodes 全量目录 → 轮转入口
   → 共用 Mutex<Admission>：一次性暂留标量资源及 GPU/NPU 卡
   → Coordinator：ClaimEnvironment
       mTLS 节点身份 + CallerContext 租户 + 实时心跳/会话 + 硬约束
-      Redis CAS 写入唯一归属与 generation
-      同一协调锁内导入内存资源/设备账本、调度快照与 generation
+      并发申请经有界微批合并，由 Redis CAS 写入唯一归属与 generation
+      各条结果再串行导入内存资源/设备账本、调度快照与 generation
   → adxlet：暂留 token 转交 Assignment，复用该 Environment 串行控制器
   → sandboxd → Execd 就绪 → 本机路由绑定 → Coordinator 提交 Running → 返回成功
 ```
@@ -41,8 +40,10 @@ adxlet 的未调度入口仅接受受信 API Server，已分配执行入口仅�
 
 ## 唯一归属与资源规则
 
-`Session::claim(spec, LocalClaim {node_id, node_session_id, devices})` 与中心 `reserve`
-共用 Redis 控制 header 和 Environment 字段；generation 在 Rust 中按 `u64` 计算。
+`Session::claim`、`Session::claim_batch` 与中心 `reserve` 共用 Redis 控制 header 和
+Environment 字段；generation 在 Rust 中按 `u64` 计算。Coordinator 释放内存调度锁后把同时到达的
+本地申请放入最多 256 条、最长等待 1 ms 的微批；同一批只执行一次 header CAS，每条申请仍独立返回
+`Owned`、`Existing` 或错误。CAS 成功后重新取得调度锁并逐条同步账本，其他调度路径不会遗漏本地占用。
 
 | 结果 | 含义和动作 |
 |---|---|
@@ -86,9 +87,9 @@ Coordinator 将中心请求与仍在途的 claim 串行协调。API 不把结果
 
 ## 验证分层
 
-- `coordinator/tests/storage/claims.rs`：9 项新增存储用例，真实 Redis/AOF；跨节点和中心 reserve 竞争、会话、设备、快照引用及超过 `2^53` 的 generation。
+- `coordinator/tests/storage/claims.rs`：10 项存储用例，真实 Redis/AOF；跨节点和中心 reserve 竞争、会话、设备、快照引用、超过 `2^53` 的 generation，以及 128 条申请的一次批量 CAS。
 - `coordinator/tests/scheduling.rs`、`adxlet/tests/lifecycle.rs`：账本导入、中心队列去重、generation、共享暂留、迟到释放和标量/整卡原子性。
-- `coordinator/tests/rpc/local_first.rs`：真实 Redis/mTLS，双节点/同节点/中心并发、心跳与调用身份、延迟写入后的屏障重建、无人重试时的后台收敛、两侧资源账本。
+- `coordinator/tests/rpc/local_first.rs`：真实 Redis/mTLS，双节点/同节点/中心并发、并发申请合并为有界 Redis 提交、心跳与调用身份、延迟写入后的屏障重建、无人重试时的后台收敛、两侧资源账本。
 - `build/ci/local_first_http.py`：实际 Rust API HTTPS → Node/Coordinator RPC，目录轮转、4 个并发请求、不同 HTTP 请求 ID 复用同 Environment、规格/租户冲突、删除后资源归零。
 - `build/e2e/local_first.py`：独立 `local-first` 基础验收组；切换 API 配置后通过安装的 SDK 创建、实际 Execd 命令和删除，检查本地 claim 日志；随后恢复中心模式。Docker/K8s 共用该组。
 

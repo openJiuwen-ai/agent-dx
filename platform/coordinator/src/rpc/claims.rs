@@ -231,15 +231,20 @@ impl CoordinatorRpc {
         } else {
             None
         };
-        let outcome = match state.session.claim(spec.clone(), &candidate).await {
+        drop(state);
+        let outcome = match self.0.claim(spec.clone(), candidate.clone()).await {
             Ok(outcome) => outcome,
             Err(e @ Error::Unavailable(_)) => {
+                let mut state = self.0.state.lock().await;
                 state.needs_recovery = true;
                 self.0.changed.notify_waiters();
                 return Err(status(e));
             }
             Err(e) => return Err(status(e)),
         };
+        let mut state = self.0.state.lock().await;
+        state.recover_authoritative_state().await.map_err(status)?;
+        state.healthy().map_err(status)?;
         let record = outcome.record().clone();
         state.accept_stored_claim(record.clone()).map_err(status)?;
         state
