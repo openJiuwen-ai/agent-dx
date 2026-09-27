@@ -3,7 +3,7 @@ use adx_core::{
     Assignment, EnvironmentRecord, EnvironmentSpec, EnvironmentState, Error, Event, LifecycleKind,
     Result,
 };
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 
@@ -534,7 +534,9 @@ impl Controller {
         self.held = true;
         self.record.resources_held = true;
         self.transition(Event::Start)?;
+        let operation_started = Instant::now();
         let attempt = timeout(self.services.operation_timeout, async {
+            let runtime_start_started = Instant::now();
             self.record.runtime.ip = Some(
                 adx_observability::trace::Trace::child("environment.runtime.start")
                     .run_result(async {
@@ -576,48 +578,74 @@ impl Controller {
                     })
                     .await?,
             );
+            let runtime_start_ms = runtime_start_started.elapsed().as_secs_f64() * 1_000.0;
+            let runtime_ready_started = Instant::now();
             adx_observability::trace::Trace::child("environment.runtime.ready")
                 .run_result(self.services.readiness.wait_ready(&self.record))
                 .await?;
+            let runtime_ready_ms = runtime_ready_started.elapsed().as_secs_f64() * 1_000.0;
+            let route_started = Instant::now();
             adx_observability::trace::Trace::child("environment.route.activate")
                 .run_result(self.services.routes.activate(&self.record))
-                .await
+                .await?;
+            Ok((
+                runtime_start_ms,
+                runtime_ready_ms,
+                route_started.elapsed().as_secs_f64() * 1_000.0,
+            ))
         })
         .await
         .unwrap_or_else(|_| Err(Error::Unavailable("environment start timed out".into())));
-        if let Err(start_error) = attempt {
-            let cleanup = self.cleanup().await;
-            self.transition(Event::Fail)?;
-            self.record.restart_pending = restart
-                && !restore_checkpoint
-                && self
-                    .record
-                    .spec
-                    .lifecycle
-                    .restart
-                    .as_ref()
-                    .is_some_and(|p| self.record.restart_attempts < p.max_attempts);
-            self.restart_after = None;
-            let commit = self.sync().await;
-            return match (cleanup, commit) {
-                (Ok(()), Ok(_)) => Err(start_error),
-                (cleanup, commit) => Err(Error::Unavailable(format!(
-                    "start failed: {start_error}; cleanup: {cleanup:?}; commit: {}",
-                    if commit.is_ok() {
-                        "accepted".into()
-                    } else {
-                        format!("{:?}", commit.err())
-                    }
-                ))),
-            };
-        }
+        let (runtime_start_ms, runtime_ready_ms, route_activate_ms) = match attempt {
+            Ok(stages) => stages,
+            Err(start_error) => {
+                let cleanup = self.cleanup().await;
+                self.transition(Event::Fail)?;
+                self.record.restart_pending = restart
+                    && !restore_checkpoint
+                    && self
+                        .record
+                        .spec
+                        .lifecycle
+                        .restart
+                        .as_ref()
+                        .is_some_and(|p| self.record.restart_attempts < p.max_attempts);
+                self.restart_after = None;
+                let commit = self.sync().await;
+                return match (cleanup, commit) {
+                    (Ok(()), Ok(_)) => Err(start_error),
+                    (cleanup, commit) => Err(Error::Unavailable(format!(
+                        "start failed: {start_error}; cleanup: {cleanup:?}; commit: {}",
+                        if commit.is_ok() {
+                            "accepted".into()
+                        } else {
+                            format!("{:?}", commit.err())
+                        }
+                    ))),
+                };
+            }
+        };
         self.transition(Event::Ready)?;
         if let Some((id, revision, kind)) = completion {
             self.completed(id, revision, kind);
         }
         self.record.restart_pending = false;
         self.restart_after = None;
-        self.sync().await
+        let commit_started = Instant::now();
+        let result = self.sync().await;
+        adx_observability::info!(
+            event = "environment_start_stages",
+            environment_id = %self.record.spec.id,
+            runtime_id = %self.record.runtime.id,
+            runtime_start_ms,
+            runtime_ready_ms,
+            route_activate_ms,
+            state_commit_ms = commit_started.elapsed().as_secs_f64() * 1_000.0,
+            total_ms = operation_started.elapsed().as_secs_f64() * 1_000.0,
+            published = result.is_ok(),
+            "environment start stages completed"
+        );
+        result
     }
 
     async fn cleanup(&mut self) -> Result<()> {
