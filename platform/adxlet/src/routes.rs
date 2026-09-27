@@ -23,6 +23,7 @@ pub struct UdsRoutes {
     path: PathBuf,
     timeout: Duration,
     local: Arc<Mutex<Local>>,
+    sync: Arc<Mutex<()>>,
     owner: String,
 }
 impl UdsRoutes {
@@ -36,6 +37,7 @@ impl UdsRoutes {
             path,
             timeout,
             local: Arc::default(),
+            sync: Arc::default(),
             owner: uuid::Uuid::new_v4().to_string(),
         })
     }
@@ -123,38 +125,62 @@ impl UdsRoutes {
         );
         self.full(s, client).await
     }
-    async fn send(&self, mut r: UpdateBindingRequest) -> Result<()> {
-        let mut s = self.local.lock().await;
-        if let Some(old) = s.bindings.get(&r.environment_id) {
-            let a = (old.ownership_generation, old.binding_revision);
-            let b = (r.ownership_generation, r.binding_revision);
-            if b < a || (b == a && old.binding != r.binding) {
-                return Err(Error::Conflict);
-            }
-        }
-        if !s.initialized && !s.buffering {
-            return Err(unavailable("binding catalog not initialized"));
-        }
-        s.bindings.insert(r.environment_id.clone(), r.clone());
-        if s.buffering {
-            return Ok(());
-        }
-        let mut client = self.connect().await?;
-        self.ensure(&mut s, &mut client).await?;
-        let session = s.session.as_ref().ok_or(Error::Conflict)?;
+    async fn update(&self, mut r: UpdateBindingRequest, session: &pb::BindingState) -> Result<()> {
         r.proxy_session_id = session.proxy_session_id.clone();
         r.sync_epoch = session.sync_epoch;
-        let accepted = client
-            .update_binding(self.request(r.clone()))
+        let expected = (r.ownership_generation, r.binding_revision);
+        let accepted = self
+            .connect()
+            .await?
+            .update_binding(self.request(r))
             .await
             .map_err(rpc_error)?
             .into_inner();
-        if accepted.ownership_generation != r.ownership_generation
-            || accepted.binding_revision != r.binding_revision
-        {
+        if (accepted.ownership_generation, accepted.binding_revision) != expected {
             return Err(Error::Conflict);
         }
         Ok(())
+    }
+    async fn send(&self, r: UpdateBindingRequest) -> Result<()> {
+        let session = {
+            let mut s = self.local.lock().await;
+            if let Some(old) = s.bindings.get(&r.environment_id) {
+                let a = (old.ownership_generation, old.binding_revision);
+                let b = (r.ownership_generation, r.binding_revision);
+                if b < a || (b == a && old.binding != r.binding) {
+                    return Err(Error::Conflict);
+                }
+            }
+            if !s.initialized && !s.buffering {
+                return Err(unavailable("binding catalog not initialized"));
+            }
+            s.bindings.insert(r.environment_id.clone(), r.clone());
+            if s.buffering {
+                return Ok(());
+            }
+            s.session.clone().ok_or(Error::Conflict)?
+        };
+        match self.update(r.clone(), &session).await {
+            Ok(()) => return Ok(()),
+            Err(Error::Conflict) => (),
+            Err(error) => return Err(error),
+        }
+
+        // A proxy restart invalidates the cached session. Only this recovery path
+        // serializes: established-session updates for independent environments stay
+        // concurrent. Recheck the catalog so a delayed activation cannot overwrite a
+        // newer retirement while it was in flight.
+        let _sync = self.sync.lock().await;
+        let session = {
+            let mut s = self.local.lock().await;
+            if s.bindings.get(&r.environment_id) != Some(&r) {
+                return Err(Error::Conflict);
+            }
+            let mut client = self.connect().await?;
+            self.ensure(&mut s, &mut client).await?;
+            s.session.clone().ok_or(Error::Conflict)?
+        };
+        self.update(r, &session).await
     }
     async fn apply(&self, r: &EnvironmentRecord, active: bool) -> Result<()> {
         let revision = r

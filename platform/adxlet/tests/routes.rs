@@ -63,6 +63,13 @@ fn record() -> EnvironmentRecord {
         resources_held: true,
     }
 }
+fn named_record(id: &str) -> EnvironmentRecord {
+    let mut record = record();
+    record.spec.id = id.into();
+    record.assignment.environment_id = id.into();
+    record.runtime.id = format!("{id}-42");
+    record
+}
 fn active(generation: u64, revision: u64) -> UpdateBindingRequest {
     UpdateBindingRequest {
         proxy_session_id: String::new(),
@@ -199,6 +206,84 @@ struct Delayed {
     entered: Arc<Semaphore>,
     release: Arc<Semaphore>,
     done: Arc<Semaphore>,
+}
+
+struct ConcurrentUpdates {
+    service: Arc<BindingService>,
+    entered: Arc<Semaphore>,
+    release: Arc<Semaphore>,
+}
+
+#[tonic::async_trait]
+impl RelayService for ConcurrentUpdates {
+    async fn get_environment_activity(
+        &self,
+        _: Request<pb::GetEnvironmentActivityRequest>,
+    ) -> Result<Response<pb::EnvironmentActivityState>, Status> {
+        Err(Status::unimplemented("fixture has no activity"))
+    }
+
+    async fn get_binding_state(
+        &self,
+        request: Request<pb::GetBindingStateRequest>,
+    ) -> Result<Response<pb::BindingState>, Status> {
+        self.service.get_binding_state(request).await
+    }
+
+    async fn begin_bindings(
+        &self,
+        request: Request<pb::BindingState>,
+    ) -> Result<Response<pb::BindingState>, Status> {
+        self.service.begin_bindings(request).await
+    }
+
+    async fn replace_bindings(
+        &self,
+        request: Request<pb::BindingSnapshot>,
+    ) -> Result<Response<pb::BindingState>, Status> {
+        self.service.replace_bindings(request).await
+    }
+
+    async fn update_binding(
+        &self,
+        request: Request<UpdateBindingRequest>,
+    ) -> Result<Response<UpdateBindingResponse>, Status> {
+        self.entered.add_permits(1);
+        self.release.acquire().await.unwrap().forget();
+        Ok(Response::new(
+            self.service.apply(request.into_inner()).await?,
+        ))
+    }
+}
+
+#[tokio::test]
+async fn independent_binding_updates_do_not_wait_for_each_other() {
+    const UPDATES: usize = 16;
+    let handler = service();
+    let entered = Arc::new(Semaphore::new(0));
+    let release = Arc::new(Semaphore::new(0));
+    let (_server, adapter) = start(ConcurrentUpdates {
+        service: handler,
+        entered: entered.clone(),
+        release: release.clone(),
+    })
+    .await;
+    let mut tasks = Vec::new();
+    for index in 0..UPDATES {
+        let adapter = adapter.clone();
+        tasks.push(tokio::spawn(async move {
+            adapter.activate(&named_record(&format!("i-{index}"))).await
+        }));
+    }
+    tokio::time::timeout(Duration::from_secs(2), entered.acquire_many(UPDATES as u32))
+        .await
+        .expect("all independent updates should reach the relay concurrently")
+        .unwrap()
+        .forget();
+    release.add_permits(UPDATES);
+    for task in tasks {
+        task.await.unwrap().unwrap();
+    }
 }
 #[tonic::async_trait]
 impl RelayService for Delayed {
