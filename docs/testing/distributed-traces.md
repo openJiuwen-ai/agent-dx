@@ -7,7 +7,7 @@ ADX 使用 OpenTelemetry SDK 和 W3C `traceparent` / `tracestate`。采样与导
 - Ingress 接收 HTTP 上下文、创建 `ingress.http` Span，并将子上下文传给 Sandbox API、Execd HTTP 或 Relay CONNECT。
 - Rust API Server 创建服务端 Span，gRPC 客户端拦截器携带上下文；节点地址缓存命中后的直达操作也经过同一拦截器。
 - Coordinator 在创建、查询、提交和快照 RPC 入口接收上下文；独立创建/提交任务显式携带子 Span。`shard.schedule_round` 记录实际调度轮次，其父上下文是驱动该轮次的任务；一轮可能服务多个等待请求，不把整个轮次耗时分别归给每个请求。
-- adxlet 在每实例命令封装中保存 `instance.queue` Span，串行执行时创建 `instance.execute`。前者包含等待与执行时间，后者只覆盖实际执行；调用方断开后，已接受操作继续保持原上下文。状态提交继续向 Coordinator 透传。
+- adxlet 在每个 Environment 命令封装中保存 `environment.queue` Span，串行执行时创建 `environment.execute`。创建链路在执行 Span 内继续划分 `environment.runtime.start`、`environment.runtime.ready`、`environment.route.activate` 和 `environment.state.commit`，分别覆盖执行后端启动、Execd 就绪、本机路由绑定和持久化提交。调用方断开后，已接受操作继续保持原上下文；状态提交继续向 Coordinator 透传。
 - Relay 为 CONNECT 生命周期记录 Span。它转发的是字节流，Execd 的 HTTP Span 延续 Ingress 注入的上下文；两者可能是同一请求的并列子 Span。
 - Execd 在解析 HTTP 头后创建 `execd.http`，Environment ID 作为属性。此 Span 覆盖 HTTP 操作处理；异步提交命令之后的用户进程运行时间尚不属于该 HTTP Span。
 
@@ -44,6 +44,6 @@ API 请求日志包含 Trace ID 和 Span ID；adxlet 操作完成日志包含 `t
 
 ## 验收
 
-组件测试覆盖跨任务/队列的并发隔离、调用方取消后已接受操作继续关联、采样关闭、导出端不可用时提交不阻塞、失败计数与退出时间。真实部署验收检查完整创建链路的Trace ID，以及每个 `instance.execute` 的父Span确为同Trace内的 `instance.queue`，同时核对EXECD收到远端上下文。
+组件测试覆盖跨任务/队列的并发隔离、调用方取消后已接受操作继续关联、采样关闭、导出端不可用时提交不阻塞、失败计数与退出时间。真实部署验收检查完整创建链路的Trace ID，以及每个 `environment.execute` 的父Span确为同Trace内的 `environment.queue`，同时核对EXECD收到远端上下文。
 
 本地与Rust API Server重写后的 [Buildkite #24 正式验收](2026-09-17-rust-apiserver-k8s.md) 已通过；统一实时队列满丢弃指标后置，详见 [事项清单](control-plane-remaining.json)。节点恢复后产生新的后台Trace，以Environment/代次/状态关联，不承诺跨进程重启续接已结束的Span。
