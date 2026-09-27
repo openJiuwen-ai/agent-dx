@@ -425,6 +425,7 @@ impl Api {
             )
             .expect("static event-stream response is valid");
         let trace = trace::Trace::child("apiserver.create_stream");
+        let started = Instant::now();
         tokio::spawn(trace.run(async move {
             let accepted = json!({"status":"creating", "requestId":request_id});
             if sender.send(Ok(sse("accepted", accepted))).await.is_err() {
@@ -445,6 +446,15 @@ impl Api {
                     }
                 }
             };
+            adx_observability::info!(
+                event = "sandbox_create_stream_completed",
+                request_id,
+                environment_id = %instance_id,
+                duration_ms = started.elapsed().as_secs_f64() * 1_000.0,
+                succeeded = result.is_ok(),
+                status_code = result.as_ref().err().map_or("OK", |error| error.code().description()),
+                "Sandbox create stream completed"
+            );
             let final_event = match result {
                 Ok(value) => value,
                 Err(error) => {
