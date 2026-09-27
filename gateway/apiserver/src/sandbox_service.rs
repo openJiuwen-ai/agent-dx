@@ -185,7 +185,7 @@ impl SandboxService {
                 return existing_running_response(spec, input, request_id, &record);
             }
             Err(error) if error.code() == Code::NotFound => {}
-            Err(error) => return Err(error),
+            Err(error) => return Err(map_create_owner_error(error)),
         }
 
         let timeouts = contract::create_timeouts(input)?;
@@ -215,9 +215,22 @@ impl SandboxService {
         // trusted node result. Central fallback and startup races use one
         // authoritative read; ordinary local-first creates do not.
         match self.clients.owner(&spec.id, caller, false).await {
-            Ok(_) => {}
+            Ok(owner) if owner_covers_create(&owner, &record)? => {}
+            Ok(_) => {
+                let owner = self.clients.owner(&spec.id, caller, true).await?;
+                if !owner_covers_create(&owner, &record)? {
+                    return Err(Status::unavailable(
+                        "environment directory has not observed the published create result",
+                    ));
+                }
+            }
             Err(error) if matches!(error.code(), Code::NotFound | Code::Unavailable) => {
-                self.clients.owner(&spec.id, caller, true).await?;
+                let owner = self.clients.owner(&spec.id, caller, true).await?;
+                if !owner_covers_create(&owner, &record)? {
+                    return Err(Status::unavailable(
+                        "environment directory has not observed the published create result",
+                    ));
+                }
             }
             Err(error) => return Err(error),
         }
@@ -236,7 +249,7 @@ impl SandboxService {
             Err(error) if error.code() == Code::NotFound => {
                 self.clients.owner(&spec.id, caller, true).await?
             }
-            Err(error) => return Err(error),
+            Err(error) => return Err(map_create_owner_error(error)),
         };
         let record = owner
             .record
@@ -294,6 +307,39 @@ fn existing_running_response(
         });
     }
     Ok(response)
+}
+
+fn owner_covers_create(
+    owner: &pb::GetEnvironmentResponse,
+    created: &pb::EnvironmentRecord,
+) -> Result<bool, Status> {
+    let cached = owner
+        .record
+        .as_ref()
+        .ok_or_else(|| Status::data_loss("environment directory returned no record"))?;
+    let cached_assignment = cached
+        .assignment
+        .as_ref()
+        .ok_or_else(|| Status::data_loss("environment directory returned no assignment"))?;
+    let created_assignment = created
+        .assignment
+        .as_ref()
+        .ok_or_else(|| Status::data_loss("create returned no assignment"))?;
+    Ok(
+        cached_assignment.environment_id == created_assignment.environment_id
+            && cached_assignment.node_id == created_assignment.node_id
+            && cached_assignment.generation == created_assignment.generation
+            && cached.revision >= created.revision
+            && cached.state == pb::EnvironmentState::Running as i32,
+    )
+}
+
+fn map_create_owner_error(error: Status) -> Status {
+    if error.code() == Code::PermissionDenied {
+        Status::already_exists("environment name is already owned by another tenant")
+    } else {
+        error
+    }
 }
 
 fn matches_spec(want: &pb::EnvironmentSpec, got: &pb::EnvironmentSpec) -> bool {
@@ -386,5 +432,79 @@ mod tests {
         )
         .unwrap();
         assert_eq!(response["tunnel"]["path"], "/tunnel/tenant-worker/18765");
+    }
+
+    #[test]
+    fn create_owner_cache_must_cover_the_published_running_revision() {
+        let record = pb::EnvironmentRecord {
+            spec: Some(pb::EnvironmentSpec {
+                id: "tenant-worker".into(),
+                tenant_id: "tenant".into(),
+                ..Default::default()
+            }),
+            assignment: Some(pb::Assignment {
+                environment_id: "tenant-worker".into(),
+                node_id: "node-a".into(),
+                generation: 7,
+                ..Default::default()
+            }),
+            state: pb::EnvironmentState::Running as i32,
+            revision: 9,
+            ..Default::default()
+        };
+        let owner = |state, generation, revision, node_id: &str| pb::GetEnvironmentResponse {
+            record: Some(pb::EnvironmentRecord {
+                spec: record.spec.clone(),
+                assignment: Some(pb::Assignment {
+                    environment_id: "tenant-worker".into(),
+                    node_id: node_id.into(),
+                    generation,
+                    ..Default::default()
+                }),
+                state,
+                revision,
+                ..Default::default()
+            }),
+            node_address: "node:9000".into(),
+            relay_address: "node:9443".into(),
+        };
+
+        assert!(!owner_covers_create(
+            &owner(pb::EnvironmentState::Starting as i32, 7, 8, "node-a"),
+            &record
+        )
+        .unwrap());
+        assert!(!owner_covers_create(
+            &owner(pb::EnvironmentState::Running as i32, 6, 20, "node-a"),
+            &record
+        )
+        .unwrap());
+        assert!(!owner_covers_create(
+            &owner(pb::EnvironmentState::Running as i32, 7, 9, "node-b"),
+            &record
+        )
+        .unwrap());
+        assert!(owner_covers_create(
+            &owner(pb::EnvironmentState::Running as i32, 7, 9, "node-a"),
+            &record
+        )
+        .unwrap());
+        assert!(owner_covers_create(
+            &owner(pb::EnvironmentState::Running as i32, 7, 10, "node-a"),
+            &record
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn create_maps_hidden_foreign_ownership_to_name_conflict() {
+        let error = map_create_owner_error(Status::permission_denied(
+            "environment belongs to another tenant",
+        ));
+        assert_eq!(error.code(), Code::AlreadyExists);
+        assert_eq!(
+            map_create_owner_error(Status::unavailable("directory unavailable")).code(),
+            Code::Unavailable
+        );
     }
 }
