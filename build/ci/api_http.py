@@ -156,8 +156,9 @@ for _ in range(2):
 assert created[0]==created[1]
 code,_=call('POST','/api/sandbox/v1/sandboxes',dict(request,name='changed'),extra={'X-Request-Id':request_id})
 assert code==409,code
-code,_=call('POST','/api/sandbox/v1/sandboxes',request,extra={'X-Request-Id':'another-request'})
-assert code==409,code
+code,value=call('POST','/api/sandbox/v1/sandboxes',request,extra={'X-Request-Id':'another-request'})
+assert code==200,(code,value)
+assert json.loads(base64.b64decode(value['data']))['sandboxId']==created[0]
 assert call('DELETE','/api/sandbox/'+created[0])[0]==200
 
 request=urllib.request.Request(endpoint+'/api/sandbox/v1/sandboxes',data=json.dumps({'name':'http-stream','namespace':'t','image':'image','cpu':100,'memory':1}).encode(),headers={'X-Auth':'a'*40,'Content-Type':'application/json','Accept':'text/event-stream'},method='POST')
