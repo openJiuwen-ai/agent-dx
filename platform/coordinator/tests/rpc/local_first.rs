@@ -276,6 +276,10 @@ async fn operator_pause_keeps_node_visible_but_removes_it_from_admission() {
         .into_inner();
     let frame = directory.message().await.unwrap().unwrap();
     assert_eq!(frame.nodes.len(), 2);
+    assert!(frame
+        .nodes
+        .iter()
+        .all(|node| !node.relay_address.is_empty()));
     assert!(
         !frame
             .nodes
