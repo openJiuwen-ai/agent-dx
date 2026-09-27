@@ -127,6 +127,9 @@ message NodeEndpoint {
   bool accepting_allocations = 7;
   repeated Device capacity_devices = 8;
   repeated Device allocatable_devices = 9;
+  // Data-plane address paired with this node process. API Server uses it to
+  // seed ownership after a successful node-local create without a Coordinator readback.
+  string relay_address = 10;
 }
 message NodeDirectory { uint64 epoch = 1; repeated NodeEndpoint nodes = 2; uint64 valid_for_millis = 3; }
 message GetSchedulingQueueRequest {}

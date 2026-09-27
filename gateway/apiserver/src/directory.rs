@@ -21,6 +21,7 @@ impl Directory {
             || frame.nodes.iter().any(|n| {
                 n.node_id.is_empty()
                     || n.address.is_empty()
+                    || n.relay_address.is_empty()
                     || n.session_id.is_empty()
                     || !ids.insert(n.node_id.clone())
             })
@@ -127,6 +128,7 @@ mod tests {
         let node = |id: &str| pb::NodeEndpoint {
             node_id: id.into(),
             address: format!("{id}:9000"),
+            relay_address: format!("{id}:9443"),
             session_id: "boot".into(),
             accepting_allocations: true,
             ..Default::default()
@@ -183,6 +185,18 @@ mod tests {
         d.clear();
         assert!(d.select().is_none());
         assert!(d.snapshot().is_none());
+        let mut incomplete = node("missing-relay");
+        incomplete.relay_address.clear();
+        assert_eq!(
+            d.update(pb::NodeDirectory {
+                epoch: 4,
+                nodes: vec![incomplete],
+                valid_for_millis: 1000,
+            })
+            .unwrap_err()
+            .code(),
+            tonic::Code::DataLoss
+        );
     }
 
     #[test]
@@ -191,6 +205,7 @@ mod tests {
         let node = |id: &str| pb::NodeEndpoint {
             node_id: id.into(),
             address: format!("{id}:9000"),
+            relay_address: format!("{id}:9443"),
             session_id: "boot".into(),
             accepting_allocations: true,
             ..Default::default()
@@ -234,6 +249,7 @@ mod tests {
         let node = |id: &str| pb::NodeEndpoint {
             node_id: id.into(),
             address: format!("{id}:9000"),
+            relay_address: format!("{id}:9443"),
             session_id: "boot".into(),
             accepting_allocations: true,
             ..Default::default()

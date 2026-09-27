@@ -695,6 +695,7 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
                                 Some(pb::NodeEndpoint {
                                     node_id: n.node.id.clone(),
                                     address: n.address.clone(),
+                                    relay_address: n.proxy_address.clone(),
                                     session_id: n
                                         .session
                                         .as_ref()

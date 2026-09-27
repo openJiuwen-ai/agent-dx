@@ -134,7 +134,7 @@ impl Clients {
                 );
                 let mut request = trace::inject(pb::LocalEnvironmentCreateRequest {
                     create: Some(request),
-                    node_session_id: node.session_id,
+                    node_session_id: node.session_id.clone(),
                 });
                 request.set_timeout(budget);
                 let result = self
@@ -143,11 +143,15 @@ impl Clients {
                         budget,
                         client.create_local_environment(request),
                     )
-                    .await;
+                    .await?;
+                if let Some(owner) = local_owner(&node, &result)? {
+                    self.put_owner(owner).await?;
+                }
                 // The entry node owns the only fallback decision. A definitive
                 // local miss is forwarded to the central scheduler with the same
-                // identity; transport failure remains an unknown outcome.
-                return result;
+                // identity. A result assigned to another node followed that
+                // central path and is resolved through the authoritative directory.
+                return Ok(result);
             }
         }
         let mut client = pb::coordinator_service_client::CoordinatorServiceClient::new(
@@ -394,6 +398,34 @@ fn filter_visible(
     Ok(visible)
 }
 
+fn local_owner(
+    node: &pb::NodeEndpoint,
+    result: &pb::EnvironmentResult,
+) -> Result<Option<pb::GetEnvironmentResponse>, Status> {
+    if result.durability != pb::Durability::Published as i32 {
+        return Ok(None);
+    }
+    let record = result
+        .record
+        .as_ref()
+        .ok_or_else(|| Status::data_loss("local create returned no environment record"))?;
+    let assignment = record
+        .assignment
+        .as_ref()
+        .ok_or_else(|| Status::data_loss("local create returned no assignment"))?;
+    if assignment.node_id != node.node_id {
+        return Ok(None);
+    }
+    if node.address.is_empty() || node.relay_address.is_empty() {
+        return Err(Status::data_loss("selected node endpoint is incomplete"));
+    }
+    Ok(Some(pb::GetEnvironmentResponse {
+        record: Some(record.clone()),
+        node_address: node.address.clone(),
+        relay_address: node.relay_address.clone(),
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -436,5 +468,57 @@ mod tests {
             ..tenant
         };
         assert_eq!(filter_visible(entries, &admin).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn local_create_owner_uses_the_selected_node_addresses() {
+        let node = pb::NodeEndpoint {
+            node_id: "node".into(),
+            address: "http://node:9000".into(),
+            relay_address: "https://node:9443".into(),
+            ..Default::default()
+        };
+        let result = pb::EnvironmentResult {
+            record: owned("capsule", "tenant").record,
+            durability: pb::Durability::Published as i32,
+        };
+
+        let owner = local_owner(&node, &result).unwrap().unwrap();
+
+        assert_eq!(owner.node_address, node.address);
+        assert_eq!(owner.relay_address, node.relay_address);
+        assert_eq!(owner.record.unwrap().assignment.unwrap().generation, 1);
+    }
+
+    #[test]
+    fn centrally_forwarded_create_is_not_cached_as_local() {
+        let node = pb::NodeEndpoint {
+            node_id: "selected".into(),
+            address: "http://node:9000".into(),
+            relay_address: "https://node:9443".into(),
+            ..Default::default()
+        };
+        let result = pb::EnvironmentResult {
+            record: owned("capsule", "tenant").record,
+            durability: pb::Durability::Published as i32,
+        };
+
+        assert!(local_owner(&node, &result).unwrap().is_none());
+    }
+
+    #[test]
+    fn journaled_local_result_is_not_published_to_the_api_cache() {
+        let node = pb::NodeEndpoint {
+            node_id: "node".into(),
+            address: "http://node:9000".into(),
+            relay_address: "https://node:9443".into(),
+            ..Default::default()
+        };
+        let result = pb::EnvironmentResult {
+            record: owned("capsule", "tenant").record,
+            durability: pb::Durability::Journaled as i32,
+        };
+
+        assert!(local_owner(&node, &result).unwrap().is_none());
     }
 }

@@ -77,15 +77,16 @@ impl EnvironmentDirectory {
     }
 
     pub fn get(&self, id: &str) -> Result<pb::GetEnvironmentResponse, Status> {
-        if self.epoch.is_none() {
-            return Err(Status::unavailable(
-                "environment directory not synchronized",
-            ));
+        if let Some(value) = self.entries.get(id) {
+            return Ok(value.clone());
         }
-        self.entries
-            .get(id)
-            .cloned()
-            .ok_or_else(|| Status::not_found("instance not found"))
+        if self.epoch.is_some() {
+            Err(Status::not_found("instance not found"))
+        } else {
+            Err(Status::unavailable(
+                "environment directory not synchronized",
+            ))
+        }
     }
 
     pub fn list(&self) -> Result<Vec<pb::GetEnvironmentResponse>, Status> {
@@ -226,6 +227,30 @@ mod tests {
         assert_eq!(
             directory.get("one").unwrap_err().code(),
             tonic::Code::NotFound
+        );
+    }
+
+    #[test]
+    fn targeted_owner_is_queryable_before_the_first_full_snapshot() {
+        let mut directory = EnvironmentDirectory::default();
+        let (_, owner) = response(entry("local", 1, 1)).unwrap();
+
+        directory.put(owner).unwrap();
+
+        assert_eq!(
+            directory
+                .get("local")
+                .unwrap()
+                .record
+                .unwrap()
+                .spec
+                .unwrap()
+                .id,
+            "local"
+        );
+        assert_eq!(
+            directory.get("missing").unwrap_err().code(),
+            tonic::Code::Unavailable
         );
     }
 

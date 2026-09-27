@@ -1112,6 +1112,7 @@ mod error_contract_tests {
         let value = resource_view(vec![pb::NodeEndpoint {
             node_id: "node-a".into(),
             address: "node-a:17001".into(),
+            relay_address: "node-a:17002".into(),
             session_id: "session-a".into(),
             capacity: Some(pb::Resources {
                 cpu_millis: 4000,

@@ -211,9 +211,16 @@ impl SandboxService {
         }
         let response = existing_running_response(spec, input, request_id, &record)?;
 
-        // Close the read-after-create window without making ordinary lifecycle
-        // requests query Coordinator. The versioned stream remains the steady-state path.
-        self.clients.owner(&spec.id, caller, true).await?;
+        // Node-local success seeds the versioned in-memory directory from the
+        // trusted node result. Central fallback and startup races use one
+        // authoritative read; ordinary local-first creates do not.
+        match self.clients.owner(&spec.id, caller, false).await {
+            Ok(_) => {}
+            Err(error) if matches!(error.code(), Code::NotFound | Code::Unavailable) => {
+                self.clients.owner(&spec.id, caller, true).await?;
+            }
+            Err(error) => return Err(error),
+        }
         Ok(response)
     }
 
