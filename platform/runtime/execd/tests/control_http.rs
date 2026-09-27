@@ -15,6 +15,8 @@ use std::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
+static PROCESS_START: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 async fn connect_tunnel(
     port: u16,
 ) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
@@ -84,6 +86,10 @@ fn record(generation: u64) -> EnvironmentRecord {
 }
 impl Runtime {
     async fn start() -> Self {
+        // These process tests share the host network namespace. Keep ephemeral
+        // port selection and child readiness in one critical section so a
+        // concurrently starting fixture cannot claim a released reservation.
+        let process_start = PROCESS_START.lock().await;
         let temp = tempfile::tempdir().unwrap();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -142,6 +148,7 @@ impl Runtime {
         })
         .await
         .unwrap();
+        drop(process_start);
         runtime
     }
     fn client(&self, token: &str) -> RuntimeControlClient {
