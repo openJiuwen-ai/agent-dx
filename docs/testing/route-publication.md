@@ -112,3 +112,9 @@ Redis CAS 生效到进程内提交事件送达之间存在一个很短的窗口�
 批量 claim 版本在同一 cn-north-4 节点完成了全部 128 次创建、路由和清理，但 C100 P99 仍为 2098.537 ms，没有达到 1 s 门槛。日志按 Environment ID 配对后，claim 到 Running 的中位数为 881.653 ms、P99 为 1392.032 ms。源码审计确认 `UdsRoutes` 在持有全节点共享锁时依次完成 UDS 建连、代理状态查询和绑定更新，使相互独立的 Environment 在路由阶段串行。
 
 当前热路径在本地目录锁内只校验版本、登记期望绑定并复制已确认的代理会话，随后并发发送各 Environment 的 `UpdateBinding`。代理会话失效时才进入串行恢复路径：重新同步完整本机目录，并在重试前确认该绑定没有被更高 revision 的退役操作替代。组件测试让 16 个更新同时阻塞在真实 UDS gRPC handler 内，证明独立绑定没有在客户端共享锁上排队；延迟 activation 与 proxy 重启回放用例继续看护 generation、revision 和会话隔离。集群性能结论仍须使用包含该修改的发布产物复测，不能由组件测试代替。
+
+## 2026-09-28 活跃目录墓碑清理
+
+同一节点 C100 创建在一次运行达到 P99 908.720 ms，但压力结束时 API Server 子进程触及 1 GiB cgroup 上限并由 supervisor 重启。集群 Redis 已积累约一万条历史 Environment；源码核对发现全量和增量发布都会把 `Deleted` 记录保留在 API Server 活跃归属目录。这既抬高稳定内存，也放大批量创建期间的目录复制和发布开销。
+
+当前发布契约保留 Redis 中的终态历史，但不把 `Deleted` 作为活跃目录条目：增量提交移除内存条目并发送 `EnvironmentDirectoryFrame.deleted`，Coordinator 重启后的全量恢复直接过滤历史墓碑。真实 Redis/mTLS 回归同时验证增量删除、重新订阅和新发布器全量恢复均不再携带该 ID，并继续要求创建和删除不触发健康视图的 `HGETALL`。修复后的 C1/C100/C128、API Server cgroup 峰值、子进程 PID 稳定性和残留清理仍须以新发布产物复测。

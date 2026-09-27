@@ -375,29 +375,78 @@ async fn environment_directory_streams_full_then_incremental_ownership() {
     assert!(!upsert.relay_address.is_empty());
 
     rig.delete(&created).await;
-    let terminal = tokio::time::timeout(Duration::from_secs(3), async {
+    tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             let frame = directory.message().await.unwrap().unwrap();
             assert_eq!(frame.base_revision, revision);
             revision = frame.revision;
-            if let Some(entry) = frame.upserts.iter().find(|entry| {
-                entry.record.as_ref().is_some_and(|record| {
-                    record.state == pb::EnvironmentState::Deleted as i32
-                        && record
-                            .spec
-                            .as_ref()
-                            .is_some_and(|spec| spec.id == "directory-case")
-                })
-            }) {
-                break entry.clone();
+            assert!(frame.upserts.iter().all(|entry| {
+                entry
+                    .record
+                    .as_ref()
+                    .and_then(|record| record.spec.as_ref())
+                    .is_none_or(|spec| spec.id != "directory-case")
+            }));
+            if frame.deleted.iter().any(|id| id == "directory-case") {
+                break;
             }
         }
     })
     .await
     .unwrap();
-    let terminal = terminal.record.unwrap();
-    assert_eq!(terminal.state, pb::EnvironmentState::Deleted as i32);
-    assert!(!terminal.resources_held);
+
+    let mut resubscribed =
+        pb::environment_directory_service_client::EnvironmentDirectoryServiceClient::new(
+            channel(rig.address, "apiserver").await,
+        )
+        .watch_environments(pb::WatchEnvironmentsRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    let full = resubscribed.message().await.unwrap().unwrap();
+    assert!(full.reset);
+    assert!(full.upserts.iter().all(|entry| {
+        entry
+            .record
+            .as_ref()
+            .and_then(|record| record.spec.as_ref())
+            .is_none_or(|spec| spec.id != "directory-case")
+    }));
+
+    let restored = RoutePublisher::new(rig.session.clone(), local_peers());
+    restored.refresh().await.unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    rig._servers.0.push(tokio::spawn(async move {
+        Server::builder()
+            .tls_config(server_tls("coordinator"))
+            .unwrap()
+            .add_service(
+                pb::environment_directory_service_server::EnvironmentDirectoryServiceServer::new(
+                    restored,
+                ),
+            )
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    }));
+    let mut restored_directory =
+        pb::environment_directory_service_client::EnvironmentDirectoryServiceClient::new(
+            channel(address, "apiserver").await,
+        )
+        .watch_environments(pb::WatchEnvironmentsRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    let restored_full = restored_directory.message().await.unwrap().unwrap();
+    assert!(restored_full.reset);
+    assert!(restored_full.upserts.iter().all(|entry| {
+        entry
+            .record
+            .as_ref()
+            .and_then(|record| record.spec.as_ref())
+            .is_none_or(|spec| spec.id != "directory-case")
+    }));
 
     let error = pb::environment_directory_service_client::EnvironmentDirectoryServiceClient::new(
         channel(rig.address, "node").await,
@@ -464,15 +513,18 @@ async fn environment_directory_increment_does_not_rescan_control_history() {
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             let frame = directory.message().await.unwrap().unwrap();
-            if frame.upserts.iter().any(|entry| {
-                entry.record.as_ref().is_some_and(|record| {
-                    record.state == pb::EnvironmentState::Deleted as i32
-                        && record
-                            .spec
-                            .as_ref()
-                            .is_some_and(|spec| spec.id == "incremental-publication")
-                })
-            }) {
+            assert!(frame.upserts.iter().all(|entry| {
+                entry
+                    .record
+                    .as_ref()
+                    .and_then(|record| record.spec.as_ref())
+                    .is_none_or(|spec| spec.id != "incremental-publication")
+            }));
+            if frame
+                .deleted
+                .iter()
+                .any(|id| id == "incremental-publication")
+            {
                 break;
             }
         }

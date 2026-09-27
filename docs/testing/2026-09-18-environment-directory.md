@@ -11,14 +11,14 @@
 - API Server 在内存维护 `Capsule ID → CapsuleRecord、Node Manager 地址、Node Proxy 地址`。目录未完成首次同步时返回 Unavailable；已同步目录缺失项直接返回 NotFound。
 - 普通流断开时继续使用最近一次完整目录并后台重连；revision 断档、非法 epoch 或损坏帧会清空目录并重新全量同步。
 - `MasterService.GetCapsule` 只用于创建后的读后写收敛，以及结果不明时固定原 Assignment 的恢复查询。
-- Redis 保留的 Deleted 等终态记录也进入实例目录，使重复删除能返回既有幂等结果；公开查询仍把 Deleted 映射成 NotFound。记录真正回收时才发布 delete 增量。
+- 当前目录只保留仍可查询或操作的归属记录。Redis 可以继续保存 `Deleted` 状态历史，但 Coordinator 在状态提交时发布 delete 增量，并在重启后的全量目录中过滤历史 `Deleted` 记录；公开查询返回 NotFound。重复操作的持久化幂等由 Coordinator 与 adxlet 状态机承担。
 - Edge 的路由订阅保持独立，只发布可路由的 Running 实例。
 
 ## TDD 与回归
 
 初始红灯 `out/ci/instance-directory/red.log` 记录目录实现尚不存在时的3项失败。内存目录单测随后覆盖全量、增量、删除、revision 断档、epoch 变化和旧版本本地结果保护。
 
-真实 RPC 首轮暴露两项接线问题并保留证据：生命周期测试夹具未装配目录服务，见 `api-control/api-http.log`；终态记录从目录移除导致第二次删除返回404，见 `api-control-final/api-http.log`。前者通过给真实 Master fixture 装配同一个 RoutePublisher 修复，后者通过发布 Redis 保留终态记录修复。目标 HTTPS 用例最终完整通过，见 `read-after-create-final/target-test.log` 与 `read-after-create-final/api-http.log`。
+真实 RPC 首轮暴露两项接线问题并保留证据：生命周期测试夹具未装配目录服务，见 `api-control/api-http.log`；终态记录从目录移除导致第二次删除返回404，见 `api-control-final/api-http.log`。前者通过给真实 Coordinator fixture 装配同一个 RoutePublisher 修复；后者当时通过发布 Redis 终态记录处理。2026-09-28 的创建压力验证发现该做法会让长期积累的墓碑进入 API Server 活跃目录并放大内存，当前契约已改为删除增量与全量过滤，第二次删除按公开 API 的 NotFound 语义处理。目标 HTTPS 用例证据见 `read-after-create-final/target-test.log` 与 `read-after-create-final/api-http.log`。
 
 最终验证日志位于工作树 `out/ci/instance-directory/`，干净克隆不包含这些文件。
 
