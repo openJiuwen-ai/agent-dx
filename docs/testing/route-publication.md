@@ -32,7 +32,7 @@ Relay 重启 → 关闭准入 → adxlet 检测新 proxy_session_id
 - Coordinator 共享 64 帧广播缓冲，每个订阅另有 8 帧发送队列。慢订阅丢失增量后返回错误，重连获取全量。
 - 已同步 Ingress 断连时继续使用内存缓存；缺失路由返回暂不可用。Ingress 重启没有磁盘缓存，等待全量后就绪。Relay 始终复核本机绑定，已退役实例不能因 Ingress 缓存滞后重新接入。
 - Ingress 定期重查 Redis 的 Coordinator 地址和 epoch，发现变化后重新连接。Redis 发现失败不主动清空已有缓存。
-- Coordinator 在本进程确认 Redis 状态提交后，把 revision 和受影响的 Environment／节点字段写入有界内存变更流。发布任务以 10 ms 有界窗口合并相近提交，普通生命周期提交只读取发生变化的字段；首次启动、revision 断档、变更流溢出或无字段的控制头更新才重新读取完整 Redis 视图。节点心跳仅在地址、Relay 地址或可路由状态变化时重算该节点已有条目。每 200 ms 的版本检查仍用于发现外部写入或通知丢失。Ingress 应用增量时重建缓存视图；尚未宣称大规模发布性能达标。
+- Coordinator 在本进程确认 Redis 状态提交后，把 revision 和受影响的 Environment／节点字段写入有界内存变更流。发布任务以 10 ms 有界窗口合并相近提交，普通生命周期提交只读取发生变化的字段；首次启动、revision 断档、变更流溢出或无字段的控制头更新才重新读取完整 Redis 视图。节点心跳仅在地址、Relay 地址或可路由状态变化时重算该节点已有条目。每 200 ms 的周期任务只恢复已经标记为不可用的发布视图；健康视图不轮询 revision，也不支持绕过 Coordinator 直接修改控制 Hash。Ingress 应用增量时重建缓存视图；尚未宣称大规模发布性能达标。
 
 ## 本机同步与重启
 
@@ -103,3 +103,5 @@ Ingress 对外 TLS、Ingress → Relay 的网络／mTLS 配置继续单独设置
 Redis CAS 生效到进程内提交事件送达之间存在一个很短的窗口。旧周期检查若恰好落在该窗口，会看到 header revision 已推进，继而把一个普通创建误判为需要全量恢复；当 control Hash 保留数千条历史记录时，这次 `HGETALL` 会直接阻塞创建响应。当前契约是：健康发布视图不按 revision 轮询，只由 `ControlChange` 增量推进；广播滞后、增量处理失败或视图已不可用时才执行全量恢复。真实 Redis 回归覆盖“健康视图存在待处理提交时，周期恢复不得增加 `HGETALL` 调用次数”。
 
 创建性能门槛按单节点统计：C1 P99 小于 200 ms，C100 P99 不超过 1 s；只有并发超过 100 后才允许 P99 明显超过 1 s。最终结论以相同节点、相同运行时和相同历史目录条件下的集群复测为准。
+
+同一口径还要求显式记录调度 request 与运行时 limit。cn-north-4 的基线以 100m／128 MiB 做调度预留、以 1 CPU／2 GiB 作为 runtime cgroup 上限；把 limit 留为0会采用 request 作为默认上限，测到的是0.1 CPU下的 runsc 启动延迟，不能与该基线比较。健康 Coordinator 的内存目录在每次成功写入后同步，结果不明会先进入权威恢复，因此新本地 claim 只保留原子存储层的一次 `HMGET`，不再在同一全局状态锁内预读相同 Environment。

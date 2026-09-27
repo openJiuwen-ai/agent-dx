@@ -663,6 +663,29 @@ async fn concurrent_local_entries_converge_and_fallback_preserves_both_ledgers()
 
 #[tokio::test]
 #[ignore = "requires real Redis and generated mTLS certificates"]
+async fn new_local_claim_uses_one_storage_read_round_trip() {
+    let mut rig = Rig::new().await;
+    let before = redis_command_calls(&rig._redis, "hmget").await;
+
+    rig.claimants[0]
+        .claim_environment(pb::ClaimEnvironmentRequest {
+            spec: Some(spec("one-storage-read").into()),
+            caller: caller(),
+            node_session_id: "boot-a".into(),
+            devices: vec![],
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        redis_command_calls(&rig._redis, "hmget").await - before,
+        1,
+        "the healthy in-memory catalog must avoid a redundant pre-claim Redis read"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires real Redis and generated mTLS certificates"]
 async fn claim_rpc_auth_session_directory_and_real_delayed_redis_write() {
     let mut rig = Rig::new().await;
     let claim = pb::ClaimEnvironmentRequest {

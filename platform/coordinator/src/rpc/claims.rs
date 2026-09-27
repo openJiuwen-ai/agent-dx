@@ -185,12 +185,13 @@ impl CoordinatorRpc {
                 });
             }
         }
-        // A stored owner is authoritative even when this candidate no longer fits.
-        let existing = match state.session.get(&spec.id).await {
-            Ok(record) => Some(record),
-            Err(Error::NotFound) => None,
-            Err(e) => return Err(status(e)),
-        };
+        // While healthy, the in-memory catalog is synchronized after every
+        // successful write and rebuilt before `needs_recovery` is cleared. The
+        // storage claim below still performs the authoritative atomic read/CAS;
+        // avoid a redundant Redis round trip only used to choose admission.
+        // A known owner remains authoritative even when this candidate no
+        // longer fits the current placement snapshot.
+        let existing = state.environments.get(&spec.id).cloned();
         if let Some(record) = &existing {
             if record.spec != spec {
                 return Err(Status::already_exists("environment specification conflict"));
