@@ -72,9 +72,6 @@ impl Readiness for ExecdReadiness {
         tokio::time::timeout(self.ready_timeout, async {
             loop {
                 let probe = tokio::time::timeout(self.probe_timeout, async {
-                    if !self.runtime.is_running(&record.runtime.id).await? {
-                        return Err(unavailable("runtime is not running"));
-                    }
                     self.probe(record).await?;
                     if !self.runtime.is_running(&record.runtime.id).await? {
                         return Err(unavailable("runtime exited during readiness"));
