@@ -166,13 +166,16 @@ elif sys.argv[1]=='auth':
             denied=ConnectionConfig(server_address='127.0.0.1:8443',token=token,use_tls=True,verify_tls=True)
             try:
                 handle=Sandbox.from_id(s.id,connection=denied);handle.close()
-            except PermissionDenied:pass
+            except PermissionDenied as error:
+                assert error.code=='PERMISSION_DENIED' and error.retry=='never',error
             except SandboxError as error:
-                assert 'HTTP 401' in str(error) or 'HTTP 403' in str(error),str(error)
+                assert getattr(error,'status_code',None) in (401,403),error
             else:raise AssertionError('unauthorized read accepted')
             try:Sandbox.delete(s.id,connection=denied)
+            except PermissionDenied as error:
+                assert error.code=='PERMISSION_DENIED' and error.retry=='never',error
             except SandboxError as error:
-                assert '403' in str(error) or '401' in str(error),str(error)
+                assert getattr(error,'status_code',None) in (401,403),error
             else:raise AssertionError('unauthorized delete accepted')
         assert s.is_running()
         event('Authentication checks passed; owner instance remains running')
