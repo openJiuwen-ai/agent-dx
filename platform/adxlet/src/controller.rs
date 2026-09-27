@@ -429,7 +429,8 @@ impl Controller {
         }
         let durability = timeout(
             self.services.operation_timeout,
-            self.services.sink.commit(&self.record),
+            adx_observability::trace::Trace::child("environment.state.commit")
+                .run_result(self.services.sink.commit(&self.record)),
         )
         .await
         .map_err(|_| Error::Unavailable("state commit timed out".into()))??;
@@ -535,44 +536,52 @@ impl Controller {
         self.transition(Event::Start)?;
         let attempt = timeout(self.services.operation_timeout, async {
             self.record.runtime.ip = Some(
-                if restore_checkpoint || self.record.spec.snapshot_id.is_some() {
-                    let cp = self.record.checkpoint.as_ref().ok_or(Error::Conflict)?;
-                    let store = &self
-                        .services
-                        .checkpoint
-                        .as_ref()
-                        .ok_or(Error::Conflict)?
-                        .store;
-                    let path = store.materialize(&cp.artifact).await?;
-                    // Firecracker reads restore files after the RPC has returned.
-                    self.recovery_files = Some(path);
-                    self.services
-                        .runtime
-                        .restore_from(
-                            &self.record.spec,
-                            &self.record.runtime.id,
-                            self.record.assignment.generation,
-                            &self.record.assignment.devices,
-                            self.recovery_files
+                adx_observability::trace::Trace::child("environment.runtime.start")
+                    .run_result(async {
+                        if restore_checkpoint || self.record.spec.snapshot_id.is_some() {
+                            let cp = self.record.checkpoint.as_ref().ok_or(Error::Conflict)?;
+                            let store = &self
+                                .services
+                                .checkpoint
                                 .as_ref()
-                                .expect("recovery file is stored immediately before restore"),
-                            cp.origin.as_ref(),
-                        )
-                        .await?
-                } else {
-                    self.services
-                        .runtime
-                        .start(
-                            &self.record.spec,
-                            &self.record.runtime.id,
-                            self.record.assignment.generation,
-                            &self.record.assignment.devices,
-                        )
-                        .await?
-                },
+                                .ok_or(Error::Conflict)?
+                                .store;
+                            let path = store.materialize(&cp.artifact).await?;
+                            // Firecracker reads restore files after the RPC has returned.
+                            self.recovery_files = Some(path);
+                            self.services
+                                .runtime
+                                .restore_from(
+                                    &self.record.spec,
+                                    &self.record.runtime.id,
+                                    self.record.assignment.generation,
+                                    &self.record.assignment.devices,
+                                    self.recovery_files.as_ref().expect(
+                                        "recovery file is stored immediately before restore",
+                                    ),
+                                    cp.origin.as_ref(),
+                                )
+                                .await
+                        } else {
+                            self.services
+                                .runtime
+                                .start(
+                                    &self.record.spec,
+                                    &self.record.runtime.id,
+                                    self.record.assignment.generation,
+                                    &self.record.assignment.devices,
+                                )
+                                .await
+                        }
+                    })
+                    .await?,
             );
-            self.services.readiness.wait_ready(&self.record).await?;
-            self.services.routes.activate(&self.record).await
+            adx_observability::trace::Trace::child("environment.runtime.ready")
+                .run_result(self.services.readiness.wait_ready(&self.record))
+                .await?;
+            adx_observability::trace::Trace::child("environment.route.activate")
+                .run_result(self.services.routes.activate(&self.record))
+                .await
         })
         .await
         .unwrap_or_else(|_| Err(Error::Unavailable("environment start timed out".into())));

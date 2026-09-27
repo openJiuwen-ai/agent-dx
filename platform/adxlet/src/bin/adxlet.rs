@@ -87,6 +87,9 @@ struct PressureConfig {
 fn runtime_ready_timeout() -> u64 {
     120
 }
+fn execd_ready_poll_interval() -> Duration {
+    Duration::from_millis(10)
+}
 async fn sample(
     source: &ResourceSource,
     runtime: &Sandboxd,
@@ -258,7 +261,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut readiness = ExecdReadiness::new(
         runtime.clone(),
         config.execd_port,
-        Duration::from_millis(100),
+        execd_ready_poll_interval(),
         timeout,
         timeout,
     )?;
@@ -660,6 +663,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn execd_readiness_poll_keeps_startup_jitter_below_twenty_milliseconds() {
+        assert!(execd_ready_poll_interval() <= Duration::from_millis(20));
+    }
 
     #[tokio::test]
     async fn bounded_rpc_releases_a_stalled_heartbeat() {
