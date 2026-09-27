@@ -66,7 +66,6 @@ enum State {
         started_at: u64,
         started: Instant,
         child: Arc<Mutex<std::process::Child>>,
-        stderr_tail: Arc<Mutex<Vec<u8>>>,
     },
     Exited(ExitInfo),
 }
@@ -117,14 +116,8 @@ impl Manager {
                 inner.create_completed = true;
                 Ok(())
             }
-            State::Running {
-                pid,
-                started_at,
-                started,
-                child,
-                stderr_tail,
-            } => {
-                let status = child
+            State::Running { child, .. } => {
+                child
                     .lock()
                     .expect("entrypoint child poisoned")
                     .try_wait()
@@ -132,33 +125,14 @@ impl Manager {
                         code: FailureCode::ProcessFailed,
                         message: format!("failed to inspect image entrypoint: {error}"),
                     })?;
-                let Some(status) = status else {
-                    inner.create_completed = true;
-                    return Ok(());
-                };
-                let exited_at = unix_millis();
-                let stderr_tail = String::from_utf8_lossy(
-                    &stderr_tail.lock().expect("entrypoint stderr poisoned"),
-                )
-                .into_owned();
-                let info = exit_info(
-                    *pid,
-                    status,
-                    *started_at,
-                    exited_at,
-                    started.elapsed().as_millis() as u64,
-                    stderr_tail,
-                );
-                Err(Failure {
-                    code: FailureCode::ProcessFailed,
-                    message: exit_json(&info),
-                })
+                inner.create_completed = true;
+                Ok(())
             }
             State::Failed(failure) => Err(failure.clone()),
-            State::Exited(info) => Err(Failure {
-                code: FailureCode::ProcessFailed,
-                message: exit_json(info),
-            }),
+            State::Exited(_) => {
+                inner.create_completed = true;
+                Ok(())
+            }
         }
     }
 
@@ -283,7 +257,6 @@ fn start_from_environment(manager: Arc<Manager>) {
         started_at,
         started,
         child: child.clone(),
-        stderr_tail: stderr_tail.clone(),
     };
     std::thread::spawn(move || {
         let status = loop {
@@ -599,10 +572,6 @@ fn unix_millis() -> u64 {
         .as_millis() as u64
 }
 
-fn exit_json(info: &ExitInfo) -> String {
-    serde_json::to_string(info).unwrap_or_else(|_| info.message.clone())
-}
-
 fn exit_value(info: &ExitInfo) -> Value {
     map_value(vec![
         ("status", Value::from("exited")),
@@ -701,7 +670,7 @@ mod tests {
     }
 
     #[test]
-    fn complete_create_fails_if_entrypoint_already_exited() {
+    fn complete_create_accepts_entrypoint_that_already_exited() {
         let manager = Manager::disabled();
         manager.inner.lock().unwrap().state = State::Exited(ExitInfo {
             kind: "entrypoint_exited",
@@ -718,8 +687,28 @@ mod tests {
             stderr_tail: String::new(),
             message: "entrypoint exited with code 0".to_string(),
         });
-        let error = manager.complete_create().expect_err("create must fail");
-        assert_eq!(error.code, FailureCode::ProcessFailed);
+        assert!(manager.complete_create().is_ok());
+        assert!(manager.inner.lock().unwrap().create_completed);
+    }
+
+    #[test]
+    fn complete_create_accepts_entrypoint_that_exits_during_readiness() {
+        let manager = Manager::disabled();
+        let child = Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("spawn short-lived entrypoint");
+        let pid = child.id();
+        std::thread::sleep(Duration::from_millis(20));
+        manager.inner.lock().unwrap().state = State::Running {
+            pid,
+            started_at: 1,
+            started: Instant::now(),
+            child: Arc::new(Mutex::new(child)),
+        };
+
+        assert!(manager.complete_create().is_ok());
+        assert!(manager.inner.lock().unwrap().create_completed);
     }
 
     #[test]
