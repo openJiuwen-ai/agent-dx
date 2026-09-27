@@ -124,7 +124,10 @@ impl Clients {
         budget: Duration,
     ) -> Result<pb::EnvironmentResult, Status> {
         if self.config.create_mode == crate::config::CreateMode::LocalFirst {
-            let node = self.directory.lock().await.select();
+            let node = match request.spec.as_ref() {
+                Some(spec) => self.directory.lock().await.select_for(spec),
+                None => self.directory.lock().await.select(),
+            };
             if let Some(node) = node {
                 let mut client = pb::node_service_client::NodeServiceClient::new(
                     self.channel(&node.address).await?,
