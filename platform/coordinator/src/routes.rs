@@ -71,6 +71,17 @@ impl RoutePublisher {
         }
         result
     }
+    /// Rebuild an unavailable publication view from committed storage.
+    ///
+    /// A healthy view advances through `ControlChange` events. Polling the
+    /// Redis revision while healthy can race with event delivery and turn an
+    /// ordinary commit into a full control-hash scan.
+    pub async fn recover(&self) -> Result<()> {
+        if self.view.lock().await.available {
+            return Ok(());
+        }
+        self.refresh().await
+    }
     async fn refresh_inner(&self) -> Result<()> {
         let revision = self.session.revision().await?;
         {
@@ -348,7 +359,7 @@ impl RoutePublisher {
             };
             let result = match changes {
                 Some(changes) if !changes.is_empty() => self.refresh_incremental(changes).await,
-                _ => self.refresh().await,
+                _ => self.recover().await,
             };
             if result.is_err() {
                 self.view.lock().await.available = false;

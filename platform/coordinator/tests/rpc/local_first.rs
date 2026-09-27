@@ -513,6 +513,31 @@ async fn environment_directory_increment_does_not_rescan_control_history() {
 
 #[tokio::test]
 #[ignore = "requires real Redis and generated mTLS certificates"]
+async fn periodic_recovery_does_not_rescan_a_healthy_view_with_a_pending_commit() {
+    let rig = Rig::new().await;
+    let publisher = RoutePublisher::new(rig.session.clone(), local_peers());
+    publisher.refresh().await.unwrap();
+    let before = redis_command_calls(&rig._redis, "hgetall").await;
+
+    // The Redis revision can become visible just before the in-process commit
+    // event is delivered. A periodic recovery tick in that window must leave
+    // the healthy view alone; the queued event remains the incremental source
+    // of truth for the normal publication path.
+    rig.session
+        .set_node_scheduling("a", true, false)
+        .await
+        .unwrap();
+    publisher.recover().await.unwrap();
+
+    assert_eq!(
+        redis_command_calls(&rig._redis, "hgetall").await,
+        before,
+        "a periodic tick must not turn a pending incremental commit into a full scan"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires real Redis and generated mTLS certificates"]
 async fn concurrent_local_entries_converge_and_fallback_preserves_both_ledgers() {
     let mut rig = Rig::new().await;
     let mut a = rig.nodes[0].clone();
