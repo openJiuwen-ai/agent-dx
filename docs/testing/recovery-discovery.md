@@ -39,6 +39,8 @@ Coordinator 使用单调时钟判断心跳是否过期，`heartbeat_timeout_seco
 
 节点回来后重新进入对账握手；Coordinator 重启后同样要求重新对账。恢复的节点从 Coordinator 加载目录完成时起有一个心跳超时周期的报到期限，期间路由关闭；逾期未报到的旧执行失效，迟到注册和结果提交也先检查期限。较长的对账期间继续发送关闭准入的心跳。CommitEnvironment 校验节点证书、当前进程 session、完整 Assignment、Spec 和 revision。Coordinator 派发 Create 也携带目标 Node session，节点拒绝发送给旧进程身份的迟到请求。
 
+`InspectNode` 返回需要节点继续管理或清理的当前目录。尚未完成、运行中、暂停中、仍占资源或等待自动重启的记录必须返回；已经 `Deleted`，以及不占资源且不再等待重启的 `Failed` 历史记录不再下发。节点仍会把真实运行时清单中未出现在权威目录的执行清理掉，因此省略历史终态不会保留失效执行，同时可避免长期运行集群因终态记录累积超过 RPC 消息上限而一直关闭准入。
+
 失效标记在 Redis/Coordinator 重启后继续有效。迟到的 Running、Paused 或自动重启结果不能恢复旧执行资格。原 adxlet 恢复连接后先清理旧控制器与实际运行时，再开放准入。有效共享 checkpoint 的跨节点恢复和归属转移已实现，并通过本地 FC 验收，详见 [节点失效契约](node-failure-takeover.md)。
 
 ## 本机恢复规则

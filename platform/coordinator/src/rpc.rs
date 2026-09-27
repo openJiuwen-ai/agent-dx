@@ -44,6 +44,17 @@ struct State {
     retired_sessions: BTreeSet<(String, String)>,
     scheduling_deadlines: BTreeMap<String, tokio::time::Instant>,
 }
+
+fn requires_node_reconciliation(environment: &StoredEnvironment) -> bool {
+    environment.result.as_ref().is_none_or(|record| {
+        !matches!(
+            record.state,
+            EnvironmentState::Deleted | EnvironmentState::Failed
+        ) || record.resources_held
+            || record.restart_pending
+    })
+}
+
 impl State {
     fn overdue(&self, id: &str, timeout: Duration) -> bool {
         self.live
@@ -878,7 +889,9 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
                 let records = snapshot
                     .environments
                     .into_values()
-                    .filter(|i| i.assignment.node_id == r.node_id)
+                    .filter(|i| {
+                        i.assignment.node_id == r.node_id && requires_node_reconciliation(i)
+                    })
                     .map(|i| {
                         i.result
                             .unwrap_or_else(|| EnvironmentRecord {
