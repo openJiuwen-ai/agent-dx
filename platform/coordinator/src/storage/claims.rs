@@ -162,7 +162,8 @@ impl Session {
                 .arg(spec.snapshot_id.as_deref().unwrap_or(""))
                 .arg(snapshot.as_deref().unwrap_or(""));
             if self.store.query::<u8>(command).await? == 1 {
-                self.store.notify_committed_revision(header.revision);
+                self.store
+                    .notify_committed_change(header.revision, vec![field]);
                 return Ok(ClaimOutcome::Owned(record));
             }
         }

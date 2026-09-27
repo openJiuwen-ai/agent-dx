@@ -10,6 +10,25 @@ fn local_peers() -> Peers {
         .map(|(cert, role)| (file(&format!("{cert}.der")), role)),
     )
 }
+
+async fn redis_command_calls(redis: &common::Redis, command: &str) -> u64 {
+    let client = redis::Client::open(redis.url.clone()).unwrap();
+    let mut connection = client.get_multiplexed_async_connection().await.unwrap();
+    let info: String = redis::cmd("INFO")
+        .arg("commandstats")
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    let prefix = format!("cmdstat_{command}:calls=");
+    info.lines()
+        .find_map(|line| {
+            line.strip_prefix(&prefix)
+                .and_then(|value| value.split(',').next())
+                .and_then(|value| value.parse().ok())
+        })
+        .unwrap_or(0)
+}
+
 struct Rig {
     _redis: common::Redis,
     _servers: Servers,
@@ -383,6 +402,113 @@ async fn environment_directory_streams_full_then_incremental_ownership() {
     .await
     .unwrap_err();
     assert_eq!(error.code(), tonic::Code::PermissionDenied);
+}
+
+#[tokio::test]
+#[ignore = "requires real Redis and generated mTLS certificates"]
+async fn environment_directory_increment_does_not_rescan_control_history() {
+    let mut rig = Rig::new().await;
+    let mut directory =
+        pb::environment_directory_service_client::EnvironmentDirectoryServiceClient::new(
+            channel(rig.address, "apiserver").await,
+        )
+        .watch_environments(pb::WatchEnvironmentsRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    let full = directory.message().await.unwrap().unwrap();
+    assert!(full.reset);
+    let target_revision = rig.session.revision().await.unwrap();
+    let mut published_revision = full.revision;
+    while published_revision < target_revision {
+        published_revision = directory.message().await.unwrap().unwrap().revision;
+    }
+    let before = redis_command_calls(&rig._redis, "hgetall").await;
+
+    let created = rig.nodes[0]
+        .create_local_environment(Rig::request("incremental-publication", 0))
+        .await
+        .unwrap()
+        .into_inner()
+        .record
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let frame = directory.message().await.unwrap().unwrap();
+            if frame.upserts.iter().any(|entry| {
+                entry.record.as_ref().is_some_and(|record| {
+                    record.state == pb::EnvironmentState::Running as i32
+                        && record
+                            .spec
+                            .as_ref()
+                            .is_some_and(|spec| spec.id == "incremental-publication")
+                })
+            }) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        redis_command_calls(&rig._redis, "hgetall").await,
+        before,
+        "ordinary lifecycle commits must not reload the full control hash"
+    );
+    rig.delete(&created).await;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let frame = directory.message().await.unwrap().unwrap();
+            if frame.upserts.iter().any(|entry| {
+                entry.record.as_ref().is_some_and(|record| {
+                    record.state == pb::EnvironmentState::Deleted as i32
+                        && record
+                            .spec
+                            .as_ref()
+                            .is_some_and(|spec| spec.id == "incremental-publication")
+                })
+            }) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        redis_command_calls(&rig._redis, "hgetall").await,
+        before,
+        "terminal lifecycle commits must remain incremental"
+    );
+
+    let stored = rig.session.snapshot().await.unwrap().nodes["a"].clone();
+    let heartbeat_before = redis_command_calls(&rig._redis, "hgetall").await;
+    rig.claimants[0]
+        .register_node(pb::RegisterNodeRequest {
+            runtime_classes: stored.node.runtime_classes,
+            node_id: stored.node.id,
+            node_address: stored.address,
+            proxy_address: stored.proxy_address,
+            capacity: Some(stored.node.capacity.into()),
+            accepting_allocations: stored.node.available,
+            labels: stored.node.labels.into_iter().collect(),
+            devices: stored.node.devices.into_iter().map(Into::into).collect(),
+            session_id: "boot-a".into(),
+            heartbeat_sequence: stored.session.unwrap().sequence + 1,
+            reconciling: false,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), directory.message())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        redis_command_calls(&rig._redis, "hgetall").await,
+        heartbeat_before,
+        "node heartbeats must not reload the full control hash"
+    );
 }
 
 #[tokio::test]

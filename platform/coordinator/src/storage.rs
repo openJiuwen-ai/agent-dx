@@ -15,7 +15,7 @@ use redis::{aio::MultiplexedConnection, FromRedisValue};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use tokio::{
-    sync::{watch, Mutex},
+    sync::{broadcast, Mutex},
     time::timeout,
 };
 
@@ -358,18 +358,26 @@ struct Connection {
     client: redis::Client,
     current: Mutex<Option<MultiplexedConnection>>,
     timeout: Duration,
-    committed_revision: watch::Sender<u64>,
+    committed_changes: broadcast::Sender<ControlChange>,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ControlChange {
+    pub(crate) revision: u64,
+    pub(crate) fields: Vec<String>,
+}
+
 #[derive(Clone)]
 pub struct RedisStore {
     connection: Arc<Connection>,
     key: String,
 }
 impl RedisStore {
-    fn notify_committed_revision(&self, revision: u64) {
-        self.connection
-            .committed_revision
-            .send_modify(|current| *current = (*current).max(revision));
+    fn notify_committed_change(&self, revision: u64, fields: Vec<String>) {
+        let _ = self
+            .connection
+            .committed_changes
+            .send(ControlChange { revision, fields });
     }
 
     pub async fn connect(url: &str, namespace: &str, duration: Duration) -> Result<Self> {
@@ -385,12 +393,13 @@ impl RedisStore {
         // Do not include connection strings or payloads in errors (may contain secrets).
         let client = redis::Client::open(url)
             .map_err(|_| Error::Invalid("invalid Redis endpoint".into()))?;
+        let (committed_changes, _) = broadcast::channel(1024);
         let store = Self {
             connection: Arc::new(Connection {
                 client,
                 current: Mutex::new(None),
                 timeout: duration,
-                committed_revision: watch::channel(0).0,
+                committed_changes,
             }),
             key: format!("adx:{{{namespace}}}:control:v1"),
         };
@@ -443,6 +452,10 @@ impl RedisStore {
         header: &Header,
         field: Option<(&str, String)>,
     ) -> Result<bool> {
+        let changed = field
+            .as_ref()
+            .map(|(name, _)| vec![(*name).to_owned()])
+            .unwrap_or_default();
         let mut cmd = redis::cmd("EVAL");
         cmd.arg(CAS)
             .arg(1)
@@ -454,7 +467,7 @@ impl RedisStore {
         }
         let applied: u8 = self.query(cmd).await?;
         if applied == 1 {
-            self.notify_committed_revision(header.revision);
+            self.notify_committed_change(header.revision, changed);
         }
         Ok(applied == 1)
     }
@@ -644,8 +657,8 @@ pub struct Session {
     epoch: u64,
 }
 impl Session {
-    pub(crate) fn committed_revisions(&self) -> watch::Receiver<u64> {
-        self.store.connection.committed_revision.subscribe()
+    pub(crate) fn committed_changes(&self) -> broadcast::Receiver<ControlChange> {
+        self.store.connection.committed_changes.subscribe()
     }
 
     pub async fn revision(&self) -> Result<u64> {
@@ -747,6 +760,17 @@ impl Session {
         let record: StoredEnvironment =
             decode(environment_value.as_deref().ok_or(Error::NotFound)?)?;
         record.validate()?;
+        Ok(record)
+    }
+
+    pub(crate) async fn get_node(&self, id: &str) -> Result<StoredNode> {
+        let [header_value, node_value] = self
+            .store
+            .fields([HEADER.into(), format!("node:{id}")])
+            .await?;
+        self.header(&header_value)?;
+        let record: StoredNode = decode(node_value.as_deref().ok_or(Error::NotFound)?)?;
+        record.node.validate()?;
         Ok(record)
     }
 
