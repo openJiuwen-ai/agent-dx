@@ -218,6 +218,37 @@ async fn concurrent_claims_allocate_exact_generations_above_lua_integer_precisio
 
 #[tokio::test]
 #[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn batched_local_claims_allocate_one_contiguous_generation_range() {
+    let rig = common::Redis::new().await;
+    let db = rig.store().await;
+    let s = db.begin(1).await.unwrap();
+    let a = claimant(&s, "a").await;
+    let before = s.snapshot().await.unwrap();
+    let claims: Vec<_> = (0..128)
+        .map(|index| (spec(&format!("batch-{index}")), a.clone()))
+        .collect();
+
+    let outcomes = s.claim_batch(claims).await.unwrap();
+
+    assert_eq!(outcomes.len(), 128);
+    assert!(outcomes
+        .iter()
+        .all(|outcome| matches!(outcome, Ok(ClaimOutcome::Owned(_)))));
+    let mut generations: Vec<_> = outcomes
+        .into_iter()
+        .map(|outcome| outcome.unwrap().record().assignment.generation)
+        .collect();
+    generations.sort_unstable();
+    assert_eq!(generations.first(), Some(&(before.generation + 1)));
+    assert_eq!(generations.last(), Some(&(before.generation + 128)));
+    let after = s.snapshot().await.unwrap();
+    assert_eq!(after.generation, before.generation + 128);
+    assert_eq!(after.revision, before.revision + 128);
+    assert_eq!(after.environments.len(), 128);
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
 async fn device_choice_is_part_of_owned_replay_and_bad_claims_do_not_consume_generation() {
     use adx_core::scheduling::{DeviceAllocation, DeviceKind, DeviceRequest};
     let rig = common::Redis::new().await;

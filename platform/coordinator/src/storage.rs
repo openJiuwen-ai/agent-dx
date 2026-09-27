@@ -441,6 +441,17 @@ impl RedisStore {
             Error::Unavailable("Redis returned an unexpected control field count".into())
         })
     }
+    async fn fields_vec(&self, fields: &[String]) -> Result<Vec<Option<String>>> {
+        let mut cmd = redis::cmd("HMGET");
+        cmd.arg(&self.key).arg(fields);
+        let values: Vec<Option<String>> = self.query(cmd).await?;
+        if values.len() != fields.len() {
+            return Err(Error::Unavailable(
+                "Redis returned an unexpected control field count".into(),
+            ));
+        }
+        Ok(values)
+    }
     async fn raw(&self) -> Result<BTreeMap<String, String>> {
         let mut cmd = redis::cmd("HGETALL");
         cmd.arg(&self.key);

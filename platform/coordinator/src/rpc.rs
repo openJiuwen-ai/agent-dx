@@ -6,7 +6,7 @@ mod metrics;
 mod recovery;
 mod snapshots;
 use crate::{
-    storage::{NodeSession, Session, StoredEnvironment, StoredNode},
+    storage::{ClaimOutcome, LocalClaim, NodeSession, Session, StoredEnvironment, StoredNode},
     Coordinator, Node, Placement,
 };
 use adx_core::{EnvironmentRecord, EnvironmentSpec, EnvironmentState, Error, Result};
@@ -19,7 +19,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{mpsc, oneshot, Mutex, Notify};
 use tonic::{transport::Endpoint, Request, Response, Status};
 
 struct LiveNode {
@@ -177,11 +177,75 @@ impl State {
 }
 struct Inner {
     state: Mutex<State>,
+    claim_sender: mpsc::Sender<PendingClaim>,
     changed: Notify,
     peers: Peers,
     node_tls: RpcClient,
     timeout: Duration,
     heartbeat_timeout: Duration,
+}
+
+struct PendingClaim {
+    spec: EnvironmentSpec,
+    candidate: LocalClaim,
+    response: oneshot::Sender<Result<ClaimOutcome>>,
+}
+
+const CLAIM_BATCH_CAPACITY: usize = 1_024;
+const CLAIM_BATCH_MAX: usize = 256;
+const CLAIM_BATCH_WINDOW: Duration = Duration::from_millis(1);
+
+async fn run_claim_batches(session: Session, mut requests: mpsc::Receiver<PendingClaim>) {
+    while let Some(first) = requests.recv().await {
+        let mut batch = Vec::with_capacity(CLAIM_BATCH_MAX);
+        batch.push(first);
+        let deadline = tokio::time::Instant::now() + CLAIM_BATCH_WINDOW;
+        while batch.len() < CLAIM_BATCH_MAX {
+            match requests.try_recv() {
+                Ok(request) => batch.push(request),
+                Err(mpsc::error::TryRecvError::Disconnected) => break,
+                Err(mpsc::error::TryRecvError::Empty) => {
+                    if tokio::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    tokio::time::sleep_until(deadline).await;
+                }
+            }
+        }
+        let claims = batch
+            .iter()
+            .map(|request| (request.spec.clone(), request.candidate.clone()))
+            .collect();
+        match session.claim_batch(claims).await {
+            Ok(outcomes) => {
+                for (request, outcome) in batch.into_iter().zip(outcomes) {
+                    let _ = request.response.send(outcome);
+                }
+            }
+            Err(error) => {
+                for request in batch {
+                    let _ = request.response.send(Err(error.clone()));
+                }
+            }
+        }
+    }
+}
+
+impl Inner {
+    async fn claim(&self, spec: EnvironmentSpec, candidate: LocalClaim) -> Result<ClaimOutcome> {
+        let (response, receiver) = oneshot::channel();
+        self.claim_sender
+            .send(PendingClaim {
+                spec,
+                candidate,
+                response,
+            })
+            .await
+            .map_err(|_| Error::Unavailable("ownership claim queue closed".into()))?;
+        receiver
+            .await
+            .map_err(|_| Error::Unavailable("ownership claim worker stopped".into()))?
+    }
 }
 
 fn scheduling_timeout(seconds: u64) -> Option<Duration> {
@@ -266,6 +330,8 @@ impl CoordinatorRpc {
         // recovered nodes one bounded registration grace, with routes kept closed.
         let now = tokio::time::Instant::now();
         let recovering = saved.nodes.keys().map(|id| (id.clone(), now)).collect();
+        let (claim_sender, claim_requests) = mpsc::channel(CLAIM_BATCH_CAPACITY);
+        tokio::spawn(run_claim_batches(session.clone(), claim_requests));
         Ok(Self(Arc::new(Inner {
             state: Mutex::new(State {
                 session,
@@ -281,6 +347,7 @@ impl CoordinatorRpc {
                 retired_sessions: BTreeSet::new(),
                 scheduling_deadlines: BTreeMap::new(),
             }),
+            claim_sender,
             changed: Notify::new(),
             peers,
             node_tls: node_tls.into(),
