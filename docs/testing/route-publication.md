@@ -92,8 +92,14 @@ Ingress 对外 TLS、Ingress → Relay 的网络／mTLS 配置继续单独设置
 
 ## 2026-09-25 提交触发发布补充验证
 
-在既有真实 Redis／mTLS／gRPC／Ingress 数据流用例中，将发布任务的周期兜底设为 10 秒，并要求一次已提交的实例修订在 1 秒内到达 Ingress 缓存。修改前该断言超时；改为提交事件触发后通过。通知由同一 Redis 存储连接的已确认 CAS、原子归属登记及节点失效写入产生，发布任务等待固定 10 ms 以合并相近提交，同时保留周期兜底。证据在 `out/ci/route-event-red-0925/target.log` 与 `out/ci/route-event-green-0925/target.log`。这项组件级验证不等同于真实双 worker 负载的可路由延迟分位验收；后者仍列于 `control-plane-remaining.json`。
+在既有真实 Redis／mTLS／gRPC／Ingress 数据流用例中，将发布任务的周期恢复检查设为 10 秒，并要求一次已提交的实例修订在 1 秒内到达 Ingress 缓存。修改前该断言超时；改为提交事件触发后通过。通知由同一 Redis 存储连接的已确认 CAS、原子归属登记及节点失效写入产生，发布任务等待固定 10 ms 以合并相近提交。周期检查只在发布视图已不可用时从 Redis 全量恢复；健康视图仅消费提交事件。证据在 `out/ci/route-event-red-0925/target.log` 与 `out/ci/route-event-green-0925/target.log`。这项组件级验证不等同于真实双 worker 负载的可路由延迟分位验收；后者仍列于 `control-plane-remaining.json`。
 
 ## 2026-09-27 创建热路径增量化
 
 创建性能调查发现，长期运行的测试 Redis 已保留 3,745 条 Deleted Environment，控制 Hash 约 15.3 MB。旧发布器在每个提交 revision 后执行 `HGETALL`，使无关历史记录进入创建热路径。新增真实 Redis/mTLS 回归先证明一次普通创建会增加 `HGETALL` 调用，随后要求创建和删除的目录增量均不增加该计数；完整 control-rpc 套件继续验证订阅游标和终态幂等。集群 P99 是否达到目标仍以新产物部署后的同负载 A/B 为准。
+
+## 2026-09-28 周期恢复与提交事件竞态
+
+Redis CAS 生效到进程内提交事件送达之间存在一个很短的窗口。旧周期检查若恰好落在该窗口，会看到 header revision 已推进，继而把一个普通创建误判为需要全量恢复；当 control Hash 保留数千条历史记录时，这次 `HGETALL` 会直接阻塞创建响应。当前契约是：健康发布视图不按 revision 轮询，只由 `ControlChange` 增量推进；广播滞后、增量处理失败或视图已不可用时才执行全量恢复。真实 Redis 回归覆盖“健康视图存在待处理提交时，周期恢复不得增加 `HGETALL` 调用次数”。
+
+创建性能门槛按单节点统计：C1 P99 小于 200 ms，C100 P99 不超过 1 s；只有并发超过 100 后才允许 P99 明显超过 1 s。最终结论以相同节点、相同运行时和相同历史目录条件下的集群复测为准。
