@@ -1041,7 +1041,7 @@ async fn heartbeat_expiry_reconciliation_and_old_session_fencing() {
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(snapshot.records.len(), 1);
+    assert!(snapshot.records.is_empty());
     let backend = Arc::new(Backend {
         session: session.clone(),
         started: AtomicUsize::new(0),
@@ -1467,14 +1467,16 @@ async fn coordinator_restart_bounds_re_registration_grace() {
             .into_inner();
         let stored = session.get("held").await.unwrap();
         assert_eq!(stored.invalidated, mode != "timely-register", "{mode}");
-        assert_eq!(catalog.records.len(), 1);
-        let record: EnvironmentRecord = catalog.records[0].clone().try_into().unwrap();
         if mode == "timely-register" {
+            assert_eq!(catalog.records.len(), 1);
+            let record: EnvironmentRecord = catalog.records[0].clone().try_into().unwrap();
             assert_eq!(record, running);
         } else {
-            assert_eq!(record.state, EnvironmentState::Failed, "{mode}");
-            assert!(!record.resources_held);
-            assert!(record.runtime.ip.is_none());
+            assert!(catalog.records.is_empty(), "{mode}");
+            let result = stored.result.as_ref().unwrap();
+            assert_eq!(result.state, EnvironmentState::Failed, "{mode}");
+            assert!(!result.resources_held);
+            assert!(result.runtime.ip.is_none());
         }
     }
 }
