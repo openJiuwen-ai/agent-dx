@@ -120,6 +120,9 @@ impl RoutePublisher {
         }
         let mut next_environments = BTreeMap::new();
         for (id, environment) in &snapshot.environments {
+            if environment.effective_record().state == adx_core::EnvironmentState::Deleted {
+                continue;
+            }
             let record = environment.effective_record();
             let node = &snapshot.nodes[&environment.assignment.node_id];
             next_environments.insert(
@@ -231,6 +234,7 @@ impl RoutePublisher {
         let mut route_upserts = BTreeMap::new();
         let mut route_deleted = BTreeSet::new();
         let mut environment_upserts = BTreeMap::new();
+        let mut environment_deleted = BTreeSet::new();
 
         for id in node_ids {
             let node = nodes.get(&id).ok_or(Error::NotFound)?;
@@ -280,10 +284,17 @@ impl RoutePublisher {
                 .ok_or(Error::NotFound)?;
             view.nodes
                 .insert(environment.assignment.node_id.clone(), node.clone());
-            let published = published_environment(&environment, node)?;
-            if view.environments.get(&id) != Some(&published) {
-                view.environments.insert(id.clone(), published.clone());
-                environment_upserts.insert(id.clone(), published);
+            if environment.effective_record().state == adx_core::EnvironmentState::Deleted {
+                environment_upserts.remove(&id);
+                if view.environments.remove(&id).is_some() {
+                    environment_deleted.insert(id.clone());
+                }
+            } else {
+                let published = published_environment(&environment, node)?;
+                if view.environments.get(&id) != Some(&published) {
+                    view.environments.insert(id.clone(), published.clone());
+                    environment_upserts.insert(id.clone(), published);
+                }
             }
             apply_route(
                 &id,
@@ -308,7 +319,7 @@ impl RoutePublisher {
             base_revision,
             reset: false,
             upserts: environment_upserts.into_values().collect(),
-            deleted: Vec::new(),
+            deleted: environment_deleted.into_iter().collect(),
         };
         view.revision = Some(revision);
         view.available = true;
