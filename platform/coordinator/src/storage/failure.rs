@@ -80,11 +80,12 @@ impl Session {
                 .arg(&self.store.key)
                 .arg(raw.get(HEADER).ok_or(Error::Conflict)?)
                 .arg(encode(&header)?);
+            let changed = writes.iter().map(|(field, _)| field.clone()).collect();
             for (field, value) in writes {
                 command.arg(field).arg(value);
             }
             if self.store.query::<u8>(command).await? == 1 {
-                self.store.notify_committed_revision(header.revision);
+                self.store.notify_committed_change(header.revision, changed);
                 return Ok(saved);
             }
         }

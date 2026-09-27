@@ -32,7 +32,7 @@ Relay 重启 → 关闭准入 → adxlet 检测新 proxy_session_id
 - Coordinator 共享 64 帧广播缓冲，每个订阅另有 8 帧发送队列。慢订阅丢失增量后返回错误，重连获取全量。
 - 已同步 Ingress 断连时继续使用内存缓存；缺失路由返回暂不可用。Ingress 重启没有磁盘缓存，等待全量后就绪。Relay 始终复核本机绑定，已退役实例不能因 Ingress 缓存滞后重新接入。
 - Ingress 定期重查 Redis 的 Coordinator 地址和 epoch，发现变化后重新连接。Redis 发现失败不主动清空已有缓存。
-- Coordinator 在本进程确认 Redis 状态提交后通知发布任务，短窗口内的提交合并为一次刷新；持续写入不会无限推迟刷新。每 200 ms 的版本检查仍用于发现外部写入或通知丢失。Ingress 应用增量时重建缓存视图；尚未宣称大规模发布性能达标。
+- Coordinator 在本进程确认 Redis 状态提交后，把 revision 和受影响的 Environment／节点字段写入有界内存变更流。发布任务以 10 ms 有界窗口合并相近提交，普通生命周期提交只读取发生变化的字段；首次启动、revision 断档、变更流溢出或无字段的控制头更新才重新读取完整 Redis 视图。节点心跳仅在地址、Relay 地址或可路由状态变化时重算该节点已有条目。每 200 ms 的版本检查仍用于发现外部写入或通知丢失。Ingress 应用增量时重建缓存视图；尚未宣称大规模发布性能达标。
 
 ## 本机同步与重启
 
@@ -93,3 +93,7 @@ Ingress 对外 TLS、Ingress → Relay 的网络／mTLS 配置继续单独设置
 ## 2026-09-25 提交触发发布补充验证
 
 在既有真实 Redis／mTLS／gRPC／Ingress 数据流用例中，将发布任务的周期兜底设为 10 秒，并要求一次已提交的实例修订在 1 秒内到达 Ingress 缓存。修改前该断言超时；改为提交事件触发后通过。通知由同一 Redis 存储连接的已确认 CAS、原子归属登记及节点失效写入产生，发布任务等待固定 10 ms 以合并相近提交，同时保留周期兜底。证据在 `out/ci/route-event-red-0925/target.log` 与 `out/ci/route-event-green-0925/target.log`。这项组件级验证不等同于真实双 worker 负载的可路由延迟分位验收；后者仍列于 `control-plane-remaining.json`。
+
+## 2026-09-27 创建热路径增量化
+
+创建性能调查发现，长期运行的测试 Redis 已保留 3,745 条 Deleted Environment，控制 Hash 约 15.3 MB。旧发布器在每个提交 revision 后执行 `HGETALL`，使无关历史记录进入创建热路径。新增真实 Redis/mTLS 回归先证明一次普通创建会增加 `HGETALL` 调用，随后要求创建和删除的目录增量均不增加该计数；完整 control-rpc 套件继续验证订阅游标和终态幂等。集群 P99 是否达到目标仍以新产物部署后的同负载 A/B 为准。

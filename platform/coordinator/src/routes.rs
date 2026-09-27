@@ -1,11 +1,15 @@
 //! One shared publication view, refreshed from committed storage only.
-use crate::storage::Session;
+use crate::storage::{ControlChange, Session, StoredEnvironment, StoredNode};
 use adx_core::{Error, Result};
 use adx_protocol::{
     auth::{Peers, Principal},
     control as pb,
 };
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+    time::Duration,
+};
 use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
@@ -27,6 +31,7 @@ fn security(value: adx_core::sandbox::DataPlaneSecurityMode) -> i32 {
 struct View {
     revision: Option<u64>,
     available: bool,
+    nodes: BTreeMap<String, StoredNode>,
     routes: BTreeMap<String, pb::PublishedRoute>,
     environments: BTreeMap<String, pb::PublishedEnvironment>,
 }
@@ -35,6 +40,7 @@ pub struct RoutePublisher {
     session: Session,
     peers: Peers,
     view: Arc<Mutex<View>>,
+    committed: Arc<Mutex<Option<broadcast::Receiver<ControlChange>>>>,
     changes: broadcast::Sender<pb::RouteFrame>,
     environment_changes: broadcast::Sender<pb::EnvironmentDirectoryFrame>,
 }
@@ -42,15 +48,18 @@ impl RoutePublisher {
     pub fn new(session: Session, peers: Peers) -> Self {
         let (changes, _) = broadcast::channel(64);
         let (environment_changes, _) = broadcast::channel(64);
+        let committed = session.committed_changes();
         Self {
             session,
             peers,
             view: Arc::new(Mutex::new(View {
                 revision: None,
                 available: false,
+                nodes: BTreeMap::new(),
                 routes: BTreeMap::new(),
                 environments: BTreeMap::new(),
             })),
+            committed: Arc::new(Mutex::new(Some(committed))),
             changes,
             environment_changes,
         }
@@ -63,11 +72,13 @@ impl RoutePublisher {
         result
     }
     async fn refresh_inner(&self) -> Result<()> {
-        let mut view = self.view.lock().await;
         let revision = self.session.revision().await?;
-        if view.revision == Some(revision) {
-            view.available = true;
-            return Ok(());
+        {
+            let mut view = self.view.lock().await;
+            if view.revision == Some(revision) {
+                view.available = true;
+                return Ok(());
+            }
         }
         let snapshot = self.session.snapshot().await?;
         let mut next = BTreeMap::new();
@@ -109,6 +120,7 @@ impl RoutePublisher {
                 },
             );
         }
+        let mut view = self.view.lock().await;
         let frame = pb::RouteFrame {
             epoch: self.session.epoch(),
             revision: snapshot.revision,
@@ -145,32 +157,305 @@ impl RoutePublisher {
         };
         view.routes = next;
         view.environments = next_environments;
+        view.nodes = snapshot.nodes;
         view.revision = Some(snapshot.revision);
         view.available = true;
         let _ = self.changes.send(frame);
         let _ = self.environment_changes.send(environment_frame);
         Ok(())
     }
+
+    async fn refresh_incremental(&self, changes: Vec<ControlChange>) -> Result<()> {
+        let base_revision = self.view.lock().await.revision.ok_or(Error::Conflict)?;
+        let changes: Vec<_> = changes
+            .into_iter()
+            .filter(|change| change.revision > base_revision)
+            .collect();
+        if changes.is_empty() {
+            return Ok(());
+        }
+        if changes
+            .iter()
+            .scan(base_revision, |previous, change| {
+                let contiguous = change.revision == previous.saturating_add(1);
+                *previous = change.revision;
+                Some(contiguous)
+            })
+            .any(|contiguous| !contiguous)
+            || changes.iter().any(|change| change.fields.is_empty())
+        {
+            return self.refresh_inner().await;
+        }
+        let revision = changes.last().expect("nonempty changes").revision;
+        let mut environment_ids = BTreeSet::new();
+        let mut node_ids = BTreeSet::new();
+        for field in changes.into_iter().flat_map(|change| change.fields) {
+            if let Some(id) = field.strip_prefix("environment:") {
+                environment_ids.insert(id.to_owned());
+            } else if let Some(id) = field.strip_prefix("node:") {
+                node_ids.insert(id.to_owned());
+            } else {
+                return self.refresh_inner().await;
+            }
+        }
+
+        let mut nodes = BTreeMap::new();
+        for id in &node_ids {
+            nodes.insert(id.clone(), self.session.get_node(id).await?);
+        }
+        let mut environments = BTreeMap::new();
+        for id in &environment_ids {
+            let environment = self.session.get(id).await?;
+            let node_id = environment.assignment.node_id.clone();
+            if !nodes.contains_key(&node_id) {
+                nodes.insert(node_id.clone(), self.session.get_node(&node_id).await?);
+            }
+            environments.insert(id.clone(), environment);
+        }
+
+        let mut view = self.view.lock().await;
+        if view.revision != Some(base_revision) {
+            return Err(Error::Conflict);
+        }
+        let mut route_upserts = BTreeMap::new();
+        let mut route_deleted = BTreeSet::new();
+        let mut environment_upserts = BTreeMap::new();
+
+        for id in node_ids {
+            let node = nodes.get(&id).ok_or(Error::NotFound)?;
+            let changed = view.nodes.get(&id).is_none_or(|previous| {
+                previous.address != node.address
+                    || previous.proxy_address != node.proxy_address
+                    || previous.session.as_ref().map(|session| session.routable)
+                        != node.session.as_ref().map(|session| session.routable)
+            });
+            view.nodes.insert(id.clone(), node.clone());
+            if !changed {
+                continue;
+            }
+            let affected: Vec<_> = view
+                .environments
+                .iter()
+                .filter(|(_, environment)| {
+                    environment
+                        .record
+                        .as_ref()
+                        .and_then(|record| record.assignment.as_ref())
+                        .is_some_and(|assignment| assignment.node_id == id)
+                })
+                .map(|(environment_id, environment)| (environment_id.clone(), environment.clone()))
+                .collect();
+            for (environment_id, mut published) in affected {
+                published.node_address = node.address.clone();
+                published.relay_address = node.proxy_address.clone();
+                if view.environments.get(&environment_id) != Some(&published) {
+                    view.environments
+                        .insert(environment_id.clone(), published.clone());
+                    environment_upserts.insert(environment_id.clone(), published.clone());
+                }
+                apply_route(
+                    &environment_id,
+                    route_from_published(&published, node)?,
+                    &mut view,
+                    &mut route_upserts,
+                    &mut route_deleted,
+                );
+            }
+        }
+
+        for (id, environment) in environments {
+            let node = nodes
+                .get(&environment.assignment.node_id)
+                .ok_or(Error::NotFound)?;
+            view.nodes
+                .insert(environment.assignment.node_id.clone(), node.clone());
+            let published = published_environment(&environment, node)?;
+            if view.environments.get(&id) != Some(&published) {
+                view.environments.insert(id.clone(), published.clone());
+                environment_upserts.insert(id.clone(), published);
+            }
+            apply_route(
+                &id,
+                published_route(&environment, node)?,
+                &mut view,
+                &mut route_upserts,
+                &mut route_deleted,
+            );
+        }
+
+        let frame = pb::RouteFrame {
+            epoch: self.session.epoch(),
+            revision,
+            base_revision,
+            reset: false,
+            upserts: route_upserts.into_values().collect(),
+            deleted: route_deleted.into_iter().collect(),
+        };
+        let environment_frame = pb::EnvironmentDirectoryFrame {
+            epoch: self.session.epoch(),
+            revision,
+            base_revision,
+            reset: false,
+            upserts: environment_upserts.into_values().collect(),
+            deleted: Vec::new(),
+        };
+        view.revision = Some(revision);
+        view.available = true;
+        drop(view);
+        let _ = self.changes.send(frame);
+        let _ = self.environment_changes.send(environment_frame);
+        Ok(())
+    }
+
     pub async fn run(self, interval: Duration) {
         let mut tick = tokio::time::interval(interval);
-        let mut committed = self.session.committed_revisions();
+        let mut committed = self
+            .committed
+            .lock()
+            .await
+            .take()
+            .expect("route publisher may only run once");
         loop {
-            tokio::select! {
-                _ = tick.tick() => {},
-                changed = committed.changed() => {
-                    if changed.is_err() {
-                        continue;
-                    }
+            let changes = tokio::select! {
+                biased;
+                changed = committed.recv() => {
+                    let first = match changed {
+                        Ok(change) => change,
+                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                            if self.refresh().await.is_err() { tracing_unavailable(); }
+                            continue;
+                        }
+                        Err(broadcast::error::RecvError::Closed) => return,
+                    };
                     // Coalesce nearby commits without postponing publication
                     // indefinitely when writes remain continuous.
                     tokio::time::sleep(Duration::from_millis(10)).await;
-                    committed.borrow_and_update();
+                    let mut changes = vec![first];
+                    loop {
+                        match committed.try_recv() {
+                            Ok(change) => changes.push(change),
+                            Err(broadcast::error::TryRecvError::Empty) => break,
+                            Err(broadcast::error::TryRecvError::Lagged(_)) => {
+                                changes.clear();
+                                break;
+                            }
+                            Err(broadcast::error::TryRecvError::Closed) => return,
+                        }
+                    }
+                    Some(changes)
                 }
-            }
-            if self.refresh().await.is_err() {
+                _ = tick.tick() => None,
+            };
+            let result = match changes {
+                Some(changes) if !changes.is_empty() => self.refresh_incremental(changes).await,
+                _ => self.refresh().await,
+            };
+            if result.is_err() {
+                self.view.lock().await.available = false;
                 tracing_unavailable();
             }
         }
+    }
+}
+
+fn published_environment(
+    environment: &StoredEnvironment,
+    node: &StoredNode,
+) -> Result<pb::PublishedEnvironment> {
+    Ok(pb::PublishedEnvironment {
+        record: Some(environment.effective_record().try_into()?),
+        node_address: node.address.clone(),
+        relay_address: node.proxy_address.clone(),
+    })
+}
+
+fn published_route(
+    environment: &StoredEnvironment,
+    node: &StoredNode,
+) -> Result<Option<pb::PublishedRoute>> {
+    let Some(record) = environment.result.as_ref().filter(|record| {
+        record.state == adx_core::EnvironmentState::Running
+            && node.session.as_ref().is_none_or(|session| session.routable)
+    }) else {
+        return Ok(None);
+    };
+    Ok(Some(pb::PublishedRoute {
+        environment_id: record.spec.id.clone(),
+        tenant_id: record.spec.tenant_id.clone(),
+        runtime_id: record.runtime.id.clone(),
+        runtime_ip: record.runtime.ip.ok_or(Error::Conflict)?.to_string(),
+        relay_address: node.proxy_address.clone(),
+        generation: record.assignment.generation,
+        environment_revision: record.revision,
+        tunnel_security_mode: security(record.spec.sandbox.data_plane.tunnel),
+        port_forward_security_mode: security(record.spec.sandbox.data_plane.port_forward),
+        forwarded_ports: record
+            .spec
+            .sandbox
+            .ports
+            .iter()
+            .map(|port| u32::from(*port))
+            .collect(),
+    }))
+}
+
+fn route_from_published(
+    environment: &pb::PublishedEnvironment,
+    node: &StoredNode,
+) -> Result<Option<pb::PublishedRoute>> {
+    let Some(record) = environment.record.as_ref().filter(|record| {
+        record.state == pb::EnvironmentState::Running as i32
+            && node.session.as_ref().is_none_or(|session| session.routable)
+    }) else {
+        return Ok(None);
+    };
+    let spec = record.spec.as_ref().ok_or(Error::Conflict)?;
+    let assignment = record.assignment.as_ref().ok_or(Error::Conflict)?;
+    let runtime = record.runtime.as_ref().ok_or(Error::Conflict)?;
+    let sandbox = spec.sandbox.as_ref().ok_or(Error::Conflict)?;
+    let data_plane = sandbox.data_plane.as_ref().ok_or(Error::Conflict)?;
+    let inherited = pb::DataPlaneSecurityMode::DataPlaneSecurityTlsToken as i32;
+    Ok(Some(pb::PublishedRoute {
+        environment_id: spec.id.clone(),
+        tenant_id: spec.tenant_id.clone(),
+        runtime_id: runtime.id.clone(),
+        runtime_ip: runtime.ip.clone(),
+        relay_address: node.proxy_address.clone(),
+        generation: assignment.generation,
+        environment_revision: record.revision,
+        tunnel_security_mode: if data_plane.tunnel == 0 {
+            inherited
+        } else {
+            data_plane.tunnel
+        },
+        port_forward_security_mode: if data_plane.port_forward == 0 {
+            inherited
+        } else {
+            data_plane.port_forward
+        },
+        forwarded_ports: sandbox.ports.clone(),
+    }))
+}
+
+fn apply_route(
+    id: &str,
+    route: Option<pb::PublishedRoute>,
+    view: &mut View,
+    upserts: &mut BTreeMap<String, pb::PublishedRoute>,
+    deleted: &mut BTreeSet<String>,
+) {
+    match route {
+        Some(route) if view.routes.get(id) != Some(&route) => {
+            view.routes.insert(id.to_owned(), route.clone());
+            upserts.insert(id.to_owned(), route);
+            deleted.remove(id);
+        }
+        Some(_) => {}
+        None if view.routes.remove(id).is_some() => {
+            upserts.remove(id);
+            deleted.insert(id.to_owned());
+        }
+        None => {}
     }
 }
 
