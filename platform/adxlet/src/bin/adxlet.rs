@@ -258,16 +258,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ) => result?,
         _ = shutdown() => return Ok(()),
     });
-    let mut readiness = ExecdReadiness::new(
+    let mut control =
+        adxlet::runtime_control::RuntimeControlClient::new(config.execd_port, timeout)?;
+    if let Some(token) = &token {
+        control = control.with_token(token)?;
+    }
+    let readiness = ExecdReadiness::with_client(
         runtime.clone(),
-        config.execd_port,
+        control.clone(),
         execd_ready_poll_interval(),
         timeout,
         timeout,
     )?;
-    if let Some(token) = &token {
-        readiness = readiness.with_token(token)?;
-    }
     let mut manager = Adxlet::new(
         config.node_id.clone(),
         runtime.clone(),
@@ -275,6 +277,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::new(UdsRoutes::new(config.proxy_socket.clone(), timeout)?),
         state_sink,
     )
+    .with_runtime_control(control.clone())?
     .with_operation_timeout(timeout)?
     .with_health_check(config.execd_health_failure_threshold)?;
     let checkpoint_storage = match (config.checkpoint_dir, config.checkpoint_storage) {
@@ -285,11 +288,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     if let Some(storage) = checkpoint_storage {
-        let mut control =
-            adxlet::runtime_control::RuntimeControlClient::new(config.execd_port, timeout)?;
-        if let Some(token) = &token {
-            control = control.with_token(token)?;
-        }
         manager = manager
             .with_checkpointing(
                 storage.build_for_node(
@@ -297,7 +295,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     session_id.clone(),
                     config.checkpoint_gc.clone(),
                 )?,
-                Arc::new(control),
+                Arc::new(control.clone()),
             )?
             .with_snapshot_catalog(sink.clone())?;
     }
