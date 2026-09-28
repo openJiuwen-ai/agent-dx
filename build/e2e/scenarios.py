@@ -262,8 +262,7 @@ elif sys.argv[1] in ('failure-cleanup','network-cleanup'):
     for sid in json.loads((E/'live-instances.json').read_text()):Sandbox.delete(sid,connection=connection)
     records=catalog()
     for sid in json.loads((E/'live-instances.json').read_text()):
-        result=json.loads(records['environment:'+sid])['result']
-        assert result['state']=='Deleted' and not result['resources_held']
+        assert 'environment:'+sid not in records
     result_name='network-partition-result.json' if sys.argv[1]=='network-cleanup' else 'node-failure-result.json'
     (E/result_name).write_text(json.dumps({'status':'passed',**observed,'reconnected_backend_empty':True,'cleanup_committed':True},indent=2))
     event('PASS: reconnected node cleaned old execution; healthy instance still executes; final deletion committed')
@@ -273,8 +272,7 @@ elif sys.argv[1] in ('cleanup-live','cleanup-live-redis','cleanup-live-control',
     for sid in ids:Sandbox.delete(sid,connection=connection)
     records=catalog()
     for sid in ids:
-        result=json.loads(records['environment:'+sid])['result']
-        assert result['state']=='Deleted' and not result['resources_held'],sid
+        assert 'environment:'+sid not in records,sid
     result_name={
         'cleanup-live':'sandboxd-restart-result.json',
         'cleanup-live-redis':'redis-restart-cleanup.json',

@@ -47,14 +47,12 @@ class RuntimeAffinityScenarioTests(unittest.TestCase):
                 })
                 for node_id in ("node1", "node2")
             }
-            result["environment:default-runtime-affinity"] = json.dumps({
-                "spec": {"runtime_class": "runsc"},
-                "assignment": {"node_id": assigned_node},
-                "result": {
-                    "state": "Deleted" if state["deleted"] else "Running",
-                    "resources_held": not state["deleted"],
-                },
-            })
+            if not state["deleted"]:
+                result["environment:default-runtime-affinity"] = json.dumps({
+                    "spec": {"runtime_class": "runsc"},
+                    "assignment": {"node_id": assigned_node},
+                    "result": {"state": "Running", "resources_held": True},
+                })
             return result
 
         modules = {

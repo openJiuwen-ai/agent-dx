@@ -19,6 +19,9 @@ def catalog():
     env={**os.environ,'REDISCLI_AUTH':(S/'redis-key').read_text().strip()}
     host=os.getenv('ADX_E2E_REDIS_HOST','coordinator')
     return json.loads(subprocess.check_output(['redis-cli','-h',host,'--json','HGETALL','adx:{acceptance}:control:v1'],env=env,text=True,timeout=5))
+def assert_environment_absent(records, instance_id):
+    key='environment:'+instance_id
+    assert key not in records, f'deleted Environment record remains in Redis: {key}'
 def persisted_runtime_id(result):
     return result['runtime']['id']
 def nodes():
@@ -331,23 +334,23 @@ def main():
             try:
                 pending=journal_pending()
                 records=catalog()
-                idle=json.loads(records['environment:'+before['idle_id']])['result']
                 keep=json.loads(records['environment:'+before['keep_id']])['result']
                 session=json.loads(records['node:node1'])['session']
                 keep_backend=labeled_backend(before['keep_id'])
                 idle_backend=labeled_backend(before['idle_id'])
-                if pending==[] and idle['state']=='Deleted' and not idle['resources_held'] \
+                if pending==[] and 'environment:'+before['idle_id'] not in records \
                         and keep['state']=='Running' and persisted_runtime_id(keep)==before['keep_runtime_id'] \
                         and keep_backend==[before['keep_backend']] and not idle_backend \
                         and session['routable']:
-                    evidence={'idle_state':idle['state'],'idle_resources_held':False,
+                    evidence={'idle_state':'Absent','idle_resources_held':False,
                               'keep_runtime_id':persisted_runtime_id(keep),'keep_backend':keep_backend,
                               'pending_records':0,'node_routable':True,
                               'seconds':round(time.monotonic()-started,3)}
                     (E/'sqlite-reconciled.json').write_text(json.dumps(evidence,indent=2))
                     print('PASS SQLite journal replay and retained backend after recovery',flush=True)
                     break
-                last={'pending':None if pending is None else len(pending),'idle':idle['state'],
+                last={'pending':None if pending is None else len(pending),
+                      'idle_present':'environment:'+before['idle_id'] in records,
                       'keep':keep['state'],'session':session.get('routable'),
                       'keep_backend':keep_backend,'idle_backend':idle_backend}
             except (OSError,sqlite3.Error,KeyError,ValueError,subprocess.SubprocessError) as error:
@@ -393,13 +396,15 @@ def main():
     elif action=='postcheck':
         result_name=node or 'sdk'
         c=catalog();r=json.loads((E/result_name/'sdk-result.json').read_text());assert r['status']=='passed'
-        records=[json.loads(c['environment:'+i]) for i in r['instances']]
-        assignments={record['assignment']['node_id'] for record in records}
+        created=json.loads((E/result_name/'sdk-result.json').read_text())
+        assignments={item['node_id'] for item in created.get('placements',[])}
+        if not assignments:
+            assignments={item['nodeId'] for item in created.get('instances_detail',[])}
+        for instance_id in r['instances']:assert_environment_absent(c,instance_id)
         assert assignments and assignments <= {'node1','node2'}
         if result_name=='sdk':assert assignments=={'node1','node2'}
-        assert all(r['result']['state']=='Deleted' and not r['result']['resources_held'] for r in records)
         output='catalog-after-delete.json' if result_name=='sdk' else f'catalog-after-delete-{result_name}.json'
-        (E/output).write_text(json.dumps(records,indent=2))
+        (E/output).write_text(json.dumps({'absent':r['instances']},indent=2))
     elif action=='sessions':
         (E/'previous-sessions.json').write_text(json.dumps({n['node']['id']:n['session']['id'] for n in nodes()}))
     elif action=='freeze':

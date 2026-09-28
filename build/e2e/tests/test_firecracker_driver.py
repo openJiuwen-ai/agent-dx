@@ -110,7 +110,7 @@ class FirecrackerEvidenceTests(unittest.TestCase):
             (root/'sdk/snapshot-collected-before-clone-resume.json').write_text(json.dumps({'snapshot_id':'saved','state':'Deleted','references':[]}))
             (root/'orphan-gc.json').write_text(json.dumps({**{k:True for k in ('passed','current_session_preserved','retired_session_removed','foreign_preserved','unmarked_preserved')},'registered_checkpoint_preserved':'saved'}))
             (root/'snapshots-final.json').write_text(json.dumps({'saved':{'state':'Deleted','references':[]}}))
-            (root/'catalog-final.json').write_text(json.dumps({'environment:a':{'result':{'state':'Deleted','resources_held':False}}}))
+            (root/'catalog-final.json').write_text('{}')
             (root/'s3-final.xml').write_text('<ListBucketResult />');(root/'inventory-final.txt').write_text('ID STATUS\n')
             self.assertEqual(len(acceptance.verify(root)),sum(map(len,acceptance.CASES.values())))
             (root/'result.json').write_text(json.dumps({'status':'passed','stop_error':'failed'}))

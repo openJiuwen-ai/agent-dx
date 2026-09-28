@@ -191,9 +191,7 @@ def run(connection, image, output):
         _wait_deleted(background_id, connection, timeout=90)
         remaining.remove(background_id)
         from node import catalog
-        record = json.loads(catalog()['environment:' + background_id])
-        assert record['result']['state'] == 'Deleted'
-        assert not record['result']['resources_held']
+        assert 'environment:' + background_id not in catalog()
         checks['idle_background_client_exit'] = background_id
         passed('lifecycle.idle-with-background-command-after-client-exit', started)
 

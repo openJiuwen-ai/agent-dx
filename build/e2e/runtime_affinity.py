@@ -33,8 +33,7 @@ def run(connection, image, output):
         })
         sandbox.kill()
         deleted = True
-        terminal = json.loads(catalog()["environment:" + sandbox.id])["result"]
-        assert terminal["state"] == "Deleted" and not terminal["resources_held"], terminal
+        assert "environment:" + sandbox.id not in catalog()
         report["status"] = "passed"
     except Exception as error:
         report["error"] = str(error)

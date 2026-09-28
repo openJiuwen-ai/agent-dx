@@ -75,8 +75,7 @@ def run(connection, image, output):
         try:
             records=catalog()
             for sid in report['instances']:
-                result=json.loads(records['environment:'+sid])['result']
-                assert result['state']=='Deleted' and not result['resources_held'],sid
+                assert 'environment:'+sid not in records,sid
             report['terminal_resources_released']=True
         except Exception as error:report['cleanup_errors'].append(str(error))
         if report['cleanup_errors']:report['status']='failed'

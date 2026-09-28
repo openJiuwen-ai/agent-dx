@@ -122,7 +122,7 @@ try:
     sandbox.kill();sandbox.close();sandbox=None
     wait(lambda: not inventory('node1') and not inventory('node2'))
     records={k:v for k,v in catalog().items() if k.startswith('environment:')}
-    assert records and all(v['result']['state']=='Deleted' and not v['result']['resources_held'] for v in records.values())
+    assert not records,records
     (root/'evidence/catalog-final.json').write_text(json.dumps(records,indent=2))
     passed(5)
     result['status']='passed'
