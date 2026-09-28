@@ -28,11 +28,13 @@ impl EnvironmentDirectory {
         if frame.epoch == 0 || frame.revision == 0 {
             return Err(Status::data_loss("invalid environment directory version"));
         }
-        let mut next = if frame.reset {
+        if frame.reset {
             if frame.base_revision != 0 {
                 return Err(Status::data_loss("invalid environment directory reset"));
             }
-            BTreeMap::new()
+            let mut next = BTreeMap::new();
+            apply_changes(&mut next, frame.upserts, frame.deleted, false)?;
+            self.entries = next;
         } else {
             let Some(epoch) = self.epoch else {
                 return Err(Status::failed_precondition(
@@ -47,32 +49,10 @@ impl EnvironmentDirectory {
             if frame.base_revision != self.revision || frame.revision <= frame.base_revision {
                 return Err(Status::out_of_range("environment directory history gap"));
             }
-            self.entries.clone()
-        };
-        let mut touched = BTreeSet::new();
-        for published in frame.upserts {
-            let (id, value) = response(published)?;
-            if !touched.insert(id.clone()) {
-                return Err(Status::data_loss("duplicate environment directory entry"));
-            }
-            if !frame.reset {
-                if let Some(old) = next.get(&id) {
-                    if version(old)? > version(&value)? {
-                        continue;
-                    }
-                }
-            }
-            next.insert(id, value);
-        }
-        for id in frame.deleted {
-            if id.is_empty() || !touched.insert(id.clone()) {
-                return Err(Status::data_loss("invalid environment directory deletion"));
-            }
-            next.remove(&id);
+            apply_changes(&mut self.entries, frame.upserts, frame.deleted, true)?;
         }
         self.epoch = Some(frame.epoch);
         self.revision = frame.revision;
-        self.entries = next;
         Ok(())
     }
 
@@ -113,6 +93,36 @@ impl EnvironmentDirectory {
         self.entries.insert(id, value);
         Ok(())
     }
+}
+
+fn apply_changes(
+    entries: &mut BTreeMap<String, pb::GetEnvironmentResponse>,
+    upserts: Vec<pb::PublishedEnvironment>,
+    deleted: Vec<String>,
+    preserve_newer: bool,
+) -> Result<(), Status> {
+    let mut touched = BTreeSet::new();
+    for published in upserts {
+        let (id, value) = response(published)?;
+        if !touched.insert(id.clone()) {
+            return Err(Status::data_loss("duplicate environment directory entry"));
+        }
+        if preserve_newer {
+            if let Some(old) = entries.get(&id) {
+                if version(old)? > version(&value)? {
+                    continue;
+                }
+            }
+        }
+        entries.insert(id, value);
+    }
+    for id in deleted {
+        if id.is_empty() || !touched.insert(id.clone()) {
+            return Err(Status::data_loss("invalid environment directory deletion"));
+        }
+        entries.remove(&id);
+    }
+    Ok(())
 }
 
 fn response(
@@ -328,6 +338,71 @@ mod tests {
         let record = directory.get("one").unwrap().record.unwrap();
         assert_eq!(record.assignment.unwrap().generation, 2);
         assert_eq!(record.revision, 4);
+    }
+
+    #[test]
+    fn incremental_update_does_not_clone_a_large_untouched_directory() {
+        let mut directory = EnvironmentDirectory::default();
+        let entries = (0..10_000)
+            .map(|index| entry(&format!("environment-{index:05}"), 1, 1))
+            .collect();
+        directory
+            .update(frame(7, 10, 0, true, entries, vec![]))
+            .unwrap();
+        let untouched_address = directory.entries["environment-09999"].node_address.as_ptr();
+
+        directory
+            .update(frame(
+                7,
+                11,
+                10,
+                false,
+                vec![entry("environment-00000", 1, 2)],
+                vec![],
+            ))
+            .unwrap();
+
+        assert_eq!(directory.entries.len(), 10_000);
+        assert_eq!(
+            directory.entries["environment-09999"].node_address.as_ptr(),
+            untouched_address,
+            "an incremental frame must not clone entries it does not touch"
+        );
+    }
+
+    #[test]
+    fn invalid_incremental_frame_clears_partially_updated_directory() {
+        let mut directory = EnvironmentDirectory::default();
+        directory
+            .update(frame(
+                7,
+                10,
+                0,
+                true,
+                vec![entry("one", 1, 1), entry("two", 1, 1)],
+                vec![],
+            ))
+            .unwrap();
+        let mut invalid = entry("invalid", 1, 1);
+        invalid.node_address.clear();
+
+        let error = directory
+            .update(frame(
+                7,
+                11,
+                10,
+                false,
+                vec![entry("one", 1, 2), invalid],
+                vec![],
+            ))
+            .unwrap_err();
+
+        assert_eq!(error.code(), tonic::Code::DataLoss);
+        assert_eq!(
+            directory.get("one").unwrap_err().code(),
+            tonic::Code::Unavailable
+        );
+        assert!(directory.entries.is_empty());
     }
 
     #[test]
