@@ -117,4 +117,4 @@ Redis CAS 生效到进程内提交事件送达之间存在一个很短的窗口�
 
 同一节点 C100 创建在一次运行达到 P99 908.720 ms，但压力结束时 API Server 子进程触及 1 GiB cgroup 上限并由 supervisor 重启。集群 Redis 已积累约一万条历史 Environment；源码核对发现全量和增量发布都会把 `Deleted` 记录保留在 API Server 活跃归属目录。这既抬高稳定内存，也放大批量创建期间的目录复制和发布开销。
 
-当前发布契约保留 Redis 中的终态历史，但不把 `Deleted` 作为活跃目录条目：增量提交移除内存条目并发送 `EnvironmentDirectoryFrame.deleted`，Coordinator 重启后的全量恢复直接过滤历史墓碑。真实 Redis/mTLS 回归同时验证增量删除、重新订阅和新发布器全量恢复均不再携带该 ID，并继续要求创建和删除不触发健康视图的 `HGETALL`。修复后的 C1/C100/C128、API Server cgroup 峰值、子进程 PID 稳定性和残留清理仍须以新发布产物复测。
+当前发布与持久化使用同一个删除边界：删除提交原子移除 Redis 主目录完整记录，写入 10 分钟最小幂等回执，并发送 `EnvironmentDirectoryFrame.deleted`；Coordinator 启动时也会清理旧版本遗留的已删除记录。真实 Redis/mTLS 回归同时验证增量删除、重新订阅和新发布器全量恢复均不再携带该 ID，并继续要求创建和删除不触发健康视图的 `HGETALL`。修复后的 C1/C100/C128、API Server cgroup 峰值、子进程 PID 稳定性和残留清理仍须以新发布产物复测。

@@ -428,7 +428,19 @@ impl pb::node_service_server::NodeService for NodeRpc {
                 if owner != assignment {
                     return Err(Status::failed_precondition("assignment changed"));
                 }
-                response(handle.delete().await.map_err(status)?).map_err(status)
+                let result = handle.delete().await.map_err(status)?;
+                if result.record.state == adx_core::EnvironmentState::Deleted {
+                    self.manager
+                        .retired_generations
+                        .lock()
+                        .expect("shared state lock poisoned")
+                        .entry(assignment.environment_id)
+                        .and_modify(|generation| {
+                            *generation = (*generation).max(assignment.generation)
+                        })
+                        .or_insert(assignment.generation);
+                }
+                response(result).map_err(status)
             })
             .await
     }

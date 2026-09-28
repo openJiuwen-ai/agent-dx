@@ -716,6 +716,22 @@ impl CoordinatorRpc {
         if let Some(stored) = state.environments.get_mut(&accepted.spec.id) {
             stored.result = Some(accepted.clone());
         }
+        if accepted.state == EnvironmentState::Deleted {
+            if let Some(snapshot_id) = &accepted.spec.snapshot_id {
+                state
+                    .session
+                    .release_snapshot(
+                        snapshot_id,
+                        adx_core::snapshots::Reference::Restore {
+                            environment_id: accepted.spec.id.clone(),
+                        },
+                    )
+                    .await?;
+            }
+            state.environments.remove(&accepted.spec.id);
+            state.specs.remove(&accepted.spec.id);
+            state.scheduling_deadlines.remove(&accepted.spec.id);
+        }
         self.0.changed.notify_waiters();
         Ok(accepted)
     }

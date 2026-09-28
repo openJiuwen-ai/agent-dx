@@ -626,7 +626,7 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
             .await
             .unwrap_err()
             .code(),
-        tonic::Code::FailedPrecondition
+        tonic::Code::NotFound
     );
     redis.crash();
     let delete = pb::DeleteEnvironmentRequest {
@@ -657,7 +657,7 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
     assert!(metrics.contains(
         "adx_coordinator_environments{shard_id=\"0\",node_id=\"node\",state=\"Running\"} 0\n"
     ));
-    assert!(metrics.contains("adx_coordinator_deleted_records 2\n"));
+    assert!(!metrics.contains("adx_coordinator_deleted_records"));
     assert!(metrics
         .contains("adx_coordinator_node_reserved_cpu_millis{shard_id=\"0\",node_id=\"node\"} 0\n"));
 
@@ -849,9 +849,9 @@ async fn coordinator_process_loads_configuration_and_restores_bootstrap_credenti
         })
         .await
         .unwrap();
-        assert!(scrape_metrics(metrics_address)
+        assert!(!scrape_metrics(metrics_address)
             .await
-            .contains("adx_coordinator_deleted_records 0\n"));
+            .contains("adx_coordinator_deleted_records"));
         let discovery =
             adx_discovery::RedisDiscovery::new(&redis.url, "process", Duration::from_secs(1))
                 .unwrap();

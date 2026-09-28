@@ -719,6 +719,33 @@ async fn concurrent_local_entries_converge_and_fallback_preserves_both_ledgers()
 
 #[tokio::test]
 #[ignore = "requires real Redis and generated mTLS certificates"]
+async fn deleted_named_environment_can_be_created_again_with_a_new_generation() {
+    let mut rig = Rig::new().await;
+    let first = rig.nodes[0]
+        .create_local_environment(Rig::request("named-recreate", 0))
+        .await
+        .unwrap()
+        .into_inner()
+        .record
+        .unwrap();
+    let first_generation = first.assignment.as_ref().unwrap().generation;
+    rig.delete(&first).await;
+
+    let second = rig.nodes[0]
+        .create_local_environment(Rig::request("named-recreate", 0))
+        .await
+        .unwrap()
+        .into_inner()
+        .record
+        .unwrap();
+    assert!(second.assignment.as_ref().unwrap().generation > first_generation);
+    assert_eq!(rig.backends[0].started.load(Ordering::SeqCst), 2);
+    assert_eq!(rig.managers[0].used().cpu_millis, 100);
+    rig.delete(&second).await;
+}
+
+#[tokio::test]
+#[ignore = "requires real Redis and generated mTLS certificates"]
 async fn new_local_claim_avoids_redundant_preclaim_storage_read() {
     let mut rig = Rig::new().await;
     let before = redis_command_calls(&rig._redis, "hmget").await;
@@ -1196,29 +1223,31 @@ async fn existing_terminal_claim_reconciles_a_late_commit_into_scheduler_account
     // Fault injection: complete the already-cleaned result directly in storage,
     // without the coordinator observing it. CLIENT PAUSE alone may discard a
     // command when its connection closes, so it does not prove late application.
-    rig.session.commit(terminal).await.unwrap();
+    rig.session.commit(terminal.clone()).await.unwrap();
     assert_eq!(
-        rig.session
-            .get("late-delete")
-            .await
-            .unwrap()
-            .result
-            .unwrap()
-            .state,
-        adx_core::EnvironmentState::Deleted
+        rig.session.get("late-delete").await,
+        Err(adx_core::Error::NotFound)
     );
-    assert!(rig.nodes[1]
+    let recreated = rig.nodes[1]
         .create_local_environment(Rig::request("late-delete", 1))
         .await
-        .is_err());
-    assert!(rig
-        .managers
-        .iter()
-        .all(|m| m.used() == Resources::default()));
+        .unwrap()
+        .into_inner()
+        .record
+        .unwrap();
+    assert!(recreated.assignment.as_ref().unwrap().generation > terminal.assignment.generation);
+    assert_eq!(
+        rig.managers
+            .iter()
+            .map(|manager| manager.used().cpu_millis)
+            .sum::<u64>(),
+        100
+    );
     let metrics = rig.rpc.metrics().await.unwrap();
     assert!(
         metrics
             .contains("adx_coordinator_node_reserved_cpu_millis{shard_id=\"0\",node_id=\"a\"} 0"),
         "{metrics}"
     );
+    rig.delete(&recreated).await;
 }

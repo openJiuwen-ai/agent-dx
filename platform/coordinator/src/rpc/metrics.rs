@@ -55,16 +55,7 @@ impl CoordinatorRpc {
                 );
             }
         }
-        let mut deleted = 0;
         for environment in state.environments.values() {
-            if environment
-                .result
-                .as_ref()
-                .is_some_and(|r| r.state == EnvironmentState::Deleted)
-            {
-                deleted += 1;
-                continue;
-            }
             let name = if environment.invalidated {
                 "Invalidated".into()
             } else if environment.recovery.as_ref().is_some_and(|r| r.pending) {
@@ -94,9 +85,6 @@ impl CoordinatorRpc {
                 count,
             );
         }
-        // Retained terminal directory entries are not live environments or an
-        // all-time event counter: future retention cleanup can decrease this.
-        out.gauge("adx_coordinator_deleted_records", &[], deleted);
         Ok(out.finish())
     }
 }

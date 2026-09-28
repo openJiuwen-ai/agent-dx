@@ -170,7 +170,7 @@ async fn restart_recovers_assignment_and_fences_old_writer() {
     deleted.revision = 4;
     deleted.resources_held = false;
     second.commit(deleted.clone()).await.unwrap();
-    assert_eq!(second.commit(r).await, Err(Error::Conflict));
+    assert_eq!(second.commit(r).await, Err(Error::NotFound));
     assert!(second
         .snapshot()
         .await
@@ -182,12 +182,70 @@ async fn restart_recovers_assignment_and_fences_old_writer() {
     let mut restored = Coordinator::restore(&snap, Placement::Pack).unwrap();
     assert_eq!(restored.pending(0).unwrap(), 0);
     restored.register(node("z")).unwrap();
-    assert_eq!(restored.submit(spec("environment")), Err(Error::Conflict));
-    restored.submit(spec("new")).unwrap();
-    let newer = restored.schedule(0).unwrap().unwrap();
-    assert!(newer.generation > a.generation);
-    second.reserve(spec("new"), newer).await.unwrap();
+    restored.submit(spec("environment")).unwrap();
+    let recreated = restored.schedule(0).unwrap().unwrap();
+    assert!(recreated.generation > a.generation);
+    second
+        .reserve(spec("environment"), recreated)
+        .await
+        .unwrap();
     assert!(db.begin(3).await.is_err());
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn deleted_environment_is_retired_and_the_name_can_be_reused() {
+    let rig = common::Redis::new().await;
+    let db = rig.store().await;
+    let session = db.begin(1).await.unwrap();
+    register(&session, "node").await;
+    let first_assignment = Assignment {
+        environment_id: "reusable-name".into(),
+        node_id: "node".into(),
+        shard_id: 0,
+        generation: 1,
+        devices: vec![],
+    };
+    session
+        .reserve(spec("reusable-name"), first_assignment.clone())
+        .await
+        .unwrap();
+    let first_running = running(spec("reusable-name"), first_assignment.clone());
+    session.commit(first_running.clone()).await.unwrap();
+    let mut deleted = first_running.clone();
+    deleted.state = EnvironmentState::Deleted;
+    deleted.resources_held = false;
+    deleted.runtime.ip = None;
+    deleted.revision += 1;
+
+    assert_eq!(session.commit(deleted.clone()).await.unwrap(), deleted);
+    assert_eq!(session.get("reusable-name").await, Err(Error::NotFound));
+    let client = redis::Client::open(rig.url.as_str()).unwrap();
+    let mut connection = client.get_multiplexed_async_connection().await.unwrap();
+    let receipt_ttl: i64 = redis::cmd("PTTL")
+        .arg("adx:{test}:control:v1:deleted:reusable-name")
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    assert!((1..=600_000).contains(&receipt_ttl));
+    // A lost delete response is replayable during the bounded receipt window.
+    assert_eq!(session.commit(deleted.clone()).await.unwrap(), deleted);
+
+    let second_assignment = Assignment {
+        generation: 2,
+        ..first_assignment
+    };
+    session
+        .reserve(spec("reusable-name"), second_assignment.clone())
+        .await
+        .unwrap();
+    let second_running = running(spec("reusable-name"), second_assignment.clone());
+    session.commit(second_running.clone()).await.unwrap();
+    assert_eq!(
+        session.get("reusable-name").await.unwrap().assignment,
+        second_assignment
+    );
+    assert_eq!(session.commit(first_running).await, Err(Error::Conflict));
 }
 
 #[tokio::test]
@@ -340,7 +398,7 @@ fn legacy_capsule_json(record: &adx_coordinator::storage::StoredEnvironment) -> 
 
 #[tokio::test]
 #[ignore = "requires real Redis; build/ci/run.py storage"]
-async fn startup_atomically_preserves_deleted_legacy_capsule_identity() {
+async fn startup_atomically_retires_deleted_legacy_capsule() {
     let rig = common::Redis::new().await;
     let db = rig.store().await;
     let first = db.begin(1).await.unwrap();
@@ -379,12 +437,13 @@ async fn startup_atomically_preserves_deleted_legacy_capsule_identity() {
     deleted.state = EnvironmentState::Deleted;
     deleted.resources_held = false;
     deleted.revision = 4;
+    let mut old = saved.clone();
+    old.result = Some(deleted.clone());
     first.commit(deleted).await.unwrap();
 
     let client = redis::Client::open(rig.url.as_str()).unwrap();
     let mut conn = client.get_multiplexed_async_connection().await.unwrap();
     let key = "adx:{test}:control:v1";
-    let old = first.get("old-deleted").await.unwrap();
     let _: () = redis::pipe()
         .atomic()
         .cmd("HSET")
@@ -401,23 +460,76 @@ async fn startup_atomically_preserves_deleted_legacy_capsule_identity() {
         .unwrap();
 
     let next = db.begin(1).await.unwrap();
-    let migrated = next.get("old-deleted").await.unwrap();
-    assert_eq!(migrated, old);
+    assert_eq!(next.get("old-deleted").await, Err(Error::NotFound));
     assert!(next.snapshot().await.unwrap().routes().unwrap().is_empty());
-    assert_eq!(next.reserve(old_spec, saved.assignment).await.unwrap(), old);
     let fields: Vec<String> = redis::cmd("HKEYS")
         .arg(key)
         .query_async(&mut conn)
         .await
         .unwrap();
     assert!(!fields.iter().any(|field| field == "capsule:old-deleted"));
-    assert!(fields
+    assert!(!fields
         .iter()
         .any(|field| field == "environment:old-deleted"));
+    let replacement = Assignment {
+        generation: saved.assignment.generation + 1,
+        ..saved.assignment
+    };
     assert_eq!(
-        db.begin(1).await.unwrap().get("old-deleted").await.unwrap(),
-        old
+        next.reserve(old_spec, replacement.clone())
+            .await
+            .unwrap()
+            .assignment,
+        replacement
     );
+}
+
+#[tokio::test]
+#[ignore = "requires real Redis; build/ci/run.py storage"]
+async fn startup_retires_deleted_environment_records_from_older_releases() {
+    let rig = common::Redis::new().await;
+    let db = rig.store().await;
+    let first = db.begin(1).await.unwrap();
+    register(&first, "node").await;
+    let assignment = Assignment {
+        environment_id: "old-environment".into(),
+        node_id: "node".into(),
+        shard_id: 0,
+        generation: 1,
+        devices: vec![],
+    };
+    let saved = first
+        .reserve(spec("old-environment"), assignment.clone())
+        .await
+        .unwrap();
+    let mut deleted = running(spec("old-environment"), assignment);
+    deleted.state = EnvironmentState::Deleted;
+    deleted.resources_held = false;
+    deleted.runtime.ip = None;
+    deleted.revision += 1;
+    let mut historical = saved;
+    historical.result = Some(deleted.clone());
+    first.commit(deleted).await.unwrap();
+
+    let client = redis::Client::open(rig.url.as_str()).unwrap();
+    let mut connection = client.get_multiplexed_async_connection().await.unwrap();
+    let _: () = redis::cmd("HSET")
+        .arg("adx:{test}:control:v1")
+        .arg("environment:old-environment")
+        .arg(serde_json::to_string(&historical).unwrap())
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+
+    let next = db.begin(1).await.unwrap();
+    assert_eq!(next.get("old-environment").await, Err(Error::NotFound));
+    let exists: bool = redis::cmd("HEXISTS")
+        .arg("adx:{test}:control:v1")
+        .arg("environment:old-environment")
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    assert!(!exists);
 }
 
 #[tokio::test]

@@ -13,6 +13,7 @@ use adx_core::{
 };
 use redis::{aio::MultiplexedConnection, FromRedisValue};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use tokio::{
     sync::{broadcast, Mutex},
@@ -32,20 +33,25 @@ else
 end
 return 1
 "#;
-const MIGRATE_DELETED_CAPSULES: &str = r#"
+const RETIRE_FIELDS: &str = r#"
 if redis.call('HGET', KEYS[1], 'header') ~= ARGV[1] then return 0 end
-for i = 3, #ARGV, 4 do
-  if redis.call('HGET', KEYS[1], ARGV[i]) ~= ARGV[i + 1]
-    or redis.call('HEXISTS', KEYS[1], ARGV[i + 2]) ~= 0 then return 0 end
-end
-for i = 3, #ARGV, 4 do
-  redis.call('HSET', KEYS[1], ARGV[i + 2], ARGV[i + 3])
+for i = 3, #ARGV do
   redis.call('HDEL', KEYS[1], ARGV[i])
 end
 redis.call('HSET', KEYS[1], 'header', ARGV[2])
 return 1
 "#;
+const RETIRE_ENVIRONMENT: &str = r#"
+if redis.call('HGET', KEYS[1], 'header') ~= ARGV[1] then return 0 end
+if redis.call('HGET', KEYS[1], ARGV[3]) ~= ARGV[4] then return 0 end
+redis.call('SET', KEYS[2], ARGV[5], 'PX', ARGV[6])
+redis.call('HSET', KEYS[1], 'header', ARGV[2])
+redis.call('HDEL', KEYS[1], ARGV[3])
+return 1
+"#;
 const ATTEMPTS: usize = 32;
+// Match the API operation replay window without retaining a deleted Environment.
+const DELETED_RECEIPT_TTL: Duration = Duration::from_secs(600);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Header {
@@ -106,6 +112,27 @@ pub struct StoredEnvironment {
     pub spec: EnvironmentSpec,
     pub assignment: Assignment,
     pub result: Option<EnvironmentRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct DeletedReceipt {
+    environment_id: String,
+    generation: u64,
+    result_digest: String,
+}
+
+impl DeletedReceipt {
+    fn from_result(result: &EnvironmentRecord) -> Result<Self> {
+        Ok(Self {
+            environment_id: result.spec.id.clone(),
+            generation: result.assignment.generation,
+            result_digest: format!("{:x}", Sha256::digest(encode(result)?.as_bytes())),
+        })
+    }
+
+    fn matches(&self, result: &EnvironmentRecord) -> Result<bool> {
+        Ok(self == &Self::from_result(result)?)
+    }
 }
 impl StoredEnvironment {
     pub fn resources_held(&self) -> bool {
@@ -482,25 +509,58 @@ impl RedisStore {
         }
         Ok(applied == 1)
     }
-    async fn migrate_deleted_capsules(
+    fn deleted_receipt_key(&self, id: &str) -> String {
+        format!("{}:deleted:{id}", self.key)
+    }
+    async fn deleted_receipt(&self, id: &str) -> Result<Option<DeletedReceipt>> {
+        let mut cmd = redis::cmd("GET");
+        cmd.arg(self.deleted_receipt_key(id));
+        self.query::<Option<String>>(cmd)
+            .await?
+            .map(|value| decode(&value))
+            .transpose()
+    }
+    async fn retire_fields(
         &self,
         expected: &str,
         header: &Header,
-        replacements: &[(String, String, String, String)],
+        retired: &[String],
     ) -> Result<bool> {
         let mut cmd = redis::cmd("EVAL");
-        cmd.arg(MIGRATE_DELETED_CAPSULES)
+        cmd.arg(RETIRE_FIELDS)
             .arg(1)
             .arg(&self.key)
             .arg(expected)
             .arg(encode(header)?);
-        for (old_field, old_value, new_field, new_value) in replacements {
-            cmd.arg(old_field)
-                .arg(old_value)
-                .arg(new_field)
-                .arg(new_value);
+        for field in retired {
+            cmd.arg(field);
         }
         let applied: u8 = self.query(cmd).await?;
+        Ok(applied == 1)
+    }
+    async fn retire_environment(
+        &self,
+        expected_header: &str,
+        expected_environment: &str,
+        header: &Header,
+        field: &str,
+        receipt: &DeletedReceipt,
+    ) -> Result<bool> {
+        let mut cmd = redis::cmd("EVAL");
+        cmd.arg(RETIRE_ENVIRONMENT)
+            .arg(2)
+            .arg(&self.key)
+            .arg(self.deleted_receipt_key(&receipt.environment_id))
+            .arg(expected_header)
+            .arg(encode(header)?)
+            .arg(field)
+            .arg(expected_environment)
+            .arg(encode(receipt)?)
+            .arg(DELETED_RECEIPT_TTL.as_millis() as u64);
+        let applied: u8 = self.query(cmd).await?;
+        if applied == 1 {
+            self.notify_committed_change(header.revision, vec![field.to_owned()]);
+        }
         Ok(applied == 1)
     }
     /// Called once per Coordinator startup, never on a Redis reconnect. A new epoch
@@ -512,7 +572,7 @@ impl RedisStore {
         for _ in 0..ATTEMPTS {
             let raw = self.raw().await?;
             let old = raw.get(HEADER).map(String::as_str).unwrap_or("");
-            let mut replacements = Vec::new();
+            let mut retired = Vec::new();
             let mut h = if raw.is_empty() {
                 Header {
                     schema: 1,
@@ -531,34 +591,38 @@ impl RedisStore {
                 let mut normalized = raw.clone();
                 for (field, value) in raw.iter().filter(|(key, _)| key.starts_with("capsule:")) {
                     let id = field.trim_start_matches("capsule:");
-                    let record = legacy_deleted_capsule(id, value)?;
+                    legacy_deleted_capsule(id, value)?;
                     let new_field = format!("environment:{id}");
                     if normalized.contains_key(&new_field) {
                         return Err(Error::Unavailable(
                             "conflicting legacy control identity".into(),
                         ));
                     }
-                    let new_value = encode(&record)?;
                     normalized.remove(field);
-                    normalized.insert(new_field.clone(), new_value.clone());
-                    replacements.push((field.clone(), value.clone(), new_field, new_value));
+                    retired.push(field.clone());
                 }
-                if replacements.is_empty() {
-                    snapshot(&normalized)?;
-                } else {
-                    snapshot(&normalized).map_err(|_| {
-                        Error::Unavailable("legacy control snapshot incompatible".into())
-                    })?;
+                for (field, value) in raw
+                    .iter()
+                    .filter(|(key, _)| key.starts_with("environment:"))
+                {
+                    let record: StoredEnvironment = decode(value)?;
+                    if record.result.as_ref().is_some_and(|result| {
+                        result.state == EnvironmentState::Deleted && !result.resources_held
+                    }) {
+                        normalized.remove(field);
+                        retired.push(field.clone());
+                    }
                 }
+                snapshot(&normalized)
+                    .map_err(|_| Error::Unavailable("control snapshot incompatible".into()))?;
                 h.epoch = h.epoch.checked_add(1).ok_or(Error::Conflict)?;
                 h
             };
             h.advance()?;
-            let applied = if replacements.is_empty() {
+            let applied = if retired.is_empty() {
                 self.cas(old, &h, None).await?
             } else {
-                self.migrate_deleted_capsules(old, &h, &replacements)
-                    .await?
+                self.retire_fields(old, &h, &retired).await?
             };
             if applied {
                 return Ok(Session {
@@ -1086,8 +1150,17 @@ impl Session {
             let [header_value, environment_value] =
                 self.store.fields([HEADER.into(), field.clone()]).await?;
             let mut header = self.header(&header_value)?;
-            let mut stored_environment: StoredEnvironment =
-                decode(environment_value.as_deref().ok_or(Error::NotFound)?)?;
+            let Some(environment_value) = environment_value.as_deref() else {
+                if result.state == EnvironmentState::Deleted {
+                    return match self.store.deleted_receipt(&result.spec.id).await? {
+                        Some(receipt) if receipt.matches(&result)? => Ok(result),
+                        Some(_) => Err(Error::Conflict),
+                        None => Err(Error::NotFound),
+                    };
+                }
+                return Err(Error::NotFound);
+            };
+            let mut stored_environment: StoredEnvironment = decode(environment_value)?;
             if !next_result(&stored_environment, &result)? {
                 return Ok(result);
             }
@@ -1105,17 +1178,29 @@ impl Session {
             stored_environment.result = Some(result.clone());
             stored_environment.validate()?;
             header.advance()?;
-            if self
-                .store
-                .cas(
-                    header_value
-                        .as_deref()
-                        .expect("validated control header is present"),
-                    &header,
-                    Some((&field, encode(&stored_environment)?)),
-                )
-                .await?
-            {
+            let expected_header = header_value
+                .as_deref()
+                .expect("validated control header is present");
+            let applied = if result.state == EnvironmentState::Deleted {
+                self.store
+                    .retire_environment(
+                        expected_header,
+                        environment_value,
+                        &header,
+                        &field,
+                        &DeletedReceipt::from_result(&result)?,
+                    )
+                    .await?
+            } else {
+                self.store
+                    .cas(
+                        expected_header,
+                        &header,
+                        Some((&field, encode(&stored_environment)?)),
+                    )
+                    .await?
+            };
+            if applied {
                 return Ok(result);
             }
         }

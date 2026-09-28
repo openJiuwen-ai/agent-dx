@@ -219,10 +219,16 @@ impl RoutePublisher {
         }
         let mut environments = BTreeMap::new();
         for id in &environment_ids {
-            let environment = self.session.get(id).await?;
-            let node_id = environment.assignment.node_id.clone();
-            if !nodes.contains_key(&node_id) {
-                nodes.insert(node_id.clone(), self.session.get_node(&node_id).await?);
+            let environment = match self.session.get(id).await {
+                Ok(environment) => Some(environment),
+                Err(Error::NotFound) => None,
+                Err(error) => return Err(error),
+            };
+            if let Some(environment) = &environment {
+                let node_id = environment.assignment.node_id.clone();
+                if !nodes.contains_key(&node_id) {
+                    nodes.insert(node_id.clone(), self.session.get_node(&node_id).await?);
+                }
             }
             environments.insert(id.clone(), environment);
         }
@@ -279,6 +285,14 @@ impl RoutePublisher {
         }
 
         for (id, environment) in environments {
+            let Some(environment) = environment else {
+                environment_upserts.remove(&id);
+                if view.environments.remove(&id).is_some() {
+                    environment_deleted.insert(id.clone());
+                }
+                apply_route(&id, None, &mut view, &mut route_upserts, &mut route_deleted);
+                continue;
+            };
             let node = nodes
                 .get(&environment.assignment.node_id)
                 .ok_or(Error::NotFound)?;

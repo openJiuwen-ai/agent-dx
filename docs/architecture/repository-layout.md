@@ -106,7 +106,7 @@ agent-dx/
 
 `core` 不依赖 Redis/SQLite/tonic/sandboxd 客户端；`protocol` 不承载调度、状态机、证书文件读取或 TLS 构建。稳定错误语义、可观测、服务进程支持和传输机制位于根级 `crates/`。adxlet 可依赖 Gateway 的 node 库，Gateway 不依赖 Coordinator/adxlet 业务实现。Shard 当前与 Coordinator 同进程。
 
-默认创建经 Global 轮转进入 Shard Filter/Score。启用 `create_mode=local_first` 时，API Server 轮转可用入口节点，adxlet 用同一 Admission 暂留资源，Coordinator 原子确认唯一归属并同步中心账本；本地不满足时使用同一 Environment ID 回退 Shard。Coordinator 向 API Server 首次全量、后续增量发布 Environment 目录，包括用于幂等生命周期结果的终态记录；已有 Environment 操作命中本地目录后直达 adxlet。
+默认创建经 Global 轮转进入 Shard Filter/Score。启用 `create_mode=local_first` 时，API Server 轮转可用入口节点，adxlet 用同一 Admission 暂留资源，Coordinator 原子确认唯一归属并同步中心账本；本地不满足时使用同一 Environment ID 回退 Shard。Coordinator 向 API Server 首次全量、后续增量发布活跃 Environment 目录；删除通过增量撤销并从 Redis 主目录移除，已有 Environment 操作命中本地目录后直达 adxlet。
 
 ## adxlet / Relay 进程组合
 

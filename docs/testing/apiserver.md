@@ -19,7 +19,7 @@ API Server 通过 `EnvironmentDirectoryService.WatchEnvironments` 维护完整�
 
 实现与本地验收证据见 [实例目录订阅验收](2026-09-18-environment-directory.md)。
 
-目录未完成首次同步时，API Server 不接受依赖实例归属的请求。已同步目录中的缺失项是确定的 NotFound，不触发逐项 Redis 查询。实例目录与 Ingress 路由缓存分开：前者包含仍可查询或操作的归属记录，`Deleted` 只保留在 Redis 状态历史中，Coordinator 通过目录 delete 增量将它从 API Server 内存移除；后者只发布可路由的 Running 实例。重复操作的存储幂等由 Coordinator 与 adxlet 状态机负责，API Server 不长期缓存已删除记录。
+目录未完成首次同步时，API Server 不接受依赖实例归属的请求。已同步目录中的缺失项是确定的 NotFound，不触发逐项 Redis 查询。实例目录与 Ingress 路由缓存分开：前者包含仍可查询或操作的活跃归属，Coordinator 通过目录 delete 增量移除已删除项；后者只发布可路由的 Running 实例。Redis 主目录也会在删除提交时移除完整记录，仅保留带 TTL 的最小删除回执。重复操作的存储幂等由 Coordinator 与 adxlet 状态机负责，API Server 不长期缓存已删除记录。
 
 正在等待确认的删除固定其目标，不因刷新或缓存淘汰更换目标；待确认操作达到上限时拒绝新的删除。已完成操作由节点的状态机与持久化结果处理重复调用。这些待确认记录仅在 API Server 内存中，不提供 API Server 重启后找回未确认操作的承诺。
 
