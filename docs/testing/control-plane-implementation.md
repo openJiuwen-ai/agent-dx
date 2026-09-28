@@ -25,7 +25,7 @@
 
 ## 生命周期与提交
 
-创建：Coordinator 先持久化 Assignment，再由 adxlet 本机准入、启动 sandboxd、确认 Execd 就绪和本机绑定，最后提交 Running。Coordinator 向 API Server 首次全量、后续增量发布保留的实例目录，包括用于幂等生命周期结果的终态记录；普通已有实例操作命中本地目录后直达节点，无需预先向 Coordinator 登记每次操作意图。
+创建：Coordinator 先持久化 Assignment，再由 adxlet 本机准入、启动 sandboxd、确认 Execd 就绪和本机绑定，最后提交 Running。Coordinator 向 API Server 首次全量、后续增量发布活跃实例目录；删除后撤销目录项并从 Redis 主目录移除，短期最小回执只用于相同删除结果重试。普通已有实例操作命中本地目录后直达节点，无需预先向 Coordinator 登记每次操作意图。
 
 可配置 `create_mode: "local_first"`：API Server 订阅可用节点并轮转入口，adxlet 用同一 Admission 暂留标量资源和整卡，再由 Coordinator 验证硬约束、CAS 确认归属并同步内存账本后启动。本地不满足时由入口节点保留同 ID 回退 ShardScheduler；API Server 不在连接失败或结果未知时二次发起中心创建。`createTimeoutSeconds` 约束完整创建，`scheduleTimeoutSeconds` 仅从请求进入 Coordinator 中心队列后计时，本地准入不预切或消耗中心排队预算。Pack/Spread、软评分和队列公平性仅适用于中心路径；默认仍为 `central`。并发、暂留释放和结果未知契约见 [本地优先与原子归属](atomic-environment-claim.md)。
 

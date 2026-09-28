@@ -8,7 +8,6 @@
 | --- | --- | --- |
 | `adx_coordinator_environments` | shard_id, node_id, state | 已分配归属的 Environment 当前状态数量，包含无执行结果的Reserved、失效的Invalidated和跨节点Recovering；Deleted不计入 |
 | `adx_coordinator_queued_requests` | shard_id | 尚未分配的内存队列长度；单列，不与 Environment 计数相加解释为运行数量 |
-| `adx_coordinator_deleted_records` | 无 | 当前目录保留的Deleted记录数，Gauge，不是永久累计事件计数 |
 | `adx_coordinator_node_schedulable` | shard_id, node_id | 该节点当前是否可调度；Coordinator重启待报到或心跳过期时为0 |
 | `adx_coordinator_node_reachable` | shard_id, node_id | 当前会话是否已报到且未超出心跳期限，不等同于可调度 |
 | `adx_coordinator_node_heartbeat_age_seconds` | shard_id, node_id | 最近接受的心跳年龄；未报到时不提供时间值 |

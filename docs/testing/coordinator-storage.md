@@ -23,7 +23,7 @@
 |---|---|
 | `header` | schema、域数量、Coordinator epoch、generation 下限、全局发布 revision、节点分域轮转位置 |
 | `node:<node_id>` | 节点资源和设备、固定 shard_id、adxlet 地址、Relay 地址 |
-| `environment:<environment_id>` | 原始 EnvironmentSpec、精确 Assignment、最后一次已提交的节点结果 |
+| `environment:<environment_id>` | 活跃 Environment 的原始 EnvironmentSpec、精确 Assignment、最后一次已提交的节点结果；删除成功后原子移除 |
 
 其他现有键：主目录后缀 `:snapshots` 保存快照目录，`:credentials` 保存凭证摘要，`:revoked-credentials` 保存吊销标记；`adx:{namespace}:coordinator:v1` 保存带 TTL 的 Coordinator 发现信息。它们不等同于持久化路由事件队列。
 
@@ -37,14 +37,14 @@
 
 ## 写入与恢复契约
 
-1. **Coordinator 启动**：`RedisStore::begin(scheduler_shards)` 增加持久化 epoch，返回 Session；加载目录并通过 `Coordinator::restore` 重建调度状态。旧 `capsule:<id>` 记录只有在已删除、未占资源、无待恢复操作和恢复点时才原子改写为 `environment:<id>`，保留终态 ID；新旧字段共存或旧记录仍可能运行时不自动丢弃。缺少头部、未知 schema、域数量不兼容、非法归属或重复卡占用也会阻止恢复。暂不可用时进程保持运行但不开放服务，每 5 秒重试并记录原因；不会把损坏目录重新初始化为空集群。
+1. **Coordinator 启动**：`RedisStore::begin(scheduler_shards)` 增加持久化 epoch，返回 Session；加载目录并通过 `Coordinator::restore` 重建调度状态。旧 `capsule:<id>` 或 `environment:<id>` 只有在确认已删除且不占资源时才原子移除；仍可能运行、格式不明或同 ID 新旧字段共存时不自动丢弃。缺少头部、未知 schema、域数量不兼容、非法归属或重复卡占用也会阻止恢复。暂不可用时进程保持运行但不开放服务，每 5 秒重试并记录原因；不会把损坏目录重新初始化为空集群。
 2. **节点注册**：首次按节点数量最少的域分配，并列时轮转；已有节点保留 shard_id。节点地址与资源更新也通过条件提交。恢复到内存后的所有节点暂时关闭新调度，重新注册后才参与选点。
 3. **首次分配**：调度内核产生 Assignment；`Session::reserve` 持久化后才能向节点派发。请求仍在等待资源时不写 Redis，重启后由客户端重试。不能把仅有的内存分配当作可执行的持久化授权。
-4. **节点结果**：adxlet 完成本机操作后提交结果，Coordinator 核验 EnvironmentSpec、完整 Assignment、实例 revision 和占用一致性，再调用 `Session::commit`。普通生命周期操作没有新增一轮 Coordinator 操作意图登记。Running 才进入路由视图；Failed/Deleted 移除路由。
+4. **节点结果**：adxlet 完成本机操作后提交结果，Coordinator 核验 EnvironmentSpec、完整 Assignment、实例 revision 和占用一致性，再调用 `Session::commit`。普通生命周期操作没有新增一轮 Coordinator 操作意图登记。Running 才进入路由视图；Failed 移除路由但保留诊断状态；Deleted 在同一次 Redis Lua 提交中推进 header、删除完整记录并写入 10 分钟最小幂等回执。
 5. **释放资源**：Failed 不等于资源可用；`resources_held=true` 时恢复占用。服务层必须先确认节点清理、提交终态，再释放调度账本；不能仅以 State=Failed 释放。节点心跳失效是单独的持久化失效路径，会释放逻辑预留并关闭节点资格；物理旧执行在返回对账时清理，见 [节点失效](node-failure-takeover.md)。
 6. **节点明确拒绝分配**：确认未执行或已清理后，可以通过 `replace_rejected` 条件替换精确旧分配，新的 generation 必须更高。Running、Deleted 或仍占用资源的 Failed 不能走这个入口。旧分配之后的迟到结果会被拒绝；这不是运行中实例的跨节点接管协议。
 
-`reserve/commit/replace_rejected` 支持相同内容的重复调用。同一实例 revision 携带不同内容、旧 revision、旧 assignment 或已删除实例的新运行结果均返回冲突。重试不能把删除状态倒退为 Running。Deleted 及已释放的 Failed 记录暂时保留为终态记录，恢复后的调度内核不允许把同一 ID 当成新创建；终态记录回收尚未实现。
+`reserve/commit/replace_rejected` 支持相同内容的重复调用。同一实例 revision 携带不同内容、旧 revision 或旧 assignment 均返回冲突。删除提交的完整结果只以摘要、ID 和 generation 形成带 TTL 的最小回执，用于应答丢失后的相同结果重试；它不会进入实例目录。删除后可用同一 ID 创建新 Environment，新 Assignment 使用更高的全局 generation；旧 generation 的迟到结果不能修改新记录。已释放的 Failed 仍保留，便于查询失败原因，后续清理由独立策略决定。
 
 每次 Coordinator 真正启动才调用 begin；Redis 连接恢复不增加 epoch。旧 Session 的写入和全量读取会被拒绝。这个机制用于排除旧 Coordinator 写者，不提供主备选举，也不证明失联节点上的旧执行已经停止。
 
@@ -55,7 +55,7 @@
 | Redis 不可用／超时 | 返回 Unavailable，清除失效连接；后续调用重新连接，不在传输层盲目重放写入 |
 | 写入已应用但响应丢失 | 调用方以相同实例身份和结果重试；通过读取现值与条件提交判定结果 |
 | Coordinator 重启 | 保留原 Assignment/generation 和资源占用，新分配从持久化 generation 下限继续 |
-| 旧版本已删除的 `capsule:*` 记录 | 启动时校验终态和资源释放条件，原子迁移为 `environment:*`，保留 ID 与代次；失败或结果未知时重读并重试 |
+| 旧版本已删除的 `capsule:*` / `environment:*` 记录 | 启动时校验终态和资源释放条件后原子移除；全局 header generation 保留旧写入隔离下限 |
 | 旧版本仍可能运行的记录或未知字段 | 不忽略、不自动删除；Coordinator 保持未就绪并重试，需先完成明确的数据迁移或处理 |
 | 资源容量缩小／卡暂时消失 | 保留原占用；可分配资源不足时继续拒绝新请求，不擦除历史占用 |
 | 未分配的内存等待队列 | 不恢复，由客户端重试 |
@@ -79,15 +79,15 @@ cargo clippy --locked -p adx-coordinator -p adx-core -p adx-scheduling --all-tar
 
 覆盖：
 
-- 两域节点归属保持、重启后占用和 generation 恢复、等待队列不恢复、删除 ID 不复活。
+- 两域节点归属保持、重启后占用和 generation 恢复、等待队列不恢复、删除后同名新 generation 可重建且旧写入不能复活。
 - 完全相同的并发提交幂等；租户/Assignment/revision 不匹配时不改变记录或路由。
 - 大于 2^53 的 generation 不丢精度；计数器到达上限时停止分配，不回绕。
 - AOF 写入后 SIGKILL Redis、重新启动，复用原 Session 重连并读取相同结果。
 - 缺失 header 和未知 schema 不触发空库初始化；原节点数据保持。
-- 已删除且不占资源的旧 `capsule:*` 记录自动原子迁移并保留 ID；仍在运行的旧记录不被清理。
+- 已删除且不占资源的旧 `capsule:*` / `environment:*` 记录在启动时自动原子移除；仍在运行的旧记录不被清理。
 - 拒绝后的分配替换、旧结果拒绝、运行中结果不可被该接口接管。
 - 容量缩小、设备暂时缺失与恢复后的占用保持，以及重复物理卡归属导致恢复失败。
 
 证据保存在 `out/ci/coordinator-storage/`：`red.log` 是接口未实现时的红灯；`regression-final.log`、`clippy-final.log`、`integration-final/result.json` 和各测试 Redis 日志是最终验证入口。后续完整平台已通过 [Buildkite #21](2026-09-17-observability-k8s.md)，与这些早期组件结果分别记录。
 
-最终结果：55 项普通回归通过（另有 6 项显式用例未在普通测试中执行），5 项真实 Redis 集成单独执行且全部通过、无忽略；严格 Clippy、定向格式检查和 7 项 CI harness 测试通过。
+2026-09-28 删除回收改造的当前证据位于 `out/ci/redis-delete-contract/`：真实 Redis storage suite 32 项通过，真实 Redis/mTLS control RPC suite 27 项通过，adxlet 普通测试 18 项通过，Coordinator 与 adxlet 严格 Clippy、格式和 diff 检查通过。覆盖删除主记录、10 分钟回执 TTL、同名更高 generation 重建、旧 generation 拒绝、旧版本 `capsule:*` / `environment:*` 清理，以及目录删除增量。

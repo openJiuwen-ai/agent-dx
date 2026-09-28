@@ -459,13 +459,13 @@ impl Adxlet {
         {
             return Err(Error::Conflict);
         }
-        if self
+        let retired_generation = self
             .retired_generations
             .lock()
             .expect("shared state lock poisoned")
             .get(&spec.id)
-            .is_some_and(|g| assignment.generation <= *g)
-        {
+            .copied();
+        if retired_generation.is_some_and(|generation| assignment.generation <= generation) {
             return Err(Error::Conflict);
         }
         let mut environments = self
@@ -473,11 +473,22 @@ impl Adxlet {
             .lock()
             .expect("shared state lock poisoned");
         if let Some((existing, owner, handle)) = environments.get(&spec.id) {
-            return if *existing == spec && *owner == assignment {
-                Ok(handle.clone())
-            } else {
-                Err(Error::Conflict)
-            };
+            if *existing == spec && *owner == assignment {
+                return Ok(handle.clone());
+            }
+            // Keep the deleted controller long enough to replay a lost delete
+            // response. A strictly newer confirmed owner may replace it; the
+            // retired generation still fences every delayed old assignment.
+            if retired_generation.is_none_or(|generation| {
+                owner.generation > generation || assignment.generation <= generation
+            }) {
+                return Err(Error::Conflict);
+            }
+            environments.remove(&spec.id);
+            self.retired_generations
+                .lock()
+                .expect("shared state lock poisoned")
+                .remove(&spec.id);
         }
         // The registry lock makes controller creation atomic across concurrent callers.
         let held = self.adopt_local(&spec, &assignment)?;
