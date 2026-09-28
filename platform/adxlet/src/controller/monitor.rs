@@ -4,7 +4,12 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 impl Controller {
-    pub(super) async fn tick(&mut self) -> Result<()> {
+    pub(super) async fn tick(&mut self) -> Result<Option<crate::OperationResult>> {
+        self.tick_inner().await?;
+        Ok(self.published_delete())
+    }
+
+    async fn tick_inner(&mut self) -> Result<()> {
         if self.durability == Some(crate::Durability::Journaled) {
             self.sync().await?;
         }
@@ -109,6 +114,16 @@ impl Controller {
             self.sync().await?;
         }
         Ok(())
+    }
+
+    fn published_delete(&self) -> Option<crate::OperationResult> {
+        (self.record.state == EnvironmentState::Deleted
+            && !self.record.resources_held
+            && self.durability == Some(crate::Durability::Published))
+        .then(|| crate::OperationResult {
+            record: self.record.clone(),
+            durability: crate::Durability::Published,
+        })
     }
     async fn unexpected_exit(&mut self) -> Result<()> {
         self.idle = None;

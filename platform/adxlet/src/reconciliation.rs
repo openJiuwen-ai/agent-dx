@@ -149,12 +149,7 @@ impl Adxlet {
                 // Drain accepted operations, then clean locally without inventing a
                 // cluster record for an identity the authority does not own.
                 handle.discard().await?;
-                self.retired_generations
-                    .lock()
-                    .expect("shared state lock poisoned")
-                    .entry(id.clone())
-                    .and_modify(|g| *g = (*g).max(assignment.generation))
-                    .or_insert(assignment.generation);
+                self.remember_retired(&assignment, None);
                 self.environments
                     .lock()
                     .expect("shared state lock poisoned")
@@ -284,30 +279,35 @@ impl Adxlet {
             expected_revision: record.revision,
         };
         let handle = {
+            let now = tokio::time::Instant::now();
+            let mut retired = self
+                .retired_environments
+                .lock()
+                .expect("shared state lock poisoned");
+            retired.retain(|_, value| value.expires_at > now);
+            if retired
+                .get(&record.spec.id)
+                .is_some_and(|value| value.generation >= record.assignment.generation)
+            {
+                return Err(Error::Conflict);
+            }
             let mut environments = self
                 .environments
                 .lock()
                 .expect("shared state lock poisoned");
-            if self
-                .retired_generations
-                .lock()
-                .expect("shared state lock poisoned")
-                .get(&record.spec.id)
-                .is_some_and(|g| *g >= record.assignment.generation)
-            {
-                return Err(Error::Conflict);
-            }
             if let Some((spec, owner, handle)) = environments.get(&record.spec.id) {
                 if *spec != record.spec || *owner != record.assignment {
                     return Err(Error::Conflict);
                 }
                 handle.clone()
             } else {
+                let environment_id = record.spec.id.clone();
                 let handle = controller::spawn_restored(record.clone(), self.services.clone());
                 environments.insert(
-                    record.spec.id.clone(),
+                    environment_id.clone(),
                     (record.spec, record.assignment, handle.clone()),
                 );
+                retired.remove(&environment_id);
                 handle
             }
         };

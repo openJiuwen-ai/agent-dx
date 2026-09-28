@@ -70,28 +70,27 @@ impl Controller {
         self.sync().await
     }
 
-    pub(super) async fn expire_checkpoint(&mut self, now: u64) -> Result<()> {
+    pub(super) async fn expire_checkpoint(&mut self, now: u64) -> Result<Option<OperationResult>> {
         let Some(cp) = self
             .record
             .checkpoint
             .clone()
             .filter(|cp| cp.expires_at_unix_seconds <= now)
         else {
-            return Ok(());
+            return Ok(None);
         };
         if self.record.state == EnvironmentState::Paused {
-            self.delete().await?;
-            return Ok(());
+            return self.delete().await.map(Some);
         }
         if self.record.state != EnvironmentState::Running
             && self.record.state != EnvironmentState::Failed
         {
-            return Ok(());
+            return Ok(None);
         }
         // An expired restore point is no longer usable, but the live execution
         // can still read its state/memory files. Persist that reference until stop.
         if self.held && self.recovery_files.is_some() {
-            return Ok(());
+            return Ok(None);
         }
         self.obsolete_checkpoints.push(cp.artifact);
         self.record.checkpoint = None;
@@ -99,7 +98,7 @@ impl Controller {
         self.record.revision = self.record.revision.checked_add(1).ok_or(Error::Conflict)?;
         self.durability = None;
         self.sync().await?;
-        Ok(())
+        Ok(None)
     }
 
     pub(super) fn replay_operation(

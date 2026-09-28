@@ -416,30 +416,33 @@ impl pb::node_service_server::NodeService for NodeRpc {
                     .ok_or_else(|| Status::invalid_argument("assignment required"))?
                     .try_into()
                     .map_err(status)?;
-                let (spec, owner, handle) = self
+                let managed = self
                     .manager
                     .environments
                     .lock()
                     .expect("shared state lock poisoned")
                     .get(&assignment.environment_id)
-                    .cloned()
-                    .ok_or_else(|| Status::not_found("environment not managed on this node"))?;
+                    .cloned();
+                let Some((spec, owner, handle)) = managed else {
+                    let retired = self
+                        .manager
+                        .retired_environment(&assignment.environment_id)
+                        .ok_or_else(|| Status::not_found("environment not managed on this node"))?;
+                    let result = retired
+                        .result
+                        .ok_or_else(|| Status::not_found("environment not managed on this node"))?;
+                    tenant(r.caller.as_ref(), &result.record.spec.tenant_id)?;
+                    if result.record.assignment != assignment {
+                        return Err(Status::failed_precondition("assignment changed"));
+                    }
+                    return response(result).map_err(status);
+                };
                 tenant(r.caller.as_ref(), &spec.tenant_id)?;
                 if owner != assignment {
                     return Err(Status::failed_precondition("assignment changed"));
                 }
                 let result = handle.delete().await.map_err(status)?;
-                if result.record.state == adx_core::EnvironmentState::Deleted {
-                    self.manager
-                        .retired_generations
-                        .lock()
-                        .expect("shared state lock poisoned")
-                        .entry(assignment.environment_id)
-                        .and_modify(|generation| {
-                            *generation = (*generation).max(assignment.generation)
-                        })
-                        .or_insert(assignment.generation);
-                }
+                self.manager.release_published_controller(&result);
                 response(result).map_err(status)
             })
             .await

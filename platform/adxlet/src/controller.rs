@@ -36,8 +36,8 @@ enum Command {
     Sync,
     Reconcile,
     Discard(oneshot::Sender<Result<()>>),
-    Expire(u64, oneshot::Sender<Result<()>>),
-    Tick(oneshot::Sender<Result<()>>),
+    Expire(u64, oneshot::Sender<Result<Option<OperationResult>>>),
+    Tick(oneshot::Sender<Result<Option<OperationResult>>>),
 }
 type Reply = oneshot::Sender<Result<OperationResult>>;
 struct Envelope {
@@ -142,7 +142,7 @@ impl EnvironmentHandle {
         rx.await
             .map_err(|_| Error::Unavailable("environment controller stopped".into()))?
     }
-    pub async fn expire_checkpoint(&self, now: u64) -> Result<()> {
+    pub async fn expire_checkpoint(&self, now: u64) -> Result<Option<OperationResult>> {
         let (tx, rx) = oneshot::channel();
         let (unused, _) = oneshot::channel();
         self.tx
@@ -152,7 +152,7 @@ impl EnvironmentHandle {
         rx.await
             .map_err(|_| Error::Unavailable("environment controller stopped".into()))?
     }
-    pub async fn tick(&self) -> Result<()> {
+    pub async fn tick(&self) -> Result<Option<OperationResult>> {
         let (tx, rx) = oneshot::channel();
         let (unused, _) = oneshot::channel();
         self.tx

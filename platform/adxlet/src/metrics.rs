@@ -68,8 +68,23 @@ impl Metrics {
 }
 impl Adxlet {
     pub fn metrics(&self) -> String {
+        self.prune_retired_environments();
         let mut output = self.services.metrics.render();
         output.push_str(&adx_observability::trace::metrics());
+        let managed_environments = u64::try_from(
+            self.environments
+                .lock()
+                .expect("shared state lock poisoned")
+                .len(),
+        )
+        .unwrap_or(u64::MAX);
+        let retired_environments = u64::try_from(
+            self.retired_environments
+                .lock()
+                .expect("shared state lock poisoned")
+                .len(),
+        )
+        .unwrap_or(u64::MAX);
         let lifecycle_ready =
             self.lifecycle_ready.try_read().is_ok_and(|ready| *ready) && !self.is_draining();
         let admission = self
@@ -91,6 +106,12 @@ impl Adxlet {
             "adx_node_device_observation_fresh",
             &[],
             u64::from(devices_fresh),
+        );
+        text.gauge("adx_node_managed_environments", &[], managed_environments);
+        text.gauge(
+            "adx_node_retired_environment_tombstones",
+            &[],
+            retired_environments,
         );
         adx_observability::metrics::resources(
             &mut text,

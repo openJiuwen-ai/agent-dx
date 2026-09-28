@@ -657,12 +657,13 @@ async fn idle_deletion_resets_on_bursts_and_unknown_observations() {
         EnvironmentState::Running
     );
     tokio::time::advance(Duration::from_secs(10)).await;
-    h.tick().await.unwrap();
+    node.monitor_environments().await.unwrap();
     assert_eq!(
         h.sync().await.unwrap().record.state,
         EnvironmentState::Deleted
     );
     assert_eq!(node.used(), Resources::default());
+    assert!(node.metrics().contains("adx_node_managed_environments 0\n"));
 }
 
 #[tokio::test(start_paused = true)]
