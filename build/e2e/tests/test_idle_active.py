@@ -42,9 +42,10 @@ class IdleActiveScenarioTests(unittest.TestCase):
                 state["deleted"] = True
 
         def catalog():
+            if state["deleted"]:
+                return {}
             return {"environment:active-idle-instance": json.dumps({
-                "result": {"state": "Deleted" if state["deleted"] else "Running",
-                           "resources_held": not state["deleted"]},
+                "result": {"state": "Running", "resources_held": True},
             })}
 
         def wait_deleted(instance_id, _connection, **_options):

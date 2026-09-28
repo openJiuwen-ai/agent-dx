@@ -106,8 +106,7 @@ def verify(connection, image, evidence, output):
             Sandbox.delete(sid, connection=connection)
             deleted.add(sid)
             _wait_deleted(sid, connection, timeout=60)
-            final = json.loads(catalog()['environment:' + sid])['result']
-            assert final['state'] == 'Deleted' and not final['resources_held'], final
+            assert 'environment:' + sid not in catalog()
             assert not labeled_backend(sid)
         report['status'] = 'passed'
         report['cases'] = [

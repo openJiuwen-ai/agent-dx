@@ -94,7 +94,7 @@ try:
  wait(snapshots_collected)
  saved={k:json.loads(v) for k,v in catalog().items() if k.startswith('environment:')}
  (E/'catalog-final.json').write_text(json.dumps(saved,indent=2))
- assert saved and all(i['result']['state']=='Deleted' and not i['result']['resources_held'] for i in saved.values()),saved
+ assert not saved,saved
  inventory=run(['sbox','-a',RUN/'sandboxd/sandboxd.sock','list'])
  assert len(inventory.splitlines())==1,inventory
  (E/'inventory-final.txt').write_text(inventory)

@@ -58,8 +58,7 @@ class ResourceStaleScenarioTests(unittest.TestCase):
             def delete(cls, instance_id, **_options):
                 deleted.append(instance_id)
                 backends.pop(instance_id, None)
-                records['environment:' + instance_id]['result'].update(
-                    state='Deleted', resources_held=False)
+                records.pop('environment:' + instance_id)
 
         modules = {
             'adx_sandbox': types.SimpleNamespace(Sandbox=Sandbox, SandboxError=SandboxError),

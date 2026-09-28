@@ -56,8 +56,7 @@ def run(connection, image, output):
         Sandbox.delete(sandbox.id, connection=connection)
         deleted = True
         _wait_deleted(sandbox.id, connection, timeout=60)
-        deleted_result = json.loads(catalog()['environment:' + sandbox.id])['result']
-        assert deleted_result['state'] == 'Deleted' and not deleted_result['resources_held']
+        assert 'environment:' + sandbox.id not in catalog()
         assert not labeled_backend(sandbox.id)
 
         report['status'] = 'passed'

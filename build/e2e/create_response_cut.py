@@ -189,8 +189,7 @@ def run(connection, image, output, secrets):
         Sandbox.delete(instance_id, connection=connection)
         deleted = True
         _wait_deleted(instance_id, connection, timeout=60)
-        final = json.loads(catalog()['environment:' + instance_id])['result']
-        assert final['state'] == 'Deleted' and not final['resources_held'], final
+        assert 'environment:' + instance_id not in catalog()
         assert not labeled_backend(instance_id)
         report['status'] = 'passed'
         report['cases'].append({

@@ -100,11 +100,13 @@ try:
     assert len(inventory())==1
     call(cli('stop'),timeout=120);supervisor.wait(timeout=30)
     records={k:v for k,v in catalog().items() if k.startswith('environment:')}
-    assert len(records)==2 and all(r['result']['state']=='Deleted' and not r['result']['resources_held'] for r in records.values())
+    assert not records,records
     result['backend_count']=len(inventory());assert result['backend_count']==0
     result['external_dependencies_alive_after_stop']=redis.poll() is None and sandboxd.poll() is None
     assert result['external_dependencies_alive_after_stop']
-    (E/'catalog-final.json').write_text(json.dumps(records,indent=2));event(5)
+    sdk_evidence=json.loads((E/'sdk.json').read_text())
+    (E/'catalog-final.json').write_text(json.dumps(
+        {'absent':[sdk_evidence['deleted'],sdk_evidence['left_for_stop']]},indent=2));event(5)
     result['status']='passed'
 except BaseException as error:
     result['error']=repr(error);traceback.print_exc();(E/'failure.txt').write_text(traceback.format_exc());print('FAIL',repr(error),flush=True)

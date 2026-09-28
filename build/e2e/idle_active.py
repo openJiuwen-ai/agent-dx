@@ -33,8 +33,7 @@ def run(connection, image, output):
         sandbox.close()
         closed = True
         _wait_deleted(sandbox.id, connection, timeout=90)
-        terminal = json.loads(catalog()["environment:" + sandbox.id])["result"]
-        assert terminal["state"] == "Deleted" and not terminal["resources_held"], terminal
+        assert "environment:" + sandbox.id not in catalog()
         deleted = True
         report["cases"].append({
             "id": "lifecycle.active-request-prevents-idle", "status": "passed",
