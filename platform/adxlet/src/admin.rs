@@ -36,11 +36,11 @@ impl Adxlet {
             .lock()
             .expect("shared state lock poisoned")
             .values()
-            .map(|(_, _, h)| h.clone())
+            .map(|(_, _, handle)| handle.clone())
             .collect();
         let count = handles.len();
-        for h in handles {
-            let r = h.delete().await?;
+        for handle in handles {
+            let r = handle.delete().await?;
             if r.record.state != EnvironmentState::Deleted
                 || r.record.resources_held
                 || r.durability != Durability::Published
@@ -49,6 +49,7 @@ impl Adxlet {
                     "cleanup is not committed to cluster storage".into(),
                 ));
             }
+            self.release_published_controller(&r);
         }
         Ok(count)
     }

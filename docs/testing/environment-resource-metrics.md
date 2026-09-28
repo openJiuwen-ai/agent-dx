@@ -13,6 +13,8 @@
 | `adx_coordinator_node_heartbeat_age_seconds` | shard_id, node_id | 最近接受的心跳年龄；未报到时不提供时间值 |
 | `adx_node_accepting_allocations` | 无 | adxlet本机准入开关 |
 | `adx_node_resource_observation_fresh` / `adx_node_device_observation_fresh` | 无 | 本机容量/设备观测是否仍在有效期内 |
+| `adx_node_managed_environments` | 无 | adxlet当前持有完整生命周期控制器的Environment数量；Published删除、空闲回收、恢复点过期或节点drain完成后立即减少 |
+| `adx_node_retired_environment_tombstones` | 无 | 为丢失删除响应和旧代次隔离而暂存的轻量终态数量；保留期为两倍节点操作超时，过期自动清理 |
 
 资源Gauge有两个前缀：Coordinator为 `adx_coordinator_node`，附带shard_id和node_id；adxlet为 `adx_node`，节点身份由采集target标签关联。后缀：
 
@@ -47,4 +49,4 @@ Pod部署需为采集方暴露私有metrics端口，并配置相应服务发现�
 
 ## 验收
 
-针对容量下降、释放、维护状态、缺失/不健康设备、Coordinator恢复后预留恢复与队列数量增加回归。真实Redis/mTLS生命周期测试额外抓取HTTP端点，核对Running、排队、删除后的 Environment 和资源；心跳故障测试核对Invalidated和不可用容量。结果及部署验收边界另行记录，组件/Socket测试不能代替正式K8s验证。
+针对容量下降、释放、维护状态、缺失/不健康设备、Coordinator恢复后预留恢复与队列数量增加回归。删除回归同时核对完整控制器立即释放、短时幂等结果可重放及轻量tombstone按期归零。真实Redis/mTLS生命周期测试额外抓取HTTP端点，核对Running、排队、删除后的 Environment 和资源；心跳故障测试核对Invalidated和不可用容量。结果及部署验收边界另行记录，组件/Socket测试不能代替正式K8s验证。

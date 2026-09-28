@@ -40,7 +40,7 @@ API Server 超时或断开不会取消已接收的创建任务；资源释放后
 
 Coordinator 不持锁等待 Node RPC，因此节点回调 CommitEnvironment 不会与创建请求互相等待。Redis 分配提交失败或节点注册提交结果不明确时，新调度进入需要恢复的状态，不能把未确认持久化的内存分配继续下发；服务应重新读取权威目录并恢复后再开放调度。已有节点的结果提交和查询仍走存储校验。
 
-Node 的删除入口只接受本机已经管理的精确 Assignment；不会因为一次删除请求缺少本机记录而创建新控制器。adxlet 自身重启后的权威对账和控制器恢复已接通，见 [发现与恢复契约](recovery-discovery.md)。
+Node 的删除入口只接受本机已经管理的精确 Assignment；不会因为一次删除请求缺少本机记录而创建新控制器。删除结果达到 Published 后，adxlet 立即释放完整生命周期控制器，仅在两倍节点操作超时内保留轻量终态，用于同一 Assignment 的丢失响应重放和旧代次隔离；窗口到期后主动回收。Journaled 删除仍保留控制器以继续补交。空闲回收、暂停恢复点过期和节点 drain 使用相同的 Published 回收契约。adxlet 自身重启后的权威对账和控制器恢复已接通，见 [发现与恢复契约](recovery-discovery.md)。
 
 ## StateSink 的成功条件
 

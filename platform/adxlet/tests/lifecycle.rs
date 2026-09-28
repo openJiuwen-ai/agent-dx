@@ -546,7 +546,7 @@ async fn explicit_drain_requires_published_deletion_and_closes_admission() {
     *deps.fail_at.lock().unwrap() = None;
     assert_eq!(node.drain().await.unwrap(), 1);
     assert_eq!(node.used(), Resources::default());
-    assert_eq!(node.drain().await.unwrap(), 1);
+    assert_eq!(node.drain().await.unwrap(), 0);
     let events = deps.events.lock().unwrap();
     assert_eq!(events.iter().filter(|e| *e == "remove").count(), 1);
 }

@@ -43,6 +43,13 @@ pub struct OperationResult {
     pub durability: Durability,
 }
 
+#[derive(Clone)]
+struct RetiredEnvironment {
+    generation: u64,
+    result: Option<OperationResult>,
+    expires_at: Instant,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeObservation {
     pub environment_id: String,
@@ -248,7 +255,7 @@ pub struct Adxlet {
     local_holds: Mutex<BTreeMap<String, local::LocalHold>>,
     draining: std::sync::atomic::AtomicBool,
     lifecycle_ready: tokio::sync::RwLock<bool>,
-    retired_generations: Mutex<BTreeMap<String, u64>>,
+    retired_environments: Mutex<BTreeMap<String, RetiredEnvironment>>,
     services: Arc<Services>,
     environments: Mutex<BTreeMap<String, (EnvironmentSpec, Assignment, EnvironmentHandle)>>,
 }
@@ -266,7 +273,7 @@ impl Adxlet {
             local_holds: Mutex::default(),
             draining: std::sync::atomic::AtomicBool::new(false),
             lifecycle_ready: tokio::sync::RwLock::new(true),
-            retired_generations: Mutex::default(),
+            retired_environments: Mutex::default(),
             services: Arc::new(Services {
                 runtime,
                 runtime_control: None,
@@ -455,6 +462,70 @@ impl Adxlet {
             .used()
     }
 
+    fn retired_environment(&self, id: &str) -> Option<RetiredEnvironment> {
+        let now = Instant::now();
+        let mut retired = self
+            .retired_environments
+            .lock()
+            .expect("shared state lock poisoned");
+        retired.retain(|_, value| value.expires_at > now);
+        retired.get(id).cloned()
+    }
+
+    fn prune_retired_environments(&self) {
+        let now = Instant::now();
+        self.retired_environments
+            .lock()
+            .expect("shared state lock poisoned")
+            .retain(|_, value| value.expires_at > now);
+    }
+
+    fn remember_retired(&self, assignment: &Assignment, result: Option<OperationResult>) {
+        let now = Instant::now();
+        let expires_at = now
+            .checked_add(self.services.operation_timeout.saturating_mul(2))
+            .unwrap_or(now);
+        self.retired_environments
+            .lock()
+            .expect("shared state lock poisoned")
+            .entry(assignment.environment_id.clone())
+            .and_modify(|retired| {
+                if assignment.generation > retired.generation {
+                    retired.generation = assignment.generation;
+                    retired.result = result.clone();
+                } else if assignment.generation == retired.generation && result.is_some() {
+                    retired.result = result.clone();
+                }
+                retired.expires_at = retired.expires_at.max(expires_at);
+            })
+            .or_insert(RetiredEnvironment {
+                generation: assignment.generation,
+                result,
+                expires_at,
+            });
+    }
+
+    fn release_published_controller(&self, result: &OperationResult) {
+        if result.record.state != adx_core::EnvironmentState::Deleted
+            || result.record.resources_held
+            || result.durability != Durability::Published
+        {
+            return;
+        }
+        let assignment = &result.record.assignment;
+        self.remember_retired(assignment, Some(result.clone()));
+        let mut environments = self
+            .environments
+            .lock()
+            .expect("shared state lock poisoned");
+        if environments
+            .get(&assignment.environment_id)
+            .is_some_and(|(_, owner, _)| owner == assignment)
+        {
+            environments.remove(&assignment.environment_id);
+        }
+    }
+
     pub fn environment(
         &self,
         spec: EnvironmentSpec,
@@ -471,12 +542,13 @@ impl Adxlet {
         {
             return Err(Error::Conflict);
         }
-        let retired_generation = self
-            .retired_generations
+        let now = Instant::now();
+        let mut retired = self
+            .retired_environments
             .lock()
-            .expect("shared state lock poisoned")
-            .get(&spec.id)
-            .copied();
+            .expect("shared state lock poisoned");
+        retired.retain(|_, value| value.expires_at > now);
+        let retired_generation = retired.get(&spec.id).map(|value| value.generation);
         if retired_generation.is_some_and(|generation| assignment.generation <= generation) {
             return Err(Error::Conflict);
         }
@@ -497,11 +569,8 @@ impl Adxlet {
                 return Err(Error::Conflict);
             }
             environments.remove(&spec.id);
-            self.retired_generations
-                .lock()
-                .expect("shared state lock poisoned")
-                .remove(&spec.id);
         }
+        retired.remove(&spec.id);
         // The registry lock makes controller creation atomic across concurrent callers.
         let held = self.adopt_local(&spec, &assignment)?;
         let handle = controller::spawn(
@@ -519,6 +588,7 @@ impl Adxlet {
     /// Best effort across independent environments; each expiration is serialized
     /// with that environment's accepted lifecycle operations.
     pub async fn expire_checkpoints(&self) -> Result<()> {
+        self.prune_retired_environments();
         let gate = self.lifecycle_ready.read().await;
         if !*gate || self.is_draining() {
             return Ok(());
@@ -533,8 +603,10 @@ impl Adxlet {
         let now = checkpoint::now()?;
         let mut failure = None;
         for h in handles {
-            if let Err(e) = h.expire_checkpoint(now).await {
-                failure = Some(e);
+            match h.expire_checkpoint(now).await {
+                Ok(Some(result)) => self.release_published_controller(&result),
+                Ok(None) => (),
+                Err(error) => failure = Some(error),
             }
         }
         failure.map_or(Ok(()), Err)
@@ -545,6 +617,7 @@ impl Adxlet {
     /// Each check enters the Environment's serial controller. Bound fan-out so a
     /// slow backend cannot create an unbounded number of node monitoring tasks.
     pub async fn monitor_environments(&self) -> Result<()> {
+        self.prune_retired_environments();
         let gate = self.lifecycle_ready.read().await;
         if !*gate || self.is_draining() {
             return Ok(());
@@ -565,7 +638,8 @@ impl Adxlet {
             }
             while let Some(result) = tasks.join_next().await {
                 match result {
-                    Ok(Ok(())) => (),
+                    Ok(Ok(Some(result))) => self.release_published_controller(&result),
+                    Ok(Ok(None)) => (),
                     Ok(Err(e)) => error = Some(e),
                     Err(e) => error = Some(Error::Unavailable(format!("lifecycle monitor: {e}"))),
                 }
