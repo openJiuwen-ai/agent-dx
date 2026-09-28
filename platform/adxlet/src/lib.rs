@@ -231,6 +231,7 @@ impl Admission {
 
 pub(crate) struct Services {
     runtime: Arc<dyn RuntimeDriver>,
+    runtime_control: Option<runtime_control::RuntimeControlClient>,
     readiness: Arc<dyn Readiness>,
     routes: Arc<dyn Routes>,
     sink: Arc<dyn StateSink>,
@@ -268,6 +269,7 @@ impl Adxlet {
             retired_generations: Mutex::default(),
             services: Arc::new(Services {
                 runtime,
+                runtime_control: None,
                 readiness,
                 routes,
                 sink,
@@ -288,6 +290,16 @@ impl Adxlet {
             }),
             environments: Mutex::default(),
         }
+    }
+
+    pub fn with_runtime_control(
+        mut self,
+        control: runtime_control::RuntimeControlClient,
+    ) -> Result<Self> {
+        Arc::get_mut(&mut self.services)
+            .ok_or(Error::Conflict)?
+            .runtime_control = Some(control);
+        Ok(self)
     }
 
     pub fn with_snapshot_catalog(

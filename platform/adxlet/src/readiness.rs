@@ -32,6 +32,21 @@ impl ExecdReadiness {
             ));
         }
         let client = RuntimeControlClient::new(port, probe_timeout)?;
+        Self::with_client(runtime, client, poll_interval, probe_timeout, ready_timeout)
+    }
+
+    pub fn with_client(
+        runtime: Arc<dyn RuntimeDriver>,
+        client: RuntimeControlClient,
+        poll_interval: Duration,
+        probe_timeout: Duration,
+        ready_timeout: Duration,
+    ) -> Result<Self> {
+        if poll_interval.is_zero() || probe_timeout.is_zero() || ready_timeout.is_zero() {
+            return Err(Error::Invalid(
+                "EXECD readiness durations must be positive".into(),
+            ));
+        }
         Ok(Self {
             runtime,
             client,

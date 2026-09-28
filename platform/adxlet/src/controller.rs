@@ -651,6 +651,9 @@ impl Controller {
     async fn cleanup(&mut self) -> Result<()> {
         timeout(self.services.operation_timeout, async {
             self.services.routes.retire(&self.record).await?;
+            if let Some(control) = &self.services.runtime_control {
+                control.retire(&self.record);
+            }
             self.services.runtime.remove(&self.record.runtime.id).await
         })
         .await

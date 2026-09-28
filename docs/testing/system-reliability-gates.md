@@ -45,6 +45,7 @@
 | NM-01 | 心跳期限内进程重启 | 新 session 完成权威对账并保留有效 backend；对账完成前不准入 | 已有本地 E2E；[Full #55](https://buildkite.com/agent-dx/agent-dx-full-test/builds/55) 在双物理 worker 上同时重启 Coordinator 与 node2 Adxlet，记录 node2 PID 110→202、session 更换、Coordinator epoch 1→2，原归属及 backend 不变，公开 SDK 查询、命令、文件和清理通过；`sqlite-node-restart` 在 [cn-north-4 定向部署](2026-09-25-cn-north-4-targeted-reliability.md) 通过，覆盖 Coordinator 暂停、SQLite 待同步删除期间重启 Adxlet；对账期间新准入仍需独立注入 |
 | NM-02 | 超过心跳期限后进程返回 | 旧实例已经失效；返回节点清理旧执行与绑定后才重新准入 | 已有本地 E2E |
 | NM-03 | 对账期间再次崩溃 | 再次启动继续从 Redis 权威状态收敛，不复活旧 generation | 已有中断物理清理后新 adxlet 重读 inventory、重复幂等删除并保持准入关闭的组件测试；[Full #43](https://buildkite.com/agent-dx/agent-dx-full-test/builds/43) 在双物理 worker 真实注入失联、runc init 暂挂、对账中 Adxlet 崩溃，随后验证换 session、清理旧 backend 再准入 |
+| NM-04 | Environment 删除后的 Runtime 控制连接 | Readiness 与 Checkpoint 共用按 Environment、Runtime、generation 和 endpoint 隔离的连接；撤路由后主动关闭该 Runtime 的空闲连接，再删除 sandboxd Runtime；旧 generation 的迟到清理不能关闭复用同一 IP 的新 Runtime；5 秒 idle close 只作为异常兜底 | 组件测试覆盖连接主动关闭和 generation 隔离；连续 create/delete 后 adxlet FD、连接与内存回归仍待使用新产物复测 |
 | NODE-01 | 节点故障且无 checkpoint | Failed、撤路由，不从镜像冷启动 | 已有组件覆盖；[Full #31](https://buildkite.com/agent-dx/agent-dx-full-test/builds/31) 在双物理 worker 网络隔离期间验证失效和公开入口拒绝。完整三 VM 门禁仍待执行 |
 | NODE-02 | 共享 checkpoint | 跨节点恢复同一 Environment ID，generation 递增，旧执行不能复活 | 已有本地 FC 覆盖，待多 VM 门禁 |
 | NODE-03 | local-only checkpoint | 明确恢复失败，不在其他节点创建空白实例 | 已有组件覆盖，待多 VM 门禁 |
