@@ -2,6 +2,7 @@
 //! through runtime status; only its durable completion ACK releases the caller.
 use super::{control, RuntimeReadyState};
 use adx_core::Error;
+use serde::Deserialize;
 use std::{
     io,
     os::unix::{
@@ -20,6 +21,15 @@ use tokio::{
     net::{UnixListener, UnixStream},
     sync::watch,
 };
+
+const MAX_CHECKPOINT_BODY_BYTES: usize = 1024;
+const DEFAULT_CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(600);
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct CheckpointRequest {
+    timeout_seconds: Option<u64>,
+}
 
 pub(crate) struct CheckpointSocket {
     listener: StdListener,
@@ -118,10 +128,17 @@ async fn handle(mut stream: UnixStream) -> io::Result<()> {
     let mut words = head.lines().next().unwrap_or_default().split_whitespace();
     let method = words.next().unwrap_or_default();
     let path = words.next().unwrap_or_default();
+    let timeout = if path == "/checkpoint" && method == "POST" {
+        read_timeout(&head, &mut stream).await
+    } else {
+        Ok(None)
+    };
     let (status, body) = if path != "/checkpoint" {
         (404, serde_json::json!({"error":"not found"}))
     } else if method != "POST" {
         (405, serde_json::json!({"error":"method not allowed"}))
+    } else if let Err(error) = &timeout {
+        (400, serde_json::json!({"error":error.to_string()}))
     } else if let Some(controller) = control::current() {
         static SEQUENCE: AtomicU64 = AtomicU64::new(1);
         let time = SystemTime::now()
@@ -130,12 +147,16 @@ async fn handle(mut stream: UnixStream) -> io::Result<()> {
             .as_nanos();
         let id = format!("execd-{time}-{}", SEQUENCE.fetch_add(1, Ordering::Relaxed));
         let _activity = super::activity::enter(super::activity::ActivitySource::Checkpoint);
-        match controller.request_checkpoint(id).await {
+        match controller.request_checkpoint(id, timeout.unwrap()).await {
             Ok(()) => (200, serde_json::json!({"status":"completed"})),
+            Err(Error::Invalid(error)) => (400, serde_json::json!({"error":error})),
             Err(Error::Conflict) => (
                 409,
                 serde_json::json!({"error":"checkpoint already in progress"}),
             ),
+            Err(Error::Unavailable(error)) if error == "checkpoint request timed out" => {
+                (504, serde_json::json!({"error":error}))
+            }
             Err(error) => (503, serde_json::json!({"error":error.to_string()})),
         }
     } else {
@@ -150,8 +171,55 @@ async fn handle(mut stream: UnixStream) -> io::Result<()> {
         404 => "Not Found",
         405 => "Method Not Allowed",
         409 => "Conflict",
+        504 => "Gateway Timeout",
+        400 => "Bad Request",
         _ => "Service Unavailable",
     };
     stream.write_all(format!("HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await?;
     stream.shutdown().await
+}
+
+async fn read_timeout(head: &str, stream: &mut UnixStream) -> io::Result<Option<Duration>> {
+    let mut content_length = None;
+    for line in head.lines().skip(1) {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.eq_ignore_ascii_case("transfer-encoding") && !value.trim().is_empty() {
+            return Err(io::Error::other("transfer encoding is not supported"));
+        }
+        if name.eq_ignore_ascii_case("content-length") {
+            if content_length.is_some() {
+                return Err(io::Error::other("duplicate content-length"));
+            }
+            content_length = Some(
+                value
+                    .trim()
+                    .parse::<usize>()
+                    .map_err(|_| io::Error::other("invalid content-length"))?,
+            );
+        }
+    }
+    let length = content_length.unwrap_or(0);
+    if length > MAX_CHECKPOINT_BODY_BYTES {
+        return Err(io::Error::other("checkpoint request body too large"));
+    }
+    if length == 0 {
+        return Ok(Some(DEFAULT_CHECKPOINT_TIMEOUT));
+    }
+    let mut body = vec![0; length];
+    tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut body))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "checkpoint body timeout"))??;
+    let request: CheckpointRequest =
+        serde_json::from_slice(&body).map_err(|error| io::Error::other(error.to_string()))?;
+    let Some(seconds) = request.timeout_seconds else {
+        return Ok(Some(DEFAULT_CHECKPOINT_TIMEOUT));
+    };
+    if !(1..=3600).contains(&seconds) {
+        return Err(io::Error::other(
+            "checkpoint timeout must be between 1 and 3600 seconds",
+        ));
+    }
+    Ok(Some(Duration::from_secs(seconds)))
 }

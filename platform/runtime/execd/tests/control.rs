@@ -279,14 +279,25 @@ async fn workload_checkpoint_waits_for_handoff_and_durable_completion() {
     .unwrap();
     let pending = {
         let control = control.clone();
-        tokio::spawn(async move { control.request_checkpoint("local-a".into()).await })
+        tokio::spawn(async move {
+            control
+                .request_checkpoint("local-a".into(), Some(std::time::Duration::from_secs(30)))
+                .await
+        })
     };
     tokio::task::yield_now().await;
     assert_eq!(
         control.status().requested_checkpoint.as_deref(),
         Some("local-a")
     );
-    assert!(control.request_checkpoint("local-b".into()).await.is_err());
+    assert!(control
+        .status()
+        .requested_checkpoint_deadline_unix_millis
+        .is_some());
+    assert!(control
+        .request_checkpoint("local-b".into(), Some(std::time::Duration::from_secs(30)))
+        .await
+        .is_err());
     let finish = FinishWorkloadCheckpoint {
         identity: identity(),
         operation_id: "local-a".into(),
@@ -329,7 +340,11 @@ async fn restored_runtime_discards_workload_request() {
     .unwrap();
     let pending = {
         let control = control.clone();
-        tokio::spawn(async move { control.request_checkpoint("source".into()).await })
+        tokio::spawn(async move {
+            control
+                .request_checkpoint("source".into(), Some(std::time::Duration::from_secs(30)))
+                .await
+        })
     };
     tokio::task::yield_now().await;
     control
@@ -343,4 +358,25 @@ async fn restored_runtime_discards_workload_request() {
     tx.send(HandoffOutcome::Restore).unwrap();
     assert!(pending.await.unwrap().is_err());
     assert!(control.status().requested_checkpoint.is_none());
+}
+
+#[tokio::test]
+async fn workload_checkpoint_timeout_keeps_the_accepted_request_for_reconciliation() {
+    let (_tx, rx) = oneshot::channel();
+    let control = Controller::new(
+        identity(),
+        Arc::new(Hooks {
+            read: Mutex::new(Some(rx)),
+            opens: AtomicUsize::new(0),
+        }),
+    )
+    .unwrap();
+    let error = control
+        .request_checkpoint("slow".into(), Some(std::time::Duration::from_millis(20)))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("timed out"));
+    let status = control.status();
+    assert_eq!(status.requested_checkpoint.as_deref(), Some("slow"));
+    assert!(status.requested_checkpoint_deadline_unix_millis.is_some());
 }

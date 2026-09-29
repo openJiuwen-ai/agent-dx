@@ -87,6 +87,10 @@ pub struct RuntimeStatus {
     /// Workload-originated request, consumed only by the owning Adxlet.
     #[serde(default)]
     pub requested_checkpoint: Option<String>,
+    /// Absolute deadline for the workload-originated checkpoint operation.
+    /// Older runtimes omit it and retain the legacy default timeout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_checkpoint_deadline_unix_millis: Option<u64>,
     pub active_requests: u64,
     pub active_commands: u64,
     /// Changes on request/command entry and exit, including bursts between polls.

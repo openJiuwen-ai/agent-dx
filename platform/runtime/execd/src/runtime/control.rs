@@ -5,6 +5,7 @@ use std::{
     io,
     pin::Pin,
     sync::{Arc, Mutex, OnceLock},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::watch;
 
@@ -59,6 +60,7 @@ impl Controller {
                     phase: RuntimePhase::Running,
                     checkpoint: None,
                     requested_checkpoint: None,
+                    requested_checkpoint_deadline_unix_millis: None,
                     active_requests: 0,
                     active_commands: 0,
                     activity_revision: 1,
@@ -74,10 +76,31 @@ impl Controller {
     }
     /// Only the local Unix listener calls this. A disconnected caller does not cancel it.
     /// Concurrent workload requests or an active checkpoint return Conflict.
-    pub async fn request_checkpoint(&self, operation_id: String) -> Result<()> {
+    pub async fn request_checkpoint(
+        &self,
+        operation_id: String,
+        timeout: Option<Duration>,
+    ) -> Result<()> {
         if operation_id.is_empty() || operation_id.len() > 128 {
             return Err(Error::Invalid("invalid checkpoint operation id".into()));
         }
+        let deadline = timeout
+            .map(|timeout| {
+                if timeout.is_zero() || timeout > Duration::from_secs(3600) {
+                    return Err(Error::Invalid(
+                        "checkpoint timeout must be positive and at most 3600 seconds".into(),
+                    ));
+                }
+                SystemTime::now()
+                    .checked_add(timeout)
+                    .ok_or_else(|| Error::Invalid("checkpoint deadline overflow".into()))?
+                    .duration_since(UNIX_EPOCH)
+                    .map_err(|_| Error::Unavailable("system clock before epoch".into()))?
+                    .as_millis()
+                    .try_into()
+                    .map_err(|_| Error::Invalid("checkpoint deadline overflow".into()))
+            })
+            .transpose()?;
         let mut reply = {
             let mut state = self
                 .state
@@ -88,19 +111,28 @@ impl Controller {
             }
             let (sender, reply) = watch::channel(None);
             state.status.requested_checkpoint = Some(operation_id);
+            state.status.requested_checkpoint_deadline_unix_millis = deadline;
             state.workload_reply = Some(sender);
             state.workload_finished = None;
             self.publish(&mut state);
             reply
         };
-        loop {
-            if let Some(result) = reply.borrow_and_update().clone() {
-                return result.map_err(Error::Unavailable);
+        let wait = async move {
+            loop {
+                if let Some(result) = reply.borrow_and_update().clone() {
+                    return result.map_err(Error::Unavailable);
+                }
+                reply
+                    .changed()
+                    .await
+                    .map_err(|_| Error::Unavailable("checkpoint request retired".into()))?;
             }
-            reply
-                .changed()
+        };
+        match timeout {
+            Some(timeout) => tokio::time::timeout(timeout, wait)
                 .await
-                .map_err(|_| Error::Unavailable("checkpoint request retired".into()))?;
+                .map_err(|_| Error::Unavailable("checkpoint request timed out".into()))?,
+            None => wait.await,
         }
     }
     /// A successful ACK requires the matching backend handoff. Duplicate ACKs are idempotent.
@@ -131,6 +163,7 @@ impl Controller {
             reply.send_replace(Some(result));
         }
         state.status.requested_checkpoint = None;
+        state.status.requested_checkpoint_deadline_unix_millis = None;
         state.workload_finished = Some(request);
         self.publish(&mut state);
         Ok(state.status.clone())
@@ -277,6 +310,7 @@ impl Controller {
                     )));
                 }
                 state.status.requested_checkpoint = None;
+                state.status.requested_checkpoint_deadline_unix_millis = None;
                 state.workload_finished = None;
                 state.status.phase = RuntimePhase::Restoring;
                 self.publish(&mut state);

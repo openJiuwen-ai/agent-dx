@@ -41,4 +41,6 @@ With checkpoint storage configured, Adxlet enables the workload-local
 with `execd_env.ADX_EXECD_CONTROL_SOCKET_PATH` (AKernel uses `/run/akernel`). This keeps
 the runtime running and produces a lifecycle-bound local recovery point for
 reload/failover. A success response requires backend handoff and Adxlet's
-persistent result acknowledgement. See the [runtime control contract](../../api/http/runtime-control.md#workload-local-checkpoint).
+persistent result acknowledgement. The optional JSON body
+`{"timeoutSeconds": 120}` bounds the complete operation. An empty body or `{}`
+uses the 600-second default. See the [runtime control contract](../../api/http/runtime-control.md#workload-local-checkpoint).
