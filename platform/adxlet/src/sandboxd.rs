@@ -938,9 +938,12 @@ impl RuntimeDriver for Sandboxd {
     async fn remove(&self, runtime_id: &str) -> Result<()> {
         let mut state = self.cell(runtime_id).lock_owned().await;
         if matches!(*state, StartState::Uncertain) {
-            return Err(unavailable(
-                "cannot confirm cleanup while Start outcome is unknown",
-            ));
+            if self.list_id(runtime_id).await?.is_empty() {
+                return Err(unavailable(
+                    "cannot confirm cleanup while Start outcome is unknown",
+                ));
+            }
+            *state = StartState::Settled;
         }
         if let Some(physical) = self.physical_id(runtime_id).await? {
             match self
