@@ -59,8 +59,17 @@ socket belongs to the Environment filesystem and is not mounted from the host.
 
 ```sh
 curl --fail-with-body --unix-socket /run/adx/execd.sock \
-  -X POST http://localhost/checkpoint
+  -H 'Content-Type: application/json' \
+  -d '{"timeoutSeconds":120}' \
+  http://localhost/checkpoint
 ```
+
+`timeoutSeconds` 可选，取值为 1–3600 的整数；空正文或 `{}` 默认使用 600 秒。
+预算从 EXECD 接受 Unix 请求时开始计算。EXECD 在
+`requested_checkpoint_deadline_unix_millis` 中发布绝对截止时间；Adxlet 对准备、
+制品存储、元数据提交及运行时确认使用同一份剩余预算。sandboxd 的
+`CheckpointRequest.timeout_seconds` 接收剩余预算，gRPC deadline 不额外延长。
+对于升级前缺少 deadline 的在途请求，Adxlet 使用同样的 600 秒兜底值。
 
 This creates an anonymous **local recovery point**, retaining the same running
 runtime, allocation and route. It does not create a reusable snapshot catalog
@@ -70,7 +79,7 @@ consumed by reload or same-node failover. It cannot recover a lost node.
 EXECD serializes local requests and exposes the pending operation ID in
 `GET /control/v1/status` as `requested_checkpoint`. Adxlet reads it during
 its lifecycle monitoring cycle, checks execution identity, prepares the handoff,
-and calls sandboxd Checkpoint with `leave_running=true` (capture timeout 300s).
+and calls sandboxd Checkpoint with `leave_running=true`.
 The existing HTTP cooperation channel carries this exchange; it requires no
 outbound control-plane credential in the guest.
 
@@ -80,8 +89,10 @@ the artifact locally and commits the Running record. Only then does it send
 `error`. EXECD requires the matching identity, pending ID and successful handoff
 before returning `200 {"status":"completed"}` to the Unix caller. A repeated
 identical finish is idempotent. Concurrent local requests return 409; unsupported
-runtime or failed work returns 503 with an error body. Other paths/methods return
-404/405. This operation is exposed only on the Unix listener.
+runtime or failed work returns 503 with an error body. Invalid timeout JSON returns
+400. Exhausting the accepted deadline returns 504, while the accepted operation
+ID remains visible for reconciliation and is never silently replayed. Other
+paths/methods return 404/405. This operation is exposed only on the Unix listener.
 
 A lost commit or finish response is retried without invoking Checkpoint again.
 A Journaled result leaves the caller pending until cluster publication succeeds.

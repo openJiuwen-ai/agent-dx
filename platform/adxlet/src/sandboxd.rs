@@ -1009,7 +1009,9 @@ impl Sandboxd {
             leave_running,
             snapshot_type: "Full".into(),
         });
-        request.set_timeout(duration + self.config.rpc_timeout);
+        // The caller passes the remaining operation budget. Do not add a new
+        // transport allowance that would extend the user-visible deadline.
+        request.set_timeout(duration);
         let mut client = self.client.clone();
         // Retain the operation guard on caller cancellation, as with Start.
         *state = StartState::Uncertain;

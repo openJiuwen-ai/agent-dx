@@ -529,6 +529,7 @@ mod tests {
         let (record, client) = record(port);
         let expected = RuntimeStatus {
             requested_checkpoint: None,
+            requested_checkpoint_deadline_unix_millis: None,
             identity: RuntimeControlClient::identity(&record),
             revision: 2,
             phase: RuntimePhase::Prepared,
@@ -616,6 +617,7 @@ mod tests {
         let (record, client) = record(port);
         let expected = RuntimeStatus {
             requested_checkpoint: None,
+            requested_checkpoint_deadline_unix_millis: None,
             identity: RuntimeControlClient::identity(&record),
             revision: 2,
             phase: RuntimePhase::Running,
@@ -671,6 +673,7 @@ mod tests {
             .map(|record| {
                 serde_json::to_vec(&RuntimeStatus {
                     requested_checkpoint: None,
+                    requested_checkpoint_deadline_unix_millis: None,
                     identity: RuntimeControlClient::identity(record),
                     revision: 2,
                     phase: RuntimePhase::Running,

@@ -28,6 +28,8 @@ struct Backend {
     fail_remove: Mutex<bool>,
     checkpoint_leaves_running: Mutex<bool>,
     workload_request: Mutex<Option<String>>,
+    workload_deadline_unix_millis: Mutex<Option<u64>>,
+    workload_checkpoint_timeouts: Mutex<Vec<Duration>>,
     fail_workload_checkpoint: Mutex<bool>,
     workload_prepared: Mutex<bool>,
 }
@@ -89,8 +91,12 @@ impl RuntimeDriver for Backend {
         }
         Ok(())
     }
-    async fn checkpoint_running(&self, id: &str, path: &Path, _: Duration) -> Result<()> {
+    async fn checkpoint_running(&self, id: &str, path: &Path, timeout: Duration) -> Result<()> {
         self.event("checkpoint-running");
+        self.workload_checkpoint_timeouts
+            .lock()
+            .unwrap()
+            .push(timeout);
         assert!(self.running.lock().unwrap().contains(id));
         if *self.fail_workload_checkpoint.lock().unwrap() {
             return Err(Error::Unavailable("reply lost".into()));
@@ -156,6 +162,10 @@ impl CheckpointCooperation for Backend {
                     }
                 }),
                 requested_checkpoint: Some(id),
+                requested_checkpoint_deadline_unix_millis: *self
+                    .workload_deadline_unix_millis
+                    .lock()
+                    .unwrap(),
                 active_requests: 1,
                 active_commands: 0,
                 activity_revision: 1,
@@ -1357,6 +1367,14 @@ async fn workload_checkpoint_keeps_execution_and_commits_before_acknowledging() 
         .any(|e| e == "checkpoint-ack"));
     *backend.unavailable_commit.lock().unwrap() = false;
     handle.tick().await.unwrap();
+    assert_eq!(
+        backend
+            .workload_checkpoint_timeouts
+            .lock()
+            .unwrap()
+            .as_slice(),
+        &[Duration::from_secs(600)]
+    );
     let record = handle.sync().await.unwrap().record;
     assert_eq!(record.state, EnvironmentState::Running);
     assert_eq!(record.runtime, created.record.runtime);
@@ -1383,6 +1401,45 @@ async fn workload_checkpoint_keeps_execution_and_commits_before_acknowledging() 
         handle.sync().await.unwrap().record.runtime,
         created.record.runtime
     );
+}
+
+#[tokio::test]
+async fn workload_checkpoint_passes_the_remaining_user_budget_to_the_backend() {
+    let (_temp, backend, node, spec, assignment) = fixture();
+    let handle = node.environment(spec, assignment).unwrap();
+    handle.create().await.unwrap();
+    *backend.workload_request.lock().unwrap() = Some("bounded".into());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    *backend.workload_deadline_unix_millis.lock().unwrap() = Some(now + 2_000);
+    handle.tick().await.unwrap();
+    let timeouts = backend.workload_checkpoint_timeouts.lock().unwrap();
+    assert_eq!(timeouts.len(), 1);
+    assert!(timeouts[0] > Duration::ZERO);
+    assert!(timeouts[0] <= Duration::from_secs(2));
+}
+
+#[tokio::test]
+async fn expired_workload_checkpoint_is_rejected_without_starting_the_backend() {
+    let (_temp, backend, node, spec, assignment) = fixture();
+    let handle = node.environment(spec, assignment).unwrap();
+    handle.create().await.unwrap();
+    *backend.workload_request.lock().unwrap() = Some("expired".into());
+    *backend.workload_deadline_unix_millis.lock().unwrap() = Some(1);
+    assert!(handle.tick().await.is_err());
+    assert!(backend
+        .workload_checkpoint_timeouts
+        .lock()
+        .unwrap()
+        .is_empty());
+    assert!(backend
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|event| event == "checkpoint-error"));
 }
 
 #[tokio::test]

@@ -324,9 +324,19 @@ async fn same_owner_restore_accepts_new_execution_and_rejects_source_control_ide
 }
 
 async fn local_checkpoint(path: std::path::PathBuf) -> String {
+    local_checkpoint_with_body(path, "").await
+}
+
+async fn local_checkpoint_with_body(path: std::path::PathBuf, body: &str) -> String {
     let mut stream = tokio::net::UnixStream::connect(path).await.unwrap();
     stream
-        .write_all(b"POST /checkpoint HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n")
+        .write_all(
+            format!(
+                "POST /checkpoint HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        )
         .await
         .unwrap();
     let mut response = String::new();
@@ -339,10 +349,36 @@ async fn local_checkpoint(path: std::path::PathBuf) -> String {
     .unwrap();
     response
 }
+
+#[tokio::test]
+async fn unix_checkpoint_validates_and_enforces_the_user_timeout() {
+    let runtime = Runtime::start().await;
+    let socket = runtime.temp.path().join("execd.sock");
+    for body in [
+        r#"{"timeoutSeconds":0}"#,
+        r#"{"timeoutSeconds":3601}"#,
+        r#"{"timeoutSeconds":"slow"}"#,
+        r#"{"timeoutSeconds":1,"unexpected":true}"#,
+    ] {
+        let response = local_checkpoint_with_body(socket.clone(), body).await;
+        assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+    }
+    let started = tokio::time::Instant::now();
+    let response = local_checkpoint_with_body(socket.clone(), r#"{"timeoutSeconds":1}"#).await;
+    assert!(response.starts_with("HTTP/1.1 504"), "{response}");
+    assert!(started.elapsed() >= Duration::from_millis(900));
+    assert!(started.elapsed() < Duration::from_secs(3));
+    let retry = local_checkpoint(socket).await;
+    assert!(retry.starts_with("HTTP/1.1 409"), "{retry}");
+}
 #[tokio::test]
 async fn unix_checkpoint_requires_handoff_and_node_ack_and_rejects_concurrency() {
     let mut runtime = Runtime::start().await;
     let client = runtime.client("before");
+    let requested_after = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
     let request = tokio::spawn(local_checkpoint(runtime.temp.path().join("execd.sock")));
     let id = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
@@ -363,6 +399,15 @@ async fn unix_checkpoint_requires_handoff_and_node_ack_and_rejects_concurrency()
         .await
         .starts_with("HTTP/1.1 409"));
     let status = client.status(&record(1)).await.unwrap();
+    let requested_before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let deadline = status
+        .requested_checkpoint_deadline_unix_millis
+        .expect("empty request body uses the 600-second default timeout");
+    assert!(deadline >= requested_after + 600_000);
+    assert!(deadline <= requested_before + 600_000);
     client
         .prepare(&record(1), &id, status.revision)
         .await
@@ -391,7 +436,14 @@ async fn unix_checkpoint_requires_handoff_and_node_ack_and_rejects_concurrency()
         .finish_checkpoint(&record(1), &id, None)
         .await
         .unwrap();
-    let next = tokio::spawn(local_checkpoint(runtime.temp.path().join("execd.sock")));
+    let requested_after = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let next = tokio::spawn(local_checkpoint_with_body(
+        runtime.temp.path().join("execd.sock"),
+        "{}",
+    ));
     let next_id = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             if let Some(id) = client
@@ -407,6 +459,18 @@ async fn unix_checkpoint_requires_handoff_and_node_ack_and_rejects_concurrency()
     })
     .await
     .unwrap();
+    let requested_before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let deadline = client
+        .status(&record(1))
+        .await
+        .unwrap()
+        .requested_checkpoint_deadline_unix_millis
+        .expect("empty JSON object uses the 600-second default timeout");
+    assert!(deadline >= requested_after + 600_000);
+    assert!(deadline <= requested_before + 600_000);
     assert!(client
         .finish_checkpoint(&record(1), &id, None)
         .await

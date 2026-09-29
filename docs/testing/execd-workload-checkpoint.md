@@ -21,6 +21,12 @@ for durable acknowledgement after handoff, stale/repeated acknowledgements,
 error replies and listener rearming after restore. Controller tests cover pending
 request retirement when execution identity changes.
 
+Timeout regression covers `{"timeoutSeconds":N}` validation (1–3600), the
+600-second empty-body and `{}` default, a 504 response at the accepted deadline,
+retention of the operation ID for reconciliation, rejection before sandboxd when
+the deadline is already stale, propagation of the remaining budget through
+Adxlet, and the sandboxd `CheckpointRequest.timeout_seconds` mapping.
+
 adxlet tests cover `leave_running=true`, stable execution/route/allocation,
 configured-store artifact registration, commit retry without repeated capture, failure
 without false success, restart cleanup of an uncommitted capture, and use of the
