@@ -1,4 +1,8 @@
-use crate::{config::Config, environment_directory::EnvironmentDirectory, ownership::Cache};
+use crate::{
+    config::Config,
+    environment_directory::{EnvironmentDirectory, EnvironmentPage},
+    ownership::Cache,
+};
 use adx_observability::trace;
 use adx_protocol::control as pb;
 use adx_transport::rpc::{RpcChannel, RpcClient, SecurityMode};
@@ -6,6 +10,7 @@ use adx_transport::tls::grpc_client_config;
 use sha2::{Digest, Sha256};
 use std::{
     future::Future,
+    num::NonZeroUsize,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -340,12 +345,16 @@ impl Clients {
         self.put_owner(v.clone()).await?;
         Ok(v)
     }
-    pub async fn visible_environments(
+    pub(crate) async fn visible_environments(
         &self,
         caller: &pb::CallerContext,
-    ) -> Result<Vec<pb::GetEnvironmentResponse>, Status> {
-        let entries = self.environments.lock().await.list()?;
-        filter_visible(entries, caller)
+        after: Option<&str>,
+        limit: NonZeroUsize,
+    ) -> Result<EnvironmentPage, Status> {
+        self.environments
+            .lock()
+            .await
+            .page(after, limit, |entry| is_visible(entry, caller))
     }
     pub async fn put_owner(&self, value: pb::GetEnvironmentResponse) -> Result<(), Status> {
         self.environments.lock().await.put(value)
@@ -383,19 +392,15 @@ pub fn authorize(
     Ok(())
 }
 
-fn filter_visible(
-    entries: Vec<pb::GetEnvironmentResponse>,
+fn is_visible(
+    entry: &pb::GetEnvironmentResponse,
     caller: &pb::CallerContext,
-) -> Result<Vec<pb::GetEnvironmentResponse>, Status> {
-    let mut visible = Vec::new();
-    for entry in entries {
-        match authorize(caller, entry.record.as_ref()) {
-            Ok(()) => visible.push(entry),
-            Err(error) if error.code() == Code::PermissionDenied => (),
-            Err(error) => return Err(error),
-        }
+) -> Result<bool, Status> {
+    match authorize(caller, entry.record.as_ref()) {
+        Ok(()) => Ok(true),
+        Err(error) if error.code() == Code::PermissionDenied => Ok(false),
+        Err(error) => Err(error),
     }
-    Ok(visible)
 }
 
 fn local_owner(
@@ -451,23 +456,21 @@ mod tests {
     }
 
     #[test]
-    fn list_excludes_other_tenants_and_administrator_sees_all() {
-        let entries = vec![owned("one", "tenant-one"), owned("two", "tenant-two")];
+    fn visibility_excludes_other_tenants_and_administrator_sees_all() {
+        let entries = [owned("one", "tenant-one"), owned("two", "tenant-two")];
         let tenant = pb::CallerContext {
             tenant_id: "tenant-one".into(),
             ..Default::default()
         };
-        let listed = filter_visible(entries.clone(), &tenant).unwrap();
-        assert_eq!(listed.len(), 1);
-        assert_eq!(
-            listed[0].record.as_ref().unwrap().spec.as_ref().unwrap().id,
-            "one"
-        );
+        assert!(is_visible(&entries[0], &tenant).unwrap());
+        assert!(!is_visible(&entries[1], &tenant).unwrap());
         let admin = pb::CallerContext {
             administrator: true,
             ..tenant
         };
-        assert_eq!(filter_visible(entries, &admin).unwrap().len(), 2);
+        assert!(entries
+            .iter()
+            .all(|entry| is_visible(entry, &admin).unwrap()));
     }
 
     #[test]

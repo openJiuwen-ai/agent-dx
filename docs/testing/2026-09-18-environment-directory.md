@@ -20,7 +20,9 @@
 
 2026-09-29 补充大目录增量成本回归。全量 reset 继续在旁路构建并校验新 `BTreeMap`，成功后一次替换，时间和内存随完整目录规模增长；普通增量直接在现有目录上应用 upsert/delete，不再复制全部 `GetEnvironmentResponse`，时间复杂度为 `O((U+D) log N)`，额外内存只随当前帧的 upsert/delete 数量增长。若增量中途发现坏条目，API Server 清空可能已部分修改的目录并要求重新全量同步，不向请求路径暴露半提交视图。
 
-新增红灯通过未触碰条目中字符串的分配地址证明旧实现发生了整表深复制；改造后同一用例扩展到 10,000 条目录，单条增量保持另外 9,999 条记录的分配不变。`adx-apiserver` 共49项测试通过，其中32项单测（包含一万条目录用例）合计约0.04秒；严格 Clippy、格式及差异检查通过。证据位于 `out/ci/environment-directory-in-place/`。这项回归只约束增量应用热路径；首次订阅、revision 断档后的完整 reset 和公开 list 查询仍然需要遍历完整目录，百万规模需要继续拆分全量传输与查询分页。
+新增红灯通过未触碰条目中字符串的分配地址证明旧实现发生了整表深复制；改造后同一用例扩展到 10,000 条目录，单条增量保持另外 9,999 条记录的分配不变。`adx-apiserver` 共49项测试通过，其中32项单测（包含一万条目录用例）合计约0.04秒；严格 Clippy、格式及差异检查通过。证据位于 `out/ci/environment-directory-in-place/`。
+
+2026-09-29 在此基础上把公开实例列表改成有界分页。`GET /api/instances` 接受 `pageSize`（默认 100、最大 1000）与 `pageToken`，返回 `items` 和 `nextPageToken`。目录按 Environment ID 字典序扫描，只复制当前页；租户过滤在扫描过程中完成，不先复制其他租户或完整目录。游标绑定认证身份但不绑定目录 revision，因此删除上一页末项后仍可继续；并发插入到游标之前的条目不会在后续页补回，接口不承诺跨页快照隔离。首次订阅和 revision 断档后的完整 reset 仍随完整目录规模增长。
 
 真实 RPC 首轮暴露两项接线问题并保留证据：生命周期测试夹具未装配目录服务，见 `api-control/api-http.log`；终态记录从目录移除导致第二次删除返回404，见 `api-control-final/api-http.log`。前者通过给真实 Coordinator fixture 装配同一个 RoutePublisher 修复；后者当时通过发布 Redis 终态记录处理。2026-09-28 的创建压力验证发现该做法会让长期积累的墓碑进入 API Server 活跃目录并放大内存，当前契约已改为删除增量与全量过滤，第二次删除按公开 API 的 NotFound 语义处理。目标 HTTPS 用例证据见 `read-after-create-final/target-test.log` 与 `read-after-create-final/api-http.log`。
 
