@@ -32,7 +32,7 @@ Relay 重启 → 关闭准入 → adxlet 检测新 proxy_session_id
 - Coordinator 共享 64 帧广播缓冲，每个订阅另有 8 帧发送队列。慢订阅丢失增量后返回错误，重连获取全量。
 - 已同步 Ingress 断连时继续使用内存缓存；缺失路由返回暂不可用。Ingress 重启没有磁盘缓存，等待全量后就绪。Relay 始终复核本机绑定，已退役实例不能因 Ingress 缓存滞后重新接入。
 - Ingress 定期重查 Redis 的 Coordinator 地址和 epoch，发现变化后重新连接。Redis 发现失败不主动清空已有缓存。
-- Coordinator 在本进程确认 Redis 状态提交后，把 revision 和受影响的 Environment／节点字段写入有界内存变更流。发布任务以 10 ms 有界窗口合并相近提交，普通生命周期提交只读取发生变化的字段；首次启动、revision 断档、变更流溢出或无字段的控制头更新才重新读取完整 Redis 视图。节点心跳仅在地址、Relay 地址或可路由状态变化时重算该节点已有条目。每 200 ms 的周期任务只恢复已经标记为不可用的发布视图；健康视图不轮询 revision，也不支持绕过 Coordinator 直接修改控制 Hash。Ingress 应用增量时重建缓存视图；尚未宣称大规模发布性能达标。
+- Coordinator 在本进程确认 Redis 状态提交后，把 revision 和受影响的 Environment／节点字段写入有界内存变更流。发布任务以 10 ms 有界窗口合并相近提交，普通生命周期提交只读取发生变化的字段；首次启动、revision 断档、变更流溢出或无字段的控制头更新才重新读取完整 Redis 视图。节点心跳仅在地址、Relay 地址或可路由状态变化时重算该节点已有条目。每 200 ms 的周期任务只恢复已经标记为不可用的发布视图；健康视图不轮询 revision，也不支持绕过 Coordinator 直接修改控制 Hash。Ingress 先校验并转换完整增量帧，再只更新帧内 upsert/delete 对应的路由和订阅通知；未触碰路由不再复制，复杂度为 `O((U+D) log N)`。首次订阅及断档恢复的 reset 仍构造并一次替换完整缓存。
 - API Server 的节点目录同时携带 Node Manager 与 Relay 地址。本地优先创建成功且返回归属仍在入口节点时，API Server 直接用受信节点结果写入本机 Environment 目录，随后由版本流覆盖和推进；不再为每个成功创建强制调用 `GetEnvironment`。本地入口转交中心调度、目录尚无对应结果或结果不明时，才执行一次权威查询。
 
 ## 本机同步与重启

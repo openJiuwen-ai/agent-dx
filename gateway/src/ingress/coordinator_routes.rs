@@ -46,11 +46,7 @@ impl RouteConsumer {
             return Err("invalid full route frame".into());
         }
         let mut ids = BTreeSet::new();
-        let mut next = if f.reset {
-            BTreeMap::new()
-        } else {
-            self.routes.clone()
-        };
+        let mut upserts = Vec::with_capacity(f.upserts.len());
         for r in f.upserts {
             if r.environment_id.is_empty()
                 || r.tenant_id.is_empty()
@@ -74,61 +70,81 @@ impl RouteConsumer {
                     return Err("route execution version regressed".into());
                 }
             }
-            next.insert(r.environment_id.clone(), r);
+            let route = route_info(&r)?;
+            upserts.push((r, route));
         }
-        for id in f.deleted {
+        let deleted = f.deleted;
+        for id in &deleted {
             if id.is_empty() || !ids.insert(id.clone()) {
                 return Err("conflicting route delta".into());
             }
-            next.remove(&id);
         }
-        if self.cursor == Some((f.epoch, f.revision)) && next != self.routes {
-            return Err("conflicting route snapshot at the same cursor".into());
-        }
-        let cache = RouteCache::default();
-        for r in next.values() {
-            let tunnel_security_mode = security_mode(r.tunnel_security_mode)?;
-            let port_forward_security_mode = security_mode(r.port_forward_security_mode)?;
-            let auth_mode = match port_forward_security_mode {
-                DataPlaneSecurityMode::TlsToken => DataPlaneAuthMode::Token,
-                DataPlaneSecurityMode::Inherit | DataPlaneSecurityMode::Tls => {
-                    DataPlaneAuthMode::None
+        if f.reset {
+            let mut next = BTreeMap::new();
+            let cache = RouteCache::default();
+            for (published, route) in upserts {
+                next.insert(published.environment_id.clone(), published);
+                cache.put(route);
+            }
+            if self.cursor == Some((f.epoch, f.revision)) {
+                if next != self.routes {
+                    return Err("conflicting route snapshot at the same cursor".into());
                 }
-            };
-            cache.put(RouteInfo {
-                instance_id: r.environment_id.clone(),
-                tenant_id: r.tenant_id.clone(),
-                sandbox_id: r.runtime_id.clone(),
-                sandbox_ip: r.runtime_ip.clone(),
-                relay_address: r.relay_address.clone(),
-                environment_status: EnvironmentStatus {
-                    code: 3,
-                    ..Default::default()
-                },
-                tunnel_security_mode,
-                port_forward_security_mode,
-                port_forward_routes: r
-                    .forwarded_ports
-                    .iter()
-                    .map(|port| {
-                        Ok(PortForwardRoute {
-                            target_port: u16::try_from(*port)
-                                .ok()
-                                .filter(|port| *port > 0)
-                                .ok_or("invalid forwarded port")?,
-                            auth_mode,
-                        })
-                    })
-                    .collect::<Result<_, &str>>()?,
-            });
+            } else {
+                self.store.replace(cache);
+                self.routes = next;
+            }
+        } else {
+            for (published, route) in upserts {
+                self.routes
+                    .insert(published.environment_id.clone(), published);
+                self.store.put(route);
+            }
+            for id in deleted {
+                self.routes.remove(&id);
+                self.store.delete(&id);
+            }
         }
-        self.store.replace(cache);
         self.store
             .record_watch_revision(f.revision.min(i64::MAX as u64) as i64);
         self.cursor = Some((f.epoch, f.revision));
-        self.routes = next;
         Ok(())
     }
+}
+
+fn route_info(r: &pb::PublishedRoute) -> Result<RouteInfo, String> {
+    let tunnel_security_mode = security_mode(r.tunnel_security_mode)?;
+    let port_forward_security_mode = security_mode(r.port_forward_security_mode)?;
+    let auth_mode = match port_forward_security_mode {
+        DataPlaneSecurityMode::TlsToken => DataPlaneAuthMode::Token,
+        DataPlaneSecurityMode::Inherit | DataPlaneSecurityMode::Tls => DataPlaneAuthMode::None,
+    };
+    Ok(RouteInfo {
+        instance_id: r.environment_id.clone(),
+        tenant_id: r.tenant_id.clone(),
+        sandbox_id: r.runtime_id.clone(),
+        sandbox_ip: r.runtime_ip.clone(),
+        relay_address: r.relay_address.clone(),
+        environment_status: EnvironmentStatus {
+            code: 3,
+            ..Default::default()
+        },
+        tunnel_security_mode,
+        port_forward_security_mode,
+        port_forward_routes: r
+            .forwarded_ports
+            .iter()
+            .map(|port| {
+                Ok(PortForwardRoute {
+                    target_port: u16::try_from(*port)
+                        .ok()
+                        .filter(|port| *port > 0)
+                        .ok_or("invalid forwarded port")?,
+                    auth_mode,
+                })
+            })
+            .collect::<Result<_, &str>>()?,
+    })
 }
 fn security_mode(value: i32) -> Result<DataPlaneSecurityMode, String> {
     match pb::DataPlaneSecurityMode::try_from(value) {
@@ -142,6 +158,63 @@ fn security_mode(value: i32) -> Result<DataPlaneSecurityMode, String> {
         Err(_) => Err("invalid data-plane security mode".into()),
     }
 }
+
+#[cfg(test)]
+mod route_consumer_tests {
+    use super::*;
+
+    fn published_route(id: &str, revision: u64) -> pb::PublishedRoute {
+        pb::PublishedRoute {
+            environment_id: id.into(),
+            tenant_id: "tenant".into(),
+            runtime_id: format!("{id}-1"),
+            runtime_ip: "10.0.0.2".into(),
+            relay_address: "127.0.0.1:9000".into(),
+            generation: 1,
+            environment_revision: revision,
+            tunnel_security_mode: pb::DataPlaneSecurityMode::DataPlaneSecurityTlsToken as i32,
+            port_forward_security_mode: pb::DataPlaneSecurityMode::DataPlaneSecurityTlsToken as i32,
+            forwarded_ports: vec![8080],
+        }
+    }
+
+    #[test]
+    fn delta_does_not_clone_untouched_routes() {
+        let store = Arc::new(RouteStore::new());
+        let mut consumer = RouteConsumer::new(store);
+        let routes = (0..10_000)
+            .map(|index| published_route(&format!("environment-{index:05}"), 1))
+            .collect();
+        consumer
+            .apply(pb::RouteFrame {
+                epoch: 1,
+                revision: 10,
+                reset: true,
+                upserts: routes,
+                ..Default::default()
+            })
+            .unwrap();
+        let untouched = consumer.routes["environment-09999"].relay_address.as_ptr();
+
+        consumer
+            .apply(pb::RouteFrame {
+                epoch: 1,
+                base_revision: 10,
+                revision: 11,
+                upserts: vec![published_route("environment-00000", 2)],
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert_eq!(consumer.routes.len(), 10_000);
+        assert_eq!(
+            consumer.routes["environment-09999"].relay_address.as_ptr(),
+            untouched,
+            "an incremental route frame must not clone untouched entries"
+        );
+    }
+}
+
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ControlConfig {

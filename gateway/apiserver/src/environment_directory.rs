@@ -1,6 +1,14 @@
 use adx_protocol::control as pb;
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroUsize;
+use std::ops::Bound::{Excluded, Unbounded};
 use tonic::Status;
+
+#[derive(Debug)]
+pub(crate) struct EnvironmentPage {
+    pub entries: Vec<pb::GetEnvironmentResponse>,
+    pub next_after: Option<String>,
+}
 
 #[derive(Default)]
 pub(crate) struct EnvironmentDirectory {
@@ -69,13 +77,42 @@ impl EnvironmentDirectory {
         }
     }
 
-    pub fn list(&self) -> Result<Vec<pb::GetEnvironmentResponse>, Status> {
+    pub fn page<F>(
+        &self,
+        after: Option<&str>,
+        limit: NonZeroUsize,
+        mut visible: F,
+    ) -> Result<EnvironmentPage, Status>
+    where
+        F: FnMut(&pb::GetEnvironmentResponse) -> Result<bool, Status>,
+    {
         if self.epoch.is_none() {
             return Err(Status::unavailable(
                 "environment directory not synchronized",
             ));
         }
-        Ok(self.entries.values().cloned().collect())
+        let mut entries = Vec::with_capacity(limit.get());
+        let mut last_id = None;
+        let lower = after
+            .map(|after| Excluded(after.to_owned()))
+            .unwrap_or(Unbounded);
+        for (id, value) in self.entries.range((lower, Unbounded)) {
+            if !visible(value)? {
+                continue;
+            }
+            if entries.len() == limit.get() {
+                return Ok(EnvironmentPage {
+                    entries,
+                    next_after: last_id,
+                });
+            }
+            entries.push(value.clone());
+            last_id = Some(id.clone());
+        }
+        Ok(EnvironmentPage {
+            entries,
+            next_after: None,
+        })
     }
 
     pub fn put(&mut self, value: pb::GetEnvironmentResponse) -> Result<(), Status> {
@@ -406,10 +443,13 @@ mod tests {
     }
 
     #[test]
-    fn synchronized_list_uses_the_current_directory_only() {
+    fn synchronized_pages_are_bounded_and_stably_ordered() {
         let mut directory = EnvironmentDirectory::default();
         assert_eq!(
-            directory.list().unwrap_err().code(),
+            directory
+                .page(None, NonZeroUsize::new(1).unwrap(), |_| Ok(true))
+                .unwrap_err()
+                .code(),
             tonic::Code::Unavailable
         );
         directory
@@ -422,8 +462,11 @@ mod tests {
                 vec![],
             ))
             .unwrap();
-        let listed = directory.list().unwrap();
-        let ids: Vec<_> = listed
+        let first = directory
+            .page(None, NonZeroUsize::new(1).unwrap(), |_| Ok(true))
+            .unwrap();
+        let ids: Vec<_> = first
+            .entries
             .iter()
             .map(|value| {
                 value
@@ -437,15 +480,73 @@ mod tests {
                     .as_str()
             })
             .collect();
-        assert_eq!(ids, ["one", "two"]);
+        assert_eq!(ids, ["one"]);
+        assert_eq!(first.next_after.as_deref(), Some("one"));
+        let second = directory
+            .page(
+                first.next_after.as_deref(),
+                NonZeroUsize::new(1).unwrap(),
+                |_| Ok(true),
+            )
+            .unwrap();
+        assert_eq!(second.entries.len(), 1);
+        assert_eq!(second.next_after, None);
+        assert_eq!(
+            second.entries[0]
+                .record
+                .as_ref()
+                .unwrap()
+                .spec
+                .as_ref()
+                .unwrap()
+                .id,
+            "two"
+        );
         directory
             .update(frame(7, 11, 10, false, vec![], vec!["one"]))
             .unwrap();
-        assert_eq!(directory.list().unwrap().len(), 1);
+        assert_eq!(
+            directory
+                .page(Some("one"), NonZeroUsize::new(1).unwrap(), |_| Ok(true))
+                .unwrap()
+                .entries
+                .len(),
+            1
+        );
         directory.clear();
         assert_eq!(
-            directory.list().unwrap_err().code(),
+            directory
+                .page(None, NonZeroUsize::new(1).unwrap(), |_| Ok(true))
+                .unwrap_err()
+                .code(),
             tonic::Code::Unavailable
         );
+    }
+
+    #[test]
+    fn page_skips_invisible_entries_without_exceeding_the_clone_budget() {
+        let mut directory = EnvironmentDirectory::default();
+        directory
+            .update(frame(
+                7,
+                10,
+                0,
+                true,
+                (0..10_000)
+                    .map(|index| entry(&format!("environment-{index:05}"), 1, 1))
+                    .collect(),
+                vec![],
+            ))
+            .unwrap();
+
+        let page = directory
+            .page(None, NonZeroUsize::new(100).unwrap(), |value| {
+                let id = &value.record.as_ref().unwrap().spec.as_ref().unwrap().id;
+                Ok(id.ends_with('0'))
+            })
+            .unwrap();
+
+        assert_eq!(page.entries.len(), 100);
+        assert_eq!(page.next_after.as_deref(), Some("environment-00990"));
     }
 }

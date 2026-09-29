@@ -17,6 +17,8 @@ adxlet → CoordinatorStateSink → Redis 条件提交
 
 API Server 通过 `EnvironmentDirectoryService.WatchEnvironments` 维护完整的内存实例目录，条目包含 EnvironmentRecord、节点地址和 Relay 地址。每次连接先接收全量 reset，随后按 Coordinator epoch 与 revision 接收增量 upsert/delete；revision 断档或非法 epoch 增量会清空目录并重新全量同步。普通传输断开期间保留最近完整目录并后台重连，节点继续检查租户与完整 generation。`GetEnvironment` 只用于创建后的读后写收敛，以及结果不明时针对原 Assignment 的恢复查询。
 
+`GET /api/instances` 是有界分页查询：`pageSize` 默认 100、最大 1000，返回 `items` 与 `nextPageToken`；后续页原样传回 `pageToken`。游标按 Environment ID 字典序继续并绑定当前租户／管理员身份，不能跨身份复用；目录并发变化时不提供快照隔离，已删除的游标条目不影响继续扫描。API Server 在目录锁内只复制当前页和一个用于判断后续页的可见条目，不再复制完整目录。带 `instance_id` 的单项查询保持原有数组响应，供现有 SDK 恢复实例句柄。
+
 实现与本地验收证据见 [实例目录订阅验收](2026-09-18-environment-directory.md)。
 
 目录未完成首次同步时，API Server 不接受依赖实例归属的请求。已同步目录中的缺失项是确定的 NotFound，不触发逐项 Redis 查询。实例目录与 Ingress 路由缓存分开：前者包含仍可查询或操作的活跃归属，Coordinator 通过目录 delete 增量移除已删除项；后者只发布可路由的 Running 实例。Redis 主目录也会在删除提交时移除完整记录，仅保留带 TTL 的最小删除回执。重复操作的存储幂等由 Coordinator 与 adxlet 状态机负责，API Server 不长期缓存已删除记录。

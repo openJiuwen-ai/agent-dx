@@ -8,7 +8,10 @@ use crate::{
 use adx_observability::trace;
 use adx_protocol::control as pb;
 use adx_transport::request::RequestContext;
-use base64::{engine::general_purpose::STANDARD, Engine};
+use base64::{
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    Engine,
+};
 use bytes::Bytes;
 use futures_util::TryStreamExt;
 use http_body_util::{combinators::UnsyncBoxBody, BodyExt, Full, StreamBody};
@@ -16,10 +19,12 @@ use hyper::{
     body::{Frame, Incoming},
     Request, Response, StatusCode,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
     convert::Infallible,
+    num::NonZeroUsize,
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -27,6 +32,8 @@ use tokio::sync::mpsc;
 use tonic::{Code, Status};
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
+const DEFAULT_INSTANCE_PAGE_SIZE: usize = 100;
+const MAX_INSTANCE_PAGE_SIZE: usize = 1000;
 pub type Body = UnsyncBoxBody<Bytes, Error>;
 pub struct Api {
     pub clients: Arc<Clients>,
@@ -248,10 +255,27 @@ impl Api {
                     }
                 };
             }
-            return match self.clients.visible_environments(&caller).await {
-                Ok(owners) => {
+            let page_size = match instance_page_size(&query) {
+                Ok(page_size) => page_size,
+                Err(error) => {
+                    return error_response(error, &request_id, None, None, false);
+                }
+            };
+            let after =
+                match instance_page_after(query.get("pageToken").map(String::as_str), &caller) {
+                    Ok(after) => after,
+                    Err(error) => {
+                        return error_response(error, &request_id, None, None, false);
+                    }
+                };
+            return match self
+                .clients
+                .visible_environments(&caller, after.as_deref(), page_size)
+                .await
+            {
+                Ok(page) => {
                     let mut views = Vec::new();
-                    for owner in owners {
+                    for owner in page.entries {
                         match instance_view(owner) {
                             Ok(view) => views.push(view),
                             Err(error) if error.code() == Code::NotFound => (),
@@ -260,7 +284,16 @@ impl Api {
                             }
                         }
                     }
-                    plain(200, json!(views))
+                    let next_page_token = match page.next_after {
+                        Some(after) => match instance_page_token(&after, &caller) {
+                            Ok(token) => token,
+                            Err(error) => {
+                                return error_response(error, &request_id, None, None, false);
+                            }
+                        },
+                        None => String::new(),
+                    };
+                    plain(200, json!({"items":views,"nextPageToken":next_page_token}))
                 }
                 Err(error) => error_response(error, &request_id, None, None, false),
             };
@@ -740,6 +773,61 @@ fn page_size(query: &HashMap<String, String>) -> Result<u32, Status> {
         .transpose()
         .map(|size| size.unwrap_or(0))
 }
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct InstancePageCursor {
+    after: String,
+    tenant_id: String,
+    administrator: bool,
+}
+
+fn instance_page_size(query: &HashMap<String, String>) -> Result<NonZeroUsize, Status> {
+    let value = query
+        .get("pageSize")
+        .map(|value| value.parse::<usize>())
+        .transpose()
+        .map_err(|_| Status::invalid_argument("invalid instance page size"))?
+        .unwrap_or(DEFAULT_INSTANCE_PAGE_SIZE);
+    NonZeroUsize::new(value)
+        .filter(|size| size.get() <= MAX_INSTANCE_PAGE_SIZE)
+        .ok_or_else(|| Status::invalid_argument("invalid instance page size"))
+}
+
+fn instance_page_token(after: &str, caller: &pb::CallerContext) -> Result<String, Status> {
+    let cursor = InstancePageCursor {
+        after: after.to_owned(),
+        tenant_id: caller.tenant_id.clone(),
+        administrator: caller.administrator,
+    };
+    serde_json::to_vec(&cursor)
+        .map(|bytes| URL_SAFE_NO_PAD.encode(bytes))
+        .map_err(|_| Status::internal("instance page cursor serialization failed"))
+}
+
+fn instance_page_after(
+    token: Option<&str>,
+    caller: &pb::CallerContext,
+) -> Result<Option<String>, Status> {
+    let Some(token) = token else {
+        return Ok(None);
+    };
+    if token.is_empty() || token.len() > 8192 {
+        return Err(Status::invalid_argument("invalid instance page token"));
+    }
+    let bytes = URL_SAFE_NO_PAD
+        .decode(token)
+        .map_err(|_| Status::invalid_argument("invalid instance page token"))?;
+    let cursor: InstancePageCursor = serde_json::from_slice(&bytes)
+        .map_err(|_| Status::invalid_argument("invalid instance page token"))?;
+    if cursor.after.is_empty()
+        || cursor.tenant_id != caller.tenant_id
+        || cursor.administrator != caller.administrator
+    {
+        return Err(Status::invalid_argument("invalid instance page token"));
+    }
+    Ok(Some(cursor.after))
+}
 fn header<'a>(request: &'a Request<Incoming>, key: &str) -> Option<&'a str> {
     request.headers().get(key).and_then(|v| v.to_str().ok())
 }
@@ -1115,6 +1203,62 @@ mod error_contract_tests {
                 .to_bytes(),
         )
         .expect("JSON error body")
+    }
+
+    #[test]
+    fn instance_page_size_is_bounded_and_has_a_default() {
+        assert_eq!(
+            instance_page_size(&HashMap::new()).unwrap().get(),
+            DEFAULT_INSTANCE_PAGE_SIZE
+        );
+        assert_eq!(
+            instance_page_size(&HashMap::from([("pageSize".into(), "250".into())]))
+                .unwrap()
+                .get(),
+            250
+        );
+        for invalid in ["0", "1001", "invalid"] {
+            assert_eq!(
+                instance_page_size(&HashMap::from([("pageSize".into(), invalid.into())]))
+                    .unwrap_err()
+                    .code(),
+                Code::InvalidArgument
+            );
+        }
+    }
+
+    #[test]
+    fn instance_page_token_is_bound_to_the_authenticated_scope() {
+        let tenant = pb::CallerContext {
+            tenant_id: "tenant-a".into(),
+            ..Default::default()
+        };
+        let token = instance_page_token("environment-00100", &tenant).unwrap();
+        assert_eq!(
+            instance_page_after(Some(&token), &tenant)
+                .unwrap()
+                .as_deref(),
+            Some("environment-00100")
+        );
+        assert_eq!(
+            instance_page_after(
+                Some(&token),
+                &pb::CallerContext {
+                    tenant_id: "tenant-b".into(),
+                    ..Default::default()
+                }
+            )
+            .unwrap_err()
+            .code(),
+            Code::InvalidArgument
+        );
+        let invalid = "not-base64".to_owned();
+        assert_eq!(
+            instance_page_after(Some(&invalid), &tenant)
+                .unwrap_err()
+                .code(),
+            Code::InvalidArgument
+        );
     }
 
     #[test]
