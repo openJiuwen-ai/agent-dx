@@ -25,6 +25,7 @@ struct Server {
     ip: String,
     labels: Arc<Mutex<std::collections::HashMap<String, String>>>,
     transport_error: bool,
+    transport_error_after_start: bool,
     invalid_argument: bool,
     retain_after_delete: bool,
 }
@@ -42,6 +43,7 @@ impl Default for Server {
             ip: "10.0.0.2".into(),
             labels: Arc::default(),
             transport_error: false,
+            transport_error_after_start: false,
             invalid_argument: false,
             retain_after_delete: false,
         }
@@ -71,6 +73,9 @@ impl sandbox_service_server::SandboxService for Server {
             return Err(Status::unavailable("connection interrupted"));
         }
         *self.running.lock().unwrap() = true;
+        if self.transport_error_after_start {
+            return Err(Status::unavailable("response interrupted after start"));
+        }
         Ok(Response::new(StartResponse {
             id: "generated-backend-id".into(),
             sandbox_ip: self.ip.clone(),
@@ -481,7 +486,30 @@ async fn transport_failure_does_not_claim_cleanup_or_repeat_start() {
     assert!(adapter.start(&spec(), "i-1", 1, &[]).await.is_err());
     assert!(adapter.start(&spec(), "i-1", 1, &[]).await.is_err());
     assert!(adapter.remove("i-1").await.is_err());
-    assert_eq!(*server.requests.lock().unwrap(), vec!["start:"]);
+    assert_eq!(*server.requests.lock().unwrap(), vec!["start:", "list:"]);
+}
+
+#[tokio::test]
+async fn transport_failure_can_clean_an_execution_discovered_by_labels() {
+    let server = Server {
+        transport_error_after_start: true,
+        ..Default::default()
+    };
+    let (adapter, _server) = connect(server.clone()).await;
+    assert!(adapter.start(&spec(), "i-1", 1, &[]).await.is_err());
+
+    adapter.remove("i-1").await.unwrap();
+
+    assert_eq!(
+        *server.requests.lock().unwrap(),
+        vec![
+            "start:",
+            "list:",
+            "delete:generated-backend-id",
+            "list:generated-backend-id",
+        ]
+    );
+    assert!(!*server.running.lock().unwrap());
 }
 
 #[tokio::test]
