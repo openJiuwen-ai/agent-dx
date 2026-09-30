@@ -10,20 +10,25 @@ SDK → Rust API Server
   目录：Coordinator 首次全量 → revision 增量 upsert/delete → 本地实例目录
   创建：本地兼容字段转换 → Coordinator.CreateEnvironment → Shard → adxlet
   删除：本地实例目录 → adxlet.DeleteEnvironment
-                         ↑ 仅结果不明／读后写时 Coordinator.GetEnvironment
+                         ↑ 结果不明／读后写时 Coordinator.GetEnvironment
+  Reload：Coordinator.GetEnvironment 最新已提交记录 → adxlet.ReloadEnvironment
 adxlet → sandboxd / Execd HTTP / Relay UDS
 adxlet → CoordinatorStateSink → Redis 条件提交
 ```
 
-API Server 通过 `EnvironmentDirectoryService.WatchEnvironments` 维护完整的内存实例目录，条目包含 EnvironmentRecord、节点地址和 Relay 地址。每次连接先接收全量 reset，随后按 Coordinator epoch 与 revision 接收增量 upsert/delete；revision 断档或非法 epoch 增量会清空目录并重新全量同步。普通传输断开期间保留最近完整目录并后台重连，节点继续检查租户与完整 generation。`GetEnvironment` 只用于创建后的读后写收敛，以及结果不明时针对原 Assignment 的恢复查询。
+API Server 通过 `EnvironmentDirectoryService.WatchEnvironments` 维护完整的内存实例目录，条目包含 EnvironmentRecord、节点地址和 Relay 地址。每次连接先接收全量 reset，随后按 Coordinator epoch 与 revision 接收增量 upsert/delete；revision 断档或非法 epoch 增量会清空目录并重新全量同步。普通传输断开期间保留最近完整目录并后台重连，节点继续检查租户与完整 generation。`GetEnvironment` 用于创建后的读后写收敛、结果不明时针对原 Assignment 的恢复查询，以及 Reload 首次选取最新已提交 revision。后者避免工作负载 checkpoint 已完成、订阅缓存尚未更新时误报版本冲突；查询失败不会退回旧缓存执行，其他生命周期操作仍从本地目录读取归属。
 
 `GET /api/instances` 是有界分页查询：`pageSize` 默认 100、最大 1000，返回 `items` 与 `nextPageToken`；后续页原样传回 `pageToken`。游标按 Environment ID 字典序继续并绑定当前租户／管理员身份，不能跨身份复用；目录并发变化时不提供快照隔离，已删除的游标条目不影响继续扫描。API Server 在目录锁内只复制当前页和一个用于判断后续页的可见条目，不再复制完整目录。带 `instance_id` 的单项查询保持原有数组响应，供现有 SDK 恢复实例句柄。
 
 实现与本地验收证据见 [实例目录订阅验收](2026-09-18-environment-directory.md)。
 
-目录未完成首次同步时，API Server 不接受依赖实例归属的请求。已同步目录中的缺失项是确定的 NotFound，不触发逐项 Redis 查询。实例目录与 Ingress 路由缓存分开：前者包含仍可查询或操作的活跃归属，Coordinator 通过目录 delete 增量移除已删除项；后者只发布可路由的 Running 实例。Redis 主目录也会在删除提交时移除完整记录，仅保留带 TTL 的最小删除回执。重复操作的存储幂等由 Coordinator 与 adxlet 状态机负责，API Server 不长期缓存已删除记录。
+目录未完成首次同步时，依赖本地目录的请求返回暂不可用；Reload 独立查询 Coordinator。已同步目录中的缺失项是确定的 NotFound，不触发逐项 Redis 查询。实例目录与 Ingress 路由缓存分开：前者包含仍可查询或操作的活跃归属，Coordinator 通过目录 delete 增量移除已删除项；后者只发布可路由的 Running 实例。Redis 主目录也会在删除提交时移除完整记录，仅保留带 TTL 的最小删除回执。重复操作的存储幂等由 Coordinator 与 adxlet 状态机负责，API Server 不长期缓存已删除记录。
 
 正在等待确认的删除固定其目标，不因刷新或缓存淘汰更换目标；待确认操作达到上限时拒绝新的删除。已完成操作由节点的状态机与持久化结果处理重复调用。这些待确认记录仅在 API Server 内存中，不提供 API Server 重启后找回未确认操作的承诺。
+
+### Reload 缓存落后回归
+
+`gateway/apiserver/tests/reload.rs` 使用真实 TCP/gRPC 和可控 Coordinator／Node 服务，刻意不发布目录增量，让缓存 revision 为 2、已提交 revision 为 3。用例验证 Reload 获取最新版本后执行，同一操作 ID 再次调用保留原 expected revision；Coordinator 查询不可用时不向节点执行 Reload，普通删除仍使用本地归属。运行入口为 `cargo test --locked -p adx-apiserver --test reload`。这组用例验证 API Server 的 RPC 协作契约，不代替真实 sandboxd checkpoint／恢复端到端验收。
 
 ## HTTP 兼容与支持范围
 

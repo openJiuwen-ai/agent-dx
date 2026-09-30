@@ -80,7 +80,9 @@ impl Operations {
             return Err(Status::invalid_argument("snapshot name cannot be blank"));
         }
         let clients = &self.clients;
-        let mut owner = clients.owner(id, caller, false).await?;
+        // Workload checkpoint acknowledges publication before the directory watch
+        // necessarily catches up. Reload must start from the committed revision.
+        let mut owner = clients.owner(id, caller, kind == Kind::Reload).await?;
         let record = owner
             .record
             .as_ref()

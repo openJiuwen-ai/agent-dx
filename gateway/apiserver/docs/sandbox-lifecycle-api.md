@@ -202,3 +202,12 @@ retires and deletes the current backend, restores the same logical Environment a
 a fresh execution, completes EXECD readiness and local route binding, then
 publishes Running. A missing or expired checkpoint fails the operation; reload
 never falls back to a cold start.
+
+Before selecting the expected revision for reload, API Server queries
+`Coordinator.GetEnvironment` for the latest committed record. This covers a
+workload checkpoint that has acknowledged publication while its directory watch
+update is still pending. If that lookup fails, reload fails without starting an
+execution from the cached record. Existing assignment, generation and operation
+ID checks still apply; other lifecycle operations continue to use the local
+directory. This read does not lock the revision against subsequent concurrent
+operations, which may still produce a conflict.
