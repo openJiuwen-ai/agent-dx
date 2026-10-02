@@ -1175,6 +1175,10 @@ class TunnelClient:
                             elif frame_type == "ws_close":
                                 code = channel_frame.get("code", 1000)
                                 reason = channel_frame.get("reason", "")
+                                # 1005 represents an empty close frame; RFC 6455
+                                # forbids transmitting it as a wire status code.
+                                if code == 1005 and not reason:
+                                    code = None
                                 await upstream_ws.close(code=code, reason=reason)
                                 return
 

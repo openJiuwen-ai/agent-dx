@@ -267,7 +267,13 @@ impl Sandboxd {
                             | Code::Unimplemented
                             | Code::PermissionDenied
                             | Code::Unauthenticated
-                    ) {
+                    ) || error
+                        .metadata()
+                        .get("sandboxd-start-settled")
+                        .is_some_and(|value| value == "true")
+                    {
+                        // sandboxd sends this trailer only after Start and its rollback return.
+                        // Missing trailers (including transport loss) remain uncertain.
                         *state = StartState::Settled;
                     }
                     return Err(unavailable(error));
