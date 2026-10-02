@@ -27,6 +27,8 @@ struct Server {
     transport_error: bool,
     transport_error_after_start: bool,
     invalid_argument: bool,
+    settled_error: Option<tonic::Code>,
+    settled_error_after_start: bool,
     retain_after_delete: bool,
 }
 impl Default for Server {
@@ -45,6 +47,8 @@ impl Default for Server {
             transport_error: false,
             transport_error_after_start: false,
             invalid_argument: false,
+            settled_error: None,
+            settled_error_after_start: false,
             retain_after_delete: false,
         }
     }
@@ -71,6 +75,14 @@ impl sandbox_service_server::SandboxService for Server {
         }
         if self.transport_error {
             return Err(Status::unavailable("connection interrupted"));
+        }
+        if let Some(code) = self.settled_error {
+            *self.running.lock().unwrap() = self.settled_error_after_start;
+            let mut status = Status::new(code, "start failed and rollback completed");
+            status
+                .metadata_mut()
+                .insert("sandboxd-start-settled", "true".parse().unwrap());
+            return Err(status);
         }
         *self.running.lock().unwrap() = true;
         if self.transport_error_after_start {
@@ -474,6 +486,32 @@ async fn cleanup_waits_for_start_after_caller_cancellation() {
             "list:generated-backend-id"
         ]
     );
+}
+
+#[tokio::test]
+async fn settled_start_errors_release_resources_after_confirmed_cleanup() {
+    for code in [tonic::Code::Unknown, tonic::Code::Internal] {
+        for remains in [false, true] {
+            let server = Server {
+                settled_error: Some(code),
+                settled_error_after_start: remains,
+                ..Default::default()
+            };
+            let (adapter, _server) = connect(server.clone()).await;
+            assert!(adapter.start(&spec(), "i-1", 1, &[]).await.is_err());
+            adapter.remove("i-1").await.unwrap();
+            assert!(!*server.running.lock().unwrap());
+            assert_eq!(server.starts.lock().unwrap().len(), 1);
+            if remains {
+                assert!(server
+                    .requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|x| x == "delete:generated-backend-id"));
+            }
+        }
+    }
 }
 
 #[tokio::test]

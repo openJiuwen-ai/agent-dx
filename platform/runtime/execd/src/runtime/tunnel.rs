@@ -42,7 +42,9 @@ use tokio::sync::{
 };
 use tokio::task::AbortHandle;
 use tokio_stream::wrappers::ReceiverStream;
-use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
+use tokio_tungstenite::tungstenite::protocol::{
+    frame::coding::CloseCode, CloseFrame, Message, WebSocketConfig,
+};
 
 const DEFAULT_HTTP_TIMEOUT: Duration = Duration::from_secs(600);
 const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -3368,11 +3370,25 @@ async fn handle_port_b_ws(stream: TcpStream, state: Arc<State>) -> Result<(), St
                         });
                     }
                 }
-                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => {
+                Some(Ok(Message::Close(close))) => {
+                    let (code, reason) = close.map_or((1005, String::new()), |close| {
+                        (u16::from(close.code), close.reason.into_owned())
+                    });
                     let _ = state.send_to_generation(generation, &Frame::WsClose {
-                        id: id.clone(),
-                        code: 1000,
-                        reason: String::new(),
+                        id: id.clone(), code, reason,
+                    });
+                    let _ = sink.flush().await;
+                    break;
+                }
+                Some(Err(error)) => {
+                    let _ = state.send_to_generation(generation, &Frame::Error {
+                        id: id.clone(), message: format!("WebSocket transport error: {error}"),
+                    });
+                    break;
+                }
+                None => {
+                    let _ = state.send_to_generation(generation, &Frame::Error {
+                        id: id.clone(), message: "WebSocket ended without a close frame".into(),
                     });
                     break;
                 }
@@ -3414,10 +3430,21 @@ async fn handle_port_b_ws(stream: TcpStream, state: Arc<State>) -> Result<(), St
                         break;
                     }
                 }
-                Some(WsTunnelMessage::Control(Frame::WsClose { .. }))
-                | Some(WsTunnelMessage::Control(Frame::Error { .. }))
-                | None => {
-                    let _ = sink.send(Message::Close(None)).await;
+                Some(WsTunnelMessage::Control(Frame::WsClose { code, reason, .. })) => {
+                    let close = if code == 1005 && reason.is_empty() {
+                        None
+                    } else if CloseCode::from(code).is_allowed() && reason.len() <= 123 {
+                        Some(CloseFrame { code: code.into(), reason: reason.into() })
+                    } else {
+                        Some(CloseFrame { code: CloseCode::Error, reason: "invalid tunnel close metadata".into() })
+                    };
+                    let _ = sink.send(Message::Close(close)).await;
+                    break;
+                }
+                Some(WsTunnelMessage::Control(Frame::Error { .. })) | None => {
+                    let _ = sink.send(Message::Close(Some(CloseFrame {
+                        code: CloseCode::Error, reason: "tunnel channel failed".into(),
+                    }))).await;
                     break;
                 }
                 _ => {}
@@ -4849,6 +4876,71 @@ mod tests {
             other => panic!("expected echo, got {other:?}"),
         }
         task.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn websocket_close_preserves_code_and_reason_in_both_directions() {
+        use tokio_tungstenite::tungstenite::protocol::{frame::coding::CloseCode, CloseFrame};
+        for from_browser in [true, false] {
+            let (ws_port, http_port) = spawn_test_server().await;
+            let mut client = connect_client(ws_port).await;
+            let task = tokio::spawn(async move {
+                let id = match next_frame(&mut client).await {
+                    Frame::WsConnect { id, .. } => id,
+                    other => panic!("expected connect, got {other:?}"),
+                };
+                client
+                    .send(Frame::WsConnected { id: id.clone() }.to_msg())
+                    .await
+                    .unwrap();
+                if from_browser {
+                    match next_frame(&mut client).await {
+                        Frame::WsClose { code, reason, .. } => {
+                            assert_eq!(code, 1008);
+                            assert_eq!(reason, "policy violation");
+                        }
+                        other => panic!("expected close, got {other:?}"),
+                    }
+                } else {
+                    client
+                        .send(
+                            Frame::WsClose {
+                                id,
+                                code: 1008,
+                                reason: "policy violation".into(),
+                            }
+                            .to_msg(),
+                        )
+                        .await
+                        .unwrap();
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            });
+            let (mut browser, _) = connect_async(format!("ws://127.0.0.1:{http_port}/close"))
+                .await
+                .unwrap();
+            if from_browser {
+                browser
+                    .close(Some(CloseFrame {
+                        code: CloseCode::Policy,
+                        reason: "policy violation".into(),
+                    }))
+                    .await
+                    .unwrap();
+            } else {
+                match tokio::time::timeout(Duration::from_secs(2), browser.next())
+                    .await
+                    .unwrap()
+                {
+                    Some(Ok(Message::Close(Some(close)))) => {
+                        assert_eq!(u16::from(close.code), 1008);
+                        assert_eq!(close.reason, "policy violation");
+                    }
+                    other => panic!("expected close metadata, got {other:?}"),
+                }
+            }
+            task.await.unwrap();
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

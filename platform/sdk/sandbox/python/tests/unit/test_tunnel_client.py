@@ -34,6 +34,27 @@ class _OuterTunnel:
 
 
 class TunnelClientWebSocketTests(unittest.IsolatedAsyncioTestCase):
+    async def test_empty_close_frame_remains_empty(self):
+        received = asyncio.Future()
+
+        async def peer(ws):
+            await ws.wait_closed()
+            received.set_result((ws.close_code, ws.close_reason))
+
+        async with websockets.serve(peer, "127.0.0.1", 0) as server:
+            port = server.sockets[0].getsockname()[1]
+            outer = _OuterTunnel()
+            proxy = asyncio.create_task(TunnelClient(f"http://127.0.0.1:{port}")._proxy_loop(outer))
+            try:
+                await outer.feed({"type": "ws_connect", "id": "empty", "path": "/", "headers": {}})
+                while (await asyncio.wait_for(outer.outgoing.get(), 2)).get("type") != "ws_connected":
+                    pass
+                await outer.feed({"type": "ws_close", "id": "empty", "code": 1005, "reason": ""})
+                self.assertEqual(await asyncio.wait_for(received, 2), (1005, ""))
+            finally:
+                await outer.finish()
+                await asyncio.wait_for(proxy, 2)
+
     async def test_reverse_websocket_text_binary_and_close_round_trip(self):
         seen = {}
 
