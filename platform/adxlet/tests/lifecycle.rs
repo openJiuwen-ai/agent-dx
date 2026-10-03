@@ -15,6 +15,7 @@ struct Dependencies {
     start_entered: Semaphore,
     start_release: Semaphore,
     block_start: bool,
+    actual: std::sync::atomic::AtomicBool,
 }
 
 impl Dependencies {
@@ -27,6 +28,7 @@ impl Dependencies {
             start_entered: Semaphore::new(0),
             start_release: Semaphore::new(0),
             block_start,
+            actual: std::sync::atomic::AtomicBool::new(false),
         })
     }
     fn event(&self, name: &str) -> Result<()> {
@@ -46,7 +48,7 @@ impl Dependencies {
 #[async_trait]
 impl RuntimeDriver for Dependencies {
     async fn is_running(&self, _: &str) -> Result<bool> {
-        Ok(true)
+        Ok(self.actual.load(std::sync::atomic::Ordering::SeqCst))
     }
     async fn start(
         &self,
@@ -60,10 +62,14 @@ impl RuntimeDriver for Dependencies {
         if self.block_start {
             self.start_release.acquire().await.unwrap().forget();
         }
+        self.actual.store(true, std::sync::atomic::Ordering::SeqCst);
         Ok("10.0.0.2".parse().unwrap())
     }
     async fn remove(&self, _runtime_id: &str) -> Result<()> {
-        self.event("remove")
+        self.event("remove")?;
+        self.actual
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
     }
     async fn set_network_policy(
         &self,
@@ -262,6 +268,32 @@ async fn failed_runtime_cleanup_keeps_reservation_and_can_be_retried() {
     assert!(environment.sync().await.unwrap().record.resources_held);
     *deps.fail_at.lock().unwrap() = None;
     environment.delete().await.unwrap();
+    assert_eq!(node.used(), Resources::default());
+}
+
+#[tokio::test]
+async fn failed_create_cleans_late_runtime_after_reservation_was_released() {
+    let deps = Dependencies::new(false);
+    let node = node(&deps);
+    let environment = node.environment(spec("a"), assignment("a")).unwrap();
+    *deps.fail_at.lock().unwrap() = Some("start".into());
+    assert!(environment.create().await.is_err());
+    assert_eq!(node.used(), Resources::default());
+    assert_eq!(
+        environment.sync().await.unwrap().record.state,
+        EnvironmentState::Failed
+    );
+    *deps.fail_at.lock().unwrap() = None;
+    deps.actual.store(true, std::sync::atomic::Ordering::SeqCst);
+    deps.events.lock().unwrap().clear();
+    environment.tick().await.unwrap();
+    assert!(!deps.actual.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(*deps.events.lock().unwrap(), ["retire", "remove"]);
+    assert_eq!(
+        environment.sync().await.unwrap().record.state,
+        EnvironmentState::Failed
+    );
+    assert!(environment.create().await.is_err());
     assert_eq!(node.used(), Resources::default());
 }
 

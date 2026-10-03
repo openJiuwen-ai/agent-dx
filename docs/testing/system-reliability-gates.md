@@ -40,6 +40,8 @@
 
 ## adxlet 与节点故障
 
+Start 失败专项：RPC 失败、超时、应答丢失及无效成功载荷均判创建 Failed；清理失败保留预留并重试。2026-10-03 本地组件契约通过：真实 gRPC/UDS 配合模拟 sandboxd，验证迟到成功应答不会变成 Running、不激活路由、不重复 Start；资源已释放后迟到后端仍被生命周期巡检删除。该结果不替代实际 sandboxd 的断流端到端验收，见 [PR78 回归](pr78-runtime-regressions.md)。
+
 | 门禁 | 场景 | 通过条件 | 当前状态 |
 |---|---|---|---|
 | NM-01 | 心跳期限内进程重启 | 新 session 完成权威对账并保留有效 backend；对账完成前不准入 | 已有本地 E2E；[Full #55](https://buildkite.com/agent-dx/agent-dx-full-test/builds/55) 在双物理 worker 上同时重启 Coordinator 与 node2 Adxlet，记录 node2 PID 110→202、session 更换、Coordinator epoch 1→2，原归属及 backend 不变，公开 SDK 查询、命令、文件和清理通过；`sqlite-node-restart` 在 [cn-north-4 定向部署](2026-09-25-cn-north-4-targeted-reliability.md) 通过，覆盖 Coordinator 暂停、SQLite 待同步删除期间重启 Adxlet；对账期间新准入仍需独立注入 |

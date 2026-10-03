@@ -1,8 +1,8 @@
 //! Local gRPC/UDS contract tests against the pinned protocol, not sandboxd E2E.
-use adx_core::{EnvironmentSpec, Resources};
+use adx_core::{Assignment, EnvironmentRecord, EnvironmentSpec, EnvironmentState, Resources};
 use adxlet::{
     sandboxd::{connect_when_ready, proto::*, start_request, Config, Sandboxd},
-    RuntimeDriver,
+    Adxlet, Durability, Readiness, Routes, RuntimeDriver, StateSink,
 };
 use std::{
     sync::{Arc, Mutex},
@@ -523,7 +523,7 @@ async fn settled_start_errors_release_resources_after_confirmed_cleanup() {
 }
 
 #[tokio::test]
-async fn transport_failure_does_not_claim_cleanup_or_repeat_start() {
+async fn failed_start_releases_absent_backend_without_repeating_start() {
     let server = Server {
         transport_error: true,
         ..Default::default()
@@ -531,8 +531,176 @@ async fn transport_failure_does_not_claim_cleanup_or_repeat_start() {
     let (adapter, _server) = connect(server.clone()).await;
     assert!(adapter.start(&spec(), "i-1", 1, &[]).await.is_err());
     assert!(adapter.start(&spec(), "i-1", 1, &[]).await.is_err());
-    assert!(adapter.remove("i-1").await.is_err());
-    assert_eq!(*server.requests.lock().unwrap(), vec!["start:", "list:"]);
+    adapter.remove("i-1").await.unwrap();
+    assert!(adapter.start(&spec(), "i-1", 1, &[]).await.is_err());
+    assert_eq!(
+        *server.requests.lock().unwrap(),
+        vec!["start:", "list:", "list:"]
+    );
+}
+
+#[tokio::test]
+async fn late_backend_of_failed_start_is_deleted_not_adopted() {
+    let server = Server {
+        transport_error: true,
+        ..Default::default()
+    };
+    let (adapter, _server) = connect(server.clone()).await;
+    assert!(adapter.start(&spec(), "i-1", 1, &[]).await.is_err());
+    adapter.remove("i-1").await.unwrap();
+    *server.running.lock().unwrap() = true;
+    // Reconciliation discovers the original execution after its failed create
+    // released capacity. It cleans that backend rather than repeating Start.
+    adapter.remove("i-1").await.unwrap();
+    assert!(!*server.running.lock().unwrap());
+    assert!(adapter.start(&spec(), "i-1", 1, &[]).await.is_err());
+    assert_eq!(server.starts.lock().unwrap().len(), 1);
+    assert!(server
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|s| s == "delete:generated-backend-id"));
+}
+
+#[derive(Default)]
+struct LifecycleHooks {
+    records: Mutex<Vec<EnvironmentRecord>>,
+    activations: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl Readiness for LifecycleHooks {
+    async fn wait_ready(&self, _: &EnvironmentRecord) -> adx_core::Result<()> {
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl Routes for LifecycleHooks {
+    async fn activate(&self, _: &EnvironmentRecord) -> adx_core::Result<()> {
+        self.activations
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn retire(&self, _: &EnvironmentRecord) -> adx_core::Result<()> {
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl StateSink for LifecycleHooks {
+    async fn commit(&self, record: &EnvironmentRecord) -> adx_core::Result<Durability> {
+        self.records.lock().unwrap().push(record.clone());
+        Ok(Durability::Published)
+    }
+}
+
+fn lifecycle_node(adapter: Sandboxd, hooks: &Arc<LifecycleHooks>) -> Adxlet {
+    let node = Adxlet::new(
+        "n".into(),
+        Arc::new(adapter),
+        hooks.clone(),
+        hooks.clone(),
+        hooks.clone(),
+    );
+    node.update_capacity(spec().resources, Duration::from_secs(30))
+        .unwrap();
+    node
+}
+
+fn lifecycle_assignment() -> Assignment {
+    Assignment {
+        environment_id: "i".into(),
+        node_id: "n".into(),
+        shard_id: 0,
+        generation: 1,
+        devices: vec![],
+    }
+}
+
+#[tokio::test]
+async fn failed_create_monitor_removes_late_backend_after_capacity_release() {
+    let server = Server {
+        transport_error: true,
+        ..Default::default()
+    };
+    let (adapter, _server) = connect(server.clone()).await;
+    let hooks = Arc::new(LifecycleHooks::default());
+    let node = lifecycle_node(adapter, &hooks);
+    let environment = node.environment(spec(), lifecycle_assignment()).unwrap();
+    assert!(environment.create().await.is_err());
+    assert_eq!(node.used(), Resources::default());
+    assert_eq!(
+        environment.sync().await.unwrap().record.state,
+        EnvironmentState::Failed
+    );
+    *server.running.lock().unwrap() = true;
+    node.monitor_environments().await.unwrap();
+    assert!(!*server.running.lock().unwrap());
+    assert_eq!(node.used(), Resources::default());
+    assert!(environment.create().await.is_err());
+    assert_eq!(server.starts.lock().unwrap().len(), 1);
+    assert_eq!(
+        hooks.activations.load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    assert!(hooks
+        .records
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|r| r.state != EnvironmentState::Running));
+}
+
+#[tokio::test]
+async fn start_timeout_remains_failed_when_success_response_arrives_late() {
+    let server = Server {
+        release: Arc::new(Semaphore::new(0)),
+        ..Default::default()
+    };
+    let (adapter, _server) = connect(server.clone()).await;
+    let hooks = Arc::new(LifecycleHooks::default());
+    let node = lifecycle_node(adapter, &hooks)
+        .with_operation_timeout(Duration::from_millis(100))
+        .unwrap();
+    let environment = node.environment(spec(), lifecycle_assignment()).unwrap();
+    let create = {
+        let environment = environment.clone();
+        tokio::spawn(async move { environment.create().await })
+    };
+    server.entered.acquire().await.unwrap().forget();
+    assert!(tokio::time::timeout(Duration::from_secs(1), create)
+        .await
+        .unwrap()
+        .unwrap()
+        .is_err());
+    let failed = environment.sync().await.unwrap().record;
+    assert_eq!(failed.state, EnvironmentState::Failed);
+    assert!(failed.resources_held);
+    server.release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(1), node.monitor_environments())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!*server.running.lock().unwrap());
+    let failed = environment.sync().await.unwrap().record;
+    assert_eq!(failed.state, EnvironmentState::Failed);
+    assert!(!failed.resources_held);
+    assert_eq!(node.used(), Resources::default());
+    assert!(environment.create().await.is_err());
+    assert_eq!(server.starts.lock().unwrap().len(), 1);
+    assert_eq!(
+        hooks.activations.load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    assert!(hooks
+        .records
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|r| r.state != EnvironmentState::Running));
 }
 
 #[tokio::test]
@@ -638,22 +806,26 @@ async fn rejected_start_can_be_cleaned_without_uncertain_outcome() {
 }
 
 #[tokio::test]
-async fn status_code_alone_does_not_confirm_start_settlement() {
+async fn every_start_error_is_failed_and_absence_allows_cleanup() {
     for code in [
         tonic::Code::InvalidArgument,
         tonic::Code::Unimplemented,
         tonic::Code::PermissionDenied,
         tonic::Code::Unauthenticated,
     ] {
-        // Runtime adapters can return these statuses after partial execution.
-        // An empty inventory and an error category do not prove quiescence.
+        // Every failed create is terminal for this execution identity.
+        // A backend arriving later is handled by reconciliation.
         let (adapter, _server) = connect(Server {
             unsettled_error: Some(code),
             ..Default::default()
         })
         .await;
         assert!(adapter.start(&spec(), "i-1", 1, &[]).await.is_err());
-        assert!(adapter.remove("i-1").await.is_err(), "status {code:?}");
+        adapter.remove("i-1").await.unwrap();
+        assert!(
+            adapter.start(&spec(), "i-1", 1, &[]).await.is_err(),
+            "status {code:?}"
+        );
     }
 }
 

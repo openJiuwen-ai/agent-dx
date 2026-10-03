@@ -1,5 +1,6 @@
 //! sandboxd PR #56 adapter. The RPC task outlives a canceled caller so cleanup
-//! cannot race a still-running Start. Ambiguous transport failures retain capacity.
+//! cannot race its client task. Failed starts are terminal; reconciliation removes
+//! any backend that arrives after the failed create released its reservation.
 use crate::RuntimeDriver;
 use adx_core::{EnvironmentSpec, Error, Result};
 use async_trait::async_trait;
@@ -46,6 +47,8 @@ enum StartState {
     Idle,
     Started(IpAddr),
     Settled,
+    Failed,
+    // Checkpoint may still be executing after its transport failed.
     Uncertain,
 }
 type Cell = Arc<tokio::sync::Mutex<StartState>>;
@@ -250,32 +253,21 @@ impl Sandboxd {
         if let StartState::Started(ip) = *state {
             return Ok(ip);
         }
+        if matches!(*state, StartState::Failed) {
+            return Err(Error::Conflict);
+        }
         if matches!(*state, StartState::Uncertain) {
             return Err(unavailable("start outcome requires reconciliation"));
         }
-        *state = StartState::Uncertain;
+        *state = StartState::Failed;
         let mut client = self.client.clone();
         let backend_ids = self.backend_ids.clone();
         let logical_id = runtime_id.to_string();
         tokio::spawn(async move {
             let response = match client.start(request).await {
                 Ok(response) => response.into_inner(),
-                Err(error) => {
-                    if error
-                        .metadata()
-                        .get("sandboxd-start-settled")
-                        .is_some_and(|value| value == "true")
-                    {
-                        // Error categories alone do not prove that the runtime was never invoked.
-                        // sandboxd supplies an explicit proof for rejected, settled starts.
-                        // Missing trailers (including transport loss) remain uncertain.
-                        *state = StartState::Settled;
-                    }
-                    return Err(unavailable(error));
-                }
+                Err(error) => return Err(unavailable(error)),
             };
-            // A completed response settles Start, even when its payload reports failure.
-            *state = StartState::Settled;
             if !response.id.is_empty() {
                 backend_ids
                     .lock()
@@ -286,7 +278,6 @@ impl Sandboxd {
                 return Err(unavailable(response.message));
             }
             if response.id.is_empty() {
-                *state = StartState::Uncertain;
                 return Err(unavailable("Start returned no backend identity"));
             }
             let ip: IpAddr = response
@@ -938,6 +929,7 @@ impl RuntimeDriver for Sandboxd {
 
     async fn remove(&self, runtime_id: &str) -> Result<()> {
         let mut state = self.cell(runtime_id).lock_owned().await;
+        let failed_start = matches!(*state, StartState::Failed);
         if matches!(*state, StartState::Uncertain) {
             if self.list_id(runtime_id).await?.is_empty() {
                 return Err(unavailable(
@@ -973,7 +965,13 @@ impl RuntimeDriver for Sandboxd {
             .lock()
             .expect("shared state lock poisoned")
             .remove(runtime_id);
-        *state = StartState::Idle;
+        // A failed create cannot become successful through a retry of the same
+        // execution. Keep its identity terminal so a later backend is cleanup-only.
+        *state = if failed_start {
+            StartState::Failed
+        } else {
+            StartState::Idle
+        };
         Ok(())
     }
 }
@@ -994,6 +992,9 @@ impl Sandboxd {
         let mut state = self.cell(runtime_id).lock_owned().await;
         if matches!(*state, StartState::Uncertain) {
             return Err(unavailable("execution outcome requires reconciliation"));
+        }
+        if matches!(*state, StartState::Failed) {
+            return Err(Error::Conflict);
         }
         let id = self.physical_id(runtime_id).await?.ok_or(Error::NotFound)?;
         let mut request = Request::new(proto::CheckpointRequest {

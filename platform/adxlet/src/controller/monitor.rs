@@ -108,10 +108,16 @@ impl Controller {
                 self.cleanup().await?;
                 self.start_attempt(true, false, None).await?;
             }
-        } else if self.record.state == EnvironmentState::Failed && self.record.resources_held {
+        } else if self.record.state == EnvironmentState::Failed {
+            let held = self.record.resources_held;
+            // A timed-out or failed Start can register its backend after an empty
+            // inventory allowed capacity release. Failed executions are never adopted.
             self.cleanup().await?;
-            self.record.revision = self.record.revision.checked_add(1).ok_or(Error::Conflict)?;
-            self.sync().await?;
+            if held {
+                self.record.revision =
+                    self.record.revision.checked_add(1).ok_or(Error::Conflict)?;
+                self.sync().await?;
+            }
         }
         Ok(())
     }

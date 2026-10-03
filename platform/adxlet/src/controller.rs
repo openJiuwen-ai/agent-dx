@@ -599,8 +599,8 @@ impl Controller {
         let (runtime_start_ms, runtime_ready_ms, route_activate_ms) = match attempt {
             Ok(stages) => stages,
             Err(start_error) => {
-                let cleanup = self.cleanup().await;
                 self.transition(Event::Fail)?;
+                let cleanup = self.cleanup().await;
                 self.record.restart_pending = restart
                     && !restore_checkpoint
                     && self

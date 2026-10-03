@@ -10,6 +10,7 @@ adxlet 拥有实例串行状态机。Coordinator 提供归属校验、Redis 持�
 - RuntimeDriver 确认执行退出后，节点先退役路由、确认旧执行清理，再标记 Failed。启用重启时，按照指数退避和累计重试上限重新申请本机资源，并分配新的执行 ID，Environment ID 与归属代次保持。
 - `restart_attempts` 和 `restart_pending` 随实例结果写入 Redis／降级日志。进程重启不重置次数。显式删除取消重启。清理未确认时保留资源，禁止启动替代执行。
 - 可配置 `execd_health_failure_threshold`；省略时不以健康探测失败触发重启。连续失败达到阈值后，仍须先确认旧执行清理。健康检查只覆盖 Execd。
+- 初次 Start 失败、超时或应答丢失均判定创建 Failed；不会触发运行中退出的自动重启策略。失败执行先清理，确认后端不存在才释放资源；Failed 控制器继续清理迟到执行，不转成 Running。节点重启按权威目录对账。
 
 ## 资源与指标
 
