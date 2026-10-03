@@ -122,7 +122,8 @@ pub trait RuntimeDriver: Send + Sync {
         ))
     }
     /// Correlate the supplied platform execution identity with a backend-generated
-    /// ID. Do not start a second runtime while a previous Start is uncertain.
+    /// ID. A failed Start is terminal for this execution; a late backend must be
+    /// cleaned by reconciliation, not adopted as a successful create.
     async fn start(
         &self,
         spec: &EnvironmentSpec,

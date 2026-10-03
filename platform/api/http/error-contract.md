@@ -65,6 +65,12 @@ SSE 创建的 `final` 事件保留 `errorCode` 数值字段，并携带同一个
 
 同一个 gRPC 状态可能映射成不同稳定码。例如 `Unavailable` 在写请求尚未提交时是 `UNAVAILABLE`，在 Adxlet 已经接受创建或生命周期操作后是 `OUTCOME_UNKNOWN`。API Server 根据请求是否越过执行边界作出映射；SDK 不重新猜测。
 
+### sandboxd Start 失败
+
+adxlet 未获得有效 Start 成功结果（失败、超时、应答丢失或无效载荷）时，将 Environment 创建判定为 `Failed`，不会重复启动同一执行，也不会把迟到后端接纳为成功实例。清理查询或删除失败时保留本机资源并重试；确认不存在后释放资源，Failed 控制器仍清理迟到执行。节点重启按权威目录对账。
+
+这与公开创建 HTTP 应答丢失的 `OUTCOME_UNKNOWN` 分开：客户端不知道服务端结果时，仍须查询或以相同身份重试。查得 Failed 后不能据此再次启动原执行；相同 Environment 的 create 会报状态冲突。checkpoint 的未知结果保护不受该 Start 契约影响。
+
 ## SDK 契约
 
 Python SDK 对结构化错误抛出 `SandboxHTTPError`，并公开 `status_code`、`code`、`retry`、`outcome`、`request_id`、`operation_id` 和 `instance_id`。自动重试只能发生在 `same_operation` 或 `after_backoff`，且复用原身份；`never` 立即返回调用方。旧服务没有 `error` 对象时，SDK 保留原有 HTTP 状态兼容路径，但无法给出稳定码。
