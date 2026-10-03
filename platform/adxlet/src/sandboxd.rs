@@ -261,18 +261,13 @@ impl Sandboxd {
             let response = match client.start(request).await {
                 Ok(response) => response.into_inner(),
                 Err(error) => {
-                    if matches!(
-                        error.code(),
-                        Code::InvalidArgument
-                            | Code::Unimplemented
-                            | Code::PermissionDenied
-                            | Code::Unauthenticated
-                    ) || error
+                    if error
                         .metadata()
                         .get("sandboxd-start-settled")
                         .is_some_and(|value| value == "true")
                     {
-                        // sandboxd sends this trailer only after Start and its rollback return.
+                        // Error categories alone do not prove that the runtime was never invoked.
+                        // sandboxd supplies an explicit proof for rejected, settled starts.
                         // Missing trailers (including transport loss) remain uncertain.
                         *state = StartState::Settled;
                     }

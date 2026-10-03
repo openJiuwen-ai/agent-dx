@@ -31,6 +31,8 @@
 
 暂停：节点完成 checkpoint、确认旧执行删除、保存制品，再经 Coordinator 提交 Paused 和恢复点。对象存储成功要求上传完成。恢复：公开 resume 直达所属节点重新准入和恢复，完成 Execd/绑定后提交 Running；共享 checkpoint 的故障跨节点恢复由 Coordinator 协调新归属。删除先退役本机绑定、确认后端删除，再释放资源和提交结果。
 
+Start RPC 失败时，ADX 仅凭明确的 `sandboxd-start-settled: true` 标记将该调用记为已确定失败；错误码（包括 `InvalidArgument`、`Unimplemented` 和认证错误）本身不构成未执行的证明。没有标记且查询不到后端时保持结果未知和资源预留，不重复 Start。通过执行标签发现后端后仍须删除并确认消失，才能释放资源。当前 sandboxd pin 不提供完整的 Start 操作结果查询或取消隔离契约，因此“未知结果最终无须节点重启即可收敛”仍未完成；这与调用任务取消后继续等待 Start 的现有保护分开。
+
 `StateSink` 返回 Published 表示 Coordinator 已提交 Redis；Journaled 表示结果只进入 SQLite 降级日志。后者不发布集群路由，API Server 不返回集群生命周期成功。Coordinator 恢复后去重补写；adxlet 重启而 Coordinator 不可用时只观察，等待权威对账。详见 [节点生命周期](node-lifecycle.md)、[暂停恢复](environment-checkpoint.md) 和 [存储](snapshot-storage.md)。
 
 节点心跳超时后，Coordinator 持久化失效、撤销路由并协调有效共享 checkpoint 的恢复。local-only、缺失或过期 checkpoint 直接失败。原节点返回先清理失效执行，再开放准入。心跳失效是控制面判定，不是物理进程已停止的证据；当前没有跨宿主网络分区的强隔离验收，见 [失效契约](node-failure-takeover.md)。
