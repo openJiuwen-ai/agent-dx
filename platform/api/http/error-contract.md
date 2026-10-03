@@ -67,7 +67,7 @@ SSE 创建的 `final` 事件保留 `errorCode` 数值字段，并携带同一个
 
 ### sandboxd Start 失败
 
-adxlet 未获得有效 Start 成功结果（失败、超时、应答丢失或无效载荷）时，将 Environment 创建判定为 `Failed`，不会重复启动同一执行，也不会把迟到后端接纳为成功实例。清理查询或删除失败时保留本机资源并重试；确认不存在后释放资源，Failed 控制器仍清理迟到执行。节点重启按权威目录对账。
+adxlet 未获得有效 Start 成功结果（失败、超时、应答丢失或无效载荷）时，将 Environment 创建判定为 `Failed`，不会重复启动同一执行，也不会把迟到后端接纳为成功实例。创建进入 Failed 即释放本机标量资源和 GPU/NPU 预留，并在清理之前提交 `resources_held=false`；查询、删除失败或清理超时不阻止资源释放。Failed 控制器独立重试清理迟到执行及补写未发布结果。节点重启按权威目录对账。
 
 这与公开创建 HTTP 应答丢失的 `OUTCOME_UNKNOWN` 分开：客户端不知道服务端结果时，仍须查询或以相同身份重试。查得 Failed 后不能据此再次启动原执行；相同 Environment 的 create 会报状态冲突。checkpoint 的未知结果保护不受该 Start 契约影响。
 

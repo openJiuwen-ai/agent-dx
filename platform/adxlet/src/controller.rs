@@ -600,7 +600,7 @@ impl Controller {
             Ok(stages) => stages,
             Err(start_error) => {
                 self.transition(Event::Fail)?;
-                let cleanup = self.cleanup().await;
+                self.release_capacity()?;
                 self.record.restart_pending = restart
                     && !restore_checkpoint
                     && self
@@ -612,6 +612,7 @@ impl Controller {
                         .is_some_and(|p| self.record.restart_attempts < p.max_attempts);
                 self.restart_after = None;
                 let commit = self.sync().await;
+                let cleanup = self.cleanup().await;
                 return match (cleanup, commit) {
                     (Ok(()), Ok(_)) => Err(start_error),
                     (cleanup, commit) => Err(Error::Unavailable(format!(
@@ -648,6 +649,19 @@ impl Controller {
         result
     }
 
+    fn release_capacity(&mut self) -> Result<()> {
+        if self.held {
+            self.services
+                .admission
+                .lock()
+                .expect("shared state lock poisoned")
+                .release(&self.record.runtime.id)?;
+            self.held = false;
+            self.record.resources_held = false;
+        }
+        Ok(())
+    }
+
     async fn cleanup(&mut self) -> Result<()> {
         timeout(self.services.operation_timeout, async {
             self.services.routes.retire(&self.record).await?;
@@ -660,16 +674,7 @@ impl Controller {
         .map_err(|_| Error::Unavailable("environment cleanup timed out".into()))??;
         self.recovery_files = None;
         self.services.metrics.remove(&self.record.spec.id);
-        if self.held {
-            self.services
-                .admission
-                .lock()
-                .expect("shared state lock poisoned")
-                .release(&self.record.runtime.id)?;
-            self.held = false;
-            self.record.resources_held = false;
-        }
-        Ok(())
+        self.release_capacity()
     }
 
     async fn delete(&mut self) -> Result<OperationResult> {

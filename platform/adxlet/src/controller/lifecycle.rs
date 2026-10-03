@@ -128,18 +128,6 @@ impl Controller {
             kind,
         });
     }
-    fn release_capacity(&mut self) -> Result<()> {
-        if self.held {
-            self.services
-                .admission
-                .lock()
-                .expect("shared state lock poisoned")
-                .release(&self.record.runtime.id)?;
-            self.held = false;
-            self.record.resources_held = false;
-        }
-        Ok(())
-    }
     pub(super) async fn pause(&mut self, request: PauseRequest) -> Result<OperationResult> {
         if self.replay_operation(
             &request.operation_id,

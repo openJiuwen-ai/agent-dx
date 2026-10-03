@@ -678,7 +678,8 @@ async fn start_timeout_remains_failed_when_success_response_arrives_late() {
         .is_err());
     let failed = environment.sync().await.unwrap().record;
     assert_eq!(failed.state, EnvironmentState::Failed);
-    assert!(failed.resources_held);
+    assert!(!failed.resources_held);
+    assert_eq!(node.used(), Resources::default());
     server.release.add_permits(1);
     tokio::time::timeout(Duration::from_secs(1), node.monitor_environments())
         .await
