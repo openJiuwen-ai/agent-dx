@@ -27,6 +27,7 @@ struct Server {
     transport_error: bool,
     transport_error_after_start: bool,
     invalid_argument: bool,
+    unsettled_error: Option<tonic::Code>,
     settled_error: Option<tonic::Code>,
     settled_error_after_start: bool,
     retain_after_delete: bool,
@@ -47,6 +48,7 @@ impl Default for Server {
             transport_error: false,
             transport_error_after_start: false,
             invalid_argument: false,
+            unsettled_error: None,
             settled_error: None,
             settled_error_after_start: false,
             retain_after_delete: false,
@@ -72,6 +74,12 @@ impl sandbox_service_server::SandboxService for Server {
         self.release.acquire().await.unwrap().forget();
         if self.invalid_argument {
             return Err(Status::invalid_argument("invalid start request"));
+        }
+        if let Some(code) = self.unsettled_error {
+            return Err(Status::new(
+                code,
+                "runtime start failed without settlement proof",
+            ));
         }
         if self.transport_error {
             return Err(Status::unavailable("connection interrupted"));
@@ -621,12 +629,32 @@ async fn concrete_gpu_and_npu_cards_reach_the_pinned_backend_protocol() {
 #[tokio::test]
 async fn rejected_start_can_be_cleaned_without_uncertain_outcome() {
     let (adapter, _server) = connect(Server {
-        invalid_argument: true,
+        settled_error: Some(tonic::Code::InvalidArgument),
         ..Default::default()
     })
     .await;
     assert!(adapter.start(&spec(), "i-1", 1, &[]).await.is_err());
     adapter.remove("i-1").await.unwrap();
+}
+
+#[tokio::test]
+async fn status_code_alone_does_not_confirm_start_settlement() {
+    for code in [
+        tonic::Code::InvalidArgument,
+        tonic::Code::Unimplemented,
+        tonic::Code::PermissionDenied,
+        tonic::Code::Unauthenticated,
+    ] {
+        // Runtime adapters can return these statuses after partial execution.
+        // An empty inventory and an error category do not prove quiescence.
+        let (adapter, _server) = connect(Server {
+            unsettled_error: Some(code),
+            ..Default::default()
+        })
+        .await;
+        assert!(adapter.start(&spec(), "i-1", 1, &[]).await.is_err());
+        assert!(adapter.remove("i-1").await.is_err(), "status {code:?}");
+    }
 }
 
 #[tokio::test]
