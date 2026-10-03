@@ -10,7 +10,9 @@ impl Controller {
     }
 
     async fn tick_inner(&mut self) -> Result<()> {
-        if self.durability == Some(crate::Durability::Journaled) {
+        let failed_cleanup =
+            self.record.state == EnvironmentState::Failed && !self.record.restart_pending;
+        if self.durability == Some(crate::Durability::Journaled) && !failed_cleanup {
             self.sync().await?;
         }
         if self.record.state == EnvironmentState::Running {
@@ -110,14 +112,18 @@ impl Controller {
             }
         } else if self.record.state == EnvironmentState::Failed {
             let held = self.record.resources_held;
-            // A timed-out or failed Start can register its backend after an empty
-            // inventory allowed capacity release. Failed executions are never adopted.
-            self.cleanup().await?;
-            if held {
+            // Failed creates release capacity independently of backend cleanup.
+            // Retrying cleanup must not delay publication of that released ledger.
+            let cleanup = self.cleanup().await;
+            let released = held && !self.record.resources_held;
+            if released {
                 self.record.revision =
                     self.record.revision.checked_add(1).ok_or(Error::Conflict)?;
+            }
+            if released || self.durability != Some(crate::Durability::Published) {
                 self.sync().await?;
             }
+            cleanup?;
         }
         Ok(())
     }

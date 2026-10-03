@@ -16,6 +16,7 @@ struct Dependencies {
     start_release: Semaphore,
     block_start: bool,
     actual: std::sync::atomic::AtomicBool,
+    fail_cleanup: std::sync::atomic::AtomicBool,
 }
 
 impl Dependencies {
@@ -29,6 +30,7 @@ impl Dependencies {
             start_release: Semaphore::new(0),
             block_start,
             actual: std::sync::atomic::AtomicBool::new(false),
+            fail_cleanup: std::sync::atomic::AtomicBool::new(false),
         })
     }
     fn event(&self, name: &str) -> Result<()> {
@@ -37,7 +39,9 @@ impl Dependencies {
             .lock()
             .unwrap()
             .push((name.into(), adx_observability::trace::traceparent()));
-        if self.fail_at.lock().unwrap().as_deref() == Some(name) {
+        if self.fail_at.lock().unwrap().as_deref() == Some(name)
+            || (name == "remove" && self.fail_cleanup.load(std::sync::atomic::Ordering::SeqCst))
+        {
             Err(Error::Unavailable(name.into()))
         } else {
             Ok(())
@@ -251,7 +255,7 @@ async fn failed_readiness_is_cleaned_before_resources_are_reused() {
     assert!(environment.create().await.is_err());
     assert_eq!(
         *deps.events.lock().unwrap(),
-        ["start", "ready", "retire", "remove", "commit:Failed"]
+        ["start", "ready", "commit:Failed", "retire", "remove"]
     );
     assert_eq!(node.used(), Resources::default());
 }
@@ -298,6 +302,114 @@ async fn failed_create_cleans_late_runtime_after_reservation_was_released() {
 }
 
 #[tokio::test]
+async fn failed_create_releases_reservation_even_when_cleanup_and_commit_fail() {
+    let deps = Dependencies::new(true);
+    let node = node(&deps)
+        .with_operation_timeout(Duration::from_millis(10))
+        .unwrap();
+    let environment = node.environment(spec("a"), assignment("a")).unwrap();
+    *deps.fail_at.lock().unwrap() = Some("commit:Failed".into());
+    deps.fail_cleanup
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(environment.create().await.is_err());
+    assert_eq!(node.used(), Resources::default());
+    // Publishing the released reservation is retried even if backend cleanup
+    // continues failing. Neither failure may reclaim another reservation.
+    *deps.fail_at.lock().unwrap() = None;
+    deps.events.lock().unwrap().clear();
+    assert!(node.monitor_environments().await.is_err());
+    assert!(deps
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|e| e == "commit:Failed"));
+    let failed = environment.sync().await.unwrap().record;
+    assert_eq!(failed.state, EnvironmentState::Failed);
+    assert!(!failed.resources_held);
+    assert_eq!(node.used(), Resources::default());
+}
+
+#[tokio::test]
+async fn failed_create_releases_scalar_and_devices_before_cleanup_succeeds() {
+    use adx_core::scheduling::*;
+    for kind in [DeviceKind::Gpu, DeviceKind::Npu] {
+        let deps = Dependencies::new(false);
+        let node = node(&deps);
+        node.update_devices(
+            vec![Device {
+                id: 0,
+                kind,
+                model: "x".into(),
+                healthy: true,
+            }],
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        let mut first_spec = spec("a");
+        first_spec.scheduling.devices = vec![DeviceRequest {
+            kind,
+            model: None,
+            count: 1,
+        }];
+        let mut assigned = assignment("a");
+        assigned.devices = vec![DeviceAllocation {
+            id: 0,
+            kind,
+            model: "x".into(),
+        }];
+        let first = node
+            .environment(first_spec.clone(), assigned.clone())
+            .unwrap();
+        *deps.fail_at.lock().unwrap() = Some("ready".into());
+        deps.fail_cleanup
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(first.create().await.is_err());
+        let failed = first.sync().await.unwrap().record;
+        assert_eq!(failed.state, EnvironmentState::Failed);
+        assert!(!failed.resources_held);
+        assert_eq!(node.used(), Resources::default());
+        // The same scalar capacity and physical card are available to another
+        // Environment; repeated cleanup of the failed one must not release them.
+        *deps.fail_at.lock().unwrap() = None;
+        first_spec.id = "b".into();
+        assigned.environment_id = "b".into();
+        let second = node.environment(first_spec, assigned).unwrap();
+        second.create().await.unwrap();
+        assert!(first.tick().await.is_err());
+        assert_eq!(node.used(), resources());
+        deps.fail_cleanup
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        first.tick().await.unwrap();
+        assert_eq!(node.used(), resources());
+        assert!(second.sync().await.unwrap().record.resources_held);
+    }
+}
+
+#[tokio::test]
+async fn failed_create_cleanup_retries_while_journal_publication_is_unavailable() {
+    let deps = Dependencies::new(false);
+    let node = node(&deps);
+    let environment = node.environment(spec("a"), assignment("a")).unwrap();
+    *deps.durability.lock().unwrap() = Durability::Journaled;
+    *deps.fail_at.lock().unwrap() = Some("ready".into());
+    deps.fail_cleanup
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(environment.create().await.is_err());
+    assert_eq!(node.used(), Resources::default());
+    *deps.fail_at.lock().unwrap() = Some("commit:Failed".into());
+    deps.events.lock().unwrap().clear();
+    assert!(node.monitor_environments().await.is_err());
+    assert!(deps
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|event| event == "remove"));
+    assert_eq!(node.used(), Resources::default());
+}
+
+#[tokio::test]
 async fn node_without_any_valid_capacity_sample_rejects_new_environments() {
     let deps = Dependencies::new(false);
     let node = Adxlet::new(
@@ -313,7 +425,7 @@ async fn node_without_any_valid_capacity_sample_rejects_new_environments() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn timed_out_start_requires_confirmed_cleanup_before_releasing_capacity() {
+async fn timed_out_start_releases_capacity_before_cleanup() {
     let deps = Dependencies::new(true);
     let node = node(&deps)
         .with_operation_timeout(Duration::from_secs(2))
@@ -325,7 +437,7 @@ async fn timed_out_start_requires_confirmed_cleanup_before_releasing_capacity() 
     assert!(task.await.unwrap().is_err());
     assert_eq!(
         *deps.events.lock().unwrap(),
-        ["start", "retire", "remove", "commit:Failed"]
+        ["start", "commit:Failed", "retire", "remove"]
     );
     assert_eq!(node.used(), Resources::default());
 }
