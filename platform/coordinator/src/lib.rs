@@ -295,6 +295,14 @@ impl Coordinator {
         self.retired.insert(id.to_string());
         Ok(())
     }
+    /// Clear the retired scheduling marker after storage confirms explicit deletion.
+    pub(crate) fn forget_deleted(&mut self, id: &str) -> Result<()> {
+        if self.requests.contains_key(id) || self.snapshot.environments().contains_key(id) {
+            return Err(Error::Conflict);
+        }
+        self.retired.remove(id);
+        Ok(())
+    }
     pub fn local_candidate(
         &self,
         spec: &EnvironmentSpec,

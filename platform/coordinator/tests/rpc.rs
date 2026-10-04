@@ -1041,7 +1041,13 @@ async fn heartbeat_expiry_reconciliation_and_old_session_fencing() {
         .await
         .unwrap()
         .into_inner();
-    assert!(snapshot.records.is_empty());
+    assert_eq!(snapshot.records.len(), 1);
+    assert_eq!(
+        snapshot.records[0].state,
+        pb::EnvironmentState::Failed as i32
+    );
+    assert!(!snapshot.records[0].resources_held);
+    assert!(!snapshot.records[0].restart_pending);
     let backend = Arc::new(Backend {
         session: session.clone(),
         started: AtomicUsize::new(0),
@@ -1472,11 +1478,35 @@ async fn coordinator_restart_bounds_re_registration_grace() {
             let record: EnvironmentRecord = catalog.records[0].clone().try_into().unwrap();
             assert_eq!(record, running);
         } else {
-            assert!(catalog.records.is_empty(), "{mode}");
+            assert_eq!(catalog.records.len(), 1, "{mode}");
             let result = stored.result.as_ref().unwrap();
+            let returned: EnvironmentRecord = catalog.records[0].clone().try_into().unwrap();
+            assert_eq!(&returned, result);
             assert_eq!(result.state, EnvironmentState::Failed, "{mode}");
             assert!(!result.resources_held);
             assert!(result.runtime.ip.is_none());
+            assert!(
+                node.commit_environment(pb::CommitEnvironmentRequest {
+                    record: Some(running.try_into().unwrap()),
+                    node_session_id: "boot".into(),
+                })
+                .await
+                .is_err(),
+                "expired execution cannot return to Running"
+            );
+            let mut deleted = returned;
+            deleted.state = EnvironmentState::Deleted;
+            deleted.revision += 1;
+            node.commit_environment(pb::CommitEnvironmentRequest {
+                record: Some(deleted.try_into().unwrap()),
+                node_session_id: "boot".into(),
+            })
+            .await
+            .unwrap();
+            assert!(matches!(
+                session.get("held").await,
+                Err(adx_core::Error::NotFound)
+            ));
         }
     }
 }
