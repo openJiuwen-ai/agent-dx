@@ -43,7 +43,7 @@ Rust Socket 用例验证两个方向的 1008/code-reason 透传；Python SDK 的
 | S3 根对象空 prefix 忽略覆盖配置 | sandboxd 修复；空／非空 prefix 的 HEAD/Range 读取通过 | 真实 AWS S3／OSS 签名、ACL 和网络互操作 |
 | 旧 wait／rrt.sock 文档 | AKernel 当前源文档已同步 wait 契约和 execd.sock | 随正式制品校验部署文档与 pin |
 
-此外，Failed 控制任务与 Redis 记录没有自动保留期限；当前显式 DELETE 才删除主目录，最小删除回执保留十分钟。高并发创建尾延迟和历史短暂路由503仍需独立处理；测试部署私有SWR凭证接入及resources/queue入口404已修正并通过公开链路验收。GPU 实机、多节点亲和、整节点故障与共享 checkpoint 跨节点恢复、长期 soak 属于原报告未覆盖的验收边界，不列作已复现缺陷。
+此外，Failed 控制任务与 Redis 记录没有自动保留期限；当前显式 DELETE 才删除主目录，最小删除回执保留十分钟。创建尾延迟仍需独立优化；首请求缓存缺失503已通过本页第十九轮修复回归，长期及更高负载尚未验收。测试部署私有SWR凭证接入及resources/queue入口404已修正并通过公开链路验收。GPU 实机、多节点亲和、整节点故障与共享 checkpoint 跨节点恢复、长期 soak 属于原报告未覆盖的验收边界，不列作已复现缺陷。
 
 ## 2026-10-04–05 本地与测试集群补充
 
@@ -90,4 +90,10 @@ Environment 状态为 Pending、Starting、Running、Pausing、Paused、Resuming
 
 第十八轮在实际SERVING和节点准入后计划C1/C8/C32各三轮，共123次。只完成42条样本，SDK构造的只读process.list已出现路由缓存缺失503，随后一次请求三次重试均Broken pipe，驱动退出失败。首轮C1/C8/C32创建中位数分别约723/572/1151ms，最大为723/617/1347ms；它们包含SDK内部路由就绪检查及重试，不能当成纯Start或P99。42个完成样本的首次raw command通过，不能据此抹去SDK构造时的503或将123样本标成通过。
 
-本轮恢复后独立核查两节点backend为0、默认profile和原adxlet二进制恢复、supervisor重启预算为0，Redis保留测试前已有的1条Failed。证据为本地cluster-closure-018.log、attempt-018/cluster-evidence.tar和restore-final-audit.json。当前源码的stream-only resolver在增量到达前立即返回Unavailable；这一缓存到达窗口与观测的503吻合，新增到达契约测试已先失败。Broken pipe的具体根因仍需单独定位，不能由503归因替代。
+本轮恢复后独立核查两节点backend为0、默认profile和原adxlet二进制恢复、supervisor重启预算为0，Redis保留测试前已有的1条Failed。证据为本地cluster-closure-018.log、attempt-018/cluster-evidence.tar和restore-final-audit.json。修复前stream-only resolver在增量到达前立即返回Unavailable；这一缓存到达窗口与观测的503吻合，新增到达契约测试已先失败。Broken pipe的具体根因仍需单独定位，不能由503归因替代。
+
+Ingress 当前对缓存缺失最多等待50ms内对应订阅路由的到达，命中立即返回；先订阅再重读，避免漏过同时到达的增量，无关事件不延长截止时间。超过窗口仍返回Unavailable，不增加Coordinator点查或SDK重试。9项路由契约、48项Ingress单测和workspace严格Clippy通过；集群复测单独记录，组件测试不证明实际负载已经消除503。
+
+第十九轮加载包含该修复的合并API Server／Ingress二进制，实际执行文件SHA256为`aef160483ad73c0dadd448fbdcebfb3c955eaae11975360659cc7a671b8151f4`。C1/C8/C32各三轮123样本全部创建和首次raw HTTP command通过，日志缓存缺失503与Broken pipe均为0；首次命令16.5–97.4ms。创建中位数/最大分别为472/837ms、579/667ms、1037/1279ms，仍超过既定目标。第十八轮Broken pipe未再次出现，根因仍未独立定位；不能以本轮通过宣称其根因修复。此次实验不更新AKernel PR，不代表正式包或生产部署升级。证据为本地attempt-019/cluster-closure-019.log及cluster-evidence.tar。
+
+独立恢复审计确认两节点物理backend均为0，原adxlet SHA、默认rootfs/bootstrap和supervisor预算恢复；Redis仅有测试前已有1条Failed，活动两节点available/routable，未手动删除已有记录。恢复与最终审计日志分别为restore-audit-019.log、final-audit-019.log。
