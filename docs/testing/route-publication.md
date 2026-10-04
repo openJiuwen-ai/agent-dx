@@ -8,7 +8,7 @@
 |---|---|
 | `coordinator/src/routes.rs` | 从已提交的 Redis 状态构造路由，共享一个发布视图，提供 mTLS 全量／增量流 |
 | `gateway/src/ingress/coordinator_routes.rs` | Redis 发现 Coordinator，订阅并校验路由版本，原子更新内存缓存；API Key 短时校验缓存 |
-| `gateway/src/ingress/resolver.rs` | 新入口只读本地缓存；缺失时暂不可用，命中不查询 Coordinator／Redis |
+| `gateway/src/ingress/resolver.rs` | 新入口只读本地缓存；缺失时最多等待 50 ms 的订阅增量，命中不查询 Coordinator／Redis |
 | `gateway/src/node/route_control.rs` | 本机完整绑定同步、准入开关、控制会话及实例版本校验、旧连接退役 |
 | `adxlet/src/routes.rs` | UDS 同步客户端，本机绑定目录，代理进程重启后的全量重放 |
 | `adxlet/src/reconciliation.rs` | Coordinator 权威目录对账与完整本机绑定同步的顺序协调 |
@@ -31,6 +31,7 @@ Relay 重启 → 关闭准入 → adxlet 检测新 proxy_session_id
 - Ingress 精确校验增量基线；版本缺口、倒退、错误执行身份或同版本不同快照都拒绝整帧，重新订阅全量。坏帧不修改已有缓存。
 - Coordinator 共享 64 帧广播缓冲，每个订阅另有 8 帧发送队列。慢订阅丢失增量后返回错误，重连获取全量。
 - 已同步 Ingress 断连时继续使用内存缓存；缺失路由返回暂不可用。Ingress 重启没有磁盘缓存，等待全量后就绪。Relay 始终复核本机绑定，已退役实例不能因 Ingress 缓存滞后重新接入。
+- stream-only 入口缓存命中立即转发；缓存缺失时先订阅变更，再重读目录，最多等待 50 ms 内对应路由的到达，避免创建提交与订阅增量之间的首请求竞态。无关增量不会满足该请求或延长截止时间；超时仍返回暂不可用。等待不调用 Coordinator 点查或 Redis，不增加 SDK 重试，也不改变后端转发超时。
 - Ingress 定期重查 Redis 的 Coordinator 地址和 epoch，发现变化后重新连接。Redis 发现失败不主动清空已有缓存。
 - Coordinator 在本进程确认 Redis 状态提交后，把 revision 和受影响的 Environment／节点字段写入有界内存变更流。发布任务以 10 ms 有界窗口合并相近提交，普通生命周期提交只读取发生变化的字段；首次启动、revision 断档、变更流溢出或无字段的控制头更新才重新读取完整 Redis 视图。节点心跳仅在地址、Relay 地址或可路由状态变化时重算该节点已有条目。每 200 ms 的周期任务只恢复已经标记为不可用的发布视图；健康视图不轮询 revision，也不支持绕过 Coordinator 直接修改控制 Hash。Ingress 先校验并转换完整增量帧，再只更新帧内 upsert/delete 对应的路由和订阅通知；未触碰路由不再复制，复杂度为 `O((U+D) log N)`。首次订阅及断档恢复的 reset 仍构造并一次替换完整缓存。
 - API Server 的节点目录同时携带 Node Manager 与 Relay 地址。本地优先创建成功且返回归属仍在入口节点时，API Server 直接用受信节点结果写入本机 Environment 目录，随后由版本流覆盖和推进；不再为每个成功创建强制调用 `GetEnvironment`。本地入口转交中心调度、目录尚无对应结果或结果不明时，才执行一次权威查询。
@@ -118,3 +119,9 @@ Redis CAS 生效到进程内提交事件送达之间存在一个很短的窗口�
 同一节点 C100 创建在一次运行达到 P99 908.720 ms，但压力结束时 API Server 子进程触及 1 GiB cgroup 上限并由 supervisor 重启。集群 Redis 已积累约一万条历史 Environment；源码核对发现全量和增量发布都会把 `Deleted` 记录保留在 API Server 活跃归属目录。这既抬高稳定内存，也放大批量创建期间的目录复制和发布开销。
 
 当前发布与持久化使用同一个删除边界：删除提交原子移除 Redis 主目录完整记录，写入 10 分钟最小幂等回执，并发送 `EnvironmentDirectoryFrame.deleted`；Coordinator 启动时也会清理旧版本遗留的已删除记录。真实 Redis/mTLS 回归同时验证增量删除、重新订阅和新发布器全量恢复均不再携带该 ID，并继续要求创建和删除不触发健康视图的 `HGETALL`。修复后的 C1/C100/C128、API Server cgroup 峰值、子进程 PID 稳定性和残留清理仍须以新发布产物复测。
+
+## 2026-10-05 首请求订阅到达窗口
+
+路由契约先复现“创建已经提交，但匹配增量到达前首请求立即失败”。当前缓存缺失最多等待50ms内匹配路由，9项路由契约和48项Ingress单测通过；持续无关增量不延长截止时间，点查计数为0。
+
+在cn-north-4的`akernel-adx-test`临时加载包含该修复的合并API Server／Ingress二进制，实际`/proc/<pid>/exe` SHA256为`aef160483ad73c0dadd448fbdcebfb3c955eaae11975360659cc7a671b8151f4`。C1／C8／C32各三轮，共123次SDK创建后首次raw HTTP command全部200，驱动日志没有缓存缺失503或Broken pipe；首次命令耗时16.5–97.4ms。该样本验证此次首请求竞态，不能证明任意负载下永久没有503，仍不能替代创建性能P99验收。证据为本地`pr78-local-closure-20261004/attempt-019/cluster-closure-019.log`及`cluster-evidence.tar`。

@@ -244,3 +244,97 @@ fn resumed_execution_route_replaces_source_and_rejects_older_revision() {
         })
         .is_err());
 }
+
+#[tokio::test]
+async fn first_request_waits_for_the_matching_route_delta() {
+    use data_plane_gateway::ingress::{AccessKind, IngressRouteResolver};
+    let store = Arc::new(RouteStore::new());
+    let mut consumer = RouteConsumer::new(store.clone());
+    consumer
+        .apply(RouteFrame {
+            epoch: 1,
+            revision: 1,
+            reset: true,
+            ..Default::default()
+        })
+        .unwrap();
+    let resolver = IngressRouteResolver::new(store).stream_only();
+    let waiting = tokio::spawn(async move {
+        resolver
+            .resolve("new", 8080, AccessKind::Direct, "first")
+            .await
+    });
+    tokio::task::yield_now().await;
+    assert!(
+        !waiting.is_finished(),
+        "a committed create may precede delivery of its route delta"
+    );
+    consumer
+        .apply(RouteFrame {
+            epoch: 1,
+            base_revision: 1,
+            revision: 2,
+            upserts: vec![route("unrelated")],
+            ..Default::default()
+        })
+        .unwrap();
+    tokio::task::yield_now().await;
+    assert!(
+        !waiting.is_finished(),
+        "another environment must not satisfy this request"
+    );
+    consumer
+        .apply(RouteFrame {
+            epoch: 1,
+            base_revision: 2,
+            revision: 3,
+            upserts: vec![route("new")],
+            ..Default::default()
+        })
+        .unwrap();
+    let resolved = tokio::time::timeout(std::time::Duration::from_secs(1), waiting)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(resolved.target.instance_id, "new");
+}
+
+#[tokio::test]
+async fn unrelated_route_updates_do_not_extend_the_missing_route_deadline() {
+    use data_plane_gateway::ingress::{AccessKind, IngressRouteResolver, ResolveError};
+    let store = Arc::new(RouteStore::new());
+    let mut consumer = RouteConsumer::new(store.clone());
+    consumer
+        .apply(RouteFrame {
+            epoch: 1,
+            revision: 1,
+            reset: true,
+            ..Default::default()
+        })
+        .unwrap();
+    let resolver = IngressRouteResolver::new(store).stream_only();
+    let updating = tokio::spawn(async move {
+        for revision in 2..30 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            consumer
+                .apply(RouteFrame {
+                    epoch: 1,
+                    base_revision: revision - 1,
+                    revision,
+                    upserts: vec![route(&format!("unrelated-{revision}"))],
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+    });
+    let resolved = tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        resolver.resolve("missing", 8080, AccessKind::Direct, "bounded"),
+    )
+    .await
+    .expect("unrelated deltas must not keep the request waiting");
+    assert!(matches!(resolved, Err(ResolveError::Unavailable(_))));
+    assert_eq!(resolver.point_get_total(), 0);
+    updating.abort();
+}

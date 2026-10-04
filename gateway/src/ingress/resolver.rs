@@ -7,7 +7,12 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 use thiserror::Error;
+
+// A committed create can precede delivery of its route delta. This grace only
+// applies to cache misses; unrelated events never extend its deadline.
+const ROUTE_ARRIVAL_WAIT: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -147,6 +152,36 @@ impl IngressRouteResolver {
             })
     }
 
+    async fn subscribed_route(&self, instance_id: &str) -> Result<RouteInfo, ResolveError> {
+        // Subscribe before re-reading so a delta between the original miss and
+        // subscription cannot be lost. A lagged receiver re-reads current state.
+        let mut changes = self.store.subscribe();
+        let arrival = async {
+            loop {
+                if !self.store.ready() {
+                    return Err(ResolveError::NotReady);
+                }
+                if let Some(route) = self.store.get(instance_id) {
+                    return Ok(route);
+                }
+                match changes.recv().await {
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        return Err(ResolveError::Unavailable(
+                            "route subscription closed".into(),
+                        ));
+                    }
+                }
+            }
+        };
+        match tokio::time::timeout(ROUTE_ARRIVAL_WAIT, arrival).await {
+            Ok(result) => result,
+            Err(_) => Err(ResolveError::Unavailable(
+                "route absent from synchronized cache".into(),
+            )),
+        }
+    }
+
     pub async fn resolve(
         &self,
         instance_id: &str,
@@ -165,11 +200,7 @@ impl IngressRouteResolver {
                     .await
                     .map_err(|error| ResolveError::Unavailable(error.to_string()))?
                     .ok_or(ResolveError::NotFound)?,
-                None if self.stream_only => {
-                    return Err(ResolveError::Unavailable(
-                        "route absent from synchronized cache".into(),
-                    ))
-                }
+                None if self.stream_only => self.subscribed_route(instance_id).await?,
                 None => return Err(ResolveError::NotFound),
             },
         };
