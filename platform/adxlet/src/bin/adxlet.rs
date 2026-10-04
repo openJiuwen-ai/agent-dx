@@ -533,8 +533,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
                         }
-                        Err(_) => adx_observability::warn!(
-                            "authoritative node catalog unavailable; lifecycle remains closed"
+                        Err(error) => adx_observability::warn!(
+                            "authoritative node catalog unavailable; lifecycle remains closed: {error}"
                         ),
                     }
                 }

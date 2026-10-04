@@ -47,11 +47,10 @@ struct State {
 
 fn requires_node_reconciliation(environment: &StoredEnvironment) -> bool {
     environment.result.as_ref().is_none_or(|record| {
-        !matches!(
-            record.state,
-            EnvironmentState::Deleted | EnvironmentState::Failed
-        ) || record.resources_held
-            || record.restart_pending
+        // Failed records need a local controller for cleanup and explicit deletion,
+        // including expired ownership. Storage fences invalidated results so a
+        // returning node cannot republish Running or reserve their resources.
+        record.state != EnvironmentState::Deleted || record.resources_held || record.restart_pending
     })
 }
 
@@ -728,6 +727,12 @@ impl CoordinatorRpc {
                     )
                     .await?;
             }
+            if !state.needs_recovery {
+                if let Err(error) = state.scheduler.forget_deleted(&accepted.spec.id) {
+                    state.needs_recovery = true;
+                    return Err(error);
+                }
+            }
             state.environments.remove(&accepted.spec.id);
             state.specs.remove(&accepted.spec.id);
             state.scheduling_deadlines.remove(&accepted.spec.id);
@@ -1289,5 +1294,79 @@ mod timeout_tests {
         assert_eq!(scheduling_timeout(0), Some(Duration::from_secs(30)));
         assert_eq!(scheduling_timeout(7), Some(Duration::from_secs(7)));
         assert_eq!(scheduling_timeout(86_401), None);
+    }
+}
+
+#[cfg(test)]
+mod reconciliation_tests {
+    use super::*;
+
+    #[test]
+    fn deleted_identity_can_enter_the_center_queue_after_failed_claim_retirement() {
+        let spec: EnvironmentSpec = serde_json::from_value(serde_json::json!({
+            "id": "named", "tenant_id": "tenant", "image": "image",
+            "runtime_class": "runsc", "priority": 0,
+            "resources": {"cpu_millis": 100, "memory_bytes": 128, "disk_bytes": 0}
+        }))
+        .unwrap();
+        let mut scheduler = Coordinator::new(1, Placement::Pack).unwrap();
+        scheduler.retire_claim(&spec.id).unwrap();
+        assert!(matches!(
+            scheduler.submit(spec.clone()),
+            Err(Error::Conflict)
+        ));
+        scheduler.forget_deleted(&spec.id).unwrap();
+        assert!(scheduler.submit(spec.clone()).is_ok());
+        assert!(
+            matches!(scheduler.forget_deleted(&spec.id), Err(Error::Conflict)),
+            "only an identity without active scheduling work may be forgotten"
+        );
+    }
+
+    #[test]
+    fn failed_without_resources_remains_deletable_after_node_restart() {
+        let spec: EnvironmentSpec = serde_json::from_value(serde_json::json!({
+            "id": "failed", "tenant_id": "tenant", "image": "image",
+            "runtime_class": "runsc", "priority": 0,
+            "resources": {"cpu_millis": 100, "memory_bytes": 128, "disk_bytes": 0}
+        }))
+        .unwrap();
+        let assignment = adx_core::Assignment {
+            environment_id: spec.id.clone(),
+            node_id: "node".into(),
+            shard_id: 0,
+            generation: 1,
+            devices: vec![],
+        };
+        let mut environment = StoredEnvironment {
+            recovery: None,
+            invalidated: false,
+            spec: spec.clone(),
+            assignment: assignment.clone(),
+            result: Some(EnvironmentRecord {
+                spec,
+                assignment,
+                state: EnvironmentState::Failed,
+                revision: 2,
+                runtime: adx_core::Runtime {
+                    id: "failed-1".into(),
+                    ip: None,
+                },
+                resources_held: false,
+                checkpoint: None,
+                last_operation: None,
+                restart_attempts: 0,
+                restart_pending: false,
+            }),
+        };
+        assert!(
+            requires_node_reconciliation(&environment),
+            "the node needs the Failed record to handle explicit deletion after restart"
+        );
+        environment.invalidated = true;
+        assert!(
+            requires_node_reconciliation(&environment),
+            "an invalidated Failed record must remain manageable for cleanup and deletion"
+        );
     }
 }
