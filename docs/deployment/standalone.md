@@ -122,3 +122,7 @@ SDK 中的 runtime 及资源数值应与已准备的 sandboxd 后端匹配。例
 `adxctl stop` 会先删除本机已管理实例，提交清理结果，然后退出服务；停止 supervisor 的 SIGTERM/SIGINT 也遵守该契约。它不适合作为保留现有实例的证书更新命令。需要保留实例时，由部署环境重启选定组件，待 adxlet 完成权威对账和路由同步后恢复使用。Coordinator 不可用时，adxlet 重启只能观察实际实例，需等待 Coordinator 对账后恢复生命周期操作。
 
 Kubernetes 同样在 Pod 内运行进程，但部署与验收应使用独立的 [K8s 驱动](../../build/e2e/kubernetes/README.md)；其 namespace、镜像身份、用例结果与清理记录单独保存。
+
+## Failed 记录保留
+
+Coordinator 服务配置 `failed_retention_seconds` 默认600秒，必须大于零。终态 Failed 在保留期后自动清理；创建失败的资源预留立即释放。正在重启／恢复的记录不按普通终态回收，清理失败继续重试。具体契约见 [Failed Environment GC](../testing/failed-environment-gc.md)。

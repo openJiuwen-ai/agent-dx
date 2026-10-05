@@ -191,12 +191,100 @@ impl Rig {
         let index = usize::from(owner.node_id == "b");
         self.nodes[index]
             .delete_environment(pb::DeleteEnvironmentRequest {
+                failed_revision: None,
+                node_session_id: String::new(),
                 assignment: Some(owner.clone()),
                 caller: caller(),
             })
             .await
             .unwrap();
     }
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Redis and generated mTLS certificates; run control-rpc suite"]
+async fn failed_gc_cleans_node_controller_redis_and_allows_same_name() {
+    let mut rig = Rig::new().await;
+    let created = rig.nodes[0]
+        .create_local_environment(Rig::request("failed-gc", 0))
+        .await
+        .unwrap()
+        .into_inner()
+        .record
+        .unwrap();
+    assert_eq!(rig.rpc.collect_failed(Duration::ZERO).await.unwrap(), 0);
+    rig.backends[0].running.lock().unwrap().clear();
+    rig.managers[0].monitor_environments().await.unwrap();
+    let failed = rig.session.get("failed-gc").await.unwrap();
+    assert_eq!(
+        failed.result.as_ref().unwrap().state,
+        adx_core::EnvironmentState::Failed
+    );
+    assert!(failed.failed_since_unix_seconds.is_some());
+    assert_eq!(
+        rig.rpc
+            .collect_failed(Duration::from_secs(600))
+            .await
+            .unwrap(),
+        0
+    );
+    rig.managers[0].pause_lifecycle().await;
+    assert!(rig.rpc.collect_failed(Duration::ZERO).await.is_err());
+    assert!(rig.session.get("failed-gc").await.is_ok());
+    rig.managers[0]
+        .reconcile(vec![failed.result.unwrap()])
+        .await
+        .unwrap();
+    assert_eq!(rig.rpc.collect_failed(Duration::ZERO).await.unwrap(), 1);
+    assert_eq!(
+        rig.session.get("failed-gc").await.unwrap_err(),
+        adx_core::Error::NotFound
+    );
+    assert!(rig.managers[0]
+        .metrics()
+        .contains("adx_node_managed_environments 0\n"));
+    assert!(rig.backends[0].running.lock().unwrap().is_empty());
+    let replacement = rig.nodes[0]
+        .create_local_environment(Rig::request("failed-gc", 0))
+        .await
+        .unwrap()
+        .into_inner()
+        .record
+        .unwrap();
+    assert!(
+        replacement.assignment.as_ref().unwrap().generation
+            > created.assignment.as_ref().unwrap().generation
+    );
+    rig.delete(&replacement).await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Redis and generated mTLS certificates; run control-rpc suite"]
+async fn failed_gc_cleans_invalidated_owner_and_fences_delayed_running() {
+    let mut rig = Rig::new().await;
+    let created = rig.nodes[0]
+        .create_local_environment(Rig::request("dead-gc", 0))
+        .await
+        .unwrap()
+        .into_inner()
+        .record
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(11)).await;
+    assert_eq!(rig.rpc.expire_nodes().await.unwrap(), 2);
+    assert_eq!(rig.rpc.collect_failed(Duration::ZERO).await.unwrap(), 1);
+    assert_eq!(
+        rig.session.get("dead-gc").await.unwrap_err(),
+        adx_core::Error::NotFound
+    );
+    assert!(rig.claimants[0]
+        .commit_environment(pb::CommitEnvironmentRequest {
+            record: Some(created),
+            node_session_id: "boot-a".into()
+        })
+        .await
+        .is_err());
+    rig.managers[0].reconcile(vec![]).await.unwrap();
+    assert!(rig.backends[0].running.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -1213,6 +1301,8 @@ async fn existing_terminal_claim_reconciles_a_late_commit_into_scheduler_account
         .unwrap();
     assert!(rig.nodes[0]
         .delete_environment(pb::DeleteEnvironmentRequest {
+            failed_revision: None,
+            node_session_id: String::new(),
             assignment: running.assignment,
             caller: caller(),
         })

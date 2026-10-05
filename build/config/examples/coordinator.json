@@ -26,6 +26,7 @@
   ],
   "advertised_address": "https://coordinator:19000",
   "heartbeat_timeout_seconds": 30,
+  "failed_retention_seconds": 600,
   "discovery_ttl_seconds": 15,
   "metrics_listen": "127.0.0.1:19090"
 }

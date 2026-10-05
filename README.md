@@ -204,6 +204,7 @@ The SDK distribution is `adx-sandbox`, its Python import is `adx_sandbox`, and i
 - [Scheduling](docs/testing/scheduling-performance.md), [node lifecycle](docs/testing/node-lifecycle.md), and [route publication](docs/testing/route-publication.md)
 - [Checkpoint and snapshot storage](docs/testing/snapshot-storage.md)
 - [Runtime stdout/stderr and retention](docs/testing/runtime-logs.md)
+- [Failed Environment GC](docs/testing/failed-environment-gc.md)
 - [Metrics](docs/testing/environment-resource-metrics.md), [logs](docs/testing/log-collection.md), and [distributed tracing](docs/testing/distributed-traces.md)
 - [Rust coding guidelines](docs/development/rust-coding-guidelines.md)
 - [Release pipelines and package layout](docs/development/release-pipelines-and-packaging.md)

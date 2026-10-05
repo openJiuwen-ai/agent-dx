@@ -83,7 +83,13 @@ message StartAssignedEnvironmentRequest {
   string node_session_id = 3;
 }
 
-message DeleteEnvironmentRequest { Assignment assignment = 1; CallerContext caller = 2; }
+message DeleteEnvironmentRequest {
+  Assignment assignment = 1;
+  CallerContext caller = 2;
+  // Coordinator GC only: the node rechecks Failed and revision in the serial lifecycle task.
+  optional uint64 failed_revision = 3;
+  string node_session_id = 4;
+}
 
 message CommitEnvironmentRequest { EnvironmentRecord record = 1; string node_session_id = 2; }
 

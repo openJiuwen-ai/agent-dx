@@ -33,6 +33,7 @@ enum Command {
     Create,
     Clone(Box<adx_core::snapshots::Snapshot>),
     Delete,
+    CollectFailed(u64),
     Sync,
     Reconcile,
     Discard(oneshot::Sender<Result<()>>),
@@ -128,6 +129,10 @@ impl EnvironmentHandle {
     }
     pub async fn delete(&self) -> Result<OperationResult> {
         self.send(Command::Delete).await
+    }
+    /// GC must not delete an execution that moved on after the candidate was read.
+    pub async fn collect_failed(&self, expected_revision: u64) -> Result<OperationResult> {
+        self.send(Command::CollectFailed(expected_revision)).await
     }
     pub(crate) async fn reconcile(&self) -> Result<OperationResult> {
         self.send(Command::Reconcile).await
@@ -287,6 +292,7 @@ impl Controller {
             Command::Recover(_) => "recover",
             Command::Create | Command::Clone(_) => "create",
             Command::Delete => "delete",
+            Command::CollectFailed(_) => "collect_failed",
             Command::Sync => "sync",
             Command::Reconcile => "reconcile",
             _ => unreachable!(),
@@ -314,6 +320,16 @@ impl Controller {
             Command::Create => self.create().await,
             Command::Clone(snapshot) => self.clone_snapshot(*snapshot).await,
             Command::Delete => self.delete().await,
+            Command::CollectFailed(revision) => {
+                if self.record.state != EnvironmentState::Failed
+                    || self.record.restart_pending
+                    || self.record.revision != revision
+                {
+                    Err(Error::Conflict)
+                } else {
+                    self.delete().await
+                }
+            }
             Command::Sync => self.sync().await,
             Command::Reconcile => self.reconcile().await,
         };

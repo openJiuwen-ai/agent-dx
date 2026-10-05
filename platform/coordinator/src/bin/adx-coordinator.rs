@@ -29,6 +29,8 @@ struct Config {
     heartbeat_timeout_seconds: u64,
     #[serde(default = "default_ttl")]
     discovery_ttl_seconds: u64,
+    #[serde(default = "default_failed_retention")]
+    failed_retention_seconds: u64,
     redis_url: String,
     namespace: String,
     scheduler_shards: usize,
@@ -43,12 +45,21 @@ fn default_heartbeat() -> u64 {
 fn default_ttl() -> u64 {
     15
 }
+fn default_failed_retention() -> u64 {
+    600
+}
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _logging_guard = adx_observability::logging::init("adx-coordinator", false)?;
     let config: Config = read_config()?;
-    if config.heartbeat_timeout_seconds == 0 || config.discovery_ttl_seconds < 3 {
-        return Err("positive heartbeat timeout and discovery TTL >= 3 required".into());
+    if config.heartbeat_timeout_seconds == 0
+        || config.discovery_ttl_seconds < 3
+        || config.failed_retention_seconds == 0
+    {
+        return Err(
+            "positive heartbeat timeout and Failed retention, and discovery TTL >= 3 required"
+                .into(),
+        );
     }
     let placement = match config.placement.as_str() {
         "pack" => Placement::Pack,
@@ -159,6 +170,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tick.tick().await;
             if let Err(error) = collection_rpc.collect_snapshots().await {
                 adx_observability::warn!("snapshot collection incomplete: {error}");
+            }
+            if let Err(error) = collection_rpc
+                .collect_failed(Duration::from_secs(config.failed_retention_seconds))
+                .await
+            {
+                adx_observability::warn!("failed environment collection incomplete: {error}");
             }
         }
     };

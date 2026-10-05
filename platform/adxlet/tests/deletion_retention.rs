@@ -95,6 +95,8 @@ fn assignment() -> Assignment {
 
 fn delete_request() -> Request<pb::DeleteEnvironmentRequest> {
     let mut request = Request::new(pb::DeleteEnvironmentRequest {
+        failed_revision: None,
+        node_session_id: String::new(),
         assignment: Some(assignment().try_into().expect("test assignment is valid")),
         caller: Some(pb::CallerContext {
             tenant_id: "tenant".into(),

@@ -185,6 +185,72 @@ async fn create_publishes_only_after_runtime_readiness_and_route_binding() {
 }
 
 #[tokio::test]
+async fn failed_collection_is_fenced_and_keeps_metadata_until_cleanup_succeeds() {
+    let deps = Dependencies::new(false);
+    let node = node(&deps);
+    let environment = node.environment(spec("gc"), assignment("gc")).unwrap();
+    let running = environment.create().await.unwrap();
+    assert_eq!(
+        environment
+            .collect_failed(running.record.revision)
+            .await
+            .unwrap_err(),
+        Error::Conflict
+    );
+    assert!(deps.actual.load(std::sync::atomic::Ordering::SeqCst));
+    deps.actual
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    environment.tick().await.unwrap();
+    let failed = environment.sync().await.unwrap().record;
+    assert_eq!(failed.state, EnvironmentState::Failed);
+    assert_eq!(
+        environment
+            .collect_failed(failed.revision - 1)
+            .await
+            .unwrap_err(),
+        Error::Conflict
+    );
+    deps.fail_cleanup
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(environment.collect_failed(failed.revision).await.is_err());
+    let retry = environment.sync().await.unwrap().record;
+    assert_eq!(retry.state, EnvironmentState::Failed);
+    deps.fail_cleanup
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let deleted = environment.collect_failed(retry.revision).await.unwrap();
+    assert_eq!(deleted.record.state, EnvironmentState::Deleted);
+    assert_eq!(deleted.durability, Durability::Published);
+    assert!(!deleted.record.resources_held);
+}
+
+#[tokio::test]
+async fn failed_collection_does_not_cancel_pending_restart() {
+    let deps = Dependencies::new(false);
+    let node = node(&deps);
+    let mut value = spec("restart-gc");
+    value.lifecycle.restart = Some(adx_core::lifecycle::RestartPolicy {
+        max_attempts: 2,
+        initial_backoff_seconds: 10,
+        max_backoff_seconds: 10,
+    });
+    let environment = node.environment(value, assignment("restart-gc")).unwrap();
+    environment.create().await.unwrap();
+    deps.actual
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    environment.tick().await.unwrap();
+    let failed = environment.sync().await.unwrap().record;
+    assert!(failed.restart_pending);
+    assert_eq!(
+        environment
+            .collect_failed(failed.revision)
+            .await
+            .unwrap_err(),
+        Error::Conflict
+    );
+    assert!(environment.sync().await.unwrap().record.restart_pending);
+}
+
+#[tokio::test]
 async fn network_policy_replacement_is_serialized_and_published_idempotently() {
     use adx_core::sandbox::{NetworkAction, NetworkPolicy, TrafficMode, TrafficPolicy};
     let deps = Dependencies::new(false);
