@@ -38,6 +38,16 @@ impl State {
         self.scheduler = scheduler;
         self.nodes = saved.nodes;
         self.environments = saved.environments;
+        self.failed_environments = self
+            .environments
+            .iter()
+            .filter(|(_, i)| {
+                i.result
+                    .as_ref()
+                    .is_some_and(|r| r.state == EnvironmentState::Failed)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
         for (id, record) in &self.environments {
             self.specs.insert(id.clone(), record.spec.clone());
         }
@@ -58,7 +68,7 @@ impl State {
         self.scheduler.generation = self.scheduler.generation.max(record.assignment.generation);
         self.specs
             .insert(record.spec.id.clone(), record.spec.clone());
-        self.environments.insert(record.spec.id.clone(), record);
+        self.remember_environment(record);
         Ok(())
     }
     pub(super) fn live_claimant(&self, id: &str, session: &str, timeout: Duration) -> Result<()> {

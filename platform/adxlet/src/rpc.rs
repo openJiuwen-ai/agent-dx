@@ -401,7 +401,8 @@ impl pb::node_service_server::NodeService for NodeRpc {
         let trace = adx_observability::trace::Trace::rpc("node.delete_environment", &request);
         trace
             .run_result(async {
-                if self.peers.authenticate(&request)? != Principal::ApiServer {
+                let principal = self.peers.authenticate(&request)?;
+                if !matches!(principal, Principal::ApiServer | Principal::Coordinator) {
                     return Err(Status::permission_denied(
                         "validated Frontend caller required",
                     ));
@@ -411,6 +412,9 @@ impl pb::node_service_server::NodeService for NodeRpc {
                     return Err(Status::unavailable("node is reconciling"));
                 }
                 let r = request.into_inner();
+                if principal == Principal::Coordinator && r.node_session_id != self.session_id {
+                    return Err(Status::failed_precondition("node session changed"));
+                }
                 let assignment: adx_core::Assignment = r
                     .assignment
                     .ok_or_else(|| Status::invalid_argument("assignment required"))?
@@ -431,17 +435,31 @@ impl pb::node_service_server::NodeService for NodeRpc {
                     let result = retired
                         .result
                         .ok_or_else(|| Status::not_found("environment not managed on this node"))?;
-                    tenant(r.caller.as_ref(), &result.record.spec.tenant_id)?;
+                    if principal == Principal::ApiServer {
+                        tenant(r.caller.as_ref(), &result.record.spec.tenant_id)?;
+                    }
                     if result.record.assignment != assignment {
                         return Err(Status::failed_precondition("assignment changed"));
                     }
                     return response(result).map_err(status);
                 };
-                tenant(r.caller.as_ref(), &spec.tenant_id)?;
+                if principal == Principal::ApiServer {
+                    tenant(r.caller.as_ref(), &spec.tenant_id)?;
+                }
                 if owner != assignment {
                     return Err(Status::failed_precondition("assignment changed"));
                 }
-                let result = handle.delete().await.map_err(status)?;
+                let result =
+                    if principal == Principal::Coordinator {
+                        handle
+                            .collect_failed(r.failed_revision.ok_or_else(|| {
+                                Status::invalid_argument("Failed revision required")
+                            })?)
+                            .await
+                    } else {
+                        handle.delete().await
+                    }
+                    .map_err(status)?;
                 self.manager.release_published_controller(&result);
                 response(result).map_err(status)
             })

@@ -537,6 +537,8 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
         tonic::Code::PermissionDenied
     );
     let mut bad_delete = pb::DeleteEnvironmentRequest {
+        failed_revision: None,
+        node_session_id: String::new(),
         assignment: Some(assignment.clone()),
         caller: caller(),
     };
@@ -554,6 +556,8 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
     assert_eq!(
         node_frontend
             .delete_environment(pb::DeleteEnvironmentRequest {
+                failed_revision: None,
+                node_session_id: String::new(),
                 assignment: Some(stale),
                 caller: caller()
             })
@@ -594,6 +598,8 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
         adx_core::Error::NotFound
     );
     let delete = pb::DeleteEnvironmentRequest {
+        failed_revision: None,
+        node_session_id: String::new(),
         assignment: Some(assignment),
         caller: caller(),
     };
@@ -630,6 +636,8 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
     );
     redis.crash();
     let delete = pb::DeleteEnvironmentRequest {
+        failed_revision: None,
+        node_session_id: String::new(),
         assignment: Some(second.assignment.try_into().unwrap()),
         caller: caller(),
     };
@@ -2332,6 +2340,8 @@ async fn snapshot_gc_waits_for_node_ack_and_recovers_from_lost_ack() {
     assert_eq!(again.snapshot.as_ref().unwrap().id, reusable.id);
     frontend
         .delete_environment(pb::DeleteEnvironmentRequest {
+            failed_revision: None,
+            node_session_id: String::new(),
             assignment: source.assignment,
             caller: caller(),
         })
@@ -2424,6 +2434,8 @@ async fn snapshot_gc_waits_for_node_ack_and_recovers_from_lost_ack() {
     );
     frontend
         .delete_environment(pb::DeleteEnvironmentRequest {
+            failed_revision: None,
+            node_session_id: String::new(),
             assignment: created.assignment,
             caller: caller(),
         })

@@ -91,6 +91,7 @@ impl Session {
             });
             stored_environment.assignment = replacement.clone();
             stored_environment.invalidated = false;
+            stored_environment.failed_since_unix_seconds = None;
             stored_environment.recovery = Some(Recovery {
                 source: previous.clone(),
                 pending: true,

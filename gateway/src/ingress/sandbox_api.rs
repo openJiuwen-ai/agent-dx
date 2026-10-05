@@ -560,6 +560,8 @@ impl Sandbox for PlatformSandbox {
         );
         let result = client
             .delete_environment(pb::DeleteEnvironmentRequest {
+                failed_revision: None,
+                node_session_id: String::new(),
                 assignment: Some(assignment),
                 caller: Some(caller(tenant)),
             })

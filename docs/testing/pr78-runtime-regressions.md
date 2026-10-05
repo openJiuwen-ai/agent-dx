@@ -14,7 +14,7 @@ ADX 在调用 sandboxd Start 时预留本机资源。Start 失败、超时、应
 
 gRPC/UDS 代理分别注入执行前 Start 错误、真实 Start 成功后切断应答、切断应答并使 Delete 不可用，以及超时后才执行的迟到 Start。四例均进入 Failed、`resources_held=false`，每例仅一次后端 Start。Delete 不可用期间可观察到一个真实残留后端；取消故障后巡检清空。迟到后端也被巡检清理，没有变成 Running。SDK 对公开创建请求的重试不会再次执行后端 Start。
 
-随后正常 SDK command、文件读写和删除通过。逐例显式删除后 Redis 主目录消失，最终 Redis environment 字段为空、两节点 backend 为空，fixture 清理通过。注意这验证了显式删除和后端清理，未实现 Failed 元数据自动 GC。证据保存在本地 `pr78-failed-create-release-20261003/evidence/`，包含 `failed-create-release.json`、`start-proxy-events.jsonl`、`fix-identity.json` 和 `result.json`；组件回归 369 通过、63 忽略，忽略的 Redis/RPC 用例不计通过。
+随后正常 SDK command、文件读写和删除通过。逐例显式删除后 Redis 主目录消失，最终 Redis environment 字段为空、两节点 backend 为空，fixture 清理通过。注意这验证了显式删除和后端清理，当时未实现 Failed 元数据自动 GC；当前契约见 [Failed GC](failed-environment-gc.md)。证据保存在本地 `pr78-failed-create-release-20261003/evidence/`，包含 `failed-create-release.json`、`start-proxy-events.jsonl`、`fix-identity.json` 和 `result.json`；组件回归 369 通过、63 忽略，忽略的 Redis/RPC 用例不计通过。
 
 ## Reverse tunnel WebSocket 关闭
 
@@ -33,7 +33,7 @@ Rust Socket 用例验证两个方向的 1008/code-reason 透传；Python SDK 的
 | 原报告问题 | 当前证据 | 尚未闭环 |
 |---|---|---|
 | 后台命令短 wait、自然退出 PTY 对象保留 | AKernel `6953519` 修复；271 SDK 单测、永久 standalone 两项和 100 个自然退出 PTY 通过 | 新 SDK 正式制品及部署 pin 整合 |
-| Start 失败／应答丢失后持续持有资源 | 创建 Failed 即释放；清理与提交失败、Journaled 降级、GPU/NPU 复用和 UDS 迟到应答均有组件测试 | 同一正式制品及部署 pin 整合；Failed 元数据 GC 尚未实现 |
+| Start 失败／应答丢失后持续持有资源 | 创建 Failed 即释放；清理与提交失败、Journaled 降级、GPU/NPU 复用和 UDS 迟到应答均有组件测试 | 同一正式制品及部署 pin 整合；Failed 元数据 GC 已接入，正式包与部署版本须单独核对 |
 | runsc gofer `EBUSY` | cn-north-4 六场景累计 8,189 次生命周期成功，未复现 | 原 x86/Linux 6.8/fork runsc 同条件复现及 main A/B；根因未定位 |
 | 混合压力文件截断／EOF | 原负载 runc 38,618 个读写周期、2,400 次生命周期通过；集群 runsc 22,859 个周期无错误 | runsc 混合仅提交 1,106/2,401 创建时隙，未完成 20 create/s；原 EOF 根因未定位 |
 | tunnel WebSocket close 丢失及并发消息 EOF | 关闭帧已修复；runc 和修复制品 runsc 的 direct/tunnel C1/C8/C16 各50连接、200消息、2,048 ping/pong通过 | 原报告并发EOF根因未定位；不能由当前消息矩阵通过推断其根因已解决 |
@@ -43,7 +43,7 @@ Rust Socket 用例验证两个方向的 1008/code-reason 透传；Python SDK 的
 | S3 根对象空 prefix 忽略覆盖配置 | sandboxd 修复；空／非空 prefix 的 HEAD/Range 读取通过 | 真实 AWS S3／OSS 签名、ACL 和网络互操作 |
 | 旧 wait／rrt.sock 文档 | AKernel 当前源文档已同步 wait 契约和 execd.sock | 随正式制品校验部署文档与 pin |
 
-此外，Failed 控制任务与 Redis 记录没有自动保留期限；当前显式 DELETE 才删除主目录，最小删除回执保留十分钟。创建尾延迟仍需独立优化；首请求缓存缺失503已通过本页第十九轮修复回归，长期及更高负载尚未验收。测试部署私有SWR凭证接入及resources/queue入口404已修正并通过公开链路验收。GPU 实机、多节点亲和、整节点故障与共享 checkpoint 跨节点恢复、长期 soak 属于原报告未覆盖的验收边界，不列作已复现缺陷。
+终态 Failed 控制任务与 Redis 主目录由 Coordinator 按保留期自动回收，默认十分钟；待重启／恢复场景受保护，清理失败会重试。最小删除回执保留十分钟，详见 [GC 契约](failed-environment-gc.md)。创建尾延迟仍需独立优化；首请求缓存缺失503已通过本页第十九轮修复回归，长期及更高负载尚未验收。测试部署私有SWR凭证接入及resources/queue入口404已修正并通过公开链路验收。GPU 实机、多节点亲和、整节点故障与共享 checkpoint 跨节点恢复、长期 soak 属于原报告未覆盖的验收边界，不列作已复现缺陷。
 
 ## 2026-10-04–05 本地与测试集群补充
 
@@ -55,7 +55,7 @@ Rust Socket 用例验证两个方向的 1008/code-reason 透传；Python SDK 的
 
 最新路由发布实现由提交事件触发，10ms 有界合并；200ms tick 用于异常视图恢复。不能继续把“事件触发尚未实现”列为源码缺口，也不能由源码通过推断旧集群的短暂503已经消除。历史 C128/C256 使用100m CPU请求，单节点8CPU最多同时预留80个，尾延迟包含中心排队，需与容量内的启动、就绪及发布延迟分别测量。
 
-Environment 状态为 Pending、Starting、Running、Pausing、Paused、Resuming、Deleting、Deleted、Failed。资源持有、待重启与checkpoint字段另行判断；Failed暂无自动元数据GC，显式删除才能退役，不能用“资源已释放”代替“元数据已清空”。
+Environment 状态为 Pending、Starting、Running、Pausing、Paused、Resuming、Deleting、Deleted、Failed。资源持有、待重启与checkpoint字段另行判断；终态 Failed 支持自动元数据 GC，仍不能用“资源已释放”代替“元数据已清空”；保留期与恢复保护见 [GC 契约](failed-environment-gc.md)。
 
 2026-10-05 在 `akernel-adx-test` 使用 `fdccbfa` 构建的 Coordinator 验证二进制（SHA256 `93e8dd64d34427324f3b4b938ebd6d36f734cf6f5e3ab9d2eb06cb4779595d80`）执行启动迁移：9,910条Deleted被原子退役，control hash从9,915字段降至5字段，仅余1条Failed和节点／控制字段，两节点均恢复routable。测试未手动HDEL；替换位于Pod可写层，重建恢复旧镜像，不算正式升级。原Coordinator对SIGTERM未退出，SIGKILL后supervisor重启一次；优雅退出挂起仍是新发现，尚未修复。
 
@@ -74,7 +74,7 @@ Environment 状态为 Pending、Starting、Running、Pausing、Paused、Resuming
 
 本轮实际测试发现：旧 `InspectNode` 排除了不占资源、不等待重启的 Failed；节点重启后失去对应控制器，DELETE 返回节点未管理该实例，SDK 把404视作已删除，但 Redis 完整记录仍保留。当前目录保留 Failed，包括已失效的归属。adxlet 对账只清理旧执行，不恢复 Running；存储校验继续拒绝失效归属重新占资源或发布 Running。
 
-测试先验证原过滤行为失败，再验证修复通过；真实 Redis/mTLS 覆盖心跳失效、返回对账、旧 Running 提交被拒绝、Deleted 提交退役。在测试集群加载 `fdccbfa` 加该修复的 Coordinator（SHA256 `cf55aacfcc21a27e0fd01800c10e6100719968c28f86c082ea8c1cd46c39f62f`），节点重启后显式 DELETE 返回200，对应Failed字段消失，保留1条测试前已有Failed，没有手动HDEL。该修复补齐显式删除，不增加Failed自动GC。
+测试先验证原过滤行为失败，再验证修复通过；真实 Redis/mTLS 覆盖心跳失效、返回对账、旧 Running 提交被拒绝、Deleted 提交退役。在测试集群加载 `fdccbfa` 加该修复的 Coordinator（SHA256 `cf55aacfcc21a27e0fd01800c10e6100719968c28f86c082ea8c1cd46c39f62f`），节点重启后显式 DELETE 返回200，对应Failed字段消失，保留1条测试前已有Failed，没有手动HDEL。该轮修复补齐显式删除；随后另行接入 [Failed 自动 GC](failed-environment-gc.md)。
 
 同名重建还须同步调度器：归属失效时内存 `retired` 标记禁止旧请求再次入队；显式删除持久化成功后必须清除该标记。当前 Deleted 提交确认无调度占用后解除标记，未删除 Failed 不受影响。回归覆盖 Failed 身份禁止重排、Deleted 后重新入中心队列、仍有待调度工作时拒绝清除；全套27项真实Redis/mTLS RPC通过。
 
@@ -97,3 +97,17 @@ Ingress 当前对缓存缺失最多等待50ms内对应订阅路由的到达，�
 第十九轮加载包含该修复的合并API Server／Ingress二进制，实际执行文件SHA256为`aef160483ad73c0dadd448fbdcebfb3c955eaae11975360659cc7a671b8151f4`。C1/C8/C32各三轮123样本全部创建和首次raw HTTP command通过，日志缓存缺失503与Broken pipe均为0；首次命令16.5–97.4ms。创建中位数/最大分别为472/837ms、579/667ms、1037/1279ms，仍超过既定目标。第十八轮Broken pipe未再次出现，根因仍未独立定位；不能以本轮通过宣称其根因修复。此次实验不更新AKernel PR，不代表正式包或生产部署升级。证据为本地attempt-019/cluster-closure-019.log及cluster-evidence.tar。
 
 独立恢复审计确认两节点物理backend均为0，原adxlet SHA、默认rootfs/bootstrap和supervisor预算恢复；Redis仅有测试前已有1条Failed，活动两节点available/routable，未手动删除已有记录。恢复与最终审计日志分别为restore-audit-019.log、final-audit-019.log。
+
+## C1 性能口径核对（2026-10-05）
+
+2026-09-27 Build #116 的原 HTTP Create 基准，隔离 C1 每次创建后删除：100 次 P50 104.088ms、P95 161.323ms、P99 179.749ms；create 返回后的路由传播单独计时，P99 115.584ms。2026-09-28 Build #121 另有单次 C1 62.089ms，样本仅一条，不能据此声称稳定 P99 为62ms。此前百毫秒级是完整 HTTP Create 到 SSE Running，并非 sandboxd Start 单阶段。
+
+第十九轮的 C1 中位数471.7ms来自 AKernel SDK Sandbox 构造，包含后续 process.list 等就绪访问；使用节点192.168.10.179、自定义镜像、runtime limit 500m/512MiB。旧基准固定另一节点、复用 HTTP 连接，runtime limit 1000m/2GiB。不能把这两种边界直接比较并宣布创建性能回退。仍需在相同节点、镜像、资源限额和计时边界下补配对测试，分别报告 raw Create 和 SDK 构造。
+
+## Failed 自动 GC（2026-10-05）
+
+Coordinator 默认保留终态 Failed 600 秒，支持 `failed_retention_seconds` 配置。失败时间持久化、回收批次有界；在线节点先清理后端再退役，失效归属原子退役后由返回节点对账清理。待重启／恢复受保护，完整契约见 [Failed GC](failed-environment-gc.md)。
+
+真实 Redis storage 全套34项、真实Redis/mTLS RPC全套29项、adxlet lifecycle 28项通过，workspace fmt／严格Clippy通过。Lima ARM64 两节点 standalone 使用真实 runc、Redis和公开Sandbox SDK，注入Start成功后丢失应答及Delete不可用：创建Failed且资源释放，超过3秒测试保留期仍保留无法清理的元数据；解除故障后自动GC，无显式DELETE；12.676秒收敛到后端与Redis Environment为空，同名重建generation 1→2，命令调用及删除成功。fixture清理通过。
+
+实际GC验证使用当前源码的Coordinator/adxlet覆盖既有隔离runtime fixture，不代表正式镜像或生产集群已升级。sandboxd故障代理沿用前轮制品，本次未修改sandboxd。证据位于本地 `pr78-local-closure-20261004/failed-gc-standalone-evidence/`，包括身份摘要、逐步日志、`failed-create-release.json`与`result.json`；`failed-gc-standalone.log`保留构建和全程输出。

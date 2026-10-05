@@ -67,6 +67,128 @@ async fn register(s: &adx_coordinator::storage::Session, id: &str) -> StoredNode
 
 #[tokio::test]
 #[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn failed_collection_age_survives_retry_and_coordinator_restart() {
+    let rig = common::Redis::new().await;
+    let store = rig.store().await;
+    let session = store.begin(1).await.unwrap();
+    register(&session, "node").await;
+    let assignment = Assignment {
+        environment_id: "failed-gc".into(),
+        node_id: "node".into(),
+        shard_id: 0,
+        generation: 1,
+        devices: vec![],
+    };
+    session
+        .reserve(spec("failed-gc"), assignment.clone())
+        .await
+        .unwrap();
+    let mut record = running(spec("failed-gc"), assignment);
+    record.state = EnvironmentState::Failed;
+    record.resources_held = false;
+    record.runtime.ip = None;
+    session.commit(record.clone()).await.unwrap();
+    let stored = session.get("failed-gc").await.unwrap();
+    let since = stored
+        .failed_since_unix_seconds
+        .expect("failure age is durable");
+    assert!(!stored.failed_collectable(since + 599, 600));
+    assert!(stored.failed_collectable(since + 600, 600));
+    record.revision += 1;
+    session.commit(record).await.unwrap();
+    assert_eq!(
+        session
+            .get("failed-gc")
+            .await
+            .unwrap()
+            .failed_since_unix_seconds,
+        Some(since)
+    );
+    let restarted = store.begin(1).await.unwrap();
+    assert_eq!(
+        restarted
+            .get("failed-gc")
+            .await
+            .unwrap()
+            .failed_since_unix_seconds,
+        Some(since)
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn invalidated_failed_collection_is_atomic_and_fences_replacement() {
+    let rig = common::Redis::new().await;
+    let session = rig.store().await.begin(1).await.unwrap();
+    session
+        .register_session(
+            node("node"),
+            "127.0.0.1:9000".into(),
+            "127.0.0.1:9001".into(),
+            Some(adx_coordinator::storage::NodeSession {
+                id: "s1".into(),
+                sequence: 1,
+                routable: true,
+            }),
+        )
+        .await
+        .unwrap();
+    let assignment = Assignment {
+        environment_id: "invalid-gc".into(),
+        node_id: "node".into(),
+        shard_id: 0,
+        generation: 1,
+        devices: vec![],
+    };
+    session
+        .reserve(spec("invalid-gc"), assignment.clone())
+        .await
+        .unwrap();
+    session
+        .commit(running(spec("invalid-gc"), assignment))
+        .await
+        .unwrap();
+    let running = session.get("invalid-gc").await.unwrap();
+    assert_eq!(
+        session
+            .retire_invalidated_failed(&running, u64::MAX)
+            .await
+            .unwrap_err(),
+        Error::Conflict
+    );
+    session.invalidate_node("node", "s1").await.unwrap();
+    let failed = session.get("invalid-gc").await.unwrap();
+    let deleted = session
+        .retire_invalidated_failed(&failed, u64::MAX)
+        .await
+        .unwrap();
+    assert_eq!(deleted.state, EnvironmentState::Deleted);
+    assert_eq!(
+        session.get("invalid-gc").await.unwrap_err(),
+        Error::NotFound
+    );
+    register(&session, "node").await;
+    session
+        .reserve(
+            spec("invalid-gc"),
+            Assignment {
+                generation: 2,
+                ..deleted.assignment
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        session
+            .retire_invalidated_failed(&failed, u64::MAX)
+            .await
+            .unwrap_err(),
+        Error::Conflict
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
 async fn administrative_scheduling_pause_survives_node_heartbeats() {
     let rig = common::Redis::new().await;
     let session = rig.store().await.begin(1).await.unwrap();

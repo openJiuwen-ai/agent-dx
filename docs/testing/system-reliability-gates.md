@@ -54,3 +54,5 @@ Start 失败专项：RPC 失败、超时、应答丢失及无效成功载荷均�
 | NODE-04 | 原节点迟到返回 | 清理旧执行后才开放准入，旧提交和旧路由全部拒绝 | 已有本地进程失联 E2E；[Full #31](https://buildkite.com/agent-dx/agent-dx-full-test/builds/31) 验证恢复节点的旧 backend 清理和准入顺序。旧 session 的直接写入拒绝仍由组件及三 VM 专项用例分别覆盖 |
 
 上述未完成项进入 Standalone、Multi-VM 和 Full Deployment 的故障扩展组。正式门禁不能用 mock、单元测试或跳过用例替代真实进程、网络、Redis 与执行后端证据。
+
+终态 Failed 自动回收的配置、隔离与测试边界见 [Failed Environment GC](failed-environment-gc.md)。

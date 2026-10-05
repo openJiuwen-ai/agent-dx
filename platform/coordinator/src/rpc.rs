@@ -2,6 +2,7 @@
 use adx_transport::rpc::RpcClient;
 mod claims;
 mod cloning;
+mod collection;
 mod metrics;
 mod recovery;
 mod snapshots;
@@ -35,10 +36,12 @@ struct State {
     scheduler: Coordinator,
     specs: BTreeMap<String, EnvironmentSpec>,
     environments: BTreeMap<String, StoredEnvironment>,
+    failed_environments: BTreeSet<String>,
     nodes: BTreeMap<String, StoredNode>,
     needs_recovery: bool,
     placement: Placement,
     recovery_cursor: Option<String>,
+    collection_cursor: Option<String>,
     live: BTreeMap<String, LiveNode>,
     recovering: BTreeMap<String, tokio::time::Instant>,
     retired_sessions: BTreeSet<(String, String)>,
@@ -55,6 +58,19 @@ fn requires_node_reconciliation(environment: &StoredEnvironment) -> bool {
 }
 
 impl State {
+    fn remember_environment(&mut self, stored: StoredEnvironment) {
+        let id = stored.spec.id.clone();
+        if stored
+            .result
+            .as_ref()
+            .is_some_and(|r| r.state == EnvironmentState::Failed)
+        {
+            self.failed_environments.insert(id.clone());
+        } else {
+            self.failed_environments.remove(&id);
+        }
+        self.environments.insert(id, stored);
+    }
     fn overdue(&self, id: &str, timeout: Duration) -> bool {
         self.live
             .get(id)
@@ -104,7 +120,7 @@ impl State {
                 }
                 self.specs
                     .insert(environment_id.clone(), stored.spec.clone());
-                self.environments.insert(environment_id, stored);
+                self.remember_environment(stored);
             }
         }
         self.recovering.remove(id);
@@ -142,7 +158,7 @@ impl State {
             };
             match saved {
                 Ok(record) => {
-                    self.environments.insert(record.spec.id.clone(), record);
+                    self.remember_environment(record);
                 }
                 Err(Error::Conflict)
                     if self
@@ -336,11 +352,22 @@ impl CoordinatorRpc {
                 session,
                 scheduler,
                 specs,
+                failed_environments: saved
+                    .environments
+                    .iter()
+                    .filter(|(_, i)| {
+                        i.result
+                            .as_ref()
+                            .is_some_and(|r| r.state == EnvironmentState::Failed)
+                    })
+                    .map(|(id, _)| id.clone())
+                    .collect(),
                 environments: saved.environments,
                 nodes: saved.nodes,
                 needs_recovery: false,
                 placement,
                 recovery_cursor: None,
+                collection_cursor: None,
                 live: BTreeMap::new(),
                 recovering,
                 retired_sessions: BTreeSet::new(),
@@ -670,9 +697,18 @@ impl CoordinatorRpc {
             return Err(Error::Conflict);
         }
         let accepted = state.session.commit(record).await?;
+        if accepted.state == EnvironmentState::Failed {
+            let durable = state.session.get(&accepted.spec.id).await?;
+            state.remember_environment(durable);
+        } else {
+            state.failed_environments.remove(&accepted.spec.id);
+        }
         if let Some(stored) = state.environments.get_mut(&accepted.spec.id) {
             stored.spec = accepted.spec.clone();
             stored.result = Some(accepted.clone());
+            if accepted.state != EnvironmentState::Failed {
+                stored.failed_since_unix_seconds = None;
+            }
             if accepted.state != EnvironmentState::Paused {
                 if let Some(recovery) = &mut stored.recovery {
                     recovery.pending = false;
@@ -734,6 +770,7 @@ impl CoordinatorRpc {
                 }
             }
             state.environments.remove(&accepted.spec.id);
+            state.failed_environments.remove(&accepted.spec.id);
             state.specs.remove(&accepted.spec.id);
             state.scheduling_deadlines.remove(&accepted.spec.id);
         }
@@ -1339,6 +1376,7 @@ mod reconciliation_tests {
             devices: vec![],
         };
         let mut environment = StoredEnvironment {
+            failed_since_unix_seconds: None,
             recovery: None,
             invalidated: false,
             spec: spec.clone(),

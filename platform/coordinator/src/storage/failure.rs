@@ -50,6 +50,7 @@ impl Session {
                 result.last_operation = None;
                 environment.result = Some(result);
                 environment.invalidated = true;
+                environment.track_failure(super::collection::now()?);
                 environment.validate()?;
                 writes.push((
                     format!("environment:{environment_id}"),

@@ -147,6 +147,8 @@ impl Operations {
                         .rpc(
                             "apiserver.delete",
                             node.delete_environment(trace::inject(pb::DeleteEnvironmentRequest {
+                                failed_revision: None,
+                                node_session_id: String::new(),
                                 assignment,
                                 caller: caller_context,
                             })),

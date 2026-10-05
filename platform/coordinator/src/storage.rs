@@ -2,6 +2,7 @@
 //! atomic hash writes; JSON and u64 counters are validated in Rust, never Lua doubles.
 mod claims;
 pub use claims::{ClaimOutcome, LocalClaim};
+mod collection;
 mod credentials;
 mod failure;
 mod recovery;
@@ -105,6 +106,9 @@ pub struct Recovery {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredEnvironment {
+    /// Durable age of a terminal failure; retries and Coordinator restarts do not reset it.
+    #[serde(default)]
+    pub failed_since_unix_seconds: Option<u64>,
     #[serde(default)]
     pub recovery: Option<Recovery>,
     #[serde(default)]
@@ -135,6 +139,27 @@ impl DeletedReceipt {
     }
 }
 impl StoredEnvironment {
+    pub fn failed_collectable(&self, now: u64, retention_seconds: u64) -> bool {
+        self.result
+            .as_ref()
+            .is_some_and(|r| r.state == EnvironmentState::Failed && !r.restart_pending)
+            && !self.recovery.as_ref().is_some_and(|r| r.pending)
+            && self.recovery_point(now).is_none()
+            && self
+                .failed_since_unix_seconds
+                .is_some_and(|since| now.saturating_sub(since) >= retention_seconds)
+    }
+    pub(crate) fn track_failure(&mut self, now: u64) {
+        if self
+            .result
+            .as_ref()
+            .is_some_and(|r| r.state == EnvironmentState::Failed && !r.restart_pending)
+        {
+            self.failed_since_unix_seconds.get_or_insert(now);
+        } else {
+            self.failed_since_unix_seconds = None;
+        }
+    }
     pub fn resources_held(&self) -> bool {
         (!self.invalidated && self.recovery.as_ref().is_some_and(|r| r.pending))
             || self.result.as_ref().is_none_or(|r| r.resources_held)
@@ -1007,6 +1032,7 @@ impl Session {
             }
         }
         let record = StoredEnvironment {
+            failed_since_unix_seconds: None,
             recovery: None,
             invalidated: false,
             spec,
@@ -1176,6 +1202,7 @@ impl Session {
             // fenced by `next_result` above.
             stored_environment.spec = result.spec.clone();
             stored_environment.result = Some(result.clone());
+            stored_environment.track_failure(collection::now()?);
             stored_environment.validate()?;
             header.advance()?;
             let expected_header = header_value
