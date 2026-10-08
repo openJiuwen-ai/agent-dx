@@ -20,6 +20,8 @@ path = "src/bin/adx-execd.rs"
 
 [dependencies]
 adx-observability = { path = "../../../crates/observability" }
+adx-protocol = { path = "../../crates/protocol" }
+tonic = "0.12"
 adx-core = { path = "../../crates/core" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "net", "time", "fs"] }
 tokio-stream = { version = "0.1", features = ["net"] }
@@ -42,4 +44,5 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 tempfile = "3"
 
 [dev-dependencies]
+async-trait = "0.1"
 adxlet = { path = "../../adxlet" }

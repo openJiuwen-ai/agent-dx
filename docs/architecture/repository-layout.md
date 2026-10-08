@@ -56,8 +56,9 @@ agent-dx/
 │   │   ├── proto/credentials.proto # 认证和密钥管理
 │   │   ├── proto/routes.proto     # 路由发布
 │   │   ├── proto/node.proto       # Relay 绑定与活动
+│   │   ├── proto/runtime_control.proto # Execd 主动控制连接
 │   │   └── http/runtime-control.md
-│   ├── runtime/execd/            # HTTP 运行时与 checkpoint 协作
+│   ├── runtime/execd/            # HTTP 数据操作与双向控制流
 │   ├── deployment/                # 统一 adxctl / supervisor；管理控制面和数据面进程
 │   └── sdk/sandbox/python/        # adx-sandbox / adx_sandbox
 ├── gateway/
@@ -98,7 +99,7 @@ agent-dx/
 | Coordinator | `storage.rs`、`storage/`、`rpc.rs`、`rpc/` | Redis 条件提交、原子归属、目录、节点失效、快照克隆、共享恢复协调；不执行节点普通生命周期 |
 | Coordinator | `auth.rs`、`routes.rs`、`metrics.rs` | API Key 摘要、路由发布、集群指标 |
 | adxlet | `controller.rs`、`controller/{lifecycle,monitor,snapshots}.rs` | 每 Environment 串行任务、暂停/恢复/删除、空闲回收与重启 |
-| adxlet | `sandboxd.rs`、`runtime_control.rs`、`readiness.rs` | RuntimeDriver 适配；本地 EROFS／OCI image 环境；Execd HTTP 协作与就绪 |
+| adxlet | `sandboxd.rs`、`runtime_control.rs`、`readiness.rs` | RuntimeDriver 适配；本地 EROFS／OCI image 环境；Execd 双向控制流／HTTP 协作与就绪 |
 | adxlet | `checkpoint.rs`、`checkpoint/` | 可扩展 CheckpointStore、本地/S3、缓存引用和远端孤儿回收 |
 | adxlet | `journal.rs`、`reconciliation.rs` | SQLite 故障降级日志与 Coordinator 权威目录对账 |
 | adxlet | `resources.rs`、`routes.rs`、`activity.rs`、`proxy.rs` | 容量源/准入、绑定同步、活动采集、代理进程组合 |
@@ -130,7 +131,7 @@ Proxy 首次启动关闭 Environment 准入，adxlet 完成权威对账与全量
 
 公开 HTTP 路由和请求响应由 Rust HTTP handler 实现，SDK 调用公开契约；`platform/api/openapi/sandbox.yaml` 与 `data-plane.yaml` 记录当前公开接口，但尚未用于生成服务端代码。参考 [HTTP 文档](../../gateway/apiserver/docs/sandbox-lifecycle-api.md)。
 
-内部 gRPC 按 Environment、快照、凭证、路由及节点本地控制拆分，详见 [协议目录](../../platform/api/proto/README.md)。Execd 用户操作及运行时协作使用 HTTP，类型在 `core/src/runtime.rs`。
+内部 gRPC 按 Environment、快照、凭证、路由及节点本地控制拆分，详见 [协议目录](../../platform/api/proto/README.md)。Execd 用户操作使用 HTTP。配置 `adxlet.runtime_control` 后，Execd 主动建立到节点的双向 gRPC 控制流，上报 Ready／checkpoint 状态并接收准备与完成命令；未配置时使用 HTTP 控制。共享类型在 `core/src/runtime.rs`，见 [运行时控制契约](../../platform/api/proto/runtime-control.md) 与 [部署配置](../deployment/runtime-control-stream.md)。
 
 正常结果经 Coordinator 写 Redis；SQLite 只在提交不可用时保存待补交结果。Journaled 不发布 Ingress 路由。节点重启而 Coordinator 不可用时等待对账，不从不完整日志重建目录。快照制品走独立的本地/S3 存储抽象。Redis 使用 `environment:<environment_id>`，SQLite journal 使用 `environment` 字段；Coordinator 启动时仅将已删除且不占资源的旧 `capsule:*` 记录原子迁移为 `environment:*`。其他旧控制状态和节点 SQLite journal 不能据此视为兼容，升级前需要单独评估和迁移。详见 [持久化契约](../testing/coordinator-storage.md)和[节点契约](../testing/node-lifecycle.md)。
 

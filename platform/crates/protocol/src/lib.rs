@@ -397,3 +397,9 @@ impl TryFrom<control::RuntimeIdentity> for adx_core::runtime::RuntimeIdentity {
         Ok(identity)
     }
 }
+
+/// Execd-initiated node-local control streams.
+pub mod runtime {
+    tonic::include_proto!("adx.runtime.v1");
+}
+pub mod runtime_stream;

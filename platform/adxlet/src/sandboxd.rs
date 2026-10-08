@@ -340,7 +340,7 @@ impl Sandboxd {
         let mut sandboxes = match response {
             Ok(response) => response.into_inner().sandboxes,
             Err(error) if physical.is_some() && error.code() == Code::NotFound => {
-                return Ok(Vec::new())
+                return Ok(Vec::new());
             }
             Err(error) => return Err(unavailable(error)),
         };
@@ -479,6 +479,25 @@ pub fn start_request(
     }
     // Deployment configuration owns control ports, tokens, and execution identity.
     envs.extend(config.env.clone());
+    // User specs cannot enable/redirect the control stream or supply credentials.
+    envs.remove("ADX_RUNTIME_CONTROL_ADDRESS");
+    envs.remove("ADX_RUNTIME_CONTROL_TOKEN");
+    envs.remove("ADX_RUNTIME_CONTROL_SECRET");
+    if let (Some(address), Some(secret)) = (
+        config.env.get("ADX_RUNTIME_CONTROL_ADDRESS"),
+        config.env.get("ADX_RUNTIME_CONTROL_SECRET"),
+    ) {
+        let identity = adx_core::runtime::RuntimeIdentity {
+            environment_id: spec.id.clone(),
+            runtime_id: runtime_id.into(),
+            ownership_generation,
+        };
+        envs.insert("ADX_RUNTIME_CONTROL_ADDRESS".into(), address.clone());
+        envs.insert(
+            "ADX_RUNTIME_CONTROL_TOKEN".into(),
+            adx_protocol::runtime_stream::execution_token(secret.as_bytes(), &identity)?,
+        );
+    }
     envs.remove("ADX_RESTORE_ORIGIN");
     envs.insert("ADX_ENVIRONMENT_ID".into(), spec.id.clone());
     envs.insert("ADX_RUNTIME_ID".into(), runtime_id.into());
@@ -614,7 +633,8 @@ pub fn start_request(
         network_policy: options
             .network
             .as_ref()
-            .map(|policy| sandbox_network_policy(policy, &options.ports)),
+            .map(|policy| sandbox_network_policy(policy, &options.ports, config))
+            .transpose()?,
         inject_entrypoint: if options.inherit_entrypoint {
             image_process_config.into()
         } else {
@@ -697,12 +717,14 @@ fn sandbox_mount(value: &adx_core::sandbox::Mount) -> Result<proto::Mount> {
 fn sandbox_network_policy(
     value: &adx_core::sandbox::NetworkPolicy,
     ports: &[u16],
-) -> proto::NetworkPolicy {
+    config: &Config,
+) -> Result<proto::NetworkPolicy> {
     use adx_core::sandbox as model;
     let action = |value| match value {
         model::NetworkAction::Allow => proto::NetworkPolicyAction::Allow as i32,
         model::NetworkAction::Deny => proto::NetworkPolicyAction::Deny as i32,
     };
+    let control_peer = runtime_control_peer(config)?;
     let traffic = value.traffic.as_ref().map(|traffic| {
         let mut rules: Vec<_> = traffic
             .rules
@@ -746,7 +768,12 @@ fn sandbox_network_policy(
         for port in std::iter::once(50090u16).chain(ports.iter().copied()) {
             rules.push(proto::TrafficRule {
                 action: proto::NetworkPolicyAction::Allow as i32,
-                direction: proto::NetworkDirection::Ingress as i32,
+                // Stateless policies cannot rely on conntrack to admit TCP
+                // replies. Match the same local service port in both directions.
+                direction: match traffic.mode {
+                    model::TrafficMode::Stateless => proto::NetworkDirection::Both as i32,
+                    model::TrafficMode::Stateful => proto::NetworkDirection::Ingress as i32,
+                },
                 protocol: proto::NetworkProtocol::Tcp as i32,
                 peer: Some(proto::NetworkEndpoint::default()),
                 // sandboxd schema v2 forbids the legacy scalar
@@ -757,6 +784,19 @@ fn sandbox_network_policy(
                     first: u32::from(port),
                     last: u32::from(port),
                 }),
+                priority: u32::MAX,
+                ..Default::default()
+            });
+        }
+        // Execd initiates this connection. Preserve only the node-owned TCP
+        // endpoint, including its replies under stateless policies. User env
+        // cannot widen the destination or port, and schema v2 uses CIDR/ranges.
+        if let Some(peer) = &control_peer {
+            rules.push(proto::TrafficRule {
+                action: proto::NetworkPolicyAction::Allow as i32,
+                direction: proto::NetworkDirection::Both as i32,
+                protocol: proto::NetworkProtocol::Tcp as i32,
+                peer: Some(peer.clone()),
                 priority: u32::MAX,
                 ..Default::default()
             });
@@ -772,7 +812,7 @@ fn sandbox_network_policy(
             ..Default::default()
         }
     });
-    proto::NetworkPolicy {
+    Ok(proto::NetworkPolicy {
         traffic,
         dns: value.dns.as_ref().map(|dns| proto::DnsPolicy {
             default_action: action(dns.default_action),
@@ -786,7 +826,36 @@ fn sandbox_network_policy(
                 .collect(),
         }),
         schema_version: 2,
+    })
+}
+
+fn runtime_control_peer(config: &Config) -> Result<Option<proto::NetworkEndpoint>> {
+    if !config.env.contains_key("ADX_RUNTIME_CONTROL_SECRET") {
+        return Ok(None);
     }
+    let Some(address) = config.env.get("ADX_RUNTIME_CONTROL_ADDRESS") else {
+        return Ok(None);
+    };
+    let endpoint = Endpoint::from_shared(address.clone())
+        .map_err(|_| Error::Invalid("invalid runtime control address".into()))?;
+    let host = endpoint
+        .uri()
+        .host()
+        .and_then(|host| host.parse::<std::net::Ipv4Addr>().ok())
+        .ok_or_else(|| {
+            Error::Invalid(
+                "runtime control requires a node IPv4 address for network isolation".into(),
+            )
+        })?;
+    let port = u32::from(endpoint.uri().port_u16().unwrap_or(80));
+    Ok(Some(proto::NetworkEndpoint {
+        cidr: format!("{host}/32"),
+        port_range: Some(proto::PortRange {
+            first: port,
+            last: port,
+        }),
+        ..Default::default()
+    }))
 }
 
 #[async_trait]
@@ -917,10 +986,14 @@ impl RuntimeDriver for Sandboxd {
         let id = self.physical_id(runtime_id).await?.ok_or(Error::NotFound)?;
         self.client
             .clone()
-            .set_network_policy(self.request(proto::SetNetworkPolicyRequest {
-                sandbox_id: id,
-                network_policy: policy.map(|value| sandbox_network_policy(value, ports)),
-            }))
+            .set_network_policy(
+                self.request(proto::SetNetworkPolicyRequest {
+                    sandbox_id: id,
+                    network_policy: policy
+                        .map(|value| sandbox_network_policy(value, ports, &self.config))
+                        .transpose()?,
+                }),
+            )
             .await
             .map_err(unavailable)?;
         Ok(())
@@ -1125,5 +1198,66 @@ mod tests {
             request.rootfs.unwrap().source,
             Some(proto::rootfs_config::Source::ImageUrl("image:tag".into()))
         );
+    }
+    #[test]
+    fn runtime_control_credentials_are_scoped_and_host_secret_is_not_injected() {
+        let mut spec = EnvironmentSpec {
+            id: "i".into(),
+            tenant_id: "t".into(),
+            image: "image".into(),
+            runtime_class: "runsc".into(),
+            resources: adx_core::Resources {
+                cpu_millis: 100,
+                memory_bytes: 1024,
+                disk_bytes: 1024,
+            },
+            runtime_profile: None,
+            snapshot_id: None,
+            lifecycle: Default::default(),
+            env: Default::default(),
+            scheduling: Default::default(),
+            priority: 0,
+            sandbox: Default::default(),
+        };
+        spec.env.insert(
+            "ADX_RUNTIME_CONTROL_ADDRESS".into(),
+            "http://attacker:1".into(),
+        );
+        spec.env
+            .insert("ADX_RUNTIME_CONTROL_SECRET".into(), "user-secret".into());
+        spec.env
+            .insert("ADX_RUNTIME_CONTROL_TOKEN".into(), "user-token".into());
+        let request = start_request(&spec, "i-7", 7, &[], &Config::default()).unwrap();
+        assert!(!request.envs.contains_key("ADX_RUNTIME_CONTROL_ADDRESS"));
+        assert!(!request.envs.contains_key("ADX_RUNTIME_CONTROL_TOKEN"));
+        assert!(!request.envs.contains_key("ADX_RUNTIME_CONTROL_SECRET"));
+        let secret = "0123456789abcdef0123456789abcdef";
+        let config = Config {
+            env: HashMap::from([
+                (
+                    "ADX_RUNTIME_CONTROL_ADDRESS".into(),
+                    "http://node:19003".into(),
+                ),
+                ("ADX_RUNTIME_CONTROL_SECRET".into(), secret.into()),
+            ]),
+            ..Config::default()
+        };
+        let request = start_request(&spec, "i-7", 7, &[], &config).unwrap();
+        let identity = adx_core::runtime::RuntimeIdentity {
+            environment_id: spec.id.clone(),
+            runtime_id: "i-7".into(),
+            ownership_generation: 7,
+        };
+        assert_eq!(
+            request.envs["ADX_RUNTIME_CONTROL_ADDRESS"],
+            "http://node:19003"
+        );
+        adx_protocol::runtime_stream::verify_token(
+            secret.as_bytes(),
+            &identity,
+            &request.envs["ADX_RUNTIME_CONTROL_TOKEN"],
+        )
+        .unwrap();
+        assert!(!request.envs.contains_key("ADX_RUNTIME_CONTROL_SECRET"));
     }
 }

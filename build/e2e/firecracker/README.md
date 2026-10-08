@@ -20,6 +20,23 @@ sudo env ADX_FC_BASE=/opt/adx ADX_FC_PROXY_MODE=embedded \
 
 `ADX_FC_PROXY_MODE` 支持 `embedded` 或 `standalone`。`ADX_E2E_EXECD_IMAGE` 和 `ADX_E2E_ENTRYPOINT_IMAGE` 可指定已发布的 EXECD／入口测试镜像；省略时分别从 `execd.tar` 和 `entrypoint.tar` 启动本机测试仓库。S3、Redis和API测试凭证每次随机生成，配置及密钥不进入公开证据。`collect.py` 只导出证据与组件日志并替换已知测试密钥。
 
+## Execd 主动控制流回归
+
+对支持主动控制流的当前 Execd 镜像，可设置 `ADX_E2E_RUNTIME_CONTROL=1`。驱动为 adxlet 配置网桥网关 `10.231.16.1:19003` 上的 gRPC 监听及节点私有凭据文件；FC guest 默认回连 `http://10.231.16.1:19003`，可通过 `ADX_E2E_RUNTIME_CONTROL_ADDRESS` 与 `ADX_E2E_RUNTIME_CONTROL_LISTEN` 分别指定回连和监听地址。使用同一版本的 ADX 发布包、静态 Execd 与 SDK，不能用旧镜像验证该模式。
+
+另外在基目录准备静态 `checkpoint-probe`。它由本目录的 `checkpoint_probe.rs` 为 guest 架构编译，是通过 SDK 上传到沙箱内的 Unix HTTP 客户端，实际调用 `/run/adx/execd.sock`，不是模拟 checkpoint 后端。ARM64 musl 构建示例：
+
+```sh
+rustc --edition=2024 --target aarch64-unknown-linux-musl \
+  -C linker=musl-gcc -O checkpoint_probe.rs -o /opt/adx/checkpoint-probe
+sudo env ADX_FC_BASE=/opt/adx ADX_E2E_RUNTIME_CONTROL=1 \
+  python3 -u /opt/adx/e2e/firecracker/node.py /var/lib/adx-fc-test/control-stream
+```
+
+启用后，驱动先执行 `sdk_control_stream.py` 的七项公共 SDK 检查：全网段拒绝下主动 Ready 创建；普通出网阻断而 SDK 命令／文件可用；stateful 全封禁下沙箱内 Unix checkpoint 与持久化完成；切换 stateless 全封禁后再次 checkpoint；reload 的执行身份切换、数据回滚与出网仍阻断；暂停后仅重启 adxlet 并恢复、出网仍阻断；删除后的 Redis 和物理后端清理。策略包含用户最高优先级的双向 Any／`0.0.0.0/0` Deny 和双向默认 Deny。通过临时仅允许探测 peer 的地址与端口确认目标实际可达，恢复全封禁后再次验证。结果写到 `evidence/sdk-control-stream.json`，任一项失败会阻止后续全量 FC 集合。
+
+本地两节点 Docker 驱动同样接受 `ADX_E2E_RUNTIME_CONTROL=1`，将监听地址设为每个容器的可达节点地址。基础功能仍由原 Standalone 用例集合验证。
+
 ## Kubernetes 与 Buildkite
 
 `kubernetes.py` 创建带唯一名称/标签的 namespace，部署一个选定 KVM worker 上的特权 Pod，执行与本地相同的26项SDK/生命周期用例。除原有 checkpoint、双克隆和故障场景外，当前集合还要求 S3 rootfs、S3 EROFS mount、独立执行 limit、镜像入口继承、reload、创建/运行期网络策略，以及有/无 checkpoint 的 failover。它保存部署命令、Pod/宿主信息、逐用例日志、结果JSON、JUnit、S3/Redis/实例清理证据。清理检查 namespace UID 与标签；不会删除替换后的 namespace。一个Pod不证明跨节点恢复。
@@ -60,7 +77,7 @@ package-v16 / Lima r20 已通过全部17项和最终清理，证据 `out/ci/paus
 
 当前18项必需用例包含公共SDK设置实例标签、实例硬亲和OR、节点顺序偏好和加权实例反亲和的创建及执行。该用例在单节点上证明SDK→Frontend→Coordinator→Adxlet→真实Firecracker的接线；两个候选节点之间的评分选择、租户隔离和反向反亲和由Rust定向测试验证，不能由单节点FC用例代替。
 
-当前代码把严格集合扩展为26项。Lima ARM64 r16 的SDK组19/19通过；r17、r18使用更新后的组件包，均先通过S3 rootfs、S3 EROFS mount、独立执行limit、入口继承、创建及运行期网络策略等前16项，再在双克隆写入阶段遇到Relay 504。生命周期隔离验收另行验证有／无checkpoint的failover和节点故障契约。上述拆分结果证明新增能力实际经过sandboxd/Firecracker，但不能替代同一次26/26严格验收；完整门禁仍需修复ARM FC双克隆网络问题后重跑并生成新的JUnit和全量清理证据。
+当前代码把严格集合扩展为26项。Lima ARM64 r16 的SDK组19/19通过；r17、r18使用更新后的组件包，均先通过S3 rootfs、S3 EROFS mount、独立执行limit、入口继承、创建及运行期网络策略等前16项，再在双克隆写入阶段遇到Relay 504。生命周期隔离验收另行验证有／无checkpoint的failover和节点故障契约。上述早期拆分结果不代表同一次26/26严格验收。后续 2026-10-07 的 `firecracker-008` 已在主动控制流模式通过原19项checkpoint和7项节点生命周期，且最终制品及实例清理通过，见[控制流验证记录](../../../docs/testing/runtime-control-stream.md)。该本地结论不代表目标Kubernetes验收。
 
 Lima ARM64 lifecycle r24 的7项故障用例全部通过：backend异常重启、有／无checkpoint的failover、Coordinator不可用时SQLite降级、Adxlet等待Coordinator、心跳过期后的旧会话隔离清理，以及资源观测过期门禁。外层清理确认6个实例全部Deleted且释放资源，runtime inventory、本地checkpoint、S3业务对象、测试进程和network namespace均无残留。证据位于`out/ci/sdk-capability-fc-20260920/fc-lifecycle-r24/`。
 

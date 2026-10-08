@@ -12,7 +12,7 @@ SDK → Rust API Server
   删除：本地实例目录 → adxlet.DeleteEnvironment
                          ↑ 结果不明／读后写时 Coordinator.GetEnvironment
   Reload：Coordinator.GetEnvironment 最新已提交记录 → adxlet.ReloadEnvironment
-adxlet → sandboxd / Execd HTTP / Relay UDS
+adxlet → sandboxd / Execd 控制流或 HTTP / Relay UDS
 adxlet → CoordinatorStateSink → Redis 条件提交
 ```
 

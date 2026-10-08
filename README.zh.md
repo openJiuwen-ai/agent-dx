@@ -152,6 +152,8 @@ ADX 将稳定逻辑身份与可替换物理执行分开：
 
 固定控制链路为 Agent／应用 → Sandbox SDK／HTTP API → API Server → Coordinator／Shard 调度器或本地优先 adxlet → sandboxd。运行时数据请求走 Ingress → Relay → Execd，不进入生命周期队列。`instanceId`、`instance_id` 和 `/api/instances` 等兼容字段只在公开边界转换；内部 Rust 类型、RPC、持久化字段、指标和运行身份统一使用 Environment 命名。
 
+Execd 支持主动向 adxlet 建立独立双向控制流，上报 Ready 和 checkpoint 状态，接收准备与完成命令。通过[节点运行时控制配置](docs/deployment/runtime-control-stream.md)启用，需要同时更新节点程序和运行镜像内的 Execd；未配置时运行时协作使用 HTTP。[接口契约](platform/api/proto/runtime-control.md)与[组件验证](docs/testing/runtime-control-stream.md)说明执行身份隔离、重连及持久化后应答规则。
+
 [组件命名与抽象](docs/architecture/naming.md)。
 
 ## ✨ 能力

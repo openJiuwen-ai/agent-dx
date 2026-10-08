@@ -1,4 +1,4 @@
-//! EXECD HTTP readiness after sandboxd has returned the runtime address.
+//! Execd Ready notification, or HTTP readiness when no stream is configured.
 use crate::runtime_control::RuntimeControlClient;
 use crate::{Readiness, RuntimeDriver};
 use adx_core::runtime::RuntimePhase;
@@ -73,6 +73,9 @@ fn unavailable(error: impl std::fmt::Display) -> Error {
 
 #[async_trait]
 impl Readiness for ExecdReadiness {
+    fn expect_runtime(&self, record: &EnvironmentRecord) -> Result<()> {
+        self.client.expect_runtime(record)
+    }
     async fn activity(&self, record: &EnvironmentRecord) -> Result<(u64, u64)> {
         let status = self.client.status(record).await?;
         if status.phase != RuntimePhase::Running || status.activity_revision == 0 {
@@ -84,6 +87,17 @@ impl Readiness for ExecdReadiness {
         Ok((status.activity_revision, status.active_requests))
     }
     async fn wait_ready(&self, record: &EnvironmentRecord) -> Result<()> {
+        if self.client.uses_stream() {
+            return tokio::time::timeout(self.ready_timeout, async {
+                self.client.wait_ready_notification(record).await?;
+                if !self.runtime.is_running(&record.runtime.id).await? {
+                    return Err(unavailable("runtime exited before Ready"));
+                }
+                Ok(())
+            })
+            .await
+            .map_err(|_| unavailable("Ready notification deadline exceeded"))?;
+        }
         tokio::time::timeout(self.ready_timeout, async {
             loop {
                 let probe = tokio::time::timeout(self.probe_timeout, async {

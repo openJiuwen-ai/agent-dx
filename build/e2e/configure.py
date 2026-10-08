@@ -149,6 +149,9 @@ if result_ttl:
 if use_journal:
  node_config['degradation_journal']=str(P/'degraded/results.sqlite')
  node_config['rpc_timeout_seconds']=30
+if os.getenv('ADX_E2E_RUNTIME_CONTROL') == '1':
+ bridge_ip=sandboxd_gateway_range(node).split('/')[0]
+ node_config['runtime_control']={'listen':f'{bridge_ip}:19003','advertised_address':f'http://{bridge_ip}:19003','key_file':str(P/'runtime-control-key')}
 add(node,'adxlet',node_config,np)
 if relay_mode=='standalone':add('relay','relay',{},np)
 if node=='node1':

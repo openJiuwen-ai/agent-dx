@@ -437,6 +437,41 @@ impl Ingress {
         route: RouteHandle,
         passive: bool,
     ) -> io::Result<IngressStream> {
+        let error = match self.open_current_stream(route.clone(), passive).await {
+            Ok(stream) => return Ok(stream),
+            Err(error) => error,
+        };
+        if self.draining.load(Ordering::Acquire)
+            || !matches!(
+                error.kind(),
+                io::ErrorKind::InvalidData | io::ErrorKind::NotConnected
+            )
+        {
+            return Err(error);
+        }
+        // CONNECT was rejected before any application bytes were sent. Wait
+        // only for a replacement binding, then open once against that execution.
+        let replacement = match self.resolver.replacement(&route).await {
+            Ok(replacement) => replacement,
+            Err(_) => return Err(error),
+        };
+        if replacement.tenant_id != route.tenant_id
+            || replacement.tunnel_security_mode != route.tunnel_security_mode
+            || replacement.port_forward_auth_mode != route.port_forward_auth_mode
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "route authorization changed while opening the stream",
+            ));
+        }
+        self.open_current_stream(replacement, passive).await
+    }
+
+    async fn open_current_stream(
+        &self,
+        route: RouteHandle,
+        passive: bool,
+    ) -> io::Result<IngressStream> {
         if self.draining.load(Ordering::Acquire) {
             return Err(io::Error::new(
                 io::ErrorKind::NotConnected,
@@ -1252,7 +1287,7 @@ impl Ingress {
                                                 subscriptions.insert(key, subscription);
                                             }
                                             Err(error) => {
-                                                outbound_tx.send(WatchState::rejected(command, error.to_string())).await?;
+                                                outbound_tx.send(WatchState::subscription_failure(command, error)).await?;
                                             }
                                         }
                                     }
@@ -1696,6 +1731,26 @@ impl WatchState {
     fn with_sandbox(mut self, sandbox_id: &str) -> Self {
         self.sandbox_id = sandbox_id.to_owned();
         self
+    }
+
+    fn subscription_failure(command: WatchCommandRef, error: IngressOpenError) -> Self {
+        // The command already exists. A temporary downstream failure should
+        // reconnect its subscription, never reject it or start another command.
+        let retryable = match &error {
+            IngressOpenError::Resolve(ResolveError::NotReady | ResolveError::Unavailable(_))
+            | IngressOpenError::Draining
+            | IngressOpenError::RouteChanged => true,
+            IngressOpenError::Connect(error) => !matches!(
+                error.kind(),
+                io::ErrorKind::PermissionDenied | io::ErrorKind::InvalidData
+            ),
+            _ => false,
+        };
+        let mut state = Self::rejected(command, error.to_string());
+        if retryable {
+            state.status = "RECONNECT".into();
+        }
+        state
     }
 
     fn rejected(command: WatchCommandRef, error: String) -> Self {
@@ -2352,6 +2407,38 @@ mod tests {
     use crate::common::protocol::ConnectTarget;
     use crate::common::route::{DataPlaneAuthMode, DataPlaneSecurityMode};
 
+    #[test]
+    fn watch_subscription_failure_reconnects_transient_transport_but_rejects_permissions() {
+        let command = || WatchCommandRef {
+            sandbox_id: "sandbox".into(),
+            command_id: "command".into(),
+        };
+        for error in [
+            IngressOpenError::Connect(io::Error::other("HTTP error: 503 Service Unavailable")),
+            IngressOpenError::Resolve(ResolveError::NotReady),
+            IngressOpenError::RouteChanged,
+        ] {
+            assert_eq!(
+                WatchState::subscription_failure(command(), error).status,
+                "RECONNECT"
+            );
+        }
+        for error in [
+            IngressOpenError::Forbidden,
+            IngressOpenError::Resolve(ResolveError::NotFound),
+            IngressOpenError::Connect(io::Error::new(io::ErrorKind::PermissionDenied, "denied")),
+            IngressOpenError::Connect(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "identity conflict",
+            )),
+        ] {
+            assert_eq!(
+                WatchState::subscription_failure(command(), error).status,
+                "REJECTED"
+            );
+        }
+    }
+
     #[derive(Clone)]
     struct TlsTestLog(Arc<Mutex<Vec<u8>>>);
 
@@ -2787,6 +2874,9 @@ mod tests {
 
 #[cfg(test)]
 mod reverse_proxy_tests;
+
+#[cfg(all(test, feature = "mock-e2e"))]
+mod route_recovery_tests;
 
 #[cfg(feature = "agent-api")]
 fn response_text(status: StatusCode, message: &str) -> Response<ProxyBody> {

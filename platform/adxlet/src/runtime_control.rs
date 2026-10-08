@@ -1,4 +1,4 @@
-//! Node-local HTTP cooperation with the Environment runtime.
+//! Node-local runtime cooperation over a control stream or HTTP.
 use adx_core::{runtime::*, EnvironmentRecord, Error, Result};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
@@ -189,6 +189,7 @@ pub struct RuntimeControlClient {
     port: u16,
     timeout: Duration,
     token: Option<HeaderValue>,
+    stream: Option<crate::control_stream::RuntimeControlHub>,
 }
 impl RuntimeControlClient {
     pub fn new(port: u16, timeout: Duration) -> Result<Self> {
@@ -202,7 +203,48 @@ impl RuntimeControlClient {
             port,
             timeout,
             token: None,
+            stream: None,
         })
+    }
+    pub fn with_stream(mut self, stream: crate::control_stream::RuntimeControlHub) -> Self {
+        self.stream = Some(stream);
+        self
+    }
+    pub fn expect_runtime(&self, record: &EnvironmentRecord) -> Result<()> {
+        if let Some(stream) = &self.stream {
+            stream.expect(&Self::identity(record))?;
+        }
+        Ok(())
+    }
+    pub async fn wait_ready_notification(&self, record: &EnvironmentRecord) -> Result<bool> {
+        if let Some(stream) = &self.stream {
+            stream.wait_ready(&Self::identity(record)).await?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+    pub fn pending_checkpoint(&self, record: &EnvironmentRecord) -> Result<Option<RuntimeStatus>> {
+        self.stream
+            .as_ref()
+            .map(|s| s.observed(&Self::identity(record)))
+            .transpose()
+            .map(Option::flatten)
+    }
+    pub async fn wait_resume_notification(
+        &self,
+        record: &EnvironmentRecord,
+        operation_id: &str,
+    ) -> Result<bool> {
+        if let Some(stream) = &self.stream {
+            stream
+                .wait_resumed(&Self::identity(record), operation_id)
+                .await?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+    pub fn uses_stream(&self) -> bool {
+        self.stream.is_some()
     }
     pub fn with_token(mut self, token: &str) -> Result<Self> {
         if token.is_empty() {
@@ -251,6 +293,9 @@ impl RuntimeControlClient {
     /// The ownership generation fences a late cleanup from closing connections
     /// belonging to a replacement runtime which reused the same endpoint.
     pub fn retire(&self, record: &EnvironmentRecord) {
+        if let Some(stream) = &self.stream {
+            stream.retire(&Self::identity(record));
+        }
         let Ok(key) = self.key(record) else {
             return;
         };
@@ -270,6 +315,38 @@ impl RuntimeControlClient {
         body: Option<Vec<u8>>,
     ) -> Result<RuntimeStatus> {
         let expected = Self::identity(record);
+        if let Some(stream) = &self.stream {
+            use adx_protocol::runtime_stream::ControlOperation;
+            let parse = |bytes: Option<Vec<u8>>| {
+                bytes.ok_or_else(|| Error::Invalid("control body required".into()))
+            };
+            let operation = match path {
+                "status" => ControlOperation::Status,
+                "checkpoint/prepare" => ControlOperation::Prepare(
+                    serde_json::from_slice(&parse(body)?).map_err(unavailable)?,
+                ),
+                "checkpoint/abort-unstarted" => ControlOperation::Abort(
+                    serde_json::from_slice(&parse(body)?).map_err(unavailable)?,
+                ),
+                "checkpoint/finish" => ControlOperation::Finish(
+                    serde_json::from_slice(&parse(body)?).map_err(unavailable)?,
+                ),
+                _ => return Err(Error::Invalid("unknown runtime control operation".into())),
+            };
+            let attempts = if matches!(operation, ControlOperation::Status) {
+                1
+            } else {
+                2
+            };
+            for attempt in 0..attempts {
+                stream.wait_connected(&expected).await?;
+                match stream.request(&expected, operation.clone()).await {
+                    Err(Error::Unavailable(_)) if attempt + 1 < attempts => continue,
+                    result => return result,
+                }
+            }
+            return Err(unavailable("runtime control unavailable"));
+        }
         let key = self.key(record)?;
         let connection = self.connection(&key);
         let method = if body.is_some() {

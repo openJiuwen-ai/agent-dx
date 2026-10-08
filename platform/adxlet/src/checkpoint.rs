@@ -92,7 +92,14 @@ impl CheckpointCooperation for crate::runtime_control::RuntimeControlClient {
         &self,
         record: &EnvironmentRecord,
     ) -> Result<Option<adx_core::runtime::RuntimeStatus>> {
-        let status = self.status(record).await?;
+        let status = if self.uses_stream() {
+            match self.pending_checkpoint(record)? {
+                Some(status) => status,
+                None => return Ok(None),
+            }
+        } else {
+            self.status(record).await?
+        };
         Ok(status.requested_checkpoint.is_some().then_some(status))
     }
     async fn finish_workload(
@@ -105,6 +112,9 @@ impl CheckpointCooperation for crate::runtime_control::RuntimeControlClient {
     }
     async fn resumed(&self, record: &EnvironmentRecord, id: &str) -> Result<()> {
         use adx_core::runtime::{CheckpointPhase, RuntimePhase};
+        if self.wait_resume_notification(record, id).await? {
+            return Ok(());
+        }
         loop {
             let status = self.status(record).await?;
             let cp = status.checkpoint.as_ref().ok_or(Error::Conflict)?;

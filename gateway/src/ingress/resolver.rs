@@ -152,6 +152,40 @@ impl IngressRouteResolver {
             })
     }
 
+    /// Wait for a replacement after Relay rejects an obsolete execution.
+    /// Subscribe before re-reading; unrelated deltas never extend the budget.
+    pub(super) async fn replacement(&self, old: &RouteHandle) -> Result<RouteHandle, ResolveError> {
+        let mut changes = self.store.subscribe();
+        let replacement = async {
+            loop {
+                if !self.store.ready() {
+                    return Err(ResolveError::NotReady);
+                }
+                if !self.route_is_current(old) {
+                    return self
+                        .resolve(
+                            &old.target.instance_id,
+                            old.target.target_port,
+                            old.access_kind,
+                            old.target.request_id.clone(),
+                        )
+                        .await;
+                }
+                match changes.recv().await {
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        return Err(ResolveError::Unavailable(
+                            "route subscription closed".into(),
+                        ));
+                    }
+                }
+            }
+        };
+        tokio::time::timeout(ROUTE_ARRIVAL_WAIT, replacement)
+            .await
+            .map_err(|_| ResolveError::Unavailable("replacement route did not arrive".into()))?
+    }
+
     async fn subscribed_route(&self, instance_id: &str) -> Result<RouteInfo, ResolveError> {
         // Subscribe before re-reading so a delta between the original miss and
         // subscription cannot be lost. A lagged receiver re-reads current state.

@@ -1,4 +1,4 @@
-//! EXECD HTTP control payloads; lifecycle decisions remain in Adxlet.
+//! Shared Execd HTTP/stream control payloads; lifecycle decisions remain in Adxlet.
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

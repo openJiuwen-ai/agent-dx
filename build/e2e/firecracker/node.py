@@ -83,6 +83,14 @@ try:
  (E/'ready.json').write_text(json.dumps({'ready':True}))
  (E/'egress-probe.json').write_text(json.dumps({'host':env['ADX_FC_EGRESS_PROBE_HOST'],'port':int(env['ADX_FC_EGRESS_PROBE_PORT']),'namespace':probe_namespace}))
  print('PLATFORM READY',RUN,flush=True)
+ if os.environ.get('ADX_E2E_RUNTIME_CONTROL') == '1':
+  deployment=json.loads((RUN/'deployment.yaml').read_text())
+  configured=next(s for s in deployment['services'] if s['role']=='adxlet')['config']['runtime_control']
+  listeners=run(['ss','-lnt'])
+  assert any(configured['listen'] in line.split() for line in listeners.splitlines()), 'runtime control did not bind the configured bridge address'
+  (E/'runtime-control-listener.json').write_text(json.dumps({'listen':configured['listen'],'advertised_address':configured['advertised_address'],'bound':True},indent=2))
+  if not (BASE/'checkpoint-probe').is_file(): raise RuntimeError('static checkpoint-probe fixture required for runtime control E2E')
+  subprocess.run([str(BASE/'client/bin/python'),'-u',str(BASE/'e2e/firecracker/sdk_control_stream.py'),'--run',str(RUN),'--base',str(BASE),'--image',image],env=env,check=True,timeout=600)
  subprocess.run([str(BASE/'client/bin/python'),'-u',str(BASE/'e2e/firecracker/sdk_checkpoint.py'),'--endpoint','127.0.0.1:8443','--token-file',str(RUN/'secrets/api-key'),'--ca',str(RUN/'secrets/tls/ca.pem'),'--image',image,'--entrypoint-image',entrypoint_image,'--package',str(BASE/'package'),'--output',str(E/'sdk'),'--restart-command','python3',str(BASE/'e2e/firecracker/restart_paused.py'),str(RUN)],env=env,check=True,timeout=1500)
  subprocess.run([str(BASE/'client/bin/python'),'-u',str(BASE/'e2e/firecracker/sdk_node_lifecycle.py'),'--run-root',str(RUN),'--image',image,'--package',str(BASE/'package'),'--tools',str(BASE/'tools')],env=env,check=True,timeout=600)
  def snapshots_collected():

@@ -154,6 +154,8 @@ ADX separates stable logical identity from replaceable execution:
 
 The fixed control path is Agent/application → Sandbox SDK/HTTP API → API Server → Coordinator/Shard scheduler or local-first adxlet → sandboxd. Runtime traffic follows Ingress → Relay → Execd and does not enter lifecycle queues. Compatibility fields such as `instanceId`, `instance_id`, and `/api/instances` are translated at the public boundary; internal Rust types, RPCs, persistence keys, metrics, and runtime identity use Environment terminology.
 
+Execd can initiate a dedicated bidirectional control stream to adxlet, publishing Ready and checkpoint state while receiving checkpoint commands. Enable it with the [node runtime-control configuration](docs/deployment/runtime-control-stream.md); both the node binary and the Execd inside the runtime image must be updated. Without that configuration, runtime cooperation uses HTTP. The [contract](platform/api/proto/runtime-control.md) and [component validation](docs/testing/runtime-control-stream.md) describe identity fencing, reconnect and durable acknowledgement.
+
 [Component names and abstractions](docs/architecture/naming.md).
 
 ## ✨ Capabilities

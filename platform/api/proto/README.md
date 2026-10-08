@@ -16,7 +16,8 @@ Public HTTP contracts are separate from these internal gRPC protocols:
 | `credentials.proto` | API Key validation and administrator operations | AuthService and CredentialService |
 | `routes.proto` | Versioned Environment directory and committed route publication | EnvironmentDirectoryService and RouteService |
 | `node.proto` / `adx.node.v1` | Versioned Relay bindings and activity | Node-local UDS services |
-| EXECD HTTP | Commands, files, health, checkpoint cooperation and tunnels | See [runtime contract](../http/runtime-control.md) |
+| `runtime_control.proto` / `adx.runtime.v1` | Execd-initiated Ready/state events and node checkpoint commands | Opt-in [bidirectional control stream](runtime-control.md) |
+| EXECD HTTP | Commands, files, health and tunnels; control when no stream is configured | See [HTTP runtime contract](../http/runtime-control.md) |
 | Management errors | Stable HTTP/gRPC/SDK code, retry and outcome semantics | See [error contract](../http/error-contract.md) |
 
 The Rust API Server converts public HTTP JSON directly into Environment RPC types.
@@ -26,8 +27,10 @@ schema boundary: deployments must upgrade all components together and start
 with a fresh Redis/SQLite control state. Public Sandbox HTTP fields such as
 `instanceId` and `instance_id` remain compatible and are translated only by API Server.
 
-EXECD uses HTTP for operations and runtime cooperation. Its POSIX stream, signal
-reporting, generated protobuf modules and protobuf build script have been removed.
+EXECD user operations use HTTP. Runtime cooperation uses an Execd-initiated
+bidirectional gRPC stream when `adxlet.runtime_control` is configured; otherwise
+it uses the HTTP control interface. Both transports share the same typed operations
+and runtime state machine. The removed POSIX and signal services are not used.
 
 The external sandboxd protocol is pinned upstream source under
 `third_party/sandboxd`; it is an execution-backend dependency, not an internal

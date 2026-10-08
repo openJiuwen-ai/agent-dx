@@ -39,6 +39,10 @@ enum Command {
     Discard(oneshot::Sender<Result<()>>),
     Expire(u64, oneshot::Sender<Result<Option<OperationResult>>>),
     Tick(oneshot::Sender<Result<Option<OperationResult>>>),
+    RuntimeEvent(
+        adx_core::runtime::RuntimeIdentity,
+        oneshot::Sender<Result<()>>,
+    ),
 }
 type Reply = oneshot::Sender<Result<OperationResult>>;
 struct Envelope {
@@ -157,6 +161,20 @@ impl EnvironmentHandle {
         rx.await
             .map_err(|_| Error::Unavailable("environment controller stopped".into()))?
     }
+    pub(crate) async fn observe_runtime(
+        &self,
+        identity: adx_core::runtime::RuntimeIdentity,
+    ) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        let (unused, _) = oneshot::channel();
+        self.tx
+            .send(Envelope::new(Command::RuntimeEvent(identity, tx), unused))
+            .await
+            .map_err(|_| Error::Unavailable("environment controller stopped".into()))?;
+        rx.await
+            .map_err(|_| Error::Unavailable("environment controller stopped".into()))?
+    }
+
     pub async fn tick(&self) -> Result<Option<OperationResult>> {
         let (tx, rx) = oneshot::channel();
         let (unused, _) = oneshot::channel();
@@ -248,6 +266,19 @@ impl Controller {
                 let _ = ack.send(result);
                 return;
             }
+            Command::RuntimeEvent(identity, ack) => {
+                let result = if self.retired
+                    || identity
+                        != super::runtime_control::RuntimeControlClient::identity(&self.record)
+                    || self.record.state != EnvironmentState::Running
+                {
+                    Ok(())
+                } else {
+                    self.workload_checkpoint().await.map(|_| ())
+                };
+                let _ = ack.send(result);
+                return;
+            }
             Command::Tick(ack) => {
                 let result = if self.retired {
                     Err(Error::Conflict)
@@ -301,7 +332,8 @@ impl Controller {
             Command::Snapshot(_, _)
             | Command::Discard(_)
             | Command::Expire(_, _)
-            | Command::Tick(_) => unreachable!(),
+            | Command::Tick(_)
+            | Command::RuntimeEvent(_, _) => unreachable!(),
             Command::Pause(request) => self.pause(request).await,
             Command::Resume(request) => self.resume(request).await,
             Command::Network {
@@ -375,6 +407,14 @@ impl Controller {
                 .is_running(&self.record.runtime.id)
                 .await?
         {
+            self.services.readiness.expect_runtime(&self.record)?;
+            if let Some(control) = &self.services.runtime_control {
+                control.expect_runtime(&self.record)?;
+                // Reconnect must deliver a full snapshot before pending-operation reconciliation.
+                if control.uses_stream() {
+                    control.status(&self.record).await?;
+                }
+            }
             self.reconcile_workload_checkpoint().await?;
             if self.record.state == EnvironmentState::Failed {
                 return self.sync().await;
@@ -552,6 +592,7 @@ impl Controller {
         self.transition(Event::Start)?;
         let operation_started = Instant::now();
         let attempt = timeout(self.services.operation_timeout, async {
+            self.services.readiness.expect_runtime(&self.record)?;
             let runtime_start_started = Instant::now();
             self.record.runtime.ip = Some(
                 adx_observability::trace::Trace::child("environment.runtime.start")

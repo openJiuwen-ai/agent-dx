@@ -238,6 +238,9 @@ impl Controller {
             self.sync().await?;
             return Err(error);
         }
+        if let Some(control) = &self.services.runtime_control {
+            control.retire(&self.record);
+        }
         self.recovery_files = None;
         self.release_capacity()?;
         self.record.runtime.ip = None;
@@ -318,6 +321,7 @@ impl Controller {
         self.record.resources_held = true;
         self.transition(Event::Resume)?;
         let attempt = async {
+            self.services.readiness.expect_runtime(&self.record)?;
             self.record.runtime.ip = Some(
                 self.services
                     .runtime
