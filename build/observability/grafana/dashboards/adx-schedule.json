@@ -1459,12 +1459,13 @@
             "type": "loki",
             "uid": "loki"
           },
-          "expr": "{adx_env=~\"$adx_env\"}",
+          "expr": "{adx_env=~\"$adx_env\"} | json | line_format `{{if .fields_message}}{{.level}} {{.fields_message}}{{else}}{{__line__}}{{end}}`",
           "refId": "A"
         }
       ],
       "title": "控制面、节点与沙箱日志",
-      "type": "logs"
+      "type": "logs",
+      "description": "组件 JSON 日志显示级别与消息，展开可查看解析字段；没有消息字段或无法解析的日志保留原文。原始日志仍保存在 Loki，未按解析结果过滤。"
     }
   ],
   "preload": false,
@@ -1480,7 +1481,7 @@
   "templating": {
     "list": [
       {
-        "allValue": ".*",
+        "allValue": ".+",
         "current": {
           "text": "All",
           "value": "$__all"
@@ -1510,6 +1511,6 @@
   "timezone": "browser",
   "title": "ADX Schedule",
   "uid": "adx-schedule",
-  "version": 3,
+  "version": 4,
   "weekStart": ""
 }
