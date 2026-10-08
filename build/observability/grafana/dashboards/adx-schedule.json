@@ -1452,20 +1452,26 @@
         "h": 10
       },
       "id": 21,
-      "options": {},
+      "options": {
+        "showTime": true,
+        "wrapLogMessage": true,
+        "enableLogDetails": true,
+        "sortOrder": "Descending",
+        "dedupStrategy": "none"
+      },
       "targets": [
         {
           "datasource": {
             "type": "loki",
             "uid": "loki"
           },
-          "expr": "{adx_env=~\"$adx_env\"} | json | line_format `{{if .fields_message}}{{.level}} {{.fields_message}}{{else}}{{__line__}}{{end}}`",
+          "expr": "{adx_env=~\"$adx_env\",component_name=\"adx-runtime\"} | runtime_id=~`${runtime_id:regex}` |= ${log_search:json}",
           "refId": "A"
         }
       ],
-      "title": "控制面、节点与沙箱日志",
+      "title": "沙箱日志搜索",
       "type": "logs",
-      "description": "组件 JSON 日志显示级别与消息，展开可查看解析字段；没有消息字段或无法解析的日志保留原文。原始日志仍保存在 Loki，未按解析结果过滤。"
+      "description": "仅查询沙箱主进程 stdout/stderr，支持运行记录多选与原文关键词搜索。运行 ID 包含 Sandbox ID 和 generation；下拉候选来自所选时间范围内的资源采样，没有采样的运行记录可通过 All 查看。SDK command 返回结果不会自动归档到这里。"
     }
   ],
   "preload": false,
@@ -1500,6 +1506,48 @@
         "regex": "",
         "sort": 1,
         "type": "query"
+      },
+      {
+        "name": "runtime_id",
+        "label": "沙箱运行记录",
+        "description": "可搜索 Sandbox ID 并多选其运行记录；候选来自当前时间范围的资源采样。All 查询全部已采集的沙箱输出。",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "definition": "label_values(adx_environment_stats_age_seconds{adx_env=~\"$adx_env\"}, runtime_id)",
+        "query": {
+          "query": "label_values(adx_environment_stats_age_seconds{adx_env=~\"$adx_env\"}, runtime_id)",
+          "refId": "Prometheus-runtime-id-Variable"
+        },
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".+",
+        "current": {
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
+        "options": [],
+        "refresh": 2,
+        "sort": 1,
+        "regex": ""
+      },
+      {
+        "name": "log_search",
+        "label": "日志关键词",
+        "description": "按原文包含关系搜索，区分大小写；留空不限制。",
+        "type": "textbox",
+        "query": "",
+        "current": {
+          "text": "",
+          "value": ""
+        },
+        "options": []
       }
     ]
   },
@@ -1511,6 +1559,6 @@
   "timezone": "browser",
   "title": "ADX Schedule",
   "uid": "adx-schedule",
-  "version": 4,
+  "version": 5,
   "weekStart": ""
 }
