@@ -27,14 +27,6 @@
   },
   "links": [
     {
-      "title": "Overview",
-      "type": "link",
-      "url": "/d/adx-observability",
-      "includeVars": true,
-      "keepTime": true,
-      "targetBlank": false
-    },
-    {
       "title": "Schedule",
       "type": "link",
       "url": "/d/adx-schedule",
