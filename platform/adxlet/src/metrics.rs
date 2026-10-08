@@ -71,6 +71,7 @@ impl Adxlet {
         self.prune_retired_environments();
         let mut output = self.services.metrics.render();
         output.push_str(&adx_observability::trace::metrics());
+        output.push_str(&adx_observability::process::metrics());
         let managed_environments = u64::try_from(
             self.environments
                 .lock()

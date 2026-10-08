@@ -1,0 +1,558 @@
+{
+  "description": "ADX scheduling, process, sandbox resource and trace export observability.",
+  "id": 0,
+  "panels": [
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 8,
+        "x": 0,
+        "y": 0
+      },
+      "id": 1,
+      "options": {},
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(adx_coordinator_node_schedulable{adx_env=~\"$adx_env\"})",
+          "legendFormat": "节点",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "可调度节点",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 8,
+        "x": 8,
+        "y": 0
+      },
+      "id": 2,
+      "options": {},
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(sandbox_running{adx_env=~\"$adx_env\"})",
+          "legendFormat": "沙箱",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "运行中沙箱",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 8,
+        "x": 16,
+        "y": 0
+      },
+      "id": 3,
+      "options": {},
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(adx_coordinator_queued_requests{adx_env=~\"$adx_env\"})",
+          "legendFormat": "请求",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "排队请求",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "cores"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 4
+      },
+      "id": 4,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(adx_coordinator_node_capacity_cpu_millis{adx_env=~\"$adx_env\"} and on (adx_env, node_id) (adx_coordinator_node_reachable{adx_env=~\"$adx_env\"} == 1)) / 1000",
+          "legendFormat": "容量",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(adx_coordinator_node_reserved_cpu_millis{adx_env=~\"$adx_env\"}) / 1000",
+          "legendFormat": "预留",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(adx_coordinator_node_available_cpu_millis{adx_env=~\"$adx_env\"} and on (adx_env, node_id) (adx_coordinator_node_reachable{adx_env=~\"$adx_env\"} == 1)) / 1000",
+          "legendFormat": "可用",
+          "range": true,
+          "refId": "C"
+        }
+      ],
+      "title": "ADX 调度 CPU（核）",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 4
+      },
+      "id": 5,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(adx_coordinator_node_capacity_memory_bytes{adx_env=~\"$adx_env\"} and on (adx_env, node_id) (adx_coordinator_node_reachable{adx_env=~\"$adx_env\"} == 1)) / 1073741824",
+          "legendFormat": "容量",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(adx_coordinator_node_reserved_memory_bytes{adx_env=~\"$adx_env\"}) / 1073741824",
+          "legendFormat": "预留",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(adx_coordinator_node_available_memory_bytes{adx_env=~\"$adx_env\"} and on (adx_env, node_id) (adx_coordinator_node_reachable{adx_env=~\"$adx_env\"} == 1)) / 1073741824",
+          "legendFormat": "可用",
+          "range": true,
+          "refId": "C"
+        }
+      ],
+      "title": "ADX 调度内存（GiB）",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 12
+      },
+      "id": 6,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "adx_coordinator_node_reachable{adx_env=~\"$adx_env\"}",
+          "legendFormat": "可达 {{node_id}}",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "adx_coordinator_node_schedulable{adx_env=~\"$adx_env\"}",
+          "legendFormat": "可调度 {{node_id}}",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "adx_node_resource_observation_fresh{adx_env=~\"$adx_env\"}",
+          "legendFormat": "资源观测新鲜度",
+          "range": true,
+          "refId": "C"
+        }
+      ],
+      "title": "节点健康与可调度状态",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 12
+      },
+      "id": 7,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "100 * node_cpu_usage{adx_env=~\"$adx_env\"} / node_cpu_limit{adx_env=~\"$adx_env\"}",
+          "legendFormat": "{{host_name}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "ADX 节点 CPU 使用率",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "cores"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 20
+      },
+      "id": 8,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sandbox_cpu_usage{adx_env=~\"$adx_env\"}",
+          "legendFormat": "{{sandbox_id}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "沙箱 CPU 使用量（核）",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 20
+      },
+      "id": 9,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sandbox_memory_usage_bytes{adx_env=~\"$adx_env\"}",
+          "legendFormat": "{{sandbox_id}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "沙箱内存使用量",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "loki",
+        "uid": "loki"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 28
+      },
+      "id": 10,
+      "options": {},
+      "targets": [
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "loki"
+          },
+          "expr": "{adx_env=~\"$adx_env\"}",
+          "refId": "A"
+        }
+      ],
+      "title": "ADX 控制面、节点与沙箱日志",
+      "type": "logs"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 37
+      },
+      "id": 11,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(adx_trace_exported_spans_total{adx_env=~\"$adx_env\"})",
+          "legendFormat": "已导出",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(adx_trace_export_failed_spans_total{adx_env=~\"$adx_env\"})",
+          "legendFormat": "导出失败",
+          "refId": "B"
+        }
+      ],
+      "title": "ADX Trace 导出与失败 span",
+      "type": "timeseries",
+      "description": "Coordinator 和 Adxlet 原生 trace 导出计数；Ingress trace 由 Tempo 直接查询。"
+    }
+  ],
+  "refresh": "15s",
+  "schemaVersion": 39,
+  "tags": [
+    "adx",
+    "agent-dx"
+  ],
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "timezone": "browser",
+  "title": "ADX Observability",
+  "uid": "adx-observability",
+  "version": 2,
+  "templating": {
+    "list": [
+      {
+        "allValue": ".*",
+        "current": {
+          "text": "cn-north-4-adx-test",
+          "value": "cn-north-4-adx-test"
+        },
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "definition": "label_values(adx_coordinator_node_capacity_cpu_millis, adx_env)",
+        "includeAll": true,
+        "label": "adx_env",
+        "name": "adx_env",
+        "options": [],
+        "query": {
+          "query": "label_values(adx_coordinator_node_capacity_cpu_millis, adx_env)",
+          "refId": "Prometheus-adx-env-Variable"
+        },
+        "refresh": 2,
+        "regex": "",
+        "sort": 1,
+        "type": "query"
+      }
+    ]
+  },
+  "links": [
+    {
+      "title": "Overview",
+      "type": "link",
+      "url": "/d/adx-observability",
+      "includeVars": true,
+      "keepTime": true,
+      "targetBlank": false
+    },
+    {
+      "title": "Schedule",
+      "type": "link",
+      "url": "/d/adx-schedule",
+      "includeVars": true,
+      "keepTime": true,
+      "targetBlank": false
+    },
+    {
+      "title": "Data Plane",
+      "type": "link",
+      "url": "/d/adx-data-plane",
+      "includeVars": true,
+      "keepTime": true,
+      "targetBlank": false
+    },
+    {
+      "title": "Process Resources",
+      "type": "link",
+      "url": "/d/adx-process-resources",
+      "includeVars": true,
+      "keepTime": true,
+      "targetBlank": false
+    }
+  ]
+}
