@@ -38,6 +38,26 @@ impl Trace {
         let context = TraceContextPropagator::new().extract_with_context(&Context::new(), &headers);
         Self::start(name, context, SpanKind::Server)
     }
+    /// Name HTTP spans by their bounded route template, never a concrete URL.
+    pub fn http(
+        method: &str,
+        route: &'static str,
+        parent: Option<&str>,
+        state: Option<&str>,
+    ) -> Self {
+        let trace = Self::remote("http.request", parent, state);
+        let method = match method {
+            "GET" | "POST" | "PUT" | "DELETE" | "PATCH" | "HEAD" | "OPTIONS" | "CONNECT" => method,
+            _ => "OTHER",
+        };
+        trace
+            .context
+            .span()
+            .update_name(format!("{method} {route}"));
+        trace.attribute("http.request.method", method.to_owned());
+        trace.attribute("http.route", route.to_owned());
+        trace
+    }
     pub fn rpc<T>(name: &'static str, request: &tonic::Request<T>) -> Self {
         Self::remote(
             name,
@@ -206,4 +226,91 @@ impl opentelemetry_sdk::trace::SpanExporter for CountedExporter {
 }
 pub fn metrics() -> String {
     format!("# TYPE adx_trace_exported_spans_total counter\nadx_trace_exported_spans_total {}\n# TYPE adx_trace_export_failed_spans_total counter\nadx_trace_export_failed_spans_total {}\n",EXPORTED.load(std::sync::atomic::Ordering::Relaxed),EXPORT_FAILED.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Bounded HTTP route names shared by the public API and runtime forwarding.
+/// Unknown paths and user-selected ports/files are never copied into span names.
+pub fn http_route(path: &str) -> &'static str {
+    let path = path.split('?').next().unwrap_or(path);
+    match path {
+        "/healthz" => return "/healthz",
+        "/metrics" => return "/metrics",
+        "/invoke" => return "/invoke",
+        "/commands/watch" => return "/commands/watch",
+        "/pty" => return "/pty",
+        "/upload" => return "/upload",
+        "/upload/status" => return "/upload/status",
+        "/upload/commit" => return "/upload/commit",
+        "/download" => return "/download",
+        "/control/v1/checkpoint" => return "/control/v1/checkpoint",
+        "/control/v1/status" => return "/control/v1/status",
+        "/api/sandbox/create" => return "/api/sandbox/create",
+        "/api/sandbox/v1/sandboxes" => return "/api/sandbox/v1/sandboxes",
+        "/api/sandbox/v1/snapshots" => return "/api/sandbox/v1/snapshots",
+        "/api/admin/v1/keys" => return "/api/admin/v1/keys",
+        "/api/agent" => return "/api/agent",
+        "/global-scheduler/resources" => return "/global-scheduler/resources",
+        "/global-scheduler/scheduling_queue" => return "/global-scheduler/scheduling_queue",
+        "/global-scheduler/node/localschedulingstatus" => {
+            return "/global-scheduler/node/localschedulingstatus"
+        }
+        _ => (),
+    }
+    if path
+        .strip_prefix("/api/sandbox/v1/snapshots/")
+        .is_some_and(|id| !id.is_empty() && !id.contains('/'))
+    {
+        return "/api/sandbox/v1/snapshots/{id}";
+    }
+    if path
+        .strip_prefix("/api/admin/v1/keys/")
+        .is_some_and(|id| !id.is_empty() && !id.contains('/'))
+    {
+        return "/api/admin/v1/keys/{id}";
+    }
+    if let Some(rest) = path.strip_prefix("/api/sandbox/v1/sandboxes/") {
+        let (id, action) = rest.split_once('/').unwrap_or((rest, ""));
+        if id.is_empty() {
+            return "/unmatched";
+        }
+        return match action {
+            "" => "/api/sandbox/v1/sandboxes/{id}",
+            "pause" => "/api/sandbox/v1/sandboxes/{id}/pause",
+            "resume" => "/api/sandbox/v1/sandboxes/{id}/resume",
+            "reload" => "/api/sandbox/v1/sandboxes/{id}/reload",
+            "network" => "/api/sandbox/v1/sandboxes/{id}/network",
+            "snapshots" => "/api/sandbox/v1/sandboxes/{id}/snapshots",
+            _ => "/unmatched",
+        };
+    }
+    if let Some(rest) = path.strip_prefix("/api/sandbox/") {
+        let (id, action) = rest.split_once('/').unwrap_or((rest, ""));
+        if id.is_empty() {
+            return "/unmatched";
+        }
+        return match action {
+            "" => "/api/sandbox/{id}",
+            "exec/invoke" => "/api/sandbox/{id}/exec/invoke",
+            "exec/commands/watch" => "/api/sandbox/{id}/exec/commands/watch",
+            "exec/pty" => "/api/sandbox/{id}/exec/pty",
+            "exec/upload" => "/api/sandbox/{id}/exec/upload",
+            "exec/upload/status" => "/api/sandbox/{id}/exec/upload/status",
+            "exec/upload/commit" => "/api/sandbox/{id}/exec/upload/commit",
+            "exec/download" => "/api/sandbox/{id}/exec/download",
+            _ => "/unmatched",
+        };
+    }
+    if let Some(rest) = path.strip_prefix("/api/agent/") {
+        let (_, action) = rest.split_once('/').unwrap_or((rest, ""));
+        return match action {
+            "" => "/api/agent/{id}",
+            "invoke" => "/api/agent/{id}/invoke",
+            "files/upload" => "/api/agent/{id}/files/upload",
+            "files/download" => "/api/agent/{id}/files/download",
+            "files/list" => "/api/agent/{id}/files/list",
+            "files/mkdir" => "/api/agent/{id}/files/mkdir",
+            _ => "/unmatched",
+        };
+    }
+    "/unmatched"
 }
