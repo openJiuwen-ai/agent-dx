@@ -22,6 +22,7 @@ pub async fn serve(listener: TcpListener, coordinator: CoordinatorRpc) -> std::i
                             match coordinator.metrics().await {
                                 Ok(mut text) => {
                                     text.push_str(&adx_observability::trace::metrics());
+                                    text.push_str(&adx_observability::process::metrics());
                                     (200, text)
                                 }
                                 Err(_) => (503, "metrics temporarily unavailable\n".into()),

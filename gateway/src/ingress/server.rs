@@ -41,7 +41,7 @@ const L4_COPY_BUFFER_SIZE: usize = 64 * 1024;
 const COMMAND_WATCH_PATH: &str = "/api/sandbox/v1/commands/watch";
 const EXECD_COMMAND_PORT: u16 = 50090;
 const SLOW_REQUEST_LOG_THRESHOLD_US: u64 = 100_000;
-const REQUEST_DURATION_BUCKETS_US: [(&str, u64); 7] = [
+const REQUEST_DURATION_BUCKETS_US: [(&str, u64); 16] = [
     ("0.001", 1_000),
     ("0.002", 2_000),
     ("0.005", 5_000),
@@ -49,6 +49,15 @@ const REQUEST_DURATION_BUCKETS_US: [(&str, u64); 7] = [
     ("0.025", 25_000),
     ("0.050", 50_000),
     ("0.100", 100_000),
+    ("0.250", 250_000),
+    ("0.500", 500_000),
+    ("1.000", 1_000_000),
+    ("2.500", 2_500_000),
+    ("5.000", 5_000_000),
+    ("10.000", 10_000_000),
+    ("30.000", 30_000_000),
+    ("60.000", 60_000_000),
+    ("120.000", 120_000_000),
 ];
 
 #[derive(Debug, Clone, Copy)]
@@ -2614,6 +2623,25 @@ mod tests {
         assert!(output.contains("data_plane_ingress_http_responses_total{class=\"5xx\"} 1\n"));
         assert!(output
             .contains("data_plane_ingress_http_request_duration_seconds_bucket{le=\"0.001\"} 1\n"));
+        assert!(output
+            .contains("data_plane_ingress_http_request_duration_seconds_bucket{le=\"+Inf\"} 3\n"));
+    }
+
+    #[test]
+    fn request_metrics_keep_slow_requests_in_finite_latency_buckets() {
+        let metrics = IngressRequestMetrics::default();
+        metrics.observe(StatusCode::OK, 200_000);
+        metrics.observe(StatusCode::OK, 2_000_000);
+        metrics.observe(StatusCode::OK, 200_000_000);
+
+        let output = metrics.prometheus();
+        assert!(output
+            .contains("data_plane_ingress_http_request_duration_seconds_bucket{le=\"0.250\"} 1\n"));
+        assert!(output
+            .contains("data_plane_ingress_http_request_duration_seconds_bucket{le=\"2.500\"} 2\n"));
+        assert!(output.contains(
+            "data_plane_ingress_http_request_duration_seconds_bucket{le=\"120.000\"} 2\n"
+        ));
         assert!(output
             .contains("data_plane_ingress_http_request_duration_seconds_bucket{le=\"+Inf\"} 3\n"));
     }

@@ -269,6 +269,12 @@ impl Sandboxd {
                 Err(error) => return Err(unavailable(error)),
             };
             if !response.id.is_empty() {
+                adx_observability::info!(
+                    event = "sandbox_identity_mapped",
+                    runtime_id = %logical_id,
+                    sandbox_id = %response.id,
+                    "sandboxd physical identity mapped to ADX runtime"
+                );
                 backend_ids
                     .lock()
                     .expect("shared state lock poisoned")
@@ -597,6 +603,11 @@ pub fn start_request(
             ("adx.tenant_id".into(), spec.tenant_id.clone()),
             ("adx.runtime_id".into(), runtime_id.into()),
             ("adx.generation".into(), ownership_generation.to_string()),
+        ]),
+        metric_labels: HashMap::from([
+            ("environment_id".into(), spec.id.clone()),
+            ("runtime_id".into(), runtime_id.into()),
+            ("tenantid".into(), spec.tenant_id.clone()),
         ]),
         writable_layer_limit_bytes: disk_limit,
         extra_config: options.extra_config.clone(),
@@ -1103,6 +1114,9 @@ mod tests {
         assert!(request.sandbox_id.is_empty());
         assert_eq!(request.labels["adx.runtime_id"], "i-7");
         assert_eq!(request.labels["adx.generation"], "7");
+        assert_eq!(request.metric_labels["environment_id"], "i");
+        assert_eq!(request.metric_labels["runtime_id"], "i-7");
+        assert_eq!(request.metric_labels["tenantid"], "t");
         assert_eq!(request.runtime, "runsc");
         assert_eq!(request.resources["CPU"], 1500.0);
         assert_eq!(request.resources["Memory"], 2048.0);

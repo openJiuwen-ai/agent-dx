@@ -1,9 +1,9 @@
 {
   "global": {"scrape_interval": "15s"},
   "scrape_configs": [
-    {"job_name": "adx-coordinator", "static_configs": [{"targets": ["127.0.0.1:17090"]}]},
-    {"job_name": "adxlet", "static_configs": [{"targets": ["127.0.0.1:17091"]}]},
-    {"job_name": "adx-ingress", "static_configs": [{"targets": ["127.0.0.1:18080"]}]},
-    {"job_name": "adx-relay", "static_configs": [{"targets": ["127.0.0.1:19443"]}]}
+    {"job_name": "adx-coordinator", "static_configs": [{"targets": ["127.0.0.1:17090"], "labels": {"adx_env": "adx", "component_name": "adx-coordinator"}}]},
+    {"job_name": "adxlet", "static_configs": [{"targets": ["127.0.0.1:17091"], "labels": {"adx_env": "adx", "component_name": "adxlet"}}]},
+    {"job_name": "adx-ingress", "static_configs": [{"targets": ["127.0.0.1:18080"], "labels": {"adx_env": "adx", "component_name": "adx-ingress"}}]},
+    {"job_name": "adx-relay", "static_configs": [{"targets": ["127.0.0.1:19443"], "labels": {"adx_env": "adx", "component_name": "adx-relay"}}]}
   ]
 }
