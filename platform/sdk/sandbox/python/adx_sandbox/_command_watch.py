@@ -189,7 +189,6 @@ class _CommandWaitManager:
                     ping_timeout=10,
                     max_size=1 << 20,
                 ) as websocket:
-                    unavailable_since = None
                     sent: Set[Tuple[str, str]] = set()
                     ready = False
                     while self._desired():
@@ -238,7 +237,12 @@ class _CommandWaitManager:
                         if state.get("status") == "REJECTED":
                             self._notify(key, str(state.get("error", "command watch rejected")))
                         elif str(state.get("status", "")) in _TERMINAL:
+                            unavailable_since = None
                             self._notify(key)
+                        elif str(state.get("status", "")) in ("PENDING", "RUNNING"):
+                            # An ingress handshake alone does not prove Execd
+                            # recovered. Reset only after a real command state.
+                            unavailable_since = None
             except Exception as error:
                 increment("command_wait_reconnect_total")
                 unavailable_since = unavailable_since or time.monotonic()

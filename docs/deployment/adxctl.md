@@ -25,6 +25,8 @@ release 安装器默认创建 `/usr/local/bin/adxctl -> /opt/adx/current/bin/adx
 
 sandboxd 不属于上述角色，始终由部署环境独立启动。Execd 位于发布包 `runtime/`，进入 Environment 环境运行，也不是宿主机服务。
 
+Execd 主动控制连接是节点服务的可选配置，见[运行时控制流部署](runtime-control-stream.md)；它需要沙箱能够访问本节点控制地址，并配套新 Execd。
+
 ## 命令
 
 ```sh

@@ -1,0 +1,15 @@
+# Per-node profile; replace addresses with values reachable from this node's runtimes.
+schema_version: 1
+profile: node
+service_overrides:
+  adxlet:
+    config:
+      node_id: ${ADX_NODE_ID}
+      advertised_address: ${ADX_NODE_ADDRESS}:19001
+      proxy_address: ${ADX_NODE_ADDRESS}:19002
+      runtime_control:
+        listen: 0.0.0.0:19003
+        advertised_address: ${ADX_RUNTIME_CONTROL_ADDRESS}
+        key_file: /opt/adx/data/runtime-control-key
+    env:
+      ADX_DATA_PLANE_RELAY_ADVERTISE_ADDRESS: ${ADX_NODE_ADDRESS}:19002

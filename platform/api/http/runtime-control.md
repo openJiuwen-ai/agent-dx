@@ -2,6 +2,8 @@
 
 EXECD 使用同一个 HTTP 监听端口提供用户操作与运行时协作。Adxlet 决定 Environment 生命周期并调用 sandboxd，EXECD 负责实例内的准备、观测和恢复后初始化。共享 JSON 类型定义在 `platform/crates/core/src/runtime.rs`；服务实现为 `runtime/control.rs`，调用端为 Adxlet `runtime_control.rs`。
 
+配置 `adxlet.runtime_control` 时，运行时协作改走 [Execd 主动连接的双向 gRPC 控制流](../proto/runtime-control.md)，用户数据操作继续使用 HTTP。未配置时使用本文 HTTP 控制接口；两种传输复用同一组类型与状态机。
+
 ## 身份与就绪
 
 sandboxd Start 环境包含 `ADX_ENVIRONMENT_ID`、`ADX_RUNTIME_ID`、`ADX_OWNERSHIP_GENERATION`；Adxlet 注入的值覆盖普通启动配置中的同名值。三个字段必须同时存在且有效。没有身份配置的独立 HTTP 运行模式只提供数据操作，控制接口返回 503。
@@ -21,7 +23,7 @@ sandboxd Start 环境包含 `ADX_ENVIRONMENT_ID`、`ADX_RUNTIME_ID`、`ADX_OWNER
 }
 ```
 
-Adxlet 核对完整身份和 `running`，并在请求前后确认 sandboxd 实例仍在运行。`/healthz` 仅作浅层存活检查。运行时状态与操作版本仅在当前执行内有效；它们不替代 Coordinator 持久化的归属代次。
+Adxlet 核对完整身份和 `running`，状态确认后再检查 sandboxd 实例仍在运行。`/healthz` 仅作浅层存活检查。运行时状态与操作版本仅在当前执行内有效；它们不替代 Coordinator 持久化的归属代次。
 
 配置 `EXECD_HTTP_TOKEN` 时控制请求携带 `X-Auth`。这属于节点到实例的调用凭据，和用户 API Key、控制面组件间 mTLS 分开。控制 JSON 正文最多 64 KiB，需要 Content-Length，拒绝 chunked。
 

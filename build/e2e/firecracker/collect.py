@@ -3,10 +3,10 @@
 import pathlib,sys
 root=pathlib.Path(sys.argv[1]);target=root/'export';target.mkdir(exist_ok=True)
 secrets=[]
-for name in ('api-key','other-key','redis-key','s3-user','s3-key'):
+for name in ('api-key','admin-key','other-key','redis-key','s3-user','s3-key'):
  path=root/'secrets'/name
  if path.exists(): secrets.append(path.read_bytes().strip())
-for directory in ('evidence','state/logs'):
+for directory in ('evidence','state/logs','runtime-logs'):
  source=root/directory
  if not source.exists(): continue
  for path in source.rglob('*'):

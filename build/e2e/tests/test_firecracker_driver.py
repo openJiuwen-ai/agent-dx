@@ -9,6 +9,30 @@ ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/'firecracker'))
 
 class FirecrackerEvidenceTests(unittest.TestCase):
+    def test_fc_bootstrap_has_separate_admin_and_tenant_credentials(self):
+        import os
+        import subprocess
+        with tempfile.TemporaryDirectory() as directory:
+            base=Path(directory)
+            artifact=base/'package/runtime/adx-runtime-rootfs.img'
+            artifact.parent.mkdir(parents=True)
+            artifact.write_bytes(b'test rootfs')
+            environment={**os.environ, 'ADX_FC_BASE':str(base), 'ADX_FC_RUN_ROOT':str(base/'run')}
+            # Supply the same helper layout used by the deployed fixture.
+            (base/'e2e').mkdir()
+            import shutil
+            shutil.copy2(ROOT.parent/'ci/rpc_certificates.py',base/'e2e/rpc_certificates.py')
+            subprocess.run([sys.executable,str(ROOT/'firecracker/configure.py'),'node1'],env=environment,check=True,capture_output=True)
+            deployment=json.loads((base/'run/deployment.yaml').read_text())
+            coordinator=next(s for s in deployment['services'] if s['role']=='coordinator')
+            credentials=coordinator['config']['bootstrap_credentials']
+            administrators=[c for c in credentials if c['administrator']]
+            tenants=[c for c in credentials if not c['administrator']]
+            self.assertEqual(len(administrators),1)
+            self.assertEqual({c['tenant_id'] for c in tenants},{'e2e','e2e-other'})
+            self.assertNotIn(administrators[0]['key_file'],[c['key_file'] for c in tenants])
+            self.assertEqual(Path(administrators[0]['key_file']).stat().st_mode & 0o777,0o600)
+
     def test_fault_oracles_read_the_nested_runtime_record(self):
         from runtime_record import runtime_id, runtime_ip
         record = {'state': 'Running', 'runtime': {'id': 'backend-1', 'ip': '10.0.0.8'}}

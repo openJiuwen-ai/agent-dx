@@ -291,6 +291,13 @@ overrides keep the baseline source and do not add the bootstrap mount.
 ## Network policy models
 
 `NetworkPolicy`, `NetworkRule`, and `PortRange` are accepted at creation.
+
+Deny-all policies retain platform rules for Execd and declared public TCP
+ports. Stateful mode uses connection tracking for replies; stateless mode
+matches those local service ports in both directions. When runtime control is
+configured, a separate rule preserves the node's exact control IPv4/TCP
+endpoint. Ordinary traffic remains subject to the user policy; see the
+[node network contract](../../../../docs/deployment/runtime-control-stream.md).
 `update_network_policy(policy)` atomically replaces the complete runtime policy;
 passing `None` clears it. Adxlet reserves the EXECD control port and declared
 published ports with the highest rule priority so a user default-deny policy
@@ -416,6 +423,11 @@ does not terminate the remote command. `CommandHandle.kill()` and
 finished, and still raise on other execution or transport failures.
 Long-running command polling retries connection failures and errors marked
 retryable by the server. Terminal errors keep their original error and request ID.
+Temporary downstream subscription failures (including a checkpoint freeze)
+reconnect the watch for the same command, without starting it again. The SDK
+uses a 30-second continuous-outage budget; an Ingress WebSocket handshake alone
+does not reset it. Receipt of an actual PENDING/RUNNING or terminal command state
+resets the budget. Authorization and permanent subscription errors fail directly.
 
 
 ### Placement

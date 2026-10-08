@@ -331,3 +331,10 @@ For the current public Sandbox SDK platform acceptance, use [build/e2e](../build
 The relay library supports tunnel, SSH and configured user-port forwarding. Public create validates forwarded ports and data-plane security settings, and Coordinator publishes the resulting routes. Generic reverse-proxy routes can forward Agent traffic to a separately supplied service; they do not implement the Agent backend.
 
 For current production logging, use [structured collection](../docs/testing/log-collection.md) and [supervisor rotation](../docs/testing/log-rotation.md). Gateway's optional own file writer above is an alternative sink; the unified JSON collection deployment leaves it disabled to avoid double writing. Trace propagation and export are implemented in Ingress and Relay, see [distributed traces](../docs/testing/distributed-traces.md). Ingress `/metrics` exposes aggregate HTTP response classes and response-header latency buckets from 1 ms through 120 s, plus `+Inf`; it includes control-plane routes and does not measure the completion time of a streaming response body. Relay `/metrics` is served on its separate health listener, which defaults to `127.0.0.1:18443` unless `ADX_DATA_PLANE_RELAY_HEALTH_BIND` is set.
+
+When Relay rejects an obsolete execution binding before CONNECT opens, Ingress
+waits up to 50 ms for that environment's route delta and opens the replacement
+once. Unrelated updates do not extend this budget. Tenant or security-policy
+changes reject reuse of the previous authorization; unchanged conflicts remain
+errors. This recovery sends no application bytes to the rejected execution and
+does not replay a command or an HTTP request already delivered to Execd.

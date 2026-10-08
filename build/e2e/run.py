@@ -269,6 +269,8 @@ class Run:
             name=self.id+'-'+node;self.nodes.append(node)
             args=['run','-d','--name',name,'--label','adx.e2e.run='+self.id,'--network',self.id,'--network-alias','coordinator' if node=='node1' else 'node2','--privileged','--cgroupns='+self.cgroupns,'-e','ADX_E2E_CGROUP_ROOT='+name,'--cpus=3','--memory=4g','--tmpfs','/tmp/adx-e2e/sandboxd/image_manager:size=1g','-v',f'{secrets}:/secrets','-v',f'{self.output}:/evidence']
             args+=['-v',f'{bundle / "execd.tar"}:/execd.tar:ro']
+            if os.getenv('ADX_E2E_RUNTIME_CONTROL') == '1':
+                args+=['-e','ADX_E2E_RUNTIME_CONTROL=1']
             self.docker(*args,m['image_ids']['node'])
             self.execute(node,'env',*setup_environment(self.selected_case),
                          'python3','/opt/adx/e2e/node.py','setup',node)

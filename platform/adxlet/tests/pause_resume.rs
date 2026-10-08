@@ -1587,3 +1587,44 @@ async fn restart_retires_uncommitted_workload_checkpoint_without_recapture() {
         .iter()
         .any(|e| e == "checkpoint-running" || e == "checkpoint-ack"));
 }
+
+#[tokio::test]
+async fn pause_retires_control_state_only_after_the_backend_stop_barrier() {
+    use adxlet::{control_stream::RuntimeControlHub, runtime_control::RuntimeControlClient};
+    let (_temp, backend, node, spec, assignment) = fixture();
+    let hub = RuntimeControlHub::new(vec![1; 32], Duration::from_secs(2)).unwrap();
+    let node = node
+        .with_runtime_control(
+            RuntimeControlClient::new(1, Duration::from_secs(2))
+                .unwrap()
+                .with_stream(hub.clone()),
+        )
+        .unwrap();
+    let handle = node.environment(spec, assignment).unwrap();
+    let created = handle.create().await.unwrap();
+    let identity = RuntimeControlClient::identity(&created.record);
+    hub.expect(&identity).unwrap();
+    let paused = handle.pause(pause(created.record.revision)).await.unwrap();
+    assert_eq!(paused.record.state, EnvironmentState::Paused);
+    assert!(
+        hub.is_empty(),
+        "stopped execution must not keep a control slot or reconnect authority"
+    );
+    assert!(hub.observed(&identity).is_err());
+
+    let running = handle.resume(resume(paused.record.revision)).await.unwrap();
+    let identity = RuntimeControlClient::identity(&running.record);
+    hub.expect(&identity).unwrap();
+    *backend.fail_remove.lock().unwrap() = true;
+    let mut request = pause(running.record.revision);
+    request.operation_id = "pause-stop-unknown".into();
+    assert!(handle.pause(request).await.is_err());
+    assert_eq!(
+        hub.len(),
+        1,
+        "unknown backend stop must not discard control state"
+    );
+    *backend.fail_remove.lock().unwrap() = false;
+    handle.delete().await.unwrap();
+    assert!(hub.is_empty());
+}

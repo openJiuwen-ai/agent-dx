@@ -7,14 +7,14 @@
 | 模块 | 当前实现 | 边界 |
 |---|---|---|
 | `platform/crates/core` | Environment 状态、资源/设备账本、归属代次、checkpoint 与调度类型 | 纯模型，不访问 Redis、sandboxd |
-| `platform/crates/protocol` / `platform/api/proto` | Environment gRPC、身份检查、类型转换；Relay 绑定/活动协议 | 协议按职责拆分；Execd 使用 HTTP |
+| `platform/crates/protocol` / `platform/api/proto` | Environment gRPC、身份检查、类型转换；Relay 绑定/活动协议 | 协议按职责拆分；Execd 数据操作使用 HTTP，协作可配置双向控制流 |
 | `crates/error` | 稳定错误码、重试指令与操作结果语义 | HTTP/gRPC 适配留在各自边界，公共 crate 不绑定协议框架 |
 | `crates/process` | 服务进程统一的类型化 `--config`、安全 JSON 配置读取、退出信号与 FD limit | 不承载协议或组件业务配置 |
 | `crates/transport` | mTLS/HTTP TLS、请求上下文和剩余 deadline | 不承载路由、调度或生命周期规则 |
 | `platform/crates/scheduling` | 静态 Filter/Score、Pack/Spread、整卡、节点/实例亲和与反亲和、增量快照与索引 | 拓扑规则存在于内部类型和库；不是公开 HTTP 已验收能力 |
 | `platform/coordinator` | Global 轮转、同进程 Shard 队列与选点、自动分片、Redis、认证、路由/快照目录、节点失效与跨节点恢复协调 | 单 Coordinator；无 scaler、抢占或租户配额；未分配队列仅在内存 |
 | `platform/adxlet` | 每 Environment 串行任务、准入、暂停/恢复/删除、空闲删除、可配置重启、资源采集、对账 | 普通生命周期由节点决定；SQLite 是提交故障降级日志 |
-| 同上 `sandboxd.rs` / `runtime_control.rs` | RuntimeDriver、Start/Stats/checkpoint/restore、Execd HTTP 准备与身份校验 | sandboxd 自行生成物理 ID；平台 Environment ID 与后端 ID 分开 |
+| 同上 `sandboxd.rs` / `runtime_control.rs` | RuntimeDriver、Start/Stats/checkpoint/restore、Execd 双向控制流／HTTP 准备与身份校验 | sandboxd 自行生成物理 ID；平台 Environment ID 与后端 ID 分开 |
 | 同上 `checkpoint.rs` / `checkpoint/` | 本地/S3 存储抽象、下载缓存、引用保护、过期和孤儿制品回收 | local-only 制品只在源节点可用；模板预热后置 |
 | 同上 `routes.rs` / `proxy.rs` | 本机绑定、全量同步、代理重启重放、活动接收；默认嵌入 RelayService | 省略 `proxy_mode` 即 `embedded`；显式 `standalone` 保留分进程；两种模式使用同一 UDS 控制契约 |
 | `gateway/apiserver` | Rust HTTPS 服务、API Key 缓存、版本化实例目录订阅、生命周期和快照适配、管理员密钥接口；默认托管 Ingress 服务 | [支持范围](apiserver.md)；Agent 路由需要另配业务服务 |

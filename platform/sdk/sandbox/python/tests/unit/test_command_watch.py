@@ -72,3 +72,52 @@ def test_command_watch_preserves_legacy_frontend_auth():
         }
 
     asyncio.run(scenario())
+
+
+def test_successful_frontend_handshake_does_not_reset_downstream_outage_budget():
+    """A live ingress can repeatedly lose Execd during checkpoint or outage."""
+    from contextlib import asynccontextmanager
+    from unittest.mock import Mock
+
+    async def scenario():
+        manager = _manager()
+        notified = Mock()
+        attempts = 0
+        clock = 1.0
+
+        class Socket:
+            async def send(self, _message):
+                pass
+
+            async def recv(self):
+                raise ConnectionError("downstream temporarily unavailable")
+
+        @asynccontextmanager
+        async def connect(_uri, **_kwargs):
+            nonlocal attempts
+            attempts += 1
+            if attempts > 5:
+                raise asyncio.CancelledError
+            yield Socket()
+
+        async def backoff(_seconds):
+            nonlocal clock
+            clock += 16
+
+        with (
+            patch.object(manager, "_desired", return_value={("sandbox", "command")}),
+            patch.object(manager, "_notify", notified),
+            patch("websockets.asyncio.client.connect", side_effect=connect),
+            patch("adx_sandbox._command_watch.time.monotonic", side_effect=lambda: clock),
+            patch("adx_sandbox._command_watch.asyncio.sleep", side_effect=backoff),
+        ):
+            try:
+                await manager._run()
+            except asyncio.CancelledError:
+                pass
+        assert attempts == 3
+        notified.assert_called_once()
+        assert notified.call_args.args[0] == ("sandbox", "command")
+        assert "command watch unavailable" in notified.call_args.args[1]
+
+    asyncio.run(scenario())

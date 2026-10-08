@@ -32,6 +32,16 @@ configured-store artifact registration, commit retry without repeated capture, f
 without false success, restart cleanup of an uncommitted capture, and use of the
 new point by failover.
 
+## Execd-initiated control stream
+
+With `adxlet.runtime_control` configured, Execd sends pending checkpoint and
+handoff state over the bidirectional gRPC stream. Adxlet dispatches a dedicated
+identity-fenced event into the existing serial Environment controller; it does
+not run the full resource/idle monitor for each notification. Reconnect carries
+a complete runtime snapshot. The Unix request still waits for artifact and
+metadata publication before success. See [stream validation](runtime-control-stream.md)
+and [configuration](../deployment/runtime-control-stream.md).
+
 ## Verified evidence (2026-09-22)
 
 - Execd control/HTTP: 12 passed; adxlet pause/resume and sandboxd RPC: 46 passed.

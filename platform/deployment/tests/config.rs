@@ -780,3 +780,36 @@ fn network_profile_removes_internal_certificates_but_keeps_public_https() {
     assert!(ingress.env.contains_key("ADX_DATA_PLANE_INGRESS_TLS_CERT"));
     assert!(ingress.env.contains_key("ADX_DATA_PLANE_INGRESS_TLS_KEY"));
 }
+
+#[test]
+fn node_control_stream_example_survives_profile_expansion_and_render() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("deployment.yaml");
+    let yaml = include_str!("../../../build/config/examples/deployment-node-control-stream.yaml")
+        .replace("${ADX_NODE_ID}", "worker-stream")
+        .replace("${ADX_NODE_ADDRESS}", "192.0.2.10")
+        .replace("${ADX_RUNTIME_CONTROL_ADDRESS}", "http://192.0.2.10:19003");
+    std::fs::write(&path, yaml).unwrap();
+    let deployment = Deployment::load(&path).unwrap();
+    let node = deployment
+        .services
+        .iter()
+        .find(|s| s.role == Role::Adxlet)
+        .unwrap();
+    assert_eq!(node.config["runtime_control"]["listen"], "0.0.0.0:19003");
+    assert_eq!(
+        node.config["runtime_control"]["advertised_address"],
+        "http://192.0.2.10:19003"
+    );
+    assert_eq!(
+        node.config["runtime_control"]["key_file"],
+        "/opt/adx/data/runtime-control-key"
+    );
+    assert_eq!(node.config["node_id"], "worker-stream");
+    let output = root.path().join("rendered");
+    deployment.render(&output).unwrap();
+    let config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(output.join(format!("{}.json", node.id))).unwrap())
+            .unwrap();
+    assert_eq!(config["runtime_control"], node.config["runtime_control"]);
+}

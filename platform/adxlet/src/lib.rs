@@ -3,6 +3,7 @@
 pub mod activity;
 pub mod admin;
 pub mod checkpoint;
+pub mod control_stream;
 mod controller;
 mod local;
 pub use local::LocalReservation;
@@ -150,6 +151,10 @@ pub trait RuntimeDriver: Send + Sync {
 
 #[async_trait]
 pub trait Readiness: Send + Sync {
+    /// Register the expected execution before Start or restore can report Ready.
+    fn expect_runtime(&self, _record: &EnvironmentRecord) -> Result<()> {
+        Ok(())
+    }
     async fn activity(&self, _record: &EnvironmentRecord) -> Result<(u64, u64)> {
         Err(Error::Unavailable("runtime activity is unavailable".into()))
     }
@@ -615,8 +620,27 @@ impl Adxlet {
 }
 
 impl Adxlet {
-    /// Each check enters the Environment's serial controller. Bound fan-out so a
-    /// slow backend cannot create an unbounded number of node monitoring tasks.
+    /// Wake checkpoint cooperation in the serial controller. The controller
+    /// fences execution identity before acting on a queued notification.
+    pub async fn observe_runtime_event(
+        &self,
+        identity: &adx_core::runtime::RuntimeIdentity,
+    ) -> Result<()> {
+        let gate = self.lifecycle_ready.read().await;
+        if !*gate || self.is_draining() {
+            return Ok(());
+        }
+        let handle = self
+            .environments
+            .lock()
+            .map_err(|_| Error::Unavailable("environment directory lock poisoned".into()))?
+            .get(&identity.environment_id)
+            .map(|(_, _, handle)| handle.clone());
+        if let Some(handle) = handle {
+            handle.observe_runtime(identity.clone()).await?;
+        }
+        Ok(())
+    }
     pub async fn monitor_environments(&self) -> Result<()> {
         self.prune_retired_environments();
         let gate = self.lifecycle_ready.read().await;

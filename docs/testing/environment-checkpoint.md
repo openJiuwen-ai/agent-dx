@@ -5,7 +5,7 @@
 ## 正常路径
 
 1. API Server 从本地缓存解析归属，携带已认证身份、operation ID 和预期状态版本直达 adxlet。
-2. adxlet 串行执行本实例的请求。先确认后端支持 checkpoint，使用 Execd HTTP 控制接口准备 checkpoint，再关闭本机路由。
+2. adxlet 串行执行本实例的请求。先确认后端支持 checkpoint，使用 Execd 控制接口准备 checkpoint（配置 runtime_control 时走双向 gRPC，否则走 HTTP），再关闭本机路由。
 3. sandboxd 完成 `leave_running=false` 的完整 checkpoint。确认源执行已停止、删除成功后，释放本机资源。
 4. 存储后端完成制品持久化；adxlet 将 Paused 状态、恢复点和过期时间一次提交给 Coordinator。Coordinator 写入 Redis、释放 Shard 占用并撤销发布路由，API Server 才返回暂停成功。
 5. 恢复时检查过期时间和制品，进行本机资源准入，通过 sandboxd 的 `Start.checkpoint_info` 恢复。后端自行生成物理 ID。
@@ -19,7 +19,7 @@
 | --- | --- |
 | `core::checkpoint` | 恢复点、制品引用、最近成功操作的持久化模型 |
 | `adxlet::controller::lifecycle` | 串行暂停／恢复、资源释放与重新准入、失败回滚 |
-| `CheckpointCooperation` | Execd HTTP prepare／未启动 checkpoint 的 abort |
+| `CheckpointCooperation` | Execd 控制 prepare／未启动 checkpoint 的 abort（gRPC／HTTP 共用状态机） |
 | `RuntimeDriver` | 能力检查、checkpoint、restore；sandboxd 适配器负责物理 ID 和 RPC |
 | `CheckpointStore` | 分配暂存、发布、物化、删除与节点本地对账清理；实现本地目录与 S3 对象存储 |
 | `coordinator::storage` / Shard | Redis 版本校验、恢复点保存、增量资源记账 |

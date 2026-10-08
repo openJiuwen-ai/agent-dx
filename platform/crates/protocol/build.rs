@@ -18,5 +18,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=../../api/proto/node.proto");
     tonic_build::configure()
         .compile_protos(&["../../api/proto/node.proto"], &["../../api/proto"])?;
+    println!("cargo:rerun-if-changed=../../api/proto/runtime_control.proto");
+    tonic_build::configure().compile_protos(
+        &["../../api/proto/runtime_control.proto"],
+        &["../../api/proto"],
+    )?;
     Ok(())
 }

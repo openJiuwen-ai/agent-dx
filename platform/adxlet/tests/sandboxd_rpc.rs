@@ -5,6 +5,7 @@ use adxlet::{
     Adxlet, Durability, Readiness, Routes, RuntimeDriver, StateSink,
 };
 use std::{
+    collections::HashMap,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -222,6 +223,9 @@ impl Drop for Harness {
     }
 }
 async fn connect(server: Server) -> (Sandboxd, Harness) {
+    connect_with_env(server, HashMap::new()).await
+}
+async fn connect_with_env(server: Server, env: HashMap<String, String>) -> (Sandboxd, Harness) {
     let directory = tempfile::tempdir().unwrap();
     let socket = directory.path().join("rpc.sock");
     let listener = UnixListener::bind(&socket).unwrap();
@@ -235,6 +239,7 @@ async fn connect(server: Server) -> (Sandboxd, Harness) {
     let adapter = Sandboxd::connect(
         socket,
         Config {
+            env,
             rpc_timeout: Duration::from_secs(2),
             runtime_logs: Some(adxlet::runtime_logs::RuntimeLogPolicy {
                 directory: directory.path().join("runtime-logs"),
@@ -1034,4 +1039,147 @@ async fn workload_checkpoint_keeps_backend_running() {
         .unwrap()
         .iter()
         .any(|r| r == "checkpoint:leave_running=true"));
+}
+
+#[tokio::test]
+async fn stateless_policy_allows_execd_and_published_port_replies() {
+    use adx_core::sandbox as model;
+    let policy = model::NetworkPolicy {
+        traffic: Some(model::TrafficPolicy {
+            ingress_default_action: model::NetworkAction::Deny,
+            egress_default_action: model::NetworkAction::Deny,
+            rules: vec![],
+            mode: model::TrafficMode::Stateless,
+        }),
+        dns: None,
+    };
+    let mut spec = spec();
+    spec.sandbox.network = Some(policy.clone());
+    spec.sandbox.ports = vec![8080];
+    let server = Server::default();
+    let (adapter, _harness) = connect(server.clone()).await;
+    adapter.start(&spec, "i-1", 1, &[]).await.unwrap();
+    adapter
+        .set_network_policy("i-1", Some(&policy), &[8080])
+        .await
+        .unwrap();
+    let starts = server.starts.lock().unwrap();
+    let updates = server.network_updates.lock().unwrap();
+    for policy in [
+        starts[0].network_policy.as_ref().unwrap(),
+        updates[0].network_policy.as_ref().unwrap(),
+    ] {
+        let traffic = policy.traffic.as_ref().unwrap();
+        for port in [50090, 8080] {
+            assert!(
+                traffic.rules.iter().any(|rule| {
+                    rule.action == NetworkPolicyAction::Allow as i32
+                        && rule.direction == NetworkDirection::Both as i32
+                        && rule.protocol == NetworkProtocol::Tcp as i32
+                        && rule.priority == u32::MAX
+                        && rule
+                            .sandbox_port_range
+                            .as_ref()
+                            .is_some_and(|range| range.first == port && range.last == port)
+                }),
+                "stateless TCP replies from platform service port {port} must be allowed"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn blocked_policy_preserves_only_node_control_endpoint_at_start_and_update() {
+    use adx_core::sandbox as model;
+    let policy = model::NetworkPolicy {
+        traffic: Some(model::TrafficPolicy {
+            ingress_default_action: model::NetworkAction::Deny,
+            egress_default_action: model::NetworkAction::Deny,
+            rules: vec![],
+            mode: model::TrafficMode::Stateless,
+        }),
+        dns: None,
+    };
+    let env = HashMap::from([
+        (
+            "ADX_RUNTIME_CONTROL_ADDRESS".into(),
+            "http://10.231.16.1:19003".into(),
+        ),
+        (
+            "ADX_RUNTIME_CONTROL_SECRET".into(),
+            "0123456789abcdef0123456789abcdef".into(),
+        ),
+    ]);
+    let mut spec = spec();
+    spec.sandbox.network = Some(policy.clone());
+    // A user-provided callback must never become a platform-owned ACL exception.
+    spec.env.insert(
+        "ADX_RUNTIME_CONTROL_ADDRESS".into(),
+        "http://10.99.1.1:5555".into(),
+    );
+    let request = start_request(
+        &spec,
+        "i-1",
+        1,
+        &[],
+        &Config {
+            env: env.clone(),
+            ..Config::default()
+        },
+    )
+    .unwrap();
+    let server = Server::default();
+    let (adapter, _harness) = connect_with_env(server.clone(), env).await;
+    adapter.start(&spec, "i-1", 1, &[]).await.unwrap();
+    adapter
+        .set_network_policy("i-1", Some(&policy), &[])
+        .await
+        .unwrap();
+    let updates = server.network_updates.lock().unwrap();
+    for policy in [
+        request.network_policy.as_ref().unwrap(),
+        updates[0].network_policy.as_ref().unwrap(),
+    ] {
+        let traffic = policy.traffic.as_ref().unwrap();
+        assert_eq!(
+            traffic.ingress_default_action,
+            NetworkPolicyAction::Deny as i32
+        );
+        assert_eq!(
+            traffic.egress_default_action,
+            NetworkPolicyAction::Deny as i32
+        );
+        let control: Vec<_> = traffic
+            .rules
+            .iter()
+            .filter(|rule| {
+                rule.direction == NetworkDirection::Both as i32 && rule.sandbox_port_range.is_none()
+            })
+            .collect();
+        assert_eq!(
+            control.len(),
+            1,
+            "only the node control TCP peer endpoint bypasses user egress policy"
+        );
+        let rule = control[0];
+        assert_eq!(rule.action, NetworkPolicyAction::Allow as i32);
+        assert_eq!(rule.protocol, NetworkProtocol::Tcp as i32);
+        assert_eq!(rule.priority, u32::MAX);
+        let peer = rule.peer.as_ref().unwrap();
+        assert_eq!(peer.cidr, "10.231.16.1/32");
+        assert!(peer.address.is_empty() && peer.domain.is_empty());
+        assert_eq!(peer.port, 0);
+        let port = peer.port_range.as_ref().unwrap();
+        assert_eq!((port.first, port.last), (19003, 19003));
+        assert!(rule.sandbox_port_range.is_none());
+    }
+    let request = start_request(&spec, "i-1", 1, &[], &Config::default()).unwrap();
+    assert!(!request
+        .network_policy
+        .unwrap()
+        .traffic
+        .unwrap()
+        .rules
+        .iter()
+        .any(|r| r.direction == NetworkDirection::Both as i32 && r.sandbox_port_range.is_none()));
 }

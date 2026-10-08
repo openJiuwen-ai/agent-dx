@@ -29,6 +29,7 @@ pub(crate) mod child_env;
 mod cmd;
 mod codec;
 pub mod control;
+pub mod control_stream;
 mod dispatch;
 mod entrypoint;
 mod fs;
@@ -212,7 +213,15 @@ async fn boot(
         checkpoint,
     });
     if let Some(identity) = identity {
-        control::install(control::Controller::new(identity, hooks.clone())?)?;
+        let controller = control::Controller::new(identity, hooks.clone())?;
+        control::install(controller.clone())?;
+        if control_stream::ControlStreamConfig::from_environment()?.is_some() {
+            tokio::spawn(control_stream::run(controller, || {
+                control_stream::ControlStreamConfig::from_environment()?.ok_or_else(|| {
+                    adx_core::Error::Unavailable("runtime control configuration missing".into())
+                })
+            }));
+        }
     }
     let _keep_listeners_alive = hooks;
     let mut watchers = tokio::task::JoinSet::new();

@@ -65,6 +65,8 @@ struct Config {
     runtime_ready_timeout_seconds: u64,
     execd_port: u16,
     #[serde(default)]
+    runtime_control: Option<adxlet::control_stream::StreamConfig>,
+    #[serde(default)]
     runtime_profile: Option<adx_core::runtime_profile::RuntimeProfile>,
     #[serde(default)]
     execd_command: Vec<String>,
@@ -241,6 +243,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     env.insert("EXECD_HTTP_PORT".into(), config.execd_port.to_string());
     let token = env.get("EXECD_HTTP_TOKEN").cloned();
+    let stream_setup = config
+        .runtime_control
+        .as_ref()
+        .map(|config| -> adx_core::Result<_> {
+            let secret = config.load_key()?;
+            env.insert(
+                "ADX_RUNTIME_CONTROL_ADDRESS".into(),
+                config.advertised_address.clone(),
+            );
+            // Host-only input to the Start adapter; removed before runtime injection.
+            env.insert(
+                "ADX_RUNTIME_CONTROL_SECRET".into(),
+                String::from_utf8(secret.clone()).map_err(|_| {
+                    adx_core::Error::Invalid("runtime control key must be UTF-8".into())
+                })?,
+            );
+            Ok((
+                config.listen,
+                adxlet::control_stream::RuntimeControlHub::new(secret, timeout)?,
+            ))
+        })
+        .transpose()?;
     let runtime_config = RuntimeConfig {
         runtime_profile: config.runtime_profile,
         command: config.execd_command,
@@ -258,10 +282,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ) => result?,
         _ = shutdown() => return Ok(()),
     });
+    // The sandboxd network plugin may create the configured bridge during
+    // initialization. Bind only after backend readiness, before admitting work.
+    let stream_listener = if let Some((listen, _)) = &stream_setup {
+        Some(tokio::net::TcpListener::bind(listen).await?)
+    } else {
+        None
+    };
     let mut control =
         adxlet::runtime_control::RuntimeControlClient::new(config.execd_port, timeout)?;
     if let Some(token) = &token {
         control = control.with_token(token)?;
+    }
+    if let Some((_, hub)) = &stream_setup {
+        control = control.with_stream(hub.clone());
     }
     let readiness = ExecdReadiness::with_client(
         runtime.clone(),
@@ -634,6 +668,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     adx_observability::info!("adxlet RPC listener ready");
+    let control_server = async {
+        if let (Some(listener), Some((_, hub))) = (stream_listener, &stream_setup) {
+            use adx_protocol::{
+                runtime::runtime_control_service_server::RuntimeControlServiceServer,
+                runtime_stream::MAX_CONTROL_MESSAGE_BYTES,
+            };
+            tonic::transport::Server::builder()
+                .http2_keepalive_interval(Some(Duration::from_secs(30)))
+                .http2_keepalive_timeout(Some(Duration::from_secs(10)))
+                .add_service(
+                    RuntimeControlServiceServer::new(hub.clone())
+                        .max_decoding_message_size(MAX_CONTROL_MESSAGE_BYTES)
+                        .max_encoding_message_size(MAX_CONTROL_MESSAGE_BYTES),
+                )
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                .await?;
+        } else {
+            std::future::pending::<()>().await;
+        }
+        Ok::<(), tonic::transport::Error>(())
+    };
+    let control_events = async {
+        if let Some((_, hub)) = &stream_setup {
+            let mut events = hub.take_events()?;
+            let mut tasks = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    event = events.recv(), if tasks.len() < 32 => {
+                        let Some(identity) = event else { break; };
+                        let manager = manager.clone();
+                        tasks.spawn(async move { manager.observe_runtime_event(&identity).await });
+                    }
+                    result = tasks.join_next(), if !tasks.is_empty() => {
+                        match result {
+                            Some(Ok(Ok(()))) => (),
+                            Some(Ok(Err(error))) => adx_observability::warn!("runtime control event processing incomplete: {error}"),
+                            Some(Err(error)) => adx_observability::warn!("runtime control event task failed: {error}"),
+                            None => (),
+                        }
+                    }
+                }
+            }
+        } else {
+            std::future::pending::<()>().await;
+        }
+        Ok::<(), adx_core::Error>(())
+    };
     let proxy_failure = async {
         match &mut embedded {
             Some(proxy) => proxy.failed().await,
@@ -642,6 +723,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     tokio::select! {
         result = proxy_failure => result?,
+        result = control_server => result?,
+        result = control_events => result?,
         result = &mut server => result?,
         result = report => result?,
         result = metrics => result?,
