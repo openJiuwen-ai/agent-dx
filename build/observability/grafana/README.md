@@ -7,13 +7,14 @@
 
 | JSON | 内容与口径 |
 | --- | --- |
-| [adx-schedule.json](dashboards/adx-schedule.json) | CPU/内存/磁盘调度容量、预留、可用及分配率，Running Environment 分布，队列、节点健康、实际用量、日志和 Trace 导出。 |
+| [adx-schedule.json](dashboards/adx-schedule.json) | CPU/内存/磁盘调度容量、预留、可用及分配率，Running Environment 分布，队列、节点健康、日志和 Trace 导出。 |
 | [adx-data-plane.json](dashboards/adx-data-plane.json) | Ingress 请求速率、状态分类、4xx/5xx 比例、响应头耗时 P50/P95/P99、超过 100 ms 比例、活跃请求及连接池；Relay 活跃流、连接成功/失败、拒绝与路由错误；Ingress 逻辑流及物理连接。 |
 | [adx-process-resources.json](dashboards/adx-process-resources.json) | 进程 CPU 核数、RSS、文件描述符、线程，以及按 Pod/组件/PID 的运行时长和虚拟内存明细。 |
 
 数据面速率和延迟查询使用 5 分钟窗口；延迟表示响应头返回耗时，不是命令完整执行或流式响应结束耗时。
 Trace 面板显示导出累计 span 数量，具体调用链通过 Tempo 查询。
-Schedule 中的节点和沙箱实际使用量依赖部署环境接入相应资源指标；ADX 调度资源账目与实际使用量分别统计。
+Schedule 聚焦调度账本、队列、准入和实例分布。节点实际使用量和沙箱实际使用量
+由部署环境的节点资源与沙箱详情看板承载，避免在调度看板重复展示。
 
 ## 导入与采集前提
 
@@ -29,5 +30,3 @@ Schedule 中的节点和沙箱实际使用量依赖部署环境接入相应资�
 磁盘展示调度账本，不是文件系统实际使用率。调度容量来自所选资源源，
 预留量直接读取 `reserved`；节点维护或压力保护会使 `available` 为零，
 不能用容量减可用量表示已分配。CPU/内存/磁盘均采用同一口径。
-沙箱 CPU 使用量使用 `rate(adx_environment_cpu_usage_seconds_total[5m])`，
-内存使用量读取 `adx_environment_memory_usage_bytes`，不是预留值。

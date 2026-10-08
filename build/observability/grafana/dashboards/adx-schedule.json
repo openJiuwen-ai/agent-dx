@@ -14,7 +14,7 @@
       }
     ]
   },
-  "description": "ADX scheduling and operations: allocation ledgers, disk, queues, health, runtime usage, logs and trace export. Allocation is distinct from actual usage.",
+  "description": "ADX scheduling and operations: allocation ledgers, disk, queues, health, logs and trace export. Actual node and sandbox resource usage belongs to their detail dashboards.",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -1261,122 +1261,6 @@
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "percent"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "x": 0,
-        "y": 33,
-        "w": 8,
-        "h": 8
-      },
-      "id": 16,
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "expr": "100 * node_cpu_usage{adx_env=~\"$adx_env\"} / node_cpu_limit{adx_env=~\"$adx_env\"}",
-          "legendFormat": "{{host_name}}",
-          "range": true,
-          "refId": "A"
-        }
-      ],
-      "title": "节点 CPU 实际使用率",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "cores"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "x": 8,
-        "y": 33,
-        "w": 8,
-        "h": 8
-      },
-      "id": 17,
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "refId": "A",
-          "expr": "rate(adx_environment_cpu_usage_seconds_total{adx_env=~\"$adx_env\"}[5m])",
-          "legendFormat": "{{environment_id}}"
-        }
-      ],
-      "title": "沙箱 CPU 实际使用量（核）",
-      "type": "timeseries",
-      "description": "ADX 后端采样的累计 CPU 时间速率；沙箱刚启动且不足两个采样点时无数据。"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "bytes"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "x": 16,
-        "y": 33,
-        "w": 8,
-        "h": 8
-      },
-      "id": 18,
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "refId": "A",
-          "expr": "adx_environment_memory_usage_bytes{adx_env=~\"$adx_env\"}",
-          "legendFormat": "{{environment_id}}"
-        }
-      ],
-      "title": "沙箱内存实际使用量",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "fieldConfig": {
-        "defaults": {
           "color": {
             "mode": "palette-classic"
           },
@@ -1447,7 +1331,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 41,
+        "y": 33,
         "w": 24,
         "h": 8
       },
@@ -1515,7 +1399,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 49,
+        "y": 41,
         "w": 24,
         "h": 8
       },
@@ -1563,7 +1447,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 57,
+        "y": 49,
         "w": 24,
         "h": 10
       },
@@ -1626,6 +1510,6 @@
   "timezone": "browser",
   "title": "ADX Schedule",
   "uid": "adx-schedule",
-  "version": 2,
+  "version": 3,
   "weekStart": ""
 }
