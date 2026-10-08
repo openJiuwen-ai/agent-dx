@@ -55,8 +55,9 @@ impl Api {
         self: Arc<Self>,
         request: Request<Incoming>,
     ) -> Result<Response<Body>, Infallible> {
-        let trace = trace::Trace::remote(
-            "apiserver.http",
+        let trace = trace::Trace::http(
+            request.method().as_str(),
+            trace::http_route(request.uri().path()),
             header(&request, "traceparent"),
             header(&request, "tracestate"),
         );
@@ -81,7 +82,19 @@ impl Api {
         let _ = request_context.inject(request.headers_mut());
         let request_id = request_context.request_id;
         let context = trace.scope(trace::traceparent).unwrap_or_default();
-        let mut response = trace.run(Box::pin(self.handle(request))).await;
+        let mut response = trace
+            .run(async {
+                let response = Box::pin(self.handle(request)).await;
+                trace::attribute(
+                    "http.response.status_code",
+                    response.status().as_u16().to_string(),
+                );
+                if response.status().is_server_error() {
+                    trace::error();
+                }
+                response
+            })
+            .await;
         if let Ok(value) = request_id.parse() {
             response.headers_mut().insert("x-request-id", value);
         }

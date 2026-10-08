@@ -135,8 +135,8 @@ impl State {
         let Some(shard) = self.scheduler.take_ready_shard() else {
             return Ok(false);
         };
-        let round = adx_observability::trace::Trace::child("shard.schedule_round")
-            .scope(|| self.scheduler.schedule_round(shard))?;
+        // A round may serve multiple requests; it has no single request parent.
+        let round = self.scheduler.schedule_round(shard)?;
         let progress = round.yielded || !round.assignments.is_empty();
         for assignment in round.assignments {
             let spec = self
@@ -1067,148 +1067,143 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
         &self,
         request: Request<pb::RegisterNodeRequest>,
     ) -> std::result::Result<Response<pb::RegisterNodeResponse>, Status> {
-        let trace = adx_observability::trace::Trace::rpc("coordinator.register_node", &request);
-        trace
-            .run_result(async {
-                let principal = self.0.peers.authenticate(&request)?;
-                let r = request.into_inner();
-                if principal != Principal::Node(r.node_id.clone()) {
-                    return Err(Status::permission_denied(
-                        "node identity does not match certificate",
-                    ));
-                }
-                if r.session_id.is_empty()
-                    || r.session_id.len() > 128
-                    || r.heartbeat_sequence == 0
-                    || (r.reconciling && r.accepting_allocations)
-                {
-                    return Err(Status::invalid_argument(
+        // Periodic registration/heartbeats do not create request traces.
+        let principal = self.0.peers.authenticate(&request)?;
+        let r = request.into_inner();
+        if principal != Principal::Node(r.node_id.clone()) {
+            return Err(Status::permission_denied(
+                "node identity does not match certificate",
+            ));
+        }
+        if r.session_id.is_empty()
+            || r.session_id.len() > 128
+            || r.heartbeat_sequence == 0
+            || (r.reconciling && r.accepting_allocations)
+        {
+            return Err(Status::invalid_argument(
                 "node session, monotonic heartbeat and closed reconciliation admission required",
             ));
-                }
-                let node = Node::try_from(r.clone()).map_err(status)?;
-                for address in [&r.node_address, &r.proxy_address] {
-                    if address.trim().is_empty() || address.contains(['/', '@', '?', '#']) {
-                        return Err(Status::invalid_argument(
-                            "advertised host:port address required",
+        }
+        let node = Node::try_from(r.clone()).map_err(status)?;
+        for address in [&r.node_address, &r.proxy_address] {
+            if address.trim().is_empty() || address.contains(['/', '@', '?', '#']) {
+                return Err(Status::invalid_argument(
+                    "advertised host:port address required",
+                ));
+            }
+            Endpoint::from_shared(format!("https://{address}"))
+                .map_err(|_| Status::invalid_argument("invalid advertised address"))?;
+        }
+        let service = self.clone();
+        tokio::spawn(async move {
+            let predecessor = service.replacement_predecessor(&r).await;
+            let mut state = service.0.state.lock().await;
+            state.recover_authoritative_state().await.map_err(status)?;
+            state.healthy().map_err(status)?;
+            if state
+                .retired_sessions
+                .contains(&(r.node_id.clone(), r.session_id.clone()))
+            {
+                return Err(Status::failed_precondition("retired node session"));
+            }
+            if state.overdue(&r.node_id, service.0.heartbeat_timeout) {
+                let result = state.invalidate_node(&r.node_id).await;
+                service.0.changed.notify_waiters();
+                result.map_err(status)?;
+            }
+            let mut inspected = false;
+            if let Some(live) = state.live.get(&r.node_id) {
+                if live.session == r.session_id {
+                    if r.heartbeat_sequence < live.sequence
+                        || (r.heartbeat_sequence == live.sequence && live.report != r)
+                    {
+                        return Err(Status::failed_precondition("stale heartbeat"));
+                    }
+                    if r.heartbeat_sequence == live.sequence && live.expired {
+                        return Err(Status::failed_precondition(
+                            "expired heartbeat; reconciliation required",
                         ));
                     }
-                    Endpoint::from_shared(format!("https://{address}"))
-                        .map_err(|_| Status::invalid_argument("invalid advertised address"))?;
+                    if r.heartbeat_sequence == live.sequence {
+                        return Ok(Response::new(pb::RegisterNodeResponse {
+                            shard_id: state.nodes[&r.node_id].shard_id as u32,
+                            coordinator_epoch: state.session.epoch(),
+                        }));
+                    }
+                    inspected =
+                        live.inspected && live.last_seen.elapsed() < service.0.heartbeat_timeout;
+                } else if live.last_seen.elapsed() < service.0.heartbeat_timeout
+                    && (predecessor.as_ref() != Some(&live.session)
+                        || live.report.node_address != r.node_address
+                        || live.report.proxy_address != r.proxy_address)
+                {
+                    return Err(Status::failed_precondition(
+                        "another node process is still registered",
+                    ));
                 }
-                let service = self.clone();
-                tokio::spawn(async move {
-                    let predecessor = service.replacement_predecessor(&r).await;
-                    let mut state = service.0.state.lock().await;
-                    state.recover_authoritative_state().await.map_err(status)?;
-                    state.healthy().map_err(status)?;
-                    if state
-                        .retired_sessions
-                        .contains(&(r.node_id.clone(), r.session_id.clone()))
-                    {
-                        return Err(Status::failed_precondition("retired node session"));
-                    }
-                    if state.overdue(&r.node_id, service.0.heartbeat_timeout) {
-                        let result = state.invalidate_node(&r.node_id).await;
-                        service.0.changed.notify_waiters();
-                        result.map_err(status)?;
-                    }
-                    let mut inspected = false;
-                    if let Some(live) = state.live.get(&r.node_id) {
-                        if live.session == r.session_id {
-                            if r.heartbeat_sequence < live.sequence
-                                || (r.heartbeat_sequence == live.sequence && live.report != r)
-                            {
-                                return Err(Status::failed_precondition("stale heartbeat"));
-                            }
-                            if r.heartbeat_sequence == live.sequence && live.expired {
-                                return Err(Status::failed_precondition(
-                                    "expired heartbeat; reconciliation required",
-                                ));
-                            }
-                            if r.heartbeat_sequence == live.sequence {
-                                return Ok(Response::new(pb::RegisterNodeResponse {
-                                    shard_id: state.nodes[&r.node_id].shard_id as u32,
-                                    coordinator_epoch: state.session.epoch(),
-                                }));
-                            }
-                            inspected = live.inspected
-                                && live.last_seen.elapsed() < service.0.heartbeat_timeout;
-                        } else if live.last_seen.elapsed() < service.0.heartbeat_timeout
-                            && (predecessor.as_ref() != Some(&live.session)
-                                || live.report.node_address != r.node_address
-                                || live.report.proxy_address != r.proxy_address)
-                        {
-                            return Err(Status::failed_precondition(
-                                "another node process is still registered",
-                            ));
-                        }
-                    }
-                    if !r.reconciling && !inspected {
-                        return Err(Status::failed_precondition("node requires reconciliation"));
-                    }
-                    let saved = match state
-                        .session
-                        .register_session(
-                            node.clone(),
-                            r.node_address.clone(),
-                            r.proxy_address.clone(),
-                            Some(NodeSession {
-                                id: r.session_id.clone(),
-                                sequence: r.heartbeat_sequence,
-                                routable: !r.reconciling,
-                            }),
-                        )
-                        .await
-                    {
-                        Ok(saved) => saved,
-                        Err(error) => {
-                            if matches!(error, Error::Unavailable(_) | Error::Conflict) {
-                                state.needs_recovery = true;
-                                service.0.changed.notify_waiters();
-                            }
-                            return Err(status(error));
-                        }
-                    };
-                    let shard = state
-                        .scheduler
-                        .register(saved.node.clone())
-                        .map_err(status)?;
-                    if shard != saved.shard_id {
-                        state.needs_recovery = true;
-                        return Err(Status::internal("node shard mismatch; recovery required"));
-                    }
-                    state.nodes.insert(saved.node.id.clone(), saved);
-                    state.recovering.remove(&r.node_id);
-                    if let Some(old) = state.live.remove(&r.node_id) {
-                        if old.session != r.session_id {
-                            state
-                                .retired_sessions
-                                .insert((r.node_id.clone(), old.session));
-                        }
-                    }
-                    state.live.insert(
-                        r.node_id.clone(),
-                        LiveNode {
-                            expired: false,
-                            session: r.session_id.clone(),
-                            sequence: r.heartbeat_sequence,
-                            last_seen: tokio::time::Instant::now(),
-                            inspected,
-                            report: r,
-                        },
-                    );
-                    service.0.changed.notify_waiters();
-                    Ok(Response::new(pb::RegisterNodeResponse {
-                        shard_id: u32::try_from(shard)
-                            .map_err(|_| Status::internal("shard overflow"))?,
-                        coordinator_epoch: state.session.epoch(),
-                    }))
-                })
+            }
+            if !r.reconciling && !inspected {
+                return Err(Status::failed_precondition("node requires reconciliation"));
+            }
+            let saved = match state
+                .session
+                .register_session(
+                    node.clone(),
+                    r.node_address.clone(),
+                    r.proxy_address.clone(),
+                    Some(NodeSession {
+                        id: r.session_id.clone(),
+                        sequence: r.heartbeat_sequence,
+                        routable: !r.reconciling,
+                    }),
+                )
                 .await
-                .map_err(|_| Status::internal("registration task failed"))?
-            })
-            .await
+            {
+                Ok(saved) => saved,
+                Err(error) => {
+                    if matches!(error, Error::Unavailable(_) | Error::Conflict) {
+                        state.needs_recovery = true;
+                        service.0.changed.notify_waiters();
+                    }
+                    return Err(status(error));
+                }
+            };
+            let shard = state
+                .scheduler
+                .register(saved.node.clone())
+                .map_err(status)?;
+            if shard != saved.shard_id {
+                state.needs_recovery = true;
+                return Err(Status::internal("node shard mismatch; recovery required"));
+            }
+            state.nodes.insert(saved.node.id.clone(), saved);
+            state.recovering.remove(&r.node_id);
+            if let Some(old) = state.live.remove(&r.node_id) {
+                if old.session != r.session_id {
+                    state
+                        .retired_sessions
+                        .insert((r.node_id.clone(), old.session));
+                }
+            }
+            state.live.insert(
+                r.node_id.clone(),
+                LiveNode {
+                    expired: false,
+                    session: r.session_id.clone(),
+                    sequence: r.heartbeat_sequence,
+                    last_seen: tokio::time::Instant::now(),
+                    inspected,
+                    report: r,
+                },
+            );
+            service.0.changed.notify_waiters();
+            Ok(Response::new(pb::RegisterNodeResponse {
+                shard_id: u32::try_from(shard).map_err(|_| Status::internal("shard overflow"))?,
+                coordinator_epoch: state.session.epoch(),
+            }))
+        })
+        .await
+        .map_err(|_| Status::internal("registration task failed"))?
     }
     async fn create_environment(
         &self,

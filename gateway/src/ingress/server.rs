@@ -733,8 +733,19 @@ impl Ingress {
         ingress_security: IngressSecurity,
         peer: std::net::SocketAddr,
     ) -> Result<Response<ProxyBody>, Infallible> {
-        let trace = adx_observability::trace::Trace::remote(
-            "ingress.http",
+        let route = match self.access_fields(&request).0 {
+            "port-forwarding" => "/{sandbox}/{port}/*",
+            "tunnel" => "/tunnel/*",
+            "direct" => self
+                .direct_route(&request)
+                .map(|route| adx_observability::trace::http_route(&route.stripped_path))
+                .unwrap_or("/unmatched"),
+            "reverse-proxy" => "/application/*",
+            _ => adx_observability::trace::http_route(request.uri().path()),
+        };
+        let trace = adx_observability::trace::Trace::http(
+            request.method().as_str(),
+            route,
             request
                 .headers()
                 .get("traceparent")
@@ -750,6 +761,10 @@ impl Ingress {
                 let response = self
                     .handle_http_inner(request, ingress_security, peer)
                     .await?;
+                adx_observability::trace::attribute(
+                    "http.response.status_code",
+                    response.status().as_u16().to_string(),
+                );
                 if response.status().is_server_error() {
                     adx_observability::trace::error();
                 }

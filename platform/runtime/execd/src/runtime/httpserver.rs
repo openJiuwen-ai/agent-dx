@@ -262,8 +262,10 @@ async fn handle_one_request(
         }
     };
     let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
-    let trace = adx_observability::trace::Trace::remote(
-        "execd.http",
+    let (trace_method, trace_path) = parse_request_line(&head);
+    let trace = adx_observability::trace::Trace::http(
+        &trace_method,
+        adx_observability::trace::http_route(&trace_path),
         parse_header(&head, "traceparent").as_deref(),
         parse_header(&head, "tracestate").as_deref(),
     );
@@ -416,6 +418,9 @@ async fn handle_one_request(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+    if let Some(operation) = super::dispatch::normalize_sandbox_action(&action) {
+        adx_observability::trace::attribute("rpc.method", operation.to_owned());
+    }
     let kw = json_args_to_kwargs(parsed.get("args"));
     let request_id = request_id_from(&head, &parsed);
 

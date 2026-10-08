@@ -47,7 +47,7 @@ def commands_for(suite, output, jobs):
         return [[redis, "--version"],
                 [python, "build/ci/rpc_certificates.py", str(output / "tls")],
                 ["env", f"ADX_TEST_REDIS_SERVER={redis}", f"ADX_TEST_TLS_DIR={output / 'tls'}", f"ADX_TEST_EVIDENCE={output}",
-                 cargo, "test", "--locked", "-p", "adx-coordinator", "--test", "rpc",
+                 cargo, "test", "--locked", "-p", "adx-coordinator", "--test", "rpc", "--test", "background_traces",
                  "-j", str(jobs), "--", "--ignored", "--nocapture"]]
     if suite == "storage":
         cargo = os.environ.get("CARGO", "cargo")
