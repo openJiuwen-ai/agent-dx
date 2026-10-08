@@ -1,0 +1,503 @@
+// Copyright (c) 2026 Ant Group Corporation.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto3";
+
+package runtime.v1;
+
+option go_package = "github.com/inclusionAI/sandboxd/api/runtime/v1;v1";
+
+// SandboxService manages sandbox lifecycle and inspection operations.
+service SandboxService {
+  // Start creates and starts a sandbox.
+  rpc Start(StartRequest) returns (StartResponse) {}
+  // Checkpoint saves a running sandbox into a caller-owned directory.
+  rpc Checkpoint(CheckpointRequest) returns (CheckpointResponse) {}
+  // Delete force-deletes a sandbox.
+  rpc Delete(DeleteRequest) returns (DeleteResponse) {}
+  // Wait waits for a sandbox to exit.
+  rpc Wait(WaitRequest) returns (WaitResponse) {}
+  // List lists sandboxes by filters.
+  rpc List(ListSandboxesRequest) returns (ListSandboxesResponse) {}
+  // Stats returns resource usage statistics for a sandbox.
+  rpc Stats(StatsRequest) returns (StatsResponse) {}
+  // ListAvailableRuntimes lists runtime classes whose handlers are ready.
+  rpc ListAvailableRuntimes(ListAvailableRuntimesRequest) returns (ListAvailableRuntimesResponse) {}
+  // SetNetworkPolicy atomically replaces the network policy of a running sandbox.
+  rpc SetNetworkPolicy(SetNetworkPolicyRequest) returns (SetNetworkPolicyResponse) {}
+}
+
+// NetworkPolicyAction is the action selected by a network policy rule.
+enum NetworkPolicyAction {
+  NETWORK_POLICY_ACTION_UNSPECIFIED = 0;
+  NETWORK_POLICY_ACTION_ALLOW       = 1;
+  NETWORK_POLICY_ACTION_DENY        = 2;
+}
+
+// NetworkDirection is expressed from the sandbox's point of view.
+enum NetworkDirection {
+  NETWORK_DIRECTION_UNSPECIFIED = 0;
+  NETWORK_DIRECTION_INGRESS     = 1;
+  NETWORK_DIRECTION_EGRESS      = 2;
+  NETWORK_DIRECTION_BOTH        = 3;
+}
+
+// NetworkProtocol selects the IPv4 transport protocol matched by a rule.
+enum NetworkProtocol {
+  NETWORK_PROTOCOL_UNSPECIFIED = 0;
+  NETWORK_PROTOCOL_ANY         = 1;
+  NETWORK_PROTOCOL_TCP         = 2;
+  NETWORK_PROTOCOL_UDP         = 3;
+  NETWORK_PROTOCOL_ICMP        = 4;
+}
+
+// TrafficPolicyMode selects whether replies are evaluated independently or
+// are admitted from connection state created by an allowed new flow.
+enum TrafficPolicyMode {
+  TRAFFIC_POLICY_MODE_UNSPECIFIED = 0;
+  TRAFFIC_POLICY_MODE_STATELESS   = 1;
+  TRAFFIC_POLICY_MODE_STATEFUL    = 2;
+}
+
+// NetworkEndpoint identifies the remote peer matched by a traffic rule.
+message NetworkEndpoint {
+  // Address is an exact IPv4 address in v1.
+  string address = 1;
+  // Port is an exact TCP or UDP port. Zero matches any port.
+  uint32 port = 2;
+  // Cidr is an IPv4 address or CIDR prefix in network policy schema v2.
+  string cidr = 3;
+  // Domain is an exact DNS name or a leading "*." suffix pattern in schema
+  // v2. Domain peers are valid only for egress rules.
+  string domain = 4;
+  // PortRange selects a contiguous remote TCP or UDP port range in schema v2.
+  PortRange port_range = 5;
+}
+
+// PortRange is an inclusive TCP or UDP port interval.
+message PortRange {
+  uint32 first = 1;
+  uint32 last  = 2;
+}
+
+// TrafficRule describes one ingress or egress packet rule.
+message TrafficRule {
+  NetworkPolicyAction action = 1;
+  NetworkDirection direction = 2;
+  NetworkProtocol protocol   = 3;
+  NetworkEndpoint peer       = 4;
+  // SandboxPort is the destination port on ingress and source port on
+  // egress. Zero matches any sandbox port. An omitted peer matches any
+  // remote address and port.
+  uint32 sandbox_port = 5;
+  // SandboxPortRange selects an inclusive local port interval in schema v2.
+  PortRange sandbox_port_range = 6;
+  // Priority orders schema v2 rules. Higher values win and DENY wins a tie.
+  // Zero selects the default user priority of 100.
+  uint32 priority = 7;
+}
+
+// TrafficPolicy controls IPv4 packets crossing a sandbox's host endpoint.
+message TrafficPolicy {
+  // DefaultAction is the shared ingress and egress default in schema v1.
+  NetworkPolicyAction default_action = 1;
+  repeated TrafficRule rules         = 2;
+  TrafficPolicyMode mode             = 3;
+  // IngressDefaultAction and EgressDefaultAction are required by schema v2.
+  NetworkPolicyAction ingress_default_action = 4;
+  NetworkPolicyAction egress_default_action  = 5;
+}
+
+// DNSRule matches either an exact DNS name or a leading "*." suffix pattern.
+message DNSRule {
+  NetworkPolicyAction action = 1;
+  string pattern             = 2;
+}
+
+// DNSPolicy controls conventional DNS queries sent through sandboxd's proxy.
+message DNSPolicy {
+  NetworkPolicyAction default_action = 1;
+  repeated DNSRule rules             = 2;
+}
+
+// NetworkPolicy combines packet and DNS policy. Missing sections allow traffic.
+message NetworkPolicy {
+  TrafficPolicy traffic = 1;
+  DNSPolicy dns         = 2;
+  // SchemaVersion is omitted for the legacy exact-address schema. Version 2
+  // enables CIDRs, domain peers, port ranges, priorities, and independent
+  // ingress and egress defaults.
+  uint32 schema_version = 3;
+}
+
+// SetNetworkPolicyRequest replaces a running sandbox's complete policy.
+message SetNetworkPolicyRequest {
+  string sandbox_id            = 1;
+  NetworkPolicy network_policy = 2;
+}
+
+// SetNetworkPolicyResponse is empty after a successful replacement.
+message SetNetworkPolicyResponse {}
+
+// RootfsSrcType identifies the root filesystem source type.
+enum RootfsSrcType {
+  S3    = 0;
+  IMAGE = 1;
+  LOCAL = 2;
+}
+
+// S3Config describes an S3 object source.
+message S3Config {
+  string endpoint          = 1;
+  string bucket            = 2;
+  string object            = 3;
+  string access_key_id     = 4;
+  string access_key_secret = 5;
+}
+
+// RootfsConfig describes the sandbox root filesystem source.
+message RootfsConfig {
+  // Readonly makes the root filesystem read-only when true.
+  bool readonly = 1;
+  // Type identifies the root filesystem source type.
+  RootfsSrcType type = 2;
+  oneof source {
+    // ImageURL is the image URL used as the root filesystem source.
+    string image_url = 3;
+    // S3Config is the S3 object used as the root filesystem source.
+    S3Config s3_config = 4;
+    // Path is a local directory or file used as the root filesystem source.
+    string path = 5;
+  }
+  // WritableLayerSizeBytes is a compatibility alias used by existing
+  // Function Proxy clients. sandboxd normalizes it to the start request's
+  // writable_layer_limit_bytes field.
+  uint64 writable_layer_size_bytes = 6;
+}
+
+// Mount describes an additional mount attached to the sandbox.
+message Mount {
+  // Type identifies the mount type, such as bind, volume, or tmpfs.
+  string type = 1;
+  // Target is the mount target path inside the sandbox.
+  string target = 2;
+  // Options contains zero or more fstab-style mount options.
+  repeated string options = 3;
+  oneof source {
+    // HostPath is a host path for bind mounts or a volume name.
+    string host_path = 10;
+    // S3Config is the S3 object used as the mount source.
+    S3Config s3_config = 11;
+    // ImageURL is the OCI image URL used as the mount source.
+    string image_url = 12;
+  }
+}
+
+// XpuAllocation describes concrete accelerator devices assigned by the
+// scheduler on the selected node.
+message XpuAllocation {
+  // Type is the normalized accelerator type, such as gpu.
+  string type = 1;
+  // DeviceIDs contains node-local physical device IDs selected by the scheduler.
+  repeated uint32 device_ids = 2;
+}
+
+// CheckpointInfo selects checkpoint restore mode for Start.
+message CheckpointInfo {
+  // CheckpointDir is the caller-owned directory containing runtime artifacts.
+  string checkpoint_dir = 1;
+}
+
+// StartRequest describes a sandbox start request.
+message StartRequest {
+  // SandboxID is an optional caller-provided sandbox ID. sandboxd generates one when empty.
+  string sandbox_id = 1;
+  // TemplateID is reserved for API compatibility with downstream builds that
+  // can start from pre-registered sandbox templates. The open-source runtime
+  // path does not implement template reuse and ignores this field.
+  string template_id = 2;
+  // Runtime is the runtime handler name, such as runsc.
+  string runtime = 3;
+  // Rootfs is the root filesystem source used by the sandbox.
+  RootfsConfig rootfs = 4;
+  // Command is the executable and arguments to run inside the sandbox.
+  repeated string command = 5;
+  // Cwd is the working directory inside the sandbox.
+  string cwd = 6;
+  // Envs contains environment variables for the sandbox process.
+  map<string, string> envs = 7;
+  // Mounts contains additional mounts attached to the sandbox.
+  repeated Mount mounts = 8;
+  // Resources contains sandbox resource requests. CPU is millicores and memory is MB.
+  map<string, double> resources = 9;
+  // Stdout is the redirect path for stdout. Empty means stdout is discarded to /dev/null.
+  string stdout = 10;
+  // Stderr is the redirect path for stderr. Empty means stderr is discarded to /dev/null.
+  string stderr = 11;
+  // ExtraConfig is a JSON string for runtime-specific configuration.
+  string extra_config = 12;
+  // Network is reserved for network-mode selection. The current runsc adapter
+  // always uses sandbox networking with netstack.
+  string network = 13;
+  // TraceID is an optional distributed trace ID.
+  string trace_id = 14;
+  // Ports contains port forwarding entries in "protocol:dstPort:targetPort" format.
+  repeated string ports = 15;
+  // Labels contains sandbox labels used for selection and runtime metadata.
+  map<string, string> labels = 16;
+  // MetricLabels contains sandbox metadata intended for metric dimensions.
+  map<string, string> metric_labels = 17;
+  // XpuAllocations contains concrete accelerator devices assigned to the sandbox.
+  repeated XpuAllocation xpu_allocations = 18;
+  // WritableLayerLimitBytes is the hard quota for the writable root filesystem
+  // layer. Zero preserves the node-configured default for older clients.
+  uint64 writable_layer_limit_bytes = 19;
+  // NetworkPolicy is the sandbox's initial packet and DNS policy. It can be
+  // replaced while the sandbox is running with SetNetworkPolicy.
+  NetworkPolicy network_policy = 20;
+  // CheckpointInfo restores the new sandbox from caller-owned runtime artifacts.
+  CheckpointInfo checkpoint_info = 21;
+  // InjectEntrypoint is the absolute in-sandbox path where sandboxd injects
+  // the effective Entrypoint/Cmd configuration from an OCI or Nydus image
+  // rootfs. Empty disables injection. It does not replace the sandbox's own
+  // command.
+  string inject_entrypoint = 22;
+}
+
+// StartResponse is returned after sandbox start.
+message StartResponse {
+  // Code is 0 on success.
+  int32 code = 1;
+  // Message contains details about the start result.
+  string message = 2;
+  // ID is the unique sandbox ID.
+  string id = 3;
+  // SandboxIP is the address assigned to the sandbox network endpoint.
+  string sandbox_ip = 4;
+}
+
+// CheckpointRequest describes a synchronous checkpoint operation.
+message CheckpointRequest {
+  // ID is the source sandbox ID.
+  string id = 1;
+  // CheckpointDir is an absolute caller-owned output directory.
+  string checkpoint_dir = 2;
+  // TimeoutSeconds bounds the complete checkpoint operation and must be non-zero.
+  uint32 timeout_seconds = 3;
+  // Compress enables runtime-supported checkpoint compression.
+  bool compress = 4;
+  // LeaveRunning keeps the source sandbox running after a successful checkpoint.
+  bool leave_running = 5;
+  // SnapshotType requests a specific checkpoint flavor: Full, Incremental,
+  // or SoftDirty. Empty (the default) leaves the automatic tier selection to
+  // the runtime. Firecracker maps the values onto its snapshot types;
+  // runtimes without incremental checkpoints ignore the field.
+  string snapshot_type = 6;
+}
+
+// CheckpointResponse is empty after the checkpoint artifact is complete.
+message CheckpointResponse {}
+
+// DeleteRequest describes a force-delete request.
+message DeleteRequest {
+  // ID is the sandbox ID.
+  string id = 1;
+  // Timeout is reserved for graceful deletion. v0.1.0 ignores it and always
+  // force-deletes the sandbox.
+  int64 timeout = 2;
+}
+
+// DeleteResponse is returned after sandbox delete.
+message DeleteResponse {}
+
+// WaitRequest describes a sandbox wait request.
+message WaitRequest {
+  // ID is the sandbox ID.
+  string id = 1;
+}
+
+// WaitResponse is returned after waiting for a sandbox.
+message WaitResponse {
+  // Status is reserved and is 0 for a successful Wait response in v0.1.0.
+  int32 status = 1;
+  // ExitCode is the sandbox process exit code.
+  int32 exit_code = 2;
+  // Message contains details about the sandbox state.
+  string message = 3;
+}
+
+// ListSandboxesRequest describes a sandbox list request.
+message ListSandboxesRequest {
+  // ID filters by sandbox ID when set.
+  string id = 1;
+  // Selector filters sandboxes by labels. Empty selector lists all sandboxes.
+  map<string, string> selector = 10;
+}
+
+// ListSandboxesResponse contains sandbox list results.
+message ListSandboxesResponse {
+  // Sandboxes contains matching sandbox statuses.
+  repeated SandboxStatus sandboxes = 1;
+}
+
+// SandboxState is the persisted lifecycle state of a sandbox.
+enum SandboxState {
+  SANDBOX_STATE_RUNNING = 0;
+  SANDBOX_STATE_EXITED  = 1;
+  SANDBOX_STATE_UNKNOWN = 2;
+}
+
+// SandboxStatus describes the current status and metadata of a sandbox.
+message SandboxStatus {
+  // ID is the sandbox ID.
+  string id = 1;
+  // Command is the executable and arguments configured for the sandbox.
+  repeated string command = 2;
+  // Runtime is the runtime handler name.
+  string runtime = 3;
+  // State is the current sandbox lifecycle state.
+  SandboxState state = 4;
+  // StartedAt is the sandbox start timestamp in Unix seconds.
+  int64 started_at = 5;
+  // FinishedAt is the sandbox finish timestamp in Unix seconds.
+  int64 finished_at = 6;
+  // ExitCode is the sandbox process exit code when available.
+  int32 exit_code = 7;
+  // Message contains details about the sandbox state.
+  string message = 8;
+  // Labels contains sandbox labels.
+  map<string, string> labels = 9;
+  // Mounts contains additional mounts attached to the sandbox.
+  repeated Mount mounts = 10;
+  // Envs contains environment variables configured for the sandbox.
+  repeated KeyValue envs = 11;
+  // Stdout is the configured stdout redirect path.
+  string stdout = 12;
+  // Stderr is the configured stderr redirect path.
+  string stderr = 13;
+  // Resources contains Linux resource settings for the sandbox.
+  LinuxSandboxResources resources = 14;
+  // MetricLabels contains sandbox metadata intended for metric dimensions.
+  map<string, string> metric_labels = 15;
+}
+
+// KeyValue represents a string key-value pair.
+message KeyValue {
+  // Key is the entry key.
+  string key   = 1;
+  // Value is the entry value.
+  string value = 2;
+}
+
+// LinuxSandboxResources describes Linux resource settings for a sandbox.
+message LinuxSandboxResources {
+  // CPUPeriod is the CPU CFS period in microseconds.
+  uint64 cpu_period = 1;
+  // CPUQuota is the CPU CFS quota in microseconds.
+  int64 cpu_quota = 2;
+  // CPUShares is the relative CPU share weight.
+  uint64 cpu_shares = 3;
+  // MemoryLimitInBytes is the memory limit in bytes.
+  int64 memory_limit_in_bytes = 4;
+  // OomScoreAdj is the OOM score adjustment.
+  int64 oom_score_adj = 5;
+  // CpusetCpus is the allowed CPU set.
+  string cpuset_cpus = 6;
+  // CpusetMems is the allowed memory node set.
+  string cpuset_mems = 7;
+  // HugepageLimits contains hugepage limits by page size.
+  repeated HugepageLimit hugepage_limits = 8;
+  // Unified contains cgroup v2 unified controller settings.
+  map<string, string> unified = 9;
+  // MemorySwapLimitInBytes is the memory plus swap limit in bytes.
+  int64 memory_swap_limit_in_bytes = 10;
+}
+
+// HugepageLimit describes a hugepage limit for one page size.
+message HugepageLimit {
+  // PageSize is the hugepage size.
+  string page_size = 1;
+  // Limit is the hugepage limit in bytes.
+  uint64 limit = 2;
+}
+
+// SandboxMetadata contains the persisted metadata for a sandbox.
+message SandboxMetadata {
+  // ID is the sandbox ID.
+  string id = 1;
+  // RuntimeHandler is the runtime handler name.
+  string runtime_handler = 3;
+  // Labels contains sandbox labels.
+  map<string, string> labels = 4;
+  // Stdout is the configured stdout redirect path.
+  string stdout = 6;
+  // Stderr is the configured stderr redirect path.
+  string stderr = 7;
+  // MetricLabels contains sandbox metadata intended for metric dimensions.
+  map<string, string> metric_labels = 8;
+}
+
+// SandboxMetadataList contains persisted sandbox metadata entries.
+message SandboxMetadataList {
+  // Sandboxes maps sandbox ID to sandbox metadata.
+  map<string, SandboxMetadata> sandboxes = 1;
+}
+
+// StatsRequest describes a sandbox stats request.
+message StatsRequest {
+  // ID is the sandbox ID.
+  string id = 1;
+}
+
+// StatsResponse contains sandbox resource usage statistics.
+message StatsResponse {
+  // Total CPU usage in nanoseconds.
+  uint64 cpu_usage_ns = 1;
+  // Current memory usage in bytes.
+  uint64 memory_usage_bytes = 2;
+  // Memory limit in bytes.
+  uint64 memory_limit_bytes = 3;
+  // Maximum memory usage observed in bytes.
+  uint64 memory_max_usage_bytes = 4;
+  // CPU usage in kernel mode in nanoseconds.
+  uint64 cpu_kernel_ns = 5;
+  // CPU usage in user mode in nanoseconds.
+  uint64 cpu_user_ns = 6;
+}
+
+// ListAvailableRuntimesRequest requests the runtime classes currently available
+// for new sandbox creation.
+message ListAvailableRuntimesRequest {}
+
+// RuntimeInfo describes one initialized runtime handler and its optional
+// checkpoint/restore application handoff interface.
+message RuntimeInfo {
+  // RuntimeClass is the handler name accepted by sandbox start requests.
+  string runtime_class = 1;
+  // SupportsCheckpointRestore reports whether the handler implements both operations.
+  bool supports_checkpoint_restore = 2;
+  // CheckpointHandoffPath is the guest-visible resume/restore/error endpoint.
+  string checkpoint_handoff_path = 3;
+  // RestoreEnvPath exposes the target OCI process environment after restore.
+  string restore_env_path = 4;
+}
+
+// ListAvailableRuntimesResponse contains the available runtime class snapshot.
+message ListAvailableRuntimesResponse {
+  // RuntimeClasses contains the sorted handler names accepted by sandbox start requests.
+  // Configured runtime classes whose handlers failed to initialize are excluded.
+  repeated string runtime_classes = 1;
+  // Runtimes contains detailed capabilities in runtime_classes order.
+  repeated RuntimeInfo runtimes = 2;
+}

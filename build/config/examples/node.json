@@ -1,0 +1,74 @@
+{
+  "node_id": "node-1",
+  "listen": "0.0.0.0:19001",
+  "advertised_address": "node-1:19001",
+  "proxy_address": "node-1:19002",
+  "tls": {
+    "ca": "/opt/adx/config/tls/ca.pem",
+    "certificate": "/opt/adx/config/tls/node-1.pem",
+    "private_key": "/opt/adx/config/tls/node-1.key",
+    "server_name": "adx.internal",
+    "peers": {
+      "coordinator": "/opt/adx/config/tls/coordinator.der",
+      "apiserver": "/opt/adx/config/tls/apiserver.der"
+    }
+  },
+  "sandboxd_socket": "/run/sandboxd/sandboxd.sock",
+  "runtime_logs": {
+    "directory": "/opt/adx/logs/runtime"
+  },
+  "proxy_mode": "standalone",
+  "proxy_socket": "/opt/adx/run/route.sock",
+  "report_interval_seconds": 5,
+  "rpc_timeout_seconds": 30,
+  "execd_port": 50090,
+  "execd_env": {},
+  "discovery": {
+    "redis_url": "redis://127.0.0.1:6379/",
+    "namespace": "adx"
+  },
+  "checkpoint_dir": "/opt/adx/data/checkpoints",
+  "resource_source": {
+    "kind": "sandboxd",
+    "socket": "/run/sandboxd/node-resource.sock",
+    "valid_for_seconds": 30
+  },
+  "degradation_journal": "/opt/adx/data/degraded/results.sqlite",
+  "pressure": {
+    "disk_path": "/opt/adx/data",
+    "thresholds": {
+      "memory_high_percent": 90,
+      "memory_low_percent": 80,
+      "disk_high_percent": 90,
+      "disk_low_percent": 80
+    }
+  },
+  "metrics_listen": "127.0.0.1:19091",
+  "runtime_ready_timeout_seconds": 120,
+  "checkpoint_gc": {
+    "enabled": true,
+    "min_age_seconds": 86400,
+    "interval_seconds": 300,
+    "max_artifacts": 100
+  },
+  "runtime_profile": {
+    "rootfs": {
+      "runtime_class": "runsc",
+      "type": "local",
+      "path": "/opt/adx/current/runtime/adx-runtime-rootfs.img",
+      "readonly": false
+    },
+    "bootstrap": {
+      "type": "erofs",
+      "root": "/opt/adx/current/runtime/adx-runtime-rootfs.img",
+      "target": "/__adx",
+      "entrypoint": [
+        "/__adx/usr/local/bin/adx-execd"
+      ],
+      "image_process_config": "/etc/adx-image-process.json"
+    },
+    "env": {
+      "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    }
+  }
+}

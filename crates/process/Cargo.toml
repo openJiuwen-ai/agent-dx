@@ -1,0 +1,21 @@
+[package]
+name = "adx-process"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared ADX process configuration, shutdown, and resource setup"
+
+[lints]
+workspace = true
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+libc = "0.2"
+serde = "1"
+serde_json = "1"
+tokio = { version = "1", features = ["signal", "macros"] }
+
+[dev-dependencies]
+tempfile = "3"

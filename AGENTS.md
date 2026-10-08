@@ -1,92 +1,43 @@
-# AGENTS.md
+# Agent DX development
 
-## Overall Goal
-你正在 `/opt/openyuanrong/yuanrong-agentruntime` 这个子项目中协作开发。该项目是 Agent Distributed Executor（agent-dx）的独立 Python CLI 包，提供 `adx` 命令，把 agent 的注册、调用封装为对底层 openYuanrong FaaS HTTP 接口的访问。
+## Boundaries
 
-默认先理解当前 CLI 行为、测试约束和上级工作区约定，再做最小侵入式修改。不要把本仓的改动混入上级 `yuanrong/` 主集成仓或其他 submodule。
+- `agent/` owns Template/Environment APIs and stateless Activators. Platform lifecycle access goes through the Sandbox capability interface; user Harness traffic uses shared Gateway forwarding.
+- `platform/` owns Environment scheduling and execution, the Sandbox SDK, Coordinator, adxlet and Execd.
+- `gateway/` owns the public Sandbox API Server, shared entrypoints, routing and node forwarding; it does not own Environment lifecycle.
+- Root `crates/` owns product-wide error semantics, observability, process bootstrap support and transport mechanics. Platform domain models, protocol, scheduling and discovery remain under `platform/crates/`.
+- Sandbox SDK uses adx-sandbox / adx_sandbox / ADX_ naming. Owned Agent namespaces use adx, Gateway commands use adx-, and config/headers use ADX. External runtime dependencies require functional replacement, not fabricated import renames. `docs/migration/sources.json` records exact provenance.
+- Keep the Rust API Server small: public HTTP types, validation and direct Environment RPC clients. Preserve Sandbox and Agent entrypoints. Do not reintroduce the removed runtime SDK, function/Job packages or metadata watchers to satisfy a helper import. Agent business logic belongs under `agent/`.
 
-## Repository Layout
+- Platform Environment (`adx_core::EnvironmentSpec` / `EnvironmentRecord`) owns execution identity and lifecycle. Agent Environment (`adx_agent_core::Environment`) owns product metadata and binds to a public Sandbox; do not merge the two state machines. `RuntimeProfile` only configures rootfs/bootstrap.
+- Process names: `adx-coordinator`, `adxlet`, `adx-apiserver`, `adx-ingress`, `adx-relay`, `adx-execd`.
 
-- `README.md`: 子项目简介。
-- `cli/`: Python 包源码与打包配置。
-- `cli/README.md`: `adx` 命令安装、使用、退出码和测试说明。
-- `cli/setup.py`: `agent-dx-cli` 包定义，console entry point 为 `adx=ar_cli.main:main`。
-- `cli/ar_cli/`: CLI 实现。
-- `tests/cli/`: CLI 单元测试。
-- `pytest.ini`: 测试配置，已将 `cli/` 加入 `pythonpath`。
+## Builds and tests
 
-## Core Modules
+- Internal gRPC contracts are Environment-centric; no legacy Frontend or POSIX protobuf adapters. Design new internal RPCs around Environment responsibilities; do not reuse old POSIX/function services. Execd user operations use HTTP. Runtime cooperation can use an Execd-initiated bidirectional gRPC stream; HTTP control remains available when the node has no runtime_control configuration. Both transports share adx-core runtime types and the same state machine.
 
-### CLI entrypoint
-- `cli/ar_cli/main.py`: `click` 根命令、全局 `-v/--verbose`、`--version` 和子命令注册。
-- `cli/ar_cli/__init__.py`: 包版本号来源，`setup.py` 会读取这里的 `__version__`。
+- Root Cargo workspace includes the API Server; Python packages build independently.
+- Use Makefile/native package commands. `build/` contains tracked scripts; outputs go to `out/` or explicitly configured external caches.
+- Run focused checks for changed components; report runtime/cluster validation separately.
+- Delegate long builds/tests/packaging to a narrow-context subagent when available: exact repo, commands, concurrency, success criteria and log path. The worker does not edit source. Keep complete logs, poll every 60–180 seconds and return compact results.
 
-### Commands
-- `cli/ar_cli/commands/deploy.py`: `adx deploy`，通过 meta_service 注册 agent/function。
-- `cli/ar_cli/commands/exec.py`: `adx exec`，调用 frontend 并流式输出 SSE 响应。
-- `cli/ar_cli/commands/__init__.py`: 已启用命令列表；新增命令时需要在这里显式注册。
+## Programming standards
 
-### Shared logic
-- `cli/ar_cli/api/`: HTTP client、函数调用、SessionCtx 和 SSE 协议封装。
-- `cli/ar_cli/interactive/`: 交互循环、SessionCtx 生命周期、查询、渲染和本地状态管理。
-- `cli/ar_cli/utils.py`: 地址归一化、JSON/spec 解析、日志配置等通用工具。
-- `cli/ar_cli/errors.py`: CLI 错误与退出码承载。
-- `cli/ar_cli/const.py`: 常量定义。
+- Rust changes follow [the repository Rust coding guidelines](docs/development/rust-coding-guidelines.md), which adopt the applicable rules from the Rust Coding Guidelines. The root `rustfmt.toml` and workspace lint configuration are authoritative; do not introduce crate-local formatting or broad lint exceptions.
+- Develop behavior changes test-first. Add a failing test that expresses the contract, implement the smallest coherent change, then run focused tests before the workspace gate.
+- New or modified production paths return structured errors for recoverable failures. Do not add unexplained `unwrap`, `expect`, `panic!`, `todo!`, `unimplemented!` or `dbg!`; tests may use assertion-oriented `unwrap` and `expect`.
+- Keep unsafe blocks minimal and add a local `SAFETY:` comment that states the concrete invariant. Validate external values at the boundary and use checked numeric conversions where narrowing can overflow.
+- Keep public APIs typed and narrow. Document caller-visible errors and intentional panics, preserve naming across API, configuration and storage boundaries, and avoid adding an abstraction until at least two real callers share the same semantics.
+- Rust completion requires `cargo fmt --all -- --check`, focused tests, and `cargo clippy --workspace --all-targets --all-features -- -D warnings`. Use `make rust-check JOBS=<n>` when validating the complete repository baseline.
 
-## Runtime Contracts
+## Documentation consistency
 
-- `adx deploy` 的 `--server` 指向 meta_service，地址格式为 `host:port`，未显式传 scheme 时默认使用 `http://`。
-- `adx deploy -s/--spec` 支持 inline JSON 字符串或 JSON 文件路径，spec 必须解析为 JSON object。
-- `adx deploy` 在 spec 未包含 `enableSessionCtx` 时默认注入 `true`；若用户显式设置 `true` 或 `false`，必须保留原值。
-- `adx exec` 的 `--server` 指向 frontend，地址格式同样为 `host:port`。
-- `adx exec` 只有在传入 `--session-ctx` 时才发送 `X-Agent-Session`。
-- `adx exec` 只有在传入 `--session-id` 时才发送 `X-Instance-Session`，并附带实例 session TTL/concurrency 默认值。
-- `adx exec --args` 必须是合法 JSON 字符串；不传时进入交互模式，每轮输入包装为 `{"message":"..."}`。
-- `adx exec` 交互模式下若用户未传 `--session-ctx`，会自动生成一个并在每次 POST 中复用。
-- 普通日志走 stderr，流式数据走 stdout；不要把 debug 日志混入 stdout。
-- 退出码约定：`0` 成功，`1` 服务端失败，`2` 参数错误，`3` 网络错误。
+- Documentation describes the checked-in implementation. A behavior, API, configuration, component, deployment mode or test is not documented as available until its implementation and required validation exist.
+- Any change to public behavior or architecture updates the affected README, API/error contract, configuration examples, deployment/use instructions and architecture material in the same change. Delete stale text instead of preserving historical behavior in current-state documents; keep history in migration reports and label future work explicitly in roadmaps.
+- Code names, paths, defaults, environment variables, ports, process roles and package names in documentation must match source and generated configuration exactly. Examples must remain executable and must not imply a stronger validation boundary than the recorded evidence.
+- When architecture Markdown changes, regenerate its HTML with `python3 build/docs/render_architecture.py`. Before completion run `python3 build/docs/check.py`, inspect the resulting errors, and run `git diff --check`.
+- Report verification evidence and material gaps together with the change. Local unit/component tests must not be presented as standalone, multi-VM, Kubernetes or full end-to-end proof.
 
-## Build, Run, And Test
+## Commits
 
-### Install locally
-在 `cli/` 目录下安装：
-
-```bash
-pip install .
-```
-
-或构建 wheel：
-
-```bash
-python setup.py bdist_wheel
-pip install dist/agent_dx_cli-*.whl
-```
-
-### Run CLI from source
-在仓库根目录可依赖 `pytest.ini` 的 `pythonpath = cli` 运行测试；手动从源码运行时确保 `cli/` 在 `PYTHONPATH` 中，或先安装包。
-
-### Tests
-在仓库根目录执行：
-
-```bash
-python -m pytest -q
-```
-
-新增或修改命令行为时，优先补充 `tests/cli/` 下的单元测试。涉及 HTTP 行为时优先 mock client/response，不依赖真实 openYuanrong 服务。
-
-## Working Rules
-
-- 修改前先确认影响的是命令参数、HTTP 请求协议、SSE 解析、session header，还是打包入口。
-- 保持 CLI 对外参数、stdout/stderr、退出码兼容；任何行为变化都需要同步更新 `cli/README.md` 和测试。
-- 新增命令时使用 `click` 现有风格，并在 `cli/ar_cli/commands/__init__.py` 注册。
-- 对 JSON/spec 处理优先复用 `utils.py` 中已有解析逻辑，避免重复实现。
-- 对请求地址处理优先复用 `normalize_addr`，避免在命令模块中拼接 URL 细节。
-- 对调用和 session header 处理优先复用 `api/` 下的协议封装，不要在命令模块中分散规则。
-- 修改 SSE 或 SessionCtx 行为时同时检查 `tests/cli/test_sse.py`、`tests/cli/test_interactive.py` 和 `tests/cli/test_session_context_client.py`。
-- 这个仓库是上级 `/opt/openyuanrong` 工作区的一部分，但不是 `yuanrong/` 主集成仓；不要在本子项目任务中修改 `../yuanrong/`、`../yuanrong/functionsystem/`、`../yuanrong/datasystem/` 或 `../yuanrong/frontend/`，除非用户明确要求。
-
-## Commit Rules
-
-- Commit 信息沿用上级工作区约定，使用 PR 类型前缀，格式如 `fix: xxxxx`。
-- Commit 正文说明具体修改内容和修改原因。
-- 提交时使用 `git commit -s`，确保包含 `Signed-off-by`。
+Use conventional commit subjects and a single CLA-compatible Signed-off-by trailer. Do not mix migration with unrelated behavior changes.
