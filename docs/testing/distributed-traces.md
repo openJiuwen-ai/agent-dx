@@ -13,6 +13,8 @@ ADX 使用 OpenTelemetry SDK 和 W3C `traceparent` / `tracestate`。采样与导
 
 创建、执行、删除是独立请求，各有自己的 Trace，通过 Environment ID 关联。SDK 目前没有新增自动事务级根 Span。
 
+sandboxd 是独立运行时服务。本版本在 adxlet→sandboxd 的 gRPC 边界停止 Trace 传播；sandboxd 原有的资源指标和日志采集不依赖该传播，也不将 sandboxd span 计入本版本的端到端 Trace 验收。
+
 ## 配置与部署
 
 通过统一部署配置中对应服务的 `env` 设置：

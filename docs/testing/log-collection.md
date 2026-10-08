@@ -60,6 +60,6 @@ Collector 自身指标使用独立的 `127.0.0.1:18888/metrics`，避开 Sandbox
 
 ## Metrics 与验证
 
-Coordinator/adxlet 的实例及资源指标继续通过 `/metrics` 抓取。Ingress 与 Relay 已有 `/metrics`，包括请求/连接/流量/错误/路由等；无需重复实现。可使用 `build/observability/prometheus.json` 中的四类目标配置，替换地址后由部署环境抓取。不同来源的资源视图不要直接相加。
+Coordinator/adxlet 的实例及资源指标继续通过 `/metrics` 抓取。Ingress 与 Relay 已有 `/metrics`，包括请求/连接/流量/错误/路由等；无需重复实现。可使用 `build/observability/prometheus.json` 中的四类目标配置，替换地址后由部署环境抓取。不同来源的资源视图不要直接相加。 ADX 的四张 Grafana 看板及导入/标签要求见 [Grafana 看板](../../build/observability/grafana/README.md)。
 
 本轮验收包括：完整行滚动、超长行后恢复、延迟压缩和保留、HTTP 请求敏感字段省略；将后端置为 503 时完成真实双节点创建/执行/删除，随后抓取 Gateway 指标并接收组件日志；注入 OTLP 后端 503、滚动文件、重启 Collector，以 40 条唯一记录验证该受控场景的读取位置和持久化队列恢复。最终结果以验收报告为准。
