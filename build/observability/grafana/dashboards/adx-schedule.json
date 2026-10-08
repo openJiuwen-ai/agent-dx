@@ -45,13 +45,13 @@
       "targetBlank": false
     },
     {
-      "title": "Explore 接口查询",
+      "title": "Explore Requests",
       "type": "link",
       "url": "/explore?schemaVersion=1&panes=%7B%22a%22%3A%7B%22datasource%22%3A%22tempo%22%2C%22queries%22%3A%5B%7B%22refId%22%3A%22A%22%2C%22datasource%22%3A%7B%22type%22%3A%22tempo%22%2C%22uid%22%3A%22tempo%22%7D%2C%22queryType%22%3A%22traceql%22%2C%22query%22%3A%22%7B%20resource.adx_env%20%3D~%20%5C%22${adx_env:percentencode}%5C%22%20%26%26%20name%20%3D~%20%5C%22%5E%28GET%7CPOST%7CPUT%7CDELETE%7CPATCH%7CHEAD%7COPTIONS%7CCONNECT%7COTHER%29%20%2F.%2A%5C%22%20%26%26%20span.http.route%20%21%3D%20%5C%22%2Funmatched%5C%22%20%26%26%20name%20%21%3D%20%5C%22GET%20%2Fhealthz%5C%22%20%26%26%20name%20%21%3D%20%5C%22GET%20%2Fmetrics%5C%22%20%7D%20%7C%20select%28name%2C%20resource.service.name%2C%20span.http.response.status_code%2C%20span.rpc.method%29%22%2C%22tableType%22%3A%22spans%22%2C%22limit%22%3A50%2C%22spss%22%3A3%7D%5D%2C%22range%22%3A%7B%22from%22%3A%22now-6h%22%2C%22to%22%3A%22now%22%7D%7D%7D",
       "includeVars": false,
       "keepTime": false,
       "targetBlank": false,
-      "tooltip": "在 Explore 按接口、组件、响应状态和 Execd 操作查询 Span；点击 Span ID 查看完整链路"
+      "tooltip": "Search spans by endpoint, component, response status and Execd operation in Explore; click a Span ID to inspect the full trace."
     }
   ],
   "panels": [
@@ -122,7 +122,7 @@
           "refId": "A"
         }
       ],
-      "title": "运行中沙箱",
+      "title": "Running Sandboxes",
       "type": "gauge"
     },
     {
@@ -181,11 +181,11 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "count((adx_coordinator_node_capacity_cpu_millis{adx_env=~\"$adx_env\"} > 0) and on (adx_env, node_id) (adx_coordinator_node_reachable{adx_env=~\"$adx_env\"} == 1))",
+          "expr": "count((adx_coordinator_node_capacity_cpu_millis{adx_env=~\"$adx_env\"} > 0) * on (adx_env, node_id) adx_coordinator_node_schedulable{adx_env=~\"$adx_env\"})",
           "refId": "A"
         }
       ],
-      "title": "可达节点",
+      "title": "Reachable Nodes",
       "type": "stat"
     },
     {
@@ -214,12 +214,12 @@
             "uid": "prometheus"
           },
           "expr": "sum(adx_coordinator_node_schedulable{adx_env=~\"$adx_env\"})",
-          "legendFormat": "节点",
+          "legendFormat": "Nodes",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "可调度节点",
+      "title": "Schedulable Nodes",
       "type": "stat"
     },
     {
@@ -248,12 +248,12 @@
             "uid": "prometheus"
           },
           "expr": "sum(adx_coordinator_queued_requests{adx_env=~\"$adx_env\"})",
-          "legendFormat": "请求",
+          "legendFormat": "Requests",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "排队请求",
+      "title": "Queued Requests",
       "type": "stat"
     },
     {
@@ -261,7 +261,7 @@
         "type": "prometheus",
         "uid": "prometheus"
       },
-      "description": "可达节点已预留资源 / 调度容量；不是实际使用率。",
+      "description": "Allocated resources divided by capacity on schedulable nodes. Nodes with admission disabled are excluded. This is not actual utilization.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -319,11 +319,11 @@
             "uid": "prometheus"
           },
           "refId": "A",
-          "expr": "sum(adx_coordinator_node_reserved_cpu_millis{adx_env=~\"$adx_env\"} and on (adx_env, node_id) (adx_coordinator_node_reachable{adx_env=~\"$adx_env\"} == 1)) / clamp_min(sum(adx_coordinator_node_capacity_cpu_millis{adx_env=~\"$adx_env\"} and on (adx_env, node_id) (adx_coordinator_node_reachable{adx_env=~\"$adx_env\"} == 1)), 1)",
-          "legendFormat": "预留比例"
+          "expr": "sum(adx_coordinator_node_reserved_cpu_millis{adx_env=~\"$adx_env\"} * on (adx_env, node_id) adx_coordinator_node_schedulable{adx_env=~\"$adx_env\"}) / clamp_min(sum(adx_coordinator_node_capacity_cpu_millis{adx_env=~\"$adx_env\"} * on (adx_env, node_id) adx_coordinator_node_schedulable{adx_env=~\"$adx_env\"}), 1)",
+          "legendFormat": "Allocation Ratio"
         }
       ],
-      "title": "CPU调度分配率",
+      "title": "CPU Allocation Ratio",
       "type": "gauge",
       "id": 5
     },
@@ -392,13 +392,6 @@
               "options": ".*capacity.*"
             },
             "properties": []
-          },
-          {
-            "matcher": {
-              "id": "byRegexpOrNames",
-              "options": ".*allocatable.*"
-            },
-            "properties": []
           }
         ]
       },
@@ -434,8 +427,8 @@
             "uid": "prometheus"
           },
           "refId": "A",
-          "expr": "sum(adx_coordinator_node_capacity_cpu_millis{adx_env=~\"$adx_env\"} and on (adx_env, node_id) (adx_coordinator_node_reachable{adx_env=~\"$adx_env\"} == 1)) / 1000",
-          "legendFormat": "调度容量"
+          "expr": "sum(adx_coordinator_node_capacity_cpu_millis{adx_env=~\"$adx_env\"} * on (adx_env, node_id) adx_coordinator_node_schedulable{adx_env=~\"$adx_env\"}) / 1000",
+          "legendFormat": "Scheduling Capacity"
         },
         {
           "datasource": {
@@ -444,28 +437,19 @@
           },
           "refId": "B",
           "expr": "sum(adx_coordinator_node_reserved_cpu_millis{adx_env=~\"$adx_env\"} and on (adx_env, node_id) (adx_coordinator_node_reachable{adx_env=~\"$adx_env\"} == 1)) / 1000",
-          "legendFormat": "已预留"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "refId": "C",
-          "expr": "sum(adx_coordinator_node_available_cpu_millis{adx_env=~\"$adx_env\"} and on (adx_env, node_id) (adx_coordinator_node_reachable{adx_env=~\"$adx_env\"} == 1)) / 1000",
-          "legendFormat": "可调度"
+          "legendFormat": "Allocated"
         }
       ],
-      "title": "CPU调度容量、预留与可用",
+      "title": "CPU Scheduling Capacity and Allocated",
       "type": "timeseries",
-      "description": "资源源上报的调度账本。可用量还受到准入/维护状态限制；磁盘容量不是文件系统物理总大小。"
+      "description": "Scheduling capacity is zero when admission is disabled. Allocated resources come from reachable-node ledgers and include starting and running environments. Disabling admission does not release allocations. This is not actual utilization."
     },
     {
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
       },
-      "description": "可达节点已预留资源 / 调度容量；不是实际使用率。",
+      "description": "Allocated resources divided by capacity on schedulable nodes. Nodes with admission disabled are excluded. This is not actual utilization.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -523,11 +507,11 @@
             "uid": "prometheus"
           },
           "refId": "A",
-          "expr": "sum(adx_coordinator_node_reserved_memory_bytes{adx_env=~\"$adx_env\"} and on (adx_env, node_id) (adx_coordinator_node_reachable{adx_env=~\"$adx_env\"} == 1)) / clamp_min(sum(adx_coordinator_node_capacity_memory_bytes{adx_env=~\"$adx_env\"} and on (adx_env, node_id) (adx_coordinator_node_reachable{adx_env=~\"$adx_env\"} == 1)), 1)",
-          "legendFormat": "预留比例"
+          "expr": "sum(adx_coordinator_node_reserved_memory_bytes{adx_env=~\"$adx_env\"} * on (adx_env, node_id) adx_coordinator_node_schedulable{adx_env=~\"$adx_env\"}) / clamp_min(sum(adx_coordinator_node_capacity_memory_bytes{adx_env=~\"$adx_env\"} * on (adx_env, node_id) adx_coordinator_node_schedulable{adx_env=~\"$adx_env\"}), 1)",
+          "legendFormat": "Allocation Ratio"
         }
       ],
-      "title": "内存调度分配率",
+      "title": "Memory Allocation Ratio",
       "type": "gauge",
       "id": 7
     },
@@ -596,13 +580,6 @@
               "options": ".*capacity.*"
             },
             "properties": []
-          },
-          {
-            "matcher": {
-              "id": "byRegexpOrNames",
-              "options": ".*allocatable.*"
-            },
-            "properties": []
           }
         ]
       },
@@ -638,8 +615,8 @@
             "uid": "prometheus"
           },
           "refId": "A",
-          "expr": "sum(adx_coordinator_node_capacity_memory_bytes{adx_env=~\"$adx_env\"} and on (adx_env, node_id) (adx_coordinator_node_reachable{adx_env=~\"$adx_env\"} == 1)) / 1",
-          "legendFormat": "调度容量"
+          "expr": "sum(adx_coordinator_node_capacity_memory_bytes{adx_env=~\"$adx_env\"} * on (adx_env, node_id) adx_coordinator_node_schedulable{adx_env=~\"$adx_env\"}) / 1",
+          "legendFormat": "Scheduling Capacity"
         },
         {
           "datasource": {
@@ -648,28 +625,19 @@
           },
           "refId": "B",
           "expr": "sum(adx_coordinator_node_reserved_memory_bytes{adx_env=~\"$adx_env\"} and on (adx_env, node_id) (adx_coordinator_node_reachable{adx_env=~\"$adx_env\"} == 1)) / 1",
-          "legendFormat": "已预留"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "refId": "C",
-          "expr": "sum(adx_coordinator_node_available_memory_bytes{adx_env=~\"$adx_env\"} and on (adx_env, node_id) (adx_coordinator_node_reachable{adx_env=~\"$adx_env\"} == 1)) / 1",
-          "legendFormat": "可调度"
+          "legendFormat": "Allocated"
         }
       ],
-      "title": "内存调度容量、预留与可用",
+      "title": "Memory Scheduling Capacity and Allocated",
       "type": "timeseries",
-      "description": "资源源上报的调度账本。可用量还受到准入/维护状态限制；磁盘容量不是文件系统物理总大小。"
+      "description": "Scheduling capacity is zero when admission is disabled. Allocated resources come from reachable-node ledgers and include starting and running environments. Disabling admission does not release allocations. This is not actual utilization."
     },
     {
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
       },
-      "description": "可达节点已预留资源 / 调度容量；不是实际使用率。",
+      "description": "Allocated resources divided by capacity on schedulable nodes. Nodes with admission disabled are excluded. This is not actual utilization.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -727,11 +695,11 @@
             "uid": "prometheus"
           },
           "refId": "A",
-          "expr": "sum(adx_coordinator_node_reserved_disk_bytes{adx_env=~\"$adx_env\"} and on (adx_env, node_id) (adx_coordinator_node_reachable{adx_env=~\"$adx_env\"} == 1)) / clamp_min(sum(adx_coordinator_node_capacity_disk_bytes{adx_env=~\"$adx_env\"} and on (adx_env, node_id) (adx_coordinator_node_reachable{adx_env=~\"$adx_env\"} == 1)), 1)",
-          "legendFormat": "预留比例"
+          "expr": "sum(adx_coordinator_node_reserved_disk_bytes{adx_env=~\"$adx_env\"} * on (adx_env, node_id) adx_coordinator_node_schedulable{adx_env=~\"$adx_env\"}) / clamp_min(sum(adx_coordinator_node_capacity_disk_bytes{adx_env=~\"$adx_env\"} * on (adx_env, node_id) adx_coordinator_node_schedulable{adx_env=~\"$adx_env\"}), 1)",
+          "legendFormat": "Allocation Ratio"
         }
       ],
-      "title": "磁盘调度分配率",
+      "title": "Disk Allocation Ratio",
       "type": "gauge",
       "id": 9
     },
@@ -800,13 +768,6 @@
               "options": ".*capacity.*"
             },
             "properties": []
-          },
-          {
-            "matcher": {
-              "id": "byRegexpOrNames",
-              "options": ".*allocatable.*"
-            },
-            "properties": []
           }
         ]
       },
@@ -842,8 +803,8 @@
             "uid": "prometheus"
           },
           "refId": "A",
-          "expr": "sum(adx_coordinator_node_capacity_disk_bytes{adx_env=~\"$adx_env\"} and on (adx_env, node_id) (adx_coordinator_node_reachable{adx_env=~\"$adx_env\"} == 1)) / 1",
-          "legendFormat": "调度容量"
+          "expr": "sum(adx_coordinator_node_capacity_disk_bytes{adx_env=~\"$adx_env\"} * on (adx_env, node_id) adx_coordinator_node_schedulable{adx_env=~\"$adx_env\"}) / 1",
+          "legendFormat": "Scheduling Capacity"
         },
         {
           "datasource": {
@@ -852,21 +813,12 @@
           },
           "refId": "B",
           "expr": "sum(adx_coordinator_node_reserved_disk_bytes{adx_env=~\"$adx_env\"} and on (adx_env, node_id) (adx_coordinator_node_reachable{adx_env=~\"$adx_env\"} == 1)) / 1",
-          "legendFormat": "已预留"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "refId": "C",
-          "expr": "sum(adx_coordinator_node_available_disk_bytes{adx_env=~\"$adx_env\"} and on (adx_env, node_id) (adx_coordinator_node_reachable{adx_env=~\"$adx_env\"} == 1)) / 1",
-          "legendFormat": "可调度"
+          "legendFormat": "Allocated"
         }
       ],
-      "title": "磁盘调度容量、预留与可用",
+      "title": "Disk Scheduling Capacity and Allocated",
       "type": "timeseries",
-      "description": "资源源上报的调度账本。可用量还受到准入/维护状态限制；磁盘容量不是文件系统物理总大小。"
+      "description": "Scheduling capacity is zero when admission is disabled. Allocated resources come from reachable-node ledgers and include starting and running environments. Disabling admission does not release allocations. This is not actual utilization."
     },
     {
       "datasource": {
@@ -942,7 +894,7 @@
           ],
           "displayMode": "table",
           "placement": "right",
-          "showLegend": true
+          "showLegend": false
         },
         "tooltip": {
           "hideZeros": false,
@@ -962,7 +914,7 @@
           "refId": "A"
         }
       ],
-      "title": "集群运行中沙箱趋势",
+      "title": "Running Sandboxes over Time",
       "type": "timeseries"
     },
     {
@@ -1059,7 +1011,7 @@
           "refId": "A"
         }
       ],
-      "title": "各节点运行中沙箱趋势",
+      "title": "Running Sandboxes by Node",
       "type": "timeseries"
     },
     {
@@ -1097,7 +1049,7 @@
       "gridPos": {
         "x": 0,
         "y": 25,
-        "w": 6,
+        "w": 12,
         "h": 8
       },
       "id": 13,
@@ -1126,11 +1078,11 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum(adx_coordinator_environments{adx_env=~\"$adx_env\",state=\"Running\"} and on (adx_env, node_id) (adx_coordinator_node_reachable{adx_env=~\"$adx_env\"} == 1)) / clamp_min(count((adx_coordinator_node_capacity_cpu_millis{adx_env=~\"$adx_env\"} > 0) and on (adx_env, node_id) (adx_coordinator_node_reachable{adx_env=~\"$adx_env\"} == 1)), 1)",
+          "expr": "sum(adx_coordinator_environments{adx_env=~\"$adx_env\",state=\"Running\"} * on (adx_env, node_id) adx_coordinator_node_schedulable{adx_env=~\"$adx_env\"}) / clamp_min(count((adx_coordinator_node_capacity_cpu_millis{adx_env=~\"$adx_env\"} > 0) * on (adx_env, node_id) adx_coordinator_node_schedulable{adx_env=~\"$adx_env\"}), 1)",
           "refId": "A"
         }
       ],
-      "title": "每节点平均运行沙箱",
+      "title": "Average Running Sandboxes per Node",
       "type": "stat"
     },
     {
@@ -1166,9 +1118,9 @@
         "overrides": []
       },
       "gridPos": {
-        "x": 6,
+        "x": 12,
         "y": 25,
-        "w": 6,
+        "w": 12,
         "h": 8
       },
       "id": 14,
@@ -1201,7 +1153,7 @@
           "refId": "A"
         }
       ],
-      "title": "单节点最多运行沙箱",
+      "title": "Maximum Running Sandboxes on a Node",
       "type": "stat"
     },
     {
@@ -1211,130 +1163,443 @@
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "short"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "x": 12,
-        "y": 25,
-        "w": 12,
-        "h": 8
-      },
-      "id": 15,
-      "options": {
-        "legend": {
-          "displayMode": "list",
-          "placement": "bottom"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "expr": "adx_coordinator_node_reachable{adx_env=~\"$adx_env\"}",
-          "legendFormat": "可达 {{node_id}}",
-          "range": true,
-          "refId": "A"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "expr": "adx_coordinator_node_schedulable{adx_env=~\"$adx_env\"}",
-          "legendFormat": "可调度 {{node_id}}",
-          "range": true,
-          "refId": "B"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "expr": "adx_node_resource_observation_fresh{adx_env=~\"$adx_env\"}",
-          "legendFormat": "资源观测新鲜度",
-          "range": true,
-          "refId": "C"
-        }
-      ],
-      "title": "节点健康、准入与资源采样状态",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "prometheus"
-      },
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
+          "noValue": "Unknown",
           "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "axisSoftMin": 0,
-            "barAlignment": 0,
-            "barWidthFactor": 0.6,
-            "drawStyle": "line",
-            "fillOpacity": 10,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "insertNulls": false,
-            "lineInterpolation": "linear",
-            "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "auto",
-            "showValues": false,
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
+            "align": "left",
+            "cellOptions": {
+              "type": "auto"
             }
-          },
-          "mappings": [],
-          "min": 0,
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": 0
-              }
-            ]
-          },
-          "unit": "bytes"
+          }
         },
         "overrides": [
           {
             "matcher": {
-              "id": "byRegexpOrNames",
-              "options": ".*capacity.*"
+              "id": "byName",
+              "options": "Reachability"
             },
-            "properties": []
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "0": {
+                        "text": "Unreachable",
+                        "color": "red",
+                        "index": 0
+                      },
+                      "1": {
+                        "text": "Reachable",
+                        "color": "green",
+                        "index": 1
+                      }
+                    }
+                  },
+                  {
+                    "type": "special",
+                    "options": {
+                      "match": "null",
+                      "result": {
+                        "text": "Unknown",
+                        "color": "orange",
+                        "index": 2
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "custom.align",
+                "value": "center"
+              },
+              {
+                "id": "custom.width",
+                "value": 130
+              }
+            ]
           },
           {
             "matcher": {
-              "id": "byRegexpOrNames",
-              "options": ".*allocatable.*"
+              "id": "byName",
+              "options": "Admission"
             },
-            "properties": []
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "0": {
+                        "text": "Blocked",
+                        "color": "red",
+                        "index": 0
+                      },
+                      "1": {
+                        "text": "Allowed",
+                        "color": "green",
+                        "index": 1
+                      }
+                    }
+                  },
+                  {
+                    "type": "special",
+                    "options": {
+                      "match": "null",
+                      "result": {
+                        "text": "Unknown",
+                        "color": "orange",
+                        "index": 2
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "custom.align",
+                "value": "center"
+              },
+              {
+                "id": "custom.width",
+                "value": 110
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Resource Sample"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "0": {
+                        "text": "Stale",
+                        "color": "red",
+                        "index": 0
+                      },
+                      "1": {
+                        "text": "Fresh",
+                        "color": "green",
+                        "index": 1
+                      }
+                    }
+                  },
+                  {
+                    "type": "special",
+                    "options": {
+                      "match": "null",
+                      "result": {
+                        "text": "Unknown",
+                        "color": "orange",
+                        "index": 2
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "custom.align",
+                "value": "center"
+              },
+              {
+                "id": "custom.width",
+                "value": 140
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "CPU Capacity (cores)"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "cores"
+              },
+              {
+                "id": "decimals",
+                "value": 1
+              },
+              {
+                "id": "custom.align",
+                "value": "right"
+              },
+              {
+                "id": "custom.width",
+                "value": 170
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Memory Capacity"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "bytes"
+              },
+              {
+                "id": "decimals",
+                "value": 1
+              },
+              {
+                "id": "custom.align",
+                "value": "right"
+              },
+              {
+                "id": "custom.width",
+                "value": 135
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Disk Capacity"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "bytes"
+              },
+              {
+                "id": "decimals",
+                "value": 1
+              },
+              {
+                "id": "custom.align",
+                "value": "right"
+              },
+              {
+                "id": "custom.width",
+                "value": 135
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Node (Env / ID)"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 250
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "CPU Allocation"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percentunit"
+              },
+              {
+                "id": "decimals",
+                "value": 1
+              },
+              {
+                "id": "min",
+                "value": 0
+              },
+              {
+                "id": "max",
+                "value": 1
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "thresholds"
+                }
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": null
+                    },
+                    {
+                      "color": "yellow",
+                      "value": 0.7
+                    },
+                    {
+                      "color": "red",
+                      "value": 0.9
+                    }
+                  ]
+                }
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "gauge",
+                  "mode": "basic",
+                  "valueDisplayMode": "text"
+                }
+              },
+              {
+                "id": "custom.width",
+                "value": 170
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Memory Allocation"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percentunit"
+              },
+              {
+                "id": "decimals",
+                "value": 1
+              },
+              {
+                "id": "min",
+                "value": 0
+              },
+              {
+                "id": "max",
+                "value": 1
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "thresholds"
+                }
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": null
+                    },
+                    {
+                      "color": "yellow",
+                      "value": 0.7
+                    },
+                    {
+                      "color": "red",
+                      "value": 0.9
+                    }
+                  ]
+                }
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "gauge",
+                  "mode": "basic",
+                  "valueDisplayMode": "text"
+                }
+              },
+              {
+                "id": "custom.width",
+                "value": 170
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Disk Allocation"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percentunit"
+              },
+              {
+                "id": "decimals",
+                "value": 1
+              },
+              {
+                "id": "min",
+                "value": 0
+              },
+              {
+                "id": "max",
+                "value": 1
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "thresholds"
+                }
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": null
+                    },
+                    {
+                      "color": "yellow",
+                      "value": 0.7
+                    },
+                    {
+                      "color": "red",
+                      "value": 0.9
+                    }
+                  ]
+                }
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "gauge",
+                  "mode": "basic",
+                  "valueDisplayMode": "text"
+                }
+              },
+              {
+                "id": "custom.width",
+                "value": 170
+              }
+            ]
           }
         ]
       },
@@ -1344,56 +1609,181 @@
         "w": 24,
         "h": 8
       },
-      "id": 19,
+      "id": 15,
       "options": {
-        "legend": {
-          "calcs": [
-            "last",
-            "max",
-            "mean"
-          ],
-          "displayMode": "table",
-          "placement": "bottom",
-          "showLegend": true
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false
         },
-        "tooltip": {
-          "hideZeros": false,
-          "mode": "multi",
-          "sort": "none"
-        }
+        "sortBy": [
+          {
+            "displayName": "Node (Env / ID)",
+            "desc": false
+          }
+        ]
       },
-      "pluginVersion": "12.3.1",
       "targets": [
         {
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
           },
+          "expr": "label_join(min by (adx_env, node_id) (adx_coordinator_node_reachable{adx_env=~\"$adx_env\"}), \"node_key\", \"/\", \"adx_env\", \"node_id\")",
+          "range": false,
           "refId": "A",
-          "expr": "adx_coordinator_node_capacity_disk_bytes{adx_env=~\"$adx_env\"} and on (adx_env, node_id) (adx_coordinator_node_reachable{adx_env=~\"$adx_env\"} == 1)",
-          "legendFormat": "{{node_id}} 调度容量"
+          "format": "table",
+          "instant": true
         },
         {
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
           },
+          "expr": "label_join(min by (adx_env, node_id) (adx_coordinator_node_schedulable{adx_env=~\"$adx_env\"}), \"node_key\", \"/\", \"adx_env\", \"node_id\")",
+          "range": false,
           "refId": "B",
-          "expr": "adx_coordinator_node_reserved_disk_bytes{adx_env=~\"$adx_env\"} and on (adx_env, node_id) (adx_coordinator_node_reachable{adx_env=~\"$adx_env\"} == 1)",
-          "legendFormat": "{{node_id}} 已预留"
+          "format": "table",
+          "instant": true
         },
         {
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
           },
+          "expr": "label_join(min by (adx_env, node_id) ((adx_node_resource_observation_fresh{adx_env=~\"$adx_env\",node_id!=\"\"} and (time() - timestamp(adx_node_resource_observation_fresh{adx_env=~\"$adx_env\",node_id!=\"\"}) < 45)) or label_replace((adx_node_resource_observation_fresh{adx_env=~\"$adx_env\",node_id=\"\",k8s_node_name!=\"\"} and (time() - timestamp(adx_node_resource_observation_fresh{adx_env=~\"$adx_env\",node_id=\"\",k8s_node_name!=\"\"}) < 45)), \"node_id\", \"$1\", \"k8s_node_name\", \"(.+)\")), \"node_key\", \"/\", \"adx_env\", \"node_id\")",
+          "range": false,
           "refId": "C",
-          "expr": "adx_coordinator_node_available_disk_bytes{adx_env=~\"$adx_env\"} and on (adx_env, node_id) (adx_coordinator_node_reachable{adx_env=~\"$adx_env\"} == 1)",
-          "legendFormat": "{{node_id}} 可调度"
+          "format": "table",
+          "instant": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "label_join(min by (adx_env, node_id) (adx_coordinator_node_capacity_cpu_millis{adx_env=~\"$adx_env\"} * on (adx_env, node_id) adx_coordinator_node_schedulable{adx_env=~\"$adx_env\"}) / 1000, \"node_key\", \"/\", \"adx_env\", \"node_id\")",
+          "range": false,
+          "instant": true,
+          "format": "table",
+          "refId": "D"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "label_join(min by (adx_env, node_id) (adx_coordinator_node_capacity_memory_bytes{adx_env=~\"$adx_env\"} * on (adx_env, node_id) adx_coordinator_node_schedulable{adx_env=~\"$adx_env\"}) / 1, \"node_key\", \"/\", \"adx_env\", \"node_id\")",
+          "range": false,
+          "instant": true,
+          "format": "table",
+          "refId": "E"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "label_join(min by (adx_env, node_id) (adx_coordinator_node_capacity_disk_bytes{adx_env=~\"$adx_env\"} * on (adx_env, node_id) adx_coordinator_node_schedulable{adx_env=~\"$adx_env\"}) / 1, \"node_key\", \"/\", \"adx_env\", \"node_id\")",
+          "range": false,
+          "instant": true,
+          "format": "table",
+          "refId": "F"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "label_join(min by (adx_env, node_id) ((adx_coordinator_node_reserved_cpu_millis{adx_env=~\"$adx_env\"} / on (adx_env, node_id) (adx_coordinator_node_capacity_cpu_millis{adx_env=~\"$adx_env\"} > 0)) and on (adx_env, node_id) (adx_coordinator_node_reachable{adx_env=~\"$adx_env\"} == 1)), \"node_key\", \"/\", \"adx_env\", \"node_id\")",
+          "range": false,
+          "instant": true,
+          "format": "table",
+          "refId": "G"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "label_join(min by (adx_env, node_id) ((adx_coordinator_node_reserved_memory_bytes{adx_env=~\"$adx_env\"} / on (adx_env, node_id) (adx_coordinator_node_capacity_memory_bytes{adx_env=~\"$adx_env\"} > 0)) and on (adx_env, node_id) (adx_coordinator_node_reachable{adx_env=~\"$adx_env\"} == 1)), \"node_key\", \"/\", \"adx_env\", \"node_id\")",
+          "range": false,
+          "instant": true,
+          "format": "table",
+          "refId": "H"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "label_join(min by (adx_env, node_id) ((adx_coordinator_node_reserved_disk_bytes{adx_env=~\"$adx_env\"} / on (adx_env, node_id) (adx_coordinator_node_capacity_disk_bytes{adx_env=~\"$adx_env\"} > 0)) and on (adx_env, node_id) (adx_coordinator_node_reachable{adx_env=~\"$adx_env\"} == 1)), \"node_key\", \"/\", \"adx_env\", \"node_id\")",
+          "range": false,
+          "instant": true,
+          "format": "table",
+          "refId": "I"
         }
       ],
-      "title": "各节点磁盘调度容量、预留与可用",
-      "type": "timeseries"
+      "title": "Node Status, Scheduling Capacity and Allocation",
+      "type": "table",
+      "description": "One row per environment and node: heartbeat reachability, scheduler admission, resource sampling, and CPU, memory and disk scheduling capacity. Unknown means missing observations. Sampling uses node_id, with k8s_node_name as a Kubernetes fallback. Samples older than 45 seconds are unknown (15-second scrape interval). Capacity is zero when admission is disabled. Disk capacity is a scheduling value, not physical filesystem size. CPU, memory and disk allocation bars show reserved / underlying capacity on reachable nodes, including starting and running environments. The underlying capacity is retained when admission is disabled, so existing allocations remain visible even when the scheduling capacity columns are zero. These are allocation ratios, not measured utilization. Zero or missing capacity produces Unknown. Bars use a fixed 0–100% scale; values above 100% remain visible as percentages. Colors: green below 70%, yellow at 70–90%, red at or above 90%.",
+      "transformations": [
+        {
+          "id": "filterFieldsByName",
+          "options": {
+            "include": {
+              "names": [
+                "node_key",
+                "Value #A",
+                "Value #B",
+                "Value #C",
+                "Value #D",
+                "Value #G",
+                "Value #E",
+                "Value #H",
+                "Value #F",
+                "Value #I"
+              ]
+            }
+          }
+        },
+        {
+          "id": "joinByField",
+          "options": {
+            "byField": "node_key",
+            "mode": "outerTabular"
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "indexByName": {
+              "node_key": 0,
+              "Value #A": 1,
+              "Value #B": 2,
+              "Value #C": 3,
+              "Value #D": 4,
+              "Value #G": 5,
+              "Value #E": 6,
+              "Value #H": 7,
+              "Value #F": 8,
+              "Value #I": 9
+            },
+            "renameByName": {
+              "node_key": "Node (Env / ID)",
+              "Value #A": "Reachability",
+              "Value #B": "Admission",
+              "Value #C": "Resource Sample",
+              "Value #D": "CPU Capacity (cores)",
+              "Value #G": "CPU Allocation",
+              "Value #E": "Memory Capacity",
+              "Value #H": "Memory Allocation",
+              "Value #F": "Disk Capacity",
+              "Value #I": "Disk Allocation"
+            }
+          }
+        }
+      ]
     },
     {
       "datasource": {
@@ -1426,7 +1816,7 @@
             "uid": "prometheus"
           },
           "expr": "sum(adx_trace_exported_spans_total{adx_env=~\"$adx_env\"})",
-          "legendFormat": "已导出",
+          "legendFormat": "Exported",
           "refId": "A"
         },
         {
@@ -1435,13 +1825,13 @@
             "uid": "prometheus"
           },
           "expr": "sum(adx_trace_export_failed_spans_total{adx_env=~\"$adx_env\"})",
-          "legendFormat": "导出失败",
+          "legendFormat": "Export Failed",
           "refId": "B"
         }
       ],
-      "title": "Trace 导出与失败 Span",
+      "title": "Exported and Failed Spans",
       "type": "timeseries",
-      "description": "Coordinator 和 Adxlet 原生 trace 导出计数；Ingress trace 由 Tempo 直接查询。"
+      "description": "Native Coordinator and adxlet span export counters. Query Ingress traces directly in Tempo."
     },
     {
       "datasource": {
@@ -1474,20 +1864,20 @@
             "type": "loki",
             "uid": "loki"
           },
-          "expr": "{adx_env=~\"$adx_env\",component_name=\"adx-runtime\"} | runtime_id=~`${runtime_id:regex}` |= ${log_search:json}",
+          "expr": "{adx_env=~\"$adx_env\",component_name=\"adx-runtime\"} | runtime_id=~`${runtime_id:regex}` |= ${log_search:doublequote}",
           "refId": "A"
         }
       ],
-      "title": "沙箱日志搜索",
+      "title": "Sandbox Logs",
       "type": "logs",
-      "description": "仅查询沙箱主进程 stdout/stderr，支持运行记录多选与原文关键词搜索。运行 ID 包含 Sandbox ID 和 generation；下拉候选来自所选时间范围内的资源采样，没有采样的运行记录可通过 All 查看。SDK command 返回结果不会自动归档到这里。 默认独立查看最近 6 小时；选定绝对时间时遵循所选范围。无主进程输出时为空是正常的。",
+      "description": "Search sandbox main-process stdout/stderr by runtime records and case-sensitive keywords. Runtime IDs contain Sandbox ID and generation. Options come from resource samples in the selected time range; use All for records without samples. SDK command results are not archived here. Defaults to the last 6 hours unless an absolute time range is selected. No main-process output means no log entries.",
       "timeFrom": "6h"
     },
     {
       "id": 22,
       "type": "table",
-      "title": "接口请求链路",
-      "description": "每行是一个匹配的 HTTP Span，展示接口、实际组件、响应状态和 Span 耗时。流式响应的 HTTP Span 可能先于后台任务结束，完整链路耗时请点击 Trace ID 查看。排除未识别接口与健康探测，不依赖上游根 Span。",
+      "title": "HTTP Request Traces",
+      "description": "One row per matching HTTP span, showing endpoint, actual component, response status and span duration. Streaming HTTP spans may finish before background tasks; click Trace ID for the complete trace. Excludes unmatched routes and health checks. Does not require an upstream root span.",
       "datasource": {
         "type": "tempo",
         "uid": "tempo"
@@ -1527,7 +1917,7 @@
                 "id": "links",
                 "value": [
                   {
-                    "title": "查看调用链",
+                    "title": "View Trace",
                     "url": "",
                     "internal": {
                       "datasourceUid": "tempo",
@@ -1545,7 +1935,7 @@
           {
             "matcher": {
               "id": "byName",
-              "options": "接口"
+              "options": "Endpoint"
             },
             "properties": [
               {
@@ -1557,7 +1947,7 @@
           {
             "matcher": {
               "id": "byName",
-              "options": "开始时间"
+              "options": "Start Time"
             },
             "properties": [
               {
@@ -1569,7 +1959,7 @@
           {
             "matcher": {
               "id": "byName",
-              "options": "组件"
+              "options": "Component"
             },
             "properties": [
               {
@@ -1581,7 +1971,7 @@
           {
             "matcher": {
               "id": "byName",
-              "options": "状态"
+              "options": "Status"
             },
             "properties": [
               {
@@ -1593,7 +1983,7 @@
           {
             "matcher": {
               "id": "byName",
-              "options": "Span 耗时"
+              "options": "Span Duration"
             },
             "properties": [
               {
@@ -1647,15 +2037,15 @@
               "Duration": 4
             },
             "renameByName": {
-              "time": "开始时间",
-              "name": "接口",
-              "service.name": "组件",
-              "http.response.status_code": "状态",
-              "duration": "Span 耗时",
+              "time": "Start Time",
+              "name": "Endpoint",
+              "service.name": "Component",
+              "http.response.status_code": "Status",
+              "duration": "Span Duration",
               "traceIdHidden": "Trace ID",
-              "Start time": "开始时间",
-              "Name": "接口",
-              "Duration": "Span 耗时"
+              "Start time": "Start Time",
+              "Name": "Endpoint",
+              "Duration": "Span Duration"
             }
           }
         }
@@ -1697,8 +2087,8 @@
       },
       {
         "name": "runtime_id",
-        "label": "沙箱运行记录",
-        "description": "可搜索 Sandbox ID 并多选其运行记录；候选来自当前时间范围的资源采样。All 查询全部已采集的沙箱输出。",
+        "label": "Sandbox Runtime",
+        "description": "Search by Sandbox ID and select runtime records from resource samples in the current time range. All searches all collected sandbox output.",
         "type": "query",
         "datasource": {
           "type": "prometheus",
@@ -1727,8 +2117,8 @@
       },
       {
         "name": "log_search",
-        "label": "日志关键词",
-        "description": "按原文包含关系搜索，区分大小写；留空不限制。",
+        "label": "Log Keyword",
+        "description": "Case-sensitive substring search in the original log message. Leave empty to match all messages.",
         "type": "textbox",
         "query": "",
         "current": {
