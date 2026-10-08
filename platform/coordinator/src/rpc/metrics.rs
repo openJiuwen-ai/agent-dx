@@ -49,6 +49,11 @@ impl CoordinatorRpc {
             );
             if let Some(live) = state.live.get(id) {
                 out.gauge(
+                    "adx_coordinator_node_heartbeat_timeout",
+                    &labels,
+                    u64::from(live.expired || state.overdue(id, self.0.heartbeat_timeout)),
+                );
+                out.gauge(
                     "adx_coordinator_node_heartbeat_age_seconds",
                     &labels,
                     live.last_seen.elapsed().as_secs(),
