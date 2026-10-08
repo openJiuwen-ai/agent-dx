@@ -7,7 +7,7 @@
 
 | JSON | 内容与口径 |
 | --- | --- |
-| [adx-schedule.json](dashboards/adx-schedule.json) | CPU/内存/磁盘调度容量、预留、可用及分配率，Running Environment 分布，队列、节点健康、日志和 Trace 导出。 |
+| [adx-schedule.json](dashboards/adx-schedule.json) | CPU/内存/磁盘调度容量、预留、可用及分配率，Running Environment 分布，队列、节点健康、沙箱日志搜索和 Trace 导出。 |
 | [adx-data-plane.json](dashboards/adx-data-plane.json) | Ingress 请求速率、状态分类、4xx/5xx 比例、响应头耗时 P50/P95/P99、超过 100 ms 比例、活跃请求及连接池；Relay 活跃流、连接成功/失败、拒绝与路由错误；Ingress 逻辑流及物理连接。 |
 | [adx-process-resources.json](dashboards/adx-process-resources.json) | 进程 CPU 核数、RSS、文件描述符、线程，以及按 Pod/组件/PID 的运行时长和虚拟内存明细。 |
 
@@ -15,10 +15,15 @@
 Trace 面板显示导出累计 span 数量，具体调用链通过 Tempo 查询。
 Schedule 聚焦调度账本、队列、准入和实例分布。节点实际使用量和沙箱实际使用量
 由部署环境的节点资源与沙箱详情看板承载，避免在调度看板重复展示。
-日志面板将组件 JSON 格式化为级别与消息，展开日志可查看解析字段。没有消息字段
-或无法解析的日志保留原文；Loki 保存的原始日志不变，不因解析失败丢弃日志。
-Schedule 仅保留所有查询共用的 `adx_env` 环境筛选；All 使用 `.+` 匹配非空环境
-标签，满足 Loki 的流选择条件。
+沙箱日志搜索面板仅查询 `component_name="adx-runtime"` 的主进程 stdout/stderr，
+保留原文。支持环境、沙箱运行记录多选及原文关键词搜索；关键词区分大小写，留空不限制。
+运行记录候选来自所选时间范围内的 `adx_environment_stats_age_seconds` 的
+`runtime_id` 标签，可输入 Sandbox ID 搜索对应运行记录。同一 Sandbox 的不同
+运行代次是不同记录；缺少资源采样的运行记录不出现在候选中，可选择 All 查看
+全部已采集输出。运行 ID 在 Loki 中仍为结构化元数据，不新增逐实例索引。
+SDK command 返回的 stdout/stderr 不会自动归档为主进程日志。
+环境和运行记录的 All 使用 `.+`，匹配非空标签；运行记录和关键词仅影响日志
+面板，不改变调度指标。控制面日志仍被采集，可在 Loki Explore 单独查询。
 
 ## 导入与采集前提
 
