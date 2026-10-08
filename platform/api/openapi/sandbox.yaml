@@ -38,6 +38,13 @@ paths:
       tags: [Scheduler compatibility]
       operationId: listLegacySchedulerResources
       summary: List online node resources using the legacy-compatible path
+      description: |
+        Capacity and allocatable totals include only online nodes accepting
+        new allocations. Online nodes with admission disabled remain in
+        resource.fragment with status 1, zero CPU/Memory/Disk capacity and
+        allocatable values, and no GPU/NPU resource entries. This is a scheduling
+        view; disabling admission does not release existing allocations or
+        erase the Coordinator's underlying capacity and allocation ledger.
       responses:
         "200":
           description: Current node capacity, allocatable resources and admission status.
@@ -99,7 +106,11 @@ paths:
         is initialized by a complete Coordinator watch frame and then refreshed by
         subsequent frames; an expired or unavailable view returns an error
         instead of stale capacity. CPU is reported in millicores and Memory and
-        Disk in MiB.
+        Disk in MiB. Nodes with admission disabled retain their identity,
+        labels and status 1, but report zero CPU/Memory/Disk capacity and
+        allocatable values and no GPU/NPU resource entries. This is a scheduling
+        view, not rated physical capacity or actual utilization. Existing
+        allocations and the Coordinator's underlying resource ledger are retained.
       responses:
         "200":
           description: Current node capacity, allocatable resources and admission status.
@@ -585,6 +596,7 @@ components:
           items: {$ref: "#/components/schemas/NodeResource"}
     NodeResource:
       type: object
+      description: Online node scheduling resources; capacity and allocatable are zero when status is 1.
       additionalProperties: false
       required: [id, status, capacity, allocatable, labels]
       properties:
@@ -615,6 +627,7 @@ components:
         message: {type: string}
     LegacyResourceResponse:
       type: object
+      description: Scheduling resource totals and online node fragments; admission-disabled nodes contribute no resources to the totals.
       additionalProperties: false
       required: [requestID, resource]
       properties:

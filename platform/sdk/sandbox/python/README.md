@@ -327,6 +327,12 @@ nodes = resources(connection=connection)
 Sandbox.delete("sandbox-id", connection=connection)
 ```
 
+`resources()` reports scheduling capacity and remaining allocatable resources.
+Online nodes that are not accepting allocations remain in the result with
+status 1, zero CPU/Memory/Disk resources and no GPU/NPU resource entries.
+Existing allocations remain held; this view does not report actual utilization
+or the rated capacity of admission-disabled nodes.
+
 Without a `ConnectionConfig`, the SDK reads `ADX_SERVER_ADDRESS`, `ADX_TOKEN`,
 `ADX_TLS`, `ADX_GATEWAY_ADDRESS`, and `ADX_GATEWAY_TLS`. The gateway address
 defaults to the frontend address for reverse-tunnel and user-port routes. PTY

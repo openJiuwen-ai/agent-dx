@@ -1031,6 +1031,16 @@ fn route_name(path: &str) -> &'static str {
     }
 }
 
+fn scheduling_resource_node(mut node: pb::NodeEndpoint) -> pb::NodeEndpoint {
+    if !node.accepting_allocations {
+        node.capacity = Some(pb::Resources::default());
+        node.allocatable = Some(pb::Resources::default());
+        node.capacity_devices.clear();
+        node.allocatable_devices.clear();
+    }
+    node
+}
+
 fn resource_view(nodes: Vec<pb::NodeEndpoint>) -> Value {
     fn resources(resources: Option<pb::Resources>, devices: &[pb::Device]) -> Value {
         let resources = resources.unwrap_or_default();
@@ -1045,7 +1055,7 @@ fn resource_view(nodes: Vec<pb::NodeEndpoint>) -> Value {
         Value::Object(values)
     }
     json!({
-        "items": nodes.into_iter().map(|node| json!({
+        "items": nodes.into_iter().map(scheduling_resource_node).map(|node| json!({
             "id": node.node_id,
             "status": if node.accepting_allocations { 0 } else { 1 },
             "capacity": resources(node.capacity, &node.capacity_devices),
@@ -1095,6 +1105,7 @@ fn legacy_resource_view(nodes: Vec<pb::NodeEndpoint>, request_id: &str) -> Value
     let mut allocatable_devices = Vec::new();
     let fragments = nodes
         .into_iter()
+        .map(scheduling_resource_node)
         .map(|node| {
             add(&mut capacity, &node.capacity);
             add(&mut allocatable, &node.allocatable);
@@ -1315,6 +1326,46 @@ mod error_contract_tests {
     }
 
     #[test]
+    fn resource_view_keeps_blocked_node_identity_but_zeros_scheduling_resources() {
+        let node = pb::NodeEndpoint {
+            node_id: "blocked".into(),
+            accepting_allocations: false,
+            capacity: Some(pb::Resources {
+                cpu_millis: 4000,
+                memory_bytes: 8 * 1_048_576,
+                disk_bytes: 20 * 1_048_576,
+            }),
+            allocatable: Some(pb::Resources {
+                cpu_millis: 3000,
+                memory_bytes: 6 * 1_048_576,
+                disk_bytes: 10 * 1_048_576,
+            }),
+            labels: [("zone".into(), "a".into())].into_iter().collect(),
+            capacity_devices: vec![pb::Device {
+                id: 0,
+                kind: pb::DeviceKind::Gpu.into(),
+                model: "A100".into(),
+                healthy: true,
+            }],
+            allocatable_devices: vec![pb::Device {
+                id: 0,
+                kind: pb::DeviceKind::Npu.into(),
+                model: "910B".into(),
+                healthy: true,
+            }],
+            ..Default::default()
+        };
+        let value = resource_view(vec![node]);
+        let item = &value["items"][0];
+        assert_eq!(item["id"], "blocked");
+        assert_eq!(item["status"], 1);
+        assert_eq!(item["labels"]["zone"], "a");
+        for field in ["capacity", "allocatable"] {
+            assert_eq!(item[field], json!({"CPU": 0, "Memory": 0, "Disk": 0}));
+        }
+    }
+
+    #[test]
     fn legacy_resource_view_exposes_fragment_units_and_aggregate_capacity() {
         let node = |id: &str, accepting_allocations: bool| pb::NodeEndpoint {
             node_id: id.into(),
@@ -1350,18 +1401,69 @@ mod error_contract_tests {
         assert_eq!(value["requestID"], "req");
         assert_eq!(
             value["resource"]["capacity"]["resources"]["CPU"]["scalar"]["value"],
-            4000
+            2000
+        );
+        assert_eq!(
+            value["resource"]["capacity"]["resources"]["Memory"]["scalar"]["value"],
+            4096
+        );
+        assert_eq!(
+            value["resource"]["capacity"]["resources"]["Disk"]["scalar"]["value"],
+            1024
+        );
+        assert_eq!(
+            value["resource"]["allocatable"]["resources"]["CPU"]["scalar"]["value"],
+            1000
+        );
+        assert_eq!(
+            value["resource"]["allocatable"]["resources"]["Memory"]["scalar"]["value"],
+            2048
+        );
+        assert_eq!(
+            value["resource"]["allocatable"]["resources"]["Disk"]["scalar"]["value"],
+            512
         );
         assert_eq!(value["resource"]["fragment"]["1"]["status"], 0);
         assert_eq!(value["resource"]["fragment"]["2"]["status"], 1);
         assert_eq!(
             value["resource"]["allocatable"]["resources"]["NPU/910B"]["vectors"]["values"]["count"]
                 ["vectors"]["cards"]["values"][0],
-            2
+            1
         );
+        for field in ["capacity", "allocatable"] {
+            assert_eq!(
+                value["resource"]["fragment"]["2"][field],
+                json!({"resources": {
+                    "CPU": {"scalar": {"value": 0}},
+                    "Memory": {"scalar": {"value": 0}},
+                    "Disk": {"scalar": {"value": 0}}
+                }})
+            );
+        }
         assert_eq!(
             value["resource"]["fragment"]["1"]["nodeLabels"]["HOST_IP"]["items"]["10.0.0.1"],
             1
+        );
+        let blocked = legacy_resource_view(vec![node("1", false), node("2", false)], "req");
+        for field in ["capacity", "allocatable"] {
+            assert_eq!(
+                blocked["resource"][field],
+                json!({"resources": {
+                    "CPU": {"scalar": {"value": 0}},
+                    "Memory": {"scalar": {"value": 0}},
+                    "Disk": {"scalar": {"value": 0}}
+                }})
+            );
+        }
+        let resumed = legacy_resource_view(vec![node("1", true), node("2", true)], "req");
+        assert_eq!(
+            resumed["resource"]["capacity"]["resources"]["CPU"]["scalar"]["value"],
+            4000
+        );
+        assert_eq!(
+            resumed["resource"]["allocatable"]["resources"]["NPU/910B"]["vectors"]["values"]
+                ["count"]["vectors"]["cards"]["values"][0],
+            2
         );
     }
 

@@ -21,6 +21,12 @@ does not repeat user or component authorization so trusted internal controllers
 can use the same operations directly.
 Both resource shapes include CPU millicores, Memory/Disk MiB and whole-card
 `GPU/<model>` or `NPU/<model>` capacity and allocatable counts.
+Both paths expose scheduling resources. Online nodes with admission disabled
+retain their ID, labels and status 1, but report zero CPU/Memory/Disk capacity
+and allocatable values and omit GPU/NPU resource entries. The legacy cluster
+totals include only nodes accepting new allocations. The watched directory and
+Coordinator ledger retain the underlying capacity and existing allocations;
+resuming admission makes the current resources visible again.
 
 ## Modules
 
