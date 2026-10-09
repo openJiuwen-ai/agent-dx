@@ -7,6 +7,7 @@ use adx_observability::trace;
 use adx_protocol::control as pb;
 use adx_transport::rpc::{RpcChannel, RpcClient, SecurityMode};
 use adx_transport::tls::grpc_client_config;
+use bytes::Bytes;
 use sha2::{Digest, Sha256};
 use std::{
     future::Future,
@@ -268,6 +269,7 @@ impl Clients {
                 tokio::time::timeout(timeout, future)
                     .await
                     .map_err(|_| Status::deadline_exceeded("control RPC deadline exceeded"))?
+                    .map_err(normalize_rpc_error)
                     .map(Response::into_inner)
             })
             .await
@@ -361,6 +363,29 @@ impl Clients {
     }
 }
 
+// Tonic reports a connection reset during handshake/reconnect as Unknown or Cancelled,
+// even though its source identifies a transport failure. Keep application
+// statuses intact: an RPC timeout or transport failure never proves that a
+// lifecycle operation did not execute.
+fn normalize_rpc_error(status: Status) -> Status {
+    if !matches!(status.code(), Code::Unknown | Code::Cancelled) {
+        return status;
+    }
+    let mut source = std::error::Error::source(&status);
+    while let Some(error) = source {
+        if error.is::<tonic::transport::Error>() {
+            return Status::with_details_and_metadata(
+                Code::Unavailable,
+                status.message(),
+                Bytes::copy_from_slice(status.details()),
+                status.metadata().clone(),
+            );
+        }
+        source = error.source();
+    }
+    status
+}
+
 pub fn unix_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -434,6 +459,96 @@ fn local_owner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rpc_test_clients(address: &str) -> Arc<Clients> {
+        Clients::new(
+            serde_json::from_value(serde_json::json!({
+                "listen": "127.0.0.1:0",
+                "coordinator_address": address,
+                "internal_security": "network",
+                "ingress_mode": "standalone",
+                "rpc_timeout_seconds": 1,
+                "cache_entries": 8,
+                "auth_cache_ttl_seconds": 1
+            }))
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn refused_node_connection_is_retryable_unavailable() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let clients = rpc_test_clients(&address);
+        let mut node = pb::node_service_client::NodeServiceClient::new(
+            clients.channel(&address).await.unwrap(),
+        );
+        let error = clients
+            .rpc(
+                "test.delete",
+                node.delete_environment(pb::DeleteEnvironmentRequest::default()),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::Unavailable, "{error:?}");
+        let detail = crate::errors::ErrorDetail::from_status(
+            &error,
+            "request",
+            Some("operation"),
+            Some("environment"),
+            true,
+        );
+        assert_eq!(detail.retry, adx_error::RetryDirective::SameOperation);
+        assert_eq!(detail.outcome, adx_error::OperationOutcome::Unknown);
+    }
+
+    #[tokio::test]
+    async fn application_internal_error_keeps_its_code() {
+        let clients = rpc_test_clients("http://127.0.0.1:1");
+        let error = clients
+            .rpc::<()>("test.application", async {
+                Err(Status::internal("application invariant failed"))
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::Internal);
+        assert_eq!(error.message(), "application invariant failed");
+        for original in [
+            Status::unknown("application error"),
+            Status::cancelled("request cancelled"),
+        ] {
+            let normalized = normalize_rpc_error(original.clone());
+            assert_eq!(normalized.code(), original.code());
+            assert_eq!(normalized.message(), original.message());
+        }
+    }
+
+    #[tokio::test]
+    async fn disconnected_node_connection_is_retryable_unavailable() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            loop {
+                let (socket, _) = listener.accept().await.unwrap();
+                drop(socket);
+            }
+        });
+        let clients = rpc_test_clients(&address);
+        let mut node = pb::node_service_client::NodeServiceClient::new(
+            clients.channel(&address).await.unwrap(),
+        );
+        let error = clients
+            .rpc(
+                "test.delete",
+                node.delete_environment(pb::DeleteEnvironmentRequest::default()),
+            )
+            .await
+            .unwrap_err();
+        task.abort();
+        assert_eq!(error.code(), Code::Unavailable, "{error:?}");
+    }
 
     fn owned(id: &str, tenant: &str) -> pb::GetEnvironmentResponse {
         pb::GetEnvironmentResponse {

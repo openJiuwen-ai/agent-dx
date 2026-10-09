@@ -8,7 +8,7 @@ API Server 和 Ingress 保持独立模块、监听与 TLS 身份。`gateway::ing
 
 同一部署包含 `apiserver` 和 `ingress` 两个逻辑角色，API Server 未设置 `ingress_mode` 或设置为 `embedded` 时，`adxctl render` 只生成一个 `adx-apiserver` 进程。它把 Ingress 控制配置作为 `ingress_control` 写入 API Server 私有配置，并把 Ingress 的 `ADX_DATA_PLANE_*` 环境合并给该进程。
 
-API Server 仍监听回环管理端口，Ingress 仍监听对外 TLS、可选明文及健康端口。两者共享 Tokio runtime 和进程重启预算；Ingress 监听绑定失败会阻止 API Server 启动，运行中的内嵌 Ingress 退出会使 API Server 退出并交给 supervisor 整体重启。Ingress 使用自己的证书连接 Coordinator 和 Relay，API Server 继续使用 API Server 证书执行管理 RPC。
+API Server 仍监听回环管理端口，Ingress 仍监听对外 TLS、可选明文及健康端口。两者共享 Tokio runtime 和进程退出与重启生命周期；Ingress 监听绑定失败会阻止 API Server 启动，运行中的内嵌 Ingress 退出会使 API Server 退出并交给 supervisor 整体重启。Ingress 使用自己的证书连接 Coordinator 和 Relay，API Server 继续使用 API Server 证书执行管理 RPC。
 
 ## 分进程（显式选择）
 

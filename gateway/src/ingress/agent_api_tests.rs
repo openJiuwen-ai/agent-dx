@@ -888,7 +888,9 @@ impl Sandbox for StalledSandbox {
         std::future::pending().await
     }
 }
-#[tokio::test(start_paused = true)]
+// Authentication uses a real TCP fixture. A paused clock can advance its
+// timeout before socket I/O completes, masking the backend timeout contract.
+#[tokio::test]
 async fn agent_management_timeout_distinguishes_queries_from_writes() {
     let (gateway, _, _) = fixture_with_backend(Arc::new(StalledSandbox)).await;
     let id = uuid::Uuid::new_v4();

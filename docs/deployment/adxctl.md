@@ -79,7 +79,7 @@ adxctl -c /srv/adx/node.yaml validate
 
 `run` 不转入后台。systemd、Pod 或其他进程管理器应直接托管它。supervisor 在 `state_dir` 创建锁和 `supervisor.sock`，同一目录只能运行一个部署。日志写入 `state_dir/logs/<service-id>.log`。
 
-`status` 返回子进程 PID、角色、重启次数、失败标记和日志状态。PID 存在只代表进程存活，不代表集群已经可以创建 Environment。AFS 服务配置了 `health_url` 时，supervisor 会查询 HTTP `/health`，只有返回 JSON 且 `status` 为 `ready` 才报告 ready；HTTP 200 但状态仍是 `starting` 或 `degraded` 不算 ready。
+`status` 返回子进程 PID、角色、重启次数、当前退出／启动失败标记和日志状态。进程退出或启动失败后，按 `restart_delay_ms` 持续重试，成功启动后清除失败标记。PID 存在只代表进程存活，不代表集群已经可以创建 Environment。AFS 服务配置了 `health_url` 时，supervisor 会查询 HTTP `/health`，只有返回 JSON 且 `status` 为 `ready` 才报告 ready；HTTP 200 但状态仍是 `starting` 或 `degraded` 不算 ready。
 
 `stop` 先要求本机 adxlet 停止新准入并删除其管理的 Environment，清理成功后才按反向顺序退出组件。清理失败时命令失败，并保留 Coordinator、Redis、代理等依赖以便重试。
 
@@ -91,7 +91,6 @@ package_dir: /opt/adx/current
 state_dir: /opt/adx/run/control
 redis_url: redis://127.0.0.1:6379/
 namespace: adx
-restart_limit: 3
 restart_delay_ms: 1000
 stop_timeout_seconds: 90
 services: []
@@ -105,7 +104,7 @@ services: []
 | `namespace` | Redis 中的 ADX 集群隔离名；同一集群必须一致，不同集群必须不同 |
 | `services` | 当前主机需要启动的角色，不是整个集群的角色清单 |
 | `with_dfs` | 默认 `false`；必须显式为 `true` 才允许 `afs-meta` 或 `afs-node` 角色 |
-| `restart_limit` | 单次 supervisor 生命周期内，每个异常退出进程的最大重启次数 |
+| `restart_delay_ms` | 进程退出或启动失败后，再次启动前的等待时间；默认 1000 毫秒，持续重试 |
 | `stop_timeout_seconds` | 单个 Drain 或进程停止阶段的超时 |
 | `environment` | adxlet 和 API Server 共用的本地 EROFS 或 OCI 运行环境定义 |
 | `logging` | supervisor 接管组件输出时的滚动、压缩和保留策略 |
@@ -173,7 +172,7 @@ services:
 - `${VAR:-default}` 在变量未设置或为空时使用默认值。
 - `$$` 生成字面量 `$`。
 - 展开在 YAML 解析完成后执行，只处理值中的字符串，不处理字段名，也不会把变量内容解析成新的 YAML 对象或数组。
-- 数字和布尔字段继续要求原生 YAML 类型。例如 `restart_limit: 3`；不要写成 `restart_limit: "${LIMIT}"`。需要按环境调整此类字段时，为不同部署文件保留明确数值。
+- 数字和布尔字段继续要求原生 YAML 类型。例如 `restart_delay_ms: 1000`；不要写成 `restart_delay_ms: "${DELAY}"`。需要按环境调整此类字段时，为不同部署文件保留明确数值。
 
 `validate`、`render`、`run`、`status` 和 `stop` 每次读取配置时都会使用当前进程环境。运行中的 supervisor 已经生成并启动的组件不会因环境变量变化而自动更新；修改后需要按部署维护流程重新加载对应进程。
 
@@ -188,7 +187,6 @@ package_dir: /opt/adx/current
 state_dir: /opt/adx/run/afs
 redis_url: redis://127.0.0.1:6379/
 namespace: adx-afs
-restart_limit: 3
 restart_delay_ms: 1000
 stop_timeout_seconds: 20
 services:
@@ -204,7 +202,7 @@ services:
       health_url: http://127.0.0.1:7501/health
 ```
 
-`adxctl` 不生成 AFS TOML，也不把 Redis namespace 注入 AFS 配置。`config_file` 必须是绝对路径，并指向部署者已经审查过的 AFS TOML。示例文件位于发布包 `etc/examples/dfs/`，可复制到 `/opt/adx/config/dfs/` 后按主机地址、挂载点、数据目录和 OwnerFs workspace bind 开关修改。默认示例显式使用 `meta_store = "local-file"`，Meta 状态写入 `/opt/adx/data/dfs/meta`，Node 数据和 UDS 分别写入 `/opt/adx/data/dfs/node-a` 与 `/opt/adx/run/dfs/node-a.sock`。启用 workspace bind 前必须先通过 OwnerFs 创建并授权对应 Home workspace；不能直接把开关当作目录初始化步骤。启动顺序为 `afs-meta` 后 `afs-node`；停止顺序相反。
+`adxctl` 不生成 AFS TOML，也不把 Redis namespace 注入 AFS 配置。`config_file` 必须是绝对路径，并指向部署者已经审查过的 AFS TOML。示例文件位于发布包 `etc/examples/dfs/`，可复制到 `/opt/adx/config/dfs/` 后按主机地址、挂载点、数据目录和 OwnerFs workspace bind 开关修改。默认示例显式使用 `meta_store = "local-file"`，Meta 状态写入 `/opt/adx/data/dfs/meta`，Node 数据和 UDS 分别写入 `/opt/adx/data/dfs/node-a` 与 `/opt/adx/run/dfs/node-a.sock`。启用 workspace bind 前必须先通过 OwnerFs 创建并授权对应 Home workspace；不能直接把开关当作目录初始化步骤。启动顺序为 `afs-meta` 后 `afs-node`；停止顺序相反。 AFS 异常退出或正常停止失败后保留失败状态，不自动重启掩盖未完成的排空或恢复；其他 ADX 角色继续使用公共 supervisor 的持续重试策略。
 
 ## 单机 standalone 部署
 
@@ -234,7 +232,7 @@ supervisor 按 Redis → Coordinator → adxlet（含内嵌 Proxy）→ API Serv
 4. 保持所有组件使用同一个顶层 `namespace`。
 5. 执行相同的 `validate` 和 `run` 命令。
 
-外置 Redis 不受 `adxctl status`、重启预算或 `stop` 管理。ADX 停止后 Redis 应继续运行并保留状态。
+外置 Redis 不受 `adxctl status`、重启或 `stop` 管理。ADX 停止后 Redis 应继续运行并保留状态。
 
 ## 多机按角色部署
 

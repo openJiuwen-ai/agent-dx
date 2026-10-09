@@ -74,7 +74,6 @@ pub struct Deployment {
     pub state_dir: PathBuf,
     pub redis_url: String,
     pub namespace: String,
-    pub restart_limit: u32,
     pub restart_delay_ms: u64,
     pub stop_timeout_seconds: u64,
     pub services: Vec<Service>,
@@ -162,8 +161,6 @@ struct ProfileDeployment {
     redis_url: Option<String>,
     #[serde(default)]
     namespace: Option<String>,
-    #[serde(default)]
-    restart_limit: Option<u32>,
     #[serde(default)]
     restart_delay_ms: Option<u64>,
     #[serde(default)]
@@ -360,7 +357,6 @@ impl Deployment {
             || self.services.len() > 256
             || self.restart_delay_ms == 0
             || self.restart_delay_ms > 60_000
-            || self.restart_limit > 1000
             || self.stop_timeout_seconds == 0
             || self.stop_timeout_seconds > 86_400
             || !self.redis_url.starts_with("redis://")
@@ -719,9 +715,6 @@ fn resolve_profile(input: ProfileDeployment) -> Result<Deployment> {
     }
     if let Some(value) = input.namespace {
         deployment.namespace = value;
-    }
-    if let Some(value) = input.restart_limit {
-        deployment.restart_limit = value;
     }
     if let Some(value) = input.restart_delay_ms {
         deployment.restart_delay_ms = value;

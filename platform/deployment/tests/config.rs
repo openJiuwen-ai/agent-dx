@@ -7,7 +7,6 @@ package_dir: /opt/adx
 state_dir: /run/adx/test
 redis_url: redis://127.0.0.1:6379/
 namespace: test
-restart_limit: 2
 restart_delay_ms: 1000
 stop_timeout_seconds: 30
 services:
@@ -17,7 +16,7 @@ services:
 "#;
 
 fn test_deployment(root: &std::path::Path) -> Deployment {
-    serde_json::from_value(json!({"schema_version":1,"package_dir":root,"state_dir":root,"redis_url":"redis://localhost:6379/","namespace":"test","restart_limit":2,"restart_delay_ms":20,"stop_timeout_seconds":3,"services":[{"id":"node","role":"adxlet","config":{"discovery":{"namespace":"wrong"},"proxy_socket":root.join("route.sock")},"env":{"ADX_DATA_PLANE_RELAY_ACTIVITY_UDS_DIR":root}},{"id":"coordinator","role":"coordinator","config":{}}]})).unwrap()
+    serde_json::from_value(json!({"schema_version":1,"package_dir":root,"state_dir":root,"redis_url":"redis://localhost:6379/","namespace":"test","restart_delay_ms":20,"stop_timeout_seconds":3,"services":[{"id":"node","role":"adxlet","config":{"discovery":{"namespace":"wrong"},"proxy_socket":root.join("route.sock")},"env":{"ADX_DATA_PLANE_RELAY_ACTIVITY_UDS_DIR":root}},{"id":"coordinator","role":"coordinator","config":{}}]})).unwrap()
 }
 
 #[test]
@@ -270,7 +269,6 @@ fn afs_roles_are_explicit_and_render_from_existing_toml_files() {
         "state_dir": state,
         "redis_url": "redis://localhost:6379/",
         "namespace": "test",
-        "restart_limit": 2,
         "restart_delay_ms": 20,
         "stop_timeout_seconds": 3,
         "services": [
@@ -311,7 +309,6 @@ fn afs_roles_require_explicit_dfs_enablement() {
         "state_dir": root.path().join("state"),
         "redis_url": "redis://localhost:6379/",
         "namespace": "test",
-        "restart_limit": 2,
         "restart_delay_ms": 20,
         "stop_timeout_seconds": 3,
         "services": [{"id": "meta", "role": "afs-meta", "config": {"config_file": root.path().join("meta.toml")}}],
@@ -350,8 +347,7 @@ fn afs_roles_reject_implicit_or_unsafe_configuration() {
             "state_dir": root.path().join("state"),
             "redis_url": "redis://localhost:6379/",
             "namespace": "test",
-            "restart_limit": 2,
-            "restart_delay_ms": 20,
+                "restart_delay_ms": 20,
             "stop_timeout_seconds": 3,
             "services": [{"id": "meta", "role": "afs-meta", "config": config}],
         }))
@@ -772,7 +768,7 @@ fn unified_deployment_renders_control_and_data_plane_services() {
 
 #[test]
 fn deployment_accepts_bounded_log_rotation_policy() {
-    let deployment: Deployment = serde_json::from_value(json!({"schema_version":1,"package_dir":"/tmp/package","state_dir":"/tmp/state","redis_url":"redis://localhost:6379/","namespace":"test","restart_limit":2,"restart_delay_ms":20,"stop_timeout_seconds":3,"services":[{"id":"coordinator","role":"coordinator","config":{}}],"logging":{"enabled":true,"max_file_bytes":1024,"rotate_seconds":60,"compress":true,"max_files":4,"max_age_seconds":3600,"max_total_bytes":8192}})).unwrap();
+    let deployment: Deployment = serde_json::from_value(json!({"schema_version":1,"package_dir":"/tmp/package","state_dir":"/tmp/state","redis_url":"redis://localhost:6379/","namespace":"test","restart_delay_ms":20,"stop_timeout_seconds":3,"services":[{"id":"coordinator","role":"coordinator","config":{}}],"logging":{"enabled":true,"max_file_bytes":1024,"rotate_seconds":60,"compress":true,"max_files":4,"max_age_seconds":3600,"max_total_bytes":8192}})).unwrap();
     deployment.validate().unwrap();
 }
 
@@ -921,4 +917,23 @@ fn node_control_stream_example_survives_profile_expansion_and_render() {
         serde_json::from_slice(&std::fs::read(output.join(format!("{}.json", node.id))).unwrap())
             .unwrap();
     assert_eq!(config["runtime_control"], node.config["runtime_control"]);
+}
+
+#[test]
+fn afs_deployment_example_uses_current_shared_schema() {
+    let deployment: Deployment = serde_saphyr::from_str(include_str!(
+        "../../../build/config/examples/dfs/deployment-ownerfs-local.yaml"
+    ))
+    .unwrap();
+    deployment.validate().unwrap();
+    assert!(deployment.with_dfs);
+    assert_eq!(deployment.restart_delay_ms, 1000);
+    assert_eq!(
+        deployment
+            .services
+            .iter()
+            .map(|service| service.role)
+            .collect::<Vec<_>>(),
+        vec![Role::AfsMeta, Role::AfsNode]
+    );
 }
