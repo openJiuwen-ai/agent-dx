@@ -1,0 +1,3392 @@
+{
+  "schema_version": 1,
+  "source_contract": "docs/testing/afs.md",
+  "generated_on": "2026-09-30",
+  "status_values": [
+    "NOT_RUN",
+    "PASS",
+    "FAIL",
+    "BLOCKED",
+    "INCONCLUSIVE",
+    "EXCLUDED"
+  ],
+  "summary": {
+    "active_first_stage_cases": 69,
+    "reserved_cases": 1,
+    "post_acceptance_todo_cases": 7,
+    "note": "REL-15 is reserved for later Meta HA design and is not active in the first-stage release gate. TODO-01..TODO-07 are documented in the acceptance contract but are not case entries and do not count as active."
+  },
+  "case_defaults": {
+    "status": "NOT_RUN",
+    "driver": {
+      "state": "TODO",
+      "command": null,
+      "note": "Runner exists; real case drivers and verified environment bindings remain TODO. No case PASS is implied."
+    }
+  },
+  "cases": [
+    {
+      "id": "ENV-01",
+      "name": "environment-gate",
+      "description": "Freeze and prove the ARM64 VM acceptance environment before product validation: VM identity and quota, ext4 disks, TLS, P2P, backend restart, cross-VM RXE verbs, upstream ext4 reference suites, MooseFS mount IO and 3FS mount IO.",
+      "category": "environment",
+      "matrix": {
+        "backends": [
+          "OwnerFs",
+          "DFS"
+        ],
+        "meta": [
+          "etcd",
+          "Redis"
+        ],
+        "topology": [
+          "ctl",
+          "A",
+          "B",
+          "C"
+        ],
+        "transport": [
+          "TCP",
+          "RXE"
+        ]
+      },
+      "stage": "environment",
+      "smoke": {
+        "required": true,
+        "scope": "All four VMs boot, fixed identities and quotas recorded, ext4 reference harness starts, single-file mount read/write probes complete for baselines."
+      },
+      "full": {
+        "required": true,
+        "scope": "Complete acceptance.lock.json with image, kernel, disk, network, RXE, binary, tool, suite, baseline and runner identities; no AFS gate starts until this passes."
+      },
+      "driver": {
+        "state": "TODO",
+        "command": null,
+        "note": "Guest inventory and partial network/RXE preparation exist; complete environment verifier, comparator mounts and driver binding remain TODO."
+      },
+      "evidence": [
+        "acceptance.lock.json",
+        "VM inventory",
+        "ext4 reference output",
+        "P2P/TLS probes",
+        "RXE verbs probe",
+        "MooseFS mount IO",
+        "3FS mount IO"
+      ],
+      "status": "NOT_RUN",
+      "active": true
+    },
+    {
+      "id": "STD-01",
+      "name": "pjdfstest",
+      "description": "Run sanwan/pjdfstest d25636a with root and non-root coverage and account for every TAP subtest, TODO and skip.",
+      "category": "standard-suite",
+      "matrix": {
+        "backends": [
+          "OwnerFs",
+          "DFS"
+        ],
+        "meta": [
+          "etcd",
+          "Redis"
+        ],
+        "reference": [
+          "ext4"
+        ],
+        "suite_sha": "sanwan/pjdfstest d25636a227606f8960e5179741d8f4ad7030ef41"
+      },
+      "stage": "ext4baseline",
+      "smoke": {
+        "required": true,
+        "scope": "Short curated pjdfstest subset proves harness wiring against ext4 and one AFS mount without treating subset success as suite pass."
+      },
+      "full": {
+        "required": true,
+        "scope": "Full upstream pjdfstest root harness with all applicable TAP subtests, including UID/GID drop probes, plus explicit non-root application permission checks. Every applicable failure is a gate failure and exclusions are predeclared."
+      },
+      "driver": {
+        "state": "READY",
+        "command": [
+          "python3",
+          "drivers/suite_binding.py"
+        ],
+        "note": "Fixed suite adapter requires an exact per-run binding and observed target identity. Missing inputs return BLOCKED; READY is not formal acceptance. Remote host orchestration remains separately unbound."
+      },
+      "evidence": [
+        "TAP output",
+        "subtest accounting",
+        "ext4 comparison",
+        "predeclared exclusions",
+        "raw logs"
+      ],
+      "status": "NOT_RUN",
+      "active": true
+    },
+    {
+      "id": "STD-02",
+      "name": "LTP-filesystem",
+      "description": "Run LTP 20260529 via kirk for frozen fs, fs_bind, fs_perms_simple, fcntl-locktests and file-related syscall sets.",
+      "category": "standard-suite",
+      "matrix": {
+        "backends": [
+          "OwnerFs",
+          "DFS"
+        ],
+        "meta": [
+          "etcd",
+          "Redis"
+        ],
+        "reference": [
+          "ext4"
+        ],
+        "suite": "LTP 20260529"
+      },
+      "stage": "ext4baseline",
+      "smoke": {
+        "required": true,
+        "scope": "Small file, permissions and lock subset verifies runner and ext4 comparison output."
+      },
+      "full": {
+        "required": true,
+        "scope": "Frozen LTP filesystem sets with each kernel/environment exclusion explained before execution; AFS feature gaps are not environment exclusions."
+      },
+      "driver": {
+        "state": "READY",
+        "command": [
+          "python3",
+          "drivers/suite_binding.py"
+        ],
+        "note": "Fixed suite adapter requires an exact per-run binding, observed target identity and pinned suite/applicability inputs. Missing inputs return BLOCKED; READY is not formal acceptance."
+      },
+      "evidence": [
+        "kirk JSON",
+        "LTP logs",
+        "ext4 comparison",
+        "applicability table",
+        "predeclared exclusions"
+      ],
+      "status": "NOT_RUN",
+      "active": true
+    },
+    {
+      "id": "STD-03",
+      "name": "FSx",
+      "description": "Run secfs.test FSx edf5eb4 for read/write/truncate and mmap data integrity.",
+      "category": "standard-suite",
+      "matrix": {
+        "backends": [
+          "OwnerFs",
+          "DFS"
+        ],
+        "meta": [
+          "etcd",
+          "Redis"
+        ],
+        "reference": [
+          "ext4"
+        ],
+        "suite_sha": "secfs.test edf5eb4a108bfb41073f765aef0cdd32bb3ee1ed",
+        "seeds_full": 3,
+        "seeds_smoke": 1
+      },
+      "stage": "ext4baseline",
+      "smoke": {
+        "required": true,
+        "scope": "Same FSx binary with reduced duration and fixed seed verifies trace capture and mismatch minimization path."
+      },
+      "full": {
+        "required": true,
+        "scope": "At least 900 seconds per seed for 3 fixed seeds; any data or length mismatch fails and preserves a minimized operation trace."
+      },
+      "driver": {
+        "state": "READY",
+        "command": [
+          "python3",
+          "drivers/suite_binding.py"
+        ],
+        "note": "Fixed suite adapter requires an exact per-run binding, observed target identity and pinned FSx inputs. Full mode retains three seeds at >=900 seconds each. Missing inputs return BLOCKED."
+      },
+      "evidence": [
+        "FSx logs",
+        "seed list",
+        "duration records",
+        "mismatch traces",
+        "ext4 comparison"
+      ],
+      "status": "NOT_RUN",
+      "active": true
+    },
+    {
+      "id": "STD-04",
+      "name": "differential-random",
+      "description": "Compare ext4 and AFS on identical randomized filesystem operation sequences using fixed seeds.",
+      "category": "standard-suite",
+      "matrix": {
+        "backends": [
+          "OwnerFs",
+          "DFS"
+        ],
+        "meta": [
+          "etcd",
+          "Redis"
+        ],
+        "reference": [
+          "ext4"
+        ],
+        "seeds_full": 10,
+        "seeds_smoke": 1,
+        "operations_per_seed_full": 10000,
+        "operations_per_seed_smoke": 100
+      },
+      "stage": "ext4baseline",
+      "smoke": {
+        "required": true,
+        "scope": "Reduced operation count with fixed seeds validates operation replay, comparison and shrink database capture."
+      },
+      "full": {
+        "required": true,
+        "scope": "10 fixed seeds with 10,000 operations per seed; preserve Hypothesis database or equivalent shrink corpus."
+      },
+      "driver": {
+        "state": "READY",
+        "command": [
+          "python3",
+          "drivers/suite_binding.py"
+        ],
+        "note": "Fixed suite adapter requires an exact per-run binding, observed target identity and independent ext4 reference. Full mode retains ten seeds x 10000 operations; missing inputs return BLOCKED."
+      },
+      "evidence": [
+        "operation corpus",
+        "seed list",
+        "comparison JSON",
+        "shrink database",
+        "raw logs"
+      ],
+      "status": "NOT_RUN",
+      "active": true
+    },
+    {
+      "id": "STD-05",
+      "name": "suite-accounting",
+      "description": "Prove that discovered suite tests equal PASS + FAIL + pre-reviewed exclusions + incomplete, and explain errno or skip differences against ext4.",
+      "category": "standard-suite",
+      "matrix": {
+        "suites": [
+          "pjdfstest",
+          "LTP-filesystem",
+          "FSx",
+          "differential-random"
+        ],
+        "backends": [
+          "OwnerFs",
+          "DFS"
+        ],
+        "meta": [
+          "etcd",
+          "Redis"
+        ]
+      },
+      "stage": "ext4baseline",
+      "smoke": {
+        "required": true,
+        "scope": "Accounting schema validates totals for reduced suite runs."
+      },
+      "full": {
+        "required": true,
+        "scope": "Full suite accounting across all frozen standard suites; excluded counts are fixed before execution and cannot increase after failures."
+      },
+      "driver": {
+        "state": "READY",
+        "command": [
+          "python3",
+          "drivers/accounting.py"
+        ],
+        "note": "Strict read-only suite-accounting driver requires AFS_ACCEPTANCE_ACCOUNTING_MANIFEST with hash-bound STD-01..STD-04 target/reference raw artifacts and pre-run difference policy bindings. READY is not formal PASS; missing or non-PASS evidence returns BLOCKED."
+      },
+      "evidence": [
+        "suite inventory",
+        "PASS/FAIL/excluded/incomplete totals",
+        "errno diff report",
+        "skip diff report"
+      ],
+      "status": "NOT_RUN",
+      "active": true
+    },
+    {
+      "id": "FUN-01",
+      "name": "basic-io",
+      "description": "Create /xxx.txt, write in parts, pread, close and reopen across sizes including stream writes without preknown final length.",
+      "category": "functional",
+      "matrix": {
+        "backends": [
+          "OwnerFs",
+          "DFS"
+        ],
+        "meta": [
+          "etcd",
+          "Redis"
+        ],
+        "sizes_smoke": [
+          "0",
+          "1",
+          "4KiB",
+          "64KiB",
+          "1MiB"
+        ],
+        "sizes_full": [
+          "0",
+          "1",
+          "4KiB",
+          "64KiB",
+          "1MiB",
+          "chunk-boundary",
+          "8GiB"
+        ]
+      },
+      "stage": "short",
+      "smoke": {
+        "required": true,
+        "scope": "Small size and chunk-boundary-equivalent writes with digest, EOF and errno checks."
+      },
+      "full": {
+        "required": true,
+        "scope": "Includes 8 GiB sequential stream case and chunk-boundary coverage."
+      },
+      "driver": {
+        "state": "TODO",
+        "command": null,
+        "note": "Functional harness is not implemented."
+      },
+      "evidence": [
+        "operation trace",
+        "content digests",
+        "range verification",
+        "EOF/length checks",
+        "errno checks"
+      ],
+      "status": "NOT_RUN",
+      "active": true
+    },
+    {
+      "id": "FUN-02",
+      "name": "same-mount-visible",
+      "description": "With a read-only fd already open on the same mount, another process writes overwrite, append and resize data; the original fd must read accepted dirty state without close or fsync, through real FUSE page-cache behavior.",
+      "category": "functional",
+      "matrix": {
+        "backends": [
+          "OwnerFs",
+          "DFS"
+        ],
+        "meta": [
+          "etcd",
+          "Redis"
+        ],
+        "owner_scenarios": [
+          "local Home",
+          "remote B via A Home"
+        ],
+        "requires_real_fuse": true
+      },
+      "stage": "semantic",
+      "smoke": {
+        "required": true,
+        "scope": "One local and one remote small-file same-mount dirty visibility sequence."
+      },
+      "full": {
+        "required": true,
+        "scope": "Overwrite, append and resize across local owner/Home and remote owner/Home scenarios for both meta backends."
+      },
+      "driver": {
+        "state": "TODO",
+        "command": null,
+        "note": "Same-mount visibility driver is not implemented."
+      },
+      "evidence": [
+        "fd operation trace",
+        "FUSE mount identity",
+        "content/range checks",
+        "length/stat checks",
+        "backend logs"
+      ],
+      "status": "NOT_RUN",
+      "active": true
+    },
+    {
+      "id": "FUN-03",
+      "name": "close-to-open",
+      "description": "After writer A closes without fsync, reader B opens later using an application barrier and must see new content and length.",
+      "category": "functional",
+      "matrix": {
+        "backends": [
+          "OwnerFs",
+          "DFS"
+        ],
+        "meta": [
+          "etcd",
+          "Redis"
+        ],
+        "mounts": [
+          "A writer",
+          "B reader"
+        ],
+        "barrier": "application signal"
+      },
+      "stage": "short",
+      "smoke": {
+        "required": true,
+        "scope": "Single small-file close-to-open sequence without sleep-based ordering."
+      },
+      "full": {
+        "required": true,
+        "scope": "Multiple sizes and both backends/meta stores; records close success before reader open."
+      },
+      "driver": {
+        "state": "TODO",
+        "command": null,
+        "note": "Close-to-open driver is not implemented."
+      },
+      "evidence": [
+        "close return",
+        "barrier event",
+        "reader open/read/stat trace",
+        "digest and length checks"
+      ],
+      "status": "NOT_RUN",
+      "active": true
+    },
+    {
+      "id": "FUN-04",
+      "name": "sync-to-reopen",
+      "description": "After fdatasync and fsync, a separate mount reopens and checks data, length/head and attribute guarantees while old remote fd behavior is judged only by the visibility contract.",
+      "category": "functional",
+      "matrix": {
+        "backends": [
+          "OwnerFs",
+          "DFS"
+        ],
+        "meta": [
+          "etcd",
+          "Redis"
+        ],
+        "barriers": [
+          "fdatasync",
+          "fsync"
+        ]
+      },
+      "stage": "semantic",
+      "smoke": {
+        "required": true,
+        "scope": "One fdatasync and one fsync small-file reopen check."
+      },
+      "full": {
+        "required": true,
+        "scope": "Data, length, head/version and full inode attribute verification for each backend/meta combination."
+      },
+      "driver": {
+        "state": "TODO",
+        "command": null,
+        "note": "Sync-to-reopen driver is not implemented."
+      },
+      "evidence": [
+        "sync return values",
+        "Meta/version trace",
+        "stat output",
+        "digest checks",
+        "old fd observation log"
+      ],
+      "status": "NOT_RUN",
+      "active": true
+    },
+    {
+      "id": "FUN-05",
+      "name": "dup-close",
+      "description": "Duplicate and fork file descriptors, close one, keep writing through others, then close; prior writes for each successful close become visible without clearing live handles or double-committing unchanged state.",
+      "category": "functional",
+      "matrix": {
+        "backends": [
+          "OwnerFs",
+          "DFS"
+        ],
+        "meta": [
+          "etcd",
+          "Redis"
+        ],
+        "fd_patterns": [
+          "dup",
+          "fork"
+        ]
+      },
+      "stage": "semantic",
+      "smoke": {
+        "required": true,
+        "scope": "Single dup case verifies handle lifetime and final content."
+      },
+      "full": {
+        "required": true,
+        "scope": "dup and fork sequences with repeated close and no-change close accounting."
+      },
+      "driver": {
+        "state": "TODO",
+        "command": null,
+        "note": "FD lifetime driver is not implemented."
+      },
+      "evidence": [
+        "fd lineage",
+        "close returns",
+        "commit count",
+        "content digest",
+        "handle cleanup logs"
+      ],
+      "status": "NOT_RUN",
+      "active": true
+    },
+    {
+      "id": "FUN-06",
+      "name": "sync-flags",
+      "description": "O_SYNC and O_DSYNC writes followed by fault injection verify that successful write return is separated from dirty acceptance and that required barriers completed.",
+      "category": "functional",
+      "matrix": {
+        "backends": [
+          "OwnerFs",
+          "DFS"
+        ],
+        "meta": [
+          "etcd",
+          "Redis"
+        ],
+        "open_flags": [
+          "O_SYNC",
+          "O_DSYNC"
+        ],
+        "faults": [
+          "post-write"
+        ]
+      },
+      "stage": "semantic",
+      "smoke": {
+        "required": true,
+        "scope": "Small O_SYNC and O_DSYNC write with restart recovery check."
+      },
+      "full": {
+        "required": true,
+        "scope": "Both flags across backend/meta combinations with injected crash immediately after successful write returns."
+      },
+      "driver": {
+        "state": "TODO",
+        "command": null,
+        "note": "Sync flag fault driver is not implemented."
+      },
+      "evidence": [
+        "write return trace",
+        "fault timestamp",
+        "recovery read",
+        "durability logs",
+        "errno checks"
+      ],
+      "status": "NOT_RUN",
+      "active": true
+    },
+    {
+      "id": "FUN-07",
+      "name": "sparse-resize",
+      "description": "Exercise far pwrite, shrink/grow, truncate/ftruncate and chunk boundaries; holes read zero, EOF is correct and truncated data does not reappear.",
+      "category": "functional",
+      "matrix": {
+        "backends": [
+          "OwnerFs",
+          "DFS"
+        ],
+        "meta": [
+          "etcd",
+          "Redis"
+        ],
+        "operations": [
+          "pwrite",
+          "truncate",
+          "ftruncate",
+          "shrink",
+          "grow"
+        ],
+        "boundary": [
+          "chunk"
+        ]
+      },
+      "stage": "semantic",
+      "smoke": {
+        "required": true,
+        "scope": "Reduced sparse-hole and shrink/grow case around a small configured chunk boundary."
+      },
+      "full": {
+        "required": true,
+        "scope": "Far offsets and chunk-boundary transitions; verifies storage does not materialize full zero ranges."
+      },
+      "driver": {
+        "state": "TODO",
+        "command": null,
+        "note": "Sparse resize driver is not implemented."
+      },
+      "evidence": [
+        "range reads",
+        "hole zero checks",
+        "EOF/length checks",
+        "storage allocation summary",
+        "operation trace"
+      ],
+      "status": "NOT_RUN",
+      "active": true
+    },
+    {
+      "id": "FUN-08",
+      "name": "namespace",
+      "description": "Cover mkdir/rmdir/readdir, rename replacement, hardlink/symlink, open-unlink, path errors and cross-mount EXDEV without half states.",
+      "category": "functional",
+      "matrix": {
+        "backends": [
+          "OwnerFs",
+          "DFS"
+        ],
+        "meta": [
+          "etcd",
+          "Redis"
+        ],
+        "operations": [
+          "mkdir",
+          "rmdir",
+          "readdir",
+          "rename",
+          "hardlink",
+          "symlink",
+          "open-unlink",
+          "EXDEV"
+        ]
+      },
+      "stage": "semantic",
+      "smoke": {
+        "required": true,
+        "scope": "Representative directory, rename and open-unlink sequence."
+      },
+      "full": {
+        "required": true,
+        "scope": "Full namespace operation matrix with errno and atomicity checks."
+      },
+      "driver": {
+        "state": "TODO",
+        "command": null,
+        "note": "Namespace driver is not implemented."
+      },
+      "evidence": [
+        "operation trace",
+        "directory listings",
+        "link counts",
+        "errno checks",
+        "atomicity observations"
+      ],
+      "status": "NOT_RUN",
+      "active": true
+    },
+    {
+      "id": "FUN-09",
+      "name": "permissions",
+      "description": "Validate two normal UID/GID identities, root, umask, chmod/chown, xattr and time attributes without remote permission bypass.",
+      "category": "functional",
+      "matrix": {
+        "backends": [
+          "OwnerFs",
+          "DFS"
+        ],
+        "meta": [
+          "etcd",
+          "Redis"
+        ],
+        "identities": [
+          "root",
+          "user1",
+          "user2"
+        ],
+        "features": [
+          "mode",
+          "uid",
+          "gid",
+          "umask",
+          "xattr",
+          "timestamps"
+        ]
+      },
+      "stage": "semantic",
+      "smoke": {
+        "required": true,
+        "scope": "Basic user denial and chmod allow sequence."
+      },
+      "full": {
+        "required": true,
+        "scope": "Complete permission, ownership, xattr and timestamp checks across local and remote access."
+      },
+      "driver": {
+        "state": "TODO",
+        "command": null,
+        "note": "Permission driver is not implemented."
+      },
+      "evidence": [
+        "identity setup",
+        "stat output",
+        "xattr output",
+        "allowed/denied errno checks",
+        "remote access trace"
+      ],
+      "status": "NOT_RUN",
+      "active": true
+    },
+    {
+      "id": "FUN-10",
+      "name": "locking-mmap",
+      "description": "Validate same-mount and cross-mount flock/fcntl ownership, process-exit release, MAP_SHARED/MAP_PRIVATE, msync and mapped write sync/close.",
+      "category": "functional",
+      "matrix": {
+        "backends": [
+          "OwnerFs",
+          "DFS"
+        ],
+        "meta": [
+          "etcd",
+          "Redis"
+        ],
+        "locks": [
+          "flock",
+          "fcntl"
+        ],
+        "mmap": [
+          "MAP_SHARED",
+          "MAP_PRIVATE"
+        ]
+      },
+      "stage": "semantic",
+      "smoke": {
+        "required": true,
+        "scope": "One flock conflict and one MAP_SHARED msync content check."
+      },
+      "full": {
+        "required": true,
+        "scope": "Lock ownership/release and mmap sync matrix across mounts and processes."
+      },
+      "driver": {
+        "state": "TODO",
+        "command": null,
+        "note": "Locking and mmap driver is not implemented."
+      },
+      "evidence": [
+        "lock event trace",
+        "process lifecycle log",
+        "mmap content checks",
+        "msync/fsync returns",
+        "errno checks"
+      ],
+      "status": "NOT_RUN",
+      "active": true
+    },
+    {
+      "id": "FUN-11",
+      "name": "concurrent-file",
+      "description": "Eight processes mutate the same inode using non-overlapping pwrite, concurrent append, resize and sync; verify complete records and confirmed prefix by owner order.",
+      "category": "functional",
+      "matrix": {
+        "backends": [
+          "OwnerFs",
+          "DFS"
+        ],
+        "meta": [
+          "etcd",
+          "Redis"
+        ],
+        "processes": 8,
+        "operations": [
+          "pwrite",
+          "append",
+          "resize",
+          "sync"
+        ]
+      },
+      "stage": "semantic",
+      "smoke": {
+        "required": true,
+        "scope": "Reduced process count and operation count verifies owner ordering and digest model."
+      },
+      "full": {
+        "required": true,
+        "scope": "Eight-process same-inode mutation workload with full confirmed-prefix verification."
+      },
+      "driver": {
+        "state": "TODO",
+        "command": null,
+        "note": "Concurrent same-inode driver is not implemented."
+      },
+      "evidence": [
+        "per-process traces",
+        "owner order log",
+        "record digest",
+        "confirmed prefix report",
+        "sync returns"
+      ],
+      "status": "NOT_RUN",
+      "active": true
+    },
+    {
+      "id": "FUN-12",
+      "name": "concurrent-inodes",
+      "description": "Block one inode on an unknown commit and prove other inodes continue to read and write without a global queue stall.",
+      "category": "functional",
+      "matrix": {
+        "backends": [
+          "OwnerFs",
+          "DFS"
+        ],
+        "meta": [
+          "etcd",
+          "Redis"
+        ],
+        "fault": [
+          "unknown commit"
+        ],
+        "inodes": [
+          "blocked",
+          "independent"
+        ]
+      },
+      "stage": "semantic",
+      "smoke": {
+        "required": true,
+        "scope": "Single blocked inode plus one independent inode operation."
+      },
+      "full": {
+        "required": true,
+        "scope": "Multiple independent inode reads/writes while one inode remains blocked pending exact replay/recovery."
+      },
+      "driver": {
+        "state": "TODO",
+        "command": null,
+        "note": "Concurrent inode isolation driver is not implemented."
+      },
+      "evidence": [
+        "blocked inode state",
+        "independent inode operation logs",
+        "latency/deadline records",
+        "recovery trace"
+      ],
+      "status": "NOT_RUN",
+      "active": true
+    },
+    {
+      "id": "FUN-13",
+      "name": "mount-isolation",
+      "description": "Run two independent OwnerFs/DFS mounts on one node using same paths, inode numbers and fd operations; identities, permissions, errors and data must not cross.",
+      "category": "functional",
+      "matrix": {
+        "backends": [
+          "OwnerFs",
+          "DFS"
+        ],
+        "meta": [
+          "etcd",
+          "Redis"
+        ],
+        "mounts_per_node": 2
+      },
+      "stage": "short",
+      "smoke": {
+        "required": true,
+        "scope": "Two mounts with same relative path and divergent content/permissions."
+      },
+      "full": {
+        "required": true,
+        "scope": "Path, inode, fd, identity, permission, error and data isolation across independent mounts."
+      },
+      "driver": {
+        "state": "READY",
+        "command": [
+          "python3",
+          "drivers/mount_isolation.py"
+        ],
+        "note": "Live FUN-13 driver requires an exact mount-isolation binding file through AFS_ACCEPTANCE_MOUNT_ISOLATION_BINDINGS; formal status remains NOT_RUN until executed through the runner in a qualified environment."
+      },
+      "evidence": [
+        "mount table",
+        "inode/stat output",
+        "fd operation trace",
+        "digest comparison",
+        "permission/error checks"
+      ],
+      "status": "NOT_RUN",
+      "active": true
+    },
+    {
+      "id": "DIST-01",
+      "name": "owner-local-remote",
+      "description": "Validate OwnerFs 1/2/3/4 node topology with Home A; local and B/C remote access must show identical content and permissions, and remote traffic targets authorized Home rather than DFS replicas.",
+      "category": "distributed",
+      "matrix": {
+        "backends": [
+          "OwnerFs"
+        ],
+        "meta": [
+          "etcd",
+          "Redis"
+        ],
+        "nodes": [
+          1,
+          2,
+          3,
+          4
+        ],
+        "home": "A"
+      },
+      "stage": "distributed",
+      "smoke": {
+        "required": true,
+        "scope": "Two-node Home A with B remote read/write and permission check."
+      },
+      "full": {
+        "required": true,
+        "scope": "1/2/3/4 node OwnerFs topology across both meta stores with traffic attribution."
+      },
+      "driver": {
+        "state": "TODO",
+        "command": null,
+        "note": "OwnerFs distributed topology driver is not implemented."
+      },
+      "evidence": [
+        "topology record",
+        "content/permission checks",
+        "peer traffic trace",
+        "authorization logs",
+        "Home identity"
+      ],
+      "status": "NOT_RUN",
+      "active": true
+    },
+    {
+      "id": "DIST-02",
+      "name": "dfs-remote-owner",
+      "description": "For DFS, B writes an inode whose owner is A, then resize, sync and close; routing and fencing must be correct and already-open ordinary readers are not forced to read owner dirty overlay.",
+      "category": "distributed",
+      "matrix": {
+        "backends": [
+          "DFS"
+        ],
+        "meta": [
+          "etcd",
+          "Redis"
+        ],
+        "writer": "B",
+        "owner": "A"
+      },
+      "stage": "distributed",
+      "smoke": {
+        "required": true,
+        "scope": "Small remote-owner write/sync/close route check."
+      },
+      "full": {
+        "required": true,
+        "scope": "Remote owner route, resize, sync, close, fencing and ordinary read behavior across meta stores."
+      },
+      "driver": {
+        "state": "TODO",
+        "command": null,
+        "note": "DFS remote-owner driver is not implemented."
+      },
+      "evidence": [
+        "owner assignment",
+        "routing trace",
+        "fencing evidence",
+        "content checks",
+        "reader observations"
+      ],
+      "status": "NOT_RUN",
+      "active": true
+    },
+    {
+      "id": "DIST-03",
+      "name": "replicas",
+      "description": "For DFS replica counts R=1/2/3/4, write one file by chunks and verify durable receipts and Meta catalog represent distinct nodes; R=1 local path uses zero peer data RPC.",
+      "category": "distributed",
+      "matrix": {
+        "backends": [
+          "DFS"
+        ],
+        "meta": [
+          "etcd",
+          "Redis"
+        ],
+        "replicas": [
+          1,
+          2,
+          3,
+          4
+        ],
+        "nodes": [
+          "A",
+          "B",
+          "C",
+          "ctl-for-R4"
+        ]
+      },
+      "stage": "distributed",
+      "smoke": {
+        "required": true,
+        "scope": "R=1 and R=2 small file verifies local and remote receipt accounting."
+      },
+      "full": {
+        "required": true,
+        "scope": "R=1/2/3/4 initialization policies with distinct-node durable receipt validation."
+      },
+      "driver": {
+        "state": "TODO",
+        "command": null,
+        "note": "Replica policy driver is not implemented."
+      },
+      "evidence": [
+        "replica config",
+        "durable receipts",
+        "Meta catalog",
+        "peer RPC counters",
+        "content digest"
+      ],
+      "status": "NOT_RUN",
+      "active": true
+    },
+    {
+      "id": "DIST-04",
+      "name": "multi-source",
+      "description": "For DFS R=3, read different chunks or ranges from A/B/C while a writer commits a new version; each internal read plan must use one consistent version/layout/chunk identity.",
+      "category": "distributed",
+      "matrix": {
+        "backends": [
+          "DFS"
+        ],
+        "meta": [
+          "etcd",
+          "Redis"
+        ],
+        "replicas": [
+          3
+        ],
+        "sources": [
+          "A",
+          "B",
+          "C"
+        ]
+      },
+      "stage": "distributed",
+      "smoke": {
+        "required": true,
+        "scope": "Two-source reduced file read while writer commits a new version."
+      },
+      "full": {
+        "required": true,
+        "scope": "Three-source range/chunk reads with concurrent version commit; no mixed layout is returned."
+      },
+      "driver": {
+        "state": "TODO",
+        "command": null,
+        "note": "Multi-source read driver is not implemented."
+      },
+      "evidence": [
+        "read plan",
+        "FileVersion/LayoutRoot ids",
+        "chunk identities",
+        "source traces",
+        "content digest"
+      ],
+      "status": "NOT_RUN",
+      "active": true
+    },
+    {
+      "id": "DIST-05",
+      "name": "source-retry",
+      "description": "When a source disconnects, returns short data, bad digest or missing op header mid-read, DFS retries qualified replicas and never returns partial scratch data to the application.",
+      "category": "distributed",
+      "matrix": {
+        "backends": [
+          "DFS"
+        ],
+        "meta": [
+          "etcd",
+          "Redis"
+        ],
+        "faults": [
+          "disconnect",
+          "short-data",
+          "bad-digest",
+          "missing-op-header"
+        ],
+        "replicas": [
+          3
+        ]
+      },
+      "stage": "distributed",
+      "smoke": {
+        "required": true,
+        "scope": "One disconnect and one bad digest small-file retry."
+      },
+      "full": {
+        "required": true,
+        "scope": "All source fault modes with retry, digest and application-visible data checks."
+      },
+      "driver": {
+        "state": "TODO",
+        "command": null,
+        "note": "Source retry driver is not implemented."
+      },
+      "evidence": [
+        "fault injection log",
+        "retry trace",
+        "source qualification",
+        "digest checks",
+        "application read result"
+      ],
+      "status": "NOT_RUN",
+      "active": true
+    },
+    {
+      "id": "DIST-06",
+      "name": "backend-parity",
+      "description": "Run the same full feature and fault set against independent etcd and Redis filesystems; after restart, versions, paths and idempotent results must match.",
+      "category": "distributed",
+      "matrix": {
+        "backends": [
+          "OwnerFs",
+          "DFS"
+        ],
+        "meta": [
+          "etcd",
+          "Redis"
+        ],
+        "comparison": "independent filesystems"
+      },
+      "stage": "distributed",
+      "smoke": {
+        "required": true,
+        "scope": "Small feature subset runs against etcd and Redis and compares visible state after restart."
+      },
+      "full": {
+        "required": true,
+        "scope": "Full applicable functional and reliability set parity across both meta backends."
+      },
+      "driver": {
+        "state": "TODO",
+        "command": null,
+        "note": "Backend parity orchestrator is not implemented."
+      },
+      "evidence": [
+        "etcd result set",
+        "Redis result set",
+        "restart logs",
+        "state diff report",
+        "idempotency records"
+      ],
+      "status": "NOT_RUN",
+      "active": true
+    },
+    {
+      "id": "DIST-07",
+      "name": "rpc-contract",
+      "description": "Collect counts and traces proving valid-owner ordinary writes do not access Meta per block, R1 changed barriers batch submit, RN transfers occur node-to-node, no-change barriers produce no empty versions, and lease refresh/retry are counted separately.",
+      "category": "distributed",
+      "matrix": {
+        "backends": [
+          "OwnerFs",
+          "DFS"
+        ],
+        "meta": [
+          "etcd",
+          "Redis"
+        ],
+        "counters": [
+          "Meta RPC",
+          "Peer RPC",
+          "lease refresh",
+          "retry"
+        ]
+      },
+      "stage": "distributed",
+      "smoke": {
+        "required": true,
+        "scope": "One ordinary write and no-change barrier with counter capture."
+      },
+      "full": {
+        "required": true,
+        "scope": "OwnerFs and DFS RPC contract scenarios across meta stores with trace-based attribution."
+      },
+      "driver": {
+        "state": "TODO",
+        "command": null,
+        "note": "RPC contract trace driver is not implemented."
+      },
+      "evidence": [
+        "RPC counters",
+        "trace spans",
+        "version creation count",
+        "peer transfer logs",
+        "lease/retry counters"
+      ],
+      "status": "NOT_RUN",
+      "active": true
+    },
+    {
+      "id": "DIST-08",
+      "name": "async-repair",
+      "description": "With sync_required=1 and desired=3, preserve repair task and insufficient replica metrics after background copy failure; repair when source/network returns, and return explicit I/O error if all valid sources are lost.",
+      "category": "distributed",
+      "matrix": {
+        "backends": [
+          "DFS"
+        ],
+        "meta": [
+          "etcd",
+          "Redis"
+        ],
+        "replication": {
+          "desired": 3,
+          "sync_required": 1
+        }
+      },
+      "stage": "distributed",
+      "smoke": {
+        "required": true,
+        "scope": "Small file async repair task creation and later completion."
+      },
+      "full": {
+        "required": true,
+        "scope": "Failure, metric persistence, recovery repair and all-source-loss error behavior."
+      },
+      "driver": {
+        "state": "TODO",
+        "command": null,
+        "note": "Async repair driver is not implemented."
+      },
+      "evidence": [
+        "repair task records",
+        "insufficient replica metrics",
+        "copy logs",
+        "read result/errors",
+        "post-repair receipts"
+      ],
+      "status": "NOT_RUN",
+      "active": true
+    },
+    {
+      "id": "PERF-01",
+      "name": "owner-local-read",
+      "description": "Ordinary OwnerFs local-read core I/O: throughput >= 1.2x comparable MooseFS AND independently measured operation latency <= 0.8x. Historical criteria/results remain immutable.",
+      "category": "performance",
+      "matrix": {
+        "backends": [
+          "OwnerFs"
+        ],
+        "meta": [
+          "etcd",
+          "Redis"
+        ],
+        "baseline": "MooseFS goal=1",
+        "sizes_full": [
+          "8GiB sequential",
+          "512MiB random/hot"
+        ],
+        "block_sizes": [
+          "4KiB",
+          "64KiB",
+          "1MiB"
+        ],
+        "concurrency": [
+          1,
+          8
+        ]
+      },
+      "stage": "perf",
+      "smoke": {
+        "required": true,
+        "scope": "Reduced dataset verifies paired timing, digest checks and ratio calculation."
+      },
+      "full": {
+        "required": true,
+        "scope": "Later full matrix retains declared sizes; each applicable read/write case requires BOTH throughput >= 1.2x same-condition MooseFS and predeclared operation-latency quantile <= 0.8x. Phase-two core small cases run first; no full-matrix expansion from this criteria update."
+      },
+      "driver": {
+        "state": "TODO",
+        "command": null,
+        "note": "Performance runner and MooseFS baseline orchestration are not implemented."
+      },
+      "evidence": [
+        "paired timings",
+        "raw per-round values",
+        "digest checks",
+        "cache-state records",
+        "ratio report",
+        "independent operation samples and p50/p95/p99",
+        "pre-run frozen comparison conditions, timing boundary and decision quantile"
+      ],
+      "status": "NOT_RUN",
+      "active": true,
+      "performance_acceptance": {
+        "revision": "20261007-ordinary-owner-moose-1.2-0.8",
+        "effective_for": "new ordinary OwnerFs core local/remote read-write acceptance only",
+        "throughput_ratio_min": 1.2,
+        "operation_latency_ratio_max": 0.8,
+        "both_required": true,
+        "latency_report_quantiles": [
+          "p50",
+          "p95",
+          "p99"
+        ],
+        "default_decision_quantile": "p95",
+        "decision_quantile_frozen_before_run": true,
+        "operation_scope_and_timer_boundary_frozen_before_run": true,
+        "latency_must_be_measured_independently": true,
+        "conditions_frozen_before_run": [
+          "interface",
+          "dataset",
+          "block_size",
+          "concurrency",
+          "cache_requested_and_observed",
+          "persistence_barrier",
+          "applicable_replica_semantics"
+        ],
+        "incomparable_result": "diagnostic only; NOT acceptance",
+        "existing_results": "reuse only if comparable and both independent metrics complete; otherwise PENDING, no immediate rerun",
+        "unchanged_targets": "workspace bind >= 0.90x native ext4; DFS matched R3 durability parity with 3FS; delete correctness and comparison report without added ratio"
+      }
+    },
+    {
+      "id": "PERF-02",
+      "name": "owner-local-write",
+      "description": "Ordinary OwnerFs local-write core I/O: throughput >= 1.2x comparable MooseFS AND independently measured operation latency <= 0.8x. Historical criteria/results remain immutable.",
+      "category": "performance",
+      "matrix": {
+        "backends": [
+          "OwnerFs"
+        ],
+        "meta": [
+          "etcd",
+          "Redis"
+        ],
+        "baseline": "MooseFS goal=1",
+        "sizes_full": [
+          "8GiB sequential",
+          "512MiB random"
+        ],
+        "barriers": [
+          "close-only",
+          "fdatasync",
+          "fsync"
+        ],
+        "concurrency": [
+          1,
+          8
+        ]
+      },
+      "stage": "perf",
+      "smoke": {
+        "required": true,
+        "scope": "Reduced dataset verifies write timing, barrier equivalence and content checks."
+      },
+      "full": {
+        "required": true,
+        "scope": "Later full matrix retains declared sizes; each applicable read/write case requires BOTH throughput >= 1.2x same-condition MooseFS and predeclared operation-latency quantile <= 0.8x. Phase-two core small cases run first; no full-matrix expansion from this criteria update."
+      },
+      "driver": {
+        "state": "TODO",
+        "command": null,
+        "note": "Performance runner and MooseFS baseline orchestration are not implemented."
+      },
+      "evidence": [
+        "paired timings",
+        "barrier returns",
+        "raw per-round values",
+        "digest checks",
+        "ratio report",
+        "independent operation samples and p50/p95/p99",
+        "pre-run frozen comparison conditions, timing boundary and decision quantile"
+      ],
+      "status": "NOT_RUN",
+      "active": true,
+      "performance_acceptance": {
+        "revision": "20261007-ordinary-owner-moose-1.2-0.8",
+        "effective_for": "new ordinary OwnerFs core local/remote read-write acceptance only",
+        "throughput_ratio_min": 1.2,
+        "operation_latency_ratio_max": 0.8,
+        "both_required": true,
+        "latency_report_quantiles": [
+          "p50",
+          "p95",
+          "p99"
+        ],
+        "default_decision_quantile": "p95",
+        "decision_quantile_frozen_before_run": true,
+        "operation_scope_and_timer_boundary_frozen_before_run": true,
+        "latency_must_be_measured_independently": true,
+        "conditions_frozen_before_run": [
+          "interface",
+          "dataset",
+          "block_size",
+          "concurrency",
+          "cache_requested_and_observed",
+          "persistence_barrier",
+          "applicable_replica_semantics"
+        ],
+        "incomparable_result": "diagnostic only; NOT acceptance",
+        "existing_results": "reuse only if comparable and both independent metrics complete; otherwise PENDING, no immediate rerun",
+        "unchanged_targets": "workspace bind >= 0.90x native ext4; DFS matched R3 durability parity with 3FS; delete correctness and comparison report without added ratio"
+      }
+    },
+    {
+      "id": "PERF-03",
+      "name": "owner-remote-read",
+      "description": "Ordinary OwnerFs remote-read core I/O: throughput >= 1.2x comparable MooseFS AND independently measured operation latency <= 0.8x. Historical criteria/results remain immutable.",
+      "category": "performance",
+      "matrix": {
+        "backends": [
+          "OwnerFs"
+        ],
+        "meta": [
+          "etcd",
+          "Redis"
+        ],
+        "baseline": "MooseFS goal=1",
+        "path": "B reads Home A",
+        "sizes_full": [
+          "8GiB sequential",
+          "512MiB random/hot"
+        ],
+        "concurrency": [
+          1,
+          8
+        ]
+      },
+      "stage": "perf",
+      "smoke": {
+        "required": true,
+        "scope": "Reduced remote read dataset verifies remote path attribution and ratio calculation."
+      },
+      "full": {
+        "required": true,
+        "scope": "Later full matrix retains declared sizes; each applicable read/write case requires BOTH throughput >= 1.2x same-condition MooseFS and predeclared operation-latency quantile <= 0.8x. Phase-two core small cases run first; no full-matrix expansion from this criteria update."
+      },
+      "driver": {
+        "state": "TODO",
+        "command": null,
+        "note": "Remote performance runner is not implemented."
+      },
+      "evidence": [
+        "paired timings",
+        "remote traffic trace",
+        "cache-disabled proof",
+        "digest checks",
+        "ratio report",
+        "independent operation samples and p50/p95/p99",
+        "pre-run frozen comparison conditions, timing boundary and decision quantile"
+      ],
+      "status": "NOT_RUN",
+      "active": true,
+      "performance_acceptance": {
+        "revision": "20261007-ordinary-owner-moose-1.2-0.8",
+        "effective_for": "new ordinary OwnerFs core local/remote read-write acceptance only",
+        "throughput_ratio_min": 1.2,
+        "operation_latency_ratio_max": 0.8,
+        "both_required": true,
+        "latency_report_quantiles": [
+          "p50",
+          "p95",
+          "p99"
+        ],
+        "default_decision_quantile": "p95",
+        "decision_quantile_frozen_before_run": true,
+        "operation_scope_and_timer_boundary_frozen_before_run": true,
+        "latency_must_be_measured_independently": true,
+        "conditions_frozen_before_run": [
+          "interface",
+          "dataset",
+          "block_size",
+          "concurrency",
+          "cache_requested_and_observed",
+          "persistence_barrier",
+          "applicable_replica_semantics"
+        ],
+        "incomparable_result": "diagnostic only; NOT acceptance",
+        "existing_results": "reuse only if comparable and both independent metrics complete; otherwise PENDING, no immediate rerun",
+        "unchanged_targets": "workspace bind >= 0.90x native ext4; DFS matched R3 durability parity with 3FS; delete correctness and comparison report without added ratio"
+      }
+    },
+    {
+      "id": "PERF-04",
+      "name": "owner-remote-write",
+      "description": "Ordinary OwnerFs remote-write core I/O: throughput >= 1.2x comparable MooseFS AND independently measured operation latency <= 0.8x. Historical criteria/results remain immutable.",
+      "category": "performance",
+      "matrix": {
+        "backends": [
+          "OwnerFs"
+        ],
+        "meta": [
+          "etcd",
+          "Redis"
+        ],
+        "baseline": "MooseFS goal=1",
+        "path": "B writes Home A",
+        "sizes_full": [
+          "8GiB sequential",
+          "512MiB random"
+        ],
+        "barriers": [
+          "close-only",
+          "fdatasync",
+          "fsync"
+        ],
+        "concurrency": [
+          1,
+          8
+        ]
+      },
+      "stage": "perf",
+      "smoke": {
+        "required": true,
+        "scope": "Reduced remote write dataset verifies barrier and remote-path measurement."
+      },
+      "full": {
+        "required": true,
+        "scope": "Later full matrix retains declared sizes; each applicable read/write case requires BOTH throughput >= 1.2x same-condition MooseFS and predeclared operation-latency quantile <= 0.8x. Phase-two core small cases run first; no full-matrix expansion from this criteria update."
+      },
+      "driver": {
+        "state": "TODO",
+        "command": null,
+        "note": "Remote performance runner is not implemented."
+      },
+      "evidence": [
+        "paired timings",
+        "barrier returns",
+        "remote traffic trace",
+        "digest checks",
+        "ratio report",
+        "independent operation samples and p50/p95/p99",
+        "pre-run frozen comparison conditions, timing boundary and decision quantile"
+      ],
+      "status": "NOT_RUN",
+      "active": true,
+      "performance_acceptance": {
+        "revision": "20261007-ordinary-owner-moose-1.2-0.8",
+        "effective_for": "new ordinary OwnerFs core local/remote read-write acceptance only",
+        "throughput_ratio_min": 1.2,
+        "operation_latency_ratio_max": 0.8,
+        "both_required": true,
+        "latency_report_quantiles": [
+          "p50",
+          "p95",
+          "p99"
+        ],
+        "default_decision_quantile": "p95",
+        "decision_quantile_frozen_before_run": true,
+        "operation_scope_and_timer_boundary_frozen_before_run": true,
+        "latency_must_be_measured_independently": true,
+        "conditions_frozen_before_run": [
+          "interface",
+          "dataset",
+          "block_size",
+          "concurrency",
+          "cache_requested_and_observed",
+          "persistence_barrier",
+          "applicable_replica_semantics"
+        ],
+        "incomparable_result": "diagnostic only; NOT acceptance",
+        "existing_results": "reuse only if comparable and both independent metrics complete; otherwise PENDING, no immediate rerun",
+        "unchanged_targets": "workspace bind >= 0.90x native ext4; DFS matched R3 durability parity with 3FS; delete correctness and comparison report without added ratio"
+      }
+    },
+    {
+      "id": "PERF-05",
+      "name": "dfs-read",
+      "description": "Compare DFS R=3 synchronous durable reads against 3FS effective three-replica chain for sequential, random, cold, repeated and hot lanes.",
+      "category": "performance",
+      "matrix": {
+        "backends": [
+          "DFS"
+        ],
+        "meta": [
+          "etcd",
+          "Redis"
+        ],
+        "baseline": "3FS three-replica chain",
+        "replicas": [
+          3
+        ],
+        "sizes_full": [
+          "8GiB sequential",
+          "512MiB random/hot"
+        ],
+        "block_sizes": [
+          "4KiB",
+          "64KiB",
+          "1MiB"
+        ],
+        "concurrency": [
+          1,
+          8
+        ]
+      },
+      "stage": "perf",
+      "smoke": {
+        "required": true,
+        "scope": "Reduced R=3 dataset verifies paired timing, digest checks and fair baseline config."
+      },
+      "full": {
+        "required": true,
+        "scope": "Full DFS read workload; median paired T_AFS/T_3FS must be <= 1.0 for each applicable task."
+      },
+      "driver": {
+        "state": "TODO",
+        "command": null,
+        "note": "DFS performance runner and 3FS baseline orchestration are not implemented."
+      },
+      "evidence": [
+        "paired timings",
+        "3FS config",
+        "raw per-round values",
+        "digest checks",
+        "ratio report"
+      ],
+      "status": "NOT_RUN",
+      "active": true
+    },
+    {
+      "id": "PERF-06",
+      "name": "dfs-write",
+      "description": "Compare DFS R=3 synchronous durable writes against 3FS effective three-replica chain for sequential, random and barrier lanes.",
+      "category": "performance",
+      "matrix": {
+        "backends": [
+          "DFS"
+        ],
+        "meta": [
+          "etcd",
+          "Redis"
+        ],
+        "baseline": "3FS three-replica chain",
+        "replicas": [
+          3
+        ],
+        "sizes_full": [
+          "8GiB sequential",
+          "512MiB random"
+        ],
+        "block_sizes": [
+          "4KiB",
+          "64KiB",
+          "1MiB"
+        ],
+        "barriers": [
+          "close-only",
+          "fdatasync",
+          "fsync"
+        ],
+        "concurrency": [
+          1,
+          8
+        ]
+      },
+      "stage": "perf",
+      "smoke": {
+        "required": true,
+        "scope": "Reduced R=3 write dataset verifies barrier timing, digest checks and fair baseline config."
+      },
+      "full": {
+        "required": true,
+        "scope": "Full DFS write workload; median paired T_AFS/T_3FS must be <= 1.0 for each applicable task."
+      },
+      "driver": {
+        "state": "TODO",
+        "command": null,
+        "note": "DFS performance runner and 3FS baseline orchestration are not implemented."
+      },
+      "evidence": [
+        "paired timings",
+        "barrier returns",
+        "3FS config",
+        "digest checks",
+        "ratio report"
+      ],
+      "status": "NOT_RUN",
+      "active": true
+    },
+    {
+      "id": "PERF-07",
+      "name": "metadata",
+      "description": "Report create/stat/readdir/rename/unlink performance for 10,000 4 KiB files with concurrency 1 and 8, separately for OwnerFs and DFS.",
+      "category": "performance",
+      "matrix": {
+        "backends": [
+          "OwnerFs",
+          "DFS"
+        ],
+        "meta": [
+          "etcd",
+          "Redis"
+        ],
+        "files": 10000,
+        "file_size": "4KiB",
+        "concurrency": [
+          1,
+          8
+        ]
+      },
+      "stage": "perf",
+      "smoke": {
+        "required": true,
+        "scope": "Reduced file count verifies metadata workload and report schema."
+      },
+      "full": {
+        "required": true,
+        "scope": "10,000 file workload; fixed report only and not a substitute for read/write ratio gates."
+      },
+      "driver": {
+        "state": "TODO",
+        "command": null,
+        "note": "Metadata performance runner is not implemented."
+      },
+      "evidence": [
+        "operation timings",
+        "raw per-round values",
+        "filesystem config",
+        "resource usage",
+        "report JSON"
+      ],
+      "status": "NOT_RUN",
+      "active": true
+    },
+    {
+      "id": "PERF-08",
+      "name": "rdma-profile",
+      "description": "Profile RDMA and gRPC on the same datasets, recording CPU, throughput, tail latency, registration/copy counts and proof that large payloads do not use gRPC body.",
+      "category": "performance",
+      "matrix": {
+        "backends": [
+          "OwnerFs",
+          "DFS"
+        ],
+        "meta": [
+          "etcd",
+          "Redis"
+        ],
+        "transport": [
+          "RDMA",
+          "gRPC"
+        ],
+        "datasets": [
+          "same as applicable read/write lanes"
+        ]
+      },
+      "stage": "perf",
+      "smoke": {
+        "required": true,
+        "scope": "Reduced payload verifies transport selection and metric capture."
+      },
+      "full": {
+        "required": true,
+        "scope": "Full RDMA/gRPC profile; functional hard gate with no speed threshold."
+      },
+      "driver": {
+        "state": "TODO",
+        "command": null,
+        "note": "RDMA profile runner is not implemented."
+      },
+      "evidence": [
+        "CPU metrics",
+        "throughput/latency",
+        "registration/copy counters",
+        "transport traces",
+        "gRPC payload proof"
+      ],
+      "status": "NOT_RUN",
+      "active": true
+    },
+    {
+      "id": "REL-01",
+      "name": "dirty-crash",
+      "description": "Kill owner after ordinary dirty write; unbarriered data may be lost, but already durable versions must recover and dirty reads are not treated as committed success.",
+      "category": "reliability",
+      "matrix": {
+        "backends": [
+          "OwnerFs",
+          "DFS"
+        ],
+        "meta": [
+          "etcd",
+          "Redis"
+        ],
+        "fault": [
+          "owner kill"
+        ],
+        "watermarks": [
+          "dirty accepted",
+          "durable version"
+        ]
+      },
+      "stage": "fault",
+      "smoke": {
+        "required": true,
+        "scope": "Small dirty write and one durable version recovery check."
+      },
+      "full": {
+        "required": true,
+        "scope": "Dirty and durable watermarks across backend/meta combinations with explicit user-observed success records."
+      },
+      "driver": {
+        "state": "TODO",
+        "command": null,
+        "note": "Reliability fault harness is not implemented."
+      },
+      "evidence": [
+        "success watermark",
+        "kill log",
+        "restart log",
+        "recovery read",
+        "durability state"
+      ],
+      "status": "NOT_RUN",
+      "active": true
+    },
+    {
+      "id": "REL-02",
+      "name": "barrier-restart",
+      "description": "After successful fsync, fdatasync or close, kill -9 and restart Node/Meta, plus guest hard reset; data and recovery state must survive within the configured fault budget.",
+      "category": "reliability",
+      "matrix": {
+        "backends": [
+          "OwnerFs",
+          "DFS"
+        ],
+        "meta": [
+          "etcd",
+          "Redis"
+        ],
+        "barriers": [
+          "fdatasync",
+          "fsync",
+          "close"
+        ],
+        "faults": [
+          "kill -9",
+          "guest hard reset"
+        ]
+      },
+      "stage": "fault",
+      "smoke": {
+        "required": true,
+        "scope": "One close and one fsync restart recovery on small data."
+      },
+      "full": {
+        "required": true,
+        "scope": "Barrier/fault matrix across backend/meta combinations with application success watermarks."
+      },
+      "driver": {
+        "state": "TODO",
+        "command": null,
+        "note": "Barrier restart driver is not implemented."
+      },
+      "evidence": [
+        "barrier returns",
+        "fault timestamps",
+        "restart logs",
+        "recovery digests",
+        "Meta state"
+      ],
+      "status": "NOT_RUN",
+      "active": true
+    },
+    {
+      "id": "REL-03",
+      "name": "finalize-crash",
+      "description": "Inject crash at staging, validation, publish and catalog cut points; ensure no half-ready chunk, no FileVersion references unfinished data and orphan cleanup is observable.",
+      "category": "reliability",
+      "matrix": {
+        "backends": [
+          "DFS"
+        ],
+        "meta": [
+          "etcd",
+          "Redis"
+        ],
+        "cutpoints": [
+          "staging",
+          "validation",
+          "publish",
+          "catalog"
+        ]
+      },
+      "stage": "fault",
+      "smoke": {
+        "required": true,
+        "scope": "One finalize cutpoint around a small chunk."
+      },
+      "full": {
+        "required": true,
+        "scope": "All finalize cutpoints with restart and orphan cleanup observation."
+      },
+      "driver": {
+        "state": "TODO",
+        "command": null,
+        "note": "Finalize cutpoint injection is not implemented."
+      },
+      "evidence": [
+        "cutpoint log",
+        "chunk state",
+        "FileVersion references",
+        "orphan cleanup result",
+        "recovery digest"
+      ],
+      "status": "NOT_RUN",
+      "active": true
+    },
+    {
+      "id": "REL-04",
+      "name": "lost-meta-ack",
+      "description": "Drop Meta ACK after persistence; retrying the same OperationId and exact request changes head once, blocks later same-inode mutation until resolved, and leaves other inodes available.",
+      "category": "reliability",
+      "matrix": {
+        "backends": [
+          "OwnerFs",
+          "DFS"
+        ],
+        "meta": [
+          "etcd",
+          "Redis"
+        ],
+        "fault": [
+          "lost Meta ACK"
+        ],
+        "scope": [
+          "same inode",
+          "other inode"
+        ]
+      },
+      "stage": "fault",
+      "smoke": {
+        "required": true,
+        "scope": "Single lost ACK and exact retry on small file."
+      },
+      "full": {
+        "required": true,
+        "scope": "Idempotent replay, same-inode blocking and other-inode progress across backend/meta combinations."
+      },
+      "driver": {
+        "state": "TODO",
+        "command": null,
+        "note": "Lost ACK injection driver is not implemented."
+      },
+      "evidence": [
+        "OperationId",
+        "request bytes",
+        "head change count",
+        "blocked inode state",
+        "other inode operation logs"
+      ],
+      "status": "NOT_RUN",
+      "active": true
+    },
+    {
+      "id": "REL-05",
+      "name": "meta-restart",
+      "description": "Restart single Meta only after old process exits; validate etcd single-member and three-member failure, Redis AOF restart and rewrite interruption, preserving heads, idempotency and inode identity while refusing success when backend cannot persist.",
+      "category": "reliability",
+      "matrix": {
+        "backends": [
+          "OwnerFs",
+          "DFS"
+        ],
+        "meta": [
+          "etcd-single",
+          "etcd-three-member",
+          "Redis-AOF"
+        ],
+        "faults": [
+          "Meta kill/restart",
+          "backend failure",
+          "Redis rewrite interruption"
+        ]
+      },
+      "stage": "fault",
+      "smoke": {
+        "required": true,
+        "scope": "Single Meta restart for etcd single-member and Redis AOF with small committed state."
+      },
+      "full": {
+        "required": true,
+        "scope": "All defined Meta/backend restart and failure modes; no active Meta HA or failover claim."
+      },
+      "driver": {
+        "state": "TODO",
+        "command": null,
+        "note": "Meta restart matrix driver is not implemented."
+      },
+      "evidence": [
+        "old process exit proof",
+        "backend logs",
+        "restart logs",
+        "head/idempotency checks",
+        "refused-success evidence"
+      ],
+      "status": "NOT_RUN",
+      "active": true
+    },
+    {
+      "id": "REL-06",
+      "name": "stale-owner",
+      "description": "After partition or restart, stale inode owner lease, Node epoch or Device epoch must not write current inode or count old device evidence as a replica.",
+      "category": "reliability",
+      "matrix": {
+        "backends": [
+          "OwnerFs",
+          "DFS"
+        ],
+        "meta": [
+          "etcd",
+          "Redis"
+        ],
+        "faults": [
+          "partition",
+          "restart",
+          "stale ACK"
+        ],
+        "authority": [
+          "inode owner lease",
+          "Node epoch",
+          "Device epoch"
+        ]
+      },
+      "stage": "fault",
+      "smoke": {
+        "required": true,
+        "scope": "Single stale owner write rejection."
+      },
+      "full": {
+        "required": true,
+        "scope": "Lease and epoch stale-write rejection across backends; does not require Meta leader election."
+      },
+      "driver": {
+        "state": "TODO",
+        "command": null,
+        "note": "Stale authority fault driver is not implemented."
+      },
+      "evidence": [
+        "lease/epoch records",
+        "partition log",
+        "write rejection",
+        "replica count proof",
+        "recovery trace"
+      ],
+      "status": "NOT_RUN",
+      "active": true
+    },
+    {
+      "id": "REL-07",
+      "name": "replica-loss",
+      "description": "After R=3 success, isolate or permanently remove one data volume; remaining replicas read degraded, replacement or fourth node repair restores target count, while R=1 unique loss is explicit unrecoverable failure.",
+      "category": "reliability",
+      "matrix": {
+        "backends": [
+          "DFS"
+        ],
+        "meta": [
+          "etcd",
+          "Redis"
+        ],
+        "replicas": [
+          1,
+          3
+        ],
+        "faults": [
+          "isolate volume",
+          "remove volume",
+          "replace empty volume",
+          "ctl fourth node repair"
+        ]
+      },
+      "stage": "fault",
+      "smoke": {
+        "required": true,
+        "scope": "R=3 one-volume isolation and degraded read on small file."
+      },
+      "full": {
+        "required": true,
+        "scope": "Temporary and permanent replica loss, replacement repair, degraded reporting and R=1 unrecoverable behavior."
+      },
+      "driver": {
+        "state": "TODO",
+        "command": null,
+        "note": "Replica loss driver is not implemented."
+      },
+      "evidence": [
+        "volume fault log",
+        "degraded status",
+        "read digest",
+        "repair receipts",
+        "R1 unrecoverable error"
+      ],
+      "status": "NOT_RUN",
+      "active": true
+    },
+    {
+      "id": "REL-08",
+      "name": "capacity-io",
+      "description": "Inject ENOSPC on quota volume, read-only device, EIO and backend OOM/reject-write; write/barrier/close must return clear errors and not publish damaged layouts or consume host reserve.",
+      "category": "reliability",
+      "matrix": {
+        "backends": [
+          "OwnerFs",
+          "DFS"
+        ],
+        "meta": [
+          "etcd",
+          "Redis"
+        ],
+        "faults": [
+          "ENOSPC",
+          "read-only device",
+          "EIO",
+          "backend OOM",
+          "backend reject-write"
+        ]
+      },
+      "stage": "fault",
+      "smoke": {
+        "required": true,
+        "scope": "Small ENOSPC and EIO injection with error assertion."
+      },
+      "full": {
+        "required": true,
+        "scope": "Capacity and I/O fault matrix with damaged-layout absence and host reserve accounting."
+      },
+      "driver": {
+        "state": "TODO",
+        "command": null,
+        "note": "Capacity/I/O fault driver is not implemented."
+      },
+      "evidence": [
+        "fault setup",
+        "write/barrier/close returns",
+        "layout state",
+        "disk usage",
+        "backend logs"
+      ],
+      "status": "NOT_RUN",
+      "active": true
+    },
+    {
+      "id": "REL-09",
+      "name": "corrupt-copy",
+      "description": "Corrupt one Chunk copy and verify reads detect and exclude bad source, RN repairs when possible, all-source corruption returns EIO, and holes do not mask missing Chunk data.",
+      "category": "reliability",
+      "matrix": {
+        "backends": [
+          "DFS"
+        ],
+        "meta": [
+          "etcd",
+          "Redis"
+        ],
+        "faults": [
+          "one corrupt chunk",
+          "all corrupt chunks",
+          "missing chunk"
+        ],
+        "replicas": [
+          3
+        ]
+      },
+      "stage": "fault",
+      "smoke": {
+        "required": true,
+        "scope": "One bad copy detection and good-source retry."
+      },
+      "full": {
+        "required": true,
+        "scope": "Bad-source exclusion, RN repair, all-source EIO and hole/missing-chunk distinction."
+      },
+      "driver": {
+        "state": "TODO",
+        "command": null,
+        "note": "Corrupt copy driver is not implemented."
+      },
+      "evidence": [
+        "corruption method",
+        "digest mismatch logs",
+        "source exclusion",
+        "repair receipts",
+        "EIO result"
+      ],
+      "status": "NOT_RUN",
+      "active": true
+    },
+    {
+      "id": "REL-10",
+      "name": "network",
+      "description": "Inject disconnect, packet loss, latency, one-way partition and TLS failure; operations must timeout under control, avoid deadlock and recover without duplicating or confusing success/failure.",
+      "category": "reliability",
+      "matrix": {
+        "backends": [
+          "OwnerFs",
+          "DFS"
+        ],
+        "meta": [
+          "etcd",
+          "Redis"
+        ],
+        "faults": [
+          "disconnect",
+          "packet-loss",
+          "latency",
+          "one-way partition",
+          "TLS failure"
+        ]
+      },
+      "stage": "fault",
+      "smoke": {
+        "required": true,
+        "scope": "Single disconnect and recovery with small operation."
+      },
+      "full": {
+        "required": true,
+        "scope": "Network fault matrix with deadline, recovery and idempotency checks."
+      },
+      "driver": {
+        "state": "TODO",
+        "command": null,
+        "note": "Network fault injection driver is not implemented."
+      },
+      "evidence": [
+        "fault injection commands",
+        "operation deadlines",
+        "timeout/recovery logs",
+        "idempotency records",
+        "content checks"
+      ],
+      "status": "NOT_RUN",
+      "active": true
+    },
+    {
+      "id": "REL-11",
+      "name": "handle-cleanup",
+      "description": "After application crash, dup/fork, repeated flush and mount exit, verify no fd, lock, lease or registered-memory leak and release errors are not misreported as application close errors.",
+      "category": "reliability",
+      "matrix": {
+        "backends": [
+          "OwnerFs",
+          "DFS"
+        ],
+        "meta": [
+          "etcd",
+          "Redis"
+        ],
+        "events": [
+          "app crash",
+          "dup/fork",
+          "repeated flush",
+          "mount exit"
+        ]
+      },
+      "stage": "fault",
+      "smoke": {
+        "required": true,
+        "scope": "Application crash and one repeated flush cleanup check."
+      },
+      "full": {
+        "required": true,
+        "scope": "Handle lifecycle cleanup matrix including RDMA memory registration where applicable."
+      },
+      "driver": {
+        "state": "TODO",
+        "command": null,
+        "note": "Handle cleanup driver is not implemented."
+      },
+      "evidence": [
+        "resource counters before/after",
+        "fd/lock/lease tables",
+        "MR counters",
+        "close/release error trace",
+        "mount exit logs"
+      ],
+      "status": "NOT_RUN",
+      "active": true
+    },
+    {
+      "id": "REL-12",
+      "name": "owner-home-loss",
+      "description": "For OwnerFs, temporary Home outage must recover file availability; permanent Home disk loss returns explicit unrecoverable status for affected workspace and must not promise DFS-style replica repair.",
+      "category": "reliability",
+      "matrix": {
+        "backends": [
+          "OwnerFs"
+        ],
+        "meta": [
+          "etcd",
+          "Redis"
+        ],
+        "faults": [
+          "Home temporary outage",
+          "Home disk permanent loss"
+        ]
+      },
+      "stage": "fault",
+      "smoke": {
+        "required": true,
+        "scope": "Temporary Home outage and recovery on small workspace."
+      },
+      "full": {
+        "required": true,
+        "scope": "Temporary and permanent Home loss behavior with workspace attribution and clear non-DFS repair boundary."
+      },
+      "driver": {
+        "state": "TODO",
+        "command": null,
+        "note": "Owner Home loss driver is not implemented."
+      },
+      "evidence": [
+        "Home fault log",
+        "workspace identity",
+        "recovery read",
+        "unrecoverable error",
+        "health/location output"
+      ],
+      "status": "NOT_RUN",
+      "active": true
+    },
+    {
+      "id": "REL-13",
+      "name": "namespace-durable",
+      "description": "Crash-inject around file fsync and fsync(dir) separately; create/rename/unlink recover only with required directory barrier, and file barrier is not counted as directory durability.",
+      "category": "reliability",
+      "matrix": {
+        "backends": [
+          "OwnerFs",
+          "DFS"
+        ],
+        "meta": [
+          "etcd",
+          "Redis"
+        ],
+        "operations": [
+          "create",
+          "rename",
+          "unlink"
+        ],
+        "barriers": [
+          "fsync(file)",
+          "fsync(dir)"
+        ]
+      },
+      "stage": "fault",
+      "smoke": {
+        "required": true,
+        "scope": "One create plus fsync(dir) recovery check."
+      },
+      "full": {
+        "required": true,
+        "scope": "Directory durability matrix for create/rename/unlink and barrier separation."
+      },
+      "driver": {
+        "state": "TODO",
+        "command": null,
+        "note": "Namespace durability driver is not implemented."
+      },
+      "evidence": [
+        "barrier returns",
+        "crash point",
+        "post-recovery namespace",
+        "file data state",
+        "errno checks"
+      ],
+      "status": "NOT_RUN",
+      "active": true
+    },
+    {
+      "id": "REL-14",
+      "name": "soak",
+      "description": "Run eight clients with mixed operations for eight hours, injecting reproducible fault/recovery every 15 minutes; full digest must match and resource growth must be explained.",
+      "category": "reliability",
+      "matrix": {
+        "backends": [
+          "OwnerFs",
+          "DFS"
+        ],
+        "meta": [
+          "etcd",
+          "Redis"
+        ],
+        "clients": 8,
+        "duration_full": "8h",
+        "fault_interval": "15m"
+      },
+      "stage": "full",
+      "smoke": {
+        "required": true,
+        "scope": "Short mixed-operation soak with reduced duration and at least one recoverable fault."
+      },
+      "full": {
+        "required": true,
+        "scope": "Eight-hour soak with deterministic fault/recovery schedule, digest validation and fd/task/memory growth analysis."
+      },
+      "driver": {
+        "state": "TODO",
+        "command": null,
+        "note": "Soak runner is not implemented."
+      },
+      "evidence": [
+        "client traces",
+        "fault schedule",
+        "digest report",
+        "resource trend",
+        "pending/stuck analysis"
+      ],
+      "status": "NOT_RUN",
+      "active": true
+    },
+    {
+      "id": "REL-15",
+      "name": "duplicate-active-meta",
+      "description": "Reserved ID for later Meta high-availability design covering duplicate active Meta instances, leader terms, failover fencing and cross-instance unknown commit recovery.",
+      "category": "reliability",
+      "matrix": {
+        "backends": [
+          "OwnerFs",
+          "DFS"
+        ],
+        "meta": [
+          "etcd",
+          "Redis"
+        ],
+        "phase": "post-acceptance TODO-01"
+      },
+      "stage": "post_acceptance_todo",
+      "smoke": {
+        "required": false,
+        "scope": "Reserved only; no first-stage smoke gate."
+      },
+      "full": {
+        "required": false,
+        "scope": "Reserved only; not part of first-stage manifest or release gate."
+      },
+      "driver": {
+        "state": "NOT_APPLICABLE",
+        "command": null,
+        "note": "Do not execute for first-stage acceptance."
+      },
+      "evidence": [
+        "future HA design and runner evidence when TODO-01 is accepted"
+      ],
+      "status": "NOT_RUN",
+      "active": false
+    },
+    {
+      "id": "RDMA-01",
+      "name": "verbs-preflight",
+      "description": "Run cross-VM RXE read/write/send probes with digest and device/GID records; this is an environment gate, not product data-path proof.",
+      "category": "rdma",
+      "matrix": {
+        "backends": [
+          "environment"
+        ],
+        "meta": [
+          "not-applicable"
+        ],
+        "transport": [
+          "RXE"
+        ],
+        "nodes": [
+          "A",
+          "B",
+          "C"
+        ]
+      },
+      "stage": "environment",
+      "smoke": {
+        "required": true,
+        "scope": "A-to-B verbs send/read/write probe with digest."
+      },
+      "full": {
+        "required": true,
+        "scope": "Cross-VM RXE probes among acceptance nodes with rdma link, ibv_devinfo, GID, MTU and provider records."
+      },
+      "driver": {
+        "state": "TODO",
+        "command": null,
+        "note": "RXE verbs preflight driver is not implemented."
+      },
+      "evidence": [
+        "rdma link",
+        "ibv_devinfo",
+        "GID/MTU",
+        "verbs probe digest",
+        "provider/module records"
+      ],
+      "status": "NOT_RUN",
+      "active": true
+    },
+    {
+      "id": "RDMA-02",
+      "name": "file-io",
+      "description": "Prove actual OwnerFs remote and DFS RN/peer-read large-file IO uses RDMA data path, with gRPC carrying only control or inline small data.",
+      "category": "rdma",
+      "matrix": {
+        "backends": [
+          "OwnerFs",
+          "DFS"
+        ],
+        "meta": [
+          "etcd",
+          "Redis"
+        ],
+        "transport": [
+          "RDMA-required"
+        ],
+        "payloads": [
+          "large file",
+          "inline small data control"
+        ]
+      },
+      "stage": "distributed",
+      "smoke": {
+        "required": true,
+        "scope": "Small large-enough payload proves RDMA completion and gRPC control split."
+      },
+      "full": {
+        "required": true,
+        "scope": "OwnerFs remote Home range and DFS chunk/range file IO traces linked to RDMA completions and verbs byte counters."
+      },
+      "driver": {
+        "state": "TODO",
+        "command": null,
+        "note": "RDMA file IO driver is not implemented."
+      },
+      "evidence": [
+        "file-to-RDMA trace",
+        "verbs byte counters",
+        "gRPC payload capture",
+        "completion logs",
+        "content digests"
+      ],
+      "status": "NOT_RUN",
+      "active": true
+    },
+    {
+      "id": "RDMA-03",
+      "name": "lifetime",
+      "description": "Verify MR/QP/CQ/buffer cleanup for success, cancellation, timeout, peer disconnect and process exit; memory still in DMA is not reused and repeated runs show no growth.",
+      "category": "rdma",
+      "matrix": {
+        "backends": [
+          "OwnerFs",
+          "DFS"
+        ],
+        "meta": [
+          "etcd",
+          "Redis"
+        ],
+        "events": [
+          "success",
+          "cancel",
+          "timeout",
+          "peer down",
+          "process exit"
+        ]
+      },
+      "stage": "fault",
+      "smoke": {
+        "required": true,
+        "scope": "One success and one cancellation lifecycle counter check."
+      },
+      "full": {
+        "required": true,
+        "scope": "RDMA resource lifecycle fault matrix with repeated-run leak detection."
+      },
+      "driver": {
+        "state": "TODO",
+        "command": null,
+        "note": "RDMA lifetime driver is not implemented."
+      },
+      "evidence": [
+        "MR/QP/CQ counters",
+        "buffer lifetime trace",
+        "fault logs",
+        "growth trend",
+        "reuse safety checks"
+      ],
+      "status": "NOT_RUN",
+      "active": true
+    },
+    {
+      "id": "RDMA-04",
+      "name": "fallback",
+      "description": "When RDMA initialization or link fails, auto mode may fall back to gRPC with a recorded reason, while required mode fails clearly without silently using TCP.",
+      "category": "rdma",
+      "matrix": {
+        "backends": [
+          "OwnerFs",
+          "DFS"
+        ],
+        "meta": [
+          "etcd",
+          "Redis"
+        ],
+        "transport_modes": [
+          "auto",
+          "required"
+        ],
+        "faults": [
+          "init failure",
+          "link failure"
+        ]
+      },
+      "stage": "fault",
+      "smoke": {
+        "required": true,
+        "scope": "One auto fallback and one required-mode failure."
+      },
+      "full": {
+        "required": true,
+        "scope": "RDMA init and link failure matrix with transport attribution."
+      },
+      "driver": {
+        "state": "TODO",
+        "command": null,
+        "note": "RDMA fallback driver is not implemented."
+      },
+      "evidence": [
+        "mode config",
+        "failure reason",
+        "transport trace",
+        "gRPC fallback proof",
+        "required-mode error"
+      ],
+      "status": "NOT_RUN",
+      "active": true
+    },
+    {
+      "id": "RDMA-05",
+      "name": "integrity",
+      "description": "Validate RDMA boundary lengths, scatter/range, out-of-order completions, bad descriptor/epoch rejection, authorization, integrity and ReplicaAck equivalence with gRPC.",
+      "category": "rdma",
+      "matrix": {
+        "backends": [
+          "OwnerFs",
+          "DFS"
+        ],
+        "meta": [
+          "etcd",
+          "Redis"
+        ],
+        "faults": [
+          "bad descriptor",
+          "bad epoch"
+        ],
+        "patterns": [
+          "boundary length",
+          "scatter/range",
+          "out-of-order completion"
+        ]
+      },
+      "stage": "fault",
+      "smoke": {
+        "required": true,
+        "scope": "Boundary length and bad descriptor rejection."
+      },
+      "full": {
+        "required": true,
+        "scope": "RDMA integrity matrix with gRPC-equivalent authorization and ReplicaAck guarantees."
+      },
+      "driver": {
+        "state": "TODO",
+        "command": null,
+        "note": "RDMA integrity driver is not implemented."
+      },
+      "evidence": [
+        "RDMA operation traces",
+        "descriptor/epoch checks",
+        "auth logs",
+        "ReplicaAck comparison",
+        "digest checks"
+      ],
+      "status": "NOT_RUN",
+      "active": true
+    },
+    {
+      "id": "OPS-01",
+      "name": "health",
+      "description": "Readiness must distinguish Meta durability, Node registration, writable device, mount availability and RDMA availability; process alive is not file-service ready.",
+      "category": "operations",
+      "matrix": {
+        "backends": [
+          "OwnerFs",
+          "DFS"
+        ],
+        "meta": [
+          "etcd",
+          "Redis"
+        ],
+        "components": [
+          "Meta",
+          "Node",
+          "device",
+          "mount",
+          "RDMA"
+        ]
+      },
+      "stage": "semantic",
+      "smoke": {
+        "required": true,
+        "scope": "Healthy and one degraded component readiness response."
+      },
+      "full": {
+        "required": true,
+        "scope": "Component readiness matrix with degraded and unavailable states."
+      },
+      "driver": {
+        "state": "READY",
+        "command": [
+          "python3",
+          "drivers/health.py"
+        ],
+        "note": "Health readiness driver validates live /health snapshots from AFS_ACCEPTANCE_HEALTH_BINDINGS."
+      },
+      "evidence": [
+        "readiness output",
+        "component fault setup",
+        "status transitions",
+        "logs",
+        "HTTP/CLI responses"
+      ],
+      "status": "NOT_RUN",
+      "active": true
+    },
+    {
+      "id": "OPS-02",
+      "name": "metrics",
+      "description": "Expose operation success/error/latency, Meta and Peer RPC, dirty bytes, pending commits, durable copies, repair backlog, bad source, disk, RDMA/fallback and resource metrics without unbounded inode/path labels.",
+      "category": "operations",
+      "matrix": {
+        "backends": [
+          "OwnerFs",
+          "DFS"
+        ],
+        "meta": [
+          "etcd",
+          "Redis"
+        ],
+        "metrics": [
+          "ops",
+          "RPC",
+          "dirty",
+          "commit",
+          "copies",
+          "repair",
+          "disk",
+          "RDMA",
+          "resources"
+        ]
+      },
+      "stage": "semantic",
+      "smoke": {
+        "required": true,
+        "scope": "One successful and one failed operation update metrics."
+      },
+      "full": {
+        "required": true,
+        "scope": "Full metric surface with label-cardinality audit."
+      },
+      "driver": {
+        "state": "TODO",
+        "command": null,
+        "note": "Metrics validation driver is not implemented."
+      },
+      "evidence": [
+        "metrics scrape",
+        "operation traces",
+        "label cardinality report",
+        "fault metric samples",
+        "resource metrics"
+      ],
+      "status": "NOT_RUN",
+      "active": true
+    },
+    {
+      "id": "OPS-03",
+      "name": "trace",
+      "description": "Trace a /xxx.txt write/sync/close through Node, OperationId, Meta commit, Chunk/replica ACK or OwnerFs Home operation without leaking tokens or credentials.",
+      "category": "operations",
+      "matrix": {
+        "backends": [
+          "OwnerFs",
+          "DFS"
+        ],
+        "meta": [
+          "etcd",
+          "Redis"
+        ],
+        "operation": "write/sync/close"
+      },
+      "stage": "semantic",
+      "smoke": {
+        "required": true,
+        "scope": "Single small-file trace path for OwnerFs and DFS."
+      },
+      "full": {
+        "required": true,
+        "scope": "Trace correlation across components and error path with secret redaction check."
+      },
+      "driver": {
+        "state": "TODO",
+        "command": null,
+        "note": "Trace validation driver is not implemented."
+      },
+      "evidence": [
+        "trace spans",
+        "OperationId",
+        "Meta commit span",
+        "Chunk/ReplicaAck or Home op span",
+        "redaction audit"
+      ],
+      "status": "NOT_RUN",
+      "active": true
+    },
+    {
+      "id": "OPS-04",
+      "name": "diagnostics",
+      "description": "A single diagnostic command exports version/config summary, processes, ports, mounts, devices, backend, recent errors and metrics with redaction, timeout and readable partial output on failure.",
+      "category": "operations",
+      "matrix": {
+        "backends": [
+          "OwnerFs",
+          "DFS"
+        ],
+        "meta": [
+          "etcd",
+          "Redis"
+        ],
+        "outputs": [
+          "version",
+          "config",
+          "process",
+          "port",
+          "mount",
+          "device",
+          "backend",
+          "errors",
+          "metrics"
+        ]
+      },
+      "stage": "semantic",
+      "smoke": {
+        "required": true,
+        "scope": "Healthy diagnostic output and one forced partial failure."
+      },
+      "full": {
+        "required": true,
+        "scope": "Diagnostic command completeness, timeout and redaction validation across backend/meta combinations."
+      },
+      "driver": {
+        "state": "TODO",
+        "command": null,
+        "note": "Diagnostic command validation is not implemented."
+      },
+      "evidence": [
+        "diagnostic output",
+        "timeout behavior",
+        "redaction audit",
+        "failure output",
+        "component inventory"
+      ],
+      "status": "NOT_RUN",
+      "active": true
+    },
+    {
+      "id": "OPS-05",
+      "name": "backpressure",
+      "description": "Under eight-client overload, memory, connections, tasks and buffers stay bounded and return controlled errors or waits; after soak, idle baseline returns without linear growth.",
+      "category": "operations",
+      "matrix": {
+        "backends": [
+          "OwnerFs",
+          "DFS"
+        ],
+        "meta": [
+          "etcd",
+          "Redis"
+        ],
+        "clients": 8,
+        "resources": [
+          "memory",
+          "connections",
+          "tasks",
+          "buffers"
+        ]
+      },
+      "stage": "semantic",
+      "smoke": {
+        "required": true,
+        "scope": "Reduced overload verifies bounded queueing or controlled errors."
+      },
+      "full": {
+        "required": true,
+        "scope": "Eight-client overload with resource limits from lock file and post-soak idle baseline comparison."
+      },
+      "driver": {
+        "state": "TODO",
+        "command": null,
+        "note": "Backpressure driver is not implemented."
+      },
+      "evidence": [
+        "resource limits",
+        "overload trace",
+        "error/wait results",
+        "resource trend",
+        "idle baseline comparison"
+      ],
+      "status": "NOT_RUN",
+      "active": true
+    },
+    {
+      "id": "OPS-06",
+      "name": "reproducible-runner",
+      "description": "Acceptance runner can filter by case ID, category, backend and transport and emits JSON plus JUnit, raw logs, seeds, SHA/environment identity and only approved result states.",
+      "category": "operations",
+      "matrix": {
+        "filters": [
+          "case ID",
+          "category",
+          "backend",
+          "transport"
+        ],
+        "outputs": [
+          "JSON",
+          "JUnit",
+          "raw logs",
+          "seeds",
+          "SHA",
+          "environment identity"
+        ]
+      },
+      "stage": "environment",
+      "smoke": {
+        "required": true,
+        "scope": "Dry-run and one no-op case selection prove schema and filters."
+      },
+      "full": {
+        "required": true,
+        "scope": "Runner reproducibility, output schema and result-state enforcement for real case execution."
+      },
+      "driver": {
+        "state": "TODO",
+        "command": null,
+        "note": "Acceptance runner is not implemented."
+      },
+      "evidence": [
+        "runner command log",
+        "JSON result",
+        "JUnit result",
+        "raw log archive",
+        "filter proof"
+      ],
+      "status": "NOT_RUN",
+      "active": true
+    },
+    {
+      "id": "OPS-07",
+      "name": "workspace-location-affinity",
+      "description": "OwnerFs workspace created on A reports Home=A, root epoch and ownership revision through REST; A access uses no Peer data RPC, B access forwards to A, and Home health is separate from ownership.",
+      "category": "operations",
+      "matrix": {
+        "backends": [
+          "OwnerFs"
+        ],
+        "meta": [
+          "etcd",
+          "Redis"
+        ],
+        "rest": "GET /v1/roots/{root_id}",
+        "nodes": [
+          "A",
+          "B"
+        ]
+      },
+      "stage": "distributed",
+      "smoke": {
+        "required": true,
+        "scope": "Create workspace on A, query location, verify A local and B remote traffic counters."
+      },
+      "full": {
+        "required": true,
+        "scope": "Location affinity, Meta/Home restart, unknown root and backend unavailable responses across etcd and Redis."
+      },
+      "driver": {
+        "state": "TODO",
+        "command": null,
+        "note": "OPS-07 runner is not implemented; existing status says full contract has not been validated."
+      },
+      "evidence": [
+        "REST response",
+        "root epoch/revision",
+        "Peer RPC counters",
+        "Home health state",
+        "restart/unknown-root/backend-failure responses"
+      ],
+      "status": "NOT_RUN",
+      "active": true
+    },
+    {
+      "id": "DEP-01",
+      "name": "clean-install",
+      "description": "On a fresh ARM64 Ubuntu VM without source or compiler, one command downloads verified release package, installs, configures, starts, mounts and completes write/close/reopen.",
+      "category": "deployment",
+      "matrix": {
+        "backends": [
+          "OwnerFs",
+          "DFS"
+        ],
+        "meta": [
+          "etcd",
+          "Redis"
+        ],
+        "host": "fresh ARM64 Ubuntu",
+        "source_tree": false,
+        "rust_compiler": false
+      },
+      "stage": "short",
+      "smoke": {
+        "required": true,
+        "scope": "Package checksum and one mount IO sequence on fresh VM image."
+      },
+      "full": {
+        "required": true,
+        "scope": "Complete one-command install through mount read/write/close/reopen without cargo/git/online build."
+      },
+      "driver": {
+        "state": "TODO",
+        "command": null,
+        "note": "Release installer acceptance driver is not implemented."
+      },
+      "evidence": [
+        "fresh VM proof",
+        "package digest",
+        "install log",
+        "process/mount status",
+        "IO digest"
+      ],
+      "status": "NOT_RUN",
+      "active": true
+    },
+    {
+      "id": "DEP-02",
+      "name": "cluster-start",
+      "description": "Deploy ctl/A/B/C from explicit topology config for etcd and Redis and declare success only after component readiness and writable mounts.",
+      "category": "deployment",
+      "matrix": {
+        "backends": [
+          "OwnerFs",
+          "DFS"
+        ],
+        "meta": [
+          "etcd",
+          "Redis"
+        ],
+        "nodes": [
+          "ctl",
+          "A",
+          "B",
+          "C"
+        ]
+      },
+      "stage": "short",
+      "smoke": {
+        "required": true,
+        "scope": "Two-node topology start and one writable mount."
+      },
+      "full": {
+        "required": true,
+        "scope": "Four-node topology for both meta backends with readiness and writable mount verification."
+      },
+      "driver": {
+        "state": "TODO",
+        "command": null,
+        "note": "Cluster deployment driver is not implemented."
+      },
+      "evidence": [
+        "topology config",
+        "component readiness",
+        "mount table",
+        "write/read proof",
+        "logs"
+      ],
+      "status": "NOT_RUN",
+      "active": true
+    },
+    {
+      "id": "DEP-03",
+      "name": "idempotent",
+      "description": "Repeating install/start with the same config must not overwrite Meta/data volumes, start duplicate PIDs or duplicate mounts; conflicting config must be rejected.",
+      "category": "deployment",
+      "matrix": {
+        "backends": [
+          "OwnerFs",
+          "DFS"
+        ],
+        "meta": [
+          "etcd",
+          "Redis"
+        ],
+        "operations": [
+          "install",
+          "start"
+        ],
+        "conflict": true
+      },
+      "stage": "full",
+      "smoke": {
+        "required": true,
+        "scope": "Development-only reduced scenario; schedule full deployment gate at P6. Repeat start verifies no duplicate PID/mount."
+      },
+      "full": {
+        "required": true,
+        "scope": "Repeated install/start and conflicting config rejection with data preservation proof."
+      },
+      "driver": {
+        "state": "TODO",
+        "command": null,
+        "note": "Idempotent deployment driver is not implemented."
+      },
+      "evidence": [
+        "before/after data digest",
+        "PID list",
+        "mount list",
+        "conflict error",
+        "logs"
+      ],
+      "status": "NOT_RUN",
+      "active": true
+    },
+    {
+      "id": "DEP-04",
+      "name": "lifecycle",
+      "description": "Validate status/stop/start/restart; normal stop drains accepted work and reports failures, force kill recovers per reliability contract, and PID reuse cannot kill unrelated processes.",
+      "category": "deployment",
+      "matrix": {
+        "backends": [
+          "OwnerFs",
+          "DFS"
+        ],
+        "meta": [
+          "etcd",
+          "Redis"
+        ],
+        "operations": [
+          "status",
+          "stop",
+          "start",
+          "restart",
+          "force kill"
+        ]
+      },
+      "stage": "full",
+      "smoke": {
+        "required": true,
+        "scope": "Development-only reduced scenario; schedule full deployment gate at P6. status/stop/start around small committed file."
+      },
+      "full": {
+        "required": true,
+        "scope": "Lifecycle operation matrix with drain/failure reporting and PID reuse safety proof."
+      },
+      "driver": {
+        "state": "TODO",
+        "command": null,
+        "note": "Lifecycle deployment driver is not implemented."
+      },
+      "evidence": [
+        "CLI outputs",
+        "drain logs",
+        "restart recovery",
+        "PID ownership proof",
+        "data digest"
+      ],
+      "status": "NOT_RUN",
+      "active": true
+    },
+    {
+      "id": "DEP-05",
+      "name": "failure-cleanup",
+      "description": "Backend address error, port conflict, insufficient permissions, missing FUSE/RDMA and bad download digest must exit non-zero, explain the error, clean temporary resources and preserve existing data.",
+      "category": "deployment",
+      "matrix": {
+        "backends": [
+          "OwnerFs",
+          "DFS"
+        ],
+        "meta": [
+          "etcd",
+          "Redis"
+        ],
+        "faults": [
+          "bad backend",
+          "port conflict",
+          "permission denied",
+          "missing FUSE",
+          "missing RDMA",
+          "bad digest"
+        ]
+      },
+      "stage": "full",
+      "smoke": {
+        "required": true,
+        "scope": "Development-only reduced scenario; schedule full deployment gate at P6. One port conflict and one bad digest cleanup check."
+      },
+      "full": {
+        "required": true,
+        "scope": "Deployment failure matrix with non-zero exit, readable error, temp cleanup and data preservation."
+      },
+      "driver": {
+        "state": "TODO",
+        "command": null,
+        "note": "Deployment failure driver is not implemented."
+      },
+      "evidence": [
+        "exit status",
+        "stderr/stdout",
+        "temp resource inventory",
+        "data preservation digest",
+        "logs"
+      ],
+      "status": "NOT_RUN",
+      "active": true
+    },
+    {
+      "id": "DEP-06",
+      "name": "offline-package",
+      "description": "After obtaining a package, operation must not depend on cargo/git/online build; dependency list and versions are explicit, and etcd/Redis can point to user-provided instances.",
+      "category": "deployment",
+      "matrix": {
+        "backends": [
+          "OwnerFs",
+          "DFS"
+        ],
+        "meta": [
+          "etcd",
+          "Redis"
+        ],
+        "network": [
+          "offline-after-package"
+        ],
+        "external_backends": true
+      },
+      "stage": "full",
+      "smoke": {
+        "required": true,
+        "scope": "Development-only reduced scenario; schedule full deployment gate at P6. Install/start with network disabled after package fetch in a reduced topology."
+      },
+      "full": {
+        "required": true,
+        "scope": "Offline package install and start with explicit dependency inventory and user-provided etcd/Redis options."
+      },
+      "driver": {
+        "state": "TODO",
+        "command": null,
+        "note": "Offline package driver is not implemented."
+      },
+      "evidence": [
+        "network-disabled proof",
+        "dependency inventory",
+        "install/start logs",
+        "external backend config",
+        "IO proof"
+      ],
+      "status": "NOT_RUN",
+      "active": true
+    },
+    {
+      "id": "DEP-07",
+      "name": "uninstall",
+      "description": "Stop processes, unmount and remove this program while preserving data and Meta config by default; persistent data deletion requires a separate explicit option.",
+      "category": "deployment",
+      "matrix": {
+        "backends": [
+          "OwnerFs",
+          "DFS"
+        ],
+        "meta": [
+          "etcd",
+          "Redis"
+        ],
+        "operations": [
+          "uninstall",
+          "explicit data delete option"
+        ]
+      },
+      "stage": "full",
+      "smoke": {
+        "required": true,
+        "scope": "Development-only reduced scenario; schedule full deployment gate at P6. Uninstall removes process and mount while preserving small data directory."
+      },
+      "full": {
+        "required": true,
+        "scope": "Default preservation and explicit deletion option behavior across backend/meta combinations."
+      },
+      "driver": {
+        "state": "TODO",
+        "command": null,
+        "note": "Uninstall driver is not implemented."
+      },
+      "evidence": [
+        "process list",
+        "mount list",
+        "program files inventory",
+        "data/config preservation proof",
+        "explicit delete audit"
+      ],
+      "status": "NOT_RUN",
+      "active": true
+    },
+    {
+      "id": "DEP-08",
+      "name": "restart-package",
+      "description": "Redeploy the same package version while preserving data; incompatible formats are refused rather than silently migrated or rebuilt, and cross-version upgrade is not first-stage scope.",
+      "category": "deployment",
+      "matrix": {
+        "backends": [
+          "OwnerFs",
+          "DFS"
+        ],
+        "meta": [
+          "etcd",
+          "Redis"
+        ],
+        "versioning": [
+          "same version",
+          "incompatible format rejection"
+        ]
+      },
+      "stage": "full",
+      "smoke": {
+        "required": true,
+        "scope": "Development-only reduced scenario; schedule full deployment gate at P6. Same-version redeploy preserves one committed file."
+      },
+      "full": {
+        "required": true,
+        "scope": "Same-version restart-package preservation and incompatible format refusal across backend/meta combinations."
+      },
+      "driver": {
+        "state": "TODO",
+        "command": null,
+        "note": "Restart-package driver is not implemented."
+      },
+      "evidence": [
+        "package identity",
+        "before/after data digest",
+        "format version records",
+        "refusal error",
+        "logs"
+      ],
+      "status": "NOT_RUN",
+      "active": true
+    }
+  ]
+}

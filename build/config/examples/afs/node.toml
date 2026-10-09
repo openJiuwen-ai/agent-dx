@@ -17,7 +17,7 @@ trace_endpoint = "http://127.0.0.1:4317"
 
 # OwnerFs workspace bind mount stays OFF. This legacy option controls only
 # the runc experiment; it does not expose a standalone host-visible bind.
-# Existing TOML/CLI names remain compatible; see docs/deployment/dfs.md.
+# Existing TOML/CLI names remain compatible; see docs/deployment/afs.md.
 experimental_native_workspace = false
 
 # Independent administrator-controlled host entry, also OFF by default.

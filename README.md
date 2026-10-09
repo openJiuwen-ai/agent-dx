@@ -199,7 +199,7 @@ python3 build/ci/run.py afs
 `afs-check` uses default OwnerFs and DFS features. The optional all-features/RDMA lint is explicit (`ADX_AFS_ALL_FEATURES=1 make afs-lint`) and first checks for `libibverbs` development files.
 
 The current filesystem scope, validation boundary and unsupported items are in
-[AFS migration plan](docs/development/dfs-plan.md), [architecture](docs/architecture/dfs.md), [deployment](docs/deployment/dfs.md) and [testing](docs/testing/dfs.md). The packaged configuration examples live under [AFS examples](build/config/examples/afs/). Ordinary release packages do not include them unless `ADX_WITH_AFS=1` is set.
+[AFS migration plan](docs/development/afs-plan.md), [architecture](docs/architecture/afs.md), [deployment](docs/deployment/afs.md) and [testing](docs/testing/afs.md). The packaged configuration examples live under [AFS examples](build/config/examples/afs/). Ordinary release packages do not include them unless `ADX_WITH_AFS=1` is set.
 
 Run component and integration suites with `python3 build/ci/run.py <suite>`. End-to-end gates use installed release artifacts, the public Sandbox SDK, Redis, Gateway, the control plane, sandboxd, and Execd. Environment requirements and gate definitions are in [control-plane CI](docs/testing/control-plane-ci.md) and the [Kubernetes E2E guide](build/e2e/kubernetes/README.md).
 

@@ -24,7 +24,7 @@ SDK 与 adxadmin 分别运行 UT、wheel/sdist 构建及安装检查，source ga
 adxadmin 复用 SDK 的 Python 3.12 容器执行器，不使用 Rust 构建镜像的 Python 3.9。
 
 Agent FS（AFS） 是可选文件系统组件。默认 source gate、基础包组装、镜像和部署不包含
-`afs-meta`、`afs-node`、AFS 配置示例或 FUSE 专属系统依赖。`dfs/**`、根 Cargo/Make
+`afs-meta`、`afs-node`、AFS 配置示例或 FUSE 专属系统依赖。`afs/**`、根 Cargo/Make
 入口或 AFS gate 本身变化时，默认 pipeline 会执行 `.buildkite/afs-gate.sh`；该 gate
 运行 `ADX_WITH_AFS=1 make afs-check` 证明文件系统代码仍可构建和测试，但不改变默认包
 或部署制品。显式文件系统包使用同一个 `ADX_WITH_AFS=1` 合同，Buildkite 才启用

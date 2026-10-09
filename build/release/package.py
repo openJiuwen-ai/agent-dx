@@ -57,7 +57,7 @@ def assemble(binary_dir, redis, redis_cli, wheel, output, commit, dirty, target,
         for path in (ROOT / "build/config/examples/afs").iterdir():
             if path.is_file():
                 inputs[f"etc/examples/afs/{path.name}"] = path
-        for path in (ROOT / "docs/migration/licenses/dfs-source").iterdir():
+        for path in (ROOT / "docs/migration/licenses/afs-source").iterdir():
             if path.is_file():
                 inputs[f"third_party/afs-source/{path.name}"] = path
     for component in ("redis", "sandboxd"):

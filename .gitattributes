@@ -1,4 +1,4 @@
 # Generated patch bundles preserve the upstream source whitespace literally.
 third_party/sandboxd/patches/*.patch -whitespace
 # Hash-bound regression inputs preserve the original collector bytes.
-build/e2e/dfs/acceptance/fixtures/verbs-preparation/**/*.raw.log -whitespace
+build/e2e/afs/acceptance/fixtures/verbs-preparation/**/*.raw.log -whitespace

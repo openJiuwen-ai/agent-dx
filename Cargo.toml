@@ -41,14 +41,14 @@ members = [
     "platform/coordinator",
     "platform/deployment",
     "platform/adxlet",
-    "dfs",
-    "dfs/client",
-    "dfs/common/error",
-    "dfs/common/logging",
-    "dfs/common/metrics",
-    "dfs/common/protocol",
-    "dfs/common/tracing",
-    "dfs/common/transport",
+    "afs",
+    "afs/client",
+    "afs/common/error",
+    "afs/common/logging",
+    "afs/common/metrics",
+    "afs/common/protocol",
+    "afs/common/tracing",
+    "afs/common/transport",
 ]
 
 [workspace.package]

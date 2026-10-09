@@ -23,6 +23,8 @@ API Server 仍保留原有九条 `/api/agent` 兼容转发路由，由 `agent_ad
 
 公开 Sandbox HTTP/SDK 契约继续使用 `/api/instances`、`instanceId` 和 `instance_id`；API Server 在边界将这些兼容字段映射为 `environment_id`。内部 Rust 类型、gRPC、持久化字段与 Metrics 统一使用 Environment/Runtime。详见 [命名与抽象](naming.md)。
 
+AFS（Agent FS）是可选文件系统组件，源码、整体文档、构建、CI 和发布入口统一使用 `afs`。OwnerFs 与 DFS 是其内部平级模式；模式模块及 `ownerfs_*`／`dfs_*` 配置沿用各自名称。参见 [AFS 架构](afs.md)。
+
 ## 实际目录
 
 ```text
@@ -36,6 +38,11 @@ agent-dx/
 │   ├── api/                       # Gateway 产品入口与 inline 适配
 │   ├── activator/                 # 无状态产品管理与按需激活
 │   └── crates/                    # core 协议模型、store 产品状态；测试随各 crate 放置
+├── afs/                           # 可选 Agent FS，ADX_WITH_AFS=1 显式启用
+│   ├── src/node/vfs/ownerfs/       # OwnerFs workspace / Home 路径
+│   ├── src/node/vfs/dfs/           # 与 OwnerFs 平级的 DistributedFs 路径
+│   ├── client/                    # DFS 专用客户端 crate
+│   └── common/                    # AFS 域内公共 crate
 ├── crates/                        # 跨 Gateway / Platform / Runtime 的横切库
 │   ├── error/                     # 稳定错误码、重试与操作结果语义
 │   ├── observability/             # 日志、Metrics、Trace 与进程日志捕获
