@@ -167,13 +167,14 @@ def _normalize_domain_pattern(pattern: str, description: str) -> str:
     if len(value) > 253:
         raise ValueError(f"invalid {description} pattern: {pattern!r}")
     for label in value.split("."):
-        if (
+        dns_label_invalid = (
             not label
             or len(label) > 63
             or label.startswith("-")
             or label.endswith("-")
             or _DNS_LABEL_PATTERN.fullmatch(label) is None
-        ):
+        )
+        if dns_label_invalid:
             raise ValueError(f"invalid {description} pattern: {pattern!r}")
     return f"*.{value}" if wildcard else value
 
@@ -415,7 +416,10 @@ class NetworkPolicy:
         normalized = tuple(dict.fromkeys(_normalize_dns_pattern(item) for item in self.dns_blacklist))
         if self.block_network and normalized:
             raise ValueError("block_network and dns_blacklist cannot be combined")
-        if (self.block_network or normalized) and (self.traffic is not None or self.dns is not None):
+        network_policy_versions_mixed = (self.block_network or normalized) and (
+            self.traffic is not None or self.dns is not None
+        )
+        if network_policy_versions_mixed:
             raise ValueError("legacy and schema v2 network policies cannot be combined")
         if self.traffic is not None and not isinstance(self.traffic, TrafficPolicy):
             raise TypeError("traffic must be a TrafficPolicy or None")

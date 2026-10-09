@@ -102,7 +102,8 @@ class _FakeClient:
             }
         raise AssertionError(action)
 
-    def instance_info(self, sandbox_id):
+    @staticmethod
+    def instance_info(sandbox_id):
         return {
             "id": sandbox_id,
             "status": "running",

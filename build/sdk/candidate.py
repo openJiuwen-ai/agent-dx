@@ -52,13 +52,12 @@ def verify(directory):
         raise ValueError('invalid SDK candidate manifest')
     if not re.fullmatch(r'[0-9a-f]{40}', candidate.get('commit', '')):
         raise ValueError('invalid SDK candidate commit')
-    actual = {
-        path.name
-        for path in directory.iterdir()
-        if path.is_file()
-        and path.name != 'sdk-candidate.json'
-        and (path.suffix == '.whl' or path.name.endswith('.tar.gz'))
-    }
+    actual = set()
+    for artifact in directory.iterdir():
+        if not artifact.is_file() or artifact.name == 'sdk-candidate.json':
+            continue
+        if artifact.suffix == '.whl' or artifact.name.endswith('.tar.gz'):
+            actual.add(artifact.name)
     if actual != set(files):
         raise ValueError('SDK candidate file list mismatch')
     for name, digest in files.items():

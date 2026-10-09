@@ -74,11 +74,11 @@ def run(connection, image, output, secrets, *, query_unavailable=False):
                 handle.wait(timeout=45)
             except CommandUnavailable as error:
                 if not (error.sandbox_id == sandbox.id):
-                    raise AssertionError(error)
+                    raise AssertionError(error) from error
                 if not (error.command_id == command_id):
-                    raise AssertionError(error)
+                    raise AssertionError(error) from error
                 if 'command watch unavailable' not in str(error):
-                    raise AssertionError(error)
+                    raise AssertionError(error) from error
             else:
                 raise AssertionError('SDK did not report the exhausted Watch reconnect budget')
             if query_unavailable:
@@ -86,11 +86,11 @@ def run(connection, image, output, secrets, *, query_unavailable=False):
                     handle.poll()
                 except SandboxError as error:
                     if not (error.code == 'OUTCOME_UNKNOWN'):
-                        raise AssertionError(error)
+                        raise AssertionError(error) from error
                     if not (error.retry == 'same_operation'):
-                        raise AssertionError(error)
+                        raise AssertionError(error) from error
                     if not (error.instance_id == sandbox.id):
-                        raise AssertionError(error)
+                        raise AssertionError(error) from error
                 else:
                     raise AssertionError('command query remained available after Watch outage')
                 if not (proxy.rejected_get_attempts > 0):

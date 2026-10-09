@@ -127,7 +127,8 @@ class MultiVmSdkAcceptanceTests(unittest.TestCase):
                     read=lambda _path, **_kwargs: self.payload,
                 )
 
-            def is_running(self):
+            @staticmethod
+            def is_running():
                 return True
 
             def kill(self):

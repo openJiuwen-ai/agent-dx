@@ -72,7 +72,10 @@ def run_capacity(
             node = nodes[worker['node_id']]
             available_cpu = node.allocatable.get('CPU', 0)
             available_memory = node.allocatable.get('Memory', 0)
-            if node.status != 0 or available_cpu != int(available_cpu) or available_cpu < 500 or available_memory < 512:
+            capacity_insufficient = (
+                node.status != 0 or available_cpu != int(available_cpu) or available_cpu < 500 or available_memory < 512
+            )
+            if capacity_insufficient:
                 raise AssertionError(f"{worker['node_id']} lacks dedicated test capacity")
             cpu[worker['node_id']] = int(available_cpu)
         report['measured_cpu_millis'] = cpu

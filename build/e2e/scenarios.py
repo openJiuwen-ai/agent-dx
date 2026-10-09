@@ -256,20 +256,20 @@ elif sys.argv[1] == 'auth':
                 handle.close()
             except PermissionDenied as error:
                 if not (error.code == 'PERMISSION_DENIED' and error.retry == 'never'):
-                    raise AssertionError(error)
+                    raise AssertionError(error) from error
             except SandboxError as error:
                 if getattr(error, 'status_code', None) not in (401, 403):
-                    raise AssertionError(error)
+                    raise AssertionError(error) from error
             else:
                 raise AssertionError('unauthorized read accepted')
             try:
                 Sandbox.delete(s.id, connection=denied)
             except PermissionDenied as error:
                 if not (error.code == 'PERMISSION_DENIED' and error.retry == 'never'):
-                    raise AssertionError(error)
+                    raise AssertionError(error) from error
             except SandboxError as error:
                 if getattr(error, 'status_code', None) not in (401, 403):
-                    raise AssertionError(error)
+                    raise AssertionError(error) from error
             else:
                 raise AssertionError('unauthorized delete accepted')
         if not (s.is_running()):
@@ -293,7 +293,8 @@ elif sys.argv[1] == 'auth':
         s.kill()
         s.close()
 elif sys.argv[1] == 'capacity':
-    from concurrent.futures import ThreadPoolExecutor, TimeoutError
+    from concurrent.futures import ThreadPoolExecutor
+    from concurrent.futures import TimeoutError as FutureTimeoutError
 
     from metrics import check as check_metrics
     from node import catalog
@@ -319,7 +320,7 @@ elif sys.argv[1] == 'capacity':
             try:
                 extra = pending.result(timeout=2)
                 instances.append(extra)
-            except TimeoutError:
+            except FutureTimeoutError:
                 event('PASS: third create is waiting while both nodes are full')
             else:
                 raise AssertionError('overcommitted full nodes')

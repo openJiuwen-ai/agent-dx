@@ -87,7 +87,8 @@ class Filesystem:
             if not isinstance(source_chunk, bytes):
                 raise TypeError("file chunks must be bytes")
             for start in range(0, len(source_chunk), _RPC_FILE_CHUNK_SIZE):
-                chunk = source_chunk[start : start + _RPC_FILE_CHUNK_SIZE]
+                end = start + _RPC_FILE_CHUNK_SIZE
+                chunk = source_chunk[start:end]
                 result = _check(
                     self._invoke(
                         "file.write_chunk",

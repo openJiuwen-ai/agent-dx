@@ -61,16 +61,14 @@ def verify(root):
     if not collected.get('snapshot_id') or collected.get('state') != 'Deleted' or collected.get('references') != []:
         raise ValueError('source snapshot collection before clone resume is unproven')
     orphan = json.loads((root / 'orphan-gc.json').read_text())
-    if any(
-        orphan.get(k) is not True
-        for k in (
-            'passed',
-            'current_session_preserved',
-            'retired_session_removed',
-            'foreign_preserved',
-            'unmarked_preserved',
-        )
-    ) or not orphan.get('registered_checkpoint_preserved'):
+    orphan_checks = (
+        'passed',
+        'current_session_preserved',
+        'retired_session_removed',
+        'foreign_preserved',
+        'unmarked_preserved',
+    )
+    if any(orphan.get(k) is not True for k in orphan_checks) or not orphan.get('registered_checkpoint_preserved'):
         raise ValueError('orphan GC preservation evidence missing')
     catalog = json.loads((root / 'catalog-final.json').read_text())
     if catalog:

@@ -33,7 +33,8 @@ class RuntimeExitScenarioTests(unittest.TestCase):
                 }
                 state["backends"][self.id] = [self.id + "-backend-0"]
 
-            def run(self, command):
+            @staticmethod
+            def run(command):
                 state["commands"].append(command)
                 return types.SimpleNamespace(exit_code=0, stdout=command.removeprefix("printf "))
 

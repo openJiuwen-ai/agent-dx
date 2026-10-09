@@ -23,15 +23,18 @@ class IdleActiveScenarioTests(unittest.TestCase):
                 self.id = "active-idle-instance"
                 self.commands = types.SimpleNamespace(run=self.run)
 
-            def run(self, command, **_options):
+            @staticmethod
+            def run(command, **_options):
                 state["command"] = command
                 state["now"] += 12
                 return types.SimpleNamespace(exit_code=0, stdout="active-request-complete")
 
-            def is_running(self):
+            @staticmethod
+            def is_running():
                 return running
 
-            def close(self):
+            @staticmethod
+            def close():
                 state["closed"] = True
 
             @classmethod

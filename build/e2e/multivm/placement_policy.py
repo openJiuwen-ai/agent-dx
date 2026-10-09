@@ -158,12 +158,10 @@ def run_placement_policy(
                         for node_id in worker_ids
                     ):
                         return None
-                    if any(
-                        (record := persisted_assignment(control, sandbox.id, remote)).get('state') != 'Deleted'
-                        or record.get('resources_held')
-                        for sandbox in handles
-                    ):
-                        return None
+                    for sandbox in handles:
+                        record = persisted_assignment(control, sandbox.id, remote)
+                        if record.get('state') != 'Deleted' or record.get('resources_held'):
+                            return None
                     if any(
                         backend_ids(worker, socket, sandbox.id, remote) for sandbox in handles for worker in workers
                     ):

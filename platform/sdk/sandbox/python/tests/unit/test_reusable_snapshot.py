@@ -23,6 +23,9 @@ class ReusableSnapshotTests(unittest.TestCase):
         sandbox._closed = False
 
         class Client:
+            def __init__(self):
+                self.request = None
+
             def create_snapshot(self, sandbox_id, name=None, timeout_seconds=300):
                 self.request = (sandbox_id, name, timeout_seconds)
                 return {"snapshotId": "snap-1", "names": ["base"]}
@@ -47,10 +50,15 @@ class ReusableSnapshotTests(unittest.TestCase):
         scope = Scope()
 
         class Tunnel:
-            def checkpoint_inflight(self):
+            @staticmethod
+            def checkpoint_inflight():
                 return scope
 
         class Client:
+            def __init__(self):
+                self.request = None
+                self.scope_was_active = False
+
             def create_snapshot(self, sandbox_id, name=None, timeout_seconds=300):
                 self.request = (sandbox_id, name, timeout_seconds)
                 self.scope_was_active = scope.active
@@ -75,7 +83,8 @@ class ReusableSnapshotTests(unittest.TestCase):
             def __init__(self):
                 pass
 
-            def create_info(self, body):
+            @staticmethod
+            def create_info(body):
                 captured.update(body)
                 return {"sandboxId": "default-clone"}
 
@@ -98,7 +107,8 @@ class ReusableSnapshotTests(unittest.TestCase):
             def __init__(self):
                 pass
 
-            def create_info(self, body):
+            @staticmethod
+            def create_info(body):
                 captured.update(body)
                 return {"sandboxId": "default-regular"}
 
@@ -121,7 +131,8 @@ class ReusableSnapshotTests(unittest.TestCase):
             def __init__(self):
                 pass
 
-            def create_info(self, body):
+            @staticmethod
+            def create_info(body):
                 captured.update(body)
                 return {"sandboxId": "default-clone"}
 
@@ -145,7 +156,12 @@ class ReusableSnapshotTests(unittest.TestCase):
 
     def test_snapshot_get_list_delete_delegate_to_transport(self):
         class Client:
-            def get_snapshot(self, snapshot_id):
+            def __init__(self):
+                self.page = None
+                self.deleted = None
+
+            @staticmethod
+            def get_snapshot(snapshot_id):
                 return {"snapshotId": snapshot_id, "names": ["one"]}
 
             def list_snapshots(self, name=None, page_token=None, page_size=None):
@@ -262,13 +278,15 @@ class ReusableSnapshotTests(unittest.TestCase):
             status_code = 200
             text = ""
 
-            def json(self):
+            @staticmethod
+            def json():
                 payload = {"snapshotId": "snap-deterministic-id", "names": ["base"]}
                 encoded = base64.b64encode(json.dumps(payload).encode()).decode()
                 return {"code": 200, "data": encoded}
 
         class HTTP:
-            def post(self, url, **kwargs):
+            @staticmethod
+            def post(url, **kwargs):
                 del url, kwargs
                 return Response()
 

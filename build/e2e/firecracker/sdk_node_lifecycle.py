@@ -57,8 +57,8 @@ def catalog():
     return {k: json.loads(v) for k, v in value.items() if k.startswith(('environment:', 'node:'))}
 
 
-def record(id):
-    return catalog().get('environment:' + id, {}).get('result')
+def record(instance_id):
+    return catalog().get('environment:' + instance_id, {}).get('result')
 
 
 def services():
@@ -101,9 +101,9 @@ def create(**kwargs):
     return s_local
 
 
-def physical(id):
+def physical(instance_id):
     lines = command(
-        [a.sbox, '-a', root / 'sandboxd/sandboxd.sock', 'list', '--label', 'adx.environment_id=' + id]
+        [a.sbox, '-a', root / 'sandboxd/sandboxd.sock', 'list', '--label', 'adx.environment_id=' + instance_id]
     ).splitlines()
     return [line.split()[0] for line in lines[1:] if line.strip()]
 
@@ -117,9 +117,12 @@ try:
     if not (len(old) == 1):
         raise AssertionError(old)
     command([a.sbox, '-a', root / 'sandboxd/sandboxd.sock', 'delete', old[0]])
-    restarted = wait(
-        lambda: r if (r := record(s.id)) and r['state'] == 'Running' and runtime_id(r) != runtime_id(first) else None
-    )
+
+    def restarted_execution():
+        r = record(s.id)
+        return r if r and r['state'] == 'Running' and (runtime_id(r) != runtime_id(first)) else None
+
+    restarted = wait(restarted_execution)
     if not (restarted['restart_attempts'] == 1):
         raise AssertionError()
     if not (s.commands.run('printf restarted').stdout.strip() == 'restarted'):
@@ -152,14 +155,13 @@ try:
     if not (len(old) == 1):
         raise AssertionError(old)
     command([a.sbox, '-a', root / 'sandboxd/sandboxd.sock', 'delete', old[0]])
+
+    def recovered_execution():
+        r = record(recovered_from_checkpoint.id)
+        return r if r and r['state'] == 'Running' and (runtime_id(r) != runtime_id(before_failover)) else None
+
     recovered = wait(
-        lambda: (
-            r
-            if (r := record(recovered_from_checkpoint.id))
-            and r['state'] == 'Running'
-            and runtime_id(r) != runtime_id(before_failover)
-            else None
-        ),
+        recovered_execution,
         120,
     )
     if not (recovered_from_checkpoint.files.read('/tmp/failover-state') == 'checkpoint-state'):
@@ -178,7 +180,12 @@ try:
     if not (len(old) == 1):
         raise AssertionError(old)
     command([a.sbox, '-a', root / 'sandboxd/sandboxd.sock', 'delete', old[0]])
-    failed = wait(lambda: r if (r := record(unrecoverable.id)) and r['state'] == 'Failed' else None, 90)
+
+    def unrecoverable_failure():
+        r = record(unrecoverable.id)
+        return r if r and r['state'] == 'Failed' else None
+
+    failed = wait(unrecoverable_failure, 90)
     if not (not physical(unrecoverable.id)):
         raise AssertionError()
     if not (not failed['restart_pending']):
@@ -228,12 +235,22 @@ try:
     passed('Adxlet restart waits for Coordinator without cleaning an owned runtime')
     os.kill(coordinator_pid, signal.SIGCONT)
     stopped.remove(coordinator_pid)
+
     # The Coordinator clock continues while the process is stopped. Once the node
     # heartbeat lease expires, the old session and all of its executions are
     # fenced. The replacement process must discard that session's journal and
     # clean its retained runtime during authoritative reconciliation.
-    idle_failed = wait(lambda: r if (r := record(idle.id)) and r['state'] == 'Failed' else None, 90)
-    keep_failed = wait(lambda: r if (r := record(keep.id)) and r['state'] == 'Failed' else None, 90)
+    def idle_failure():
+        r = record(idle.id)
+        return r if r and r['state'] == 'Failed' else None
+
+    idle_failed = wait(idle_failure, 90)
+
+    def keep_failure():
+        r = record(keep.id)
+        return r if r and r['state'] == 'Failed' else None
+
+    keep_failed = wait(keep_failure, 90)
     wait(lambda: catalog()['node:node1']['session']['routable'], 90)
 
     def drained():

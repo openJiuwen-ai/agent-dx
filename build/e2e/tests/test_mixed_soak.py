@@ -14,7 +14,8 @@ from e2e.mixed_soak import evaluate, exercise, run, verify_assignment
 
 class FakeSandbox:
     class Commands:
-        def run(self, command):
+        @staticmethod
+        def run(command):
             marker = command.rsplit("'", 2)[1]
             return type('Result', (), {'exit_code': 0, 'stdout': marker})()
 
@@ -53,7 +54,8 @@ class MixedSoakTests(unittest.TestCase):
                 self.commands = self
                 instances.append(self)
 
-            def run(self, _command):
+            @staticmethod
+            def run(_command):
                 raise RuntimeError('command unavailable')
 
             def kill(self):

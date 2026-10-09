@@ -28,7 +28,8 @@ class _RpcClient:
         if action == "file.read_chunk":
             offset = args["offset"]
             limit = args["limit"]
-            chunk = bytes(self.data[offset : offset + limit])
+            end = offset + limit
+            chunk = bytes(self.data[offset:end])
             return {
                 "path": args["path"],
                 "offset": offset,
@@ -45,7 +46,8 @@ class _RpcClient:
                 self.data.clear()
             if len(self.data) < offset:
                 self.data.extend(b"\0" * (offset - len(self.data)))
-            self.data[offset : offset + len(chunk)] = chunk
+            end = offset + len(chunk)
+            self.data[offset:end] = chunk
             return {"bytes_written": len(chunk), "error": None}
         if action == "file.stat":
             return {

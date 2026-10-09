@@ -97,14 +97,16 @@ def verify(connection, evidence, secrets, policy):
     deleted = False
     try:
         if policy == 'never':
-            record = _wait(
-                lambda: (
+
+            def failed_runtime_record():
+                record = _record(instance_id)
+                return (
                     record
-                    if (record := _record(instance_id))['result']['state'] == 'Failed'
-                    and not record['result']['resources_held']
+                    if record['result']['state'] == 'Failed' and (not record['result']['resources_held'])
                     else None
                 )
-            )
+
+            record = _wait(failed_runtime_record)
             if not (record['assignment'] == before['assignment']):
                 raise AssertionError()
             if not (not record['result']['restart_pending']):
@@ -117,14 +119,19 @@ def verify(connection, evidence, secrets, policy):
             case_id = 'reliability.daemon-loss-never'
             extra = {'terminal_state': 'Failed', 'route': route}
         else:
-            record = _wait(
-                lambda: (
+
+            def restarted_runtime_record():
+                record = _record(instance_id)
+                return (
                     record
-                    if (record := _record(instance_id))['result']['state'] == 'Running'
+                    if record['result']['state'] == 'Running'
                     and persisted_runtime_id(record['result']) != before['runtime_id']
-                    and record['result']['restart_attempts'] == 1
+                    and (record['result']['restart_attempts'] == 1)
                     else None
-                ),
+                )
+
+            record = _wait(
+                restarted_runtime_record,
                 seconds=120,
             )
             if not (record['assignment'] == before['assignment']):
@@ -145,13 +152,15 @@ def verify(connection, evidence, secrets, policy):
             extra = {'backend_id': backends[0], 'restart_attempts': 1, 'api_visibility_seconds': api_visibility_seconds}
         Sandbox.delete(instance_id, connection=connection)
         deleted = True
+
+        def deleted_runtime_record():
+            record = _record(instance_id)
+            return (
+                record if record['result']['state'] == 'Deleted' and (not record['result']['resources_held']) else None
+            )
+
         _wait(
-            lambda: (
-                record
-                if (record := _record(instance_id))['result']['state'] == 'Deleted'
-                and not record['result']['resources_held']
-                else None
-            ),
+            deleted_runtime_record,
             seconds=60,
         )
         if not (not labeled_backend(instance_id)):

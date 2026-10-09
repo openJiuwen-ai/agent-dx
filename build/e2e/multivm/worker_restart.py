@@ -28,19 +28,21 @@ def restarted_state(control, worker, instance_id, old_pid, old_session, old_gene
     node = node_record(control, worker['node_id'], remote)
     assignment = persisted_assignment(control, instance_id, remote)
     backends = backend_ids(worker, socket, instance_id, remote)
-    if (
+    worker_restart_pending = (
         pid == old_pid
         or node['session']['id'] == old_session
         or not node['available']
         or not node['session']['routable']
-    ):
+    )
+    if worker_restart_pending:
         return None
-    if (
+    worker_ownership_changed = (
         assignment.get('state') != 'Running'
         or assignment.get('node_id') != worker['node_id']
         or assignment.get('generation') != old_generation
         or backends != old_backend
-    ):
+    )
+    if worker_ownership_changed:
         raise AssertionError('quick worker restart changed instance ownership or backend identity')
     return {
         'old_pid': old_pid,
@@ -69,7 +71,7 @@ def run_session_probe(executable, control, worker, instance_id, old_session, new
         result = json.loads(completed.stdout)
     except ValueError as error:
         raise AssertionError('stale-session RPC probe returned invalid JSON') from error
-    if (
+    session_fence_evidence_invalid = (
         result.get('status') != 'passed'
         or result.get('grpc_code') != 'FailedPrecondition'
         or result.get('record_unchanged') is not True
@@ -77,7 +79,8 @@ def run_session_probe(executable, control, worker, instance_id, old_session, new
         or result.get('instance_id') != instance_id
         or result.get('old_session') != old_session
         or result.get('new_session') != new_session
-    ):
+    )
+    if session_fence_evidence_invalid:
         raise AssertionError(f'stale-session RPC probe did not prove fencing: {result}')
     return result
 

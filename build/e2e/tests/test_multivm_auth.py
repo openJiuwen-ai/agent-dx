@@ -20,7 +20,8 @@ class AuthAcceptanceTests(unittest.TestCase):
                 self.commands = SimpleNamespace(run=lambda _command: SimpleNamespace(exit_code=0, stdout='still-owned'))
                 actions.append(('create', options['node_id']))
 
-            def is_running(self):
+            @staticmethod
+            def is_running():
                 return True
 
             def kill(self):

@@ -243,6 +243,15 @@ def main():
     dirty = bool(subprocess.check_output([_executable("git"), "status", "--porcelain"], text=True).strip())
     if os.environ.get("BUILDKITE") == "true" and dirty:
         parser.error("Buildkite requires a clean checkout before running the suite")
+    cache_variables = (
+        'CARGO_TARGET_DIR',
+        'CARGO_INCREMENTAL',
+        'RUSTC_WRAPPER',
+        'SCCACHE_DIR',
+        'GOCACHE',
+        'GOMODCACHE',
+        'PIP_CACHE_DIR',
+    )
     metadata = {
         "suite": args.suite,
         "commit": commit,
@@ -252,18 +261,7 @@ def main():
         "build_url": os.environ.get("BUILDKITE_BUILD_URL"),
         "image": os.environ.get("ADX_CI_IMAGE"),
         "jobs": args.jobs,
-        "caches": {
-            key: os.environ.get(key)
-            for key in (
-                "CARGO_TARGET_DIR",
-                "CARGO_INCREMENTAL",
-                "RUSTC_WRAPPER",
-                "SCCACHE_DIR",
-                "GOCACHE",
-                "GOMODCACHE",
-                "PIP_CACHE_DIR",
-            )
-        },
+        "caches": {key: os.environ.get(key) for key in cache_variables},
     }
     if args.suite in ("storage", "control-rpc", "api-control"):
         binary = shutil.which(os.environ.get("ADX_TEST_REDIS_SERVER", "redis-server"))

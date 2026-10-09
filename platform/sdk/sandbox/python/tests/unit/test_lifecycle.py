@@ -370,13 +370,16 @@ class LifecycleTests(unittest.TestCase):
             def __init__(self):
                 pass
 
-            def create_info(self, _body):
+            @staticmethod
+            def create_info(_body):
                 return {"sandboxId": "sandbox-1", "status": "running"}
 
-            def delete(self, sandbox_id):
+            @staticmethod
+            def delete(sandbox_id):
                 tracker.delete(sandbox_id)
 
-            def close(self):
+            @staticmethod
+            def close():
                 tracker.close()
 
             @staticmethod
@@ -388,7 +391,8 @@ class LifecycleTests(unittest.TestCase):
                 self.token = token
                 self.sandbox_id = sandbox_id
 
-            def start(self, _url, timeout=60):
+            @staticmethod
+            def start(_url, timeout=60):
                 return False
 
             def stop(self):
@@ -440,7 +444,8 @@ class LifecycleTests(unittest.TestCase):
                 seen["token"] = token
                 seen["sandbox_id"] = sandbox_id
 
-            def start(self, url, timeout=60):
+            @staticmethod
+            def start(url, timeout=60):
                 seen["url"] = url
                 return True
 

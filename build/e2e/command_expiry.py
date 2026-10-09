@@ -39,9 +39,9 @@ def run(connection, image, output):
             sandbox.commands.get(missing_id)
         except CommandNotFound as error:
             if not (not isinstance(error, CommandExpired)):
-                raise AssertionError(error)
+                raise AssertionError(error) from error
             if not (error.sandbox_id == sandbox.id and error.command_id == missing_id):
-                raise AssertionError()
+                raise AssertionError() from error
         else:
             raise AssertionError('unknown command did not return CommandNotFound')
 
@@ -58,7 +58,7 @@ def run(connection, image, output):
             sandbox.commands.get(command_id)
         except CommandExpired as error:
             if not (error.sandbox_id == sandbox.id and error.command_id == command_id):
-                raise AssertionError()
+                raise AssertionError() from error
         else:
             raise AssertionError('expired command did not return CommandExpired')
 

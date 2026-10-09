@@ -45,10 +45,11 @@ def summary(control, remote=ssh):
 
 
 def worker_routable(control, workers, remote=ssh):
-    return all(
-        (record := node_record(control, worker['node_id'], remote))['available'] and record['session']['routable']
-        for worker in workers
-    )
+    for worker in workers:
+        record = node_record(control, worker['node_id'], remote)
+        if not record['available'] or not record['session']['routable']:
+            return False
+    return True
 
 
 def route_ready(sandboxes):
@@ -156,12 +157,13 @@ def run_control_restarts(
             for sandbox in handles:
                 owner, generation, backends = baseline[sandbox.id]
                 assignment = persisted_assignment(control, sandbox.id, remote)
-                if (
+                ownership_changed = (
                     assignment.get('node_id') != owner
                     or assignment.get('generation') != generation
                     or assignment.get('state') != 'Running'
                     or not assignment.get('resources_held')
-                ):
+                )
+                if ownership_changed:
                     raise AssertionError(f'{sandbox.id} ownership changed after {role} restart')
                 if physical(sandbox.id) != backends:
                     raise AssertionError(f'{sandbox.id} backend changed after {role} restart')

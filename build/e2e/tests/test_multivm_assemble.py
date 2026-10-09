@@ -153,15 +153,16 @@ def full_evidence(root, inv):
                 }
             )
         if name == 'node-preferences':
+            preference_cases = (
+                'weighted node preference',
+                'ordered node preference',
+                'environment affinity OR',
+                'environment anti-affinity',
+                'explicit node and OR constraints',
+            )
             report['cases'] = [
                 {'name': label, 'expected_node': 'node1', 'actual_node': 'node1', 'backend_id': label}
-                for label in (
-                    'weighted node preference',
-                    'ordered node preference',
-                    'environment affinity OR',
-                    'environment anti-affinity',
-                    'explicit node and OR constraints',
-                )
+                for label in preference_cases
             ]
         if name in ('placement-pack', 'placement-spread'):
             report['instances'] = [{'node_id': 'node1'}, {'node_id': 'node1' if name == 'placement-pack' else 'node2'}]

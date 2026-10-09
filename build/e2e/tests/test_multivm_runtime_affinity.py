@@ -20,10 +20,12 @@ class RuntimeAffinityTests(unittest.TestCase):
                 self.id = 'runtime-choice'
                 self.commands = SimpleNamespace(run=lambda _cmd: SimpleNamespace(exit_code=0, stdout='runtime-ready'))
 
-            def kill(self):
+            @staticmethod
+            def kill():
                 state['deleted'] = True
 
-            def close(self):
+            @staticmethod
+            def close():
                 state['closed'] = True
 
         def remote(machine, *command):

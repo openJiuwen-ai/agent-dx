@@ -27,13 +27,14 @@ def runtime_owner(control, workers, runtime_class, remote=ssh):
         record = node_record(control, node_id, remote)
         session = record.get('session', {})
         classes = record.get('runtime_classes')
-        if (
+        runtime_inventory_unavailable = (
             record.get('id') != node_id
             or not record.get('available')
             or not session.get('routable')
             or not isinstance(classes, list)
             or not classes
-        ):
+        )
+        if runtime_inventory_unavailable:
             raise AssertionError(f'{node_id} lacks a live sandboxd runtime inventory')
         inventories[node_id] = classes
         if runtime_class in classes:

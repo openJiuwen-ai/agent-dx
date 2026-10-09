@@ -3,6 +3,7 @@
 import json
 import time
 import uuid
+from pathlib import PurePosixPath
 
 from command_response_cut import CommandResponseCutProxy
 
@@ -16,7 +17,7 @@ def run(connection, image, output, secrets):
     report = {'status': 'failed', 'cases': [], 'cleanup_errors': []}
     name = 'unsupported-' + uuid.uuid4().hex[:12]
     command_id = 'unsupported-' + uuid.uuid4().hex[:12]
-    marker = '/tmp/' + command_id + '.marker'
+    marker = str(PurePosixPath('/tmp') / f'{command_id}.marker')
     sandbox = None
     attached = None
     recovered = None
@@ -63,9 +64,9 @@ def run(connection, image, output, secrets):
                 )
             except UnsupportedFeature as error:
                 if not (error.sandbox_id == sandbox.id):
-                    raise AssertionError(error)
+                    raise AssertionError(error) from error
                 if not (error.command_id == command_id):
-                    raise AssertionError(error)
+                    raise AssertionError(error) from error
             else:
                 raise AssertionError('SDK started a command without the required capability')
             if not (len(proxy.capability_attempts) == 1):

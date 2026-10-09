@@ -121,7 +121,7 @@ def run(connection, image, output):
             )
         except SandboxError as error:
             if 'central scheduling queue deadline exceeded' not in str(error):
-                raise AssertionError(str(error))
+                raise AssertionError(str(error)) from error
         else:
             handles.append(unexpected)
             report['instances'].append(unexpected.id)

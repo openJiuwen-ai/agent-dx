@@ -578,18 +578,17 @@ class KubernetesLifecycleTests(unittest.TestCase):
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
         ]
         sync = next(node.lineno for node in calls if node.func.attr == 'sync_harness')
-        preflight = next(
-            node.lineno
-            for node in calls
-            if node.func.attr == 'execute'
-            and any(isinstance(arg, ast.Constant) and arg.value == '/opt/adx/e2e/preflight.py' for arg in node.args)
-        )
-        setup = next(
-            node.lineno
-            for node in calls
-            if node.func.attr == 'execute'
-            and any(isinstance(arg, ast.Constant) and arg.value == 'setup' for arg in node.args)
-        )
+
+        def execute_lines(argument):
+            for node in calls:
+                if node.func.attr != 'execute':
+                    continue
+                values = (arg.value for arg in node.args if isinstance(arg, ast.Constant))
+                if argument in values:
+                    yield node.lineno
+
+        preflight = next(execute_lines('/opt/adx/e2e/preflight.py'))
+        setup = next(execute_lines('setup'))
         self.assertLess(sync, preflight)
         self.assertLess(sync, setup)
 

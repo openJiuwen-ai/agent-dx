@@ -473,13 +473,14 @@ def main():
                 keep = json.loads(records['environment:' + live['keep_id']])['result']
                 keep_backend = labeled_backend(live['keep_id'])
                 idle_backend = labeled_backend(live['idle_id'])
-                if (
+                idle_cleanup_ready = (
                     local
                     and idle['state'] == 'Running'
                     and keep['state'] == 'Running'
                     and len(keep_backend) == 1
                     and not idle_backend
-                ):
+                )
+                if idle_cleanup_ready:
                     evidence = {
                         'idle_id': live['idle_id'],
                         'keep_id': live['keep_id'],
@@ -539,7 +540,7 @@ def main():
                 session = json.loads(records['node:node1'])['session']
                 keep_backend = labeled_backend(before['keep_id'])
                 idle_backend = labeled_backend(before['idle_id'])
-                if (
+                idle_recovery_complete = (
                     pending == []
                     and 'environment:' + before['idle_id'] not in records
                     and keep['state'] == 'Running'
@@ -547,7 +548,8 @@ def main():
                     and keep_backend == [before['keep_backend']]
                     and not idle_backend
                     and session['routable']
-                ):
+                )
+                if idle_recovery_complete:
                     evidence = {
                         'idle_state': 'Absent',
                         'idle_resources_held': False,
@@ -586,7 +588,7 @@ def main():
                 node2 = json.loads(records['node:node2'])
                 result = json.loads(records['environment:' + live['instance_id']])['result']
                 backends = labeled_backend(live['instance_id'])
-                if (
+                network_partition_reconciled = (
                     node1['node']['available'] == expect_available
                     and node1['session']['routable']
                     and node1['session']['id'] == live['session_id']
@@ -594,7 +596,8 @@ def main():
                     and result['state'] == 'Running'
                     and persisted_runtime_id(result) == live['runtime_id']
                     and backends == [live['backend']]
-                ):
+                )
+                if network_partition_reconciled:
                     evidence = {
                         'node1_available': expect_available,
                         'node2_available': True,
@@ -712,7 +715,7 @@ def main():
                     raise AssertionError('stale runc init PID was replaced before cleanup')
                 status = process_status(runtime['pid'])
                 failed = json.loads(records['environment:' + failed_id])
-                if (
+                invalidation_observed = (
                     service['pid']
                     and not routable
                     and not available
@@ -720,7 +723,8 @@ def main():
                     and failed['result']['state'] == 'Failed'
                     and runtime['runtime_id'] in runtimes
                     and stopped_with_pending_signal(status, signal.SIGTERM)
-                ):
+                )
+                if invalidation_observed:
                     evidence = {
                         'old_manager_pid': service['pid'],
                         'old_session_id': record['session']['id'],
@@ -758,7 +762,7 @@ def main():
                 runtimes = backend()
                 if not (not node_record['node']['available'] or not runtimes):
                     raise AssertionError('node reopened admission before stale backend cleanup')
-                if (
+                reconciliation_complete = (
                     service['pid']
                     and service['pid'] != before['old_manager_pid']
                     and session['id'] != before['old_session_id']
@@ -768,7 +772,8 @@ def main():
                     and failed.get('invalidated')
                     and failed['result']['state'] == 'Failed'
                     and not failed['result']['resources_held']
-                ):
+                )
+                if reconciliation_complete:
                     (E / 'reconcile-recovered.json').write_text(
                         json.dumps(
                             {
@@ -839,7 +844,8 @@ def main():
                 current = backend()
                 failed_id, available, routable = returning_node_status(records, current)
                 old_backend = labeled_backend(failed_id)
-                if available and routable and not old_backend and not current:
+                backend_cleanup_complete = available and routable and not old_backend and not current
+                if backend_cleanup_complete:
                     evidence = {
                         'node_id': 'node2',
                         'failed_id': failed_id,
@@ -1182,7 +1188,7 @@ def main():
                             )
                         )
                         break
-            except (OSError, subprocess.SubprocessError) as error:
+            except (OSError, subprocess.SubprocessError):
                 pass
             if time.monotonic() > deadline:
                 raise TimeoutError(f'sandboxd backend IDs did not converge: before={before!r}, after={last_after!r}')

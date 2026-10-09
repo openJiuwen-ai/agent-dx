@@ -5,7 +5,6 @@ import collections
 import gzip
 import http.server
 import json
-import os
 import signal
 import subprocess
 import sys
@@ -248,8 +247,11 @@ def has_execd_http_context(rows):
 
 def complete_create_trace_ids(rows):
     stages = {
-        'coordinator.create_environment', 'node.create_environment', 'environment.queue',
-        'environment.execute', 'coordinator.commit_environment',
+        'coordinator.create_environment',
+        'node.create_environment',
+        'environment.queue',
+        'environment.execute',
+        'coordinator.commit_environment',
     }
     groups = {}
     for span in rows:
@@ -258,13 +260,14 @@ def complete_create_trace_ids(rows):
     for trace_id, spans in groups.items():
         if not stages <= {span['name'] for span in spans}:
             continue
-        http = [
-            span for span in spans
-            if span.get('service') == 'adx-apiserver'
-            and span['name'] == 'POST /api/sandbox/v1/sandboxes'
-        ]
-        ids = {span['spanId'] for span in http}
-        if len(ids) >= 2 and any(span.get('parentSpanId') in ids for span in http):
+        http_spans = []
+        for candidate in spans:
+            if candidate.get('service') != 'adx-apiserver':
+                continue
+            if candidate['name'] == 'POST /api/sandbox/v1/sandboxes':
+                http_spans.append(candidate)
+        ids = {span['spanId'] for span in http_spans}
+        if len(ids) >= 2 and any(span.get('parentSpanId') in ids for span in http_spans):
             complete.append(trace_id)
     return complete
 
@@ -285,8 +288,11 @@ def validate_traces(node):
         if not any(s['name'] == 'node.delete_environment' for s in rows):
             raise AssertionError('delete trace missing')
     result = {
-        'status': 'passed', 'span_count': len(rows), 'services': sorted(services),
-        'environment_executions': count, 'complete_create_trace_ids': trace_ids,
+        'status': 'passed',
+        'span_count': len(rows),
+        'services': sorted(services),
+        'environment_executions': count,
+        'complete_create_trace_ids': trace_ids,
         'execd_context_received': True,
     }
     (E / f'traces-{node}.json').write_text(json.dumps(result, indent=2))

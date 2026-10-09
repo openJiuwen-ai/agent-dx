@@ -10,7 +10,7 @@ import threading
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from urllib.error import HTTPError
 from urllib.parse import parse_qs, urlsplit
 from urllib.request import HTTPSHandler, ProxyHandler, Request, build_opener
@@ -55,12 +55,8 @@ class UploadResponseCutProxy:
 
             def _forward(self):
                 body = self.rfile.read(int(self.headers['Content-Length'])) if self.command == 'POST' else None
-                headers = {
-                    key: value
-                    for key, value in self.headers.items()
-                    if key.lower()
-                    not in ('host', 'connection', 'content-length', 'accept-encoding', 'transfer-encoding')
-                }
+                excluded_headers = ('host', 'connection', 'content-length', 'accept-encoding', 'transfer-encoding')
+                headers = {key: value for key, value in self.headers.items() if key.lower() not in excluded_headers}
                 request = Request(proxy.upstream + self.path, data=body, headers=headers, method=self.command)
                 handlers = [ProxyHandler({})]
                 if proxy.upstream.startswith('https:'):
@@ -179,7 +175,7 @@ def run(connection, image, output, secrets):
     started = time.monotonic()
     report = {'status': 'failed', 'cases': [], 'cleanup_errors': []}
     name = 'upload-cut-' + uuid.uuid4().hex[:12]
-    remote_path = '/tmp/' + name + '.bin'
+    remote_path = str(PurePosixPath('/tmp') / f'{name}.bin')
     sandbox = None
     attached = None
     recovered = None

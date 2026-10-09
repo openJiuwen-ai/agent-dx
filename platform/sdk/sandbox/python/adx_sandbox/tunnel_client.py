@@ -83,6 +83,15 @@ _HOP_BY_HOP_HEADERS = frozenset(
 )
 
 
+def _binary_chunks(payload: bytes, chunk_size: int):
+    if not payload:
+        yield b""
+        return
+    for start in range(0, len(payload), chunk_size):
+        end = start + chunk_size
+        yield payload[start:end]
+
+
 def _positive_int_env(name: str, default: int, maximum: int) -> int:
     raw = os.environ.get(name)
     try:
@@ -121,13 +130,13 @@ def _header_pairs(headers):
 def _headers_for_rebuilt_request(headers):
     """Return ordered second-hop headers after removing connection metadata."""
     pairs = _header_pairs(headers)
-    connection_tokens = {
-        token.strip().lower()
-        for name, value in pairs
-        if name.lower() == "connection"
-        for token in value.split(",")
-        if token.strip()
-    }
+    connection_tokens = set()
+    for name, value in pairs:
+        if name.lower() != "connection":
+            continue
+        for token in value.split(","):
+            if token.strip():
+                connection_tokens.add(token.strip().lower())
     excluded = (
         _HOP_BY_HOP_HEADERS
         | connection_tokens
@@ -299,7 +308,9 @@ class TunnelClient:
 
     def _log_reconnect(self, level: int, message: str, *args: Any) -> None:
         if self._checkpoint_is_inflight():
-            logger.debug("checkpoint in-flight; " + message, *args)
+            if logger.isEnabledFor(logging.DEBUG):
+                formatted_message = message % args if args else message
+                logger.debug("checkpoint in-flight; %s", formatted_message)
             return
         logger.log(level, message, *args)
 
@@ -534,7 +545,6 @@ class TunnelClient:
         negotiated_stream_window = self._stream_window_frames
         negotiated_max_body_size = self._max_body_size
         negotiated_max_ws_message_size = self._max_ws_message_size
-        negotiated_resumable = True
 
         async def send_frame(obj: dict) -> None:
             # websockets does not allow concurrent send() from multiple tasks;
@@ -691,7 +701,8 @@ class TunnelClient:
                     for offset in range(0, len(raw_chunk), negotiated_stream_chunk):
                         await response_ready.wait()
                         await credit_queue.get()
-                        chunk = raw_chunk[offset : offset + negotiated_stream_chunk]
+                        chunk_end = offset + negotiated_stream_chunk
+                        chunk = raw_chunk[offset:chunk_end]
                         chunk_offset = response_state["next_offset"]
                         response_state["next_offset"] += len(chunk)
                         response_state["unacked"].append((chunk_offset, chunk))
@@ -1003,18 +1014,7 @@ class TunnelClient:
                             elif negotiated_protocol_version >= PROTOCOL_VERSION:
                                 if len(upstream_message) > negotiated_max_ws_message_size:
                                     raise ProtocolError("WebSocket binary message exceeds tunnel limit")
-                                chunks = (
-                                    [b""]
-                                    if not upstream_message
-                                    else (
-                                        upstream_message[offset : offset + negotiated_stream_chunk]
-                                        for offset in range(
-                                            0,
-                                            len(upstream_message),
-                                            negotiated_stream_chunk,
-                                        )
-                                    )
-                                )
+                                chunks = _binary_chunks(upstream_message, negotiated_stream_chunk)
                                 chunk_count = max(
                                     1,
                                     (len(upstream_message) + negotiated_stream_chunk - 1) // negotiated_stream_chunk,
@@ -1245,7 +1245,7 @@ class TunnelClient:
                         peer_window = frame.get("stream_window_frames")
                         peer_max_body = frame.get("max_body_size", self._max_body_size)
                         peer_max_ws_message = frame.get("max_ws_message_size", self._max_ws_message_size)
-                        if (
+                        stream_negotiation_supported = (
                             self._protocol_version >= PROTOCOL_VERSION
                             and isinstance(peer_version, int)
                             and peer_version >= PROTOCOL_VERSION
@@ -1260,7 +1260,8 @@ class TunnelClient:
                             and isinstance(peer_max_ws_message, int)
                             and peer_max_ws_message > 0
                             and frame.get("resume") is True
-                        ):
+                        )
+                        if stream_negotiation_supported:
                             negotiated_protocol_version = PROTOCOL_VERSION
                             negotiated_stream_chunk = min(self._max_stream_chunk, peer_chunk)
                             negotiated_max_inflight = min(self._max_inflight, peer_inflight)
@@ -1331,14 +1332,15 @@ class TunnelClient:
                         await request_state["queue"].put(None)
                     elif ftype == "window":
                         rid = frame.get("id", "")
-                        credits = frame.get("credits")
+                        received_credits = frame.get("credits")
                         ack_offset = frame.get("ack_offset")
-                        if (
-                            not isinstance(credits, int)
-                            or credits < 0
-                            or (credits == 0 and not isinstance(ack_offset, int))
+                        window_frame_invalid = (
+                            not isinstance(received_credits, int)
+                            or received_credits < 0
+                            or (received_credits == 0 and not isinstance(ack_offset, int))
                             or (ack_offset is not None and (not isinstance(ack_offset, int) or ack_offset < 0))
-                        ):
+                        )
+                        if window_frame_invalid:
                             raise ProtocolError("window must carry credits or a valid ack_offset")
                         response_state = response_credits.get(rid)
                         if response_state is None:
@@ -1353,7 +1355,7 @@ class TunnelClient:
                             response_credits.pop(rid, None)
                             continue
                         credit_queue = response_state["credits"]
-                        for _ in range(min(credits, negotiated_stream_window)):
+                        for _ in range(min(received_credits, negotiated_stream_window)):
                             try:
                                 credit_queue.put_nowait(None)
                             except asyncio.QueueFull:

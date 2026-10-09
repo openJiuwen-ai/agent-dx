@@ -64,9 +64,11 @@ def verify_machines(inventory, remote=ssh, release_manifest=None):
         machine_id = remote(machine, 'cat', '/etc/machine-id').strip()
         hostname = remote(machine, 'hostname').strip()
         addresses = json.loads(remote(machine, 'ip', '-j', 'address', 'show'))
-        assigned = {
-            item['local'] for interface in addresses for item in interface.get('addr_info', []) if 'local' in item
-        }
+        assigned = set()
+        for interface in addresses:
+            for address_info in interface.get('addr_info', []):
+                if 'local' in address_info:
+                    assigned.add(address_info['local'])
         expected = str(ipaddress.ip_address(machine['address']))
         if (machine_id, hostname) != (machine['machine_id'], machine['hostname']):
             raise AssertionError(f"{machine['role']} identity differs from inventory")

@@ -36,7 +36,8 @@ class ResourceStaleScenarioTests(unittest.TestCase):
                     'result': {'state': 'Running', 'runtime': {'id': 'runtime-' + self.id}, 'resources_held': True},
                 }
 
-            def run(self, command):
+            @staticmethod
+            def run(command):
                 return types.SimpleNamespace(exit_code=0, stdout=command.removeprefix('printf '))
 
             def close(self):

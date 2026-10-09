@@ -15,6 +15,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 
+class ProgressUsageError(Exception):
+    """An invalid CLI request that must not change progress state."""
+
+
 def now():
     return datetime.now(timezone.utc).isoformat()
 
@@ -52,7 +56,7 @@ def update(path, mutation):
 
 def initialize(args):
     if args.state.exists():
-        raise SystemExit('State already exists; use stage to update it.')
+        raise ProgressUsageError('State already exists; use stage to update it.')
     stages = []
     for line in args.roadmap.read_text().splitlines():
         columns = [column.strip() for column in line.split('|')]
@@ -69,7 +73,7 @@ def initialize(args):
                 }
             )
     if not stages:
-        raise SystemExit('No stages found in roadmap.')
+        raise ProgressUsageError('No stages found in roadmap.')
     update(args.state, lambda state: state.update(stages=stages))
 
 
@@ -77,7 +81,7 @@ def change_stage(args):
     def mutate(state):
         stage = next((stage for stage in state['stages'] if stage['id'] == args.id), None)
         if stage is None:
-            raise SystemExit('Unknown stage: ' + args.id)
+            raise ProgressUsageError('Unknown stage: ' + args.id)
         if args.status:
             stage['status'] = args.status
         if args.note is not None:
@@ -89,7 +93,7 @@ def change_stage(args):
 def run(args):
     command = args.command[1:] if args.command[:1] == ['--'] else args.command
     if not command:
-        raise SystemExit('Missing command after --')
+        raise ProgressUsageError('Missing command after --')
     args.log.parent.mkdir(parents=True, exist_ok=True)
     run_id = uuid.uuid4().hex
     job = {
@@ -233,7 +237,11 @@ def main():
         default=Path(__file__).resolve().parents[2] / 'docs/testing/control-plane-remaining.json',
     )
     args = parser.parse_args()
-    return {'init': initialize, 'stage': change_stage, 'run': run, 'serve': serve}[args.action](args)
+    try:
+        return {'init': initialize, 'stage': change_stage, 'run': run, 'serve': serve}[args.action](args)
+    except ProgressUsageError as error:
+        print(str(error), file=sys.stderr)
+        return 1
 
 
 if __name__ == '__main__':

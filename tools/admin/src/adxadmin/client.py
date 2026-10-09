@@ -138,14 +138,15 @@ class AdminClient:
 
 def _validate_endpoint(endpoint: str, allow_loopback_http: bool) -> str:
     parsed = urlsplit(endpoint)
-    if (
+    endpoint_origin_invalid = (
         not parsed.hostname
         or parsed.username
         or parsed.password
         or parsed.query
         or parsed.fragment
         or parsed.path not in ("", "/")
-    ):
+    )
+    if endpoint_origin_invalid:
         raise InvalidInput("endpoint must be an origin URL without credentials, path, query or fragment")
     if parsed.scheme == "https":
         return endpoint.rstrip("/")
@@ -171,7 +172,7 @@ def _metadata(value: object) -> dict[str, Any]:
     key_id = value.get("id")
     tenant = value.get("tenantId")
     expires_at = value.get("expiresAtUnixSeconds")
-    if (
+    key_metadata_invalid = (
         not isinstance(key_id, str)
         or not KEY_ID.fullmatch(key_id)
         or not isinstance(tenant, str)
@@ -181,7 +182,8 @@ def _metadata(value: object) -> dict[str, Any]:
         or not isinstance(expires_at, int)
         or isinstance(expires_at, bool)
         or expires_at < 0
-    ):
+    )
+    if key_metadata_invalid:
         raise InvalidInput("server returned invalid Key metadata")
     return {
         "id": key_id,

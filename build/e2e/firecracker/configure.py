@@ -11,15 +11,15 @@ import time
 from fc_runtime_profile import resolve as resolve_runtime_profile
 
 
-def _executable(name, environment=None, cwd=None):
+def _executable(command_name, environment=None, cwd=None):
     """Resolve an external command using the child's execution environment."""
     directory = os.getcwd() if cwd is None else os.path.abspath(cwd)
     search_path = os.pathsep.join(
         os.path.abspath(os.path.join(directory, entry)) for entry in os.get_exec_path(environment)
     )
-    executable = shutil.which(name, path=search_path)
+    executable = shutil.which(command_name, path=search_path)
     if executable is None:
-        raise FileNotFoundError(f"required executable not found: {name}")
+        raise FileNotFoundError(f"required executable not found: {command_name}")
     return os.path.abspath(executable)
 
 
@@ -182,7 +182,6 @@ cgroup_memory_limit = "0"
 ''')
 (P / 'proxy').mkdir(exist_ok=True, mode=0o700)
 # Observe the limits visible inside the node, supporting cgroup v1 and v2.
-import os
 
 cg = pathlib.Path('/sys/fs/cgroup')
 capacity = {'cpu_millis': 4000, 'memory_bytes': 3 * 1024**3, 'disk_bytes': 4 * 1024**3}

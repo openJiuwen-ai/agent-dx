@@ -62,11 +62,11 @@ def run(connection, image, output):
             )
         except SandboxError as error:
             if not (error.code == 'CONFLICT'):
-                raise AssertionError(error.code)
+                raise AssertionError(error.code) from error
             if not (error.retry == 'never'):
-                raise AssertionError(error.retry)
+                raise AssertionError(error.retry) from error
             if not (error.outcome == 'not_started'):
-                raise AssertionError(error.outcome)
+                raise AssertionError(error.outcome) from error
         else:
             instances.append(changed)
             raise AssertionError('changed specification unexpectedly accepted')

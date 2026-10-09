@@ -51,17 +51,13 @@ blocked_execd = None
 
 
 def catalog():
-    return {
-        k: json.loads(v)
-        for k, v in json.loads(
-            subprocess.check_output(
-                [str(base / 'tools/redis-cli'), '--json', 'HGETALL', 'adx:{acceptance}:control:v1'],
-                env=env,
-                text=True,
-                timeout=10,
-            )
-        ).items()
-    }
+    raw_catalog = subprocess.check_output(
+        [str(base / 'tools/redis-cli'), '--json', 'HGETALL', 'adx:{acceptance}:control:v1'],
+        env=env,
+        text=True,
+        timeout=10,
+    )
+    return {key: json.loads(value) for key, value in json.loads(raw_catalog).items()}
 
 
 def wait(predicate, seconds=180):
@@ -190,13 +186,14 @@ try:
         def uncommitted_backend():
             r = catalog()['environment:' + sandbox.id]
             backends_local = inventory(target)
-            if (
+            recovery_backend_ready = (
                 r['assignment']['node_id'] == target
                 and r.get('recovery', {}).get('pending')
                 and r['result']['state'] == 'Paused'
                 and len(backends_local) == 1
                 and 'SANDBOX_STATE_RUNNING' in backends_local[0]
-            ):
+            )
+            if recovery_backend_ready:
                 return r, backends_local[0].split()[0]
             return None
 

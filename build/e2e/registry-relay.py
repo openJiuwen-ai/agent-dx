@@ -8,7 +8,10 @@ async def handle(r, w):
 
         async def copy(a, b):
             try:
-                while data := await a.read(65536):
+                while True:
+                    data = await a.read(65536)
+                    if not data:
+                        break
                     b.write(data)
                     await b.drain()
             finally:

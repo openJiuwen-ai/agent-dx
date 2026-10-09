@@ -58,12 +58,8 @@ class ResponseCutProxy:
                     proxy.attempts.append((request_id, request['name']))
                     first = len(proxy.attempts) == 1
 
-                headers = {
-                    key: value
-                    for key, value in self.headers.items()
-                    if key.lower()
-                    not in ('host', 'connection', 'content-length', 'accept-encoding', 'transfer-encoding')
-                }
+                excluded_headers = ('host', 'connection', 'content-length', 'accept-encoding', 'transfer-encoding')
+                headers = {key: value for key, value in self.headers.items() if key.lower() not in excluded_headers}
                 upstream_request = Request(proxy.upstream + self.path, data=body, headers=headers, method='POST')
                 handlers = [ProxyHandler({})]
                 if proxy.upstream.startswith('https:'):

@@ -718,7 +718,8 @@ def test_sandbox_create_timeout_precedence_and_body():
     seen = []
 
     class FakeClient:
-        def create_info(self, body):
+        @staticmethod
+        def create_info(body):
             seen.append(dict(body))
             return {"sandboxId": f"sandbox-{len(seen)}", "status": "running"}
 
@@ -1647,15 +1648,8 @@ def test_tunnel_client_keeps_http_req_dedup_cache():
 
 
 def test_direct_entry_uses_server_and_ignores_plain_gateway_entry():
-    old_env = {
-        name: os.environ.get(name)
-        for name in (
-            "ADX_SERVER_ADDRESS",
-            "ADX_TLS",
-            "ADX_GATEWAY_ADDRESS",
-            "ADX_GATEWAY_TLS",
-        )
-    }
+    connection_variables = ('ADX_SERVER_ADDRESS', 'ADX_TLS', 'ADX_GATEWAY_ADDRESS', 'ADX_GATEWAY_TLS')
+    old_env = {name: os.environ.get(name) for name in connection_variables}
     try:
         os.environ["ADX_SERVER_ADDRESS"] = "ingress-tls:8443"
         os.environ["ADX_TLS"] = "1"
@@ -1694,19 +1688,23 @@ def test_reverse_tunnel_url_uses_gateway_tunnel_alias():
         execd_port = 50090
         token = "test-token"
 
-        def create(self, body):
+        @staticmethod
+        def create(body):
             seen["create_ports"] = body.get("ports")
             seen["create_env"] = body.get("env", {})
             seen["create_tunnel"] = body.get("tunnel")
             return "sandbox-demo"
 
-        def invoke(self, *args, **kwargs):
+        @staticmethod
+        def invoke(*args, **kwargs):
             return {"exists": True}
 
-        def delete(self, sandbox_id):
+        @staticmethod
+        def delete(sandbox_id):
             seen["deleted"] = sandbox_id
 
-        def close(self):
+        @staticmethod
+        def close():
             seen["closed"] = True
 
         @staticmethod
@@ -1719,12 +1717,14 @@ def test_reverse_tunnel_url_uses_gateway_tunnel_alias():
             seen["token"] = token
             seen["sandbox_id"] = sandbox_id
 
-        def start(self, url, timeout=60):
+        @staticmethod
+        def start(url, timeout=60):
             seen["url"] = url
             seen["timeout"] = timeout
             return True
 
-        def stop(self):
+        @staticmethod
+        def stop():
             seen["stopped"] = True
 
     try:
@@ -1782,7 +1782,8 @@ def test_reverse_tunnel_uses_frontend_returned_tunnel_metadata():
         execd_port = 50090
         token = "test-token"
 
-        def create_info(self, body):
+        @staticmethod
+        def create_info(body):
             seen["create_ports"] = body.get("ports")
             seen["create_env"] = body.get("env", {})
             seen["create_tunnel"] = body.get("tunnel")
@@ -1794,10 +1795,12 @@ def test_reverse_tunnel_uses_frontend_returned_tunnel_metadata():
                 },
             }
 
-        def delete(self, sandbox_id):
+        @staticmethod
+        def delete(sandbox_id):
             seen["deleted"] = sandbox_id
 
-        def close(self):
+        @staticmethod
+        def close():
             seen["closed"] = True
 
         @staticmethod
@@ -1809,7 +1812,8 @@ def test_reverse_tunnel_uses_frontend_returned_tunnel_metadata():
             seen["token"] = token
             seen["sandbox_id"] = sandbox_id
 
-        def start(self, url, timeout=60):
+        @staticmethod
+        def start(url, timeout=60):
             seen["url"] = url
             return True
 

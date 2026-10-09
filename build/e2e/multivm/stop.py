@@ -70,13 +70,14 @@ def run_route_probe(executable, control):
         result = json.loads(completed.stdout)
     except ValueError as error:
         raise AssertionError('route snapshot RPC probe returned invalid JSON') from error
-    if (
+    route_snapshot_invalid = (
         result.get('status') != 'passed'
         or result.get('reset') is not True
         or not isinstance(result.get('published_routes'), int)
         or result['published_routes'] < 0
         or not isinstance(result.get('revision'), int)
-    ):
+    )
+    if route_snapshot_invalid:
         raise AssertionError(f'route snapshot RPC probe returned invalid evidence: {result}')
     return result
 
@@ -180,10 +181,13 @@ def run_stop(
             'backend_instances': {worker['role']: len(backend_inventory(worker, socket, remote)) for worker in workers},
         }
         if route_probe is not None:
+
+            def withdrawn_routes():
+                result = route_probe(control)
+                return (result if result['published_routes'] == 0 else None) if result else None
+
             snapshot = wait(
-                lambda: (
-                    (result if result['published_routes'] == 0 else None) if (result := route_probe(control)) else None
-                ),
+                withdrawn_routes,
                 'published routes remain after worker shutdown',
                 30,
             )
