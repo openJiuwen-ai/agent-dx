@@ -31,6 +31,7 @@ Set these variables on a Buildkite build or in that pipeline's environment setti
 | Variable | Default | Applies to / responsibility |
 |---|---|---|
 | `ADX_OBS_UPLOAD` | base `1`, SDK `0` | `0` disables OBS upload for the selected pipeline |
+| `ADX_ARM_TESTS` | `0` | Base: `1` runs Rust component tests and install smoke on ARM, as on x86 |
 | `ADX_ARM_OBS_UPLOAD` | inherits `ADX_OBS_UPLOAD` | Base: override only ARM final OBS publication; ARM Buildkite artifacts remain available |
 | `ADX_OBS_UPLOAD_CHANNEL` | `daily` | Base/SDK: `daily` or `release` |
 | `ADX_RELEASE_VERSION` | tag-derived | OBS release path version |
@@ -53,8 +54,23 @@ separately from `adx/daily/` and `adx/release/`.
 
 ## Parallel Linux ARM64 packages
 
-The base pipeline runs `platform-build-arm64` alongside the AMD64 build. It uses
-an `os=macos, arch=arm64` worker with Docker to execute native Linux ARM64;
+The base pipeline runs two symmetric, independent Linux architecture flows:
+
+| Stage | x86_64 | ARM64 |
+|---|---|---|
+| Compile components | `build-platform`, `build-gateway`, `build-execd` | `build-platform-arm64`, `build-gateway-arm64`, `build-execd-arm64` |
+| Assemble release | `platform-build` | `platform-build-arm64` |
+| Publish to OBS | `publish-amd64` | `publish-arm64` |
+| Artifact index | `artifact-manifest` | `artifact-manifest-arm64` |
+
+Both use `build-component.sh` and `package-components.sh`. All component compile
+steps start without cross-architecture dependencies; assembly waits for its own
+components and the shared source gate, SDK and adxadmin candidates. x86 runs the
+Rust component tests and release install smoke. ARM defaults to compilation and
+package integrity checks; `ADX_ARM_TESTS=1` enables the same tests on ARM.
+ARM uses an `os=macos, arch=arm64` worker with Docker to execute native Linux ARM64.
+The current ARM pool uses one `adx/native-arm64` concurrency slot to protect
+worker checkout and Docker cache ownership; the x86 flow advances independently.
 Docker must be running and the worker must be able to pull the SWR build image.
 The ARM step maps the cluster's encrypted `ADX_SWR_PULL_CONFIG` secret to
 `SWR_DOCKER_CONFIG_JSON`; the registry wrapper creates an owner-only temporary
@@ -70,12 +86,6 @@ Cargo source configuration remains rsproxy sparse. ARM Docker volumes are
 `adx-arm64-cargo-home`, `adx-arm64-cargo-target`, `adx-arm64-go-build` and
 `adx-arm64-go-mod`, separate from AMD64 caches.
 
-The ARM job runs all three Rust component test partitions, builds GNU services
-and static musl Execd, then verifies the release, native ELF architecture, EROFS,
-installer/CLI and Redis startup. It consumes the SDK/adxadmin candidates produced
-by this same build. Its prerequisite jobs are SDK, admin and source gate; it
-does not wait for AMD64 package assembly.
-
 ARM artifacts are stored under `out/buildkite/arm64/`, and published to OBS
 `linux/arm64/`; `artifact-manifest-arm64` produces `index-arm64.html` with links
 and checksums. The `publish-arm64` job runs architecture-independent package
@@ -88,7 +98,7 @@ The ARM product packages are `adx-release.tar.gz` and `adx-execd.tar.gz`, with
 SHA256 and identity manifests. They use an external ARM sandboxd deployment;
 this job does not copy an AMD64 backend bundle or compile sandboxd. Its build
 manifest explicitly records `backend: null`. Kubernetes L0 continues to verify
-AMD64 in `platform-e2e`; an ARM package/install pass is not ARM Kubernetes E2E.
+AMD64 in `platform-e2e`; an ARM packaging pass is not ARM Kubernetes E2E.
 
 ## Python test environment
 
@@ -105,9 +115,9 @@ The base package ships `adxctl`, `adx-coordinator`, `adxlet`, `adx-apiserver`,
 inside adxlet by default; the two standalone binaries support explicit split
 process deployments. The debug forwarder remains source-built. Execd and the
 SDK remain in the unified release archive.
-By default, `platform-build` uploads verified local outputs, including
-adxadmin candidates. The same job publishes
-`out/buildkite/obs/manifest.json` and URLs without downloading the assembled package again.
+By default, `publish-amd64` uploads verified outputs from `platform-build`, including
+adxadmin candidates. It publishes
+`out/buildkite/obs/manifest.json` and URLs after verifying the downloaded archives.
 The independent `artifact-manifest` step reads this manifest and uploads
 `out/buildkite/index.html` to Buildkite Artifacts with links, sizes and SHA256
 for every OBS object. Set `ADX_OBS_UPLOAD=0` to skip final OBS publication;
@@ -292,10 +302,10 @@ not the Full E2E gate. `source-gate` owns fmt/Clippy and CI/release tooling chec
 `admin-package` and `sdk-package` produce tested Python artifacts in parallel.
 
 The base SDK step reuses the independent SDK pipeline command and produces a
-tested wheel/sdist candidate. After all six jobs pass, `platform-build` downloads each component archive once
+tested wheel/sdist candidate. After the shared gates and x86 component jobs pass, `platform-build` downloads each component archive once
 through the selected transport, validates the component manifest, assembles the
 release, and runs installation/help smoke checks in a temporary directory.
-Optional OBS publication uses these local outputs directly. Buildkite still
+The architecture-specific publication job downloads these immutable outputs for OBS upload. Buildkite still
 retains final base/backend archives for downstream Full runs and manual downloads;
 intermediate component archives use OBS by default. `build-manifest.json` binds
 the commit, component manifests, base archive, backend bundle and tested SDK
@@ -460,7 +470,7 @@ Failures still publish a summary and retain their original exit status.
 
 ## OBS artifact publication
 
-The base assembly job publishes final artifacts by default. Set
+The base publication jobs publish final artifacts by default. Set
 `ADX_OBS_UPLOAD=0` to disable this publication for a build.
 The local release archive, package manifest, build manifest, admin candidate and
 sandboxd backend bundle are verified before upload. No product binary is rebuilt.

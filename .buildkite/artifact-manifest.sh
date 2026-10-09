@@ -6,7 +6,7 @@ set -euo pipefail
 : "${BUILDKITE_BUILD_URL:?Buildkite build URL required}"
 
 arch=${ADX_BUILD_ARCH:-amd64}
-step=platform-build
+step=publish-amd64
 artifact_root=out/buildkite
 index=out/buildkite/index.html
 if [[ $arch == arm64 ]]; then
