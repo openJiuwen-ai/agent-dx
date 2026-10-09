@@ -1,4 +1,4 @@
-"""Exercise only the optional component boundary added by the DFS import."""
+"""Exercise only the optional component boundary added by the AFS import."""
 import os
 import subprocess
 import tempfile
@@ -9,8 +9,8 @@ ROOT = Path(__file__).resolve().parents[3]
 SCRIPT = ROOT / "build/release/build.sh"
 
 
-class DfsBuildBoundaryTests(unittest.TestCase):
-    def run_build(self, flag, host="x86_64-unknown-linux-gnu"):
+class AfsBuildBoundaryTests(unittest.TestCase):
+    def run_build(self, flag, host="x86_64-unknown-linux-gnu", legacy=None):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             tools = root / "tools"
@@ -28,7 +28,9 @@ class DfsBuildBoundaryTests(unittest.TestCase):
                        ADX_REDIS_SERVER=str(root / "redis-server"),
                        ADX_REDIS_CLI=str(root / "redis-cli"),
                        ADX_RELEASE_TARGET=host, ADX_RELEASE_OUTPUT=str(root / "output"),
-                       ADX_WITH_DFS=flag)
+                       ADX_WITH_AFS=flag)
+            if legacy is not None:
+                env[legacy] = "1"
             result = subprocess.run(["bash", str(SCRIPT)], cwd=ROOT, env=env,
                                     capture_output=True, text=True)
             return result, marker.exists()
@@ -36,8 +38,16 @@ class DfsBuildBoundaryTests(unittest.TestCase):
     def test_invalid_component_flag_stops_before_build(self):
         result, built = self.run_build("yes")
         self.assertEqual(result.returncode, 2)
-        self.assertIn("ADX_WITH_DFS must be 0 or 1", result.stderr)
+        self.assertIn("ADX_WITH_AFS must be 0 or 1", result.stderr)
         self.assertFalse(built)
+
+    def test_legacy_flags_are_rejected_before_build(self):
+        for legacy in ("ADX_WITH_DFS", "ADX_DFS_ALL_FEATURES"):
+            with self.subTest(legacy=legacy):
+                result, built = self.run_build("1", legacy=legacy)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn(legacy + " was replaced by", result.stderr)
+                self.assertFalse(built)
 
     def test_on_rejects_non_linux_builder_before_build(self):
         result, built = self.run_build("1", "aarch64-apple-darwin")

@@ -1,4 +1,4 @@
-# DFS/OwnerFs 快照迁移报告
+# Agent FS（AFS）快照迁移报告
 
 日期：2026-10-09。目标分支基线：`openJiuwen/agent-dx refactor` `11dc43e270ea7d02b5bbb9d1b1777e279060b129`。
 
@@ -20,7 +20,7 @@
 | `client/` | `dfs/client/` | DFS 客户端 crate |
 | `common/*` | `dfs/common/*` | 共享错误、日志、指标、协议、追踪和传输 crate |
 | `error-codes.toml` | `dfs/error-codes.toml` | 保留相对 include 输入 |
-| `examples/*.toml` | `dfs/examples/` 与 `build/config/examples/dfs/` | crate 示例和发布包配置示例 |
+| `examples/*.toml` | `dfs/examples/` 与 `build/config/examples/afs/` | crate 示例和发布包配置示例 |
 | Cargo 绑定测试 | `dfs/tests/` | 随 crate 保留 |
 | 验收工具 | `build/e2e/dfs/` | 保留维护中的 runner、driver、probe、小规模入口和约 2.8MiB 小型回归 fixture；旧部署器、历史过程证据和大日志留在本地归档 |
 | 许可证 | `docs/migration/licenses/dfs-source/` | 保留来源 LICENSE/NOTICE |
@@ -29,9 +29,15 @@
 
 ## 当前 MR 边界
 
-默认 ADX 工程路径保持不带 DFS。DFS 相关变更会在默认 pipeline 中触发 Buildkite DFS gate；该 gate 使用 `ADX_WITH_DFS=1` 执行检查，但不把文件系统 artifact 注入默认发布包。只有显式带组件的 release package 才包含 `afs-meta`、`afs-node`、DFS 示例配置和 `with_dfs: true` 清单。普通 release package 本轮仍不包含文件系统二进制、配置或运行依赖。
+默认 ADX 工程路径保持不带 AFS。AFS 相关变更会在默认 pipeline 中触发 Buildkite AFS gate；该 gate 使用 `ADX_WITH_AFS=1` 执行检查，但不把文件系统 artifact 注入默认发布包。只有显式带组件的 release package 才包含 `afs-meta`、`afs-node`、AFS 示例配置和 `with_afs: true` 清单。普通 release package 本轮仍不包含文件系统二进制、配置或运行依赖。
 
 目标仓本轮二进制已有下列限定运行证据；原 DMS/AFS 历史结论仍绑定原版本。本次 MR 的 ON 安装交付出口尚未完成，MR 建立不表示迁移 Goal 已完成。
+
+### AFS 命名与 CLA 对齐
+
+产品统一为 Agent FS（AFS），OwnerFs 和 DistributedFs（DFS）是其中的路径；DMS 仅作来源追溯。当前工程入口统一为 `ADX_WITH_AFS=0|1`、`ADX_AFS_ALL_FEATURES=0|1`、Make `afs-*`、CI suite/component `afs`、包参数 `--with-afs`、清单与部署字段 `with_afs`；发布示例改为 `etc/examples/afs/`。旧环境变量明确报出替换提示，旧 CLI/YAML/manifest 拒绝。内部 DFS 类型和已对齐的源码/测试目录不作全仓重命名。
+
+新分支初始提交 `f633bc7b99bf4548993b5bc6718a2a64d1539276` 的完整树 `3c21c1e5ef2399b9f892acad72290ae81bc3cfe3` 与旧候选 `83640fa` 一致。author、committer 和唯一 signoff 均使用已签署 CLA 的邮箱；[MR !33](https://gitcode.com/openJiuwen/agent-dx/merge_requests/33) 远端 CLA 已通过，替代并关闭 !32。旧分支及证据保留，不重写历史或 force push。命名整改受测输入为仓外 `afs-naming-candidate-v2.patch`（SHA-256 `23599c7db5d883d9b52eaec119a9405a723e8c5c83d167e1bfe8b04deba7afde`），Linux 临时 tree `0d88162d1ed45ea5ab54be7345852dc845d66bc6` 与提交前代码精确匹配；随后仅更新本报告。Linux fmt、部署 config33/process10、Python unittest59 及严格 workspace/all-targets/all-features Clippy 通过。Host 工程 unittest49（48通过、1范围skip）及文档检查通过；旧变量/参数/字段拒绝及包与汇总清单 ON/OFF 模式矛盾的针对性回归包含其中。一次不必要的 pytest 调用因缺模块失败，未安装或修改环境，既有 unittest 入口完成相应测试。下方原命令、版本和结果仍保留原身份。
 
 ## 当前验证
 
@@ -47,8 +53,8 @@ Rust 受测输入为目标提交 `3c6e3b47f25317662640ec7b47039f2c1f6c735b`，51
 | OwnerFs bind ON＋远端 | 功能通过（限定范围） | 实际 Home 底层 ext4 bind 与远端 FUSE；双向 64KiB/close-to-open、权限/setid、errno、目录持久屏障、local-file 有序全停重启及删除可见；70 检查、7 actual wait0、无 owned 挂载/进程残留 |
 | FUSE mmap 与正常排空 | 功能通过（限定范围） | 已编译 AFS libtest 中 covered-root lifecycle 和 file/mmap reference drain 两个真实 kernel case；普通 unmount/FUSE join 成功，无残留 |
 | DFS 一写多读 | 功能通过（限定范围） | 同 VM 三个独立 Node/mTLS TCP；A 写、B/C 并发读，三轮 64KiB/fsync/close-to-open、删除可见；55 检查、4 actual wait0；只要求一份持久副本，不是三同步副本或跨主机证明 |
-| 统一 ON 包及安装 | 环境阻塞／待验收 | 本地 builder 已按 ADX 既有定义准备 Redis 7.2.5、EROFS 1.8.10，Python pip/setuptools 已具备；固定 Rust 1.95.0 的 musl target 单次下载超过 5 分钟后停止并留证，替代下载路径待确认。完整 ON artifact、安装和生命周期尚未执行；公共镜像保持原样 |
-| GitCode 交付 | 进行中 | Issue #10、MR !32 已创建；必要 ON 安装出口未完成，暂不合并 |
+| 统一 ON 包及安装 | 进行中／待验收 | Redis 7.2.5、EROFS 1.8.10 与 Python 打包工具已就绪；原 musl 下载超时记录保留，经用户授权由主机同官方源下载校验、传入现有 VM 后 target 已就绪。旧836候选首次因输出目录已存在而组装失败，保留原记录；随后 fresh output 出包成功仅绑定旧候选。新AFS入口最终 artifact、安装和生命周期尚未通过，公共镜像保持原样 |
+| GitCode 交付 | 进行中 | Issue #10、MR !33（CLA yes）替代已关闭的 !32；新命名的 Linux 验证已通过，必要 ON 出包及安装出口未完成，暂不合并 |
 
 本轮未声明性能、跨主机、完整 POSIX、三同步副本、崩溃恢复或分布式锁通过。库测试的 22 个 ignored 中仅上述两个 kernel case 另行实际执行，不把其余 ignored 计为通过。
 
@@ -69,6 +75,8 @@ Rust 受测输入为目标提交 `3c6e3b47f25317662640ec7b47039f2c1f6c735b`，51
 - `kernel-runtime-20261009T2231-kernel-tests/kernel-runtime-20261009T2231-kernel-tests.tar`：`4e4e12174d620182408df3184543b182d1432f79fe5b87e110c6b33fea8967e4`。
 - `test-helper-20261009T225045-test-helper/test-helper-evidence.tar`：`fb9e29818863a3f3e7ac03053fce10c73c3a0a06f2171c6e5c748afae2c8c115`。
 - `release-deps-20261009T223725-release-deps/release-deps-evidence.tar`：`d3d98e30b8d02e26c00d5119f07acfef544a85d79050b074ac18e785af92d9a3`。
+- `naming-v2-20261009T2334/naming-v2-evidence.tar`：`5f23bc1f7dc97131ed1aac1be826b853ea8aaca4d9f0f7ee33707810c02970cc`。
+- `release-20261009T231226-release/release-evidence.tar`：`6306756955de5baa456288ce81d5ea4aab5db4cdb3890be41afed05671e39978`，保留旧836出包原失败与随后成功，不等于新 AFS 入口安装通过。
 
 首次 DFS 驱动在配置准备时因未绑定变量失败，未启动服务；原失败归档保留。最小修正并以身份配置测试先重现失败再通过后，只补跑 DFS。首次 ON 构建被两个 root-owned 可再生 `.d` 文件权限阻塞；归档内容、stat 和 hash 后按缓存维护授权仅 unlink 这两个文件，一次重试通过。均不隐去原错误，也不重跑无变化的通过项。
 

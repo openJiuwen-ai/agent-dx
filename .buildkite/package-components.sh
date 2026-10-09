@@ -1,22 +1,29 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+for legacy_flag in ADX_WITH_DFS ADX_DFS_ALL_FEATURES; do
+  if [[ ${!legacy_flag+x} ]]; then
+    echo "$legacy_flag was replaced by ${legacy_flag/DFS/AFS}; update the caller" >&2
+    exit 2
+  fi
+done
+
 : "${BUILDKITE_COMMIT:?Buildkite revision required}"
 [[ -z $(git status --porcelain) ]] || { echo 'clean checkout required'; exit 1; }
 [[ $(git rev-parse HEAD) == "$BUILDKITE_COMMIT" ]]
 
 export ADX_RELEASE_TARGET=x86_64-unknown-linux-gnu
 export ADX_RELEASE_OUTPUT="$PWD/out/buildkite/package"
-ADX_WITH_DFS=${ADX_WITH_DFS:-0}
-case "$ADX_WITH_DFS" in
+ADX_WITH_AFS=${ADX_WITH_AFS:-0}
+case "$ADX_WITH_AFS" in
   0|1) ;;
-  *) echo 'ADX_WITH_DFS must be 0 or 1' >&2; exit 2 ;;
+  *) echo 'ADX_WITH_AFS must be 0 or 1' >&2; exit 2 ;;
 esac
 components=(platform gateway execd)
 package_args=()
-if [[ "$ADX_WITH_DFS" == "1" ]]; then
-  components+=(dfs)
-  package_args+=(--with-dfs)
+if [[ "$ADX_WITH_AFS" == "1" ]]; then
+  components+=(afs)
+  package_args+=(--with-afs)
 fi
 source .buildkite/bootstrap-build.sh
 rm -rf out/buildkite/components "$ADX_RELEASE_OUTPUT" \

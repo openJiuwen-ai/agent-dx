@@ -264,7 +264,7 @@ fn afs_roles_are_explicit_and_render_from_existing_toml_files() {
     std::fs::write(&node_config, "id = 'node-a'\n").unwrap();
     let deployment: Deployment = serde_json::from_value(json!({
         "schema_version": 1,
-        "with_dfs": true,
+        "with_afs": true,
         "package_dir": package,
         "state_dir": state,
         "redis_url": "redis://localhost:6379/",
@@ -301,7 +301,7 @@ fn afs_roles_are_explicit_and_render_from_existing_toml_files() {
 }
 
 #[test]
-fn afs_roles_require_explicit_dfs_enablement() {
+fn afs_roles_require_explicit_afs_enablement() {
     let root = tempfile::tempdir().unwrap();
     let deployment: Deployment = serde_json::from_value(json!({
         "schema_version": 1,
@@ -318,9 +318,52 @@ fn afs_roles_require_explicit_dfs_enablement() {
     let error = deployment.validate().unwrap_err().to_string();
 
     assert!(
-        error.contains("with_dfs: true"),
+        error.contains("with_afs: true"),
         "unexpected error: {error}"
     );
+}
+
+#[test]
+fn afs_roles_reject_legacy_with_dfs_field() {
+    let root = tempfile::tempdir().unwrap();
+    let error = serde_json::from_value::<Deployment>(json!({
+        "schema_version": 1,
+        "with_dfs": true,
+        "package_dir": root.path().join("package"),
+        "state_dir": root.path().join("state"),
+        "redis_url": "redis://localhost:6379/",
+        "namespace": "test",
+        "restart_delay_ms": 20,
+        "stop_timeout_seconds": 3,
+        "services": [],
+    }))
+    .err()
+    .expect("legacy field must fail")
+    .to_string();
+
+    assert!(error.contains("with_dfs"), "unexpected error: {error}");
+}
+
+#[test]
+fn profile_deployment_rejects_legacy_with_dfs_field() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("deployment.yaml");
+    std::fs::write(
+        &path,
+        r#"
+schema_version: 1
+profile: standalone
+with_dfs: true
+"#,
+    )
+    .unwrap();
+
+    let error = Deployment::load(&path)
+        .err()
+        .expect("legacy field must fail")
+        .to_string();
+
+    assert!(error.contains("with_dfs"), "unexpected error: {error}");
 }
 
 #[test]
@@ -342,7 +385,7 @@ fn afs_roles_reject_implicit_or_unsafe_configuration() {
     ] {
         let deployment: Deployment = serde_json::from_value(json!({
             "schema_version": 1,
-            "with_dfs": true,
+            "with_afs": true,
             "package_dir": root.path().join("package"),
             "state_dir": root.path().join("state"),
             "redis_url": "redis://localhost:6379/",
@@ -780,7 +823,7 @@ fn shipped_role_deployment_examples_are_valid() {
         include_str!("../../../build/config/examples/deployment-coordinator.yaml"),
         include_str!("../../../build/config/examples/deployment-node.yaml"),
         include_str!("../../../build/config/examples/deployment-ingress-api.yaml"),
-        include_str!("../../../build/config/examples/dfs/deployment-ownerfs-local.yaml"),
+        include_str!("../../../build/config/examples/afs/deployment-ownerfs-local.yaml"),
     ];
 
     for example in examples {
@@ -922,11 +965,11 @@ fn node_control_stream_example_survives_profile_expansion_and_render() {
 #[test]
 fn afs_deployment_example_uses_current_shared_schema() {
     let deployment: Deployment = serde_saphyr::from_str(include_str!(
-        "../../../build/config/examples/dfs/deployment-ownerfs-local.yaml"
+        "../../../build/config/examples/afs/deployment-ownerfs-local.yaml"
     ))
     .unwrap();
     deployment.validate().unwrap();
-    assert!(deployment.with_dfs);
+    assert!(deployment.with_afs);
     assert_eq!(deployment.restart_delay_ms, 1000);
     assert_eq!(
         deployment

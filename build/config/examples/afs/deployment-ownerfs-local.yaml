@@ -1,5 +1,5 @@
 schema_version: 1
-with_dfs: true
+with_afs: true
 package_dir: /opt/adx/current
 state_dir: /opt/adx/run/afs
 redis_url: redis://127.0.0.1:6379/
@@ -10,10 +10,10 @@ services:
   - id: meta
     role: afs-meta
     config:
-      config_file: /opt/adx/config/dfs/meta.toml
+      config_file: /opt/adx/config/afs/meta.toml
       health_url: http://127.0.0.1:7401/health
   - id: node-a
     role: afs-node
     config:
-      config_file: /opt/adx/config/dfs/node.toml
+      config_file: /opt/adx/config/afs/node.toml
       health_url: http://127.0.0.1:7501/health

@@ -1,6 +1,6 @@
-# DFS/OwnerFs
+# Agent FS（AFS）
 
-`dfs/` 是从 DMS/AFS 仓库迁入的可选文件系统源码快照，包含 OwnerFs 和 DistributedFs 两条路径。它只在显式开启 `ADX_WITH_DFS=1` 时参与 Agent DX 的文件系统构建、测试和带组件发布包；默认 Agent DX 构建、测试、发布包和部署不包含这些运行二进制或 FUSE 专属系统依赖。
+`dfs/` 是从 DMS/AFS 仓库迁入的可选文件系统源码快照，包含 OwnerFs 和 DistributedFs 两条路径。它只在显式开启 `ADX_WITH_AFS=1` 时参与 Agent DX 的文件系统构建、测试和带组件发布包；默认 Agent DX 构建、测试、发布包和部署不包含这些运行二进制或 FUSE 专属系统依赖。
 
 ## 组件范围
 
@@ -9,7 +9,7 @@
 | `src/` | `afs-meta`、`afs-node`、OwnerFs、DFS、Meta 后端、FUSE 适配和运行时入口 |
 | `client/` | DFS 客户端 crate |
 | `common/` | 错误、日志、指标、协议、追踪和传输等共享 crate |
-| `examples/` | crate 级示例配置；发布包示例另见 `build/config/examples/dfs/` |
+| `examples/` | crate 级示例配置；发布包示例另见 `build/config/examples/afs/` |
 | `tests/` | Cargo 绑定的单元、契约和小型集成测试 |
 
 迁入内容不包含源仓过程资产、历史证据、checkpoint、旧 release 包、VM 数据、`.codex`、`.omx`、GitHub Actions 或 `third_party/fuser`。FUSE 依赖使用根工作区声明的官方固定 `fuser =0.18.0`。
@@ -27,12 +27,12 @@ make platform-release
 显式文件系统入口：
 
 ```sh
-ADX_WITH_DFS=1 make dfs-check
-ADX_WITH_DFS=1 make platform-release
-python3 build/ci/run.py dfs
+ADX_WITH_AFS=1 make afs-check
+ADX_WITH_AFS=1 make platform-release
+python3 build/ci/run.py afs
 ```
 
-DFS 相关文件变化会触发专用 CI gate，并在 gate 内用 `ADX_WITH_DFS=1` 检查文件系统源码。该 gate 不会把 `afs-meta`、`afs-node` 或 DFS 示例配置注入默认发布包。
+AFS 相关文件变化会触发专用 CI gate，并在 gate 内用 `ADX_WITH_AFS=1` 检查文件系统源码。该 gate 不会把 `afs-meta`、`afs-node` 或 AFS 示例配置注入默认发布包。
 
 ## 当前能力边界
 
@@ -53,6 +53,6 @@ DFS 相关文件变化会触发专用 CI gate，并在 gate 内用 `ADX_WITH_DFS
 - 快照来源和路径映射：[docs/migration/2026-10-09-dfs-snapshot.md](../docs/migration/2026-10-09-dfs-snapshot.md)
 - 来源索引和校验身份：[docs/migration/sources.json](../docs/migration/sources.json)
 - 验收工具入口：[build/e2e/dfs/acceptance/README.md](../build/e2e/dfs/acceptance/README.md)
-- 发布配置示例：[build/config/examples/dfs/](../build/config/examples/dfs/)
+- 发布配置示例：[build/config/examples/afs/](../build/config/examples/afs/)
 
 目标仓不继承 DMS/AFS 历史运行验收结论。所有 Agent DX 候选版本的功能、性能和交付状态必须以目标仓源码、目标仓二进制和对应 Linux 证据登记。

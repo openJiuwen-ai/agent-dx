@@ -1,5 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
+
+for legacy_flag in ADX_WITH_DFS ADX_DFS_ALL_FEATURES; do
+  if [[ ${!legacy_flag+x} ]]; then
+    echo "$legacy_flag was replaced by ${legacy_flag/DFS/AFS}; update the caller" >&2
+    exit 2
+  fi
+done
 # Linux release builder. sandboxd is supplied independently by the runtime environment.
 : "${CARGO_TARGET_DIR:?set persistent Cargo cache}"
 : "${ADX_REDIS_SERVER:?provide pinned Redis 7.2.5 binary}"
@@ -8,10 +15,10 @@ set -euo pipefail
 : "${ADX_RELEASE_OUTPUT:?set new output package directory}"
 JOBS=${JOBS:-2}
 PYTHON=${PYTHON:-python3}
-ADX_WITH_DFS=${ADX_WITH_DFS:-0}
-case "$ADX_WITH_DFS" in
+ADX_WITH_AFS=${ADX_WITH_AFS:-0}
+case "$ADX_WITH_AFS" in
   0|1) ;;
-  *) echo 'ADX_WITH_DFS must be 0 or 1' >&2; exit 2 ;;
+  *) echo 'ADX_WITH_AFS must be 0 or 1' >&2; exit 2 ;;
 esac
 root=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$root"
@@ -23,8 +30,8 @@ case "$host" in
  aarch64-apple-darwin) ;;
  *) echo 'unsupported native release target' >&2; exit 1 ;;
 esac
-if [[ "$ADX_WITH_DFS" == "1" && "$host" != *-linux-gnu ]]; then
-  echo 'ADX_WITH_DFS=1 requires a Linux release builder' >&2
+if [[ "$ADX_WITH_AFS" == "1" && "$host" != *-linux-gnu ]]; then
+  echo 'ADX_WITH_AFS=1 requires a Linux release builder' >&2
   exit 2
 fi
 stage=$(mktemp -d "${TMPDIR:-/tmp}/adx-build.XXXXXX")
@@ -36,8 +43,8 @@ cargo build --locked --release -j "$JOBS" \
 for name in adx-apiserver adx-ingress adx-relay adxctl adx-inspect adx-coordinator adxlet adx-execd; do
  cp "$CARGO_TARGET_DIR/release/$name" "$stage/$name"
 done
-if [[ "$ADX_WITH_DFS" == "1" ]]; then
-  echo "--- :file_folder: Compile DFS and OwnerFs"
+if [[ "$ADX_WITH_AFS" == "1" ]]; then
+  echo "--- :file_folder: Compile Agent FS (AFS)"
   cargo build --locked --release -j "$JOBS" -p afs --bins
   for name in afs-meta afs-node; do
     cp "$CARGO_TARGET_DIR/release/$name" "$stage/$name"
@@ -65,7 +72,7 @@ package_args=(
   --profile release
   --output "$ADX_RELEASE_OUTPUT"
 )
-if [[ "$ADX_WITH_DFS" == "1" ]]; then
-  package_args+=(--with-dfs)
+if [[ "$ADX_WITH_AFS" == "1" ]]; then
+  package_args+=(--with-afs)
 fi
 "$PYTHON" "${package_args[@]}"

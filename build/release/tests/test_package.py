@@ -1,3 +1,4 @@
+import json
 import importlib.util
 import platform
 import subprocess
@@ -44,6 +45,16 @@ class PackageTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 pkg.assemble(binaries, redis, redis_cli, wheel, out, "a" * 40, True, "test-fixture", "debug")
 
+    def test_legacy_manifest_cannot_silently_disable_afs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for mode in (True, False):
+                (root / "manifest.json").write_text(json.dumps({
+                    "schema_version": 1, "files": {}, "with_dfs": mode,
+                }))
+                with self.assertRaisesRegex(ValueError, "legacy with_dfs"):
+                    pkg.verify(root)
+
     def test_package_ships_optional_split_process_binaries(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -75,12 +86,12 @@ class PackageTests(unittest.TestCase):
             self.assertNotIn("bin/afs-meta", manifest["files"])
             pkg.verify(output)
 
-    def test_dfs_artifacts_are_only_shipped_when_enabled(self):
+    def test_afs_artifacts_are_only_shipped_when_enabled(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             binaries = root / "bin"
             binaries.mkdir()
-            for name in pkg.BINARIES + pkg.DFS_BINARIES + ("adx-execd",):
+            for name in pkg.BINARIES + pkg.AFS_BINARIES + ("adx-execd",):
                 (binaries / name).write_bytes(b"fixture")
             redis = root / "redis"
             redis.write_text("#!/bin/sh\necho 'Redis server v=7.2.5 sha=fixture'\n")
@@ -95,33 +106,33 @@ class PackageTests(unittest.TestCase):
             default_manifest = pkg.assemble(
                 binaries, redis, redis_cli, wheel, default_output, "a" * 40, True, "test-fixture", "debug"
             )
-            self.assertNotIn("with_dfs", default_manifest)
+            self.assertNotIn("with_afs", default_manifest)
             self.assertNotIn("bin/afs-meta", default_manifest["files"])
-            self.assertFalse((default_output / "etc/examples/dfs").exists())
+            self.assertFalse((default_output / "etc/examples/afs").exists())
             pkg.verify(default_output)
 
-            dfs_output = root / "dfs-package"
-            dfs_manifest = pkg.assemble(
-                binaries, redis, redis_cli, wheel, dfs_output, "a" * 40, True, "test-fixture", "debug", True
+            afs_output = root / "afs-package"
+            afs_manifest = pkg.assemble(
+                binaries, redis, redis_cli, wheel, afs_output, "a" * 40, True, "test-fixture", "debug", True
             )
-            self.assertTrue(dfs_manifest["with_dfs"])
-            self.assertIn("bin/afs-meta", dfs_manifest["files"])
-            self.assertIn("bin/afs-node", dfs_manifest["files"])
-            self.assertIn("etc/examples/dfs/meta.toml", dfs_manifest["files"])
-            self.assertIn("third_party/dfs-source/LICENSE", dfs_manifest["files"])
-            self.assertIn("third_party/dfs-source/NOTICE", dfs_manifest["files"])
-            pkg.verify(dfs_output)
+            self.assertTrue(afs_manifest["with_afs"])
+            self.assertIn("bin/afs-meta", afs_manifest["files"])
+            self.assertIn("bin/afs-node", afs_manifest["files"])
+            self.assertIn("etc/examples/afs/meta.toml", afs_manifest["files"])
+            self.assertIn("third_party/afs-source/LICENSE", afs_manifest["files"])
+            self.assertIn("third_party/afs-source/NOTICE", afs_manifest["files"])
+            pkg.verify(afs_output)
 
-            (dfs_output / "bin/afs-node").write_bytes(b"tampered")
+            (afs_output / "bin/afs-node").write_bytes(b"tampered")
             with self.assertRaises(ValueError):
-                pkg.verify(dfs_output)
+                pkg.verify(afs_output)
 
-    def test_cli_assemble_accepts_with_dfs_flag(self):
+    def test_cli_assemble_accepts_with_afs_flag(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             binaries = root / "bin"
             binaries.mkdir()
-            for name in pkg.BINARIES + pkg.DFS_BINARIES + ("adx-execd",):
+            for name in pkg.BINARIES + pkg.AFS_BINARIES + ("adx-execd",):
                 (binaries / name).write_bytes(b"fixture")
             redis = root / "redis"
             redis.write_text("#!/bin/sh\necho 'Redis server v=7.2.5 sha=fixture'\n")
@@ -152,7 +163,7 @@ class PackageTests(unittest.TestCase):
                     "test-fixture",
                     "--profile",
                     "debug",
-                    "--with-dfs",
+                    "--with-afs",
                 ],
                 text=True,
                 capture_output=True,
@@ -160,10 +171,10 @@ class PackageTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, result.stderr)
             manifest = pkg.verify(output)
-            self.assertTrue(manifest["with_dfs"])
+            self.assertTrue(manifest["with_afs"])
             self.assertIn("bin/afs-meta", manifest["files"])
 
-    def test_dfs_package_requires_both_runtime_binaries(self):
+    def test_afs_package_requires_both_runtime_binaries(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             binaries = root / "bin"
@@ -184,7 +195,7 @@ class PackageTests(unittest.TestCase):
                     redis,
                     redis_cli,
                     wheel,
-                    root / "dfs-package",
+                    root / "afs-package",
                     "a" * 40,
                     True,
                     "test-fixture",

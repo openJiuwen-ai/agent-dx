@@ -1,7 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-for flag in ADX_OBS_UPLOAD ADX_ADMIN_PYPI_UPLOAD ADX_SDK_PYPI_UPLOAD ADX_WITH_DFS; do
+for legacy_flag in ADX_WITH_DFS ADX_DFS_ALL_FEATURES; do
+  if [[ ${!legacy_flag+x} ]]; then
+    echo "$legacy_flag was replaced by ${legacy_flag/DFS/AFS}; update the caller" >&2
+    exit 2
+  fi
+done
+
+for flag in ADX_OBS_UPLOAD ADX_ADMIN_PYPI_UPLOAD ADX_SDK_PYPI_UPLOAD ADX_WITH_AFS; do
   value=${!flag:-0}
   [[ $value == 0 || $value == 1 ]] || { echo "$flag must be 0 or 1" >&2; exit 2; }
 done

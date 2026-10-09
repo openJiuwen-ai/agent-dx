@@ -1,16 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+for legacy_flag in ADX_WITH_DFS ADX_DFS_ALL_FEATURES; do
+  if [[ ${!legacy_flag+x} ]]; then
+    echo "$legacy_flag was replaced by ${legacy_flag/DFS/AFS}; update the caller" >&2
+    exit 2
+  fi
+done
+
 component=${1:?component is required}
 : "${BUILDKITE_COMMIT:?Buildkite revision required}"
 [[ -z $(git status --porcelain) ]] || { echo 'clean checkout required'; exit 1; }
 [[ $(git rev-parse HEAD) == "$BUILDKITE_COMMIT" ]]
 
 export ADX_RELEASE_TARGET=x86_64-unknown-linux-gnu
-ADX_WITH_DFS=${ADX_WITH_DFS:-0}
-case "$ADX_WITH_DFS" in
+ADX_WITH_AFS=${ADX_WITH_AFS:-0}
+case "$ADX_WITH_AFS" in
   0|1) ;;
-  *) echo 'ADX_WITH_DFS must be 0 or 1' >&2; exit 2 ;;
+  *) echo 'ADX_WITH_AFS must be 0 or 1' >&2; exit 2 ;;
 esac
 source .buildkite/bootstrap-build.sh
 host=$(rustc -vV | sed -n 's/^host: //p')
@@ -52,9 +59,9 @@ case "$component" in
       --binary "$output/adx-execd" \
       --output "$output/adx-runtime-rootfs.img"
     ;;
-  dfs)
-    [[ "$ADX_WITH_DFS" == "1" ]] || { echo 'DFS component requires ADX_WITH_DFS=1' >&2; exit 2; }
-    echo "--- :file_folder: Compile DFS and OwnerFs"
+  afs)
+    [[ "$ADX_WITH_AFS" == "1" ]] || { echo 'AFS component requires ADX_WITH_AFS=1' >&2; exit 2; }
+    echo "--- :file_folder: Compile Agent FS (AFS)"
     cargo build --locked --release -j "$jobs" -p afs --bins
     for binary in afs-meta afs-node; do
       cp "$CARGO_TARGET_DIR/release/$binary" "$output/$binary"
