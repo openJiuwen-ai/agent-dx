@@ -79,7 +79,7 @@ class ArmPackageTests(unittest.TestCase):
         self.assertIn('.buildkite/package-components.sh', native)
         self.assertIn('ADX_ARM_TESTS:-0', native)
         self.assertIn('ADX_COMPONENT_TESTS=0', native)
-        self.assertIn('chmod a+rwx out/buildkite', script)
+        self.assertIn('chmod -R a+rwX out/buildkite', script)
         self.assertIn('build/release/package.py verify', (ROOT / '.buildkite/package-components.sh').read_text())
         self.assertNotIn('build_backend.py', native)
 
@@ -136,6 +136,8 @@ class ArmRunnerTests(unittest.TestCase):
                 'buildkite-agent': '#!/bin/bash\nexit 0\n',
                 'docker': '''#!/bin/bash
 if [[ $1 == run ]]; then
+  python3 -c 'from pathlib import Path; assert Path("out/buildkite/logs").stat().st_mode & 2'
+  if [[ $? != 0 ]]; then exit 18; fi
   mkdir -p out/buildkite/components
   echo evidence > out/buildkite/components/execd.tar.gz
   echo deliberate-container-failure

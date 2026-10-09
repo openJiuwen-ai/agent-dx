@@ -36,7 +36,7 @@ if [[ $phase == package ]]; then
 fi
 # Docker Desktop maps the worker-owned output directory into the Linux builder.
 # Only generated artifacts are writable; registry credentials live outside checkout.
-chmod a+rwx out/buildkite
+chmod -R a+rwX out/buildkite
 image=$(python3 -c 'import json; print(json.load(open("build/images/build-environment-arm64.json"))["ci_image"])')
 [[ $image == *@sha256:* ]]
 env_args=()
