@@ -71,7 +71,6 @@ def main():
                 'state_dir': str(root / 'state'),
                 'redis_url': f'redis://127.0.0.1:{redis_port}/',
                 'namespace': 'process-smoke',
-                'restart_limit': 4,
                 'restart_delay_ms': 200,
                 'stop_timeout_seconds': 5,
                 'services': [

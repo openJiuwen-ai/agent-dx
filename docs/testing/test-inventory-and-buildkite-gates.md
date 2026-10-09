@@ -66,7 +66,7 @@ Standalone 在一台 Linux 主机或一台 Lima KVM VM 上，以进程方式运�
 
 | Standalone 用例 | 当前归属 |
 |---|---|
-| `adxctl validate/render/start/status/stop` | 验证统一配置、supervisor、进程重启预算和停机清理 |
+| `adxctl validate/render/start/status/stop` | 验证统一配置、supervisor、进程持续重启和停机清理 |
 | 发布包安装示例 | 从干净发布包和 wheel 启动，配置及制品哈希固定 |
 | 运行环境 | 本地 EROFS、OCI 默认 runtime、runtime-only、自定义镜像只读挂载 Execd |
 | Relay 组合 | embedded 和 standalone 两种模式遵守同一绑定／路由契约 |

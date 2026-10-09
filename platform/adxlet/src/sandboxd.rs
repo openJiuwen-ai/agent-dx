@@ -541,6 +541,27 @@ pub fn start_request(
             }]
         }));
     }
+    // Kata's default OCI spec mounts /dev as tmpfs but omits devpts. Execd
+    // allocates terminals inside the guest, without CAP_SYS_ADMIN to mount it.
+    // Let the runtime prepare a private PTY filesystem at container creation.
+    if spec.runtime_class == "kata" && !mounts.iter().any(|mount| mount.target == "/dev/pts") {
+        mounts.push(proto::Mount {
+            r#type: "devpts".into(),
+            target: "/dev/pts".into(),
+            options: [
+                "nosuid",
+                "noexec",
+                "newinstance",
+                "ptmxmode=0666",
+                "mode=0620",
+                "gid=5",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+            source: Some(proto::mount::Source::HostPath("devpts".into())),
+        });
+    }
     let image_process_config = environment.map_or(
         adx_core::runtime_profile::DEFAULT_IMAGE_PROCESS_CONFIG,
         |value| value.bootstrap.image_process_config.as_str(),
@@ -768,11 +789,13 @@ fn sandbox_network_policy(
         for port in std::iter::once(50090u16).chain(ports.iter().copied()) {
             rules.push(proto::TrafficRule {
                 action: proto::NetworkPolicyAction::Allow as i32,
-                // Stateless policies cannot rely on conntrack to admit TCP
-                // replies. Match the same local service port in both directions.
-                direction: match traffic.mode {
-                    model::TrafficMode::Stateless => proto::NetworkDirection::Both as i32,
-                    model::TrafficMode::Stateful => proto::NetworkDirection::Ingress as i32,
+                // Execd control replies must not depend on a conntrack entry
+                // from the previous policy generation. Stateless published
+                // ports also need an explicit return-path rule.
+                direction: if port == 50090 || traffic.mode == model::TrafficMode::Stateless {
+                    proto::NetworkDirection::Both as i32
+                } else {
+                    proto::NetworkDirection::Ingress as i32
                 },
                 protocol: proto::NetworkProtocol::Tcp as i32,
                 peer: Some(proto::NetworkEndpoint::default()),

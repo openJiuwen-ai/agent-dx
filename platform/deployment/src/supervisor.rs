@@ -50,7 +50,7 @@ impl Request {
 struct ManagedService {
     config: Process,
     child: Option<Child>,
-    restarts: u32,
+    restarts: u64,
     next_start: Instant,
     failed: bool,
     capture: Option<crate::logging::Capture>,
@@ -83,6 +83,7 @@ impl ManagedService {
         };
         self.child = Some(command.spawn()?);
         self.capture = capture;
+        self.failed = false;
         Ok(())
     }
     async fn finish_logs(&mut self) -> Result<()> {
@@ -296,6 +297,7 @@ pub async fn run(deployment: Deployment) -> Result<()> {
             finished_log: None,
         };
         if let Err(error) = service.start(&logs, &deployment.logging) {
+            service.failed = true;
             eprintln!("service {} spawn failed: {error}", service.config.id);
             service.next_start =
                 Instant::now() + Duration::from_millis(deployment.restart_delay_ms);
@@ -389,21 +391,17 @@ pub async fn run(deployment: Deployment) -> Result<()> {
                     if let Some(child) = &mut service.child {
                         if child.try_wait()?.is_some() {
                             service.child = None;
+                            service.failed = true;
                             service.finish_logs().await?;
                             service.next_start = Instant::now()
                                 + Duration::from_millis(deployment.restart_delay_ms);
                         }
                     }
-                    if service.child.is_none()
-                        && !service.failed
-                        && Instant::now() >= service.next_start
-                    {
-                        if service.restarts >= deployment.restart_limit {
+                    if service.child.is_none() && Instant::now() >= service.next_start {
+                        service.restarts = service.restarts.saturating_add(1);
+                        if let Err(error) = service.start(&logs, &deployment.logging) {
                             service.failed = true;
-                            continue;
-                        }
-                        service.restarts += 1;
-                        if service.start(&logs, &deployment.logging).is_err() {
+                            eprintln!("service {} spawn failed: {error}", service.config.id);
                             service.next_start = Instant::now()
                                 + Duration::from_millis(deployment.restart_delay_ms);
                         }

@@ -3,7 +3,6 @@ package_dir: /opt/adx/current
 state_dir: /opt/adx/run/node
 redis_url: redis://redis.internal:6379/
 namespace: adx
-restart_limit: 3
 restart_delay_ms: 1000
 stop_timeout_seconds: 90
 services:

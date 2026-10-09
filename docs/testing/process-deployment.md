@@ -37,7 +37,7 @@ adxctl stop
 
 ## 进程和停止契约
 
-默认启动顺序为 Redis → Coordinator → adxlet（含内嵌 Proxy）→ API Server（含内嵌 Ingress）。显式分进程时，独立 Relay 在 adxlet 前启动，独立 Ingress 在 API Server 后启动。该顺序只安排进程拉起；组件通过已有发现和对账握手达到就绪。异常退出按配置延迟重启，超过本次 supervisor 生命周期的预算后标记失败，其他角色保持运行；不会假装故障组件已就绪。初次 spawn 失败同样进入有限重试。
+默认启动顺序为 Redis → Coordinator → adxlet（含内嵌 Proxy）→ API Server（含内嵌 Ingress）。显式分进程时，独立 Relay 在 adxlet 前启动，独立 Ingress 在 API Server 后启动。该顺序只安排进程拉起；组件通过已有发现和对账握手达到就绪。进程退出或 spawn 失败后按 `restart_delay_ms` 持续重试，其他角色保持运行。状态中的 `restarts` 只记录重试次数，`failed` 表示当前退出或启动失败状态，成功启动后清除；进程存活仍不代表业务就绪。
 
 显式 `stop` 和 supervisor 收到 SIGTERM／SIGINT 都执行：
 
@@ -88,7 +88,7 @@ package/
 ## 验证边界
 
 - TDD 首先确认 `drain`／`is_draining` 接口缺失；随后测试删除提交失败、重试只补提交、未对账拒绝停止、新分配拒绝。
-- supervisor 测试运行真实子进程和 UDS，检查重复启动排他、重启预算、清理失败时依赖存活、再次停止成功。
+- supervisor 测试运行真实子进程和 UDS，检查重复启动排他、连续退出后仍可恢复、清理失败时依赖存活、再次停止成功。
 - 真实包 smoke 托管真实 Redis＋Coordinator，检查 Redis 地址发布、Coordinator 强制退出后的新 PID／新 epoch，以及 `adxctl stop` 后 supervisor 退出。
 - API Server 通过根 Cargo workspace 编译与测试；原有 HTTPS／RPC／Redis 协作套件继续回归。
 

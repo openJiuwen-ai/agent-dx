@@ -110,7 +110,7 @@ def _fetch_request(request, ca_path):
     raise TimeoutError(f"forwarded port was not ready: {last_error}")
 
 
-def run(connection, image, output, ca_path):
+def run(connection, image, output, ca_path, *, runtime='runc', node_ids=('node1', 'node2')):
     # Keep module-level protocol helpers dependency-free so the CI driver
     # contract suite does not depend on an installed public SDK. The real
     # functional case runs inside the packaged client environment and imports
@@ -147,9 +147,9 @@ def run(connection, image, output, ca_path):
         started = begin('resources.current-capacity')
         discovered = resources(connection=connection)
         by_id = {node.id: node for node in discovered}
-        if not ({'node1', 'node2'}.issubset(by_id)):
+        if not set(node_ids).issubset(by_id):
             raise AssertionError(by_id)
-        for node_id in ('node1', 'node2'):
+        for node_id in node_ids:
             node = by_id[node_id]
             if not (node.status == 0):
                 raise AssertionError(node)  # Public resources contract: 0 is accepting allocations.
@@ -167,15 +167,16 @@ def run(connection, image, output, ca_path):
         started = begin('sandbox.create-query-reattach')
         sandbox = Sandbox(
             image=image,
-            runtime='runc',
+            runtime=runtime,
             cpu=500,
             memory=512,
             idle_timeout=0,
             env={'E2E_FUNCTIONAL_ENV': 'functional'},
             cwd='/tmp',
             labels={'adx.e2e': 'data-plane'},
-            node_id='node1',
+            node_id=node_ids[0],
             port_forwardings=[PORT],
+            data_plane_security=DataPlaneSecurityPolicy(port_forward_mode='tls-token'),
             connection=connection,
             create_timeout=150,
         )
@@ -446,11 +447,11 @@ def run(connection, image, output, ca_path):
         started = begin('port-forward.per-instance-tls-route')
         security_sandbox = Sandbox(
             image=image,
-            runtime='runc',
+            runtime=runtime,
             cpu=500,
             memory=512,
             idle_timeout=0,
-            node_id='node1',
+            node_id=node_ids[0],
             port_forwardings=[TLS_PORT],
             data_plane_security=DataPlaneSecurityPolicy(port_forward_mode='tls'),
             connection=connection,
@@ -474,11 +475,11 @@ def run(connection, image, output, ca_path):
         upstream_port = tunnel_upstream.server_address[1]
         tunnel_sandbox = Sandbox(
             image=image,
-            runtime='runc',
+            runtime=runtime,
             cpu=500,
             memory=512,
             idle_timeout=0,
-            node_id='node1',
+            node_id=node_ids[0],
             upstream=f'http://127.0.0.1:{upstream_port}',
             connection=connection,
             create_timeout=150,

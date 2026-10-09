@@ -125,3 +125,15 @@ deadline、命令提交／Watch／查询故障、registry 容量、能力协商�
 
 仍需补充：真实旧版 Execd 能力协商、快照分页／过期／引用删除、真实 storage/XPU profile，
 以及活动期间不触发空闲回收的独立故障注入。Firecracker 双克隆问题和多 VM 实机验收继续单列。
+
+## 集群运行夹具
+
+`build/e2e/functional_data_plane.py` 的 `run` 支持显式传入 `runtime` 与
+`node_ids`。默认仍为两节点基础流水线的 `runc`、`node1/node2`；集群运行应从
+`resources` 中选择实际可准入节点，不能把基础流水线的节点名当成部署要求。
+
+该组显式创建 `tls-token` 和 `tls` 两种端口安全策略的实例，避免依赖部署默认值。
+Host 子域名断言要求 Ingress 配置 `ADX_DATA_PLANE_INGRESS_PORT_HOST_DOMAIN=example.test`。
+测试端设置 Host 头不能替代服务端配置。HTTPS 客户端使用证书 SAN 覆盖的地址与公共 CA，
+不得关闭校验来掩盖域名错误。单次组通过只验证本组执行的操作，快照目录、暂停恢复、
+故障接管以及特殊存储/设备依赖仍按表中的独立组验收。

@@ -77,6 +77,8 @@ API Server 把合并后的配置放入 `EnvironmentSpec.runtime_profile`（`Runt
 
 Execd 在 Linux PID 1 场景内置进程回收：单线程启动阶段 fork 实际服务进程，PID 1 转发信号并回收已退出的孤儿；HTTP/命令/PTY 服务子进程保留自身的子进程等待逻辑。主服务退出后返回对应退出码（信号退出为 `128+signal`）。非 PID 1 启动维持原行为，孤儿由所在环境的 init 管理。
 
+Kata 的 PTY 同样由 guest 内的 Execd 分配。adxlet 在 Kata 创建请求中为 `/dev/pts` 添加独立的 `devpts` 挂载，由执行后端在创建容器时准备；无需在 guest 中授予 `CAP_SYS_ADMIN` 或自行执行 mount。若请求已有 `/dev/pts` 挂载，保留该配置，由配置者保证终端设备可用。其他 runtime 的终端准备保持各自后端行为。旧节点侧 `sbox exec -t` 的运行时终端路径与 Execd 原生 PTY 不同；对照及回归证据见 [Kata 定位记录](../testing/2026-10-09-h2-close-and-acl.md#kata-旧镜像对照)。
+
 发布构建需要原生 musl Rust target、musl C 工具链、`busybox-static`、`erofs-utils` 和 `readelf`。`build/runtime/rootfs.py` 拒绝带动态解释器的 Execd/BusyBox，再生成并检查 EROFS。构建示例与进程部署见 [standalone](standalone.md)。
 
 使用 EROFS 配置的节点必须支持从普通文件创建只读 loop 设备并实际挂载 EROFS。`/proc/filesystems` 中出现 `erofs` 只表示驱动已登记，不足以证明该内核构建和设备路径可用；对应 preflight 会对发布包内制品执行一次真实挂载和卸载。OCI 配置不要求 EROFS，仍要求 sandboxd 能访问并解析配置的 digest 引用。Buildkite K8s 验收使用 OCI 模式；本地与 standalone 验证继续覆盖 EROFS 模式。
