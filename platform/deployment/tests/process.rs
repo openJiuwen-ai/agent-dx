@@ -14,7 +14,7 @@ use std::{
     time::Duration,
 };
 fn test_deployment(root: &Path, services: serde_json::Value) -> Deployment {
-    serde_json::from_value(json!({"schema_version":1,"package_dir":root,"state_dir":root.join("state"),"redis_url":"redis://localhost:6379/","namespace":"test","restart_limit":2,"restart_delay_ms":20,"stop_timeout_seconds":1,"services":services})).unwrap()
+    serde_json::from_value(json!({"schema_version":1,"package_dir":root,"state_dir":root.join("state"),"redis_url":"redis://localhost:6379/","namespace":"test","restart_delay_ms":20,"stop_timeout_seconds":1,"services":services})).unwrap()
 }
 fn install_test_binary(root: &Path, name: &str, script: &str) {
     std::fs::create_dir_all(root.join("bin")).unwrap();
@@ -50,13 +50,17 @@ fn service_status<'a>(status: &'a serde_json::Value, service_id: &str) -> &'a se
 }
 
 #[tokio::test]
-async fn restart_budget_lock_and_scoped_stop() {
+async fn repeated_exits_keep_restarting_until_recovery_and_scoped_stop() {
     let temp_directory = tempfile::Builder::new()
         .prefix("adx-p-")
         .tempdir_in("/tmp")
         .unwrap();
     let root = temp_directory.path();
-    install_test_binary(root, "adx-coordinator", "#!/bin/sh\nexit 1\n");
+    install_test_binary(
+        root,
+        "adx-coordinator",
+        "#!/bin/sh\ncounter=\"$0.attempts\"\nn=0\n[ ! -f \"$counter\" ] || n=$(cat \"$counter\")\nn=$((n+1))\necho \"$n\" > \"$counter\"\n[ \"$n\" -gt 6 ] || exit 1\nexec sleep 100\n",
+    );
     install_test_binary(root, "adx-apiserver", "#!/bin/sh\nexec sleep 100\n");
     let services =
         json!([{"id":"coordinator","role":"coordinator"},{"id":"api","role":"apiserver"}]);
@@ -67,14 +71,21 @@ async fn restart_budget_lock_and_scoped_stop() {
     assert!(supervisor::run(test_deployment(root, services))
         .await
         .is_err());
-    tokio::time::timeout(Duration::from_secs(5), async {
+    let recovery = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let status = wait_until_ready(&state_directory).await;
             let coordinator = service_status(&status, "coordinator");
-            if coordinator.get("failed") == Some(&serde_json::Value::Bool(true)) {
+            if coordinator
+                .get("restarts")
+                .and_then(serde_json::Value::as_u64)
+                .is_some_and(|count| count >= 6)
+                && coordinator
+                    .get("pid")
+                    .is_some_and(serde_json::Value::is_number)
+            {
                 assert_eq!(
-                    coordinator.get("restarts"),
-                    Some(&serde_json::Value::from(2))
+                    coordinator.get("failed"),
+                    Some(&serde_json::Value::Bool(false))
                 );
                 assert!(service_status(&status, "api")
                     .get("pid")
@@ -84,14 +95,56 @@ async fn restart_budget_lock_and_scoped_stop() {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
-    .await
-    .unwrap();
+    .await;
     supervisor::request(&state_directory, Request::Stop, Duration::from_secs(5))
         .await
         .unwrap();
     supervisor_task.await.unwrap().unwrap();
     assert!(!state_directory.join("supervisor.sock").exists());
+    recovery.expect("service must recover after more than six consecutive exits");
 }
+#[tokio::test]
+async fn spawn_failures_keep_retrying_and_clear_failure_after_recovery() {
+    let temp_directory = tempfile::Builder::new()
+        .prefix("adx-spawn-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let root = temp_directory.path();
+    // Executable validation succeeds; the missing interpreter makes spawn fail.
+    install_test_binary(root, "adx-coordinator", "#!/adx-missing-interpreter\n");
+    let deployment = test_deployment(root, json!([{"id":"coordinator","role":"coordinator"}]));
+    let state_directory = deployment.state_dir.clone();
+    let supervisor_task = tokio::spawn(supervisor::run(deployment));
+    let recovery = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut repaired = false;
+        loop {
+            let status = wait_until_ready(&state_directory).await;
+            let service = service_status(&status, "coordinator");
+            if !repaired
+                && service
+                    .get("restarts")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some_and(|count| count >= 6)
+            {
+                assert_eq!(service.get("failed"), Some(&serde_json::Value::Bool(true)));
+                assert_eq!(service.get("pid"), Some(&serde_json::Value::Null));
+                install_test_binary(root, "adx-coordinator", "#!/bin/sh\nexec sleep 100\n");
+                repaired = true;
+            } else if repaired && service.get("pid").is_some_and(serde_json::Value::is_number) {
+                assert_eq!(service.get("failed"), Some(&serde_json::Value::Bool(false)));
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    supervisor::request(&state_directory, Request::Stop, Duration::from_secs(5))
+        .await
+        .unwrap();
+    supervisor_task.await.unwrap().unwrap();
+    recovery.expect("spawn retries must continue until the executable becomes runnable");
+}
+
 struct NodeAdmin(Arc<AtomicBool>);
 #[tonic::async_trait]
 impl pb::node_admin_service_server::NodeAdminService for NodeAdmin {

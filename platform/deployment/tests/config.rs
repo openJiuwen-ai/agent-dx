@@ -7,7 +7,6 @@ package_dir: /opt/adx
 state_dir: /run/adx/test
 redis_url: redis://127.0.0.1:6379/
 namespace: test
-restart_limit: 2
 restart_delay_ms: 1000
 stop_timeout_seconds: 30
 services:
@@ -17,7 +16,7 @@ services:
 "#;
 
 fn test_deployment(root: &std::path::Path) -> Deployment {
-    serde_json::from_value(json!({"schema_version":1,"package_dir":root,"state_dir":root,"redis_url":"redis://localhost:6379/","namespace":"test","restart_limit":2,"restart_delay_ms":20,"stop_timeout_seconds":3,"services":[{"id":"node","role":"adxlet","config":{"discovery":{"namespace":"wrong"},"proxy_socket":root.join("route.sock")},"env":{"ADX_DATA_PLANE_RELAY_ACTIVITY_UDS_DIR":root}},{"id":"coordinator","role":"coordinator","config":{}}]})).unwrap()
+    serde_json::from_value(json!({"schema_version":1,"package_dir":root,"state_dir":root,"redis_url":"redis://localhost:6379/","namespace":"test","restart_delay_ms":20,"stop_timeout_seconds":3,"services":[{"id":"node","role":"adxlet","config":{"discovery":{"namespace":"wrong"},"proxy_socket":root.join("route.sock")},"env":{"ADX_DATA_PLANE_RELAY_ACTIVITY_UDS_DIR":root}},{"id":"coordinator","role":"coordinator","config":{}}]})).unwrap()
 }
 
 #[test]
@@ -664,7 +663,7 @@ fn unified_deployment_renders_control_and_data_plane_services() {
 
 #[test]
 fn deployment_accepts_bounded_log_rotation_policy() {
-    let deployment: Deployment = serde_json::from_value(json!({"schema_version":1,"package_dir":"/tmp/package","state_dir":"/tmp/state","redis_url":"redis://localhost:6379/","namespace":"test","restart_limit":2,"restart_delay_ms":20,"stop_timeout_seconds":3,"services":[{"id":"coordinator","role":"coordinator","config":{}}],"logging":{"enabled":true,"max_file_bytes":1024,"rotate_seconds":60,"compress":true,"max_files":4,"max_age_seconds":3600,"max_total_bytes":8192}})).unwrap();
+    let deployment: Deployment = serde_json::from_value(json!({"schema_version":1,"package_dir":"/tmp/package","state_dir":"/tmp/state","redis_url":"redis://localhost:6379/","namespace":"test","restart_delay_ms":20,"stop_timeout_seconds":3,"services":[{"id":"coordinator","role":"coordinator","config":{}}],"logging":{"enabled":true,"max_file_bytes":1024,"rotate_seconds":60,"compress":true,"max_files":4,"max_age_seconds":3600,"max_total_bytes":8192}})).unwrap();
     deployment.validate().unwrap();
 }
 

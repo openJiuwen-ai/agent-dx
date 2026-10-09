@@ -65,6 +65,8 @@ SSE 创建的 `final` 事件保留 `errorCode` 数值字段，并携带同一个
 
 同一个 gRPC 状态可能映射成不同稳定码。例如 `Unavailable` 在写请求尚未提交时是 `UNAVAILABLE`，在 Adxlet 已经接受创建或生命周期操作后是 `OUTCOME_UNKNOWN`。API Server 根据请求是否越过执行边界作出映射；SDK 不重新猜测。
 
+内部 RPC 的连接拒绝、连接重置等传输不可用返回 HTTP 503。Tonic 在握手或重连期间将部分连接重置报告为 `Unknown / transport error` 或带有传输来源的 `Cancelled`；API Server 仅在错误来源链包含 `tonic::transport::Error` 时归一为 `Unavailable`，不会把应用返回的 `Unknown`、`Cancelled` 或 `Internal` 一律改成 503。RPC 超时仍返回 504。写请求的结果可能未知，重试必须沿用原 Request ID、Operation ID、Environment ID 和归属代次；连接失败不能作为释放归属或换 ID 重建的依据。
+
 ### 创建重放缓存
 
 生命周期操作的重试身份表不以 `cache_entries` 为准入限制，不会因为保留的操作记录多而返回 429；实际节点资源或准入拒绝仍按原错误契约处理。

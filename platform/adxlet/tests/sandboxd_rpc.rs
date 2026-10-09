@@ -288,6 +288,67 @@ fn spec() -> EnvironmentSpec {
 }
 
 #[test]
+fn kata_start_prepares_guest_pty_without_privileged_guest_capabilities() {
+    let mut spec = spec();
+    spec.runtime_class = "kata".into();
+    let request = start_request(&spec, "i-1", 1, &[], &Config::default()).unwrap();
+    let pts = request
+        .mounts
+        .iter()
+        .find(|mount| mount.target == "/dev/pts")
+        .expect("guest-native PTY requires an OCI devpts mount");
+    assert_eq!(pts.r#type, "devpts");
+    assert_eq!(pts.source, Some(mount::Source::HostPath("devpts".into())));
+    for option in [
+        "newinstance",
+        "ptmxmode=0666",
+        "mode=0620",
+        "gid=5",
+        "nosuid",
+        "noexec",
+    ] {
+        assert!(pts.options.iter().any(|value| value == option));
+    }
+}
+
+#[test]
+fn kata_start_preserves_explicit_terminal_mount() {
+    let mut spec = spec();
+    spec.runtime_class = "kata".into();
+    spec.sandbox.mounts.push(adx_core::sandbox::Mount {
+        kind: "bind".into(),
+        target: "/dev/pts".into(),
+        options: vec!["rbind".into()],
+        source: adx_core::sandbox::StorageSource::Local("/runtime/pts".into()),
+    });
+    let request = start_request(&spec, "i-1", 1, &[], &Config::default()).unwrap();
+    let mounts: Vec<_> = request
+        .mounts
+        .iter()
+        .filter(|mount| mount.target == "/dev/pts")
+        .collect();
+    assert_eq!(mounts.len(), 1);
+    assert_eq!(mounts[0].r#type, "bind");
+    assert_eq!(
+        mounts[0].source,
+        Some(mount::Source::HostPath("/runtime/pts".into()))
+    );
+}
+
+#[test]
+fn other_runtimes_keep_their_terminal_preparation() {
+    for runtime in ["runsc", "runc", "firecracker"] {
+        let mut spec = spec();
+        spec.runtime_class = runtime.into();
+        let request = start_request(&spec, "i-1", 1, &[], &Config::default()).unwrap();
+        assert!(!request
+            .mounts
+            .iter()
+            .any(|mount| mount.target == "/dev/pts"));
+    }
+}
+
+#[test]
 fn start_maps_public_sandbox_contract_to_backend_protocol() {
     use adx_core::sandbox as model;
     let mut spec = spec();
@@ -1182,4 +1243,56 @@ async fn blocked_policy_preserves_only_node_control_endpoint_at_start_and_update
         .rules
         .iter()
         .any(|r| r.direction == NetworkDirection::Both as i32 && r.sandbox_port_range.is_none()));
+}
+
+#[tokio::test]
+async fn stateful_policy_keeps_execd_replies_independent_of_conntrack_generation() {
+    use adx_core::sandbox as model;
+    let policy = model::NetworkPolicy {
+        traffic: Some(model::TrafficPolicy {
+            ingress_default_action: model::NetworkAction::Deny,
+            egress_default_action: model::NetworkAction::Deny,
+            rules: vec![],
+            mode: model::TrafficMode::Stateful,
+        }),
+        dns: None,
+    };
+    let mut spec = spec();
+    spec.sandbox.network = Some(policy.clone());
+    let server = Server::default();
+    let (adapter, _harness) = connect(server.clone()).await;
+    adapter.start(&spec, "i-1", 1, &[]).await.unwrap();
+    adapter
+        .set_network_policy("i-1", Some(&policy), &[])
+        .await
+        .unwrap();
+    let starts = server.starts.lock().unwrap();
+    let updates = server.network_updates.lock().unwrap();
+    for policy in [
+        starts[0].network_policy.as_ref().unwrap(),
+        updates[0].network_policy.as_ref().unwrap(),
+    ] {
+        let traffic = policy.traffic.as_ref().unwrap();
+        assert_eq!(
+            traffic.ingress_default_action,
+            NetworkPolicyAction::Deny as i32
+        );
+        assert_eq!(
+            traffic.egress_default_action,
+            NetworkPolicyAction::Deny as i32
+        );
+        assert!(
+            traffic.rules.iter().any(|rule| {
+                rule.action == NetworkPolicyAction::Allow as i32
+                    && rule.direction == NetworkDirection::Both as i32
+                    && rule.protocol == NetworkProtocol::Tcp as i32
+                    && rule.priority == u32::MAX
+                    && rule
+                        .sandbox_port_range
+                        .as_ref()
+                        .is_some_and(|range| range.first == 50090 && range.last == 50090)
+            }),
+            "Execd replies must survive updates to the stateful policy generation"
+        );
+    }
 }

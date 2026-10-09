@@ -407,7 +407,6 @@ d = {
     'state_dir': str(P / 'state'),
     'redis_url': f'redis://:{redis_key.read_text().strip()}@{redis_host}:6379/',
     'namespace': 'acceptance',
-    'restart_limit': 3,
     'restart_delay_ms': 1000,
     'stop_timeout_seconds': 30,
     'services': services,
