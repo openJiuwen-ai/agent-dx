@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-for flag in ADX_OBS_UPLOAD ADX_ARM_OBS_UPLOAD ADX_ADMIN_PYPI_UPLOAD ADX_SDK_PYPI_UPLOAD; do
+for flag in ADX_ARM_TESTS ADX_OBS_UPLOAD ADX_ARM_OBS_UPLOAD ADX_ADMIN_PYPI_UPLOAD ADX_SDK_PYPI_UPLOAD; do
   value=${!flag:-0}
   [[ $value == 0 || $value == 1 ]] || { echo "$flag must be 0 or 1" >&2; exit 2; }
 done

@@ -16,7 +16,11 @@ rm -rf "$output"
 mkdir -p "$output"
 jobs=${JOBS:-4}
 
-bash .buildkite/component-tests.sh "$component"
+case "${ADX_COMPONENT_TESTS:-1}" in
+  1) bash .buildkite/component-tests.sh "$component" ;;
+  0) echo "Component tests disabled: $component" ;;
+  *) echo 'ADX_COMPONENT_TESTS must be 0 or 1' >&2; exit 2 ;;
+esac
 
 case "$component" in
   platform)

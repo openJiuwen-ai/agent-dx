@@ -1,5 +1,5 @@
 steps:
-- label: ':rust: Test and package Platform'
+- label: Build · Platform · Linux x86_64
   key: build-platform
   agents:
     queue: default
@@ -55,7 +55,7 @@ steps:
           hostPath:
             path: /mnt/paas
             type: DirectoryOrCreate
-- label: ':rust: Test and package Gateway'
+- label: Build · Gateway · Linux x86_64
   key: build-gateway
   agents:
     queue: default
@@ -77,7 +77,7 @@ steps:
     GOCACHE: /mnt/paas/build-cache/adx/go-build/amd64
     GOMODCACHE: /mnt/paas/build-cache/adx/go-mod
   plugins: *id001
-- label: ':rust: Test and package EXECD'
+- label: Build · Execd · Linux x86_64
   key: build-execd
   agents:
     queue: default
@@ -99,7 +99,58 @@ steps:
     GOCACHE: /mnt/paas/build-cache/adx/go-build/amd64
     GOMODCACHE: /mnt/paas/build-cache/adx/go-mod
   plugins: *id001
-- label: ':test_tube: Source and Rust gate'
+- label: Build · Platform · Linux ARM64
+  key: build-platform-arm64
+  agents:
+    queue: default
+    os: macos
+    arch: arm64
+  concurrency: 1
+  concurrency_group: adx/native-arm64
+  command: python3 .buildkite/with_registry.py --docker -- bash .buildkite/build-arm-package.sh build platform
+  secrets:
+    SWR_DOCKER_CONFIG_JSON: ADX_SWR_PULL_CONFIG
+  timeout_in_minutes: 60
+  artifact_paths:
+  - out/buildkite/arm64/logs/**/*
+  - out/buildkite/arm64/components/*.tar.gz
+  env:
+    JOBS: '4'
+- label: Build · Gateway · Linux ARM64
+  key: build-gateway-arm64
+  agents:
+    queue: default
+    os: macos
+    arch: arm64
+  concurrency: 1
+  concurrency_group: adx/native-arm64
+  command: python3 .buildkite/with_registry.py --docker -- bash .buildkite/build-arm-package.sh build gateway
+  secrets:
+    SWR_DOCKER_CONFIG_JSON: ADX_SWR_PULL_CONFIG
+  timeout_in_minutes: 60
+  artifact_paths:
+  - out/buildkite/arm64/logs/**/*
+  - out/buildkite/arm64/components/*.tar.gz
+  env:
+    JOBS: '4'
+- label: Build · Execd · Linux ARM64
+  key: build-execd-arm64
+  agents:
+    queue: default
+    os: macos
+    arch: arm64
+  concurrency: 1
+  concurrency_group: adx/native-arm64
+  command: python3 .buildkite/with_registry.py --docker -- bash .buildkite/build-arm-package.sh build execd
+  secrets:
+    SWR_DOCKER_CONFIG_JSON: ADX_SWR_PULL_CONFIG
+  timeout_in_minutes: 60
+  artifact_paths:
+  - out/buildkite/arm64/logs/**/*
+  - out/buildkite/arm64/components/*.tar.gz
+  env:
+    JOBS: '4'
+- label: Quality · Source
   key: source-gate
   agents:
     queue: default
@@ -142,7 +193,7 @@ steps:
           hostPath:
             path: /mnt/paas
             type: DirectoryOrCreate
-- label: ':python: Test and package adxadmin'
+- label: Python · adxadmin
   key: admin-package
   agents:
     queue: default
@@ -208,7 +259,7 @@ steps:
           hostPath:
             path: /mnt/paas
             type: DirectoryOrCreate
-- label: ':python: Test and package ADX Sandbox SDK'
+- label: Python · Sandbox SDK
   key: sdk-package
   agents:
     queue: default
@@ -271,7 +322,7 @@ steps:
           hostPath:
             path: /mnt/paas
             type: DirectoryOrCreate
-- label: ':package: Assemble and publish ADX base package'
+- label: Release · Assemble · Linux x86_64
   key: platform-build
   depends_on:
   - build-platform
@@ -309,23 +360,27 @@ steps:
     GOCACHE: /mnt/paas/build-cache/adx/go-build/amd64
     GOMODCACHE: /mnt/paas/build-cache/adx/go-mod
     ADX_BACKEND_ARTIFACT_BUILD: 01a0ad6d-9629-4da8-903b-3f8bd1ddc992
+    ADX_DEFER_PUBLICATION: '1'
   plugins: *id001
-- label: ':rust: ARM64 tests, package and install smoke'
+- label: Release · Assemble · Linux ARM64
   key: platform-build-arm64
   depends_on:
+  - build-platform-arm64
+  - build-gateway-arm64
+  - build-execd-arm64
+  - source-gate
   - sdk-package
   - admin-package
-  - source-gate
   agents:
     queue: default
     os: macos
     arch: arm64
   concurrency: 1
-  concurrency_group: adx/package-arm64
-  command: python3 .buildkite/with_registry.py --docker -- bash .buildkite/build-arm-package.sh
+  concurrency_group: adx/native-arm64
+  command: python3 .buildkite/with_registry.py --docker -- bash .buildkite/build-arm-package.sh package
   secrets:
     SWR_DOCKER_CONFIG_JSON: ADX_SWR_PULL_CONFIG
-  timeout_in_minutes: 90
+  timeout_in_minutes: 20
   artifact_paths:
   - out/buildkite/arm64/logs/**/*
   - out/buildkite/arm64/*.tar.gz
@@ -336,7 +391,22 @@ steps:
   - out/buildkite/arm64/admin/*
   env:
     JOBS: '4'
-- label: ':cloud: Publish ARM64 packages to OBS'
+- label: Release · Publish · Linux x86_64
+  key: publish-amd64
+  depends_on: platform-build
+  agents:
+    queue: default
+    os: linux
+    arch: amd64
+  command: bash .buildkite/step.sh obs-amd64 bash .buildkite/publish-amd-package.sh
+  timeout_in_minutes: 20
+  artifact_paths:
+  - out/buildkite/obs/*
+  - out/buildkite/logs/**/*
+  env:
+    BUILDKITE_AGENT_NAME: agent-stack-k8s
+  plugins: *id001
+- label: Release · Publish · Linux ARM64
   key: publish-arm64
   depends_on: platform-build-arm64
   agents:
@@ -351,7 +421,7 @@ steps:
   env:
     BUILDKITE_AGENT_NAME: agent-stack-k8s
   plugins: *id001
-- label: ':page_facing_up: ARM64 artifact manifest'
+- label: Release · Index · Linux ARM64
   key: artifact-manifest-arm64
   depends_on: publish-arm64
   agents:
@@ -366,9 +436,9 @@ steps:
     ADX_BUILD_ARCH: arm64
     BUILDKITE_AGENT_NAME: agent-stack-k8s
   plugins: *id001
-- label: ':page_facing_up: Artifact manifest'
+- label: Release · Index · Linux x86_64
   key: artifact-manifest
-  depends_on: platform-build
+  depends_on: publish-amd64
   agents:
     queue: default
     os: linux
@@ -394,7 +464,7 @@ steps:
             limits:
               cpu: '2'
               memory: 2Gi
-- label: ':docker: Compose L0 smoke images'
+- label: Acceptance · Build Images
   key: platform-images
   agents:
     queue: default
@@ -461,8 +531,10 @@ steps:
         volumes:
         - name: docker-graph
           emptyDir: {}
-  depends_on: platform-build
-- label: ':kubernetes: L0 SDK and authentication smoke'
+  depends_on:
+  - platform-build
+  - publish-amd64
+- label: Acceptance · Kubernetes L0
   key: platform-e2e
   depends_on: platform-images
   agents:
@@ -511,7 +583,7 @@ steps:
                 name: swr-pull-secret
                 key: .dockerconfigjson
                 optional: true
-- label: ':pypi: Publish adxadmin'
+- label: Publish · adxadmin · PyPI
   key: admin-pypi
   depends_on: platform-e2e
   if: build.env("ADX_ADMIN_PYPI_UPLOAD") == "1" && build.tag != null
@@ -564,7 +636,7 @@ steps:
           hostPath:
             path: /mnt/paas
             type: DirectoryOrCreate
-- label: ':pypi: Publish ADX Sandbox SDK'
+- label: Publish · Sandbox SDK · PyPI
   key: sdk-pypi
   depends_on: platform-e2e
   if: build.env("ADX_SDK_PYPI_UPLOAD") == "1" && build.tag != null

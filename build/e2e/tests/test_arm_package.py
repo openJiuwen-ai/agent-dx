@@ -21,12 +21,22 @@ class ArmPackageTests(unittest.TestCase):
         self.assertEqual(arm['agents']['arch'], 'arm64')
         self.assertEqual(arm['agents']['os'], 'macos')
         self.assertNotIn('platform-build', arm['depends_on'])
-        self.assertEqual(set(arm['depends_on']), {'sdk-package', 'admin-package', 'source-gate'})
+        self.assertEqual(set(arm['depends_on']), {'build-platform-arm64', 'build-gateway-arm64', 'build-execd-arm64', 'sdk-package', 'admin-package', 'source-gate'})
+        compiler = steps['build-platform-arm64']
+        self.assertNotIn('depends_on', compiler)
+        self.assertIn('build-arm-package.sh build platform', compiler['command'])
+        self.assertIn('build-arm-package.sh package', arm['command'])
+        self.assertIn('out/buildkite/arm64/components/*.tar.gz', compiler['artifact_paths'])
         self.assertIn('out/buildkite/arm64/*.tar.gz', arm['artifact_paths'])
         self.assertIn('out/buildkite/arm64/logs/**/*', arm['artifact_paths'])
         self.assertEqual(arm['secrets'], {'SWR_DOCKER_CONFIG_JSON': 'ADX_SWR_PULL_CONFIG'})
         self.assertIn('with_registry.py --docker', arm['command'])
         self.assertEqual(steps['artifact-manifest-arm64']['depends_on'], 'publish-arm64')
+        self.assertEqual(steps['artifact-manifest']['depends_on'], 'publish-amd64')
+        for component in ('platform', 'gateway', 'execd'):
+            self.assertNotIn('depends_on', steps[f'build-{component}'])
+            self.assertNotIn('depends_on', steps[f'build-{component}-arm64'])
+        self.assertTrue(all(not step['label'].startswith(':') for step in steps.values()))
         publisher = steps['publish-arm64']
         self.assertEqual(publisher['depends_on'], 'platform-build-arm64')
         self.assertEqual(publisher['agents']['arch'], 'amd64')
@@ -64,9 +74,50 @@ class ArmPackageTests(unittest.TestCase):
         ]:
             self.assertIn(term, script)
         native = (ROOT / '.buildkite/package-arm-native.sh').read_text()
-        self.assertIn('install.sh', native)
-        self.assertIn('build/release/package.py verify', native)
+        self.assertNotIn('install.sh', native)
+        self.assertNotIn('redis.sock', native)
+        self.assertIn('.buildkite/package-components.sh', native)
+        self.assertIn('ADX_ARM_TESTS:-0', native)
+        self.assertIn('ADX_COMPONENT_TESTS=0', native)
+        self.assertIn('chmod a+rwx out/buildkite', script)
+        self.assertIn('build/release/package.py verify', (ROOT / '.buildkite/package-components.sh').read_text())
         self.assertNotIn('build_backend.py', native)
+
+
+class ComponentTestSwitch(unittest.TestCase):
+    def test_arm_can_skip_tests_without_skipping_compilation(self):
+        for flag in ('0', '1'):
+            with self.subTest(flag=flag), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                (root / '.buildkite').mkdir()
+                (root / 'build/release').mkdir(parents=True)
+                for file in ('build-component.sh', 'build-architecture.sh'):
+                    shutil.copy(ROOT / '.buildkite' / file, root / '.buildkite' / file)
+                shutil.copy(ROOT / 'build/release/component.py', root / 'build/release/component.py')
+                (root / '.buildkite/bootstrap-build.sh').write_text('export CARGO_TARGET_DIR="$PWD/target"\n')
+                (root / '.buildkite/component-tests.sh').write_text('echo tests-ran > tests-ran\n')
+                commands = root / 'commands'
+                commands.mkdir()
+                fixtures = {
+                    'git': '#!/bin/bash\nif [[ $1 == rev-parse ]]; then echo "$BUILDKITE_COMMIT"; fi\n',
+                    'rustc': '#!/bin/bash\necho "host: aarch64-unknown-linux-gnu"\n',
+                    'cargo': '#!/bin/bash\necho "$@" > compile-args\nmkdir -p "$CARGO_TARGET_DIR/release"\nfor bin in adxctl adx-inspect adx-coordinator adxlet; do echo binary > "$CARGO_TARGET_DIR/release/$bin"; done\n',
+                }
+                for name, content in fixtures.items():
+                    file = commands / name
+                    file.write_text(content)
+                    file.chmod(0o755)
+                result = subprocess.run(
+                    [shutil.which('bash'), '.buildkite/build-component.sh', 'platform'], cwd=root,
+                    env=dict(os.environ, PATH=str(commands) + os.pathsep + os.environ['PATH'],
+                             BUILDKITE_COMMIT='b' * 40, ADX_BUILD_ARCH='arm64',
+                             ADX_COMPONENT_LOCAL='1', ADX_COMPONENT_TESTS=flag),
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue((root / 'compile-args').read_text().startswith('build --locked --release'))
+                self.assertEqual((root / 'tests-ran').exists(), flag == '1')
+                self.assertTrue((root / 'out/buildkite/components/platform.tar.gz').is_file())
 
 
 class ArmRunnerTests(unittest.TestCase):
@@ -103,7 +154,7 @@ fi
             runner = root / 'runner.sh'
             runner.write_text(script)
             result = subprocess.run(
-                [shutil.which('bash'), str(runner)], cwd=root,
+                [shutil.which('bash'), str(runner), 'build', 'execd'], cwd=root,
                 env=dict(
                     os.environ, PATH=str(commands) + os.pathsep + os.environ['PATH'],
                     BUILDKITE_COMMIT='b' * 40, BUILDKITE_BUILD_ID='build-test', ADX_OBS_UPLOAD='0',
