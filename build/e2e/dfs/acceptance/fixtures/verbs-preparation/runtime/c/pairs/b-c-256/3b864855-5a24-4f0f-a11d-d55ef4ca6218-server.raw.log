@@ -1,0 +1,77 @@
+verbose
+validate data
+size 256
+count 3
+port 19669
+server
+created cm_id 0xc490d30cbcf0
+rdma_bind_addr successful
+rdma_listen
+cma_event type RDMA_CM_EVENT_CONNECT_REQUEST cma_id 0xf3c088000ce0 (child)
+child cma 0xf3c088000ce0
+created pd 0xc490d30c0b80
+created channel 0xc490d30c0bc0
+created cq 0xc490d30cc5c0
+created qp 0xc490d30cc730
+rping_setup_buffers called on cb 0xc490d30be7c0
+allocated & registered buffers...
+accepting client connection request
+cq_thread started.
+cma_event type RDMA_CM_EVENT_ESTABLISHED cma_id 0xf3c088000ce0 (child)
+ESTABLISHED
+recv completion
+Received rkey 3970 addr bf309f41f580 len 256 from peer
+server received sink adv
+server posted rdma read req 
+rdma read completion
+server received read complete
+server ping data: rdma-ping-0: ABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyzABCDEFGHIJ
+server posted go ahead
+send completion
+recv completion
+Received rkey 38c9 addr bf309f41f430 len 256 from peer
+server received sink adv
+rdma write from lkey a7f laddr c490d30cc990 len 256
+rdma write completion
+server rdma write complete 
+server posted go ahead
+send completion
+recv completion
+Received rkey 3970 addr bf309f41f580 len 256 from peer
+server received sink adv
+server posted rdma read req 
+rdma read completion
+server received read complete
+server ping data: rdma-ping-1: BCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyzABCDEFGHIJK
+server posted go ahead
+send completion
+recv completion
+Received rkey 38c9 addr bf309f41f430 len 256 from peer
+server received sink adv
+rdma write from lkey a7f laddr c490d30cc990 len 256
+rdma write completion
+server rdma write complete 
+server posted go ahead
+send completion
+recv completion
+Received rkey 3970 addr bf309f41f580 len 256 from peer
+server received sink adv
+server posted rdma read req 
+rdma read completion
+server received read complete
+server ping data: rdma-ping-2: CDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyzABCDEFGHIJKL
+server posted go ahead
+send completion
+recv completion
+Received rkey 38c9 addr bf309f41f430 len 256 from peer
+server received sink adv
+rdma write from lkey a7f laddr c490d30cc990 len 256
+rdma write completion
+server rdma write complete 
+server posted go ahead
+send completion
+cma_event type RDMA_CM_EVENT_DISCONNECTED cma_id 0xf3c088000ce0 (child)
+server DISCONNECT EVENT...
+wait for RDMA_READ_ADV state 10
+rping_free_buffers called on cb 0xc490d30be7c0
+destroy cm_id 0xc490d30cbcf0

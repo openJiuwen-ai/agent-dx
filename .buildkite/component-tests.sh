@@ -10,6 +10,9 @@ case "$component" in
     packages=(adx-apiserver data-plane-gateway adx-agent-core adx-agent-store adx-agent-api adx-activator adx-cli)
     ;;
   execd) packages=(adx-execd) ;;
+  dfs)
+    packages=(afs afs-client afs-error afs-logging afs-metrics afs-protocol afs-tracing afs-transport)
+    ;;
   *) echo "unknown component: $component" >&2; exit 2 ;;
 esac
 args=()

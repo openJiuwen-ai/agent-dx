@@ -62,7 +62,7 @@ class ComponentManifestTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             components = root / "components"
-            for name in component.COMPONENTS:
+            for name in component.BASE_COMPONENTS:
                 directory = self.write_component(components, name)
                 component.create_manifest(
                     component=name,
@@ -94,6 +94,7 @@ class ComponentManifestTests(unittest.TestCase):
             )
 
             self.assertEqual(set(manifest["components"]), {"platform", "gateway", "execd"})
+            self.assertFalse(manifest["with_dfs"])
             self.assertEqual(manifest["package"]["archive"]["name"], release.name)
             self.assertEqual(manifest["sdk"]["name"], wheel.name)
             self.assertEqual(manifest["backend"]["manifest"]["name"], backend_manifest.name)
@@ -128,11 +129,103 @@ class ComponentManifestTests(unittest.TestCase):
                     backend_archive=backend_archive,
                 )
 
+    def test_build_manifest_rejects_dfs_component_when_off(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            components = root / "components"
+            for name in component.COMPONENTS:
+                directory = self.write_component(components, name)
+                component.create_manifest(
+                    component=name,
+                    directory=directory,
+                    commit="d" * 40,
+                    target="x86_64-unknown-linux-gnu",
+                )
+
+            release = root / "adx-release.tar.gz"
+            package_manifest = root / "release-manifest.json"
+            wheel = root / "adx_sandbox-0.1.0-py3-none-any.whl"
+            backend_manifest = root / "backend-manifest.json"
+            backend_archive = root / "backend.tar.gz"
+            release.write_bytes(b"release")
+            package_manifest.write_text(json.dumps({"commit": "d" * 40}))
+            wheel.write_bytes(b"wheel")
+            backend_manifest.write_text(json.dumps({"sandboxd_revision": "fixture"}))
+            backend_archive.write_bytes(b"backend archive")
+
+            manifest = component.create_build_manifest(
+                component_root=components,
+                commit="d" * 40,
+                target="x86_64-unknown-linux-gnu",
+                package_manifest=package_manifest,
+                release_archive=release,
+                wheel=wheel,
+                backend_manifest=backend_manifest,
+                backend_archive=backend_archive,
+            )
+
+            self.assertEqual(set(manifest["components"]), {"platform", "gateway", "execd"})
+            self.assertNotIn("dfs", manifest["components"])
+
+    def test_release_manifest_can_include_optional_dfs_component(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            components = root / "components"
+            for name in component.COMPONENTS:
+                directory = self.write_component(components, name)
+                component.create_manifest(
+                    component=name,
+                    directory=directory,
+                    commit="c" * 40,
+                    target="x86_64-unknown-linux-gnu",
+                )
+
+            release = root / "adx-release.tar.gz"
+            package_manifest = root / "release-manifest.json"
+            wheel = root / "adx_sandbox-0.1.0-py3-none-any.whl"
+            backend_manifest = root / "backend-manifest.json"
+            backend_archive = root / "backend.tar.gz"
+            release.write_bytes(b"release")
+            package_manifest.write_text(json.dumps({"commit": "c" * 40}))
+            wheel.write_bytes(b"wheel")
+            backend_manifest.write_text(json.dumps({"sandboxd_revision": "fixture"}))
+            backend_archive.write_bytes(b"backend archive")
+
+            manifest = component.create_build_manifest(
+                component_root=components,
+                commit="c" * 40,
+                target="x86_64-unknown-linux-gnu",
+                package_manifest=package_manifest,
+                release_archive=release,
+                wheel=wheel,
+                backend_manifest=backend_manifest,
+                backend_archive=backend_archive,
+                with_dfs=True,
+            )
+
+            self.assertEqual(set(manifest["components"]), {"platform", "gateway", "execd", "dfs"})
+            self.assertEqual(set(manifest["components"]["dfs"]["files"]), {"afs-meta", "afs-node"})
+            build_manifest = root / "build-manifest.json"
+            build_manifest.write_text(json.dumps(manifest))
+            extracted_package_manifest = root / "manifest.json"
+            extracted_package_manifest.write_bytes(package_manifest.read_bytes())
+            component.verify_build_manifest(
+                manifest_path=build_manifest,
+                commit="c" * 40,
+                target="x86_64-unknown-linux-gnu",
+                package_manifest=extracted_package_manifest,
+                release_archive=release,
+                wheel=wheel,
+                backend_manifest=backend_manifest,
+                backend_archive=backend_archive,
+                with_dfs=True,
+            )
+
     def test_mixed_component_commits_are_rejected(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             components = root / "components"
-            for index, name in enumerate(("platform", "gateway", "execd")):
+            for index, name in enumerate(component.BASE_COMPONENTS):
                 directory = self.write_component(components, name)
                 component.create_manifest(
                     component=name,

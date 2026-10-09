@@ -1,5 +1,26 @@
 [workspace]
 resolver = "2"
+default-members = [
+    "agent/crates/core",
+    "agent/crates/store",
+    "agent/activator",
+    "agent/api",
+    "agent/cli",
+    "gateway/apiserver",
+    "gateway",
+    "crates/error",
+    "crates/observability",
+    "crates/process",
+    "crates/transport",
+    "platform/runtime/execd",
+    "platform/crates/core",
+    "platform/crates/scheduling",
+    "platform/crates/protocol",
+    "platform/crates/discovery",
+    "platform/coordinator",
+    "platform/deployment",
+    "platform/adxlet",
+]
 members = [
     "agent/crates/core",
     "agent/crates/store",
@@ -20,6 +41,14 @@ members = [
     "platform/coordinator",
     "platform/deployment",
     "platform/adxlet",
+    "dfs",
+    "dfs/client",
+    "dfs/common/error",
+    "dfs/common/logging",
+    "dfs/common/metrics",
+    "dfs/common/protocol",
+    "dfs/common/tracing",
+    "dfs/common/transport",
 ]
 
 [workspace.package]

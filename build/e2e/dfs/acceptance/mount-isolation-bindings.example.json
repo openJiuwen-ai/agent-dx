@@ -1,0 +1,83 @@
+{
+  "schema_version": 1,
+  "bindings": [
+    {
+      "case_id": "FUN-13",
+      "profile": "smoke",
+      "matrix": {
+        "backend": "OwnerFs",
+        "meta": "memory"
+      },
+      "owner_mount": "/mnt/lima-afsbdata/afs-delivery/round3-managed-resource-v102/mount/ownerfs",
+      "dfs_mount": "/mnt/lima-afsbdata/afs-delivery/round3-managed-resource-v102/mount/dfs",
+      "owner_base_dir": "/mnt/lima-afsbdata/afs-delivery/round3-managed-resource-v102/mount/ownerfs/workspace-managed-resource-v102",
+      "dfs_base_dir": "/mnt/lima-afsbdata/afs-delivery/round3-managed-resource-v102/mount/dfs",
+      "node_process": {
+        "role": "node",
+        "pid": 175471,
+        "sha256": "<observed-afs-node-sha256>",
+        "config_path": "/mnt/lima-afsbdata/afs-delivery/round3-managed-resource-v102/etc/node.toml",
+        "config_sha256": "<observed-node-config-sha256>",
+        "boot_id": "<observed-node-boot-id>",
+        "start_ticks": "<observed-node-start-ticks>"
+      },
+      "meta_worker": {
+        "transport": "ssh",
+        "host": "afs-v97-ctl",
+        "ssh_config": "/home/lzc.guest/afs-suite-v102/auth/ssh_config",
+        "python": "/usr/bin/python3",
+        "driver": "/home/lzc.guest/afs-suite-v102/drivers/mount_isolation.py",
+        "expected_process": {
+          "role": "meta",
+          "pid": 1458467,
+          "sha256": "<observed-afs-meta-sha256>",
+          "config_path": "/mnt/lima-afsctlstate/afs-delivery/round3-managed-resource-v102/etc/meta.toml",
+          "config_sha256": "<observed-meta-config-sha256>",
+          "boot_id": "<observed-meta-boot-id>",
+          "start_ticks": "<observed-meta-start-ticks>"
+        }
+      },
+      "access_uid": 65534,
+      "access_gid": 65534
+    },
+    {
+      "case_id": "FUN-13",
+      "profile": "smoke",
+      "matrix": {
+        "backend": "DFS",
+        "meta": "memory"
+      },
+      "owner_mount": "/mnt/lima-afsbdata/afs-delivery/round3-managed-resource-v102/mount/ownerfs",
+      "dfs_mount": "/mnt/lima-afsbdata/afs-delivery/round3-managed-resource-v102/mount/dfs",
+      "owner_base_dir": "/mnt/lima-afsbdata/afs-delivery/round3-managed-resource-v102/mount/ownerfs/workspace-managed-resource-v102",
+      "dfs_base_dir": "/mnt/lima-afsbdata/afs-delivery/round3-managed-resource-v102/mount/dfs",
+      "node_process": {
+        "role": "node",
+        "pid": 175471,
+        "sha256": "<observed-afs-node-sha256>",
+        "config_path": "/mnt/lima-afsbdata/afs-delivery/round3-managed-resource-v102/etc/node.toml",
+        "config_sha256": "<observed-node-config-sha256>",
+        "boot_id": "<observed-node-boot-id>",
+        "start_ticks": "<observed-node-start-ticks>"
+      },
+      "meta_worker": {
+        "transport": "ssh",
+        "host": "afs-v97-ctl",
+        "ssh_config": "/home/lzc.guest/afs-suite-v102/auth/ssh_config",
+        "python": "/usr/bin/python3",
+        "driver": "/home/lzc.guest/afs-suite-v102/drivers/mount_isolation.py",
+        "expected_process": {
+          "role": "meta",
+          "pid": 1458467,
+          "sha256": "<observed-afs-meta-sha256>",
+          "config_path": "/mnt/lima-afsctlstate/afs-delivery/round3-managed-resource-v102/etc/meta.toml",
+          "config_sha256": "<observed-meta-config-sha256>",
+          "boot_id": "<observed-meta-boot-id>",
+          "start_ticks": "<observed-meta-start-ticks>"
+        }
+      },
+      "access_uid": 65534,
+      "access_gid": 65534
+    }
+  ]
+}

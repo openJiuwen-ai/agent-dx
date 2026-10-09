@@ -175,13 +175,31 @@ The root Cargo workspace contains the platform and Agent components. Python pack
 ```sh
 make help
 make rust-check
-cargo test --locked --workspace --all-features -j 2
+make rust-test
 make agent-test
 PYTHONPATH=platform/sdk/sandbox/python \
   python -m pytest -q -c platform/sdk/sandbox/pytest.ini \
   platform/sdk/sandbox/python/tests
 make package PYTHON=/path/to/venv/bin/python
 ```
+
+DFS/OwnerFs is an optional filesystem component imported from the DMS/AFS
+snapshot. Default builds, tests and packages exclude its runtime binaries and
+system dependencies. DFS-related changes still run the dedicated CI gate, which
+uses `ADX_WITH_DFS=1` for checks without injecting DFS artifacts into the
+default release. Set `ADX_WITH_DFS=1` when running the filesystem gate locally
+or building an explicit filesystem package:
+
+```sh
+ADX_WITH_DFS=1 make dfs-check
+ADX_WITH_DFS=1 make platform-release
+python3 build/ci/run.py dfs
+```
+
+`dfs-check` uses default OwnerFs and DFS features. The optional all-features/RDMA lint is explicit (`ADX_DFS_ALL_FEATURES=1 make dfs-lint`) and first checks for `libibverbs` development files.
+
+The current filesystem scope, validation boundary and unsupported items are in
+[DFS migration plan](docs/development/dfs-plan.md), [architecture](docs/architecture/dfs.md), [deployment](docs/deployment/dfs.md) and [testing](docs/testing/dfs.md). The packaged configuration examples live under [DFS examples](build/config/examples/dfs/). Ordinary release packages do not include them unless `ADX_WITH_DFS=1` is set.
 
 Run component and integration suites with `python3 build/ci/run.py <suite>`. End-to-end gates use installed release artifacts, the public Sandbox SDK, Redis, Gateway, the control plane, sandboxd, and Execd. Environment requirements and gate definitions are in [control-plane CI](docs/testing/control-plane-ci.md) and the [Kubernetes E2E guide](build/e2e/kubernetes/README.md).
 

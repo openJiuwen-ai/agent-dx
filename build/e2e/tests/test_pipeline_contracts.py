@@ -74,8 +74,9 @@ class PipelineContracts(unittest.TestCase):
         self.assertIn('.buildkite/artifact-manifest.sh', index['command'])
 
     def test_component_test_partition_covers_workspace_once(self):
-        workspace = (ROOT / 'Cargo.toml').read_text().split('[workspace.package]')[0]
-        members = re.findall(r'^\s+"([^"]+)",', workspace, re.M)
+        workspace = (ROOT / 'Cargo.toml').read_text()
+        default_members = workspace.split('default-members = [', 1)[1].split(']', 1)[0]
+        members = re.findall(r'^\s+"([^"]+)",', default_members, re.M)
         expected = {
             re.search(r'^name = "([^"]+)"', (ROOT / path / 'Cargo.toml').read_text(), re.M)[1] for path in members
         }
@@ -101,6 +102,107 @@ class PipelineContracts(unittest.TestCase):
         self.assertEqual(set(actual), expected)
         self.assertEqual(len(actual), len(expected))
 
+    def test_default_make_gates_exclude_dfs_packages(self):
+        makefile = (ROOT / 'Makefile').read_text()
+        for package in (
+            'afs',
+            'afs-client',
+            'afs-error',
+            'afs-logging',
+            'afs-metrics',
+            'afs-protocol',
+            'afs-tracing',
+            'afs-transport',
+        ):
+            self.assertIn(f'--exclude {package}', makefile)
+        self.assertIn('ADX_WITH_DFS ?= 0', makefile)
+        self.assertIn('ADX_DFS_ALL_FEATURES ?= 0', makefile)
+        self.assertIn('dfs-check: dfs-build dfs-lint dfs-test', makefile)
+        self.assertIn('dfs-all-features-lint:', makefile)
+        self.assertIn('pkg-config --exists libibverbs', makefile)
+        self.assertIn('dfs-build:\n\t$(CARGO) build --locked -p afs --bins', makefile)
+        self.assertNotIn('--bins --examples', makefile)
+
+
+    def test_platform_release_passes_make_dfs_mode_to_release_builder(self):
+        makefile = (ROOT / 'Makefile').read_text()
+        self.assertIn('ADX_WITH_DFS=$(ADX_WITH_DFS) bash build/release/build.sh', makefile)
+
+    def test_release_build_validates_dfs_mode_before_rust_probe(self):
+        script = (ROOT / 'build/release/build.sh').read_text()
+        validation = script.index('ADX_WITH_DFS must be 0 or 1')
+        root_resolution = script.index('root=$(cd')
+        rust_probe = script.index('rustc -vV')
+        dfs_compile = script.index('Compile DFS and OwnerFs')
+        linux_guard = script.index('ADX_WITH_DFS=1 requires a Linux release builder')
+        self.assertLess(validation, root_resolution)
+        self.assertLess(validation, rust_probe)
+        self.assertLess(linux_guard, dfs_compile)
+
+    def test_ci_runner_has_explicit_dfs_suite(self):
+        result = subprocess.run(
+            [
+                _executable('python3'),
+                str(ROOT / 'build/ci/run.py'),
+                'dfs',
+                '--list',
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        self.assertIn('ADX_WITH_DFS=1', result.stdout)
+        self.assertIn('ADX_DFS_ALL_FEATURES=1', result.stdout)
+        self.assertIn('dfs-check', result.stdout)
+
+    def test_dfs_gate_runs_when_base_is_unknown(self):
+        script = (ROOT / '.buildkite/dfs-gate.sh').read_text()
+        self.assertIn('No merge base available; running DFS optional gate conservatively.', script)
+        self.assertIn("changed='dfs/__unknown_base__'", script)
+        self.assertIn('BUILDKITE_COMMIT}^" >/dev/null 2>&1', script)
+        self.assertIn('ADX_WITH_DFS=1 ADX_DFS_ALL_FEATURES=1 make dfs-check', script)
+
+    def test_dfs_gate_tracks_integration_paths(self):
+        script = (ROOT / '.buildkite/dfs-gate.sh').read_text()
+        for path in (
+            'dfs/',
+            'build/e2e/dfs/',
+            'build/config/examples/dfs/',
+            'build/release/',
+            'platform/deployment/',
+            'Cargo\\.toml',
+            'Cargo\\.lock',
+            'rustfmt\\.toml',
+        ):
+            self.assertIn(path, script)
+
+    def test_dfs_gate_executes_conservatively_without_base_commit(self):
+        if shutil.which('git') is None:
+            self.skipTest('git is required to exercise dfs gate base detection')
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            (repo / '.buildkite').mkdir()
+            (repo / '.buildkite/dfs-gate.sh').write_text((ROOT / '.buildkite/dfs-gate.sh').read_text())
+            (repo / '.buildkite/bootstrap-build.sh').write_text('#!/usr/bin/env bash\n')
+            makefile = repo / 'Makefile'
+            makefile.write_text('dfs-check:\n\t@echo "$${ADX_WITH_DFS}:$${ADX_DFS_ALL_FEATURES}" > gate-ran\n')
+            subprocess.run(['git', 'init'], cwd=repo, capture_output=True, text=True, check=True)
+            subprocess.run(['git', 'config', 'user.email', 'ci@example.invalid'], cwd=repo, check=True)
+            subprocess.run(['git', 'config', 'user.name', 'CI'], cwd=repo, check=True)
+            subprocess.run(['git', 'add', '.'], cwd=repo, check=True)
+            subprocess.run(['git', 'commit', '-m', 'initial'], cwd=repo, capture_output=True, text=True, check=True)
+            commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=repo, text=True).strip()
+            result = subprocess.run(
+                [_executable('bash'), '.buildkite/dfs-gate.sh'],
+                cwd=repo,
+                env=dict(os.environ, BUILDKITE_COMMIT=commit, PATH=os.environ['PATH']),
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            self.assertIn('No merge base available; running DFS optional gate conservatively.', result.stdout)
+            self.assertEqual((repo / 'gate-ran').read_text().strip(), '1:1')
+
     def test_transport_rejects_unknown_value_before_network(self):
         result = subprocess.run(
             [
@@ -120,8 +222,15 @@ class PipelineContracts(unittest.TestCase):
 
         pipeline = yaml.safe_load((ROOT / '.buildkite/pipeline-package.yml').read_text())
         steps = {step['key']: step for step in pipeline['steps']}
+        self.assertIn('dfs-gate', steps)
+        self.assertEqual(steps['dfs-gate']['depends_on'], 'source-gate')
+        self.assertIn('build-dfs', steps)
+        self.assertEqual(steps['build-dfs']['if'], 'build.env("ADX_WITH_DFS") == "1"')
+        self.assertEqual(steps['build-dfs']['env']['ADX_WITH_DFS'], '1')
         self.assertIn('sdk-package', steps)
         self.assertIn('sdk-package', steps['platform-build']['depends_on'])
+        self.assertIn('dfs-gate', steps['platform-build']['depends_on'])
+        self.assertIn('build-dfs', steps['platform-build']['depends_on'])
         self.assertEqual(steps['platform-e2e']['env']['ADX_E2E_PROFILE'], 'l0')
         self.assertEqual(steps['platform-images']['depends_on'], 'platform-build')
         self.assertIn('out/buildkite/adx-execd.tar.gz', steps['platform-build']['artifact_paths'])
@@ -131,6 +240,11 @@ class PipelineContracts(unittest.TestCase):
         assemble = (ROOT / '.buildkite/package-components.sh').read_text()
         self.assertNotIn('platform/sdk/sandbox/python/build.sh', assemble)
         self.assertIn('--step sdk-package', assemble)
+        self.assertIn('components=(platform gateway execd)', assemble)
+        self.assertIn('components+=(dfs)', assemble)
+        self.assertIn('package_args+=(--with-dfs)', assemble)
+        self.assertIn('"${package_args[@]}"', assemble)
+        self.assertIn('component_args+=(--with-dfs)', (ROOT / '.buildkite/upload-obs.sh').read_text())
 
     def test_python_build_commands_are_shared_by_base_and_independent_pipelines(self):
         import yaml

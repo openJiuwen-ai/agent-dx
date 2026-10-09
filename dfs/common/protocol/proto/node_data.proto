@@ -1,0 +1,793 @@
+syntax = "proto3";
+package afs.node.data.v1;
+
+import "meta.proto";
+
+// Node 的 data 面同时承载传输诊断和文件业务命令；OwnerFiles 与 DfsChunks
+// 各自保持独立 service/消息，Handler 不与诊断 Storage 混用。
+// 控制面的根授权由 Meta 协调，传输会话由 node_control.proto 管理。
+
+// 仅选择内容搬运方式；RDMA 不取代 gRPC 文件命令或业务成功回复。
+enum DataTransfer {
+  DATA_TRANSFER_UNSPECIFIED = 0;
+  DATA_TRANSFER_GRPC_INLINE = 1;
+  DATA_TRANSFER_RDMA_ONE_SIDED = 2;
+}
+
+// NodeData 仅用于 8-byte 传输诊断，不是可用文件系统接口。
+service NodeData {
+  rpc Read(DataReadRequest) returns (DataReadReply);
+  rpc Write(DataWriteRequest) returns (DataWriteReply);
+}
+
+message DataReadRequest {
+  uint64 session_id = 1;
+  DataTransfer transfer = 2;
+  string name = 3;
+  uint64 offset = 4;
+  uint32 length = 5;
+}
+
+message DataReadReply {
+  bytes data = 1;
+  uint32 length = 2;
+}
+
+message DataWriteRequest {
+  uint64 session_id = 1;
+  DataTransfer transfer = 2;
+  string name = 3;
+  uint64 offset = 4;
+  bytes data = 5;
+  uint32 length = 6;
+}
+
+message DataWriteReply {
+  uint32 written = 1;
+}
+
+// DistributedFs replica commands. gRPC streaming and one-sided RDMA are two
+// byte movers below the same immutable Chunk/ReplicaAck state machine.
+service DfsChunks {
+  rpc PutReplicaStream(stream DfsPutReplicaFrame) returns (DfsPutReplicaReply);
+  rpc PutReplicaRdma(DfsPutReplicaRdmaRequest) returns (DfsPutReplicaReply);
+  rpc ConfirmReplica(DfsConfirmReplicaRequest) returns (DfsReplicaAck);
+  rpc ReadRanges(DfsReadRangesRequest) returns (stream DfsReadRangesFrame);
+  rpc NegotiateRdma(DfsNegotiateRdmaRequest) returns (DfsNegotiateRdmaReply);
+  rpc CloseRdma(DfsCloseRdmaRequest) returns (DfsCloseRdmaReply);
+  rpc ReadRangesRdma(DfsReadRangesRdmaRequest) returns (DfsReadRangesRdmaReply);
+}
+
+message DfsPutReplicaHeader {
+  string operation_id = 1;
+  string chunk_id = 2;
+  uint64 chunk_length = 3;
+  bytes content_digest = 4;
+  uint64 placement_revision = 5;
+  uint64 placement_epoch = 6;
+  string replica_group_id = 7;
+  repeated DfsReplicaTarget ordered_targets = 8;
+  DfsDigestAlgorithm content_digest_algorithm = 9;
+  uint32 target_index = 10;
+  string initiator_node_id = 11;
+  uint64 initiator_node_epoch = 12;
+  // Only background repair carries this persisted task authority. File writes
+  // keep their existing placement validation and synchronous prefix.
+  afs.meta.v1.DfsReplicationClaim repair_claim = 13;
+}
+
+enum DfsDigestAlgorithm {
+  DFS_DIGEST_ALGORITHM_UNSPECIFIED = 0;
+  DFS_DIGEST_ALGORITHM_BLAKE3 = 1;
+}
+
+message DfsStorageDevice {
+  string device_id = 1;
+  uint64 device_epoch = 2;
+  uint64 catalog_revision = 3;
+  string failure_domain = 4;
+}
+
+message DfsReplicaTarget {
+  string node_id = 1;
+  uint64 node_epoch = 2;
+  string data_endpoint = 3;
+  DfsStorageDevice device = 4;
+}
+
+message DfsReplicaAck {
+  string operation_id = 1;
+  string chunk_id = 2;
+  uint64 placement_revision = 3;
+  uint64 placement_epoch = 4;
+  string node_id = 5;
+  uint64 node_epoch = 6;
+  string device_id = 7;
+  uint64 device_epoch = 8;
+  uint64 catalog_revision = 9;
+  uint64 persisted_bytes = 10;
+  bytes verified_digest = 11;
+  DfsDigestAlgorithm verified_digest_algorithm = 12;
+}
+
+message DfsPutReplicaFrame {
+  oneof body {
+    DfsPutReplicaHeader header = 1;
+    bytes data = 2;
+  }
+}
+
+message DfsPutReplicaRdmaRequest {
+  DfsPutReplicaHeader header = 1;
+  uint64 rdma_session_id = 2;
+  uint64 region_offset = 3;
+  uint64 length = 4;
+  uint64 chunk_offset = 5;
+  string staging_id = 6;
+}
+
+message DfsNegotiateRdmaRequest {
+  bytes client_info = 1;
+  uint32 capacity = 2;
+  uint32 handshake_version = 3;
+  oneof authority {
+    DfsPutReplicaHeader replica_header = 4;
+    DfsReadRangesRequest read_request = 5;
+  }
+}
+
+message DfsNegotiateRdmaReply {
+  uint64 session_id = 1;
+  bytes server_info = 2;
+  uint32 capacity = 3;
+  bool rdma_supported = 4;
+  uint32 handshake_version = 5;
+}
+
+message DfsCloseRdmaRequest {
+  uint64 session_id = 1;
+  uint64 peer_node_epoch = 2;
+}
+
+message DfsCloseRdmaReply {}
+
+message DfsReadRangesRdmaRequest {
+  DfsReadRangesRequest request = 1;
+  uint64 rdma_session_id = 2;
+}
+
+message DfsReadRangesRdmaReply {
+  string read_id = 1;
+  string attempt_id = 2;
+  repeated DfsReadRangesCompletion completions = 3;
+  uint64 transferred_bytes = 4;
+}
+
+message DfsPutReplicaReply {
+  repeated DfsReplicaAck durable_acks = 1;
+}
+
+message DfsConfirmReplicaRequest {
+  string operation_id = 1;
+  string chunk_id = 2;
+  bytes expected_digest = 3;
+  uint64 placement_revision = 4;
+  uint64 placement_epoch = 5;
+  DfsDigestAlgorithm expected_digest_algorithm = 6;
+}
+
+message DfsReadGrant {
+  string namespace_id = 1;
+  string file_version_id = 2;
+  string layout_root_id = 3;
+  string caller_node_id = 4;
+  uint64 caller_node_epoch = 5;
+  uint64 expires_at_unix_ms = 6;
+  uint64 fence = 7;
+  string token = 8;
+}
+
+message DfsChunkReadOp {
+  uint32 operation_index = 1;
+  string chunk_id = 2;
+  uint64 chunk_offset = 3;
+  uint64 length = 4;
+  uint64 destination_offset = 5;
+  string source_copy_id = 6;
+  // Authorization remains scoped to this copy/range when batching one peer.
+  DfsReadGrant grant = 7;
+}
+
+message DfsReadRangesRequest {
+  string read_id = 1;
+  string attempt_id = 2;
+  string file_version_id = 3;
+  string layout_root_id = 4;
+  reserved 5; // Grants now belong to each operation, never to a whole peer.
+  repeated DfsChunkReadOp operations = 6;
+}
+
+message DfsReadRangesHeader {
+  string read_id = 1;
+  string attempt_id = 2;
+  uint32 operation_index = 3;
+  string chunk_id = 4;
+  uint64 chunk_offset = 5;
+  uint64 length = 6;
+  string source_copy_id = 7;
+}
+
+message DfsReadRangesCompletion {
+  string read_id = 1;
+  string attempt_id = 2;
+  uint32 operation_index = 3;
+  string source_copy_id = 4;
+  uint64 transferred_bytes = 5;
+  bytes range_checksum = 6;
+  DfsDigestAlgorithm range_checksum_algorithm = 7;
+}
+
+message DfsReadRangesFrame {
+  oneof body {
+    DfsReadRangesHeader header = 1;
+    bytes data = 2;
+    DfsReadRangesCompletion completion = 3;
+  }
+}
+
+// OwnerFiles 是 OwnerFs 的远端文件数据面合同。
+//
+// NodeData 上面的 Read/Write 只服务 8-byte diagnostics；OwnerFiles 才表达真实
+// workspace 文件操作。所有请求都携带 RootAccess，服务端用 root_epoch、
+// access_generation、session_id 和 fencing_token 拦住旧授权、旧进程会话或撤销后的请求。
+// Open 返回 opaque handle，后续 read/write/flush/release 不重新解释路径，避免远端
+// 客户端持有本机 inode 细节。handle 只在当前 owner Node 进程会话内有效，Node
+// 重启后必须重新 open；根授权来自 RootAccess，文件强身份来自 FileIdentity，
+// 两者都不能只靠 dev+ino 代替。当前实现尚未接
+// OwnerFs，所以必须返回 UNIMPLEMENTED。
+service OwnerFiles {
+  rpc Lookup(OwnerLookupRequest) returns (OwnerLookupReply);
+  rpc GetAttr(OwnerGetAttrRequest) returns (OwnerGetAttrReply);
+  rpc StatFs(OwnerStatFsRequest) returns (OwnerStatFsReply);
+  rpc SetAttr(OwnerSetAttrRequest) returns (OwnerSetAttrReply);
+  rpc GetXattr(OwnerGetXattrRequest) returns (OwnerGetXattrReply);
+  rpc ListXattr(OwnerListXattrRequest) returns (OwnerListXattrReply);
+  rpc SetXattr(OwnerSetXattrRequest) returns (OwnerSetXattrReply);
+  rpc RemoveXattr(OwnerRemoveXattrRequest) returns (OwnerRemoveXattrReply);
+  rpc Create(OwnerCreateRequest) returns (OwnerCreateReply);
+  rpc Mkdir(OwnerMkdirRequest) returns (OwnerMkdirReply);
+  rpc Mknod(OwnerMknodRequest) returns (OwnerMknodReply);
+  rpc Unlink(OwnerUnlinkRequest) returns (OwnerUnlinkReply);
+  rpc Rmdir(OwnerRmdirRequest) returns (OwnerRmdirReply);
+  rpc Rename(OwnerRenameRequest) returns (OwnerRenameReply);
+  rpc Open(OwnerOpenRequest) returns (OwnerOpenReply);
+  rpc Readlink(OwnerReadlinkRequest) returns (OwnerReadlinkReply);
+  rpc Read(OwnerReadRequest) returns (OwnerReadReply);
+  rpc Write(OwnerWriteRequest) returns (OwnerWriteReply);
+  rpc Flush(OwnerFlushRequest) returns (OwnerFlushReply);
+  rpc Fsync(OwnerFsyncRequest) returns (OwnerFsyncReply);
+  rpc Release(OwnerReleaseRequest) returns (OwnerReleaseReply);
+  rpc Opendir(OwnerOpendirRequest) returns (OwnerOpendirReply);
+  rpc Readdir(OwnerReaddirRequest) returns (OwnerReaddirReply);
+  rpc FsyncDir(OwnerFsyncDirRequest) returns (OwnerFsyncDirReply);
+  rpc ReleaseDir(OwnerReleaseDirRequest) returns (OwnerReleaseDirReply);
+  rpc Symlink(OwnerSymlinkRequest) returns (OwnerSymlinkReply);
+  rpc Link(OwnerLinkRequest) returns (OwnerLinkReply);
+}
+
+// RootAccess 是一次 OwnerFs 远端访问的防陈旧身份。
+//
+// root_id/root_epoch/access_generation/holder_node_id/home_node_id/session_id/home_session_id/fencing_token
+// 必须直接来自 Meta grant。P2P 不携带 caller 自报的 root_path；服务端只用 root_id 在
+// 本机可信 catalog 找 backing root。文件相对 path 仍在各请求中用 bytes 表达。
+// 这些字段本身不证明授权仍有效：Home 首次见到 B grant 时须让 Meta 核验
+// 当前权威状态和经通道认证的 peer 身份，并缓存结果；真正撤权须围栏该缓存。
+// 即便根授权有效，也不证明某个路径仍是之前打开或查到的文件；
+// 同名删除重建、O_TRUNC 防误截断等文件级陈旧判断必须使用 FileIdentity。
+message RootAccess {
+  string root_id = 1;
+  uint64 root_epoch = 2;
+  uint64 access_generation = 3;
+  string holder_node_id = 4;
+  string home_node_id = 5;
+  string session_id = 6;
+  string fencing_token = 7;
+  // 若 A 已重启，旧 grant 即使 root_id/epoch 未变也必须拒绝。
+  string home_session_id = 8;
+}
+
+// DataPlane 让同一业务命令选择内容搬运方式。
+//
+// gRPC inline 时 bytes 字段携带内容；RDMA one-sided 时使用 rdma_session_id 与远端
+// 注册缓冲区窗口，bytes 必须为空。buffer_offset 指向会话 MR 内本次请求起点，长度取
+// OwnerReadRequest.length 或 OwnerWriteRequest.length。未来服务端必须校验
+// buffer_offset + length <= MR 容量；请求方必须保证注册内存生命周期覆盖 CQ 与业务完成。
+// 控制语义不随传输方式变化。
+message DataPlane {
+  DataTransfer transfer = 1;
+  uint64 rdma_session_id = 2;
+  uint64 buffer_offset = 3;
+}
+
+// FileIdentity 是 OwnerFs 返回给远端节点的不透明文件身份。
+//
+// 它可由 owner Node 内部选择 generation、持久 file id 或其它组合编码；远端不能解析，
+// 只能在 Open(expected_file_identity) 等请求中原样带回，帮助 owner Node 发现同名重建
+// 后的陈旧请求。不要只用 Linux dev+ino 作为强身份。
+message FileIdentity {
+  bytes opaque = 1;
+}
+
+message OwnerHandle {
+  bytes opaque = 1;
+}
+
+message OwnerDirectoryHandle {
+  bytes opaque = 1;
+}
+
+enum OwnerFileKind {
+  OWNER_FILE_KIND_UNSPECIFIED = 0;
+  OWNER_FILE_KIND_REGULAR = 1;
+  OWNER_FILE_KIND_DIRECTORY = 2;
+  OWNER_FILE_KIND_SYMLINK = 3;
+  OWNER_FILE_KIND_BLOCK_DEVICE = 4;
+  OWNER_FILE_KIND_CHAR_DEVICE = 5;
+  OWNER_FILE_KIND_FIFO = 6;
+  OWNER_FILE_KIND_SOCKET = 7;
+}
+
+message OwnerSpecialNode {
+  OwnerFileKind kind = 1;
+  uint64 rdev = 2;
+}
+
+message OwnerFileAttr {
+  FileIdentity identity = 1;
+  OwnerFileKind kind = 2;
+  uint32 mode = 3;
+  uint32 uid = 4;
+  uint32 gid = 5;
+  uint64 size = 6;
+  uint64 blocks = 7;
+  uint64 atime_ns = 8;
+  uint64 mtime_ns = 9;
+  uint64 ctime_ns = 10;
+  uint32 nlink = 11;
+  uint32 blksize = 12;
+  OwnerSpecialNode special_node = 13;
+}
+
+message OwnerSetAttr {
+  optional uint32 mode = 1;
+  optional uint32 uid = 2;
+  optional uint32 gid = 3;
+  optional uint64 size = 4;
+  optional uint64 atime_ns = 5;
+  optional uint64 mtime_ns = 6;
+  bool kill_suidgid = 7;
+  bool timestamps_now = 8;
+}
+
+message OwnerLookupRequest {
+  RootAccess access = 1;
+  bytes path = 2;
+  // Optional only for the empty root path. Non-root lookup must carry the
+  // parent directory identity observed by the remote node, so Home can reject
+  // lookup through a stale old directory after same-name replacement.
+  FileIdentity expected_parent_identity = 3;
+}
+
+message OwnerLookupReply {
+  OwnerFileAttr attr = 1;
+  string owner_session_id = 2;
+}
+
+message OwnerGetAttrRequest {
+  RootAccess access = 1;
+  bytes path = 2;
+  FileIdentity expected_file_identity = 3;
+  // 若 handle 存在，服务端按已打开文件取属性；path/expected_file_identity 只作为无
+  // handle 时的 lookup 防陈旧输入，避免 rename/unlink 后旧 FD 的 fstat 误走新路径。
+  OwnerHandle handle = 4;
+}
+
+message OwnerGetAttrReply {
+  OwnerFileAttr attr = 1;
+  string owner_session_id = 2;
+}
+
+message OwnerFilesystemCapacity {
+  uint64 blocks = 1;
+  uint64 bfree = 2;
+  uint64 bavail = 3;
+  uint64 files = 4;
+  uint64 ffree = 5;
+  uint32 bsize = 6;
+  uint32 namelen = 7;
+  uint32 frsize = 8;
+}
+
+message OwnerStatFsRequest {
+  RootAccess access = 1;
+  bytes path = 2;
+  FileIdentity expected_file_identity = 3;
+}
+
+message OwnerStatFsReply {
+  OwnerFilesystemCapacity capacity = 1;
+}
+
+message OwnerCaller {
+  uint32 uid = 1;
+  uint32 gid = 2;
+  uint32 pid = 3;
+  uint32 umask = 4;
+  repeated uint32 supplementary_gids = 5;
+}
+
+message OwnerSetAttrRequest {
+  RootAccess access = 1;
+  bytes path = 2;
+  FileIdentity expected_file_identity = 3;
+  OwnerSetAttr attr = 4;
+  // 若 handle 存在，服务端按已打开文件改属性/截断；path/expected_file_identity 只作为无
+  // handle 时的 lookup 防陈旧输入，避免 rename/unlink 后旧 FD 的 ftruncate 误走新路径。
+  OwnerHandle handle = 5;
+  // Original FUSE caller. Home must authorize chmod/chown/truncate/time changes
+  // with this identity instead of the peer daemon identity.
+  OwnerCaller caller = 6;
+}
+
+message OwnerSetAttrReply {
+  OwnerFileAttr attr = 1;
+  string owner_session_id = 2;
+}
+
+
+message OwnerGetXattrRequest {
+  RootAccess access = 1;
+  bytes path = 2;
+  FileIdentity expected_file_identity = 3;
+  bytes name = 4;
+  OwnerCaller caller = 5;
+}
+message OwnerGetXattrReply { bytes value = 1; }
+
+message OwnerListXattrRequest {
+  RootAccess access = 1;
+  bytes path = 2;
+  FileIdentity expected_file_identity = 3;
+  OwnerCaller caller = 4;
+}
+message OwnerListXattrReply { bytes names = 1; }
+
+message OwnerSetXattrRequest {
+  RootAccess access = 1;
+  bytes path = 2;
+  FileIdentity expected_file_identity = 3;
+  bytes name = 4;
+  bytes value = 5;
+  int32 flags = 6;
+  OwnerCaller caller = 7;
+}
+message OwnerSetXattrReply {}
+
+message OwnerRemoveXattrRequest {
+  RootAccess access = 1;
+  bytes path = 2;
+  FileIdentity expected_file_identity = 3;
+  bytes name = 4;
+  OwnerCaller caller = 5;
+}
+message OwnerRemoveXattrReply {}
+
+message OwnerCreateRequest {
+  RootAccess access = 1;
+  bytes path = 2;
+  uint32 flags = 3;
+  uint32 mode = 4;
+  // Parent directory identity observed by the remote node before issuing this
+  // create. Home must reject the request if the parent path now names a
+  // different directory, otherwise a stale remote dentry can create in the
+  // wrong generation after same-name delete/recreate.
+  FileIdentity expected_parent = 5;
+  OwnerCaller caller = 6;
+  bool kill_suidgid = 7;
+}
+
+message OwnerCreateReply {
+  OwnerHandle handle = 1;
+  OwnerFileAttr attr = 2;
+  string owner_session_id = 3;
+}
+
+message OwnerMkdirRequest {
+  RootAccess access = 1;
+  bytes path = 2;
+  uint32 mode = 3;
+  // Required stale-parent guard for the containing directory.
+  FileIdentity expected_parent = 4;
+  OwnerCaller caller = 5;
+}
+
+message OwnerMkdirReply {
+  OwnerFileAttr attr = 1;
+  string owner_session_id = 2;
+}
+
+message OwnerMknodRequest {
+  RootAccess access = 1;
+  bytes path = 2;
+  OwnerSpecialNode special_node = 3;
+  uint32 mode = 4;
+  FileIdentity expected_parent = 5;
+  OwnerCaller caller = 6;
+}
+
+message OwnerMknodReply {
+  OwnerFileAttr attr = 1;
+  string owner_session_id = 2;
+}
+
+message OwnerUnlinkRequest {
+  RootAccess access = 1;
+  bytes path = 2;
+  FileIdentity expected_file_identity = 3;
+  // Required stale-parent guard for the containing directory.
+  FileIdentity expected_parent = 4;
+  // Required caller credentials; absent credentials fail closed.
+  OwnerCaller caller = 5;
+}
+
+message OwnerUnlinkReply {}
+
+message OwnerRmdirRequest {
+  RootAccess access = 1;
+  bytes path = 2;
+  FileIdentity expected_file_identity = 3;
+  // Required stale-parent guard for the containing directory.
+  FileIdentity expected_parent = 4;
+  // Required caller credentials; absent credentials fail closed.
+  OwnerCaller caller = 5;
+}
+
+message OwnerRmdirReply {}
+
+message OwnerRenameRequest {
+  RootAccess access = 1;
+  bytes old_path = 2;
+  bytes new_path = 3;
+  FileIdentity expected_old_identity = 4;
+  FileIdentity expected_new_identity = 5;
+  uint32 flags = 6;
+  // Required stale-parent guard for the source directory.
+  FileIdentity expected_old_parent = 7;
+  // Required stale-parent guard for the destination directory.
+  FileIdentity expected_new_parent = 8;
+  // Required caller credentials; absent credentials fail closed.
+  OwnerCaller caller = 9;
+}
+
+message OwnerRenameReply {}
+
+message OwnerOpenRequest {
+  RootAccess access = 1;
+  bytes path = 2;
+  uint32 flags = 3;
+  uint32 mode = 4;
+  FileIdentity expected_file_identity = 5;
+  bool kill_suidgid = 6;
+  bool disable_prefetch = 7;
+}
+
+message OwnerOpenReply {
+  OwnerHandle handle = 1;
+  FileIdentity file_identity = 2;
+  string owner_session_id = 3;
+  OwnerFileAttr attr = 4;
+  // A small read-only file can travel with OPEN. Presence matters: an empty
+  // file is a valid prefetched result, while absence means READ must use RPC.
+  optional bytes prefetched_data = 5;
+}
+
+message OwnerReadlinkRequest {
+  RootAccess access = 1;
+  bytes path = 2;
+  FileIdentity expected_file_identity = 3;
+}
+
+message OwnerReadlinkReply {
+  bytes target = 1;
+}
+
+message OwnerReadRequest {
+  RootAccess access = 1;
+  OwnerHandle handle = 2;
+  uint64 offset = 3;
+  uint32 length = 4;
+  DataPlane plane = 5;
+}
+
+message OwnerReadReply {
+  bytes data = 1;
+  uint32 read = 2;
+  bool eof = 3;
+  bytes data_checksum = 4;
+}
+
+message OwnerWriteRequest {
+  RootAccess access = 1;
+  OwnerHandle handle = 2;
+  uint64 offset = 3;
+  bytes data = 4;
+  uint32 length = 5;
+  DataPlane plane = 6;
+  bool kill_suidgid = 7;
+  bytes data_checksum = 8;
+}
+
+message OwnerWriteReply {
+  uint32 written = 1;
+}
+
+message OwnerFlushRequest {
+  RootAccess access = 1;
+  OwnerHandle handle = 2;
+}
+
+message OwnerFlushReply {}
+
+message OwnerFsyncRequest {
+  RootAccess access = 1;
+  OwnerHandle handle = 2;
+  bool datasync = 3;
+}
+
+message OwnerFsyncReply {}
+
+message OwnerReleaseRequest {
+  RootAccess access = 1;
+  OwnerHandle handle = 2;
+}
+
+message OwnerReleaseReply {}
+
+message OwnerOpendirRequest {
+  RootAccess access = 1;
+  bytes path = 2;
+  FileIdentity expected_file_identity = 3;
+}
+
+message OwnerOpendirReply {
+  OwnerDirectoryHandle handle = 1;
+  FileIdentity file_identity = 2;
+  string owner_session_id = 3;
+}
+
+message OwnerDirEntry {
+  bytes name = 1;
+  OwnerFileAttr attr = 2;
+  uint64 next_offset = 3;
+}
+
+message OwnerReaddirRequest {
+  RootAccess access = 1;
+  OwnerDirectoryHandle handle = 2;
+  uint64 offset = 3;
+  uint32 max_entries = 4;
+}
+
+message OwnerReaddirReply {
+  repeated OwnerDirEntry entries = 1;
+  bool eof = 2;
+}
+
+message OwnerFsyncDirRequest {
+  RootAccess access = 1;
+  OwnerDirectoryHandle handle = 2;
+  bool datasync = 3;
+}
+
+message OwnerFsyncDirReply {}
+
+message OwnerReleaseDirRequest {
+  RootAccess access = 1;
+  OwnerDirectoryHandle handle = 2;
+}
+
+message OwnerReleaseDirReply {}
+
+message OwnerSymlinkRequest {
+  RootAccess access = 1;
+  bytes link_path = 2;
+  bytes target = 3;
+  FileIdentity expected_parent = 4;
+  OwnerCaller caller = 5;
+}
+
+message OwnerSymlinkReply {
+  OwnerFileAttr attr = 1;
+  string owner_session_id = 2;
+}
+
+message OwnerLinkRequest {
+  RootAccess access = 1;
+  bytes old_path = 2;
+  bytes new_path = 3;
+  FileIdentity expected_old_identity = 4;
+  FileIdentity expected_new_parent = 5;
+  OwnerCaller caller = 6;
+}
+
+message OwnerLinkReply {
+  OwnerFileAttr attr = 1;
+  string owner_session_id = 2;
+}
+
+// DFS active writer-handle commands. These are unrelated to OwnerFs Home files.
+// Read is only for a writer handle's dirty view. Ordinary fixed-version reads
+// use DfsChunks and never add a mandatory inode-owner content hop.
+service DfsOwnerFiles {
+  // Data calls carry file ranges or sync barriers. Lifecycle and handle creation
+  // live in node_control.proto so control-plane authorization cannot be hidden
+  // inside the file-byte service.
+  rpc Read(DfsOwnerReadRequest) returns (DfsOwnerReadReply);
+  rpc Write(DfsOwnerWriteRequest) returns (DfsOwnerWriteReply);
+  rpc Resize(DfsOwnerResizeRequest) returns (DfsOwnerResizeReply);
+  rpc Sync(DfsOwnerSyncRequest) returns (DfsOwnerSyncReply);
+}
+
+// Established by owner open/forwarding flow. This wire shape does not
+// itself authorize access: the receiver validates the authenticated caller,
+// handle table, current owner session, lease epoch and rights before execution.
+message DfsOwnerHandle {
+  string namespace_id = 1;
+  string inode_id = 2;
+  string owner_node_id = 3;
+  string owner_session_id = 4;
+  uint64 lease_epoch = 5;
+  string caller_node_id = 6;
+  string caller_session_id = 7;
+  bytes opaque_handle = 8;
+  uint64 open_seq = 9;
+}
+message DfsOwnerReadRequest {
+  DfsOwnerHandle handle = 1;
+  uint64 offset = 2;
+  uint64 length = 3;
+}
+message DfsOwnerReadReply {
+  bytes data = 1;
+  uint64 visible_write_seq = 2;
+}
+message DfsOwnerWriteRequest {
+  DfsOwnerHandle handle = 1;
+  string operation_id = 2;
+  uint64 offset = 3;
+  bytes data = 4;
+  bool append = 5;
+  bool kill_suidgid = 6;
+}
+message DfsOwnerWriteReply {
+  uint64 written = 1;
+  uint64 accepted_write_seq = 2;
+  uint64 effective_offset = 3;
+}
+message DfsOwnerResizeRequest {
+  DfsOwnerHandle handle = 1;
+  string operation_id = 2;
+  uint64 length = 3;
+  bool kill_suidgid = 4;
+}
+message DfsOwnerResizeReply { uint64 accepted_write_seq = 1; }
+message DfsOwnerSyncRequest {
+  DfsOwnerHandle handle = 1;
+  string operation_id = 2;
+  uint64 through_write_seq = 3;
+  bool data_only = 4;
+}
+message DfsOwnerSyncReply {
+  uint64 durable_write_seq = 1;
+  string file_version_id = 2;
+}

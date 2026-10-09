@@ -1,0 +1,184 @@
+{
+  "schema_version": 1,
+  "bindings": [
+    {
+      "case_id": "STD-01",
+      "profile": "full",
+      "mode": "remote-host",
+      "matrix": {
+        "backend": "DFS",
+        "meta": "etcd"
+      },
+      "driver_matrix": {
+        "reference": "ext4",
+        "suite_sha": "sanwan/pjdfstest <observed-revision>"
+      },
+      "worker_a": {
+        "transport": "ssh",
+        "host": "afs-meta-a",
+        "ssh_config": "/etc/afs-acceptance/ssh_config",
+        "python": "/usr/bin/python3",
+        "standard_driver": "/opt/afs-acceptance/drivers/standard.py",
+        "expected_processes": [
+          {
+            "role": "meta",
+            "pid": 1234,
+            "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+          }
+        ]
+      },
+      "worker_b": {
+        "transport": "ssh",
+        "host": "afs-node-b",
+        "python": "/usr/bin/python3",
+        "standard_driver": "/opt/afs-acceptance/drivers/standard.py",
+        "expected_processes": [
+          {
+            "role": "node",
+            "pid": 2345,
+            "sha256": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+          }
+        ]
+      },
+      "expected_meta_endpoint": "https://10.0.0.10:17880",
+      "meta_identity_path_a": "/",
+      "mount_b": "/mnt/afs",
+      "base_dir_b": "/mnt/afs/acceptance",
+      "suite_root_b": "/opt/afs-acceptance/suites-reference/src/pjdfstest",
+      "worker_run_dir_b": "/var/tmp/afs-acceptance/std01-worker",
+      "timeout": 1800,
+      "command_timeout": 3600
+    },
+    {
+      "case_id": "STD-02",
+      "profile": "full",
+      "mode": "remote-host",
+      "matrix": {
+        "backend": "DFS",
+        "meta": "etcd"
+      },
+      "driver_matrix": {
+        "reference": "ext4",
+        "suite": "LTP 20260529"
+      },
+      "worker_a": {
+        "transport": "ssh",
+        "host": "afs-meta-a",
+        "ssh_config": "/etc/afs-acceptance/ssh_config",
+        "python": "/usr/bin/python3",
+        "standard_driver": "/opt/afs-acceptance/drivers/standard.py",
+        "expected_processes": [
+          {
+            "role": "meta",
+            "pid": 1234,
+            "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+          }
+        ]
+      },
+      "worker_b": {
+        "transport": "ssh",
+        "host": "afs-node-b",
+        "python": "/usr/bin/python3",
+        "standard_driver": "/opt/afs-acceptance/drivers/standard.py",
+        "expected_processes": [
+          {
+            "role": "node",
+            "pid": 2345,
+            "sha256": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+          }
+        ]
+      },
+      "expected_meta_endpoint": "https://10.0.0.10:17880",
+      "mount_b": "/mnt/afs",
+      "base_dir_b": "/mnt/afs/acceptance",
+      "suite_root_b": "/opt/afs-acceptance/suites-reference/src/ltp",
+      "ltp_install_b": "/opt/afs-tools/ltp-install",
+      "expanded_tsv_b": "/opt/afs-acceptance/suites-reference/evidence/inventory/ltp-filesystem-expanded.tsv",
+      "applicability_manifest_b": "/opt/afs-acceptance/ltp-applicability-manifest.json",
+      "worker_run_dir_b": "/var/tmp/afs-acceptance/std02-worker",
+      "command_timeout": 3600
+    },
+    {
+      "case_id": "STD-03",
+      "profile": "smoke",
+      "mode": "remote-host",
+      "matrix": {"backend": "DFS", "meta": "Redis"},
+      "driver_matrix": {
+        "reference": "ext4",
+        "suite_sha": "secfs.test <observed-revision>",
+        "seeds": 3
+      },
+      "worker_a": {
+        "transport": "ssh",
+        "host": "afs-meta-a",
+        "python": "/usr/bin/python3",
+        "standard_driver": "/opt/afs-acceptance/drivers/standard.py",
+        "expected_processes": [
+          {
+            "role": "meta",
+            "pid": 1234,
+            "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+          }
+        ]
+      },
+      "worker_b": {
+        "transport": "ssh",
+        "host": "afs-node-b",
+        "python": "/usr/bin/python3",
+        "standard_driver": "/opt/afs-acceptance/drivers/standard.py",
+        "expected_processes": [
+          {
+            "role": "node",
+            "pid": 2345,
+            "sha256": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+          }
+        ]
+      },
+      "expected_meta_endpoint": "https://10.0.0.10:17880",
+      "mount_b": "/mnt/afs",
+      "base_dir_b": "/mnt/afs/acceptance",
+      "suite_root_b": "/opt/afs-acceptance/suites-reference/src/secfs.test",
+      "fsx_binary_b": "/opt/afs-acceptance/suites-reference/src/secfs.test/tools/bin/fsx",
+      "worker_run_dir_b": "/var/tmp/afs-acceptance/std03-worker",
+      "command_timeout": 3600
+    },
+    {
+      "case_id": "STD-04",
+      "profile": "smoke",
+      "mode": "remote-host",
+      "matrix": {"backend": "DFS", "meta": "Redis"},
+      "worker_a": {
+        "transport": "ssh",
+        "host": "afs-meta-a",
+        "python": "/usr/bin/python3",
+        "standard_driver": "/opt/afs-acceptance/drivers/standard.py",
+        "expected_processes": [
+          {
+            "role": "meta",
+            "pid": 1234,
+            "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+          }
+        ]
+      },
+      "worker_b": {
+        "transport": "ssh",
+        "host": "afs-node-b",
+        "python": "/usr/bin/python3",
+        "standard_driver": "/opt/afs-acceptance/drivers/standard.py",
+        "expected_processes": [
+          {
+            "role": "node",
+            "pid": 2345,
+            "sha256": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+          }
+        ]
+      },
+      "expected_meta_endpoint": "https://10.0.0.10:17880",
+      "mount_b": "/REPLACE/WITH/OBSERVED/DFS/MOUNT",
+      "base_dir_b": "/REPLACE/WITH/OBSERVED/DFS/MOUNT/workspace",
+      "reference_dir_b": "/REPLACE/WITH/INDEPENDENT/GUEST-EXT4/REFERENCE",
+      "worker_run_dir_b": "/var/tmp/afs-acceptance/std04-worker",
+      "command_timeout": 3600
+    }
+  ]
+}

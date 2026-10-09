@@ -1,0 +1,43 @@
+verbose
+validate data
+size 256
+count 3
+port 19669
+client
+created cm_id 0xbf309f41ecc0
+cma_event type RDMA_CM_EVENT_ADDR_RESOLVED cma_id 0xbf309f41ecc0 (parent)
+cma_event type RDMA_CM_EVENT_ROUTE_RESOLVED cma_id 0xbf309f41ecc0 (parent)
+rdma_resolve_addr - rdma_resolve_route successful
+created pd 0xbf309f413860
+created channel 0xbf309f414890
+created cq 0xbf309f41f060
+created qp 0xbf309f41f1d0
+rping_setup_buffers called on cb 0xbf309f4117c0
+allocated & registered buffers...
+cq_thread started.
+cma_event type RDMA_CM_EVENT_ESTABLISHED cma_id 0xbf309f41ecc0 (parent)
+ESTABLISHED
+rdma_connect successful
+RDMA addr bf309f41f580 rkey 3970 len 256
+send completion
+recv completion
+RDMA addr bf309f41f430 rkey 38c9 len 256
+send completion
+recv completion
+ping data: rdma-ping-0: ABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyzABCDEFGHIJ
+RDMA addr bf309f41f580 rkey 3970 len 256
+send completion
+recv completion
+RDMA addr bf309f41f430 rkey 38c9 len 256
+send completion
+recv completion
+ping data: rdma-ping-1: BCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyzABCDEFGHIJK
+RDMA addr bf309f41f580 rkey 3970 len 256
+send completion
+recv completion
+RDMA addr bf309f41f430 rkey 38c9 len 256
+send completion
+recv completion
+ping data: rdma-ping-2: CDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyzABCDEFGHIJKL
+rping_free_buffers called on cb 0xbf309f4117c0
+destroy cm_id 0xbf309f41ecc0

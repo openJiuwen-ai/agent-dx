@@ -1,0 +1,2 @@
+# 已有 STD-04 shrink/replay 工具依赖；不属于产品运行时。
+hypothesis==6.168.3

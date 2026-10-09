@@ -1,0 +1,602 @@
+# AFS language-neutral error-code catalog. Stable layout: 0xCCSSRRRR.
+# main 旧 KV/Arena/Journal 等业务编号保留，禁止改作新语义。
+
+[[error]]
+name = "CLIENT_ARGUMENT_INVALID"
+value = "0x01010001"
+kind = "InvalidArgument"
+component = "Client"
+subsystem = "Argument"
+description = "调用者参数不合法"
+
+[[error]]
+name = "CLIENT_CONNECTION_UNAVAILABLE"
+value = "0x01020001"
+kind = "Unavailable"
+component = "Client"
+subsystem = "Connection"
+description = "无法建立到目标节点的连接"
+
+[[error]]
+name = "CLIENT_DEADLINE_EXCEEDED"
+value = "0x01020002"
+kind = "DeadlineExceeded"
+component = "Client"
+subsystem = "Connection"
+description = "本机 SDK 等待 RPC 超时，写入结果可能未知"
+
+[[error]]
+name = "CLIENT_PROTOCOL_INVALID_ERROR_DETAIL"
+value = "0x01030001"
+kind = "Internal"
+component = "Client"
+subsystem = "Protocol"
+description = "远端错误详情损坏、重复或相互矛盾"
+
+[[error]]
+name = "CLIENT_PROTOCOL_VIOLATION"
+value = "0x01030002"
+kind = "Internal"
+component = "Client"
+subsystem = "Protocol"
+description = "远端正常响应的形状或长度违反请求合同"
+
+[[error]]
+name = "CLIENT_REMOTE_STATUS"
+value = "0x01030003"
+kind = "Unknown"
+component = "Client"
+subsystem = "Protocol"
+description = "远端或传输框架没有 AFS 详情，保留原生 gRPC 分类"
+
+[[error]]
+name = "CLIENT_PERMISSION_DENIED"
+value = "0x01040001"
+kind = "PermissionDenied"
+component = "Client"
+subsystem = "Permission"
+description = "本机调用者提供的授权 token 无效"
+
+[[error]]
+name = "CLIENT_SHM_UNAVAILABLE"
+value = "0x01050001"
+kind = "Unavailable"
+component = "Client"
+subsystem = "LocalRuntime"
+description = "本机共享内存机制不可用"
+
+[[error]]
+name = "CLIENT_WORKER_FAILED"
+value = "0x01050002"
+kind = "Internal"
+component = "Client"
+subsystem = "LocalRuntime"
+description = "本机工作任务或 broker 线程失败"
+
+[[error]]
+name = "CLIENT_CLOSED"
+value = "0x01050003"
+kind = "FailedPrecondition"
+component = "Client"
+subsystem = "LocalRuntime"
+description = "本机 SDK 接入已关闭"
+
+[[error]]
+name = "NODE_TRANSFER_UNSUPPORTED"
+value = "0x02040001"
+kind = "Unimplemented"
+component = "Node"
+subsystem = "Transfer"
+description = "当前节点或编译产物不支持请求的传输"
+
+[[error]]
+name = "NODE_TRANSFER_CORRUPT_DATA"
+value = "0x02040002"
+kind = "DataLoss"
+component = "Node"
+subsystem = "Transfer"
+description = "数据传输或诊断往返的内容校验失败"
+
+[[error]]
+name = "NODE_TRANSFER_UNAVAILABLE"
+value = "0x02040003"
+kind = "Unavailable"
+component = "Node"
+subsystem = "Transfer"
+description = "RDMA 设备、QP 或搬运操作失败"
+
+[[error]]
+name = "NODE_TRANSFER_INVALID"
+value = "0x02040004"
+kind = "InvalidArgument"
+component = "Node"
+subsystem = "Transfer"
+description = "数据传输参数不合法"
+
+[[error]]
+name = "NODE_TRANSFER_INTERNAL"
+value = "0x02040005"
+kind = "Internal"
+component = "Node"
+subsystem = "Transfer"
+description = "传输工作任务或返回长度转换失败"
+
+[[error]]
+name = "NODE_STORAGE_INVALID"
+value = "0x02070001"
+kind = "InvalidArgument"
+component = "Node"
+subsystem = "Storage"
+description = "诊断文件名、范围或传输长度不合法"
+
+[[error]]
+name = "NODE_STORAGE_NOT_FOUND"
+value = "0x02070002"
+kind = "NotFound"
+component = "Node"
+subsystem = "Storage"
+description = "诊断存储文件不存在"
+
+[[error]]
+name = "NODE_STORAGE_UNSAFE_TYPE"
+value = "0x02070003"
+kind = "FailedPrecondition"
+component = "Node"
+subsystem = "Storage"
+description = "目标不是允许访问的普通文件"
+
+[[error]]
+name = "NODE_STORAGE_IO"
+value = "0x02070004"
+kind = "Internal"
+component = "Node"
+subsystem = "Storage"
+description = "本机文件 I/O 失败且没有更精确分类"
+
+[[error]]
+name = "NODE_STORAGE_TASK_FAILED"
+value = "0x02070005"
+kind = "Internal"
+component = "Node"
+subsystem = "Storage"
+description = "存储阻塞任务异常退出"
+
+[[error]]
+name = "NODE_VFS_NOT_FOUND"
+value = "0x02080001"
+kind = "NotFound"
+component = "Node"
+subsystem = "Vfs"
+description = "namespace 不存在或未启用"
+
+[[error]]
+name = "NODE_VFS_INVALID"
+value = "0x02080002"
+kind = "InvalidArgument"
+component = "Node"
+subsystem = "Vfs"
+description = "后端选择或文件名不合法"
+
+[[error]]
+name = "NODE_VFS_UNIMPLEMENTED"
+value = "0x02080003"
+kind = "Unimplemented"
+component = "Node"
+subsystem = "Vfs"
+description = "该后端文件操作尚未实现"
+
+[[error]]
+name = "NODE_VFS_UNAVAILABLE"
+value = "0x02080004"
+kind = "Unavailable"
+component = "Node"
+subsystem = "Vfs"
+description = "请求的后端未编译进产物"
+
+[[error]]
+name = "NODE_MOUNT_CONFLICT"
+value = "0x02080005"
+kind = "AlreadyExists"
+component = "Node"
+subsystem = "Vfs"
+description = "目标路径已存在挂载"
+
+[[error]]
+name = "NODE_OWNER_INVALID_GRANT"
+value = "0x020b0001"
+kind = "FailedPrecondition"
+component = "Node"
+subsystem = "OwnerFs"
+description = "根授权与当前创建预留或本机会话不匹配"
+
+[[error]]
+name = "NODE_OWNER_GRANT_UNAVAILABLE"
+value = "0x020b0002"
+kind = "Unavailable"
+component = "Node"
+subsystem = "OwnerFs"
+description = "根授权尚未获取、已失效或正在撤销"
+
+[[error]]
+name = "NODE_OWNER_RIGHT_DENIED"
+value = "0x020b0003"
+kind = "PermissionDenied"
+component = "Node"
+subsystem = "OwnerFs"
+description = "根授权不包含本次操作要求的权限"
+
+[[error]]
+name = "NODE_OWNER_STALE_ACCESS"
+value = "0x020b0004"
+kind = "FailedPrecondition"
+component = "Node"
+subsystem = "OwnerFs"
+description = "根授权绑定旧 Home 进程会话或旧授权代，需要重新向 Meta 申请"
+
+[[error]]
+name = "NODE_OWNER_STALE_HANDLE"
+value = "0x020b0005"
+kind = "FailedPrecondition"
+component = "Node"
+subsystem = "OwnerFs"
+description = "远端文件或目录句柄由已退出的 Home 进程签发，需要重新打开"
+
+[[error]]
+name = "NODE_DFS_STALE_HANDLE"
+value = "0x020c0001"
+kind = "FailedPrecondition"
+component = "Node"
+subsystem = "DistributedFs"
+description = "DFS 文件句柄已关闭或不属于当前挂载会话，需要重新打开"
+
+[[error]]
+name = "NODE_RDMA_SESSION_UNKNOWN"
+value = "0x02090001"
+kind = "FailedPrecondition"
+component = "Node"
+subsystem = "RdmaSession"
+description = "RDMA 会话不存在、关闭或已被清理"
+
+[[error]]
+name = "NODE_RDMA_SESSION_POISONED"
+value = "0x02090002"
+kind = "FailedPrecondition"
+component = "Node"
+subsystem = "RdmaSession"
+description = "失败或取消后禁止继续使用该 RDMA 会话"
+
+[[error]]
+name = "NODE_RDMA_NOT_READY"
+value = "0x02090003"
+kind = "FailedPrecondition"
+component = "Node"
+subsystem = "RdmaSession"
+description = "RDMA 会话尚未就绪"
+
+[[error]]
+name = "NODE_RDMA_CAPACITY"
+value = "0x02090004"
+kind = "ResourceExhausted"
+component = "Node"
+subsystem = "RdmaSession"
+description = "RDMA 会话数量达到上限"
+
+[[error]]
+name = "NODE_RDMA_HANDSHAKE_VERSION"
+value = "0x02090005"
+kind = "FailedPrecondition"
+component = "Node"
+subsystem = "RdmaSession"
+description = "两端 RDMA 握手版本不兼容"
+
+[[error]]
+name = "NODE_RDMA_CLOSED"
+value = "0x02090006"
+kind = "FailedPrecondition"
+component = "Node"
+subsystem = "RdmaSession"
+description = "调用方已关闭 RDMA 会话"
+
+[[error]]
+name = "NODE_SHM_INVALID"
+value = "0x020a0001"
+kind = "InvalidArgument"
+component = "Node"
+subsystem = "Shm"
+description = "SHM grant、范围或协议参数不合法"
+
+[[error]]
+name = "NODE_SHM_UNSUPPORTED"
+value = "0x020a0002"
+kind = "FailedPrecondition"
+component = "Node"
+subsystem = "Shm"
+description = "环境不支持所需 SHM 机制"
+
+[[error]]
+name = "NODE_SHM_UNAVAILABLE"
+value = "0x020a0003"
+kind = "Unavailable"
+component = "Node"
+subsystem = "Shm"
+description = "节点 SHM 通道不可用"
+
+[[error]]
+name = "NODE_SHM_INTERNAL"
+value = "0x020a0004"
+kind = "Internal"
+component = "Node"
+subsystem = "Shm"
+description = "SHM 内部状态或工作任务失败"
+
+[[error]]
+name = "NODE_SHM_ACCESS_DENIED"
+value = "0x020a0005"
+kind = "PermissionDenied"
+component = "Node"
+subsystem = "Shm"
+description = "SHM grant token 验证失败"
+
+[[error]]
+name = "META_CATALOG_INVALID_REQUEST"
+value = "0x03010001"
+kind = "InvalidArgument"
+component = "Meta"
+subsystem = "Catalog"
+description = "Meta 请求参数不合法"
+
+[[error]]
+name = "META_DFS_CONFLICT"
+value = "0x03030001"
+kind = "FailedPrecondition"
+component = "Meta"
+subsystem = "DistributedFs"
+description = "DFS 条件或写租约已变化，请求明确被拒绝，原 owner 必须停止修改"
+
+[[error]]
+name = "META_DFS_LEASE_RETRY"
+value = "0x03030002"
+kind = "Unavailable"
+component = "Meta"
+subsystem = "DistributedFs"
+description = "同一有效租约续租持续竞争，调用者可保留当前权威并重试；不表示 owner 已被隔离"
+
+[[error]]
+name = "META_DFS_REPAIR_SUPERSEDED"
+value = "0x03030003"
+kind = "FailedPrecondition"
+component = "Meta"
+subsystem = "DistributedFs"
+description = "复制修复任务已离开 Running 或精确 claim 已被替换，原 worker 可结束该 claim；普通 CAS 冲突不得按此处理"
+
+[[error]]
+name = "META_STORE_UNIMPLEMENTED"
+value = "0x03020001"
+kind = "Unimplemented"
+component = "Meta"
+subsystem = "Store"
+description = "Meta 持久权威后端尚未配置"
+
+[[error]]
+name = "CONFIG_INVALID"
+value = "0x04010001"
+kind = "InvalidArgument"
+component = "Runtime"
+subsystem = "Config"
+description = "配置值、组合或编译开关不合法"
+
+[[error]]
+name = "RUNTIME_INTERNAL"
+value = "0x04020001"
+kind = "Internal"
+component = "Runtime"
+subsystem = "Process"
+description = "进程基础状态解析失败"
+
+[[error]]
+name = "DIAGNOSTICS_NOT_CONFIGURED"
+value = "0x04020002"
+kind = "FailedPrecondition"
+component = "Runtime"
+subsystem = "Process"
+description = "诊断依赖的端点未配置"
+
+[[error]]
+name = "METRICS_FAILED"
+value = "0x04020003"
+kind = "Internal"
+component = "Runtime"
+subsystem = "Process"
+description = "指标注册或编码失败"
+
+[[error]]
+name = "IO_NOT_FOUND"
+value = "0x04030001"
+kind = "NotFound"
+component = "Runtime"
+subsystem = "Io"
+description = "I/O 目标不存在"
+
+[[error]]
+name = "IO_PERMISSION_DENIED"
+value = "0x04030002"
+kind = "PermissionDenied"
+component = "Runtime"
+subsystem = "Io"
+description = "操作系统拒绝权限"
+
+[[error]]
+name = "IO_ALREADY_EXISTS"
+value = "0x04030003"
+kind = "AlreadyExists"
+component = "Runtime"
+subsystem = "Io"
+description = "I/O 目标已存在"
+
+[[error]]
+name = "IO_INVALID"
+value = "0x04030004"
+kind = "InvalidArgument"
+component = "Runtime"
+subsystem = "Io"
+description = "I/O 输入或格式不合法"
+
+[[error]]
+name = "IO_TIMEOUT"
+value = "0x04030005"
+kind = "DeadlineExceeded"
+component = "Runtime"
+subsystem = "Io"
+description = "I/O 等待超时"
+
+[[error]]
+name = "IO_UNAVAILABLE"
+value = "0x04030006"
+kind = "Unavailable"
+component = "Runtime"
+subsystem = "Io"
+description = "连接中断或 I/O 暂不可用"
+
+[[error]]
+name = "IO_CAPACITY"
+value = "0x04030007"
+kind = "ResourceExhausted"
+component = "Runtime"
+subsystem = "Io"
+description = "存储空间或配额耗尽"
+
+[[error]]
+name = "IO_OTHER"
+value = "0x04030008"
+kind = "Internal"
+component = "Runtime"
+subsystem = "Io"
+description = "未归入专用类别的 I/O 失败"
+
+[[error]]
+name = "IO_NOT_DIRECTORY"
+value = "0x04030009"
+kind = "FailedPrecondition"
+component = "Runtime"
+subsystem = "Io"
+description = "路径组件不是目录"
+
+[[error]]
+name = "IO_IS_DIRECTORY"
+value = "0x0403000a"
+kind = "FailedPrecondition"
+component = "Runtime"
+subsystem = "Io"
+description = "目标是目录"
+
+[[error]]
+name = "IO_OUT_OF_MEMORY"
+value = "0x0403000c"
+kind = "ResourceExhausted"
+component = "Runtime"
+subsystem = "Io"
+description = "操作系统分配内存失败"
+
+[[error]]
+name = "IO_DIRECTORY_NOT_EMPTY"
+value = "0x0403000b"
+kind = "FailedPrecondition"
+component = "Runtime"
+subsystem = "Io"
+description = "目录非空"
+
+[[error]]
+name = "IO_CROSS_DEVICE"
+value = "0x0403000d"
+kind = "FailedPrecondition"
+component = "Runtime"
+subsystem = "Io"
+description = "跨文件系统或跨根目录操作不支持"
+
+[[error]]
+name = "IO_BAD_FILE_DESCRIPTOR"
+value = "0x0403000e"
+kind = "FailedPrecondition"
+component = "Runtime"
+subsystem = "Io"
+description = "文件描述符无效或不具备请求的访问模式"
+
+[[error]]
+name = "IO_NAME_TOO_LONG"
+value = "0x0403000f"
+kind = "OutOfRange"
+component = "Runtime"
+subsystem = "Io"
+description = "路径组件或名称超过支持长度"
+
+[[error]]
+name = "IO_NO_DATA"
+value = "0x04030010"
+kind = "NotFound"
+component = "Runtime"
+subsystem = "Io"
+description = "扩展属性或命名数据不存在"
+
+[[error]]
+name = "IO_NOT_SUPPORTED"
+value = "0x04030011"
+kind = "FailedPrecondition"
+component = "Runtime"
+subsystem = "Io"
+description = "当前对象或命名空间不支持请求的操作"
+
+[[error]]
+name = "IO_OPERATION_NOT_PERMITTED"
+value = "0x04030012"
+kind = "PermissionDenied"
+component = "Runtime"
+subsystem = "Io"
+description = "调用者缺少执行请求操作的所有者或特权权限"
+
+[[error]]
+name = "IO_TOO_MANY_SYMLINKS"
+value = "0x04030013"
+kind = "FailedPrecondition"
+component = "Runtime"
+subsystem = "Io"
+description = "路径解析遇到过多符号链接或符号链接环"
+
+[[error]]
+name = "IO_FILE_TOO_LARGE"
+value = "0x04030014"
+kind = "OutOfRange"
+component = "Runtime"
+subsystem = "Io"
+description = "文件大小或写入范围超过支持上限"
+
+[[error]]
+name = "IO_INTERRUPTED"
+value = "0x04030015"
+kind = "Cancelled"
+component = "Runtime"
+subsystem = "Io"
+description = "调用者中断了等待中的操作"
+
+[[error]]
+name = "IO_WOULD_BLOCK"
+value = "0x04030016"
+kind = "Unavailable"
+component = "Runtime"
+subsystem = "Io"
+description = "非阻塞操作当前无法立即完成"
+
+[[error]]
+name = "IO_DEADLOCK"
+value = "0x04030017"
+kind = "FailedPrecondition"
+component = "Runtime"
+subsystem = "Io"
+description = "文件锁等待将形成死锁"
+
+[[error]]
+name = "IO_NO_LOCKS"
+value = "0x04030018"
+kind = "ResourceExhausted"
+component = "Runtime"
+subsystem = "Io"
+description = "文件锁或等待记录达到容量上限"

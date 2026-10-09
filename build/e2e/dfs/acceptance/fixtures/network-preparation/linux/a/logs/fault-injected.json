@@ -1,0 +1,25 @@
+{
+  "checks": {
+    "tcp": {
+      "elapsed_seconds": 2.0017014920013025,
+      "reason": "timeout",
+      "status": "FAIL"
+    },
+    "tls": {
+      "elapsed_seconds": 2.0008047329902183,
+      "reason": "timeout",
+      "status": "FAIL"
+    },
+    "udp": {
+      "elapsed_seconds": 2.0010956699989038,
+      "reason": "timeout",
+      "status": "FAIL"
+    }
+  },
+  "source_bind": "192.168.109.12",
+  "status": "FAIL",
+  "target": "192.168.109.13",
+  "timeout_seconds": 2.0,
+  "token_bytes": 32,
+  "token_sha256": "b500892929aa30e87d2d8f7e8ea616c8e9c3f5ed3877279b201d69f550c5bbb8"
+}

@@ -1,0 +1,19 @@
+verbose
+validate data
+size 256
+count 3
+port 19669
+client
+created cm_id 0xbdc92a045cc0
+cma_event type RDMA_CM_EVENT_ADDR_RESOLVED cma_id 0xbdc92a045cc0 (parent)
+cma_event type RDMA_CM_EVENT_ROUTE_RESOLVED cma_id 0xbdc92a045cc0 (parent)
+rdma_resolve_addr - rdma_resolve_route successful
+created pd 0xbdc92a03a860
+created channel 0xbdc92a03b890
+created cq 0xbdc92a046060
+created qp 0xbdc92a0461d0
+rping_setup_buffers called on cb 0xbdc92a0387c0
+allocated & registered buffers...
+cq_thread started.
+cma_event type RDMA_CM_EVENT_REJECTED cma_id 0xbdc92a045cc0 (parent)
+cma event RDMA_CM_EVENT_REJECTED, error 8

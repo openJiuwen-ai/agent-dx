@@ -1,0 +1,234 @@
+{
+  "bindings": [
+    {
+      "backend": "OwnerFs",
+      "case_id": "FUN-02",
+      "ctl_worker": {
+        "base_dir": "/mnt/afs-ownerfs-a/home-a",
+        "driver": "/opt/afs/acceptance/drivers/visibility.py",
+        "expected_process": {
+          "boot_id": "11111111-2222-3333-4444-555555555555",
+          "config_path": "/etc/afs/meta.toml",
+          "config_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "pid": 1234,
+          "role": "meta",
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "start_ticks": 123456
+        },
+        "host": "afs-ctl",
+        "mount": "/mnt/afs-ownerfs-a",
+        "python": "/usr/bin/python3",
+        "ssh_config": "/home/afs/.ssh/config",
+        "transport": "ssh",
+        "worker_run_dir": "/var/tmp/afs-acceptance/fun-ctl"
+      },
+      "expected_meta_endpoint": "10.0.0.10:50051",
+      "fun02_targets": [
+        {
+          "base_dir": "/mnt/afs-ownerfs-a/home-a",
+          "label": "home-a-local",
+          "mount": "/mnt/afs-ownerfs-a",
+          "rel_path": "visibility/fun02-local.dat",
+          "worker": "writer"
+        },
+        {
+          "base_dir": "/mnt/afs-ownerfs-a-remote/home-a",
+          "label": "b-remote-home-a",
+          "mount": "/mnt/afs-ownerfs-a-remote",
+          "rel_path": "visibility/fun02-remote.dat",
+          "worker": "reader"
+        }
+      ],
+      "matrix": {
+        "backend": "OwnerFs",
+        "meta": "etcd",
+        "transport": "tcp"
+      },
+      "mode": "remote-host",
+      "profile": "smoke",
+      "reader_worker": {
+        "base_dir": "/mnt/afs-ownerfs-a-remote/home-a",
+        "driver": "/opt/afs/acceptance/drivers/visibility.py",
+        "expected_process": {
+          "boot_id": "33333333-4444-5555-6666-777777777777",
+          "config_path": "/etc/afs/node.toml",
+          "config_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+          "pid": 3234,
+          "role": "node",
+          "sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+          "start_ticks": 323456
+        },
+        "host": "afs-b",
+        "mount": "/mnt/afs-ownerfs-a-remote",
+        "python": "/usr/bin/python3",
+        "ssh_config": "/home/afs/.ssh/config",
+        "transport": "ssh",
+        "worker_run_dir": "/var/tmp/afs-acceptance/fun-b"
+      },
+      "timeout": 30,
+      "writer_worker": {
+        "base_dir": "/mnt/afs-ownerfs-a/home-a",
+        "driver": "/opt/afs/acceptance/drivers/visibility.py",
+        "expected_process": {
+          "boot_id": "22222222-3333-4444-5555-666666666666",
+          "config_path": "/etc/afs/node.toml",
+          "config_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "pid": 2234,
+          "role": "node",
+          "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "start_ticks": 223456
+        },
+        "host": "afs-a",
+        "mount": "/mnt/afs-ownerfs-a",
+        "python": "/usr/bin/python3",
+        "ssh_config": "/home/afs/.ssh/config",
+        "transport": "ssh",
+        "worker_run_dir": "/var/tmp/afs-acceptance/fun-a"
+      }
+    },
+    {
+      "backend": "OwnerFs",
+      "case_id": "FUN-03",
+      "ctl_worker": {
+        "base_dir": "/mnt/afs-ownerfs-a/home-a",
+        "driver": "/opt/afs/acceptance/drivers/visibility.py",
+        "expected_process": {
+          "boot_id": "11111111-2222-3333-4444-555555555555",
+          "config_path": "/etc/afs/meta.toml",
+          "config_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "pid": 1234,
+          "role": "meta",
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "start_ticks": 123456
+        },
+        "host": "afs-ctl",
+        "mount": "/mnt/afs-ownerfs-a",
+        "python": "/usr/bin/python3",
+        "ssh_config": "/home/afs/.ssh/config",
+        "transport": "ssh",
+        "worker_run_dir": "/var/tmp/afs-acceptance/fun-ctl"
+      },
+      "expected_meta_endpoint": "10.0.0.10:50051",
+      "matrix": {
+        "backend": "OwnerFs",
+        "meta": "etcd",
+        "transport": "tcp"
+      },
+      "mode": "remote-host",
+      "profile": "smoke",
+      "reader_worker": {
+        "base_dir": "/mnt/afs-ownerfs-a-remote/home-a",
+        "driver": "/opt/afs/acceptance/drivers/visibility.py",
+        "expected_process": {
+          "boot_id": "33333333-4444-5555-6666-777777777777",
+          "config_path": "/etc/afs/node.toml",
+          "config_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+          "pid": 3234,
+          "role": "node",
+          "sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+          "start_ticks": 323456
+        },
+        "host": "afs-b",
+        "mount": "/mnt/afs-ownerfs-a-remote",
+        "python": "/usr/bin/python3",
+        "ssh_config": "/home/afs/.ssh/config",
+        "transport": "ssh",
+        "worker_run_dir": "/var/tmp/afs-acceptance/fun-b"
+      },
+      "rel_path": "visibility/fun03-close-to-open.dat",
+      "timeout": 30,
+      "writer_worker": {
+        "base_dir": "/mnt/afs-ownerfs-a/home-a",
+        "driver": "/opt/afs/acceptance/drivers/visibility.py",
+        "expected_process": {
+          "boot_id": "22222222-3333-4444-5555-666666666666",
+          "config_path": "/etc/afs/node.toml",
+          "config_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "pid": 2234,
+          "role": "node",
+          "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "start_ticks": 223456
+        },
+        "host": "afs-a",
+        "mount": "/mnt/afs-ownerfs-a",
+        "python": "/usr/bin/python3",
+        "ssh_config": "/home/afs/.ssh/config",
+        "transport": "ssh",
+        "worker_run_dir": "/var/tmp/afs-acceptance/fun-a"
+      }
+    },
+    {
+      "backend": "OwnerFs",
+      "case_id": "FUN-04",
+      "ctl_worker": {
+        "base_dir": "/mnt/afs-ownerfs-a/home-a",
+        "driver": "/opt/afs/acceptance/drivers/visibility.py",
+        "expected_process": {
+          "boot_id": "11111111-2222-3333-4444-555555555555",
+          "config_path": "/etc/afs/meta.toml",
+          "config_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "pid": 1234,
+          "role": "meta",
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "start_ticks": 123456
+        },
+        "host": "afs-ctl",
+        "mount": "/mnt/afs-ownerfs-a",
+        "python": "/usr/bin/python3",
+        "ssh_config": "/home/afs/.ssh/config",
+        "transport": "ssh",
+        "worker_run_dir": "/var/tmp/afs-acceptance/fun-ctl"
+      },
+      "expected_meta_endpoint": "10.0.0.10:50051",
+      "matrix": {
+        "backend": "OwnerFs",
+        "meta": "etcd",
+        "transport": "tcp"
+      },
+      "mode": "remote-host",
+      "old_reader_fd_observation": true,
+      "profile": "smoke",
+      "reader_worker": {
+        "base_dir": "/mnt/afs-ownerfs-a-remote/home-a",
+        "driver": "/opt/afs/acceptance/drivers/visibility.py",
+        "expected_process": {
+          "boot_id": "33333333-4444-5555-6666-777777777777",
+          "config_path": "/etc/afs/node.toml",
+          "config_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+          "pid": 3234,
+          "role": "node",
+          "sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+          "start_ticks": 323456
+        },
+        "host": "afs-b",
+        "mount": "/mnt/afs-ownerfs-a-remote",
+        "python": "/usr/bin/python3",
+        "ssh_config": "/home/afs/.ssh/config",
+        "transport": "ssh",
+        "worker_run_dir": "/var/tmp/afs-acceptance/fun-b"
+      },
+      "rel_path": "visibility/fun04-sync-to-reopen.dat",
+      "timeout": 30,
+      "writer_worker": {
+        "base_dir": "/mnt/afs-ownerfs-a/home-a",
+        "driver": "/opt/afs/acceptance/drivers/visibility.py",
+        "expected_process": {
+          "boot_id": "22222222-3333-4444-5555-666666666666",
+          "config_path": "/etc/afs/node.toml",
+          "config_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "pid": 2234,
+          "role": "node",
+          "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "start_ticks": 223456
+        },
+        "host": "afs-a",
+        "mount": "/mnt/afs-ownerfs-a",
+        "python": "/usr/bin/python3",
+        "ssh_config": "/home/afs/.ssh/config",
+        "transport": "ssh",
+        "worker_run_dir": "/var/tmp/afs-acceptance/fun-a"
+      }
+    }
+  ],
+  "schema_version": 1
+}

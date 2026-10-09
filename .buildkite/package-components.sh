@@ -7,6 +7,17 @@ set -euo pipefail
 
 export ADX_RELEASE_TARGET=x86_64-unknown-linux-gnu
 export ADX_RELEASE_OUTPUT="$PWD/out/buildkite/package"
+ADX_WITH_DFS=${ADX_WITH_DFS:-0}
+case "$ADX_WITH_DFS" in
+  0|1) ;;
+  *) echo 'ADX_WITH_DFS must be 0 or 1' >&2; exit 2 ;;
+esac
+components=(platform gateway execd)
+package_args=()
+if [[ "$ADX_WITH_DFS" == "1" ]]; then
+  components+=(dfs)
+  package_args+=(--with-dfs)
+fi
 source .buildkite/bootstrap-build.sh
 rm -rf out/buildkite/components "$ADX_RELEASE_OUTPUT" \
   out/buildkite/sdk out/buildkite/backend
@@ -18,14 +29,14 @@ download_component() {
   bash .buildkite/component-transfer.sh download "$component"
 }
 pids=()
-for component in platform gateway execd; do
+for component in "${components[@]}"; do
   download_component "$component" &
   pids+=("$!")
 done
 for pid in "${pids[@]}"; do
   wait "$pid"
 done
-for component in platform gateway execd; do
+for component in "${components[@]}"; do
   mkdir "out/buildkite/components/$component"
   tar -xzf "out/buildkite/components/$component.tar.gz" \
     -C "out/buildkite/components/$component"
@@ -45,7 +56,7 @@ done
 
 stage=$(mktemp -d "${TMPDIR:-/tmp}/adx-components.XXXXXX")
 trap 'rm -rf "$stage"' EXIT
-for component in platform gateway execd; do
+for component in "${components[@]}"; do
   find "out/buildkite/components/$component" -maxdepth 1 -type f \
     ! -name manifest.json -exec cp {} "$stage/" \;
 done
@@ -71,7 +82,8 @@ python3 build/release/package.py assemble \
   --wheel "${wheel[0]}" \
   --target "$ADX_RELEASE_TARGET" \
   --profile release \
-  --output "$ADX_RELEASE_OUTPUT"
+  --output "$ADX_RELEASE_OUTPUT" \
+  "${package_args[@]}"
 echo "--- :test_tube: Install assembled release in an isolated prefix"
 install_root=$(mktemp -d "$stage/install.XXXXXX")
 bash "$ADX_RELEASE_OUTPUT/install.sh" --prefix "$install_root/adx" --bin-dir "$install_root/bin"
@@ -112,7 +124,8 @@ python3 build/release/component.py aggregate \
   --wheel "${wheel[0]}" \
   --backend-manifest out/buildkite/backend/manifest.json \
   --backend-archive out/buildkite/backend.tar.gz \
-  --output out/buildkite/build-manifest.json
+  --output out/buildkite/build-manifest.json \
+  "${package_args[@]}"
 
 # adxadmin is an independent Python artifact produced by this base build.
 buildkite-agent artifact download 'out/buildkite/admin/*' . --step admin-package

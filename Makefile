@@ -26,10 +26,27 @@ K8S_E2E_PROFILE ?= k8s-basic
 RUST_POLICY_PACKAGES := -p adx-apiserver -p adx-deployment -p adx-coordinator \
 	-p adxlet -p adx-core -p adx-discovery -p adx-observability \
 	-p adx-protocol -p adx-scheduling
+ADX_WITH_DFS ?= 0
+ADX_DFS_ALL_FEATURES ?= 0
+DFS_PACKAGES := -p afs -p afs-client -p afs-error -p afs-logging \
+	-p afs-metrics -p afs-protocol -p afs-tracing -p afs-transport
+DFS_EXCLUDES := --exclude afs --exclude afs-client --exclude afs-error \
+	--exclude afs-logging --exclude afs-metrics --exclude afs-protocol \
+	--exclude afs-tracing --exclude afs-transport
+ifeq ($(ADX_WITH_DFS),1)
+else ifeq ($(ADX_WITH_DFS),0)
+else
+$(error ADX_WITH_DFS must be 0 or 1)
+endif
+ifeq ($(ADX_DFS_ALL_FEATURES),1)
+else ifeq ($(ADX_DFS_ALL_FEATURES),0)
+else
+$(error ADX_DFS_ALL_FEATURES must be 0 or 1)
+endif
 
-.PHONY: help cargo-cache-info cargo-cache-env cargo-cache-isolated-env generate build test rust-check rust-test scheduler-bench python-test agent-test sandbox-sdk-test admin-test package ci data-plane-gateway data-plane-gateway-dev data-plane-gateway-ut
+.PHONY: help cargo-cache-info cargo-cache-env cargo-cache-isolated-env generate build test rust-check rust-test dfs-check dfs-build dfs-lint dfs-all-features-lint dfs-test scheduler-bench python-test agent-test sandbox-sdk-test admin-test package ci data-plane-gateway data-plane-gateway-dev data-plane-gateway-ut
 help:
-	@echo 'generate | build | test | package | ci SUITE=<suite>; tests: rust-check rust-test scheduler-bench python-test; cache: cargo-cache-info cargo-cache-env cargo-cache-isolated-env'
+	@echo 'generate | build | test | package | ci SUITE=<suite>; set ADX_WITH_DFS=1 for DFS/OwnerFs; tests: rust-check rust-test scheduler-bench python-test; cache: cargo-cache-info cargo-cache-env cargo-cache-isolated-env'
 cargo-cache-info:
 	@$(PYTHON) $(ADX_CARGO_CACHE_HELPER) --repo $(CURDIR) status --target-dir '$(CARGO_TARGET_DIR)'
 cargo-cache-env:
@@ -39,13 +56,38 @@ cargo-cache-isolated-env:
 generate:
 	$(CARGO) check --locked -p adx-protocol -j $(JOBS)
 build: generate
-	$(CARGO) build --locked --workspace --all-features -j $(JOBS)
+	$(CARGO) build --locked --workspace $(DFS_EXCLUDES) --all-features -j $(JOBS)
+	@if [ "$(ADX_WITH_DFS)" = "1" ]; then \
+		$(MAKE) dfs-build JOBS=$(JOBS) PYTHON='$(PYTHON)' CARGO='$(CARGO)'; \
+	fi
 rust-check:
 	$(CARGO) fmt --all -- --check
-	$(CARGO) clippy --locked --workspace --all-features --all-targets -j $(JOBS) -- -D warnings
+	$(CARGO) clippy --locked --workspace $(DFS_EXCLUDES) --all-features --all-targets -j $(JOBS) -- -D warnings
 	$(CARGO) clippy --locked --no-deps --all-features --lib --bins -j $(JOBS) $(RUST_POLICY_PACKAGES) -- -D clippy::unwrap_used
+	@if [ "$(ADX_WITH_DFS)" = "1" ]; then \
+		$(MAKE) dfs-lint JOBS=$(JOBS) PYTHON='$(PYTHON)' CARGO='$(CARGO)'; \
+	fi
 rust-test:
-	$(CARGO) test --locked --workspace --all-features -j $(JOBS) -- --test-threads=$(JOBS)
+	$(CARGO) test --locked --workspace $(DFS_EXCLUDES) --all-features -j $(JOBS) -- --test-threads=$(JOBS)
+	@if [ "$(ADX_WITH_DFS)" = "1" ]; then \
+		$(MAKE) dfs-test JOBS=$(JOBS) PYTHON='$(PYTHON)' CARGO='$(CARGO)'; \
+	fi
+dfs-check: dfs-build dfs-lint dfs-test
+dfs-build:
+	$(CARGO) build --locked -p afs --bins -j $(JOBS)
+dfs-lint:
+	$(CARGO) check --locked $(DFS_PACKAGES) --all-targets -j $(JOBS)
+	$(CARGO) clippy --locked $(DFS_PACKAGES) --all-targets -j $(JOBS) -- -D warnings
+	@if [ "$(ADX_DFS_ALL_FEATURES)" = "1" ]; then \
+		$(MAKE) dfs-all-features-lint JOBS=$(JOBS) PYTHON='$(PYTHON)' CARGO='$(CARGO)'; \
+	else \
+		echo 'Skipping DFS all-features/RDMA lint; set ADX_DFS_ALL_FEATURES=1 after libibverbs is prepared.'; \
+	fi
+dfs-all-features-lint:
+	@command -v pkg-config >/dev/null 2>&1 && pkg-config --exists libibverbs || { echo 'ADX_DFS_ALL_FEATURES=1 requires libibverbs development files' >&2; exit 2; }
+	$(CARGO) clippy --locked $(DFS_PACKAGES) --all-features --all-targets -j $(JOBS) -- -D warnings
+dfs-test:
+	$(CARGO) test --locked $(DFS_PACKAGES) --all-targets -j $(JOBS) -- --test-threads=$(JOBS)
 scheduler-bench:
 	$(CARGO) test --locked --release -p adx-coordinator --test benchmark -j $(JOBS) -- --ignored --nocapture
 python-test: sandbox-sdk-test admin-test
@@ -75,7 +117,7 @@ platform-release:
 		echo 'platform-release requires an isolated CARGO_TARGET_DIR; use cargo-cache-isolated-env or set an explicit release cache' >&2; \
 		exit 2; \
 	fi
-	JOBS=$(JOBS) PYTHON=$(PYTHON) bash build/release/build.sh
+	JOBS=$(JOBS) PYTHON=$(PYTHON) ADX_WITH_DFS=$(ADX_WITH_DFS) bash build/release/build.sh
 process-smoke:
 	$(PYTHON) build/ci/process_smoke.py --package "$(PACKAGE_DIR)" --output "$(EVIDENCE_DIR)"
 

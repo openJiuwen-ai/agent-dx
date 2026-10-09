@@ -7,6 +7,11 @@ component=${1:?component is required}
 [[ $(git rev-parse HEAD) == "$BUILDKITE_COMMIT" ]]
 
 export ADX_RELEASE_TARGET=x86_64-unknown-linux-gnu
+ADX_WITH_DFS=${ADX_WITH_DFS:-0}
+case "$ADX_WITH_DFS" in
+  0|1) ;;
+  *) echo 'ADX_WITH_DFS must be 0 or 1' >&2; exit 2 ;;
+esac
 source .buildkite/bootstrap-build.sh
 host=$(rustc -vV | sed -n 's/^host: //p')
 [[ $host == "$ADX_RELEASE_TARGET" ]] || { echo "builder target mismatch: $host" >&2; exit 1; }
@@ -46,6 +51,14 @@ case "$component" in
     python3 build/runtime/rootfs.py \
       --binary "$output/adx-execd" \
       --output "$output/adx-runtime-rootfs.img"
+    ;;
+  dfs)
+    [[ "$ADX_WITH_DFS" == "1" ]] || { echo 'DFS component requires ADX_WITH_DFS=1' >&2; exit 2; }
+    echo "--- :file_folder: Compile DFS and OwnerFs"
+    cargo build --locked --release -j "$jobs" -p afs --bins
+    for binary in afs-meta afs-node; do
+      cp "$CARGO_TARGET_DIR/release/$binary" "$output/$binary"
+    done
     ;;
   *)
     echo "unknown build component: $component" >&2
