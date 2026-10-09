@@ -12,12 +12,12 @@ Shipped deployment examples:
 | `deployment-node.yaml` | One Worker's Adxlet with embedded Relay | Shared external Redis |
 | `deployment-ingress-api.yaml` | Ingress and API Server ingress host | Shared external Redis |
 
-Optional DFS/OwnerFs examples are under `dfs/`. They are copied into release
-packages only when `ADX_WITH_DFS=1` is used for the explicit filesystem package.
-Default ADX packages do not include `afs-meta`, `afs-node`, DFS ports, data
+Optional Agent FS (AFS) examples are under `afs/`. They are copied into release
+packages only when `ADX_WITH_AFS=1` is used for the explicit filesystem package.
+Default ADX packages do not include `afs-meta`, `afs-node`, AFS ports, data
 directories, mount points or filesystem probes. The standalone AFS deployment
-example uses `with_dfs: true` and absolute AFS TOML paths; copy those TOML files
-to `/opt/adx/config/dfs/` or update the paths before running `adxctl`.
+example uses `with_afs: true` and absolute AFS TOML paths; copy those TOML files
+to `/opt/adx/config/afs/` or update the paths before running `adxctl`.
 
 See the [`adxctl` deployment guide](../../../docs/deployment/adxctl.md) for exact commands, role boundaries and split-host startup order. `adx-apiserver` is the current control-plane Frontend and hosts Ingress by default; explicit process isolation requires building `adx-ingress` from source; it is not shipped in the release package.
 

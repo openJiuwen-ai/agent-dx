@@ -64,16 +64,16 @@ class BuildImageContractTests(unittest.TestCase):
                 if container['image'] == image:
                     build_image_steps.append(step['key'])
         self.assertTrue({
-            'build-platform', 'build-gateway', 'build-execd', 'build-dfs', 'source-gate',
+            'build-platform', 'build-gateway', 'build-execd', 'build-afs', 'source-gate',
             'platform-build',
         }.issubset(build_image_steps))
-        for key in ('build-platform', 'build-gateway', 'build-execd', 'build-dfs',
+        for key in ('build-platform', 'build-gateway', 'build-execd', 'build-afs',
                     'source-gate', 'platform-build'):
             self.assertIn('key: ' + key, pipeline)
         assembly = next(step for step in steps if step['key'] == 'platform-build')
         self.assertIn('admin-package', assembly['depends_on'])
         self.assertIn('out/buildkite/build-manifest.json', pipeline)
-        for component in ('platform', 'gateway', 'execd', 'dfs'):
+        for component in ('platform', 'gateway', 'execd', 'afs'):
             self.assertIn(f'key: build-{component}', pipeline)
         component_build = (ROOT / '.buildkite/build-component.sh').read_text()
         component_package = (ROOT / '.buildkite/package-components.sh').read_text()

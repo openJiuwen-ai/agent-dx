@@ -39,7 +39,7 @@ python3 build/e2e/dfs/scripts/ownerfs/bind-two-node-localfile.py --help
 运行前需先在 Linux 上构建目标二进制，例如：
 
 ```bash
-make ADX_WITH_DFS=1 JOBS=2 dfs-build
+make ADX_WITH_AFS=1 JOBS=2 afs-build
 sudo python3 build/e2e/dfs/scripts/ownerfs/bind-two-node-localfile.py \
   --binary-dir "${CARGO_TARGET_DIR:-target}/debug" \
   --work-root "/var/tmp/adx-dfs-bind-two-node-$(date +%Y%m%dT%H%M%S)"

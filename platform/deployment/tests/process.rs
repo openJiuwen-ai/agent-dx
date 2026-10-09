@@ -14,7 +14,7 @@ use std::{
     time::Duration,
 };
 fn test_deployment(root: &Path, services: serde_json::Value) -> Deployment {
-    serde_json::from_value(json!({"schema_version":1,"with_dfs":true,"package_dir":root,"state_dir":root.join("state"),"redis_url":"redis://localhost:6379/","namespace":"test","restart_delay_ms":20,"stop_timeout_seconds":1,"services":services})).unwrap()
+    serde_json::from_value(json!({"schema_version":1,"with_afs":true,"package_dir":root,"state_dir":root.join("state"),"redis_url":"redis://localhost:6379/","namespace":"test","restart_delay_ms":20,"stop_timeout_seconds":1,"services":services})).unwrap()
 }
 fn install_test_binary(root: &Path, name: &str, script: &str) {
     std::fs::create_dir_all(root.join("bin")).unwrap();

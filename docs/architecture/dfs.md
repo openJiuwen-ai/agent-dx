@@ -1,6 +1,6 @@
-# DFS/OwnerFs 架构边界
+# Agent FS（AFS） 架构边界
 
-DFS/OwnerFs 是从 DMS/AFS 快照迁入的可选文件系统组件。它位于根级 `dfs/`，只在显式设置 `ADX_WITH_DFS=1` 时进入文件系统专用构建、测试、带组件发布包和部署入口；默认 Agent DX 构建、包和部署不包含 `afs-meta`、`afs-node` 或 FUSE 专属系统依赖。
+Agent FS（AFS） 是从 DMS/AFS 快照迁入的可选文件系统组件。它位于根级 `dfs/`，只在显式设置 `ADX_WITH_AFS=1` 时进入文件系统专用构建、测试、带组件发布包和部署入口；默认 Agent DX 构建、包和部署不包含 `afs-meta`、`afs-node` 或 FUSE 专属系统依赖。
 
 ## 组件职责
 
@@ -33,4 +33,4 @@ OwnerFs workspace bind mount 是当前实际试用场景的优先能力，默认
 
 本次 MR 不以前置完成以下能力：完整 POSIX、复杂可靠性、多 Meta、高可用、etcd/Redis 后端验收、大规模长时间运行、RDMA 性能专项、跨节点 `fcntl/flock`、阻塞锁等待取消、bind/native 与远端 FUSE 锁域协同。bind 本机 ext4 锁和单挂载内核回退不能宣传为分布式锁。
 
-支持范围、验证边界和性能目标见 [DFS/OwnerFs 迁移计划](../development/dfs-plan.md)。
+支持范围、验证边界和性能目标见 [Agent FS（AFS） 迁移计划](../development/dfs-plan.md)。

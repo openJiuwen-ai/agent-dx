@@ -1,6 +1,6 @@
-# DFS/OwnerFs 部署与配置
+# Agent FS（AFS） 部署与配置
 
-DFS/OwnerFs 是 Agent DX 的可选文件系统组件。默认部署配置、默认发布包和默认 supervisor 服务都不包含 AFS 二进制、配置示例或 FUSE 依赖；只有显式设置 `ADX_WITH_DFS=1` 的文件系统包和部署入口才包含这些内容。
+Agent FS（AFS） 是 Agent DX 的可选文件系统组件。默认部署配置、默认发布包和默认 supervisor 服务都不包含 AFS 二进制、配置示例或 FUSE 依赖；只有显式设置 `ADX_WITH_AFS=1` 的文件系统包和部署入口才包含这些内容。
 
 ## 发布包合同
 
@@ -8,14 +8,14 @@ DFS/OwnerFs 是 Agent DX 的可选文件系统组件。默认部署配置、默�
 
 - `bin/afs-meta`
 - `bin/afs-node`
-- `etc/examples/dfs/`
-- DFS/OwnerFs 专用端口、数据目录、挂载点或探针程序
+- `etc/examples/afs/`
+- Agent FS（AFS） 专用端口、数据目录、挂载点或探针程序
 
-显式文件系统包必须在 `manifest.json` 中记录 `with_dfs: true`，并包含 `afs-meta`、`afs-node` 和 `etc/examples/dfs/*` 的摘要。测试辅助程序只由验收流程按需构建和放入测试环境，不加入普通试用包。
+显式文件系统包必须在 `manifest.json` 中记录 `with_afs: true`，并包含 `afs-meta`、`afs-node` 和 `etc/examples/afs/*` 的摘要。测试辅助程序只由验收流程按需构建和放入测试环境，不加入普通试用包。
 
 ## 配置示例
 
-发布包配置示例来自 [build/config/examples/dfs/](../../build/config/examples/dfs/)，源码级示例保留在 [dfs/examples/](../../dfs/examples/)。部署层只负责把 AFS TOML 交给 `afs-meta` 和 `afs-node`，以及进程启动、健康查询、正常停止和卸载；它不改写 AFS 自有配置 schema。
+发布包配置示例来自 [build/config/examples/afs/](../../build/config/examples/afs/)，源码级示例保留在 [dfs/examples/](../../dfs/examples/)。部署层只负责把 AFS TOML 交给 `afs-meta` 和 `afs-node`，以及进程启动、健康查询、正常停止和卸载；它不改写 AFS 自有配置 schema。
 
 Meta 后端优先级：
 
@@ -24,22 +24,22 @@ Meta 后端优先级：
 3. `etcd`：资源和可靠性专题后置；
 4. `redis`：最低优先级，后置。
 
-当前试用建议使用 `local-file`。发布包内 `etc/examples/dfs/meta.toml` 已显式设置 `meta_store = "local-file"`，并把 Meta 状态放在 `/opt/adx/data/dfs/meta`，避免因代码默认值误连 etcd。使用 `memory` 时，验收报告必须明确“Meta 重启后不保留状态”。
+当前试用建议使用 `local-file`。发布包内 `etc/examples/afs/meta.toml` 已显式设置 `meta_store = "local-file"`，并把 Meta 状态放在 `/opt/adx/data/afs/meta`，避免因代码默认值误连 etcd。使用 `memory` 时，验收报告必须明确“Meta 重启后不保留状态”。
 
 单机试用前先准备配置、数据、运行时和挂载目录：
 
 ```sh
-sudo install -d -m 0755 /opt/adx/config/dfs /opt/adx/run/dfs /mnt/adx/ownerfs /mnt/adx/dfs
-sudo install -d -m 0700 /opt/adx/data/dfs/meta /opt/adx/data/dfs/node-a
-sudo cp /opt/adx/current/etc/examples/dfs/meta.toml /opt/adx/config/dfs/meta.toml
-sudo cp /opt/adx/current/etc/examples/dfs/node.toml /opt/adx/config/dfs/node.toml
+sudo install -d -m 0755 /opt/adx/config/afs /opt/adx/run/afs /mnt/adx/ownerfs /mnt/adx/dfs
+sudo install -d -m 0700 /opt/adx/data/afs/meta /opt/adx/data/afs/node-a
+sudo cp /opt/adx/current/etc/examples/afs/meta.toml /opt/adx/config/afs/meta.toml
+sudo cp /opt/adx/current/etc/examples/afs/node.toml /opt/adx/config/afs/node.toml
 ```
 
-示例 Node 配置使用 `/opt/adx/data/dfs/node-a` 和 `/opt/adx/run/dfs/node-a.sock`。如果启用 FUSE 挂载，先确认 `/mnt/adx/ownerfs` 与 `/mnt/adx/dfs` 为空目录，再在 `node.toml` 中启用对应 `ownerfs_mount` 或 `dfs_mount`。
+示例 Node 配置使用 `/opt/adx/data/afs/node-a` 和 `/opt/adx/run/afs/node-a.sock`。如果启用 FUSE 挂载，先确认 `/mnt/adx/ownerfs` 与 `/mnt/adx/dfs` 为空目录，再在 `node.toml` 中启用对应 `ownerfs_mount` 或 `dfs_mount`。
 
 ## OwnerFs workspace bind ON
 
-普通发行默认关闭 workspace bind。当前实际试用场景需要显式开启，示例字段以 `build/config/examples/dfs/node.toml` 为准；历史 `native_workspace` 命名只作为兼容入口，不能作为新的核心能力名称。
+普通发行默认关闭 workspace bind。当前实际试用场景需要显式开启，示例字段以 `build/config/examples/afs/node.toml` 为准；历史 `native_workspace` 命名只作为兼容入口，不能作为新的核心能力名称。
 
 开启条件：
 

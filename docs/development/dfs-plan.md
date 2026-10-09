@@ -1,8 +1,16 @@
-# DFS/OwnerFs 迁移计划
+# Agent FS（AFS） 迁移计划
 
 更新日期：2026-10-09。
 
-本页是 Agent DX 仓内当前 DFS/OwnerFs 迁移入口。它承接 DMS/AFS 快照的正式能力说明，但不导入原仓过程资产、历史证据、checkpoint、`.codex`、`.omx` 或旧 GitHub Actions。
+本页是 Agent DX 仓内当前 Agent FS（AFS） 迁移入口。它承接 DMS/AFS 快照的正式能力说明，但不导入原仓过程资产、历史证据、checkpoint、`.codex`、`.omx` 或旧 GitHub Actions。
+
+## 产品命名与开关
+
+统一产品名称为 Agent FS（AFS），包含 OwnerFs 和 DistributedFs（DFS）。构建开关为 `ADX_WITH_AFS=0|1`（默认 `0`），扩展 lint 开关为 `ADX_AFS_ALL_FEATURES=0|1`；Make 入口为 `afs-*`，CI suite/component 为 `afs`，包参数为 `--with-afs`，清单与部署字段为 `with_afs`。发布配置示例位于 `etc/examples/afs/`。
+
+本次迁移尚未合入，旧开关和参数不保留别名：使用 `ADX_WITH_DFS` 或 `ADX_DFS_ALL_FEATURES` 会报出替换提示，旧 `--with-dfs` 和部署 `with_dfs` 会被拒绝，旧 manifest 不能按新清单验证器误判为 OFF。历史包和测试必须由原版本工具验证；修改旧包清单不能将其升级为新版本。
+
+`dfs/` 产品源码与 `build/e2e/dfs/` 测试目录保留已对齐的快照落位；内部 DFS 类型、模式、测试 case ID 以及来源许可证目录保持原语义，不作全仓重命名。DMS 仅用于来源追溯。
 
 ## 当前目标
 
@@ -10,9 +18,9 @@
 
 - 源码位于根级 `dfs/`，包含 OwnerFs 和 DistributedFs 两条路径。
 - 默认 ADX 构建、测试、发布包和部署不包含文件系统二进制或运行依赖。
-- DFS 相关变更在默认 pipeline 中触发专用 gate；该 gate 使用 `ADX_WITH_DFS=1` 检查 DFS/OwnerFs，不改变默认发布包。
-- 显式设置 `ADX_WITH_DFS=1` 后，Buildkite 运行独立 `build-dfs` 组件步并在组装、包清单和发布校验中传递 `--with-dfs`。
-- 默认 `dfs-check` 覆盖 OwnerFs 和 DFS 默认 feature；RDMA/all-features lint 需要显式设置 `ADX_DFS_ALL_FEATURES=1`，并以 `libibverbs` 开发文件作为前置。
+- AFS 相关变更在默认 pipeline 中触发专用 gate；该 gate 使用 `ADX_WITH_AFS=1` 检查 Agent FS（AFS），不改变默认发布包。
+- 显式设置 `ADX_WITH_AFS=1` 后，Buildkite 运行独立 `build-afs` 组件步并在组装、包清单和发布校验中传递 `--with-afs`。
+- 默认 `afs-check` 覆盖 OwnerFs 和 DFS 默认 feature；RDMA/all-features lint 需要显式设置 `ADX_AFS_ALL_FEATURES=1`，并以 `libibverbs` 开发文件作为前置。
 - 测试辅助程序只由验收流程显式构建，不作为普通产品二进制发布。
 
 ## 支持范围
@@ -47,7 +55,7 @@ OwnerFs 和 DFS 共用进程、FUSE 和传输基础设施，但挂载、后端�
 
 复用 ADX 既有公共构建、镜像、发布与部署体系，只增加组件开关和必要适配；本地 builder 缺少既有工具时按现有镜像定义补齐，不把环境准备或通用构建整改混入文件系统迁移。
 
-默认入口保持 ADX 原行为，不携带 DFS/OwnerFs 二进制、配置示例或 FUSE 专属依赖：
+默认入口保持 ADX 原行为，不携带 Agent FS（AFS） 二进制、配置示例或 FUSE 专属依赖：
 
 ```sh
 make rust-check
@@ -58,14 +66,14 @@ make platform-release
 显式文件系统入口：
 
 ```sh
-ADX_WITH_DFS=1 make dfs-check
-ADX_WITH_DFS=1 make platform-release
-python3 build/ci/run.py dfs
+ADX_WITH_AFS=1 make afs-check
+ADX_WITH_AFS=1 make platform-release
+python3 build/ci/run.py afs
 ```
 
-普通 ON 产品构建只编译 `afs-meta` 和 `afs-node`，不编译 `tests/support` 下的 examples/验收探针。需要覆盖 RDMA/all-features 时显式运行 `ADX_DFS_ALL_FEATURES=1 make dfs-lint`；环境缺少 `libibverbs` 开发文件时该项失败关闭，不把默认 feature 检查冒充为 RDMA 验收。
+普通 ON 产品构建只编译 `afs-meta` 和 `afs-node`，不编译 `tests/support` 下的 examples/验收探针。需要覆盖 RDMA/all-features 时显式运行 `ADX_AFS_ALL_FEATURES=1 make afs-lint`；环境缺少 `libibverbs` 开发文件时该项失败关闭，不把默认 feature 检查冒充为 RDMA 验收。
 
-默认包不得包含 `bin/afs-meta`、`bin/afs-node` 或 `etc/examples/dfs/`。带 DFS 包的 `manifest.json` 必须包含 `with_dfs: true`，并记录上述文件的摘要。部署层只负责把已有 AFS TOML 配置交给 `afs-meta`/`afs-node`，以及启动、健康查询和正常停止，不改写 AFS 自有配置 schema。随包 DFS 示例必须显式使用 `local-file` Meta 和 `/opt/adx` 下的持久数据/运行时路径，避免目标仓试用误走 etcd 或 `/tmp` 状态。部署 YAML 必须显式设置 `with_dfs: true` 才允许 `afs-meta` 或 `afs-node` 角色；默认 profile 和默认包继续拒绝文件系统角色。`status` 只在 AFS HTTP `/health` 返回 JSON `status=ready` 时标记就绪，HTTP 200 但状态为 `starting/degraded` 仍不是 ready。
+默认包不得包含 `bin/afs-meta`、`bin/afs-node` 或 `etc/examples/afs/`。带 AFS 包的 `manifest.json` 必须包含 `with_afs: true`，并记录上述文件的摘要。部署层只负责把已有 AFS TOML 配置交给 `afs-meta`/`afs-node`，以及启动、健康查询和正常停止，不改写 AFS 自有配置 schema。随包 AFS 示例必须显式使用 `local-file` Meta 和 `/opt/adx` 下的持久数据/运行时路径，避免目标仓试用误走 etcd 或 `/tmp` 状态。部署 YAML 必须显式设置 `with_afs: true` 才允许 `afs-meta` 或 `afs-node` 角色；默认 profile 和默认包继续拒绝文件系统角色。`status` 只在 AFS HTTP `/health` 返回 JSON `status=ready` 时标记就绪，HTTP 200 但状态为 `starting/degraded` 仍不是 ready。
 
 ## 文档与配置
 
@@ -73,9 +81,9 @@ python3 build/ci/run.py dfs
 - 架构边界：[docs/architecture/dfs.md](../architecture/dfs.md)。
 - 部署与配置：[docs/deployment/dfs.md](../deployment/dfs.md)。
 - 测试与验收：[docs/testing/dfs.md](../testing/dfs.md)。
-- 示例配置：[build/config/examples/dfs/meta.toml](../../build/config/examples/dfs/meta.toml)、[build/config/examples/dfs/node.toml](../../build/config/examples/dfs/node.toml) 和 [build/config/examples/dfs/deployment-ownerfs-local.yaml](../../build/config/examples/dfs/deployment-ownerfs-local.yaml)。
+- 示例配置：[build/config/examples/afs/meta.toml](../../build/config/examples/afs/meta.toml)、[build/config/examples/afs/node.toml](../../build/config/examples/afs/node.toml) 和 [build/config/examples/afs/deployment-ownerfs-local.yaml](../../build/config/examples/afs/deployment-ownerfs-local.yaml)。
 - 维护中的验收驱动：[build/e2e/dfs/acceptance/README.md](../../build/e2e/dfs/acceptance/README.md)。
-- 迁移来源和许可证：[迁移来源索引](../migration/sources.json) 与 [DFS 快照报告](../migration/2026-10-09-dfs-snapshot.md)。
+- 迁移来源和许可证：[迁移来源索引](../migration/sources.json) 与 [AFS 快照报告](../migration/2026-10-09-dfs-snapshot.md)。
 
 ## 本次验收出口
 

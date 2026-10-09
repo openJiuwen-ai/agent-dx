@@ -69,7 +69,7 @@ pub struct Deployment {
     pub logging: crate::logging::Policy,
     pub schema_version: u32,
     #[serde(default)]
-    pub with_dfs: bool,
+    pub with_afs: bool,
     pub package_dir: PathBuf,
     pub state_dir: PathBuf,
     pub redis_url: String,
@@ -150,7 +150,7 @@ struct ProfileDeployment {
     schema_version: u32,
     profile: Profile,
     #[serde(default)]
-    with_dfs: bool,
+    with_afs: bool,
     #[serde(default)]
     internal_security: Option<adx_protocol::auth::SecurityMode>,
     #[serde(default)]
@@ -482,8 +482,8 @@ impl Deployment {
                 RedisConfig::parse(&service.config)?;
             }
             if matches!(service.role, Role::AfsMeta | Role::AfsNode) {
-                if !self.with_dfs {
-                    return Err("AFS roles require with_dfs: true".into());
+                if !self.with_afs {
+                    return Err("AFS roles require with_afs: true".into());
                 }
                 AfsServiceConfig::parse(&service.config)?;
             }
@@ -703,7 +703,7 @@ fn resolve_profile(input: ProfileDeployment) -> Result<Deployment> {
     let mut deployment: Deployment = serde_saphyr::from_str(input.profile.template())
         .map_err(|error| format!("invalid built-in deployment profile: {error}"))?;
     deployment.schema_version = input.schema_version;
-    deployment.with_dfs = input.with_dfs;
+    deployment.with_afs = input.with_afs;
     if let Some(value) = input.package_dir {
         deployment.package_dir = value;
     }
