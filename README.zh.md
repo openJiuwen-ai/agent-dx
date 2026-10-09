@@ -173,13 +173,25 @@ Execd 支持主动向 adxlet 建立独立双向控制流，上报 Ready 和 chec
 ```sh
 make help
 make rust-check
-cargo test --locked --workspace --all-features -j 2
+make rust-test
 make agent-test
 PYTHONPATH=platform/sdk/sandbox/python \
   python -m pytest -q -c platform/sdk/sandbox/pytest.ini \
   platform/sdk/sandbox/python/tests
 make package PYTHON=/path/to/venv/bin/python
 ```
+
+DFS/OwnerFs 是从 DMS/AFS 快照迁入的可选文件系统组件。默认构建、测试和发布包不包含它的运行二进制，也不引入它的系统依赖。DFS 相关变更仍会触发专用 CI gate；该 gate 使用 `ADX_WITH_DFS=1` 做检查，但不会把 DFS artifact 注入默认发布包。本地运行文件系统 gate 或构建显式带文件系统的包时设置 `ADX_WITH_DFS=1`：
+
+```sh
+ADX_WITH_DFS=1 make dfs-check
+ADX_WITH_DFS=1 make platform-release
+python3 build/ci/run.py dfs
+```
+
+`dfs-check` 使用默认 OwnerFs 和 DFS feature。可选 all-features/RDMA lint 必须显式执行（`ADX_DFS_ALL_FEATURES=1 make dfs-lint`），并先检查 `libibverbs` 开发文件。
+
+当前文件系统范围、验收边界和未支持项见 [DFS 迁移计划](docs/development/dfs-plan.md)、[架构边界](docs/architecture/dfs.md)、[部署说明](docs/deployment/dfs.md) 和 [测试验收](docs/testing/dfs.md)。发布包配置示例位于 [DFS 示例目录](build/config/examples/dfs/)。
 
 组件与集成测试使用 `python3 build/ci/run.py <suite>`。端到端门禁使用已安装发布包、公开 Sandbox SDK、Redis、Gateway、控制面、sandboxd 和 Execd。环境要求与门禁定义见[控制面 CI](docs/testing/control-plane-ci.md)和 [Kubernetes E2E 指南](build/e2e/kubernetes/README.md)。
 

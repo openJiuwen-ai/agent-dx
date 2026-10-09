@@ -1,0 +1,28 @@
+{
+  "boot_id": "36a572e0-859b-4a94-adc7-789210a83fc8",
+  "hostname": "lima-afs-accept-a",
+  "limits": {
+    "backlog": 16,
+    "max_frame": 65536,
+    "timeout_seconds": 3.0
+  },
+  "machine_id": "9253e8d222af4657a862f974ae5ce752",
+  "pid": 731821,
+  "script_sha256": "3db932a4c1a72d450edbcc222ae8ae4010061fac84b5c012f061c91186e79612",
+  "source_ip": "192.168.109.12",
+  "start_ticks": 8447739,
+  "status": "READY",
+  "tcp": {
+    "bind_ip": "192.168.109.12",
+    "port": 19566
+  },
+  "tls": {
+    "bind_ip": "192.168.109.12",
+    "mtls": true,
+    "port": 19567
+  },
+  "udp": {
+    "bind_ip": "192.168.109.12",
+    "port": 19566
+  }
+}

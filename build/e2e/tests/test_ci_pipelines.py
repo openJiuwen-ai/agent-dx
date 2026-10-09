@@ -16,12 +16,12 @@ class IndependentPipelineTests(unittest.TestCase):
         full = (ROOT / '.buildkite/pipeline-full.yml').read_text()
 
         self.assertIn('key: platform-build', package)
-        for key in ('build-platform', 'build-gateway', 'build-execd', 'source-gate'):
+        for key in ('build-platform', 'build-gateway', 'build-execd', 'build-dfs', 'source-gate', 'dfs-gate'):
             self.assertIn(f'key: {key}', package)
         steps = {step['key']: step for step in yaml.safe_load(package)['steps']}
         self.assertEqual(
             set(steps['platform-build']['depends_on']),
-            {'build-platform', 'build-gateway', 'build-execd', 'source-gate', 'admin-package', 'sdk-package'},
+            {'build-platform', 'build-gateway', 'build-execd', 'build-dfs', 'source-gate', 'dfs-gate', 'admin-package', 'sdk-package'},
         )
         self.assertIn('key: platform-e2e', package)
         self.assertIn('key: sdk-package', package)
@@ -57,6 +57,8 @@ class IndependentPipelineTests(unittest.TestCase):
         self.assertEqual(steps['admin-pypi']['depends_on'], 'platform-e2e')
         self.assertNotIn('artifact download', (ROOT / '.buildkite/upload-obs.sh').read_text())
         self.assertIn('bash .buildkite/upload-obs.sh', (ROOT / '.buildkite/package-components.sh').read_text())
+        self.assertIn('ADX_WITH_DFS', (ROOT / '.buildkite/select-pipeline.sh').read_text())
+        self.assertIn('components+=(dfs)', (ROOT / '.buildkite/package-components.sh').read_text())
 
     def test_default_entrypoint_dispatches_by_buildkite_pipeline_slug(self):
         pipeline = (ROOT / '.buildkite/pipeline.yml').read_text()

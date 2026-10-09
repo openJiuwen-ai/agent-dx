@@ -1,0 +1,20 @@
+schema_version: 1
+with_dfs: true
+package_dir: /opt/adx/current
+state_dir: /opt/adx/run/afs
+redis_url: redis://127.0.0.1:6379/
+namespace: adx-afs
+restart_limit: 3
+restart_delay_ms: 1000
+stop_timeout_seconds: 20
+services:
+  - id: meta
+    role: afs-meta
+    config:
+      config_file: /opt/adx/config/dfs/meta.toml
+      health_url: http://127.0.0.1:7401/health
+  - id: node-a
+    role: afs-node
+    config:
+      config_file: /opt/adx/config/dfs/node.toml
+      health_url: http://127.0.0.1:7501/health

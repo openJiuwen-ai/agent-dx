@@ -1,0 +1,35 @@
+[package]
+name = "afs-tracing"
+version.workspace = true
+edition = "2024"
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared distributed tracing context and process runtime for AFS"
+publish = false
+
+[features]
+default = []
+runtime = [
+    "dep:opentelemetry-otlp",
+    "dep:tokio",
+    "dep:tracing-subscriber",
+    "dep:tower",
+]
+test-support = ["runtime", "opentelemetry_sdk/testing"]
+
+[dependencies]
+afs-metrics = { path = "../metrics" }
+opentelemetry = { version = "0.32.0", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.32.0", default-features = false, features = ["trace"] }
+opentelemetry-otlp = { version = "0.32.0", default-features = false, features = ["trace", "grpc-tonic", "tls-ring"], optional = true }
+thiserror = "2.0.16"
+tonic = "0.14.6"
+tracing = "0.1.41"
+tracing-opentelemetry = { version = "0.33.0", default-features = false }
+tracing-subscriber = { version = "0.3.20", default-features = false, features = ["registry"], optional = true }
+tokio = { version = "1.47.1", features = ["rt-multi-thread"], optional = true }
+tower = { version = "0.5.2", optional = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "source_contract": "docs/testing/dfs.md#功能优先级",
+  "scope": "STD-01..STD-05 preparation only",
+  "full_acceptance": false,
+  "suites": [
+    {
+      "case_id": "STD-01",
+      "name": "pjdfstest",
+      "upstream": "https://github.com/sanwan/pjdfstest.git",
+      "pinned_revision": "d25636a227606f8960e5179741d8f4ad7030ef41",
+      "required_full": "root and non-root full tests with TAP accounting, TODO and skip visibility",
+      "short_reference": "selected ext4 smoke subsets only"
+    },
+    {
+      "case_id": "STD-02",
+      "name": "LTP-filesystem",
+      "upstream": "https://github.com/linux-test-project/ltp.git",
+      "pinned_revision": "20260529",
+      "runner": "kirk",
+      "required_full": "LTP 20260529 fs, fs_bind, fs_perms_simple, fcntl-locktests and file-related syscall set",
+      "short_reference": "selected ext4 smoke commands only"
+    },
+    {
+      "case_id": "STD-03",
+      "name": "FSx",
+      "upstream": "https://github.com/billziss-gh/secfs.test.git",
+      "pinned_revision": "edf5eb4a108bfb41073f765aef0cdd32bb3ee1ed",
+      "required_full": "FSx read/write/truncate/mmap for at least 900 seconds x 3 fixed seeds",
+      "short_reference": "short ext4 smoke run with fixed seed"
+    },
+    {
+      "case_id": "STD-04",
+      "name": "differential-random",
+      "upstream_reference": "JuiceFS fsrand/Hypothesis approach",
+      "juicefs_reference_commit": "adcca1cc61bb4d668a945d64b2e176b44ac8e5b5",
+      "required_full": "10 fixed seeds, 10000 operations per seed, ext4 versus AFS comparison and shrink corpus retention",
+      "short_reference": "local deterministic random model smoke on ext4"
+    },
+    {
+      "case_id": "STD-05",
+      "name": "suite-accounting",
+      "required_full": "discovered = PASS + FAIL + pre-reviewed exclusions + incomplete; errno and skip differences explained against ext4",
+      "short_reference": "accounting schema populated from discovered inventories and smoke outputs"
+    }
+  ],
+  "exclusion_policy": {
+    "pre_review_required": true,
+    "post_failure_exclusions_allowed": false,
+    "prepared_exclusions": []
+  }
+}

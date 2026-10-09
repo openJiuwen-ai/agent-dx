@@ -1,5 +1,5 @@
 use crate::{
-    config::{Deployment, Process},
+    config::{Deployment, Process, Role},
     Result,
 };
 use adx_protocol::relay as pb;
@@ -20,7 +20,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-    net::{UnixListener, UnixStream},
+    net::{TcpStream, UnixListener, UnixStream},
 };
 use tower::service_fn;
 
@@ -57,6 +57,10 @@ struct ManagedService {
     finished_log: Option<crate::logging::Status>,
 }
 impl ManagedService {
+    fn is_afs(&self) -> bool {
+        matches!(self.config.role, Role::AfsMeta | Role::AfsNode)
+    }
+
     fn start(&mut self, logs: &Path, policy: &crate::logging::Policy) -> Result<()> {
         let mut command = Command::new(&self.config.binary);
         command
@@ -221,10 +225,19 @@ async fn stop(children: &mut [ManagedService], timeout: Duration) -> Result<()> 
         }
     }
     for service in children.iter_mut().rev() {
+        if service.is_afs() && service.child.is_none() && service.failed {
+            return Err("AFS service failed before stop".into());
+        }
         service.signal(libc::SIGTERM)?;
         let deadline = Instant::now() + timeout;
         while let Some(child) = &mut service.child {
-            if child.try_wait()?.is_some() {
+            if let Some(status) = child.try_wait()? {
+                if service.is_afs() && !status.success() {
+                    service.child = None;
+                    service.failed = true;
+                    service.finish_logs().await?;
+                    return Err("AFS service exited unsuccessfully during stop".into());
+                }
                 break;
             }
             if Instant::now() >= deadline {
@@ -232,6 +245,9 @@ async fn stop(children: &mut [ManagedService], timeout: Duration) -> Result<()> 
                 if let Some(child) = &mut service.child {
                     child.wait()?;
                 }
+                service.child = None;
+                service.failed = true;
+                service.finish_logs().await?;
                 return Err("service termination deadline exceeded".into());
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -240,7 +256,77 @@ async fn stop(children: &mut [ManagedService], timeout: Duration) -> Result<()> 
     }
     Ok(())
 }
-fn status(children: &[ManagedService]) -> Value {
+async fn health_status(url: &str) -> Value {
+    let Some(target) = url.strip_prefix("http://") else {
+        return json!({"ready": false, "error": "unsupported health URL"});
+    };
+    let Some((authority, path)) = target.split_once('/') else {
+        return json!({"ready": false, "error": "invalid health URL"});
+    };
+    let path = format!("/{path}");
+    let Ok(Ok(mut stream)) =
+        tokio::time::timeout(Duration::from_millis(500), TcpStream::connect(authority)).await
+    else {
+        return json!({"ready": false, "error": "health endpoint unavailable"});
+    };
+    let request = format!("GET {path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n");
+    if stream.write_all(request.as_bytes()).await.is_err() {
+        return json!({"ready": false, "error": "health request failed"});
+    }
+    let mut data = Vec::new();
+    match tokio::time::timeout(Duration::from_millis(500), stream.read_to_end(&mut data)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(_)) => return json!({"ready": false, "error": "health response read failed"}),
+        Err(_) => return json!({"ready": false, "error": "health response timed out"}),
+    }
+    let status_line =
+        String::from_utf8_lossy(data.split(|b| *b == b'\n').next().unwrap_or_default())
+            .trim_end_matches('\r')
+            .to_owned();
+    if !data.starts_with(b"HTTP/1.1 200 ") && !data.starts_with(b"HTTP/1.0 200 ") {
+        return json!({"ready": false, "status_line": status_line});
+    }
+    let body = data
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|index| &data[index + 4..])
+        .unwrap_or_default();
+    let Ok(body) = serde_json::from_slice::<Value>(body) else {
+        return json!({"ready": false, "status_line": status_line, "error": "health response is not JSON"});
+    };
+    let ready = body.get("status").and_then(Value::as_str) == Some("ready");
+    json!({"ready": ready, "status_line": status_line, "body": body})
+}
+
+async fn status(children: &[ManagedService]) -> Value {
+    let mut services = Vec::new();
+    for service in children {
+        let health = if service.child.as_ref().is_some_and(|child| child.id() > 0) {
+            match &service.config.health_url {
+                Some(url) => Some(health_status(url).await),
+                None => None,
+            }
+        } else {
+            None
+        };
+        services.push(json!({
+            "id": service.config.id,
+            "role": service.config.role,
+            "pid": service.child.as_ref().map(Child::id),
+            "restarts": service.restarts,
+            "failed": service.failed,
+            "health": health,
+            "logging": service
+                .capture
+                .as_ref()
+                .map(crate::logging::Capture::status)
+                .or_else(|| service.finished_log.clone()),
+        }));
+    }
+    json!({"ok": true, "services": services})
+}
+
+fn stopped_status(children: &[ManagedService]) -> Value {
     let services = children
         .iter()
         .map(|service| {
@@ -324,7 +410,7 @@ pub async fn run(deployment: Deployment) -> Result<()> {
 
                 let request = Request::parse(request_line.trim());
                 let response = match request {
-                    Some(Request::Status) => status(&children),
+                    Some(Request::Status) => status(&children).await,
                     Some(Request::Stop) => {
                         match stop(
                             &mut children,
@@ -333,7 +419,7 @@ pub async fn run(deployment: Deployment) -> Result<()> {
                         .await
                         {
                             Ok(()) => {
-                                let service_status = status(&children)
+                                let service_status = stopped_status(&children)
                                     .get("services")
                                     .cloned()
                                     .unwrap_or_else(|| json!([]));
@@ -387,11 +473,16 @@ pub async fn run(deployment: Deployment) -> Result<()> {
             _ = tick.tick() => {
                 for service in &mut children {
                     if let Some(child) = &mut service.child {
-                        if child.try_wait()?.is_some() {
+                        if let Some(status) = child.try_wait()? {
+                            let failed_afs_exit = service.is_afs() && !status.success();
                             service.child = None;
                             service.finish_logs().await?;
-                            service.next_start = Instant::now()
-                                + Duration::from_millis(deployment.restart_delay_ms);
+                            if failed_afs_exit {
+                                service.failed = true;
+                            } else {
+                                service.next_start = Instant::now()
+                                    + Duration::from_millis(deployment.restart_delay_ms);
+                            }
                         }
                     }
                     if service.child.is_none()

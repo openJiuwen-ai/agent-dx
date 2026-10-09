@@ -1,0 +1,86 @@
+{
+  "checks": {
+    "tcp": {
+      "bytes": 32,
+      "elapsed_seconds": 0.0003778219997911947,
+      "local": [
+        "192.168.109.14",
+        60395
+      ],
+      "peer": [
+        "192.168.109.13",
+        19566
+      ],
+      "status": "PASS"
+    },
+    "tls": {
+      "bytes": 32,
+      "cipher": "TLS_AES_256_GCM_SHA384",
+      "elapsed_seconds": 0.004707777000021451,
+      "local": [
+        "192.168.109.14",
+        36561
+      ],
+      "peer": [
+        "192.168.109.13",
+        19567
+      ],
+      "server_cert_names": [
+        "192.168.109.13",
+        "afs-env-b"
+      ],
+      "status": "PASS",
+      "tls_version": "TLSv1.3"
+    },
+    "tls_missing_client_cert": {
+      "negative": "missing_client_cert",
+      "observed": {
+        "detail": "[SSL: TLSV13_ALERT_CERTIFICATE_REQUIRED] tlsv13 alert certificate required (_ssl.c:2570)",
+        "reason": "missing_client_cert",
+        "status": "FAIL"
+      },
+      "status": "PASS"
+    },
+    "tls_untrusted_ca": {
+      "negative": "untrusted_ca",
+      "observed": {
+        "detail": "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: self-signed certificate in certificate chain (_ssl.c:1000)",
+        "reason": "untrusted_ca",
+        "status": "FAIL",
+        "verify_code": "19",
+        "verify_message": "self-signed certificate in certificate chain"
+      },
+      "status": "PASS"
+    },
+    "tls_wrong_hostname": {
+      "negative": "wrong_hostname",
+      "observed": {
+        "detail": "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: Hostname mismatch, certificate is not valid for 'afs-env-probe.invalid'. (_ssl.c:1000)",
+        "reason": "wrong_hostname",
+        "status": "FAIL",
+        "verify_code": "62",
+        "verify_message": "Hostname mismatch, certificate is not valid for 'afs-env-probe.invalid'."
+      },
+      "status": "PASS"
+    },
+    "udp": {
+      "bytes": 32,
+      "elapsed_seconds": 0.00020999299977120245,
+      "local": [
+        "192.168.109.14",
+        57368
+      ],
+      "sender": [
+        "192.168.109.13",
+        19566
+      ],
+      "status": "PASS"
+    }
+  },
+  "source_bind": "192.168.109.14",
+  "status": "PASS",
+  "target": "192.168.109.13",
+  "timeout_seconds": 2.0,
+  "token_bytes": 32,
+  "token_sha256": "a915dc9520caac534eb015e3b684a9c2b9ea0e40f41b242a8c984d8f8b046c3c"
+}

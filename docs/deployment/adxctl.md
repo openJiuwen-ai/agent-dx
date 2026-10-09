@@ -20,6 +20,8 @@ release 安装器默认创建 `/usr/local/bin/adxctl -> /opt/adx/current/bin/adx
 | `apiserver` | `adx-apiserver` | 接入节点，默认内嵌 Ingress | 用户 API Key、Sandbox HTTP API、归属缓存和生命周期转发 |
 | `ingress` | 内嵌时无独立进程；分进程时为 `adx-ingress` | 接入节点 | 对外 TLS、控制请求转发以及到 Relay 的数据连接 |
 | `redis` | `redis-server` | 可选，仅一个主机 | 由 `adxctl` 托管的 Redis 7.2.5 和 AOF |
+| `afs-meta` | `afs-meta` | 显式 DFS/OwnerFs 主机 | AFS 命名空间、版本、布局和副本目录；仅 `with_dfs: true` 可用 |
+| `afs-node` | `afs-node` | 显式 DFS/OwnerFs 节点 | AFS OwnerFs/DFS 挂载、缓存、复制和节点间传输；仅 `with_dfs: true` 可用 |
 
 当前没有 `adx-frontend` 二进制。原控制面 Frontend 已重写并命名为 `adx-apiserver`。API Server 默认在同一进程中托管 Ingress，两个模块仍保持独立监听，默认使用各自的 TLS 身份；显式设置 `ingress_mode: standalone` 时才启动 `adx-ingress`。API Server 只监听回环地址，由 Ingress 对外提供 HTTPS。
 
@@ -77,7 +79,7 @@ adxctl -c /srv/adx/node.yaml validate
 
 `run` 不转入后台。systemd、Pod 或其他进程管理器应直接托管它。supervisor 在 `state_dir` 创建锁和 `supervisor.sock`，同一目录只能运行一个部署。日志写入 `state_dir/logs/<service-id>.log`。
 
-`status` 返回子进程 PID、角色、重启次数、失败标记和日志状态。PID 存在只代表进程存活，不代表集群已经可以创建 Environment。
+`status` 返回子进程 PID、角色、重启次数、失败标记和日志状态。PID 存在只代表进程存活，不代表集群已经可以创建 Environment。AFS 服务配置了 `health_url` 时，supervisor 会查询 HTTP `/health`，只有返回 JSON 且 `status` 为 `ready` 才报告 ready；HTTP 200 但状态仍是 `starting` 或 `degraded` 不算 ready。
 
 `stop` 先要求本机 adxlet 停止新准入并删除其管理的 Environment，清理成功后才按反向顺序退出组件。清理失败时命令失败，并保留 Coordinator、Redis、代理等依赖以便重试。
 
@@ -102,6 +104,7 @@ services: []
 | `redis_url` | 集群状态和 Coordinator 发现使用的 Redis；所有主机必须指向同一个后端 |
 | `namespace` | Redis 中的 ADX 集群隔离名；同一集群必须一致，不同集群必须不同 |
 | `services` | 当前主机需要启动的角色，不是整个集群的角色清单 |
+| `with_dfs` | 默认 `false`；必须显式为 `true` 才允许 `afs-meta` 或 `afs-node` 角色 |
 | `restart_limit` | 单次 supervisor 生命周期内，每个异常退出进程的最大重启次数 |
 | `stop_timeout_seconds` | 单个 Drain 或进程停止阶段的超时 |
 | `environment` | adxlet 和 API Server 共用的本地 EROFS 或 OCI 运行环境定义 |
@@ -173,6 +176,35 @@ services:
 - 数字和布尔字段继续要求原生 YAML 类型。例如 `restart_limit: 3`；不要写成 `restart_limit: "${LIMIT}"`。需要按环境调整此类字段时，为不同部署文件保留明确数值。
 
 `validate`、`render`、`run`、`status` 和 `stop` 每次读取配置时都会使用当前进程环境。运行中的 supervisor 已经生成并启动的组件不会因环境变量变化而自动更新；修改后需要按部署维护流程重新加载对应进程。
+
+## 可选 DFS/OwnerFs 进程部署
+
+DFS/OwnerFs 不属于默认 ADX profile。需要试用文件系统组件时，先使用 `ADX_WITH_DFS=1` 生成包含 `afs-meta`、`afs-node` 和 `etc/examples/dfs/` 的发布包，再准备一份显式部署 YAML：
+
+```yaml
+schema_version: 1
+with_dfs: true
+package_dir: /opt/adx/current
+state_dir: /opt/adx/run/afs
+redis_url: redis://127.0.0.1:6379/
+namespace: adx-afs
+restart_limit: 3
+restart_delay_ms: 1000
+stop_timeout_seconds: 20
+services:
+  - id: meta
+    role: afs-meta
+    config:
+      config_file: /opt/adx/config/dfs/meta.toml
+      health_url: http://127.0.0.1:7401/health
+  - id: node-a
+    role: afs-node
+    config:
+      config_file: /opt/adx/config/dfs/node.toml
+      health_url: http://127.0.0.1:7501/health
+```
+
+`adxctl` 不生成 AFS TOML，也不把 Redis namespace 注入 AFS 配置。`config_file` 必须是绝对路径，并指向部署者已经审查过的 AFS TOML。示例文件位于发布包 `etc/examples/dfs/`，可复制到 `/opt/adx/config/dfs/` 后按主机地址、挂载点、数据目录和 OwnerFs workspace bind 开关修改。默认示例显式使用 `meta_store = "local-file"`，Meta 状态写入 `/opt/adx/data/dfs/meta`，Node 数据和 UDS 分别写入 `/opt/adx/data/dfs/node-a` 与 `/opt/adx/run/dfs/node-a.sock`。启用 workspace bind 前必须先通过 OwnerFs 创建并授权对应 Home workspace；不能直接把开关当作目录初始化步骤。启动顺序为 `afs-meta` 后 `afs-node`；停止顺序相反。
 
 ## 单机 standalone 部署
 

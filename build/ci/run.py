@@ -40,6 +40,7 @@ SUITES = (
     "storage",
     "control-rpc",
     "api-control",
+    "dfs",
 )
 
 
@@ -66,6 +67,9 @@ def commands_for(suite, output, jobs):
     if suite == "rust":
         cargo = os.environ.get("CARGO", "cargo")
         return [[cargo, "--version"], make + ["rust-check", "rust-test"]]
+    if suite == "dfs":
+        cargo = os.environ.get("CARGO", "cargo")
+        return [[cargo, "--version"], make + ["ADX_WITH_DFS=1", "ADX_DFS_ALL_FEATURES=1", "dfs-check"]]
     if suite in ("control-rpc", "api-control"):
         if suite == "api-control" and (
             not Path(os.environ.get("ADX_TEST_APISERVER", "")).is_file()

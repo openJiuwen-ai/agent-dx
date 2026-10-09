@@ -1,0 +1,299 @@
+syntax = "proto3";
+package afs.node.control.v1;
+
+import "node_data.proto";
+
+// 会话协商/close 是传输资源控制，不是目录读写授权。
+// 就绪通过 RDMA SEND_WITH_IMM 探测确认，不再提供 ReadyData RPC。
+// 根访问权由 meta.proto 的 OwnerRoots 协调；B 首次加入不切换授权模式。
+// 真正撤权/删根/Home 恢复的围栏不能用 RDMA session_id 代替。
+
+// Node → Node 的控制命令：协同、屏障及传输会话建立/关闭等。
+// 控制统一 gRPC，不能把收到命令当作已经完成缓存/在途请求屏障。
+// 不承载文件内容。
+
+service NodeControl {
+  // Home owns advisory lock authority; no file payload travels here.
+  rpc OwnerGetLock(OwnerGetLockRequest) returns (OwnerGetLockReply);
+  rpc OwnerSetLock(OwnerSetLockRequest) returns (OwnerSetLockReply);
+  rpc OwnerAckLockWait(OwnerAckLockWaitRequest) returns (OwnerAckLockWaitReply);
+  rpc OwnerCancelLockWait(OwnerCancelLockWaitRequest) returns (OwnerCancelLockWaitReply);
+  rpc OwnerReleaseLocks(OwnerReleaseLocksRequest) returns (OwnerReleaseLocksReply);
+  rpc OwnerReleaseLockSession(OwnerReleaseLockSessionRequest) returns (OwnerReleaseLockSessionReply);
+
+  rpc NegotiateData(NegotiateDataRequest) returns (NegotiateDataReply);
+  rpc CloseData(CloseDataRequest) returns (CloseDataReply);
+  rpc OwnerNegotiateData(OwnerNegotiateDataRequest) returns (NegotiateDataReply);
+  rpc OwnerCloseData(OwnerCloseDataRequest) returns (CloseDataReply);
+  rpc Ping(PingRequest) returns (PingReply);
+
+  // DFS owner lifecycle is control-plane: these calls create/inspect/drop a
+  // writer handle and carry no file bytes. Data ranges remain in node_data.
+  rpc DfsOwnerOpen(DfsOwnerOpenRequest) returns (DfsOwnerOpenReply);
+  rpc DfsOwnerGetAttr(DfsOwnerGetAttrRequest) returns (DfsOwnerGetAttrReply);
+  rpc DfsOwnerMknod(DfsOwnerMknodRequest) returns (DfsOwnerMknodReply);
+  rpc DfsOwnerGetLock(DfsOwnerGetLockRequest) returns (DfsOwnerGetLockReply);
+  rpc DfsOwnerSetLock(DfsOwnerSetLockRequest) returns (DfsOwnerSetLockReply);
+  rpc DfsOwnerCancelLockWait(DfsOwnerCancelLockWaitRequest) returns (DfsOwnerCancelLockWaitReply);
+  rpc DfsOwnerAcknowledgeLockWait(DfsOwnerAcknowledgeLockWaitRequest) returns (DfsOwnerAcknowledgeLockWaitReply);
+  rpc DfsOwnerReleaseLocks(DfsOwnerReleaseLocksRequest) returns (DfsOwnerReleaseLocksReply);
+  rpc DfsOwnerReleaseLockSession(DfsOwnerReleaseLockSessionRequest) returns (DfsOwnerReleaseLockSessionReply);
+  rpc DfsOwnerRelease(DfsOwnerReleaseRequest) returns (DfsOwnerReleaseReply);
+}
+
+message NegotiateDataRequest {
+  bytes client_info = 1;
+  uint32 capacity = 2;
+  // 1 = RDMA 探测握手；0（旧实现）必须拒绝，不能绕过就绪屏障。
+  uint32 handshake_version = 3;
+}
+
+message NegotiateDataReply {
+  uint64 session_id = 1;
+  bytes server_info = 2;
+  uint32 capacity = 3;
+  bool rdma_supported = 4;
+  uint32 handshake_version = 5;
+}
+
+message CloseDataRequest {
+  uint64 session_id = 1;
+}
+
+message CloseDataReply {}
+
+message OwnerNegotiateDataRequest {
+  afs.node.data.v1.RootAccess access = 1;
+  NegotiateDataRequest negotiation = 2;
+}
+
+message OwnerCloseDataRequest {
+  afs.node.data.v1.RootAccess access = 1;
+  uint64 session_id = 2;
+}
+
+message PingRequest {
+  string payload = 1;
+}
+
+message PingReply {
+  string payload = 1;
+}
+
+message DfsOwnerOpenRequest {
+  string namespace_id = 1;
+  string inode_id = 2;
+  string owner_node_id = 3;
+  string owner_session_id = 4;
+  uint64 lease_epoch = 5;
+  string caller_session_id = 6;
+  int32 open_flags = 7;
+  bool kill_suidgid = 8;
+  // Monotonic non-zero caller admission sequence scoped by the authenticated
+  // caller node, caller process session, owner process session, and request body.
+  uint64 open_seq = 9;
+}
+message DfsOwnerOpenReply { DfsOwnerHandle handle = 1; }
+message DfsOwnerGetAttrRequest { DfsOwnerHandle handle = 1; }
+message DfsOwnerGetAttrReply { DfsOwnerFileAttr attr = 1; }
+message DfsOwnerMknodRequest {
+  string namespace_id = 1;
+  string parent_inode_id = 2;
+  string owner_node_id = 3;
+  string owner_session_id = 4;
+  uint64 lease_epoch = 5;
+  string caller_session_id = 6;
+  bytes name = 7;
+  uint32 mode = 8;
+  DfsOwnerSpecialNode special_node = 9;
+}
+message DfsOwnerMknodReply { DfsOwnerFileAttr attr = 1; }
+message DfsOwnerGetLockRequest {
+  DfsOwnerLockAuthority authority = 1;
+  DfsOwnerLockRequest lock = 2;
+}
+message DfsOwnerGetLockReply { DfsOwnerLockConflict conflict = 1; }
+message DfsOwnerSetLockRequest {
+  DfsOwnerLockAuthority authority = 1;
+  DfsOwnerLockRequest lock = 2;
+  DfsOwnerLockWaiter waiter = 3;
+}
+message DfsOwnerSetLockReply {}
+message DfsOwnerCancelLockWaitRequest {
+  DfsOwnerLockAuthority authority = 1;
+  DfsOwnerLockWaiter waiter = 2;
+}
+message DfsOwnerCancelLockWaitReply {
+  // 1 = cancelled before grant; 2 = already granted; 3 = unknown/retired.
+  uint32 outcome = 1;
+}
+message DfsOwnerAcknowledgeLockWaitRequest {
+  DfsOwnerLockAuthority authority = 1;
+  DfsOwnerLockWaiter waiter = 2;
+}
+message DfsOwnerAcknowledgeLockWaitReply {}
+message DfsOwnerReleaseLocksRequest {
+  DfsOwnerLockAuthority authority = 1;
+  DfsOwnerLockOwner owner = 2;
+  DfsOwnerLockReleaseKind release_kind = 3;
+}
+message DfsOwnerReleaseLocksReply {}
+message DfsOwnerReleaseLockSessionRequest {
+  DfsOwnerLockAuthority authority = 1;
+  string ingress_session_id = 2;
+}
+message DfsOwnerReleaseLockSessionReply {}
+message DfsOwnerReleaseRequest { DfsOwnerHandle handle = 1; }
+message DfsOwnerReleaseReply {}
+
+
+enum DfsOwnerSpecialNodeKind {
+  DFS_OWNER_SPECIAL_NODE_KIND_UNSPECIFIED = 0;
+  DFS_OWNER_SPECIAL_NODE_KIND_FIFO = 1;
+  DFS_OWNER_SPECIAL_NODE_KIND_SOCKET = 2;
+  DFS_OWNER_SPECIAL_NODE_KIND_BLOCK_DEVICE = 3;
+  DFS_OWNER_SPECIAL_NODE_KIND_CHAR_DEVICE = 4;
+}
+
+message DfsOwnerSpecialNode {
+  DfsOwnerSpecialNodeKind kind = 1;
+  uint64 rdev = 2;
+}
+
+message DfsOwnerFileAttr {
+  uint64 size = 1;
+  uint32 mode = 2;
+  uint32 uid = 3;
+  uint32 gid = 4;
+  uint32 nlink = 5;
+  uint64 atime_unix_ms = 6;
+  uint64 mtime_unix_ms = 7;
+  uint64 ctime_unix_ms = 8;
+  uint32 kind = 9;
+  DfsOwnerSpecialNode special_node = 10;
+}
+
+// Established by owner open/forwarding flow. This wire shape does not itself
+// authorize access: the receiver validates authenticated caller, handle table,
+// current owner session, lease epoch and rights before execution.
+message DfsOwnerHandle {
+  string namespace_id = 1;
+  string inode_id = 2;
+  string owner_node_id = 3;
+  string owner_session_id = 4;
+  uint64 lease_epoch = 5;
+  string caller_node_id = 6;
+  string caller_session_id = 7;
+  bytes opaque_handle = 8;
+  // Present on all live data handles. On Release only, opaque_handle may be
+  // empty when open_seq identifies a caller-known admission to cancel/retire.
+  uint64 open_seq = 9;
+}
+
+// Lock authority is separate from DfsOwnerHandle: advisory read locks need the
+// fenced inode owner but must not allocate writer handles or dirty state.
+message DfsOwnerLockAuthority {
+  string namespace_id = 1;
+  string inode_id = 2;
+  string owner_node_id = 3;
+  string owner_session_id = 4;
+  uint64 lease_epoch = 5;
+  uint64 lease_expires_at_unix_ms = 6;
+  string caller_node_id = 7;
+  string caller_session_id = 8;
+}
+
+enum DfsOwnerLockKind {
+  DFS_OWNER_LOCK_KIND_UNSPECIFIED = 0;
+  DFS_OWNER_LOCK_KIND_POSIX = 1;
+  DFS_OWNER_LOCK_KIND_FLOCK = 2;
+}
+
+enum DfsOwnerLockType {
+  DFS_OWNER_LOCK_TYPE_UNSPECIFIED = 0;
+  DFS_OWNER_LOCK_TYPE_READ = 1;
+  DFS_OWNER_LOCK_TYPE_WRITE = 2;
+  DFS_OWNER_LOCK_TYPE_UNLOCK = 3;
+}
+
+enum DfsOwnerLockReleaseKind {
+  DFS_OWNER_LOCK_RELEASE_KIND_UNSPECIFIED = 0;
+  DFS_OWNER_LOCK_RELEASE_KIND_POSIX_OWNER = 1;
+  DFS_OWNER_LOCK_RELEASE_KIND_FLOCK_OWNER = 2;
+}
+
+message DfsOwnerLockOwner {
+  string ingress_session_id = 1;
+  uint64 kernel_owner = 2;
+}
+
+message DfsOwnerLockRange {
+  uint64 start = 1;
+  uint64 end = 2;
+}
+
+message DfsOwnerLockRequest {
+  DfsOwnerLockKind kind = 1;
+  DfsOwnerLockOwner owner = 2;
+  uint32 pid = 3;
+  DfsOwnerLockRange range = 4;
+  DfsOwnerLockType lock_type = 5;
+}
+
+message DfsOwnerLockConflict {
+  DfsOwnerLockKind kind = 1;
+  DfsOwnerLockOwner owner = 2;
+  uint32 pid = 3;
+  DfsOwnerLockRange range = 4;
+  DfsOwnerLockType lock_type = 5;
+}
+
+message DfsOwnerLockWaiter {
+  string ingress_session_id = 1;
+  uint64 request_id = 2;
+}
+
+// A lock uses a held Home FD and immutable file identity, never a path.
+message OwnerLockHandle {
+  afs.node.data.v1.RootAccess access = 1;
+  afs.node.data.v1.OwnerHandle file = 2;
+  afs.node.data.v1.FileIdentity identity = 3;
+}
+message OwnerFileLock {
+  // 1 = POSIX byte-range; 2 = Linux flock (separate conflict namespace).
+  uint32 kind = 1;
+  string ingress_session_id = 2;
+  uint64 kernel_owner = 3;
+  uint32 pid = 4;
+  uint64 start = 5;
+  uint64 end = 6;
+  // 1 = read; 2 = write; 3 = unlock.
+  uint32 lock_type = 7;
+}
+message OwnerLockWaiter {
+  string ingress_session_id = 1;
+  uint64 request_id = 2;
+}
+message OwnerGetLockRequest { OwnerLockHandle handle = 1; OwnerFileLock lock = 2; }
+message OwnerGetLockReply { OwnerFileLock conflict = 1; }
+message OwnerSetLockRequest { OwnerLockHandle handle = 1; OwnerFileLock lock = 2; OwnerLockWaiter waiter = 3; }
+message OwnerSetLockReply {}
+message OwnerCancelLockWaitRequest { afs.node.data.v1.RootAccess access = 1; OwnerLockWaiter waiter = 2; }
+message OwnerCancelLockWaitReply {
+  // 1 = cancelled before grant; 2 = already granted; 3 = unknown/retired.
+  uint32 outcome = 1;
+}
+message OwnerReleaseLocksRequest {
+  OwnerLockHandle handle = 1;
+  string ingress_session_id = 2;
+  uint64 kernel_owner = 3;
+  // 1 = process POSIX owner; 2 = last flock OFD owner.
+  uint32 release_kind = 4;
+}
+message OwnerReleaseLocksReply {}
+message OwnerReleaseLockSessionRequest { afs.node.data.v1.RootAccess access = 1; string ingress_session_id = 2; }
+message OwnerReleaseLockSessionReply {}
+
+// Acknowledge reception of a completed blocking result; never unlocks data.
+message OwnerAckLockWaitRequest { afs.node.data.v1.RootAccess access = 1; OwnerLockWaiter waiter = 2; }
+message OwnerAckLockWaitReply {}
