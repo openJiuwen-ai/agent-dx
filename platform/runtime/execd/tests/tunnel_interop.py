@@ -52,29 +52,37 @@ class InteropHandler(http.server.BaseHTTPRequestHandler):
         lengths = self.headers.get_all("Content-Length", [])
         encodings = self.headers.get_all("Transfer-Encoding", [])
         if encodings:
-            assert not lengths, "ambiguous request framing"
-            assert encodings == ["chunked"], encodings
+            if not (not lengths):
+                raise AssertionError("ambiguous request framing")
+            if not (encodings == ["chunked"]):
+                raise AssertionError(encodings)
             chunks = []
             while True:
                 size = int(self.rfile.readline().strip().split(b";", 1)[0], 16)
-                assert 0 <= size <= 1024 * 1024, "invalid fixture chunk size"
+                if not (0 <= size <= 1024 * 1024):
+                    raise AssertionError("invalid fixture chunk size")
                 if size == 0:
                     while True:
                         trailer = self.rfile.readline()
-                        assert trailer, "truncated chunk trailers"
+                        if not (trailer):
+                            raise AssertionError("truncated chunk trailers")
                         if trailer == b"\r\n":
                             break
                     break
                 chunk = self.rfile.read(size)
-                assert len(chunk) == size
-                assert self.rfile.read(2) == b"\r\n"
+                if not (len(chunk) == size):
+                    raise AssertionError()
+                if not (self.rfile.read(2) == b"\r\n"):
+                    raise AssertionError()
                 chunks.append(chunk)
             body = b"".join(chunks)
         else:
-            assert len(lengths) <= 1, lengths
+            if not (len(lengths) <= 1):
+                raise AssertionError(lengths)
             content_length = int(lengths[0]) if lengths else 0
             body = self.rfile.read(content_length)
-            assert len(body) == content_length
+            if not (len(body) == content_length):
+                raise AssertionError()
         headers = list(self.headers.raw_items())
         type(self).observations.append((self.path, headers, body))
         return body
@@ -223,10 +231,7 @@ def main():
             b"Content-Type: application/json\r\n"
             b"X-Dup: first\r\n"
             b"X-Dup: second\r\n"
-            b"X-First-Hop: secret\r\n\r\n"
-            + f"{len(payload):x}\r\n".encode()
-            + payload
-            + b"\r\n0\r\n\r\n"
+            b"X-First-Hop: secret\r\n\r\n" + f"{len(payload):x}\r\n".encode() + payload + b"\r\n0\r\n\r\n"
         )
         status, _, body = raw_request(http_port, chunked)
         _, upstream_headers, upstream_body = InteropHandler.observations[-1]
@@ -256,12 +261,15 @@ def main():
         status, _, body = raw_request(
             http_port,
             b"POST /buffered HTTP/1.1\r\nHost: local\r\nConnection: close\r\n"
-            + f"Content-Length: {len(payload)}\r\n\r\n".encode() + payload,
+            + f"Content-Length: {len(payload)}\r\n\r\n".encode()
+            + payload,
         )
         _, buffered_headers, buffered_body = InteropHandler.observations[-1]
         check(
             "known-length buffered framing rebuilt",
-            status == 200 and body == b"ECHO:" + payload and buffered_body == payload
+            status == 200
+            and body == b"ECHO:" + payload
+            and buffered_body == payload
             and header_values(buffered_headers, "Content-Length") == [str(len(payload))]
             and not header_values(buffered_headers, "Transfer-Encoding"),
             f"status={status} headers={buffered_headers!r} body={body!r}",
@@ -282,8 +290,7 @@ def main():
         )
         check(
             "duplicate Set-Cookie",
-            header_values(headers, "Set-Cookie")
-            == ["session=one; Path=/", "theme=dark; Path=/"],
+            header_values(headers, "Set-Cookie") == ["session=one; Path=/", "theme=dark; Path=/"],
             repr(header_values(headers, "Set-Cookie")),
             passed,
         )
@@ -310,9 +317,7 @@ def main():
         )
         check(
             "HEAD representation length",
-            status == 200
-            and body == b""
-            and header_values(headers, "Content-Length") == ["123"],
+            status == 200 and body == b"" and header_values(headers, "Content-Length") == ["123"],
             f"headers={headers!r} body={body!r}",
             passed,
         )
@@ -322,9 +327,7 @@ def main():
         ):
             status, headers, body = raw_request(
                 http_port,
-                (
-                    f"GET {path} HTTP/1.1\r\nHost: local\r\nConnection: close\r\n\r\n"
-                ).encode(),
+                (f"GET {path} HTTP/1.1\r\nHost: local\r\nConnection: close\r\n\r\n").encode(),
             )
             check(
                 f"{expected_status} response semantics",

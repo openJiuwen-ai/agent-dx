@@ -1,16 +1,13 @@
 import importlib.util
 import json
 import os
-from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 
-
-SPEC = importlib.util.spec_from_file_location(
-    "adx_obs", Path(__file__).resolve().parents[1] / "obs_upload.py"
-)
+SPEC = importlib.util.spec_from_file_location("adx_obs", Path(__file__).resolve().parents[1] / "obs_upload.py")
 obs = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(obs)
 
@@ -86,19 +83,25 @@ class ObsClient:
             artifact.write_bytes(b"platform")
             output = root / "manifest.json"
             env = dict(os.environ)
-            env.update({
-                "PYTHONPATH": str(root),
-                "OBS_ACCESS_KEY_ID": "fixture-ak",
-                "OBS_SECRET_ACCESS_KEY": "fixture-sk",
-            })
+            env.update(
+                {
+                    "PYTHONPATH": str(root),
+                    "OBS_ACCESS_KEY_ID": "fixture-ak",
+                    "OBS_SECRET_ACCESS_KEY": "fixture-sk",
+                }
+            )
             result = subprocess.run(
                 [
                     sys.executable,
                     str(Path(obs.__file__)),
-                    "--output", str(output),
-                    "--arch", "amd64",
-                    "--timestamp", "20260921123045",
-                    "--commit", "d" * 40,
+                    "--output",
+                    str(output),
+                    "--arch",
+                    "amd64",
+                    "--timestamp",
+                    "20260921123045",
+                    "--commit",
+                    "d" * 40,
                     str(artifact),
                 ],
                 capture_output=True,
@@ -136,10 +139,13 @@ class ObsClient:
             )
 
             prefix = "adx/daily/20260921123045-aaaaaaaaaaaa/linux/amd64/"
-            self.assertEqual([item["object"] for item in manifest["artifacts"]], [
-                prefix + package.name,
-                prefix + checksum.name,
-            ])
+            self.assertEqual(
+                [item["object"] for item in manifest["artifacts"]],
+                [
+                    prefix + package.name,
+                    prefix + checksum.name,
+                ],
+            )
             self.assertEqual(manifest["artifacts"][0]["bytes"], len(b"platform"))
             self.assertEqual(len(manifest["artifacts"][0]["sha256"]), 64)
             self.assertNotIn("source", manifest["artifacts"][0])
@@ -154,12 +160,28 @@ class ObsClient:
             artifact.write_bytes(b"execd")
             with self.assertRaisesRegex(ValueError, "version"):
                 obs.plan(
-                    [artifact], "release", None, "linux", "arm64",
-                    "20260921123045", "b" * 40, "build-43", "bucket", "obs.test"
+                    [artifact],
+                    "release",
+                    None,
+                    "linux",
+                    "arm64",
+                    "20260921123045",
+                    "b" * 40,
+                    "build-43",
+                    "bucket",
+                    "obs.test",
                 )
             manifest = obs.plan(
-                [artifact], "release", "0.2.0-rc.1", "linux", "arm64",
-                "20260921123045", "b" * 40, "build-43", "bucket", "obs.test"
+                [artifact],
+                "release",
+                "0.2.0-rc.1",
+                "linux",
+                "arm64",
+                "20260921123045",
+                "b" * 40,
+                "build-43",
+                "bucket",
+                "obs.test",
             )
             self.assertEqual(
                 manifest["artifacts"][0]["object"],
@@ -181,8 +203,7 @@ class ObsClient:
             invalid.write_bytes(b"invalid")
             link = root / "link.tar.zst"
             link.symlink_to(first)
-            common = ("daily", None, "linux", "amd64", "20260921123045", "c" * 40,
-                      "build-44", "bucket", "obs.test")
+            common = ("daily", None, "linux", "amd64", "20260921123045", "c" * 40, "build-44", "bucket", "obs.test")
             with self.assertRaisesRegex(ValueError, "symlink"):
                 obs.plan([link], *common)
             with self.assertRaisesRegex(ValueError, "duplicate"):

@@ -22,13 +22,21 @@ def run(connection, image, output):
     deleted = False
     try:
         sandbox = Sandbox(
-            name=name, image=image, runtime='runc', node_id='node1',
-            cpu=500, memory=512, idle_timeout=0, detached=True,
-            connection=connection, create_timeout=150,
+            name=name,
+            image=image,
+            runtime='runc',
+            node_id='node1',
+            cpu=500,
+            memory=512,
+            idle_timeout=0,
+            detached=True,
+            connection=connection,
+            create_timeout=150,
         )
         record = json.loads(catalog()['environment:' + sandbox.id])
         backend = labeled_backend(sandbox.id)
-        assert len(backend) == 1, backend
+        if not (len(backend) == 1):
+            raise AssertionError(backend)
 
         held = sandbox.commands.run('sleep 60', background=True, command_id=held_id)
         try:
@@ -40,35 +48,47 @@ def run(connection, image, output):
         else:
             raise AssertionError('second command was admitted while registry limit was one')
 
-        assert held.kill(), 'long-running holder ended before capacity rejection'
+        if not (held.kill()):
+            raise AssertionError('long-running holder ended before capacity rejection')
         held.wait(timeout=10)
         held = None
         recovered = sandbox.commands.run(
-            command, background=True, command_id=rejected_id,
+            command,
+            background=True,
+            command_id=rejected_id,
         ).wait(timeout=30)
-        assert recovered.exit_code == 0 and recovered.stdout == 'capacity-released', recovered
+        if not (recovered.exit_code == 0 and recovered.stdout == 'capacity-released'):
+            raise AssertionError(recovered)
         marker_result = sandbox.commands.run(f'cat {marker}')
-        assert marker_result.exit_code == 0 and marker_result.stdout == 'y', marker_result
+        if not (marker_result.exit_code == 0 and marker_result.stdout == 'y'):
+            raise AssertionError(marker_result)
         sandbox.commands.run(f'rm {marker}')
 
         current = json.loads(catalog()['environment:' + sandbox.id])
-        assert current['assignment']['generation'] == record['assignment']['generation']
-        assert labeled_backend(sandbox.id) == backend
+        if not (current['assignment']['generation'] == record['assignment']['generation']):
+            raise AssertionError()
+        if not (labeled_backend(sandbox.id) == backend):
+            raise AssertionError()
         Sandbox.delete(sandbox.id, connection=connection)
         deleted = True
         _wait_deleted(sandbox.id, connection, timeout=60)
-        assert 'environment:' + sandbox.id not in catalog()
-        assert not labeled_backend(sandbox.id)
+        if not ('environment:' + sandbox.id not in catalog()):
+            raise AssertionError()
+        if not (not labeled_backend(sandbox.id)):
+            raise AssertionError()
 
         report['status'] = 'passed'
-        report['cases'].append({
-            'id': 'command.registry-capacity', 'status': 'passed',
-            'seconds': round(time.monotonic() - started, 3),
-            'instance_id': sandbox.id,
-            'holder_command_id': held_id,
-            'rejected_command_id': rejected_id,
-            'backend': backend[0],
-        })
+        report['cases'].append(
+            {
+                'id': 'command.registry-capacity',
+                'status': 'passed',
+                'seconds': round(time.monotonic() - started, 3),
+                'instance_id': sandbox.id,
+                'holder_command_id': held_id,
+                'rejected_command_id': rejected_id,
+                'backend': backend[0],
+            }
+        )
         return report
     except Exception as error:
         report['error'] = str(error)

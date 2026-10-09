@@ -7,6 +7,7 @@ available under a block-network policy; invoke chunks remain the bounded
 fallback for transport failures.
 """
 
+import logging
 import os
 import shlex
 import tarfile
@@ -28,15 +29,11 @@ def _safe_extract_tar(tar: tarfile.TarFile, dest: str) -> None:
     for member in tar.getmembers():
         target = os.path.realpath(os.path.join(dest, member.name))
         if target != dest_real and not target.startswith(dest_real + os.sep):
-            raise RuntimeError(
-                f"unsafe tar member escapes destination: {member.name!r}"
-            )
+            raise RuntimeError(f"unsafe tar member escapes destination: {member.name!r}")
         tar.extract(member, dest)
 
 
-def _tar_directory_chunks(
-    local_path: str, chunk_size: int = 1024 * 1024
-) -> Iterator[bytes]:
+def _tar_directory_chunks(local_path: str, chunk_size: int = 1024 * 1024) -> Iterator[bytes]:
     """Stream a directory as tar bytes without materializing a temporary archive."""
     read_fd, write_fd = os.pipe()
     errors = []
@@ -50,9 +47,7 @@ def _tar_directory_chunks(
         except BaseException as exc:  # propagate producer failures to consumer
             errors.append(exc)
 
-    producer = threading.Thread(
-        target=produce_tar, name="adx-copy-from-local-tar", daemon=True
-    )
+    producer = threading.Thread(target=produce_tar, name="adx-copy-from-local-tar", daemon=True)
     producer.start()
 
     try:
@@ -128,9 +123,7 @@ class Filesystem:
             try:
                 chunk = bytes.fromhex(str(result.get("data", "")))
             except ValueError as exc:
-                raise RuntimeError(
-                    f"Invalid RuntimeRPC file data for {path}"
-                ) from exc
+                raise RuntimeError(f"Invalid RuntimeRPC file data for {path}") from exc
             if int(result.get("bytes_read", -1)) != len(chunk):
                 raise RuntimeError(f"Invalid RuntimeRPC byte count for {path}")
             if chunk:
@@ -157,21 +150,23 @@ class Filesystem:
         try:
             self._invoke("file.remove", path=path)
         except Exception:
-            pass
+            logging.getLogger(__name__).debug("Best-effort operation failed", exc_info=True)
 
     @overload
-    def read(self, path: str, format: Literal["text"] = "text") -> str: ...
+    def read(self, path: str, format: Literal["text"] = "text") -> str:
+        """Read decoded text."""
+        ...
 
     @overload
-    def read(self, path: str, format: Literal["bytes"]) -> bytes: ...
+    def read(self, path: str, format: Literal["bytes"]) -> bytes:
+        """Read the original bytes."""
+        ...
 
     def read(self, path: str, format: str = "text") -> Union[str, bytes]:
         if format not in ("text", "bytes"):
             raise ValueError("format must be 'text' or 'bytes'")
         if self._client.direct_enabled:
-            data = self._client.download_bytes_direct(
-                self._sid, path, timeout_or_default()
-            )
+            data = self._client.download_bytes_direct(self._sid, path, timeout_or_default())
         else:
             data = b"".join(self._read_rpc_chunks(path))
         if format == "bytes":
@@ -182,9 +177,7 @@ class Filesystem:
         payload = data if isinstance(data, bytes) else data.encode("utf-8")
         if not self._client.direct_enabled:
             return self._write_rpc_chunks(path, iter((payload,)))
-        result = self._client.upload_bytes_direct(
-            self._sid, payload, path, timeout_or_default()
-        )
+        result = self._client.upload_bytes_direct(self._sid, payload, path, timeout_or_default())
         return self._entry_from_upload(_check(result, f"Failed to write {path}"))
 
     def list(self, path: str, depth: int = 1) -> List[EntryInfo]:
@@ -218,9 +211,7 @@ class Filesystem:
         return self._entry(result)
 
     def make_dir(self, path: str) -> bool:
-        result = _check(
-            self._invoke("file.make_dir", path=path), f"Failed to make dir {path}"
-        )
+        result = _check(self._invoke("file.make_dir", path=path), f"Failed to make dir {path}")
         return result["created"]
 
     def get_info(self, path: str) -> EntryInfo:
@@ -246,9 +237,7 @@ class Filesystem:
             if os.path.isdir(local_path):
                 temp_path = f"/tmp/.adx-upload-{uuid.uuid4().hex}.tar"
                 try:
-                    self._write_rpc_chunks(
-                        temp_path, _tar_directory_chunks(local_path)
-                    )
+                    self._write_rpc_chunks(temp_path, _tar_directory_chunks(local_path))
                     command = (
                         f"mkdir -p -- {shlex.quote(remote_path)} && "
                         f"tar -xf {shlex.quote(temp_path)} "
@@ -282,9 +271,7 @@ class Filesystem:
             )
             _check(result, f"Failed to copy {local_path} to {remote_path}")
             return
-        result = self._client.upload_file_direct(
-            self._sid, local_path, remote_path, timeout_or_default()
-        )
+        result = self._client.upload_file_direct(self._sid, local_path, remote_path, timeout_or_default())
         _check(result, f"Failed to copy {local_path} to {remote_path}")
 
     def copy_to_local(self, remote_path: str, local_path: str) -> None:
@@ -309,10 +296,7 @@ class Filesystem:
                 else:
                     remote_temp = f"/tmp/.adx-download-{uuid.uuid4().hex}.tar"
                     try:
-                        command = (
-                            f"tar -cf {shlex.quote(remote_temp)} "
-                            f"-C {shlex.quote(remote_path)} ."
-                        )
+                        command = f"tar -cf {shlex.quote(remote_temp)} -C {shlex.quote(remote_path)} ."
                         self._run_control_command(
                             command,
                             f"Failed to archive {remote_path}",
@@ -342,9 +326,7 @@ class Filesystem:
                     os.unlink(part_path)
             return
 
-        self._client.download_file_direct(
-            self._sid, remote_path, local_path, timeout_or_default()
-        )
+        self._client.download_file_direct(self._sid, remote_path, local_path, timeout_or_default())
 
     @staticmethod
     def _entry(result: dict) -> EntryInfo:

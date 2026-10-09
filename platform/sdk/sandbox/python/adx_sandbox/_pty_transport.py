@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import threading
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future
@@ -138,7 +139,7 @@ class _PtyConnection:
             try:
                 future.result(timeout=_WRITE_TIMEOUT)
             except Exception:
-                pass
+                logging.getLogger(__name__).debug("Best-effort operation failed", exc_info=True)
         elif loop is not None and run_task is not None and not run_task.done():
             loop.call_soon_threadsafe(run_task.cancel)
         if self._thread.is_alive() and threading.current_thread() is not self._thread:
@@ -149,17 +150,13 @@ class _PtyConnection:
             self._raise_error()
             raise _PtyTransportError("PTY session is no longer running")
         if threading.current_thread() is self._thread:
-            raise _PtyTransportError(
-                "PTY methods cannot be called from the on_data callback"
-            )
+            raise _PtyTransportError("PTY methods cannot be called from the on_data callback")
         with self._state_lock:
             loop = self._loop
             websocket = self._websocket
         if loop is None or websocket is None:
             raise _PtyTransportError("PTY transport is not connected")
-        future: Future[Any] = asyncio.run_coroutine_threadsafe(
-            websocket.send(data), loop
-        )
+        future: Future[Any] = asyncio.run_coroutine_threadsafe(websocket.send(data), loop)
         try:
             future.result(timeout=_WRITE_TIMEOUT)
         except Exception as exc:
@@ -176,7 +173,7 @@ class _PtyConnection:
             try:
                 self._on_done()
             except Exception:
-                pass
+                logging.getLogger(__name__).debug("Best-effort operation failed", exc_info=True)
 
     async def _run(self) -> None:
         import websockets.asyncio.client as ws_client
@@ -205,11 +202,7 @@ class _PtyConnection:
                             try:
                                 self._on_data(message)
                             except BaseException as exc:
-                                self._set_error(
-                                    _PtyTransportError(
-                                        f"PTY on_data callback failed: {exc}"
-                                    )
-                                )
+                                self._set_error(_PtyTransportError(f"PTY on_data callback failed: {exc}"))
                                 await websocket.close()
                                 return
                         continue
@@ -220,18 +213,14 @@ class _PtyConnection:
                         return
         except BaseException as exc:
             if not self._closed_by_client and not self._done.is_set():
-                self._set_error(
-                    _PtyTransportError(f"PTY WebSocket connection failed: {exc}")
-                )
+                self._set_error(_PtyTransportError(f"PTY WebSocket connection failed: {exc}"))
         finally:
             with self._state_lock:
                 self._websocket = None
                 self._loop = None
                 self._run_task = None
         if not self._closed_by_client and not self._done.is_set():
-            self._set_error(
-                _PtyTransportError("PTY connection closed before terminal status")
-            )
+            self._set_error(_PtyTransportError("PTY connection closed before terminal status"))
 
     def _handle_control(self, message: str) -> None:
         try:
@@ -266,9 +255,7 @@ class _PtyConnection:
             self._session_id = session_id
             self._set_error(_PtyTransportError(f"remote PTY error: {detail}"))
         else:
-            self._set_error(
-                _PtyTransportError(f"unknown PTY control event {event_type!r}")
-            )
+            self._set_error(_PtyTransportError(f"unknown PTY control event {event_type!r}"))
 
     def _set_error(self, error: BaseException) -> None:
         with self._state_lock:

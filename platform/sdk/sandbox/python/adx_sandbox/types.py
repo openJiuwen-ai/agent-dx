@@ -25,18 +25,22 @@ class RestartPolicy:
     max_backoff_seconds: int = 30
 
     def __post_init__(self):
-        for value, limit in ((self.max_attempts, (1 << 32) - 1),
-                             (self.initial_backoff_seconds, (1 << 64) - 1),
-                             (self.max_backoff_seconds, (1 << 64) - 1)):
+        for value, limit in (
+            (self.max_attempts, (1 << 32) - 1),
+            (self.initial_backoff_seconds, (1 << 64) - 1),
+            (self.max_backoff_seconds, (1 << 64) - 1),
+        ):
             if isinstance(value, bool) or not isinstance(value, int) or not 0 < value <= limit:
                 raise ValueError("restart limits must be positive integers within protocol bounds")
         if self.initial_backoff_seconds > self.max_backoff_seconds:
             raise ValueError("initial restart backoff must not exceed maximum backoff")
 
     def to_dict(self) -> Dict[str, int]:
-        return {"maxAttempts": self.max_attempts,
-                "initialBackoffSeconds": self.initial_backoff_seconds,
-                "maxBackoffSeconds": self.max_backoff_seconds}
+        return {
+            "maxAttempts": self.max_attempts,
+            "initialBackoffSeconds": self.initial_backoff_seconds,
+            "maxBackoffSeconds": self.max_backoff_seconds,
+        }
 
 
 _DNS_LABEL_PATTERN = re.compile(r"^[a-z0-9_-]+$")
@@ -99,10 +103,7 @@ class ConnectionConfig:
             raise ValueError("server_address must be a non-empty string")
         object.__setattr__(self, "token", self.token.strip())
         if self.gateway_address is not None:
-            if (
-                not isinstance(self.gateway_address, str)
-                or not self.gateway_address.strip()
-            ):
+            if not isinstance(self.gateway_address, str) or not self.gateway_address.strip():
                 raise ValueError("gateway_address must be a non-empty string")
             object.__setattr__(
                 self,
@@ -162,9 +163,7 @@ def _normalize_domain_pattern(pattern: str, description: str) -> str:
         # Preserve the existing DNS-SD-compatible underscore behavior for
         # ASCII owner names while normalizing ordinary IDNs to punycode.
         if any(ord(char) > 127 for char in value):
-            raise ValueError(
-                f"invalid {description} pattern: {pattern!r}"
-            ) from None
+            raise ValueError(f"invalid {description} pattern: {pattern!r}") from None
     if len(value) > 253:
         raise ValueError(f"invalid {description} pattern: {pattern!r}")
     for label in value.split("."):
@@ -227,13 +226,12 @@ class PortRange:
         object.__setattr__(self, "last", last)
 
     def to_dict(self) -> Dict[str, int]:
-        assert self.last is not None
+        if not (self.last is not None):
+            raise AssertionError()
         return {"first": self.first, "last": self.last}
 
 
-def _normalize_port_range(
-    value: Optional[object], name: str
-) -> Optional[PortRange]:
+def _normalize_port_range(value: Optional[object], name: str) -> Optional[PortRange]:
     if value is None or isinstance(value, PortRange):
         return value
     if isinstance(value, bool) or not isinstance(value, int):
@@ -262,36 +260,22 @@ class NetworkRule:
 
     def __post_init__(self) -> None:
         action = _normalize_choice(self.action, "action", _NETWORK_ACTIONS)
-        direction = _normalize_choice(
-            self.direction, "direction", _NETWORK_DIRECTIONS
-        )
-        protocol = _normalize_choice(
-            self.protocol, "protocol", _NETWORK_PROTOCOLS
-        )
+        direction = _normalize_choice(self.direction, "direction", _NETWORK_DIRECTIONS)
+        protocol = _normalize_choice(self.protocol, "protocol", _NETWORK_PROTOCOLS)
         if self.cidr is not None and self.domain is not None:
             raise ValueError("cidr and domain cannot be combined in one rule")
         cidr = _normalize_cidr(self.cidr) if self.cidr is not None else None
-        domain = (
-            _normalize_domain_pattern(self.domain, "domain")
-            if self.domain is not None
-            else None
-        )
+        domain = _normalize_domain_pattern(self.domain, "domain") if self.domain is not None else None
         if domain is not None and direction != "egress":
             raise ValueError("domain rules are valid only for egress")
         port_range = _normalize_port_range(self.port_range, "port_range")
-        sandbox_port_range = _normalize_port_range(
-            self.sandbox_port_range, "sandbox_port_range"
-        )
-        if (port_range is not None or sandbox_port_range is not None) and (
-            protocol not in ("tcp", "udp")
-        ):
+        sandbox_port_range = _normalize_port_range(self.sandbox_port_range, "sandbox_port_range")
+        if (port_range is not None or sandbox_port_range is not None) and (protocol not in ("tcp", "udp")):
             raise ValueError("port ranges require protocol='tcp' or 'udp'")
         if isinstance(self.priority, bool) or not isinstance(self.priority, int):
             raise TypeError("priority must be an integer")
         if self.priority < 1 or self.priority > _MAX_USER_RULE_PRIORITY:
-            raise ValueError(
-                f"priority must be in 1..{_MAX_USER_RULE_PRIORITY}"
-            )
+            raise ValueError(f"priority must be in 1..{_MAX_USER_RULE_PRIORITY}")
         object.__setattr__(self, "action", action)
         object.__setattr__(self, "direction", direction)
         object.__setattr__(self, "protocol", protocol)
@@ -313,12 +297,14 @@ class NetworkRule:
         if self.domain is not None:
             peer["domain"] = self.domain
         if self.port_range is not None:
-            assert isinstance(self.port_range, PortRange)
+            if not (isinstance(self.port_range, PortRange)):
+                raise AssertionError()
             peer["portRange"] = self.port_range.to_dict()
         if peer:
             value["peer"] = peer
         if self.sandbox_port_range is not None:
-            assert isinstance(self.sandbox_port_range, PortRange)
+            if not (isinstance(self.sandbox_port_range, PortRange)):
+                raise AssertionError()
             value["sandboxPortRange"] = self.sandbox_port_range.to_dict()
         return value
 
@@ -348,9 +334,7 @@ class TrafficPolicy:
             raise TypeError("rules must be a sequence of NetworkRule values")
         rules = tuple(self.rules)
         if len(rules) > _MAX_TRAFFIC_RULES:
-            raise ValueError(
-                f"traffic policies support at most {_MAX_TRAFFIC_RULES} rules"
-            )
+            raise ValueError(f"traffic policies support at most {_MAX_TRAFFIC_RULES} rules")
         if any(not isinstance(rule, NetworkRule) for rule in rules):
             raise TypeError("rules must contain only NetworkRule values")
         object.__setattr__(self, "ingress_default_action", ingress)
@@ -375,12 +359,8 @@ class DNSRule:
     action: str = "deny"
 
     def __post_init__(self) -> None:
-        object.__setattr__(
-            self, "action", _normalize_choice(self.action, "action", _NETWORK_ACTIONS)
-        )
-        object.__setattr__(
-            self, "pattern", _normalize_domain_pattern(self.pattern, "DNS")
-        )
+        object.__setattr__(self, "action", _normalize_choice(self.action, "action", _NETWORK_ACTIONS))
+        object.__setattr__(self, "pattern", _normalize_domain_pattern(self.pattern, "DNS"))
 
     def to_dict(self) -> Dict[str, str]:
         return {"action": self.action, "pattern": self.pattern}
@@ -394,9 +374,7 @@ class DNSPolicy:
     rules: Sequence[DNSRule] = ()
 
     def __post_init__(self) -> None:
-        default = _normalize_choice(
-            self.default_action, "default_action", _NETWORK_ACTIONS
-        )
+        default = _normalize_choice(self.default_action, "default_action", _NETWORK_ACTIONS)
         if isinstance(self.rules, (str, bytes)):
             raise TypeError("rules must be a sequence of DNSRule values")
         rules = tuple(self.rules)
@@ -434,24 +412,12 @@ class NetworkPolicy:
             raise TypeError("block_network must be a boolean")
         if isinstance(self.dns_blacklist, (str, bytes)):
             raise TypeError("dns_blacklist must be a sequence of patterns")
-        normalized = tuple(
-            dict.fromkeys(
-                _normalize_dns_pattern(item) for item in self.dns_blacklist
-            )
-        )
+        normalized = tuple(dict.fromkeys(_normalize_dns_pattern(item) for item in self.dns_blacklist))
         if self.block_network and normalized:
-            raise ValueError(
-                "block_network and dns_blacklist cannot be combined"
-            )
-        if (self.block_network or normalized) and (
-            self.traffic is not None or self.dns is not None
-        ):
-            raise ValueError(
-                "legacy and schema v2 network policies cannot be combined"
-            )
-        if self.traffic is not None and not isinstance(
-            self.traffic, TrafficPolicy
-        ):
+            raise ValueError("block_network and dns_blacklist cannot be combined")
+        if (self.block_network or normalized) and (self.traffic is not None or self.dns is not None):
+            raise ValueError("legacy and schema v2 network policies cannot be combined")
+        if self.traffic is not None and not isinstance(self.traffic, TrafficPolicy):
             raise TypeError("traffic must be a TrafficPolicy or None")
         if self.dns is not None and not isinstance(self.dns, DNSPolicy):
             raise TypeError("dns must be a DNSPolicy or None")
@@ -494,12 +460,7 @@ class NetworkPolicy:
 
     @property
     def is_empty(self) -> bool:
-        return (
-            not self.block_network
-            and not self.dns_blacklist
-            and self.traffic is None
-            and self.dns is None
-        )
+        return not self.block_network and not self.dns_blacklist and self.traffic is None and self.dns is None
 
     def to_dict(self) -> Dict[str, Any]:
         result: Dict[str, Any] = {}
@@ -693,12 +654,8 @@ class Mount:
         sources = [self.image_url, self.s3_config]
         count = sum(1 for s in sources if s is not None)
         if count != 1:
-            raise ValueError(
-                f"Exactly one of image_url, s3_config must be specified, got {count}"
-            )
-        if self.image_url is not None and (
-            not isinstance(self.image_url, str) or not self.image_url.strip()
-        ):
+            raise ValueError(f"Exactly one of image_url, s3_config must be specified, got {count}")
+        if self.image_url is not None and (not isinstance(self.image_url, str) or not self.image_url.strip()):
             raise ValueError("image_url must be a non-empty string")
         if self.type not in ("bind", "erofs"):
             raise ValueError(f"type must be 'bind' or 'erofs', got {self.type!r}")

@@ -2,13 +2,12 @@
 
 import importlib.util
 import json
-from pathlib import Path
 import sys
 import tempfile
 import types
 import unittest
+from pathlib import Path
 from unittest.mock import patch
-
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -38,21 +37,26 @@ class RuntimeAffinityScenarioTests(unittest.TestCase):
 
         def catalog():
             result = {
-                f"node:{node_id}": json.dumps({
-                    "node": {
-                        "id": node_id, "available": True,
-                        "runtime_classes": ["runc", "runsc"] if node_id == runsc_node else ["runc"],
-                    },
-                    "session": {"routable": True},
-                })
+                f"node:{node_id}": json.dumps(
+                    {
+                        "node": {
+                            "id": node_id,
+                            "available": True,
+                            "runtime_classes": ["runc", "runsc"] if node_id == runsc_node else ["runc"],
+                        },
+                        "session": {"routable": True},
+                    }
+                )
                 for node_id in ("node1", "node2")
             }
             if not state["deleted"]:
-                result["environment:default-runtime-affinity"] = json.dumps({
-                    "spec": {"runtime_class": "runsc"},
-                    "assignment": {"node_id": assigned_node},
-                    "result": {"state": "Running", "resources_held": True},
-                })
+                result["environment:default-runtime-affinity"] = json.dumps(
+                    {
+                        "spec": {"runtime_class": "runsc"},
+                        "assignment": {"node_id": assigned_node},
+                        "result": {"state": "Running", "resources_held": True},
+                    }
+                )
             return result
 
         modules = {

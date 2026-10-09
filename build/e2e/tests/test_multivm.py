@@ -1,12 +1,12 @@
-import importlib.util
-from pathlib import Path
 import hashlib
+import importlib.util
 import io
 import json
 import tarfile
 import tempfile
-from types import SimpleNamespace
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location('multivm_contract', ROOT / 'multivm/contract.py')
@@ -19,28 +19,51 @@ def inventory():
     value = {
         'schema_version': 1,
         'machines': [
-            {'role': 'control', 'machine_id': 'm-control', 'hostname': 'control', 'address': '10.0.0.10', 'ssh_target': 'control'},
-            {'role': 'worker-1', 'machine_id': 'm-worker-1', 'hostname': 'worker-1', 'address': '10.0.0.11', 'ssh_target': 'worker-1', 'node_id': 'node1'},
-            {'role': 'worker-2', 'machine_id': 'm-worker-2', 'hostname': 'worker-2', 'address': '10.0.0.12', 'ssh_target': 'worker-2', 'node_id': 'node2'},
+            {
+                'role': 'control',
+                'machine_id': 'm-control',
+                'hostname': 'control',
+                'address': '10.0.0.10',
+                'ssh_target': 'control',
+            },
+            {
+                'role': 'worker-1',
+                'machine_id': 'm-worker-1',
+                'hostname': 'worker-1',
+                'address': '10.0.0.11',
+                'ssh_target': 'worker-1',
+                'node_id': 'node1',
+            },
+            {
+                'role': 'worker-2',
+                'machine_id': 'm-worker-2',
+                'hostname': 'worker-2',
+                'address': '10.0.0.12',
+                'ssh_target': 'worker-2',
+                'node_id': 'node2',
+            },
         ],
-        'artifacts': {'commit': 'a' * 40, 'release_sha256': 'b' * 64,
-                      'target': 'x86_64-unknown-linux-gnu'},
+        'artifacts': {'commit': 'a' * 40, 'release_sha256': 'b' * 64, 'target': 'x86_64-unknown-linux-gnu'},
     }
     return value
 
 
 def result():
     return {
-        'status': 'passed', 'profile': 'multi-vm', 'deployment': 'process',
-        'required_checks': list(contract.REQUIRED), 'checks': list(contract.REQUIRED),
-        'missing_checks': [], 'cleanup_errors': [], 'error': None,
+        'status': 'passed',
+        'profile': 'multi-vm',
+        'deployment': 'process',
+        'required_checks': list(contract.REQUIRED),
+        'checks': list(contract.REQUIRED),
+        'missing_checks': [],
+        'cleanup_errors': [],
+        'error': None,
         'inventory_sha256': contract.inventory_digest(inventory()),
         'placement': [
             {'instance_id': 'one', 'machine_role': 'worker-1'},
             {'instance_id': 'two', 'machine_role': 'worker-2'},
         ],
-        'final_state': {'backend_instances': {'worker-1': 0, 'worker-2': 0},
-                        'published_routes': 0},
+        'final_state': {'backend_instances': {'worker-1': 0, 'worker-2': 0}, 'published_routes': 0},
     }
 
 
@@ -96,10 +119,13 @@ class MultiVmSdkAcceptanceTests(unittest.TestCase):
             def __init__(self, *, node_id, **_options):
                 self.id = 'sandbox-' + node_id
                 state['actual'][self.id] = node_id
-                self.commands = SimpleNamespace(run=lambda _command: SimpleNamespace(
-                    stdout='adx-three-vm', stderr='stderr', exit_code=7))
-                self.files = SimpleNamespace(write=lambda _path, payload: setattr(self, 'payload', payload),
-                                             read=lambda _path, **_kwargs: self.payload)
+                self.commands = SimpleNamespace(
+                    run=lambda _command: SimpleNamespace(stdout='adx-three-vm', stderr='stderr', exit_code=7)
+                )
+                self.files = SimpleNamespace(
+                    write=lambda _path, payload: setattr(self, 'payload', payload),
+                    read=lambda _path, **_kwargs: self.payload,
+                )
 
             def is_running(self):
                 return True
@@ -119,13 +145,25 @@ class MultiVmSdkAcceptanceTests(unittest.TestCase):
             if command == ('ip', '-j', 'address', 'show'):
                 return json.dumps([{'addr_info': [{'local': machine['address']}]}])
             if command == ('cat', '/opt/adx/current/manifest.json'):
-                return json.dumps({'commit': inventory()['artifacts']['commit'],
-                                   'target': inventory()['artifacts']['target']})
-            if command[:5] == ('/opt/adx/current/bin/adx-inspect', '-c',
-                                '/opt/adx/config/deployment.yaml', 'environment', 'get'):
+                return json.dumps(
+                    {'commit': inventory()['artifacts']['commit'], 'target': inventory()['artifacts']['target']}
+                )
+            if command[:5] == (
+                '/opt/adx/current/bin/adx-inspect',
+                '-c',
+                '/opt/adx/config/deployment.yaml',
+                'environment',
+                'get',
+            ):
                 instance_id = command[5]
-                return json.dumps({'id': instance_id, 'node_id': instance_id.removeprefix('sandbox-'),
-                                   'state': 'Running', 'resources_held': True})
+                return json.dumps(
+                    {
+                        'id': instance_id,
+                        'node_id': instance_id.removeprefix('sandbox-'),
+                        'state': 'Running',
+                        'resources_held': True,
+                    }
+                )
             if command[:4] == ('sbox', '-a', '/run/sandboxd/sandboxd.sock', 'list'):
                 instance_id = command[5].split('=', 1)[1]
                 actual = state['actual'].get(instance_id)
@@ -136,8 +174,17 @@ class MultiVmSdkAcceptanceTests(unittest.TestCase):
             return [SimpleNamespace(id=node_id, status=0) for node_id in ('node1', 'node2')]
 
         with tempfile.TemporaryDirectory() as directory:
-            report = run_acceptance(inventory(), object(), 'image', '/run/sandboxd/sandboxd.sock',
-                                    Path(directory), FakeSandbox, resources, remote, placement_timeout=0)
+            report = run_acceptance(
+                inventory(),
+                object(),
+                'image',
+                '/run/sandboxd/sandboxd.sock',
+                Path(directory),
+                FakeSandbox,
+                resources,
+                remote,
+                placement_timeout=0,
+            )
             self.assertEqual(report['status'], 'passed')
             self.assertEqual(len(report['backends']), 2)
             self.assertEqual(len(report['assignments']), 2)
@@ -153,7 +200,16 @@ class MultiVmSdkAcceptanceTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaisesRegex(AssertionError, 'physical backend placement mismatch'):
-                run_acceptance(inventory(), object(), 'image', '/run/sandboxd/sandboxd.sock',
-                               Path(directory), MisplacedSandbox, resources, remote, placement_timeout=0)
+                run_acceptance(
+                    inventory(),
+                    object(),
+                    'image',
+                    '/run/sandboxd/sandboxd.sock',
+                    Path(directory),
+                    MisplacedSandbox,
+                    resources,
+                    remote,
+                    placement_timeout=0,
+                )
             self.assertEqual(json.loads((Path(directory) / 'sdk-accept-result.json').read_text())['status'], 'failed')
             self.assertFalse(state['actual'])

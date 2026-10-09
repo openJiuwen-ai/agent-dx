@@ -4,8 +4,22 @@
 import argparse
 import hashlib
 import json
+import os
+import shutil
 import subprocess
 from pathlib import Path
+
+
+def _executable(name, environment=None, cwd=None):
+    """Resolve an external command using the child's execution environment."""
+    directory = os.getcwd() if cwd is None else os.path.abspath(cwd)
+    search_path = os.pathsep.join(
+        os.path.abspath(os.path.join(directory, entry)) for entry in os.get_exec_path(environment)
+    )
+    executable = shutil.which(name, path=search_path)
+    if executable is None:
+        raise FileNotFoundError(f"required executable not found: {name}")
+    return os.path.abspath(executable)
 
 
 COMPONENTS = ("platform", "gateway", "execd")
@@ -180,7 +194,7 @@ def verify_build_manifest(
 
 
 def _git_commit():
-    return subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+    return subprocess.check_output([_executable("git"), "rev-parse", "HEAD"], text=True).strip()
 
 
 def main():

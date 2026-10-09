@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Final three-VM acceptance: stop workers before the control node."""
+
 from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
-from pathlib import Path
 import subprocess
+from pathlib import Path
 
 if __package__:
     from .contract import verify_inventory
@@ -20,8 +22,7 @@ else:
 
 def service_status(machine, remote=ssh):
     config = machine.get('deployment_config', '/opt/adx/config/deployment.yaml')
-    return json.loads(remote(machine, '/opt/adx/current/bin/adxctl', 'status',
-                             '--config', config))
+    return json.loads(remote(machine, '/opt/adx/current/bin/adxctl', 'status', '--config', config))
 
 
 def backend_inventory(worker, socket, remote=ssh):
@@ -43,14 +44,12 @@ def processes_gone(machine, pids, remote=ssh):
 
 def stop_services(machine, remote=ssh, wait=wait_until):
     services = service_status(machine, remote)['services']
-    pids = [service['pid'] for service in services if isinstance(service.get('pid'), int)
-            and service['pid'] > 0]
+    pids = [service['pid'] for service in services if isinstance(service.get('pid'), int) and service['pid'] > 0]
     if not pids:
         raise AssertionError(f"{machine['role']} has no supervised child processes")
     config = machine.get('deployment_config', '/opt/adx/config/deployment.yaml')
     remote(machine, 'sudo', '-n', '/opt/adx/current/bin/adxctl', 'stop', '--config', config)
-    wait(lambda: processes_gone(machine, pids, remote),
-         f"{machine['role']} retained a supervised child", 90)
+    wait(lambda: processes_gone(machine, pids, remote), f"{machine['role']} retained a supervised child", 90)
     return pids
 
 
@@ -61,47 +60,64 @@ def run_route_probe(executable, control):
     command = [str(executable), address]
     tls = control.get('route_probe_tls')
     if tls is not None:
-        if not isinstance(tls, dict) or any(not tls.get(key)
-                                            for key in ('ca', 'cert', 'key', 'server_name')):
+        if not isinstance(tls, dict) or any(not tls.get(key) for key in ('ca', 'cert', 'key', 'server_name')):
             raise ValueError('route_probe_tls needs ca, cert, key and server_name')
         command.extend(str(tls[key]) for key in ('ca', 'cert', 'key', 'server_name'))
-    completed = subprocess.run(command, capture_output=True, text=True,
-                               timeout=30, check=False)
+    completed = subprocess.run(command, capture_output=True, text=True, timeout=30, check=False)
     if completed.returncode != 0:
         raise AssertionError('route snapshot RPC probe failed: ' + completed.stderr[-1000:])
     try:
         result = json.loads(completed.stdout)
     except ValueError as error:
         raise AssertionError('route snapshot RPC probe returned invalid JSON') from error
-    if result.get('status') != 'passed' or result.get('reset') is not True \
-            or not isinstance(result.get('published_routes'), int) \
-            or result['published_routes'] < 0 \
-            or not isinstance(result.get('revision'), int):
+    if (
+        result.get('status') != 'passed'
+        or result.get('reset') is not True
+        or not isinstance(result.get('published_routes'), int)
+        or result['published_routes'] < 0
+        or not isinstance(result.get('revision'), int)
+    ):
         raise AssertionError(f'route snapshot RPC probe returned invalid evidence: {result}')
     return result
 
 
-def run_stop(inventory, connection, image, socket, output, dedicated=False,
-             sandbox_factory=None, remote=ssh, wait=wait_until, route_probe=None):
+def run_stop(
+    inventory,
+    connection,
+    image,
+    socket,
+    output,
+    dedicated=False,
+    sandbox_factory=None,
+    remote=ssh,
+    wait=wait_until,
+    route_probe=None,
+):
     if not dedicated:
         raise ValueError('stop acceptance requires explicit dedicated-VM confirmation')
     verify_inventory(inventory)
     if sandbox_factory is None:
         from adx_sandbox import Sandbox
+
         sandbox_factory = Sandbox
     machines = {machine['role']: machine for machine in inventory['machines']}
     control = machines['control']
     workers = (machines['worker-1'], machines['worker-2'])
-    report = {'status': 'failed', 'profile': 'multi-vm-stop',
-              'checks': [], 'instances': [], 'stop_order': [], 'cleanup_errors': []}
+    report = {
+        'status': 'failed',
+        'profile': 'multi-vm-stop',
+        'checks': [],
+        'instances': [],
+        'stop_order': [],
+        'cleanup_errors': [],
+    }
     handles = {}
     output.mkdir(parents=True, exist_ok=True)
     try:
         report['machines'] = verify_machines(inventory, remote)
         for machine in (*workers, control):
             services = service_status(machine, remote)['services']
-            if not any(isinstance(service.get('pid'), int) and service['pid'] > 0
-                       for service in services):
+            if not any(isinstance(service.get('pid'), int) and service['pid'] > 0 for service in services):
                 raise AssertionError(f"{machine['role']} has no running services")
         for worker in workers:
             if backend_inventory(worker, socket, remote):
@@ -109,14 +125,18 @@ def run_stop(inventory, connection, image, socket, output, dedicated=False,
         report['checks'].append('dedicated-empty-workers')
         for worker in workers:
             sandbox = sandbox_factory(
-                image=image, runtime='runc', node_id=worker['node_id'],
-                cpu=500, memory=512, idle_timeout=0,
-                connection=connection, create_timeout=150,
+                image=image,
+                runtime='runc',
+                node_id=worker['node_id'],
+                cpu=500,
+                memory=512,
+                idle_timeout=0,
+                connection=connection,
+                create_timeout=150,
             )
             handles[worker['role']] = sandbox
             assignment = persisted_assignment(control, sandbox.id, remote)
-            if assignment.get('node_id') != worker['node_id'] \
-                    or assignment.get('state') != 'Running':
+            if assignment.get('node_id') != worker['node_id'] or assignment.get('state') != 'Running':
                 raise AssertionError(f'initial ownership mismatch: {assignment}')
             if len(backend_inventory(worker, socket, remote)) != 1:
                 raise AssertionError(f"{worker['role']} has no unique backend")
@@ -126,21 +146,27 @@ def run_stop(inventory, connection, image, socket, output, dedicated=False,
             report['instances'].append({'id': sandbox.id, 'node_id': worker['node_id']})
         report['checks'].append('both-workers-serving')
 
-        for stopped_worker, surviving_worker in ((workers[1], workers[0]),
-                                                  (workers[0], None)):
-            report['stopped_pids_' + stopped_worker['role']] = stop_services(
-                stopped_worker, remote, wait)
+        for stopped_worker, surviving_worker in ((workers[1], workers[0]), (workers[0], None)):
+            report['stopped_pids_' + stopped_worker['role']] = stop_services(stopped_worker, remote, wait)
             report['stop_order'].append(stopped_worker['role'])
-            wait(lambda: not backend_inventory(stopped_worker, socket, remote),
-                 f"{stopped_worker['role']} retained a backend", 30)
+            wait(
+                lambda stopped_worker=stopped_worker: not backend_inventory(stopped_worker, socket, remote),
+                f"{stopped_worker['role']} retained a backend",
+                30,
+            )
             affected = handles[stopped_worker['role']]
-            wait(lambda: persisted_assignment(control, affected.id, remote).get('state') == 'Deleted'
-                 and not persisted_assignment(control, affected.id, remote).get('resources_held'),
-                 f'{affected.id} persisted cleanup missing', 30)
+            wait(
+                lambda affected=affected: (
+                    persisted_assignment(control, affected.id, remote).get('state') == 'Deleted'
+                    and not persisted_assignment(control, affected.id, remote).get('resources_held')
+                ),
+                f'{affected.id} persisted cleanup missing',
+                30,
+            )
             try:
                 affected.commands.run('printf should-not-route')
             except Exception:
-                pass
+                logging.getLogger(__name__).debug("Best-effort operation failed", exc_info=True)
             else:
                 raise AssertionError(f'{affected.id} remained routable after worker stop')
             if surviving_worker is not None:
@@ -151,16 +177,16 @@ def run_stop(inventory, connection, image, socket, output, dedicated=False,
             report['checks'].append(stopped_worker['role'] + '-drained-and-route-withdrawn')
 
         report['final_state'] = {
-            'backend_instances': {
-                worker['role']: len(backend_inventory(worker, socket, remote))
-                for worker in workers
-            },
+            'backend_instances': {worker['role']: len(backend_inventory(worker, socket, remote)) for worker in workers},
         }
         if route_probe is not None:
             snapshot = wait(
-                lambda: (result if result['published_routes'] == 0 else None)
-                if (result := route_probe(control)) else None,
-                'published routes remain after worker shutdown', 30)
+                lambda: (
+                    (result if result['published_routes'] == 0 else None) if (result := route_probe(control)) else None
+                ),
+                'published routes remain after worker shutdown',
+                30,
+            )
             report['route_snapshot'] = snapshot
             report['final_state']['published_routes'] = snapshot['published_routes']
             report['checks'].append('published-route-catalog-empty')
@@ -203,19 +229,26 @@ def main():
     parser.add_argument('--confirm-dedicated', action='store_true', required=True)
     parser.add_argument('--route-probe', type=Path)
     args = parser.parse_args()
-    if args.route_probe and (not args.route_probe.is_file()
-                             or not os.access(args.route_probe, os.X_OK)):
+    if args.route_probe and (not args.route_probe.is_file() or not os.access(args.route_probe, os.X_OK)):
         parser.error('--route-probe must name a built route_snapshot_probe executable')
     os.environ['SSL_CERT_FILE'] = str(args.ca.resolve())
     from adx_sandbox import ConnectionConfig
+
     connection = ConnectionConfig(
-        server_address=args.endpoint, token=args.token_file.read_text().strip(),
-        use_tls=True, verify_tls=True,
+        server_address=args.endpoint,
+        token=args.token_file.read_text().strip(),
+        use_tls=True,
+        verify_tls=True,
     )
-    report = run_stop(json.loads(args.inventory.read_text()), connection,
-                      args.image, args.socket, args.output, dedicated=args.confirm_dedicated,
-                      route_probe=(lambda control: run_route_probe(args.route_probe, control))
-                      if args.route_probe else None)
+    report = run_stop(
+        json.loads(args.inventory.read_text()),
+        connection,
+        args.image,
+        args.socket,
+        args.output,
+        dedicated=args.confirm_dedicated,
+        route_probe=(lambda control: run_route_probe(args.route_probe, control)) if args.route_probe else None,
+    )
     print(json.dumps({'status': report['status'], 'checks': report['checks']}), flush=True)
 
 

@@ -48,10 +48,7 @@ class BinaryEnvelope:
 
     def encode(self, max_payload: int = DEFAULT_STREAM_CHUNK_BYTES) -> bytes:
         if len(self.payload) > max_payload:
-            raise ProtocolError(
-                f"binary payload exceeds negotiated chunk limit: "
-                f"{len(self.payload)} > {max_payload}"
-            )
+            raise ProtocolError(f"binary payload exceeds negotiated chunk limit: {len(self.payload)} > {max_payload}")
         try:
             request_uuid = uuid.UUID(self.request_id)
         except (ValueError, AttributeError) as exc:
@@ -84,9 +81,7 @@ class BinaryEnvelope:
     ) -> "BinaryEnvelope":
         if len(raw) < _HEADER.size:
             raise ProtocolError("binary envelope is shorter than its header")
-        magic, version, kind, id_length, raw_id, flags, payload_length = (
-            _HEADER.unpack_from(raw)
-        )
+        magic, version, kind, id_length, raw_id, flags, payload_length = _HEADER.unpack_from(raw)
         if magic != BINARY_MAGIC:
             raise ProtocolError("invalid binary envelope magic")
         if version != BINARY_ENVELOPE_VERSION:
@@ -101,15 +96,10 @@ class BinaryEnvelope:
             raise ProtocolError(f"unknown binary envelope flags: {flags:#x}")
         wire_limit = max_payload + (8 if flags & _HAS_OFFSET else 0)
         if payload_length > wire_limit:
-            raise ProtocolError(
-                f"binary payload exceeds negotiated chunk limit: "
-                f"{payload_length} > {wire_limit}"
-            )
+            raise ProtocolError(f"binary payload exceeds negotiated chunk limit: {payload_length} > {wire_limit}")
         wire_payload = raw[_HEADER.size :]
         if len(wire_payload) != payload_length:
-            raise ProtocolError(
-                f"binary payload length mismatch: {len(wire_payload)} != {payload_length}"
-            )
+            raise ProtocolError(f"binary payload length mismatch: {len(wire_payload)} != {payload_length}")
         offset = None
         payload = wire_payload
         if flags & _HAS_OFFSET:
@@ -118,10 +108,7 @@ class BinaryEnvelope:
             offset = struct.unpack("!Q", wire_payload[:8])[0]
             payload = wire_payload[8:]
         if len(payload) > max_payload:
-            raise ProtocolError(
-                "binary payload exceeds negotiated chunk limit: "
-                f"{len(payload)} > {max_payload}"
-            )
+            raise ProtocolError(f"binary payload exceeds negotiated chunk limit: {len(payload)} > {max_payload}")
         return cls(
             request_id=str(uuid.UUID(bytes=raw_id)),
             kind=binary_kind,

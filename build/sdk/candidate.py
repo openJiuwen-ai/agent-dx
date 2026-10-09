@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """Create and verify the immutable Python SDK candidate manifest."""
+
 import argparse
 import email.parser
 import hashlib
 import json
-from pathlib import Path
 import re
 import zipfile
+from pathlib import Path
 
 
 def sha(path):
@@ -51,8 +52,13 @@ def verify(directory):
         raise ValueError('invalid SDK candidate manifest')
     if not re.fullmatch(r'[0-9a-f]{40}', candidate.get('commit', '')):
         raise ValueError('invalid SDK candidate commit')
-    actual = {path.name for path in directory.iterdir() if path.is_file() and path.name != 'sdk-candidate.json'
-              and (path.suffix == '.whl' or path.name.endswith('.tar.gz'))}
+    actual = {
+        path.name
+        for path in directory.iterdir()
+        if path.is_file()
+        and path.name != 'sdk-candidate.json'
+        and (path.suffix == '.whl' or path.name.endswith('.tar.gz'))
+    }
     if actual != set(files):
         raise ValueError('SDK candidate file list mismatch')
     for name, digest in files.items():

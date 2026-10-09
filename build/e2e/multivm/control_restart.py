@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Restart supervised control roles while two worker backends remain live."""
+
 from __future__ import annotations
 
 import argparse
 import json
 import os
-from pathlib import Path
 import subprocess
 import time
+from pathlib import Path
 
 if __package__:
     from .contract import verify_inventory
@@ -25,31 +26,29 @@ OPTIONAL_ROLES = ('ingress',)
 
 def control_status(control, remote=ssh):
     config = control.get('deployment_config', '/opt/adx/config/deployment.yaml')
-    return json.loads(remote(control, '/opt/adx/current/bin/adxctl', 'status',
-                             '--config', config))
+    return json.loads(remote(control, '/opt/adx/current/bin/adxctl', 'status', '--config', config))
 
 
 def service_pid(control, role, remote=ssh):
-    services = [service for service in control_status(control, remote)['services']
-                if service['role'] == role]
-    if len(services) != 1 or not isinstance(services[0].get('pid'), int) \
-            or services[0]['pid'] <= 0:
+    services = [service for service in control_status(control, remote)['services'] if service['role'] == role]
+    if len(services) != 1 or not isinstance(services[0].get('pid'), int) or services[0]['pid'] <= 0:
         raise AssertionError(f'control node has no unique supervised {role} process')
     return services[0]['pid']
 
 
 def summary(control, remote=ssh):
     config = control.get('deployment_config', '/opt/adx/config/deployment.yaml')
-    result = json.loads(remote(control, '/opt/adx/current/bin/adx-inspect',
-                               '-c', config, 'summary'))
+    result = json.loads(remote(control, '/opt/adx/current/bin/adx-inspect', '-c', config, 'summary'))
     if not isinstance(result.get('epoch'), int) or result['epoch'] < 1:
         raise AssertionError(f'invalid Coordinator epoch: {result}')
     return result
 
 
 def worker_routable(control, workers, remote=ssh):
-    return all((record := node_record(control, worker['node_id'], remote))['available']
-               and record['session']['routable'] for worker in workers)
+    return all(
+        (record := node_record(control, worker['node_id'], remote))['available'] and record['session']['routable']
+        for worker in workers
+    )
 
 
 def route_ready(sandboxes):
@@ -67,27 +66,33 @@ def route_ready(sandboxes):
     return True
 
 
-def run_control_restarts(inventory, connection, image, socket, output,
-                         sandbox_factory=None, remote=ssh, wait=wait_until, roles=None):
+def run_control_restarts(
+    inventory, connection, image, socket, output, sandbox_factory=None, remote=ssh, wait=wait_until, roles=None
+):
     verify_inventory(inventory)
     roles = ROLES if roles is None else tuple(roles)
-    if not roles or len(set(roles)) != len(roles) \
-            or any(role not in ROLES + OPTIONAL_ROLES for role in roles):
+    if not roles or len(set(roles)) != len(roles) or any(role not in ROLES + OPTIONAL_ROLES for role in roles):
         raise ValueError('select distinct supervised control roles')
     if sandbox_factory is None:
         from adx_sandbox import Sandbox
+
         sandbox_factory = Sandbox
     machines = {machine['role']: machine for machine in inventory['machines']}
     control = machines['control']
     workers = (machines['worker-1'], machines['worker-2'])
-    report = {'status': 'failed', 'profile': 'multi-vm-control-restart',
-              'checks': [], 'instances': [], 'restarts': {}, 'cleanup_errors': []}
+    report = {
+        'status': 'failed',
+        'profile': 'multi-vm-control-restart',
+        'checks': [],
+        'instances': [],
+        'restarts': {},
+        'cleanup_errors': [],
+    }
     handles = []
     output.mkdir(parents=True, exist_ok=True)
 
     def physical(instance_id):
-        return {worker['node_id']: backend_ids(worker, socket, instance_id, remote)
-                for worker in workers}
+        return {worker['node_id']: backend_ids(worker, socket, instance_id, remote) for worker in workers}
 
     try:
         report['machines'] = verify_machines(inventory, remote)
@@ -98,21 +103,28 @@ def run_control_restarts(inventory, connection, image, socket, output,
         baseline = {}
         for worker in workers:
             sandbox = sandbox_factory(
-                image=image, runtime='runc', node_id=worker['node_id'],
-                cpu=500, memory=512, idle_timeout=0,
-                connection=connection, create_timeout=150,
+                image=image,
+                runtime='runc',
+                node_id=worker['node_id'],
+                cpu=500,
+                memory=512,
+                idle_timeout=0,
+                connection=connection,
+                create_timeout=150,
             )
             handles.append(sandbox)
             sandbox.files.write('/tmp/adx-control-restart-marker', b'marker')
             assignment = persisted_assignment(control, sandbox.id, remote)
-            if assignment.get('node_id') != worker['node_id'] \
-                    or assignment.get('state') != 'Running' \
-                    or not assignment.get('resources_held'):
+            if (
+                assignment.get('node_id') != worker['node_id']
+                or assignment.get('state') != 'Running'
+                or not assignment.get('resources_held')
+            ):
                 raise AssertionError(f'initial ownership invalid: {assignment}')
             backends = physical(sandbox.id)
-            if len(backends[worker['node_id']]) != 1 \
-                    or any(ids for node_id, ids in backends.items()
-                           if node_id != worker['node_id']):
+            if len(backends[worker['node_id']]) != 1 or any(
+                ids for node_id, ids in backends.items() if node_id != worker['node_id']
+            ):
                 raise AssertionError(f'{sandbox.id} has no unique physical backend')
             baseline[sandbox.id] = (assignment['node_id'], assignment['generation'], backends)
             report['instances'].append({'id': sandbox.id, 'node_id': worker['node_id']})
@@ -125,13 +137,12 @@ def run_control_restarts(inventory, connection, image, socket, output,
             old_epoch = epoch
             remote(control, 'sudo', '-n', 'kill', '-KILL', str(old_pid))
 
-            def restarted():
+            def restarted(role=role, old_pid=old_pid, old_epoch=old_epoch):
                 try:
                     new_pid = service_pid(control, role, remote)
                     new_epoch = summary(control, remote)['epoch']
                     routable = worker_routable(control, workers, remote)
-                except (OSError, subprocess.SubprocessError, AssertionError,
-                        KeyError, ValueError):
+                except (OSError, subprocess.SubprocessError, AssertionError, KeyError, ValueError):
                     return None
                 if new_pid == old_pid or not routable:
                     return None
@@ -145,16 +156,22 @@ def run_control_restarts(inventory, connection, image, socket, output,
             for sandbox in handles:
                 owner, generation, backends = baseline[sandbox.id]
                 assignment = persisted_assignment(control, sandbox.id, remote)
-                if assignment.get('node_id') != owner \
-                        or assignment.get('generation') != generation \
-                        or assignment.get('state') != 'Running' \
-                        or not assignment.get('resources_held'):
+                if (
+                    assignment.get('node_id') != owner
+                    or assignment.get('generation') != generation
+                    or assignment.get('state') != 'Running'
+                    or not assignment.get('resources_held')
+                ):
                     raise AssertionError(f'{sandbox.id} ownership changed after {role} restart')
                 if physical(sandbox.id) != backends:
                     raise AssertionError(f'{sandbox.id} backend changed after {role} restart')
             wait(lambda: route_ready(handles), f'public SDK did not recover after {role} restart', 60)
-            report['restarts'][role] = {'previous_pid': old_pid, 'pid': new_pid,
-                                        'epoch_before': old_epoch, 'epoch_after': epoch}
+            report['restarts'][role] = {
+                'previous_pid': old_pid,
+                'pid': new_pid,
+                'epoch_before': old_epoch,
+                'epoch_after': epoch,
+            }
             report['checks'].append(role + '-restart-preserved-ownership-and-route')
     except Exception as error:
         report['error'] = f'{type(error).__name__}: {error}'
@@ -176,19 +193,23 @@ def run_control_restarts(inventory, connection, image, socket, output,
                 residual = {
                     sandbox.id: {
                         'assignment': persisted_assignment(control, sandbox.id, remote),
-                        'backends': {worker['node_id']: backend_ids(worker, socket, sandbox.id, remote)
-                                     for worker in workers},
+                        'backends': {
+                            worker['node_id']: backend_ids(worker, socket, sandbox.id, remote) for worker in workers
+                        },
                     }
                     for sandbox in handles
                 }
-                if all(item['assignment']['state'] == 'Deleted'
-                       and not item['assignment']['resources_held']
-                       and not any(item['backends'].values()) for item in residual.values()):
+                if all(
+                    item['assignment']['state'] == 'Deleted'
+                    and not item['assignment']['resources_held']
+                    and not any(item['backends'].values())
+                    for item in residual.values()
+                ):
                     report['checks'].append('owned-backends-and-capacity-released')
                     break
                 if time.monotonic() >= deadline:
                     raise AssertionError(f'control-restart cleanup incomplete: {residual}')
-                time.sleep(.2)
+                time.sleep(0.2)
         except Exception as error:
             report['cleanup_errors'].append(str(error))
         if not report.get('error') and not report['cleanup_errors']:
@@ -208,17 +229,20 @@ def main():
     parser.add_argument('--image', required=True)
     parser.add_argument('--socket', default='/run/sandboxd/sandboxd.sock')
     parser.add_argument('--output', required=True, type=Path)
-    parser.add_argument('--role', dest='roles', action='append',
-                        choices=ROLES + OPTIONAL_ROLES)
+    parser.add_argument('--role', dest='roles', action='append', choices=ROLES + OPTIONAL_ROLES)
     args = parser.parse_args()
     os.environ['SSL_CERT_FILE'] = str(args.ca.resolve())
     from adx_sandbox import ConnectionConfig
+
     connection = ConnectionConfig(
-        server_address=args.endpoint, token=args.token_file.read_text().strip(),
-        use_tls=True, verify_tls=True,
+        server_address=args.endpoint,
+        token=args.token_file.read_text().strip(),
+        use_tls=True,
+        verify_tls=True,
     )
-    report = run_control_restarts(json.loads(args.inventory.read_text()), connection,
-                                  args.image, args.socket, args.output, roles=args.roles)
+    report = run_control_restarts(
+        json.loads(args.inventory.read_text()), connection, args.image, args.socket, args.output, roles=args.roles
+    )
     print(json.dumps({'status': report['status'], 'checks': report['checks']}), flush=True)
 
 

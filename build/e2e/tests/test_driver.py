@@ -1,136 +1,159 @@
 import importlib.util
 import json
-from pathlib import Path
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location('e2e_driver', ROOT / 'run.py')
 driver = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(driver)
 
+
 class AcceptanceGateTests(unittest.TestCase):
     def test_coordinator_and_adxlet_restart_together_preserve_both_backends(self):
-        self.assertEqual(driver.selected_checks('full', 'coordinator-adxlet-restart'),
-                         ('coordinator-adxlet-restart',))
+        self.assertEqual(driver.selected_checks('full', 'coordinator-adxlet-restart'), ('coordinator-adxlet-restart',))
         with tempfile.TemporaryDirectory() as directory:
             run = driver.Run(Path(directory))
             run.nodes = ['node1', 'node2']
             calls = []
-            run.execute = lambda node, *args, **_kwargs: calls.append(
-                ('execute', node, args[-1]))
-            run.helper = lambda node, *args, **_kwargs: calls.append(
-                ('helper', node, args[0]))
+
+            def _assigned_execute(node, *args, **_kwargs):
+                return calls.append(('execute', node, args[-1]))
+
+            run.execute = _assigned_execute
+
+            def _assigned_helper(node, *args, **_kwargs):
+                return calls.append(('helper', node, args[0]))
+
+            run.helper = _assigned_helper
             checks = []
             run.scenarios(checks, ('coordinator-adxlet-restart',))
             self.assertEqual(checks, ['coordinator-adxlet-restart'])
             self.assertEqual(calls[0], ('execute', 'node1', 'create-marker'))
-            self.assertEqual(calls[1:3], [('helper', 'node1', 'capture-backend'),
-                                          ('helper', 'node2', 'capture-backend')])
-            self.assertEqual(set(calls[3:5]), {
-                ('helper', 'node1', 'coordinator-restart'),
-                ('helper', 'node2', 'restart'),
-            })
-            self.assertEqual(calls[5:], [
-                ('helper', 'node1', 'ready'),
-                ('helper', 'node2', 'adxlet-session-changed'),
-                ('helper', 'node1', 'unchanged'),
-                ('helper', 'node2', 'unchanged'),
-                ('execute', 'node1', 'recovered-marker'),
-                ('execute', 'node1', 'cleanup-live-control'),
-                ('helper', 'node1', 'empty'),
-                ('helper', 'node2', 'empty'),
-            ])
+            self.assertEqual(
+                calls[1:3], [('helper', 'node1', 'capture-backend'), ('helper', 'node2', 'capture-backend')]
+            )
+            self.assertEqual(
+                set(calls[3:5]),
+                {
+                    ('helper', 'node1', 'coordinator-restart'),
+                    ('helper', 'node2', 'restart'),
+                },
+            )
+            self.assertEqual(
+                calls[5:],
+                [
+                    ('helper', 'node1', 'ready'),
+                    ('helper', 'node2', 'adxlet-session-changed'),
+                    ('helper', 'node1', 'unchanged'),
+                    ('helper', 'node2', 'unchanged'),
+                    ('execute', 'node1', 'recovered-marker'),
+                    ('execute', 'node1', 'cleanup-live-control'),
+                    ('helper', 'node1', 'empty'),
+                    ('helper', 'node2', 'empty'),
+                ],
+            )
 
     def test_sandboxd_lost_runtime_is_targeted_two_policy_fault(self):
-        self.assertEqual(driver.selected_checks('full', 'sandboxd-runtime-loss'),
-                         ('sandboxd-runtime-loss',))
+        self.assertEqual(driver.selected_checks('full', 'sandboxd-runtime-loss'), ('sandboxd-runtime-loss',))
         with tempfile.TemporaryDirectory() as directory:
             run = driver.Run(Path(directory))
             run.nodes = ['node1', 'node2']
             calls = []
-            run.execute = lambda node, *args, **_kwargs: (
-                calls.append(('execute', node, args[-1]))
-                or json.dumps({'cases': [{'id': 'reliability.daemon-loss-never',
-                                          'status': 'passed'},
-                                         {'id': 'reliability.daemon-loss-restart',
-                                          'status': 'passed'}]})
-            )
-            run.helper = lambda node, *args, **_kwargs: calls.append(
-                ('helper', node, args[0]))
+
+            def _assigned_execute(node, *args, **_kwargs):
+                return calls.append(('execute', node, args[-1])) or json.dumps(
+                    {
+                        'cases': [
+                            {'id': 'reliability.daemon-loss-never', 'status': 'passed'},
+                            {'id': 'reliability.daemon-loss-restart', 'status': 'passed'},
+                        ]
+                    }
+                )
+
+            run.execute = _assigned_execute
+
+            def _assigned_helper(node, *args, **_kwargs):
+                return calls.append(('helper', node, args[0]))
+
+            run.helper = _assigned_helper
             checks = []
             run.scenarios(checks, ('sandboxd-runtime-loss',))
             self.assertEqual(checks, ['sandboxd-runtime-loss'])
-            self.assertEqual(calls, [
-                ('execute', 'node1', 'loss-create-never'),
-                ('helper', 'node1', 'freeze'),
-                ('helper', 'node1', 'restart-sandboxd-lost'),
-                ('helper', 'node1', 'thaw'),
-                ('execute', 'node1', 'loss-verify-never'),
-                ('execute', 'node1', 'loss-create-restart'),
-                ('helper', 'node1', 'freeze'),
-                ('helper', 'node1', 'restart-sandboxd-lost'),
-                ('helper', 'node1', 'thaw'),
-                ('execute', 'node1', 'loss-verify-restart'),
-                ('helper', 'node1', 'empty'),
-                ('helper', 'node2', 'empty'),
-            ])
+            self.assertEqual(
+                calls,
+                [
+                    ('execute', 'node1', 'loss-create-never'),
+                    ('helper', 'node1', 'freeze'),
+                    ('helper', 'node1', 'restart-sandboxd-lost'),
+                    ('helper', 'node1', 'thaw'),
+                    ('execute', 'node1', 'loss-verify-never'),
+                    ('execute', 'node1', 'loss-create-restart'),
+                    ('helper', 'node1', 'freeze'),
+                    ('helper', 'node1', 'restart-sandboxd-lost'),
+                    ('helper', 'node1', 'thaw'),
+                    ('execute', 'node1', 'loss-verify-restart'),
+                    ('helper', 'node1', 'empty'),
+                    ('helper', 'node2', 'empty'),
+                ],
+            )
 
     def test_only_independent_ingress_restart_uses_standalone_fixture(self):
-        self.assertEqual(driver.setup_environment('ingress-restart'),
-                         ('ADX_E2E_INGRESS_MODE=standalone',))
+        self.assertEqual(driver.setup_environment('ingress-restart'), ('ADX_E2E_INGRESS_MODE=standalone',))
         self.assertEqual(driver.setup_environment('apiserver-restart'), ())
         self.assertEqual(driver.setup_environment(None), ())
 
     def test_standalone_relay_case_uses_separate_node_processes(self):
-        self.assertEqual(driver.setup_environment('relay-standalone'),
-                         ('ADX_E2E_RELAY_MODE=standalone',))
-        self.assertEqual(driver.selected_checks('full', 'relay-standalone'),
-                         ('relay-standalone',))
+        self.assertEqual(driver.setup_environment('relay-standalone'), ('ADX_E2E_RELAY_MODE=standalone',))
+        self.assertEqual(driver.selected_checks('full', 'relay-standalone'), ('relay-standalone',))
 
     def test_sqlite_fallback_enables_only_its_fault_fixture(self):
-        self.assertEqual(driver.setup_environment('sqlite-fallback'),
-                         ('ADX_E2E_SQLITE_FALLBACK=1',))
-        self.assertEqual(driver.selected_checks('full', 'sqlite-fallback'),
-                         ('sqlite-fallback',))
+        self.assertEqual(driver.setup_environment('sqlite-fallback'), ('ADX_E2E_SQLITE_FALLBACK=1',))
+        self.assertEqual(driver.selected_checks('full', 'sqlite-fallback'), ('sqlite-fallback',))
         self.assertEqual(driver.setup_environment('runtime-exit'), ())
 
     def test_sqlite_node_restart_retains_pending_record_during_control_outage(self):
-        self.assertEqual(driver.setup_environment('sqlite-node-restart'),
-                         ('ADX_E2E_SQLITE_FALLBACK=1',))
-        self.assertEqual(driver.selected_checks('full', 'sqlite-node-restart'),
-                         ('sqlite-node-restart',))
+        self.assertEqual(driver.setup_environment('sqlite-node-restart'), ('ADX_E2E_SQLITE_FALLBACK=1',))
+        self.assertEqual(driver.selected_checks('full', 'sqlite-node-restart'), ('sqlite-node-restart',))
         with tempfile.TemporaryDirectory() as directory:
             run = driver.Run(Path(directory))
             run.nodes = ['node1', 'node2']
             calls = []
-            run.execute = lambda node, *args, **_kwargs: (
-                calls.append(('execute', node, args[-1]))
-                or json.dumps({'cases': [{'id': 'reliability.sqlite-node-restart',
-                                          'status': 'passed'}]})
-            )
-            run.helper = lambda node, *args, **_kwargs: calls.append(
-                ('helper', node, args[0]))
+
+            def _assigned_execute(node, *args, **_kwargs):
+                return calls.append(('execute', node, args[-1])) or json.dumps(
+                    {'cases': [{'id': 'reliability.sqlite-node-restart', 'status': 'passed'}]}
+                )
+
+            run.execute = _assigned_execute
+
+            def _assigned_helper(node, *args, **_kwargs):
+                return calls.append(('helper', node, args[0]))
+
+            run.helper = _assigned_helper
             checks = []
             run.scenarios(checks, ('sqlite-node-restart',))
             self.assertEqual(checks, ['sqlite-node-restart'])
-            self.assertEqual(calls, [
-                ('execute', 'node1', 'sqlite-create'),
-                ('helper', 'node1', 'coordinator-suspend'),
-                ('helper', 'node1', 'sqlite-journaled'),
-                ('helper', 'node1', 'restart'),
-                ('helper', 'node1', 'sqlite-after-restart'),
-                ('helper', 'node1', 'coordinator-resume'),
-                ('helper', 'node1', 'sqlite-reconciled'),
-                ('execute', 'node1', 'sqlite-verify-restart'),
-                ('helper', 'node1', 'empty'),
-                ('helper', 'node2', 'empty'),
-            ])
+            self.assertEqual(
+                calls,
+                [
+                    ('execute', 'node1', 'sqlite-create'),
+                    ('helper', 'node1', 'coordinator-suspend'),
+                    ('helper', 'node1', 'sqlite-journaled'),
+                    ('helper', 'node1', 'restart'),
+                    ('helper', 'node1', 'sqlite-after-restart'),
+                    ('helper', 'node1', 'coordinator-resume'),
+                    ('helper', 'node1', 'sqlite-reconciled'),
+                    ('execute', 'node1', 'sqlite-verify-restart'),
+                    ('helper', 'node1', 'empty'),
+                    ('helper', 'node2', 'empty'),
+                ],
+            )
 
     def test_create_response_cut_is_targeted_full_fault_case(self):
-        self.assertEqual(driver.selected_checks('full', 'create-response-cut'),
-                         ('create-response-cut',))
+        self.assertEqual(driver.selected_checks('full', 'create-response-cut'), ('create-response-cut',))
         self.assertEqual(driver.setup_environment('create-response-cut'), ())
         with self.assertRaisesRegex(ValueError, 'not in E2E profile'):
             driver.selected_checks('l0', 'create-response-cut')
@@ -140,221 +163,284 @@ class AcceptanceGateTests(unittest.TestCase):
             run = driver.Run(Path(directory))
             run.nodes = ['node1', 'node2']
             calls = []
-            run.execute = lambda node, *args, **_kwargs: (
-                calls.append(('execute', node, args[-1]))
-                or json.dumps({'cases': [{'id': 'reliability.create-final-response-cut',
-                                          'status': 'passed'}]})
-            )
-            run.helper = lambda node, *args, **_kwargs: calls.append(
-                ('helper', node, args[0]))
+
+            def _assigned_execute(node, *args, **_kwargs):
+                return calls.append(('execute', node, args[-1])) or json.dumps(
+                    {'cases': [{'id': 'reliability.create-final-response-cut', 'status': 'passed'}]}
+                )
+
+            run.execute = _assigned_execute
+
+            def _assigned_helper(node, *args, **_kwargs):
+                return calls.append(('helper', node, args[0]))
+
+            run.helper = _assigned_helper
             checks = []
             run.scenarios(checks, ('create-response-cut',))
             self.assertEqual(checks, ['create-response-cut'])
-            self.assertEqual(calls, [
-                ('execute', 'node1', 'create-response-cut'),
-                ('helper', 'node1', 'empty'),
-                ('helper', 'node2', 'empty'),
-            ])
-            self.assertEqual(run.case_results[0]['subcases'][0]['id'],
-                             'reliability.create-final-response-cut')
+            self.assertEqual(
+                calls,
+                [
+                    ('execute', 'node1', 'create-response-cut'),
+                    ('helper', 'node1', 'empty'),
+                    ('helper', 'node2', 'empty'),
+                ],
+            )
+            self.assertEqual(run.case_results[0]['subcases'][0]['id'], 'reliability.create-final-response-cut')
 
     def test_unknown_query_404_is_targeted_full_case_with_physical_cleanup(self):
-        self.assertEqual(driver.selected_checks('full', 'create-unknown-query'),
-                         ('create-unknown-query',))
+        self.assertEqual(driver.selected_checks('full', 'create-unknown-query'), ('create-unknown-query',))
         with tempfile.TemporaryDirectory() as directory:
             run = driver.Run(Path(directory))
             run.nodes = ['node1', 'node2']
             calls = []
-            run.execute = lambda node, *args, **_kwargs: (
-                calls.append(('execute', node, args[-1]))
-                or json.dumps({'cases': [{'id': 'reliability.unknown-query-404-same-create',
-                                          'status': 'passed'}]})
-            )
-            run.helper = lambda node, *args, **_kwargs: calls.append(
-                ('helper', node, args[0]))
+
+            def _assigned_execute(node, *args, **_kwargs):
+                return calls.append(('execute', node, args[-1])) or json.dumps(
+                    {'cases': [{'id': 'reliability.unknown-query-404-same-create', 'status': 'passed'}]}
+                )
+
+            run.execute = _assigned_execute
+
+            def _assigned_helper(node, *args, **_kwargs):
+                return calls.append(('helper', node, args[0]))
+
+            run.helper = _assigned_helper
             checks = []
             run.scenarios(checks, ('create-unknown-query',))
             self.assertEqual(checks, ['create-unknown-query'])
-            self.assertEqual(calls, [
-                ('execute', 'node1', 'create-unknown-query'),
-                ('helper', 'node1', 'empty'),
-                ('helper', 'node2', 'empty'),
-            ])
+            self.assertEqual(
+                calls,
+                [
+                    ('execute', 'node1', 'create-unknown-query'),
+                    ('helper', 'node1', 'empty'),
+                    ('helper', 'node2', 'empty'),
+                ],
+            )
 
     def test_schedule_deadline_is_targeted_full_case_with_physical_cleanup(self):
-        self.assertEqual(driver.selected_checks('full', 'schedule-deadline'),
-                         ('schedule-deadline',))
+        self.assertEqual(driver.selected_checks('full', 'schedule-deadline'), ('schedule-deadline',))
         with tempfile.TemporaryDirectory() as directory:
             run = driver.Run(Path(directory))
             run.nodes = ['node1', 'node2']
             calls = []
-            run.execute = lambda node, *args, **_kwargs: (
-                calls.append(('execute', node, args[-1]))
-                or json.dumps({'cases': [{'id': 'reliability.central-queue-deadline',
-                                          'status': 'passed'}]})
-            )
-            run.helper = lambda node, *args, **_kwargs: calls.append(
-                ('helper', node, args[0]))
+
+            def _assigned_execute(node, *args, **_kwargs):
+                return calls.append(('execute', node, args[-1])) or json.dumps(
+                    {'cases': [{'id': 'reliability.central-queue-deadline', 'status': 'passed'}]}
+                )
+
+            run.execute = _assigned_execute
+
+            def _assigned_helper(node, *args, **_kwargs):
+                return calls.append(('helper', node, args[0]))
+
+            run.helper = _assigned_helper
             checks = []
             run.scenarios(checks, ('schedule-deadline',))
             self.assertEqual(checks, ['schedule-deadline'])
-            self.assertEqual(calls, [
-                ('execute', 'node1', 'schedule-deadline'),
-                ('helper', 'node1', 'empty'),
-                ('helper', 'node2', 'empty'),
-            ])
+            self.assertEqual(
+                calls,
+                [
+                    ('execute', 'node1', 'schedule-deadline'),
+                    ('helper', 'node1', 'empty'),
+                    ('helper', 'node2', 'empty'),
+                ],
+            )
 
     def test_command_response_cut_is_targeted_full_case_with_physical_cleanup(self):
-        self.assertEqual(driver.selected_checks('full', 'command-response-cut'),
-                         ('command-response-cut',))
+        self.assertEqual(driver.selected_checks('full', 'command-response-cut'), ('command-response-cut',))
         with self.assertRaisesRegex(ValueError, 'not in E2E profile'):
             driver.selected_checks('l0', 'command-response-cut')
         with tempfile.TemporaryDirectory() as directory:
             run = driver.Run(Path(directory))
             run.nodes = ['node1', 'node2']
             calls = []
-            run.execute = lambda node, *args, **_kwargs: (
-                calls.append(('execute', node, args[-1]))
-                or json.dumps({'cases': [{'id': 'reliability.command-start-response-cut',
-                                          'status': 'passed'}]})
-            )
-            run.helper = lambda node, *args, **_kwargs: calls.append(
-                ('helper', node, args[0]))
+
+            def _assigned_execute(node, *args, **_kwargs):
+                return calls.append(('execute', node, args[-1])) or json.dumps(
+                    {'cases': [{'id': 'reliability.command-start-response-cut', 'status': 'passed'}]}
+                )
+
+            run.execute = _assigned_execute
+
+            def _assigned_helper(node, *args, **_kwargs):
+                return calls.append(('helper', node, args[0]))
+
+            run.helper = _assigned_helper
             checks = []
             run.scenarios(checks, ('command-response-cut',))
             self.assertEqual(checks, ['command-response-cut'])
-            self.assertEqual(calls, [
-                ('execute', 'node1', 'command-response-cut'),
-                ('helper', 'node1', 'empty'),
-                ('helper', 'node2', 'empty'),
-            ])
+            self.assertEqual(
+                calls,
+                [
+                    ('execute', 'node1', 'command-response-cut'),
+                    ('helper', 'node1', 'empty'),
+                    ('helper', 'node2', 'empty'),
+                ],
+            )
 
     def test_command_registry_capacity_is_isolated_to_targeted_full_case(self):
-        self.assertEqual(driver.selected_checks('full', 'command-registry-capacity'),
-                         ('command-registry-capacity',))
-        self.assertEqual(driver.setup_environment('command-registry-capacity'),
-                         ('ADX_E2E_COMMAND_REGISTRY_MAX_RECORDS=1',))
+        self.assertEqual(driver.selected_checks('full', 'command-registry-capacity'), ('command-registry-capacity',))
+        self.assertEqual(
+            driver.setup_environment('command-registry-capacity'), ('ADX_E2E_COMMAND_REGISTRY_MAX_RECORDS=1',)
+        )
         self.assertEqual(driver.setup_environment('sdk'), ())
         with tempfile.TemporaryDirectory() as directory:
             run = driver.Run(Path(directory))
             run.nodes = ['node1', 'node2']
             calls = []
-            run.execute = lambda node, *args, **_kwargs: (
-                calls.append(('execute', node, args[-1]))
-                or json.dumps({'cases': [{'id': 'command.registry-capacity',
-                                          'status': 'passed'}]})
-            )
-            run.helper = lambda node, *args, **_kwargs: calls.append(
-                ('helper', node, args[0]))
+
+            def _assigned_execute(node, *args, **_kwargs):
+                return calls.append(('execute', node, args[-1])) or json.dumps(
+                    {'cases': [{'id': 'command.registry-capacity', 'status': 'passed'}]}
+                )
+
+            run.execute = _assigned_execute
+
+            def _assigned_helper(node, *args, **_kwargs):
+                return calls.append(('helper', node, args[0]))
+
+            run.helper = _assigned_helper
             checks = []
             run.scenarios(checks, ('command-registry-capacity',))
             self.assertEqual(checks, ['command-registry-capacity'])
-            self.assertEqual(calls, [
-                ('execute', 'node1', 'command-registry-capacity'),
-                ('helper', 'node1', 'empty'),
-                ('helper', 'node2', 'empty'),
-            ])
+            self.assertEqual(
+                calls,
+                [
+                    ('execute', 'node1', 'command-registry-capacity'),
+                    ('helper', 'node1', 'empty'),
+                    ('helper', 'node2', 'empty'),
+                ],
+            )
 
     def test_command_expiry_is_isolated_to_targeted_full_case(self):
-        self.assertEqual(driver.selected_checks('full', 'command-expiry'),
-                         ('command-expiry',))
-        self.assertEqual(driver.setup_environment('command-expiry'),
-                         ('ADX_E2E_COMMAND_RESULT_TTL_SECS=1',))
+        self.assertEqual(driver.selected_checks('full', 'command-expiry'), ('command-expiry',))
+        self.assertEqual(driver.setup_environment('command-expiry'), ('ADX_E2E_COMMAND_RESULT_TTL_SECS=1',))
         self.assertEqual(driver.setup_environment('sdk'), ())
         with tempfile.TemporaryDirectory() as directory:
             run = driver.Run(Path(directory))
             run.nodes = ['node1', 'node2']
             calls = []
-            run.execute = lambda node, *args, **_kwargs: (
-                calls.append(('execute', node, args[-1]))
-                or json.dumps({'cases': [{'id': 'command.expired-result',
-                                          'status': 'passed'}]})
-            )
-            run.helper = lambda node, *args, **_kwargs: calls.append(
-                ('helper', node, args[0]))
+
+            def _assigned_execute(node, *args, **_kwargs):
+                return calls.append(('execute', node, args[-1])) or json.dumps(
+                    {'cases': [{'id': 'command.expired-result', 'status': 'passed'}]}
+                )
+
+            run.execute = _assigned_execute
+
+            def _assigned_helper(node, *args, **_kwargs):
+                return calls.append(('helper', node, args[0]))
+
+            run.helper = _assigned_helper
             checks = []
             run.scenarios(checks, ('command-expiry',))
             self.assertEqual(checks, ['command-expiry'])
-            self.assertEqual(calls, [
-                ('execute', 'node1', 'command-expiry'),
-                ('helper', 'node1', 'empty'),
-                ('helper', 'node2', 'empty'),
-            ])
+            self.assertEqual(
+                calls,
+                [
+                    ('execute', 'node1', 'command-expiry'),
+                    ('helper', 'node1', 'empty'),
+                    ('helper', 'node2', 'empty'),
+                ],
+            )
 
     def test_upload_response_cut_is_targeted_full_case_with_physical_cleanup(self):
-        self.assertEqual(driver.selected_checks('full', 'upload-response-cut'),
-                         ('upload-response-cut',))
+        self.assertEqual(driver.selected_checks('full', 'upload-response-cut'), ('upload-response-cut',))
         with self.assertRaisesRegex(ValueError, 'not in E2E profile'):
             driver.selected_checks('l0', 'upload-response-cut')
         with tempfile.TemporaryDirectory() as directory:
             run = driver.Run(Path(directory))
             run.nodes = ['node1', 'node2']
             calls = []
-            run.execute = lambda node, *args, **_kwargs: (
-                calls.append(('execute', node, args[-1]))
-                or json.dumps({'cases': [{'id': 'file.resumable-upload-response-cut',
-                                          'status': 'passed'}]})
-            )
-            run.helper = lambda node, *args, **_kwargs: calls.append(
-                ('helper', node, args[0]))
+
+            def _assigned_execute(node, *args, **_kwargs):
+                return calls.append(('execute', node, args[-1])) or json.dumps(
+                    {'cases': [{'id': 'file.resumable-upload-response-cut', 'status': 'passed'}]}
+                )
+
+            run.execute = _assigned_execute
+
+            def _assigned_helper(node, *args, **_kwargs):
+                return calls.append(('helper', node, args[0]))
+
+            run.helper = _assigned_helper
             checks = []
             run.scenarios(checks, ('upload-response-cut',))
             self.assertEqual(checks, ['upload-response-cut'])
-            self.assertEqual(calls, [
-                ('execute', 'node1', 'upload-response-cut'),
-                ('helper', 'node1', 'empty'),
-                ('helper', 'node2', 'empty'),
-            ])
+            self.assertEqual(
+                calls,
+                [
+                    ('execute', 'node1', 'upload-response-cut'),
+                    ('helper', 'node1', 'empty'),
+                    ('helper', 'node2', 'empty'),
+                ],
+            )
 
     def test_download_response_cut_is_targeted_full_case_with_physical_cleanup(self):
-        self.assertEqual(driver.selected_checks('full', 'download-response-cut'),
-                         ('download-response-cut',))
+        self.assertEqual(driver.selected_checks('full', 'download-response-cut'), ('download-response-cut',))
         with self.assertRaisesRegex(ValueError, 'not in E2E profile'):
             driver.selected_checks('l0', 'download-response-cut')
         with tempfile.TemporaryDirectory() as directory:
             run = driver.Run(Path(directory))
             run.nodes = ['node1', 'node2']
             calls = []
-            run.execute = lambda node, *args, **_kwargs: (
-                calls.append(('execute', node, args[-1]))
-                or json.dumps({'cases': [{'id': 'file.resumable-download-response-cut',
-                                          'status': 'passed'}]})
-            )
-            run.helper = lambda node, *args, **_kwargs: calls.append(
-                ('helper', node, args[0]))
+
+            def _assigned_execute(node, *args, **_kwargs):
+                return calls.append(('execute', node, args[-1])) or json.dumps(
+                    {'cases': [{'id': 'file.resumable-download-response-cut', 'status': 'passed'}]}
+                )
+
+            run.execute = _assigned_execute
+
+            def _assigned_helper(node, *args, **_kwargs):
+                return calls.append(('helper', node, args[0]))
+
+            run.helper = _assigned_helper
             checks = []
             run.scenarios(checks, ('download-response-cut',))
             self.assertEqual(checks, ['download-response-cut'])
-            self.assertEqual(calls, [
-                ('execute', 'node1', 'download-response-cut'),
-                ('helper', 'node1', 'empty'),
-                ('helper', 'node2', 'empty'),
-            ])
+            self.assertEqual(
+                calls,
+                [
+                    ('execute', 'node1', 'download-response-cut'),
+                    ('helper', 'node1', 'empty'),
+                    ('helper', 'node2', 'empty'),
+                ],
+            )
 
     def test_command_watch_unavailable_is_targeted_full_case_with_physical_cleanup(self):
-        self.assertEqual(driver.selected_checks('full', 'command-watch-unavailable'),
-                         ('command-watch-unavailable',))
+        self.assertEqual(driver.selected_checks('full', 'command-watch-unavailable'), ('command-watch-unavailable',))
         with self.assertRaisesRegex(ValueError, 'not in E2E profile'):
             driver.selected_checks('l0', 'command-watch-unavailable')
         with tempfile.TemporaryDirectory() as directory:
             run = driver.Run(Path(directory))
             run.nodes = ['node1', 'node2']
             calls = []
-            run.execute = lambda node, *args, **_kwargs: (
-                calls.append(('execute', node, args[-1]))
-                or json.dumps({'cases': [{'id': 'reliability.command-watch-unavailable',
-                                          'status': 'passed'}]})
-            )
-            run.helper = lambda node, *args, **_kwargs: calls.append(
-                ('helper', node, args[0]))
+
+            def _assigned_execute(node, *args, **_kwargs):
+                return calls.append(('execute', node, args[-1])) or json.dumps(
+                    {'cases': [{'id': 'reliability.command-watch-unavailable', 'status': 'passed'}]}
+                )
+
+            run.execute = _assigned_execute
+
+            def _assigned_helper(node, *args, **_kwargs):
+                return calls.append(('helper', node, args[0]))
+
+            run.helper = _assigned_helper
             checks = []
             run.scenarios(checks, ('command-watch-unavailable',))
             self.assertEqual(checks, ['command-watch-unavailable'])
-            self.assertEqual(calls, [
-                ('execute', 'node1', 'command-watch-unavailable'),
-                ('helper', 'node1', 'empty'),
-                ('helper', 'node2', 'empty'),
-            ])
+            self.assertEqual(
+                calls,
+                [
+                    ('execute', 'node1', 'command-watch-unavailable'),
+                    ('helper', 'node1', 'empty'),
+                    ('helper', 'node2', 'empty'),
+                ],
+            )
 
     def test_command_watch_and_query_outage_is_targeted_full_case(self):
         case = 'command-watch-query-unavailable'
@@ -365,153 +451,206 @@ class AcceptanceGateTests(unittest.TestCase):
             run = driver.Run(Path(directory))
             run.nodes = ['node1', 'node2']
             calls = []
-            run.execute = lambda node, *args, **_kwargs: (
-                calls.append(('execute', node, args[-1]))
-                or json.dumps({'cases': [{'id': 'reliability.' + case,
-                                          'status': 'passed'}]})
-            )
-            run.helper = lambda node, *args, **_kwargs: calls.append(
-                ('helper', node, args[0]))
+
+            def _assigned_execute(node, *args, **_kwargs):
+                return calls.append(('execute', node, args[-1])) or json.dumps(
+                    {'cases': [{'id': 'reliability.' + case, 'status': 'passed'}]}
+                )
+
+            run.execute = _assigned_execute
+
+            def _assigned_helper(node, *args, **_kwargs):
+                return calls.append(('helper', node, args[0]))
+
+            run.helper = _assigned_helper
             checks = []
             run.scenarios(checks, (case,))
             self.assertEqual(checks, [case])
-            self.assertEqual(calls, [
-                ('execute', 'node1', case),
-                ('helper', 'node1', 'empty'),
-                ('helper', 'node2', 'empty'),
-            ])
+            self.assertEqual(
+                calls,
+                [
+                    ('execute', 'node1', case),
+                    ('helper', 'node1', 'empty'),
+                    ('helper', 'node2', 'empty'),
+                ],
+            )
 
     def test_command_unsupported_feature_is_targeted_full_case_with_physical_cleanup(self):
-        self.assertEqual(driver.selected_checks('full', 'command-unsupported-feature'),
-                         ('command-unsupported-feature',))
+        self.assertEqual(
+            driver.selected_checks('full', 'command-unsupported-feature'), ('command-unsupported-feature',)
+        )
         with self.assertRaisesRegex(ValueError, 'not in E2E profile'):
             driver.selected_checks('l0', 'command-unsupported-feature')
         with tempfile.TemporaryDirectory() as directory:
             run = driver.Run(Path(directory))
             run.nodes = ['node1', 'node2']
             calls = []
-            run.execute = lambda node, *args, **_kwargs: (
-                calls.append(('execute', node, args[-1]))
-                or json.dumps({'cases': [{'id': 'command.unsupported-feature',
-                                          'status': 'passed'}]})
-            )
-            run.helper = lambda node, *args, **_kwargs: calls.append(
-                ('helper', node, args[0]))
+
+            def _assigned_execute(node, *args, **_kwargs):
+                return calls.append(('execute', node, args[-1])) or json.dumps(
+                    {'cases': [{'id': 'command.unsupported-feature', 'status': 'passed'}]}
+                )
+
+            run.execute = _assigned_execute
+
+            def _assigned_helper(node, *args, **_kwargs):
+                return calls.append(('helper', node, args[0]))
+
+            run.helper = _assigned_helper
             checks = []
             run.scenarios(checks, ('command-unsupported-feature',))
             self.assertEqual(checks, ['command-unsupported-feature'])
-            self.assertEqual(calls, [
-                ('execute', 'node1', 'command-unsupported-feature'),
-                ('helper', 'node1', 'empty'),
-                ('helper', 'node2', 'empty'),
-            ])
+            self.assertEqual(
+                calls,
+                [
+                    ('execute', 'node1', 'command-unsupported-feature'),
+                    ('helper', 'node1', 'empty'),
+                    ('helper', 'node2', 'empty'),
+                ],
+            )
 
     def test_resource_stale_closes_admission_until_observer_recovers(self):
-        self.assertEqual(driver.selected_checks('full', 'resource-stale'),
-                         ('resource-stale',))
+        self.assertEqual(driver.selected_checks('full', 'resource-stale'), ('resource-stale',))
         with tempfile.TemporaryDirectory() as directory:
             run = driver.Run(Path(directory))
             run.nodes = ['node1', 'node2']
             calls = []
-            run.execute = lambda node, *args, **_kwargs: (
-                calls.append(('execute', node, args[-1]))
-                or json.dumps({'cases': [{'id': 'reliability.resource-stale-admission',
-                                          'status': 'passed'}]})
-            )
-            run.helper = lambda node, *args, **_kwargs: calls.append(
-                ('helper', node, args[0]))
+
+            def _assigned_execute(node, *args, **_kwargs):
+                return calls.append(('execute', node, args[-1])) or json.dumps(
+                    {'cases': [{'id': 'reliability.resource-stale-admission', 'status': 'passed'}]}
+                )
+
+            run.execute = _assigned_execute
+
+            def _assigned_helper(node, *args, **_kwargs):
+                return calls.append(('helper', node, args[0]))
+
+            run.helper = _assigned_helper
             checks = []
             run.scenarios(checks, ('resource-stale',))
             self.assertEqual(checks, ['resource-stale'])
-            self.assertEqual(calls, [
-                ('execute', 'node1', 'resource-create'),
-                ('helper', 'node1', 'observer-freeze'),
-                ('helper', 'node1', 'resource-stale'),
-                ('execute', 'node1', 'resource-rejected'),
-                ('helper', 'node1', 'observer-resume'),
-                ('helper', 'node1', 'resource-fresh'),
-                ('execute', 'node1', 'resource-verify'),
-                ('helper', 'node1', 'empty'),
-                ('helper', 'node2', 'empty'),
-            ])
+            self.assertEqual(
+                calls,
+                [
+                    ('execute', 'node1', 'resource-create'),
+                    ('helper', 'node1', 'observer-freeze'),
+                    ('helper', 'node1', 'resource-stale'),
+                    ('execute', 'node1', 'resource-rejected'),
+                    ('helper', 'node1', 'observer-resume'),
+                    ('helper', 'node1', 'resource-fresh'),
+                    ('execute', 'node1', 'resource-verify'),
+                    ('helper', 'node1', 'empty'),
+                    ('helper', 'node2', 'empty'),
+                ],
+            )
 
     def test_network_partition_heals_before_reconnected_backend_cleanup(self):
-        self.assertEqual(driver.selected_checks('full', 'network-partition'),
-                         ('network-partition',))
+        self.assertEqual(driver.selected_checks('full', 'network-partition'), ('network-partition',))
         with tempfile.TemporaryDirectory() as directory:
             run = driver.Run(Path(directory))
             run.nodes = ['node1', 'node2']
             calls = []
-            run.execute = lambda node, *args, **_kwargs: (
-                calls.append(('execute', node, args[-1]))
-                or json.dumps({'cases': [{'id': 'reliability.partition-route-withdrawal',
-                                          'status': 'passed'}]})
-            )
-            run.helper = lambda node, *args, **_kwargs: calls.append(
-                ('helper', node, args[0]))
+
+            def _assigned_execute(node, *args, **_kwargs):
+                return calls.append(('execute', node, args[-1])) or json.dumps(
+                    {'cases': [{'id': 'reliability.partition-route-withdrawal', 'status': 'passed'}]}
+                )
+
+            run.execute = _assigned_execute
+
+            def _assigned_helper(node, *args, **_kwargs):
+                return calls.append(('helper', node, args[0]))
+
+            run.helper = _assigned_helper
             checks = []
             run.scenarios(checks, ('network-partition',))
             self.assertEqual(checks, ['network-partition'])
-            self.assertEqual(calls, [
-                ('execute', 'node1', 'create'),
-                ('helper', 'node2', 'network-partition'),
-                ('helper', 'node1', 'failure-observed'),
-                ('execute', 'node1', 'partition-observed'),
-                ('helper', 'node2', 'network-heal'),
-                ('helper', 'node2', 'network-recovery'),
-                ('helper', 'node1', 'ready'),
-                ('helper', 'node2', 'empty'),
-                ('execute', 'node1', 'network-cleanup'),
-                ('helper', 'node1', 'empty'),
-                ('helper', 'node2', 'empty'),
-            ])
+            self.assertEqual(
+                calls,
+                [
+                    ('execute', 'node1', 'create'),
+                    ('helper', 'node2', 'network-partition'),
+                    ('helper', 'node1', 'failure-observed'),
+                    ('execute', 'node1', 'partition-observed'),
+                    ('helper', 'node2', 'network-heal'),
+                    ('helper', 'node2', 'network-recovery'),
+                    ('helper', 'node1', 'ready'),
+                    ('helper', 'node2', 'empty'),
+                    ('execute', 'node1', 'network-cleanup'),
+                    ('helper', 'node1', 'empty'),
+                    ('helper', 'node2', 'empty'),
+                ],
+            )
 
     def test_reconciliation_crash_retries_stale_backend_cleanup(self):
-        self.assertEqual(driver.selected_checks('full', 'reconcile-crash'),
-                         ('reconcile-crash',))
+        self.assertEqual(driver.selected_checks('full', 'reconcile-crash'), ('reconcile-crash',))
         with tempfile.TemporaryDirectory() as directory:
-            run=driver.Run(Path(directory))
-            run.nodes=['node1','node2']
-            calls=[]
-            run.execute=lambda node,*args,**kwargs:calls.append(('execute',node,args[-1])) or ''
-            def helper(node,*args,**kwargs):
-                if args[0] in ('freeze-stale-runtime', 'thaw-stale-runtime',
-                               'reconcile-delete-blocked', 'reconcile-recovered'):
+            run = driver.Run(Path(directory))
+            run.nodes = ['node1', 'node2']
+            calls = []
+
+            def _assigned_execute(node, *args, **kwargs):
+                return calls.append(('execute', node, args[-1])) or ''
+
+            run.execute = _assigned_execute
+
+            def helper(node, *args, **kwargs):
+                if args[0] in (
+                    'freeze-stale-runtime',
+                    'thaw-stale-runtime',
+                    'reconcile-delete-blocked',
+                    'reconcile-recovered',
+                ):
                     self.assertEqual(args[1:], ('node2',))
-                calls.append(('helper',node,args[0]))
-            run.helper=helper
-            checks=[]
-            run.scenarios(checks,('reconcile-crash',))
-            self.assertEqual(checks,['reconcile-crash'])
-            self.assertEqual(calls,[
-                ('execute','node1','create'),
-                ('helper','node2','freeze'),
-                ('helper','node1','failure-observed'),
-                ('helper','node2','freeze-stale-runtime'),
-                ('helper','node2','thaw'),
-                ('helper','node2','reconcile-delete-blocked'),
-                ('helper','node2','thaw-stale-runtime'),
-                ('helper','node2','reconcile-recovered'),
-                ('execute','node1','failure-cleanup'),
-                ('helper','node1','empty'),
-                ('helper','node2','empty'),
-            ])
+                calls.append(('helper', node, args[0]))
+
+            run.helper = helper
+            checks = []
+            run.scenarios(checks, ('reconcile-crash',))
+            self.assertEqual(checks, ['reconcile-crash'])
+            self.assertEqual(
+                calls,
+                [
+                    ('execute', 'node1', 'create'),
+                    ('helper', 'node2', 'freeze'),
+                    ('helper', 'node1', 'failure-observed'),
+                    ('helper', 'node2', 'freeze-stale-runtime'),
+                    ('helper', 'node2', 'thaw'),
+                    ('helper', 'node2', 'reconcile-delete-blocked'),
+                    ('helper', 'node2', 'thaw-stale-runtime'),
+                    ('helper', 'node2', 'reconcile-recovered'),
+                    ('execute', 'node1', 'failure-cleanup'),
+                    ('helper', 'node1', 'empty'),
+                    ('helper', 'node2', 'empty'),
+                ],
+            )
 
     def test_entrypoint_fixture_outlives_instance_startup(self):
-        source=(ROOT/'prepare.py').read_text()
-        self.assertIn('sleep 30; echo adx-entrypoint-stderr',source)
-        self.assertNotIn('sleep 5; echo adx-entrypoint-stderr',source)
+        source = (ROOT / 'prepare.py').read_text()
+        self.assertIn('sleep 30; echo adx-entrypoint-stderr', source)
+        self.assertNotIn('sleep 5; echo adx-entrypoint-stderr', source)
 
     def test_runtime_affinity_uses_one_heterogeneous_worker(self):
-        self.assertEqual(driver.setup_environment('runtime-affinity'),
-                         ('ADX_E2E_RUNSC_NODE=node2',))
+        self.assertEqual(driver.setup_environment('runtime-affinity'), ('ADX_E2E_RUNSC_NODE=node2',))
 
     def test_profiles_separate_l0_from_standalone_and_full(self):
         self.assertEqual(driver.required_for_profile('l0'), ('l0', 'auth'))
         self.assertEqual(
             set(driver.required_for_profile('standalone')),
-            {'sdk', 'data-plane', 'lifecycle', 'auth', 'capacity', 'placement',
-             'local-first', 'node-failure', 'sandboxd-restart', 'restart', 'stop'},
+            {
+                'sdk',
+                'data-plane',
+                'lifecycle',
+                'auth',
+                'capacity',
+                'placement',
+                'local-first',
+                'node-failure',
+                'sandboxd-restart',
+                'restart',
+                'stop',
+            },
         )
         self.assertEqual(
             driver.required_for_profile('k8s-basic'),
@@ -559,35 +698,40 @@ class AcceptanceGateTests(unittest.TestCase):
             path = Path(directory) / 'junit.xml'
             driver.write_junit(path, report)
             suite = ET.parse(path).getroot()
-        self.assertEqual([case.attrib['name'] for case in suite.findall('testcase')],
-                         ['l0', 'auth', 'cleanup'])
+        self.assertEqual([case.attrib['name'] for case in suite.findall('testcase')], ['l0', 'auth', 'cleanup'])
         self.assertEqual(suite.attrib['tests'], '3')
         self.assertEqual(suite.attrib['skipped'], '1')
 
     def test_sdk_subcases_are_extracted_and_reported_individually(self):
-        output = '\n'.join([
-            'ordinary log output',
-            json.dumps({
-                'status': 'passed',
-                'cases': [
-                    {'id': 'command.foreground', 'status': 'passed', 'seconds': 0.2},
-                    {'id': 'filesystem.copy', 'status': 'passed', 'seconds': 0.4},
-                ],
-            }),
-            '[SCENARIO COMPLETE] data-plane',
-        ])
+        output = '\n'.join(
+            [
+                'ordinary log output',
+                json.dumps(
+                    {
+                        'status': 'passed',
+                        'cases': [
+                            {'id': 'command.foreground', 'status': 'passed', 'seconds': 0.2},
+                            {'id': 'filesystem.copy', 'status': 'passed', 'seconds': 0.4},
+                        ],
+                    }
+                ),
+                '[SCENARIO COMPLETE] data-plane',
+            ]
+        )
         subcases = driver.sdk_subcases_from_output(output)
         self.assertEqual(
             [case['id'] for case in subcases],
             ['command.foreground', 'filesystem.copy'],
         )
         report = driver.finish_report(None, [], ['data-plane'], ('data-plane',))
-        report['cases'] = [{
-            'name': 'data-plane',
-            'status': 'passed',
-            'seconds': 1.0,
-            'subcases': subcases,
-        }]
+        report['cases'] = [
+            {
+                'name': 'data-plane',
+                'status': 'passed',
+                'seconds': 1.0,
+                'subcases': subcases,
+            }
+        ]
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'junit.xml'
             driver.write_junit(path, report)
@@ -599,15 +743,17 @@ class AcceptanceGateTests(unittest.TestCase):
         self.assertEqual(suite.attrib['tests'], '3')
 
     def test_placement_boolean_cases_are_extracted(self):
-        output = json.dumps({
-            'status': 'passed',
-            'cases': [
-                {'name': 'sandboxd runtime inventory', 'passed': True},
-                {'name': 'environment affinity OR', 'passed': True},
-                {'name': 'reverse instance anti-affinity', 'passed': True},
-                {'name': 'unavailable runtime stays unassigned', 'passed': True},
-            ],
-        })
+        output = json.dumps(
+            {
+                'status': 'passed',
+                'cases': [
+                    {'name': 'sandboxd runtime inventory', 'passed': True},
+                    {'name': 'environment affinity OR', 'passed': True},
+                    {'name': 'reverse instance anti-affinity', 'passed': True},
+                    {'name': 'unavailable runtime stays unassigned', 'passed': True},
+                ],
+            }
+        )
         self.assertEqual(
             driver.sdk_subcases_from_output(output),
             [
@@ -632,72 +778,154 @@ class AcceptanceGateTests(unittest.TestCase):
         self.assertEqual(driver.finish_report(None, [], ['sdk'])['status'], 'failed')
 
     def test_complete_clean_run_passes(self):
-        self.assertEqual(driver.finish_report(None, [], [
-            'sdk', 'data-plane', 'lifecycle', 'auth', 'capacity', 'placement',
-            'local-first', 'node-failure', 'sandboxd-restart', 'restart', 'stop'])['status'], 'passed')
+        self.assertEqual(
+            driver.finish_report(
+                None,
+                [],
+                [
+                    'sdk',
+                    'data-plane',
+                    'lifecycle',
+                    'auth',
+                    'capacity',
+                    'placement',
+                    'local-first',
+                    'node-failure',
+                    'sandboxd-restart',
+                    'restart',
+                    'stop',
+                ],
+            )['status'],
+            'passed',
+        )
 
     def test_sandboxd_restart_checks_existing_instances_before_cleanup(self):
         with tempfile.TemporaryDirectory() as directory:
             run = driver.Run(Path(directory))
             run.nodes = ['node1', 'node2']
             calls = []
-            run.execute = lambda node, *args, **kwargs: calls.append(('execute', node, args[-1])) or ''
-            run.helper = lambda node, *args, **kwargs: calls.append(('helper', node, args[0])) or ''
+
+            def _assigned_execute(node, *args, **kwargs):
+                return calls.append(('execute', node, args[-1])) or ''
+
+            run.execute = _assigned_execute
+
+            def _assigned_helper(node, *args, **kwargs):
+                return calls.append(('helper', node, args[0])) or ''
+
+            run.helper = _assigned_helper
             checks = []
             run.scenarios(checks, ('sandboxd-restart',))
             self.assertEqual(checks, ['sandboxd-restart'])
-            self.assertEqual(calls, [
-                ('execute', 'node1', 'create-marker'),
-                ('helper', 'node1', 'restart-sandboxd'),
-                ('helper', 'node2', 'restart-sandboxd'),
-                ('execute', 'node1', 'recovered-marker'),
-                ('execute', 'node1', 'cleanup-live'),
-                ('helper', 'node1', 'empty'),
-                ('helper', 'node2', 'empty'),
-            ])
+            self.assertEqual(
+                calls,
+                [
+                    ('execute', 'node1', 'create-marker'),
+                    ('helper', 'node1', 'restart-sandboxd'),
+                    ('helper', 'node2', 'restart-sandboxd'),
+                    ('execute', 'node1', 'recovered-marker'),
+                    ('execute', 'node1', 'cleanup-live'),
+                    ('helper', 'node1', 'empty'),
+                    ('helper', 'node2', 'empty'),
+                ],
+            )
 
     def test_stop_creates_its_own_live_backends(self):
         with tempfile.TemporaryDirectory() as directory:
             run = driver.Run(Path(directory))
             run.nodes = ['node1', 'node2']
             calls = []
-            run.execute = lambda node, *args, **kwargs: calls.append(('execute', node, args[-2] if args[-2] in ('outage-start','outage-end') else args[-1])) or ''
-            run.helper = lambda node, *args, **kwargs: calls.append(('helper', node, args[0])) or ''
+
+            def _assigned_execute(node, *args, **kwargs):
+                return (
+                    calls.append(
+                        ('execute', node, args[-2] if args[-2] in ('outage-start', 'outage-end') else args[-1])
+                    )
+                    or ''
+                )
+
+            run.execute = _assigned_execute
+
+            def _assigned_helper(node, *args, **kwargs):
+                return calls.append(('helper', node, args[0])) or ''
+
+            run.helper = _assigned_helper
             checks = []
             run.scenarios(checks, ('stop',))
             self.assertEqual(checks, ['stop'])
-            self.assertEqual(calls, [
-                ('execute', 'node1', 'outage-start'),
-                ('execute', 'node2', 'outage-start'),
-                ('execute', 'node1', 'create-stop'),
-                ('execute', 'node1', 'outage-end'),
-                ('execute', 'node2', 'outage-end'),
-                ('helper', 'node1', 'occupied'),
-                ('helper', 'node2', 'occupied'),
-                ('helper', 'node2', 'stop'),
-                ('helper', 'node2', 'empty'),
-                ('helper', 'node1', 'stop'),
-                ('helper', 'node1', 'empty'),
-            ])
+            self.assertEqual(
+                calls,
+                [
+                    ('execute', 'node1', 'outage-start'),
+                    ('execute', 'node2', 'outage-start'),
+                    ('execute', 'node1', 'create-stop'),
+                    ('execute', 'node1', 'outage-end'),
+                    ('execute', 'node2', 'outage-end'),
+                    ('helper', 'node1', 'occupied'),
+                    ('helper', 'node2', 'occupied'),
+                    ('helper', 'node2', 'stop'),
+                    ('helper', 'node2', 'empty'),
+                    ('helper', 'node1', 'stop'),
+                    ('helper', 'node1', 'empty'),
+                ],
+            )
 
     def test_old_eight_scenarios_without_functional_data_plane_cannot_pass(self):
-        report = driver.finish_report(None, [], [
-            'sdk', 'auth', 'capacity', 'placement', 'local-first',
-            'node-failure', 'sandboxd-restart', 'restart', 'stop'])
+        report = driver.finish_report(
+            None,
+            [],
+            [
+                'sdk',
+                'auth',
+                'capacity',
+                'placement',
+                'local-first',
+                'node-failure',
+                'sandboxd-restart',
+                'restart',
+                'stop',
+            ],
+        )
         self.assertEqual(report['status'], 'failed')
         self.assertEqual(report['missing_checks'], ['data-plane', 'lifecycle'])
 
     def test_missing_node_failure_scenario_cannot_pass(self):
-        report = driver.finish_report(None, [], ['sdk', 'data-plane', 'lifecycle',
-                                                'auth', 'capacity', 'placement',
-                                                'local-first', 'sandboxd-restart', 'restart', 'stop'])
+        report = driver.finish_report(
+            None,
+            [],
+            [
+                'sdk',
+                'data-plane',
+                'lifecycle',
+                'auth',
+                'capacity',
+                'placement',
+                'local-first',
+                'sandboxd-restart',
+                'restart',
+                'stop',
+            ],
+        )
         self.assertEqual(report['status'], 'failed')
         self.assertEqual(report['missing_checks'], ['node-failure'])
 
     def test_old_seven_scenarios_without_local_first_cannot_pass(self):
-        report = driver.finish_report(None, [], ['sdk', 'data-plane', 'lifecycle',
-                                                'auth', 'capacity', 'placement',
-                                                'node-failure', 'sandboxd-restart', 'restart', 'stop'])
+        report = driver.finish_report(
+            None,
+            [],
+            [
+                'sdk',
+                'data-plane',
+                'lifecycle',
+                'auth',
+                'capacity',
+                'placement',
+                'node-failure',
+                'sandboxd-restart',
+                'restart',
+                'stop',
+            ],
+        )
         self.assertEqual(report['status'], 'failed')
         self.assertEqual(report['missing_checks'], ['local-first'])
 
@@ -708,37 +936,44 @@ class AcceptanceGateTests(unittest.TestCase):
 
     def test_runtime_architecture_must_match_artifact(self):
         with self.assertRaisesRegex(ValueError, 'architecture'):
-            driver.validate_identity({'target':'aarch64-unknown-linux-gnu','commit':'a'*40,'dirty':False}, 'amd64', 'a'*40, True)
+            driver.validate_identity(
+                {'target': 'aarch64-unknown-linux-gnu', 'commit': 'a' * 40, 'dirty': False}, 'amd64', 'a' * 40, True
+            )
 
     def test_ci_rejects_dirty_or_wrong_commit(self):
-        for commit, dirty in [('b'*40,False), ('a'*40,True)]:
+        for commit, dirty in [('b' * 40, False), ('a' * 40, True)]:
             with self.assertRaises(ValueError):
-                driver.validate_identity({'target':'x86_64-unknown-linux-gnu','commit':commit,'dirty':dirty}, 'amd64', 'a'*40, True)
+                driver.validate_identity(
+                    {'target': 'x86_64-unknown-linux-gnu', 'commit': commit, 'dirty': dirty}, 'amd64', 'a' * 40, True
+                )
 
     def test_modified_bundle_is_rejected_before_deployment(self):
         with tempfile.TemporaryDirectory() as d:
-            p=Path(d);(p/'images.tar').write_bytes(b'changed')
-            (p/'bundle.json').write_text(json.dumps({'schema_version':1,'archive_sha256':'0'*64}))
-            with self.assertRaises(ValueError):driver.verify_bundle(p)
+            p = Path(d)
+            (p / 'images.tar').write_bytes(b'changed')
+            (p / 'bundle.json').write_text(json.dumps({'schema_version': 1, 'archive_sha256': '0' * 64}))
+            with self.assertRaises(ValueError):
+                driver.verify_bundle(p)
 
     def test_complete_bundle_requires_node_execd_and_entrypoint_archives(self):
         with tempfile.TemporaryDirectory() as d:
-            p=Path(d)
-            for name,payload in (
-                ('images.tar',b'node'),('execd.tar',b'execd'),
-                ('entrypoint.tar',b'entrypoint'),
+            p = Path(d)
+            for name, payload in (
+                ('images.tar', b'node'),
+                ('execd.tar', b'execd'),
+                ('entrypoint.tar', b'entrypoint'),
             ):
-                (p/name).write_bytes(payload)
-            manifest={
-                'schema_version':1,
-                'archive_sha256':driver.sha(p/'images.tar'),
-                'execd_archive_sha256':driver.sha(p/'execd.tar'),
-                'entrypoint_archive_sha256':driver.sha(p/'entrypoint.tar'),
+                (p / name).write_bytes(payload)
+            manifest = {
+                'schema_version': 1,
+                'archive_sha256': driver.sha(p / 'images.tar'),
+                'execd_archive_sha256': driver.sha(p / 'execd.tar'),
+                'entrypoint_archive_sha256': driver.sha(p / 'entrypoint.tar'),
             }
-            (p/'bundle.json').write_text(json.dumps(manifest))
-            self.assertEqual(driver.verify_bundle(p),manifest)
-            (p/'entrypoint.tar').write_bytes(b'replaced')
-            with self.assertRaisesRegex(ValueError,'entrypoint'):
+            (p / 'bundle.json').write_text(json.dumps(manifest))
+            self.assertEqual(driver.verify_bundle(p), manifest)
+            (p / 'entrypoint.tar').write_bytes(b'replaced')
+            with self.assertRaisesRegex(ValueError, 'entrypoint'):
                 driver.verify_bundle(p)
 
     def test_makefile_has_separate_local_and_kubernetes_profile_defaults(self):
@@ -749,36 +984,67 @@ class AcceptanceGateTests(unittest.TestCase):
         self.assertIn('$(K8S_E2E_PROFILE)', k8s_target)
         self.assertNotIn('--profile "$(E2E_PROFILE)"', k8s_target)
 
+
 class RegistryImportTests(unittest.TestCase):
     def test_archive_import_checks_manifest_and_compresses_layers(self):
-        import gzip, hashlib, http.server, io, tarfile, threading
-        spec=importlib.util.spec_from_file_location('registry_publish',ROOT/'publish.py')
-        module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
-        blobs={};published=[]
+        import gzip
+        import hashlib
+        import http.server
+        import io
+        import tarfile
+        import threading
+
+        spec_local = importlib.util.spec_from_file_location('registry_publish', ROOT / 'publish.py')
+        module = importlib.util.module_from_spec(spec_local)
+        spec_local.loader.exec_module(module)
+        blobs = {}
+        published = []
+
         class Handler(http.server.BaseHTTPRequestHandler):
-            def log_message(self,*args):pass
-            def do_GET(self):self.send_response(200);self.end_headers()
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                self.send_response(200)
+                self.end_headers()
+
             def do_POST(self):
-                self.send_response(202);self.send_header('Location','/upload?id=fixture');self.end_headers()
+                self.send_response(202)
+                self.send_header('Location', '/upload?id=fixture')
+                self.end_headers()
+
             def do_PUT(self):
-                data=self.rfile.read(int(self.headers['Content-Length']))
-                digest='sha256:'+hashlib.sha256(data).hexdigest()
+                data = self.rfile.read(int(self.headers['Content-Length']))
+                digest = 'sha256:' + hashlib.sha256(data).hexdigest()
                 if self.path.startswith('/upload'):
-                    self.assertion=digest in self.path;blobs[digest]=data
-                else:published.append(json.loads(data))
-                self.send_response(201);self.send_header('Docker-Content-Digest',digest);self.end_headers()
-        server=http.server.ThreadingHTTPServer(('127.0.0.1',0),Handler)
-        thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
-        self.addCleanup(server.server_close);self.addCleanup(server.shutdown)
-        module.BASE='http://127.0.0.1:'+str(server.server_port)
+                    self.assertion = digest in self.path
+                    blobs[digest] = data
+                else:
+                    published.append(json.loads(data))
+                self.send_response(201)
+                self.send_header('Docker-Content-Digest', digest)
+                self.end_headers()
+
+        server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        module.BASE = 'http://127.0.0.1:' + str(server.server_port)
         with tempfile.TemporaryDirectory() as d:
-            archive=Path(d)/'image.tar'
-            with tarfile.open(archive,'w') as tar:
-                for name,data in [('manifest.json',json.dumps([{'Config':'config.json','Layers':['layer.tar']}]).encode()),('config.json',b'{}'),('layer.tar',b'fixture layer')]:
-                    info=tarfile.TarInfo(name);info.size=len(data);tar.addfile(info,io.BytesIO(data))
-            digest=module.publish(archive)
+            archive = Path(d) / 'image.tar'
+            with tarfile.open(archive, 'w') as tar:
+                for name, data in [
+                    ('manifest.json', json.dumps([{'Config': 'config.json', 'Layers': ['layer.tar']}]).encode()),
+                    ('config.json', b'{}'),
+                    ('layer.tar', b'fixture layer'),
+                ]:
+                    info = tarfile.TarInfo(name)
+                    info.size = len(data)
+                    tar.addfile(info, io.BytesIO(data))
+            digest = module.publish(archive)
         self.assertTrue(digest.startswith('sha256:'))
-        self.assertEqual(len(published),1)
-        layer=published[0]['layers'][0]
-        self.assertEqual(gzip.decompress(blobs[layer['digest']]),b'fixture layer')
-        self.assertEqual(layer['size'],len(blobs[layer['digest']]))
+        self.assertEqual(len(published), 1)
+        layer = published[0]['layers'][0]
+        self.assertEqual(gzip.decompress(blobs[layer['digest']]), b'fixture layer')
+        self.assertEqual(layer['size'], len(blobs[layer['digest']]))

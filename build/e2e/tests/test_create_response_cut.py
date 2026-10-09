@@ -2,13 +2,12 @@
 
 import importlib.util
 import json
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from http.client import RemoteDisconnected
-from pathlib import Path
 import threading
 import unittest
+from http.client import RemoteDisconnected
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.request import Request, urlopen
-
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -21,10 +20,13 @@ class CreateResponseCutTests(unittest.TestCase):
             def do_POST(self):
                 body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
                 received.append((self.headers['X-Request-Id'], body['name']))
-                final = json.dumps({
-                    'status': 'running', 'sandboxId': body['name'],
-                    'requestId': self.headers['X-Request-Id'],
-                }).encode()
+                final = json.dumps(
+                    {
+                        'status': 'running',
+                        'sandboxId': body['name'],
+                        'requestId': self.headers['X-Request-Id'],
+                    }
+                ).encode()
                 payload = b'event: final\ndata: ' + final + b'\n\n'
                 self.send_response(200)
                 self.send_header('Content-Type', 'text/event-stream')
@@ -45,9 +47,11 @@ class CreateResponseCutTests(unittest.TestCase):
             upstream = f'http://127.0.0.1:{server.server_port}'
             with proxy_module.ResponseCutProxy(upstream) as proxy:
                 url = f'http://127.0.0.1:{proxy.port}/api/sandbox/v1/sandboxes'
-                request = Request(url, data=json.dumps({'name': 'same-capsule'}).encode(),
-                                  headers={'X-Request-Id': 'same-request',
-                                           'Content-Type': 'application/json'})
+                request = Request(
+                    url,
+                    data=json.dumps({'name': 'same-capsule'}).encode(),
+                    headers={'X-Request-Id': 'same-request', 'Content-Type': 'application/json'},
+                )
                 with self.assertRaises(RemoteDisconnected):
                     urlopen(request, timeout=5)
                 with urlopen(request, timeout=5) as response:

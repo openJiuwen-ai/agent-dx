@@ -1,10 +1,11 @@
 import http.server
-from pathlib import Path
+import shlex
+import shutil
 import subprocess
 import sys
 import threading
 import unittest
-
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 REPOSITORY = ROOT.parents[1]
@@ -13,8 +14,8 @@ sys.path.insert(0, str(REPOSITORY / 'platform/sdk/sandbox/python'))
 
 from functional_data_plane import (  # noqa: E402
     TUNNEL_BODY,
-    _TunnelUpstream,
     _tunnel_fetch_command,
+    _TunnelUpstream,
 )
 
 
@@ -24,12 +25,15 @@ class ReverseTunnelCaseTests(unittest.TestCase):
         thread = threading.Thread(target=upstream.serve_forever, daemon=True)
         thread.start()
         try:
-            command = _tunnel_fetch_command(
-                f'http://127.0.0.1:{upstream.server_address[1]}'
-            )
+            command = _tunnel_fetch_command(f'http://127.0.0.1:{upstream.server_address[1]}')
+            arguments = shlex.split(command)
+            executable = shutil.which(arguments[0])
+            if executable is None:
+                raise FileNotFoundError(arguments[0])
+            arguments[0] = executable
             result = subprocess.run(
-                command,
-                shell=True,
+                arguments,
+                shell=False,
                 capture_output=True,
                 text=True,
                 timeout=5,

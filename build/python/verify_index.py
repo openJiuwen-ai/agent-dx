@@ -3,11 +3,10 @@
 
 import argparse
 import json
-from pathlib import Path
 import time
+from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import urlopen
-
 
 INDEXES = {
     "pypi": "https://pypi.org/pypi/{name}/{version}/json",
@@ -17,9 +16,7 @@ INDEXES = {
 
 def verify_payload(payload, candidate, repository):
     info = payload.get("info", {})
-    if info.get("name", "").lower() != candidate["name"] or info.get(
-        "version"
-    ) != candidate["version"]:
+    if info.get("name", "").lower() != candidate["name"] or info.get("version") != candidate["version"]:
         raise ValueError("published package identity mismatch")
     urls = {item.get("filename"): item for item in payload.get("urls", [])}
     if set(urls) != set(candidate["files"]):
@@ -45,9 +42,7 @@ def verify_payload(payload, candidate, repository):
 
 
 def fetch(candidate, repository, attempts=6):
-    url = INDEXES[repository].format(
-        name=candidate["name"], version=candidate["version"]
-    )
+    url = INDEXES[repository].format(name=candidate["name"], version=candidate["version"])
     for attempt in range(attempts):
         try:
             with urlopen(url, timeout=15) as response:

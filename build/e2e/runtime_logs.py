@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Inspect sandboxd host stream redirects after the public SDK scenario."""
+
 import json
-from pathlib import Path
 import sys
+from pathlib import Path
 
 
 def inspect(directory, instance_ids):

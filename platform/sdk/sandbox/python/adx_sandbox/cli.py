@@ -58,9 +58,7 @@ def main(argv=None) -> int:
             sys.stderr.write(result.get("stderr", ""))
             return int(result.get("exit_code", 0))
         elif args.cmd == "ls":
-            result = client.invoke(
-                args.sandbox_id, "file.list", {"path": args.path, "depth": 1}
-            )
+            result = client.invoke(args.sandbox_id, "file.list", {"path": args.path, "depth": 1})
             for e in result.get("entries", []):
                 print(f"{e['permissions']}\t{e['size']}\t{e['name']}")
     finally:

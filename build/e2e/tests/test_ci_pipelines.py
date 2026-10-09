@@ -1,10 +1,9 @@
 import importlib.util
-from pathlib import Path
 import tempfile
 import unittest
+from pathlib import Path
 
 import yaml
-
 
 ROOT = Path(__file__).resolve().parents[3]
 
@@ -20,8 +19,10 @@ class IndependentPipelineTests(unittest.TestCase):
         for key in ('build-platform', 'build-gateway', 'build-execd', 'source-gate'):
             self.assertIn(f'key: {key}', package)
         steps = {step['key']: step for step in yaml.safe_load(package)['steps']}
-        self.assertEqual(set(steps['platform-build']['depends_on']),
-                         {'build-platform', 'build-gateway', 'build-execd', 'source-gate', 'admin-package', 'sdk-package'})
+        self.assertEqual(
+            set(steps['platform-build']['depends_on']),
+            {'build-platform', 'build-gateway', 'build-execd', 'source-gate', 'admin-package', 'sdk-package'},
+        )
         self.assertIn('key: platform-e2e', package)
         self.assertIn('key: sdk-package', package)
 
@@ -104,9 +105,7 @@ class IndependentPipelineTests(unittest.TestCase):
         self.assertIn('sha512sum --check', script)
 
     def test_e2e_bundle_records_independent_sdk_candidate(self):
-        spec = importlib.util.spec_from_file_location(
-            'e2e_prepare', ROOT / 'build/e2e/prepare.py'
-        )
+        spec = importlib.util.spec_from_file_location('e2e_prepare', ROOT / 'build/e2e/prepare.py')
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         with tempfile.TemporaryDirectory() as directory:
@@ -115,9 +114,11 @@ class IndependentPipelineTests(unittest.TestCase):
             wheel.write_bytes(b'wheel')
             candidate = root / 'sdk-candidate.json'
             candidate.write_text(
-                '{"schema_version":1,"commit":"' + 'a' * 40
+                '{"schema_version":1,"commit":"'
+                + 'a' * 40
                 + '","version":"0.1.0","files":{"adx_sandbox-0.1.0-py3-none-any.whl":"'
-                + module.sha(wheel) + '"}}'
+                + module.sha(wheel)
+                + '"}}'
             )
             value = module.verify_sdk(wheel, candidate, 'a' * 40)
             self.assertEqual(value['version'], '0.1.0')
@@ -126,9 +127,7 @@ class IndependentPipelineTests(unittest.TestCase):
                 module.verify_sdk(wheel, candidate, 'a' * 40)
 
     def test_optional_runsc_binary_must_match_release_architecture(self):
-        spec = importlib.util.spec_from_file_location(
-            'e2e_prepare', ROOT / 'build/e2e/prepare.py'
-        )
+        spec = importlib.util.spec_from_file_location('e2e_prepare', ROOT / 'build/e2e/prepare.py')
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         with tempfile.TemporaryDirectory() as directory:
@@ -138,8 +137,7 @@ class IndependentPipelineTests(unittest.TestCase):
             elf[18:20] = (62).to_bytes(2, 'little')
             runsc.write_bytes(elf)
             runsc.chmod(0o755)
-            self.assertEqual(module.verify_runsc(runsc, 'x86_64-unknown-linux-gnu'),
-                             module.sha(runsc))
+            self.assertEqual(module.verify_runsc(runsc, 'x86_64-unknown-linux-gnu'), module.sha(runsc))
             with self.assertRaisesRegex(ValueError, 'architecture'):
                 module.verify_runsc(runsc, 'aarch64-unknown-linux-gnu')
             runsc.write_bytes(b'not-an-ELF')

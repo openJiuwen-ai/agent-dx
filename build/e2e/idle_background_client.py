@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Exit a separate SDK client while its detached command remains active."""
+
 import json
+import logging
 import os
-from pathlib import Path
 import sys
+from pathlib import Path
 
 from adx_sandbox import CommandStatus, ConnectionConfig, Sandbox
 
@@ -28,21 +30,25 @@ def main(image, output):
         create_timeout=150,
     )
     try:
-        command = sandbox.commands.run(
-            'sleep 120', background=True, command_id='idle-client-exit'
+        command = sandbox.commands.run('sleep 120', background=True, command_id='idle-client-exit')
+        if not (command.poll() == CommandStatus.RUNNING):
+            raise AssertionError()
+        output.write_text(
+            json.dumps(
+                {
+                    'instance_id': sandbox.id,
+                    'command_id': command.id,
+                    'command_running_before_exit': True,
+                    'client_pid': os.getpid(),
+                }
+            )
+            + '\n'
         )
-        assert command.poll() == CommandStatus.RUNNING
-        output.write_text(json.dumps({
-            'instance_id': sandbox.id,
-            'command_id': command.id,
-            'command_running_before_exit': True,
-            'client_pid': os.getpid(),
-        }) + '\n')
     except Exception:
         try:
             sandbox.kill()
         except Exception:
-            pass
+            logging.getLogger(__name__).debug("Best-effort operation failed", exc_info=True)
         raise
     finally:
         sandbox.close()

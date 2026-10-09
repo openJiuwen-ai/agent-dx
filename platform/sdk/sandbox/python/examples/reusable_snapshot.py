@@ -11,7 +11,8 @@ def main() -> None:
         source.files.write("/tmp/marker", "from reusable snapshot")
         snapshot = source.create_snapshot(name="python-ready")
         clone = Sandbox.create(snapshot, name="snapshot-clone")
-        assert clone.files.read("/tmp/marker") == "from reusable snapshot"
+        if not (clone.files.read("/tmp/marker") == "from reusable snapshot"):
+            raise AssertionError()
         print(f"Restored {clone.id} from {snapshot.snapshot_id}")
     finally:
         if clone is not None:

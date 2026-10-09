@@ -17,4 +17,4 @@ def wait_for_route(sandbox, *, timeout=10, clock=time.monotonic, sleep=time.slee
                 raise
             if clock() >= deadline:
                 raise TimeoutError('instance route did not synchronize') from error
-            sleep(.1)
+            sleep(0.1)

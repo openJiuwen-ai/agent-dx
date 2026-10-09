@@ -25,6 +25,7 @@ import hashlib
 import http.server
 import os
 import shlex
+import shutil
 import sys
 import tempfile
 import threading
@@ -49,80 +50,103 @@ TEST_SIZES = [
 def start_local_server(port: int):
     """Start an HTTP server serving pre-generated files with known SHA256 hashes."""
     temp_dir = tempfile.mkdtemp(prefix="tunnel_large_test_")
+    server = None
+    thread = None
+    try:
+        file_hashes = {}
+        for label, size in TEST_SIZES:
+            content = ("DATA_BLOCK_" + label + "_" + "X" * 1023 + "\n") * (size // 1024)
+            content = content[:size]
+            content_bytes = content.encode()
+            filepath = os.path.join(temp_dir, label + ".bin")
+            with open(filepath, "wb") as f:
+                f.write(content_bytes)
+            file_hashes[label] = hashlib.sha256(content_bytes).hexdigest()
+            print((f"  Created {label}.bin: {os.path.getsize(filepath):,} bytes, sha256={file_hashes[label][:16]}..."))
 
-    file_hashes = {}
-    for label, size in TEST_SIZES:
-        content = ("DATA_BLOCK_" + label + "_" + "X" * 1023 + "\n") * (size // 1024)
-        content = content[:size]
-        content_bytes = content.encode()
-        filepath = os.path.join(temp_dir, label + ".bin")
-        with open(filepath, "wb") as f:
-            f.write(content_bytes)
-        file_hashes[label] = hashlib.sha256(content_bytes).hexdigest()
-        print(f"  Created {label}.bin: {os.path.getsize(filepath):,} bytes, sha256={file_hashes[label][:16]}...")
+        class QuietHandler(http.server.SimpleHTTPRequestHandler):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, directory=temp_dir, **kwargs)
 
-    class QuietHandler(http.server.SimpleHTTPRequestHandler):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, directory=temp_dir, **kwargs)
-
-        def do_GET(self):
-            if self.path == "/health":
-                self.send_response(200)
-                self.send_header("Content-Type", "text/plain")
-                self.end_headers()
-                self.wfile.write(b"OK")
+            def do_GET(self):
+                if self.path == "/health":
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain")
+                    self.end_headers()
+                    self.wfile.write(b"OK")
+                    return
+                super().do_GET()
                 return
-            return super().do_GET()
 
-        def log_message(self, format, *args):  # noqa: A002 - stdlib signature
-            return
+            def log_message(self, format, *args):  # noqa: A002 - stdlib signature
+                return
 
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", port), QuietHandler)
-    actual_port = server.server_address[1]
-    thread = threading.Thread(
-        target=server.serve_forever, name="tunnel-large-local-http", daemon=True
-    )
-    thread.start()
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", port), QuietHandler)
+        actual_port = server.server_address[1]
+        thread = threading.Thread(target=server.serve_forever, name="tunnel-large-local-http", daemon=True)
+        thread.start()
 
-    # Wait for our server to serve expected content, not merely for any process
-    # to accept TCP on a fixed port.
-    for _ in range(30):
+        # Wait for our server to serve expected content, not merely for any process
+        # to accept TCP on a fixed port.
+        for _ in range(30):
+            try:
+                import urllib.request
+
+                with urllib.request.urlopen(f"http://127.0.0.1:{actual_port}/health", timeout=0.5) as response:
+                    data = response.read()
+                if data == b"OK":
+                    print(f"[OK] Local HTTP server started on port {actual_port}")
+                    return server, thread, temp_dir, file_hashes, actual_port
+            except Exception:
+                time.sleep(0.2)
+
+        raise RuntimeError("Failed to start local HTTP server")
+
+    except BaseException:
         try:
-            import urllib.request
-
-            data = urllib.request.urlopen(
-                f"http://127.0.0.1:{actual_port}/health", timeout=0.5
-            ).read()
-            if data == b"OK":
-                print(f"[OK] Local HTTP server started on port {actual_port}")
-                return server, thread, temp_dir, file_hashes, actual_port
-        except Exception:
-            time.sleep(0.2)
-
-    server.shutdown()
-    server.server_close()
-    raise RuntimeError("Failed to start local HTTP server")
+            if server is not None:
+                if thread is not None and thread.is_alive():
+                    server.shutdown()
+                    thread.join(timeout=5)
+                server.server_close()
+        finally:
+            shutil.rmtree(temp_dir)
+        raise
 
 
 def main():
     server, thread, temp_dir, file_hashes, local_port = start_local_server(LOCAL_PORT)
 
-    # Quick local verification (also confirms the port isn't hijacked by a proxy)
-    print("\n[Verify] Local server sanity check...")
-    import urllib.request
-    for label, size in TEST_SIZES:
-        url = f"http://127.0.0.1:{local_port}/{label}.bin"
-        r = urllib.request.urlopen(url, timeout=30)
-        data = r.read()
-        local_sha = hashlib.sha256(data).hexdigest()
-        ok = len(data) == size and local_sha == file_hashes[label]
-        print(f"  {label}: local_size={len(data):,} expected={size:,} sha_ok={local_sha == file_hashes[label]} {'OK' if ok else 'FAIL'}")
-        if not ok:
-            print(f"    ERROR: local server returned wrong data for {label}")
-            return 1
-    print("  Local server OK")
-
     try:
+        # Quick local verification (also confirms the port isn't hijacked by a proxy)
+        print("\n[Verify] Local server sanity check...")
+        import urllib.request
+
+        for label, size in TEST_SIZES:
+            url = f"http://127.0.0.1:{local_port}/{label}.bin"
+            with urllib.request.urlopen(url, timeout=30) as response:
+                data = response.read()
+            local_sha = hashlib.sha256(data).hexdigest()
+            ok = len(data) == size and local_sha == file_hashes[label]
+            print(
+                (
+                    f"  "
+                    f"{label}"
+                    f": local_size="
+                    f"{len(data):,}"
+                    f" expected="
+                    f"{size:,}"
+                    f" sha_ok="
+                    f"{local_sha == file_hashes[label]}"
+                    f" "
+                    f"{'OK' if ok else 'FAIL'}"
+                )
+            )
+            if not ok:
+                print(f"    ERROR: local server returned wrong data for {label}")
+                return 1
+        print("  Local server OK")
+
         print("\n[Sandbox] Creating sandbox with tunnel...")
         with Sandbox(
             cpu=2000,
@@ -150,16 +174,31 @@ def main():
                 t0 = time.time()
                 tmp_path = f"/tmp/tunnel-large-{label}.bin"
                 result = sb.commands.run(
-                    "set -e; "
-                    f"tmp={shlex.quote(tmp_path)}; "
-                    f"curl --noproxy '*' -fsS -m 60 {shlex.quote(url)} -o \"$tmp\"; "
-                    "actual=$(wc -c < \"$tmp\" | tr -d ' '); "
-                    "sha=$(openssl dgst -sha256 -r \"$tmp\" | awk '{print $1}'); "
-                    f"size_ok=false; [ \"$actual\" = {shlex.quote(str(size))} ] && size_ok=true; "
-                    f"sha_ok=false; [ \"$sha\" = {shlex.quote(expected_sha)} ] && sha_ok=true; "
-                    f"echo RESULT:{label} expected={size} actual=$actual size_ok=$size_ok sha_ok=$sha_ok sha256=$sha; "
-                    "rm -f \"$tmp\"; "
-                    "[ \"$size_ok\" = true ] && [ \"$sha_ok\" = true ]",
+                    (
+                        "set -e; "
+                        f"tmp="
+                        f"{shlex.quote(tmp_path)}"
+                        f"; "
+                        f"curl --noproxy '*' -fsS -m 60 "
+                        f"{shlex.quote(url)}"
+                        f" -o \"$tmp\"; "
+                        "actual=$(wc -c < \"$tmp\" | tr -d ' '); "
+                        "sha=$(openssl dgst -sha256 -r \"$tmp\" | awk '{print $1}'); "
+                        f"size_ok=false; [ \"$actual\" = "
+                        f"{shlex.quote(str(size))}"
+                        f" ] && size_ok=true; "
+                        f"sha_ok=false; [ \"$sha\" = "
+                        f"{shlex.quote(expected_sha)}"
+                        f" ] && sha_ok=true; "
+                        f"echo RESULT:"
+                        f"{label}"
+                        f" expected="
+                        f"{size}"
+                        f" actual=$actual size_ok=$size_ok sha_ok=$sha_ok "
+                        f"sha256=$sha; "
+                        "rm -f \"$tmp\"; "
+                        "[ \"$size_ok\" = true ] && [ \"$sha_ok\" = true ]"
+                    ),
                     timeout=120,
                 )
                 elapsed = time.time() - t0
@@ -179,16 +218,31 @@ def main():
                 t0 = time.time()
                 tmp_path = f"/tmp/tunnel-large-{label}.bin"
                 result = sb.commands.run(
-                    "set -e; "
-                    f"tmp={shlex.quote(tmp_path)}; "
-                    f"curl --noproxy '*' -fsS -m 60 {shlex.quote(url)} -o \"$tmp\"; "
-                    "actual=$(wc -c < \"$tmp\" | tr -d ' '); "
-                    "sha=$(openssl dgst -sha256 -r \"$tmp\" | awk '{print $1}'); "
-                    f"size_ok=false; [ \"$actual\" = {shlex.quote(str(size))} ] && size_ok=true; "
-                    f"sha_ok=false; [ \"$sha\" = {shlex.quote(expected_sha)} ] && sha_ok=true; "
-                    f"echo RESULT:{label} expected={size} actual=$actual size_ok=$size_ok sha_ok=$sha_ok sha256=$sha; "
-                    "rm -f \"$tmp\"; "
-                    "[ \"$size_ok\" = true ] && [ \"$sha_ok\" = true ]",
+                    (
+                        "set -e; "
+                        f"tmp="
+                        f"{shlex.quote(tmp_path)}"
+                        f"; "
+                        f"curl --noproxy '*' -fsS -m 60 "
+                        f"{shlex.quote(url)}"
+                        f" -o \"$tmp\"; "
+                        "actual=$(wc -c < \"$tmp\" | tr -d ' '); "
+                        "sha=$(openssl dgst -sha256 -r \"$tmp\" | awk '{print $1}'); "
+                        f"size_ok=false; [ \"$actual\" = "
+                        f"{shlex.quote(str(size))}"
+                        f" ] && size_ok=true; "
+                        f"sha_ok=false; [ \"$sha\" = "
+                        f"{shlex.quote(expected_sha)}"
+                        f" ] && sha_ok=true; "
+                        f"echo RESULT:"
+                        f"{label}"
+                        f" expected="
+                        f"{size}"
+                        f" actual=$actual size_ok=$size_ok sha_ok=$sha_ok "
+                        f"sha256=$sha; "
+                        "rm -f \"$tmp\"; "
+                        "[ \"$size_ok\" = true ] && [ \"$sha_ok\" = true ]"
+                    ),
                     timeout=120,
                 )
                 elapsed = time.time() - t0
@@ -217,8 +271,7 @@ def main():
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
-        import shutil
-        shutil.rmtree(temp_dir, ignore_errors=True)
+        shutil.rmtree(temp_dir)
         print("[OK] Local server stopped and cleaned up.")
 
     return 0 if all_passed else 1

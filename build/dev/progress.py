@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """Local development progress: atomic state, command recording and read-only UI."""
+
 import argparse
-from datetime import datetime, timezone
 import fcntl
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
-from pathlib import Path
 import signal
 import subprocess
 import sys
 import tempfile
 import uuid
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 
 def now():
@@ -20,8 +21,7 @@ def now():
 
 def read_state(path):
     if not path.exists():
-        return {'title': 'ADX 开发进度', 'updated_at': None, 'revision': 0,
-                'stages': [], 'jobs': {}}
+        return {'title': 'ADX 开发进度', 'updated_at': None, 'revision': 0, 'stages': [], 'jobs': {}}
     return json.loads(path.read_text())
 
 
@@ -58,9 +58,16 @@ def initialize(args):
         columns = [column.strip() for column in line.split('|')]
         if len(columns) == 5 and columns[1][:1].isdigit():
             title = columns[1].split('. ', 1)[-1]
-            stages.append({'id': str(len(stages) + 1), 'title': title,
-                           'scope': columns[2], 'gate': columns[3],
-                           'status': 'pending', 'note': ''})
+            stages.append(
+                {
+                    'id': str(len(stages) + 1),
+                    'title': title,
+                    'scope': columns[2],
+                    'gate': columns[3],
+                    'status': 'pending',
+                    'note': '',
+                }
+            )
     if not stages:
         raise SystemExit('No stages found in roadmap.')
     update(args.state, lambda state: state.update(stages=stages))
@@ -75,6 +82,7 @@ def change_stage(args):
             stage['status'] = args.status
         if args.note is not None:
             stage['note'] = args.note
+
     update(args.state, mutate)
 
 
@@ -84,9 +92,17 @@ def run(args):
         raise SystemExit('Missing command after --')
     args.log.parent.mkdir(parents=True, exist_ok=True)
     run_id = uuid.uuid4().hex
-    job = {'label': args.label, 'stage': args.stage, 'status': 'running',
-           'started_at': now(), 'finished_at': None, 'exit_code': None,
-           'log': str(args.log.resolve()), 'pid': os.getpid(), 'run_id': run_id}
+    job = {
+        'label': args.label,
+        'stage': args.stage,
+        'status': 'running',
+        'started_at': now(),
+        'finished_at': None,
+        'exit_code': None,
+        'log': str(args.log.resolve()),
+        'pid': os.getpid(),
+        'run_id': run_id,
+    }
     update(args.state, lambda state: state['jobs'].__setitem__(args.job, job))
     process = None
     received_signal = None
@@ -107,8 +123,9 @@ def run(args):
     try:
         with args.log.open('ab', buffering=0) as log:
             log.write(('\n--- Started ' + job['started_at'] + ' ---\n').encode())
-            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                       start_new_session=True)
+            process = subprocess.Popen(
+                command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True
+            )
             if received_signal:
                 interrupt(received_signal, None)
             with process.stdout:
@@ -129,12 +146,16 @@ def run(args):
     finally:
         for signum, handler in original_handlers.items():
             signal.signal(signum, handler)
-        job.update(status='interrupted' if received_signal or code < 0 else
-                   ('passed' if code == 0 else 'failed'), finished_at=now(), exit_code=code)
+        job.update(
+            status='interrupted' if received_signal or code < 0 else ('passed' if code == 0 else 'failed'),
+            finished_at=now(),
+            exit_code=code,
+        )
 
         def finish(state):
             if state['jobs'].get(args.job, {}).get('run_id') == run_id:
                 state['jobs'][args.job] = job
+
         update(args.state, finish)
     return 128 + abs(code) if code < 0 else code
 
@@ -206,8 +227,11 @@ def main():
     command.add_argument('command', nargs=argparse.REMAINDER)
     server = commands.add_parser('serve')
     server.add_argument('--port', type=int, default=0)
-    server.add_argument('--remaining', type=Path, default=Path(__file__).resolve().parents[2] /
-                        'docs/testing/control-plane-remaining.json')
+    server.add_argument(
+        '--remaining',
+        type=Path,
+        default=Path(__file__).resolve().parents[2] / 'docs/testing/control-plane-remaining.json',
+    )
     args = parser.parse_args()
     return {'init': initialize, 'stage': change_stage, 'run': run, 'serve': serve}[args.action](args)
 

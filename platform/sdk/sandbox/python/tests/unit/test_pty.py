@@ -109,5 +109,6 @@ class PtyTests(unittest.TestCase):
             self.assertEqual(_pty_server(), "ingress:8080")
             self.assertTrue(_use_tls())
 
+
 if __name__ == "__main__":
     unittest.main()

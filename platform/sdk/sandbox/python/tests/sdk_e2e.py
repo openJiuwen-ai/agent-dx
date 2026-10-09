@@ -1,13 +1,23 @@
-import os, sys, asyncio, tempfile
+import asyncio
+import os
+import sys
+import tempfile
+
 os.environ["ADX_TLS"] = "0"
 os.environ.setdefault("ADX_SERVER_ADDRESS", "172.21.0.2:8889")
 os.environ.setdefault("ADX_TOKEN", "x")
 from adx_sandbox import Sandbox
 
 P, F = [], []
+
+
 def chk(name, cond, detail=""):
     (P if cond else F).append(name)
-    print(f"[{'PASS' if cond else 'FAIL'}] {name}" + (f"  {detail}" if detail and not cond else f"  {detail}" if detail else ""))
+    print(
+        f"[{'PASS' if cond else 'FAIL'}] {name}"
+        + (f"  {detail}" if detail and not cond else f"  {detail}" if detail else "")
+    )
+
 
 sb = Sandbox(image="aio-adx-runtime:latest", name="sdke2e")
 chk("create", bool(sb.id), f"id={sb.id}")
@@ -48,11 +58,12 @@ try:
     # shells (async)
     async def shell_test():
         sh = await sb.shells.create(cwd="/tmp")
-        r1 = await sh.run("export FOO=bar; echo started")
-        r2 = await sh.run("echo FOO=$FOO")          # state persists
-        r3 = await sh.run("pwd")                      # cwd=/tmp
+        r1_local = await sh.run("export FOO=bar; echo started")
+        r2_local = await sh.run("echo FOO=$FOO")  # state persists
+        r3_local = await sh.run("pwd")  # cwd=/tmp
         await sh.kill()
-        return r1, r2, r3
+        return r1_local, r2_local, r3_local
+
     r1, r2, r3 = asyncio.run(shell_test())
     chk("shells.create+run started", r1.exit_code == 0 and r1.stdout == "started", f"out={r1.stdout!r}")
     chk("shell state persists (clean output)", r2.stdout == "FOO=bar", f"out={r2.stdout!r}")
@@ -60,10 +71,15 @@ try:
 
     # Direct HTTP copy upload/download
     with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
-        f.write("ws-small-payload-64b-xxxxxxxxxxxxxxxxxxxxx"); local_up = f.name
+        f.write("ws-small-payload-64b-xxxxxxxxxxxxxxxxxxxxx")
+        local_up = f.name
     sb.files.copy_from_local(local_up, "/tmp/up.dat")
     remote_content = sb.files.read("/tmp/up.dat")
-    chk("files.copy_from_local (direct)", remote_content == "ws-small-payload-64b-xxxxxxxxxxxxxxxxxxxxx", f"len={len(remote_content)}")
+    chk(
+        "files.copy_from_local (direct)",
+        remote_content == "ws-small-payload-64b-xxxxxxxxxxxxxxxxxxxxx",
+        f"len={len(remote_content)}",
+    )
     local_dn = local_up + ".dn"
     sb.files.copy_to_local("/tmp/up.dat", local_dn)
     chk("files.copy_to_local (direct)", open(local_dn).read() == "ws-small-payload-64b-xxxxxxxxxxxxxxxxxxxxx")
@@ -77,4 +93,6 @@ finally:
     chk("kill", sb.is_running() is False)
 
 print(f"\n==== {len(P)} PASS, {len(F)} FAIL ====")
-if F: print("FAILED:", F); sys.exit(1)
+if F:
+    print("FAILED:", F)
+    sys.exit(1)

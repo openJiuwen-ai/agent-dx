@@ -1,11 +1,11 @@
 """Command-line entry point for remote ADX administration."""
 
 import argparse
-from importlib import metadata
 import json
 import os
-from pathlib import Path
 import sys
+from importlib import metadata
+from pathlib import Path
 from typing import Mapping, Sequence, TextIO
 
 from .client import AdminClient, ClientOptions
@@ -15,12 +15,8 @@ from .errors import AdminError
 
 def build_parser(environ: Mapping[str, str] | None = None) -> argparse.ArgumentParser:
     values = os.environ if environ is None else environ
-    parser = argparse.ArgumentParser(
-        prog="adxadmin", description="Administer a remote ADX cluster"
-    )
-    parser.add_argument(
-        "--version", action="version", version=f"adxadmin {_package_version()}"
-    )
+    parser = argparse.ArgumentParser(prog="adxadmin", description="Administer a remote ADX cluster")
+    parser.add_argument("--version", action="version", version=f"adxadmin {_package_version()}")
     parser.add_argument(
         "--endpoint",
         default=values.get("ADX_ENDPOINT"),

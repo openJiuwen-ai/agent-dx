@@ -15,9 +15,9 @@ from urllib.parse import urlparse
 
 from ._transport import SandboxClient, SandboxError
 from .commands import Commands
-from .scheduling import encode_affinities, instance_labels
 from .filesystem import Filesystem
 from .pty import Pty
+from .scheduling import encode_affinities, instance_labels
 from .shell import Shells
 from .types import (
     ADX_GET_DEFAULT_TIMEOUT,
@@ -27,8 +27,8 @@ from .types import (
     NetworkPolicy,
     PauseResult,
     PortForwarding,
-    ResumeResult,
     RestartPolicy,
+    ResumeResult,
     S3Config,
     SandboxInfo,
     SnapshotInfo,
@@ -41,9 +41,7 @@ _INIT_CALL_TIMEOUT = 30
 CREATE_TIMEOUT_BUFFER = 30
 _CREATE_TIMEOUT_RESERVE = _INIT_CALL_TIMEOUT + CREATE_TIMEOUT_BUFFER
 _SUPPORTED_XPU_TYPES = frozenset({"gpu", "npu"})
-_SNAPSHOT_RESOURCE_FIELDS = frozenset(
-    {"cpu", "memory", "cpu_limit", "mem_limit"}
-)
+_SNAPSHOT_RESOURCE_FIELDS = frozenset({"cpu", "memory", "cpu_limit", "mem_limit"})
 _ENTRYPOINT_POLL_INTERVAL = 10.0
 
 
@@ -55,44 +53,29 @@ def _get_create_timeout(timeout: Optional[int]) -> int:
         try:
             value = int(raw)
         except ValueError as exc:
-            raise ValueError(
-                "ADX_SANDBOX_CREATE_TIMEOUT must be an integer number of seconds"
-            ) from exc
+            raise ValueError("ADX_SANDBOX_CREATE_TIMEOUT must be an integer number of seconds") from exc
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError("create_timeout must be a positive integer")
     return value
 
 
-def _resolve_create_timeouts(
-    create_timeout: Optional[int], schedule_timeout: Optional[int]
-) -> tuple[int, int]:
+def _resolve_create_timeouts(create_timeout: Optional[int], schedule_timeout: Optional[int]) -> tuple[int, int]:
     if schedule_timeout is not None and (
-        isinstance(schedule_timeout, bool)
-        or not isinstance(schedule_timeout, int)
-        or schedule_timeout <= 0
+        isinstance(schedule_timeout, bool) or not isinstance(schedule_timeout, int) or schedule_timeout <= 0
     ):
         raise ValueError("schedule_timeout must be a positive integer")
 
-    resolved_schedule = (
-        DEFAULT_SCHEDULE_TIMEOUT
-        if schedule_timeout is None
-        else schedule_timeout
-    )
+    resolved_schedule = DEFAULT_SCHEDULE_TIMEOUT if schedule_timeout is None else schedule_timeout
     if create_timeout is None and "ADX_SANDBOX_CREATE_TIMEOUT" not in os.environ:
         resolved_create = resolved_schedule + _CREATE_TIMEOUT_RESERVE
     else:
         resolved_create = _get_create_timeout(create_timeout)
 
     if resolved_schedule > resolved_create:
-        raise ValueError(
-            "schedule_timeout must be less than or equal to create_timeout"
-        )
+        raise ValueError("schedule_timeout must be less than or equal to create_timeout")
     remaining_create_budget = resolved_create - resolved_schedule
     if remaining_create_budget < CREATE_TIMEOUT_BUFFER:
-        raise ValueError(
-            "create_timeout - schedule_timeout must be at least "
-            f"{CREATE_TIMEOUT_BUFFER}"
-        )
+        raise ValueError(f"create_timeout - schedule_timeout must be at least {CREATE_TIMEOUT_BUFFER}")
     if remaining_create_budget < _CREATE_TIMEOUT_RESERVE:
         resolved_create = resolved_schedule + _CREATE_TIMEOUT_RESERVE
     return resolved_create, resolved_schedule
@@ -106,9 +89,7 @@ def _get_tunnel_connect_timeout(timeout: Optional[float]) -> float:
         try:
             value = float(raw)
         except ValueError as e:
-            raise ValueError(
-                "ADX_TUNNEL_CONNECT_TIMEOUT must be a number of seconds"
-            ) from e
+            raise ValueError("ADX_TUNNEL_CONNECT_TIMEOUT must be a number of seconds") from e
     if value <= 0:
         raise ValueError("tunnel_connect_timeout must be greater than 0")
     return value
@@ -146,11 +127,7 @@ def _gateway_address(connection: Optional[ConnectionConfig]) -> str:
 
 def _gateway_uses_tls(connection: Optional[ConnectionConfig]) -> bool:
     if connection is not None:
-        return (
-            connection.gateway_use_tls
-            if connection.gateway_address is not None
-            else connection.use_tls
-        )
+        return connection.gateway_use_tls if connection.gateway_address is not None else connection.use_tls
     gateway = os.environ.get("ADX_GATEWAY_ADDRESS", "").strip()
     flag = "ADX_GATEWAY_TLS" if gateway else "ADX_TLS"
     default = "0" if gateway else "1"
@@ -211,14 +188,8 @@ class Sandbox:
         Snapshot. Explicit resource fields must be compatible with its runtime;
         the current Firecracker backend requires the original resource geometry.
         """
-        value = (
-            snapshot_id.snapshot_id
-            if isinstance(snapshot_id, SnapshotInfo)
-            else snapshot_id
-        )
-        explicit_resource_fields = frozenset(kwargs).intersection(
-            _SNAPSHOT_RESOURCE_FIELDS
-        )
+        value = snapshot_id.snapshot_id if isinstance(snapshot_id, SnapshotInfo) else snapshot_id
+        explicit_resource_fields = frozenset(kwargs).intersection(_SNAPSHOT_RESOURCE_FIELDS)
         return cls(
             snapshot_id=value,
             _snapshot_resource_fields=explicit_resource_fields,
@@ -229,11 +200,7 @@ class Sandbox:
     def _snapshot_info(payload: Mapping[str, Any]) -> SnapshotInfo:
         snapshot_id = str(payload.get("snapshotId") or "")
         names = payload.get("names") or []
-        if (
-            not snapshot_id
-            or not isinstance(names, list)
-            or not all(isinstance(name, str) for name in names)
-        ):
+        if not snapshot_id or not isinstance(names, list) or not all(isinstance(name, str) for name in names):
             raise SandboxError("invalid reusable Snapshot response")
         return SnapshotInfo(snapshot_id=snapshot_id, names=tuple(names))
 
@@ -285,9 +252,7 @@ class Sandbox:
         page_size: Optional[int] = None,
         connection: Optional[ConnectionConfig] = None,
     ) -> Tuple[List[SnapshotInfo], str]:
-        if name is not None and (
-            not isinstance(name, str) or not name.strip()
-        ):
+        if name is not None and (not isinstance(name, str) or not name.strip()):
             raise ValueError("name must be a non-empty string or None")
         if page_token is not None and not isinstance(page_token, str):
             raise TypeError("page_token must be a string or None")
@@ -415,9 +380,7 @@ class Sandbox:
                 server defaults.
             extra_config: Extra sandbox-side configuration forwarded to sandboxd.
         """
-        if image is not None and (
-            not isinstance(image, str) or not image.strip()
-        ):
+        if image is not None and (not isinstance(image, str) or not image.strip()):
             raise ValueError("image must be a non-empty string")
         if rootfs is not None and not isinstance(rootfs, S3Config):
             raise TypeError("rootfs must be an S3Config")
@@ -425,9 +388,7 @@ class Sandbox:
             raise ValueError("image and rootfs are mutually exclusive")
         if rootfs_readonly is not None and not isinstance(rootfs_readonly, bool):
             raise TypeError("rootfs_readonly must be a boolean or None")
-        if snapshot_id is not None and (
-            not isinstance(snapshot_id, str) or not snapshot_id.strip()
-        ):
+        if snapshot_id is not None and (not isinstance(snapshot_id, str) or not snapshot_id.strip()):
             raise ValueError("snapshot_id must be a non-empty string")
         if not isinstance(failover, bool):
             raise TypeError("failover must be a boolean")
@@ -441,15 +402,10 @@ class Sandbox:
             raise ValueError("rootfs_readonly cannot be combined with snapshot_id")
         if env is not None and (
             not isinstance(env, Mapping)
-            or not all(
-                isinstance(key, str) and isinstance(value, str)
-                for key, value in env.items()
-            )
+            or not all(isinstance(key, str) and isinstance(value, str) for key, value in env.items())
         ):
             raise TypeError("env must map strings to strings")
-        if name is not None and (
-            not isinstance(name, str) or not name.strip()
-        ):
+        if name is not None and (not isinstance(name, str) or not name.strip()):
             raise ValueError("name must be a non-empty string")
         if cwd is not None:
             if not isinstance(cwd, str):
@@ -469,23 +425,17 @@ class Sandbox:
                 raise TypeError("storage_mb must be an integer or None")
             if storage_mb <= 0:
                 raise ValueError("storage_mb must be greater than 0")
-        if isinstance(storage_limit_mb, bool) or not isinstance(
-            storage_limit_mb, int
-        ):
+        if isinstance(storage_limit_mb, bool) or not isinstance(storage_limit_mb, int):
             raise TypeError("storage_limit_mb must be an integer")
         if storage_limit_mb < 0:
             raise ValueError("storage_limit_mb must be 0 or greater")
         if storage_mb is not None and 0 < storage_limit_mb < storage_mb:
-            raise ValueError(
-                "storage_limit_mb must be greater than or equal to storage_mb"
-            )
+            raise ValueError("storage_limit_mb must be greater than or equal to storage_mb")
         if network is not None and not isinstance(network, NetworkPolicy):
             raise TypeError("network must be a NetworkPolicy or None")
         if connection is not None and not isinstance(connection, ConnectionConfig):
             raise TypeError("connection must be a ConnectionConfig or None")
-        if data_plane_security is not None and not isinstance(
-            data_plane_security, DataPlaneSecurityPolicy
-        ):
+        if data_plane_security is not None and not isinstance(data_plane_security, DataPlaneSecurityPolicy):
             raise TypeError("data_plane_security must be a DataPlaneSecurityPolicy or None")
         if mounts is None:
             mount_list: List[Mount] = []
@@ -495,9 +445,7 @@ class Sandbox:
             mount_list = list(mounts)
             if not all(isinstance(mount, Mount) for mount in mount_list):
                 raise TypeError("mounts must contain only Mount objects")
-        if upstream is not None and (
-            not isinstance(upstream, str) or not upstream.strip()
-        ):
+        if upstream is not None and (not isinstance(upstream, str) or not upstream.strip()):
             raise ValueError("upstream must be a non-empty address")
         if isinstance(proxy_port, bool) or not isinstance(proxy_port, int):
             raise TypeError("proxy_port must be an integer")
@@ -509,9 +457,7 @@ class Sandbox:
         pf_ports: List[str] = []
         if port_forwardings:
             if isinstance(port_forwardings, (str, bytes)):
-                raise TypeError(
-                    "port_forwardings must contain integers or PortForwarding objects"
-                )
+                raise TypeError("port_forwardings must contain integers or PortForwarding objects")
             ports: List[int] = []
             for forwarding in port_forwardings:
                 if isinstance(forwarding, PortForwarding):
@@ -519,9 +465,7 @@ class Sandbox:
                 else:
                     port = forwarding
                 if isinstance(port, bool) or not isinstance(port, int):
-                    raise TypeError(
-                        "forwarded port must be an integer or PortForwarding object"
-                    )
+                    raise TypeError("forwarded port must be an integer or PortForwarding object")
                 if not 1 <= port <= 65535:
                     raise ValueError("forwarded port must be between 1 and 65535")
                 ports.append(port)
@@ -530,15 +474,10 @@ class Sandbox:
             self._forwarded_ports.update(ports)
             pf_ports.extend(str(port) for port in ports)
         if upstream is not None:
-            conflicts = self._forwarded_ports.intersection(
-                {proxy_port - 1, proxy_port}
-            )
+            conflicts = self._forwarded_ports.intersection({proxy_port - 1, proxy_port})
             if conflicts:
                 rendered = ", ".join(str(port) for port in sorted(conflicts))
-                raise ValueError(
-                    "reverse tunnel ports conflict with port_forwardings: "
-                    f"{rendered}"
-                )
+                raise ValueError(f"reverse tunnel ports conflict with port_forwardings: {rendered}")
 
         # ── reverse tunnel ────────────────────────────────────────────────
         self._tunnel_client = None
@@ -547,9 +486,7 @@ class Sandbox:
         self._upstream = upstream
 
         # ── build create body ─────────────────────────────────────────────
-        resolved_create_timeout, resolved_schedule_timeout = _resolve_create_timeouts(
-            create_timeout, schedule_timeout
-        )
+        resolved_create_timeout, resolved_schedule_timeout = _resolve_create_timeouts(create_timeout, schedule_timeout)
         body: Dict[str, Any] = {
             "namespace": "default",
             "snapshotId": snapshot_id.strip() if snapshot_id is not None else None,
@@ -652,9 +589,7 @@ class Sandbox:
             create_info = self._create(body)
             sandbox_id = create_info.get("sandboxId") or create_info.get("instanceId")
             if not isinstance(sandbox_id, str) or not sandbox_id:
-                raise RuntimeError(
-                    f"create response missing sandbox id: {create_info}"
-                )
+                raise RuntimeError(f"create response missing sandbox id: {create_info}")
             self._sid = sandbox_id
 
             # ── reverse tunnel: connect after sandbox is running ──────────
@@ -666,10 +601,7 @@ class Sandbox:
                 tunnel_info = create_info.get("tunnel") or {}
                 if not isinstance(tunnel_info, dict):
                     tunnel_info = {}
-                self._tunnel_url = (
-                    tunnel_info.get("proxyUrl")
-                    or f"http://127.0.0.1:{proxy_port}"
-                )
+                self._tunnel_url = tunnel_info.get("proxyUrl") or f"http://127.0.0.1:{proxy_port}"
                 tunnel_url = tunnel_info.get("url") or tunnel_info.get("path")
                 safe_id = self._client._safe_id(self._sid)
                 tls = _gateway_uses_tls(self._connection)
@@ -679,29 +611,22 @@ class Sandbox:
                     scheme=ws_scheme,
                     path=tunnel_url or f"/tunnel/{safe_id}",
                 )
-                connect_timeout = _get_tunnel_connect_timeout(
-                    tunnel_connect_timeout
-                )
+                connect_timeout = _get_tunnel_connect_timeout(tunnel_connect_timeout)
 
                 from .tunnel_client import TunnelClient
 
                 # Only carry the JWT over a TLS tunnel. Plaintext mode is for
                 # auth-disabled local/dev frontends.
                 tunnel_token = self._client.token if tls else None
-                self._tunnel_client = TunnelClient(
-                    upstream, token=tunnel_token, sandbox_id=self._sid
-                )
+                self._tunnel_client = TunnelClient(upstream, token=tunnel_token, sandbox_id=self._sid)
                 logger.info(
-                    "Starting TunnelClient: sandbox_id=%s name=%s url=%s "
-                    "timeout=%.1fs",
+                    "Starting TunnelClient: sandbox_id=%s name=%s url=%s timeout=%.1fs",
                     safe_id,
                     name or "",
                     tunnel_ws_url,
                     connect_timeout,
                 )
-                if self._tunnel_client.start(
-                    tunnel_ws_url, timeout=connect_timeout
-                ):
+                if self._tunnel_client.start(tunnel_ws_url, timeout=connect_timeout):
                     logger.info(
                         "TunnelClient connected: sandbox_id=%s name=%s",
                         safe_id,
@@ -773,9 +698,7 @@ class Sandbox:
         try:
             info = client.instance_info(sandbox_id)
             if str(info.get("status", "")).lower() != "running":
-                raise RuntimeError(
-                    f"sandbox {sandbox_id} is not running: {info.get('status', 'unknown')}"
-                )
+                raise RuntimeError(f"sandbox {sandbox_id} is not running: {info.get('status', 'unknown')}")
             sandbox = cls.__new__(cls)
             sandbox._sid = sandbox_id
             sandbox._client = client
@@ -835,9 +758,7 @@ class Sandbox:
         selected from the sandbox's resolved gateway connection settings.
         """
         if port not in self._forwarded_ports:
-            raise ValueError(
-                f"Port {port} is not in forwarded ports: {self._forwarded_ports}"
-            )
+            raise ValueError(f"Port {port} is not in forwarded ports: {self._forwarded_ports}")
         connection = getattr(self, "_connection", None)
         gateway = _gateway_address(connection)
         safe_id = self._client._safe_id(self._sid)
@@ -879,9 +800,7 @@ class Sandbox:
             RuntimeError: if no reverse tunnel was configured.
         """
         if self._upstream is None:
-            raise RuntimeError(
-                "No upstream configured. Pass upstream= to Sandbox()."
-            )
+            raise RuntimeError("No upstream configured. Pass upstream= to Sandbox().")
         return self._tunnel_url
 
     def _create(self, body: Dict[str, Any]) -> Dict[str, Any]:
@@ -919,14 +838,10 @@ class Sandbox:
                 self._entrypoint_exit_info = dict(result)
                 exit_code = result.get("shell_exit_code", result.get("exit_code"))
                 if isinstance(exit_code, bool) or not isinstance(exit_code, int):
-                    raise SandboxError(
-                        f"entrypoint exit response missing exit code: {result}"
-                    )
+                    raise SandboxError(f"entrypoint exit response missing exit code: {result}")
                 return exit_code
             if status == "error":
-                raise SandboxError(
-                    str(result.get("message") or "entrypoint polling failed")
-                )
+                raise SandboxError(str(result.get("message") or "entrypoint polling failed"))
             raise SandboxError(f"invalid entrypoint poll response: {result}")
 
     @property
@@ -966,9 +881,7 @@ class Sandbox:
         """Create a non-expiring reusable Snapshot and keep this sandbox running."""
         if self._closed:
             raise RuntimeError("sandbox is closed")
-        if name is not None and (
-            not isinstance(name, str) or not name.strip()
-        ):
+        if name is not None and (not isinstance(name, str) or not name.strip()):
             raise ValueError("name must be a non-empty string or None")
         if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, int):
             raise ValueError("timeout_seconds must be a positive integer")
@@ -1009,9 +922,7 @@ class Sandbox:
             raise ValueError("timeout_seconds must be between 1 and 3600")
         if self._closed:
             raise RuntimeError("sandbox is closed")
-        result = self._client.pause(
-            self._sid, ttl_seconds, timeout_seconds=timeout_seconds
-        )
+        result = self._client.pause(self._sid, ttl_seconds, timeout_seconds=timeout_seconds)
         pause = PauseResult(
             sandbox_id=str(result.get("sandboxId") or ""),
             snapshot_id=str(result.get("snapshotId") or ""),
@@ -1019,8 +930,13 @@ class Sandbox:
             state=str(result.get("state") or ""),
             expires_at=int(result.get("expiresAt") or 0),
         )
-        if (pause.sandbox_id != self._sid or pause.state != "paused"
-                or not pause.snapshot_id or pause.size <= 0 or pause.expires_at <= 0):
+        if (
+            pause.sandbox_id != self._sid
+            or pause.state != "paused"
+            or not pause.snapshot_id
+            or pause.size <= 0
+            or pause.expires_at <= 0
+        ):
             raise SandboxError("pause response is not an authoritative PAUSED result")
         return pause
 
@@ -1040,8 +956,12 @@ class Sandbox:
             node_id=str(result.get("nodeId") or ""),
             port_mappings={str(key): int(value) for key, value in mappings.items()},
         )
-        if (resume.sandbox_id != self._sid or resume.state != "running"
-                or not resume.route_address or not resume.function_proxy_id):
+        if (
+            resume.sandbox_id != self._sid
+            or resume.state != "running"
+            or not resume.route_address
+            or not resume.function_proxy_id
+        ):
             raise SandboxError("resume response is not an authoritative RUNNING result")
         return resume
 
@@ -1054,9 +974,7 @@ class Sandbox:
         except SandboxError:
             return False
 
-    def update_network_policy(
-        self, policy: Optional[NetworkPolicy]
-    ) -> None:
+    def update_network_policy(self, policy: Optional[NetworkPolicy]) -> None:
         """Atomically replace this sandbox's complete network policy.
 
         Passing None or an empty NetworkPolicy clears the policy and restores
@@ -1066,11 +984,7 @@ class Sandbox:
             raise TypeError("policy must be a NetworkPolicy or None")
         if self._closed:
             raise RuntimeError("sandbox is closed")
-        body = (
-            {}
-            if policy is None or policy.is_empty
-            else policy.to_dict()
-        )
+        body = {} if policy is None or policy.is_empty else policy.to_dict()
         result = self._client.update_network_policy(self._sid, body)
         if not bool(result.get("success", False)):
             raise SandboxError("network policy update was not acknowledged")

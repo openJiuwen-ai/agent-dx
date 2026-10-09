@@ -1,12 +1,12 @@
 """Cut one real HTTP create response after its final event, then pass retries through."""
 
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import socket
 import ssl
 import threading
 import time
 import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import HTTPError
 from urllib.request import HTTPSHandler, ProxyHandler, Request, build_opener
 
@@ -28,8 +28,7 @@ def final_event(payload):
 class ResponseCutProxy:
     """A one-shot TLS-capable response fault outside the SDK and API Server."""
 
-    def __init__(self, upstream, *, certificate=None, private_key=None, ca=None,
-                 on_first_final=None):
+    def __init__(self, upstream, *, certificate=None, private_key=None, ca=None, on_first_final=None):
         self.upstream = upstream.rstrip('/')
         self.ca = ca
         self.on_first_final = on_first_final
@@ -60,16 +59,15 @@ class ResponseCutProxy:
                     first = len(proxy.attempts) == 1
 
                 headers = {
-                    key: value for key, value in self.headers.items()
-                    if key.lower() not in ('host', 'connection', 'content-length',
-                                           'accept-encoding', 'transfer-encoding')
+                    key: value
+                    for key, value in self.headers.items()
+                    if key.lower()
+                    not in ('host', 'connection', 'content-length', 'accept-encoding', 'transfer-encoding')
                 }
-                upstream_request = Request(proxy.upstream + self.path, data=body,
-                                           headers=headers, method='POST')
+                upstream_request = Request(proxy.upstream + self.path, data=body, headers=headers, method='POST')
                 handlers = [ProxyHandler({})]
                 if proxy.upstream.startswith('https:'):
-                    handlers.append(HTTPSHandler(
-                        context=ssl.create_default_context(cafile=str(proxy.ca))))
+                    handlers.append(HTTPSHandler(context=ssl.create_default_context(cafile=str(proxy.ca))))
                 opener = build_opener(*handlers)
                 try:
                     response = opener.open(upstream_request, timeout=180)
@@ -139,7 +137,8 @@ def run(connection, image, output, secrets):
         record = json.loads(catalog()['environment:' + sid])
         result = record['result']
         backends = labeled_backend(sid)
-        assert result['state'] == 'Running' and len(backends) == 1, (result, backends)
+        if not (result['state'] == 'Running' and len(backends) == 1):
+            raise AssertionError((result, backends))
         return {
             'instance_id': sid,
             'generation': record['assignment']['generation'],
@@ -148,20 +147,31 @@ def run(connection, image, output, secrets):
         }
 
     proxy = ResponseCutProxy(
-        'https://127.0.0.1:8443', certificate=secrets / 'tls/ingress.pem',
-        private_key=secrets / 'tls/ingress.key', ca=secrets / 'tls/ca.pem',
+        'https://127.0.0.1:8443',
+        certificate=secrets / 'tls/ingress.pem',
+        private_key=secrets / 'tls/ingress.key',
+        ca=secrets / 'tls/ca.pem',
         on_first_final=committed,
     )
     try:
         with proxy:
             proxy_connection = ConnectionConfig(
-                server_address=f'127.0.0.1:{proxy.port}', token=connection.token,
-                use_tls=True, verify_tls=True,
+                server_address=f'127.0.0.1:{proxy.port}',
+                token=connection.token,
+                use_tls=True,
+                verify_tls=True,
             )
             sandbox = Sandbox(
-                image=image, runtime='runc', cpu=500, memory=512,
-                idle_timeout=0, detached=True, node_id='node1', name=name,
-                connection=proxy_connection, create_timeout=150,
+                image=image,
+                runtime='runc',
+                cpu=500,
+                memory=512,
+                idle_timeout=0,
+                detached=True,
+                node_id='node1',
+                name=name,
+                connection=proxy_connection,
+                create_timeout=150,
             )
             instance_id = sandbox.id
             sandbox.close()
@@ -170,35 +180,49 @@ def run(connection, image, output, secrets):
         if proxy.first_error is not None:
             raise AssertionError(f'first committed response observation failed: {proxy.first_error}')
         first = proxy.first_evidence
-        assert first is not None and first['instance_id'] == instance_id, first
-        assert 2 <= len(proxy.attempts) <= 3, proxy.attempts
+        if not (first is not None and first['instance_id'] == instance_id):
+            raise AssertionError(first)
+        if not (2 <= len(proxy.attempts) <= 3):
+            raise AssertionError(proxy.attempts)
         request_ids = {request_id for request_id, _ in proxy.attempts}
         names = {request_name for _, request_name in proxy.attempts}
-        assert len(request_ids) == 1 and names == {name}, proxy.attempts
+        if not (len(request_ids) == 1 and names == {name}):
+            raise AssertionError(proxy.attempts)
 
         record = json.loads(catalog()['environment:' + instance_id])
-        assert record['assignment']['generation'] == first['generation'], record['assignment']
-        assert persisted_runtime_id(record['result']) == first['runtime_id'], record['result']
-        assert labeled_backend(instance_id) == [first['backend']]
+        if not (record['assignment']['generation'] == first['generation']):
+            raise AssertionError(record['assignment'])
+        if not (persisted_runtime_id(record['result']) == first['runtime_id']):
+            raise AssertionError(record['result'])
+        if not (labeled_backend(instance_id) == [first['backend']]):
+            raise AssertionError()
         attached = Sandbox.from_id(instance_id, connection=connection)
         try:
             command = attached.commands.run('printf response-cut-recovered')
-            assert command.exit_code == 0 and command.stdout == 'response-cut-recovered'
+            if not (command.exit_code == 0 and command.stdout == 'response-cut-recovered'):
+                raise AssertionError()
         finally:
             attached.close()
         Sandbox.delete(instance_id, connection=connection)
         deleted = True
         _wait_deleted(instance_id, connection, timeout=60)
-        assert 'environment:' + instance_id not in catalog()
-        assert not labeled_backend(instance_id)
+        if not ('environment:' + instance_id not in catalog()):
+            raise AssertionError()
+        if not (not labeled_backend(instance_id)):
+            raise AssertionError()
         report['status'] = 'passed'
-        report['cases'].append({
-            'id': 'reliability.create-final-response-cut', 'status': 'passed',
-            'seconds': round(time.monotonic() - started, 3),
-            'instance_id': instance_id, 'request_id': next(iter(request_ids)),
-            'attempts': len(proxy.attempts), 'generation': first['generation'],
-            'backend': first['backend'],
-        })
+        report['cases'].append(
+            {
+                'id': 'reliability.create-final-response-cut',
+                'status': 'passed',
+                'seconds': round(time.monotonic() - started, 3),
+                'instance_id': instance_id,
+                'request_id': next(iter(request_ids)),
+                'attempts': len(proxy.attempts),
+                'generation': first['generation'],
+                'backend': first['backend'],
+            }
+        )
         return report
     except Exception as error:
         report['error'] = str(error)

@@ -19,55 +19,77 @@ def run(connection, image, output):
     deleted = False
     try:
         sandbox = Sandbox(
-            name=name, image=image, runtime='runc', node_id='node1',
-            cpu=500, memory=512, idle_timeout=0, detached=True,
-            connection=connection, create_timeout=150,
+            name=name,
+            image=image,
+            runtime='runc',
+            node_id='node1',
+            cpu=500,
+            memory=512,
+            idle_timeout=0,
+            detached=True,
+            connection=connection,
+            create_timeout=150,
         )
         initial = json.loads(catalog()['environment:' + sandbox.id])
         backend = labeled_backend(sandbox.id)
-        assert len(backend) == 1, backend
+        if not (len(backend) == 1):
+            raise AssertionError(backend)
 
         try:
             sandbox.commands.get(missing_id)
         except CommandNotFound as error:
-            assert not isinstance(error, CommandExpired), error
-            assert error.sandbox_id == sandbox.id and error.command_id == missing_id
+            if not (not isinstance(error, CommandExpired)):
+                raise AssertionError(error)
+            if not (error.sandbox_id == sandbox.id and error.command_id == missing_id):
+                raise AssertionError()
         else:
             raise AssertionError('unknown command did not return CommandNotFound')
 
         finished = sandbox.commands.run(
-            'printf expired-command', background=True, command_id=command_id,
+            'printf expired-command',
+            background=True,
+            command_id=command_id,
         ).wait(timeout=20)
-        assert finished.exit_code == 0 and finished.stdout == 'expired-command', finished
+        if not (finished.exit_code == 0 and finished.stdout == 'expired-command'):
+            raise AssertionError(finished)
         # This case injects a one-second terminal-record TTL on node1 only.
         time.sleep(2)
         try:
             sandbox.commands.get(command_id)
         except CommandExpired as error:
-            assert error.sandbox_id == sandbox.id and error.command_id == command_id
+            if not (error.sandbox_id == sandbox.id and error.command_id == command_id):
+                raise AssertionError()
         else:
             raise AssertionError('expired command did not return CommandExpired')
 
         alive = sandbox.commands.run('printf runtime-alive')
-        assert alive.exit_code == 0 and alive.stdout == 'runtime-alive', alive
+        if not (alive.exit_code == 0 and alive.stdout == 'runtime-alive'):
+            raise AssertionError(alive)
         final = json.loads(catalog()['environment:' + sandbox.id])
-        assert final['assignment']['generation'] == initial['assignment']['generation']
-        assert labeled_backend(sandbox.id) == backend
+        if not (final['assignment']['generation'] == initial['assignment']['generation']):
+            raise AssertionError()
+        if not (labeled_backend(sandbox.id) == backend):
+            raise AssertionError()
         Sandbox.delete(sandbox.id, connection=connection)
         deleted = True
         _wait_deleted(sandbox.id, connection, timeout=60)
-        assert 'environment:' + sandbox.id not in catalog()
-        assert not labeled_backend(sandbox.id)
+        if not ('environment:' + sandbox.id not in catalog()):
+            raise AssertionError()
+        if not (not labeled_backend(sandbox.id)):
+            raise AssertionError()
 
         report['status'] = 'passed'
-        report['cases'].append({
-            'id': 'command.expired-result', 'status': 'passed',
-            'seconds': round(time.monotonic() - started, 3),
-            'instance_id': sandbox.id,
-            'expired_command_id': command_id,
-            'missing_command_id': missing_id,
-            'backend': backend[0],
-        })
+        report['cases'].append(
+            {
+                'id': 'command.expired-result',
+                'status': 'passed',
+                'seconds': round(time.monotonic() - started, 3),
+                'instance_id': sandbox.id,
+                'expired_command_id': command_id,
+                'missing_command_id': missing_id,
+                'backend': backend[0],
+            }
+        )
         return report
     except Exception as error:
         report['error'] = str(error)

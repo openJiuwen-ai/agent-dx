@@ -130,8 +130,7 @@ try:
     check("files.write bytes", written.size == 12, written.size)
     check(
         "files.read bytes",
-        sandbox.files.read("/tmp/akernel-e2e.txt", format="bytes")
-        == b"direct-bytes",
+        sandbox.files.read("/tmp/akernel-e2e.txt", format="bytes") == b"direct-bytes",
     )
     check(
         "frontend direct path remains active",
@@ -141,9 +140,7 @@ try:
     command = sandbox.commands.run("pwd && printf command-ok", timeout=30)
     check(
         "command cwd inheritance",
-        command.exit_code == 0
-        and command.stdout.startswith("/tmp")
-        and "command-ok" in command.stdout,
+        command.exit_code == 0 and command.stdout.startswith("/tmp") and "command-ok" in command.stdout,
         {"exit_code": command.exit_code, "stdout": command.stdout},
     )
 

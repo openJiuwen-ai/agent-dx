@@ -5,9 +5,9 @@ import argparse
 import email.parser
 import hashlib
 import json
-from pathlib import Path
 import re
 import zipfile
+from pathlib import Path
 
 
 def sha(path):
@@ -41,9 +41,7 @@ def create(directory, commit, build_id=None):
         "build_id": build_id,
         "files": {path.name: sha(path) for path in (wheel[0], source[0])},
     }
-    (directory / "admin-candidate.json").write_text(
-        json.dumps(result, indent=2) + "\n", encoding="utf-8"
-    )
+    (directory / "admin-candidate.json").write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     return result
 
 
@@ -52,9 +50,7 @@ def verify(directory):
     files = candidate.get("files")
     if candidate.get("schema_version") != 1 or not isinstance(files, dict):
         raise ValueError("invalid admin candidate manifest")
-    if candidate.get("name") != "adxadmin" or not re.fullmatch(
-        r"[0-9a-f]{40}", candidate.get("commit", "")
-    ):
+    if candidate.get("name") != "adxadmin" or not re.fullmatch(r"[0-9a-f]{40}", candidate.get("commit", "")):
         raise ValueError("invalid admin candidate identity")
     actual = {
         path.name
@@ -70,9 +66,7 @@ def verify(directory):
             raise ValueError("admin candidate artifact digest mismatch")
     wheel = next(directory / name for name in files if name.endswith(".whl"))
     metadata = wheel_metadata(wheel)
-    if metadata["Name"] != candidate["name"] or metadata["Version"] != candidate.get(
-        "version"
-    ):
+    if metadata["Name"] != candidate["name"] or metadata["Version"] != candidate.get("version"):
         raise ValueError("admin candidate metadata mismatch")
     return candidate
 

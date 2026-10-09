@@ -1,12 +1,12 @@
 """Inject command start, Watch, and capability faults at the SDK entry."""
 
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import socket
 import ssl
 import threading
 import time
 import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import HTTPError
 from urllib.request import HTTPSHandler, ProxyHandler, Request, build_opener
 
@@ -14,10 +14,19 @@ from urllib.request import HTTPSHandler, ProxyHandler, Request, build_opener
 class CommandResponseCutProxy:
     """Forward to real Ingress with configurable command response faults."""
 
-    def __init__(self, upstream, *, certificate=None, private_key=None, ca=None,
-                 cut_start=True, reject_watch=False, reject_get=False,
-                 reject_get_on_watch=False,
-                 strip_watch_capability=False):
+    def __init__(
+        self,
+        upstream,
+        *,
+        certificate=None,
+        private_key=None,
+        ca=None,
+        cut_start=True,
+        reject_watch=False,
+        reject_get=False,
+        reject_get_on_watch=False,
+        strip_watch_capability=False,
+    ):
         self.upstream = upstream.rstrip('/')
         self.certificate = certificate
         self.private_key = private_key
@@ -45,8 +54,7 @@ class CommandResponseCutProxy:
 
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self):
-                if (proxy.reject_watch
-                        and self.path.startswith('/api/sandbox/v1/commands/watch')):
+                if proxy.reject_watch and self.path.startswith('/api/sandbox/v1/commands/watch'):
                     with proxy._lock:
                         proxy.watch_attempts += 1
                         if proxy.reject_get_on_watch:
@@ -59,26 +67,27 @@ class CommandResponseCutProxy:
                 self._forward()
 
             def _forward(self):
-                body = (self.rfile.read(int(self.headers['Content-Length']))
-                        if self.command == 'POST' else None)
-                if (body is not None and self.path.startswith('/direct/')
-                        and json.loads(body).get('action') == 'process.get'
-                        and proxy.reject_get):
+                body = self.rfile.read(int(self.headers['Content-Length'])) if self.command == 'POST' else None
+                if (
+                    body is not None
+                    and self.path.startswith('/direct/')
+                    and json.loads(body).get('action') == 'process.get'
+                    and proxy.reject_get
+                ):
                     with proxy._lock:
                         proxy.rejected_get_attempts += 1
                     self.send_error(503, 'command query unavailable')
                     return
                 headers = {
-                    key: value for key, value in self.headers.items()
-                    if key.lower() not in ('host', 'connection', 'content-length',
-                                           'accept-encoding', 'transfer-encoding')
+                    key: value
+                    for key, value in self.headers.items()
+                    if key.lower()
+                    not in ('host', 'connection', 'content-length', 'accept-encoding', 'transfer-encoding')
                 }
-                request = Request(proxy.upstream + self.path, data=body,
-                                  headers=headers, method=self.command)
+                request = Request(proxy.upstream + self.path, data=body, headers=headers, method=self.command)
                 handlers = [ProxyHandler({})]
                 if proxy.upstream.startswith('https:'):
-                    handlers.append(HTTPSHandler(
-                        context=ssl.create_default_context(cafile=str(proxy.ca))))
+                    handlers.append(HTTPSHandler(context=ssl.create_default_context(cafile=str(proxy.ca))))
                 opener = build_opener(*handlers)
                 try:
                     response = opener.open(request, timeout=60)
@@ -87,8 +96,7 @@ class CommandResponseCutProxy:
                 with response:
                     payload = response.read()
                     status = response.status
-                    content_type = response.headers.get(
-                        'Content-Type', 'application/octet-stream')
+                    content_type = response.headers.get('Content-Type', 'application/octet-stream')
 
                 start = None
                 if self.command == 'POST' and self.path.startswith('/direct/'):
@@ -99,17 +107,20 @@ class CommandResponseCutProxy:
                             proxy.capability_attempts.append(dict(capability_response))
                         if proxy.strip_watch_capability:
                             capability_response['capabilities'] = [
-                                capability for capability in capability_response['capabilities']
+                                capability
+                                for capability in capability_response['capabilities']
                                 if capability != 'multiplexed-command-watch'
                             ]
                             payload = json.dumps(capability_response).encode()
                     if submitted.get('action') == 'process.start':
                         start = submitted
                         with proxy._lock:
-                            proxy.start_attempts.append({
-                                'request_id': self.headers.get('X-ADX-Request-ID'),
-                                'command_id': start['args']['command_id'],
-                            })
+                            proxy.start_attempts.append(
+                                {
+                                    'request_id': self.headers.get('X-ADX-Request-ID'),
+                                    'command_id': start['args']['command_id'],
+                                }
+                            )
                 if proxy.cut_start and start is not None and status == 200:
                     result = json.loads(payload)
                     if not result.get('error'):
@@ -154,7 +165,9 @@ class CommandResponseCutProxy:
 def run(connection, image, output, secrets):
     """Recover a real command whose every successful start response was lost."""
     from adx_sandbox import (
-        CommandSubmissionError, ConnectionConfig, Sandbox,
+        CommandSubmissionError,
+        ConnectionConfig,
+        Sandbox,
     )
     from functional_lifecycle import _wait_deleted
     from node import catalog, labeled_backend
@@ -169,43 +182,64 @@ def run(connection, image, output, secrets):
     recovered_handle = None
     deleted = False
     proxy = CommandResponseCutProxy(
-        'https://127.0.0.1:8443', certificate=secrets / 'tls/ingress.pem',
-        private_key=secrets / 'tls/ingress.key', ca=secrets / 'tls/ca.pem',
+        'https://127.0.0.1:8443',
+        certificate=secrets / 'tls/ingress.pem',
+        private_key=secrets / 'tls/ingress.key',
+        ca=secrets / 'tls/ca.pem',
     )
     try:
         sandbox = Sandbox(
-            name=name, image=image, runtime='runc', node_id='node1',
-            cpu=500, memory=512, idle_timeout=0, detached=True,
-            connection=connection, create_timeout=150,
+            name=name,
+            image=image,
+            runtime='runc',
+            node_id='node1',
+            cpu=500,
+            memory=512,
+            idle_timeout=0,
+            detached=True,
+            connection=connection,
+            create_timeout=150,
         )
         initial = json.loads(catalog()['environment:' + sandbox.id])
         initial_backend = labeled_backend(sandbox.id)
-        assert len(initial_backend) == 1, initial_backend
+        if not (len(initial_backend) == 1):
+            raise AssertionError(initial_backend)
 
         with proxy:
             proxied = ConnectionConfig(
                 server_address=f'127.0.0.1:{proxy.port}',
-                token=connection.token, use_tls=True, verify_tls=True,
+                token=connection.token,
+                use_tls=True,
+                verify_tls=True,
             )
             attached = Sandbox.from_id(sandbox.id, connection=proxied)
             try:
                 attached.commands.run(
                     f"printf x >> {marker}; printf command-cut-complete",
-                    background=True, command_id=command_id,
+                    background=True,
+                    command_id=command_id,
                 )
             except CommandSubmissionError as error:
-                if (error.command_id != command_id or not error.may_have_started
-                        or error.sandbox_id != sandbox.id or not error.request_id):
+                if (
+                    error.command_id != command_id
+                    or not error.may_have_started
+                    or error.sandbox_id != sandbox.id
+                    or not error.request_id
+                ):
                     raise AssertionError(f'command unknown-outcome identity lost: {error}') from error
                 report['request_id'] = error.request_id
             else:
                 raise AssertionError('SDK did not surface the lost command result')
 
             attempts = proxy.cut_attempts
-            assert len(attempts) == 3, attempts
-            assert {item['request_id'] for item in attempts} == {report['request_id']}
-            assert {item['command_id'] for item in attempts} == {command_id}
-            assert all(item['result'].get('pid', 0) > 0 for item in attempts), attempts
+            if not (len(attempts) == 3):
+                raise AssertionError(attempts)
+            if not ({item['request_id'] for item in attempts} == {report['request_id']}):
+                raise AssertionError()
+            if not ({item['command_id'] for item in attempts} == {command_id}):
+                raise AssertionError()
+            if not (all(item['result'].get('pid', 0) > 0 for item in attempts)):
+                raise AssertionError(attempts)
             attached.close()
             attached = None
 
@@ -213,33 +247,41 @@ def run(connection, image, output, secrets):
         # command without replaying process.start or changing its command ID.
         recovered_handle = Sandbox.from_id(sandbox.id, connection=connection)
         recovered = recovered_handle.commands.get(command_id).wait(timeout=30)
-        assert recovered.exit_code == 0 and recovered.stdout == 'command-cut-complete', recovered
+        if not (recovered.exit_code == 0 and recovered.stdout == 'command-cut-complete'):
+            raise AssertionError(recovered)
         marker_result = recovered_handle.commands.run(f'cat {marker}')
-        assert marker_result.exit_code == 0 and marker_result.stdout == 'x', marker_result
+        if not (marker_result.exit_code == 0 and marker_result.stdout == 'x'):
+            raise AssertionError(marker_result)
         recovered_handle.commands.run(f'rm {marker}')
         recovered_handle.close()
         recovered_handle = None
 
         final = json.loads(catalog()['environment:' + sandbox.id])
-        assert final['assignment']['generation'] == initial['assignment']['generation']
-        assert labeled_backend(sandbox.id) == initial_backend
+        if not (final['assignment']['generation'] == initial['assignment']['generation']):
+            raise AssertionError()
+        if not (labeled_backend(sandbox.id) == initial_backend):
+            raise AssertionError()
         Sandbox.delete(sandbox.id, connection=connection)
         deleted = True
         _wait_deleted(sandbox.id, connection, timeout=60)
-        assert 'environment:' + sandbox.id not in catalog()
-        assert not labeled_backend(sandbox.id)
+        if not ('environment:' + sandbox.id not in catalog()):
+            raise AssertionError()
+        if not (not labeled_backend(sandbox.id)):
+            raise AssertionError()
 
         report['status'] = 'passed'
-        report['cases'].append({
-            'id': 'reliability.command-start-response-cut',
-            'status': 'passed',
-            'seconds': round(time.monotonic() - started, 3),
-            'instance_id': sandbox.id,
-            'command_id': command_id,
-            'request_id': report['request_id'],
-            'start_attempts': len(attempts),
-            'backend': initial_backend[0],
-        })
+        report['cases'].append(
+            {
+                'id': 'reliability.command-start-response-cut',
+                'status': 'passed',
+                'seconds': round(time.monotonic() - started, 3),
+                'instance_id': sandbox.id,
+                'command_id': command_id,
+                'request_id': report['request_id'],
+                'start_attempts': len(attempts),
+                'backend': initial_backend[0],
+            }
+        )
         return report
     except Exception as error:
         report['error'] = str(error)

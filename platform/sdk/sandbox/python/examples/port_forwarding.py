@@ -28,12 +28,21 @@ EXPECTED_BODY = "ROUTER-PF-OK-808"
 # Perl + Socket is available in the CI images and is enough for a tiny HTTP
 # server that validates the fixed Traefik router -> frontend sandboxRouter path:
 #   http://<gateway>/<safeID>/<port>
-SERVER_CMD = rf'''perl -MSocket -e '$|=1; socket(S,PF_INET,SOCK_STREAM,getprotobyname("tcp")); setsockopt(S,SOL_SOCKET,SO_REUSEADDR,1); bind(S,sockaddr_in({PORT},INADDR_ANY)) or die $!; listen(S,10); while(accept(C,S)){{ print C "HTTP/1.1 200 OK\r\nContent-Length: {len(EXPECTED_BODY)}\r\nConnection: close\r\n\r\n{EXPECTED_BODY}"; close C; }}' '''
+SERVER_CMD = (
+    rf'''perl -MSocket -e '$|=1; '''
+    rf'''socket(S,PF_INET,SOCK_STREAM,getprotobyname("tcp")); '''
+    rf'''setsockopt(S,SOL_SOCKET,SO_REUSEADDR,1); bind(S,sockaddr_in('''
+    rf'''{PORT}'''
+    rf''',INADDR_ANY)) or die $!; listen(S,10); while(accept(C,S)){{ '''
+    rf'''print C "HTTP/1.1 200 OK\r\nContent-Length: '''
+    rf'''{len(EXPECTED_BODY)}'''
+    rf'''\r\nConnection: close\r\n\r\n'''
+    rf'''{EXPECTED_BODY}'''
+    rf'''"; close C; }}' '''
+)
 
 
-def fetch_text(
-    url: str, timeout: int = 10, route_attempts: int = 30, retry_delay: float = 1
-) -> str:
+def fetch_text(url: str, timeout: int = 10, route_attempts: int = 30, retry_delay: float = 1) -> str:
     for attempt in range(route_attempts):
         try:
             with urllib.request.urlopen(url, timeout=timeout) as resp:
@@ -62,7 +71,8 @@ def main():
 
         body = fetch_text(url)
         print(f"Router response: {body}")
-        assert body == EXPECTED_BODY, f"unexpected response from router: {body!r}"
+        if not (body == EXPECTED_BODY):
+            raise AssertionError(f"unexpected response from router: {body!r}")
 
     print("Port forwarding through fixed router verified.")
 

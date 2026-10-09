@@ -1,20 +1,19 @@
 """Lose a committed upload chunk reply and verify offset-based recovery."""
 
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import hashlib
 import json
 import os
-from pathlib import Path
 import socket
 import ssl
 import tempfile
 import threading
 import time
+import uuid
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.error import HTTPError
 from urllib.parse import parse_qs, urlsplit
 from urllib.request import HTTPSHandler, ProxyHandler, Request, build_opener
-import uuid
-
 
 CHUNK_SIZE = 64 * 1024
 
@@ -22,8 +21,9 @@ CHUNK_SIZE = 64 * 1024
 class UploadResponseCutProxy:
     """Forward binary chunks, cutting only the first successful chunk reply."""
 
-    def __init__(self, upstream, *, certificate=None, private_key=None, ca=None,
-                 cut_upload=True, download_cut_bytes=None):
+    def __init__(
+        self, upstream, *, certificate=None, private_key=None, ca=None, cut_upload=True, download_cut_bytes=None
+    ):
         self.upstream = upstream.rstrip('/')
         self.certificate = certificate
         self.private_key = private_key
@@ -54,19 +54,17 @@ class UploadResponseCutProxy:
                 self._forward()
 
             def _forward(self):
-                body = (self.rfile.read(int(self.headers['Content-Length']))
-                        if self.command == 'POST' else None)
+                body = self.rfile.read(int(self.headers['Content-Length'])) if self.command == 'POST' else None
                 headers = {
-                    key: value for key, value in self.headers.items()
-                    if key.lower() not in ('host', 'connection', 'content-length',
-                                           'accept-encoding', 'transfer-encoding')
+                    key: value
+                    for key, value in self.headers.items()
+                    if key.lower()
+                    not in ('host', 'connection', 'content-length', 'accept-encoding', 'transfer-encoding')
                 }
-                request = Request(proxy.upstream + self.path, data=body,
-                                  headers=headers, method=self.command)
+                request = Request(proxy.upstream + self.path, data=body, headers=headers, method=self.command)
                 handlers = [ProxyHandler({})]
                 if proxy.upstream.startswith('https:'):
-                    handlers.append(HTTPSHandler(
-                        context=ssl.create_default_context(cafile=str(proxy.ca))))
+                    handlers.append(HTTPSHandler(context=ssl.create_default_context(cafile=str(proxy.ca))))
                 opener = build_opener(*handlers)
                 try:
                     response = opener.open(request, timeout=60)
@@ -75,19 +73,15 @@ class UploadResponseCutProxy:
                 with response:
                     payload = response.read()
                     status = response.status
-                    content_type = response.headers.get(
-                        'Content-Type', 'application/octet-stream')
+                    content_type = response.headers.get('Content-Type', 'application/octet-stream')
                     content_range = response.headers.get('Content-Range')
 
                 parsed_url = urlsplit(self.path)
                 params = parse_qs(parsed_url.query)
-                if (self.command == 'GET'
-                        and parsed_url.path.endswith('/upload/status')
-                        and status == 200):
+                if self.command == 'GET' and parsed_url.path.endswith('/upload/status') and status == 200:
                     with proxy._lock:
                         proxy.status_offsets.append(int(json.loads(payload)['offset']))
-                if (self.command == 'POST' and parsed_url.path.endswith('/upload')
-                        and params.get('uploadId')):
+                if self.command == 'POST' and parsed_url.path.endswith('/upload') and params.get('uploadId'):
                     chunk = {
                         'upload_id': params['uploadId'][0],
                         'offset': int(params['offset'][0]),
@@ -100,7 +94,8 @@ class UploadResponseCutProxy:
                             result = json.loads(payload)
                             if not result.get('error'):
                                 proxy.cut_chunk = {
-                                    **chunk, 'committed_offset': int(result['offset']),
+                                    **chunk,
+                                    'committed_offset': int(result['offset']),
                                 }
                                 cut = True
                             else:
@@ -115,31 +110,33 @@ class UploadResponseCutProxy:
                         self.connection.close()
                         return
 
-                if (self.command == 'GET'
-                        and parsed_url.path.endswith('/download')
-                        and params.get('type') == ['file']):
+                if self.command == 'GET' and parsed_url.path.endswith('/download') and params.get('type') == ['file']:
                     range_header = self.headers.get('Range')
                     attempt = {
-                        'range': range_header, 'status': status,
+                        'range': range_header,
+                        'status': status,
                         'size': len(payload),
                     }
                     with proxy._lock:
                         proxy.download_attempts.append(attempt)
-                        cut_download = (proxy.download_cut_bytes is not None
-                                        and proxy.cut_download is None
-                                        and range_header is None
-                                        and status == 200
-                                        and len(payload) > proxy.download_cut_bytes)
+                        cut_download = (
+                            proxy.download_cut_bytes is not None
+                            and proxy.cut_download is None
+                            and range_header is None
+                            and status == 200
+                            and len(payload) > proxy.download_cut_bytes
+                        )
                         if cut_download:
                             proxy.cut_download = {
-                                **attempt, 'bytes_sent': proxy.download_cut_bytes,
+                                **attempt,
+                                'bytes_sent': proxy.download_cut_bytes,
                             }
                     if cut_download:
                         self.send_response(status)
                         self.send_header('Content-Type', content_type)
                         self.send_header('Content-Length', str(len(payload)))
                         self.end_headers()
-                        self.wfile.write(payload[:proxy.download_cut_bytes])
+                        self.wfile.write(payload[: proxy.download_cut_bytes])
                         self.wfile.flush()
                         self.close_connection = True
                         self.connection.shutdown(socket.SHUT_RDWR)
@@ -174,10 +171,10 @@ class UploadResponseCutProxy:
 
 def run(connection, image, output, secrets):
     """Use the installed SDK with real Execd and verify the final file digest."""
-    from route_ready import wait_for_route
     from adx_sandbox import ConnectionConfig, Sandbox
     from functional_lifecycle import _wait_deleted
     from node import catalog, labeled_backend
+    from route_ready import wait_for_route
 
     started = time.monotonic()
     report = {'status': 'failed', 'cases': [], 'cleanup_errors': []}
@@ -188,18 +185,28 @@ def run(connection, image, output, secrets):
     recovered = None
     deleted = False
     proxy = UploadResponseCutProxy(
-        'https://127.0.0.1:8443', certificate=secrets / 'tls/ingress.pem',
-        private_key=secrets / 'tls/ingress.key', ca=secrets / 'tls/ca.pem',
+        'https://127.0.0.1:8443',
+        certificate=secrets / 'tls/ingress.pem',
+        private_key=secrets / 'tls/ingress.key',
+        ca=secrets / 'tls/ca.pem',
     )
     try:
         sandbox = Sandbox(
-            name=name, image=image, runtime='runc', node_id='node1',
-            cpu=500, memory=512, idle_timeout=0, detached=True,
-            connection=connection, create_timeout=150,
+            name=name,
+            image=image,
+            runtime='runc',
+            node_id='node1',
+            cpu=500,
+            memory=512,
+            idle_timeout=0,
+            detached=True,
+            connection=connection,
+            create_timeout=150,
         )
         initial = json.loads(catalog()['environment:' + sandbox.id])
         backend = labeled_backend(sandbox.id)
-        assert len(backend) == 1, backend
+        if not (len(backend) == 1):
+            raise AssertionError(backend)
         wait_for_route(sandbox)
 
         with tempfile.TemporaryDirectory(prefix='adx-upload-cut-') as directory:
@@ -209,16 +216,15 @@ def run(connection, image, output, secrets):
             source.write_bytes(payload)
             expected_digest = hashlib.sha256(payload).hexdigest()
             with proxy:
-                prior = {
-                    key: os.environ.get(key)
-                    for key in ('ADX_RESUME_MIN_SIZE', 'ADX_RESUME_CHUNK_SIZE')
-                }
+                prior = {key: os.environ.get(key) for key in ('ADX_RESUME_MIN_SIZE', 'ADX_RESUME_CHUNK_SIZE')}
                 try:
                     os.environ['ADX_RESUME_MIN_SIZE'] = '1'
                     os.environ['ADX_RESUME_CHUNK_SIZE'] = str(CHUNK_SIZE)
                     proxied = ConnectionConfig(
                         server_address=f'127.0.0.1:{proxy.port}',
-                        token=connection.token, use_tls=True, verify_tls=True,
+                        token=connection.token,
+                        use_tls=True,
+                        verify_tls=True,
                     )
                     attached = Sandbox.from_id(sandbox.id, connection=proxied)
                     attached.files.copy_from_local(str(source), remote_path)
@@ -232,42 +238,62 @@ def run(connection, image, output, secrets):
                             os.environ[key] = value
 
             cut = proxy.cut_chunk
-            assert cut is not None and cut['offset'] == 0, cut
-            assert cut['committed_offset'] == CHUNK_SIZE, cut
-            assert proxy.status_offsets == [0, CHUNK_SIZE], proxy.status_offsets
-            assert {item['upload_id'] for item in proxy.chunks} == {cut['upload_id']}
-            assert [item['offset'] for item in proxy.chunks] == [
-                0, CHUNK_SIZE, 2 * CHUNK_SIZE, 3 * CHUNK_SIZE,
-            ], proxy.chunks
-            assert all(item['status'] == 200 for item in proxy.chunks), proxy.chunks
+            if not (cut is not None and cut['offset'] == 0):
+                raise AssertionError(cut)
+            if not (cut['committed_offset'] == CHUNK_SIZE):
+                raise AssertionError(cut)
+            if not (proxy.status_offsets == [0, CHUNK_SIZE]):
+                raise AssertionError(proxy.status_offsets)
+            if not ({item['upload_id'] for item in proxy.chunks} == {cut['upload_id']}):
+                raise AssertionError()
+            if not (
+                [item['offset'] for item in proxy.chunks]
+                == [
+                    0,
+                    CHUNK_SIZE,
+                    2 * CHUNK_SIZE,
+                    3 * CHUNK_SIZE,
+                ]
+            ):
+                raise AssertionError(proxy.chunks)
+            if not (all(item['status'] == 200 for item in proxy.chunks)):
+                raise AssertionError(proxy.chunks)
 
             recovered = Sandbox.from_id(sandbox.id, connection=connection)
             recovered.files.copy_to_local(remote_path, str(target))
             actual_digest = hashlib.sha256(target.read_bytes()).hexdigest()
-            assert actual_digest == expected_digest, (actual_digest, expected_digest)
+            if not (actual_digest == expected_digest):
+                raise AssertionError((actual_digest, expected_digest))
             recovered.close()
             recovered = None
 
         final = json.loads(catalog()['environment:' + sandbox.id])
-        assert final['assignment']['generation'] == initial['assignment']['generation']
-        assert labeled_backend(sandbox.id) == backend
+        if not (final['assignment']['generation'] == initial['assignment']['generation']):
+            raise AssertionError()
+        if not (labeled_backend(sandbox.id) == backend):
+            raise AssertionError()
         Sandbox.delete(sandbox.id, connection=connection)
         deleted = True
         _wait_deleted(sandbox.id, connection, timeout=60)
-        assert 'environment:' + sandbox.id not in catalog()
-        assert not labeled_backend(sandbox.id)
+        if not ('environment:' + sandbox.id not in catalog()):
+            raise AssertionError()
+        if not (not labeled_backend(sandbox.id)):
+            raise AssertionError()
 
         report['status'] = 'passed'
-        report['cases'].append({
-            'id': 'file.resumable-upload-response-cut', 'status': 'passed',
-            'seconds': round(time.monotonic() - started, 3),
-            'instance_id': sandbox.id,
-            'upload_id': cut['upload_id'],
-            'cut_offset': cut['committed_offset'],
-            'chunks': len(proxy.chunks),
-            'sha256': expected_digest,
-            'backend': backend[0],
-        })
+        report['cases'].append(
+            {
+                'id': 'file.resumable-upload-response-cut',
+                'status': 'passed',
+                'seconds': round(time.monotonic() - started, 3),
+                'instance_id': sandbox.id,
+                'upload_id': cut['upload_id'],
+                'cut_offset': cut['committed_offset'],
+                'chunks': len(proxy.chunks),
+                'sha256': expected_digest,
+                'backend': backend[0],
+            }
+        )
         return report
     except Exception as error:
         report['error'] = str(error)

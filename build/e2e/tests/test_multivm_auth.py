@@ -1,8 +1,8 @@
 import json
-from pathlib import Path
 import tempfile
-from types import SimpleNamespace
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
 
 from e2e.multivm.auth_accept import run_acceptance
 from e2e.tests.test_multivm_local_first import inventory
@@ -17,8 +17,7 @@ class AuthAcceptanceTests(unittest.TestCase):
             id = 'sandbox-owned'
 
             def __init__(self, **options):
-                self.commands = SimpleNamespace(run=lambda _command: SimpleNamespace(
-                    exit_code=0, stdout='still-owned'))
+                self.commands = SimpleNamespace(run=lambda _command: SimpleNamespace(exit_code=0, stdout='still-owned'))
                 actions.append(('create', options['node_id']))
 
             def is_running(self):
@@ -58,9 +57,16 @@ class AuthAcceptanceTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             result = run_acceptance(
-                inventory(), object(), 'image', Path(directory),
-                owner_token='owner', admin_token='admin', sandbox_factory=Sandbox,
-                request=request, verify=lambda _inventory: ['verified'])
+                inventory(),
+                object(),
+                'image',
+                Path(directory),
+                owner_token='owner',
+                admin_token='admin',
+                sandbox_factory=Sandbox,
+                request=request,
+                verify=lambda _inventory: ['verified'],
+            )
             report = json.loads((Path(directory) / 'auth-result.json').read_text())
         return result, report, actions
 

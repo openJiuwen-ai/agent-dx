@@ -10,13 +10,11 @@ import weakref
 from collections import defaultdict
 from typing import Dict, Optional, Set, Tuple
 
-from .types import ConnectionConfig
 from ._command_metrics import increment
+from .types import ConnectionConfig
 
 _TERMINAL = frozenset(("SUCCEEDED", "FAILED", "TIMED_OUT", "KILLED"))
-_MANAGERS: "weakref.WeakValueDictionary[ConnectionConfig, _CommandWaitManager]" = (
-    weakref.WeakValueDictionary()
-)
+_MANAGERS: "weakref.WeakValueDictionary[ConnectionConfig, _CommandWaitManager]" = weakref.WeakValueDictionary()
 _MANAGERS_LOCK = threading.Lock()
 
 
@@ -39,9 +37,9 @@ class _CommandWaitManager:
         self._connection = connection
         self._lock = threading.Lock()
         self._waiters: Dict[Tuple[str, str], Set[threading.Event]] = defaultdict(set)
-        self._async_waiters: Dict[
-            Tuple[str, str], Set[Tuple[asyncio.AbstractEventLoop, asyncio.Future]]
-        ] = defaultdict(set)
+        self._async_waiters: Dict[Tuple[str, str], Set[Tuple[asyncio.AbstractEventLoop, asyncio.Future]]] = defaultdict(
+            set
+        )
         self._errors: Dict[Tuple[str, str], str] = {}
         self._changed: "queue.SimpleQueue[None]" = queue.SimpleQueue()
         self._thread: Optional[threading.Thread] = None
@@ -64,9 +62,7 @@ class _CommandWaitManager:
             if error:
                 from .commands import CommandUnavailable
 
-                raise CommandUnavailable(
-                    error, sandbox_id=sandbox_id, command_id=command_id
-                )
+                raise CommandUnavailable(error, sandbox_id=sandbox_id, command_id=command_id)
         finally:
             with self._lock:
                 waiters = self._waiters.get(key)
@@ -77,9 +73,7 @@ class _CommandWaitManager:
                         self._errors.pop(key, None)
             self._changed.put(None)
 
-    async def wait_async(
-        self, sandbox_id: str, command_id: str, timeout: Optional[float]
-    ) -> None:
+    async def wait_async(self, sandbox_id: str, command_id: str, timeout: Optional[float]) -> None:
         key = (sandbox_id, command_id)
         loop = asyncio.get_running_loop()
         future = loop.create_future()
@@ -95,15 +89,11 @@ class _CommandWaitManager:
             except asyncio.TimeoutError as timeout_error:
                 from .commands import CommandWaitTimeout
 
-                raise CommandWaitTimeout(
-                    sandbox_id, command_id, timeout
-                ) from timeout_error
+                raise CommandWaitTimeout(sandbox_id, command_id, timeout) from timeout_error
             if error:
                 from .commands import CommandUnavailable
 
-                raise CommandUnavailable(
-                    error, sandbox_id=sandbox_id, command_id=command_id
-                )
+                raise CommandUnavailable(error, sandbox_id=sandbox_id, command_id=command_id)
         finally:
             with self._lock:
                 waiters = self._async_waiters.get(key)
@@ -175,9 +165,7 @@ class _CommandWaitManager:
             ssl_context = None
             if scheme == "wss":
                 ssl_context = (
-                    ssl.create_default_context()
-                    if self._connection.verify_tls
-                    else ssl._create_unverified_context()  # noqa: SLF001
+                    ssl.create_default_context() if self._connection.verify_tls else ssl._create_unverified_context()  # noqa: SLF001
                 )
             try:
                 token = self._connection.resolved_token()
@@ -202,8 +190,7 @@ class _CommandWaitManager:
                                         "protocolVersion": 1,
                                         "op": "subscribe",
                                         "commands": [
-                                            {"sandboxId": sid, "commandId": cid}
-                                            for sid, cid in sorted(added)
+                                            {"sandboxId": sid, "commandId": cid} for sid, cid in sorted(added)
                                         ],
                                     }
                                 )
@@ -214,8 +201,7 @@ class _CommandWaitManager:
                                     {
                                         "op": "unsubscribe",
                                         "commands": [
-                                            {"sandboxId": sid, "commandId": cid}
-                                            for sid, cid in sorted(removed)
+                                            {"sandboxId": sid, "commandId": cid} for sid, cid in sorted(removed)
                                         ],
                                     }
                                 )
@@ -227,7 +213,9 @@ class _CommandWaitManager:
                             continue
                         state = json.loads(raw)
                         if state.get("op") == "ready":
-                            if state.get("protocolVersion") != 1 or "multiplexed-command-watch" not in state.get("capabilities", ()):
+                            if state.get("protocolVersion") != 1 or "multiplexed-command-watch" not in state.get(
+                                "capabilities", ()
+                            ):
                                 raise RuntimeError("server does not support command watch protocol v1")
                             ready = True
                             continue

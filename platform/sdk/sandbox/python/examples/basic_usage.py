@@ -12,8 +12,10 @@ Usage:
   python basic_usage.py
 """
 
+import tempfile
+from pathlib import Path
+
 from adx_sandbox import Sandbox
-import os
 
 
 def main():
@@ -65,37 +67,27 @@ def main():
 
         # --- File copy (local <-> sandbox) ---
         # Create a local file and upload it to the sandbox
-        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            local_root = Path(directory)
+            local_src = local_root / "upload.txt"
+            local_src.write_text("local file content")
+            sb.files.copy_from_local(str(local_src), "/tmp/uploaded.txt")
+            print(f"uploaded: {sb.files.read('/tmp/uploaded.txt')}")
 
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
-            f.write("local file content")
-            local_src = f.name
+            # Download a file inside the owned temporary directory.
+            sb.files.write("/tmp/to_download.txt", "sandbox content")
+            local_dst = local_root / "download.txt"
+            sb.files.copy_to_local("/tmp/to_download.txt", str(local_dst))
+            print(f"downloaded: {local_dst.read_text()}")
 
-        sb.files.copy_from_local(local_src, "/tmp/uploaded.txt")
-        print(f"uploaded: {sb.files.read('/tmp/uploaded.txt')}")
-        os.remove(local_src)
-
-        # Download a file from sandbox to local
-        sb.files.write("/tmp/to_download.txt", "sandbox content")
-        local_dst = tempfile.mktemp(suffix=".txt")
-        sb.files.copy_to_local("/tmp/to_download.txt", local_dst)
-        with open(local_dst) as f:
-            print(f"downloaded: {f.read()}")
-        os.remove(local_dst)
-
-        # Upload a local directory into the sandbox. copy_from_local streams a
-        # directory as a single tar archive that the sandbox extracts.
-        local_dir = tempfile.mkdtemp()
-        with open(os.path.join(local_dir, "f1.txt"), "w") as f:
-            f.write("file1")
-        with open(os.path.join(local_dir, "f2.txt"), "w") as f:
-            f.write("file2")
-        sb.files.copy_from_local(local_dir, "/tmp/uploaded_dir")
-        for entry in sb.files.list("/tmp/uploaded_dir"):
-            print(f"  uploaded_dir/{entry.name}: {sb.files.read(entry.path)}")
-        os.remove(os.path.join(local_dir, "f1.txt"))
-        os.remove(os.path.join(local_dir, "f2.txt"))
-        os.rmdir(local_dir)
+            # copy_from_local streams a directory as one tar archive.
+            local_dir = local_root / "uploaded_dir"
+            local_dir.mkdir()
+            (local_dir / "f1.txt").write_text("file1")
+            (local_dir / "f2.txt").write_text("file2")
+            sb.files.copy_from_local(str(local_dir), "/tmp/uploaded_dir")
+            for entry in sb.files.list("/tmp/uploaded_dir"):
+                print(f"  uploaded_dir/{entry.name}: {sb.files.read(entry.path)}")
 
         # --- Background process ---
         handle = sb.commands.run("sleep 10", background=True)

@@ -3,10 +3,9 @@
 import argparse
 import hashlib
 import os
-from pathlib import Path
 import re
 import subprocess
-
+from pathlib import Path
 
 IMAGE_REF = re.compile(r'[^\s@]+@sha256:[0-9a-f]{64}\Z')
 SHA512 = re.compile(r'[0-9a-fA-F]{128}\Z')
@@ -32,8 +31,9 @@ def stage(image, expected_sha512, output, run=subprocess.run):
     output.parent.mkdir(parents=True, exist_ok=True)
     run(['docker', 'pull', '--platform', 'linux/amd64', image], check=True)
     # The carrier image intentionally has no default command; it is never run.
-    created = run(['docker', 'create', image, '/runsc', '--version'], check=True, text=True,
-                  capture_output=True).stdout.strip()
+    created = run(
+        ['docker', 'create', image, '/runsc', '--version'], check=True, text=True, capture_output=True
+    ).stdout.strip()
     if not CONTAINER_ID.fullmatch(created):
         raise ValueError('docker create returned an invalid container identity')
     try:
@@ -47,8 +47,7 @@ def stage(image, expected_sha512, output, run=subprocess.run):
             output.unlink(missing_ok=True)
             raise
     finally:
-        run(['docker', 'rm', '-f', created], check=True,
-            stdout=subprocess.DEVNULL)
+        run(['docker', 'rm', '-f', created], check=True, stdout=subprocess.DEVNULL)
 
 
 def main():

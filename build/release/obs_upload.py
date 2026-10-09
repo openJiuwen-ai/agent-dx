@@ -5,10 +5,9 @@ import argparse
 import hashlib
 import json
 import os
-from pathlib import Path
 import re
+from pathlib import Path
 from urllib.parse import quote
-
 
 DEFAULT_BUCKET = "openyuanrong"
 DEFAULT_ENDPOINT = "obs.cn-southwest-2.myhuaweicloud.com"
@@ -35,7 +34,7 @@ def normalized_endpoint(endpoint):
     value = endpoint.strip()
     for scheme in ("https://", "http://"):
         if value.startswith(scheme):
-            value = value[len(scheme):]
+            value = value[len(scheme) :]
             break
     value = value.rstrip("/")
     if not value or "/" in value or any(ch.isspace() for ch in value):
@@ -81,13 +80,15 @@ def plan(files, channel, version, platform, arch, timestamp, commit, build_id, b
             raise ValueError(f"duplicate artifact filename: {path.name}")
         names.add(path.name)
         object_path = f"{root}/{path.name}"
-        artifacts.append({
-            "name": path.name,
-            "bytes": path.stat().st_size,
-            "sha256": digest(path),
-            "object": object_path,
-            "url": public_url(endpoint, bucket, object_path),
-        })
+        artifacts.append(
+            {
+                "name": path.name,
+                "bytes": path.stat().st_size,
+                "sha256": digest(path),
+                "object": object_path,
+                "url": public_url(endpoint, bucket, object_path),
+            }
+        )
     manifest_object = f"{root}/manifest.json"
     return {
         "schema_version": 1,
@@ -118,12 +119,11 @@ def checked_upload(client, bucket, object_path, path):
         raise RuntimeError(f"OBS readback verification failed for {path.name}")
 
 
-def publish(*, client, files, output, bucket, endpoint, channel, version, platform, arch,
-            timestamp, commit, build_id, dry_run):
+def publish(
+    *, client, files, output, bucket, endpoint, channel, version, platform, arch, timestamp, commit, build_id, dry_run
+):
     try:
-        manifest = plan(
-            files, channel, version, platform, arch, timestamp, commit, build_id, bucket, endpoint
-        )
+        manifest = plan(files, channel, version, platform, arch, timestamp, commit, build_id, bucket, endpoint)
         output = Path(output)
         if not dry_run:
             for path, artifact in zip(map(Path, files), manifest["artifacts"]):

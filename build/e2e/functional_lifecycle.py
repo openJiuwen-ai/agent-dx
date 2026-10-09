@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Installed SDK acceptance for ordinary instance lifecycle behavior."""
+
 import json
-from pathlib import Path
+import logging
 import subprocess
 import sys
 import time
 import uuid
+from pathlib import Path
 
 from adx_sandbox import Sandbox, SandboxNotFound
 
@@ -63,7 +65,8 @@ def run(connection, image, output):
         attached = Sandbox.from_id(detached_id, connection=connection)
         try:
             result = attached.commands.run("printf 'reattached'")
-            assert result.exit_code == 0 and result.stdout == 'reattached'
+            if not (result.exit_code == 0 and result.stdout == 'reattached'):
+                raise AssertionError()
         finally:
             attached.close()
         Sandbox.delete(detached_id, connection=connection)
@@ -100,8 +103,10 @@ def run(connection, image, output):
             create_timeout=150,
         )
         try:
-            assert reopened.id == named_id
-            assert reopened.commands.run("printf 'same-owner'").stdout == 'same-owner'
+            if not (reopened.id == named_id):
+                raise AssertionError()
+            if not (reopened.commands.run("printf 'same-owner'").stdout == 'same-owner'):
+                raise AssertionError()
         finally:
             reopened.close()
         Sandbox.delete(named_id, connection=connection)
@@ -126,7 +131,8 @@ def run(connection, image, output):
         reopened = Sandbox.from_id(attached_id, connection=connection)
         try:
             result = reopened.commands.run("printf 'close-preserved'")
-            assert result.exit_code == 0 and result.stdout == 'close-preserved'
+            if not (result.exit_code == 0 and result.stdout == 'close-preserved'):
+                raise AssertionError()
         finally:
             reopened.close()
         # A handle obtained through from_id is detached from ownership by
@@ -150,7 +156,8 @@ def run(connection, image, output):
         ) as context_environment:
             context_id = context_environment.id
             remaining.add(context_id)
-            assert context_environment.is_running()
+            if not (context_environment.is_running()):
+                raise AssertionError()
         remaining.remove(context_id)
         _wait_deleted(context_id, connection)
         passed('lifecycle.context-manager-deletes', started)
@@ -168,7 +175,8 @@ def run(connection, image, output):
         )
         idle_id = idle.id
         remaining.add(idle_id)
-        assert idle.commands.run("printf 'idle-start'").stdout == 'idle-start'
+        if not (idle.commands.run("printf 'idle-start'").stdout == 'idle-start'):
+            raise AssertionError()
         idle.close()
         _wait_deleted(idle_id, connection)
         remaining.remove(idle_id)
@@ -185,13 +193,16 @@ def run(connection, image, output):
         child = json.loads(child_evidence.read_text())
         background_id = child['instance_id']
         remaining.add(background_id)
-        assert child['command_running_before_exit']
+        if not (child['command_running_before_exit']):
+            raise AssertionError()
         # The separate SDK process has exited, but its 120-second command has
         # not. The 90-second wait proves idle cleanup does not wait for it.
         _wait_deleted(background_id, connection, timeout=90)
         remaining.remove(background_id)
         from node import catalog
-        assert 'environment:' + background_id not in catalog()
+
+        if not ('environment:' + background_id not in catalog()):
+            raise AssertionError()
         checks['idle_background_client_exit'] = background_id
         passed('lifecycle.idle-with-background-command-after-client-exit', started)
 
@@ -203,4 +214,4 @@ def run(connection, image, output):
             try:
                 Sandbox.delete(instance_id, connection=connection)
             except Exception:
-                pass
+                logging.getLogger(__name__).debug("Best-effort operation failed", exc_info=True)

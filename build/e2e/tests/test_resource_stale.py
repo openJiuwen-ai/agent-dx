@@ -2,13 +2,12 @@
 
 import importlib.util
 import json
-from pathlib import Path
 import sys
 import tempfile
 import types
 import unittest
+from pathlib import Path
 from unittest.mock import patch
-
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -16,10 +15,8 @@ ROOT = Path(__file__).resolve().parents[1]
 class ResourceStaleScenarioTests(unittest.TestCase):
     def test_rejects_stale_allocation_then_reopens_without_replacing_live_backend(self):
         records = {
-            'node:node1': {'node': {'available': True},
-                           'session': {'id': 'session-one', 'routable': True}},
-            'node:node2': {'node': {'available': True},
-                           'session': {'id': 'session-two', 'routable': True}},
+            'node:node1': {'node': {'available': True}, 'session': {'id': 'session-one', 'routable': True}},
+            'node:node2': {'node': {'available': True}, 'session': {'id': 'session-two', 'routable': True}},
         }
         backends = {}
         deleted = []
@@ -36,13 +33,11 @@ class ResourceStaleScenarioTests(unittest.TestCase):
                 backends[self.id] = 'backend-' + self.id
                 records['environment:' + self.id] = {
                     'assignment': {'node_id': 'node1'},
-                    'result': {'state': 'Running', 'runtime': {'id': 'runtime-' + self.id},
-                               'resources_held': True},
+                    'result': {'state': 'Running', 'runtime': {'id': 'runtime-' + self.id}, 'resources_held': True},
                 }
 
             def run(self, command):
-                return types.SimpleNamespace(exit_code=0,
-                                             stdout=command.removeprefix('printf '))
+                return types.SimpleNamespace(exit_code=0, stdout=command.removeprefix('printf '))
 
             def close(self):
                 pass
@@ -66,13 +61,11 @@ class ResourceStaleScenarioTests(unittest.TestCase):
             'node': types.SimpleNamespace(
                 catalog=lambda: {key: json.dumps(value) for key, value in records.items()},
                 backend=lambda: sorted(backends.values()),
-                labeled_backend=lambda instance_id: (
-                    [backends[instance_id]] if instance_id in backends else []),
+                labeled_backend=lambda instance_id: [backends[instance_id]] if instance_id in backends else [],
                 persisted_runtime_id=lambda result: result['runtime']['id'],
             ),
         }
-        spec = importlib.util.spec_from_file_location('resource_stale_case',
-                                                      ROOT / 'resource_stale.py')
+        spec = importlib.util.spec_from_file_location('resource_stale_case', ROOT / 'resource_stale.py')
         scenario = importlib.util.module_from_spec(spec)
         with patch.dict(sys.modules, modules):
             spec.loader.exec_module(scenario)
@@ -90,13 +83,15 @@ class ResourceStaleScenarioTests(unittest.TestCase):
             records['node:node1']['node']['available'] = True
             (evidence / 'resource-stale.json').write_text(json.dumps({'seconds': 12.0}))
             (evidence / 'resource-fresh.json').write_text(json.dumps({'seconds': 2.0}))
-            report = scenario.verify(object(), 'test-image', evidence,
-                                     evidence / 'resource-result.json')
+            report = scenario.verify(object(), 'test-image', evidence, evidence / 'resource-result.json')
             self.assertEqual(report['status'], 'passed')
-            self.assertEqual([case['id'] for case in report['cases']], [
-                'reliability.resource-stale-admission',
-                'reliability.resource-observation-recovery',
-            ])
+            self.assertEqual(
+                [case['id'] for case in report['cases']],
+                [
+                    'reliability.resource-stale-admission',
+                    'reliability.resource-observation-recovery',
+                ],
+            )
             self.assertEqual(sorted(deleted), ['instance-1', 'instance-2'])
             self.assertEqual(backends, {})
 

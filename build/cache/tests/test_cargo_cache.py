@@ -1,9 +1,23 @@
 import importlib.util
-from pathlib import Path
+import os
+import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+from pathlib import Path
+
+
+def _executable(name, environment=None, cwd=None):
+    """Resolve an external command using the child's execution environment."""
+    directory = os.getcwd() if cwd is None else os.path.abspath(cwd)
+    search_path = os.pathsep.join(
+        os.path.abspath(os.path.join(directory, entry)) for entry in os.get_exec_path(environment)
+    )
+    executable = shutil.which(name, path=search_path)
+    if executable is None:
+        raise FileNotFoundError(f"required executable not found: {name}")
+    return os.path.abspath(executable)
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "cargo_cache.py"
@@ -29,13 +43,26 @@ class CargoCacheTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp) / "source"
             linked = Path(temp) / "feature"
-            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            subprocess.run([_executable("git"), "init", "-q", str(root)], check=True)
             subprocess.run(
-                ["git", "-C", str(root), "-c", "user.name=Test", "-c", "user.email=test@example.com",
-                 "commit", "--allow-empty", "-qm", "initial"],
+                [
+                    _executable("git"),
+                    "-C",
+                    str(root),
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.com",
+                    "commit",
+                    "--allow-empty",
+                    "-qm",
+                    "initial",
+                ],
                 check=True,
             )
-            subprocess.run(["git", "-C", str(root), "worktree", "add", "-q", "-b", "feature", str(linked)], check=True)
+            subprocess.run(
+                [_executable("git"), "-C", str(root), "worktree", "add", "-q", "-b", "feature", str(linked)], check=True
+            )
             rustc = Path(temp) / "rustc"
             rustc.write_text("#!/bin/sh\nprintf '%s\\n' 'host: aarch64-apple-darwin' 'release: 1.95.0'\n")
             rustc.chmod(0o755)

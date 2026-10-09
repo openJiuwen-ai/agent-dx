@@ -1,7 +1,7 @@
 import importlib.util
-from pathlib import Path
 import tempfile
 import unittest
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location('local_cgroups_driver', ROOT / 'run.py')
@@ -33,9 +33,9 @@ class LocalCgroupTests(unittest.TestCase):
             self.assertEqual((owned / 'occupied').read_text(), 'do not delete')
 
     def test_limits_follow_container_membership_in_host_namespace(self):
-        spec = importlib.util.spec_from_file_location('cgroup_limits', ROOT / 'cgroup_limits.py')
-        limits = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(limits)
+        spec_local = importlib.util.spec_from_file_location('cgroup_limits', ROOT / 'cgroup_limits.py')
+        limits = importlib.util.module_from_spec(spec_local)
+        spec_local.loader.exec_module(limits)
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             own = root / 'system.slice/docker-test.scope'

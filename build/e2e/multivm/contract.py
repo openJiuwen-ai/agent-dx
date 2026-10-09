@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Machine-readable acceptance contract for a pre-provisioned ADX three-VM run."""
+
 from __future__ import annotations
 
-import re
 import hashlib
-import json
 import ipaddress
+import json
+import re
 
 REQUIRED = (
     'l0',
