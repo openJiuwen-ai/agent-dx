@@ -235,44 +235,63 @@ def required_log_services(node):
     return services
 
 
+def has_execd_http_context(rows):
+    routes = {'POST /invoke', 'POST /upload', 'GET /download', 'GET /pty', 'GET /commands/watch'}
+    return any(
+        span.get('service') == 'adx-execd'
+        and span.get('name') in routes
+        and span.get('parentSpanId', '').strip('0')
+        and any(attr['key'] == 'http.route' for attr in span.get('attributes', []))
+        for span in rows
+    )
+
+
+def complete_create_trace_ids(rows):
+    stages = {
+        'coordinator.create_environment', 'node.create_environment', 'environment.queue',
+        'environment.execute', 'coordinator.commit_environment',
+    }
+    groups = {}
+    for span in rows:
+        groups.setdefault(span['traceId'], []).append(span)
+    complete = []
+    for trace_id, spans in groups.items():
+        if not stages <= {span['name'] for span in spans}:
+            continue
+        http = [
+            span for span in spans
+            if span.get('service') == 'adx-apiserver'
+            and span['name'] == 'POST /api/sandbox/v1/sandboxes'
+        ]
+        ids = {span['spanId'] for span in http}
+        if len(ids) >= 2 and any(span.get('parentSpanId') in ids for span in http):
+            complete.append(trace_id)
+    return complete
+
+
 def validate_traces(node):
     rows = trace_records()
     count = check_trace_links(rows)
     services = {s['service'] for s in rows}
     if 'adxlet' not in services:
         raise AssertionError(services)
-    if not (any(s['name'] == 'execd.http' and s.get('parentSpanId', '').strip('0') for s in rows)):
+    if not has_execd_http_context(rows):
         raise AssertionError('EXECD did not receive data request context')
     trace_ids = []
     if node == 'node1':
-        names = {
-            'ingress.http',
-            'apiserver.http',
-            'coordinator.create_environment',
-            'node.create_environment',
-            'environment.queue',
-            'environment.execute',
-            'coordinator.commit_environment',
-        }
-        groups = {}
-        for span in rows:
-            groups.setdefault(span['traceId'], set()).add(span['name'])
-        trace_ids = [key for key, value in groups.items() if names <= value]
-        if not (trace_ids):
+        trace_ids = complete_create_trace_ids(rows)
+        if not trace_ids:
             raise AssertionError('no complete Ingress/API/Coordinator/Node/state-commit creation trace')
-        if not (any(s['name'] == 'node.delete_environment' for s in rows)):
+        if not any(s['name'] == 'node.delete_environment' for s in rows):
             raise AssertionError('delete trace missing')
     result = {
-        'status': 'passed',
-        'span_count': len(rows),
-        'services': sorted(services),
-        'environment_executions': count,
-        'complete_create_trace_ids': trace_ids,
+        'status': 'passed', 'span_count': len(rows), 'services': sorted(services),
+        'environment_executions': count, 'complete_create_trace_ids': trace_ids,
         'execd_context_received': True,
     }
     (E / f'traces-{node}.json').write_text(json.dumps(result, indent=2))
     print(
-        (f'[TRACE PASS] {node}: {len(rows)} spans; {count} queue/execution parent links; EXECD context received'),
+        f'[TRACE PASS] {node}: {len(rows)} spans; {count} queue/execution parent links; EXECD context received',
         flush=True,
     )
 

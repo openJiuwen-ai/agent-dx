@@ -11,6 +11,9 @@ pub struct Discovery {
 fn poll() -> u64 {
     2
 }
+fn unknown_create_retention() -> u64 {
+    600
+}
 #[derive(Clone, Copy, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CreateMode {
@@ -50,6 +53,8 @@ pub struct Config {
     pub server_name: String,
     pub rpc_timeout_seconds: u64,
     pub cache_entries: usize,
+    #[serde(default = "unknown_create_retention")]
+    pub create_unknown_retention_seconds: u64,
     pub auth_cache_ttl_seconds: u64,
     #[serde(default)]
     pub agent_address: String,
@@ -69,6 +74,7 @@ impl Config {
             || self.rpc_timeout_seconds == 0
             || self.auth_cache_ttl_seconds == 0
             || self.cache_entries == 0
+            || self.create_unknown_retention_seconds == 0
             || self.discovery.as_ref().is_some_and(|d| d.poll_seconds == 0)
         {
             return Err("positive RPC/cache bounds, TLS name and exactly one Coordinator discovery source required".into());

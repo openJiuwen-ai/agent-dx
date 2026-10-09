@@ -22,13 +22,15 @@ API Server 通过 `EnvironmentDirectoryService.WatchEnvironments` 维护完整�
 
 实现与本地验收证据见 [实例目录订阅验收](2026-09-18-environment-directory.md)。
 
-目录未完成首次同步时，依赖本地目录的请求返回暂不可用；Reload 独立查询 Coordinator。已同步目录中的缺失项是确定的 NotFound，不触发逐项 Redis 查询。实例目录与 Ingress 路由缓存分开：前者包含仍可查询或操作的活跃归属，Coordinator 通过目录 delete 增量移除已删除项；后者只发布可路由的 Running 实例。Redis 主目录也会在删除提交时移除完整记录，仅保留带 TTL 的最小删除回执。重复操作的存储幂等由 Coordinator 与 adxlet 状态机负责，API Server 不长期缓存已删除记录。
+目录未完成首次同步时，依赖本地目录的请求返回暂不可用；Reload 独立查询 Coordinator。已同步目录中的缺失项是确定的 NotFound，不触发逐项 Redis 查询。实例目录与 Ingress 路由缓存分开：前者包含仍可查询或操作的活跃归属，Coordinator 通过目录 delete 增量移除已删除项；API Server 收到已发布、资源已释放的 Deleted 操作结果时，也立即按 generation/revision 移除旧归属，不等待订阅增量。迟到的旧删除结果不能移除同名的新 generation；后者只发布可路由的 Running 实例。Redis 主目录也会在删除提交时移除完整记录，仅保留带 TTL 的最小删除回执。重复操作的存储幂等由 Coordinator 与 adxlet 状态机负责，API Server 不长期缓存已删除记录。
 
 正在等待确认的删除固定其目标，不因刷新或缓存淘汰更换目标；待确认操作达到上限时拒绝新的删除。已完成操作由节点的状态机与持久化结果处理重复调用。这些待确认记录仅在 API Server 内存中，不提供 API Server 重启后找回未确认操作的承诺。
 
 ### Reload 缓存落后回归
 
 `gateway/apiserver/tests/reload.rs` 使用真实 TCP/gRPC 和可控 Coordinator／Node 服务，刻意不发布目录增量，让缓存 revision 为 2、已提交 revision 为 3。用例验证 Reload 获取最新版本后执行，同一操作 ID 再次调用保留原 expected revision；Coordinator 查询不可用时不向节点执行 Reload，普通删除仍使用本地归属。运行入口为 `cargo test --locked -p adx-apiserver --test reload`。这组用例验证 API Server 的 RPC 协作契约，不代替真实 sandboxd checkpoint／恢复端到端验收。
+
+创建请求的在途／未知身份与已完成响应分开管理；完成响应保留 600 秒，容量满时淘汰旧完成项，不因 `cache_entries` 满而拒绝新创建。未知请求在保留窗口内复用原身份查询／重试，不按完成缓存容量淘汰；`create_unknown_retention_seconds` 默认 600 秒，过期后由周期 GC 直接回收请求上下文，不查询或修改 Environment。执行中及共享身份的等待请求不被 GC。生命周期操作的在途／未知身份同样不按 `cache_entries` 拒绝新操作；无恢复点的 Reload 失败不能阻止后续删除。创建重放缓存、删除目录及 PTY 关闭的定向修复与验证边界见 [创建重放与 PTY 关闭](create-replay-and-pty-close.md)。
 
 ## HTTP 兼容与支持范围
 

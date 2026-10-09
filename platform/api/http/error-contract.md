@@ -65,6 +65,12 @@ SSE 创建的 `final` 事件保留 `errorCode` 数值字段，并携带同一个
 
 同一个 gRPC 状态可能映射成不同稳定码。例如 `Unavailable` 在写请求尚未提交时是 `UNAVAILABLE`，在 Adxlet 已经接受创建或生命周期操作后是 `OUTCOME_UNKNOWN`。API Server 根据请求是否越过执行边界作出映射；SDK 不重新猜测。
 
+### 创建重放缓存
+
+生命周期操作的重试身份表不以 `cache_entries` 为准入限制，不会因为保留的操作记录多而返回 429；实际节点资源或准入拒绝仍按原错误契约处理。
+
+API Server 的已完成创建响应使用 600 秒 TTL 与 `cache_entries` 容量淘汰；缓存满只淘汰旧完成项，不产生 `RESOURCE_EXHAUSTED`。正在执行和结果未知的请求保留同一租户、Request ID、Environment ID 与规格，不受完成缓存容量限制。结果未知的重试在保留窗口内查询权威归属，或以原身份进入原子创建链路；不会仅凭传输超时将 Environment 标为 Failed 或释放节点预留。未知上下文的 `create_unknown_retention_seconds` 默认 600 秒，从首次未知结果计时，不因未决重试续期；到期后周期 GC 直接回收，不查询权威状态，执行中或仍有共享身份等待的请求不回收。GC 不改变 Environment 或资源状态。完成响应过期、淘汰、未知请求 GC 或进程重启后，重试按当前 Environment 状态处理，不再保证历史请求去重或参数绑定。
+
 ### sandboxd Start 失败
 
 adxlet 未获得有效 Start 成功结果（失败、超时、应答丢失或无效载荷）时，将 Environment 创建判定为 `Failed`，不会重复启动同一执行，也不会把迟到后端接纳为成功实例。创建进入 Failed 即释放本机标量资源和 GPU/NPU 预留，并在清理之前提交 `resources_held=false`；查询、删除失败或清理超时不阻止资源释放。Failed 控制器独立重试清理迟到执行及补写未发布结果。节点重启按权威目录对账。

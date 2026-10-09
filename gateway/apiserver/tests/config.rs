@@ -71,3 +71,18 @@ fn apiserver_defaults_to_embedded_ingress() {
     let standalone: Config = serde_json::from_value(standalone).unwrap();
     standalone.validate().unwrap();
 }
+
+#[test]
+fn unknown_create_retention_is_positive_and_configurable() {
+    let mut value = base();
+    value["ingress_mode"] = json!("standalone");
+    let defaults: Config = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(defaults.create_unknown_retention_seconds, 600);
+    value["create_unknown_retention_seconds"] = json!(1);
+    let config: Config = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(config.create_unknown_retention_seconds, 1);
+    config.validate().unwrap();
+    value["create_unknown_retention_seconds"] = json!(0);
+    let config: Config = serde_json::from_value(value).unwrap();
+    assert!(config.validate().is_err());
+}

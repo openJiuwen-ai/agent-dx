@@ -3,6 +3,7 @@ use crate::{
     clients::{authorize, Clients},
     contract,
     operations::{Kind, Operations},
+    ownership::Cache,
 };
 use adx_protocol::control as pb;
 use serde_json::{json, Value};
@@ -21,25 +22,81 @@ struct CreateOperation {
     digest: Vec<u8>,
     spec: pb::EnvironmentSpec,
     result: Option<Result<Value, Status>>,
-    touched: Instant,
+    created_at: Instant,
+    unknown_since: Option<Instant>,
+}
+
+type SharedCreate = Arc<Mutex<CreateOperation>>;
+
+struct CreateReplays {
+    pending: HashMap<CreateKey, SharedCreate>,
+    completed: Cache<CreateKey, SharedCreate>,
+}
+
+impl CreateReplays {
+    fn expire_pending(&mut self, now: Instant, retention: Duration) -> Vec<(String, CreateKey)> {
+        let mut expired = Vec::new();
+        self.pending.retain(|key, shared| {
+            // A caller may already have obtained this identity and be waiting
+            // for its operation lock. Keep that identity until callers finish.
+            if Arc::strong_count(shared) > 1 {
+                return true;
+            }
+            let Ok(operation) = shared.try_lock() else {
+                return true;
+            };
+            let since = operation.unknown_since.unwrap_or(operation.created_at);
+            if now.saturating_duration_since(since) < retention {
+                return true;
+            }
+            // created_at also bounds contexts abandoned by a cancelled caller,
+            // whose future never reached finish_create. No backend state changes.
+            expired.push((operation.spec.id.clone(), key.clone()));
+            false
+        });
+        expired
+    }
 }
 
 /// Owns Sandbox lifecycle semantics independently of any transport adapter.
 pub struct SandboxService {
     clients: Arc<Clients>,
     operations: Operations,
-    creates: Mutex<HashMap<CreateKey, Arc<Mutex<CreateOperation>>>>,
+    creates: Mutex<CreateReplays>,
     names: Mutex<HashMap<String, CreateKey>>,
 }
 
 impl SandboxService {
     pub fn new(clients: Arc<Clients>) -> Arc<Self> {
-        Arc::new(Self {
+        let retention = Duration::from_secs(clients.config.create_unknown_retention_seconds);
+        let period = retention.min(Duration::from_secs(60));
+        let service = Arc::new(Self {
             operations: Operations::new(clients.clone()),
+            creates: Mutex::new(CreateReplays {
+                pending: HashMap::new(),
+                completed: Cache::new(clients.config.cache_entries),
+            }),
             clients,
-            creates: Mutex::default(),
             names: Mutex::default(),
-        })
+        });
+        let weak = Arc::downgrade(&service);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(period).await;
+                let Some(service) = weak.upgrade() else {
+                    break;
+                };
+                let mut creates = service.creates.lock().await;
+                let expired = creates.expire_pending(Instant::now(), retention);
+                let mut names = service.names.lock().await;
+                for (id, key) in expired {
+                    if names.get(&id) == Some(&key) {
+                        names.remove(&id);
+                    }
+                }
+            }
+        });
+        service
     }
 
     pub async fn execute(
@@ -88,31 +145,27 @@ impl SandboxService {
             serde_json::to_vec(&input).expect("serde_json::Value serialization is infallible"),
         )
         .to_vec();
-        let operation = {
+        let (operation, retry_pending) = {
             let mut creates = self.creates.lock().await;
-            creates.retain(|_, operation| {
-                operation.try_lock().map_or(true, |operation| {
-                    operation.result.is_none()
-                        || operation.touched.elapsed() < Duration::from_secs(600)
-                })
-            });
-            if let Some(operation) = creates.get(&create_key) {
-                operation.clone()
+            if let Some(operation) = creates.pending.get(&create_key) {
+                (operation.clone(), true)
+            } else if let Some(operation) = creates.completed.get(&create_key) {
+                (operation, false)
             } else {
-                if creates.len() >= self.clients.config.cache_entries {
-                    return Err(Status::resource_exhausted("create replay budget exhausted"));
-                }
                 let operation = Arc::new(Mutex::new(CreateOperation {
                     digest: request_digest.clone(),
                     spec,
                     result: None,
-                    touched: Instant::now(),
+                    created_at: Instant::now(),
+                    unknown_since: None,
                 }));
-                creates.insert(create_key.clone(), operation.clone());
-                operation
+                creates
+                    .pending
+                    .insert(create_key.clone(), operation.clone());
+                (operation, false)
             }
         };
-        let mut operation = operation.lock().await;
+        let mut operation = operation.lock_owned().await;
         if operation.digest != request_digest {
             return Err(Status::already_exists(
                 "request ID reused with different arguments",
@@ -135,39 +188,69 @@ impl SandboxService {
             }
         };
         if let Some(competing_key) = competing_create {
-            let other = self.creates.lock().await.get(&competing_key).cloned();
+            let other = {
+                let mut creates = self.creates.lock().await;
+                creates
+                    .pending
+                    .get(&competing_key)
+                    .cloned()
+                    .or_else(|| creates.completed.get(&competing_key))
+            };
             if let Some(other) = other {
                 let other = other.lock().await;
                 if !matches_spec(&operation.spec, &other.spec) {
-                    return Err(Status::already_exists(
+                    let result = Err(Status::already_exists(
                         "environment create in progress with different arguments",
                     ));
+                    self.finish_create(&create_key, &mut operation, &result)
+                        .await;
+                    return result;
                 }
             }
             let result = self
                 .reuse_existing(&operation.spec, &input, request_id, caller)
                 .await;
-            if !result.as_ref().is_err_and(|error| {
-                matches!(error.code(), Code::Unavailable | Code::DeadlineExceeded)
-            }) {
-                operation.result = Some(result.clone());
-            }
-            operation.touched = Instant::now();
+            self.finish_create(&create_key, &mut operation, &result)
+                .await;
             return result;
         }
         let result = self
-            .perform_create(&operation.spec, &input, request_id, caller)
+            .perform_create(&operation.spec, &input, request_id, caller, retry_pending)
             .await;
         self.names.lock().await.remove(&operation.spec.id);
-        // An uncertain result is retryable only through this retained spec/ID.
-        if !result
-            .as_ref()
-            .is_err_and(|error| matches!(error.code(), Code::Unavailable | Code::DeadlineExceeded))
-        {
-            operation.result = Some(result.clone());
-        }
-        operation.touched = Instant::now();
+        self.finish_create(&create_key, &mut operation, &result)
+            .await;
         result
+    }
+
+    async fn finish_create(
+        &self,
+        key: &CreateKey,
+        operation: &mut CreateOperation,
+        result: &Result<Value, Status>,
+    ) {
+        // Unknown outcomes retain their identity for a finite retry window.
+        // Repeated inconclusive retries do not renew that window.
+        if result.as_ref().is_err_and(|error| {
+            matches!(
+                error.code(),
+                Code::Cancelled
+                    | Code::Unknown
+                    | Code::Unavailable
+                    | Code::DeadlineExceeded
+                    | Code::Internal
+            )
+        }) {
+            operation.unknown_since.get_or_insert_with(Instant::now);
+            return;
+        }
+        operation.result = Some(result.clone());
+        let mut creates = self.creates.lock().await;
+        if let Some(shared) = creates.pending.remove(key) {
+            creates
+                .completed
+                .insert(key.clone(), shared, Duration::from_secs(600));
+        }
     }
 
     async fn perform_create(
@@ -176,8 +259,11 @@ impl SandboxService {
         input: &Value,
         request_id: &str,
         caller: &pb::CallerContext,
+        retry_pending: bool,
     ) -> Result<Value, Status> {
-        match self.clients.owner(&spec.id, caller, false).await {
+        // A pending retry bypasses a potentially stale subscription. Absence
+        // still retries the same identity through atomic ownership, never a new ID.
+        match self.clients.owner(&spec.id, caller, retry_pending).await {
             Ok(owner) => {
                 let record = owner
                     .record
@@ -374,6 +460,66 @@ fn matches_spec(want: &pb::EnvironmentSpec, got: &pb::EnvironmentSpec) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unknown_gc_preserves_waiters_and_collects_abandoned_contexts() {
+        let now = Instant::now();
+        let old = now - Duration::from_secs(30);
+        let key = ("tenant".into(), "request".into());
+        let operation = Arc::new(Mutex::new(CreateOperation {
+            digest: Vec::new(),
+            spec: pb::EnvironmentSpec {
+                id: "environment".into(),
+                ..Default::default()
+            },
+            result: None,
+            created_at: old,
+            unknown_since: None,
+        }));
+        let mut replays = CreateReplays {
+            pending: HashMap::from([(key.clone(), operation.clone())]),
+            completed: Cache::new(1),
+        };
+        // A retry has taken a shared identity but has not acquired its lock yet.
+        assert!(replays
+            .expire_pending(now, Duration::from_secs(10))
+            .is_empty());
+        drop(operation);
+        assert_eq!(
+            replays.expire_pending(now, Duration::from_secs(10)),
+            vec![("environment".into(), key)]
+        );
+        assert!(replays.pending.is_empty());
+    }
+
+    #[test]
+    fn unknown_retention_starts_at_first_unknown_result() {
+        let now = Instant::now();
+        let key = ("tenant".into(), "request".into());
+        let mut replays = CreateReplays {
+            pending: HashMap::from([(
+                key.clone(),
+                Arc::new(Mutex::new(CreateOperation {
+                    digest: Vec::new(),
+                    spec: pb::EnvironmentSpec {
+                        id: "environment".into(),
+                        ..Default::default()
+                    },
+                    result: None,
+                    created_at: now - Duration::from_secs(30),
+                    unknown_since: Some(now),
+                })),
+            )]),
+            completed: Cache::new(1),
+        };
+        assert!(replays
+            .expire_pending(now, Duration::from_secs(10))
+            .is_empty());
+        assert_eq!(
+            replays.expire_pending(now + Duration::from_secs(10), Duration::from_secs(10)),
+            vec![("environment".into(), key)]
+        );
+    }
 
     #[test]
     fn existing_running_name_converges_only_for_identical_spec() {

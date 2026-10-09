@@ -17,6 +17,7 @@ services:
       server_name: adx.internal
       rpc_timeout_seconds: 90
       cache_entries: 10000
+      create_unknown_retention_seconds: 600
       auth_cache_ttl_seconds: 10
       agent_address: ''
       loopback_http: true

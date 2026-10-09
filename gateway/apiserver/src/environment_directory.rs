@@ -127,7 +127,17 @@ impl EnvironmentDirectory {
                 return Ok(());
             }
         }
-        self.entries.insert(id, value);
+        let retired = value.record.as_ref().is_some_and(|record| {
+            record.state == pb::EnvironmentState::Deleted as i32 && !record.resources_held
+        });
+        if retired {
+            // A confirmed delete releases the name immediately, even when its
+            // watch deletion arrived before this targeted RPC result. The
+            // version check above protects a concurrently recreated generation.
+            self.entries.remove(&id);
+        } else {
+            self.entries.insert(id, value);
+        }
         Ok(())
     }
 }
@@ -251,6 +261,63 @@ mod tests {
             upserts,
             deleted: deleted.into_iter().map(str::to_owned).collect(),
         }
+    }
+
+    #[test]
+    fn confirmed_delete_removes_the_old_name_without_waiting_for_watch() {
+        let mut directory = EnvironmentDirectory::default();
+        directory
+            .update(frame(7, 10, 0, true, vec![entry("one", 1, 1)], vec![]))
+            .unwrap();
+        let mut deleted = entry("one", 1, 2);
+        deleted.record.as_mut().unwrap().state = pb::EnvironmentState::Deleted as i32;
+        deleted.record.as_mut().unwrap().resources_held = false;
+        directory.put(response(deleted).unwrap().1).unwrap();
+        assert_eq!(
+            directory.get("one").unwrap_err().code(),
+            tonic::Code::NotFound
+        );
+        assert!(directory.entries.is_empty());
+    }
+
+    #[test]
+    fn late_delete_result_never_removes_a_newer_generation() {
+        let mut directory = EnvironmentDirectory::default();
+        directory
+            .update(frame(7, 10, 0, true, vec![entry("one", 2, 1)], vec![]))
+            .unwrap();
+        let mut deleted = entry("one", 1, 99);
+        deleted.record.as_mut().unwrap().state = pb::EnvironmentState::Deleted as i32;
+        deleted.record.as_mut().unwrap().resources_held = false;
+        directory.put(response(deleted).unwrap().1).unwrap();
+        assert_eq!(
+            directory
+                .get("one")
+                .unwrap()
+                .record
+                .unwrap()
+                .assignment
+                .unwrap()
+                .generation,
+            2
+        );
+    }
+
+    #[test]
+    fn delete_result_after_watch_removal_does_not_reinsert_old_ownership() {
+        let mut directory = EnvironmentDirectory::default();
+        directory
+            .update(frame(7, 10, 0, true, vec![], vec![]))
+            .unwrap();
+        let mut deleted = entry("one", 1, 2);
+        deleted.record.as_mut().unwrap().state = pb::EnvironmentState::Deleted as i32;
+        deleted.record.as_mut().unwrap().resources_held = false;
+        directory.put(response(deleted).unwrap().1).unwrap();
+        assert_eq!(
+            directory.get("one").unwrap_err().code(),
+            tonic::Code::NotFound
+        );
+        assert!(directory.entries.is_empty());
     }
 
     #[test]
