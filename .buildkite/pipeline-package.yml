@@ -310,6 +310,60 @@ steps:
     GOMODCACHE: /mnt/paas/build-cache/adx/go-mod
     ADX_BACKEND_ARTIFACT_BUILD: 01a0ad6d-9629-4da8-903b-3f8bd1ddc992
   plugins: *id001
+- label: ':rust: ARM64 tests, package and install smoke'
+  key: platform-build-arm64
+  depends_on:
+  - sdk-package
+  - admin-package
+  - source-gate
+  agents:
+    queue: default
+    os: macos
+    arch: arm64
+  concurrency: 1
+  concurrency_group: adx/package-arm64
+  command: bash .buildkite/build-arm-package.sh
+  timeout_in_minutes: 90
+  artifact_paths:
+  - out/buildkite/arm64/logs/**/*
+  - out/buildkite/arm64/*.tar.gz
+  - out/buildkite/arm64/*.sha256
+  - out/buildkite/arm64/*manifest.json
+  - out/buildkite/arm64/obs/*
+  - out/buildkite/arm64/sdk/*
+  - out/buildkite/arm64/admin/*
+  env:
+    JOBS: '4'
+- label: ':cloud: Publish ARM64 packages to OBS'
+  key: publish-arm64
+  depends_on: platform-build-arm64
+  agents:
+    queue: default
+    os: linux
+    arch: amd64
+  command: bash .buildkite/step.sh obs-arm64 bash .buildkite/publish-arm-package.sh
+  timeout_in_minutes: 20
+  artifact_paths:
+  - out/buildkite/arm64/obs/*
+  - out/buildkite/logs/**/*
+  env:
+    BUILDKITE_AGENT_NAME: agent-stack-k8s
+  plugins: *id001
+- label: ':page_facing_up: ARM64 artifact manifest'
+  key: artifact-manifest-arm64
+  depends_on: publish-arm64
+  agents:
+    queue: default
+    os: linux
+    arch: amd64
+  command: bash .buildkite/artifact-manifest.sh
+  timeout_in_minutes: 5
+  artifact_paths:
+  - out/buildkite/index-arm64.html
+  env:
+    ADX_BUILD_ARCH: arm64
+    BUILDKITE_AGENT_NAME: agent-stack-k8s
+  plugins: *id001
 - label: ':page_facing_up: Artifact manifest'
   key: artifact-manifest
   depends_on: platform-build

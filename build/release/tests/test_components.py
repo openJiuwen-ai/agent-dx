@@ -128,6 +128,31 @@ class ComponentManifestTests(unittest.TestCase):
                     backend_archive=backend_archive,
                 )
 
+    def test_arm_release_without_external_backend_is_explicit_and_verified(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name in component.COMPONENTS:
+                directory = self.write_component(root / 'components', name)
+                component.create_manifest(name, directory, 'c' * 40, 'aarch64-unknown-linux-gnu')
+            package = root / 'release-manifest.json'
+            package.write_text(json.dumps({'commit': 'c' * 40, 'target': 'aarch64-unknown-linux-gnu'}))
+            archive = root / 'adx-release.tar.gz'
+            archive.write_bytes(b'release')
+            wheel = root / 'sdk.whl'
+            wheel.write_bytes(b'wheel')
+            args = (root / 'components', 'c' * 40, 'aarch64-unknown-linux-gnu', package, archive, wheel)
+            manifest = component.create_build_manifest(*args, None, None)
+            self.assertIsNone(manifest['backend'])
+            path = root / 'build-manifest.json'
+            path.write_text(json.dumps(manifest))
+            component.verify_build_manifest(path, 'c' * 40, 'aarch64-unknown-linux-gnu', package, archive, wheel, None, None)
+            with self.assertRaises(ValueError):
+                component.create_build_manifest(*args, package, None)
+            manifest['backend'] = {'manifest': {}}
+            path.write_text(json.dumps(manifest))
+            with self.assertRaises(ValueError):
+                component.verify_build_manifest(path, 'c' * 40, 'aarch64-unknown-linux-gnu', package, archive, wheel, None, None)
+
     def test_mixed_component_commits_are_rejected(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

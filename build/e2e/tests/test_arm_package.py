@@ -1,0 +1,116 @@
+"""ARM packaging contracts: native execution and isolated publication."""
+
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import tempfile
+import unittest
+
+import yaml
+
+ROOT = Path(__file__).resolve().parents[3]
+
+
+class ArmPackageTests(unittest.TestCase):
+    def test_arm_is_parallel_and_uses_available_native_worker(self):
+        pipeline = yaml.safe_load((ROOT / '.buildkite/pipeline-package.yml').read_text())
+        steps = {step['key']: step for step in pipeline['steps']}
+        arm = steps['platform-build-arm64']
+        self.assertEqual(arm['agents']['arch'], 'arm64')
+        self.assertEqual(arm['agents']['os'], 'macos')
+        self.assertNotIn('platform-build', arm['depends_on'])
+        self.assertEqual(set(arm['depends_on']), {'sdk-package', 'admin-package', 'source-gate'})
+        self.assertIn('out/buildkite/arm64/*.tar.gz', arm['artifact_paths'])
+        self.assertIn('out/buildkite/arm64/logs/**/*', arm['artifact_paths'])
+        self.assertEqual(steps['artifact-manifest-arm64']['depends_on'], 'publish-arm64')
+        publisher = steps['publish-arm64']
+        self.assertEqual(publisher['depends_on'], 'platform-build-arm64')
+        self.assertEqual(publisher['agents']['arch'], 'amd64')
+        self.assertIn('out/buildkite/arm64/obs/*', publisher['artifact_paths'])
+        publish = (ROOT / '.buildkite/publish-arm-package.sh').read_text()
+        self.assertIn('--step platform-build-arm64', publish)
+        self.assertIn('ADX_BUILD_ARCH=arm64', publish)
+        self.assertNotIn('OBS_ACCESS_KEY_ID', (ROOT / '.buildkite/build-arm-package.sh').read_text())
+
+    def test_architecture_resolves_native_targets_and_rejects_unknown(self):
+        script = ROOT / '.buildkite/build-architecture.sh'
+        command = 'source "$1"; printf "%s %s" "$ADX_RELEASE_TARGET" "$ADX_MUSL_TARGET"'
+        for arch, target in [('amd64', 'x86_64'), ('arm64', 'aarch64')]:
+            result = subprocess.run(
+                ['bash', '-c', command, 'test', str(script)],
+                env=dict(os.environ, ADX_BUILD_ARCH=arch), capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, f'{target}-unknown-linux-gnu {target}-unknown-linux-musl')
+        result = subprocess.run(
+            ['bash', str(script)], env=dict(os.environ, ADX_BUILD_ARCH='invalid'),
+            capture_output=True, text=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_arm_image_and_container_cache_are_isolated(self):
+        config = json.loads((ROOT / 'build/images/build-environment-arm64.json').read_text())
+        self.assertEqual(config['platform'], 'linux/arm64')
+        self.assertRegex(config['source_image'], r'@sha256:[0-9a-f]{64}$')
+        self.assertRegex(config['ci_image'], r'@sha256:[0-9a-f]{64}$')
+        script = (ROOT / '.buildkite/build-arm-package.sh').read_text()
+        for term in [
+            '--platform linux/arm64', 'adx-arm64-cargo-home', 'adx-arm64-cargo-target',
+            'ADX_BUILD_ARCH=arm64', '--step sdk-package', '--step admin-package',
+        ]:
+            self.assertIn(term, script)
+        native = (ROOT / '.buildkite/package-arm-native.sh').read_text()
+        self.assertIn('install.sh', native)
+        self.assertIn('build/release/package.py verify', native)
+        self.assertNotIn('build_backend.py', native)
+
+
+class ArmRunnerTests(unittest.TestCase):
+    def test_container_failure_retains_logs_and_archives_in_arm_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'build/images').mkdir(parents=True)
+            (root / 'build/images/build-environment-arm64.json').write_text(json.dumps({
+                'ci_image': 'registry/builder@sha256:' + 'a' * 64,
+            }))
+            commands = root / 'commands'
+            commands.mkdir()
+            fixtures = {
+                'uname': '#!/bin/bash\necho arm64\n',
+                'git': '#!/bin/bash\nif [[ $1 == rev-parse ]]; then echo "$BUILDKITE_COMMIT"; fi\n',
+                'buildkite-agent': '#!/bin/bash\nexit 0\n',
+                'docker': '''#!/bin/bash
+if [[ $1 == run ]]; then
+  mkdir -p out/buildkite/components
+  echo evidence > out/buildkite/components/execd.tar.gz
+  echo deliberate-container-failure
+  exit 17
+fi
+''',
+            }
+            for name, contents in fixtures.items():
+                file = commands / name
+                file.write_text(contents)
+                file.chmod(0o755)
+            # Avoid selecting the host's installed Docker in this failure fixture.
+            script = (ROOT / '.buildkite/build-arm-package.sh').read_text().replace(
+                'export PATH="/usr/local/bin:/opt/homebrew/bin:$PATH"', ':',
+            )
+            runner = root / 'runner.sh'
+            runner.write_text(script)
+            result = subprocess.run(
+                [shutil.which('bash'), str(runner)], cwd=root,
+                env=dict(
+                    os.environ, PATH=str(commands) + os.pathsep + os.environ['PATH'],
+                    BUILDKITE_COMMIT='b' * 40, BUILDKITE_BUILD_ID='build-test', ADX_OBS_UPLOAD='0',
+                ),
+                capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 17, result.stderr)
+            evidence = root / 'out/buildkite/arm64'
+            self.assertEqual((evidence / 'components/execd.tar.gz').read_text(), 'evidence\n')
+            self.assertIn(
+                'deliberate-container-failure', (evidence / 'logs/step-release-arm64.log').read_text(),
+            )

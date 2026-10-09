@@ -15,7 +15,7 @@ preparation are isolated in `pipeline-maintenance.yml`. The Full E2E job uses a
 mounted target kubeconfig to create a unique `adx-e2e-*` namespace and deletes
 that namespace when the run finishes.
 
-The current formal validation used commit
+The recorded three-pipeline validation used commit
 `a4798032e96a602bd58cc13c1312cd01e67effb3` across all three pipelines:
 [base package #68](https://buildkite.com/agent-dx/agent-dx/builds/68),
 [Python SDK #4](https://buildkite.com/agent-dx/agent-dx-python-sdk/builds/4), and
@@ -31,6 +31,7 @@ Set these variables on a Buildkite build or in that pipeline's environment setti
 | Variable | Default | Applies to / responsibility |
 |---|---|---|
 | `ADX_OBS_UPLOAD` | base `1`, SDK `0` | `0` disables OBS upload for the selected pipeline |
+| `ADX_ARM_OBS_UPLOAD` | inherits `ADX_OBS_UPLOAD` | Base: override only ARM final OBS publication; ARM Buildkite artifacts remain available |
 | `ADX_OBS_UPLOAD_CHANNEL` | `daily` | Base/SDK: `daily` or `release` |
 | `ADX_RELEASE_VERSION` | tag-derived | OBS release path version |
 | `ADX_OBS_BUCKET` / `ADX_OBS_ENDPOINT` | `openyuanrong` / `obs.cn-southwest-2.myhuaweicloud.com` | OBS intermediate transport and final publication destination |
@@ -45,10 +46,45 @@ Boolean controls accept only `0` or `1`. Component transport is independent of
 final publication: `ADX_OBS_UPLOAD=0` still permits intermediate OBS transfers
 when `ADX_ARTIFACT_TRANSPORT=obs`. To build without OBS, select `buildkite` and
 set `ADX_OBS_UPLOAD=0`. Missing OBS credentials or corrupt files fail the job;
-there is no silent transport fallback. Temporary artifacts use
+there is no silent transport fallback. AMD64 temporary artifacts use
 `adx/ci/<build UUID>/<commit>/<component>/`, with commit/build/group and SHA256
 checked before extraction. Configure bucket retention for this temporary prefix
 separately from `adx/daily/` and `adx/release/`.
+
+## Parallel Linux ARM64 packages
+
+The base pipeline runs `platform-build-arm64` alongside the AMD64 build. It uses
+an `os=macos, arch=arm64` worker with Docker to execute native Linux ARM64;
+Docker must be running and the worker must be able to pull the SWR build image.
+`build/images/build-environment-arm64.json` pins the ARM source and ADX builder.
+For build-image maintenance on networks that cannot reach GitHub,
+`ADX_EROFS_SOURCE_ARCHIVE` can point to a downloaded EROFS source archive.
+The build mounts it temporarily and verifies the same pinned SHA256 before use.
+`ADX_REDIS_SOURCE_ARCHIVE` provides the equivalent option for Redis sources.
+The builder supplies Rust 1.95.0, Go 1.25.5, Redis 7.2.5, musl and EROFS 1.8.10.
+Cargo source configuration remains rsproxy sparse. ARM Docker volumes are
+`adx-arm64-cargo-home`, `adx-arm64-cargo-target`, `adx-arm64-go-build` and
+`adx-arm64-go-mod`, separate from AMD64 caches.
+
+The ARM job runs all three Rust component test partitions, builds GNU services
+and static musl Execd, then verifies the release, native ELF architecture, EROFS,
+installer/CLI and Redis startup. It consumes the SDK/adxadmin candidates produced
+by this same build. Its prerequisite jobs are SDK, admin and source gate; it
+does not wait for AMD64 package assembly.
+
+ARM artifacts are stored under `out/buildkite/arm64/`, and published to OBS
+`linux/arm64/`; `artifact-manifest-arm64` produces `index-arm64.html` with links
+and checksums. The `publish-arm64` job runs architecture-independent package
+verification and upload on the existing Linux Kubernetes worker, using its
+`obs-credentials` Secret. The Mac worker only needs SWR pull access. Set
+`ADX_ARM_OBS_UPLOAD=0` to validate ARM packaging without final OBS publication;
+this leaves AMD64 publication unchanged.
+
+The ARM product packages are `adx-release.tar.gz` and `adx-execd.tar.gz`, with
+SHA256 and identity manifests. They use an external ARM sandboxd deployment;
+this job does not copy an AMD64 backend bundle or compile sandboxd. Its build
+manifest explicitly records `backend: null`. Kubernetes L0 continues to verify
+AMD64 in `platform-e2e`; an ARM package/install pass is not ARM Kubernetes E2E.
 
 ## Python test environment
 
