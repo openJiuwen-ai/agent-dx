@@ -1,0 +1,18 @@
+Netid State  Recv-Q Send-Q       Local Address:Port  Peer Address:PortProcess
+udp   UNCONN 0      0               127.0.0.54:53         0.0.0.0:*    users:(("systemd-resolve",pid=463,fd=18))
+udp   UNCONN 0      0            127.0.0.53%lo:53         0.0.0.0:*    users:(("systemd-resolve",pid=463,fd=16))
+udp   UNCONN 0      0      192.168.109.13%eth0:68         0.0.0.0:*    users:(("systemd-network",pid=599,fd=11))
+udp   UNCONN 0      0                  0.0.0.0:4791       0.0.0.0:*
+udp   UNCONN 0      0                  0.0.0.0:5353       0.0.0.0:*    users:(("systemd-resolve",pid=463,fd=11))
+udp   UNCONN 0      0                     [::]:4791          [::]:*
+udp   UNCONN 0      0                     [::]:5353          [::]:*    users:(("systemd-resolve",pid=463,fd=12))
+tcp   LISTEN 0      4096               0.0.0.0:22         0.0.0.0:*    users:(("sshd",pid=1147,fd=3),("systemd",pid=1,fd=173))
+tcp   LISTEN 0      4096         127.0.0.53%lo:53         0.0.0.0:*    users:(("systemd-resolve",pid=463,fd=17))
+tcp   LISTEN 0      4096            127.0.0.54:53         0.0.0.0:*    users:(("systemd-resolve",pid=463,fd=19))
+tcp   LISTEN 0      128                0.0.0.0:18485      0.0.0.0:*    users:(("afs-node",pid=136108,fd=14))
+tcp   LISTEN 0      128                0.0.0.0:18484      0.0.0.0:*    users:(("afs-node",pid=136108,fd=13))
+tcp   LISTEN 0      128                0.0.0.0:18585      0.0.0.0:*    users:(("afs-node",pid=137034,fd=14))
+tcp   LISTEN 0      128                0.0.0.0:18584      0.0.0.0:*    users:(("afs-node",pid=137034,fd=13))
+tcp   LISTEN 0      128                0.0.0.0:18685      0.0.0.0:*    users:(("afs-node",pid=137921,fd=14))
+tcp   LISTEN 0      128                0.0.0.0:18684      0.0.0.0:*    users:(("afs-node",pid=137921,fd=13))
+tcp   LISTEN 0      4096                  [::]:22            [::]:*    users:(("sshd",pid=1147,fd=4),("systemd",pid=1,fd=174))

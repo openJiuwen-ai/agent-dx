@@ -1,0 +1,55 @@
+{
+  "checks": {
+    "tcp": {
+      "bytes": 32,
+      "elapsed_seconds": 0.0017278290033573285,
+      "local": [
+        "192.168.109.12",
+        51027
+      ],
+      "peer": [
+        "192.168.109.13",
+        19566
+      ],
+      "status": "PASS"
+    },
+    "tls": {
+      "bytes": 32,
+      "cipher": "TLS_AES_256_GCM_SHA384",
+      "elapsed_seconds": 0.005484545006765984,
+      "local": [
+        "192.168.109.12",
+        35199
+      ],
+      "peer": [
+        "192.168.109.13",
+        19567
+      ],
+      "server_cert_names": [
+        "192.168.109.13",
+        "afs-env-b"
+      ],
+      "status": "PASS",
+      "tls_version": "TLSv1.3"
+    },
+    "udp": {
+      "bytes": 32,
+      "elapsed_seconds": 0.0001291310036322102,
+      "local": [
+        "192.168.109.12",
+        54271
+      ],
+      "sender": [
+        "192.168.109.13",
+        19566
+      ],
+      "status": "PASS"
+    }
+  },
+  "source_bind": "192.168.109.12",
+  "status": "PASS",
+  "target": "192.168.109.13",
+  "timeout_seconds": 2.0,
+  "token_bytes": 32,
+  "token_sha256": "fc6c47e583eec6e310ca6a8dd2990f6da3b9286216a7b9e7bf6eed0efcae54de"
+}

@@ -1,0 +1,46 @@
+{
+  "observed_at_unix": 1790833466.008178,
+  "hostname": "lima-afs-accept-b",
+  "boot_id": "3adebcd0-cb31-4df0-b18a-e970786ab7fb",
+  "machine_id": "c581e30d9cc847af8a866d69ed374dc7",
+  "processes": [
+    {
+      "pid": 136108,
+      "start_ticks": "6759983",
+      "exe": "/mnt/lima-afsbdata/afs-delivery/repair-v60-b/prefix/bin/afs-node",
+      "exe_sha256": "53da41fb54bcabbfe567bef91096891274ea36b3d28d989dba372fc6940c12ea",
+      "configs": [
+        {
+          "path": "/mnt/lima-afsbdata/afs-delivery/repair-v60-b/etc/node.toml",
+          "sha256": "c85f5faf9d915b7da5c7a17ee9935d811b1c4444bccf52fc600d72ad86126a8e"
+        }
+      ]
+    },
+    {
+      "pid": 137034,
+      "start_ticks": "6881944",
+      "exe": "/mnt/lima-afsbdata/afs-delivery/corrupt-v62-b/prefix/bin/afs-node",
+      "exe_sha256": "6afabb84e1e830c0dca452557c50308b1cabc9f748fc31566fe3525fe1f3ea8f",
+      "configs": [
+        {
+          "path": "/mnt/lima-afsbdata/afs-delivery/corrupt-v62-b/etc/node.toml",
+          "sha256": "bf0f5eb4052f21777d9270b61727de30fc414125ac6b915522873719b75cf4d6"
+        }
+      ]
+    },
+    {
+      "pid": 137921,
+      "start_ticks": "6941537",
+      "exe": "/mnt/lima-afsbdata/afs-delivery/rxe-repair-v62-b/prefix/bin/afs-node",
+      "exe_sha256": "6afabb84e1e830c0dca452557c50308b1cabc9f748fc31566fe3525fe1f3ea8f",
+      "configs": [
+        {
+          "path": "/mnt/lima-afsbdata/afs-delivery/rxe-repair-v62-b/etc/node.toml",
+          "sha256": "fd423d8afb2fe62dfc67a6f88ddde1dbcd6a1964352bc2a78f23fab0b3110389"
+        }
+      ]
+    }
+  ],
+  "mountinfo": "26 32 0:24 / /sys rw,nosuid,nodev,noexec,relatime shared:7 - sysfs sysfs rw\n27 32 0:25 / /proc rw,nosuid,nodev,noexec,relatime shared:13 - proc proc rw\n28 32 0:5 / /dev rw,nosuid,relatime shared:2 - devtmpfs udev rw,size=2974872k,nr_inodes=743718,mode=755,inode64\n29 28 0:26 / /dev/pts rw,nosuid,noexec,relatime shared:3 - devpts devpts rw,gid=5,mode=620,ptmxmode=000\n30 32 0:27 / /run rw,nosuid,nodev,noexec,relatime shared:5 - tmpfs tmpfs rw,size=605372k,mode=755,inode64\n31 26 0:28 / /sys/firmware/efi/efivars rw,nosuid,nodev,noexec,relatime shared:8 - efivarfs efivarfs rw\n32 1 253:1 / / rw,relatime shared:1 - ext4 /dev/vda1 rw,discard,errors=remount-ro,commit=30\n33 26 0:6 / /sys/kernel/security rw,nosuid,nodev,noexec,relatime shared:9 - securityfs securityfs rw\n34 28 0:29 / /dev/shm rw,nosuid,nodev shared:4 - tmpfs tmpfs rw,inode64\n35 30 0:30 / /run/lock rw,nosuid,nodev,noexec,relatime shared:6 - tmpfs tmpfs rw,size=5120k,inode64\n36 26 0:31 / /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime shared:10 - cgroup2 cgroup2 rw,nsdelegate,memory_recursiveprot\n37 26 0:32 / /sys/fs/pstore rw,nosuid,nodev,noexec,relatime shared:11 - pstore pstore rw\n38 26 0:33 / /sys/fs/bpf rw,nosuid,nodev,noexec,relatime shared:12 - bpf bpf rw,mode=700\n39 27 0:34 / /proc/sys/fs/binfmt_misc rw,relatime shared:14 - autofs systemd-1 rw,fd=32,pgrp=1,timeout=0,minproto=5,maxproto=5,direct,pipe_ino=5198\n40 28 0:35 / /dev/hugepages rw,nosuid,nodev,relatime shared:15 - hugetlbfs hugetlbfs rw,pagesize=2M\n41 28 0:22 / /dev/mqueue rw,nosuid,nodev,noexec,relatime shared:16 - mqueue mqueue rw\n42 26 0:7 / /sys/kernel/debug rw,nosuid,nodev,noexec,relatime shared:17 - debugfs debugfs rw\n43 26 0:12 / /sys/kernel/tracing rw,nosuid,nodev,noexec,relatime shared:18 - tracefs tracefs rw\n44 26 0:36 / /sys/fs/fuse/connections rw,nosuid,nodev,noexec,relatime shared:19 - fusectl fusectl rw\n45 26 0:23 / /sys/kernel/config rw,nosuid,nodev,noexec,relatime shared:20 - configfs configfs rw\n47 32 259:0 / /boot rw,relatime shared:30 - ext4 /dev/vda16 rw\n49 47 253:15 / /boot/efi rw,relatime shared:46 - vfat /dev/vda15 rw,fmask=0077,dmask=0077,codepage=437,iocharset=iso8859-1,shortname=mixed,errors=remount-ro\n51 39 0:37 / /proc/sys/fs/binfmt_misc rw,nosuid,nodev,noexec,relatime shared:48 - binfmt_misc binfmt_misc rw\n58 30 0:44 / /run/user/501 rw,nosuid,nodev,relatime shared:178 - tmpfs tmpfs rw,size=605368k,nr_inodes=151342,mode=700,uid=501,gid=1000,inode64\n91 32 253:32 / /mnt/lima-cidata ro,relatime shared:306 - iso9660 /dev/vdc ro,nojoliet,overriderockperm,check=s,map=n,blocksize=2048,uid=0,dmode=700,fmode=700,iocharset=utf8\n100 32 253:17 / /mnt/lima-afsbdata rw,relatime shared:349 - ext4 /dev/vdb1 rw\n92 100 0:48 / /mnt/lima-afsbdata/afs-delivery/repair-v60-b/mount-ownerfs rw,nosuid,nodev,noatime shared:307 - fuse afs-ownerfs rw,user_id=0,group_id=0,default_permissions,allow_other\n361 100 0:49 / /mnt/lima-afsbdata/afs-delivery/repair-v60-b/mount-dfs rw,nosuid,nodev,noatime shared:339 - fuse afs-dfs rw,user_id=0,group_id=0,default_permissions,allow_other\n370 100 0:50 / /mnt/lima-afsbdata/afs-delivery/corrupt-v62-b/mount-ownerfs rw,nosuid,nodev,noatime shared:363 - fuse afs-ownerfs rw,user_id=0,group_id=0,default_permissions,allow_other\n413 100 0:51 / /mnt/lima-afsbdata/afs-delivery/corrupt-v62-b/mount-dfs rw,nosuid,nodev,noatime shared:372 - fuse afs-dfs rw,user_id=0,group_id=0,default_permissions,allow_other\n422 100 0:52 / /mnt/lima-afsbdata/afs-delivery/rxe-repair-v62-b/mount-ownerfs rw,nosuid,nodev,noatime shared:381 - fuse afs-ownerfs rw,user_id=0,group_id=0,default_permissions,allow_other\n431 100 0:53 / /mnt/lima-afsbdata/afs-delivery/rxe-repair-v62-b/mount-dfs rw,nosuid,nodev,noatime shared:390 - fuse afs-dfs rw,user_id=0,group_id=0,default_permissions,allow_other\n",
+  "iptables": "# Generated by iptables-save v1.8.10 (nf_tables) on Thu Oct  1 13:44:26 2026\n*nat\n:PREROUTING ACCEPT [0:0]\n:INPUT ACCEPT [0:0]\n:OUTPUT ACCEPT [0:0]\n:POSTROUTING ACCEPT [0:0]\n:LIMADNS - [0:0]\n-A PREROUTING -j LIMADNS\n-A OUTPUT -j LIMADNS\nCOMMIT\n# Completed on Thu Oct  1 13:44:26 2026\n"
+}

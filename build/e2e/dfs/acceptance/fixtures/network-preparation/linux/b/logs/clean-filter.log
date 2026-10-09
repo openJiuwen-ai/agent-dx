@@ -1,0 +1,5 @@
+Traceback (most recent call last):
+  File "/tmp/afs-v67-clean-filter.py", line 15, in <module>
+    assert sorted(chains)==['FORWARD','INPUT','OUTPUT']
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError

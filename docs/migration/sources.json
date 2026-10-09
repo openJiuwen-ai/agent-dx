@@ -28,6 +28,16 @@
       "version": "0.1.0",
       "version_note": "Imported source pin; ADX releases declare the SDK version in pyproject.toml",
       "tree": "d4b6d234e9b05b51f762ed8a890d8ad77536f3ed"
+    },
+    {
+      "source": "https://github.com/lelezi257/dms",
+      "commit": "1bf02097483539363a158163c682f9b805c15a86",
+      "tested_commit": "808ad739c07b0c6e04d8075376faa72737f4dd44",
+      "tree": "4de2bd77a15cb05e7c7b2c858eba5b8493aefd82",
+      "target": "dfs",
+      "selection": "Whitelisted DMS/AFS source snapshot: product crates, Cargo-bound tests, small fixtures, test support helpers and source license texts. Process evidence, checkpoints, archives, third_party/fuser, GitHub/Codex/OMX metadata and historical logs remain outside this repository.",
+      "component_gate": "Default Agent DX build/test/package/deploy excludes DFS/OwnerFs. Set ADX_WITH_DFS=1 or run the dfs CI suite to exercise the optional component build and tests; set ADX_WITH_DFS=1 for an explicit filesystem release package.",
+      "migration_note": "docs/migration/2026-10-09-dfs-snapshot.md"
     }
   ],
   "protocols": "Imported protobuf structures retained; component environment variables, route keys and branded headers use ADX naming. Frontend go_package imports are local to this module.",

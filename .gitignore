@@ -49,3 +49,6 @@ env/
 
 # Local sandboxd diagnostic output
 /sandboxd.log
+
+# Local verification environments
+/.local/

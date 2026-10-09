@@ -5,6 +5,15 @@ case "${ADX_OBS_UPLOAD:-1}" in
   1) ;;
   *) echo 'ADX_OBS_UPLOAD must be 0 or 1' >&2; exit 2 ;;
 esac
+ADX_WITH_DFS=${ADX_WITH_DFS:-0}
+case "$ADX_WITH_DFS" in
+  0|1) ;;
+  *) echo 'ADX_WITH_DFS must be 0 or 1' >&2; exit 2 ;;
+esac
+component_args=()
+if [[ "$ADX_WITH_DFS" == "1" ]]; then
+  component_args+=(--with-dfs)
+fi
 
 : "${BUILDKITE_COMMIT:?Buildkite revision required}"
 : "${BUILDKITE_BUILD_ID:?Buildkite build ID required}"
@@ -39,7 +48,8 @@ base_wheels=("$verify_dir"/sdk/adx_sandbox-*.whl)
   --release-archive out/buildkite/adx-release.tar.gz \
   --wheel "${base_wheels[0]}" \
   --backend-manifest out/buildkite/backend/manifest.json \
-  --backend-archive out/buildkite/backend.tar.gz
+  --backend-archive out/buildkite/backend.tar.gz \
+  "${component_args[@]}"
 rm -rf "$verify_dir"
 
 commit_short=${BUILDKITE_COMMIT:0:12}

@@ -1,0 +1,1115 @@
+{
+  "schema_version": 1,
+  "scope": "standalone cross-VM rping preparation; not full ENV or product acceptance",
+  "checks": [
+    {
+      "name": "frozen_probe",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "complete_matrix",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "ctl-a-256:client:raw",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "ctl-a-256:client:scope",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "ctl-a-256:client:guest",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "ctl-a-256:server:raw",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "ctl-a-256:server:scope",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "ctl-a-256:server:guest",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "ctl-a-256:semantics",
+      "status": "PASS",
+      "detail": {
+        "status": "PASS",
+        "problems": [],
+        "descriptor_sha256": [
+          "f200fed8e4f4586491d875aa67b7aa4720f126b64e6a8f96f6279747caeb8417",
+          "48710dc707481b69be64a4730e433646cb0bd80d88b88b5ea59b3314b2e87e7f",
+          "f200fed8e4f4586491d875aa67b7aa4720f126b64e6a8f96f6279747caeb8417",
+          "48710dc707481b69be64a4730e433646cb0bd80d88b88b5ea59b3314b2e87e7f",
+          "f200fed8e4f4586491d875aa67b7aa4720f126b64e6a8f96f6279747caeb8417",
+          "48710dc707481b69be64a4730e433646cb0bd80d88b88b5ea59b3314b2e87e7f"
+        ],
+        "limitations": [
+          "stock rping server does not authorize peer source; client source binding and descriptor receipt are recorded"
+        ]
+      }
+    },
+    {
+      "name": "ctl-b-256:client:raw",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "ctl-b-256:client:scope",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "ctl-b-256:client:guest",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "ctl-b-256:server:raw",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "ctl-b-256:server:scope",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "ctl-b-256:server:guest",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "ctl-b-256:semantics",
+      "status": "PASS",
+      "detail": {
+        "status": "PASS",
+        "problems": [],
+        "descriptor_sha256": [
+          "91d994a6d94659c7baff78b1e6c94bd110207db9e3a1030a1f94b8166ff5b909",
+          "1f504dc64ec71110bb6c9755cde1bd72c8fe30f30f5f5d4f122c93101e95a0f2",
+          "91d994a6d94659c7baff78b1e6c94bd110207db9e3a1030a1f94b8166ff5b909",
+          "1f504dc64ec71110bb6c9755cde1bd72c8fe30f30f5f5d4f122c93101e95a0f2",
+          "91d994a6d94659c7baff78b1e6c94bd110207db9e3a1030a1f94b8166ff5b909",
+          "1f504dc64ec71110bb6c9755cde1bd72c8fe30f30f5f5d4f122c93101e95a0f2"
+        ],
+        "limitations": [
+          "stock rping server does not authorize peer source; client source binding and descriptor receipt are recorded"
+        ]
+      }
+    },
+    {
+      "name": "ctl-c-256:client:raw",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "ctl-c-256:client:scope",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "ctl-c-256:client:guest",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "ctl-c-256:server:raw",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "ctl-c-256:server:scope",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "ctl-c-256:server:guest",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "ctl-c-256:semantics",
+      "status": "PASS",
+      "detail": {
+        "status": "PASS",
+        "problems": [],
+        "descriptor_sha256": [
+          "c15c27a3a3dbdccc8ec57467bc086bff4df76f6253f243f3bd0be21ad367fcb2",
+          "339691e1edd93c147ee4deeec5b6b34d5b9ee7eb181775e5f9f5e45ca4d87227",
+          "c15c27a3a3dbdccc8ec57467bc086bff4df76f6253f243f3bd0be21ad367fcb2",
+          "339691e1edd93c147ee4deeec5b6b34d5b9ee7eb181775e5f9f5e45ca4d87227",
+          "c15c27a3a3dbdccc8ec57467bc086bff4df76f6253f243f3bd0be21ad367fcb2",
+          "339691e1edd93c147ee4deeec5b6b34d5b9ee7eb181775e5f9f5e45ca4d87227"
+        ],
+        "limitations": [
+          "stock rping server does not authorize peer source; client source binding and descriptor receipt are recorded"
+        ]
+      }
+    },
+    {
+      "name": "a-ctl-256:client:raw",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "a-ctl-256:client:scope",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "a-ctl-256:client:guest",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "a-ctl-256:server:raw",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "a-ctl-256:server:scope",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "a-ctl-256:server:guest",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "a-ctl-256:semantics",
+      "status": "PASS",
+      "detail": {
+        "status": "PASS",
+        "problems": [],
+        "descriptor_sha256": [
+          "31448024922d48f1b498ab0b3fca3497e2cce4dfbef6ef542b04f44ca71fe589",
+          "e383e4d6bfae1abb70a02d6997b56d1c1308fc5655af0ab815eff4049bb3a80d",
+          "31448024922d48f1b498ab0b3fca3497e2cce4dfbef6ef542b04f44ca71fe589",
+          "e383e4d6bfae1abb70a02d6997b56d1c1308fc5655af0ab815eff4049bb3a80d",
+          "31448024922d48f1b498ab0b3fca3497e2cce4dfbef6ef542b04f44ca71fe589",
+          "e383e4d6bfae1abb70a02d6997b56d1c1308fc5655af0ab815eff4049bb3a80d"
+        ],
+        "limitations": [
+          "stock rping server does not authorize peer source; client source binding and descriptor receipt are recorded"
+        ]
+      }
+    },
+    {
+      "name": "a-b-256:client:raw",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "a-b-256:client:scope",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "a-b-256:client:guest",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "a-b-256:server:raw",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "a-b-256:server:scope",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "a-b-256:server:guest",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "a-b-256:semantics",
+      "status": "PASS",
+      "detail": {
+        "status": "PASS",
+        "problems": [],
+        "descriptor_sha256": [
+          "4c10602fd1b8ef80a47d2341d09fc1a211b5d3b4af80403dd7a77b2e92ff633d",
+          "1496a05aa4a375f137cdeeb65208f038368cb76bf3119be7b31c1b6d285af4ec",
+          "4c10602fd1b8ef80a47d2341d09fc1a211b5d3b4af80403dd7a77b2e92ff633d",
+          "1496a05aa4a375f137cdeeb65208f038368cb76bf3119be7b31c1b6d285af4ec",
+          "4c10602fd1b8ef80a47d2341d09fc1a211b5d3b4af80403dd7a77b2e92ff633d",
+          "1496a05aa4a375f137cdeeb65208f038368cb76bf3119be7b31c1b6d285af4ec"
+        ],
+        "limitations": [
+          "stock rping server does not authorize peer source; client source binding and descriptor receipt are recorded"
+        ]
+      }
+    },
+    {
+      "name": "a-c-256:client:raw",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "a-c-256:client:scope",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "a-c-256:client:guest",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "a-c-256:server:raw",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "a-c-256:server:scope",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "a-c-256:server:guest",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "a-c-256:semantics",
+      "status": "PASS",
+      "detail": {
+        "status": "PASS",
+        "problems": [],
+        "descriptor_sha256": [
+          "0d59de30cbec661d201348d589b204aa1ed61e89fce7f9c36448b7c84dc43992",
+          "07d5654fb091f70b48458cdc5f935e5855a5d097ee0914ec2d1c68643c800831",
+          "0d59de30cbec661d201348d589b204aa1ed61e89fce7f9c36448b7c84dc43992",
+          "07d5654fb091f70b48458cdc5f935e5855a5d097ee0914ec2d1c68643c800831",
+          "0d59de30cbec661d201348d589b204aa1ed61e89fce7f9c36448b7c84dc43992",
+          "07d5654fb091f70b48458cdc5f935e5855a5d097ee0914ec2d1c68643c800831"
+        ],
+        "limitations": [
+          "stock rping server does not authorize peer source; client source binding and descriptor receipt are recorded"
+        ]
+      }
+    },
+    {
+      "name": "b-ctl-256:client:raw",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "b-ctl-256:client:scope",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "b-ctl-256:client:guest",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "b-ctl-256:server:raw",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "b-ctl-256:server:scope",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "b-ctl-256:server:guest",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "b-ctl-256:semantics",
+      "status": "PASS",
+      "detail": {
+        "status": "PASS",
+        "problems": [],
+        "descriptor_sha256": [
+          "ea35974cbb08fa4d6611dc3eafdf1ef0fd8a396c9866b4d21f6ab49d9869e023",
+          "b87523331954f789d7dcab9a6c00b3ed69ea15faf958bf7c4554ddb7d3f78346",
+          "ea35974cbb08fa4d6611dc3eafdf1ef0fd8a396c9866b4d21f6ab49d9869e023",
+          "b87523331954f789d7dcab9a6c00b3ed69ea15faf958bf7c4554ddb7d3f78346",
+          "ea35974cbb08fa4d6611dc3eafdf1ef0fd8a396c9866b4d21f6ab49d9869e023",
+          "b87523331954f789d7dcab9a6c00b3ed69ea15faf958bf7c4554ddb7d3f78346"
+        ],
+        "limitations": [
+          "stock rping server does not authorize peer source; client source binding and descriptor receipt are recorded"
+        ]
+      }
+    },
+    {
+      "name": "b-a-256:client:raw",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "b-a-256:client:scope",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "b-a-256:client:guest",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "b-a-256:server:raw",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "b-a-256:server:scope",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "b-a-256:server:guest",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "b-a-256:semantics",
+      "status": "PASS",
+      "detail": {
+        "status": "PASS",
+        "problems": [],
+        "descriptor_sha256": [
+          "681660e6166ee43b6b50fb39ba60f7af78926078761c3b1bd74b4d75d31db549",
+          "f418d10342278bfa120fc6ae4c7be560e292e6fb88aa4ef25edaca9895ebdb7e",
+          "681660e6166ee43b6b50fb39ba60f7af78926078761c3b1bd74b4d75d31db549",
+          "f418d10342278bfa120fc6ae4c7be560e292e6fb88aa4ef25edaca9895ebdb7e",
+          "681660e6166ee43b6b50fb39ba60f7af78926078761c3b1bd74b4d75d31db549",
+          "f418d10342278bfa120fc6ae4c7be560e292e6fb88aa4ef25edaca9895ebdb7e"
+        ],
+        "limitations": [
+          "stock rping server does not authorize peer source; client source binding and descriptor receipt are recorded"
+        ]
+      }
+    },
+    {
+      "name": "b-c-256:client:raw",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "b-c-256:client:scope",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "b-c-256:client:guest",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "b-c-256:server:raw",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "b-c-256:server:scope",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "b-c-256:server:guest",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "b-c-256:semantics",
+      "status": "PASS",
+      "detail": {
+        "status": "PASS",
+        "problems": [],
+        "descriptor_sha256": [
+          "04bb7b32e7ebfa57aa3181b0608d2d89056a3169d8b8fb320c1ef9350b9138c1",
+          "5221b210a455978ab392c7c3cd8e6328ac71149fada4a01931ef99135da1b999",
+          "04bb7b32e7ebfa57aa3181b0608d2d89056a3169d8b8fb320c1ef9350b9138c1",
+          "5221b210a455978ab392c7c3cd8e6328ac71149fada4a01931ef99135da1b999",
+          "04bb7b32e7ebfa57aa3181b0608d2d89056a3169d8b8fb320c1ef9350b9138c1",
+          "5221b210a455978ab392c7c3cd8e6328ac71149fada4a01931ef99135da1b999"
+        ],
+        "limitations": [
+          "stock rping server does not authorize peer source; client source binding and descriptor receipt are recorded"
+        ]
+      }
+    },
+    {
+      "name": "c-ctl-256:client:raw",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "c-ctl-256:client:scope",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "c-ctl-256:client:guest",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "c-ctl-256:server:raw",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "c-ctl-256:server:scope",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "c-ctl-256:server:guest",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "c-ctl-256:semantics",
+      "status": "PASS",
+      "detail": {
+        "status": "PASS",
+        "problems": [],
+        "descriptor_sha256": [
+          "66f794d4c7a258d7a1d6eabcf210063be701579d27ddea9f6c0acb88abbe3e9f",
+          "6ed44873985b342d7fe1d494805e915a539c7fdd4e5c710339ae953916985cba",
+          "66f794d4c7a258d7a1d6eabcf210063be701579d27ddea9f6c0acb88abbe3e9f",
+          "6ed44873985b342d7fe1d494805e915a539c7fdd4e5c710339ae953916985cba",
+          "66f794d4c7a258d7a1d6eabcf210063be701579d27ddea9f6c0acb88abbe3e9f",
+          "6ed44873985b342d7fe1d494805e915a539c7fdd4e5c710339ae953916985cba"
+        ],
+        "limitations": [
+          "stock rping server does not authorize peer source; client source binding and descriptor receipt are recorded"
+        ]
+      }
+    },
+    {
+      "name": "c-a-256:client:raw",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "c-a-256:client:scope",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "c-a-256:client:guest",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "c-a-256:server:raw",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "c-a-256:server:scope",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "c-a-256:server:guest",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "c-a-256:semantics",
+      "status": "PASS",
+      "detail": {
+        "status": "PASS",
+        "problems": [],
+        "descriptor_sha256": [
+          "0b48772bda160d2be6b37692b1c8599264d95a240ee840b54e97bfe7bb46385d",
+          "f8069fa8947aac88540138c4e0bda027aab93e2bcef26241f9ca4010621c250b",
+          "0b48772bda160d2be6b37692b1c8599264d95a240ee840b54e97bfe7bb46385d",
+          "f8069fa8947aac88540138c4e0bda027aab93e2bcef26241f9ca4010621c250b",
+          "0b48772bda160d2be6b37692b1c8599264d95a240ee840b54e97bfe7bb46385d",
+          "f8069fa8947aac88540138c4e0bda027aab93e2bcef26241f9ca4010621c250b"
+        ],
+        "limitations": [
+          "stock rping server does not authorize peer source; client source binding and descriptor receipt are recorded"
+        ]
+      }
+    },
+    {
+      "name": "c-b-256:client:raw",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "c-b-256:client:scope",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "c-b-256:client:guest",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "c-b-256:server:raw",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "c-b-256:server:scope",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "c-b-256:server:guest",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "c-b-256:semantics",
+      "status": "PASS",
+      "detail": {
+        "status": "PASS",
+        "problems": [],
+        "descriptor_sha256": [
+          "b36ee3c8025838876b25a97352b4f8b29edb1e0559689adf09d7d726da7e38f7",
+          "2853f0e1735feb3c34d8ac745685633f1de16b00ea67dd9f5f33ed6c479ef67e",
+          "b36ee3c8025838876b25a97352b4f8b29edb1e0559689adf09d7d726da7e38f7",
+          "2853f0e1735feb3c34d8ac745685633f1de16b00ea67dd9f5f33ed6c479ef67e",
+          "b36ee3c8025838876b25a97352b4f8b29edb1e0559689adf09d7d726da7e38f7",
+          "2853f0e1735feb3c34d8ac745685633f1de16b00ea67dd9f5f33ed6c479ef67e"
+        ],
+        "limitations": [
+          "stock rping server does not authorize peer source; client source binding and descriptor receipt are recorded"
+        ]
+      }
+    },
+    {
+      "name": "a-b-65535:client:raw",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "a-b-65535:client:scope",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "a-b-65535:client:guest",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "a-b-65535:server:raw",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "a-b-65535:server:scope",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "a-b-65535:server:guest",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "a-b-65535:semantics",
+      "status": "PASS",
+      "detail": {
+        "status": "PASS",
+        "problems": [],
+        "descriptor_sha256": [
+          "09386c740abdd3463b2969a0d36d9889b2d2c779f1bd284042cf53fa4c9d9764",
+          "0f7376d24211cf46269742367cb67697b17c3dbe9bacfca4dff82cc9d61b0f5f",
+          "09386c740abdd3463b2969a0d36d9889b2d2c779f1bd284042cf53fa4c9d9764",
+          "0f7376d24211cf46269742367cb67697b17c3dbe9bacfca4dff82cc9d61b0f5f",
+          "09386c740abdd3463b2969a0d36d9889b2d2c779f1bd284042cf53fa4c9d9764",
+          "0f7376d24211cf46269742367cb67697b17c3dbe9bacfca4dff82cc9d61b0f5f"
+        ],
+        "limitations": [
+          "stock rping server does not authorize peer source; client source binding and descriptor receipt are recorded"
+        ]
+      }
+    },
+    {
+      "name": "absent_listener",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "negative_no_payload",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "ctl:observer_identity",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "ctl:observation_order",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "ctl:observed_boot_identity",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "ctl:guest_preserved",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "ctl:afs_processes_preserved",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "ctl:afs_mounts_preserved",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "ctl:no_owned_qp",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "ctl:no_owned_cm_id",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "a:observer_identity",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "a:observation_order",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "a:observed_boot_identity",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "a:guest_preserved",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "a:afs_processes_preserved",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "a:afs_mounts_preserved",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "a:no_owned_qp",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "a:no_owned_cm_id",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "b:observer_identity",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "b:observation_order",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "b:observed_boot_identity",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "b:guest_preserved",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "b:afs_processes_preserved",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "b:afs_mounts_preserved",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "b:no_owned_qp",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "b:no_owned_cm_id",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "c:observer_identity",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "c:observation_order",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "c:observed_boot_identity",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "c:guest_preserved",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "c:afs_processes_preserved",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "c:afs_mounts_preserved",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "c:no_owned_qp",
+      "status": "PASS",
+      "detail": null
+    },
+    {
+      "name": "c:no_owned_cm_id",
+      "status": "PASS",
+      "detail": null
+    }
+  ],
+  "payloads": [
+    {
+      "pair": "ctl-a-256",
+      "size": 256,
+      "read_sha256": [
+        "b5ea9bbf8f7297f2fb7ea0c29b14334c6373592ac3dee81d435e55befc974039",
+        "beb6bc569b0fc7f1a29434d213621fbe25706d256f263165eb6e7c69cfd2668b",
+        "9cbe38676e984a37e4834c468b368af7ef966155bfc4440aac8e1bca4a7f6b0e"
+      ],
+      "write_echo_sha256": [
+        "b5ea9bbf8f7297f2fb7ea0c29b14334c6373592ac3dee81d435e55befc974039",
+        "beb6bc569b0fc7f1a29434d213621fbe25706d256f263165eb6e7c69cfd2668b",
+        "9cbe38676e984a37e4834c468b368af7ef966155bfc4440aac8e1bca4a7f6b0e"
+      ],
+      "control_descriptor_sha256": [
+        "f200fed8e4f4586491d875aa67b7aa4720f126b64e6a8f96f6279747caeb8417",
+        "48710dc707481b69be64a4730e433646cb0bd80d88b88b5ea59b3314b2e87e7f",
+        "f200fed8e4f4586491d875aa67b7aa4720f126b64e6a8f96f6279747caeb8417",
+        "48710dc707481b69be64a4730e433646cb0bd80d88b88b5ea59b3314b2e87e7f",
+        "f200fed8e4f4586491d875aa67b7aa4720f126b64e6a8f96f6279747caeb8417",
+        "48710dc707481b69be64a4730e433646cb0bd80d88b88b5ea59b3314b2e87e7f"
+      ]
+    },
+    {
+      "pair": "ctl-b-256",
+      "size": 256,
+      "read_sha256": [
+        "b5ea9bbf8f7297f2fb7ea0c29b14334c6373592ac3dee81d435e55befc974039",
+        "beb6bc569b0fc7f1a29434d213621fbe25706d256f263165eb6e7c69cfd2668b",
+        "9cbe38676e984a37e4834c468b368af7ef966155bfc4440aac8e1bca4a7f6b0e"
+      ],
+      "write_echo_sha256": [
+        "b5ea9bbf8f7297f2fb7ea0c29b14334c6373592ac3dee81d435e55befc974039",
+        "beb6bc569b0fc7f1a29434d213621fbe25706d256f263165eb6e7c69cfd2668b",
+        "9cbe38676e984a37e4834c468b368af7ef966155bfc4440aac8e1bca4a7f6b0e"
+      ],
+      "control_descriptor_sha256": [
+        "91d994a6d94659c7baff78b1e6c94bd110207db9e3a1030a1f94b8166ff5b909",
+        "1f504dc64ec71110bb6c9755cde1bd72c8fe30f30f5f5d4f122c93101e95a0f2",
+        "91d994a6d94659c7baff78b1e6c94bd110207db9e3a1030a1f94b8166ff5b909",
+        "1f504dc64ec71110bb6c9755cde1bd72c8fe30f30f5f5d4f122c93101e95a0f2",
+        "91d994a6d94659c7baff78b1e6c94bd110207db9e3a1030a1f94b8166ff5b909",
+        "1f504dc64ec71110bb6c9755cde1bd72c8fe30f30f5f5d4f122c93101e95a0f2"
+      ]
+    },
+    {
+      "pair": "ctl-c-256",
+      "size": 256,
+      "read_sha256": [
+        "b5ea9bbf8f7297f2fb7ea0c29b14334c6373592ac3dee81d435e55befc974039",
+        "beb6bc569b0fc7f1a29434d213621fbe25706d256f263165eb6e7c69cfd2668b",
+        "9cbe38676e984a37e4834c468b368af7ef966155bfc4440aac8e1bca4a7f6b0e"
+      ],
+      "write_echo_sha256": [
+        "b5ea9bbf8f7297f2fb7ea0c29b14334c6373592ac3dee81d435e55befc974039",
+        "beb6bc569b0fc7f1a29434d213621fbe25706d256f263165eb6e7c69cfd2668b",
+        "9cbe38676e984a37e4834c468b368af7ef966155bfc4440aac8e1bca4a7f6b0e"
+      ],
+      "control_descriptor_sha256": [
+        "c15c27a3a3dbdccc8ec57467bc086bff4df76f6253f243f3bd0be21ad367fcb2",
+        "339691e1edd93c147ee4deeec5b6b34d5b9ee7eb181775e5f9f5e45ca4d87227",
+        "c15c27a3a3dbdccc8ec57467bc086bff4df76f6253f243f3bd0be21ad367fcb2",
+        "339691e1edd93c147ee4deeec5b6b34d5b9ee7eb181775e5f9f5e45ca4d87227",
+        "c15c27a3a3dbdccc8ec57467bc086bff4df76f6253f243f3bd0be21ad367fcb2",
+        "339691e1edd93c147ee4deeec5b6b34d5b9ee7eb181775e5f9f5e45ca4d87227"
+      ]
+    },
+    {
+      "pair": "a-ctl-256",
+      "size": 256,
+      "read_sha256": [
+        "b5ea9bbf8f7297f2fb7ea0c29b14334c6373592ac3dee81d435e55befc974039",
+        "beb6bc569b0fc7f1a29434d213621fbe25706d256f263165eb6e7c69cfd2668b",
+        "9cbe38676e984a37e4834c468b368af7ef966155bfc4440aac8e1bca4a7f6b0e"
+      ],
+      "write_echo_sha256": [
+        "b5ea9bbf8f7297f2fb7ea0c29b14334c6373592ac3dee81d435e55befc974039",
+        "beb6bc569b0fc7f1a29434d213621fbe25706d256f263165eb6e7c69cfd2668b",
+        "9cbe38676e984a37e4834c468b368af7ef966155bfc4440aac8e1bca4a7f6b0e"
+      ],
+      "control_descriptor_sha256": [
+        "31448024922d48f1b498ab0b3fca3497e2cce4dfbef6ef542b04f44ca71fe589",
+        "e383e4d6bfae1abb70a02d6997b56d1c1308fc5655af0ab815eff4049bb3a80d",
+        "31448024922d48f1b498ab0b3fca3497e2cce4dfbef6ef542b04f44ca71fe589",
+        "e383e4d6bfae1abb70a02d6997b56d1c1308fc5655af0ab815eff4049bb3a80d",
+        "31448024922d48f1b498ab0b3fca3497e2cce4dfbef6ef542b04f44ca71fe589",
+        "e383e4d6bfae1abb70a02d6997b56d1c1308fc5655af0ab815eff4049bb3a80d"
+      ]
+    },
+    {
+      "pair": "a-b-256",
+      "size": 256,
+      "read_sha256": [
+        "b5ea9bbf8f7297f2fb7ea0c29b14334c6373592ac3dee81d435e55befc974039",
+        "beb6bc569b0fc7f1a29434d213621fbe25706d256f263165eb6e7c69cfd2668b",
+        "9cbe38676e984a37e4834c468b368af7ef966155bfc4440aac8e1bca4a7f6b0e"
+      ],
+      "write_echo_sha256": [
+        "b5ea9bbf8f7297f2fb7ea0c29b14334c6373592ac3dee81d435e55befc974039",
+        "beb6bc569b0fc7f1a29434d213621fbe25706d256f263165eb6e7c69cfd2668b",
+        "9cbe38676e984a37e4834c468b368af7ef966155bfc4440aac8e1bca4a7f6b0e"
+      ],
+      "control_descriptor_sha256": [
+        "4c10602fd1b8ef80a47d2341d09fc1a211b5d3b4af80403dd7a77b2e92ff633d",
+        "1496a05aa4a375f137cdeeb65208f038368cb76bf3119be7b31c1b6d285af4ec",
+        "4c10602fd1b8ef80a47d2341d09fc1a211b5d3b4af80403dd7a77b2e92ff633d",
+        "1496a05aa4a375f137cdeeb65208f038368cb76bf3119be7b31c1b6d285af4ec",
+        "4c10602fd1b8ef80a47d2341d09fc1a211b5d3b4af80403dd7a77b2e92ff633d",
+        "1496a05aa4a375f137cdeeb65208f038368cb76bf3119be7b31c1b6d285af4ec"
+      ]
+    },
+    {
+      "pair": "a-c-256",
+      "size": 256,
+      "read_sha256": [
+        "b5ea9bbf8f7297f2fb7ea0c29b14334c6373592ac3dee81d435e55befc974039",
+        "beb6bc569b0fc7f1a29434d213621fbe25706d256f263165eb6e7c69cfd2668b",
+        "9cbe38676e984a37e4834c468b368af7ef966155bfc4440aac8e1bca4a7f6b0e"
+      ],
+      "write_echo_sha256": [
+        "b5ea9bbf8f7297f2fb7ea0c29b14334c6373592ac3dee81d435e55befc974039",
+        "beb6bc569b0fc7f1a29434d213621fbe25706d256f263165eb6e7c69cfd2668b",
+        "9cbe38676e984a37e4834c468b368af7ef966155bfc4440aac8e1bca4a7f6b0e"
+      ],
+      "control_descriptor_sha256": [
+        "0d59de30cbec661d201348d589b204aa1ed61e89fce7f9c36448b7c84dc43992",
+        "07d5654fb091f70b48458cdc5f935e5855a5d097ee0914ec2d1c68643c800831",
+        "0d59de30cbec661d201348d589b204aa1ed61e89fce7f9c36448b7c84dc43992",
+        "07d5654fb091f70b48458cdc5f935e5855a5d097ee0914ec2d1c68643c800831",
+        "0d59de30cbec661d201348d589b204aa1ed61e89fce7f9c36448b7c84dc43992",
+        "07d5654fb091f70b48458cdc5f935e5855a5d097ee0914ec2d1c68643c800831"
+      ]
+    },
+    {
+      "pair": "b-ctl-256",
+      "size": 256,
+      "read_sha256": [
+        "b5ea9bbf8f7297f2fb7ea0c29b14334c6373592ac3dee81d435e55befc974039",
+        "beb6bc569b0fc7f1a29434d213621fbe25706d256f263165eb6e7c69cfd2668b",
+        "9cbe38676e984a37e4834c468b368af7ef966155bfc4440aac8e1bca4a7f6b0e"
+      ],
+      "write_echo_sha256": [
+        "b5ea9bbf8f7297f2fb7ea0c29b14334c6373592ac3dee81d435e55befc974039",
+        "beb6bc569b0fc7f1a29434d213621fbe25706d256f263165eb6e7c69cfd2668b",
+        "9cbe38676e984a37e4834c468b368af7ef966155bfc4440aac8e1bca4a7f6b0e"
+      ],
+      "control_descriptor_sha256": [
+        "ea35974cbb08fa4d6611dc3eafdf1ef0fd8a396c9866b4d21f6ab49d9869e023",
+        "b87523331954f789d7dcab9a6c00b3ed69ea15faf958bf7c4554ddb7d3f78346",
+        "ea35974cbb08fa4d6611dc3eafdf1ef0fd8a396c9866b4d21f6ab49d9869e023",
+        "b87523331954f789d7dcab9a6c00b3ed69ea15faf958bf7c4554ddb7d3f78346",
+        "ea35974cbb08fa4d6611dc3eafdf1ef0fd8a396c9866b4d21f6ab49d9869e023",
+        "b87523331954f789d7dcab9a6c00b3ed69ea15faf958bf7c4554ddb7d3f78346"
+      ]
+    },
+    {
+      "pair": "b-a-256",
+      "size": 256,
+      "read_sha256": [
+        "b5ea9bbf8f7297f2fb7ea0c29b14334c6373592ac3dee81d435e55befc974039",
+        "beb6bc569b0fc7f1a29434d213621fbe25706d256f263165eb6e7c69cfd2668b",
+        "9cbe38676e984a37e4834c468b368af7ef966155bfc4440aac8e1bca4a7f6b0e"
+      ],
+      "write_echo_sha256": [
+        "b5ea9bbf8f7297f2fb7ea0c29b14334c6373592ac3dee81d435e55befc974039",
+        "beb6bc569b0fc7f1a29434d213621fbe25706d256f263165eb6e7c69cfd2668b",
+        "9cbe38676e984a37e4834c468b368af7ef966155bfc4440aac8e1bca4a7f6b0e"
+      ],
+      "control_descriptor_sha256": [
+        "681660e6166ee43b6b50fb39ba60f7af78926078761c3b1bd74b4d75d31db549",
+        "f418d10342278bfa120fc6ae4c7be560e292e6fb88aa4ef25edaca9895ebdb7e",
+        "681660e6166ee43b6b50fb39ba60f7af78926078761c3b1bd74b4d75d31db549",
+        "f418d10342278bfa120fc6ae4c7be560e292e6fb88aa4ef25edaca9895ebdb7e",
+        "681660e6166ee43b6b50fb39ba60f7af78926078761c3b1bd74b4d75d31db549",
+        "f418d10342278bfa120fc6ae4c7be560e292e6fb88aa4ef25edaca9895ebdb7e"
+      ]
+    },
+    {
+      "pair": "b-c-256",
+      "size": 256,
+      "read_sha256": [
+        "b5ea9bbf8f7297f2fb7ea0c29b14334c6373592ac3dee81d435e55befc974039",
+        "beb6bc569b0fc7f1a29434d213621fbe25706d256f263165eb6e7c69cfd2668b",
+        "9cbe38676e984a37e4834c468b368af7ef966155bfc4440aac8e1bca4a7f6b0e"
+      ],
+      "write_echo_sha256": [
+        "b5ea9bbf8f7297f2fb7ea0c29b14334c6373592ac3dee81d435e55befc974039",
+        "beb6bc569b0fc7f1a29434d213621fbe25706d256f263165eb6e7c69cfd2668b",
+        "9cbe38676e984a37e4834c468b368af7ef966155bfc4440aac8e1bca4a7f6b0e"
+      ],
+      "control_descriptor_sha256": [
+        "04bb7b32e7ebfa57aa3181b0608d2d89056a3169d8b8fb320c1ef9350b9138c1",
+        "5221b210a455978ab392c7c3cd8e6328ac71149fada4a01931ef99135da1b999",
+        "04bb7b32e7ebfa57aa3181b0608d2d89056a3169d8b8fb320c1ef9350b9138c1",
+        "5221b210a455978ab392c7c3cd8e6328ac71149fada4a01931ef99135da1b999",
+        "04bb7b32e7ebfa57aa3181b0608d2d89056a3169d8b8fb320c1ef9350b9138c1",
+        "5221b210a455978ab392c7c3cd8e6328ac71149fada4a01931ef99135da1b999"
+      ]
+    },
+    {
+      "pair": "c-ctl-256",
+      "size": 256,
+      "read_sha256": [
+        "b5ea9bbf8f7297f2fb7ea0c29b14334c6373592ac3dee81d435e55befc974039",
+        "beb6bc569b0fc7f1a29434d213621fbe25706d256f263165eb6e7c69cfd2668b",
+        "9cbe38676e984a37e4834c468b368af7ef966155bfc4440aac8e1bca4a7f6b0e"
+      ],
+      "write_echo_sha256": [
+        "b5ea9bbf8f7297f2fb7ea0c29b14334c6373592ac3dee81d435e55befc974039",
+        "beb6bc569b0fc7f1a29434d213621fbe25706d256f263165eb6e7c69cfd2668b",
+        "9cbe38676e984a37e4834c468b368af7ef966155bfc4440aac8e1bca4a7f6b0e"
+      ],
+      "control_descriptor_sha256": [
+        "66f794d4c7a258d7a1d6eabcf210063be701579d27ddea9f6c0acb88abbe3e9f",
+        "6ed44873985b342d7fe1d494805e915a539c7fdd4e5c710339ae953916985cba",
+        "66f794d4c7a258d7a1d6eabcf210063be701579d27ddea9f6c0acb88abbe3e9f",
+        "6ed44873985b342d7fe1d494805e915a539c7fdd4e5c710339ae953916985cba",
+        "66f794d4c7a258d7a1d6eabcf210063be701579d27ddea9f6c0acb88abbe3e9f",
+        "6ed44873985b342d7fe1d494805e915a539c7fdd4e5c710339ae953916985cba"
+      ]
+    },
+    {
+      "pair": "c-a-256",
+      "size": 256,
+      "read_sha256": [
+        "b5ea9bbf8f7297f2fb7ea0c29b14334c6373592ac3dee81d435e55befc974039",
+        "beb6bc569b0fc7f1a29434d213621fbe25706d256f263165eb6e7c69cfd2668b",
+        "9cbe38676e984a37e4834c468b368af7ef966155bfc4440aac8e1bca4a7f6b0e"
+      ],
+      "write_echo_sha256": [
+        "b5ea9bbf8f7297f2fb7ea0c29b14334c6373592ac3dee81d435e55befc974039",
+        "beb6bc569b0fc7f1a29434d213621fbe25706d256f263165eb6e7c69cfd2668b",
+        "9cbe38676e984a37e4834c468b368af7ef966155bfc4440aac8e1bca4a7f6b0e"
+      ],
+      "control_descriptor_sha256": [
+        "0b48772bda160d2be6b37692b1c8599264d95a240ee840b54e97bfe7bb46385d",
+        "f8069fa8947aac88540138c4e0bda027aab93e2bcef26241f9ca4010621c250b",
+        "0b48772bda160d2be6b37692b1c8599264d95a240ee840b54e97bfe7bb46385d",
+        "f8069fa8947aac88540138c4e0bda027aab93e2bcef26241f9ca4010621c250b",
+        "0b48772bda160d2be6b37692b1c8599264d95a240ee840b54e97bfe7bb46385d",
+        "f8069fa8947aac88540138c4e0bda027aab93e2bcef26241f9ca4010621c250b"
+      ]
+    },
+    {
+      "pair": "c-b-256",
+      "size": 256,
+      "read_sha256": [
+        "b5ea9bbf8f7297f2fb7ea0c29b14334c6373592ac3dee81d435e55befc974039",
+        "beb6bc569b0fc7f1a29434d213621fbe25706d256f263165eb6e7c69cfd2668b",
+        "9cbe38676e984a37e4834c468b368af7ef966155bfc4440aac8e1bca4a7f6b0e"
+      ],
+      "write_echo_sha256": [
+        "b5ea9bbf8f7297f2fb7ea0c29b14334c6373592ac3dee81d435e55befc974039",
+        "beb6bc569b0fc7f1a29434d213621fbe25706d256f263165eb6e7c69cfd2668b",
+        "9cbe38676e984a37e4834c468b368af7ef966155bfc4440aac8e1bca4a7f6b0e"
+      ],
+      "control_descriptor_sha256": [
+        "b36ee3c8025838876b25a97352b4f8b29edb1e0559689adf09d7d726da7e38f7",
+        "2853f0e1735feb3c34d8ac745685633f1de16b00ea67dd9f5f33ed6c479ef67e",
+        "b36ee3c8025838876b25a97352b4f8b29edb1e0559689adf09d7d726da7e38f7",
+        "2853f0e1735feb3c34d8ac745685633f1de16b00ea67dd9f5f33ed6c479ef67e",
+        "b36ee3c8025838876b25a97352b4f8b29edb1e0559689adf09d7d726da7e38f7",
+        "2853f0e1735feb3c34d8ac745685633f1de16b00ea67dd9f5f33ed6c479ef67e"
+      ]
+    },
+    {
+      "pair": "a-b-65535",
+      "size": 65535,
+      "read_sha256": [
+        "df520908545ec808928a712b138f9f445fffaaff87d393afad22a058ca94496f",
+        "4871dd57c628859085697dee32b1149ebe1e8b40cdccbfbbca76d76fcb2be5d6",
+        "5cf30c413335db96b69f851820bc6346c4ab1e42539c29573b4b0302c65acbfd"
+      ],
+      "write_echo_sha256": [
+        "df520908545ec808928a712b138f9f445fffaaff87d393afad22a058ca94496f",
+        "4871dd57c628859085697dee32b1149ebe1e8b40cdccbfbbca76d76fcb2be5d6",
+        "5cf30c413335db96b69f851820bc6346c4ab1e42539c29573b4b0302c65acbfd"
+      ],
+      "control_descriptor_sha256": [
+        "09386c740abdd3463b2969a0d36d9889b2d2c779f1bd284042cf53fa4c9d9764",
+        "0f7376d24211cf46269742367cb67697b17c3dbe9bacfca4dff82cc9d61b0f5f",
+        "09386c740abdd3463b2969a0d36d9889b2d2c779f1bd284042cf53fa4c9d9764",
+        "0f7376d24211cf46269742367cb67697b17c3dbe9bacfca4dff82cc9d61b0f5f",
+        "09386c740abdd3463b2969a0d36d9889b2d2c779f1bd284042cf53fa4c9d9764",
+        "0f7376d24211cf46269742367cb67697b17c3dbe9bacfca4dff82cc9d61b0f5f"
+      ]
+    }
+  ],
+  "summary": {
+    "PASS": 127,
+    "FAIL": 0
+  }
+}

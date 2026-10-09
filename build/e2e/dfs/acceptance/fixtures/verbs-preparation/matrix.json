@@ -1,0 +1,70 @@
+{
+  "probe_sha256": "c8ea5535f2cb0f85fe80e0e9d2104e77229c35ed478a865fdd2231e6dabab130",
+  "pairs": [
+    {
+      "client": "ctl",
+      "server": "a",
+      "size": 256
+    },
+    {
+      "client": "ctl",
+      "server": "b",
+      "size": 256
+    },
+    {
+      "client": "ctl",
+      "server": "c",
+      "size": 256
+    },
+    {
+      "client": "a",
+      "server": "ctl",
+      "size": 256
+    },
+    {
+      "client": "a",
+      "server": "b",
+      "size": 256
+    },
+    {
+      "client": "a",
+      "server": "c",
+      "size": 256
+    },
+    {
+      "client": "b",
+      "server": "ctl",
+      "size": 256
+    },
+    {
+      "client": "b",
+      "server": "a",
+      "size": 256
+    },
+    {
+      "client": "b",
+      "server": "c",
+      "size": 256
+    },
+    {
+      "client": "c",
+      "server": "ctl",
+      "size": 256
+    },
+    {
+      "client": "c",
+      "server": "a",
+      "size": 256
+    },
+    {
+      "client": "c",
+      "server": "b",
+      "size": 256
+    },
+    {
+      "client": "a",
+      "server": "b",
+      "size": 65535
+    }
+  ]
+}

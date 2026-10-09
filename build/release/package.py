@@ -12,16 +12,19 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 BINARIES = ("adxctl", "adx-inspect", "adx-coordinator", "adxlet", "adx-apiserver", "adx-ingress", "adx-relay")
+DFS_BINARIES = ("afs-meta", "afs-node")
 
 
 def sha(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def assemble(binary_dir, redis, redis_cli, wheel, output, commit, dirty, target, profile):
+def assemble(binary_dir, redis, redis_cli, wheel, output, commit, dirty, target, profile, with_dfs=False):
     if output.exists():
         raise ValueError("output already exists")
     inputs = {f"bin/{name}": binary_dir / name for name in BINARIES}
+    if with_dfs:
+        inputs.update({f"bin/{name}": binary_dir / name for name in DFS_BINARIES})
     inputs["runtime/adx-execd"] = binary_dir / "adx-execd"
     # Native Linux release builder supplies the EROFS payload. Debug/native macOS
     # packages retain binary-only development support.
@@ -50,6 +53,13 @@ def assemble(binary_dir, redis, redis_cli, wheel, output, commit, dirty, target,
     for path in (ROOT / "build/config/examples").iterdir():
         if path.is_file():
             inputs[f"etc/examples/{path.name}"] = path
+    if with_dfs:
+        for path in (ROOT / "build/config/examples/dfs").iterdir():
+            if path.is_file():
+                inputs[f"etc/examples/dfs/{path.name}"] = path
+        for path in (ROOT / "docs/migration/licenses/dfs-source").iterdir():
+            if path.is_file():
+                inputs[f"third_party/dfs-source/{path.name}"] = path
     for component in ("redis", "sandboxd"):
         for name in ("source.json", "LICENSE"):
             inputs[f"third_party/{component}/{name}"] = ROOT / "third_party" / component / name
@@ -86,6 +96,8 @@ def assemble(binary_dir, redis, redis_cli, wheel, output, commit, dirty, target,
             "redis_version": "7.2.5",
             "files": {name: sha(stage / name) for name in sorted(inputs)},
         }
+        if with_dfs:
+            manifest["with_dfs"] = True
         (stage / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
         stage.rename(output)
     verify(output)
@@ -105,6 +117,15 @@ def verify(directory):
     }
     if manifest.get("profile") == "release" and "linux" in manifest.get("target", ""):
         required.add("runtime/adx-runtime-rootfs.img")
+    if manifest.get("with_dfs") is True:
+        required.update({f"bin/{name}" for name in DFS_BINARIES})
+        required.update({"etc/examples/dfs/meta.toml", "etc/examples/dfs/node.toml"})
+        required.update({"third_party/dfs-source/LICENSE", "third_party/dfs-source/NOTICE"})
+    else:
+        forbidden = {f"bin/{name}" for name in DFS_BINARIES}
+        forbidden.update(path for path in expected if path.startswith("etc/examples/dfs/"))
+        if forbidden & expected:
+            raise ValueError("DFS artifacts are present in a default package")
     if not required.issubset(expected) or not any(
         n.startswith("sdk/adx_sandbox-") and n.endswith(".whl") for n in expected
     ):
@@ -132,6 +153,7 @@ def main():
         p.add_argument("--" + arg, type=Path, required=True)
     p.add_argument("--target", required=True)
     p.add_argument("--profile", choices=("debug", "release"), required=True)
+    p.add_argument("--with-dfs", action="store_true", help="include OwnerFs and DistributedFs binaries")
     v = sub.add_parser("verify")
     v.add_argument("directory", type=Path)
     args = parser.parse_args()
@@ -156,6 +178,7 @@ def main():
             dirty,
             args.target,
             args.profile,
+            args.with_dfs,
         )
     print("package verified")
 

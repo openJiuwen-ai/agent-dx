@@ -1,0 +1,227 @@
+{
+  "argv": [
+    "/usr/bin/stdbuf",
+    "-oL",
+    "-eL",
+    "/usr/bin/rping",
+    "-d",
+    "-v",
+    "-V",
+    "-S",
+    "256",
+    "-C",
+    "3",
+    "-p",
+    "19669",
+    "-c",
+    "-I",
+    "192.168.109.12",
+    "-a",
+    "192.168.109.11"
+  ],
+  "bind": "192.168.109.12",
+  "count": 3,
+  "ended_unix": 1790835772.251198,
+  "host": {
+    "boot_id": "36a572e0-859b-4a94-adc7-789210a83fc8\n",
+    "hostname": "lima-afs-accept-a",
+    "kernel": "6.8.0-142-generic",
+    "machine": "aarch64",
+    "machine_id": "9253e8d222af4657a862f974ae5ce752\n"
+  },
+  "inventory": {
+    "binary": {
+      "expected_sha256": "d4d82fdd9b78cfb9404bbb4c2a8c07dde9d450d7fd4d7041d5d0ffcf32e3e89f",
+      "path": "/usr/bin/rping",
+      "sha256": "d4d82fdd9b78cfb9404bbb4c2a8c07dde9d450d7fd4d7041d5d0ffcf32e3e89f"
+    },
+    "ibv_devinfo": {
+      "argv": [
+        "ibv_devinfo"
+      ],
+      "returncode": 0,
+      "stderr": "",
+      "stdout": "hca_id:\trxe0\n\ttransport:\t\t\tInfiniBand (0)\n\tfw_ver:\t\t\t\t0.0.0\n\tnode_guid:\t\t\t5055:55ff:fe61:9296\n\tsys_image_guid:\t\t\t5055:55ff:fe61:9296\n\tvendor_id:\t\t\t0xffffff\n\tvendor_part_id:\t\t\t0\n\thw_ver:\t\t\t\t0x0\n\tphys_port_cnt:\t\t\t1\n\t\tport:\t1\n\t\t\tstate:\t\t\tPORT_ACTIVE (4)\n\t\t\tmax_mtu:\t\t4096 (5)\n\t\t\tactive_mtu:\t\t1024 (3)\n\t\t\tsm_lid:\t\t\t0\n\t\t\tport_lid:\t\t0\n\t\t\tport_lmc:\t\t0x00\n\t\t\tlink_layer:\t\tEthernet\n\n"
+    },
+    "installed_provider": {
+      "ldconfig": {
+        "argv": [
+          "/sbin/ldconfig",
+          "-p"
+        ],
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "418 libs found in cache `/etc/ld.so.cache'\n\tlibzstd.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libzstd.so.1\n\tlibz.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libz.so.1\n\tlibz.so (libc6,AArch64) => /lib/aarch64-linux-gnu/libz.so\n\tlibyaml-0.so.2 (libc6,AArch64) => /lib/aarch64-linux-gnu/libyaml-0.so.2\n\tlibxxhash.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libxxhash.so.0\n\tlibxtables.so.12 (libc6,AArch64) => /lib/aarch64-linux-gnu/libxtables.so.12\n\tlibxslt.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libxslt.so.1\n\tlibxml2.so.2 (libc6,AArch64) => /lib/aarch64-linux-gnu/libxml2.so.2\n\tlibxmlsec1.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libxmlsec1.so.1\n\tlibxmlsec1-openssl.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libxmlsec1-openssl.so.1\n\tlibxmlb.so.2 (libc6,AArch64) => /lib/aarch64-linux-gnu/libxmlb.so.2\n\tlibxkbcommon.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libxkbcommon.so.0\n\tlibxcb.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libxcb.so.1\n\tlibwrap.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libwrap.so.0\n\tlibwebp.so.7 (libc6,AArch64) => /lib/aarch64-linux-gnu/libwebp.so.7\n\tlibvolume_key.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libvolume_key.so.1\n\tlibvmtools.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libvmtools.so.0\n\tlibvgauth.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libvgauth.so.0\n\tlibuv.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libuv.so.1\n\tlibuuid.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libuuid.so.1\n\tlibutil.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libutil.so.1\n\tlibutempter.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libutempter.so.0\n\tlibusb-1.0.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libusb-1.0.so.0\n\tliburcu.so.8 (libc6,AArch64) => /lib/aarch64-linux-gnu/liburcu.so.8\n\tliburcu-signal.so.8 (libc6,AArch64) => /lib/aarch64-linux-gnu/liburcu-signal.so.8\n\tliburcu-qsbr.so.8 (libc6,AArch64) => /lib/aarch64-linux-gnu/liburcu-qsbr.so.8\n\tliburcu-memb.so.8 (libc6,AArch64) => /lib/aarch64-linux-gnu/liburcu-memb.so.8\n\tliburcu-mb.so.8 (libc6,AArch64) => /lib/aarch64-linux-gnu/liburcu-mb.so.8\n\tliburcu-common.so.8 (libc6,AArch64) => /lib/aarch64-linux-gnu/liburcu-common.so.8\n\tliburcu-cds.so.8 (libc6,AArch64) => /lib/aarch64-linux-gnu/liburcu-cds.so.8\n\tliburcu-bp.so.8 (libc6,AArch64) => /lib/aarch64-linux-gnu/liburcu-bp.so.8\n\tlibunwind.so.8 (libc6,AArch64) => /lib/aarch64-linux-gnu/libunwind.so.8\n\tlibunwind-ptrace.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libunwind-ptrace.so.0\n\tlibunwind-coredump.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libunwind-coredump.so.0\n\tlibunwind-aarch64.so.8 (libc6,AArch64) => /lib/aarch64-linux-gnu/libunwind-aarch64.so.8\n\tlibunistring.so.5 (libc6,AArch64) => /lib/aarch64-linux-gnu/libunistring.so.5\n\tlibudisks2.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libudisks2.so.0\n\tlibudev.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libudev.so.1\n\tlibuchardet.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libuchardet.so.0\n\tlibubsan.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libubsan.so.1\n\tlibubootenv.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libubootenv.so.0\n\tlibtsan.so.2 (libc6,AArch64) => /lib/aarch64-linux-gnu/libtsan.so.2\n\tlibtracefs.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libtracefs.so.1\n\tlibtraceevent.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libtraceevent.so.1\n\tlibtirpc.so.3 (libc6,AArch64) => /lib/aarch64-linux-gnu/libtirpc.so.3\n\tlibtinfo.so.6 (libc6,AArch64) => /lib/aarch64-linux-gnu/libtinfo.so.6\n\tlibtiff.so.6 (libc6,AArch64) => /lib/aarch64-linux-gnu/libtiff.so.6\n\tlibtic.so.6 (libc6,AArch64) => /lib/aarch64-linux-gnu/libtic.so.6\n\tlibthread_db.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libthread_db.so.1\n\tlibthread_db.so (libc6,AArch64) => /lib/aarch64-linux-gnu/libthread_db.so\n\tlibtcmalloc_minimal_debug.so.4 (libc6,AArch64) => /lib/aarch64-linux-gnu/libtcmalloc_minimal_debug.so.4\n\tlibtcmalloc_minimal.so.4 (libc6,AArch64) => /lib/aarch64-linux-gnu/libtcmalloc_minimal.so.4\n\tlibtcmalloc_debug.so.4 (libc6,AArch64) => /lib/aarch64-linux-gnu/libtcmalloc_debug.so.4\n\tlibtcmalloc_and_profiler.so.4 (libc6,AArch64) => /lib/aarch64-linux-gnu/libtcmalloc_and_profiler.so.4\n\tlibtcmalloc.so.4 (libc6,AArch64) => /lib/aarch64-linux-gnu/libtcmalloc.so.4\n\tlibtcl8.6.so (libc6,AArch64) => /lib/aarch64-linux-gnu/libtcl8.6.so\n\tlibtasn1.so.6 (libc6,AArch64) => /lib/aarch64-linux-gnu/libtasn1.so.6\n\tlibsystemd.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libsystemd.so.0\n\tlibstemmer.so.0d (libc6,AArch64) => /lib/aarch64-linux-gnu/libstemmer.so.0d\n\tlibstdc++.so.6 (libc6,AArch64) => /lib/aarch64-linux-gnu/libstdc++.so.6\n\tlibssl3.so (libc6,AArch64) => /lib/aarch64-linux-gnu/libssl3.so\n\tlibssl.so.3 (libc6,AArch64) => /lib/aarch64-linux-gnu/libssl.so.3\n\tlibssh.so.4 (libc6,AArch64) => /lib/aarch64-linux-gnu/libssh.so.4\n\tlibss.so.2 (libc6,AArch64) => /lib/aarch64-linux-gnu/libss.so.2\n\tlibsqlite3.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libsqlite3.so.0\n\tlibsource-highlight.so.4 (libc6,AArch64) => /lib/aarch64-linux-gnu/libsource-highlight.so.4\n\tlibsoftokn3.so (libc6,AArch64) => /lib/aarch64-linux-gnu/libsoftokn3.so\n\tlibsodium.so.23 (libc6,AArch64) => /lib/aarch64-linux-gnu/libsodium.so.23\n\tlibsnappy.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libsnappy.so.1\n\tlibsmime3.so (libc6,AArch64) => /lib/aarch64-linux-gnu/libsmime3.so\n\tlibsmartcols.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libsmartcols.so.1\n\tlibslang.so.2 (libc6,AArch64) => /lib/aarch64-linux-gnu/libslang.so.2\n\tlibsigsegv.so.2 (libc6,AArch64) => /lib/aarch64-linux-gnu/libsigsegv.so.2\n\tlibsharpyuv.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libsharpyuv.so.0\n\tlibsgutils2-1.46.so.2 (libc6,AArch64) => /lib/aarch64-linux-gnu/libsgutils2-1.46.so.2\n\tlibsframe.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libsframe.so.1\n\tlibsepol.so.2 (libc6,AArch64) => /lib/aarch64-linux-gnu/libsepol.so.2\n\tlibsensors.so.5 (libc6,AArch64) => /lib/aarch64-linux-gnu/libsensors.so.5\n\tlibsemanage.so.2 (libc6,AArch64) => /lib/aarch64-linux-gnu/libsemanage.so.2\n\tlibselinux.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libselinux.so.1\n\tlibseccomp.so.2 (libc6,AArch64) => /lib/aarch64-linux-gnu/libseccomp.so.2\n\tlibsctp.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libsctp.so.1\n\tlibsasl2.so.2 (libc6,AArch64) => /lib/aarch64-linux-gnu/libsasl2.so.2\n\tlibrtmp.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/librtmp.so.1\n\tlibrt.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/librt.so.1\n\tlibresolv.so.2 (libc6,AArch64) => /lib/aarch64-linux-gnu/libresolv.so.2\n\tlibresolv.so (libc6,AArch64) => /lib/aarch64-linux-gnu/libresolv.so\n\tlibreiserfscore.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libreiserfscore.so.0\n\tlibreadline.so.8 (libc6,AArch64) => /lib/aarch64-linux-gnu/libreadline.so.8\n\tlibrdmacm.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/librdmacm.so.1\n\tlibrbd.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/librbd.so.1\n\tlibrados.so.2 (libc6,AArch64) => /lib/aarch64-linux-gnu/librados.so.2\n\tlibqrtr-glib.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libqrtr-glib.so.0\n\tlibqmi-glib.so.5 (libc6,AArch64) => /lib/aarch64-linux-gnu/libqmi-glib.so.5\n\tlibp11-kit.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libp11-kit.so.0\n\tlibpython3.12.so.1.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libpython3.12.so.1.0\n\tlibpython3.12.so (libc6,AArch64) => /lib/aarch64-linux-gnu/libpython3.12.so\n\tlibpthread.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libpthread.so.0\n\tlibpsx.so.2 (libc6,AArch64) => /lib/aarch64-linux-gnu/libpsx.so.2\n\tlibpsl.so.5 (libc6,AArch64) => /lib/aarch64-linux-gnu/libpsl.so.5\n\tlibprotobuf-c.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libprotobuf-c.so.1\n\tlibprofiler.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libprofiler.so.0\n\tlibproc2.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libproc2.so.0\n\tlibpopt.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libpopt.so.0\n\tlibpolkit-gobject-1.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libpolkit-gobject-1.so.0\n\tlibpolkit-agent-1.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libpolkit-agent-1.so.0\n\tlibpng16.so.16 (libc6,AArch64) => /lib/aarch64-linux-gnu/libpng16.so.16\n\tlibpmemobj.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libpmemobj.so.1\n\tlibpmem.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libpmem.so.1\n\tlibply.so.5 (libc6,AArch64) => /lib/aarch64-linux-gnu/libply.so.5\n\tlibply-splash-graphics.so.5 (libc6,AArch64) => /lib/aarch64-linux-gnu/libply-splash-graphics.so.5\n\tlibply-splash-core.so.5 (libc6,AArch64) => /lib/aarch64-linux-gnu/libply-splash-core.so.5\n\tlibply-boot-client.so.5 (libc6,AArch64) => /lib/aarch64-linux-gnu/libply-boot-client.so.5\n\tlibplds4.so (libc6,AArch64) => /lib/aarch64-linux-gnu/libplds4.so\n\tlibplc4.so (libc6,AArch64) => /lib/aarch64-linux-gnu/libplc4.so\n\tlibpkgconf.so.3 (libc6,AArch64) => /lib/aarch64-linux-gnu/libpkgconf.so.3\n\tlibpipeline.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libpipeline.so.1\n\tlibperl.so.5.38 (libc6,AArch64) => /lib/aarch64-linux-gnu/libperl.so.5.38\n\tlibpcre2-8.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libpcre2-8.so.0\n\tlibpcprofile.so (libc6,AArch64) => /lib/aarch64-linux-gnu/libpcprofile.so\n\tlibpci.so.3 (libc6,AArch64) => /lib/aarch64-linux-gnu/libpci.so.3\n\tlibpcap.so.0.8 (libc6,AArch64) => /lib/aarch64-linux-gnu/libpcap.so.0.8\n\tlibparted.so.2 (libc6,AArch64) => /lib/aarch64-linux-gnu/libparted.so.2\n\tlibpanelw.so.6 (libc6,AArch64) => /lib/aarch64-linux-gnu/libpanelw.so.6\n\tlibpanel.so.6 (libc6,AArch64) => /lib/aarch64-linux-gnu/libpanel.so.6\n\tlibpamc.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libpamc.so.0\n\tlibpam_misc.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libpam_misc.so.0\n\tlibpam.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libpam.so.0\n\tlibpackagekit-glib2.so.18 (libc6,AArch64) => /lib/aarch64-linux-gnu/libpackagekit-glib2.so.18\n\tlibopeniscsiusr.so.0.2.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libopeniscsiusr.so.0.2.0\n\tlibopcodes-2.42-system.so (libc6,AArch64) => /lib/aarch64-linux-gnu/libopcodes-2.42-system.so\n\tlibonig.so.5 (libc6,AArch64) => /lib/aarch64-linux-gnu/libonig.so.5\n\tlibnvme.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libnvme.so.1\n\tlibnvme-mi.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libnvme-mi.so.1\n\tlibnuma.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libnuma.so.1\n\tlibntfs-3g.so.89 (libc6,AArch64) => /lib/aarch64-linux-gnu/libntfs-3g.so.89\n\tlibnss3.so (libc6,AArch64) => /lib/aarch64-linux-gnu/libnss3.so\n\tlibnssutil3.so (libc6,AArch64) => /lib/aarch64-linux-gnu/libnssutil3.so\n\tlibnssdbm3.so (libc6,AArch64) => /lib/aarch64-linux-gnu/libnssdbm3.so\n\tlibnssckbi.so (libc6,AArch64) => /lib/aarch64-linux-gnu/libnssckbi.so\n\tlibnss_systemd.so.2 (libc6,AArch64) => /lib/aarch64-linux-gnu/libnss_systemd.so.2\n\tlibnss_hesiod.so.2 (libc6,AArch64) => /lib/aarch64-linux-gnu/libnss_hesiod.so.2\n\tlibnss_hesiod.so (libc6,AArch64) => /lib/aarch64-linux-gnu/libnss_hesiod.so\n\tlibnss_files.so.2 (libc6,AArch64) => /lib/aarch64-linux-gnu/libnss_files.so.2\n\tlibnss_dns.so.2 (libc6,AArch64) => /lib/aarch64-linux-gnu/libnss_dns.so.2\n\tlibnss_compat.so.2 (libc6,AArch64) => /lib/aarch64-linux-gnu/libnss_compat.so.2\n\tlibnss_compat.so (libc6,AArch64) => /lib/aarch64-linux-gnu/libnss_compat.so\n\tlibnspr4.so (libc6,AArch64) => /lib/aarch64-linux-gnu/libnspr4.so\n\tlibnsl.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libnsl.so.1\n\tlibns-9.18.39-0ubuntu0.24.04.2-Ubuntu.so (libc6,AArch64) => /lib/aarch64-linux-gnu/libns-9.18.39-0ubuntu0.24.04.2-Ubuntu.so\n\tlibnpth.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libnpth.so.0\n\tlibnl-3.so.200 (libc6,AArch64) => /lib/aarch64-linux-gnu/libnl-3.so.200\n\tlibnl-route-3.so.200 (libc6,AArch64) => /lib/aarch64-linux-gnu/libnl-route-3.so.200\n\tlibnl-genl-3.so.200 (libc6,AArch64) => /lib/aarch64-linux-gnu/libnl-genl-3.so.200\n\tlibnghttp2.so.14 (libc6,AArch64) => /lib/aarch64-linux-gnu/libnghttp2.so.14\n\tlibnftnl.so.11 (libc6,AArch64) => /lib/aarch64-linux-gnu/libnftnl.so.11\n\tlibnftables.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libnftables.so.1\n\tlibnfnetlink.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libnfnetlink.so.0\n\tlibnewt.so.0.52 (libc6,AArch64) => /lib/aarch64-linux-gnu/libnewt.so.0.52\n\tlibnettle.so.8 (libc6,AArch64) => /lib/aarch64-linux-gnu/libnettle.so.8\n\tlibnetplan.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libnetplan.so.1\n\tlibnetfilter_conntrack.so.3 (libc6,AArch64) => /lib/aarch64-linux-gnu/libnetfilter_conntrack.so.3\n\tlibndctl.so.6 (libc6,AArch64) => /lib/aarch64-linux-gnu/libndctl.so.6\n\tlibncursesw.so.6 (libc6,AArch64) => /lib/aarch64-linux-gnu/libncursesw.so.6\n\tlibncurses.so.6 (libc6,AArch64) => /lib/aarch64-linux-gnu/libncurses.so.6\n\tlibnbd.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libnbd.so.0\n\tlibmvec.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libmvec.so.1\n\tlibmvec.so (libc6,AArch64) => /lib/aarch64-linux-gnu/libmvec.so\n\tlibmultipath.so.0 (libc6,AArch64) => /lib/libmultipath.so.0\n\tlibmspack.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libmspack.so.0\n\tlibmpfr.so.6 (libc6,AArch64) => /lib/aarch64-linux-gnu/libmpfr.so.6\n\tlibmpc.so.3 (libc6,AArch64) => /lib/aarch64-linux-gnu/libmpc.so.3\n\tlibmpathutil.so.0 (libc6,AArch64) => /lib/libmpathutil.so.0\n\tlibmpathpersist.so.0 (libc6,AArch64) => /lib/libmpathpersist.so.0\n\tlibmpathcmd.so.0 (libc6,AArch64) => /lib/libmpathcmd.so.0\n\tlibmount.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libmount.so.1\n\tlibmnl.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libmnl.so.0\n\tlibmm-glib.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libmm-glib.so.0\n\tlibmlx5.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libmlx5.so.1\n\tlibmlx4.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libmlx4.so.1\n\tlibmenuw.so.6 (libc6,AArch64) => /lib/aarch64-linux-gnu/libmenuw.so.6\n\tlibmenu.so.6 (libc6,AArch64) => /lib/aarch64-linux-gnu/libmenu.so.6\n\tlibmemusage.so (libc6,AArch64) => /lib/aarch64-linux-gnu/libmemusage.so\n\tlibmd.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libmd.so.0\n\tlibmbim-glib.so.4 (libc6,AArch64) => /lib/aarch64-linux-gnu/libmbim-glib.so.4\n\tlibmaxminddb.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libmaxminddb.so.0\n\tlibmana.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libmana.so.1\n\tlibmagic.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libmagic.so.1\n\tlibm.so.6 (libc6,AArch64) => /lib/aarch64-linux-gnu/libm.so.6\n\tliblz4.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/liblz4.so.1\n\tliblzo2.so.2 (libc6,AArch64) => /lib/aarch64-linux-gnu/liblzo2.so.2\n\tliblzma.so.5 (libc6,AArch64) => /lib/aarch64-linux-gnu/liblzma.so.5\n\tliblvm2cmd.so.2.03 (libc6,AArch64) => /lib/aarch64-linux-gnu/liblvm2cmd.so.2.03\n\tliblsan.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/liblsan.so.0\n\tliblmdb.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/liblmdb.so.0\n\tlibldap.so.2 (libc6,AArch64) => /lib/aarch64-linux-gnu/libldap.so.2\n\tliblber.so.2 (libc6,AArch64) => /lib/aarch64-linux-gnu/liblber.so.2\n\tlibk5crypto.so.3 (libc6,AArch64) => /lib/aarch64-linux-gnu/libk5crypto.so.3\n\tlibksba.so.8 (libc6,AArch64) => /lib/aarch64-linux-gnu/libksba.so.8\n\tlibkrb5support.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libkrb5support.so.0\n\tlibkrb5.so.3 (libc6,AArch64) => /lib/aarch64-linux-gnu/libkrb5.so.3\n\tlibkmod.so.2 (libc6,AArch64) => /lib/aarch64-linux-gnu/libkmod.so.2\n\tlibkeyutils.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libkeyutils.so.1\n\tlibjson-glib-1.0.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libjson-glib-1.0.so.0\n\tlibjson-c.so.5 (libc6,AArch64) => /lib/aarch64-linux-gnu/libjson-c.so.5\n\tlibjq.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libjq.so.1\n\tlibjpeg.so.8 (libc6,AArch64) => /lib/aarch64-linux-gnu/libjpeg.so.8\n\tlibjemalloc.so.2 (libc6,AArch64) => /lib/aarch64-linux-gnu/libjemalloc.so.2\n\tlibjcat.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libjcat.so.1\n\tlibjbig.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libjbig.so.0\n\tlibjansson.so.4 (libc6,AArch64) => /lib/aarch64-linux-gnu/libjansson.so.4\n\tlibitm.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libitm.so.1\n\tlibisns.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libisns.so.0\n\tlibisl.so.23 (libc6,AArch64) => /lib/aarch64-linux-gnu/libisl.so.23\n\tlibisccfg-9.18.39-0ubuntu0.24.04.2-Ubuntu.so (libc6,AArch64) => /lib/aarch64-linux-gnu/libisccfg-9.18.39-0ubuntu0.24.04.2-Ubuntu.so\n\tlibisccc-9.18.39-0ubuntu0.24.04.2-Ubuntu.so (libc6,AArch64) => /lib/aarch64-linux-gnu/libisccc-9.18.39-0ubuntu0.24.04.2-Ubuntu.so\n\tlibisc-9.18.39-0ubuntu0.24.04.2-Ubuntu.so (libc6,AArch64) => /lib/aarch64-linux-gnu/libisc-9.18.39-0ubuntu0.24.04.2-Ubuntu.so\n\tlibirs-9.18.39-0ubuntu0.24.04.2-Ubuntu.so (libc6,AArch64) => /lib/aarch64-linux-gnu/libirs-9.18.39-0ubuntu0.24.04.2-Ubuntu.so\n\tlibip6tc.so.2 (libc6,AArch64) => /lib/aarch64-linux-gnu/libip6tc.so.2\n\tlibip4tc.so.2 (libc6,AArch64) => /lib/aarch64-linux-gnu/libip4tc.so.2\n\tlibiperf.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libiperf.so.0\n\tlibiniparser.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libiniparser.so.1\n\tlibinih.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libinih.so.1\n\tlibidn2.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libidn2.so.0\n\tlibicuuc.so.74 (libc6,AArch64) => /lib/aarch64-linux-gnu/libicuuc.so.74\n\tlibicutu.so.74 (libc6,AArch64) => /lib/aarch64-linux-gnu/libicutu.so.74\n\tlibicutest.so.74 (libc6,AArch64) => /lib/aarch64-linux-gnu/libicutest.so.74\n\tlibicui18n.so.74 (libc6,AArch64) => /lib/aarch64-linux-gnu/libicui18n.so.74\n\tlibicuio.so.74 (libc6,AArch64) => /lib/aarch64-linux-gnu/libicuio.so.74\n\tlibicudata.so.74 (libc6,AArch64) => /lib/aarch64-linux-gnu/libicudata.so.74\n\tlibibverbs.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libibverbs.so.1\n\tlibibumad.so.3 (libc6,AArch64) => /lib/aarch64-linux-gnu/libibumad.so.3\n\tlibhwasan.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libhwasan.so.0\n\tlibhogweed.so.6 (libc6,AArch64) => /lib/aarch64-linux-gnu/libhogweed.so.6\n\tlibhistory.so.8 (libc6,AArch64) => /lib/aarch64-linux-gnu/libhistory.so.8\n\tlibhgfs.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libhgfs.so.0\n\tlibheif.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libheif.so.1\n\tlibhandle.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libhandle.so.1\n\tlibgusb.so.2 (libc6,AArch64) => /lib/aarch64-linux-gnu/libgusb.so.2\n\tlibguestlib.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libguestlib.so.0\n\tlibguestStoreClient.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libguestStoreClient.so.0\n\tlibgudev-1.0.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libgudev-1.0.so.0\n\tlibgthread-2.0.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libgthread-2.0.so.0\n\tlibgstreamer-1.0.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libgstreamer-1.0.so.0\n\tlibgstnet-1.0.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libgstnet-1.0.so.0\n\tlibgstcontroller-1.0.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libgstcontroller-1.0.so.0\n\tlibgstcheck-1.0.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libgstcheck-1.0.so.0\n\tlibgstbase-1.0.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libgstbase-1.0.so.0\n\tlibgssapi_krb5.so.2 (libc6,AArch64) => /lib/aarch64-linux-gnu/libgssapi_krb5.so.2\n\tlibgprofng.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libgprofng.so.0\n\tlibgpm.so.2 (libc6,AArch64) => /lib/aarch64-linux-gnu/libgpm.so.2\n\tlibgpgme.so.11 (libc6,AArch64) => /lib/aarch64-linux-gnu/libgpgme.so.11\n\tlibgpg-error.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libgpg-error.so.0\n\tlibgomp.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libgomp.so.1\n\tlibgobject-2.0.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libgobject-2.0.so.0\n\tlibgnutls.so.30 (libc6,AArch64) => /lib/aarch64-linux-gnu/libgnutls.so.30\n\tlibgmp.so.10 (libc6,AArch64) => /lib/aarch64-linux-gnu/libgmp.so.10\n\tlibgmodule-2.0.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libgmodule-2.0.so.0\n\tlibglusterfs.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libglusterfs.so.0\n\tlibglog.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libglog.so.1\n\tlibglib-2.0.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libglib-2.0.so.0\n\tlibgirepository-1.0.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libgirepository-1.0.so.1\n\tlibgio-2.0.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libgio-2.0.so.0\n\tlibgfxdr.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libgfxdr.so.0\n\tlibgfrpc.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libgfrpc.so.0\n\tlibgflags_nothreads.so.2.2 (libc6,AArch64) => /lib/aarch64-linux-gnu/libgflags_nothreads.so.2.2\n\tlibgflags.so.2.2 (libc6,AArch64) => /lib/aarch64-linux-gnu/libgflags.so.2.2\n\tlibgfapi.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libgfapi.so.0\n\tlibgdbm_compat.so.4 (libc6,AArch64) => /lib/aarch64-linux-gnu/libgdbm_compat.so.4\n\tlibgdbm.so.6 (libc6,AArch64) => /lib/aarch64-linux-gnu/libgdbm.so.6\n\tlibgd.so.3 (libc6,AArch64) => /lib/aarch64-linux-gnu/libgd.so.3\n\tlibgcrypt.so.20 (libc6,AArch64) => /lib/aarch64-linux-gnu/libgcrypt.so.20\n\tlibgcc_s.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libgcc_s.so.1\n\tlibfwupd.so.2 (libc6,AArch64) => /lib/aarch64-linux-gnu/libfwupd.so.2\n\tlibfuse3.so.3 (libc6,AArch64) => /lib/aarch64-linux-gnu/libfuse3.so.3\n\tlibftdi1.so.2 (libc6,AArch64) => /lib/aarch64-linux-gnu/libftdi1.so.2\n\tlibfribidi.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libfribidi.so.0\n\tlibfreetype.so.6 (libc6,AArch64) => /lib/aarch64-linux-gnu/libfreetype.so.6\n\tlibfreebl3.so (libc6,AArch64) => /lib/aarch64-linux-gnu/libfreebl3.so\n\tlibfreeblpriv3.so (libc6,AArch64) => /lib/aarch64-linux-gnu/libfreeblpriv3.so\n\tlibformw.so.6 (libc6,AArch64) => /lib/aarch64-linux-gnu/libformw.so.6\n\tlibform.so.6 (libc6,AArch64) => /lib/aarch64-linux-gnu/libform.so.6\n\tlibfontconfig.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libfontconfig.so.1\n\tlibflashrom.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libflashrom.so.1\n\tlibfido2.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libfido2.so.1\n\tlibffi.so.8 (libc6,AArch64) => /lib/aarch64-linux-gnu/libffi.so.8\n\tlibfdt.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libfdt.so.1\n\tlibfdisk.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libfdisk.so.1\n\tlibfdb_c_shim.so (libc6,AArch64) => /lib/libfdb_c_shim.so\n\tlibfdb_c.so (libc6,AArch64) => /lib/libfdb_c.so\n\tlibfastjson.so.4 (libc6,AArch64) => /lib/aarch64-linux-gnu/libfastjson.so.4\n\tlibfakeroot-0.so (libc6,AArch64) => /usr/lib/aarch64-linux-gnu/libfakeroot/libfakeroot-0.so\n\tlibe2p.so.2 (libc6,AArch64) => /lib/aarch64-linux-gnu/libe2p.so.2\n\tlibext2fs.so.2 (libc6,AArch64) => /lib/aarch64-linux-gnu/libext2fs.so.2\n\tlibexslt.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libexslt.so.0\n\tlibexpatw.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libexpatw.so.1\n\tlibexpatw.so (libc6,AArch64) => /lib/aarch64-linux-gnu/libexpatw.so\n\tlibexpat.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libexpat.so.1\n\tlibexpat.so (libc6,AArch64) => /lib/aarch64-linux-gnu/libexpat.so\n\tlibevent_core-2.1.so.7 (libc6,AArch64) => /lib/aarch64-linux-gnu/libevent_core-2.1.so.7\n\tlibevent-2.1.so.7 (libc6,AArch64) => /lib/aarch64-linux-gnu/libevent-2.1.so.7\n\tlibevdev.so.2 (libc6,AArch64) => /lib/aarch64-linux-gnu/libevdev.so.2\n\tlibestr.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libestr.so.0\n\tlibelf.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libelf.so.1\n\tlibefivar.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libefivar.so.1\n\tlibefiboot.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libefiboot.so.1\n\tlibefa.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libefa.so.1\n\tlibedit.so.2 (libc6,AArch64) => /lib/aarch64-linux-gnu/libedit.so.2\n\tlibeatmydata.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libeatmydata.so.1\n\tlibeatmydata.so (libc6,AArch64) => /lib/aarch64-linux-gnu/libeatmydata.so\n\tlibdwarf.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libdwarf.so.1\n\tlibdw.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libdw.so.1\n\tlibduktape.so.207 (libc6,AArch64) => /lib/aarch64-linux-gnu/libduktape.so.207\n\tlibdrop_ambient.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libdrop_ambient.so.0\n\tlibdrm.so.2 (libc6,AArch64) => /lib/aarch64-linux-gnu/libdrm.so.2\n\tlibdouble-conversion.so.3 (libc6,AArch64) => /lib/aarch64-linux-gnu/libdouble-conversion.so.3\n\tlibdns-9.18.39-0ubuntu0.24.04.2-Ubuntu.so (libc6,AArch64) => /lib/aarch64-linux-gnu/libdns-9.18.39-0ubuntu0.24.04.2-Ubuntu.so\n\tlibdl.so.2 (libc6,AArch64) => /lib/aarch64-linux-gnu/libdl.so.2\n\tlibde265.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libde265.so.0\n\tlibdevmapper.so.1.02.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libdevmapper.so.1.02.1\n\tlibdevmapper-event.so.1.02.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libdevmapper-event.so.1.02.1\n\tlibdevmapper-event-lvm2vdo.so (libc6,AArch64) => /lib/aarch64-linux-gnu/libdevmapper-event-lvm2vdo.so\n\tlibdevmapper-event-lvm2thin.so (libc6,AArch64) => /lib/aarch64-linux-gnu/libdevmapper-event-lvm2thin.so\n\tlibdevmapper-event-lvm2snapshot.so (libc6,AArch64) => /lib/aarch64-linux-gnu/libdevmapper-event-lvm2snapshot.so\n\tlibdevmapper-event-lvm2raid.so (libc6,AArch64) => /lib/aarch64-linux-gnu/libdevmapper-event-lvm2raid.so\n\tlibdevmapper-event-lvm2mirror.so (libc6,AArch64) => /lib/aarch64-linux-gnu/libdevmapper-event-lvm2mirror.so\n\tlibdevmapper-event-lvm2.so.2.03 (libc6,AArch64) => /lib/aarch64-linux-gnu/libdevmapper-event-lvm2.so.2.03\n\tlibdevmapper-event-lvm2.so (libc6,AArch64) => /lib/aarch64-linux-gnu/libdevmapper-event-lvm2.so\n\tlibdeflate.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libdeflate.so.0\n\tlibdebuginfod.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libdebuginfod.so.1\n\tlibdebconfclient.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libdebconfclient.so.0\n\tlibdbus-1.so.3 (libc6,AArch64) => /lib/aarch64-linux-gnu/libdbus-1.so.3\n\tlibdb-5.3.so (libc6,AArch64) => /lib/aarch64-linux-gnu/libdb-5.3.so\n\tlibdaxctl.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libdaxctl.so.1\n\tlibcurl.so.4 (libc6,AArch64) => /lib/aarch64-linux-gnu/libcurl.so.4\n\tlibcurl-gnutls.so.4 (libc6,AArch64) => /lib/aarch64-linux-gnu/libcurl-gnutls.so.4\n\tlibctf.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libctf.so.0\n\tlibctf-nobfd.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libctf-nobfd.so.0\n\tlibcryptsetup.so.12 (libc6,AArch64) => /lib/aarch64-linux-gnu/libcryptsetup.so.12\n\tlibcrypto.so.3 (libc6,AArch64) => /lib/aarch64-linux-gnu/libcrypto.so.3\n\tlibcrypt.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libcrypt.so.1\n\tlibcrypt.so (libc6,AArch64) => /lib/aarch64-linux-gnu/libcrypt.so\n\tlibcom_err.so.2 (libc6,AArch64) => /lib/aarch64-linux-gnu/libcom_err.so.2\n\tlibclang-18.so.18 (libc6,AArch64) => /lib/aarch64-linux-gnu/libclang-18.so.18\n\tlibclang-cpp.so.18.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libclang-cpp.so.18.1\n\tlibcc1.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libcc1.so.0\n\tlibcbor.so.0.10 (libc6,AArch64) => /lib/aarch64-linux-gnu/libcbor.so.0.10\n\tlibcap.so.2 (libc6,AArch64) => /lib/aarch64-linux-gnu/libcap.so.2\n\tlibcap-ng.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libcap-ng.so.0\n\tlibc_malloc_debug.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libc_malloc_debug.so.0\n\tlibc_malloc_debug.so (libc6,AArch64) => /lib/aarch64-linux-gnu/libc_malloc_debug.so\n\tlibc.so.6 (libc6,AArch64) => /lib/aarch64-linux-gnu/libc.so.6\n\tlibbz2.so.1.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libbz2.so.1.0\n\tlibbytesize.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libbytesize.so.1\n\tlibbsd.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libbsd.so.0\n\tlibbrotlienc.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libbrotlienc.so.1\n\tlibbrotlidec.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libbrotlidec.so.1\n\tlibbrotlicommon.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libbrotlicommon.so.1\n\tlibbpf.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libbpf.so.1\n\tlibboost_thread.so.1.83.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libboost_thread.so.1.83.0\n\tlibboost_system.so.1.83.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libboost_system.so.1.83.0\n\tlibboost_regex.so.1.83.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libboost_regex.so.1.83.0\n\tlibboost_program_options.so.1.83.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libboost_program_options.so.1.83.0\n\tlibboost_iostreams.so.1.83.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libboost_iostreams.so.1.83.0\n\tlibboost_filesystem.so.1.83.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libboost_filesystem.so.1.83.0\n\tlibboost_context.so.1.83.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libboost_context.so.1.83.0\n\tlibboost_atomic.so.1.83.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libboost_atomic.so.1.83.0\n\tlibblockdev.so.3 (libc6,AArch64) => /lib/aarch64-linux-gnu/libblockdev.so.3\n\tlibblkid.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libblkid.so.1\n\tlibbind9-9.18.39-0ubuntu0.24.04.2-Ubuntu.so (libc6,AArch64) => /lib/aarch64-linux-gnu/libbind9-9.18.39-0ubuntu0.24.04.2-Ubuntu.so\n\tlibbfd-2.42-system.so (libc6,AArch64) => /lib/aarch64-linux-gnu/libbfd-2.42-system.so\n\tlibbd_utils.so.3 (libc6,AArch64) => /lib/aarch64-linux-gnu/libbd_utils.so.3\n\tlibbd_swap.so.3 (libc6,AArch64) => /lib/aarch64-linux-gnu/libbd_swap.so.3\n\tlibbd_part.so.3 (libc6,AArch64) => /lib/aarch64-linux-gnu/libbd_part.so.3\n\tlibbd_nvme.so.3 (libc6,AArch64) => /lib/aarch64-linux-gnu/libbd_nvme.so.3\n\tlibbd_mdraid.so.3 (libc6,AArch64) => /lib/aarch64-linux-gnu/libbd_mdraid.so.3\n\tlibbd_loop.so.3 (libc6,AArch64) => /lib/aarch64-linux-gnu/libbd_loop.so.3\n\tlibbd_fs.so.3 (libc6,AArch64) => /lib/aarch64-linux-gnu/libbd_fs.so.3\n\tlibbd_crypto.so.3 (libc6,AArch64) => /lib/aarch64-linux-gnu/libbd_crypto.so.3\n\tlibbcc_bpf.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libbcc_bpf.so.0\n\tlibbcc.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libbcc.so.0\n\tlibbabeltrace.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libbabeltrace.so.1\n\tlibbabeltrace-lttng-live.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libbabeltrace-lttng-live.so.1\n\tlibbabeltrace-dummy.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libbabeltrace-dummy.so.1\n\tlibbabeltrace-ctf.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libbabeltrace-ctf.so.1\n\tlibbabeltrace-ctf-text.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libbabeltrace-ctf-text.so.1\n\tlibbabeltrace-ctf-metadata.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libbabeltrace-ctf-metadata.so.1\n\tlibaudit.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libaudit.so.1\n\tlibattr.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libattr.so.1\n\tlibatomic.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libatomic.so.1\n\tlibatm.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libatm.so.1\n\tlibatasmart.so.4 (libc6,AArch64) => /lib/aarch64-linux-gnu/libatasmart.so.4\n\tlibassuan.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libassuan.so.0\n\tlibasan.so.8 (libc6,AArch64) => /lib/aarch64-linux-gnu/libasan.so.8\n\tlibargon2.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libargon2.so.1\n\tlibarchive.so.13 (libc6,AArch64) => /lib/aarch64-linux-gnu/libarchive.so.13\n\tlibapt-private.so.0.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libapt-private.so.0.0\n\tlibapt-pkg.so.6.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libapt-pkg.so.6.0\n\tlibappstream.so.5 (libc6,AArch64) => /lib/aarch64-linux-gnu/libappstream.so.5\n\tlibapparmor.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libapparmor.so.1\n\tlibaom.so.3 (libc6,AArch64) => /lib/aarch64-linux-gnu/libaom.so.3\n\tlibanl.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libanl.so.1\n\tlibanl.so (libc6,AArch64) => /lib/aarch64-linux-gnu/libanl.so\n\tlibaio.so.1t64 (libc6,AArch64) => /lib/aarch64-linux-gnu/libaio.so.1t64\n\tlibacl.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libacl.so.1\n\tlibX11.so.6 (libc6,AArch64) => /lib/aarch64-linux-gnu/libX11.so.6\n\tlibXpm.so.4 (libc6,AArch64) => /lib/aarch64-linux-gnu/libXpm.so.4\n\tlibXmuu.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libXmuu.so.1\n\tlibXext.so.6 (libc6,AArch64) => /lib/aarch64-linux-gnu/libXext.so.6\n\tlibXdmcp.so.6 (libc6,AArch64) => /lib/aarch64-linux-gnu/libXdmcp.so.6\n\tlibXau.so.6 (libc6,AArch64) => /lib/aarch64-linux-gnu/libXau.so.6\n\tlibLerc.so.4 (libc6,AArch64) => /lib/aarch64-linux-gnu/libLerc.so.4\n\tlibLLVM.so.18.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libLLVM.so.18.1\n\tlibDeployPkg.so.0 (libc6,AArch64) => /lib/aarch64-linux-gnu/libDeployPkg.so.0\n\tlibBrokenLocale.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/libBrokenLocale.so.1\n\tlibBrokenLocale.so (libc6,AArch64) => /lib/aarch64-linux-gnu/libBrokenLocale.so\n\tld-linux-aarch64.so.1 (libc6,AArch64) => /lib/aarch64-linux-gnu/ld-linux-aarch64.so.1\n\tld-linux-aarch64.so.1 (libc6,AArch64) => /lib/ld-linux-aarch64.so.1\nCache generated by: ldconfig (Ubuntu GLIBC 2.39-0ubuntu8.9) stable release version 2.39\n"
+      },
+      "libibverbs": {
+        "argv": [
+          "dpkg-query",
+          "-W",
+          "-f=${Package} ${Version}\\n",
+          "libibverbs1:arm64"
+        ],
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "libibverbs1 50.0-2ubuntu0.2\n"
+      },
+      "libibverbs_so_sha256": "84e987a9131e90bf7933614bf2f415ea0e928d5614328685461cf646cdb384e4",
+      "rdma_core": {
+        "argv": [
+          "dpkg-query",
+          "-W",
+          "-f=${Package} ${Version}\\n",
+          "rdma-core"
+        ],
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "rdma-core 50.0-2ubuntu0.2\n"
+      },
+      "rdma_rxe_modinfo": {
+        "argv": [
+          "modinfo",
+          "rdma_rxe"
+        ],
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "filename:       /lib/modules/6.8.0-142-generic/kernel/drivers/infiniband/sw/rxe/rdma_rxe.ko.zst\nalias:          rdma-link-rxe\nlicense:        Dual BSD/GPL\ndescription:    Soft RDMA transport\nauthor:         Bob Pearson, Frank Zago, John Groves, Kamal Heib\nsrcversion:     FA59DE80E917E49F05E3123\ndepends:        ib_uverbs,ib_core,udp_tunnel,ip6_udp_tunnel\nintree:         Y\nname:           rdma_rxe\nvermagic:       6.8.0-142-generic SMP preempt mod_unload modversions aarch64\nsig_id:         PKCS#7\nsigner:         Build time autogenerated kernel key\nsig_key:        08:E4:56:37:7D:9C:93:13:D0:66:21:02:28:22:67:AB:DB:50:D4:76\nsig_hashalgo:   sha512\nsignature:      29:EB:71:0E:DB:18:A0:BB:35:BE:93:EB:B8:D6:D0:3A:71:13:BE:02:\n\t\t74:DB:E5:07:15:A6:55:52:02:AF:F5:F7:D7:1B:68:01:B5:1A:B1:28:\n\t\t81:E9:92:0B:4A:90:D3:35:D1:6E:01:3C:BF:91:79:E4:F8:C1:1B:89:\n\t\tC5:D5:B9:E3:2C:C9:6D:2D:76:82:20:95:0D:F1:9F:CE:00:E6:3E:DE:\n\t\t41:86:30:27:37:05:FD:E3:87:7C:65:A0:E7:69:F0:A4:2F:E1:38:34:\n\t\tCF:CC:38:39:E6:BD:D4:8A:B2:40:54:D2:FE:3D:45:FA:52:99:43:05:\n\t\t34:71:BC:75:54:B3:A1:6B:A6:B9:72:F9:C6:AB:9E:53:14:11:C7:11:\n\t\t3D:B1:F5:3E:15:79:91:8C:EC:20:FC:4A:96:13:00:60:7D:D5:56:6C:\n\t\tEE:D0:4F:3C:74:9B:FD:11:89:D5:D6:63:58:89:B4:0C:F7:2A:6D:47:\n\t\tCB:D0:29:83:2D:4C:B4:C6:56:01:10:61:A5:A2:BC:7B:DC:2B:B8:AB:\n\t\t10:B0:34:E1:63:4E:CC:05:E4:56:AF:DC:DA:15:3F:8A:D9:52:92:B6:\n\t\tEC:52:B5:14:07:D9:10:29:4C:58:D9:24:AF:C0:44:BF:F1:75:44:69:\n\t\tC8:27:C2:74:0F:04:68:36:9E:A9:28:D3:6B:94:8B:CC:CD:8A:82:7D:\n\t\t47:12:F6:47:B4:3B:1F:F4:8F:0E:98:5D:04:FB:6E:3F:D7:2E:82:9A:\n\t\t11:A6:9F:50:DC:50:3C:C8:6E:88:5C:3B:B1:F2:F4:6F:F3:E9:5D:44:\n\t\t9D:1F:F4:33:EF:0F:AC:20:41:C5:1A:87:16:C0:EF:99:AE:BD:33:7D:\n\t\t31:4B:F9:60:C0:5E:AD:C3:90:5C:77:41:A4:4A:DD:D8:7D:BE:B1:A1:\n\t\t78:F6:E5:41:71:E4:A4:CB:16:73:27:88:B4:B2:E4:60:6B:A8:78:41:\n\t\t68:30:C5:6E:FD:CE:00:DF:C0:23:D5:61:9C:72:F7:8E:AA:D9:FF:FF:\n\t\t4E:63:14:B5:E7:83:3D:A4:D8:F3:A6:E6:97:EE:F5:B8:35:B0:48:7D:\n\t\tD3:F5:05:E9:B5:C1:3C:D8:16:C0:4D:51:16:72:CD:33:A0:FC:98:82:\n\t\tAA:A8:BE:0F:BE:94:CE:A2:F0:04:14:C4:80:28:89:94:85:23:FB:9B:\n\t\tA8:5F:12:66:A2:48:93:50:1F:FD:12:8F:F7:62:D4:64:8C:B7:E1:48:\n\t\t14:AA:A6:1D:2D:38:28:68:62:C5:A9:AC:68:D4:FC:A0:D2:8D:B0:10:\n\t\t2C:A5:A2:34:0E:49:44:51:E2:50:62:5F:86:9A:7B:93:F1:4D:1C:FD:\n\t\tD5:F3:A3:1D:D4:13:6D:FD:FD:03:EC:A2\n"
+      },
+      "rxe_provider_so_sha256": "9d4125ef4088b5f13af3ec829fd36ddf7a89af72c623b98e4cb5228cd847f090"
+    },
+    "rdma_link": {
+      "argv": [
+        "rdma",
+        "link"
+      ],
+      "returncode": 0,
+      "stderr": "",
+      "stdout": "link rxe0/1 state ACTIVE physical_state LINK_UP netdev eth0 \n"
+    },
+    "route": {
+      "argv": [
+        "ip",
+        "route",
+        "get",
+        "192.168.109.11",
+        "from",
+        "192.168.109.12"
+      ],
+      "returncode": 0,
+      "stderr": "",
+      "stdout": "192.168.109.11 from 192.168.109.12 dev eth0 uid 501 \n    cache \n"
+    },
+    "sysfs": {
+      "eth0_mtu": "1500\n",
+      "gid": "0000:0000:0000:0000:0000:ffff:c0a8:6d0c\n",
+      "gid_index": 1,
+      "rxe0_node_type": "1: CA\n"
+    }
+  },
+  "peer": "192.168.109.11",
+  "port": 19669,
+  "process": {
+    "exe": "/usr/bin/rping",
+    "exe_sha256": "d4d82fdd9b78cfb9404bbb4c2a8c07dde9d450d7fd4d7041d5d0ffcf32e3e89f",
+    "pid": 732214,
+    "start_ticks": 8691964
+  },
+  "raw_log": "verbose\nvalidate data\nsize 256\ncount 3\nport 19669\nclient\ncreated cm_id 0xb9b004639cc0\ncma_event type RDMA_CM_EVENT_ADDR_RESOLVED cma_id 0xb9b004639cc0 (parent)\ncma_event type RDMA_CM_EVENT_ROUTE_RESOLVED cma_id 0xb9b004639cc0 (parent)\nrdma_resolve_addr - rdma_resolve_route successful\ncreated pd 0xb9b00462e860\ncreated channel 0xb9b00462f890\ncreated cq 0xb9b00463a060\ncreated qp 0xb9b00463a1d0\nrping_setup_buffers called on cb 0xb9b00462c7c0\nallocated & registered buffers...\ncq_thread started.\ncma_event type RDMA_CM_EVENT_ESTABLISHED cma_id 0xb9b004639cc0 (parent)\nESTABLISHED\nrdma_connect successful\nRDMA addr b9b00463a580 rkey 297c4 len 256\nsend completion\nrecv completion\nRDMA addr b9b00463a430 rkey 296bc len 256\nsend completion\nrecv completion\nping data: rdma-ping-0: ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyzABCDEFGHIJ\nRDMA addr b9b00463a580 rkey 297c4 len 256\nsend completion\nrecv completion\nRDMA addr b9b00463a430 rkey 296bc len 256\nsend completion\nrecv completion\nping data: rdma-ping-1: BCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyzABCDEFGHIJK\nRDMA addr b9b00463a580 rkey 297c4 len 256\nsend completion\nrecv completion\nRDMA addr b9b00463a430 rkey 296bc len 256\nsend completion\nrecv completion\nping data: rdma-ping-2: CDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyzABCDEFGHIJKL\nrping_free_buffers called on cb 0xb9b00462c7c0\ndestroy cm_id 0xb9b004639cc0\ncma_event type RDMA_CM_EVENT_DISCONNECTED cma_id 0xb9b004639cc0 (parent)\nclient DISCONNECT EVENT...\n",
+  "raw_log_path": "/tmp/afs-verbs-v69/pairs/a-ctl-256/51ae014f-ac59-48f2-93bd-9f007ae00cdf-client.raw.log",
+  "raw_log_sha256": "b22c34de3e0d4511c167961ad5223a28a52bfb55b2b9639e102f4d35ce70a136",
+  "resources_after": {
+    "rdma_cm_id_json": {
+      "argv": [
+        "rdma",
+        "-j",
+        "resource",
+        "show",
+        "cm_id"
+      ],
+      "returncode": 0,
+      "stderr": "",
+      "stdout": "[]\n"
+    },
+    "rdma_link": {
+      "argv": [
+        "rdma",
+        "link"
+      ],
+      "returncode": 0,
+      "stderr": "",
+      "stdout": "link rxe0/1 state ACTIVE physical_state LINK_UP netdev eth0 \n"
+    },
+    "rdma_qp_json": {
+      "argv": [
+        "rdma",
+        "-j",
+        "resource",
+        "show",
+        "qp"
+      ],
+      "returncode": 0,
+      "stderr": "",
+      "stdout": "[{\"ifindex\":0,\"ifname\":\"rxe0\",\"port\":1,\"lqpn\":370,\"rqpn\":51,\"type\":\"RC\",\"state\":\"RTS\",\"rq-psn\":0,\"sq-psn\":1,\"path-mig-state\":\"MIGRATED\",\"pdn\":121,\"pid\":730780,\"comm\":\"tokio-rt-worker\"},{\"ifindex\":0,\"ifname\":\"rxe0\",\"port\":1,\"lqpn\":1,\"type\":\"GSI\",\"state\":\"RTS\",\"sq-psn\":10,\"comm\":\"ib_core\"}]\n"
+    },
+    "rdma_resource": {
+      "argv": [
+        "rdma",
+        "resource",
+        "show"
+      ],
+      "returncode": 0,
+      "stderr": "",
+      "stdout": "0: rxe0: pd 2 cq 2 qp 2 cm_id 0 mr 1 ctx 1 srq 0 \n"
+    }
+  },
+  "resources_before": {
+    "rdma_cm_id_json": {
+      "argv": [
+        "rdma",
+        "-j",
+        "resource",
+        "show",
+        "cm_id"
+      ],
+      "returncode": 0,
+      "stderr": "",
+      "stdout": "[]\n"
+    },
+    "rdma_link": {
+      "argv": [
+        "rdma",
+        "link"
+      ],
+      "returncode": 0,
+      "stderr": "",
+      "stdout": "link rxe0/1 state ACTIVE physical_state LINK_UP netdev eth0 \n"
+    },
+    "rdma_qp_json": {
+      "argv": [
+        "rdma",
+        "-j",
+        "resource",
+        "show",
+        "qp"
+      ],
+      "returncode": 0,
+      "stderr": "",
+      "stdout": "[{\"ifindex\":0,\"ifname\":\"rxe0\",\"port\":1,\"lqpn\":370,\"rqpn\":51,\"type\":\"RC\",\"state\":\"RTS\",\"rq-psn\":0,\"sq-psn\":1,\"path-mig-state\":\"MIGRATED\",\"pdn\":121,\"pid\":730780,\"comm\":\"tokio-rt-worker\"},{\"ifindex\":0,\"ifname\":\"rxe0\",\"port\":1,\"lqpn\":1,\"type\":\"GSI\",\"state\":\"RTS\",\"sq-psn\":7,\"comm\":\"ib_core\"}]\n"
+    },
+    "rdma_resource": {
+      "argv": [
+        "rdma",
+        "resource",
+        "show"
+      ],
+      "returncode": 0,
+      "stderr": "",
+      "stdout": "0: rxe0: pd 2 cq 2 qp 2 cm_id 0 mr 1 ctx 1 srq 0 \n"
+    }
+  },
+  "returncode": 0,
+  "role": "client",
+  "run_id": "51ae014f-ac59-48f2-93bd-9f007ae00cdf",
+  "size": 256,
+  "started_unix": 1790835772.242048,
+  "timed_out": false,
+  "timeout_seconds": 25
+}

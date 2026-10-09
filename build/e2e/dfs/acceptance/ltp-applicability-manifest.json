@@ -1,0 +1,937 @@
+{
+  "binding": {
+    "expanded_tsv_sha256": "93d60fb5b90e134a46129e5a773c7013b022adae5f8d68af422e37af03cc8ff4",
+    "kernel_release": "6.8.0-142-generic",
+    "machine": "aarch64",
+    "suite_revision": "3a64d78f58bdceba93ed321e91215fb969a047ed"
+  },
+  "policy": {
+    "reference_only_scopes": [
+      "alternateFS-check"
+    ]
+  },
+  "entries": [
+    {
+      "disposition": "pre_reviewed_not_applicable",
+      "event_match": {
+        "message_regex": "'mkisofs'\\ is\\ a\\ symlink\\ to\\ another\\ tool",
+        "source": "__none__",
+        "status": "TCONF"
+      },
+      "id": "0064-isofs:TCONF:__none__:0",
+      "ordinary_subtests_required": true,
+      "rationale": "Install `genisoimage`/`xorriso`; most subtests pass, but `mkisofs` symlink check remains TCONF.",
+      "scope": "alternateFS-check",
+      "test_id": "isofs"
+    },
+    {
+      "disposition": "pre_reviewed_not_applicable",
+      "event_match": {
+        "message_regex": "16\\-bit\\ version\\ of\\ chown\\(\\)\\ is\\ not\\ supported\\ on\\ your\\ platform",
+        "source": "compat_tst_16.h:153",
+        "status": "TCONF"
+      },
+      "id": "0195-chown01_16:TCONF:compat_tst_16.h:153:1",
+      "ordinary_subtests_required": false,
+      "rationale": "aarch64 does not support the legacy 16-bit chown/fchown syscall variant.",
+      "scope": "architectureunsupported",
+      "test_id": "chown01_16"
+    },
+    {
+      "disposition": "pre_reviewed_not_applicable",
+      "event_match": {
+        "message_regex": "16\\-bit\\ version\\ of\\ chown\\(\\)\\ is\\ not\\ supported\\ on\\ your\\ platform",
+        "source": "compat_tst_16.h:153",
+        "status": "TCONF"
+      },
+      "id": "0197-chown02_16:TCONF:compat_tst_16.h:153:2",
+      "ordinary_subtests_required": false,
+      "rationale": "aarch64 does not support the legacy 16-bit chown/fchown syscall variant.",
+      "scope": "architectureunsupported",
+      "test_id": "chown02_16"
+    },
+    {
+      "disposition": "pre_reviewed_not_applicable",
+      "event_match": {
+        "message_regex": "16\\-bit\\ version\\ of\\ chown\\(\\)\\ is\\ not\\ supported\\ on\\ your\\ platform",
+        "source": "compat_tst_16.h:153",
+        "status": "TCONF"
+      },
+      "id": "0199-chown03_16:TCONF:compat_tst_16.h:153:3",
+      "ordinary_subtests_required": false,
+      "rationale": "aarch64 does not support the legacy 16-bit chown/fchown syscall variant.",
+      "scope": "architectureunsupported",
+      "test_id": "chown03_16"
+    },
+    {
+      "disposition": "pre_reviewed_not_applicable",
+      "event_match": {
+        "message_regex": "16\\-bit\\ version\\ of\\ chown\\(\\)\\ is\\ not\\ supported\\ on\\ your\\ platform",
+        "source": "compat_tst_16.h:153",
+        "status": "TCONF"
+      },
+      "id": "0201-chown04_16:TCONF:compat_tst_16.h:153:4",
+      "ordinary_subtests_required": false,
+      "rationale": "aarch64 does not support the legacy 16-bit chown/fchown syscall variant.",
+      "scope": "architectureunsupported",
+      "test_id": "chown04_16"
+    },
+    {
+      "disposition": "pre_reviewed_not_applicable",
+      "event_match": {
+        "message_regex": "16\\-bit\\ version\\ of\\ chown\\(\\)\\ is\\ not\\ supported\\ on\\ your\\ platform",
+        "source": "compat_tst_16.h:153",
+        "status": "TCONF"
+      },
+      "id": "0203-chown05_16:TCONF:compat_tst_16.h:153:5",
+      "ordinary_subtests_required": false,
+      "rationale": "aarch64 does not support the legacy 16-bit chown/fchown syscall variant.",
+      "scope": "architectureunsupported",
+      "test_id": "chown05_16"
+    },
+    {
+      "disposition": "pre_reviewed_not_applicable",
+      "event_match": {
+        "message_regex": "syscall\\(\\-1\\)\\ __NR_epoll_create\\ not\\ supported\\ on\\ your\\ arch",
+        "source": "epoll_create.h:15",
+        "status": "TCONF"
+      },
+      "id": "0216-epoll_create01:TCONF:epoll_create.h:15:6",
+      "ordinary_subtests_required": false,
+      "rationale": "Legacy `__NR_epoll_create` syscall number is not supported on aarch64; modern epoll API coverage is separate.",
+      "scope": "architectureunsupported",
+      "test_id": "epoll_create01"
+    },
+    {
+      "disposition": "pre_reviewed_not_applicable",
+      "event_match": {
+        "message_regex": "syscall\\(\\-1\\)\\ __NR_epoll_create\\ not\\ supported\\ on\\ your\\ arch",
+        "source": "epoll_create.h:15",
+        "status": "TCONF"
+      },
+      "id": "0217-epoll_create02:TCONF:epoll_create.h:15:7",
+      "ordinary_subtests_required": false,
+      "rationale": "Legacy `__NR_epoll_create` syscall number is not supported on aarch64; modern epoll API coverage is separate.",
+      "scope": "architectureunsupported",
+      "test_id": "epoll_create02"
+    },
+    {
+      "disposition": "pre_reviewed_not_applicable",
+      "event_match": {
+        "message_regex": "fallocate\\(\\)\\ not\\ supported",
+        "source": "fallocate04.c:92",
+        "status": "TCONF"
+      },
+      "id": "0223-fallocate04:TCONF:fallocate04.c:92:8",
+      "ordinary_subtests_required": true,
+      "rationale": "Command has passing subtests but reports TCONF for unsupported filesystem/kernel feature combinations; not a prereq-only failure.",
+      "scope": "alternateFS-check",
+      "test_id": "fallocate04"
+    },
+    {
+      "disposition": "pre_reviewed_not_applicable",
+      "event_match": {
+        "message_regex": "FALLOC_FL_COLLAPSE_RANGE\\ not\\ supported",
+        "source": "fallocate04.c:201",
+        "status": "TCONF"
+      },
+      "id": "0223-fallocate04:TCONF:fallocate04.c:201:9",
+      "ordinary_subtests_required": true,
+      "rationale": "Command has passing subtests but reports TCONF for unsupported filesystem/kernel feature combinations; not a prereq-only failure.",
+      "scope": "alternateFS-check",
+      "test_id": "fallocate04"
+    },
+    {
+      "disposition": "pre_reviewed_not_applicable",
+      "event_match": {
+        "message_regex": "FALLOC_FL_PUNCH_HOLE\\ not\\ supported",
+        "source": "fallocate04.c:115",
+        "status": "TCONF"
+      },
+      "id": "0223-fallocate04:TCONF:fallocate04.c:115:10",
+      "ordinary_subtests_required": true,
+      "rationale": "Command has passing subtests but reports TCONF for unsupported filesystem/kernel feature combinations; not a prereq-only failure.",
+      "scope": "alternateFS-check",
+      "test_id": "fallocate04"
+    },
+    {
+      "disposition": "pre_reviewed_not_applicable",
+      "event_match": {
+        "message_regex": "FALLOC_FL_ZERO_RANGE\\ not\\ supported",
+        "source": "fallocate04.c:164",
+        "status": "TCONF"
+      },
+      "id": "0223-fallocate04:TCONF:fallocate04.c:164:11",
+      "ordinary_subtests_required": true,
+      "rationale": "Command has passing subtests but reports TCONF for unsupported filesystem/kernel feature combinations; not a prereq-only failure.",
+      "scope": "alternateFS-check",
+      "test_id": "fallocate04"
+    },
+    {
+      "disposition": "pre_reviewed_not_applicable",
+      "event_match": {
+        "message_regex": "fallocate\\(\\)\\ not\\ supported:\\ EOPNOTSUPP\\ \\(95\\)",
+        "source": "fallocate05.c:68",
+        "status": "TCONF"
+      },
+      "id": "0224-fallocate05:TCONF:fallocate05.c:68:12",
+      "ordinary_subtests_required": true,
+      "rationale": "Command has passing subtests but reports TCONF for unsupported filesystem/kernel feature combinations; not a prereq-only failure.",
+      "scope": "alternateFS-check",
+      "test_id": "fallocate05"
+    },
+    {
+      "disposition": "pre_reviewed_not_applicable",
+      "event_match": {
+        "message_regex": "fallocate\\(FALLOC_FL_PUNCH_HOLE\\ \\|\\ FALLOC_FL_KEEP_SIZE\\)",
+        "source": "fallocate05.c:130",
+        "status": "TCONF"
+      },
+      "id": "0224-fallocate05:TCONF:fallocate05.c:130:13",
+      "ordinary_subtests_required": true,
+      "rationale": "Command has passing subtests but reports TCONF for unsupported filesystem/kernel feature combinations; not a prereq-only failure.",
+      "scope": "alternateFS-check",
+      "test_id": "fallocate05"
+    },
+    {
+      "disposition": "pre_reviewed_not_applicable",
+      "event_match": {
+        "message_regex": "fallocate\\(\\)\\ not\\ supported:\\ EOPNOTSUPP\\ \\(95\\)",
+        "source": "fallocate06.c:196",
+        "status": "TCONF"
+      },
+      "id": "0225-fallocate06:TCONF:fallocate06.c:196:14",
+      "ordinary_subtests_required": true,
+      "rationale": "Command has passing subtests but reports TCONF for unsupported filesystem/kernel feature combinations; not a prereq-only failure.",
+      "scope": "alternateFS-check",
+      "test_id": "fallocate06"
+    },
+    {
+      "disposition": "pre_reviewed_not_applicable",
+      "event_match": {
+        "message_regex": "File\\ system\\ does\\ not\\ support\\ copy\\-on\\-write",
+        "source": "fallocate06.c:181",
+        "status": "TCONF"
+      },
+      "id": "0225-fallocate06:TCONF:fallocate06.c:181:15",
+      "ordinary_subtests_required": true,
+      "rationale": "Command has passing subtests but reports TCONF for unsupported filesystem/kernel feature combinations; not a prereq-only failure.",
+      "scope": "alternateFS-check",
+      "test_id": "fallocate06"
+    },
+    {
+      "disposition": "pre_reviewed_not_applicable",
+      "event_match": {
+        "message_regex": "fallocate\\(FALLOC_FL_PUNCH_HOLE\\ \\|\\ FALLOC_FL_KEEP_SIZE\\):\\ EOPNOTSUPP\\ \\(95\\)",
+        "source": "fallocate06.c:217",
+        "status": "TCONF"
+      },
+      "id": "0225-fallocate06:TCONF:fallocate06.c:217:16",
+      "ordinary_subtests_required": true,
+      "rationale": "Command has passing subtests but reports TCONF for unsupported filesystem/kernel feature combinations; not a prereq-only failure.",
+      "scope": "alternateFS-check",
+      "test_id": "fallocate06"
+    },
+    {
+      "disposition": "pre_reviewed_not_applicable",
+      "event_match": {
+        "message_regex": "fsetxattr\\(2\\)\\ not\\ supported",
+        "source": "fsetxattr01.c:150",
+        "status": "TCONF"
+      },
+      "id": "0226-fsetxattr01:TCONF:fsetxattr01.c:150:17",
+      "ordinary_subtests_required": true,
+      "rationale": "Command has passing xattr subtests but reports TCONF for unsupported namespace/filesystem combinations.",
+      "scope": "alternateFS-check",
+      "test_id": "fsetxattr01"
+    },
+    {
+      "disposition": "pre_reviewed_not_applicable",
+      "event_match": {
+        "message_regex": "16\\-bit\\ version\\ of\\ fchown\\(\\)\\ is\\ not\\ supported\\ on\\ your\\ platform",
+        "source": "compat_tst_16.h:143",
+        "status": "TCONF"
+      },
+      "id": "0239-fchown01_16:TCONF:compat_tst_16.h:143:18",
+      "ordinary_subtests_required": false,
+      "rationale": "aarch64 does not support the legacy 16-bit chown/fchown syscall variant.",
+      "scope": "architectureunsupported",
+      "test_id": "fchown01_16"
+    },
+    {
+      "disposition": "pre_reviewed_not_applicable",
+      "event_match": {
+        "message_regex": "16\\-bit\\ version\\ of\\ fchown\\(\\)\\ is\\ not\\ supported\\ on\\ your\\ platform",
+        "source": "compat_tst_16.h:143",
+        "status": "TCONF"
+      },
+      "id": "0241-fchown02_16:TCONF:compat_tst_16.h:143:19",
+      "ordinary_subtests_required": false,
+      "rationale": "aarch64 does not support the legacy 16-bit chown/fchown syscall variant.",
+      "scope": "architectureunsupported",
+      "test_id": "fchown02_16"
+    },
+    {
+      "disposition": "pre_reviewed_not_applicable",
+      "event_match": {
+        "message_regex": "16\\-bit\\ version\\ of\\ fchown\\(\\)\\ is\\ not\\ supported\\ on\\ your\\ platform",
+        "source": "compat_tst_16.h:143",
+        "status": "TCONF"
+      },
+      "id": "0243-fchown03_16:TCONF:compat_tst_16.h:143:20",
+      "ordinary_subtests_required": false,
+      "rationale": "aarch64 does not support the legacy 16-bit chown/fchown syscall variant.",
+      "scope": "architectureunsupported",
+      "test_id": "fchown03_16"
+    },
+    {
+      "disposition": "pre_reviewed_not_applicable",
+      "event_match": {
+        "message_regex": "16\\-bit\\ version\\ of\\ fchown\\(\\)\\ is\\ not\\ supported\\ on\\ your\\ platform",
+        "source": "compat_tst_16.h:143",
+        "status": "TCONF"
+      },
+      "id": "0245-fchown04_16:TCONF:compat_tst_16.h:143:21",
+      "ordinary_subtests_required": false,
+      "rationale": "aarch64 does not support the legacy 16-bit chown/fchown syscall variant.",
+      "scope": "architectureunsupported",
+      "test_id": "fchown04_16"
+    },
+    {
+      "disposition": "pre_reviewed_not_applicable",
+      "event_match": {
+        "message_regex": "16\\-bit\\ version\\ of\\ fchown\\(\\)\\ is\\ not\\ supported\\ on\\ your\\ platform",
+        "source": "compat_tst_16.h:143",
+        "status": "TCONF"
+      },
+      "id": "0247-fchown05_16:TCONF:compat_tst_16.h:143:22",
+      "ordinary_subtests_required": false,
+      "rationale": "aarch64 does not support the legacy 16-bit chown/fchown syscall variant.",
+      "scope": "architectureunsupported",
+      "test_id": "fchown05_16"
+    },
+    {
+      "disposition": "pre_reviewed_not_applicable",
+      "event_match": {
+        "message_regex": "The\\ test\\ requires\\ kernel\\ 6\\.12\\ or\\ newer",
+        "source": "tst_test.c:1080",
+        "status": "TCONF"
+      },
+      "id": "0325-fcntl40:TCONF:tst_test.c:1080:23",
+      "ordinary_subtests_required": false,
+      "rationale": "Requires kernel >= 6.12; current ctl kernel is 6.8.0-142.",
+      "scope": "irrelevantkernel",
+      "test_id": "fcntl40"
+    },
+    {
+      "disposition": "pre_reviewed_not_applicable",
+      "event_match": {
+        "message_regex": "The\\ test\\ requires\\ kernel\\ 6\\.12\\ or\\ newer",
+        "source": "tst_test.c:1080",
+        "status": "TCONF"
+      },
+      "id": "0326-fcntl40_64:TCONF:tst_test.c:1080:24",
+      "ordinary_subtests_required": false,
+      "rationale": "Requires kernel >= 6.12; current ctl kernel is 6.8.0-142.",
+      "scope": "irrelevantkernel",
+      "test_id": "fcntl40_64"
+    },
+    {
+      "disposition": "pre_reviewed_not_applicable",
+      "event_match": {
+        "message_regex": "no\\ xattr\\ support\\ in\\ fs,\\ mounted\\ without\\ user_xattr\\ option\\ or\\ invalid\\ namespace/name\\ format",
+        "source": "fgetxattr01.c:121",
+        "status": "TCONF"
+      },
+      "id": "0330-fgetxattr01:TCONF:fgetxattr01.c:121:25",
+      "ordinary_subtests_required": true,
+      "rationale": "Command has passing xattr subtests but reports TCONF for unsupported namespace/filesystem combinations.",
+      "scope": "alternateFS-check",
+      "test_id": "fgetxattr01"
+    },
+    {
+      "disposition": "pre_reviewed_not_applicable",
+      "event_match": {
+        "message_regex": "fremovexattr\\(2\\)\\ not\\ supported",
+        "source": "fremovexattr01.c:82",
+        "status": "TCONF"
+      },
+      "id": "0342-fremovexattr01:TCONF:fremovexattr01.c:82:26",
+      "ordinary_subtests_required": true,
+      "rationale": "Command has passing xattr subtests but reports TCONF for unsupported namespace/filesystem combinations.",
+      "scope": "alternateFS-check",
+      "test_id": "fremovexattr01"
+    },
+    {
+      "disposition": "pre_reviewed_not_applicable",
+      "event_match": {
+        "message_regex": "fremovexattr\\(2\\)\\ not\\ supported",
+        "source": "fremovexattr02.c:68",
+        "status": "TCONF"
+      },
+      "id": "0343-fremovexattr02:TCONF:fremovexattr02.c:68:27",
+      "ordinary_subtests_required": true,
+      "rationale": "Command has passing xattr subtests but reports TCONF for unsupported namespace/filesystem combinations.",
+      "scope": "alternateFS-check",
+      "test_id": "fremovexattr02"
+    },
+    {
+      "disposition": "pre_reviewed_not_applicable",
+      "event_match": {
+        "message_regex": "Aborting\\ due\\ to\\ unsuitable\\ kernel\\ config,\\ see\\ above!",
+        "source": "tst_test.c:1453",
+        "status": "TCONF"
+      },
+      "id": "0363-ftruncate04:TCONF:tst_test.c:1453:28",
+      "ordinary_subtests_required": false,
+      "rationale": "Aborts due to unsuitable kernel config reported by LTP.",
+      "scope": "irrelevantkernel",
+      "test_id": "ftruncate04"
+    },
+    {
+      "disposition": "pre_reviewed_not_applicable",
+      "event_match": {
+        "message_regex": "Aborting\\ due\\ to\\ unsuitable\\ kernel\\ config,\\ see\\ above!",
+        "source": "tst_test.c:1453",
+        "status": "TCONF"
+      },
+      "id": "0364-ftruncate04_64:TCONF:tst_test.c:1453:29",
+      "ordinary_subtests_required": false,
+      "rationale": "Aborts due to unsuitable kernel config reported by LTP.",
+      "scope": "irrelevantkernel",
+      "test_id": "ftruncate04_64"
+    },
+    {
+      "disposition": "pre_reviewed_not_applicable",
+      "event_match": {
+        "message_regex": "syscall\\(\\-1\\)\\ __NR_getdents\\ not\\ supported\\ on\\ your\\ arch",
+        "source": "getdents.h:45",
+        "status": "TCONF"
+      },
+      "id": "0365-getdents01:TCONF:getdents.h:45:30",
+      "ordinary_subtests_required": false,
+      "rationale": "Legacy syscall/API is unavailable on aarch64 or unsupported by this arch.",
+      "scope": "architectureunsupported",
+      "test_id": "getdents01"
+    },
+    {
+      "disposition": "pre_reviewed_not_applicable",
+      "event_match": {
+        "message_regex": "libc\\ getdents\\(\\)\\ is\\ not\\ implemented",
+        "source": "getdents.h:157",
+        "status": "TCONF"
+      },
+      "id": "0365-getdents01:TCONF:getdents.h:157:31",
+      "ordinary_subtests_required": false,
+      "rationale": "Legacy syscall/API is unavailable on aarch64 or unsupported by this arch.",
+      "scope": "architectureunsupported",
+      "test_id": "getdents01"
+    },
+    {
+      "disposition": "pre_reviewed_not_applicable",
+      "event_match": {
+        "message_regex": "syscall\\(\\-1\\)\\ __NR_getdents\\ not\\ supported\\ on\\ your\\ arch",
+        "source": "getdents.h:45",
+        "status": "TCONF"
+      },
+      "id": "0366-getdents02:TCONF:getdents.h:45:32",
+      "ordinary_subtests_required": false,
+      "rationale": "Legacy syscall/API is unavailable on aarch64 or unsupported by this arch.",
+      "scope": "architectureunsupported",
+      "test_id": "getdents02"
+    },
+    {
+      "disposition": "pre_reviewed_not_applicable",
+      "event_match": {
+        "message_regex": "libc\\ getdents\\(\\)\\ is\\ not\\ implemented",
+        "source": "getdents.h:157",
+        "status": "TCONF"
+      },
+      "id": "0366-getdents02:TCONF:getdents.h:157:33",
+      "ordinary_subtests_required": false,
+      "rationale": "Legacy syscall/API is unavailable on aarch64 or unsupported by this arch.",
+      "scope": "architectureunsupported",
+      "test_id": "getdents02"
+    },
+    {
+      "disposition": "pre_reviewed_not_applicable",
+      "event_match": {
+        "message_regex": "No\\ xattr\\ support\\ in\\ fs\\ or\\ mount\\ without\\ user_xattr\\ option",
+        "source": "getxattr02.c:99",
+        "status": "TCONF"
+      },
+      "id": "0368-getxattr02:TCONF:getxattr02.c:99:34",
+      "ordinary_subtests_required": true,
+      "rationale": "Command has passing xattr subtests but reports TCONF for unsupported namespace/filesystem combinations.",
+      "scope": "alternateFS-check",
+      "test_id": "getxattr02"
+    },
+    {
+      "disposition": "pre_reviewed_not_applicable",
+      "event_match": {
+        "message_regex": "There\\ are\\ no\\ LSM\\(s\\)\\ implementing\\ xattr",
+        "source": "listxattr04.c:71",
+        "status": "TCONF"
+      },
+      "id": "0387-listxattr04:TCONF:listxattr04.c:71:35",
+      "ordinary_coverage_link": [
+        "setxattr01",
+        "fsetxattr01",
+        "getxattr02",
+        "fgetxattr01"
+      ],
+      "ordinary_subtests_required": true,
+      "rationale": "Security/LSM xattr class is unavailable in this VM; this command has no ordinary TPASS in the repaired run.",
+      "scope": "alternateFS-check",
+      "test_id": "listxattr04"
+    },
+    {
+      "disposition": "pre_reviewed_not_applicable",
+      "event_match": {
+        "message_regex": "symlink\\(\\)\\ not\\ supported",
+        "source": "lremovexattr01.c:112",
+        "status": "TCONF"
+      },
+      "id": "0394-lremovexattr01:TCONF:lremovexattr01.c:112:36",
+      "ordinary_subtests_required": true,
+      "rationale": "Command has passing xattr subtests but reports TCONF for unsupported namespace/filesystem combinations.",
+      "scope": "alternateFS-check",
+      "test_id": "lremovexattr01"
+    },
+    {
+      "disposition": "pre_reviewed_not_applicable",
+      "event_match": {
+        "message_regex": "MAP_DROPPABLE\\ not\\ supported",
+        "source": "mmap22.c:105",
+        "status": "TCONF"
+      },
+      "id": "0431-mmap22:TCONF:mmap22.c:105:37",
+      "ordinary_subtests_required": false,
+      "rationale": "MAP_DROPPABLE not supported by this kernel.",
+      "scope": "irrelevantkernel",
+      "test_id": "mmap22"
+    },
+    {
+      "disposition": "pre_reviewed_not_applicable",
+      "event_match": {
+        "message_regex": "write\\(3,0xb2edc64d9f38,7\\)\\ failed:\\ EFBIG\\ \\(27\\)",
+        "source": "openat02.c:151",
+        "status": "TBROK"
+      },
+      "id": "0453-openat02:TBROK:openat02.c:151:38",
+      "ordinary_subtests_required": true,
+      "rationale": "Still TBROK on ntfs3 subcase: write to large file returns EFBIG after earlier ext* subcases pass.",
+      "scope": "alternateFS-check",
+      "test_id": "openat02"
+    },
+    {
+      "disposition": "pre_reviewed_not_applicable",
+      "event_match": {
+        "message_regex": "Kernel\\ does\\ not\\ support\\ noacl\\ feature",
+        "source": "openat04.c:47",
+        "status": "TCONF"
+      },
+      "id": "0455-openat04:TCONF:openat04.c:47:39",
+      "ordinary_subtests_required": true,
+      "rationale": "Command has passing subtests but reports TCONF for unsupported filesystem/kernel feature combinations; not a prereq-only failure.",
+      "scope": "alternateFS-check",
+      "test_id": "openat04"
+    },
+    {
+      "disposition": "pre_reviewed_not_applicable",
+      "event_match": {
+        "message_regex": "fs\\ doesn't\\ support\\ O_TMPFILE",
+        "source": "openat04.c:66",
+        "status": "TCONF"
+      },
+      "id": "0455-openat04:TCONF:openat04.c:66:40",
+      "ordinary_subtests_required": true,
+      "rationale": "Command has passing subtests but reports TCONF for unsupported filesystem/kernel feature combinations; not a prereq-only failure.",
+      "scope": "alternateFS-check",
+      "test_id": "openat04"
+    },
+    {
+      "disposition": "pre_reviewed_not_applicable",
+      "event_match": {
+        "message_regex": "preadv2\\(\\):\\ EOPNOTSUPP\\ \\(95\\)",
+        "source": "preadv203.c:237",
+        "status": "TCONF"
+      },
+      "id": "0481-preadv203:TCONF:preadv203.c:237:41",
+      "ordinary_subtests_required": true,
+      "rationale": "Command has passing subtests but reports TCONF for unsupported filesystem/kernel feature combinations; not a prereq-only failure.",
+      "scope": "alternateFS-check",
+      "test_id": "preadv203"
+    },
+    {
+      "disposition": "pre_reviewed_not_applicable",
+      "event_match": {
+        "message_regex": "preadv2\\(\\):\\ EOPNOTSUPP\\ \\(95\\)",
+        "source": "preadv203.c:237",
+        "status": "TCONF"
+      },
+      "id": "0482-preadv203_64:TCONF:preadv203.c:237:42",
+      "ordinary_subtests_required": true,
+      "rationale": "Command has passing subtests but reports TCONF for unsupported filesystem/kernel feature combinations; not a prereq-only failure.",
+      "scope": "alternateFS-check",
+      "test_id": "preadv203_64"
+    },
+    {
+      "disposition": "pre_reviewed_not_applicable",
+      "event_match": {
+        "message_regex": "syscall\\(\\-1\\)\\ __NR_readdir\\ not\\ supported\\ on\\ your\\ arch",
+        "source": "readdir21.c:69",
+        "status": "TCONF"
+      },
+      "id": "0514-readdir21:TCONF:readdir21.c:69:43",
+      "ordinary_subtests_required": false,
+      "rationale": "Legacy syscall/API is unavailable on aarch64 or unsupported by this arch.",
+      "scope": "architectureunsupported",
+      "test_id": "readdir21"
+    },
+    {
+      "disposition": "pre_reviewed_not_applicable",
+      "event_match": {
+        "message_regex": "rename11\\.c:167:\\ EMLINK\\ test\\ is\\ not\\ appropriate",
+        "source": "rename11.c:167",
+        "status": "TCONF"
+      },
+      "id": "0532-rename11:TCONF:rename11.c:167:44",
+      "ordinary_subtests_required": true,
+      "rationale": "Command has passing subtests but reports TCONF for unsupported filesystem/kernel feature combinations; not a prereq-only failure.",
+      "scope": "alternateFS-check",
+      "test_id": "rename11"
+    },
+    {
+      "disposition": "pre_reviewed_not_applicable",
+      "event_match": {
+        "message_regex": "renameat01\\.c:192:\\ EMLINK\\ test\\ is\\ not\\ appropriate",
+        "source": "renameat01.c:192",
+        "status": "TCONF"
+      },
+      "id": "0537-renameat01:TCONF:renameat01.c:192:45",
+      "ordinary_subtests_required": true,
+      "rationale": "Command has passing subtests but reports TCONF for unsupported filesystem/kernel feature combinations; not a prereq-only failure.",
+      "scope": "alternateFS-check",
+      "test_id": "renameat01"
+    },
+    {
+      "disposition": "pre_reviewed_not_applicable",
+      "event_match": {
+        "message_regex": "This\\ arch\\ 'aarch64'\\ is\\ not\\ supported\\ for\\ test!",
+        "source": "tst_test.c:1417",
+        "status": "TCONF"
+      },
+      "id": "0559-set_thread_area01:TCONF:tst_test.c:1417:46",
+      "ordinary_subtests_required": false,
+      "rationale": "Legacy syscall/API is unavailable on aarch64 or unsupported by this arch.",
+      "scope": "architectureunsupported",
+      "test_id": "set_thread_area01"
+    },
+    {
+      "disposition": "pre_reviewed_not_applicable",
+      "event_match": {
+        "message_regex": "This\\ arch\\ 'aarch64'\\ is\\ not\\ supported\\ for\\ test!",
+        "source": "tst_test.c:1417",
+        "status": "TCONF"
+      },
+      "id": "0560-set_thread_area02:TCONF:tst_test.c:1417:47",
+      "ordinary_subtests_required": false,
+      "rationale": "Legacy syscall/API is unavailable on aarch64 or unsupported by this arch.",
+      "scope": "architectureunsupported",
+      "test_id": "set_thread_area02"
+    },
+    {
+      "disposition": "pre_reviewed_not_applicable",
+      "event_match": {
+        "message_regex": "setxattr\\(2\\)\\ not\\ supported",
+        "source": "setxattr01.c:138",
+        "status": "TCONF"
+      },
+      "id": "0561-setxattr01:TCONF:setxattr01.c:138:48",
+      "ordinary_subtests_required": true,
+      "rationale": "Command has passing xattr subtests but reports TCONF for unsupported namespace/filesystem combinations.",
+      "scope": "alternateFS-check",
+      "test_id": "setxattr01"
+    },
+    {
+      "disposition": "pre_reviewed_not_applicable",
+      "event_match": {
+        "message_regex": "The\\ test\\ requires\\ kernel\\ 6\\.11\\ or\\ newer",
+        "source": "tst_test.c:1080",
+        "status": "TCONF"
+      },
+      "id": "0589-statmount09:TCONF:tst_test.c:1080:49",
+      "ordinary_subtests_required": false,
+      "rationale": "Requires kernel >= 6.11; current ctl kernel is 6.8.0-142.",
+      "scope": "irrelevantkernel",
+      "test_id": "statmount09"
+    },
+    {
+      "disposition": "pre_reviewed_not_applicable",
+      "event_match": {
+        "message_regex": "Inode\\ attributes\\ not\\ supported\\ by\\ 'ntfs3'",
+        "source": "unlink09.c:66",
+        "status": "TBROK"
+      },
+      "id": "0615-unlink09:TBROK:unlink09.c:66:50",
+      "ordinary_subtests_required": true,
+      "rationale": "Still TBROK on ntfs3 subcase: inode attributes unsupported by ntfs3 after ext* subcases pass.",
+      "scope": "alternateFS-check",
+      "test_id": "unlink09"
+    },
+    {
+      "disposition": "pre_reviewed_not_applicable",
+      "event_match": {
+        "message_regex": "syscall\\(\\-1\\)\\ __NR_ustat\\ not\\ supported\\ on\\ your\\ arch",
+        "source": "ustat01.c:26",
+        "status": "TCONF"
+      },
+      "id": "0618-ustat01:TCONF:ustat01.c:26:51",
+      "ordinary_subtests_required": false,
+      "rationale": "Legacy syscall/API is unavailable on aarch64 or unsupported by this arch.",
+      "scope": "architectureunsupported",
+      "test_id": "ustat01"
+    },
+    {
+      "disposition": "pre_reviewed_not_applicable",
+      "event_match": {
+        "message_regex": "syscall\\(\\-1\\)\\ __NR_ustat\\ not\\ supported\\ on\\ your\\ arch",
+        "source": "ustat02.c:40",
+        "status": "TCONF"
+      },
+      "id": "0619-ustat02:TCONF:ustat02.c:40:52",
+      "ordinary_subtests_required": false,
+      "rationale": "Legacy syscall/API is unavailable on aarch64 or unsupported by this arch.",
+      "scope": "architectureunsupported",
+      "test_id": "ustat02"
+    },
+    {
+      "disposition": "pre_reviewed_not_applicable",
+      "event_match": {
+        "message_regex": "perf_event_open01\\.c:152:\\ perf_event_open\\ for\\ PERF_COUNT_HW_INSTRUCTIONS\\ not\\ supported:\\ TEST_ERRNO=ENOENT\\(2\\):\\ No\\ such\\ file\\ or\\ directory",
+        "source": "perf_event_open01.c:152",
+        "status": "TCONF"
+      },
+      "id": "0636-perf_event_open01:TCONF:perf_event_open01.c:152:53",
+      "ordinary_subtests_required": false,
+      "rationale": "Perf hardware/intel_pt events unavailable under this ARM VM/kernel configuration.",
+      "scope": "irrelevantkernel",
+      "test_id": "perf_event_open01"
+    },
+    {
+      "disposition": "pre_reviewed_not_applicable",
+      "event_match": {
+        "message_regex": "perf_event_open01\\.c:152:\\ perf_event_open\\ for\\ PERF_COUNT_HW_CACHE_REFERENCES\\ not\\ supported:\\ TEST_ERRNO=ENOENT\\(2\\):\\ No\\ such\\ file\\ or\\ directory",
+        "source": "perf_event_open01.c:152",
+        "status": "TCONF"
+      },
+      "id": "0636-perf_event_open01:TCONF:perf_event_open01.c:152:54",
+      "ordinary_subtests_required": false,
+      "rationale": "Perf hardware/intel_pt events unavailable under this ARM VM/kernel configuration.",
+      "scope": "irrelevantkernel",
+      "test_id": "perf_event_open01"
+    },
+    {
+      "disposition": "pre_reviewed_not_applicable",
+      "event_match": {
+        "message_regex": "perf_event_open01\\.c:152:\\ perf_event_open\\ for\\ PERF_COUNT_HW_CACHE_MISSES\\ not\\ supported:\\ TEST_ERRNO=ENOENT\\(2\\):\\ No\\ such\\ file\\ or\\ directory",
+        "source": "perf_event_open01.c:152",
+        "status": "TCONF"
+      },
+      "id": "0636-perf_event_open01:TCONF:perf_event_open01.c:152:55",
+      "ordinary_subtests_required": false,
+      "rationale": "Perf hardware/intel_pt events unavailable under this ARM VM/kernel configuration.",
+      "scope": "irrelevantkernel",
+      "test_id": "perf_event_open01"
+    },
+    {
+      "disposition": "pre_reviewed_not_applicable",
+      "event_match": {
+        "message_regex": "perf_event_open01\\.c:152:\\ perf_event_open\\ for\\ PERF_COUNT_HW_BRANCH_INSTRUCTIONS\\ not\\ supported:\\ TEST_ERRNO=ENOENT\\(2\\):\\ No\\ such\\ file\\ or\\ directory",
+        "source": "perf_event_open01.c:152",
+        "status": "TCONF"
+      },
+      "id": "0636-perf_event_open01:TCONF:perf_event_open01.c:152:56",
+      "ordinary_subtests_required": false,
+      "rationale": "Perf hardware/intel_pt events unavailable under this ARM VM/kernel configuration.",
+      "scope": "irrelevantkernel",
+      "test_id": "perf_event_open01"
+    },
+    {
+      "disposition": "pre_reviewed_not_applicable",
+      "event_match": {
+        "message_regex": "perf_event_open01\\.c:152:\\ perf_event_open\\ for\\ PERF_COUNT_HW_BRANCH_MISSES\\ not\\ supported:\\ TEST_ERRNO=ENOENT\\(2\\):\\ No\\ such\\ file\\ or\\ directory",
+        "source": "perf_event_open01.c:152",
+        "status": "TCONF"
+      },
+      "id": "0636-perf_event_open01:TCONF:perf_event_open01.c:152:57",
+      "ordinary_subtests_required": false,
+      "rationale": "Perf hardware/intel_pt events unavailable under this ARM VM/kernel configuration.",
+      "scope": "irrelevantkernel",
+      "test_id": "perf_event_open01"
+    },
+    {
+      "disposition": "pre_reviewed_not_applicable",
+      "event_match": {
+        "message_regex": "perf_event_open\\ type/config\\ not\\ supported:\\ ENOENT\\ \\(2\\)",
+        "source": "perf_event_open.h:30",
+        "status": "TCONF"
+      },
+      "id": "0637-perf_event_open02:TCONF:perf_event_open.h:30:58",
+      "ordinary_subtests_required": false,
+      "rationale": "Perf hardware/intel_pt events unavailable under this ARM VM/kernel configuration.",
+      "scope": "irrelevantkernel",
+      "test_id": "perf_event_open02"
+    },
+    {
+      "disposition": "pre_reviewed_not_applicable",
+      "event_match": {
+        "message_regex": "copy_file_range\\(\\)\\ doesn't\\ support\\ cross\\-device,\\ skip\\ it",
+        "source": "copy_file_range01.c:179",
+        "status": "TCONF"
+      },
+      "id": "0642-copy_file_range01:TCONF:copy_file_range01.c:179:59",
+      "ordinary_subtests_required": true,
+      "rationale": "Command has passing subtests but reports TCONF for unsupported filesystem/kernel feature combinations; not a prereq-only failure.",
+      "scope": "alternateFS-check",
+      "test_id": "copy_file_range01"
+    },
+    {
+      "disposition": "pre_reviewed_not_applicable",
+      "event_match": {
+        "message_regex": "copy_file_range\\(\\)\\ doesn't\\ support\\ cross\\-device,\\ skip\\ it",
+        "source": "copy_file_range02.c:115",
+        "status": "TCONF"
+      },
+      "id": "0643-copy_file_range02:TCONF:copy_file_range02.c:115:60",
+      "ordinary_subtests_required": true,
+      "rationale": "Command has passing subtests but reports TCONF for unsupported filesystem/kernel feature combinations; not a prereq-only failure.",
+      "scope": "alternateFS-check",
+      "test_id": "copy_file_range02"
+    },
+    {
+      "disposition": "pre_reviewed_not_applicable",
+      "event_match": {
+        "message_regex": "Inode\\ attributes\\ not\\ supported:\\ ENOTTY\\ \\(25\\)",
+        "source": "statx04.c:89",
+        "status": "TCONF"
+      },
+      "id": "0648-statx04:TCONF:statx04.c:89:61",
+      "ordinary_subtests_required": true,
+      "rationale": "Command has passing subtests but reports TCONF for unsupported filesystem/kernel feature combinations; not a prereq-only failure.",
+      "scope": "alternateFS-check",
+      "test_id": "statx04"
+    },
+    {
+      "disposition": "pre_reviewed_not_applicable",
+      "event_match": {
+        "message_regex": "filesystem\\ doesn't\\ support\\ FS_COMPR_FL",
+        "source": "statx08.c:134",
+        "status": "TCONF"
+      },
+      "id": "0652-statx08:TCONF:statx08.c:134:62",
+      "ordinary_subtests_required": true,
+      "rationale": "Command has passing subtests but reports TCONF for unsupported filesystem/kernel feature combinations; not a prereq-only failure.",
+      "scope": "alternateFS-check",
+      "test_id": "statx08"
+    },
+    {
+      "disposition": "pre_reviewed_not_applicable",
+      "event_match": {
+        "message_regex": "filesystem\\ doesn't\\ support\\ FS_APPEND_FL",
+        "source": "statx08.c:138",
+        "status": "TCONF"
+      },
+      "id": "0652-statx08:TCONF:statx08.c:138:63",
+      "ordinary_subtests_required": true,
+      "rationale": "Command has passing subtests but reports TCONF for unsupported filesystem/kernel feature combinations; not a prereq-only failure.",
+      "scope": "alternateFS-check",
+      "test_id": "statx08"
+    },
+    {
+      "disposition": "pre_reviewed_not_applicable",
+      "event_match": {
+        "message_regex": "filesystem\\ doesn't\\ support\\ FS_IMMUTABLE_FL",
+        "source": "statx08.c:142",
+        "status": "TCONF"
+      },
+      "id": "0652-statx08:TCONF:statx08.c:142:64",
+      "ordinary_subtests_required": true,
+      "rationale": "Command has passing subtests but reports TCONF for unsupported filesystem/kernel feature combinations; not a prereq-only failure.",
+      "scope": "alternateFS-check",
+      "test_id": "statx08"
+    },
+    {
+      "disposition": "pre_reviewed_not_applicable",
+      "event_match": {
+        "message_regex": "filesystem\\ doesn't\\ support\\ FS_NODUMP_FL",
+        "source": "statx08.c:146",
+        "status": "TCONF"
+      },
+      "id": "0652-statx08:TCONF:statx08.c:146:65",
+      "ordinary_subtests_required": true,
+      "rationale": "Command has passing subtests but reports TCONF for unsupported filesystem/kernel feature combinations; not a prereq-only failure.",
+      "scope": "alternateFS-check",
+      "test_id": "statx08"
+    },
+    {
+      "disposition": "pre_reviewed_not_applicable",
+      "event_match": {
+        "message_regex": "filesystem\\ doesn't\\ support\\ the\\ above\\ any\\ attr,\\ skip\\ it",
+        "source": "statx08.c:149",
+        "status": "TCONF"
+      },
+      "id": "0652-statx08:TCONF:statx08.c:149:66",
+      "ordinary_subtests_required": true,
+      "rationale": "Command has passing subtests but reports TCONF for unsupported filesystem/kernel feature combinations; not a prereq-only failure.",
+      "scope": "alternateFS-check",
+      "test_id": "statx08"
+    },
+    {
+      "disposition": "pre_reviewed_not_applicable",
+      "event_match": {
+        "message_regex": "FS_IOC_GETFLAGS\\ not\\ supported:\\ ENOTTY\\ \\(25\\)",
+        "source": "statx08.c:93",
+        "status": "TCONF"
+      },
+      "id": "0652-statx08:TCONF:statx08.c:93:67",
+      "ordinary_subtests_required": true,
+      "rationale": "Command has passing subtests but reports TCONF for unsupported filesystem/kernel feature combinations; not a prereq-only failure.",
+      "scope": "alternateFS-check",
+      "test_id": "statx08"
+    },
+    {
+      "disposition": "pre_reviewed_not_applicable",
+      "event_match": {
+        "message_regex": "This\\ test\\ only\\ supports\\ ext4\\ and\\ xfs",
+        "source": "statx10.c:69",
+        "status": "TCONF"
+      },
+      "id": "0654-statx10:TCONF:statx10.c:69:68",
+      "ordinary_subtests_required": true,
+      "rationale": "Command has passing subtests but reports TCONF for unsupported filesystem/kernel feature combinations; not a prereq-only failure.",
+      "scope": "alternateFS-check",
+      "test_id": "statx10"
+    },
+    {
+      "disposition": "pre_reviewed_not_applicable",
+      "event_match": {
+        "message_regex": "intel_pt\\ is\\ not\\ available",
+        "source": "perf_event_open03.c:41",
+        "status": "TCONF"
+      },
+      "id": "0657-perf_event_open03:TCONF:perf_event_open03.c:41:69",
+      "ordinary_subtests_required": false,
+      "rationale": "Perf hardware/intel_pt events unavailable under this ARM VM/kernel configuration.",
+      "scope": "irrelevantkernel",
+      "test_id": "perf_event_open03"
+    }
+  ],
+  "policy": {
+    "post_failure_filtering": false,
+    "raw_commands_required": 657,
+    "unit": "ltp-event",
+    "whole_command_exclusions": false
+  }
+}

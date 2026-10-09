@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "observed_unix_ns": 1790835418780876653,
+  "hostname": "lima-afs-accept-c",
+  "kernel": "6.8.0-142-generic",
+  "boot_id": "3f24f24f-11f0-48f1-98b9-d54fe961595f",
+  "machine_id": "180c1789613a45409c8e5a793aaf0b07",
+  "processes": [],
+  "afs_mounts": [],
+  "commands": {
+    "rdma_link": {
+      "argv": [
+        "rdma",
+        "link"
+      ],
+      "returncode": 0,
+      "stdout": "link rxe0/1 state ACTIVE physical_state LINK_UP netdev eth0 \n",
+      "stderr": ""
+    },
+    "qp": {
+      "argv": [
+        "rdma",
+        "-j",
+        "resource",
+        "show",
+        "qp"
+      ],
+      "returncode": 0,
+      "stdout": "[{\"ifindex\":0,\"ifname\":\"rxe0\",\"port\":1,\"lqpn\":1,\"type\":\"GSI\",\"state\":\"RTS\",\"sq-psn\":0,\"comm\":\"ib_core\"}]\n",
+      "stderr": ""
+    },
+    "cm_id": {
+      "argv": [
+        "rdma",
+        "-j",
+        "resource",
+        "show",
+        "cm_id"
+      ],
+      "returncode": 0,
+      "stdout": "[]\n",
+      "stderr": ""
+    },
+    "statistics": {
+      "argv": [
+        "rdma",
+        "statistic",
+        "show",
+        "link",
+        "rxe0/1"
+      ],
+      "returncode": 0,
+      "stdout": "link rxe0/1 sent_pkts 0 rcvd_pkts 0 duplicate_request 0 out_of_seq_request 0 rcvd_rnr_err 0 send_rnr_err 0 rcvd_seq_err 0 ack_deferred 0 retry_exceeded_err 0 retry_rnr_exceeded_err 0 completer_retry_err 0 send_err 0 link_downed 0 rdma_sends 0 rdma_recvs 0 \n",
+      "stderr": ""
+    }
+  }
+}
