@@ -6,7 +6,7 @@ component=${1:?component is required}
 [[ -z $(git status --porcelain) ]] || { echo 'clean checkout required'; exit 1; }
 [[ $(git rev-parse HEAD) == "$BUILDKITE_COMMIT" ]]
 
-export ADX_RELEASE_TARGET=x86_64-unknown-linux-gnu
+source .buildkite/build-architecture.sh
 source .buildkite/bootstrap-build.sh
 host=$(rustc -vV | sed -n 's/^host: //p')
 [[ $host == "$ADX_RELEASE_TARGET" ]] || { echo "builder target mismatch: $host" >&2; exit 1; }
@@ -39,7 +39,7 @@ case "$component" in
     ;;
   execd)
     echo "--- :rust: Compile static EXECD and runtime filesystem"
-    musl_target=x86_64-unknown-linux-musl
+    musl_target=$ADX_MUSL_TARGET
     cargo build --locked --release --target "$musl_target" -j "$jobs" \
       -p adx-execd --bin adx-execd
     cp "$CARGO_TARGET_DIR/$musl_target/release/adx-execd" "$output/adx-execd"
@@ -60,4 +60,6 @@ python3 build/release/component.py create \
   --target "$ADX_RELEASE_TARGET"
 tar -czf "out/buildkite/components/$component.tar.gz" -C "$output" .
 
-bash .buildkite/component-transfer.sh upload "$component"
+if [[ ${ADX_COMPONENT_LOCAL:-0} != 1 ]]; then
+  bash .buildkite/component-transfer.sh upload "$component"
+fi

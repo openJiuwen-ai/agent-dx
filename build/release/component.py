@@ -115,6 +115,8 @@ def create_build_manifest(
     backend_manifest,
     backend_archive,
 ):
+    if (backend_manifest is None) != (backend_archive is None):
+        raise ValueError("backend manifest and archive must be supplied together")
     _identity(commit, target)
     component_root = Path(component_root)
     components = {}
@@ -139,7 +141,7 @@ def create_build_manifest(
             "archive": _artifact(release_archive),
         },
         "sdk": _artifact(wheel),
-        "backend": {
+        "backend": None if backend_manifest is None else {
             "manifest": _artifact(backend_manifest),
             "archive": _artifact(backend_archive),
         },
@@ -188,8 +190,14 @@ def verify_build_manifest(
     )
     _verify_artifact(manifest.get("package", {}).get("archive"), release_archive, "release archive")
     _verify_artifact(manifest.get("sdk"), wheel, "SDK wheel")
-    _verify_artifact(manifest.get("backend", {}).get("manifest"), backend_manifest, "backend manifest")
-    _verify_artifact(manifest.get("backend", {}).get("archive"), backend_archive, "backend archive")
+    if (backend_manifest is None) != (backend_archive is None):
+        raise ValueError("backend manifest and archive must be supplied together")
+    if backend_manifest is None:
+        if "backend" not in manifest or manifest["backend"] is not None:
+            raise ValueError("unexpected external backend record")
+    else:
+        _verify_artifact((manifest.get("backend") or {}).get("manifest"), backend_manifest, "backend manifest")
+        _verify_artifact((manifest.get("backend") or {}).get("archive"), backend_archive, "backend archive")
     return manifest
 
 
@@ -220,8 +228,8 @@ def main():
     aggregate.add_argument("--package-manifest", type=Path, required=True)
     aggregate.add_argument("--release-archive", type=Path, required=True)
     aggregate.add_argument("--wheel", type=Path, required=True)
-    aggregate.add_argument("--backend-manifest", type=Path, required=True)
-    aggregate.add_argument("--backend-archive", type=Path, required=True)
+    aggregate.add_argument("--backend-manifest", type=Path)
+    aggregate.add_argument("--backend-archive", type=Path)
     aggregate.add_argument("--output", type=Path, required=True)
 
     verify_build = subparsers.add_parser("verify-build")
@@ -231,8 +239,8 @@ def main():
     verify_build.add_argument("--package-manifest", type=Path, required=True)
     verify_build.add_argument("--release-archive", type=Path, required=True)
     verify_build.add_argument("--wheel", type=Path, required=True)
-    verify_build.add_argument("--backend-manifest", type=Path, required=True)
-    verify_build.add_argument("--backend-archive", type=Path, required=True)
+    verify_build.add_argument("--backend-manifest", type=Path)
+    verify_build.add_argument("--backend-archive", type=Path)
 
     arguments = parser.parse_args()
     commit = getattr(arguments, "commit", None) or _git_commit()

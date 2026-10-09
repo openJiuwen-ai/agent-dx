@@ -29,7 +29,9 @@ class BuildImageContractTests(unittest.TestCase):
         for package in ('autoconf', 'automake', 'libtool', 'pkg-config', 'binutils',
                         'busybox-static', 'musl-tools'):
             self.assertIn(package, self.dockerfile)
-        self.assertIn('rustup target add x86_64-unknown-linux-musl', self.dockerfile)
+        self.assertIn('target=x86_64-unknown-linux-musl', self.dockerfile)
+        self.assertIn('target=aarch64-unknown-linux-musl', self.dockerfile)
+        self.assertIn('rustup target add "$target"', self.dockerfile)
         self.assertIn('rustup component add rustfmt clippy', self.dockerfile)
         self.assertIn('GOROOT=/usr/local/go', self.dockerfile)
         self.assertIn('go env GOROOT', self.verify)
@@ -47,8 +49,8 @@ class BuildImageContractTests(unittest.TestCase):
         self.assertIn('docker pull "$published"', self.sync)
         self.assertIn('verify_image "$published"', self.sync)
         self.assertIn('[[ $repository != *:latest ]]', self.sync)
-        self.assertIn('tag="$repository:${BUILDKITE_COMMIT:0:12}"', self.sync)
-        self.assertIn('cache_tag="$repository:buildcache"', self.sync)
+        self.assertIn('tag="$repository:${BUILDKITE_COMMIT:0:12}$suffix"', self.sync)
+        self.assertIn('cache_tag="$repository:buildcache$suffix"', self.sync)
         self.assertIn('BUILDKIT_INLINE_CACHE=1', self.sync)
 
     def test_pipeline_and_local_build_use_published_image(self):
