@@ -25,10 +25,10 @@ if [[ -n "$merge_base" ]]; then
   changed=$(git diff --name-only "$merge_base"...HEAD)
 else
   echo 'No merge base available; running AFS optional gate conservatively.'
-  changed='dfs/__unknown_base__'
+  changed='afs/__unknown_base__'
 fi
 
-if ! grep -Eq '^(dfs/|build/e2e/dfs/|build/config/examples/afs/|docs/(development/dfs-plan\.md|migration/2026-10-09-dfs-snapshot\.md|migration/sources\.json)|Cargo\.toml|Cargo\.lock|rust-toolchain\.toml|rustfmt\.toml|Makefile|\.buildkite/afs-gate\.sh|build/ci/run\.py|build/release/|platform/deployment/)' <<<"$changed"; then
+if ! grep -Eq '^(afs/|build/e2e/afs/|build/config/examples/afs/|docs/((architecture|deployment|testing)/afs\.md|development/afs-plan\.md|migration/2026-10-09-afs-snapshot\.md|migration/sources\.json)|Cargo\.toml|Cargo\.lock|rust-toolchain\.toml|rustfmt\.toml|Makefile|\.buildkite/afs-gate\.sh|build/ci/run\.py|build/release/|platform/deployment/)' <<<"$changed"; then
   echo 'No AFS-related changes detected; skipping AFS optional gate.'
   exit 0
 fi

@@ -34,10 +34,10 @@
       "commit": "1bf02097483539363a158163c682f9b805c15a86",
       "tested_commit": "808ad739c07b0c6e04d8075376faa72737f4dd44",
       "tree": "4de2bd77a15cb05e7c7b2c858eba5b8493aefd82",
-      "target": "dfs",
+      "target": "afs",
       "selection": "Whitelisted DMS/AFS source snapshot: product crates, Cargo-bound tests, small fixtures, test support helpers and source license texts. Process evidence, checkpoints, archives, third_party/fuser, GitHub/Codex/OMX metadata and historical logs remain outside this repository.",
       "component_gate": "Default Agent DX build/test/package/deploy excludes Agent FS（AFS，含 OwnerFs 和 DFS）. Set ADX_WITH_AFS=1 or run the afs CI suite to exercise the optional component build and tests; set ADX_WITH_AFS=1 for an explicit filesystem release package.",
-      "migration_note": "docs/migration/2026-10-09-dfs-snapshot.md"
+      "migration_note": "docs/migration/2026-10-09-afs-snapshot.md"
     }
   ],
   "protocols": "Imported protobuf structures retained; component environment variables, route keys and branded headers use ADX naming. Frontend go_package imports are local to this module.",
