@@ -25,14 +25,17 @@ class RuntimeAffinityScenarioTests(unittest.TestCase):
                 self.id = "default-runtime-affinity"
                 self.commands = types.SimpleNamespace(run=self.run)
 
-            def run(self, command):
+            @staticmethod
+            def run(command):
                 state["commands"].append(command)
                 return types.SimpleNamespace(exit_code=0, stdout="runtime-affinity-ready")
 
-            def kill(self):
+            @staticmethod
+            def kill():
                 state["deleted"] = True
 
-            def close(self):
+            @staticmethod
+            def close():
                 state["closed"] = True
 
         def catalog():

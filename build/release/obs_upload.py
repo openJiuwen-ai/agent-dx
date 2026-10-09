@@ -34,7 +34,8 @@ def normalized_endpoint(endpoint):
     value = endpoint.strip()
     for scheme in ("https://", "http://"):
         if value.startswith(scheme):
-            value = value[len(scheme) :]
+            prefix_length = len(scheme)
+            value = value[prefix_length:]
             break
     value = value.rstrip("/")
     if not value or "/" in value or any(ch.isspace() for ch in value):

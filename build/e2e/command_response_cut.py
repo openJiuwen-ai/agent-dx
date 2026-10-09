@@ -7,6 +7,7 @@ import threading
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import PurePosixPath
 from urllib.error import HTTPError
 from urllib.request import HTTPSHandler, ProxyHandler, Request, build_opener
 
@@ -68,22 +69,19 @@ class CommandResponseCutProxy:
 
             def _forward(self):
                 body = self.rfile.read(int(self.headers['Content-Length'])) if self.command == 'POST' else None
-                if (
+                reject_command_query = (
                     body is not None
                     and self.path.startswith('/direct/')
                     and json.loads(body).get('action') == 'process.get'
                     and proxy.reject_get
-                ):
+                )
+                if reject_command_query:
                     with proxy._lock:
                         proxy.rejected_get_attempts += 1
                     self.send_error(503, 'command query unavailable')
                     return
-                headers = {
-                    key: value
-                    for key, value in self.headers.items()
-                    if key.lower()
-                    not in ('host', 'connection', 'content-length', 'accept-encoding', 'transfer-encoding')
-                }
+                excluded_headers = ('host', 'connection', 'content-length', 'accept-encoding', 'transfer-encoding')
+                headers = {key: value for key, value in self.headers.items() if key.lower() not in excluded_headers}
                 request = Request(proxy.upstream + self.path, data=body, headers=headers, method=self.command)
                 handlers = [ProxyHandler({})]
                 if proxy.upstream.startswith('https:'):
@@ -176,7 +174,7 @@ def run(connection, image, output, secrets):
     report = {'status': 'failed', 'cases': [], 'cleanup_errors': []}
     name = 'command-cut-' + uuid.uuid4().hex[:12]
     command_id = 'command-cut-' + uuid.uuid4().hex[:12]
-    marker = '/tmp/' + command_id + '.marker'
+    marker = str(PurePosixPath('/tmp') / f'{command_id}.marker')
     sandbox = None
     attached = None
     recovered_handle = None
@@ -220,12 +218,13 @@ def run(connection, image, output, secrets):
                     command_id=command_id,
                 )
             except CommandSubmissionError as error:
-                if (
+                outcome_identity_lost = (
                     error.command_id != command_id
                     or not error.may_have_started
                     or error.sandbox_id != sandbox.id
                     or not error.request_id
-                ):
+                )
+                if outcome_identity_lost:
                     raise AssertionError(f'command unknown-outcome identity lost: {error}') from error
                 report['request_id'] = error.request_id
             else:

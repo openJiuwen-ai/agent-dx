@@ -1,5 +1,17 @@
 """Machine-readable ownership of the public Sandbox SDK E2E surface."""
 
+_FILESYSTEM_OPERATIONS = (
+    'read',
+    'write',
+    'list',
+    'exists',
+    'remove',
+    'rename',
+    'make_dir',
+    'get_info',
+    'copy_from_local',
+    'copy_to_local',
+)
 SURFACE = {
     'Sandbox': {
         'create': 'firecracker',
@@ -34,21 +46,7 @@ SURFACE = {
         for name in ('id', 'sandbox_id', 'poll', 'wait', 'wait_async', 'kill', 'send_stdin', 'close_stdin')
     },
     'Commands': {name: 'standalone' for name in ('run', 'get', 'list', 'kill', 'send_stdin', 'close_stdin')},
-    'Filesystem': {
-        name: 'standalone'
-        for name in (
-            'read',
-            'write',
-            'list',
-            'exists',
-            'remove',
-            'rename',
-            'make_dir',
-            'get_info',
-            'copy_from_local',
-            'copy_to_local',
-        )
-    },
+    'Filesystem': {name: 'standalone' for name in _FILESYSTEM_OPERATIONS},
     'PtySession': {
         name: 'standalone'
         for name in ('session_id', 'exit_code', 'done', 'send_stdin', 'close_stdin', 'resize', 'wait', 'close')
@@ -143,9 +141,9 @@ def counts():
 
 
 def supported_operations():
-    return {
-        f'{owner}.{name}'
-        for owner, members in SURFACE.items()
-        for name, status in members.items()
-        if status != 'unsupported'
-    }
+    supported = set()
+    for owner, members in SURFACE.items():
+        for name, status in members.items():
+            if status != 'unsupported':
+                supported.add(f'{owner}.{name}')
+    return supported

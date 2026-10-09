@@ -185,17 +185,19 @@ def run_plan(config, execute=execute_subprocess, now=time.time):
         raise ValueError('destructive stop case must be last')
     if 'stop' in config.cases and not config.confirm_dedicated:
         raise ValueError('stop requires explicit dedicated-VM confirmation')
-    if 'session-fence' in config.cases and (
+    session_probe_missing = 'session-fence' in config.cases and (
         config.session_probe is None
         or not config.session_probe.is_file()
         or not os.access(config.session_probe, os.X_OK)
-    ):
+    )
+    if session_probe_missing:
         raise ValueError('session-fence requires a built --session-probe executable')
-    if (
+    route_probe_invalid = (
         'stop' in config.cases
         and config.route_probe is not None
         and (not config.route_probe.is_file() or not os.access(config.route_probe, os.X_OK))
-    ):
+    )
+    if route_probe_invalid:
         raise ValueError('--route-probe must name a built executable')
     config.output.mkdir(parents=True, exist_ok=True)
     state_path = config.output / 'budget-state.json'

@@ -116,9 +116,10 @@ def collect(root, stage, exit_code, commit, artifact_build=None):
                 for e in node.values()
             ):
                 raise ValueError('Collector and Gateway metrics evidence missing or failed')
-        if exit_code == 0 and (
+        acceptance_failed = exit_code == 0 and (
             not report or report['status'] != 'passed' or report['cleanup_errors'] or report['missing_checks']
-        ):
+        )
+        if acceptance_failed:
             raise ValueError('Kubernetes acceptance evidence missing or failed')
     return result
 

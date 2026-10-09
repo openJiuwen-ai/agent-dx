@@ -422,7 +422,7 @@ def run(connection, image, output, ca_path):
             _fetch_forwarded(sandbox, ca_path, authenticated=False)
         except urllib.error.HTTPError as error:
             if error.code not in (401, 403):
-                raise AssertionError(error)
+                raise AssertionError(error) from error
         else:
             raise AssertionError('tls-token forwarded port accepted a request without a token')
         if not (_fetch_forwarded(sandbox, ca_path) == EXPECTED_BODY):
@@ -435,7 +435,7 @@ def run(connection, image, output, ca_path):
             _fetch_host_forwarded(sandbox, ca_path, authenticated=False)
         except urllib.error.HTTPError as error:
             if error.code not in (401, 403):
-                raise AssertionError(error)
+                raise AssertionError(error) from error
         else:
             raise AssertionError('Host forwarded port accepted a request without a token')
         if not (_fetch_host_forwarded(sandbox, ca_path) == HOST_EXPECTED_BODY):

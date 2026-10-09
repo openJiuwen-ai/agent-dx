@@ -192,7 +192,6 @@ cgroup_memory_limit = "0"
 ''')
 (P / 'proxy').mkdir(exist_ok=True, mode=0o700)
 # Observe the limits visible inside the node, supporting cgroup v1 and v2.
-import os
 
 cg = pathlib.Path('/sys/fs/cgroup')
 if (cg / 'cgroup.controllers').exists():

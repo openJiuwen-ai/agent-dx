@@ -10,6 +10,29 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'firecracker'))
 
 
+def assigned_to(node, name):
+    if not isinstance(node, ast.Assign):
+        return False
+    for target in node.targets:
+        if isinstance(target, ast.Name) and target.id == name:
+            return True
+    return False
+
+
+def creates_sandbox(node):
+    if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Call):
+        return False
+    return isinstance(node.value.func, ast.Name) and node.value.func.id == 'Sandbox'
+
+
+def has_labels(node, expected):
+    for keyword in node.value.keywords:
+        if keyword.arg == 'labels' and isinstance(keyword.value, ast.Dict):
+            if ast.literal_eval(keyword.value) == expected:
+                return True
+    return False
+
+
 class FirecrackerEvidenceTests(unittest.TestCase):
     def test_fc_bootstrap_has_separate_admin_and_tenant_credentials(self):
         import os
@@ -62,12 +85,7 @@ class FirecrackerEvidenceTests(unittest.TestCase):
         restart = (ROOT / 'firecracker/restart_paused.py').read_text()
         self.assertIn('[*a.restart_command, sandbox.id]', checkpoint)
         tree = ast.parse(restart)
-        key = next(
-            node.value
-            for node in tree.body
-            if isinstance(node, ast.Assign)
-            and any(isinstance(target, ast.Name) and target.id == 'key' for target in node.targets)
-        )
+        key = next(node.value for node in tree.body if assigned_to(node, 'key'))
         self.assertEqual(ast.dump(key), ast.dump(ast.parse("'environment:' + INSTANCE_ID", mode='eval').body))
         self.assertFalse(
             any(
@@ -83,29 +101,13 @@ class FirecrackerEvidenceTests(unittest.TestCase):
 
     def test_runtime_network_policy_uses_a_fresh_execution(self):
         source = (ROOT / 'firecracker/sdk_checkpoint.py').read_text()
-        assignments = [
-            node
-            for node in ast.walk(ast.parse(source))
-            if isinstance(node, ast.Assign)
-            and isinstance(node.value, ast.Call)
-            and isinstance(node.value.func, ast.Name)
-            and node.value.func.id == 'Sandbox'
-        ]
+        assignments = [node for node in ast.walk(ast.parse(source)) if creates_sandbox(node)]
         network_case = next(
             node.lineno
             for node in assignments
             if any(isinstance(target, ast.Name) and target.id == 'networked' for target in node.targets)
         )
-        checkpoint_case = next(
-            node.lineno
-            for node in assignments
-            if any(
-                keyword.arg == 'labels'
-                and isinstance(keyword.value, ast.Dict)
-                and ast.literal_eval(keyword.value) == {'app': 'checkpoint-source'}
-                for keyword in node.value.keywords
-            )
-        )
+        checkpoint_case = next(node.lineno for node in assignments if has_labels(node, {'app': 'checkpoint-source'}))
         self.assertLess(network_case, checkpoint_case)
         self.assertIn('networked.update_network_policy(NetworkPolicy.block())', source)
         self.assertIn('networked.update_network_policy(None)', source)
@@ -223,19 +225,17 @@ class FirecrackerEvidenceTests(unittest.TestCase):
             (root / 'sdk/snapshot-collected-before-clone-resume.json').write_text(
                 json.dumps({'snapshot_id': 'saved', 'state': 'Deleted', 'references': []})
             )
+            orphan_checks = (
+                'passed',
+                'current_session_preserved',
+                'retired_session_removed',
+                'foreign_preserved',
+                'unmarked_preserved',
+            )
             (root / 'orphan-gc.json').write_text(
                 json.dumps(
                     {
-                        **{
-                            k: True
-                            for k in (
-                                'passed',
-                                'current_session_preserved',
-                                'retired_session_removed',
-                                'foreign_preserved',
-                                'unmarked_preserved',
-                            )
-                        },
+                        **{k: True for k in orphan_checks},
                         'registered_checkpoint_preserved': 'saved',
                     }
                 )

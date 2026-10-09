@@ -156,7 +156,7 @@ def sdk_placement(report, inventory):
         instance_id, owner = item['id'], item['node_id']
         assignment = report.get('assignments', {}).get(instance_id, {})
         physical = report.get('backends', {}).get(instance_id, {})
-        if (
+        ownership_mismatch = (
             assignment.get('node_id') != owner
             or assignment.get('state') != 'Running'
             or assignment.get('resources_held') is not True
@@ -164,7 +164,8 @@ def sdk_placement(report, inventory):
             or any(not isinstance(ids, list) for ids in physical.values())
             or len(physical[owner]) != 1
             or any(physical[node] for node in node_roles if node != owner)
-        ):
+        )
+        if ownership_mismatch:
             raise ValueError(f'SDK ownership or physical backend mismatch for {instance_id}')
         placements.append(
             {
@@ -204,7 +205,7 @@ def validate_case(name, report, inventory):
         owners = [node for node in workers if runtime in inventories.get(node, [])]
         assignment = report.get('assignment', {})
         physical = report.get('backends', {})
-        if (
+        runtime_evidence_incomplete = (
             not runtime
             or len(owners) != 1
             or assignment.get('node_id') != owners[0]
@@ -213,11 +214,12 @@ def validate_case(name, report, inventory):
             or set(physical) != workers
             or len(physical[owners[0]]) != 1
             or any(physical[node] for node in workers if node != owners[0])
-        ):
+        )
+        if runtime_evidence_incomplete:
             raise ValueError('runtime affinity inventory or backend evidence is incomplete')
     if name in ('worker-restart', 'session-fence'):
         restart = report.get('restart', {})
-        if (
+        replacement_evidence_incomplete = (
             not restart.get('old_session')
             or not restart.get('new_session')
             or restart['old_session'] == restart['new_session']
@@ -225,7 +227,8 @@ def validate_case(name, report, inventory):
             or restart['generation'] < 1
             or not isinstance(restart.get('backend_ids'), list)
             or len(restart['backend_ids']) != 1
-        ):
+        )
+        if replacement_evidence_incomplete:
             raise ValueError('worker replacement did not prove a new session on one backend')
     if name == 'session-fence':
         fencing = report.get('fencing', {})
@@ -247,7 +250,7 @@ def validate_case(name, report, inventory):
     if name == 'stop':
         final = report.get('final_state', {})
         snapshot = report.get('route_snapshot', {})
-        if (
+        final_catalog_not_empty = (
             report.get('stop_order') != ['worker-2', 'worker-1', 'control']
             or final.get('backend_instances') != {'worker-1': 0, 'worker-2': 0}
             or final.get('published_routes') != 0
@@ -255,7 +258,8 @@ def validate_case(name, report, inventory):
             or snapshot.get('reset') is not True
             or snapshot.get('published_routes') != 0
             or not isinstance(snapshot.get('revision'), int)
-        ):
+        )
+        if final_catalog_not_empty:
             raise ValueError('final backend or publication catalog is not empty')
     return None
 
@@ -276,7 +280,7 @@ def assemble(inventory, root):
     finished_at = state.get('finished_at')
     if state.get('scope') != 'deployment-and-cases':
         errors.append('three-hour deployment and case budget was not started before deployment')
-    if (
+    budget_state_invalid = (
         state.get('schema_version') != 2
         or state.get('inventory_sha256') != digest
         or not isinstance(budget, int)
@@ -284,15 +288,17 @@ def assemble(inventory, root):
         or not isinstance(duration, (int, float))
         or not 0 <= duration <= budget
         or state.get('active')
-    ):
+    )
+    if budget_state_invalid:
         errors.append('suite inventory or three-hour budget evidence is invalid')
-    if (
+    wall_clock_budget_invalid = (
         not isinstance(started_at, (int, float))
         or not isinstance(finished_at, (int, float))
         or finished_at < started_at
         or not isinstance(budget, int)
         or finished_at - started_at > budget
-    ):
+    )
+    if wall_clock_budget_invalid:
         errors.append('suite wall-clock budget evidence exceeds three hours or is missing')
     records = state.get('cases', [])
     if not isinstance(records, list):

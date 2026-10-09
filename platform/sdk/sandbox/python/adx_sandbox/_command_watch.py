@@ -164,9 +164,12 @@ class _CommandWaitManager:
             uri = f"{scheme}://{self._connection.server_address}/api/sandbox/v1/commands/watch"
             ssl_context = None
             if scheme == "wss":
-                ssl_context = (
-                    ssl.create_default_context() if self._connection.verify_tls else ssl._create_unverified_context()  # noqa: SLF001
-                )
+                if self._connection.verify_tls:
+                    ssl_context = ssl.create_default_context()
+                else:
+                    ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                    ssl_context.check_hostname = False
+                    ssl_context.verify_mode = ssl.CERT_NONE
             try:
                 token = self._connection.resolved_token()
                 async with ws_client.connect(

@@ -3,6 +3,7 @@
 import json
 import time
 import uuid
+from pathlib import PurePosixPath
 
 
 def run(connection, image, output):
@@ -15,7 +16,7 @@ def run(connection, image, output):
     name = 'registry-capacity-' + uuid.uuid4().hex[:12]
     held_id = 'capacity-holder-' + uuid.uuid4().hex[:12]
     rejected_id = 'capacity-rejected-' + uuid.uuid4().hex[:12]
-    marker = '/tmp/' + rejected_id + '.marker'
+    marker = str(PurePosixPath('/tmp') / f'{rejected_id}.marker')
     command = f'printf y >> {marker}; printf capacity-released'
     sandbox = None
     held = None

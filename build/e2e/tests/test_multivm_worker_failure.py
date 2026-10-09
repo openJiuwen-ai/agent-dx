@@ -58,7 +58,10 @@ class WorkerFailureTests(unittest.TestCase):
             def command(self, command):
                 if command == 'printf baseline-route':
                     return SimpleNamespace(stdout='baseline-route', exit_code=0)
-                if self.id == 'sandbox-node2-2' and (state['frozen'] or state.get('recovered')) and not route_leaks:
+                route_withdrawn = (
+                    self.id == 'sandbox-node2-2' and (state['frozen'] or state.get('recovered')) and not route_leaks
+                )
+                if route_withdrawn:
                     raise FakeSandboxError('route withdrawn')
                 response = 'healthy-worker' if self.node_id == 'node1' else 'resumed-admission'
                 return SimpleNamespace(stdout=response, exit_code=0)

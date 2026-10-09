@@ -16,7 +16,6 @@ import signal
 import subprocess
 import sys
 import tempfile
-import xml.etree.ElementTree as ET
 from pathlib import Path
 
 
@@ -163,20 +162,17 @@ def default_redis_storage_class(value):
     classes = value.get('items') if isinstance(value, dict) else None
     if not isinstance(classes, list):
         raise ValueError('Kubernetes StorageClass list is invalid')
-    defaults = [
-        item['metadata']['name']
-        for item in classes
-        if item.get('provisioner') not in (None, 'kubernetes.io/no-provisioner')
-        and item.get('metadata', {})
-        .get('annotations', {})
-        .get(
+    defaults = []
+    for item in classes:
+        if item.get('provisioner') in (None, 'kubernetes.io/no-provisioner'):
+            continue
+        annotations = item.get('metadata', {}).get('annotations', {})
+        is_default = annotations.get(
             'storageclass.kubernetes.io/is-default-class',
-            item.get('metadata', {})
-            .get('annotations', {})
-            .get('storageclass.beta.kubernetes.io/is-default-class', 'false'),
+            annotations.get('storageclass.beta.kubernetes.io/is-default-class', 'false'),
         )
-        == 'true'
-    ]
+        if is_default == 'true':
+            defaults.append(item['metadata']['name'])
     if len(defaults) != 1:
         raise ValueError(
             ('redis-pod-restart requires one default dynamic StorageClass or an explicit --redis-storage-class')
@@ -232,7 +228,7 @@ class KubernetesRun(common.Run):
         return self.command(
             [*self.kubectl, *args],
             timeout,
-            stream=not any(args[i : i + 2] == ('-o', 'json') for i in range(len(args) - 1)),
+            stream=not any(pair == ('-o', 'json') for pair in zip(args, args[1:])),
         )
 
     def apply(self, value):

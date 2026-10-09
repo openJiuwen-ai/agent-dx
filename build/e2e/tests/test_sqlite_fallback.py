@@ -92,7 +92,8 @@ class SqliteFallbackOracleTests(unittest.TestCase):
                 self.commands = types.SimpleNamespace(run=self.run)
                 state['created'].append((self.id, options))
 
-            def run(self, command):
+            @staticmethod
+            def run(command):
                 state['commands'].append(command)
                 return types.SimpleNamespace(exit_code=0, stdout=command.removeprefix('printf '))
 

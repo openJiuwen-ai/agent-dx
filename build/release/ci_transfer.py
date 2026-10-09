@@ -31,7 +31,10 @@ def upload(client, bucket, build_id, commit, group, files):
     entries = {}
     for path in map(Path, files):
         component(path.name, 'filename')
-        if path.is_symlink() or not path.is_file() or path.name == 'manifest.json' or path.name in entries:
+        artifact_entry_invalid = (
+            path.is_symlink() or not path.is_file() or path.name == 'manifest.json' or path.name in entries
+        )
+        if artifact_entry_invalid:
             raise ValueError('invalid or duplicate artifact')
         entries[path.name] = {'bytes': path.stat().st_size, 'sha256': digest(path)}
     if not entries:

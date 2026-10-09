@@ -1,4 +1,3 @@
-import importlib.util
 import json
 import sys
 import tempfile
@@ -73,10 +72,10 @@ class TransferTests(unittest.TestCase):
             source.write_bytes(b'archive')
             store = Store()
 
-            def _assigned_putFile(*args):
+            def _assigned_put_file(*args):
                 return SimpleNamespace(status=500)
 
-            store.putFile = _assigned_putFile
+            store.putFile = _assigned_put_file
             with self.assertRaises(RuntimeError):
                 transfer.upload(store, 'bucket', 'b1', 'a' * 40, 'platform', [source])
             self.assertEqual(store.objects, {})

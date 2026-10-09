@@ -52,7 +52,7 @@ class CreateRequestTests(unittest.TestCase):
         if request.method == "POST" and request.url.path == "/direct/create-contract/invoke":
             self.assertEqual(json.loads(request.content)["action"], "process.list")
             return httpx.Response(200, json={"processes": []})
-        self.fail(f"Unexpected gateway request: {request.method} {request.url}")
+        raise AssertionError(f"Unexpected gateway request: {request.method} {request.url}")
 
     def capture_create(self, **options):
         start = len(self.exchanges)

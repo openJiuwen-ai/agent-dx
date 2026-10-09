@@ -84,9 +84,12 @@ def run(connection, image, output):
         started = time.monotonic()
         never = create()
         old_backend = _delete_backend(never.id)
-        failed = _wait(
-            lambda: r if (r := _record(never.id)["result"])["state"] == "Failed" and not r["resources_held"] else None
-        )
+
+        def never_terminal_result():
+            r = _record(never.id)['result']
+            return r if r['state'] == 'Failed' and (not r['resources_held']) else None
+
+        failed = _wait(never_terminal_result)
         if not (not failed["restart_pending"]):
             raise AssertionError(failed)
         if not (not _backend_ids(never.id)):
@@ -115,20 +118,24 @@ def run(connection, image, output):
         for attempt in (1, 2):
             previous = persisted_runtime_id(_record(restarted.id)["result"])
             old_backend = _delete_backend(restarted.id)
-            _wait(
-                lambda: (
-                    r if (r := _record(restarted.id)["result"])["state"] == "Failed" and r["restart_pending"] else None
-                )
-            )
-            running = _wait(
-                lambda previous=previous, attempt=attempt: (
+
+            def pending_restart_result():
+                r = _record(restarted.id)['result']
+                return r if r['state'] == 'Failed' and r['restart_pending'] else None
+
+            _wait(pending_restart_result)
+
+            def restarted_runtime_result(previous=previous, attempt=attempt):
+                r = _record(restarted.id)['result']
+                return (
                     r
-                    if (r := _record(restarted.id)["result"])["state"] == "Running"
+                    if r['state'] == 'Running'
                     and persisted_runtime_id(r) != previous
-                    and r["restart_attempts"] == attempt
+                    and (r['restart_attempts'] == attempt)
                     else None
                 )
-            )
+
+            running = _wait(restarted_runtime_result)
             record = _record(restarted.id)
             if not (record["assignment"] == original_assignment):
                 raise AssertionError(record["assignment"])
@@ -142,15 +149,12 @@ def run(connection, image, output):
                 {"attempt": attempt, "runtime_id": persisted_runtime_id(running), "backend_id": identities[0]}
             )
         _delete_backend(restarted.id)
-        exhausted = _wait(
-            lambda: (
-                r
-                if (r := _record(restarted.id)["result"])["state"] == "Failed"
-                and not r["restart_pending"]
-                and not r["resources_held"]
-                else None
-            )
-        )
+
+        def exhausted_restart_result():
+            r = _record(restarted.id)['result']
+            return r if r['state'] == 'Failed' and (not r['restart_pending']) and (not r['resources_held']) else None
+
+        exhausted = _wait(exhausted_restart_result)
         if not (exhausted["restart_attempts"] == 2):
             raise AssertionError(exhausted)
         if not (not _backend_ids(restarted.id)):

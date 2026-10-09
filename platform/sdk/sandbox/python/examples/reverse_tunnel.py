@@ -71,7 +71,7 @@ def start_local_server(port: int):
             def __init__(self, *args, **kwargs):
                 super().__init__(*args, directory=temp_dir, **kwargs)
 
-            def log_message(self, format, *args):  # noqa: A002 - stdlib signature
+            def log_message(self, _format, *args):
                 return
 
         server = http.server.ThreadingHTTPServer(("127.0.0.1", port), QuietHandler)

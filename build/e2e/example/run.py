@@ -21,15 +21,15 @@ import urllib.request
 from contract import CASES, verify
 
 
-def _executable(name, environment=None, cwd=None):
+def _executable(command_name, environment=None, cwd=None):
     """Resolve an external command using the child's execution environment."""
     directory = os.getcwd() if cwd is None else os.path.abspath(cwd)
     search_path = os.pathsep.join(
         os.path.abspath(os.path.join(directory, entry)) for entry in os.get_exec_path(environment)
     )
-    executable = shutil.which(name, path=search_path)
+    executable = shutil.which(command_name, path=search_path)
     if executable is None:
-        raise FileNotFoundError(f"required executable not found: {name}")
+        raise FileNotFoundError(f"required executable not found: {command_name}")
     return os.path.abspath(executable)
 
 
@@ -38,14 +38,15 @@ ROOT = pathlib.Path(sys.argv[1]).resolve()
 INSTALL = pathlib.Path('/opt/adx')
 SYSTEM_CLI = pathlib.Path('/usr/local/bin/adxctl')
 SOCKET = pathlib.Path('/run/sandboxd/sandboxd.sock')
-if (
+deployment_paths_occupied = (
     ROOT.exists()
     or INSTALL.exists()
     or INSTALL.is_symlink()
     or SYSTEM_CLI.exists()
     or SYSTEM_CLI.is_symlink()
     or SOCKET.exists()
-):
+)
+if deployment_paths_occupied:
     raise RuntimeError('example paths must be unused; refusing to overwrite existing deployment')
 env = {
     **os.environ,

@@ -74,13 +74,14 @@ def run(connection, image, output, ca, admin_key, *, queue_reader=pending_ids, c
                 try:
                     unexpected = future.result(timeout=90)
                 except SandboxError as error:
-                    if (
+                    deadline_contract_invalid = (
                         'central scheduling queue deadline exceeded' not in str(error)
                         or error.code != 'OUTCOME_UNKNOWN'
                         or error.retry != 'same_operation'
                         or error.outcome != 'unknown'
                         or error.instance_id != instance_id
-                    ):
+                    )
+                    if deadline_contract_invalid:
                         raise AssertionError(f'wrong scheduling deadline contract: {error}') from error
                     report['error_contract'] = {
                         'code': error.code,

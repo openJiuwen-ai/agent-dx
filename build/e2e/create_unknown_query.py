@@ -80,12 +80,8 @@ class UnknownQueryProxy:
                 body = self.rfile.read(int(self.headers['Content-Length']))
                 request = json.loads(body)
                 request_id = self.headers['X-Request-Id']
-                headers = {
-                    key: value
-                    for key, value in self.headers.items()
-                    if key.lower()
-                    not in ('host', 'connection', 'content-length', 'accept-encoding', 'transfer-encoding')
-                }
+                excluded_headers = ('host', 'connection', 'content-length', 'accept-encoding', 'transfer-encoding')
+                headers = {key: value for key, value in self.headers.items() if key.lower() not in excluded_headers}
                 with proxy._lock:
                     proxy.attempts.append((request_id, request['name']))
                     first = len(proxy.attempts) == 1

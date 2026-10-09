@@ -80,19 +80,15 @@ def main():
 
     call(['python3', base / 'e2e/package.py', 'verify', base / 'package'])
     shutil.copyfile(base / 'package/manifest.json', evidence / 'package-manifest.json')
-    (evidence / 'runtime-hashes.json').write_text(
-        json.dumps(
-            {
-                str(p): hashlib.file_digest(p.open('rb'), 'sha256').hexdigest()
-                for p in [
-                    Path('/opt/adx-fc/bin/sandboxd'),
-                    Path('/opt/adx-fc/bin/firecracker'),
-                    base / 'package/runtime/adx-execd',
-                ]
-            },
-            indent=2,
-        )
-    )
+    runtime_hashes = {}
+    for binary in (
+        Path('/opt/adx-fc/bin/sandboxd'),
+        Path('/opt/adx-fc/bin/firecracker'),
+        base / 'package/runtime/adx-execd',
+    ):
+        with binary.open('rb') as stream:
+            runtime_hashes[str(binary)] = hashlib.file_digest(stream, 'sha256').hexdigest()
+    (evidence / 'runtime-hashes.json').write_text(json.dumps(runtime_hashes, indent=2))
     tag = hashlib.sha256(str(root).encode()).hexdigest()[:6]
     bridge = 'axt' + tag
     namespaces = {n: 'axt-' + tag + '-' + n for n in ADDRESSES}

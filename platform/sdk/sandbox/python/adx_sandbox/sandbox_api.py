@@ -60,9 +60,10 @@ def _get_create_timeout(timeout: Optional[int]) -> int:
 
 
 def _resolve_create_timeouts(create_timeout: Optional[int], schedule_timeout: Optional[int]) -> tuple[int, int]:
-    if schedule_timeout is not None and (
+    schedule_timeout_invalid = schedule_timeout is not None and (
         isinstance(schedule_timeout, bool) or not isinstance(schedule_timeout, int) or schedule_timeout <= 0
-    ):
+    )
+    if schedule_timeout_invalid:
         raise ValueError("schedule_timeout must be a positive integer")
 
     resolved_schedule = DEFAULT_SCHEDULE_TIMEOUT if schedule_timeout is None else schedule_timeout
@@ -930,13 +931,14 @@ class Sandbox:
             state=str(result.get("state") or ""),
             expires_at=int(result.get("expiresAt") or 0),
         )
-        if (
+        pause_result_invalid = (
             pause.sandbox_id != self._sid
             or pause.state != "paused"
             or not pause.snapshot_id
             or pause.size <= 0
             or pause.expires_at <= 0
-        ):
+        )
+        if pause_result_invalid:
             raise SandboxError("pause response is not an authoritative PAUSED result")
         return pause
 
@@ -956,12 +958,13 @@ class Sandbox:
             node_id=str(result.get("nodeId") or ""),
             port_mappings={str(key): int(value) for key, value in mappings.items()},
         )
-        if (
+        resume_result_invalid = (
             resume.sandbox_id != self._sid
             or resume.state != "running"
             or not resume.route_address
             or not resume.function_proxy_id
-        ):
+        )
+        if resume_result_invalid:
             raise SandboxError("resume response is not an authoritative RUNNING result")
         return resume
 

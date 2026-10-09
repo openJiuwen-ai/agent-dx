@@ -128,13 +128,12 @@ def main():
                     coordinator = next(s for s in before['services'] if s['id'] == 'coordinator')
                     # This PID is a currently owned child reported by this run's supervisor.
                     os.kill(coordinator['pid'], signal.SIGKILL)
-                    recovered = wait(
-                        lambda: (
-                            (v if v and v['epoch'] > first['epoch'] else None)
-                            if (v := endpoint(redis_port)) is not None
-                            else None
-                        )
-                    )
+
+                    def recovered_coordinator():
+                        v = endpoint(redis_port)
+                        return (v if v and v['epoch'] > first['epoch'] else None) if v is not None else None
+
+                    recovered = wait(recovered_coordinator)
                     after = control('status')
                     new = next(s for s in after['services'] if s['id'] == 'coordinator')
                     if not (new['pid'] != coordinator['pid'] and new['restarts'] > coordinator['restarts']):

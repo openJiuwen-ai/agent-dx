@@ -5,7 +5,7 @@ import json
 import tempfile
 import time
 import uuid
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from route_ready import wait_for_route
 from upload_response_cut import CHUNK_SIZE, UploadResponseCutProxy
@@ -19,7 +19,7 @@ def run(connection, image, output, secrets):
     started = time.monotonic()
     report = {'status': 'failed', 'cases': [], 'cleanup_errors': []}
     name = 'download-cut-' + uuid.uuid4().hex[:12]
-    remote_path = '/tmp/' + name + '.bin'
+    remote_path = str(PurePosixPath('/tmp') / f'{name}.bin')
     sandbox = None
     attached = None
     deleted = False

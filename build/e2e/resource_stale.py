@@ -77,7 +77,7 @@ def rejected(connection, image, evidence):
         )
     except SandboxError as error:
         if 'central scheduling queue deadline exceeded' not in str(error):
-            raise AssertionError(str(error))
+            raise AssertionError(str(error)) from error
     else:
         try:
             raise AssertionError('stale node accepted a new instance')

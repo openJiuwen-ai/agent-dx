@@ -97,7 +97,8 @@ class BinaryEnvelope:
         wire_limit = max_payload + (8 if flags & _HAS_OFFSET else 0)
         if payload_length > wire_limit:
             raise ProtocolError(f"binary payload exceeds negotiated chunk limit: {payload_length} > {wire_limit}")
-        wire_payload = raw[_HEADER.size :]
+        header_size = _HEADER.size
+        wire_payload = raw[header_size:]
         if len(wire_payload) != payload_length:
             raise ProtocolError(f"binary payload length mismatch: {len(wire_payload)} != {payload_length}")
         offset = None

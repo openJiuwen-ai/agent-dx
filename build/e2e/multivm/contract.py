@@ -47,7 +47,10 @@ def verify_inventory(inventory):
         except ValueError as error:
             raise ValueError('machine address must be an assigned IP address') from error
         target = machine.get('ssh_target')
-        if not isinstance(target, str) or not target or target.startswith('-') or any(c.isspace() for c in target):
+        ssh_target_invalid = (
+            not isinstance(target, str) or not target or target.startswith('-') or any(c.isspace() for c in target)
+        )
+        if ssh_target_invalid:
             raise ValueError('every machine requires a safe ssh_target')
         if machine['role'] != 'control' and not machine.get('node_id'):
             raise ValueError('each worker requires a node_id')

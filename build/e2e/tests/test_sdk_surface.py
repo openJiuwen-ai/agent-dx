@@ -40,12 +40,14 @@ class PublicSdkSurfaceTests(unittest.TestCase):
                 class_name,
             )
         init_tree = ast.parse((SDK / '__init__.py').read_text())
-        exports = next(
-            ast.literal_eval(node.value)
-            for node in init_tree.body
-            if isinstance(node, ast.Assign)
-            and any(isinstance(target, ast.Name) and target.id == '__all__' for target in node.targets)
-        )
+        exports = None
+        for node in init_tree.body:
+            if not isinstance(node, ast.Assign):
+                continue
+            if any(isinstance(target, ast.Name) and target.id == '__all__' for target in node.targets):
+                exports = ast.literal_eval(node.value)
+                break
+        self.assertIsNotNone(exports, '__all__ assignment is missing')
         self.assertEqual(len(exports), 41)
         self.assertTrue({'Sandbox', 'CommandHandle', 'PtySession', 'resources'}.issubset(exports))
         self.assertIn('resources', exports)

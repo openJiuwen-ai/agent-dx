@@ -11,7 +11,7 @@ CASES = (
 
 
 def verify(result):
-    if (
+    evidence_incomplete = (
         result.get('status') != 'passed'
         or result.get('profile') != 'standalone'
         or result.get('deployment') != 'process'
@@ -25,5 +25,6 @@ def verify(result):
         or result.get('cleanup_errors') != []
         or [c.get('name') for c in result.get('cases', [])] != list(CASES)
         or not all(c.get('passed') is True for c in result['cases'])
-    ):
+    )
+    if evidence_incomplete:
         raise ValueError('incomplete deployment example evidence')

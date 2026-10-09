@@ -24,7 +24,7 @@ def recovered(old, new):
 def verify(result):
     if result.get('node_interruption_requested'):
         fault = result.get('node_recovery_restart', {})
-        if (
+        cleanup_evidence_missing = (
             fault.get('state_at_crash') != 'Paused'
             or fault.get('pending_at_crash') is not True
             or fault.get('assignment_preserved') is not True
@@ -35,18 +35,20 @@ def verify(result):
             or not fault.get('backend_before')
             or not fault.get('backend_after')
             or fault['backend_before'] == fault['backend_after']
-        ):
+        )
+        if cleanup_evidence_missing:
             raise ValueError('missing uncommitted recovery cleanup evidence')
     if result.get('interruption_requested'):
         fault = result.get('mid_recovery_restart', {})
         if fault.get('plan_preserved') is not True or fault.get('epoch_after', 0) <= fault.get('epoch_before', 0):
             raise ValueError('missing in-flight Coordinator restart evidence')
     cases = result.get('cases', [])
-    if (
+    transfer_evidence_incomplete = (
         result.get('status') != 'passed'
         or result.get('cleanup_errors') != []
         or result.get('inventories') != {'node1': 0, 'node2': 0}
         or [c.get('name') for c in cases] != list(CASES)
         or not all(c.get('passed') is True for c in cases)
-    ):
+    )
+    if transfer_evidence_incomplete:
         raise ValueError('incomplete Firecracker transfer evidence')

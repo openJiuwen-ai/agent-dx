@@ -1,4 +1,5 @@
 import asyncio
+import ssl
 from unittest.mock import patch
 
 from adx_sandbox._command_watch import _CommandWaitManager
@@ -70,6 +71,35 @@ def test_command_watch_preserves_legacy_frontend_auth():
         assert captured["additional_headers"] == {"Authorization": "Bearer token", "X-Auth": "token"}
 
     asyncio.run(scenario())
+
+
+def test_command_watch_tls_context_preserves_verification_setting():
+    async def scenario(verify_tls):
+        manager = _CommandWaitManager(
+            ConnectionConfig(server_address="ingress.example:443", token="token", use_tls=True, verify_tls=verify_tls)
+        )
+        captured = {}
+
+        def connect(_uri, **kwargs):
+            captured.update(kwargs)
+            raise asyncio.CancelledError
+
+        with (
+            patch.object(manager, "_desired", return_value={("sandbox", "command")}),
+            patch("websockets.asyncio.client.connect", side_effect=connect),
+        ):
+            try:
+                await manager._run()
+            except asyncio.CancelledError:
+                pass
+        context = captured["ssl"]
+        assert context.check_hostname == verify_tls
+        assert context.verify_mode == (ssl.CERT_REQUIRED if verify_tls else ssl.CERT_NONE)
+        if verify_tls:
+            assert context.get_ca_certs()
+
+    for verify_tls in (False, True):
+        asyncio.run(scenario(verify_tls))
 
 
 def test_successful_frontend_handshake_does_not_reset_downstream_outage_budget():

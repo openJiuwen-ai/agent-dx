@@ -6,6 +6,7 @@ import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import PurePosixPath
 
 MINIMUM_OPERATIONS = {'command': 40, 'file': 40, 'create': 5, 'delete': 5}
 
@@ -30,7 +31,7 @@ def exercise(sandbox, marker):
     command_ms = (time.monotonic() - started) * 1000
     if command.exit_code != 0 or command.stdout != marker:
         raise AssertionError('mixed-load command result differs from request')
-    path = '/tmp/adx-soak-' + marker + '.bin'
+    path = str(PurePosixPath('/tmp') / f'adx-soak-{marker}.bin')
     payload = marker.encode() * 16 + b'\x00\xff'
     started = time.monotonic()
     sandbox.files.write(path, payload)

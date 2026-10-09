@@ -15,7 +15,8 @@ def checked_url(value, host):
     parsed = urlsplit(value)
     if parsed.scheme != "https" or parsed.netloc != host or not parsed.path.startswith("/adx/"):
         raise ValueError("invalid artifact URL")
-    if parsed.query or parsed.fragment or parsed.username or parsed.password:
+    artifact_url_invalid = parsed.query or parsed.fragment or parsed.username or parsed.password
+    if artifact_url_invalid:
         raise ValueError("invalid artifact URL")
     return html.escape(value, quote=True)
 

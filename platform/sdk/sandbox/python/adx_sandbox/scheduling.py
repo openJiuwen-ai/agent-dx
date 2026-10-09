@@ -10,7 +10,10 @@ def instance_labels(labels):
     if not isinstance(labels, Mapping) or len(labels) > 256:
         raise ValueError('labels must be a mapping with at most 256 entries')
     for key, value in labels.items():
-        if not isinstance(key, str) or not key.strip() or ':' in key or '=' in key or not isinstance(value, str):
+        label_invalid = (
+            not isinstance(key, str) or not key.strip() or ':' in key or '=' in key or not isinstance(value, str)
+        )
+        if label_invalid:
             raise ValueError('labels require nonempty string keys without : or = and string values')
     return dict(labels)
 
@@ -38,32 +41,34 @@ def encode_affinities(affinities, node_id):
         if not isinstance(ops, list) or not 1 <= len(ops) <= 64:
             raise ValueError('labelOps requires 1..64 expressions')
         for op in ops:
-            if (
+            label_operator_invalid = (
                 not isinstance(op, dict)
                 or (not isinstance(op.get('type'), int) or isinstance(op.get('type'), bool))
                 or op['type'] not in range(4)
-            ):
+            )
+            if label_operator_invalid:
                 raise ValueError('invalid label operator')
             if not isinstance(op.get('labelKey'), str) or not op['labelKey'].strip():
                 raise ValueError('labelKey must be a nonempty string')
             values = op.get('labelValues', [])
-            if (
+            label_values_invalid = (
                 not isinstance(values, list)
                 or any(not isinstance(v, str) for v in values)
                 or (op['type'] < 2 and not values)
-            ):
+            )
+            if label_values_invalid:
                 raise ValueError('invalid labelValues')
     if node_id:
         constraint = {'type': 0, 'labelKey': 'NODE_ID', 'labelValues': [node_id]}
-        required = [
-            item
-            for item in result
-            if item['kind'] == 0
-            and (
-                item['affinity'] == 2
-                or (item['affinity'] == 0 and item.get('preferredPriority') and item.get('preferredAntiOtherLabels'))
+        required = []
+        for item in result:
+            if item['kind'] != 0:
+                continue
+            requires_node = item['affinity'] == 2 or (
+                item['affinity'] == 0 and item.get('preferredPriority') and item.get('preferredAntiOtherLabels')
             )
-        ]
+            if requires_node:
+                required.append(item)
         if required:
             for item in required:
                 if len(item['labelOps']) == 64:
