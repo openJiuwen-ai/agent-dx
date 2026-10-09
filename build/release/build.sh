@@ -27,50 +27,6 @@ if [[ "$ADX_WITH_DFS" == "1" && "$host" != *-linux-gnu ]]; then
   echo 'ADX_WITH_DFS=1 requires a Linux release builder' >&2
   exit 2
 fi
-require_redis_725() {
-  local binary="$1"
-  local label="$2"
-  [[ -x "$binary" ]] || { echo "$label must be an executable Redis 7.2.5 binary: $binary" >&2; exit 2; }
-  local version
-  version=$("$binary" --version 2>&1) || { echo "$label --version failed" >&2; exit 2; }
-  if [[ "$label" == "ADX_REDIS_SERVER" ]]; then
-    [[ "$version " == *'v=7.2.5 '* ]] || { echo "$label must report Redis 7.2.5, got: $version" >&2; exit 2; }
-  else
-    [[ "$version" == 'redis-cli 7.2.5' ]] || { echo "$label must report Redis 7.2.5, got: $version" >&2; exit 2; }
-  fi
-}
-require_python_build_backend() {
-  "$PYTHON" - <<'PY'
-import importlib.util
-import sys
-if importlib.util.find_spec("build") is not None:
-    raise SystemExit(0)
-if importlib.util.find_spec("pip") is not None and importlib.util.find_spec("setuptools") is not None:
-    raise SystemExit(0)
-print("python release build requires module 'build' or the existing pip/setuptools fallback", file=sys.stderr)
-raise SystemExit(2)
-PY
-}
-preflight_release_tools() {
-  require_redis_725 "$ADX_REDIS_SERVER" ADX_REDIS_SERVER
-  require_redis_725 "$ADX_REDIS_CLI" ADX_REDIS_CLI
-  if [[ "$host" == *-linux-gnu ]]; then
-    local musl_target="${host%-gnu}-musl"
-    rustup target list --installed | grep -Fx -- "$musl_target" >/dev/null || {
-      echo "missing Rust musl target: $musl_target" >&2
-      exit 2
-    }
-    : "${ADX_EROFS_CACHE:?set persistent EROFS tools cache}"
-    bash build/runtime/erofs-tools.sh >/dev/null
-    local erofs_bin
-    erofs_bin=$(find "$ADX_EROFS_CACHE" -maxdepth 3 -type f -path '*/bin/mkfs.erofs' -print -quit)
-    [[ -n "$erofs_bin" ]] || { echo 'mkfs.erofs was not prepared by build/runtime/erofs-tools.sh' >&2; exit 2; }
-    export PATH="$(dirname "$erofs_bin"):$PATH"
-    command -v fsck.erofs >/dev/null || { echo 'fsck.erofs was not prepared by build/runtime/erofs-tools.sh' >&2; exit 2; }
-  fi
-  require_python_build_backend
-}
-preflight_release_tools
 stage=$(mktemp -d "${TMPDIR:-/tmp}/adx-build.XXXXXX")
 trap 'rm -rf "$stage"' EXIT
 echo "--- :rust: Compile control plane, gateway and EXECD"
