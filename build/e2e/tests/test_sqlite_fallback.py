@@ -2,14 +2,13 @@
 
 import importlib.util
 import json
-from pathlib import Path
 import sqlite3
 import sys
 import tempfile
 import types
 import unittest
+from pathlib import Path
 from unittest.mock import patch
-
 
 ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location("e2e_node_sqlite", ROOT / "node.py")
@@ -22,33 +21,57 @@ class SqliteFallbackOracleTests(unittest.TestCase):
         before = {'pid': 101, 'session_id': 'old-session'}
         status = {'services': [{'role': 'adxlet', 'pid': 202}]}
         journaled = {
-            'keep_id': 'live', 'idle_id': 'idle',
-            'keep_backend': 'runtime-live', 'keep_runtime_id': 'runtime-live',
+            'keep_id': 'live',
+            'idle_id': 'idle',
+            'keep_backend': 'runtime-live',
+            'keep_runtime_id': 'runtime-live',
         }
         records = {
-            'environment:live': json.dumps({
-                'result': {'state': 'Running', 'runtime': {'id': 'runtime-live'}},
-            }),
+            'environment:live': json.dumps(
+                {
+                    'result': {'state': 'Running', 'runtime': {'id': 'runtime-live'}},
+                }
+            ),
             'environment:idle': json.dumps({'result': {'state': 'Running'}}),
         }
         pending = [{'spec': {'id': 'idle'}, 'state': 'Deleted'}]
         evidence = NODE.validated_sqlite_node_restart(
-            before, status, records, pending, ['runtime-live'], journaled,
+            before,
+            status,
+            records,
+            pending,
+            ['runtime-live'],
+            journaled,
         )
         self.assertEqual(evidence['pid_before'], 101)
         self.assertEqual(evidence['pid_after'], 202)
         self.assertEqual(evidence['pending_records'], 1)
         with self.assertRaisesRegex(AssertionError, 'backend'):
             NODE.validated_sqlite_node_restart(
-                before, status, records, pending, [], journaled,
+                before,
+                status,
+                records,
+                pending,
+                [],
+                journaled,
             )
         with self.assertRaisesRegex(AssertionError, 'pending'):
             NODE.validated_sqlite_node_restart(
-                before, status, records, [], ['runtime-live'], journaled,
+                before,
+                status,
+                records,
+                [],
+                ['runtime-live'],
+                journaled,
             )
         with self.assertRaisesRegex(AssertionError, 'duplicated'):
             NODE.validated_sqlite_node_restart(
-                before, status, records, pending * 2, ['runtime-live'], journaled,
+                before,
+                status,
+                records,
+                pending * 2,
+                ['runtime-live'],
+                journaled,
             )
 
     def test_unopened_healthy_journal_is_not_required(self):
@@ -101,8 +124,9 @@ class SqliteFallbackOracleTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            scenario.create(object(), 'image@sha256:test', root / 'sqlite-live.json',
-                            journal_path=root / 'absent.sqlite')
+            scenario.create(
+                object(), 'image@sha256:test', root / 'sqlite-live.json', journal_path=root / 'absent.sqlite'
+            )
             live = json.loads((root / 'sqlite-live.json').read_text())
             self.assertEqual((live['keep_id'], live['idle_id']), ('instance-1', 'instance-2'))
             self.assertEqual([options['idle_timeout'] for _, options in state['created']], [0, 6])
@@ -120,8 +144,7 @@ class SqliteFallbackOracleTests(unittest.TestCase):
             eager = root / 'eager.sqlite'
             eager.touch()
             with self.assertRaisesRegex(AssertionError, 'healthy node opened'):
-                scenario.create(object(), 'image@sha256:test', root / 'sqlite-live.json',
-                                journal_path=eager)
+                scenario.create(object(), 'image@sha256:test', root / 'sqlite-live.json', journal_path=eager)
         self.assertEqual(state['deleted'][-2:], ['instance-3', 'instance-4'])
 
     def test_pending_wal_record_is_read_without_mutating_it(self):
@@ -131,18 +154,20 @@ class SqliteFallbackOracleTests(unittest.TestCase):
             path.parent.mkdir()
             payload = {"spec": {"id": "idle-capsule"}, "state": "Deleted"}
             with sqlite3.connect(path) as connection:
-                connection.executescript("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; "
-                                         "CREATE TABLE pending (sequence INTEGER PRIMARY KEY, "
-                                         "environment TEXT NOT NULL, payload TEXT NOT NULL);")
-                connection.execute("INSERT INTO pending(environment,payload) VALUES (?,?)",
-                                   ("idle-capsule", json.dumps(payload)))
+                connection.executescript(
+                    "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; "
+                    "CREATE TABLE pending (sequence INTEGER PRIMARY KEY, "
+                    "environment TEXT NOT NULL, payload TEXT NOT NULL);"
+                )
+                connection.execute(
+                    "INSERT INTO pending(environment,payload) VALUES (?,?)", ("idle-capsule", json.dumps(payload))
+                )
             old = NODE.P
             NODE.P = root
             try:
                 self.assertEqual(NODE.journal_pending(), [payload])
                 with sqlite3.connect(path) as connection:
-                    self.assertEqual(connection.execute("SELECT COUNT(*) FROM pending")
-                                     .fetchone()[0], 1)
+                    self.assertEqual(connection.execute("SELECT COUNT(*) FROM pending").fetchone()[0], 1)
             finally:
                 NODE.P = old
 

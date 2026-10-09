@@ -1,9 +1,9 @@
 import json
-from pathlib import Path
 import tempfile
 import threading
-from types import SimpleNamespace
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
 
 from e2e.multivm.local_first import run_local_first
 
@@ -12,15 +12,31 @@ def inventory():
     return {
         'schema_version': 1,
         'machines': [
-            {'role': 'control', 'machine_id': 'control-id', 'hostname': 'control',
-             'address': '10.0.0.10', 'ssh_target': 'control'},
-            {'role': 'worker-1', 'machine_id': 'worker-a-id', 'hostname': 'worker-a',
-             'address': '10.0.0.11', 'ssh_target': 'worker-a', 'node_id': 'node1'},
-            {'role': 'worker-2', 'machine_id': 'worker-b-id', 'hostname': 'worker-b',
-             'address': '10.0.0.12', 'ssh_target': 'worker-b', 'node_id': 'node2'},
+            {
+                'role': 'control',
+                'machine_id': 'control-id',
+                'hostname': 'control',
+                'address': '10.0.0.10',
+                'ssh_target': 'control',
+            },
+            {
+                'role': 'worker-1',
+                'machine_id': 'worker-a-id',
+                'hostname': 'worker-a',
+                'address': '10.0.0.11',
+                'ssh_target': 'worker-a',
+                'node_id': 'node1',
+            },
+            {
+                'role': 'worker-2',
+                'machine_id': 'worker-b-id',
+                'hostname': 'worker-b',
+                'address': '10.0.0.12',
+                'ssh_target': 'worker-b',
+                'node_id': 'node2',
+            },
         ],
-        'artifacts': {'commit': 'a' * 40, 'release_sha256': 'b' * 64,
-                      'target': 'x86_64-unknown-linux-gnu'},
+        'artifacts': {'commit': 'a' * 40, 'release_sha256': 'b' * 64, 'target': 'x86_64-unknown-linux-gnu'},
     }
 
 
@@ -32,15 +48,15 @@ class Conflict(Exception):
 
 class LocalFirstTests(unittest.TestCase):
     def exercise(self, double_account=False, missing_fallback=False):
-        state = {'live': {}, 'all': {}, 'claimed': set(), 'fallback_count': 0,
-                 'deleted': set()}
+        state = {'live': {}, 'all': {}, 'claimed': set(), 'fallback_count': 0, 'deleted': set()}
         mutex = threading.Lock()
 
         class Sandbox:
             def __init__(self, *, name, cpu, node_id=None, **_options):
                 self.id = 'tenant-' + name
-                self.commands = SimpleNamespace(run=lambda _command: SimpleNamespace(
-                    stdout='local-first-three-vm', exit_code=0))
+                self.commands = SimpleNamespace(
+                    run=lambda _command: SimpleNamespace(stdout='local-first-three-vm', exit_code=0)
+                )
                 with mutex:
                     if self.id in state['all']:
                         if cpu != 500:
@@ -77,18 +93,31 @@ class LocalFirstTests(unittest.TestCase):
                 return json.dumps([{'addr_info': [{'local': machine['address']}]}])
             if command == ('cat', '/opt/adx/current/manifest.json'):
                 return json.dumps({'commit': 'a' * 40, 'target': 'x86_64-unknown-linux-gnu'})
-            if command[:5] == ('/opt/adx/current/bin/adx-inspect', '-c',
-                                '/opt/adx/config/deployment.yaml', 'environment', 'get'):
+            if command[:5] == (
+                '/opt/adx/current/bin/adx-inspect',
+                '-c',
+                '/opt/adx/config/deployment.yaml',
+                'environment',
+                'get',
+            ):
                 instance_id = command[5]
                 live = instance_id in state['live']
-                return json.dumps({'id': instance_id, 'node_id': state['all'][instance_id],
-                                   'state': 'Running' if live else 'Deleted',
-                                   'resources_held': live, 'generation': 1})
+                return json.dumps(
+                    {
+                        'id': instance_id,
+                        'node_id': state['all'][instance_id],
+                        'state': 'Running' if live else 'Deleted',
+                        'resources_held': live,
+                        'generation': 1,
+                    }
+                )
             if command[:4] == ('sbox', '-a', '/run/sandboxd/sandboxd.sock', 'list'):
                 instance_id = command[5].split('=', 1)[1]
                 return 'ID STATE\n' + (
                     instance_id + '-backend running\n'
-                    if state['live'].get(instance_id) == machine.get('node_id') else '')
+                    if state['live'].get(instance_id) == machine.get('node_id')
+                    else ''
+                )
             raise AssertionError(command)
 
         def resources(**_kwargs):
@@ -97,8 +126,10 @@ class LocalFirstTests(unittest.TestCase):
                 counts[owner] += 500
             if double_account and state['fallback_count'] == 2:
                 counts['node2'] += 500
-            return [SimpleNamespace(id=node_id, allocatable={'CPU': 3000 - counts[node_id]})
-                    for node_id in ('node1', 'node2')]
+            return [
+                SimpleNamespace(id=node_id, allocatable={'CPU': 3000 - counts[node_id]})
+                for node_id in ('node1', 'node2')
+            ]
 
         def claims(_control, identities, _remote):
             return identities & state['claimed']
@@ -121,12 +152,36 @@ class LocalFirstTests(unittest.TestCase):
             if double_account or missing_fallback:
                 expected = 'double-counted' if double_account else 'incomplete claim and forward events'
                 with self.assertRaisesRegex(AssertionError, expected):
-                    run_local_first(inventory(), object(), 'image', '/run/sandboxd/sandboxd.sock',
-                                    output, Sandbox, Conflict, resources, remote, claims, fallbacks, wait)
+                    run_local_first(
+                        inventory(),
+                        object(),
+                        'image',
+                        '/run/sandboxd/sandboxd.sock',
+                        output,
+                        Sandbox,
+                        Conflict,
+                        resources,
+                        remote,
+                        claims,
+                        fallbacks,
+                        wait,
+                    )
                 self.assertEqual(json.loads((output / 'local-first-result.json').read_text())['status'], 'failed')
             else:
-                result = run_local_first(inventory(), object(), 'image', '/run/sandboxd/sandboxd.sock',
-                                         output, Sandbox, Conflict, resources, remote, claims, fallbacks, wait)
+                result = run_local_first(
+                    inventory(),
+                    object(),
+                    'image',
+                    '/run/sandboxd/sandboxd.sock',
+                    output,
+                    Sandbox,
+                    Conflict,
+                    resources,
+                    remote,
+                    claims,
+                    fallbacks,
+                    wait,
+                )
                 self.assertEqual(result['status'], 'passed')
                 self.assertEqual(result['fallback']['cpu_millis_delta'], 1000)
                 self.assertEqual(len(result['instances']), 5)

@@ -53,9 +53,7 @@ def _make_client(handler):
     os.environ.pop("ADX_GATEWAY_ADDRESS", None)
     os.environ["ADX_TLS"] = "0"
     c = SandboxClient()
-    c._http = httpx.Client(
-        transport=httpx.MockTransport(handler), headers={"X-Auth": "test-token"}
-    )
+    c._http = httpx.Client(transport=httpx.MockTransport(handler), headers={"X-Auth": "test-token"})
     return c
 
 
@@ -94,10 +92,7 @@ def test_create_transport_default_covers_default_logical_budget():
         return httpx.Response(
             200,
             headers={"content-type": "text/event-stream"},
-            text=(
-                'event: final\n'
-                'data: {"sandboxId":"sandbox-default-timeout","status":"running"}\n\n'
-            ),
+            text=('event: final\ndata: {"sandboxId":"sandbox-default-timeout","status":"running"}\n\n'),
         )
 
     c = _make_client(handler)
@@ -175,19 +170,12 @@ def test_create_retries_clean_eof_after_accepted_with_stable_identity():
             return httpx.Response(
                 200,
                 headers={"content-type": "text/event-stream"},
-                text=(
-                    'event: accepted\n'
-                    'data: {"status":"creating"}\n\n'
-                    ': heartbeat\n\n'
-                ),
+                text=('event: accepted\ndata: {"status":"creating"}\n\n: heartbeat\n\n'),
             )
         return httpx.Response(
             200,
             headers={"content-type": "text/event-stream"},
-            text=(
-                'event: final\n'
-                'data: {"sandboxId":"sandbox-after-eof","status":"running"}\n\n'
-            ),
+            text=('event: final\ndata: {"sandboxId":"sandbox-after-eof","status":"running"}\n\n'),
         )
 
     result = _make_client(handler).create_info({"createTimeoutSeconds": 3})
@@ -261,20 +249,13 @@ def test_create_retries_structured_unknown_final_with_same_identity():
                     'data: {"status":"failed","errorCode":503,'
                     '"message":"reply lost","error":{'
                     '"code":"OUTCOME_UNKNOWN","retry":"same_operation",'
-                    '"outcome":"unknown","requestId":"'
-                    + request_id
-                    + '","instanceId":"'
-                    + body["name"]
-                    + '"}}\n\n'
+                    '"outcome":"unknown","requestId":"' + request_id + '","instanceId":"' + body["name"] + '"}}\n\n'
                 ),
             )
         return httpx.Response(
             200,
             headers={"content-type": "text/event-stream"},
-            text=(
-                'event: final\n'
-                'data: {"sandboxId":"sandbox-after-unknown","status":"running"}\n\n'
-            ),
+            text=('event: final\ndata: {"sandboxId":"sandbox-after-unknown","status":"running"}\n\n'),
         )
 
     result = _make_client(handler).create_info({"createTimeoutSeconds": 3})
@@ -338,11 +319,7 @@ def test_create_does_not_retry_structured_terminal_final():
                 'data: {"status":"failed","errorCode":409,'
                 '"message":"specification conflict","error":{'
                 '"code":"CONFLICT","retry":"never",'
-                '"outcome":"not_started","requestId":"'
-                + request_id
-                + '","instanceId":"'
-                + body["name"]
-                + '"}}\n\n'
+                '"outcome":"not_started","requestId":"' + request_id + '","instanceId":"' + body["name"] + '"}}\n\n'
             ),
         )
 
@@ -363,10 +340,7 @@ def test_create_retries_broken_sse_with_stable_request_identity():
 
     class BrokenCreateStream(httpx.SyncByteStream):
         def __iter__(self):
-            yield (
-                b'event: accepted\n'
-                b'data: {"status":"creating"}\n\n'
-            )
+            yield (b'event: accepted\ndata: {"status":"creating"}\n\n')
             raise httpx.ReadError("connection reset during chunked response")
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -385,10 +359,7 @@ def test_create_retries_broken_sse_with_stable_request_identity():
         return httpx.Response(
             200,
             headers={"content-type": "text/event-stream"},
-            text=(
-                'event: final\n'
-                'data: {"sandboxId":"sandbox-retried","status":"running"}\n\n'
-            ),
+            text=('event: final\ndata: {"sandboxId":"sandbox-retried","status":"running"}\n\n'),
         )
 
     c = _make_client(handler)
@@ -405,8 +376,7 @@ def test_create_retries_broken_sse_with_stable_request_identity():
         f"generated instance name changed across retries: {attempts}",
     )
     _check(
-        attempts[0]["body"]["name"]
-        == f"sandbox-{attempts[0]['request_id'].removeprefix('create-')}",
+        attempts[0]["body"]["name"] == f"sandbox-{attempts[0]['request_id'].removeprefix('create-')}",
         f"generated name is not tied to the request identity: {attempts}",
     )
     print("ok: broken create SSE retries with stable request identity")
@@ -487,10 +457,7 @@ def test_distinct_logical_creates_use_distinct_request_ids_and_names():
         return httpx.Response(
             200,
             headers={"content-type": "text/event-stream"},
-            text=(
-                'event: final\n'
-                f'data: {{"sandboxId":"sandbox-{len(attempts)}","status":"running"}}\n\n'
-            ),
+            text=(f'event: final\ndata: {{"sandboxId":"sandbox-{len(attempts)}","status":"running"}}\n\n'),
         )
 
     c = _make_client(handler)
@@ -529,10 +496,7 @@ def test_create_retries_gateway_503_with_stable_request_id():
         return httpx.Response(
             200,
             headers={"content-type": "text/event-stream"},
-            text=(
-                'event: final\n'
-                'data: {"sandboxId":"sandbox-after-503","status":"running"}\n\n'
-            ),
+            text=('event: final\ndata: {"sandboxId":"sandbox-after-503","status":"running"}\n\n'),
         )
 
     c = _make_client(handler)
@@ -901,13 +865,11 @@ def test_direct_503_retries_with_same_request_id():
     out = c.invoke("sandbox-demo", "process.exec", {"cmd": ["touch", "/tmp/once"]})
     _check(out == {"created": True}, f"retry result: {out}")
     _check(
-        len(calls) == 3
-        and all(call[0] == "/direct/sandbox-demo/invoke" for call in calls),
+        len(calls) == 3 and all(call[0] == "/direct/sandbox-demo/invoke" for call in calls),
         f"expected three direct attempts: {calls}",
     )
     _check(
-        len({call[1] for call in calls}) == 1
-        and all(call[1] == call[2] for call in calls),
+        len({call[1] for call in calls}) == 1 and all(call[1] == call[2] for call in calls),
         f"direct retries must reuse request id: {calls}",
     )
     _check(c._direct_disabled is False, "transient 503 must not disable direct")
@@ -939,8 +901,7 @@ def test_direct_read_timeout_retries_with_same_request_id():
     out = c.invoke("sandbox-demo", "process.start", {"cmd": ["side-effect"]})
     _check(out == {"started": True}, f"retry result: {out}")
     _check(
-        len(calls) == 2
-        and all(call[0] == "/direct/sandbox-demo/invoke" for call in calls),
+        len(calls) == 2 and all(call[0] == "/direct/sandbox-demo/invoke" for call in calls),
         f"read timeout should retry direct once: {calls}",
     )
     _check(
@@ -980,8 +941,7 @@ def test_direct_unknown_outcome_retry_exhaustion_does_not_fallback():
         raise AssertionError("exhausted unknown-outcome retries must fail")
     _check(len(calls) == 3, f"expected three direct attempts: {calls}")
     _check(
-        len({call[1] for call in calls}) == 1
-        and all(call[1] == call[2] for call in calls),
+        len({call[1] for call in calls}) == 1 and all(call[1] == call[2] for call in calls),
         f"exhausted retries must reuse request id: {calls}",
     )
     _check(
@@ -992,27 +952,30 @@ def test_direct_unknown_outcome_retry_exhaustion_does_not_fallback():
 
 
 def test_direct_mixed_failures_preserve_unknown_outcome():
+    def make_handler(first, later):
+        calls = []
+
+        def handler(request):
+            body = json.loads(request.content)
+            calls.append((request.url.path, body["requestId"], request.headers["x-adx-request-id"]))
+            _check(request.url.path.startswith("/direct/"), f"unknown outcome crossed to RuntimeRPC: {calls}")
+            if len(calls) == 1:
+                if first == "read":
+                    raise httpx.RemoteProtocolError("response lost", request=request)
+                if first == "invalid-json":
+                    return httpx.Response(200, content=b"incomplete-json")
+                return httpx.Response(502, text="upstream lost")
+            if later == "connect":
+                raise httpx.ConnectError("connection refused", request=request)
+            if later == "pool":
+                raise httpx.PoolTimeout("pool exhausted", request=request)
+            return httpx.Response(404)
+
+        return calls, handler
+
     for first in ("read", "invalid-json", "gateway"):
         for later in ("connect", "pool", "missing"):
-            calls = []
-
-            def handler(request):
-                body = json.loads(request.content)
-                calls.append((request.url.path, body["requestId"],
-                              request.headers["x-adx-request-id"]))
-                _check(request.url.path.startswith("/direct/"),
-                       f"unknown outcome crossed to RuntimeRPC: {calls}")
-                if len(calls) == 1:
-                    if first == "read":
-                        raise httpx.RemoteProtocolError("response lost", request=request)
-                    if first == "invalid-json":
-                        return httpx.Response(200, content=b"incomplete-json")
-                    return httpx.Response(502, text="upstream lost")
-                if later == "connect":
-                    raise httpx.ConnectError("connection refused", request=request)
-                if later == "pool":
-                    raise httpx.PoolTimeout("pool exhausted", request=request)
-                return httpx.Response(404)
+            calls, handler = make_handler(first, later)
 
             client = _make_client(handler)
             try:
@@ -1033,18 +996,21 @@ def test_direct_mixed_failures_preserve_unknown_outcome():
 
 
 def test_direct_non_retryable_http_errors_do_not_fallback():
-    for status in (400, 401, 403, 409, 429, 500):
+    def make_handler(status):
         calls = []
 
         def handler(
             request: httpx.Request,
-            status=status,
-            calls=calls,
         ) -> httpx.Response:
             calls.append(request.url.path)
             if request.url.path.startswith("/api/sandbox/v1"):
                 return httpx.Response(200, json=_envelope({"ok": True}))
             return httpx.Response(status, json={"error": f"status-{status}"})
+
+        return calls, handler
+
+    for status in (400, 401, 403, 409, 429, 500):
+        calls, handler = make_handler(status)
 
         c = _make_client(handler)
         try:
@@ -1083,8 +1049,7 @@ def test_direct_invalid_json_retries_with_same_request_id():
     out = c.invoke("sandbox-demo", "process.exec", {"cmd": ["side-effect"]})
     _check(out == {"ok": True}, f"invalid JSON retry result: {out}")
     _check(
-        len(calls) == 2
-        and all(call[0] == "/direct/sandbox-demo/invoke" for call in calls),
+        len(calls) == 2 and all(call[0] == "/direct/sandbox-demo/invoke" for call in calls),
         f"invalid response should retry direct: {calls}",
     )
     _check(
@@ -1116,17 +1081,12 @@ def test_direct_connect_error_falls_back():
     _check(out == {"ok": 1}, f"connect-error fallback: {out}")
     _check(c._direct_disabled is True, "connect error should sticky-disable")
     _check(
-        len(calls) == 4
-        and all(
-            call[0] == "/direct/sandbox-demo/invoke"
-            for call in calls[:3]
-        ),
+        len(calls) == 4 and all(call[0] == "/direct/sandbox-demo/invoke" for call in calls[:3]),
         f"connect error should retry direct three times: {calls}",
     )
     _check(calls[3][0].startswith("/api/sandbox/v1"), f"fallback: {calls}")
     _check(
-        len({call[1] for call in calls}) == 1
-        and all(call[1] == call[2] for call in calls),
+        len({call[1] for call in calls}) == 1 and all(call[1] == call[2] for call in calls),
         f"fallback must reuse the logical request id: {calls}",
     )
     print("ok: connect-error fallback ->", calls)
@@ -1154,16 +1114,12 @@ def test_direct_pool_timeout_retries_then_falls_back():
     _check(c._direct_disabled is True, "pool timeout should sticky-disable")
     _check(
         len(calls) == 4
-        and all(
-            call[0] == "/direct/sandbox-demo/invoke"
-            for call in calls[:3]
-        )
+        and all(call[0] == "/direct/sandbox-demo/invoke" for call in calls[:3])
         and calls[3][0].startswith("/api/sandbox/v1"),
         f"pool timeout retry/fallback calls: {calls}",
     )
     _check(
-        len({call[1] for call in calls}) == 1
-        and all(call[1] == call[2] for call in calls),
+        len({call[1] for call in calls}) == 1 and all(call[1] == call[2] for call in calls),
         f"pool-timeout fallback must reuse request id: {calls}",
     )
     print("ok: pool timeout retries then falls back ->", calls)
@@ -1188,9 +1144,7 @@ def test_direct_fallback_when_frontend_direct_missing():
 
     os.environ["ADX_TLS"] = "0"
     c = SandboxClient()
-    c._http = httpx.Client(
-        transport=httpx.MockTransport(handler), headers={"X-Auth": "t"}
-    )
+    c._http = httpx.Client(transport=httpx.MockTransport(handler), headers={"X-Auth": "t"})
     _check(
         c.direct_enabled is True,
         "direct should default on through frontend /direct",
@@ -1205,8 +1159,7 @@ def test_direct_fallback_when_frontend_direct_missing():
             )
             _check(
                 warning.call_count == (1 if invocation > 3 else 0),
-                "warning must only be emitted when direct is disabled: "
-                f"{warning.call_args_list}",
+                f"warning must only be emitted when direct is disabled: {warning.call_args_list}",
             )
 
         # Once the fourth consecutive miss exhausts the failure budget, later
@@ -1227,15 +1180,11 @@ def test_direct_fallback_when_frontend_direct_missing():
         direct_call = calls[offset]
         fallback_call = calls[offset + 1]
         _check(
-            direct_call[0] == "/direct/sandbox-demo/invoke"
-            and fallback_call[0].startswith("/api/sandbox/v1"),
+            direct_call[0] == "/direct/sandbox-demo/invoke" and fallback_call[0].startswith("/api/sandbox/v1"),
             f"404 must immediately fall back: {calls}",
         )
         _check(
-            direct_call[1]
-            == direct_call[2]
-            == fallback_call[1]
-            == fallback_call[2],
+            direct_call[1] == direct_call[2] == fallback_call[1] == fallback_call[2],
             f"404 fallback must reuse the logical request id: {calls}",
         )
     _check(
@@ -1288,10 +1237,7 @@ def test_direct_success_resets_route_miss_count():
         return httpx.Response(200, json={"via": "direct"})
 
     c = _make_client(handler)
-    results = [
-        c.invoke("sandbox-demo", "file.exists", {"path": "/"})
-        for _ in direct_statuses
-    ]
+    results = [c.invoke("sandbox-demo", "file.exists", {"path": "/"}) for _ in direct_statuses]
 
     _check(direct_calls == len(direct_statuses), f"direct calls: {direct_calls}")
     _check(results[2] == {"via": "direct"}, f"first direct success: {results}")
@@ -1424,7 +1370,8 @@ def test_copy_from_local_small_file_uses_single_direct_upload():
         Filesystem(c, "sandbox-demo").copy_from_local(f.name, "/tmp/up.dat")
 
     _check(
-        calls == [
+        calls
+        == [
             (
                 "POST",
                 "/direct/sandbox-demo/upload",
@@ -1490,17 +1437,16 @@ def test_copy_from_local_file_uses_resumable_direct_upload_above_threshold():
         f"status call: {calls}",
     )
     _check(
-        calls[1][0:5]
-        == ("POST", "/direct/sandbox-demo/upload", "/tmp/up.dat", True, "0"),
+        calls[1][0:5] == ("POST", "/direct/sandbox-demo/upload", "/tmp/up.dat", True, "0"),
         f"chunk call: {calls}",
     )
     _check(calls[1][5] == b"upload-file", f"uploaded body: {calls}")
     _check(
-        calls[2][0:3]
-        == ("POST", "/direct/sandbox-demo/upload/commit", "/tmp/up.dat"),
+        calls[2][0:3] == ("POST", "/direct/sandbox-demo/upload/commit", "/tmp/up.dat"),
         f"commit call: {calls}",
     )
     print("ok: copy_from_local large file uses resumable upload ->", calls)
+
 
 def test_files_read_uses_direct_download():
     calls = []
@@ -1521,7 +1467,8 @@ def test_files_read_uses_direct_download():
     )
     _check(fs.read("/tmp/read.bin") == "hello�", "text read mismatch")
     _check(
-        calls == [
+        calls
+        == [
             ("GET", "/direct/sandbox-demo/download", "/tmp/read.bin"),
             ("GET", "/direct/sandbox-demo/download", "/tmp/read.bin"),
         ],
@@ -1586,7 +1533,13 @@ def test_copy_from_local_dir_streams_direct_tar_upload():
         _check(names == ["a.txt"], f"tar names: {names}")
         return httpx.Response(
             200,
-            json={"error": None, "name": "remote-dir", "path": request.url.params.get("path"), "type": "dir", "size": len(body)},
+            json={
+                "error": None,
+                "name": "remote-dir",
+                "path": request.url.params.get("path"),
+                "type": "dir",
+                "size": len(body),
+            },
         )
 
     c = _make_client(handler)
@@ -1619,7 +1572,14 @@ def test_copy_to_local_dir_uses_direct_tar_download():
         if request.url.path.endswith("/invoke"):
             return httpx.Response(
                 200,
-                json={"name": "remote-dir", "path": "/tmp/remote-dir", "type": "dir", "size": 0, "permissions": "", "modified_time": 0},
+                json={
+                    "name": "remote-dir",
+                    "path": "/tmp/remote-dir",
+                    "type": "dir",
+                    "size": 0,
+                    "permissions": "",
+                    "modified_time": 0,
+                },
             )
         _check(request.url.path == "/direct/sandbox-demo/download", f"dir download path: {request.url.path}")
         return httpx.Response(200, content=tar_bytes)
@@ -1678,7 +1638,9 @@ def test_tunnel_client_keeps_http_req_dedup_cache():
     import adx_sandbox.tunnel_client as tunnel_client
 
     source = inspect.getsource(tunnel_client.TunnelClient._proxy_loop)
-    _check("inflight" in source and "completed" in source, "TunnelClient should cache in-flight/completed http_req frames")
+    _check(
+        "inflight" in source and "completed" in source, "TunnelClient should cache in-flight/completed http_req frames"
+    )
     _check("if rid and rid in completed" in source, "TunnelClient should replay completed http_req ids")
     _check("if rid and rid in inflight" in source, "TunnelClient should coalesce running http_req ids")
     print("ok: TunnelClient has http_req id dedup/replay cache")
@@ -1797,12 +1759,10 @@ def test_reverse_tunnel_url_uses_gateway_tunnel_alias():
         f"SDK should ask frontend for tunnel declaratively, got {seen.get('create_tunnel')}",
     )
     _check(
-        "EXECD_TUNNEL_WS_PORT" not in seen["create_env"]
-        and "EXECD_TUNNEL_HTTP_PORT" not in seen["create_env"],
+        "EXECD_TUNNEL_WS_PORT" not in seen["create_env"] and "EXECD_TUNNEL_HTTP_PORT" not in seen["create_env"],
         f"SDK must not set EXECD tunnel envs, got {seen['create_env']}",
     )
     print("ok: reverse tunnel URL uses gateway alias and hides control port ->", seen["url"])
-
 
 
 def test_reverse_tunnel_uses_frontend_returned_tunnel_metadata():
@@ -1897,12 +1857,8 @@ def test_reverse_tunnel_example_local_server_serves_owned_ephemeral_port():
     server, thread, temp_dir, port = module.start_local_server(0)
     try:
         _check(port > 0, f"expected ephemeral port, got {port}")
-        health = urllib.request.urlopen(
-            f"http://127.0.0.1:{port}/health", timeout=2
-        ).read().decode()
-        index = urllib.request.urlopen(
-            f"http://127.0.0.1:{port}/index.html", timeout=2
-        ).read().decode()
+        health = urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=2).read().decode()
+        index = urllib.request.urlopen(f"http://127.0.0.1:{port}/index.html", timeout=2).read().decode()
         _check(health == "OK", f"health body mismatch: {health!r}")
         _check("Hello from local machine!" in index, "index body mismatch")
         print("ok: reverse_tunnel local server uses owned ephemeral port ->", port)
@@ -1926,13 +1882,9 @@ def test_tunnel_large_response_example_local_server_serves_owned_ephemeral_port(
     server, thread, temp_dir, file_hashes, port = module.start_local_server(0)
     try:
         _check(port > 0, f"expected ephemeral port, got {port}")
-        health = urllib.request.urlopen(
-            f"http://127.0.0.1:{port}/health", timeout=2
-        ).read()
+        health = urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=2).read()
         first_label, first_size = module.TEST_SIZES[0]
-        data = urllib.request.urlopen(
-            f"http://127.0.0.1:{port}/{first_label}.bin", timeout=2
-        ).read()
+        data = urllib.request.urlopen(f"http://127.0.0.1:{port}/{first_label}.bin", timeout=2).read()
         _check(health == b"OK", f"health body mismatch: {health!r}")
         _check(len(data) == first_size, f"large fixture size mismatch: {len(data)}")
         _check(
@@ -1957,9 +1909,7 @@ def test_tunnel_client_ignores_proxy_env_for_local_upstream():
     clients = [
         node
         for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "AsyncClient"
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "AsyncClient"
     ]
     _check(clients, "TunnelClient must construct an upstream HTTP client")
     for client in clients:
@@ -1979,9 +1929,7 @@ def test_safe_id_matches_router_sanitize():
         SandboxClient._safe_id("sandbox@v1/foo.bar_baz") == "sandbox-at-v1-foo-bar-baz",
         "safe_id sanitize mismatch",
     )
-    _check(
-        SandboxClient._safe_id("default-rtt") == "default-rtt", "safe_id passthrough"
-    )
+    _check(SandboxClient._safe_id("default-rtt") == "default-rtt", "safe_id passthrough")
     print("ok: safe_id sanitize")
 
 

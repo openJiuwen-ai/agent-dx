@@ -2,14 +2,13 @@
 
 import importlib.util
 import json
-from pathlib import Path
 import sys
 import tempfile
 import time
 import types
 import unittest
+from pathlib import Path
 from unittest.mock import patch
-
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -33,15 +32,17 @@ class ScheduleDeadlineTests(unittest.TestCase):
                 state['created'] += 1
                 state['options'] = options
                 state['pending'] = True
-                time.sleep(.08)
+                time.sleep(0.08)
                 state['pending'] = False
                 raise SandboxError('default-' + options['name'])
 
         nodes = {
-            'node:' + node: json.dumps({
-                'node': {'available': True, 'runtime_classes': ['runc']},
-                'session': {'routable': True},
-            })
+            'node:' + node: json.dumps(
+                {
+                    'node': {'available': True, 'runtime_classes': ['runc']},
+                    'session': {'routable': True},
+                }
+            )
             for node in ('node1', 'node2')
         }
 
@@ -51,8 +52,7 @@ class ScheduleDeadlineTests(unittest.TestCase):
             state['queries'] += 1
             return {'default-' + state['options']['name']} if state['pending'] else set()
 
-        spec = importlib.util.spec_from_file_location(
-            'schedule_deadline_case', ROOT / 'schedule_deadline.py')
+        spec = importlib.util.spec_from_file_location('schedule_deadline_case', ROOT / 'schedule_deadline.py')
         scenario = importlib.util.module_from_spec(spec)
         modules = {
             'adx_sandbox': types.SimpleNamespace(Sandbox=Sandbox, SandboxError=SandboxError),
@@ -68,8 +68,9 @@ class ScheduleDeadlineTests(unittest.TestCase):
             output = root / 'deadline.json'
             admin_key = root / 'admin-key'
             admin_key.write_text('admin-token\n')
-            result = scenario.run(connection, 'test-image', output, root / 'ca.pem',
-                                  admin_key, queue_reader=queue_reader)
+            result = scenario.run(
+                connection, 'test-image', output, root / 'ca.pem', admin_key, queue_reader=queue_reader
+            )
             persisted = json.loads(output.read_text())
         self.assertEqual(result, persisted)
         self.assertEqual(result['status'], 'passed')

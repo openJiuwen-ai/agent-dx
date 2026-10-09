@@ -4,136 +4,378 @@
 Owns /opt/adx only when absent at start.
 External sandboxd/Redis fixtures are deliberately outside the ADX supervisor.
 """
-import hashlib,json,os,pathlib,secrets,shutil,ssl,subprocess,sys,time,traceback,urllib.request
-from contract import CASES,verify
-BASE=pathlib.Path(os.environ['ADX_EXAMPLE_BASE']);ROOT=pathlib.Path(sys.argv[1]).resolve()
-INSTALL=pathlib.Path('/opt/adx')
-SYSTEM_CLI=pathlib.Path('/usr/local/bin/adxctl')
-SOCKET=pathlib.Path('/run/sandboxd/sandboxd.sock')
-if ROOT.exists() or INSTALL.exists() or INSTALL.is_symlink() or SYSTEM_CLI.exists() or SYSTEM_CLI.is_symlink() or SOCKET.exists():
+
+import hashlib
+import json
+import os
+import pathlib
+import secrets
+import shutil
+import ssl
+import subprocess
+import sys
+import time
+import traceback
+import urllib.request
+
+from contract import CASES, verify
+
+
+def _executable(name, environment=None, cwd=None):
+    """Resolve an external command using the child's execution environment."""
+    directory = os.getcwd() if cwd is None else os.path.abspath(cwd)
+    search_path = os.pathsep.join(
+        os.path.abspath(os.path.join(directory, entry)) for entry in os.get_exec_path(environment)
+    )
+    executable = shutil.which(name, path=search_path)
+    if executable is None:
+        raise FileNotFoundError(f"required executable not found: {name}")
+    return os.path.abspath(executable)
+
+
+BASE = pathlib.Path(os.environ['ADX_EXAMPLE_BASE'])
+ROOT = pathlib.Path(sys.argv[1]).resolve()
+INSTALL = pathlib.Path('/opt/adx')
+SYSTEM_CLI = pathlib.Path('/usr/local/bin/adxctl')
+SOCKET = pathlib.Path('/run/sandboxd/sandboxd.sock')
+if (
+    ROOT.exists()
+    or INSTALL.exists()
+    or INSTALL.is_symlink()
+    or SYSTEM_CLI.exists()
+    or SYSTEM_CLI.is_symlink()
+    or SOCKET.exists()
+):
     raise RuntimeError('example paths must be unused; refusing to overwrite existing deployment')
-env={**os.environ,'PATH':f'/opt/adx-fc/bin:{BASE}/tools:'+os.environ['PATH'],
-     'NO_PROXY':'127.0.0.1,localhost,10.88.0.0/16','no_proxy':'127.0.0.1,localhost,10.88.0.0/16'}
-ROOT.mkdir(parents=True);E=ROOT/'evidence';E.mkdir();children=[];created=[]
-result={'status':'failed','profile':'standalone','deployment':'process','required_checks':list(CASES),
-        'checks':[],'missing_checks':list(CASES),'cases':[],'cleanup_errors':[]}
-def event(index,**data):
-    name=CASES[index];result['cases'].append({'name':name,'passed':True,**data});result['checks'].append(name)
-    result['missing_checks']=[case for case in CASES if case not in result['checks']];print('PASS',name,flush=True)
-def call(args,**kw):return subprocess.run(list(map(str,args)),env=env,check=True,**kw)
-def output(args):return subprocess.check_output(list(map(str,args)),env=env,text=True,timeout=15)
-def spawn(name,args):
-    with (E/(name+'.log')).open('w') as log:p=subprocess.Popen(list(map(str,args)),env=env,stdout=log,stderr=subprocess.STDOUT)
-    children.append((name,p));return p
-def wait(test,seconds=120):
-    end=time.monotonic()+seconds
-    while time.monotonic()<end:
-        for name,p in children:
-            if p.poll() is not None:raise RuntimeError(name+' exited')
+env = {
+    **os.environ,
+    'PATH': f'/opt/adx-fc/bin:{BASE}/tools:' + os.environ['PATH'],
+    'NO_PROXY': '127.0.0.1,localhost,10.88.0.0/16',
+    'no_proxy': '127.0.0.1,localhost,10.88.0.0/16',
+}
+ROOT.mkdir(parents=True)
+E = ROOT / 'evidence'
+E.mkdir()
+children = []
+created = []
+result = {
+    'status': 'failed',
+    'profile': 'standalone',
+    'deployment': 'process',
+    'required_checks': list(CASES),
+    'checks': [],
+    'missing_checks': list(CASES),
+    'cases': [],
+    'cleanup_errors': [],
+}
+
+
+def event(index, **data_local):
+    name_local = CASES[index]
+    result['cases'].append({'name': name_local, 'passed': True, **data_local})
+    result['checks'].append(name_local)
+    result['missing_checks'] = [case for case in CASES if case not in result['checks']]
+    print('PASS', name_local, flush=True)
+
+
+def call(args_local, **kw):
+    return subprocess.run(list(map(str, args_local)), env=env, check=True, **kw)
+
+
+def output(args_local):
+    return subprocess.check_output(list(map(str, args_local)), env=env, text=True, timeout=15)
+
+
+def spawn(name_local, args_local):
+    with (E / (name_local + '.log')).open('w') as log_local:
+        p = subprocess.Popen(list(map(str, args_local)), env=env, stdout=log_local, stderr=subprocess.STDOUT)
+    children.append((name_local, p))
+    return p
+
+
+def wait(test, seconds=120):
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        for name_local, p in children:
+            if p.poll() is not None:
+                raise RuntimeError(name_local + ' exited')
         try:
-            r=test()
-            if r:return r
-        except (OSError,subprocess.SubprocessError,KeyError,ValueError):pass
-        time.sleep(.5)
+            r = test()
+            if r:
+                return r
+        except (OSError, subprocess.SubprocessError, KeyError, ValueError):
+            pass
+        time.sleep(0.5)
     raise TimeoutError('example readiness timeout')
-def catalog():return {k:json.loads(v) for k,v in json.loads(output(['redis-cli','--json','HGETALL','adx:{adx}:control:v1'])).items()}
-def cli(command,*args):return [SYSTEM_CLI,command,'--config','/opt/adx/config/deployment.yaml',*args]
-def inventory():return output(['sbox','-a',SOCKET,'list']).strip().splitlines()[1:]
+
+
+def catalog():
+    return {
+        k: json.loads(v)
+        for k, v in json.loads(output(['redis-cli', '--json', 'HGETALL', 'adx:{adx}:control:v1'])).items()
+    }
+
+
+def cli(command, *args_local):
+    return [SYSTEM_CLI, command, '--config', '/opt/adx/config/deployment.yaml', *args_local]
+
+
+def inventory():
+    return output(['sbox', '-a', SOCKET, 'list']).strip().splitlines()[1:]
+
+
 try:
     # Reuse only the external sandboxd prerequisites from the FC fixture helper.
-    preparation=ROOT/'prerequisites'
-    prep_env={**env,'ADX_FC_BASE':str(BASE),'ADX_FC_RUN_ROOT':str(preparation)}
-    subprocess.run(['python3',str(BASE/'e2e/firecracker/configure.py'),'node1'],env=prep_env,check=True)
-    created.append(INSTALL);call([BASE/'package/install.sh'])
-    shutil.copyfile('/opt/adx/current/manifest.json',E/'package-manifest.json')
-    example=pathlib.Path('/opt/adx/current/etc/examples/deployment.yaml')
-    installed=pathlib.Path('/opt/adx/config/deployment.yaml');shutil.copyfile(example,installed);installed.chmod(0o600)
-    result['example_sha256']=hashlib.sha256(example.read_bytes()).hexdigest()
-    result['installed_sha256']=hashlib.sha256(installed.read_bytes()).hexdigest()
-    tls=pathlib.Path('/opt/adx/config/tls');tls.mkdir(mode=0o700,exist_ok=True)
-    def openssl(*args):call(['openssl',*args],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
-    openssl('req','-x509','-newkey','rsa:2048','-nodes','-keyout',tls/'ca.key','-out',tls/'ca.pem','-days','2','-subj','/CN=ADX example test CA')
-    extensions=ROOT/'extensions.cnf';extensions.write_text('basicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth,clientAuth\nsubjectAltName=DNS:adx.internal,DNS:localhost,IP:127.0.0.1\n')
-    for name in ('coordinator','node-1','apiserver','ingress','ingress-public'):
-        openssl('req','-newkey','rsa:2048','-nodes','-keyout',tls/(name+'.key'),'-out',ROOT/(name+'.csr'),'-subj','/CN=ADX example '+name)
-        openssl('x509','-req','-in',ROOT/(name+'.csr'),'-CA',tls/'ca.pem','-CAkey',tls/'ca.key','-CAcreateserial','-out',tls/(name+'.pem'),'-days','2','-extfile',extensions)
-        openssl('x509','-in',tls/(name+'.pem'),'-outform','DER','-out',tls/(name+'.der'))
-    for path in tls.glob('*.key'):path.chmod(0o600)
-    shutil.copyfile(tls/'ca.pem',tls/'public-ca.pem')
-    private=pathlib.Path('/opt/adx/config/secrets');private.mkdir(mode=0o700,exist_ok=True)
-    key=private/'admin-key';key.write_text(secrets.token_hex(32));key.chmod(0o600)
+    preparation = ROOT / 'prerequisites'
+    prep_env = {**env, 'ADX_FC_BASE': str(BASE), 'ADX_FC_RUN_ROOT': str(preparation)}
+    subprocess.run(
+        [_executable('python3', environment=prep_env), str(BASE / 'e2e/firecracker/configure.py'), 'node1'],
+        env=prep_env,
+        check=True,
+    )
+    created.append(INSTALL)
+    call([BASE / 'package/install.sh'])
+    shutil.copyfile('/opt/adx/current/manifest.json', E / 'package-manifest.json')
+    example = pathlib.Path('/opt/adx/current/etc/examples/deployment.yaml')
+    installed = pathlib.Path('/opt/adx/config/deployment.yaml')
+    shutil.copyfile(example, installed)
+    installed.chmod(0o600)
+    result['example_sha256'] = hashlib.sha256(example.read_bytes()).hexdigest()
+    result['installed_sha256'] = hashlib.sha256(installed.read_bytes()).hexdigest()
+    tls = pathlib.Path('/opt/adx/config/tls')
+    tls.mkdir(mode=0o700, exist_ok=True)
+
+    def openssl(*args_local):
+        call(['openssl', *args_local], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    openssl(
+        'req',
+        '-x509',
+        '-newkey',
+        'rsa:2048',
+        '-nodes',
+        '-keyout',
+        tls / 'ca.key',
+        '-out',
+        tls / 'ca.pem',
+        '-days',
+        '2',
+        '-subj',
+        '/CN=ADX example test CA',
+    )
+    extensions = ROOT / 'extensions.cnf'
+    extensions.write_text(
+        (
+            'basicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncip'
+            'herment\nextendedKeyUsage=serverAuth,clientAuth\nsubjectAltNam'
+            'e=DNS:adx.internal,DNS:localhost,IP:127.0.0.1\n'
+        )
+    )
+    for name in ('coordinator', 'node-1', 'apiserver', 'ingress', 'ingress-public'):
+        openssl(
+            'req',
+            '-newkey',
+            'rsa:2048',
+            '-nodes',
+            '-keyout',
+            tls / (name + '.key'),
+            '-out',
+            ROOT / (name + '.csr'),
+            '-subj',
+            '/CN=ADX example ' + name,
+        )
+        openssl(
+            'x509',
+            '-req',
+            '-in',
+            ROOT / (name + '.csr'),
+            '-CA',
+            tls / 'ca.pem',
+            '-CAkey',
+            tls / 'ca.key',
+            '-CAcreateserial',
+            '-out',
+            tls / (name + '.pem'),
+            '-days',
+            '2',
+            '-extfile',
+            extensions,
+        )
+        openssl('x509', '-in', tls / (name + '.pem'), '-outform', 'DER', '-out', tls / (name + '.der'))
+    for path in tls.glob('*.key'):
+        path.chmod(0o600)
+    shutil.copyfile(tls / 'ca.pem', tls / 'public-ca.pem')
+    private = pathlib.Path('/opt/adx/config/secrets')
+    private.mkdir(mode=0o700, exist_ok=True)
+    key = private / 'admin-key'
+    key.write_text(secrets.token_hex(32))
+    key.chmod(0o600)
     # Keep a private copy for evidence redaction, never exported itself.
-    (ROOT/'secrets').mkdir(mode=0o700);shutil.copyfile(key,ROOT/'secrets/admin-key')
-    backend=preparation/'sandboxd/config.toml'
-    backend.write_text(backend.read_text().replace('10.231.16.0/20','10.88.0.0/16'))
-    registry=spawn('registry',['docker-registry','serve',preparation/'registry.yaml'])
-    sys.path.insert(0,str(BASE/'e2e'));import publish
-    image='127.0.0.1:5000/adx-execd@'+publish.publish(str(BASE/'execd.tar'))
-    (E/'image.json').write_text(json.dumps({'image':image}))
-    redis=spawn('external-redis',['/opt/adx/current/bin/redis-server','--bind','127.0.0.1','--port','6379','--appendonly','yes','--appendfsync','always','--dir',preparation/'redis','--save',''])
-    wait(lambda:output(['redis-cli','ping'])=='PONG\n')
-    SOCKET.parent.mkdir(mode=0o700,parents=True,exist_ok=True)
-    sandboxd=spawn('external-sandboxd',['sandboxd','--root',preparation/'sandboxd/root','--config',backend,'--socket',SOCKET,'--http-address','127.0.0.1:18081','--pprof-address','127.0.0.1:16061','--log-file',E/'sandboxd-service.log'])
-    wait(lambda:SOCKET.exists())
-    for args,name in [(cli('validate'),'validate'),(cli('render','--output','/opt/adx/run/config-review'),'render')]:
-        with (E/(name+'.log')).open('w') as log:call(args,stdout=log,stderr=subprocess.STDOUT)
+    (ROOT / 'secrets').mkdir(mode=0o700)
+    shutil.copyfile(key, ROOT / 'secrets/admin-key')
+    backend = preparation / 'sandboxd/config.toml'
+    backend.write_text(backend.read_text().replace('10.231.16.0/20', '10.88.0.0/16'))
+    registry = spawn('registry', ['docker-registry', 'serve', preparation / 'registry.yaml'])
+    sys.path.insert(0, str(BASE / 'e2e'))
+    import publish
+
+    image = '127.0.0.1:5000/adx-execd@' + publish.publish(str(BASE / 'execd.tar'))
+    (E / 'image.json').write_text(json.dumps({'image': image}))
+    redis = spawn(
+        'external-redis',
+        [
+            '/opt/adx/current/bin/redis-server',
+            '--bind',
+            '127.0.0.1',
+            '--port',
+            '6379',
+            '--appendonly',
+            'yes',
+            '--appendfsync',
+            'always',
+            '--dir',
+            preparation / 'redis',
+            '--save',
+            '',
+        ],
+    )
+    wait(lambda: output(['redis-cli', 'ping']) == 'PONG\n')
+    SOCKET.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    sandboxd = spawn(
+        'external-sandboxd',
+        [
+            'sandboxd',
+            '--root',
+            preparation / 'sandboxd/root',
+            '--config',
+            backend,
+            '--socket',
+            SOCKET,
+            '--http-address',
+            '127.0.0.1:18081',
+            '--pprof-address',
+            '127.0.0.1:16061',
+            '--log-file',
+            E / 'sandboxd-service.log',
+        ],
+    )
+    wait(lambda: SOCKET.exists())
+    for args, name in [
+        (cli('validate'), 'validate'),
+        (cli('render', '--output', '/opt/adx/run/config-review'), 'render'),
+    ]:
+        with (E / (name + '.log')).open('w') as log:
+            call(args, stdout=log, stderr=subprocess.STDOUT)
     event(0)
-    supervisor=spawn('supervisor',cli('run'))
-    wait(lambda:catalog()['node:node-1']['session']['routable'] and catalog()['node:node-1']['node']['available'])
-    status=json.loads(output(cli('status')))
-    (E/'status-running.json').write_text(json.dumps(status,indent=2))
-    assert len(status['services'])==5 and all(s['pid'] and not s['failed'] for s in status['services']), 'five live supervisor roles required; inspect status-running.json and component-logs'
-    node=catalog()['node:node-1'];(E/'node-ready.json').write_text(json.dumps(node,indent=2))
+    supervisor = spawn('supervisor', cli('run'))
+    wait(lambda: catalog()['node:node-1']['session']['routable'] and catalog()['node:node-1']['node']['available'])
+    status = json.loads(output(cli('status')))
+    (E / 'status-running.json').write_text(json.dumps(status, indent=2))
+    if not (len(status['services']) == 5 and all(s['pid'] and not s['failed'] for s in status['services'])):
+        raise AssertionError('five live supervisor roles required; inspect status-running.json and component-logs')
+    node = catalog()['node:node-1']
+    (E / 'node-ready.json').write_text(json.dumps(node, indent=2))
     event(1)
-    context=ssl.create_default_context(cafile='/opt/adx/config/tls/public-ca.pem')
-    def request(method,path,data=None):
-        req=urllib.request.Request('https://localhost:8443'+path,data=json.dumps(data).encode() if data else None,method=method,headers={'Authorization':'Bearer '+key.read_text().strip(),'Content-Type':'application/json'})
-        with urllib.request.urlopen(req,context=context,timeout=20) as response:return json.load(response)
-    wait(lambda:request('GET','/api/admin/v1/keys') is not None)
-    credential=request('POST','/api/admin/v1/keys',{'tenantId':'example'})
-    tenant=private/'tenant-key';tenant.write_text(credential['apiKey']);tenant.chmod(0o600)
-    shutil.copyfile(tenant,ROOT/'secrets/tenant-key')
+    context = ssl.create_default_context(cafile='/opt/adx/config/tls/public-ca.pem')
+
+    def request(method, path_local, data_local=None):
+        req = urllib.request.Request(
+            'https://localhost:8443' + path_local,
+            data=json.dumps(data_local).encode() if data_local else None,
+            method=method,
+            headers={'Authorization': 'Bearer ' + key.read_text().strip(), 'Content-Type': 'application/json'},
+        )
+        with urllib.request.urlopen(req, context=context, timeout=20) as response:
+            return json.load(response)
+
+    wait(lambda: request('GET', '/api/admin/v1/keys') is not None)
+    credential = request('POST', '/api/admin/v1/keys', {'tenantId': 'example'})
+    tenant = private / 'tenant-key'
+    tenant.write_text(credential['apiKey'])
+    tenant.chmod(0o600)
+    shutil.copyfile(tenant, ROOT / 'secrets/tenant-key')
     event(2)
-    call([BASE/'client/bin/python','-m','pip','install','--no-index','--no-deps','--force-reinstall',next(pathlib.Path('/opt/adx/current/sdk').glob('*.whl'))],stdout=subprocess.DEVNULL)
-    call([BASE/'client/bin/python','-u',BASE/'e2e/example/sdk.py',ROOT,image],timeout=300)
-    event(3);event(4)
-    assert len(inventory())==1
-    call(cli('stop'),timeout=120);supervisor.wait(timeout=30)
-    records={k:v for k,v in catalog().items() if k.startswith('environment:')}
-    assert not records,records
-    result['backend_count']=len(inventory());assert result['backend_count']==0
-    result['external_dependencies_alive_after_stop']=redis.poll() is None and sandboxd.poll() is None
-    assert result['external_dependencies_alive_after_stop']
-    sdk_evidence=json.loads((E/'sdk.json').read_text())
-    (E/'catalog-final.json').write_text(json.dumps(
-        {'absent':[sdk_evidence['deleted'],sdk_evidence['left_for_stop']]},indent=2));event(5)
-    result['status']='passed'
+    call(
+        [
+            BASE / 'client/bin/python',
+            '-m',
+            'pip',
+            'install',
+            '--no-index',
+            '--no-deps',
+            '--force-reinstall',
+            next(pathlib.Path('/opt/adx/current/sdk').glob('*.whl')),
+        ],
+        stdout=subprocess.DEVNULL,
+    )
+    call([BASE / 'client/bin/python', '-u', BASE / 'e2e/example/sdk.py', ROOT, image], timeout=300)
+    event(3)
+    event(4)
+    if not (len(inventory()) == 1):
+        raise AssertionError()
+    call(cli('stop'), timeout=120)
+    supervisor.wait(timeout=30)
+    records = {k: v for k, v in catalog().items() if k.startswith('environment:')}
+    if not (not records):
+        raise AssertionError(records)
+    result['backend_count'] = len(inventory())
+    if not (result['backend_count'] == 0):
+        raise AssertionError()
+    result['external_dependencies_alive_after_stop'] = redis.poll() is None and sandboxd.poll() is None
+    if not (result['external_dependencies_alive_after_stop']):
+        raise AssertionError()
+    sdk_evidence = json.loads((E / 'sdk.json').read_text())
+    (E / 'catalog-final.json').write_text(
+        json.dumps({'absent': [sdk_evidence['deleted'], sdk_evidence['left_for_stop']]}, indent=2)
+    )
+    event(5)
+    result['status'] = 'passed'
 except BaseException as error:
-    result['error']=repr(error);traceback.print_exc();(E/'failure.txt').write_text(traceback.format_exc());print('FAIL',repr(error),flush=True)
+    result['error'] = repr(error)
+    traceback.print_exc()
+    (E / 'failure.txt').write_text(traceback.format_exc())
+    print('FAIL', repr(error), flush=True)
 finally:
-    if any(n=='supervisor' and p.poll() is None for n,p in children):
-        try:call(cli('stop'),timeout=120)
-        except Exception as error:result['cleanup_errors'].append(str(error))
-    logs=pathlib.Path('/opt/adx/run/control/logs')
-    if logs.exists():shutil.copytree(logs,E/'component-logs')
-    for name,proc in reversed(children):
+    if any(n == 'supervisor' and p.poll() is None for n, p in children):
+        try:
+            call(cli('stop'), timeout=120)
+        except Exception as error:
+            result['cleanup_errors'].append(str(error))
+    logs = pathlib.Path('/opt/adx/run/control/logs')
+    if logs.exists():
+        shutil.copytree(logs, E / 'component-logs')
+    for name, proc in reversed(children):
         if proc.poll() is None:
             proc.terminate()
-            try:proc.wait(timeout=20)
-            except subprocess.TimeoutExpired:proc.kill();proc.wait();result['cleanup_errors'].append(name+' forced kill')
-    if SYSTEM_CLI.is_symlink() and SYSTEM_CLI.readlink()==pathlib.Path('/opt/adx/current/bin/adxctl'):SYSTEM_CLI.unlink()
+            try:
+                proc.wait(timeout=20)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+                result['cleanup_errors'].append(name + ' forced kill')
+    if SYSTEM_CLI.is_symlink() and SYSTEM_CLI.readlink() == pathlib.Path('/opt/adx/current/bin/adxctl'):
+        SYSTEM_CLI.unlink()
     # Remove only installation paths exclusively created by this run.
-    for path in reversed(created):shutil.rmtree(path)
-    if SOCKET.exists():SOCKET.unlink()
-    try:verify(result)
-    except ValueError:result['status']='failed'
-    (E/'result.json').write_text(json.dumps(result,indent=2))
-    hidden=[p.read_bytes().strip() for p in (ROOT/'secrets').glob('*') if p.is_file()]
-    export=ROOT/'export/evidence';export.mkdir(parents=True)
+    for path in reversed(created):
+        shutil.rmtree(path)
+    if SOCKET.exists():
+        SOCKET.unlink()
+    try:
+        verify(result)
+    except ValueError:
+        result['status'] = 'failed'
+    (E / 'result.json').write_text(json.dumps(result, indent=2))
+    hidden = [p.read_bytes().strip() for p in (ROOT / 'secrets').glob('*') if p.is_file()]
+    export = ROOT / 'export/evidence'
+    export.mkdir(parents=True)
     for path in E.rglob('*'):
-        if not path.is_file():continue
-        data=path.read_bytes()
+        if not path.is_file():
+            continue
+        data = path.read_bytes()
         for token in hidden:
-            if token:data=data.replace(token,b'[REDACTED]')
-        target=export/path.relative_to(E);target.parent.mkdir(parents=True,exist_ok=True);target.write_bytes(data)
-sys.exit(0 if result['status']=='passed' else 1)
+            if token:
+                data = data.replace(token, b'[REDACTED]')
+        target = export / path.relative_to(E)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+sys.exit(0 if result['status'] == 'passed' else 1)

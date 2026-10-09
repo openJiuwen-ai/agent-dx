@@ -17,23 +17,37 @@ def run(connection, image, output):
     try:
         expected_node = require_unique_runtime_node(catalog(), runtime_class)
         sandbox = Sandbox(
-            image=image, runtime=runtime_class, cpu=250, memory=256,
-            idle_timeout=0, connection=connection, create_timeout=150,
+            image=image,
+            runtime=runtime_class,
+            cpu=250,
+            memory=256,
+            idle_timeout=0,
+            connection=connection,
+            create_timeout=150,
         )
         record = json.loads(catalog()["environment:" + sandbox.id])
-        assert record["result"]["state"] == "Running", record["result"]
-        assert record["assignment"]["node_id"] == expected_node, record["assignment"]
-        assert record["spec"]["runtime_class"] == runtime_class, record["spec"]
+        if not (record["result"]["state"] == "Running"):
+            raise AssertionError(record["result"])
+        if not (record["assignment"]["node_id"] == expected_node):
+            raise AssertionError(record["assignment"])
+        if not (record["spec"]["runtime_class"] == runtime_class):
+            raise AssertionError(record["spec"])
         command = sandbox.commands.run("printf runtime-affinity-ready")
-        assert command.exit_code == 0 and command.stdout == "runtime-affinity-ready"
-        report["cases"].append({
-            "id": "runtime-affinity.unique-runsc-node", "status": "passed",
-            "seconds": round(time.monotonic() - started, 3),
-            "instance_id": sandbox.id, "node_id": expected_node,
-        })
+        if not (command.exit_code == 0 and command.stdout == "runtime-affinity-ready"):
+            raise AssertionError()
+        report["cases"].append(
+            {
+                "id": "runtime-affinity.unique-runsc-node",
+                "status": "passed",
+                "seconds": round(time.monotonic() - started, 3),
+                "instance_id": sandbox.id,
+                "node_id": expected_node,
+            }
+        )
         sandbox.kill()
         deleted = True
-        assert "environment:" + sandbox.id not in catalog()
+        if not ("environment:" + sandbox.id not in catalog()):
+            raise AssertionError()
         report["status"] = "passed"
     except Exception as error:
         report["error"] = str(error)

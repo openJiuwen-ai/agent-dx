@@ -29,6 +29,7 @@ Usage:
 import http.server
 import os
 import shlex
+import shutil
 import socket
 import sys
 import tempfile
@@ -54,52 +55,55 @@ def start_local_server(port: int):
     not just that some process accepted a TCP connection.
     """
     temp_dir = tempfile.mkdtemp(prefix="tunnel_test_")
+    server = None
+    thread = None
+    try:
+        # Create a test file
+        index = os.path.join(temp_dir, "index.html")
+        with open(index, "w") as f:
+            f.write(f"<h1>Hello from local machine!</h1>\n<p>{time.ctime()}</p>\n")
 
-    # Create a test file
-    index = os.path.join(temp_dir, "index.html")
-    with open(index, "w") as f:
-        f.write(f"<h1>Hello from local machine!</h1>\n<p>{time.ctime()}</p>\n")
+        health = os.path.join(temp_dir, "health")
+        with open(health, "w") as f:
+            f.write("OK")
 
-    health = os.path.join(temp_dir, "health")
-    with open(health, "w") as f:
-        f.write("OK")
+        class QuietHandler(http.server.SimpleHTTPRequestHandler):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, directory=temp_dir, **kwargs)
 
-    class QuietHandler(http.server.SimpleHTTPRequestHandler):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, directory=temp_dir, **kwargs)
+            def log_message(self, format, *args):  # noqa: A002 - stdlib signature
+                return
 
-        def log_message(self, format, *args):  # noqa: A002 - stdlib signature
-            return
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", port), QuietHandler)
+        actual_port = server.server_address[1]
+        thread = threading.Thread(target=server.serve_forever, name="reverse-tunnel-local-http", daemon=True)
+        thread.start()
 
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", port), QuietHandler)
-    actual_port = server.server_address[1]
-    thread = threading.Thread(
-        target=server.serve_forever, name="reverse-tunnel-local-http", daemon=True
-    )
-    thread.start()
+        # Wait for our server to bind and serve the file, not merely for any process
+        # to accept TCP on the requested port.
+        for _ in range(20):
+            try:
+                with socket.create_connection(("127.0.0.1", actual_port), timeout=0.2) as sock:
+                    sock.sendall(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                    data = sock.recv(1024)
+                if b"200" in data and b"OK" in data:
+                    print(f"[OK] Local HTTP server started on port {actual_port}")
+                    return server, thread, temp_dir, actual_port
+            except OSError:
+                time.sleep(0.2)
 
-    # Wait for our server to bind and serve the file, not merely for any process
-    # to accept TCP on the requested port.
-    for _ in range(20):
+        raise RuntimeError("Failed to start local HTTP server")
+
+    except BaseException:
         try:
-            with socket.create_connection(
-                ("127.0.0.1", actual_port), timeout=0.2
-            ) as sock:
-                sock.sendall(
-                    b"GET /health HTTP/1.1\r\n"
-                    b"Host: localhost\r\n"
-                    b"Connection: close\r\n\r\n"
-                )
-                data = sock.recv(1024)
-            if b"200" in data and b"OK" in data:
-                print(f"[OK] Local HTTP server started on port {actual_port}")
-                return server, thread, temp_dir, actual_port
-        except OSError:
-            time.sleep(0.2)
-
-    server.shutdown()
-    server.server_close()
-    raise RuntimeError("Failed to start local HTTP server")
+            if server is not None:
+                if thread is not None and thread.is_alive():
+                    server.shutdown()
+                    thread.join(timeout=5)
+                server.server_close()
+        finally:
+            shutil.rmtree(temp_dir)
+        raise
 
 
 def main():
@@ -132,8 +136,15 @@ def main():
                         # the sandbox command default timeout.
                         time.sleep(PROBE_RETRY_DELAY)
                 raise RuntimeError(
-                    f"{label} failed: expected {expected!r}, "
-                    f"rc={last_result.exit_code}, stdout={last_result.stdout!r}"
+                    (
+                        f"{label}"
+                        f" failed: expected "
+                        f"{expected!r}"
+                        f", rc="
+                        f"{last_result.exit_code}"
+                        f", stdout="
+                        f"{last_result.stdout!r}"
+                    )
                 )
 
             def fetch_command(url: str, expected_status: int = 200) -> str:
@@ -163,9 +174,7 @@ def main():
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
-        import shutil
-
-        shutil.rmtree(temp_dir, ignore_errors=True)
+        shutil.rmtree(temp_dir)
         print("[OK] Local server stopped and cleaned up.")
 
 

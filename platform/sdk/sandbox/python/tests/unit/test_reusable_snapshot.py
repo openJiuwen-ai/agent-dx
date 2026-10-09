@@ -232,9 +232,7 @@ class ReusableSnapshotTests(unittest.TestCase):
         client._base = "https://frontend/api/sandbox/v1"
         client._http = HTTP()
 
-        created = client.create_snapshot(
-            "default-source", name="base", timeout_seconds=240
-        )
+        created = client.create_snapshot("default-source", name="base", timeout_seconds=240)
         client.get_snapshot("snap-1")
         client.list_snapshots(name="base", page_token="next", page_size=10)
         client.delete_snapshot("snap-1")
@@ -257,11 +255,7 @@ class ReusableSnapshotTests(unittest.TestCase):
             client._http.calls[2][2]["params"],
             {"name": "base", "pageToken": "next", "pageSize": 10},
         )
-        self.assertTrue(
-            client._http.calls[3][2]["headers"]["X-ADX-Request-ID"].startswith(
-                "delete-snapshot-"
-            )
-        )
+        self.assertTrue(client._http.calls[3][2]["headers"]["X-ADX-Request-ID"].startswith("delete-snapshot-"))
 
     def test_transport_accepts_snapshot_id_distinct_from_request_id(self):
         class Response:

@@ -18,15 +18,15 @@ from adx_sandbox import (
     Sandbox,
     TrafficPolicy,
 )
+from adx_sandbox._transport import SandboxClient, SandboxHTTPError
 from adx_sandbox.commands import (
     CommandConflict,
     CommandExpired,
     CommandHandle,
     CommandNotFound,
-    CommandSubmissionError,
     Commands,
+    CommandSubmissionError,
 )
-from adx_sandbox._transport import SandboxClient, SandboxHTTPError
 from adx_sandbox.shell import Shells
 from adx_sandbox.shell.shell import Shell
 
@@ -318,10 +318,15 @@ class SDKContractTests(unittest.TestCase):
             Sandbox(image="ubuntu:22.04", failover=1, detached=True)
 
     def test_affinity_groups_keep_weights_and_conjoin_node_id_in_every_alternative(self):
-        groups = [{"kind": 0, "affinity": 2, "labelOps": [{"type": 0, "labelKey": "pool", "labelValues": [pool]}]} for pool in ("a", "b")]
+        groups = [
+            {"kind": 0, "affinity": 2, "labelOps": [{"type": 0, "labelKey": "pool", "labelValues": [pool]}]}
+            for pool in ("a", "b")
+        ]
         groups.append({"kind": 1, "affinity": 0, "weight": 9, "labelOps": [{"type": 2, "labelKey": "app"}]})
         with patch("adx_sandbox.sandbox_api.SandboxClient", _FakeClient):
-            Sandbox(image="ubuntu", node_id="node-a", labels={"app": "worker"}, schedule_affinities=groups, detached=True)
+            Sandbox(
+                image="ubuntu", node_id="node-a", labels={"app": "worker"}, schedule_affinities=groups, detached=True
+            )
         body = _FakeClient.created[-1]
         self.assertEqual(body["labels"], {"app": "worker"})
         self.assertEqual(body["scheduleAffinities"][2]["weight"], 9)
@@ -419,9 +424,7 @@ class SDKContractTests(unittest.TestCase):
         self.assertTrue(sandbox._client.direct_enabled)
 
     def test_dns_blacklist_is_normalized_and_forwarded(self):
-        policy = NetworkPolicy.deny_dns(
-            "GitHub.COM.", "*.GitHub.com", "github.com"
-        )
+        policy = NetworkPolicy.deny_dns("GitHub.COM.", "*.GitHub.com", "github.com")
         with patch("adx_sandbox.sandbox_api.SandboxClient", _FakeClient):
             sandbox = Sandbox(
                 image="ubuntu:22.04",
@@ -494,9 +497,7 @@ class SDKContractTests(unittest.TestCase):
                             "direction": "egress",
                             "protocol": "udp",
                             "priority": 100,
-                            "peer": {
-                                "portRange": {"first": 53, "last": 53}
-                            },
+                            "peer": {"portRange": {"first": 53, "last": 53}},
                         },
                     ],
                 },
@@ -550,9 +551,7 @@ class SDKContractTests(unittest.TestCase):
                 },
                 "dns": {
                     "defaultAction": "deny",
-                    "rules": [
-                        {"action": "allow", "pattern": "*.example.com"}
-                    ],
+                    "rules": [{"action": "allow", "pattern": "*.example.com"}],
                 },
             },
         )
@@ -812,9 +811,7 @@ class SDKContractTests(unittest.TestCase):
                 return super().invoke(sandbox_id, action, args, **kwargs)
 
         with self.assertRaises(CommandConflict) as conflict:
-            Commands(_ConflictClient(), "sandbox-1").run(
-                "true", background=True, command_id="stable-id"
-            )
+            Commands(_ConflictClient(), "sandbox-1").run("true", background=True, command_id="stable-id")
         self.assertEqual(conflict.exception.sandbox_id, "sandbox-1")
         self.assertEqual(conflict.exception.command_id, "stable-id")
         self.assertEqual(conflict.exception.request_id, "request-conflict")
@@ -843,8 +840,10 @@ class SDKContractTests(unittest.TestCase):
                     return {"command_id": args["command_id"], "status": "EXPIRED"}
                 if action == "process.start":
                     raise SandboxHTTPError(
-                        410, {"error": "command result expired", "error_code": "COMMAND_EXPIRED"},
-                        "command result expired", request_id="request-expired",
+                        410,
+                        {"error": "command result expired", "error_code": "COMMAND_EXPIRED"},
+                        "command result expired",
+                        request_id="request-expired",
                     )
                 return super().invoke(sandbox_id, action, args, **kwargs)
 

@@ -4,15 +4,15 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
 import hashlib
 import json
 import os
-from pathlib import Path
 import re
 import shlex
 import shutil
 import subprocess
+from dataclasses import dataclass
+from pathlib import Path
 
 
 def command(*argv: str) -> str:
@@ -59,11 +59,11 @@ class Layout:
 
 def discover(repo: Path, cache_root: Path | None = None, rustc: str = "rustc") -> Layout:
     repo = Path(command("git", "-C", str(repo), "rev-parse", "--show-toplevel")).resolve()
-    common = Path(
-        command("git", "-C", str(repo), "rev-parse", "--path-format=absolute", "--git-common-dir")
-    ).resolve()
+    common = Path(command("git", "-C", str(repo), "rev-parse", "--path-format=absolute", "--git-common-dir")).resolve()
     primary = common.parent
-    configured = cache_root or (Path(os.environ["ADX_BUILD_CACHE_ROOT"]) if os.environ.get("ADX_BUILD_CACHE_ROOT") else None)
+    configured = cache_root or (
+        Path(os.environ["ADX_BUILD_CACHE_ROOT"]) if os.environ.get("ADX_BUILD_CACHE_ROOT") else None
+    )
     root = configured.expanduser().resolve() if configured else primary / ".adx-cache"
     host, release = parse_rustc_info(command(rustc, "-vV"))
     key = f"{sanitize(host)}-rust{sanitize(release)}"

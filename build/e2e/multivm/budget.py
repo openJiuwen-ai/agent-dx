@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Start the non-resettable three-VM acceptance wall-clock budget."""
+
 from __future__ import annotations
 
 import argparse
 import json
 import math
 import os
-from pathlib import Path
 import time
+from pathlib import Path
 
 if __package__:
     from .contract import inventory_digest, verify_inventory
@@ -22,8 +23,7 @@ def start_budget(inventory, output, budget_seconds=MAX_BUDGET_SECONDS, now=time.
     if type(budget_seconds) is not int or not 0 < budget_seconds <= MAX_BUDGET_SECONDS:
         raise ValueError('suite budget must be at most three hours')
     started_at = now()
-    if not isinstance(started_at, (int, float)) or not math.isfinite(started_at) \
-            or started_at <= 0:
+    if not isinstance(started_at, (int, float)) or not math.isfinite(started_at) or started_at <= 0:
         raise ValueError('budget start time must be a positive Unix timestamp')
     state = {
         'schema_version': 2,
@@ -57,12 +57,17 @@ def main():
     parser.add_argument('--output', required=True, type=Path)
     parser.add_argument('--budget-seconds', type=int, default=MAX_BUDGET_SECONDS)
     args = parser.parse_args()
-    state = start_budget(json.loads(args.inventory.read_text()), args.output,
-                         args.budget_seconds)
-    print(json.dumps({'budget_state': str(args.output / 'budget-state.json'),
-                      'started_at': state['started_at'],
-                      'deadline_at': state['started_at'] + state['budget_seconds']}),
-          flush=True)
+    state = start_budget(json.loads(args.inventory.read_text()), args.output, args.budget_seconds)
+    print(
+        json.dumps(
+            {
+                'budget_state': str(args.output / 'budget-state.json'),
+                'started_at': state['started_at'],
+                'deadline_at': state['started_at'] + state['budget_seconds'],
+            }
+        ),
+        flush=True,
+    )
 
 
 if __name__ == '__main__':

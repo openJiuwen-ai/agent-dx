@@ -10,13 +10,14 @@ import random
 import re
 import time
 import uuid
-import httpx
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Union
 
+import httpx
+
+from ._command_metrics import increment, observe_wait
 from ._http_pool import SandboxClientClosedError
 from ._transport import SandboxClient, SandboxError, SandboxHTTPError
-from ._command_metrics import increment, observe_wait
 from .types import CommandInfo, CommandResult, CommandStatus
 
 logger = logging.getLogger(__name__)
@@ -135,9 +136,7 @@ class ResourceExhausted(RuntimeError):
 
 def _validate_command_id(command_id: str) -> str:
     if not isinstance(command_id, str) or _COMMAND_ID.fullmatch(command_id) is None:
-        raise ValueError(
-            "command_id must contain 1..128 ASCII letters, digits, '.', '_', ':', or '-'"
-        )
+        raise ValueError("command_id must contain 1..128 ASCII letters, digits, '.', '_', ':', or '-'")
     return command_id
 
 
@@ -171,9 +170,7 @@ def _wait_timeout_result(snapshot: dict) -> CommandResult:
     timeout_snapshot["status"] = "RUNNING"
     timeout_snapshot["error_code"] = "WAIT_TIMEOUT"
     timeout_snapshot["error_message"] = str(
-        timeout_snapshot.get("error")
-        or timeout_snapshot.get("error_message")
-        or "command wait timed out"
+        timeout_snapshot.get("error") or timeout_snapshot.get("error_message") or "command wait timed out"
     )
     timeout_snapshot.pop("exit_code", None)
     return _result(timeout_snapshot)
@@ -192,9 +189,7 @@ def _kill_command(client: SandboxClient, sandbox_id: str, key: dict) -> bool:
     if response.get("error_code") in ("COMMAND_NOT_FOUND", "COMMAND_NOT_RUNNING"):
         return False
     if response.get("error"):
-        raise SandboxError(
-            str(response["error"]), request_id=getattr(response, "request_id", None)
-        )
+        raise SandboxError(str(response["error"]), request_id=getattr(response, "request_id", None))
     return bool(response["killed"])
 
 
@@ -251,9 +246,7 @@ class CommandHandle:
 
     def _raw_snapshot(self) -> dict:
         try:
-            snapshot = self._client.invoke(
-                self._sid, "process.get", {"command_id": self.command_id}
-            )
+            snapshot = self._client.invoke(self._sid, "process.get", {"command_id": self.command_id})
         except SandboxHTTPError as error:
             if error.status_code == 404:
                 raise CommandNotFound(
@@ -332,9 +325,7 @@ class CommandHandle:
                 from ._command_watch import manager_for
 
                 try:
-                    await manager_for(connection).wait_async(
-                        self._sid, self.command_id, timeout
-                    )
+                    await manager_for(connection).wait_async(self._sid, self.command_id, timeout)
                 except CommandWaitTimeout:
                     return _wait_timeout_result(snapshot)
                 snapshot = await asyncio.to_thread(self._raw_snapshot)
@@ -344,9 +335,7 @@ class CommandHandle:
 
     def kill(self) -> bool:
         """Return whether a live command was signalled (False if absent or finished)."""
-        return _kill_command(
-            self._client, self._sid, {"command_id": self.command_id}
-        )
+        return _kill_command(self._client, self._sid, {"command_id": self.command_id})
 
     def send_stdin(self, data: str, eof: bool = False) -> None:
         response = self._client.invoke(
@@ -512,7 +501,8 @@ class Commands:
             cwd=cwd,
             timeout=timeout,
         )
-        assert isinstance(handle, CommandHandle)
+        if not (isinstance(handle, CommandHandle)):
+            raise AssertionError()
         deadline = time.monotonic() + timeout
         while True:
             remaining = deadline - time.monotonic()
@@ -545,10 +535,18 @@ class Commands:
                 continue
             except (httpx.TransportError, SandboxError) as error:
                 if isinstance(error, SandboxError):
-                    if error.outcome == "terminal" or error.code in (
-                        "SANDBOX_EXITED", "SCHEDULE_FAILED", "SANDBOX_SCHEDULE_FAILED",
-                        "SCHEDULING_FAILED", "INSTANCE_FAILED"
-                    ) or error.retry not in ("after_backoff", "same_operation"):
+                    if (
+                        error.outcome == "terminal"
+                        or error.code
+                        in (
+                            "SANDBOX_EXITED",
+                            "SCHEDULE_FAILED",
+                            "SANDBOX_SCHEDULE_FAILED",
+                            "SCHEDULING_FAILED",
+                            "INSTANCE_FAILED",
+                        )
+                        or error.retry not in ("after_backoff", "same_operation")
+                    ):
                         raise
                 logger.warning("command wait failed (command_id=%s): %s", handle.id, error)
                 retry_delay = min(_POLL_RETRY_DELAY, deadline - time.monotonic())
@@ -577,9 +575,7 @@ class Commands:
 
     def send_stdin(self, command: Union[str, int], data: str, eof: bool = False) -> None:
         key = {"command_id": command} if isinstance(command, str) else {"pid": command}
-        response = self._client.invoke(
-            self._sid, "process.send_stdin", {**key, "data": data, "eof": eof}
-        )
+        response = self._client.invoke(self._sid, "process.send_stdin", {**key, "data": data, "eof": eof})
         if response.get("error"):
             raise RuntimeError(f"Failed to send stdin: {response['error']}")
 

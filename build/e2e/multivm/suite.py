@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """Run selected three-VM cases with one shared, resumable runtime budget."""
+
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
 import fcntl
 import json
 import os
-from pathlib import Path
 import signal
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 if __package__:
@@ -73,11 +74,25 @@ def write_json(path, value):
 
 def case_command(config, case, destination):
     definition = CASES[case]
-    command = [sys.executable, '-u', str(Path(__file__).parent / definition.script),
-               '--inventory', str(config.inventory_path), '--endpoint', config.endpoint,
-               '--token-file', str(config.token_file), '--ca', str(config.ca),
-               '--image', config.image, '--socket', config.socket,
-               '--output', str(destination)]
+    command = [
+        sys.executable,
+        '-u',
+        str(Path(__file__).parent / definition.script),
+        '--inventory',
+        str(config.inventory_path),
+        '--endpoint',
+        config.endpoint,
+        '--token-file',
+        str(config.token_file),
+        '--ca',
+        str(config.ca),
+        '--image',
+        config.image,
+        '--socket',
+        config.socket,
+        '--output',
+        str(destination),
+    ]
     if case == 'sdk':
         command += ['--release', str(config.release)]
     elif case in ('auth', 'capacity'):
@@ -99,8 +114,7 @@ def execute_subprocess(_case, command, log, timeout, _report_name):
     started = time.monotonic()
     pid_path = log.parent / 'case.pid'
     with log.open('wb') as stream:
-        process = subprocess.Popen(command, stdout=stream, stderr=subprocess.STDOUT,
-                                   start_new_session=True)
+        process = subprocess.Popen(command, stdout=stream, stderr=subprocess.STDOUT, start_new_session=True)
         pid_path.write_text(str(process.pid) + '\n')
         timed_out = False
         try:
@@ -140,36 +154,48 @@ def result_from_state(state, timestamp):
     records = state['cases']
     failed = [record['case'] for record in records if record['status'] != 'passed']
     wall_elapsed = max(0, timestamp - state['started_at'])
-    return {'schema_version': 1, 'scope': 'selected-cases',
-            'inventory_sha256': state['inventory_sha256'],
-            'budget_seconds': state['budget_seconds'],
-            'budget_scope': state['scope'],
-            'runtime_seconds': state['runtime_seconds'],
-            'wall_elapsed_seconds': wall_elapsed,
-            'remaining_seconds': max(0, min(state['budget_seconds'] - state['runtime_seconds'],
-                                            state['budget_seconds'] - wall_elapsed)),
-            'status': 'failed' if failed else 'passed',
-            'failed_cases': failed, 'cases': records}
+    return {
+        'schema_version': 1,
+        'scope': 'selected-cases',
+        'inventory_sha256': state['inventory_sha256'],
+        'budget_seconds': state['budget_seconds'],
+        'budget_scope': state['scope'],
+        'runtime_seconds': state['runtime_seconds'],
+        'wall_elapsed_seconds': wall_elapsed,
+        'remaining_seconds': max(
+            0, min(state['budget_seconds'] - state['runtime_seconds'], state['budget_seconds'] - wall_elapsed)
+        ),
+        'status': 'failed' if failed else 'passed',
+        'failed_cases': failed,
+        'cases': records,
+    }
 
 
 def run_plan(config, execute=execute_subprocess, now=time.time):
     verify_inventory(config.inventory)
     if not 0 < config.budget_seconds <= MAX_BUDGET_SECONDS:
         raise ValueError('suite budget must be at most three hours')
-    if not config.cases or len(set(config.cases)) != len(config.cases) \
-            or any(case not in CASES for case in config.cases):
+    if (
+        not config.cases
+        or len(set(config.cases)) != len(config.cases)
+        or any(case not in CASES for case in config.cases)
+    ):
         raise ValueError('suite requires distinct known cases')
     if 'stop' in config.cases and config.cases[-1] != 'stop':
         raise ValueError('destructive stop case must be last')
     if 'stop' in config.cases and not config.confirm_dedicated:
         raise ValueError('stop requires explicit dedicated-VM confirmation')
-    if 'session-fence' in config.cases \
-            and (config.session_probe is None or not config.session_probe.is_file()
-                 or not os.access(config.session_probe, os.X_OK)):
+    if 'session-fence' in config.cases and (
+        config.session_probe is None
+        or not config.session_probe.is_file()
+        or not os.access(config.session_probe, os.X_OK)
+    ):
         raise ValueError('session-fence requires a built --session-probe executable')
-    if 'stop' in config.cases and config.route_probe is not None \
-            and (not config.route_probe.is_file()
-                 or not os.access(config.route_probe, os.X_OK)):
+    if (
+        'stop' in config.cases
+        and config.route_probe is not None
+        and (not config.route_probe.is_file() or not os.access(config.route_probe, os.X_OK))
+    ):
         raise ValueError('--route-probe must name a built executable')
     config.output.mkdir(parents=True, exist_ok=True)
     state_path = config.output / 'budget-state.json'
@@ -185,20 +211,26 @@ def run_plan(config, execute=execute_subprocess, now=time.time):
         if state.get('scope') not in ('deployment-and-cases', 'cases-only'):
             raise ValueError('suite budget scope is invalid')
     else:
-        state = {'schema_version': 2, 'inventory_sha256': digest,
-                 'budget_seconds': config.budget_seconds,
-                 'scope': 'cases-only',
-                 'started_at': now(), 'finished_at': None,
-                 'runtime_seconds': 0, 'cases': [], 'active': None}
+        state = {
+            'schema_version': 2,
+            'inventory_sha256': digest,
+            'budget_seconds': config.budget_seconds,
+            'scope': 'cases-only',
+            'started_at': now(),
+            'finished_at': None,
+            'runtime_seconds': 0,
+            'cases': [],
+            'active': None,
+        }
     if state.get('active'):
         active = state['active']
         if active_process_group(active['log']):
             raise RuntimeError(f"previous case {active['case']} is still running; inspect {active['log']}")
-        elapsed = min(max(now() - active['started_at'], 0),
-                      max(0, config.budget_seconds - state['runtime_seconds']))
+        elapsed = min(max(now() - active['started_at'], 0), max(0, config.budget_seconds - state['runtime_seconds']))
         state['runtime_seconds'] += elapsed
-        state['cases'].append({'case': active['case'], 'status': 'interrupted',
-                               'seconds': elapsed, 'log': active['log']})
+        state['cases'].append(
+            {'case': active['case'], 'status': 'interrupted', 'seconds': elapsed, 'log': active['log']}
+        )
         state['active'] = None
         state['finished_at'] = now()
         write_json(state_path, state)
@@ -208,11 +240,12 @@ def run_plan(config, execute=execute_subprocess, now=time.time):
     if seen.intersection(config.cases):
         raise ValueError('case already recorded in this budget; use a new suite for regression')
     for case in config.cases:
-        remaining = max(0, min(config.budget_seconds - state['runtime_seconds'],
-                               state['started_at'] + config.budget_seconds - now()))
+        remaining = max(
+            0,
+            min(config.budget_seconds - state['runtime_seconds'], state['started_at'] + config.budget_seconds - now()),
+        )
         if remaining <= 0:
-            state['cases'].append({'case': case, 'status': 'not-run-budget-exhausted',
-                                   'seconds': 0})
+            state['cases'].append({'case': case, 'status': 'not-run-budget-exhausted', 'seconds': 0})
             state['finished_at'] = now()
             write_json(state_path, state)
             continue
@@ -239,14 +272,25 @@ def run_plan(config, execute=execute_subprocess, now=time.time):
         except (OSError, ValueError):
             report = None
         finished_at = now()
-        passed = code == 0 and not timed_out and elapsed <= timeout \
-            and finished_at <= state['started_at'] + config.budget_seconds \
-            and isinstance(report, dict) \
-            and report.get('status') == 'passed' and not report.get('cleanup_errors') \
+        passed = (
+            code == 0
+            and not timed_out
+            and elapsed <= timeout
+            and finished_at <= state['started_at'] + config.budget_seconds
+            and isinstance(report, dict)
+            and report.get('status') == 'passed'
+            and not report.get('cleanup_errors')
             and not report.get('error')
-        record = {'case': case, 'status': 'passed' if passed else 'failed',
-                  'seconds': elapsed, 'exit_code': code, 'timed_out': timed_out,
-                  'log': str(log), 'report': str(report_path) if report else None}
+        )
+        record = {
+            'case': case,
+            'status': 'passed' if passed else 'failed',
+            'seconds': elapsed,
+            'exit_code': code,
+            'timed_out': timed_out,
+            'log': str(log),
+            'report': str(report_path) if report else None,
+        }
         if execution_error:
             record['error'] = execution_error
         if finished_at > state['started_at'] + config.budget_seconds:
@@ -283,11 +327,18 @@ def main():
     if ('capacity' in args.cases or 'auth' in args.cases) and not args.admin_token_file:
         parser.error('--case auth and --case capacity require --admin-token-file')
     config = RunConfig(
-        inventory=json.loads(args.inventory.read_text()), inventory_path=args.inventory,
-        output=args.output, endpoint=args.endpoint, token_file=args.token_file,
-        admin_token_file=args.admin_token_file or Path(''), ca=args.ca,
-        image=args.image, release=args.release or Path(''), socket=args.socket,
-        cases=tuple(args.cases), budget_seconds=args.budget_seconds,
+        inventory=json.loads(args.inventory.read_text()),
+        inventory_path=args.inventory,
+        output=args.output,
+        endpoint=args.endpoint,
+        token_file=args.token_file,
+        admin_token_file=args.admin_token_file or Path(''),
+        ca=args.ca,
+        image=args.image,
+        release=args.release or Path(''),
+        socket=args.socket,
+        cases=tuple(args.cases),
+        budget_seconds=args.budget_seconds,
         confirm_dedicated=args.confirm_dedicated,
         session_probe=args.session_probe,
         route_probe=args.route_probe,
@@ -299,8 +350,16 @@ def main():
         except BlockingIOError:
             parser.error('another suite runner is using this output directory')
         result = run_plan(config)
-    print(json.dumps({'status': result['status'], 'failed_cases': result['failed_cases'],
-                      'runtime_seconds': result['runtime_seconds']}), flush=True)
+    print(
+        json.dumps(
+            {
+                'status': result['status'],
+                'failed_cases': result['failed_cases'],
+                'runtime_seconds': result['runtime_seconds'],
+            }
+        ),
+        flush=True,
+    )
     if result['status'] != 'passed':
         raise SystemExit(1)
 

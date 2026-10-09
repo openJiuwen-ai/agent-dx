@@ -2,7 +2,6 @@ import ast
 import pathlib
 import unittest
 
-
 SCRIPT = pathlib.Path(__file__).parents[1] / "e2e_execd_direct.py"
 
 
@@ -13,9 +12,7 @@ class EXECDDirectE2EContractTests(unittest.TestCase):
         sandbox_calls = [
             node
             for node in ast.walk(tree)
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "Sandbox"
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "Sandbox"
         ]
 
         self.assertEqual(len(sandbox_calls), 1)

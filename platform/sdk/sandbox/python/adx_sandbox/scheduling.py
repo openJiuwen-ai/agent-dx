@@ -1,4 +1,5 @@
 """Encode public placement options without weakening explicit node selection."""
+
 from collections.abc import Mapping
 from copy import deepcopy
 
@@ -25,29 +26,44 @@ def encode_affinities(affinities, node_id):
             raise ValueError('each scheduling condition must be a mapping')
         for key, maximum in (('kind', 1), ('affinity', 3)):
             value = item.get(key)
-            if type(value) is not int or not 0 <= value <= maximum:
+            if (not isinstance(value, int) or isinstance(value, bool)) or not 0 <= value <= maximum:
                 raise ValueError('invalid affinity ' + key)
         weight = item.get('weight', 0)
-        if type(weight) is not int or not 0 <= weight <= 1000:
+        if (not isinstance(weight, int) or isinstance(weight, bool)) or not 0 <= weight <= 1000:
             raise ValueError('affinity weight must be between 0 and 1000')
         for key in ('preferredPriority', 'preferredAntiOtherLabels'):
-            if key in item and type(item[key]) is not bool:
+            if key in item and not isinstance(item[key], bool):
                 raise ValueError(key + ' must be boolean')
         ops = item.get('labelOps')
         if not isinstance(ops, list) or not 1 <= len(ops) <= 64:
             raise ValueError('labelOps requires 1..64 expressions')
         for op in ops:
-            if not isinstance(op, dict) or type(op.get('type')) is not int or op['type'] not in range(4):
+            if (
+                not isinstance(op, dict)
+                or (not isinstance(op.get('type'), int) or isinstance(op.get('type'), bool))
+                or op['type'] not in range(4)
+            ):
                 raise ValueError('invalid label operator')
             if not isinstance(op.get('labelKey'), str) or not op['labelKey'].strip():
                 raise ValueError('labelKey must be a nonempty string')
             values = op.get('labelValues', [])
-            if not isinstance(values, list) or any(not isinstance(v, str) for v in values) or (op['type'] < 2 and not values):
+            if (
+                not isinstance(values, list)
+                or any(not isinstance(v, str) for v in values)
+                or (op['type'] < 2 and not values)
+            ):
                 raise ValueError('invalid labelValues')
     if node_id:
         constraint = {'type': 0, 'labelKey': 'NODE_ID', 'labelValues': [node_id]}
-        required = [item for item in result if item['kind'] == 0 and (
-            item['affinity'] == 2 or (item['affinity'] == 0 and item.get('preferredPriority') and item.get('preferredAntiOtherLabels')))]
+        required = [
+            item
+            for item in result
+            if item['kind'] == 0
+            and (
+                item['affinity'] == 2
+                or (item['affinity'] == 0 and item.get('preferredPriority') and item.get('preferredAntiOtherLabels'))
+            )
+        ]
         if required:
             for item in required:
                 if len(item['labelOps']) == 64:

@@ -2,47 +2,60 @@
 
 SURFACE = {
     'Sandbox': {
-        'create': 'firecracker', 'get_snapshot': 'firecracker',
-        'list_snapshots': 'firecracker', 'delete_snapshot': 'firecracker',
-        'from_id': 'standalone', 'files': 'standalone', 'commands': 'standalone',
-        'shells': 'standalone', 'pty': 'standalone', 'id': 'standalone',
-        'sandbox_id': 'standalone', 'get_port_url': 'standalone',
-        'get_port_auth_headers': 'standalone', 'get_tunnel_url': 'standalone',
-        'wait_entrypoint': 'firecracker', 'entrypoint_exit_info': 'firecracker',
-        'is_running': 'standalone', 'get_info': 'standalone',
-        'create_snapshot': 'firecracker', 'pause': 'firecracker',
-        'resume': 'firecracker', 'reload': 'firecracker',
-        'update_network_policy': 'firecracker', 'close': 'standalone',
-        'kill': 'standalone', 'delete': 'standalone',
+        'create': 'firecracker',
+        'get_snapshot': 'firecracker',
+        'list_snapshots': 'firecracker',
+        'delete_snapshot': 'firecracker',
+        'from_id': 'standalone',
+        'files': 'standalone',
+        'commands': 'standalone',
+        'shells': 'standalone',
+        'pty': 'standalone',
+        'id': 'standalone',
+        'sandbox_id': 'standalone',
+        'get_port_url': 'standalone',
+        'get_port_auth_headers': 'standalone',
+        'get_tunnel_url': 'standalone',
+        'wait_entrypoint': 'firecracker',
+        'entrypoint_exit_info': 'firecracker',
+        'is_running': 'standalone',
+        'get_info': 'standalone',
+        'create_snapshot': 'firecracker',
+        'pause': 'firecracker',
+        'resume': 'firecracker',
+        'reload': 'firecracker',
+        'update_network_policy': 'firecracker',
+        'close': 'standalone',
+        'kill': 'standalone',
+        'delete': 'standalone',
     },
     'CommandHandle': {
-        name: 'standalone' for name in (
-            'id', 'sandbox_id', 'poll', 'wait', 'wait_async', 'kill',
-            'send_stdin', 'close_stdin'
-        )
+        name: 'standalone'
+        for name in ('id', 'sandbox_id', 'poll', 'wait', 'wait_async', 'kill', 'send_stdin', 'close_stdin')
     },
-    'Commands': {
-        name: 'standalone' for name in (
-            'run', 'get', 'list', 'kill', 'send_stdin', 'close_stdin'
-        )
-    },
+    'Commands': {name: 'standalone' for name in ('run', 'get', 'list', 'kill', 'send_stdin', 'close_stdin')},
     'Filesystem': {
-        name: 'standalone' for name in (
-            'read', 'write', 'list', 'exists', 'remove', 'rename', 'make_dir',
-            'get_info', 'copy_from_local', 'copy_to_local'
+        name: 'standalone'
+        for name in (
+            'read',
+            'write',
+            'list',
+            'exists',
+            'remove',
+            'rename',
+            'make_dir',
+            'get_info',
+            'copy_from_local',
+            'copy_to_local',
         )
     },
     'PtySession': {
-        name: 'standalone' for name in (
-            'session_id', 'exit_code', 'done', 'send_stdin', 'close_stdin',
-            'resize', 'wait', 'close'
-        )
+        name: 'standalone'
+        for name in ('session_id', 'exit_code', 'done', 'send_stdin', 'close_stdin', 'resize', 'wait', 'close')
     },
     'Pty': {'create': 'standalone'},
     'Shells': {'create': 'standalone', 'close': 'standalone'},
-    'Shell': {
-        name: 'standalone' for name in ('session_id', 'run', 'kill', 'close')
-    },
+    'Shell': {name: 'standalone' for name in ('session_id', 'run', 'kill', 'close')},
     '<module>': {'resources': 'standalone'},
 }
 

@@ -2,13 +2,12 @@
 
 import importlib.util
 import json
-from pathlib import Path
 import sys
 import tempfile
 import types
 import unittest
+from pathlib import Path
 from unittest.mock import patch
-
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -30,13 +29,15 @@ class RuntimeLossTests(unittest.TestCase):
                 Sandbox=types.SimpleNamespace(from_id=from_id),
             ),
             'node': types.SimpleNamespace(
-                catalog=lambda: {}, labeled_backend=lambda _id: [],
+                catalog=lambda: {},
+                labeled_backend=lambda _id: [],
                 persisted_runtime_id=lambda result: result['runtime']['id'],
             ),
         }
         with patch.dict(sys.modules, modules):
             spec = importlib.util.spec_from_file_location(
-                'runtime_loss_api_directory_case', ROOT / 'sandboxd_runtime_loss.py')
+                'runtime_loss_api_directory_case', ROOT / 'sandboxd_runtime_loss.py'
+            )
             scenario = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(scenario)
             with patch.object(scenario.time, 'sleep'):
@@ -51,7 +52,8 @@ class RuntimeLossTests(unittest.TestCase):
         record = {
             'assignment': assignment,
             'result': {
-                'state': 'Failed', 'resources_held': False,
+                'state': 'Failed',
+                'resources_held': False,
                 'restart_pending': False,
             },
         }
@@ -81,19 +83,30 @@ class RuntimeLossTests(unittest.TestCase):
             'network_partition': types.SimpleNamespace(withdrawn_route=withdrawn_route),
         }
         with patch.dict(sys.modules, modules), tempfile.TemporaryDirectory() as directory:
-            spec = importlib.util.spec_from_file_location(
-                'runtime_loss_route_case', ROOT / 'sandboxd_runtime_loss.py')
+            spec = importlib.util.spec_from_file_location('runtime_loss_route_case', ROOT / 'sandboxd_runtime_loss.py')
             scenario = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(scenario)
             evidence = Path(directory)
-            (evidence / 'loss-never-created.json').write_text(json.dumps({
-                'instance_id': instance_id, 'assignment': assignment,
-                'backend_id': 'old-backend', 'runtime_id': 'old-runtime',
-            }))
-            (evidence / 'sandboxd-runtime-loss-node1-never.json').write_text(json.dumps({
-                'backend_ids_before': ['old-backend'], 'backend_ids_after': [],
-                'previous_pid': 100, 'pid': 200,
-            }))
+            (evidence / 'loss-never-created.json').write_text(
+                json.dumps(
+                    {
+                        'instance_id': instance_id,
+                        'assignment': assignment,
+                        'backend_id': 'old-backend',
+                        'runtime_id': 'old-runtime',
+                    }
+                )
+            )
+            (evidence / 'sandboxd-runtime-loss-node1-never.json').write_text(
+                json.dumps(
+                    {
+                        'backend_ids_before': ['old-backend'],
+                        'backend_ids_after': [],
+                        'previous_pid': 100,
+                        'pid': 200,
+                    }
+                )
+            )
             result = scenario.verify(object(), evidence, evidence, 'never')
 
         self.assertEqual(calls, ['route', 'delete'])

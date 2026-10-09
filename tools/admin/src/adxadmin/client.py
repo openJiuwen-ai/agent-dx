@@ -1,16 +1,15 @@
 """Typed boundary over the public ADX administration HTTP API."""
 
-from dataclasses import dataclass
 import ipaddress
 import re
+import uuid
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
-import uuid
 
 import httpx
 
 from .errors import ApiError, InvalidInput
-
 
 KEY_PATH = "/api/admin/v1/keys"
 KEY_ID = re.compile(r"^[0-9a-fA-F]{64}$")
@@ -20,7 +19,7 @@ KEY_ID = re.compile(r"^[0-9a-fA-F]{64}$")
 class ClientOptions:
     endpoint: str
     token: str
-    timeout_seconds: float = 30
+    timeout_seconds: float = 30.0
     ca_file: str | None = None
     allow_loopback_http: bool = False
 
@@ -32,9 +31,7 @@ class AdminClient:
         *,
         transport: httpx.BaseTransport | None = None,
     ) -> None:
-        self._endpoint = _validate_endpoint(
-            options.endpoint, options.allow_loopback_http
-        )
+        self._endpoint = _validate_endpoint(options.endpoint, options.allow_loopback_http)
         _validate_secret(options.token, "administrator API Key")
         if options.timeout_seconds <= 0:
             raise InvalidInput("request timeout must be positive")
@@ -149,17 +146,13 @@ def _validate_endpoint(endpoint: str, allow_loopback_http: bool) -> str:
         or parsed.fragment
         or parsed.path not in ("", "/")
     ):
-        raise InvalidInput(
-            "endpoint must be an origin URL without credentials, path, query or fragment"
-        )
+        raise InvalidInput("endpoint must be an origin URL without credentials, path, query or fragment")
     if parsed.scheme == "https":
         return endpoint.rstrip("/")
     if parsed.scheme == "http" and allow_loopback_http and _is_loopback(parsed.hostname):
         return endpoint.rstrip("/")
     if parsed.scheme == "http":
-        raise InvalidInput(
-            "plaintext endpoint is permitted only for loopback with --allow-loopback-http"
-        )
+        raise InvalidInput("plaintext endpoint is permitted only for loopback with --allow-loopback-http")
     raise InvalidInput("endpoint must use https")
 
 
@@ -198,9 +191,7 @@ def _metadata(value: object) -> dict[str, Any]:
 
 
 def _validate_secret(secret: str, kind: str) -> None:
-    if not 32 <= len(secret) <= 512 or any(
-        ord(character) < 33 or ord(character) == 127 for character in secret
-    ):
+    if not 32 <= len(secret) <= 512 or any(ord(character) < 33 or ord(character) == 127 for character in secret):
         raise InvalidInput(f"{kind} must contain 32..512 non-whitespace characters")
 
 

@@ -1,20 +1,22 @@
 #!/usr/bin/env python3
 """Assemble explicit build artifacts; never compile or fetch during deployment."""
+
 import argparse
 import hashlib
 import json
 import os
-from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-BINARIES = ("adxctl", "adx-inspect", "adx-coordinator", "adxlet", "adx-apiserver",
-            "adx-ingress", "adx-relay")
+BINARIES = ("adxctl", "adx-inspect", "adx-coordinator", "adxlet", "adx-apiserver", "adx-ingress", "adx-relay")
+
 
 def sha(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
 
 def assemble(binary_dir, redis, redis_cli, wheel, output, commit, dirty, target, profile):
     if output.exists():
@@ -54,7 +56,11 @@ def assemble(binary_dir, redis, redis_cli, wheel, output, commit, dirty, target,
     sandboxd_source = json.loads((ROOT / "third_party/sandboxd/source.json").read_text())
     for patch in sandboxd_source.get("patches", []):
         relative = Path(patch["path"])
-        if relative.is_absolute() or ".." in relative.parts or relative.parts[:3] != ("third_party", "sandboxd", "patches"):
+        if (
+            relative.is_absolute()
+            or ".." in relative.parts
+            or relative.parts[:3] != ("third_party", "sandboxd", "patches")
+        ):
             raise ValueError("invalid sandboxd patch path")
         source = ROOT / relative
         if sha(source) != patch["sha256"]:
@@ -71,13 +77,20 @@ def assemble(binary_dir, redis, redis_cli, wheel, output, commit, dirty, target,
             shutil.copy2(source, dest)
             if name.startswith(("bin/", "runtime/")) or name == "install.sh":
                 dest.chmod(0o755)
-        manifest = {"schema_version": 1, "commit": commit, "dirty": dirty,
-                    "target": target, "profile": profile, "redis_version": "7.2.5",
-                    "files": {name: sha(stage / name) for name in sorted(inputs)}}
+        manifest = {
+            "schema_version": 1,
+            "commit": commit,
+            "dirty": dirty,
+            "target": target,
+            "profile": profile,
+            "redis_version": "7.2.5",
+            "files": {name: sha(stage / name) for name in sorted(inputs)},
+        }
         (stage / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
         stage.rename(output)
     verify(output)
     return manifest
+
 
 def verify(directory):
     manifest = json.loads((directory / "manifest.json").read_text())
@@ -92,7 +105,9 @@ def verify(directory):
     }
     if manifest.get("profile") == "release" and "linux" in manifest.get("target", ""):
         required.add("runtime/adx-runtime-rootfs.img")
-    if not required.issubset(expected) or not any(n.startswith("sdk/adx_sandbox-") and n.endswith(".whl") for n in expected):
+    if not required.issubset(expected) or not any(
+        n.startswith("sdk/adx_sandbox-") and n.endswith(".whl") for n in expected
+    ):
         raise ValueError("incomplete package")
     actual = set()
     for path in directory.rglob("*"):
@@ -107,6 +122,7 @@ def verify(directory):
         if path.is_absolute() or ".." in path.parts or sha(directory / path) != digest:
             raise ValueError("package integrity check failed")
     return manifest
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -130,8 +146,19 @@ def main():
                 raise ValueError("CI checkout differs from the requested commit")
             if dirty:
                 raise ValueError("CI source checkout changed during build:\n" + status)
-        assemble(args.binary_dir, args.redis, args.redis_cli, args.wheel, args.output, commit, dirty, args.target, args.profile)
+        assemble(
+            args.binary_dir,
+            args.redis,
+            args.redis_cli,
+            args.wheel,
+            args.output,
+            commit,
+            dirty,
+            args.target,
+            args.profile,
+        )
     print("package verified")
+
 
 if __name__ == "__main__":
     main()

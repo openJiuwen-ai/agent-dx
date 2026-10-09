@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Verify a three-VM inventory and completed acceptance result."""
+
 import argparse
 import json
 from pathlib import Path

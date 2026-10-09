@@ -2,21 +2,19 @@
 
 import importlib.util
 import json
-from pathlib import Path
 import sys
 import tempfile
 import types
 import unittest
+from pathlib import Path
 from unittest.mock import patch
-
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 class IdleActiveScenarioTests(unittest.TestCase):
     def fixture(self, *, running=True):
-        state = {"now": 0, "created": 0, "closed": False, "deleted": False,
-                 "waited": False, "command": None}
+        state = {"now": 0, "created": 0, "closed": False, "deleted": False, "waited": False, "command": None}
 
         class Sandbox:
             def __init__(self, **options):
@@ -44,9 +42,13 @@ class IdleActiveScenarioTests(unittest.TestCase):
         def catalog():
             if state["deleted"]:
                 return {}
-            return {"environment:active-idle-instance": json.dumps({
-                "result": {"state": "Running", "resources_held": True},
-            })}
+            return {
+                "environment:active-idle-instance": json.dumps(
+                    {
+                        "result": {"state": "Running", "resources_held": True},
+                    }
+                )
+            }
 
         def wait_deleted(instance_id, _connection, **_options):
             self.assertEqual(instance_id, "active-idle-instance")
@@ -62,7 +64,11 @@ class IdleActiveScenarioTests(unittest.TestCase):
         scenario = importlib.util.module_from_spec(spec)
         with patch.dict(sys.modules, modules):
             spec.loader.exec_module(scenario)
-        scenario.monotonic = lambda: state["now"]
+
+        def _assigned_monotonic():
+            return state["now"]
+
+        scenario.monotonic = _assigned_monotonic
         return scenario, state
 
     def test_active_request_survives_then_idle_reclaims(self):

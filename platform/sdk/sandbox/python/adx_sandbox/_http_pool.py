@@ -61,21 +61,14 @@ def _positive_float_env(name: str, default: float) -> float:
 
 
 def _new_http_client(verify_tls: bool) -> httpx.Client:
-    max_connections = _positive_int_env(
-        "ADX_HTTP_MAX_CONNECTIONS", _DEFAULT_MAX_CONNECTIONS
-    )
+    max_connections = _positive_int_env("ADX_HTTP_MAX_CONNECTIONS", _DEFAULT_MAX_CONNECTIONS)
     max_keepalive_connections = _positive_int_env(
         "ADX_HTTP_MAX_KEEPALIVE_CONNECTIONS",
         _DEFAULT_MAX_KEEPALIVE_CONNECTIONS,
     )
     if max_keepalive_connections > max_connections:
-        raise ValueError(
-            "ADX_HTTP_MAX_KEEPALIVE_CONNECTIONS must be less than or equal to "
-            "ADX_HTTP_MAX_CONNECTIONS"
-        )
-    keepalive_expiry = _positive_float_env(
-        "ADX_HTTP_KEEPALIVE_EXPIRY", _DEFAULT_KEEPALIVE_EXPIRY
-    )
+        raise ValueError("ADX_HTTP_MAX_KEEPALIVE_CONNECTIONS must be less than or equal to ADX_HTTP_MAX_CONNECTIONS")
+    keepalive_expiry = _positive_float_env("ADX_HTTP_KEEPALIVE_EXPIRY", _DEFAULT_KEEPALIVE_EXPIRY)
     cookie_jar = http.cookiejar.CookieJar(policy=_RejectAllCookiesPolicy())
     return httpx.Client(
         verify=verify_tls,
@@ -143,10 +136,7 @@ class _SharedHTTPClientRegistry:
         """Return pool identities and reference counts for diagnostics/tests."""
         with self._lock:
             self._reset_after_fork_locked()
-            return {
-                (self._pid, *target): (entry.client, entry.references)
-                for target, entry in self._entries.items()
-            }
+            return {(self._pid, *target): (entry.client, entry.references) for target, entry in self._entries.items()}
 
     def _reset_after_fork_locked(self) -> None:
         current_pid = os.getpid()
@@ -216,17 +206,13 @@ class _SharedHTTPClientLease:
     def _current_client(self) -> httpx.Client:
         with self._lock:
             if self._closed:
-                raise SandboxClientClosedError(
-                    "Cannot send a request after SandboxClient.close()"
-                )
+                raise SandboxClientClosedError("Cannot send a request after SandboxClient.close()")
             current_pid = os.getpid()
             if current_pid != self._pid:
                 self._pid, self._client = self._registry._acquire_target(self._target)
             return self._client
 
-    def _request_headers(
-        self, url: str, headers: Mapping[str, str] | None
-    ) -> httpx.Headers:
+    def _request_headers(self, url: str, headers: Mapping[str, str] | None) -> httpx.Headers:
         request_headers = httpx.Headers(headers)
         token = self._token() if callable(self._token) else self._token
         if not isinstance(token, str) or not token.strip():
@@ -241,9 +227,7 @@ class _SharedHTTPClientLease:
 
 _SHARED_HTTP_CLIENT_REGISTRY = _SharedHTTPClientRegistry()
 if hasattr(os, "register_at_fork"):
-    os.register_at_fork(
-        after_in_child=_SHARED_HTTP_CLIENT_REGISTRY._after_fork_in_child
-    )
+    os.register_at_fork(after_in_child=_SHARED_HTTP_CLIENT_REGISTRY._after_fork_in_child)
 atexit.register(_SHARED_HTTP_CLIENT_REGISTRY.close_all)
 
 

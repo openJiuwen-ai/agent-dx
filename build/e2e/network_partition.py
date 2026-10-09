@@ -6,6 +6,7 @@ import time
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
+
 def withdrawn_route(instance_id, secrets):
     """Distinguish an Ingress route rejection from an EXECD 404 response."""
     context = ssl.create_default_context(cafile=str(secrets / 'tls/ca.pem'))
@@ -21,12 +22,10 @@ def withdrawn_route(instance_id, secrets):
                 last = f'route unexpectedly served HTTP {response.status}'
         except HTTPError as error:
             body = error.read().decode('utf-8', 'replace')
-            if error.code in (404, 409, 503) and (
-                'route' in body or 'not connectable' in body
-            ):
+            if error.code in (404, 409, 503) and ('route' in body or 'not connectable' in body):
                 return {'http_status': error.code, 'message': body[:250]}
             last = f'HTTP {error.code}: {body[:250]}'
-        time.sleep(.2)
+        time.sleep(0.2)
     raise AssertionError(f'failed instance route remained usable: {last}')
 
 
@@ -53,33 +52,50 @@ def run(connection, image, evidence, secrets, output):
                 unexpected.close()
                 if time.monotonic() >= deadline:
                     raise AssertionError('failed instance remained queryable as Running')
-                time.sleep(.2)
-        report['cases'].append({
-            'id': 'reliability.partition-route-withdrawal', 'status': 'passed',
-            'seconds': round(time.monotonic() - started, 3),
-            'failed_id': failed_id, **route,
-        })
+                time.sleep(0.2)
+        report['cases'].append(
+            {
+                'id': 'reliability.partition-route-withdrawal',
+                'status': 'passed',
+                'seconds': round(time.monotonic() - started, 3),
+                'failed_id': failed_id,
+                **route,
+            }
+        )
 
         healthy = Sandbox.from_id(healthy_id, connection=connection)
         try:
             command = healthy.commands.run('printf partition-unaffected')
-            assert command.exit_code == 0 and command.stdout == 'partition-unaffected'
+            if not (command.exit_code == 0 and command.stdout == 'partition-unaffected'):
+                raise AssertionError()
         finally:
             healthy.close()
         extra = Sandbox(
-            image=image, runtime='runc', node_id='node1', cpu=250, memory=256,
-            idle_timeout=0, detached=True, connection=connection, create_timeout=150,
+            image=image,
+            runtime='runc',
+            node_id='node1',
+            cpu=250,
+            memory=256,
+            idle_timeout=0,
+            detached=True,
+            connection=connection,
+            create_timeout=150,
         )
         command = extra.commands.run('printf partition-new-allocation')
-        assert command.exit_code == 0 and command.stdout == 'partition-new-allocation'
+        if not (command.exit_code == 0 and command.stdout == 'partition-new-allocation'):
+            raise AssertionError()
         Sandbox.delete(extra.id, connection=connection)
         deleted = True
         _wait_deleted(extra.id, connection, timeout=60)
-        report['cases'].append({
-            'id': 'reliability.partition-healthy-worker-continues',
-            'status': 'passed', 'seconds': round(time.monotonic() - started, 3),
-            'healthy_id': healthy_id, 'new_id': extra.id,
-        })
+        report['cases'].append(
+            {
+                'id': 'reliability.partition-healthy-worker-continues',
+                'status': 'passed',
+                'seconds': round(time.monotonic() - started, 3),
+                'healthy_id': healthy_id,
+                'new_id': extra.id,
+            }
+        )
         report['status'] = 'passed'
         return report
     except Exception as error:

@@ -1,16 +1,20 @@
 """Inject interrupted-publication objects; test real S3 collection on node restart."""
+
 import json
 import time
-import uuid
 import urllib.error
+import uuid
+
 from s3_client import Client
+
 
 class OrphanFixture:
     def __init__(self, run, artifact, session):
         self.run, self.client = run, Client(run)
         self.artifact = artifact
         owner = json.loads(self.client.request('GET', f'/checkpoints/adx/{artifact}/owner.json'))
-        assert owner == {'version': 1, 'node_id': 'node1', 'session_id': session}, owner
+        if not (owner == {'version': 1, 'node_id': 'node1', 'session_id': session}):
+            raise AssertionError(owner)
         self.keys = []
         self.orphan = self.seed(owner)
         self.foreign = self.seed({**owner, 'node_id': 'foreign-fixture'})
@@ -44,16 +48,21 @@ class OrphanFixture:
                     absent += 1
             if absent == len(self.orphan):
                 break
-            time.sleep(.5)
+            time.sleep(0.5)
         else:
             raise TimeoutError('retired-session orphan was not collected')
         for key in self.foreign + self.legacy:
             self.client.request('HEAD', key)
         self.client.request('GET', f'/checkpoints/adx/{self.artifact}/manifest.json')
-        evidence = {'passed': True, 'injection': 'partial upload objects with real prior node session',
-            'current_session_preserved': True, 'retired_session_removed': True,
-            'foreign_preserved': True, 'unmarked_preserved': True,
-            'registered_checkpoint_preserved': self.artifact}
+        evidence = {
+            'passed': True,
+            'injection': 'partial upload objects with real prior node session',
+            'current_session_preserved': True,
+            'retired_session_removed': True,
+            'foreign_preserved': True,
+            'unmarked_preserved': True,
+            'registered_checkpoint_preserved': self.artifact,
+        }
         (self.run / 'evidence/orphan-gc.json').write_text(json.dumps(evidence, indent=2))
         # Remove only test-owned survivors, leaving the actual recovery point intact.
         for key in self.foreign + self.legacy:

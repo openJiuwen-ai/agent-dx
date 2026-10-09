@@ -4,10 +4,9 @@
 import argparse
 import html
 import json
-from pathlib import Path
 import re
+from pathlib import Path
 from urllib.parse import urlsplit
-
 
 SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 
@@ -26,10 +25,11 @@ def size_label(size):
         raise ValueError("invalid artifact size")
     if size < 1024:
         return f"{size} B"
-    for unit in ("KiB", "MiB", "GiB"):
+    for unit in ("KiB", "MiB"):
         size /= 1024
-        if size < 1024 or unit == "GiB":
+        if size < 1024:
             return f"{size:.1f} {unit}"
+    return f"{size / 1024:.1f} GiB"
 
 
 def render(manifest, *, commit, build_id, build_url):
@@ -39,8 +39,7 @@ def render(manifest, *, commit, build_id, build_url):
     build_link = html.escape(build_url, quote=True)
     rows = []
     if manifest is None:
-        contents = ("<p>OBS publication disabled. "
-                    f'<a href="{build_link}#artifacts">View Buildkite artifacts</a>.</p>')
+        contents = f"<p>OBS publication disabled. <a href=\"{build_link}#artifacts\">View Buildkite artifacts</a>.</p>"
     else:
         if manifest.get("commit") != commit:
             raise ValueError("OBS manifest commit does not match this build")
@@ -57,22 +56,25 @@ def render(manifest, *, commit, build_id, build_url):
             if not isinstance(digest, str) or not SHA256.fullmatch(digest):
                 raise ValueError("invalid artifact SHA256")
             size = size_label(artifact["bytes"])
-            rows.append(f'<tr><td><a href="{url}">{name}</a></td>'
-                        f'<td>{size}</td><td><code>{digest}</code></td></tr>')
-        contents = (f'<p>{len(rows)} verified OBS artifacts · '
-                    f'<a href="{manifest_link}">manifest.json</a></p>'
-                    '<table><thead><tr><th>Artifact</th><th>Size</th><th>SHA256</th>'
-                    '</tr></thead><tbody>' + "".join(rows) + '</tbody></table>')
-    return ("<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">"
-            '<meta name="viewport" content="width=device-width, initial-scale=1">'
-            '<title>ADX Build Artifacts</title>'
-            '<style>body{font:16px system-ui,sans-serif;max-width:1100px;margin:40px auto;'
-            'padding:0 20px;color:#20242b}a{color:#0969da}table{width:100%;border-collapse:collapse}'
-            'th,td{padding:10px;border-bottom:1px solid #ddd;text-align:left}'
-            'code{font-size:12px;overflow-wrap:anywhere}</style></head><body>'
-            '<h1>ADX Build Artifacts</h1>'
-            f'<p>Build <a href="{build_link}">{html.escape(build_id)}</a> · '
-            f'commit <code>{html.escape(commit)}</code></p>{contents}</body></html>\n')
+            rows.append(f'<tr><td><a href="{url}">{name}</a></td><td>{size}</td><td><code>{digest}</code></td></tr>')
+        contents = (
+            f'<p>{len(rows)} verified OBS artifacts · '
+            f'<a href="{manifest_link}">manifest.json</a></p>'
+            '<table><thead><tr><th>Artifact</th><th>Size</th><th>SHA256</th>'
+            '</tr></thead><tbody>' + "".join(rows) + '</tbody></table>'
+        )
+    return (
+        "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">"
+        '<meta name="viewport" content="width=device-width, initial-scale=1">'
+        '<title>ADX Build Artifacts</title>'
+        '<style>body{font:16px system-ui,sans-serif;max-width:1100px;margin:40px auto;'
+        'padding:0 20px;color:#20242b}a{color:#0969da}table{width:100%;border-collapse:collapse}'
+        'th,td{padding:10px;border-bottom:1px solid #ddd;text-align:left}'
+        'code{font-size:12px;overflow-wrap:anywhere}</style></head><body>'
+        '<h1>ADX Build Artifacts</h1>'
+        f'<p>Build <a href="{build_link}">{html.escape(build_id)}</a> · '
+        f'commit <code>{html.escape(commit)}</code></p>{contents}</body></html>\n'
+    )
 
 
 def main():
@@ -84,8 +86,7 @@ def main():
     parser.add_argument("--build-url", required=True)
     args = parser.parse_args()
     manifest = json.loads(args.manifest.read_text()) if args.manifest else None
-    page = render(manifest, commit=args.commit, build_id=args.build_id,
-                  build_url=args.build_url)
+    page = render(manifest, commit=args.commit, build_id=args.build_id, build_url=args.build_url)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(page, encoding="utf-8")
 

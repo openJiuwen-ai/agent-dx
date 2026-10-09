@@ -1,12 +1,11 @@
 """Bounded public-SDK mixed load for the two-node acceptance deployment."""
 
-from concurrent.futures import ThreadPoolExecutor
 import json
 import math
 import re
 import threading
 import time
-
+from concurrent.futures import ThreadPoolExecutor
 
 MINIMUM_OPERATIONS = {'command': 40, 'file': 40, 'create': 5, 'delete': 5}
 
@@ -17,8 +16,7 @@ def verify_assignment(instance_id, expected_node, catalog):
     actual = record['assignment']['node_id']
     if actual != expected_node:
         raise AssertionError(
-            f'node assignment differs from requested target: {instance_id} '
-            f'expected={expected_node} actual={actual}'
+            (f'node assignment differs from requested target: {instance_id} expected={expected_node} actual={actual}')
         )
     return actual
 
@@ -49,24 +47,33 @@ def evaluate(samples, errors, elapsed, minimum_seconds):
         count = len(values)
         operations[name] = {'count': count, 'minimum': minimum}
         if values:
-            operations[name].update({
-                'p50_ms': round(values[math.ceil(count * 0.50) - 1], 3),
-                'p95_ms': round(values[math.ceil(count * 0.95) - 1], 3),
-                'p99_ms': round(values[math.ceil(count * 0.99) - 1], 3),
-                'max_ms': round(values[-1], 3),
-            })
-    passed = (elapsed >= minimum_seconds and not errors
-              and all(operations[name]['count'] >= minimum
-                      for name, minimum in MINIMUM_OPERATIONS.items()))
-    cases = [{'id': 'mixed-soak.' + name,
-              'status': 'passed' if operations[name]['count'] >= minimum else 'failed',
-              'seconds': 0} for name, minimum in MINIMUM_OPERATIONS.items()]
-    cases.extend((
-        {'id': 'mixed-soak.duration',
-         'status': 'passed' if elapsed >= minimum_seconds else 'failed', 'seconds': 0},
-        {'id': 'mixed-soak.zero-errors',
-         'status': 'passed' if not errors else 'failed', 'seconds': 0},
-    ))
+            operations[name].update(
+                {
+                    'p50_ms': round(values[math.ceil(count * 0.50) - 1], 3),
+                    'p95_ms': round(values[math.ceil(count * 0.95) - 1], 3),
+                    'p99_ms': round(values[math.ceil(count * 0.99) - 1], 3),
+                    'max_ms': round(values[-1], 3),
+                }
+            )
+    passed = (
+        elapsed >= minimum_seconds
+        and not errors
+        and all(operations[name]['count'] >= minimum for name, minimum in MINIMUM_OPERATIONS.items())
+    )
+    cases = [
+        {
+            'id': 'mixed-soak.' + name,
+            'status': 'passed' if operations[name]['count'] >= minimum else 'failed',
+            'seconds': 0,
+        }
+        for name, minimum in MINIMUM_OPERATIONS.items()
+    ]
+    cases.extend(
+        (
+            {'id': 'mixed-soak.duration', 'status': 'passed' if elapsed >= minimum_seconds else 'failed', 'seconds': 0},
+            {'id': 'mixed-soak.zero-errors', 'status': 'passed' if not errors else 'failed', 'seconds': 0},
+        )
+    )
     return {
         'status': 'passed' if passed else 'failed',
         'elapsed_seconds': round(elapsed, 3),
@@ -103,9 +110,16 @@ def run(connection, image, output, seconds=300):
 
     def create(node):
         begin = time.monotonic()
-        sandbox = Sandbox(image=image, runtime='runc', node_id=node,
-                          cpu=250, memory=256, idle_timeout=0,
-                          connection=connection, create_timeout=150)
+        sandbox = Sandbox(
+            image=image,
+            runtime='runc',
+            node_id=node,
+            cpu=250,
+            memory=256,
+            idle_timeout=0,
+            connection=connection,
+            create_timeout=150,
+        )
         try:
             verify_assignment(sandbox.id, node, catalog)
         except Exception:
@@ -161,16 +175,16 @@ def run(connection, image, output, seconds=300):
         started = time.monotonic()
         deadline = started + seconds
         with ThreadPoolExecutor(max_workers=3) as pool:
-            jobs = [pool.submit(anchor_work, index, anchor, deadline)
-                    for index, anchor in enumerate(anchors)]
+            jobs = [pool.submit(anchor_work, index, anchor, deadline) for index, anchor in enumerate(anchors)]
             jobs.append(pool.submit(churn_work, deadline))
             while not stop.is_set() and any(not job.done() for job in jobs):
                 stop.wait(30)
                 with lock:
                     counts = {key: len(value) for key, value in samples.items()}
-                print('[SOAK] elapsed=' + str(round(time.monotonic() - started, 1)) +
-                      's operations=' + str(counts),
-                      flush=True)
+                print(
+                    '[SOAK] elapsed=' + str(round(time.monotonic() - started, 1)) + 's operations=' + str(counts),
+                    flush=True,
+                )
             for job in jobs:
                 job.result()
     except Exception as error:

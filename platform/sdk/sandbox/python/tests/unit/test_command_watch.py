@@ -67,9 +67,7 @@ def test_command_watch_preserves_legacy_frontend_auth():
                 await manager._run()
             except asyncio.CancelledError:
                 pass
-        assert captured["additional_headers"] == {
-            "Authorization": "Bearer token", "X-Auth": "token"
-        }
+        assert captured["additional_headers"] == {"Authorization": "Bearer token", "X-Auth": "token"}
 
     asyncio.run(scenario())
 

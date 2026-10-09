@@ -1,36 +1,44 @@
 #!/usr/bin/env python3
 """Three-VM worker heartbeat failure and stale backend reconciliation."""
+
 from __future__ import annotations
 
 import argparse
 import json
 import os
-from pathlib import Path
 import time
+from pathlib import Path
 
 if __package__:
     from .contract import verify_inventory
-    from .sdk_accept import (backend_ids, persisted_assignment, ssh,
-                             verify_machines, wait_for_backends)
+    from .sdk_accept import (
+        backend_ids,
+        persisted_assignment,
+        ssh,
+        verify_machines,
+        wait_for_backends,
+    )
 else:
     from contract import verify_inventory
-    from sdk_accept import (backend_ids, persisted_assignment, ssh,
-                            verify_machines, wait_for_backends)
+    from sdk_accept import (
+        backend_ids,
+        persisted_assignment,
+        ssh,
+        verify_machines,
+        wait_for_backends,
+    )
 
 
 def node_record(control, node_id, remote=ssh):
     config = control.get('deployment_config', '/opt/adx/config/deployment.yaml')
-    return json.loads(remote(control, '/opt/adx/current/bin/adx-inspect', '-c', config,
-                             'node', 'get', node_id))
+    return json.loads(remote(control, '/opt/adx/current/bin/adx-inspect', '-c', config, 'node', 'get', node_id))
 
 
 def manager_pid(worker, remote=ssh):
     config = worker.get('deployment_config', '/opt/adx/config/deployment.yaml')
-    status = json.loads(remote(worker, '/opt/adx/current/bin/adxctl', 'status',
-                               '--config', config))
+    status = json.loads(remote(worker, '/opt/adx/current/bin/adxctl', 'status', '--config', config))
     managers = [service for service in status['services'] if service['role'] == 'adxlet']
-    if len(managers) != 1 or not isinstance(managers[0].get('pid'), int) \
-            or managers[0]['pid'] <= 0:
+    if len(managers) != 1 or not isinstance(managers[0].get('pid'), int) or managers[0]['pid'] <= 0:
         raise AssertionError('worker has no unique running adxlet process')
     return managers[0]['pid']
 
@@ -43,24 +51,39 @@ def wait_until(check, description, timeout, clock=time.monotonic, sleep=time.sle
             return value
         if clock() >= deadline:
             raise TimeoutError(description)
-        sleep(.5)
+        sleep(0.5)
 
 
-def run_failure(inventory, connection, image, socket, output,
-                sandbox_factory=None, sandbox_error=None, remote=ssh,
-                failure_timeout=90, recovery_timeout=90,
-                wait=wait_until):
+def run_failure(
+    inventory,
+    connection,
+    image,
+    socket,
+    output,
+    sandbox_factory=None,
+    sandbox_error=None,
+    remote=ssh,
+    failure_timeout=90,
+    recovery_timeout=90,
+    wait=wait_until,
+):
     """Freeze only the selected worker's manager; never stop the VM/sandboxd."""
     verify_inventory(inventory)
     if sandbox_factory is None or sandbox_error is None:
         from adx_sandbox import Sandbox, SandboxError
+
         sandbox_factory = sandbox_factory or Sandbox
         sandbox_error = sandbox_error or SandboxError
     machines = {machine['role']: machine for machine in inventory['machines']}
     control = machines['control']
     healthy_worker, affected_worker = machines['worker-1'], machines['worker-2']
-    report = {'status': 'failed', 'profile': 'multi-vm-worker-failure',
-              'checks': [], 'instances': [], 'cleanup_errors': []}
+    report = {
+        'status': 'failed',
+        'profile': 'multi-vm-worker-failure',
+        'checks': [],
+        'instances': [],
+        'cleanup_errors': [],
+    }
     handles = []
     frozen = False
     output.mkdir(parents=True, exist_ok=True)
@@ -69,15 +92,19 @@ def run_failure(inventory, connection, image, socket, output,
         report['checks'].append('machine-identity')
         for worker in (healthy_worker, affected_worker):
             sandbox = sandbox_factory(
-                image=image, runtime='runc', node_id=worker['node_id'],
-                cpu=500, memory=512, idle_timeout=0,
-                connection=connection, create_timeout=150,
+                image=image,
+                runtime='runc',
+                node_id=worker['node_id'],
+                cpu=500,
+                memory=512,
+                idle_timeout=0,
+                connection=connection,
+                create_timeout=150,
             )
             handles.append(sandbox)
             report['instances'].append({'id': sandbox.id, 'node_id': worker['node_id']})
         expected = {item['id']: item['node_id'] for item in report['instances']}
-        report['before_backends'] = wait_for_backends(
-            (healthy_worker, affected_worker), socket, expected, remote)
+        report['before_backends'] = wait_for_backends((healthy_worker, affected_worker), socket, expected, remote)
         for sandbox in handles:
             assignment = persisted_assignment(control, sandbox.id, remote)
             if assignment.get('node_id') != expected[sandbox.id] or assignment.get('state') != 'Running':
@@ -95,7 +122,9 @@ def run_failure(inventory, connection, image, socket, output,
         affected = handles[1]
         report['failed_assignment'] = wait(
             lambda: _failed_assignment(control, affected_worker, affected.id, remote),
-            'worker heartbeat did not invalidate the instance', failure_timeout)
+            'worker heartbeat did not invalidate the instance',
+            failure_timeout,
+        )
         report['checks'].append('heartbeat-expiry')
         try:
             affected.commands.run('printf stale-route-must-not-execute')
@@ -111,10 +140,10 @@ def run_failure(inventory, connection, image, socket, output,
         remote(affected_worker, 'sudo', '-n', 'kill', '-CONT', str(pid))
         frozen = False
         report['recovered_node'] = wait(
-            lambda: _reconciled_node(control, affected_worker, affected.id,
-                                     old_session, socket, remote),
+            lambda: _reconciled_node(control, affected_worker, affected.id, old_session, socket, remote),
             'returning worker did not reconcile stale backend and reopen admission',
-            recovery_timeout)
+            recovery_timeout,
+        )
         report['checks'].append('stale-backend-cleanup-before-readmission')
         try:
             affected.commands.run('printf old-route-must-stay-invalid')
@@ -123,9 +152,14 @@ def run_failure(inventory, connection, image, socket, output,
         else:
             raise AssertionError('old instance route revived after worker rejoined')
         replacement = sandbox_factory(
-            image=image, runtime='runc', node_id=affected_worker['node_id'],
-            cpu=500, memory=512, idle_timeout=0,
-            connection=connection, create_timeout=150,
+            image=image,
+            runtime='runc',
+            node_id=affected_worker['node_id'],
+            cpu=500,
+            memory=512,
+            idle_timeout=0,
+            connection=connection,
+            create_timeout=150,
         )
         handles.append(replacement)
         report['instances'].append({'id': replacement.id, 'node_id': affected_worker['node_id']})
@@ -133,8 +167,8 @@ def run_failure(inventory, connection, image, socket, output,
         if assignment.get('node_id') != affected_worker['node_id'] or assignment.get('state') != 'Running':
             raise AssertionError(f'new instance assigned to wrong worker: {assignment}')
         report['replacement_backend'] = wait_for_backends(
-            (healthy_worker, affected_worker), socket,
-            {replacement.id: affected_worker['node_id']}, remote)
+            (healthy_worker, affected_worker), socket, {replacement.id: affected_worker['node_id']}, remote
+        )
         result = replacement.commands.run('printf resumed-admission')
         if result.exit_code != 0 or result.stdout != 'resumed-admission':
             raise AssertionError('returning worker failed to serve a fresh instance')
@@ -178,7 +212,7 @@ def run_failure(inventory, connection, image, socket, output,
                     break
                 if time.monotonic() >= deadline:
                     raise AssertionError(f'test-owned backend remains: {residual}')
-                time.sleep(.2)
+                time.sleep(0.2)
         except Exception as error:
             report['cleanup_errors'].append(str(error))
         if not report.get('error') and not report['cleanup_errors']:
@@ -196,8 +230,7 @@ def _failed_assignment(control, worker, instance_id, remote):
         return None
     if assignment.get('node_id') != worker['node_id']:
         raise AssertionError('failed instance changed owner without checkpoint recovery')
-    if assignment.get('state') != 'Failed' or not assignment.get('invalidated') \
-            or assignment.get('resources_held'):
+    if assignment.get('state') != 'Failed' or not assignment.get('invalidated') or assignment.get('resources_held'):
         return None
     return assignment
 
@@ -226,9 +259,12 @@ def main():
     args = parser.parse_args()
     os.environ['SSL_CERT_FILE'] = str(args.ca.resolve())
     from adx_sandbox import ConnectionConfig
+
     connection = ConnectionConfig(
-        server_address=args.endpoint, token=args.token_file.read_text().strip(),
-        use_tls=True, verify_tls=True,
+        server_address=args.endpoint,
+        token=args.token_file.read_text().strip(),
+        use_tls=True,
+        verify_tls=True,
     )
     inventory = json.loads(args.inventory.read_text())
     result = run_failure(inventory, connection, args.image, args.socket, args.output)

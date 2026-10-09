@@ -56,9 +56,7 @@ async def main():
         print(f"true: exit_code={result.exit_code}")
 
         # --- One-shot cwd/envs (does not persist) ---
-        result = await sh.run(
-            "pwd && echo $TEMP_VAR", cwd="/tmp", envs={"TEMP_VAR": "temporary"}
-        )
+        result = await sh.run("pwd && echo $TEMP_VAR", cwd="/tmp", envs={"TEMP_VAR": "temporary"})
         print(f"one-shot cwd+env: {result.stdout.strip()}")
 
         result = await sh.run("pwd")

@@ -1,8 +1,7 @@
 import ast
 import importlib.util
-from pathlib import Path
 import unittest
-
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SDK = ROOT.parents[1] / 'platform/sdk/sandbox/python/adx_sandbox'
@@ -26,14 +25,11 @@ class PublicSdkSurfaceTests(unittest.TestCase):
     @staticmethod
     def public_members(path, class_name):
         tree = ast.parse(path.read_text())
-        node = next(
-            item for item in tree.body
-            if isinstance(item, ast.ClassDef) and item.name == class_name
-        )
+        node = next(item for item in tree.body if isinstance(item, ast.ClassDef) and item.name == class_name)
         return {
-            item.name for item in node.body
-            if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and not item.name.startswith('_')
+            item.name
+            for item in node.body
+            if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and not item.name.startswith('_')
         }
 
     def test_every_public_sdk_operation_has_an_e2e_disposition(self):
@@ -45,7 +41,8 @@ class PublicSdkSurfaceTests(unittest.TestCase):
             )
         init_tree = ast.parse((SDK / '__init__.py').read_text())
         exports = next(
-            ast.literal_eval(node.value) for node in init_tree.body
+            ast.literal_eval(node.value)
+            for node in init_tree.body
             if isinstance(node, ast.Assign)
             and any(isinstance(target, ast.Name) and target.id == '__all__' for target in node.targets)
         )
@@ -55,12 +52,15 @@ class PublicSdkSurfaceTests(unittest.TestCase):
         self.assertEqual(surface.SURFACE['<module>'], {'resources': 'standalone'})
 
     def test_documented_operation_counts_do_not_drift(self):
-        self.assertEqual(surface.counts(), {
-            'public_operations': 66,
-            'standalone': 55,
-            'firecracker': 11,
-            'unsupported': 0,
-        })
+        self.assertEqual(
+            surface.counts(),
+            {
+                'public_operations': 66,
+                'standalone': 55,
+                'firecracker': 11,
+                'unsupported': 0,
+            },
+        )
 
     def test_reverse_tunnel_has_a_real_standalone_case_owner(self):
         self.assertEqual(

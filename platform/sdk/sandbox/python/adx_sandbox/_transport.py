@@ -33,7 +33,7 @@ import httpx
 
 # Default per-call timeout buffer, mirroring types.ADX_GET_TIMEOUT_BUFFER.
 from ._http_pool import acquire_shared_http_client
-from .types import ConnectionConfig, ADX_GET_DEFAULT_TIMEOUT, ADX_GET_TIMEOUT_BUFFER
+from .types import ADX_GET_DEFAULT_TIMEOUT, ADX_GET_TIMEOUT_BUFFER, ConnectionConfig
 
 logger = logging.getLogger(__name__)
 
@@ -209,9 +209,7 @@ class SandboxClient:
             if not isinstance(connection, ConnectionConfig):
                 raise TypeError("connection must be a ConnectionConfig")
             if server is not None or token is not None or verify_tls:
-                raise ValueError(
-                    "connection cannot be combined with server, token, or verify_tls"
-                )
+                raise ValueError("connection cannot be combined with server, token, or verify_tls")
         else:
             connection = ConnectionConfig.from_env(
                 server_address=server,
@@ -240,9 +238,7 @@ class SandboxClient:
         # Required /direct traffic always shares ADX_SERVER_ADDRESS + ADX_TLS.
         # ADX_GATEWAY_ADDRESS is intentionally not consulted here: it can point
         # at the optional plaintext tunnel/port-forward listener.
-        self._execd_port = int(
-            os.environ.get("ADX_EXECD_PORT", "50090").strip() or "50090"
-        )
+        self._execd_port = int(os.environ.get("ADX_EXECD_PORT", "50090").strip() or "50090")
         self._direct_enabled = True
         # A 404 falls back immediately for the current invoke. Only a sustained
         # run of route misses sticky-disables direct for this client.
@@ -250,13 +246,9 @@ class SandboxClient:
         self._direct_route_misses = 0
         self._direct_base = f"{scheme}://{self._server}/direct"
         self._last_create: Dict[str, Any] = {}
-        self._resume_chunk_size = int(
-            os.environ.get("ADX_RESUME_CHUNK_SIZE", str(8 * 1024 * 1024))
-        )
+        self._resume_chunk_size = int(os.environ.get("ADX_RESUME_CHUNK_SIZE", str(8 * 1024 * 1024)))
         self._resume_max_retries = int(os.environ.get("ADX_RESUME_MAX_RETRIES", "3"))
-        self._resume_min_size = int(
-            os.environ.get("ADX_RESUME_MIN_SIZE", str(64 * 1024 * 1024))
-        )
+        self._resume_min_size = int(os.environ.get("ADX_RESUME_MIN_SIZE", str(64 * 1024 * 1024)))
 
     # ── lifecycle ──────────────────────────────────────────────────────
 
@@ -276,9 +268,7 @@ class SandboxClient:
             timeout=60,
         )
         if resp.status_code >= 400:
-            raise SandboxError(
-                f"resource query failed: HTTP {resp.status_code} {resp.text}"
-            )
+            raise SandboxError(f"resource query failed: HTTP {resp.status_code} {resp.text}")
         try:
             payload = resp.json()
         except ValueError as exc:
@@ -289,9 +279,7 @@ class SandboxClient:
 
     def create_info(self, body: Dict[str, Any]) -> Dict[str, Any]:
         """POST /sandboxes and return the confirmed-running final SSE result."""
-        logical_timeout = int(
-            body.get("createTimeoutSeconds") or _DEFAULT_CREATE_LOGICAL_TIMEOUT
-        )
+        logical_timeout = int(body.get("createTimeoutSeconds") or _DEFAULT_CREATE_LOGICAL_TIMEOUT)
         request_timeout = logical_timeout + ADX_GET_TIMEOUT_BUFFER
         # A UUIDv4 identifies this logical create across transport retries.
         operation_id = str(uuid.uuid4())
@@ -326,8 +314,7 @@ class SandboxClient:
                 if backoff <= 0:
                     break
                 logger.warning(
-                    "sandbox create transport error; retrying "
-                    "request_id=%s name=%s attempt=%d/%d error=%s",
+                    "sandbox create transport error; retrying request_id=%s name=%s attempt=%d/%d error=%s",
                     request_id,
                     request_name,
                     attempt,
@@ -346,16 +333,12 @@ class SandboxClient:
             f"{attempts} attempts "
             f"(requestId={request_id}, name={request_name}): "
             f"{last_error or 'create deadline exhausted'}",
-            request_id=(contract_error.request_id if contract_error else None)
-            or request_id,
-            code=(contract_error.code if contract_error else None)
-            or "OUTCOME_UNKNOWN",
-            retry=(contract_error.retry if contract_error else None)
-            or "same_operation",
+            request_id=(contract_error.request_id if contract_error else None) or request_id,
+            code=(contract_error.code if contract_error else None) or "OUTCOME_UNKNOWN",
+            retry=(contract_error.retry if contract_error else None) or "same_operation",
             outcome=(contract_error.outcome if contract_error else None) or "unknown",
             operation_id=contract_error.operation_id if contract_error else None,
-            instance_id=(contract_error.instance_id if contract_error else None)
-            or request_name,
+            instance_id=(contract_error.instance_id if contract_error else None) or request_name,
         ) from last_error
 
     def _create_info_attempt(
@@ -399,13 +382,9 @@ class SandboxClient:
                         try:
                             parsed = json.loads("\n".join(data_lines))
                         except json.JSONDecodeError as exc:
-                            raise SandboxError(
-                                f"invalid sandbox create final event: {exc}"
-                            ) from exc
+                            raise SandboxError(f"invalid sandbox create final event: {exc}") from exc
                         if not isinstance(parsed, dict):
-                            raise SandboxError(
-                                "sandbox create final event must contain a JSON object"
-                            )
+                            raise SandboxError("sandbox create final event must contain a JSON object")
                         final = parsed
                         break
                     event = ""
@@ -493,8 +472,7 @@ class SandboxClient:
             if attempt >= _DELETE_MAX_ATTEMPTS:
                 break
             logger.warning(
-                "sandbox delete transport error; retrying "
-                "request_id=%s sandbox_id=%s attempt=%d/%d error=%s",
+                "sandbox delete transport error; retrying request_id=%s sandbox_id=%s attempt=%d/%d error=%s",
                 request_id,
                 sandbox_id,
                 attempt,
@@ -504,8 +482,16 @@ class SandboxClient:
             time.sleep(_DELETE_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1)))
 
         raise SandboxError(
-            f"delete {sandbox_id} failed after {_DELETE_MAX_ATTEMPTS} attempts "
-            f"(requestId={request_id}): {last_error}",
+            (
+                f"delete "
+                f"{sandbox_id}"
+                f" failed after "
+                f"{_DELETE_MAX_ATTEMPTS}"
+                f" attempts (requestId="
+                f"{request_id}"
+                f"): "
+                f"{last_error}"
+            ),
             request_id=request_id,
             code="OUTCOME_UNKNOWN",
             retry="same_operation",
@@ -540,8 +526,7 @@ class SandboxClient:
             )
         except _CREATE_RETRYABLE_ERRORS as exc:
             raise SandboxError(
-                "sandbox snapshot result is uncertain "
-                f"(requestId={request_id}): {exc}",
+                f"sandbox snapshot result is uncertain (requestId={request_id}): {exc}",
                 request_id=request_id,
                 code="OUTCOME_UNKNOWN",
                 retry="same_operation",
@@ -620,9 +605,7 @@ class SandboxClient:
             body={},
         )
 
-    def update_network_policy(
-        self, sandbox_id: str, policy: Dict[str, Any]
-    ) -> Dict[str, Any]:
+    def update_network_policy(self, sandbox_id: str, policy: Dict[str, Any]) -> Dict[str, Any]:
         """Atomically replace the complete network policy of one sandbox."""
         return self._lifecycle_request(
             sandbox_id,
@@ -658,10 +641,7 @@ class SandboxClient:
                     try:
                         result = self._json(resp)
                     except SandboxError as exc:
-                        raise SandboxError(
-                            f"sandbox {operation} failed "
-                            f"(requestId={request_id}): {exc}"
-                        ) from exc
+                        raise SandboxError(f"sandbox {operation} failed (requestId={request_id}): {exc}") from exc
                     if operation == "pause" and result.get("snapshotId") != request_id:
                         raise SandboxError(
                             "sandbox pause returned a snapshotId that does not match "
@@ -676,8 +656,7 @@ class SandboxClient:
             if attempt >= _LIFECYCLE_MAX_ATTEMPTS:
                 break
             logger.warning(
-                "sandbox %s transport error; retrying "
-                "request_id=%s sandbox_id=%s attempt=%d/%d error=%s",
+                "sandbox %s transport error; retrying request_id=%s sandbox_id=%s attempt=%d/%d error=%s",
                 operation,
                 request_id,
                 sandbox_id,
@@ -714,13 +693,9 @@ class SandboxClient:
         try:
             payload = resp.json()
         except ValueError as exc:
-            raise SandboxError(
-                f"get instance {sandbox_id} returned invalid JSON"
-            ) from exc
+            raise SandboxError(f"get instance {sandbox_id} returned invalid JSON") from exc
         if not isinstance(payload, list):
-            raise SandboxError(
-                f"get instance {sandbox_id} returned an invalid response"
-            )
+            raise SandboxError(f"get instance {sandbox_id} returned an invalid response")
         for item in payload:
             if isinstance(item, dict) and item.get("id") == sandbox_id:
                 return item
@@ -751,11 +726,7 @@ class SandboxClient:
             rpc_timeout = max(timeout + ADX_GET_TIMEOUT_BUFFER, ADX_GET_DEFAULT_TIMEOUT)
 
         request_id = self._new_request_id("invoke")
-        deadline = (
-            None
-            if rpc_timeout is None
-            else time.monotonic() + rpc_timeout
-        )
+        deadline = None if rpc_timeout is None else time.monotonic() + rpc_timeout
 
         # Prefer the /direct path; fall back to the control-plane invoke path.
         if self._direct_enabled and not self._direct_disabled:
@@ -772,8 +743,7 @@ class SandboxClient:
         fallback_timeout = self._remaining_timeout(deadline)
         if fallback_timeout is not None and fallback_timeout <= 0:
             raise SandboxError(
-                "invoke deadline exhausted before frontend fallback "
-                f"(requestId={request_id})",
+                f"invoke deadline exhausted before frontend fallback (requestId={request_id})",
                 request_id=request_id,
             )
         try:
@@ -828,9 +798,7 @@ class SandboxClient:
                 break
             attempts = attempt
             pool_timeout = (
-                _DIRECT_POOL_TIMEOUT_SECONDS
-                if remaining is None
-                else min(_DIRECT_POOL_TIMEOUT_SECONDS, remaining)
+                _DIRECT_POOL_TIMEOUT_SECONDS if remaining is None else min(_DIRECT_POOL_TIMEOUT_SECONDS, remaining)
             )
             request_timeout = httpx.Timeout(
                 remaining,
@@ -859,8 +827,7 @@ class SandboxClient:
             except httpx.RequestError as exc:
                 self._direct_route_misses = 0
                 raise SandboxError(
-                    "direct invoke outcome is unknown after transport failure "
-                    f"(requestId={request_id}): {exc}",
+                    f"direct invoke outcome is unknown after transport failure (requestId={request_id}): {exc}",
                     request_id=request_id,
                     code="OUTCOME_UNKNOWN",
                     retry="same_operation",
@@ -889,10 +856,7 @@ class SandboxClient:
                         )
                         break
                     self._direct_route_misses += 1
-                    if (
-                        self._direct_route_misses > _DIRECT_ROUTE_MISS_BUDGET
-                        and not self._direct_disabled
-                    ):
+                    if self._direct_route_misses > _DIRECT_ROUTE_MISS_BUDGET and not self._direct_disabled:
                         self._direct_disabled = True
                         logger.warning(
                             "direct invoke disabled; all subsequent invokes "
@@ -906,9 +870,7 @@ class SandboxClient:
                     return {}, True
                 self._direct_route_misses = 0
                 if resp.status_code in _RETRYABLE_GATEWAY_STATUS_CODES:
-                    last_error = _RetryableHTTPStatus(
-                        self._http_error(resp, request_id=request_id)
-                    )
+                    last_error = _RetryableHTTPStatus(self._http_error(resp, request_id=request_id))
                     last_failure_safe = False
                     outcome_unknown = True
                 elif resp.status_code >= 400:
@@ -937,8 +899,7 @@ class SandboxClient:
             if backoff <= 0:
                 break
             logger.warning(
-                "direct invoke transport error; retrying "
-                "request_id=%s action=%s attempt=%d/%d error=%s",
+                "direct invoke transport error; retrying request_id=%s action=%s attempt=%d/%d error=%s",
                 request_id,
                 action,
                 attempt,
@@ -953,8 +914,7 @@ class SandboxClient:
             return {}, True
         detail = last_error or "invoke deadline exhausted"
         raise SandboxError(
-            "direct invoke outcome is unknown after "
-            f"{attempts} attempts (requestId={request_id}): {detail}",
+            (f"direct invoke outcome is unknown after {attempts} attempts (requestId={request_id}): {detail}"),
             request_id=request_id,
             code="OUTCOME_UNKNOWN",
             retry="same_operation",
@@ -981,9 +941,7 @@ class SandboxClient:
         """Upload a file/tar over the required /direct binary data path."""
         content_len = os.path.getsize(local_path)
         if upload_type == "file" and content_len >= self._resume_min_size:
-            return self._upload_file_resumable(
-                sandbox_id, local_path, remote_path, rpc_timeout
-            )
+            return self._upload_file_resumable(sandbox_id, local_path, remote_path, rpc_timeout)
         with open(local_path, "rb") as f:
             return self._upload_direct(
                 sandbox_id,
@@ -1033,9 +991,7 @@ class SandboxClient:
                         attempts += 1
                         if attempts > self._resume_max_retries:
                             raise
-                        offset = self._upload_status(
-                            sandbox_id, remote_path, upload_id, rpc_timeout
-                        )
+                        offset = self._upload_status(sandbox_id, remote_path, upload_id, rpc_timeout)
             return self._upload_commit(sandbox_id, remote_path, upload_id, total, rpc_timeout)
 
     def _upload_status(
@@ -1055,9 +1011,7 @@ class SandboxClient:
         except httpx.RequestError as e:
             raise SandboxError(f"direct upload status {sandbox_id} failed: {e}") from e
         if resp.status_code >= 400:
-            raise SandboxError(
-                f"direct upload status {sandbox_id} failed: HTTP {resp.status_code} {resp.text}"
-            )
+            raise SandboxError(f"direct upload status {sandbox_id} failed: HTTP {resp.status_code} {resp.text}")
         try:
             parsed = resp.json()
         except ValueError as e:
@@ -1088,9 +1042,7 @@ class SandboxClient:
         except httpx.RequestError as e:
             raise SandboxError(f"direct upload commit {sandbox_id} failed: {e}") from e
         if resp.status_code >= 400:
-            raise SandboxError(
-                f"direct upload commit {sandbox_id} failed: HTTP {resp.status_code} {resp.text}"
-            )
+            raise SandboxError(f"direct upload commit {sandbox_id} failed: HTTP {resp.status_code} {resp.text}")
         try:
             parsed = resp.json()
         except ValueError as e:
@@ -1107,9 +1059,7 @@ class SandboxClient:
         rpc_timeout: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Upload bytes over the required /direct binary data path."""
-        return self._upload_direct(
-            sandbox_id, data, remote_path, rpc_timeout, content_len=len(data)
-        )
+        return self._upload_direct(sandbox_id, data, remote_path, rpc_timeout, content_len=len(data))
 
     def upload_stream_direct(
         self,
@@ -1159,9 +1109,7 @@ class SandboxClient:
         except httpx.RequestError as e:
             raise SandboxError(f"direct upload {sandbox_id} failed: {e}") from e
         if resp.status_code >= 400:
-            raise SandboxError(
-                f"direct upload {sandbox_id} failed: HTTP {resp.status_code} {resp.text}"
-            )
+            raise SandboxError(f"direct upload {sandbox_id} failed: HTTP {resp.status_code} {resp.text}")
         try:
             parsed = resp.json()
         except ValueError as e:
@@ -1181,9 +1129,8 @@ class SandboxClient:
     ) -> None:
         """Download a file/tar over the required /direct binary data path."""
         if download_type == "file":
-            return self._download_file_resumable(
-                sandbox_id, remote_path, local_path, rpc_timeout
-            )
+            self._download_file_resumable(sandbox_id, remote_path, local_path, rpc_timeout)
+            return
         url = f"{self._direct_base}/{self._safe_id(sandbox_id)}/download"
         try:
             with self._http.stream(
@@ -1194,9 +1141,7 @@ class SandboxClient:
             ) as resp:
                 if resp.status_code >= 400:
                     body = resp.read().decode("utf-8", errors="replace")
-                    raise SandboxError(
-                        f"direct download {sandbox_id} failed: HTTP {resp.status_code} {body}"
-                    )
+                    raise SandboxError(f"direct download {sandbox_id} failed: HTTP {resp.status_code} {body}")
                 self._write_stream_to_file(resp, local_path, append=False)
         except httpx.RequestError as e:
             raise SandboxError(f"direct download {sandbox_id} failed: {e}") from e
@@ -1227,9 +1172,7 @@ class SandboxClient:
                 ) as resp:
                     if resp.status_code >= 400:
                         body = resp.read().decode("utf-8", errors="replace")
-                        raise SandboxError(
-                            f"direct download {sandbox_id} failed: HTTP {resp.status_code} {body}"
-                        )
+                        raise SandboxError(f"direct download {sandbox_id} failed: HTTP {resp.status_code} {body}")
                     append = offset > 0 and resp.status_code == 206
                     if offset > 0 and resp.status_code != 206:
                         append = False
@@ -1266,9 +1209,7 @@ class SandboxClient:
         except httpx.RequestError as e:
             raise SandboxError(f"direct download {sandbox_id} failed: {e}") from e
         if resp.status_code >= 400:
-            raise SandboxError(
-                f"direct download {sandbox_id} failed: HTTP {resp.status_code} {resp.text}"
-            )
+            raise SandboxError(f"direct download {sandbox_id} failed: HTTP {resp.status_code} {resp.text}")
         return resp.content
 
     @property
@@ -1314,9 +1255,7 @@ class SandboxClient:
     # ── internal ───────────────────────────────────────────────────────
 
     @staticmethod
-    def _http_error(
-        resp: httpx.Response, *, request_id: Optional[str] = None
-    ) -> SandboxHTTPError:
+    def _http_error(resp: httpx.Response, *, request_id: Optional[str] = None) -> SandboxHTTPError:
         try:
             payload = resp.json()
         except (AttributeError, ValueError):
@@ -1331,14 +1270,8 @@ class SandboxClient:
             or (raw_error if isinstance(raw_error, str) else "")
             or resp.text
         )
-        resolved_request_id = (
-            detail.get("requestId")
-            or getattr(resp, "headers", {}).get("x-request-id")
-            or request_id
-        )
-        identity = (
-            f" (requestId={resolved_request_id})" if resolved_request_id else ""
-        )
+        resolved_request_id = detail.get("requestId") or getattr(resp, "headers", {}).get("x-request-id") or request_id
+        identity = f" (requestId={resolved_request_id})" if resolved_request_id else ""
         return SandboxHTTPError(
             resp.status_code,
             payload,
@@ -1380,7 +1313,7 @@ class SandboxClient:
             try:
                 decoded = base64.b64decode(raw)
                 parsed = json.loads(decoded)
-            except (ValueError, json.JSONDecodeError) as e:
+            except ValueError as e:
                 raise SandboxError(f"failed to decode response data: {e}") from e
         else:
             # Some deployments may already return a JSON object for data.

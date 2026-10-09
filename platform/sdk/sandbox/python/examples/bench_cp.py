@@ -11,10 +11,12 @@ Usage:
   python bench_cp.py
 """
 
+import logging
 import os
+import sys
 import tempfile
 import time
-import sys
+
 from adx_sandbox import Sandbox
 
 # Test file sizes in bytes
@@ -35,6 +37,7 @@ ITERATIONS = 5
 def generate_file(path: str, size: int) -> None:
     """Generate a file filled with pseudo-random printable bytes."""
     import random
+
     random.seed(42)
     chunk = bytes(random.randint(32, 126) for _ in range(min(size, 64 * 1024)))
     with open(path, "wb") as f:
@@ -109,7 +112,7 @@ def main():
                     try:
                         sb.files.remove(remote_path)
                     except Exception:
-                        pass
+                        logging.getLogger(__name__).debug("Best-effort operation failed", exc_info=True)
 
             os.remove(local_path)
 

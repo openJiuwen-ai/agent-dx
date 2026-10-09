@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """Use the existing CI registry secrets without writing credentials into artifacts."""
+
 import argparse
 import base64
 import json
 import os
-from pathlib import Path
-import subprocess
 import signal
+import subprocess
 import tempfile
+from pathlib import Path
 
 DEFAULT_REPOSITORY = 'swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/adx-e2e'
+
 
 def registry_config(env):
     raw = env.get('SWR_DOCKER_CONFIG_JSON')
@@ -27,6 +29,7 @@ def registry_config(env):
         auth = base64.b64encode((username + ':' + password).encode()).decode()
         return {'auths': {registry: {'auth': auth}}}
     return None
+
 
 def main():
     p = argparse.ArgumentParser()
@@ -48,12 +51,15 @@ def main():
             if a.docker:
                 env['DOCKER_CONFIG'] = temp
         child = subprocess.Popen(command, env=env)
+
         def forward(signum, frame):
             if child.poll() is None:
                 child.send_signal(signum)
+
         for sig in (signal.SIGTERM, signal.SIGINT):
             signal.signal(sig, forward)
         return child.wait()
+
 
 if __name__ == '__main__':
     raise SystemExit(main())

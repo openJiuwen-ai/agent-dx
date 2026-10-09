@@ -1,13 +1,13 @@
 """Exercise a 404 read after create transport loss, before its write completes."""
 
-from concurrent.futures import ThreadPoolExecutor
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import socket
 import ssl
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import HTTPError
 from urllib.request import HTTPSHandler, ProxyHandler, Request, build_opener
 
@@ -20,8 +20,7 @@ else:
 class UnknownQueryProxy:
     """Lose the first create response; hold its upstream write until a real 404."""
 
-    def __init__(self, upstream, *, certificate=None, private_key=None, ca=None,
-                 on_first_final=None):
+    def __init__(self, upstream, *, certificate=None, private_key=None, ca=None, on_first_final=None):
         self.upstream = upstream.rstrip('/')
         self.certificate = certificate
         self.private_key = private_key
@@ -44,21 +43,17 @@ class UnknownQueryProxy:
         return self._server.server_port
 
     def _forward(self, path, body, headers):
-        upstream_request = Request(self.upstream + path, data=body,
-                                   headers=headers, method='POST')
+        upstream_request = Request(self.upstream + path, data=body, headers=headers, method='POST')
         handlers = [ProxyHandler({})]
         if self.upstream.startswith('https:'):
-            handlers.append(HTTPSHandler(
-                context=ssl.create_default_context(cafile=str(self.ca))))
+            handlers.append(HTTPSHandler(context=ssl.create_default_context(cafile=str(self.ca))))
         opener = build_opener(*handlers)
         try:
             response = opener.open(upstream_request, timeout=180)
         except HTTPError as error:
             response = error
         with response:
-            return (response.status,
-                    response.headers.get('Content-Type', 'application/octet-stream'),
-                    response.read())
+            return (response.status, response.headers.get('Content-Type', 'application/octet-stream'), response.read())
 
     def _finish_first(self, path, body, headers):
         try:
@@ -86,9 +81,10 @@ class UnknownQueryProxy:
                 request = json.loads(body)
                 request_id = self.headers['X-Request-Id']
                 headers = {
-                    key: value for key, value in self.headers.items()
-                    if key.lower() not in ('host', 'connection', 'content-length',
-                                           'accept-encoding', 'transfer-encoding')
+                    key: value
+                    for key, value in self.headers.items()
+                    if key.lower()
+                    not in ('host', 'connection', 'content-length', 'accept-encoding', 'transfer-encoding')
                 }
                 with proxy._lock:
                     proxy.attempts.append((request_id, request['name']))
@@ -96,7 +92,8 @@ class UnknownQueryProxy:
                 if first:
                     proxy._first_worker = threading.Thread(
                         target=proxy._finish_first,
-                        args=(self.path, body, headers), daemon=True,
+                        args=(self.path, body, headers),
+                        daemon=True,
                     )
                     proxy._first_worker.start()
                     self.close_connection = True
@@ -159,7 +156,8 @@ def run(connection, image, output, secrets):
         record = json.loads(catalog()['environment:' + sid])
         result = record['result']
         backends = labeled_backend(sid)
-        assert result['state'] == 'Running' and len(backends) == 1, (result, backends)
+        if not (result['state'] == 'Running' and len(backends) == 1):
+            raise AssertionError((result, backends))
         return {
             'instance_id': sid,
             'generation': record['assignment']['generation'],
@@ -168,20 +166,32 @@ def run(connection, image, output, secrets):
         }
 
     proxy = UnknownQueryProxy(
-        'https://127.0.0.1:8443', certificate=secrets / 'tls/ingress.pem',
-        private_key=secrets / 'tls/ingress.key', ca=secrets / 'tls/ca.pem',
+        'https://127.0.0.1:8443',
+        certificate=secrets / 'tls/ingress.pem',
+        private_key=secrets / 'tls/ingress.key',
+        ca=secrets / 'tls/ca.pem',
         on_first_final=committed,
     )
     try:
         with proxy, ThreadPoolExecutor(max_workers=1) as executor:
             proxy_connection = ConnectionConfig(
-                server_address=f'127.0.0.1:{proxy.port}', token=connection.token,
-                use_tls=True, verify_tls=True,
+                server_address=f'127.0.0.1:{proxy.port}',
+                token=connection.token,
+                use_tls=True,
+                verify_tls=True,
             )
             future = executor.submit(
-                Sandbox, image=image, runtime='runc', cpu=500, memory=512,
-                idle_timeout=0, detached=True, node_id='node1', name=name,
-                connection=proxy_connection, create_timeout=150,
+                Sandbox,
+                image=image,
+                runtime='runc',
+                cpu=500,
+                memory=512,
+                idle_timeout=0,
+                detached=True,
+                node_id='node1',
+                name=name,
+                connection=proxy_connection,
+                create_timeout=150,
             )
             try:
                 if not proxy.first_cut.wait(10):
@@ -215,29 +225,39 @@ def run(connection, image, output, secrets):
         if len(request_ids) != 1 or names != {name}:
             raise AssertionError(f'create retried with a different identity: {proxy.attempts}')
         record = json.loads(catalog()['environment:' + instance_id])
-        if (record['assignment']['generation'] != first['generation']
-                or persisted_runtime_id(record['result']) != first['runtime_id']
-                or labeled_backend(instance_id) != [first['backend']]):
+        if (
+            record['assignment']['generation'] != first['generation']
+            or persisted_runtime_id(record['result']) != first['runtime_id']
+            or labeled_backend(instance_id) != [first['backend']]
+        ):
             raise AssertionError('retry created a second assignment or backend')
         attached = Sandbox.from_id(instance_id, connection=connection)
         try:
             command = attached.commands.run('printf unknown-query-recovered')
-            assert command.exit_code == 0 and command.stdout == 'unknown-query-recovered'
+            if not (command.exit_code == 0 and command.stdout == 'unknown-query-recovered'):
+                raise AssertionError()
         finally:
             attached.close()
         Sandbox.delete(instance_id, connection=connection)
         deleted = True
         _wait_deleted(instance_id, connection, timeout=60)
-        assert 'environment:' + instance_id not in catalog()
-        assert not labeled_backend(instance_id)
+        if not ('environment:' + instance_id not in catalog()):
+            raise AssertionError()
+        if not (not labeled_backend(instance_id)):
+            raise AssertionError()
         report['status'] = 'passed'
-        report['cases'].append({
-            'id': 'reliability.unknown-query-404-same-create', 'status': 'passed',
-            'seconds': round(time.monotonic() - started, 3),
-            'instance_id': instance_id, 'request_id': next(iter(request_ids)),
-            'attempts': len(proxy.attempts), 'generation': first['generation'],
-            'backend': first['backend'],
-        })
+        report['cases'].append(
+            {
+                'id': 'reliability.unknown-query-404-same-create',
+                'status': 'passed',
+                'seconds': round(time.monotonic() - started, 3),
+                'instance_id': instance_id,
+                'request_id': next(iter(request_ids)),
+                'attempts': len(proxy.attempts),
+                'generation': first['generation'],
+                'backend': first['backend'],
+            }
+        )
         return report
     except Exception as error:
         report['error'] = str(error)

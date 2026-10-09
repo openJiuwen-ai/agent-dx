@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Buildkite Kubernetes acceptance, sharing business scenarios with local E2E."""
+
 import argparse
 import base64
 import hashlib
 import importlib.util
-import json
 import ipaddress
+import json
+import logging
 import os
-from pathlib import Path
 import re
 import secrets
 import shutil
@@ -16,6 +17,20 @@ import subprocess
 import sys
 import tempfile
 import xml.etree.ElementTree as ET
+from pathlib import Path
+
+
+def _executable(name, environment=None, cwd=None):
+    """Resolve an external command using the child's execution environment."""
+    directory = os.getcwd() if cwd is None else os.path.abspath(cwd)
+    search_path = os.pathsep.join(
+        os.path.abspath(os.path.join(directory, entry)) for entry in os.get_exec_path(environment)
+    )
+    executable = shutil.which(name, path=search_path)
+    if executable is None:
+        raise FileNotFoundError(f"required executable not found: {name}")
+    return os.path.abspath(executable)
+
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[2]
@@ -25,8 +40,9 @@ spec.loader.exec_module(common)
 sys.path.insert(0, str(HERE))
 from manifest import LABEL, resources
 
+
 def validate_physical_placement(placement, required):
-    hosts={item['host'] for item in placement}
+    hosts = {item['host'] for item in placement}
     if required and len(hosts) < 2:
         raise RuntimeError('full profile requires two distinct Kubernetes workers')
 
@@ -35,7 +51,8 @@ def source_commit():
     commit = os.getenv('BUILDKITE_COMMIT')
     if commit is None:
         commit = subprocess.check_output(
-            ['git', '-C', str(ROOT), 'rev-parse', 'HEAD'], text=True,
+            [_executable('git'), '-C', str(ROOT), 'rev-parse', 'HEAD'],
+            text=True,
         ).strip()
     if not re.fullmatch(r'[0-9a-f]{40}', commit):
         raise ValueError('test harness commit must be a 40-character Git commit')
@@ -44,7 +61,8 @@ def source_commit():
 
 def stage_harness(destination):
     shutil.copytree(
-        ROOT / 'build/e2e', destination,
+        ROOT / 'build/e2e',
+        destination,
         ignore=shutil.ignore_patterns('__pycache__', 'tests', '*.pyc'),
     )
     shutil.copy2(ROOT / 'build/ci/rpc_certificates.py', destination / 'rpc_certificates.py')
@@ -74,30 +92,61 @@ def identity(bundle, registry, commit=None, ci=False):
 def credentials(directory, image, runtime_image):
     subprocess.run([sys.executable, str(ROOT / 'build/ci/rpc_certificates.py'), str(directory / 'tls')], check=True)
     tls = directory / 'tls'
+
     def openssl(*args):
-        subprocess.run(['openssl', *map(str, args)], check=True,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    openssl('req', '-newkey', 'rsa:2048', '-nodes', '-keyout', tls / 'node2.key',
-            '-out', tls / 'node2.csr', '-subj', '/CN=ADX test node2')
-    openssl('x509', '-req', '-in', tls / 'node2.csr', '-CA', tls / 'ca.pem',
-            '-CAkey', tls / 'ca.key', '-CAcreateserial', '-out', tls / 'node2.pem',
-            '-days', '2', '-extfile', tls / 'extensions.cnf')
+        subprocess.run(
+            [_executable('openssl'), *map(str, args)], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+
+    openssl(
+        'req',
+        '-newkey',
+        'rsa:2048',
+        '-nodes',
+        '-keyout',
+        tls / 'node2.key',
+        '-out',
+        tls / 'node2.csr',
+        '-subj',
+        '/CN=ADX test node2',
+    )
+    openssl(
+        'x509',
+        '-req',
+        '-in',
+        tls / 'node2.csr',
+        '-CA',
+        tls / 'ca.pem',
+        '-CAkey',
+        tls / 'ca.key',
+        '-CAcreateserial',
+        '-out',
+        tls / 'node2.pem',
+        '-days',
+        '2',
+        '-extfile',
+        tls / 'extensions.cnf',
+    )
     openssl('x509', '-in', tls / 'node2.pem', '-outform', 'DER', '-out', tls / 'node2.der')
     for name in ('api-key', 'other-key', 'admin-key', 'redis-key'):
         path = directory / name
         path.write_text(secrets.token_hex(32))
         path.chmod(0o600)
-    (directory / 'redis-acl').write_text(
-        'user default on >' + (directory / 'redis-key').read_text() + ' ~* &* +@all\n'
-    )
+    (directory / 'redis-acl').write_text('user default on >' + (directory / 'redis-key').read_text() + ' ~* &* +@all\n')
     (directory / 'redis-acl').chmod(0o600)
     (directory / 'image').write_text(image)
     (directory / 'runtime-image').write_text(runtime_image)
-    data = {p.name: base64.b64encode(p.read_bytes()).decode() for p in tls.iterdir()
-            if p.suffix in ('.pem', '.key', '.der') and p.name != 'ca.key'}
-    data.update({name: base64.b64encode((directory / name).read_bytes()).decode()
-                 for name in ('api-key', 'other-key', 'admin-key', 'redis-key', 'redis-acl',
-                              'image', 'runtime-image')})
+    data = {
+        p.name: base64.b64encode(p.read_bytes()).decode()
+        for p in tls.iterdir()
+        if p.suffix in ('.pem', '.key', '.der') and p.name != 'ca.key'
+    }
+    data.update(
+        {
+            name: base64.b64encode((directory / name).read_bytes()).decode()
+            for name in ('api-key', 'other-key', 'admin-key', 'redis-key', 'redis-acl', 'image', 'runtime-image')
+        }
+    )
     return data
 
 
@@ -114,15 +163,24 @@ def default_redis_storage_class(value):
     classes = value.get('items') if isinstance(value, dict) else None
     if not isinstance(classes, list):
         raise ValueError('Kubernetes StorageClass list is invalid')
-    defaults = [item['metadata']['name'] for item in classes
-                if item.get('provisioner') not in (None, 'kubernetes.io/no-provisioner')
-                and item.get('metadata', {}).get('annotations', {}).get(
-                    'storageclass.kubernetes.io/is-default-class',
-                    item.get('metadata', {}).get('annotations', {}).get(
-                        'storageclass.beta.kubernetes.io/is-default-class', 'false')) == 'true']
+    defaults = [
+        item['metadata']['name']
+        for item in classes
+        if item.get('provisioner') not in (None, 'kubernetes.io/no-provisioner')
+        and item.get('metadata', {})
+        .get('annotations', {})
+        .get(
+            'storageclass.kubernetes.io/is-default-class',
+            item.get('metadata', {})
+            .get('annotations', {})
+            .get('storageclass.beta.kubernetes.io/is-default-class', 'false'),
+        )
+        == 'true'
+    ]
     if len(defaults) != 1:
-        raise ValueError('redis-pod-restart requires one default dynamic StorageClass '
-                         'or an explicit --redis-storage-class')
+        raise ValueError(
+            ('redis-pod-restart requires one default dynamic StorageClass or an explicit --redis-storage-class')
+        )
     return defaults[0]
 
 
@@ -136,21 +194,27 @@ def storage_class_inventory(value):
         metadata = item.get('metadata', {})
         annotations = metadata.get('annotations', {})
         provisioner = item.get('provisioner')
-        inventory.append({
-            'name': metadata.get('name'),
-            'provisioner': provisioner,
-            'volume_binding_mode': item.get('volumeBindingMode'),
-            'reclaim_policy': item.get('reclaimPolicy'),
-            'default': annotations.get('storageclass.kubernetes.io/is-default-class',
-                                       annotations.get('storageclass.beta.kubernetes.io/is-default-class')) == 'true',
-            'dynamic': provisioner not in (None, 'kubernetes.io/no-provisioner'),
-        })
+        inventory.append(
+            {
+                'name': metadata.get('name'),
+                'provisioner': provisioner,
+                'volume_binding_mode': item.get('volumeBindingMode'),
+                'reclaim_policy': item.get('reclaimPolicy'),
+                'default': annotations.get(
+                    'storageclass.kubernetes.io/is-default-class',
+                    annotations.get('storageclass.beta.kubernetes.io/is-default-class'),
+                )
+                == 'true',
+                'dynamic': provisioner not in (None, 'kubernetes.io/no-provisioner'),
+            }
+        )
     return sorted(inventory, key=lambda item: item['name'] or '')
 
 
 class KubernetesRun(common.Run):
-    def __init__(self, output, kubeconfig, context=None, profile="k8s-basic",
-                 selected_case=None, redis_storage_class=None):
+    def __init__(
+        self, output, kubeconfig, context=None, profile="k8s-basic", selected_case=None, redis_storage_class=None
+    ):
         super().__init__(output)
         self.kubectl = ['kubectl', '--kubeconfig', str(kubeconfig.resolve())]
         if context:
@@ -165,8 +229,11 @@ class KubernetesRun(common.Run):
         self.stop_evidence = 'stop' in selected_checks(profile, selected_case)
 
     def kube(self, *args, timeout=180):
-        return self.command([*self.kubectl, *args], timeout, stream=not any(
-            args[i:i+2] == ('-o', 'json') for i in range(len(args)-1)))
+        return self.command(
+            [*self.kubectl, *args],
+            timeout,
+            stream=not any(args[i : i + 2] == ('-o', 'json') for i in range(len(args) - 1)),
+        )
 
     def apply(self, value):
         # Secret bodies stay on stdin; redact any API validation error that echoes values.
@@ -177,9 +244,12 @@ class KubernetesRun(common.Run):
                 self.redactions.update(line for line in decoded.splitlines() if len(line) >= 8)
                 self.redactions.add(decoded)
             self.redactions.discard('')
-        self.command([*self.kubectl, 'create', '-f', '-'], timeout=60,
-                     input_data=json.dumps(value),
-                     label='kubectl create ' + value['kind'] + '/' + value['metadata']['name'])
+        self.command(
+            [*self.kubectl, 'create', '-f', '-'],
+            timeout=60,
+            input_data=json.dumps(value),
+            label='kubectl create ' + value['kind'] + '/' + value['metadata']['name'],
+        )
 
     def execute(self, node, *args, timeout=180):
         return self.kube('-n', self.id, 'exec', node, '-c', 'platform', '--', *args, timeout=timeout)
@@ -210,13 +280,15 @@ class KubernetesRun(common.Run):
                 "assert not bad,bad"
             )
             for node in self.nodes:
-                self.kube('-n', self.id, 'cp', str(harness) + '/.',
-                          node + ':/opt/adx/e2e', '-c', 'platform', timeout=60)
+                self.kube(
+                    '-n', self.id, 'cp', str(harness) + '/.', node + ':/opt/adx/e2e', '-c', 'platform', timeout=60
+                )
                 self.execute(node, 'python3', '-c', verify, timeout=30)
             self.event('[PASS] Current E2E harness synchronized and verified')
 
-    def deploy(self, m, refs, data, registry_auth=None, node_names=(), require_distinct_workers=False,
-               harness_commit=None):
+    def deploy(
+        self, m, refs, data, registry_auth=None, node_names=(), require_distinct_workers=False, harness_commit=None
+    ):
         print('--- Kubernetes deployment', flush=True)
         self.event('[DEPLOY] namespace=' + self.id + '; eligible nodes=' + ','.join(node_names))
         # Check credentials/connectivity before creating any test resource.
@@ -233,23 +305,47 @@ class KubernetesRun(common.Run):
             )
             self.event('[DEPLOY] Redis StorageClass=' + self.redis_storage_class)
         self.namespace_attempted = True
-        self.apply({'apiVersion': 'v1', 'kind': 'Namespace', 'metadata': {
-            'name': self.id, 'labels': {LABEL: self.id, 'pod-security.kubernetes.io/enforce': 'privileged'}}})
+        self.apply(
+            {
+                'apiVersion': 'v1',
+                'kind': 'Namespace',
+                'metadata': {
+                    'name': self.id,
+                    'labels': {LABEL: self.id, 'pod-security.kubernetes.io/enforce': 'privileged'},
+                },
+            }
+        )
         namespace = json.loads(self.kube('get', 'namespace', self.id, '-o', 'json'))
         self.namespace_uid = namespace['metadata']['uid']
-        self.apply({'apiVersion': 'v1', 'kind': 'Secret', 'type': 'Opaque',
-                    'metadata': {'name': 'adx-test-credentials', 'namespace': self.id}, 'data': data})
+        self.apply(
+            {
+                'apiVersion': 'v1',
+                'kind': 'Secret',
+                'type': 'Opaque',
+                'metadata': {'name': 'adx-test-credentials', 'namespace': self.id},
+                'data': data,
+            }
+        )
         if registry_auth:
             auth = json.loads(registry_auth.read_text())
             if not isinstance(auth.get('auths'), dict):
                 raise ValueError('registry auth must be a Docker config with auths')
-            self.apply({'apiVersion': 'v1', 'kind': 'Secret', 'type': 'kubernetes.io/dockerconfigjson',
-                        'metadata': {'name': 'adx-test-registry', 'namespace': self.id},
-                        'data': {'.dockerconfigjson': base64.b64encode(registry_auth.read_bytes()).decode()}})
-        objects = resources(self.id, refs['node'], m['architecture'], registry_auth is not None,
-                            node_names, self.redis_storage_class)
+            self.apply(
+                {
+                    'apiVersion': 'v1',
+                    'kind': 'Secret',
+                    'type': 'kubernetes.io/dockerconfigjson',
+                    'metadata': {'name': 'adx-test-registry', 'namespace': self.id},
+                    'data': {'.dockerconfigjson': base64.b64encode(registry_auth.read_bytes()).decode()},
+                }
+            )
+        objects = resources(
+            self.id, refs['node'], m['architecture'], registry_auth is not None, node_names, self.redis_storage_class
+        )
         # Public manifest contains Secret references, never Secret contents.
-        (self.output / 'resources.json').write_text(json.dumps({'apiVersion': 'v1', 'kind': 'List', 'items': objects}, indent=2))
+        (self.output / 'resources.json').write_text(
+            json.dumps({'apiVersion': 'v1', 'kind': 'List', 'items': objects}, indent=2)
+        )
         for obj in objects:
             self.apply(obj)
             if obj['kind'] == 'Pod' and obj['metadata']['name'] in ('node1', 'node2'):
@@ -260,10 +356,12 @@ class KubernetesRun(common.Run):
         self.event('[DEPLOY] Waiting for Pod readiness and image pulls')
         self.kube('-n', self.id, 'wait', 'pod', '--all', '--for=condition=Ready', '--timeout=300s', timeout=320)
         pods = json.loads(self.kube('-n', self.id, 'get', 'pods', '-o', 'json'))['items']
-        placement = [{'pod': p['metadata']['name'], 'host': p['spec']['nodeName'],
-                      'ip': p['status']['podIP']} for p in pods]
+        placement = [
+            {'pod': p['metadata']['name'], 'host': p['spec']['nodeName'], 'ip': p['status']['podIP']} for p in pods
+        ]
         validate_physical_placement(
-            [item for item in placement if item['pod'] in self.nodes], require_distinct_workers,
+            [item for item in placement if item['pod'] in self.nodes],
+            require_distinct_workers,
         )
         (self.output / 'placement.json').write_text(json.dumps(placement, indent=2) + '\n')
         print('Kubernetes placement: ' + json.dumps(placement), flush=True)
@@ -272,20 +370,35 @@ class KubernetesRun(common.Run):
         self.sync_harness(harness_commit or source_commit(), m['package']['commit'])
         self.event('[DEPLOY] Checking OCI runtime and bridge netfilter prerequisites')
         for node in self.nodes:
-            self.execute(node, 'python3', '-u', '/opt/adx/e2e/preflight.py',
-                         '--runtime-source', 'image')
+            self.execute(node, 'python3', '-u', '/opt/adx/e2e/preflight.py', '--runtime-source', 'image')
         self.event('[DEPLOY] Configuring nodes and starting sandboxd')
         for node in self.nodes:
-            self.execute(node, 'env', 'ADX_E2E_INGRESS_IP=' + ingress_ip,
-                         *common.setup_environment(self.selected_case),
-                         'python3', '/opt/adx/e2e/node.py', 'setup', node)
-            self.execute(node, 'sh', '-c', 'python3 /opt/adx/e2e/node.py services ' + node +
-                         ' > /evidence/services-' + node + '.log 2>&1 &')
+            self.execute(
+                node,
+                'env',
+                'ADX_E2E_INGRESS_IP=' + ingress_ip,
+                *common.setup_environment(self.selected_case),
+                'python3',
+                '/opt/adx/e2e/node.py',
+                'setup',
+                node,
+            )
+            self.execute(
+                node,
+                'sh',
+                '-c',
+                'python3 /opt/adx/e2e/node.py services ' + node + ' > /evidence/services-' + node + '.log 2>&1 &',
+            )
         self.event('[DEPLOY] Waiting for sandboxd; starting ADX supervisor and services')
         for node in self.nodes:
             self.helper(node, 'backend-ready', timeout=40)
-            self.execute(node, 'sh', '-c', '/opt/adx/package/bin/adxctl run --config /tmp/adx-e2e/deployment.yaml'
-                         ' > /evidence/supervisor-' + node + '.log 2>&1 &')
+            self.execute(
+                node,
+                'sh',
+                '-c',
+                '/opt/adx/package/bin/adxctl run --config /tmp/adx-e2e/deployment.yaml'
+                ' > /evidence/supervisor-' + node + '.log 2>&1 &',
+            )
         # Pod Ready only means the fixture is available; platform readiness is a separate gate.
         self.event('[DEPLOY] Waiting for Coordinator registration, reconciliation and routes')
         self.helper('node1', 'ready', timeout=150)
@@ -302,28 +415,31 @@ class KubernetesRun(common.Run):
         (self.output / 'redis-pod-before.log').write_text(
             self.kube('-n', self.id, 'logs', 'redis', '-c', 'redis', timeout=20)
         )
-        self.kube('-n', self.id, 'delete', 'pod', 'redis', '--wait=true',
-                  '--timeout=180s', timeout=200)
+        self.kube('-n', self.id, 'delete', 'pod', 'redis', '--wait=true', '--timeout=180s', timeout=200)
         self.apply(self.redis_pod_manifest)
-        self.kube('-n', self.id, 'wait', 'pod/redis', '--for=condition=Ready',
-                  '--timeout=300s', timeout=320)
+        self.kube('-n', self.id, 'wait', 'pod/redis', '--for=condition=Ready', '--timeout=300s', timeout=320)
         new = json.loads(self.kube('-n', self.id, 'get', 'pod', 'redis', '-o', 'json'))
         retained = json.loads(self.kube('-n', self.id, 'get', 'pvc', 'redis-data', '-o', 'json'))
-        assert new['metadata']['uid'] != pod_uid, 'Redis Pod was not replaced'
-        assert retained['metadata']['uid'] == claim_uid, 'Redis PVC identity changed'
-        evidence = {'pod_before': pod_uid, 'pod_after': new['metadata']['uid'],
-                    'pvc_uid': claim_uid}
+        if not (new['metadata']['uid'] != pod_uid):
+            raise AssertionError('Redis Pod was not replaced')
+        if not (retained['metadata']['uid'] == claim_uid):
+            raise AssertionError('Redis PVC identity changed')
+        evidence = {'pod_before': pod_uid, 'pod_after': new['metadata']['uid'], 'pvc_uid': claim_uid}
         (self.output / 'redis-pod-identity.json').write_text(json.dumps(evidence, indent=2) + '\n')
         return evidence
 
     def scenarios(self, checks, required):
         if required != ('redis-pod-restart',):
-            return super().scenarios(checks, required)
+            super().scenarios(checks, required)
+            return
         with self.case('redis-pod-restart', checks) as record:
-            self.event('Create live instances on both workers, replace only the Redis Pod, '
-                       'and verify PVC, ownership, backend identities and public SDK access')
-            self.execute('node1', '/opt/adx/client/bin/python', '-u',
-                         '/opt/adx/e2e/scenarios.py', 'create-marker', timeout=300)
+            self.event(
+                'Create live instances on both workers, replace only the Redis Pod, '
+                'and verify PVC, ownership, backend identities and public SDK access'
+            )
+            self.execute(
+                'node1', '/opt/adx/client/bin/python', '-u', '/opt/adx/e2e/scenarios.py', 'create-marker', timeout=300
+            )
             for node in self.nodes:
                 self.helper(node, 'capture-backend', node)
             self.helper('node1', 'redis-pod-before', timeout=20)
@@ -332,11 +448,18 @@ class KubernetesRun(common.Run):
             self.helper('node1', 'redis-pod-after', timeout=45)
             for node in self.nodes:
                 self.helper(node, 'unchanged', node)
-            output = self.execute('node1', '/opt/adx/client/bin/python', '-u',
-                                  '/opt/adx/e2e/scenarios.py', 'recovered-marker', timeout=90)
+            output = self.execute(
+                'node1', '/opt/adx/client/bin/python', '-u', '/opt/adx/e2e/scenarios.py', 'recovered-marker', timeout=90
+            )
             record['subcases'] = common.sdk_subcases_from_output(output)
-            self.execute('node1', '/opt/adx/client/bin/python', '-u',
-                         '/opt/adx/e2e/scenarios.py', 'cleanup-live-redis', timeout=90)
+            self.execute(
+                'node1',
+                '/opt/adx/client/bin/python',
+                '-u',
+                '/opt/adx/e2e/scenarios.py',
+                'cleanup-live-redis',
+                timeout=90,
+            )
             for node in self.nodes:
                 self.helper(node, 'empty', node)
 
@@ -361,20 +484,35 @@ class KubernetesRun(common.Run):
                 try:
                     self.kube('-n', self.id, *args, timeout=20)
                 except Exception:
-                    pass
+                    logging.getLogger(__name__).debug("Best-effort operation failed", exc_info=True)
             for node in reversed(self.nodes):
                 try:
                     # If the scenario already stopped it, skip the unavailable supervisor.
                     action = 'stop' if self.stop_evidence else 'cleanup'
-                    self.execute(node, 'sh', '-c', 'test -f /evidence/stop-' + node + '.json || '
-                                 'python3 /opt/adx/e2e/node.py ' + action + ' ' + node, timeout=180)
+                    self.execute(
+                        node,
+                        'sh',
+                        '-c',
+                        'test -f /evidence/stop-' + node + '.json || '
+                        'python3 /opt/adx/e2e/node.py ' + action + ' ' + node,
+                        timeout=180,
+                    )
                 except Exception as e:
                     errors.append(f'{node} stop: {e}')
                 try:
                     # The selected stop case writes final observability evidence.
                     # Always copy after teardown so the summary sees final diagnostics.
                     self.helper(node, 'collect', node, timeout=20)
-                    self.kube('-n', self.id, 'cp', node + ':/evidence/.', str(self.output / node), '-c', 'platform', timeout=60)
+                    self.kube(
+                        '-n',
+                        self.id,
+                        'cp',
+                        node + ':/evidence/.',
+                        str(self.output / node),
+                        '-c',
+                        'platform',
+                        timeout=60,
+                    )
                 except Exception as e:
                     errors.append(f'{node} diagnostics: {e}')
             if self.redis_pod_manifest is not None:
@@ -405,22 +543,29 @@ def main():
     p.add_argument('--context')
     p.add_argument('--node-name', action='append', default=[], help='eligible Kubernetes node; repeat for a pool')
     p.add_argument('--registry-auth', type=Path)
-    p.add_argument('--profile', choices=('l0','k8s-basic','full'), default='k8s-basic')
+    p.add_argument('--profile', choices=('l0', 'k8s-basic', 'full'), default='k8s-basic')
     p.add_argument('--case', help='run one case as a targeted diagnostic, not a Full gate')
-    p.add_argument('--redis-storage-class',
-                   help='StorageClass for the targeted Redis Pod/PVC recovery case')
+    p.add_argument('--redis-storage-class', help='StorageClass for the targeted Redis Pod/PVC recovery case')
     a = p.parse_args()
-    required=selected_checks(a.profile,a.case)
+    required = selected_checks(a.profile, a.case)
     if a.redis_storage_class and a.case != 'redis-pod-restart':
         p.error('--redis-storage-class is only used by --case redis-pod-restart')
     output = a.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
     checks = []
-    run = KubernetesRun(output, a.kubeconfig, a.context, a.profile, a.case,
-                        a.redis_storage_class if a.case == 'redis-pod-restart' else None)
+    run = KubernetesRun(
+        output,
+        a.kubeconfig,
+        a.context,
+        a.profile,
+        a.case,
+        a.redis_storage_class if a.case == 'redis-pod-restart' else None,
+    )
     error = None
+
     def cancel(signum, frame):
         raise InterruptedError(f'canceled by signal {signum}')
+
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, cancel)
     with tempfile.TemporaryDirectory(prefix='adx-k8s-secrets-') as private:
@@ -435,9 +580,16 @@ def main():
             if not re.fullmatch(r'[^\s]+@sha256:[0-9a-f]{64}', user_image):
                 raise ValueError('immutable custom user image required')
             data = credentials(Path(private), user_image, published['references']['execd'])
-            run.deploy(m, published['references'], data, a.registry_auth, a.node_name,
-                       require_distinct_workers=a.profile == 'full', harness_commit=source_commit())
-            run.scenarios(checks,required)
+            run.deploy(
+                m,
+                published['references'],
+                data,
+                a.registry_auth,
+                a.node_name,
+                require_distinct_workers=a.profile == 'full',
+                harness_commit=source_commit(),
+            )
+            run.scenarios(checks, required)
         except Exception as e:
             error = f'{type(e).__name__}: {e}'
             run.event('[FAIL] Kubernetes acceptance: ' + error)
@@ -445,10 +597,16 @@ def main():
             for sig in (signal.SIGTERM, signal.SIGINT):
                 signal.signal(sig, signal.SIG_IGN)
             cleanup_errors = run.cleanup()
-    report = common.finish_report(error, cleanup_errors, checks,required)
-    report.update(run_id=run.id, deployment='kubernetes', profile='targeted' if a.case else a.profile,
-                  source_profile=a.profile, selected_case=a.case,
-                  harness=run.harness, cases=run.case_results)
+    report = common.finish_report(error, cleanup_errors, checks, required)
+    report.update(
+        run_id=run.id,
+        deployment='kubernetes',
+        profile='targeted' if a.case else a.profile,
+        source_profile=a.profile,
+        selected_case=a.case,
+        harness=run.harness,
+        cases=run.case_results,
+    )
     (output / 'result.json').write_text(json.dumps(report, indent=2) + '\n')
     write_junit(output / 'junit.xml', report)
     print('--- Kubernetes acceptance result', flush=True)
@@ -456,9 +614,21 @@ def main():
         run.event(f"[{'PASS' if case['status'] == 'passed' else 'FAIL'}] {case['name']} ({case['seconds']:.3f}s)")
     for name in report['missing_checks']:
         run.event('[NOT RUN] ' + name)
-    run.event(f"[RESULT] {report['status'].upper()}: {len(checks)}/{len(required)} cases passed; cleanup_errors={len(cleanup_errors)}")
+    run.event(
+        (
+            f"[RESULT] "
+            f"{report['status'].upper()}"
+            f": "
+            f"{len(checks)}"
+            f"/"
+            f"{len(required)}"
+            f" cases passed; cleanup_errors="
+            f"{len(cleanup_errors)}"
+        )
+    )
     print(json.dumps(report), flush=True)
     return 0 if report['status'] == 'passed' else 1
+
 
 if __name__ == '__main__':
     raise SystemExit(main())

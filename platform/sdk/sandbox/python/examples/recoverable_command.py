@@ -9,7 +9,6 @@ import uuid
 
 from adx_sandbox import Sandbox
 
-
 sandbox_id = os.environ["SANDBOX_ID"]
 command_id = os.environ.get("COMMAND_ID", f"cmd-{uuid.uuid4()}")
 sandbox = Sandbox.from_id(sandbox_id)

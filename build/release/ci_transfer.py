@@ -1,12 +1,21 @@
 #!/usr/bin/env python3
 """Transfer intermediate CI artifacts via authenticated OBS, with identity and SHA checks."""
+
 import argparse
 import json
 import os
-from pathlib import Path
 import tempfile
+from pathlib import Path
 
-from obs_upload import COMMIT, component, digest, checked_upload, obs_client, DEFAULT_BUCKET, DEFAULT_ENDPOINT
+from obs_upload import (
+    COMMIT,
+    DEFAULT_BUCKET,
+    DEFAULT_ENDPOINT,
+    checked_upload,
+    component,
+    digest,
+    obs_client,
+)
 
 
 def prefix(build_id, commit, group):
@@ -42,10 +51,12 @@ def download(client, bucket, build_id, commit, group, output):
     output.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=output) as tmp:
         staging = Path(tmp)
+
         def fetch(name):
             response = client.getObject(bucket, f'{root}/{name}', downloadPath=str(staging / name))
             if response.status >= 300:
                 raise RuntimeError(f'OBS download failed: {group}/{name}, status={response.status}')
+
         fetch('manifest.json')
         manifest = json.loads((staging / 'manifest.json').read_text())
         for name, expected in [('schema_version', 1), ('build_id', build_id), ('commit', commit), ('group', group)]:

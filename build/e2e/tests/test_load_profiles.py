@@ -1,9 +1,9 @@
 """The optional load profiles require a real two-worker Full deployment."""
 
-import unittest
 import json
-from pathlib import Path
 import tempfile
+import unittest
+from pathlib import Path
 
 from e2e import run as driver
 
@@ -21,12 +21,19 @@ class LoadProfileTests(unittest.TestCase):
     def test_performance_report_has_per_operation_rates(self):
         from e2e.load.performance import summarize
 
-        result = summarize({
-            'status': 'passed', 'elapsed_seconds': 60,
-            'operations': {'command': {'count': 120}, 'file': {'count': 60},
-                           'create': {'count': 12}, 'delete': {'count': 12}},
-            'cases': [{'id': 'mixed-soak.command', 'status': 'passed', 'seconds': 0}],
-        })
+        result = summarize(
+            {
+                'status': 'passed',
+                'elapsed_seconds': 60,
+                'operations': {
+                    'command': {'count': 120},
+                    'file': {'count': 60},
+                    'create': {'count': 12},
+                    'delete': {'count': 12},
+                },
+                'cases': [{'id': 'mixed-soak.command', 'status': 'passed', 'seconds': 0}],
+            }
+        )
         self.assertEqual(result['operations']['command']['rate_per_second'], 2.0)
         self.assertEqual(result['operations']['file']['rate_per_second'], 1.0)
         self.assertEqual(result['operations']['create']['rate_per_second'], 0.2)
@@ -47,22 +54,29 @@ class LoadProfileTests(unittest.TestCase):
             runner = driver.Run(Path(directory))
             runner.nodes = ['node1', 'node2']
             commands = []
-            runner.execute = lambda node, *args, **kwargs: (
-                commands.append(('execute', node, args[-1]))
-                or json.dumps({'cases': [{'id': 'load-pressure.drained',
-                                          'status': 'passed', 'seconds': 0}]})
-            )
-            runner.helper = lambda node, *args, **kwargs: (
-                commands.append(('helper', node, args[0]))
-            )
+
+            def _assigned_execute(node, *args, **kwargs):
+                return commands.append(('execute', node, args[-1])) or json.dumps(
+                    {'cases': [{'id': 'load-pressure.drained', 'status': 'passed', 'seconds': 0}]}
+                )
+
+            runner.execute = _assigned_execute
+
+            def _assigned_helper(node, *args, **kwargs):
+                return commands.append(('helper', node, args[0]))
+
+            runner.helper = _assigned_helper
             checks = []
             runner.scenarios(checks, ('load-pressure',))
             self.assertEqual(checks, ['load-pressure'])
-            self.assertEqual(commands, [
-                ('execute', 'node1', 'load-pressure'),
-                ('helper', 'node1', 'empty'),
-                ('helper', 'node2', 'empty'),
-            ])
+            self.assertEqual(
+                commands,
+                [
+                    ('execute', 'node1', 'load-pressure'),
+                    ('helper', 'node1', 'empty'),
+                    ('helper', 'node2', 'empty'),
+                ],
+            )
 
 
 if __name__ == '__main__':

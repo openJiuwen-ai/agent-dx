@@ -1,5 +1,5 @@
-import inspect
 import gc
+import inspect
 import os
 import unittest
 from unittest.mock import patch
@@ -499,6 +499,7 @@ class LifecycleTests(unittest.TestCase):
         sandbox._closed = True
         with self.assertRaises(RuntimeError):
             sandbox.update_network_policy(None)
+
 
 if __name__ == "__main__":
     unittest.main()

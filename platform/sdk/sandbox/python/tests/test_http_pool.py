@@ -181,9 +181,7 @@ def test_token_provider_is_resolved_for_every_http_request(monkeypatch):
     try:
         first = client._http.get(f"http://{address}/echo", timeout=5).json()
         current["token"] = "token-b"
-        second = client._http.get(
-            f"http://{address}/direct/sandbox/8080", timeout=5
-        ).json()
+        second = client._http.get(f"http://{address}/direct/sandbox/8080", timeout=5).json()
 
         assert first["token"] == "token-a"
         assert second["token"] == "token-b"
@@ -197,9 +195,7 @@ def test_concurrent_clients_share_pool_without_token_leakage(monkeypatch):
     server, thread = _start_server()
     address = f"127.0.0.1:{server.server_port}"
     url = f"http://{address}/echo"
-    clients = [
-        _new_client(monkeypatch, address, f"token-{index}") for index in range(24)
-    ]
+    clients = [_new_client(monkeypatch, address, f"token-{index}") for index in range(24)]
     try:
 
         def request(index: int):
@@ -208,9 +204,7 @@ def test_concurrent_clients_share_pool_without_token_leakage(monkeypatch):
         with ThreadPoolExecutor(max_workers=12) as executor:
             responses = list(executor.map(request, range(len(clients))))
 
-        assert [response["token"] for response in responses] == [
-            f"token-{index}" for index in range(len(clients))
-        ]
+        assert [response["token"] for response in responses] == [f"token-{index}" for index in range(len(clients))]
         assert all(response["cookie"] is None for response in responses)
     finally:
         for client in clients:
@@ -276,15 +270,9 @@ def test_real_http_service_reuses_connections(monkeypatch, tmp_path, tls):
     address = f"127.0.0.1:{server.server_port}"
     scheme = "https" if tls else "http"
     url = f"{scheme}://{address}/echo"
-    clients = [
-        _new_client(monkeypatch, address, f"token-{index}", tls=tls)
-        for index in range(4)
-    ]
+    clients = [_new_client(monkeypatch, address, f"token-{index}", tls=tls) for index in range(4)]
     try:
-        responses = [
-            clients[index % len(clients)]._http.get(url, timeout=5).json()
-            for index in range(20)
-        ]
+        responses = [clients[index % len(clients)]._http.get(url, timeout=5).json() for index in range(20)]
         assert len(responses) == 20
         assert 0 < len(server.client_ports) < len(responses)
     finally:
@@ -294,9 +282,7 @@ def test_real_http_service_reuses_connections(monkeypatch, tmp_path, tls):
 
 
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="requires os.fork")
-@pytest.mark.filterwarnings(
-    "ignore:This process .* is multi-threaded, use of fork.*:DeprecationWarning"
-)
+@pytest.mark.filterwarnings("ignore:This process .* is multi-threaded, use of fork.*:DeprecationWarning")
 def test_fork_replaces_inherited_pool_and_socket(monkeypatch):
     server, thread = _start_server()
     address = f"127.0.0.1:{server.server_port}"
@@ -309,12 +295,8 @@ def test_fork_replaces_inherited_pool_and_socket(monkeypatch):
         try:
             os.close(read_fd)
             child_response = client._http.get(url, timeout=5).json()
-            child_keys = [
-                list(key) for key in _SHARED_HTTP_CLIENT_REGISTRY.snapshot()
-            ]
-            payload = json.dumps(
-                {"response": child_response, "keys": child_keys}
-            ).encode()
+            child_keys = [list(key) for key in _SHARED_HTTP_CLIENT_REGISTRY.snapshot()]
+            payload = json.dumps({"response": child_response, "keys": child_keys}).encode()
             os.write(write_fd, payload)
         finally:
             os.close(write_fd)
