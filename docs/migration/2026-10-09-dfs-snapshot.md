@@ -31,7 +31,7 @@
 
 默认 ADX 工程路径保持不带 AFS。AFS 相关变更会在默认 pipeline 中触发 Buildkite AFS gate；该 gate 使用 `ADX_WITH_AFS=1` 执行检查，但不把文件系统 artifact 注入默认发布包。只有显式带组件的 release package 才包含 `afs-meta`、`afs-node`、AFS 示例配置和 `with_afs: true` 清单。普通 release package 本轮仍不包含文件系统二进制、配置或运行依赖。
 
-目标仓本轮二进制已有下列限定运行证据；原 DMS/AFS 历史结论仍绑定原版本。本次 MR 的 ON 安装交付出口尚未完成，MR 建立不表示迁移 Goal 已完成。
+目标仓本轮二进制已有下列限定运行证据；原 DMS/AFS 历史结论仍绑定原版本。本次 MR 的统一 ON 包及安装交付出口已完成；本报告限定到可审查的迁移成果，不表示性能、完整 POSIX 或复杂可靠性达标。
 
 ### AFS 命名与 CLA 对齐
 
@@ -53,8 +53,8 @@ Rust 受测输入为目标提交 `3c6e3b47f25317662640ec7b47039f2c1f6c735b`，51
 | OwnerFs bind ON＋远端 | 功能通过（限定范围） | 实际 Home 底层 ext4 bind 与远端 FUSE；双向 64KiB/close-to-open、权限/setid、errno、目录持久屏障、local-file 有序全停重启及删除可见；70 检查、7 actual wait0、无 owned 挂载/进程残留 |
 | FUSE mmap 与正常排空 | 功能通过（限定范围） | 已编译 AFS libtest 中 covered-root lifecycle 和 file/mmap reference drain 两个真实 kernel case；普通 unmount/FUSE join 成功，无残留 |
 | DFS 一写多读 | 功能通过（限定范围） | 同 VM 三个独立 Node/mTLS TCP；A 写、B/C 并发读，三轮 64KiB/fsync/close-to-open、删除可见；55 检查、4 actual wait0；只要求一份持久副本，不是三同步副本或跨主机证明 |
-| 统一 ON 包及安装 | 进行中／待验收 | Redis 7.2.5、EROFS 1.8.10 与 Python 打包工具已就绪；原 musl 下载超时记录保留，经用户授权由主机同官方源下载校验、传入现有 VM 后 target 已就绪。旧836候选首次因输出目录已存在而组装失败，保留原记录；随后 fresh output 出包成功仅绑定旧候选。新AFS入口最终 artifact、安装和生命周期尚未通过，公共镜像保持原样 |
-| GitCode 交付 | 进行中 | Issue #10、MR !33（CLA yes）替代已关闭的 !32；新命名的 Linux 验证已通过，必要 ON 出包及安装出口未完成，暂不合并 |
+| 统一 ON 包及安装 | 通过（限定范围） | Redis 7.2.5、EROFS 1.8.10 与 Python 打包工具已就绪；原 musl 下载超时记录保留，经用户授权由主机同官方源下载校验、传入现有 VM 后 target 已就绪。旧836候选首次因输出目录已存在而组装失败，保留原记录；随后 fresh output 出包成功仅绑定旧候选。新AFS入口bfd876统一release已成功，with_afs=true、产品bin/AFS示例存在且probe_count=0；installed adxctl 的 bind ON／远端核心及有序恢复通过，公共镜像保持原样 |
+| GitCode 交付 | 进行中 | Issue #10、MR !33（CLA yes）替代已关闭的 !32；新命名的 Linux 验证已通过，新AFS入口统一出包及安装通过；远端最终报告核验后交付，仍不自动合并 |
 
 本轮未声明性能、跨主机、完整 POSIX、三同步副本、崩溃恢复或分布式锁通过。库测试的 22 个 ignored 中仅上述两个 kernel case 另行实际执行，不把其余 ignored 计为通过。
 
@@ -90,9 +90,37 @@ Rust 受测输入为目标提交 `3c6e3b47f25317662640ec7b47039f2c1f6c735b`，51
 
 仓外索引：`refactor-integration-4d82831/refactor-red-evidence.tar` 为 `c6cfeb5c2070414a520354a82285cd29c94e3058e0d6c400a449e0bcbb9dbd32`，`refactor-green-evidence.tar` 为 `5e4cad901e7df63516b03c1ea5b1dff78a0736d8b23f5da9000d969cd7cd9e98`。
 
+## 新 AFS 入口统一发布包
+
+来源 `bfd876bc92cdd98fde63dc3457ae8f4c5e385fea`／tree `1cdc26aa6c6fd274d7adf966ec72116ec70c99a2`，Linux clean checkout。`ADX_WITH_AFS=1 make platform-release JOBS=1` rc0，输出目录此前不存在；实际包目录 201,622,404 字节，规范 tar 流 SHA-256 `af1229eb54c23dacf28d93875bbc75332af3c5c8c68b02582f2a028194c2b677`。manifest SHA-256 `b31c697f4861c31cebb13b01d2c9ec1ead4c69bb0e430b81f3f54261d1686834`，`with_afs: true`，包含 `afs-meta`、`afs-node` 和 `etc/examples/afs/`；两个测试 examples 不入包（probe_count=0）。该包后续实际安装与限定运行已通过，见下节。
+
+| 新包产物 | SHA-256 |
+| --- | --- |
+| `bin/adxctl` | `81c5d236f037c3c85a0e9e66a6140052dd47a2f90fef1bf862cba7cd35a7769c` |
+| `bin/afs-meta` | `9d5d5f8400307b7a1270954db2f338f1b36ceed7a1c0db36a7755ede2c27cf23` |
+| `bin/afs-node` | `66b88561da894bf34c56a7baf922c210025e7ac53b8b4bd9b86d30d3f4be1b9f` |
+
+仓外 `linux/release-20261009T2340-afs-release-bfd876b/release-evidence.tar` SHA-256 `00a5db39c631325f9af5376ccde89b4f5433122be4e4db9a359a9d280695690f`，含命令、准入、清单、全部文件 hash 和工作树身份。旧836出包记录保留原版本，不作新包验收证据。
+
+## 实际安装与运行
+
+从上述 bfd876 ON 包调用原 `install.sh`，安装到全新 guest ext4 路径，未修改 `/opt/adx` 或旧数据。安装后的 `adxctl`／`afs-meta`／`afs-node` SHA 与包内相同。实际 `adxctl validate/render/run/status/stop`，bind OFF provision → bind ON 双 Node → 全停 → 中心 local-file 重启读回 → 删除可见 → 正常停止均通过，82 个检查。两个节点在同一 Linux VM，以 mTLS TCP 通信；不是跨主机证明。
+
+Home workspace 绑定源为真实 `state/ownerfs/root-776f726b7370616365-e1`，目标是 FUSE 根下一级 `workspace`；目标 fstype=ext4，与源 dev/ino `[64769,1850507]` 一致，远端根为 `afs-ownerfs` FUSE。覆盖双向约64KiB/fsync/close-to-open、权限拒绝、ENOENT、非特权写清除 setid 和 root CAP_FSETID 保留语义。有序重启后 bind／远端读回与删除可见通过。
+
+三个 supervisor `run` 实际 wait0；这不是每个子进程的独立 wait0 记录。独立收尾核对 11 个观察到的 supervisor/服务 PID 均已退出，无本轮挂载残留；仅删除本轮新安装目录／链接，保留数据及证据。
+
+仓外 `linux/installed-20261009T154056Z-final/` 索引：
+
+- `pass-installed-ownerfs.tgz`：`f6b44e50dec6dcf743b85602f102dd047c0d23d8d1b9be143f681fb726d85a87`。
+- driver：`ce886a3bb31ca0a1f425cb416fcdef5de3ab72d25a5451bff87d689aebd42311`。
+- `fail-preflight-wrong-source-path.tgz`：`d4d2c12709144493a99c0c0f4e13d1ac82eb9b0be5b5c2df3dcf2765defd01c2`，调用参数 source 路径拼写错误，零服务启动。
+- `fail-render-driver-assertion.tgz`：`de475bf9ea6db2b39e4020eb5fa0dbed869ec47b552812e93cd1f22e3b40da2f`，误要求 AFS-only render 必须生成 JSON；实际按设计直接传已有 TOML，修正观察器后执行正式运行。原失败在服务启动前，均保留，不修改环境或产品。
+- `root-postcheck.json`：完整 observed PID 列表与无残留核对；TLS 私钥只留仓外。
+
 ## 剩余必要出口
 
-- M3：准备本地 builder 的固定发布依赖后，用统一入口产生真实 ON artifact，完成安装、配置、启动、健康检查、正常停止和卸载。
+- M3：已关闭；bfd876 统一 ON 出包及该包实际安装、配置、启动、ready、正常停止／卸载通过。
 - M5：把最终交付结果追加到同一个 MR，核对远端分支和实际文件树；不自动合并。
 
-M1/M2 与本轮 M4 限定运行已收口；上述必要交付未完成前 Goal 保持进行中。性能、完整 POSIX、复杂可靠性和锁专题仍按 [产品计划](../development/dfs-plan.md) 后置。
+M1/M2/M3 与本轮 M4 限定运行已收口；M5 仅剩本报告提交后的远端身份核验。性能、完整 POSIX、复杂可靠性和锁专题仍按 [产品计划](../development/dfs-plan.md) 后置。

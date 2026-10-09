@@ -40,7 +40,7 @@ Rust 构建、Cargo metadata、格式、Clippy、单元测试、FUSE 运行、mo
 本次迁移 MR 的必要出口包括：
 
 1. 默认 OFF 的构建、测试和包清单验证；
-2. 显式 ON 的 DFS crates 构建、严格 all-features Clippy、受影响单测和真实带组件包验证；
+2. 显式 ON 的 AFS crates 构建、严格 all-features Clippy、受影响单测和真实带组件包验证；
 3. 从本轮 ON artifact 完成安装、配置、启动、健康检查、正常停止和卸载；
 4. 用目标仓实际二进制完成 OwnerFs bind ON＋远端双向访问、权限/清位/errno、中心 local-file 正常重启恢复，以及小规模 DFS 一写多读；
 5. 验证 direct-I/O mmap 协商及正常卸载/受管引用排空；测试辅助程序只由验收流程显式构建，不进入普通包。
