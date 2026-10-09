@@ -42,6 +42,44 @@ class BindTwoNodeLocalFileTests(unittest.TestCase):
             self.assertFalse(checks[-1]["passed"])
             self.assertIsNone(checks[-1]["detail"]["fusermount3"])
 
+    def test_successful_preflight_creates_root_and_records_checks(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            repo = base / "repo"
+            (repo / "dfs").mkdir(parents=True)
+            (repo / "Cargo.toml").write_text("[workspace]\n")
+            (repo / "dfs/Cargo.toml").write_text("[package]\nname='afs'\nversion='0.0.0'\nedition='2024'\n")
+            binaries = base / "bin"
+            binaries.mkdir()
+            for name in ("afs-meta", "afs-node"):
+                exe = binaries / name
+                exe.write_text("#!/bin/sh\nexit 0\n")
+                exe.chmod(0o755)
+            root = base / "fresh-root"
+            scenario = module.Scenario(repo, binaries, root, False)
+
+            class FakeSocket:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, exc_type, exc, tb):
+                    return False
+
+                def bind(self, address):
+                    self.address = address
+
+            with mock.patch.object(module.platform, "system", return_value="Linux"), \
+                 mock.patch.object(module.os, "geteuid", return_value=0), \
+                 mock.patch.object(module.shutil, "which", side_effect=lambda tool: f"/usr/bin/{tool}"), \
+                 mock.patch.object(module.shutil, "disk_usage", return_value=mock.Mock(free=2 * 1024**3)), \
+                 mock.patch.object(module.socket, "socket", side_effect=lambda: FakeSocket()):
+                scenario.preflight()
+
+            checks = json.loads((root / "checks.json").read_text())
+            self.assertTrue(root.is_dir())
+            self.assertEqual(checks[-1]["name"], "afs-node executable")
+            self.assertTrue(all(item["passed"] for item in checks))
+
     def test_existing_root_is_rejected_without_overwriting_sentinel(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             base = Path(td)
@@ -60,6 +98,8 @@ class BindTwoNodeLocalFileTests(unittest.TestCase):
         self.assertEqual(module.health_ready(200, '{"status":"starting"}')[0], False)
         self.assertEqual(module.health_ready(503, '{"status":"ready"}')[0], False)
         self.assertEqual(module.health_ready(200, '{"status":"ready"}')[0], True)
+        self.assertEqual(module.health_ready(200, 'null')[0], False)
+        self.assertEqual(module.health_ready(200, '[{"status":"ready"}]')[0], False)
 
 
 if __name__ == "__main__":

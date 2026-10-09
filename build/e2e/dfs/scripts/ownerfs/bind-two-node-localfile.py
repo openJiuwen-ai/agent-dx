@@ -54,7 +54,7 @@ def health_ready(status: int, body: str) -> tuple[bool, object]:
         parsed = json.loads(body)
     except json.JSONDecodeError as exc:
         return False, {"status": status, "body": body[:1000], "error": str(exc)}
-    ready = status == 200 and parsed.get("status") == "ready" and parsed.get("ready", True) is not False
+    ready = isinstance(parsed, dict) and status == 200 and parsed.get("status") == "ready" and parsed.get("ready", True) is not False
     return ready, {"status": status, "body": parsed}
 
 
@@ -123,7 +123,6 @@ class Scenario:
         ]:
             with socket.socket() as sock:
                 sock.bind((address, port))
-        self.root.mkdir(mode=0o755)
 
     def write_identity(self) -> None:
         source_files = [
