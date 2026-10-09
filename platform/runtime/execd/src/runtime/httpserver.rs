@@ -360,9 +360,13 @@ async fn handle_one_request(
         && route == "/commands/watch"
         && header_has_token(&head, "upgrade", "websocket")
     {
+        // An upgraded stream owns this connection until it ends. Returning to
+        // the HTTP keep-alive loop would keep TCP open after its Close frame.
+        *close_after_response = true;
         return handle_command_watch(sock, &head).await;
     }
     if method == "GET" && route == "/pty" && header_has_token(&head, "upgrade", "websocket") {
+        *close_after_response = true;
         return handle_pty(sock, &head, &path).await;
     }
 
@@ -2216,6 +2220,76 @@ mod tests {
         let replay: serde_json::Value = serde_json::from_str(replay.to_text().unwrap()).unwrap();
         assert_eq!(replay["status"], "SUCCEEDED");
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn pty_terminal_status_and_close_frame_are_followed_by_tcp_eof() {
+        let listener = bind(0).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = serve_listener(listener, None).await;
+        });
+        let uri = format!(
+            "ws://{address}/pty?protocol=sandbox.pty.v1&command=%2Fbin%2Fsh&command=-c&command=exit%200"
+        );
+        let (mut websocket, _) = tokio_tungstenite::connect_async(uri).await.unwrap();
+        let mut exited = false;
+        loop {
+            let message = tokio::time::timeout(std::time::Duration::from_secs(5), websocket.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            match message {
+                tokio_tungstenite::tungstenite::Message::Text(text) => {
+                    let event: serde_json::Value = serde_json::from_str(&text).unwrap();
+                    if event["type"] == "exited" {
+                        assert_eq!(event["exit_code"], 0);
+                        exited = true;
+                    }
+                }
+                tokio_tungstenite::tungstenite::Message::Close(_) => break,
+                _ => {}
+            }
+        }
+        assert!(exited);
+        // Read the underlying TCP socket without another WebSocket poll: a
+        // completed upgraded session must not wait for another HTTP request.
+        let socket = websocket.get_mut();
+        let mut buffer = [0; 1024];
+        let eof =
+            tokio::time::timeout(std::time::Duration::from_secs(1), socket.read(&mut buffer)).await;
+        server.abort();
+        assert_eq!(
+            eof.expect("Execd must close TCP after the PTY closes")
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn command_watch_client_close_does_not_return_to_http_keepalive() {
+        let listener = bind(0).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let _ = serve_listener(listener, None).await;
+        });
+        let (mut websocket, _) =
+            tokio_tungstenite::connect_async(format!("ws://{address}/commands/watch"))
+                .await
+                .unwrap();
+        websocket
+            .send(tokio_tungstenite::tungstenite::Message::Close(None))
+            .await
+            .unwrap();
+        let socket = websocket.get_mut();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            let mut buffer = [0; 1024];
+            while socket.read(&mut buffer).await.unwrap() != 0 {}
+        })
+        .await;
+        server.abort();
+        result.expect("Execd must close TCP after the command watch closes");
     }
 
     #[tokio::test]

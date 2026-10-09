@@ -18,6 +18,7 @@ struct State {
     reloads: usize,
     executions: usize,
     lookup_unavailable: bool,
+    reload_unavailable: bool,
 }
 
 // Expand before async_trait so every generated method receives its RPC lifetime.
@@ -65,6 +66,9 @@ service_impl!(pb::node_service_server::NodeService, {
         let request = request.into_inner();
         let mut state = self.0.lock().unwrap();
         state.reloads += 1;
+        if state.reload_unavailable {
+            return Err(Status::unavailable("reload recovery point is unavailable"));
+        }
         let record = state.owner.record.as_mut().unwrap();
         assert_eq!(request.assignment, record.assignment);
         assert_eq!(request.caller.as_ref().unwrap().tenant_id, "tenant");
@@ -156,6 +160,7 @@ impl Fixture {
             reloads: 0,
             executions: 0,
             lookup_unavailable: false,
+            reload_unavailable: false,
         }));
         let service = Service(state.clone());
         let server = tokio::spawn(async move {
@@ -175,7 +180,7 @@ impl Fixture {
         let config: Config = serde_json::from_value(json!({
             "listen": "127.0.0.1:0", "coordinator_address": address,
             "internal_security": "network", "ingress_mode": "standalone",
-            "rpc_timeout_seconds": 2, "cache_entries": 16, "auth_cache_ttl_seconds": 1
+            "rpc_timeout_seconds": 2, "cache_entries": 1, "auth_cache_ttl_seconds": 1
         }))
         .unwrap();
         let clients = Clients::new(config).unwrap();
@@ -234,20 +239,19 @@ async fn delete_still_uses_cached_owner_when_coordinator_is_unavailable() {
         serde_json::Value::Null
     );
     assert_eq!(fixture.state.lock().unwrap().lookups, 0);
-    // The confirmed result also updates the local cache.
+    // The confirmed delete clears the old ownership. This fixture deliberately
+    // withholds the initial watch snapshot, so a missing entry is Unavailable
+    // rather than a directory-wide authoritative NotFound.
     let caller = pb::CallerContext {
         tenant_id: "tenant".into(),
         administrator: false,
     };
-    let owner = fixture
+    let error = fixture
         .clients
         .owner("environment", &caller, false)
         .await
-        .unwrap();
-    assert_eq!(
-        owner.record.unwrap().state,
-        pb::EnvironmentState::Deleted as i32
-    );
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::Unavailable);
 }
 
 #[tokio::test]
@@ -261,4 +265,41 @@ async fn reload_does_not_execute_from_stale_cache_when_refresh_fails() {
     let state = fixture.state.lock().unwrap();
     assert_eq!(state.lookups, 1);
     assert_eq!(state.reloads, 0);
+}
+
+#[tokio::test]
+async fn unknown_reload_cannot_exhaust_cache_or_block_delete() {
+    let fixture = Fixture::new().await;
+    fixture.state.lock().unwrap().reload_unavailable = true;
+    let caller = pb::CallerContext {
+        tenant_id: "tenant".into(),
+        administrator: false,
+    };
+    for index in 0..12 {
+        let error = fixture
+            .operations
+            .execute(
+                Kind::Reload,
+                "environment",
+                &format!("unavailable-reload-{index}"),
+                json!({}),
+                &caller,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::Unavailable);
+    }
+    assert_eq!(fixture.state.lock().unwrap().reloads, 24);
+    let deleted = fixture
+        .operations
+        .execute(
+            Kind::Delete,
+            "environment",
+            "delete-after-unknown-reload",
+            json!({}),
+            &caller,
+        )
+        .await
+        .unwrap();
+    assert_eq!(deleted, serde_json::Value::Null);
 }

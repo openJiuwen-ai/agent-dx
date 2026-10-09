@@ -99,11 +99,8 @@ impl Operations {
             if let Some(operation) = pending.get(&key) {
                 operation.clone()
             } else {
-                if pending.len() >= clients.config.cache_entries {
-                    return Err(Status::resource_exhausted(
-                        "pending operation budget exhausted",
-                    ));
-                }
+                // Retained retry identities are not admission slots. Completed
+                // cache capacity must not reject an independent lifecycle request.
                 let expected = record
                     .last_operation
                     .as_ref()

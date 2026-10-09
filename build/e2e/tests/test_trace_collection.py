@@ -57,3 +57,25 @@ class TraceCollectionTests(unittest.TestCase):
         ]
         with self.assertRaises(AssertionError):
             telemetry.check_trace_links(rows)
+
+
+class HttpTraceContractTests(unittest.TestCase):
+
+    def test_execd_named_http_span_with_parent_proves_context(self):
+        rows = [{'service': 'adx-execd', 'name': 'POST /invoke', 'parentSpanId': 'a', 'attributes': [{'key': 'http.route', 'value': {'stringValue': '/invoke'}}]}]
+        self.assertTrue(telemetry.has_execd_http_context(rows))
+
+    def test_other_service_or_root_http_span_does_not_prove_execd_context(self):
+        for (service, parent) in [('adx-apiserver', 'a'), ('adx-execd', '0000000000000000')]:
+            rows = [{'service': service, 'name': 'POST /invoke', 'parentSpanId': parent, 'attributes': [{'key': 'http.route', 'value': {'stringValue': '/invoke'}}]}]
+            self.assertFalse(telemetry.has_execd_http_context(rows))
+
+    def test_create_trace_requires_two_linked_http_spans_and_all_stages(self):
+        rows = [{'traceId': 't', 'spanId': '1', 'name': 'POST /api/sandbox/v1/sandboxes', 'service': 'adx-apiserver'}, {'traceId': 't', 'spanId': '2', 'parentSpanId': '1', 'name': 'POST /api/sandbox/v1/sandboxes', 'service': 'adx-apiserver'}]
+        rows += [{'traceId': 't', 'spanId': str(i + 3), 'name': name} for (i, name) in enumerate(['coordinator.create_environment', 'node.create_environment', 'environment.queue', 'environment.execute', 'coordinator.commit_environment'])]
+        self.assertEqual(telemetry.complete_create_trace_ids(rows), ['t'])
+        rows[1]['parentSpanId'] = 'missing'
+        self.assertEqual(telemetry.complete_create_trace_ids(rows), [])
+        rows[1]['parentSpanId'] = '1'
+        rows.pop()
+        self.assertEqual(telemetry.complete_create_trace_ids(rows), [])
