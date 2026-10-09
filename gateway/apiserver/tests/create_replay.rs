@@ -254,9 +254,7 @@ async fn active_creates_are_not_evicted_and_same_request_is_serialized() {
     let spawn = |id: &'static str, request_id: &'static str| {
         let service = fixture.service.clone();
         tokio::spawn(async move {
-            service
-                .create(spec(id), json!({"name":id}), request_id, &caller())
-                .await
+            Box::pin(service.create(spec(id), json!({"name":id}), request_id, &caller())).await
         })
     };
     let first = spawn("one", "request-one");
