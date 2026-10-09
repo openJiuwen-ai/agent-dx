@@ -24,6 +24,8 @@ class ArmPackageTests(unittest.TestCase):
         self.assertEqual(set(arm['depends_on']), {'sdk-package', 'admin-package', 'source-gate'})
         self.assertIn('out/buildkite/arm64/*.tar.gz', arm['artifact_paths'])
         self.assertIn('out/buildkite/arm64/logs/**/*', arm['artifact_paths'])
+        self.assertEqual(arm['secrets'], {'SWR_DOCKER_CONFIG_JSON': 'ADX_SWR_PULL_CONFIG'})
+        self.assertIn('with_registry.py --docker', arm['command'])
         self.assertEqual(steps['artifact-manifest-arm64']['depends_on'], 'publish-arm64')
         publisher = steps['publish-arm64']
         self.assertEqual(publisher['depends_on'], 'platform-build-arm64')

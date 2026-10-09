@@ -322,7 +322,9 @@ steps:
     arch: arm64
   concurrency: 1
   concurrency_group: adx/package-arm64
-  command: bash .buildkite/build-arm-package.sh
+  command: python3 .buildkite/with_registry.py --docker -- bash .buildkite/build-arm-package.sh
+  secrets:
+    SWR_DOCKER_CONFIG_JSON: ADX_SWR_PULL_CONFIG
   timeout_in_minutes: 90
   artifact_paths:
   - out/buildkite/arm64/logs/**/*

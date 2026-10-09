@@ -56,6 +56,10 @@ separately from `adx/daily/` and `adx/release/`.
 The base pipeline runs `platform-build-arm64` alongside the AMD64 build. It uses
 an `os=macos, arch=arm64` worker with Docker to execute native Linux ARM64;
 Docker must be running and the worker must be able to pull the SWR build image.
+The ARM step maps the cluster's encrypted `ADX_SWR_PULL_CONFIG` secret to
+`SWR_DOCKER_CONFIG_JSON`; the registry wrapper creates an owner-only temporary
+Docker configuration and removes it when the job exits. Its access policy
+allows the `agent-dx` pipeline on `refactor`.
 `build/images/build-environment-arm64.json` pins the ARM source and ADX builder.
 For build-image maintenance on networks that cannot reach GitHub,
 `ADX_EROFS_SOURCE_ARCHIVE` can point to a downloaded EROFS source archive.
