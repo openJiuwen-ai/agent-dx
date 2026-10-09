@@ -22,7 +22,7 @@ ESTABLISHED
 recv completion
 Received rkey 29b2e addr c503088a4580 len 256 from peer
 server received sink adv
-server posted rdma read req
+server posted rdma read req 
 rdma read completion
 server received read complete
 server ping data: rdma-ping-0: ABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyzABCDEFGHIJ
@@ -33,13 +33,13 @@ Received rkey 29ad4 addr c503088a4430 len 256 from peer
 server received sink adv
 rdma write from lkey 2d6b laddr ad9214a97990 len 256
 rdma write completion
-server rdma write complete
+server rdma write complete 
 server posted go ahead
 send completion
 recv completion
 Received rkey 29b2e addr c503088a4580 len 256 from peer
 server received sink adv
-server posted rdma read req
+server posted rdma read req 
 rdma read completion
 server received read complete
 server ping data: rdma-ping-1: BCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyzABCDEFGHIJK
@@ -50,13 +50,13 @@ Received rkey 29ad4 addr c503088a4430 len 256 from peer
 server received sink adv
 rdma write from lkey 2d6b laddr ad9214a97990 len 256
 rdma write completion
-server rdma write complete
+server rdma write complete 
 server posted go ahead
 send completion
 recv completion
 Received rkey 29b2e addr c503088a4580 len 256 from peer
 server received sink adv
-server posted rdma read req
+server posted rdma read req 
 rdma read completion
 server received read complete
 server ping data: rdma-ping-2: CDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ[\]^_`abcdefghijklmnopqrstuvwxyzABCDEFGHIJKL
@@ -67,7 +67,7 @@ Received rkey 29ad4 addr c503088a4430 len 256 from peer
 server received sink adv
 rdma write from lkey 2d6b laddr ad9214a97990 len 256
 rdma write completion
-server rdma write complete
+server rdma write complete 
 server posted go ahead
 send completion
 cma_event type RDMA_CM_EVENT_DISCONNECTED cma_id 0xf6a738000ce0 (child)

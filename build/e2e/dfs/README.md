@@ -49,6 +49,16 @@ sudo python3 build/e2e/dfs/scripts/ownerfs/bind-two-node-localfile.py \
 
 ### DFS 一写多读最小入口
 
+迁移的有限功能回归可直接启动同一 Linux VM 上的 Meta 和三个独立 Node：
+
+```bash
+sudo python3 build/e2e/dfs/scripts/dfs/three_node_core.py \
+  --repo "$PWD" --binary-dir "$CARGO_TARGET_DIR/debug" \
+  --work-root /var/tmp/adx-dfs-three-node-RUN
+```
+
+目录必须全新；要求 root、ext4、`/dev/fuse`、OpenSSL、findmnt 和 FUSE 卸载工具，使用独立的 127.0.0.1–4 端口。A 连续写入三个 64KiB 版本并 fsync，B/C 同时独立读回，检查删除可见性及实际正常退出/卸载。配置为一份必需持久副本；这只证明小规模一写多读功能，不证明跨主机、三份同步副本、3FS 性能持平或崩溃恢复。完整运行和失败证据写入外部 `--work-root`，不提交原始日志。
+
 DFS 当前保留的是小规模一写多读的维护驱动，不负责启动集群生命周期，也不声明 3FS 性能持平。运行时先由部署层准备三个已挂载的 `afs-dfs` 根目录、同一候选身份文件和同一个 C I/O 探针，然后按 cohort 协议组织：
 
 ```bash

@@ -22,7 +22,7 @@
 | 范围 | 当前处理 |
 | --- | --- |
 | OwnerFs workspace bind mount | 保留实现和配置，默认 OFF；显式配置后用于当前实际试用场景 |
-| OwnerFs 远端 FUSE 访问 | 保留代码路径，目标仓二进制需要后续 Linux 运行证据 |
+| OwnerFs 远端 FUSE 访问 | 保留代码路径，目标仓二进制须有本轮限定 Linux 运行证据 |
 | DistributedFs 一写多读 | 保留核心代码与验收驱动，目标仓回归按受影响范围补测 |
 | 中心 Meta `local-file` | 作为当前可重启恢复基线 |
 | `memory` Meta | 仅用于一次性演示，重启不保留状态 |
@@ -75,13 +75,16 @@ python3 build/ci/run.py dfs
 - 维护中的验收驱动：[build/e2e/dfs/acceptance/README.md](../../build/e2e/dfs/acceptance/README.md)。
 - 迁移来源和许可证：[迁移来源索引](../migration/sources.json) 与 [DFS 快照报告](../migration/2026-10-09-dfs-snapshot.md)。
 
-## 后续验收
+## 本次验收出口
 
-本次迁移 MR 的工程验收先收敛在：
+本次 MR 必须同时完成工程集成和限定实际运行，不能将创建 MR 视为完成：
 
-1. 默认 OFF 的构建、测试和包清单验证。
-2. 显式 ON 的 DFS crates 构建、`cargo check`、Clippy、带组件包清单和部署配置渲染验证。
-3. 验收辅助程序不进入普通产品包，只由验收流程显式构建。
-4. 未跑完的 `dfs-test`、显式 ON 安装、启动、健康检查、正常停止、卸载和小规模 OwnerFs/DFS 运行回归继续登记为待验收。
+1. 默认 OFF 构建、测试和包边界。
+2. 显式 ON 构建、严格 all-features Clippy、受影响单测及真实带组件包。
+3. 从本轮 ON artifact 安装、配置、启动、健康检查、正常停止和卸载。
+4. 目标仓二进制的 OwnerFs bind ON＋远端双向访问、权限/清位/errno、local-file 有序重启恢复、direct-I/O mmap 和正常卸载/排空，以及小规模 DFS 一写多读。
+5. 验收辅助程序只按需构建，不进入普通包；版本、二进制、配置和证据可追溯。
+
+未完成的必要出口继续登记为待验收或阻塞。当前进度统一见 [迁移报告](../migration/2026-10-09-dfs-snapshot.md)，不自动继承原仓运行结论。
 
 性能目标、完整 POSIX、复杂可靠性、多 Meta、etcd、Redis 和大规模长时间测试继续后置。性能目标包括：OwnerFs workspace bind 核心 case `>=0.90x` native ext4；普通 OwnerFs 本地和远端读写吞吐 `>=1.2x` 同条件 MooseFS 且独立操作时延 `<=0.8x` 同条件 MooseFS；DFS 在同接口、三份同步持久副本条件下持平 3FS；删除要求正确性和性能对照报告，不新增硬比例。历史 DMS/AFS 证据保留原版本、原环境和原判据；新目标仓候选不自动继承。
