@@ -116,7 +116,7 @@ class VisibilityBindingTests(unittest.TestCase):
         with self.assertRaises(visibility.BindingError):
             visibility.worker_record(worker, "node", "worker")
         worker["host"] = "node-b"
-        worker["driver"] = "/Users/lzc/visibility.py"
+        worker["driver"] = "/Users/test-user/visibility.py"
         with self.assertRaises(visibility.BindingError):
             visibility.worker_record(worker, "node", "worker")
 

@@ -1,4 +1,0 @@
-Chain INPUT (policy ACCEPT 93 packets, 12547 bytes)
-    pkts      bytes target     prot opt in     out     source               destination
-       1       60 DROP       17   --  *      *       192.168.109.12       192.168.109.13       udp dpt:19566 /* afs-env-v67-only */
-       4      240 DROP       6    --  *      *       192.168.109.12       192.168.109.13       multiport dports 19566,19567 /* afs-env-v67-only */

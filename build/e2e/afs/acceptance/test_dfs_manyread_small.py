@@ -16,6 +16,10 @@ spec = importlib.util.spec_from_file_location("dfs_manyread_small", Path(__file_
 dfs_manyread_small = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(dfs_manyread_small)
 
+TEST_COMMIT = "1" * 40
+TEST_MAP = "2" * 64
+TEST_IDENTITY = dfs_manyread_small.validate_product_identity(TEST_COMMIT, TEST_MAP)
+
 
 def good_io(operation: str = "seq-read", barrier: str = "close") -> dict[str, object]:
     return {
@@ -37,10 +41,7 @@ def good_io(operation: str = "seq-read", barrier: str = "close") -> dict[str, ob
 def good_manifest() -> dict[str, object]:
     return {
         "status": "DATA_RECORDED",
-        "product_source_commit": dfs_manyread_small.PRODUCT_SOURCE_COMMIT,
-        "source6d": dfs_manyread_small.PRODUCT_SOURCE_COMMIT[:7],
-        "compiler_input_map": dfs_manyread_small.COMPILER_INPUT_MAP,
-        "map66": dfs_manyread_small.COMPILER_INPUT_MAP[:8],
+        **TEST_IDENTITY,
         "io_tool": {"sha256": dfs_manyread_small.IO_TOOL_SHA256},
         "payload": {
             "relative_dir": "dfs-manyread-small-test",
@@ -84,10 +85,7 @@ def good_delete_manifest() -> dict[str, object]:
     return {
         "role": "delete-writer",
         "status": "DATA_RECORDED",
-        "product_source_commit": dfs_manyread_small.PRODUCT_SOURCE_COMMIT,
-        "source6d": dfs_manyread_small.PRODUCT_SOURCE_COMMIT[:7],
-        "compiler_input_map": dfs_manyread_small.COMPILER_INPUT_MAP,
-        "map66": dfs_manyread_small.COMPILER_INPUT_MAP[:8],
+        **TEST_IDENTITY,
         "fs": {"dfs_root": {"path": DELETE_DFS_ROOT, "device": 1, "inode": 2, "mode": 0o755, "uid": 0, "gid": 0}},
         "mount": {"source": "afs-dfs", "target": DELETE_DFS_ROOT, "fstype": "fuse", "options": "rw", "id": "10"},
         "run_id": DELETE_RUN_ID,
@@ -100,22 +98,36 @@ def good_delete_manifest() -> dict[str, object]:
 class DfsManyReadSmallGuardTests(unittest.TestCase):
     def test_missing_or_bad_manifest_is_rejected(self) -> None:
         with self.assertRaises(ValueError):
-            dfs_manyread_small.validate_manifest_shape({})
+            dfs_manyread_small.validate_manifest_shape({}, TEST_IDENTITY)
         bad = good_manifest()
         bad["status"] = "FAIL"
         with self.assertRaises(ValueError):
-            dfs_manyread_small.validate_manifest_shape(bad)
+            dfs_manyread_small.validate_manifest_shape(bad, TEST_IDENTITY)
 
     def test_manifest_shape_and_sha_are_checked(self) -> None:
-        dfs_manyread_small.validate_manifest_shape(good_manifest())
+        dfs_manyread_small.validate_manifest_shape(good_manifest(), TEST_IDENTITY)
         wrong_shape = good_manifest()
         wrong_shape["payload"]["bytes"] = 1
         with self.assertRaises(ValueError):
-            dfs_manyread_small.validate_manifest_shape(wrong_shape)
+            dfs_manyread_small.validate_manifest_shape(wrong_shape, TEST_IDENTITY)
         wrong_sha = good_manifest()
         wrong_sha["payload"]["sha256"] = "0" * 64
         with self.assertRaises(ValueError):
-            dfs_manyread_small.validate_manifest_shape(wrong_sha)
+            dfs_manyread_small.validate_manifest_shape(wrong_sha, TEST_IDENTITY)
+
+    def test_product_identity_is_caller_supplied_and_strict(self) -> None:
+        self.assertEqual(TEST_IDENTITY["identity_source"], "caller supplied identity")
+        self.assertNotIn("source" + "6d", good_manifest())
+        self.assertNotIn("map" + "66", good_manifest())
+        with self.assertRaises(ValueError):
+            dfs_manyread_small.validate_product_identity("g" * 40, TEST_MAP)
+        with self.assertRaises(ValueError):
+            dfs_manyread_small.validate_product_identity(TEST_COMMIT, "z" * 64)
+        with self.assertRaises(ValueError):
+            dfs_manyread_small.validate_manifest_shape(
+                good_manifest(),
+                dfs_manyread_small.validate_product_identity("3" * 40, TEST_MAP),
+            )
 
     def test_io_result_rejects_failed_c_or_short_read(self) -> None:
         dfs_manyread_small.validate_io_result(good_io(), "seq-read", "close")
@@ -150,10 +162,22 @@ class DfsManyReadSmallGuardTests(unittest.TestCase):
                 dfs_root = "/missing-dfs"
                 io_tool = "/missing-io"
                 output = str(out)
+                product_source_commit = TEST_COMMIT
+                compiler_input_map = TEST_MAP
 
             result = dfs_manyread_small.writer(Args())
             self.assertEqual(result["status"], "BLOCKED")
             self.assertEqual(sentinel.read_text(encoding="utf-8"), "sentinel")
+
+    def test_missing_product_identity_is_structured_blocked(self) -> None:
+        class Args:
+            dfs_root = "/missing-dfs"
+            io_tool = "/missing-io"
+            output = "/tmp/not-created"
+
+        result = dfs_manyread_small.writer(Args())
+        self.assertEqual(result["status"], "BLOCKED")
+        self.assertIn("product identity requires", result["error"])
 
     def test_foreign_fuse_mount_is_rejected(self) -> None:
         with self.assertRaises(ValueError):
@@ -190,20 +214,20 @@ class DfsManyReadSmallGuardTests(unittest.TestCase):
         self.assertTrue(callable(helper.timed_unlink))
 
     def test_delete_manifest_shape_and_helper_identity_are_checked(self) -> None:
-        rounds = dfs_manyread_small.validate_delete_manifest(good_delete_manifest())
+        rounds = dfs_manyread_small.validate_delete_manifest(good_delete_manifest(), TEST_IDENTITY)
         self.assertEqual(len(rounds), dfs_manyread_small.WARMUP_ROUNDS + dfs_manyread_small.MEASUREMENT_ROUNDS)
         bad = good_delete_manifest()
         bad["owner_delete_helper"] = {"sha256": "0" * 64}
         with self.assertRaises(ValueError):
-            dfs_manyread_small.validate_delete_manifest(bad)
+            dfs_manyread_small.validate_delete_manifest(bad, TEST_IDENTITY)
         bad_shape = good_delete_manifest()
         bad_shape["delete_shape"] = {"files": 1}
         with self.assertRaises(ValueError):
-            dfs_manyread_small.validate_delete_manifest(bad_shape)
+            dfs_manyread_small.validate_delete_manifest(bad_shape, TEST_IDENTITY)
         bad_rounds = good_delete_manifest()
         bad_rounds["delete_rounds"] = bad_rounds["delete_rounds"][:-1]
         with self.assertRaises(ValueError):
-            dfs_manyread_small.validate_delete_manifest(bad_rounds)
+            dfs_manyread_small.validate_delete_manifest(bad_rounds, TEST_IDENTITY)
 
     def test_delete_manifest_binds_run_id_exact_names_directories_and_mount(self) -> None:
         cases = []
@@ -230,7 +254,7 @@ class DfsManyReadSmallGuardTests(unittest.TestCase):
         cases.append(wrong_mount_source)
         for manifest in cases:
             with self.subTest(manifest=manifest), self.assertRaises(ValueError):
-                dfs_manyread_small.validate_delete_manifest(manifest)
+                dfs_manyread_small.validate_delete_manifest(manifest, TEST_IDENTITY)
 
     def test_delete_manifest_rejects_corrupt_content_failed_unlink_cleanup_and_traversal(self) -> None:
         for mutated in (
@@ -242,13 +266,13 @@ class DfsManyReadSmallGuardTests(unittest.TestCase):
             manifest = good_delete_manifest()
             manifest["delete_rounds"][0] = {**manifest["delete_rounds"][0], **mutated}
             with self.subTest(mutated=mutated), self.assertRaises(ValueError):
-                dfs_manyread_small.validate_delete_manifest(manifest)
+                dfs_manyread_small.validate_delete_manifest(manifest, TEST_IDENTITY)
 
     def test_deleted_path_checker_requires_actual_lstat_enoent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             manifest = good_delete_manifest()
-            rounds = dfs_manyread_small.validate_delete_manifest(manifest)
+            rounds = dfs_manyread_small.validate_delete_manifest(manifest, TEST_IDENTITY)
             self.assertEqual(dfs_manyread_small.check_deleted_paths(root, rounds)["status"], "PASS")
             present_dir = root / rounds[0]["sample_name"]
             present_dir.mkdir()
@@ -283,6 +307,8 @@ class DfsManyReadSmallGuardTests(unittest.TestCase):
             class Args:
                 dfs_root = "/missing-dfs"
                 output = str(out)
+                product_source_commit = TEST_COMMIT
+                compiler_input_map = TEST_MAP
 
             result = dfs_manyread_small.delete_writer(Args())
             self.assertEqual(result["status"], "BLOCKED")

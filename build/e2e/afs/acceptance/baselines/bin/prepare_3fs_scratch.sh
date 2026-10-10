@@ -5,6 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=common.sh
 source "$SCRIPT_DIR/common.sh"
 
+: "${AFS_BASELINE_LIMA_INSTANCE:?set AFS_BASELINE_LIMA_INSTANCE to an existing Linux builder}"
 : "${REF_3FS:?set REF_3FS to the fixed read-only 3FS checkout}"
 : "${EVIDENCE_DIR:?set EVIDENCE_DIR to an external run directory}"
 : "${AFS_BASELINE_GUEST_ROOT:?set AFS_BASELINE_GUEST_ROOT to the Linux scratch directory}"

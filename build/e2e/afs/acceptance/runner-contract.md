@@ -58,32 +58,28 @@ digest. The default contract path resolves to `docs/testing/afs.md` in the Agent
 
 ## Environment preparation and qualification
 
-Full runs additionally require `lock.environment_evidence` with a relative
-`path` and `sha256`. `environment.py` reads and hashes that bundle and its raw
-artifacts, then evaluates mandatory environment predicates independently of
-declared `FROZEN/PASS` fields. Missing, changed or unsupported proof blocks full
-dispatch. A generic JSON record saying PASS is not environment qualification.
+Full runs require `lock.environment_evidence` with a relative `path` and SHA-256.
+`environment.py` checks the bundle's path containment, hash and JSON object
+shape, then explicitly returns `BLOCKED`: a portable full environment verifier
+is not implemented. A self-reported PASS or matching hash cannot grant full
+qualification. Smoke dispatch remains available with its own driver checks.
 
-Optional `bundle.network` references relative probe, command and guest artifact
-paths. Each consumed artifact is hash-bound by `artifact_references`. The
-network evaluator independently checks the original exchange identities,
-TLS errors, precise directed fault and restoration, rather than importing an
-audit summary. A network preparation PASS does not establish independent
-watchdog recovery, product authorization, verbs or the remaining ENV predicates.
+The former evaluator was tied to one historical lab and also could not qualify
+full acceptance. Its implementation, observations and tightly coupled regression
+inputs are archived outside this source tree. Parameterized network/TLS/verbs
+probes and their synthetic unit tests remain maintained here; their success is
+not proof of the current environment or product qualification.
 
-The preparation evaluator is a separate Linux CLI. It does not modify the
-lock or formal cases. It reports observed resource/storage facts and outstanding
-checks. Fresh live environment qualification, backend restart, verbs,
-reference-suite, comparator mount and frozen-input semantic verification is still required;
-the current partial evaluator cannot qualify full acceptance. A future frozen
-verifier must also check live identities instead of treating old inventories as
-current observations.
+For a diagnostic report (exit 2, immutable output):
 
-Smoke remains a development result. Missing full environment prerequisites do
-not prevent a registered local smoke driver from reporting its actual scoped
-result; `full_release_gate_pass` remains false. Runner protocol unit tests that
-mock environment validation are explicitly isolated dispatcher tests, not ENV
-proof.
+```bash
+python3 build/e2e/afs/acceptance/environment.py \
+  --lock /path/to/run/acceptance.lock.json --output /path/to/run/environment.json
+```
+
+Future full qualification must verify live environment, suite, reference,
+backend, source and binary identities against pre-fixed conditions. It must
+not import historical inventories or weaken this failure boundary.
 
 ## Driver proof
 

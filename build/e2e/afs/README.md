@@ -22,7 +22,7 @@
 
 - 本机 Lima YAML、IP/MAC 租约、实际运行 lock 和旧阶段专用驱动不作为仓内公共配置；原件、失败记录和路径/校验和索引在开发者源码树外归档，并可从整改前 Git 版本追溯。
 - `runner.py --list` 不需要环境；执行必须显式提供 `--lock /path/to/run/acceptance.lock.json`。无机器身份的 `acceptance/acceptance.lock.example.json` 只说明结构，不能直接形成正式 PASS。
-- 固定回归夹具只保留一份相同内容，以映射在测试临时目录恢复原路径与字节；不向夹具加入每轮运行产物。
+- 旧实验室原始观测和紧耦合判定器已归档仓外；保留底层参数化探针及合成负例。通用完整 ENV verifier 未实现，full 明确 BLOCKED，不因移出历史工具放行。
 - 跨节点锁、锁取消、bind/native↔FUSE 锁域及 RDMA 专题工具保留为后置研究/回归资产，不是本次迁移的前置，也不证明这些能力受支持。本机 ext4 锁成功不能代替分布式锁验收。
 - 旧 W1/W2/S5 批次诊断及旧并发判定器退出当前入口。维护中的 `owner_remote_small.py`、`owner_remote_write_small.py` 等测量工具继续保留；工具输出不自动满足吞吐与独立操作时延双目标。
 
@@ -90,7 +90,7 @@ python3 build/e2e/afs/acceptance/dfs_multinode_small.py coordinator \
   --output /path/to/evidence/ctl-read
 ```
 
-实际多节点运行由外层 harness 连接三个 worker 的 stdin/stdout。若只需单 writer + 两 reader 的基础同步读辅助，可使用 `dfs_manyread_small.py writer/reader/coordinator`；两者都只产生功能和测量证据，不自动给出性能达标结论。
+实际多节点运行由外层 harness 连接三个 worker 的 stdin/stdout。若只需单 writer + 两 reader 的基础同步读辅助，可使用 `dfs_manyread_small.py writer/reader/coordinator`（writer／reader 必须显式传入本轮 `--product-source-commit` 和 `--compiler-input-map`，两端一致）；两者都只产生功能和测量证据，不自动给出性能达标结论。
 
 ### 测试探针边界
 
@@ -101,11 +101,10 @@ python3 build/e2e/afs/acceptance/dfs_multinode_small.py coordinator \
 | 来源路径 | 目标路径 | 处理 | 原因与影响 |
 | --- | --- | --- | --- |
 | `tests/acceptance/runner.py`、`drivers/`、`probes/`、`suites/`、`cases.json` | `build/e2e/afs/acceptance/` | 保留 | 当前标准验收和小规模回归仍读取这些入口。路径定位已调整为目标仓根目录。 |
-| `tests/acceptance/fixtures/` | `build/e2e/afs/acceptance/fixtures/` | 保留 | 网络/verbs 固定回归输入去重保存；测试临时恢复原目录和 SHA-256，完整历史原件在仓外。 |
 | `tests/ownerfs_acceptance.py` | `build/e2e/afs/ownerfs_acceptance.py` | 保留 | OwnerFs 远端/三节点验收入口，proto 默认路径已改为 `afs/common/protocol/proto`。 |
 | `scripts/dfs/r1_e2e.py` | `build/e2e/afs/scripts/dfs/r1_e2e.py` | 保留 | DFS R=1 小规模 E2E 驱动。 |
 | `scripts/ownerfs/native-workspace-control.py` | `build/e2e/afs/scripts/ownerfs/` | 保留 | OwnerFs bind/workspace 场景的测试控制工具；旧 W1/W2/S5 诊断入口已归档。 |
-| `local-archive/fuser-investigation/verify_official_runtime.py` 的 bounded 两节点 local-file bind ON 断言 | `build/e2e/afs/scripts/ownerfs/bind-two-node-localfile.py` | 迁移并改写 | 仅保留运行断言和证据输出；旧 `scripts/deploy/afs-trial-config`/包身份依赖被替换为目标仓二进制、脚本内临时配置和 mTLS 材料生成。 |
+| 来源快照的限定两节点 local-file bind ON 断言 | `build/e2e/afs/scripts/ownerfs/bind-two-node-localfile.py` | 迁移并改写 | 仅保留运行断言和证据输出；旧 `scripts/deploy/afs-trial-config`/包身份依赖被替换为目标仓二进制、脚本内临时配置和 mTLS 材料生成。 |
 | `scripts/check-rdma-cancellation.py` | `build/e2e/afs/scripts/check-rdma-cancellation.py` | 保留 | RDMA 取消路径辅助检查。 |
 | 旧 `tests/acceptance/*-linux.py` 中依赖源仓 release 包、`scripts/deploy/afs-processctl`、旧 package identity 的一次性驱动 | 未迁入 | 目标仓改由 `build/release`、部署适配和 `adxctl` 交付；这些脚本在源仓本地归档保留历史证据，不作为目标仓可运行入口。 |
 | 源仓 `.github/`、`.codex/`、`.omx/`、`development/`、历史日志、checkpoint、压缩包、VM 镜像 | 未迁入 | 过程资产不进入目标代码仓，避免负担和证据身份混淆。 |

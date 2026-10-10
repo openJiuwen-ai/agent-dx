@@ -1,16 +1,15 @@
 # AFS 验收工具
 
-本目录保留维护中的验收 runner、驱动、探针、套件绑定和必要夹具。它是工程测试资产，不是历史证据归档。
+本目录保留维护中的验收 runner、驱动、探针、套件绑定和必要测试。它是工程测试资产，不是历史证据归档。
 
 ## 目录
 
 - `cases.json`：正式 case ID、适用范围、smoke/full 边界和 driver 注册。
 - `acceptance.lock.example.json`：无机器状态的锁结构示例。实际环境、套件、参考系统、源码、二进制和 runner 身份锁保存在仓外，通过 `--lock` 显式传入；`PREPARING` 状态不能通过完整发布门禁。
 - `runner.py`：调度注册 driver，并核对结构化结果和矩阵计数。
-- `environment.py`：评估 hash 绑定的环境准备观测。
+- `environment.py`：检查本轮环境输入的路径、SHA 和格式；可移植完整 ENV verifier 尚未实现，full 始终明确 BLOCKED。
 - `drivers/`：标准套件、健康、计数、目标身份、挂载隔离和可见性等 driver。
 - `probes/`：OwnerFs、DFS、环境和基线辅助探针。
-- `fixtures/`：当前回归测试实际读取的小型固定夹具。相同内容去重保存，测试恢复原路径后核对 SHA-256；保留 hash 绑定的源码输入和 receipt/log 片段；不保留 TLS 私钥、VM 数据或大型过程证据。
 
 ## 使用边界
 
@@ -43,6 +42,6 @@ python3 build/e2e/afs/acceptance/runner.py --case FUN-01 --profile smoke \
   --lock /path/to/run/acceptance.lock.json --results-dir /path/to/run/results
 ```
 
-`/path/to/run` 应先替换为已创建的仓外运行目录；复制示例不等于环境准入。按实际观测补齐 lock 的身份和环境证明，完整门禁仍要求 FROZEN、校验和一致及语义资格检查。`--list` 只读取 case，不执行 driver；缺少 `--lock` 的执行在创建结果目录前拒绝。
+`/path/to/run` 应先替换为已创建的仓外运行目录；复制示例不等于环境准入。按实际观测补齐 lock 的身份和环境证明，完整门禁要求 FROZEN、校验和一致及真实语义资格检查；当前通用完整 ENV verifier 未实现，因此即便输入自报 PASS 也不放行 full。旧固定实验室判定器和原始观测已归档仓外，底层参数化探针及合成负例保留。`--list` 只读取 case，不执行 driver；缺少 `--lock` 的执行在创建结果目录前拒绝。
 
 本机 VM 创建配置、网络租约和旧阶段启动脚本不再随工具分发。环境由现有部署层准备，运行条件以本次 lock 记录，不复用个人路径或历史 VM 状态。跨节点锁/RDMA 等后置专题的工具回归不代表当前产品支持这些功能。

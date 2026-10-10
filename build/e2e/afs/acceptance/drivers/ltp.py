@@ -40,7 +40,7 @@ except ModuleNotFoundError:
 
 LTP_REV = "3a64d78f58bdceba93ed321e91215fb969a047ed"
 LTP_TAG = "20260529"
-DEFAULT_REFERENCE_ROOT = Path("/mnt/lima-afsctlstate/afs-acceptance/suites-reference")
+DEFAULT_REFERENCE_ROOT = Path("/var/lib/afs-acceptance/suites-reference")
 DEFAULT_SUITE_ROOT = DEFAULT_REFERENCE_ROOT / "src" / "ltp"
 DEFAULT_INSTALL_ROOT = Path("/opt/afs-tools/ltp-install")
 DEFAULT_EXPANDED_TSV = DEFAULT_REFERENCE_ROOT / "evidence" / "inventory" / "ltp-filesystem-expanded.tsv"

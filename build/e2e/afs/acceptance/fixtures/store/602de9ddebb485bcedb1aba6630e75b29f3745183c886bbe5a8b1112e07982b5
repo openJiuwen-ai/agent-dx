@@ -1,6 +1,0 @@
-{
-  "run_id": "dab656d8-8d0c-4f50-b58b-c5eb675ad9b3",
-  "returncode": 255,
-  "report": "/tmp/afs-verbs-v69/negative-no-listener/dab656d8-8d0c-4f50-b58b-c5eb675ad9b3-client.json",
-  "scope": "standalone absent-listener failure; not product fallback or required-mode proof"
-}

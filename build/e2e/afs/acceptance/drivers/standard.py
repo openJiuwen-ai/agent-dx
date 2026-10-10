@@ -30,7 +30,7 @@ from typing import Any
 from target_identity import mount_record, remote_target_checks, target_checks
 
 PJDFS_REV = "d25636a227606f8960e5179741d8f4ad7030ef41"
-DEFAULT_SUITE_ROOT = Path("/mnt/lima-afsctlstate/afs-acceptance/suites-reference/src/pjdfstest")
+DEFAULT_SUITE_ROOT = Path("/var/lib/afs-acceptance/suites-reference/src/pjdfstest")
 SMOKE_TESTS = ["open/00.t", "mkdir/00.t", "rename/00.t", "mknod/00.t"]
 
 

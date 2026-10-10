@@ -18,11 +18,11 @@
         "host": "afs-ctl",
         "mount": "/mnt/afs-ownerfs-a",
         "python": "/usr/bin/python3",
-        "ssh_config": "/home/afs/.ssh/config",
+        "ssh_config": "/etc/afs-acceptance/ssh_config",
         "transport": "ssh",
         "worker_run_dir": "/var/tmp/afs-acceptance/fun-ctl"
       },
-      "expected_meta_endpoint": "10.0.0.10:50051",
+      "expected_meta_endpoint": "192.0.2.10:50051",
       "fun02_targets": [
         {
           "base_dir": "/mnt/afs-ownerfs-a/home-a",
@@ -61,7 +61,7 @@
         "host": "afs-b",
         "mount": "/mnt/afs-ownerfs-a-remote",
         "python": "/usr/bin/python3",
-        "ssh_config": "/home/afs/.ssh/config",
+        "ssh_config": "/etc/afs-acceptance/ssh_config",
         "transport": "ssh",
         "worker_run_dir": "/var/tmp/afs-acceptance/fun-b"
       },
@@ -81,7 +81,7 @@
         "host": "afs-a",
         "mount": "/mnt/afs-ownerfs-a",
         "python": "/usr/bin/python3",
-        "ssh_config": "/home/afs/.ssh/config",
+        "ssh_config": "/etc/afs-acceptance/ssh_config",
         "transport": "ssh",
         "worker_run_dir": "/var/tmp/afs-acceptance/fun-a"
       }
@@ -104,11 +104,11 @@
         "host": "afs-ctl",
         "mount": "/mnt/afs-ownerfs-a",
         "python": "/usr/bin/python3",
-        "ssh_config": "/home/afs/.ssh/config",
+        "ssh_config": "/etc/afs-acceptance/ssh_config",
         "transport": "ssh",
         "worker_run_dir": "/var/tmp/afs-acceptance/fun-ctl"
       },
-      "expected_meta_endpoint": "10.0.0.10:50051",
+      "expected_meta_endpoint": "192.0.2.10:50051",
       "matrix": {
         "backend": "OwnerFs",
         "meta": "etcd",
@@ -131,7 +131,7 @@
         "host": "afs-b",
         "mount": "/mnt/afs-ownerfs-a-remote",
         "python": "/usr/bin/python3",
-        "ssh_config": "/home/afs/.ssh/config",
+        "ssh_config": "/etc/afs-acceptance/ssh_config",
         "transport": "ssh",
         "worker_run_dir": "/var/tmp/afs-acceptance/fun-b"
       },
@@ -152,7 +152,7 @@
         "host": "afs-a",
         "mount": "/mnt/afs-ownerfs-a",
         "python": "/usr/bin/python3",
-        "ssh_config": "/home/afs/.ssh/config",
+        "ssh_config": "/etc/afs-acceptance/ssh_config",
         "transport": "ssh",
         "worker_run_dir": "/var/tmp/afs-acceptance/fun-a"
       }
@@ -175,11 +175,11 @@
         "host": "afs-ctl",
         "mount": "/mnt/afs-ownerfs-a",
         "python": "/usr/bin/python3",
-        "ssh_config": "/home/afs/.ssh/config",
+        "ssh_config": "/etc/afs-acceptance/ssh_config",
         "transport": "ssh",
         "worker_run_dir": "/var/tmp/afs-acceptance/fun-ctl"
       },
-      "expected_meta_endpoint": "10.0.0.10:50051",
+      "expected_meta_endpoint": "192.0.2.10:50051",
       "matrix": {
         "backend": "OwnerFs",
         "meta": "etcd",
@@ -203,7 +203,7 @@
         "host": "afs-b",
         "mount": "/mnt/afs-ownerfs-a-remote",
         "python": "/usr/bin/python3",
-        "ssh_config": "/home/afs/.ssh/config",
+        "ssh_config": "/etc/afs-acceptance/ssh_config",
         "transport": "ssh",
         "worker_run_dir": "/var/tmp/afs-acceptance/fun-b"
       },
@@ -224,7 +224,7 @@
         "host": "afs-a",
         "mount": "/mnt/afs-ownerfs-a",
         "python": "/usr/bin/python3",
-        "ssh_config": "/home/afs/.ssh/config",
+        "ssh_config": "/etc/afs-acceptance/ssh_config",
         "transport": "ssh",
         "worker_run_dir": "/var/tmp/afs-acceptance/fun-a"
       }
