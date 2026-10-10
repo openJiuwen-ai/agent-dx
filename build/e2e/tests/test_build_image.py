@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -153,6 +154,147 @@ class BuildImageContractTests(unittest.TestCase):
         self.assertIn('build.env("ADX_BUILD_IMAGE_SYNC_ONLY") == "1"', maintenance)
         self.assertIn('ADX_BUILD_IMAGE_SYNC_ONLY', selector)
         self.assertNotIn('key: build-image-sync', package)
+
+    def test_arm_build_image_sync_uses_native_worker_without_changing_amd64(self):
+        pipeline = yaml.safe_load((ROOT / '.buildkite/pipeline-maintenance.yml').read_text())
+        steps = {step['key']: step for step in pipeline['steps']}
+        amd64 = steps['build-image-sync']
+        arm64 = steps['build-image-sync-arm64']
+
+        self.assertEqual(amd64['agents'], {'queue': 'default', 'os': 'linux', 'arch': 'amd64'})
+        self.assertIn('ADX_BUILD_IMAGE_CONFIG") != "build/images/build-environment-arm64.json"', amd64['if'])
+        self.assertIn('kubernetes', amd64['plugins'][0])
+
+        self.assertEqual(arm64['agents'], {'queue': 'default', 'os': 'macos', 'arch': 'arm64'})
+        self.assertEqual(arm64['concurrency_group'], 'adx/native-arm64')
+        self.assertEqual(arm64['secrets'], {'SWR_DOCKER_CONFIG_JSON': 'ADX_SWR_PULL_CONFIG'})
+        self.assertNotIn('plugins', arm64)
+        self.assertIn('ADX_BUILD_IMAGE_CONFIG") == "build/images/build-environment-arm64.json"', arm64['if'])
+        self.assertEqual(arm64['command'], amd64['command'])
+
+    def test_sync_build_image_is_portable_on_native_arm_worker_hosts(self):
+        self.assertNotIn('readarray', self.sync)
+        self.assertNotIn('sha256sum', self.sync)
+        self.assertIn('non-Linux build image maintenance requires a native Docker service', self.sync)
+
+    def test_sync_build_image_runs_with_stub_docker_and_without_gnu_sha256sum(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / '.buildkite').mkdir()
+            shutil.copy(ROOT / '.buildkite/sync-build-image.sh', root / '.buildkite/sync-build-image.sh')
+            (root / 'build/images').mkdir(parents=True)
+            (root / 'build/images/build-environment-arm64.json').write_text(json.dumps({
+                'source_image': 'registry.example/base@sha256:' + 'a' * 64,
+                'repository': 'registry.example/adx-build',
+                'platform': 'linux/arm64',
+            }))
+            (root / 'build/images/Dockerfile.ci').write_text('FROM scratch\n')
+            commands = root / 'commands'
+            commands.mkdir()
+            published = 'registry.example/adx-build@sha256:' + 'b' * 64
+            docker = commands / 'docker'
+            docker.write_text(f'''#!/bin/bash
+set -euo pipefail
+printf '%s\\n' "$*" >> docker.log
+case "$1" in
+  info|pull|build|push|tag|run) exit 0 ;;
+  image)
+    if [[ "$2" == inspect ]]; then
+      printf '%s\\n' '{published}'
+      exit 0
+    fi
+    if [[ "$2" == rm ]]; then
+      exit 0
+    fi
+    ;;
+esac
+exit 17
+''')
+            sha256sum = commands / 'sha256sum'
+            sha256sum.write_text('#!/bin/sh\necho sha256sum must not be called >&2\nexit 99\n')
+            for file in (docker, sha256sum):
+                file.chmod(0o755)
+            environment = dict(os.environ, PATH=str(commands) + os.pathsep + os.environ['PATH'],
+                               BUILDKITE_COMMIT='c' * 40,
+                               ADX_BUILD_IMAGE_CONFIG='build/images/build-environment-arm64.json')
+            bash = Path('/bin/bash') if Path('/bin/bash').exists() else Path(shutil.which('bash'))
+            result = subprocess.run([str(bash), '.buildkite/sync-build-image.sh'],
+                                    cwd=root, env=environment, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            result_json = json.loads((root / 'out/buildkite/build-image/result.json').read_text())
+            self.assertEqual(result_json['platform'], 'linux/arm64')
+            self.assertEqual(result_json['reference'], published)
+            docker_log = (root / 'docker.log').read_text()
+            self.assertIn('--platform linux/arm64', docker_log)
+            self.assertIn('GO_SHA256=b00b694903d126c588c378e72d3545549935d3982635ba3f7a964c9fa23fe3b9', docker_log)
+
+    def test_sync_build_image_stops_before_publish_when_verifier_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / '.buildkite').mkdir()
+            shutil.copy(ROOT / '.buildkite/sync-build-image.sh', root / '.buildkite/sync-build-image.sh')
+            (root / 'build/images').mkdir(parents=True)
+            (root / 'build/images/build-environment-arm64.json').write_text(json.dumps({
+                'source_image': 'registry.example/base@sha256:' + 'a' * 64,
+                'repository': 'registry.example/adx-build',
+                'platform': 'linux/arm64',
+            }))
+            (root / 'build/images/Dockerfile.ci').write_text('FROM scratch\n')
+            commands = root / 'commands'
+            commands.mkdir()
+            docker = commands / 'docker'
+            docker.write_text('''#!/bin/bash
+set -euo pipefail
+printf '%s\\n' "$*" >> docker.log
+case "$1" in
+  info|pull|build) exit 0 ;;
+  run) exit 23 ;;
+  push) echo unexpected-push >&2; exit 99 ;;
+esac
+exit 17
+''')
+            docker.chmod(0o755)
+            environment = dict(os.environ, PATH=str(commands) + os.pathsep + os.environ['PATH'],
+                               BUILDKITE_COMMIT='c' * 40,
+                               ADX_BUILD_IMAGE_CONFIG='build/images/build-environment-arm64.json')
+            bash = Path('/bin/bash') if Path('/bin/bash').exists() else Path(shutil.which('bash'))
+            result = subprocess.run([str(bash), '.buildkite/sync-build-image.sh'],
+                                    cwd=root, env=environment, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 23, result.stderr)
+            self.assertFalse((root / 'out/buildkite/build-image/result.json').exists())
+            docker_log = (root / 'docker.log').read_text()
+            self.assertIn('run --rm --platform linux/arm64', docker_log)
+            self.assertNotIn('push', docker_log)
+
+    def test_sync_build_image_rejects_bad_config_before_building(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / '.buildkite').mkdir()
+            shutil.copy(ROOT / '.buildkite/sync-build-image.sh', root / '.buildkite/sync-build-image.sh')
+            (root / 'build/images').mkdir(parents=True)
+            (root / 'build/images/build-environment-arm64.json').write_text('{bad-json')
+            (root / 'build/images/Dockerfile.ci').write_text('FROM scratch\n')
+            commands = root / 'commands'
+            commands.mkdir()
+            docker = commands / 'docker'
+            docker.write_text('''#!/bin/bash
+set -euo pipefail
+printf '%s\\n' "$*" >> docker.log
+case "$1" in
+  info) exit 0 ;;
+  *) echo unexpected-docker-command >&2; exit 99 ;;
+esac
+''')
+            docker.chmod(0o755)
+            environment = dict(os.environ, PATH=str(commands) + os.pathsep + os.environ['PATH'],
+                               BUILDKITE_COMMIT='c' * 40,
+                               ADX_BUILD_IMAGE_CONFIG='build/images/build-environment-arm64.json')
+            bash = Path('/bin/bash') if Path('/bin/bash').exists() else Path(shutil.which('bash'))
+            result = subprocess.run([str(bash), '.buildkite/sync-build-image.sh'],
+                                    cwd=root, env=environment, capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse((root / 'out/buildkite/build-image/result.json').exists())
+            self.assertEqual((root / 'docker.log').read_text(), 'info\n')
 
 
 if __name__ == '__main__':

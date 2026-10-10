@@ -86,7 +86,8 @@ Docker must be running and the worker must be able to pull the SWR build image.
 The ARM step maps the cluster's encrypted `ADX_SWR_PULL_CONFIG` secret to
 `SWR_DOCKER_CONFIG_JSON`; the registry wrapper creates an owner-only temporary
 Docker configuration and removes it when the job exits. Its access policy
-allows the `agent-dx` pipeline on `refactor`.
+must allow the exact pipeline and build branch; allowing `refactor` alone does
+not authorize a feature branch. Never pass the secret value in build parameters.
 `build/images/build-environment-arm64.json` pins the ARM source and ADX builder.
 For build-image maintenance on networks that cannot reach GitHub,
 `ADX_EROFS_SOURCE_ARCHIVE` can point to a downloaded EROFS source archive.
@@ -441,7 +442,14 @@ time. Set `ADX_BUILD_IMAGE_SYNC_ONLY=1` on the base pipeline to dispatch the
 maintenance job that builds the Ubuntu 20.04 recipe, pushes the immutable image,
 verifies it by digest and records `out/buildkite/build-image/result.json`. A
 mutable `buildcache` tag may seed BuildKit cache only; product jobs always use
-the recorded digest.
+the recorded digest. Set
+`ADX_BUILD_IMAGE_CONFIG=build/images/build-environment-arm64.json` for ARM image
+maintenance on the existing native ARM worker, using the same recipe and
+verification script. The host uses Docker; build commands execute in Linux ARM64.
+The default AMD64 maintenance route remains unchanged. ARM maintenance shares
+the `adx/native-arm64` concurrency slot and registry-secret handling with ARM
+package jobs. Update the pinned ARM `ci_image` only after the pushed digest has
+passed pull-back verification.
 
 `.buildkite/setup-cargo.sh` restores the image's rsproxy sparse source settings in
 the persistent ADX Cargo home, including Git dependency caching.
