@@ -600,15 +600,28 @@ mod tests {
         assert!(read_owned(&link, owner).is_err());
         assert!(hash_valid(&"a".repeat(64)));
         assert!(!hash_valid(&"A".repeat(64)));
-        // Hash the caller process, never /proc/self/exe inside sha256sum's child.
-        assert_eq!(
-            sha256_file(Path::new(&format!("/proc/{}/exe", std::process::id()))).unwrap(),
-            sha256_file(&std::env::current_exe().unwrap()).unwrap()
-        );
-        assert_ne!(
-            sha256_file(&std::env::current_exe().unwrap()).unwrap(),
-            sha256_file(Path::new("/usr/bin/sha256sum")).unwrap()
-        );
+        // Use a small real process so the two-second production hash deadline
+        // does not depend on the size of this debug test executable. An explicit
+        // /proc/<pid>/exe must hash that process, not sha256sum's /proc/self/exe.
+        let executable = Path::new("/usr/bin/sleep");
+        let mut caller = Command::new(executable)
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let actual = sha256_file(Path::new(&format!("/proc/{}/exe", caller.id())));
+        let expected = sha256_file(executable);
+        let helper = sha256_file(Path::new("/usr/bin/sha256sum"));
+        // Reap the fixture before asserting, including hash failure paths.
+        let stopped = caller.kill();
+        let reaped = caller.wait();
+        stopped.unwrap();
+        reaped.unwrap();
+        let actual = actual.unwrap();
+        assert_eq!(actual, expected.unwrap());
+        assert_ne!(actual, helper.unwrap());
     }
 
     #[test]
