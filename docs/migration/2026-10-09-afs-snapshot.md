@@ -195,3 +195,14 @@ Linux精确受测tree `b9ae4c47ca64142839ea5c0649c7138a90187117`：20模块284�
 #137实际清单均绑定`8be97c1`且`with_afs=true`：build-manifest SHA-256 `b9f099a55d85950db2c9bc491d5f5bfb10a003f422134f29be3eac19135f46b8`，release-manifest SHA-256 `1f5dbd98f4a2aa54d90dc0caf418ae27a1433a58abd3180c16e69d268c6c5c0a`；包含`bin/afs-meta`／`bin/afs-node`，文件清单不含测试探针。#137 AFS库原始日志SHA-256 `63abdfb71162dac66df1a54e3494d7767fc12725ab8455f6e57fbe4d47c87cb5`。紧凑清单、实际L0结果、镜像维护记录及失败原件由`EV-BUILDKITE-X86`仓外索引定位。
 
 ARM按用户选择暂缓（原拉取凭据拒绝记录保留），不能算通过；OBS／PyPI最终发布关闭，步骤名称Publish通过不表示执行了外部产品发布。公共L0不等于重新验证bind ON文件系统核心场景或性能，原bfd876安装运行证据继续绑定原包；阶段一历史8/8保持关闭。随后提交仅同步本报告与Buildkite使用说明，不把文档提交自动宣称为新的完整运行候选。
+
+
+### Full11 交付件回归与 ARM 恢复（2026-10-10）
+
+[Full #66](https://buildkite.com/agent-dx/agent-dx-full-test/builds/66) 终态通过，固定使用 `8be97c12865322dcb6e21c8827f74ee38fe9ee25` harness，复用 ON #137 的统一包、SDK及不可变镜像，没有重新编译或替换产物。原有 sdk、data-plane、lifecycle、auth、capacity、placement、local-first、node-failure、sandboxd-restart、restart、stop 共11组全部通过，`missing_checks=[]`、`cleanup_errors=[]`、`error=null`。JUnit共48条记录（含子项），0失败、0跳过；不将48条记录称为48组。
+
+harness／product／image build commit均为原 `8be97c1`。统一包 SHA-256 `1597ba483ad8e5c2e29be2552c9969a5d744c1c79d2d0e7e9525f3f3073b3950`、SDK元数据及node／execd／entrypoint镜像摘要与#137一致；`with_afs=true`、AFS两产品二进制存在且测试探针不入包。result.json SHA-256为 `08859fee8c09e6fc99b1fbd0d77bbf4b5764751c303c32df50b32200b327f046`，JUnit SHA-256为 `eaad7b0d513adfb3cfdd0c9b91c8fc6b085b4b3c5409f7a7bfefaa3a7de4e1ad`；完整原始日志、紧凑清单与逐项身份核对保存在`EV-BUILDKITE-X86`。Full仓库地址和默认分支按授权同步至官方仓库／refactor，原步骤不变、原配置留档。镜像重建与独立Firecracker扩展步骤按条件排除，不算运行通过。
+
+ARM已恢复推进：当前账号按用户授权追加secret精确分支访问规则并回读，保留refactor规则、不改密钥值。随后[ARM镜像维护 #138](https://buildkite.com/agent-dx/agent-dx/builds/138)真实失败：原维护步骤固定在amd64 worker，执行ARM镜像首个RUN报`exec format error`；未到strace验证或镜像推送，原失败留证且未重试。用户已授权最小改用现有原生ARM worker，复用公共Dockerfile、维护脚本、凭据隔离与并发槽，补宿主脚本兼容和受影响回归：Linux镜像／CI合同53项通过，macOS Bash3.2真实脚本stub运行通过；验证器失败不推送、坏JSON在build前拒绝。文档检查139份／639链接通过。未改Rust、Dockerfile或第三方源码。新维护运行、固定ARM摘要及正式ARM UT／组包／安装验证仍待完成；调度修复不等于ARM交付通过。
+
+Full证明上述x86交付件通过ADX原有11组回归；没有新增bind ON文件系统运行、完整POSIX或性能结论。原bfd876运行及阶段一历史8/8保持原身份，OBS／PyPI最终发布继续关闭。

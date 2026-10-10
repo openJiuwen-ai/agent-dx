@@ -27,6 +27,10 @@ cleanup() {
 }
 trap cleanup EXIT
 if ! docker info >/dev/null 2>&1; then
+  if [[ $(uname -s) != Linux ]]; then
+    echo "Docker is not running; non-Linux build image maintenance requires a native Docker service" >&2
+    exit 1
+  fi
   dockerd --host="${DOCKER_HOST:-unix:///var/run/docker.sock}" \
     --storage-driver="${DOCKER_DRIVER:-overlay2}" > "$output/dockerd.log" 2>&1 &
   daemon_pid=$!
@@ -42,17 +46,15 @@ if ! docker info >/dev/null 2>&1; then
   done
   docker info >/dev/null
 fi
-readarray -t values < <(python3 - "$config" <<'PY'
+config_assignments=$(python3 - "$config" <<'PY'
 import json, sys
+from shlex import quote
 config = json.load(open(sys.argv[1]))
-print(config['source_image'])
-print(config['repository'])
-print(config['platform'])
+for key in ('source_image', 'repository', 'platform'):
+    print(f"{key}={quote(str(config[key]))}")
 PY
 )
-source_image=${values[0]}
-repository=${values[1]}
-platform=${values[2]}
+eval "$config_assignments"
 [[ $source_image == *@sha256:* ]]
 [[ $repository != *:latest ]]
 
@@ -92,7 +94,15 @@ docker image rm "$tag" >/dev/null
 docker pull "$published"
 verify_image "$published"
 
-recipe_sha256=$(sha256sum "$recipe_file" | awk '{print $1}')
+recipe_sha256=$(python3 - "$recipe_file" <<'PY'
+import hashlib, sys
+digest = hashlib.sha256()
+with open(sys.argv[1], 'rb') as handle:
+    for chunk in iter(lambda: handle.read(1024 * 1024), b''):
+        digest.update(chunk)
+print(digest.hexdigest())
+PY
+)
 python3 - "$output/result.json" "$source_image" "$published" "$platform" "$recipe_sha256" <<'PY'
 import json, os, sys
 path, source, published, platform, recipe = sys.argv[1:]
