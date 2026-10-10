@@ -85,6 +85,7 @@ steps:
     BUILDKITE_AGENT_NAME: agent-stack-k8s
   artifact_paths:
   - out/buildkite/build-image/result.json
+  - out/buildkite/build-image/preflight.json
   - out/buildkite/build-image/dockerd.log
   plugins:
   - kubernetes:
@@ -142,6 +143,7 @@ steps:
   timeout_in_minutes: 45
   artifact_paths:
   - out/buildkite/build-image/result.json
+  - out/buildkite/build-image/preflight.json
   - out/buildkite/build-image/dockerd.log
   if: build.env("ADX_BUILD_IMAGE_SYNC_ONLY") == "1" && build.env("ADX_COLLECTOR_SYNC_ONLY") != "1" && build.env("ADX_BUILD_IMAGE_CONFIG") == "build/images/build-environment-arm64.json"
 - label: ':python: Build cached Python package environment'

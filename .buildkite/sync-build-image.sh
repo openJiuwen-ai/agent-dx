@@ -67,6 +67,65 @@ verify_image() {
   docker run --rm --platform "$platform" "$1" "$verifier"
 }
 
+normalize_platform() {
+  case "$1" in
+    linux/aarch64) echo linux/arm64 ;;
+    linux/x86_64) echo linux/amd64 ;;
+    *) echo "$1" ;;
+  esac
+}
+
+capture_command() {
+  local label=$1
+  shift
+  local output
+  output=$("$@" 2>&1) || {
+    local status=$?
+    printf '%s failed:\n%s\n' "$label" "$output" >&2
+    exit "$status"
+  }
+  printf '%s' "$output"
+}
+
+docker_version=$(capture_command 'docker version' docker version)
+buildx_version=$(capture_command 'docker buildx version' docker buildx version)
+buildx_inspect=$(capture_command 'docker buildx inspect --bootstrap' docker buildx inspect --bootstrap)
+export ADX_DOCKER_VERSION="$docker_version"
+export ADX_BUILDX_VERSION="$buildx_version"
+export ADX_BUILDX_INSPECT="$buildx_inspect"
+docker_platform=$(normalize_platform "$(docker info --format '{{.OSType}}/{{.Architecture}}')")
+if [[ $docker_platform != "$platform" ]]; then
+  echo "Docker daemon platform $docker_platform does not match requested $platform" >&2
+  exit 1
+fi
+docker_root=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null || true)
+docker pull --platform "$platform" "$source_image"
+source_probe=$(docker run --rm --platform "$platform" "$source_image" /bin/sh -c 'uname -m; df -Pk /')
+export ADX_SOURCE_IMAGE_PROBE="$source_probe"
+python3 - "$output/preflight.json" "$platform" "$docker_platform" "$docker_root" <<'PY'
+import json, os, shutil, sys
+path, requested, docker_platform, docker_root = sys.argv[1:]
+def usage(path):
+    try:
+        total, used, free = shutil.disk_usage(path)
+    except OSError:
+        return None
+    return {'path': path, 'total_bytes': total, 'free_bytes': free}
+result = {
+    'schema_version': 1,
+    'commit': os.environ['BUILDKITE_COMMIT'],
+    'requested_platform': requested,
+    'docker_platform': docker_platform,
+    'workspace_disk': usage(os.getcwd()),
+    'docker_root_disk': usage(docker_root) if docker_root else None,
+    'docker_version': os.environ.get('ADX_DOCKER_VERSION', ''),
+    'buildx_version': os.environ.get('ADX_BUILDX_VERSION', ''),
+    'buildx_inspect': os.environ.get('ADX_BUILDX_INSPECT', ''),
+    'docker_probe': os.environ.get('ADX_SOURCE_IMAGE_PROBE', ''),
+}
+open(path, 'w').write(json.dumps(result, indent=2) + '\n')
+print(json.dumps(result, indent=2))
+PY
 docker pull "$cache_tag" >/dev/null 2>&1 || true
 build_args=()
 if [[ $arch == arm64 && ${1:-rust} == rust ]]; then
