@@ -22,7 +22,7 @@
 | `error-codes.toml` | `afs/error-codes.toml` | 保留相对 include 输入 |
 | `examples/*.toml` | `afs/examples/` 与 `build/config/examples/afs/` | crate 示例和发布包配置示例 |
 | Cargo 绑定测试 | `afs/tests/` | 随 crate 保留 |
-| 验收工具 | `build/e2e/afs/` | 保留维护中的 runner、driver、probe、小规模入口和约 2.8MiB 小型回归 fixture；旧部署器、历史过程证据和大日志留在本地归档 |
+| 验收工具 | `build/e2e/afs/` | 保留维护中的 runner、driver、probe、小规模入口和去重固定回归 fixture；旧部署器、历史过程证据和大日志留在本地归档 |
 | 许可证 | `docs/migration/licenses/afs-source/` | 保留来源 LICENSE/NOTICE |
 
 未导入：`.github/`、`.codex/`、`.omx/`、历史 `development/`、过程性测试工具快照、原始过程日志（维护回归所需的固定小型 fixture 除外）、压缩包、旧 release 包、VM 镜像、过程计划和历史 checkpoint。
@@ -143,3 +143,13 @@ M1/M2/M3 与本轮 M4 限定运行已收口；M5 仅剩本报告提交后的远�
 Linux 精确受测 tree `8d267b893991d8bf08142622fc7e127515f80b9c`，随后仅补本文与 Buildkite README。Python 10 个模块68项、部署 process10项、API create_replay4项、fmt及严格 workspace/all-targets/all-features Clippy 均通过；host58项中57通过、1范围skip，文档及shell语法检查通过。ARM开关／组件接线回归先失败后通过，补验无backend清单与AFS ON/OFF、真实CLI校验、容器适配参数传递及失败证据留存。
 
 本轮未执行远端 Buildkite 双架构完整发布、OBS上传或新候选完整安装／文件系统运行矩阵；历史包和运行结果继续绑定原版本。仓外 `migration-20261010-refactor-conflicts/linux/refactor-conflicts-linux-evidence.tar` SHA-256 为 `0fa68f1963f3253242ac9b4419077b7ba3d796f153553cc3e421e63f27c3a525`，保存精确patch/tree、命令、准入、完整输出和退出码。阶段一历史8/8不重开，未引入私有第三方修改。
+
+## 2026-10-10：限定整理 AFS E2E 工具
+
+以 `a0d03508c8e87e61acfce501c3d684ad476a5ded` 为归档锚点，原327文件／4,738,211字节完整归档并逐项校验后，移出15个个人VM配置、租约、旧PREPARING锁及失效实验入口（83,553字节）。保留维护中的标准测试、OwnerFs bind ON与远端／local-file恢复、DFS一写多读、性能测量工具和锁／RDMA负例；原mmap探针字节不变，改为 `build/e2e/afs/acceptance/probes/mmap_freshness.py`。runner执行必须显式传入本轮 `--lock`；`--list`不需锁，示例PREPARING锁不能产生正式PASS。基线准备不再默认引用个人源码或VM路径，缺少必需输入时在复制或创建输出前拒绝。
+
+185个冻结回归输入映射为144个SHA-256内容对象，去掉41份重复内容／192,157字节；manifest保留原路径、大小、SHA和来源版本，测试临时恢复并验证全部输入，原网络／RDMA负例不删。manifest SHA-256为 `158b716513d028a498e015c9f9a895569f406c60886e9790172d157a184de7bd`。最终测试树275文件／4,507,644字节，净减少52文件／230,567字节；100个维护中的Python工具及测试文件继续正常计入源码。保留的个人路径字符串仅用于冻结历史协议核对或拒绝宿主路径的负例，不作为当前环境默认值。
+
+Linux aarch64／Python3.12.3精确受测tree `7e05e7128dd1abbf4e667cfc0513e4559863d8c4`：12个模块141项测试全部通过，无skip；覆盖恢复校验／损坏拒绝、网络与RDMA负例、缺锁拒绝、环境准入、挂载隔离、rootfs与bind／DFS核心工具。CLI入口、shell语法、三个基线必需输入缺失拒绝、文档140份／639链接及diff检查通过。最后仅追加本节并复核文档。Rust、Cargo、产品构建入口及第三方无变化，本轮未重跑编译、出包或文件系统运行，不将工具通过计为新产品功能／性能通过。G1历史8/8及已有运行证据保持原版本。
+
+仓外入口 `local-archive/migration-20261010-e2e-cleanup/README.md`；完整原件 `afs-e2e-before.tar`、`before.json`、`retired-map.json`支持恢复，旧提交仍保留。Linux原始日志 `linux/afs-e2e-cleanup-evidence.tar` SHA-256为 `f4cb14d4a8bb597c991b4f9e02e88032d86ec9fbbd1e350dc3e035e66b5e0980`，含候选身份、准入、命令、输出和退出码；原失败及个人资产不入目标仓。

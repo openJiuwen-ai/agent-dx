@@ -57,7 +57,7 @@
       },
       "full": {
         "required": true,
-        "scope": "Complete acceptance.lock.json with image, kernel, disk, network, RXE, binary, tool, suite, baseline and runner identities; no AFS gate starts until this passes."
+        "scope": "Complete a run-specific acceptance lock with image, kernel, disk, network, RXE, binary, tool, suite, baseline and runner identities; no AFS gate starts until this passes."
       },
       "driver": {
         "state": "TODO",
@@ -65,7 +65,7 @@
         "note": "Guest inventory and partial network/RXE preparation exist; complete environment verifier, comparator mounts and driver binding remain TODO."
       },
       "evidence": [
-        "acceptance.lock.json",
+        "run-specific acceptance lock",
         "VM inventory",
         "ext4 reference output",
         "P2P/TLS probes",

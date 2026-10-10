@@ -7,20 +7,20 @@ import unittest
 from pathlib import Path
 
 import environment
+import fixture_store
 import test_environment
-
-
-FIXTURE = Path(__file__).resolve().parent / "fixtures/network-preparation"
 
 
 class NetworkEnvironmentTests(unittest.TestCase):
     def make_bundle(self, root):
         bundle = test_environment.EnvironmentEvaluatorTests().make_bundle(root)
+        fixture = root / "_fixture_network"
+        fixture_store.restore("network-preparation", fixture)
         net = root / "network"
-        shutil.copytree(FIXTURE / "linux", net)
-        shutil.copyfile(FIXTURE / "semantic-final/env_network.py", net / "probe.py")
-        shutil.copyfile(FIXTURE / "attempt-2/commands.jsonl", net / "commands.jsonl")
-        shutil.copyfile(FIXTURE / "afs-v67-fault-r2.sh", net / "fault.sh")
+        shutil.copytree(fixture / "linux", net)
+        shutil.copyfile(fixture / "semantic-final/env_network.py", net / "probe.py")
+        shutil.copyfile(fixture / "attempt-2/commands.jsonl", net / "commands.jsonl")
+        shutil.copyfile(fixture / "afs-v67-fault-r2.sh", net / "fault.sh")
         bundle["network"] = {"prefix": "network", "probe_source": "network/probe.py",
                              "commands": "network/commands.jsonl", "fault_source": "network/fault.sh"}
         for path in net.rglob("*"):

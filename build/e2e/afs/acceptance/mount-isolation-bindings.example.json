@@ -24,9 +24,9 @@
       "meta_worker": {
         "transport": "ssh",
         "host": "afs-v97-ctl",
-        "ssh_config": "/home/lzc.guest/afs-suite-v102/auth/ssh_config",
+        "ssh_config": "/etc/afs-acceptance/ssh_config",
         "python": "/usr/bin/python3",
-        "driver": "/home/lzc.guest/afs-suite-v102/drivers/mount_isolation.py",
+        "driver": "/opt/afs-acceptance/drivers/mount_isolation.py",
         "expected_process": {
           "role": "meta",
           "pid": 1458467,
@@ -63,9 +63,9 @@
       "meta_worker": {
         "transport": "ssh",
         "host": "afs-v97-ctl",
-        "ssh_config": "/home/lzc.guest/afs-suite-v102/auth/ssh_config",
+        "ssh_config": "/etc/afs-acceptance/ssh_config",
         "python": "/usr/bin/python3",
-        "driver": "/home/lzc.guest/afs-suite-v102/drivers/mount_isolation.py",
+        "driver": "/opt/afs-acceptance/drivers/mount_isolation.py",
         "expected_process": {
           "role": "meta",
           "pid": 1458467,

@@ -77,6 +77,8 @@ python3 build/ci/run.py afs
 
 默认包不得包含 `bin/afs-meta`、`bin/afs-node` 或 `etc/examples/afs/`。带 AFS 包的 `manifest.json` 必须包含 `with_afs: true`，并记录上述文件的摘要。部署层只负责把已有 AFS TOML 配置交给 `afs-meta`/`afs-node`，以及启动、健康查询和正常停止，不改写 AFS 自有配置 schema。随包 AFS 示例必须显式使用 `local-file` Meta 和 `/opt/adx` 下的持久数据/运行时路径，避免目标仓试用误走 etcd 或 `/tmp` 状态。部署 YAML 必须显式设置 `with_afs: true` 才允许 `afs-meta` 或 `afs-node` 角色；默认 profile 和默认包继续拒绝文件系统角色。`status` 只在 AFS HTTP `/health` 返回 JSON `status=ready` 时标记就绪，HTTP 200 但状态为 `starting/degraded` 仍不是 ready。
 
+本机 VM 配置、租约、历史运行 lock 和旧阶段专用驱动作为仓外本地资产维护；仓内保留核心验收、标准套件和去重固定夹具。通用 runner 执行必须显式指定本轮 `--lock`，列出 case 不需环境。后置专题工具和原版本记录不作为当前交付结论。
+
 ## 文档与配置
 
 - 源码局部规则：[afs/AGENTS.md](../../afs/AGENTS.md)。

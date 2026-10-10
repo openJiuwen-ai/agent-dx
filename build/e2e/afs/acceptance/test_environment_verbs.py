@@ -4,23 +4,20 @@
 from __future__ import annotations
 
 import json
-import shutil
 import tempfile
 import unittest
 from pathlib import Path
 
 import environment
+import fixture_store
 import test_environment
-
-
-FIXTURE = Path(__file__).resolve().parent / "fixtures/verbs-preparation"
 
 
 class VerbsEnvironmentTests(unittest.TestCase):
     def make_bundle(self, root: Path) -> dict:
         bundle = test_environment.EnvironmentEvaluatorTests().make_bundle(root, initial_available=120 * test_environment.GIB)
         verbs = root / "verbs"
-        shutil.copytree(FIXTURE, verbs)
+        fixture_store.restore("verbs-preparation", verbs)
         bundle["verbs"] = {"prefix": "verbs"}
         for path in verbs.rglob("*"):
             if path.is_file():

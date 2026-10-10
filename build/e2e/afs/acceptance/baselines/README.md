@@ -1,65 +1,18 @@
-# AFS comparator baseline builds
+# AFS 性能对照构建工具
 
-## Current small namespace reference — 2026-10-07
+本目录只维护 MooseFS/3FS 构建准备工具，不保存某次运行状态。对照资格仍需单独验收；构建成功不等于正式性能基线可用，也不证明三份同步持久副本语义。
 
-Original DMS/AFS evidence ID `20261007-threefs-delete-small` records one
-patched 3FS R2 small-delete run with all 6 samples and B/C 600 ENOENT each,
-median 615.210 and pooled 509.565 ops/s. Reuse prior DFS 29.861/30.682 without
-rerun. A exceeds the predeclared 1 GiB allocated budget by 4,067,328 B
-(free 2.99 GB/floor PASS; logs 1.57 MB), and FDB actual wait -15 violates the
-9 wait0 contract. Formal reference qualification stays failed/pending; no
-thresholds waived or environment repaired. All 18 owned PIDs/mounts are gone,
-old 10 processes/all old mount IDs unchanged from raw; frozen TARGET-only
-postcheck false FAIL preserved with supplemental ID audit and a
-repair-before-reuse TODO. Shared environment/cache UNOBSERVED, 512 KiB vs 4 KiB
-allocation and explicit ARM patch prohibit stock or full parity claims. User
-decision: defer baseline qualification to a separate topic and return to
-workspace core fixes.
+## 输入和运行
 
+- `bin/prepare_3fs_scratch.sh`：从宿主编排，把固定只读 3FS checkout 复制到现有 Linux builder，初始化副本的 submodule。必须显式提供 `REF_3FS`、仓外 `EVIDENCE_DIR` 和 guest 绝对目录 `AFS_BASELINE_GUEST_ROOT`；不依赖个人目录。通过 `AFS_BASELINE_LIMA_INSTANCE` 选择现有 VM（默认 `afs-build`）。
+- `bin/build_moosefs.sh`：只在 Linux builder 构建固定官方 MooseFS commit。
+- `bin/prepare_3fs_deps.sh`：只在 Linux builder 下载并核验固定 FoundationDB/libfuse 构建依赖。
+- `bin/build_3fs.sh`：只在 Linux builder 检查依赖并构建 3FS；现有 ARM 兼容修改必须披露，不能称为 stock 3FS 对照。
 
-This directory owns reproducible scripts for the first-stage AFS comparator
-baselines. They prepare real MooseFS and 3FS artifacts on Linux and record
-evidence under `evidence/afs-delivery/baseline-build/`.
+版本默认值由 `bin/common.sh` 固定。三个 guest 构建入口默认使用 `$HOME/afs-build/baselines`，可通过 `AFS_BASELINE_GUEST_ROOT` 覆盖。产物和带时间戳日志保存在运行目录，不提交到源码仓。
 
-Scope boundaries:
+## 判据边界
 
-- Product code under `source/` is not modified by these scripts.
-- The reference 3FS checkout under `../ref/3FS` is treated as read-only. The
-  scripts copy it to the build VM before initializing submodules.
-- MooseFS CE v4.59.2 remains blocked for strong durable-write comparison until
-  a stock-version/config proof shows that application success waits for data,
-  CRC and required metadata durability. These scripts build the stock artifact;
-  they do not patch MooseFS or relax AFS barriers.
-- Heavy compilation runs only inside the Linux `afs-build` VM. macOS is used
-  only for orchestration and file transfer.
+MooseFS 持久写语义、3FS 接口/副本/同步屏障和资源资格必须在测量前固定并有实证。历史资格失败和未完成项保持原结论，不降低门槛或转为 PASS。本轮只整理工具，不重新运行基线或扩大性能矩阵。
 
-Main entry points:
-
-- `bin/prepare_3fs_scratch.sh` copies the fixed 3FS checkout to
-  `/home/lzc.guest/afs-build/baselines/3fs-src` in `afs-build` and initializes
-  submodules there.
-- `bin/build_moosefs.sh` runs inside `afs-build` and builds MooseFS from the
-  fixed upstream commit.
-- `bin/prepare_3fs_deps.sh` runs inside `afs-build` and downloads/verifies
-  FoundationDB 7.3.63 ARM packages plus the libfuse 3.16.2 release asset. It
-  does not start the 3FS C++ build.
-- `bin/build_3fs.sh` runs inside `afs-build`, installs/verifies FoundationDB
-  7.3.63 ARM packages, checks build dependencies, applies 3FS patches, and
-  builds with low parallelism.
-
-Each script writes a timestamped log and status file. A missing dependency or a
-blocked durability proof is recorded as `BLOCKED`, not as a successful baseline.
-
-## 2026-10-07 small deletion qualification boundary
-
-Original DMS/AFS evidence ID `20261007-dfs-delete-small` includes a read-only
-four-role survey confirming retained 3FS 39-entry artifacts/ELF dependencies,
-with no live current comparator. The retained ARM64 reference includes a
-disclosed compatibility patch and small-fixture resource settings; it is not
-stock/unmodified or a frozen fair performance baseline. Its current
-candidate 100-file deletion result is separate from formal 3FS comparison.
-Namespace unlink/rmdir qualification can be assessed independently of
-three-sync data/WAL/Meta durability; original strong read/write blockers stay
-unchanged. Fix the small comparison artifact/resource/mount/timer contract
-before any measurement; do not lower old guards after failure or repair an
-environment in this lane.
+2026-10-07 小删除及其失败记录的完整说明保存在整改前 Git 版本 `a0d03508c8e87e61acfce501c3d684ad476a5ded` 的本文件及开发者本地归档；通用入口不再承载逐轮过程记录。结果只能复用原版本、原环境和原判据的范围。

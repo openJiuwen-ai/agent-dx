@@ -5,9 +5,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=common.sh
 source "$SCRIPT_DIR/common.sh"
 
-RESEARCH_ROOT="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
-REF_3FS="${REF_3FS:-/Users/lzc/workspace/code/agentruntime/ref/3FS}"
-EVIDENCE_DIR="${EVIDENCE_DIR:-$RESEARCH_ROOT/evidence/afs-delivery/baseline-build}"
+: "${REF_3FS:?set REF_3FS to the fixed read-only 3FS checkout}"
+: "${EVIDENCE_DIR:?set EVIDENCE_DIR to an external run directory}"
+: "${AFS_BASELINE_GUEST_ROOT:?set AFS_BASELINE_GUEST_ROOT to the Linux scratch directory}"
 RUN_ID="${RUN_ID:-3fs-scratch-$(timestamp_utc)}"
 LOG_FILE="$EVIDENCE_DIR/${RUN_ID}.log"
 STATUS_FILE="$EVIDENCE_DIR/${RUN_ID}.status"

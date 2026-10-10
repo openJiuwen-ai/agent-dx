@@ -4,6 +4,7 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=common.sh
 source "$SCRIPT_DIR/common.sh"
+AFS_BASELINE_GUEST_ROOT="${AFS_BASELINE_GUEST_ROOT:-$HOME/afs-build/baselines}"
 
 RUN_ID="${RUN_ID:-moosefs-build-$(timestamp_utc)}"
 GUEST_ROOT="${GUEST_ROOT:-$AFS_BASELINE_GUEST_ROOT}"
