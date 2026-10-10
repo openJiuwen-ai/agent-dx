@@ -265,4 +265,18 @@ x86 最终 `adx-release.tar.gz` 为79,412,589字节，SHA-256 `3d38c720e90dba9a2
 
 现有 checkpoint 测试先补充失败诊断：若生命周期处理任务在进入持久发布前返回，直接报告其结果；到期则报告已观察的 runtime 状态及 Execd 子进程日志。保留2秒等待期限、真实检查点存储、发布前不得成功响应、资源保持及正常删除断言。此项先不修改产品实现，不以诊断改动或本地通过宣称 ARM 故障已修复。
 
-诊断候选的 Linux 定点验证：原期限的单项首次运行及同一二进制10次重复通过，整个 control_stream9通过；格式修正后重新编译的control_stream9、fmt与严格workspace/all-targets/all-features Clippy通过，Cargo.lock不变。这未复现ARM CI失败，不能作为根因修复证明；正式新候选待实际回执。
+诊断候选的 Linux 定点验证：原期限的单项首次运行及同一二进制10次重复通过，整个 control_stream9通过；格式修正后重新编译的control_stream9、fmt与严格workspace/all-targets/all-features Clippy通过，Cargo.lock不变。这未复现ARM CI失败，不能作为根因修复证明；正式新候选 #147 的实际结果如下。
+
+
+### #147 双架构正式交付收口
+
+[正式 ON #147](https://buildkite.com/agent-dx/agent-dx/builds/147) 绑定 `a5fef9cdcd80b7b1566100afe2f30c4b382646fc`，终态 passed。公共 Source、Python admin／SDK、双架构 Platform／Gateway／Execd／AFS 测试及编译、双架构组包／安装 smoke／发布索引、x86 验收镜像及 Kubernetes L0 全部通过。OBS／PyPI 外发按本轮参数关闭。ARM Execd 使用原2秒期限通过；本轮没有触发新增诊断分支，也没有复现或证明已消除之前的间歇性失败。
+
+| 最终交付件（#147 Artifacts） | 字节 | SHA-256 |
+| --- | ---: | --- |
+| `out/buildkite/adx-release.tar.gz`（x86_64） | 79,412,959 | `17f3ca96c1602c4069575766a1746a40d266e96e22131e145e7e1399f04caf55` |
+| `out/buildkite/arm64/adx-release.tar.gz`（ARM64） | 77,411,105 | `67c1efdb06022d9b8cf66d87a2bad2c20aa09a89fe80b91a36c7f3c4a82bcb95` |
+
+两份生产步骤的 build／release manifest、checksum 和 artifact job 归属已核对，commit／target匹配，with_afs=true，AFS组件摘要与统一包清单一致，只有afs-meta／afs-node，没有测试探针。仅保存紧凑清单和安装日志，没有在本地重复下载整包；安装与L0结果来自本轮实际步骤。终态、交付身份和原失败在 `EV-SOURCE-GATE-MERGE`。
+
+本次仅将该结果写入文档，受测源码仍为a5fef9c；文档提交不冒称新的二进制候选。没有新增 #147 包的真实 bind／远端运行、ARM Full 或性能结论；#143限定运行、Full66及G1历史8/8保留原版本。后续不因诊断或文档变动重跑未受影响的矩阵；间歇性超时根因保留待定位，不扩大此次迁移收尾。
