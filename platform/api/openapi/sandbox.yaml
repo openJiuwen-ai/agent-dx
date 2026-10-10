@@ -30,8 +30,6 @@ tags:
     description: Administrator compatibility surface for established scheduler operations.
   - name: Snapshots
     description: Tenant-scoped reusable checkpoint catalog.
-  - name: Agent Sandbox Service
-    description: Service-authenticated Sandbox capability used by Agent components.
 paths:
   /global-scheduler/resources:
     get:
@@ -416,67 +414,6 @@ paths:
           $ref: "#/components/responses/Error"
         default:
           $ref: "#/components/responses/Error"
-  /api/sandbox/v2/instances:
-    post:
-      tags: [Agent Sandbox Service]
-      operationId: createAgentSandbox
-      summary: Create the stable Sandbox identity requested by an Agent service
-      description: The body tenant must equal the single tenant query value.
-      security:
-        - serviceBearer: []
-      parameters:
-        - $ref: "#/components/parameters/Tenant"
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: {$ref: "#/components/schemas/ServiceCreateSandbox"}
-      responses:
-        "200":
-          description: Current observation after the create converges.
-          content:
-            application/json:
-              schema: {$ref: "#/components/schemas/ServiceSandboxObservation"}
-        "4XX":
-          $ref: "#/components/responses/ServiceError"
-        default:
-          $ref: "#/components/responses/ServiceError"
-  /api/sandbox/v2/instances/{sandboxId}:
-    parameters:
-      - $ref: "#/components/parameters/SandboxId"
-      - $ref: "#/components/parameters/Tenant"
-    get:
-      tags: [Agent Sandbox Service]
-      operationId: getAgentSandbox
-      summary: Observe an Agent service Sandbox
-      security:
-        - serviceBearer: []
-      responses:
-        "200":
-          description: Current platform and runtime readiness observation.
-          content:
-            application/json:
-              schema: {$ref: "#/components/schemas/ServiceSandboxObservation"}
-        "4XX":
-          $ref: "#/components/responses/ServiceError"
-        default:
-          $ref: "#/components/responses/ServiceError"
-    delete:
-      tags: [Agent Sandbox Service]
-      operationId: deleteAgentSandbox
-      summary: Delete an Agent service Sandbox and return the confirmed observation
-      security:
-        - serviceBearer: []
-      responses:
-        "200":
-          description: Authoritatively deleted Sandbox observation.
-          content:
-            application/json:
-              schema: {$ref: "#/components/schemas/ServiceSandboxObservation"}
-        "4XX":
-          $ref: "#/components/responses/ServiceError"
-        default:
-          $ref: "#/components/responses/ServiceError"
 components:
   securitySchemes:
     bearerAuth:
@@ -488,10 +425,6 @@ components:
       in: header
       name: X-Auth
       description: Compatibility API Key header.
-    serviceBearer:
-      type: http
-      scheme: bearer
-      description: Deployment-provided service token used by trusted Agent components.
   headers:
     RequestId:
       description: Logical request identity echoed by API Server.
@@ -564,12 +497,6 @@ components:
         type: string
         minLength: 1
         maxLength: 128
-    Tenant:
-      name: tenant
-      in: query
-      required: true
-      description: Exactly one tenant query value is required.
-      schema: {type: string, minLength: 1}
   responses:
     Error:
       description: Stable ADX error envelope; retry behavior comes from `error.retry` and `error.outcome`.
@@ -580,11 +507,6 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/ErrorEnvelope"
-    ServiceError:
-      description: Agent Sandbox service error; `outcome_unknown` requires inspection of the same ID.
-      content:
-        application/json:
-          schema: {$ref: "#/components/schemas/ServiceSandboxError"}
   schemas:
     NodeResourceList:
       type: object
@@ -1114,65 +1036,3 @@ components:
         requestId: {type: string}
         operationId: {type: string}
         instanceId: {type: string}
-    ServiceCreateSandbox:
-      type: object
-      additionalProperties: false
-      required: [id, tenant, execution]
-      properties:
-        id: {type: string, minLength: 1}
-        tenant: {type: string, minLength: 1}
-        execution: {$ref: "#/components/schemas/ServiceExecutionSpec"}
-    ServiceExecutionSpec:
-      type: object
-      additionalProperties: false
-      required: [image, isolation_runtime, entrypoint, working_dir, env, resources, service]
-      properties:
-        image: {type: string, minLength: 1}
-        isolation_runtime: {type: string, minLength: 1}
-        entrypoint:
-          type: array
-          items: {type: string}
-        working_dir: {type: string}
-        user: {type: [string, "null"]}
-        env:
-          type: object
-          additionalProperties: {type: string}
-        resources:
-          $ref: "#/components/schemas/ServiceResources"
-        service:
-          type: array
-          items: {$ref: "#/components/schemas/DeclaredService"}
-    ServiceResources:
-      type: object
-      additionalProperties: false
-      required: [cpu_millis, memory_mib]
-      properties:
-        cpu_millis: {type: integer, format: int64, minimum: 1}
-        memory_mib: {type: integer, format: int64, minimum: 1}
-    DeclaredService:
-      type: object
-      additionalProperties: false
-      required: [protocol, port]
-      properties:
-        protocol: {type: string, enum: [http, ws, ssh]}
-        port: {type: integer, minimum: 1, maximum: 65535}
-    ServiceSandboxObservation:
-      type: object
-      additionalProperties: false
-      required: [id, tenant, phase, ready, runtime_id, message]
-      properties:
-        id: {type: string}
-        tenant: {type: string}
-        phase: {type: string, enum: [creating, running, failed, deleted]}
-        ready: {type: boolean}
-        runtime_id: {type: [string, "null"]}
-        message: {type: [string, "null"]}
-    ServiceSandboxError:
-      type: object
-      additionalProperties: false
-      required: [kind]
-      properties:
-        kind:
-          type: string
-          enum: [not_found, invalid, unsupported, conflict, unavailable, outcome_unknown]
-        message: {type: string}

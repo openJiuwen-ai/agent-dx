@@ -1,5 +1,5 @@
 //! Authenticated Gateway/Activator contracts. No platform runtime state is persisted here.
-use crate::{Environment, Scope, Service, TemplateVersion};
+use crate::{AgentBinding, Scope, Service, TemplateVersion};
 use serde::{Deserialize, Serialize};
 
 pub const DEADLINE_HEADER: &str = "x-adx-deadline-ms";
@@ -12,7 +12,7 @@ pub struct ScopeRequest {
 #[serde(deny_unknown_fields)]
 pub struct ActivationRequest {
     pub scope: Scope,
-    /// Internal retry stays within the Environment selected by this incoming request.
+    /// Internal retry stays within the AgentBinding selected by this incoming request.
     #[serde(default)]
     pub expected_generation: Option<String>,
     /// Force a Sandbox observation even if this Activator already activated this generation.
@@ -34,14 +34,14 @@ pub struct PublishRequest {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Target {
-    pub environment: Environment,
+    pub binding: AgentBinding,
     pub service: Vec<Service>,
 }
 
-/// A bounded page of Environment metadata within one tenant/template version.
+/// A bounded page of AgentBinding metadata within one tenant/template version.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct EnvironmentList {
+pub struct BindingList {
     pub tenant: String,
     pub template: String,
     pub version: String,
@@ -56,12 +56,12 @@ pub const fn default_page_size() -> usize {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EnvironmentPage {
-    pub environments: Vec<Environment>,
+pub struct BindingPage {
+    pub bindings: Vec<AgentBinding>,
     pub next_page_token: Option<String>,
 }
 
-impl EnvironmentList {
+impl BindingList {
     pub fn validate(&self) -> crate::ValidationResult {
         for (label, value) in [
             ("tenant", &self.tenant),
@@ -70,11 +70,19 @@ impl EnvironmentList {
         ] {
             crate::identifier(value, label)?;
         }
-        if !(1..=crate::limits::ENVIRONMENT_PAGE_SIZE).contains(&self.page_size)
+        if !(1..=crate::limits::BINDING_PAGE_SIZE).contains(&self.page_size)
             || self.page_token.as_ref().is_some_and(|v| v.len() > 16384)
         {
-            return Err("invalid Environment page size or token".into());
+            return Err("invalid AgentBinding page size or token".into());
         }
         Ok(())
     }
+}
+
+/// Internal-only preparation; user credentials never appear in returned bindings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrepareBindingRequest {
+    pub scope: Scope,
+    pub launch: crate::launch::LaunchConfig,
 }

@@ -1,0 +1,34 @@
+{
+  "source_commit": "7ee0009a76de11a229735e06b688cbec3e1b16be",
+  "secret": "ssssssssssssssssssssssssssssssss",
+  "vectors": {
+    "ordinary": {
+      "payload": {
+        "path": "/data/报告.txt",
+        "sid": "session-a"
+      },
+      "token": "eyJwYXRoIjoiL2RhdGEv5oql5ZGKLnR4dCIsInNpZCI6InNlc3Npb24tYSJ9.083a419fb11b71ef6fb1b85b33b93c9a01b8adac7539e518a2f356f8d66960d6"
+    },
+    "expiring": {
+      "payload": {
+        "path": "/data/report.txt",
+        "sid": "session-a",
+        "exp": 110
+      },
+      "token": "eyJwYXRoIjoiL2RhdGEvcmVwb3J0LnR4dCIsInNpZCI6InNlc3Npb24tYSIsImV4cCI6MTEwfQ==.7cf374ac81d222810b54aa62731bd4457aae42aa5cf2445cb145ed199dbbf1f3"
+    },
+    "verified": {
+      "payload": {
+        "kind": "verified_asset_v1",
+        "asset_id": "abababababababababababababababab",
+        "path": "/assets/abababababababababababababababab.pdf",
+        "exp": 160.5,
+        "size": 123,
+        "digest": "sha256:1212121212121212121212121212121212121212121212121212121212121212",
+        "name": "报告.pdf",
+        "sid": "session-a"
+      },
+      "token": "eyJraW5kIjoidmVyaWZpZWRfYXNzZXRfdjEiLCJhc3NldF9pZCI6ImFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiIiwicGF0aCI6Ii9hc3NldHMvYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWJhYmFiYWIucGRmIiwiZXhwIjoxNjAuNSwic2l6ZSI6MTIzLCJkaWdlc3QiOiJzaGEyNTY6MTIxMjEyMTIxMjEyMTIxMjEyMTIxMjEyMTIxMjEyMTIxMjEyMTIxMjEyMTIxMjEyMTIxMjEyMTIxMjEyMTIxMiIsIm5hbWUiOiLmiqXlkYoucGRmIiwic2lkIjoic2Vzc2lvbi1hIn0=.79ce4f32fbf194ca1b00bdd42de29208f1bc82096e4630dc69d19f0892cc6d8b"
+    }
+  }
+}

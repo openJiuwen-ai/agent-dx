@@ -130,6 +130,30 @@ impl SandboxService {
         }
     }
 
+    /// Build a Platform specification from the public Sandbox request contract.
+    pub fn prepare_create(
+        &self,
+        input: Value,
+        caller: &pb::CallerContext,
+    ) -> Result<pb::EnvironmentSpec, Status> {
+        contract::create_spec_with_environment(
+            input,
+            caller,
+            self.clients.config.runtime_profile.as_ref(),
+        )
+    }
+
+    /// Shared admission for HTTP and in-process callers; accepts no Agent-specific types.
+    pub async fn create_request(
+        &self,
+        input: Value,
+        request_id: &str,
+        caller: &pb::CallerContext,
+    ) -> Result<Value, Status> {
+        let spec = self.prepare_create(input.clone(), caller)?;
+        Box::pin(self.create(spec, input, request_id, caller)).await
+    }
+
     pub async fn create(
         &self,
         spec: pb::EnvironmentSpec,
@@ -276,18 +300,18 @@ impl SandboxService {
 
         let timeouts = contract::create_timeouts(input)?;
         let budget = Duration::from_secs(timeouts.create_seconds);
-        let result = self
-            .clients
-            .create_environment(
-                pb::CreateEnvironmentRequest {
-                    spec: Some(spec.clone()),
-                    caller: Some(caller.clone()),
-                    schedule_timeout_seconds: timeouts.schedule_seconds,
-                    create_timeout_seconds: timeouts.create_seconds,
-                },
-                budget,
-            )
-            .await?;
+        // The RPC future is large in debug builds; keep it off the nested
+        // embedded HTTP/Activator polling stack while preserving cancellation.
+        let result = Box::pin(self.clients.create_environment(
+            pb::CreateEnvironmentRequest {
+                spec: Some(spec.clone()),
+                caller: Some(caller.clone()),
+                schedule_timeout_seconds: timeouts.schedule_seconds,
+                create_timeout_seconds: timeouts.create_seconds,
+            },
+            budget,
+        ))
+        .await?;
         authorize(caller, result.record.as_ref())?;
         let record = result
             .record
@@ -455,6 +479,39 @@ fn matches_spec(want: &pb::EnvironmentSpec, got: &pb::EnvironmentSpec) -> bool {
             .all(|(key, value)| got.env.get(key) == Some(value))
         && want.priority == got.priority
         && want.lifecycle == got.lifecycle
+}
+
+/// Embedded Ingress uses the same tenant-filtered directory as the public instance API.
+/// No runtime credentials or EnvironmentSpec are returned to business adapters.
+#[async_trait::async_trait]
+impl data_plane_gateway::ingress::sandbox_files::SandboxDirectory for SandboxService {
+    async fn authorize(
+        &self,
+        tenant: &str,
+        sandbox_id: &str,
+    ) -> Result<(), data_plane_gateway::ingress::sandbox_files::ReadError> {
+        use data_plane_gateway::ingress::sandbox_files::ReadError;
+        if tenant.trim().is_empty() || sandbox_id.trim().is_empty() {
+            return Err(ReadError::Identity);
+        }
+        let response = self
+            .inspect(tenant, sandbox_id)
+            .await
+            .map_err(|error| match error.code() {
+                Code::NotFound | Code::PermissionDenied => ReadError::NotFound,
+                _ => ReadError::Runtime,
+            })?
+            .ok_or(ReadError::NotFound)?;
+        let record = response.record.ok_or(ReadError::Runtime)?;
+        let spec = record.spec.ok_or(ReadError::Runtime)?;
+        if spec.tenant_id != tenant || spec.id != sandbox_id {
+            return Err(ReadError::NotFound);
+        }
+        if record.state != pb::EnvironmentState::Running as i32 {
+            return Err(ReadError::Runtime);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

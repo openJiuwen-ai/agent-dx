@@ -41,7 +41,7 @@ adxlet 调用 sandboxd Start 时，RPC 失败、超时、应答丢失或成功�
 
 新平台已接通创建、查询、删除、同节点暂停/恢复、reload、可复用快照目录和克隆、空闲删除、重启策略、`failover=true`、HTTP/SDK 放置约束、S3 rootfs／mount、镜像入口继承、创建及运行期网络策略、独立执行 limit、extra_config、每实例数据面安全策略、鉴权端口转发、`upstream` reverse tunnel 及命令/文件数据链路。公开请求中的本机 rootfs 和 host mount 会被拒绝；节点本地 Execd 运行环境仍由部署配置拥有。旧 `/invoke` 兼容传输不属于新数据链路。
 
-`agent/` 已实现 Rust Template/Environment 管理和无状态 Activator；Gateway Ingress 装配 Agent API，inline create/get/kill 直接适配 Sandbox。Environment 首次访问按稳定身份激活，用户 Harness 通过 HTTP/WS/SSH 访问。具体部署及已验证范围见 [Agent 使用说明](../../agent/README.md)；平台基础 E2E 与 Agent 端到端验收分开记录。 API Server 原有 `agent_address` 兼容转发入口继续保留，与 Ingress 内的 Agent API 分开。
+`agent/` 已实现 Rust Template/AgentBinding 管理和无状态 Activator；Gateway Ingress 装配 Agent API，Activator 的 Sandbox 管理经 API Server。AgentBinding 首次访问按稳定身份激活，用户 Harness 通过 HTTP/WS/SSH 访问。具体部署及已验证范围见 [Agent 使用说明](../../agent/README.md)；平台基础 E2E 与 Agent 端到端验收分开记录。 API Server 原有 `agent_address` 兼容转发入口继续保留，与 Ingress 内的 Agent API 分开。
 
 ## 验收与剩余范围
 

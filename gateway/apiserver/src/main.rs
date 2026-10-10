@@ -1,6 +1,6 @@
-use adx_agent_core::sandbox::Sandbox;
+use adx_activator::local_sandbox::LocalSandbox;
+use adx_agent_core::{limits, sandbox::Sandbox};
 use adx_apiserver::{
-    activator::ActivatorSandboxAdapter,
     clients::Clients,
     config::{Config, IngressMode},
     http::Api,
@@ -8,7 +8,6 @@ use adx_apiserver::{
 };
 use adx_process::{read_config, shutdown};
 use adx_transport::tls::http_server_acceptor;
-use data_plane_gateway::ingress::sandbox_api::{EnvironmentRequestMapper, SandboxConfig};
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use std::{sync::Arc, time::Duration};
@@ -46,6 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .clone()
                     .ok_or("embedded Ingress control configuration missing")?,
                 sandbox_service,
+                api.sandbox_service.clone(),
             )
             .await
             .map_err(local_error)?,
@@ -131,20 +131,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn embedded_sandbox_service(
     api: &Arc<Api>,
 ) -> Result<Option<Arc<dyn Sandbox>>, Box<dyn std::error::Error>> {
-    let Ok(path) = std::env::var("ADX_SANDBOX_CONFIG") else {
-        return Ok(None);
-    };
-    let settings: SandboxConfig = serde_json::from_slice(&std::fs::read(path)?)
-        .map_err(|_| "invalid Sandbox configuration")?;
-    let mapper = EnvironmentRequestMapper::new(
-        settings.preinstalled_profiles,
-        std::env::var("ADX_SANDBOX_EXECD_TOKEN")?,
-    )
-    .map_err(|error| std::io::Error::other(error.to_string()))?;
-    Ok(Some(ActivatorSandboxAdapter::new(
+    Ok(Some(Arc::new(LocalSandbox::new(
         api.sandbox_service.clone(),
-        mapper,
-    )))
+        limits::SANDBOX_REQUEST_TIMEOUT,
+    )?)))
 }
 
 fn local_error(error: Box<dyn std::error::Error + Send + Sync>) -> Box<dyn std::error::Error> {

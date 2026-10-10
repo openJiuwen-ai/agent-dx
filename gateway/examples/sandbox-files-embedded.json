@@ -1,0 +1,4 @@
+{
+  "port": 50090,
+  "token_env": "ADX_EXECD_HTTP_TOKEN"
+}

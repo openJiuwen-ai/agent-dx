@@ -6,7 +6,7 @@ use adx_activator::{
 };
 use adx_agent_store::{AgentState, RedisRepository};
 use serde::Deserialize;
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, net::SocketAddr, sync::Arc, time::Duration};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -15,11 +15,12 @@ struct Settings {
     redis_url: String,
     namespace: String,
     sandbox_url: String,
+    sandbox_api_key_envs: BTreeMap<String, String>,
     allow_plaintext_transport: bool,
     sandbox_ca_file: Option<String>,
     request_timeout_seconds: u64,
     #[serde(default)]
-    env_cache: CacheSettings,
+    binding_cache: CacheSettings,
     registration: Option<RegistrationConfig>,
 }
 #[tokio::main]
@@ -36,7 +37,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ca = settings.sandbox_ca_file.map(std::fs::read).transpose()?;
     let sandbox = Arc::new(HttpSandbox::new(
         &settings.sandbox_url,
-        std::env::var("ADX_SANDBOX_SERVICE_TOKEN")?,
+        settings
+            .sandbox_api_key_envs
+            .into_iter()
+            .map(|(tenant, variable)| std::env::var(variable).map(|key| (tenant, key)))
+            .collect::<Result<BTreeMap<_, _>, _>>()?,
         timeout,
         ca.as_deref(),
         settings.allow_plaintext_transport,
@@ -50,9 +55,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?,
     );
     let activator = Arc::new(Activator::with_cache(
-        AgentState::new(store),
+        AgentState::new(store).with_deployment_credentials()?,
         sandbox,
-        settings.env_cache,
+        settings.binding_cache,
     )?);
     let app = server::router(
         activator,

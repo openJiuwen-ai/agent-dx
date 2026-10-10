@@ -4,7 +4,7 @@ Rust public management HTTP service, binary `adx-apiserver`, in the root Cargo w
 
 Requests are converted directly to the generated Environment RPC types. There is no Go adapter, function payload, generic Signal dispatch or legacy protobuf dependency. Public Sandbox paths and base64 JSON response envelopes remain compatible with the Sandbox SDK. Existing `functionProxyId` in a resume response is a public compatibility field containing the node ID.
 
-Sandbox lifecycle behavior is owned by `sandbox_service::SandboxService`. The HTTP adapter parses the public REST contract and delegates create/delete/pause/resume operations to that service. When Ingress and Agent Activator are embedded, `ActivatorSandboxAdapter` implements the Agent `Sandbox` contract over the same application-service `Arc`; Activator calls it as a Rust module without HTTP loopback or an internal RPC. Standalone Ingress keeps its separately configured platform adapter for its Sandbox and inline endpoints.
+Sandbox management operations enter through `sandbox_service::SandboxService`; Platform remains the lifecycle authority. HTTP and embedded callers share `prepare_create`/`create_request` for Sandbox request validation, EnvironmentSpec conversion and deployment runtime injection. Agent-specific `CreateSandbox`/`ExecutionSpec` conversion lives in `adx_activator::sandbox_request`, shared by its HTTP and local adapters. The API Server implements the local `SandboxApplication` bridge over the same service `Arc`, without HTTP loopback. Ingress Sandbox v2 and Inline endpoints have been removed. Jiuwen downloads still use the old direct Platform runtime lookup pending a restricted API Server replacement; that lookup cannot read Execd credentials stored only in runtime_profile.env, so live download validation is required before deploying this refactor.
 
 The API Server also owns the legacy-compatible scheduler HTTP paths while
 Coordinator owns their state and decisions. `/global-scheduler/resources` reads the
@@ -35,7 +35,7 @@ resuming admission makes the current resources visible again.
 | `contract.rs` | Typed public JSON validation, resources, environment and affinity conversion |
 | `http.rs` | REST routes, authentication boundary, JSON/SSE responses and Agent compatibility forwarding |
 | `sandbox_service.rs` | Sandbox lifecycle semantics, create replay handling and durable-result checks |
-| `activator.rs` | In-process Agent `Sandbox` adapter over the API Server application service |
+| `activator.rs` | Composition bridge implementing Activator’s local Sandbox application interface; no Agent execution-spec conversion |
 | `clients.rs` | mTLS RPC clients, Redis discovery, API Key validation and ownership reads |
 | `ownership.rs` | Bounded LRU caches with fixed expiration |
 | `operations.rs` | Pause/resume/delete/snapshot, pinned assignment/revision, durable-result validation |

@@ -38,26 +38,26 @@ pub struct Key(String, Option<Index>);
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Index(String);
 impl Index {
-    pub fn environments(tenant: &str, template: &str, version: &str) -> Result<Self> {
+    pub fn bindings(tenant: &str, template: &str, version: &str) -> Result<Self> {
         for value in [tenant, template, version] {
             adx_agent_core::identifier(value, "index scope").map_err(Error::Invalid)?;
         }
         Ok(Self(format!(
-            "environments:{}",
+            "bindings:{}",
             adx_agent_core::encode_key(&[tenant, template, version])
         )))
     }
 }
 impl Key {
     pub fn new(kind: &str, parts: &[&str]) -> Result<Self> {
-        if !matches!(kind, "template" | "environment")
+        if !matches!(kind, "template" | "binding" | "binding-launch")
             || parts.is_empty()
             || parts.iter().any(|s| s.is_empty() || s.len() > 2048)
         {
             return Err(Error::Invalid("invalid record key".into()));
         }
-        let index = if kind == "environment" && parts.len() == 4 {
-            Some(Index::environments(parts[0], parts[1], parts[2])?)
+        let index = if kind == "binding" && parts.len() == 4 {
+            Some(Index::bindings(parts[0], parts[1], parts[2])?)
         } else {
             None
         };
