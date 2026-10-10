@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 component=${1:?component}
+# Keep real subprocess, fsync and checkpoint tests from competing inside one
+# test executable. Cargo build concurrency and the complete test set stay intact.
 case "$component" in
   platform)
     packages=(adx-deployment adx-coordinator adxlet adx-core adx-scheduling adx-protocol adx-discovery

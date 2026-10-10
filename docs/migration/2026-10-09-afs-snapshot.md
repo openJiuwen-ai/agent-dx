@@ -243,3 +243,15 @@ ARM Full 需在公共入口补显式架构交接，并核验固定原生 ARM 后
 Linux fmt 与 `ADX_WITH_AFS=1 ADX_AFS_ALL_FEATURES=1 make rust-check JOBS=4` 通过，包含公共 all-targets/all-features Clippy、公共 unwrap 规则、AFS 默认及 all-features 检查。此为工作树快照检查，非正式 Buildkite clean checkout 运行；缓存布局辅助查询因快照无 Git 元数据产生的非致命提示保留。受影响测试及正式 CI 结果在 `EV-SOURCE-GATE-MERGE` 按候选分别登记；原 #143 包、运行及 Full66 不自动变为本轮合入候选的结论。未修改 AFS 产品 Rust、第三方源码或公共镜像；阶段一历史8/8及后置范围保持原结论。
 
 本轮有效 Linux 回归：CI tooling331项、release tooling32项全部通过；部署 config33／process10、Gateway all-features lib106（另2忽略）、Agent四包60（另10忽略）、Execd control_stream9／entrypoint_ready1通过。source-gate 的4项针对性回归在旧脚本下3失败、新脚本下全部通过；含 ON 环境继承隔离、默认/OFF/ON、显式 all-features、非法变量及失败传播。工具快照误覆盖、首次缺 PATH／Git HEAD 的无效运行均保留，不计产品失败或通过；恢复后验证使用独立完整快照及源码外日志。额外误选的共享 `adx-process --lib` 单包检查因 serde derive feature 不可用未编译，该目录本轮未改；它不能替代部署 process10，后者已正式通过。不据此宣称整个 workspace UT 全部通过。文档检查140份／657本地链接通过；正式 Buildkite 与远端状态以本轮后续实际回执为准。
+
+
+### #144 失败与有限测试修复
+
+[正式 ON #144](https://buildkite.com/agent-dx/agent-dx/builds/144) 绑定 `fa9d54dd5db156a787cfcb03f8b2fbf16bd52b14`，终态 failed：x86 Platform 在等待日志轮转时超时，ARM Platform 的 Meta 测试脚本执行报 `Text file busy`，ARM Execd 在等待 checkpoint 发布入口时超时。Source、双架构 AFS／Gateway 及 x86 Execd 通过；下游组包未执行。原版本、完整失败日志与本轮修复证据均保存在 `EV-SOURCE-GATE-MERGE`，不改写 #143 及 Full66 的历史结论。
+
+测试 fixture 改为临时文件关闭后原子 rename，再执行；新增回归持有旧 inode 的写句柄，验证新路径仍可正确执行。Platform／Execd 的组件测试使用一个 libtest worker，减少同一测试程序中真实子进程、同步落盘和 checkpoint 用例的资源竞争；用例集合、Cargo 编译并发和失败传播保持。该并发措施是有限稳定化尝试，未证明两个超时的根因。原有公共组件测试此前已启用，不能将本轮失败归因于 source-gate 新增了这些测试。
+
+本地候选曾加入日志 Stop 和 checkpoint 等待的超时放宽；收敛时撤回，保留原期限和持久发布前不得响应成功的断言。未修改 AFS 或其他组件的产品实现、共享恢复策略、第三方源码或镜像。本轮 Linux 验证和正式 CI 分开登记；构建或工具检查通过不等于新候选交付、文件系统运行或性能验收通过。
+
+
+本次收敛候选的 Linux 回归：原地写 fixture 的新增用例先以 `ETXTBSY` 失败，原子发布后部署 process11 全部通过；Execd control_stream9 使用原期限通过，fmt、严格 workspace/all-targets/all-features Clippy、CI 合同16项通过。Cargo.lock 保持上述495afc57摘要。首轮 GREEN 因源文件时间早于共享 target 中的 RED 产物而误复用旧二进制，原失败保留；仅刷新该测试源的 mtime 后确认重新编译及 ELF 摘要变化，再取得有效11项通过。macOS 的额外工具检查因缺 yaml 出现3个导入错误，未安装依赖；上述16项使用已有 Linux 环境全部通过。不将两个超时判为根因已解决，正式新候选双架构 CI／组包仍待验收。

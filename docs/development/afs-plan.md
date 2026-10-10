@@ -27,6 +27,8 @@
 
 公共 Full #66 已使用 ON #137 的 x86 交付件通过原有11组业务用例。ARM Full 尚不能直接复用该入口：当前交接脚本固定选择 x86 产物及 target，并要求外部 backend；#143 ARM 清单的 backend 为 null。还需在公共流程补架构选择，核验原生 ARM 后端、固定 runtime／Collector 镜像和至少两个 ARM Kubernetes worker。不得用 #143 的 x86 镜像 bundle 代替 ARM Full；这些缺口不阻止独立验证 ARM 包的 bind ON 与远端 FUSE 核心场景。
 
+最新 source-gate／refactor 整合候选 `fa9d54d` 的正式 ON #144 失败，不能继承 #143 的交付通过结论。三个失败涉及 Platform 日志轮转等待、测试脚本 `ETXTBSY` 和 ARM Execd checkpoint 发布等待；后续组包未运行。当前有限修复只调整测试脚本发布与 Platform／Execd 的 CI 测试并发，保留全部用例、原操作期限和产品语义。受影响检查、正式新候选及其交付结果分别登记到下方迁移报告；没有新 CI 通过前保持待验收。
+
 ## 支持范围
 
 当前 MR 只证明工程集成和限定运行入口，不把原 DMS/AFS 的历史验收结论自动升级为 Agent DX 目标仓结论。
