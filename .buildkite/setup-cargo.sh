@@ -4,9 +4,9 @@ set -euo pipefail
 # Some shared worker profile scripts reset CARGO_HOME after step env injection.
 export CARGO_HOME=${ADX_CARGO_HOME:-/mnt/paas/build-cache/adx/cargo-home}
 : "${CARGO_TARGET_DIR:?persistent Cargo compilation cache required}"
-export RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-stable}
-export RUSTUP_AUTO_INSTALL=0
 expected=$(sed -n 's/^channel = "\([^"]*\)"/\1/p' rust-toolchain.toml)
+export RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-$expected}
+export RUSTUP_AUTO_INSTALL=0
 actual=$(rustc --version | awk '{print $2}')
 [[ "$actual" == "$expected" ]] || { echo "Rust image version mismatch: expected $expected, found $actual" >&2; return 1; }
 # Build images carry every required component. CI must fail on image drift

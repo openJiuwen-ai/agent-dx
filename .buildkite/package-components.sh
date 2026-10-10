@@ -1,12 +1,30 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+for legacy_flag in ADX_WITH_DFS ADX_DFS_ALL_FEATURES; do
+  if [[ ${!legacy_flag+x} ]]; then
+    echo "$legacy_flag was replaced by ${legacy_flag/DFS/AFS}; update the caller" >&2
+    exit 2
+  fi
+done
+
 : "${BUILDKITE_COMMIT:?Buildkite revision required}"
 [[ -z $(git status --porcelain) ]] || { echo 'clean checkout required'; exit 1; }
 [[ $(git rev-parse HEAD) == "$BUILDKITE_COMMIT" ]]
 
 source .buildkite/build-architecture.sh
 export ADX_RELEASE_OUTPUT="$PWD/out/buildkite/package"
+ADX_WITH_AFS=${ADX_WITH_AFS:-0}
+case "$ADX_WITH_AFS" in
+  0|1) ;;
+  *) echo 'ADX_WITH_AFS must be 0 or 1' >&2; exit 2 ;;
+esac
+components=(platform gateway execd)
+package_args=()
+if [[ "$ADX_WITH_AFS" == "1" ]]; then
+  components+=(afs)
+  package_args+=(--with-afs)
+fi
 source .buildkite/bootstrap-build.sh
 rm -rf "$ADX_RELEASE_OUTPUT" out/buildkite/backend
 if [[ ${ADX_COMPONENT_LOCAL:-0} != 1 ]]; then rm -rf out/buildkite/components; fi
@@ -20,7 +38,7 @@ download_component() {
 }
 pids=()
 if [[ ${ADX_COMPONENT_LOCAL:-0} != 1 ]]; then
-  for component in platform gateway execd; do
+  for component in "${components[@]}"; do
     download_component "$component" &
     pids+=("$!")
   done
@@ -28,7 +46,7 @@ if [[ ${ADX_COMPONENT_LOCAL:-0} != 1 ]]; then
     wait "$pid"
   done
 fi
-for component in platform gateway execd; do
+for component in "${components[@]}"; do
   mkdir "out/buildkite/components/$component"
   tar -xzf "out/buildkite/components/$component.tar.gz" \
     -C "out/buildkite/components/$component"
@@ -48,7 +66,7 @@ done
 
 stage=$(mktemp -d "${TMPDIR:-/tmp}/adx-components.XXXXXX")
 trap 'rm -rf "$stage"' EXIT
-for component in platform gateway execd; do
+for component in "${components[@]}"; do
   find "out/buildkite/components/$component" -maxdepth 1 -type f \
     ! -name manifest.json -exec cp {} "$stage/" \;
 done
@@ -76,7 +94,8 @@ python3 build/release/package.py assemble \
   --wheel "${wheel[0]}" \
   --target "$ADX_RELEASE_TARGET" \
   --profile release \
-  --output "$ADX_RELEASE_OUTPUT"
+  --output "$ADX_RELEASE_OUTPUT" \
+  "${package_args[@]}"
 python3 build/release/package.py verify "$ADX_RELEASE_OUTPUT"
 case "$ADX_BUILD_ARCH" in
   amd64) machine='Advanced Micro Devices X86-64' ;;
@@ -135,7 +154,8 @@ python3 build/release/component.py aggregate \
   --release-archive out/buildkite/adx-release.tar.gz \
   --wheel "${wheel[0]}" \
   "${backend_args[@]}" \
-  --output out/buildkite/build-manifest.json
+  --output out/buildkite/build-manifest.json \
+  "${package_args[@]}"
 
 # adxadmin is an independent Python artifact produced by this base build.
 if [[ ${ADX_CANDIDATE_LOCAL:-0} != 1 ]]; then

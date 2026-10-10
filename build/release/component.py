@@ -22,11 +22,14 @@ def _executable(name, environment=None, cwd=None):
     return os.path.abspath(executable)
 
 
-COMPONENTS = ("platform", "gateway", "execd")
+BASE_COMPONENTS = ("platform", "gateway", "execd")
+OPTIONAL_COMPONENTS = ("afs",)
+COMPONENTS = BASE_COMPONENTS + OPTIONAL_COMPONENTS
 REQUIRED_FILES = {
     "platform": {"adxctl", "adx-inspect", "adx-coordinator", "adxlet"},
     "gateway": {"adx-apiserver", "adx-ingress", "adx-relay"},
     "execd": {"adx-execd", "adx-runtime-rootfs.img"},
+    "afs": {"afs-meta", "afs-node"},
 }
 
 
@@ -114,13 +117,15 @@ def create_build_manifest(
     wheel,
     backend_manifest,
     backend_archive,
+    with_afs=False,
 ):
     if (backend_manifest is None) != (backend_archive is None):
         raise ValueError("backend manifest and archive must be supplied together")
     _identity(commit, target)
     component_root = Path(component_root)
     components = {}
-    for name in COMPONENTS:
+    expected_components = BASE_COMPONENTS + (OPTIONAL_COMPONENTS if with_afs else ())
+    for name in expected_components:
         directory = component_root / name
         manifest = verify_manifest(directory, component=name, commit=commit, target=target)
         components[name] = {
@@ -129,12 +134,15 @@ def create_build_manifest(
         }
     package_manifest = Path(package_manifest)
     package = json.loads(package_manifest.read_text())
+    if "with_dfs" in package or package.get("with_afs", False) is not with_afs:
+        raise ValueError("package AFS mode differs from build manifest mode")
     if package.get("commit") != commit or package.get("target") not in (None, target):
         raise ValueError("package identity differs from component identity")
     return {
         "schema_version": 1,
         "commit": commit,
         "target": target,
+        "with_afs": with_afs,
         "components": components,
         "package": {
             "manifest": _artifact(package_manifest),
@@ -166,6 +174,7 @@ def verify_build_manifest(
     wheel,
     backend_manifest,
     backend_archive,
+    with_afs=False,
 ):
     _identity(commit, target)
     manifest_path = Path(manifest_path)
@@ -174,7 +183,14 @@ def verify_build_manifest(
         raise ValueError("invalid build manifest")
     if manifest.get("commit") != commit or manifest.get("target") != target:
         raise ValueError("build manifest identity mismatch")
-    if set(manifest.get("components", {})) != set(COMPONENTS):
+    if "with_dfs" in manifest:
+        raise ValueError("legacy with_dfs build manifest; rebuild with --with-afs")
+    if not isinstance(manifest.get("with_afs", False), bool):
+        raise ValueError("with_afs must be a boolean")
+    if manifest.get("with_afs", False) != with_afs:
+        raise ValueError("build manifest AFS component mode mismatch")
+    expected_components = set(BASE_COMPONENTS + (OPTIONAL_COMPONENTS if with_afs else ()))
+    if set(manifest.get("components", {})) != expected_components:
         raise ValueError("build manifest component set is incomplete")
     for name, record in manifest["components"].items():
         if set(record.get("files", {})) != REQUIRED_FILES[name]:
@@ -182,6 +198,9 @@ def verify_build_manifest(
         digest = record.get("manifest_sha256", "")
         if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
             raise ValueError(f"{name} component manifest digest is invalid")
+    package = json.loads(Path(package_manifest).read_text())
+    if "with_dfs" in package or package.get("with_afs", False) is not with_afs:
+        raise ValueError("package AFS mode differs from build manifest mode")
     _verify_artifact(
         manifest.get("package", {}).get("manifest"),
         package_manifest,
@@ -231,6 +250,7 @@ def main():
     aggregate.add_argument("--backend-manifest", type=Path)
     aggregate.add_argument("--backend-archive", type=Path)
     aggregate.add_argument("--output", type=Path, required=True)
+    aggregate.add_argument("--with-afs", action="store_true")
 
     verify_build = subparsers.add_parser("verify-build")
     verify_build.add_argument("--manifest", type=Path, required=True)
@@ -241,6 +261,7 @@ def main():
     verify_build.add_argument("--wheel", type=Path, required=True)
     verify_build.add_argument("--backend-manifest", type=Path)
     verify_build.add_argument("--backend-archive", type=Path)
+    verify_build.add_argument("--with-afs", action="store_true")
 
     arguments = parser.parse_args()
     commit = getattr(arguments, "commit", None) or _git_commit()
@@ -258,6 +279,7 @@ def main():
             arguments.wheel,
             arguments.backend_manifest,
             arguments.backend_archive,
+            arguments.with_afs,
         )
         arguments.output.parent.mkdir(parents=True, exist_ok=True)
         arguments.output.write_text(json.dumps(manifest, indent=2) + "\n")
@@ -271,6 +293,7 @@ def main():
             arguments.wheel,
             arguments.backend_manifest,
             arguments.backend_archive,
+            arguments.with_afs,
         )
     print("component artifacts verified")
 

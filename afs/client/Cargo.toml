@@ -1,0 +1,29 @@
+[package]
+name = "afs-client"
+version.workspace = true
+edition = "2024"
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Local data SDK using UDS control and shared memory"
+# 目录为独立 crate；实际发布前仍需 API、实现、文档和兼容性验收。
+publish = false
+
+[dependencies]
+afs-error = { path = "../common/error" }
+afs-protocol = { path = "../common/protocol" }
+afs-transport = { path = "../common/transport", default-features = false, features = ["grpc", "shm"] }
+
+afs-tracing = { path = "../common/tracing" }
+afs-logging = { path = "../common/logging" }
+tonic = "0.14.6"
+thiserror = "2.0.16"
+tokio = { version = "1.47.1", features = ["full"] }
+hyper-util = { version = "0.1.20", features = ["tokio"] }
+tower = { version = "0.5.2", features = ["util"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

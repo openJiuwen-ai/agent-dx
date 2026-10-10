@@ -31,6 +31,8 @@ Set these variables on a Buildkite build or in that pipeline's environment setti
 | Variable | Default | Applies to / responsibility |
 |---|---|---|
 | `ADX_OBS_UPLOAD` | base `1`, SDK `0` | `0` disables OBS upload for the selected pipeline |
+| `ADX_WITH_AFS` | `0` | Base: `1` adds the optional AFS component to both architecture packages; OFF packages exclude AFS |
+| `ADX_ARM_BUILD` | `1` | Base: `0` defers all ARM compile, assembly, publication and index steps; x86 and shared gates still run |
 | `ADX_ARM_TESTS` | `0` | Base: `1` runs Rust component tests and install smoke on ARM, as on x86 |
 | `ADX_ARM_OBS_UPLOAD` | inherits `ADX_OBS_UPLOAD` | Base: override only ARM final OBS publication; ARM Buildkite artifacts remain available |
 | `ADX_OBS_UPLOAD_CHANNEL` | `daily` | Base/SDK: `daily` or `release` |
@@ -54,11 +56,14 @@ separately from `adx/daily/` and `adx/release/`.
 
 ## Parallel Linux ARM64 packages
 
-The base pipeline runs two symmetric, independent Linux architecture flows:
+The base pipeline defaults to two symmetric, independent Linux architecture flows.
+Set `ADX_ARM_BUILD=0` for explicit x86-only validation; this records ARM as excluded,
+not passed. `ADX_ARM_TESTS=0` alone still compiles and packages ARM.
 
 | Stage | x86_64 | ARM64 |
 |---|---|---|
 | Compile components | `build-platform`, `build-gateway`, `build-execd` | `build-platform-arm64`, `build-gateway-arm64`, `build-execd-arm64` |
+| Optional AFS compile | `build-afs` | `build-afs-arm64` |
 | Assemble release | `platform-build` | `platform-build-arm64` |
 | Publish to OBS | `publish-amd64` | `publish-arm64` |
 | Artifact index | `artifact-manifest` | `artifact-manifest-arm64` |
@@ -68,14 +73,23 @@ steps start without cross-architecture dependencies; assembly waits for its own
 components and the shared source gate, SDK and adxadmin candidates. x86 runs the
 Rust component tests and release install smoke. ARM defaults to compilation and
 package integrity checks; `ADX_ARM_TESTS=1` enables the same tests on ARM.
+With `ADX_WITH_AFS=1`, source-gate adds AFS lint and each architecture also
+waits for its AFS component; component manifests, package assembly and
+publication verification use the same `--with-afs` contract. This does not change ARM
+backend policy (`backend: null`) or the default OFF package.
+AFS durability regressions require `strace` and child-process tracing in the
+public Rust build image; the image verifier checks this before compilation.
 ARM uses an `os=macos, arch=arm64` worker with Docker to execute native Linux ARM64.
 The current ARM pool uses one `adx/native-arm64` concurrency slot to protect
 worker checkout and Docker cache ownership; the x86 flow advances independently.
 Docker must be running and the worker must be able to pull the SWR build image.
 The ARM step maps the cluster's encrypted `ADX_SWR_PULL_CONFIG` secret to
 `SWR_DOCKER_CONFIG_JSON`; the registry wrapper creates an owner-only temporary
-Docker configuration and removes it when the job exits. Its access policy
-allows the `agent-dx` pipeline on `refactor`.
+Docker configuration and removes it when the job exits. Tool-only plugin
+search directories are preserved so Docker Buildx remains discoverable; host
+authentication, credential helpers and contexts are not copied. Its access policy
+must allow the exact pipeline and build branch; allowing `refactor` alone does
+not authorize a feature branch. Never pass the secret value in build parameters.
 `build/images/build-environment-arm64.json` pins the ARM source and ADX builder.
 For build-image maintenance on networks that cannot reach GitHub,
 `ADX_EROFS_SOURCE_ARCHIVE` can point to a downloaded EROFS source archive.
@@ -323,6 +337,9 @@ the wheel named and hashed by the
 independent `sdk-package` candidate.
 
 The Full pipeline requires `ADX_BASE_PACKAGE_BUILD_ID` and `ADX_SDK_BUILD_ID`.
+For an AFS-enabled base candidate, also set `ADX_WITH_AFS=1`; the image
+handoff checks the explicit mode against both manifests and rejects a mismatch.
+Base L0 forwards its build mode through the same verification path.
 `platform-images` downloads both immutable candidates by Buildkite build UUID,
 verifies their commits and digests, restores the base package tree and injects
 the independently built SDK wheel into the test image. It then publishes the
@@ -427,7 +444,17 @@ time. Set `ADX_BUILD_IMAGE_SYNC_ONLY=1` on the base pipeline to dispatch the
 maintenance job that builds the Ubuntu 20.04 recipe, pushes the immutable image,
 verifies it by digest and records `out/buildkite/build-image/result.json`. A
 mutable `buildcache` tag may seed BuildKit cache only; product jobs always use
-the recorded digest.
+the recorded digest. Set
+`ADX_BUILD_IMAGE_CONFIG=build/images/build-environment-arm64.json` for ARM image
+maintenance on the existing native ARM worker, using the same recipe and
+verification script. The host uses Docker; build commands execute in Linux ARM64.
+The default AMD64 maintenance route remains unchanged. ARM maintenance shares
+the `adx/native-arm64` concurrency slot and registry-secret handling with ARM
+package jobs. Update the pinned ARM `ci_image` only after the pushed digest has
+passed pull-back verification. Before image compilation the maintenance job
+checks Docker, Buildx/BuildKit, the native daemon platform, storage and access
+to the pinned source image; a failed prerequisite stops that job before build
+or push.
 
 `.buildkite/setup-cargo.sh` restores the image's rsproxy sparse source settings in
 the persistent ADX Cargo home, including Git dependency caching.

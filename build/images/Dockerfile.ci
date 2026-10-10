@@ -10,7 +10,7 @@ RUN sed -i 's|http://mirrors.aliyun.com/ubuntu-ports|https://mirrors.aliyun.com/
     && apt-get -o Acquire::ForceIPv4=true -o Acquire::http::Timeout=30 -o Acquire::Retries=2 update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
        autoconf automake binutils build-essential busybox-static ca-certificates \
-       cmake curl git libssl-dev libtool musl-tools pkg-config python3-venv \
+       cmake curl git libssl-dev libtool musl-tools pkg-config python3-venv strace \
     && rm -rf /var/lib/apt/lists/*
 
 ARG TARGETARCH=amd64

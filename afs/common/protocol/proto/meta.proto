@@ -1,0 +1,1138 @@
+syntax = "proto3";
+package afs.meta.v1;
+
+// Meta 是 afs-meta 的基础入口：连通性探测、节点注册和将来的集群级租约。
+// Ping 只证明 gRPC/观测链路可达，不授予根目录访问权。
+// RegisterNode 需要持久 MetaStore 后才能承诺注册生效，当前实现必须返回 UNIMPLEMENTED。
+service Meta {
+  rpc Ping(PingRequest) returns (PingReply);
+  rpc RegisterNode(RegisterNodeRequest) returns (RegisterNodeReply);
+  rpc LookupNode(LookupNodeRequest) returns (LookupNodeReply);
+}
+
+message PingRequest {
+  string node_id = 1;
+}
+
+message PingReply {
+  string message = 1;
+  string instance = 2;
+}
+
+message NodeEndpoint {
+  string grpc_addr = 1;
+  string data_addr = 2;
+  string rest_addr = 3;
+}
+
+message NodeDescriptor {
+  string node_id = 1;
+  NodeEndpoint endpoint = 2;
+  map<string, string> labels = 3;
+  repeated string capabilities = 4;
+  // 每次 afs-node 进程启动生成新身份；同一 node_id 的旧会话不得继续签发授权。
+  string session_id = 5;
+  repeated DfsStorageDevice storage_devices = 6;
+}
+
+message RegisterNodeRequest {
+  string request_id = 1;
+  NodeDescriptor node = 2;
+  uint64 lease_seconds = 3;
+}
+
+message RegisterNodeReply {
+  string node_id = 1;
+  uint64 lease_epoch = 2;
+  uint64 expires_at_unix_ms = 3;
+  MetaBackendPersistence meta_backend_persistence = 4;
+  bool meta_backend_healthy = 5;
+  bool meta_persistence_ready = 6;
+  string meta_persistence_detail = 7;
+}
+
+enum MetaBackendPersistence {
+  META_BACKEND_PERSISTENCE_UNSPECIFIED = 0;
+  META_BACKEND_PERSISTENCE_UNKNOWN = 1;
+  META_BACKEND_PERSISTENCE_VOLATILE = 2;
+  META_BACKEND_PERSISTENCE_PERSISTENT = 3;
+}
+
+message LookupNodeRequest {
+  string request_id = 1;
+  string node_id = 2;
+}
+
+message LookupNodeReply {
+  NodeDescriptor node = 1;
+  uint64 lease_epoch = 2;
+  uint64 expires_at_unix_ms = 3;
+  bool found = 4;
+}
+
+// ===== OwnerFs 根目录归属与访问授权 =====
+// OwnerRoots 是 OwnerFs 的粗粒度授权面。Meta 只管理根目录归属、
+// 授权代与撤销屏障；每个文件的 inode/dentry/内容仍在 afs-node。
+//
+// 状态机不变量：
+// - root_epoch 标识根目录归属事实的世代，只有持久 MetaStore 条件事务能推进。
+// - access_generation 标识真正撤权/删根/Home 会话恢复的围栏代；B 加入不改变 A 的 grant。
+// - A 第一次收到 B 的 grant 时向 Meta 验证后缓存；P2P 请求自身不是签名能力票据。
+// - 真正撤权须先让 Home 拒绝旧 grant 并 ACK，才可提交撤权；watch 通知本身不是屏障。
+// - session_id 是全系统统一的字符串 Node 会话 ID，P2P 和 Meta 不得混用 uint64。
+// - 旧 preview 分支只有中心内存协调，缺少 durable grant 与 revoke ACK，不能直接作为本合同。
+service OwnerRoots {
+  rpc ReserveRoot(ReserveRootRequest) returns (ReserveRootReply);
+  rpc ActivateRoot(ActivateRootRequest) returns (ActivateRootReply);
+  rpc AbortRoot(AbortRootRequest) returns (AbortRootReply);
+  rpc LookupRoot(LookupRootRequest) returns (LookupRootReply);
+  rpc ListOwnerRoots(ListOwnerRootsRequest) returns (ListOwnerRootsReply);
+  rpc AcquireRoot(AcquireRootRequest) returns (AcquireRootReply);
+  rpc ValidateRootAccess(ValidateRootAccessRequest) returns (ValidateRootAccessReply);
+  rpc WatchRootCommands(WatchRootCommandsRequest) returns (stream RootCommand);
+  rpc PollRootCommandBatch(PollRootCommandBatchRequest) returns (RootCommandBatchReply);
+  rpc AckRevocation(AckRevocationRequest) returns (AckRevocationReply);
+  rpc RecoverRoot(RecoverRootRequest) returns (RecoverRootReply);
+}
+
+enum RootRight {
+  ROOT_RIGHT_UNSPECIFIED = 0;
+  ROOT_RIGHT_LOOKUP = 1;
+  ROOT_RIGHT_READ = 2;
+  ROOT_RIGHT_WRITE = 3;
+  ROOT_RIGHT_ADMIN = 4;
+}
+
+enum RootCommandType {
+  ROOT_COMMAND_TYPE_UNSPECIFIED = 0;
+  ROOT_COMMAND_TYPE_REVOKE_ACCESS = 1;
+  ROOT_COMMAND_TYPE_INVALIDATE_CACHE = 2;
+}
+
+// REVOKE_ACCESS 仅用于真正撤权、根删除或 Home 恢复；B 首次加入不触发。
+
+enum ReserveConflictPolicy {
+  RESERVE_CONFLICT_POLICY_UNSPECIFIED = 0;
+  RESERVE_CONFLICT_POLICY_FAIL_IF_EXISTS = 1;
+  RESERVE_CONFLICT_POLICY_REUSE_IF_SAME_INTENT = 2;
+}
+
+message RootAccess {
+  string root_id = 1;
+  uint64 root_epoch = 2;
+  string home_node_id = 3;
+  string holder_node_id = 4;
+  string session_id = 5;
+  uint64 access_generation = 6;
+  reserved 7;
+  reserved "mode";
+  repeated RootRight rights = 8;
+  string fencing_token = 9;
+  // Home 进程重启后改变；P2P 服务端须与自己的当前会话核对。
+  string home_session_id = 10;
+}
+
+// RootLocation 是查询结果，不是授权。它告诉调度器或 node 某个 root 当前在哪、
+// 属于哪个 epoch；它不包含 rights、fencing token 或 access_generation。
+message RootLocation {
+  string root_id = 1;
+  uint64 root_epoch = 2;
+  string home_node_id = 3;
+  reserved 4;
+  reserved "mode";
+  // 只供定位/故障诊断，仍不是授权。旧进程会话不能代替 RootAccess。
+  string home_session_id = 5;
+}
+
+// RootReservation 是 reserve 阶段的准备记录。Node 拿到它后只能本地 mkdir、
+// fsync parent 并携带 prepare_token 调 ActivateRoot；不能凭它读写该 root。
+message RootReservation {
+  string root_id = 1;
+  uint64 root_epoch = 2;
+  string home_node_id = 3;
+  string session_id = 4;
+  string create_intent_id = 5;
+  string prepare_token = 6;
+}
+
+message ReserveRootRequest {
+  string request_id = 1;
+  string root_id = 2;
+  string preferred_home_node_id = 3;
+  string session_id = 4;
+  repeated RootRight rights = 5;
+  uint64 expected_root_epoch = 6;
+  string parent_root_id = 7;
+  string create_intent_id = 8;
+  ReserveConflictPolicy conflict_policy = 9;
+}
+
+message ReserveRootReply {
+  RootReservation reservation = 1;
+  bool already_reserved_by_same_intent = 2;
+}
+
+message ActivateRootRequest {
+  string request_id = 1;
+  RootReservation reservation = 2;
+  string local_prepare_id = 3;
+  uint64 parent_fsync_generation = 4;
+  bool parent_fsync_complete = 5;
+}
+
+message ActivateRootReply {
+  RootAccess access = 1;
+}
+
+message AbortRootRequest {
+  string request_id = 1;
+  string root_id = 2;
+  uint64 root_epoch = 3;
+  string session_id = 4;
+  string create_intent_id = 5;
+  string reason = 6;
+  string prepare_token = 7;
+}
+
+message AbortRootReply {}
+
+message LookupRootRequest {
+  string request_id = 1;
+  string root_id = 2;
+}
+
+message LookupRootReply {
+  RootLocation location = 1;
+  bool found = 2;
+}
+
+message ListOwnerRootsRequest {
+  string request_id = 1;
+  string home_node_id = 2;
+}
+
+message ListOwnerRootsReply {
+  repeated RootLocation active_roots = 1;
+  repeated RootReservation pending_reservations = 2;
+  uint64 authority_revision = 3;
+}
+
+message AcquireRootRequest {
+  string request_id = 1;
+  string root_id = 2;
+  string requester_node_id = 3;
+  string session_id = 4;
+  repeated RootRight rights = 5;
+  uint64 expected_root_epoch = 6;
+  uint64 expected_access_generation = 7;
+}
+
+message AcquireRootReply {
+  RootAccess access = 1;
+}
+
+// Node 数据面只传下面这份出示凭证，不传根权限列表；权限只能从 Meta
+// 验证成功后返回的完整 RootAccess 取得，不能相信远端自报的 rights。
+message PresentedRootAccess {
+  string root_id = 1;
+  uint64 root_epoch = 2;
+  string home_node_id = 3;
+  string holder_node_id = 4;
+  string session_id = 5;
+  uint64 access_generation = 6;
+  string fencing_token = 7;
+  string home_session_id = 8;
+}
+
+// Home A 首次收到 B 的 P2P grant 时向 Meta 做权威验证。调用方必须把经
+// 节点间认证得到的 peer 身份填入 observed_peer_node_id，不可照抄请求体。
+// Meta 以持久权威状态核对出示凭证全部字段、B 当前 Node session、Home 当前
+// session、授权代/权利及未撤权状态；无效或无法权威判断时返回错误，不返回假成功。
+// A 缓存验证结果，后续同 grant 文件操作不逐次查询 Meta；撤权须先在 A 安装
+// 拒绝旧授权的屏障并等待 ACK，不能仅靠 watch 延迟推断缓存已失效。
+message ValidateRootAccessRequest {
+  string request_id = 1;
+  PresentedRootAccess presented_access = 2;
+  string observed_peer_node_id = 3;
+  string validator_home_node_id = 4;
+  string validator_home_session_id = 5;
+}
+
+message ValidateRootAccessReply {
+  RootAccess access = 1;
+  uint64 authority_revision = 2;
+}
+
+message WatchRootCommandsRequest {
+  string node_id = 1;
+  string session_id = 2;
+  uint64 after_revision = 3;
+}
+
+message PollRootCommandBatchRequest {
+  string node_id = 1;
+  string session_id = 2;
+  uint64 after_revision = 3;
+}
+
+message RootCommand {
+  string command_id = 1;
+  RootCommandType command_type = 2;
+  RootAccess access = 3;
+  uint64 revision = 4;
+}
+
+message RootCommandBatchEvents {
+  uint64 start_revision = 1;
+  uint64 next_revision = 2;
+  repeated RootCommand commands = 3;
+}
+
+enum RootCommandRecoveryReason {
+  ROOT_COMMAND_RECOVERY_REASON_UNSPECIFIED = 0;
+  ROOT_COMMAND_RECOVERY_REASON_WATCH_COMPACTED = 1;
+  ROOT_COMMAND_RECOVERY_REASON_NODE_SESSION_RESTARTED = 2;
+  ROOT_COMMAND_RECOVERY_REASON_BACKEND_LEADER_CHANGED = 3;
+}
+
+message RootCommandRecoveryCursor {
+  uint64 resume_after = 1;
+  RootCommandRecoveryReason reason = 2;
+}
+
+message RootCommandBatchCompacted {
+  uint64 requested_after = 1;
+  uint64 compacted_to = 2;
+  RootCommandRecoveryCursor recovery_cursor = 3;
+}
+
+message RootCommandBatchUnsupported {
+  string message = 1;
+}
+
+message RootCommandBatchReply {
+  oneof result {
+    RootCommandBatchEvents events = 1;
+    RootCommandBatchCompacted compacted = 2;
+    RootCommandBatchUnsupported unsupported = 3;
+  }
+}
+
+message AckRevocationRequest {
+  // Meta 只接受当前 Home 会话对相应 command 的成功 ACK 作为撤权提交屏障；
+  // B 的 ACK、watch 投递或超时均不能代替 Home 已拒绝旧 grant 的证明。
+  string request_id = 1;
+  string command_id = 2;
+  string node_id = 3;
+  string session_id = 4;
+  string root_id = 5;
+  uint64 root_epoch = 6;
+  uint64 access_generation = 7;
+  bool success = 8;
+  string message = 9;
+}
+
+message AckRevocationReply {
+  uint64 accepted_at_unix_ms = 1;
+}
+
+// A 重启时先验证本机根身份记录和独占数据目录锁，再以新 Node session 请求恢复。
+// Meta 比对已持久化的 home、root_epoch 与 ActivateRoot 的 local_prepare_id，
+// 将旧 Home 会话和旧授权代围栏，完成必要的远端缓存屏障后才能返回新 grant。
+// 同一个 request_id 的重试必须查询/复用原结果，不能多次推进授权代。
+// 本 RPC 不从目录扫描结果创建新根，也不迁移 Home；Meta 不可达时失败关闭。
+message RecoverRootRequest {
+  string request_id = 1;
+  string root_id = 2;
+  uint64 expected_root_epoch = 3;
+  string home_node_id = 4;
+  string home_session_id = 5;
+  string local_prepare_id = 6;
+}
+
+message RecoverRootReply {
+  RootAccess access = 1;
+}
+
+// ===== DistributedFs namespace, immutable FileVersion and placement =====
+// Meta never carries file content. A node publishes a new inode head only
+// after local or replicated ChunkStore writes have produced durable receipts.
+service DfsMeta {
+  rpc Lookup(DfsLookupRequest) returns (DfsLookupReply);
+  rpc Create(DfsCreateRequest) returns (DfsCreateReply);
+  rpc Mkdir(DfsMkdirRequest) returns (DfsMkdirReply);
+  rpc ReadDir(DfsReadDirRequest) returns (DfsReadDirReply);
+  rpc Unlink(DfsUnlinkRequest) returns (DfsUnlinkReply);
+  rpc Rmdir(DfsRmdirRequest) returns (DfsRmdirReply);
+  rpc Rename(DfsRenameRequest) returns (DfsRenameReply);
+  rpc Link(DfsLinkRequest) returns (DfsLinkReply);
+  rpc Symlink(DfsSymlinkRequest) returns (DfsSymlinkReply);
+  rpc Mknod(DfsMknodRequest) returns (DfsMknodReply);
+  rpc ReadLink(DfsReadLinkRequest) returns (DfsReadLinkReply);
+  rpc SetInodeAttributes(DfsSetInodeAttributesRequest) returns (DfsSetInodeAttributesReply);
+  rpc GetXattr(DfsGetXattrRequest) returns (DfsGetXattrReply);
+  rpc ListXattr(DfsListXattrRequest) returns (DfsListXattrReply);
+  rpc SetXattr(DfsSetXattrRequest) returns (DfsSetXattrReply);
+  rpc RemoveXattr(DfsRemoveXattrRequest) returns (DfsRemoveXattrReply);
+  rpc OpenWrite(OpenDfsWriteRequest) returns (OpenDfsWriteReply);
+  rpc ResolveLockAuthority(ResolveDfsLockAuthorityRequest) returns (ResolveDfsLockAuthorityReply);
+  rpc ResolveWriteAuthority(ResolveDfsWriteAuthorityRequest) returns (ResolveDfsWriteAuthorityReply);
+  rpc RenewWriteLease(RenewDfsWriteLeaseRequest) returns (DfsWriteLeaseReply);
+  rpc GetInode(GetDfsInodeRequest) returns (GetDfsInodeReply);
+  rpc GetFileVersion(GetFileVersionRequest) returns (GetFileVersionReply);
+  rpc GetPlacementSnapshot(GetDfsPlacementSnapshotRequest) returns (GetDfsPlacementSnapshotReply);
+  rpc ValidateReplicaWrite(ValidateDfsReplicaWriteRequest) returns (ValidateDfsReplicaWriteReply);
+  rpc ClaimReplicationTask(ClaimDfsReplicationTaskRequest) returns (ClaimDfsReplicationTaskReply);
+  rpc ReportReplicationTask(ReportDfsReplicationTaskRequest) returns (ReportDfsReplicationTaskReply);
+  rpc ReportChunkCorruption(ReportDfsChunkCorruptionRequest) returns (ReportDfsChunkCorruptionReply);
+  rpc GetChunkSources(GetDfsChunkSourcesRequest) returns (GetDfsChunkSourcesReply);
+  rpc ValidateReadGrants(ValidateDfsReadGrantsRequest) returns (ValidateDfsReadGrantsReply);
+  rpc SyncInodeMetadata(SyncDfsInodeMetadataRequest) returns (SyncDfsInodeMetadataReply);
+  rpc CommitFileVersion(CommitFileVersionRequest) returns (CommitFileVersionReply);
+}
+
+enum DfsLocalCopyPolicy {
+  DFS_LOCAL_COPY_POLICY_UNSPECIFIED = 0;
+  DFS_LOCAL_COPY_POLICY_REQUIRED = 1;
+  DFS_LOCAL_COPY_POLICY_PREFERRED = 2;
+  DFS_LOCAL_COPY_POLICY_NOT_REQUIRED = 3;
+}
+
+message DfsReplicationConfig {
+  uint32 desired_copies = 1;
+  uint32 sync_required_copies = 2;
+  uint32 min_distinct_nodes = 3;
+  uint32 min_distinct_failure_domains = 4;
+  DfsLocalCopyPolicy local_copy = 5;
+}
+
+message DfsStorageDevice {
+  string device_id = 1;
+  uint64 device_epoch = 2;
+  uint64 catalog_revision = 3;
+  string failure_domain = 4;
+}
+
+message DfsReplicaTarget {
+  string node_id = 1;
+  uint64 node_epoch = 2;
+  string data_endpoint = 3;
+  DfsStorageDevice device = 4;
+}
+
+message DfsReplicaGroup {
+  string replica_group_id = 1;
+  uint64 placement_epoch = 2;
+  repeated DfsReplicaTarget targets = 3;
+}
+
+message DfsPlacementSnapshot {
+  uint64 revision = 1;
+  DfsReplicationConfig replication = 2;
+  repeated DfsReplicaGroup replica_groups = 3;
+}
+
+message DfsReplicaWriteGrant {
+  string requester_node_id = 1;
+  uint64 requester_node_epoch = 2;
+  string initiator_node_id = 3;
+  uint64 initiator_node_epoch = 4;
+  string operation_id = 5;
+  string chunk_id = 6;
+  uint64 chunk_length = 7;
+  bytes content_digest = 8;
+  DfsDigestAlgorithm content_digest_algorithm = 9;
+  uint64 placement_revision = 10;
+  uint64 placement_epoch = 11;
+  string replica_group_id = 12;
+  uint32 target_index = 13;
+  DfsReplicationConfig replication = 14;
+  DfsReplicaGroup replica_group = 15;
+  uint64 expires_at_unix_ms = 16;
+  uint64 fence = 17;
+  string token = 18;
+}
+
+message DfsReplicaAck {
+  string operation_id = 1;
+  string chunk_id = 2;
+  uint64 placement_revision = 3;
+  uint64 placement_epoch = 4;
+  string node_id = 5;
+  uint64 node_epoch = 6;
+  string device_id = 7;
+  uint64 device_epoch = 8;
+  uint64 catalog_revision = 9;
+  uint64 persisted_bytes = 10;
+  bytes verified_digest = 11;
+  DfsDigestAlgorithm verified_digest_algorithm = 12;
+}
+
+message DfsChunkObject {
+  string chunk_id = 1;
+  uint64 length = 2;
+  bytes content_digest = 3;
+  DfsDigestAlgorithm content_digest_algorithm = 4;
+}
+
+message DfsReplicationClaim {
+  string task_id = 1;
+  string operation_id = 2;
+  string worker_node_id = 3;
+  uint64 worker_node_epoch = 4;
+  string worker_session_id = 5;
+  uint64 expires_at_unix_ms = 6;
+  uint64 fence = 7;
+  DfsChunkObject chunk = 8;
+  string source_copy_id = 9;
+  uint64 placement_revision = 10;
+  DfsReplicaGroup replica_group = 11;
+  DfsReplicationConfig replication = 12;
+}
+
+enum DfsReplicationTaskState {
+  DFS_REPLICATION_TASK_STATE_UNSPECIFIED = 0;
+  DFS_REPLICATION_TASK_STATE_PENDING = 1;
+  DFS_REPLICATION_TASK_STATE_RUNNING = 2;
+  DFS_REPLICATION_TASK_STATE_RETRY_WAITING = 3;
+  DFS_REPLICATION_TASK_STATE_COMPLETED = 4;
+  DFS_REPLICATION_TASK_STATE_BLOCKED_NO_SOURCE = 5;
+}
+
+message DfsReplicationTask {
+  string task_id = 1;
+  string chunk_id = 2;
+  uint64 placement_epoch = 3;
+  uint32 desired_copies = 4;
+  repeated string existing_copy_ids = 5;
+  DfsReplicationTaskState state = 6;
+  uint32 attempt = 7;
+  uint64 next_retry_unix_ms = 8;
+  optional string last_error = 9;
+  DfsReplicationClaim claim = 10;
+}
+
+message ClaimDfsReplicationTaskRequest {
+  string caller_id = 1;
+  string caller_session_id = 2;
+  uint64 caller_node_epoch = 3;
+  string operation_id = 4;
+  uint64 lease_seconds = 5;
+}
+
+message ClaimDfsReplicationTaskReply {
+  bool claimed = 1;
+  DfsReplicationClaim claim = 2;
+}
+
+message ReportDfsReplicationTaskRequest {
+  string caller_id = 1;
+  string caller_session_id = 2;
+  uint64 caller_node_epoch = 3;
+  string operation_id = 4;
+  DfsReplicationClaim claim = 5;
+  repeated DfsReplicaAck durable_acks = 6;
+  optional string error = 7;
+  bool source_invalid = 8;
+}
+
+message ReportDfsReplicationTaskReply {
+  DfsReplicationTask task = 1;
+}
+
+message ReportDfsChunkCorruptionRequest {
+  string caller_id = 1;
+  string caller_session_id = 2;
+  uint64 caller_node_epoch = 3;
+  string operation_id = 4;
+  string chunk_id = 5;
+  string device_id = 6;
+  uint64 device_epoch = 7;
+  uint64 catalog_revision = 8;
+}
+
+message ReportDfsChunkCorruptionReply {}
+
+enum DfsDigestAlgorithm {
+  DFS_DIGEST_ALGORITHM_UNSPECIFIED = 0;
+  DFS_DIGEST_ALGORITHM_BLAKE3 = 1;
+}
+
+enum DfsInodeKind {
+  DFS_INODE_KIND_UNSPECIFIED = 0;
+  DFS_INODE_KIND_REGULAR = 1;
+  DFS_INODE_KIND_DIRECTORY = 2;
+  DFS_INODE_KIND_SYMLINK = 3;
+  DFS_INODE_KIND_SPECIAL = 4;
+}
+
+enum DfsSpecialNodeKind {
+  DFS_SPECIAL_NODE_KIND_UNSPECIFIED = 0;
+  DFS_SPECIAL_NODE_KIND_FIFO = 1;
+  DFS_SPECIAL_NODE_KIND_SOCKET = 2;
+  DFS_SPECIAL_NODE_KIND_BLOCK_DEVICE = 3;
+  DFS_SPECIAL_NODE_KIND_CHAR_DEVICE = 4;
+}
+
+message DfsSpecialNode {
+  DfsSpecialNodeKind kind = 1;
+  // Meaningful only for block/character devices. FIFO and sockets must carry 0.
+  uint64 rdev = 2;
+}
+
+message DfsInodeAttributes {
+  uint32 mode = 1;
+  uint32 uid = 2;
+  uint32 gid = 3;
+  uint32 nlink = 4;
+  uint64 atime_unix_ms = 5;
+  uint64 mtime_unix_ms = 6;
+  uint64 ctime_unix_ms = 7;
+}
+
+message DfsXattrRecord {
+  bytes name = 1;
+  bytes value = 2;
+}
+
+message DfsInodeRecord {
+  string namespace_id = 1;
+  string inode_id = 2;
+  DfsInodeKind kind = 3;
+  DfsInodeAttributes attributes = 4;
+  string head_version_id = 5;
+  uint64 revision = 6;
+  bytes symlink_target = 7;
+  repeated DfsXattrRecord xattrs = 8;
+  DfsSpecialNode special_node = 9;
+}
+
+message DfsExtent {
+  uint64 file_offset = 1;
+  uint64 length = 2;
+  string chunk_id = 3;
+  uint64 chunk_offset = 4;
+}
+
+message DfsLayoutRoot {
+  string layout_root_id = 1;
+  uint64 file_length = 2;
+  repeated DfsExtent inline_extents = 3;
+}
+
+message DfsFileVersion {
+  string version_id = 1;
+  string inode_id = 2;
+  string parent_version_id = 3;
+  uint64 length = 4;
+  string layout_root_id = 5;
+  uint64 created_at_unix_ms = 6;
+}
+
+message DfsChunkReceipt {
+  string operation_id = 1;
+  string chunk_id = 2;
+  uint64 chunk_length = 3;
+  bytes content_digest = 4;
+  reserved 5 to 8;
+  uint64 placement_revision = 9;
+  uint64 placement_epoch = 10;
+  string replica_group_id = 11;
+  repeated DfsReplicaAck durable_acks = 12;
+  DfsDigestAlgorithm content_digest_algorithm = 13;
+}
+
+message DfsWriteLease {
+  string inode_id = 1;
+  string owner_node_id = 2;
+  string owner_session_id = 3;
+  uint64 lease_epoch = 4;
+  uint64 expires_at_unix_ms = 5;
+}
+
+enum DfsCommitMetadataMode {
+  DFS_COMMIT_METADATA_MODE_UNSPECIFIED = 0;
+  DFS_COMMIT_METADATA_MODE_DATA_ONLY = 1;
+  DFS_COMMIT_METADATA_MODE_FULL = 2;
+}
+
+message DfsCommitMetadataDelta {
+  DfsCommitMetadataMode mode = 1;
+  uint64 mtime_unix_ms = 2;
+  uint64 ctime_unix_ms = 3;
+  bool kill_suidgid = 4;
+}
+
+message DfsLookupRequest {
+  string namespace_id = 1;
+  string parent_inode_id = 2;
+  bytes name = 3;
+}
+
+message DfsLookupReply {
+  DfsInodeRecord inode = 1;
+  bool found = 2;
+}
+
+message DfsCreateRequest {
+  string caller_id = 1;
+  string operation_id = 2;
+  string namespace_id = 3;
+  string parent_inode_id = 4;
+  bytes name = 5;
+  DfsInodeAttributes attributes = 6;
+  string owner_session_id = 7;
+  uint64 lease_seconds = 8;
+}
+
+message DfsCreateReply {
+  DfsInodeRecord inode = 1;
+  DfsWriteLease write_lease = 2;
+}
+
+
+message DfsDentryRecord {
+  bytes name = 1;
+  DfsInodeRecord inode = 2;
+}
+
+message DfsMkdirRequest {
+  string caller_id = 1;
+  string operation_id = 2;
+  string namespace_id = 3;
+  string parent_inode_id = 4;
+  bytes name = 5;
+  DfsInodeAttributes attributes = 6;
+  DfsCallerContext caller = 7;
+}
+
+message DfsMkdirReply {
+  DfsInodeRecord inode = 1;
+}
+
+message DfsReadDirRequest {
+  string namespace_id = 1;
+  string parent_inode_id = 2;
+}
+
+message DfsReadDirReply {
+  repeated DfsDentryRecord entries = 1;
+}
+
+message DfsUnlinkRequest {
+  string caller_id = 1;
+  string operation_id = 2;
+  string namespace_id = 3;
+  string parent_inode_id = 4;
+  bytes name = 5;
+  DfsCallerContext caller = 6;
+}
+
+message DfsUnlinkReply {
+  DfsInodeRecord inode = 1;
+}
+
+message DfsRmdirRequest {
+  string caller_id = 1;
+  string operation_id = 2;
+  string namespace_id = 3;
+  string parent_inode_id = 4;
+  bytes name = 5;
+  DfsCallerContext caller = 6;
+}
+
+message DfsRmdirReply {
+  DfsInodeRecord inode = 1;
+}
+
+enum DfsRenameMode {
+  DFS_RENAME_MODE_UNSPECIFIED = 0;
+  DFS_RENAME_MODE_NO_REPLACE = 1;
+  DFS_RENAME_MODE_REPLACE = 2;
+}
+
+message DfsRenameRequest {
+  string caller_id = 1;
+  string operation_id = 2;
+  string namespace_id = 3;
+  string old_parent_inode_id = 4;
+  bytes old_name = 5;
+  string new_parent_inode_id = 6;
+  bytes new_name = 7;
+  DfsRenameMode mode = 8;
+  DfsCallerContext caller = 9;
+}
+
+message DfsRenameReply {
+  DfsInodeRecord inode = 1;
+  DfsInodeRecord replaced_inode = 2;
+  bool replaced = 3;
+}
+
+message DfsLinkRequest {
+  string caller_id = 1;
+  string operation_id = 2;
+  string namespace_id = 3;
+  string existing_inode_id = 4;
+  uint64 expected_inode_revision = 5;
+  string parent_inode_id = 6;
+  bytes name = 7;
+  DfsCallerContext caller = 8;
+}
+
+message DfsLinkReply {
+  DfsInodeRecord inode = 1;
+}
+
+message DfsSymlinkRequest {
+  string caller_id = 1;
+  string operation_id = 2;
+  string namespace_id = 3;
+  string parent_inode_id = 4;
+  bytes name = 5;
+  bytes target = 6;
+  DfsInodeAttributes attributes = 7;
+  DfsCallerContext caller = 8;
+}
+
+message DfsSymlinkReply {
+  DfsInodeRecord inode = 1;
+}
+
+message DfsMknodRequest {
+  string caller_id = 1;
+  string operation_id = 2;
+  string namespace_id = 3;
+  string parent_inode_id = 4;
+  bytes name = 5;
+  DfsSpecialNode special_node = 6;
+  DfsInodeAttributes attributes = 7;
+  DfsCallerContext caller = 8;
+}
+
+message DfsMknodReply {
+  DfsInodeRecord inode = 1;
+}
+
+message DfsReadLinkRequest {
+  string namespace_id = 1;
+  string inode_id = 2;
+}
+
+message DfsReadLinkReply {
+  bytes target = 1;
+}
+
+message DfsCallerContext {
+  uint32 uid = 1;
+  uint32 gid = 2;
+  repeated uint32 supplementary_gids = 3;
+}
+
+message DfsInodeAttributeUpdate {
+  optional uint32 mode = 1;
+  optional uint32 uid = 2;
+  optional uint32 gid = 3;
+  optional uint64 atime_unix_ms = 4;
+  optional uint64 mtime_unix_ms = 5;
+  optional uint64 ctime_unix_ms = 6;
+  bool timestamps_now = 7;
+}
+
+message DfsSetInodeAttributesRequest {
+  string caller_id = 1;
+  string operation_id = 2;
+  DfsCallerContext caller = 3;
+  string inode_id = 4;
+  uint64 expected_inode_revision = 5;
+  DfsInodeAttributeUpdate update = 6;
+}
+
+message DfsSetInodeAttributesReply {
+  DfsInodeRecord inode = 1;
+}
+
+message DfsGetXattrRequest {
+  DfsCallerContext caller = 1;
+  string inode_id = 2;
+  bytes name = 3;
+}
+
+message DfsGetXattrReply {
+  bytes value = 1;
+}
+
+message DfsListXattrRequest {
+  DfsCallerContext caller = 1;
+  string inode_id = 2;
+}
+
+message DfsListXattrReply {
+  repeated bytes names = 1;
+}
+
+enum DfsXattrSetMode {
+  DFS_XATTR_SET_MODE_UNSPECIFIED = 0;
+  DFS_XATTR_SET_MODE_UPSERT = 1;
+  DFS_XATTR_SET_MODE_CREATE = 2;
+  DFS_XATTR_SET_MODE_REPLACE = 3;
+}
+
+message DfsSetXattrRequest {
+  string caller_id = 1;
+  string operation_id = 2;
+  DfsCallerContext caller = 3;
+  string inode_id = 4;
+  uint64 expected_inode_revision = 5;
+  bytes name = 6;
+  bytes value = 7;
+  DfsXattrSetMode mode = 8;
+}
+
+message DfsSetXattrReply {
+  DfsInodeRecord inode = 1;
+}
+
+message DfsRemoveXattrRequest {
+  string caller_id = 1;
+  string operation_id = 2;
+  DfsCallerContext caller = 3;
+  string inode_id = 4;
+  uint64 expected_inode_revision = 5;
+  bytes name = 6;
+}
+
+message DfsRemoveXattrReply {
+  DfsInodeRecord inode = 1;
+}
+
+message OpenDfsWriteRequest {
+  string caller_id = 1;
+  string owner_session_id = 2;
+  string operation_id = 3;
+  string inode_id = 4;
+  uint64 lease_seconds = 5;
+}
+
+message OpenDfsWriteReply {
+  DfsInodeRecord inode = 1;
+  DfsWriteLease write_lease = 2;
+}
+
+message RenewDfsWriteLeaseRequest {
+  string caller_id = 1;
+  string owner_session_id = 2;
+  string operation_id = 3;
+  DfsWriteLease current_lease = 4;
+  uint64 lease_seconds = 5;
+}
+
+// A fresh lock authority read; only missing/expired authority acquires a lease.
+// operation_id identifies that conditional acquire, not the read-only result.
+message ResolveDfsLockAuthorityRequest {
+  string caller_id = 1;
+  string owner_session_id = 2;
+  string operation_id = 3;
+  string inode_id = 4;
+  uint64 lease_seconds = 5;
+}
+
+message ResolveDfsLockAuthorityReply {
+  DfsInodeRecord inode = 1;
+  DfsWriteLease write_lease = 2;
+}
+
+// A fresh writable-open authority read; only missing/expired authority acquires
+// a lease. lease_seconds is the missing/expired acquisition TTL, not a promise
+// that every live resolution extends the owner lifetime. operation_id identifies
+// that conditional acquire, not the read-only result.
+message ResolveDfsWriteAuthorityRequest {
+  string caller_id = 1;
+  string owner_session_id = 2;
+  string operation_id = 3;
+  string inode_id = 4;
+  uint64 lease_seconds = 5;
+}
+
+message ResolveDfsWriteAuthorityReply {
+  DfsInodeRecord inode = 1;
+  DfsWriteLease write_lease = 2;
+}
+
+message DfsWriteLeaseReply {
+  DfsWriteLease write_lease = 1;
+}
+
+message GetDfsInodeRequest {
+  string inode_id = 1;
+}
+
+message GetDfsInodeReply {
+  DfsInodeRecord inode = 1;
+}
+
+message GetFileVersionRequest {
+  string version_id = 1;
+}
+
+message GetFileVersionReply {
+  DfsFileVersion version = 1;
+  DfsLayoutRoot layout = 2;
+}
+
+message GetDfsPlacementSnapshotRequest {
+  string caller_id = 1;
+  uint64 minimum_revision = 2;
+}
+
+message GetDfsPlacementSnapshotReply {
+  DfsPlacementSnapshot snapshot = 1;
+}
+
+message ValidateDfsReplicaWriteRequest {
+  string requester_node_id = 1;
+  uint64 requester_node_epoch = 2;
+  string initiator_node_id = 3;
+  uint64 initiator_node_epoch = 4;
+  string operation_id = 5;
+  string chunk_id = 6;
+  uint64 chunk_length = 7;
+  bytes content_digest = 8;
+  DfsDigestAlgorithm content_digest_algorithm = 9;
+  uint64 placement_revision = 10;
+  uint64 placement_epoch = 11;
+  string replica_group_id = 12;
+  uint32 target_index = 13;
+  repeated DfsReplicaTarget ordered_targets = 14;
+  DfsReplicationClaim repair_claim = 15;
+}
+
+message ValidateDfsReplicaWriteReply {
+  DfsReplicaWriteGrant grant = 1;
+}
+
+enum DfsCopyRole {
+  DFS_COPY_ROLE_UNSPECIFIED = 0;
+  DFS_COPY_ROLE_DURABLE_REPLICA = 1;
+  DFS_COPY_ROLE_VERIFIED_CACHE = 2;
+  DFS_COPY_ROLE_EXTERNAL_COMMITTED = 3;
+}
+
+enum DfsCopyState {
+  DFS_COPY_STATE_UNSPECIFIED = 0;
+  DFS_COPY_STATE_READY = 1;
+  DFS_COPY_STATE_CORRUPT = 2;
+  DFS_COPY_STATE_DELETING = 3;
+}
+
+message DfsCopyLocation {
+  message Node {
+    string node_id = 1;
+    uint64 node_epoch = 2;
+    string device_id = 3;
+    uint64 device_epoch = 4;
+    uint64 catalog_revision = 5;
+  }
+  message External {
+    string store_id = 1;
+    string object_key = 2;
+    string object_revision = 3;
+  }
+  oneof location {
+    Node node = 1;
+    External external = 2;
+  }
+}
+
+message DfsReadGrant {
+  string namespace_id = 1;
+  string file_version_id = 2;
+  string layout_root_id = 3;
+  string caller_node_id = 4;
+  uint64 caller_node_epoch = 5;
+  uint64 expires_at_unix_ms = 6;
+  uint64 fence = 7;
+  string token = 8;
+}
+
+message DfsSourceCandidate {
+  string copy_id = 1;
+  string chunk_id = 2;
+  DfsCopyRole role = 3;
+  DfsCopyState state = 4;
+  DfsCopyLocation location = 5;
+  optional string data_endpoint = 6;
+  uint32 load_hint = 7;
+  DfsReadGrant read_grant = 8;
+}
+
+message DfsChunkSources {
+  string chunk_id = 1;
+  repeated DfsSourceCandidate sources = 2;
+}
+
+message GetDfsChunkSourcesRequest {
+  string caller_id = 1;
+  string namespace_id = 2;
+  string file_version_id = 3;
+  string layout_root_id = 4;
+  repeated string chunk_ids = 5;
+}
+
+message GetDfsChunkSourcesReply {
+  uint64 revision = 1;
+  repeated DfsChunkSources chunks = 2;
+}
+
+message SyncDfsInodeMetadataRequest {
+  string caller_id = 1;
+  string operation_id = 2;
+  string inode_id = 3;
+  DfsWriteLease write_lease = 4;
+  uint64 expected_inode_revision = 5;
+  string expected_head_version_id = 6;
+  DfsCommitMetadataDelta metadata_delta = 7;
+}
+
+message SyncDfsInodeMetadataReply {
+  DfsInodeRecord inode = 1;
+}
+
+message CommitFileVersionRequest {
+  string caller_id = 1;
+  string operation_id = 2;
+  string inode_id = 3;
+  uint64 expected_inode_revision = 4;
+  string expected_head_version_id = 5;
+  DfsFileVersion version = 6;
+  DfsLayoutRoot layout = 7;
+  repeated DfsChunkReceipt chunk_receipts = 8;
+  DfsWriteLease write_lease = 9;
+  DfsCommitMetadataDelta metadata_delta = 10;
+}
+
+message CommitFileVersionReply {
+  DfsInodeRecord inode = 1;
+}
+
+// Receiver-authenticated, batched authority check. No file bytes traverse Meta.
+message DfsReadValidation {
+  DfsReadGrant grant = 1;
+  string chunk_id = 2;
+  string copy_id = 3;
+  uint64 chunk_offset = 4;
+  uint64 length = 5;
+}
+message DfsAuthorizedRead {
+  DfsReadValidation validation = 1;
+  message Range { uint64 offset = 1; uint64 length = 2; }
+  repeated Range allowed_ranges = 2;
+  uint64 expires_at_unix_ms = 3;
+}
+message ValidateDfsReadGrantsRequest {
+  string receiver_node_id = 1;
+  uint64 receiver_node_epoch = 2;
+  string peer_node_id = 3;
+  repeated DfsReadValidation validations = 4;
+}
+message ValidateDfsReadGrantsReply { repeated DfsAuthorizedRead authorizations = 1; }

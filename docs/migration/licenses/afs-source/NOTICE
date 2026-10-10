@@ -1,0 +1,9 @@
+AFS Agent workload foundation
+
+Cargo.toml declares Apache-2.0; LICENSE supplies those license terms.
+This branch is an unpublished foundation and does not establish ownership or
+authorize a public release. The maintainer must confirm permissions before
+publishing.
+
+Third-party dependencies retain their own licenses and attribution notices.
+Third-party dependencies retain their own license terms and notices.

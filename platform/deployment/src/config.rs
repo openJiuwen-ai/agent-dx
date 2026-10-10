@@ -18,6 +18,10 @@ pub enum Role {
     #[serde(rename = "apiserver")]
     ApiServer,
     Ingress,
+    #[serde(rename = "afs-meta")]
+    AfsMeta,
+    #[serde(rename = "afs-node")]
+    AfsNode,
 }
 impl Role {
     pub fn name(self) -> &'static str {
@@ -28,6 +32,8 @@ impl Role {
             Self::Adxlet => "adxlet",
             Self::ApiServer => "apiserver",
             Self::Ingress => "ingress",
+            Self::AfsMeta => "afs-meta",
+            Self::AfsNode => "afs-node",
         }
     }
 
@@ -39,6 +45,8 @@ impl Role {
             Self::Relay => "adx-relay",
             Self::ApiServer => "adx-apiserver",
             Self::Ingress => "adx-ingress",
+            Self::AfsMeta => "afs-meta",
+            Self::AfsNode => "afs-node",
         }
     }
 }
@@ -60,6 +68,8 @@ pub struct Deployment {
     #[serde(default)]
     pub logging: crate::logging::Policy,
     pub schema_version: u32,
+    #[serde(default)]
+    pub with_afs: bool,
     pub package_dir: PathBuf,
     pub state_dir: PathBuf,
     pub redis_url: String,
@@ -139,6 +149,8 @@ impl Profile {
 struct ProfileDeployment {
     schema_version: u32,
     profile: Profile,
+    #[serde(default)]
+    with_afs: bool,
     #[serde(default)]
     internal_security: Option<adx_protocol::auth::SecurityMode>,
     #[serde(default)]
@@ -252,6 +264,34 @@ pub struct Process {
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
     pub admin_socket: Option<PathBuf>,
+    pub health_url: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AfsServiceConfig {
+    config_file: PathBuf,
+    #[serde(default)]
+    health_url: Option<String>,
+}
+
+impl AfsServiceConfig {
+    fn parse(value: &Value) -> Result<Self> {
+        let config: Self = serde_json::from_value(value.clone())
+            .map_err(|error| format!("invalid AFS config: {error}"))?;
+        if !config.config_file.is_absolute() {
+            return Err("AFS config_file must be absolute".into());
+        }
+        if let Some(url) = &config.health_url {
+            if !url.starts_with("http://")
+                || !url.ends_with("/health")
+                || url.contains(['\n', '\r'])
+            {
+                return Err("AFS health_url must be an http://.../health endpoint".into());
+            }
+        }
+        Ok(config)
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -441,6 +481,12 @@ impl Deployment {
             if service.role == Role::Redis {
                 RedisConfig::parse(&service.config)?;
             }
+            if matches!(service.role, Role::AfsMeta | Role::AfsNode) {
+                if !self.with_afs {
+                    return Err("AFS roles require with_afs: true".into());
+                }
+                AfsServiceConfig::parse(&service.config)?;
+            }
             if service.role == Role::Adxlet {
                 let admin_socket = self.admin_path(service);
                 if admin_socket.as_os_str().len() > 100 || !sockets.insert(admin_socket) {
@@ -499,6 +545,7 @@ impl Deployment {
             };
             let mut environment = service.env.clone();
             let mut admin_socket = None;
+            let mut health_url = None;
             let config_path = output_directory.join(format!(
                 "{}.{}",
                 service.id,
@@ -612,8 +659,15 @@ impl Deployment {
                     redis_config_text = Some(RedisConfig::parse(&service.config)?.text()?);
                     vec![config_path.display().to_string()]
                 }
+                Role::AfsMeta | Role::AfsNode => {
+                    let config = AfsServiceConfig::parse(&service.config)?;
+                    health_url = config.health_url;
+                    vec!["--config".into(), config.config_file.display().to_string()]
+                }
             };
-            if let Some(text) = redis_config_text {
+            if matches!(service.role, Role::AfsMeta | Role::AfsNode) {
+                // AFS owns its TOML schema. Deployment only wires the chosen file into lifecycle.
+            } else if let Some(text) = redis_config_text {
                 private_write(&config_path, text.as_bytes())?;
             } else {
                 private_write(&config_path, &serde_json::to_vec_pretty(&config)?)?;
@@ -626,6 +680,7 @@ impl Deployment {
                 args: arguments,
                 env: environment,
                 admin_socket,
+                health_url,
             });
         }
         processes.sort_by_key(|process| process.role);
@@ -648,6 +703,7 @@ fn resolve_profile(input: ProfileDeployment) -> Result<Deployment> {
     let mut deployment: Deployment = serde_saphyr::from_str(input.profile.template())
         .map_err(|error| format!("invalid built-in deployment profile: {error}"))?;
     deployment.schema_version = input.schema_version;
+    deployment.with_afs = input.with_afs;
     if let Some(value) = input.package_dir {
         deployment.package_dir = value;
     }

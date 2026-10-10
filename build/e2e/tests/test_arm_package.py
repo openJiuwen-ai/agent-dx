@@ -21,7 +21,7 @@ class ArmPackageTests(unittest.TestCase):
         self.assertEqual(arm['agents']['arch'], 'arm64')
         self.assertEqual(arm['agents']['os'], 'macos')
         self.assertNotIn('platform-build', arm['depends_on'])
-        self.assertEqual(set(arm['depends_on']), {'build-platform-arm64', 'build-gateway-arm64', 'build-execd-arm64', 'sdk-package', 'admin-package', 'source-gate'})
+        self.assertEqual(set(arm['depends_on']), {'build-platform-arm64', 'build-gateway-arm64', 'build-execd-arm64', 'build-afs-arm64', 'sdk-package', 'admin-package', 'source-gate'})
         compiler = steps['build-platform-arm64']
         self.assertNotIn('depends_on', compiler)
         self.assertIn('build-arm-package.sh build platform', compiler['command'])
@@ -45,6 +45,61 @@ class ArmPackageTests(unittest.TestCase):
         self.assertIn('--step platform-build-arm64', publish)
         self.assertIn('ADX_BUILD_ARCH=arm64', publish)
         self.assertNotIn('OBS_ACCESS_KEY_ID', (ROOT / '.buildkite/build-arm-package.sh').read_text())
+
+    def test_afs_on_uses_the_native_arm_component_and_source_gate(self):
+        steps = {step['key']: step for step in yaml.safe_load(
+            (ROOT / '.buildkite/pipeline-package.yml').read_text())['steps']}
+        afs = steps['build-afs-arm64']
+        self.assertEqual(afs['if'], 'build.env("ADX_ARM_BUILD") != "0" && build.env("ADX_WITH_AFS") == "1"')
+        self.assertEqual(afs['env']['ADX_WITH_AFS'], '1')
+        self.assertEqual(afs['agents']['arch'], 'arm64')
+        self.assertIn('build-arm-package.sh build afs', afs['command'])
+        runner = (ROOT / '.buildkite/build-arm-package.sh').read_text()
+        self.assertIn('parts+=(afs)', runner)
+        self.assertIn('ADX_ARM_TESTS ADX_WITH_AFS', runner)
+        self.assertIn('build:afs', runner)
+        self.assertIn('"${backend_args[@]}"', (ROOT / '.buildkite/package-components.sh').read_text())
+
+    def test_arm_build_can_be_deferred_without_removing_x86_or_shared_gates(self):
+        steps = {step['key']: step for step in yaml.safe_load(
+            (ROOT / '.buildkite/pipeline-package.yml').read_text())['steps']}
+        arm_keys = {'build-platform-arm64', 'build-afs-arm64', 'build-gateway-arm64',
+                    'build-execd-arm64', 'platform-build-arm64', 'publish-arm64',
+                    'artifact-manifest-arm64'}
+        # Include ARM publication/index steps which themselves run on x86 agents.
+        actual_arm = {key for key, step in steps.items()
+                      if 'ARM64' in step['label'] or step.get('env', {}).get('ADX_BUILD_ARCH') == 'arm64'}
+        self.assertEqual(actual_arm, arm_keys)
+        for key in arm_keys:
+            expected = 'build.env("ADX_ARM_BUILD") != "0"'
+            if key == 'build-afs-arm64':
+                expected += ' && build.env("ADX_WITH_AFS") == "1"'
+            self.assertEqual(steps[key]['if'], expected, key)
+        for key in set(steps) - arm_keys:
+            self.assertNotIn('ADX_ARM_BUILD', steps[key].get('if', ''), key)
+
+    def test_arm_build_selector_defaults_on_and_rejects_invalid_input(self):
+        with tempfile.TemporaryDirectory() as directory:
+            agent = Path(directory) / 'buildkite-agent'
+            agent.write_text('#!/bin/sh\nprintf "%s\\n" "$*"\n')
+            agent.chmod(0o755)
+            environment = {key: value for key, value in os.environ.items()
+                           if not key.startswith(('ADX_', 'BUILDKITE_'))}
+            environment['PATH'] = directory + os.pathsep + environment['PATH']
+            for value in (None, '0', '1', 'invalid'):
+                with self.subTest(value=value):
+                    env = dict(environment)
+                    if value is not None:
+                        env['ADX_ARM_BUILD'] = value
+                    result = subprocess.run(['bash', str(ROOT / '.buildkite/select-pipeline.sh')],
+                                            env=env, capture_output=True, text=True)
+                    if value == 'invalid':
+                        self.assertEqual(result.returncode, 2)
+                        self.assertIn('ADX_ARM_BUILD must be 0 or 1', result.stderr)
+                        self.assertNotIn('pipeline upload', result.stdout)
+                    else:
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertIn('pipeline upload .buildkite/pipeline-package.yml', result.stdout)
 
     def test_architecture_resolves_native_targets_and_rejects_unknown(self):
         script = ROOT / '.buildkite/build-architecture.sh'
@@ -86,8 +141,8 @@ class ArmPackageTests(unittest.TestCase):
 
 class ComponentTestSwitch(unittest.TestCase):
     def test_arm_can_skip_tests_without_skipping_compilation(self):
-        for flag in ('0', '1'):
-            with self.subTest(flag=flag), tempfile.TemporaryDirectory() as tmp:
+        for part, flag in (('platform', '0'), ('platform', '1'), ('afs', '0'), ('afs', '1')):
+            with self.subTest(component=part, flag=flag), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
                 (root / '.buildkite').mkdir()
                 (root / 'build/release').mkdir(parents=True)
@@ -101,41 +156,51 @@ class ComponentTestSwitch(unittest.TestCase):
                 fixtures = {
                     'git': '#!/bin/bash\nif [[ $1 == rev-parse ]]; then echo "$BUILDKITE_COMMIT"; fi\n',
                     'rustc': '#!/bin/bash\necho "host: aarch64-unknown-linux-gnu"\n',
-                    'cargo': '#!/bin/bash\necho "$@" > compile-args\nmkdir -p "$CARGO_TARGET_DIR/release"\nfor bin in adxctl adx-inspect adx-coordinator adxlet; do echo binary > "$CARGO_TARGET_DIR/release/$bin"; done\n',
+                    'cargo': '#!/bin/bash\necho "$@" > compile-args\nmkdir -p "$CARGO_TARGET_DIR/release"\nfor bin in adxctl adx-inspect adx-coordinator adxlet afs-meta afs-node; do echo binary > "$CARGO_TARGET_DIR/release/$bin"; done\n',
                 }
                 for name, content in fixtures.items():
                     file = commands / name
                     file.write_text(content)
                     file.chmod(0o755)
                 result = subprocess.run(
-                    [shutil.which('bash'), '.buildkite/build-component.sh', 'platform'], cwd=root,
+                    [shutil.which('bash'), '.buildkite/build-component.sh', part], cwd=root,
                     env=dict(os.environ, PATH=str(commands) + os.pathsep + os.environ['PATH'],
                              BUILDKITE_COMMIT='b' * 40, ADX_BUILD_ARCH='arm64',
-                             ADX_COMPONENT_LOCAL='1', ADX_COMPONENT_TESTS=flag),
+                             ADX_COMPONENT_LOCAL='1', ADX_COMPONENT_TESTS=flag, ADX_WITH_AFS='1' if part == 'afs' else '0'),
                     capture_output=True, text=True,
                 )
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertTrue((root / 'compile-args').read_text().startswith('build --locked --release'))
                 self.assertEqual((root / 'tests-ran').exists(), flag == '1')
-                self.assertTrue((root / 'out/buildkite/components/platform.tar.gz').is_file())
+                self.assertTrue((root / f'out/buildkite/components/{part}.tar.gz').is_file())
 
 
 class ArmRunnerTests(unittest.TestCase):
+    def test_afs_component_requires_explicit_on_before_builder_access(self):
+        result = subprocess.run(
+            [shutil.which('bash'), str(ROOT / '.buildkite/build-arm-package.sh'), 'build', 'afs'],
+            env=dict(os.environ, ADX_WITH_AFS='0'), capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn('AFS component requires ADX_WITH_AFS=1', result.stderr)
+
     def test_container_failure_retains_logs_and_archives_in_arm_directory(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / 'build/images').mkdir(parents=True)
-            (root / 'build/images/build-environment-arm64.json').write_text(json.dumps({
-                'ci_image': 'registry/builder@sha256:' + 'a' * 64,
-            }))
-            commands = root / 'commands'
-            commands.mkdir()
-            fixtures = {
-                'uname': '#!/bin/bash\necho arm64\n',
-                'git': '#!/bin/bash\nif [[ $1 == rev-parse ]]; then echo "$BUILDKITE_COMMIT"; fi\n',
-                'buildkite-agent': '#!/bin/bash\nexit 0\n',
-                'docker': '''#!/bin/bash
+        for part in ('execd', 'afs'):
+            with self.subTest(component=part), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                (root / 'build/images').mkdir(parents=True)
+                (root / 'build/images/build-environment-arm64.json').write_text(json.dumps({
+                    'ci_image': 'registry/builder@sha256:' + 'a' * 64,
+                }))
+                commands = root / 'commands'
+                commands.mkdir()
+                fixtures = {
+                    'uname': '#!/bin/bash\necho arm64\n',
+                    'git': '#!/bin/bash\nif [[ $1 == rev-parse ]]; then echo "$BUILDKITE_COMMIT"; fi\n',
+                    'buildkite-agent': '#!/bin/bash\nexit 0\n',
+                    'docker': '''#!/bin/bash
 if [[ $1 == run ]]; then
+  printf '%s\\n' "$@" > docker-args
   python3 -c 'from pathlib import Path; assert Path("out/buildkite/logs").stat().st_mode & 2'
   if [[ $? != 0 ]]; then exit 18; fi
   mkdir -p out/buildkite/components
@@ -144,28 +209,30 @@ if [[ $1 == run ]]; then
   exit 17
 fi
 ''',
-            }
-            for name, contents in fixtures.items():
-                file = commands / name
-                file.write_text(contents)
-                file.chmod(0o755)
-            # Avoid selecting the host's installed Docker in this failure fixture.
-            script = (ROOT / '.buildkite/build-arm-package.sh').read_text().replace(
-                'export PATH="/usr/local/bin:/opt/homebrew/bin:$PATH"', ':',
-            )
-            runner = root / 'runner.sh'
-            runner.write_text(script)
-            result = subprocess.run(
-                [shutil.which('bash'), str(runner), 'build', 'execd'], cwd=root,
-                env=dict(
-                    os.environ, PATH=str(commands) + os.pathsep + os.environ['PATH'],
-                    BUILDKITE_COMMIT='b' * 40, BUILDKITE_BUILD_ID='build-test', ADX_OBS_UPLOAD='0',
-                ),
-                capture_output=True, text=True,
-            )
-            self.assertEqual(result.returncode, 17, result.stderr)
-            evidence = root / 'out/buildkite/arm64'
-            self.assertEqual((evidence / 'components/execd.tar.gz').read_text(), 'evidence\n')
-            self.assertIn(
-                'deliberate-container-failure', (evidence / 'logs/step-release-arm64.log').read_text(),
-            )
+                }
+                for name, contents in fixtures.items():
+                    file = commands / name
+                    file.write_text(contents)
+                    file.chmod(0o755)
+                # Avoid selecting the host's installed Docker in this failure fixture.
+                script = (ROOT / '.buildkite/build-arm-package.sh').read_text().replace(
+                    'export PATH="/usr/local/bin:/opt/homebrew/bin:$PATH"', ':',
+                )
+                runner = root / 'runner.sh'
+                runner.write_text(script)
+                result = subprocess.run(
+                    [shutil.which('bash'), str(runner), 'build', part], cwd=root,
+                    env=dict(
+                        os.environ, PATH=str(commands) + os.pathsep + os.environ['PATH'],
+                        BUILDKITE_COMMIT='b' * 40, BUILDKITE_BUILD_ID='build-test', ADX_OBS_UPLOAD='0', ADX_WITH_AFS='1' if part == 'afs' else '0',
+                    ),
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(result.returncode, 17, result.stderr)
+                evidence = root / 'out/buildkite/arm64'
+                self.assertEqual((evidence / 'components/execd.tar.gz').read_text(), 'evidence\n')
+                self.assertIn(
+                    'deliberate-container-failure', (evidence / 'logs/step-release-arm64.log').read_text(),
+                )
+                args = (root / 'docker-args').read_text().splitlines()
+                self.assertIn('ADX_WITH_AFS', args)

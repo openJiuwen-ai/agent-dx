@@ -1,0 +1,11 @@
+{
+  "state": "PREPARING",
+  "verification": {
+    "status": "NOT_RUN"
+  },
+  "contract": {},
+  "runner": {},
+  "manifest": {},
+  "source": {},
+  "binary": {}
+}

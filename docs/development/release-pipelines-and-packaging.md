@@ -23,6 +23,17 @@ SDK 与 adxadmin 分别运行 UT、wheel/sdist 构建及安装检查，source ga
 没有漏项或重复。被显式忽略的环境依赖测试仍由专项验收负责，不计为本轮 UT 已通过。
 adxadmin 复用 SDK 的 Python 3.12 容器执行器，不使用 Rust 构建镜像的 Python 3.9。
 
+Agent FS（AFS） 是可选文件系统组件。默认 source gate、基础包组装、镜像和部署不包含
+`afs-meta`、`afs-node`、AFS 配置示例或 FUSE 专属系统依赖。`afs/**`、根 Cargo/Make
+入口或 source gate 本身变化时，默认 pipeline 仍走 `.buildkite/source-gate.sh`；显式
+`ADX_WITH_AFS=1` 时，source gate 在公共 fmt/Clippy/tooling 检查中追加 AFS lint，但不改变默认包
+或部署制品。显式文件系统包使用同一个 `ADX_WITH_AFS=1` 合同，Buildkite 才启用
+`build-afs` 和 `build-afs-arm64` 可选组件步，组装时下载 AFS 组件并把 `--with-afs` 传给包清单、build manifest
+和 OBS 发布校验。带 AFS 包写入 `with_afs: true` 并包含 `bin/afs-meta`、`bin/afs-node`
+和 `etc/examples/afs/*`；默认包校验会拒绝这些文件。普通产品构建不编译 AFS
+examples/验收探针；RDMA/all-features lint 需要 `ADX_AFS_ALL_FEATURES=1` 且先通过
+`libibverbs` 开发文件检查。
+
 组件中间产物默认经 OBS `adx/ci/<build UUID>/<commit>/<component>/` 传递，校验身份和
 SHA256 后组装。`ADX_ARTIFACT_TRANSPORT=buildkite` 可切回 Buildkite 传递。
 组装、临时目录安装检查和默认 OBS 上传都在 `platform-build` 内完成，上传直接使用本地
