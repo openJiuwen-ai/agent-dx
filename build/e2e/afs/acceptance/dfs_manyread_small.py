@@ -15,6 +15,7 @@ import os
 import select
 from pathlib import Path
 import platform
+import re
 import shutil
 import stat
 import subprocess
@@ -27,14 +28,14 @@ BLOCK_BYTES = 1024 * 1024
 CONCURRENCY = 1
 PATTERN_BYTE = 97
 IO_TOOL_SHA256 = "70ac97c7634d406a177a74c783d446b62a2014ba198586132882a1d9228e55e8"
-PRODUCT_SOURCE_COMMIT = "6d51aeb45c1ed8669d80f612b3817e6d1bdabe04"
-COMPILER_INPUT_MAP = "66dbbe3e0071fcec1efc9cf370c709a99f025d39acd4f37ba57582c874429304"
 WARMUP_ROUNDS = 1
 MEASUREMENT_ROUNDS = 5
 PAYLOAD_NAME = "payload64m.bin"
 DELETE_FILE_COUNT = 100
 DELETE_FILE_BYTES = 4096
 OWNER_REMOTE_SMALL_SHA256 = "a28a1bee8092705298a7fcb03311152d574917a0176d6fcbd056d40e10405480"
+COMMIT_RE = re.compile(r"[0-9a-f]{40}")
+SHA256_RE = re.compile(r"[0-9a-f]{64}")
 
 
 def sha256_file(path: Path) -> str:
@@ -132,6 +133,35 @@ def validate_io_tool(path: Path) -> dict[str, Any]:
     if digest != IO_TOOL_SHA256:
         raise ValueError(f"io tool sha256 mismatch: {digest}")
     return {"path": str(path), "sha256": digest}
+
+
+def validate_product_identity(product_source_commit: str, compiler_input_map: str) -> dict[str, str]:
+    if not COMMIT_RE.fullmatch(product_source_commit):
+        raise ValueError(f"product source commit must be 40 lowercase hex chars: {product_source_commit!r}")
+    if not SHA256_RE.fullmatch(compiler_input_map):
+        raise ValueError(f"compiler input map must be 64 lowercase hex chars: {compiler_input_map!r}")
+    return {
+        "product_source_commit": product_source_commit,
+        "compiler_input_map": compiler_input_map,
+        "identity_source": "caller supplied identity",
+    }
+
+
+def product_identity_from_args(args: argparse.Namespace) -> dict[str, str]:
+    product_source_commit = getattr(args, "product_source_commit", None)
+    compiler_input_map = getattr(args, "compiler_input_map", None)
+    if not isinstance(product_source_commit, str) or not isinstance(compiler_input_map, str):
+        raise ValueError("product identity requires --product-source-commit and --compiler-input-map")
+    return validate_product_identity(product_source_commit, compiler_input_map)
+
+
+def require_manifest_identity(manifest: dict[str, Any], expected_identity: dict[str, str], label: str) -> None:
+    if manifest.get("product_source_commit") != expected_identity["product_source_commit"]:
+        raise ValueError(f"{label} manifest full source identity mismatch")
+    if manifest.get("compiler_input_map") != expected_identity["compiler_input_map"]:
+        raise ValueError(f"{label} manifest full compiler input map mismatch")
+    if manifest.get("identity_source") != "caller supplied identity":
+        raise ValueError(f"{label} manifest must record caller supplied identity")
 
 
 def validate_io_result(record: dict[str, Any], operation: str, barrier: str) -> None:
@@ -453,13 +483,10 @@ def run_delete_sample(dfs_root: Path, run_id: str, round_index: int, helper: Any
     return record
 
 
-def validate_delete_manifest(manifest: dict[str, Any]) -> list[dict[str, Any]]:
+def validate_delete_manifest(manifest: dict[str, Any], expected_identity: dict[str, str]) -> list[dict[str, Any]]:
     if manifest.get("status") != "DATA_RECORDED":
         raise ValueError("delete writer manifest is not DATA_RECORDED")
-    if manifest.get("product_source_commit") != PRODUCT_SOURCE_COMMIT or manifest.get("compiler_input_map") != COMPILER_INPUT_MAP:
-        raise ValueError("delete writer manifest source/map mismatch")
-    if manifest.get("source6d") != PRODUCT_SOURCE_COMMIT[:7] or manifest.get("map66") != COMPILER_INPUT_MAP[:8]:
-        raise ValueError("delete writer manifest display source/map mismatch")
+    require_manifest_identity(manifest, expected_identity, "delete writer")
     run_id = validate_delete_run_id(manifest.get("run_id"))
     dfs_root_path = validate_delete_writer_root(manifest)
     helper = manifest.get("owner_delete_helper")
@@ -531,6 +558,8 @@ def delete_writer(args: argparse.Namespace) -> dict[str, Any]:
     output_created = False
     rounds: list[dict[str, Any]] = []
     try:
+        identity = product_identity_from_args(args)
+        result.update(identity)
         dfs_root = require_absolute_path(args.dfs_root, "dfs-root")
         output = require_absolute_path(args.output, "output")
         validate_output_path(output)
@@ -544,10 +573,6 @@ def delete_writer(args: argparse.Namespace) -> dict[str, Any]:
         run_id = f"{time.time_ns()}-{os.getpid()}"
         result.update({
             "status": "FAIL",
-            "product_source_commit": PRODUCT_SOURCE_COMMIT,
-            "source6d": PRODUCT_SOURCE_COMMIT[:7],
-            "compiler_input_map": COMPILER_INPUT_MAP,
-            "map66": COMPILER_INPUT_MAP[:8],
             "platform": platform_identity,
             "fs": {"dfs_root": stat_identity(dfs_root)},
             "mount": mount,
@@ -558,7 +583,7 @@ def delete_writer(args: argparse.Namespace) -> dict[str, Any]:
             "cache_state": "UNOBSERVED",
             "comparison_status": "CANDIDATE_ONLY_3FS_COMPARATOR_NOT_RUN",
         })
-        write_json(output / "preflight.json", {k: result[k] for k in ("product_source_commit", "compiler_input_map", "platform", "fs", "mount", "delete_shape", "owner_delete_helper")})
+        write_json(output / "preflight.json", {k: result[k] for k in ("product_source_commit", "compiler_input_map", "identity_source", "platform", "fs", "mount", "delete_shape", "owner_delete_helper")})
         for index in range(WARMUP_ROUNDS + MEASUREMENT_ROUNDS):
             sample = run_delete_sample(dfs_root, run_id, index, helper)
             sample_path = output / "delete-samples" / f"round-{index:02d}.json"
@@ -587,6 +612,8 @@ def delete_checker(args: argparse.Namespace) -> dict[str, Any]:
     output: Path | None = None
     output_created = False
     try:
+        identity = product_identity_from_args(args)
+        result.update(identity)
         dfs_root = require_absolute_path(args.dfs_root, "dfs-root")
         manifest_path = require_absolute_path(args.manifest, "manifest")
         output = require_absolute_path(args.output, "output")
@@ -600,15 +627,11 @@ def delete_checker(args: argparse.Namespace) -> dict[str, Any]:
         mount = find_mount(dfs_root)
         require_dfs_mount(mount, dfs_root)
         manifest = read_json(manifest_path)
-        rounds = validate_delete_manifest(manifest)
+        rounds = validate_delete_manifest(manifest, identity)
         check = check_deleted_paths(dfs_root, rounds)
         write_json(output / "enoent-check.json", check)
         result.update({
             "status": "DATA_RECORDED" if check.get("status") == "PASS" else "FAIL",
-            "product_source_commit": PRODUCT_SOURCE_COMMIT,
-            "source6d": PRODUCT_SOURCE_COMMIT[:7],
-            "compiler_input_map": COMPILER_INPUT_MAP,
-            "map66": COMPILER_INPUT_MAP[:8],
             "platform": platform_identity,
             "fs": {"dfs_root": stat_identity(dfs_root)},
             "mount": mount,
@@ -632,6 +655,8 @@ def writer(args: argparse.Namespace) -> dict[str, Any]:
     output: Path | None = None
     output_created = False
     try:
+        identity = product_identity_from_args(args)
+        result.update(identity)
         dfs_root = require_absolute_path(args.dfs_root, "dfs-root")
         io_tool = require_absolute_path(args.io_tool, "io-tool")
         output = require_absolute_path(args.output, "output")
@@ -658,10 +683,6 @@ def writer(args: argparse.Namespace) -> dict[str, Any]:
         content = verify_payload(payload, expected_sha)
         result.update({
             "status": "DATA_RECORDED" if write_record.get("status") == "PASS" and content.get("status") == "PASS" else "FAIL",
-            "product_source_commit": PRODUCT_SOURCE_COMMIT,
-            "source6d": PRODUCT_SOURCE_COMMIT[:7],
-            "compiler_input_map": COMPILER_INPUT_MAP,
-            "map66": COMPILER_INPUT_MAP[:8],
             "io_tool": io_identity,
             "fs": {"dfs_root": stat_identity(dfs_root), "sample_dir": stat_identity(sample_dir), "payload": stat_identity(payload)},
             "mount": mount,
@@ -681,15 +702,10 @@ def writer(args: argparse.Namespace) -> dict[str, Any]:
     return result
 
 
-def validate_manifest_shape(manifest: dict[str, Any]) -> dict[str, Any]:
+def validate_manifest_shape(manifest: dict[str, Any], expected_identity: dict[str, str]) -> dict[str, Any]:
     if manifest.get("status") != "DATA_RECORDED":
         raise ValueError("writer manifest is not DATA_RECORDED")
-    if manifest.get("product_source_commit") != PRODUCT_SOURCE_COMMIT:
-        raise ValueError("writer manifest full source identity mismatch")
-    if manifest.get("compiler_input_map") != COMPILER_INPUT_MAP:
-        raise ValueError("writer manifest full compiler input map mismatch")
-    if manifest.get("source6d") != PRODUCT_SOURCE_COMMIT[:7] or manifest.get("map66") != COMPILER_INPUT_MAP[:8]:
-        raise ValueError("writer manifest display source/map identity mismatch")
+    require_manifest_identity(manifest, expected_identity, "writer")
     io_tool = manifest.get("io_tool")
     if not isinstance(io_tool, dict) or io_tool.get("sha256") != IO_TOOL_SHA256:
         raise ValueError("writer manifest io tool identity mismatch")
@@ -764,6 +780,8 @@ def sync_reader(args: argparse.Namespace) -> dict[str, Any]:
                                 "protocol": "afs.dfs_manyread.sync_stdio.v1", "rounds": MEASUREMENT_ROUNDS})
     control_reader = JsonLineReader(sys.stdin)
     try:
+        identity = product_identity_from_args(args)
+        result.update(identity)
         read_ack_event(control_reader, 0, timeout, reader_id=reader_id, session_token=session_token)
         dfs_root = require_absolute_path(args.dfs_root, "dfs-root")
         io_tool = require_absolute_path(args.io_tool, "io-tool")
@@ -777,7 +795,7 @@ def sync_reader(args: argparse.Namespace) -> dict[str, Any]:
         if manifest_path.is_symlink() or not manifest_path.is_file():
             raise ValueError(f"manifest must be an existing non-symlink file: {manifest_path}")
         manifest = read_json(manifest_path)
-        payload_shape = validate_manifest_shape(manifest)
+        payload_shape = validate_manifest_shape(manifest, identity)
         mount = find_mount(dfs_root)
         require_dfs_mount(mount, dfs_root)
         io_identity = validate_io_tool(io_tool)
@@ -786,7 +804,7 @@ def sync_reader(args: argparse.Namespace) -> dict[str, Any]:
         write_json(output / "manifest-precheck.json", {"manifest": str(manifest_path), "content_verify": pre_content})
         result.update({
             "platform": platform_identity,
-            "manifest": {"path": str(manifest_path), "payload": payload_shape, "product_source_commit": manifest.get("product_source_commit"), "compiler_input_map": manifest.get("compiler_input_map"), "source6d": manifest.get("source6d"), "map66": manifest.get("map66")},
+            "manifest": {"path": str(manifest_path), "payload": payload_shape, "product_source_commit": manifest.get("product_source_commit"), "compiler_input_map": manifest.get("compiler_input_map"), "identity_source": manifest.get("identity_source")},
             "io_tool": io_identity,
             "fs": {"dfs_root": stat_identity(dfs_root), "payload": stat_identity(payload)},
             "mount": mount,
@@ -851,6 +869,8 @@ def reader(args: argparse.Namespace) -> dict[str, Any]:
     output: Path | None = None
     output_created = False
     try:
+        identity = product_identity_from_args(args)
+        result.update(identity)
         dfs_root = require_absolute_path(args.dfs_root, "dfs-root")
         io_tool = require_absolute_path(args.io_tool, "io-tool")
         manifest_path = require_absolute_path(args.manifest, "manifest")
@@ -863,7 +883,7 @@ def reader(args: argparse.Namespace) -> dict[str, Any]:
         if manifest_path.is_symlink() or not manifest_path.is_file():
             raise ValueError(f"manifest must be an existing non-symlink file: {manifest_path}")
         manifest = read_json(manifest_path)
-        payload_shape = validate_manifest_shape(manifest)
+        payload_shape = validate_manifest_shape(manifest, identity)
         mount = find_mount(dfs_root)
         require_dfs_mount(mount, dfs_root)
         io_identity = validate_io_tool(io_tool)
@@ -872,7 +892,7 @@ def reader(args: argparse.Namespace) -> dict[str, Any]:
         write_json(output / "manifest-precheck.json", {"manifest": str(manifest_path), "content_verify": content})
         result.update({
             "platform": platform_identity,
-            "manifest": {"path": str(manifest_path), "payload": payload_shape, "product_source_commit": manifest.get("product_source_commit"), "compiler_input_map": manifest.get("compiler_input_map"), "source6d": manifest.get("source6d"), "map66": manifest.get("map66")},
+            "manifest": {"path": str(manifest_path), "payload": payload_shape, "product_source_commit": manifest.get("product_source_commit"), "compiler_input_map": manifest.get("compiler_input_map"), "identity_source": manifest.get("identity_source")},
             "io_tool": io_identity,
             "fs": {"dfs_root": stat_identity(dfs_root), "payload": stat_identity(payload)},
             "mount": mount,
@@ -1021,14 +1041,20 @@ def parse_args() -> argparse.Namespace:
         item.add_argument("--dfs-root", required=True)
         item.add_argument("--io-tool", required=True)
         item.add_argument("--output", required=True)
+        item.add_argument("--product-source-commit", required=True)
+        item.add_argument("--compiler-input-map", required=True)
     delete_writer_parser = sub.add_parser("delete-writer")
     delete_writer_parser.add_argument("--dfs-root", required=True)
     delete_writer_parser.add_argument("--output", required=True)
+    delete_writer_parser.add_argument("--product-source-commit", required=True)
+    delete_writer_parser.add_argument("--compiler-input-map", required=True)
     delete_checker_parser = sub.add_parser("delete-checker")
     delete_checker_parser.add_argument("--dfs-root", required=True)
     delete_checker_parser.add_argument("--manifest", required=True)
     delete_checker_parser.add_argument("--output", required=True)
     delete_checker_parser.add_argument("--checker-id", choices=("B", "C"), required=True)
+    delete_checker_parser.add_argument("--product-source-commit", required=True)
+    delete_checker_parser.add_argument("--compiler-input-map", required=True)
     coordinator_parser = sub.add_parser("coordinator")
     coordinator_parser.add_argument("--output", required=True)
     coordinator_parser.add_argument("--session-token", required=True)

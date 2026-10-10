@@ -688,16 +688,14 @@ class AccountingDriverTests(unittest.TestCase):
         fixture.entries[3]["raw_artifacts"] = [item for item in fixture.entries[3]["raw_artifacts"] if item["path"] != missing_rel]  # type: ignore[index]
         self.assertBlocked(fixture, "raw artifact is not hash-bound")
 
-    def test_frozen_fixture_identity_without_node_meta_process_is_rejected(self):
-        repo = Path(__file__).resolve().parents[2]
-        fixture_path = repo / "evidence" / "afs-delivery" / "suite-binding-v93" / "ctl" / "ext4-reference" / "STD-01" / "artifacts" / "std-01-pjdfstest" / "identity.json"
-        if not fixture_path.exists():
-            self.skipTest("frozen STD-01 identity fixture not present")
-        identity = json.loads(fixture_path.read_text())
+    def test_self_reported_product_without_process_identity_is_rejected(self):
+        # Product hashes alone cannot establish the running node/meta identity.
+        identity = {"product": {"node_sha256": "a" * 64, "meta_sha256": "b" * 64}}
         with self.assertRaises(accounting.AccountingError) as ctx:
             accounting.check_stable_process_identity("STD-01", identity)
         self.assertEqual(ctx.exception.status, "BLOCKED")
         self.assertIn("original stable node process identity is missing", str(ctx.exception))
+
 
 
 if __name__ == "__main__":

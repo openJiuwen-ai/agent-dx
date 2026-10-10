@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import stat
 import subprocess
 import time
@@ -24,10 +25,10 @@ CONCURRENCY = 1
 PATTERN_BYTE = 97
 EXPECTED_SHA256 = "fae972222d455a2eaee1661ad9625502ec3bfc5ec38b87a6eec5afd5107331b5"
 IO_TOOL_SHA256 = "70ac97c7634d406a177a74c783d446b62a2014ba198586132882a1d9228e55e8"
-PRODUCT_SOURCE_COMMIT = "6d51aeb45c1ed8669d80f612b3817e6d1bdabe04"
-COMPILER_INPUT_MAP = "66dbbe3e0071fcec1efc9cf370c709a99f025d39acd4f37ba57582c874429304"
 WARMUP_ROUNDS = 1
 MEASUREMENT_ROUNDS = 5
+COMMIT_RE = re.compile(r"[0-9a-f]{40}")
+SHA256_RE = re.compile(r"[0-9a-f]{64}")
 
 
 def sha256_file(path: Path) -> str:
@@ -98,11 +99,33 @@ def require_owner_mount(mount: dict[str, Any]) -> None:
         raise ValueError(f"owner root must be exact FUSE source afs-ownerfs: {mount}")
 
 
-def require_moose_mount(mount: dict[str, Any]) -> None:
+def require_moose_mount(mount: dict[str, Any], expected_source: str) -> None:
+    if not isinstance(expected_source, str) or not re.fullmatch(r"mfs#[^\s\x00]+", expected_source):
+        raise ValueError("expected MooseFS source must be a nonempty mfs# source without whitespace")
     source = str(mount.get("source", ""))
     fstype = str(mount.get("fstype", ""))
-    if fstype not in ("fuse", "fuse.mfs") or source != "mfs#192.168.109.11:23042":
-        raise ValueError(f"moose root must be standard FUSE with exact one-copy MooseFS source mfs#192.168.109.11:23042: {mount}")
+    if fstype not in ("fuse", "fuse.mfs") or source != expected_source:
+        raise ValueError(f"moose root must be standard FUSE with exact caller-supplied MooseFS source {expected_source}: {mount}")
+
+
+def validate_product_identity(product_source_commit: str, compiler_input_map: str) -> dict[str, str]:
+    if not COMMIT_RE.fullmatch(product_source_commit):
+        raise ValueError(f"product source commit must be 40 lowercase hex chars: {product_source_commit!r}")
+    if not SHA256_RE.fullmatch(compiler_input_map):
+        raise ValueError(f"compiler input map must be 64 lowercase hex chars: {compiler_input_map!r}")
+    return {
+        "product_source_commit": product_source_commit,
+        "compiler_input_map": compiler_input_map,
+        "identity_source": "caller supplied identity",
+    }
+
+
+def product_identity_from_args(args: argparse.Namespace) -> dict[str, str]:
+    product_source_commit = getattr(args, "product_source_commit", None)
+    compiler_input_map = getattr(args, "compiler_input_map", None)
+    if not isinstance(product_source_commit, str) or not isinstance(compiler_input_map, str):
+        raise ValueError("product identity requires --product-source-commit and --compiler-input-map")
+    return validate_product_identity(product_source_commit, compiler_input_map)
 
 
 def fsync_directory(path: Path) -> None:
@@ -246,15 +269,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "scope": "small OwnerFs remote write vs MooseFS write diagnostic; not parity or durability qualification",
         "cache_state": "unobserved",
         "moose_strong_durable_ack": "BLOCKED_PARENT_BASELINE",
-        "product_source_commit": PRODUCT_SOURCE_COMMIT,
-        "source6d": PRODUCT_SOURCE_COMMIT[:7],
-        "compiler_input_map": COMPILER_INPUT_MAP,
-        "map66": COMPILER_INPUT_MAP[:8],
         "shape": {"bytes": DATA_BYTES, "block_bytes": BLOCK_BYTES, "concurrency": CONCURRENCY, "pattern_byte": PATTERN_BYTE, "warmups": WARMUP_ROUNDS, "measurements": MEASUREMENT_ROUNDS},
     }
     output: Path | None = None
     output_created = False
     try:
+        identity = product_identity_from_args(args)
+        result.update(identity)
         owner_root = require_absolute_path(args.owner_root, "owner-root")
         moose_root = require_absolute_path(args.moose_root, "moose-root")
         io_tool = require_absolute_path(args.io_tool, "io-tool")
@@ -268,11 +289,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         owner_mount = find_mount(owner_root)
         moose_mount = find_mount(moose_root)
         require_owner_mount(owner_mount)
-        require_moose_mount(moose_mount)
+        require_moose_mount(moose_mount, args.moose_source)
         io_identity = validate_io_tool(io_tool)
         preflight = {
             "platform": platform_identity,
             "io_tool": io_identity,
+            "product_identity": identity,
             "roots": {"owner": stat_identity(owner_root), "moose": stat_identity(moose_root)},
             "mounts": {"owner": owner_mount, "moose": moose_mount},
         }
@@ -295,8 +317,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--owner-root", required=True)
     parser.add_argument("--moose-root", required=True)
+    parser.add_argument("--moose-source", required=True)
     parser.add_argument("--io-tool", required=True)
     parser.add_argument("--output", required=True)
+    parser.add_argument("--product-source-commit", required=True)
+    parser.add_argument("--compiler-input-map", required=True)
     return parser.parse_args()
 
 

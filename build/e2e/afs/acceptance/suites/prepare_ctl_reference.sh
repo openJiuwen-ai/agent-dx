@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-STATE_ROOT="${STATE_ROOT:-/mnt/lima-afsctlstate/afs-acceptance/suites-reference}"
+STATE_ROOT="${STATE_ROOT:-/var/lib/afs-acceptance/suites-reference}"
 RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$$}"
 EVIDENCE_ROOT="${EVIDENCE_ROOT:-$STATE_ROOT/evidence/runs/$RUN_ID}"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"

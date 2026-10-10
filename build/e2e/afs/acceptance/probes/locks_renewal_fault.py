@@ -353,7 +353,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--renamed-a", help=argparse.SUPPRESS)
     parser.add_argument("--renamed-b", help=argparse.SUPPRESS)
     parser.add_argument("--evidence", required=True)
-    parser.add_argument("--meta-control-json", required=True, type=_json_argv, help="JSON command prefix used to run Python control snippets next to the Meta process, e.g. [\"limactl\",\"shell\",\"afs-accept-a\",\"--\",\"sudo\"]")
+    parser.add_argument("--meta-control-json", required=True, type=_json_argv, help="JSON command prefix used to run Python control snippets next to the Meta process, e.g. [\"limactl\",\"shell\",\"afs-test-node\",\"--\",\"sudo\"]")
     parser.add_argument("--meta-pid-file", required=True, help="PID file path as seen by the Meta control prefix")
     parser.add_argument("--meta-executable-sha256", required=True, help="expected SHA256 of /proc/PID/exe for the Meta process")
     parser.add_argument("--command-timeout", type=float, default=DEFAULT_COMMAND_TIMEOUT_SECONDS)

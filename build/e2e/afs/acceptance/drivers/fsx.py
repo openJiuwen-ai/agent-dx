@@ -27,7 +27,7 @@ from typing import Any
 from target_identity import target_checks
 
 SECFS_REV = "edf5eb4a108bfb41073f765aef0cdd32bb3ee1ed"
-DEFAULT_SUITE_ROOT = Path("/mnt/lima-afsctlstate/afs-acceptance/suites-reference/src/secfs.test")
+DEFAULT_SUITE_ROOT = Path("/var/lib/afs-acceptance/suites-reference/src/secfs.test")
 DEFAULT_FSX_BINARY = DEFAULT_SUITE_ROOT / "tools" / "bin" / "fsx"
 FULL_SEEDS = [1, 2, 3]
 FULL_DURATION_SECONDS = 900

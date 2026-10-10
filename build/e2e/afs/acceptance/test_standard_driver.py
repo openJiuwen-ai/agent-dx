@@ -190,7 +190,7 @@ class StandardRemoteIdentityHelpersTest(unittest.TestCase):
             cfg_path = root / "node.toml"
             cfg_path.write_text(
                 "\n".join([
-                    "meta_endpoint = 'https://192.168.109.12:17880/path#fragment'",
+                    "meta_endpoint = 'https://192.0.2.12:17880/path#fragment'",
                     "grpc_listen = '0.0.0.0:17884'",
                     "rest_listen = '0.0.0.0:17885'",
                     f"tls_ca_certificate = '{root / 'ca.pem'}'",
@@ -202,7 +202,7 @@ class StandardRemoteIdentityHelpersTest(unittest.TestCase):
                 encoding="utf-8",
             )
             summary = standard.config_summary(cfg_path)
-            self.assertEqual(summary["meta_endpoint"], "https://192.168.109.12:17880/path#fragment")
+            self.assertEqual(summary["meta_endpoint"], "https://192.0.2.12:17880/path#fragment")
             self.assertEqual(summary["grpc_listen"], "0.0.0.0:17884")
             self.assertTrue(summary["tls_required"])
             self.assertEqual(summary["tls_missing"], [])
@@ -354,7 +354,7 @@ class StandardHostRemoteGuardTest(unittest.TestCase):
             def fake_worker(prefix, args, timeout):
                 calls.append(args[0])
                 raise AssertionError("worker must not run when worker-run-dir-b is a host path")
-            rc, proof = self.run_host_with_fake_worker(fake_worker, run_dir, ["--worker-run-dir-b", "/Users/lzc/evidence/std01"])
+            rc, proof = self.run_host_with_fake_worker(fake_worker, run_dir, ["--worker-run-dir-b", "/Users/test-user/evidence/std01"])
             self.assertEqual(rc, 1)
             self.assertEqual(proof["status"], "BLOCKED")
             self.assertFalse(calls)

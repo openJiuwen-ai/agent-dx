@@ -1,8 +1,0 @@
-{
-  "pid": 731821,
-  "start_ticks": 8447739,
-  "cmdline": "python3 /var/lib/afs-acceptance/network-v67-r2/env_network.py server --bind-ip 192.168.109.12 --port 19566 --tls-port 19567 --ca /var/lib/afs-acceptance/network-v67-r2/tls/ca.pem --server-cert /var/lib/afs-acceptance/network-v67-r2/tls/a.pem --server-key /var/lib/afs-acceptance/network-v67-r2/tls/a.key --ready-json /var/lib/afs-acceptance/network-v67-r2/ready.json ",
-  "boot_id": "36a572e0-859b-4a94-adc7-789210a83fc8",
-  "script_sha256": "3db932a4c1a72d450edbcc222ae8ae4010061fac84b5c012f061c91186e79612",
-  "status": "LIVE"
-}

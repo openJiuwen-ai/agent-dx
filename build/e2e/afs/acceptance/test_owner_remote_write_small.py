@@ -10,6 +10,10 @@ spec = importlib.util.spec_from_file_location("owner_remote_write_small", Path(_
 owner_remote_write_small = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(owner_remote_write_small)
 
+TEST_COMMIT = "1" * 40
+TEST_MAP = "2" * 64
+TEST_MOOSE_SOURCE = "mfs#moose-meta.example:23042"
+
 
 def good_write_result(**overrides: object) -> dict[str, object]:
     record: dict[str, object] = {
@@ -79,23 +83,53 @@ class OwnerRemoteWriteSmallGuardTests(unittest.TestCase):
             class Args:
                 owner_root = "/missing-owner"
                 moose_root = "/missing-moose"
+                moose_source = TEST_MOOSE_SOURCE
                 io_tool = "/missing-io"
                 output = str(out)
+                product_source_commit = TEST_COMMIT
+                compiler_input_map = TEST_MAP
 
             result = owner_remote_write_small.run(Args())
             self.assertEqual(result["status"], "BLOCKED")
             self.assertEqual(sentinel.read_text(encoding="utf-8"), "sentinel")
+
+    def test_caller_source_cannot_mislabel_another_fuse_mount_as_moose(self) -> None:
+        for source in ("", "afs-ownerfs", "afs-dfs", "mfs#", "mfs#bad source"):
+            with self.subTest(source=source), self.assertRaises(ValueError):
+                owner_remote_write_small.require_moose_mount({"fstype": "fuse", "source": source}, source)
 
     def test_foreign_mounts_are_rejected(self) -> None:
         with self.assertRaises(ValueError):
             owner_remote_write_small.require_owner_mount({"fstype": "fuse", "source": "afs-dfs"})
         owner_remote_write_small.require_owner_mount({"fstype": "fuse", "source": "afs-ownerfs"})
         with self.assertRaises(ValueError):
-            owner_remote_write_small.require_moose_mount({"fstype": "fuse.mfs", "source": "mfs#other"})
+            owner_remote_write_small.require_moose_mount({"fstype": "fuse.mfs", "source": "mfs#other"}, TEST_MOOSE_SOURCE)
         with self.assertRaises(ValueError):
-            owner_remote_write_small.require_moose_mount({"fstype": "fuse", "source": "mfs#other"})
-        owner_remote_write_small.require_moose_mount({"fstype": "fuse.mfs", "source": "mfs#192.168.109.11:23042"})
-        owner_remote_write_small.require_moose_mount({"fstype": "fuse", "source": "mfs#192.168.109.11:23042"})
+            owner_remote_write_small.require_moose_mount({"fstype": "fuse", "source": "mfs#other"}, TEST_MOOSE_SOURCE)
+        owner_remote_write_small.require_moose_mount({"fstype": "fuse.mfs", "source": TEST_MOOSE_SOURCE}, TEST_MOOSE_SOURCE)
+        owner_remote_write_small.require_moose_mount({"fstype": "fuse", "source": TEST_MOOSE_SOURCE}, TEST_MOOSE_SOURCE)
+
+    def test_product_identity_is_caller_supplied_and_strict(self) -> None:
+        identity = owner_remote_write_small.validate_product_identity(TEST_COMMIT, TEST_MAP)
+        self.assertEqual(identity["product_source_commit"], TEST_COMMIT)
+        self.assertEqual(identity["compiler_input_map"], TEST_MAP)
+        self.assertEqual(identity["identity_source"], "caller supplied identity")
+        for bad_commit, bad_map in (("g" * 40, TEST_MAP), (TEST_COMMIT[:-1], TEST_MAP), (TEST_COMMIT, "z" * 64), (TEST_COMMIT, TEST_MAP[:-1])):
+            with self.subTest(bad_commit=bad_commit, bad_map=bad_map), self.assertRaises(ValueError):
+                owner_remote_write_small.validate_product_identity(bad_commit, bad_map)
+
+    def test_missing_product_identity_is_structured_blocked(self) -> None:
+        class Args:
+            owner_root = "/missing-owner"
+            moose_root = "/missing-moose"
+            moose_source = TEST_MOOSE_SOURCE
+            io_tool = "/missing-io"
+            output = "/tmp/not-created"
+
+        result = owner_remote_write_small.run(Args())
+        self.assertEqual(result["status"], "BLOCKED")
+        self.assertIn("product identity requires", result["error"])
+
 
 
 if __name__ == "__main__":

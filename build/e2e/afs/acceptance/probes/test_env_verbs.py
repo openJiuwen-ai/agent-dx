@@ -54,8 +54,8 @@ def inventory(bind, peer, *, binary_hash=None, route=True, gid=True, mtu="1500",
     }
 
 def endpoint(role, *, raw=None, binary_hash=None, route=True, rc=0, size=256, count=3, host=None, **inv):
-    bind = "192.168.109.12" if role == "client" else "192.168.109.13"
-    peer = "192.168.109.13" if role == "client" else "192.168.109.12"
+    bind = "192.0.2.12" if role == "client" else "192.0.2.13"
+    peer = "192.0.2.13" if role == "client" else "192.0.2.12"
     raw_log = raw if raw is not None else stock_log(role, size, count)
     return {
         "run_id": RUN_ID,
@@ -124,7 +124,7 @@ class EnvVerbsTests(unittest.TestCase):
             ep["raw_log"] = ep["raw_log"].replace("server DISCONNECT EVENT...", "comment DISCONNECT EVENT")
             ep["raw_log_sha256"] = env_verbs.sha256_bytes(ep["raw_log"].encode())
         self.assertEqual("FAIL", env_verbs.evaluate_pair(client, server)["status"])
-        for route in ("192.168.109.99 dev eth0 src 192.168.109.12", "192.168.109.13 dev lo src 192.168.109.12"):
+        for route in ("192.0.2.99 dev eth0 src 192.0.2.12", "192.0.2.13 dev lo src 192.0.2.12"):
             client, server = endpoint("client"), endpoint("server")
             client["inventory"]["route"]["stdout"] = route
             self.assertEqual("FAIL", env_verbs.evaluate_pair(client, server)["status"])
@@ -216,8 +216,8 @@ class EnvVerbsTests(unittest.TestCase):
                 mock.patch.object(env_verbs, "sha256_file", return_value=env_verbs.EXPECTED_RPING_SHA256):
             rc = env_verbs.run_endpoint(Namespace(
                 role="client",
-                bind="192.168.109.12",
-                peer="192.168.109.13",
+                bind="192.0.2.12",
+                peer="192.0.2.13",
                 port=19669,
                 size=256,
                 count=3,
@@ -235,8 +235,8 @@ class EnvVerbsTests(unittest.TestCase):
             with self.assertRaises(env_verbs.VerbsError):
                 env_verbs.run_endpoint(Namespace(
                     role="client",
-                    bind="192.168.109.12",
-                    peer="192.168.109.13",
+                    bind="192.0.2.12",
+                    peer="192.0.2.13",
                     port=19669,
                     size=256,
                     count=3,

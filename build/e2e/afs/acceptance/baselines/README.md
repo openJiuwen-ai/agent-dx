@@ -4,7 +4,7 @@
 
 ## 输入和运行
 
-- `bin/prepare_3fs_scratch.sh`：从宿主编排，把固定只读 3FS checkout 复制到现有 Linux builder，初始化副本的 submodule。必须显式提供 `REF_3FS`、仓外 `EVIDENCE_DIR` 和 guest 绝对目录 `AFS_BASELINE_GUEST_ROOT`；不依赖个人目录。通过 `AFS_BASELINE_LIMA_INSTANCE` 选择现有 VM（默认 `afs-build`）。
+- `bin/prepare_3fs_scratch.sh`：从宿主编排，把固定只读 3FS checkout 复制到现有 Linux builder，初始化副本的 submodule。必须显式提供 `REF_3FS`、仓外 `EVIDENCE_DIR` 和 guest 绝对目录 `AFS_BASELINE_GUEST_ROOT`；不依赖个人目录。必须通过 `AFS_BASELINE_LIMA_INSTANCE` 显式选择现有 Linux builder，不绑定开发者 VM 名称。
 - `bin/build_moosefs.sh`：只在 Linux builder 构建固定官方 MooseFS commit。
 - `bin/prepare_3fs_deps.sh`：只在 Linux builder 下载并核验固定 FoundationDB/libfuse 构建依赖。
 - `bin/build_3fs.sh`：只在 Linux builder 检查依赖并构建 3FS；现有 ARM 兼容修改必须披露，不能称为 stock 3FS 对照。
