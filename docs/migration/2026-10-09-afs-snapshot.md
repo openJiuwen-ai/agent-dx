@@ -179,3 +179,5 @@ Linux精确受测tree `b9ae4c47ca64142839ea5c0649c7138a90187117`：20模块284�
 本轮按用户选择暂缓 ARM。新增 `ADX_ARM_BUILD=0|1`（缺省1保留公共双架构流程），显式0排除全部 ARM 编译、组装、发布及索引；`ADX_ARM_TESTS=0`仅关闭ARM测试，不能用于暂停架构。x86与共享检查保持原流程，未修改 secret 策略。Linux 38项CI合同通过；后续固定提交 OFF／ON复验采用显式0，不能据此声称ARM通过。
 
 固定提交 `2fddf079f15f6a1e9a2a66ceef1ac5ea0918da56` 的 [x86 OFF #133](https://buildkite.com/agent-dx/agent-dx/builds/133)／[ON #134](https://buildkite.com/agent-dx/agent-dx/builds/134) 均失败：Python adxadmin、Sandbox SDK通过；所有9个失败Rust步骤在编译前报 `Rust image is missing rustfmt`，组包未执行，ARM按条件排除未运行。流水线显式选择 `stable`，与镜像按仓库准备的固定 `1.95.0` 工具链不一致；后续修复选择固定版本及bootstrap缺省来源，不安装组件或降低准入。该失败保留原身份；修复后完整CI仍待验收。
+
+`fe1568de371b09d7a1f90cfe8c04a23b01eb0d1d` 的 [x86 OFF #135](https://buildkite.com/agent-dx/agent-dx/builds/135) 整轮通过，含组包、隔离安装和公共 Kubernetes L0/auth。其 [ON #136](https://buildkite.com/agent-dx/agent-dx/builds/136) 已通过全部组件、Source／AFS gate、组包及隔离安装；库615通过／0失败／22忽略，原四项strace持久化及两项root敏感测试均通过。ON清单包含`afs-meta`／`afs-node`且不含测试探针，OFF不含AFS。ON镜像交接因脚本漏传`--with-afs`被模式一致性检查拒绝，L0未启动；后续仅补模式传递及对应回归，保留严格拒绝、不改产品或环境。OFF结果复用，ON需一次受影响公共流程复验；不扩大到Full11组。
