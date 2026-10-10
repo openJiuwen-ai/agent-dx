@@ -19,13 +19,15 @@ impl EmbeddedIngress {
     pub async fn start(
         control: ControlConfig,
         sandbox_service: Option<Arc<dyn Sandbox>>,
+        directory: Arc<dyn data_plane_gateway::ingress::sandbox_files::SandboxDirectory>,
     ) -> Result<Self> {
         let nofile_soft_limit = raise_nofile_soft_limit_from_env()?;
         adx_observability::info!(nofile_soft_limit, "embedded Ingress FD limit configured");
         let config = IngressConfig::from_env()?;
         let service = match sandbox_service {
             Some(service) => {
-                IngressService::bind_with_sandbox_service(config, control, service).await?
+                IngressService::bind_with_sandbox_service(config, control, service, directory)
+                    .await?
             }
             None => IngressService::bind(config, control).await?,
         };

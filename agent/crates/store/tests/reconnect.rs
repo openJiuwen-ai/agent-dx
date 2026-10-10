@@ -14,7 +14,7 @@ async fn reconnect_without_replaying_unknown_write() {
     )
     .await
     .unwrap();
-    let key = Key::new("environment", &["tenant", "id"]).unwrap();
+    let key = Key::new("binding", &["tenant", "id"]).unwrap();
     let mut admin = redis::Client::open(url)
         .unwrap()
         .get_multiplexed_async_connection()

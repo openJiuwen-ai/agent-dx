@@ -3,32 +3,16 @@ use serde_json::json;
 
 fn template() -> serde_json::Value {
     json!({"name":"test","version":"1","image":"registry/app:v1",
-        "isolation_runtime":"runsc","entrypoint":["/app/start", ""],
+        "isolation_runtime":"runsc",
         "resources":{"cpu_millis":1000,"memory_mib":1024},
         "service":[{"protocol":"http","port":8080},{"protocol":"ws","port":8080}]})
 }
 
 #[test]
-fn template_preserves_argv_and_shared_http_ws_port() {
+fn template_preserves_shared_http_ws_port() {
     let t: TemplateVersion = serde_json::from_value(template()).unwrap();
     t.validate().unwrap();
-    assert_eq!(t.entrypoint[1], "");
     assert_eq!(t.service.len(), 2);
-}
-
-#[test]
-fn template_requires_an_explicit_valid_entrypoint() {
-    let mut t = template();
-    t.as_object_mut().unwrap().remove("entrypoint");
-    assert!(serde_json::from_value::<TemplateVersion>(t).is_err());
-    for argv in [json!([]), json!([""]), json!(["start", "a\u{0000}b"])] {
-        let mut t = template();
-        t["entrypoint"] = argv;
-        assert!(serde_json::from_value::<TemplateVersion>(t)
-            .unwrap()
-            .validate()
-            .is_err());
-    }
 }
 
 #[test]
@@ -38,6 +22,35 @@ fn keys_include_every_scope_component_without_delimiter_collisions() {
         encode_key(&["t", "n", "1", "c"]),
         encode_key(&["t", "n", "2", "c"])
     );
+}
+
+#[test]
+fn binding_identity_round_trips_between_wire_scope_and_target() {
+    let scope_json = json!({
+        "tenant": "tenant-a",
+        "template": "assistant",
+        "version": "v1",
+        "binding_id": "user:a/中文"
+    });
+    let scope: Scope = serde_json::from_value(scope_json.clone()).unwrap();
+    scope.validate().unwrap();
+    assert_eq!(serde_json::to_value(&scope).unwrap(), scope_json);
+
+    let wire = json!({
+        "binding": {
+            "scope": scope_json,
+            "generation": "generation-a",
+            "sandbox_id": "sandbox-a",
+            "phase": "active"
+        },
+        "service": [{"protocol": "ws", "port": 8080}]
+    });
+    let resolved: adx_agent_core::activator::Target = serde_json::from_value(wire.clone()).unwrap();
+    assert_eq!(serde_json::to_value(resolved).unwrap(), wire);
+
+    let urn = "urn:adx:binding:assistant:v1:user%3Aa%2F%E4%B8%AD%E6%96%87";
+    let target: adx_agent_core::target::Target = urn.parse().unwrap();
+    assert_eq!(target.to_string(), urn);
 }
 
 #[test]
@@ -62,8 +75,39 @@ fn internal_response_additions_are_allowed_but_write_specs_remain_strict() {
     assert!(
         serde_json::from_value::<adx_agent_core::sandbox::SandboxObservation>(observation).is_ok()
     );
-    let target = serde_json::json!({"environment":{"sandbox_id":"s", "scope":{"tenant":"t","template":"a","version":"1","environment_id":"e"}, "generation":"g", "phase":"active"}, "service":[], "future_field":42});
+    let target = serde_json::json!({"binding":{"sandbox_id":"s", "scope":{"tenant":"t","template":"a","version":"1","binding_id":"e"}, "generation":"g", "phase":"active"}, "service":[], "future_field":42});
     assert!(serde_json::from_value::<adx_agent_core::activator::Target>(target).is_ok());
     let execution = serde_json::json!({"image":"app", "isolation_runtime":"runc", "entrypoint":[], "working_dir":"/", "user":null, "env":{}, "resources":{"cpu_millis":1,"memory_mib":1}, "service":[], "future_field":42});
     assert!(serde_json::from_value::<adx_agent_core::sandbox::ExecutionSpec>(execution).is_err());
+}
+
+#[test]
+fn managed_template_inherits_image_process_without_overrides() {
+    let mut wire = template();
+    wire.as_object_mut().unwrap().remove("entrypoint");
+    wire.as_object_mut().unwrap().remove("working_dir");
+    let template: TemplateVersion = serde_json::from_value(wire.clone()).unwrap();
+    template.validate().unwrap();
+    assert_eq!(
+        serde_json::to_value(&template).unwrap().get("entrypoint"),
+        None
+    );
+    assert_eq!(
+        serde_json::to_value(&template).unwrap().get("working_dir"),
+        None
+    );
+    let execution = adx_agent_core::sandbox::ExecutionSpec::from(&template);
+    execution.validate().unwrap();
+    assert_eq!(
+        serde_json::to_value(execution).unwrap()["inherit_entrypoint"],
+        true
+    );
+    for (field, value) in [
+        ("entrypoint", json!(["/override"])),
+        ("working_dir", json!("/override")),
+    ] {
+        let mut changed = wire.clone();
+        changed[field] = value;
+        assert!(serde_json::from_value::<TemplateVersion>(changed).is_err());
+    }
 }

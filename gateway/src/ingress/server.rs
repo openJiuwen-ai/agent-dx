@@ -237,11 +237,11 @@ pub fn parse_static_routes(value: &str) -> Result<Vec<StaticRoute>, String> {
 #[derive(Clone)]
 pub struct Ingress {
     #[cfg(feature = "agent-api")]
+    pub(super) execd_access: Option<Arc<super::sandbox_files::ExecdAccess>>,
+    #[cfg(feature = "agent-api")]
     pub(super) agent_api: Option<Arc<super::agent_api::AgentApi>>,
     #[cfg(feature = "agent-api")]
-    inline_api: Option<Arc<super::inline_api::InlineApi>>,
-    #[cfg(feature = "agent-api")]
-    sandbox_api: Option<Arc<super::sandbox_api::SandboxApi>>,
+    jiuwen_api: Option<Arc<super::jiuwen::entrypoint::JiuwenApi>>,
     resolver: Arc<IngressRouteResolver>,
     connector: DataPlaneL4Connector,
     http_pool: BackendHttpPool,
@@ -277,11 +277,11 @@ impl Ingress {
     ) -> Self {
         Self {
             #[cfg(feature = "agent-api")]
+            execd_access: None,
+            #[cfg(feature = "agent-api")]
             agent_api: None,
             #[cfg(feature = "agent-api")]
-            inline_api: None,
-            #[cfg(feature = "agent-api")]
-            sandbox_api: None,
+            jiuwen_api: None,
             resolver,
             connector,
             http_pool: BackendHttpPool::new(BackendHttpPoolConfig::default()),
@@ -307,20 +307,14 @@ impl Ingress {
     }
 
     #[cfg(feature = "agent-api")]
+    pub fn with_jiuwen_api(mut self, api: Arc<super::jiuwen::entrypoint::JiuwenApi>) -> Self {
+        self.jiuwen_api = Some(api);
+        self
+    }
+
+    #[cfg(feature = "agent-api")]
     pub fn with_agent_api(mut self, api: Arc<super::agent_api::AgentApi>) -> Self {
         self.agent_api = Some(api);
-        self
-    }
-
-    #[cfg(feature = "agent-api")]
-    pub fn with_inline_api(mut self, api: Arc<super::inline_api::InlineApi>) -> Self {
-        self.inline_api = Some(api);
-        self
-    }
-
-    #[cfg(feature = "agent-api")]
-    pub fn with_sandbox_api(mut self, api: Arc<super::sandbox_api::SandboxApi>) -> Self {
-        self.sandbox_api = Some(api);
         self
     }
 
@@ -360,6 +354,12 @@ impl Ingress {
     pub fn with_client_acl(mut self, networks: Vec<ipnet::IpNet>, allow_any_client: bool) -> Self {
         self.allowed_client_networks = Arc::new(networks);
         self.allow_any_client = allow_any_client;
+        self
+    }
+
+    #[cfg(feature = "agent-api")]
+    pub fn with_execd_access(mut self, access: Arc<super::sandbox_files::ExecdAccess>) -> Self {
+        self.execd_access = Some(access);
         self
     }
 
@@ -413,7 +413,7 @@ impl Ingress {
             .await?)
     }
 
-    async fn open_resolved_stream(
+    pub(super) async fn open_resolved_stream(
         &self,
         route: RouteHandle,
         tenant_id: &str,
@@ -465,6 +465,25 @@ impl Ingress {
             ));
         }
         self.open_current_stream(replacement, passive).await
+    }
+
+    #[cfg(feature = "agent-api")]
+    pub(super) fn subscribe_route_changes(
+        &self,
+    ) -> broadcast::Receiver<super::route_store::RouteChange> {
+        self.resolver.subscribe_changes()
+    }
+
+    #[cfg(feature = "agent-api")]
+    pub(super) fn route_is_current(&self, route: &RouteHandle) -> bool {
+        self.resolver.route_is_current(route)
+    }
+
+    /// Open exactly the admitted execution. File transfers must not follow a
+    /// replacement route between chunks or between upload and commit.
+    #[cfg(feature = "agent-api")]
+    pub(super) async fn open_pinned_stream(&self, route: RouteHandle) -> io::Result<IngressStream> {
+        self.open_current_stream(route, false).await
     }
 
     async fn open_current_stream(
@@ -799,16 +818,12 @@ impl Ingress {
         #[cfg(not(feature = "agent-api"))]
         let agent_data_error: Option<Response<ProxyBody>> = None;
         #[cfg(feature = "agent-api")]
-        let environment_notice = request
+        let binding_notice = request
             .extensions()
-            .get::<super::agent_access::EnvironmentNotice>()
+            .get::<super::agent_access::BindingNotice>()
             .cloned();
         #[cfg(feature = "agent-api")]
-        let agent_forward = environment_notice.is_some()
-            || request
-                .extensions()
-                .get::<super::agent_access::InlineForward>()
-                .is_some();
+        let agent_forward = binding_notice.is_some();
         #[cfg(not(feature = "agent-api"))]
         let agent_forward = false;
         let response = if let Some(response) = agent_data_error {
@@ -820,18 +835,14 @@ impl Ingress {
         } else {
             match request.uri().path() {
                 #[cfg(feature = "agent-api")]
-                path if super::inline_api::InlineApi::matches(path)
-                    && self.inline_api.is_some() =>
+                path if super::jiuwen::entrypoint::JiuwenApi::matches(path)
+                    && self.jiuwen_api.is_some() =>
                 {
-                    if ingress_security == IngressSecurity::Plaintext {
-                        tls_required()
-                    } else {
-                        self.inline_api
-                            .as_ref()
-                            .expect("matched configured inline API")
-                            .management(request, &self)
-                            .await
-                    }
+                    self.jiuwen_api
+                        .as_ref()
+                        .expect("configured Jiuwen API")
+                        .handle(request, self.clone())
+                        .await
                 }
                 #[cfg(feature = "agent-api")]
                 path if super::agent_api::AgentApi::matches(path) && self.agent_api.is_some() => {
@@ -855,34 +866,6 @@ impl Ingress {
                                 "tenant authentication required",
                             ),
                             Err(error) => response_text(error.status(), &error.to_string()),
-                        }
-                    }
-                }
-                #[cfg(feature = "agent-api")]
-                path if super::sandbox_api::SandboxApi::matches(path)
-                    && self.sandbox_api.is_some() =>
-                {
-                    if ingress_security == IngressSecurity::Plaintext {
-                        tls_required()
-                    } else {
-                        let api = self.sandbox_api.as_ref().expect("configured Sandbox API");
-                        if api.service_authorized(request.headers()) {
-                            api.handle(request, None).await
-                        } else {
-                            match self
-                                .authenticator
-                                .authenticate_request_with_policy(&request, true)
-                                .await
-                            {
-                                Ok(tenant) if !tenant.is_empty() => {
-                                    api.handle(request, Some(&tenant)).await
-                                }
-                                Ok(_) => response_text(
-                                    StatusCode::UNAUTHORIZED,
-                                    "tenant authentication required",
-                                ),
-                                Err(error) => response_text(error.status(), &error.to_string()),
-                            }
                         }
                     }
                 }
@@ -912,7 +895,7 @@ impl Ingress {
         #[cfg(feature = "agent-api")]
         let response = {
             let mut response = response;
-            if let Some(notice) = environment_notice {
+            if let Some(notice) = binding_notice {
                 notice.apply(response.headers_mut());
             }
             response
@@ -963,8 +946,7 @@ impl Ingress {
         request: &mut Request<B>,
         ingress_security: IngressSecurity,
     ) -> Result<(), Response<ProxyBody>> {
-        use super::agent_access::{AccessRequest, InlineForward};
-        use adx_agent_core::target::Target;
+        use super::agent_access::AccessRequest;
         let Some(access) = AccessRequest::parse(request)
             .map_err(|error| super::agent_response::error_response(error, None))?
         else {
@@ -973,56 +955,26 @@ impl Ingress {
         if ingress_security == IngressSecurity::Plaintext {
             return Err(tls_required());
         }
-        if let Target::Instance(id) = &access.target {
-            let api = self
-                .inline_api
-                .as_ref()
-                .ok_or_else(|| response_text(StatusCode::NOT_FOUND, "inline access is disabled"))?;
-            let identity = api
-                .authenticate_data(request)
-                .await
-                .map_err(|_| response_text(StatusCode::UNAUTHORIZED, "authentication failed"))?;
-            let port = access.port.unwrap_or(18092);
-            *request.uri_mut() = format!("/{id}/{port}{}", access.backend_uri)
-                .parse()
-                .map_err(|_| response_text(StatusCode::BAD_REQUEST, "invalid instance target"))?;
-            if access.protocol == adx_agent_core::Protocol::Http {
-                request.headers_mut().remove(header::AUTHORIZATION);
-                if request
-                    .headers()
-                    .get("x-forwarded-proto")
-                    .is_none_or(|v| v.is_empty())
-                {
-                    request
-                        .headers_mut()
-                        .insert("x-forwarded-proto", http::HeaderValue::from_static("https"));
-                }
-            }
-            request.extensions_mut().insert(identity);
-            request.extensions_mut().insert(InlineForward {
-                backend_uri: access.backend_uri,
-            });
-        } else {
-            let api = self.agent_api.as_ref().ok_or_else(|| {
-                response_text(StatusCode::NOT_FOUND, "managed access is disabled")
-            })?;
-            let identity = self
-                .authenticator
-                .authenticate_request_identity_with_policy(request, true)
-                .await
-                .map_err(|error| response_text(error.status(), &error.to_string()))?;
-            if identity.tenant_id.is_empty() {
-                return Err(response_text(
-                    StatusCode::UNAUTHORIZED,
-                    "tenant authentication required",
-                ));
-            }
-            let tenant = identity.tenant_id.clone();
-            request.extensions_mut().insert(identity);
-            api.prepare_data(request, &tenant, access)
-                .await
-                .map_err(|error| super::agent_response::error_response(error, None))?;
+        let api = self
+            .agent_api
+            .as_ref()
+            .ok_or_else(|| response_text(StatusCode::NOT_FOUND, "managed access is disabled"))?;
+        let identity = self
+            .authenticator
+            .authenticate_request_identity_with_policy(request, true)
+            .await
+            .map_err(|error| response_text(error.status(), &error.to_string()))?;
+        if identity.tenant_id.is_empty() {
+            return Err(response_text(
+                StatusCode::UNAUTHORIZED,
+                "tenant authentication required",
+            ));
         }
+        let tenant = identity.tenant_id.clone();
+        request.extensions_mut().insert(identity);
+        api.prepare_data(request, &tenant, access)
+            .await
+            .map_err(|error| super::agent_response::error_response(error, None))?;
         Ok(())
     }
 
@@ -1137,12 +1089,22 @@ impl Ingress {
                     pool.discarded_total,
                     pool.acquire_timeouts_total,
                     self.request_metrics.prometheus(),
-                    self.command_watch_metrics.connections.load(Ordering::Relaxed),
-                    self.command_watch_metrics.subscriptions.load(Ordering::Relaxed),
+                    self.command_watch_metrics
+                        .connections
+                        .load(Ordering::Relaxed),
+                    self.command_watch_metrics
+                        .subscriptions
+                        .load(Ordering::Relaxed),
                     self.command_watch_metrics.sandboxes.load(Ordering::Relaxed),
-                    self.command_watch_metrics.reconnects.load(Ordering::Relaxed),
-                    self.command_watch_metrics.auth_failures.load(Ordering::Relaxed),
-                    self.command_watch_metrics.downstream_streams.load(Ordering::Relaxed),
+                    self.command_watch_metrics
+                        .reconnects
+                        .load(Ordering::Relaxed),
+                    self.command_watch_metrics
+                        .auth_failures
+                        .load(Ordering::Relaxed),
+                    self.command_watch_metrics
+                        .downstream_streams
+                        .load(Ordering::Relaxed),
                 )
             }),
             _ => plain(StatusCode::NOT_FOUND, "not found"),
@@ -1542,6 +1504,44 @@ impl Ingress {
         ingress_security: IngressSecurity,
         api: &super::agent_api::AgentApi,
     ) -> Response<ProxyBody> {
+        if request.headers().contains_key(header::UPGRADE) {
+            if let Some((selection, backend_uri)) = api.take_service_selection(&mut request) {
+                let stream = match api.service_access().connect_service(self, selection).await {
+                    Ok(stream) => stream,
+                    Err(super::agent_service::ServiceAccessError::Agent(error)) => {
+                        return super::agent_response::error_response(error, None);
+                    }
+                    Err(super::agent_service::ServiceAccessError::Ingress(error)) => {
+                        return error_response(error);
+                    }
+                };
+                let query = backend_uri
+                    .query()
+                    .map(strip_token_query)
+                    .unwrap_or_default();
+                let uri = if query.is_empty() {
+                    backend_uri.path().to_owned()
+                } else {
+                    format!("{}?{query}", backend_uri.path())
+                };
+                let Ok(uri) = uri.parse() else {
+                    return response_text(StatusCode::BAD_REQUEST, "invalid backend URI");
+                };
+                *request.uri_mut() = uri;
+                for name in [
+                    H_INSTANCE_ID,
+                    H_WORKLOAD_ID,
+                    H_TARGET_IP,
+                    H_TARGET_PORT,
+                    "x-auth",
+                    "authorization",
+                ] {
+                    request.headers_mut().remove(name);
+                }
+                let cancelled = stream.cancelled.clone();
+                return proxy_http(request, stream, "sandbox", Some(cancelled)).await;
+            }
+        }
         loop {
             // Preserve only managed selection metadata. Ordinary fixed-ID forwarding keeps its
             // original path with no header copying. The body is never cloned or buffered.
@@ -1583,15 +1583,6 @@ impl Ingress {
                 ));
             }
         }
-        #[cfg(feature = "agent-api")]
-        let inline_forward = request
-            .extensions()
-            .get::<super::agent_access::InlineForward>()
-            .cloned();
-        #[cfg(feature = "agent-api")]
-        let legacy = inline_forward.is_some();
-        #[cfg(not(feature = "agent-api"))]
-        let legacy = false;
         let request_id = header_string(&request, "x-request-id");
         let route = match self
             .resolve_route(
@@ -1604,14 +1595,7 @@ impl Ingress {
         {
             Ok(route) => route,
             Err(error) => {
-                return Err((
-                    if legacy {
-                        inline_forward_error(error)
-                    } else {
-                        error_response(error)
-                    },
-                    request,
-                ))
+                return Err((error_response(error), request));
             }
         };
         let auth_required = self.auth_required(parsed.access_kind, &route);
@@ -1630,11 +1614,6 @@ impl Ingress {
                 Err(error) => return Ok(plain(error.status(), &error.to_string())),
             }
         };
-        let tenant_id = if legacy && tenant_id == "0" {
-            route.tenant_id.clone()
-        } else {
-            tenant_id
-        };
         let query = request
             .uri()
             .query()
@@ -1649,7 +1628,7 @@ impl Ingress {
             .parse()
             .expect("stripped route path is a valid origin-form URI");
         *request.uri_mut() = uri;
-        if !legacy {
+        {
             request.headers_mut().remove(H_INSTANCE_ID);
             request.headers_mut().remove(H_WORKLOAD_ID);
             request.headers_mut().remove(H_TARGET_IP);
@@ -1658,22 +1637,28 @@ impl Ingress {
             request.headers_mut().remove(header::AUTHORIZATION);
         }
         #[cfg(feature = "agent-api")]
-        if let Some(forward) = inline_forward {
-            *request.uri_mut() = forward.backend_uri;
+        if parsed.access_kind == AccessKind::Direct {
+            if let Some(access) = &self.execd_access {
+                if parsed.target_port == access.port {
+                    if let Err(error) = access
+                        .apply(&tenant_id, &parsed.instance_id, &mut request)
+                        .await
+                    {
+                        let status = match error {
+                            super::sandbox_files::ReadError::NotFound => StatusCode::NOT_FOUND,
+                            _ => StatusCode::BAD_GATEWAY,
+                        };
+                        return Ok(plain(status, "Sandbox file access unavailable"));
+                    }
+                }
+            }
         }
         let upgrade_requested = request.headers().contains_key(header::UPGRADE);
         if upgrade_requested {
             let stream = match self.open_resolved_stream(route, &tenant_id).await {
                 Ok(stream) => stream,
                 Err(error) => {
-                    return Err((
-                        if legacy {
-                            inline_forward_error(error)
-                        } else {
-                            error_response(error)
-                        },
-                        request,
-                    ))
+                    return Err((error_response(error), request));
                 }
             };
             let cancelled = stream.cancelled.clone();
@@ -2040,7 +2025,7 @@ where
     }
 }
 
-async fn wait_for_route_cancellation(cancelled: Option<watch::Receiver<bool>>) {
+pub(super) async fn wait_for_route_cancellation(cancelled: Option<watch::Receiver<bool>>) {
     let Some(mut cancelled) = cancelled else {
         std::future::pending::<()>().await;
         return;
@@ -2238,6 +2223,13 @@ pub struct IngressStream {
     _guard: SessionGuard,
 }
 
+impl IngressStream {
+    #[cfg(feature = "agent-api")]
+    pub(super) fn cancellation(&self) -> watch::Receiver<bool> {
+        self.cancelled.clone()
+    }
+}
+
 impl AsyncRead for IngressStream {
     fn poll_read(
         mut self: Pin<&mut Self>,
@@ -2353,16 +2345,6 @@ fn strip_token_query(query: &str) -> String {
                 .filter(|(name, _)| !name.eq_ignore_ascii_case("token")),
         )
         .finish()
-}
-
-fn inline_forward_error(error: IngressOpenError) -> Response<ProxyBody> {
-    let status = match error {
-        IngressOpenError::Forbidden => StatusCode::FORBIDDEN,
-        IngressOpenError::Auth(_) => StatusCode::UNAUTHORIZED,
-        IngressOpenError::Resolve(ResolveError::EnvironmentStatus { .. }) => StatusCode::CONFLICT,
-        _ => StatusCode::BAD_GATEWAY,
-    };
-    plain(status, &error.to_string())
 }
 
 fn error_response(error: IngressOpenError) -> Response<ProxyBody> {

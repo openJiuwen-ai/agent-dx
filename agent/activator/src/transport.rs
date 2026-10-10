@@ -1,36 +1,52 @@
-//! HTTP binding of the common Gateway Sandbox API; no Platform client lives here.
+//! Standalone Activator adapter for the existing API Server management API.
+use crate::sandbox_request::{self, observation, validate_identity};
 use adx_agent_core::{
     limits,
     sandbox::*,
-    transport::{service_origin, validate_service_token},
+    transport::{capped_deadline, remaining_time, service_origin},
 };
 use async_trait::async_trait;
+use base64::{engine::general_purpose::STANDARD, Engine};
 use reqwest::{Client, Method, StatusCode, Url};
-use std::time::Duration;
+use serde_json::{json, Value};
+use std::{collections::BTreeMap, time::Duration};
 
-pub const SANDBOX_PATH: &str = "/api/sandbox/v2/instances";
+pub const SANDBOX_PATH: &str = "/api/sandbox/v1/sandboxes";
 
 pub struct HttpSandbox {
     client: Client,
     base: Url,
-    token: String,
+    api_keys: BTreeMap<String, String>,
     timeout: Duration,
 }
 impl HttpSandbox {
+    /// Keys must be tenant-scoped Platform API keys; API Server derives ownership from the key.
     pub fn new(
         base: &str,
-        token: String,
+        api_keys: BTreeMap<String, String>,
         timeout: Duration,
         ca_pem: Option<&[u8]>,
         allow_http: bool,
     ) -> Result<Self, SandboxError> {
         let base = service_origin(base, allow_http).map_err(SandboxError::Invalid)?;
-        validate_service_token(&token).map_err(SandboxError::Invalid)?;
-        if timeout.is_zero() {
+        if api_keys.is_empty() {
             return Err(SandboxError::Invalid(
-                "Sandbox timeout must be positive".into(),
+                "Sandbox tenant API keys required".into(),
             ));
         }
+        for (tenant, key) in &api_keys {
+            validate_identity(tenant)?;
+            if key.is_empty()
+                || key.len() > limits::HTTP_JSON_BYTES
+                || key
+                    .bytes()
+                    .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+                || reqwest::header::HeaderValue::from_str(key).is_err()
+            {
+                return Err(SandboxError::Invalid("invalid Platform API key".into()));
+            }
+        }
+        sandbox_request::validate_timeout(timeout)?;
         let mut builder = Client::builder()
             .timeout(timeout)
             .connect_timeout(timeout.min(limits::CONNECT_TIMEOUT))
@@ -38,7 +54,7 @@ impl HttpSandbox {
         if let Some(pem) = ca_pem {
             builder = builder.add_root_certificate(
                 reqwest::Certificate::from_pem(pem)
-                    .map_err(|_| SandboxError::Invalid("invalid Gateway CA".into()))?,
+                    .map_err(|_| SandboxError::Invalid("invalid API Server CA".into()))?,
             );
         }
         Ok(Self {
@@ -46,44 +62,55 @@ impl HttpSandbox {
                 .build()
                 .map_err(|_| SandboxError::Invalid("HTTP client initialization failed".into()))?,
             base,
-            token,
+            api_keys,
             timeout,
         })
     }
+
     async fn request(
         &self,
         method: Method,
         tenant: &str,
-        id: Option<&str>,
-        payload: Option<&CreateSandbox>,
-    ) -> Result<Option<SandboxObservation>, SandboxError> {
-        if tenant.is_empty()
-            || tenant.len() > limits::IDENTIFIER_BYTES
-            || id.is_some_and(|id| {
-                id.is_empty() || id.len() > limits::IDENTIFIER_BYTES || id == "." || id == ".."
-            })
-        {
-            return Err(SandboxError::Invalid("invalid Sandbox identity".into()));
-        }
+        id: &str,
+        payload: Option<Value>,
+        deadline: Option<u64>,
+    ) -> Result<Option<Value>, SandboxError> {
+        validate_identity(tenant)?;
+        validate_identity(id)?;
+        let key = self.api_keys.get(tenant).ok_or(SandboxError::NotFound)?;
         let read = method == Method::GET;
-        let mut url = self.base.join(SANDBOX_PATH).expect("static Sandbox path");
-        if let Some(id) = id {
-            url.path_segments_mut().expect("HTTP URL").push(id);
+        let create = method == Method::POST;
+        let mut url = self
+            .base
+            .join(if read { "/api/instances" } else { SANDBOX_PATH })
+            .map_err(|_| SandboxError::Invalid("invalid API Server URL".into()))?;
+        if read {
+            url.query_pairs_mut().append_pair("instance_id", id);
+        } else if !create {
+            url.path_segments_mut()
+                .map_err(|_| SandboxError::Invalid("invalid API Server URL".into()))?
+                .push(id);
         }
-        url.query_pairs_mut().append_pair("tenant", tenant);
-        let mut request = self.client.request(method, url).bearer_auth(&self.token);
+        let remaining = remaining_time(capped_deadline(deadline, self.timeout));
+        if remaining.is_zero() {
+            return Err(SandboxError::Unavailable(
+                "Sandbox deadline expired before submission".into(),
+            ));
+        }
+        let mut request = self
+            .client
+            .request(method, url)
+            .bearer_auth(key)
+            .timeout(remaining);
+        if !read {
+            let action = if create { "create" } else { "delete" };
+            request = request.header(
+                "x-request-id",
+                sandbox_request::operation_id(action, tenant, id)?,
+            );
+        }
         if let Some(payload) = payload {
-            let mut payload = payload.clone();
-            let deadline =
-                adx_agent_core::transport::capped_deadline(payload.deadline_unix_ms, self.timeout);
-            let remaining = adx_agent_core::transport::remaining_time(deadline);
-            if remaining.is_zero() {
-                return Err(SandboxError::Unavailable(
-                    "Sandbox create deadline expired before submission".into(),
-                ));
-            }
-            payload.deadline_unix_ms = Some(deadline);
-            request = request.timeout(remaining).json(&payload);
+            request = request.json(&payload);
         }
         let uncertain = || {
             if read {
@@ -96,7 +123,7 @@ impl HttpSandbox {
         };
         let mut response = request.send().await.map_err(|error| {
             if error.is_connect() {
-                SandboxError::Unavailable("Sandbox connection failed".into())
+                SandboxError::Unavailable("API Server connection failed".into())
             } else {
                 uncertain()
             }
@@ -113,62 +140,98 @@ impl HttpSandbox {
         }
         let mut body = Vec::new();
         while let Some(chunk) = response.chunk().await.map_err(|_| uncertain())? {
-            if body.len() + chunk.len() > limits::HTTP_JSON_BYTES {
+            if chunk.len() > limits::HTTP_JSON_BYTES.saturating_sub(body.len()) {
                 return Err(uncertain());
             }
             body.extend_from_slice(&chunk);
         }
         if !status.is_success() {
-            // Only typed responses from the authenticated Sandbox boundary are trusted.
-            return Err(
-                serde_json::from_slice::<SandboxError>(&body).unwrap_or_else(|_| match status {
-                    StatusCode::BAD_REQUEST => {
-                        SandboxError::Invalid("Sandbox rejected request".into())
-                    }
-                    StatusCode::CONFLICT => {
-                        SandboxError::Conflict("Sandbox identity/specification conflict".into())
-                    }
-                    StatusCode::NOT_IMPLEMENTED => {
-                        SandboxError::Unsupported("Sandbox capability unavailable".into())
-                    }
-                    _ => uncertain(),
-                }),
-            );
+            // Do not expose server messages or interpret absence as completed deletion.
+            return Err(match status {
+                StatusCode::BAD_REQUEST => {
+                    SandboxError::Invalid("API Server rejected request".into())
+                }
+                StatusCode::CONFLICT => {
+                    SandboxError::Conflict("Sandbox identity/specification conflict".into())
+                }
+                StatusCode::FORBIDDEN => SandboxError::NotFound,
+                StatusCode::UNAUTHORIZED => {
+                    SandboxError::Unavailable("API Server credential rejected".into())
+                }
+                StatusCode::NOT_IMPLEMENTED => {
+                    SandboxError::Unsupported("Sandbox capability unavailable".into())
+                }
+                _ => uncertain(),
+            });
         }
-        let observed: SandboxObservation =
-            serde_json::from_slice(&body).map_err(|_| uncertain())?;
-        if observed.tenant != tenant
-            || observed.id != id.unwrap_or_else(|| &payload.expect("create payload").id)
-        {
+        let value: Value = serde_json::from_slice(&body).map_err(|_| uncertain())?;
+        if read {
+            return Ok(Some(value));
+        }
+        if value.get("code").and_then(Value::as_u64) != Some(200) {
             return Err(uncertain());
         }
-        Ok(Some(observed))
+        let data = value.get("data").ok_or_else(uncertain)?;
+        if create {
+            let encoded = data.as_str().ok_or_else(uncertain)?;
+            let decoded = STANDARD.decode(encoded).map_err(|_| uncertain())?;
+            let result: Value = serde_json::from_slice(&decoded).map_err(|_| uncertain())?;
+            sandbox_request::created(tenant, id, &result)?;
+            Ok(Some(result))
+        } else if data.is_null() {
+            // API Server returns success only after deletion confirmation is published.
+            Ok(Some(Value::Null))
+        } else {
+            Err(uncertain())
+        }
     }
 }
 #[async_trait]
 impl Sandbox for HttpSandbox {
+    fn validate_execution(&self, execution: &ExecutionSpec) -> Result<(), SandboxError> {
+        sandbox_request::validate_execution(execution)
+    }
     async fn create(&self, request: &CreateSandbox) -> Result<SandboxObservation, SandboxError> {
-        request
-            .execution
-            .validate()
-            .map_err(SandboxError::Invalid)?;
-        if request.id.is_empty() || request.id.len() > limits::IDENTIFIER_BYTES {
-            return Err(SandboxError::Invalid("invalid Sandbox ID".into()));
-        }
-        self.request(Method::POST, &request.tenant, None, Some(request))
-            .await?
-            .ok_or_else(|| SandboxError::OutcomeUnknown("missing create result".into()))
+        let payload = sandbox_request::create_input(request, self.timeout)?;
+        self.request(
+            Method::POST,
+            &request.tenant,
+            &request.id,
+            Some(payload),
+            request.deadline_unix_ms,
+        )
+        .await?;
+        Ok(observation(
+            &request.tenant,
+            &request.id,
+            SandboxPhase::Running,
+        ))
     }
     async fn get(
         &self,
         tenant: &str,
         id: &str,
     ) -> Result<Option<SandboxObservation>, SandboxError> {
-        self.request(Method::GET, tenant, Some(id), None).await
+        let Some(value) = self.request(Method::GET, tenant, id, None, None).await? else {
+            return Ok(None);
+        };
+        let rows = value
+            .as_array()
+            .filter(|rows| rows.len() == 1)
+            .ok_or_else(|| {
+                SandboxError::Unavailable("invalid API Server instance response".into())
+            })?;
+        sandbox_request::observed(tenant, id, &rows[0]).map(Some)
     }
     async fn delete(&self, tenant: &str, id: &str) -> Result<SandboxObservation, SandboxError> {
-        self.request(Method::DELETE, tenant, Some(id), None)
-            .await?
-            .ok_or_else(|| SandboxError::OutcomeUnknown("missing delete result".into()))
+        self.request(
+            Method::DELETE,
+            tenant,
+            id,
+            Some(json!({"timeoutSeconds":self.timeout.as_secs().max(1)})),
+            None,
+        )
+        .await?;
+        Ok(observation(tenant, id, SandboxPhase::Deleted))
     }
 }

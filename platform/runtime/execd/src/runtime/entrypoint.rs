@@ -260,7 +260,13 @@ fn start_from_environment(manager: Arc<Manager>) {
     };
     std::thread::spawn(move || {
         let status = loop {
-            match child.lock().expect("entrypoint child poisoned").try_wait() {
+            // Release the child lock before sleeping so startup can inspect it
+            // without blocking the single-threaded runtime's control listener.
+            let result = {
+                let mut child = child.lock().expect("entrypoint child poisoned");
+                child.try_wait()
+            };
+            match result {
                 Ok(Some(status)) => break Ok(status),
                 Ok(None) => std::thread::sleep(Duration::from_millis(10)),
                 Err(error) => break Err(error),

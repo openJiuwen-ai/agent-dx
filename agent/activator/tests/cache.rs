@@ -88,14 +88,14 @@ impl Sandbox for Platform {
     }
 }
 fn template() -> TemplateVersion {
-    serde_json::from_value(serde_json::json!({"name":"app","version":"1","image":"app:1","isolation_runtime":"runc","entrypoint":["/start"],"resources":{"cpu_millis":1000,"memory_mib":512},"service":[{"protocol":"http","port":8080}]})).unwrap()
+    serde_json::from_value(serde_json::json!({"name":"app","version":"1","image":"app:1","isolation_runtime":"runc","resources":{"cpu_millis":1000,"memory_mib":512},"service":[{"protocol":"http","port":8080}]})).unwrap()
 }
 fn scope() -> Scope {
     Scope {
         tenant: "tenant".into(),
         template: "app".into(),
         version: "1".into(),
-        environment_id: "env".into(),
+        binding_id: "env".into(),
     }
 }
 fn deadline() -> u64 {
@@ -155,7 +155,7 @@ async fn immutable_templates_share_cached_reads_without_caching_absence() {
         state.template("tenant", "app", "1").await.unwrap(),
         Some(template())
     );
-    state.create_environment(scope()).await.unwrap();
+    state.create_binding(scope()).await.unwrap();
     assert_eq!(
         store.reads.load(Ordering::SeqCst),
         0,
@@ -176,7 +176,7 @@ async fn bypasscache_refreshes_and_failed_refresh_does_not_leave_a_success_hit()
     let first = service.activate(&scope(), None, deadline()).await.unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!(
-        "http://{}/internal/adx/v1/environments/activate",
+        "http://{}/internal/adx/v1/bindings/activate",
         listener.local_addr().unwrap()
     );
     let app =
@@ -195,7 +195,7 @@ async fn bypasscache_refreshes_and_failed_refresh_does_not_leave_a_success_hit()
         .records
         .lock()
         .unwrap()
-        .get_mut(&first.environment.sandbox_id)
+        .get_mut(&first.binding.sandbox_id)
         .unwrap()
         .ready = false;
     let response = reqwest::Client::new()
@@ -228,26 +228,16 @@ async fn remote_deletion_allows_stale_hits_until_bypass_and_preserves_generation
     AgentState::new(store).begin_delete(&scope()).await.unwrap();
     assert_eq!(a.activate(&scope(), None, deadline()).await.unwrap(), first);
     assert!(matches!(
-        a.activate_with_cache(
-            &scope(),
-            Some(&first.environment.generation),
-            deadline(),
-            true
-        )
-        .await,
+        a.activate_with_cache(&scope(), Some(&first.binding.generation), deadline(), true)
+            .await,
         Err(Error::Conflict(_))
     ));
-    b.delete_environment(&scope()).await.unwrap();
+    b.delete_binding(&scope()).await.unwrap();
     let next = b.activate(&scope(), None, deadline()).await.unwrap();
-    assert_ne!(first.environment.generation, next.environment.generation);
+    assert_ne!(first.binding.generation, next.binding.generation);
     assert!(matches!(
-        a.activate_with_cache(
-            &scope(),
-            Some(&first.environment.generation),
-            deadline(),
-            true
-        )
-        .await,
+        a.activate_with_cache(&scope(), Some(&first.binding.generation), deadline(), true)
+            .await,
         Err(Error::Conflict(_))
     ));
     let before = platform.gets.load(Ordering::SeqCst);
@@ -278,7 +268,7 @@ async fn older_observation_cannot_refill_cache_after_newer_refresh_fails() {
         .records
         .lock()
         .unwrap()
-        .get_mut(&first.environment.sandbox_id)
+        .get_mut(&first.binding.sandbox_id)
         .unwrap()
         .ready = false;
     assert!(matches!(
@@ -300,13 +290,13 @@ async fn older_observation_cannot_refill_cache_after_newer_refresh_fails() {
 async fn not_ready_binding_is_not_cached_and_can_become_ready() {
     let state = AgentState::new(Arc::new(Store::default()));
     state.publish("tenant", &template()).await.unwrap();
-    let environment = state.create_environment(scope()).await.unwrap();
+    let binding = state.create_binding(scope()).await.unwrap();
     let platform = Arc::new(Platform::default());
     platform.records.lock().unwrap().insert(
-        environment.sandbox_id.clone(),
+        binding.sandbox_id.clone(),
         SandboxObservation {
-            id: environment.sandbox_id.clone(),
-            tenant: environment.scope.tenant.clone(),
+            id: binding.sandbox_id.clone(),
+            tenant: binding.scope.tenant.clone(),
             phase: SandboxPhase::Creating,
             ready: false,
             runtime_id: None,
@@ -320,7 +310,7 @@ async fn not_ready_binding_is_not_cached_and_can_become_ready() {
     ));
     {
         let mut records = platform.records.lock().unwrap();
-        let record = records.get_mut(&environment.sandbox_id).unwrap();
+        let record = records.get_mut(&binding.sandbox_id).unwrap();
         record.phase = SandboxPhase::Running;
         record.ready = true;
     }
@@ -385,11 +375,11 @@ async fn sliding_ttl_renews_on_access_and_lru_eviction_only_causes_reload() {
     service.publish("tenant", &template()).await.unwrap();
     let a = scope();
     let b = Scope {
-        environment_id: "b".into(),
+        binding_id: "b".into(),
         ..scope()
     };
     let c = Scope {
-        environment_id: "c".into(),
+        binding_id: "c".into(),
         ..scope()
     };
     let first = service.activate(&a, None, deadline()).await.unwrap();

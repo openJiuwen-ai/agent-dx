@@ -14,12 +14,12 @@ the first adapter, not part of the generic relay contract:
 * `IngressRouteResolver` reads the shared in-memory `RouteStore`. The production Ingress discovers Coordinator through Redis, receives an initial full route snapshot followed by gRPC deltas, and verifies API keys through Coordinator with a bounded short-lived cache.
 
 With `agent-api`, managed Agent requests cache immutable templates. In standalone
-Activator mode, Env operations use deterministic rendezvous hashing over individual
+Activator mode, AgentBinding operations use deterministic rendezvous hashing over individual
 instance URLs or Redis membership discovery; discovery refresh runs in the
 background and requests use a local member snapshot. Embedded Activator mode calls
-the local module without cross-instance Env affinity. Both modes share Env caching
+the local module without cross-instance AgentBinding affinity. Both modes share AgentBinding activation caching
 and explicit bypass semantics. See the
-[Agent deployment and cache contract](../agent/README.md#activator-发现与-env-亲和路由).
+[Agent deployment and cache contract](../agent/README.md#activator-发现与-agentbinding-亲和路由).
 
 The typed public Ingress → Relay → EXECD operations are defined by the
 [`data-plane.yaml`](../platform/api/openapi/data-plane.yaml) OpenAPI contract.
@@ -338,3 +338,193 @@ once. Unrelated updates do not extend this budget. Tenant or security-policy
 changes reject reuse of the previous authorization; unchanged conflicts remain
 errors. This recovery sends no application bytes to the rejected execution and
 does not replay a command or an HTTP request already delivered to Execd.
+
+### Management boundary
+
+Ingress forwards data and calls Activator for AgentBinding activation. Standalone
+Activator uses the API Server's existing Sandbox REST API; embedded Activator uses
+its application service. The Inline HTTP/JWT compatibility adapter and Ingress
+`/api/sandbox/v2/instances` endpoint have been removed. Configure standalone
+Activator with an API Server management URL and tenant-scoped API key environment
+references (see [Activator](../agent/activator/README.md)). Common Sandbox file
+access uses the API Server instance directory for admission and the shared data
+plane for Relay/Execd transport. PlatformSandbox and its runtime lookup have been
+removed. This source change does not redeploy the cluster.
+
+### Managed Agent service access
+
+With `agent-api`, `AgentApi::service_access()` supplies `AgentV2Access` backed by
+its existing ManagedService. `select` validates the authenticated tenant's binding
+scope and declared service, retaining the request deadline and binding generation.
+`connect_service` opens an authorized Relay stream and can refresh the same
+generation once after an unsent route/connection failure. Authorization failures do
+not reactivate the target. Returned streams never replay application writes.
+Managed WS uses this path; managed HTTP shares selection/retry while retaining the
+backend HTTP pool. The Jiuwen codecs, bounded session/request state and E2A socket
+driver are implemented. Its internal connection adapter uses the shared authorized
+Relay stream, bounds the WS handshake by the original admission deadline, and
+observes route revocation during both handshake and streaming. The driver never
+reconnects or replays business writes. Each frontend owns one independent E2A
+connection and reuses it for its requests. Multiple frontends may connect to the
+same binding, including while another handshake is pending. The gateway does not
+arbitrate per-binding connection concurrency; the business service owns concurrent
+session semantics. Dropping a connection releases only its own Relay stream.
+Authentication, route revocation and the existing transport resource limits still
+apply to each connection.
+
+The backend handshake uses `/`, Host `127.0.0.1:<service-port>` and Origin
+`http://127.0.0.1:<service-port>` on the selected stream; it does not dial that URL
+or forward frontend credentials. If AgentServer Origin checks are enabled, its
+allowlist must include `127.0.0.1`. Local Relay/mock-backend component tests cover
+authorized WS reuse, handshake timeout and route revocation. After the narrowly
+scoped Execd entrypoint-lock fix, real isolated Sandbox creation through the
+independent Activator passed, including AgentServer argv/working directory and
+service listening. The earlier embedded stack overflow was fixed and covered by a 2 MiB worker-stack
+regression. Standalone cloud validation covers new Sandbox creation, cross-replica
+file transfers, and real DeepSeek responses through LiteLLM. The subsequent upstream
+merge passed local regression checks and has not been redeployed; see the
+[design](../docs/development/jiuwenswarm-adx-gateway-design.md).
+Real Huawei login and beegent device validation remain
+incomplete.
+
+Jiuwen download settings are decoded from the selected `TemplateVersion.env` by
+`jiuwen::download_config::DownloadConfig::load`, using the shared ManagedService
+and its tenant/template/version cache without creating a binding or Sandbox.
+The same env is already passed to AgentServer through ExecutionSpec. Templates
+must explicitly set absolute `JIUWENSWARM_WORKSPACE` and
+`JIUWENSWARM_DOWNLOAD_ASSET_ROOT` paths. A nonempty
+`JIUWENSWARM_FILE_DOWNLOAD_SECRET` takes precedence and must contain at least 32
+characters; it is kept verbatim and redacted in Debug. If absent or empty, the
+adapter selects `<workspace>/config/.file_download_secret` in the authorized
+Sandbox. No second Ingress configuration or process-environment probing is used.
+Public identity and binding routing use authenticated business sessions.
+
+`jiuwen::download_token` implements HMAC verification over the original Base64URL
+text, claim/expiry checks, and verified registration/file-metadata comparisons.
+`SignedDownload::check_file` requires active matching registration and actual file
+type/size for verified assets before returning `CheckedDownload`. Digest matching
+uses the registration; it does not hash the entire download. Verification input
+limits are 16 KiB for a token and 64 KiB each for secret/registration contents.
+`jiuwen::download_runtime::Reader::authorize` combines these checks with bounded
+reads from the common `sandbox_files::Files` capability. The common data plane
+checks Sandbox ownership/state through the API Server and supplies Execd
+credentials internally; Jiuwen never receives them. It reads a key file only when needed, a registration only for verified
+assets, and path metadata before admission. The original deadline covers lookup,
+connect and body reads; revocation or caller cancellation drops the owned HTTP
+connection immediately. Errors do not echo upstream bodies or credentials.
+`jiuwen::download_http::Download::respond` implements internal GET/HEAD attachment
+responses. Verified assets support single byte ranges (206/416) and inline;
+ordinary attachments retain full 200 responses and ignore Range/inline. Both
+use no-store, encoded UTF-8 filenames and extension-based MIME detection.
+Execd reads are pulled in chunks of at most 64 KiB, each with fresh business
+signature/registration admission, expiry checks and exact upstream range/length
+validation. API Server ownership/state admission is shared by the entire HTTP
+transfer, including metadata reads and all chunks. Buffered first bytes
+are admitted again when consumed; backpressure does not start background reads.
+The caller's deadline covers the whole transfer. Errors before headers produce
+bounded JSON responses; later errors abort the body without a successful truncation.
+Local Relay/simulated-Execd tests cover these paths; real Sandbox validation and
+production account integration remains subject to the validation below. CheckedDownload is a
+point-in-time result, not a reusable authorization credential.
+
+### Common Sandbox file access
+
+With `agent-api`, set `ADX_SANDBOX_FILES_CONFIG` to a JSON configuration:
+[standalone](examples/sandbox-files.json) or
+[embedded](examples/sandbox-files-embedded.json). `token_env` references a protected
+process environment variable containing the deployment-owned Execd token; no inline
+secret is stored in JSON. `port` must equal the Ingress `default_direct_port`.
+Standalone Ingress uses `directory` and `api_key_envs` to call the existing API
+Server `GET /api/instances?instance_id=...`; keys must be tenant-scoped, never admin
+keys. Embedded Ingress receives `SandboxService` directly and rejects HTTP directory
+configuration. Both require the requested Sandbox to belong to the tenant and be
+Running. Each frontend upload/download request owns one `Files` context: its first
+backend operation queries the directory, and the result is reused for all metadata,
+secret/registration reads, body chunks, and upload/commit operations in that request.
+A multipart request also shares admission across its files. A new frontend request
+must query again; failed admission is not repeatedly queried within the same context.
+Neither lookup activates a Sandbox or returns credentials.
+
+The context pins the admitted runtime route. Each operation checks local route
+currency and retained route-change events; a target change, removal, or lost event
+history ends the transfer, even if the old route is subsequently restored. In-flight
+I/O retains the existing cancellation checks. File connections do not follow a
+replacement execution, and failed operations are not automatically replayed. All
+operations share the original deadline; business session and download signature/
+registration checks remain active throughout the transfer.
+
+`Files` owns bounded reads, metadata, upload and commit over shared authorized
+Relay streams. Jiuwen owns its business protocol and signature/workspace checks.
+Public `/direct` requests targeting the configured Execd port use the same
+`ExecdAccess` authorization and server-owned credential; clients do not supply
+Execd tokens. Files never pass through API Server.
+
+API Server runtime profile, node and Ingress must use the same Execd port and
+Secret. Cross-process configuration agreement is a deployment requirement, not an
+automatically verified property: node environment overrides can change the actual
+credential. Different per-node credentials and one-sided rotation are unsupported.
+There is no old `spec.env` credential fallback. Existing deployment manifests must
+be updated to the new configuration before using this binary.
+
+## Jiuwen authenticated entrypoints
+
+Build with `--features agent-api`. Configure `ADX_JIUWEN_CONFIG` using
+[jiuwen.json](examples/jiuwen.json), and `ADX_ACCOUNT_CONFIG` using
+[accounts.json](examples/accounts.json). Both standalone and embedded Ingress
+require Agent configuration and `ADX_SANDBOX_FILES_CONFIG` as described above. Fixed-user `local_fixed` mode
+has been removed; Jiuwen requires business session tokens independently of the
+listener transport. It neither checks TLS state nor trusts `X-Forwarded-Proto`
+for authorization. Both HTTP and HTTPS listeners use the same business checks.
+`allowed_origins` accepts exact HTTP or HTTPS origins, including non-default ports.
+
+For TLS termination at an external load balancer, bind the existing HTTP listener
+with `ADX_DATA_PLANE_INGRESS_PLAIN_BIND=0.0.0.0:8080`, route the business Service
+port 80 to port 8080 using HTTP, and retain HTTPS/WSS at the public listener.
+Restrict the HTTP port to the deployment's internal network and configure the
+public hostname in `allowed_hosts`. This does not change the existing TLS-only
+management routes or Ingress-to-Node mTLS.
+
+`POST /auth/huawei/login` exchanges an Account Kit authorization code and returns
+an opaque business token. First registration requires `agreementVersion`.
+`POST /auth/logout` revokes that session only. `/ws`, `GET/HEAD
+/file-api/download?token=...`, and `POST /file-api/upload` require
+`Authorization: Bearer <business token>`.
+User identity comes only from the session. On `/ws`, the optional `user_id`
+query parameter is ignored, including empty or repeated values; it cannot select
+another user or binding. Other query parameters and query strings over 1024 bytes
+return `400 INVALID_QUERY`. Download retains its own file-token validation.
+Upload accepts `multipart/form-data` with one or more `file` parts, optional
+`dir`, `session_id`, `user_id`, and `agent_type` fields, and at most 64 MiB
+of total request body (up to 20 files). The optional upload query parameter
+`token` is ignored; it does not authorize the request or select the target.
+`session_id` is accepted for client compatibility but does not change the
+selected binding. The `user_id` field and `X-User-Id` header, if present, must match the
+authenticated user. Upload paths are relative to the immutable template's
+`JIUWENSWARM_WORKSPACE` and written to that user's bound Sandbox through
+Relay and Execd. The response has Jiuwen's
+`{"ok":true,"files":[{"filename":"...","path":"...","mime_type":"...","size_bytes":0}],"errors":[]}`
+shape. Upload does not open another AgentServer WS connection.
+ADX management and service credentials
+remain separate. Use a Jiuwen hostname outside the direct-port host domain.
+
+Accounts, hashed sessions and encrypted per-user LiteLLM credentials use a shared
+PostgreSQL schema. Apply [schema.sql](src/ingress/accounts/schema.sql) before
+startup. Ingress and standalone Activators share `ADX_CREDENTIAL_KEY_FILE`, a
+protected file containing a persistent 32-byte encryption key as 64 hex characters.
+Huawei application secrets and LiteLLM administrative keys remain on Ingress.
+
+The first WS for a new binding provisions/reconciles a user model key, then
+prepares an immutable private binding launch configuration. Activator overlays
+that configuration on the shared template environment before Sandbox creation.
+Retries and rebuilds reuse it; public Binding metadata does not return it.
+Downloads resolve existing bindings without provisioning keys or creating Sandboxes.
+
+WS checks sessions before business messages and periodically while idle; download
+streams also stop on expiry/revocation. Multiple independent WS connections may
+use the same binding; business concurrency is owned by AgentServer.
+Platform-wide target connection limits remain deferred, as does
+Execd's path/open race. Ordinary and verified download token/registry checks remain.
+
+Deployment, two authentication boundaries, client requirements and verification
+limits are documented in the
+[Jiuwen gateway design](../docs/development/jiuwenswarm-adx-gateway-design.md).

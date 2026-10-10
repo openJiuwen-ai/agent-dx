@@ -4,7 +4,7 @@ use super::*;
 #[cfg(target_os = "linux")]
 #[test]
 #[ignore = "manual RSS sizing, run alone with --ignored --nocapture"]
-fn env_cache_memory_profile() {
+fn binding_cache_memory_profile() {
     fn rss_kib() -> usize {
         std::fs::read_to_string("/proc/self/status")
             .unwrap()
@@ -25,14 +25,14 @@ fn env_cache_memory_profile() {
             tenant: "t".repeat(36),
             template: "a".repeat(32),
             version: "v".repeat(8),
-            environment_id: format!("{i:036}"),
+            binding_id: format!("{i:036}"),
         };
         let target = Target {
-            environment: Environment {
+            binding: AgentBinding {
                 scope: scope.clone(),
                 generation: "g".repeat(36),
                 sandbox_id: "s".repeat(40),
-                phase: EnvironmentPhase::Active,
+                phase: BindingPhase::Active,
             },
             service: vec![adx_agent_core::Service {
                 protocol: adx_agent_core::Protocol::Http,
@@ -50,6 +50,11 @@ fn env_cache_memory_profile() {
     }
     std::hint::black_box(&entries);
     let delta = rss_kib().saturating_sub(baseline);
-    println!("entries={count} scope_bytes={} binding_bytes={} rss_delta_kib={delta} approximate_bytes_per_entry={}", std::mem::size_of::<Scope>(), std::mem::size_of::<Binding>(), delta * 1024 / count);
+    println!(
+        "entries={count} scope_bytes={} binding_bytes={} rss_delta_kib={delta} approximate_bytes_per_entry={}",
+        std::mem::size_of::<Scope>(),
+        std::mem::size_of::<Binding>(),
+        delta * 1024 / count
+    );
     assert_eq!(entries.len(), count);
 }
