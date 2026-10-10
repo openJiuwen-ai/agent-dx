@@ -12,11 +12,15 @@ python3 runner.py \
   [--case ID ...] [--category CATEGORY] \
   [--backend OwnerFs|DFS] [--meta etcd|Redis] [--transport MODE] \
   [--profile smoke|full] [--timeout SECONDS] \
-  [--cases cases.json] [--lock acceptance.lock.json] \
+  [--cases cases.json] --lock /path/to/run/acceptance.lock.json \
   [--contract PATH/docs/testing/afs.md] \
   [--identity-attestation observed-identity.json] \
   [--results-dir DIR]
 ```
+
+Execution requires an explicit run-specific `--lock` before creating any results.
+`--list` needs no lock and executes no driver. `acceptance.lock.example.json` is
+a machine-independent PREPARING skeleton, not qualified environment evidence.
 
 Driver commands in `cases.json` must be argv arrays. Shell strings are rejected.
 The runner executes drivers with `shell=False`, streams stdout/stderr directly

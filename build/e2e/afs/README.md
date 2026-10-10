@@ -9,7 +9,7 @@
 - `acceptance/`：标准验收 runner、环境准入、driver、probe 和小规模 case 清单。
 - `ownerfs_acceptance.py`：OwnerFs 三节点/远端访问验收入口，默认从目标仓根目录定位 `afs/common/protocol/proto`。
 - `scripts/dfs/r1_e2e.py`：DFS R=1 小规模本地 E2E 驱动。
-- `scripts/ownerfs/`：OwnerFs 现行小规模控制、诊断、工作负载脚本，以及 bind ON 两节点 local-file 恢复验证入口。
+- `scripts/ownerfs/`：OwnerFs workspace 控制，以及 bind ON 两节点 local-file 恢复验证入口。
 - `scripts/check-rdma-cancellation.py`：RDMA 取消路径辅助检查。
 
 不保留内容：
@@ -17,6 +17,14 @@
 - 源仓旧 `scripts/deploy/` 产品安装器和 release 包流程；目标仓统一使用 `build/release` 与部署适配层。
 - 旧 VM 过程证据、checkpoint、日志、压缩包、镜像和历史失败原件；这些留在 Agent Runtime 工作区上一级本地归档。
 - 依赖旧包身份、源仓部署器或历史环境状态的一次性验证脚本。
+
+## 维护边界
+
+- 本机 Lima YAML、IP/MAC 租约、实际运行 lock 和旧阶段专用驱动不作为仓内公共配置；原件、失败记录和路径/校验和索引在开发者源码树外归档，并可从整改前 Git 版本追溯。
+- `runner.py --list` 不需要环境；执行必须显式提供 `--lock /path/to/run/acceptance.lock.json`。无机器身份的 `acceptance/acceptance.lock.example.json` 只说明结构，不能直接形成正式 PASS。
+- 固定回归夹具只保留一份相同内容，以映射在测试临时目录恢复原路径与字节；不向夹具加入每轮运行产物。
+- 跨节点锁、锁取消、bind/native↔FUSE 锁域及 RDMA 专题工具保留为后置研究/回归资产，不是本次迁移的前置，也不证明这些能力受支持。本机 ext4 锁成功不能代替分布式锁验收。
+- 旧 W1/W2/S5 批次诊断及旧并发判定器退出当前入口。维护中的 `owner_remote_small.py`、`owner_remote_write_small.py` 等测量工具继续保留；工具输出不自动满足吞吐与独立操作时延双目标。
 
 ## 常用入口
 
@@ -92,11 +100,11 @@ python3 build/e2e/afs/acceptance/dfs_multinode_small.py coordinator \
 
 | 来源路径 | 目标路径 | 处理 | 原因与影响 |
 | --- | --- | --- | --- |
-| `tests/acceptance/runner.py`、`drivers/`、`probes/`、`suites/`、`cases.json`、`acceptance.lock.json` | `build/e2e/afs/acceptance/` | 保留 | 当前标准验收和小规模回归仍读取这些入口。路径定位已调整为目标仓根目录。 |
-| `tests/acceptance/fixtures/` | `build/e2e/afs/acceptance/fixtures/` | 保留 | 约 2.8MiB 小型回归输入，`test_environment_network.py`、`test_environment_verbs.py` 等测试直接读取。它们不是大体积过程证据。 |
+| `tests/acceptance/runner.py`、`drivers/`、`probes/`、`suites/`、`cases.json` | `build/e2e/afs/acceptance/` | 保留 | 当前标准验收和小规模回归仍读取这些入口。路径定位已调整为目标仓根目录。 |
+| `tests/acceptance/fixtures/` | `build/e2e/afs/acceptance/fixtures/` | 保留 | 网络/verbs 固定回归输入去重保存；测试临时恢复原目录和 SHA-256，完整历史原件在仓外。 |
 | `tests/ownerfs_acceptance.py` | `build/e2e/afs/ownerfs_acceptance.py` | 保留 | OwnerFs 远端/三节点验收入口，proto 默认路径已改为 `afs/common/protocol/proto`。 |
 | `scripts/dfs/r1_e2e.py` | `build/e2e/afs/scripts/dfs/r1_e2e.py` | 保留 | DFS R=1 小规模 E2E 驱动。 |
-| `scripts/ownerfs/native-workspace-control.py`、诊断和工作负载脚本 | `build/e2e/afs/scripts/ownerfs/` | 保留 | OwnerFs bind/workspace 场景的测试控制与诊断工具。 |
+| `scripts/ownerfs/native-workspace-control.py` | `build/e2e/afs/scripts/ownerfs/` | 保留 | OwnerFs bind/workspace 场景的测试控制工具；旧 W1/W2/S5 诊断入口已归档。 |
 | `local-archive/fuser-investigation/verify_official_runtime.py` 的 bounded 两节点 local-file bind ON 断言 | `build/e2e/afs/scripts/ownerfs/bind-two-node-localfile.py` | 迁移并改写 | 仅保留运行断言和证据输出；旧 `scripts/deploy/afs-trial-config`/包身份依赖被替换为目标仓二进制、脚本内临时配置和 mTLS 材料生成。 |
 | `scripts/check-rdma-cancellation.py` | `build/e2e/afs/scripts/check-rdma-cancellation.py` | 保留 | RDMA 取消路径辅助检查。 |
 | 旧 `tests/acceptance/*-linux.py` 中依赖源仓 release 包、`scripts/deploy/afs-processctl`、旧 package identity 的一次性驱动 | 未迁入 | 目标仓改由 `build/release`、部署适配和 `adxctl` 交付；这些脚本在源仓本地归档保留历史证据，不作为目标仓可运行入口。 |

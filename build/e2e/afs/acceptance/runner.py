@@ -39,7 +39,6 @@ def find_repo_root(start: Path) -> Path:
 
 REPO_ROOT = find_repo_root(Path(__file__).resolve())
 DEFAULT_CASES = Path(__file__).with_name("cases.json")
-DEFAULT_LOCK = Path(__file__).with_name("acceptance.lock.json")
 DEFAULT_RESULTS = REPO_ROOT / ".local" / "acceptance"
 DEFAULT_CONTRACT = REPO_ROOT / "docs" / "testing" / "afs.md"
 STRUCTURED_PASS_CHECK_STATUSES = {"PASS", "EXCLUDED"}
@@ -955,7 +954,7 @@ def list_cases(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="AFS Linux ARM64 acceptance runner")
     parser.add_argument("--cases", default=str(DEFAULT_CASES), help="case manifest JSON")
-    parser.add_argument("--lock", default=str(DEFAULT_LOCK), help="acceptance lock JSON")
+    parser.add_argument("--lock", help="explicit run-specific acceptance lock JSON (required except with --list)")
     parser.add_argument("--contract", default=str(DEFAULT_CONTRACT), help="actual AFS acceptance contract to hash against lock.contract")
     parser.add_argument("--identity-attestation", help="observed Linux source/binary identity JSON for full release")
     parser.add_argument("--results-dir", default=str(DEFAULT_RESULTS), help="immutable results root")
@@ -979,6 +978,8 @@ def main(argv: list[str] | None = None) -> int:
             raise AcceptanceError("--timeout must be positive")
         if args.list:
             return list_cases(args)
+        if not args.lock:
+            parser.error("--lock is required for execution; provide a run-specific acceptance lock")
         report = run_acceptance(args)
     except AcceptanceError as exc:
         print(f"runner error: {exc}", file=sys.stderr)

@@ -17,6 +17,33 @@ def write_json(path: Path, value: object) -> None:
 
 
 class RunnerTests(unittest.TestCase):
+    def test_cli_requires_explicit_lock_before_creating_run(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            results = Path(temporary) / "must-not-exist"
+            process = subprocess.run(
+                [sys.executable, str(Path(runner.__file__)),
+                 "--case", "FUN-01", "--results-dir", str(results)],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(process.returncode, 2, process.stderr)
+            self.assertIn("--lock is required", process.stderr)
+            self.assertFalse(results.exists())
+
+    def test_list_does_not_require_environment_lock(self):
+        process = subprocess.run(
+            [sys.executable, str(Path(runner.__file__)), "--list"],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(process.returncode, 0, process.stderr)
+        self.assertIn("FUN-01", process.stdout)
+
+    def test_example_lock_cannot_authorize_full_release(self):
+        example = runner.load_json(Path(runner.__file__).with_name("acceptance.lock.example.json"))
+        ready, errors = runner.release_lock_validation(example, {})
+        self.assertFalse(ready)
+        self.assertIn("lock state is not FROZEN", errors)
+        self.assertIn("lock verification.status is not PASS", errors)
+
     def make_workspace(self):
         temp = tempfile.TemporaryDirectory()
         root = Path(temp.name)

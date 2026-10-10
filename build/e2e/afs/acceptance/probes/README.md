@@ -1,5 +1,7 @@
 # AFS POSIX smoke probes
 
+锁工具属于后置专题：本次版本不承诺跨节点 fcntl/flock、阻塞锁取消或 bind/native↔FUSE 锁域一致性。以下工具用于记录行为，不代表当前产品已通过或支持这些能力。
+
 `posix_smoke.py` is a short, real filesystem probe used during P2c/POSIX bring-up. It creates one exclusive random fixture directory under the supplied mount and records every step in JSON evidence.
 
 It covers a targeted subset only:
@@ -104,3 +106,13 @@ On success the fixture is removed. On failure it is kept unless setup failed bef
 The `host` command takes JSON worker command prefixes, the OwnerFs workspace and DFS roots visible to each worker, and exact expected Node/Meta PID and executable SHA pairs. Use `--require-cross-mount` for product runs. The report must identify different Linux boot IDs, all four actual AFS FUSE mounts and the same expected processes throughout the run. `--allow-host-non-linux` permits VM orchestration only; worker file operations remain on Linux. See `host --help` for the complete arguments.
 
 Run `python3 consistency_cross.py selftest` on Linux to verify positive reference behavior, bounded silent-worker timeout, wrong-binary rejection and rejection of unqualified mounts. Reference selftests do not qualify AFS behavior. Evidence includes exact commands, phase-specific errors, content, sizes, identities and discovered step accounting.
+
+## mmap 新鲜度探针
+
+`mmap_freshness.py` 保留原 `p1b-probe.py` 的真实挂载核验和读写检查，改名不改变语义：热驻留只读映射对覆盖、append、truncate/扩展的即时可见性，以及共享可写 mmap 的 flush/fsync/close/reopen。只在已有 Linux FUSE 测试挂载执行，不负责部署或启动服务，也不替代完整 POSIX 验收。
+
+```sh
+python3 build/e2e/afs/acceptance/probes/mmap_freshness.py \
+  --dfs /path/to/dfs-mount --ownerfs /path/to/ownerfs-mount \
+  --suffix UNIQUE-RUN --cache --mmap-write
+```
