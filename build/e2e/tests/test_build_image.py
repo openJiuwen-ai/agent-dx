@@ -27,7 +27,7 @@ class BuildImageContractTests(unittest.TestCase):
 
     def test_recipe_contains_every_offline_build_prerequisite(self):
         for package in ('autoconf', 'automake', 'libtool', 'pkg-config', 'binutils',
-                        'busybox-static', 'musl-tools'):
+                        'busybox-static', 'musl-tools', 'strace'):
             self.assertIn(package, self.dockerfile)
         self.assertIn('target=x86_64-unknown-linux-musl', self.dockerfile)
         self.assertIn('target=aarch64-unknown-linux-musl', self.dockerfile)
@@ -39,6 +39,7 @@ class BuildImageContractTests(unittest.TestCase):
         self.assertNotIn('--break-system-packages', self.dockerfile)
         self.assertIn('/opt/adx-build-tools/python', self.verify)
         self.assertIn('build/runtime/erofs-tools.sh', self.dockerfile)
+        self.assertIn('strace', self.verify)
         self.assertIn('$VERSION_ID == 20.04', self.verify)
 
     def test_sync_rechecks_the_pushed_digest(self):

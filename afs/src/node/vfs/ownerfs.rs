@@ -8829,9 +8829,25 @@ mod tests {
         let private = fs
             .mkdir(&ctx, root, OsStr::new("job-local-mknod-private"), 0o555)
             .unwrap();
+        if ctx.uid == 0 {
+            let privileged = fs
+                .mknod(
+                    &ctx,
+                    private.inode,
+                    OsStr::new("root.fifo"),
+                    SpecialFileKind::Fifo,
+                    0o600,
+                )
+                .expect("root can create FIFOs even when directory mode lacks write bits");
+            assert_eq!(
+                privileged.attributes.kind,
+                FileKind::Special(SpecialFileKind::Fifo)
+            );
+        }
+        let denied_ctx = non_owner_context(ctx.clone());
         let denied = fs
             .mknod(
-                &ctx,
+                &denied_ctx,
                 private.inode,
                 OsStr::new("denied.fifo"),
                 SpecialFileKind::Fifo,
@@ -8949,18 +8965,21 @@ mod tests {
         let attrs = created.entry.attributes.clone();
         fs.release(&ctx, created.handle).unwrap();
 
-        let allowed_gid = attrs.gid.saturating_add(1);
+        let mut non_root_attrs = attrs.clone();
+        non_root_attrs.uid = if attrs.uid == 1000 { 1001 } else { 1000 };
+        non_root_attrs.gid = if attrs.gid == 1000 { 1001 } else { 1000 };
+        let allowed_gid = non_root_attrs.gid.saturating_add(1);
         let owner_with_group = RequestContext {
-            uid: attrs.uid,
-            gid: attrs.gid,
+            uid: non_root_attrs.uid,
+            gid: non_root_attrs.gid,
             supplementary_gids: vec![allowed_gid],
             ..ctx
         };
         authorize_setattr_with_options(
             &owner_with_group,
-            &attrs,
+            &non_root_attrs,
             &AttributeChange {
-                uid: Some(attrs.uid),
+                uid: Some(non_root_attrs.uid),
                 gid: Some(allowed_gid),
                 ..AttributeChange::default()
             },
@@ -8970,9 +8989,9 @@ mod tests {
 
         let denied = authorize_setattr_with_options(
             &owner_with_group,
-            &attrs,
+            &non_root_attrs,
             &AttributeChange {
-                uid: Some(attrs.uid.saturating_add(1)),
+                uid: Some(non_root_attrs.uid.saturating_add(1)),
                 gid: Some(allowed_gid),
                 ..AttributeChange::default()
             },
@@ -8980,6 +8999,24 @@ mod tests {
         )
         .expect_err("non-root owner cannot change uid to another uid");
         assert_eq!(denied.code(), afs_error::IO_PERMISSION_DENIED);
+
+        let root_ctx = RequestContext {
+            uid: 0,
+            gid: 0,
+            supplementary_gids: Vec::new(),
+            ..owner_with_group
+        };
+        authorize_setattr_with_options(
+            &root_ctx,
+            &non_root_attrs,
+            &AttributeChange {
+                uid: Some(non_root_attrs.uid.saturating_add(1)),
+                gid: Some(allowed_gid),
+                ..AttributeChange::default()
+            },
+            SetAttrOptions::default(),
+        )
+        .expect("root can change file owner and group");
     }
 
     #[test]
