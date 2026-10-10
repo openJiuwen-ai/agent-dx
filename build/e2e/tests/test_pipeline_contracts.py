@@ -109,6 +109,31 @@ class PipelineContracts(unittest.TestCase):
         self.assertEqual(set(actual), expected)
         self.assertEqual(len(actual), len(expected))
 
+    def test_process_heavy_component_tests_run_serially(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cargo = Path(tmp) / 'cargo'
+            cargo.write_text('#!/bin/sh\nprintf "threads=%s\\n" "$RUST_TEST_THREADS"\n')
+            cargo.chmod(0o755)
+            env = dict(os.environ, PATH=tmp + os.pathsep + os.environ['PATH'])
+            for group in ('platform', 'execd'):
+                result = subprocess.run(
+                    [_executable('bash', environment=env), str(ROOT / '.buildkite/component-tests.sh'), group],
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                self.assertIn('threads=1', result.stdout)
+
+            result = subprocess.run(
+                [_executable('bash', environment=env), str(ROOT / '.buildkite/component-tests.sh'), 'gateway'],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            self.assertIn('threads=\n', result.stdout)
+
     def test_default_make_gates_exclude_afs_packages(self):
         makefile = (ROOT / 'Makefile').read_text()
         for package in (
