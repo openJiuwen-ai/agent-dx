@@ -175,3 +175,5 @@ Linux精确受测tree `b9ae4c47ca64142839ea5c0649c7138a90187117`：20模块284�
 整改仅涉及公共镜像的必需追踪工具和测试身份；保留生产权限、同步错误传播及持久屏障行为，不删除失败检查。镜像通过既有维护流程构建、推送、回拉验证后才更新固定摘要，新提交另行验收。ARM 在准备 `ADX_SWR_PULL_CONFIG` 时访问被拒，未进入编译，按已接受的范围暂缓；不修改公共凭据策略。上述轮次关闭 OBS／PyPI 最终发布，使用 Buildkite 传递产物，失败记录保持原版本结论。该 CI 缺口不重开阶段一历史8/8，也不改变既有包的限定运行结论。
 
 公共镜像维护 [#132](https://buildkite.com/agent-dx/agent-dx/builds/132) 基于 `21d03e2edf461c55152f9c288d04ca0793f1b12a` 完成构建、推送及按摘要回拉验证，包含工具检查和真实子进程追踪。发布摘要为 `sha256:7cd63f1d779963576ba3ddbf258a01af9fad289fb4f0e848a34dfb75d5139ade`，Dockerfile SHA-256 为 `030508ebf208d31690de2b7100c3278a8e36e7afddd6a51e0f2b0cedf4789559`；result.json 由该构建产物提供。x86 公共配置和流水线引用统一切换到此摘要，ARM引用不变。两项权限测试在 Linux 普通用户与 root 下通过，fmt、严格 workspace/all-targets/all-features Clippy、6项镜像合同和文档检查通过；新固定提交的完整 x86 OFF／ON结果仍待验收，镜像验证不等于文件系统功能或性能通过。
+
+本轮按用户选择暂缓 ARM。新增 `ADX_ARM_BUILD=0|1`（缺省1保留公共双架构流程），显式0排除全部 ARM 编译、组装、发布及索引；`ADX_ARM_TESTS=0`仅关闭ARM测试，不能用于暂停架构。x86与共享检查保持原流程，未修改 secret 策略。Linux 38项CI合同通过；后续固定提交 OFF／ON复验采用显式0，不能据此声称ARM通过。

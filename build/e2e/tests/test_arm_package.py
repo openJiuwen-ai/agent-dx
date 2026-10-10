@@ -50,7 +50,7 @@ class ArmPackageTests(unittest.TestCase):
         steps = {step['key']: step for step in yaml.safe_load(
             (ROOT / '.buildkite/pipeline-package.yml').read_text())['steps']}
         afs = steps['build-afs-arm64']
-        self.assertEqual(afs['if'], 'build.env("ADX_WITH_AFS") == "1"')
+        self.assertEqual(afs['if'], 'build.env("ADX_ARM_BUILD") != "0" && build.env("ADX_WITH_AFS") == "1"')
         self.assertEqual(afs['env']['ADX_WITH_AFS'], '1')
         self.assertEqual(afs['agents']['arch'], 'arm64')
         self.assertIn('build-arm-package.sh build afs', afs['command'])
@@ -59,6 +59,47 @@ class ArmPackageTests(unittest.TestCase):
         self.assertIn('ADX_ARM_TESTS ADX_WITH_AFS', runner)
         self.assertIn('build:afs', runner)
         self.assertIn('"${backend_args[@]}"', (ROOT / '.buildkite/package-components.sh').read_text())
+
+    def test_arm_build_can_be_deferred_without_removing_x86_or_shared_gates(self):
+        steps = {step['key']: step for step in yaml.safe_load(
+            (ROOT / '.buildkite/pipeline-package.yml').read_text())['steps']}
+        arm_keys = {'build-platform-arm64', 'build-afs-arm64', 'build-gateway-arm64',
+                    'build-execd-arm64', 'platform-build-arm64', 'publish-arm64',
+                    'artifact-manifest-arm64'}
+        # Include ARM publication/index steps which themselves run on x86 agents.
+        actual_arm = {key for key, step in steps.items()
+                      if 'ARM64' in step['label'] or step.get('env', {}).get('ADX_BUILD_ARCH') == 'arm64'}
+        self.assertEqual(actual_arm, arm_keys)
+        for key in arm_keys:
+            expected = 'build.env("ADX_ARM_BUILD") != "0"'
+            if key == 'build-afs-arm64':
+                expected += ' && build.env("ADX_WITH_AFS") == "1"'
+            self.assertEqual(steps[key]['if'], expected, key)
+        for key in set(steps) - arm_keys:
+            self.assertNotIn('ADX_ARM_BUILD', steps[key].get('if', ''), key)
+
+    def test_arm_build_selector_defaults_on_and_rejects_invalid_input(self):
+        with tempfile.TemporaryDirectory() as directory:
+            agent = Path(directory) / 'buildkite-agent'
+            agent.write_text('#!/bin/sh\nprintf "%s\\n" "$*"\n')
+            agent.chmod(0o755)
+            environment = {key: value for key, value in os.environ.items()
+                           if not key.startswith(('ADX_', 'BUILDKITE_'))}
+            environment['PATH'] = directory + os.pathsep + environment['PATH']
+            for value in (None, '0', '1', 'invalid'):
+                with self.subTest(value=value):
+                    env = dict(environment)
+                    if value is not None:
+                        env['ADX_ARM_BUILD'] = value
+                    result = subprocess.run(['bash', str(ROOT / '.buildkite/select-pipeline.sh')],
+                                            env=env, capture_output=True, text=True)
+                    if value == 'invalid':
+                        self.assertEqual(result.returncode, 2)
+                        self.assertIn('ADX_ARM_BUILD must be 0 or 1', result.stderr)
+                        self.assertNotIn('pipeline upload', result.stdout)
+                    else:
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertIn('pipeline upload .buildkite/pipeline-package.yml', result.stdout)
 
     def test_architecture_resolves_native_targets_and_rejects_unknown(self):
         script = ROOT / '.buildkite/build-architecture.sh'

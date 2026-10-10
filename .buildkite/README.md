@@ -32,6 +32,7 @@ Set these variables on a Buildkite build or in that pipeline's environment setti
 |---|---|---|
 | `ADX_OBS_UPLOAD` | base `1`, SDK `0` | `0` disables OBS upload for the selected pipeline |
 | `ADX_WITH_AFS` | `0` | Base: `1` adds the optional AFS component to both architecture packages; OFF packages exclude AFS |
+| `ADX_ARM_BUILD` | `1` | Base: `0` defers all ARM compile, assembly, publication and index steps; x86 and shared gates still run |
 | `ADX_ARM_TESTS` | `0` | Base: `1` runs Rust component tests and install smoke on ARM, as on x86 |
 | `ADX_ARM_OBS_UPLOAD` | inherits `ADX_OBS_UPLOAD` | Base: override only ARM final OBS publication; ARM Buildkite artifacts remain available |
 | `ADX_OBS_UPLOAD_CHANNEL` | `daily` | Base/SDK: `daily` or `release` |
@@ -55,7 +56,9 @@ separately from `adx/daily/` and `adx/release/`.
 
 ## Parallel Linux ARM64 packages
 
-The base pipeline runs two symmetric, independent Linux architecture flows:
+The base pipeline defaults to two symmetric, independent Linux architecture flows.
+Set `ADX_ARM_BUILD=0` for explicit x86-only validation; this records ARM as excluded,
+not passed. `ADX_ARM_TESTS=0` alone still compiles and packages ARM.
 
 | Stage | x86_64 | ARM64 |
 |---|---|---|

@@ -125,6 +125,7 @@ steps:
   plugins: *id001
 - label: Build · Platform · Linux ARM64
   key: build-platform-arm64
+  if: build.env("ADX_ARM_BUILD") != "0"
   agents:
     queue: default
     os: macos
@@ -142,7 +143,7 @@ steps:
     JOBS: '4'
 - label: Build · AFS · Linux ARM64
   key: build-afs-arm64
-  if: build.env("ADX_WITH_AFS") == "1"
+  if: build.env("ADX_ARM_BUILD") != "0" && build.env("ADX_WITH_AFS") == "1"
   agents:
     queue: default
     os: macos
@@ -161,6 +162,7 @@ steps:
     ADX_WITH_AFS: '1'
 - label: Build · Gateway · Linux ARM64
   key: build-gateway-arm64
+  if: build.env("ADX_ARM_BUILD") != "0"
   agents:
     queue: default
     os: macos
@@ -178,6 +180,7 @@ steps:
     JOBS: '4'
 - label: Build · Execd · Linux ARM64
   key: build-execd-arm64
+  if: build.env("ADX_ARM_BUILD") != "0"
   agents:
     queue: default
     os: macos
@@ -451,6 +454,7 @@ steps:
   plugins: *id001
 - label: Release · Assemble · Linux ARM64
   key: platform-build-arm64
+  if: build.env("ADX_ARM_BUILD") != "0"
   depends_on:
   - build-platform-arm64
   - build-gateway-arm64
@@ -497,6 +501,7 @@ steps:
   plugins: *id001
 - label: Release · Publish · Linux ARM64
   key: publish-arm64
+  if: build.env("ADX_ARM_BUILD") != "0"
   depends_on: platform-build-arm64
   agents:
     queue: default
@@ -512,6 +517,7 @@ steps:
   plugins: *id001
 - label: Release · Index · Linux ARM64
   key: artifact-manifest-arm64
+  if: build.env("ADX_ARM_BUILD") != "0"
   depends_on: publish-arm64
   agents:
     queue: default
