@@ -3,7 +3,7 @@
 `adxadmin` manages an ADX cluster through its public HTTPS administration API.
 
 ```sh
-pipx install ./adxadmin-0.1.0-py3-none-any.whl
+pipx install ./adxadmin-0.1.0rc1-py3-none-any.whl
 adxadmin key create --tenant team-a
 adxadmin key list --tenant team-a
 ```
