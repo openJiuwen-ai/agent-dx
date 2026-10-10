@@ -11,9 +11,9 @@ Server 的公开 HTTPS API 管理 ADX，不读取部署 YAML，不连接 Redis�
 `adxadmin-<version>-py3-none-any.whl`，Linux、macOS 和 Windows 使用同一产物：
 
 ```sh
-pipx install ./adxadmin-0.1.0-py3-none-any.whl
+pipx install ./adxadmin-0.1.0rc1-py3-none-any.whl
 # 或安装构建产物
-python3 -m pip install ./adxadmin-0.1.0-py3-none-any.whl
+python3 -m pip install ./adxadmin-0.1.0rc1-py3-none-any.whl
 ```
 
 从源码构建 wheel 和 sdist：
@@ -28,7 +28,7 @@ PYTHON=python3.12 bash tools/admin/build.sh out/wheels
 正式发布后可直接从 PyPI 安装：
 
 ```sh
-pipx install adxadmin==0.1.0
+pipx install adxadmin==0.1.0rc1
 ```
 
 基础流水线 `agent-dx` 与独立流水线 `agent-dx-admin` 共享 `admin-package` 步骤始终构建并校验 wheel 与 sdist，但默认不上传。
