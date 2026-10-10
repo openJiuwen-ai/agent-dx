@@ -177,3 +177,5 @@ Linux精确受测tree `b9ae4c47ca64142839ea5c0649c7138a90187117`：20模块284�
 公共镜像维护 [#132](https://buildkite.com/agent-dx/agent-dx/builds/132) 基于 `21d03e2edf461c55152f9c288d04ca0793f1b12a` 完成构建、推送及按摘要回拉验证，包含工具检查和真实子进程追踪。发布摘要为 `sha256:7cd63f1d779963576ba3ddbf258a01af9fad289fb4f0e848a34dfb75d5139ade`，Dockerfile SHA-256 为 `030508ebf208d31690de2b7100c3278a8e36e7afddd6a51e0f2b0cedf4789559`；result.json 由该构建产物提供。x86 公共配置和流水线引用统一切换到此摘要，ARM引用不变。两项权限测试在 Linux 普通用户与 root 下通过，fmt、严格 workspace/all-targets/all-features Clippy、6项镜像合同和文档检查通过；新固定提交的完整 x86 OFF／ON结果仍待验收，镜像验证不等于文件系统功能或性能通过。
 
 本轮按用户选择暂缓 ARM。新增 `ADX_ARM_BUILD=0|1`（缺省1保留公共双架构流程），显式0排除全部 ARM 编译、组装、发布及索引；`ADX_ARM_TESTS=0`仅关闭ARM测试，不能用于暂停架构。x86与共享检查保持原流程，未修改 secret 策略。Linux 38项CI合同通过；后续固定提交 OFF／ON复验采用显式0，不能据此声称ARM通过。
+
+固定提交 `2fddf079f15f6a1e9a2a66ceef1ac5ea0918da56` 的 [x86 OFF #133](https://buildkite.com/agent-dx/agent-dx/builds/133)／[ON #134](https://buildkite.com/agent-dx/agent-dx/builds/134) 均失败：Python adxadmin、Sandbox SDK通过；所有9个失败Rust步骤在编译前报 `Rust image is missing rustfmt`，组包未执行，ARM按条件排除未运行。流水线显式选择 `stable`，与镜像按仓库准备的固定 `1.95.0` 工具链不一致；后续修复选择固定版本及bootstrap缺省来源，不安装组件或降低准入。该失败保留原身份；修复后完整CI仍待验收。
