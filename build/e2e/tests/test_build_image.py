@@ -1,4 +1,8 @@
 import json
+import os
+import re
+import subprocess
+import tempfile
 from pathlib import Path
 import unittest
 
@@ -15,6 +19,46 @@ class BuildImageContractTests(unittest.TestCase):
         self.sync = (ROOT / '.buildkite/sync-build-image.sh').read_text()
         self.verify = (ROOT / '.buildkite/verify-build-image.sh').read_text()
         self.bootstrap = (ROOT / '.buildkite/bootstrap-build.sh').read_text()
+
+    def test_ci_steps_use_the_repository_pinned_toolchain(self):
+        expected = re.search(r'^channel = "([^"]+)"',
+                             (ROOT / 'rust-toolchain.toml').read_text(), re.M)[1]
+        steps = yaml.safe_load((ROOT / '.buildkite/pipeline-package.yml').read_text())['steps']
+        configured = [step['env']['RUSTUP_TOOLCHAIN'] for step in steps
+                      if 'RUSTUP_TOOLCHAIN' in step.get('env', {})]
+        self.assertTrue(configured)
+        self.assertEqual(set(configured), {expected})
+
+    def test_cargo_bootstrap_uses_pinned_components_and_fails_on_drift(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'rust-toolchain.toml').write_text('[toolchain]\nchannel = "1.95.0"\n')
+            (root / 'rustc').write_text('#!/bin/sh\necho "rustc ${FAKE_RUST_VERSION:-1.95.0} (fixture)"\n')
+            (root / 'rustup').write_text(
+                '#!/bin/sh\n'
+                '[ "$*" = "component list --installed --toolchain 1.95.0" ] || exit 9\n'
+                '[ "${FAKE_MISSING_COMPONENT:-0}" = 1 ] && exit 0\n'
+                'printf "rustfmt-x86_64-unknown-linux-gnu\\nclippy-x86_64-unknown-linux-gnu\\n"\n')
+            for name in ('rustc', 'rustup'):
+                (root / name).chmod(0o755)
+            environment = {key: value for key, value in os.environ.items()
+                           if key not in ('RUSTUP_TOOLCHAIN', 'RUSTC_WRAPPER')}
+            environment.update(PATH=str(root) + os.pathsep + os.environ['PATH'],
+                               ADX_CARGO_HOME=str(root / 'cargo'),
+                               CARGO_TARGET_DIR=str(root / 'target'))
+            script = ROOT / '.buildkite/setup-cargo.sh'
+            for overrides, error in (({}, None), ({'FAKE_MISSING_COMPONENT': '1'}, 'missing rustfmt'),
+                                     ({'FAKE_RUST_VERSION': '1.94.0'}, 'version mismatch')):
+                with self.subTest(overrides=overrides):
+                    result = subprocess.run(['bash', '-c', 'source "$1"', 'test', str(script)],
+                                            cwd=root, env=dict(environment, **overrides),
+                                            capture_output=True, text=True)
+                    if error:
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertIn(error, result.stderr)
+                    else:
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertIn('Rust=1.95.0', result.stdout)
 
     def test_source_is_digest_pinned_ubuntu_2004_amd64(self):
         self.assertEqual(self.config['schema_version'], 1)
