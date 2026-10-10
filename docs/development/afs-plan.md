@@ -27,7 +27,7 @@
 
 公共 Full #66 已使用 ON #137 的 x86 交付件通过原有11组业务用例。ARM Full 尚不能直接复用该入口：当前交接脚本固定选择 x86 产物及 target，并要求外部 backend；#143 ARM 清单的 backend 为 null。还需在公共流程补架构选择，核验原生 ARM 后端、固定 runtime／Collector 镜像和至少两个 ARM Kubernetes worker。不得用 #143 的 x86 镜像 bundle 代替 ARM Full；这些缺口不阻止独立验证 ARM 包的 bind ON 与远端 FUSE 核心场景。
 
-最新正式 ON [#146](https://buildkite.com/agent-dx/agent-dx/builds/146) 绑定 `aa5f63d`：x86 公共组件及 AFS 测试、编译、组包、安装 smoke、镜像和 Kubernetes L0 全部通过；ARM Platform／AFS／Gateway 测试与编译通过，Execd 仍在同一个 checkpoint 发布入口等待失败，因此整轮 failed，ARM 组包未执行。fixture 原子发布已取得回归证据；串行化没有解决剩余 ARM 超时，根因保持待定位。现有测试补充提前返回错误和超时状态诊断，保留原 2 秒期限与持久化发布屏障。原 #144 失败及 #143／Full66 历史结果不改写，新诊断候选不自动继承交付结论。
+最新正式 ON [#147](https://buildkite.com/agent-dx/agent-dx/builds/147) 绑定 `a5fef9c`，整轮 passed：双架构公共组件及 AFS 测试／编译、统一组包、安装 smoke、发布索引，以及 x86 验收镜像和 Kubernetes L0 全部通过；两份最终包均 with_afs=true 且不含测试探针。OBS／PyPI 外发关闭，ARM Full 与新包真实文件系统运行未在此轮新增。原 #144／#146 checkpoint 超时及其他失败保持版本和证据；原期限下本轮通过，没有证明间歇性超时根因已消除。fixture 原子发布的确定性回归和现有 checkpoint 测试的失败诊断已纳入，产品语义、期限、持久屏障及第三方源码未变。#143 的真实 bind ON／远端访问与 Full66 继续保留原身份，详见[迁移报告](../migration/2026-10-09-afs-snapshot.md)。
 
 ## 支持范围
 
