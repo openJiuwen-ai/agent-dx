@@ -1,8 +1,8 @@
 """Read and write administrator credentials without silent permission widening."""
 
 import os
-from pathlib import Path
 import stat
+from pathlib import Path
 
 from .errors import InvalidInput
 

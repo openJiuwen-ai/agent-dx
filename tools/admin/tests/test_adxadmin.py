@@ -4,7 +4,9 @@ import os
 import stat
 import sys
 import tempfile
+import unicodedata
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
@@ -12,13 +14,127 @@ import httpx
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from adxadmin.cli import build_parser, run
+from adxadmin.cli import _expiry, _print_created, _print_page, build_parser, run
 from adxadmin.client import AdminClient, ClientOptions
 from adxadmin.credentials import read_token, write_secret
 from adxadmin.errors import ApiError, InvalidInput
 
 
 class CliContractTests(unittest.TestCase):
+    def test_key_list_columns_align_and_expiry_is_a_date(self):
+        page = {
+            "items": [
+                {
+                    "id": "a" * 64,
+                    "tenantId": "team-a",
+                    "expiresAtUnixSeconds": 1794212720,
+                },
+                {
+                    "id": "b" * 64,
+                    "tenantId": "a-much-longer-tenant",
+                    "expiresAtUnixSeconds": 0,
+                },
+            ],
+            "nextPageToken": "next-page",
+        }
+        output = io.StringIO()
+        _print_page(page, "table", output)
+        lines = output.getvalue().splitlines()
+        self.assertNotIn("\t", "\n".join(lines[:3]))
+        self.assertEqual(lines[0].index("TENANT"), lines[1].index("team-a"))
+        self.assertEqual(
+            lines[0].index("TENANT"), lines[2].index("a-much-longer-tenant")
+        )
+        expires = lines[1][lines[0].index("EXPIRES_AT") :]
+        self.assertEqual(int(datetime.fromisoformat(expires).timestamp()), 1794212720)
+        self.assertEqual(lines[0].index("EXPIRES_AT"), lines[2].index("never"))
+        self.assertIn("NEXT_PAGE_TOKEN", lines[3])
+
+    def test_key_list_aligns_wide_tenant_characters(self):
+        output = io.StringIO()
+        _print_page(
+            {
+                "items": [
+                    {"id": "a" * 64, "tenantId": "研发团队", "expiresAtUnixSeconds": 0}
+                ],
+                "nextPageToken": "",
+            },
+            "table",
+            output,
+        )
+        header, row = output.getvalue().splitlines()
+        prefix = row[: row.index("never")]
+        width = sum(
+            2 if unicodedata.east_asian_width(c) in ("W", "F") else 1 for c in prefix
+        )
+        self.assertEqual(width, header.index("EXPIRES_AT"))
+
+    def test_key_list_json_preserves_unix_expiry(self):
+        page = {
+            "items": [
+                {
+                    "id": "a" * 64,
+                    "tenantId": "team-a",
+                    "expiresAtUnixSeconds": 1794212720,
+                }
+            ],
+            "nextPageToken": "",
+        }
+        output = io.StringIO()
+        _print_page(page, "json", output)
+        self.assertEqual(json.loads(output.getvalue()), page)
+
+    def test_key_create_uses_the_same_date_table(self):
+        created = {
+            "key": {
+                "id": "a" * 64,
+                "tenantId": "team-a",
+                "expiresAtUnixSeconds": 1794212720,
+            },
+            "outputFile": "/secure/team-a.key",
+        }
+        output = io.StringIO()
+        _print_created(created, "table", output)
+        lines = output.getvalue().splitlines()
+        self.assertNotIn("\t", lines[0])
+        expires = lines[1][lines[0].index("EXPIRES_AT") :]
+        self.assertEqual(int(datetime.fromisoformat(expires).timestamp()), 1794212720)
+        self.assertIn("/secure/team-a.key", lines[2])
+
+    def test_key_expiry_outside_datetime_range_remains_printable(self):
+        self.assertIn(str(2**63 - 1), _expiry(2**63 - 1))
+        self.assertEqual(_expiry(0), "never")
+
+    def test_tls_verification_is_opt_in_and_reaches_the_http_client(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            token_file = Path(temporary) / "admin.key"
+            token_file.write_text("a" * 64)
+            token_file.chmod(0o600)
+            for flags, expected in (([], False), (["--verify-tls"], True)):
+                with (
+                    self.subTest(verify_tls=expected),
+                    mock.patch("adxadmin.cli.AdminClient") as client_type,
+                ):
+                    client_type.return_value.__enter__.return_value.list_keys.return_value = {
+                        "items": [],
+                        "nextPageToken": "",
+                    }
+                    result = run(
+                        [
+                            "--endpoint",
+                            "https://adx.example.com",
+                            "--token-file",
+                            str(token_file),
+                            *flags,
+                            "key",
+                            "list",
+                        ],
+                        environ={},
+                        stdout=io.StringIO(),
+                    )
+                    self.assertEqual(result, 0)
+                    self.assertEqual(client_type.call_args.args[0].verify_tls, expected)
+
     def test_create_does_not_require_an_output_file(self):
         parser = build_parser({})
         arguments = parser.parse_args(
@@ -167,6 +283,45 @@ class CredentialTests(unittest.TestCase):
 
 
 class ClientContractTests(unittest.TestCase):
+    def test_certificate_verification_is_opt_in_or_enabled_by_a_ca_file(self):
+        for verify_tls, ca_file, expected in (
+            (False, None, False),
+            (False, "/tmp/ca.pem", "/tmp/ca.pem"),
+            (True, None, True),
+            (True, "/tmp/ca.pem", "/tmp/ca.pem"),
+        ):
+            with (
+                self.subTest(verify_tls=verify_tls, ca_file=ca_file),
+                mock.patch("adxadmin.client.httpx.Client") as client_type,
+            ):
+                with AdminClient(
+                    ClientOptions(
+                        endpoint="https://adx.example.com",
+                        token="a" * 64,
+                        ca_file=ca_file,
+                        verify_tls=verify_tls,
+                    )
+                ):
+                    pass
+                self.assertEqual(client_type.call_args.kwargs["verify"], expected)
+
+    def test_default_tls_mode_preserves_authentication_and_rejects_remote_plaintext(
+        self,
+    ):
+        def handler(request):
+            self.assertEqual(request.headers["authorization"], "Bearer " + "a" * 64)
+            return httpx.Response(200, json={"items": [], "nextPageToken": ""})
+
+        options = ClientOptions(
+            endpoint="https://adx.example.com",
+            token="a" * 64,
+        )
+        with AdminClient(options, transport=httpx.MockTransport(handler)) as client:
+            client.list_keys()
+        options.endpoint = "http://example.com"
+        with self.assertRaises(InvalidInput):
+            AdminClient(options)
+
     def client(self, handler, endpoint="http://127.0.0.1:8000"):
         return AdminClient(
             ClientOptions(
@@ -244,9 +399,11 @@ class ClientContractTests(unittest.TestCase):
                 },
             )
 
-        with self.client(handler) as client:
-            with self.assertRaisesRegex(InvalidInput, "tenant"):
-                client.create_key("team-a")
+        with (
+            self.client(handler) as client,
+            self.assertRaisesRegex(InvalidInput, "tenant"),
+        ):
+            client.create_key("team-a")
 
     def test_list_rejects_malformed_key_metadata(self):
         def handler(_request):
@@ -264,9 +421,11 @@ class ClientContractTests(unittest.TestCase):
                 },
             )
 
-        with self.client(handler) as client:
-            with self.assertRaisesRegex(InvalidInput, "metadata"):
-                client.list_keys()
+        with (
+            self.client(handler) as client,
+            self.assertRaisesRegex(InvalidInput, "metadata"),
+        ):
+            client.list_keys()
 
     def test_revoke_uses_the_digest_identifier(self):
         key_id = "d" * 64
@@ -294,9 +453,8 @@ class ClientContractTests(unittest.TestCase):
                 },
             )
 
-        with self.client(handler) as client:
-            with self.assertRaises(ApiError) as raised:
-                client.list_keys()
+        with self.client(handler) as client, self.assertRaises(ApiError) as raised:
+            client.list_keys()
         self.assertEqual(raised.exception.code, "UNAVAILABLE")
         self.assertEqual(raised.exception.retry, "AFTER_BACKOFF")
         self.assertEqual(raised.exception.request_id, "request-a")
