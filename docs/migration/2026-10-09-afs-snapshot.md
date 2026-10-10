@@ -208,3 +208,7 @@ ARM已恢复推进：当前账号按用户授权追加secret精确分支访问�
 [正式ON #141](https://buildkite.com/agent-dx/agent-dx/builds/141)固定`1cd6541`、ARM_TESTS=1，唯一实际失败为ARM AFS库测试：614通过、1失败、22忽略。`pending_trace_owned_inputs_and_actual_instance_guard`首次计算libtest进程可执行文件SHA时报超时或失败；日志未记录文件尺寸或哈希耗时，不能把大型debug程序触发2秒期限的推断写成已证明根因。ARM Platform／Gateway／Execd测试与编译通过，x86组件／检查／组包／L0独立通过；ARM组包和安装未运行，没有本轮ARM统一包。完整原失败及产物元数据保留在`EV-BUILDKITE-X86`。后续只将该测试改用小型真实sleep进程，比对显式`/proc/<pid>/exe`与对应文件摘要并排除sha256sum自身，所有哈希结果先保存、kill/wait后再断言；生产2秒期限、身份／权限校验、错误传播及文件系统实现不变。Linux3项定向回归、fmt和严格workspace/all-targets/all-features Clippy通过，真实新ARM交付仍待验收。
 
 Full证明上述x86交付件通过ADX原有11组回归；没有新增bind ON文件系统运行、完整POSIX或性能结论。原bfd876运行及阶段一历史8/8保持原身份，OBS／PyPI最终发布继续关闭。
+
+[正式 ON #142](https://buildkite.com/agent-dx/agent-dx/builds/142)固定`c996673`终态失败：ARM AFS库615通过／22忽略，原实例哈希测试通过；随后`storage_localfs`为1通过／7失败，七项均在fixture向源码目录的`target/storage-localfs-tests`创建目录时EACCES，尚未进入LocalFs。ARM公共构建已设置外部Cargo target，fixture却仍写宿主映射checkout；具体宿主权限成因未记录，不能称产品权限错误。只将该测试helper改为已有tempfile的系统临时目录，保留全部8项断言及同步、重命名、符号链接检查，不改公共镜像／挂载／用户／产品实现。Linux非root、只读cwd且可写系统tmp下，原二进制1通过／7失败，改后8通过且未生成cwd/target；正常suite8通过、fmt及严格workspace/all-targets/all-features Clippy通过。
+
+同轮另有两个公共组件实际失败：x86 Platform的`supervisor_drains_rotated_logs_on_stop`在5秒Stop请求超时，ARM Execd的`adxlet_creation_and_event_driven_checkpoint_wait_for_state_publication`在2秒等待发布入口超时。原失败、完整日志及版本保留；未放宽期限、删断言或改公共停止／恢复逻辑。未修改的部署process10项和Execd control_stream9项在现有ARM64 Linux分别单次通过，仅属有限核对，不证明CI失败根因或解决。本轮没有ARM统一包／安装结果，修复后正式交付仍待验收。证据继续索引到`EV-BUILDKITE-X86`，Full66及旧OFF135／ON137保持原版本结论。
