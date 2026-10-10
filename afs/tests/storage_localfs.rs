@@ -9,14 +9,10 @@ fn path(value: &str) -> StoragePath {
 }
 
 fn tempdir() -> tempfile::TempDir {
-    let base = std::env::current_dir()
-        .unwrap()
-        .join("target")
-        .join("storage-localfs-tests");
-    std::fs::create_dir_all(&base).unwrap();
+    // Fixtures must not require a writable checkout; CI uses an external target.
     tempfile::Builder::new()
-        .prefix("case-")
-        .tempdir_in(base)
+        .prefix("storage-localfs-")
+        .tempdir()
         .unwrap()
 }
 
