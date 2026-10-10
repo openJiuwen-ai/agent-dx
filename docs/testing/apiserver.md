@@ -95,3 +95,5 @@ API Server 的 `create_mode` 默认 `central`；配置为 `local_first` 后，�
 本地成功不经过 Pack/Spread、软偏好评分或中心队列。相同规格的同 ID 创建收敛，规格/租户变化返回冲突。
 入口超时使用同身份向 Coordinator 重试；不会把一次缺失查询当作重新生成 ID 的许可。
 目录有效期、mTLS、暂留资源和验收范围见 [创建契约](atomic-environment-claim.md)。
+
+实例视图包含 `tenant_id`，来自权威 Environment 规格的归属租户。分页列表与 `instance_id` 单项查询返回同一视图；普通租户仍只能看到自己的实例，管理员可以看到各租户实例。此字段仅用于展示，不接受客户端指定的租户作为认证依据。

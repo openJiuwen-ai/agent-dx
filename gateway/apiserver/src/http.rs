@@ -959,6 +959,7 @@ pub(crate) fn instance_view(owner: pb::GetEnvironmentResponse) -> Result<Value, 
     let resource = spec.resources.unwrap_or_default();
     Ok(json!({
         "id": spec.id,
+        "tenant_id": spec.tenant_id,
         "status": state(record.state),
         "required_cpu": resource.cpu_millis,
         "required_mem": resource.memory_bytes / 1048576,
@@ -1222,6 +1223,28 @@ mod error_contract_tests {
                 .to_bytes(),
         )
         .expect("JSON error body")
+    }
+
+    #[test]
+    fn instance_view_exposes_record_tenant_without_execution_secrets() {
+        let view = instance_view(pb::GetEnvironmentResponse {
+            record: Some(pb::EnvironmentRecord {
+                spec: Some(pb::EnvironmentSpec {
+                    id: "sandbox-1".into(),
+                    tenant_id: "tenant-a".into(),
+                    env: HashMap::from([("EXECD_HTTP_TOKEN".into(), "private".into())]),
+                    ..Default::default()
+                }),
+                state: pb::EnvironmentState::Running as i32,
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(view["tenant_id"], "tenant-a");
+        assert_eq!(view["id"], "sandbox-1");
+        assert!(view.get("env").is_none());
+        assert!(!view.to_string().contains("private"));
     }
 
     #[test]
