@@ -4,7 +4,7 @@ requires-python = ">=3.10"
 
 [[package]]
 name = "adx-sandbox"
-version = "0.1.0"
+version = "0.1.0rc1"
 source = { editable = "." }
 dependencies = [
     { name = "httpx" },
