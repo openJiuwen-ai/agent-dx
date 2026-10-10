@@ -65,10 +65,10 @@ pub enum Command {
         #[command(subcommand)]
         command: TemplateCommand,
     },
-    /// 查询或删除 Environment；创建由访问流量触发。
-    Env {
+    /// 查询或删除 AgentBinding；创建由访问流量触发。
+    Binding {
         #[command(subcommand)]
-        command: EnvironmentCommand,
+        command: BindingCommand,
     },
 }
 #[derive(Debug, Subcommand)]
@@ -91,7 +91,7 @@ pub struct TemplateScope {
     pub version: String,
 }
 #[derive(Debug, Subcommand)]
-pub enum EnvironmentCommand {
+pub enum BindingCommand {
     List {
         #[command(flatten)]
         scope: TemplateScope,
@@ -115,13 +115,8 @@ fn parse_page_size(value: &str) -> std::result::Result<usize, String> {
     value
         .parse::<usize>()
         .ok()
-        .filter(|v| (1..=limits::ENVIRONMENT_PAGE_SIZE).contains(v))
-        .ok_or_else(|| {
-            format!(
-                "page-size 必须在 1..={} 之间",
-                limits::ENVIRONMENT_PAGE_SIZE
-            )
-        })
+        .filter(|v| (1..=limits::BINDING_PAGE_SIZE).contains(v))
+        .ok_or_else(|| format!("page-size 必须在 1..={} 之间", limits::BINDING_PAGE_SIZE))
 }
 
 #[derive(Default, Deserialize)]
@@ -320,13 +315,11 @@ pub async fn execute(command: &Command, config: &Configuration) -> Result<Comman
                 &["api", "agent", "v2", "templates", name, "versions", version],
             )?,
         ),
-        Command::Env { command } => {
+        Command::Binding { command } => {
             let (scope, id, method) = match command {
-                EnvironmentCommand::List { scope, .. } => (scope, None, reqwest::Method::GET),
-                EnvironmentCommand::Get { id, scope } => (scope, Some(id), reqwest::Method::GET),
-                EnvironmentCommand::Delete { id, scope } => {
-                    (scope, Some(id), reqwest::Method::DELETE)
-                }
+                BindingCommand::List { scope, .. } => (scope, None, reqwest::Method::GET),
+                BindingCommand::Get { id, scope } => (scope, Some(id), reqwest::Method::GET),
+                BindingCommand::Delete { id, scope } => (scope, Some(id), reqwest::Method::DELETE),
             };
             let mut segments = vec![
                 "api",
@@ -336,13 +329,13 @@ pub async fn execute(command: &Command, config: &Configuration) -> Result<Comman
                 &scope.template,
                 "versions",
                 &scope.version,
-                "environments",
+                "bindings",
             ];
             if let Some(id) = id {
                 segments.push(id);
             }
             let mut url = route(&config.endpoint, &segments)?;
-            if let EnvironmentCommand::List {
+            if let BindingCommand::List {
                 page_size,
                 page_token,
                 ..

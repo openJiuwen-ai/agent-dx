@@ -1,6 +1,5 @@
 use crate::{
     clients::Clients,
-    contract,
     errors::ErrorDetail,
     operations::{snapshot_value, Kind},
     sandbox_service::SandboxService,
@@ -328,20 +327,16 @@ impl Api {
                     object.remove("runtime");
                 }
             }
-            let spec = match contract::create_spec_with_environment(
-                input.clone(),
-                &caller,
-                self.clients.config.runtime_profile.as_ref(),
-            ) {
-                Ok(s) => s,
-                Err(error) => return error_response(error, &request_id, None, None, false),
-            };
             if stream && path.ends_with("sandboxes") {
+                let spec = match self.sandbox_service.prepare_create(input.clone(), &caller) {
+                    Ok(spec) => spec,
+                    Err(error) => return error_response(error, &request_id, None, None, false),
+                };
                 return self.create_stream(spec, input, request_id, caller);
             }
             let result = Box::pin(
                 self.sandbox_service
-                    .create(spec, input, &request_id, &caller),
+                    .create_request(input, &request_id, &caller),
             )
             .await;
             return response(
@@ -951,7 +946,7 @@ fn status_code(error: &Status) -> u16 {
         _ => 500,
     }
 }
-fn instance_view(owner: pb::GetEnvironmentResponse) -> Result<Value, Status> {
+pub(crate) fn instance_view(owner: pb::GetEnvironmentResponse) -> Result<Value, Status> {
     let record = owner
         .record
         .ok_or_else(|| Status::data_loss("environment directory returned no record"))?;

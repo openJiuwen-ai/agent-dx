@@ -25,8 +25,8 @@ adxadmin 复用 SDK 的 Python 3.12 容器执行器，不使用 Rust 构建镜�
 
 Agent FS（AFS） 是可选文件系统组件。默认 source gate、基础包组装、镜像和部署不包含
 `afs-meta`、`afs-node`、AFS 配置示例或 FUSE 专属系统依赖。`afs/**`、根 Cargo/Make
-入口或 AFS gate 本身变化时，默认 pipeline 会执行 `.buildkite/afs-gate.sh`；该 gate
-运行 `ADX_WITH_AFS=1 make afs-check` 证明文件系统代码仍可构建和测试，但不改变默认包
+入口或 source gate 本身变化时，默认 pipeline 仍走 `.buildkite/source-gate.sh`；显式
+`ADX_WITH_AFS=1` 时，source gate 在公共 fmt/Clippy/tooling 检查中追加 AFS lint，但不改变默认包
 或部署制品。显式文件系统包使用同一个 `ADX_WITH_AFS=1` 合同，Buildkite 才启用
 `build-afs` 和 `build-afs-arm64` 可选组件步，组装时下载 AFS 组件并把 `--with-afs` 传给包清单、build manifest
 和 OBS 发布校验。带 AFS 包写入 `with_afs: true` 并包含 `bin/afs-meta`、`bin/afs-node`

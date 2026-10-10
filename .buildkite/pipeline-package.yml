@@ -368,48 +368,6 @@ steps:
           hostPath:
             path: /mnt/paas
             type: DirectoryOrCreate
-- label: Quality · AFS
-  key: afs-gate
-  depends_on: source-gate
-  agents:
-    queue: default
-    os: linux
-    arch: amd64
-  concurrency: 1
-  concurrency_group: adx/afs-gate-amd64
-  command: bash .buildkite/step.sh afs-gate bash .buildkite/afs-gate.sh
-  timeout_in_minutes: 45
-  artifact_paths:
-  - out/buildkite/logs/**/*
-  env:
-    BUILDKITE_AGENT_NAME: agent-stack-k8s
-    ADX_CARGO_HOME: /mnt/paas/build-cache/adx/cargo-home
-    CARGO_HOME: /mnt/paas/build-cache/adx/cargo-home
-    CARGO_TARGET_DIR: /mnt/paas/build-cache/adx/cargo-target/afs-gate-amd64-rust1950
-    RUSTUP_TOOLCHAIN: 1.95.0
-    RUSTUP_AUTO_INSTALL: '0'
-  plugins:
-  - kubernetes:
-      podSpec:
-        imagePullSecrets:
-        - name: swr-pull-secret
-        containers:
-        - image: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/adx-build@sha256:7cd63f1d779963576ba3ddbf258a01af9fad289fb4f0e848a34dfb75d5139ade
-          volumeMounts:
-          - name: build-cache
-            mountPath: /mnt/paas
-          resources:
-            requests:
-              cpu: '4'
-              memory: 8Gi
-            limits:
-              cpu: '8'
-              memory: 16Gi
-        volumes:
-        - name: build-cache
-          hostPath:
-            path: /mnt/paas
-            type: DirectoryOrCreate
 - label: Release · Assemble · Linux x86_64
   key: platform-build
   depends_on:
@@ -418,7 +376,6 @@ steps:
   - build-execd
   - build-afs
   - source-gate
-  - afs-gate
   - admin-package
   - sdk-package
   agents:
@@ -460,7 +417,6 @@ steps:
   - build-gateway-arm64
   - build-execd-arm64
   - build-afs-arm64
-  - afs-gate
   - source-gate
   - sdk-package
   - admin-package

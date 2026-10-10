@@ -12,8 +12,8 @@ use url::Url;
 pub struct HttpArgs {
     #[command(flatten)]
     pub scope: TemplateScope,
-    #[arg(long = "env")]
-    pub environment: Option<String>,
+    #[arg(long)]
+    pub binding_id: Option<String>,
     #[arg(long, value_parser = clap::value_parser!(u16).range(1..))]
     pub port: Option<u16>,
     #[arg(long, default_value = "/")]
@@ -31,8 +31,8 @@ pub struct HttpArgs {
 impl HttpArgs {
     /// Builds a Gateway URL; rejects paths or query selectors that can escape this route.
     pub fn url(&self, endpoint: &Url) -> Result<Url> {
-        let target = match &self.environment {
-            Some(id) => Target::Environment {
+        let target = match &self.binding_id {
+            Some(id) => Target::Binding {
                 name: self.scope.template.clone(),
                 version: self.scope.version.clone(),
                 id: id.clone(),
@@ -156,8 +156,8 @@ pub async fn execute(
         })?;
     let status = response.status();
     for (header, label) in [
-        ("x-adx-environment-id", "Environment"),
-        ("x-adx-environment-urn", "Target"),
+        ("x-adx-binding-id", "AgentBinding"),
+        ("x-adx-binding-urn", "Target"),
     ] {
         if let Some(value) = response.headers().get(header).and_then(|v| v.to_str().ok()) {
             if value.chars().any(char::is_control) {

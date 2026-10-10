@@ -2,9 +2,9 @@
 use crate::{activator::Control, request::RequestContext, Result};
 use adx_activator::Activator;
 use adx_agent_core::{
-    activator::{EnvironmentList, EnvironmentPage, Target},
+    activator::{BindingList, BindingPage, Target},
     sandbox::Sandbox,
-    Environment, Scope, TemplateVersion,
+    AgentBinding, Scope, TemplateVersion,
 };
 use adx_agent_store::{AgentState, RedisRepository};
 use async_trait::async_trait;
@@ -22,7 +22,7 @@ impl LocalControl {
     ) -> Result<Self> {
         let store = RedisRepository::connect(redis_url, namespace, Duration::from_secs(3)).await?;
         Ok(Self::new(Arc::new(Activator::new(
-            AgentState::new(Arc::new(store)),
+            AgentState::new(Arc::new(store)).with_deployment_credentials()?,
             sandbox,
         ))))
     }
@@ -34,6 +34,15 @@ impl LocalControl {
 
 #[async_trait]
 impl Control for LocalControl {
+    async fn prepare_binding(
+        &self,
+        ctx: &RequestContext,
+        scope: &Scope,
+        launch: &adx_agent_core::launch::LaunchConfig,
+    ) -> Result<AgentBinding> {
+        ctx.start_write();
+        self.activator.prepare_binding(scope, launch).await
+    }
     async fn publish(
         &self,
         ctx: &RequestContext,
@@ -52,19 +61,19 @@ impl Control for LocalControl {
     ) -> Result<TemplateVersion> {
         self.activator.template(tenant, name, version).await
     }
-    async fn environment(&self, _ctx: &RequestContext, scope: &Scope) -> Result<Environment> {
-        self.activator.environment(scope).await
+    async fn binding(&self, _ctx: &RequestContext, scope: &Scope) -> Result<AgentBinding> {
+        self.activator.binding(scope).await
     }
-    async fn list_environments(
+    async fn list_bindings(
         &self,
         _ctx: &RequestContext,
-        query: &EnvironmentList,
-    ) -> Result<EnvironmentPage> {
-        self.activator.list_environments(query).await
+        query: &BindingList,
+    ) -> Result<BindingPage> {
+        self.activator.list_bindings(query).await
     }
-    async fn delete_environment(&self, ctx: &RequestContext, scope: &Scope) -> Result<()> {
+    async fn delete_binding(&self, ctx: &RequestContext, scope: &Scope) -> Result<()> {
         ctx.start_write();
-        self.activator.delete_environment(scope).await
+        self.activator.delete_binding(scope).await
     }
     async fn activate(
         &self,

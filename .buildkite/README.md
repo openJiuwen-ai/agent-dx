@@ -73,9 +73,9 @@ steps start without cross-architecture dependencies; assembly waits for its own
 components and the shared source gate, SDK and adxadmin candidates. x86 runs the
 Rust component tests and release install smoke. ARM defaults to compilation and
 package integrity checks; `ADX_ARM_TESTS=1` enables the same tests on ARM.
-With `ADX_WITH_AFS=1`, each architecture also waits for its AFS component and
-the shared AFS gate; component manifests, package assembly and publication
-verification use the same `--with-afs` contract. This does not change ARM
+With `ADX_WITH_AFS=1`, source-gate adds AFS lint and each architecture also
+waits for its AFS component; component manifests, package assembly and
+publication verification use the same `--with-afs` contract. This does not change ARM
 backend policy (`backend: null`) or the default OFF package.
 AFS durability regressions require `strace` and child-process tracing in the
 public Rust build image; the image verifier checks this before compilation.

@@ -3,7 +3,7 @@ use crate::discovery::{validate_members, DiscoveryConfig};
 use crate::request::RequestContext;
 use crate::{Error, Result};
 use adx_agent_core::discovery::{ranked_endpoints, ActivatorEndpoint};
-use adx_agent_core::{activator::*, transport, Environment, Scope, TemplateVersion};
+use adx_agent_core::{activator::*, transport, AgentBinding, Scope, TemplateVersion};
 use async_trait::async_trait;
 use serde::{de::DeserializeOwned, Serialize};
 use std::{
@@ -17,6 +17,16 @@ use std::{
 /// Product operations shared by the independent HTTP client and embedded Activator.
 #[async_trait]
 pub trait Control: Send + Sync {
+    async fn prepare_binding(
+        &self,
+        _ctx: &RequestContext,
+        _scope: &Scope,
+        _launch: &adx_agent_core::launch::LaunchConfig,
+    ) -> Result<AgentBinding> {
+        Err(Error::Unsupported(
+            "private binding preparation unavailable".into(),
+        ))
+    }
     async fn publish(
         &self,
         ctx: &RequestContext,
@@ -30,13 +40,10 @@ pub trait Control: Send + Sync {
         name: &str,
         version: &str,
     ) -> Result<TemplateVersion>;
-    async fn environment(&self, ctx: &RequestContext, scope: &Scope) -> Result<Environment>;
-    async fn list_environments(
-        &self,
-        ctx: &RequestContext,
-        query: &EnvironmentList,
-    ) -> Result<EnvironmentPage>;
-    async fn delete_environment(&self, ctx: &RequestContext, scope: &Scope) -> Result<()>;
+    async fn binding(&self, ctx: &RequestContext, scope: &Scope) -> Result<AgentBinding>;
+    async fn list_bindings(&self, ctx: &RequestContext, query: &BindingList)
+        -> Result<BindingPage>;
+    async fn delete_binding(&self, ctx: &RequestContext, scope: &Scope) -> Result<()>;
     async fn activate(
         &self,
         ctx: &RequestContext,
@@ -236,6 +243,24 @@ impl ActivatorClient {
 
 #[async_trait]
 impl Control for ActivatorClient {
+    async fn prepare_binding(
+        &self,
+        ctx: &RequestContext,
+        scope: &Scope,
+        launch: &adx_agent_core::launch::LaunchConfig,
+    ) -> Result<AgentBinding> {
+        self.request(
+            ctx,
+            "bindings/prepare",
+            &PrepareBindingRequest {
+                scope: scope.clone(),
+                launch: launch.clone(),
+            },
+            true,
+            Some(scope),
+        )
+        .await
+    }
     async fn publish(
         &self,
         ctx: &RequestContext,
@@ -253,18 +278,18 @@ impl Control for ActivatorClient {
     ) -> Result<TemplateVersion> {
         ActivatorClient::template(self, ctx, tenant, name, version).await
     }
-    async fn environment(&self, ctx: &RequestContext, scope: &Scope) -> Result<Environment> {
-        ActivatorClient::environment(self, ctx, scope).await
+    async fn binding(&self, ctx: &RequestContext, scope: &Scope) -> Result<AgentBinding> {
+        ActivatorClient::binding(self, ctx, scope).await
     }
-    async fn list_environments(
+    async fn list_bindings(
         &self,
         ctx: &RequestContext,
-        query: &EnvironmentList,
-    ) -> Result<EnvironmentPage> {
-        ActivatorClient::list_environments(self, ctx, query).await
+        query: &BindingList,
+    ) -> Result<BindingPage> {
+        ActivatorClient::list_bindings(self, ctx, query).await
     }
-    async fn delete_environment(&self, ctx: &RequestContext, scope: &Scope) -> Result<()> {
-        ActivatorClient::delete_environment(self, ctx, scope).await
+    async fn delete_binding(&self, ctx: &RequestContext, scope: &Scope) -> Result<()> {
+        ActivatorClient::delete_binding(self, ctx, scope).await
     }
     async fn activate(
         &self,
@@ -331,10 +356,10 @@ impl ActivatorClient {
         )
         .await
     }
-    pub async fn environment(&self, ctx: &RequestContext, scope: &Scope) -> Result<Environment> {
+    pub async fn binding(&self, ctx: &RequestContext, scope: &Scope) -> Result<AgentBinding> {
         self.request(
             ctx,
-            "environments/get",
+            "bindings/get",
             &ScopeRequest {
                 scope: scope.clone(),
             },
@@ -343,18 +368,17 @@ impl ActivatorClient {
         )
         .await
     }
-    pub async fn list_environments(
+    pub async fn list_bindings(
         &self,
         ctx: &RequestContext,
-        query: &EnvironmentList,
-    ) -> Result<EnvironmentPage> {
-        self.request(ctx, "environments/list", query, false, None)
-            .await
+        query: &BindingList,
+    ) -> Result<BindingPage> {
+        self.request(ctx, "bindings/list", query, false, None).await
     }
-    pub async fn delete_environment(&self, ctx: &RequestContext, scope: &Scope) -> Result<()> {
+    pub async fn delete_binding(&self, ctx: &RequestContext, scope: &Scope) -> Result<()> {
         self.request(
             ctx,
-            "environments/delete",
+            "bindings/delete",
             &ScopeRequest {
                 scope: scope.clone(),
             },
@@ -382,7 +406,7 @@ impl ActivatorClient {
     ) -> Result<Target> {
         self.request(
             ctx,
-            "environments/activate",
+            "bindings/activate",
             &ActivationRequest {
                 scope: scope.clone(),
                 expected_generation: expected_generation.map(str::to_owned),

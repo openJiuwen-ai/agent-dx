@@ -21,6 +21,13 @@ def _executable(name, environment=None, cwd=None):
     return os.path.abspath(executable)
 
 
+def _without_afs_environment():
+    environment = dict(os.environ)
+    for key in ('ADX_WITH_AFS', 'ADX_AFS_ALL_FEATURES', 'ADX_WITH_DFS', 'ADX_DFS_ALL_FEATURES'):
+        environment.pop(key, None)
+    return environment
+
+
 ROOT = Path(__file__).resolve().parents[3]
 
 
@@ -155,90 +162,129 @@ class PipelineContracts(unittest.TestCase):
         self.assertIn('ADX_AFS_ALL_FEATURES=1', result.stdout)
         self.assertIn('afs-check', result.stdout)
 
-    def test_afs_gate_runs_when_base_is_unknown(self):
-        script = (ROOT / '.buildkite/afs-gate.sh').read_text()
-        self.assertIn('No merge base available; running AFS optional gate conservatively.', script)
-        self.assertIn("changed='afs/__unknown_base__'", script)
-        self.assertIn('BUILDKITE_COMMIT}^" >/dev/null 2>&1', script)
-        self.assertIn('ADX_WITH_AFS=1 ADX_AFS_ALL_FEATURES=1 make afs-check', script)
+    def test_source_gate_owns_optional_afs_lint(self):
+        script = (ROOT / '.buildkite/source-gate.sh').read_text()
+        self.assertIn('ADX_WITH_AFS must be 0 or 1', script)
+        self.assertIn('ADX_AFS_ALL_FEATURES must be 0 or 1', script)
+        self.assertIn('make rust-check', script)
+        self.assertNotIn('make afs-check', script)
+        self.assertFalse((ROOT / '.buildkite/afs-gate.sh').exists())
 
-    def test_afs_gate_tracks_integration_paths(self):
-        script = (ROOT / '.buildkite/afs-gate.sh').read_text()
-        for path in (
-            'afs/',
-            'build/e2e/afs/',
-            'build/config/examples/afs/',
-            'build/release/',
-            'platform/deployment/',
-            'Cargo\\.toml',
-            'Cargo\\.lock',
-            'rustfmt\\.toml',
-        ):
-            self.assertIn(path, script)
-
-    def test_afs_gate_executes_conservatively_without_base_commit(self):
-        if shutil.which('git') is None:
-            self.skipTest('git is required to exercise afs gate base detection')
+    def test_source_gate_routes_afs_lint_by_switch(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             (repo / '.buildkite').mkdir()
-            (repo / '.buildkite/afs-gate.sh').write_text((ROOT / '.buildkite/afs-gate.sh').read_text())
+            (repo / 'build/e2e/tests').mkdir(parents=True)
+            (repo / 'build/release/tests').mkdir(parents=True)
+            (repo / 'build/e2e/tests/test_stub.py').write_text(
+                'import unittest\n\nclass Stub(unittest.TestCase):\n    def test_ok(self):\n        pass\n'
+            )
+            (repo / 'build/release/tests/test_stub.py').write_text(
+                'import unittest\n\nclass Stub(unittest.TestCase):\n    def test_ok(self):\n        pass\n'
+            )
+            (repo / '.gitignore').write_text('gate-ran\nout/\n__pycache__/\n')
+            (repo / '.buildkite/source-gate.sh').write_text((ROOT / '.buildkite/source-gate.sh').read_text())
             (repo / '.buildkite/bootstrap-build.sh').write_text('#!/usr/bin/env bash\n')
-            makefile = repo / 'Makefile'
-            makefile.write_text('afs-check:\n\t@echo "$${ADX_WITH_AFS}:$${ADX_AFS_ALL_FEATURES}" > gate-ran\n')
+            (repo / 'Makefile').write_text(
+                'rust-check:\n\t@echo rust >> gate-ran\n'
+                '\t@if [ "$${ADX_WITH_AFS}" = "1" ]; then '
+                'echo "afs:$${ADX_WITH_AFS}:$${ADX_AFS_ALL_FEATURES}" >> gate-ran; fi\n'
+            )
             subprocess.run(['git', 'init'], cwd=repo, capture_output=True, text=True, check=True)
             subprocess.run(['git', 'config', 'user.email', 'ci@example.invalid'], cwd=repo, check=True)
             subprocess.run(['git', 'config', 'user.name', 'CI'], cwd=repo, check=True)
             subprocess.run(['git', 'add', '.'], cwd=repo, check=True)
             subprocess.run(['git', 'commit', '-m', 'initial'], cwd=repo, capture_output=True, text=True, check=True)
             commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=repo, text=True).strip()
+            base_env = dict(_without_afs_environment(), BUILDKITE_COMMIT=commit, PATH=os.environ['PATH'])
+            for value, all_features, expected in [
+                (None, None, 'rust'),
+                ('0', None, 'rust'),
+                ('1', None, 'rust\nafs:1:0'),
+                ('1', '1', 'rust\nafs:1:1'),
+            ]:
+                with self.subTest(value=value, all_features=all_features):
+                    (repo / 'gate-ran').unlink(missing_ok=True)
+                    env = dict(base_env)
+                    if value is not None:
+                        env['ADX_WITH_AFS'] = value
+                    if all_features is not None:
+                        env['ADX_AFS_ALL_FEATURES'] = all_features
+                    subprocess.run(['bash', '.buildkite/source-gate.sh'], cwd=repo, env=env,
+                                   capture_output=True, text=True, check=True)
+                    self.assertEqual((repo / 'gate-ran').read_text().strip(), expected)
+
+    def test_source_gate_rejects_invalid_afs_switches_before_bootstrap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            (repo / '.buildkite').mkdir()
+            (repo / 'build/e2e/tests').mkdir(parents=True)
+            (repo / 'build/release/tests').mkdir(parents=True)
+            (repo / 'build/e2e/tests/test_stub.py').write_text(
+                'import unittest\n\nclass Stub(unittest.TestCase):\n    def test_ok(self):\n        pass\n'
+            )
+            (repo / 'build/release/tests/test_stub.py').write_text(
+                'import unittest\n\nclass Stub(unittest.TestCase):\n    def test_ok(self):\n        pass\n'
+            )
+            (repo / '.gitignore').write_text('bootstrap-ran\nout/\n__pycache__/\n')
+            (repo / '.buildkite/source-gate.sh').write_text((ROOT / '.buildkite/source-gate.sh').read_text())
+            (repo / '.buildkite/bootstrap-build.sh').write_text('echo bootstrap-ran > bootstrap-ran\n')
+            (repo / 'Makefile').write_text('rust-check:\n\t@true\n')
+            subprocess.run(['git', 'init'], cwd=repo, capture_output=True, text=True, check=True)
+            subprocess.run(['git', 'config', 'user.email', 'ci@example.invalid'], cwd=repo, check=True)
+            subprocess.run(['git', 'config', 'user.name', 'CI'], cwd=repo, check=True)
+            subprocess.run(['git', 'add', '.'], cwd=repo, check=True)
+            subprocess.run(['git', 'commit', '-m', 'initial'], cwd=repo, capture_output=True, text=True, check=True)
+            commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=repo, text=True).strip()
+            for key in ('ADX_WITH_AFS', 'ADX_AFS_ALL_FEATURES'):
+                env = dict(_without_afs_environment(), BUILDKITE_COMMIT=commit, PATH=os.environ['PATH'], **{key: 'bad'})
+                result = subprocess.run(['bash', '.buildkite/source-gate.sh'], cwd=repo, env=env,
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn(f'{key} must be 0 or 1', result.stderr)
+                self.assertFalse((repo / 'bootstrap-ran').exists())
+
+    def test_source_gate_fails_when_afs_lint_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            (repo / '.buildkite').mkdir()
+            (repo / 'build/e2e/tests').mkdir(parents=True)
+            (repo / 'build/release/tests').mkdir(parents=True)
+            (repo / 'build/e2e/tests/test_stub.py').write_text(
+                'import unittest\n\nclass Stub(unittest.TestCase):\n    def test_ok(self):\n        pass\n'
+            )
+            (repo / 'build/release/tests/test_stub.py').write_text(
+                'import unittest\n\nclass Stub(unittest.TestCase):\n    def test_ok(self):\n        pass\n'
+            )
+            (repo / '.gitignore').write_text('gate-ran\nout/\n__pycache__/\n')
+            (repo / '.buildkite/source-gate.sh').write_text((ROOT / '.buildkite/source-gate.sh').read_text())
+            (repo / '.buildkite/bootstrap-build.sh').write_text('#!/usr/bin/env bash\n')
+            (repo / 'Makefile').write_text(
+                'rust-check:\n\t@echo rust >> gate-ran\n'
+                '\t@if [ "$${ADX_WITH_AFS}" = "1" ]; then exit 7; fi\n'
+            )
+            subprocess.run(['git', 'init'], cwd=repo, capture_output=True, text=True, check=True)
+            subprocess.run(['git', 'config', 'user.email', 'ci@example.invalid'], cwd=repo, check=True)
+            subprocess.run(['git', 'config', 'user.name', 'CI'], cwd=repo, check=True)
+            subprocess.run(['git', 'add', '.'], cwd=repo, check=True)
+            subprocess.run(['git', 'commit', '-m', 'initial'], cwd=repo, capture_output=True, text=True, check=True)
+            commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=repo, text=True).strip()
+            env = dict(_without_afs_environment(), BUILDKITE_COMMIT=commit, ADX_WITH_AFS='1', PATH=os.environ['PATH'])
             result = subprocess.run(
-                [_executable('bash'), '.buildkite/afs-gate.sh'],
+                ['bash', '.buildkite/source-gate.sh'],
                 cwd=repo,
-                env=dict(os.environ, BUILDKITE_COMMIT=commit, PATH=os.environ['PATH']),
+                env=env,
                 capture_output=True,
                 text=True,
-                check=True,
             )
-            self.assertIn('No merge base available; running AFS optional gate conservatively.', result.stdout)
-            self.assertEqual((repo / 'gate-ran').read_text().strip(), '1:1')
-
-    def test_afs_gate_selects_component_paths_after_move(self):
-        for changed, expected in [
-            ("afs/src/node/vfs/ownerfs/marker", True),
-            ("build/e2e/afs/scripts/dfs/marker", True),
-            ("docs/deployment/afs.md", True),
-            ("agent/unrelated-marker", False),
-        ]:
-            with self.subTest(changed=changed), tempfile.TemporaryDirectory() as tmp:
-                repo = Path(tmp)
-                (repo / ".buildkite").mkdir()
-                (repo / ".buildkite/afs-gate.sh").write_text((ROOT / ".buildkite/afs-gate.sh").read_text())
-                (repo / ".buildkite/bootstrap-build.sh").write_text("#!/usr/bin/env bash\n")
-                (repo / "Makefile").write_text('afs-check:\n\t@echo "$${ADX_WITH_AFS}:$${ADX_AFS_ALL_FEATURES}" > gate-ran\n')
-                for args in [
-                    ["init"], ["config", "user.email", "ci@example.invalid"],
-                    ["config", "user.name", "CI"], ["add", "."], ["commit", "-m", "initial"],
-                ]:
-                    subprocess.run(["git", *args], cwd=repo, capture_output=True, check=True)
-                path = repo / changed
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text("changed\n")
-                subprocess.run(["git", "add", "."], cwd=repo, check=True)
-                subprocess.run(["git", "commit", "-m", "change"], cwd=repo, capture_output=True, check=True)
-                commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
-                subprocess.run(["bash", ".buildkite/afs-gate.sh"], cwd=repo,
-                               env=dict(os.environ, BUILDKITE_COMMIT=commit, BUILDKITE_PULL_REQUEST_BASE_BRANCH="missing"),
-                               capture_output=True, text=True, check=True)
-                self.assertEqual((repo / "gate-ran").exists(), expected)
-                if expected:
-                    self.assertEqual((repo / "gate-ran").read_text().strip(), "1:1")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual((repo / 'gate-ran').read_text().strip(), 'rust')
 
     def test_legacy_flags_fail_before_build_or_network(self):
         scripts = (
             'build/release/build.sh', '.buildkite/select-pipeline.sh',
             '.buildkite/build-component.sh', '.buildkite/package-components.sh',
-            '.buildkite/upload-obs.sh', '.buildkite/afs-gate.sh',
+            '.buildkite/upload-obs.sh', '.buildkite/source-gate.sh',
         )
         for legacy in ('ADX_WITH_DFS', 'ADX_DFS_ALL_FEATURES'):
             environment = dict(os.environ, **{legacy: '1', 'ADX_WITH_AFS': '1'})
@@ -272,14 +318,13 @@ class PipelineContracts(unittest.TestCase):
 
         pipeline = yaml.safe_load((ROOT / '.buildkite/pipeline-package.yml').read_text())
         steps = {step['key']: step for step in pipeline['steps']}
-        self.assertIn('afs-gate', steps)
-        self.assertEqual(steps['afs-gate']['depends_on'], 'source-gate')
+        self.assertNotIn('afs-gate', steps)
         self.assertIn('build-afs', steps)
         self.assertEqual(steps['build-afs']['if'], 'build.env("ADX_WITH_AFS") == "1"')
         self.assertEqual(steps['build-afs']['env']['ADX_WITH_AFS'], '1')
         self.assertIn('sdk-package', steps)
         self.assertIn('sdk-package', steps['platform-build']['depends_on'])
-        self.assertIn('afs-gate', steps['platform-build']['depends_on'])
+        self.assertNotIn('afs-gate', steps['platform-build']['depends_on'])
         self.assertIn('build-afs', steps['platform-build']['depends_on'])
         self.assertEqual(steps['platform-e2e']['env']['ADX_E2E_PROFILE'], 'l0')
         self.assertEqual(steps['platform-images']['depends_on'], ['platform-build', 'publish-amd64'])

@@ -42,7 +42,7 @@ local members = redis.call('ZRANGEBYLEX', KEYS[1], ARGV[1], '+', 'LIMIT', 0, ARG
 local result = {}
 for _, key in ipairs(members) do
   local value = redis.call('GET', key)
-  if not value then return redis.error_reply('missing Environment index member') end
+  if not value then return redis.error_reply('missing AgentBinding index member') end
   table.insert(result, key)
   table.insert(result, value)
 end
@@ -109,7 +109,7 @@ impl RedisRepository {
         })
     }
     async fn check_schema(&self) -> Result<()> {
-        const SCHEMA: &str = "environment-index-v1";
+        const SCHEMA: &str = "binding-index-v1";
         let key = format!("{}schema", self.prefix);
         let mut set = redis::cmd("SET");
         set.arg(&key).arg(SCHEMA).arg("NX");
@@ -251,14 +251,14 @@ impl Repository for RedisRepository {
             .arg(limit);
         let values: Vec<String> = self.execute(command, false).await?;
         if !values.len().is_multiple_of(2) {
-            return Err(Error::Corrupt("invalid Environment page response".into()));
+            return Err(Error::Corrupt("invalid AgentBinding page response".into()));
         }
         values
             .chunks_exact(2)
             .map(|pair| {
                 let key = pair[0]
                     .strip_prefix(&self.prefix)
-                    .ok_or_else(|| Error::Corrupt("invalid Environment index member".into()))?;
+                    .ok_or_else(|| Error::Corrupt("invalid AgentBinding index member".into()))?;
                 let record =
                     serde_json::from_str(&pair[1]).map_err(|e| Error::Corrupt(e.to_string()))?;
                 Ok((key.to_owned(), record))

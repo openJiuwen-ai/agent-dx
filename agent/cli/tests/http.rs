@@ -3,7 +3,7 @@ use clap::Parser;
 use std::time::Duration;
 
 #[tokio::test]
-async fn http_routes_body_and_reports_environment_before_streaming_output() {
+async fn http_routes_body_and_reports_binding_before_streaming_output() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
     let app = axum::Router::new().fallback(|request: axum::extract::Request| async {
@@ -25,11 +25,8 @@ async fn http_routes_body_and_reports_environment_before_streaming_output() {
         );
         (
             [
-                ("x-adx-environment-id", "generated"),
-                (
-                    "x-adx-environment-urn",
-                    "urn:adx:environment:demo:1:generated",
-                ),
+                ("x-adx-binding-id", "generated"),
+                ("x-adx-binding-urn", "urn:adx:binding:demo:1:generated"),
             ],
             "data: hello\n\ndata: world\n\n",
         )
@@ -65,12 +62,15 @@ async fn http_routes_body_and_reports_environment_before_streaming_output() {
     .unwrap();
     let mut output = Vec::new();
     http::execute(args, &config, &mut output).await.unwrap();
-    assert_eq!(String::from_utf8(output).unwrap(), "Environment: generated\nTarget: urn:adx:environment:demo:1:generated\ndata: hello\n\ndata: world\n\n");
+    assert_eq!(
+        String::from_utf8(output).unwrap(),
+        "AgentBinding: generated\nTarget: urn:adx:binding:demo:1:generated\ndata: hello\n\ndata: world\n\n"
+    );
     server.abort();
 }
 
 #[test]
-fn http_validates_business_paths_and_preserves_explicit_environment() {
+fn http_validates_business_paths_and_preserves_explicit_binding() {
     let config = Configuration::new(
         "https://gateway.example",
         "key".into(),
@@ -110,7 +110,7 @@ fn http_validates_business_paths_and_preserves_explicit_environment() {
         "demo",
         "--version",
         "1",
-        "--env",
+        "--binding-id",
         "existing",
         "--port",
         "8080",
@@ -122,7 +122,7 @@ fn http_validates_business_paths_and_preserves_explicit_environment() {
     let url = args.url(&config.endpoint).unwrap();
     assert!(url
         .query_pairs()
-        .any(|(k, v)| k == "target" && v == "urn:adx:environment:demo:1:existing"));
+        .any(|(k, v)| k == "target" && v == "urn:adx:binding:demo:1:existing"));
     assert!(url.query_pairs().any(|(k, v)| k == "port" && v == "8080"));
 }
 

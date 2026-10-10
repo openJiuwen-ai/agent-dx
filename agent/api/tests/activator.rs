@@ -42,7 +42,7 @@ impl Sandbox for Backend {
     }
 }
 #[tokio::test]
-async fn authenticated_services_observe_environment_deletion_and_recreation() {
+async fn authenticated_services_observe_binding_deletion_and_recreation() {
     let backend = Arc::new(Backend(AtomicUsize::new(0)));
     let activator = Arc::new(Activator::new(
         AgentState::new(Arc::new(MemoryRepository::default())),
@@ -64,7 +64,7 @@ async fn authenticated_services_observe_environment_deletion_and_recreation() {
                     if request.uri().path().ends_with("templates/get") {
                         tc.fetch_add(1, Ordering::SeqCst);
                     }
-                    if request.uri().path().ends_with("environments/activate") {
+                    if request.uri().path().ends_with("bindings/activate") {
                         ac.fetch_add(1, Ordering::SeqCst);
                     }
                     next.run(request).await
@@ -97,7 +97,7 @@ async fn authenticated_services_observe_environment_deletion_and_recreation() {
         .unwrap(),
     );
     let other_gateway = ManagedService::new(other_client.clone());
-    let template:TemplateVersion=serde_json::from_value(serde_json::json!({"name":"app","version":"1","image":"app:1","isolation_runtime":"runc","entrypoint":["/start"],"resources":{"cpu_millis":1000,"memory_mib":512},"service":[{"protocol":"http","port":8080}]})).unwrap();
+    let template:TemplateVersion=serde_json::from_value(serde_json::json!({"name":"app","version":"1","image":"app:1","isolation_runtime":"runc","resources":{"cpu_millis":1000,"memory_mib":512},"service":[{"protocol":"http","port":8080}]})).unwrap();
     other_gateway
         .publish(&context(), "tenant", &template)
         .await
@@ -110,7 +110,7 @@ async fn authenticated_services_observe_environment_deletion_and_recreation() {
         tenant: "tenant".into(),
         template: "app".into(),
         version: "1".into(),
-        environment_id: "env".into(),
+        binding_id: "env".into(),
     };
     assert!(matches!(
         service
@@ -120,7 +120,7 @@ async fn authenticated_services_observe_environment_deletion_and_recreation() {
     ));
     assert_eq!(backend.0.load(Ordering::SeqCst), 0);
     assert!(matches!(
-        service.environment(&context(), &scope).await,
+        service.binding(&context(), &scope).await,
         Err(Error::NotFound)
     ));
     let first = service
@@ -151,13 +151,13 @@ async fn authenticated_services_observe_environment_deletion_and_recreation() {
             .activate(&context(), &scope, None)
             .await
             .unwrap()
-            .environment,
-        first.0.environment
+            .binding,
+        first.0.binding
     );
     let page = other_gateway
-        .list_environments(
+        .list_bindings(
             &context(),
-            &activator::EnvironmentList {
+            &activator::BindingList {
                 tenant: "tenant".into(),
                 template: "app".into(),
                 version: "1".into(),
@@ -167,16 +167,16 @@ async fn authenticated_services_observe_environment_deletion_and_recreation() {
         )
         .await
         .unwrap();
-    assert_eq!(page.environments, vec![first.0.environment.clone()]);
-    let env = service.environment(&context(), &scope).await.unwrap();
+    assert_eq!(page.bindings, vec![first.0.binding.clone()]);
+    let env = service.binding(&context(), &scope).await.unwrap();
     let other_target = other_gateway
         .resolve(&context(), &scope, Protocol::Http, None)
         .await
         .unwrap();
     assert_eq!(first, other_target);
-    assert_eq!(first.0.environment, env);
+    assert_eq!(first.0.binding, env);
     other_gateway
-        .delete_environment(&context(), &scope)
+        .delete_binding(&context(), &scope)
         .await
         .unwrap();
     let fresh = service
@@ -184,7 +184,7 @@ async fn authenticated_services_observe_environment_deletion_and_recreation() {
         .await
         .unwrap()
         .0
-        .environment;
+        .binding;
     assert_ne!(fresh.generation, env.generation);
     assert_ne!(fresh.sandbox_id, env.sandbox_id);
     assert!(matches!(
@@ -199,18 +199,18 @@ async fn authenticated_services_observe_environment_deletion_and_recreation() {
             .await
             .unwrap()
             .0
-            .environment,
+            .binding,
         fresh
     );
     let response = reqwest::Client::new()
-        .post(format!("{url}/internal/adx/v1/environments/get"))
+        .post(format!("{url}/internal/adx/v1/bindings/get"))
         .json(&serde_json::json!({"scope":scope}))
         .send()
         .await
         .unwrap();
     assert_eq!(response.status(), 401);
     let response = reqwest::Client::new()
-        .post(format!("{url}/internal/adx/v1/environments/get"))
+        .post(format!("{url}/internal/adx/v1/bindings/get"))
         .bearer_auth(TOKEN)
         .header(activator::DEADLINE_HEADER, "1")
         .json(&serde_json::json!({"scope":scope}))
@@ -222,4 +222,61 @@ async fn authenticated_services_observe_environment_deletion_and_recreation() {
         Error::Unavailable(_)
     ));
     task.abort();
+}
+
+#[tokio::test]
+async fn private_launch_configuration_crosses_only_authenticated_control_api() {
+    use adx_agent_api::activator::Control;
+    let state = AgentState::new(Arc::new(MemoryRepository::default())).with_credential_key([4; 32]);
+    let activator = Arc::new(Activator::new(
+        state,
+        Arc::new(Backend(AtomicUsize::new(0))),
+    ));
+    let template:TemplateVersion=serde_json::from_value(serde_json::json!({"name":"app","version":"1","image":"app:1","isolation_runtime":"runc","resources":{"cpu_millis":1000,"memory_mib":512},"service":[{"protocol":"http","port":8080}]})).unwrap();
+    activator.publish("tenant", &template).await.unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let app = adx_activator::server::router(activator, TOKEN, Duration::from_secs(3)).unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let scope = Scope {
+        tenant: "tenant".into(),
+        template: "app".into(),
+        version: "1".into(),
+        binding_id: "private".into(),
+    };
+    let launch = adx_agent_core::launch::LaunchConfig {
+        credential_version: "1".into(),
+        env: std::collections::BTreeMap::from([("API_KEY".into(), "sk-private".into())]),
+    };
+    let response = reqwest::Client::new()
+        .post(format!("{url}/internal/adx/v1/bindings/prepare"))
+        .json(&adx_agent_core::activator::PrepareBindingRequest {
+            scope: scope.clone(),
+            launch: launch.clone(),
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 401);
+    let client =
+        ActivatorClient::new(vec![url], TOKEN.into(), Duration::from_secs(3), None, true).unwrap();
+    let binding = client
+        .prepare_binding(&context(), &scope, &launch)
+        .await
+        .unwrap();
+    assert_eq!(client.binding(&context(), &scope).await.unwrap(), binding);
+    assert!(!serde_json::to_string(&binding)
+        .unwrap()
+        .contains("sk-private"));
+    assert_eq!(
+        client
+            .activate(&context(), &scope, None)
+            .await
+            .unwrap()
+            .binding,
+        binding
+    );
+    server.abort();
 }
