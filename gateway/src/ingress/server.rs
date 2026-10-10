@@ -1073,8 +1073,10 @@ impl Ingress {
             "/readyz" => plain(StatusCode::SERVICE_UNAVAILABLE, "not ready"),
             "/metrics" => plain(StatusCode::OK, &{
                 let pool = self.http_pool.metrics();
+                // Embedded Ingress exports the API Server's owning PID only once.
+                let process_metrics = adx_observability::process::metrics();
                 format!(
-                    "data_plane_ingress_ready {}\ndata_plane_ingress_route_cache_entries {}\ndata_plane_ingress_route_watch_revision {}\ndata_plane_ingress_route_watch_lag_seconds {}\ndata_plane_ingress_route_point_get_total {}\ndata_plane_ingress_active_sessions {}\ndata_plane_ingress_h2_physical_connections {}\ndata_plane_ingress_route_forced_close_total {}\ndata_plane_ingress_backend_http_idle_connections {}\ndata_plane_ingress_backend_http_opened_total {}\ndata_plane_ingress_backend_http_reused_total {}\ndata_plane_ingress_backend_http_discarded_total {}\ndata_plane_ingress_backend_http_acquire_timeouts_total {}\n{}command_watch_connections {}\ncommand_watch_subscriptions {}\ncommand_watch_sandboxes {}\ncommand_watch_reconnects {}\ncommand_watch_auth_failures {}\ncommand_watch_downstream_streams {}\n",
+                    "data_plane_ingress_ready {}\ndata_plane_ingress_route_cache_entries {}\ndata_plane_ingress_route_watch_revision {}\ndata_plane_ingress_route_watch_lag_seconds {}\ndata_plane_ingress_route_point_get_total {}\ndata_plane_ingress_active_sessions {}\ndata_plane_ingress_h2_physical_connections {}\ndata_plane_ingress_route_forced_close_total {}\ndata_plane_ingress_backend_http_idle_connections {}\ndata_plane_ingress_backend_http_opened_total {}\ndata_plane_ingress_backend_http_reused_total {}\ndata_plane_ingress_backend_http_discarded_total {}\ndata_plane_ingress_backend_http_acquire_timeouts_total {}\n{}command_watch_connections {}\ncommand_watch_subscriptions {}\ncommand_watch_sandboxes {}\ncommand_watch_reconnects {}\ncommand_watch_auth_failures {}\ncommand_watch_downstream_streams {}\n{process_metrics}",
                     usize::from(self.ready()),
                     self.resolver.cache_len(),
                     self.resolver.watch_revision(),
@@ -2690,6 +2692,62 @@ mod tests {
                 target_port: 22,
                 request_id: "request-a".into(),
             },
+        }
+    }
+
+    #[tokio::test]
+    async fn health_metrics_include_business_and_single_process_resources() {
+        let ingress = Ingress::new(
+            Arc::new(IngressRouteResolver::new(Arc::new(
+                super::super::RouteStore::new(),
+            ))),
+            DataPlaneL4Connector::new(super::super::H2PoolConfig::default()),
+            IngressAuthenticator::new(true, false, "", std::time::Duration::from_secs(30)).unwrap(),
+            50090,
+            8765,
+            "127.0.0.1:18888",
+            Vec::new(),
+        );
+        let response = ingress.health_response("/metrics");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body = std::str::from_utf8(&body).unwrap();
+        assert!(body.contains("data_plane_ingress_ready 0\n"));
+        assert!(body.contains("data_plane_ingress_http_requests_total 0\n"));
+
+        #[cfg(target_os = "linux")]
+        {
+            let pid = std::process::id();
+            for metric in [
+                "process_memory_usage_bytes",
+                "process_memory_virtual_bytes",
+                "process_open_file_descriptors",
+                "process_threads",
+                "process_uptime_seconds",
+            ] {
+                let prefix = format!("{metric}{{process_pid=\"{pid}\"}} ");
+                let samples: Vec<_> = body
+                    .lines()
+                    .filter(|line| line.starts_with(&prefix))
+                    .collect();
+                assert_eq!(samples.len(), 1, "one sample per owning process: {metric}");
+                let value: f64 = samples[0].strip_prefix(&prefix).unwrap().parse().unwrap();
+                assert!(
+                    value.is_finite() && value >= 0.0,
+                    "invalid {metric}: {value}"
+                );
+            }
+            for state in ["user", "system"] {
+                let prefix = format!(
+                    "process_cpu_time_seconds_total{{process_pid=\"{pid}\",state=\"{state}\"}} "
+                );
+                assert_eq!(
+                    body.lines()
+                        .filter(|line| line.starts_with(&prefix))
+                        .count(),
+                    1
+                );
+            }
         }
     }
 
