@@ -23,7 +23,9 @@
 - 默认 `afs-check` 覆盖 OwnerFs 和 DFS 默认 feature；RDMA/all-features lint 需要显式设置 `ADX_AFS_ALL_FEATURES=1`，并以 `libibverbs` 开发文件作为前置。
 - 测试辅助程序只由验收流程显式构建，不作为普通产品二进制发布。
 
-显式 ON 在 x86_64 与 ARM64 使用相同开关和包清单合同。ARM64 沿用公共原生 Linux builder、独立缓存、凭据适配和本地组件组装；无外部 backend 的清单与 AFS ON/OFF 分别校验。未在本轮执行远端 Buildkite 全量发布，不将本地合同测试写成正式双架构出包通过。
+显式 ON 在 x86_64 与 ARM64 使用相同开关和包清单合同。ARM64 沿用公共原生 Linux builder、独立缓存、凭据适配和本地组件组装；无外部 backend 的清单与 AFS ON/OFF 分别校验。正式 ON #143 已完成两架构组件测试、编译和组包；其 ARM 安装 smoke 仅检查安装及已安装命令的 help。同一 ARM 最终包另在 Linux VM 完成已安装 `adxctl` 的 bind ON＋远端读写、权限／错误、local-file 有序恢复及正常卸载核心运行。该证据限定同 VM 两 Node，不代替跨 VM 或 ARM Full。具体版本和运行结果见[迁移报告](../migration/2026-10-09-afs-snapshot.md)。
+
+公共 Full #66 已使用 ON #137 的 x86 交付件通过原有11组业务用例。ARM Full 尚不能直接复用该入口：当前交接脚本固定选择 x86 产物及 target，并要求外部 backend；#143 ARM 清单的 backend 为 null。还需在公共流程补架构选择，核验原生 ARM 后端、固定 runtime／Collector 镜像和至少两个 ARM Kubernetes worker。不得用 #143 的 x86 镜像 bundle 代替 ARM Full；这些缺口不阻止独立验证 ARM 包的 bind ON 与远端 FUSE 核心场景。
 
 ## 支持范围
 

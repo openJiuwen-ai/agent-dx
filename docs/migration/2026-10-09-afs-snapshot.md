@@ -216,3 +216,19 @@ Full证明上述x86交付件通过ADX原有11组回归；没有新增bind ON文�
 [正式 ON #143](https://buildkite.com/agent-dx/agent-dx/builds/143)固定`986566a3553f6b41bcfdae66c3c16c75092ff2a2`、Build ID `01a124e7-b9ed-45aa-b3fb-5bb34990fd70`，终态通过。沿公共双架构流程，ARM四组件UT／编译、AFS gate、统一组包、隔离prefix安装和索引通过，x86组件／组包／验收镜像／Kubernetes L0通过。ARM库615通过／22忽略，storage_localfs8通过；上一轮公共超时所在的x86 process10和ARM control_stream9本轮均通过。原142失败保留，不将单次新通过写成已确认或永久修复了超时根因。
 
 ARM最终交付件为`out/buildkite/arm64/adx-release.tar.gz`，76,433,898字节，SHA-256 `7a518289687d4478360942e09abc61598abbb95b23c13784a8b855b933a83c01`；不是`afs.tar.gz`中间组件。实际下载包、独立checksum、build/release清单一致，清单36文件逐项SHA通过；源码为986566a、target为aarch64-unknown-linux-gnu、with_afs=true、backend=null。清单没有build_id字段，四份artifact的job_id均核对为本轮通过的ARM assembly `01a124e8-1c9a-4388-b9ba-4957b85d8d73`，不以写入常量替代实际归属验证。包内afs-meta/node均为AArch64 ELF，SHA分别为`9192a2fb8506f49613c93a1f6c208cc982833fba7a12598e6da611ba890a939e`／`8b84c8b06ea10358cfb490fbd8c06080e6e32f88c2de0041c9d74fe5670abc2b`，不含测试探针。安装证据限定为公共安装脚本和已安装adxctl／adx-inspect的help检查；未新增该ARM包的真实FUSE/bind运行、ARM Full或性能结论。既有Full66仍绑定ON137产物。OBS／PyPI最终外发关闭，Publish步骤通过不等于外部产品发布；包与完整日志继续留在`EV-BUILDKITE-X86`仓外归档。
+
+### #143 ARM 最终包的实际 OwnerFs 运行补验
+
+上一收尾只关闭了 UT、组包和安装命令检查，没有完成该包的真实运行，不能作为完整功能交付出口。本次直接安装上述 #143 ARM 最终包，未重新编译；包内、安装后 `adxctl`／`afs-meta`／`afs-node` 的 SHA 一致，产品候选仍为 `986566a`，后续文档提交不作为新受测二进制。
+
+在现有 ARM64 Linux VM 的全新 ext4 路径上，安装后的 `adxctl validate/render/run/status/stop` 及 OwnerFs bind ON 核心场景通过：同 VM 两个 Node 经 mTLS TCP 双向读写约64KiB并 fsync／close 后重新读取，权限拒绝、setid 清除与特权保留、ENOENT、有序全停后 local-file Meta 恢复读回、远端删除在 bind 侧可见。Home 底层真实目录绑定到 FUSE 根下一级 `workspace`，挂载类型为 ext4，源与目标 dev/ino 均为 `[64769,869598]`；远端根仍为 `afs-ownerfs` FUSE，未把 FUSE 自身作为绕过路径。
+
+正式功能运行 rc0，85个驱动检查均通过（不是85个独立产品 case），三个 supervisor 的实际 wait 均为0；退出后无本轮 AFS／adxctl 进程及挂载残留，仅移除本轮安装链接／目录，数据与证据保留。前两次包装器准入失败分别是预写观测文件与 fresh-root 检查冲突、随后对已存在目录再次 mkdir；均在产品安装和服务启动前停止。原失败保留，最终仅修正包装器目录处理，没有修改产品、测试断言或环境。
+
+`EV-ARM143-RUNTIME` 保存原命令、包装器与原驱动身份、全部清单 hash、准入、运行检查、挂载身份、状态、停止回执和原失败；紧凑证据包 SHA-256 为 `b55c334a272dedd267484be9aa0888f76cc7cfe5ac0a087280dda4f5470c765b`。交付包复用 `EV-BUILDKITE-X86` 的已校验原件，不再重复归档整包。这是该 ARM 包的新功能运行证据，不是跨 VM、完整 POSIX、DFS 矩阵或性能验收。
+
+### ARM Full 的独立缺口
+
+`EV-ARM143-FULL-SCOPE` 为源码核对：公共 `.buildkite/package-e2e.sh` 固定下载 `platform-build` 根层产物并校验 x86 target，要求 `backend.tar.gz`；公共 Full 调度和 runtime／Collector 固定镜像也尚无 ARM 组合入口。#143 ARM 清单为 `backend=null`，该轮已有 `platform-images` bundle 属于 x86，不能选同一 Build ID 就当作 ARM Full。
+
+ARM Full 需在公共入口补显式架构交接，并核验固定原生 ARM 后端与镜像、至少两个 ARM Kubernetes worker；worker 是否具备尚待环境核对，不能说已证实缺失。本次不触发会选错架构的 Full，也不创建私有替代流程。既有 x86 Full66继续绑定ON137，ARM Full保留待验收；性能仍按既定计划后置。
