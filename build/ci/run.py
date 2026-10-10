@@ -40,6 +40,7 @@ SUITES = (
     "storage",
     "control-rpc",
     "api-control",
+    "afs",
 )
 
 
@@ -66,6 +67,9 @@ def commands_for(suite, output, jobs):
     if suite == "rust":
         cargo = os.environ.get("CARGO", "cargo")
         return [[cargo, "--version"], make + ["rust-check", "rust-test"]]
+    if suite == "afs":
+        cargo = os.environ.get("CARGO", "cargo")
+        return [[cargo, "--version"], make + ["ADX_WITH_AFS=1", "ADX_AFS_ALL_FEATURES=1", "afs-check"]]
     if suite in ("control-rpc", "api-control"):
         if suite == "api-control" and (
             not Path(os.environ.get("ADX_TEST_APISERVER", "")).is_file()
@@ -231,6 +235,9 @@ def main():
     args = parser.parse_args()
     if args.jobs < 1 or args.timeout <= 0:
         parser.error("jobs and timeout must be positive")
+    for legacy in ("ADX_WITH_DFS", "ADX_DFS_ALL_FEATURES"):
+        if legacy in os.environ:
+            parser.error(f"{legacy} was replaced by {legacy.replace('DFS', 'AFS')}; update the caller")
     os.chdir(ROOT)
     configure_local_cargo_cache()
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]

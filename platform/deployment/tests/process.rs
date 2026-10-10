@@ -7,6 +7,7 @@ use serde_json::json;
 use std::{
     os::unix::fs::PermissionsExt,
     path::Path,
+    process::Command,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -14,14 +15,39 @@ use std::{
     time::Duration,
 };
 fn test_deployment(root: &Path, services: serde_json::Value) -> Deployment {
-    serde_json::from_value(json!({"schema_version":1,"package_dir":root,"state_dir":root.join("state"),"redis_url":"redis://localhost:6379/","namespace":"test","restart_delay_ms":20,"stop_timeout_seconds":1,"services":services})).unwrap()
+    serde_json::from_value(json!({"schema_version":1,"with_afs":true,"package_dir":root,"state_dir":root.join("state"),"redis_url":"redis://localhost:6379/","namespace":"test","restart_delay_ms":20,"stop_timeout_seconds":1,"services":services})).unwrap()
 }
 fn install_test_binary(root: &Path, name: &str, script: &str) {
     std::fs::create_dir_all(root.join("bin")).unwrap();
     let binary_path = root.join("bin").join(name);
-    std::fs::write(&binary_path, script).unwrap();
-    std::fs::set_permissions(binary_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let temporary_path = binary_path.with_extension(format!("tmp-{}", std::process::id()));
+    std::fs::write(&temporary_path, script).unwrap();
+    std::fs::set_permissions(&temporary_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::rename(&temporary_path, binary_path).unwrap();
 }
+
+#[test]
+fn install_test_binary_replaces_busy_fixture_atomically() {
+    let temp_directory = tempfile::Builder::new()
+        .prefix("adx-busy-fixture-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let root = temp_directory.path();
+    install_test_binary(root, "adx-coordinator", "#!/bin/sh\nprintf old\n");
+    let _busy_old_inode = std::fs::OpenOptions::new()
+        .write(true)
+        .open(root.join("bin/adx-coordinator"))
+        .unwrap();
+
+    install_test_binary(root, "adx-coordinator", "#!/bin/sh\nprintf new\n");
+
+    let output = Command::new(root.join("bin/adx-coordinator"))
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"new");
+}
+
 async fn wait_until_ready(root: &Path) -> serde_json::Value {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -35,6 +61,10 @@ async fn wait_until_ready(root: &Path) -> serde_json::Value {
     })
     .await
     .unwrap()
+}
+
+fn graceful_service_script() -> &'static str {
+    "#!/bin/sh\ntrap 'exit 0' TERM\nwhile :; do sleep 1; done\n"
 }
 
 fn service_status<'a>(status: &'a serde_json::Value, service_id: &str) -> &'a serde_json::Value {
@@ -170,7 +200,7 @@ async fn failed_environment_cleanup_keeps_dependencies_running_then_retries() {
         .unwrap();
     let root = temp_directory.path();
     for binary_name in ["adx-coordinator", "adxlet"] {
-        install_test_binary(root, binary_name, "#!/bin/sh\nexec sleep 100\n");
+        install_test_binary(root, binary_name, graceful_service_script());
     }
     let deployment = test_deployment(
         root,
@@ -261,4 +291,294 @@ async fn supervisor_drains_rotated_logs_on_stop() {
         .map(|sequence| format!("entry-{sequence}\n"))
         .collect::<String>();
     assert_eq!(content, expected.as_bytes());
+}
+
+#[tokio::test]
+async fn afs_services_start_and_stop_under_supervisor() {
+    let temp_directory = tempfile::Builder::new()
+        .prefix("adx-afs-stop-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let root = temp_directory.path();
+    for binary_name in ["adx-coordinator", "afs-meta", "afs-node"] {
+        install_test_binary(root, binary_name, graceful_service_script());
+    }
+    let meta_config = root.join("meta.toml");
+    let node_config = root.join("node.toml");
+    std::fs::write(&meta_config, "id='meta'\n").unwrap();
+    std::fs::write(&node_config, "id='node-a'\n").unwrap();
+    let deployment = test_deployment(
+        root,
+        json!([
+            {"id":"coordinator","role":"coordinator"},
+            {"id":"meta","role":"afs-meta","config":{"config_file":meta_config}},
+            {"id":"node","role":"afs-node","config":{"config_file":node_config}}
+        ]),
+    );
+    let state_directory = deployment.state_dir.clone();
+    let supervisor_task = tokio::spawn(supervisor::run(deployment));
+    wait_until_ready(&state_directory).await;
+
+    supervisor::request(&state_directory, Request::Stop, Duration::from_secs(5))
+        .await
+        .unwrap();
+    supervisor_task.await.unwrap().unwrap();
+    assert!(!state_directory.join("supervisor.sock").exists());
+}
+
+#[tokio::test]
+async fn afs_stop_timeout_fails_without_stopping_meta_or_restarting_node() {
+    let temp_directory = tempfile::Builder::new()
+        .prefix("adx-afs-stop-timeout-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let root = temp_directory.path();
+    install_test_binary(root, "afs-meta", "#!/bin/sh\nexec sleep 100\n");
+    install_test_binary(
+        root,
+        "afs-node",
+        "#!/bin/sh\ntrap '' TERM\nwhile :; do sleep 1; done\n",
+    );
+    let meta_config = root.join("meta.toml");
+    let node_config = root.join("node.toml");
+    std::fs::write(&meta_config, "id='meta'\n").unwrap();
+    std::fs::write(&node_config, "id='node-a'\n").unwrap();
+    let deployment = test_deployment(
+        root,
+        json!([
+            {"id":"meta","role":"afs-meta","config":{"config_file":meta_config}},
+            {"id":"node","role":"afs-node","config":{"config_file":node_config}}
+        ]),
+    );
+    let state_directory = deployment.state_dir.clone();
+    let supervisor_task = tokio::spawn(supervisor::run(deployment));
+    wait_until_ready(&state_directory).await;
+
+    let stop_error = supervisor::request(&state_directory, Request::Stop, Duration::from_secs(3))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        stop_error.contains("supervisor operation failed"),
+        "unexpected stop error: {stop_error}"
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let status = supervisor::request(&state_directory, Request::Status, Duration::from_secs(3))
+        .await
+        .unwrap();
+    assert!(service_status(&status, "meta")["pid"].is_number());
+    assert_eq!(
+        service_status(&status, "node")["failed"],
+        serde_json::Value::Bool(true)
+    );
+    assert!(service_status(&status, "node")["pid"].is_null());
+
+    supervisor_task.abort();
+    let _ = supervisor_task.await;
+}
+
+#[tokio::test]
+async fn afs_node_exit_124_on_sigterm_fails_stop_and_keeps_meta_running() {
+    let temp_directory = tempfile::Builder::new()
+        .prefix("adx-afs-stop-exit-124-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let root = temp_directory.path();
+    install_test_binary(root, "afs-meta", "#!/bin/sh\nexec sleep 100\n");
+    install_test_binary(
+        root,
+        "afs-node",
+        "#!/bin/sh\ntrap 'exit 124' TERM\nwhile :; do sleep 1; done\n",
+    );
+    let meta_config = root.join("meta.toml");
+    let node_config = root.join("node.toml");
+    std::fs::write(&meta_config, "id='meta'\n").unwrap();
+    std::fs::write(&node_config, "id='node-a'\n").unwrap();
+    let deployment = test_deployment(
+        root,
+        json!([
+            {"id":"meta","role":"afs-meta","config":{"config_file":meta_config}},
+            {"id":"node","role":"afs-node","config":{"config_file":node_config}}
+        ]),
+    );
+    let state_directory = deployment.state_dir.clone();
+    let supervisor_task = tokio::spawn(supervisor::run(deployment));
+    wait_until_ready(&state_directory).await;
+
+    let stop_error = supervisor::request(&state_directory, Request::Stop, Duration::from_secs(3))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        stop_error.contains("supervisor operation failed"),
+        "unexpected stop error: {stop_error}"
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let status = supervisor::request(&state_directory, Request::Status, Duration::from_secs(3))
+        .await
+        .unwrap();
+    assert!(service_status(&status, "meta")["pid"].is_number());
+    assert_eq!(
+        service_status(&status, "node")["failed"],
+        serde_json::Value::Bool(true)
+    );
+    assert!(service_status(&status, "node")["pid"].is_null());
+
+    supervisor_task.abort();
+    let _ = supervisor_task.await;
+}
+
+#[tokio::test]
+async fn afs_node_reaped_before_stop_fails_stop_and_keeps_meta_running() {
+    let temp_directory = tempfile::Builder::new()
+        .prefix("adx-afs-prestop-exit-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let root = temp_directory.path();
+    install_test_binary(root, "afs-meta", "#!/bin/sh\nexec sleep 100\n");
+    install_test_binary(root, "afs-node", "#!/bin/sh\nexit 124\n");
+    let meta_config = root.join("meta.toml");
+    let node_config = root.join("node.toml");
+    std::fs::write(&meta_config, "id='meta'\n").unwrap();
+    std::fs::write(&node_config, "id='node-a'\n").unwrap();
+    let deployment = test_deployment(
+        root,
+        json!([
+            {"id":"meta","role":"afs-meta","config":{"config_file":meta_config}},
+            {"id":"node","role":"afs-node","config":{"config_file":node_config}}
+        ]),
+    );
+    let state_directory = deployment.state_dir.clone();
+    let supervisor_task = tokio::spawn(supervisor::run(deployment));
+    wait_until_ready(&state_directory).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let status =
+                supervisor::request(&state_directory, Request::Status, Duration::from_secs(3))
+                    .await
+                    .unwrap();
+            if service_status(&status, "node")["failed"] == serde_json::Value::Bool(true) {
+                assert!(service_status(&status, "node")["pid"].is_null());
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let stop_error = supervisor::request(&state_directory, Request::Stop, Duration::from_secs(3))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        stop_error.contains("supervisor operation failed"),
+        "unexpected stop error: {stop_error}"
+    );
+    let status = supervisor::request(&state_directory, Request::Status, Duration::from_secs(3))
+        .await
+        .unwrap();
+    assert!(service_status(&status, "meta")["pid"].is_number());
+    assert!(service_status(&status, "node")["pid"].is_null());
+
+    supervisor_task.abort();
+    let _ = supervisor_task.await;
+}
+
+#[tokio::test]
+async fn afs_status_reports_actual_http_health() {
+    let temp_directory = tempfile::Builder::new()
+        .prefix("adx-afs-health-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let root = temp_directory.path();
+    install_test_binary(root, "afs-node", graceful_service_script());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let health_task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buffer = [0; 512];
+        let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buffer)
+            .await
+            .unwrap();
+        tokio::io::AsyncWriteExt::write_all(
+            &mut stream,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 18\r\n\r\n{\"status\":\"ready\"}",
+        )
+        .await
+        .unwrap();
+    });
+    let node_config = root.join("node.toml");
+    std::fs::write(&node_config, "id='node-a'\n").unwrap();
+    let deployment = test_deployment(
+        root,
+        json!([{
+            "id":"node",
+            "role":"afs-node",
+            "config":{"config_file":node_config,"health_url":format!("http://{address}/health")}
+        }]),
+    );
+    let state_directory = deployment.state_dir.clone();
+    let supervisor_task = tokio::spawn(supervisor::run(deployment));
+
+    let status = wait_until_ready(&state_directory).await;
+
+    assert_eq!(
+        service_status(&status, "node")["health"]["ready"],
+        serde_json::Value::Bool(true)
+    );
+    supervisor::request(&state_directory, Request::Stop, Duration::from_secs(5))
+        .await
+        .unwrap();
+    supervisor_task.await.unwrap().unwrap();
+    health_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn afs_status_does_not_treat_http_200_degraded_as_ready() {
+    let temp_directory = tempfile::Builder::new()
+        .prefix("adx-afs-health-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let root = temp_directory.path();
+    install_test_binary(root, "afs-node", graceful_service_script());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let health_task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut buffer = [0; 512];
+        let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buffer)
+            .await
+            .unwrap();
+        tokio::io::AsyncWriteExt::write_all(
+            &mut stream,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 21\r\n\r\n{\"status\":\"degraded\"}",
+        )
+        .await
+        .unwrap();
+    });
+    let node_config = root.join("node.toml");
+    std::fs::write(&node_config, "id='node-a'\n").unwrap();
+    let deployment = test_deployment(
+        root,
+        json!([{
+            "id":"node",
+            "role":"afs-node",
+            "config":{"config_file":node_config,"health_url":format!("http://{address}/health")}
+        }]),
+    );
+    let state_directory = deployment.state_dir.clone();
+    let supervisor_task = tokio::spawn(supervisor::run(deployment));
+
+    let status = wait_until_ready(&state_directory).await;
+
+    assert_eq!(
+        service_status(&status, "node")["health"]["ready"],
+        serde_json::Value::Bool(false)
+    );
+    supervisor::request(&state_directory, Request::Stop, Duration::from_secs(5))
+        .await
+        .unwrap();
+    supervisor_task.await.unwrap().unwrap();
+    health_task.await.unwrap();
 }

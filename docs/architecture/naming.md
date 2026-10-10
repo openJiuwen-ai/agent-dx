@@ -46,3 +46,7 @@ Agent 层的 `adx_agent_core::AgentBinding` 表示 `(tenant, template, version, 
 独立主机使用各自的 `deployment.yaml`。内置 profile 为 `standalone`、`standalone-external-redis`、`coordinator`、`node`、`ingress-api`。`adxctl` 将它们展开为上表中的组件配置，详见 [部署入口](../deployment/standalone.md)。
 
 Execd 仍独立出包；发布清单、构建步骤、进程启动参数、日志和测试驱动使用 `execd` 名称。历史验收报告保留当时的命令和产物名称，不能作为本次重命名的端到端验收证据。
+
+## AFS 与内部文件系统模式
+
+Agent FS（AFS）是整体可选组件，源码根目录为 `afs/`，通用验收工具为 `build/e2e/afs/`；构建与发布使用 `ADX_WITH_AFS`、`afs-*` 和 `with_afs`。OwnerFs 与 DistributedFs（DFS）是组件内平级模式，因此 `vfs/ownerfs` 与 `vfs/dfs`、各自的模式 feature／配置／专项测试保留名称。不得把包含两种模式的组件整体称为 DFS。

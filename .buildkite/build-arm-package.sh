@@ -4,9 +4,18 @@ set -euo pipefail
 phase=${1:?build or package}
 component=${2:-}
 case "$phase:$component" in
-  build:platform|build:gateway|build:execd|package:) ;;
-  *) echo 'expected build <platform|gateway|execd> or package' >&2; exit 2 ;;
+  build:platform|build:gateway|build:execd|build:afs|package:) ;;
+  *) echo 'expected build <platform|gateway|execd|afs> or package' >&2; exit 2 ;;
 esac
+ADX_WITH_AFS=${ADX_WITH_AFS:-0}
+case "$ADX_WITH_AFS" in
+  0|1) ;;
+  *) echo 'ADX_WITH_AFS must be 0 or 1' >&2; exit 2 ;;
+esac
+if [[ $component == afs && $ADX_WITH_AFS != 1 ]]; then
+  echo 'AFS component requires ADX_WITH_AFS=1' >&2
+  exit 2
+fi
 : "${BUILDKITE_COMMIT:?Buildkite revision required}"
 : "${BUILDKITE_BUILD_ID:?Buildkite build ID required}"
 [[ $(uname -m) == arm64 ]] || { echo 'native macOS ARM worker required' >&2; exit 1; }
@@ -29,7 +38,9 @@ trap finish EXIT
 if [[ $phase == package ]]; then
   buildkite-agent artifact download 'out/buildkite/sdk/*' . --step sdk-package
   buildkite-agent artifact download 'out/buildkite/admin/*' . --step admin-package
-  for part in platform gateway execd; do
+  parts=(platform gateway execd)
+  if [[ $ADX_WITH_AFS == 1 ]]; then parts+=(afs); fi
+  for part in "${parts[@]}"; do
     buildkite-agent artifact download "out/buildkite/arm64/components/$part.tar.gz" . --step "build-$part-arm64"
   done
   mv out/buildkite/arm64/components out/buildkite/components
@@ -40,7 +51,7 @@ chmod -R a+rwX out/buildkite
 image=$(python3 -c 'import json; print(json.load(open("build/images/build-environment-arm64.json"))["ci_image"])')
 [[ $image == *@sha256:* ]]
 env_args=()
-for key in BUILDKITE_COMMIT BUILDKITE_BUILD_ID JOBS ADX_ARM_TESTS; do
+for key in BUILDKITE_COMMIT BUILDKITE_BUILD_ID JOBS ADX_ARM_TESTS ADX_WITH_AFS; do
   if [[ -n ${!key:-} ]]; then env_args+=(-e "$key"); fi
 done
 # Publication runs on the existing Kubernetes worker with its OBS Secret.

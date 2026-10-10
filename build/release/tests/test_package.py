@@ -1,3 +1,4 @@
+import json
 import importlib.util
 import platform
 import subprocess
@@ -44,6 +45,16 @@ class PackageTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 pkg.assemble(binaries, redis, redis_cli, wheel, out, "a" * 40, True, "test-fixture", "debug")
 
+    def test_legacy_manifest_cannot_silently_disable_afs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for mode in (True, False):
+                (root / "manifest.json").write_text(json.dumps({
+                    "schema_version": 1, "files": {}, "with_dfs": mode,
+                }))
+                with self.assertRaisesRegex(ValueError, "legacy with_dfs"):
+                    pkg.verify(root)
+
     def test_package_ships_optional_split_process_binaries(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -72,7 +83,125 @@ class PackageTests(unittest.TestCase):
             manifest = pkg.assemble(binaries, redis, redis_cli, wheel, output, "a" * 40, True, "test-fixture", "debug")
             self.assertEqual({p.name for p in (output / "bin").iterdir()}, shipped | {"redis-server", "redis-cli"})
             self.assertNotIn("bin/adx-data-plane-forward", manifest["files"])
+            self.assertNotIn("bin/afs-meta", manifest["files"])
             pkg.verify(output)
+
+    def test_afs_artifacts_are_only_shipped_when_enabled(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            binaries = root / "bin"
+            binaries.mkdir()
+            for name in pkg.BINARIES + pkg.AFS_BINARIES + ("adx-execd",):
+                (binaries / name).write_bytes(b"fixture")
+            redis = root / "redis"
+            redis.write_text("#!/bin/sh\necho 'Redis server v=7.2.5 sha=fixture'\n")
+            redis.chmod(0o700)
+            redis_cli = root / "redis-cli"
+            redis_cli.write_text("#!/bin/sh\necho 'redis-cli 7.2.5'\n")
+            redis_cli.chmod(0o700)
+            wheel = root / "adx_sandbox-1-py3-none-any.whl"
+            wheel.write_bytes(b"fixture")
+
+            default_output = root / "default-package"
+            default_manifest = pkg.assemble(
+                binaries, redis, redis_cli, wheel, default_output, "a" * 40, True, "test-fixture", "debug"
+            )
+            self.assertNotIn("with_afs", default_manifest)
+            self.assertNotIn("bin/afs-meta", default_manifest["files"])
+            self.assertFalse((default_output / "etc/examples/afs").exists())
+            pkg.verify(default_output)
+
+            afs_output = root / "afs-package"
+            afs_manifest = pkg.assemble(
+                binaries, redis, redis_cli, wheel, afs_output, "a" * 40, True, "test-fixture", "debug", True
+            )
+            self.assertTrue(afs_manifest["with_afs"])
+            self.assertIn("bin/afs-meta", afs_manifest["files"])
+            self.assertIn("bin/afs-node", afs_manifest["files"])
+            self.assertIn("etc/examples/afs/meta.toml", afs_manifest["files"])
+            self.assertIn("third_party/afs-source/LICENSE", afs_manifest["files"])
+            self.assertIn("third_party/afs-source/NOTICE", afs_manifest["files"])
+            pkg.verify(afs_output)
+
+            (afs_output / "bin/afs-node").write_bytes(b"tampered")
+            with self.assertRaises(ValueError):
+                pkg.verify(afs_output)
+
+    def test_cli_assemble_accepts_with_afs_flag(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            binaries = root / "bin"
+            binaries.mkdir()
+            for name in pkg.BINARIES + pkg.AFS_BINARIES + ("adx-execd",):
+                (binaries / name).write_bytes(b"fixture")
+            redis = root / "redis"
+            redis.write_text("#!/bin/sh\necho 'Redis server v=7.2.5 sha=fixture'\n")
+            redis.chmod(0o700)
+            redis_cli = root / "redis-cli"
+            redis_cli.write_text("#!/bin/sh\necho 'redis-cli 7.2.5'\n")
+            redis_cli.chmod(0o700)
+            wheel = root / "adx_sandbox-1-py3-none-any.whl"
+            wheel.write_bytes(b"fixture")
+            output = root / "package"
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(Path(__file__).resolve().parents[1] / "package.py"),
+                    "assemble",
+                    "--binary-dir",
+                    str(binaries),
+                    "--redis",
+                    str(redis),
+                    "--redis-cli",
+                    str(redis_cli),
+                    "--wheel",
+                    str(wheel),
+                    "--output",
+                    str(output),
+                    "--target",
+                    "test-fixture",
+                    "--profile",
+                    "debug",
+                    "--with-afs",
+                ],
+                text=True,
+                capture_output=True,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            manifest = pkg.verify(output)
+            self.assertTrue(manifest["with_afs"])
+            self.assertIn("bin/afs-meta", manifest["files"])
+
+    def test_afs_package_requires_both_runtime_binaries(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            binaries = root / "bin"
+            binaries.mkdir()
+            for name in pkg.BINARIES + ("afs-meta", "adx-execd"):
+                (binaries / name).write_bytes(b"fixture")
+            redis = root / "redis"
+            redis.write_text("#!/bin/sh\necho 'Redis server v=7.2.5 sha=fixture'\n")
+            redis.chmod(0o700)
+            redis_cli = root / "redis-cli"
+            redis_cli.write_text("#!/bin/sh\necho 'redis-cli 7.2.5'\n")
+            redis_cli.chmod(0o700)
+            wheel = root / "adx_sandbox-1-py3-none-any.whl"
+            wheel.write_bytes(b"fixture")
+            with self.assertRaises(ValueError):
+                pkg.assemble(
+                    binaries,
+                    redis,
+                    redis_cli,
+                    wheel,
+                    root / "afs-package",
+                    "a" * 40,
+                    True,
+                    "test-fixture",
+                    "debug",
+                    True,
+                )
 
     def test_missing_artifact_never_creates_package(self):
         with tempfile.TemporaryDirectory() as t:

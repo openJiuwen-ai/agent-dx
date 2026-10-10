@@ -1,0 +1,30 @@
+id = "node-a"
+grpc_listen = "127.0.0.1:7500"
+rest_listen = "127.0.0.1:7501"
+meta_endpoint = "http://127.0.0.1:7400"
+# peer_endpoint = "http://127.0.0.1:7600"
+fs = "all"
+data_mode = "grpc"
+data_dir = "/opt/adx/data/afs/node-a"
+uds_path = "/opt/adx/run/afs/node-a.sock"
+# ownerfs_mount = "/mnt/adx/ownerfs"
+# dfs_mount = "/mnt/adx/dfs"
+timeout_ms = 5000
+log_level = "info"
+trace_enabled = false
+trace_sample_ratio = 1.0
+trace_endpoint = "http://127.0.0.1:4317"
+
+# OwnerFs workspace bind mount stays OFF. This legacy option controls only
+# the runc experiment; it does not expose a standalone host-visible bind.
+# Existing TOML/CLI names remain compatible; see docs/deployment/afs.md.
+experimental_native_workspace = false
+
+# Independent administrator-controlled host entry, also OFF by default.
+# Create and authorize the Home workspace through OwnerFs before enabling this.
+# Only one already-existing local Home workspace is supported. Stop managed
+# users before shutdown/root changes; native FDs are not instantly revocable.
+# Do not enable both experimental entries together.
+experimental_ownerfs_workspace_bind = false
+# [ownerfs_workspace_bind]
+# workspace = "agent1"

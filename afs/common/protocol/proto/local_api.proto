@@ -1,0 +1,146 @@
+syntax = "proto3";
+package afs.local.v1;
+
+// 本协议只在本机 UDS 上使用。LocalShmGrant 描述如何取得共享缓冲 FD，
+// token 是一次性 broker grant 匹配信息；file_offset 是文件偏移，region_offset 是缓冲偏移。
+// 两个偏移属于不同空间，不能互换。bytes token 不是文件内容。
+
+// 本机 SDK → Node 的高性能数据 API 控制协议，使用 gRPC over UDS。
+// 内容通过共享内存传递；无 SHM 时使用 POSIX，不提供远端 SDK 或内容 gRPC 兜底。
+
+// LocalData 是早期 Storage 诊断穿刺。它只操作 node 的 diagnostics 对象目录，
+// 不是 OwnerFs 或 DistributedFs 文件 API。正式 DFS 集成必须使用 DfsLocalData。
+service LocalData {
+  rpc Read(LocalReadRequest) returns (LocalReadReply);
+  rpc Write(LocalWriteRequest) returns (LocalWriteReply);
+}
+
+// DfsLocalData 是 DistributedFs 专用的侵入式本机数据入口。Node 签发的 handle
+// 绑定打开文件状态；固定 FileVersion 引用只允许读。范围和同步屏障始终显式传递，
+// 文件内容只经 LocalShmGrant 指向的共享内存搬运。
+service DfsLocalData {
+  rpc Open(DfsOpenRequest) returns (DfsOpenReply);
+  rpc Read(DfsReadRequest) returns (DfsReadReply);
+  rpc Write(DfsWriteRequest) returns (DfsWriteReply);
+  rpc Sync(DfsSyncRequest) returns (DfsSyncReply);
+  rpc Close(DfsCloseRequest) returns (DfsCloseReply);
+}
+
+message LocalShmGrant {
+  string broker_socket_path = 1;
+  bytes token = 2;
+  uint64 session_id = 3;
+  uint64 region_id = 4;
+  uint64 region_offset = 5;
+  uint32 length = 6;
+}
+
+message LocalReadRequest {
+  string name = 1;
+  uint64 file_offset = 2;
+  uint32 length = 3;
+  LocalShmGrant target = 4;
+}
+
+message LocalReadReply {
+  uint32 length = 1;
+}
+
+message LocalWriteRequest {
+  string name = 1;
+  uint64 file_offset = 2;
+  uint32 length = 3;
+  LocalShmGrant source = 4;
+}
+
+message LocalWriteReply {
+  uint32 written = 1;
+}
+
+enum DfsOpenAccess {
+  DFS_OPEN_ACCESS_UNSPECIFIED = 0;
+  DFS_OPEN_ACCESS_READ_ONLY = 1;
+  DFS_OPEN_ACCESS_READ_WRITE = 2;
+}
+
+enum DfsSyncBarrier {
+  DFS_SYNC_BARRIER_UNSPECIFIED = 0;
+  DFS_SYNC_BARRIER_DATA = 1;
+  DFS_SYNC_BARRIER_FULL = 2;
+}
+
+// value 是 Node 生成并校验的本机不透明身份，SDK 不解析、不拼接。
+message DfsFileHandle {
+  bytes value = 1;
+}
+
+// 固定版本引用绕过 mutable head；三个身份必须同时出现，且只能用于读取。
+message DfsFileVersionRef {
+  string namespace_id = 1;
+  string inode_id = 2;
+  string file_version_id = 3;
+}
+
+message DfsReadTarget {
+  oneof target {
+    DfsFileHandle handle = 1;
+    DfsFileVersionRef version = 2;
+  }
+}
+
+message DfsFileRange {
+  uint64 offset = 1;
+  uint32 length = 2;
+}
+
+message DfsOpenRequest {
+  string namespace_id = 1;
+  string inode_id = 2;
+  DfsOpenAccess access = 3;
+  // 非空时要求 mutable head 恰好等于该版本，防止在错误版本上打开。
+  optional string expected_file_version_id = 4;
+}
+
+message DfsOpenReply {
+  DfsFileHandle handle = 1;
+  string file_version_id = 2;
+  uint64 length = 3;
+}
+
+message DfsReadRequest {
+  DfsReadTarget target = 1;
+  DfsFileRange range = 2;
+  LocalShmGrant target_buffer = 3;
+}
+
+message DfsReadReply {
+  uint32 length = 1;
+  string resolved_file_version_id = 2;
+}
+
+message DfsWriteRequest {
+  DfsFileHandle handle = 1;
+  DfsFileRange range = 2;
+  LocalShmGrant source_buffer = 3;
+}
+
+message DfsWriteReply {
+  uint32 written = 1;
+  uint64 accepted_write_seq = 2;
+}
+
+message DfsSyncRequest {
+  DfsFileHandle handle = 1;
+  DfsSyncBarrier barrier = 2;
+}
+
+message DfsSyncReply {
+  string file_version_id = 1;
+  uint64 durable_write_seq = 2;
+}
+
+message DfsCloseRequest {
+  DfsFileHandle handle = 1;
+}
+
+message DfsCloseReply {}

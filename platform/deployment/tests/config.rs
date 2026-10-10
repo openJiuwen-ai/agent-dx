@@ -253,6 +253,154 @@ fn every_minimal_profile_resolves_to_its_expected_roles() {
 }
 
 #[test]
+fn afs_roles_are_explicit_and_render_from_existing_toml_files() {
+    let root = tempfile::tempdir().unwrap();
+    let package = root.path().join("package");
+    let state = root.path().join("state");
+    let rendered = root.path().join("rendered");
+    let meta_config = root.path().join("meta.toml");
+    let node_config = root.path().join("node.toml");
+    std::fs::write(&meta_config, "id = 'meta'\n").unwrap();
+    std::fs::write(&node_config, "id = 'node-a'\n").unwrap();
+    let deployment: Deployment = serde_json::from_value(json!({
+        "schema_version": 1,
+        "with_afs": true,
+        "package_dir": package,
+        "state_dir": state,
+        "redis_url": "redis://localhost:6379/",
+        "namespace": "test",
+        "restart_delay_ms": 20,
+        "stop_timeout_seconds": 3,
+        "services": [
+            {"id": "meta", "role": "afs-meta", "config": {"config_file": meta_config, "health_url": "http://127.0.0.1:7401/health"}},
+            {"id": "node", "role": "afs-node", "config": {"config_file": node_config, "health_url": "http://127.0.0.1:7501/health"}}
+        ],
+    }))
+    .unwrap();
+
+    let processes = deployment.render(&rendered).unwrap();
+
+    assert_eq!(
+        processes
+            .iter()
+            .map(|process| process.role)
+            .collect::<Vec<_>>(),
+        vec![Role::AfsMeta, Role::AfsNode]
+    );
+    assert_eq!(processes[0].binary, package.join("bin/afs-meta"));
+    assert_eq!(
+        processes[0].args,
+        vec!["--config".to_owned(), meta_config.display().to_string()]
+    );
+    assert_eq!(
+        processes[1].health_url.as_deref(),
+        Some("http://127.0.0.1:7501/health")
+    );
+    assert!(!rendered.join("meta.json").exists());
+    assert!(!rendered.join("node.json").exists());
+}
+
+#[test]
+fn afs_roles_require_explicit_afs_enablement() {
+    let root = tempfile::tempdir().unwrap();
+    let deployment: Deployment = serde_json::from_value(json!({
+        "schema_version": 1,
+        "package_dir": root.path().join("package"),
+        "state_dir": root.path().join("state"),
+        "redis_url": "redis://localhost:6379/",
+        "namespace": "test",
+        "restart_delay_ms": 20,
+        "stop_timeout_seconds": 3,
+        "services": [{"id": "meta", "role": "afs-meta", "config": {"config_file": root.path().join("meta.toml")}}],
+    }))
+    .unwrap();
+
+    let error = deployment.validate().unwrap_err().to_string();
+
+    assert!(
+        error.contains("with_afs: true"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn afs_roles_reject_legacy_with_dfs_field() {
+    let root = tempfile::tempdir().unwrap();
+    let error = serde_json::from_value::<Deployment>(json!({
+        "schema_version": 1,
+        "with_dfs": true,
+        "package_dir": root.path().join("package"),
+        "state_dir": root.path().join("state"),
+        "redis_url": "redis://localhost:6379/",
+        "namespace": "test",
+        "restart_delay_ms": 20,
+        "stop_timeout_seconds": 3,
+        "services": [],
+    }))
+    .err()
+    .expect("legacy field must fail")
+    .to_string();
+
+    assert!(error.contains("with_dfs"), "unexpected error: {error}");
+}
+
+#[test]
+fn profile_deployment_rejects_legacy_with_dfs_field() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("deployment.yaml");
+    std::fs::write(
+        &path,
+        r#"
+schema_version: 1
+profile: standalone
+with_dfs: true
+"#,
+    )
+    .unwrap();
+
+    let error = Deployment::load(&path)
+        .err()
+        .expect("legacy field must fail")
+        .to_string();
+
+    assert!(error.contains("with_dfs"), "unexpected error: {error}");
+}
+
+#[test]
+fn afs_roles_reject_implicit_or_unsafe_configuration() {
+    let root = tempfile::tempdir().unwrap();
+    for (config, expected) in [
+        (
+            json!({"config_file":"relative.toml"}),
+            "AFS config_file must be absolute",
+        ),
+        (
+            json!({"config_file":root.path().join("meta.toml"),"health_url":"https://127.0.0.1/health"}),
+            "AFS health_url",
+        ),
+        (
+            json!({"config_file":root.path().join("meta.toml"),"unknown":true}),
+            "invalid AFS config",
+        ),
+    ] {
+        let deployment: Deployment = serde_json::from_value(json!({
+            "schema_version": 1,
+            "with_afs": true,
+            "package_dir": root.path().join("package"),
+            "state_dir": root.path().join("state"),
+            "redis_url": "redis://localhost:6379/",
+            "namespace": "test",
+                "restart_delay_ms": 20,
+            "stop_timeout_seconds": 3,
+            "services": [{"id": "meta", "role": "afs-meta", "config": config}],
+        }))
+        .unwrap();
+        let error = deployment.validate().unwrap_err().to_string();
+        assert!(error.contains(expected), "unexpected error: {error}");
+    }
+}
+
+#[test]
 fn ingress_api_profile_embeds_ingress_in_apiserver_by_default() {
     let root = tempfile::tempdir().unwrap();
     let mut deployment: Deployment = serde_saphyr::from_str(include_str!(
@@ -675,6 +823,7 @@ fn shipped_role_deployment_examples_are_valid() {
         include_str!("../../../build/config/examples/deployment-coordinator.yaml"),
         include_str!("../../../build/config/examples/deployment-node.yaml"),
         include_str!("../../../build/config/examples/deployment-ingress-api.yaml"),
+        include_str!("../../../build/config/examples/afs/deployment-ownerfs-local.yaml"),
     ];
 
     for example in examples {
@@ -811,4 +960,23 @@ fn node_control_stream_example_survives_profile_expansion_and_render() {
         serde_json::from_slice(&std::fs::read(output.join(format!("{}.json", node.id))).unwrap())
             .unwrap();
     assert_eq!(config["runtime_control"], node.config["runtime_control"]);
+}
+
+#[test]
+fn afs_deployment_example_uses_current_shared_schema() {
+    let deployment: Deployment = serde_saphyr::from_str(include_str!(
+        "../../../build/config/examples/afs/deployment-ownerfs-local.yaml"
+    ))
+    .unwrap();
+    deployment.validate().unwrap();
+    assert!(deployment.with_afs);
+    assert_eq!(deployment.restart_delay_ms, 1000);
+    assert_eq!(
+        deployment
+            .services
+            .iter()
+            .map(|service| service.role)
+            .collect::<Vec<_>>(),
+        vec![Role::AfsMeta, Role::AfsNode]
+    );
 }

@@ -1,5 +1,10 @@
 import base64
 import importlib.util
+import json
+import os
+import subprocess
+import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -33,6 +38,50 @@ class ExistingCiCredentialsTests(unittest.TestCase):
     def test_absent_secret_preserves_external_credential_setup(self):
         self.assertIsNone(module.registry_config({}))
 
+    def test_docker_auth_config_preserves_only_cli_plugin_discovery(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            original = root / 'docker'
+            extra = root / 'extra-plugins'
+            home_plugins = original / 'cli-plugins'
+            extra.mkdir()
+            home_plugins.mkdir(parents=True)
+            (original / 'config.json').write_text(json.dumps({
+                'auths': {'host.example': {'auth': 'must-not-copy'}},
+                'credsStore': 'desktop',
+                'credHelpers': {'host.example': 'desktop'},
+                'currentContext': 'desktop-linux',
+                'cliPluginsExtraDirs': [str(extra)],
+            }))
+            result = module.docker_config(
+                {'SWR_DOCKER_CONFIG_JSON': '{"auths":{"swr.example":{"auth":"fixture"}}}',
+                 'DOCKER_CONFIG': str(original)}
+            )
+            self.assertEqual(result['auths'], {'swr.example': {'auth': 'fixture'}})
+            self.assertEqual(result['cliPluginsExtraDirs'], [str(extra), str(home_plugins)])
+            self.assertNotIn('credsStore', result)
+            self.assertNotIn('credHelpers', result)
+            self.assertNotIn('currentContext', result)
+
+    def test_docker_auth_config_ignores_bad_cli_plugin_discovery(self):
+        with tempfile.TemporaryDirectory() as directory:
+            original = Path(directory)
+            (original / 'config.json').write_text(json.dumps({
+                'cliPluginsExtraDirs': ['/safe/plugins', {'bad': 'value'}, 7],
+            }))
+            result = module.docker_config(
+                {'SWR_DOCKER_CONFIG_JSON': '{"auths":{"swr.example":{"auth":"fixture"}}}',
+                 'DOCKER_CONFIG': str(original)}
+            )
+            self.assertEqual(result['cliPluginsExtraDirs'], ['/safe/plugins'])
+
+    def test_docker_auth_config_falls_back_when_home_is_unset(self):
+        result = module.docker_config(
+            {'SWR_DOCKER_CONFIG_JSON': '{"auths":{"swr.example":{"auth":"fixture"}}}',
+             'HOME': ''}
+        )
+        self.assertEqual(result, {'auths': {'swr.example': {'auth': 'fixture'}}})
+
     def test_existing_target_path_is_the_default(self):
         script = (ROOT / '.buildkite/run-e2e.sh').read_text()
         self.assertIn('/var/run/yr-k8s/target/kubeconfig', script)
@@ -49,11 +98,6 @@ class ExistingCiCredentialsTests(unittest.TestCase):
         self.assertIn('build.env("ADX_K8S_NODE_PREPARE_ONLY") == "1"', pipeline)
 
     def test_secret_file_is_private_removed_and_child_failure_is_preserved(self):
-        import json
-        import os
-        import subprocess
-        import sys
-
         env = {**os.environ, 'SWR_DOCKER_CONFIG_JSON': '{"auths":{"swr.example":{"auth":"fixture"}}}'}
         child = (
             "import json,os,pathlib,stat; p=pathlib.Path(os.environ['ADX_"

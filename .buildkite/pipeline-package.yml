@@ -16,7 +16,7 @@ steps:
     ADX_CARGO_HOME: /mnt/paas/build-cache/adx/cargo-home
     CARGO_HOME: /mnt/paas/build-cache/adx/cargo-home
     CARGO_TARGET_DIR: /mnt/paas/build-cache/adx/cargo-target/platform-amd64-rust1950
-    RUSTUP_TOOLCHAIN: stable
+    RUSTUP_TOOLCHAIN: 1.95.0
     RUSTUP_AUTO_INSTALL: '0'
     GOCACHE: /mnt/paas/build-cache/adx/go-build/amd64
     GOMODCACHE: /mnt/paas/build-cache/adx/go-mod
@@ -26,7 +26,7 @@ steps:
         imagePullSecrets:
         - name: swr-pull-secret
         containers:
-        - image: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/adx-build@sha256:ad9edff0b7cd2d907648a772109ad516e5da7b7b8762f08fd8653979a1e2cb67
+        - image: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/adx-build@sha256:7cd63f1d779963576ba3ddbf258a01af9fad289fb4f0e848a34dfb75d5139ade
           volumeMounts:
           - name: build-cache
             mountPath: /mnt/paas
@@ -72,7 +72,7 @@ steps:
     ADX_CARGO_HOME: /mnt/paas/build-cache/adx/cargo-home
     CARGO_HOME: /mnt/paas/build-cache/adx/cargo-home
     CARGO_TARGET_DIR: /mnt/paas/build-cache/adx/cargo-target/gateway-amd64-rust1950
-    RUSTUP_TOOLCHAIN: stable
+    RUSTUP_TOOLCHAIN: 1.95.0
     RUSTUP_AUTO_INSTALL: '0'
     GOCACHE: /mnt/paas/build-cache/adx/go-build/amd64
     GOMODCACHE: /mnt/paas/build-cache/adx/go-mod
@@ -94,13 +94,38 @@ steps:
     ADX_CARGO_HOME: /mnt/paas/build-cache/adx/cargo-home
     CARGO_HOME: /mnt/paas/build-cache/adx/cargo-home
     CARGO_TARGET_DIR: /mnt/paas/build-cache/adx/cargo-target/execd-amd64-rust1950
-    RUSTUP_TOOLCHAIN: stable
+    RUSTUP_TOOLCHAIN: 1.95.0
+    RUSTUP_AUTO_INSTALL: '0'
+    GOCACHE: /mnt/paas/build-cache/adx/go-build/amd64
+    GOMODCACHE: /mnt/paas/build-cache/adx/go-mod
+  plugins: *id001
+- label: Build · AFS · Linux x86_64
+  key: build-afs
+  if: build.env("ADX_WITH_AFS") == "1"
+  agents:
+    queue: default
+    os: linux
+    arch: amd64
+  concurrency: 1
+  concurrency_group: adx/build-afs-amd64
+  command: bash .buildkite/step.sh build-afs bash .buildkite/build-component.sh afs
+  timeout_in_minutes: 45
+  artifact_paths:
+  - out/buildkite/logs/**/*
+  env:
+    BUILDKITE_AGENT_NAME: agent-stack-k8s
+    ADX_WITH_AFS: '1'
+    ADX_CARGO_HOME: /mnt/paas/build-cache/adx/cargo-home
+    CARGO_HOME: /mnt/paas/build-cache/adx/cargo-home
+    CARGO_TARGET_DIR: /mnt/paas/build-cache/adx/cargo-target/afs-component-amd64-rust1950
+    RUSTUP_TOOLCHAIN: 1.95.0
     RUSTUP_AUTO_INSTALL: '0'
     GOCACHE: /mnt/paas/build-cache/adx/go-build/amd64
     GOMODCACHE: /mnt/paas/build-cache/adx/go-mod
   plugins: *id001
 - label: Build · Platform · Linux ARM64
   key: build-platform-arm64
+  if: build.env("ADX_ARM_BUILD") != "0"
   agents:
     queue: default
     os: macos
@@ -116,8 +141,28 @@ steps:
   - out/buildkite/arm64/components/*.tar.gz
   env:
     JOBS: '4'
+- label: Build · AFS · Linux ARM64
+  key: build-afs-arm64
+  if: build.env("ADX_ARM_BUILD") != "0" && build.env("ADX_WITH_AFS") == "1"
+  agents:
+    queue: default
+    os: macos
+    arch: arm64
+  concurrency: 1
+  concurrency_group: adx/native-arm64
+  command: python3 .buildkite/with_registry.py --docker -- bash .buildkite/build-arm-package.sh build afs
+  secrets:
+    SWR_DOCKER_CONFIG_JSON: ADX_SWR_PULL_CONFIG
+  timeout_in_minutes: 60
+  artifact_paths:
+  - out/buildkite/arm64/logs/**/*
+  - out/buildkite/arm64/components/*.tar.gz
+  env:
+    JOBS: '4'
+    ADX_WITH_AFS: '1'
 - label: Build · Gateway · Linux ARM64
   key: build-gateway-arm64
+  if: build.env("ADX_ARM_BUILD") != "0"
   agents:
     queue: default
     os: macos
@@ -135,6 +180,7 @@ steps:
     JOBS: '4'
 - label: Build · Execd · Linux ARM64
   key: build-execd-arm64
+  if: build.env("ADX_ARM_BUILD") != "0"
   agents:
     queue: default
     os: macos
@@ -167,7 +213,7 @@ steps:
     ADX_CARGO_HOME: /mnt/paas/build-cache/adx/cargo-home
     CARGO_HOME: /mnt/paas/build-cache/adx/cargo-home
     CARGO_TARGET_DIR: /mnt/paas/build-cache/adx/cargo-target/source-gate-amd64-rust1950
-    RUSTUP_TOOLCHAIN: stable
+    RUSTUP_TOOLCHAIN: 1.95.0
     RUSTUP_AUTO_INSTALL: '0'
     GOCACHE: /mnt/paas/build-cache/adx/go-build/amd64
     GOMODCACHE: /mnt/paas/build-cache/adx/go-mod
@@ -177,7 +223,7 @@ steps:
         imagePullSecrets:
         - name: swr-pull-secret
         containers:
-        - image: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/adx-build@sha256:ad9edff0b7cd2d907648a772109ad516e5da7b7b8762f08fd8653979a1e2cb67
+        - image: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/adx-build@sha256:7cd63f1d779963576ba3ddbf258a01af9fad289fb4f0e848a34dfb75d5139ade
           volumeMounts:
           - name: build-cache
             mountPath: /mnt/paas
@@ -328,6 +374,7 @@ steps:
   - build-platform
   - build-gateway
   - build-execd
+  - build-afs
   - source-gate
   - admin-package
   - sdk-package
@@ -355,7 +402,7 @@ steps:
     ADX_CARGO_HOME: /mnt/paas/build-cache/adx/cargo-home
     CARGO_HOME: /mnt/paas/build-cache/adx/cargo-home
     CARGO_TARGET_DIR: /mnt/paas/build-cache/adx/cargo-target/package-amd64-rust1950
-    RUSTUP_TOOLCHAIN: stable
+    RUSTUP_TOOLCHAIN: 1.95.0
     RUSTUP_AUTO_INSTALL: '0'
     GOCACHE: /mnt/paas/build-cache/adx/go-build/amd64
     GOMODCACHE: /mnt/paas/build-cache/adx/go-mod
@@ -364,10 +411,12 @@ steps:
   plugins: *id001
 - label: Release · Assemble · Linux ARM64
   key: platform-build-arm64
+  if: build.env("ADX_ARM_BUILD") != "0"
   depends_on:
   - build-platform-arm64
   - build-gateway-arm64
   - build-execd-arm64
+  - build-afs-arm64
   - source-gate
   - sdk-package
   - admin-package
@@ -408,6 +457,7 @@ steps:
   plugins: *id001
 - label: Release · Publish · Linux ARM64
   key: publish-arm64
+  if: build.env("ADX_ARM_BUILD") != "0"
   depends_on: platform-build-arm64
   agents:
     queue: default
@@ -423,6 +473,7 @@ steps:
   plugins: *id001
 - label: Release · Index · Linux ARM64
   key: artifact-manifest-arm64
+  if: build.env("ADX_ARM_BUILD") != "0"
   depends_on: publish-arm64
   agents:
     queue: default

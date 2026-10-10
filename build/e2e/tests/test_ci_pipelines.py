@@ -1,4 +1,6 @@
 import importlib.util
+import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -16,12 +18,13 @@ class IndependentPipelineTests(unittest.TestCase):
         full = (ROOT / '.buildkite/pipeline-full.yml').read_text()
 
         self.assertIn('key: platform-build', package)
-        for key in ('build-platform', 'build-gateway', 'build-execd', 'source-gate'):
+        for key in ('build-platform', 'build-gateway', 'build-execd', 'build-afs', 'source-gate'):
             self.assertIn(f'key: {key}', package)
+        self.assertNotIn('key: afs-gate', package)
         steps = {step['key']: step for step in yaml.safe_load(package)['steps']}
         self.assertEqual(
             set(steps['platform-build']['depends_on']),
-            {'build-platform', 'build-gateway', 'build-execd', 'source-gate', 'admin-package', 'sdk-package'},
+            {'build-platform', 'build-gateway', 'build-execd', 'build-afs', 'source-gate', 'admin-package', 'sdk-package'},
         )
         self.assertIn('key: platform-e2e', package)
         self.assertIn('key: sdk-package', package)
@@ -57,6 +60,8 @@ class IndependentPipelineTests(unittest.TestCase):
         self.assertEqual(steps['admin-pypi']['depends_on'], 'platform-e2e')
         self.assertNotIn('artifact download', (ROOT / '.buildkite/upload-obs.sh').read_text())
         self.assertIn('bash .buildkite/upload-obs.sh', (ROOT / '.buildkite/package-components.sh').read_text())
+        self.assertIn('ADX_WITH_AFS', (ROOT / '.buildkite/select-pipeline.sh').read_text())
+        self.assertIn('components+=(afs)', (ROOT / '.buildkite/package-components.sh').read_text())
 
     def test_default_entrypoint_dispatches_by_buildkite_pipeline_slug(self):
         pipeline = (ROOT / '.buildkite/pipeline.yml').read_text()
@@ -103,6 +108,44 @@ class IndependentPipelineTests(unittest.TestCase):
         self.assertIn('ADX_E2E_RUNSC_IMAGE', script)
         self.assertIn('build/e2e/runsc_image.py', script)
         self.assertIn('sha512sum --check', script)
+
+    def test_e2e_handoff_forwards_afs_mode_and_preserves_verifier_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tools = root / 'tools'
+            tools.mkdir()
+            scripts = {
+                'git': '#!/bin/sh\n[ "$1" = rev-parse ] && echo fixture-commit\nexit 0\n',
+                'buildkite-agent': '#!/bin/sh\nmkdir -p out/buildkite/package/sdk\ntouch out/buildkite/package/sdk/adx_sandbox-fixture.whl\n',
+                'sha256sum': '#!/bin/sh\nexit 0\n',
+                'tar': '#!/bin/sh\nexit 0\n',
+                'python3': '#!/bin/sh\nif [ "$2" = verify-build ]; then echo "$*"; exit 31; fi\n',
+            }
+            for name, script in scripts.items():
+                path = tools / name
+                path.write_text(script)
+                path.chmod(0o755)
+            env = {key: value for key, value in os.environ.items()
+                   if not key.startswith(('ADX_', 'BUILDKITE_'))}
+            env.update(PATH=str(tools) + os.pathsep + env['PATH'],
+                       ADX_E2E_IMAGE_REPOSITORY='fixture.invalid/adx',
+                       ADX_BASE_PACKAGE_BUILD_ID='fixture-base', ADX_SDK_BUILD_ID='fixture-sdk',
+                       BUILDKITE_COMMIT='fixture-commit')
+            for mode in (None, '0', '1', 'invalid'):
+                with self.subTest(mode=mode):
+                    child_env = dict(env)
+                    if mode is not None:
+                        child_env['ADX_WITH_AFS'] = mode
+                    result = subprocess.run(['bash', str(ROOT / '.buildkite/package-e2e.sh')],
+                                            cwd=root, env=child_env, capture_output=True, text=True)
+                    if mode == 'invalid':
+                        self.assertEqual(result.returncode, 2)
+                        self.assertIn('ADX_WITH_AFS must be 0 or 1', result.stderr)
+                    else:
+                        # Stop at the real handoff boundary: do not start Docker after failure.
+                        self.assertEqual(result.returncode, 31, result.stderr)
+                        self.assertIn('component.py verify-build', result.stdout)
+                        self.assertEqual('--with-afs' in result.stdout, mode == '1')
 
     def test_e2e_bundle_records_independent_sdk_candidate(self):
         spec = importlib.util.spec_from_file_location('e2e_prepare', ROOT / 'build/e2e/prepare.py')

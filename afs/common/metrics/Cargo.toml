@@ -1,0 +1,16 @@
+[package]
+name = "afs-metrics"
+version.workspace = true
+edition = "2024"
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared Prometheus registry and OpenMetrics exemplar support"
+publish = false
+
+[dependencies]
+prometheus = { version = "0.14.0", default-features = false }
+thiserror = "2.0.16"
+
+[lints]
+workspace = true

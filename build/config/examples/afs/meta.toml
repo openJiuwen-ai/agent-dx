@@ -1,0 +1,14 @@
+id = "meta"
+grpc_listen = "127.0.0.1:7400"
+rest_listen = "127.0.0.1:7401"
+meta_store = "local-file"
+data_dir = "/opt/adx/data/afs/meta"
+# DFS replication is a filesystem initialization contract. These R1 defaults
+# must remain unchanged on later starts unless the filesystem is reinitialized.
+dfs_desired_copies = 1
+dfs_sync_required_copies = 1
+dfs_min_distinct_nodes = 1
+dfs_min_distinct_failure_domains = 1
+dfs_local_copy = "required"
+log_level = "info"
+trace_enabled = false

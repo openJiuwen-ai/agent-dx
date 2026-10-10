@@ -12,16 +12,19 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 BINARIES = ("adxctl", "adx-inspect", "adx-coordinator", "adxlet", "adx-apiserver", "adx-ingress", "adx-relay")
+AFS_BINARIES = ("afs-meta", "afs-node")
 
 
 def sha(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def assemble(binary_dir, redis, redis_cli, wheel, output, commit, dirty, target, profile):
+def assemble(binary_dir, redis, redis_cli, wheel, output, commit, dirty, target, profile, with_afs=False):
     if output.exists():
         raise ValueError("output already exists")
     inputs = {f"bin/{name}": binary_dir / name for name in BINARIES}
+    if with_afs:
+        inputs.update({f"bin/{name}": binary_dir / name for name in AFS_BINARIES})
     inputs["runtime/adx-execd"] = binary_dir / "adx-execd"
     # Native Linux release builder supplies the EROFS payload. Debug/native macOS
     # packages retain binary-only development support.
@@ -50,6 +53,13 @@ def assemble(binary_dir, redis, redis_cli, wheel, output, commit, dirty, target,
     for path in (ROOT / "build/config/examples").iterdir():
         if path.is_file():
             inputs[f"etc/examples/{path.name}"] = path
+    if with_afs:
+        for path in (ROOT / "build/config/examples/afs").iterdir():
+            if path.is_file():
+                inputs[f"etc/examples/afs/{path.name}"] = path
+        for path in (ROOT / "docs/migration/licenses/afs-source").iterdir():
+            if path.is_file():
+                inputs[f"third_party/afs-source/{path.name}"] = path
     for component in ("redis", "sandboxd"):
         for name in ("source.json", "LICENSE"):
             inputs[f"third_party/{component}/{name}"] = ROOT / "third_party" / component / name
@@ -86,6 +96,8 @@ def assemble(binary_dir, redis, redis_cli, wheel, output, commit, dirty, target,
             "redis_version": "7.2.5",
             "files": {name: sha(stage / name) for name in sorted(inputs)},
         }
+        if with_afs:
+            manifest["with_afs"] = True
         (stage / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
         stage.rename(output)
     verify(output)
@@ -96,6 +108,10 @@ def verify(directory):
     manifest = json.loads((directory / "manifest.json").read_text())
     if manifest.get("schema_version") != 1 or not isinstance(manifest.get("files"), dict):
         raise ValueError("invalid package manifest")
+    if "with_dfs" in manifest:
+        raise ValueError("legacy with_dfs manifest; rebuild with --with-afs")
+    if "with_afs" in manifest and not isinstance(manifest["with_afs"], bool):
+        raise ValueError("with_afs must be a boolean")
     expected = set(manifest["files"])
     required = {f"bin/{b}" for b in BINARIES} | {
         "bin/redis-server",
@@ -105,6 +121,15 @@ def verify(directory):
     }
     if manifest.get("profile") == "release" and "linux" in manifest.get("target", ""):
         required.add("runtime/adx-runtime-rootfs.img")
+    if manifest.get("with_afs") is True:
+        required.update({f"bin/{name}" for name in AFS_BINARIES})
+        required.update({"etc/examples/afs/meta.toml", "etc/examples/afs/node.toml"})
+        required.update({"third_party/afs-source/LICENSE", "third_party/afs-source/NOTICE"})
+    else:
+        forbidden = {f"bin/{name}" for name in AFS_BINARIES}
+        forbidden.update(path for path in expected if path.startswith("etc/examples/afs/"))
+        if forbidden & expected:
+            raise ValueError("AFS artifacts are present in a default package")
     if not required.issubset(expected) or not any(
         n.startswith("sdk/adx_sandbox-") and n.endswith(".whl") for n in expected
     ):
@@ -132,6 +157,7 @@ def main():
         p.add_argument("--" + arg, type=Path, required=True)
     p.add_argument("--target", required=True)
     p.add_argument("--profile", choices=("debug", "release"), required=True)
+    p.add_argument("--with-afs", action="store_true", help="include OwnerFs and DistributedFs binaries")
     v = sub.add_parser("verify")
     v.add_argument("directory", type=Path)
     args = parser.parse_args()
@@ -156,6 +182,7 @@ def main():
             dirty,
             args.target,
             args.profile,
+            args.with_afs,
         )
     print("package verified")
 

@@ -356,15 +356,29 @@ async fn adxlet_creation_and_event_driven_checkpoint_wait_for_state_publication(
         .is_none());
     assert!(!caller.is_finished());
     let current = node.clone();
-    let handling = tokio::spawn(async move { current.observe_runtime_event(&event).await });
-    tokio::time::timeout(
-        Duration::from_secs(2),
-        publication.checkpoint_entered.acquire(),
-    )
-    .await
-    .unwrap()
-    .unwrap()
-    .forget();
+    let mut handling = tokio::spawn(async move { current.observe_runtime_event(&event).await });
+    // Preserve the publication deadline, but report an early lifecycle failure
+    // instead of hiding it behind a semaphore timeout.
+    let publication_entry = tokio::select! {
+        result = &mut handling => panic!("checkpoint handling finished before publication: {result:?}"),
+        result = tokio::time::timeout(
+            Duration::from_secs(2),
+            publication.checkpoint_entered.acquire(),
+        ) => result,
+    };
+    publication_entry
+        .unwrap_or_else(|error| {
+            let process = runtime.process.lock().unwrap();
+            let log = process
+                .as_ref()
+                .map(|process| std::fs::read_to_string(process.temp.path().join("execd.log")));
+            panic!(
+                "checkpoint publication deadline: {error}; observed={:?}; execd={log:?}",
+                test.hub.observed(&identity())
+            );
+        })
+        .unwrap()
+        .forget();
     assert!(
         !caller.is_finished(),
         "backend resume is not durable completion"
