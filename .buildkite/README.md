@@ -74,6 +74,8 @@ With `ADX_WITH_AFS=1`, each architecture also waits for its AFS component and
 the shared AFS gate; component manifests, package assembly and publication
 verification use the same `--with-afs` contract. This does not change ARM
 backend policy (`backend: null`) or the default OFF package.
+AFS durability regressions require `strace` and child-process tracing in the
+public Rust build image; the image verifier checks this before compilation.
 ARM uses an `os=macos, arch=arm64` worker with Docker to execute native Linux ARM64.
 The current ARM pool uses one `adx/native-arm64` concurrency slot to protect
 worker checkout and Docker cache ownership; the x86 flow advances independently.

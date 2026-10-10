@@ -167,3 +167,9 @@ Linux aarch64／Python3.12.3精确受测tree `7e05e7128dd1abbf4e667cfc0513e45598
 Linux精确受测tree `b9ae4c47ca64142839ea5c0649c7138a90187117`：20模块284项，281通过／3项因非root跳过；sudo补跑DFS manyread模块25项全部通过。最终工具tree `a927f2b49c3f41f01dde8f5378dd89e84b135de8`：新增Moose负例先失败后通过，受影响Owner写／DFS模块33项全部通过，覆盖上述3个root-only项。CLI、缺候选身份／缺输入拒绝、shell语法及文档检查通过；最后只追加本文并复核文档。未修改Rust／Cargo／公共构建发布入口／第三方，未新增产品运行、完整POSIX或性能结论；G1历史8/8保持关闭。
 
 `EV-MR-PORTABILITY` 保存原件、路径／SHA映射、恢复核对和原失败。Linux原始日志 `afs-mr-portability-linux-evidence-v2.tar` SHA-256 `c30a439b5eab976e6cabdec5f5c78e75ba1b36320d6c416387d9a3f43a933b14`，含候选tree、准入、命令及退出码；通用full verifier与3FS资格仍按现有计划后置。
+
+## 公共 Buildkite 验证边界
+
+固定提交 `e110e2101904e86494fb266fe77a414831e28c10` 的 [AFS OFF #130](https://buildkite.com/agent-dx/agent-dx/builds/130) 与 [AFS ON #131](https://buildkite.com/agent-dx/agent-dx/builds/131) 均失败。两轮 x86 Platform、Gateway、Execd、Source、adxadmin、Sandbox SDK 通过；AFS gate 失败，组包未执行。ON AFS 库测试609通过、6失败、22忽略：四项因公共镜像缺少 `strace`，两项因测试将 root 上下文误作普通用户。OFF 按条件跳过 AFS 组件构建，仍执行相关变更的 AFS gate。
+
+整改仅涉及公共镜像的必需追踪工具和测试身份；保留生产权限、同步错误传播及持久屏障行为，不删除失败检查。镜像通过既有维护流程构建、推送、回拉验证后才更新固定摘要，新提交另行验收。ARM 在准备 `ADX_SWR_PULL_CONFIG` 时访问被拒，未进入编译，按已接受的范围暂缓；不修改公共凭据策略。上述轮次关闭 OBS／PyPI 最终发布，使用 Buildkite 传递产物，失败记录保持原版本结论。该 CI 缺口不重开阶段一历史8/8，也不改变既有包的限定运行结论。
