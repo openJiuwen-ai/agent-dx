@@ -252,7 +252,6 @@ async fn supervisor_drains_rotated_logs_on_stop() {
     deployment.logging.enabled = true;
     deployment.logging.max_file_bytes = 64;
     deployment.logging.max_files = 100;
-    deployment.stop_timeout_seconds = 5;
     let state_directory = deployment.state_dir.clone();
     let supervisor_task = tokio::spawn(supervisor::run(deployment));
     wait_until_ready(&state_directory).await;

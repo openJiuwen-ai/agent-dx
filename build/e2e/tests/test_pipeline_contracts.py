@@ -115,6 +115,7 @@ class PipelineContracts(unittest.TestCase):
             cargo.write_text('#!/bin/sh\nprintf "threads=%s\\n" "$RUST_TEST_THREADS"\n')
             cargo.chmod(0o755)
             env = dict(os.environ, PATH=tmp + os.pathsep + os.environ['PATH'])
+            env.pop('RUST_TEST_THREADS', None)
             for group in ('platform', 'execd'):
                 result = subprocess.run(
                     [_executable('bash', environment=env), str(ROOT / '.buildkite/component-tests.sh'), group],
