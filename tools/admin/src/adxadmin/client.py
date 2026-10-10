@@ -8,6 +8,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 import httpx
+from typing_extensions import Self
 
 from .errors import ApiError, InvalidInput
 
@@ -22,6 +23,7 @@ class ClientOptions:
     timeout_seconds: float = 30.0
     ca_file: str | None = None
     allow_loopback_http: bool = False
+    verify_tls: bool = False
 
 
 class AdminClient:
@@ -39,12 +41,12 @@ class AdminClient:
         self._client = httpx.Client(
             base_url=self._endpoint,
             timeout=options.timeout_seconds,
-            verify=options.ca_file or True,
+            verify=options.ca_file or options.verify_tls,
             follow_redirects=False,
             transport=transport,
         )
 
-    def __enter__(self) -> "AdminClient":
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *_unused: object) -> None:

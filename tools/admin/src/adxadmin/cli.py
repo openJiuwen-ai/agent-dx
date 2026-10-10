@@ -4,9 +4,12 @@ import argparse
 import json
 import os
 import sys
+import unicodedata
+from collections.abc import Mapping, Sequence
+from datetime import datetime, timezone
 from importlib import metadata
 from pathlib import Path
-from typing import Mapping, Sequence, TextIO
+from typing import TextIO
 
 from .client import AdminClient, ClientOptions
 from .credentials import read_token, write_secret
@@ -15,8 +18,12 @@ from .errors import AdminError
 
 def build_parser(environ: Mapping[str, str] | None = None) -> argparse.ArgumentParser:
     values = os.environ if environ is None else environ
-    parser = argparse.ArgumentParser(prog="adxadmin", description="Administer a remote ADX cluster")
-    parser.add_argument("--version", action="version", version=f"adxadmin {_package_version()}")
+    parser = argparse.ArgumentParser(
+        prog="adxadmin", description="Administer a remote ADX cluster"
+    )
+    parser.add_argument(
+        "--version", action="version", version=f"adxadmin {_package_version()}"
+    )
     parser.add_argument(
         "--endpoint",
         default=values.get("ADX_ENDPOINT"),
@@ -35,6 +42,11 @@ def build_parser(environ: Mapping[str, str] | None = None) -> argparse.ArgumentP
         default=values.get("ADX_ADMIN_TOKEN_FILE"),
         required="ADX_ADMIN_TOKEN_FILE" not in values,
         help="administrator API Key file (env: ADX_ADMIN_TOKEN_FILE)",
+    )
+    parser.add_argument(
+        "--verify-tls",
+        action="store_true",
+        help="verify the HTTPS certificate using system CAs; --ca also enables verification",
     )
     parser.add_argument(
         "--output",
@@ -82,13 +94,17 @@ def run(
         timeout_seconds=options.timeout_seconds,
         ca_file=options.ca_file,
         allow_loopback_http=options.allow_loopback_http,
+        verify_tls=options.verify_tls,
     )
     with AdminClient(client_options) as client:
         if options.key_command == "create":
             created = client.create_key(options.tenant, options.expires_at)
             if options.output_file:
                 write_secret(options.output_file, created["apiKey"])
-                created = {"key": created["key"], "outputFile": str(options.output_file)}
+                created = {
+                    "key": created["key"],
+                    "outputFile": str(options.output_file),
+                }
             _print_created(created, options.output, stdout)
         elif options.key_command == "list":
             page = client.list_keys(
@@ -118,12 +134,7 @@ def _print_created(value: dict, output: str, stream: TextIO) -> None:
     if output == "json":
         _print(value, output, stream)
         return
-    key = value["key"]
-    print("ID\tTENANT\tEXPIRES_AT", file=stream)
-    print(
-        f"{key['id']}\t{key['tenantId']}\t{_expiry(key['expiresAtUnixSeconds'])}",
-        file=stream,
-    )
+    _print_key_table([value["key"]], stream)
     if "apiKey" in value:
         print(f"API_KEY\t{value['apiKey']}", file=stream)
     elif "outputFile" in value:
@@ -134,14 +145,35 @@ def _print_page(value: dict, output: str, stream: TextIO) -> None:
     if output == "json":
         _print(value, output, stream)
         return
-    print("ID\tTENANT\tEXPIRES_AT", file=stream)
-    for key in value["items"]:
-        print(
-            f"{key['id']}\t{key['tenantId']}\t{_expiry(key['expiresAtUnixSeconds'])}",
-            file=stream,
-        )
+    _print_key_table(value["items"], stream)
     if value["nextPageToken"]:
         print(f"NEXT_PAGE_TOKEN\t{value['nextPageToken']}", file=stream)
+
+
+def _display_width(value: str) -> int:
+    return sum(
+        0
+        if unicodedata.combining(char)
+        else 2
+        if unicodedata.east_asian_width(char) in ("W", "F")
+        else 1
+        for char in value
+    )
+
+
+def _print_key_table(keys: Sequence[dict], stream: TextIO) -> None:
+    rows = [["ID", "TENANT", "EXPIRES_AT"]]
+    rows.extend(
+        [key["id"], key["tenantId"], _expiry(key["expiresAtUnixSeconds"])]
+        for key in keys
+    )
+    widths = [max(_display_width(row[column]) for row in rows) for column in range(3)]
+    for row in rows:
+        cells = [
+            row[index] + " " * (widths[index] - _display_width(row[index]))
+            for index in range(2)
+        ]
+        print("  ".join([*cells, row[2]]), file=stream)
 
 
 def _print(value: dict, output: str, stream: TextIO) -> None:
@@ -153,7 +185,16 @@ def _print(value: dict, output: str, stream: TextIO) -> None:
 
 
 def _expiry(value: int) -> str:
-    return "never" if value == 0 else str(value)
+    if value == 0:
+        return "never"
+    try:
+        return (
+            datetime.fromtimestamp(value, timezone.utc)
+            .astimezone()
+            .isoformat(sep=" ", timespec="seconds")
+        )
+    except (OverflowError, OSError, ValueError):
+        return f"{value} (outside date range)"
 
 
 def _package_version() -> str:

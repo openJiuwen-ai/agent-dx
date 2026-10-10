@@ -68,6 +68,18 @@ Windows 不使用 POSIX mode；管理员需要通过用户 ACL 保护该文件�
 密码、路径、查询参数或 fragment 的 endpoint。仅本机测试可显式使用
 `--allow-loopback-http` 访问 `http://localhost` 或回环 IP；远端明文 HTTP 始终被拒绝。
 
+默认跳过 HTTPS 证书链和主机名校验，可以直接访问 IP，无需 CA 文件：
+
+```sh
+adxadmin --endpoint https://113.44.226.187 \
+  --token-file ~/.config/adx/cn-north-4/admin.key \
+  key list --tenant default
+```
+
+HTTPS 加密和管理员 API Key 鉴权保持启用；远端明文 HTTP 仍被拒绝。
+默认模式不验证服务器身份。需要校验时，使用 `--verify-tls` 信任系统 CA，
+或通过 `--ca` / `ADX_CA_FILE` 指定 CA 文件；指定 CA 文件会自动开启证书校验。
+
 ## 租户 Key
 
 创建不过期的租户 Key。明文只在本次响应中出现：
@@ -104,6 +116,11 @@ adxadmin key list --tenant team-a --page-size 100
 adxadmin key list --page-token <previous-next-page-token>
 adxadmin --output json key list --tenant team-a
 ```
+
+表格按终端显示宽度对齐列，创建和列表输出中的到期时间使用当前机器的本地时区，
+并包含 UTC 偏移，例如 `2026-11-09 16:25:20+08:00`；不过期显示 `never`。
+`--expires-at` 输入和 `--output json` 的 `expiresAtUnixSeconds` 仍使用 Unix 秒，
+便于脚本处理。超出系统日期表示范围的值保留数字并标注 `outside date range`。
 
 列表只包含摘要 ID、租户和到期时间，不包含 Key 明文。使用摘要 ID 吊销：
 
