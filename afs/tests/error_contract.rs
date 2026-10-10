@@ -44,6 +44,7 @@ async fn tcp_peer_and_local_sdk_preserve_identical_storage_identity() {
         mode: DataMode::Grpc,
         rdma_device: None,
         timeout: Duration::from_secs(2),
+        tls: Default::default(),
     })
     .await
     .unwrap();

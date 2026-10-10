@@ -556,7 +556,8 @@ impl Config {
     }
 
     /// gRPC builders共用安全配置；只有配置了完整证书集合才启用 mTLS。
-    /// OwnerFiles 远端业务还要求 `trusted_node_certs` 与证书身份匹配。
+    /// Meta authority and node-to-node filesystem RPCs also require
+    /// `trusted_node_certs` to bind a verified certificate to one Node ID.
     pub fn tls_config(&self) -> afs_transport::grpc::TlsConfig {
         match (
             &self.tls_ca_certificate,

@@ -1,6 +1,6 @@
 # AFS E2E 工具（OwnerFs / DFS）
 
-本目录承载从 DMS/AFS 快照迁入 Agent DX 的可维护验收工具。它不是历史证据归档，也不是产品发布包的一部分。
+本目录承载 Agent DX AFS 的可维护验收工具。它不是历史证据归档，也不是产品发布包的一部分；来源映射仅在文末供追溯。
 
 ## 范围
 
@@ -23,6 +23,11 @@
 - 本机 Lima YAML、IP/MAC 租约、实际运行 lock 和旧阶段专用驱动不作为仓内公共配置；原件、失败记录和路径/校验和索引在开发者源码树外归档，并可从整改前 Git 版本追溯。
 - `runner.py --list` 不需要环境；执行必须显式提供 `--lock /path/to/run/acceptance.lock.json`。无机器身份的 `acceptance/acceptance.lock.example.json` 只说明结构，不能直接形成正式 PASS。
 - 旧实验室原始观测和紧耦合判定器已归档仓外；保留底层参数化探针及合成负例。通用完整 ENV verifier 未实现，full 明确 BLOCKED，不因移出历史工具放行。
+- 旧 `workspace-bind-recovery-linux.py` 依赖未迁入的
+  `workspace-bind-epoch-linux.py`、`afs-processctl` 和历史 `r2/` 状态，已从当前入口移除；
+  它仍可从迁移提交历史追溯。其“物理 Home inode/权限不变、重启后会话 epoch
+  前进”的有效断言已并入维护中的 `bind-two-node-localfile.py`，由目标仓二进制、
+  临时配置和 mTLS 材料执行。
 - 跨节点锁、锁取消、bind/native↔FUSE 锁域及 RDMA 专题工具保留为后置研究/回归资产，不是本次迁移的前置，也不证明这些能力受支持。本机 ext4 锁成功不能代替分布式锁验收。
 - 旧 W1/W2/S5 批次诊断及旧并发判定器退出当前入口。维护中的 `owner_remote_small.py`、`owner_remote_write_small.py` 等测量工具继续保留；工具输出不自动满足吞吐与独立操作时延双目标。
 
@@ -42,7 +47,7 @@ python3 build/e2e/afs/scripts/ownerfs/bind-two-node-localfile.py --help
 
 ### OwnerFs workspace bind ON 两节点 local-file 验证
 
-该入口用于迁移后最小真实运行核对：在一台 Linux VM 上启动 `afs-meta`、`node-a`、`node-b`，使用 local-file Meta 和 mTLS，先通过 FUSE 创建 Home workspace，再对 `node-a` 开启 OwnerFs workspace bind mount，验证本地 bind 与远端 FUSE 的读写、权限、错误传播、正常停止、local-file Meta 重启恢复和卸载排空。它不声明性能达标，也不声明跨节点锁能力。
+该入口用于当前候选的最小真实运行核对：在一台 Linux VM 上启动 `afs-meta`、`node-a`、`node-b`，使用 local-file Meta 和 mTLS，先通过 FUSE 创建 Home workspace，再对 `node-a` 开启 OwnerFs workspace bind mount，验证本地 bind 与远端 FUSE 的读写、权限、错误传播、正常停止、local-file Meta 重启恢复和卸载排空。它不声明性能达标，也不声明跨节点锁能力。
 
 运行前需先在 Linux 上构建目标二进制，例如：
 

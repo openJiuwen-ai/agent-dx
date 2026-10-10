@@ -312,6 +312,21 @@ workspace = "{WORKSPACE}"
             time.sleep(0.1)
         raise AssertionError((name, "not healthy", last_error))
 
+    def health(self, name: str) -> dict:
+        ip, port = {
+            "meta": (META_IP, META_REST),
+            "node-a": (NODE_A_IP, NODE_REST),
+            "node-b": (NODE_B_IP, NODE_REST),
+        }[name]
+        conn = http.client.HTTPConnection(ip, port, timeout=2)
+        conn.request("GET", "/health")
+        response = conn.getresponse()
+        body = response.read().decode("utf-8", errors="replace")
+        conn.close()
+        ready, detail = health_ready(response.status, body)
+        self.check(f"{name} health snapshot ready", ready, detail)
+        return detail["body"]
+
     def stop(self, name: str) -> None:
         proc = self.processes[name]
         proc.terminate()
@@ -421,11 +436,60 @@ workspace = "{WORKSPACE}"
             for folder in [home, remote]:
                 self.user("f=os.open(sys.argv[1],os.O_RDONLY|os.O_DIRECTORY);os.fsync(f);os.close(f)", folder)
 
+            physical_identity = (
+                physical[0].stat().st_dev,
+                physical[0].stat().st_ino,
+            )
+            proof = home / "cross.bin"
+            proof_stat = proof.stat()
+            proof_identity = (
+                proof_stat.st_dev,
+                proof_stat.st_ino,
+                proof_stat.st_uid,
+                proof_stat.st_gid,
+                proof_stat.st_mode & 0o7777,
+                proof_stat.st_size,
+            )
+            registration_before = self.health("node-a")["checks"]["node_registration"]
             self.stop("node-b")
             self.stop("node-a")
             self.stop("meta")
             for name in ["meta", "node-a", "node-b"]:
                 self.start(name)
+            recovered_physical = list(
+                (self.root / "node-a/state/ownerfs").glob("root-776f726b7370616365-e*")
+            )
+            self.check(
+                "restart preserves one physical Home inode",
+                len(recovered_physical) == 1
+                and (
+                    recovered_physical[0].stat().st_dev,
+                    recovered_physical[0].stat().st_ino,
+                )
+                == physical_identity,
+                [str(path) for path in recovered_physical],
+            )
+            recovered_stat = proof.stat()
+            self.check(
+                "restart preserves proof inode ownership mode and size",
+                (
+                    recovered_stat.st_dev,
+                    recovered_stat.st_ino,
+                    recovered_stat.st_uid,
+                    recovered_stat.st_gid,
+                    recovered_stat.st_mode & 0o7777,
+                    recovered_stat.st_size,
+                )
+                == proof_identity,
+                proof_identity,
+            )
+            registration_after = self.health("node-a")["checks"]["node_registration"]
+            self.check(
+                "restart establishes a fresh higher registration epoch",
+                registration_after["session_id"] != registration_before["session_id"]
+                and registration_after["lease_epoch"] > registration_before["lease_epoch"],
+                {"before": registration_before, "after": registration_after},
+            )
             self.read_payload(home / "cross.bin", last_reverse)
             self.read_payload(remote / "cross.bin", last_reverse)
             self.user("os.unlink(sys.argv[1]);d=os.open(sys.argv[2],os.O_RDONLY|os.O_DIRECTORY);os.fsync(d);os.close(d)", remote / "cross.bin", remote)

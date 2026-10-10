@@ -181,7 +181,7 @@ PYTHONPATH=platform/sdk/sandbox/python \
 make package PYTHON=/path/to/venv/bin/python
 ```
 
-Agent FS（AFS） 是从 DMS/AFS 快照迁入的可选文件系统组件。默认构建、测试和发布包不包含它的运行二进制，也不引入它的系统依赖。AFS 相关变更仍会触发专用 CI gate；该 gate 使用 `ADX_WITH_AFS=1` 做检查，但不会把 AFS artifact 注入默认发布包。本地运行文件系统 gate 或构建显式带文件系统的包时设置 `ADX_WITH_AFS=1`：
+Agent FS（AFS）由 OwnerFs 与 DistributedFs（DFS）组成，是 ADX 的可选文件系统子系统。默认构建、测试和发布包不包含它的运行二进制，也不引入它的系统依赖。共享 source gate 只在显式设置 `ADX_WITH_AFS=1` 时纳入 AFS 检查，并且不会把 AFS artifact 注入默认发布包。本地运行文件系统 gate 或构建显式带文件系统的包时设置 `ADX_WITH_AFS=1`：
 
 ```sh
 ADX_WITH_AFS=1 make afs-check
@@ -191,7 +191,7 @@ python3 build/ci/run.py afs
 
 `afs-check` 使用默认 OwnerFs 和 DFS feature。可选 all-features/RDMA lint 必须显式执行（`ADX_AFS_ALL_FEATURES=1 make afs-lint`），并先检查 `libibverbs` 开发文件。
 
-当前文件系统范围、验收边界和未支持项见 [AFS 迁移计划](docs/development/afs-plan.md)、[架构边界](docs/architecture/afs.md)、[部署说明](docs/deployment/afs.md) 和 [测试验收](docs/testing/afs.md)。发布包配置示例位于 [AFS 示例目录](build/config/examples/afs/)。
+子系统职责、当前范围和真实限制见 [架构边界](docs/architecture/afs.md)、[部署说明](docs/deployment/afs.md)、[测试验收](docs/testing/afs.md)和 [AFS 演进计划](docs/development/afs-plan.md)。来源与带日期的历史证据保留在 `docs/migration/`；它们不定义当前运行合同。发布包配置示例位于 [AFS 示例目录](build/config/examples/afs/)。
 
 组件与集成测试使用 `python3 build/ci/run.py <suite>`。端到端门禁使用已安装发布包、公开 Sandbox SDK、Redis、Gateway、控制面、sandboxd 和 Execd。环境要求与门禁定义见[控制面 CI](docs/testing/control-plane-ci.md)和 [Kubernetes E2E 指南](build/e2e/kubernetes/README.md)。
 

@@ -12,6 +12,9 @@ Agent FS（AFS） 是 Agent DX 的可选文件系统组件。默认部署配置�
 - Agent FS（AFS） 专用端口、数据目录、挂载点或探针程序
 
 显式文件系统包必须在 `manifest.json` 中记录 `with_afs: true`，并包含 `afs-meta`、`afs-node` 和 `etc/examples/afs/*` 的摘要。测试辅助程序只由验收流程按需构建和放入测试环境，不加入普通试用包。
+组包完成后的校验与安装前／暂存后的校验共用随包
+`lib/package_manifest.py` 合同；AFS ON、默认 OFF、旧 `with_dfs`、文件清单、摘要和
+主机架构不会由两份独立规则分别解释。
 
 ## 配置示例
 
@@ -26,16 +29,34 @@ Meta 后端优先级：
 
 当前试用建议使用 `local-file`。发布包内 `etc/examples/afs/meta.toml` 已显式设置 `meta_store = "local-file"`，并把 Meta 状态放在 `/opt/adx/data/afs/meta`，避免因代码默认值误连 etcd。使用 `memory` 时，验收报告必须明确“Meta 重启后不保留状态”。
 
-单机试用前先准备配置、数据、运行时和挂载目录：
+单机试用前先准备配置、数据、运行时、挂载目录和本机临时证书：
 
 ```sh
 sudo install -d -m 0755 /opt/adx/config/afs /opt/adx/run/afs /mnt/adx/ownerfs /mnt/adx/dfs
 sudo install -d -m 0700 /opt/adx/data/afs/meta /opt/adx/data/afs/node-a
 sudo cp /opt/adx/current/etc/examples/afs/meta.toml /opt/adx/config/afs/meta.toml
 sudo cp /opt/adx/current/etc/examples/afs/node.toml /opt/adx/config/afs/node.toml
+sudo /opt/adx/current/etc/examples/afs/prepare-local-tls.sh
+sudo cp /opt/adx/current/etc/examples/afs/deployment-ownerfs-local.yaml \
+  /opt/adx/config/deployment.yaml
+sudo adxctl validate
 ```
 
-示例 Node 配置使用 `/opt/adx/data/afs/node-a` 和 `/opt/adx/run/afs/node-a.sock`。如果启用 FUSE 挂载，先确认 `/mnt/adx/ownerfs` 与 `/mnt/adx/dfs` 为空目录，再在 `node.toml` 中启用对应 `ownerfs_mount` 或 `dfs_mount`。
+证书脚本只创建 30 天有效的本机隔离试用 CA、Meta 和 `node-a` 身份，并在已有
+任一目标文件时拒绝覆盖；它不分发固定私钥，也不适用于生产或多主机扩容。生产部署
+必须由自己的 CA 为每个 Node 签发独立身份，并在 Meta 和 peer 的
+`trusted_node_certs` 中把证书精确映射到该 Node ID。不要复制 Node 私钥到其他主机。
+
+示例 Node 配置使用 mTLS `https://` endpoint、`/opt/adx/data/afs/node-a` 和
+`/opt/adx/run/afs/node-a.sock`。前台运行 `sudo adxctl run` 后，在另一终端用
+`sudo adxctl status` 检查 Meta 与 Node 都返回 `status=ready`，并用
+`sudo adxctl stop` 正常停止。Supervisor 按 Meta→Node 排序启动；Node 在尚未挂载或
+暴露本地 API 前对首次 Meta 注册做有界、可取消重试。预算耗尽、证书/身份拒绝或运行后
+心跳/排空失败仍然失败关闭，不会无限重试或盲目重启。
+
+如果启用 FUSE 挂载，先确认 `/mnt/adx/ownerfs` 与 `/mnt/adx/dfs` 为空目录，再在
+`node.toml` 中启用对应 `ownerfs_mount` 或 `dfs_mount`。挂载所有者捕获的 canonical
+path、mount ID 和 source 同时作为 readiness 身份；挂载被替换时健康检查继续失败关闭。
 
 ## OwnerFs workspace bind ON
 

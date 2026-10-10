@@ -1,6 +1,9 @@
 # Agent FS（AFS） 架构边界
 
-Agent FS（AFS） 是从 DMS/AFS 快照迁入的可选文件系统组件。它位于根级 `afs/`，只在显式设置 `ADX_WITH_AFS=1` 时进入文件系统专用构建、测试、带组件发布包和部署入口；默认 Agent DX 构建、包和部署不包含 `afs-meta`、`afs-node` 或 FUSE 专属系统依赖。
+Agent FS（AFS） 是 Agent DX 的可选文件系统子系统。它位于根级 `afs/`，
+只在显式设置 `ADX_WITH_AFS=1` 时进入文件系统专用构建、测试、带组件发布包
+和部署入口；默认 Agent DX 构建、包和部署不包含 `afs-meta`、`afs-node`
+或 FUSE 专属系统依赖。
 
 ## 组件职责
 
@@ -13,7 +16,9 @@ AFS 把用户可见的文件语义和文件字节搬运分开：
 | `afs/common/*` | AFS 域内共享的错误、日志、指标、协议、追踪和传输 crate |
 | `afs/client` | DFS 客户端 crate；不作为 Agent DX 平台内部 RPC 适配层 |
 
-`afs/common/*` 是 AFS 域内绑定，不纳入 Agent DX 根级产品基础设施。Agent DX 平台内部 gRPC 仍按 Environment、Runtime、Snapshot、Route 和 Node 责任拆分；不得为了迁移 AFS 重新引入旧 POSIX/Frontend 适配器到 Platform 内部 RPC。
+`afs/common/*` 是 AFS 域内共享层，不纳入 Agent DX 根级产品基础设施。
+Agent DX 平台内部 gRPC 仍按 Environment、Runtime、Snapshot、Route 和 Node
+责任拆分；AFS 不把 POSIX/Frontend 适配器接入 Platform 内部 RPC。
 
 ## Meta 与数据路径
 
@@ -23,6 +28,12 @@ OwnerFs 面向小规模 Agent workspace。Home 节点把 workspace 保存为普�
 
 DFS 把已提交数据表示为不可变 chunk。普通写入先进入 inode 的 dirty 状态；sync、同步写标志、close-time flush 或后台策略触发提交，形成新的 `FileVersion`。复制发生在文件布局之下，Meta 只在收到可验证持久 receipt 后提交新版本和副本目录。验证缓存不能自动算作持久副本。
 
+所有启用 OwnerFs 或 DFS 权威能力的 Meta 都要求 mTLS 和
+`trusted_node_certs`。CA 只证明证书链可信；Meta 还把握手得到的叶证书 DER 精确
+映射到一个 Node ID，并校验 RPC 中声明的 caller／holder／owner 身份。DFS-only
+部署与 OwnerFs 部署执行同一身份绑定，不能用另一张同 CA 证书冒充目标 Node。
+Node 的 Meta、peer control 和 data 诊断请求复用生产 TLS 配置，诊断不建立明文旁路。
+
 ## OwnerFs workspace bind mount
 
 OwnerFs workspace bind mount 是当前实际试用场景的优先能力，默认 OFF。开启后，它把 Home 上 workspace 的底层真实目录 bind 到 OwnerFs FUSE 根目录下对应的一级目录，例如 `/mnt/afs/ownerfs/agent1`。把 FUSE 目录自身 bind 到别处不满足此设计。
@@ -31,6 +42,9 @@ OwnerFs workspace bind mount 是当前实际试用场景的优先能力，默认
 
 ## 后置能力
 
-本次 MR 不以前置完成以下能力：完整 POSIX、复杂可靠性、多 Meta、高可用、etcd/Redis 后端验收、大规模长时间运行、RDMA 性能专项、跨节点 `fcntl/flock`、阻塞锁等待取消、bind/native 与远端 FUSE 锁域协同。bind 本机 ext4 锁和单挂载内核回退不能宣传为分布式锁。
+当前不承诺以下能力：完整 POSIX、复杂可靠性、多 Meta、高可用、etcd/Redis
+后端验收、大规模长时间运行、RDMA 性能专项、跨节点 `fcntl/flock`、阻塞锁
+等待取消、bind/native 与远端 FUSE 锁域协同。bind 本机 ext4 锁和单挂载
+内核回退不能宣传为分布式锁。
 
-支持范围、验证边界和性能目标见 [Agent FS（AFS） 迁移计划](../development/afs-plan.md)。
+支持范围、验证边界和性能目标见 [Agent FS（AFS） 演进计划](../development/afs-plan.md)。
