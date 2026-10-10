@@ -12,6 +12,10 @@ for flag in ADX_WITH_AFS ADX_ARM_TESTS ADX_OBS_UPLOAD ADX_ARM_OBS_UPLOAD ADX_ADM
   value=${!flag:-0}
   [[ $value == 0 || $value == 1 ]] || { echo "$flag must be 0 or 1" >&2; exit 2; }
 done
+if [[ ${ADX_ARM_BUILD:-1} != 0 && ${ADX_ARM_BUILD:-1} != 1 ]]; then
+  echo 'ADX_ARM_BUILD must be 0 or 1' >&2
+  exit 2
+fi
 case "${ADX_ARTIFACT_TRANSPORT:-obs}" in
   obs|buildkite) ;;
   *) echo 'ADX_ARTIFACT_TRANSPORT must be obs or buildkite' >&2; exit 2 ;;
