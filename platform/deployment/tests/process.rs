@@ -7,6 +7,7 @@ use serde_json::json;
 use std::{
     os::unix::fs::PermissionsExt,
     path::Path,
+    process::Command,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -19,9 +20,34 @@ fn test_deployment(root: &Path, services: serde_json::Value) -> Deployment {
 fn install_test_binary(root: &Path, name: &str, script: &str) {
     std::fs::create_dir_all(root.join("bin")).unwrap();
     let binary_path = root.join("bin").join(name);
-    std::fs::write(&binary_path, script).unwrap();
-    std::fs::set_permissions(binary_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let temporary_path = binary_path.with_extension(format!("tmp-{}", std::process::id()));
+    std::fs::write(&temporary_path, script).unwrap();
+    std::fs::set_permissions(&temporary_path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::rename(&temporary_path, binary_path).unwrap();
 }
+
+#[test]
+fn install_test_binary_replaces_busy_fixture_atomically() {
+    let temp_directory = tempfile::Builder::new()
+        .prefix("adx-busy-fixture-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let root = temp_directory.path();
+    install_test_binary(root, "adx-coordinator", "#!/bin/sh\nprintf old\n");
+    let _busy_old_inode = std::fs::OpenOptions::new()
+        .write(true)
+        .open(root.join("bin/adx-coordinator"))
+        .unwrap();
+
+    install_test_binary(root, "adx-coordinator", "#!/bin/sh\nprintf new\n");
+
+    let output = Command::new(root.join("bin/adx-coordinator"))
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"new");
+}
+
 async fn wait_until_ready(root: &Path) -> serde_json::Value {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -226,6 +252,7 @@ async fn supervisor_drains_rotated_logs_on_stop() {
     deployment.logging.enabled = true;
     deployment.logging.max_file_bytes = 64;
     deployment.logging.max_files = 100;
+    deployment.stop_timeout_seconds = 5;
     let state_directory = deployment.state_dir.clone();
     let supervisor_task = tokio::spawn(supervisor::run(deployment));
     wait_until_ready(&state_directory).await;
