@@ -1,0 +1,127 @@
+# Coordinator 路由发布与 Relay 同步
+
+2026-09-15。接通 Coordinator → Ingress 的路由发布与 adxlet → Relay 的完整绑定同步。Environment 生命周期仍由 adxlet 管理。
+
+## 模块和实际调用链
+
+| 模块 | 实现职责 |
+|---|---|
+| `coordinator/src/routes.rs` | 从已提交的 Redis 状态构造路由，共享一个发布视图，提供 mTLS 全量／增量流 |
+| `gateway/src/ingress/coordinator_routes.rs` | Redis 发现 Coordinator，订阅并校验路由版本，原子更新内存缓存；API Key 短时校验缓存 |
+| `gateway/src/ingress/resolver.rs` | 新入口只读本地缓存；缺失时最多等待 50 ms 的订阅增量，命中不查询 Coordinator／Redis |
+| `gateway/src/node/route_control.rs` | 本机完整绑定同步、准入开关、控制会话及实例版本校验、旧连接退役 |
+| `adxlet/src/routes.rs` | UDS 同步客户端，本机绑定目录，代理进程重启后的全量重放 |
+| `adxlet/src/reconciliation.rs` | Coordinator 权威目录对账与完整本机绑定同步的顺序协调 |
+
+```text
+adxlet → sandboxd 启动／Execd 就绪 → Relay 绑定确认
+             → Coordinator 提交 Running 到 Redis
+             → Coordinator RouteService 发布
+             → Ingress 更新内存缓存 → Relay 复核绑定 → 实例 TCP 端点
+
+Relay 重启 → 关闭准入 → adxlet 检测新 proxy_session_id
+               → BeginBindings → ReplaceBindings 完整校验 → 开放准入
+```
+
+只有已提交的 Running 记录、有效运行时地址和可路由节点才能进入发布视图。节点维护开关仅影响调度；节点不可达或实例退役则使路由退出视图。未写入集群存储的节点结果不会凭本地缓存发布给 Ingress。
+
+## 路由同步契约
+
+- 每条订阅流首先发送完整快照，此后增量携带 `epoch / base_revision / revision`。订阅和取得全量使用同一把发布视图锁，避免全量与增量之间漏事件。
+- Ingress 精确校验增量基线；版本缺口、倒退、错误执行身份或同版本不同快照都拒绝整帧，重新订阅全量。坏帧不修改已有缓存。
+- Coordinator 共享 64 帧广播缓冲，每个订阅另有 8 帧发送队列。慢订阅丢失增量后返回错误，重连获取全量。
+- 已同步 Ingress 断连时继续使用内存缓存；缺失路由返回暂不可用。Ingress 重启没有磁盘缓存，等待全量后就绪。Relay 始终复核本机绑定，已退役实例不能因 Ingress 缓存滞后重新接入。
+- stream-only 入口缓存命中立即转发；缓存缺失时先订阅变更，再重读目录，最多等待 50 ms 内对应路由的到达，避免创建提交与订阅增量之间的首请求竞态。无关增量不会满足该请求或延长截止时间；超时仍返回暂不可用。等待不调用 Coordinator 点查或 Redis，不增加 SDK 重试，也不改变后端转发超时。
+- Ingress 定期重查 Redis 的 Coordinator 地址和 epoch，发现变化后重新连接。Redis 发现失败不主动清空已有缓存。
+- Coordinator 在本进程确认 Redis 状态提交后，把 revision 和受影响的 Environment／节点字段写入有界内存变更流。发布任务以 10 ms 有界窗口合并相近提交，普通生命周期提交只读取发生变化的字段；首次启动、revision 断档、变更流溢出或无字段的控制头更新才重新读取完整 Redis 视图。节点心跳仅在地址、Relay 地址或可路由状态变化时重算该节点已有条目。每 200 ms 的周期任务只恢复已经标记为不可用的发布视图；健康视图不轮询 revision，也不支持绕过 Coordinator 直接修改控制 Hash。Ingress 先校验并转换完整增量帧，再只更新帧内 upsert/delete 对应的路由和订阅通知；未触碰路由不再复制，复杂度为 `O((U+D) log N)`。首次订阅及断档恢复的 reset 仍构造并一次替换完整缓存。
+- API Server 的节点目录同时携带 Node Manager 与 Relay 地址。本地优先创建成功且返回归属仍在入口节点时，API Server 直接用受信节点结果写入本机 Environment 目录，随后由版本流覆盖和推进；不再为每个成功创建强制调用 `GetEnvironment`。本地入口转交中心调度、目录尚无对应结果或结果不明时，才执行一次权威查询。
+
+## 本机同步与重启
+
+代理进程 UUID 标识一次 Relay 启动；`sync_epoch` 标识一次完整同步。`BeginBindings` 比较旧身份后推进 epoch，关闭准入，并退役已有流。`ReplaceBindings` 先校验全部条目，成功后才开放入口；相同快照重试可确认完成。
+
+增量绑定必须携带当前代理 UUID 和同步 epoch，再按实例归属 generation／绑定 revision 校验。退役保留版本记录；旧进程或旧同步的迟到激活无法复活实例。完整同步遗漏的旧绑定也保留退役记录。
+
+adxlet 持续运行而仅代理重启时，可直接重放本机内存目录。adxlet 自身重启则须先取得 Coordinator 权威目录，不能把不完整内存当作全量。完整对账会中断本机已有代理连接；同步失败时保持关闭，等待重试。这一流程不新增节点磁盘依赖。
+
+共进程和分进程均已装配同一 `RelayService`，两种模式都走 UDS 与同一绑定校验；见 [进程模式](relay-process-modes.md)。本页末尾的早期测试是分进程批次。
+
+## 认证与配置
+
+`RouteService` 只允许 `ingress` 组件证书；API Key 校验允许受信 API Server 和 Ingress。Coordinator 配置需要加入 Ingress DER 身份。Ingress 新入口不调用独立 IAM，也不读 etcd 路由。
+
+认证缓存只以密钥摘要索引，限制条目数和有效期；有效期取缓存 TTL 与密钥到期时间的较小值。Coordinator 不可用时只接受仍有效的缓存身份，新密钥无法校验。主动吊销最多受到缓存 TTL 的延迟影响。数据请求仍校验租户归属，端口转发也要求凭证。
+
+| 配置 | 用途 |
+|---|---|
+| `build/config/examples/coordinator.json` | Coordinator 的 `ingress` 证书身份 |
+| `build/config/examples/ingress-control.json` | Redis 地址／namespace、控制 RPC mTLS、发现周期、认证缓存预算 |
+| `ADX_INGRESS_CONTROL_CONFIG` | 指向 Ingress 控制连接配置文件 |
+| `ADX_DATA_PLANE_RELAY_ACTIVITY_UDS_DIR=/opt/adx/run/node` | Relay 本机控制 socket 目录，须限制目录访问权限 |
+| adxlet `proxy_socket=/opt/adx/run/node/route.sock` | 与上述目录一致 |
+
+Ingress 对外 TLS、Ingress → Relay 的网络／mTLS 配置继续单独设置。默认部署由 adxlet 内嵌 Proxy；显式 `proxy_mode=standalone` 才启动两个受管进程。旧的可选 etcd 库和历史测试脚本还未整体删除，历史脚本须适配新的启动契约后才能复用。
+
+## 验证范围
+
+`out/ci/route-publication/` 保存红灯、编译、单测和服务协作测试。新 RPC 用例使用真实 Redis、双向 TLS、gRPC 路由流、Relay H2 和实际 TCP 回显服务，覆盖：
+
+1. 错误组件身份不能订阅；错误／缺失 API Key 不能接入。
+2. 全量与同连接增量驱动 Ingress 缓存，真实数据流往返。
+3. Coordinator 端点停止后仍使用已同步路由和有效认证缓存。
+4. 本机退役先于 Ingress 删除路由时，代理拒绝新连接。
+5. Redis 发布新 Coordinator 地址／epoch 后，Ingress 重新获取全量，旧 Coordinator 无法继续刷新。
+
+本机测试另覆盖代理重启重放、完整同步之前禁止准入、坏快照原子拒绝，以及旧同步请求拒绝。Go 服务生成协议、单测、vet 和构建独立执行。
+
+这些测试使用 TCP 回显服务和测试运行时，未启动真实 sandboxd／Execd，也未构成公开 Sandbox SDK 创建—执行—删除的 Buildkite 验收。后续已完成统一进程装配、Node Activity、SQLite 降级、暂停/快照生命周期；基本 K8s 结果见 [Buildkite #21](2026-09-17-observability-k8s.md)，FC 结果见 [路线图](control-plane-roadmap.md)。
+
+## 本轮结果
+
+验证对象为 `refactor/monorepo-layout` 基准 `1e49d86f2123173a8f5358182ca294fab9a9b1e4` 上的未提交工作树。Rust／Redis／RPC 在 macOS ARM64 执行，Go 在 Linux ARM64 工具链容器测试并构建本机服务。
+
+| 检查 | 结果 | `out/ci/route-publication/` 证据 |
+|---|---|---|
+| Gateway、Coordinator、adxlet、Protocol | 174 通过、0 失败、12 默认忽略 | `rust-v6.log` |
+| 严格 Clippy，全部相关测试目标 | 通过 | `clippy-final.log` |
+| 最后一处等价 lint 修改后的 Gateway 协议矩阵 | 3 通过、0 忽略 | `gateway-final.log` |
+| Go 全包测试、vet、服务构建 | 206 通过，vet／构建通过 | `go-v3.log` |
+| 真实 Redis／mTLS／路由与 H2/TCP | 4 通过、0 忽略 | `rpc-v6/result.json` |
+| 启用 Go HTTP 服务的同一 RPC 套件 | 4 通过、0 忽略 | `frontend-v6/result.json` |
+| 真实 Redis 存储／发现恢复 | 7 通过、0 忽略 | `storage-v6/result.json` |
+
+默认忽略项不算通过；专用 Redis／RPC 用例由上面独立入口实际运行，性能基准未执行。API Server 表项复用了同一 RPC 套件，不能与 RPC 计数当成八个独立场景。源码、被执行的测试程序和服务制品 SHA256 记录于 `source-manifest.json`。中间失败日志保留，最终通过证据以上表为准。
+
+## 2026-09-25 提交触发发布补充验证
+
+在既有真实 Redis／mTLS／gRPC／Ingress 数据流用例中，将发布任务的周期恢复检查设为 10 秒，并要求一次已提交的实例修订在 1 秒内到达 Ingress 缓存。修改前该断言超时；改为提交事件触发后通过。通知由同一 Redis 存储连接的已确认 CAS、原子归属登记及节点失效写入产生，发布任务等待固定 10 ms 以合并相近提交。周期检查只在发布视图已不可用时从 Redis 全量恢复；健康视图仅消费提交事件。证据在 `out/ci/route-event-red-0925/target.log` 与 `out/ci/route-event-green-0925/target.log`。这项组件级验证不等同于真实双 worker 负载的可路由延迟分位验收；后者仍列于 `control-plane-remaining.json`。
+
+## 2026-09-27 创建热路径增量化
+
+创建性能调查发现，长期运行的测试 Redis 已保留 3,745 条 Deleted Environment，控制 Hash 约 15.3 MB。旧发布器在每个提交 revision 后执行 `HGETALL`，使无关历史记录进入创建热路径。新增真实 Redis/mTLS 回归先证明一次普通创建会增加 `HGETALL` 调用，随后要求创建和删除的目录增量均不增加该计数；完整 control-rpc 套件继续验证订阅游标和终态幂等。集群 P99 是否达到目标仍以新产物部署后的同负载 A/B 为准。
+
+## 2026-09-28 周期恢复与提交事件竞态
+
+Redis CAS 生效到进程内提交事件送达之间存在一个很短的窗口。旧周期检查若恰好落在该窗口，会看到 header revision 已推进，继而把一个普通创建误判为需要全量恢复；当 control Hash 保留数千条历史记录时，这次 `HGETALL` 会直接阻塞创建响应。当前契约是：健康发布视图不按 revision 轮询，只由 `ControlChange` 增量推进；广播滞后、增量处理失败或视图已不可用时才执行全量恢复。真实 Redis 回归覆盖“健康视图存在待处理提交时，周期恢复不得增加 `HGETALL` 调用次数”。
+
+创建性能门槛按单节点统计：C1 P99 小于 200 ms，C100 P99 不超过 1 s；只有并发超过 100 后才允许 P99 明显超过 1 s。最终结论以相同节点、相同运行时和相同历史目录条件下的集群复测为准。
+
+同一口径还要求显式记录调度 request 与运行时 limit。cn-north-4 的基线以 100m／128 MiB 做调度预留、以 1 CPU／2 GiB 作为 runtime cgroup 上限；把 limit 留为0会采用 request 作为默认上限，测到的是0.1 CPU下的 runsc 启动延迟，不能与该基线比较。健康 Coordinator 的内存目录在每次成功写入后同步，结果不明会先进入权威恢复，因此新本地 claim 只保留原子存储层的一次 `HMGET`，不再在同一全局状态锁内预读相同 Environment。
+
+## 2026-09-28 节点路由绑定并发化
+
+批量 claim 版本在同一 cn-north-4 节点完成了全部 128 次创建、路由和清理，但 C100 P99 仍为 2098.537 ms，没有达到 1 s 门槛。日志按 Environment ID 配对后，claim 到 Running 的中位数为 881.653 ms、P99 为 1392.032 ms。源码审计确认 `UdsRoutes` 在持有全节点共享锁时依次完成 UDS 建连、代理状态查询和绑定更新，使相互独立的 Environment 在路由阶段串行。
+
+当前热路径在本地目录锁内只校验版本、登记期望绑定并复制已确认的代理会话，随后并发发送各 Environment 的 `UpdateBinding`。代理会话失效时才进入串行恢复路径：重新同步完整本机目录，并在重试前确认该绑定没有被更高 revision 的退役操作替代。组件测试让 16 个更新同时阻塞在真实 UDS gRPC handler 内，证明独立绑定没有在客户端共享锁上排队；延迟 activation 与 proxy 重启回放用例继续看护 generation、revision 和会话隔离。集群性能结论仍须使用包含该修改的发布产物复测，不能由组件测试代替。
+
+## 2026-09-28 活跃目录墓碑清理
+
+同一节点 C100 创建在一次运行达到 P99 908.720 ms，但压力结束时 API Server 子进程触及 1 GiB cgroup 上限并由 supervisor 重启。集群 Redis 已积累约一万条历史 Environment；源码核对发现全量和增量发布都会把 `Deleted` 记录保留在 API Server 活跃归属目录。这既抬高稳定内存，也放大批量创建期间的目录复制和发布开销。
+
+当前发布与持久化使用同一个删除边界：删除提交原子移除 Redis 主目录完整记录，写入 10 分钟最小幂等回执，并发送 `EnvironmentDirectoryFrame.deleted`；Coordinator 启动时也会清理旧版本遗留的已删除记录。真实 Redis/mTLS 回归同时验证增量删除、重新订阅和新发布器全量恢复均不再携带该 ID，并继续要求创建和删除不触发健康视图的 `HGETALL`。修复后的 C1/C100/C128、API Server cgroup 峰值、子进程 PID 稳定性和残留清理仍须以新发布产物复测。
+
+## 2026-10-05 首请求订阅到达窗口
+
+路由契约先复现“创建已经提交，但匹配增量到达前首请求立即失败”。当前缓存缺失最多等待50ms内匹配路由，9项路由契约和48项Ingress单测通过；持续无关增量不延长截止时间，点查计数为0。
+
+在cn-north-4的`akernel-adx-test`临时加载包含该修复的合并API Server／Ingress二进制，实际`/proc/<pid>/exe` SHA256为`aef160483ad73c0dadd448fbdcebfb3c955eaae11975360659cc7a671b8151f4`。C1／C8／C32各三轮，共123次SDK创建后首次raw HTTP command全部200，驱动日志没有缓存缺失503或Broken pipe；首次命令耗时16.5–97.4ms。该样本验证此次首请求竞态，不能证明任意负载下永久没有503，仍不能替代创建性能P99验收。证据为本地`pr78-local-closure-20261004/attempt-019/cluster-closure-019.log`及`cluster-evidence.tar`。

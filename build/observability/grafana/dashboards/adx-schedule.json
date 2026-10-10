@@ -1,0 +1,2142 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "ADX scheduling and operations: allocation ledgers, disk, queues, health, logs and trace export. Actual node and sandbox resource usage belongs to their detail dashboards.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [
+    {
+      "title": "Schedule",
+      "type": "link",
+      "url": "/d/adx-schedule",
+      "includeVars": true,
+      "keepTime": true,
+      "targetBlank": false
+    },
+    {
+      "title": "Data Plane",
+      "type": "link",
+      "url": "/d/adx-data-plane",
+      "includeVars": true,
+      "keepTime": true,
+      "targetBlank": false
+    },
+    {
+      "title": "Process Resources",
+      "type": "link",
+      "url": "/d/adx-process-resources",
+      "includeVars": true,
+      "keepTime": true,
+      "targetBlank": false
+    },
+    {
+      "title": "Explore Requests",
+      "type": "link",
+      "url": "/explore?schemaVersion=1&panes=%7B%22a%22%3A%7B%22datasource%22%3A%22tempo%22%2C%22queries%22%3A%5B%7B%22refId%22%3A%22A%22%2C%22datasource%22%3A%7B%22type%22%3A%22tempo%22%2C%22uid%22%3A%22tempo%22%7D%2C%22queryType%22%3A%22traceql%22%2C%22query%22%3A%22%7B%20resource.adx_env%20%3D~%20%5C%22${adx_env:percentencode}%5C%22%20%26%26%20name%20%3D~%20%5C%22%5E%28GET%7CPOST%7CPUT%7CDELETE%7CPATCH%7CHEAD%7COPTIONS%7CCONNECT%7COTHER%29%20%2F.%2A%5C%22%20%26%26%20span.http.route%20%21%3D%20%5C%22%2Funmatched%5C%22%20%26%26%20name%20%21%3D%20%5C%22GET%20%2Fhealthz%5C%22%20%26%26%20name%20%21%3D%20%5C%22GET%20%2Fmetrics%5C%22%20%7D%20%7C%20select%28name%2C%20resource.service.name%2C%20span.http.response.status_code%2C%20span.rpc.method%29%22%2C%22tableType%22%3A%22spans%22%2C%22limit%22%3A50%2C%22spss%22%3A3%7D%5D%2C%22range%22%3A%7B%22from%22%3A%22now-6h%22%2C%22to%22%3A%22now%22%7D%7D%7D",
+      "includeVars": false,
+      "keepTime": false,
+      "targetBlank": false,
+      "tooltip": "Search spans by endpoint, component, response status and Execd operation in Explore; click a Span ID to inspect the full trace."
+    }
+  ],
+  "panels": [
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "yellow",
+                "value": 50
+              },
+              {
+                "color": "red",
+                "value": 100
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 6,
+        "h": 4
+      },
+      "id": 1,
+      "options": {
+        "minVizHeight": 75,
+        "minVizWidth": 75,
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showThresholdLabels": false,
+        "showThresholdMarkers": true,
+        "sizing": "auto",
+        "text": {}
+      },
+      "pluginVersion": "12.3.1",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(adx_coordinator_environments{adx_env=~\"$adx_env\",state=\"Running\"})",
+          "legendFormat": "Total Running Instances",
+          "refId": "A"
+        }
+      ],
+      "title": "Running Sandboxes",
+      "type": "gauge"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "x": 6,
+        "y": 0,
+        "w": 6,
+        "h": 4
+      },
+      "id": 2,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "percentChangeColorMode": "standard",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "text": {},
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "pluginVersion": "12.3.1",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "count((adx_coordinator_node_capacity_cpu_millis{adx_env=~\"$adx_env\"} > 0) * on (adx_env, node_id) adx_coordinator_node_schedulable{adx_env=~\"$adx_env\"})",
+          "refId": "A"
+        }
+      ],
+      "title": "Reachable Nodes",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 0,
+        "w": 6,
+        "h": 4
+      },
+      "id": 3,
+      "options": {},
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(adx_coordinator_node_schedulable{adx_env=~\"$adx_env\"})",
+          "legendFormat": "Nodes",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Schedulable Nodes",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "x": 18,
+        "y": 0,
+        "w": 6,
+        "h": 4
+      },
+      "id": 4,
+      "options": {},
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(adx_coordinator_queued_requests{adx_env=~\"$adx_env\"})",
+          "legendFormat": "Requests",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Queued Requests",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Allocated resources divided by capacity on schedulable nodes. Nodes with admission disabled are excluded. This is not actual utilization.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "max": 1,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "yellow",
+                "value": 0.7
+              },
+              {
+                "color": "red",
+                "value": 0.9
+              }
+            ]
+          },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 4,
+        "w": 8,
+        "h": 5
+      },
+      "options": {
+        "minVizHeight": 75,
+        "minVizWidth": 75,
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showThresholdLabels": false,
+        "showThresholdMarkers": true
+      },
+      "pluginVersion": "12.3.1",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "A",
+          "expr": "sum(adx_coordinator_node_reserved_cpu_millis{adx_env=~\"$adx_env\"} * on (adx_env, node_id) adx_coordinator_node_schedulable{adx_env=~\"$adx_env\"}) / clamp_min(sum(adx_coordinator_node_capacity_cpu_millis{adx_env=~\"$adx_env\"} * on (adx_env, node_id) adx_coordinator_node_schedulable{adx_env=~\"$adx_env\"}), 1)",
+          "legendFormat": "Allocation Ratio"
+        }
+      ],
+      "title": "CPU Allocation Ratio",
+      "type": "gauge",
+      "id": 5
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "axisSoftMin": 0,
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "cores"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexpOrNames",
+              "options": ".*capacity.*"
+            },
+            "properties": []
+          }
+        ]
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 9,
+        "w": 8,
+        "h": 8
+      },
+      "id": 6,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "max",
+            "mean"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "pluginVersion": "12.3.1",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "A",
+          "expr": "sum(adx_coordinator_node_capacity_cpu_millis{adx_env=~\"$adx_env\"} * on (adx_env, node_id) adx_coordinator_node_schedulable{adx_env=~\"$adx_env\"}) / 1000",
+          "legendFormat": "Scheduling Capacity"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "B",
+          "expr": "sum(adx_coordinator_node_reserved_cpu_millis{adx_env=~\"$adx_env\"} and on (adx_env, node_id) (adx_coordinator_node_reachable{adx_env=~\"$adx_env\"} == 1)) / 1000",
+          "legendFormat": "Allocated"
+        }
+      ],
+      "title": "CPU Scheduling Capacity and Allocated",
+      "type": "timeseries",
+      "description": "Scheduling capacity is zero when admission is disabled. Allocated resources come from reachable-node ledgers and include starting and running environments. Disabling admission does not release allocations. This is not actual utilization."
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Allocated resources divided by capacity on schedulable nodes. Nodes with admission disabled are excluded. This is not actual utilization.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "max": 1,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "yellow",
+                "value": 0.7
+              },
+              {
+                "color": "red",
+                "value": 0.9
+              }
+            ]
+          },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 4,
+        "w": 8,
+        "h": 5
+      },
+      "options": {
+        "minVizHeight": 75,
+        "minVizWidth": 75,
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showThresholdLabels": false,
+        "showThresholdMarkers": true
+      },
+      "pluginVersion": "12.3.1",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "A",
+          "expr": "sum(adx_coordinator_node_reserved_memory_bytes{adx_env=~\"$adx_env\"} * on (adx_env, node_id) adx_coordinator_node_schedulable{adx_env=~\"$adx_env\"}) / clamp_min(sum(adx_coordinator_node_capacity_memory_bytes{adx_env=~\"$adx_env\"} * on (adx_env, node_id) adx_coordinator_node_schedulable{adx_env=~\"$adx_env\"}), 1)",
+          "legendFormat": "Allocation Ratio"
+        }
+      ],
+      "title": "Memory Allocation Ratio",
+      "type": "gauge",
+      "id": 7
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "axisSoftMin": 0,
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "bytes"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexpOrNames",
+              "options": ".*capacity.*"
+            },
+            "properties": []
+          }
+        ]
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 9,
+        "w": 8,
+        "h": 8
+      },
+      "id": 8,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "max",
+            "mean"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "pluginVersion": "12.3.1",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "A",
+          "expr": "sum(adx_coordinator_node_capacity_memory_bytes{adx_env=~\"$adx_env\"} * on (adx_env, node_id) adx_coordinator_node_schedulable{adx_env=~\"$adx_env\"}) / 1",
+          "legendFormat": "Scheduling Capacity"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "B",
+          "expr": "sum(adx_coordinator_node_reserved_memory_bytes{adx_env=~\"$adx_env\"} and on (adx_env, node_id) (adx_coordinator_node_reachable{adx_env=~\"$adx_env\"} == 1)) / 1",
+          "legendFormat": "Allocated"
+        }
+      ],
+      "title": "Memory Scheduling Capacity and Allocated",
+      "type": "timeseries",
+      "description": "Scheduling capacity is zero when admission is disabled. Allocated resources come from reachable-node ledgers and include starting and running environments. Disabling admission does not release allocations. This is not actual utilization."
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "description": "Allocated resources divided by capacity on schedulable nodes. Nodes with admission disabled are excluded. This is not actual utilization.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "max": 1,
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "yellow",
+                "value": 0.7
+              },
+              {
+                "color": "red",
+                "value": 0.9
+              }
+            ]
+          },
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 4,
+        "w": 8,
+        "h": 5
+      },
+      "options": {
+        "minVizHeight": 75,
+        "minVizWidth": 75,
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showThresholdLabels": false,
+        "showThresholdMarkers": true
+      },
+      "pluginVersion": "12.3.1",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "A",
+          "expr": "sum(adx_coordinator_node_reserved_disk_bytes{adx_env=~\"$adx_env\"} * on (adx_env, node_id) adx_coordinator_node_schedulable{adx_env=~\"$adx_env\"}) / clamp_min(sum(adx_coordinator_node_capacity_disk_bytes{adx_env=~\"$adx_env\"} * on (adx_env, node_id) adx_coordinator_node_schedulable{adx_env=~\"$adx_env\"}), 1)",
+          "legendFormat": "Allocation Ratio"
+        }
+      ],
+      "title": "Disk Allocation Ratio",
+      "type": "gauge",
+      "id": 9
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "axisSoftMin": 0,
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "bytes"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexpOrNames",
+              "options": ".*capacity.*"
+            },
+            "properties": []
+          }
+        ]
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 9,
+        "w": 8,
+        "h": 8
+      },
+      "id": 10,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "max",
+            "mean"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "pluginVersion": "12.3.1",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "A",
+          "expr": "sum(adx_coordinator_node_capacity_disk_bytes{adx_env=~\"$adx_env\"} * on (adx_env, node_id) adx_coordinator_node_schedulable{adx_env=~\"$adx_env\"}) / 1",
+          "legendFormat": "Scheduling Capacity"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "refId": "B",
+          "expr": "sum(adx_coordinator_node_reserved_disk_bytes{adx_env=~\"$adx_env\"} and on (adx_env, node_id) (adx_coordinator_node_reachable{adx_env=~\"$adx_env\"} == 1)) / 1",
+          "legendFormat": "Allocated"
+        }
+      ],
+      "title": "Disk Scheduling Capacity and Allocated",
+      "type": "timeseries",
+      "description": "Scheduling capacity is zero when admission is disabled. Allocated resources come from reachable-node ledgers and include starting and running environments. Disabling admission does not release allocations. This is not actual utilization."
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 17,
+        "w": 12,
+        "h": 8
+      },
+      "id": 11,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "max",
+            "mean"
+          ],
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": false
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "pluginVersion": "12.3.1",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(adx_coordinator_environments{adx_env=~\"$adx_env\",state=\"Running\"})",
+          "legendFormat": "Cluster total",
+          "refId": "A"
+        }
+      ],
+      "title": "Running Sandboxes over Time",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "showValues": false,
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 17,
+        "w": 12,
+        "h": 8
+      },
+      "id": 12,
+      "options": {
+        "legend": {
+          "calcs": [
+            "last",
+            "max",
+            "mean"
+          ],
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "pluginVersion": "12.3.1",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (node_id) (adx_coordinator_environments{adx_env=~\"$adx_env\",state=\"Running\"} and on (adx_env, node_id) (adx_coordinator_node_reachable{adx_env=~\"$adx_env\"} == 1))",
+          "legendFormat": "{{node_id}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Running Sandboxes by Node",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "yellow",
+                "value": 10
+              },
+              {
+                "color": "red",
+                "value": 20
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 25,
+        "w": 12,
+        "h": 8
+      },
+      "id": 13,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "percentChangeColorMode": "standard",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "text": {},
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "pluginVersion": "12.3.1",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(adx_coordinator_environments{adx_env=~\"$adx_env\",state=\"Running\"} * on (adx_env, node_id) adx_coordinator_node_schedulable{adx_env=~\"$adx_env\"}) / clamp_min(count((adx_coordinator_node_capacity_cpu_millis{adx_env=~\"$adx_env\"} > 0) * on (adx_env, node_id) adx_coordinator_node_schedulable{adx_env=~\"$adx_env\"}), 1)",
+          "refId": "A"
+        }
+      ],
+      "title": "Average Running Sandboxes per Node",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              },
+              {
+                "color": "orange",
+                "value": 30
+              },
+              {
+                "color": "red",
+                "value": 50
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 25,
+        "w": 12,
+        "h": 8
+      },
+      "id": 14,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "percentChangeColorMode": "standard",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "text": {},
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "pluginVersion": "12.3.1",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "max(sum by (node_id) (adx_coordinator_environments{adx_env=~\"$adx_env\",state=\"Running\"} and on (adx_env, node_id) (adx_coordinator_node_reachable{adx_env=~\"$adx_env\"} == 1)))",
+          "refId": "A"
+        }
+      ],
+      "title": "Maximum Running Sandboxes on a Node",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "noValue": "Unknown",
+          "custom": {
+            "align": "left",
+            "cellOptions": {
+              "type": "auto"
+            }
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Reachability"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "0": {
+                        "text": "Unreachable",
+                        "color": "red",
+                        "index": 0
+                      },
+                      "1": {
+                        "text": "Reachable",
+                        "color": "green",
+                        "index": 1
+                      }
+                    }
+                  },
+                  {
+                    "type": "special",
+                    "options": {
+                      "match": "null",
+                      "result": {
+                        "text": "Unknown",
+                        "color": "orange",
+                        "index": 2
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "custom.align",
+                "value": "center"
+              },
+              {
+                "id": "custom.width",
+                "value": 130
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Admission"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "0": {
+                        "text": "Blocked",
+                        "color": "red",
+                        "index": 0
+                      },
+                      "1": {
+                        "text": "Allowed",
+                        "color": "green",
+                        "index": 1
+                      }
+                    }
+                  },
+                  {
+                    "type": "special",
+                    "options": {
+                      "match": "null",
+                      "result": {
+                        "text": "Unknown",
+                        "color": "orange",
+                        "index": 2
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "custom.align",
+                "value": "center"
+              },
+              {
+                "id": "custom.width",
+                "value": 110
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Resource Sample"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "0": {
+                        "text": "Stale",
+                        "color": "red",
+                        "index": 0
+                      },
+                      "1": {
+                        "text": "Fresh",
+                        "color": "green",
+                        "index": 1
+                      }
+                    }
+                  },
+                  {
+                    "type": "special",
+                    "options": {
+                      "match": "null",
+                      "result": {
+                        "text": "Unknown",
+                        "color": "orange",
+                        "index": 2
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "custom.align",
+                "value": "center"
+              },
+              {
+                "id": "custom.width",
+                "value": 140
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "CPU Capacity (cores)"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "cores"
+              },
+              {
+                "id": "decimals",
+                "value": 1
+              },
+              {
+                "id": "custom.align",
+                "value": "right"
+              },
+              {
+                "id": "custom.width",
+                "value": 170
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Memory Capacity"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "bytes"
+              },
+              {
+                "id": "decimals",
+                "value": 1
+              },
+              {
+                "id": "custom.align",
+                "value": "right"
+              },
+              {
+                "id": "custom.width",
+                "value": 135
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Disk Capacity"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "bytes"
+              },
+              {
+                "id": "decimals",
+                "value": 1
+              },
+              {
+                "id": "custom.align",
+                "value": "right"
+              },
+              {
+                "id": "custom.width",
+                "value": 135
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Node (Env / ID)"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 250
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "CPU Allocation"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percentunit"
+              },
+              {
+                "id": "decimals",
+                "value": 1
+              },
+              {
+                "id": "min",
+                "value": 0
+              },
+              {
+                "id": "max",
+                "value": 1
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "thresholds"
+                }
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": null
+                    },
+                    {
+                      "color": "yellow",
+                      "value": 0.7
+                    },
+                    {
+                      "color": "red",
+                      "value": 0.9
+                    }
+                  ]
+                }
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "gauge",
+                  "mode": "basic",
+                  "valueDisplayMode": "text"
+                }
+              },
+              {
+                "id": "custom.width",
+                "value": 170
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Memory Allocation"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percentunit"
+              },
+              {
+                "id": "decimals",
+                "value": 1
+              },
+              {
+                "id": "min",
+                "value": 0
+              },
+              {
+                "id": "max",
+                "value": 1
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "thresholds"
+                }
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": null
+                    },
+                    {
+                      "color": "yellow",
+                      "value": 0.7
+                    },
+                    {
+                      "color": "red",
+                      "value": 0.9
+                    }
+                  ]
+                }
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "gauge",
+                  "mode": "basic",
+                  "valueDisplayMode": "text"
+                }
+              },
+              {
+                "id": "custom.width",
+                "value": 170
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Disk Allocation"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percentunit"
+              },
+              {
+                "id": "decimals",
+                "value": 1
+              },
+              {
+                "id": "min",
+                "value": 0
+              },
+              {
+                "id": "max",
+                "value": 1
+              },
+              {
+                "id": "color",
+                "value": {
+                  "mode": "thresholds"
+                }
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "green",
+                      "value": null
+                    },
+                    {
+                      "color": "yellow",
+                      "value": 0.7
+                    },
+                    {
+                      "color": "red",
+                      "value": 0.9
+                    }
+                  ]
+                }
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "gauge",
+                  "mode": "basic",
+                  "valueDisplayMode": "text"
+                }
+              },
+              {
+                "id": "custom.width",
+                "value": 170
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 33,
+        "w": 24,
+        "h": 8
+      },
+      "id": 15,
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "footer": {
+          "show": false
+        },
+        "sortBy": [
+          {
+            "displayName": "Node (Env / ID)",
+            "desc": false
+          }
+        ]
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "label_join(min by (adx_env, node_id) (adx_coordinator_node_reachable{adx_env=~\"$adx_env\"}), \"node_key\", \"/\", \"adx_env\", \"node_id\")",
+          "range": false,
+          "refId": "A",
+          "format": "table",
+          "instant": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "label_join(min by (adx_env, node_id) (adx_coordinator_node_schedulable{adx_env=~\"$adx_env\"}), \"node_key\", \"/\", \"adx_env\", \"node_id\")",
+          "range": false,
+          "refId": "B",
+          "format": "table",
+          "instant": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "label_join(min by (adx_env, node_id) ((adx_node_resource_observation_fresh{adx_env=~\"$adx_env\",node_id!=\"\"} and (time() - timestamp(adx_node_resource_observation_fresh{adx_env=~\"$adx_env\",node_id!=\"\"}) < 45)) or label_replace((adx_node_resource_observation_fresh{adx_env=~\"$adx_env\",node_id=\"\",k8s_node_name!=\"\"} and (time() - timestamp(adx_node_resource_observation_fresh{adx_env=~\"$adx_env\",node_id=\"\",k8s_node_name!=\"\"}) < 45)), \"node_id\", \"$1\", \"k8s_node_name\", \"(.+)\")), \"node_key\", \"/\", \"adx_env\", \"node_id\")",
+          "range": false,
+          "refId": "C",
+          "format": "table",
+          "instant": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "label_join(min by (adx_env, node_id) (adx_coordinator_node_capacity_cpu_millis{adx_env=~\"$adx_env\"} * on (adx_env, node_id) adx_coordinator_node_schedulable{adx_env=~\"$adx_env\"}) / 1000, \"node_key\", \"/\", \"adx_env\", \"node_id\")",
+          "range": false,
+          "instant": true,
+          "format": "table",
+          "refId": "D"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "label_join(min by (adx_env, node_id) (adx_coordinator_node_capacity_memory_bytes{adx_env=~\"$adx_env\"} * on (adx_env, node_id) adx_coordinator_node_schedulable{adx_env=~\"$adx_env\"}) / 1, \"node_key\", \"/\", \"adx_env\", \"node_id\")",
+          "range": false,
+          "instant": true,
+          "format": "table",
+          "refId": "E"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "label_join(min by (adx_env, node_id) (adx_coordinator_node_capacity_disk_bytes{adx_env=~\"$adx_env\"} * on (adx_env, node_id) adx_coordinator_node_schedulable{adx_env=~\"$adx_env\"}) / 1, \"node_key\", \"/\", \"adx_env\", \"node_id\")",
+          "range": false,
+          "instant": true,
+          "format": "table",
+          "refId": "F"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "label_join(min by (adx_env, node_id) ((adx_coordinator_node_reserved_cpu_millis{adx_env=~\"$adx_env\"} / on (adx_env, node_id) (adx_coordinator_node_capacity_cpu_millis{adx_env=~\"$adx_env\"} > 0)) and on (adx_env, node_id) (adx_coordinator_node_reachable{adx_env=~\"$adx_env\"} == 1)), \"node_key\", \"/\", \"adx_env\", \"node_id\")",
+          "range": false,
+          "instant": true,
+          "format": "table",
+          "refId": "G"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "label_join(min by (adx_env, node_id) ((adx_coordinator_node_reserved_memory_bytes{adx_env=~\"$adx_env\"} / on (adx_env, node_id) (adx_coordinator_node_capacity_memory_bytes{adx_env=~\"$adx_env\"} > 0)) and on (adx_env, node_id) (adx_coordinator_node_reachable{adx_env=~\"$adx_env\"} == 1)), \"node_key\", \"/\", \"adx_env\", \"node_id\")",
+          "range": false,
+          "instant": true,
+          "format": "table",
+          "refId": "H"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "label_join(min by (adx_env, node_id) ((adx_coordinator_node_reserved_disk_bytes{adx_env=~\"$adx_env\"} / on (adx_env, node_id) (adx_coordinator_node_capacity_disk_bytes{adx_env=~\"$adx_env\"} > 0)) and on (adx_env, node_id) (adx_coordinator_node_reachable{adx_env=~\"$adx_env\"} == 1)), \"node_key\", \"/\", \"adx_env\", \"node_id\")",
+          "range": false,
+          "instant": true,
+          "format": "table",
+          "refId": "I"
+        }
+      ],
+      "title": "Node Status, Scheduling Capacity and Allocation",
+      "type": "table",
+      "description": "One row per environment and node: heartbeat reachability, scheduler admission, resource sampling, and CPU, memory and disk scheduling capacity. Unknown means missing observations. Sampling uses node_id, with k8s_node_name as a Kubernetes fallback. Samples older than 45 seconds are unknown (15-second scrape interval). Capacity is zero when admission is disabled. Disk capacity is a scheduling value, not physical filesystem size. CPU, memory and disk allocation bars show reserved / underlying capacity on reachable nodes, including starting and running environments. The underlying capacity is retained when admission is disabled, so existing allocations remain visible even when the scheduling capacity columns are zero. These are allocation ratios, not measured utilization. Zero or missing capacity produces Unknown. Bars use a fixed 0–100% scale; values above 100% remain visible as percentages. Colors: green below 70%, yellow at 70–90%, red at or above 90%.",
+      "transformations": [
+        {
+          "id": "filterFieldsByName",
+          "options": {
+            "include": {
+              "names": [
+                "node_key",
+                "Value #A",
+                "Value #B",
+                "Value #C",
+                "Value #D",
+                "Value #G",
+                "Value #E",
+                "Value #H",
+                "Value #F",
+                "Value #I"
+              ]
+            }
+          }
+        },
+        {
+          "id": "joinByField",
+          "options": {
+            "byField": "node_key",
+            "mode": "outerTabular"
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "indexByName": {
+              "node_key": 0,
+              "Value #A": 1,
+              "Value #B": 2,
+              "Value #C": 3,
+              "Value #D": 4,
+              "Value #G": 5,
+              "Value #E": 6,
+              "Value #H": 7,
+              "Value #F": 8,
+              "Value #I": 9
+            },
+            "renameByName": {
+              "node_key": "Node (Env / ID)",
+              "Value #A": "Reachability",
+              "Value #B": "Admission",
+              "Value #C": "Resource Sample",
+              "Value #D": "CPU Capacity (cores)",
+              "Value #G": "CPU Allocation",
+              "Value #E": "Memory Capacity",
+              "Value #H": "Memory Allocation",
+              "Value #F": "Disk Capacity",
+              "Value #I": "Disk Allocation"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 41,
+        "w": 24,
+        "h": 8
+      },
+      "id": 20,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(adx_trace_exported_spans_total{adx_env=~\"$adx_env\"})",
+          "legendFormat": "Exported",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(adx_trace_export_failed_spans_total{adx_env=~\"$adx_env\"})",
+          "legendFormat": "Export Failed",
+          "refId": "B"
+        }
+      ],
+      "title": "Exported and Failed Spans",
+      "type": "timeseries",
+      "description": "Native Coordinator and adxlet span export counters. Query Ingress traces directly in Tempo."
+    },
+    {
+      "datasource": {
+        "type": "loki",
+        "uid": "loki"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 49,
+        "w": 24,
+        "h": 10
+      },
+      "id": 21,
+      "options": {
+        "showTime": true,
+        "wrapLogMessage": true,
+        "enableLogDetails": true,
+        "sortOrder": "Descending",
+        "dedupStrategy": "none"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "loki"
+          },
+          "expr": "{adx_env=~\"$adx_env\",component_name=\"adx-runtime\"} | runtime_id=~`${runtime_id:regex}` |= ${log_search:doublequote}",
+          "refId": "A"
+        }
+      ],
+      "title": "Sandbox Logs",
+      "type": "logs",
+      "description": "Search sandbox main-process stdout/stderr by runtime records and case-sensitive keywords. Runtime IDs contain Sandbox ID and generation. Options come from resource samples in the selected time range; use All for records without samples. SDK command results are not archived here. Defaults to the last 6 hours unless an absolute time range is selected. No main-process output means no log entries.",
+      "timeFrom": "6h"
+    },
+    {
+      "id": 22,
+      "type": "table",
+      "title": "HTTP Request Traces",
+      "description": "One row per matching HTTP span, showing endpoint, actual component, response status and span duration. Streaming HTTP spans may finish before background tasks; click Trace ID for the complete trace. Excludes unmatched routes and health checks. Does not require an upstream root span.",
+      "datasource": {
+        "type": "tempo",
+        "uid": "tempo"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 59,
+        "w": 24,
+        "h": 10
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "inspect": false
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Trace ID"
+            },
+            "properties": [
+              {
+                "id": "custom.hidden",
+                "value": false
+              },
+              {
+                "id": "custom.width",
+                "value": 290
+              },
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "View Trace",
+                    "url": "",
+                    "internal": {
+                      "datasourceUid": "tempo",
+                      "datasourceName": "Tempo",
+                      "query": {
+                        "query": "${__value.raw}",
+                        "queryType": "traceql"
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Endpoint"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 500
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Start Time"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 225
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Component"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 150
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Status"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 80
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Span Duration"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 100
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "tempo",
+            "uid": "tempo"
+          },
+          "queryType": "traceql",
+          "tableType": "spans",
+          "query": "{ resource.adx_env =~ \"$adx_env\" && (resource.service.name = \"adx-apiserver\" || resource.service.name = \"adx-ingress\") && name =~ \"^(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS|CONNECT|OTHER) /.*\" && span.http.route != \"/unmatched\" && name != \"GET /healthz\" && name != \"GET /metrics\" } | select(span.http.request.method, span.http.route, span.http.response.status_code, resource.service.name)",
+          "limit": 50,
+          "filters": []
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "traceService": true,
+              "traceName": true,
+              "spanID": true,
+              "adx_env": true,
+              "http.request.method": true,
+              "http.route": true,
+              "nested": true
+            },
+            "indexByName": {
+              "time": 0,
+              "name": 1,
+              "service.name": 2,
+              "http.response.status_code": 3,
+              "duration": 4,
+              "traceIdHidden": 5,
+              "Start time": 0,
+              "Name": 1,
+              "Duration": 4
+            },
+            "renameByName": {
+              "time": "Start Time",
+              "name": "Endpoint",
+              "service.name": "Component",
+              "http.response.status_code": "Status",
+              "duration": "Span Duration",
+              "traceIdHidden": "Trace ID",
+              "Start time": "Start Time",
+              "Name": "Endpoint",
+              "Duration": "Span Duration"
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "preload": false,
+  "refresh": "30s",
+  "schemaVersion": 42,
+  "tags": [
+    "adx",
+    "schedule",
+    "instances",
+    "metrics",
+    "monitoring"
+  ],
+  "templating": {
+    "list": [
+      {
+        "allValue": ".+",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "datasource": "Prometheus",
+        "definition": "label_values(adx_coordinator_node_capacity_cpu_millis, adx_env)",
+        "includeAll": true,
+        "label": "adx_env",
+        "name": "adx_env",
+        "options": [],
+        "query": {
+          "query": "label_values(adx_coordinator_node_capacity_cpu_millis, adx_env)",
+          "refId": "Prometheus-adx-env-Variable"
+        },
+        "refresh": 2,
+        "regex": "",
+        "sort": 1,
+        "type": "query"
+      },
+      {
+        "name": "runtime_id",
+        "label": "Sandbox Runtime",
+        "description": "Search by Sandbox ID and select runtime records from resource samples in the current time range. All searches all collected sandbox output.",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "definition": "label_values(adx_environment_stats_age_seconds{adx_env=~\"$adx_env\"}, runtime_id)",
+        "query": {
+          "query": "label_values(adx_environment_stats_age_seconds{adx_env=~\"$adx_env\"}, runtime_id)",
+          "refId": "Prometheus-runtime-id-Variable"
+        },
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".+",
+        "current": {
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
+        "options": [],
+        "refresh": 2,
+        "sort": 1,
+        "regex": ""
+      },
+      {
+        "name": "log_search",
+        "label": "Log Keyword",
+        "description": "Case-sensitive substring search in the original log message. Leave empty to match all messages.",
+        "type": "textbox",
+        "query": "",
+        "current": {
+          "text": "",
+          "value": ""
+        },
+        "options": []
+      }
+    ]
+  },
+  "time": {
+    "from": "now-30m",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "ADX Schedule",
+  "uid": "adx-schedule",
+  "version": 9,
+  "weekStart": ""
+}

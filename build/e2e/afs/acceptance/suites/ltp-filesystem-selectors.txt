@@ -1,0 +1,8 @@
+# LTP 20260529 selectors required by docs/testing/afs.md 功能优先级.
+# The preparation script expands these names against the pinned LTP runtest/
+# files and records discovered tests. This file is not an exclusion list.
+fs
+fs_bind
+fs_perms_simple
+fcntl-locktests
+syscalls-file-related

@@ -1,0 +1,302 @@
+#!/usr/bin/env python3
+"""Public SDK cases plus explicitly scoped faults in an ADX FC fixture.
+
+Run as the fixture owner in its Linux VM. Redis/backend reads are test oracles;
+all ordinary create/execute/delete requests use the installed public SDK.
+"""
+
+import argparse
+import json
+import os
+import signal
+import sqlite3
+import subprocess
+import time
+import traceback
+import urllib.request
+from pathlib import Path
+
+from runtime_record import runtime_id
+
+p = argparse.ArgumentParser()
+p.add_argument('--run-root', required=True, type=Path)
+p.add_argument('--image', required=True)
+p.add_argument('--endpoint', default='127.0.0.1:8443')
+p.add_argument('--package', default='/opt/adx-pause/package', type=Path)
+p.add_argument('--tools', default='/opt/adx-pause/tools', type=Path)
+p.add_argument('--sbox', default='/opt/adx-fc/bin/sbox', type=Path)
+a = p.parse_args()
+root = a.run_root.resolve()
+if not ((root / 'deployment.yaml').is_file()):
+    raise AssertionError('explicit deployed fixture required')
+config = json.loads((root / 'deployment.yaml').read_text())
+if not (Path(config['package_dir']).resolve() == a.package.resolve()):
+    raise AssertionError()
+os.environ['SSL_CERT_FILE'] = str(root / 'secrets/tls/ca.pem')
+from adx_sandbox import ConnectionConfig, RestartPolicy, Sandbox
+
+connection = ConnectionConfig(
+    server_address=a.endpoint, token=(root / 'secrets/api-key').read_text().strip(), use_tls=True, verify_tls=True
+)
+env = {**os.environ, 'REDISCLI_AUTH': (root / 'secrets/redis-key').read_text().strip()}
+out = root / 'evidence/lifecycle'
+out.mkdir(exist_ok=False)
+result = {'status': 'failed', 'cases': []}
+instances = []
+stopped = set()
+hidden_socket = root / 'resource-hidden.sock'
+resource_socket = root / 'resource.sock'
+
+
+def command(args):
+    return subprocess.check_output(list(map(str, args)), text=True, env=env, timeout=30).strip()
+
+
+def catalog():
+    value = json.loads(command([a.tools / 'redis-cli', '--json', 'HGETALL', 'adx:{acceptance}:control:v1']))
+    return {k: json.loads(v) for k, v in value.items() if k.startswith(('environment:', 'node:'))}
+
+
+def record(instance_id):
+    return catalog().get('environment:' + instance_id, {}).get('result')
+
+
+def services():
+    return json.loads(command([a.package / 'bin/adxctl', 'status', '--config', root / 'deployment.yaml']))['services']
+
+
+def pid(role):
+    matches = [s['pid'] for s in services() if s['role'] == role]
+    if not (len(matches) == 1):
+        raise AssertionError((role, matches))
+    return matches[0]
+
+
+def wait(test, seconds=90):
+    end = time.monotonic() + seconds
+    last = None
+    while time.monotonic() < end:
+        try:
+            value = test()
+            if value:
+                return value
+        except Exception as error_local:
+            last = repr(error_local)
+        time.sleep(0.5)
+    raise TimeoutError(f'condition did not become true; last error={last}')
+
+
+def passed(name, **details):
+    print('PASS', name, json.dumps(details), flush=True)
+    result['cases'].append({'name': name, 'passed': True, **details})
+
+
+def create(**kwargs):
+    s_local = Sandbox(
+        image=a.image, runtime='firecracker', cpu=1000, memory=512, connection=connection, create_timeout=180, **kwargs
+    )
+    instances.append(s_local)
+    if not (s_local.commands.run('printf lifecycle-ready').stdout.strip() == 'lifecycle-ready'):
+        raise AssertionError()
+    return s_local
+
+
+def physical(instance_id):
+    lines = command(
+        [a.sbox, '-a', root / 'sandboxd/sandboxd.sock', 'list', '--label', 'adx.environment_id=' + instance_id]
+    ).splitlines()
+    return [line.split()[0] for line in lines[1:] if line.strip()]
+
+
+try:
+    s = create(
+        idle_timeout=0, restart_policy=RestartPolicy(max_attempts=2, initial_backoff_seconds=1, max_backoff_seconds=4)
+    )
+    first = record(s.id)
+    old = physical(s.id)
+    if not (len(old) == 1):
+        raise AssertionError(old)
+    command([a.sbox, '-a', root / 'sandboxd/sandboxd.sock', 'delete', old[0]])
+
+    def restarted_execution():
+        r = record(s.id)
+        return r if r and r['state'] == 'Running' and (runtime_id(r) != runtime_id(first)) else None
+
+    restarted = wait(restarted_execution)
+    if not (restarted['restart_attempts'] == 1):
+        raise AssertionError()
+    if not (s.commands.run('printf restarted').stdout.strip() == 'restarted'):
+        raise AssertionError()
+    passed(
+        'unexpected backend exit restarts with a fresh execution',
+        instance_id=s.id,
+        old_runtime=runtime_id(first),
+        new_runtime=runtime_id(restarted),
+    )
+
+    def sampled_stats():
+        text = urllib.request.urlopen('http://127.0.0.1:17003/metrics', timeout=5).read().decode()
+        return text if 'adx_environment_memory_usage_bytes' in text and s.id in text else None
+
+    stats = wait(sampled_stats, 30)
+    (out / 'metrics.txt').write_text(stats)
+    if 'adx_node_reserved_cpu_millis' not in stats:
+        raise AssertionError()
+    s.kill()
+
+    recovered_from_checkpoint = create(idle_timeout=0, failover=True)
+    recovered_from_checkpoint.files.write('/tmp/failover-state', 'checkpoint-state')
+    checkpoint = recovered_from_checkpoint.pause(ttl_seconds=600, timeout_seconds=120)
+    if not (checkpoint.size > 0):
+        raise AssertionError()
+    recovered_from_checkpoint.resume()
+    before_failover = record(recovered_from_checkpoint.id)
+    old = physical(recovered_from_checkpoint.id)
+    if not (len(old) == 1):
+        raise AssertionError(old)
+    command([a.sbox, '-a', root / 'sandboxd/sandboxd.sock', 'delete', old[0]])
+
+    def recovered_execution():
+        r = record(recovered_from_checkpoint.id)
+        return r if r and r['state'] == 'Running' and (runtime_id(r) != runtime_id(before_failover)) else None
+
+    recovered = wait(
+        recovered_execution,
+        120,
+    )
+    if not (recovered_from_checkpoint.files.read('/tmp/failover-state') == 'checkpoint-state'):
+        raise AssertionError()
+    passed(
+        'failover restores the latest checkpoint without a cold start',
+        instance_id=recovered_from_checkpoint.id,
+        snapshot_id=checkpoint.snapshot_id,
+        old_runtime=runtime_id(before_failover),
+        new_runtime=runtime_id(recovered),
+    )
+    recovered_from_checkpoint.kill()
+
+    unrecoverable = create(idle_timeout=0, failover=True)
+    old = physical(unrecoverable.id)
+    if not (len(old) == 1):
+        raise AssertionError(old)
+    command([a.sbox, '-a', root / 'sandboxd/sandboxd.sock', 'delete', old[0]])
+
+    def unrecoverable_failure():
+        r = record(unrecoverable.id)
+        return r if r and r['state'] == 'Failed' else None
+
+    failed = wait(unrecoverable_failure, 90)
+    if not (not physical(unrecoverable.id)):
+        raise AssertionError()
+    if not (not failed['restart_pending']):
+        raise AssertionError()
+    passed('failover without a checkpoint becomes failed without cold start', instance_id=unrecoverable.id)
+    unrecoverable.kill()
+
+    keep = create(idle_timeout=0)
+    idle = create(idle_timeout=8)
+    coordinator_pid = pid('coordinator')
+    os.kill(coordinator_pid, signal.SIGSTOP)
+    stopped.add(coordinator_pid)
+    db_path = root / 'degraded/results.sqlite'
+
+    def journaled_delete():
+        if not db_path.exists():
+            return False
+        with sqlite3.connect('file:' + str(db_path) + '?mode=ro', uri=True, timeout=2) as db:
+            return next(
+                (
+                    json.loads(row[0])
+                    for row in db.execute('select payload from pending')
+                    if json.loads(row[0])['spec']['id'] == idle.id and json.loads(row[0])['state'] == 'Deleted'
+                ),
+                None,
+            )
+
+    deleted = wait(journaled_delete, 60)
+    if not (record(idle.id)['state'] == 'Running'):
+        raise AssertionError('Redis should still contain the pre-outage record')
+    if not (not physical(idle.id)):
+        raise AssertionError('idle backend was not cleaned locally')
+    (out / 'journaled-delete.json').write_text(json.dumps(deleted, indent=2))
+    passed('Coordinator outage uses SQLite for idle deletion while Redis remains stale', instance_id=idle.id)
+
+    node_pid = pid('adxlet')
+    kept_runtime = runtime_id(record(keep.id))
+    os.kill(node_pid, signal.SIGKILL)
+    wait(lambda: pid('adxlet') != node_pid, 30)
+    time.sleep(4)
+    if not (len(physical(keep.id)) == 1):
+        raise AssertionError()
+    if not (runtime_id(record(keep.id)) == kept_runtime):
+        raise AssertionError()
+    if not (journaled_delete()):
+        raise AssertionError()
+    passed('Adxlet restart waits for Coordinator without cleaning an owned runtime')
+    os.kill(coordinator_pid, signal.SIGCONT)
+    stopped.remove(coordinator_pid)
+
+    # The Coordinator clock continues while the process is stopped. Once the node
+    # heartbeat lease expires, the old session and all of its executions are
+    # fenced. The replacement process must discard that session's journal and
+    # clean its retained runtime during authoritative reconciliation.
+    def idle_failure():
+        r = record(idle.id)
+        return r if r and r['state'] == 'Failed' else None
+
+    idle_failed = wait(idle_failure, 90)
+
+    def keep_failure():
+        r = record(keep.id)
+        return r if r and r['state'] == 'Failed' else None
+
+    keep_failed = wait(keep_failure, 90)
+    wait(lambda: catalog()['node:node1']['session']['routable'], 90)
+
+    def drained():
+        with sqlite3.connect(db_path) as db:
+            return db.execute('select count(*) from pending').fetchone()[0] == 0
+
+    wait(drained)
+    wait(lambda: not physical(keep.id), 90)
+    if not (not idle_failed['resources_held'] and not keep_failed['resources_held']):
+        raise AssertionError()
+    passed('Coordinator recovery fences an expired node session and reconciles stale runtimes')
+    keep.kill()
+    idle.kill()
+
+    observed = create(idle_timeout=0)
+    resource_socket.rename(hidden_socket)
+    wait(lambda: not catalog()['node:node1']['node']['available'], 30)
+    if not (len(physical(observed.id)) == 1):
+        raise AssertionError()
+    hidden_socket.rename(resource_socket)
+    wait(lambda: catalog()['node:node1']['node']['available'], 30)
+    passed('expired resource observations close admission and recover without killing instances')
+    observed.kill()
+    wait(
+        lambda: all(
+            v.get('result', {}).get('state') == 'Deleted' for k, v in catalog().items() if k.startswith('environment:')
+        )
+    )
+    result['status'] = 'passed'
+except Exception as error:
+    result['error'] = f'{type(error).__name__}: {error}'
+    traceback.print_exc()
+finally:
+    for stopped_pid in stopped:
+        try:
+            os.kill(stopped_pid, signal.SIGCONT)
+        except ProcessLookupError:
+            pass
+    if hidden_socket.exists():
+        hidden_socket.rename(resource_socket)
+    for s in instances:
+        try:
+            s.kill()
+        except Exception as error:
+            result.setdefault('cleanup_errors', []).append(str(error))
+        s.close()
+    (out / 'result.json').write_text(json.dumps(result, indent=2) + '\n')
+print(json.dumps(result), flush=True)
+raise SystemExit(0 if result['status'] == 'passed' and not result.get('cleanup_errors') else 1)

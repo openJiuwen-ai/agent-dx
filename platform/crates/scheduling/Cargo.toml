@@ -1,0 +1,15 @@
+[package]
+name = "adx-scheduling"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ADX scheduling filters, scores, and resource accounting"
+
+[lints]
+workspace = true
+
+[dependencies]
+adx-core = { path = "../core" }
+im = { version = "15.1", default-features = false }

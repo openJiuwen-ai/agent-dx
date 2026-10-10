@@ -1,0 +1,15 @@
+[package]
+name = "adx-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared ADX control-plane domain types and metrics"
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+thiserror = "1"

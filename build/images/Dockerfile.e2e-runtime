@@ -1,0 +1,4 @@
+ARG BASE=ubuntu:24.04@sha256:224a1869083a311ef3f13648a154ba79832fbef6364d31493642ca03082da254
+FROM ${BASE}
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates curl busybox-static iproute2 iptables ipset kmod e2fsprogs erofs-utils procps libseccomp2 libapparmor1 python3 python3-venv python3-pip openssl docker-registry gcc make libc6-dev && rm -rf /var/lib/apt/lists/*
+RUN update-alternatives --set iptables /usr/sbin/iptables-legacy && update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy

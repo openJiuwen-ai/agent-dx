@@ -1,0 +1,52 @@
+syntax = "proto3";
+
+package adx.control.v1;
+
+import "environment_types.proto";
+
+service RouteService { rpc WatchRoutes(WatchRoutesRequest) returns (stream RouteFrame); }
+
+service EnvironmentDirectoryService {
+  rpc WatchEnvironments(WatchEnvironmentsRequest) returns (stream EnvironmentDirectoryFrame);
+}
+
+message WatchRoutesRequest {}
+
+message PublishedRoute {
+ string environment_id = 1;
+ string tenant_id = 2;
+ string runtime_id = 3;
+ string runtime_ip = 4;
+ string relay_address = 5;
+ uint64 generation = 6;
+ uint64 environment_revision = 7;
+ DataPlaneSecurityMode tunnel_security_mode = 8;
+ DataPlaneSecurityMode port_forward_security_mode = 9;
+ repeated uint32 forwarded_ports = 10;
+}
+
+message RouteFrame {
+ uint64 epoch = 1;
+ uint64 revision = 2;
+ uint64 base_revision = 3;
+ bool reset = 4;
+ repeated PublishedRoute upserts = 5;
+ repeated string deleted = 6;
+}
+
+message WatchEnvironmentsRequest {}
+
+message PublishedEnvironment {
+  EnvironmentRecord record = 1;
+  string node_address = 2;
+  string relay_address = 3;
+}
+
+message EnvironmentDirectoryFrame {
+  uint64 epoch = 1;
+  uint64 revision = 2;
+  uint64 base_revision = 3;
+  bool reset = 4;
+  repeated PublishedEnvironment upserts = 5;
+  repeated string deleted = 6;
+}

@@ -1,0 +1,58 @@
+[package]
+name = "afs"
+version.workspace = true
+edition = "2024"
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Agent FS process and backend foundation"
+publish = false
+
+[features]
+default = ["ownerfs", "dfs"]
+ownerfs = []
+dfs = []
+rdma = ["afs-transport/rdma"]
+
+[[example]]
+name = "afs-workspace-probe"
+path = "tests/support/workspace_probe.rs"
+
+[[example]]
+name = "afs-root-command-meta"
+path = "tests/support/root_command_meta.rs"
+required-features = ["ownerfs"]
+
+[dependencies]
+afs-error = { path = "common/error" }
+afs-logging = { path = "common/logging" }
+afs-metrics = { path = "common/metrics" }
+afs-protocol = { path = "common/protocol" }
+afs-tracing = { path = "common/tracing", features = ["runtime"] }
+afs-transport = { path = "common/transport", default-features = false, features = ["grpc", "shm"] }
+
+clap = { version = "4.5.51", features = ["derive"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0"
+etcd-client = { version = "0.20.0", default-features = false, features = ["tls-ring"] }
+redis = { version = "1", default-features = false, features = ["aio", "tokio-comp"] }
+toml = "0.9.8"
+tokio = { version = "1.47.1", features = ["full"] }
+tokio-stream = { version = "0.1.17", features = ["net"] }
+tonic = { version = "0.14.6", features = ["tls-ring"] }
+prost = "0.14"
+axum = "0.8"
+thiserror = "2.0.16"
+libc = "0.2"
+blake3 = "1.8"
+fuser = { version = "=0.18.0", default-features = false }
+
+[dev-dependencies]
+tempfile = "3"
+afs-client = { path = "client" }
+hyper-util = { version = "0.1", features = ["tokio"] }
+opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic", "trace"] }
+tower = { version = "0.5", features = ["util"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,83 @@
+{
+  "schema_version": 1,
+  "bindings": [
+    {
+      "case_id": "FUN-13",
+      "profile": "smoke",
+      "matrix": {
+        "backend": "OwnerFs",
+        "meta": "memory"
+      },
+      "owner_mount": "/mnt/afs-ownerfs",
+      "dfs_mount": "/mnt/afs-dfs",
+      "owner_base_dir": "/mnt/afs-ownerfs/workspace",
+      "dfs_base_dir": "/mnt/afs-dfs",
+      "node_process": {
+        "role": "node",
+        "pid": 175471,
+        "sha256": "<observed-afs-node-sha256>",
+        "config_path": "/etc/afs/node.toml",
+        "config_sha256": "<observed-node-config-sha256>",
+        "boot_id": "<observed-node-boot-id>",
+        "start_ticks": "<observed-node-start-ticks>"
+      },
+      "meta_worker": {
+        "transport": "ssh",
+        "host": "afs-test-control",
+        "ssh_config": "/etc/afs-acceptance/ssh_config",
+        "python": "/usr/bin/python3",
+        "driver": "/opt/afs-acceptance/drivers/mount_isolation.py",
+        "expected_process": {
+          "role": "meta",
+          "pid": 1458467,
+          "sha256": "<observed-afs-meta-sha256>",
+          "config_path": "/etc/afs/meta.toml",
+          "config_sha256": "<observed-meta-config-sha256>",
+          "boot_id": "<observed-meta-boot-id>",
+          "start_ticks": "<observed-meta-start-ticks>"
+        }
+      },
+      "access_uid": 65534,
+      "access_gid": 65534
+    },
+    {
+      "case_id": "FUN-13",
+      "profile": "smoke",
+      "matrix": {
+        "backend": "DFS",
+        "meta": "memory"
+      },
+      "owner_mount": "/mnt/afs-ownerfs",
+      "dfs_mount": "/mnt/afs-dfs",
+      "owner_base_dir": "/mnt/afs-ownerfs/workspace",
+      "dfs_base_dir": "/mnt/afs-dfs",
+      "node_process": {
+        "role": "node",
+        "pid": 175471,
+        "sha256": "<observed-afs-node-sha256>",
+        "config_path": "/etc/afs/node.toml",
+        "config_sha256": "<observed-node-config-sha256>",
+        "boot_id": "<observed-node-boot-id>",
+        "start_ticks": "<observed-node-start-ticks>"
+      },
+      "meta_worker": {
+        "transport": "ssh",
+        "host": "afs-test-control",
+        "ssh_config": "/etc/afs-acceptance/ssh_config",
+        "python": "/usr/bin/python3",
+        "driver": "/opt/afs-acceptance/drivers/mount_isolation.py",
+        "expected_process": {
+          "role": "meta",
+          "pid": 1458467,
+          "sha256": "<observed-afs-meta-sha256>",
+          "config_path": "/etc/afs/meta.toml",
+          "config_sha256": "<observed-meta-config-sha256>",
+          "boot_id": "<observed-meta-boot-id>",
+          "start_ticks": "<observed-meta-start-ticks>"
+        }
+      },
+      "access_uid": 65534,
+      "access_gid": 65534
+    }
+  ]
+}

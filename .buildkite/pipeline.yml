@@ -1,0 +1,9 @@
+steps:
+- label: ':pipeline: Select ADX pipeline'
+  key: select-pipeline
+  agents:
+    queue: default
+    os: linux
+    arch: amd64
+  command: bash .buildkite/select-pipeline.sh
+  timeout_in_minutes: 5

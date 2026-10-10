@@ -1,0 +1,14 @@
+{
+  "listen": "127.0.0.1:8091",
+  "redis_url": "redis://127.0.0.1:6379/0",
+  "namespace": "adx-environment-local",
+  "sandbox_url": "http://127.0.0.1:8081",
+  "sandbox_api_key_envs": {"tenant": "ADX_PLATFORM_TENANT_API_KEY"},
+  "allow_plaintext_transport": true,
+  "sandbox_ca_file": null,
+  "request_timeout_seconds": 60,
+  "binding_cache": {
+    "capacity": 200000,
+    "idle_seconds": 18000
+  }
+}

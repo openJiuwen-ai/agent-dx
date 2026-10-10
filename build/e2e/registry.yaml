@@ -1,0 +1,8 @@
+version: 0.1
+log:
+  level: warn
+storage:
+  filesystem:
+    rootdirectory: /tmp/adx-e2e/registry
+http:
+  addr: :5000

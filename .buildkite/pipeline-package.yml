@@ -1,0 +1,742 @@
+steps:
+- label: Build · Platform · Linux x86_64
+  key: build-platform
+  agents:
+    queue: default
+    os: linux
+    arch: amd64
+  concurrency: 1
+  concurrency_group: adx/build-platform-amd64
+  command: bash .buildkite/step.sh build-platform bash .buildkite/build-component.sh platform
+  timeout_in_minutes: 45
+  artifact_paths:
+  - out/buildkite/logs/**/*
+  env:
+    BUILDKITE_AGENT_NAME: agent-stack-k8s
+    ADX_CARGO_HOME: /mnt/paas/build-cache/adx/cargo-home
+    CARGO_HOME: /mnt/paas/build-cache/adx/cargo-home
+    CARGO_TARGET_DIR: /mnt/paas/build-cache/adx/cargo-target/platform-amd64-rust1950
+    RUSTUP_TOOLCHAIN: 1.95.0
+    RUSTUP_AUTO_INSTALL: '0'
+    GOCACHE: /mnt/paas/build-cache/adx/go-build/amd64
+    GOMODCACHE: /mnt/paas/build-cache/adx/go-mod
+  plugins: &id001
+  - kubernetes:
+      podSpec:
+        imagePullSecrets:
+        - name: swr-pull-secret
+        containers:
+        - image: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/adx-build@sha256:7cd63f1d779963576ba3ddbf258a01af9fad289fb4f0e848a34dfb75d5139ade
+          volumeMounts:
+          - name: build-cache
+            mountPath: /mnt/paas
+          resources:
+            requests:
+              cpu: '4'
+              memory: 8Gi
+            limits:
+              cpu: '8'
+              memory: 16Gi
+          env:
+          - name: OBS_ACCESS_KEY_ID
+            valueFrom:
+              secretKeyRef:
+                name: obs-credentials
+                key: AK
+                optional: true
+          - name: OBS_SECRET_ACCESS_KEY
+            valueFrom:
+              secretKeyRef:
+                name: obs-credentials
+                key: SK
+                optional: true
+        volumes:
+        - name: build-cache
+          hostPath:
+            path: /mnt/paas
+            type: DirectoryOrCreate
+- label: Build · Gateway · Linux x86_64
+  key: build-gateway
+  agents:
+    queue: default
+    os: linux
+    arch: amd64
+  concurrency: 1
+  concurrency_group: adx/build-gateway-amd64
+  command: bash .buildkite/step.sh build-gateway bash .buildkite/build-component.sh gateway
+  timeout_in_minutes: 45
+  artifact_paths:
+  - out/buildkite/logs/**/*
+  env:
+    BUILDKITE_AGENT_NAME: agent-stack-k8s
+    ADX_CARGO_HOME: /mnt/paas/build-cache/adx/cargo-home
+    CARGO_HOME: /mnt/paas/build-cache/adx/cargo-home
+    CARGO_TARGET_DIR: /mnt/paas/build-cache/adx/cargo-target/gateway-amd64-rust1950
+    RUSTUP_TOOLCHAIN: 1.95.0
+    RUSTUP_AUTO_INSTALL: '0'
+    GOCACHE: /mnt/paas/build-cache/adx/go-build/amd64
+    GOMODCACHE: /mnt/paas/build-cache/adx/go-mod
+  plugins: *id001
+- label: Build · Execd · Linux x86_64
+  key: build-execd
+  agents:
+    queue: default
+    os: linux
+    arch: amd64
+  concurrency: 1
+  concurrency_group: adx/build-execd-amd64
+  command: bash .buildkite/step.sh build-execd bash .buildkite/build-component.sh execd
+  timeout_in_minutes: 30
+  artifact_paths:
+  - out/buildkite/logs/**/*
+  env:
+    BUILDKITE_AGENT_NAME: agent-stack-k8s
+    ADX_CARGO_HOME: /mnt/paas/build-cache/adx/cargo-home
+    CARGO_HOME: /mnt/paas/build-cache/adx/cargo-home
+    CARGO_TARGET_DIR: /mnt/paas/build-cache/adx/cargo-target/execd-amd64-rust1950
+    RUSTUP_TOOLCHAIN: 1.95.0
+    RUSTUP_AUTO_INSTALL: '0'
+    GOCACHE: /mnt/paas/build-cache/adx/go-build/amd64
+    GOMODCACHE: /mnt/paas/build-cache/adx/go-mod
+  plugins: *id001
+- label: Build · AFS · Linux x86_64
+  key: build-afs
+  if: build.env("ADX_WITH_AFS") == "1"
+  agents:
+    queue: default
+    os: linux
+    arch: amd64
+  concurrency: 1
+  concurrency_group: adx/build-afs-amd64
+  command: bash .buildkite/step.sh build-afs bash .buildkite/build-component.sh afs
+  timeout_in_minutes: 45
+  artifact_paths:
+  - out/buildkite/logs/**/*
+  env:
+    BUILDKITE_AGENT_NAME: agent-stack-k8s
+    ADX_WITH_AFS: '1'
+    ADX_CARGO_HOME: /mnt/paas/build-cache/adx/cargo-home
+    CARGO_HOME: /mnt/paas/build-cache/adx/cargo-home
+    CARGO_TARGET_DIR: /mnt/paas/build-cache/adx/cargo-target/afs-component-amd64-rust1950
+    RUSTUP_TOOLCHAIN: 1.95.0
+    RUSTUP_AUTO_INSTALL: '0'
+    GOCACHE: /mnt/paas/build-cache/adx/go-build/amd64
+    GOMODCACHE: /mnt/paas/build-cache/adx/go-mod
+  plugins: *id001
+- label: Build · Platform · Linux ARM64
+  key: build-platform-arm64
+  if: build.env("ADX_ARM_BUILD") != "0"
+  agents:
+    queue: default
+    os: macos
+    arch: arm64
+  concurrency: 1
+  concurrency_group: adx/native-arm64
+  command: python3 .buildkite/with_registry.py --docker -- bash .buildkite/build-arm-package.sh build platform
+  secrets:
+    SWR_DOCKER_CONFIG_JSON: ADX_SWR_PULL_CONFIG
+  timeout_in_minutes: 60
+  artifact_paths:
+  - out/buildkite/arm64/logs/**/*
+  - out/buildkite/arm64/components/*.tar.gz
+  env:
+    JOBS: '4'
+- label: Build · AFS · Linux ARM64
+  key: build-afs-arm64
+  if: build.env("ADX_ARM_BUILD") != "0" && build.env("ADX_WITH_AFS") == "1"
+  agents:
+    queue: default
+    os: macos
+    arch: arm64
+  concurrency: 1
+  concurrency_group: adx/native-arm64
+  command: python3 .buildkite/with_registry.py --docker -- bash .buildkite/build-arm-package.sh build afs
+  secrets:
+    SWR_DOCKER_CONFIG_JSON: ADX_SWR_PULL_CONFIG
+  timeout_in_minutes: 60
+  artifact_paths:
+  - out/buildkite/arm64/logs/**/*
+  - out/buildkite/arm64/components/*.tar.gz
+  env:
+    JOBS: '4'
+    ADX_WITH_AFS: '1'
+- label: Build · Gateway · Linux ARM64
+  key: build-gateway-arm64
+  if: build.env("ADX_ARM_BUILD") != "0"
+  agents:
+    queue: default
+    os: macos
+    arch: arm64
+  concurrency: 1
+  concurrency_group: adx/native-arm64
+  command: python3 .buildkite/with_registry.py --docker -- bash .buildkite/build-arm-package.sh build gateway
+  secrets:
+    SWR_DOCKER_CONFIG_JSON: ADX_SWR_PULL_CONFIG
+  timeout_in_minutes: 60
+  artifact_paths:
+  - out/buildkite/arm64/logs/**/*
+  - out/buildkite/arm64/components/*.tar.gz
+  env:
+    JOBS: '4'
+- label: Build · Execd · Linux ARM64
+  key: build-execd-arm64
+  if: build.env("ADX_ARM_BUILD") != "0"
+  agents:
+    queue: default
+    os: macos
+    arch: arm64
+  concurrency: 1
+  concurrency_group: adx/native-arm64
+  command: python3 .buildkite/with_registry.py --docker -- bash .buildkite/build-arm-package.sh build execd
+  secrets:
+    SWR_DOCKER_CONFIG_JSON: ADX_SWR_PULL_CONFIG
+  timeout_in_minutes: 60
+  artifact_paths:
+  - out/buildkite/arm64/logs/**/*
+  - out/buildkite/arm64/components/*.tar.gz
+  env:
+    JOBS: '4'
+- label: Quality · Source
+  key: source-gate
+  agents:
+    queue: default
+    os: linux
+    arch: amd64
+  concurrency: 1
+  concurrency_group: adx/source-gate-amd64
+  command: bash .buildkite/step.sh source-gate bash .buildkite/source-gate.sh
+  timeout_in_minutes: 60
+  artifact_paths:
+  - out/buildkite/logs/**/*
+  env:
+    BUILDKITE_AGENT_NAME: agent-stack-k8s
+    ADX_CARGO_HOME: /mnt/paas/build-cache/adx/cargo-home
+    CARGO_HOME: /mnt/paas/build-cache/adx/cargo-home
+    CARGO_TARGET_DIR: /mnt/paas/build-cache/adx/cargo-target/source-gate-amd64-rust1950
+    RUSTUP_TOOLCHAIN: 1.95.0
+    RUSTUP_AUTO_INSTALL: '0'
+    GOCACHE: /mnt/paas/build-cache/adx/go-build/amd64
+    GOMODCACHE: /mnt/paas/build-cache/adx/go-mod
+  plugins:
+  - kubernetes:
+      podSpec:
+        imagePullSecrets:
+        - name: swr-pull-secret
+        containers:
+        - image: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/adx-build@sha256:7cd63f1d779963576ba3ddbf258a01af9fad289fb4f0e848a34dfb75d5139ade
+          volumeMounts:
+          - name: build-cache
+            mountPath: /mnt/paas
+          resources:
+            requests:
+              cpu: '4'
+              memory: 8Gi
+            limits:
+              cpu: '8'
+              memory: 16Gi
+        volumes:
+        - name: build-cache
+          hostPath:
+            path: /mnt/paas
+            type: DirectoryOrCreate
+- label: Python · adxadmin
+  key: admin-package
+  agents:
+    queue: default
+    os: linux
+    arch: amd64
+  concurrency: 1
+  concurrency_group: adx/admin-package
+  command: python3 .buildkite/with_registry.py --docker -- bash .buildkite/step.sh admin-package bash .buildkite/build-sdk.sh
+    admin
+  timeout_in_minutes: 30
+  artifact_paths:
+  - out/buildkite/admin/**/*
+  - out/buildkite/logs/admin-*.log
+  - out/buildkite/logs/step-admin-package.log
+  - out/buildkite/logs/sdk-dockerd.log
+  env:
+    BUILDKITE_AGENT_NAME: agent-stack-k8s
+    ADX_SDK_TEST_IMAGE: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/adx-python-build@sha256:12afbd81cde9ec5931c9db8aaf955720fdfd1e1e267545a44430ce79a4d81854
+  plugins:
+  - kubernetes:
+      podSpec:
+        imagePullSecrets:
+        - name: swr-pull-secret
+        containers:
+        - image: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/sandbox-packager:v20260506_kubectl
+          securityContext:
+            privileged: true
+          volumeMounts:
+          - name: docker-graph
+            mountPath: /var/lib/docker
+          - name: build-cache
+            mountPath: /mnt/paas
+          resources:
+            requests:
+              cpu: '2'
+              memory: 4Gi
+            limits:
+              cpu: '4'
+              memory: 8Gi
+          env:
+          - name: SWR_USERNAME
+            valueFrom:
+              secretKeyRef:
+                name: swr-credentials
+                key: username
+                optional: true
+          - name: SWR_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: swr-credentials
+                key: password
+                optional: true
+          - name: SWR_DOCKER_CONFIG_JSON
+            valueFrom:
+              secretKeyRef:
+                name: swr-pull-secret
+                key: .dockerconfigjson
+                optional: true
+        volumes:
+        - name: docker-graph
+          emptyDir: {}
+        - name: build-cache
+          hostPath:
+            path: /mnt/paas
+            type: DirectoryOrCreate
+- label: Python · Sandbox SDK
+  key: sdk-package
+  agents:
+    queue: default
+    os: linux
+    arch: amd64
+  concurrency: 1
+  concurrency_group: adx/sdk-package
+  command: python3 .buildkite/with_registry.py --docker -- bash .buildkite/build-sdk.sh
+  timeout_in_minutes: 30
+  artifact_paths:
+  - out/buildkite/sdk/**/*
+  - out/buildkite/logs/sdk-*.log
+  env:
+    BUILDKITE_AGENT_NAME: agent-stack-k8s
+    ADX_SDK_TEST_IMAGE: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/adx-python-build@sha256:12afbd81cde9ec5931c9db8aaf955720fdfd1e1e267545a44430ce79a4d81854
+  plugins:
+  - kubernetes:
+      podSpec:
+        imagePullSecrets:
+        - name: swr-pull-secret
+        containers:
+        - image: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/sandbox-packager:v20260506_kubectl
+          securityContext:
+            privileged: true
+          volumeMounts:
+          - name: docker-graph
+            mountPath: /var/lib/docker
+          - name: build-cache
+            mountPath: /mnt/paas
+          resources:
+            requests:
+              cpu: '2'
+              memory: 4Gi
+            limits:
+              cpu: '4'
+              memory: 8Gi
+          env:
+          - name: SWR_USERNAME
+            valueFrom:
+              secretKeyRef:
+                name: swr-credentials
+                key: username
+                optional: true
+          - name: SWR_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: swr-credentials
+                key: password
+                optional: true
+          - name: SWR_DOCKER_CONFIG_JSON
+            valueFrom:
+              secretKeyRef:
+                name: swr-pull-secret
+                key: .dockerconfigjson
+                optional: true
+        volumes:
+        - name: docker-graph
+          emptyDir: {}
+        - name: build-cache
+          hostPath:
+            path: /mnt/paas
+            type: DirectoryOrCreate
+- label: Release · Assemble · Linux x86_64
+  key: platform-build
+  depends_on:
+  - build-platform
+  - build-gateway
+  - build-execd
+  - build-afs
+  - source-gate
+  - admin-package
+  - sdk-package
+  agents:
+    queue: default
+    os: linux
+    arch: amd64
+  command: bash .buildkite/step.sh release bash .buildkite/package-components.sh
+  timeout_in_minutes: 20
+  artifact_paths:
+  - out/buildkite/logs/**/*
+  - out/buildkite/adx-release.tar.gz
+  - out/buildkite/adx-release.tar.gz.sha256
+  - out/buildkite/backend.tar.gz
+  - out/buildkite/release-manifest.json
+  - out/buildkite/build-manifest.json
+  - out/buildkite/obs/*.json
+  - out/buildkite/obs/urls.txt
+  - out/buildkite/admin/**/*
+  - out/buildkite/adx-execd.tar.gz
+  - out/buildkite/adx-execd.tar.gz.sha256
+  - out/buildkite/sdk/**/*
+  env:
+    BUILDKITE_AGENT_NAME: agent-stack-k8s
+    ADX_CARGO_HOME: /mnt/paas/build-cache/adx/cargo-home
+    CARGO_HOME: /mnt/paas/build-cache/adx/cargo-home
+    CARGO_TARGET_DIR: /mnt/paas/build-cache/adx/cargo-target/package-amd64-rust1950
+    RUSTUP_TOOLCHAIN: 1.95.0
+    RUSTUP_AUTO_INSTALL: '0'
+    GOCACHE: /mnt/paas/build-cache/adx/go-build/amd64
+    GOMODCACHE: /mnt/paas/build-cache/adx/go-mod
+    ADX_BACKEND_ARTIFACT_BUILD: 01a0ad6d-9629-4da8-903b-3f8bd1ddc992
+    ADX_DEFER_PUBLICATION: '1'
+  plugins: *id001
+- label: Release · Assemble · Linux ARM64
+  key: platform-build-arm64
+  if: build.env("ADX_ARM_BUILD") != "0"
+  depends_on:
+  - build-platform-arm64
+  - build-gateway-arm64
+  - build-execd-arm64
+  - build-afs-arm64
+  - source-gate
+  - sdk-package
+  - admin-package
+  agents:
+    queue: default
+    os: macos
+    arch: arm64
+  concurrency: 1
+  concurrency_group: adx/native-arm64
+  command: python3 .buildkite/with_registry.py --docker -- bash .buildkite/build-arm-package.sh package
+  secrets:
+    SWR_DOCKER_CONFIG_JSON: ADX_SWR_PULL_CONFIG
+  timeout_in_minutes: 20
+  artifact_paths:
+  - out/buildkite/arm64/logs/**/*
+  - out/buildkite/arm64/*.tar.gz
+  - out/buildkite/arm64/*.sha256
+  - out/buildkite/arm64/*manifest.json
+  - out/buildkite/arm64/obs/*
+  - out/buildkite/arm64/sdk/*
+  - out/buildkite/arm64/admin/*
+  env:
+    JOBS: '4'
+- label: Release · Publish · Linux x86_64
+  key: publish-amd64
+  depends_on: platform-build
+  agents:
+    queue: default
+    os: linux
+    arch: amd64
+  command: bash .buildkite/step.sh obs-amd64 bash .buildkite/publish-amd-package.sh
+  timeout_in_minutes: 20
+  artifact_paths:
+  - out/buildkite/obs/*
+  - out/buildkite/logs/**/*
+  env:
+    BUILDKITE_AGENT_NAME: agent-stack-k8s
+  plugins: *id001
+- label: Release · Publish · Linux ARM64
+  key: publish-arm64
+  if: build.env("ADX_ARM_BUILD") != "0"
+  depends_on: platform-build-arm64
+  agents:
+    queue: default
+    os: linux
+    arch: amd64
+  command: bash .buildkite/step.sh obs-arm64 bash .buildkite/publish-arm-package.sh
+  timeout_in_minutes: 20
+  artifact_paths:
+  - out/buildkite/arm64/obs/*
+  - out/buildkite/logs/**/*
+  env:
+    BUILDKITE_AGENT_NAME: agent-stack-k8s
+  plugins: *id001
+- label: Release · Index · Linux ARM64
+  key: artifact-manifest-arm64
+  if: build.env("ADX_ARM_BUILD") != "0"
+  depends_on: publish-arm64
+  agents:
+    queue: default
+    os: linux
+    arch: amd64
+  command: bash .buildkite/artifact-manifest.sh
+  timeout_in_minutes: 5
+  artifact_paths:
+  - out/buildkite/index-arm64.html
+  env:
+    ADX_BUILD_ARCH: arm64
+    BUILDKITE_AGENT_NAME: agent-stack-k8s
+  plugins: *id001
+- label: Release · Index · Linux x86_64
+  key: artifact-manifest
+  depends_on: publish-amd64
+  agents:
+    queue: default
+    os: linux
+    arch: amd64
+  command: bash .buildkite/step.sh manifest bash .buildkite/artifact-manifest.sh
+  timeout_in_minutes: 5
+  artifact_paths:
+  - out/buildkite/index.html
+  - out/buildkite/logs/step-manifest.log
+  env:
+    BUILDKITE_AGENT_NAME: agent-stack-k8s
+  plugins:
+  - kubernetes:
+      podSpec:
+        imagePullSecrets:
+        - name: swr-pull-secret
+        containers:
+        - image: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/sandbox-deployer:v20260506_kubectl_py39
+          resources:
+            requests:
+              cpu: '1'
+              memory: 1Gi
+            limits:
+              cpu: '2'
+              memory: 2Gi
+- label: Acceptance · Build Images
+  key: platform-images
+  agents:
+    queue: default
+    os: linux
+    arch: amd64
+  command: bash .buildkite/step.sh images python3 .buildkite/with_registry.py --docker -- bash .buildkite/package-smoke.sh
+  timeout_in_minutes: 40
+  env:
+    BUILDKITE_AGENT_NAME: agent-stack-k8s
+    ADX_E2E_IMAGE_REPOSITORY: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/adx-e2e
+  artifact_paths:
+  - out/buildkite/logs/**/*
+  - out/buildkite/bundle/*.json
+  plugins:
+  - kubernetes:
+      podSpec:
+        imagePullSecrets:
+        - name: swr-pull-secret
+        containers:
+        - image: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/sandbox-packager:v20260506_kubectl
+          securityContext:
+            privileged: true
+          volumeMounts:
+          - name: docker-graph
+            mountPath: /var/lib/docker
+          resources:
+            requests:
+              cpu: '8'
+              memory: 16Gi
+            limits:
+              cpu: '8'
+              memory: 16Gi
+          env:
+          - name: SWR_USERNAME
+            valueFrom:
+              secretKeyRef:
+                name: swr-credentials
+                key: username
+                optional: true
+          - name: SWR_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: swr-credentials
+                key: password
+                optional: true
+          - name: SWR_DOCKER_CONFIG_JSON
+            valueFrom:
+              secretKeyRef:
+                name: swr-pull-secret
+                key: .dockerconfigjson
+                optional: true
+          - name: OBS_ACCESS_KEY_ID
+            valueFrom:
+              secretKeyRef:
+                name: obs-credentials
+                key: AK
+                optional: true
+          - name: OBS_SECRET_ACCESS_KEY
+            valueFrom:
+              secretKeyRef:
+                name: obs-credentials
+                key: SK
+                optional: true
+        volumes:
+        - name: docker-graph
+          emptyDir: {}
+  depends_on:
+  - platform-build
+  - publish-amd64
+- label: Acceptance · Kubernetes L0
+  key: platform-e2e
+  depends_on: platform-images
+  agents:
+    queue: default
+    os: linux
+    arch: amd64
+  command: bash .buildkite/step.sh e2e python3 .buildkite/with_registry.py -- bash .buildkite/run-e2e.sh
+  timeout_in_minutes: 30
+  artifact_paths:
+  - out/buildkite/acceptance/**/*
+  - out/buildkite/logs/**/*
+  env:
+    BUILDKITE_AGENT_NAME: agent-stack-k8s
+    ADX_KUBECONFIG: /var/run/yr-k8s/target/kubeconfig
+    ADX_E2E_PROFILE: l0
+  plugins:
+  - kubernetes:
+      podSpec:
+        imagePullSecrets:
+        - name: swr-pull-secret
+        containers:
+        - image: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/sandbox-deployer:v20260506_kubectl_py39
+          resources:
+            requests:
+              cpu: '2'
+              memory: 4Gi
+            limits:
+              cpu: '4'
+              memory: 8Gi
+          env:
+          - name: SWR_USERNAME
+            valueFrom:
+              secretKeyRef:
+                name: swr-credentials
+                key: username
+                optional: true
+          - name: SWR_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: swr-credentials
+                key: password
+                optional: true
+          - name: SWR_DOCKER_CONFIG_JSON
+            valueFrom:
+              secretKeyRef:
+                name: swr-pull-secret
+                key: .dockerconfigjson
+                optional: true
+- label: Publish · adxadmin · PyPI
+  key: admin-pypi
+  depends_on: platform-e2e
+  if: build.env("ADX_ADMIN_PYPI_UPLOAD") == "1" && build.tag != null
+  agents:
+    queue: default
+    os: linux
+    arch: amd64
+  concurrency: 1
+  concurrency_group: adx/admin-pypi
+  command: bash .buildkite/step.sh admin-pypi bash .buildkite/publish-admin-pypi.sh
+  timeout_in_minutes: 15
+  artifact_paths:
+  - out/buildkite/admin-publish/**/*
+  - out/buildkite/logs/step-admin-pypi.log
+  env:
+    BUILDKITE_AGENT_NAME: agent-stack-k8s
+    PIP_CACHE_DIR: /mnt/paas/build-cache/adx/pip
+  plugins:
+  - kubernetes:
+      podSpec:
+        imagePullSecrets:
+        - name: swr-pull-secret
+        containers:
+        - image: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/adx-python-build@sha256:12afbd81cde9ec5931c9db8aaf955720fdfd1e1e267545a44430ce79a4d81854
+          volumeMounts:
+          - name: build-cache
+            mountPath: /mnt/paas
+          resources:
+            requests:
+              cpu: '1'
+              memory: 2Gi
+            limits:
+              cpu: '2'
+              memory: 4Gi
+          env:
+          - name: ADX_ADMIN_PYPI_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: adx-pypi-credentials
+                key: admin-pypi-token
+                optional: true
+          - name: ADX_ADMIN_TEST_PYPI_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: adx-pypi-credentials
+                key: admin-testpypi-token
+                optional: true
+        volumes:
+        - name: build-cache
+          hostPath:
+            path: /mnt/paas
+            type: DirectoryOrCreate
+- label: Publish · Sandbox SDK · PyPI
+  key: sdk-pypi
+  depends_on: platform-e2e
+  if: build.env("ADX_SDK_PYPI_UPLOAD") == "1" && build.tag != null
+  agents:
+    queue: default
+    os: linux
+    arch: amd64
+  concurrency: 1
+  concurrency_group: adx/sdk-pypi
+  command: bash .buildkite/step.sh sdk-pypi bash .buildkite/publish-sdk-pypi.sh
+  timeout_in_minutes: 15
+  artifact_paths:
+  - out/buildkite/sdk-publish/**/*
+  - out/buildkite/logs/step-sdk-pypi.log
+  env:
+    BUILDKITE_AGENT_NAME: agent-stack-k8s
+    PIP_CACHE_DIR: /mnt/paas/build-cache/adx/pip
+  plugins:
+  - kubernetes:
+      podSpec:
+        imagePullSecrets:
+        - name: swr-pull-secret
+        containers:
+        - image: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/adx-python-build@sha256:12afbd81cde9ec5931c9db8aaf955720fdfd1e1e267545a44430ce79a4d81854
+          volumeMounts:
+          - name: build-cache
+            mountPath: /mnt/paas
+          resources:
+            requests:
+              cpu: '1'
+              memory: 2Gi
+            limits:
+              cpu: '2'
+              memory: 4Gi
+          env:
+          - name: ADX_SANDBOX_PYPI_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: adx-pypi-credentials
+                key: sandbox-pypi-token
+                optional: true
+          - name: ADX_SANDBOX_TEST_PYPI_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: adx-pypi-credentials
+                key: sandbox-testpypi-token
+                optional: true
+        volumes:
+        - name: build-cache
+          hostPath:
+            path: /mnt/paas
+            type: DirectoryOrCreate
