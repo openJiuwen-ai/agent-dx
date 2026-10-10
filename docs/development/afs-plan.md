@@ -1,6 +1,6 @@
 # Agent FS（AFS） 迁移计划
 
-更新日期：2026-10-09。
+更新日期：2026-10-10。
 
 本页是 Agent DX 仓内当前 Agent FS（AFS） 迁移入口。它承接 DMS/AFS 快照的正式能力说明，但不导入原仓过程资产、历史证据、checkpoint、`.codex`、`.omx` 或旧 GitHub Actions。
 
@@ -19,9 +19,11 @@
 - 源码位于根级 `afs/`，包含 OwnerFs 和 DistributedFs 两条路径。
 - 默认 ADX 构建、测试、发布包和部署不包含文件系统二进制或运行依赖。
 - AFS 相关变更在默认 pipeline 中触发专用 gate；该 gate 使用 `ADX_WITH_AFS=1` 检查 Agent FS（AFS），不改变默认发布包。
-- 显式设置 `ADX_WITH_AFS=1` 后，Buildkite 运行独立 `build-afs` 组件步并在组装、包清单和发布校验中传递 `--with-afs`。
+- 显式设置 `ADX_WITH_AFS=1` 后，Buildkite 运行独立 `build-afs` 和 `build-afs-arm64` 可选组件步并在组装、包清单和发布校验中传递 `--with-afs`。
 - 默认 `afs-check` 覆盖 OwnerFs 和 DFS 默认 feature；RDMA/all-features lint 需要显式设置 `ADX_AFS_ALL_FEATURES=1`，并以 `libibverbs` 开发文件作为前置。
 - 测试辅助程序只由验收流程显式构建，不作为普通产品二进制发布。
+
+显式 ON 在 x86_64 与 ARM64 使用相同开关和包清单合同。ARM64 沿用公共原生 Linux builder、独立缓存、凭据适配和本地组件组装；无外部 backend 的清单与 AFS ON/OFF 分别校验。未在本轮执行远端 Buildkite 全量发布，不将本地合同测试写成正式双架构出包通过。
 
 ## 支持范围
 

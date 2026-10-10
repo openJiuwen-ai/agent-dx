@@ -25,6 +25,7 @@ fi
 : "${BUILDKITE_COMMIT:?Buildkite revision required}"
 : "${BUILDKITE_BUILD_ID:?Buildkite build ID required}"
 
+source "$(dirname "$0")/build-architecture.sh"
 root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$root"
 output=out/buildkite/obs
@@ -40,29 +41,34 @@ verify_dir=$(mktemp -d out/buildkite/obs-package-check.XXXXXX)
 trap 'rm -rf "$verify_dir"' EXIT
 tar -xzf out/buildkite/adx-release.tar.gz -C "$verify_dir"
 "$python" build/release/package.py verify "$verify_dir"
-mkdir -p out/buildkite/backend
-tar -xzf out/buildkite/backend.tar.gz -C out/buildkite/backend
-"$python" build/e2e/verify_backend.py \
-  --directory out/buildkite/backend \
-  --target x86_64-unknown-linux-gnu
+case "${ADX_EXTERNAL_BACKEND:-1}" in
+  0|1) ;;
+  *) echo 'ADX_EXTERNAL_BACKEND must be 0 or 1' >&2; exit 2 ;;
+esac
+backend_args=()
+runtime_artifacts=()
+if [[ ${ADX_EXTERNAL_BACKEND:-1} == 1 ]]; then
+  mkdir -p out/buildkite/backend
+  tar -xzf out/buildkite/backend.tar.gz -C out/buildkite/backend
+  "$python" build/e2e/verify_backend.py --directory out/buildkite/backend --target "$ADX_RELEASE_TARGET"
+  backend_args=(--backend-manifest out/buildkite/backend/manifest.json --backend-archive out/buildkite/backend.tar.gz)
+  runtime_archive="$output/adx-runtime-runc-${BUILDKITE_COMMIT:0:12}-linux-${ADX_BUILD_ARCH}.tar.gz"
+  cp out/buildkite/backend.tar.gz "$runtime_archive"
+  sha256sum "$runtime_archive" > "$runtime_archive.sha256"
+  runtime_artifacts=("$runtime_archive" "$runtime_archive.sha256")
+fi
 base_wheels=("$verify_dir"/sdk/adx_sandbox-*.whl)
 [[ ${#base_wheels[@]} == 1 && -f ${base_wheels[0]} ]] || { echo 'base package SDK wheel is missing' >&2; exit 1; }
 "$python" build/release/component.py verify-build \
   --manifest out/buildkite/build-manifest.json \
   --commit "$BUILDKITE_COMMIT" \
-  --target x86_64-unknown-linux-gnu \
+  --target "$ADX_RELEASE_TARGET" \
   --package-manifest "$verify_dir/manifest.json" \
   --release-archive out/buildkite/adx-release.tar.gz \
   --wheel "${base_wheels[0]}" \
-  --backend-manifest out/buildkite/backend/manifest.json \
-  --backend-archive out/buildkite/backend.tar.gz \
+  "${backend_args[@]}" \
   "${component_args[@]}"
 rm -rf "$verify_dir"
-
-commit_short=${BUILDKITE_COMMIT:0:12}
-runtime_archive="$output/adx-runtime-runc-${commit_short}-linux-amd64.tar.gz"
-cp out/buildkite/backend.tar.gz "$runtime_archive"
-sha256sum "$runtime_archive" > "$runtime_archive.sha256"
 
 channel=${ADX_OBS_UPLOAD_CHANNEL:-daily}
 version_args=()
@@ -82,8 +88,7 @@ artifacts=(
   out/buildkite/adx-release.tar.gz.sha256
   out/buildkite/release-manifest.json
   out/buildkite/build-manifest.json
-  "$runtime_archive"
-  "$runtime_archive.sha256"
+  "${runtime_artifacts[@]}"
 )
 python3 build/admin/candidate.py --verify --directory out/buildkite/admin
 artifacts+=(out/buildkite/sdk/*.whl out/buildkite/sdk/*.tar.gz out/buildkite/sdk/sdk-candidate.json)
@@ -99,7 +104,7 @@ echo "--- :cloud: Upload ADX artifacts to Huawei Cloud OBS"
   --channel "$channel" \
   "${version_args[@]}" \
   --platform linux \
-  --arch amd64 \
+  --arch "$ADX_BUILD_ARCH" \
   --timestamp "$timestamp" \
   --commit "$BUILDKITE_COMMIT" \
   --build-id "$BUILDKITE_BUILD_ID" \
@@ -114,5 +119,7 @@ pathlib.Path(sys.argv[1]).with_name('urls.txt').write_text(
 )
 PY
 
-buildkite-agent meta-data set obs-manifest-url "$("$python" -c 'import json; print(json.load(open("out/buildkite/obs/manifest.json"))["manifest_url"])')"
+if [[ ${ADX_OBS_METADATA:-1} == 1 ]]; then
+  buildkite-agent meta-data set obs-manifest-url "$("$python" -c 'import json; print(json.load(open("out/buildkite/obs/manifest.json"))["manifest_url"])')"
+fi
 echo "OBS manifest: $(tail -n 1 "$output/urls.txt" | cut -f2-)"

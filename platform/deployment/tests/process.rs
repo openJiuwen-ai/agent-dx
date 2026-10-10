@@ -75,7 +75,9 @@ async fn repeated_exits_keep_restarting_until_recovery_and_scoped_stop() {
     assert!(supervisor::run(test_deployment(root, services))
         .await
         .is_err());
-    let recovery = tokio::time::timeout(Duration::from_secs(5), async {
+    // Each retry launches a real process and drains its captured logs. Keep the
+    // behavioral assertion independent of CPU contention on shared CI workers.
+    let recovery = tokio::time::timeout(Duration::from_secs(15), async {
         loop {
             let status = wait_until_ready(&state_directory).await;
             let coordinator = service_status(&status, "coordinator");
@@ -119,7 +121,7 @@ async fn spawn_failures_keep_retrying_and_clear_failure_after_recovery() {
     let deployment = test_deployment(root, json!([{"id":"coordinator","role":"coordinator"}]));
     let state_directory = deployment.state_dir.clone();
     let supervisor_task = tokio::spawn(supervisor::run(deployment));
-    let recovery = tokio::time::timeout(Duration::from_secs(5), async {
+    let recovery = tokio::time::timeout(Duration::from_secs(15), async {
         let mut repaired = false;
         loop {
             let status = wait_until_ready(&state_directory).await;

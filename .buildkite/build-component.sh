@@ -13,7 +13,7 @@ component=${1:?component is required}
 [[ -z $(git status --porcelain) ]] || { echo 'clean checkout required'; exit 1; }
 [[ $(git rev-parse HEAD) == "$BUILDKITE_COMMIT" ]]
 
-export ADX_RELEASE_TARGET=x86_64-unknown-linux-gnu
+source .buildkite/build-architecture.sh
 ADX_WITH_AFS=${ADX_WITH_AFS:-0}
 case "$ADX_WITH_AFS" in
   0|1) ;;
@@ -28,7 +28,11 @@ rm -rf "$output"
 mkdir -p "$output"
 jobs=${JOBS:-4}
 
-bash .buildkite/component-tests.sh "$component"
+case "${ADX_COMPONENT_TESTS:-1}" in
+  1) bash .buildkite/component-tests.sh "$component" ;;
+  0) echo "Component tests disabled: $component" ;;
+  *) echo 'ADX_COMPONENT_TESTS must be 0 or 1' >&2; exit 2 ;;
+esac
 
 case "$component" in
   platform)
@@ -51,7 +55,7 @@ case "$component" in
     ;;
   execd)
     echo "--- :rust: Compile static EXECD and runtime filesystem"
-    musl_target=x86_64-unknown-linux-musl
+    musl_target=$ADX_MUSL_TARGET
     cargo build --locked --release --target "$musl_target" -j "$jobs" \
       -p adx-execd --bin adx-execd
     cp "$CARGO_TARGET_DIR/$musl_target/release/adx-execd" "$output/adx-execd"
@@ -80,4 +84,6 @@ python3 build/release/component.py create \
   --target "$ADX_RELEASE_TARGET"
 tar -czf "out/buildkite/components/$component.tar.gz" -C "$output" .
 
-bash .buildkite/component-transfer.sh upload "$component"
+if [[ ${ADX_COMPONENT_LOCAL:-0} != 1 ]]; then
+  bash .buildkite/component-transfer.sh upload "$component"
+fi

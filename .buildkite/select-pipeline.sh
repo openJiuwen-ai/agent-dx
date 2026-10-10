@@ -8,7 +8,7 @@ for legacy_flag in ADX_WITH_DFS ADX_DFS_ALL_FEATURES; do
   fi
 done
 
-for flag in ADX_OBS_UPLOAD ADX_ADMIN_PYPI_UPLOAD ADX_SDK_PYPI_UPLOAD ADX_WITH_AFS; do
+for flag in ADX_WITH_AFS ADX_ARM_TESTS ADX_OBS_UPLOAD ADX_ARM_OBS_UPLOAD ADX_ADMIN_PYPI_UPLOAD ADX_SDK_PYPI_UPLOAD; do
   value=${!flag:-0}
   [[ $value == 0 || $value == 1 ]] || { echo "$flag must be 0 or 1" >&2; exit 2; }
 done

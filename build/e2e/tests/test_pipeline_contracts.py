@@ -69,7 +69,7 @@ class PipelineContracts(unittest.TestCase):
         pipeline = yaml.safe_load((ROOT / '.buildkite/pipeline-package.yml').read_text())
         steps = {step['key']: step for step in pipeline['steps']}
         index = steps['artifact-manifest']
-        self.assertEqual(index['depends_on'], 'platform-build')
+        self.assertEqual(index['depends_on'], 'publish-amd64')
         self.assertIn('out/buildkite/index.html', index['artifact_paths'])
         self.assertIn('.buildkite/artifact-manifest.sh', index['command'])
 
@@ -282,7 +282,7 @@ class PipelineContracts(unittest.TestCase):
         self.assertIn('afs-gate', steps['platform-build']['depends_on'])
         self.assertIn('build-afs', steps['platform-build']['depends_on'])
         self.assertEqual(steps['platform-e2e']['env']['ADX_E2E_PROFILE'], 'l0')
-        self.assertEqual(steps['platform-images']['depends_on'], 'platform-build')
+        self.assertEqual(steps['platform-images']['depends_on'], ['platform-build', 'publish-amd64'])
         self.assertIn('out/buildkite/adx-execd.tar.gz', steps['platform-build']['artifact_paths'])
         self.assertEqual(steps['admin-pypi']['depends_on'], 'platform-e2e')
         self.assertEqual(steps['sdk-pypi']['depends_on'], 'platform-e2e')
