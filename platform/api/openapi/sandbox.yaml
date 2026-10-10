@@ -174,7 +174,7 @@ paths:
       tags: [Sandboxes]
       operationId: listSandboxes
       summary: List caller-visible Sandboxes, or inspect one by ID
-      description: Returns the synchronized in-memory directory. Without instance_id, only instances belonging to the caller's tenant are listed; administrators can see every tenant. Tombstones are omitted.
+      description: Returns the synchronized in-memory directory. Without instance_id, returns a bounded page of caller-visible instances; administrators can see every tenant. Every view includes tenant_id from the owning record. With instance_id, returns the matching view in an array. Tombstones are omitted.
       parameters:
         - name: instance_id
           in: query
@@ -182,15 +182,34 @@ paths:
           schema:
             type: string
             minLength: 1
+        - name: pageSize
+          in: query
+          schema: {type: integer, minimum: 1, maximum: 1000, default: 100}
+          description: Page size for list queries without instance_id.
+        - name: pageToken
+          in: query
+          schema: {type: string}
+          description: Opaque cursor from the previous page, bound to the caller scope.
       responses:
         "200":
-          description: Array of Sandbox views. With instance_id, contains exactly one view.
+          description: Paged Sandbox views, or a one-element array with instance_id.
           content:
             application/json:
               schema:
-                type: array
-                items:
-                  $ref: "#/components/schemas/InstanceView"
+                oneOf:
+                  - type: array
+                    items:
+                      $ref: "#/components/schemas/InstanceView"
+                  - type: object
+                    required: [items, nextPageToken]
+                    properties:
+                      items:
+                        type: array
+                        items:
+                          $ref: "#/components/schemas/InstanceView"
+                      nextPageToken:
+                        type: string
+                        description: Empty on the last page.
         "4XX":
           $ref: "#/components/responses/Error"
         default:
@@ -860,9 +879,10 @@ components:
         tunnel: {type: object, additionalProperties: true}
     InstanceView:
       type: object
-      required: [id, status, required_cpu, required_mem, image]
+      required: [id, tenant_id, status, required_cpu, required_mem, image]
       properties:
         id: {type: string}
+        tenant_id: {type: string, description: Owning tenant from the Environment record}
         status: {type: string}
         required_cpu: {type: integer, format: int64, description: CPU millicores}
         required_mem: {type: integer, format: int64, description: Memory MiB}
