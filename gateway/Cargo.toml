@@ -33,10 +33,10 @@ default = ["activity-client"]
 activity-client = ["dep:prost", "dep:tonic", "dep:tower"]
 etcd-watch = ["dep:etcd-client"]
 mock-e2e = []
-agent-api = ["activity-client", "dep:adx-agent-core", "dep:adx-agent-api", "dep:russh", "dep:multer"]
+agent-api = ["activity-client", "dep:adx-agent-core", "dep:adx-agent-api", "dep:russh", "dep:reqwest", "dep:tokio-postgres", "dep:tokio-postgres-rustls", "dep:deadpool-postgres", "dep:webpki-roots", "dep:jsonwebtoken"]
 
 [dependencies]
-multer = { version = "3", optional = true }
+adx-core = { path = "../platform/crates/core" }
 russh = { version = "0.63.3", default-features = false, features = ["ring"], optional = true }
 adx-agent-core = { path = "../agent/crates/core", optional = true }
 adx-agent-api = { path = "../agent/api", optional = true }
@@ -46,6 +46,9 @@ adx-transport = { path = "../crates/transport" }
 adx-protocol = { path = "../platform/crates/protocol" }
 adx-discovery = { path = "../platform/crates/discovery" }
 sha2 = "0.10"
+ring = "0.17"
+hex = "0.4"
+mime_guess = "2"
 async-trait = "0.1"
 base64 = "0.22"
 bytes = "1"
@@ -75,6 +78,13 @@ uuid = { version = "1", features = ["v4"] }
 url = "2"
 tokio-tungstenite = "0.24"
 tokio-stream = { version = "0.1", features = ["net"] }
+
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
+tokio-postgres = { version = "0.7", optional = true }
+tokio-postgres-rustls = { version = "0.13", optional = true }
+deadpool-postgres = { version = "0.14", optional = true }
+webpki-roots = { version = "1", optional = true }
+jsonwebtoken = { version = "9", optional = true }
 
 [dev-dependencies]
 axum = { version = "0.7", default-features = false, features = ["http1", "json", "tokio"] }

@@ -1,0 +1,10 @@
+{
+  "tenant": "your-tenant",
+  "agent_type": "assistant",
+  "template": "jiuwen",
+  "version": "1",
+  "allowed_hosts": ["agent.example.com"],
+  "allowed_origins": [],
+  "request_timeout_seconds": 60,
+  "download_timeout_seconds": 300
+}

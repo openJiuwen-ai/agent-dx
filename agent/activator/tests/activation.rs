@@ -63,14 +63,14 @@ impl Sandbox for Platform {
     }
 }
 fn template() -> TemplateVersion {
-    serde_json::from_value(serde_json::json!({"name":"app","version":"1","image":"app:1","isolation_runtime":"runc","entrypoint":["/start"],"resources":{"cpu_millis":1000,"memory_mib":512},"service":[{"protocol":"http","port":8080}]})).unwrap()
+    serde_json::from_value(serde_json::json!({"name":"app","version":"1","image":"app:1","isolation_runtime":"runc","resources":{"cpu_millis":1000,"memory_mib":512},"service":[{"protocol":"http","port":8080}]})).unwrap()
 }
 fn scope(id: &str) -> Scope {
     Scope {
         tenant: "tenant".into(),
         template: "app".into(),
         version: "1".into(),
-        environment_id: id.into(),
+        binding_id: id.into(),
     }
 }
 #[tokio::test]
@@ -90,18 +90,18 @@ async fn replicas_and_unknown_outcomes_keep_the_committed_identity() {
         .await,
         Err(Error::OutcomeUnknown(_))
     ));
-    let original = a.environment(&scope("e")).await.unwrap();
+    let original = a.binding(&scope("e")).await.unwrap();
     let e = scope("e");
     let (x, y) = tokio::join!(
         a.activate(&e, None, adx_agent_core::unix_time_millis() + 60_000),
         b.activate(&e, None, adx_agent_core::unix_time_millis() + 60_000)
     );
     assert_eq!(x.unwrap(), y.unwrap());
-    assert_eq!(b.environment(&scope("e")).await.unwrap(), original);
+    assert_eq!(b.binding(&scope("e")).await.unwrap(), original);
     assert_eq!(platform.observations.lock().unwrap().len(), 1);
     platform.lose_delete_response.store(true, Ordering::SeqCst);
     assert!(matches!(
-        b.delete_environment(&scope("e")).await,
+        b.delete_binding(&scope("e")).await,
         Err(Error::OutcomeUnknown(_))
     ));
     assert!(matches!(
@@ -114,7 +114,7 @@ async fn replicas_and_unknown_outcomes_keep_the_committed_identity() {
         .await,
         Err(Error::Conflict(_))
     ));
-    a.delete_environment(&scope("e")).await.unwrap();
+    a.delete_binding(&scope("e")).await.unwrap();
     let fresh = b
         .activate(
             &scope("e"),
@@ -123,7 +123,7 @@ async fn replicas_and_unknown_outcomes_keep_the_committed_identity() {
         )
         .await
         .unwrap()
-        .environment;
+        .binding;
     assert_ne!(fresh.sandbox_id, original.sandbox_id);
     assert_eq!(
         a.activate(
@@ -133,12 +133,12 @@ async fn replicas_and_unknown_outcomes_keep_the_committed_identity() {
         )
         .await
         .unwrap()
-        .environment,
+        .binding,
         fresh
     );
 }
 #[tokio::test]
-async fn independent_environments_and_platform_readiness() {
+async fn independent_bindings_and_platform_readiness() {
     let state = AgentState::new(Arc::new(MemoryRepository::default()));
     let platform = Arc::new(Platform::default());
     let service = Activator::new(state.clone(), platform.clone());
@@ -149,8 +149,8 @@ async fn independent_environments_and_platform_readiness() {
         service.activate(&sa, None, adx_agent_core::unix_time_millis() + 60_000),
         service.activate(&sb, None, adx_agent_core::unix_time_millis() + 60_000)
     );
-    let x = a.unwrap().environment;
-    let y = b.unwrap().environment;
+    let x = a.unwrap().binding;
+    let y = b.unwrap().binding;
     assert_ne!(x.sandbox_id, y.sandbox_id);
     platform
         .observations
@@ -170,7 +170,7 @@ async fn independent_environments_and_platform_readiness() {
             .await,
         Err(Error::NotReady(_))
     ));
-    assert_eq!(service.environment(&scope("a")).await.unwrap(), x);
+    assert_eq!(service.binding(&scope("a")).await.unwrap(), x);
     let other = Scope {
         tenant: "other".into(),
         ..scope("a")
@@ -184,7 +184,7 @@ async fn independent_environments_and_platform_readiness() {
 }
 
 #[tokio::test]
-async fn first_traffic_creates_one_environment_across_activators() {
+async fn first_traffic_creates_one_binding_across_activators() {
     let state = AgentState::new(Arc::new(MemoryRepository::default()));
     let platform = Arc::new(Platform::default());
     let a = Activator::new(state.clone(), platform.clone());
@@ -198,7 +198,7 @@ async fn first_traffic_creates_one_environment_across_activators() {
     let first = left.unwrap();
     assert_eq!(first, right.unwrap());
     assert_eq!(platform.observations.lock().unwrap().len(), 1);
-    a.delete_environment(&scope).await.unwrap();
+    a.delete_binding(&scope).await.unwrap();
     let recreated = b
         .activate_with_cache(
             &scope,
@@ -208,10 +208,7 @@ async fn first_traffic_creates_one_environment_across_activators() {
         )
         .await
         .unwrap();
-    assert_ne!(
-        first.environment.generation,
-        recreated.environment.generation
-    );
+    assert_ne!(first.binding.generation, recreated.binding.generation);
 }
 
 #[tokio::test]
@@ -225,19 +222,19 @@ async fn delayed_retry_cannot_recreate_or_select_another_generation() {
         .activate(&scope, None, adx_agent_core::unix_time_millis() + 60_000)
         .await
         .unwrap();
-    activator.delete_environment(&scope).await.unwrap();
+    activator.delete_binding(&scope).await.unwrap();
     assert!(matches!(
         activator
             .activate(
                 &scope,
-                Some(&first.environment.generation),
+                Some(&first.binding.generation),
                 adx_agent_core::unix_time_millis() + 60_000
             )
             .await,
         Err(Error::Conflict(_))
     ));
     assert!(matches!(
-        activator.environment(&scope).await,
+        activator.binding(&scope).await,
         Err(Error::NotFound)
     ));
     let fresh = activator
@@ -248,7 +245,7 @@ async fn delayed_retry_cannot_recreate_or_select_another_generation() {
         activator
             .activate(
                 &scope,
-                Some(&first.environment.generation),
+                Some(&first.binding.generation),
                 adx_agent_core::unix_time_millis() + 60_000
             )
             .await,
@@ -258,7 +255,7 @@ async fn delayed_retry_cannot_recreate_or_select_another_generation() {
         activator
             .activate(
                 &scope,
-                Some(&fresh.environment.generation),
+                Some(&fresh.binding.generation),
                 adx_agent_core::unix_time_millis() + 60_000
             )
             .await

@@ -66,7 +66,7 @@ impl Repository for MemoryRepository {
                     .get(&Key(member.clone(), Some(index.clone())))
                     .cloned()
                     .map(|record| (member.clone(), record))
-                    .ok_or_else(|| Error::Corrupt("Environment index member missing".into()))
+                    .ok_or_else(|| Error::Corrupt("AgentBinding index member missing".into()))
             })
             .collect()
     }

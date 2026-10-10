@@ -79,10 +79,11 @@ pub fn router(activator: Arc<Activator>, token: &str, timeout: Duration) -> Resu
     Ok(Router::new()
         .route("/internal/adx/v1/templates/publish", post(publish))
         .route("/internal/adx/v1/templates/get", post(template))
-        .route("/internal/adx/v1/environments/get", post(environment))
-        .route("/internal/adx/v1/environments/list", post(environments))
-        .route("/internal/adx/v1/environments/delete", post(delete))
-        .route("/internal/adx/v1/environments/activate", post(activate))
+        .route("/internal/adx/v1/bindings/get", post(binding))
+        .route("/internal/adx/v1/bindings/prepare", post(prepare))
+        .route("/internal/adx/v1/bindings/list", post(bindings))
+        .route("/internal/adx/v1/bindings/delete", post(delete))
+        .route("/internal/adx/v1/bindings/activate", post(activate))
         .layer(DefaultBodyLimit::max(limits::HTTP_JSON_BYTES))
         .route_layer(middleware::from_fn_with_state(s.clone(), authorize))
         .route("/health/live", get(|| async { StatusCode::NO_CONTENT }))
@@ -106,14 +107,14 @@ async fn template(State(s): State<Service>, Json(r): Json<TemplateRequest>) -> R
         Err(e) => failure(e),
     }
 }
-async fn environment(State(s): State<Service>, Json(r): Json<ScopeRequest>) -> Response {
-    match s.activator.environment(&r.scope).await {
+async fn binding(State(s): State<Service>, Json(r): Json<ScopeRequest>) -> Response {
+    match s.activator.binding(&r.scope).await {
         Ok(v) => Json(v).into_response(),
         Err(e) => failure(e),
     }
 }
-async fn environments(State(s): State<Service>, Json(r): Json<EnvironmentList>) -> Response {
-    match s.activator.list_environments(&r).await {
+async fn bindings(State(s): State<Service>, Json(r): Json<BindingList>) -> Response {
+    match s.activator.list_bindings(&r).await {
         Ok(v) => Json(v).into_response(),
         Err(e) => failure(e),
     }
@@ -124,7 +125,7 @@ async fn delete(
     Json(r): Json<ScopeRequest>,
 ) -> Response {
     p.start_write();
-    match s.activator.delete_environment(&r.scope).await {
+    match s.activator.delete_binding(&r.scope).await {
         Ok(()) => Json(()).into_response(),
         Err(e) => failure(e),
     }
@@ -146,6 +147,18 @@ async fn activate(
         )
         .await
     {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => failure(e),
+    }
+}
+
+async fn prepare(
+    State(s): State<Service>,
+    axum::Extension(p): axum::Extension<Arc<RequestProgress>>,
+    Json(r): Json<PrepareBindingRequest>,
+) -> Response {
+    p.start_write();
+    match s.activator.prepare_binding(&r.scope, &r.launch).await {
         Ok(v) => Json(v).into_response(),
         Err(e) => failure(e),
     }

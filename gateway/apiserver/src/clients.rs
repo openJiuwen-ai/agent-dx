@@ -264,6 +264,9 @@ impl Clients {
         timeout: Duration,
         future: impl Future<Output = Result<Response<T>, Status>>,
     ) -> Result<T, Status> {
+        // Keep the generated RPC future out of the nested timeout/trace state
+        // machines on the embedded Activator's HTTP polling stack.
+        let future = Box::pin(future);
         trace::Trace::child(name)
             .run_result(async {
                 tokio::time::timeout(timeout, future)

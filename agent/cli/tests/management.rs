@@ -24,7 +24,7 @@ async fn public_management_routes_credentials_and_json_output() {
         let method = request.method().to_string();
         seen.lock().unwrap().push((method, uri.clone(), auth));
         if uri.contains("page_size") {
-            axum::Json(json!({"environments":[],"next_page_token":"next"}))
+            axum::Json(json!({"bindings":[],"next_page_token":"next"}))
         } else {
             axum::Json(json!({"status":"deleted"}))
         }
@@ -36,16 +36,61 @@ async fn public_management_routes_credentials_and_json_output() {
         .with_state(seen.clone());
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     for (args, expected_method, expected_path) in [
-        (vec!["adx", "--output", "json", "env", "list", "--template", "app/name", "--version", "v 1", "--page-size", "2", "--page-token", "a+b"], "GET", "/api/agent/v2/templates/app%2Fname/versions/v%201/environments?page_size=2&page_token=a%2Bb"),
-        (vec!["adx", "env", "delete", "demo", "--template", "app", "--version", "1"], "DELETE", "/api/agent/v2/templates/app/versions/1/environments/demo"),
+        (
+            vec![
+                "adx",
+                "--output",
+                "json",
+                "binding",
+                "list",
+                "--template",
+                "app/name",
+                "--version",
+                "v 1",
+                "--page-size",
+                "2",
+                "--page-token",
+                "a+b",
+            ],
+            "GET",
+            "/api/agent/v2/templates/app%2Fname/versions/v%201/bindings?page_size=2&page_token=a%2Bb",
+        ),
+        (
+            vec![
+                "adx",
+                "binding",
+                "delete",
+                "demo",
+                "--template",
+                "app",
+                "--version",
+                "1",
+            ],
+            "DELETE",
+            "/api/agent/v2/templates/app/versions/1/bindings/demo",
+        ),
     ] {
         let cli = Cli::try_parse_from(args).unwrap();
-        let config = Configuration::new(&endpoint, "tenant-key".into(), None, std::time::Duration::from_secs(3), true).unwrap();
+        let config = Configuration::new(
+            &endpoint,
+            "tenant-key".into(),
+            None,
+            std::time::Duration::from_secs(3),
+            true,
+        )
+        .unwrap();
         let result = execute(&cli.command, &config).await.unwrap();
         let text = result.render(cli.output).unwrap();
         serde_json::from_str::<Value>(&text).unwrap();
         let call = seen.lock().unwrap().last().unwrap().clone();
-        assert_eq!(call, (expected_method.into(), expected_path.into(), "Bearer tenant-key".into()));
+        assert_eq!(
+            call,
+            (
+                expected_method.into(),
+                expected_path.into(),
+                "Bearer tenant-key".into()
+            )
+        );
     }
     server.abort();
 }
@@ -107,7 +152,7 @@ async fn server_errors_do_not_replay_writes_or_expose_credentials() {
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let cli = Cli::try_parse_from([
         "adx",
-        "env",
+        "binding",
         "delete",
         "demo",
         "--template",
@@ -139,9 +184,8 @@ async fn server_errors_do_not_replay_writes_or_expose_credentials() {
 async fn binary_prints_machine_result_to_stdout() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
-    let app = axum::Router::new().fallback(|| async {
-        axum::Json(json!({"environment":{"scope":{"environment_id":"demo"}}}))
-    });
+    let app = axum::Router::new()
+        .fallback(|| async { axum::Json(json!({"binding":{"scope":{"binding_id":"demo"}}})) });
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_adx"))
         .args([
@@ -150,7 +194,7 @@ async fn binary_prints_machine_result_to_stdout() {
             "--allow-http",
             "--output",
             "json",
-            "env",
+            "binding",
             "get",
             "demo",
             "--template",
@@ -168,8 +212,7 @@ async fn binary_prints_machine_result_to_stdout() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(
-        serde_json::from_slice::<Value>(&output.stdout).unwrap()["environment"]["scope"]
-            ["environment_id"],
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()["binding"]["scope"]["binding_id"],
         "demo"
     );
     assert!(output.stderr.is_empty());

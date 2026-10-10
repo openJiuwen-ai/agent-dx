@@ -2,15 +2,17 @@
 
 ## Boundaries
 
-- `agent/` owns Template/Environment APIs and stateless Activators. Platform lifecycle access goes through the Sandbox capability interface; user Harness traffic uses shared Gateway forwarding.
+- `agent/` owns Template/AgentBinding APIs and stateless Activators. Platform lifecycle access goes through the Sandbox capability interface; user Harness traffic uses shared Gateway forwarding.
 - `platform/` owns Environment scheduling and execution, the Sandbox SDK, Coordinator, adxlet and Execd.
 - `gateway/` owns the public Sandbox API Server, shared entrypoints, routing and node forwarding; it does not own Environment lifecycle.
 - Root `crates/` owns product-wide error semantics, observability, process bootstrap support and transport mechanics. Platform domain models, protocol, scheduling and discovery remain under `platform/crates/`.
 - Sandbox SDK uses adx-sandbox / adx_sandbox / ADX_ naming. Owned Agent namespaces use adx, Gateway commands use adx-, and config/headers use ADX. External runtime dependencies require functional replacement, not fabricated import renames. `docs/migration/sources.json` records exact provenance.
 - Keep the Rust API Server small: public HTTP types, validation and direct Environment RPC clients. Preserve Sandbox and Agent entrypoints. Do not reintroduce the removed runtime SDK, function/Job packages or metadata watchers to satisfy a helper import. Agent business logic belongs under `agent/`.
 
-- Platform Environment (`adx_core::EnvironmentSpec` / `EnvironmentRecord`) owns execution identity and lifecycle. Agent Environment (`adx_agent_core::Environment`) owns product metadata and binds to a public Sandbox; do not merge the two state machines. `RuntimeProfile` only configures rootfs/bootstrap.
+- Platform Environment (`adx_core::EnvironmentSpec` / `EnvironmentRecord`) owns execution identity and lifecycle. AgentBinding (`adx_agent_core::AgentBinding`) owns product metadata and binds to a public Sandbox; do not merge the two state machines. `RuntimeProfile` only configures rootfs/bootstrap.
 - Process names: `adx-coordinator`, `adxlet`, `adx-apiserver`, `adx-ingress`, `adx-relay`, `adx-execd`.
+
+- The system is not yet launched. Only explicitly confirmed compatibility interfaces require backward compatibility; other changes update callers and storage directly without legacy aliases or migrations.
 
 ## Builds and tests
 

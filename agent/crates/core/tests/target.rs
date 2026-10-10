@@ -5,7 +5,7 @@ fn urn_and_ssh_routes_keep_target_identity_and_options() {
     for value in [
         "urn:adx:instance:instance-1",
         "urn:adx:template:demo:1",
-        "urn:adx:environment:demo:1:env%3Aone",
+        "urn:adx:binding:demo:1:env%3Aone",
     ] {
         let target: Target = value.parse().unwrap();
         assert_eq!(target.to_string(), value);
@@ -34,7 +34,7 @@ fn malformed_or_ambiguous_routes_are_rejected() {
         "urn:adx:template:demo",
         "urn:adx:template::1",
         "urn:adx:instance:id%GG",
-        "urn:adx:environment:a:b:x:y",
+        "urn:adx:binding:a:b:x:y",
     ] {
         assert!(value.parse::<Target>().is_err(), "{value}");
     }

@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 pub mod activator;
 pub mod cache;
 pub mod error;
-pub mod inline;
+pub mod launch;
 pub mod limits;
 pub mod sandbox;
 pub mod target;
@@ -50,7 +50,7 @@ pub struct Scope {
     pub tenant: String,
     pub template: String,
     pub version: String,
-    pub environment_id: String,
+    pub binding_id: String,
 }
 
 impl Scope {
@@ -59,7 +59,7 @@ impl Scope {
             ("tenant", &self.tenant),
             ("template", &self.template),
             ("version", &self.version),
-            ("environment_id", &self.environment_id),
+            ("binding_id", &self.binding_id),
         ] {
             identifier(value, label)?;
         }
@@ -108,9 +108,6 @@ pub struct TemplateVersion {
     pub version: String,
     pub image: String,
     pub isolation_runtime: String,
-    pub entrypoint: Vec<String>,
-    #[serde(default)]
-    pub working_dir: Option<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     pub resources: Resources,
@@ -127,21 +124,6 @@ impl TemplateVersion {
             ("isolation_runtime", &self.isolation_runtime),
         ] {
             identifier(value, label)?;
-        }
-        if self
-            .entrypoint
-            .first()
-            .is_none_or(|arg| arg.trim().is_empty())
-            || self.entrypoint.iter().any(|arg| arg.contains('\0'))
-        {
-            return Err("entrypoint requires a nonempty executable and NUL-free argv".into());
-        }
-        if let Some(cwd) = &self.working_dir {
-            if !cwd.starts_with('/') || cwd.contains('\0') || cwd.split('/').any(|p| p == "..") {
-                return Err(
-                    "working_dir must be an absolute sandbox path without parent traversal".into(),
-                );
-            }
         }
         for (key, value) in &self.env {
             if key.is_empty() || key.contains(['=', '\0']) || value.contains('\0') {
@@ -173,20 +155,20 @@ impl TemplateVersion {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum EnvironmentPhase {
+pub enum BindingPhase {
     Active,
     Deleting,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Environment {
+pub struct AgentBinding {
     pub scope: Scope,
     pub generation: String,
     /// Stable Platform identity, including across retries and runtime pause/resume.
     pub sandbox_id: String,
     /// Product deletion intent only; Sandbox runtime state belongs to Platform.
-    pub phase: EnvironmentPhase,
+    pub phase: BindingPhase,
 }
 
 pub mod discovery;

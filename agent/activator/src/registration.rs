@@ -1,4 +1,4 @@
-//! Process membership leases; independent of Env cache TTL and Sandbox lifecycle.
+//! Process membership leases; independent of AgentBinding cache TTL and Sandbox lifecycle.
 use crate::{Error, Result};
 use adx_agent_core::discovery::ActivatorEndpoint;
 use adx_agent_store::discovery::RedisRegistry;

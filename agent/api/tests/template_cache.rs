@@ -21,7 +21,7 @@ async fn template_cache_coalesces_loads_isolates_tenants_and_retries_invalid_res
             let n = calls.fetch_add(1, Ordering::SeqCst);
             if n == 0 { return (axum::http::StatusCode::NOT_FOUND, axum::Json(serde_json::to_value(Error::NotFound).unwrap())); }
             tokio::time::sleep(Duration::from_millis(20)).await;
-            (axum::http::StatusCode::OK, axum::Json(serde_json::json!({"name":if n == 1 {"wrong"} else {"app"},"version":"1","image":"app:1","isolation_runtime":"runc","entrypoint":["/start"],"resources":{"cpu_millis":1000,"memory_mib":512},"service":[{"protocol":"http","port":8080}]})))
+            (axum::http::StatusCode::OK, axum::Json(serde_json::json!({"name":if n == 1 {"wrong"} else {"app"},"version":"1","image":"app:1","isolation_runtime":"runc","resources":{"cpu_millis":1000,"memory_mib":512},"service":[{"protocol":"http","port":8080}]})))
         }
     }));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

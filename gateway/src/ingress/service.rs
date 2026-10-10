@@ -14,7 +14,10 @@ use tokio::{
 use tokio_rustls::TlsAcceptor;
 
 #[cfg(feature = "agent-api")]
-type SandboxOverride = Option<Arc<dyn adx_agent_core::sandbox::Sandbox>>;
+type SandboxOverride = Option<(
+    Arc<dyn adx_agent_core::sandbox::Sandbox>,
+    Arc<dyn super::sandbox_files::SandboxDirectory>,
+)>;
 #[cfg(not(feature = "agent-api"))]
 type SandboxOverride = ();
 
@@ -50,8 +53,9 @@ impl IngressService {
         config: IngressConfig,
         control: ControlConfig,
         service: Arc<dyn adx_agent_core::sandbox::Sandbox>,
+        directory: Arc<dyn super::sandbox_files::SandboxDirectory>,
     ) -> Result<Self, ServiceError> {
-        Self::bind_inner(config, control, Some(service)).await
+        Self::bind_inner(config, control, Some((service, directory))).await
     }
 
     async fn bind_inner(
@@ -62,13 +66,13 @@ impl IngressService {
         #[cfg(not(feature = "agent-api"))]
         let () = injected;
         #[cfg(not(feature = "agent-api"))]
-        if std::env::var_os("ADX_SANDBOX_CONFIG").is_some()
+        if std::env::var_os("ADX_SANDBOX_FILES_CONFIG").is_some()
             || std::env::var_os("ADX_AGENT_CONFIG").is_some()
-            || std::env::var_os("ADX_INLINE_CONFIG").is_some()
             || std::env::var_os("ADX_SSH_CONFIG").is_some()
+            || std::env::var_os("ADX_JIUWEN_CONFIG").is_some()
         {
             return Err(
-                "Sandbox, Agent, inline and SSH configuration require a Gateway built with --features agent-api".into(),
+                "Sandbox, Agent, Jiuwen and SSH configuration require a Gateway built with --features agent-api".into(),
             );
         }
         let tls_listener = TcpListener::bind(config.tls_bind).await?;
@@ -82,18 +86,14 @@ impl IngressService {
         let connector = DataPlaneL4Connector::new(config.h2_pool_config()?);
         let authenticator = IngressAuthenticator::with_verifier(watcher.clone());
         #[cfg(feature = "agent-api")]
-        let sandbox_api = if let Ok(path) = std::env::var("ADX_SANDBOX_CONFIG") {
-            use super::sandbox_api::{PlatformSandbox, SandboxApi, SandboxConfig};
-            let settings: SandboxConfig = serde_json::from_slice(&std::fs::read(path)?)
-                .map_err(|_| "invalid Sandbox configuration")?;
-            let backend = Arc::new(
-                PlatformSandbox::new(settings, std::env::var("ADX_SANDBOX_EXECD_TOKEN")?)
-                    .map_err(send_error)?,
-            );
-            Some(Arc::new(SandboxApi::new(
-                backend,
-                &std::env::var("ADX_SANDBOX_SERVICE_TOKEN")?,
-            )?))
+        let file_access = if let Ok(path) = std::env::var("ADX_SANDBOX_FILES_CONFIG") {
+            let settings: super::sandbox_files::FileAccessConfig =
+                serde_json::from_slice(&std::fs::read(path)?)
+                    .map_err(|_| "invalid Sandbox file configuration")?;
+            if settings.port != config.default_direct_port {
+                return Err("Sandbox file port must match Ingress direct port".into());
+            }
+            Some(settings.build(injected.as_ref().map(|(_, directory)| directory.clone()))?)
         } else {
             None
         };
@@ -106,7 +106,8 @@ impl IngressService {
                 AgentApi::new_embedded(
                     settings,
                     injected
-                        .clone()
+                        .as_ref()
+                        .map(|(service, _)| service.clone())
                         .ok_or("embedded Activator requires a Sandbox service")?,
                 )
                 .await
@@ -119,16 +120,39 @@ impl IngressService {
             None
         };
         #[cfg(feature = "agent-api")]
-        let inline_api = if let Ok(path) = std::env::var("ADX_INLINE_CONFIG") {
-            use super::inline_api::{InlineApi, InlineConfig};
-            let settings: InlineConfig = serde_json::from_slice(&std::fs::read(path)?)
-                .map_err(|_| "invalid inline compatibility configuration")?;
-            let sandbox = sandbox_api
+        let jiuwen_api = if let Ok(path) = std::env::var("ADX_JIUWEN_CONFIG") {
+            use super::jiuwen::entrypoint::{JiuwenApi, JiuwenConfig};
+            let settings: JiuwenConfig = serde_json::from_slice(&std::fs::read(path)?)
+                .map_err(|_| "invalid Jiuwen configuration")?;
+            if let Some(domain) = &config.port_host_domain {
+                if settings
+                    .allowed_hosts
+                    .iter()
+                    .any(|host| host.ends_with(&format!(".{domain}")))
+                {
+                    return Err("Jiuwen hosts must not use the direct-port host domain".into());
+                }
+            }
+            let agent = agent_api
                 .as_ref()
-                .ok_or("inline APIs require ADX_SANDBOX_CONFIG")?;
-            Some(Arc::new(
-                InlineApi::new(settings, sandbox.backend.clone()).map_err(send_error)?,
-            ))
+                .ok_or("Jiuwen requires ADX_AGENT_CONFIG")?;
+            if file_access.is_none() {
+                return Err("Jiuwen requires ADX_SANDBOX_FILES_CONFIG".into());
+            }
+            let account_path = std::env::var("ADX_ACCOUNT_CONFIG")
+                .map_err(|_| "Jiuwen requires ADX_ACCOUNT_CONFIG")?;
+            let account_config: super::accounts::AccountConfig =
+                serde_json::from_slice(&std::fs::read(account_path)?)
+                    .map_err(|_| "invalid account configuration")?;
+            if account_config.tenant != settings.tenant {
+                return Err("Jiuwen/account tenant mismatch".into());
+            }
+            let auth = Arc::new(super::accounts::AccountService::connect(account_config).await?);
+            Some(Arc::new(JiuwenApi::new(
+                settings,
+                agent.managed.clone(),
+                auth,
+            )?))
         } else {
             None
         };
@@ -156,10 +180,9 @@ impl IngressService {
             config.allow_any_client,
         );
         #[cfg(feature = "agent-api")]
-        let gateway = if let Some(api) = &sandbox_api {
-            gateway.with_sandbox_api(api.clone())
-        } else {
-            gateway
+        let gateway = match file_access {
+            Some(access) => gateway.with_execd_access(access),
+            None => gateway,
         };
         #[cfg(feature = "agent-api")]
         let gateway = if let Some(api) = &agent_api {
@@ -168,8 +191,8 @@ impl IngressService {
             gateway
         };
         #[cfg(feature = "agent-api")]
-        let gateway = if let Some(api) = &inline_api {
-            gateway.with_inline_api(api.clone())
+        let gateway = if let Some(api) = jiuwen_api {
+            gateway.with_jiuwen_api(api)
         } else {
             gateway
         };

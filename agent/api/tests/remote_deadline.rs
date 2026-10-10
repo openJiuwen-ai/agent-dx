@@ -40,11 +40,11 @@ fn scope() -> Scope {
         tenant: "tenant".into(),
         template: "app".into(),
         version: "1".into(),
-        environment_id: "env".into(),
+        binding_id: "env".into(),
     }
 }
 fn template() -> TemplateVersion {
-    serde_json::from_value(serde_json::json!({"name":"app","version":"1","image":"app:1","isolation_runtime":"runc","entrypoint":["/start"],"resources":{"cpu_millis":1000,"memory_mib":512},"service":[{"protocol":"http","port":8080}]})).unwrap()
+    serde_json::from_value(serde_json::json!({"name":"app","version":"1","image":"app:1","isolation_runtime":"runc","resources":{"cpu_millis":1000,"memory_mib":512},"service":[{"protocol":"http","port":8080}]})).unwrap()
 }
 
 fn context() -> adx_agent_api::request::RequestContext {
@@ -64,7 +64,7 @@ async fn caller_deadline_distinguishes_remote_reads_and_possible_writes() {
     ));
     let ctx = context();
     assert!(matches!(
-        ctx.run(control.environment(&ctx, &scope())).await,
+        ctx.run(control.binding(&ctx, &scope())).await,
         Err(Error::Unavailable(_))
     ));
     let ctx = context();
@@ -84,21 +84,21 @@ async fn timed_out_activation_keeps_identity_for_another_replica() {
         ctx.run(a.activate(&ctx, &scope(), None)).await,
         Err(Error::OutcomeUnknown(_))
     ));
-    let original = b.environment(&context(), &scope()).await.unwrap();
+    let original = b.binding(&context(), &scope()).await.unwrap();
     let ctx = context();
     assert!(matches!(
         ctx.run(b.activate(&ctx, &scope(), None)).await,
         Err(Error::OutcomeUnknown(_))
     ));
-    assert_eq!(a.environment(&context(), &scope()).await.unwrap(), original);
+    assert_eq!(a.binding(&context(), &scope()).await.unwrap(), original);
     let ctx = context();
     assert!(matches!(
-        ctx.run(a.delete_environment(&ctx, &scope())).await,
+        ctx.run(a.delete_binding(&ctx, &scope())).await,
         Err(Error::OutcomeUnknown(_))
     ));
     assert_eq!(
-        b.environment(&context(), &scope()).await.unwrap().phase,
-        adx_agent_core::EnvironmentPhase::Deleting
+        b.binding(&context(), &scope()).await.unwrap().phase,
+        adx_agent_core::BindingPhase::Deleting
     );
 }
 
@@ -152,7 +152,7 @@ async fn remote_activation_passes_the_original_deadline_to_sandbox_create() {
     let ctx = context();
     let original = ctx.deadline_unix_ms();
     let target = client.activate(&ctx, &scope(), None).await.unwrap();
-    assert_eq!(target.environment.scope, scope());
+    assert_eq!(target.binding.scope, scope());
     let received = backend.0.lock().unwrap().unwrap();
     assert!(
         received <= original + 2,
