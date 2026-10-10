@@ -134,3 +134,12 @@ Home workspace 绑定源为真实 `state/ownerfs/root-776f726b7370616365-e1`，�
 - M5：把最终交付结果追加到同一个 MR，核对远端分支和实际文件树；不自动合并。
 
 M1/M2/M3 与本轮 M4 限定运行已收口；M5 仅剩本报告提交后的远端身份核验。性能、完整 POSIX、复杂可靠性和锁专题仍按 [产品计划](../development/afs-plan.md) 后置。
+
+
+## 2026-10-10：同步并行发布流程并解决 MR 冲突
+
+在命名补正候选 `ea54b66` 上正常合并目标 `refactor 683b61fe7f30395a85dbb0f12f2592afb83ca89e`，不重写已有提交。目标新增五个提交，七处内容冲突集中在公共 CI／发布脚本及其测试。保留最新双架构并行、ARM 原生 Linux builder、凭据隔离、输出权限、可选外部 backend 和正常失败留证流程，在相同扩展点接入 AFS 默认 OFF／显式 ON。ARM64 增加可选 `build-afs-arm64`，与 x86_64 使用同一个 `ADX_WITH_AFS`、包清单和发布校验合同；模式层 OwnerFs／DFS 及 AFS 产品源码未改。
+
+Linux 精确受测 tree `8d267b893991d8bf08142622fc7e127515f80b9c`，随后仅补本文与 Buildkite README。Python 10 个模块68项、部署 process10项、API create_replay4项、fmt及严格 workspace/all-targets/all-features Clippy 均通过；host58项中57通过、1范围skip，文档及shell语法检查通过。ARM开关／组件接线回归先失败后通过，补验无backend清单与AFS ON/OFF、真实CLI校验、容器适配参数传递及失败证据留存。
+
+本轮未执行远端 Buildkite 双架构完整发布、OBS上传或新候选完整安装／文件系统运行矩阵；历史包和运行结果继续绑定原版本。仓外 `migration-20261010-refactor-conflicts/linux/refactor-conflicts-linux-evidence.tar` SHA-256 为 `0fa68f1963f3253242ac9b4419077b7ba3d796f153553cc3e421e63f27c3a525`，保存精确patch/tree、命令、准入、完整输出和退出码。阶段一历史8/8不重开，未引入私有第三方修改。

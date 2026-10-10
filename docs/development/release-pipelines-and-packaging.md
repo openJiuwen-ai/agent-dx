@@ -28,7 +28,7 @@ Agent FS（AFS） 是可选文件系统组件。默认 source gate、基础包�
 入口或 AFS gate 本身变化时，默认 pipeline 会执行 `.buildkite/afs-gate.sh`；该 gate
 运行 `ADX_WITH_AFS=1 make afs-check` 证明文件系统代码仍可构建和测试，但不改变默认包
 或部署制品。显式文件系统包使用同一个 `ADX_WITH_AFS=1` 合同，Buildkite 才启用
-`build-afs` 组件步，组装时下载 AFS 组件并把 `--with-afs` 传给包清单、build manifest
+`build-afs` 和 `build-afs-arm64` 可选组件步，组装时下载 AFS 组件并把 `--with-afs` 传给包清单、build manifest
 和 OBS 发布校验。带 AFS 包写入 `with_afs: true` 并包含 `bin/afs-meta`、`bin/afs-node`
 和 `etc/examples/afs/*`；默认包校验会拒绝这些文件。普通产品构建不编译 AFS
 examples/验收探针；RDMA/all-features lint 需要 `ADX_AFS_ALL_FEATURES=1` 且先通过

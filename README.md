@@ -210,6 +210,9 @@ tag-gated option. The Full pipeline
 consumes explicit base-package and SDK build UUIDs and does not rebuild either candidate. See the
 [Buildkite pipeline contract](.buildkite/README.md).
 
+基础出包流水线包含并行的 Linux amd64 / arm64 出包。两种架构使用同样的编译、组包、发布和索引流程；x86 跑测试，ARM 默认只编译与校验产物，可通过 `ADX_ARM_TESTS=1` 开启测试。ARM 在原生 ARM worker 的 Linux 容器中构建；产物及 OBS 路径按架构隔离。Kubernetes L0 当前验证 amd64，详见 [流水线说明](.buildkite/README.md#parallel-linux-arm64-packages)。
+
+
 The SDK distribution is `adx-sandbox`, its Python import is `adx_sandbox`, and its CLI is `adx-sandbox`. ADX environment variables use the `ADX_` prefix, and internal branded HTTP headers use `X-ADX-`.
 
 ## 📚 Learn more

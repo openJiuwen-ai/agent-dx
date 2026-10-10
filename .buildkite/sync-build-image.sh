@@ -4,7 +4,7 @@ set -euo pipefail
 
 case "${1:-rust}" in
   rust)
-    config=build/images/build-environment.json
+    config=${ADX_BUILD_IMAGE_CONFIG:-build/images/build-environment.json}
     output=out/buildkite/build-image
     recipe_file=build/images/Dockerfile.ci
     verifier=/usr/local/bin/adx-verify-build-image
@@ -56,16 +56,31 @@ platform=${values[2]}
 [[ $source_image == *@sha256:* ]]
 [[ $repository != *:latest ]]
 
-tag="$repository:${BUILDKITE_COMMIT:0:12}"
-cache_tag="$repository:buildcache"
+arch=${platform#linux/}
+suffix=""
+[[ $arch == amd64 ]] || suffix="-$arch"
+tag="$repository:${BUILDKITE_COMMIT:0:12}$suffix"
+cache_tag="$repository:buildcache$suffix"
 verify_image() {
   docker run --rm --platform "$platform" "$1" "$verifier"
 }
 
 docker pull "$cache_tag" >/dev/null 2>&1 || true
+build_args=()
+if [[ $arch == arm64 && ${1:-rust} == rust ]]; then
+  build_args=(--build-arg GO_SHA256=b00b694903d126c588c378e72d3545549935d3982635ba3f7a964c9fa23fe3b9)
+fi
+if [[ ${1:-rust} == rust && -n ${ADX_EROFS_SOURCE_ARCHIVE:-} ]]; then
+  [[ -f $ADX_EROFS_SOURCE_ARCHIVE ]]
+  cp "$ADX_EROFS_SOURCE_ARCHIVE" build/images/source-cache/erofs-utils-1.8.10.tar.gz
+fi
+if [[ ${1:-rust} == rust && -n ${ADX_REDIS_SOURCE_ARCHIVE:-} ]]; then
+  [[ -f $ADX_REDIS_SOURCE_ARCHIVE ]]
+  cp "$ADX_REDIS_SOURCE_ARCHIVE" build/images/source-cache/redis-7.2.5.tar.gz
+fi
 docker build --progress=plain --provenance=false --platform "$platform" \
   --build-arg BUILDKIT_INLINE_CACHE=1 --cache-from "$cache_tag" \
-  --build-arg "BASE=$source_image" -f "$recipe_file" -t "$tag" .
+  --build-arg "BASE=$source_image" --build-arg "TARGETARCH=$arch" "${build_args[@]}" -f "$recipe_file" -t "$tag" .
 verify_image "$tag"
 docker push "$tag"
 docker tag "$tag" "$cache_tag"
