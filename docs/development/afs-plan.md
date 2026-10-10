@@ -27,7 +27,7 @@
 
 公共 Full #66 已使用 ON #137 的 x86 交付件通过原有11组业务用例。ARM Full 尚不能直接复用该入口：当前交接脚本固定选择 x86 产物及 target，并要求外部 backend；#143 ARM 清单的 backend 为 null。还需在公共流程补架构选择，核验原生 ARM 后端、固定 runtime／Collector 镜像和至少两个 ARM Kubernetes worker。不得用 #143 的 x86 镜像 bundle 代替 ARM Full；这些缺口不阻止独立验证 ARM 包的 bind ON 与远端 FUSE 核心场景。
 
-最新 source-gate／refactor 整合候选 `fa9d54d` 的正式 ON #144 失败，不能继承 #143 的交付通过结论。三个失败涉及 Platform 日志轮转等待、测试脚本 `ETXTBSY` 和 ARM Execd checkpoint 发布等待；后续组包未运行。当前有限修复只调整测试脚本发布与 Platform／Execd 的 CI 测试并发，保留全部用例、原操作期限和产品语义。受影响检查、正式新候选及其交付结果分别登记到下方迁移报告；没有新 CI 通过前保持待验收。
+最新正式 ON [#146](https://buildkite.com/agent-dx/agent-dx/builds/146) 绑定 `aa5f63d`：x86 公共组件及 AFS 测试、编译、组包、安装 smoke、镜像和 Kubernetes L0 全部通过；ARM Platform／AFS／Gateway 测试与编译通过，Execd 仍在同一个 checkpoint 发布入口等待失败，因此整轮 failed，ARM 组包未执行。fixture 原子发布已取得回归证据；串行化没有解决剩余 ARM 超时，根因保持待定位。现有测试补充提前返回错误和超时状态诊断，保留原 2 秒期限与持久化发布屏障。原 #144 失败及 #143／Full66 历史结果不改写，新诊断候选不自动继承交付结论。
 
 ## 支持范围
 

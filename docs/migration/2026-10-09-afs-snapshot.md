@@ -254,4 +254,15 @@ Linux fmt 与 `ADX_WITH_AFS=1 ADX_AFS_ALL_FEATURES=1 make rust-check JOBS=4` 通
 本地候选曾加入日志 Stop 和 checkpoint 等待的超时放宽；收敛时撤回，保留原期限和持久发布前不得响应成功的断言。未修改 AFS 或其他组件的产品实现、共享恢复策略、第三方源码或镜像。本轮 Linux 验证和正式 CI 分开登记；构建或工具检查通过不等于新候选交付、文件系统运行或性能验收通过。
 
 
-本次收敛候选的 Linux 回归：原地写 fixture 的新增用例先以 `ETXTBSY` 失败，原子发布后部署 process11 全部通过；Execd control_stream9 使用原期限通过，fmt、严格 workspace/all-targets/all-features Clippy、CI 合同16项通过。Cargo.lock 保持上述495afc57摘要。首轮 GREEN 因源文件时间早于共享 target 中的 RED 产物而误复用旧二进制，原失败保留；仅刷新该测试源的 mtime 后确认重新编译及 ELF 摘要变化，再取得有效11项通过。macOS 的额外工具检查因缺 yaml 出现3个导入错误，未安装依赖；上述16项使用已有 Linux 环境全部通过。不将两个超时判为根因已解决，正式新候选双架构 CI／组包仍待验收。
+本次收敛候选的 Linux 回归：原地写 fixture 的新增用例先以 `ETXTBSY` 失败，原子发布后部署 process11 全部通过；Execd control_stream9 使用原期限通过，fmt、严格 workspace/all-targets/all-features Clippy、CI 合同16项通过。Cargo.lock 保持上述495afc57摘要。首轮 GREEN 因源文件时间早于共享 target 中的 RED 产物而误复用旧二进制，原失败保留；仅刷新该测试源的 mtime 后确认重新编译及 ELF 摘要变化，再取得有效11项通过。macOS 的额外工具检查因缺 yaml 出现3个导入错误，未安装依赖；上述16项使用已有 Linux 环境全部通过。不将两个超时判为根因已解决；后续正式 #146 的结果如下。
+
+
+### #146 当前交付与剩余 ARM 失败
+
+[正式 ON #146](https://buildkite.com/agent-dx/agent-dx/builds/146) 绑定 `aa5f63dec2132a3b7c63a569e39ff4261cecc00c`，终态 failed。x86 公共组件与 AFS 测试／编译、统一组包、安装 smoke、验收镜像和 Kubernetes L0 全部通过；ARM Platform／AFS／Gateway 通过，Execd 的 `process::adxlet_creation_and_event_driven_checkpoint_wait_for_state_publication` 仍在原 2 秒发布入口等待超时，8通过／1失败。ARM Assemble／Publish／Index 未运行，没有本轮 ARM 最终包。串行化未解决这一失败，不认定根因已修复。
+
+x86 最终 `adx-release.tar.gz` 为79,412,589字节，SHA-256 `3d38c720e90dba9a2dbfa65024df6e33b796d934ff80f33e29fd0fc9bd841505`；生产步骤的 build／release manifest 均绑定该候选，with_afs=true，AFS二进制只有afs-meta／afs-node，无测试探针。已核验紧凑清单、归档摘要与组件摘要之间的一致性，未在本地再次下载整包；安装与L0结论来自对应正式步骤。完整失败日志、终态及清单在 `EV-SOURCE-GATE-MERGE`。
+
+现有 checkpoint 测试先补充失败诊断：若生命周期处理任务在进入持久发布前返回，直接报告其结果；到期则报告已观察的 runtime 状态及 Execd 子进程日志。保留2秒等待期限、真实检查点存储、发布前不得成功响应、资源保持及正常删除断言。此项先不修改产品实现，不以诊断改动或本地通过宣称 ARM 故障已修复。
+
+诊断候选的 Linux 定点验证：原期限的单项首次运行及同一二进制10次重复通过，整个 control_stream9通过；格式修正后重新编译的control_stream9、fmt与严格workspace/all-targets/all-features Clippy通过，Cargo.lock不变。这未复现ARM CI失败，不能作为根因修复证明；正式新候选待实际回执。
