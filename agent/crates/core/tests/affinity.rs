@@ -27,7 +27,7 @@ fn affinity_is_order_independent_and_membership_changes_only_move_affected_envs(
             tenant: "tenant".into(),
             template: "app".into(),
             version: "1".into(),
-            environment_id: i.to_string(),
+            binding_id: i.to_string(),
         };
         let ranked = ranked_endpoints(&scope, &old);
         assert_eq!(ranked, ranked_endpoints(&scope, &reversed));

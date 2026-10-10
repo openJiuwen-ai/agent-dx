@@ -8,7 +8,7 @@ pub enum Target {
         name: String,
         version: String,
     },
-    Environment {
+    Binding {
         name: String,
         version: String,
         id: String,
@@ -24,12 +24,12 @@ impl FromStr for Target {
                 name: decode(name)?,
                 version: decode(version)?,
             }),
-            ["urn", "adx", "environment", name, version, id] => Ok(Self::Environment {
+            ["urn", "adx", "binding", name, version, id] => Ok(Self::Binding {
                 name: decode(name)?,
                 version: decode(version)?,
                 id: decode(id)?,
             }),
-            _ => Err("target must be an ADX instance, template or environment URN".into()),
+            _ => Err("target must be an ADX instance, template or binding URN".into()),
         }
     }
 }
@@ -40,9 +40,9 @@ impl fmt::Display for Target {
             Self::Template { name, version } => {
                 write!(f, "urn:adx:template:{}:{}", encode(name), encode(version))
             }
-            Self::Environment { name, version, id } => write!(
+            Self::Binding { name, version, id } => write!(
                 f,
-                "urn:adx:environment:{}:{}:{}",
+                "urn:adx:binding:{}:{}:{}",
                 encode(name),
                 encode(version),
                 encode(id)

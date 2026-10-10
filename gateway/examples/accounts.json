@@ -1,0 +1,19 @@
+{
+  "tenant": "your-tenant",
+  "developer_scope": "your-huawei-developer-scope",
+  "agreement_version": "1",
+  "database_url_env": "ADX_ACCOUNT_DATABASE_URL",
+  "database_allow_plaintext": false,
+  "session_ttl_seconds": 604800,
+  "litellm": {
+    "management_url": "https://litellm.internal.example.com",
+    "api_base": "https://litellm.internal.example.com/v1",
+    "admin_key_env": "ADX_LITELLM_ADMIN_KEY",
+    "model": "agent-model",
+    "max_budget": 5.0,
+    "budget_duration": "30d",
+    "rpm_limit": 30,
+    "tpm_limit": 30000,
+    "allow_plaintext": false
+  }
+}

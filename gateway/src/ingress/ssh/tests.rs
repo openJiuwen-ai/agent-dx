@@ -25,7 +25,7 @@ fn ssh_credentials_select_the_requested_target_family() {
 }
 
 #[test]
-fn terminal_notice_returns_a_reusable_environment_identity() {
+fn terminal_notice_returns_a_reusable_binding_identity() {
     let route: SshRoute = "adx:target:urn%3Aadx%3Atemplate%3Ademo%3A1"
         .parse()
         .unwrap();
@@ -34,17 +34,17 @@ fn terminal_notice_returns_a_reusable_environment_identity() {
         panic!("managed target expected")
     };
     let notice = target.notice().unwrap();
-    assert!(notice.contains(&scope.environment_id));
+    assert!(notice.contains(&scope.binding_id));
     let urn = notice
         .lines()
-        .find_map(|line| line.strip_prefix("Environment URN: "))
+        .find_map(|line| line.strip_prefix("AgentBinding URN: "))
         .unwrap();
     assert_eq!(
         urn.parse::<Target>().unwrap(),
-        Target::Environment {
+        Target::Binding {
             name: "demo".into(),
             version: "1".into(),
-            id: scope.environment_id.clone()
+            id: scope.binding_id.clone()
         }
     );
     let again = SessionTarget::new(

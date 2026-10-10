@@ -17,8 +17,8 @@ fn create(key: Key, value: serde_json::Value) -> Transaction {
 
 async fn contracts(a: &dyn Repository, b: &dyn Repository) {
     let template = Key::new("template", &["tenant", "i"]).unwrap();
-    let environment = Key::new("environment", &["tenant", "ctx", "s"]).unwrap();
-    let another_environment = Key::new("environment", &["tenant", "ctx"]).unwrap();
+    let binding = Key::new("binding", &["tenant", "ctx", "s"]).unwrap();
+    let another_binding = Key::new("binding", &["tenant", "ctx"]).unwrap();
     assert!(a
         .commit(&create(
             template.clone(),
@@ -35,12 +35,12 @@ async fn contracts(a: &dyn Repository, b: &dyn Repository) {
                     expected: Some(before.revision.clone()),
                 },
                 Check {
-                    key: environment.clone(),
+                    key: binding.clone(),
                     expected: None,
                 },
             ],
             vec![Put {
-                key: environment.clone(),
+                key: binding.clone(),
                 record: Record::new(&json!({"template":id})).unwrap(),
             }],
         )
@@ -51,8 +51,8 @@ async fn contracts(a: &dyn Repository, b: &dyn Repository) {
     let (x, y) = tokio::join!(a.commit(&left), b.commit(&right));
     assert_ne!(x.unwrap(), y.unwrap());
     assert_eq!(
-        a.get(&environment).await.unwrap(),
-        b.get(&environment).await.unwrap()
+        a.get(&binding).await.unwrap(),
+        b.get(&binding).await.unwrap()
     );
     assert_eq!(
         a.get(&template).await.unwrap().unwrap().value["large"],
@@ -72,7 +72,7 @@ async fn contracts(a: &dyn Repository, b: &dyn Repository) {
     )
     .unwrap();
     assert!(a.commit(&tx).await.unwrap());
-    // A stale candidate revision must prevent ALL writes, including a new Environment record.
+    // A stale candidate revision must prevent ALL writes, including a new AgentBinding record.
     let stale = Transaction::new(
         vec![
             Check {
@@ -80,49 +80,49 @@ async fn contracts(a: &dyn Repository, b: &dyn Repository) {
                 expected: Some(before.revision),
             },
             Check {
-                key: another_environment.clone(),
+                key: another_binding.clone(),
                 expected: None,
             },
         ],
         vec![Put {
-            key: another_environment.clone(),
+            key: another_binding.clone(),
             record: Record::new(&json!({"phase":"active"})).unwrap(),
         }],
     )
     .unwrap();
     assert!(!b.commit(&stale).await.unwrap());
-    assert!(a.get(&another_environment).await.unwrap().is_none());
-    let prior = a.get(&environment).await.unwrap().unwrap();
+    assert!(a.get(&another_binding).await.unwrap().is_none());
+    let prior = a.get(&binding).await.unwrap().unwrap();
     let removal = Transaction::with_deletes(
         vec![Check {
-            key: environment.clone(),
+            key: binding.clone(),
             expected: Some(prior.revision.clone()),
         }],
         vec![],
-        vec![environment.clone()],
+        vec![binding.clone()],
     )
     .unwrap();
     assert!(b.commit(&removal).await.unwrap());
-    assert!(a.get(&environment).await.unwrap().is_none());
+    assert!(a.get(&binding).await.unwrap().is_none());
     assert!(a
         .commit(&create(
-            environment.clone(),
+            binding.clone(),
             json!({"template":"new-lifecycle"})
         ))
         .await
         .unwrap());
     assert!(!b.commit(&removal).await.unwrap());
     assert_eq!(
-        a.get(&environment).await.unwrap().unwrap().value["template"],
+        a.get(&binding).await.unwrap().unwrap().value["template"],
         "new-lifecycle"
     );
     assert!(Transaction::with_deletes(
         vec![Check {
-            key: environment.clone(),
+            key: binding.clone(),
             expected: None
         }],
         vec![],
-        vec![environment]
+        vec![binding]
     )
     .is_err());
 }
@@ -229,5 +229,5 @@ async fn concurrent_namespace_initialization_preserves_current_state() {
         .query_async(&mut connection)
         .await
         .unwrap();
-    assert_eq!(marker, "environment-index-v1");
+    assert_eq!(marker, "binding-index-v1");
 }

@@ -33,7 +33,7 @@
 
 ## 当前 MR 边界
 
-默认 ADX 工程路径保持不带 AFS。AFS 相关变更会在默认 pipeline 中触发 Buildkite AFS gate；该 gate 使用 `ADX_WITH_AFS=1` 执行检查，但不把文件系统 artifact 注入默认发布包。只有显式带组件的 release package 才包含 `afs-meta`、`afs-node`、AFS 示例配置和 `with_afs: true` 清单。普通 release package 本轮仍不包含文件系统二进制、配置或运行依赖。
+默认 ADX 工程路径保持不带 AFS。`source-gate` 是公共源码质量入口；显式 `ADX_WITH_AFS=1` 时，它在同一 fmt/Clippy/tooling gate 内追加 AFS lint，但不把文件系统 artifact 注入默认发布包。只有显式带组件的 release package 才包含 `afs-meta`、`afs-node`、AFS 示例配置和 `with_afs: true` 清单。普通 release package 本轮仍不包含文件系统二进制、配置或运行依赖。
 
 目标仓本轮二进制已有下列限定运行证据；原 DMS/AFS 历史结论仍绑定原版本。本次 MR 的统一 ON 包及安装交付出口已完成；本报告限定到可审查的迁移成果，不表示性能、完整 POSIX 或复杂可靠性达标。
 
@@ -232,3 +232,14 @@ ARM最终交付件为`out/buildkite/arm64/adx-release.tar.gz`，76,433,898字节
 `EV-ARM143-FULL-SCOPE` 为源码核对：公共 `.buildkite/package-e2e.sh` 固定下载 `platform-build` 根层产物并校验 x86 target，要求 `backend.tar.gz`；公共 Full 调度和 runtime／Collector 固定镜像也尚无 ARM 组合入口。#143 ARM 清单为 `backend=null`，该轮已有 `platform-images` bundle 属于 x86，不能选同一 Build ID 就当作 ARM Full。
 
 ARM Full 需在公共入口补显式架构交接，并核验固定原生 ARM 后端与镜像、至少两个 ARM Kubernetes worker；worker 是否具备尚待环境核对，不能说已证实缺失。本次不触发会选错架构的 Full，也不创建私有替代流程。既有 x86 Full66继续绑定ON137，ARM Full保留待验收；性能仍按既定计划后置。
+
+
+### 公共 source-gate 收敛与目标分支冲突处理
+
+按公共工程入口收敛质量检查，移除独立 `.buildkite/afs-gate.sh` 和对应 pipeline step。`ADX_WITH_AFS=0`（默认）保留公共源码检查；显式 `1` 经现有 `make rust-check` 纳入 AFS lint。`ADX_AFS_ALL_FEATURES=1` 仍为显式扩展检查；非法或旧开关在 bootstrap 前拒绝。AFS UT 与产品编译由现有 `build-afs`／`build-afs-arm64` 负责，不在 source-gate 重复执行。两架构组包依赖公共 source-gate 和对应组件，检查失败继续阻止交付。
+
+正常合并目标 `refactor` 的 `859aac819677b142fbf0a419fcb63a60da66a4b3`，不重写迁移历史。冲突仅在 Cargo.lock 的6处：保留上游新增 Agent／Gateway 依赖、AFS 的固定官方依赖和重复版本的显式标识；随上游移除不再使用的 multer／spin 旧依赖。合并锁文件包含584个包，保留目标锁文件的全部521个包，共有包的校验和不变；最终 SHA-256 为 `495afc57bce8eea5f4e69a557daf481c93e2892ec4d4e3b5af346387e9377bbd`。Linux `cargo metadata --locked` 已通过且未改锁文件，新增依赖正常下载；离线首轮缓存缺项原记录保留。
+
+Linux fmt 与 `ADX_WITH_AFS=1 ADX_AFS_ALL_FEATURES=1 make rust-check JOBS=4` 通过，包含公共 all-targets/all-features Clippy、公共 unwrap 规则、AFS 默认及 all-features 检查。此为工作树快照检查，非正式 Buildkite clean checkout 运行；缓存布局辅助查询因快照无 Git 元数据产生的非致命提示保留。受影响测试及正式 CI 结果在 `EV-SOURCE-GATE-MERGE` 按候选分别登记；原 #143 包、运行及 Full66 不自动变为本轮合入候选的结论。未修改 AFS 产品 Rust、第三方源码或公共镜像；阶段一历史8/8及后置范围保持原结论。
+
+本轮有效 Linux 回归：CI tooling331项、release tooling32项全部通过；部署 config33／process10、Gateway all-features lib106（另2忽略）、Agent四包60（另10忽略）、Execd control_stream9／entrypoint_ready1通过。source-gate 的4项针对性回归在旧脚本下3失败、新脚本下全部通过；含 ON 环境继承隔离、默认/OFF/ON、显式 all-features、非法变量及失败传播。工具快照误覆盖、首次缺 PATH／Git HEAD 的无效运行均保留，不计产品失败或通过；恢复后验证使用独立完整快照及源码外日志。额外误选的共享 `adx-process --lib` 单包检查因 serde derive feature 不可用未编译，该目录本轮未改；它不能替代部署 process10，后者已正式通过。不据此宣称整个 workspace UT 全部通过。文档检查140份／657本地链接通过；正式 Buildkite 与远端状态以本轮后续实际回执为准。

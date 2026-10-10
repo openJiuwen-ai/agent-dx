@@ -21,7 +21,7 @@ class ArmPackageTests(unittest.TestCase):
         self.assertEqual(arm['agents']['arch'], 'arm64')
         self.assertEqual(arm['agents']['os'], 'macos')
         self.assertNotIn('platform-build', arm['depends_on'])
-        self.assertEqual(set(arm['depends_on']), {'build-platform-arm64', 'build-gateway-arm64', 'build-execd-arm64', 'build-afs-arm64', 'afs-gate', 'sdk-package', 'admin-package', 'source-gate'})
+        self.assertEqual(set(arm['depends_on']), {'build-platform-arm64', 'build-gateway-arm64', 'build-execd-arm64', 'build-afs-arm64', 'sdk-package', 'admin-package', 'source-gate'})
         compiler = steps['build-platform-arm64']
         self.assertNotIn('depends_on', compiler)
         self.assertIn('build-arm-package.sh build platform', compiler['command'])
@@ -46,7 +46,7 @@ class ArmPackageTests(unittest.TestCase):
         self.assertIn('ADX_BUILD_ARCH=arm64', publish)
         self.assertNotIn('OBS_ACCESS_KEY_ID', (ROOT / '.buildkite/build-arm-package.sh').read_text())
 
-    def test_afs_on_uses_the_native_arm_component_and_gate(self):
+    def test_afs_on_uses_the_native_arm_component_and_source_gate(self):
         steps = {step['key']: step for step in yaml.safe_load(
             (ROOT / '.buildkite/pipeline-package.yml').read_text())['steps']}
         afs = steps['build-afs-arm64']

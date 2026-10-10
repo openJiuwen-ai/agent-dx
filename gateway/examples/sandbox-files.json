@@ -1,0 +1,10 @@
+{
+  "port": 50090,
+  "token_env": "ADX_EXECD_HTTP_TOKEN",
+  "directory": {
+    "url": "https://apiserver.internal:8081",
+    "allow_http": false,
+    "ca_file": "/etc/adx/ca.pem"
+  },
+  "api_key_envs": {"tenant": "ADX_PLATFORM_TENANT_API_KEY"}
+}

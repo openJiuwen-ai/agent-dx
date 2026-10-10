@@ -182,10 +182,7 @@ impl AgentApi {
             .split('/')
             .collect();
         let listing = parts.method == http::Method::GET
-            && matches!(
-                path.as_slice(),
-                ["templates", _, "versions", _, "environments"]
-            );
+            && matches!(path.as_slice(), ["templates", _, "versions", _, "bindings"]);
         if !listing && parts.uri.query().is_some() {
             return Err(Error::Invalid(
                 "this managed API does not accept query parameters".into(),
@@ -203,8 +200,8 @@ impl AgentApi {
         };
         let name = segment(name)?;
         let version = segment(version)?;
-        if rest == ["environments"] && parts.method == http::Method::GET {
-            let mut query = adx_agent_core::activator::EnvironmentList {
+        if rest == ["bindings"] && parts.method == http::Method::GET {
+            let mut query = adx_agent_core::activator::BindingList {
                 tenant: tenant.into(),
                 template: name,
                 version,
@@ -228,30 +225,30 @@ impl AgentApi {
                     _ => return Err(Error::Invalid("unknown pagination parameter".into())),
                 }
             }
-            return serde_json::to_value(managed.list_environments(ctx, &query).await?)
-                .map_err(|_| Error::Unavailable("Environment page serialization failed".into()));
+            return serde_json::to_value(managed.list_bindings(ctx, &query).await?)
+                .map_err(|_| Error::Unavailable("AgentBinding page serialization failed".into()));
         }
         if rest.is_empty() && parts.method == http::Method::GET {
             return Ok(
                 serde_json::json!({"template":managed.template(ctx, tenant,&name,&version).await?}),
             );
         }
-        let ["environments", environment, action @ ..] = rest else {
+        let ["bindings", binding, action @ ..] = rest else {
             return Err(Error::NotFound);
         };
         let scope = Scope {
             tenant: tenant.into(),
             template: name,
             version,
-            environment_id: segment(environment)?,
+            binding_id: segment(binding)?,
         };
         scope.validate().map_err(Error::Invalid)?;
         match (parts.method, action) {
             (http::Method::GET, []) => {
-                Ok(serde_json::json!({"environment":managed.environment(ctx, &scope).await?}))
+                Ok(serde_json::json!({"binding":managed.binding(ctx, &scope).await?}))
             }
             (http::Method::DELETE, []) => {
-                managed.delete_environment(ctx, &scope).await?;
+                managed.delete_binding(ctx, &scope).await?;
                 Ok(serde_json::json!({"status":"deleted"}))
             }
             (http::Method::POST, ["resolve"]) => {
@@ -261,12 +258,26 @@ impl AgentApi {
                     .resolve_with_cache(ctx, &scope, input.protocol, input.port, input.bypass_cache)
                     .await?;
                 Ok(
-                    serde_json::json!({"sandbox_id":target.environment.sandbox_id,"port":port,"protocol":input.protocol}),
+                    serde_json::json!({"sandbox_id":target.binding.sandbox_id,"port":port,"protocol":input.protocol}),
                 )
             }
             _ => Err(Error::NotFound),
         }
     }
+    pub fn service_access(&self) -> super::agent_service::AgentV2Access {
+        super::agent_service::AgentV2Access::new(self.managed.clone())
+    }
+
+    pub(super) fn take_service_selection<B>(
+        &self,
+        request: &mut Request<B>,
+    ) -> Option<(super::agent_service::ServiceSelection, http::Uri)> {
+        request
+            .extensions_mut()
+            .remove::<SelectionRetry>()
+            .map(|retry| (retry.selection, retry.backend_uri))
+    }
+
     /// Rewrite a managed HTTP/WS request into the existing fixed Sandbox forwarding path.
     /// SSH clients use the resolve endpoint then the existing Sandbox-ID CONNECT/tunnel interface.
     pub fn can_retry_data<B>(&self, request: &Request<B>) -> bool {
@@ -277,23 +288,11 @@ impl AgentApi {
         let Some(retry) = request.extensions_mut().remove::<SelectionRetry>() else {
             return Ok(false);
         };
-        let (target, port) = retry
-            .context
-            .run(self.managed.retry_resolve(
-                &retry.context,
-                &retry.scope,
-                retry.protocol,
-                retry.port,
-                &retry.generation,
-            ))
-            .await?;
-        let uri = format!(
-            "/{}/{port}/{}",
-            target.environment.sandbox_id, retry.tail_and_query
-        );
-        *request.uri_mut() = uri
-            .parse()
-            .map_err(|_| Error::Unavailable("invalid resolved forwarding path".into()))?;
+        let mut selection = retry.selection;
+        if !self.service_access().retry(&mut selection).await? {
+            return Ok(false);
+        }
+        *request.uri_mut() = selection.forwarding_uri(&retry.backend_uri)?;
         Ok(true)
     }
     pub(super) async fn prepare_data<B>(
@@ -302,34 +301,25 @@ impl AgentApi {
         tenant: &str,
         access: super::agent_access::AccessRequest,
     ) -> Result<(), Error> {
-        let scope = ManagedService::environment_scope(tenant, &access.target)?;
-        let notice = super::agent_access::EnvironmentNotice::new(&scope)?;
+        let scope = ManagedService::binding_scope(tenant, &access.target)?;
+        let notice = super::agent_access::BindingNotice::new(&scope)?;
         request.extensions_mut().insert(notice);
         let context = Arc::new(RequestContext::new(self.request_timeout));
-        let (target, port) = context
-            .run(
-                self.managed
-                    .resolve(&context, &scope, access.protocol, access.port),
+        let selection = self
+            .service_access()
+            .select(
+                context,
+                scope,
+                super::agent_service::ServiceSelector {
+                    protocol: access.protocol,
+                    port: access.port,
+                },
             )
             .await?;
-        let backend_uri = access.backend_uri.to_string();
-        let tail_and_query = backend_uri
-            .strip_prefix('/')
-            .unwrap_or(&backend_uri)
-            .to_owned();
-        *request.uri_mut() = format!(
-            "/{}/{port}/{}",
-            target.environment.sandbox_id, tail_and_query
-        )
-        .parse()
-        .map_err(|_| Error::Unavailable("invalid resolved forwarding path".into()))?;
+        *request.uri_mut() = selection.forwarding_uri(&access.backend_uri)?;
         request.extensions_mut().insert(SelectionRetry {
-            context,
-            generation: target.environment.generation,
-            scope,
-            protocol: access.protocol,
-            port,
-            tail_and_query,
+            selection,
+            backend_uri: access.backend_uri,
         });
         Ok(())
     }
@@ -353,10 +343,6 @@ async fn read_body(body: hyper::body::Incoming) -> Result<Bytes, Error> {
 
 #[derive(Clone)]
 struct SelectionRetry {
-    context: Arc<RequestContext>,
-    generation: String,
-    scope: Scope,
-    protocol: Protocol,
-    port: u16,
-    tail_and_query: String,
+    selection: super::agent_service::ServiceSelection,
+    backend_uri: http::Uri,
 }

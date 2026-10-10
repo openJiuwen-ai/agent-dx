@@ -1,4 +1,4 @@
-//! Redis leases for Activator membership, separate from Template/Environment records.
+//! Redis leases for Activator membership, separate from Template/AgentBinding records.
 use crate::{Error, RedisRepository, Result};
 use adx_agent_core::discovery::ActivatorEndpoint;
 use serde::{Deserialize, Serialize};

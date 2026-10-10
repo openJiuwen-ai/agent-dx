@@ -37,7 +37,7 @@ Coordinator 保存集群状态，内嵌 Global 轮转与 ShardScheduler。adxlet
 
 ## Agent 与公开 Sandbox 边界
 
-Agent 层已有的 `adx_agent_core::Environment` 表示产品执行上下文，绑定稳定的逻辑 Sandbox；由 Activator 管理其 Template、元数据与激活状态。平台 `adx_core::EnvironmentRecord` 表示调度和执行对象。两层通过 Sandbox 能力接口连接，分别维护自己的状态机和存储。
+Agent 层的 `adx_agent_core::AgentBinding` 表示 `(tenant, template, version, binding_id)` 到稳定 `sandbox_id` 的业务绑定，由 Activator 管理元数据、绑定代次与删除意图。`sandbox_id` 即 Platform Environment ID；平台 `adx_core::EnvironmentRecord` 独占调度和执行生命周期。Environment 专指平台运行环境，AgentBinding 不复制平台运行状态。
 
 公开 Python 包仍为 `adx-sandbox` / `adx_sandbox`，用户仍使用 `Sandbox`。公开 HTTP 路径 `/api/instances`、字段 `instanceId` 和 SDK 的 `instance_id` 保持现有接口定义，由 API Server 在边界映射到平台 `environment_id`。内部组件重命名不把 Agent 产品接口并入平台 API。
 
