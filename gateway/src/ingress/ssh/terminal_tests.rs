@@ -169,13 +169,13 @@ async fn read_until(channel: &mut russh::Channel<client::Msg>, text: &str) -> St
 }
 
 #[tokio::test]
-async fn ssh_terminal_activates_one_environment_and_proxies_input_resize_and_exit() {
+async fn ssh_terminal_activates_one_binding_and_proxies_input_resize_and_exit() {
     terminal_case(false).await;
 }
 
 #[tokio::test]
 #[ignore = "requires system OpenSSH client"]
-async fn native_openssh_receives_environment_on_terminal_stdout() {
+async fn native_openssh_receives_binding_on_terminal_stdout() {
     terminal_case(true).await;
 }
 
@@ -228,7 +228,7 @@ async fn terminal_case(native: bool) {
     sandbox.install("tenant", "inline-instance").await;
     sandbox.install("other", "other-instance").await;
     let state = AgentState::new(Arc::new(MemoryRepository::default()));
-    let template = serde_json::from_value(serde_json::json!({"name":"demo","version":"1","image":"app:1","isolation_runtime":"runc","entrypoint":["/start"],"resources":{"cpu_millis":1000,"memory_mib":512},"service":[{"protocol":"ssh","port":port}]})).unwrap();
+    let template = serde_json::from_value(serde_json::json!({"name":"demo","version":"1","image":"app:1","isolation_runtime":"runc","resources":{"cpu_millis":1000,"memory_mib":512},"service":[{"protocol":"ssh","port":port}]})).unwrap();
     state.publish("tenant", &template).await.unwrap();
     let api = Arc::new(AgentApi {
         managed: Arc::new(adx_agent_api::managed::ManagedService::new(Arc::new(
@@ -319,7 +319,7 @@ async fn terminal_case(native: bool) {
             .await
             .unwrap()
             .success());
-        let query = adx_agent_core::activator::EnvironmentList {
+        let query = adx_agent_core::activator::BindingList {
             tenant: "tenant".into(),
             template: "demo".into(),
             version: "1".into(),
@@ -327,10 +327,10 @@ async fn terminal_case(native: bool) {
             page_token: None,
         };
         assert!(state
-            .list_environments(&query)
+            .list_bindings(&query)
             .await
             .unwrap()
-            .environments
+            .bindings
             .is_empty());
         let mut channel = client.channel_open_session().await.unwrap();
         channel
@@ -342,32 +342,32 @@ async fn terminal_case(native: bool) {
         let output = read_until(&mut channel, "backend-ready").await;
         let id = output
             .lines()
-            .find_map(|v| v.strip_prefix("Environment ID: "))
+            .find_map(|v| v.strip_prefix("AgentBinding ID: "))
             .unwrap();
         let urn = output
             .lines()
-            .find_map(|v| v.strip_prefix("Environment URN: "))
+            .find_map(|v| v.strip_prefix("AgentBinding URN: "))
             .unwrap();
         assert_eq!(
             urn.parse::<Target>().unwrap(),
-            Target::Environment {
+            Target::Binding {
                 name: "demo".into(),
                 version: "1".into(),
                 id: id.into()
             }
         );
-        let environment = state
-            .environment(&Scope {
+        let binding = state
+            .binding(&Scope {
                 tenant: "tenant".into(),
                 template: "demo".into(),
                 version: "1".into(),
-                environment_id: id.into(),
+                binding_id: id.into(),
             })
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(environment.scope.environment_id, id);
-        assert!(output.find("Environment ID:").unwrap() < output.find("backend-ready").unwrap());
+        assert_eq!(binding.scope.binding_id, id);
+        assert!(output.find("AgentBinding ID:").unwrap() < output.find("backend-ready").unwrap());
         channel.data(&b"hello\r"[..]).await.unwrap();
         assert_eq!(read_until(&mut channel, "hello\r").await, "hello\r");
         channel.window_change(132, 43, 0, 0).await.unwrap();
@@ -416,16 +416,8 @@ async fn terminal_case(native: bool) {
             .unwrap();
         channel.request_shell(true).await.unwrap();
         let next = read_until(&mut channel, "backend-ready").await;
-        assert!(next.contains(&format!("Environment ID: {id}\r\n")));
-        assert_eq!(
-            state
-                .list_environments(&query)
-                .await
-                .unwrap()
-                .environments
-                .len(),
-            1
-        );
+        assert!(next.contains(&format!("AgentBinding ID: {id}\r\n")));
+        assert_eq!(state.list_bindings(&query).await.unwrap().bindings.len(), 1);
         reconnect
             .disconnect(russh::Disconnect::ByApplication, "done", "")
             .await
@@ -446,7 +438,7 @@ async fn terminal_case(native: bool) {
             .unwrap()
             .success());
         let mut channel = client.channel_open_session().await.unwrap();
-        // OpenSSH may pipeline environment, PTY and shell requests. Each requested reply must keep its order.
+        // OpenSSH may pipeline binding, PTY and shell requests. Each requested reply must keep its order.
         channel.set_env(true, "LANG", "C.UTF-8").await.unwrap();
         channel
             .request_pty(true, "xterm", 80, 24, 0, 0, &[])
@@ -573,9 +565,9 @@ async fn terminal_case(native: bool) {
                 String::from_utf8_lossy(&output.stderr)
             );
             let text = std::str::from_utf8(&output.stdout).unwrap();
-            assert!(text.contains("Environment ID: "), "{text}");
+            assert!(text.contains("AgentBinding ID: "), "{text}");
             assert!(
-                text.contains("Environment URN: urn:adx:environment:demo:1:"),
+                text.contains("AgentBinding URN: urn:adx:binding:demo:1:"),
                 "{text}"
             );
             assert!(text.contains("backend-ready"), "{text}");

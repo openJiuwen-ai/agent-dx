@@ -61,7 +61,7 @@ async fn remote_calls_propagate_the_remaining_request_budget() {
         async move {
             seen.lock().unwrap().push(headers[adx_agent_core::activator::DEADLINE_HEADER].to_str().unwrap().parse().unwrap());
             tokio::time::sleep(Duration::from_millis(50)).await;
-            Json(serde_json::json!({"name":"app","version":"1","image":"app:1","isolation_runtime":"runc","entrypoint":["/start"],"resources":{"cpu_millis":1000,"memory_mib":512},"service":[{"protocol":"http","port":8080}]}))
+            Json(serde_json::json!({"name":"app","version":"1","image":"app:1","isolation_runtime":"runc","resources":{"cpu_millis":1000,"memory_mib":512},"service":[{"protocol":"http","port":8080}]}))
         }
     }));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

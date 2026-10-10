@@ -9,7 +9,7 @@ pub struct SshArgs {
     #[command(flatten)]
     pub scope: TemplateScope,
     #[arg(long)]
-    pub env: Option<String>,
+    pub binding_id: Option<String>,
     /// Template 中声明的 SSH service 端口。
     #[arg(long)]
     pub port: Option<u16>,
@@ -58,8 +58,8 @@ pub fn arguments(
     if port == 0 || ssh.port == Some(0) || host.starts_with('-') {
         return Err(Error::Invalid("无效 SSH 地址或端口".into()));
     }
-    let target = match &ssh.env {
-        Some(id) => Target::Environment {
+    let target = match &ssh.binding_id {
+        Some(id) => Target::Binding {
             name: ssh.scope.template.clone(),
             version: ssh.scope.version.clone(),
             id: id.clone(),
@@ -145,7 +145,7 @@ mod tests {
             "1",
             "--gateway",
             "localhost:2222",
-            "--env",
+            "--binding-id",
             "my env",
             "--port",
             "2223",
@@ -163,7 +163,7 @@ mod tests {
         let route: SshRoute = username.parse().unwrap();
         assert_eq!(
             route.target,
-            Target::Environment {
+            Target::Binding {
                 name: "demo agent".into(),
                 version: "1".into(),
                 id: "my env".into()
@@ -179,7 +179,7 @@ mod tests {
         assert_eq!(args.last().unwrap(), "localhost");
     }
     #[test]
-    fn ssh_can_select_server_generated_environment_and_ipv6_endpoint() {
+    fn ssh_can_select_server_generated_binding_and_ipv6_endpoint() {
         let cli =
             Cli::try_parse_from(["adx", "ssh", "--template", "demo", "--version", "1"]).unwrap();
         let crate::Command::Ssh(ssh) = &cli.command else {

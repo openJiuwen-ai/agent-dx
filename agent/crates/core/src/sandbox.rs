@@ -10,7 +10,10 @@ use std::collections::BTreeMap;
 pub struct ExecutionSpec {
     pub image: String,
     pub isolation_runtime: String,
-    /// Empty only for an inline base sandbox which runs EXECD without a user process.
+    /// Managed Agent execution inherits the image process. Internal runtime profiles may use explicit startup.
+    #[serde(default)]
+    pub inherit_entrypoint: bool,
+    /// Empty for image inheritance or an idle sandbox.
     pub entrypoint: Vec<String>,
     pub working_dir: String,
     pub user: Option<String>,
@@ -23,8 +26,9 @@ impl From<&TemplateVersion> for ExecutionSpec {
         Self {
             image: value.image.clone(),
             isolation_runtime: value.isolation_runtime.clone(),
-            entrypoint: value.entrypoint.clone(),
-            working_dir: value.working_dir.clone().unwrap_or_else(|| "/".into()),
+            inherit_entrypoint: true,
+            entrypoint: vec![],
+            working_dir: String::new(),
             user: None,
             env: value.env.clone(),
             resources: value.resources.clone(),
@@ -39,17 +43,34 @@ impl ExecutionSpec {
             version: "1".into(),
             image: self.image.clone(),
             isolation_runtime: self.isolation_runtime.clone(),
-            entrypoint: if self.entrypoint.is_empty() {
-                vec!["execd-idle".into()]
-            } else {
-                self.entrypoint.clone()
-            },
-            working_dir: Some(self.working_dir.clone()),
             env: self.env.clone(),
             resources: self.resources.clone(),
             service: self.service.clone(),
         };
         template.validate()?;
+        if self.inherit_entrypoint {
+            if !self.entrypoint.is_empty() || !self.working_dir.is_empty() || self.user.is_some() {
+                return Err("image process inheritance cannot include startup overrides".into());
+            }
+        } else {
+            if self
+                .entrypoint
+                .first()
+                .is_some_and(|arg| arg.trim().is_empty())
+                || self.entrypoint.iter().any(|arg| arg.contains('\0'))
+            {
+                return Err("entrypoint requires a nonempty executable and NUL-free argv".into());
+            }
+            if !self.working_dir.starts_with('/')
+                || self.working_dir.contains('\0')
+                || self.working_dir.split('/').any(|part| part == "..")
+            {
+                return Err(
+                    "working_dir must be an absolute sandbox path without parent traversal".into(),
+                );
+            }
+        }
+
         if self
             .user
             .as_ref()
@@ -114,12 +135,6 @@ pub struct SandboxInfo {
     pub sandbox_ip: Option<String>,
     pub execution: Option<ExecutionSpec>,
 }
-/// Privileged in-process connection parameters. Never serialize or return to a public caller.
-pub struct SandboxRuntime {
-    pub port: u16,
-    pub token: String,
-}
-
 #[async_trait]
 pub trait Sandbox: Send + Sync {
     async fn describe(&self, tenant: &str, id: &str) -> Result<Option<SandboxInfo>, SandboxError> {
@@ -136,13 +151,6 @@ pub trait Sandbox: Send + Sync {
             "Sandbox directory unavailable".into(),
         ))
     }
-    /// Only for the trusted Gateway inline adapter, after tenant authorization.
-    async fn runtime(&self, _tenant: &str, _id: &str) -> Result<SandboxRuntime, SandboxError> {
-        Err(SandboxError::Unsupported(
-            "Sandbox runtime access unavailable".into(),
-        ))
-    }
-
     /// Local admission validation only; implementations may reject deployment
     /// capabilities before any state or execution is created.
     fn validate_execution(&self, execution: &ExecutionSpec) -> Result<(), SandboxError> {

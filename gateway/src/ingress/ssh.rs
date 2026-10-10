@@ -1,4 +1,4 @@
-//! SSH terminal entrypoint shared by inline instances and managed Environments.
+//! SSH terminal entrypoint shared by inline instances and managed AgentBindings.
 use super::{server::IngressStream, AccessKind, Ingress};
 use adx_agent_api::managed::ManagedService;
 use adx_agent_core::{
@@ -24,7 +24,7 @@ pub enum Error {
     Invalid(String),
     #[error("SSH access denied")]
     Forbidden,
-    #[error("SSH activation or connection timed out; retry using the same Environment")]
+    #[error("SSH activation or connection timed out; retry using the same AgentBinding")]
     Timeout,
     #[error("SSH protocol failed: {0}")]
     Protocol(#[from] russh::Error),
@@ -270,7 +270,7 @@ impl SessionTarget {
                 trace,
             });
         }
-        let scope = ManagedService::environment_scope(tenant, &route.target)
+        let scope = ManagedService::binding_scope(tenant, &route.target)
             .map_err(|e| Error::Invalid(e.to_string()))?;
         Ok(Self::Managed {
             scope,
@@ -282,14 +282,14 @@ impl SessionTarget {
         let Self::Managed { scope, .. } = self else {
             return None;
         };
-        let urn = Target::Environment {
+        let urn = Target::Binding {
             name: scope.template.clone(),
             version: scope.version.clone(),
-            id: scope.environment_id.clone(),
+            id: scope.binding_id.clone(),
         };
         Some(format!(
-            "Environment ID: {}\r\nEnvironment URN: {urn}\r\n",
-            scope.environment_id
+            "AgentBinding ID: {}\r\nAgentBinding URN: {urn}\r\n",
+            scope.binding_id
         ))
     }
     async fn connect(
@@ -312,7 +312,7 @@ impl SessionTarget {
                     .await
                     .map_err(|e| Error::Target(e.to_string()))?;
                 (
-                    target.environment.sandbox_id,
+                    target.binding.sandbox_id,
                     scope.tenant.as_str(),
                     port,
                     trace,
@@ -476,7 +476,7 @@ impl server::Handler for Connection {
             let id = channel.id();
             if let Err(error) = terminal(channel, handle.clone(), target, gateway, settings).await {
                 tracing::debug!(%error, "SSH terminal closed");
-                // Connection diagnostics are channel stderr; only the interactive shell receives the Environment notice.
+                // Connection diagnostics are channel stderr; only the interactive shell receives the AgentBinding notice.
                 let _ = handle
                     .extended_data(id, 1, format!("ADX: {error}\r\n"))
                     .await;
@@ -547,7 +547,7 @@ async fn terminal(
     let pty = pty.ok_or_else(|| Error::Invalid("interactive SSH requires a terminal".into()))?;
     let ctx = adx_agent_api::request::RequestContext::new(settings.connect_timeout);
     let deadline = ctx.deadline();
-    // Validate the managed service before announcing an Environment or submitting a create.
+    // Validate the managed service before announcing an AgentBinding or submitting a create.
     if let SessionTarget::Managed { scope, port, .. } = &target {
         let api = gateway.agent_api.as_ref().ok_or(Error::Forbidden)?;
         let template = tokio::time::timeout_at(

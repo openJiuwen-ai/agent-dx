@@ -1,4 +1,4 @@
-//! Agent-only Activator membership and deterministic Env routing.
+//! Agent-only Activator membership and deterministic AgentBinding routing.
 use crate::{transport, Scope};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -24,7 +24,7 @@ pub fn ranked_endpoints(scope: &Scope, endpoints: &[ActivatorEndpoint]) -> Vec<A
         &scope.tenant,
         &scope.template,
         &scope.version,
-        &scope.environment_id,
+        &scope.binding_id,
     ]);
     let mut ranked: Vec<_> = endpoints
         .iter()

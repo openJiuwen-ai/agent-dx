@@ -18,25 +18,25 @@ impl ManagedService {
             templates: Mutex::new(BoundedCache::new(1024)),
         }
     }
-    /// Select an Environment identity without creating product or Sandbox state.
-    /// Returns Invalid for an inline target or invalid scope components.
-    pub fn environment_scope(tenant: &str, target: &AccessTarget) -> Result<Scope> {
+    /// Select an AgentBinding identity without creating product or Sandbox state.
+    /// Returns Invalid for a direct instance target or invalid scope components.
+    pub fn binding_scope(tenant: &str, target: &AccessTarget) -> Result<Scope> {
         let (name, version, id) = match target {
             AccessTarget::Template { name, version } => {
                 (name, version, uuid::Uuid::new_v4().to_string())
             }
-            AccessTarget::Environment { name, version, id } => (name, version, id.clone()),
+            AccessTarget::Binding { name, version, id } => (name, version, id.clone()),
             AccessTarget::Instance(_) => {
                 return Err(Error::Invalid(
-                    "instance requires inline authentication".into(),
-                ))
+                    "managed access requires a template or binding target".into(),
+                ));
             }
         };
         let scope = Scope {
             tenant: tenant.into(),
             template: name.clone(),
             version: version.clone(),
-            environment_id: id,
+            binding_id: id,
         };
         scope.validate().map_err(Error::Invalid)?;
         Ok(scope)
@@ -104,22 +104,37 @@ impl ManagedService {
         .await
     }
 
-    pub async fn environment(&self, ctx: &RequestContext, scope: &Scope) -> Result<Environment> {
-        self.control.environment(ctx, scope).await
-    }
-    pub async fn list_environments(
+    pub async fn prepare_binding(
         &self,
         ctx: &RequestContext,
-        query: &activator::EnvironmentList,
-    ) -> Result<activator::EnvironmentPage> {
-        query.validate().map_err(Error::Invalid)?;
-        self.control.list_environments(ctx, query).await
+        scope: &Scope,
+        launch: &adx_agent_core::launch::LaunchConfig,
+    ) -> Result<AgentBinding> {
+        scope.validate().map_err(Error::Invalid)?;
+        let binding = self.control.prepare_binding(ctx, scope, launch).await?;
+        if binding.scope != *scope || binding.phase != BindingPhase::Active {
+            return Err(Error::Unavailable(
+                "prepared binding identity mismatch".into(),
+            ));
+        }
+        Ok(binding)
     }
-    pub async fn delete_environment(&self, ctx: &RequestContext, scope: &Scope) -> Result<()> {
-        self.control.delete_environment(ctx, scope).await
+    pub async fn binding(&self, ctx: &RequestContext, scope: &Scope) -> Result<AgentBinding> {
+        self.control.binding(ctx, scope).await
+    }
+    pub async fn list_bindings(
+        &self,
+        ctx: &RequestContext,
+        query: &activator::BindingList,
+    ) -> Result<activator::BindingPage> {
+        query.validate().map_err(Error::Invalid)?;
+        self.control.list_bindings(ctx, query).await
+    }
+    pub async fn delete_binding(&self, ctx: &RequestContext, scope: &Scope) -> Result<()> {
+        self.control.delete_binding(ctx, scope).await
     }
 
-    /// Each request validates the service; the Activator may reuse a cached Env binding.
+    /// Each request validates the service; the Activator may reuse a cached AgentBinding binding.
     pub async fn resolve(
         &self,
         ctx: &RequestContext,
@@ -172,10 +187,10 @@ impl ManagedService {
             .control
             .activate_with_cache(ctx, scope, generation, bypass_cache)
             .await?;
-        if target.environment.scope != *scope
-            || target.environment.phase != EnvironmentPhase::Active
-            || target.environment.generation.is_empty()
-            || target.environment.sandbox_id.is_empty()
+        if target.binding.scope != *scope
+            || target.binding.phase != BindingPhase::Active
+            || target.binding.generation.is_empty()
+            || target.binding.sandbox_id.is_empty()
             || target.service != template.service
         {
             return Err(Error::Unavailable(

@@ -1,4 +1,4 @@
-//! Shared HTTP/WS entrypoint selection; compatibility stays behind the selected target.
+//! Managed Agent HTTP/WS target selection and backend path adaptation.
 use adx_agent_api::Error;
 use adx_agent_core::{target::Target, Protocol, Scope};
 use http::{HeaderMap, Request};
@@ -10,35 +10,31 @@ pub(super) struct AccessRequest {
     pub port: Option<u16>,
     pub backend_uri: http::Uri,
 }
-#[derive(Clone)]
-pub(super) struct InlineForward {
-    pub backend_uri: http::Uri,
-}
 #[derive(Debug, Clone)]
-pub(super) struct EnvironmentNotice {
+pub(super) struct BindingNotice {
     id: http::HeaderValue,
     urn: http::HeaderValue,
 }
-impl EnvironmentNotice {
+impl BindingNotice {
     pub fn new(scope: &Scope) -> Result<Self, Error> {
-        let urn = Target::Environment {
+        let urn = Target::Binding {
             name: scope.template.clone(),
             version: scope.version.clone(),
-            id: scope.environment_id.clone(),
+            id: scope.binding_id.clone(),
         }
         .to_string();
         Ok(Self {
-            id: scope.environment_id.parse().map_err(|_| {
-                Error::Invalid("Environment ID is not a valid response header".into())
+            id: scope.binding_id.parse().map_err(|_| {
+                Error::Invalid("AgentBinding ID is not a valid response header".into())
             })?,
             urn: urn
                 .parse()
-                .map_err(|_| Error::Invalid("invalid Environment URN".into()))?,
+                .map_err(|_| Error::Invalid("invalid AgentBinding URN".into()))?,
         })
     }
     pub fn apply(&self, headers: &mut HeaderMap) {
-        headers.insert("x-adx-environment-id", self.id.clone());
-        headers.insert("x-adx-environment-urn", self.urn.clone());
+        headers.insert("x-adx-binding-id", self.id.clone());
+        headers.insert("x-adx-binding-urn", self.urn.clone());
     }
 }
 impl AccessRequest {
@@ -59,7 +55,6 @@ impl AccessRequest {
             .get("upgrade")
             .and_then(|v| v.to_str().ok())
             .is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
-        let mut instance = None;
         let mut target = None;
         let mut port = None;
         let mut seen = std::collections::BTreeSet::new();
@@ -72,7 +67,11 @@ impl AccessRequest {
                 return Err(Error::Invalid("duplicate target or port parameter".into()));
             }
             match name.as_ref() {
-                "instance" => instance = Some(value.trim().to_owned()),
+                "instance" => {
+                    return Err(Error::Invalid(
+                        "managed access requires a template or binding target".into(),
+                    ))
+                }
                 "target" => target = Some(value.parse::<Target>().map_err(Error::Invalid)?),
                 "port" if !value.trim().is_empty() => {
                     port = Some(
@@ -87,16 +86,12 @@ impl AccessRequest {
                 _ => {}
             }
         }
-        let target = match (instance, target) {
-            (Some(id), None) => Target::Instance(id),
-            (None, Some(target)) => target,
-            _ => {
-                return Err(Error::Invalid(
-                    "specify exactly one of instance or target".into(),
-                ))
-            }
-        };
-        let inline = matches!(target, Target::Instance(_));
+        let target = target.ok_or_else(|| Error::Invalid("managed target required".into()))?;
+        if matches!(target, Target::Instance(_)) {
+            return Err(Error::Invalid(
+                "managed access requires a template or binding target".into(),
+            ));
+        }
         if websocket != (protocol == Protocol::Ws)
             || protocol == Protocol::Ws && request.method() != http::Method::GET
         {
@@ -104,27 +99,10 @@ impl AccessRequest {
                 "HTTP/WS route does not match the request".into(),
             ));
         }
-        if let Target::Instance(id) = &target {
-            adx_agent_core::identifier(id, "instance").map_err(Error::Invalid)?;
-            if id.contains(['/', '?', '#', '%']) || matches!(id.as_str(), "." | "..") {
-                return Err(Error::Invalid("invalid instance identifier".into()));
-            }
-        }
-        let backend_uri = if inline && protocol == Protocol::Ws {
-            if !tail.is_empty() {
-                return Err(Error::Invalid("inline WS uses /agent/ws".into()));
-            }
-            // Only the public entrypoint was renamed. Preserve the legacy backend handshake path.
-            match request.uri().query() {
-                Some(query) => format!("/serverless/v1/ws?{query}"),
-                None => "/serverless/v1/ws".into(),
-            }
-        } else {
+        let backend_uri = {
             let mut query = url::form_urlencoded::Serializer::new(String::new());
             for (name, value) in pairs {
-                if matches!(name.as_ref(), "instance" | "target" | "port")
-                    || inline && matches!(name.as_ref(), "tenant_id" | "token")
-                {
+                if matches!(name.as_ref(), "instance" | "target" | "port") {
                     continue;
                 }
                 query.append_pair(&name, &value);
@@ -155,9 +133,8 @@ mod tests {
     #[test]
     fn http_and_ws_entries_enforce_the_selected_protocol_for_all_targets() {
         for selector in [
-            "instance=inline-id",
-            "target=urn:adx:instance:inline-id",
-            "target=urn:adx:environment:demo:1:env",
+            "target=urn:adx:template:demo:1",
+            "target=urn:adx:binding:demo:1:env",
         ] {
             for (method, path, upgrade) in [
                 ("GET", "/agent/http", true),
@@ -192,11 +169,7 @@ mod tests {
                 .body(())
                 .unwrap();
             let access = AccessRequest::parse(&ws).unwrap().unwrap();
-            let expected = if matches!(access.target, Target::Instance(_)) {
-                format!("/serverless/v1/ws?{selector}&q=1")
-            } else {
-                "/?q=1".into()
-            };
+            let expected = "/?q=1";
             assert_eq!(access.backend_uri.to_string(), expected);
         }
     }

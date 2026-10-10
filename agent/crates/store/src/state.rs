@@ -1,8 +1,9 @@
 //! Product metadata transactions. Sandbox lifecycle belongs to Platform.
 use crate::*;
-use adx_agent_core::activator::{EnvironmentList, EnvironmentPage};
+use adx_agent_core::activator::{BindingList, BindingPage};
 use adx_agent_core::cache::BoundedCache;
-use adx_agent_core::{limits, Environment, EnvironmentPhase, Scope, TemplateVersion};
+use adx_agent_core::launch::{CredentialCipher, LaunchConfig};
+use adx_agent_core::{limits, AgentBinding, BindingPhase, Scope, TemplateVersion};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use std::sync::Arc;
 use tokio::sync::{Mutex, OnceCell};
@@ -20,16 +21,17 @@ struct PageCursor {
 pub struct AgentState {
     store: Arc<dyn Repository>,
     templates: Arc<Mutex<BoundedCache<Key, TemplateCell>>>,
+    credential_cipher: Option<Arc<CredentialCipher>>,
 }
-pub(crate) fn environment_key(scope: &Scope) -> Result<Key> {
+pub(crate) fn binding_key(scope: &Scope) -> Result<Key> {
     scope.validate().map_err(Error::Invalid)?;
     Key::new(
-        "environment",
+        "binding",
         &[
             &scope.tenant,
             &scope.template,
             &scope.version,
-            &scope.environment_id,
+            &scope.binding_id,
         ],
     )
 }
@@ -49,8 +51,55 @@ impl AgentState {
     pub fn new(store: Arc<dyn Repository>) -> Self {
         Self {
             store,
+            credential_cipher: None,
             templates: Arc::new(Mutex::new(BoundedCache::new(TEMPLATE_CACHE_ENTRIES))),
         }
+    }
+    pub fn with_credential_key(mut self, key: [u8; 32]) -> Self {
+        self.credential_cipher = Some(Arc::new(CredentialCipher::new(key)));
+        self
+    }
+    /// Optional for generic Agents; private model bindings fail closed when unconfigured.
+    pub fn with_deployment_credentials(self) -> Result<Self> {
+        let Some(path) = std::env::var_os("ADX_CREDENTIAL_KEY_FILE") else {
+            return Ok(self);
+        };
+        let text = std::fs::read_to_string(path)
+            .map_err(|_| Error::Unavailable("credential key file unreadable".into()))?;
+        let text = text.trim();
+        if text.len() != 64 || !text.is_ascii() {
+            return Err(Error::Invalid(
+                "credential key must be 64 hex characters".into(),
+            ));
+        }
+        let mut key = [0u8; 32];
+        for (i, byte) in key.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&text[i * 2..i * 2 + 2], 16)
+                .map_err(|_| Error::Invalid("invalid credential key".into()))?;
+        }
+        Ok(self.with_credential_key(key))
+    }
+    fn cipher(&self) -> Result<&CredentialCipher> {
+        self.credential_cipher.as_deref().ok_or_else(|| {
+            Error::Unavailable("binding credential encryption is not configured".into())
+        })
+    }
+    pub async fn launch_config(&self, binding: &AgentBinding) -> Result<Option<LaunchConfig>> {
+        let key = launch_key(&binding.scope)?;
+        let Some(record) = self.store.get(&key).await? else {
+            return Ok(None);
+        };
+        let encrypted: Vec<u8> = record.decode()?;
+        let aad = serde_json::to_vec(&(binding.scope.clone(), &binding.generation))
+            .map_err(|_| Error::Corrupt("invalid binding".into()))?;
+        let plain = self
+            .cipher()?
+            .open(&aad, &encrypted)
+            .map_err(|e| Error::Corrupt(e.into()))?;
+        let launch: LaunchConfig = serde_json::from_slice(&plain)
+            .map_err(|_| Error::Corrupt("invalid private launch configuration".into()))?;
+        launch.validate().map_err(Error::Corrupt)?;
+        Ok(Some(launch))
     }
     pub async fn publish(&self, tenant: &str, template: &TemplateVersion) -> Result<()> {
         adx_agent_core::identifier(tenant, "tenant").map_err(Error::Invalid)?;
@@ -112,16 +161,16 @@ impl AgentState {
             Err(Some(error)) => Err(error),
         }
     }
-    pub async fn environment(&self, scope: &Scope) -> Result<Option<Environment>> {
+    pub async fn binding(&self, scope: &Scope) -> Result<Option<AgentBinding>> {
         self.store
-            .get(&environment_key(scope)?)
+            .get(&binding_key(scope)?)
             .await?
             .map(|r| r.decode())
             .transpose()
     }
-    pub async fn list_environments(&self, query: &EnvironmentList) -> Result<EnvironmentPage> {
+    pub async fn list_bindings(&self, query: &BindingList) -> Result<BindingPage> {
         query.validate().map_err(Error::Invalid)?;
-        let index = Index::environments(&query.tenant, &query.template, &query.version)?;
+        let index = Index::bindings(&query.tenant, &query.template, &query.version)?;
         let scope = [
             query.tenant.clone(),
             query.template.clone(),
@@ -136,7 +185,7 @@ impl AgentState {
                     .map_err(|_| Error::Invalid("invalid page token".into()))?;
                 let token: PageCursor = serde_json::from_slice(&bytes)
                     .map_err(|_| Error::Invalid("invalid page token".into()))?;
-                if token.scope != scope || !token.after.starts_with("environment:") {
+                if token.scope != scope || !token.after.starts_with("binding:") {
                     return Err(Error::Invalid(
                         "page token does not match query scope".into(),
                     ));
@@ -165,28 +214,39 @@ impl AgentState {
         } else {
             None
         };
-        let environments = records
+        let bindings = records
             .into_iter()
             .map(|(key, record)| {
-                let value: Environment = record.decode()?;
+                let value: AgentBinding = record.decode()?;
                 if value.scope.tenant != query.tenant
                     || value.scope.template != query.template
                     || value.scope.version != query.version
-                    || environment_key(&value.scope)?.as_str() != key
+                    || binding_key(&value.scope)?.as_str() != key
                 {
-                    return Err(Error::Corrupt("Environment index scope mismatch".into()));
+                    return Err(Error::Corrupt("AgentBinding index scope mismatch".into()));
                 }
                 Ok(value)
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok(EnvironmentPage {
-            environments,
+        Ok(BindingPage {
+            bindings,
             next_page_token,
         })
     }
     /// Commit one stable Sandbox identity before any activation side effect.
-    pub async fn create_environment(&self, scope: Scope) -> Result<Environment> {
-        let key = environment_key(&scope)?;
+    pub async fn create_binding(&self, scope: Scope) -> Result<AgentBinding> {
+        self.create_binding_with_launch(scope, None).await
+    }
+    pub async fn create_binding_with_launch(
+        &self,
+        scope: Scope,
+        launch: Option<&LaunchConfig>,
+    ) -> Result<AgentBinding> {
+        if let Some(launch) = launch {
+            launch.validate().map_err(Error::Invalid)?;
+            self.cipher()?;
+        }
+        let key = binding_key(&scope)?;
         if self
             .template(&scope.tenant, &scope.template, &scope.version)
             .await?
@@ -195,58 +255,82 @@ impl AgentState {
             return Err(Error::Invalid("template version does not exist".into()));
         }
         let generation = uuid::Uuid::new_v4().to_string();
-        let value = Environment {
+        let value = AgentBinding {
             scope,
             sandbox_id: format!("adx-{generation}"),
             generation,
-            phase: EnvironmentPhase::Active,
+            phase: BindingPhase::Active,
         };
+        let private_key = launch_key(&value.scope)?;
+        let mut checks = vec![
+            Check {
+                key: key.clone(),
+                expected: None,
+            },
+            Check {
+                key: private_key.clone(),
+                expected: None,
+            },
+        ];
+        let mut puts = vec![put(&key, &value)?];
+        if let Some(launch) = launch {
+            let aad = serde_json::to_vec(&(value.scope.clone(), &value.generation))
+                .map_err(|_| Error::Invalid("invalid binding".into()))?;
+            let plain = serde_json::to_vec(launch)
+                .map_err(|_| Error::Invalid("invalid launch configuration".into()))?;
+            let encrypted = self
+                .cipher()?
+                .seal(&aad, &plain)
+                .map_err(|e| Error::Unavailable(e.into()))?;
+            puts.push(put(&private_key, &encrypted)?);
+        }
         if self
             .store
-            .commit(&Transaction::new(
-                vec![Check {
-                    key: key.clone(),
-                    expected: None,
-                }],
-                vec![put(&key, &value)?],
-            )?)
+            .commit(&Transaction::new(std::mem::take(&mut checks), puts)?)
             .await?
         {
             return Ok(value);
         }
-        let existing: Environment = self
+        let existing: AgentBinding = self
             .store
             .get(&key)
             .await?
-            .ok_or_else(|| Error::Conflict("environment changed".into()))?
+            .ok_or_else(|| Error::Conflict("binding changed".into()))?
             .decode()?;
-        if existing.phase == EnvironmentPhase::Active {
+        if existing.phase == BindingPhase::Active {
+            if let Some(launch) = launch {
+                if self.launch_config(&existing).await?.as_ref() != Some(launch) {
+                    return Err(Error::Conflict(
+                        "binding startup configuration is immutable".into(),
+                    ));
+                }
+            }
             Ok(existing)
         } else {
-            Err(Error::Conflict("environment is deleting".into()))
+            Err(Error::Conflict("binding is deleting".into()))
         }
     }
-    pub async fn begin_delete(&self, scope: &Scope) -> Result<Environment> {
-        let key = environment_key(scope)?;
+    pub async fn begin_delete(&self, scope: &Scope) -> Result<AgentBinding> {
+        let key = binding_key(scope)?;
         let generation = self
-            .environment(scope)
+            .binding(scope)
             .await?
-            .ok_or_else(|| Error::Conflict("environment missing".into()))?
+            .ok_or_else(|| Error::Conflict("binding missing".into()))?
             .generation;
         for _ in 0..limits::CAS_ATTEMPTS {
             let record = self
                 .store
                 .get(&key)
                 .await?
-                .ok_or_else(|| Error::Conflict("environment missing".into()))?;
-            let mut value: Environment = record.decode()?;
+                .ok_or_else(|| Error::Conflict("binding missing".into()))?;
+            let mut value: AgentBinding = record.decode()?;
             if value.generation != generation {
-                return Err(Error::Conflict("environment lifecycle changed".into()));
+                return Err(Error::Conflict("binding lifecycle changed".into()));
             }
-            if value.phase == EnvironmentPhase::Deleting {
+            if value.phase == BindingPhase::Deleting {
                 return Ok(value);
             }
-            value.phase = EnvironmentPhase::Deleting;
+            value.phase = BindingPhase::Deleting;
             if self
                 .store
                 .commit(&Transaction::new(
@@ -258,39 +342,49 @@ impl AgentState {
                 return Ok(value);
             }
         }
-        Err(Error::Conflict("environment deletion contention".into()))
+        Err(Error::Conflict("binding deletion contention".into()))
     }
     /// Only after Platform confirms deletion. A late completion cannot erase a new lifecycle.
-    pub async fn finish_delete(&self, environment: &Environment) -> Result<()> {
-        let key = environment_key(&environment.scope)?;
+    pub async fn finish_delete(&self, binding: &AgentBinding) -> Result<()> {
+        let key = binding_key(&binding.scope)?;
         let Some(record) = self.store.get(&key).await? else {
             return Ok(());
         };
-        let current: Environment = record.decode()?;
-        if current.generation != environment.generation {
+        let current: AgentBinding = record.decode()?;
+        if current.generation != binding.generation {
             return Ok(());
         }
-        if current.phase != EnvironmentPhase::Deleting
-            || current.sandbox_id != environment.sandbox_id
-        {
-            return Err(Error::Conflict(
-                "environment deletion identity mismatch".into(),
-            ));
+        if current.phase != BindingPhase::Deleting || current.sandbox_id != binding.sandbox_id {
+            return Err(Error::Conflict("binding deletion identity mismatch".into()));
+        }
+        let private_key = launch_key(&binding.scope)?;
+        let private = self.store.get(&private_key).await?;
+        let mut checks = vec![check(&key, &record)];
+        let mut deletes = vec![key];
+        if let Some(record) = private {
+            checks.push(check(&private_key, &record));
+            deletes.push(private_key);
         }
         if self
             .store
-            .commit(&Transaction::with_deletes(
-                vec![check(&key, &record)],
-                vec![],
-                vec![key],
-            )?)
+            .commit(&Transaction::with_deletes(checks, vec![], deletes)?)
             .await?
         {
             Ok(())
         } else {
-            Err(Error::Conflict(
-                "environment changed during deletion".into(),
-            ))
+            Err(Error::Conflict("binding changed during deletion".into()))
         }
     }
+}
+
+fn launch_key(scope: &Scope) -> Result<Key> {
+    Key::new(
+        "binding-launch",
+        &[
+            &scope.tenant,
+            &scope.template,
+            &scope.version,
+            &scope.binding_id,
+        ],
+    )
 }

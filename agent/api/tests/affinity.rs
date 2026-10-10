@@ -2,7 +2,7 @@ use adx_agent_api::{activator::ActivatorClient, request::RequestContext, Error};
 use adx_agent_core::{
     activator::Target,
     discovery::{ranked_endpoints, ActivatorEndpoint},
-    Environment, EnvironmentPhase, Scope,
+    AgentBinding, BindingPhase, Scope,
 };
 use axum::{extract::State, Json};
 use std::{
@@ -16,7 +16,7 @@ fn scope() -> Scope {
         tenant: "t".into(),
         template: "a".into(),
         version: "1".into(),
-        environment_id: "env".into(),
+        binding_id: "env".into(),
     }
 }
 fn context() -> RequestContext {
@@ -45,20 +45,20 @@ async fn handler(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     calls.lock().unwrap().push((uri.path().into(), bypass));
-    let environment = Environment {
+    let binding = AgentBinding {
         scope: serde_json::from_value(value["scope"].clone()).unwrap(),
         generation: id,
         sandbox_id: "sandbox".into(),
-        phase: EnvironmentPhase::Active,
+        phase: BindingPhase::Active,
     };
     if uri.path().ends_with("/delete") {
         Json(serde_json::Value::Null)
     } else if uri.path().ends_with("/get") {
-        Json(serde_json::to_value(environment).unwrap())
+        Json(serde_json::to_value(binding).unwrap())
     } else {
         Json(
             serde_json::to_value(Target {
-                environment,
+                binding,
                 service: vec![],
             })
             .unwrap(),
@@ -94,24 +94,16 @@ async fn all_env_operations_and_bypass_use_same_instance_across_gateways() {
     }
     assert_eq!(
         client
-            .activate_with_cache(
-                &context(),
-                &scope(),
-                Some(&first.environment.generation),
-                true
-            )
+            .activate_with_cache(&context(), &scope(), Some(&first.binding.generation), true)
             .await
             .unwrap(),
         first
     );
     assert_eq!(
-        client.environment(&context(), &scope()).await.unwrap(),
-        first.environment
+        client.binding(&context(), &scope()).await.unwrap(),
+        first.binding
     );
-    client
-        .delete_environment(&context(), &scope())
-        .await
-        .unwrap();
+    client.delete_binding(&context(), &scope()).await.unwrap();
     let a_calls = ca.lock().unwrap();
     let b_calls = cb.lock().unwrap();
     assert!(a_calls.is_empty() != b_calls.is_empty());
@@ -145,7 +137,7 @@ async fn unreachable_preferred_instance_uses_second_ranked_address() {
     ];
     let mut selected = scope();
     for i in 0..1000 {
-        selected.environment_id = i.to_string();
+        selected.binding_id = i.to_string();
         if ranked_endpoints(&selected, &endpoints)[0].url == down {
             break;
         }
@@ -164,7 +156,7 @@ async fn unreachable_preferred_instance_uses_second_ranked_address() {
             .activate(&context(), &selected, None)
             .await
             .unwrap()
-            .environment
+            .binding
             .generation,
         "up"
     );
@@ -203,7 +195,7 @@ async fn discovery_updates_routes_retains_snapshot_on_error_and_accepts_empty_sn
             loop {
                 let result = client.activate(&context(), scope, None).await;
                 match (&result, expected) {
-                    (Ok(target), Some(id)) if target.environment.generation == id => return,
+                    (Ok(target), Some(id)) if target.binding.generation == id => return,
                     (Err(Error::Unavailable(_)), None) => return,
                     _ => tokio::time::sleep(Duration::from_millis(25)).await,
                 }
@@ -214,7 +206,7 @@ async fn discovery_updates_routes_retains_snapshot_on_error_and_accepts_empty_sn
     }
     let mut selected = scope();
     for i in 0..1000 {
-        selected.environment_id = i.to_string();
+        selected.binding_id = i.to_string();
         if ranked_endpoints(&selected, &[a.clone(), b.clone()])[0].id == "b" {
             break;
         }
@@ -246,7 +238,7 @@ async fn discovery_updates_routes_retains_snapshot_on_error_and_accepts_empty_sn
             .activate(&context(), &selected, None)
             .await
             .unwrap()
-            .environment
+            .binding
             .generation,
         "a"
     );
