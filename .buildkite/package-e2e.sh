@@ -3,6 +3,12 @@ set -euo pipefail
 : "${ADX_E2E_IMAGE_REPOSITORY:?set the registry repository}"
 : "${ADX_BASE_PACKAGE_BUILD_ID:?set the immutable base-package Buildkite build UUID}"
 : "${ADX_SDK_BUILD_ID:?set the immutable Python SDK Buildkite build UUID}"
+component_args=()
+case "${ADX_WITH_AFS:-0}" in
+  0) ;;
+  1) component_args+=(--with-afs) ;;
+  *) echo 'ADX_WITH_AFS must be 0 or 1' >&2; exit 2 ;;
+esac
 [[ -z $(git status --porcelain) ]] || { echo 'clean checkout required'; exit 1; }
 [[ $(git rev-parse HEAD) == "$BUILDKITE_COMMIT" ]]
 mkdir -p out/buildkite/logs
@@ -37,7 +43,7 @@ python3 build/release/component.py verify-build \
   --release-archive out/buildkite/adx-release.tar.gz \
   --wheel "${base_wheels[0]}" \
   --backend-manifest out/buildkite/backend/manifest.json \
-  --backend-archive out/buildkite/backend.tar.gz
+  --backend-archive out/buildkite/backend.tar.gz "${component_args[@]}"
 echo "--- :python: Verify independent Sandbox SDK handoff"
 buildkite-agent artifact download 'out/buildkite/sdk/sdk-candidate.json' . --step sdk-package --build "$ADX_SDK_BUILD_ID"
 buildkite-agent artifact download 'out/buildkite/sdk/adx_sandbox-*.whl' . --step sdk-package --build "$ADX_SDK_BUILD_ID"
