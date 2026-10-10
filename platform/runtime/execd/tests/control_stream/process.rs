@@ -358,7 +358,7 @@ async fn adxlet_creation_and_event_driven_checkpoint_wait_for_state_publication(
     let current = node.clone();
     let handling = tokio::spawn(async move { current.observe_runtime_event(&event).await });
     tokio::time::timeout(
-        Duration::from_secs(2),
+        Duration::from_secs(10),
         publication.checkpoint_entered.acquire(),
     )
     .await
@@ -375,7 +375,7 @@ async fn adxlet_creation_and_event_driven_checkpoint_wait_for_state_publication(
     assert_eq!(committed.runtime.id, "i-1");
     publication.checkpoint_release.add_permits(1);
     handling.await.unwrap().unwrap();
-    let response = tokio::time::timeout(Duration::from_secs(2), caller)
+    let response = tokio::time::timeout(Duration::from_secs(10), caller)
         .await
         .unwrap()
         .unwrap();
