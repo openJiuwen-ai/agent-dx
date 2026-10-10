@@ -164,6 +164,7 @@ class BuildImageContractTests(unittest.TestCase):
         self.assertEqual(amd64['agents'], {'queue': 'default', 'os': 'linux', 'arch': 'amd64'})
         self.assertIn('ADX_BUILD_IMAGE_CONFIG") != "build/images/build-environment-arm64.json"', amd64['if'])
         self.assertIn('kubernetes', amd64['plugins'][0])
+        self.assertIn('out/buildkite/build-image/preflight.json', amd64['artifact_paths'])
 
         self.assertEqual(arm64['agents'], {'queue': 'default', 'os': 'macos', 'arch': 'arm64'})
         self.assertEqual(arm64['concurrency_group'], 'adx/native-arm64')
@@ -171,6 +172,7 @@ class BuildImageContractTests(unittest.TestCase):
         self.assertNotIn('plugins', arm64)
         self.assertIn('ADX_BUILD_IMAGE_CONFIG") == "build/images/build-environment-arm64.json"', arm64['if'])
         self.assertEqual(arm64['command'], amd64['command'])
+        self.assertIn('out/buildkite/build-image/preflight.json', arm64['artifact_paths'])
 
     def test_sync_build_image_is_portable_on_native_arm_worker_hosts(self):
         self.assertNotIn('readarray', self.sync)
@@ -196,8 +198,17 @@ class BuildImageContractTests(unittest.TestCase):
             docker.write_text(f'''#!/bin/bash
 set -euo pipefail
 printf '%s\\n' "$*" >> docker.log
+if [[ "$1" == info && "${{2:-}}" == --format ]]; then
+  if [[ "${{3:-}}" == *DockerRootDir* ]]; then
+    pwd
+  else
+    printf 'linux/arm64\\n'
+  fi
+  exit 0
+fi
 case "$1" in
-  info|pull|build|push|tag|run) exit 0 ;;
+  info|version|pull|build|push|tag|run) exit 0 ;;
+  buildx) exit 0 ;;
   image)
     if [[ "$2" == inspect ]]; then
       printf '%s\\n' '{published}'
@@ -224,6 +235,9 @@ exit 17
             result_json = json.loads((root / 'out/buildkite/build-image/result.json').read_text())
             self.assertEqual(result_json['platform'], 'linux/arm64')
             self.assertEqual(result_json['reference'], published)
+            preflight = json.loads((root / 'out/buildkite/build-image/preflight.json').read_text())
+            self.assertIn('buildx_inspect', preflight)
+            self.assertIn('docker_probe', preflight)
             docker_log = (root / 'docker.log').read_text()
             self.assertIn('--platform linux/arm64', docker_log)
             self.assertIn('GO_SHA256=b00b694903d126c588c378e72d3545549935d3982635ba3f7a964c9fa23fe3b9', docker_log)
@@ -246,9 +260,23 @@ exit 17
             docker.write_text('''#!/bin/bash
 set -euo pipefail
 printf '%s\\n' "$*" >> docker.log
+if [[ "$1" == info && "${2:-}" == --format ]]; then
+  if [[ "${3:-}" == *DockerRootDir* ]]; then
+    pwd
+  else
+    printf 'linux/arm64\\n'
+  fi
+  exit 0
+fi
 case "$1" in
-  info|pull|build) exit 0 ;;
-  run) exit 23 ;;
+  info|version|pull|build) exit 0 ;;
+  buildx) exit 0 ;;
+  run)
+    if [[ "$*" == *registry.example/base* ]]; then
+      exit 0
+    fi
+    exit 23
+    ;;
   push) echo unexpected-push >&2; exit 99 ;;
 esac
 exit 17
@@ -295,6 +323,53 @@ esac
             self.assertNotEqual(result.returncode, 0)
             self.assertFalse((root / 'out/buildkite/build-image/result.json').exists())
             self.assertEqual((root / 'docker.log').read_text(), 'info\n')
+
+    def test_sync_build_image_preflight_failure_stops_before_building(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / '.buildkite').mkdir()
+            shutil.copy(ROOT / '.buildkite/sync-build-image.sh', root / '.buildkite/sync-build-image.sh')
+            (root / 'build/images').mkdir(parents=True)
+            (root / 'build/images/build-environment-arm64.json').write_text(json.dumps({
+                'source_image': 'registry.example/base@sha256:' + 'a' * 64,
+                'repository': 'registry.example/adx-build',
+                'platform': 'linux/arm64',
+            }))
+            (root / 'build/images/Dockerfile.ci').write_text('FROM scratch\n')
+            commands = root / 'commands'
+            commands.mkdir()
+            docker = commands / 'docker'
+            docker.write_text('''#!/bin/bash
+set -euo pipefail
+printf '%s\\n' "$*" >> docker.log
+case "$1 ${2:-}" in
+  "info --format")
+    printf 'linux/arm64\\n'
+    exit 0
+    ;;
+esac
+case "$1" in
+  info|version) exit 0 ;;
+  buildx) echo buildx missing >&2; exit 42 ;;
+  build|push) echo unexpected-build-or-push >&2; exit 99 ;;
+esac
+exit 17
+''')
+            docker.chmod(0o755)
+            environment = dict(os.environ, PATH=str(commands) + os.pathsep + os.environ['PATH'],
+                               BUILDKITE_COMMIT='c' * 40,
+                               ADX_BUILD_IMAGE_CONFIG='build/images/build-environment-arm64.json')
+            bash = Path('/bin/bash') if Path('/bin/bash').exists() else Path(shutil.which('bash'))
+            result = subprocess.run([str(bash), '.buildkite/sync-build-image.sh'],
+                                    cwd=root, env=environment, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 42, result.stderr)
+            self.assertIn('docker buildx version failed:', result.stderr)
+            self.assertIn('buildx missing', result.stderr)
+            self.assertFalse((root / 'out/buildkite/build-image/result.json').exists())
+            docker_log = (root / 'docker.log').read_text()
+            self.assertIn('buildx version', docker_log)
+            self.assertNotIn('build --progress=plain', docker_log)
+            self.assertNotIn('push', docker_log)
 
 
 if __name__ == '__main__':

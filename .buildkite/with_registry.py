@@ -7,6 +7,7 @@ import json
 import os
 import signal
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -31,6 +32,58 @@ def registry_config(env):
     return None
 
 
+def docker_config_dir(env):
+    configured = env.get('DOCKER_CONFIG')
+    if configured:
+        return Path(configured)
+    if 'HOME' in env:
+        home = env.get('HOME')
+        return Path(home) / '.docker' if home else None
+    try:
+        return Path.home() / '.docker'
+    except RuntimeError:
+        return None
+
+
+def docker_cli_plugin_dirs(env):
+    dirs = []
+    config_dir = docker_config_dir(env)
+    if config_dir:
+        config_path = config_dir / 'config.json'
+        if config_path.is_file():
+            try:
+                config = json.loads(config_path.read_text())
+            except (OSError, ValueError):
+                config = {}
+            extra_dirs = config.get('cliPluginsExtraDirs', []) if isinstance(config, dict) else []
+            if isinstance(extra_dirs, list):
+                dirs.extend(value for value in extra_dirs if isinstance(value, str) and value)
+        local_plugins = config_dir / 'cli-plugins'
+        if local_plugins.is_dir():
+            dirs.append(str(local_plugins))
+    desktop_plugins = Path('/Applications/Docker.app/Contents/Resources/cli-plugins')
+    if sys.platform == 'darwin' and desktop_plugins.is_dir():
+        dirs.append(str(desktop_plugins))
+    result = []
+    seen = set()
+    for value in dirs:
+        if value not in seen:
+            result.append(value)
+            seen.add(value)
+    return result
+
+
+def docker_config(env):
+    config = registry_config(env)
+    if config is None:
+        return None
+    plugin_dirs = docker_cli_plugin_dirs(env)
+    if plugin_dirs:
+        config = dict(config)
+        config['cliPluginsExtraDirs'] = plugin_dirs
+    return config
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--docker', action='store_true')
@@ -41,7 +94,7 @@ def main():
         raise ValueError('child command required')
     env = dict(os.environ)
     env.setdefault('ADX_E2E_IMAGE_REPOSITORY', DEFAULT_REPOSITORY)
-    config = registry_config(env)
+    config = docker_config(env) if a.docker else registry_config(env)
     with tempfile.TemporaryDirectory(prefix='adx-ci-registry-') as temp:
         if config:
             path = Path(temp) / 'config.json'

@@ -85,7 +85,9 @@ worker checkout and Docker cache ownership; the x86 flow advances independently.
 Docker must be running and the worker must be able to pull the SWR build image.
 The ARM step maps the cluster's encrypted `ADX_SWR_PULL_CONFIG` secret to
 `SWR_DOCKER_CONFIG_JSON`; the registry wrapper creates an owner-only temporary
-Docker configuration and removes it when the job exits. Its access policy
+Docker configuration and removes it when the job exits. Tool-only plugin
+search directories are preserved so Docker Buildx remains discoverable; host
+authentication, credential helpers and contexts are not copied. Its access policy
 must allow the exact pipeline and build branch; allowing `refactor` alone does
 not authorize a feature branch. Never pass the secret value in build parameters.
 `build/images/build-environment-arm64.json` pins the ARM source and ADX builder.
@@ -449,7 +451,10 @@ verification script. The host uses Docker; build commands execute in Linux ARM64
 The default AMD64 maintenance route remains unchanged. ARM maintenance shares
 the `adx/native-arm64` concurrency slot and registry-secret handling with ARM
 package jobs. Update the pinned ARM `ci_image` only after the pushed digest has
-passed pull-back verification.
+passed pull-back verification. Before image compilation the maintenance job
+checks Docker, Buildx/BuildKit, the native daemon platform, storage and access
+to the pinned source image; a failed prerequisite stops that job before build
+or push.
 
 `.buildkite/setup-cargo.sh` restores the image's rsproxy sparse source settings in
 the persistent ADX Cargo home, including Git dependency caching.
