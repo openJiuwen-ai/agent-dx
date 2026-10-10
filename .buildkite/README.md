@@ -334,6 +334,9 @@ the wheel named and hashed by the
 independent `sdk-package` candidate.
 
 The Full pipeline requires `ADX_BASE_PACKAGE_BUILD_ID` and `ADX_SDK_BUILD_ID`.
+For an AFS-enabled base candidate, also set `ADX_WITH_AFS=1`; the image
+handoff checks the explicit mode against both manifests and rejects a mismatch.
+Base L0 forwards its build mode through the same verification path.
 `platform-images` downloads both immutable candidates by Buildkite build UUID,
 verifies their commits and digests, restores the base package tree and injects
 the independently built SDK wheel into the test image. It then publishes the
