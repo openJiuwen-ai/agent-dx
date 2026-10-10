@@ -181,3 +181,17 @@ Linux精确受测tree `b9ae4c47ca64142839ea5c0649c7138a90187117`：20模块284�
 固定提交 `2fddf079f15f6a1e9a2a66ceef1ac5ea0918da56` 的 [x86 OFF #133](https://buildkite.com/agent-dx/agent-dx/builds/133)／[ON #134](https://buildkite.com/agent-dx/agent-dx/builds/134) 均失败：Python adxadmin、Sandbox SDK通过；所有9个失败Rust步骤在编译前报 `Rust image is missing rustfmt`，组包未执行，ARM按条件排除未运行。流水线显式选择 `stable`，与镜像按仓库准备的固定 `1.95.0` 工具链不一致；后续修复选择固定版本及bootstrap缺省来源，不安装组件或降低准入。该失败保留原身份；修复后完整CI仍待验收。
 
 `fe1568de371b09d7a1f90cfe8c04a23b01eb0d1d` 的 [x86 OFF #135](https://buildkite.com/agent-dx/agent-dx/builds/135) 整轮通过，含组包、隔离安装和公共 Kubernetes L0/auth。其 [ON #136](https://buildkite.com/agent-dx/agent-dx/builds/136) 已通过全部组件、Source／AFS gate、组包及隔离安装；库615通过／0失败／22忽略，原四项strace持久化及两项root敏感测试均通过。ON清单包含`afs-meta`／`afs-node`且不含测试探针，OFF不含AFS。ON镜像交接因脚本漏传`--with-afs`被模式一致性检查拒绝，L0未启动；后续仅补模式传递及对应回归，保留严格拒绝、不改产品或环境。OFF结果复用，ON需一次受影响公共流程复验；不扩大到Full11组。
+
+
+### x86 公共 CI 收口（2026-10-10）
+
+| 模式 | 固定受测提交 | 真实流水线 | 结果与范围 |
+| --- | --- | --- | --- |
+| OFF | `fe1568de371b09d7a1f90cfe8c04a23b01eb0d1d` | [#135](https://buildkite.com/agent-dx/agent-dx/builds/135) | 通过：公共组件、Source／AFS gate、组包、隔离安装、验收镜像、Kubernetes L0/auth；无AFS组件入包 |
+| ON | `8be97c12865322dcb6e21c8827f74ee38fe9ee25` | [#137](https://buildkite.com/agent-dx/agent-dx/builds/137) | 通过：上述范围及AFS组件构建；AFS库615通过、0失败、22忽略；ON模式交接及L0通过 |
+
+原四项持久化追踪测试及两项root敏感测试在#137全部通过。整改保留产品权限与持久化行为，只修正测试身份、公共镜像依赖、固定工具链选择和ON模式传递；Linux44项CI／发布合同、shell及文档检查通过。OFF不受最后的ON传参修复影响，复用#135，不重复完整运行。#130／#131、#133／#134及#136的原失败记录保留，不改判。
+
+#137实际清单均绑定`8be97c1`且`with_afs=true`：build-manifest SHA-256 `b9f099a55d85950db2c9bc491d5f5bfb10a003f422134f29be3eac19135f46b8`，release-manifest SHA-256 `1f5dbd98f4a2aa54d90dc0caf418ae27a1433a58abd3180c16e69d268c6c5c0a`；包含`bin/afs-meta`／`bin/afs-node`，文件清单不含测试探针。#137 AFS库原始日志SHA-256 `63abdfb71162dac66df1a54e3494d7767fc12725ab8455f6e57fbe4d47c87cb5`。紧凑清单、实际L0结果、镜像维护记录及失败原件由`EV-BUILDKITE-X86`仓外索引定位。
+
+ARM按用户选择暂缓（原拉取凭据拒绝记录保留），不能算通过；OBS／PyPI最终发布关闭，步骤名称Publish通过不表示执行了外部产品发布。公共L0不等于重新验证bind ON文件系统核心场景或性能，原bfd876安装运行证据继续绑定原包；阶段一历史8/8保持关闭。随后提交仅同步本报告与Buildkite使用说明，不把文档提交自动宣称为新的完整运行候选。
