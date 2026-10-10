@@ -1,5 +1,43 @@
 use afs::config::{Cli, Config, MetaStoreBackend, Role};
 use clap::Parser;
+
+#[test]
+fn shipped_examples_resolve_with_mutual_tls_and_node_identity_binding() {
+    let examples = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
+    let meta_path = examples.join("meta.toml");
+    let node_path = examples.join("node.toml");
+    let meta = Config::resolve(
+        Role::Meta,
+        Cli::parse_from(["afs-meta", "--config", meta_path.to_str().unwrap()]),
+    )
+    .unwrap();
+    let node = Config::resolve(
+        Role::Node,
+        Cli::parse_from(["afs-node", "--config", node_path.to_str().unwrap()]),
+    )
+    .unwrap();
+
+    assert!(meta.ownerfs && meta.dfs);
+    assert!(node.ownerfs && node.dfs);
+    assert_eq!(meta.trusted_node_certs.len(), 1);
+    assert_eq!(node.trusted_node_certs.len(), 1);
+    assert!(
+        node.meta_endpoint
+            .as_deref()
+            .unwrap()
+            .starts_with("https://")
+    );
+    assert!(
+        node.peer_endpoint
+            .as_deref()
+            .unwrap()
+            .starts_with("https://")
+    );
+    for tls in [meta.tls_config(), node.tls_config()] {
+        assert!(matches!(tls, afs_transport::TlsConfig::MutualTls { .. }));
+    }
+}
+
 #[test]
 fn file_values_are_overridden_only_by_explicit_cli() {
     let dir = tempfile::tempdir().unwrap();

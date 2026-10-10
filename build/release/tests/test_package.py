@@ -39,6 +39,34 @@ class PackageTests(unittest.TestCase):
             self.assertIn("bin/redis-cli", m["files"])
             self.assertTrue((out / "bin/redis-cli").stat().st_mode & 0o111)
             self.assertTrue((out / "install.sh").stat().st_mode & 0o111)
+            shipped_verifier = out / "lib/package_manifest.py"
+            self.assertEqual(
+                shipped_verifier.read_bytes(),
+                (Path(__file__).resolve().parents[1] / "package_manifest.py").read_bytes(),
+            )
+            result = subprocess.run(
+                [sys.executable, str(shipped_verifier), str(out)],
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+            manifest_path = out / "manifest.json"
+            original_manifest = manifest_path.read_text()
+            legacy = json.loads(original_manifest)
+            legacy["with_dfs"] = False
+            manifest_path.write_text(json.dumps(legacy))
+            with self.assertRaisesRegex(ValueError, "legacy with_dfs"):
+                pkg.verify(out)
+            installed_result = subprocess.run(
+                [sys.executable, str(shipped_verifier), str(out)],
+                text=True,
+                capture_output=True,
+            )
+            self.assertNotEqual(installed_result.returncode, 0)
+            self.assertIn("legacy with_dfs", installed_result.stderr)
+            manifest_path.write_text(original_manifest)
+
             (out / "bin/adxctl").write_bytes(b"changed")
             with self.assertRaises(ValueError):
                 pkg.verify(out)

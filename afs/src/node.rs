@@ -30,6 +30,7 @@ use crate::{
 };
 use rpc::meta::{MetaPersistenceCapability, NodeRegistrationReadiness};
 use std::{
+    future::Future,
     os::unix::ffi::OsStrExt,
     path::{Component, Path, PathBuf},
     sync::{
@@ -40,6 +41,104 @@ use std::{
 };
 
 const OWNER_ONLY_TCP_MAX_FRAME_SIZE: u32 = 256 * 1024;
+const INITIAL_REGISTRATION_MIN_BUDGET: Duration = Duration::from_secs(10);
+const INITIAL_REGISTRATION_MAX_BUDGET: Duration = Duration::from_secs(60);
+const INITIAL_REGISTRATION_FIRST_DELAY: Duration = Duration::from_millis(100);
+const INITIAL_REGISTRATION_MAX_DELAY: Duration = Duration::from_secs(2);
+
+fn initial_registration_budget(request_timeout: Duration) -> Duration {
+    request_timeout
+        .saturating_mul(3)
+        .max(INITIAL_REGISTRATION_MIN_BUDGET)
+        .min(INITIAL_REGISTRATION_MAX_BUDGET)
+}
+
+async fn initial_shutdown_signal() {
+    let Ok(mut terminate) =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+    else {
+        let _ = tokio::signal::ctrl_c().await;
+        return;
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = terminate.recv() => {}
+    }
+}
+
+async fn retry_initial_registration<T, F, Fut, C>(
+    mut attempt: F,
+    cancellation: C,
+    budget: Duration,
+) -> afs_error::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = afs_error::Result<T>>,
+    C: Future<Output = ()>,
+{
+    let deadline = tokio::time::Instant::now() + budget;
+    let mut delay = INITIAL_REGISTRATION_FIRST_DELAY;
+    let mut last_error = None;
+    tokio::pin!(cancellation);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(last_error.unwrap_or_else(|| {
+                afs_error::Error::coded(
+                    afs_error::CLIENT_CONNECTION_UNAVAILABLE,
+                    "initial Node registration retry budget expired",
+                )
+            }));
+        }
+        let result = tokio::select! {
+            _ = &mut cancellation => {
+                return Err(afs_error::Error::coded(
+                    afs_error::IO_INTERRUPTED,
+                    "initial Node registration cancelled",
+                ));
+            }
+            result = tokio::time::timeout(remaining, attempt()) => match result {
+                Ok(result) => result,
+                Err(_) => {
+                    return Err(last_error.unwrap_or_else(|| {
+                        afs_error::Error::coded(
+                            afs_error::CLIENT_CONNECTION_UNAVAILABLE,
+                            "initial Node registration retry budget expired",
+                        )
+                    }));
+                }
+            }
+        };
+        match result {
+            Ok(value) => return Ok(value),
+            Err(error) if initial_registration_error_is_retryable(&error) => {
+                afs_logging::warn!(
+                    "node.initial_registration_retry";
+                    "error" => error.to_string(),
+                    "remaining_ms" => u64::try_from(
+                        deadline
+                            .saturating_duration_since(tokio::time::Instant::now())
+                            .as_millis()
+                    ).unwrap_or(u64::MAX)
+                );
+                last_error = Some(error);
+                let sleep_for =
+                    delay.min(deadline.saturating_duration_since(tokio::time::Instant::now()));
+                tokio::select! {
+                    _ = &mut cancellation => {
+                        return Err(afs_error::Error::coded(
+                            afs_error::IO_INTERRUPTED,
+                            "initial Node registration cancelled",
+                        ));
+                    }
+                    _ = tokio::time::sleep(sleep_for) => {}
+                }
+                delay = delay.saturating_mul(2).min(INITIAL_REGISTRATION_MAX_DELAY);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
 
 fn configure_node_tcp_server(
     grpc_config: &afs_transport::grpc::GrpcConfig,
@@ -225,6 +324,16 @@ pub struct AfsMountIdentity {
 }
 
 impl AfsMountIdentity {
+    fn from_mounted(mounted: &fuse::MountedFuse, expected_source: &str) -> Self {
+        let (path, mount_id) = mounted.identity();
+        Self {
+            path: path.to_path_buf(),
+            mount_id: Some(mount_id.to_string()),
+            expected_source: expected_source.to_owned(),
+            capture_error: None,
+        }
+    }
+
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
@@ -507,6 +616,26 @@ impl NodeReadiness {
         data_mode: &str,
         rdma_device: Option<&str>,
     ) -> Self {
+        Self::new_with_mount_identities(
+            meta_required,
+            registered_epoch,
+            registered_at,
+            ownerfs_mount.map(|path| capture_afs_mount_identity(path, "afs-ownerfs")),
+            dfs_mount.map(|path| capture_afs_mount_identity(path, "afs-dfs")),
+            data_mode,
+            rdma_device,
+        )
+    }
+
+    fn new_with_mount_identities(
+        meta_required: bool,
+        registered_epoch: Option<u64>,
+        registered_at: Option<Instant>,
+        ownerfs_mount: Option<AfsMountIdentity>,
+        dfs_mount: Option<AfsMountIdentity>,
+        data_mode: &str,
+        rdma_device: Option<&str>,
+    ) -> Self {
         let rdma_required = data_mode == "rdma";
         let rdma_configured = rdma_device.is_some();
         Self {
@@ -533,9 +662,8 @@ impl NodeReadiness {
             } else {
                 None
             }),
-            ownerfs_mount: ownerfs_mount
-                .map(|path| capture_afs_mount_identity(path, "afs-ownerfs")),
-            dfs_mount: dfs_mount.map(|path| capture_afs_mount_identity(path, "afs-dfs")),
+            ownerfs_mount,
+            dfs_mount,
             data_device: Mutex::new(ReadinessObservation::unknown("data_dir internal sampler")),
             rdma_required,
             rdma_configured,
@@ -1125,11 +1253,21 @@ async fn run_node(
     });
     let (registered_node_epoch, registered_node_at, registered_readiness) =
         if let Some((endpoint, descriptor)) = &node_descriptor {
-            let registration = rpc::meta::register_node_with_readiness(
-                endpoint,
-                descriptor.clone(),
-                timeout,
-                cfg.tls_config(),
+            // No FUSE mount or local API has been exposed yet. A bounded retry
+            // absorbs the valid cold-start window in which Meta has been
+            // spawned but is still opening its durable backend. Runtime
+            // heartbeat/drain failures retain their stricter fail-closed path.
+            let registration = retry_initial_registration(
+                || {
+                    rpc::meta::register_node_with_readiness(
+                        endpoint,
+                        descriptor.clone(),
+                        timeout,
+                        cfg.tls_config(),
+                    )
+                },
+                initial_shutdown_signal(),
+                initial_registration_budget(timeout),
             )
             .await?;
             (
@@ -1401,7 +1539,19 @@ async fn run_node(
         (None, _) => None,
     };
 
-    let readiness = Arc::new(NodeReadiness::new(
+    #[cfg(feature = "ownerfs")]
+    let ownerfs_mount_identity = mounted_ownerfs
+        .as_ref()
+        .map(|mounted| AfsMountIdentity::from_mounted(mounted, "afs-ownerfs"));
+    #[cfg(not(feature = "ownerfs"))]
+    let ownerfs_mount_identity: Option<AfsMountIdentity> = None;
+    #[cfg(feature = "dfs")]
+    let dfs_mount_identity = mounted_dfs
+        .as_ref()
+        .map(|mounted| AfsMountIdentity::from_mounted(mounted, "afs-dfs"));
+    #[cfg(not(feature = "dfs"))]
+    let dfs_mount_identity: Option<AfsMountIdentity> = None;
+    let readiness = Arc::new(NodeReadiness::new_with_mount_identities(
         needs_meta,
         if needs_meta {
             Some(registered_node_epoch)
@@ -1409,8 +1559,8 @@ async fn run_node(
             None
         },
         registered_node_at,
-        cfg.ownerfs_mount.clone(),
-        cfg.dfs_mount.clone(),
+        ownerfs_mount_identity,
+        dfs_mount_identity,
         &cfg.data_mode,
         cfg.rdma_device.as_deref(),
     ));
@@ -2543,6 +2693,16 @@ fn heartbeat_error_is_retryable(error: &afs_error::Error) -> bool {
     )
 }
 
+fn initial_registration_error_is_retryable(error: &afs_error::Error) -> bool {
+    matches!(
+        error.kind(),
+        afs_error::ErrorKind::Unavailable
+            | afs_error::ErrorKind::DeadlineExceeded
+            | afs_error::ErrorKind::ResourceExhausted
+            | afs_error::ErrorKind::Aborted
+    )
+}
+
 fn remember_shutdown_error(first: &mut Option<BoxError>, error: BoxError) {
     if first.is_none() {
         *first = Some(error);
@@ -2604,7 +2764,6 @@ fn dfs_rdma_startup_device(
 
 #[cfg(test)]
 mod shutdown_tests {
-    #[cfg(feature = "ownerfs")]
     use std::time::Duration;
 
     #[test]
@@ -2627,6 +2786,75 @@ mod shutdown_tests {
                 "registration authority rejected",
             )
         ));
+    }
+
+    #[tokio::test]
+    async fn initial_registration_recovers_within_bounded_retry_window() {
+        let mut attempts = 0;
+        let value = super::retry_initial_registration(
+            || {
+                attempts += 1;
+                let attempt = attempts;
+                async move {
+                    if attempt < 3 {
+                        Err(afs_error::Error::coded(
+                            afs_error::CLIENT_CONNECTION_UNAVAILABLE,
+                            "Meta is still starting",
+                        ))
+                    } else {
+                        Ok(41)
+                    }
+                }
+            },
+            std::future::pending(),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert_eq!(value, 41);
+        assert_eq!(attempts, 3);
+    }
+
+    #[tokio::test]
+    async fn initial_registration_stops_on_non_retryable_identity_failure() {
+        let mut attempts = 0;
+        let error = super::retry_initial_registration::<(), _, _, _>(
+            || {
+                attempts += 1;
+                async {
+                    Err(afs_error::Error::coded(
+                        afs_error::IO_PERMISSION_DENIED,
+                        "certificate belongs to another Node",
+                    ))
+                }
+            },
+            std::future::pending(),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), afs_error::ErrorKind::PermissionDenied);
+        assert_eq!(attempts, 1);
+    }
+
+    #[tokio::test]
+    async fn initial_registration_can_be_cancelled_without_waiting_for_budget() {
+        let (cancel, cancelled) = tokio::sync::oneshot::channel::<()>();
+        cancel.send(()).unwrap();
+        let error = super::retry_initial_registration::<(), _, _, _>(
+            || async {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                Ok(())
+            },
+            async move {
+                let _ = cancelled.await;
+            },
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), afs_error::ErrorKind::Cancelled);
+        assert!(error.to_string().contains("cancelled"));
     }
 
     #[test]

@@ -33,17 +33,25 @@ use std::time::Duration;
 #[cfg(any(feature = "ownerfs", feature = "dfs"))]
 use tonic::transport::Channel;
 use tonic::transport::Endpoint;
-pub async fn ping(endpoint: &str, node_id: &str, timeout: Duration) -> afs_error::Result<String> {
+pub async fn ping(
+    endpoint: &str,
+    node_id: &str,
+    timeout: Duration,
+    tls: TlsConfig,
+) -> afs_error::Result<String> {
     let config = GrpcConfig {
         connect_timeout: timeout,
         request_timeout: timeout,
         ..Default::default()
     };
-    let channel = config
-        .configure_client(
-            Endpoint::from_shared(endpoint.to_owned())
-                .map_err(|e| Error::coded(CLIENT_ARGUMENT_INVALID, e.to_string()))?,
-        )
+    let endpoint = config.configure_client(
+        Endpoint::from_shared(endpoint.to_owned())
+            .map_err(|e| Error::coded(CLIENT_ARGUMENT_INVALID, e.to_string()))?,
+    );
+    let channel = SecurityManager::new(tls)
+        .map_err(|e| Error::coded(CLIENT_ARGUMENT_INVALID, e.to_string()))?
+        .configure_client(endpoint)
+        .map_err(|e| Error::coded(CLIENT_ARGUMENT_INVALID, e.to_string()))?
         .connect()
         .await
         .map_err(|e| Error::coded(CLIENT_CONNECTION_UNAVAILABLE, e.to_string()))?;
@@ -57,6 +65,31 @@ pub async fn ping(endpoint: &str, node_id: &str, timeout: Duration) -> afs_error
         .await
         .map_err(afs_transport::grpc::error_status::status_to_error)?;
     Ok(reply.into_inner().message)
+}
+
+#[cfg(test)]
+mod ping_tls_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn ping_applies_tls_policy_before_connecting() {
+        let error = ping(
+            "https://127.0.0.1:1",
+            "node-a",
+            Duration::from_millis(10),
+            TlsConfig::MutualTls {
+                ca_certificate: "missing-ca.pem".into(),
+                identity_certificate: "missing-client.pem".into(),
+                identity_private_key: "missing-client-key.pem".into(),
+                server_name: String::new(),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.code(), CLIENT_ARGUMENT_INVALID);
+        assert!(error.to_string().contains("server_name"));
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

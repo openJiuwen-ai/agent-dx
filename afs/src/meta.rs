@@ -157,6 +157,10 @@ impl Meta {
 }
 /// 先成功绑定两个端口，再并发启动 gRPC 和 REST；它们共享同一个 Arc<Meta>。
 pub async fn run(cfg: Config, obs: Observability) -> Result<(), BoxError> {
+    // Validate the transport identity policy before opening listeners or
+    // touching a configured persistent backend. A filesystem authority must
+    // never become partially available with CA-only authentication.
+    let (trusted_nodes_by_der, enforce_peer_identity) = peer_identity_policy(&cfg)?;
     let grpc = tokio::net::TcpListener::bind(cfg.grpc_listen).await?;
     let rest = tokio::net::TcpListener::bind(cfg.rest_listen).await?;
     let store = if cfg.ownerfs || cfg.dfs {
@@ -196,14 +200,6 @@ pub async fn run(cfg: Config, obs: Observability) -> Result<(), BoxError> {
     } else {
         None
     };
-    let trusted_nodes_by_der = load_trusted_node_certs(&cfg.trusted_node_certs)?;
-    if cfg.ownerfs && trusted_nodes_by_der.is_empty() {
-        return Err(afs_error::Error::coded(
-            afs_error::CONFIG_INVALID,
-            "meta ownerfs requires trusted_node_certs for mTLS node identity binding",
-        )
-        .into());
-    }
     let owner_roots = store.as_ref().map_or_else(
         || {
             Arc::new(owner_roots::MissingOwnerRootAuthority)
@@ -242,7 +238,7 @@ pub async fn run(cfg: Config, obs: Observability) -> Result<(), BoxError> {
         owner_roots,
         dfs,
         trusted_nodes_by_der: Arc::new(trusted_nodes_by_der),
-        enforce_peer_identity: cfg.ownerfs,
+        enforce_peer_identity,
     });
     let mut services = Services::new();
     let stop = services.stop.subscribe();
@@ -280,6 +276,19 @@ pub async fn run(cfg: Config, obs: Observability) -> Result<(), BoxError> {
     services.run().await
 }
 
+fn peer_identity_policy(
+    cfg: &Config,
+) -> Result<(HashMap<Vec<u8>, String>, bool), afs_error::Error> {
+    let trusted_nodes_by_der = load_trusted_node_certs(&cfg.trusted_node_certs)?;
+    let enforce_peer_identity = cfg.ownerfs || cfg.dfs;
+    if enforce_peer_identity && trusted_nodes_by_der.is_empty() {
+        return Err(config_invalid(
+            "meta filesystem authority requires trusted_node_certs for mTLS node identity binding",
+        ));
+    }
+    Ok((trusted_nodes_by_der, enforce_peer_identity))
+}
+
 fn load_trusted_node_certs(
     certs: &HashMap<String, std::path::PathBuf>,
 ) -> Result<HashMap<Vec<u8>, String>, afs_error::Error> {
@@ -307,7 +316,37 @@ fn config_invalid(message: impl Into<String>) -> afs_error::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{Cli, Role};
+    use clap::Parser;
     use std::{sync::Arc, time::Duration};
+
+    #[test]
+    fn dfs_authority_requires_exact_node_certificate_bindings() {
+        let mut cfg = Config::resolve(Role::Meta, Cli::parse_from(["afs-meta"])).unwrap();
+        cfg.ownerfs = false;
+        cfg.dfs = true;
+        cfg.trusted_node_certs.clear();
+
+        let error = peer_identity_policy(&cfg).unwrap_err();
+        assert_eq!(error.code(), afs_error::CONFIG_INVALID);
+        assert!(error.to_string().contains("trusted_node_certs"));
+
+        cfg.dfs = false;
+        let (trusted, enforced) = peer_identity_policy(&cfg).unwrap();
+        assert!(trusted.is_empty());
+        assert!(!enforced);
+    }
+
+    #[tokio::test]
+    async fn production_dfs_startup_rejects_ca_only_identity_before_backend_or_listeners() {
+        let mut cfg = Config::resolve(Role::Meta, Cli::parse_from(["afs-meta"])).unwrap();
+        cfg.ownerfs = false;
+        cfg.dfs = true;
+        cfg.trusted_node_certs.clear();
+
+        let error = run(cfg, Observability::new().unwrap()).await.unwrap_err();
+        assert!(error.to_string().contains("trusted_node_certs"));
+    }
 
     #[tokio::test]
     async fn lookup_node_treats_expired_current_session_as_absent() {
