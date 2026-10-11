@@ -2,7 +2,6 @@ import shutil
 import stat
 import subprocess
 import tempfile
-import tomllib
 import unittest
 from pathlib import Path
 
@@ -14,26 +13,28 @@ SOURCE = ROOT / "afs/examples"
 
 class AfsExampleTests(unittest.TestCase):
     def test_packaged_examples_are_secure_and_match_crate_examples(self):
-        meta = tomllib.loads((PACKAGED / "meta.toml").read_text())
-        node = tomllib.loads((PACKAGED / "node.toml").read_text())
-
-        self.assertEqual(meta, tomllib.loads((SOURCE / "meta.toml").read_text()))
-        self.assertEqual(node, tomllib.loads((SOURCE / "node.toml").read_text()))
-        self.assertEqual(meta["fs"], "all")
-        self.assertEqual(node["fs"], "all")
-        self.assertTrue(node["meta_endpoint"].startswith("https://"))
-        self.assertTrue(node["peer_endpoint"].startswith("https://"))
-        for config in (meta, node):
-            for field in (
-                "tls_ca_certificate",
-                "tls_identity_certificate",
-                "tls_identity_private_key",
-                "tls_server_name",
-            ):
-                self.assertTrue(config[field])
-            self.assertEqual(config["trusted_node_certs"], {
-                "node-a": "/opt/adx/config/afs/tls/node-a.pem"
-            })
+        # Config::resolve is exercised by afs/tests/config_contract.rs.
+        # Keep this package-copy contract runnable in ADX's Python 3.9 image.
+        for name, identity in (("meta", "meta"), ("node", "node-a")):
+            text = (PACKAGED / f"{name}.toml").read_text()
+            lines = [line.strip() for line in text.splitlines()
+                     if line.strip() and not line.lstrip().startswith("#")]
+            source_lines = [line.strip() for line in (SOURCE / f"{name}.toml").read_text().splitlines()
+                            if line.strip() and not line.lstrip().startswith("#")]
+            self.assertEqual(lines, source_lines)
+            expected = {
+                "fs": "all",
+                "tls_ca_certificate": "/opt/adx/config/afs/tls/ca.pem",
+                "tls_identity_certificate": f"/opt/adx/config/afs/tls/{identity}.pem",
+                "tls_identity_private_key": f"/opt/adx/config/afs/tls/{identity}-key.pem",
+                "tls_server_name": "afs-cluster",
+            }
+            if name == "node":
+                expected.update(meta_endpoint="https://127.0.0.1:7400",
+                                peer_endpoint="https://127.0.0.1:7500")
+            for field, value in expected.items():
+                self.assertIn(f'{field} = "{value}"', lines)
+            self.assertIn('[trusted_node_certs]\nnode-a = "/opt/adx/config/afs/tls/node-a.pem"', text)
 
         deployment = (PACKAGED / "deployment-ownerfs-local.yaml").read_text()
         self.assertIn("with_afs: true", deployment)
