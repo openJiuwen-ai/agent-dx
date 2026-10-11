@@ -1,4 +1,5 @@
 id = "meta"
+fs = "all"
 grpc_listen = "127.0.0.1:7400"
 rest_listen = "127.0.0.1:7401"
 meta_store = "local-file"
@@ -12,3 +13,13 @@ dfs_min_distinct_failure_domains = 1
 dfs_local_copy = "required"
 log_level = "info"
 trace_enabled = false
+
+# Generate this local-only material with prepare-local-tls.sh. Never reuse
+# example identities or copy private keys between hosts.
+tls_ca_certificate = "/opt/adx/config/afs/tls/ca.pem"
+tls_identity_certificate = "/opt/adx/config/afs/tls/meta.pem"
+tls_identity_private_key = "/opt/adx/config/afs/tls/meta-key.pem"
+tls_server_name = "afs-cluster"
+
+[trusted_node_certs]
+node-a = "/opt/adx/config/afs/tls/node-a.pem"

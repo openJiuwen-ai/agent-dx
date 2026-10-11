@@ -4106,6 +4106,7 @@ mod tests {
             mode: DataMode::Grpc,
             rdma_device: None,
             timeout: std::time::Duration::from_secs(5),
+            tls: Default::default(),
         })
         .await
         .unwrap();
@@ -4131,6 +4132,7 @@ mod tests {
             mode: DataMode::Auto,
             rdma_device: None,
             timeout: std::time::Duration::from_secs(5),
+            tls: Default::default(),
         })
         .await
         .unwrap();
@@ -4156,6 +4158,7 @@ mod tests {
             mode: DataMode::Rdma,
             rdma_device: None,
             timeout: std::time::Duration::from_secs(5),
+            tls: Default::default(),
         })
         .await;
         let error = match result {

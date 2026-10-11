@@ -1,8 +1,8 @@
 id = "node-a"
 grpc_listen = "127.0.0.1:7500"
 rest_listen = "127.0.0.1:7501"
-meta_endpoint = "http://127.0.0.1:7400"
-# peer_endpoint = "http://127.0.0.1:7600"
+meta_endpoint = "https://127.0.0.1:7400"
+peer_endpoint = "https://127.0.0.1:7500"
 fs = "all"
 data_mode = "grpc"
 data_dir = "/opt/adx/data/afs/node-a"
@@ -28,3 +28,11 @@ experimental_native_workspace = false
 experimental_ownerfs_workspace_bind = false
 # [ownerfs_workspace_bind]
 # workspace = "agent1"
+
+tls_ca_certificate = "/opt/adx/config/afs/tls/ca.pem"
+tls_identity_certificate = "/opt/adx/config/afs/tls/node-a.pem"
+tls_identity_private_key = "/opt/adx/config/afs/tls/node-a-key.pem"
+tls_server_name = "afs-cluster"
+
+[trusted_node_certs]
+node-a = "/opt/adx/config/afs/tls/node-a.pem"
