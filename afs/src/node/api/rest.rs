@@ -77,17 +77,21 @@ async fn diagnose(node: Arc<Node>) -> afs_error::Result<Value> {
         )
     })?;
     let timeout = Duration::from_millis(config.timeout_ms);
-    let meta_pong = meta::ping(meta_endpoint, &config.id, timeout).await?;
+    let tls = config.tls_config();
+    let meta_pong = meta::ping(meta_endpoint, &config.id, timeout, tls.clone()).await?;
     let grpc_config = afs_transport::grpc::GrpcConfig {
         connect_timeout: timeout,
         request_timeout: timeout,
         ..Default::default()
     };
-    let channel = grpc_config
-        .configure_client(
-            tonic::transport::Endpoint::from_shared(peer_endpoint.clone())
-                .map_err(|e| Error::coded(CLIENT_ARGUMENT_INVALID, e.to_string()))?,
-        )
+    let endpoint = grpc_config.configure_client(
+        tonic::transport::Endpoint::from_shared(peer_endpoint.clone())
+            .map_err(|e| Error::coded(CLIENT_ARGUMENT_INVALID, e.to_string()))?,
+    );
+    let channel = afs_transport::grpc::SecurityManager::new(tls.clone())
+        .map_err(|e| Error::coded(CLIENT_ARGUMENT_INVALID, e.to_string()))?
+        .configure_client(endpoint)
+        .map_err(|e| Error::coded(CLIENT_ARGUMENT_INVALID, e.to_string()))?
         .connect()
         .await
         .map_err(|e| Error::coded(CLIENT_CONNECTION_UNAVAILABLE, e.to_string()))?;
@@ -109,6 +113,7 @@ async fn diagnose(node: Arc<Node>) -> afs_error::Result<Value> {
         mode,
         rdma_device: config.rdma_device.clone(),
         timeout,
+        tls,
     })
     .await?;
     let chosen = data.mode().to_owned();

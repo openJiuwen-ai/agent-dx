@@ -2103,6 +2103,7 @@ pub struct DataClientOptions {
     pub mode: DataMode,
     pub rdma_device: Option<String>,
     pub timeout: Duration,
+    pub tls: afs_transport::TlsConfig,
 }
 
 pub type PeerResult<T> = Result<T, PeerError>;
@@ -2225,7 +2226,7 @@ impl OwnerRuntime {
 
 #[cfg(feature = "ownerfs")]
 pub async fn connect_owner_files_client(options: DataClientOptions) -> PeerResult<OwnerPeerClient> {
-    let channel = connect_channel(&options.endpoint, options.timeout).await?;
+    let channel = connect_channel(&options.endpoint, options.timeout, options.tls.clone()).await?;
     Ok(
         owner_files_client_from_channel(channel).with_data_transport(
             options.mode,
@@ -2237,10 +2238,9 @@ pub async fn connect_owner_files_client(options: DataClientOptions) -> PeerResul
 
 /// Build an OwnerFiles client from an already configured tonic channel.
 ///
-/// Node wiring should use this when peer traffic requires mTLS: construct the
-/// `Channel` through the common SecurityManager/TLS config, then pass it here.
-/// The legacy `connect_owner_files_client` remains for plaintext diagnostics and
-/// tests until Node config owns secure endpoint construction.
+/// Node wiring that already owns a configured channel can use this directly.
+/// Callers that start from an endpoint, including diagnostics, must use
+/// `connect_owner_files_client` so the supplied common TLS policy is applied.
 #[cfg(feature = "ownerfs")]
 pub fn owner_files_client_from_channel(channel: Channel) -> OwnerPeerClient {
     owner_files_client_from_channel_result(channel)
@@ -3778,7 +3778,7 @@ impl DataPeerClient {
 /// Auto 只允许在 RDMA 建连阶段失败时回退；一旦业务 read/write 已发出，
 /// 结果未知就不能自动改走 gRPC 重放。
 pub async fn connect_data_client(options: DataClientOptions) -> PeerResult<DataPeerClient> {
-    let channel = connect_channel(&options.endpoint, options.timeout).await?;
+    let channel = connect_channel(&options.endpoint, options.timeout, options.tls.clone()).await?;
     match options.mode {
         DataMode::Grpc => Ok(DataPeerClient {
             inner: DataPeerClientInner::Grpc(GrpcInlineClient::new(channel, "grpc")),
@@ -4363,12 +4363,19 @@ fn protocol_error(message: &'static str) -> afs_error::Error {
     afs_error::Error::coded(afs_error::CLIENT_PROTOCOL_VIOLATION, message)
 }
 
-async fn connect_channel(endpoint: &str, timeout: Duration) -> PeerResult<Channel> {
-    Ok(Endpoint::from_shared(endpoint.to_string())?
+async fn connect_channel(
+    endpoint: &str,
+    timeout: Duration,
+    tls: afs_transport::TlsConfig,
+) -> PeerResult<Channel> {
+    let endpoint = Endpoint::from_shared(endpoint.to_string())?
         .connect_timeout(timeout)
-        .timeout(timeout)
-        .connect()
-        .await?)
+        .timeout(timeout);
+    let endpoint = afs_transport::SecurityManager::new(tls)
+        .map_err(|error| PeerError::coded(afs_error::CLIENT_ARGUMENT_INVALID, error.to_string()))?
+        .configure_client(endpoint)
+        .map_err(|error| PeerError::coded(afs_error::CLIENT_ARGUMENT_INVALID, error.to_string()))?;
+    Ok(endpoint.connect().await?)
 }
 
 fn validate_length(length: usize) -> PeerResult<()> {
@@ -4514,6 +4521,30 @@ mod tests {
     use tokio_stream::wrappers::TcpListenerStream;
     use tonic::{Request, Response, Status, transport::Server};
 
+    #[tokio::test]
+    async fn endpoint_client_applies_tls_policy_before_connecting() {
+        let result = connect_data_client(DataClientOptions {
+            endpoint: "https://127.0.0.1:1".into(),
+            mode: DataMode::Grpc,
+            rdma_device: None,
+            timeout: Duration::from_millis(10),
+            tls: afs_transport::TlsConfig::MutualTls {
+                ca_certificate: "missing-ca.pem".into(),
+                identity_certificate: "missing-client.pem".into(),
+                identity_private_key: "missing-client-key.pem".into(),
+                server_name: String::new(),
+            },
+        })
+        .await;
+
+        let error = match result {
+            Ok(_) => panic!("invalid diagnostics TLS policy must fail before connecting"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code(), afs_error::CLIENT_ARGUMENT_INVALID);
+        assert!(error.to_string().contains("server_name"));
+    }
+
     #[derive(Clone, Copy)]
     enum BadReplyKind {
         ReadShape,
@@ -4561,6 +4592,7 @@ mod tests {
             mode: DataMode::Grpc,
             rdma_device: None,
             timeout: Duration::from_secs(5),
+            tls: Default::default(),
         })
         .await
         .unwrap();
@@ -4579,6 +4611,7 @@ mod tests {
             mode: DataMode::Grpc,
             rdma_device: None,
             timeout: Duration::from_secs(5),
+            tls: Default::default(),
         })
         .await
         .unwrap();

@@ -7,12 +7,13 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-BINARIES = ("adxctl", "adx-inspect", "adx-coordinator", "adxlet", "adx-apiserver", "adx-ingress", "adx-relay")
-AFS_BINARIES = ("afs-meta", "afs-node")
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from package_manifest import AFS_BINARIES, BINARIES, verify as verify_manifest  # noqa: E402
 
 
 def sha(path):
@@ -36,6 +37,7 @@ def assemble(binary_dir, redis, redis_cli, wheel, output, commit, dirty, target,
     inputs["bin/redis-server"] = redis
     inputs["bin/redis-cli"] = redis_cli
     inputs["install.sh"] = ROOT / "build/release/install.sh"
+    inputs["lib/package_manifest.py"] = ROOT / "build/release/package_manifest.py"
     if not wheel.name.startswith("adx_sandbox-") or wheel.suffix != ".whl":
         raise ValueError("an adx_sandbox wheel is required")
     inputs[f"sdk/{wheel.name}"] = wheel
@@ -85,7 +87,10 @@ def assemble(binary_dir, redis, redis_cli, wheel, output, commit, dirty, target,
             dest = stage / name
             dest.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, dest)
-            if name.startswith(("bin/", "runtime/")) or name == "install.sh":
+            if name.startswith(("bin/", "runtime/")) or name in {
+                "install.sh",
+                "etc/examples/afs/prepare-local-tls.sh",
+            }:
                 dest.chmod(0o755)
         manifest = {
             "schema_version": 1,
@@ -105,48 +110,7 @@ def assemble(binary_dir, redis, redis_cli, wheel, output, commit, dirty, target,
 
 
 def verify(directory):
-    manifest = json.loads((directory / "manifest.json").read_text())
-    if manifest.get("schema_version") != 1 or not isinstance(manifest.get("files"), dict):
-        raise ValueError("invalid package manifest")
-    if "with_dfs" in manifest:
-        raise ValueError("legacy with_dfs manifest; rebuild with --with-afs")
-    if "with_afs" in manifest and not isinstance(manifest["with_afs"], bool):
-        raise ValueError("with_afs must be a boolean")
-    expected = set(manifest["files"])
-    required = {f"bin/{b}" for b in BINARIES} | {
-        "bin/redis-server",
-        "bin/redis-cli",
-        "install.sh",
-        "runtime/adx-execd",
-    }
-    if manifest.get("profile") == "release" and "linux" in manifest.get("target", ""):
-        required.add("runtime/adx-runtime-rootfs.img")
-    if manifest.get("with_afs") is True:
-        required.update({f"bin/{name}" for name in AFS_BINARIES})
-        required.update({"etc/examples/afs/meta.toml", "etc/examples/afs/node.toml"})
-        required.update({"third_party/afs-source/LICENSE", "third_party/afs-source/NOTICE"})
-    else:
-        forbidden = {f"bin/{name}" for name in AFS_BINARIES}
-        forbidden.update(path for path in expected if path.startswith("etc/examples/afs/"))
-        if forbidden & expected:
-            raise ValueError("AFS artifacts are present in a default package")
-    if not required.issubset(expected) or not any(
-        n.startswith("sdk/adx_sandbox-") and n.endswith(".whl") for n in expected
-    ):
-        raise ValueError("incomplete package")
-    actual = set()
-    for path in directory.rglob("*"):
-        if path.is_symlink():
-            raise ValueError("package contains a symlink")
-        if path.is_file() and path != directory / "manifest.json":
-            actual.add(path.relative_to(directory).as_posix())
-    if actual != expected:
-        raise ValueError("package file list mismatch")
-    for name, digest in manifest["files"].items():
-        path = Path(name)
-        if path.is_absolute() or ".." in path.parts or sha(directory / path) != digest:
-            raise ValueError("package integrity check failed")
-    return manifest
+    return verify_manifest(directory)
 
 
 def main():

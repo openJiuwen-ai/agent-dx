@@ -77,6 +77,7 @@ async fn real_negotiated_rdma_write_then_read_roundtrip() {
         mode: DataMode::Rdma,
         rdma_device: Some(device),
         timeout: Duration::from_secs(5),
+        tls: Default::default(),
     })
     .await
     .expect("rdma client");
@@ -125,6 +126,7 @@ async fn posted_rdma_cancel_keeps_endpoint_until_worker_drains() {
         mode: DataMode::Rdma,
         rdma_device: Some(device),
         timeout: Duration::from_secs(30),
+        tls: Default::default(),
     })
     .await
     .expect("real RDMA client");
@@ -252,6 +254,7 @@ async fn grpc_inline_data_server_does_not_require_control_service() {
         mode: DataMode::Grpc,
         rdma_device: None,
         timeout: Duration::from_secs(5),
+        tls: Default::default(),
     })
     .await
     .expect("grpc client");
@@ -282,6 +285,7 @@ async fn cancelled_rdma_call_poisons_same_client_without_grpc_replay() {
         mode: DataMode::Rdma,
         rdma_device: Some(device),
         timeout: Duration::from_secs(5),
+        tls: Default::default(),
     })
     .await
     .expect("rdma client");
@@ -527,6 +531,7 @@ async fn rdma_adapter_preserves_remote_error_before_poisoning_session() {
         mode: DataMode::Rdma,
         rdma_device: Some(device),
         timeout: Duration::from_secs(2),
+        tls: Default::default(),
     })
     .await
     .unwrap();

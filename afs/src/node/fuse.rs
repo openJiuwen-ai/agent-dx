@@ -148,18 +148,23 @@ pub struct MountedFuse {
     cleanup_error: Arc<Mutex<Option<Error>>>,
 }
 
+fn canonical_mount_path(path: &Path) -> Result<PathBuf> {
+    path.canonicalize().map_err(Error::from)
+}
+
 impl MountedFuse {
     fn new(
         session: BackgroundSession,
         path: &Path,
         cleanup_error: Arc<Mutex<Option<Error>>>,
     ) -> Result<Self> {
+        let canonical_path = canonical_mount_path(path)?;
         match current_mount_id(path).and_then(|id| {
             id.ok_or_else(|| Error::from(io::Error::other("new FUSE mount identity is missing")))
         }) {
             Ok(mount_id) => Ok(Self {
                 session,
-                mount_path: path.to_path_buf(),
+                mount_path: canonical_path,
                 mount_id,
                 cleanup_error,
             }),
@@ -169,6 +174,13 @@ impl MountedFuse {
                 Err(error)
             }
         }
+    }
+
+    /// Canonical path and kernel mount ID captured by the mount owner.
+    /// Readiness must reuse these values rather than interpreting config again.
+    #[must_use]
+    pub fn identity(&self) -> (&Path, u64) {
+        (&self.mount_path, self.mount_id)
     }
 
     pub fn join(self) -> Result<()> {
@@ -241,7 +253,8 @@ fn mount_dfs_inner(
     path: &Path,
     metrics: Option<FuseRequestMetrics>,
 ) -> Result<MountedFuse> {
-    reject_existing_mount(path)?;
+    let path = canonical_mount_path(path)?;
+    reject_existing_mount(&path)?;
     let mut fs = AfsFuse::new(backend);
     fs.requests = metrics.map(|metrics| (metrics, "dfs"));
     // Cached write-through sends each syscall write to the inode owner and
@@ -250,8 +263,8 @@ fn mount_dfs_inner(
     fs.cached_io = true;
     let cleanup_error = fs.cleanup_error.clone();
     let session =
-        fuser::spawn_mount(fs, path, &mount_config("afs-dfs", true)).map_err(Error::from)?;
-    MountedFuse::new(session, path, cleanup_error)
+        fuser::spawn_mount(fs, &path, &mount_config("afs-dfs", true)).map_err(Error::from)?;
+    MountedFuse::new(session, &path, cleanup_error)
 }
 
 /// OwnerFs 使用相同 FUSE 实现，并额外接入其本地 Home 缓存策略与 notifier。
@@ -275,25 +288,27 @@ fn mount_ownerfs_inner(
     path: &Path,
     metrics: Option<FuseRequestMetrics>,
 ) -> Result<MountedFuse> {
-    reject_existing_mount(path)?;
+    let path = canonical_mount_path(path)?;
+    reject_existing_mount(&path)?;
     let mut fs = AfsFuse::new(ownerfs.clone());
     fs.requests = metrics.map(|metrics| (metrics, "ownerfs"));
     fs.ownerfs = Some(ownerfs.clone());
     let cleanup_error = fs.cleanup_error.clone();
     let session =
-        fuser::spawn_mount(fs, path, &mount_config("afs-ownerfs", true)).map_err(Error::from)?;
+        fuser::spawn_mount(fs, &path, &mount_config("afs-ownerfs", true)).map_err(Error::from)?;
     ownerfs.register_fuse_notifier(session.notifier());
-    MountedFuse::new(session, path, cleanup_error)
+    MountedFuse::new(session, &path, cleanup_error)
 }
 
 #[doc(hidden)]
 pub fn mount_test_backend(backend: Arc<dyn Backend>, path: &Path) -> Result<MountedFuse> {
-    reject_existing_mount(path)?;
+    let path = canonical_mount_path(path)?;
+    reject_existing_mount(&path)?;
     let fs = AfsFuse::new(backend);
     let cleanup_error = fs.cleanup_error.clone();
     let session =
-        fuser::spawn_mount(fs, path, &mount_config("afs-test", false)).map_err(Error::from)?;
-    MountedFuse::new(session, path, cleanup_error)
+        fuser::spawn_mount(fs, &path, &mount_config("afs-test", false)).map_err(Error::from)?;
+    MountedFuse::new(session, &path, cleanup_error)
 }
 
 fn mount_config(fs_name: &str, allow_other: bool) -> Config {
@@ -396,6 +411,27 @@ fn parse_octal(bytes: &[u8]) -> Option<u8> {
         b'0'..=b'7' => acc.checked_mul(8)?.checked_add(byte - b'0'),
         _ => None,
     })
+}
+
+#[cfg(test)]
+mod mount_path_tests {
+    use super::canonical_mount_path;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn mount_owner_resolves_ancestor_symlinks_once() {
+        let root = tempfile::tempdir().unwrap();
+        let actual_parent = root.path().join("actual");
+        let actual_mount = actual_parent.join("mount");
+        std::fs::create_dir_all(&actual_mount).unwrap();
+        let alias = root.path().join("alias");
+        symlink(&actual_parent, &alias).unwrap();
+
+        assert_eq!(
+            canonical_mount_path(&alias.join("mount")).unwrap(),
+            actual_mount
+        );
+    }
 }
 
 type FuseJob = Box<dyn FnOnce() + Send + 'static>;
