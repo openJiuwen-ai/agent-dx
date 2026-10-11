@@ -214,7 +214,7 @@ pub async fn run(cfg: Config, obs: Observability) -> Result<(), BoxError> {
             "none" => crate::dfs::LocalCopyPolicy::NotRequired,
             _ => unreachable!("Config validates dfs_local_copy"),
         };
-        let service = dfs::DfsService::with_replication_config(
+        let service = dfs::DfsService::with_durability_policy(
             store.clone(),
             crate::dfs::ReplicationConfig {
                 desired_copies: cfg.dfs_desired_copies,
@@ -223,6 +223,13 @@ pub async fn run(cfg: Config, obs: Observability) -> Result<(), BoxError> {
                 min_distinct_failure_domains: cfg.dfs_min_distinct_failure_domains,
                 local_copy,
             },
+            cfg.dfs_external_backend.as_ref().map_or(
+                crate::dfs::DfsDurabilityPolicy::NodeReplicated,
+                |backend| crate::dfs::DfsDurabilityPolicy::ExternalBackend {
+                    store_id: backend.store_id.clone(),
+                    generation: backend.generation.clone(),
+                },
+            ),
         );
         if cfg.dfs {
             service.initialize_replication_config().await?;

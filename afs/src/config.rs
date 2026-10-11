@@ -59,6 +59,67 @@ pub struct WorkspaceBindConfig {
     pub workspace: String,
 }
 
+/// External object storage durability. Deployment of the S3 service is external
+/// to AFS. Credentials remain in the process environment or an administrator file.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DfsExternalBackendConfig {
+    pub store_id: String,
+    pub generation: String,
+    pub endpoint: String,
+    pub bucket: String,
+    pub region: String,
+    #[serde(default)]
+    pub allow_http: bool,
+    pub credentials_file: Option<PathBuf>,
+}
+
+impl DfsExternalBackendConfig {
+    /// Reject ambiguous namespaces, implicit plaintext and relative secret paths.
+    pub fn validate(&self) -> Result<()> {
+        for value in [&self.store_id, &self.generation, &self.bucket, &self.region] {
+            if value.is_empty()
+                || value.len() > 128
+                || !value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"_-.".contains(&byte))
+                || value == "."
+                || value == ".."
+            {
+                return Err(invalid(
+                    "external backend identity fields require safe non-empty path segments",
+                ));
+            }
+        }
+        let endpoint = tonic::transport::Endpoint::from_shared(self.endpoint.clone())
+            .map_err(|_| invalid("external backend endpoint requires an http(s) URI"))?;
+        let uri = endpoint.uri();
+        if !matches!(uri.scheme_str(), Some("http" | "https"))
+            || uri.host().is_none()
+            || uri
+                .authority()
+                .is_some_and(|authority| authority.as_str().contains('@'))
+            || uri.query().is_some()
+            || !matches!(uri.path(), "" | "/")
+            || (uri.scheme_str() == Some("http") && !self.allow_http)
+        {
+            return Err(invalid(
+                "external backend requires an explicit HTTPS origin, or allow_http=true for an isolated test endpoint",
+            ));
+        }
+        if self
+            .credentials_file
+            .as_ref()
+            .is_some_and(|path| !path.is_absolute())
+        {
+            return Err(invalid(
+                "external backend credentials_file must be absolute",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Parser, Default)]
 #[command(version, about = "AFS process foundation")]
 /// 命令行输入层。None 表示用户未传入，因此应继续考虑 TOML 与最终默认值。
@@ -181,6 +242,7 @@ struct FileConfig {
     experimental_ownerfs_workspace_bind: Option<bool>,
     ownerfs_workspace_bind: Option<WorkspaceBindConfig>,
     dfs_mount: Option<PathBuf>,
+    dfs_external_backend: Option<DfsExternalBackendConfig>,
     dfs_desired_copies: Option<u16>,
     dfs_sync_required_copies: Option<u16>,
     dfs_min_distinct_nodes: Option<u16>,
@@ -225,6 +287,7 @@ pub struct Config {
     pub experimental_ownerfs_workspace_bind: bool,
     pub ownerfs_workspace_bind: Option<WorkspaceBindConfig>,
     pub dfs_mount: Option<PathBuf>,
+    pub dfs_external_backend: Option<DfsExternalBackendConfig>,
     pub dfs_desired_copies: u16,
     pub dfs_sync_required_copies: u16,
     pub dfs_min_distinct_nodes: u16,
@@ -404,6 +467,7 @@ impl Config {
                 .unwrap_or(false),
             ownerfs_workspace_bind: file.ownerfs_workspace_bind,
             dfs_mount: cli.dfs_mount.or(file.dfs_mount),
+            dfs_external_backend: file.dfs_external_backend,
             dfs_desired_copies,
             dfs_sync_required_copies,
             dfs_min_distinct_nodes,
@@ -428,6 +492,20 @@ impl Config {
                 .unwrap_or(0.01),
             print_config: cli.print_config,
         };
+        if let Some(external) = &cfg.dfs_external_backend {
+            external.validate()?;
+            if !cfg.dfs
+                || cfg.dfs_desired_copies != 1
+                || cfg.dfs_sync_required_copies != 1
+                || cfg.dfs_min_distinct_nodes != 1
+                || cfg.dfs_min_distinct_failure_domains != 1
+                || cfg.dfs_local_copy != "required"
+            {
+                return Err(invalid(
+                    "external backend requires DFS with fixed single-copy defaults; Node replication combinations are unsupported",
+                ));
+            }
+        }
         if cfg.timeout_ms == 0 || cfg.timeout_ms > 300_000 {
             return Err(invalid("timeout_ms must be in 1..300000"));
         }

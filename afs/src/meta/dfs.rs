@@ -11,10 +11,10 @@ use afs_error::{Error, Result};
 use crate::dfs::{
     CallerContext, ChunkObject, ChunkSources, ClaimReplicationTask, CommitFileVersion,
     CommitMetadataMode, CopyId, CopyLocation, CopyRecord, CopyRole, CopyState, Dentry, DentryKey,
-    DentryRecord, DfsChunkSourcesReply, DfsChunkSourcesRequest, DfsReadGrant, FileVersion,
-    FileVersionId, GetXattrRequest, InodeAttributes, InodeId, InodeKind, InodeRecord, LayoutRoot,
-    LinkRequest, ListXattrRequest, LocalCopyPolicy, MkdirRequest, MknodRequest, NamespaceId,
-    OperationId, PlacementHealth, PlacementRecord, PlacementSnapshot, ReadLinkRequest,
+    DentryRecord, DfsChunkSourcesReply, DfsChunkSourcesRequest, DfsDurabilityPolicy, DfsReadGrant,
+    FileVersion, FileVersionId, GetXattrRequest, InodeAttributes, InodeId, InodeKind, InodeRecord,
+    LayoutRoot, LinkRequest, ListXattrRequest, LocalCopyPolicy, MkdirRequest, MknodRequest,
+    NamespaceId, OperationId, PlacementHealth, PlacementRecord, PlacementSnapshot, ReadLinkRequest,
     RemoveXattrRequest, RenameMode, RenameOutcome, RenameRequest, ReplicaAck, ReplicaGroup,
     ReplicaGroupId, ReplicaTarget, ReplicaWriteGrant, ReplicationClaim, ReplicationConfig,
     ReplicationTask, ReplicationTaskId, ReplicationTaskState, ReportChunkCorruption,
@@ -32,6 +32,7 @@ use super::store::{
 pub struct DfsService {
     store: Arc<dyn MetaStore>,
     replication: ReplicationConfig,
+    durability_policy: DfsDurabilityPolicy,
     read_grant_key: Arc<Option<[u8; 32]>>,
 }
 
@@ -62,6 +63,14 @@ impl DfsService {
         store: Arc<dyn MetaStore>,
         replication: ReplicationConfig,
     ) -> Self {
+        Self::with_durability_policy(store, replication, DfsDurabilityPolicy::NodeReplicated)
+    }
+
+    pub fn with_durability_policy(
+        store: Arc<dyn MetaStore>,
+        replication: ReplicationConfig,
+        durability_policy: DfsDurabilityPolicy,
+    ) -> Self {
         use std::io::Read;
         let mut key = [0; 32];
         let read_grant_key = std::fs::File::open("/dev/urandom")
@@ -71,6 +80,7 @@ impl DfsService {
         Self {
             store,
             replication,
+            durability_policy,
             read_grant_key: Arc::new(read_grant_key),
         }
     }
@@ -87,6 +97,7 @@ impl DfsService {
         if !self.replication.is_valid() {
             return Err(invalid("DFS replication config is invalid"));
         }
+        self.initialize_durability_policy().await?;
         let existing = self.store.read(MetaRead::DfsReplicationConfig).await?;
         if let Some(MetaEntity::DfsReplicationConfig(config)) = existing.entity {
             return if config == self.replication {
@@ -127,7 +138,105 @@ impl DfsService {
         }
     }
 
+    async fn initialize_durability_policy(&self) -> Result<()> {
+        if let DfsDurabilityPolicy::ExternalBackend {
+            store_id,
+            generation,
+        } = &self.durability_policy
+        {
+            crate::dfs::validate_external_store_identity(store_id, generation)?;
+        }
+        if self.is_external_backend() && self.replication != ReplicationConfig::local_single_copy()
+        {
+            return Err(invalid(
+                "external durability requires the fixed single-copy configuration",
+            ));
+        }
+        let existing = self.store.read(MetaRead::DfsDurabilityPolicy).await?;
+        if let Some(MetaEntity::DfsDurabilityPolicy(policy)) = existing.entity {
+            return if policy == self.durability_policy {
+                Ok(())
+            } else {
+                Err(conflict(
+                    "DFS durability policy is immutable; reinitialize the filesystem to change it",
+                ))
+            };
+        }
+        // A pre-policy filesystem already containing replication authority is
+        // NodeReplicated. Its chunks must never be advertised as external data.
+        if self.is_external_backend()
+            && self
+                .store
+                .read(MetaRead::DfsReplicationConfig)
+                .await?
+                .entity
+                .is_some()
+        {
+            return Err(conflict(
+                "existing Node-replicated filesystem cannot become an external filesystem",
+            ));
+        }
+        let request = RequestKey::new("afs-meta", "dfs-durability-policy-v1");
+        let mut txn = MetaTxn::new(
+            request.clone(),
+            StoreOperation::DfsInitializeDurabilityPolicy,
+        );
+        txn.conditions.extend([
+            TxnCondition::RequestAbsent(request.clone()),
+            TxnCondition::Missing(MetaKey::DfsDurabilityPolicy),
+        ]);
+        if self.is_external_backend() {
+            txn.conditions
+                .push(TxnCondition::Missing(MetaKey::DfsReplicationConfig));
+        }
+        txn.mutations.extend([
+            TxnMutation::Put(MetaEntity::DfsDurabilityPolicy(
+                self.durability_policy.clone(),
+            )),
+            TxnMutation::RecordRequestOutcome(RequestOutcome {
+                request,
+                operation: StoreOperation::DfsInitializeDurabilityPolicy,
+                result: OperationResult::Empty,
+            }),
+        ]);
+        let _ = self.store.compare_and_commit(txn).await?;
+        match self.store.read(MetaRead::DfsDurabilityPolicy).await?.entity {
+            Some(MetaEntity::DfsDurabilityPolicy(policy)) if policy == self.durability_policy => {
+                Ok(())
+            }
+            Some(MetaEntity::DfsDurabilityPolicy(_)) => Err(conflict(
+                "DFS durability policy changed during initialization",
+            )),
+            _ => Err(invalid("DFS durability policy was not persisted")),
+        }
+    }
+
+    fn is_external_backend(&self) -> bool {
+        matches!(
+            self.durability_policy,
+            DfsDurabilityPolicy::ExternalBackend { .. }
+        )
+    }
+
+    async fn current_durability_policy(&self) -> Result<DfsDurabilityPolicy> {
+        match self.store.read(MetaRead::DfsDurabilityPolicy).await?.entity {
+            Some(MetaEntity::DfsDurabilityPolicy(policy)) if policy == self.durability_policy => {
+                Ok(policy)
+            }
+            Some(MetaEntity::DfsDurabilityPolicy(_)) => Err(conflict(
+                "DFS durability policy differs from the initialized filesystem",
+            )),
+            None if !self.is_external_backend() => Ok(DfsDurabilityPolicy::NodeReplicated),
+            _ => Err(invalid("DFS durability policy is not initialized")),
+        }
+    }
+
     pub async fn placement_snapshot(&self, caller_id: String) -> Result<PlacementSnapshot> {
+        if self.is_external_backend() {
+            return Err(invalid(
+                "external durability does not use Node replica placement",
+            ));
+        }
         require_id(&caller_id, "caller_id")?;
         let config_snapshot = self.store.read(MetaRead::DfsReplicationConfig).await?;
         let replication = match config_snapshot.entity {
@@ -181,6 +290,11 @@ impl DfsService {
         &self,
         request: ValidateReplicaWriteRequest,
     ) -> Result<ReplicaWriteGrant> {
+        if self.is_external_backend() {
+            return Err(invalid(
+                "external durability does not accept Node replica writes",
+            ));
+        }
         require_id(&request.requester_node_id, "requester_node_id")?;
         require_id(&request.initiator_node_id, "initiator_node_id")?;
         require_id(&request.operation_id.0, "operation_id")?;
@@ -288,6 +402,10 @@ impl DfsService {
         &self,
         request: ClaimReplicationTask,
     ) -> Result<Option<ReplicationClaim>> {
+        if self.is_external_backend() {
+            self.current_durability_policy().await?;
+            return Ok(None);
+        }
         let request_digest = namespace_request_digest(&request)?;
         require_id(&request.caller_id, "caller_id")?;
         require_id(&request.caller_session_id, "caller_session_id")?;
@@ -619,6 +737,11 @@ impl DfsService {
         &self,
         request: ReportReplicationTask,
     ) -> Result<ReplicationTask> {
+        if self.is_external_backend() {
+            return Err(invalid(
+                "external durability does not accept Node repair reports",
+            ));
+        }
         let request_digest = namespace_request_digest(&request)?;
         require_id(&request.caller_id, "caller_id")?;
         require_id(&request.caller_session_id, "caller_session_id")?;
@@ -2612,14 +2735,24 @@ impl DfsService {
             }
         };
 
+        self.current_durability_policy().await?;
         let mut revision = 0;
         let mut chunks = Vec::with_capacity(request.chunk_ids.len());
         for chunk_id in request.chunk_ids {
+            let chunk = match view
+                .read(MetaRead::DfsChunk(chunk_id.clone()))
+                .await?
+                .entity
+            {
+                Some(MetaEntity::DfsChunk(chunk)) => chunk,
+                _ => return Err(invalid("DFS source chunk identity is missing")),
+            };
             let placement_snapshot = view.read(MetaRead::DfsPlacement(chunk_id.clone())).await?;
             revision = revision.max(placement_snapshot.revision.0);
             let Some(MetaEntity::DfsPlacement(placement)) = placement_snapshot.entity else {
                 chunks.push(ChunkSources {
                     chunk_id,
+                    chunk: Some(chunk),
                     sources: Vec::new(),
                 });
                 continue;
@@ -2631,23 +2764,32 @@ impl DfsService {
                 let Some(MetaEntity::DfsCopy(copy)) = copy_snapshot.entity else {
                     continue;
                 };
-                if copy.chunk_id != chunk_id || !copy.is_ready_durable() {
-                    continue;
-                }
-                let CopyLocation::Node { node_id, .. } = &copy.location else {
-                    continue;
-                }; // ExternalCommitted never masquerades as a Peer replica.
-                let session_snapshot = view
-                    .read(MetaRead::CurrentNodeSession {
-                        node_id: node_id.clone(),
-                    })
-                    .await?;
-                revision = revision.max(session_snapshot.revision.0);
-                let Some(MetaEntity::NodeSession(session)) = session_snapshot.entity else {
-                    continue;
-                };
-                let Some(serving_copy) = serving_read_copy(&copy, &session, now_unix_ms()) else {
-                    continue;
+                let (serving_copy, data_endpoint) = if self.is_external_backend() {
+                    if !self.external_copy_matches(&copy, &chunk)? {
+                        continue;
+                    }
+                    (copy.clone(), None)
+                } else {
+                    if copy.chunk_id != chunk_id || !copy.is_ready_durable() {
+                        continue;
+                    }
+                    let CopyLocation::Node { node_id, .. } = &copy.location else {
+                        continue;
+                    };
+                    let session_snapshot = view
+                        .read(MetaRead::CurrentNodeSession {
+                            node_id: node_id.clone(),
+                        })
+                        .await?;
+                    revision = revision.max(session_snapshot.revision.0);
+                    let Some(MetaEntity::NodeSession(session)) = session_snapshot.entity else {
+                        continue;
+                    };
+                    let Some(serving_copy) = serving_read_copy(&copy, &session, now_unix_ms())
+                    else {
+                        continue;
+                    };
+                    (serving_copy, Some(session.data_addr))
                 };
                 let mut read_grant = DfsReadGrant {
                     namespace_id: request.namespace_id.clone(),
@@ -2659,14 +2801,6 @@ impl DfsService {
                     fence: revision,
                     token: String::new(),
                 };
-                let chunk = match view
-                    .read(MetaRead::DfsChunk(chunk_id.clone()))
-                    .await?
-                    .entity
-                {
-                    Some(MetaEntity::DfsChunk(chunk)) => chunk,
-                    _ => return Err(invalid("DFS source chunk identity is missing")),
-                };
                 let ranges = read_chunk_intervals(&layout, &chunk)?;
                 read_grant.token =
                     self.read_grant_token(&read_grant, &serving_copy, &chunk, &ranges)?;
@@ -2676,14 +2810,141 @@ impl DfsService {
                     role: copy.role,
                     state: copy.state,
                     location: serving_copy.location.clone(),
-                    data_endpoint: Some(session.data_addr),
+                    data_endpoint,
                     load_hint: 0,
                     read_grant,
                 });
             }
-            chunks.push(ChunkSources { chunk_id, sources });
+            chunks.push(ChunkSources {
+                chunk_id,
+                chunk: Some(chunk),
+                sources,
+            });
         }
         Ok(DfsChunkSourcesReply { revision, chunks })
+    }
+
+    fn external_copy_matches(&self, copy: &CopyRecord, chunk: &ChunkObject) -> Result<bool> {
+        external_copy_matches(&self.durability_policy, copy, chunk)
+    }
+
+    /// Authorizes backend reads from the committed catalog and fixed layout.
+    /// The authenticated requesting Node is the reader; no writer/Peer session
+    /// is consulted. Invalid, expired or out-of-layout grants are rejected.
+    pub async fn validate_external_read_grants(
+        &self,
+        caller_id: String,
+        validations: Vec<crate::dfs::DfsReadValidation>,
+    ) -> Result<Vec<crate::dfs::DfsExternalAuthorizedRead>> {
+        if !self.is_external_backend() || validations.is_empty() || validations.len() > 128 {
+            return Err(invalid(
+                "external read authorization requires the external policy and 1..128 entries",
+            ));
+        }
+        self.current_durability_policy().await?;
+        let now = now_unix_ms();
+        let view = self.store.read_view().await?;
+        let mut result = Vec::with_capacity(validations.len());
+        for validation in validations {
+            let grant = &validation.grant;
+            if grant.caller_node_id != caller_id
+                || grant.expires_at_unix_ms <= now
+                || grant.token.len() != 76
+            {
+                return Err(permission_denied(
+                    "external read grant caller or expiry differs",
+                ));
+            }
+            let caller = live_read_session(&view, &caller_id, grant.caller_node_epoch, now).await?;
+            let version = match view
+                .read(MetaRead::DfsFileVersion(grant.file_version_id.clone()))
+                .await?
+                .entity
+            {
+                Some(MetaEntity::DfsFileVersion(version))
+                    if version.layout_root == grant.layout_root_id =>
+                {
+                    version
+                }
+                _ => {
+                    return Err(permission_denied(
+                        "external read grant version or layout differs",
+                    ));
+                }
+            };
+            match view
+                .read(MetaRead::DfsInode(version.inode_id))
+                .await?
+                .entity
+            {
+                Some(MetaEntity::DfsInode(inode)) if inode.namespace_id == grant.namespace_id => {}
+                _ => return Err(permission_denied("external read grant namespace differs")),
+            }
+            let layout = match view
+                .read(MetaRead::DfsLayoutRoot(grant.layout_root_id.clone()))
+                .await?
+                .entity
+            {
+                Some(MetaEntity::DfsLayoutRoot(layout)) => layout,
+                _ => return Err(permission_denied("external read grant layout is missing")),
+            };
+            let chunk = match view
+                .read(MetaRead::DfsChunk(validation.chunk_id.clone()))
+                .await?
+                .entity
+            {
+                Some(MetaEntity::DfsChunk(chunk)) => chunk,
+                _ => return Err(permission_denied("external read grant chunk is missing")),
+            };
+            let copy = match view
+                .read(MetaRead::DfsCopy(validation.copy_id.clone()))
+                .await?
+                .entity
+            {
+                Some(MetaEntity::DfsCopy(copy)) if self.external_copy_matches(&copy, &chunk)? => {
+                    copy
+                }
+                _ => {
+                    return Err(permission_denied(
+                        "external read grant copy is not committed and Ready",
+                    ));
+                }
+            };
+            let intervals = read_chunk_intervals(&layout, &chunk)?;
+            let supplied = grant
+                .token
+                .strip_prefix("dfs-read-v1:")
+                .and_then(|hex| blake3::Hash::from_hex(hex).ok())
+                .ok_or_else(|| permission_denied("external read grant MAC format is invalid"))?;
+            if supplied != self.read_grant_mac(grant, &copy, &chunk, &intervals)? {
+                return Err(permission_denied(
+                    "external read grant MAC authentication failed",
+                ));
+            }
+            if !read_range_covered(&intervals, validation.chunk_offset, validation.length) {
+                return Err(permission_denied(
+                    "external read range is outside the committed layout",
+                ));
+            }
+            let allowed_ranges = if intervals.len() <= 128 {
+                intervals
+            } else {
+                vec![(validation.chunk_offset, validation.length)]
+            };
+            result.push(crate::dfs::DfsExternalAuthorizedRead {
+                authorized: crate::dfs::DfsAuthorizedRead {
+                    expires_at_unix_ms: now
+                        .saturating_add(5_000)
+                        .min(grant.expires_at_unix_ms)
+                        .min(caller.expires_at_unix_ms),
+                    validation,
+                    allowed_ranges,
+                },
+                chunk,
+                location: copy.location,
+            });
+        }
+        Ok(result)
     }
 
     fn read_grant_mac(
@@ -2956,6 +3217,18 @@ impl DfsService {
             ));
         }
         let replication = self.current_replication_config().await?;
+        let durability_policy = self.current_durability_policy().await?;
+        let external_session = if self.is_external_backend() {
+            let session = self.current_live_session(&caller_id, now_unix_ms()).await?;
+            if session.session_id != commit.write_lease.owner_session_id {
+                return Err(conflict(
+                    "external receipt writer does not own the current Node session",
+                ));
+            }
+            Some(session)
+        } else {
+            None
+        };
         let expected_base_layout = match commit.expected_head_version.as_ref() {
             Some(version_id) => Some(self.get_file_version(version_id.clone()).await?.1),
             None => None,
@@ -2969,10 +3242,12 @@ impl DfsService {
             if !receipt_chunks.insert(receipt.chunk.id.clone()) {
                 return Err(invalid("commit contains duplicate ChunkReceipts"));
             }
-            accepted_copies.push(
+            accepted_copies.push(if self.is_external_backend() {
+                self.validate_external_chunk_receipt(receipt, &durability_policy)?
+            } else {
                 self.validate_chunk_receipt(&caller_id, receipt, &replication)
-                    .await?,
-            );
+                    .await?
+            });
         }
         let mut previous_end = 0;
         for extent in &commit.layout_root.inline_extents {
@@ -3053,6 +3328,15 @@ impl DfsService {
             TxnCondition::Missing(MetaKey::DfsFileVersion(commit.file_version.id.clone())),
             TxnCondition::Missing(MetaKey::DfsLayoutRoot(commit.layout_root.id.clone())),
         ]);
+        if let Some(session) = external_session {
+            txn.conditions.extend([
+                TxnCondition::EntityEquals(MetaEntity::DfsDurabilityPolicy(durability_policy)),
+                TxnCondition::NodeSessionCurrent {
+                    node_id: session.node_id,
+                    session_id: session.session_id,
+                },
+            ]);
+        }
         for (receipt, copies) in commit.chunk_receipts.iter().zip(accepted_copies) {
             txn.mutations.push(TxnMutation::Put(MetaEntity::DfsChunk(
                 receipt.chunk.clone(),
@@ -3074,14 +3358,23 @@ impl DfsService {
                 .push(TxnMutation::Put(MetaEntity::DfsPlacement(
                     PlacementRecord {
                         chunk_id: receipt.chunk.id.clone(),
-                        replica_group_id: receipt.replica_group_id.clone(),
-                        placement_epoch: receipt.placement_epoch,
+                        replica_group_id: if self.is_external_backend() {
+                            ReplicaGroupId::new("external")
+                        } else {
+                            receipt.replica_group_id.clone()
+                        },
+                        placement_epoch: if self.is_external_backend() {
+                            1
+                        } else {
+                            receipt.placement_epoch
+                        },
                         desired_copies: replication.desired_copies,
                         copies: copy_ids.clone(),
                         health,
                     },
                 )));
-            if copies.len() < usize::from(replication.desired_copies) {
+            if !self.is_external_backend() && copies.len() < usize::from(replication.desired_copies)
+            {
                 txn.mutations
                     .push(TxnMutation::Put(MetaEntity::DfsReplicationTask(
                         ReplicationTask {
@@ -3127,12 +3420,78 @@ impl DfsService {
         }
     }
 
+    fn validate_external_chunk_receipt(
+        &self,
+        receipt: &crate::dfs::ChunkReceipt,
+        policy: &DfsDurabilityPolicy,
+    ) -> Result<Vec<CopyRecord>> {
+        let DfsDurabilityPolicy::ExternalBackend {
+            store_id,
+            generation,
+        } = policy
+        else {
+            return Err(invalid(
+                "external receipt requires the external durability policy",
+            ));
+        };
+        let external = receipt
+            .external_commit
+            .as_ref()
+            .ok_or_else(|| invalid("external durability requires an external commit receipt"))?;
+        let key = crate::dfs::external_object_key(store_id, generation, &receipt.chunk.id)?;
+        let canonical_chunk = format!(
+            "blake3-{}-{}",
+            blake3::Hash::from(receipt.chunk.content_digest.bytes).to_hex(),
+            receipt.chunk.length
+        );
+        if !receipt.durable_acks.is_empty()
+            || receipt.placement_revision != 0
+            || receipt.placement_epoch != 0
+            || !receipt.replica_group_id.0.is_empty()
+            || external.store_id != *store_id
+            || external.generation != *generation
+            || external.object_key != key
+            || external.persisted_bytes != receipt.chunk.length
+            || external.verified_digest != receipt.chunk.content_digest
+            || receipt.chunk.id.0 != canonical_chunk
+            || receipt.chunk.length == 0
+        {
+            return Err(invalid(
+                "external receipt does not prove the configured immutable Chunk",
+            ));
+        }
+        // Authenticated service Nodes are trusted to issue this receipt only
+        // after the configured PUT succeeds, just as replica Nodes issue ACKs
+        // only after persistence. No arbitrary store, key or Node ACK is accepted.
+        Ok(vec![CopyRecord {
+            id: CopyId::new(format!(
+                "external:{store_id}:{generation}:{}",
+                receipt.chunk.id.0
+            )),
+            chunk_id: receipt.chunk.id.clone(),
+            role: CopyRole::ExternalCommitted,
+            location: CopyLocation::External {
+                store_id: store_id.clone(),
+                object_key: key,
+                object_revision: generation.clone(),
+            },
+            state: CopyState::Ready,
+            persisted_bytes: receipt.chunk.length,
+            verified_digest: receipt.chunk.content_digest.clone(),
+        }])
+    }
+
     async fn validate_chunk_receipt(
         &self,
         caller_id: &str,
         receipt: &crate::dfs::ChunkReceipt,
         replication: &ReplicationConfig,
     ) -> Result<Vec<CopyRecord>> {
+        if receipt.external_commit.is_some() {
+            return Err(invalid(
+                "Node replication does not accept external commit receipts",
+            ));
+        }
         if receipt.placement_revision == 0
             || receipt.placement_epoch == 0
             || receipt.durable_acks.len() < usize::from(replication.sync_required_copies)
@@ -4641,6 +5000,30 @@ fn copy_is_on_node(copy: &CopyRecord, node_id: &str) -> bool {
             ..
         } if copy_node == node_id
     )
+}
+
+pub(super) fn external_copy_matches(
+    policy: &DfsDurabilityPolicy,
+    copy: &CopyRecord,
+    chunk: &ChunkObject,
+) -> Result<bool> {
+    let DfsDurabilityPolicy::ExternalBackend {
+        store_id,
+        generation,
+    } = policy
+    else {
+        return Ok(false);
+    };
+    if copy.role != CopyRole::ExternalCommitted
+        || !copy.state.is_readable()
+        || !copy_matches_chunk(copy, chunk)
+    {
+        return Ok(false);
+    }
+    let expected_key = crate::dfs::external_object_key(store_id, generation, &chunk.id)?;
+    Ok(matches!(&copy.location,
+        CopyLocation::External { store_id: actual_store, object_key, object_revision }
+            if actual_store == store_id && object_key == &expected_key && object_revision == generation))
 }
 
 fn copy_matches_chunk(copy: &CopyRecord, chunk: &ChunkObject) -> bool {
@@ -6518,5 +6901,478 @@ mod read_recovery_tests {
             *node_epoch = 0;
         }
         assert!(serving_read_copy(&zero_epoch, &session, now).is_none());
+    }
+}
+
+#[cfg(all(test, feature = "dfs"))]
+mod external_policy_tests {
+    use super::*;
+    use crate::dfs::{
+        ChunkReceipt, CommitMetadataDelta, DfsDurabilityPolicy, Extent, ExternalCommitReceipt,
+        LayoutRootId,
+    };
+    use crate::meta::store::{NodeSessionLease, Store, local_file::LocalFileBackend};
+    use crate::node::chunk::StagedChunk;
+
+    fn external_policy() -> DfsDurabilityPolicy {
+        DfsDurabilityPolicy::ExternalBackend {
+            store_id: "seaweed-test".into(),
+            generation: "generation-1".into(),
+        }
+    }
+
+    async fn register(store: &Store, node_id: &str) {
+        store
+            .register_node_session(
+                RequestKey::new(node_id, "register"),
+                NodeSessionLease {
+                    node_id: node_id.into(),
+                    session_id: format!("{node_id}-session"),
+                    grpc_addr: "http://127.0.0.1:1".into(),
+                    data_addr: "http://127.0.0.1:2".into(),
+                    rest_addr: "http://127.0.0.1:3".into(),
+                    storage_devices: Vec::new(),
+                    lease_ttl: std::time::Duration::from_secs(60),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn pending_commit(service: &DfsService) -> CommitFileVersion {
+        let namespace_id = NamespaceId::new("default");
+        let root = service.ensure_namespace_root(&namespace_id).await.unwrap();
+        let mut attributes = root.attributes;
+        attributes.mode = 0o644;
+        let (inode, write_lease) = service
+            .create(CreateFileRequest {
+                caller_id: "writer".into(),
+                owner_session_id: "writer-session".into(),
+                operation_id: OperationId::new("create-file"),
+                namespace_id,
+                parent_inode_id: root.inode_id,
+                name: b"external-file".to_vec(),
+                attributes,
+                lease_seconds: 60,
+            })
+            .await
+            .unwrap();
+        let operation_id = OperationId::new("publish-file");
+        let staged = StagedChunk::new(operation_id.clone(), b"data".to_vec());
+        let receipt = ChunkReceipt {
+            operation_id: operation_id.clone(),
+            chunk: staged.chunk.clone(),
+            placement_revision: 0,
+            placement_epoch: 0,
+            replica_group_id: ReplicaGroupId::new(""),
+            durable_acks: Vec::new(),
+            external_commit: Some(ExternalCommitReceipt {
+                store_id: "seaweed-test".into(),
+                generation: "generation-1".into(),
+                object_key: crate::dfs::external_object_key(
+                    "seaweed-test",
+                    "generation-1",
+                    &staged.chunk.id,
+                )
+                .unwrap(),
+                persisted_bytes: staged.chunk.length,
+                verified_digest: staged.chunk.content_digest.clone(),
+            }),
+        };
+        let layout = LayoutRoot {
+            id: LayoutRootId::new("external-layout"),
+            file_length: 4,
+            inline_extents: vec![Extent {
+                file_offset: 0,
+                length: 4,
+                chunk_id: staged.chunk.id,
+                chunk_offset: 0,
+            }],
+        };
+        CommitFileVersion {
+            operation_id,
+            inode_id: inode.inode_id.clone(),
+            write_lease,
+            expected_inode_revision: inode.revision,
+            expected_head_version: inode.head_version,
+            file_version: FileVersion {
+                id: FileVersionId::new("external-version"),
+                inode_id: inode.inode_id,
+                parent_version: None,
+                length: 4,
+                layout_root: layout.id.clone(),
+                created_at_unix_ms: 1,
+            },
+            layout_root: layout,
+            chunk_receipts: vec![receipt],
+            metadata_delta: CommitMetadataDelta {
+                mode: CommitMetadataMode::DataOnly,
+                mtime_unix_ms: None,
+                ctime_unix_ms: None,
+                kill_suidgid: false,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn external_receipt_rejects_wrong_store_key_length_digest_without_publication() {
+        let temp = tempfile::tempdir().unwrap();
+        let backend = Arc::new(LocalFileBackend::open(temp.path()).unwrap());
+        let store = Arc::new(Store::open(backend).await.unwrap());
+        register(&store, "writer").await;
+        let service = DfsService::with_durability_policy(
+            store.clone(),
+            ReplicationConfig::local_single_copy(),
+            external_policy(),
+        );
+        service.initialize_replication_config().await.unwrap();
+        let commit = pending_commit(&service).await;
+        for case in 0..10 {
+            let mut invalid_commit = commit.clone();
+            let receipt = invalid_commit.chunk_receipts[0]
+                .external_commit
+                .as_mut()
+                .unwrap();
+            match case {
+                0 => receipt.store_id = "other-store".into(),
+                1 => receipt.generation = "other-generation".into(),
+                2 => receipt.object_key = "arbitrary/client/key".into(),
+                3 => receipt.persisted_bytes += 1,
+                4 => receipt.verified_digest.bytes[0] ^= 1,
+                5 => invalid_commit.chunk_receipts[0].external_commit = None,
+                6 => invalid_commit.chunk_receipts[0].placement_epoch = 1,
+                7 => {
+                    invalid_commit.chunk_receipts[0].chunk.content_digest.bytes[0] ^= 1;
+                    let changed = invalid_commit.chunk_receipts[0]
+                        .chunk
+                        .content_digest
+                        .clone();
+                    invalid_commit.chunk_receipts[0]
+                        .external_commit
+                        .as_mut()
+                        .unwrap()
+                        .verified_digest = changed;
+                }
+                8 => {
+                    invalid_commit.chunk_receipts[0].chunk.id =
+                        crate::dfs::ChunkId::new("unbound-chunk")
+                }
+                _ => invalid_commit.chunk_receipts[0]
+                    .durable_acks
+                    .push(ReplicaAck {
+                        operation_id: commit.operation_id.clone(),
+                        chunk_id: commit.chunk_receipts[0].chunk.id.clone(),
+                        placement_revision: 1,
+                        placement_epoch: 1,
+                        node_id: "fake-node".into(),
+                        node_epoch: 1,
+                        device_id: "fake-device".into(),
+                        device_epoch: 1,
+                        catalog_revision: 1,
+                        persisted_bytes: 4,
+                        verified_digest: commit.chunk_receipts[0].chunk.content_digest.clone(),
+                    }),
+            }
+            assert!(
+                service
+                    .commit_file_version("writer".into(), invalid_commit)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                service
+                    .get_inode(commit.inode_id.clone())
+                    .await
+                    .unwrap()
+                    .head_version
+                    .is_none()
+            );
+            assert!(
+                store
+                    .read(MetaRead::DfsChunk(
+                        commit.chunk_receipts[0].chunk.id.clone()
+                    ))
+                    .await
+                    .unwrap()
+                    .entity
+                    .is_none()
+            );
+        }
+        service
+            .commit_file_version("writer".into(), commit)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn external_policy_and_published_reference_survive_local_file_store_reload() {
+        let temp = tempfile::tempdir().unwrap();
+        let backend = Arc::new(LocalFileBackend::open(temp.path()).unwrap());
+        let store = Arc::new(Store::open(backend.clone()).await.unwrap());
+        register(&store, "writer").await;
+        register(&store, "reader").await;
+        let service = DfsService::with_durability_policy(
+            store.clone(),
+            ReplicationConfig::local_single_copy(),
+            external_policy(),
+        );
+        service.initialize_replication_config().await.unwrap();
+        let commit = pending_commit(&service).await;
+        let published = service
+            .commit_file_version("writer".into(), commit.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            service
+                .commit_file_version("writer".into(), commit.clone())
+                .await
+                .unwrap(),
+            published
+        );
+        let request = RequestKey::new("fixture", "writer-left");
+        let mut leave = MetaTxn::new(request.clone(), StoreOperation::RegisterNode);
+        leave.conditions.extend([
+            TxnCondition::RequestAbsent(request.clone()),
+            TxnCondition::NodeSessionCurrent {
+                node_id: "writer".into(),
+                session_id: "writer-session".into(),
+            },
+        ]);
+        leave.mutations.extend([
+            TxnMutation::Delete(MetaKey::CurrentNodeSession {
+                node_id: "writer".into(),
+            }),
+            TxnMutation::RecordRequestOutcome(RequestOutcome {
+                request,
+                operation: StoreOperation::RegisterNode,
+                result: OperationResult::Empty,
+            }),
+        ]);
+        assert!(matches!(
+            store.compare_and_commit(leave).await.unwrap(),
+            TxnOutcome::Committed { .. }
+        ));
+        drop(service);
+        drop(store);
+        let reopened = Arc::new(Store::open(backend).await.unwrap());
+        let restored = DfsService::with_durability_policy(
+            reopened.clone(),
+            ReplicationConfig::local_single_copy(),
+            external_policy(),
+        );
+        restored.initialize_replication_config().await.unwrap();
+        let sources = restored
+            .chunk_sources(DfsChunkSourcesRequest {
+                caller_id: "reader".into(),
+                namespace_id: NamespaceId::new("default"),
+                file_version_id: commit.file_version.id,
+                layout_root_id: commit.layout_root.id,
+                chunk_ids: vec![commit.chunk_receipts[0].chunk.id.clone()],
+            })
+            .await
+            .unwrap();
+        let source = &sources.chunks[0].sources[0];
+        assert_eq!(source.role, CopyRole::ExternalCommitted);
+        assert!(source.data_endpoint.is_none());
+        assert!(
+            matches!(&source.location, CopyLocation::External { store_id, object_key, .. }
+            if store_id == "seaweed-test" && object_key == &commit.chunk_receipts[0].external_commit.as_ref().unwrap().object_key)
+        );
+        let validation = crate::dfs::DfsReadValidation {
+            grant: source.read_grant.clone(),
+            chunk_id: source.chunk_id.clone(),
+            copy_id: source.copy_id.clone(),
+            chunk_offset: 0,
+            length: 4,
+        };
+        let authorized = restored
+            .validate_external_read_grants("reader".into(), vec![validation.clone()])
+            .await
+            .unwrap();
+        assert_eq!(authorized[0].chunk, commit.chunk_receipts[0].chunk);
+        assert_eq!(authorized[0].location, source.location);
+        assert!(authorized[0].authorized.expires_at_unix_ms > now_unix_ms());
+        for case in 0..5 {
+            let mut bad = validation.clone();
+            match case {
+                0 => bad.grant.namespace_id = NamespaceId::new("other-namespace"),
+                1 => {
+                    bad.chunk_offset = 3;
+                    bad.length = 2;
+                }
+                2 => bad.grant.expires_at_unix_ms = now_unix_ms(),
+                3 => bad.grant.token = format!("dfs-read-v1:{}", "0".repeat(64)),
+                _ => bad.grant.caller_node_epoch += 1,
+            }
+            assert!(
+                restored
+                    .validate_external_read_grants("reader".into(), vec![bad])
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(
+            restored
+                .validate_external_read_grants("other-reader".into(), vec![validation.clone()])
+                .await
+                .is_err()
+        );
+        reopened
+            .register_node_session(
+                RequestKey::new("reader", "restart"),
+                NodeSessionLease {
+                    node_id: "reader".into(),
+                    session_id: "reader-restarted".into(),
+                    grpc_addr: "http://127.0.0.1:1".into(),
+                    data_addr: "http://127.0.0.1:2".into(),
+                    rest_addr: "http://127.0.0.1:3".into(),
+                    storage_devices: Vec::new(),
+                    lease_ttl: std::time::Duration::from_secs(60),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            restored
+                .validate_external_read_grants("reader".into(), vec![validation])
+                .await
+                .is_err()
+        );
+        assert!(
+            DfsService::with_replication_config(
+                reopened.clone(),
+                ReplicationConfig::local_single_copy()
+            )
+            .initialize_replication_config()
+            .await
+            .is_err()
+        );
+        let changed = DfsService::with_durability_policy(
+            reopened,
+            ReplicationConfig::local_single_copy(),
+            DfsDurabilityPolicy::ExternalBackend {
+                store_id: "seaweed-test".into(),
+                generation: "generation-2".into(),
+            },
+        );
+        assert!(changed.initialize_replication_config().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn existing_node_replication_authority_cannot_be_reclassified_as_external() {
+        let store = Arc::new(
+            Store::open(Arc::new(
+                crate::meta::store::memory::MemoryBackend::default(),
+            ))
+            .await
+            .unwrap(),
+        );
+        let request = RequestKey::new("legacy", "replication");
+        let mut txn = MetaTxn::new(
+            request.clone(),
+            StoreOperation::DfsInitializeReplicationConfig,
+        );
+        txn.conditions.extend([
+            TxnCondition::RequestAbsent(request.clone()),
+            TxnCondition::Missing(MetaKey::DfsReplicationConfig),
+            TxnCondition::Missing(MetaKey::DfsDurabilityPolicy),
+        ]);
+        txn.mutations.extend([
+            TxnMutation::Put(MetaEntity::DfsReplicationConfig(
+                ReplicationConfig::local_single_copy(),
+            )),
+            TxnMutation::RecordRequestOutcome(RequestOutcome {
+                request,
+                operation: StoreOperation::DfsInitializeReplicationConfig,
+                result: OperationResult::Empty,
+            }),
+        ]);
+        assert!(matches!(
+            store.compare_and_commit(txn).await.unwrap(),
+            TxnOutcome::Committed { .. }
+        ));
+        let service = DfsService::with_durability_policy(
+            store.clone(),
+            ReplicationConfig::local_single_copy(),
+            external_policy(),
+        );
+        assert!(service.initialize_replication_config().await.is_err());
+        assert!(
+            store
+                .read(MetaRead::DfsDurabilityPolicy)
+                .await
+                .unwrap()
+                .entity
+                .is_none()
+        );
+        DfsService::new(store)
+            .initialize_replication_config()
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn external_publication_has_one_external_copy_and_no_replication_debt() {
+        let store = Arc::new(
+            Store::open(Arc::new(
+                crate::meta::store::memory::MemoryBackend::default(),
+            ))
+            .await
+            .unwrap(),
+        );
+        register(&store, "writer").await;
+        let service = DfsService::with_durability_policy(
+            store.clone(),
+            ReplicationConfig::local_single_copy(),
+            external_policy(),
+        );
+        service.initialize_replication_config().await.unwrap();
+        let commit = pending_commit(&service).await;
+        let node_service = DfsService::new(store.clone());
+        assert!(
+            node_service
+                .validate_chunk_receipt(
+                    "writer",
+                    &commit.chunk_receipts[0],
+                    &ReplicationConfig::local_single_copy()
+                )
+                .await
+                .is_err()
+        );
+        service
+            .commit_file_version("writer".into(), commit.clone())
+            .await
+            .unwrap();
+        let placement = service
+            .placement(&commit.chunk_receipts[0].chunk.id)
+            .await
+            .unwrap();
+        assert_eq!(placement.desired_copies, 1);
+        assert_eq!(placement.health, PlacementHealth::Satisfied);
+        assert_eq!(placement.copies.len(), 1);
+        let copy = service.copy(&placement.copies[0]).await.unwrap();
+        assert_eq!(copy.role, CopyRole::ExternalCommitted);
+        assert!(matches!(copy.location, CopyLocation::External { .. }));
+        assert!(
+            store
+                .read(MetaRead::DfsReplicationTasks)
+                .await
+                .unwrap()
+                .entities
+                .is_empty()
+        );
+        assert!(
+            service
+                .claim_replication_task(ClaimReplicationTask {
+                    caller_id: "writer".into(),
+                    caller_session_id: "writer-session".into(),
+                    caller_node_epoch: 1,
+                    operation_id: OperationId::new("no-repair"),
+                    lease_seconds: 30,
+                })
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }

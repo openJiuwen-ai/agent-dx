@@ -377,3 +377,53 @@ fn ownerfs_workspace_bind_rejects_simultaneous_native_workspace_mode() {
         .is_err()
     );
 }
+
+#[cfg(feature = "dfs")]
+fn external_config(extra: &str) -> afs_error::Result<Config> {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("s3.toml");
+    std::fs::write(&path, format!("fs='dfs'\n{extra}\n[dfs_external_backend]\nstore_id='test-fs'\ngeneration='generation-1'\nendpoint='http://127.0.0.1:8333'\nbucket='afs-test'\nregion='us-east-1'\nallow_http=true\n")).unwrap();
+    Config::resolve(
+        Role::Node,
+        Cli::parse_from(["afs-node", "--config", path.to_str().unwrap()]),
+    )
+}
+
+#[test]
+#[cfg(feature = "dfs")]
+fn external_backend_is_explicit_and_fixed_single_copy() {
+    let config = external_config("").unwrap();
+    let external = config.dfs_external_backend.as_ref().unwrap();
+    assert_eq!(external.store_id, "test-fs");
+    assert_eq!(config.dfs_desired_copies, 1);
+    for counts in [
+        "dfs_desired_copies=3",
+        "dfs_local_copy='none'",
+        "dfs_desired_copies=2\ndfs_sync_required_copies=2",
+    ] {
+        assert!(external_config(counts).is_err(), "must reject {counts}");
+    }
+    let ordinary =
+        Config::resolve(Role::Node, Cli::parse_from(["afs-node", "--fs", "dfs"])).unwrap();
+    assert!(ordinary.dfs_external_backend.is_none());
+}
+
+#[test]
+#[cfg(feature = "dfs")]
+fn external_backend_validates_identity_transport_and_credentials_without_exposing_secrets() {
+    let mut config = external_config("").unwrap();
+    let external = config.dfs_external_backend.as_mut().unwrap();
+    external.generation = "../escape".into();
+    assert!(external.validate().is_err());
+    external.generation = "generation-1".into();
+    external.allow_http = false;
+    assert!(external.validate().is_err());
+    external.allow_http = true;
+    external.credentials_file = Some("relative.json".into());
+    assert!(external.validate().is_err());
+    assert!(
+        !serde_json::to_string(&config)
+            .unwrap()
+            .contains("secret_access_key")
+    );
+}

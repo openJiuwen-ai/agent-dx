@@ -1504,6 +1504,7 @@ fn dfs_commit_keeps_file_layout_and_durable_chunk_receipt_explicit() {
             }],
         }),
         chunk_receipts: vec![DfsChunkReceipt {
+            external_commit: None,
             operation_id: "session-a-write-1".into(),
             chunk_id: "digest-5".into(),
             chunk_length: 5,
@@ -2395,6 +2396,7 @@ async fn lost_result_commit_request(
             }],
         }),
         chunk_receipts: vec![DfsChunkReceipt {
+            external_commit: None,
             operation_id: "commit-lost-result".into(),
             chunk_id: "chunk-lost-result".into(),
             chunk_length: 4096,
@@ -2896,6 +2898,7 @@ async fn dfs_commit_accepts_durable_ack_after_unrelated_catalog_advance() {
                 }],
             }),
             chunk_receipts: vec![DfsChunkReceipt {
+                external_commit: None,
                 operation_id: "commit-old-ack".into(),
                 chunk_id: "chunk-old-ack".into(),
                 chunk_length: 4096,

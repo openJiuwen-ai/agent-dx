@@ -79,3 +79,30 @@ python3 build/ci/run.py afs
 
 历史来源不自动构成当前候选版本的运行结论。所有功能、性能和交付状态必须以
 当前 Agent DX 源码、二进制和对应 Linux 证据登记。
+
+## DFS 外部 S3 后端（实验接入）
+
+在 Meta 和所有 DFS Node 的 TOML 中显式配置相同的
+`[dfs_external_backend]`，即可选择独立的外部对象持久化路径。该策略只允许
+新文件系统初始化；已有 Node 复制文件系统不能通过改配置原地切换。store_id
+和 generation 持久写入 Meta，重启不能改变。未配置时沿用原 Node 复制路径。
+
+外部模式固定单副本配置，禁用 Node 复制及复制修复。普通 write 进入 dirty
+状态，fsync/fdatasync 等提交屏障先等待所有普通 S3 PUT 完成，再通过原 Meta
+事务发布 FileVersion、布局和对象引用。上传失败不能发布新版本；Meta 确认
+未知时保留原请求做幂等恢复，不删除可能已上传的对象。本地 chunk/catalog
+不作为该模式的耐久副本，数据可靠性取决于管理员提供的 S3 持久性合同；
+AFS Meta 的持久性仍需独立保证。
+
+每个不超过 4MiB 的不可变 chunk 对应一个原始字节对象，key 为
+`afs/v1/<store_id>/<generation>/chunks/<摘要前两位>/<ChunkId>`。
+读 Node 先取得 Meta 的独立外部读授权，再完整 GET 并验证长度和 BLAKE3，
+最后返回授权范围；不依赖写 Node 在线，不回退到 Peer。普通路径不增加
+HEAD、条件 PUT/GET 或版本 ID。当前内容 cache OFF，writeback OFF；
+有界异步磁盘 cache ON 尚未实现，不将上传成功等同于本地 cache 完成。
+S3 容量查询暂不支持，statfs 明确返回不支持，不能用 Node 空间冒充后端容量。
+删除不立即删除 S3 对象；复杂对象回收后置。
+
+SeaweedFS 等 S3 服务是外部运行依赖，其部署脚本、数据库和测试凭据不进入
+产品仓。连接方式见[部署配置](../docs/deployment/afs.md#dfs-外部-s3-连接)，
+验证边界见[验收说明](../docs/testing/afs.md#dfs-外部-s3-闭环)。

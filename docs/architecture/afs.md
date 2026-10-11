@@ -36,6 +36,19 @@ Node 的 Meta、peer control 和 data 诊断请求复用生产 TLS 配置，诊�
 这里的 Node ID 绑定发生在服务端对调用方的校验中；客户端仍按 CA 和
 `tls_server_name` 验证服务端，不承诺按目标 Node ID 对服务端证书逐一 pinning。
 
+## DFS 外部对象持久化边界
+
+可选外部后端配置把新文件系统固定为单副本策略：本地暂存不是耐久副本，
+不运行 Node 复制／修复。Node 用官方 S3 客户端执行普通 PUT，成功后返回
+绑定 store/generation/key、完整长度和摘要的有类型凭据。Meta 在原版本提交
+事务中发布外部对象引用和 inode head；旧 Node 复制凭据与外部凭据不能混用。
+
+B 使用单独的外部读授权 RPC，校验 reader epoch、MAC、版本／布局、对象身份、
+范围和期限后 GET；每块完整校验，在最终返回前再次检查期限。该路径不伪装
+Peer 接收者，也不依赖原 writer session。当前内容 cache OFF；有界异步 cache
+ON 后续实现。对象存储部署与服务端持久性属于外部依赖，Meta 状态持久化
+仍由 AFS 配置的 Meta 后端承担。详见[配置](../deployment/afs.md#dfs-外部-s3-连接)。
+
 ## OwnerFs workspace bind mount
 
 OwnerFs workspace bind mount 是当前实际试用场景的优先能力，默认 OFF。开启后，它把 Home 上 workspace 的底层真实目录 bind 到 OwnerFs FUSE 根目录下对应的一级目录，例如 `/mnt/afs/ownerfs/agent1`。把 FUSE 目录自身 bind 到别处不满足此设计。

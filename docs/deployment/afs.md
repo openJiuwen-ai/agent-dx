@@ -78,3 +78,39 @@ path、mount ID 和 source 同时作为 readiness 身份；挂载被替换时健
 启动前一次性检查二进制身份、配置 SHA、端口、TLS、数据目录、运行目录、日志目录、挂载目录、FUSE 设备、`fusermount3`/`umount`、旧 PID、旧 UDS、旧挂载和磁盘余量。遇到环境阻塞时保存证据并停止受影响项，不把环境修补混入产品结论。
 
 正常停止应记录进程退出状态，确认 FUSE mount 和 bind mount 已卸载，UDS/PID/临时 claim 无遗留。`local-file` Meta 的恢复检查至少要覆盖写入、sync/close、正常停止、重启、重新打开和内容校验；这不等于 crash recovery、HA、多 Meta 或复杂可靠性通过。
+
+## DFS 外部 S3 连接
+
+这是实验接入，先验证小规模发布／回源闭环，尚不承诺性能或完整故障验收。
+在新 Meta 和参与的 Node 中添加相同的身份与后端连接配置；Node 另需凭据。
+保留默认 DFS 单副本计数，任何外部后端与多 Node 副本的组合均在启动前拒绝。
+
+```toml
+[dfs_external_backend]
+store_id = "filesystem-a"
+generation = "generation-1"
+endpoint = "https://s3.example.com"
+bucket = "afs-chunks"
+region = "us-east-1"
+allow_http = false
+# Node-only; omit on Meta. Must be absolute, owned by the Node process UID,
+# regular file without symlink, and mode 0600 or stricter.
+credentials_file = "/opt/adx/config/afs/s3-credentials.json"
+```
+
+凭据 JSON 包含 `access_key_id`、`secret_access_key` 和可选 `session_token`。
+不在示例中提供真实凭据，不把秘密直接放 TOML 或命令行。未指定文件的 Node
+显式读取 `AWS_ACCESS_KEY_ID`、`AWS_SECRET_ACCESS_KEY` 和可选
+`AWS_SESSION_TOKEN`；缺失凭据启动失败。`--print-config` 只显示文件路径。
+默认 HTTPS；`allow_http=true` 仅供隔离测试端点。外部服务的认证、bucket
+权限、数据同步落盘及数据库持久配置由管理员在服务端保证；HTTP 成功本身
+不能证明物理持久性。产品包不部署或打包 SeaweedFS、PostgreSQL 或 JuiceFS。
+
+Meta 的 `meta_store` 是另一项独立配置：程序默认 etcd，现有试用示例明确选择
+local-file。本接入不增加 PostgreSQL Meta，也不改变原默认或后端选择。
+对象 key 身份不允许变更后重新使用同一 Meta 数据目录；配置错误及 GET/PUT
+错误向调用方传播。正常停机仍需先排空工作负载和 FUSE 引用。
+
+外部模式的当前恢复范围是读取已经发布的版本；写节点重启后重新取得写权
+另行验收。旧写租约有效时，新会话立即复写原文件可能返回 EBUSY，不能将
+“退出后可回源读取”理解为“新会话立即恢复写入”。

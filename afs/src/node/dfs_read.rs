@@ -1,9 +1,10 @@
 //! DFS fixed-version Chunk read path.
 //!
 //! DistributedFs resolves a file range into immutable Chunk ranges, then this
-//! module chooses local or peer sources. Local reads use verified pinned
-//! readers. Peer reads land in a scratch buffer first and publish into the
-//! caller buffer only after the whole requested range succeeds.
+//! module chooses local or peer sources, or an explicitly configured external
+//! backend. All paths publish into the caller buffer only after the whole
+//! requested batch succeeds. External reads authorize every batch and verify
+//! complete immutable chunks, without a local content cache.
 
 use std::{
     collections::{BTreeSet, HashMap},
@@ -15,8 +16,9 @@ use afs_error::{Error, Result};
 
 use crate::{
     dfs::{
-        ChunkId, ChunkSources, CopyLocation, CopyRole, DfsChunkSourcesReply,
-        DfsChunkSourcesRequest, FileVersionId, LayoutRootId, SourceCandidate,
+        ChunkId, ChunkObject, ChunkSources, CopyLocation, CopyRole, DfsChunkSourcesReply,
+        DfsChunkSourcesRequest, DfsExternalAuthorizedRead, DfsReadValidation, FileVersionId,
+        LayoutRootId, SourceCandidate,
     },
     node::chunk::{LocalChunkStore, PinnedChunkReader, VerifiedRangeCopy},
 };
@@ -24,6 +26,9 @@ use crate::{
 /// Hard protocol budgets shared by the scheduler, peer adapter and service.
 pub const MAX_DFS_READ_OPS: usize = 128;
 pub const MAX_DFS_READ_BYTES: u64 = 8 * 1024 * 1024;
+/// External objects are fetched and verified one at a time, independently of
+/// the requested range budget. This matches the producer's staged chunk limit.
+pub const MAX_DFS_EXTERNAL_CHUNK_BYTES: u64 = crate::node::chunk::MAX_STAGED_CHUNK_BYTES as u64;
 
 #[derive(Clone, Debug)]
 pub struct DfsReadConfig {
@@ -136,6 +141,29 @@ pub trait ReadSourceProvider: Send + Sync {
     fn sources_for(&self, request: DfsChunkSourcesRequest) -> Result<DfsChunkSourcesReply>;
 }
 
+/// Revalidates committed external copy identity and allowed ranges on every
+/// read batch. A source-cache hit is never an authorization-cache hit.
+pub trait ExternalReadAuthorizer: Send + Sync {
+    fn validate_external_read_grants(
+        &self,
+        caller_id: &str,
+        validations: Vec<DfsReadValidation>,
+    ) -> Result<Vec<DfsExternalAuthorizedRead>>;
+}
+
+/// Fetch one complete immutable external chunk. Implementations must bound
+/// response allocation by the supplied chunk length and reject another store,
+/// key or generation. The engine independently checks length and BLAKE3 before
+/// making any requested range visible. This interface does not fill local cache.
+pub trait ExternalChunkReader: Send + Sync {
+    fn read_chunk(&self, chunk: &ChunkObject, source: &SourceCandidate) -> Result<Vec<u8>>;
+}
+
+struct ExternalReadBackend {
+    reader: Arc<dyn ExternalChunkReader>,
+    authorizer: Arc<dyn ExternalReadAuthorizer>,
+}
+
 /// Every operation keeps its own physical copy. A batch shares only the peer
 /// connection and the same version and authenticated caller context; each copy retains its grant.
 #[derive(Clone, Debug)]
@@ -221,6 +249,7 @@ pub struct DfsReadEngine {
     source_provider: Arc<dyn ReadSourceProvider>,
     transfer: Arc<dyn ChunkTransfer>,
     config: DfsReadConfig,
+    external_backend: Option<ExternalReadBackend>,
     readers: Mutex<HashMap<ChunkId, Arc<PinnedChunkReader>>>,
     source_cache: Mutex<HashMap<SourceCacheKey, CachedSources>>,
 }
@@ -247,9 +276,21 @@ impl DfsReadEngine {
             source_provider,
             transfer,
             config,
+            external_backend: None,
             readers: Mutex::new(HashMap::new()),
             source_cache: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Select external-backend-only reads. Healthy local chunks and peer
+    /// candidates are deliberately bypassed; errors never fall back to them.
+    pub fn with_external_backend(
+        mut self,
+        reader: Arc<dyn ExternalChunkReader>,
+        authorizer: Arc<dyn ExternalReadAuthorizer>,
+    ) -> Self {
+        self.external_backend = Some(ExternalReadBackend { reader, authorizer });
+        self
     }
 
     pub fn read_batch(&self, batch: &ReadBatch, out: &mut [u8]) -> Result<()> {
@@ -264,7 +305,19 @@ impl DfsReadEngine {
             length += op.length as usize;
         }
         let mut staged = vec![0; length];
-        self.read_batch_into(&staged_batch, &mut staged)?;
+        let expires_at = if let Some(backend) = &self.external_backend {
+            self.read_external_batch(backend, &staged_batch, &mut staged)?
+        } else {
+            self.read_batch_into(&staged_batch, &mut staged)?;
+            None
+        };
+        // Full-object fetches may outlive the authorization that allowed them.
+        // Check again at the publication boundary, including cached sources.
+        if expires_at.is_some_and(|deadline| deadline <= now_unix_ms()) {
+            return Err(external_denied(
+                "external read authority expired before publication",
+            ));
+        }
         for (original, packed) in batch.ops.iter().zip(&staged_batch.ops) {
             if original.length == 0 {
                 continue;
@@ -274,6 +327,135 @@ impl DfsReadEngine {
                 .copy_from_slice(&staged[packed.output_offset..packed.output_offset + length]);
         }
         Ok(())
+    }
+
+    fn read_external_batch(
+        &self,
+        backend: &ExternalReadBackend,
+        batch: &ReadBatch,
+        out: &mut [u8],
+    ) -> Result<Option<u64>> {
+        let batch = ReadBatch {
+            file_version_id: batch.file_version_id.clone(),
+            layout_root_id: batch.layout_root_id.clone(),
+            ops: batch
+                .ops
+                .iter()
+                .filter(|op| op.length != 0)
+                .cloned()
+                .collect(),
+        };
+        // Holes and EOF do not require fetching or authorizing a chunk.
+        if batch.ops.is_empty() {
+            return Ok(None);
+        }
+        let sources = self.sources_for(&batch)?;
+        let mut selected = Vec::with_capacity(batch.ops.len());
+        let mut validations = Vec::with_capacity(batch.ops.len());
+        for op in &batch.ops {
+            let set = sources
+                .iter()
+                .find(|set| set.chunk_id == op.chunk_id)
+                .ok_or_else(|| unavailable("external source lookup omitted a requested Chunk"))?;
+            let chunk = set
+                .chunk
+                .as_ref()
+                .ok_or_else(|| invalid("external source has no trusted Chunk identity"))?;
+            if chunk.id != op.chunk_id
+                || chunk.length > MAX_DFS_EXTERNAL_CHUNK_BYTES
+                || op
+                    .chunk_offset
+                    .checked_add(op.length)
+                    .is_none_or(|end| end > chunk.length)
+            {
+                return Err(invalid(
+                    "external Chunk identity, size or requested range is invalid",
+                ));
+            }
+            let source = set
+                .sources
+                .iter()
+                .find(|source| {
+                    source.role == CopyRole::ExternalCommitted
+                        && source.state.is_readable()
+                        && source.data_endpoint.is_none()
+                        && matches!(source.location, CopyLocation::External { .. })
+                })
+                .ok_or_else(|| unavailable("committed Chunk has no readable external copy"))?;
+            validations.push(DfsReadValidation {
+                grant: source.read_grant.clone(),
+                chunk_id: op.chunk_id.clone(),
+                copy_id: source.copy_id.clone(),
+                chunk_offset: op.chunk_offset,
+                length: op.length,
+            });
+            selected.push((chunk, source));
+        }
+        let authorized = backend
+            .authorizer
+            .validate_external_read_grants(&self.local_node_id, validations.clone())?;
+        if authorized.len() != validations.len() {
+            return Err(external_denied(
+                "external read authorization reply is incomplete",
+            ));
+        }
+        let now = now_unix_ms();
+        let mut expires_at = u64::MAX;
+        for ((entry, validation), (chunk, source)) in
+            authorized.iter().zip(&validations).zip(&selected)
+        {
+            let authorization = &entry.authorized;
+            let covered = authorization.allowed_ranges.iter().any(|(start, length)| {
+                validation.chunk_offset >= *start
+                    && start.checked_add(*length).is_some_and(|end| {
+                        validation
+                            .chunk_offset
+                            .checked_add(validation.length)
+                            .is_some_and(|requested_end| requested_end <= end)
+                    })
+            });
+            if authorization.validation != *validation
+                || authorization.expires_at_unix_ms <= now
+                || authorization.expires_at_unix_ms > validation.grant.expires_at_unix_ms
+                || authorization.allowed_ranges.len() > MAX_DFS_READ_OPS
+                || !covered
+                || entry.chunk != **chunk
+                || entry.location != source.location
+            {
+                return Err(external_denied(
+                    "external read authorization changed identity, range or expiry",
+                ));
+            }
+            expires_at = expires_at.min(authorization.expires_at_unix_ms);
+        }
+        // Retain at most one full object plus the requested-byte staging buffer.
+        // Several ranges of one chunk share this fetch and full-content digest.
+        let mut fetched = BTreeSet::new();
+        for (chunk, source) in &selected {
+            if !fetched.insert(chunk.id.clone()) {
+                continue;
+            }
+            if expires_at <= now_unix_ms() {
+                return Err(external_denied(
+                    "external read authority expired before the next fetch",
+                ));
+            }
+            let bytes = backend.reader.read_chunk(chunk, source)?;
+            if bytes.len() as u64 != chunk.length
+                || blake3::hash(&bytes).as_bytes() != &chunk.content_digest.bytes
+            {
+                return Err(corrupt("external Chunk length or content digest mismatch"));
+            }
+            for op in batch.ops.iter().filter(|op| op.chunk_id == chunk.id) {
+                let start = usize::try_from(op.chunk_offset)
+                    .map_err(|_| invalid("external Chunk offset is too large"))?;
+                let length = usize::try_from(op.length)
+                    .map_err(|_| invalid("external Chunk range is too large"))?;
+                out[op.output_offset..op.output_offset + length]
+                    .copy_from_slice(&bytes[start..start + length]);
+            }
+        }
+        Ok(Some(expires_at))
     }
 
     fn read_batch_into(&self, batch: &ReadBatch, out: &mut [u8]) -> Result<()> {
@@ -647,6 +829,10 @@ fn unavailable(message: impl Into<String>) -> Error {
     Error::coded(afs_error::NODE_TRANSFER_UNAVAILABLE, message)
 }
 
+fn external_denied(message: impl Into<String>) -> Error {
+    Error::coded(afs_error::IO_PERMISSION_DENIED, message)
+}
+
 fn corrupt(message: impl Into<String>) -> Error {
     Error::coded(afs_error::NODE_TRANSFER_CORRUPT_DATA, message)
 }
@@ -864,6 +1050,7 @@ mod tests {
         let sources = Arc::new(StaticSources::new(DfsChunkSourcesReply {
             revision: 1,
             chunks: vec![ChunkSources {
+                chunk: None,
                 chunk_id: chunk_id.clone(),
                 sources: vec![source("remote-short", &chunk_id, "node-b")],
             }],
@@ -990,6 +1177,7 @@ mod tests {
         let sources = Arc::new(StaticSources::new(DfsChunkSourcesReply {
             revision: 1,
             chunks: vec![ChunkSources {
+                chunk: None,
                 chunk_id: chunk_id.clone(),
                 sources: vec![source("healthy-b", &chunk_id, "node-b")],
             }],
@@ -1060,6 +1248,7 @@ mod tests {
         let sources = Arc::new(StaticSources::new(DfsChunkSourcesReply {
             revision: 1,
             chunks: vec![ChunkSources {
+                chunk: None,
                 chunk_id: chunk_id.clone(),
                 sources: Vec::new(),
             }],
@@ -1099,6 +1288,7 @@ mod tests {
         let sources = Arc::new(StaticSources::new(DfsChunkSourcesReply {
             revision: 1,
             chunks: vec![ChunkSources {
+                chunk: None,
                 chunk_id: chunk_id.clone(),
                 sources: vec![
                     source("copy-b", &chunk_id, "node-b"),
@@ -1164,10 +1354,12 @@ mod tests {
             revision: 1,
             chunks: vec![
                 ChunkSources {
+                    chunk: None,
                     chunk_id: chunks[0].clone(),
                     sources: vec![source("a-copy", &chunks[0], "node-b")],
                 },
                 ChunkSources {
+                    chunk: None,
                     chunk_id: chunks[1].clone(),
                     sources: vec![second],
                 },
@@ -1215,6 +1407,7 @@ mod tests {
         let sources = Arc::new(StaticSources::new(DfsChunkSourcesReply {
             revision: 1,
             chunks: vec![ChunkSources {
+                chunk: None,
                 chunk_id: chunk.clone(),
                 sources: vec![source("a-copy", &chunk, "node-b")],
             }],
@@ -1291,10 +1484,12 @@ mod tests {
                 revision: 1,
                 chunks: vec![
                     ChunkSources {
+                        chunk: None,
                         chunk_id: a.clone(),
                         sources: vec![source("a-only", &a, "node-x")],
                     },
                     ChunkSources {
+                        chunk: None,
                         chunk_id: b.clone(),
                         sources: vec![
                             source("b-stale", &b, "node-x"),
@@ -1395,5 +1590,451 @@ mod tests {
             };
             assert!(empty.validate_for_output(0, &config).is_err());
         }
+    }
+
+    #[derive(Clone, Copy)]
+    enum ExternalAuthorityFault {
+        Chunk,
+        Location,
+        Validation,
+        Range,
+        MissingReply,
+    }
+
+    struct ExternalFixture {
+        chunk: crate::dfs::ChunkObject,
+        candidate: SourceCandidate,
+        bytes: Mutex<Vec<u8>>,
+        authorizations: Mutex<u64>,
+        fetches: Mutex<u64>,
+        denial: Mutex<bool>,
+        expires_at: Mutex<u64>,
+        expires_after: Option<Duration>,
+        authority_fault: Option<ExternalAuthorityFault>,
+        delay: Duration,
+    }
+
+    impl ExternalFixture {
+        fn new(bytes: &[u8]) -> Self {
+            let staged = crate::node::chunk::StagedChunk::new(
+                OperationId::new("external-fixture"),
+                bytes.to_vec(),
+            );
+            let mut candidate = source("external-copy", &staged.chunk.id, "node-b");
+            candidate.role = CopyRole::ExternalCommitted;
+            candidate.data_endpoint = None;
+            candidate.location = CopyLocation::External {
+                store_id: "store".into(),
+                object_key: "generation/chunk".into(),
+                object_revision: "immutable-v1".into(),
+            };
+            Self {
+                chunk: staged.chunk,
+                candidate,
+                bytes: Mutex::new(bytes.to_vec()),
+                authorizations: Mutex::new(0),
+                fetches: Mutex::new(0),
+                denial: Mutex::new(false),
+                expires_at: Mutex::new(u64::MAX),
+                expires_after: None,
+                authority_fault: None,
+                delay: Duration::ZERO,
+            }
+        }
+
+        fn sources(&self) -> Arc<StaticSources> {
+            Arc::new(StaticSources::new(DfsChunkSourcesReply {
+                revision: 1,
+                chunks: vec![ChunkSources {
+                    chunk: Some(self.chunk.clone()),
+                    chunk_id: self.chunk.id.clone(),
+                    sources: vec![self.candidate.clone()],
+                }],
+            }))
+        }
+
+        fn batch(&self) -> ReadBatch {
+            ReadBatch {
+                file_version_id: Some(FileVersionId::new("version")),
+                layout_root_id: LayoutRootId::new("layout"),
+                ops: vec![ChunkReadOp {
+                    chunk_id: self.chunk.id.clone(),
+                    chunk_offset: 1,
+                    length: 2,
+                    output_offset: 0,
+                }],
+            }
+        }
+
+        fn engine(
+            self: &Arc<Self>,
+            local: Arc<LocalChunkStore>,
+            sources: Arc<StaticSources>,
+        ) -> DfsReadEngine {
+            DfsReadEngine::new(
+                crate::dfs::NamespaceId::new("default"),
+                "node-a".into(),
+                local,
+                sources,
+                Arc::new(UnimplementedChunkTransfer),
+                DfsReadConfig {
+                    source_cache_ttl: Duration::from_secs(60),
+                    ..DfsReadConfig::default()
+                },
+            )
+            .with_external_backend(self.clone(), self.clone())
+        }
+    }
+
+    impl ExternalReadAuthorizer for ExternalFixture {
+        fn validate_external_read_grants(
+            &self,
+            caller_id: &str,
+            validations: Vec<crate::dfs::DfsReadValidation>,
+        ) -> Result<Vec<crate::dfs::DfsExternalAuthorizedRead>> {
+            assert_eq!(caller_id, "node-a");
+            *self.authorizations.lock().unwrap() += 1;
+            if *self.denial.lock().unwrap() {
+                return Err(unavailable("external authorization denied"));
+            }
+            if matches!(
+                self.authority_fault,
+                Some(ExternalAuthorityFault::MissingReply)
+            ) {
+                return Ok(Vec::new());
+            }
+            let expires_at = self.expires_after.map_or_else(
+                || *self.expires_at.lock().unwrap(),
+                |duration| now_unix_ms() + duration.as_millis() as u64,
+            );
+            Ok(validations
+                .into_iter()
+                .map(|validation| {
+                    let mut entry = crate::dfs::DfsExternalAuthorizedRead {
+                        authorized: crate::dfs::DfsAuthorizedRead {
+                            validation,
+                            allowed_ranges: vec![(0, self.chunk.length)],
+                            expires_at_unix_ms: expires_at,
+                        },
+                        chunk: self.chunk.clone(),
+                        location: self.candidate.location.clone(),
+                    };
+                    match self.authority_fault {
+                        Some(ExternalAuthorityFault::Chunk) => {
+                            entry.chunk.content_digest.bytes[0] ^= 1
+                        }
+                        Some(ExternalAuthorityFault::Location) => {
+                            entry.location = CopyLocation::External {
+                                store_id: "another-store".into(),
+                                object_key: "generation/chunk".into(),
+                                object_revision: "immutable-v1".into(),
+                            }
+                        }
+                        Some(ExternalAuthorityFault::Validation) => {
+                            entry.authorized.validation.copy_id = CopyId::new("another-copy")
+                        }
+                        Some(ExternalAuthorityFault::Range) => {
+                            entry.authorized.allowed_ranges = vec![(0, 1)]
+                        }
+                        _ => {}
+                    }
+                    entry
+                })
+                .collect())
+        }
+    }
+
+    impl ExternalChunkReader for ExternalFixture {
+        fn read_chunk(
+            &self,
+            chunk: &crate::dfs::ChunkObject,
+            source: &SourceCandidate,
+        ) -> Result<Vec<u8>> {
+            assert_eq!(chunk, &self.chunk);
+            assert_eq!(source.location, self.candidate.location);
+            *self.fetches.lock().unwrap() += 1;
+            std::thread::sleep(self.delay);
+            Ok(self.bytes.lock().unwrap().clone())
+        }
+    }
+
+    #[test]
+    fn external_backend_bypasses_healthy_local_and_reauthorizes_cached_sources() {
+        let temp = tempfile::tempdir().unwrap();
+        let local = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
+        put_local_chunk(&local, "healthy-local", b"abcdef");
+        let fixture = Arc::new(ExternalFixture::new(b"abcdef"));
+        let sources = fixture.sources();
+        let engine = fixture.engine(local, sources.clone());
+        let mut batch = fixture.batch();
+        batch.ops.push(ChunkReadOp {
+            chunk_id: fixture.chunk.id.clone(),
+            chunk_offset: 3,
+            length: 2,
+            output_offset: 1,
+        });
+        let mut out = [b'!'; 4];
+        engine.read_batch(&batch, &mut out).unwrap();
+        assert_eq!(&out, b"bde!");
+        assert_eq!(*fixture.fetches.lock().unwrap(), 1, "one fetch per chunk");
+        // Sources remain cached; content is deliberately not cached in S1.
+        *fixture.denial.lock().unwrap() = true;
+        out.fill(b'!');
+        assert!(engine.read_batch(&batch, &mut out).is_err());
+        assert_eq!(&out, b"!!!!");
+        assert_eq!(*sources.calls.lock().unwrap(), 1);
+        assert_eq!(*fixture.authorizations.lock().unwrap(), 2);
+        assert_eq!(*fixture.fetches.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn external_backend_verifies_full_chunk_before_publishing_any_range() {
+        for bytes in [b"abcde!".to_vec(), b"abc".to_vec(), b"abcdef!".to_vec()] {
+            let temp = tempfile::tempdir().unwrap();
+            let fixture = Arc::new(ExternalFixture::new(b"abcdef"));
+            *fixture.bytes.lock().unwrap() = bytes;
+            let engine = fixture.engine(
+                Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap()),
+                fixture.sources(),
+            );
+            let mut out = [b'!'; 2];
+            let error = engine.read_batch(&fixture.batch(), &mut out).unwrap_err();
+            assert_eq!(error.code(), afs_error::NODE_TRANSFER_CORRUPT_DATA);
+            assert_eq!(&out, b"!!");
+        }
+    }
+
+    #[test]
+    fn external_backend_refuses_invalid_authority_before_fetch() {
+        for failure in 0..4 {
+            let temp = tempfile::tempdir().unwrap();
+            let mut fixture = ExternalFixture::new(b"abcdef");
+            match failure {
+                0 => *fixture.expires_at.lock().unwrap() = 1,
+                1 => fixture.chunk.length = MAX_DFS_EXTERNAL_CHUNK_BYTES + 1,
+                2 => fixture.chunk.id = ChunkId::new("unexpected-chunk"),
+                _ => {
+                    fixture.candidate.location = CopyLocation::Node {
+                        node_id: "node-b".into(),
+                        node_epoch: 1,
+                        device_id: "local-0".into(),
+                        device_epoch: 1,
+                        catalog_revision: 1,
+                    }
+                }
+            }
+            let fixture = Arc::new(fixture);
+            let mut batch = fixture.batch();
+            batch.ops[0].chunk_id = fixture.candidate.chunk_id.clone();
+            let sources = fixture.sources();
+            sources.reply.lock().unwrap().chunks[0].chunk_id = fixture.candidate.chunk_id.clone();
+            let engine = fixture.engine(
+                Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap()),
+                sources,
+            );
+            let mut out = [b'!'; 2];
+            assert!(engine.read_batch(&batch, &mut out).is_err());
+            assert_eq!(&out, b"!!");
+            assert_eq!(*fixture.fetches.lock().unwrap(), 0);
+        }
+    }
+
+    #[test]
+    fn external_backend_rechecks_authority_after_fetch() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut fixture = ExternalFixture::new(b"abcdef");
+        fixture.delay = Duration::from_millis(150);
+        fixture.expires_after = Some(Duration::from_millis(100));
+        let fixture = Arc::new(fixture);
+        let engine = fixture.engine(
+            Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap()),
+            fixture.sources(),
+        );
+        let mut out = [b'!'; 2];
+        assert!(engine.read_batch(&fixture.batch(), &mut out).is_err());
+        assert_eq!(&out, b"!!");
+        assert_eq!(*fixture.fetches.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn external_backend_rejects_changed_authorization_identity_and_range() {
+        for fault in [
+            ExternalAuthorityFault::Chunk,
+            ExternalAuthorityFault::Location,
+            ExternalAuthorityFault::Validation,
+            ExternalAuthorityFault::Range,
+            ExternalAuthorityFault::MissingReply,
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let mut fixture = ExternalFixture::new(b"abcdef");
+            fixture.authority_fault = Some(fault);
+            let fixture = Arc::new(fixture);
+            let engine = fixture.engine(
+                Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap()),
+                fixture.sources(),
+            );
+            let mut out = [b'!'; 2];
+            assert!(engine.read_batch(&fixture.batch(), &mut out).is_err());
+            assert_eq!(&out, b"!!");
+            assert_eq!(*fixture.fetches.lock().unwrap(), 0);
+        }
+    }
+
+    struct ExternalChunks(Vec<Arc<ExternalFixture>>);
+
+    impl ExternalReadAuthorizer for ExternalChunks {
+        fn validate_external_read_grants(
+            &self,
+            caller_id: &str,
+            validations: Vec<DfsReadValidation>,
+        ) -> Result<Vec<DfsExternalAuthorizedRead>> {
+            let mut replies = Vec::new();
+            for validation in validations {
+                let fixture = self
+                    .0
+                    .iter()
+                    .find(|fixture| fixture.chunk.id == validation.chunk_id)
+                    .unwrap();
+                replies.extend(fixture.validate_external_read_grants(caller_id, vec![validation])?);
+            }
+            Ok(replies)
+        }
+    }
+
+    impl ExternalChunkReader for ExternalChunks {
+        fn read_chunk(&self, chunk: &ChunkObject, source: &SourceCandidate) -> Result<Vec<u8>> {
+            self.0
+                .iter()
+                .find(|fixture| fixture.chunk.id == chunk.id)
+                .unwrap()
+                .read_chunk(chunk, source)
+        }
+    }
+
+    #[test]
+    fn external_backend_late_chunk_failure_never_publishes_earlier_success() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = Arc::new(ExternalFixture::new(b"abcdef"));
+        let second = Arc::new(ExternalFixture::new(b"uvwxyz"));
+        second.bytes.lock().unwrap()[5] ^= 1;
+        let chunks = Arc::new(ExternalChunks(vec![first.clone(), second.clone()]));
+        let sources = Arc::new(StaticSources::new(DfsChunkSourcesReply {
+            revision: 1,
+            chunks: [&first, &second]
+                .iter()
+                .map(|fixture| ChunkSources {
+                    chunk_id: fixture.chunk.id.clone(),
+                    chunk: Some(fixture.chunk.clone()),
+                    sources: vec![fixture.candidate.clone()],
+                })
+                .collect(),
+        }));
+        let engine = DfsReadEngine::new(
+            crate::dfs::NamespaceId::new("default"),
+            "node-a".into(),
+            Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap()),
+            sources,
+            Arc::new(UnimplementedChunkTransfer),
+            DfsReadConfig::default(),
+        )
+        .with_external_backend(chunks.clone(), chunks);
+        let mut batch = first.batch();
+        let mut last_op = second.batch().ops.remove(0);
+        last_op.output_offset = 2;
+        batch.ops.push(last_op);
+        let mut out = [b'!'; 4];
+        assert!(engine.read_batch(&batch, &mut out).is_err());
+        assert_eq!(&out, b"!!!!");
+        assert_eq!(*first.fetches.lock().unwrap(), 1);
+        assert_eq!(*second.fetches.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn external_backend_does_not_start_another_get_after_authority_expires() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut first = ExternalFixture::new(b"abcdef");
+        first.delay = Duration::from_millis(150);
+        first.expires_after = Some(Duration::from_millis(100));
+        let first = Arc::new(first);
+        let second = Arc::new(ExternalFixture::new(b"uvwxyz"));
+        let chunks = Arc::new(ExternalChunks(vec![first.clone(), second.clone()]));
+        let sources = Arc::new(StaticSources::new(DfsChunkSourcesReply {
+            revision: 1,
+            chunks: [&first, &second]
+                .iter()
+                .map(|fixture| ChunkSources {
+                    chunk_id: fixture.chunk.id.clone(),
+                    chunk: Some(fixture.chunk.clone()),
+                    sources: vec![fixture.candidate.clone()],
+                })
+                .collect(),
+        }));
+        let engine = DfsReadEngine::new(
+            crate::dfs::NamespaceId::new("default"),
+            "node-a".into(),
+            Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap()),
+            sources,
+            Arc::new(UnimplementedChunkTransfer),
+            DfsReadConfig::default(),
+        )
+        .with_external_backend(chunks.clone(), chunks);
+        let mut batch = first.batch();
+        let mut last_op = second.batch().ops.remove(0);
+        last_op.output_offset = 2;
+        batch.ops.push(last_op);
+        let mut out = [b'!'; 4];
+        assert!(engine.read_batch(&batch, &mut out).is_err());
+        assert_eq!(&out, b"!!!!");
+        assert_eq!(*first.fetches.lock().unwrap(), 1);
+        assert_eq!(*second.fetches.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn external_backend_new_version_requires_its_original_grant() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = Arc::new(ExternalFixture::new(b"abcdef"));
+        let sources = fixture.sources();
+        let engine = fixture.engine(
+            Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap()),
+            sources.clone(),
+        );
+        let mut batch = fixture.batch();
+        let mut out = [b'!'; 2];
+        engine.read_batch(&batch, &mut out).unwrap();
+        batch.file_version_id = Some(FileVersionId::new("next-version"));
+        out.fill(b'!');
+        assert!(engine.read_batch(&batch, &mut out).is_err());
+        assert_eq!(&out, b"!!");
+        sources.reply.lock().unwrap().chunks[0].sources[0]
+            .read_grant
+            .file_version_id = FileVersionId::new("next-version");
+        engine.read_batch(&batch, &mut out).unwrap();
+        assert_eq!(&out, b"bc");
+        assert_eq!(*sources.calls.lock().unwrap(), 3);
+        assert_eq!(*fixture.authorizations.lock().unwrap(), 2);
+        assert_eq!(
+            *fixture.fetches.lock().unwrap(),
+            2,
+            "S1 has no content cache"
+        );
+    }
+
+    #[test]
+    fn external_backend_preserves_holes_without_requesting_a_source() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = Arc::new(ExternalFixture::new(b"abcdef"));
+        let sources = fixture.sources();
+        let engine = fixture.engine(
+            Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap()),
+            sources.clone(),
+        );
+        let mut batch = fixture.batch();
+        batch.ops.clear();
+        let mut out = [0; 4];
+        engine.read_batch(&batch, &mut out).unwrap();
+        assert_eq!(out, [0; 4]);
+        assert_eq!(*sources.calls.lock().unwrap(), 0);
+        assert_eq!(*fixture.authorizations.lock().unwrap(), 0);
+        assert_eq!(*fixture.fetches.lock().unwrap(), 0);
     }
 }

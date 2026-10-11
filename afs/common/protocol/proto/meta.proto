@@ -387,6 +387,7 @@ service DfsMeta {
   rpc ReportChunkCorruption(ReportDfsChunkCorruptionRequest) returns (ReportDfsChunkCorruptionReply);
   rpc GetChunkSources(GetDfsChunkSourcesRequest) returns (GetDfsChunkSourcesReply);
   rpc ValidateReadGrants(ValidateDfsReadGrantsRequest) returns (ValidateDfsReadGrantsReply);
+  rpc ValidateExternalReadGrants(ValidateExternalReadGrantsRequest) returns (ValidateExternalReadGrantsReply);
   rpc SyncInodeMetadata(SyncDfsInodeMetadataRequest) returns (SyncDfsInodeMetadataReply);
   rpc CommitFileVersion(CommitFileVersionRequest) returns (CommitFileVersionReply);
 }
@@ -629,6 +630,14 @@ message DfsFileVersion {
   uint64 created_at_unix_ms = 6;
 }
 
+message DfsExternalCommitReceipt {
+  string store_id = 1;
+  string generation = 2;
+  string object_key = 3;
+  uint64 persisted_bytes = 4;
+  bytes verified_digest = 5;
+  DfsDigestAlgorithm verified_digest_algorithm = 6;
+}
 message DfsChunkReceipt {
   string operation_id = 1;
   string chunk_id = 2;
@@ -640,6 +649,7 @@ message DfsChunkReceipt {
   string replica_group_id = 11;
   repeated DfsReplicaAck durable_acks = 12;
   DfsDigestAlgorithm content_digest_algorithm = 13;
+  DfsExternalCommitReceipt external_commit = 14;
 }
 
 message DfsWriteLease {
@@ -1069,6 +1079,7 @@ message DfsSourceCandidate {
 message DfsChunkSources {
   string chunk_id = 1;
   repeated DfsSourceCandidate sources = 2;
+  DfsChunkObject chunk = 3;
 }
 
 message GetDfsChunkSourcesRequest {
@@ -1136,3 +1147,16 @@ message ValidateDfsReadGrantsRequest {
   repeated DfsReadValidation validations = 4;
 }
 message ValidateDfsReadGrantsReply { repeated DfsAuthorizedRead authorizations = 1; }
+
+message DfsExternalAuthorizedRead {
+  DfsAuthorizedRead authorized = 1;
+  DfsChunkObject chunk = 2;
+  DfsCopyLocation location = 3;
+}
+message ValidateExternalReadGrantsRequest {
+  string caller_id = 1;
+  repeated DfsReadValidation validations = 2;
+}
+message ValidateExternalReadGrantsReply {
+  repeated DfsExternalAuthorizedRead authorizations = 1;
+}

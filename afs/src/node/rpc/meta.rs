@@ -1030,6 +1030,31 @@ impl GrpcDfsMeta {
             .collect()
     }
 
+    pub fn validate_external_read_grants(
+        &self,
+        request: crate::dfs::ValidateExternalReadGrants,
+    ) -> afs_error::Result<Vec<crate::dfs::DfsExternalAuthorizedRead>> {
+        let reply = self
+            .run(
+                self.client().validate_external_read_grants(
+                    afs_protocol::meta::ValidateExternalReadGrantsRequest {
+                        caller_id: request.caller_id,
+                        validations: request
+                            .validations
+                            .into_iter()
+                            .map(wire_read_validation)
+                            .collect(),
+                    },
+                ),
+            )?
+            .into_inner();
+        reply
+            .authorizations
+            .into_iter()
+            .map(domain_external_authorized_read)
+            .collect()
+    }
+
     pub fn validate_replica_write(
         &self,
         request: crate::dfs::ValidateReplicaWriteRequest,
@@ -1219,6 +1244,23 @@ impl crate::node::dfs_read::ReadSourceProvider for GrpcDfsMeta {
                 .map(domain_dfs_chunk_sources)
                 .collect::<afs_error::Result<Vec<_>>>()?,
         })
+    }
+}
+
+#[cfg(feature = "dfs")]
+impl crate::node::dfs_read::ExternalReadAuthorizer for GrpcDfsMeta {
+    fn validate_external_read_grants(
+        &self,
+        caller_id: &str,
+        validations: Vec<crate::dfs::DfsReadValidation>,
+    ) -> afs_error::Result<Vec<crate::dfs::DfsExternalAuthorizedRead>> {
+        GrpcDfsMeta::validate_external_read_grants(
+            self,
+            crate::dfs::ValidateExternalReadGrants {
+                caller_id: caller_id.to_owned(),
+                validations,
+            },
+        )
     }
 }
 
@@ -2107,6 +2149,18 @@ fn wire_chunk_receipt(receipt: crate::dfs::ChunkReceipt) -> afs_protocol::meta::
         placement_revision: receipt.placement_revision,
         placement_epoch: receipt.placement_epoch,
         replica_group_id: receipt.replica_group_id.0,
+        external_commit: receipt.external_commit.map(|external| {
+            afs_protocol::meta::DfsExternalCommitReceipt {
+                store_id: external.store_id,
+                generation: external.generation,
+                object_key: external.object_key,
+                persisted_bytes: external.persisted_bytes,
+                verified_digest: external.verified_digest.bytes.to_vec(),
+                verified_digest_algorithm: wire_digest_algorithm(
+                    external.verified_digest.algorithm,
+                ),
+            }
+        }),
         durable_acks: receipt
             .durable_acks
             .into_iter()
@@ -2462,11 +2516,100 @@ fn domain_placement_snapshot(
 }
 
 #[cfg(feature = "dfs")]
+fn wire_read_validation(
+    validation: crate::dfs::DfsReadValidation,
+) -> afs_protocol::meta::DfsReadValidation {
+    let grant = validation.grant;
+    afs_protocol::meta::DfsReadValidation {
+        grant: Some(afs_protocol::meta::DfsReadGrant {
+            namespace_id: grant.namespace_id.0,
+            file_version_id: grant.file_version_id.0,
+            layout_root_id: grant.layout_root_id.0,
+            caller_node_id: grant.caller_node_id,
+            caller_node_epoch: grant.caller_node_epoch,
+            expires_at_unix_ms: grant.expires_at_unix_ms,
+            fence: grant.fence,
+            token: grant.token,
+        }),
+        chunk_id: validation.chunk_id.0,
+        copy_id: validation.copy_id.0,
+        chunk_offset: validation.chunk_offset,
+        length: validation.length,
+    }
+}
+
+#[cfg(feature = "dfs")]
+fn domain_external_authorized_read(
+    entry: afs_protocol::meta::DfsExternalAuthorizedRead,
+) -> afs_error::Result<crate::dfs::DfsExternalAuthorizedRead> {
+    let authorized = required(entry.authorized, "ExternalReadAuthorization.authorized")?;
+    let validation = required(
+        authorized.validation,
+        "ExternalReadAuthorization.validation",
+    )?;
+    let chunk = domain_chunk_object(required(entry.chunk, "ExternalReadAuthorization.chunk")?)?;
+    let location = domain_dfs_copy_location(required(
+        entry.location,
+        "ExternalReadAuthorization.location",
+    )?)?;
+    let crate::dfs::CopyLocation::External {
+        store_id,
+        object_key,
+        object_revision,
+    } = &location
+    else {
+        return Err(Error::coded(
+            CLIENT_PROTOCOL_VIOLATION,
+            "external authorization requires external location",
+        ));
+    };
+    let expected_key = crate::dfs::external_object_key(store_id, object_revision, &chunk.id)
+        .map_err(|error| Error::coded(CLIENT_PROTOCOL_VIOLATION, error.to_string()))?;
+    if chunk.id.0 != validation.chunk_id || *object_key != expected_key {
+        return Err(Error::coded(
+            CLIENT_PROTOCOL_VIOLATION,
+            "external authorization identity mismatch",
+        ));
+    }
+    Ok(crate::dfs::DfsExternalAuthorizedRead {
+        authorized: crate::dfs::DfsAuthorizedRead {
+            validation: crate::dfs::DfsReadValidation {
+                grant: domain_dfs_read_grant(required(
+                    validation.grant,
+                    "ExternalReadAuthorization.grant",
+                )?),
+                chunk_id: crate::dfs::ChunkId::new(validation.chunk_id),
+                copy_id: crate::dfs::CopyId::new(validation.copy_id),
+                chunk_offset: validation.chunk_offset,
+                length: validation.length,
+            },
+            allowed_ranges: authorized
+                .allowed_ranges
+                .into_iter()
+                .map(|range| (range.offset, range.length))
+                .collect(),
+            expires_at_unix_ms: authorized.expires_at_unix_ms,
+        },
+        chunk,
+        location,
+    })
+}
+
+#[cfg(feature = "dfs")]
 fn domain_dfs_chunk_sources(
     value: afs_protocol::meta::DfsChunkSources,
 ) -> afs_error::Result<crate::dfs::ChunkSources> {
+    let chunk_id = crate::dfs::ChunkId::new(value.chunk_id);
+    let chunk = value.chunk.map(domain_chunk_object).transpose()?;
+    if chunk.as_ref().is_some_and(|object| object.id != chunk_id) {
+        return Err(Error::coded(
+            CLIENT_PROTOCOL_VIOLATION,
+            "chunk source object identity mismatch",
+        ));
+    }
     Ok(crate::dfs::ChunkSources {
-        chunk_id: crate::dfs::ChunkId::new(value.chunk_id),
+        chunk_id,
+        chunk,
         sources: value
             .sources
             .into_iter()
@@ -3201,6 +3344,62 @@ mod n2b2_root_command_batch_tests {
 mod tests {
     use super::*;
     use crate::node::vfs::dfs::DfsMeta;
+
+    #[test]
+    fn external_authorization_wire_rejects_node_receiver_and_changed_object_key() {
+        let chunk_id = crate::dfs::ChunkId::new(format!("blake3-{}-4", "a".repeat(64)));
+        let key = crate::dfs::external_object_key("filesystem", "g1", &chunk_id).unwrap();
+        let valid = afs_protocol::meta::DfsExternalAuthorizedRead {
+            authorized: Some(afs_protocol::meta::DfsAuthorizedRead {
+                validation: Some(afs_protocol::meta::DfsReadValidation {
+                    grant: Some(afs_protocol::meta::DfsReadGrant::default()),
+                    chunk_id: chunk_id.0.clone(),
+                    copy_id: "external-copy".into(),
+                    chunk_offset: 0,
+                    length: 4,
+                }),
+                allowed_ranges: vec![afs_protocol::meta::dfs_authorized_read::Range {
+                    offset: 0,
+                    length: 4,
+                }],
+                expires_at_unix_ms: 10,
+            }),
+            chunk: Some(afs_protocol::meta::DfsChunkObject {
+                chunk_id: chunk_id.0,
+                length: 4,
+                content_digest: vec![0xaa; 32],
+                content_digest_algorithm: afs_protocol::meta::DfsDigestAlgorithm::Blake3 as i32,
+            }),
+            location: Some(afs_protocol::meta::DfsCopyLocation {
+                location: Some(afs_protocol::meta::dfs_copy_location::Location::External(
+                    afs_protocol::meta::dfs_copy_location::External {
+                        store_id: "filesystem".into(),
+                        object_key: key,
+                        object_revision: "g1".into(),
+                    },
+                )),
+            }),
+        };
+        assert!(domain_external_authorized_read(valid.clone()).is_ok());
+        let mut missing_identity = valid.clone();
+        missing_identity.chunk = None;
+        assert!(domain_external_authorized_read(missing_identity).is_err());
+        let mut wrong_key = valid.clone();
+        if let Some(afs_protocol::meta::dfs_copy_location::Location::External(external)) =
+            wrong_key.location.as_mut().unwrap().location.as_mut()
+        {
+            external.object_key.push_str("-alias");
+        }
+        assert!(domain_external_authorized_read(wrong_key).is_err());
+        let mut node_receiver = valid;
+        node_receiver.location = Some(afs_protocol::meta::DfsCopyLocation {
+            location: Some(afs_protocol::meta::dfs_copy_location::Location::Node(
+                afs_protocol::meta::dfs_copy_location::Node::default(),
+            )),
+        });
+        assert!(domain_external_authorized_read(node_receiver).is_err());
+    }
+
     use std::time::Instant;
     use tokio::net::TcpListener;
 

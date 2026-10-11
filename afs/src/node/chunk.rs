@@ -686,6 +686,7 @@ impl ChunkStore for LocalChunkStore {
             .into_iter()
             .zip(acks)
             .map(|(item, ack)| ChunkReceipt {
+                external_commit: None,
                 operation_id: item.operation_id,
                 chunk: item.chunk,
                 placement_revision: 1,

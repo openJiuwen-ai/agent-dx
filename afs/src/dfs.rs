@@ -394,6 +394,79 @@ pub struct ChunkObject {
     pub encoding: ChunkEncoding,
 }
 
+/// Immutable durability contract; external storage never counts as a Node replica.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub enum DfsDurabilityPolicy {
+    #[default]
+    NodeReplicated,
+    ExternalBackend {
+        store_id: String,
+        generation: String,
+    },
+}
+
+/// Stable backend acknowledgement, bound to the enclosing receipt's operation and chunk.
+/// ETag and backend version IDs are deliberately excluded from commit identity.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ExternalCommitReceipt {
+    pub store_id: String,
+    pub generation: String,
+    pub object_key: String,
+    pub persisted_bytes: u64,
+    pub verified_digest: ContentDigest,
+}
+
+/// Reject ambiguous or unsafe object-namespace path segments.
+pub fn validate_external_store_identity(store_id: &str, generation: &str) -> afs_error::Result<()> {
+    let safe_segment = |value: &str| {
+        !value.is_empty()
+            && value != "."
+            && value != ".."
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
+    };
+    if !safe_segment(store_id) || !safe_segment(generation) {
+        return Err(afs_error::Error::coded(
+            afs_error::CLIENT_ARGUMENT_INVALID,
+            "invalid external store identity",
+        ));
+    }
+    Ok(())
+}
+
+/// Canonical immutable object key. Store ID is a filesystem/store namespace.
+/// Invalid path segments or noncanonical chunk identities return an argument error.
+pub fn external_object_key(
+    store_id: &str,
+    generation: &str,
+    chunk_id: &ChunkId,
+) -> afs_error::Result<String> {
+    validate_external_store_identity(store_id, generation)?;
+    let invalid = || {
+        afs_error::Error::coded(
+            afs_error::CLIENT_ARGUMENT_INVALID,
+            "invalid external chunk identity",
+        )
+    };
+    let content = chunk_id.0.strip_prefix("blake3-").ok_or_else(invalid)?;
+    let (digest, length) = content.split_once('-').ok_or_else(invalid)?;
+    let parsed_length = length.parse::<u64>().map_err(|_| invalid())?;
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || parsed_length.to_string() != length
+    {
+        return Err(invalid());
+    }
+    Ok(format!(
+        "afs/v1/{store_id}/{generation}/chunks/{}/{}",
+        &digest[..2],
+        chunk_id.0
+    ))
+}
+
 /// One immutable filesystem-wide replication contract.
 ///
 /// The first implementation writes this record when the filesystem is
@@ -568,6 +641,7 @@ pub enum CopyLocation {
     External {
         store_id: String,
         object_key: String,
+        /// Fixed store generation; backend ETag/version observations are not identity.
         object_revision: String,
     },
 }
@@ -642,6 +716,8 @@ pub struct ChunkReceipt {
     pub placement_epoch: u64,
     pub replica_group_id: ReplicaGroupId,
     pub durable_acks: Vec<ReplicaAck>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_commit: Option<ExternalCommitReceipt>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -755,6 +831,20 @@ pub struct DfsAuthorizedRead {
     pub expires_at_unix_ms: u64,
 }
 
+/// Fresh authorization for a trusted Node fetching an external object directly.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DfsExternalAuthorizedRead {
+    pub authorized: DfsAuthorizedRead,
+    pub chunk: ChunkObject,
+    pub location: CopyLocation,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ValidateExternalReadGrants {
+    pub caller_id: String,
+    pub validations: Vec<DfsReadValidation>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ValidateDfsReadGrants {
     pub receiver_node_id: String,
@@ -784,6 +874,8 @@ impl SourceCandidate {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ChunkSources {
     pub chunk_id: ChunkId,
+    #[serde(default)]
+    pub chunk: Option<ChunkObject>,
     pub sources: Vec<SourceCandidate>,
 }
 
@@ -839,4 +931,76 @@ pub struct SyncInodeMetadata {
     pub expected_inode_revision: u64,
     pub expected_head_version: Option<FileVersionId>,
     pub metadata_delta: CommitMetadataDelta,
+}
+
+#[cfg(test)]
+mod external_identity_tests {
+    use super::*;
+
+    #[test]
+    fn node_receipt_preserves_pre_external_exact_replay_digest() {
+        // This is the previous wire-independent commit receipt shape. Persisted
+        // namespace outcomes hash these exact serialized bytes, including order.
+        #[derive(Serialize)]
+        struct LegacyReceipt<'a> {
+            operation_id: &'a OperationId,
+            chunk: &'a ChunkObject,
+            placement_revision: u64,
+            placement_epoch: u64,
+            replica_group_id: &'a ReplicaGroupId,
+            durable_acks: &'a [ReplicaAck],
+        }
+        let receipt = ChunkReceipt {
+            operation_id: OperationId::new("commit-original"),
+            chunk: ChunkObject {
+                id: ChunkId::new(format!("blake3-{}-42", "a".repeat(64))),
+                length: 42,
+                content_digest: ContentDigest {
+                    algorithm: DigestAlgorithm::Blake3,
+                    bytes: [0xaa; 32],
+                },
+                encoding: ChunkEncoding::Raw,
+            },
+            placement_revision: 7,
+            placement_epoch: 3,
+            replica_group_id: ReplicaGroupId::new("group-original"),
+            durable_acks: Vec::new(),
+            external_commit: None,
+        };
+        let legacy = LegacyReceipt {
+            operation_id: &receipt.operation_id,
+            chunk: &receipt.chunk,
+            placement_revision: receipt.placement_revision,
+            placement_epoch: receipt.placement_epoch,
+            replica_group_id: &receipt.replica_group_id,
+            durable_acks: &receipt.durable_acks,
+        };
+        let old_bytes = serde_json::to_vec(&legacy).unwrap();
+        let new_bytes = serde_json::to_vec(&receipt).unwrap();
+        assert_eq!(new_bytes, old_bytes);
+        assert_eq!(blake3::hash(&new_bytes), blake3::hash(&old_bytes));
+        let recovered: ChunkReceipt = serde_json::from_slice(&old_bytes).unwrap();
+        assert_eq!(recovered, receipt);
+        assert_eq!(serde_json::to_vec(&recovered).unwrap(), old_bytes);
+    }
+
+    #[test]
+    fn external_key_is_stable_and_rejects_path_or_chunk_aliases() {
+        let chunk = ChunkId::new(format!("blake3-{}-42", "a".repeat(64)));
+        assert_eq!(
+            external_object_key("filesystem", "generation-1", &chunk).unwrap(),
+            format!("afs/v1/filesystem/generation-1/chunks/aa/{}", chunk.0)
+        );
+        for segment in ["", "..", "a/b", "a b", "a%2fb"] {
+            assert!(external_object_key(segment, "generation", &chunk).is_err());
+            assert!(external_object_key("store", segment, &chunk).is_err());
+        }
+        for identity in [
+            format!("blake3-{}-042", "a".repeat(64)),
+            format!("blake3-{}-42", "A".repeat(64)),
+            "short".into(),
+        ] {
+            assert!(external_object_key("store", "generation", &ChunkId::new(identity)).is_err());
+        }
+    }
 }

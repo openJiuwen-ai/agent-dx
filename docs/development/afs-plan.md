@@ -43,6 +43,7 @@ runner 的 case 执行仍限定专用 Linux ARM64 root 环境；这来自探针�
 | OwnerFs workspace bind mount | 保留实现和配置，默认 OFF；显式配置后用于当前实际试用场景 |
 | OwnerFs 远端 FUSE 访问 | 保留代码路径，目标仓二进制须有本轮限定 Linux 运行证据 |
 | DistributedFs 一写多读 | 保留核心代码与验收驱动，目标仓回归按受影响范围补测 |
+| DFS 外部 S3 发布／回源 | 实验接入；Linux debug 候选的64KiB／64MiB跨VM cache OFF闭环通过；有界cache ON仍待完成，同后端性能及复杂回收后续验收 |
 | 中心 Meta `local-file` | 作为当前可重启恢复基线 |
 | `memory` Meta | 仅用于一次性演示，重启不保留状态 |
 | etcd / Redis Meta | 代码保留，当前候选不宣称已验收 |

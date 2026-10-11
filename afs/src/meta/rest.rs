@@ -162,9 +162,10 @@ async fn root_location(
     })))
 }
 
-/// Observed availability is derived from one linearizable view, including live
-/// sessions and recovered device floors. No live source means unavailable, not
-/// proof of permanent data loss. Persisted receipt evidence remains unchanged.
+/// Source eligibility is derived from one linearizable catalog view. Node
+/// sources require live sessions and recovered device floors. External sources
+/// require committed policy-matching references; backend reachability is not
+/// probed. Missing sources are not proof of permanent data loss.
 async fn chunk_replication(
     State(meta): State<Arc<Meta>>,
     Path(chunk_id): Path<String>,
@@ -190,15 +191,28 @@ async fn chunk_replication(
             "DFS placement references missing chunk metadata",
         )));
     };
+    let policy = match view.read(MetaRead::DfsDurabilityPolicy).await?.entity {
+        Some(MetaEntity::DfsDurabilityPolicy(policy)) => policy,
+        _ => crate::dfs::DfsDurabilityPolicy::NodeReplicated,
+    };
+    let external = matches!(
+        policy,
+        crate::dfs::DfsDurabilityPolicy::ExternalBackend { .. }
+    );
     let now = now_unix_ms();
     let mut copies = Vec::new();
     let mut live_nodes = std::collections::HashSet::new();
+    let mut external_copies = std::collections::HashSet::new();
     for copy_id in &placement.copies {
         if let Some(MetaEntity::DfsCopy(copy)) =
             view.read(MetaRead::DfsCopy(copy_id.clone())).await?.entity
         {
             let mut available = false;
-            if let crate::dfs::CopyLocation::Node { node_id, .. } = &copy.location
+            if external && super::dfs::external_copy_matches(&policy, &copy, &chunk)? {
+                available = true;
+                external_copies.insert(copy.id.clone());
+            } else if !external
+                && let crate::dfs::CopyLocation::Node { node_id, .. } = &copy.location
                 && let Some(MetaEntity::NodeSession(session)) = view
                     .read(MetaRead::CurrentNodeSession {
                         node_id: node_id.clone(),
@@ -226,22 +240,28 @@ async fn chunk_replication(
             _ => None,
         })
         .collect::<Vec<_>>();
-    let health = if live_nodes.is_empty() {
+    let available_copies = live_nodes.len() + external_copies.len();
+    let health = if available_copies == 0 {
         crate::dfs::PlacementHealth::BlockedNoSource
-    } else if live_nodes.len() < usize::from(placement.desired_copies) {
+    } else if available_copies < usize::from(placement.desired_copies) {
         crate::dfs::PlacementHealth::UnderReplicated
     } else {
         crate::dfs::PlacementHealth::Satisfied
     };
-    Ok(Json(json!({
+    let mut response = json!({
         "chunk_id":id,
         "health":health,
-        "available_copies":live_nodes.len(),
+        "available_copies":available_copies,
         "placement":placement,
         "copies":copies,
         "tasks":tasks,
         "checked_at_unix_ms":now,
         "revision":snapshot.revision.0,
         "loss_confirmed":false,
-    })))
+    });
+    if external {
+        response["availability_scope"] = json!("external_committed_catalog_eligibility");
+        response["backend_reachability"] = json!("not_probed");
+    }
+    Ok(Json(response))
 }

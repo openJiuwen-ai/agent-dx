@@ -417,6 +417,7 @@ impl ReplicationEngine {
                 }
                 validate_acks(plan, &item, &durable_acks, &self.local_node_id)?;
                 receipts[index] = Some(ChunkReceipt {
+                    external_commit: None,
                     operation_id: item.operation_id,
                     chunk: item.chunk,
                     placement_revision: plan.placement_revision,
@@ -559,6 +560,7 @@ impl DfsChunkStore {
                 .zip(local_acks)
             {
                 receipts[index] = Some(ChunkReceipt {
+                    external_commit: None,
                     operation_id: item.operation_id,
                     chunk: item.chunk,
                     placement_revision: group.plan.placement_revision,

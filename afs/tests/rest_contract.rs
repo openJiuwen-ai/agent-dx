@@ -393,3 +393,121 @@ async fn chunk_replication_reports_observed_availability_without_claiming_data_l
     let (status, _) = get_json(meta, "/v1/dfs/chunks/missing/replication").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn external_replication_summary_reports_catalog_eligibility_without_backend_probe() {
+    use afs::dfs::*;
+    use afs::meta::store::{
+        MetaEntity, MetaKey, MetaStore, MetaTxn, OperationResult, RequestOutcome, StoreOperation,
+        TxnCondition, TxnMutation, TxnOutcome,
+    };
+
+    let (meta, store) = meta_with_memory_store().await;
+    let digest = ContentDigest {
+        algorithm: DigestAlgorithm::Blake3,
+        bytes: [7; 32],
+    };
+    let id = ChunkId::new(format!(
+        "blake3-{}-4",
+        blake3::Hash::from(digest.bytes).to_hex()
+    ));
+    let copy_id = CopyId::new("external-rest-copy");
+    let mut copy = CopyRecord {
+        id: copy_id.clone(),
+        chunk_id: id.clone(),
+        role: CopyRole::ExternalCommitted,
+        state: CopyState::Ready,
+        location: CopyLocation::External {
+            store_id: "rest-store".into(),
+            object_key: external_object_key("rest-store", "generation-1", &id).unwrap(),
+            object_revision: "generation-1".into(),
+        },
+        persisted_bytes: 4,
+        verified_digest: digest.clone(),
+    };
+    let request = RequestKey::new("fixture", "external-rest");
+    let mut txn = MetaTxn::new(request.clone(), StoreOperation::DfsCommitFileVersion);
+    txn.conditions.extend([
+        TxnCondition::RequestAbsent(request.clone()),
+        TxnCondition::Missing(MetaKey::DfsDurabilityPolicy),
+    ]);
+    txn.mutations.extend([
+        TxnMutation::Put(MetaEntity::DfsDurabilityPolicy(
+            DfsDurabilityPolicy::ExternalBackend {
+                store_id: "rest-store".into(),
+                generation: "generation-1".into(),
+            },
+        )),
+        TxnMutation::Put(MetaEntity::DfsChunk(ChunkObject {
+            id: id.clone(),
+            length: 4,
+            content_digest: digest,
+            encoding: ChunkEncoding::Raw,
+        })),
+        TxnMutation::Put(MetaEntity::DfsCopy(copy.clone())),
+        TxnMutation::Put(MetaEntity::DfsPlacement(PlacementRecord {
+            chunk_id: id.clone(),
+            replica_group_id: ReplicaGroupId::new("external"),
+            placement_epoch: 1,
+            desired_copies: 1,
+            copies: vec![copy_id],
+            health: PlacementHealth::Satisfied,
+        })),
+        TxnMutation::RecordRequestOutcome(RequestOutcome {
+            request,
+            operation: StoreOperation::DfsCommitFileVersion,
+            result: OperationResult::Empty,
+        }),
+    ]);
+    assert!(matches!(
+        store.compare_and_commit(txn).await.unwrap(),
+        TxnOutcome::Committed { .. }
+    ));
+    // This fixture has no Node sessions or S3 client; the response describes
+    // committed catalog eligibility and must not claim backend reachability.
+    let path = format!("/v1/dfs/chunks/{}/replication", id.0);
+    let (status, body) = get_json(meta.clone(), &path).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["health"], "Satisfied");
+    assert_eq!(body["available_copies"], 1);
+    assert_eq!(body["copies"][0]["available"], true);
+    assert_eq!(
+        body["availability_scope"],
+        "external_committed_catalog_eligibility"
+    );
+    assert_eq!(body["backend_reachability"], "not_probed");
+    assert_eq!(body["loss_confirmed"], false);
+
+    let original_copy = copy.clone();
+    if let CopyLocation::External {
+        object_revision, ..
+    } = &mut copy.location
+    {
+        *object_revision = "generation-2".into();
+    }
+    let request = RequestKey::new("fixture", "external-rest-wrong-generation");
+    let mut txn = MetaTxn::new(request.clone(), StoreOperation::DfsCommitFileVersion);
+    txn.conditions.extend([
+        TxnCondition::RequestAbsent(request.clone()),
+        TxnCondition::EntityEquals(MetaEntity::DfsCopy(original_copy)),
+    ]);
+    txn.mutations.extend([
+        TxnMutation::Put(MetaEntity::DfsCopy(copy)),
+        TxnMutation::RecordRequestOutcome(RequestOutcome {
+            request,
+            operation: StoreOperation::DfsCommitFileVersion,
+            result: OperationResult::Empty,
+        }),
+    ]);
+    assert!(matches!(
+        store.compare_and_commit(txn).await.unwrap(),
+        TxnOutcome::Committed { .. }
+    ));
+    let (status, body) = get_json(meta, &path).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["health"], "BlockedNoSource");
+    assert_eq!(body["available_copies"], 0);
+    assert_eq!(body["copies"][0]["available"], false);
+    assert_eq!(body["backend_reachability"], "not_probed");
+    assert_eq!(body["loss_confirmed"], false);
+}

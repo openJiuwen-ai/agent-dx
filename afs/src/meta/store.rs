@@ -22,9 +22,10 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{RwLock, mpsc, oneshot};
 
 use crate::dfs::{
-    ChunkObject, CopyRecord, Dentry, DentryKey, FileVersion, FileVersionId, InodeId, InodeRecord,
-    LayoutRoot, LayoutRootId, NamespaceId, PlacementRecord, RenameOutcome, ReplicationClaim,
-    ReplicationConfig, ReplicationTask, ReplicationTaskId, StorageDeviceDescriptor, WriteLease,
+    ChunkObject, CopyRecord, Dentry, DentryKey, DfsDurabilityPolicy, FileVersion, FileVersionId,
+    InodeId, InodeRecord, LayoutRoot, LayoutRootId, NamespaceId, PlacementRecord, RenameOutcome,
+    ReplicationClaim, ReplicationConfig, ReplicationTask, ReplicationTaskId,
+    StorageDeviceDescriptor, WriteLease,
 };
 
 pub mod etcd;
@@ -288,6 +289,7 @@ pub enum MetaEntity {
     DfsLayoutRoot(LayoutRoot),
     DfsChunk(ChunkObject),
     DfsReplicationConfig(ReplicationConfig),
+    DfsDurabilityPolicy(DfsDurabilityPolicy),
     DfsPlacement(PlacementRecord),
     DfsCopy(CopyRecord),
     DfsReplicationTask(ReplicationTask),
@@ -309,6 +311,7 @@ impl MetaEntity {
             Self::DfsLayoutRoot(_) => "dfs_layout_root",
             Self::DfsChunk(_) => "dfs_chunk",
             Self::DfsReplicationConfig(_) => "dfs_replication_config",
+            Self::DfsDurabilityPolicy(_) => "dfs_durability_policy",
             Self::DfsPlacement(_) => "dfs_placement",
             Self::DfsCopy(_) => "dfs_copy",
             Self::DfsReplicationTask(_) => "dfs_replication_task",
@@ -368,6 +371,7 @@ pub enum MetaRead {
     DfsPlacements,
     DfsCopy(crate::dfs::CopyId),
     DfsReplicationConfig,
+    DfsDurabilityPolicy,
     DfsReplicationTask(ReplicationTaskId),
     DfsReplicationTasks,
     DfsWriteLease(InodeId),
@@ -488,6 +492,7 @@ pub enum MetaKey {
     DfsLayoutRoot(LayoutRootId),
     DfsChunk(crate::dfs::ChunkId),
     DfsReplicationConfig,
+    DfsDurabilityPolicy,
     DfsPlacement(crate::dfs::ChunkId),
     DfsCopy(crate::dfs::CopyId),
     DfsReplicationTask(ReplicationTaskId),
@@ -534,6 +539,7 @@ pub enum StoreOperation {
     DfsSyncInodeMetadata,
     DfsCommitFileVersion,
     DfsInitializeReplicationConfig,
+    DfsInitializeDurabilityPolicy,
     DfsClaimReplicationTask,
     DfsReportReplicationTask,
     DfsReportChunkCorruption,
@@ -1345,6 +1351,7 @@ impl MetaStore for StoreState {
                 MetaRead::DfsPlacements => None,
                 MetaRead::DfsChunk(id) => state.entities.get(&MetaKey::DfsChunk(id.clone())),
                 MetaRead::DfsCopy(id) => state.entities.get(&MetaKey::DfsCopy(id.clone())),
+                MetaRead::DfsDurabilityPolicy => state.entities.get(&MetaKey::DfsDurabilityPolicy),
                 MetaRead::DfsReplicationConfig => {
                     state.entities.get(&MetaKey::DfsReplicationConfig)
                 }
@@ -1816,6 +1823,7 @@ fn entity_key(entity: &MetaEntity) -> MetaKey {
         MetaEntity::DfsLayoutRoot(layout) => MetaKey::DfsLayoutRoot(layout.id.clone()),
         MetaEntity::DfsChunk(chunk) => MetaKey::DfsChunk(chunk.id.clone()),
         MetaEntity::DfsReplicationConfig(_) => MetaKey::DfsReplicationConfig,
+        MetaEntity::DfsDurabilityPolicy(_) => MetaKey::DfsDurabilityPolicy,
         MetaEntity::DfsPlacement(placement) => MetaKey::DfsPlacement(placement.chunk_id.clone()),
         MetaEntity::DfsCopy(copy) => MetaKey::DfsCopy(copy.id.clone()),
         MetaEntity::DfsReplicationTask(task) => MetaKey::DfsReplicationTask(task.id.clone()),

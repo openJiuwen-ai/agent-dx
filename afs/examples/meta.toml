@@ -21,3 +21,15 @@ tls_server_name = "afs-cluster"
 
 [trusted_node_certs]
 node-a = "/opt/adx/config/afs/tls/node-a.pem"
+
+# Optional external S3 durability for a NEW DFS filesystem only.
+# Configure the same store/generation on Meta and every DFS Node; retain R1
+# default counts. External mode does not use Node durable replicas.
+# Service deployment is external. See docs/deployment/afs.md.
+# [dfs_external_backend]
+# store_id = "filesystem-a"
+# generation = "generation-1"
+# endpoint = "https://s3.example.com"
+# bucket = "afs-chunks"
+# region = "us-east-1"
+# allow_http = false

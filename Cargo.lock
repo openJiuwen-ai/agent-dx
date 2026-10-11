@@ -388,6 +388,7 @@ dependencies = [
 name = "afs"
 version = "0.1.0"
 dependencies = [
+ "adx-transport",
  "afs-client",
  "afs-error",
  "afs-logging",
@@ -402,9 +403,11 @@ dependencies = [
  "fuser",
  "hyper-util",
  "libc",
+ "object_store",
  "opentelemetry-proto 0.32.0",
  "prost 0.14.4",
  "redis",
+ "reqwest 0.13.5",
  "serde",
  "serde_json",
  "tempfile",

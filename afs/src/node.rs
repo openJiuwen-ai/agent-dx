@@ -15,6 +15,8 @@ pub mod api;
 pub mod chunk;
 #[cfg(feature = "dfs")]
 pub mod dfs_read;
+#[cfg(feature = "dfs")]
+pub mod external_chunk;
 pub mod fuse;
 #[cfg(feature = "ownerfs")]
 mod native_workspace;
@@ -1430,20 +1432,47 @@ async fn run_node(
             .as_ref()
             .expect("DFS local ChunkStore was opened before registration")
             .clone();
-        let chunk_store = Arc::new(replication::DfsChunkStore::new_with_epoch(
-            cfg.id.clone(),
-            registered_node_epoch,
-            chunks.clone(),
-            meta.clone(),
-            dfs_replica_plane.clone(),
-        ));
+        // The external backend owns durability. Never request placement or
+        // synthesize local ReplicaAck records for an external object.
+        let external_store = if let Some(backend) = &cfg.dfs_external_backend {
+            let options = external_chunk::S3ChunkStoreOptions {
+                endpoint: backend.endpoint.clone(),
+                bucket: backend.bucket.clone(),
+                region: backend.region.clone(),
+                store_id: backend.store_id.clone(),
+                generation: backend.generation.clone(),
+                allow_http: backend.allow_http,
+                credentials: backend.credentials_file.clone().map_or(
+                    external_chunk::S3CredentialsSource::Environment,
+                    external_chunk::S3CredentialsSource::File,
+                ),
+                request_timeout: timeout,
+                max_retries: 2,
+            };
+            Some(Arc::new(
+                tokio::task::spawn_blocking(move || external_chunk::S3ChunkStore::new(options))
+                    .await??,
+            ))
+        } else {
+            None
+        };
+        let chunk_store: Arc<dyn chunk::ChunkStore> = match &external_store {
+            Some(store) => store.clone(),
+            None => Arc::new(replication::DfsChunkStore::new_with_epoch(
+                cfg.id.clone(),
+                registered_node_epoch,
+                chunks.clone(),
+                meta.clone(),
+                dfs_replica_plane.clone(),
+            )),
+        };
         let read_config = dfs_read::DfsReadConfig {
             max_ops_per_batch: cfg.dfs_read_max_ops_per_batch,
             max_inflight_bytes: cfg.dfs_read_max_inflight_bytes,
             source_cache_ttl: std::time::Duration::from_millis(cfg.dfs_read_source_cache_ttl_ms),
         };
         read_config.validate()?;
-        let read_engine = Arc::new(dfs_read::DfsReadEngine::new(
+        let read_engine = dfs_read::DfsReadEngine::new(
             namespace.clone(),
             cfg.id.clone(),
             chunks,
@@ -1455,7 +1484,11 @@ async fn run_node(
                 dfs_rdma_pool.clone(),
             )?,
             read_config,
-        ));
+        );
+        let read_engine = Arc::new(match external_store {
+            Some(store) => read_engine.with_external_backend(store, meta.clone()),
+            None => read_engine,
+        });
         let remote_factory = Arc::new(rpc::peer::GrpcDfsOwnerFactory::new(
             peer_connections.clone(),
             timeout,
@@ -1902,7 +1935,11 @@ async fn run_node(
             .map_err(Into::into)
     });
     #[cfg(feature = "dfs")]
-    if let (Some(meta), Some(local)) = (dfs_meta, local_chunk_store) {
+    if let (Some(meta), Some(local), None) = (
+        dfs_meta,
+        local_chunk_store,
+        cfg.dfs_external_backend.as_ref(),
+    ) {
         let worker = Arc::new(replication::ReplicationWorker::new(
             cfg.id.clone(),
             registered_node_epoch,
