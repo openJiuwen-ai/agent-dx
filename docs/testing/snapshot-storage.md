@@ -26,6 +26,8 @@ adxlet 可使用原来的 `checkpoint_dir`，或显式选择 `checkpoint_storage
 
 ## 制品提交与恢复
 
+- 本地目录发布检查制品路径、文件类型和总长度，成功时文件已生成且可在本机读取；adxlet 不对制品和目录执行 `fsync`，由操作系统及执行后端异步写回。local-only 不承诺返回前已稳定落盘，也不支持丢失节点后的跨节点恢复。恢复点元数据仍按生命周期契约提交给 Coordinator。暂停、workload checkpoint、上传失败后的本地保留和本地快照复制共用该语义。
+- 本地恢复与节点重启对账重新检查制品；缺失、长度变化、符号链接及特殊文件会被拒绝。该校验不是本地逐字节校验和或断电耐久性保证。
 - 后端先生成完整本地 checkpoint。对象适配器按文件流式上传，记录每个文件的长度、SHA256 和权限；所有文件完成后才写入版本化格式的 manifest，作为发布完成标记。
 - 下载按 manifest 限制路径、长度和校验和，不接受符号链接及特殊文件。完整下载后以 rename 暴露缓存目录，避免恢复读取半成品。
 - 上传失败保留本地制品，adxlet 尝试回滚恢复。回滚使用的本地恢复点写入实例结果，保持 local-only 语义；成功上传后的暂存目录在结果全局提交后清理。
@@ -50,6 +52,10 @@ Coordinator 的快照目录模型、Redis 存储与 mTLS SnapshotService 已实�
 - Redis CAS 同时校验当前 Coordinator epoch 和旧记录内容，旧 Coordinator 不可修改新 Coordinator 接管后的引用。租户检查和不可变制品身份在目录层执行。
 
 ## 验证边界
+
+`platform/adxlet/tests/local_checkpoint.rs` 覆盖本地发布后立即读取、存储对象重建、回滚保留、独立快照复制以及缺失／截断／非法文件拒绝。Linux 上可用 `python3 build/ci/check_local_checkpoint_io.py --test-binary <local_checkpoint 测试可执行文件> --output <证据目录>` 对真实存储调用执行 syscall 检查，确认这些本地发布路径不触发强制刷盘；需要先构建 `cargo test -p adxlet --test local_checkpoint --no-run`，并安装 `strace`。该组件检查不替代真实执行后端恢复验收。
+
+本地发布契约的真实 FC 同节点恢复、Paused 时重启、Unix checkpoint／reload 和耗时边界见 [2026-10-11 回归记录](2026-10-11-local-checkpoint-publication.md)。
 
 对象存储、文件引用、上传失败回滚已有 adxlet 行为测试；快照引用、延迟删除、Redis/Coordinator 重启已有真实 Redis 测试。真实 S3＋Firecracker 部署验收已通过，下节列出证据。创建链路已通过组件与真实 Redis/mTLS 测试，统一 package-v12 的 Lima r15 已通过 13 项真实 FC/SDK 验收。从快照创建新实例的实现和本地验证见后文；未登记远端制品回收的契约与验收见后文。
 

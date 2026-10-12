@@ -249,7 +249,11 @@ paths:
               $ref: "#/components/schemas/PauseRequest"
       responses:
         "200":
-          description: Restore point bytes and metadata are durable and published.
+          description: >-
+            Restore point metadata is committed. With local storage the complete
+            artifact is readable on its owning node, without an adxlet fsync
+            barrier or a host-crash durability guarantee. With object storage,
+            artifact upload is complete before success is returned.
           content:
             application/json:
               schema:

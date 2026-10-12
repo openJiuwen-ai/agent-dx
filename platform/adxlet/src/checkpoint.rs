@@ -149,7 +149,9 @@ pub trait CheckpointStore: Send + Sync {
     async fn discard_staged(&self, staged: &Path) -> Result<()>;
     /// Preserve a complete local recovery point for running capture or upload rollback.
     async fn retain_staged(&self, staged: &Path) -> Result<CheckpointArtifact>;
-    /// Complete storage durability (including upload for a remote backend).
+    /// Validate a complete, readable local artifact or finish its remote upload.
+    /// Local publication does not force filesystem writeback; the caller must
+    /// still commit the artifact's authoritative metadata before acknowledging.
     async fn publish(&self, staged: &Path) -> Result<CheckpointArtifact>;
     async fn materialize(&self, artifact: &CheckpointArtifact) -> Result<MaterializedCheckpoint>;
     async fn remove(&self, artifact: &CheckpointArtifact) -> Result<()>;
@@ -221,6 +223,8 @@ pub(crate) struct CheckpointServices {
     pub store: Arc<dyn CheckpointStore>,
     pub cooperation: Arc<dyn CheckpointCooperation>,
 }
+/// Node-local artifacts remain subject to filesystem writeback. Publication
+/// does not guarantee survival of a host crash or power loss.
 pub struct LocalCheckpointStore {
     root: PathBuf,
 }
@@ -248,7 +252,7 @@ impl LocalCheckpointStore {
 fn io_error(e: impl std::fmt::Display) -> Error {
     Error::Unavailable(format!("checkpoint storage: {e}"))
 }
-fn scan(path: &Path, sync: bool) -> Result<u64> {
+fn scan(path: &Path) -> Result<u64> {
     let meta = std::fs::symlink_metadata(path).map_err(io_error)?;
     if meta.is_symlink() {
         return Err(Error::Invalid("checkpoint symlink is not allowed".into()));
@@ -257,18 +261,13 @@ fn scan(path: &Path, sync: bool) -> Result<u64> {
     if meta.is_dir() {
         for entry in std::fs::read_dir(path).map_err(io_error)? {
             size = size
-                .checked_add(scan(&entry.map_err(io_error)?.path(), sync)?)
+                .checked_add(scan(&entry.map_err(io_error)?.path())?)
                 .ok_or_else(|| Error::Invalid("checkpoint size overflow".into()))?;
         }
     } else if meta.is_file() {
         size = meta.len();
     } else {
         return Err(Error::Invalid("checkpoint contains special file".into()));
-    }
-    if sync {
-        std::fs::File::open(path)
-            .and_then(|f| f.sync_all())
-            .map_err(io_error)?;
     }
     Ok(size)
 }
@@ -323,15 +322,12 @@ impl CheckpointStore for LocalCheckpointStore {
     async fn publish(&self, staged: &Path) -> Result<CheckpointArtifact> {
         let path = self.owned_path(staged)?;
         let copy = path.clone();
-        let size = tokio::task::spawn_blocking(move || scan(&copy, true))
+        let size = tokio::task::spawn_blocking(move || scan(&copy))
             .await
             .map_err(io_error)??;
         if size == 0 {
             return Err(Error::Invalid("empty checkpoint".into()));
         }
-        std::fs::File::open(&self.root)
-            .and_then(|f| f.sync_all())
-            .map_err(io_error)?;
         Ok(CheckpointArtifact {
             storage: "local".into(),
             location: path.to_string_lossy().into_owned(),
@@ -344,7 +340,7 @@ impl CheckpointStore for LocalCheckpointStore {
         }
         let path = self.owned_path(Path::new(&artifact.location))?;
         let copy = path.clone();
-        let size = tokio::task::spawn_blocking(move || scan(&copy, false))
+        let size = tokio::task::spawn_blocking(move || scan(&copy))
             .await
             .map_err(io_error)??;
         if size != artifact.size_bytes {

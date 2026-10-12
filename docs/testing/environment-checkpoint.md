@@ -7,7 +7,7 @@
 1. API Server 从本地缓存解析归属，携带已认证身份、operation ID 和预期状态版本直达 adxlet。
 2. adxlet 串行执行本实例的请求。先确认后端支持 checkpoint，使用 Execd 控制接口准备 checkpoint（配置 runtime_control 时走双向 gRPC，否则走 HTTP），再关闭本机路由。
 3. sandboxd 完成 `leave_running=false` 的完整 checkpoint。确认源执行已停止、删除成功后，释放本机资源。
-4. 存储后端完成制品持久化；adxlet 将 Paused 状态、恢复点和过期时间一次提交给 Coordinator。Coordinator 写入 Redis、释放 Shard 占用并撤销发布路由，API Server 才返回暂停成功。
+4. 存储后端完成制品发布：本地目录检查制品，对象存储完成上传；adxlet 将 Paused 状态、恢复点和过期时间一次提交给 Coordinator。Coordinator 写入 Redis、释放 Shard 占用并撤销发布路由，API Server 才返回暂停成功。
 5. 恢复时检查过期时间和制品，进行本机资源准入，通过 sandboxd 的 `Start.checkpoint_info` 恢复。后端自行生成物理 ID。
 6. Execd 确认新执行身份、重新开放服务，本机绑定完成后，adxlet 提交 Running。Coordinator 增量恢复 Shard 资源占用、发布新路由。
 
@@ -26,6 +26,8 @@
 | `sandbox-api/controlbackend` | HTTP 兼容格式转换、缓存归属、固定目标与版本的重试 |
 
 `CheckpointStore::publish` 是存储完成边界。对象存储在此完成上传，通过 `materialize` 下载；本地/S3、缓存引用和跨节点恢复已实现，见 [存储契约](snapshot-storage.md) 与 [跨节点恢复](firecracker-cross-node.md)。
+
+local-only 成功表示后端已生成完整、可在本机读取的制品，并已提交恢复点元数据。adxlet 不主动对本地制品及目录执行 `fsync`；未完成的磁盘写回由操作系统和执行后端处理，不保证突然断电或宿主机崩溃后的制品完整性。该规则同样用于 workload checkpoint、本地回滚恢复点和可复用快照副本；对象存储仍等待完整上传。恢复及重启对账保留本地制品的路径、类型和长度校验，校验失败的恢复点不能用于恢复。
 
 ## 配置与部署
 

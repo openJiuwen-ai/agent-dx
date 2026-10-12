@@ -912,7 +912,11 @@ class Sandbox:
         *,
         timeout_seconds: int = ADX_GET_DEFAULT_TIMEOUT,
     ) -> PauseResult:
-        """Synchronously pause this sandbox and return its durable snapshot."""
+        """Pause and return a validated checkpoint with committed metadata.
+
+        Local-only files are immediately readable on the owning node, without
+        forced filesystem writeback. Remote storage completes its upload.
+        """
         if isinstance(ttl_seconds, bool) or not isinstance(ttl_seconds, int):
             raise ValueError("ttl_seconds must be a positive integer")
         if ttl_seconds <= 0:

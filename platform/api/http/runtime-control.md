@@ -96,6 +96,13 @@ runtime or failed work returns 503 with an error body. Invalid timeout JSON retu
 ID remains visible for reconciliation and is never silently replayed. Other
 paths/methods return 404/405. This operation is exposed only on the Unix listener.
 
+With local checkpoint storage, successful completion confirms a readable local
+artifact and committed recovery-point metadata. Adxlet validates the files but
+does not force their writeback with `fsync`; success does not guarantee artifact
+survival after host power loss or a host crash. S3 storage still requires complete
+upload before acknowledging completion. Local recovery and restart reconciliation
+reject missing artifacts, changed lengths, symlinks and special files.
+
 A lost commit or finish response is retried without invoking Checkpoint again.
 A Journaled result leaves the caller pending until cluster publication succeeds.
 A client disconnect does not cancel accepted work. A restored runtime discards

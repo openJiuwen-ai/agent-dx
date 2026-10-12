@@ -17,7 +17,7 @@ cargo test -p adxlet --test pause_resume --test sandboxd_rpc
 
 The Execd tests use a real process, TCP control requests, Unix socket requests and
 a FIFO backend handoff fixture. They cover concurrent request rejection, waiting
-for durable acknowledgement after handoff, stale/repeated acknowledgements,
+for artifact and authoritative metadata acknowledgement after handoff, stale/repeated acknowledgements,
 error replies and listener rearming after restore. Controller tests cover pending
 request retirement when execution identity changes.
 

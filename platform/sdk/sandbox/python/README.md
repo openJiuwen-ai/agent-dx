@@ -163,7 +163,7 @@ requires the response to identify this sandbox, report `"running"`, and
 include a route address and function-proxy ID. Resume performs local admission on the owning node, restores the checkpoint, rearms the runtime listener and commits Running. Route-cache convergence after
 that result is outside the resume success boundary.
 
-Pausing persists bytes through the configured local or S3 store and commits Paused after removing the old execution. A SQLite-only result is not cluster success. Public resume requires the authoritative Paused identity and a valid checkpoint. Failed-node cross-node recovery with a shared checkpoint is a separate Coordinator coordinator path; it is not selected by the public resume call.
+Pausing validates the configured store's artifact and commits Paused after removing the old execution. Local-only files are immediately readable on the owning node; adxlet does not force filesystem writeback, so publication does not guarantee survival of a host crash or power loss. S3 publication waits for upload completion. A SQLite-only result is not cluster success. Public resume requires the authoritative Paused identity and a valid checkpoint. Failed-node cross-node recovery with a shared checkpoint is a separate Coordinator path; it is not selected by the public resume call.
 
 ## Recovery methods
 
@@ -172,7 +172,7 @@ unexpected backend exit on the owning node. If no valid checkpoint exists, the
 Environment becomes Failed and is not recreated from the original image.
 `Sandbox.reload() -> bool` explicitly replaces a Running backend from that same
 recovery point. It returns `True` only after the replacement reaches Running and
-the result is durably published. Automatic restart policy is a separate cold
+the authoritative result is committed. Automatic restart policy is a separate cold
 restart mechanism. Shared-checkpoint node-failure recovery is coordinated by
 Coordinator and is not selected by either public call.
 
