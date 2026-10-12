@@ -374,6 +374,18 @@ class _ExecutorRequestHandler(SandboxRequestMixin, BaseHTTPRequestHandler):
         values = query.get(name)
         return values[0] if values else default
 
+    @staticmethod
+    def _query_bool(query: dict[str, list[str]], name: str, default: bool = False) -> bool:
+        values = query.get(name)
+        if not values:
+            return default
+        value = values[0].lower()
+        if value == "true":
+            return True
+        if value == "false":
+            return False
+        raise ValueError(f"{name} must be true or false")
+
     def send_response(self, code, message=None):
         """Record the response status so _agent_trace can report it on exit."""
         self._agent_response_status = int(code)
