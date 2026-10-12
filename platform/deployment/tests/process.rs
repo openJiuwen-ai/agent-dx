@@ -64,7 +64,27 @@ async fn wait_until_ready(root: &Path) -> serde_json::Value {
 }
 
 fn graceful_service_script() -> &'static str {
-    "#!/bin/sh\ntrap 'exit 0' TERM\nwhile :; do sleep 1; done\n"
+    // Unlike a foreground sleep, wait lets the shell handle TERM immediately
+    // within the fixture's one-second stop budget.
+    "#!/bin/sh\ntrap 'exit 0' TERM\nsleep 100 &\nprintf ready > \"$0.ready\"\nwait\n"
+}
+
+async fn wait_for_graceful_services(root: &Path, binaries: &[&str]) {
+    // A supervisor PID confirms spawn, not that the child installed its TERM
+    // handler. Wait for the fixture's explicit readiness before testing stop.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if binaries
+                .iter()
+                .all(|binary| root.join("bin").join(format!("{binary}.ready")).is_file())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("graceful service fixtures must install their signal handlers");
 }
 
 fn service_status<'a>(status: &'a serde_json::Value, service_id: &str) -> &'a serde_json::Value {
@@ -222,6 +242,7 @@ async fn failed_environment_cleanup_keeps_dependencies_running_then_retries() {
     });
     let supervisor_task = tokio::spawn(supervisor::run(deployment));
     let before = wait_until_ready(&state_directory).await;
+    wait_for_graceful_services(root, &["adx-coordinator", "adxlet"]).await;
     assert!(
         supervisor::request(&state_directory, Request::Stop, Duration::from_secs(5))
             .await
@@ -318,6 +339,7 @@ async fn afs_services_start_and_stop_under_supervisor() {
     let state_directory = deployment.state_dir.clone();
     let supervisor_task = tokio::spawn(supervisor::run(deployment));
     wait_until_ready(&state_directory).await;
+    wait_for_graceful_services(root, &["adx-coordinator", "afs-meta", "afs-node"]).await;
 
     supervisor::request(&state_directory, Request::Stop, Duration::from_secs(5))
         .await
@@ -522,6 +544,7 @@ async fn afs_status_reports_actual_http_health() {
     let supervisor_task = tokio::spawn(supervisor::run(deployment));
 
     let status = wait_until_ready(&state_directory).await;
+    wait_for_graceful_services(root, &["afs-node"]).await;
 
     assert_eq!(
         service_status(&status, "node")["health"]["ready"],
@@ -571,6 +594,7 @@ async fn afs_status_does_not_treat_http_200_degraded_as_ready() {
     let supervisor_task = tokio::spawn(supervisor::run(deployment));
 
     let status = wait_until_ready(&state_directory).await;
+    wait_for_graceful_services(root, &["afs-node"]).await;
 
     assert_eq!(
         service_status(&status, "node")["health"]["ready"],

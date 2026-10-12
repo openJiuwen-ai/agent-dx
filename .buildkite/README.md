@@ -23,6 +23,11 @@ The recorded three-pipeline validation used commit
 The optimized base build completed in 3 minutes 30 seconds, compared with
 7 minutes 11 seconds for the previous serial #65 build. Full passed all ten
 groups on two physical workers with no missing checks or cleanup errors.
+Supervisor process tests use real child fixtures. A successful supervisor status
+request confirms process spawn; graceful-stop tests separately wait for the child
+to report that its TERM handler is installed before sending Stop. This keeps the
+fixture startup race separate from the production termination contract.
+
 ## Pipeline controls
 
 Base builds publish verified candidates to OBS by default. PyPI publication remains opt-in.
