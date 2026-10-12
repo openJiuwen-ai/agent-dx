@@ -156,7 +156,7 @@ def test_start_logs_agent_trace_startup_line(monkeypatch, caplog):
 
     monkeypatch.setattr(
         "yr.agentexecutor.runtime.ExecutorHTTPServer",
-        lambda host, port, max_file_size=0: ServerStub(),
+        lambda host, port, max_file_size=0, sandbox_manager=None: ServerStub(),
     )
     monkeypatch.setattr(
         "yr.agentexecutor.runtime.ProcessManager.start_from_env", lambda self, environ=None: None
