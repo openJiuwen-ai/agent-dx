@@ -77,7 +77,7 @@ Install the platform-independent administrator wheel on an operator workstation,
 then create the first tenant Key through the public HTTPS API:
 
 ```sh
-pipx install ./adxadmin-0.1.0-py3-none-any.whl
+pipx install ./adxadmin-0.1.0rc2-py3-none-any.whl
 export ADX_ENDPOINT=https://adx.example.com:8443
 export ADX_CA_FILE=$HOME/.config/adx/public-ca.pem
 export ADX_ADMIN_TOKEN_FILE=$HOME/.config/adx/admin.key

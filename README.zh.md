@@ -76,7 +76,7 @@ sudo adxctl run
 在管理员工作站安装平台无关的 wheel，然后通过公开 HTTPS API 创建首个租户 Key：
 
 ```sh
-pipx install ./adxadmin-0.1.0-py3-none-any.whl
+pipx install ./adxadmin-0.1.0rc2-py3-none-any.whl
 export ADX_ENDPOINT=https://adx.example.com:8443
 export ADX_CA_FILE=$HOME/.config/adx/public-ca.pem
 export ADX_ADMIN_TOKEN_FILE=$HOME/.config/adx/admin.key
