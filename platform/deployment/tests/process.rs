@@ -265,7 +265,11 @@ async fn supervisor_drains_rotated_logs_on_stop() {
         .tempdir_in("/tmp")
         .unwrap();
     let root = temp_directory.path();
-    install_test_binary(root,"adx-coordinator","#!/bin/sh\ni=1; while [ $i -le 120 ]; do printf 'entry-%s\\n' \"$i\"; i=$((i+1)); done\nexec sleep 100\n");
+    install_test_binary(
+        root,
+        "adx-coordinator",
+        "#!/bin/sh\ntrap 'exit 0' TERM\ni=1; while [ $i -le 120 ]; do printf 'entry-%s\\n' \"$i\"; i=$((i+1)); done\nsleep 100 &\nprintf ready > \"$0.ready\"\nwait\n",
+    );
     let mut deployment = test_deployment(
         root,
         json!([{"id":"coordinator","role":"coordinator","config":{}}]),
@@ -276,29 +280,25 @@ async fn supervisor_drains_rotated_logs_on_stop() {
     let state_directory = deployment.state_dir.clone();
     let supervisor_task = tokio::spawn(supervisor::run(deployment));
     wait_until_ready(&state_directory).await;
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if std::fs::read_dir(state_directory.join("logs"))
-                .unwrap()
-                .count()
-                > 2
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .unwrap();
-    supervisor::request(&state_directory, Request::Stop, Duration::from_secs(5))
+    // Confirm all bytes were submitted by the child, rather than waiting for
+    // asynchronous archive compression to finish before exercising Stop.
+    wait_for_graceful_services(root, &["adx-coordinator"]).await;
+    let stopped = supervisor::request(&state_directory, Request::Stop, Duration::from_secs(5))
         .await
         .unwrap();
     supervisor_task.await.unwrap().unwrap();
+    let logging = &service_status(&stopped, "coordinator")["logging"];
+    assert_eq!(logging["error"], serde_json::Value::Null);
+    assert_eq!(logging["failed_bytes"], 0);
     let mut files = std::fs::read_dir(state_directory.join("logs"))
         .unwrap()
         .map(|entry| entry.unwrap().path())
         .filter(|path| path.extension().is_some_and(|extension| extension == "gz"))
         .collect::<Vec<_>>();
+    assert!(
+        !files.is_empty(),
+        "Stop must drain and compress rotated logs"
+    );
     files.sort();
     let mut content = Vec::new();
     use std::io::Read;
