@@ -82,7 +82,8 @@ def _parse_start_ticks(stat_text: str) -> int:
     close = stat_text.rfind(")")
     if close == -1:
         raise RuntimeError("/proc stat is malformed: missing comm terminator")
-    tail = stat_text[close + 2 :].split()
+    tail_start = close + 2
+    tail = stat_text[tail_start:].split()
     if len(tail) <= 19:
         raise RuntimeError("/proc stat is malformed: missing starttime")
     return int(tail[19])
@@ -231,7 +232,8 @@ def _same_mount_visible(path: Path) -> dict[str, Any]:
         after_close = _read_all(path)
     finally:
         os.close(fd_ro)
-    expected = (overwrite + initial[len(overwrite) :])[:final_size]
+    overwrite_size = len(overwrite)
+    expected = (overwrite + initial[overwrite_size:])[:final_size]
     return {
         "ok": observed == expected and after_close == expected and len(observed) == final_size and close_error is None,
         "before_hex": before.hex(),

@@ -448,21 +448,19 @@ class OwnerFsAcceptance:
                 )
             if self.args.tls_server_name:
                 tls_args.extend(["-authority", self.args.tls_server_name])
-        grpcurl_args = " ".join(
-            shlex.quote(part)
-            for part in [
-                self.args.grpcurl,
-                *tls_args,
-                "-import-path",
-                remote_proto_dir,
-                "-proto",
-                "meta.proto",
-                "-d",
-                f"@{remote_request}",
-                f"127.0.0.1:{self.meta_grpc}",
-                "afs.meta.v1.OwnerRoots/LookupRoot",
-            ]
-        )
+        argv_parts = [
+            self.args.grpcurl,
+            *tls_args,
+            "-import-path",
+            remote_proto_dir,
+            "-proto",
+            "meta.proto",
+            "-d",
+            f"@{remote_request}",
+            f"127.0.0.1:{self.meta_grpc}",
+            "afs.meta.v1.OwnerRoots/LookupRoot",
+        ]
+        grpcurl_args = " ".join(shlex.quote(part) for part in argv_parts)
         script = (
             f"cat > {shlex.quote(remote_request)} <<'OWNERFS_LOOKUP_JSON'\n"
             f"{request_json}\n"

@@ -196,7 +196,8 @@ def parse_start_ticks(stat_text: str) -> int:
     close = stat_text.rfind(")")
     if close == -1:
         raise InventoryError("/proc stat is malformed: missing comm terminator")
-    tail = stat_text[close + 2 :].split()
+    tail_start = close + 2
+    tail = stat_text[tail_start:].split()
     # proc_pid_stat(5): fields after comm start at field 3, so starttime field
     # 22 is tail index 19.
     if len(tail) <= 19:

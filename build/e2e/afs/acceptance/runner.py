@@ -327,12 +327,11 @@ def select_matrix(
     backends = [requested.backend] if requested.backend is not None else backend_expected or [None]
     metas = [requested.meta] if requested.meta is not None else meta_expected or [None]
     transports = [requested.transport] if requested.transport is not None else transport_expected or [None]
-    points = [
-        MatrixSelection(backend=backend, meta=meta, transport=transport)
-        for backend in backends
-        for meta in metas
-        for transport in transports
-    ]
+    points = []
+    for backend in backends:
+        for meta in metas:
+            for transport in transports:
+                points.append(MatrixSelection(backend=backend, meta=meta, transport=transport))
     selected_axes = {}
     for key, values in selected_values.items():
         selected_axes[key] = [value for value in values if value is not None]

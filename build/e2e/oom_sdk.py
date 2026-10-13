@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
 """Standalone OOM contract acceptance. Run only against an isolated fixture."""
 
-from pathlib import Path
-import os, json, time, dataclasses, subprocess, uuid, sys
 import argparse
+import dataclasses
+import importlib.metadata
+import json
+import os
+import subprocess
+import sys
+import time
+import uuid
+from pathlib import Path
 
 parser = argparse.ArgumentParser(
     description="Real standalone OOM-to-SDK acceptance; Linux/cgroup v2, isolated AKernel container required"
@@ -26,12 +33,11 @@ os.environ.update(
     no_proxy="*",
 )
 from adx_sandbox import Sandbox
-import importlib.metadata
 
 
-def docker(args, check=True):
+def docker(command_args, check=True):
     return subprocess.run(
-        ["docker", "exec", NAME] + args, capture_output=True, text=True, check=check, timeout=30
+        ["docker", "exec", NAME] + command_args, capture_output=True, text=True, check=check, timeout=30
     )
 
 
@@ -47,8 +53,7 @@ def error(e):
         "type": type(e).__name__,
         "message": str(e),
         "fields": {
-            k: getattr(e, k, None)
-            for k in ["status_code", "code", "retry", "outcome", "request_id", "instance_id"]
+            k: getattr(e, k, None) for k in ["status_code", "code", "retry", "outcome", "request_id", "instance_id"]
         },
         "payload": getattr(e, "payload", None),
         "failure": getattr(e, "failure", None),
@@ -65,9 +70,54 @@ def record(sid):
     return {k: r.get(k) for k in ["assignment", "result", "invalidated", "revision"]}
 
 
-MAP_CODE = "from pathlib import Path\nimport json,sys\nsid=sys.argv[1];matches=[]\nfor p in Path(sys.argv[2]).glob('*/config.json'):\n try:s=json.loads(p.read_text())\n except (ValueError,OSError):continue\n if s.get('annotations',{}).get('adx.environment_id')!=sid:continue\n cg=s['linux']['cgroupsPath'];path=(Path('/sys/fs/cgroup')/cg.lstrip('/')).resolve()\n if not (str(path).startswith('/sys/fs/cgroup/') and path.name not in ['akernel','system.slice']):raise RuntimeError('unsafe sandbox cgroup')\n d={'backend_id':p.parent.name,'cgroup':str(path),'cgroup_config':cg,'memory_limit':s['linux'].get('resources',{}).get('memory',{}),'runtime_id':s.get('annotations',{}).get('adx.runtime_id')}\n for n in ['memory.max','memory.current','memory.oom.group','memory.events']:\n  try:d[n]=(path/n).read_text().strip()\n  except OSError:d[n]=None\n matches.append(d)\nif len(matches)!=1:raise RuntimeError('ambiguous sandbox identity: '+str(len(matches)))\nprint(json.dumps(matches[0]))"
-MONITOR = "from pathlib import Path\nimport time,json,sys\np=Path(sys.argv[1]);old=None\nfor i in range(900):\n d={'unix':time.time(),'present':p.exists()}\n for n in ['memory.events','memory.oom.group','memory.max']:\n  try:d[n]=(p/n).read_text().strip()\n  except OSError:d[n]=None\n try:d['memory.current']=int((p/'memory.current').read_text())\n except OSError:d['memory.current']=None\n key=(d['present'],d['memory.events'],d['memory.oom.group'])\n if key!=old:print(json.dumps(d),flush=True);old=key\n if not d['present']:break\n time.sleep(.1)"
-PRESSURE = "import os,time\nblocks=[]\nfor i in range(1024):\n b=bytearray(1024*1024)\n for j in range(0,len(b),4096):b[j]=1\n blocks.append(b)\n if i%16==0:print('allocated_mib='+str(i+1),flush=True)\n time.sleep(.002)\nprint('UNEXPECTED_ALLOCATION_COMPLETED',flush=True)\ntime.sleep(2)\n"
+MAP_CODE = (
+    "from pathlib import Path\n"
+    "import json,sys\n"
+    "sid=sys.argv[1];matches=[]\n"
+    "for p in Path(sys.argv[2]).glob('*/config.json'):\n"
+    " try:s=json.loads(p.read_text())\n"
+    " except (ValueError,OSError):continue\n"
+    " if s.get('annotations',{}).get('adx.environment_id')!=sid:continue\n"
+    " cg=s['linux']['cgroupsPath'];path=(Path('/sys/fs/cgroup')/cg.lstrip('/')).resolve()\n"
+    " if not (str(path).startswith('/sys/fs/cgroup/') and path.name not in ['akernel','system.slice']):raise "
+    "RuntimeError('unsafe sandbox cgroup')\n"
+    " d={'backend_id':p.parent.name,'cgroup':str(path),'cgroup_config':cg,'memory_limit':s['linux']"
+    ".get('resources',{}).get('memory',{}),'runtime_id':s.get('annotations',{}).get('adx.runtime_id')}\n"
+    " for n in ['memory.max','memory.current','memory.oom.group','memory.events']:\n"
+    "  try:d[n]=(path/n).read_text().strip()\n"
+    "  except OSError:d[n]=None\n"
+    " matches.append(d)\n"
+    "if len(matches)!=1:raise RuntimeError('ambiguous sandbox identity: '+str(len(matches)))\n"
+    "print(json.dumps(matches[0]))"
+)
+MONITOR = (
+    "from pathlib import Path\n"
+    "import time,json,sys\n"
+    "p=Path(sys.argv[1]);old=None\n"
+    "for i in range(900):\n"
+    " d={'unix':time.time(),'present':p.exists()}\n"
+    " for n in ['memory.events','memory.oom.group','memory.max']:\n"
+    "  try:d[n]=(p/n).read_text().strip()\n"
+    "  except OSError:d[n]=None\n"
+    " try:d['memory.current']=int((p/'memory.current').read_text())\n"
+    " except OSError:d['memory.current']=None\n"
+    " key=(d['present'],d['memory.events'],d['memory.oom.group'])\n"
+    " if key!=old:print(json.dumps(d),flush=True);old=key\n"
+    " if not d['present']:break\n"
+    " time.sleep(.1)"
+)
+PRESSURE = (
+    "import os,time\n"
+    "blocks=[]\n"
+    "for i in range(1024):\n"
+    " b=bytearray(1024*1024)\n"
+    " for j in range(0,len(b),4096):b[j]=1\n"
+    " blocks.append(b)\n"
+    " if i%16==0:print('allocated_mib='+str(i+1),flush=True)\n"
+    " time.sleep(.002)\n"
+    "print('UNEXPECTED_ALLOCATION_COMPLETED',flush=True)\n"
+    "time.sleep(2)\n"
+)
 
 
 def main():
@@ -75,7 +125,7 @@ def main():
         raise RuntimeError("Refuse to overwrite previous run")
     parent_before = json.loads(subprocess.check_output(["docker", "inspect", NAME], text=True))[0]
     before = docker(["sbox", "list"]).stdout
-    if len([l for l in before.splitlines()[1:] if l.strip()]):
+    if [line for line in before.splitlines()[1:] if line.strip()]:
         raise RuntimeError("Standalone has unrelated backends; defer OOM test")
     identity = {
         "parent_before": {k: parent_before["State"][k] for k in ["Pid", "StartedAt"]},
@@ -115,7 +165,11 @@ def main():
             )
             case_data["environment_id"] = sb.id
             proof = sb.commands.run(
-                "echo OOM_PREFLIGHT_OK; cat /proc/meminfo | head -n 3; cat /proc/self/cgroup; grep cgroup /proc/self/mountinfo || true",
+                (
+                    "echo OOM_PREFLIGHT_OK; cat /proc/meminfo | head -n 3; cat /proc/self/cgroup; grep cgroup "
+                    "/proc/self/mountinfo || "
+                    "true"
+                ),
                 timeout=10,
             )
             if proof.exit_code != 0 or "OOM_PREFLIGHT_OK" not in proof.stdout:
@@ -129,7 +183,7 @@ def main():
                     raise RuntimeError("unsafe sandbox memory limit: " + json.dumps(mapping))
             else:
                 memtotal = (
-                    int(next((l.split()[1] for l in proof.stdout.splitlines() if l.startswith("MemTotal:"))))
+                    int(next((line.split()[1] for line in proof.stdout.splitlines() if line.startswith("MemTotal:"))))
                     * 1024
                 )
                 if not 0 < memtotal <= 512 * 1048576:
@@ -139,7 +193,11 @@ def main():
                     [
                         "python3",
                         "-c",
-                        'from pathlib import Path\nimport sys\np=Path(sys.argv[1])\nif not p.is_dir():raise RuntimeError("sandbox cgroup is absent")\n(p/"memory.oom.group").write_text("1")',
+                        (
+                            "from pathlib import Path\nimport sys\np=Path(sys.argv[1])\nif not p.is_dir():raise "
+                            'RuntimeError("sandbox cgroup is absent")\n'
+                            '(p/"memory.oom.group").write_text("1")'
+                        ),
                         mapping["cgroup"],
                     ]
                 )
@@ -176,9 +234,7 @@ def main():
             case_data["views"] = views
             case_data["after_record"] = record(sb.id)
             try:
-                case_data["subsequent_command"] = dataclasses.asdict(
-                    sb.commands.run("echo AFTER_OOM_ALIVE", timeout=5)
-                )
+                case_data["subsequent_command"] = dataclasses.asdict(sb.commands.run("echo AFTER_OOM_ALIVE", timeout=5))
             except Exception as e:
                 case_data["subsequent_command_error"] = error(e)
             if runtime == "firecracker":
@@ -207,8 +263,7 @@ def main():
                     or result.get("error_code") is not None
                 ):
                     raise AssertionError(
-                        "user-process termination signal did not reach SDK CommandResult: "
-                        + json.dumps(result)
+                        "user-process termination signal did not reach SDK CommandResult: " + json.dumps(result)
                     )
                 if (
                     views[-1].get("sdk_get_info", {}).get("state") != "running"
@@ -218,10 +273,7 @@ def main():
                 handle = sb.commands.run("exec python3 /tmp/oom_pressure.py", background=True, timeout=20)
                 background_result = dataclasses.asdict(handle.wait(timeout=25))
                 case_data["background_oom_result"] = background_result
-                if (
-                    background_result.get("exit_signal") != 9
-                    or background_result.get("error_code") is not None
-                ):
+                if background_result.get("exit_signal") != 9 or background_result.get("error_code") is not None:
                     raise AssertionError(
                         "background termination signal was not retained: " + json.dumps(background_result)
                     )
@@ -230,9 +282,7 @@ def main():
                     result = dataclasses.asdict(sb.commands.run(command, timeout=timeout))
                     controls.append({"command": command, "result": result})
                     if result.get("error_code") is not None:
-                        raise AssertionError(
-                            "ordinary termination unexpectedly received an error classification"
-                        )
+                        raise AssertionError("ordinary termination unexpectedly received an error classification")
                 case_data["negative_controls"] = controls
             case_data["harness_status"] = "completed"
         except Exception as e:
@@ -261,9 +311,9 @@ def main():
                 log.close()
             case_data["cgroup_samples"] = (
                 [
-                    json.loads(l)
-                    for l in (ROOT / (case + "-cgroup.jsonl")).read_text().splitlines()
-                    if l.startswith("{")
+                    json.loads(line)
+                    for line in (ROOT / (case + "-cgroup.jsonl")).read_text().splitlines()
+                    if line.startswith("{")
                 ]
                 if (ROOT / (case + "-cgroup.jsonl")).exists()
                 else []
@@ -273,22 +323,20 @@ def main():
             (ROOT / "results.json").write_text(json.dumps(results, indent=2, default=str) + "\n")
     inventory = docker(["sbox", "list"]).stdout
     (ROOT / "backend-final.txt").write_text(inventory)
-    environments = docker(
-        ["/opt/adx/current/bin/redis-cli", "--raw", "HKEYS", "adx:{akernel}:control:v1"]
-    ).stdout
+    environments = docker(["/opt/adx/current/bin/redis-cli", "--raw", "HKEYS", "adx:{akernel}:control:v1"]).stdout
     own = {r.get("environment_id") for r in results}
+    environment_prefix = "environment:"
+    prefix_length = len(environment_prefix)
     residual = [
-        l
-        for l in environments.splitlines()
-        if l.startswith("environment:") and l[len("environment:") :] in own
+        line
+        for line in environments.splitlines()
+        if line.startswith(environment_prefix) and line[prefix_length:] in own
     ]
     (ROOT / "redis-final.json").write_text(json.dumps({"test_environment_fields": residual}) + "\n")
-    parent = json.loads(
-        subprocess.check_output(["docker", "inspect", "-f", "{{json .State}}", NAME], text=True)
-    )
+    parent = json.loads(subprocess.check_output(["docker", "inspect", "-f", "{{json .State}}", NAME], text=True))
     clean = (
         not residual
-        and (not [l for l in inventory.splitlines()[1:] if l.strip()])
+        and (not [line for line in inventory.splitlines()[1:] if line.strip()])
         and parent["Running"]
         and (parent["Pid"] == parent_before["State"]["Pid"])
         and (parent["StartedAt"] == parent_before["State"]["StartedAt"])

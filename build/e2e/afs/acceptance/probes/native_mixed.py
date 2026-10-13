@@ -285,7 +285,8 @@ class Inotify:
             while offset + 16 <= len(data):
                 wd, mask, cookie, name_len = struct.unpack_from("iIII", data, offset)
                 offset += 16
-                raw_name = data[offset : offset + name_len]
+                name_end = offset + name_len
+                raw_name = data[offset:name_end]
                 offset += name_len
                 name = raw_name.rstrip(b"\0").decode("utf-8", "replace")
                 events.append(
@@ -596,13 +597,14 @@ class Probe:
             try:
                 with mmap.mmap(nfd, 4096, flags=mmap.MAP_SHARED, prot=mmap.PROT_READ | mmap.PROT_WRITE) as view:
                     native_payload = b"NATIVE-MAP-SHARED"
-                    view[128 : 128 + len(native_payload)] = native_payload
+                    native_end = 128 + len(native_payload)
+                    view[128:native_end] = native_payload
                     view.flush()
                     os.fsync(nfd)
             finally:
                 os.close(nfd)
             expect(
-                primary_file.read_bytes()[128 : 128 + len(native_payload)] == native_payload,
+                primary_file.read_bytes()[128:native_end] == native_payload,
                 "FUSE read sees native MAP_SHARED write",
             )
 
@@ -610,15 +612,14 @@ class Probe:
             try:
                 with mmap.mmap(nfd, 4096, flags=mmap.MAP_SHARED, prot=mmap.PROT_READ) as view:
                     fuse_payload = b"FUSE-WRITE-SEEN-BY-MAP"
+                    fuse_end = 512 + len(fuse_payload)
                     pfd = os.open(primary_file, os.O_WRONLY)
                     try:
                         os.pwrite(pfd, fuse_payload, 512)
                         os.fsync(pfd)
                     finally:
                         os.close(pfd)
-                    expect(
-                        view[512 : 512 + len(fuse_payload)] == fuse_payload, "native MAP_SHARED read sees FUSE write"
-                    )
+                    expect(view[512:fuse_end] == fuse_payload, "native MAP_SHARED read sees FUSE write")
             finally:
                 os.close(nfd)
             json_write(

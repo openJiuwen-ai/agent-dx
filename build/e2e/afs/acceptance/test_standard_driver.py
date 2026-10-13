@@ -629,16 +629,14 @@ class StandardHostRemoteGuardTest(unittest.TestCase):
     def test_host_mirrors_legacy_acceptance_environment_defaults(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp) / "env-run"
-            old_env = {
-                name: os.environ.get(name)
-                for name in (
-                    "AFS_ACCEPTANCE_BACKEND",
-                    "AFS_ACCEPTANCE_PROFILE",
-                    "AFS_ACCEPTANCE_CASE_ID",
-                    "AFS_ACCEPTANCE_MATRIX",
-                    "AFS_ACCEPTANCE_RUN_DIR",
-                )
-            }
+            env_names = (
+                "AFS_ACCEPTANCE_BACKEND",
+                "AFS_ACCEPTANCE_PROFILE",
+                "AFS_ACCEPTANCE_CASE_ID",
+                "AFS_ACCEPTANCE_MATRIX",
+                "AFS_ACCEPTANCE_RUN_DIR",
+            )
+            old_env = {name: os.environ.get(name) for name in env_names}
             os.environ.update(
                 {
                     "AFS_ACCEPTANCE_BACKEND": "DFS",

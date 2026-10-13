@@ -437,7 +437,8 @@ def parse_start_ticks(stat_text: str) -> int:
     close = stat_text.rfind(")")
     if close == -1:
         raise RuntimeError("/proc stat is malformed: missing comm terminator")
-    tail = stat_text[close + 2 :].split()
+    tail_start = close + 2
+    tail = stat_text[tail_start:].split()
     if len(tail) <= 19:
         raise RuntimeError("/proc stat is malformed: missing starttime")
     return int(tail[19])
@@ -507,8 +508,9 @@ def string_map_toml_value(values: dict[str, Any], key: str) -> dict[str, str]:
     if isinstance(value, str) and value:
         return {key: value}
     prefix = f"{key}."
+    prefix_length = len(prefix)
     children = {
-        name[len(prefix) :]: child
+        name[prefix_length:]: child
         for name, child in values.items()
         if name.startswith(prefix) and isinstance(child, str) and child
     }
@@ -604,8 +606,10 @@ def process_socket_inodes(pid: int) -> set[str]:
             target = os.readlink(fd)
         except OSError:
             continue
-        if target.startswith("socket:[") and target.endswith("]"):
-            inodes.add(target[len("socket:[") : -1])
+        socket_prefix = "socket:["
+        if target.startswith(socket_prefix) and target.endswith("]"):
+            prefix_length = len(socket_prefix)
+            inodes.add(target[prefix_length:-1])
     return inodes
 
 
@@ -617,9 +621,15 @@ def parse_ipv4_hex(value: str) -> str:
 def parse_ipv6_hex(value: str) -> str:
     # /proc/net/tcp6 stores each 32-bit word little-endian.
     raw = bytes.fromhex(value)
-    words = [raw[index : index + 4][::-1] for index in range(0, 16, 4)]
+    words = []
+    for index in range(0, 16, 4):
+        end = index + 4
+        words.append(raw[index:end][::-1])
     data = b"".join(words)
-    groups = [data[index : index + 2].hex() for index in range(0, 16, 2)]
+    groups = []
+    for index in range(0, 16, 2):
+        end = index + 2
+        groups.append(data[index:end].hex())
     return ":".join(groups)
 
 
@@ -1850,7 +1860,8 @@ def legacy_main(argv: list[str]) -> int:
                     shutil.rmtree(fixture)
                     fixture_kept = False
                     checks.append(build_check("cleanup-fixture", "PASS", {"fixture": str(fixture), "kept": False}))
-                except Exception as cleanup_exc:  # noqa: BLE001 - preserve suite accounting and report cleanup separately
+                except Exception as cleanup_exc:  # noqa: BLE001
+                    # Preserve suite accounting and report cleanup separately.
                     fixture_kept = True
                     cleanup_artifact = artifacts / "cleanup-error.json"
                     write_json(

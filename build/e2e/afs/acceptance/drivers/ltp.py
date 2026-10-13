@@ -277,7 +277,8 @@ def extract_ltp_events(text: str) -> list[dict[str, Any]]:
         if not match:
             continue
         prefix = line[: match.start()].strip()
-        message = line[match.end() :].strip()
+        message_start = match.end()
+        message = line[message_start:].strip()
         case_index = None
         index_match = re.search(r"(?:^|\s)(\d+)\s*$", prefix)
         if index_match:

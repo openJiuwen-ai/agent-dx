@@ -113,7 +113,8 @@ class DfsUniqueIoQualificationTests(unittest.TestCase):
                 for block_in_chunk in range(CHUNK_BYTES // BLOCK_BYTES):
                     block_index = chunk_index * (CHUNK_BYTES // BLOCK_BYTES) + block_in_chunk
                     begin = block_in_chunk * BLOCK_BYTES
-                    self.assertEqual(chunk[begin : begin + 16], expected_block(block_index)[:16])
+                    end = begin + 16
+                    self.assertEqual(chunk[begin:end], expected_block(block_index)[:16])
             self.assertEqual(handle.read(1), b"")
         self.assertEqual(digest.hexdigest(), EXPECTED_SHA256)
         self.assertEqual(len(set(chunk_digests)), 16)

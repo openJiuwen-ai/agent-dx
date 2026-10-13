@@ -324,7 +324,8 @@ def fetch_json(url: str, timeout: float) -> dict[str, Any]:
     body = b""
     error = None
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310 - operator supplied acceptance URL
+        # Operator supplied acceptance URL.
+        with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310
             status = response.getcode()
             body = response.read(1024 * 1024)
     except urllib.error.HTTPError as exc:

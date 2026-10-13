@@ -700,22 +700,17 @@ def delete_writer(args: argparse.Namespace) -> dict[str, Any]:
                 "comparison_status": "CANDIDATE_ONLY_3FS_COMPARATOR_NOT_RUN",
             }
         )
-        write_json(
-            output / "preflight.json",
-            {
-                k: result[k]
-                for k in (
-                    "product_source_commit",
-                    "compiler_input_map",
-                    "identity_source",
-                    "platform",
-                    "fs",
-                    "mount",
-                    "delete_shape",
-                    "owner_delete_helper",
-                )
-            },
+        preflight_keys = (
+            "product_source_commit",
+            "compiler_input_map",
+            "identity_source",
+            "platform",
+            "fs",
+            "mount",
+            "delete_shape",
+            "owner_delete_helper",
         )
+        write_json(output / "preflight.json", {key: result[key] for key in preflight_keys})
         for index in range(WARMUP_ROUNDS + MEASUREMENT_ROUNDS):
             sample = run_delete_sample(dfs_root, run_id, index, helper)
             sample_path = output / "delete-samples" / f"round-{index:02d}.json"
