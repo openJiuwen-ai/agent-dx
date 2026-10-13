@@ -538,25 +538,25 @@ def _worker_main(args: argparse.Namespace) -> int:
             )
             return 0
         if args.op == "same-mount":
-            if not path is not None:
+            if path is None:
                 raise AssertionError("path is not None")
             result = _same_mount_visible(path)
             _emit(_result_event(args.op, path, expected_processes, **result, stat=_stat_json(path)))
             return 0 if result.get("ok") else 1
         if args.op == "write-close":
-            if not path is not None:
+            if path is None:
                 raise AssertionError("path is not None")
             result = _write_close(path, args.payload.encode(), args.resize_to, args.fsync_before_close)
             _emit(_result_event(args.op, path, expected_processes, **result, stat=_stat_json(path)))
             return 0 if result.get("ok") else 1
         if args.op == "fresh-verify":
-            if not path is not None:
+            if path is None:
                 raise AssertionError("path is not None")
             result = _fresh_verify(path, args.expected.encode())
             _emit(_result_event(args.op, path, expected_processes, **result, stat=_stat_json(path)))
             return 0 if result.get("ok") else 1
         if args.op == "provider-resize-write-visible":
-            if not path is not None:
+            if path is None:
                 raise AssertionError("path is not None")
             result = _provider_resize_write_visible(
                 path, args.payload.encode(), 0 if args.resize_to is None else args.resize_to
@@ -564,13 +564,13 @@ def _worker_main(args: argparse.Namespace) -> int:
             _emit(_result_event(args.op, path, expected_processes, **result, stat=_stat_json(path)))
             return 0 if result.get("ok") else 1
         if args.op == "rename-overwrite-hardlink":
-            if not path is not None:
+            if path is None:
                 raise AssertionError("path is not None")
             result = _rename_overwrite_hardlink(path)
             _emit(_result_event(args.op, path, expected_processes, **result, stat=_stat_json(path)))
             return 0 if result.get("ok") else 1
         if args.op == "hold-old-then-fresh":
-            if not path is not None:
+            if path is None:
                 raise AssertionError("path is not None")
             return _hold_old_then_fresh(path, args.expected.encode(), expected_processes)
         raise RuntimeError(f"unknown worker op {args.op!r}")
@@ -600,7 +600,7 @@ class StreamingWorker:
         self.stderr = ""
 
     def read_event(self, event: str) -> dict[str, Any]:
-        if not self.proc.stdout is not None:
+        if self.proc.stdout is None:
             raise AssertionError("self.proc.stdout is not None")
         selector = selectors.DefaultSelector()
         selector.register(self.proc.stdout, selectors.EVENT_READ)
@@ -649,7 +649,7 @@ class StreamingWorker:
             self.stderr += err or ""
 
     def send_go(self) -> None:
-        if not self.proc.stdin is not None:
+        if self.proc.stdin is None:
             raise AssertionError("self.proc.stdin is not None")
         self.proc.stdin.write("GO\n")
         self.proc.stdin.flush()

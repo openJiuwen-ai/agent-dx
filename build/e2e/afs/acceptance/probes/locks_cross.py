@@ -214,7 +214,7 @@ def _worker_main(args: argparse.Namespace) -> int:
             )
             return 0
         if op == "init":
-            if not path is not None:
+            if path is None:
                 raise AssertionError("path is not None")
             path.parent.mkdir(parents=True, exist_ok=True)
             fd = os.open(path, os.O_CREAT | os.O_TRUNC | os.O_RDWR, 0o666)
@@ -226,13 +226,13 @@ def _worker_main(args: argparse.Namespace) -> int:
             _emit(_worker_result(op, path, stat=_stat_json(path), **identity_kwargs))
             return 0
         if op == "read_stat":
-            if not path is not None:
+            if path is None:
                 raise AssertionError("path is not None")
             data = path.read_bytes()
             _emit(_worker_result(op, path, stat=_stat_json(path), prefix=data[:32].hex(), **identity_kwargs))
             return 0
         if op == "unlink_path":
-            if not path is not None:
+            if path is None:
                 raise AssertionError("path is not None")
             existed = path.exists()
             if existed:
@@ -240,7 +240,7 @@ def _worker_main(args: argparse.Namespace) -> int:
             _emit(_worker_result(op, path, existed=existed, removed=not path.exists(), **identity_kwargs))
             return 0
         if op == "try_fcntl":
-            if not path is not None:
+            if path is None:
                 raise AssertionError("path is not None")
             fd = os.open(path, os.O_RDWR)
             try:
@@ -262,7 +262,7 @@ def _worker_main(args: argparse.Namespace) -> int:
             finally:
                 os.close(fd)
         if op == "try_readonly_write_lock":
-            if not path is not None:
+            if path is None:
                 raise AssertionError("path is not None")
             fd = os.open(path, os.O_RDONLY)
             try:
@@ -284,7 +284,7 @@ def _worker_main(args: argparse.Namespace) -> int:
             finally:
                 os.close(fd)
         if op == "getlk":
-            if not path is not None:
+            if path is None:
                 raise AssertionError("path is not None")
             fd = os.open(path, os.O_RDWR)
             try:
@@ -294,7 +294,7 @@ def _worker_main(args: argparse.Namespace) -> int:
             finally:
                 os.close(fd)
         if op == "hold_fcntl":
-            if not path is not None:
+            if path is None:
                 raise AssertionError("path is not None")
             fd = os.open(path, os.O_RDWR)
             try:
@@ -324,7 +324,7 @@ def _worker_main(args: argparse.Namespace) -> int:
             finally:
                 os.close(fd)
         if op == "wait_fcntl":
-            if not path is not None:
+            if path is None:
                 raise AssertionError("path is not None")
             fd = os.open(path, os.O_RDWR)
             interrupted = False
@@ -389,7 +389,7 @@ def _worker_main(args: argparse.Namespace) -> int:
             finally:
                 os.close(fd)
         if op == "fcntl_close_other_then_hold":
-            if not path is not None:
+            if path is None:
                 raise AssertionError("path is not None")
             fd = os.open(path, os.O_RDWR)
             fd2 = os.open(path, os.O_RDWR)
@@ -424,7 +424,7 @@ def _worker_main(args: argparse.Namespace) -> int:
                     os.close(fd2)
                 os.close(fd)
         if op == "hold_flock":
-            if not path is not None:
+            if path is None:
                 raise AssertionError("path is not None")
             fd = os.open(path, os.O_RDWR)
             try:
@@ -443,7 +443,7 @@ def _worker_main(args: argparse.Namespace) -> int:
             finally:
                 os.close(fd)
         if op == "try_flock":
-            if not path is not None:
+            if path is None:
                 raise AssertionError("path is not None")
             fd = os.open(path, os.O_RDWR)
             try:
@@ -465,7 +465,7 @@ def _worker_main(args: argparse.Namespace) -> int:
             finally:
                 os.close(fd)
         if op == "flock_dup_close_then_hold":
-            if not path is not None:
+            if path is None:
                 raise AssertionError("path is not None")
             fd = os.open(path, os.O_RDWR)
             try:
@@ -488,7 +488,7 @@ def _worker_main(args: argparse.Namespace) -> int:
             finally:
                 os.close(fd)
         if op == "fcntl_rename_unlink_recreate":
-            if not path is not None:
+            if path is None:
                 raise AssertionError("path is not None")
             renamed = Path(args.renamed_path).resolve() if args.renamed_path else path.with_name(path.name + ".held")
             fd = os.open(path, os.O_RDWR)
@@ -602,7 +602,7 @@ class WorkerProcess:
 
     def send(self, line: str) -> None:
         if self.proc.poll() is None:
-            if not self.proc.stdin is not None:
+            if self.proc.stdin is None:
                 raise AssertionError("self.proc.stdin is not None")
             self.proc.stdin.write(line + "\n")
             self.proc.stdin.flush()

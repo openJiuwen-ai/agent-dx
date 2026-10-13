@@ -1140,7 +1140,7 @@ def start_worker_json(worker: dict[str, Any], args: list[str]) -> dict[str, Any]
 
 def read_worker_event(started_record: dict[str, Any], event: str, timeout: int) -> dict[str, Any]:
     proc = started_record["proc"]
-    if not proc.stdout is not None:
+    if proc.stdout is None:
         raise AssertionError("proc.stdout is not None")
     deadline = time.monotonic() + timeout
     while True:
@@ -1178,7 +1178,7 @@ def read_worker_event(started_record: dict[str, Any], event: str, timeout: int) 
 
 def finish_started_worker(started_record: dict[str, Any], command: str, timeout: int) -> dict[str, Any]:
     proc = started_record["proc"]
-    if not proc.stdin is not None:
+    if proc.stdin is None:
         raise AssertionError("proc.stdin is not None")
     started = started_record["started"]
     proc.stdin.write(command + "\n")

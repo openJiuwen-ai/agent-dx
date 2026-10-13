@@ -73,7 +73,7 @@ def relay_commands(
 
     def pump(role: str, proc: subprocess.Popen[str]) -> None:
         try:
-            if not proc.stdout is not None:
+            if proc.stdout is None:
                 raise AssertionError("proc.stdout is not None")
             for line in proc.stdout:
                 messages.put((role, line))

@@ -27,7 +27,7 @@ def _load_counts_module():
     path = Path(__file__).resolve().with_name("fuse_callback_counts.py")
     spec = importlib.util.spec_from_file_location("fuse_callback_counts", path)
     module = importlib.util.module_from_spec(spec)
-    if not spec.loader is not None:
+    if spec.loader is None:
         raise AssertionError("spec.loader is not None")
     spec.loader.exec_module(module)
     return module

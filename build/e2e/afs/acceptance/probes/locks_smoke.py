@@ -408,7 +408,7 @@ class Child:
     def release(self) -> int:
         if self.proc.poll() is None:
             try:
-                if not self.proc.stdin is not None:
+                if self.proc.stdin is None:
                     raise AssertionError("self.proc.stdin is not None")
                 self.proc.stdin.write("release\n")
                 self.proc.stdin.flush()

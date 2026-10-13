@@ -418,7 +418,7 @@ def run_endpoint(args: argparse.Namespace) -> int:
     chunks: list[bytes] = []
 
     def reader() -> None:
-        if not proc.stdout is not None:
+        if proc.stdout is None:
             raise AssertionError("proc.stdout is not None")
         with raw_path.open("xb") as f:
             for chunk in iter(lambda: proc.stdout.readline(), b""):
