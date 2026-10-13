@@ -4,29 +4,38 @@
 Keep failed protocol output and reap the whole cohort before product teardown.
 This helper records transport/process closure, not data or performance acceptance.
 """
+
 from __future__ import annotations
 
 import argparse
 import json
 import os
-from pathlib import Path
 import queue
 import signal
 import subprocess
 import threading
 import time
+from pathlib import Path
 
 ROLES = ("ctl", "A", "B", "C")
 
 
-def relay_commands(commands: dict[str, list[str]], output: Path, *, timeout: float = 95,
-                   drain_timeout: float = 65, terminate_timeout: float = 2,
-                   protocol: str = "multinode") -> dict[str, object]:
+def relay_commands(
+    commands: dict[str, list[str]],
+    output: Path,
+    *,
+    timeout: float = 95,
+    drain_timeout: float = 65,
+    terminate_timeout: float = 2,
+    protocol: str = "multinode",
+) -> dict[str, object]:
     if protocol not in ("multinode", "pair"):
         raise ValueError("protocol must be multinode or pair")
     roles = ROLES if protocol == "multinode" else ("ctl", "B", "C")
     workers = roles[1:]
-    if set(commands) != set(roles) or any(not v or not all(isinstance(s, str) and s for s in v) for v in commands.values()):
+    if set(commands) != set(roles) or any(
+        not v or not all(isinstance(s, str) and s for s in v) for v in commands.values()
+    ):
         raise ValueError("exact protocol roles with nonempty argv required")
     if min(timeout, drain_timeout, terminate_timeout) <= 0:
         raise ValueError("positive timeouts required")
@@ -47,7 +56,7 @@ def relay_commands(commands: dict[str, list[str]], output: Path, *, timeout: flo
         try:
             if p.stdin and not p.stdin.closed:
                 p.stdin.close()
-        except (BrokenPipeError, OSError) as error:
+        except OSError as error:
             errors.append({"stage": "stdin_close", "role": role, "error": repr(error)})
 
     def fail(stage: str, error: object, role: str = "", *, authoritative: bool = False) -> None:
@@ -64,7 +73,8 @@ def relay_commands(commands: dict[str, list[str]], output: Path, *, timeout: flo
 
     def pump(role: str, proc: subprocess.Popen[str]) -> None:
         try:
-            assert proc.stdout is not None
+            if not proc.stdout is not None:
+                raise AssertionError("proc.stdout is not None")
             for line in proc.stdout:
                 messages.put((role, line))
         finally:
@@ -111,7 +121,7 @@ def relay_commands(commands: dict[str, list[str]], output: Path, *, timeout: flo
                 raise BrokenPipeError("target stdin already closed")
             stream.write(line)
             stream.flush()
-        except (BrokenPipeError, OSError) as error:
+        except OSError as error:
             fail("forward", error, role)
 
     def terminate_groups(sig: int) -> None:
@@ -126,13 +136,30 @@ def relay_commands(commands: dict[str, list[str]], output: Path, *, timeout: flo
 
     try:
         for role in roles:
-            (output / (role + ".command.json")).write_text(json.dumps({"argv": commands[role],
-                "timeout": timeout, "drain_timeout": drain_timeout, "timing_owner": "Linux worker/ctl only"}, indent=2) + "\n")
+            (output / (role + ".command.json")).write_text(
+                json.dumps(
+                    {
+                        "argv": commands[role],
+                        "timeout": timeout,
+                        "drain_timeout": drain_timeout,
+                        "timing_owner": "Linux worker/ctl only",
+                    },
+                    indent=2,
+                )
+                + "\n"
+            )
             out = (output / (role + ".stdout")).open("w")
             err = (output / (role + ".stderr")).open("w")
             handles[role] = (out, err)
-            proc = subprocess.Popen(commands[role], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                    stderr=err, text=True, bufsize=1, start_new_session=True)
+            proc = subprocess.Popen(
+                commands[role],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=err,
+                text=True,
+                bufsize=1,
+                start_new_session=True,
+            )
             procs[role] = proc
             thread = threading.Thread(target=pump, args=(role, proc), daemon=True)
             threads[role] = thread
@@ -182,25 +209,39 @@ def relay_commands(commands: dict[str, list[str]], output: Path, *, timeout: flo
         for role, proc in procs.items():
             if proc.stdout:
                 proc.stdout.close()
-            (output / (role + ".result.json")).write_text(json.dumps({"rc": codes.get(role),
-                "reaped": proc.poll() is not None}, indent=2) + "\n")
+            (output / (role + ".result.json")).write_text(
+                json.dumps({"rc": codes.get(role), "reaped": proc.poll() is not None}, indent=2) + "\n"
+            )
         for out, err in handles.values():
             out.close()
             err.close()
     summaries = [v["event"] for v in events if v["source"] == "ctl" and v["event"].get("event") == "SUMMARY"]
-    finals = {r: [v["event"] for v in events if v["source"] == r and v["event"].get("event") == "FINAL"] for r in workers}
-    summary_complete = ((len(summaries) == 1 and summaries[0].get("status") == "DATA_RECORDED")
-                        if protocol == "multinode" else not summaries)
-    if primary is None and (not summary_complete
-                           or any(len(rows) != 1 or rows[0].get("status") != "DATA_RECORDED" for rows in finals.values())):
+    finals = {
+        r: [v["event"] for v in events if v["source"] == r and v["event"].get("event") == "FINAL"] for r in workers
+    }
+    summary_complete = (
+        (len(summaries) == 1 and summaries[0].get("status") == "DATA_RECORDED")
+        if protocol == "multinode"
+        else not summaries
+    )
+    if primary is None and (
+        not summary_complete
+        or any(len(rows) != 1 or rows[0].get("status") != "DATA_RECORDED" for rows in finals.values())
+    ):
         fail("missing_completion", "exact protocol completion and successful worker finals required")
     if primary is None and (set(codes) != set(roles) or any(rc != 0 for rc in codes.values())):
         fail("process_exit", codes)
-    result = {"status": "PASS_TRANSPORT_CLOSURE_ONLY" if primary is None else "FAIL",
-              "primary_error": primary, "errors": errors, "codes": codes,
-              "all_started_processes_reaped": all(p.poll() is not None for p in procs.values()),
-              "all_stdout_pumps_closed": all(not t.is_alive() for t in threads.values()),
-              "started_roles": list(procs), "protocol": protocol, "no_data_or_performance_acceptance_claim": True}
+    result = {
+        "status": "PASS_TRANSPORT_CLOSURE_ONLY" if primary is None else "FAIL",
+        "primary_error": primary,
+        "errors": errors,
+        "codes": codes,
+        "all_started_processes_reaped": all(p.poll() is not None for p in procs.values()),
+        "all_stdout_pumps_closed": all(not t.is_alive() for t in threads.values()),
+        "started_roles": list(procs),
+        "protocol": protocol,
+        "no_data_or_performance_acceptance_claim": True,
+    }
     (output / "events.json").write_text(json.dumps(events, indent=2) + "\n")
     (output / "summary.json").write_text(json.dumps(result, indent=2) + "\n")
     return result
@@ -212,11 +253,20 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True, help="fresh receipt directory")
     parser.add_argument("--timeout", type=float, default=95)
     parser.add_argument("--drain-timeout", type=float, default=65)
-    parser.add_argument("--protocol", choices=("multinode", "pair"), default="multinode",
-                        help="pair uses existing ctl/B/C HELLO/READY/DONE protocol; default unchanged")
+    parser.add_argument(
+        "--protocol",
+        choices=("multinode", "pair"),
+        default="multinode",
+        help="pair uses existing ctl/B/C HELLO/READY/DONE protocol; default unchanged",
+    )
     args = parser.parse_args()
-    result = relay_commands(json.loads(args.commands.read_text()), args.output,
-                            timeout=args.timeout, drain_timeout=args.drain_timeout, protocol=args.protocol)
+    result = relay_commands(
+        json.loads(args.commands.read_text()),
+        args.output,
+        timeout=args.timeout,
+        drain_timeout=args.drain_timeout,
+        protocol=args.protocol,
+    )
     print(json.dumps(result, indent=2))
     return 0 if result["status"] == "PASS_TRANSPORT_CLOSURE_ONLY" else 1
 

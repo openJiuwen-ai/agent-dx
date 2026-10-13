@@ -13,6 +13,7 @@ Plan and scope:
   identity, and exit status.  Unsupported lock APIs or unsupported errno values
   fail the primitive instead of being treated as conflicts.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -30,7 +31,6 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Any
-
 
 F_OFD_GETLK = getattr(fcntl, "F_OFD_GETLK", None)
 F_OFD_SETLK = getattr(fcntl, "F_OFD_SETLK", None)
@@ -252,14 +252,20 @@ class Child:
             line = self._readline_bounded(deadline)
             if not line:
                 if self.proc.poll() is not None:
-                    raise RuntimeError(json.dumps({"message": f"child exited before {expected}", "child": self.snapshot()}, sort_keys=True))
+                    raise RuntimeError(
+                        json.dumps(
+                            {"message": f"child exited before {expected}", "child": self.snapshot()}, sort_keys=True
+                        )
+                    )
                 continue
             event = json.loads(line)
             self.events.append(event)
             if event.get("event") == expected:
                 return event
         child = self.terminate_owned()
-        raise TimeoutError(json.dumps({"message": f"timed out waiting for child event {expected}", "child": child}, sort_keys=True))
+        raise TimeoutError(
+            json.dumps({"message": f"timed out waiting for child event {expected}", "child": child}, sort_keys=True)
+        )
 
     def send(self) -> None:
         require(self.proc.stdin is not None, "child stdin missing")
@@ -339,7 +345,11 @@ def assert_lock_seen(
     length: int,
     pid: int,
 ) -> None:
-    require(result["ok"] and result["result"]["l_type_name"] in {"F_RDLCK", "F_WRLCK"}, f"{label} reports conflicting lock", result)
+    require(
+        result["ok"] and result["result"]["l_type_name"] in {"F_RDLCK", "F_WRLCK"},
+        f"{label} reports conflicting lock",
+        result,
+    )
     observed = result["result"]
     require(observed["l_type_name"] == lock_type, f"{label} reports exact lock type", result)
     require(observed["l_start"] == start, f"{label} reports exact start", result)
@@ -360,7 +370,9 @@ def run_probe(work_dir: Path, output: Path) -> dict[str, Any]:
     require(platform.machine() == "aarch64", "native_lock_kernel requires aarch64", platform.machine())
     require(os.geteuid() == 0, "native_lock_kernel requires root")
     require(F_OFD_GETLK is not None and F_OFD_SETLK is not None, "missing F_OFD_* constants")
-    require(work_dir.is_absolute() and work_dir.is_dir(), "--work-dir must be an existing absolute directory", str(work_dir))
+    require(
+        work_dir.is_absolute() and work_dir.is_dir(), "--work-dir must be an existing absolute directory", str(work_dir)
+    )
     require(output.is_absolute(), "--output must be absolute", str(output))
     require(output.parent.exists(), "--output parent must exist", str(output.parent))
     require(not output.exists() and not output.is_symlink(), "--output must be fresh", str(output))
@@ -388,10 +400,16 @@ def run_probe(work_dir: Path, output: Path) -> dict[str, Any]:
             assert_conflict(child_result(child_try), "child POSIX overlap against OFD")
             child_getlk = run_child(target, "getlk", fcntl.F_WRLCK, 0, 100)
             seen = child_result(child_getlk)
-            assert_lock_seen(seen, "child POSIX GETLK sees parent OFD", lock_type="F_WRLCK", start=0, length=100, pid=-1)
+            assert_lock_seen(
+                seen, "child POSIX GETLK sees parent OFD", lock_type="F_WRLCK", start=0, length=100, pid=-1
+            )
             nonoverlap = run_child(target, "try", fcntl.F_WRLCK, 128, 16)
             assert_success(child_result(nonoverlap), "non-overlap child POSIX lock")
-            record_case(cases, "ofd_parent_vs_child_posix", {"set": ofd, "try": child_try, "getlk": child_getlk, "nonoverlap": nonoverlap})
+            record_case(
+                cases,
+                "ofd_parent_vs_child_posix",
+                {"set": ofd, "try": child_try, "getlk": child_getlk, "nonoverlap": nonoverlap},
+            )
             setlk(fd, F_OFD_SETLK, fcntl.F_UNLCK, 0, 100)
 
             # Child POSIX lock blocks parent OFD on the same inode.
@@ -414,7 +432,11 @@ def run_probe(work_dir: Path, output: Path) -> dict[str, Any]:
             except Exception:
                 holder.terminate_owned()
                 raise
-            record_case(cases, "child_posix_vs_parent_ofd", {"ready": ready, "getlk": parent_getlk, "try": parent_try, "child_exit": holder_exit})
+            record_case(
+                cases,
+                "child_posix_vs_parent_ofd",
+                {"ready": ready, "getlk": parent_getlk, "try": parent_try, "child_exit": holder_exit},
+            )
 
             # Shared/shared succeeds, shared/exclusive rejects.
             shared = setlk(fd, F_OFD_SETLK, fcntl.F_RDLCK, 300, 50)
@@ -423,7 +445,11 @@ def run_probe(work_dir: Path, output: Path) -> dict[str, Any]:
             assert_success(child_result(shared_child), "child POSIX shared/shared")
             exclusive_child = run_child(target, "try", fcntl.F_WRLCK, 300, 50)
             assert_conflict(child_result(exclusive_child), "child POSIX exclusive against shared")
-            record_case(cases, "shared_shared_and_shared_exclusive", {"shared": shared, "shared_child": shared_child, "exclusive_child": exclusive_child})
+            record_case(
+                cases,
+                "shared_shared_and_shared_exclusive",
+                {"shared": shared, "shared_child": shared_child, "exclusive_child": exclusive_child},
+            )
             setlk(fd, F_OFD_SETLK, fcntl.F_UNLCK, 300, 50)
 
             # Partial unlock leaves the remaining range protected.
@@ -435,7 +461,11 @@ def run_probe(work_dir: Path, output: Path) -> dict[str, Any]:
             assert_success(left_unlock, "left half unlock")
             assert_success(child_result(left_child), "unlocked left half")
             assert_conflict(child_result(right_child), "still-locked right half")
-            record_case(cases, "partial_unlock", {"whole": whole, "left_unlock": left_unlock, "left_child": left_child, "right_child": right_child})
+            record_case(
+                cases,
+                "partial_unlock",
+                {"whole": whole, "left_unlock": left_unlock, "left_child": left_child, "right_child": right_child},
+            )
             setlk(fd, F_OFD_SETLK, fcntl.F_UNLCK, 450, 50)
 
             # Classic POSIX locks are process-owned: closing any fd for the inode releases them.
@@ -455,7 +485,11 @@ def run_probe(work_dir: Path, output: Path) -> dict[str, Any]:
             except Exception:
                 control.terminate_owned()
                 raise
-            record_case(cases, "posix_owner_any_close_control", {"locked": locked, "before": before, "closed": closed, "after": after, "child_exit": control_exit})
+            record_case(
+                cases,
+                "posix_owner_any_close_control",
+                {"locked": locked, "before": before, "closed": closed, "after": after, "child_exit": control_exit},
+            )
 
             # OFD locks survive dup/original close and release only after the final close.
             fd2 = os.dup(fd)
@@ -472,7 +506,11 @@ def run_probe(work_dir: Path, output: Path) -> dict[str, Any]:
                     pass
             final = run_child(target, "try", fcntl.F_WRLCK, 700, 50)
             assert_success(child_result(final), "OFD lock releases after final close")
-            record_case(cases, "ofd_dup_final_close", {"lock": dup_lock, "conflict_after_original_close": conflict, "success_after_final_close": final})
+            record_case(
+                cases,
+                "ofd_dup_final_close",
+                {"lock": dup_lock, "conflict_after_original_close": conflict, "success_after_final_close": final},
+            )
         finally:
             if fd >= 0:
                 os.close(fd)
@@ -489,8 +527,16 @@ def run_probe(work_dir: Path, output: Path) -> dict[str, Any]:
         "not_product_pass": True,
         "limits": [
             "OFD locks are not transparent classic POSIX locks.",
-            "Linux F_GETLK reports a conflicting OFD lock with raw l_pid=-1; this probe records that fact and does not reinterpret it as a correct process pid.",
-            "Blocking, deadlock detection, namespace pid translation, and product lock bridging are outside this non-blocking primitive probe.",
+            (
+                "Linux F_GETLK reports a conflicting OFD lock with raw l_pid=-1; "
+                "this probe records that fact and does not reinterpret it as a "
+                "correct process pid."
+            ),
+            (
+                "Blocking, deadlock detection, namespace pid translation, and "
+                "product lock bridging are outside this non-blocking primitive "
+                "probe."
+            ),
         ],
         "work_dir": str(work_dir),
         "output": str(output),
@@ -537,4 +583,4 @@ if __name__ == "__main__":
         raise SystemExit(main())
     except Exception as exc:
         print(json.dumps({"status": "FAIL", "message": str(exc)}, sort_keys=True), file=sys.stderr)
-        raise SystemExit(1)
+        raise SystemExit(1) from exc

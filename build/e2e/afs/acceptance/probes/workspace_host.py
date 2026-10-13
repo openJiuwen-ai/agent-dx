@@ -5,6 +5,7 @@ the uid/gid to execute as.  The probe drops credentials, performs one concrete
 filesystem operation, and prints a JSON record that can be compared with Node
 and metrics evidence.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -13,10 +14,9 @@ import hashlib
 import importlib.util
 import json
 import os
-from pathlib import Path
 import platform
 import sys
-
+from pathlib import Path
 
 PAYLOAD = bytes(range(256)) * 256
 PAYLOAD_SHA256 = hashlib.sha256(PAYLOAD).hexdigest()
@@ -27,7 +27,8 @@ def _load_counts_module():
     path = Path(__file__).resolve().with_name("fuse_callback_counts.py")
     spec = importlib.util.spec_from_file_location("fuse_callback_counts", path)
     module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
+    if not spec.loader is not None:
+        raise AssertionError("spec.loader is not None")
     spec.loader.exec_module(module)
     return module
 

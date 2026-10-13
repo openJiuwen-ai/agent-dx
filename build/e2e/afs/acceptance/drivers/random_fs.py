@@ -7,6 +7,7 @@ It generates deterministic operation streams, applies each operation to an ext4
 reference fixture and a target fixture, and records the first semantic mismatch
 with a raw failing prefix trace.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -65,7 +66,9 @@ def run_text(argv: list[str]) -> dict[str, Any]:
     import subprocess
 
     try:
-        proc = subprocess.run(argv, shell=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10, check=False)
+        proc = subprocess.run(
+            argv, shell=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10, check=False
+        )
         return {"argv": argv, "returncode": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr}
     except Exception as exc:  # noqa: BLE001
         return {"argv": argv, "returncode": None, "exception": type(exc).__name__, "message": str(exc)}
@@ -170,7 +173,11 @@ def data_for(seed: int, index: int, label: str, max_len: int = 257) -> bytes:
 
 def errno_result(exc: BaseException) -> dict[str, Any]:
     err = getattr(exc, "errno", None)
-    return {"ok": False, "errno": err, "errno_name": errno.errorcode.get(err, str(err)) if err is not None else type(exc).__name__}
+    return {
+        "ok": False,
+        "errno": err,
+        "errno_name": errno.errorcode.get(err, str(err)) if err is not None else type(exc).__name__,
+    }
 
 
 def ok_result(extra: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -181,10 +188,10 @@ def ok_result(extra: dict[str, Any] | None = None) -> dict[str, Any]:
 
 
 def safe_join(root: Path, rel_path: str) -> Path:
-    rel = Path(rel_path)
-    if rel.is_absolute() or ".." in rel.parts:
+    relative = Path(rel_path)
+    if relative.is_absolute() or ".." in relative.parts:
         raise ValueError(f"unsafe relative path: {rel_path}")
-    return root / rel
+    return root / relative
 
 
 def path_pool() -> list[str]:
@@ -209,7 +216,13 @@ def generate_operation(seed: int, index: int, rng: random.Random) -> dict[str, A
     elif op == "write":
         event.update({"path": rng.choice(paths), "data_hex": data_for(seed, index, "write", 128).hex()})
     elif op == "pwrite":
-        event.update({"path": rng.choice(paths), "offset": rng.randrange(0, 2048), "data_hex": data_for(seed, index, "pwrite", 192).hex()})
+        event.update(
+            {
+                "path": rng.choice(paths),
+                "offset": rng.randrange(0, 2048),
+                "data_hex": data_for(seed, index, "pwrite", 192).hex(),
+            }
+        )
     elif op == "append":
         event.update({"path": rng.choice(paths), "data_hex": data_for(seed, index, "append", 96).hex()})
     elif op == "read":
@@ -217,7 +230,13 @@ def generate_operation(seed: int, index: int, rng: random.Random) -> dict[str, A
     elif op == "truncate":
         event.update({"path": rng.choice(paths), "size": rng.randrange(0, 4096)})
     elif op == "sparse":
-        event.update({"path": rng.choice(paths), "offset": rng.randrange(4096, 16384), "data_hex": data_for(seed, index, "sparse", 32).hex()})
+        event.update(
+            {
+                "path": rng.choice(paths),
+                "offset": rng.randrange(4096, 16384),
+                "data_hex": data_for(seed, index, "sparse", 32).hex(),
+            }
+        )
     elif op == "rename":
         event.update({"src": rng.choice(paths), "dst": rng.choice(paths)})
     elif op == "hardlink":
@@ -255,7 +274,13 @@ def path_snapshot(root: Path, rel_path: str) -> dict[str, Any]:
     result: dict[str, Any] = {
         "exists": True,
         "mode": stat.S_IMODE(st.st_mode),
-        "type": "dir" if stat.S_ISDIR(st.st_mode) else "symlink" if stat.S_ISLNK(st.st_mode) else "file" if stat.S_ISREG(st.st_mode) else str(mode_type),
+        "type": "dir"
+        if stat.S_ISDIR(st.st_mode)
+        else "symlink"
+        if stat.S_ISLNK(st.st_mode)
+        else "file"
+        if stat.S_ISREG(st.st_mode)
+        else str(mode_type),
         "nlink": st.st_nlink,
     }
     if stat.S_ISLNK(st.st_mode):
@@ -323,7 +348,9 @@ def apply_operation(root: Path, op: dict[str, Any]) -> dict[str, Any]:
         if name == "read":
             fd = os.open(safe_join(root, op["path"]), os.O_RDONLY)
             data = os.pread(fd, int(op["length"]), int(op["offset"]))
-            return ok_result({"read_len": len(data), "sha256": sha256_bytes(data), "eof": len(data) < int(op["length"])})
+            return ok_result(
+                {"read_len": len(data), "sha256": sha256_bytes(data), "eof": len(data) < int(op["length"])}
+            )
         if name == "truncate":
             os.truncate(safe_join(root, op["path"]), int(op["size"]))
             return ok_result()
@@ -428,7 +455,9 @@ def replay_operations(
                     "index": index,
                     "failing_prefix_operations": index + 1,
                     "minimized": False,
-                    "reason": "result mismatch" if not compare_payload(ref_result, target_result) else "tree digest mismatch",
+                    "reason": "result mismatch"
+                    if not compare_payload(ref_result, target_result)
+                    else "tree digest mismatch",
                     "operation": op,
                     "reference_result": ref_result,
                     "target_result": target_result,
@@ -439,10 +468,23 @@ def replay_operations(
         if keep_trace:
             write_json(replay_dir / "trace.json", trace)
         cleanup_ok, cleanup = cleanup_fixtures(replay_dir, [("reference", ref_fixture), ("target", target_fixture)])
-        return {"status": "FAIL" if mismatch else "PASS", "mismatch": mismatch, "fingerprint": mismatch_fingerprint(mismatch), "cleanup_ok": cleanup_ok, "cleanup": cleanup, "trace": rel(replay_dir / "trace.json", artifacts) if keep_trace else None}
+        return {
+            "status": "FAIL" if mismatch else "PASS",
+            "mismatch": mismatch,
+            "fingerprint": mismatch_fingerprint(mismatch),
+            "cleanup_ok": cleanup_ok,
+            "cleanup": cleanup,
+            "trace": rel(replay_dir / "trace.json", artifacts) if keep_trace else None,
+        }
     except Exception as exc:  # noqa: BLE001
         cleanup_ok, cleanup = cleanup_fixtures(replay_dir, [("reference", ref_fixture), ("target", target_fixture)])
-        return {"status": "INCONCLUSIVE", "exception": type(exc).__name__, "message": str(exc), "cleanup_ok": cleanup_ok, "cleanup": cleanup}
+        return {
+            "status": "INCONCLUSIVE",
+            "exception": type(exc).__name__,
+            "message": str(exc),
+            "cleanup_ok": cleanup_ok,
+            "cleanup": cleanup,
+        }
 
 
 def shrink_with_hypothesis(
@@ -459,31 +501,69 @@ def shrink_with_hypothesis(
     database_dir = seed_dir / "hypothesis-db"
     database_dir.mkdir(parents=True, exist_ok=True)
     if not info.get("available"):
-        result = {"status": "BLOCKED", "hypothesis": info, "database_dir": rel(database_dir, artifacts), "reason": "Hypothesis is not installed"}
+        result = {
+            "status": "BLOCKED",
+            "hypothesis": info,
+            "database_dir": rel(database_dir, artifacts),
+            "reason": "Hypothesis is not installed",
+        }
         write_json(seed_dir / "hypothesis-shrink.json", result)
         return result
     try:
         from hypothesis import find, settings
-        from hypothesis.database import DirectoryBasedExampleDatabase
         from hypothesis import strategies as st
+        from hypothesis.database import DirectoryBasedExampleDatabase
 
         operations = [event["operation"] for event in trace]
         attempts: list[dict[str, Any]] = []
 
         def reproduces(prefix_len: int) -> bool:
             label = f"seed-{seed}-candidate-{len(attempts)}-{prefix_len}"
-            replay = replay_operations(reference_root, target_root, operations[:prefix_len], artifacts, label, inject_target_fault_at, keep_trace=False)
-            candidate = {"prefix_len": prefix_len, "status": replay.get("status"), "fingerprint": replay.get("fingerprint"), "cleanup_ok": replay.get("cleanup_ok")}
+            replay = replay_operations(
+                reference_root,
+                target_root,
+                operations[:prefix_len],
+                artifacts,
+                label,
+                inject_target_fault_at,
+                keep_trace=False,
+            )
+            candidate = {
+                "prefix_len": prefix_len,
+                "status": replay.get("status"),
+                "fingerprint": replay.get("fingerprint"),
+                "cleanup_ok": replay.get("cleanup_ok"),
+            }
             attempts.append(candidate)
-            return replay.get("status") == "FAIL" and replay.get("fingerprint") == original_fingerprint and replay.get("cleanup_ok") is True
+            return (
+                replay.get("status") == "FAIL"
+                and replay.get("fingerprint") == original_fingerprint
+                and replay.get("cleanup_ok") is True
+            )
 
         minimal_len = find(
             st.integers(min_value=1, max_value=len(operations)),
             reproduces,
-            settings=settings(database=DirectoryBasedExampleDatabase(str(database_dir)), max_examples=max(50, min(1000, len(operations) * 4)), deadline=None),
+            settings=settings(
+                database=DirectoryBasedExampleDatabase(str(database_dir)),
+                max_examples=max(50, min(1000, len(operations) * 4)),
+                deadline=None,
+            ),
         )
-        final = replay_operations(reference_root, target_root, operations[:minimal_len], artifacts, f"seed-{seed}-minimal-{minimal_len}", inject_target_fault_at, keep_trace=True)
-        reproduced = final.get("status") == "FAIL" and final.get("fingerprint") == original_fingerprint and final.get("cleanup_ok") is True
+        final = replay_operations(
+            reference_root,
+            target_root,
+            operations[:minimal_len],
+            artifacts,
+            f"seed-{seed}-minimal-{minimal_len}",
+            inject_target_fault_at,
+            keep_trace=True,
+        )
+        reproduced = (
+            final.get("status") == "FAIL"
+            and final.get("fingerprint") == original_fingerprint
+            and final.get("cleanup_ok") is True
+        )
         result = {
             "status": "REPRODUCED" if reproduced else "INCONCLUSIVE",
             "kind": "hypothesis-prefix-shrink-replay",
@@ -496,15 +576,29 @@ def shrink_with_hypothesis(
             "attempt_count": len(attempts),
             "attempts": attempts[-100:],
             "fingerprint": original_fingerprint,
-            "note": "Hypothesis shrank the deterministic state-machine operation prefix and replayed it on clean fixtures. The operation generator remains the fixed seeded STD-04 stream.",
+            "note": (
+                "Hypothesis shrank the deterministic state-machine operation "
+                "prefix and replayed it on clean fixtures. The operation "
+                "generator remains the fixed seeded STD-04 stream."
+            ),
         }
     except Exception as exc:  # noqa: BLE001
-        result = {"status": "INCONCLUSIVE", "kind": "hypothesis-prefix-shrink-replay", "hypothesis": info, "database_dir": rel(database_dir, artifacts), "exception": type(exc).__name__, "message": str(exc), "traceback": traceback.format_exc()}
+        result = {
+            "status": "INCONCLUSIVE",
+            "kind": "hypothesis-prefix-shrink-replay",
+            "hypothesis": info,
+            "database_dir": rel(database_dir, artifacts),
+            "exception": type(exc).__name__,
+            "message": str(exc),
+            "traceback": traceback.format_exc(),
+        }
     write_json(seed_dir / "hypothesis-shrink.json", result)
     return result
 
 
-def cleanup_fixtures(seed_dir: Path, fixtures: list[tuple[str, Path]], skip_target_cleanup: bool = False) -> tuple[bool, dict[str, Any]]:
+def cleanup_fixtures(
+    seed_dir: Path, fixtures: list[tuple[str, Path]], skip_target_cleanup: bool = False
+) -> tuple[bool, dict[str, Any]]:
     cleanup: dict[str, Any] = {}
     for label, fixture in fixtures:
         if skip_target_cleanup and label == "target":
@@ -514,7 +608,12 @@ def cleanup_fixtures(seed_dir: Path, fixtures: list[tuple[str, Path]], skip_targ
             shutil.rmtree(fixture)
             cleanup[label] = {"path": str(fixture), "removed": not fixture.exists()}
         except Exception as exc:  # noqa: BLE001
-            cleanup[label] = {"path": str(fixture), "removed": False, "exception": type(exc).__name__, "message": str(exc)}
+            cleanup[label] = {
+                "path": str(fixture),
+                "removed": False,
+                "exception": type(exc).__name__,
+                "message": str(exc),
+            }
     cleanup_ok = all(item.get("removed") for item in cleanup.values())
     write_json(seed_dir / "cleanup.json", cleanup)
     if not cleanup_ok:
@@ -560,7 +659,10 @@ def run_seed(
             "operation": op,
             "reference_result": ref_result,
             "target_result": target_result,
-            "affected_paths": {"reference": {path: path_snapshot(ref_fixture, path) for path in affected_paths(op)}, "target": {path: path_snapshot(target_fixture, path) for path in affected_paths(op)}},
+            "affected_paths": {
+                "reference": {path: path_snapshot(ref_fixture, path) for path in affected_paths(op)},
+                "target": {path: path_snapshot(target_fixture, path) for path in affected_paths(op)},
+            },
             "reference_tree_sha256": ref_tree["sha256"],
             "target_tree_sha256": target_tree["sha256"],
             "reference_entry_count": ref_tree["entry_count"],
@@ -572,7 +674,9 @@ def run_seed(
                 "index": index,
                 "failing_prefix_operations": index + 1,
                 "minimized": False,
-                "reason": "result mismatch" if not compare_payload(ref_result, target_result) else "tree digest mismatch",
+                "reason": "result mismatch"
+                if not compare_payload(ref_result, target_result)
+                else "tree digest mismatch",
                 "operation": op,
                 "reference_result": ref_result,
                 "target_result": target_result,
@@ -587,7 +691,16 @@ def run_seed(
     hypothesis_shrink: dict[str, Any] | None = None
     if mismatch:
         original_fingerprint = mismatch_fingerprint(mismatch)
-        hypothesis_shrink = shrink_with_hypothesis(reference_root, target_root, trace, original_fingerprint or {}, artifacts, seed_dir, seed, inject_target_fault_at)
+        hypothesis_shrink = shrink_with_hypothesis(
+            reference_root,
+            target_root,
+            trace,
+            original_fingerprint or {},
+            artifacts,
+            seed_dir,
+            seed,
+            inject_target_fault_at,
+        )
         if hypothesis_shrink.get("status") == "REPRODUCED":
             mismatch["minimized"] = True
             mismatch["minimal_failing_prefix_operations"] = hypothesis_shrink.get("minimal_failing_prefix_operations")
@@ -601,12 +714,21 @@ def run_seed(
             "hypothesis_shrink": rel(seed_dir / "hypothesis-shrink.json", artifacts),
             "mismatch": mismatch,
             "trace_prefix": trace,
-            "note": "Hypothesis shrink/replay result is authoritative for minimization. Raw trace_prefix preserves the original failing prefix.",
+            "note": (
+                "Hypothesis shrink/replay result is authoritative for "
+                "minimization. Raw trace_prefix preserves the original failing "
+                "prefix."
+            ),
         }
         write_json(seed_dir / "shrink-corpus.json", shrink)
     else:
-        write_json(seed_dir / "shrink-corpus.json", {"kind": "hypothesis-prefix-shrink-replay", "status": "NOT_RUN", "reason": "seed passed"})
-    cleanup_ok, cleanup = cleanup_fixtures(seed_dir, [("reference", ref_fixture), ("target", target_fixture)], skip_target_cleanup)
+        write_json(
+            seed_dir / "shrink-corpus.json",
+            {"kind": "hypothesis-prefix-shrink-replay", "status": "NOT_RUN", "reason": "seed passed"},
+        )
+    cleanup_ok, cleanup = cleanup_fixtures(
+        seed_dir, [("reference", ref_fixture), ("target", target_fixture)], skip_target_cleanup
+    )
     if not cleanup_ok and status == "PASS":
         status = "INCONCLUSIVE"
     return {
@@ -631,17 +753,40 @@ def run_seed(
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run AFS STD-04 deterministic differential random driver")
     parser.add_argument("--case-id", default=os.environ.get("AFS_ACCEPTANCE_CASE_ID", "STD-04"))
-    parser.add_argument("--profile", choices=["smoke", "full"], default=os.environ.get("AFS_ACCEPTANCE_PROFILE", "smoke"))
+    parser.add_argument(
+        "--profile", choices=["smoke", "full"], default=os.environ.get("AFS_ACCEPTANCE_PROFILE", "smoke")
+    )
     parser.add_argument("--matrix-json", default=os.environ.get("AFS_ACCEPTANCE_MATRIX", "{}"))
-    parser.add_argument("--run-dir", type=Path, default=Path(os.environ.get("AFS_ACCEPTANCE_RUN_DIR", "results/std-04-random")))
-    parser.add_argument("--mount", type=Path, default=Path(os.environ["AFS_ACCEPTANCE_MOUNT"]) if os.environ.get("AFS_ACCEPTANCE_MOUNT") else None)
-    parser.add_argument("--base-dir", type=Path, default=Path(os.environ["AFS_ACCEPTANCE_BASE_DIR"]) if os.environ.get("AFS_ACCEPTANCE_BASE_DIR") else None, help="Target directory under --mount. Relative paths are resolved below --mount.")
-    parser.add_argument("--reference-dir", type=Path, default=Path(os.environ["AFS_ACCEPTANCE_REFERENCE_DIR"]) if os.environ.get("AFS_ACCEPTANCE_REFERENCE_DIR") else None)
+    parser.add_argument(
+        "--run-dir", type=Path, default=Path(os.environ.get("AFS_ACCEPTANCE_RUN_DIR", "results/std-04-random"))
+    )
+    parser.add_argument(
+        "--mount",
+        type=Path,
+        default=Path(os.environ["AFS_ACCEPTANCE_MOUNT"]) if os.environ.get("AFS_ACCEPTANCE_MOUNT") else None,
+    )
+    parser.add_argument(
+        "--base-dir",
+        type=Path,
+        default=Path(os.environ["AFS_ACCEPTANCE_BASE_DIR"]) if os.environ.get("AFS_ACCEPTANCE_BASE_DIR") else None,
+        help="Target directory under --mount. Relative paths are resolved below --mount.",
+    )
+    parser.add_argument(
+        "--reference-dir",
+        type=Path,
+        default=Path(os.environ["AFS_ACCEPTANCE_REFERENCE_DIR"])
+        if os.environ.get("AFS_ACCEPTANCE_REFERENCE_DIR")
+        else None,
+    )
     parser.add_argument("--seeds", default=None)
     parser.add_argument("--operations", type=int, default=None)
     parser.add_argument("--max-seeds", type=int, default=None)
     parser.add_argument("--per-seed-timeout-seconds", type=float, default=None)
-    parser.add_argument("--allow-reference-fixture", action="store_true", help="Allow non-AFS target fixtures for driver selftests and smoke only; full profile remains BLOCKED.")
+    parser.add_argument(
+        "--allow-reference-fixture",
+        action="store_true",
+        help=("Allow non-AFS target fixtures for driver selftests and smoke only; full profile remains BLOCKED."),
+    )
     parser.add_argument("--backend", default=os.environ.get("AFS_ACCEPTANCE_BACKEND"))
     parser.add_argument("--process-pid", default=os.environ.get("AFS_ACCEPTANCE_PROCESS_PID"))
     parser.add_argument("--meta-process-pid", default=os.environ.get("AFS_ACCEPTANCE_META_PROCESS_PID"))
@@ -680,9 +825,19 @@ def main(argv: list[str]) -> int:
         if args.max_seeds is not None:
             seeds = seeds[: args.max_seeds]
             cap_applied = True
-        operations = args.operations if args.operations is not None else (FULL_OPERATIONS if args.profile == "full" else SMOKE_OPERATIONS)
-        timeout_seconds = args.per_seed_timeout_seconds if args.per_seed_timeout_seconds is not None else (900.0 if args.profile == "full" else 60.0)
-        full_seed_operation_ok = args.profile != "full" or (seeds == FULL_SEEDS and operations == FULL_OPERATIONS and not cap_applied)
+        operations = (
+            args.operations
+            if args.operations is not None
+            else (FULL_OPERATIONS if args.profile == "full" else SMOKE_OPERATIONS)
+        )
+        timeout_seconds = (
+            args.per_seed_timeout_seconds
+            if args.per_seed_timeout_seconds is not None
+            else (900.0 if args.profile == "full" else 60.0)
+        )
+        full_seed_operation_ok = args.profile != "full" or (
+            seeds == FULL_SEEDS and operations == FULL_OPERATIONS and not cap_applied
+        )
         hyp_identity = hypothesis_identity()
         hypothesis_gate_ok = args.profile != "full" or hyp_identity.get("available") is True
         target_mount_identity = mount_identity(args.mount)
@@ -694,22 +849,54 @@ def main(argv: list[str]) -> int:
         product_target = is_product_backend(str(product_backend))
         node_identity = process_identity(args.process_pid)
         meta_identity = process_identity(args.meta_process_pid)
-        observed_checks = target_checks(platform.system(), str(product_backend), target_mount_identity, target_base_identity, node_identity, meta_identity)
+        observed_checks = target_checks(
+            platform.system(),
+            str(product_backend),
+            target_mount_identity,
+            target_base_identity,
+            node_identity,
+            meta_identity,
+        )
         driver_path = Path(__file__).resolve()
         identity = {
             "created_at": utc(),
             "host": run_text(["hostname"]),
             "uname": run_text(["uname", "-a"]),
-            "platform": {"system": platform.system(), "release": platform.release(), "machine": platform.machine(), "python": platform.python_version(), "uid": os.geteuid(), "gid": os.getegid()},
-            "driver": "AFS custom deterministic differential-random; JuiceFS fsrand/Hypothesis-inspired, not upstream suite",
+            "platform": {
+                "system": platform.system(),
+                "release": platform.release(),
+                "machine": platform.machine(),
+                "python": platform.python_version(),
+                "uid": os.geteuid(),
+                "gid": os.getegid(),
+            },
+            "driver": (
+                "AFS custom deterministic differential-random; JuiceFS fsrand/Hypothesis-inspired, not upstream suite"
+            ),
             "driver_file": {"path": str(driver_path), "sha256": sha256_file(driver_path)},
             "hypothesis": hyp_identity,
             "operation_alphabet": OP_NAMES,
             "selftest_inject_target_fault_at": args.selftest_inject_target_fault_at,
             "selftest_skip_target_cleanup": args.selftest_skip_target_cleanup,
             "allow_reference_fixture": args.allow_reference_fixture,
-            "selection": {"profile": args.profile, "full_seeds": FULL_SEEDS, "selected_seeds": seeds, "operations_per_seed": operations, "cap_applied": cap_applied, "per_seed_timeout_seconds": timeout_seconds},
-            "product": {"backend": product_backend, "meta": args.meta or matrix.get("meta"), "mount_path": str(args.mount), "target_base": str(target_base), "reference_base": str(reference_base), "process_pid": args.process_pid, "meta_process_pid": args.meta_process_pid, "product_target": product_target},
+            "selection": {
+                "profile": args.profile,
+                "full_seeds": FULL_SEEDS,
+                "selected_seeds": seeds,
+                "operations_per_seed": operations,
+                "cap_applied": cap_applied,
+                "per_seed_timeout_seconds": timeout_seconds,
+            },
+            "product": {
+                "backend": product_backend,
+                "meta": args.meta or matrix.get("meta"),
+                "mount_path": str(args.mount),
+                "target_base": str(target_base),
+                "reference_base": str(reference_base),
+                "process_pid": args.process_pid,
+                "meta_process_pid": args.meta_process_pid,
+                "product_target": product_target,
+            },
             "mount": target_mount_identity,
             "target_base_mount": target_base_identity,
             "reference_mount": reference_identity,
@@ -721,29 +908,128 @@ def main(argv: list[str]) -> int:
         }
         write_json(artifacts / "identity.json", identity)
         linux_ok = platform.system() == "Linux"
-        mount_ok = args.mount.exists() and target_base.is_dir() and is_under(target_base, args.mount) and identity["target_base_mount"].get("returncode") == 0
-        reference_ok = reference_base.is_dir() and identity["reference_mount"].get("returncode") == 0 and reference_fs.get("fstype") == "ext4"
+        mount_ok = (
+            args.mount.exists()
+            and target_base.is_dir()
+            and is_under(target_base, args.mount)
+            and identity["target_base_mount"].get("returncode") == 0
+        )
+        reference_ok = (
+            reference_base.is_dir()
+            and identity["reference_mount"].get("returncode") == 0
+            and reference_fs.get("fstype") == "ext4"
+        )
         backend_ok = bool(identity["product"]["backend"])
         target_identity_ok = all(observed_checks.values())
         reference_fixture_ok = (not args.allow_reference_fixture) or args.profile != "full"
-        full_contract_ok = full_seed_operation_ok and hypothesis_gate_ok and target_identity_ok and reference_ok and reference_fixture_ok
-        checks.extend([
-            build_check("linux-host", "PASS" if linux_ok else "BLOCKED", identity["platform"], rel(artifacts / "identity.json", run_dir)),
-            build_check("target-mount-scope", "PASS" if mount_ok else "BLOCKED", {"mount": str(args.mount), "target_base": str(target_base), "under_mount": is_under(target_base, args.mount), "exists": target_base.exists(), "filesystem": target_fs}, rel(artifacts / "identity.json", run_dir)),
-            build_check("reference-ext4-scope", "PASS" if reference_ok else "BLOCKED", {"reference_base": str(reference_base), "exists": reference_base.exists(), "findmnt_returncode": identity["reference_mount"].get("returncode"), "filesystem": reference_fs}, rel(artifacts / "identity.json", run_dir)),
-            build_check("backend-selection", "PASS" if backend_ok else "BLOCKED", identity["product"], rel(artifacts / "identity.json", run_dir)),
-            build_check("fixed-seed-operation-contract", "PASS" if full_seed_operation_ok else "BLOCKED", {"profile": args.profile, "required_full_seeds": FULL_SEEDS, "selected_seeds": seeds, "required_operations": FULL_OPERATIONS, "operations_per_seed": operations, "cap_applied": cap_applied}, rel(artifacts / "identity.json", run_dir)),
-            build_check("hypothesis-shrink-database", "PASS" if hypothesis_gate_ok else "BLOCKED", {"profile": args.profile, "implemented": True, "hypothesis": hyp_identity, "required_for_full_pass": True}, rel(artifacts / "identity.json", run_dir)),
-            build_check("reference-fixture-scope", "PASS" if reference_fixture_ok else "BLOCKED", {"allow_reference_fixture": args.allow_reference_fixture, "profile": args.profile}, rel(artifacts / "identity.json", run_dir)),
-        ])
+        full_contract_ok = (
+            full_seed_operation_ok
+            and hypothesis_gate_ok
+            and target_identity_ok
+            and reference_ok
+            and reference_fixture_ok
+        )
+        checks.extend(
+            [
+                build_check(
+                    "linux-host",
+                    "PASS" if linux_ok else "BLOCKED",
+                    identity["platform"],
+                    rel(artifacts / "identity.json", run_dir),
+                ),
+                build_check(
+                    "target-mount-scope",
+                    "PASS" if mount_ok else "BLOCKED",
+                    {
+                        "mount": str(args.mount),
+                        "target_base": str(target_base),
+                        "under_mount": is_under(target_base, args.mount),
+                        "exists": target_base.exists(),
+                        "filesystem": target_fs,
+                    },
+                    rel(artifacts / "identity.json", run_dir),
+                ),
+                build_check(
+                    "reference-ext4-scope",
+                    "PASS" if reference_ok else "BLOCKED",
+                    {
+                        "reference_base": str(reference_base),
+                        "exists": reference_base.exists(),
+                        "findmnt_returncode": identity["reference_mount"].get("returncode"),
+                        "filesystem": reference_fs,
+                    },
+                    rel(artifacts / "identity.json", run_dir),
+                ),
+                build_check(
+                    "backend-selection",
+                    "PASS" if backend_ok else "BLOCKED",
+                    identity["product"],
+                    rel(artifacts / "identity.json", run_dir),
+                ),
+                build_check(
+                    "fixed-seed-operation-contract",
+                    "PASS" if full_seed_operation_ok else "BLOCKED",
+                    {
+                        "profile": args.profile,
+                        "required_full_seeds": FULL_SEEDS,
+                        "selected_seeds": seeds,
+                        "required_operations": FULL_OPERATIONS,
+                        "operations_per_seed": operations,
+                        "cap_applied": cap_applied,
+                    },
+                    rel(artifacts / "identity.json", run_dir),
+                ),
+                build_check(
+                    "hypothesis-shrink-database",
+                    "PASS" if hypothesis_gate_ok else "BLOCKED",
+                    {
+                        "profile": args.profile,
+                        "implemented": True,
+                        "hypothesis": hyp_identity,
+                        "required_for_full_pass": True,
+                    },
+                    rel(artifacts / "identity.json", run_dir),
+                ),
+                build_check(
+                    "reference-fixture-scope",
+                    "PASS" if reference_fixture_ok else "BLOCKED",
+                    {"allow_reference_fixture": args.allow_reference_fixture, "profile": args.profile},
+                    rel(artifacts / "identity.json", run_dir),
+                ),
+            ]
+        )
         for name, passed in observed_checks.items():
-            checks.append(build_check(name, "PASS" if passed else "BLOCKED", {"observed": passed}, rel(artifacts / "identity.json", run_dir)))
-        if not linux_ok or not mount_ok or not reference_ok or not backend_ok or not target_identity_ok or not reference_fixture_ok or not hypothesis_gate_ok:
+            checks.append(
+                build_check(
+                    name,
+                    "PASS" if passed else "BLOCKED",
+                    {"observed": passed},
+                    rel(artifacts / "identity.json", run_dir),
+                )
+            )
+        if (
+            not linux_ok
+            or not mount_ok
+            or not reference_ok
+            or not backend_ok
+            or not target_identity_ok
+            or not reference_fixture_ok
+            or not hypothesis_gate_ok
+        ):
             status = "BLOCKED"
             reason = "STD-04 preflight failed"
         else:
             for seed in seeds:
-                result = run_seed(reference_base, target_base, seed, operations, artifacts, timeout_seconds, args.selftest_inject_target_fault_at, args.selftest_skip_target_cleanup)
+                result = run_seed(
+                    reference_base,
+                    target_base,
+                    seed,
+                    operations,
+                    artifacts,
+                    timeout_seconds,
+                    args.selftest_inject_target_fault_at,
+                    args.selftest_skip_target_cleanup,
+                )
                 seed_results.append(result)
                 command_summary["counts"][result["status"]] += 1
                 if result["status"] in {"FAIL", "INCONCLUSIVE"}:
@@ -757,24 +1043,64 @@ def main(argv: list[str]) -> int:
                 reason = "seed execution timed out or cleanup could not prove a clean result"
             elif args.profile == "full" and not full_contract_ok:
                 status = "BLOCKED"
-                reason = "full STD-04 requires 10 fixed seeds x 10,000 operations, qualified AFS target identity, ext4 reference, and Hypothesis shrink/replay database availability"
+                reason = (
+                    "full STD-04 requires 10 fixed seeds x 10,000 operations, "
+                    "qualified AFS target identity, ext4 reference, and Hypothesis "
+                    "shrink/replay database availability"
+                )
             else:
                 status = "PASS"
                 reason = ""
-            checks.append(build_check("seed-execution", "PASS" if seed_results else "BLOCKED", {"selected": len(seeds), "executed": len(seed_results), "counts": command_summary["counts"]}, rel(artifacts / "seed-results.json", run_dir)))
-            checks.append(build_check("differential-results", "PASS" if status == "PASS" else "FAIL" if status == "FAIL" else "INCONCLUSIVE" if status == "INCONCLUSIVE" else "BLOCKED", {"counts": command_summary["counts"], "first_failure": next((item for item in seed_results if item["status"] == "FAIL"), None), "first_inconclusive": next((item for item in seed_results if item["status"] == "INCONCLUSIVE"), None)}, rel(artifacts / "seed-results.json", run_dir)))
+            checks.append(
+                build_check(
+                    "seed-execution",
+                    "PASS" if seed_results else "BLOCKED",
+                    {"selected": len(seeds), "executed": len(seed_results), "counts": command_summary["counts"]},
+                    rel(artifacts / "seed-results.json", run_dir),
+                )
+            )
+            checks.append(
+                build_check(
+                    "differential-results",
+                    "PASS"
+                    if status == "PASS"
+                    else "FAIL"
+                    if status == "FAIL"
+                    else "INCONCLUSIVE"
+                    if status == "INCONCLUSIVE"
+                    else "BLOCKED",
+                    {
+                        "counts": command_summary["counts"],
+                        "first_failure": next((item for item in seed_results if item["status"] == "FAIL"), None),
+                        "first_inconclusive": next(
+                            (item for item in seed_results if item["status"] == "INCONCLUSIVE"), None
+                        ),
+                    },
+                    rel(artifacts / "seed-results.json", run_dir),
+                )
+            )
     except Exception as exc:  # noqa: BLE001
         status = "BLOCKED"
         reason = f"driver setup failed: {type(exc).__name__}: {exc}"
-        write_json(artifacts / "setup-error.json", {"exception": type(exc).__name__, "message": str(exc), "traceback": traceback.format_exc()})
+        write_json(
+            artifacts / "setup-error.json",
+            {"exception": type(exc).__name__, "message": str(exc), "traceback": traceback.format_exc()},
+        )
         checks.append(build_check("driver-setup", "BLOCKED", reason, rel(artifacts / "setup-error.json", run_dir)))
 
     accounting = {
         "profile": args.profile,
         "fixed_full_seeds": FULL_SEEDS,
-        "selected_seeds": [item.get("seed") for item in seed_results] or (parse_seed_list(args.seeds, FULL_SEEDS if args.profile == "full" else SMOKE_SEEDS)[: args.max_seeds] if args.max_seeds else parse_seed_list(args.seeds, FULL_SEEDS if args.profile == "full" else SMOKE_SEEDS)),
+        "selected_seeds": [item.get("seed") for item in seed_results]
+        or (
+            parse_seed_list(args.seeds, FULL_SEEDS if args.profile == "full" else SMOKE_SEEDS)[: args.max_seeds]
+            if args.max_seeds
+            else parse_seed_list(args.seeds, FULL_SEEDS if args.profile == "full" else SMOKE_SEEDS)
+        ),
         "executed": len(seed_results),
-        "operations_per_seed": args.operations if args.operations is not None else (FULL_OPERATIONS if args.profile == "full" else SMOKE_OPERATIONS),
+        "operations_per_seed": args.operations
+        if args.operations is not None
+        else (FULL_OPERATIONS if args.profile == "full" else SMOKE_OPERATIONS),
         "required_full_operations_per_seed": FULL_OPERATIONS,
         "result_counts": command_summary["counts"],
         "raw_trace_per_seed": True,
@@ -784,9 +1110,18 @@ def main(argv: list[str]) -> int:
     }
     write_json(artifacts / "accounting.json", accounting)
     coverage_axes = {
-        "reference": {"values": [str(matrix.get("reference", "ext4"))], "checks": {str(matrix.get("reference", "ext4")): "reference-ext4-scope"}},
-        "seeds": {"values": [str(len(accounting["selected_seeds"]))], "checks": {str(len(accounting["selected_seeds"])): "fixed-seed-operation-contract"}},
-        "operations_per_seed": {"values": [str(accounting["operations_per_seed"])], "checks": {str(accounting["operations_per_seed"]): "fixed-seed-operation-contract"}},
+        "reference": {
+            "values": [str(matrix.get("reference", "ext4"))],
+            "checks": {str(matrix.get("reference", "ext4")): "reference-ext4-scope"},
+        },
+        "seeds": {
+            "values": [str(len(accounting["selected_seeds"]))],
+            "checks": {str(len(accounting["selected_seeds"])): "fixed-seed-operation-contract"},
+        },
+        "operations_per_seed": {
+            "values": [str(accounting["operations_per_seed"])],
+            "checks": {str(accounting["operations_per_seed"]): "fixed-seed-operation-contract"},
+        },
     }
     coverage_axes[f"seeds_{args.profile}"] = coverage_axes["seeds"]
     coverage_axes[f"operations_per_seed_{args.profile}"] = coverage_axes["operations_per_seed"]
@@ -803,10 +1138,22 @@ def main(argv: list[str]) -> int:
         "accounting": accounting,
         "command_summary": command_summary,
         "notes": [
-            "This is an AFS custom deterministic differential driver inspired by JuiceFS fsrand/Hypothesis; it is not an upstream JuiceFS suite.",
+            (
+                "This is an AFS custom deterministic differential driver "
+                "inspired by JuiceFS fsrand/Hypothesis; it is not an upstream "
+                "JuiceFS suite."
+            ),
             "Smoke runs use reduced seeds/operation counts and cannot satisfy full STD-04 release PASS.",
-            "On failure the original mismatch trace is preserved and Hypothesis shrink/replay writes hypothesis-shrink.json plus a DirectoryBasedExampleDatabase.",
-            "Full STD-04 release PASS requires 10 fixed seeds x 10,000 operations on qualified AFS target identity with Hypothesis available.",
+            (
+                "On failure the original mismatch trace is preserved and "
+                "Hypothesis shrink/replay writes hypothesis-shrink.json plus a "
+                "DirectoryBasedExampleDatabase."
+            ),
+            (
+                "Full STD-04 release PASS requires 10 fixed seeds x 10,000 "
+                "operations on qualified AFS target identity with Hypothesis "
+                "available."
+            ),
         ],
     }
     write_json(artifacts / "proof.json", proof)

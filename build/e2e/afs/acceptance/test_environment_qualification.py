@@ -1,11 +1,12 @@
 """Fail-closed full qualification without a developer-specific lab profile."""
+
 from __future__ import annotations
 
 import hashlib
 import json
-from pathlib import Path
 import tempfile
 import unittest
+from pathlib import Path
 
 import environment
 
@@ -26,7 +27,9 @@ class EnvironmentQualificationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             lock, path = self.make_evidence(Path(tmp), {"status": "PASS", "checks": []})
             errors = environment.qualification_errors(lock, path)
-            self.assertEqual(errors, ["portable full environment verifier is not implemented; full acceptance remains BLOCKED"])
+            self.assertEqual(
+                errors, [("portable full environment verifier is not implemented; full acceptance remains BLOCKED")]
+            )
 
     def test_missing_or_tampered_bundle_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -83,7 +86,7 @@ class EnvironmentQualificationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             lock, path = self.make_evidence(root)
-            data = b'{broken'
+            data = b"{broken"
             (root / "bundle.json").write_bytes(data)
             lock["environment_evidence"]["sha256"] = hashlib.sha256(data).hexdigest()
             self.assertIn("malformed", environment.qualification_errors(lock, path)[0])

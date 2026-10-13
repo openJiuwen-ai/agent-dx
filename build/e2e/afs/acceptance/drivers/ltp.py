@@ -5,6 +5,7 @@ The driver executes the frozen LTP filesystem command inventory prepared by
 ``suites/prepare_ctl_reference.sh``.  It preserves every command's raw output
 and emits the acceptance runner proof JSON as the final stdout object.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -71,7 +72,9 @@ def sha256_file(path: Path) -> str:
 
 def run_text(argv: list[str], timeout: int = 10) -> dict[str, Any]:
     try:
-        proc = subprocess.run(argv, shell=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, check=False)
+        proc = subprocess.run(
+            argv, shell=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, check=False
+        )
         return {"argv": argv, "returncode": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr}
     except Exception as exc:  # noqa: BLE001 - evidence records exact failure
         return {"argv": argv, "returncode": None, "exception": type(exc).__name__, "message": str(exc)}
@@ -131,7 +134,11 @@ def ltp_identity(suite_root: Path, install_root: Path, expanded_tsv: Path) -> di
     head = run_text(git + ["rev-parse", "HEAD"])
     status = run_text(git + ["status", "--porcelain"])
     kirk = install_root / "kirk"
-    kirk_version = run_text([str(kirk), "--version"]) if kirk.exists() else {"returncode": None, "stdout": "", "stderr": "missing kirk"}
+    kirk_version = (
+        run_text([str(kirk), "--version"])
+        if kirk.exists()
+        else {"returncode": None, "stdout": "", "stderr": "missing kirk"}
+    )
     return {
         "suite_root": str(suite_root),
         "install_root": str(install_root),
@@ -164,11 +171,17 @@ def read_commands(expanded_tsv: Path) -> list[dict[str, str]]:
     return records
 
 
-def select_commands(records: list[dict[str, str]], profile: str, max_tests: int | None) -> tuple[list[dict[str, str]], dict[str, Any]]:
+def select_commands(
+    records: list[dict[str, str]], profile: str, max_tests: int | None
+) -> tuple[list[dict[str, str]], dict[str, Any]]:
     if profile == "smoke":
         by_id = {record["test_id"]: record for record in records}
         selected = [by_id[test_id] for test_id in SMOKE_TEST_IDS if test_id in by_id]
-        selection = {"mode": "smoke", "requested_test_ids": SMOKE_TEST_IDS, "missing_smoke_test_ids": [test_id for test_id in SMOKE_TEST_IDS if test_id not in by_id]}
+        selection = {
+            "mode": "smoke",
+            "requested_test_ids": SMOKE_TEST_IDS,
+            "missing_smoke_test_ids": [test_id for test_id in SMOKE_TEST_IDS if test_id not in by_id],
+        }
     else:
         selected = list(records)
         selection = {"mode": "full", "requested_test_ids": "all"}
@@ -190,7 +203,7 @@ def ltp_shell_command(command: str, test_dir: Path, tmp_dir: Path, install_root:
         [
             f"cd {shell_quote(str(test_dir))}",
             f"export LTPROOT={shell_quote(str(install_root))}",
-            f"export PATH={shell_quote(ltp_bin_path)}:\"$PATH\"",
+            f'export PATH={shell_quote(ltp_bin_path)}:"$PATH"',
             f"export TMPDIR={shell_quote(str(tmp_dir))}",
             f"export TMP={shell_quote(str(tmp_dir))}",
             f"export TEMP={shell_quote(str(tmp_dir))}",
@@ -230,7 +243,14 @@ def run_bounded(argv: list[str], cwd: Path, timeout: int, stdout_path: Path, std
                     pass
                 returncode = process.wait()
             err.write(f"LTP command timed out after {timeout}s\n".encode())
-    return {"argv": argv, "cwd": str(cwd), "returncode": returncode, "timed_out": timed_out, "timeout_seconds": timeout, "duration_seconds": round(time.time() - started, 3)}
+    return {
+        "argv": argv,
+        "cwd": str(cwd),
+        "returncode": returncode,
+        "timed_out": timed_out,
+        "timeout_seconds": timeout,
+        "duration_seconds": round(time.time() - started, 3),
+    }
 
 
 def load_json_if_present(path: Path) -> Any | None:
@@ -263,15 +283,17 @@ def extract_ltp_events(text: str) -> list[dict[str, Any]]:
         if index_match:
             case_index = int(index_match.group(1))
         source = extract_event_source(line, message)
-        events.append({
-            "line": line_no,
-            "status": match.group("status"),
-            "case_index": case_index,
-            "prefix": prefix,
-            "message": message,
-            "source": source,
-            "raw": line,
-        })
+        events.append(
+            {
+                "line": line_no,
+                "status": match.group("status"),
+                "case_index": case_index,
+                "prefix": prefix,
+                "message": message,
+                "source": source,
+                "raw": line,
+            }
+        )
     return events
 
 
@@ -300,7 +322,6 @@ def ltp_path_budget_ok(tmp_dir: Path) -> bool:
     return len(str(tmp_dir)) <= MAX_LEGACY_LTP_TMPDIR_LEN
 
 
-
 APPLICABLE_BLOCKING_STATUSES = {"TCONF", "TBROK", "TFAIL"}
 PRE_REVIEWABLE_STATUSES = {"TCONF", "TBROK"}
 REFERENCE_BACKENDS = {"reference", "ext4"}
@@ -315,8 +336,6 @@ def manifest_binding_value(manifest: dict[str, Any], *names: str) -> Any | None:
         if name in binding:
             return binding[name]
     return None
-
-
 
 
 def load_json_no_duplicate_keys(path: Path) -> Any:
@@ -344,7 +363,9 @@ def timeout_policy_binding_value(policy: dict[str, Any], *names: str) -> Any | N
     return None
 
 
-def load_timeout_policy(path: Path, identity: dict[str, Any], selected: list[dict[str, str]], per_test_timeout: int) -> dict[str, Any]:
+def load_timeout_policy(
+    path: Path, identity: dict[str, Any], selected: list[dict[str, str]], per_test_timeout: int
+) -> dict[str, Any]:
     raw = load_json_no_duplicate_keys(path)
     if not isinstance(raw, dict):
         raise RuntimeError("timeout policy must be a JSON object")
@@ -410,11 +431,22 @@ def load_timeout_policy(path: Path, identity: dict[str, Any], selected: list[dic
             errors.append(f"timeouts[{index}].suite_timeout_seconds must be a positive integer")
             continue
         if exec_timeout < per_test_timeout:
-            errors.append(f"timeouts[{index}] exec_timeout_seconds {exec_timeout} is below per-test baseline {per_test_timeout}")
+            errors.append(
+                f"timeouts[{index}] exec_timeout_seconds {exec_timeout} is below per-test baseline {per_test_timeout}"
+            )
         if suite_timeout < 240:
             errors.append(f"timeouts[{index}] suite_timeout_seconds {suite_timeout} is below baseline 240")
         if suite_timeout <= exec_timeout:
-            errors.append(f"timeouts[{index}] suite_timeout_seconds {suite_timeout} must be greater than exec_timeout_seconds {exec_timeout}")
+            errors.append(
+                (
+                    f"timeouts["
+                    f"{index}"
+                    f"] suite_timeout_seconds "
+                    f"{suite_timeout}"
+                    f" must be greater than exec_timeout_seconds "
+                    f"{exec_timeout}"
+                )
+            )
         normalized[test_id] = {"exec_timeout_seconds": exec_timeout, "suite_timeout_seconds": suite_timeout}
     if errors:
         raise RuntimeError("invalid timeout policy: " + "; ".join(errors))
@@ -427,18 +459,30 @@ def load_timeout_policy(path: Path, identity: dict[str, Any], selected: list[dic
         "schema": 1,
         "binding": expected,
         "timeouts": normalized,
-        "default": {"exec_timeout_seconds": per_test_timeout, "suite_timeout_seconds": max(240, per_test_timeout + 10, per_test_timeout * 2)},
+        "default": {
+            "exec_timeout_seconds": per_test_timeout,
+            "suite_timeout_seconds": max(240, per_test_timeout + 10, per_test_timeout * 2),
+        },
     }
 
 
 def command_timeouts(test_id: str, per_test_timeout: int, timeout_policy: dict[str, Any] | None) -> dict[str, Any]:
-    default = {"exec_timeout_seconds": per_test_timeout, "suite_timeout_seconds": max(240, per_test_timeout + 10, per_test_timeout * 2), "source": "default"}
+    default = {
+        "exec_timeout_seconds": per_test_timeout,
+        "suite_timeout_seconds": max(240, per_test_timeout + 10, per_test_timeout * 2),
+        "source": "default",
+    }
     if not timeout_policy:
         return default
     override = timeout_policy.get("timeouts", {}).get(test_id)
     if not override:
         return default
-    return {"exec_timeout_seconds": override["exec_timeout_seconds"], "suite_timeout_seconds": override["suite_timeout_seconds"], "source": "timeout-policy"}
+    return {
+        "exec_timeout_seconds": override["exec_timeout_seconds"],
+        "suite_timeout_seconds": override["suite_timeout_seconds"],
+        "source": "timeout-policy",
+    }
+
 
 def load_applicability_manifest(path: Path, identity: dict[str, Any]) -> dict[str, Any]:
     manifest = json.loads(path.read_text(encoding="utf-8"))
@@ -466,7 +510,16 @@ def load_applicability_manifest(path: Path, identity: dict[str, Any]) -> dict[st
         observed_selected = identity.get("selection", {}).get("selected_count")
         observed_total = identity.get("selection", {}).get("total_commands")
         if observed_selected != raw_commands_required or observed_total != raw_commands_required:
-            errors.append(f"raw_commands_required mismatch: manifest={raw_commands_required!r} selected={observed_selected!r} total={observed_total!r}")
+            errors.append(
+                (
+                    f"raw_commands_required mismatch: manifest="
+                    f"{raw_commands_required!r}"
+                    f" selected="
+                    f"{observed_selected!r}"
+                    f" total="
+                    f"{observed_total!r}"
+                )
+            )
     entries = manifest.get("entries")
     if not isinstance(entries, list) or not entries:
         errors.append("entries must be a non-empty list")
@@ -486,7 +539,15 @@ def load_applicability_manifest(path: Path, identity: dict[str, Any]) -> dict[st
         scope = raw_entry.get("scope")
         ordinary_required = bool(raw_entry.get("ordinary_subtests_required", False))
         coverage_link = raw_entry.get("ordinary_coverage_link") or raw_entry.get("ordinary_coverage_test_ids")
-        fields = {"test_id": test_id, "status": status, "source": source, "message_regex": message_regex, "disposition": disposition, "rationale": rationale, "scope": scope}
+        fields = {
+            "test_id": test_id,
+            "status": status,
+            "source": source,
+            "message_regex": message_regex,
+            "disposition": disposition,
+            "rationale": rationale,
+            "scope": scope,
+        }
         missing = [name for name, value in fields.items() if not value]
         if missing:
             errors.append(f"entries[{idx}] missing required fields: {', '.join(missing)}")
@@ -499,18 +560,20 @@ def load_applicability_manifest(path: Path, identity: dict[str, Any]) -> dict[st
             re.compile(str(message_regex))
         except re.error as exc:
             errors.append(f"entries[{idx}] message_regex is invalid: {exc}")
-        normalized_entries.append({
-            "id": raw_entry.get("id") or f"{test_id}:{status}:{source}:{idx}",
-            "test_id": str(test_id),
-            "status": str(status),
-            "source": str(source),
-            "message_regex": str(message_regex),
-            "scope": str(scope),
-            "disposition": str(disposition),
-            "rationale": str(rationale),
-            "ordinary_subtests_required": ordinary_required,
-            "ordinary_coverage_link": coverage_link,
-        })
+        normalized_entries.append(
+            {
+                "id": raw_entry.get("id") or f"{test_id}:{status}:{source}:{idx}",
+                "test_id": str(test_id),
+                "status": str(status),
+                "source": str(source),
+                "message_regex": str(message_regex),
+                "scope": str(scope),
+                "disposition": str(disposition),
+                "rationale": str(rationale),
+                "ordinary_subtests_required": ordinary_required,
+                "ordinary_coverage_link": coverage_link,
+            }
+        )
     if errors:
         raise RuntimeError("invalid applicability manifest: " + "; ".join(errors))
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
@@ -520,7 +583,10 @@ def load_applicability_manifest(path: Path, identity: dict[str, Any]) -> dict[st
     return {
         "path": str(path),
         "sha256": digest,
-        "binding": {**expected, **{k: v for k, v in optional_expected.items() if manifest_binding_value(manifest, k) is not None}},
+        "binding": {
+            **expected,
+            **{k: v for k, v in optional_expected.items() if manifest_binding_value(manifest, k) is not None},
+        },
         "policy": {"reference_only_scopes": sorted(set(reference_only_scopes))},
         "entries": normalized_entries,
     }
@@ -536,7 +602,10 @@ def event_matches_entry(event: dict[str, Any], entry: dict[str, Any]) -> bool:
             return False
     elif event_source != entry_source:
         return False
-    return re.search(entry["message_regex"], event.get("message", "")) is not None or re.search(entry["message_regex"], event.get("raw", "")) is not None
+    return (
+        re.search(entry["message_regex"], event.get("message", "")) is not None
+        or re.search(entry["message_regex"], event.get("raw", "")) is not None
+    )
 
 
 def applicability_target_context(identity: dict[str, Any] | None) -> dict[str, Any]:
@@ -556,7 +625,9 @@ def entry_allowed_for_target(entry: dict[str, Any], manifest: dict[str, Any] | N
     return target.get("is_reference_backend", False) or entry.get("scope") not in reference_only_scopes
 
 
-def apply_applicability(command_records: list[dict[str, Any]], manifest: dict[str, Any] | None, identity: dict[str, Any] | None = None) -> dict[str, Any]:
+def apply_applicability(
+    command_records: list[dict[str, Any]], manifest: dict[str, Any] | None, identity: dict[str, Any] | None = None
+) -> dict[str, Any]:
     raw_blocking_events: list[dict[str, Any]] = []
     pre_reviewed_events: list[dict[str, Any]] = []
     unmatched_events: list[dict[str, Any]] = []
@@ -571,13 +642,23 @@ def apply_applicability(command_records: list[dict[str, Any]], manifest: dict[st
     for entry in entries:
         entries_by_test.setdefault(entry["test_id"], []).append(entry)
 
-    tpass_by_test = {record["test_id"]: record.get("ltp_event_counts", {}).get("TPASS", 0) for record in command_records}
+    tpass_by_test = {
+        record["test_id"]: record.get("ltp_event_counts", {}).get("TPASS", 0) for record in command_records
+    }
     for record in command_records:
         tpass_count = record.get("ltp_event_counts", {}).get("TPASS", 0)
         for event in record.get("ltp_events", []):
             if event.get("status") not in APPLICABLE_BLOCKING_STATUSES:
                 continue
-            event_ref = {"index": record["index"], "test_id": record["test_id"], "status": event.get("status"), "source": event.get("source"), "line": event.get("line"), "message": event.get("message"), "raw": event.get("raw")}
+            event_ref = {
+                "index": record["index"],
+                "test_id": record["test_id"],
+                "status": event.get("status"),
+                "source": event.get("source"),
+                "line": event.get("line"),
+                "message": event.get("message"),
+                "raw": event.get("raw"),
+            }
             raw_blocking_events.append(event_ref)
             matched_entry = None
             for entry in entries_by_test.get(record["test_id"], []):
@@ -591,14 +672,19 @@ def apply_applicability(command_records: list[dict[str, Any]], manifest: dict[st
             if allowed_for_target:
                 matched_entry_ids.add(matched_entry["id"])
             else:
-                target_context_failures.append({
-                    **event_ref,
-                    "entry_id": matched_entry["id"],
-                    "scope": matched_entry["scope"],
-                    "rationale": matched_entry["rationale"],
-                    "reason": "pre-reviewed event is scoped to the reference filesystem and cannot waive a product backend result",
-                    "target": target_context,
-                })
+                target_context_failures.append(
+                    {
+                        **event_ref,
+                        "entry_id": matched_entry["id"],
+                        "scope": matched_entry["scope"],
+                        "rationale": matched_entry["rationale"],
+                        "reason": (
+                            "pre-reviewed event is scoped to the reference filesystem and "
+                            "cannot waive a product backend result"
+                        ),
+                        "target": target_context,
+                    }
+                )
                 continue
             if matched_entry["ordinary_subtests_required"] and tpass_count <= 0:
                 coverage_link = matched_entry.get("ordinary_coverage_link")
@@ -609,13 +695,41 @@ def apply_applicability(command_records: list[dict[str, Any]], manifest: dict[st
                 else:
                     coverage_ids = []
                 if not any(tpass_by_test.get(test_id, 0) > 0 for test_id in coverage_ids):
-                    ordinary_coverage_failures.append({"entry_id": matched_entry["id"], "test_id": record["test_id"], "coverage_link": coverage_link, "reason": "ordinary_subtests_required but neither this command nor linked commands have TPASS coverage"})
-            event_ref = {**event_ref, "entry_id": matched_entry["id"], "scope": matched_entry["scope"], "rationale": matched_entry["rationale"]}
+                    ordinary_coverage_failures.append(
+                        {
+                            "entry_id": matched_entry["id"],
+                            "test_id": record["test_id"],
+                            "coverage_link": coverage_link,
+                            "reason": (
+                                "ordinary_subtests_required but neither this command nor linked "
+                                "commands have TPASS coverage"
+                            ),
+                        }
+                    )
+            event_ref = {
+                **event_ref,
+                "entry_id": matched_entry["id"],
+                "scope": matched_entry["scope"],
+                "rationale": matched_entry["rationale"],
+            }
             pre_reviewed_events.append(event_ref)
 
     for entry in entries:
-        if entry["test_id"] in selected_test_ids and entry["id"] not in matched_entry_ids and entry_allowed_for_target(entry, manifest, target_context):
-            missing_entries.append({"entry_id": entry["id"], "test_id": entry["test_id"], "status": entry["status"], "source": entry["source"], "message_regex": entry["message_regex"], "reason": "selected command did not emit the expected pre-reviewed event"})
+        if (
+            entry["test_id"] in selected_test_ids
+            and entry["id"] not in matched_entry_ids
+            and entry_allowed_for_target(entry, manifest, target_context)
+        ):
+            missing_entries.append(
+                {
+                    "entry_id": entry["id"],
+                    "test_id": entry["test_id"],
+                    "status": entry["status"],
+                    "source": entry["source"],
+                    "message_regex": entry["message_regex"],
+                    "reason": "selected command did not emit the expected pre-reviewed event",
+                }
+            )
 
     enabled = manifest is not None
     errors = []
@@ -638,7 +752,15 @@ def apply_applicability(command_records: list[dict[str, Any]], manifest: dict[st
         effective_blocking_events.extend(target_context_failures)
     return {
         "enabled": enabled,
-        "manifest": {"path": manifest.get("path"), "sha256": manifest.get("sha256"), "binding": manifest.get("binding"), "policy": manifest.get("policy"), "entries": len(entries)} if manifest else None,
+        "manifest": {
+            "path": manifest.get("path"),
+            "sha256": manifest.get("sha256"),
+            "binding": manifest.get("binding"),
+            "policy": manifest.get("policy"),
+            "entries": len(entries),
+        }
+        if manifest
+        else None,
         "target": target_context,
         "raw_blocking_event_count": len(raw_blocking_events),
         "pre_reviewed_event_count": len(pre_reviewed_events),
@@ -718,7 +840,17 @@ def run_ltp_commands(
         kirk_tmp.mkdir(parents=True, exist_ok=True)
         os.chmod(tmp_dir, 0o1777)
         if not ltp_path_budget_ok(tmp_dir):
-            raise RuntimeError(f"LTP tmpdir path is too long for legacy fixed-buffer tests: {tmp_dir} ({len(str(tmp_dir))} > {MAX_LEGACY_LTP_TMPDIR_LEN})")
+            raise RuntimeError(
+                (
+                    f"LTP tmpdir path is too long for legacy fixed-buffer tests: "
+                    f"{tmp_dir}"
+                    f" ("
+                    f"{len(str(tmp_dir))}"
+                    f" > "
+                    f"{MAX_LEGACY_LTP_TMPDIR_LEN}"
+                    f")"
+                )
+            )
         stdout = out_dir / "stdout.log"
         stderr = out_dir / "stderr.log"
         report = out_dir / "kirk-report.json"
@@ -727,7 +859,11 @@ def run_ltp_commands(
         timeout_fact = command_timeouts(record["test_id"], per_test_timeout, timeout_policy)
         exec_timeout = timeout_fact["exec_timeout_seconds"]
         suite_timeout = timeout_fact["suite_timeout_seconds"]
-        process_timeout = suite_timeout + 5 if timeout_fact["source"] == "timeout-policy" else max(per_test_timeout + 5, per_test_timeout * 2 + 5)
+        process_timeout = (
+            suite_timeout + 5
+            if timeout_fact["source"] == "timeout-policy"
+            else max(per_test_timeout + 5, per_test_timeout * 2 + 5)
+        )
         timeout_fact = {**timeout_fact, "process_timeout_seconds": process_timeout}
         argv = [
             str(install_root / "kirk"),
@@ -745,7 +881,9 @@ def run_ltp_commands(
             "--workers",
             "1",
         ]
-        command_result = run_bounded(argv, cwd=install_root, timeout=process_timeout, stdout_path=stdout, stderr_path=stderr)
+        command_result = run_bounded(
+            argv, cwd=install_root, timeout=process_timeout, stdout_path=stdout, stderr_path=stderr
+        )
         classification = classify_result(command_result, stdout, stderr, report)
         counts[classification["result"]] += 1
         total_duration += float(command_result["duration_seconds"])
@@ -771,7 +909,18 @@ def run_ltp_commands(
                 "command": str((out_dir / "command.json").relative_to(artifacts)),
             },
         }
-        write_json(out_dir / "command.json", {"record": record, "execution_payload": payload, "argv": argv, "shell_command": command, "timeout": timeout_fact, "result": command_result, "classification": classification})
+        write_json(
+            out_dir / "command.json",
+            {
+                "record": record,
+                "execution_payload": payload,
+                "argv": argv,
+                "shell_command": command,
+                "timeout": timeout_fact,
+                "result": command_result,
+                "classification": classification,
+            },
+        )
         command_records.append(command_record)
     return command_records, {"counts": counts, "duration_seconds": round(total_duration, 3)}
 
@@ -779,28 +928,80 @@ def run_ltp_commands(
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run AFS STD-02 LTP filesystem driver")
     parser.add_argument("--case-id", default=os.environ.get("AFS_ACCEPTANCE_CASE_ID", "STD-02"))
-    parser.add_argument("--profile", choices=["smoke", "full"], default=os.environ.get("AFS_ACCEPTANCE_PROFILE", "smoke"))
+    parser.add_argument(
+        "--profile", choices=["smoke", "full"], default=os.environ.get("AFS_ACCEPTANCE_PROFILE", "smoke")
+    )
     parser.add_argument("--matrix-json", default=os.environ.get("AFS_ACCEPTANCE_MATRIX", "{}"))
-    parser.add_argument("--run-dir", type=Path, default=Path(os.environ.get("AFS_ACCEPTANCE_RUN_DIR", "results/std-02-ltp")))
-    parser.add_argument("--mount", type=Path, default=Path(os.environ["AFS_ACCEPTANCE_MOUNT"]) if os.environ.get("AFS_ACCEPTANCE_MOUNT") else None)
-    parser.add_argument("--base-dir", type=Path, default=Path(os.environ["AFS_ACCEPTANCE_BASE_DIR"]) if os.environ.get("AFS_ACCEPTANCE_BASE_DIR") else None)
+    parser.add_argument(
+        "--run-dir", type=Path, default=Path(os.environ.get("AFS_ACCEPTANCE_RUN_DIR", "results/std-02-ltp"))
+    )
+    parser.add_argument(
+        "--mount",
+        type=Path,
+        default=Path(os.environ["AFS_ACCEPTANCE_MOUNT"]) if os.environ.get("AFS_ACCEPTANCE_MOUNT") else None,
+    )
+    parser.add_argument(
+        "--base-dir",
+        type=Path,
+        default=Path(os.environ["AFS_ACCEPTANCE_BASE_DIR"]) if os.environ.get("AFS_ACCEPTANCE_BASE_DIR") else None,
+    )
     parser.add_argument("--suite-root", type=Path, default=DEFAULT_SUITE_ROOT)
     parser.add_argument("--ltp-install", type=Path, default=DEFAULT_INSTALL_ROOT)
     parser.add_argument("--expanded-tsv", type=Path, default=DEFAULT_EXPANDED_TSV)
     parser.add_argument("--per-test-timeout", type=int, default=120)
-    parser.add_argument("--max-tests", type=int, default=None, help="Development-only cap; any full run with this set is BLOCKED, never PASS.")
+    parser.add_argument(
+        "--max-tests",
+        type=int,
+        default=None,
+        help="Development-only cap; any full run with this set is BLOCKED, never PASS.",
+    )
     parser.add_argument("--process-pid", default=os.environ.get("AFS_ACCEPTANCE_PROCESS_PID"))
     parser.add_argument("--meta-process-pid", default=os.environ.get("AFS_ACCEPTANCE_META_PROCESS_PID"))
     parser.add_argument("--backend", default=os.environ.get("AFS_ACCEPTANCE_BACKEND"))
     parser.add_argument("--meta", default=os.environ.get("AFS_ACCEPTANCE_META"))
-    parser.add_argument("--allow-nonroot-fixture", action="store_true", help="Only for driver self-tests with a fake kirk; real STD-02 must run as root.")
-    parser.add_argument("--allow-unpinned-suite-fixture", action="store_true", help="Only for driver self-tests with a fake LTP tree; real STD-02 must match the pinned revision.")
-    parser.add_argument("--applicability-manifest", type=Path, default=Path(os.environ["AFS_ACCEPTANCE_LTP_APPLICABILITY_MANIFEST"]) if os.environ.get("AFS_ACCEPTANCE_LTP_APPLICABILITY_MANIFEST") else None, help="Pre-run event-level applicability manifest. Raw command results remain preserved; unmatched nonpass events fail closed.")
-    parser.add_argument("--timeout-policy", type=Path, default=Path(os.environ["AFS_ACCEPTANCE_LTP_TIMEOUT_POLICY"]) if os.environ.get("AFS_ACCEPTANCE_LTP_TIMEOUT_POLICY") else None, help="Optional pre-run schema-1 per-test timeout policy bound to the selected LTP suite identity. Defaults remain unchanged when omitted.")
+    parser.add_argument(
+        "--allow-nonroot-fixture",
+        action="store_true",
+        help="Only for driver self-tests with a fake kirk; real STD-02 must run as root.",
+    )
+    parser.add_argument(
+        "--allow-unpinned-suite-fixture",
+        action="store_true",
+        help=("Only for driver self-tests with a fake LTP tree; real STD-02 must match the pinned revision."),
+    )
+    parser.add_argument(
+        "--applicability-manifest",
+        type=Path,
+        default=Path(os.environ["AFS_ACCEPTANCE_LTP_APPLICABILITY_MANIFEST"])
+        if os.environ.get("AFS_ACCEPTANCE_LTP_APPLICABILITY_MANIFEST")
+        else None,
+        help=(
+            "Pre-run event-level applicability manifest. Raw command results "
+            "remain preserved; unmatched nonpass events fail closed."
+        ),
+    )
+    parser.add_argument(
+        "--timeout-policy",
+        type=Path,
+        default=Path(os.environ["AFS_ACCEPTANCE_LTP_TIMEOUT_POLICY"])
+        if os.environ.get("AFS_ACCEPTANCE_LTP_TIMEOUT_POLICY")
+        else None,
+        help=(
+            "Optional pre-run schema-1 per-test timeout policy bound to the "
+            "selected LTP suite identity. Defaults remain unchanged when "
+            "omitted."
+        ),
+    )
     return parser.parse_args(argv)
 
 
-def proof_status_from_accounting(accounting: dict[str, Any], command_summary: dict[str, Any], profile: str, max_tests: int | None, applicability: dict[str, Any] | None = None) -> tuple[str, str]:
+def proof_status_from_accounting(
+    accounting: dict[str, Any],
+    command_summary: dict[str, Any],
+    profile: str,
+    max_tests: int | None,
+    applicability: dict[str, Any] | None = None,
+) -> tuple[str, str]:
     counts = command_summary["counts"]
     if max_tests is not None and profile == "full":
         return "BLOCKED", "full LTP run was capped by --max-tests; incomplete accounting preserved"
@@ -815,11 +1016,16 @@ def proof_status_from_accounting(accounting: dict[str, Any], command_summary: di
     raw_nonpass = counts["TBROK"] > 0 or counts["TCONF"] > 0
     if applicability and applicability.get("enabled"):
         if raw_nonpass and applicability.get("status") == "PASS":
-            return "PASS", "all raw TCONF/TBROK events were pre-reviewed by the applicability manifest; raw command results were preserved"
+            return "PASS", (
+                "all raw TCONF/TBROK events were pre-reviewed by the "
+                "applicability manifest; raw command results were preserved"
+            )
         if applicability.get("status") != "PASS":
             return "BLOCKED", "applicability manifest did not match the selected run exactly"
     if counts["TBROK"] > 0:
-        return "FAIL", "LTP reported TBROK without a pre-reviewed applicability manifest; raw command evidence was preserved"
+        return "FAIL", (
+            "LTP reported TBROK without a pre-reviewed applicability manifest; raw command evidence was preserved"
+        )
     if counts["TCONF"] > 0:
         return "BLOCKED", "LTP reported TCONF without a pre-reviewed applicability manifest"
     if counts["PASS"] == accounting["executed"]:
@@ -877,7 +1083,14 @@ def main(argv: list[str]) -> int:
             "created_at": utc(),
             "host": run_text(["hostname"]),
             "uname": run_text(["uname", "-a"]),
-            "platform": {"system": platform.system(), "release": platform.release(), "machine": platform.machine(), "python": platform.python_version(), "uid": os.geteuid(), "gid": os.getegid()},
+            "platform": {
+                "system": platform.system(),
+                "release": platform.release(),
+                "machine": platform.machine(),
+                "python": platform.python_version(),
+                "uid": os.geteuid(),
+                "gid": os.getegid(),
+            },
             "suite": ltp,
             "mount": mnt,
             "base_mount": base_mnt,
@@ -888,7 +1101,10 @@ def main(argv: list[str]) -> int:
             "lock_state_note": "acceptance.lock.json may remain PREPARING; driver readiness is not a release PASS.",
         }
         write_json(artifacts / "identity.json", identity)
-        write_json(artifacts / "discovery.json", {"total_commands": len(commands), "selection": selection, "selected": selected})
+        write_json(
+            artifacts / "discovery.json",
+            {"total_commands": len(commands), "selection": selection, "selected": selected},
+        )
         if args.timeout_policy is not None:
             timeout_policy = load_timeout_policy(args.timeout_policy, identity, selected, args.per_test_timeout)
             write_json(artifacts / "timeout-policy.normalized.json", timeout_policy)
@@ -897,18 +1113,85 @@ def main(argv: list[str]) -> int:
             write_json(artifacts / "applicability-manifest.normalized.json", applicability_manifest)
 
         suite_ok = (ltp["git_head"] == LTP_REV or args.allow_unpinned_suite_fixture) and ltp["kirk_exists"]
-        checks.append(build_check("pinned-suite-identity", "PASS" if suite_ok else "FAIL", {"expected": LTP_REV, "observed": ltp.get("git_head"), "kirk_exists": ltp.get("kirk_exists"), "allow_unpinned_suite_fixture": args.allow_unpinned_suite_fixture}, rel(artifacts / "identity.json", run_dir)))
+        checks.append(
+            build_check(
+                "pinned-suite-identity",
+                "PASS" if suite_ok else "FAIL",
+                {
+                    "expected": LTP_REV,
+                    "observed": ltp.get("git_head"),
+                    "kirk_exists": ltp.get("kirk_exists"),
+                    "allow_unpinned_suite_fixture": args.allow_unpinned_suite_fixture,
+                },
+                rel(artifacts / "identity.json", run_dir),
+            )
+        )
         root_ok = os.geteuid() == 0 or args.allow_nonroot_fixture
-        checks.append(build_check("root-harness", "PASS" if root_ok else "BLOCKED", {"euid": os.geteuid(), "allow_nonroot_fixture": args.allow_nonroot_fixture, "note": "real STD-02 runs as root; nonroot is allowed only for fake-kirk driver self-tests."}, rel(artifacts / "identity.json", run_dir)))
+        checks.append(
+            build_check(
+                "root-harness",
+                "PASS" if root_ok else "BLOCKED",
+                {
+                    "euid": os.geteuid(),
+                    "allow_nonroot_fixture": args.allow_nonroot_fixture,
+                    "note": "real STD-02 runs as root; nonroot is allowed only for fake-kirk driver self-tests.",
+                },
+                rel(artifacts / "identity.json", run_dir),
+            )
+        )
         mount_ok = mnt.get("returncode") == 0 and bool(mnt.get("stdout", "").strip())
         base_dir_ok = base_dir.is_dir() and is_under(base_dir, args.mount)
-        checks.append(build_check("mount-identity", "PASS" if mount_ok else "BLOCKED", {"mount": str(args.mount), "findmnt_returncode": mnt.get("returncode")}, rel(artifacts / "identity.json", run_dir)))
-        checks.append(build_check("base-dir-scope", "PASS" if base_dir_ok else "BLOCKED", {"mount": str(args.mount), "base_dir": str(base_dir), "exists": base_dir.exists(), "is_dir": base_dir.is_dir(), "under_mount": is_under(base_dir, args.mount)}, rel(artifacts / "identity.json", run_dir)))
-        target_result = target_checks(identity["platform"]["system"], product_identity["backend"], mnt, base_mnt, proc, meta_proc)
+        checks.append(
+            build_check(
+                "mount-identity",
+                "PASS" if mount_ok else "BLOCKED",
+                {"mount": str(args.mount), "findmnt_returncode": mnt.get("returncode")},
+                rel(artifacts / "identity.json", run_dir),
+            )
+        )
+        checks.append(
+            build_check(
+                "base-dir-scope",
+                "PASS" if base_dir_ok else "BLOCKED",
+                {
+                    "mount": str(args.mount),
+                    "base_dir": str(base_dir),
+                    "exists": base_dir.exists(),
+                    "is_dir": base_dir.is_dir(),
+                    "under_mount": is_under(base_dir, args.mount),
+                },
+                rel(artifacts / "identity.json", run_dir),
+            )
+        )
+        target_result = target_checks(
+            identity["platform"]["system"], product_identity["backend"], mnt, base_mnt, proc, meta_proc
+        )
         target_ok = bool(target_result) and all(target_result.values())
-        checks.append(build_check("target-identity", "PASS" if target_ok else "BLOCKED", {"backend": product_identity["backend"], "target_checks": target_result, "note": "Reference runs require observed ext4. Product runs require observed afs-ownerfs/afs-dfs FUSE plus live afs-node and afs-meta identities."}, rel(artifacts / "identity.json", run_dir)))
+        checks.append(
+            build_check(
+                "target-identity",
+                "PASS" if target_ok else "BLOCKED",
+                {
+                    "backend": product_identity["backend"],
+                    "target_checks": target_result,
+                    "note": (
+                        "Reference runs require observed ext4. Product runs require "
+                        "observed afs-ownerfs/afs-dfs FUSE plus live afs-node and "
+                        "afs-meta identities."
+                    ),
+                },
+                rel(artifacts / "identity.json", run_dir),
+            )
+        )
         discovery_ok = len(commands) == 657 or args.allow_unpinned_suite_fixture
-        checks.append(build_check("frozen-command-discovery", "PASS" if discovery_ok else "BLOCKED", {"expected": 657, "observed": len(commands), "selected": len(selected), "selection": selection}, rel(artifacts / "discovery.json", run_dir)))
+        checks.append(
+            build_check(
+                "frozen-command-discovery",
+                "PASS" if discovery_ok else "BLOCKED",
+                {"expected": 657, "observed": len(commands), "selected": len(selected), "selection": selection},
+                rel(artifacts / "discovery.json", run_dir),
+            )
+        )
 
         if not suite_ok or not root_ok or not mount_ok or not base_dir_ok or not target_ok or not discovery_ok:
             status = "BLOCKED" if not (mount_ok and base_dir_ok and target_ok and discovery_ok and root_ok) else "FAIL"
@@ -917,7 +1200,9 @@ def main(argv: list[str]) -> int:
             fixture = base_dir / short_fixture_name()
             fixture.mkdir(mode=0o755)
             os.chmod(fixture, 0o755)
-            command_records, command_summary = run_ltp_commands(selected, fixture, args.ltp_install, artifacts, args.per_test_timeout, timeout_policy)
+            command_records, command_summary = run_ltp_commands(
+                selected, fixture, args.ltp_install, artifacts, args.per_test_timeout, timeout_policy
+            )
             write_json(artifacts / "commands.json", command_records)
             applicability = apply_applicability(command_records, applicability_manifest, identity)
             if applicability_manifest is not None:
@@ -940,19 +1225,78 @@ def main(argv: list[str]) -> int:
                 "raw_output_per_command": True,
             }
             write_json(artifacts / "accounting.json", accounting)
-            checks.append(build_check("command-accounting", "PASS", accounting, rel(artifacts / "accounting.json", run_dir)))
-            checks.append(build_check("timeout-policy", "PASS", timeout_policy or {"enabled": False, "default": command_timeouts("__default__", args.per_test_timeout, None)}, rel(artifacts / "timeout-policy.normalized.json", run_dir) if timeout_policy else None))
+            checks.append(
+                build_check("command-accounting", "PASS", accounting, rel(artifacts / "accounting.json", run_dir))
+            )
+            checks.append(
+                build_check(
+                    "timeout-policy",
+                    "PASS",
+                    timeout_policy
+                    or {"enabled": False, "default": command_timeouts("__default__", args.per_test_timeout, None)},
+                    rel(artifacts / "timeout-policy.normalized.json", run_dir) if timeout_policy else None,
+                )
+            )
             all_commands_executed = accounting["executed"] == accounting["selected"]
-            checks.append(build_check("complete-selected-execution", "PASS" if all_commands_executed else "BLOCKED", {"selected": accounting["selected"], "executed": accounting["executed"]}, rel(artifacts / "commands.json", run_dir)))
-            result_check_status = "PASS" if command_summary["counts"].get("PASS", 0) == accounting["executed"] and accounting["executed"] > 0 else "FAIL"
+            checks.append(
+                build_check(
+                    "complete-selected-execution",
+                    "PASS" if all_commands_executed else "BLOCKED",
+                    {"selected": accounting["selected"], "executed": accounting["executed"]},
+                    rel(artifacts / "commands.json", run_dir),
+                )
+            )
+            result_check_status = (
+                "PASS"
+                if command_summary["counts"].get("PASS", 0) == accounting["executed"] and accounting["executed"] > 0
+                else "FAIL"
+            )
             if command_summary["counts"].get("TIMEOUT", 0) > 0 or command_summary["counts"].get("TCONF", 0) > 0:
                 result_check_status = "BLOCKED"
-            if applicability_manifest is not None and command_summary["counts"].get("FAIL", 0) == 0 and command_summary["counts"].get("TIMEOUT", 0) == 0 and applicability and applicability.get("status") == "PASS":
+            if (
+                applicability_manifest is not None
+                and command_summary["counts"].get("FAIL", 0) == 0
+                and command_summary["counts"].get("TIMEOUT", 0) == 0
+                and applicability
+                and applicability.get("status") == "PASS"
+            ):
                 result_check_status = "PASS"
-            checks.append(build_check("ltp-results", result_check_status, {"counts": command_summary["counts"], "applicability": {"enabled": bool(applicability_manifest), "status": applicability.get("status") if applicability else "NOT_APPLIED", "pre_reviewed_event_count": applicability.get("pre_reviewed_event_count", 0) if applicability else 0, "unmatched_event_count": applicability.get("unmatched_event_count", 0) if applicability else 0}, "note": "Raw TCONF/TBROK remain counted. They can be effective PASS only through a pre-run event-level applicability manifest."}, rel(artifacts / "commands.json", run_dir)))
+            checks.append(
+                build_check(
+                    "ltp-results",
+                    result_check_status,
+                    {
+                        "counts": command_summary["counts"],
+                        "applicability": {
+                            "enabled": bool(applicability_manifest),
+                            "status": applicability.get("status") if applicability else "NOT_APPLIED",
+                            "pre_reviewed_event_count": applicability.get("pre_reviewed_event_count", 0)
+                            if applicability
+                            else 0,
+                            "unmatched_event_count": applicability.get("unmatched_event_count", 0)
+                            if applicability
+                            else 0,
+                        },
+                        "note": (
+                            "Raw TCONF/TBROK remain counted. They can be effective PASS only "
+                            "through a pre-run event-level applicability manifest."
+                        ),
+                    },
+                    rel(artifacts / "commands.json", run_dir),
+                )
+            )
             if applicability_manifest is not None:
-                checks.append(build_check("ltp-applicability", "PASS" if applicability and applicability.get("status") == "PASS" else "BLOCKED", applicability, rel(artifacts / "applicability.json", run_dir)))
-            status, reason = proof_status_from_accounting(accounting, command_summary, args.profile, args.max_tests, applicability)
+                checks.append(
+                    build_check(
+                        "ltp-applicability",
+                        "PASS" if applicability and applicability.get("status") == "PASS" else "BLOCKED",
+                        applicability,
+                        rel(artifacts / "applicability.json", run_dir),
+                    )
+                )
+            status, reason = proof_status_from_accounting(
+                accounting, command_summary, args.profile, args.max_tests, applicability
+            )
             if status == "PASS" and fixture.exists():
                 try:
                     shutil.rmtree(fixture)
@@ -961,8 +1305,27 @@ def main(argv: list[str]) -> int:
                 except Exception as cleanup_exc:  # noqa: BLE001
                     fixture_kept = True
                     cleanup_artifact = artifacts / "cleanup-error.json"
-                    write_json(cleanup_artifact, {"fixture": str(fixture), "exception": type(cleanup_exc).__name__, "message": str(cleanup_exc), "traceback": traceback.format_exc()})
-                    checks.append(build_check("cleanup-fixture", "FAIL", {"fixture": str(fixture), "kept": True, "error": f"{type(cleanup_exc).__name__}: {cleanup_exc}"}, rel(cleanup_artifact, run_dir)))
+                    write_json(
+                        cleanup_artifact,
+                        {
+                            "fixture": str(fixture),
+                            "exception": type(cleanup_exc).__name__,
+                            "message": str(cleanup_exc),
+                            "traceback": traceback.format_exc(),
+                        },
+                    )
+                    checks.append(
+                        build_check(
+                            "cleanup-fixture",
+                            "FAIL",
+                            {
+                                "fixture": str(fixture),
+                                "kept": True,
+                                "error": f"{type(cleanup_exc).__name__}: {cleanup_exc}",
+                            },
+                            rel(cleanup_artifact, run_dir),
+                        )
+                    )
                     status = "FAIL"
                     reason = "LTP passed but fixture cleanup failed; accounting was preserved"
             else:
@@ -970,12 +1333,21 @@ def main(argv: list[str]) -> int:
     except Exception as exc:  # noqa: BLE001
         status = "BLOCKED"
         reason = f"driver setup failed: {type(exc).__name__}: {exc}"
-        write_json(artifacts / "setup-error.json", {"exception": type(exc).__name__, "message": str(exc), "traceback": traceback.format_exc()})
+        write_json(
+            artifacts / "setup-error.json",
+            {"exception": type(exc).__name__, "message": str(exc), "traceback": traceback.format_exc()},
+        )
         checks.append(build_check("driver-setup", "BLOCKED", reason, rel(artifacts / "setup-error.json", run_dir)))
 
     coverage_axes = {
-        "reference": {"values": [str(matrix.get("reference", "ext4"))], "checks": {str(matrix.get("reference", "ext4")): "target-identity"}},
-        "suite": {"values": [str(matrix.get("suite", f"LTP {LTP_TAG}"))], "checks": {str(matrix.get("suite", f"LTP {LTP_TAG}")): "pinned-suite-identity"}},
+        "reference": {
+            "values": [str(matrix.get("reference", "ext4"))],
+            "checks": {str(matrix.get("reference", "ext4")): "target-identity"},
+        },
+        "suite": {
+            "values": [str(matrix.get("suite", f"LTP {LTP_TAG}"))],
+            "checks": {str(matrix.get("suite", f"LTP {LTP_TAG}")): "pinned-suite-identity"},
+        },
     }
     proof = {
         "case_id": args.case_id,
@@ -986,15 +1358,29 @@ def main(argv: list[str]) -> int:
         "checks": checks,
         "coverage": {"profile": args.profile, "axes": coverage_axes},
         "artifacts": {"root": rel(artifacts, run_dir)},
-        "fixture": {"path": str(fixture) if fixture else None, "base_dir": str(resolve_base_dir(args.mount, args.base_dir)) if args.mount else None, "kept": fixture_kept},
-        "identity": {"artifact": rel(artifacts / "identity.json", run_dir), "product": identity.get("product") if identity else None},
+        "fixture": {
+            "path": str(fixture) if fixture else None,
+            "base_dir": str(resolve_base_dir(args.mount, args.base_dir)) if args.mount else None,
+            "kept": fixture_kept,
+        },
+        "identity": {
+            "artifact": rel(artifacts / "identity.json", run_dir),
+            "product": identity.get("product") if identity else None,
+        },
         "accounting": accounting,
         "command_summary": command_summary,
         "applicability": applicability or {"enabled": False, "status": "NOT_APPLIED"},
         "timeout_policy": timeout_policy or {"enabled": False},
         "notes": [
-            "STD-02 driver READY means the fixed LTP filesystem subset can run and report proof; it is not a release acceptance PASS by itself.",
-            "No tests are filtered after execution. TCONF/TBROK/TIMEOUT are counted and block or fail according to the contract.",
+            (
+                "STD-02 driver READY means the fixed LTP filesystem subset can "
+                "run and report proof; it is not a release acceptance PASS by "
+                "itself."
+            ),
+            (
+                "No tests are filtered after execution. TCONF/TBROK/TIMEOUT are "
+                "counted and block or fail according to the contract."
+            ),
         ],
     }
     write_json(artifacts / "proof.json", proof)

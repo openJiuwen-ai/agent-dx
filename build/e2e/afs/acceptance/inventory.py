@@ -6,6 +6,7 @@ or satisfy resource/durability gates. Optional unreadable fields remain UNKNOWN.
 They intentionally avoid /proc/<pid>/cmdline and environ because those may
 contain secrets.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -100,24 +101,38 @@ def cgroup_observation(
         result["reason"] = "cgroup membership is outside the mounted cgroup hierarchy"
         return result
     # Ancestor limits also apply: the leaf's `max` is not an unlimited budget.
+    field_names = (
+        "cpu.max",
+        "cpuset.cpus.effective",
+        "cpuset.mems.effective",
+        "memory.max",
+        "memory.high",
+        "memory.current",
+        "memory.swap.max",
+        "memory.swap.current",
+        "pids.max",
+        "pids.current",
+    )
     ancestors: list[dict[str, object]] = []
     current = leaf
     while True:
-        ancestors.append({
-            "path": str(current),
-            "fields": {name: file_observation(current / name) for name in (
-                "cpu.max", "cpuset.cpus.effective", "cpuset.mems.effective",
-                "memory.max", "memory.high", "memory.current", "memory.swap.max",
-                "memory.swap.current", "pids.max", "pids.current",
-            )},
-        })
+        ancestors.append(
+            {
+                "path": str(current),
+                "fields": {name: file_observation(current / name) for name in field_names},
+            }
+        )
         if current == root:
             break
         current = current.parent
-    result.update({
-        "status": "OBSERVED", "version": 2, "ancestors": ancestors,
-        "scope": "visible guest hierarchy only; host quotas are unknown",
-    })
+    result.update(
+        {
+            "status": "OBSERVED",
+            "version": 2,
+            "ancestors": ancestors,
+            "scope": "visible guest hierarchy only; host quotas are unknown",
+        }
+    )
     return result
 
 
@@ -127,9 +142,11 @@ def sysfs_observations(root: pathlib.Path, fields: tuple[str, ...]) -> dict[str,
     except OSError as error:
         return {"status": "UNKNOWN", "path": str(root), "error": str(error)}
     return {
-        "status": "OBSERVED", "path": str(root),
-        "entries": {entry.name: {name: file_observation(entry / name) for name in fields}
-                    for entry in entries if entry.is_dir()},
+        "status": "OBSERVED",
+        "path": str(root),
+        "entries": {
+            entry.name: {name: file_observation(entry / name) for name in fields} for entry in entries if entry.is_dir()
+        },
     }
 
 
@@ -153,9 +170,7 @@ def parse_pid(value: str, source: str) -> int:
 
 def validate_process_name(name: str) -> str:
     if not PROCESS_NAME_RE.fullmatch(name):
-        raise InventoryError(
-            f"process name {name!r} must match {PROCESS_NAME_RE.pattern}; do not use paths"
-        )
+        raise InventoryError(f"process name {name!r} must match {PROCESS_NAME_RE.pattern}; do not use paths")
     return name
 
 
@@ -218,9 +233,7 @@ def read_process_fingerprint(pid: int, proc_root: pathlib.Path = PROC_ROOT) -> d
 def assert_same_process(before: dict[str, object], after: dict[str, object], name: str) -> None:
     for key in ("pid", "start_ticks", "exe_dev", "exe_inode"):
         if before[key] != after[key]:
-            raise InventoryError(
-                f"process {name} changed while probing: {key} {before[key]!r} -> {after[key]!r}"
-            )
+            raise InventoryError(f"process {name} changed while probing: {key} {before[key]!r} -> {after[key]!r}")
 
 
 def collect_process_identity(probe: ProcessProbe, proc_root: pathlib.Path = PROC_ROOT) -> dict[str, object]:
@@ -283,14 +296,25 @@ def collect_guest_state(probes: Iterable[ProcessProbe]) -> dict[str, object]:
             "cgroup": cgroup_observation(os.getpid()),
             "swappiness": file_observation(PROC_ROOT / "sys" / "vm" / "swappiness"),
         },
-        "block_metadata": sysfs_observations(pathlib.Path("/sys/block"), (
-            "queue/write_cache", "queue/scheduler", "queue/rotational",
-            "queue/logical_block_size", "queue/physical_block_size",
-        )),
+        "block_metadata": sysfs_observations(
+            pathlib.Path("/sys/block"),
+            (
+                "queue/write_cache",
+                "queue/scheduler",
+                "queue/rotational",
+                "queue/logical_block_size",
+                "queue/physical_block_size",
+            ),
+        ),
         "host_disk_cache_and_thin_allocation": "UNKNOWN; cannot be established inside a guest",
-        "fuse_connections": sysfs_observations(pathlib.Path("/sys/fs/fuse/connections"), (
-            "waiting", "max_background", "congestion_threshold",
-        )),
+        "fuse_connections": sysfs_observations(
+            pathlib.Path("/sys/fs/fuse/connections"),
+            (
+                "waiting",
+                "max_background",
+                "congestion_threshold",
+            ),
+        ),
         "fuse_module_parameters": {
             name: file_observation(pathlib.Path("/sys/module/fuse/parameters") / name)
             for name in ("max_user_bgreq", "max_user_congthresh")
@@ -302,11 +326,29 @@ def collect_guest_state(probes: Iterable[ProcessProbe]) -> dict[str, object]:
         "volumes": ["findmnt", "--json", "--real"],
         "disks": ["lsblk", "-J", "-b", "-o", "NAME,SIZE,FSTYPE,MOUNTPOINTS"],
         "disk_space": ["df", "--local", "--block-size=1", "--output=source,fstype,size,used,avail,pcent,target"],
-        "block_layout": ["lsblk", "-J", "-b", "-o", "NAME,MAJ:MIN,SIZE,FSTYPE,UUID,MOUNTPOINTS,ROTA,RO,LOG-SEC,PHY-SEC"],
-        "time_service": ["timedatectl", "show", "--property=NTPSynchronized", "--property=NTP", "--property=Timezone", "--property=LocalRTC"],
-        "kernel_packages": ["dpkg-query", "-W", "-f=${Package} ${Version} ${Status}\n",
-                            f"linux-image-{platform.release()}", f"linux-modules-{platform.release()}",
-                            f"linux-modules-extra-{platform.release()}"],
+        "block_layout": [
+            "lsblk",
+            "-J",
+            "-b",
+            "-o",
+            "NAME,MAJ:MIN,SIZE,FSTYPE,UUID,MOUNTPOINTS,ROTA,RO,LOG-SEC,PHY-SEC",
+        ],
+        "time_service": [
+            "timedatectl",
+            "show",
+            "--property=NTPSynchronized",
+            "--property=NTP",
+            "--property=Timezone",
+            "--property=LocalRTC",
+        ],
+        "kernel_packages": [
+            "dpkg-query",
+            "-W",
+            "-f=${Package} ${Version} ${Status}\n",
+            f"linux-image-{platform.release()}",
+            f"linux-modules-{platform.release()}",
+            f"linux-modules-extra-{platform.release()}",
+        ],
         "rdma_links": ["rdma", "link", "show"],
         "rdma_device": ["ibv_devinfo", "-d", "rxe0", "-v"],
         "packages": ["dpkg-query", "-W", "-f=${Package} ${Version}\n"],
@@ -316,7 +358,8 @@ def collect_guest_state(probes: Iterable[ProcessProbe]) -> dict[str, object]:
         path = rdma / name
         state[name] = path.read_text(encoding="utf-8") if path.exists() else None
     packages = state["packages"]
-    assert isinstance(packages, dict)
+    if not isinstance(packages, dict):
+        raise AssertionError("isinstance(packages, dict)")
     state["packages_sha256"] = hashlib.sha256(str(packages["stdout"]).encode()).hexdigest()
     process_identities = collect_processes(probes)
     if process_identities:

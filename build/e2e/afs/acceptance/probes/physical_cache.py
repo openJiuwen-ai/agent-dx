@@ -3,17 +3,23 @@
 Only the requested backing-file range is counted. Client/FUSE cache layers are
 separate observations. mincore is a snapshot, not a pin or a durability proof.
 """
+
 import ctypes
 import mmap
 import os
-from pathlib import Path
 import platform
 import stat
+from pathlib import Path
 
 
 def identity(info):
-    return {"device": info.st_dev, "inode": info.st_ino, "size": info.st_size,
-            "mtime_ns": info.st_mtime_ns, "ctime_ns": info.st_ctime_ns}
+    return {
+        "device": info.st_dev,
+        "inode": info.st_ino,
+        "size": info.st_size,
+        "mtime_ns": info.st_mtime_ns,
+        "ctime_ns": info.st_ctime_ns,
+    }
 
 
 def observe(path, offset, length, expected=None):
@@ -37,8 +43,7 @@ def observe(path, offset, length, expected=None):
         mapped_length = offset + length - aligned
         pages = (mapped_length + page - 1) // page
         libc = ctypes.CDLL(None, use_errno=True)
-        libc.mmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int,
-                              ctypes.c_int, ctypes.c_int, ctypes.c_long]
+        libc.mmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_long]
         libc.mmap.restype = ctypes.c_void_p
         libc.mincore.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p]
         libc.mincore.restype = ctypes.c_int
@@ -51,17 +56,26 @@ def observe(path, offset, length, expected=None):
             vector = (ctypes.c_ubyte * pages)()
             if libc.mincore(address, mapped_length, vector):
                 raise OSError(ctypes.get_errno(), "mincore", str(path))
-            resident = sum(max(0, min(aligned + (i + 1) * page, offset + length)
-                               - max(aligned + i * page, offset))
-                           for i, bit in enumerate(vector) if bit & 1)
+            resident = sum(
+                max(0, min(aligned + (i + 1) * page, offset + length) - max(aligned + i * page, offset))
+                for i, bit in enumerate(vector)
+                if bit & 1
+            )
         finally:
             if libc.munmap(address, mapped_length):
                 raise OSError(ctypes.get_errno(), "residency munmap", str(path))
         if identity(os.fstat(fd)) != before or identity(path.stat()) != before:
             raise ValueError("backing file changed during observation")
-        return {"path": str(path), "identity": before, "offset": offset,
-                "length": length, "page_size": page, "pages": pages,
-                "resident_bytes": resident, "fully_resident": resident == length,
-                "method": "read-only MAP_SHARED + mincore; no mapped payload access"}
+        return {
+            "path": str(path),
+            "identity": before,
+            "offset": offset,
+            "length": length,
+            "page_size": page,
+            "pages": pages,
+            "resident_bytes": resident,
+            "fully_resident": resident == length,
+            "method": "read-only MAP_SHARED + mincore; no mapped payload access",
+        }
     finally:
         os.close(fd)

@@ -6,6 +6,7 @@ upstream pjdfstest root harness against a caller supplied mount directory,
 records raw TAP/prove output, and emits the runner proof JSON as the final
 stdout object.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -19,11 +20,11 @@ import shlex
 import shutil
 import signal
 import subprocess
-import uuid
 import sys
 import time
-import traceback
 import tomllib
+import traceback
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -53,7 +54,9 @@ def write_json(path: Path, value: Any) -> None:
 
 def run_text(argv: list[str], timeout: int = 10) -> dict[str, Any]:
     try:
-        proc = subprocess.run(argv, shell=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, check=False)
+        proc = subprocess.run(
+            argv, shell=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, check=False
+        )
         return {"argv": argv, "returncode": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr}
     except Exception as exc:  # noqa: BLE001 - evidence path records exact failure
         return {"argv": argv, "returncode": None, "exception": type(exc).__name__, "message": str(exc)}
@@ -83,7 +86,14 @@ def run_bounded(argv: list[str], cwd: Path, timeout: int, stdout_path: Path, std
                     pass
                 returncode = process.wait()
             err.write(f"pjdfstest driver timed out after {timeout}s\n".encode())
-    return {"argv": argv, "cwd": str(cwd), "returncode": returncode, "timeout_seconds": timeout, "timed_out": timed_out, "duration_seconds": round(time.time() - started, 3)}
+    return {
+        "argv": argv,
+        "cwd": str(cwd),
+        "returncode": returncode,
+        "timeout_seconds": timeout,
+        "timed_out": timed_out,
+        "duration_seconds": round(time.time() - started, 3),
+    }
 
 
 def discover_tests(suite_root: Path) -> dict[str, Any]:
@@ -91,12 +101,12 @@ def discover_tests(suite_root: Path) -> dict[str, Any]:
     tests = sorted(str(path.relative_to(tests_root)) for path in tests_root.rglob("*.t") if path.is_file())
     uid_drop_tests: list[str] = []
     todo_source_files: list[str] = []
-    for rel in tests:
-        text = (tests_root / rel).read_text(errors="replace")
+    for test_path in tests:
+        text = (tests_root / test_path).read_text(errors="replace")
         if re.search(r"\s-u\s+\d+", text) or re.search(r"\s-g\s+\d+", text):
-            uid_drop_tests.append(rel)
+            uid_drop_tests.append(test_path)
         if "TODO" in text:
-            todo_source_files.append(rel)
+            todo_source_files.append(test_path)
     misc = tests_root / "misc.sh"
     misc_text = misc.read_text(errors="replace") if misc.exists() else ""
     return {
@@ -172,7 +182,11 @@ def tap_file_progress(text: str, selected_tests: list[str]) -> dict[str, Any]:
             if re.match(r"^(?:not\s+)?ok$", stripped):
                 current_has_result = True
 
-    truncated_current = current if current is not None and current not in seen_completed and current_has_output and not current_has_result else None
+    truncated_current = (
+        current
+        if current is not None and current not in seen_completed and current_has_output and not current_has_result
+        else None
+    )
     finish_current(completed_by_header=False)
     unobserved = [rel_test for rel_test in selected_tests if rel_test not in seen_started]
     observed_incomplete = [rel_test for rel_test in started if rel_test not in seen_completed]
@@ -368,24 +382,30 @@ def artifact_file_manifest(root: Path, base: Path, exclude: set[Path] | None = N
     return files
 
 
-def remote_check_artifacts(checks: list[dict[str, Any]], manifest: list[dict[str, Any]], host_artifact: str) -> list[dict[str, Any]]:
+def remote_check_artifacts(
+    checks: list[dict[str, Any]], manifest: list[dict[str, Any]], host_artifact: str
+) -> list[dict[str, Any]]:
     manifest_by_path = {entry.get("path"): entry for entry in manifest if isinstance(entry, dict)}
     rewritten: list[dict[str, Any]] = []
     for check in checks:
         copy = dict(check)
         if "artifact" in copy:
             remote_artifact = copy["artifact"]
-            evidence = copy.get("evidence") if isinstance(copy.get("evidence"), dict) else {"value": copy.get("evidence")}
+            evidence = (
+                copy.get("evidence") if isinstance(copy.get("evidence"), dict) else {"value": copy.get("evidence")}
+            )
             evidence = dict(evidence)
             evidence["remote_artifact"] = remote_artifact
             evidence["remote_manifest_entry"] = manifest_by_path.get(remote_artifact)
             evidence["remote_artifact_manifest_matched"] = remote_artifact in manifest_by_path
-            evidence["remote_artifact_note"] = "Remote path is relative to worker --run-dir on B; host artifact preserves the worker proof and manifest."
+            evidence["remote_artifact_note"] = (
+                "Remote path is relative to worker --run-dir on B; host artifact "
+                "preserves the worker proof and manifest."
+            )
             copy["evidence"] = evidence
             copy["artifact"] = host_artifact
         rewritten.append(copy)
     return rewritten
-
 
 
 def parse_expected_process(value: str) -> tuple[str, int, str]:
@@ -429,7 +449,13 @@ def process_fingerprint(pid: int) -> dict[str, Any]:
     exe = proc / "exe"
     exe_target = os.readlink(exe)
     exe_stat = exe.stat()
-    return {"pid": pid, "start_ticks": parse_start_ticks(stat_text), "exe_path": exe_target, "exe_dev": exe_stat.st_dev, "exe_inode": exe_stat.st_ino}
+    return {
+        "pid": pid,
+        "start_ticks": parse_start_ticks(stat_text),
+        "exe_path": exe_target,
+        "exe_dev": exe_stat.st_dev,
+        "exe_inode": exe_stat.st_ino,
+    }
 
 
 def cmdline_for_pid(pid: int) -> list[str]:
@@ -481,7 +507,11 @@ def string_map_toml_value(values: dict[str, Any], key: str) -> dict[str, str]:
     if isinstance(value, str) and value:
         return {key: value}
     prefix = f"{key}."
-    children = {name[len(prefix):]: child for name, child in values.items() if name.startswith(prefix) and isinstance(child, str) and child}
+    children = {
+        name[len(prefix) :]: child
+        for name, child in values.items()
+        if name.startswith(prefix) and isinstance(child, str) and child
+    }
     return children
 
 
@@ -501,8 +531,14 @@ def config_summary(path: Path) -> dict[str, Any]:
     values = flattened_toml_values(parsed)
     tls_names = ("tls_ca_certificate", "tls_identity_certificate", "tls_identity_private_key")
     tls = {name: file_digest(string_toml_value(values, name)) for name in tls_names if string_toml_value(values, name)}
-    trusted_node_certs = {name: file_digest(cert_path) for name, cert_path in string_map_toml_value(values, "trusted_node_certs").items()}
-    tls_required = bool(any(string_toml_value(values, name) for name in tls_names) or string_toml_value(values, "tls_server_name") or trusted_node_certs)
+    trusted_node_certs = {
+        name: file_digest(cert_path) for name, cert_path in string_map_toml_value(values, "trusted_node_certs").items()
+    }
+    tls_required = bool(
+        any(string_toml_value(values, name) for name in tls_names)
+        or string_toml_value(values, "tls_server_name")
+        or trusted_node_certs
+    )
     tls_missing = [name for name in tls_names if tls_required and not string_toml_value(values, name)]
     return {
         "path": str(path),
@@ -618,7 +654,10 @@ def process_network_identity(pid: int) -> dict[str, Any]:
     owned = process_socket_inodes(pid)
     sockets = parse_proc_net(Path("/proc/net/tcp"), "tcp", owned)
     sockets.extend(parse_proc_net(Path("/proc/net/tcp6"), "tcp6", owned))
-    return {"interface_ips": local_interface_ips(), "listen_sockets": sorted(sockets, key=lambda item: (item["family"], item["ip"], item["port"], item["inode"]))}
+    return {
+        "interface_ips": local_interface_ips(),
+        "listen_sockets": sorted(sockets, key=lambda item: (item["family"], item["ip"], item["port"], item["inode"])),
+    }
 
 
 def emit(value: dict[str, Any]) -> None:
@@ -634,7 +673,13 @@ def worker_identity_main(argv: list[str]) -> int:
     args = parser.parse_args(argv)
     identities = {role: strict_process_identity(role, pid, sha) for role, pid, sha in args.expected_process}
     base_path = args.base_path or args.path
-    event = {"event": "IDENTITY", "platform": {"system": platform.system(), "machine": platform.machine(), "python": platform.python_version()}, "mount": mount_identity(args.path), "base_mount": mount_identity(base_path), "processes": identities}
+    event = {
+        "event": "IDENTITY",
+        "platform": {"system": platform.system(), "machine": platform.machine(), "python": platform.python_version()},
+        "mount": mount_identity(args.path),
+        "base_mount": mount_identity(base_path),
+        "processes": identities,
+    }
     if args.worker_run_dir is not None:
         event["worker_run_dir"] = str(args.worker_run_dir)
         event["worker_run_dir_mount"] = mount_identity(args.worker_run_dir)
@@ -666,19 +711,80 @@ def run_pjdfstest_worker(args: argparse.Namespace) -> dict[str, Any]:
         base_dir = resolve_base_dir(args.mount, args.base_dir)
         mnt = mount_identity(args.mount)
         base_mnt = mount_identity(base_dir)
-        identity = {"created_at": utc(), "host": run_text(["hostname"]), "uname": run_text(["uname", "-a"]), "platform": {"system": platform.system(), "release": platform.release(), "machine": platform.machine(), "python": platform.python_version(), "uid": os.geteuid(), "gid": os.getegid()}, "suite": suite, "mount": mnt, "base_mount": base_mnt, "product": {"backend": args.backend, "mount_path": str(args.mount), "base_dir": str(base_dir)}}
+        identity = {
+            "created_at": utc(),
+            "host": run_text(["hostname"]),
+            "uname": run_text(["uname", "-a"]),
+            "platform": {
+                "system": platform.system(),
+                "release": platform.release(),
+                "machine": platform.machine(),
+                "python": platform.python_version(),
+                "uid": os.geteuid(),
+                "gid": os.getegid(),
+            },
+            "suite": suite,
+            "mount": mnt,
+            "base_mount": base_mnt,
+            "product": {"backend": args.backend, "mount_path": str(args.mount), "base_dir": str(base_dir)},
+        }
         write_json(artifacts / "identity.json", identity)
         write_json(artifacts / "discovery.json", discovery)
         suite_ok = suite["git_head"] == PJDFS_REV and suite["executable_exists"]
-        checks.append(build_check("pinned-suite-identity", "PASS" if suite_ok else "FAIL", {"expected": PJDFS_REV, "observed": suite.get("git_head"), "executable_exists": suite.get("executable_exists")}, rel(artifacts / "identity.json", run_dir)))
+        checks.append(
+            build_check(
+                "pinned-suite-identity",
+                "PASS" if suite_ok else "FAIL",
+                {
+                    "expected": PJDFS_REV,
+                    "observed": suite.get("git_head"),
+                    "executable_exists": suite.get("executable_exists"),
+                },
+                rel(artifacts / "identity.json", run_dir),
+            )
+        )
         root_ok = os.geteuid() == 0
-        checks.append(build_check("root-harness", "PASS" if root_ok else "BLOCKED", {"euid": os.geteuid(), "uid_drop_test_file_count": discovery["uid_drop_test_file_count"]}, rel(artifacts / "discovery.json", run_dir)))
+        checks.append(
+            build_check(
+                "root-harness",
+                "PASS" if root_ok else "BLOCKED",
+                {"euid": os.geteuid(), "uid_drop_test_file_count": discovery["uid_drop_test_file_count"]},
+                rel(artifacts / "discovery.json", run_dir),
+            )
+        )
         mount_ok = mnt.get("returncode") == 0 and bool(mnt.get("stdout", "").strip())
         base_dir_ok = base_dir.is_dir() and is_under(base_dir, args.mount)
-        checks.append(build_check("mount-identity", "PASS" if mount_ok else "BLOCKED", {"mount": str(args.mount), "findmnt_returncode": mnt.get("returncode")}, rel(artifacts / "identity.json", run_dir)))
-        checks.append(build_check("base-dir-scope", "PASS" if base_dir_ok else "BLOCKED", {"mount": str(args.mount), "base_dir": str(base_dir), "exists": base_dir.exists(), "is_dir": base_dir.is_dir(), "under_mount": is_under(base_dir, args.mount)}, rel(artifacts / "identity.json", run_dir)))
+        checks.append(
+            build_check(
+                "mount-identity",
+                "PASS" if mount_ok else "BLOCKED",
+                {"mount": str(args.mount), "findmnt_returncode": mnt.get("returncode")},
+                rel(artifacts / "identity.json", run_dir),
+            )
+        )
+        checks.append(
+            build_check(
+                "base-dir-scope",
+                "PASS" if base_dir_ok else "BLOCKED",
+                {
+                    "mount": str(args.mount),
+                    "base_dir": str(base_dir),
+                    "exists": base_dir.exists(),
+                    "is_dir": base_dir.is_dir(),
+                    "under_mount": is_under(base_dir, args.mount),
+                },
+                rel(artifacts / "identity.json", run_dir),
+            )
+        )
         discovery_ok = discovery["discovered_files"] > 0
-        checks.append(build_check("discovery", "PASS" if discovery_ok else "BLOCKED", {"discovered_files": discovery["discovered_files"]}, rel(artifacts / "discovery.json", run_dir)))
+        checks.append(
+            build_check(
+                "discovery",
+                "PASS" if discovery_ok else "BLOCKED",
+                {"discovered_files": discovery["discovered_files"]},
+                rel(artifacts / "discovery.json", run_dir),
+            )
+        )
         if not suite_ok or not root_ok or not mount_ok or not base_dir_ok or not discovery_ok:
             status = "BLOCKED"
             reason = "pjdfstest worker preflight failed"
@@ -687,34 +793,127 @@ def run_pjdfstest_worker(args: argparse.Namespace) -> dict[str, Any]:
             selected_tests = SMOKE_TESTS if args.profile == "smoke" else discovery["tests"]
             timeout = args.timeout or (180 if args.profile == "smoke" else 1800)
             test_paths = [str(tests_root / rel_test) for rel_test in selected_tests]
-            fixture = base_dir / f".afs-std01-pjdfstest-{dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}"
+            fixture = base_dir / (
+                f".afs-std01-pjdfstest-"
+                f"{dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+                f"-"
+                f"{uuid.uuid4().hex[:8]}"
+            )
             fixture.mkdir(mode=0o755)
             os.chmod(fixture, 0o755)
             stdout = artifacts / "pjdfstest.stdout.tap"
             stderr = artifacts / "pjdfstest.stderr.log"
-            command_result = run_bounded(["prove", "-e", "/bin/sh", "-rv", *test_paths], cwd=fixture, timeout=timeout, stdout_path=stdout, stderr_path=stderr)
+            command_result = run_bounded(
+                ["prove", "-e", "/bin/sh", "-rv", *test_paths],
+                cwd=fixture,
+                timeout=timeout,
+                stdout_path=stdout,
+                stderr_path=stderr,
+            )
             write_json(artifacts / "command.json", command_result)
             accounting = parse_tap_and_prove(stdout, stderr, selected_tests)
-            accounting.update({"profile": args.profile, "discovered_files": discovery["discovered_files"], "not_selected_files": max(0, discovery["discovered_files"] - len(selected_tests)), "upstream_todo_source_file_count": discovery["todo_source_file_count"], "uid_drop_test_file_count": discovery["uid_drop_test_file_count"]})
+            accounting.update(
+                {
+                    "profile": args.profile,
+                    "discovered_files": discovery["discovered_files"],
+                    "not_selected_files": max(0, discovery["discovered_files"] - len(selected_tests)),
+                    "upstream_todo_source_file_count": discovery["todo_source_file_count"],
+                    "uid_drop_test_file_count": discovery["uid_drop_test_file_count"],
+                }
+            )
             write_json(artifacts / "tap-accounting.json", accounting)
-            checks.append(build_check("subprocess-bound", "PASS" if not command_result["timed_out"] else "BLOCKED", {"timeout_seconds": command_result["timeout_seconds"], "timed_out": command_result["timed_out"], "returncode": command_result["returncode"]}, rel(artifacts / "command.json", run_dir)))
+            checks.append(
+                build_check(
+                    "subprocess-bound",
+                    "PASS" if not command_result["timed_out"] else "BLOCKED",
+                    {
+                        "timeout_seconds": command_result["timeout_seconds"],
+                        "timed_out": command_result["timed_out"],
+                        "returncode": command_result["returncode"],
+                    },
+                    rel(artifacts / "command.json", run_dir),
+                )
+            )
             accounting_ok = complete_accounting(accounting, len(selected_tests))
-            checks.append(build_check("tap-accounting", "PASS" if accounting_ok else "FAIL", accounting, rel(artifacts / "tap-accounting.json", run_dir)))
-            result_ok = accounting_ok and command_result["returncode"] == 0 and not command_result["timed_out"] and accounting["tap_unexpected_fail"] == 0 and accounting.get("prove_result") == "PASS"
-            checks.append(build_check("pjdfstest-result", "PASS" if result_ok else "FAIL", {"returncode": command_result["returncode"], "prove_result": accounting.get("prove_result"), "tap_unexpected_fail": accounting.get("tap_unexpected_fail"), "tap_todo": accounting.get("tap_todo")}, rel(artifacts / "pjdfstest.stdout.tap", run_dir)))
+            checks.append(
+                build_check(
+                    "tap-accounting",
+                    "PASS" if accounting_ok else "FAIL",
+                    accounting,
+                    rel(artifacts / "tap-accounting.json", run_dir),
+                )
+            )
+            result_ok = (
+                accounting_ok
+                and command_result["returncode"] == 0
+                and not command_result["timed_out"]
+                and accounting["tap_unexpected_fail"] == 0
+                and accounting.get("prove_result") == "PASS"
+            )
+            checks.append(
+                build_check(
+                    "pjdfstest-result",
+                    "PASS" if result_ok else "FAIL",
+                    {
+                        "returncode": command_result["returncode"],
+                        "prove_result": accounting.get("prove_result"),
+                        "tap_unexpected_fail": accounting.get("tap_unexpected_fail"),
+                        "tap_todo": accounting.get("tap_todo"),
+                    },
+                    rel(artifacts / "pjdfstest.stdout.tap", run_dir),
+                )
+            )
             if command_result["timed_out"]:
-                status = "BLOCKED"; reason = f"pjdfstest timed out after {command_result['timeout_seconds']}s"
+                status = "BLOCKED"
+                reason = f"pjdfstest timed out after {command_result['timeout_seconds']}s"
             elif not result_ok:
-                status = "FAIL"; reason = "pjdfstest reported failures; raw TAP was preserved without filtering"
+                status = "FAIL"
+                reason = "pjdfstest reported failures; raw TAP was preserved without filtering"
             if status == "PASS" and fixture.exists():
-                shutil.rmtree(fixture); fixture_kept = False
+                shutil.rmtree(fixture)
+                fixture_kept = False
             else:
                 fixture_kept = bool(fixture and fixture.exists())
     except Exception as exc:
-        status = "BLOCKED"; reason = f"driver setup failed: {type(exc).__name__}: {exc}"
-        write_json(artifacts / "setup-error.json", {"exception": type(exc).__name__, "message": str(exc), "traceback": traceback.format_exc()})
+        status = "BLOCKED"
+        reason = f"driver setup failed: {type(exc).__name__}: {exc}"
+        write_json(
+            artifacts / "setup-error.json",
+            {"exception": type(exc).__name__, "message": str(exc), "traceback": traceback.format_exc()},
+        )
         checks.append(build_check("driver-setup", "BLOCKED", reason, rel(artifacts / "setup-error.json", run_dir)))
-    proof = {"case_id": args.case_id, "profile": args.profile, "matrix": matrix, "status": status, "reason": reason, "checks": checks, "coverage": {"profile": args.profile, "axes": {"reference": {"values": [str(matrix.get("reference", "ext4"))]}, "suite_sha": {"values": [str(matrix.get("suite_sha", f"sanwan/pjdfstest {PJDFS_REV}"))]}}}, "artifacts": {"root": rel(artifacts, run_dir), "manifest": []}, "fixture": {"path": str(fixture) if fixture else None, "base_dir": str(resolve_base_dir(args.mount, args.base_dir)), "kept": fixture_kept}, "identity": {"artifact": rel(artifacts / "identity.json", run_dir), "product": {"backend": args.backend, "mount_path": str(args.mount), "base_dir": str(resolve_base_dir(args.mount, args.base_dir))}}, "accounting": accounting, "command": command_result, "notes": ["Worker suite execution is qualified by standard.py host strict Node/Meta identity checks."]}
+    proof = {
+        "case_id": args.case_id,
+        "profile": args.profile,
+        "matrix": matrix,
+        "status": status,
+        "reason": reason,
+        "checks": checks,
+        "coverage": {
+            "profile": args.profile,
+            "axes": {
+                "reference": {"values": [str(matrix.get("reference", "ext4"))]},
+                "suite_sha": {"values": [str(matrix.get("suite_sha", f"sanwan/pjdfstest {PJDFS_REV}"))]},
+            },
+        },
+        "artifacts": {"root": rel(artifacts, run_dir), "manifest": []},
+        "fixture": {
+            "path": str(fixture) if fixture else None,
+            "base_dir": str(resolve_base_dir(args.mount, args.base_dir)),
+            "kept": fixture_kept,
+        },
+        "identity": {
+            "artifact": rel(artifacts / "identity.json", run_dir),
+            "product": {
+                "backend": args.backend,
+                "mount_path": str(args.mount),
+                "base_dir": str(resolve_base_dir(args.mount, args.base_dir)),
+            },
+        },
+        "accounting": accounting,
+        "command": command_result,
+        "notes": [("Worker suite execution is qualified by standard.py host strict Node/Meta identity checks.")],
+    }
     write_json(artifacts / "proof.json", proof)
     proof["artifacts"]["manifest"] = artifact_file_manifest(artifacts, run_dir, exclude={artifacts / "proof.json"})
     write_json(artifacts / "proof.json", proof)
@@ -768,7 +967,15 @@ def worker_driver_main(argv: list[str]) -> int:
         driver_args = driver_args[1:]
     env = dict(os.environ)
     env["AFS_ACCEPTANCE_REMOTE_HOST_QUALIFIED"] = "1"
-    proc = subprocess.run([sys.executable, str(args.driver), *driver_args], shell=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, env=env)
+    proc = subprocess.run(
+        [sys.executable, str(args.driver), *driver_args],
+        shell=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        env=env,
+    )
     if proc.stderr:
         sys.stderr.write(proc.stderr)
     proof = read_child_proof(proc.stdout)
@@ -779,7 +986,13 @@ def worker_driver_main(argv: list[str]) -> int:
             "matrix": {},
             "status": "BLOCKED",
             "reason": "worker driver did not emit structured JSON proof",
-            "checks": [{"name": "worker-driver", "status": "BLOCKED", "evidence": {"driver": str(args.driver), "returncode": proc.returncode}}],
+            "checks": [
+                {
+                    "name": "worker-driver",
+                    "status": "BLOCKED",
+                    "evidence": {"driver": str(args.driver), "returncode": proc.returncode},
+                }
+            ],
         }
     emit({"event": "DRIVER", "driver": str(args.driver), "returncode": proc.returncode, "proof": proof})
     return proc.returncode if proof.get("status") == "PASS" else 1
@@ -787,16 +1000,16 @@ def worker_driver_main(argv: list[str]) -> int:
 
 def run_worker_json(prefix: list[str], args: list[str], timeout: int) -> dict[str, Any]:
     argv = prefix + args
-    if prefix and Path(prefix[0]).name == 'ssh':
+    if prefix and Path(prefix[0]).name == "ssh":
         # SSH concatenates remote argv before invoking the login shell. Quote
         # both the fixed worker program and every later fixture/identity arg.
         # The adapter supplies an explicit separator and host; reject opaque
         # prefixes rather than guessing where SSH options end.
-        if '--' not in prefix:
-            raise ValueError('SSH worker requires an explicit -- host separator')
-        remote_start = prefix.index('--') + 2
+        if "--" not in prefix:
+            raise ValueError("SSH worker requires an explicit -- host separator")
+        remote_start = prefix.index("--") + 2
         if remote_start >= len(prefix):
-            raise ValueError('SSH worker requires a host and remote program')
+            raise ValueError("SSH worker requires a host and remote program")
         argv = prefix[:remote_start] + [shlex.join(prefix[remote_start:] + args)]
     started = time.time()
     timed_out = False
@@ -828,7 +1041,17 @@ def run_worker_json(prefix: list[str], args: list[str], timeout: int) -> dict[st
             events.append(json.loads(line))
         except json.JSONDecodeError as exc:
             parse_errors.append({"line": line_number, "error": str(exc), "text": line})
-    return {"argv": argv, "returncode": returncode, "stdout": stdout, "stderr": stderr, "json_events": events, "json_parse_errors": parse_errors, "timed_out": timed_out, "timeout_seconds": timeout, "duration_seconds": round(time.time() - started, 3)}
+    return {
+        "argv": argv,
+        "returncode": returncode,
+        "stdout": stdout,
+        "stderr": stderr,
+        "json_events": events,
+        "json_parse_errors": parse_errors,
+        "timed_out": timed_out,
+        "timeout_seconds": timeout,
+        "duration_seconds": round(time.time() - started, 3),
+    }
 
 
 def latest_event(record: dict[str, Any], event: str) -> dict[str, Any]:
@@ -838,7 +1061,16 @@ def latest_event(record: dict[str, Any], event: str) -> dict[str, Any]:
     if record.get("json_parse_errors"):
         raise RuntimeError(f"worker emitted malformed JSON before {event}: {record['json_parse_errors']!r}")
     if not events or events[-1].get("event") != event:
-        raise RuntimeError(json.dumps({"message": f"worker did not emit {event}", "returncode": record.get("returncode"), "stderr": record.get("stderr")}, sort_keys=True))
+        raise RuntimeError(
+            json.dumps(
+                {
+                    "message": f"worker did not emit {event}",
+                    "returncode": record.get("returncode"),
+                    "stderr": record.get("stderr"),
+                },
+                sort_keys=True,
+            )
+        )
     return events[-1]
 
 
@@ -846,7 +1078,12 @@ def validate_worker_run_dir_b(path: Path) -> str | None:
     text = str(path)
     if not path.is_absolute():
         return "--worker-run-dir-b must be an absolute Linux guest path"
-    if text.startswith("/Users/") or text.startswith("/Volumes/") or text.startswith("/private/") or text.startswith("/var/folders/"):
+    if (
+        text.startswith("/Users/")
+        or text.startswith("/Volumes/")
+        or text.startswith("/private/")
+        or text.startswith("/var/folders/")
+    ):
         return "--worker-run-dir-b must not be a macOS host path"
     return None
 
@@ -863,16 +1100,26 @@ def worker_run_dir_ext4_check(identity_event: dict[str, Any], expected_path: Pat
 
 
 def mount_records_stable(before: dict[str, Any], after: dict[str, Any]) -> bool:
-    return bool(before) and bool(after) and all(before.get(key) == after.get(key) for key in ("target", "source", "fstype"))
+    return (
+        bool(before)
+        and bool(after)
+        and all(before.get(key) == after.get(key) for key in ("target", "source", "fstype"))
+    )
 
 
-def worker_run_dir_stability(pre_event: dict[str, Any], post_event: dict[str, Any], expected_path: Path) -> dict[str, Any]:
+def worker_run_dir_stability(
+    pre_event: dict[str, Any], post_event: dict[str, Any], expected_path: Path
+) -> dict[str, Any]:
     pre = worker_run_dir_ext4_check(pre_event, expected_path)
     post = worker_run_dir_ext4_check(post_event, expected_path)
     return {
         "pre": pre,
         "post": post,
-        "stable": pre["path_matches"] and post["path_matches"] and pre["is_ext4"] and post["is_ext4"] and mount_records_stable(pre.get("findmnt") or {}, post.get("findmnt") or {}),
+        "stable": pre["path_matches"]
+        and post["path_matches"]
+        and pre["is_ext4"]
+        and post["is_ext4"]
+        and mount_records_stable(pre.get("findmnt") or {}, post.get("findmnt") or {}),
     }
 
 
@@ -902,11 +1149,19 @@ def validate_worker_artifacts(worker_proof: dict[str, Any] | None) -> dict[str, 
             "artifacts/std-01-pjdfstest/pjdfstest.stdout.tap",
         }
     else:
-        identity_artifact = ((worker_proof.get("identity") or {}).get("artifact") if isinstance(worker_proof.get("identity"), dict) else None)
-        required_paths = {identity_artifact} if manifest and isinstance(identity_artifact, str) and identity_artifact else set()
+        identity_artifact = (
+            (worker_proof.get("identity") or {}).get("artifact")
+            if isinstance(worker_proof.get("identity"), dict)
+            else None
+        )
+        required_paths = (
+            {identity_artifact} if manifest and isinstance(identity_artifact, str) and identity_artifact else set()
+        )
     paths = {entry.get("path") for entry in manifest if isinstance(entry, dict)}
     missing_paths = sorted(required_paths - paths)
-    invalid_entries = [entry for entry in manifest if not isinstance(entry, dict) or not worker_manifest_entry_valid(entry)]
+    invalid_entries = [
+        entry for entry in manifest if not isinstance(entry, dict) or not worker_manifest_entry_valid(entry)
+    ]
     embedded = {
         "accounting": bool(worker_proof.get("accounting")),
         "command": isinstance(worker_proof.get("command"), dict),
@@ -917,7 +1172,13 @@ def validate_worker_artifacts(worker_proof: dict[str, Any] | None) -> dict[str, 
     for check in worker_proof.get("checks") or []:
         remote_artifact = check.get("artifact")
         if remote_artifact:
-            check_artifacts.append({"check": check.get("name"), "artifact": remote_artifact, "manifest_entry": manifest_by_path.get(remote_artifact)})
+            check_artifacts.append(
+                {
+                    "check": check.get("name"),
+                    "artifact": remote_artifact,
+                    "manifest_entry": manifest_by_path.get(remote_artifact),
+                }
+            )
     unmatched_check_artifacts = [item for item in check_artifacts if manifest and item.get("manifest_entry") is None]
     if root == "artifacts/std-01-pjdfstest":
         valid = (
@@ -961,11 +1222,25 @@ def worker_artifact_manifest(worker_proof: dict[str, Any] | None) -> dict[str, A
         "proof_embedded_in_host_proof": True,
         "accounting_embedded_in_host_proof": bool(worker_proof.get("accounting")),
         "command_embedded_in_host_proof": bool(worker_proof.get("command")),
-        "note": "Worker artifact paths are relative to --worker-run-dir-b on B; host artifacts/root contains host-local proof and remote-worker-records only.",
+        "note": (
+            "Worker artifact paths are relative to --worker-run-dir-b on B; "
+            "host artifacts/root contains host-local proof and "
+            "remote-worker-records only."
+        ),
     }
 
 
-def host_proof_template(args: argparse.Namespace, artifacts: Path, run_dir: Path, status: str, reason: str, checks: list[dict[str, Any]], records: dict[str, Any], qualification: dict[str, bool] | None = None, worker_proof: dict[str, Any] | None = None) -> dict[str, Any]:
+def host_proof_template(
+    args: argparse.Namespace,
+    artifacts: Path,
+    run_dir: Path,
+    status: str,
+    reason: str,
+    checks: list[dict[str, Any]],
+    records: dict[str, Any],
+    qualification: dict[str, bool] | None = None,
+    worker_proof: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     matrix = json.loads(args.matrix_json) if args.matrix_json.strip() else {}
     if not isinstance(matrix, dict):
         matrix = {}
@@ -976,22 +1251,43 @@ def host_proof_template(args: argparse.Namespace, artifacts: Path, run_dir: Path
     if args.case_id == "STD-01":
         coverage_axes["suite_sha"] = {"values": [str(matrix["suite_sha"])]}
     proof: dict[str, Any] = {}
-    proof.update({
-        "case_id": args.case_id,
-        "profile": args.profile,
-        "matrix": matrix,
-        "status": status,
-        "reason": reason,
-        "checks": checks,
-        "coverage": (worker_proof or {}).get("coverage", {"profile": args.profile, "axes": coverage_axes}),
-        "artifacts": {"root": rel(artifacts, run_dir), "manifest": artifact_file_manifest(artifacts, run_dir, exclude={artifacts / "proof.json"}), "remote_worker": worker_artifact_manifest(worker_proof)},
-        "worker_run_dir_b": str(args.worker_run_dir_b),
-        "fixture": (worker_proof or {}).get("fixture", {"path": None, "base_dir": str(args.base_dir_b or args.mount_b), "kept": None}),
-        "identity": {"artifact": None, "product": {"backend": args.backend, "mount_path": str(args.mount_b), "base_dir": str(args.base_dir_b or args.mount_b)}},
-        "accounting": (worker_proof or {}).get("accounting", {}),
-        "command": (worker_proof or {}).get("command"),
-        "remote_identity": {"qualification": qualification or {}, "records_artifact": rel(artifacts / "remote-worker-records.json", run_dir), "records": records, "suite_invoked": "suite" in records, "worker_proof": worker_proof},
-    })
+    proof.update(
+        {
+            "case_id": args.case_id,
+            "profile": args.profile,
+            "matrix": matrix,
+            "status": status,
+            "reason": reason,
+            "checks": checks,
+            "coverage": (worker_proof or {}).get("coverage", {"profile": args.profile, "axes": coverage_axes}),
+            "artifacts": {
+                "root": rel(artifacts, run_dir),
+                "manifest": artifact_file_manifest(artifacts, run_dir, exclude={artifacts / "proof.json"}),
+                "remote_worker": worker_artifact_manifest(worker_proof),
+            },
+            "worker_run_dir_b": str(args.worker_run_dir_b),
+            "fixture": (worker_proof or {}).get(
+                "fixture", {"path": None, "base_dir": str(args.base_dir_b or args.mount_b), "kept": None}
+            ),
+            "identity": {
+                "artifact": None,
+                "product": {
+                    "backend": args.backend,
+                    "mount_path": str(args.mount_b),
+                    "base_dir": str(args.base_dir_b or args.mount_b),
+                },
+            },
+            "accounting": (worker_proof or {}).get("accounting", {}),
+            "command": (worker_proof or {}).get("command"),
+            "remote_identity": {
+                "qualification": qualification or {},
+                "records_artifact": rel(artifacts / "remote-worker-records.json", run_dir),
+                "records": records,
+                "suite_invoked": "suite" in records,
+                "worker_proof": worker_proof,
+            },
+        }
+    )
     return proof
 
 
@@ -1006,22 +1302,48 @@ def host_main(argv: list[str]) -> int:
     parser.add_argument("--mount-b", type=Path, required=True)
     parser.add_argument("--base-dir-b", type=Path)
     parser.add_argument("--suite-root-b", type=Path, default=DEFAULT_SUITE_ROOT)
-    parser.add_argument("--backend", default=os.environ.get("AFS_ACCEPTANCE_BACKEND"), required=os.environ.get("AFS_ACCEPTANCE_BACKEND") is None)
-    parser.add_argument("--profile", choices=["smoke", "full"], default=os.environ.get("AFS_ACCEPTANCE_PROFILE", "smoke"))
+    parser.add_argument(
+        "--backend",
+        default=os.environ.get("AFS_ACCEPTANCE_BACKEND"),
+        required=os.environ.get("AFS_ACCEPTANCE_BACKEND") is None,
+    )
+    parser.add_argument(
+        "--profile", choices=["smoke", "full"], default=os.environ.get("AFS_ACCEPTANCE_PROFILE", "smoke")
+    )
     parser.add_argument("--case-id", default=os.environ.get("AFS_ACCEPTANCE_CASE_ID", "STD-01"))
     parser.add_argument("--matrix-json", default=os.environ.get("AFS_ACCEPTANCE_MATRIX", "{}"))
-    parser.add_argument("--run-dir", type=Path, default=Path(os.environ.get("AFS_ACCEPTANCE_RUN_DIR", "results/std-01-driver-host")), help="Host-local evidence directory for host proof and worker records.")
-    parser.add_argument("--worker-run-dir-b", type=Path, required=True, help="B guest ext4 absolute directory for pjdfstest worker artifacts.")
+    parser.add_argument(
+        "--run-dir",
+        type=Path,
+        default=Path(os.environ.get("AFS_ACCEPTANCE_RUN_DIR", "results/std-01-driver-host")),
+        help="Host-local evidence directory for host proof and worker records.",
+    )
+    parser.add_argument(
+        "--worker-run-dir-b",
+        type=Path,
+        required=True,
+        help="B guest ext4 absolute directory for pjdfstest worker artifacts.",
+    )
     parser.add_argument("--worker-suite-event", default="PJDFSTEST")
     parser.add_argument("--worker-suite-args-json", type=parse_json_argv)
     parser.add_argument("--timeout", type=int)
     parser.add_argument("--command-timeout", type=int, default=3600)
     parser.add_argument("--require-cross-worker", action="store_true", default=True, help=argparse.SUPPRESS)
-    parser.add_argument("--allow-same-worker", action="store_true", help="Diagnostic-only escape hatch; product remote suite qualification requires distinct worker boot and machine IDs by default.")
+    parser.add_argument(
+        "--allow-same-worker",
+        action="store_true",
+        help=(
+            "Diagnostic-only escape hatch; product remote suite "
+            "qualification requires distinct worker boot and machine IDs by "
+            "default."
+        ),
+    )
     args = parser.parse_args(argv)
     args.require_cross_worker = not args.allow_same_worker
     run_dir = args.run_dir.resolve()
-    artifacts = run_dir / "artifacts" / ("std-01-pjdfstest" if args.case_id == "STD-01" else f"{args.case_id.lower()}-remote")
+    artifacts = (
+        run_dir / "artifacts" / ("std-01-pjdfstest" if args.case_id == "STD-01" else f"{args.case_id.lower()}-remote")
+    )
     artifacts.mkdir(parents=True, exist_ok=True)
     records: dict[str, Any] = {}
     checks: list[dict[str, Any]] = []
@@ -1029,7 +1351,9 @@ def host_main(argv: list[str]) -> int:
 
     def finish(status: str, reason: str, worker_proof: dict[str, Any] | None = None) -> int:
         write_json(artifacts / "remote-worker-records.json", records)
-        proof = host_proof_template(args, artifacts, run_dir, status, reason, checks, records, qualification, worker_proof)
+        proof = host_proof_template(
+            args, artifacts, run_dir, status, reason, checks, records, qualification, worker_proof
+        )
         write_json(artifacts / "proof.json", proof)
         print(json.dumps(proof, sort_keys=True))
         return 0 if status == "PASS" else 1
@@ -1044,18 +1368,39 @@ def host_main(argv: list[str]) -> int:
         roles_a = {role for role, _pid, _sha in args.worker_a_expected_process}
         roles_b = {role for role, _pid, _sha in args.worker_b_expected_process}
         if "meta" not in roles_a:
-            checks.append(build_check("host-arguments", "BLOCKED", "--worker-a-expected-process must include meta=PID:SHA256"))
+            checks.append(
+                build_check("host-arguments", "BLOCKED", "--worker-a-expected-process must include meta=PID:SHA256")
+            )
             return finish("BLOCKED", "host argument validation failed")
         if "node" not in roles_b:
-            checks.append(build_check("host-arguments", "BLOCKED", "--worker-b-expected-process must include node=PID:SHA256"))
+            checks.append(
+                build_check("host-arguments", "BLOCKED", "--worker-b-expected-process must include node=PID:SHA256")
+            )
             return finish("BLOCKED", "host argument validation failed")
         worker_dir_error = validate_worker_run_dir_b(args.worker_run_dir_b)
         if worker_dir_error:
-            checks.append(build_check("worker-run-dir-b", "BLOCKED", {"path": str(args.worker_run_dir_b), "error": worker_dir_error}))
+            checks.append(
+                build_check(
+                    "worker-run-dir-b", "BLOCKED", {"path": str(args.worker_run_dir_b), "error": worker_dir_error}
+                )
+            )
             return finish("BLOCKED", "host argument validation failed")
 
-        meta_identity_args = ["worker-identity", "--path", str(args.meta_identity_path_a), *exp_args(args.worker_a_expected_process)]
-        node_identity_args = ["worker-identity", "--path", str(args.mount_b), *( ["--base-path", str(args.base_dir_b)] if args.base_dir_b else [] ), "--worker-run-dir", str(args.worker_run_dir_b), *exp_args(args.worker_b_expected_process)]
+        meta_identity_args = [
+            "worker-identity",
+            "--path",
+            str(args.meta_identity_path_a),
+            *exp_args(args.worker_a_expected_process),
+        ]
+        node_identity_args = [
+            "worker-identity",
+            "--path",
+            str(args.mount_b),
+            *(["--base-path", str(args.base_dir_b)] if args.base_dir_b else []),
+            "--worker-run-dir",
+            str(args.worker_run_dir_b),
+            *exp_args(args.worker_b_expected_process),
+        ]
         records["meta_pre"] = run_worker_json(args.worker_a_json, meta_identity_args, args.command_timeout)
         records["node_pre"] = run_worker_json(args.worker_b_json, node_identity_args, args.command_timeout)
         meta_pre = latest_event(records["meta_pre"], "IDENTITY")["processes"].get("meta")
@@ -1064,16 +1409,53 @@ def host_main(argv: list[str]) -> int:
         expected_node_sha = next(sha for role, _pid, sha in args.worker_b_expected_process if role == "node")
         expected_meta_sha = next(sha for role, _pid, sha in args.worker_a_expected_process if role == "meta")
         worker_system = (node_pre_event.get("platform") or {}).get("system", "")
-        pre_qualification = remote_target_checks(worker_system, args.backend, node_pre_event["mount"], node_pre_event["base_mount"], node_pre, node_pre, meta_pre, meta_pre, expected_node_sha, expected_meta_sha, args.expected_meta_endpoint, args.require_cross_worker)
+        pre_qualification = remote_target_checks(
+            worker_system,
+            args.backend,
+            node_pre_event["mount"],
+            node_pre_event["base_mount"],
+            node_pre,
+            node_pre,
+            meta_pre,
+            meta_pre,
+            expected_node_sha,
+            expected_meta_sha,
+            args.expected_meta_endpoint,
+            args.require_cross_worker,
+        )
         worker_dir_check = worker_run_dir_ext4_check(node_pre_event, args.worker_run_dir_b)
         worker_dir_pre_ok = worker_dir_check["is_ext4"] and worker_dir_check["path_matches"]
-        checks.append(build_check("worker-run-dir-b-preflight", "PASS" if worker_dir_pre_ok else "BLOCKED", worker_dir_check))
-        checks.append(build_check("remote-target-preflight", "PASS" if all(pre_qualification.values()) else "BLOCKED", pre_qualification))
+        checks.append(
+            build_check("worker-run-dir-b-preflight", "PASS" if worker_dir_pre_ok else "BLOCKED", worker_dir_check)
+        )
+        checks.append(
+            build_check(
+                "remote-target-preflight", "PASS" if all(pre_qualification.values()) else "BLOCKED", pre_qualification
+            )
+        )
         if not all(pre_qualification.values()) or not worker_dir_pre_ok:
             qualification = pre_qualification
             return finish("BLOCKED", "remote target identity preflight failed")
 
-        suite_args = args.worker_suite_args_json or ["worker-pjdfstest", "--case-id", args.case_id, "--profile", args.profile, "--matrix-json", args.matrix_json, "--run-dir", str(args.worker_run_dir_b), "--mount", str(args.mount_b), "--backend", args.backend, "--suite-root", str(args.suite_root_b), *( ["--base-dir", str(args.base_dir_b)] if args.base_dir_b else [] ), *( ["--timeout", str(args.timeout)] if args.timeout else [] )]
+        suite_args = args.worker_suite_args_json or [
+            "worker-pjdfstest",
+            "--case-id",
+            args.case_id,
+            "--profile",
+            args.profile,
+            "--matrix-json",
+            args.matrix_json,
+            "--run-dir",
+            str(args.worker_run_dir_b),
+            "--mount",
+            str(args.mount_b),
+            "--backend",
+            args.backend,
+            "--suite-root",
+            str(args.suite_root_b),
+            *(["--base-dir", str(args.base_dir_b)] if args.base_dir_b else []),
+            *(["--timeout", str(args.timeout)] if args.timeout else []),
+        ]
         records["suite"] = run_worker_json(args.worker_b_json, suite_args, args.command_timeout)
         records["node_post"] = run_worker_json(args.worker_b_json, node_identity_args, args.command_timeout)
         records["meta_post"] = run_worker_json(args.worker_a_json, meta_identity_args, args.command_timeout)
@@ -1083,10 +1465,27 @@ def host_main(argv: list[str]) -> int:
         suite_event = latest_event(records["suite"], args.worker_suite_event)
         worker_proof = suite_event["proof"]
         post_system = (node_post_event.get("platform") or {}).get("system", worker_system)
-        qualification = remote_target_checks(post_system, args.backend, node_post_event["mount"], node_post_event["base_mount"], node_pre, node_post, meta_pre, meta_post, expected_node_sha, expected_meta_sha, args.expected_meta_endpoint, args.require_cross_worker)
+        qualification = remote_target_checks(
+            post_system,
+            args.backend,
+            node_post_event["mount"],
+            node_post_event["base_mount"],
+            node_pre,
+            node_post,
+            meta_pre,
+            meta_post,
+            expected_node_sha,
+            expected_meta_sha,
+            args.expected_meta_endpoint,
+            args.require_cross_worker,
+        )
         post_mount_stability = {
-            "mount_stable": mount_records_stable(mount_record(node_pre_event["mount"]), mount_record(node_post_event["mount"])),
-            "base_mount_stable": mount_records_stable(mount_record(node_pre_event["base_mount"]), mount_record(node_post_event["base_mount"])),
+            "mount_stable": mount_records_stable(
+                mount_record(node_pre_event["mount"]), mount_record(node_post_event["mount"])
+            ),
+            "base_mount_stable": mount_records_stable(
+                mount_record(node_pre_event["base_mount"]), mount_record(node_post_event["base_mount"])
+            ),
             "pre_mount": mount_record(node_pre_event["mount"]),
             "post_mount": mount_record(node_post_event["mount"]),
             "pre_base_mount": mount_record(node_pre_event["base_mount"]),
@@ -1099,35 +1498,84 @@ def host_main(argv: list[str]) -> int:
             qualification["worker-artifacts-complete"] = False
         post_checks = [
             build_check("remote-target-identity", "PASS" if all(qualification.values()) else "BLOCKED", qualification),
-            build_check("remote-mount-stability", "PASS" if post_mount_stability["mount_stable"] and post_mount_stability["base_mount_stable"] else "BLOCKED", post_mount_stability),
-            build_check("worker-run-dir-b-stability", "PASS" if run_dir_stability["stable"] else "BLOCKED", run_dir_stability),
-            build_check("remote-worker-artifacts", "PASS" if artifact_validation["valid"] or worker_proof.get("status") != "PASS" else "BLOCKED", artifact_validation),
+            build_check(
+                "remote-mount-stability",
+                "PASS"
+                if post_mount_stability["mount_stable"] and post_mount_stability["base_mount_stable"]
+                else "BLOCKED",
+                post_mount_stability,
+            ),
+            build_check(
+                "worker-run-dir-b-stability", "PASS" if run_dir_stability["stable"] else "BLOCKED", run_dir_stability
+            ),
+            build_check(
+                "remote-worker-artifacts",
+                "PASS" if artifact_validation["valid"] or worker_proof.get("status") != "PASS" else "BLOCKED",
+                artifact_validation,
+            ),
         ]
-        worker_manifest = ((worker_proof.get("artifacts") or {}).get("manifest") or [])
+        worker_manifest = (worker_proof.get("artifacts") or {}).get("manifest") or []
         host_records_artifact = rel(artifacts / "remote-worker-records.json", run_dir)
-        checks = checks + remote_check_artifacts(list(worker_proof.get("checks") or []), worker_manifest, host_records_artifact) + post_checks
-        qualified = all(qualification.values()) and post_mount_stability["mount_stable"] and post_mount_stability["base_mount_stable"] and run_dir_stability["stable"] and (artifact_validation["valid"] or worker_proof.get("status") != "PASS")
+        checks = (
+            checks
+            + remote_check_artifacts(list(worker_proof.get("checks") or []), worker_manifest, host_records_artifact)
+            + post_checks
+        )
+        qualified = (
+            all(qualification.values())
+            and post_mount_stability["mount_stable"]
+            and post_mount_stability["base_mount_stable"]
+            and run_dir_stability["stable"]
+            and (artifact_validation["valid"] or worker_proof.get("status") != "PASS")
+        )
         status = worker_proof.get("status") if qualified else "BLOCKED"
         reason = worker_proof.get("reason") if qualified else "remote target identity or artifact qualification failed"
         return finish(status, reason, worker_proof)
     except Exception as exc:  # noqa: BLE001 - preserve structured proof for bad/missing worker evidence
-        checks.append(build_check("host-orchestration", "BLOCKED", {"exception": type(exc).__name__, "message": str(exc)}))
+        checks.append(
+            build_check("host-orchestration", "BLOCKED", {"exception": type(exc).__name__, "message": str(exc)})
+        )
         return finish("BLOCKED", f"host orchestration failed: {type(exc).__name__}: {exc}")
+
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run AFS STD-01 pjdfstest driver")
     parser.add_argument("--case-id", default=os.environ.get("AFS_ACCEPTANCE_CASE_ID", "STD-01"))
-    parser.add_argument("--profile", choices=["smoke", "full"], default=os.environ.get("AFS_ACCEPTANCE_PROFILE", "smoke"))
+    parser.add_argument(
+        "--profile", choices=["smoke", "full"], default=os.environ.get("AFS_ACCEPTANCE_PROFILE", "smoke")
+    )
     parser.add_argument("--matrix-json", default=os.environ.get("AFS_ACCEPTANCE_MATRIX", "{}"))
-    parser.add_argument("--run-dir", type=Path, default=Path(os.environ.get("AFS_ACCEPTANCE_RUN_DIR", "results/std-01-driver")))
-    parser.add_argument("--mount", type=Path, default=Path(os.environ["AFS_ACCEPTANCE_MOUNT"]) if os.environ.get("AFS_ACCEPTANCE_MOUNT") else None)
-    parser.add_argument("--base-dir", type=Path, default=Path(os.environ["AFS_ACCEPTANCE_BASE_DIR"]) if os.environ.get("AFS_ACCEPTANCE_BASE_DIR") else None, help="Directory under --mount that contains the temporary pjdfstest fixture. Relative paths are resolved below --mount.")
+    parser.add_argument(
+        "--run-dir", type=Path, default=Path(os.environ.get("AFS_ACCEPTANCE_RUN_DIR", "results/std-01-driver"))
+    )
+    parser.add_argument(
+        "--mount",
+        type=Path,
+        default=Path(os.environ["AFS_ACCEPTANCE_MOUNT"]) if os.environ.get("AFS_ACCEPTANCE_MOUNT") else None,
+    )
+    parser.add_argument(
+        "--base-dir",
+        type=Path,
+        default=Path(os.environ["AFS_ACCEPTANCE_BASE_DIR"]) if os.environ.get("AFS_ACCEPTANCE_BASE_DIR") else None,
+        help=(
+            "Directory under --mount that contains the temporary pjdfstest "
+            "fixture. Relative paths are resolved below --mount."
+        ),
+    )
     parser.add_argument("--suite-root", type=Path, default=DEFAULT_SUITE_ROOT)
     parser.add_argument("--timeout", type=int, default=None, help="pjdfstest subprocess timeout in seconds")
     parser.add_argument("--process-pid", default=os.environ.get("AFS_ACCEPTANCE_PROCESS_PID"))
     parser.add_argument("--meta-process-pid", default=os.environ.get("AFS_ACCEPTANCE_META_PROCESS_PID"))
-    parser.add_argument("--backend", default=os.environ.get("AFS_ACCEPTANCE_BACKEND"), help="Observed product backend label, for proof identity only.")
-    parser.add_argument("--meta", default=os.environ.get("AFS_ACCEPTANCE_META"), help="Observed Meta backend label, for proof identity only.")
+    parser.add_argument(
+        "--backend",
+        default=os.environ.get("AFS_ACCEPTANCE_BACKEND"),
+        help="Observed product backend label, for proof identity only.",
+    )
+    parser.add_argument(
+        "--meta",
+        default=os.environ.get("AFS_ACCEPTANCE_META"),
+        help="Observed Meta backend label, for proof identity only.",
+    )
     return parser.parse_args(argv)
 
 
@@ -1178,7 +1626,14 @@ def legacy_main(argv: list[str]) -> int:
             "created_at": utc(),
             "host": run_text(["hostname"]),
             "uname": run_text(["uname", "-a"]),
-            "platform": {"system": platform.system(), "release": platform.release(), "machine": platform.machine(), "python": platform.python_version(), "uid": os.geteuid(), "gid": os.getegid()},
+            "platform": {
+                "system": platform.system(),
+                "release": platform.release(),
+                "machine": platform.machine(),
+                "python": platform.python_version(),
+                "uid": os.geteuid(),
+                "gid": os.getegid(),
+            },
             "suite": suite,
             "mount": mnt,
             "base_mount": base_mnt,
@@ -1191,24 +1646,103 @@ def legacy_main(argv: list[str]) -> int:
         write_json(artifacts / "discovery.json", discovery)
 
         suite_ok = suite["git_head"] == PJDFS_REV and suite["executable_exists"]
-        checks.append(build_check("pinned-suite-identity", "PASS" if suite_ok else "FAIL", {"expected": PJDFS_REV, "observed": suite.get("git_head"), "executable_exists": suite.get("executable_exists")}, rel(artifacts / "identity.json", run_dir)))
+        checks.append(
+            build_check(
+                "pinned-suite-identity",
+                "PASS" if suite_ok else "FAIL",
+                {
+                    "expected": PJDFS_REV,
+                    "observed": suite.get("git_head"),
+                    "executable_exists": suite.get("executable_exists"),
+                },
+                rel(artifacts / "identity.json", run_dir),
+            )
+        )
         root_ok = os.geteuid() == 0
-        checks.append(build_check("root-harness", "PASS" if root_ok else "BLOCKED", {"euid": os.geteuid(), "uid_drop_test_file_count": discovery["uid_drop_test_file_count"], "note": "pjdfstest must run as root; internal -u/-g tests provide non-root coverage."}, rel(artifacts / "discovery.json", run_dir)))
+        checks.append(
+            build_check(
+                "root-harness",
+                "PASS" if root_ok else "BLOCKED",
+                {
+                    "euid": os.geteuid(),
+                    "uid_drop_test_file_count": discovery["uid_drop_test_file_count"],
+                    "note": "pjdfstest must run as root; internal -u/-g tests provide non-root coverage.",
+                },
+                rel(artifacts / "discovery.json", run_dir),
+            )
+        )
         mount_ok = mnt.get("returncode") == 0 and bool(mnt.get("stdout", "").strip())
         base_dir_ok = base_dir.is_dir() and is_under(base_dir, args.mount)
-        checks.append(build_check("mount-identity", "PASS" if mount_ok else "BLOCKED", {"mount": str(args.mount), "findmnt_returncode": mnt.get("returncode")}, rel(artifacts / "identity.json", run_dir)))
-        checks.append(build_check("base-dir-scope", "PASS" if base_dir_ok else "BLOCKED", {"mount": str(args.mount), "base_dir": str(base_dir), "exists": base_dir.exists(), "is_dir": base_dir.is_dir(), "under_mount": is_under(base_dir, args.mount)}, rel(artifacts / "identity.json", run_dir)))
+        checks.append(
+            build_check(
+                "mount-identity",
+                "PASS" if mount_ok else "BLOCKED",
+                {"mount": str(args.mount), "findmnt_returncode": mnt.get("returncode")},
+                rel(artifacts / "identity.json", run_dir),
+            )
+        )
+        checks.append(
+            build_check(
+                "base-dir-scope",
+                "PASS" if base_dir_ok else "BLOCKED",
+                {
+                    "mount": str(args.mount),
+                    "base_dir": str(base_dir),
+                    "exists": base_dir.exists(),
+                    "is_dir": base_dir.is_dir(),
+                    "under_mount": is_under(base_dir, args.mount),
+                },
+                rel(artifacts / "identity.json", run_dir),
+            )
+        )
         backend_ok = bool(product_identity["backend"])
-        checks.append(build_check("backend-selection", "PASS" if backend_ok else "BLOCKED", product_identity, rel(artifacts / "identity.json", run_dir)))
+        checks.append(
+            build_check(
+                "backend-selection",
+                "PASS" if backend_ok else "BLOCKED",
+                product_identity,
+                rel(artifacts / "identity.json", run_dir),
+            )
+        )
         observed_checks = target_checks(platform.system(), product_identity["backend"], mnt, base_mnt, proc, meta_proc)
         for name, passed in observed_checks.items():
-            checks.append(build_check(name, "PASS" if passed else "BLOCKED", {"observed": passed}, rel(artifacts / "identity.json", run_dir)))
+            checks.append(
+                build_check(
+                    name,
+                    "PASS" if passed else "BLOCKED",
+                    {"observed": passed},
+                    rel(artifacts / "identity.json", run_dir),
+                )
+            )
         target_ok = all(observed_checks.values())
         discovery_ok = discovery["discovered_files"] > 0
-        checks.append(build_check("discovery", "PASS" if discovery_ok else "BLOCKED", {"discovered_files": discovery["discovered_files"], "uid_drop_test_file_count": discovery["uid_drop_test_file_count"], "todo_source_file_count": discovery["todo_source_file_count"]}, rel(artifacts / "discovery.json", run_dir)))
+        checks.append(
+            build_check(
+                "discovery",
+                "PASS" if discovery_ok else "BLOCKED",
+                {
+                    "discovered_files": discovery["discovered_files"],
+                    "uid_drop_test_file_count": discovery["uid_drop_test_file_count"],
+                    "todo_source_file_count": discovery["todo_source_file_count"],
+                },
+                rel(artifacts / "discovery.json", run_dir),
+            )
+        )
 
-        if not suite_ok or not root_ok or not mount_ok or not base_dir_ok or not backend_ok or not discovery_ok or not target_ok:
-            status = "BLOCKED" if not (root_ok and mount_ok and base_dir_ok and backend_ok and discovery_ok and target_ok) else "FAIL"
+        if (
+            not suite_ok
+            or not root_ok
+            or not mount_ok
+            or not base_dir_ok
+            or not backend_ok
+            or not discovery_ok
+            or not target_ok
+        ):
+            status = (
+                "BLOCKED"
+                if not (root_ok and mount_ok and base_dir_ok and backend_ok and discovery_ok and target_ok)
+                else "FAIL"
+            )
             reason = "pjdfstest preflight failed"
         else:
             tests_root = args.suite_root / "tests"
@@ -1219,7 +1753,12 @@ def legacy_main(argv: list[str]) -> int:
                 selected_tests = discovery["tests"]
                 timeout = args.timeout or 1800
             test_paths = [str(tests_root / rel_test) for rel_test in selected_tests]
-            fixture = base_dir / f".afs-std01-pjdfstest-{dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}"
+            fixture = base_dir / (
+                f".afs-std01-pjdfstest-"
+                f"{dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+                f"-"
+                f"{uuid.uuid4().hex[:8]}"
+            )
             fixture.mkdir(mode=0o755)
             # pjdfstest runs as root but many upstream checks drop to numeric
             # non-root users through the harness. Those child processes must be
@@ -1232,22 +1771,74 @@ def legacy_main(argv: list[str]) -> int:
             command_result = run_bounded(command, cwd=fixture, timeout=timeout, stdout_path=stdout, stderr_path=stderr)
             write_json(artifacts / "command.json", command_result)
             accounting = parse_tap_and_prove(stdout, stderr, selected_tests)
-            accounting.update({
-                "profile": args.profile,
-                "discovered_files": discovery["discovered_files"],
-                "not_selected_files": max(0, discovery["discovered_files"] - len(selected_tests)),
-                "upstream_todo_source_file_count": discovery["todo_source_file_count"],
-                "uid_drop_test_file_count": discovery["uid_drop_test_file_count"],
-            })
+            accounting.update(
+                {
+                    "profile": args.profile,
+                    "discovered_files": discovery["discovered_files"],
+                    "not_selected_files": max(0, discovery["discovered_files"] - len(selected_tests)),
+                    "upstream_todo_source_file_count": discovery["todo_source_file_count"],
+                    "uid_drop_test_file_count": discovery["uid_drop_test_file_count"],
+                }
+            )
             write_json(artifacts / "tap-accounting.json", accounting)
-            checks.append(build_check("subprocess-bound", "PASS" if not command_result["timed_out"] else "BLOCKED", {"timeout_seconds": command_result["timeout_seconds"], "timed_out": command_result["timed_out"], "returncode": command_result["returncode"]}, rel(artifacts / "command.json", run_dir)))
+            checks.append(
+                build_check(
+                    "subprocess-bound",
+                    "PASS" if not command_result["timed_out"] else "BLOCKED",
+                    {
+                        "timeout_seconds": command_result["timeout_seconds"],
+                        "timed_out": command_result["timed_out"],
+                        "returncode": command_result["returncode"],
+                    },
+                    rel(artifacts / "command.json", run_dir),
+                )
+            )
             accounting_ok = complete_accounting(accounting, len(selected_tests))
-            checks.append(build_check("tap-accounting", "PASS" if accounting_ok else "FAIL", accounting, rel(artifacts / "tap-accounting.json", run_dir)))
+            checks.append(
+                build_check(
+                    "tap-accounting",
+                    "PASS" if accounting_ok else "FAIL",
+                    accounting,
+                    rel(artifacts / "tap-accounting.json", run_dir),
+                )
+            )
             uid_drop_executed = bool(set(selected_tests) & set(discovery["uid_drop_test_files"]))
             uid_drop_status = "PASS" if uid_drop_executed or args.profile == "smoke" else "BLOCKED"
-            checks.append(build_check("uid-drop-coverage", uid_drop_status, {"executed_uid_drop_tests": sorted(set(selected_tests) & set(discovery["uid_drop_test_files"])), "total_uid_drop_test_files": discovery["uid_drop_test_file_count"], "profile": args.profile, "note": "smoke verifies harness wiring; full profile must include upstream uid/gid drop tests."}, rel(artifacts / "tap-accounting.json", run_dir)))
-            result_ok = accounting_ok and command_result["returncode"] == 0 and not command_result["timed_out"] and accounting["tap_unexpected_fail"] == 0 and accounting.get("prove_result") == "PASS"
-            checks.append(build_check("pjdfstest-result", "PASS" if result_ok else "FAIL", {"returncode": command_result["returncode"], "prove_result": accounting.get("prove_result"), "tap_unexpected_fail": accounting.get("tap_unexpected_fail"), "tap_todo": accounting.get("tap_todo")}, rel(artifacts / "pjdfstest.stdout.tap", run_dir)))
+            checks.append(
+                build_check(
+                    "uid-drop-coverage",
+                    uid_drop_status,
+                    {
+                        "executed_uid_drop_tests": sorted(set(selected_tests) & set(discovery["uid_drop_test_files"])),
+                        "total_uid_drop_test_files": discovery["uid_drop_test_file_count"],
+                        "profile": args.profile,
+                        "note": (
+                            "smoke verifies harness wiring; full profile must include upstream uid/gid drop tests."
+                        ),
+                    },
+                    rel(artifacts / "tap-accounting.json", run_dir),
+                )
+            )
+            result_ok = (
+                accounting_ok
+                and command_result["returncode"] == 0
+                and not command_result["timed_out"]
+                and accounting["tap_unexpected_fail"] == 0
+                and accounting.get("prove_result") == "PASS"
+            )
+            checks.append(
+                build_check(
+                    "pjdfstest-result",
+                    "PASS" if result_ok else "FAIL",
+                    {
+                        "returncode": command_result["returncode"],
+                        "prove_result": accounting.get("prove_result"),
+                        "tap_unexpected_fail": accounting.get("tap_unexpected_fail"),
+                        "tap_todo": accounting.get("tap_todo"),
+                    },
+                    rel(artifacts / "pjdfstest.stdout.tap", run_dir),
+                )
+            )
             if command_result["timed_out"]:
                 status = "BLOCKED"
                 reason = f"pjdfstest timed out after {command_result['timeout_seconds']}s"
@@ -1262,8 +1853,27 @@ def legacy_main(argv: list[str]) -> int:
                 except Exception as cleanup_exc:  # noqa: BLE001 - preserve suite accounting and report cleanup separately
                     fixture_kept = True
                     cleanup_artifact = artifacts / "cleanup-error.json"
-                    write_json(cleanup_artifact, {"fixture": str(fixture), "exception": type(cleanup_exc).__name__, "message": str(cleanup_exc), "traceback": traceback.format_exc()})
-                    checks.append(build_check("cleanup-fixture", "FAIL", {"fixture": str(fixture), "kept": True, "error": f"{type(cleanup_exc).__name__}: {cleanup_exc}"}, rel(cleanup_artifact, run_dir)))
+                    write_json(
+                        cleanup_artifact,
+                        {
+                            "fixture": str(fixture),
+                            "exception": type(cleanup_exc).__name__,
+                            "message": str(cleanup_exc),
+                            "traceback": traceback.format_exc(),
+                        },
+                    )
+                    checks.append(
+                        build_check(
+                            "cleanup-fixture",
+                            "FAIL",
+                            {
+                                "fixture": str(fixture),
+                                "kept": True,
+                                "error": f"{type(cleanup_exc).__name__}: {cleanup_exc}",
+                            },
+                            rel(cleanup_artifact, run_dir),
+                        )
+                    )
                     status = "FAIL"
                     reason = "pjdfstest passed but fixture cleanup failed; accounting was preserved"
             else:
@@ -1271,12 +1881,21 @@ def legacy_main(argv: list[str]) -> int:
     except Exception as exc:  # noqa: BLE001 - proof must preserve setup failure
         status = "BLOCKED"
         reason = f"driver setup failed: {type(exc).__name__}: {exc}"
-        write_json(artifacts / "setup-error.json", {"exception": type(exc).__name__, "message": str(exc), "traceback": traceback.format_exc()})
+        write_json(
+            artifacts / "setup-error.json",
+            {"exception": type(exc).__name__, "message": str(exc), "traceback": traceback.format_exc()},
+        )
         checks.append(build_check("driver-setup", "BLOCKED", reason, rel(artifacts / "setup-error.json", run_dir)))
 
     coverage_axes = {
-        "reference": {"values": [str(matrix.get("reference", "ext4"))], "checks": {str(matrix.get("reference", "ext4")): "mount-identity"}},
-        "suite_sha": {"values": [str(matrix.get("suite_sha", f"sanwan/pjdfstest {PJDFS_REV}"))], "checks": {str(matrix.get("suite_sha", f"sanwan/pjdfstest {PJDFS_REV}")): "pinned-suite-identity"}},
+        "reference": {
+            "values": [str(matrix.get("reference", "ext4"))],
+            "checks": {str(matrix.get("reference", "ext4")): "mount-identity"},
+        },
+        "suite_sha": {
+            "values": [str(matrix.get("suite_sha", f"sanwan/pjdfstest {PJDFS_REV}"))],
+            "checks": {str(matrix.get("suite_sha", f"sanwan/pjdfstest {PJDFS_REV}")): "pinned-suite-identity"},
+        },
     }
     proof = {
         "case_id": args.case_id,
@@ -1287,12 +1906,22 @@ def legacy_main(argv: list[str]) -> int:
         "checks": checks,
         "coverage": {"profile": args.profile, "axes": coverage_axes},
         "artifacts": {"root": rel(artifacts, run_dir)},
-        "fixture": {"path": str(fixture) if fixture else None, "base_dir": str(resolve_base_dir(args.mount, args.base_dir)) if args.mount else None, "kept": fixture_kept},
-        "identity": {"artifact": rel(artifacts / "identity.json", run_dir), "product": (identity.get("product") if "identity" in locals() else None)},
+        "fixture": {
+            "path": str(fixture) if fixture else None,
+            "base_dir": str(resolve_base_dir(args.mount, args.base_dir)) if args.mount else None,
+            "kept": fixture_kept,
+        },
+        "identity": {
+            "artifact": rel(artifacts / "identity.json", run_dir),
+            "product": (identity.get("product") if "identity" in locals() else None),
+        },
         "accounting": accounting,
         "command": command_result,
         "notes": [
-            "STD-01 driver READY means the pjdfstest harness can run and report proof; it is not a release acceptance PASS by itself.",
+            (
+                "STD-01 driver READY means the pjdfstest harness can run and "
+                "report proof; it is not a release acceptance PASS by itself."
+            ),
             "No failures are filtered after execution. TODO and SKIP are counted in TAP accounting.",
         ],
     }

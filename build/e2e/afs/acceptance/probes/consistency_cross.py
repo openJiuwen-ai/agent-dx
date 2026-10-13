@@ -6,6 +6,7 @@ all filesystem IO on Linux. The controller only orchestrates ordering, records
 raw command output, and writes evidence. It does not restart, signal, or mutate
 AFS runtime processes.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -13,8 +14,8 @@ import hashlib
 import json
 import os
 import platform
-import selectors
 import random
+import selectors
 import subprocess
 import sys
 import tempfile
@@ -22,7 +23,6 @@ import time
 import traceback
 from pathlib import Path
 from typing import Any
-
 
 SCHEMA = "afs.consistency_cross.v1"
 DEFAULT_IDLE_SECONDS = 35.0
@@ -194,7 +194,9 @@ def _expected_after_resize(payload: bytes, resize_to: int | None) -> bytes:
     return payload + (b"\x00" * (resize_to - len(payload)))
 
 
-def _result_event(op: str, path: Path | None, expected_processes: list[tuple[str, int, str]], **extra: Any) -> dict[str, Any]:
+def _result_event(
+    op: str, path: Path | None, expected_processes: list[tuple[str, int, str]], **extra: Any
+) -> dict[str, Any]:
     return {"event": "RESULT", "op": op, "identity": _worker_identity(path, expected_processes), **extra}
 
 
@@ -465,16 +467,49 @@ def _hold_old_then_fresh(path: Path, expected: bytes, expected_processes: list[t
     try:
         fd = os.open(path, os.O_RDONLY)
         old = os.pread(fd, 4096, 0)
-        _emit({"event": "READY", "op": "hold-old-then-fresh", "path": str(path), "identity": _worker_identity(path, expected_processes), "old_fd_initial_hex": old.hex(), "old_fd_initial_size": len(old)})
+        _emit(
+            {
+                "event": "READY",
+                "op": "hold-old-then-fresh",
+                "path": str(path),
+                "identity": _worker_identity(path, expected_processes),
+                "old_fd_initial_hex": old.hex(),
+                "old_fd_initial_size": len(old),
+            }
+        )
         line = sys.stdin.readline()
         if line.strip() != "GO":
             raise RuntimeError(f"expected GO on stdin, got {line!r}")
         result = _fresh_verify(path, expected)
-        result.update({"old_fd_initial_hex": old.hex(), "old_fd_initial_size": len(old), "duration_seconds": round(time.time() - started, 6)})
-        _emit({"event": "RESULT", "op": "hold-old-then-fresh", "path": str(path), "identity": _worker_identity(path, expected_processes), **result})
+        result.update(
+            {
+                "old_fd_initial_hex": old.hex(),
+                "old_fd_initial_size": len(old),
+                "duration_seconds": round(time.time() - started, 6),
+            }
+        )
+        _emit(
+            {
+                "event": "RESULT",
+                "op": "hold-old-then-fresh",
+                "path": str(path),
+                "identity": _worker_identity(path, expected_processes),
+                **result,
+            }
+        )
         return 0 if result.get("ok") else 1
     except Exception as exc:  # noqa: BLE001 - preserve worker failure as evidence
-        _emit({"event": "ERROR", "op": "hold-old-then-fresh", "path": str(path), "exception": type(exc).__name__, "message": str(exc), "identity": _worker_identity(path, expected_processes), "duration_seconds": round(time.time() - started, 6)})
+        _emit(
+            {
+                "event": "ERROR",
+                "op": "hold-old-then-fresh",
+                "path": str(path),
+                "exception": type(exc).__name__,
+                "message": str(exc),
+                "identity": _worker_identity(path, expected_processes),
+                "duration_seconds": round(time.time() - started, 6),
+            }
+        )
         return 1
     finally:
         if fd is not None:
@@ -483,45 +518,73 @@ def _hold_old_then_fresh(path: Path, expected: bytes, expected_processes: list[t
 
 def _worker_main(args: argparse.Namespace) -> int:
     if platform.system() != "Linux":
-        _emit({"event": "ERROR", "op": args.op, "message": "consistency_cross worker requires Linux", "platform": platform.system()})
+        _emit(
+            {
+                "event": "ERROR",
+                "op": args.op,
+                "message": "consistency_cross worker requires Linux",
+                "platform": platform.system(),
+            }
+        )
         return 1
     path = Path(args.path).resolve() if args.path else None
     expected_processes = args.expected_process or []
     try:
         if args.op == "identity":
-            _emit(_result_event(args.op, path, expected_processes, stat=_stat_json(path) if path and path.exists() else None))
+            _emit(
+                _result_event(
+                    args.op, path, expected_processes, stat=_stat_json(path) if path and path.exists() else None
+                )
+            )
             return 0
         if args.op == "same-mount":
-            assert path is not None
+            if not path is not None:
+                raise AssertionError("path is not None")
             result = _same_mount_visible(path)
             _emit(_result_event(args.op, path, expected_processes, **result, stat=_stat_json(path)))
             return 0 if result.get("ok") else 1
         if args.op == "write-close":
-            assert path is not None
+            if not path is not None:
+                raise AssertionError("path is not None")
             result = _write_close(path, args.payload.encode(), args.resize_to, args.fsync_before_close)
             _emit(_result_event(args.op, path, expected_processes, **result, stat=_stat_json(path)))
             return 0 if result.get("ok") else 1
         if args.op == "fresh-verify":
-            assert path is not None
+            if not path is not None:
+                raise AssertionError("path is not None")
             result = _fresh_verify(path, args.expected.encode())
             _emit(_result_event(args.op, path, expected_processes, **result, stat=_stat_json(path)))
             return 0 if result.get("ok") else 1
         if args.op == "provider-resize-write-visible":
-            assert path is not None
-            result = _provider_resize_write_visible(path, args.payload.encode(), 0 if args.resize_to is None else args.resize_to)
+            if not path is not None:
+                raise AssertionError("path is not None")
+            result = _provider_resize_write_visible(
+                path, args.payload.encode(), 0 if args.resize_to is None else args.resize_to
+            )
             _emit(_result_event(args.op, path, expected_processes, **result, stat=_stat_json(path)))
             return 0 if result.get("ok") else 1
         if args.op == "rename-overwrite-hardlink":
-            assert path is not None
+            if not path is not None:
+                raise AssertionError("path is not None")
             result = _rename_overwrite_hardlink(path)
             _emit(_result_event(args.op, path, expected_processes, **result, stat=_stat_json(path)))
             return 0 if result.get("ok") else 1
         if args.op == "hold-old-then-fresh":
-            assert path is not None
+            if not path is not None:
+                raise AssertionError("path is not None")
             return _hold_old_then_fresh(path, args.expected.encode(), expected_processes)
         raise RuntimeError(f"unknown worker op {args.op!r}")
     except Exception as exc:  # noqa: BLE001 - preserve raw worker error
-        _emit({"event": "ERROR", "op": args.op, "path": str(path) if path else None, "exception": type(exc).__name__, "message": str(exc), "identity": _worker_identity(path, expected_processes) if path else None})
+        _emit(
+            {
+                "event": "ERROR",
+                "op": args.op,
+                "path": str(path) if path else None,
+                "exception": type(exc).__name__,
+                "message": str(exc),
+                "identity": _worker_identity(path, expected_processes) if path else None,
+            }
+        )
         return 1
 
 
@@ -530,12 +593,15 @@ class StreamingWorker:
         self.name = name
         self.argv = argv
         self.timeout = timeout
-        self.proc = subprocess.Popen(argv, text=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.proc = subprocess.Popen(
+            argv, text=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
         self.events: list[dict[str, Any]] = []
         self.stderr = ""
 
     def read_event(self, event: str) -> dict[str, Any]:
-        assert self.proc.stdout is not None
+        if not self.proc.stdout is not None:
+            raise AssertionError("self.proc.stdout is not None")
         selector = selectors.DefaultSelector()
         selector.register(self.proc.stdout, selectors.EVENT_READ)
         deadline = time.monotonic() + self.timeout
@@ -544,11 +610,15 @@ class StreamingWorker:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     self._terminate_after_timeout()
-                    raise TimeoutError(f"{self.name} did not emit {event}; events={self.events}; stderr={self.stderr!r}")
+                    raise TimeoutError(
+                        f"{self.name} did not emit {event}; events={self.events}; stderr={self.stderr!r}"
+                    )
                 ready = selector.select(remaining)
                 if not ready:
                     self._terminate_after_timeout()
-                    raise TimeoutError(f"{self.name} did not emit {event}; events={self.events}; stderr={self.stderr!r}")
+                    raise TimeoutError(
+                        f"{self.name} did not emit {event}; events={self.events}; stderr={self.stderr!r}"
+                    )
                 line = self.proc.stdout.readline()
                 if not line:
                     if self.proc.poll() is not None:
@@ -579,7 +649,8 @@ class StreamingWorker:
             self.stderr += err or ""
 
     def send_go(self) -> None:
-        assert self.proc.stdin is not None
+        if not self.proc.stdin is not None:
+            raise AssertionError("self.proc.stdin is not None")
         self.proc.stdin.write("GO\n")
         self.proc.stdin.flush()
 
@@ -603,7 +674,14 @@ class ConsistencyController:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
         self.evidence = Path(args.evidence).resolve()
-        self.run_id = args.run_id or f"consistency-cross-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-{os.getpid()}-{random.randrange(1_000_000):06d}"
+        self.run_id = args.run_id or (
+            f"consistency-cross-"
+            f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}"
+            f"-"
+            f"{os.getpid()}"
+            f"-"
+            f"{random.randrange(1000000):06d}"
+        )
         self.commands: list[dict[str, Any]] = []
         self.steps: list[dict[str, Any]] = []
         self.failures: list[dict[str, Any]] = []
@@ -638,7 +716,14 @@ class ConsistencyController:
     def run_cmd(self, worker: str, op: str, path: str | None = None, **kwargs: Any) -> dict[str, Any]:
         argv = self.argv(worker, op, path, **kwargs)
         started = time.time()
-        proc = subprocess.run(argv, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=self.args.command_timeout, check=False)
+        proc = subprocess.run(
+            argv,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=self.args.command_timeout,
+            check=False,
+        )
         events = [json.loads(line) for line in proc.stdout.splitlines() if line.strip()]
         record = {
             "worker": worker,
@@ -670,13 +755,16 @@ class ConsistencyController:
 
     def remember_identity_baseline(self, worker: str, event: dict[str, Any]) -> None:
         processes = event.get("identity", {}).get("expected_processes") or {}
-        self.identity_baseline[worker] = {role: {
-            "pid": value.get("pid"),
-            "start_ticks": value.get("start_ticks"),
-            "sha256": value.get("sha256"),
-            "exe_dev": value.get("exe_dev"),
-            "exe_inode": value.get("exe_inode"),
-        } for role, value in processes.items()}
+        self.identity_baseline[worker] = {
+            role: {
+                "pid": value.get("pid"),
+                "start_ticks": value.get("start_ticks"),
+                "sha256": value.get("sha256"),
+                "exe_dev": value.get("exe_dev"),
+                "exe_inode": value.get("exe_inode"),
+            }
+            for role, value in processes.items()
+        }
 
     def validate_event_identity(self, worker: str, event: dict[str, Any]) -> None:
         if not self.identity_baseline:
@@ -684,7 +772,18 @@ class ConsistencyController:
         expected = self.identity_baseline.get(worker) or {}
         observed = event.get("identity", {}).get("expected_processes") or {}
         if set(observed) != set(expected):
-            raise RuntimeError(json.dumps({"message": "worker identity roles changed", "worker": worker, "expected_roles": sorted(expected), "observed_roles": sorted(observed), "event": event}, sort_keys=True))
+            raise RuntimeError(
+                json.dumps(
+                    {
+                        "message": "worker identity roles changed",
+                        "worker": worker,
+                        "expected_roles": sorted(expected),
+                        "observed_roles": sorted(observed),
+                        "event": event,
+                    },
+                    sort_keys=True,
+                )
+            )
         for role, want in expected.items():
             got = observed.get(role) or {}
             current = {
@@ -695,7 +794,19 @@ class ConsistencyController:
                 "exe_inode": got.get("exe_inode"),
             }
             if current != want or got.get("sha256_ok") is not True:
-                raise RuntimeError(json.dumps({"message": "worker process identity changed or mismatched", "worker": worker, "role": role, "expected": want, "observed": got, "event_op": event.get("op")}, sort_keys=True))
+                raise RuntimeError(
+                    json.dumps(
+                        {
+                            "message": "worker process identity changed or mismatched",
+                            "worker": worker,
+                            "role": role,
+                            "expected": want,
+                            "observed": got,
+                            "event_op": event.get("op"),
+                        },
+                        sort_keys=True,
+                    )
+                )
 
     def checked_stream_event(self, worker: str, child: StreamingWorker, expected_event: str) -> dict[str, Any]:
         event = child.read_event(expected_event)
@@ -719,7 +830,9 @@ class ConsistencyController:
         return fstype.startswith("fuse") and ("afs" in fstype or "afs" in source or "afs" in options)
 
     def expected_processes_ok(self, event: dict[str, Any]) -> bool:
-        return bool(event.get("identity", {}).get("expected_processes")) and bool(event.get("identity", {}).get("all_expected_processes_ok"))
+        return bool(event.get("identity", {}).get("expected_processes")) and bool(
+            event.get("identity", {}).get("all_expected_processes_ok")
+        )
 
     def setup(self) -> None:
         self.evidence.mkdir(parents=True, exist_ok=True)
@@ -731,7 +844,9 @@ class ConsistencyController:
         self.remember_identity_baseline("B", owner_b)
         dfs_a = self.event(self.run_cmd("A", "identity", self.args.dfs_root_a))
         dfs_b = self.event(self.run_cmd("B", "identity", self.args.dfs_root_b))
-        all_expected_roles = [role for role, _pid, _sha in (self.args.worker_a_expected_process + self.args.worker_b_expected_process)]
+        all_expected_roles = [
+            role for role, _pid, _sha in (self.args.worker_a_expected_process + self.args.worker_b_expected_process)
+        ]
         boot_a = owner_a.get("identity", {}).get("boot_id")
         boot_b = owner_b.get("identity", {}).get("boot_id")
         qualification = {
@@ -743,15 +858,34 @@ class ConsistencyController:
             "worker_b_dfs_afs_fuse": self.mount_is_afs_fuse(dfs_b),
             "worker_a_expected_processes_ok": self.expected_processes_ok(owner_a) and self.expected_processes_ok(dfs_a),
             "worker_b_expected_processes_ok": self.expected_processes_ok(owner_b) and self.expected_processes_ok(dfs_b),
-            "worker_a_node_identity_present": any(role.startswith("node") for role, _pid, _sha in self.args.worker_a_expected_process),
-            "worker_b_node_identity_present": any(role.startswith("node") for role, _pid, _sha in self.args.worker_b_expected_process),
+            "worker_a_node_identity_present": any(
+                role.startswith("node") for role, _pid, _sha in self.args.worker_a_expected_process
+            ),
+            "worker_b_node_identity_present": any(
+                role.startswith("node") for role, _pid, _sha in self.args.worker_b_expected_process
+            ),
             "meta_identity_present": any(role.startswith("meta") for role in all_expected_roles),
         }
-        self.identity = {"worker_a_owner": owner_a, "worker_b_owner": owner_b, "worker_a_dfs": dfs_a, "worker_b_dfs": dfs_b, "qualification": qualification, "cross_mount_qualified": all(qualification.values())}
+        self.identity = {
+            "worker_a_owner": owner_a,
+            "worker_b_owner": owner_b,
+            "worker_a_dfs": dfs_a,
+            "worker_b_dfs": dfs_b,
+            "qualification": qualification,
+            "cross_mount_qualified": all(qualification.values()),
+        }
         if not self.args.allow_same_kernel_reference:
-            self.expect(qualification["worker_boot_ids_nonempty"] and qualification["different_worker_kernels"], "workers must have nonempty distinct kernel boot IDs", self.identity)
+            self.expect(
+                qualification["worker_boot_ids_nonempty"] and qualification["different_worker_kernels"],
+                "workers must have nonempty distinct kernel boot IDs",
+                self.identity,
+            )
         if self.args.require_cross_mount:
-            self.expect(self.identity["cross_mount_qualified"], "workers are not qualified cross-mount AFS evidence", self.identity)
+            self.expect(
+                self.identity["cross_mount_qualified"],
+                "workers are not qualified cross-mount AFS evidence",
+                self.identity,
+            )
 
     def expect(self, condition: bool, message: str, details: dict[str, Any] | None = None) -> None:
         if not condition:
@@ -764,7 +898,9 @@ class ConsistencyController:
             details = func()
             record.update({"ok": True, "details": details})
         except Exception as exc:  # noqa: BLE001 - preserve failures and continue
-            record.update({"ok": False, "exception": type(exc).__name__, "message": str(exc), "traceback": traceback.format_exc()})
+            record.update(
+                {"ok": False, "exception": type(exc).__name__, "message": str(exc), "traceback": traceback.format_exc()}
+            )
             self.failures.append(record)
         finally:
             record["duration_ms"] = round((time.time() - started) * 1000, 3)
@@ -801,8 +937,19 @@ class ConsistencyController:
         holder.send_go()
         result = self.checked_stream_event("B", holder, "RESULT")
         rc, stderr = holder.finish()
-        self.expect(rc == 0 and result.get("ok") is True, f"{backend} B one-shot fresh open did not observe close-to-open content", {"result": result, "returncode": rc, "stderr": stderr})
-        return {"initial": initial, "precheck": precheck, "ready": ready, "final_close": final_close, "b_fresh_once": result, "holder_returncode": rc}
+        self.expect(
+            rc == 0 and result.get("ok") is True,
+            f"{backend} B one-shot fresh open did not observe close-to-open content",
+            {"result": result, "returncode": rc, "stderr": stderr},
+        )
+        return {
+            "initial": initial,
+            "precheck": precheck,
+            "ready": ready,
+            "final_close": final_close,
+            "b_fresh_once": result,
+            "holder_returncode": rc,
+        }
 
     def remote_owner(self, backend: str) -> dict[str, Any]:
         path_a = self.backend_path(backend, "A", f"{backend}-remote-owner.txt")
@@ -816,10 +963,16 @@ class ConsistencyController:
             expected = "dfs-remote-final"
         initial = self.event(self.run_cmd("A", "write-close", path_a, payload=initial_payload))
         self.expect(initial.get("ok") is True, f"{backend} remote initial close failed", initial)
-        b_write = self.event(self.run_cmd("B", "write-close", path_b, payload=final_payload, resize_to=len(expected), fsync_before_close=True))
+        b_write = self.event(
+            self.run_cmd(
+                "B", "write-close", path_b, payload=final_payload, resize_to=len(expected), fsync_before_close=True
+            )
+        )
         self.expect(b_write.get("ok") is True, f"{backend} B write/resize/fsync/close failed", b_write)
         a_verify = self.event(self.run_cmd("A", "fresh-verify", path_a, expected=expected))
-        self.expect(a_verify.get("ok") is True, f"{backend} A fresh open did not observe B remote-owner write", a_verify)
+        self.expect(
+            a_verify.get("ok") is True, f"{backend} A fresh open did not observe B remote-owner write", a_verify
+        )
         return {"initial": initial, "b_write": b_write, "a_verify": a_verify}
 
     def owner_rename_overwrite_hardlink(self, worker: str, label: str) -> dict[str, Any]:
@@ -834,14 +987,37 @@ class ConsistencyController:
         initial = self.event(self.run_cmd("A", "write-close", path_a, payload="dfs-handover-initial"))
         self.expect(initial.get("ok") is True, "DFS handover initial close failed", initial)
         time.sleep(self.args.handover_idle_seconds)
-        b_write = self.event(self.run_cmd("B", "write-close", path_b, payload="dfs-handover-final-payload", resize_to=len("dfs-handover-final"), fsync_before_close=True))
+        b_write = self.event(
+            self.run_cmd(
+                "B",
+                "write-close",
+                path_b,
+                payload="dfs-handover-final-payload",
+                resize_to=len("dfs-handover-final"),
+                fsync_before_close=True,
+            )
+        )
         self.expect(b_write.get("ok") is True, "DFS B handover write/resize/fsync/close failed", b_write)
         a_verify = self.event(self.run_cmd("A", "fresh-verify", path_a, expected="dfs-handover-final"))
         self.expect(a_verify.get("ok") is True, "DFS A fresh open after B handover close saw stale content", a_verify)
-        a_provider = self.event(self.run_cmd("A", "provider-resize-write-visible", path_a, payload="dfs-handover-provider-final", resize_to=0))
-        self.expect(a_provider.get("ok") is True, "DFS A retained local state shadowed provider write after B handover", a_provider)
-        b_verify_after_provider = self.event(self.run_cmd("B", "fresh-verify", path_b, expected="dfs-handover-provider-final"))
-        self.expect(b_verify_after_provider.get("ok") is True, "DFS B fresh open after A post-handover provider close saw stale content", b_verify_after_provider)
+        a_provider = self.event(
+            self.run_cmd(
+                "A", "provider-resize-write-visible", path_a, payload="dfs-handover-provider-final", resize_to=0
+            )
+        )
+        self.expect(
+            a_provider.get("ok") is True,
+            "DFS A retained local state shadowed provider write after B handover",
+            a_provider,
+        )
+        b_verify_after_provider = self.event(
+            self.run_cmd("B", "fresh-verify", path_b, expected="dfs-handover-provider-final")
+        )
+        self.expect(
+            b_verify_after_provider.get("ok") is True,
+            "DFS B fresh open after A post-handover provider close saw stale content",
+            b_verify_after_provider,
+        )
         return {
             "initial": initial,
             "idle_seconds": self.args.handover_idle_seconds,
@@ -856,10 +1032,18 @@ class ConsistencyController:
         path_b = self.backend_path("dfs", "B", "dfs-provider-existing-handle.txt")
         initial = self.event(self.run_cmd("A", "write-close", path_a, payload="dfs-provider-initial"))
         self.expect(initial.get("ok") is True, "DFS provider initial A close failed", initial)
-        b_provider = self.event(self.run_cmd("B", "provider-resize-write-visible", path_b, payload="dfs-provider-final", resize_to=0))
-        self.expect(b_provider.get("ok") is True, "DFS B existing handle write after handleless resize was not same-mount visible before close", b_provider)
+        b_provider = self.event(
+            self.run_cmd("B", "provider-resize-write-visible", path_b, payload="dfs-provider-final", resize_to=0)
+        )
+        self.expect(
+            b_provider.get("ok") is True,
+            ("DFS B existing handle write after handleless resize was not same-mount visible before close"),
+            b_provider,
+        )
         a_verify = self.event(self.run_cmd("A", "fresh-verify", path_a, expected="dfs-provider-final"))
-        self.expect(a_verify.get("ok") is True, "DFS A fresh open after provider close did not observe final bytes", a_verify)
+        self.expect(
+            a_verify.get("ok") is True, "DFS A fresh open after provider close did not observe final bytes", a_verify
+        )
         return {"initial": initial, "b_provider": b_provider, "a_verify": a_verify}
 
     def run(self) -> None:
@@ -869,10 +1053,15 @@ class ConsistencyController:
         self.step("dfs_close_to_open", lambda: self.close_to_open("dfs"))
         self.step("owner_remote_owner", lambda: self.remote_owner("owner"))
         self.step("owner_rename_overwrite_hardlink_local", lambda: self.owner_rename_overwrite_hardlink("A", "local"))
-        self.step("owner_rename_overwrite_hardlink_remote_home", lambda: self.owner_rename_overwrite_hardlink("B", "remote-home"))
+        self.step(
+            "owner_rename_overwrite_hardlink_remote_home",
+            lambda: self.owner_rename_overwrite_hardlink("B", "remote-home"),
+        )
         self.step("dfs_remote_owner", lambda: self.remote_owner("dfs"))
         self.step("dfs_handover_after_idle", self.dfs_handover_after_idle)
-        self.step("dfs_provider_existing_handle_after_remote_resize", self.dfs_provider_existing_handle_after_remote_resize)
+        self.step(
+            "dfs_provider_existing_handle_after_remote_resize", self.dfs_provider_existing_handle_after_remote_resize
+        )
 
     def write_report(self) -> None:
         report = {
@@ -895,17 +1084,40 @@ class ConsistencyController:
                 "python": platform.python_version(),
                 "boot_id": _read_text_optional(Path("/proc/sys/kernel/random/boot_id")),
             },
-            "summary": {"steps": len(self.steps), "passed": sum(1 for step in self.steps if step.get("ok")), "failed": len(self.failures), "commands": len(self.commands)},
+            "summary": {
+                "steps": len(self.steps),
+                "passed": sum(1 for step in self.steps if step.get("ok")),
+                "failed": len(self.failures),
+                "commands": len(self.commands),
+            },
             "steps": self.steps,
             "failures": self.failures,
             "commands": self.commands,
             "notes": [
                 "All product file IO is performed by Linux worker subprocesses.",
-                "Close-to-open checks use one fresh open after an explicit stdin GO orchestration point; no read retry is used to hide stale results.",
+                (
+                    "Close-to-open checks use one fresh open after an explicit stdin "
+                    "GO orchestration point; no read retry is used to hide stale "
+                    "results."
+                ),
                 "The controller does not restart, signal, pause, or reconfigure product runtime processes.",
-                "The DFS handover case intentionally idles before B writable open, performs one A fresh-open verification after B close, then verifies the former local owner can perform a provider write without retained stale state shadowing it.",
-                "The OwnerFs rename regression overwrites dst with src while a dst hardlink survives, then checks the surviving hardlink inode, nlink, and content without retry.",
-                "The DFS provider regression keeps a B writable handle open, performs handleless truncate(path), writes through the original handle without sync, checks same-B readonly visibility before close, then checks A fresh-open visibility after close.",
+                (
+                    "The DFS handover case intentionally idles before B writable "
+                    "open, performs one A fresh-open verification after B close, "
+                    "then verifies the former local owner can perform a provider "
+                    "write without retained stale state shadowing it."
+                ),
+                (
+                    "The OwnerFs rename regression overwrites dst with src while a "
+                    "dst hardlink survives, then checks the surviving hardlink "
+                    "inode, nlink, and content without retry."
+                ),
+                (
+                    "The DFS provider regression keeps a B writable handle open, "
+                    "performs handleless truncate(path), writes through the original "
+                    "handle without sync, checks same-B readonly visibility before "
+                    "close, then checks A fresh-open visibility after close."
+                ),
             ],
         }
         _write_json(self.evidence / "report.json", report)
@@ -922,17 +1134,38 @@ def _host_main(args: argparse.Namespace) -> int:
         controller.setup()
         controller.run()
     except Exception as exc:  # noqa: BLE001 - preserve setup/runner failure
-        controller.failures.append({"name": "setup_or_runner", "ok": False, "exception": type(exc).__name__, "message": str(exc), "traceback": traceback.format_exc()})
+        controller.failures.append(
+            {
+                "name": "setup_or_runner",
+                "ok": False,
+                "exception": type(exc).__name__,
+                "message": str(exc),
+                "traceback": traceback.format_exc(),
+            }
+        )
     finally:
         controller.write_report()
     status = "PASS" if not controller.failures else "FAIL"
-    print(f"status={status} cross_mount_qualified={controller.identity.get('cross_mount_qualified', False)} evidence={controller.evidence}")
+    print(
+        (
+            f"status="
+            f"{status}"
+            f" cross_mount_qualified="
+            f"{controller.identity.get('cross_mount_qualified', False)}"
+            f" evidence="
+            f"{controller.evidence}"
+        )
+    )
     return 0 if not controller.failures else 1
 
 
 def _selftest_main() -> int:
     if platform.system() != "Linux":
-        print(json.dumps({"status": "SKIP", "reason": "Linux-only selftest", "platform": platform.system()}, sort_keys=True))
+        print(
+            json.dumps(
+                {"status": "SKIP", "reason": "Linux-only selftest", "platform": platform.system()}, sort_keys=True
+            )
+        )
         return 0
 
     results: list[dict[str, Any]] = []
@@ -949,7 +1182,13 @@ def _selftest_main() -> int:
             record("silent_worker_timeout", False, message="read_event unexpectedly returned")
         except TimeoutError as exc:
             elapsed = time.monotonic() - started
-            record("silent_worker_timeout", elapsed < 2.0 and silent.proc.poll() is not None, elapsed_seconds=round(elapsed, 3), message=str(exc), returncode=silent.proc.returncode)
+            record(
+                "silent_worker_timeout",
+                elapsed < 2.0 and silent.proc.poll() is not None,
+                elapsed_seconds=round(elapsed, 3),
+                message=str(exc),
+                returncode=silent.proc.returncode,
+            )
     finally:
         if silent.proc.poll() is None:
             silent.proc.kill()
@@ -967,14 +1206,33 @@ def _selftest_main() -> int:
         # so it must use the explicit reference-only switch and not require cross mount.
         evidence = temp / "evidence-pass"
         argv = [
-            sys.executable, str(script), "host",
-            "--worker-a-json", worker, "--worker-b-json", worker,
-            "--owner-root-a", str(temp / "owner-a"), "--owner-root-b", str(temp / "owner-a"),
-            "--dfs-root-a", str(temp / "dfs-a"), "--dfs-root-b", str(temp / "dfs-a"),
-            "--worker-a-expected-process", expected_node, "--worker-a-expected-process", expected_meta,
-            "--worker-b-expected-process", expected_node, "--worker-b-expected-process", expected_meta,
-            "--evidence", str(evidence),
-            "--handover-idle-seconds", "0.01",
+            sys.executable,
+            str(script),
+            "host",
+            "--worker-a-json",
+            worker,
+            "--worker-b-json",
+            worker,
+            "--owner-root-a",
+            str(temp / "owner-a"),
+            "--owner-root-b",
+            str(temp / "owner-a"),
+            "--dfs-root-a",
+            str(temp / "dfs-a"),
+            "--dfs-root-b",
+            str(temp / "dfs-a"),
+            "--worker-a-expected-process",
+            expected_node,
+            "--worker-a-expected-process",
+            expected_meta,
+            "--worker-b-expected-process",
+            expected_node,
+            "--worker-b-expected-process",
+            expected_meta,
+            "--evidence",
+            str(evidence),
+            "--handover-idle-seconds",
+            "0.01",
             "--allow-same-kernel-reference",
         ]
         proc = subprocess.run(argv, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60, check=False)
@@ -982,7 +1240,11 @@ def _selftest_main() -> int:
         summary = report["summary"]
         record(
             "local_reference_positive",
-            proc.returncode == 0 and report["status"] == "PASS" and summary["steps"] == 10 and summary["passed"] == 10 and summary["failed"] == 0,
+            proc.returncode == 0
+            and report["status"] == "PASS"
+            and summary["steps"] == 10
+            and summary["passed"] == 10
+            and summary["failed"] == 0,
             returncode=proc.returncode,
             summary=summary,
             stderr=proc.stderr,
@@ -993,33 +1255,79 @@ def _selftest_main() -> int:
         wrong_sha_path.write_text("identity\n", encoding="utf-8")
         wrong_sha = "0" * 64
         wrong_proc = subprocess.run(
-            [sys.executable, str(script), "worker", "--op", "identity", "--path", str(wrong_sha_path), "--expected-process", f"node={os.getpid()}:{wrong_sha}"],
-            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20, check=False,
+            [
+                sys.executable,
+                str(script),
+                "worker",
+                "--op",
+                "identity",
+                "--path",
+                str(wrong_sha_path),
+                "--expected-process",
+                f"node={os.getpid()}:{wrong_sha}",
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=20,
+            check=False,
         )
         wrong_event = json.loads(wrong_proc.stdout)
-        record("wrong_sha_detected", wrong_event.get("identity", {}).get("all_expected_processes_ok") is False and wrong_event["identity"]["expected_processes"]["node"]["sha256_ok"] is False, returncode=wrong_proc.returncode, event=wrong_event)
+        record(
+            "wrong_sha_detected",
+            wrong_event.get("identity", {}).get("all_expected_processes_ok") is False
+            and wrong_event["identity"]["expected_processes"]["node"]["sha256_ok"] is False,
+            returncode=wrong_proc.returncode,
+            event=wrong_event,
+        )
 
         # Regression: --require-cross-mount must reject ordinary ext4/non-AFS DFS roots.
         evidence_reject = temp / "evidence-reject-nonafs"
         reject_argv = [
-            sys.executable, str(script), "host",
-            "--worker-a-json", worker, "--worker-b-json", worker,
-            "--owner-root-a", str(temp / "owner-r"), "--owner-root-b", str(temp / "owner-r"),
-            "--dfs-root-a", str(temp / "dfs-r"), "--dfs-root-b", str(temp / "dfs-r"),
-            "--worker-a-expected-process", expected_node, "--worker-a-expected-process", expected_meta,
-            "--worker-b-expected-process", expected_node, "--worker-b-expected-process", expected_meta,
-            "--evidence", str(evidence_reject),
-            "--handover-idle-seconds", "0.01",
+            sys.executable,
+            str(script),
+            "host",
+            "--worker-a-json",
+            worker,
+            "--worker-b-json",
+            worker,
+            "--owner-root-a",
+            str(temp / "owner-r"),
+            "--owner-root-b",
+            str(temp / "owner-r"),
+            "--dfs-root-a",
+            str(temp / "dfs-r"),
+            "--dfs-root-b",
+            str(temp / "dfs-r"),
+            "--worker-a-expected-process",
+            expected_node,
+            "--worker-a-expected-process",
+            expected_meta,
+            "--worker-b-expected-process",
+            expected_node,
+            "--worker-b-expected-process",
+            expected_meta,
+            "--evidence",
+            str(evidence_reject),
+            "--handover-idle-seconds",
+            "0.01",
             "--allow-same-kernel-reference",
             "--require-cross-mount",
         ]
-        reject_proc = subprocess.run(reject_argv, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30, check=False)
+        reject_proc = subprocess.run(
+            reject_argv, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30, check=False
+        )
         reject_report = json.loads((evidence_reject / "report.json").read_text(encoding="utf-8"))
         q = reject_report.get("identity", {}).get("qualification", {})
         record(
             "nonafs_dfs_rejected_for_cross_mount",
-            reject_proc.returncode != 0 and reject_report["status"] == "FAIL" and q.get("worker_a_dfs_afs_fuse") is False and q.get("worker_b_dfs_afs_fuse") is False,
-            returncode=reject_proc.returncode, qualification=q, failures=reject_report.get("failures"),
+            reject_proc.returncode != 0
+            and reject_report["status"] == "FAIL"
+            and q.get("worker_a_dfs_afs_fuse") is False
+            and q.get("worker_b_dfs_afs_fuse") is False,
+            returncode=reject_proc.returncode,
+            qualification=q,
+            failures=reject_report.get("failures"),
         )
 
     ok = all(item["ok"] for item in results)
@@ -1038,16 +1346,36 @@ def build_parser() -> argparse.ArgumentParser:
     host.add_argument("--owner-root-b", required=True, help="same OwnerFs logical fixture root as seen by worker B")
     host.add_argument("--dfs-root-a", required=True, help="DFS fixture root as seen by worker A")
     host.add_argument("--dfs-root-b", required=True, help="same DFS logical fixture root as seen by worker B")
-    host.add_argument("--worker-a-expected-process", action="append", type=_parse_expected_process, default=[], metavar="ROLE=PID:SHA256")
-    host.add_argument("--worker-b-expected-process", action="append", type=_parse_expected_process, default=[], metavar="ROLE=PID:SHA256")
+    host.add_argument(
+        "--worker-a-expected-process",
+        action="append",
+        type=_parse_expected_process,
+        default=[],
+        metavar="ROLE=PID:SHA256",
+    )
+    host.add_argument(
+        "--worker-b-expected-process",
+        action="append",
+        type=_parse_expected_process,
+        default=[],
+        metavar="ROLE=PID:SHA256",
+    )
     host.add_argument("--evidence", required=True)
     host.add_argument("--run-id")
     host.add_argument("--handover-idle-seconds", type=float, default=DEFAULT_IDLE_SECONDS)
     host.add_argument("--command-timeout", type=float, default=DEFAULT_COMMAND_TIMEOUT_SECONDS)
     host.add_argument("--child-timeout", type=float, default=DEFAULT_CHILD_TIMEOUT_SECONDS)
     host.add_argument("--require-cross-mount", action="store_true")
-    host.add_argument("--allow-same-kernel-reference", action="store_true", help="allow same-kernel reference/selftest runs; product A/B evidence must omit this")
-    host.add_argument("--allow-host-non-linux", action="store_true", help="allow macOS host orchestration; workers must still be Linux")
+    host.add_argument(
+        "--allow-same-kernel-reference",
+        action="store_true",
+        help="allow same-kernel reference/selftest runs; product A/B evidence must omit this",
+    )
+    host.add_argument(
+        "--allow-host-non-linux",
+        action="store_true",
+        help="allow macOS host orchestration; workers must still be Linux",
+    )
 
     worker = sub.add_parser("worker", help=argparse.SUPPRESS)
     worker.add_argument("--op", required=True)
@@ -1056,7 +1384,9 @@ def build_parser() -> argparse.ArgumentParser:
     worker.add_argument("--expected", default="")
     worker.add_argument("--resize-to", type=int)
     worker.add_argument("--fsync-before-close", action="store_true")
-    worker.add_argument("--expected-process", action="append", type=_parse_expected_process, default=[], metavar="ROLE=PID:SHA256")
+    worker.add_argument(
+        "--expected-process", action="append", type=_parse_expected_process, default=[], metavar="ROLE=PID:SHA256"
+    )
 
     sub.add_parser("selftest", help="run local Linux selftest; skips on non-Linux")
     return parser

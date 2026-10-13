@@ -1,12 +1,15 @@
 """Guard tests for owner_remote_write_small diagnostic helpers."""
+
 from __future__ import annotations
 
 import importlib.util
-from pathlib import Path
 import tempfile
 import unittest
+from pathlib import Path
 
-spec = importlib.util.spec_from_file_location("owner_remote_write_small", Path(__file__).with_name("owner_remote_write_small.py"))
+spec = importlib.util.spec_from_file_location(
+    "owner_remote_write_small", Path(__file__).with_name("owner_remote_write_small.py")
+)
 owner_remote_write_small = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(owner_remote_write_small)
 
@@ -40,7 +43,11 @@ def sample(target: str, round_index: int, status: str = "PASS") -> dict[str, obj
         "round": round_index,
         "status": status,
         "write": {"verify": {"status": "PASS"}},
-        "content_verify": {"status": "PASS", "bytes": owner_remote_write_small.DATA_BYTES, "sha256": owner_remote_write_small.EXPECTED_SHA256},
+        "content_verify": {
+            "status": "PASS",
+            "bytes": owner_remote_write_small.DATA_BYTES,
+            "sha256": owner_remote_write_small.EXPECTED_SHA256,
+        },
         "dir_fsync": True,
     }
 
@@ -48,7 +55,13 @@ def sample(target: str, round_index: int, status: str = "PASS") -> dict[str, obj
 def full_rounds() -> list[dict[str, object]]:
     rounds = []
     for index in range(owner_remote_write_small.WARMUP_ROUNDS + owner_remote_write_small.MEASUREMENT_ROUNDS):
-        rounds.append({"round": index, "order": owner_remote_write_small.paired_order(index), "samples": [sample(target, index) for target in owner_remote_write_small.paired_order(index)]})
+        rounds.append(
+            {
+                "round": index,
+                "order": owner_remote_write_small.paired_order(index),
+                "samples": [sample(target, index) for target in owner_remote_write_small.paired_order(index)],
+            }
+        )
     return rounds
 
 
@@ -58,7 +71,9 @@ class OwnerRemoteWriteSmallGuardTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             owner_remote_write_small.validate_write_result(good_write_result(content_ok=False))
         with self.assertRaises(ValueError):
-            owner_remote_write_small.validate_write_result(good_write_result(io_bytes=owner_remote_write_small.DATA_BYTES - 1))
+            owner_remote_write_small.validate_write_result(
+                good_write_result(io_bytes=owner_remote_write_small.DATA_BYTES - 1)
+            )
         with self.assertRaises(ValueError):
             owner_remote_write_small.validate_write_result(good_write_result(cache_requested="unchecked"))
 
@@ -103,10 +118,14 @@ class OwnerRemoteWriteSmallGuardTests(unittest.TestCase):
             owner_remote_write_small.require_owner_mount({"fstype": "fuse", "source": "afs-dfs"})
         owner_remote_write_small.require_owner_mount({"fstype": "fuse", "source": "afs-ownerfs"})
         with self.assertRaises(ValueError):
-            owner_remote_write_small.require_moose_mount({"fstype": "fuse.mfs", "source": "mfs#other"}, TEST_MOOSE_SOURCE)
+            owner_remote_write_small.require_moose_mount(
+                {"fstype": "fuse.mfs", "source": "mfs#other"}, TEST_MOOSE_SOURCE
+            )
         with self.assertRaises(ValueError):
             owner_remote_write_small.require_moose_mount({"fstype": "fuse", "source": "mfs#other"}, TEST_MOOSE_SOURCE)
-        owner_remote_write_small.require_moose_mount({"fstype": "fuse.mfs", "source": TEST_MOOSE_SOURCE}, TEST_MOOSE_SOURCE)
+        owner_remote_write_small.require_moose_mount(
+            {"fstype": "fuse.mfs", "source": TEST_MOOSE_SOURCE}, TEST_MOOSE_SOURCE
+        )
         owner_remote_write_small.require_moose_mount({"fstype": "fuse", "source": TEST_MOOSE_SOURCE}, TEST_MOOSE_SOURCE)
 
     def test_product_identity_is_caller_supplied_and_strict(self) -> None:
@@ -114,7 +133,12 @@ class OwnerRemoteWriteSmallGuardTests(unittest.TestCase):
         self.assertEqual(identity["product_source_commit"], TEST_COMMIT)
         self.assertEqual(identity["compiler_input_map"], TEST_MAP)
         self.assertEqual(identity["identity_source"], "caller supplied identity")
-        for bad_commit, bad_map in (("g" * 40, TEST_MAP), (TEST_COMMIT[:-1], TEST_MAP), (TEST_COMMIT, "z" * 64), (TEST_COMMIT, TEST_MAP[:-1])):
+        for bad_commit, bad_map in (
+            ("g" * 40, TEST_MAP),
+            (TEST_COMMIT[:-1], TEST_MAP),
+            (TEST_COMMIT, "z" * 64),
+            (TEST_COMMIT, TEST_MAP[:-1]),
+        ):
             with self.subTest(bad_commit=bad_commit, bad_map=bad_map), self.assertRaises(ValueError):
                 owner_remote_write_small.validate_product_identity(bad_commit, bad_map)
 
@@ -129,7 +153,6 @@ class OwnerRemoteWriteSmallGuardTests(unittest.TestCase):
         result = owner_remote_write_small.run(Args())
         self.assertEqual(result["status"], "BLOCKED")
         self.assertIn("product identity requires", result["error"])
-
 
 
 if __name__ == "__main__":

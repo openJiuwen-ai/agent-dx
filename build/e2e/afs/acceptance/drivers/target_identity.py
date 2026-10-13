@@ -1,4 +1,5 @@
 """Fail-closed suite target checks; labels cannot substitute for observed identity."""
+
 from __future__ import annotations
 
 import json
@@ -27,9 +28,7 @@ def process_matches(identity: dict[str, Any] | None, executable: str) -> bool:
         return False
     digest = identity.get("exe_sha256")
     return (
-        Path(str(identity.get("exe", ""))).name == executable
-        and _is_sha256(digest)
-        and bool(identity.get("cmdline"))
+        Path(str(identity.get("exe", ""))).name == executable and _is_sha256(digest) and bool(identity.get("cmdline"))
     )
 
 
@@ -56,16 +55,12 @@ def target_checks(
     return {
         "linux-runtime": system == "Linux",
         "observed-target-backend": bool(record) and bool(target_ok),
-        "same-fixture-filesystem": bool(base) and all(
-            base.get(key) == record.get(key) for key in ("target", "source", "fstype")
-        ),
+        "same-fixture-filesystem": bool(base)
+        and all(base.get(key) == record.get(key) for key in ("target", "source", "fstype")),
         "product-process-identity": reference
         or (
             process_matches(node, "afs-node")
-            and (
-                process_matches(meta, "afs-meta")
-                or os.environ.get("AFS_ACCEPTANCE_REMOTE_HOST_QUALIFIED") == "1"
-            )
+            and (process_matches(meta, "afs-meta") or os.environ.get("AFS_ACCEPTANCE_REMOTE_HOST_QUALIFIED") == "1")
         ),
     }
 
@@ -152,7 +147,14 @@ def _configured_tls_digests_stable(before_cfg: dict[str, Any], after_cfg: dict[s
     after_tls = after_cfg.get("tls") or {}
     before_trusted = before_cfg.get("trusted_node_certs") or {}
     after_trusted = after_cfg.get("trusted_node_certs") or {}
-    tls_required = bool(before_cfg.get("tls_required") or after_cfg.get("tls_required") or before_tls or after_tls or before_trusted or after_trusted)
+    tls_required = bool(
+        before_cfg.get("tls_required")
+        or after_cfg.get("tls_required")
+        or before_tls
+        or after_tls
+        or before_trusted
+        or after_trusted
+    )
     if tls_required:
         if set(before_cfg.get("tls_missing") or []) or set(after_cfg.get("tls_missing") or []):
             return False
@@ -165,7 +167,9 @@ def _configured_tls_digests_stable(before_cfg: dict[str, Any], after_cfg: dict[s
     return True
 
 
-def _meta_endpoint_binding(meta_identity: dict[str, Any] | None, expected_endpoint: str, require_cross_worker: bool) -> bool:
+def _meta_endpoint_binding(
+    meta_identity: dict[str, Any] | None, expected_endpoint: str, require_cross_worker: bool
+) -> bool:
     if not meta_identity:
         return False
     host = _endpoint_host(expected_endpoint)
@@ -227,14 +231,26 @@ def remote_target_checks(
     meta_post_ok = strict_process_identity(meta_after, "meta", "afs-meta", expected_meta_sha256)
     return {
         "linux-runtime": system == "Linux",
-        "observed-target-backend": expected is not None and bool(record) and str(record.get("fstype", "")).startswith("fuse") and record.get("source") == expected,
-        "same-fixture-filesystem": bool(base) and all(base.get(key) == record.get(key) for key in ("target", "source", "fstype")),
+        "observed-target-backend": expected is not None
+        and bool(record)
+        and str(record.get("fstype", "")).startswith("fuse")
+        and record.get("source") == expected,
+        "same-fixture-filesystem": bool(base)
+        and all(base.get(key) == record.get(key) for key in ("target", "source", "fstype")),
         "node-process-identity": node_pre_ok and node_post_ok,
         "meta-process-identity": meta_pre_ok and meta_post_ok,
         "node-process-stable": process_stable(node_before, node_after),
         "meta-process-stable": process_stable(meta_before, meta_after),
         "node-meta-endpoint-bound": bool(expected_meta_endpoint) and node_endpoint == expected_meta_endpoint,
-        "meta-listen-port-bound": _meta_endpoint_binding(meta_before, expected_meta_endpoint, require_cross_worker) and _meta_endpoint_binding(meta_after, expected_meta_endpoint, require_cross_worker),
-        "tls-digests-recorded": _configured_tls_digests_stable(node_cfg, node_after_cfg) and _configured_tls_digests_stable(meta_cfg, meta_after_cfg),
-        "cross-worker-identity": (bool(node_boot) and bool(meta_boot) and bool(node_machine) and bool(meta_machine) and (not require_cross_worker or (node_boot != meta_boot and node_machine != meta_machine))),
+        "meta-listen-port-bound": _meta_endpoint_binding(meta_before, expected_meta_endpoint, require_cross_worker)
+        and _meta_endpoint_binding(meta_after, expected_meta_endpoint, require_cross_worker),
+        "tls-digests-recorded": _configured_tls_digests_stable(node_cfg, node_after_cfg)
+        and _configured_tls_digests_stable(meta_cfg, meta_after_cfg),
+        "cross-worker-identity": (
+            bool(node_boot)
+            and bool(meta_boot)
+            and bool(node_machine)
+            and bool(meta_machine)
+            and (not require_cross_worker or (node_boot != meta_boot and node_machine != meta_machine))
+        ),
     }

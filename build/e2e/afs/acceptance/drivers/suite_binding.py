@@ -5,6 +5,7 @@ The acceptance runner owns case/profile/matrix/run-dir selection.  This helper
 only supplies per-run runtime inputs such as mounts, suite roots and observed
 process ids to the fixed STD-01..STD-04 driver CLIs.
 """
+
 from __future__ import annotations
 
 import json
@@ -13,7 +14,6 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Any
-
 
 STATUS_VALUES = {"PASS", "FAIL", "BLOCKED", "INCONCLUSIVE", "EXCLUDED"}
 DRIVER_DIR = Path(__file__).resolve().parent
@@ -48,9 +48,14 @@ CASE_CONFIG: dict[str, dict[str, Any]] = {
         "extra_keys": {
             "suite_root",
             "timeout",
-        } | REMOTE_COMMON_KEYS,
+        }
+        | REMOTE_COMMON_KEYS,
         "path_flags": {"mount": "--mount", "base_dir": "--base-dir", "suite_root": "--suite-root"},
-        "value_flags": {"process_pid": "--process-pid", "meta_process_pid": "--meta-process-pid", "timeout": "--timeout"},
+        "value_flags": {
+            "process_pid": "--process-pid",
+            "meta_process_pid": "--meta-process-pid",
+            "timeout": "--timeout",
+        },
         "driver_matrix_keys": {"reference", "suite_sha"},
     },
     "STD-02": {
@@ -64,7 +69,8 @@ CASE_CONFIG: dict[str, dict[str, Any]] = {
             "ltp_install_b",
             "expanded_tsv_b",
             "applicability_manifest_b",
-        } | REMOTE_COMMON_KEYS,
+        }
+        | REMOTE_COMMON_KEYS,
         "path_flags": {
             "mount": "--mount",
             "base_dir": "--base-dir",
@@ -73,7 +79,11 @@ CASE_CONFIG: dict[str, dict[str, Any]] = {
             "expanded_tsv": "--expanded-tsv",
             "applicability_manifest": "--applicability-manifest",
         },
-        "value_flags": {"process_pid": "--process-pid", "meta_process_pid": "--meta-process-pid", "per_test_timeout": "--per-test-timeout"},
+        "value_flags": {
+            "process_pid": "--process-pid",
+            "meta_process_pid": "--meta-process-pid",
+            "per_test_timeout": "--per-test-timeout",
+        },
         "driver_matrix_keys": {"reference", "suite"},
     },
     "STD-03": {
@@ -85,8 +95,14 @@ CASE_CONFIG: dict[str, dict[str, Any]] = {
             "failure_replay_attempts",
             "failure_replay_timeout",
             "fsx_binary_b",
-        } | REMOTE_COMMON_KEYS,
-        "path_flags": {"mount": "--mount", "base_dir": "--base-dir", "suite_root": "--suite-root", "fsx_binary": "--fsx-binary"},
+        }
+        | REMOTE_COMMON_KEYS,
+        "path_flags": {
+            "mount": "--mount",
+            "base_dir": "--base-dir",
+            "suite_root": "--suite-root",
+            "fsx_binary": "--fsx-binary",
+        },
         "value_flags": {
             "process_pid": "--process-pid",
             "meta_process_pid": "--meta-process-pid",
@@ -260,7 +276,9 @@ def validate_process_record(value: Any, expected_role: str, name: str) -> tuple[
 def validate_worker(value: Any, expected_role: str, name: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise BindingError(f"{name} must be an object")
-    unknown = sorted(set(value) - {"transport", "host", "ssh_config", "python", "standard_driver", "expected_processes"})
+    unknown = sorted(
+        set(value) - {"transport", "host", "ssh_config", "python", "standard_driver", "expected_processes"}
+    )
     if unknown:
         raise BindingError(f"unsupported {name} field(s): {', '.join(unknown)}")
     if value.get("transport") != "ssh":
@@ -273,7 +291,10 @@ def validate_worker(value: Any, expected_role: str, name: str) -> dict[str, Any]
     records = value.get("expected_processes")
     if not isinstance(records, list) or not records:
         raise BindingError(f"{name}.expected_processes must be a non-empty list")
-    parsed = [validate_process_record(record, expected_role, f"{name}.expected_processes[{idx}]") for idx, record in enumerate(records)]
+    parsed = [
+        validate_process_record(record, expected_role, f"{name}.expected_processes[{idx}]")
+        for idx, record in enumerate(records)
+    ]
     roles = {role for role, _pid, _sha in parsed}
     if roles != {expected_role}:
         raise BindingError(f"{name}.expected_processes must contain only {expected_role}")
@@ -298,7 +319,9 @@ def validate_remote_binding(binding: dict[str, Any], case_id: str) -> None:
         raise BindingError("expected_meta_endpoint is required")
     validate_absolute_path(binding.get("mount_b"), "mount_b")
     validate_absolute_path(binding.get("worker_run_dir_b"), "worker_run_dir_b")
-    remote_driver = binding.get("driver_b") or str(Path(worker_b["standard_driver"]).with_name(CASE_CONFIG[case_id]["driver"]))
+    remote_driver = binding.get("driver_b") or str(
+        Path(worker_b["standard_driver"]).with_name(CASE_CONFIG[case_id]["driver"])
+    )
     validate_absolute_path(remote_driver, "driver_b")
     if binding.get("meta_identity_path_a") is not None:
         validate_absolute_path(binding.get("meta_identity_path_a"), "meta_identity_path_a")
@@ -342,7 +365,9 @@ def child_env(parent: dict[str, str], matrix: dict[str, str]) -> dict[str, str]:
     return env
 
 
-def build_child_argv(binding: dict[str, Any], case_id: str, profile: str, matrix: dict[str, str], run_dir: Path) -> list[str]:
+def build_child_argv(
+    binding: dict[str, Any], case_id: str, profile: str, matrix: dict[str, str], run_dir: Path
+) -> list[str]:
     if binding.get("mode") == "remote-host":
         return build_remote_argv(binding, case_id, profile, matrix, run_dir)
     config = CASE_CONFIG[case_id]
@@ -399,31 +424,47 @@ def remote_driver_path(binding: dict[str, Any], case_id: str, worker_b: dict[str
     return str(binding.get("driver_b") or Path(worker_b["standard_driver"]).with_name(CASE_CONFIG[case_id]["driver"]))
 
 
-def remote_suite_args(binding: dict[str, Any], case_id: str, profile: str, matrix: dict[str, str], worker_b: dict[str, Any]) -> tuple[str, list[str]]:
+def remote_suite_args(
+    binding: dict[str, Any], case_id: str, profile: str, matrix: dict[str, str], worker_b: dict[str, Any]
+) -> tuple[str, list[str]]:
     child = child_matrix(binding, matrix)
     if case_id == "STD-01":
         args = [
             "worker-pjdfstest",
-            "--case-id", case_id,
-            "--profile", profile,
-            "--matrix-json", json.dumps(child, sort_keys=True),
-            "--run-dir", str(binding["worker_run_dir_b"]),
-            "--mount", str(binding["mount_b"]),
-            "--backend", matrix["backend"],
+            "--case-id",
+            case_id,
+            "--profile",
+            profile,
+            "--matrix-json",
+            json.dumps(child, sort_keys=True),
+            "--run-dir",
+            str(binding["worker_run_dir_b"]),
+            "--mount",
+            str(binding["mount_b"]),
+            "--backend",
+            matrix["backend"],
         ]
         event = "PJDFSTEST"
     else:
         args = [
             "worker-driver",
-            "--driver", remote_driver_path(binding, case_id, worker_b),
+            "--driver",
+            remote_driver_path(binding, case_id, worker_b),
             "--",
-            "--case-id", case_id,
-            "--profile", profile,
-            "--matrix-json", json.dumps(child, sort_keys=True),
-            "--run-dir", str(binding["worker_run_dir_b"]),
-            "--mount", str(binding["mount_b"]),
-            "--backend", matrix["backend"],
-            "--process-pid", str(worker_process_pid(worker_b, "node")),
+            "--case-id",
+            case_id,
+            "--profile",
+            profile,
+            "--matrix-json",
+            json.dumps(child, sort_keys=True),
+            "--run-dir",
+            str(binding["worker_run_dir_b"]),
+            "--mount",
+            str(binding["mount_b"]),
+            "--backend",
+            matrix["backend"],
+            "--process-pid",
+            str(worker_process_pid(worker_b, "node")),
         ]
         event = "DRIVER"
         for axis, flag in (("meta", "--meta"),):
@@ -436,10 +477,20 @@ def remote_suite_args(binding: dict[str, Any], case_id: str, profile: str, matri
     if case_id == "STD-01" and binding.get("timeout"):
         args.extend(["--timeout", str(binding["timeout"])])
     elif case_id == "STD-02":
-        for key, flag in (("ltp_install_b", "--ltp-install"), ("expanded_tsv_b", "--expanded-tsv"), ("applicability_manifest_b", "--applicability-manifest"), ("per_test_timeout", "--per-test-timeout")):
+        for key, flag in (
+            ("ltp_install_b", "--ltp-install"),
+            ("expanded_tsv_b", "--expanded-tsv"),
+            ("applicability_manifest_b", "--applicability-manifest"),
+            ("per_test_timeout", "--per-test-timeout"),
+        ):
             add_flag(args, flag, binding.get(key))
     elif case_id == "STD-03":
-        for key, flag in (("fsx_binary_b", "--fsx-binary"), ("per_seed_timeout", "--per-seed-timeout"), ("failure_replay_attempts", "--failure-replay-attempts"), ("failure_replay_timeout", "--failure-replay-timeout")):
+        for key, flag in (
+            ("fsx_binary_b", "--fsx-binary"),
+            ("per_seed_timeout", "--per-seed-timeout"),
+            ("failure_replay_attempts", "--failure-replay-attempts"),
+            ("failure_replay_timeout", "--failure-replay-timeout"),
+        ):
             add_flag(args, flag, binding.get(key))
     elif case_id == "STD-04":
         args.extend(["--reference-dir", str(binding["reference_dir_b"])])
@@ -447,7 +498,9 @@ def remote_suite_args(binding: dict[str, Any], case_id: str, profile: str, matri
     return event, args
 
 
-def build_remote_argv(binding: dict[str, Any], case_id: str, profile: str, matrix: dict[str, str], run_dir: Path) -> list[str]:
+def build_remote_argv(
+    binding: dict[str, Any], case_id: str, profile: str, matrix: dict[str, str], run_dir: Path
+) -> list[str]:
     worker_a = validate_worker(binding["worker_a"], "meta", "worker_a")
     worker_b = validate_worker(binding["worker_b"], "node", "worker_b")
     suite_event, suite_args = remote_suite_args(binding, case_id, profile, matrix, worker_b)

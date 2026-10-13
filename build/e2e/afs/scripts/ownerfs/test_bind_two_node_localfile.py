@@ -32,9 +32,15 @@ class BindTwoNodeLocalFileTests(unittest.TestCase):
                 exe.chmod(0o755)
             root = base / "fresh-root"
             scenario = module.Scenario(repo, binaries, root, False)
-            with mock.patch.object(module.platform, "system", return_value="Linux"), \
-                 mock.patch.object(module.os, "geteuid", return_value=0), \
-                 mock.patch.object(module.shutil, "which", side_effect=lambda tool: None if tool == "fusermount3" else f"/usr/bin/{tool}"):
+            with (
+                mock.patch.object(module.platform, "system", return_value="Linux"),
+                mock.patch.object(module.os, "geteuid", return_value=0),
+                mock.patch.object(
+                    module.shutil,
+                    "which",
+                    side_effect=lambda tool: None if tool == "fusermount3" else f"/usr/bin/{tool}",
+                ),
+            ):
                 with self.assertRaises(AssertionError):
                     scenario.preflight()
             checks = json.loads((root / "checks.json").read_text())
@@ -59,6 +65,9 @@ class BindTwoNodeLocalFileTests(unittest.TestCase):
             scenario = module.Scenario(repo, binaries, root, False)
 
             class FakeSocket:
+                def __init__(self):
+                    self.address = None
+
                 def __enter__(self):
                     return self
 
@@ -68,11 +77,13 @@ class BindTwoNodeLocalFileTests(unittest.TestCase):
                 def bind(self, address):
                     self.address = address
 
-            with mock.patch.object(module.platform, "system", return_value="Linux"), \
-                 mock.patch.object(module.os, "geteuid", return_value=0), \
-                 mock.patch.object(module.shutil, "which", side_effect=lambda tool: f"/usr/bin/{tool}"), \
-                 mock.patch.object(module.shutil, "disk_usage", return_value=mock.Mock(free=2 * 1024**3)), \
-                 mock.patch.object(module.socket, "socket", side_effect=lambda: FakeSocket()):
+            with (
+                mock.patch.object(module.platform, "system", return_value="Linux"),
+                mock.patch.object(module.os, "geteuid", return_value=0),
+                mock.patch.object(module.shutil, "which", side_effect=lambda tool: f"/usr/bin/{tool}"),
+                mock.patch.object(module.shutil, "disk_usage", return_value=mock.Mock(free=2 * 1024**3)),
+                mock.patch.object(module.socket, "socket", side_effect=lambda: FakeSocket()),
+            ):
                 scenario.preflight()
 
             checks = json.loads((root / "checks.json").read_text())
@@ -88,18 +99,20 @@ class BindTwoNodeLocalFileTests(unittest.TestCase):
             sentinel = root / "checks.json"
             sentinel.write_text("sentinel")
             scenario = module.Scenario(base / "repo", base / "bin", root, False)
-            with mock.patch.object(module.platform, "system", return_value="Linux"), \
-                 mock.patch.object(module.os, "geteuid", return_value=0):
+            with (
+                mock.patch.object(module.platform, "system", return_value="Linux"),
+                mock.patch.object(module.os, "geteuid", return_value=0),
+            ):
                 with self.assertRaises(module.PreflightError):
                     scenario.preflight()
             self.assertEqual(sentinel.read_text(), "sentinel")
 
     def test_health_requires_ready_json_not_only_http_200(self) -> None:
-        self.assertEqual(module.health_ready(200, '{"status":"starting"}')[0], False)
-        self.assertEqual(module.health_ready(503, '{"status":"ready"}')[0], False)
-        self.assertEqual(module.health_ready(200, '{"status":"ready"}')[0], True)
-        self.assertEqual(module.health_ready(200, 'null')[0], False)
-        self.assertEqual(module.health_ready(200, '[{"status":"ready"}]')[0], False)
+        self.assertIs(module.health_ready(200, '{"status":"starting"}')[0], False)
+        self.assertIs(module.health_ready(503, '{"status":"ready"}')[0], False)
+        self.assertIs(module.health_ready(200, '{"status":"ready"}')[0], True)
+        self.assertIs(module.health_ready(200, "null")[0], False)
+        self.assertIs(module.health_ready(200, '[{"status":"ready"}]')[0], False)
 
 
 if __name__ == "__main__":

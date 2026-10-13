@@ -5,12 +5,15 @@ import unittest
 from pathlib import Path
 
 spec = importlib.util.spec_from_file_location("target_identity", Path(__file__).parent / "drivers/target_identity.py")
-target = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(target)
+target_driver = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(target_driver)
 
 
 def mount(source="afs-dfs", filesystem="fuse", target="/mount"):
-    return {"returncode": 0, "stdout": json.dumps({"filesystems": [{"source": source, "fstype": filesystem, "target": target}]})}
+    return {
+        "returncode": 0,
+        "stdout": json.dumps({"filesystems": [{"source": source, "fstype": filesystem, "target": target}]}),
+    }
 
 
 def process(name):
@@ -20,7 +23,7 @@ def process(name):
 class TargetIdentityTest(unittest.TestCase):
     def checks(self, backend="DFS", observed=None, base=None, node=None, meta=None, system="Linux"):
         observed = observed or mount()
-        return target.target_checks(system, backend, observed, base or observed, node, meta)
+        return target_driver.target_checks(system, backend, observed, base or observed, node, meta)
 
     def test_observed_product(self):
         self.assertTrue(all(self.checks(node=process("afs-node"), meta=process("afs-meta")).values()))
@@ -68,7 +71,18 @@ class TargetIdentityTest(unittest.TestCase):
         self.assertFalse(self.checks(observed={"returncode": 0, "stdout": "broken"})["observed-target-backend"])
 
 
-def strict_identity(role="node", exe="afs-node", sha="a" * 64, boot="boot-a", machine="machine-a", cfg_sha="c" * 64, endpoint="http://10.0.0.1:7400", listen="0.0.0.0:7400", tls=None, start=123):
+def strict_identity(
+    role="node",
+    exe="afs-node",
+    sha="a" * 64,
+    boot="boot-a",
+    machine="machine-a",
+    cfg_sha="c" * 64,
+    endpoint="http://10.0.0.1:7400",
+    listen="0.0.0.0:7400",
+    tls=None,
+    start=123,
+):
     cfg = {"sha256": cfg_sha, "tls": tls or {}}
     if role == "node":
         cfg["meta_endpoint"] = endpoint
@@ -88,7 +102,12 @@ def strict_identity(role="node", exe="afs-node", sha="a" * 64, boot="boot-a", ma
         "expected_sha256": sha,
         "sha256_ok": True,
         "config": cfg,
-        "network": {"interface_ips": ["10.0.0.1" if role == "meta" else "10.0.0.2"], "listen_sockets": ([{"family": "tcp", "ip": "0.0.0.0", "port": 7400, "inode": "99"}] if role == "meta" else [])},
+        "network": {
+            "interface_ips": ["10.0.0.1" if role == "meta" else "10.0.0.2"],
+            "listen_sockets": (
+                [{"family": "tcp", "ip": "0.0.0.0", "port": 7400, "inode": "99"}] if role == "meta" else []
+            ),
+        },
     }
 
 
@@ -115,7 +134,7 @@ class RemoteTargetIdentityTest(unittest.TestCase):
             "require_cross_worker": True,
         }
         params.update(overrides)
-        return target.remote_target_checks(**params)
+        return target_driver.remote_target_checks(**params)
 
     def test_remote_identity_strict_passes_without_tls(self):
         self.assertTrue(all(self.remote_checks().values()))
@@ -135,7 +154,9 @@ class RemoteTargetIdentityTest(unittest.TestCase):
         self.assertFalse(checks["node-process-stable"])
 
     def test_remote_identity_rejects_endpoint_mismatch(self):
-        node = strict_identity("node", "afs-node", "a" * 64, boot="boot-b", machine="machine-b", endpoint="http://10.0.0.2:7400")
+        node = strict_identity(
+            "node", "afs-node", "a" * 64, boot="boot-b", machine="machine-b", endpoint="http://10.0.0.2:7400"
+        )
         checks = self.remote_checks(node=node, node_after=dict(node))
         self.assertFalse(checks["node-meta-endpoint-bound"])
 
@@ -160,7 +181,9 @@ class RemoteTargetIdentityTest(unittest.TestCase):
         tls = self.complete_tls()
         node = strict_identity("node", "afs-node", "a" * 64, boot="boot-b", machine="machine-b", tls=tls)
         node["config"]["tls_required"] = True
-        node["config"]["trusted_node_certs"] = {"memory-node-a": {"path": "/secret/peer-a", "sha256": "f" * 64, "exists": True}}
+        node["config"]["trusted_node_certs"] = {
+            "memory-node-a": {"path": "/secret/peer-a", "sha256": "f" * 64, "exists": True}
+        }
         checks = self.remote_checks(node=node, node_after=dict(node))
         self.assertTrue(checks["tls-digests-recorded"])
 
@@ -221,8 +244,18 @@ class RemoteTargetIdentityTest(unittest.TestCase):
         tls = self.complete_tls()
         node = strict_identity("node", "afs-node", "a" * 64, boot="boot-b", machine="machine-b", tls=tls)
         node_after = strict_identity("node", "afs-node", "a" * 64, boot="boot-b", machine="machine-b", tls=tls)
-        node["config"].update({"tls_required": True, "trusted_node_certs": {"peer": {"path": "/peer", "sha256": "1" * 64, "exists": True}}})
-        node_after["config"].update({"tls_required": True, "trusted_node_certs": {"peer": {"path": "/peer", "sha256": "2" * 64, "exists": True}}})
+        node["config"].update(
+            {
+                "tls_required": True,
+                "trusted_node_certs": {"peer": {"path": "/peer", "sha256": "1" * 64, "exists": True}},
+            }
+        )
+        node_after["config"].update(
+            {
+                "tls_required": True,
+                "trusted_node_certs": {"peer": {"path": "/peer", "sha256": "2" * 64, "exists": True}},
+            }
+        )
         checks = self.remote_checks(node=node, node_after=node_after)
         self.assertFalse(checks["tls-digests-recorded"])
 

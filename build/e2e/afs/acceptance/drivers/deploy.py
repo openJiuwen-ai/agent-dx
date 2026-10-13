@@ -7,6 +7,7 @@ returns BLOCKED for full release matrices and for topology/fault coverage that
 is not implemented yet. A PASS from this driver is therefore scoped to the
 requested smoke case and its emitted checks only.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -69,26 +70,48 @@ CASE_CHECKS: dict[str, list[str]] = {
 
 CASE_LIMITATIONS: dict[str, list[str]] = {
     "DEP-01": [
-        "Smoke uses an existing prepared Linux guest and local package path; it does not prove a pristine VM without source/compiler or one-command download.",
+        (
+            "Smoke uses an existing prepared Linux guest and local package "
+            "path; it does not prove a pristine VM without source/compiler "
+            "or one-command download."
+        ),
         "Smoke uses the local-file default package topology, not etcd and Redis matrices.",
     ],
     "DEP-02": [
         "Cluster topology deployment for ctl/A/B/C and etcd/Redis is not implemented in this driver.",
     ],
     "DEP-03": [
-        "Smoke verifies repeated install and duplicate start rejection; conflicting configuration rejection is not covered.",
+        (
+            "Smoke verifies repeated install and duplicate start rejection; "
+            "conflicting configuration rejection is not covered."
+        ),
     ],
     "DEP-04": [
-        "Smoke verifies CLI lifecycle and PID identity safety; hard-kill recovery and Rust drain-failure propagation are not covered.",
+        (
+            "Smoke verifies CLI lifecycle and PID identity safety; hard-kill "
+            "recovery and Rust drain-failure propagation are not covered."
+        ),
     ],
     "DEP-05": [
-        "Smoke verifies one bad digest and one port conflict path; bad backend, permission denied, missing FUSE and missing RDMA are not covered.",
+        (
+            "Smoke verifies one bad digest and one port conflict path; bad "
+            "backend, permission denied, missing FUSE and missing RDMA are "
+            "not covered."
+        ),
     ],
     "DEP-06": [
-        "Smoke inspects the offline package manifest and installs from a local tarball; network-disabled execution and user-provided etcd/Redis instances are not covered.",
+        (
+            "Smoke inspects the offline package manifest and installs from a "
+            "local tarball; network-disabled execution and user-provided "
+            "etcd/Redis instances are not covered."
+        ),
     ],
     "DEP-07": [
-        "Smoke verifies default program-only uninstall; explicit persistent data deletion is intentionally not implemented for first-stage scripts.",
+        (
+            "Smoke verifies default program-only uninstall; explicit "
+            "persistent data deletion is intentionally not implemented for "
+            "first-stage scripts."
+        ),
     ],
 }
 
@@ -113,7 +136,9 @@ def write_json(path: Path, value: Any) -> None:
 def run(argv: list[str], artifact: Path, timeout: int = 30, check: bool = False) -> dict[str, Any]:
     started = time.time()
     artifact.parent.mkdir(parents=True, exist_ok=True)
-    proc = subprocess.run(argv, shell=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, check=False)
+    proc = subprocess.run(
+        argv, shell=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, check=False
+    )
     record = {
         "argv": argv,
         "returncode": proc.returncode,
@@ -201,12 +226,21 @@ def sudo_prefix() -> list[str]:
 def safe_extract(package: Path, dest: Path) -> Path:
     dest.mkdir(parents=True, exist_ok=False)
     with tarfile.open(package, "r:gz") as tf:
-        root_names = {member.name.split("/", 1)[0] for member in tf.getmembers() if member.name and not member.name.startswith("/")}
+        root_names = {
+            member.name.split("/", 1)[0]
+            for member in tf.getmembers()
+            if member.name and not member.name.startswith("/")
+        }
         for member in tf.getmembers():
             target = (dest / member.name).resolve()
             target.relative_to(dest.resolve())
         tf.extractall(dest)
-    roots = sorted(path for name in root_names for path in [dest / name] if path.is_dir())
+    roots = []
+    for name in root_names:
+        path = dest / name
+        if path.is_dir():
+            roots.append(path)
+    roots.sort()
     if len(roots) != 1:
         raise RuntimeError(f"package must contain exactly one root directory, found {roots}")
     return roots[0]
@@ -311,7 +345,9 @@ def verify_manifest_for_offline(manifest: dict[str, Any], package_root: Path) ->
     }
 
 
-def verify_bad_digest_rejected(extract_root: Path, work_root: Path, sudo: list[str], artifact_dir: Path) -> dict[str, Any]:
+def verify_bad_digest_rejected(
+    extract_root: Path, work_root: Path, sudo: list[str], artifact_dir: Path
+) -> dict[str, Any]:
     bad_root = work_root / "bad-digest-extract"
     if bad_root.exists():
         shutil.rmtree(bad_root)
@@ -363,51 +399,100 @@ def verify_port_conflict_rejected(common: list[str], port: int, run_path: Path, 
     finally:
         sock.close()
     if record["returncode"] == 0 or "port already in use" not in (record.get("stderr") or ""):
-        raise RuntimeError(f"port conflict did not fail as expected: rc={record['returncode']} stderr={record.get('stderr')!r}")
+        raise RuntimeError(
+            f"port conflict did not fail as expected: rc={record['returncode']} stderr={record.get('stderr')!r}"
+        )
     if (run_path / "meta.pid").exists() or (run_path / "meta.identity").exists():
         raise RuntimeError("port conflict left meta pid/identity files")
     return {"returncode": record["returncode"], "stderr": record["stderr"], "pid_files_absent": True}
 
 
-def run_deployment_slice(args: argparse.Namespace, case_id: str, profile: str, matrix: dict[str, str], run_dir: Path) -> dict[str, Any]:
+def run_deployment_slice(
+    args: argparse.Namespace, case_id: str, profile: str, matrix: dict[str, str], run_dir: Path
+) -> dict[str, Any]:
     if case_id not in SUPPORTED_CASES:
         return blocked(case_id, profile, matrix, f"unsupported deployment case: {case_id}")
     package = Path(args.package).expanduser().resolve()
     if not package.is_file():
         return blocked(case_id, profile, matrix, f"package does not exist: {package}")
     if profile != "smoke":
-        return blocked(case_id, profile, matrix, "deployment driver implements smoke slices only; full DEP matrix remains TODO")
+        return blocked(
+            case_id, profile, matrix, "deployment driver implements smoke slices only; full DEP matrix remains TODO"
+        )
     if case_id == "DEP-02":
-        return blocked(case_id, profile, matrix, "DEP-02 requires multi-node topology deployment; this driver only owns single-node package lifecycle slices")
+        return blocked(
+            case_id,
+            profile,
+            matrix,
+            (
+                "DEP-02 requires multi-node topology deployment; this driver "
+                "only owns single-node package lifecycle slices"
+            ),
+        )
     linux_error = require_linux()
     if linux_error:
         return blocked(case_id, profile, matrix, linux_error)
 
-    work_root = Path(args.work_root).expanduser().resolve() if args.work_root else Path(tempfile.mkdtemp(prefix="afs-deploy-driver-"))
+    work_root = (
+        Path(args.work_root).expanduser().resolve()
+        if args.work_root
+        else Path(tempfile.mkdtemp(prefix="afs-deploy-driver-"))
+    )
     work_root.mkdir(parents=True, exist_ok=True)
     artifact_dir = run_dir / "deploy-artifacts" / uuid.uuid4().hex[:12]
     artifact_dir.mkdir(parents=True, exist_ok=False)
 
     all_checks: list[dict[str, Any]] = []
-    write_json(artifact_dir / "inputs.json", {"package": str(package), "work_root": str(work_root), "ports_base": args.ports_base, "case_id": case_id})
+    write_json(
+        artifact_dir / "inputs.json",
+        {"package": str(package), "work_root": str(work_root), "ports_base": args.ports_base, "case_id": case_id},
+    )
     package_sha = sha256_file(package)
     add_check(all_checks, "package-sha256", STATUS_PASS, {"sha256": package_sha}, "deploy-artifacts")
 
     mount_record = findmnt(work_root, artifact_dir / "work-root-findmnt.json")
     fstype = fstype_from_findmnt(mount_record)
     if fstype != "ext4":
-        return blocked(case_id, profile, matrix, f"work root must be on guest ext4, observed fstype={fstype!r}; see {artifact_dir/'work-root-findmnt.json'}")
-    add_check(all_checks, "work-root-ext4", STATUS_PASS, {"fstype": fstype, "path": str(work_root)}, str((artifact_dir / "work-root-findmnt.json").relative_to(run_dir)))
+        return blocked(
+            case_id,
+            profile,
+            matrix,
+            (
+                f"work root must be on guest ext4, observed fstype="
+                f"{fstype!r}"
+                f"; see "
+                f"{artifact_dir / 'work-root-findmnt.json'}"
+            ),
+        )
+    add_check(
+        all_checks,
+        "work-root-ext4",
+        STATUS_PASS,
+        {"fstype": fstype, "path": str(work_root)},
+        str((artifact_dir / "work-root-findmnt.json").relative_to(run_dir)),
+    )
 
     sudo = sudo_prefix()
     extract_root = safe_extract(package, work_root / "extract")
     manifest = read_manifest(extract_root)
     write_json(artifact_dir / "manifest.json", manifest)
     offline_evidence = verify_manifest_for_offline(manifest, extract_root)
-    add_check(all_checks, "offline-package-manifest", STATUS_PASS, offline_evidence, str((artifact_dir / "manifest.json").relative_to(run_dir)))
+    add_check(
+        all_checks,
+        "offline-package-manifest",
+        STATUS_PASS,
+        offline_evidence,
+        str((artifact_dir / "manifest.json").relative_to(run_dir)),
+    )
 
     bad_digest = verify_bad_digest_rejected(extract_root, work_root, sudo, artifact_dir)
-    add_check(all_checks, "bad-digest-rejected", STATUS_PASS, bad_digest, str((artifact_dir / "bad-digest-install.json").relative_to(run_dir)))
+    add_check(
+        all_checks,
+        "bad-digest-rejected",
+        STATUS_PASS,
+        bad_digest,
+        str((artifact_dir / "bad-digest-install.json").relative_to(run_dir)),
+    )
 
     prefix = work_root / "opt"
     config = work_root / "etc"
@@ -417,7 +502,12 @@ def run_deployment_slice(args: argparse.Namespace, case_id: str, profile: str, m
     mount_root = work_root / "mnt"
     destructive_paths = [prefix, config, state, run_path, log, mount_root]
     assert_confined_paths(work_root, destructive_paths)
-    add_check(all_checks, "confined-destructive-paths", STATUS_PASS, {"work_root": str(work_root), "paths": [str(path) for path in destructive_paths]})
+    add_check(
+        all_checks,
+        "confined-destructive-paths",
+        STATUS_PASS,
+        {"work_root": str(work_root), "paths": [str(path) for path in destructive_paths]},
+    )
 
     install_cmd = sudo + [
         str(extract_root / "install.sh"),
@@ -436,9 +526,17 @@ def run_deployment_slice(args: argparse.Namespace, case_id: str, profile: str, m
     ]
     run(install_cmd, artifact_dir / "install.json", timeout=60, check=True)
     patch_ports([config / "meta.toml", config / "node.toml"], args.ports_base, sudo)
-    add_check(all_checks, "install-checksum-and-config", STATUS_PASS, "install.sh verified SHA256SUMS and generated config", str((artifact_dir / "install.json").relative_to(run_dir)))
+    add_check(
+        all_checks,
+        "install-checksum-and-config",
+        STATUS_PASS,
+        "install.sh verified SHA256SUMS and generated config",
+        str((artifact_dir / "install.json").relative_to(run_dir)),
+    )
 
-    tls_files = [config / "tls" / name for name in ("ca.pem", "meta.pem", "meta-key.pem", "node-a.pem", "node-a-key.pem")]
+    tls_files = [
+        config / "tls" / name for name in ("ca.pem", "meta.pem", "meta-key.pem", "node-a.pem", "node-a-key.pem")
+    ]
     missing_tls = [str(path) for path in tls_files if not path.exists()]
     if missing_tls:
         raise RuntimeError(f"missing TLS bootstrap files: {missing_tls}")
@@ -447,39 +545,101 @@ def run_deployment_slice(args: argparse.Namespace, case_id: str, profile: str, m
     node_text = (config / "node.toml").read_text(encoding="utf-8")
     if str(mount_root / "dfs") not in node_text or str(mount_root / "ownerfs") not in node_text:
         raise RuntimeError("node config does not contain separate DFS and OwnerFs mount paths")
-    add_check(all_checks, "separate-mounts-configs", STATUS_PASS, {"dfs_mount": str(mount_root / "dfs"), "ownerfs_mount": str(mount_root / "ownerfs"), "node_config": str(config / "node.toml")})
+    add_check(
+        all_checks,
+        "separate-mounts-configs",
+        STATUS_PASS,
+        {
+            "dfs_mount": str(mount_root / "dfs"),
+            "ownerfs_mount": str(mount_root / "ownerfs"),
+            "node_config": str(config / "node.toml"),
+        },
+    )
 
     hashes_before = binary_hashes(prefix)
     write_json(artifact_dir / "binary-hashes-before.json", hashes_before)
 
     ctl = prefix / "bin" / "afs-processctl"
     dep_smoke = prefix / "bin" / "dep02-smoke.sh"
-    common = sudo + [str(ctl), "--prefix", str(prefix), "--config-dir", str(config), "--run-dir", str(run_path), "--log-dir", str(log), "--timeout", str(args.timeout)]
+    common = sudo + [
+        str(ctl),
+        "--prefix",
+        str(prefix),
+        "--config-dir",
+        str(config),
+        "--run-dir",
+        str(run_path),
+        "--log-dir",
+        str(log),
+        "--timeout",
+        str(args.timeout),
+    ]
 
     port_conflict = verify_port_conflict_rejected(common, args.ports_base, run_path, artifact_dir)
-    add_check(all_checks, "port-conflict-rejected", STATUS_PASS, port_conflict, str((artifact_dir / "port-conflict-meta.json").relative_to(run_dir)))
+    add_check(
+        all_checks,
+        "port-conflict-rejected",
+        STATUS_PASS,
+        port_conflict,
+        str((artifact_dir / "port-conflict-meta.json").relative_to(run_dir)),
+    )
 
     run(common + ["start", "all"], artifact_dir / "start-all.json", timeout=60, check=True)
     run(common + ["status", "all"], artifact_dir / "status-start.json", timeout=20, check=True)
-    run(sudo + [str(dep_smoke), "--mount", str(mount_root / "dfs"), "--name", "driver-dfs"], artifact_dir / "smoke-dfs.json", timeout=60, check=True)
-    run(sudo + [str(dep_smoke), "--mount", str(mount_root / "ownerfs"), "--name", "driver-owner"], artifact_dir / "smoke-owner.json", timeout=60, check=True)
-    add_check(all_checks, "one-node-two-mount-io", STATUS_PASS, "DFS and OwnerFs dep02-smoke passed on exact AFS FUSE mounts", str((artifact_dir / "smoke-dfs.json").relative_to(run_dir)))
+    run(
+        sudo + [str(dep_smoke), "--mount", str(mount_root / "dfs"), "--name", "driver-dfs"],
+        artifact_dir / "smoke-dfs.json",
+        timeout=60,
+        check=True,
+    )
+    run(
+        sudo + [str(dep_smoke), "--mount", str(mount_root / "ownerfs"), "--name", "driver-owner"],
+        artifact_dir / "smoke-owner.json",
+        timeout=60,
+        check=True,
+    )
+    add_check(
+        all_checks,
+        "one-node-two-mount-io",
+        STATUS_PASS,
+        "DFS and OwnerFs dep02-smoke passed on exact AFS FUSE mounts",
+        str((artifact_dir / "smoke-dfs.json").relative_to(run_dir)),
+    )
 
-    before_cfg = {"meta": sha256_file(config / "meta.toml"), "node": sha256_file(config / "node.toml"), "ca": sha256_file(config / "tls" / "ca.pem")}
+    before_cfg = {
+        "meta": sha256_file(config / "meta.toml"),
+        "node": sha256_file(config / "node.toml"),
+        "ca": sha256_file(config / "tls" / "ca.pem"),
+    }
     run(install_cmd, artifact_dir / "reinstall.json", timeout=60, check=True)
-    after_cfg = {"meta": sha256_file(config / "meta.toml"), "node": sha256_file(config / "node.toml"), "ca": sha256_file(config / "tls" / "ca.pem")}
+    after_cfg = {
+        "meta": sha256_file(config / "meta.toml"),
+        "node": sha256_file(config / "node.toml"),
+        "ca": sha256_file(config / "tls" / "ca.pem"),
+    }
     if before_cfg != after_cfg:
         raise RuntimeError(f"reinstall changed config/TLS digest: before={before_cfg} after={after_cfg}")
     hashes_after_reinstall = binary_hashes(prefix)
     if hashes_before != hashes_after_reinstall:
         raise RuntimeError("binary hashes changed across reinstall")
-    add_check(all_checks, "repeat-install-preserves-config-and-binaries", STATUS_PASS, {"config_tls_sha256": before_cfg, "binary_sha256": hashes_before})
+    add_check(
+        all_checks,
+        "repeat-install-preserves-config-and-binaries",
+        STATUS_PASS,
+        {"config_tls_sha256": before_cfg, "binary_sha256": hashes_before},
+    )
 
     duplicate_meta = run(common + ["start", "meta"], artifact_dir / "duplicate-meta.json", timeout=20)
     duplicate_node = run(common + ["start", "node"], artifact_dir / "duplicate-node.json", timeout=20)
     if duplicate_meta["returncode"] == 0 or duplicate_node["returncode"] == 0:
         raise RuntimeError("duplicate start unexpectedly succeeded")
-    add_check(all_checks, "duplicate-start-rejected", STATUS_PASS, {"meta_rc": duplicate_meta["returncode"], "node_rc": duplicate_node["returncode"]}, str((artifact_dir / "duplicate-meta.json").relative_to(run_dir)))
+    add_check(
+        all_checks,
+        "duplicate-start-rejected",
+        STATUS_PASS,
+        {"meta_rc": duplicate_meta["returncode"], "node_rc": duplicate_node["returncode"]},
+        str((artifact_dir / "duplicate-meta.json").relative_to(run_dir)),
+    )
 
     fake = work_root / "fake-identity"
     assert_confined_paths(work_root, [fake])
@@ -490,13 +650,57 @@ def run_deployment_slice(args: argparse.Namespace, case_id: str, profile: str, m
     fake_node = fake / "prefix" / "bin" / "afs-node"
     fake_node.write_text("#!/usr/bin/env bash\nwhile true; do sleep 60; done\n", encoding="utf-8")
     fake_node.chmod(0o755)
-    (fake / "etc" / "node.toml").write_text(f'rest_listen = "127.0.0.1:0"\ngrpc_listen = "127.0.0.1:0"\ndfs_mount = "{fake}/mnt-dfs"\nownerfs_mount = "{fake}/mnt-owner"\n', encoding="utf-8")
-    proc = subprocess.Popen([str(fake_node), "--config", str(fake / "etc" / "node.toml")], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    (fake / "etc" / "node.toml").write_text(
+        (
+            f'rest_listen = "127.0.0.1:0"\ngrpc_listen = '
+            f'"127.0.0.1:0"\ndfs_mount = "'
+            f"{fake}"
+            f'/mnt-dfs"\nownerfs_mount = "'
+            f"{fake}"
+            f'/mnt-owner"\n'
+        ),
+        encoding="utf-8",
+    )
+    proc = subprocess.Popen(
+        [str(fake_node), "--config", str(fake / "etc" / "node.toml")],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
     try:
         time.sleep(1)
         (fake / "run" / "node.pid").write_text(f"{proc.pid}\n", encoding="utf-8")
-        (fake / "run" / "node.identity").write_text(f"pid={proc.pid}\nexe={fake_node.resolve()}\nconfig={(fake/'etc'/'node.toml').resolve()}\nstart_ticks=1\ncmdline=wrong\n", encoding="utf-8")
-        neg = run([str(ctl), "--prefix", str(fake / "prefix"), "--config-dir", str(fake / "etc"), "--run-dir", str(fake / "run"), "--log-dir", str(fake / "log"), "--timeout", "1", "stop", "node"], artifact_dir / "negative-pid.json", timeout=10)
+        (fake / "run" / "node.identity").write_text(
+            (
+                f"pid="
+                f"{proc.pid}"
+                f"\nexe="
+                f"{fake_node.resolve()}"
+                f"\nconfig="
+                f"{(fake / 'etc' / 'node.toml').resolve()}"
+                f"\nstart_ticks=1\ncmdline=wrong\n"
+            ),
+            encoding="utf-8",
+        )
+        neg = run(
+            [
+                str(ctl),
+                "--prefix",
+                str(fake / "prefix"),
+                "--config-dir",
+                str(fake / "etc"),
+                "--run-dir",
+                str(fake / "run"),
+                "--log-dir",
+                str(fake / "log"),
+                "--timeout",
+                "1",
+                "stop",
+                "node",
+            ],
+            artifact_dir / "negative-pid.json",
+            timeout=10,
+        )
         if neg["returncode"] == 0 or proc.poll() is not None:
             raise RuntimeError("negative PID identity test failed: processctl killed or accepted mismatched pid")
     finally:
@@ -513,16 +717,53 @@ def run_deployment_slice(args: argparse.Namespace, case_id: str, profile: str, m
                 except ProcessLookupError:
                     pass
                 proc.wait()
-    add_check(all_checks, "negative-pid-identity-not-killed", STATUS_PASS, "mismatched live PID was refused and remained alive", str((artifact_dir / "negative-pid.json").relative_to(run_dir)))
+    add_check(
+        all_checks,
+        "negative-pid-identity-not-killed",
+        STATUS_PASS,
+        "mismatched live PID was refused and remained alive",
+        str((artifact_dir / "negative-pid.json").relative_to(run_dir)),
+    )
 
     run(common + ["restart", "all"], artifact_dir / "restart-all.json", timeout=60, check=True)
     run(common + ["status", "all"], artifact_dir / "status-restart.json", timeout=20, check=True)
-    add_check(all_checks, "start-status-restart", STATUS_PASS, "status/start/restart lifecycle succeeded", str((artifact_dir / "restart-all.json").relative_to(run_dir)))
+    add_check(
+        all_checks,
+        "start-status-restart",
+        STATUS_PASS,
+        "status/start/restart lifecycle succeeded",
+        str((artifact_dir / "restart-all.json").relative_to(run_dir)),
+    )
 
-    timeout_stop = run(sudo + [str(ctl), "--prefix", str(prefix), "--config-dir", str(config), "--run-dir", str(run_path), "--log-dir", str(log), "--timeout", "0", "stop", "node"], artifact_dir / "stop-timeout.json", timeout=10)
+    timeout_stop = run(
+        sudo
+        + [
+            str(ctl),
+            "--prefix",
+            str(prefix),
+            "--config-dir",
+            str(config),
+            "--run-dir",
+            str(run_path),
+            "--log-dir",
+            str(log),
+            "--timeout",
+            "0",
+            "stop",
+            "node",
+        ],
+        artifact_dir / "stop-timeout.json",
+        timeout=10,
+    )
     if timeout_stop["returncode"] == 0 or "did not stop within" not in timeout_stop.get("stderr", ""):
         raise RuntimeError("stop timeout did not surface non-zero timeout")
-    add_check(all_checks, "stop-timeout-nonzero", STATUS_PASS, {"returncode": timeout_stop["returncode"], "stderr": timeout_stop["stderr"]}, str((artifact_dir / "stop-timeout.json").relative_to(run_dir)))
+    add_check(
+        all_checks,
+        "stop-timeout-nonzero",
+        STATUS_PASS,
+        {"returncode": timeout_stop["returncode"], "stderr": timeout_stop["stderr"]},
+        str((artifact_dir / "stop-timeout.json").relative_to(run_dir)),
+    )
 
     assert_confined_paths(work_root, destructive_paths)
     run(common + ["stop", "all"], artifact_dir / "stop-all.json", timeout=60, check=True)
@@ -533,12 +774,26 @@ def run_deployment_slice(args: argparse.Namespace, case_id: str, profile: str, m
     preserved = [config / "meta.toml", config / "node.toml", state]
     missing_preserved = [str(path) for path in preserved if not path.exists()]
     if still_present or missing_preserved:
-        raise RuntimeError(f"uninstall verification failed; still_present={still_present}; missing_preserved={missing_preserved}")
-    mounts_after = run(["findmnt", "-rn", "--mountpoint", str(mount_root / "dfs"), "-o", "SOURCE,FSTYPE,TARGET"], artifact_dir / "mounts-after-dfs.json")
-    mounts_owner_after = run(["findmnt", "-rn", "--mountpoint", str(mount_root / "ownerfs"), "-o", "SOURCE,FSTYPE,TARGET"], artifact_dir / "mounts-after-owner.json")
+        raise RuntimeError(
+            f"uninstall verification failed; still_present={still_present}; missing_preserved={missing_preserved}"
+        )
+    mounts_after = run(
+        ["findmnt", "-rn", "--mountpoint", str(mount_root / "dfs"), "-o", "SOURCE,FSTYPE,TARGET"],
+        artifact_dir / "mounts-after-dfs.json",
+    )
+    mounts_owner_after = run(
+        ["findmnt", "-rn", "--mountpoint", str(mount_root / "ownerfs"), "-o", "SOURCE,FSTYPE,TARGET"],
+        artifact_dir / "mounts-after-owner.json",
+    )
     if mounts_after["stdout"].strip() or mounts_owner_after["stdout"].strip():
         raise RuntimeError("uninstall left AFS mounts behind")
-    add_check(all_checks, "program-only-uninstall", STATUS_PASS, "program files removed; config/state preserved; mounts absent", str((artifact_dir / "uninstall-all.json").relative_to(run_dir)))
+    add_check(
+        all_checks,
+        "program-only-uninstall",
+        STATUS_PASS,
+        "program files removed; config/state preserved; mounts absent",
+        str((artifact_dir / "uninstall-all.json").relative_to(run_dir)),
+    )
 
     write_json(artifact_dir / "all-checks.json", all_checks)
     selected = select_case_checks(all_checks, case_id)
@@ -568,7 +823,13 @@ def main() -> int:
             profile,
             matrix,
             STATUS_FAIL,
-            [{"name": "deployment-driver-exception", "status": STATUS_FAIL, "evidence": f"{type(exc).__name__}: {exc}"}],
+            [
+                {
+                    "name": "deployment-driver-exception",
+                    "status": STATUS_FAIL,
+                    "evidence": f"{type(exc).__name__}: {exc}",
+                }
+            ],
             f"{type(exc).__name__}: {exc}",
         )
     print(json.dumps(result, sort_keys=True))

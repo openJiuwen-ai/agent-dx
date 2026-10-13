@@ -2,10 +2,9 @@ import importlib.util
 import json
 import subprocess
 import sys
-from pathlib import Path
 import tempfile
 import unittest
-
+from pathlib import Path
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "component.py"
 SPEC = importlib.util.spec_from_file_location("component", MODULE_PATH)
@@ -19,11 +18,11 @@ class ComponentManifestTests(unittest.TestCase):
             root = Path(temporary)
             path = root / "manifest.json"
             for mode in (True, False):
-                path.write_text(json.dumps({"schema_version": 1, "commit": "a" * 40,
-                                            "target": "test", "with_dfs": mode}))
+                path.write_text(
+                    json.dumps({"schema_version": 1, "commit": "a" * 40, "target": "test", "with_dfs": mode})
+                )
                 with self.assertRaisesRegex(ValueError, "legacy with_dfs"):
-                    component.verify_build_manifest(path, "a" * 40, "test",
-                                                    root, root, root, root, root)
+                    component.verify_build_manifest(path, "a" * 40, "test", root, root, root, root, root)
 
     def test_gateway_component_contains_both_process_modes(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -31,14 +30,12 @@ class ComponentManifestTests(unittest.TestCase):
             (root / "adx-apiserver").write_bytes(b"fixture")
             (root / "adx-ingress").write_bytes(b"fixture")
             (root / "adx-relay").write_bytes(b"fixture")
-            manifest = component.create_manifest("gateway", root, "a" * 40,
-                                                 "x86_64-unknown-linux-gnu")
+            manifest = component.create_manifest("gateway", root, "a" * 40, "x86_64-unknown-linux-gnu")
             self.assertEqual(set(manifest["files"]), {"adx-apiserver", "adx-ingress", "adx-relay"})
             component.verify_manifest(root)
             (root / "adx-data-plane-forward").write_bytes(b"unexpected")
             with self.assertRaises(ValueError):
-                component.create_manifest("gateway", root, "a" * 40,
-                                          "x86_64-unknown-linux-gnu")
+                component.create_manifest("gateway", root, "a" * 40, "x86_64-unknown-linux-gnu")
 
     @staticmethod
     def write_component(root, name):
@@ -242,12 +239,10 @@ class ComponentManifestTests(unittest.TestCase):
                 directory = self.write_component(components, name)
                 component.create_manifest(name, directory, "c" * 40, "test")
             paths = {}
-            for name in ("package_manifest", "release_archive", "wheel",
-                         "backend_manifest", "backend_archive"):
+            for name in ("package_manifest", "release_archive", "wheel", "backend_manifest", "backend_archive"):
                 paths[name] = root / name
                 paths[name].write_bytes(b"fixture")
-            arguments = dict(component_root=components, commit="c" * 40,
-                             target="test", **paths)
+            arguments = dict(component_root=components, commit="c" * 40, target="test", **paths)
             for enabled in (True, False):
                 with self.subTest(with_afs=enabled):
                     package = {"commit": "c" * 40, "with_afs": enabled}
@@ -262,43 +257,68 @@ class ComponentManifestTests(unittest.TestCase):
                     path = root / "build-manifest.json"
                     path.write_text(json.dumps(manifest))
                     with self.assertRaisesRegex(ValueError, "package AFS mode"):
-                        component.verify_build_manifest(path, "c" * 40, "test",
-                                                        **paths, with_afs=enabled)
+                        component.verify_build_manifest(path, "c" * 40, "test", **paths, with_afs=enabled)
 
     def test_arm_release_without_external_backend_is_explicit_and_verified(self):
         for with_afs in (False, True):
             with self.subTest(with_afs=with_afs), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
                 for name in component.COMPONENTS:
-                    directory = self.write_component(root / 'components', name)
-                    component.create_manifest(name, directory, 'c' * 40, 'aarch64-unknown-linux-gnu')
-                package = root / 'release-manifest.json'
-                package.write_text(json.dumps({'commit': 'c' * 40, 'target': 'aarch64-unknown-linux-gnu', 'with_afs': with_afs}))
-                archive = root / 'adx-release.tar.gz'
-                archive.write_bytes(b'release')
-                wheel = root / 'sdk.whl'
-                wheel.write_bytes(b'wheel')
-                args = (root / 'components', 'c' * 40, 'aarch64-unknown-linux-gnu', package, archive, wheel)
+                    directory = self.write_component(root / "components", name)
+                    component.create_manifest(name, directory, "c" * 40, "aarch64-unknown-linux-gnu")
+                package = root / "release-manifest.json"
+                package.write_text(
+                    json.dumps({"commit": "c" * 40, "target": "aarch64-unknown-linux-gnu", "with_afs": with_afs})
+                )
+                archive = root / "adx-release.tar.gz"
+                archive.write_bytes(b"release")
+                wheel = root / "sdk.whl"
+                wheel.write_bytes(b"wheel")
+                args = (root / "components", "c" * 40, "aarch64-unknown-linux-gnu", package, archive, wheel)
                 manifest = component.create_build_manifest(*args, None, None, with_afs=with_afs)
-                self.assertIsNone(manifest['backend'])
-                path = root / 'build-manifest.json'
+                self.assertIsNone(manifest["backend"])
+                path = root / "build-manifest.json"
                 path.write_text(json.dumps(manifest))
-                component.verify_build_manifest(path, 'c' * 40, 'aarch64-unknown-linux-gnu', package, archive, wheel, None, None, with_afs=with_afs)
-                cli = [sys.executable, str(MODULE_PATH), 'verify-build', '--manifest', str(path),
-                       '--commit', 'c' * 40, '--target', 'aarch64-unknown-linux-gnu',
-                       '--package-manifest', str(package), '--release-archive', str(archive),
-                       '--wheel', str(wheel)]
+                component.verify_build_manifest(
+                    path, "c" * 40, "aarch64-unknown-linux-gnu", package, archive, wheel, None, None, with_afs=with_afs
+                )
+                cli = [
+                    sys.executable,
+                    str(MODULE_PATH),
+                    "verify-build",
+                    "--manifest",
+                    str(path),
+                    "--commit",
+                    "c" * 40,
+                    "--target",
+                    "aarch64-unknown-linux-gnu",
+                    "--package-manifest",
+                    str(package),
+                    "--release-archive",
+                    str(archive),
+                    "--wheel",
+                    str(wheel),
+                ]
                 if with_afs:
-                    cli.append('--with-afs')
+                    cli.append("--with-afs")
                 result = subprocess.run(cli, capture_output=True, text=True)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 with self.assertRaises(ValueError):
                     component.create_build_manifest(*args, package, None)
-                manifest['backend'] = {'manifest': {}}
+                manifest["backend"] = {"manifest": {}}
                 path.write_text(json.dumps(manifest))
                 with self.assertRaises(ValueError):
-                    component.verify_build_manifest(path, 'c' * 40, 'aarch64-unknown-linux-gnu', package, archive, wheel, None, None, with_afs=with_afs)
-
+                    component.verify_build_manifest(
+                        path,
+                        "c" * 40,
+                        "aarch64-unknown-linux-gnu",
+                        package,
+                        archive,
+                        wheel,
+                        None,
+                        None,
+                        with_afs=with_afs,
+                    )
 
     def test_mixed_component_commits_are_rejected(self):
         with tempfile.TemporaryDirectory() as temporary:

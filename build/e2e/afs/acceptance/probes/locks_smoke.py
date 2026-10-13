@@ -7,6 +7,7 @@ reference and on an AFS FUSE mount as a local-mount probe. Optional second
 path/mount arguments let the same cases run against two paths that should name
 one logical file; callers must decide whether that is same-node or cross-node.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -18,6 +19,7 @@ import json
 import os
 import platform
 import random
+import re
 import selectors
 import shutil
 import signal
@@ -29,7 +31,6 @@ import time
 import traceback
 from pathlib import Path
 from typing import Any, Callable
-
 
 _LIBC = ctypes.CDLL(None, use_errno=True)
 
@@ -47,14 +48,14 @@ class CFlock(ctypes.Structure):
 _LIBC.fcntl.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.POINTER(CFlock)]
 _LIBC.fcntl.restype = ctypes.c_int
 
-PROCESS_NAME_RE = __import__("re").compile(r"^[A-Za-z0-9_.-]+$")
+PROCESS_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 
 def _now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
-def _errno_name(value: int | None) -> str | None:
+def errno_name(value: int | None) -> str | None:
     if value is None:
         return None
     return errno.errorcode.get(value, f"ERRNO_{value}")
@@ -98,7 +99,7 @@ def _process_fingerprint(pid: int) -> dict[str, Any]:
     }
 
 
-def _process_identity(pid: int, name: str, source: str) -> dict[str, Any]:
+def process_identity(pid: int, name: str, source: str) -> dict[str, Any]:
     before = _process_fingerprint(pid)
     digest = _sha256_file(Path("/proc") / str(pid) / "exe")
     after = _process_fingerprint(pid)
@@ -136,16 +137,16 @@ def _fcntl_call(fd: int, cmd: int, lock_type: int, start: int, length: int) -> t
     return rc, lock, err
 
 
-def _fcntl_set(fd: int, lock_type: int, start: int, length: int, blocking: bool) -> tuple[bool, int | None]:
+def fcntl_set(fd: int, lock_type: int, start: int, length: int, blocking: bool) -> tuple[bool, int | None]:
     cmd = fcntl.F_SETLKW if blocking else fcntl.F_SETLK
     rc, _lock, err = _fcntl_call(fd, cmd, lock_type, start, length)
     return rc == 0, err
 
 
-def _fcntl_getlk(fd: int, lock_type: int, start: int, length: int) -> dict[str, Any]:
+def fcntl_getlk(fd: int, lock_type: int, start: int, length: int) -> dict[str, Any]:
     rc, lock, err = _fcntl_call(fd, fcntl.F_GETLK, lock_type, start, length)
     if rc != 0:
-        return {"ok": False, "errno": err, "errno_name": _errno_name(err)}
+        return {"ok": False, "errno": err, "errno_name": errno_name(err)}
     return {
         "ok": True,
         "l_type": int(lock.l_type),
@@ -167,7 +168,7 @@ def _lock_type_name(value: int) -> str:
     return f"LOCK_TYPE_{value}"
 
 
-def _flock_op(mode: str) -> int:
+def flock_op(mode: str) -> int:
     if mode == "shared":
         return fcntl.LOCK_SH
     if mode == "exclusive":
@@ -198,39 +199,47 @@ def _child_main(args: argparse.Namespace) -> int:
             try:
                 lock_type = fcntl.F_RDLCK if args.mode == "shared" else fcntl.F_WRLCK
                 if op == "hold_fcntl":
-                    ok, err = _fcntl_set(fd, lock_type, args.start, args.length, blocking=False)
+                    ok, err = fcntl_set(fd, lock_type, args.start, args.length, blocking=False)
                     if not ok:
-                        _emit({"event": "ERROR", "errno": err, "errno_name": _errno_name(err), "pid": os.getpid()})
+                        _emit({"event": "ERROR", "errno": err, "errno_name": errno_name(err), "pid": os.getpid()})
                         return 1
                     _emit({"event": "READY", "pid": os.getpid()})
                     sys.stdin.readline()
-                    _fcntl_set(fd, fcntl.F_UNLCK, args.start, args.length, blocking=False)
+                    fcntl_set(fd, fcntl.F_UNLCK, args.start, args.length, blocking=False)
                     return 0
                 if op == "wait_fcntl":
                     _emit({"event": "WAITING", "pid": os.getpid()})
-                    ok, err = _fcntl_set(fd, lock_type, args.start, args.length, blocking=True)
+                    ok, err = fcntl_set(fd, lock_type, args.start, args.length, blocking=True)
                     if not ok:
-                        _emit({"event": "ERROR", "errno": err, "errno_name": _errno_name(err), "pid": os.getpid()})
+                        _emit({"event": "ERROR", "errno": err, "errno_name": errno_name(err), "pid": os.getpid()})
                         return 1
                     _emit({"event": "ACQUIRED", "pid": os.getpid()})
                     sys.stdin.readline()
-                    _fcntl_set(fd, fcntl.F_UNLCK, args.start, args.length, blocking=False)
+                    fcntl_set(fd, fcntl.F_UNLCK, args.start, args.length, blocking=False)
                     return 0
                 if op == "try_fcntl":
-                    ok, err = _fcntl_set(fd, lock_type, args.start, args.length, blocking=False)
-                    _emit({"event": "RESULT", "ok": ok, "errno": err, "errno_name": _errno_name(err), "pid": os.getpid()})
+                    ok, err = fcntl_set(fd, lock_type, args.start, args.length, blocking=False)
+                    _emit(
+                        {"event": "RESULT", "ok": ok, "errno": err, "errno_name": errno_name(err), "pid": os.getpid()}
+                    )
                     if ok:
-                        _fcntl_set(fd, fcntl.F_UNLCK, args.start, args.length, blocking=False)
+                        fcntl_set(fd, fcntl.F_UNLCK, args.start, args.length, blocking=False)
                     return 0 if ok or _fcntl_conflict_errno_ok(err) else 1
                 if op == "getlk":
-                    _emit({"event": "RESULT", "result": _fcntl_getlk(fd, lock_type, args.start, args.length), "pid": os.getpid()})
+                    _emit(
+                        {
+                            "event": "RESULT",
+                            "result": fcntl_getlk(fd, lock_type, args.start, args.length),
+                            "pid": os.getpid(),
+                        }
+                    )
                     return 0
                 if op == "fcntl_close_other_then_hold":
                     fd2 = os.open(path, os.O_RDWR)
                     try:
-                        ok, err = _fcntl_set(fd, fcntl.F_WRLCK, args.start, args.length, blocking=False)
+                        ok, err = fcntl_set(fd, fcntl.F_WRLCK, args.start, args.length, blocking=False)
                         if not ok:
-                            _emit({"event": "ERROR", "errno": err, "errno_name": _errno_name(err), "pid": os.getpid()})
+                            _emit({"event": "ERROR", "errno": err, "errno_name": errno_name(err), "pid": os.getpid()})
                             return 1
                         os.close(fd2)
                         fd2 = -1
@@ -245,7 +254,7 @@ def _child_main(args: argparse.Namespace) -> int:
         if op in {"hold_flock", "wait_flock", "try_flock", "flock_dup_close_then_hold"}:
             fd = os.open(path, os.O_RDWR)
             try:
-                operation = _flock_op(args.mode)
+                operation = flock_op(args.mode)
                 if op == "hold_flock":
                     fcntl.flock(fd, operation | fcntl.LOCK_NB)
                     _emit({"event": "READY", "pid": os.getpid()})
@@ -267,7 +276,9 @@ def _child_main(args: argparse.Namespace) -> int:
                     except OSError as exc:
                         ok = False
                         err = exc.errno
-                    _emit({"event": "RESULT", "ok": ok, "errno": err, "errno_name": _errno_name(err), "pid": os.getpid()})
+                    _emit(
+                        {"event": "RESULT", "ok": ok, "errno": err, "errno_name": errno_name(err), "pid": os.getpid()}
+                    )
                     if ok:
                         fcntl.flock(fd, fcntl.LOCK_UN)
                     return 0 if ok or _flock_conflict_errno_ok(err) else 1
@@ -284,10 +295,27 @@ def _child_main(args: argparse.Namespace) -> int:
                 os.close(fd)
         raise RuntimeError(f"unknown child op {op}")
     except OSError as exc:
-        _emit({"event": "ERROR", "exception": type(exc).__name__, "message": str(exc), "errno": exc.errno, "errno_name": _errno_name(exc.errno), "pid": os.getpid()})
+        _emit(
+            {
+                "event": "ERROR",
+                "exception": type(exc).__name__,
+                "message": str(exc),
+                "errno": exc.errno,
+                "errno_name": errno_name(exc.errno),
+                "pid": os.getpid(),
+            }
+        )
         return 1
     except Exception as exc:  # noqa: BLE001
-        _emit({"event": "ERROR", "exception": type(exc).__name__, "message": str(exc), "traceback": traceback.format_exc(), "pid": os.getpid()})
+        _emit(
+            {
+                "event": "ERROR",
+                "exception": type(exc).__name__,
+                "message": str(exc),
+                "traceback": traceback.format_exc(),
+                "pid": os.getpid(),
+            }
+        )
         return 1
 
 
@@ -328,18 +356,36 @@ class Child:
                 self.events.append(event)
                 observed.append(event)
                 if event.get("event") == forbidden:
-                    raise AssertionError(json.dumps({"message": f"child {self.role} emitted {forbidden} too early", "event": event}, sort_keys=True))
+                    raise AssertionError(
+                        json.dumps(
+                            {"message": f"child {self.role} emitted {forbidden} too early", "event": event},
+                            sort_keys=True,
+                        )
+                    )
                 if event.get("event") == "ERROR":
                     raise RuntimeError(json.dumps({"role": self.role, "event": event}, sort_keys=True))
                 continue
             if self.proc.poll() is not None:
                 if require_alive:
-                    raise AssertionError(json.dumps({"message": f"child {self.role} exited before {forbidden} check finished", "returncode": self.proc.returncode}, sort_keys=True))
+                    raise AssertionError(
+                        json.dumps(
+                            {
+                                "message": f"child {self.role} exited before {forbidden} check finished",
+                                "returncode": self.proc.returncode,
+                            },
+                            sort_keys=True,
+                        )
+                    )
                 break
             time.sleep(0.02)
         if require_alive:
             _expect(self.proc.poll() is None, f"child {self.role} remains alive while {forbidden} is absent")
-        return {"forbidden": forbidden, "duration_seconds": duration, "observed": observed, "pid_alive": self.proc.poll() is None}
+        return {
+            "forbidden": forbidden,
+            "duration_seconds": duration,
+            "observed": observed,
+            "pid_alive": self.proc.poll() is None,
+        }
 
     def _readline(self, deadline: float) -> str:
         if self.proc.stdout is None:
@@ -362,7 +408,8 @@ class Child:
     def release(self) -> int:
         if self.proc.poll() is None:
             try:
-                assert self.proc.stdin is not None
+                if not self.proc.stdin is not None:
+                    raise AssertionError("self.proc.stdin is not None")
                 self.proc.stdin.write("release\n")
                 self.proc.stdin.flush()
             except BrokenPipeError:
@@ -395,7 +442,14 @@ class Probe:
         self.records: list[dict[str, Any]] = []
         self.failures: list[dict[str, Any]] = []
         self.children: list[Child] = []
-        self.run_id = f"locks-smoke-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-{os.getpid()}-{random.randrange(1_000_000):06d}"
+        self.run_id = (
+            f"locks-smoke-"
+            f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}"
+            f"-"
+            f"{os.getpid()}"
+            f"-"
+            f"{random.randrange(1000000):06d}"
+        )
         self.fixture_root: Path | None = None
         self.primary_path: Path | None = Path(args.path).absolute() if args.path else None
         self.secondary_path: Path | None = Path(args.second_path).absolute() if args.second_path else None
@@ -431,7 +485,11 @@ class Probe:
                 if self.secondary_path.exists():
                     break
                 time.sleep(0.1)
-            _expect(self.secondary_path.exists(), "second mount sees primary fixture path", {"primary": str(self.primary_path), "secondary": str(self.secondary_path)})
+            _expect(
+                self.secondary_path.exists(),
+                "second mount sees primary fixture path",
+                {"primary": str(self.primary_path), "secondary": str(self.secondary_path)},
+            )
             _expect(self.secondary_path.read_bytes().startswith(b"afs-locks-smoke"), "second mount reads fixture data")
 
     def cleanup(self) -> None:
@@ -452,7 +510,7 @@ class Probe:
         processes: dict[str, Any] = {}
         for assignment in self.args.process:
             name, pid, source = assignment
-            processes[name] = _process_identity(pid, name, source)
+            processes[name] = process_identity(pid, name, source)
         report = {
             "schema": "afs.locks_smoke.v1",
             "created_at": _now(),
@@ -471,7 +529,7 @@ class Probe:
                 "uid": os.geteuid(),
                 "gid": os.getegid(),
             },
-            "probe_process": _process_identity(os.getpid(), "locks_smoke", "self"),
+            "probe_process": process_identity(os.getpid(), "locks_smoke", "self"),
             "observed_processes": processes,
             "findmnt": {"primary": findmnt_primary, "secondary": findmnt_secondary},
             "summary": {
@@ -485,13 +543,30 @@ class Probe:
             "notes": [
                 "This is a short real Linux advisory-lock probe, not a complete POSIX lock suite.",
                 "Failures with ENOSYS/EOPNOTSUPP indicate missing filesystem/FUSE lock support for this probe.",
-                "When primary and secondary paths differ, this script proves only those two paths' observed lock behavior; the caller supplies the cross-mount fixture identity.",
+                (
+                    "When primary and secondary paths differ, this script proves "
+                    "only those two paths' observed lock behavior; the caller "
+                    "supplies the cross-mount fixture identity."
+                ),
             ],
         }
         (self.evidence / "report.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
         (self.evidence / "summary.txt").write_text(
-            f"status={report['summary']['status']} steps={report['summary']['steps']} failed={report['summary']['failed']} "
-            f"primary={self.primary_path} secondary={self.secondary_path} kept={self.fixture_kept}\n"
+            (
+                f"status="
+                f"{report['summary']['status']}"
+                f" steps="
+                f"{report['summary']['steps']}"
+                f" failed="
+                f"{report['summary']['failed']}"
+                f" primary="
+                f"{self.primary_path}"
+                f" secondary="
+                f"{self.secondary_path}"
+                f" kept="
+                f"{self.fixture_kept}"
+                f"\n"
+            )
         )
 
     def _findmnt(self, path: Path | None) -> dict[str, Any] | None:
@@ -524,7 +599,7 @@ class Probe:
         ]
         proc = subprocess.Popen(cmd, text=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         child = Child(proc, role, timeout=self.args.child_timeout)
-        child.identity = _process_identity(proc.pid, role, "subprocess")
+        child.identity = process_identity(proc.pid, role, "subprocess")
         self.children.append(child)
         return child
 
@@ -541,20 +616,23 @@ class Probe:
             details = func()
             record.update({"ok": True, "exit_status": 0, "details": details})
         except Exception as exc:  # noqa: BLE001 - probe must serialize raw failure
-            record.update({
-                "ok": False,
-                "exit_status": 1,
-                "exception": type(exc).__name__,
-                "message": str(exc),
-                "traceback": traceback.format_exc(),
-            })
+            record.update(
+                {
+                    "ok": False,
+                    "exit_status": 1,
+                    "exception": type(exc).__name__,
+                    "message": str(exc),
+                    "traceback": traceback.format_exc(),
+                }
+            )
             self.failures.append(record)
         finally:
             record["duration_ms"] = round((time.time() - started) * 1000, 3)
             self.records.append(record)
 
     def paths(self) -> tuple[Path, Path]:
-        assert self.primary_path is not None and self.secondary_path is not None
+        if not (self.primary_path is not None and self.secondary_path is not None):
+            raise AssertionError("self.primary_path is not None and self.secondary_path is not None")
         return self.primary_path, self.secondary_path
 
     def test_fcntl_conflict_nonoverlap_getlk(self) -> dict[str, Any]:
@@ -566,12 +644,27 @@ class Probe:
         getlk = self.run_try("getlk", secondary, "exclusive", 0, 10)
         rc = holder.release()
         _expect(conflict["event"].get("ok") is False, "overlapping fcntl exclusive lock conflicts", conflict)
-        _expect(_fcntl_conflict_errno_ok(conflict["event"].get("errno")), "conflict errno proves a held-lock conflict", conflict)
+        _expect(
+            _fcntl_conflict_errno_ok(conflict["event"].get("errno")),
+            "conflict errno proves a held-lock conflict",
+            conflict,
+        )
         _expect(nonoverlap["event"].get("ok") is True, "non-overlapping fcntl range succeeds", nonoverlap)
         result = getlk["event"].get("result", {})
-        _expect(result.get("ok") is True and result.get("l_type") != fcntl.F_UNLCK, "F_GETLK reports conflicting lock", getlk)
+        _expect(
+            result.get("ok") is True and result.get("l_type") != fcntl.F_UNLCK,
+            "F_GETLK reports conflicting lock",
+            getlk,
+        )
         _expect(rc == 0, "holder exits cleanly", {"returncode": rc})
-        return {"holder_ready": ready, "holder_identity": holder.identity, "conflict": conflict, "nonoverlap": nonoverlap, "getlk": getlk, "holder_returncode": rc}
+        return {
+            "holder_ready": ready,
+            "holder_identity": holder.identity,
+            "conflict": conflict,
+            "nonoverlap": nonoverlap,
+            "getlk": getlk,
+            "holder_returncode": rc,
+        }
 
     def test_fcntl_shared_exclusive(self) -> dict[str, Any]:
         primary, secondary = self.paths()
@@ -582,9 +675,19 @@ class Probe:
         rc = holder.release()
         _expect(shared["event"].get("ok") is True, "second shared fcntl lock succeeds", shared)
         _expect(exclusive["event"].get("ok") is False, "exclusive fcntl lock conflicts with shared holder", exclusive)
-        _expect(_fcntl_conflict_errno_ok(exclusive["event"].get("errno")), "exclusive fcntl conflict errno proves a held-lock conflict", exclusive)
+        _expect(
+            _fcntl_conflict_errno_ok(exclusive["event"].get("errno")),
+            "exclusive fcntl conflict errno proves a held-lock conflict",
+            exclusive,
+        )
         _expect(rc == 0, "shared holder exits cleanly", {"returncode": rc})
-        return {"holder_ready": ready, "holder_identity": holder.identity, "shared": shared, "exclusive": exclusive, "holder_returncode": rc}
+        return {
+            "holder_ready": ready,
+            "holder_identity": holder.identity,
+            "shared": shared,
+            "exclusive": exclusive,
+            "holder_returncode": rc,
+        }
 
     def test_fcntl_blocking_waiter_wakeup(self) -> dict[str, Any]:
         primary, secondary = self.paths()
@@ -598,7 +701,14 @@ class Probe:
         waiter_rc = waiter.release()
         _expect(holder_rc == 0, "blocking holder exits cleanly", {"returncode": holder_rc})
         _expect(waiter_rc == 0, "blocking waiter exits cleanly", {"returncode": waiter_rc})
-        return {"holder_ready": ready, "waiting": waiting, "before_unlock": before_unlock, "acquired": acquired, "holder_identity": holder.identity, "waiter_identity": waiter.identity}
+        return {
+            "holder_ready": ready,
+            "waiting": waiting,
+            "before_unlock": before_unlock,
+            "acquired": acquired,
+            "holder_identity": holder.identity,
+            "waiter_identity": waiter.identity,
+        }
 
     def test_fcntl_owner_exit_release(self) -> dict[str, Any]:
         primary, secondary = self.paths()
@@ -608,7 +718,12 @@ class Probe:
         holder_rc = holder.wait()
         acquired = self.run_try("try_fcntl", secondary, "exclusive", 120, 10)
         _expect(acquired["event"].get("ok") is True, "fcntl lock released after owner process exits", acquired)
-        return {"holder_ready": ready, "holder_identity": holder.identity, "holder_returncode": holder_rc, "post_exit_acquire": acquired}
+        return {
+            "holder_ready": ready,
+            "holder_identity": holder.identity,
+            "holder_returncode": holder_rc,
+            "post_exit_acquire": acquired,
+        }
 
     def test_fcntl_close_other_fd_releases_process_locks(self) -> dict[str, Any]:
         primary, secondary = self.paths()
@@ -616,9 +731,18 @@ class Probe:
         ready = holder.read_event("READY")
         acquired = self.run_try("try_fcntl", secondary, "exclusive", 160, 10)
         rc = holder.release()
-        _expect(acquired["event"].get("ok") is True, "closing another fd releases POSIX process locks for that file", acquired)
+        _expect(
+            acquired["event"].get("ok") is True,
+            "closing another fd releases POSIX process locks for that file",
+            acquired,
+        )
         _expect(rc == 0, "close-other child exits cleanly", {"returncode": rc})
-        return {"holder_ready": ready, "holder_identity": holder.identity, "post_close_acquire": acquired, "holder_returncode": rc}
+        return {
+            "holder_ready": ready,
+            "holder_identity": holder.identity,
+            "post_close_acquire": acquired,
+            "holder_returncode": rc,
+        }
 
     def test_flock_conflict_shared_and_dup(self) -> dict[str, Any]:
         primary, secondary = self.paths()
@@ -627,7 +751,11 @@ class Probe:
         ex_conflict = self.run_try("try_flock", secondary, "exclusive")
         ex_rc = ex_holder.release()
         _expect(ex_conflict["event"].get("ok") is False, "flock exclusive conflicts with exclusive holder", ex_conflict)
-        _expect(_flock_conflict_errno_ok(ex_conflict["event"].get("errno")), "flock exclusive conflict errno proves a held-lock conflict", ex_conflict)
+        _expect(
+            _flock_conflict_errno_ok(ex_conflict["event"].get("errno")),
+            "flock exclusive conflict errno proves a held-lock conflict",
+            ex_conflict,
+        )
         _expect(ex_rc == 0, "flock exclusive holder exits cleanly", {"returncode": ex_rc})
 
         sh_holder = self.child("flock-shared-holder", "hold_flock", primary, "shared")
@@ -637,7 +765,11 @@ class Probe:
         sh_rc = sh_holder.release()
         _expect(sh_ok["event"].get("ok") is True, "second shared flock succeeds", sh_ok)
         _expect(sh_conflict["event"].get("ok") is False, "exclusive flock conflicts with shared holder", sh_conflict)
-        _expect(_flock_conflict_errno_ok(sh_conflict["event"].get("errno")), "flock shared/exclusive conflict errno proves a held-lock conflict", sh_conflict)
+        _expect(
+            _flock_conflict_errno_ok(sh_conflict["event"].get("errno")),
+            "flock shared/exclusive conflict errno proves a held-lock conflict",
+            sh_conflict,
+        )
         _expect(sh_rc == 0, "flock shared holder exits cleanly", {"returncode": sh_rc})
 
         dup_holder = self.child("flock-dup-holder", "flock_dup_close_then_hold", primary, "exclusive")
@@ -645,15 +777,40 @@ class Probe:
         dup_conflict = self.run_try("try_flock", secondary, "exclusive")
         dup_rc = dup_holder.release()
         after_release = self.run_try("try_flock", secondary, "exclusive")
-        _expect(dup_conflict["event"].get("ok") is False, "flock survives closing original fd while dup remains", dup_conflict)
-        _expect(_flock_conflict_errno_ok(dup_conflict["event"].get("errno")), "flock dup conflict errno proves a held-lock conflict", dup_conflict)
+        _expect(
+            dup_conflict["event"].get("ok") is False,
+            "flock survives closing original fd while dup remains",
+            dup_conflict,
+        )
+        _expect(
+            _flock_conflict_errno_ok(dup_conflict["event"].get("errno")),
+            "flock dup conflict errno proves a held-lock conflict",
+            dup_conflict,
+        )
         _expect(after_release["event"].get("ok") is True, "flock released after final duplicate closes", after_release)
         _expect(dup_rc == 0, "flock dup holder exits cleanly", {"returncode": dup_rc})
 
         return {
-            "exclusive": {"ready": ex_ready, "holder_identity": ex_holder.identity, "conflict": ex_conflict, "returncode": ex_rc},
-            "shared": {"ready": sh_ready, "holder_identity": sh_holder.identity, "shared_ok": sh_ok, "exclusive_conflict": sh_conflict, "returncode": sh_rc},
-            "dup_close": {"ready": dup_ready, "holder_identity": dup_holder.identity, "conflict_while_dup_open": dup_conflict, "after_release": after_release, "returncode": dup_rc},
+            "exclusive": {
+                "ready": ex_ready,
+                "holder_identity": ex_holder.identity,
+                "conflict": ex_conflict,
+                "returncode": ex_rc,
+            },
+            "shared": {
+                "ready": sh_ready,
+                "holder_identity": sh_holder.identity,
+                "shared_ok": sh_ok,
+                "exclusive_conflict": sh_conflict,
+                "returncode": sh_rc,
+            },
+            "dup_close": {
+                "ready": dup_ready,
+                "holder_identity": dup_holder.identity,
+                "conflict_while_dup_open": dup_conflict,
+                "after_release": after_release,
+                "returncode": dup_rc,
+            },
         }
 
     def test_flock_blocking_waiter_owner_exit(self) -> dict[str, Any]:
@@ -676,8 +833,20 @@ class Probe:
         after_exit = self.run_try("try_flock", secondary, "exclusive")
         _expect(after_exit["event"].get("ok") is True, "flock released after owner process exits", after_exit)
         return {
-            "blocking": {"ready": ready, "waiting": waiting, "before_unlock": before_unlock, "acquired": acquired, "holder_identity": holder.identity, "waiter_identity": waiter.identity},
-            "owner_exit": {"ready": exit_ready, "holder_identity": exit_holder.identity, "holder_returncode": exit_rc, "after_exit": after_exit},
+            "blocking": {
+                "ready": ready,
+                "waiting": waiting,
+                "before_unlock": before_unlock,
+                "acquired": acquired,
+                "holder_identity": holder.identity,
+                "waiter_identity": waiter.identity,
+            },
+            "owner_exit": {
+                "ready": exit_ready,
+                "holder_identity": exit_holder.identity,
+                "holder_returncode": exit_rc,
+                "after_exit": after_exit,
+            },
         }
 
     def run(self) -> None:
@@ -694,29 +863,70 @@ class Probe:
         primary, secondary = self.paths()
         p_stat = primary.stat()
         s_stat = secondary.stat()
-        _expect(primary.exists() and secondary.exists(), "primary and secondary paths exist", {"primary": str(primary), "secondary": str(secondary)})
+        _expect(
+            primary.exists() and secondary.exists(),
+            "primary and secondary paths exist",
+            {"primary": str(primary), "secondary": str(secondary)},
+        )
         _expect(primary.read_bytes() == secondary.read_bytes(), "primary and secondary paths read same fixture bytes")
         return {
             "primary": str(primary),
             "secondary": str(secondary),
             "same_path": primary == secondary,
-            "primary_stat": {"dev": p_stat.st_dev, "ino": p_stat.st_ino, "size": p_stat.st_size, "mode": oct(p_stat.st_mode & 0o7777), "type_regular": stat.S_ISREG(p_stat.st_mode)},
-            "secondary_stat": {"dev": s_stat.st_dev, "ino": s_stat.st_ino, "size": s_stat.st_size, "mode": oct(s_stat.st_mode & 0o7777), "type_regular": stat.S_ISREG(s_stat.st_mode)},
+            "primary_stat": {
+                "dev": p_stat.st_dev,
+                "ino": p_stat.st_ino,
+                "size": p_stat.st_size,
+                "mode": oct(p_stat.st_mode & 0o7777),
+                "type_regular": stat.S_ISREG(p_stat.st_mode),
+            },
+            "secondary_stat": {
+                "dev": s_stat.st_dev,
+                "ino": s_stat.st_ino,
+                "size": s_stat.st_size,
+                "mode": oct(s_stat.st_mode & 0o7777),
+                "type_regular": stat.S_ISREG(s_stat.st_mode),
+            },
         }
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run short Linux advisory lock smoke probe")
     parser.add_argument("--mount", help="mount/root directory where the probe creates an isolated fixture")
-    parser.add_argument("--second-mount", help="optional second mount that should expose the same relative fixture path")
+    parser.add_argument(
+        "--second-mount", help="optional second mount that should expose the same relative fixture path"
+    )
     parser.add_argument("--path", help="explicit primary file path; parent is created and file overwritten")
     parser.add_argument("--second-path", help="explicit secondary file path naming the same logical file")
     parser.add_argument("--evidence", required=False, default="/tmp/afs-locks-smoke-evidence")
     parser.add_argument("--child-timeout", type=float, default=5.0)
     parser.add_argument("--keep-fixture", action="store_true")
-    parser.add_argument("--process", action="append", type=_parse_process_assignment, default=[], metavar="NAME=PID", help="record live process identity without reading cmdline/environ")
-    parser.add_argument("--child-op", choices=["hold_fcntl", "wait_fcntl", "try_fcntl", "getlk", "fcntl_close_other_then_hold", "hold_flock", "wait_flock", "try_flock", "flock_dup_close_then_hold"], help=argparse.SUPPRESS)
-    parser.add_argument("--mode", choices=["shared", "exclusive", "unlock"], default="exclusive", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--process",
+        action="append",
+        type=_parse_process_assignment,
+        default=[],
+        metavar="NAME=PID",
+        help="record live process identity without reading cmdline/environ",
+    )
+    parser.add_argument(
+        "--child-op",
+        choices=[
+            "hold_fcntl",
+            "wait_fcntl",
+            "try_fcntl",
+            "getlk",
+            "fcntl_close_other_then_hold",
+            "hold_flock",
+            "wait_flock",
+            "try_flock",
+            "flock_dup_close_then_hold",
+        ],
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--mode", choices=["shared", "exclusive", "unlock"], default="exclusive", help=argparse.SUPPRESS
+    )
     parser.add_argument("--start", type=int, default=0, help=argparse.SUPPRESS)
     parser.add_argument("--length", type=int, default=10, help=argparse.SUPPRESS)
     return parser
@@ -732,15 +942,17 @@ def main(argv: list[str]) -> int:
         probe.setup()
         probe.run()
     except Exception as exc:  # noqa: BLE001
-        probe.failures.append({
-            "name": "setup_or_runner",
-            "started_at": _now(),
-            "ok": False,
-            "exit_status": 1,
-            "exception": type(exc).__name__,
-            "message": str(exc),
-            "traceback": traceback.format_exc(),
-        })
+        probe.failures.append(
+            {
+                "name": "setup_or_runner",
+                "started_at": _now(),
+                "ok": False,
+                "exit_status": 1,
+                "exception": type(exc).__name__,
+                "message": str(exc),
+                "traceback": traceback.format_exc(),
+            }
+        )
     finally:
         probe.cleanup()
         probe.write_report()

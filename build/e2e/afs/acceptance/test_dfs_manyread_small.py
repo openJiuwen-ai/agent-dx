@@ -1,4 +1,5 @@
 """Guard tests for dfs_manyread_small evidence helpers."""
+
 from __future__ import annotations
 
 import importlib.util
@@ -7,9 +8,9 @@ import os
 import platform
 import subprocess
 import sys
-from pathlib import Path
 import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location("dfs_manyread_small", Path(__file__).with_name("dfs_manyread_small.py"))
@@ -51,7 +52,11 @@ def good_manifest() -> dict[str, object]:
             "sha256": dfs_manyread_small.expected_payload_sha(),
         },
         "write": {"rc": 0, "status": "PASS", "result": good_io("seq-write", "fdatasync"), "verify": {"status": "PASS"}},
-        "content_verify": {"status": "PASS", "bytes": dfs_manyread_small.DATA_BYTES, "sha256": dfs_manyread_small.expected_payload_sha()},
+        "content_verify": {
+            "status": "PASS",
+            "bytes": dfs_manyread_small.DATA_BYTES,
+            "sha256": dfs_manyread_small.expected_payload_sha(),
+        },
         "dir_fsync": True,
         "parent_dir_fsync": True,
     }
@@ -61,7 +66,9 @@ DELETE_RUN_ID = "123456789-4242"
 DELETE_DFS_ROOT = "/mnt/dfs"
 
 
-def good_delete_sample(round_index: int = 0, *, run_id: str = DELETE_RUN_ID, dfs_root: str = DELETE_DFS_ROOT, **overrides: object) -> dict[str, object]:
+def good_delete_sample(
+    round_index: int = 0, *, run_id: str = DELETE_RUN_ID, dfs_root: str = DELETE_DFS_ROOT, **overrides: object
+) -> dict[str, object]:
     sample_name = dfs_manyread_small.delete_sample_name(run_id, round_index)
     sample: dict[str, object] = {
         "round": round_index,
@@ -70,8 +77,16 @@ def good_delete_sample(round_index: int = 0, *, run_id: str = DELETE_RUN_ID, dfs
         "directory": str(Path(dfs_root) / sample_name),
         "files": dfs_manyread_small.expected_delete_files(),
         "status": "PASS",
-        "prepare": {"files": dfs_manyread_small.expected_delete_files(), "fdatasync_per_file": True, "parent_fsync": True},
-        "fresh_open_verify": {"status": "PASS", "files_checked": dfs_manyread_small.DELETE_FILE_COUNT, "bytes_per_file": dfs_manyread_small.DELETE_FILE_BYTES},
+        "prepare": {
+            "files": dfs_manyread_small.expected_delete_files(),
+            "fdatasync_per_file": True,
+            "parent_fsync": True,
+        },
+        "fresh_open_verify": {
+            "status": "PASS",
+            "files_checked": dfs_manyread_small.DELETE_FILE_COUNT,
+            "bytes_per_file": dfs_manyread_small.DELETE_FILE_BYTES,
+        },
         "unlink_timer": {"status": "PASS", "files": dfs_manyread_small.DELETE_FILE_COUNT, "wall_ns": 1000},
         "post_unlink": {"status": "PASS", "remaining": [], "parent_fsync": True},
         "cleanup": {"status": "PASS", "removed_sample_dir": True},
@@ -81,7 +96,10 @@ def good_delete_sample(round_index: int = 0, *, run_id: str = DELETE_RUN_ID, dfs
 
 
 def good_delete_manifest() -> dict[str, object]:
-    rounds = [good_delete_sample(index) for index in range(dfs_manyread_small.WARMUP_ROUNDS + dfs_manyread_small.MEASUREMENT_ROUNDS)]
+    rounds = [
+        good_delete_sample(index)
+        for index in range(dfs_manyread_small.WARMUP_ROUNDS + dfs_manyread_small.MEASUREMENT_ROUNDS)
+    ]
     return {
         "role": "delete-writer",
         "status": "DATA_RECORDED",
@@ -90,7 +108,12 @@ def good_delete_manifest() -> dict[str, object]:
         "mount": {"source": "afs-dfs", "target": DELETE_DFS_ROOT, "fstype": "fuse", "options": "rw", "id": "10"},
         "run_id": DELETE_RUN_ID,
         "owner_delete_helper": {"sha256": dfs_manyread_small.OWNER_REMOTE_SMALL_SHA256},
-        "delete_shape": {"files": dfs_manyread_small.DELETE_FILE_COUNT, "file_bytes": dfs_manyread_small.DELETE_FILE_BYTES, "warmups": dfs_manyread_small.WARMUP_ROUNDS, "measurements": dfs_manyread_small.MEASUREMENT_ROUNDS},
+        "delete_shape": {
+            "files": dfs_manyread_small.DELETE_FILE_COUNT,
+            "file_bytes": dfs_manyread_small.DELETE_FILE_BYTES,
+            "warmups": dfs_manyread_small.WARMUP_ROUNDS,
+            "measurements": dfs_manyread_small.MEASUREMENT_ROUNDS,
+        },
         "delete_rounds": rounds,
     }
 
@@ -181,12 +204,16 @@ class DfsManyReadSmallGuardTests(unittest.TestCase):
 
     def test_foreign_fuse_mount_is_rejected(self) -> None:
         with self.assertRaises(ValueError):
-            dfs_manyread_small.require_dfs_mount({"fstype": "fuse", "source": "some-dfs", "target": "/mnt/dfs"}, Path("/mnt/dfs"))
+            dfs_manyread_small.require_dfs_mount(
+                {"fstype": "fuse", "source": "some-dfs", "target": "/mnt/dfs"}, Path("/mnt/dfs")
+            )
         with self.assertRaises(ValueError):
-            dfs_manyread_small.require_dfs_mount({"fstype": "fuse", "source": "afs-dfs", "target": "/mnt/other"}, Path("/mnt/dfs"))
-        dfs_manyread_small.require_dfs_mount({"fstype": "fuse", "source": "afs-dfs", "target": "/mnt/dfs"}, Path("/mnt/dfs"))
-
-
+            dfs_manyread_small.require_dfs_mount(
+                {"fstype": "fuse", "source": "afs-dfs", "target": "/mnt/other"}, Path("/mnt/dfs")
+            )
+        dfs_manyread_small.require_dfs_mount(
+            {"fstype": "fuse", "source": "afs-dfs", "target": "/mnt/dfs"}, Path("/mnt/dfs")
+        )
 
     def test_changed_helper_is_rejected_before_import(self) -> None:
         with patch.object(dfs_manyread_small, "sha256_file", return_value="0" * 64):
@@ -194,14 +221,18 @@ class DfsManyReadSmallGuardTests(unittest.TestCase):
                 dfs_manyread_small.load_owner_delete_helper()
 
     def test_coordinator_platform_guard_rejects_nonroot_and_other_architecture(self) -> None:
-        with patch.object(dfs_manyread_small.platform, "system", return_value="Linux"), \
-             patch.object(dfs_manyread_small.platform, "machine", return_value="aarch64"), \
-             patch.object(dfs_manyread_small.os, "geteuid", return_value=501):
+        with (
+            patch.object(dfs_manyread_small.platform, "system", return_value="Linux"),
+            patch.object(dfs_manyread_small.platform, "machine", return_value="aarch64"),
+            patch.object(dfs_manyread_small.os, "geteuid", return_value=501),
+        ):
             with self.assertRaisesRegex(RuntimeError, "requires Linux aarch64 root"):
                 dfs_manyread_small.verify_linux_aarch64_root()
-        with patch.object(dfs_manyread_small.platform, "system", return_value="Linux"), \
-             patch.object(dfs_manyread_small.platform, "machine", return_value="x86_64"), \
-             patch.object(dfs_manyread_small.os, "geteuid", return_value=0):
+        with (
+            patch.object(dfs_manyread_small.platform, "system", return_value="Linux"),
+            patch.object(dfs_manyread_small.platform, "machine", return_value="x86_64"),
+            patch.object(dfs_manyread_small.os, "geteuid", return_value=0),
+        ):
             with self.assertRaisesRegex(RuntimeError, "requires Linux aarch64 root"):
                 dfs_manyread_small.verify_linux_aarch64_root()
 
@@ -241,10 +272,16 @@ class DfsManyReadSmallGuardTests(unittest.TestCase):
         bad_role["role"] = "reader"
         cases.append(bad_role)
         wrong_name = good_delete_manifest()
-        wrong_name["delete_rounds"][0] = {**wrong_name["delete_rounds"][0], "sample_name": ".afs-dfs-delete-123456789-9999-r00"}
+        wrong_name["delete_rounds"][0] = {
+            **wrong_name["delete_rounds"][0],
+            "sample_name": ".afs-dfs-delete-123456789-9999-r00",
+        }
         cases.append(wrong_name)
         wrong_dir = good_delete_manifest()
-        wrong_dir["delete_rounds"][0] = {**wrong_dir["delete_rounds"][0], "directory": "/mnt/dfs/.afs-dfs-delete-123456789-4242-r99"}
+        wrong_dir["delete_rounds"][0] = {
+            **wrong_dir["delete_rounds"][0],
+            "directory": "/mnt/dfs/.afs-dfs-delete-123456789-4242-r99",
+        }
         cases.append(wrong_dir)
         wrong_root = good_delete_manifest()
         wrong_root["fs"]["dfs_root"]["path"] = "/mnt/other"
@@ -258,7 +295,13 @@ class DfsManyReadSmallGuardTests(unittest.TestCase):
 
     def test_delete_manifest_rejects_corrupt_content_failed_unlink_cleanup_and_traversal(self) -> None:
         for mutated in (
-            {"fresh_open_verify": {"status": "FAIL", "files_checked": dfs_manyread_small.DELETE_FILE_COUNT, "bytes_per_file": dfs_manyread_small.DELETE_FILE_BYTES}},
+            {
+                "fresh_open_verify": {
+                    "status": "FAIL",
+                    "files_checked": dfs_manyread_small.DELETE_FILE_COUNT,
+                    "bytes_per_file": dfs_manyread_small.DELETE_FILE_BYTES,
+                }
+            },
             {"unlink_timer": {"status": "FAIL", "files": dfs_manyread_small.DELETE_FILE_COUNT, "wall_ns": 1000}},
             {"cleanup": {"status": "FAIL", "left_in_place": "/tmp/x"}},
             {"sample_name": "../escape"},
@@ -278,12 +321,17 @@ class DfsManyReadSmallGuardTests(unittest.TestCase):
             present_dir.mkdir()
             (present_dir / "entry-0000.bin").write_bytes(b"still-here")
             result = dfs_manyread_small.check_deleted_paths(root, rounds)
-            self.assertEqual(result["checked"], dfs_manyread_small.DELETE_FILE_COUNT * (dfs_manyread_small.WARMUP_ROUNDS + dfs_manyread_small.MEASUREMENT_ROUNDS))
+            self.assertEqual(
+                result["checked"],
+                dfs_manyread_small.DELETE_FILE_COUNT
+                * (dfs_manyread_small.WARMUP_ROUNDS + dfs_manyread_small.MEASUREMENT_ROUNDS),
+            )
             self.assertEqual(result["status"], "FAIL")
             self.assertEqual(result["failures"][0]["status"], "PRESENT")
 
             original_lstat = dfs_manyread_small.os.lstat
             try:
+
                 def denied_lstat(path: Path) -> object:
                     if str(path).endswith("entry-0000.bin"):
                         raise PermissionError(13, "denied", str(path))
@@ -315,12 +363,23 @@ class DfsManyReadSmallGuardTests(unittest.TestCase):
             self.assertEqual(sentinel.read_text(encoding="utf-8"), "sentinel")
 
     def test_start_event_rejects_wrong_reader_round_or_session(self) -> None:
-        good = json.dumps({"event": "START", "reader_id": "B", "session_token": "s", "round": 1, "round_token": "s:round:1"})
-        self.assertEqual(dfs_manyread_small.parse_start_event(good, 1, reader_id="B", session_token="s")["round_token"], "s:round:1")
+        good = json.dumps(
+            {"event": "START", "reader_id": "B", "session_token": "s", "round": 1, "round_token": "s:round:1"}
+        )
+        self.assertEqual(
+            dfs_manyread_small.parse_start_event(good, 1, reader_id="B", session_token="s")["round_token"], "s:round:1"
+        )
         ack0 = json.dumps({"event": "ACK", "reader_id": "B", "session_token": "s", "round": 0})
         self.assertEqual(dfs_manyread_small.parse_ack_event(ack0, 0, reader_id="B", session_token="s")["event"], "ACK")
-        ack = json.dumps({"event": "ACK", "reader_id": "B", "session_token": "s", "round": 1, "round_token": "s:round:1"})
-        self.assertEqual(dfs_manyread_small.parse_ack_event(ack, 1, reader_id="B", session_token="s", round_token="s:round:1")["event"], "ACK")
+        ack = json.dumps(
+            {"event": "ACK", "reader_id": "B", "session_token": "s", "round": 1, "round_token": "s:round:1"}
+        )
+        self.assertEqual(
+            dfs_manyread_small.parse_ack_event(ack, 1, reader_id="B", session_token="s", round_token="s:round:1")[
+                "event"
+            ],
+            "ACK",
+        )
         with self.assertRaises(ValueError):
             dfs_manyread_small.parse_ack_event(ack, 1, reader_id="B", session_token="s", round_token="other")
         with self.assertRaises(ValueError):
@@ -337,13 +396,17 @@ class DfsManyReadSmallGuardTests(unittest.TestCase):
             {"event": "READY", "reader_id": "B", "session_token": "s", "round": 1},
             {"event": "READY", "reader_id": "C", "session_token": "s", "round": 1},
         ]
-        self.assertEqual(dfs_manyread_small.validate_ready_pair(events, expected_round=1, session_token="s")["status"], "PASS")
+        self.assertEqual(
+            dfs_manyread_small.validate_ready_pair(events, expected_round=1, session_token="s")["status"], "PASS"
+        )
         with self.assertRaises(ValueError):
             dfs_manyread_small.validate_ready_pair(events[:1], expected_round=1, session_token="s")
         with self.assertRaises(ValueError):
             dfs_manyread_small.validate_ready_pair([events[0], dict(events[0])], expected_round=1, session_token="s")
         with self.assertRaises(ValueError):
-            dfs_manyread_small.validate_ready_pair([events[0], {**events[1], "round": 2}], expected_round=1, session_token="s")
+            dfs_manyread_small.validate_ready_pair(
+                [events[0], {**events[1], "round": 2}], expected_round=1, session_token="s"
+            )
 
     def test_json_line_reader_times_out_on_partial_line_and_keeps_buffer(self) -> None:
         read_fd, write_fd = os.pipe()
@@ -353,7 +416,7 @@ class DfsManyReadSmallGuardTests(unittest.TestCase):
             reader = dfs_manyread_small.JsonLineReader(reader_file)
             with self.assertRaises(TimeoutError):
                 reader.read_line(0.01)
-            os.write(write_fd, b'}\n')
+            os.write(write_fd, b"}\n")
             self.assertEqual(json.loads(reader.read_line(1))["event"], "START")
             reader_file.close()
         finally:
@@ -365,9 +428,17 @@ class DfsManyReadSmallGuardTests(unittest.TestCase):
     def test_run_io_timeout_and_nonzero_child_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             slow = Path(tmp) / "slow.py"
-            slow.write_text("#!/usr/bin/env python3\nimport sys,time\nsys.stdout.write('{\\\"partial\\\":')\nsys.stdout.flush()\ntime.sleep(5)\n", encoding="utf-8")
+            slow.write_text(
+                (
+                    "#!/usr/bin/env python3\nimport sys,time\nsys.stdout.write('{\\\"part"
+                    "ial\\\":')\nsys.stdout.flush()\ntime.sleep(5)\n"
+                ),
+                encoding="utf-8",
+            )
             slow.chmod(0o755)
-            timed = dfs_manyread_small.run_io(slow, Path(tmp) / "payload", "seq-read", "close", "existing", timeout=0.05)
+            timed = dfs_manyread_small.run_io(
+                slow, Path(tmp) / "payload", "seq-read", "close", "existing", timeout=0.05
+            )
             self.assertEqual(timed["status"], "FAIL")
             self.assertTrue(timed["timed_out"])
             self.assertTrue(timed["child_reaped"])
@@ -375,7 +446,10 @@ class DfsManyReadSmallGuardTests(unittest.TestCase):
             self.assertIsInstance(timed["stdout"], str)
 
             bad = Path(tmp) / "bad.py"
-            bad.write_text("#!/usr/bin/env python3\nimport json,sys\nprint(json.dumps(" + repr(good_io()) + "))\nsys.exit(7)\n", encoding="utf-8")
+            bad.write_text(
+                "#!/usr/bin/env python3\nimport json,sys\nprint(json.dumps(" + repr(good_io()) + "))\nsys.exit(7)\n",
+                encoding="utf-8",
+            )
             bad.chmod(0o755)
             failed = dfs_manyread_small.run_io(bad, Path(tmp) / "payload", "seq-read", "close", "existing", timeout=1)
             self.assertEqual(failed["rc"], 7)
@@ -384,14 +458,21 @@ class DfsManyReadSmallGuardTests(unittest.TestCase):
 
     def test_sync_status_requires_measurement_rounds_and_final_eof(self) -> None:
         rounds = [{"round": 0, "measured": False, "samples": [{"status": "PASS", "verify": {"status": "PASS"}}]}]
-        rounds.extend({"round": i, "measured": True, "samples": [{"status": "PASS", "verify": {"status": "PASS"}}]} for i in range(1, 6))
-        self.assertEqual(dfs_manyread_small.sync_read_status(rounds, {"status": "PASS"}, {"status": "PASS"}), "DATA_RECORDED")
+        rounds.extend(
+            {"round": i, "measured": True, "samples": [{"status": "PASS", "verify": {"status": "PASS"}}]}
+            for i in range(1, 6)
+        )
+        self.assertEqual(
+            dfs_manyread_small.sync_read_status(rounds, {"status": "PASS"}, {"status": "PASS"}), "DATA_RECORDED"
+        )
         wrong = list(rounds)
         wrong[1] = {**wrong[1], "measured": False}
         self.assertEqual(dfs_manyread_small.sync_read_status(wrong, {"status": "PASS"}, {"status": "PASS"}), "FAIL")
         self.assertEqual(dfs_manyread_small.sync_read_status(rounds, {"status": "PASS"}, {"status": "FAIL"}), "FAIL")
 
-    def coordinator_input(self, failed_done: bool = False, wrong_round: bool = False, missing_peer: bool = False, bad_result: bool = False) -> str:
+    def coordinator_input(
+        self, failed_done: bool = False, wrong_round: bool = False, missing_peer: bool = False, bad_result: bool = False
+    ) -> str:
         lines = [
             {"event": "HELLO", "reader_id": "B", "session_token": "s"},
         ]
@@ -399,26 +480,71 @@ class DfsManyReadSmallGuardTests(unittest.TestCase):
             lines.append({"event": "HELLO", "reader_id": "C", "session_token": "s"})
         for round_index in range(1, 6):
             lines.append({"event": "READY", "reader_id": "B", "session_token": "s", "round": round_index})
-            lines.append({"event": "READY", "reader_id": "C", "session_token": "s", "round": round_index + 1 if wrong_round and round_index == 1 else round_index})
+            lines.append(
+                {
+                    "event": "READY",
+                    "reader_id": "C",
+                    "session_token": "s",
+                    "round": round_index + 1 if wrong_round and round_index == 1 else round_index,
+                }
+            )
             token = f"s:round:{round_index}"
             status = "FAIL" if failed_done and round_index == 1 else "PASS"
             b_result = good_io()
             if bad_result and round_index == 1:
                 b_result["io_bytes"] = dfs_manyread_small.DATA_BYTES - 1
-            lines.append({"event": "DONE", "reader_id": "B", "session_token": "s", "round": round_index, "round_token": token, "status": status, "rc": 0, "result": b_result})
-            lines.append({"event": "DONE", "reader_id": "C", "session_token": "s", "round": round_index, "round_token": token, "status": "PASS", "rc": 0, "result": good_io()})
-        lines.extend([
-            {"event": "FINAL", "reader_id": "B", "session_token": "s", "status": "DATA_RECORDED"},
-            {"event": "FINAL", "reader_id": "C", "session_token": "s", "status": "DATA_RECORDED"},
-        ])
+            lines.append(
+                {
+                    "event": "DONE",
+                    "reader_id": "B",
+                    "session_token": "s",
+                    "round": round_index,
+                    "round_token": token,
+                    "status": status,
+                    "rc": 0,
+                    "result": b_result,
+                }
+            )
+            lines.append(
+                {
+                    "event": "DONE",
+                    "reader_id": "C",
+                    "session_token": "s",
+                    "round": round_index,
+                    "round_token": token,
+                    "status": "PASS",
+                    "rc": 0,
+                    "result": good_io(),
+                }
+            )
+        lines.extend(
+            [
+                {"event": "FINAL", "reader_id": "B", "session_token": "s", "status": "DATA_RECORDED"},
+                {"event": "FINAL", "reader_id": "C", "session_token": "s", "status": "DATA_RECORDED"},
+            ]
+        )
         return "\n".join(json.dumps(line) for line in lines) + "\n"
 
-    def run_coordinator_process(self, stdin_text: str, timeout: str = "1") -> tuple[subprocess.CompletedProcess[str], dict[str, object]]:
+    def run_coordinator_process(
+        self, stdin_text: str, timeout: str = "1"
+    ) -> tuple[subprocess.CompletedProcess[str], dict[str, object]]:
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp) / "coord"
             completed = subprocess.run(
-                [sys.executable, str(Path(dfs_manyread_small.__file__)), "coordinator", "--output", str(out),
-                 "--session-token", "s", "--round-timeout", timeout, "--readers", "B", "C"],
+                [
+                    sys.executable,
+                    str(Path(dfs_manyread_small.__file__)),
+                    "coordinator",
+                    "--output",
+                    str(out),
+                    "--session-token",
+                    "s",
+                    "--round-timeout",
+                    timeout,
+                    "--readers",
+                    "B",
+                    "C",
+                ],
                 input=stdin_text,
                 text=True,
                 stdout=subprocess.PIPE,
@@ -428,8 +554,10 @@ class DfsManyReadSmallGuardTests(unittest.TestCase):
             summary = json.loads((out / "summary.json").read_text(encoding="utf-8"))
             return completed, summary
 
-    @unittest.skipUnless(platform.system() == "Linux" and platform.machine() == "aarch64" and os.geteuid() == 0,
-                         "real coordinator requires Linux aarch64 root")
+    @unittest.skipUnless(
+        platform.system() == "Linux" and platform.machine() == "aarch64" and os.geteuid() == 0,
+        "real coordinator requires Linux aarch64 root",
+    )
     def test_coordinator_records_ctl_clock_boundaries_with_real_stdio_process(self) -> None:
         completed, summary = self.run_coordinator_process(self.coordinator_input())
         self.assertEqual(completed.returncode, 0, completed.stderr)
@@ -440,21 +568,34 @@ class DfsManyReadSmallGuardTests(unittest.TestCase):
         self.assertEqual(sum(1 for event in starts if event["event"] == "ACK" and event["round"] == 0), 2)
         self.assertEqual(summary["status"], "DATA_RECORDED")
         self.assertEqual(summary["platform"], {"system": "Linux", "machine": "aarch64", "euid": 0})
-        self.assertEqual(summary["monotonic_clock"]["monotonic"], True)
+        self.assertIs(summary["monotonic_clock"]["monotonic"], True)
         self.assertEqual(len(summary["rounds"]), 5)
         for row in summary["rounds"]:
             self.assertLessEqual(row["start_before_emit_ns"], row["end_after_both_done_ns"])
             self.assertGreaterEqual(row["elapsed_ns"], 0)
 
-
-    @unittest.skipUnless(platform.system() == "Linux" and platform.machine() == "aarch64" and os.geteuid() == 0,
-                         "real coordinator requires Linux aarch64 root")
+    @unittest.skipUnless(
+        platform.system() == "Linux" and platform.machine() == "aarch64" and os.geteuid() == 0,
+        "real coordinator requires Linux aarch64 root",
+    )
     def test_coordinator_ack_gates_fast_reader_next_ready_with_real_stdio_process(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp) / "coord"
             proc = subprocess.Popen(
-                [sys.executable, str(Path(dfs_manyread_small.__file__)), "coordinator", "--output", str(out),
-                 "--session-token", "s", "--round-timeout", "1", "--readers", "B", "C"],
+                [
+                    sys.executable,
+                    str(Path(dfs_manyread_small.__file__)),
+                    "coordinator",
+                    "--output",
+                    str(out),
+                    "--session-token",
+                    "s",
+                    "--round-timeout",
+                    "1",
+                    "--readers",
+                    "B",
+                    "C",
+                ],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -480,11 +621,31 @@ class DfsManyReadSmallGuardTests(unittest.TestCase):
             starts = [recv_event(), recv_event()]
             self.assertEqual({event["event"] for event in starts}, {"START"})
             token = starts[0]["round_token"]
-            send({"event": "DONE", "reader_id": "B", "session_token": "s", "round": 1, "round_token": token,
-                  "status": "PASS", "rc": 0, "result": good_io()})
+            send(
+                {
+                    "event": "DONE",
+                    "reader_id": "B",
+                    "session_token": "s",
+                    "round": 1,
+                    "round_token": token,
+                    "status": "PASS",
+                    "rc": 0,
+                    "result": good_io(),
+                }
+            )
             # Fast B cannot legally send READY round 2 until coordinator acknowledges both DONEs.
-            send({"event": "DONE", "reader_id": "C", "session_token": "s", "round": 1, "round_token": token,
-                  "status": "PASS", "rc": 0, "result": good_io()})
+            send(
+                {
+                    "event": "DONE",
+                    "reader_id": "C",
+                    "session_token": "s",
+                    "round": 1,
+                    "round_token": token,
+                    "status": "PASS",
+                    "rc": 0,
+                    "result": good_io(),
+                }
+            )
             acks = [recv_event(), recv_event()]
             self.assertEqual({event["event"] for event in acks}, {"ACK"})
             self.assertEqual({event["reader_id"] for event in acks}, {"B", "C"})
@@ -495,8 +656,10 @@ class DfsManyReadSmallGuardTests(unittest.TestCase):
             proc.kill()
             proc.wait(timeout=2)
 
-    @unittest.skipUnless(platform.system() == "Linux" and platform.machine() == "aarch64" and os.geteuid() == 0,
-                         "real coordinator requires Linux aarch64 root")
+    @unittest.skipUnless(
+        platform.system() == "Linux" and platform.machine() == "aarch64" and os.geteuid() == 0,
+        "real coordinator requires Linux aarch64 root",
+    )
     def test_coordinator_fail_closed_on_missing_peer_wrong_round_or_failed_done(self) -> None:
         for payload, expected in [
             (self.coordinator_input(missing_peer=True), "expected HELLO"),
@@ -508,7 +671,6 @@ class DfsManyReadSmallGuardTests(unittest.TestCase):
             self.assertNotEqual(completed.returncode, 0)
             self.assertEqual(summary["status"], "BLOCKED")
             self.assertIn(expected, summary["error"])
-
 
 
 if __name__ == "__main__":

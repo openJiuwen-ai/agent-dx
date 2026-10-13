@@ -1,5 +1,5 @@
-import importlib.util
 import errno
+import importlib.util
 import socket
 import ssl
 import struct
@@ -8,7 +8,6 @@ import unittest
 from argparse import Namespace
 from pathlib import Path
 from unittest import mock
-
 
 HERE = Path(__file__).resolve().parent
 SPEC = importlib.util.spec_from_file_location("env_network", HERE / "env_network.py")
@@ -32,27 +31,36 @@ class EnvNetworkUnitTest(unittest.TestCase):
         raw, ctx, tls = mock.MagicMock(), mock.MagicMock(), mock.MagicMock()
         ctx.wrap_socket.return_value.__enter__.return_value = tls
         tls.recv.side_effect = ssl.SSLError("TLSV13_ALERT_CERTIFICATE_REQUIRED")
-        args = Namespace(source_ip="127.0.0.1", target_ip="127.0.0.1",
-                         tls_port=19567, timeout=1)
-        with mock.patch.object(env_network, "_connect_tcp", return_value=raw), \
-                mock.patch.object(env_network, "_tls_context_client", return_value=ctx):
+        args = Namespace(source_ip="127.0.0.1", target_ip="127.0.0.1", tls_port=19567, timeout=1)
+        with (
+            mock.patch.object(env_network, "_connect_tcp", return_value=raw),
+            mock.patch.object(env_network, "_tls_context_client", return_value=ctx),
+        ):
             result = env_network._tls_attempt(args, Path("ca.pem"), None, None, "server")
         self.assertEqual("FAIL", result["status"])
         self.assertEqual("missing_client_cert", result["reason"])
 
     def test_ready_write_failure_closes_started_resources(self):
         tcp, udp, tls = mock.Mock(), mock.Mock(), mock.Mock()
-        args = Namespace(bind_ip="127.0.0.1", port=19566, tls_port=19567,
-                         ca=Path("ca.pem"), server_cert=Path("cert.pem"),
-                         server_key=Path("key.pem"), peer_expected=None,
-                         ready_json=Path("ready.json"))
-        with mock.patch.object(env_network, "live_linux_arm64_guard"), \
-                mock.patch.object(env_network.signal, "signal"), \
-                mock.patch.object(env_network, "_bind_tcp", side_effect=[tcp, tls]), \
-                mock.patch.object(env_network, "_bind_udp", return_value=udp), \
-                mock.patch.object(env_network, "_tls_context_server"), \
-                mock.patch.object(env_network.threading, "Thread") as factory, \
-                mock.patch.object(env_network, "_write_ready", side_effect=OSError("readonly")):
+        args = Namespace(
+            bind_ip="127.0.0.1",
+            port=19566,
+            tls_port=19567,
+            ca=Path("ca.pem"),
+            server_cert=Path("cert.pem"),
+            server_key=Path("key.pem"),
+            peer_expected=None,
+            ready_json=Path("ready.json"),
+        )
+        with (
+            mock.patch.object(env_network, "live_linux_arm64_guard"),
+            mock.patch.object(env_network.signal, "signal"),
+            mock.patch.object(env_network, "_bind_tcp", side_effect=[tcp, tls]),
+            mock.patch.object(env_network, "_bind_udp", return_value=udp),
+            mock.patch.object(env_network, "_tls_context_server"),
+            mock.patch.object(env_network.threading, "Thread") as factory,
+            mock.patch.object(env_network, "_write_ready", side_effect=OSError("readonly")),
+        ):
             with self.assertRaises(OSError):
                 env_network.server_main(args)
             self.assertEqual(3, factory.return_value.start.call_count)
@@ -63,19 +71,23 @@ class EnvNetworkUnitTest(unittest.TestCase):
     def test_partial_bind_failure_closes_prior_listener(self):
         tcp = mock.Mock()
         args = Namespace(bind_ip="127.0.0.1", port=19566, tls_port=19567)
-        with mock.patch.object(env_network, "live_linux_arm64_guard"), \
-                mock.patch.object(env_network.signal, "signal"), \
-                mock.patch.object(env_network, "_bind_tcp", return_value=tcp), \
-                mock.patch.object(env_network, "_bind_udp", side_effect=OSError("busy")):
+        with (
+            mock.patch.object(env_network, "live_linux_arm64_guard"),
+            mock.patch.object(env_network.signal, "signal"),
+            mock.patch.object(env_network, "_bind_tcp", return_value=tcp),
+            mock.patch.object(env_network, "_bind_udp", side_effect=OSError("busy")),
+        ):
             with self.assertRaises(OSError):
                 env_network.server_main(args)
         tcp.close.assert_called_once()
 
     def test_server_rejects_other_architecture_before_binding(self):
-        with mock.patch.object(env_network.platform, "system", return_value="Linux"), \
-                mock.patch.object(env_network.platform, "machine", return_value="x86_64"), \
-                mock.patch.object(env_network, "_bind_tcp") as tcp, \
-                mock.patch.object(env_network, "_bind_udp") as udp:
+        with (
+            mock.patch.object(env_network.platform, "system", return_value="Linux"),
+            mock.patch.object(env_network.platform, "machine", return_value="x86_64"),
+            mock.patch.object(env_network, "_bind_tcp") as tcp,
+            mock.patch.object(env_network, "_bind_udp") as udp,
+        ):
             with self.assertRaises(env_network.ProbeError) as raised:
                 env_network.server_main(Namespace())
             self.assertEqual(raised.exception.reason, "linux_arm64_required")
@@ -130,7 +142,10 @@ class EnvNetworkUnitTest(unittest.TestCase):
 
     def test_tls_negative_classification(self):
         cases = [
-            (ssl.SSLCertVerificationError("certificate verify failed: unable to get local issuer certificate"), "untrusted_ca"),
+            (
+                ssl.SSLCertVerificationError("certificate verify failed: unable to get local issuer certificate"),
+                "untrusted_ca",
+            ),
             (ssl.CertificateError("hostname 'bad' doesn't match"), "wrong_hostname"),
             (ssl.SSLError("TLSV13_ALERT_CERTIFICATE_REQUIRED"), "missing_client_cert"),
             (ssl.SSLError("SSLV3_ALERT_BAD_CERTIFICATE"), "handshake_rejected"),
@@ -149,18 +164,29 @@ class EnvNetworkUnitTest(unittest.TestCase):
     def test_wrong_check_selection_is_rejected_by_parser(self):
         parser = env_network.build_parser()
         with self.assertRaises(SystemExit):
-            parser.parse_args([
-                "client",
-                "--source-ip", "127.0.0.1",
-                "--target-ip", "127.0.0.1",
-                "--port", "19566",
-                "--tls-port", "19567",
-                "--ca", "ca.pem",
-                "--client-cert", "client.pem",
-                "--client-key", "client.key",
-                "--server-hostname", "afs-env-a",
-                "--check", "bogus",
-            ])
+            parser.parse_args(
+                [
+                    "client",
+                    "--source-ip",
+                    "127.0.0.1",
+                    "--target-ip",
+                    "127.0.0.1",
+                    "--port",
+                    "19566",
+                    "--tls-port",
+                    "19567",
+                    "--ca",
+                    "ca.pem",
+                    "--client-cert",
+                    "client.pem",
+                    "--client-key",
+                    "client.key",
+                    "--server-hostname",
+                    "afs-env-a",
+                    "--check",
+                    "bogus",
+                ]
+            )
 
     def test_connect_tcp_closes_socket_on_connect_failure(self):
         made = []
@@ -168,6 +194,8 @@ class EnvNetworkUnitTest(unittest.TestCase):
         class FakeSocket:
             def __init__(self, *args):
                 self.closed = False
+                self.timeout = None
+                self.bound = None
                 made.append(self)
 
             def settimeout(self, timeout):

@@ -21,9 +21,9 @@ import sys
 import threading
 import time
 import uuid
+from ipaddress import IPv6Address, ip_address
 from pathlib import Path
 from typing import Any
-from ipaddress import ip_address, IPv6Address
 
 RPING = Path("/usr/bin/rping")
 EXPECTED_RPING_SHA256 = "d4d82fdd9b78cfb9404bbb4c2a8c07dde9d450d7fd4d7041d5d0ffcf32e3e89f"
@@ -63,7 +63,12 @@ def read_text(path: Path, limit: int = 65536) -> str | None:
 def run_cmd(argv: list[str], timeout: float = 3.0) -> dict[str, Any]:
     try:
         proc = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, check=False)
-        return {"argv": argv, "returncode": proc.returncode, "stdout": proc.stdout.decode("utf-8", "replace"), "stderr": proc.stderr.decode("utf-8", "replace")}
+        return {
+            "argv": argv,
+            "returncode": proc.returncode,
+            "stdout": proc.stdout.decode("utf-8", "replace"),
+            "stderr": proc.stderr.decode("utf-8", "replace"),
+        }
     except Exception as exc:  # pragma: no cover - exact exception type is not material evidence.
         return {"argv": argv, "error": repr(exc)}
 
@@ -105,7 +110,13 @@ def wait_rping_identity(pid: int, deadline: float = 1.5) -> dict[str, Any]:
 
 
 def host_identity() -> dict[str, Any]:
-    return {"hostname": platform.node(), "kernel": platform.release(), "machine": platform.machine(), "boot_id": read_text(Path("/proc/sys/kernel/random/boot_id")), "machine_id": read_text(Path("/etc/machine-id"))}
+    return {
+        "hostname": platform.node(),
+        "kernel": platform.release(),
+        "machine": platform.machine(),
+        "boot_id": read_text(Path("/proc/sys/kernel/random/boot_id")),
+        "machine_id": read_text(Path("/etc/machine-id")),
+    }
 
 
 def rdma_inventory(bind: str, peer: str, gid_index: int = DEFAULT_GID) -> dict[str, Any]:
@@ -116,7 +127,9 @@ def rdma_inventory(bind: str, peer: str, gid_index: int = DEFAULT_GID) -> dict[s
         "binary": {"path": str(RPING), "sha256": sha256_file(RPING), "expected_sha256": EXPECTED_RPING_SHA256},
         "installed_provider": {
             "ldconfig": run_cmd(["/sbin/ldconfig", "-p"], timeout=2.0),
-            "libibverbs": run_cmd(["dpkg-query", "-W", "-f=${Package} ${Version}\\n", "libibverbs1:arm64"], timeout=2.0),
+            "libibverbs": run_cmd(
+                ["dpkg-query", "-W", "-f=${Package} ${Version}\\n", "libibverbs1:arm64"], timeout=2.0
+            ),
             "rdma_core": run_cmd(["dpkg-query", "-W", "-f=${Package} ${Version}\\n", "rdma-core"], timeout=2.0),
             "libibverbs_so_sha256": next((sha256_file(p) for p in lib_paths if p.exists()), None),
             "rxe_provider_so_sha256": next((sha256_file(p) for p in rxe_paths if p.exists()), None),
@@ -135,7 +148,12 @@ def rdma_inventory(bind: str, peer: str, gid_index: int = DEFAULT_GID) -> dict[s
 
 
 def resources_snapshot() -> dict[str, Any]:
-    return {"rdma_link": run_cmd(["rdma", "link"], timeout=2.0), "rdma_resource": run_cmd(["rdma", "resource", "show"], timeout=2.0), "rdma_qp_json": run_cmd(["rdma", "-j", "resource", "show", "qp"], timeout=2.0), "rdma_cm_id_json": run_cmd(["rdma", "-j", "resource", "show", "cm_id"], timeout=2.0)}
+    return {
+        "rdma_link": run_cmd(["rdma", "link"], timeout=2.0),
+        "rdma_resource": run_cmd(["rdma", "resource", "show"], timeout=2.0),
+        "rdma_qp_json": run_cmd(["rdma", "-j", "resource", "show", "qp"], timeout=2.0),
+        "rdma_cm_id_json": run_cmd(["rdma", "-j", "resource", "show", "cm_id"], timeout=2.0),
+    }
 
 
 def expected_payload(index: int, size: int) -> bytes:
@@ -178,8 +196,14 @@ def validate_run_args(args: argparse.Namespace) -> None:
 
 
 def parse_descriptors(text: str) -> dict[str, list[tuple[int, int, int]]]:
-    client = [(int(a, 16), int(r, 16), int(s)) for a, r, s in re.findall(r"RDMA addr ([0-9a-fA-F]+) rkey ([0-9a-fA-F]+) len (\d+)", text)]
-    server = [(int(a, 16), int(r, 16), int(s)) for r, a, s in re.findall(r"Received rkey ([0-9a-fA-F]+) addr ([0-9a-fA-F]+) len (\d+) from peer", text)]
+    client = [
+        (int(a, 16), int(r, 16), int(s))
+        for a, r, s in re.findall(r"RDMA addr ([0-9a-fA-F]+) rkey ([0-9a-fA-F]+) len (\d+)", text)
+    ]
+    server = [
+        (int(a, 16), int(r, 16), int(s))
+        for r, a, s in re.findall(r"Received rkey ([0-9a-fA-F]+) addr ([0-9a-fA-F]+) len (\d+) from peer", text)
+    ]
     return {"client": client, "server": server}
 
 
@@ -207,9 +231,16 @@ def parse_log(text: str, role: str, size: int, count: int) -> dict[str, Any]:
         "payload_sha256": [sha256_bytes((p + "\x00").encode("ascii", "replace")) for p in payloads],
         "completions": completions,
         "descriptors": parse_descriptors(text),
-        "has_established": bool(re.search(r"^cma_event type RDMA_CM_EVENT_ESTABLISHED cma_id 0x[0-9a-f]+ \((parent|child)\)$", text, re.M)),
-        "has_disconnect": bool(re.search(r"^cma_event type RDMA_CM_EVENT_DISCONNECTED cma_id 0x[0-9a-f]+ \((parent|child)\)$", text, re.M)),
-        "has_cleanup": bool(re.search(r"^rping_free_buffers called on cb 0x[0-9a-f]+$", text, re.M) and re.search(r"^destroy cm_id 0x[0-9a-f]+$", text, re.M)),
+        "has_established": bool(
+            re.search(r"^cma_event type RDMA_CM_EVENT_ESTABLISHED cma_id 0x[0-9a-f]+ \((parent|child)\)$", text, re.M)
+        ),
+        "has_disconnect": bool(
+            re.search(r"^cma_event type RDMA_CM_EVENT_DISCONNECTED cma_id 0x[0-9a-f]+ \((parent|child)\)$", text, re.M)
+        ),
+        "has_cleanup": bool(
+            re.search(r"^rping_free_buffers called on cb 0x[0-9a-f]+$", text, re.M)
+            and re.search(r"^destroy cm_id 0x[0-9a-f]+$", text, re.M)
+        ),
         "allowed_server_tail": role == "server" and allowed_tail in text,
         "error_lines": error_lines,
     }
@@ -237,7 +268,12 @@ def inventory_ok(ep: dict[str, Any], problems: list[str], name: str) -> None:
     route = inv.get("route", {}).get("stdout", "")
     tokens = route.splitlines()[0].split() if route.splitlines() else []
     fields = {key: tokens[i + 1] for i, key in enumerate(tokens[:-1]) if key in {"from", "src", "prefsrc", "dev"}}
-    if not tokens or tokens[0] != ep.get("peer") or fields.get("dev") != "eth0" or not any(fields.get(key) == ep.get("bind") for key in ("from", "src", "prefsrc")):
+    if (
+        not tokens
+        or tokens[0] != ep.get("peer")
+        or fields.get("dev") != "eth0"
+        or not any(fields.get(key) == ep.get("bind") for key in ("from", "src", "prefsrc"))
+    ):
         problems.append(f"{name} route is not source-bound")
     sysfs = inv.get("sysfs", {})
     if str(sysfs.get("eth0_mtu", "")).strip() != "1500":
@@ -288,7 +324,12 @@ def evaluate_pair(client: dict[str, Any], server: dict[str, Any]) -> dict[str, A
             if not isinstance(ep.get("run_id"), str) or not ep["run_id"]:
                 raise VerbsError("endpoint evidence requires a concrete run UUID")
             uuid.UUID(ep["run_id"])
-            validate_run_args(argparse.Namespace(**{key: ep[key] for key in ("run_id", "bind", "peer", "port", "size", "count")}, timeout=ep["timeout_seconds"]))
+            validate_run_args(
+                argparse.Namespace(
+                    **{key: ep[key] for key in ("run_id", "bind", "peer", "port", "size", "count")},
+                    timeout=ep["timeout_seconds"],
+                )
+            )
         endpoint_identity_ok(client, server, problems)
         for name, ep in (("client", client), ("server", server)):
             if ep.get("returncode") != 0:
@@ -305,13 +346,21 @@ def evaluate_pair(client: dict[str, Any], server: dict[str, Any]) -> dict[str, A
                 problems.append("server RDMA READ/WRITE completions missing")
             if name == "client" and (parsed["completions"]["read"] or parsed["completions"]["write"]):
                 problems.append("client unexpectedly reports RDMA READ/WRITE completions")
-            if not parsed["has_established"] or not parsed["has_cleanup"] or (name == "server" and not parsed["has_disconnect"]):
+            if (
+                not parsed["has_established"]
+                or not parsed["has_cleanup"]
+                or (name == "server" and not parsed["has_disconnect"])
+            ):
                 problems.append(f"{name} connection lifecycle evidence missing")
             if parsed["error_lines"]:
                 problems.append(f"{name} error lines present")
         c_desc = client["parsed"]["descriptors"]["client"]
         s_desc = server["parsed"]["descriptors"]["server"]
-        if any(not (0 <= a <= 2**64 - 1 and 0 <= r <= 2**32 - 1 and s == size) for descs in (c_desc, s_desc) for a, r, s in descs):
+        if any(
+            not (0 <= a <= 2**64 - 1 and 0 <= r <= 2**32 - 1 and s == size)
+            for descs in (c_desc, s_desc)
+            for a, r, s in descs
+        ):
             problems.append("descriptor values out of bounds")
         if len(c_desc) != count * 2 or len(s_desc) != count * 2:
             problems.append("descriptor advertisements missing")
@@ -322,8 +371,17 @@ def evaluate_pair(client: dict[str, Any], server: dict[str, Any]) -> dict[str, A
     return {
         "status": "FAIL" if problems else "PASS",
         "problems": problems,
-        "descriptor_sha256": [descriptor_sha(d) for d in c_desc[: count * 2] if 0 <= d[0] <= 2**64 - 1 and 0 <= d[1] <= 2**32 - 1 and 0 <= d[2] <= 2**32 - 1],
-        "limitations": ["stock rping server does not authorize peer source; client source binding and descriptor receipt are recorded"],
+        "descriptor_sha256": [
+            descriptor_sha(d)
+            for d in c_desc[: count * 2]
+            if 0 <= d[0] <= 2**64 - 1 and 0 <= d[1] <= 2**32 - 1 and 0 <= d[2] <= 2**32 - 1
+        ],
+        "limitations": [
+            (
+                "stock rping server does not authorize peer source; client "
+                "source binding and descriptor receipt are recorded"
+            )
+        ],
     }
 
 
@@ -360,7 +418,8 @@ def run_endpoint(args: argparse.Namespace) -> int:
     chunks: list[bytes] = []
 
     def reader() -> None:
-        assert proc.stdout is not None
+        if not proc.stdout is not None:
+            raise AssertionError("proc.stdout is not None")
         with raw_path.open("xb") as f:
             for chunk in iter(lambda: proc.stdout.readline(), b""):
                 chunks.append(chunk)
@@ -452,4 +511,4 @@ if __name__ == "__main__":
         raise SystemExit(main())
     except VerbsError as exc:
         print(f"env_verbs: {exc}", file=sys.stderr)
-        raise SystemExit(2)
+        raise SystemExit(2) from exc

@@ -10,6 +10,7 @@ they are readable.
 The script does not signal, restart, or inspect AFS processes.  Runtime identity
 and fault injection remain the orchestrator's responsibility.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -24,7 +25,6 @@ import time
 import traceback
 from pathlib import Path
 from typing import Any
-
 
 SCHEMA = "afs.owner_restart.v1"
 DEFAULT_PAYLOAD_SIZE = 64 * 1024
@@ -122,7 +122,12 @@ def _write_json_atomic(path: Path, value: dict[str, Any]) -> None:
     data = json.dumps(value, indent=2, sort_keys=True) + "\n"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        try:
+            handle = os.fdopen(fd, "w", encoding="utf-8")
+        except BaseException:
+            os.close(fd)
+            raise
+        with handle:
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
@@ -361,8 +366,10 @@ def check_main(args: argparse.Namespace) -> int:
     expected_sha = str(expected_payload.get("sha256", ""))
     started = time.monotonic()
     previous = signal.getsignal(signal.SIGALRM)
+
     def on_alarm(_signum: int, _frame: Any) -> None:
         raise TimeoutError(f"recovery read exceeded {args.open_timeout} seconds")
+
     signal.signal(signal.SIGALRM, on_alarm)
     signal.setitimer(signal.ITIMER_REAL, args.open_timeout)
     result = {
@@ -378,15 +385,25 @@ def check_main(args: argparse.Namespace) -> int:
         data = _read_file_once(target)
         actual = {"length": len(data), "sha256": _sha256_bytes(data)}
         ok = actual["length"] == expected_size and actual["sha256"] == expected_sha
-        result.update(status="PASS" if ok else "MISMATCH", actual=actual,
-                      attempts=[{"event": "read", "ok": True, "target_stat": _stat_record(target)}])
+        result.update(
+            status="PASS" if ok else "MISMATCH",
+            actual=actual,
+            attempts=[{"event": "read", "ok": True, "target_stat": _stat_record(target)}],
+        )
     except TimeoutError as exc:
         result.update(status="READ_TIMEOUT", error=str(exc), attempts=[{"event": "timeout"}])
     except OSError as exc:
-        result.update(status="READ_ERROR", attempts=[{
-            "event": "open_or_read_error", "errno": exc.errno,
-            "errno_name": errno.errorcode.get(exc.errno, "UNKNOWN"), "message": str(exc),
-        }])
+        result.update(
+            status="READ_ERROR",
+            attempts=[
+                {
+                    "event": "open_or_read_error",
+                    "errno": exc.errno,
+                    "errno_name": errno.errorcode.get(exc.errno, "UNKNOWN"),
+                    "message": str(exc),
+                }
+            ],
+        )
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, previous)
@@ -437,7 +454,9 @@ def selftest_main(args: argparse.Namespace) -> int:
     waited_pid, status = os.waitpid(pid, 0)
     if waited_pid != pid or os.WEXITSTATUS(status) != 0:
         raise ProbeError(f"selftest writer failed with status {status}")
-    check_args = argparse.Namespace(target=str(target), ready_file=str(ready), result_file=str(check_result), open_timeout=5.0)
+    check_args = argparse.Namespace(
+        target=str(target), ready_file=str(ready), result_file=str(check_result), open_timeout=5.0
+    )
     check_rc = check_main(check_args)
     report = {
         "schema": SCHEMA,
@@ -470,7 +489,12 @@ def build_parser() -> argparse.ArgumentParser:
     checker.add_argument("--target", required=True, help="DFS path to open after restart")
     checker.add_argument("--ready-file", required=True, help="READY JSON produced by writer")
     checker.add_argument("--result-file", required=True, help="ext4 JSON file receiving recovery result")
-    checker.add_argument("--open-timeout", type=float, default=DEFAULT_CHECK_TIMEOUT_SECONDS, help="deadline for one fresh open/read; errors are not retried")
+    checker.add_argument(
+        "--open-timeout",
+        type=float,
+        default=DEFAULT_CHECK_TIMEOUT_SECONDS,
+        help="deadline for one fresh open/read; errors are not retried",
+    )
 
     selftest = sub.add_parser("selftest", help="run a Linux ext4 protocol selftest on an ordinary file")
     selftest.add_argument("--root", required=True, help="ext4 directory for selftest files")

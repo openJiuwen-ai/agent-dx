@@ -5,6 +5,7 @@ These tests are Linux-only because they exercise real fcntl ABI shape and a
 short ext4 primitive run.  They intentionally assert PRIMITIVE_PASS wording so
 future callers do not mistake the probe for product or full POSIX evidence.
 """
+
 from __future__ import annotations
 
 import importlib.util
@@ -18,7 +19,6 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
-
 
 PROBE = Path(__file__).resolve().with_name("native_lock_kernel.py")
 
@@ -49,9 +49,11 @@ class NativeLockKernelTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             work = Path(td).resolve()
             out = work / "out"
-            with patch.object(probe.platform, "machine", return_value="aarch64"), \
-                    patch.object(probe.os, "geteuid", return_value=0), \
-                    patch.object(probe, "F_OFD_GETLK", None):
+            with (
+                patch.object(probe.platform, "machine", return_value="aarch64"),
+                patch.object(probe.os, "geteuid", return_value=0),
+                patch.object(probe, "F_OFD_GETLK", None),
+            ):
                 with self.assertRaisesRegex(RuntimeError, "missing F_OFD"):
                     probe.run_probe(work, out)
 
@@ -63,8 +65,10 @@ class NativeLockKernelTests(unittest.TestCase):
             out.mkdir()
             sentinel = out / "sentinel.txt"
             sentinel.write_text("keep\n", encoding="utf-8")
-            with patch.object(probe.platform, "machine", return_value="aarch64"), \
-                    patch.object(probe.os, "geteuid", return_value=0):
+            with (
+                patch.object(probe.platform, "machine", return_value="aarch64"),
+                patch.object(probe.os, "geteuid", return_value=0),
+            ):
                 with self.assertRaisesRegex(RuntimeError, "fresh"):
                     probe.run_probe(work, out)
             self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep\n")
@@ -74,8 +78,10 @@ class NativeLockKernelTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             work = Path(td).resolve()
             out = work / "out"
-            with patch.object(probe.platform, "machine", return_value="x86_64"), \
-                    patch.object(probe.subprocess, "check_output") as command:
+            with (
+                patch.object(probe.platform, "machine", return_value="x86_64"),
+                patch.object(probe.subprocess, "check_output") as command,
+            ):
                 with self.assertRaisesRegex(RuntimeError, "requires aarch64"):
                     probe.run_probe(work, out)
                 command.assert_not_called()
@@ -95,11 +101,7 @@ class NativeLockKernelTests(unittest.TestCase):
 
     def test_child_result_followed_by_exit_one_is_rejected(self) -> None:
         probe = load_probe_module()
-        fake = (
-            "import json, sys\n"
-            "print(json.dumps({'event':'RESULT','result':{'ok':True}}), flush=True)\n"
-            "sys.exit(1)\n"
-        )
+        fake = "import json, sys\nprint(json.dumps({'event':'RESULT','result':{'ok':True}}), flush=True)\nsys.exit(1)\n"
         with patch.object(probe, "child_argv", return_value=[sys.executable, "-c", fake]):
             with self.assertRaisesRegex(RuntimeError, "child exited nonzero"):
                 probe.run_child(Path("/tmp/unused"), "try", 1, 0, 1)
@@ -115,7 +117,10 @@ class NativeLockKernelTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "exact owner pid"):
             probe.assert_lock_seen(bad_pid, "guard", lock_type="F_WRLCK", start=0, length=100, pid=-1)
 
-    @unittest.skipUnless(platform.machine() == "aarch64" and os.geteuid() == 0 and shutil.which("findmnt"), "full primitive requires root aarch64 Linux")
+    @unittest.skipUnless(
+        platform.machine() == "aarch64" and os.geteuid() == 0 and shutil.which("findmnt"),
+        "full primitive requires root aarch64 Linux",
+    )
     def test_ext4_primitive_pass_records_raw_lock_facts(self) -> None:
         with tempfile.TemporaryDirectory(dir="/var/tmp") as td:
             root = Path(td)

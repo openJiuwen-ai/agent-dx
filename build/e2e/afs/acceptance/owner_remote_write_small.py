@@ -5,18 +5,19 @@ This records bounded 64 MiB write samples only. It is diagnostic data, not a
 MooseFS parity or durable-ACK qualification. The parent owns cross-node B mount
 readback and environment capacity checks.
 """
+
 from __future__ import annotations
 
 import argparse
 import hashlib
 import json
 import os
-from pathlib import Path
 import platform
 import re
 import stat
 import subprocess
 import time
+from pathlib import Path
 from typing import Any
 
 DATA_BYTES = 64 * 1024 * 1024
@@ -75,7 +76,14 @@ def validate_output_path(path: Path) -> None:
 
 def stat_identity(path: Path) -> dict[str, Any]:
     st = path.stat()
-    return {"path": str(path), "device": st.st_dev, "inode": st.st_ino, "mode": stat.S_IMODE(st.st_mode), "uid": st.st_uid, "gid": st.st_gid}
+    return {
+        "path": str(path),
+        "device": st.st_dev,
+        "inode": st.st_ino,
+        "mode": stat.S_IMODE(st.st_mode),
+        "uid": st.st_uid,
+        "gid": st.st_gid,
+    }
 
 
 def find_mount(path: Path) -> dict[str, Any]:
@@ -105,7 +113,9 @@ def require_moose_mount(mount: dict[str, Any], expected_source: str) -> None:
     source = str(mount.get("source", ""))
     fstype = str(mount.get("fstype", ""))
     if fstype not in ("fuse", "fuse.mfs") or source != expected_source:
-        raise ValueError(f"moose root must be standard FUSE with exact caller-supplied MooseFS source {expected_source}: {mount}")
+        raise ValueError(
+            f"moose root must be standard FUSE with exact caller-supplied MooseFS source {expected_source}: {mount}"
+        )
 
 
 def validate_product_identity(product_source_commit: str, compiler_input_map: str) -> dict[str, str]:
@@ -177,12 +187,28 @@ def validate_write_result(record: dict[str, Any]) -> None:
 
 def run_io_write(io_tool: Path, payload: Path) -> dict[str, Any]:
     argv = [
-        str(io_tool), str(payload), "seq-write", str(DATA_BYTES), str(BLOCK_BYTES), str(CONCURRENCY),
-        "fdatasync", str(DATA_BYTES), str(PATTERN_BYTE), "create", "unobserved",
+        str(io_tool),
+        str(payload),
+        "seq-write",
+        str(DATA_BYTES),
+        str(BLOCK_BYTES),
+        str(CONCURRENCY),
+        "fdatasync",
+        str(DATA_BYTES),
+        str(PATTERN_BYTE),
+        "create",
+        "unobserved",
     ]
     began = time.monotonic_ns()
     completed = subprocess.run(argv, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    record: dict[str, Any] = {"argv": argv, "rc": completed.returncode, "stdout": completed.stdout, "stderr": completed.stderr, "elapsed_ns": time.monotonic_ns() - began, "status": "FAIL"}
+    record: dict[str, Any] = {
+        "argv": argv,
+        "rc": completed.returncode,
+        "stdout": completed.stdout,
+        "stderr": completed.stderr,
+        "elapsed_ns": time.monotonic_ns() - began,
+        "status": "FAIL",
+    }
     try:
         result = json.loads(completed.stdout)
         record["result"] = result
@@ -202,7 +228,14 @@ def verify_content(path: Path) -> dict[str, Any]:
         tail = handle.read(1)
     digest = hashlib.sha256(data).hexdigest()
     status = "PASS" if len(data) == DATA_BYTES and tail == b"" and digest == EXPECTED_SHA256 else "FAIL"
-    return {"status": status, "path": str(path), "bytes": len(data), "sha256": digest, "expected_sha256": EXPECTED_SHA256, "tail_empty": tail == b""}
+    return {
+        "status": status,
+        "path": str(path),
+        "bytes": len(data),
+        "sha256": digest,
+        "expected_sha256": EXPECTED_SHA256,
+        "tail_empty": tail == b"",
+    }
 
 
 def paired_order(round_index: int) -> list[str]:
@@ -213,9 +246,17 @@ def sample_name(target: str, round_index: int) -> str:
     return f"{target}-write-r{round_index:02d}-payload64m.bin"
 
 
-def run_sample(root: Path, target: str, round_index: int, measured: bool, io_tool: Path, output: Path) -> dict[str, Any]:
+def run_sample(
+    root: Path, target: str, round_index: int, measured: bool, io_tool: Path, output: Path
+) -> dict[str, Any]:
     payload = root / sample_name(target, round_index)
-    record: dict[str, Any] = {"target": target, "round": round_index, "measured": measured, "path": str(payload), "status": "FAIL"}
+    record: dict[str, Any] = {
+        "target": target,
+        "round": round_index,
+        "measured": measured,
+        "path": str(payload),
+        "status": "FAIL",
+    }
     try:
         if payload.exists():
             raise FileExistsError(str(payload))
@@ -242,7 +283,12 @@ def run_rounds(owner_root: Path, moose_root: Path, io_tool: Path, output: Path) 
         for target in paired_order(index):
             root = owner_root if target == "owner" else moose_root
             samples.append(run_sample(root, target, index, index >= WARMUP_ROUNDS, io_tool, output))
-        round_record = {"round": index, "measured": index >= WARMUP_ROUNDS, "order": paired_order(index), "samples": samples}
+        round_record = {
+            "round": index,
+            "measured": index >= WARMUP_ROUNDS,
+            "order": paired_order(index),
+            "samples": samples,
+        }
         write_json(output / f"round-{index:02d}.json", round_record)
         rounds.append(round_record)
     return rounds
@@ -258,7 +304,12 @@ def write_status(rounds: list[dict[str, Any]]) -> str:
         if not isinstance(samples, list) or len(samples) != 2:
             return "FAIL"
         for sample in samples:
-            if sample.get("status") != "PASS" or sample.get("write", {}).get("verify", {}).get("status") != "PASS" or sample.get("content_verify", {}).get("status") != "PASS" or sample.get("dir_fsync") is not True:
+            if (
+                sample.get("status") != "PASS"
+                or sample.get("write", {}).get("verify", {}).get("status") != "PASS"
+                or sample.get("content_verify", {}).get("status") != "PASS"
+                or sample.get("dir_fsync") is not True
+            ):
                 return "FAIL"
     return "DATA_RECORDED"
 
@@ -269,7 +320,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "scope": "small OwnerFs remote write vs MooseFS write diagnostic; not parity or durability qualification",
         "cache_state": "unobserved",
         "moose_strong_durable_ack": "BLOCKED_PARENT_BASELINE",
-        "shape": {"bytes": DATA_BYTES, "block_bytes": BLOCK_BYTES, "concurrency": CONCURRENCY, "pattern_byte": PATTERN_BYTE, "warmups": WARMUP_ROUNDS, "measurements": MEASUREMENT_ROUNDS},
+        "shape": {
+            "bytes": DATA_BYTES,
+            "block_bytes": BLOCK_BYTES,
+            "concurrency": CONCURRENCY,
+            "pattern_byte": PATTERN_BYTE,
+            "warmups": WARMUP_ROUNDS,
+            "measurements": MEASUREMENT_ROUNDS,
+        },
     }
     output: Path | None = None
     output_created = False

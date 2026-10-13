@@ -1,12 +1,13 @@
 """Guard tests for owner_remote_small diagnostic evidence shape."""
+
 from __future__ import annotations
 
 import importlib.util
-from pathlib import Path
 import subprocess
 import tempfile
-from types import SimpleNamespace
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 spec = importlib.util.spec_from_file_location("owner_remote_small", Path(__file__).with_name("owner_remote_small.py"))
@@ -54,11 +55,23 @@ def read_result(**overrides: object) -> dict[str, object]:
 
 class OwnerRemoteSmallGuardTests(unittest.TestCase):
     def test_raw_case_stops_at_first_failed_probe_and_keeps_evidence(self) -> None:
-        failure = {"target": "owner", "round": 0, "measured": False,
-                   "status": "FAIL", "rc": 2, "stdout": "", "stderr": "residency mapping: No such device"}
+        failure = {
+            "target": "owner",
+            "round": 0,
+            "measured": False,
+            "status": "FAIL",
+            "rc": 2,
+            "stdout": "",
+            "stderr": "residency mapping: No such device",
+        }
         with tempfile.TemporaryDirectory() as tmp:
-            inputs = {"io_tool": Path("/io"), "owner_read_file": Path("/owner"),
-                      "moose_read_file": Path("/moose"), "raw_latency": True, "read_cache": "repeat"}
+            inputs = {
+                "io_tool": Path("/io"),
+                "owner_read_file": Path("/owner"),
+                "moose_read_file": Path("/moose"),
+                "raw_latency": True,
+                "read_cache": "repeat",
+            }
             with mock.patch.object(owner_remote_small, "run_io_read", return_value=failure) as probe:
                 rounds = owner_remote_small.run_read_rounds(inputs, Path(tmp))
             self.assertEqual(probe.call_count, 1)
@@ -98,7 +111,9 @@ class OwnerRemoteSmallGuardTests(unittest.TestCase):
         )
         cases = [
             with_latency(read_result(cache_requested="repeat", residency_observed=True), latency_values()[:-1]),
-            with_latency(read_result(cache_requested="repeat", residency_observed=True), list(reversed(latency_values()))),
+            with_latency(
+                read_result(cache_requested="repeat", residency_observed=True), list(reversed(latency_values()))
+            ),
             with_latency(read_result(cache_requested="repeat", residency_observed=True), [True] + latency_values()[1:]),
             with_latency(read_result(cache_requested="repeat", residency_observed=True), [0] + latency_values()[1:]),
             {
@@ -120,7 +135,10 @@ class OwnerRemoteSmallGuardTests(unittest.TestCase):
         for mutated in (
             {"operations": float(owner_remote_small.READ_BYTES // owner_remote_small.READ_BLOCK_BYTES)},
             {"wall_ns": True},
-            {"p95_ns": True, "latency_samples_ns": [1] * (owner_remote_small.READ_BYTES // owner_remote_small.READ_BLOCK_BYTES)},
+            {
+                "p95_ns": True,
+                "latency_samples_ns": [1] * (owner_remote_small.READ_BYTES // owner_remote_small.READ_BLOCK_BYTES),
+            },
         ):
             record = with_latency(read_result(cache_requested="repeat", residency_observed=True))
             record.update(mutated)
@@ -137,7 +155,9 @@ class OwnerRemoteSmallGuardTests(unittest.TestCase):
             }
             calls: list[dict[str, object]] = []
 
-            def fake_run_io_read(io_tool: Path, read_file: Path, label: str, round_index: int, measured: bool, **kwargs: object) -> dict[str, object]:
+            def fake_run_io_read(
+                io_tool: Path, read_file: Path, label: str, round_index: int, measured: bool, **kwargs: object
+            ) -> dict[str, object]:
                 calls.append({"label": label, "kwargs": kwargs, "read_file": read_file})
                 return {"status": "PASS", "verify": {"status": "PASS"}}
 
@@ -145,7 +165,9 @@ class OwnerRemoteSmallGuardTests(unittest.TestCase):
                 rounds = owner_remote_small.run_read_rounds(read_inputs, output)
 
             self.assertEqual(len(rounds), owner_remote_small.WARMUP_ROUNDS + owner_remote_small.MEASUREMENT_ROUNDS)
-            self.assertEqual(calls[0]["kwargs"], {"raw_latency": False, "read_cache": owner_remote_small.READ_DEFAULT_CACHE})
+            self.assertEqual(
+                calls[0]["kwargs"], {"raw_latency": False, "read_cache": owner_remote_small.READ_DEFAULT_CACHE}
+            )
 
     def test_repeat_cache_requires_raw_latency_and_raw_tool_identity(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -179,7 +201,9 @@ class OwnerRemoteSmallGuardTests(unittest.TestCase):
                 owner_remote_small.validate_read_inputs(args, owner_root, moose_root)
 
             args.raw_latency = True
-            with mock.patch.object(owner_remote_small, "sha256_file", return_value=owner_remote_small.RAW_LATENCY_IO_TOOL_SHA256):
+            with mock.patch.object(
+                owner_remote_small, "sha256_file", return_value=owner_remote_small.RAW_LATENCY_IO_TOOL_SHA256
+            ):
                 result = owner_remote_small.validate_read_inputs(args, owner_root, moose_root)
             self.assertTrue(result["raw_latency"])
             self.assertEqual(result["read_cache"], "repeat")
@@ -238,16 +262,26 @@ class OwnerRemoteSmallGuardTests(unittest.TestCase):
         ]
         self.assertEqual(owner_remote_small.compute_status(rounds, [], "delete"), "FAIL")
 
-
     def test_missing_rounds_do_not_record_data(self) -> None:
-        one_round = [{"samples": [{"status": "PASS", "cleanup": {"status": "PASS"}}, {"status": "PASS", "cleanup": {"status": "PASS"}}]}]
+        one_round = [
+            {
+                "samples": [
+                    {"status": "PASS", "cleanup": {"status": "PASS"}},
+                    {"status": "PASS", "cleanup": {"status": "PASS"}},
+                ]
+            }
+        ]
         self.assertEqual(owner_remote_small.delete_status(one_round), "FAIL")
         self.assertEqual(owner_remote_small.read_status(one_round), "FAIL")
 
-
     def test_all_requires_read_rounds_before_data_recorded(self) -> None:
         rounds = [
-            {"samples": [{"status": "PASS", "cleanup": {"status": "PASS"}}, {"status": "PASS", "cleanup": {"status": "PASS"}}]}
+            {
+                "samples": [
+                    {"status": "PASS", "cleanup": {"status": "PASS"}},
+                    {"status": "PASS", "cleanup": {"status": "PASS"}},
+                ]
+            }
             for _ in range(owner_remote_small.WARMUP_ROUNDS + owner_remote_small.MEASUREMENT_ROUNDS)
         ]
         self.assertEqual(owner_remote_small.delete_status(rounds), "DATA_RECORDED")

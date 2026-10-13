@@ -5,14 +5,14 @@ The former evaluator recognized one historical lab only and could not grant
 full qualification. Its raw observations and implementation are archived
 outside the source tree. A portable full verifier remains a separate task.
 """
+
 from __future__ import annotations
 
 import argparse
 import hashlib
 import json
-from pathlib import Path
 import re
-
+from pathlib import Path
 
 FULL_BLOCKER = "portable full environment verifier is not implemented; full acceptance remains BLOCKED"
 

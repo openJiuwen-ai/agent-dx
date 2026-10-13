@@ -7,6 +7,7 @@ identity, and expected healthy/degraded scenarios. It is fail-closed: no binding
 loose identity, arbitrary HTTP responses, missing raw artifacts, or incomplete
 component coverage cannot produce PASS.
 """
+
 from __future__ import annotations
 
 import datetime as dt
@@ -35,7 +36,15 @@ COMPONENT_CHECKS = {
 BINDING_KEYS = {"case_id", "profile", "matrix", "target", "scenarios"}
 TARGET_KEYS = {"role", "id", "scope", "backend", "process"}
 PROCESS_KEYS = {"pid", "executable_name", "exe_sha256", "boot_id", "config_sha256"}
-SCENARIO_KEYS = {"name", "component", "url", "expected_ready", "expected_http_status", "timeout_seconds", "expected_scope"}
+SCENARIO_KEYS = {
+    "name",
+    "component",
+    "url",
+    "expected_ready",
+    "expected_http_status",
+    "timeout_seconds",
+    "expected_scope",
+}
 
 
 class BindingError(RuntimeError):
@@ -68,7 +77,11 @@ def write_json(path: Path, value: Any, run_dir: Path) -> dict[str, Any]:
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     resolved = path.resolve()
     relative = resolved.relative_to(run_dir.resolve())
-    return {"artifact": str(relative), "artifact_bytes": resolved.stat().st_size, "artifact_sha256": sha256_file(resolved)}
+    return {
+        "artifact": str(relative),
+        "artifact_bytes": resolved.stat().st_size,
+        "artifact_sha256": sha256_file(resolved),
+    }
 
 
 def matrix_from_env(env: dict[str, str]) -> dict[str, str]:
@@ -117,7 +130,9 @@ def select_binding(path: Path, case_id: str, profile: str, matrix: dict[str, str
     if not matches:
         raise BindingError(f"no health binding for {case_id} with exact matrix {json.dumps(matrix, sort_keys=True)}")
     if len(matches) > 1:
-        raise BindingError(f"ambiguous health bindings for {case_id} with exact matrix {json.dumps(matrix, sort_keys=True)}")
+        raise BindingError(
+            f"ambiguous health bindings for {case_id} with exact matrix {json.dumps(matrix, sort_keys=True)}"
+        )
     return matches[0]
 
 
@@ -146,7 +161,9 @@ def validate_target(binding: dict[str, Any], matrix: dict[str, str]) -> dict[str
             raise BindingError(f"target.{key} is required")
     expected_backend = matrix.get("backend")
     if target.get("backend") != expected_backend:
-        raise BindingError(f"target.backend {target.get('backend')!r} does not match matrix backend {expected_backend!r}")
+        raise BindingError(
+            f"target.backend {target.get('backend')!r} does not match matrix backend {expected_backend!r}"
+        )
     process = target.get("process")
     if not isinstance(process, dict):
         raise BindingError("target.process must be an object with exact local process identity")
@@ -170,7 +187,9 @@ def validate_target(binding: dict[str, Any], matrix: dict[str, str]) -> dict[str
     return target
 
 
-def validate_binding(binding: dict[str, Any], profile: str, matrix: dict[str, str]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+def validate_binding(
+    binding: dict[str, Any], profile: str, matrix: dict[str, str]
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     target = validate_target(binding, matrix)
     scenarios = binding.get("scenarios")
     if not isinstance(scenarios, list) or not scenarios:
@@ -207,18 +226,22 @@ def validate_binding(binding: dict[str, Any], profile: str, matrix: dict[str, st
             raise BindingError(f"scenario {name!r} expected_scope must be one of {sorted(VALID_SCOPES)}")
         if component != "all" and expected_ready is False:
             degraded_components.add(str(component))
-        normalized.append({
-            "name": name,
-            "component": component,
-            "url": validate_url(scenario.get("url"), f"scenario {name!r} url"),
-            "expected_ready": expected_ready,
-            "expected_status": int(expected_status),
-            "timeout_seconds": float(timeout),
-            "expected_scope": expected_scope,
-        })
+        normalized.append(
+            {
+                "name": name,
+                "component": component,
+                "url": validate_url(scenario.get("url"), f"scenario {name!r} url"),
+                "expected_ready": expected_ready,
+                "expected_status": int(expected_status),
+                "timeout_seconds": float(timeout),
+                "expected_scope": expected_scope,
+            }
+        )
     if profile == "full" and degraded_components != VALID_COMPONENTS:
         missing = sorted(VALID_COMPONENTS - degraded_components)
-        raise BindingError(f"full OPS-01 binding must include degraded scenarios for every component; missing {missing}")
+        raise BindingError(
+            f"full OPS-01 binding must include degraded scenarios for every component; missing {missing}"
+        )
     if profile == "smoke" and not degraded_components:
         raise BindingError("smoke OPS-01 binding must include at least one degraded component scenario")
     return target, normalized
@@ -281,7 +304,11 @@ def target_identity_check(target: dict[str, Any], run_dir: Path) -> dict[str, An
         errors.append("target process boot_id mismatch")
     if process.get("config_sha256") is not None and observed.get("config_sha256") != process.get("config_sha256"):
         errors.append("target process config_sha256 mismatch")
-    artifact_meta = write_json(run_dir / "health" / "00-target-identity.json", {"expected": target, "observed": observed, "errors": errors}, run_dir)
+    artifact_meta = write_json(
+        run_dir / "health" / "00-target-identity.json",
+        {"expected": target, "observed": observed, "errors": errors},
+        run_dir,
+    )
     return {
         "name": "target-identity",
         "status": STATUS_PASS if not errors else STATUS_FAIL,
@@ -369,7 +396,9 @@ def endpoint_identity_errors(document: dict[str, Any], target: dict[str, Any], e
     return errors
 
 
-def validate_scenario(scenario: dict[str, Any], target: dict[str, Any], artifact: Path, run_dir: Path) -> dict[str, Any]:
+def validate_scenario(
+    scenario: dict[str, Any], target: dict[str, Any], artifact: Path, run_dir: Path
+) -> dict[str, Any]:
     record = fetch_json(scenario["url"], scenario["timeout_seconds"])
     artifact_meta = write_json(artifact, {"scenario": scenario, "target": target, "observation": record}, run_dir)
     evidence: dict[str, Any] = {
@@ -380,19 +409,48 @@ def validate_scenario(scenario: dict[str, Any], target: dict[str, Any], artifact
         "response_sha256": record.get("response_sha256"),
     }
     if record.get("error"):
-        return {"name": scenario["name"], "status": STATUS_BLOCKED, "evidence": {**evidence, "error": record["error"]}, **artifact_meta}
+        return {
+            "name": scenario["name"],
+            "status": STATUS_BLOCKED,
+            "evidence": {**evidence, "error": record["error"]},
+            **artifact_meta,
+        }
     document = record.get("json")
     if not isinstance(document, dict):
-        return {"name": scenario["name"], "status": STATUS_FAIL, "evidence": {**evidence, "decode_error": record.get("decode_error")}, **artifact_meta}
+        return {
+            "name": scenario["name"],
+            "status": STATUS_FAIL,
+            "evidence": {**evidence, "decode_error": record.get("decode_error")},
+            **artifact_meta,
+        }
     identity_errors = endpoint_identity_errors(document, target, scenario["expected_scope"])
     if identity_errors:
-        return {"name": scenario["name"], "status": STATUS_FAIL, "evidence": {**evidence, "identity_errors": identity_errors}, **artifact_meta}
+        return {
+            "name": scenario["name"],
+            "status": STATUS_FAIL,
+            "evidence": {**evidence, "identity_errors": identity_errors},
+            **artifact_meta,
+        }
     expected_status = scenario["expected_status"]
     if record.get("http_status") != expected_status:
-        return {"name": scenario["name"], "status": STATUS_FAIL, "evidence": {**evidence, "expected_http_status": expected_status}, **artifact_meta}
+        return {
+            "name": scenario["name"],
+            "status": STATUS_FAIL,
+            "evidence": {**evidence, "expected_http_status": expected_status},
+            **artifact_meta,
+        }
     top_ready = document.get("status") in {"ready", "foundation"}
     if top_ready != scenario["expected_ready"]:
-        return {"name": scenario["name"], "status": STATUS_FAIL, "evidence": {**evidence, "observed_status": document.get("status"), "expected_ready": scenario["expected_ready"]}, **artifact_meta}
+        return {
+            "name": scenario["name"],
+            "status": STATUS_FAIL,
+            "evidence": {
+                **evidence,
+                "observed_status": document.get("status"),
+                "expected_ready": scenario["expected_ready"],
+            },
+            **artifact_meta,
+        }
     component = scenario["component"]
     if component == "all":
         missing: list[str] = []
@@ -406,19 +464,47 @@ def validate_scenario(scenario: dict[str, Any], target: dict[str, Any], artifact
             elif ready is not True:
                 not_ready.append(item)
         if missing or (scenario["expected_ready"] and not_ready):
-            return {"name": scenario["name"], "status": STATUS_FAIL, "evidence": {**evidence, "missing": missing, "not_ready": not_ready, "observed": observed}, **artifact_meta}
-        return {"name": scenario["name"], "status": STATUS_PASS, "evidence": {**evidence, "components": sorted(VALID_COMPONENTS)}, **artifact_meta}
+            return {
+                "name": scenario["name"],
+                "status": STATUS_FAIL,
+                "evidence": {**evidence, "missing": missing, "not_ready": not_ready, "observed": observed},
+                **artifact_meta,
+            }
+        return {
+            "name": scenario["name"],
+            "status": STATUS_PASS,
+            "evidence": {**evidence, "components": sorted(VALID_COMPONENTS)},
+            **artifact_meta,
+        }
     ready, detail = component_ready(document, component)
     expected_component_ready = scenario["expected_ready"]
     if ready is None or ready != expected_component_ready:
-        return {"name": scenario["name"], "status": STATUS_FAIL, "evidence": {**evidence, "component": component, "component_ready": ready, "expected_component_ready": expected_component_ready, "detail": detail}, **artifact_meta}
-    return {"name": scenario["name"], "status": STATUS_PASS, "evidence": {**evidence, "component": component, "component_ready": ready}, **artifact_meta}
+        return {
+            "name": scenario["name"],
+            "status": STATUS_FAIL,
+            "evidence": {
+                **evidence,
+                "component": component,
+                "component_ready": ready,
+                "expected_component_ready": expected_component_ready,
+                "detail": detail,
+            },
+            **artifact_meta,
+        }
+    return {
+        "name": scenario["name"],
+        "status": STATUS_PASS,
+        "evidence": {**evidence, "component": component, "component_ready": ready},
+        **artifact_meta,
+    }
 
 
 def coverage(profile: str, checks: list[dict[str, Any]], scenarios: list[dict[str, Any]]) -> dict[str, Any]:
     refs: dict[str, str] = {}
     pass_names = {check["name"] for check in checks if check.get("status") == STATUS_PASS}
-    healthy = next((scenario for scenario in scenarios if scenario["component"] == "all" and scenario["expected_ready"]), None)
+    healthy = next(
+        (scenario for scenario in scenarios if scenario["component"] == "all" and scenario["expected_ready"]), None
+    )
     for scenario in scenarios:
         if scenario["component"] in VALID_COMPONENTS and scenario["name"] in pass_names:
             refs[scenario["component"]] = scenario["name"]
@@ -427,18 +513,42 @@ def coverage(profile: str, checks: list[dict[str, Any]], scenarios: list[dict[st
             refs.setdefault(component, healthy["name"])
     return {
         "profile": profile,
-        "axes": {"components": {"values": sorted(VALID_COMPONENTS), "checks": {component: refs.get(component, "") for component in sorted(VALID_COMPONENTS)}}},
+        "axes": {
+            "components": {
+                "values": sorted(VALID_COMPONENTS),
+                "checks": {component: refs.get(component, "") for component in sorted(VALID_COMPONENTS)},
+            }
+        },
     }
 
 
-def proof(case_id: str, profile: str, matrix: dict[str, str], checks: list[dict[str, Any]], scenarios: list[dict[str, Any]]) -> dict[str, Any]:
+def proof(
+    case_id: str, profile: str, matrix: dict[str, str], checks: list[dict[str, Any]], scenarios: list[dict[str, Any]]
+) -> dict[str, Any]:
     statuses = {str(check.get("status")) for check in checks}
     status = STATUS_PASS if statuses == {STATUS_PASS} else STATUS_BLOCKED if STATUS_BLOCKED in statuses else STATUS_FAIL
-    return {"case_id": case_id, "profile": profile, "matrix": matrix, "status": status, "reason": "", "checks": checks, "coverage": coverage(profile, checks, scenarios), "generated_at": utc()}
+    return {
+        "case_id": case_id,
+        "profile": profile,
+        "matrix": matrix,
+        "status": status,
+        "reason": "",
+        "checks": checks,
+        "coverage": coverage(profile, checks, scenarios),
+        "generated_at": utc(),
+    }
 
 
 def blocked(case_id: str, profile: str, matrix: dict[str, str], reason: str) -> dict[str, Any]:
-    return {"case_id": case_id, "profile": profile, "matrix": matrix, "status": STATUS_BLOCKED, "reason": reason, "checks": [{"name": "health-driver-preflight", "status": STATUS_BLOCKED, "evidence": reason}], "generated_at": utc()}
+    return {
+        "case_id": case_id,
+        "profile": profile,
+        "matrix": matrix,
+        "status": STATUS_BLOCKED,
+        "reason": reason,
+        "checks": [{"name": "health-driver-preflight", "status": STATUS_BLOCKED, "evidence": reason}],
+        "generated_at": utc(),
+    }
 
 
 def main() -> int:
@@ -451,7 +561,12 @@ def main() -> int:
             binding = select_binding(Path(binding_path).resolve(), case_id, profile, matrix)
             target, scenarios = validate_binding(binding, profile, matrix)
             checks = [target_identity_check(target, run_dir)]
-            checks.extend(validate_scenario(scenario, target, run_dir / "health" / f"{index + 1:02d}-{scenario['name']}.json", run_dir) for index, scenario in enumerate(scenarios))
+            checks.extend(
+                validate_scenario(
+                    scenario, target, run_dir / "health" / f"{index + 1:02d}-{scenario['name']}.json", run_dir
+                )
+                for index, scenario in enumerate(scenarios)
+            )
             result = proof(case_id, profile, matrix, checks, scenarios)
     except BindingError as exc:
         case_id = os.environ.get("AFS_ACCEPTANCE_CASE_ID") or "OPS-01"
@@ -468,7 +583,15 @@ def main() -> int:
             matrix = matrix_from_env(os.environ)
         except BindingError:
             matrix = {}
-        result = {"case_id": case_id, "profile": profile, "matrix": matrix, "status": STATUS_FAIL, "reason": f"health driver crashed: {type(exc).__name__}: {exc}", "checks": [{"name": "health-driver-exception", "status": STATUS_FAIL, "evidence": repr(exc)}], "generated_at": utc()}
+        result = {
+            "case_id": case_id,
+            "profile": profile,
+            "matrix": matrix,
+            "status": STATUS_FAIL,
+            "reason": f"health driver crashed: {type(exc).__name__}: {exc}",
+            "checks": [{"name": "health-driver-exception", "status": STATUS_FAIL, "evidence": repr(exc)}],
+            "generated_at": utc(),
+        }
     print(json.dumps(result, sort_keys=True))
     return 0 if result.get("status") == STATUS_PASS else 1
 

@@ -6,18 +6,19 @@ This tool records a bounded 100-file unlink diagnostic and, optionally, a fixed
 state is unobserved unless explicitly requested, and the output must not be
 interpreted as a performance gate.
 """
+
 from __future__ import annotations
 
 import argparse
 import hashlib
 import json
 import os
-from pathlib import Path
 import platform
 import shutil
 import stat
 import subprocess
 import time
+from pathlib import Path
 from typing import Any
 
 DELETE_FILE_COUNT = 100
@@ -168,10 +169,17 @@ def check_deleted_on_home(owner_home_root: Path, sample_name: str) -> dict[str, 
         if path.exists():
             present.append(str(path))
         checked += 1
-    return {"status": "PASS" if not present else "FAIL", "checked": checked, "present": present, "directory": str(home_dir)}
+    return {
+        "status": "PASS" if not present else "FAIL",
+        "checked": checked,
+        "present": present,
+        "directory": str(home_dir),
+    }
 
 
-def run_delete_sample(root: Path, label: str, round_index: int, measured: bool, owner_home_root: Path | None) -> dict[str, Any]:
+def run_delete_sample(
+    root: Path, label: str, round_index: int, measured: bool, owner_home_root: Path | None
+) -> dict[str, Any]:
     sample_name = f".afs-owner-remote-small-{label}-r{round_index:02d}"
     directory = root / sample_name
     record: dict[str, Any] = {
@@ -189,10 +197,16 @@ def run_delete_sample(root: Path, label: str, round_index: int, measured: bool, 
         record["unlink_timer"] = timed_unlink(directory)
         fsync_directory(directory)
         remaining = sorted(path.name for path in directory.iterdir())
-        record["post_unlink"] = {"parent_fsync": True, "remaining": remaining, "status": "PASS" if not remaining else "FAIL"}
+        record["post_unlink"] = {
+            "parent_fsync": True,
+            "remaining": remaining,
+            "status": "PASS" if not remaining else "FAIL",
+        }
         if owner_home_root is not None:
             record["owner_home_deleted_check"] = check_deleted_on_home(owner_home_root, sample_name)
-            record["owner_home_deleted_check"]["scope"] = "same-host local namespace check only; external Home/B validation is collected by the parent layer"
+            record["owner_home_deleted_check"]["scope"] = (
+                "same-host local namespace check only; external Home/B validation is collected by the parent layer"
+            )
         else:
             record["external_home_absence"] = "PENDING_PARENT_B_MOUNT_CHECK"
         directory.rmdir()
@@ -222,7 +236,9 @@ def run_delete_rounds(owner_root: Path, owner_home_root: Path, moose_root: Path,
         samples = []
         for label in paired_order(round_index):
             if label == "owner":
-                sample = run_delete_sample(owner_root, label, round_index, round_index >= WARMUP_ROUNDS, owner_home_root)
+                sample = run_delete_sample(
+                    owner_root, label, round_index, round_index >= WARMUP_ROUNDS, owner_home_root
+                )
             else:
                 sample = run_delete_sample(moose_root, label, round_index, round_index >= WARMUP_ROUNDS, None)
             sample_path = samples_dir / f"round-{round_index:02d}-{label}.json"
@@ -232,13 +248,22 @@ def run_delete_rounds(owner_root: Path, owner_home_root: Path, moose_root: Path,
             if read_inputs.get("raw_latency", False) and sample.get("status") != "PASS":
                 # Keep the first failure; do not repeat an unsupported cache or
                 # filesystem operation through the rest of a raw-latency case.
-                round_record = {"round": round_index, "measured": round_index >= WARMUP_ROUNDS,
-                                "order": paired_order(round_index), "samples": samples,
-                                "stopped_after_failure": True}
+                round_record = {
+                    "round": round_index,
+                    "measured": round_index >= WARMUP_ROUNDS,
+                    "order": paired_order(round_index),
+                    "samples": samples,
+                    "stopped_after_failure": True,
+                }
                 write_json(output / f"read-round-{round_index:02d}.json", round_record)
                 rounds.append(round_record)
                 return rounds
-        round_record = {"round": round_index, "measured": round_index >= WARMUP_ROUNDS, "order": paired_order(round_index), "samples": samples}
+        round_record = {
+            "round": round_index,
+            "measured": round_index >= WARMUP_ROUNDS,
+            "order": paired_order(round_index),
+            "samples": samples,
+        }
         write_json(output / f"delete-round-{round_index:02d}.json", round_record)
         rounds.append(round_record)
     return rounds
@@ -268,7 +293,9 @@ def validate_latency_samples(record: dict[str, Any]) -> None:
             raise ValueError(f"p{percentile}_ns does not match latency_samples_ns")
 
 
-def validate_io_result(record: dict[str, Any], *, raw_latency: bool = False, read_cache: str = READ_DEFAULT_CACHE) -> None:
+def validate_io_result(
+    record: dict[str, Any], *, raw_latency: bool = False, read_cache: str = READ_DEFAULT_CACHE
+) -> None:
     expected = {
         "operation": "seq-read",
         "file_bytes": READ_BYTES,
@@ -348,7 +375,6 @@ def run_io_read(
     return record
 
 
-
 def run_read_rounds(read_inputs: dict[str, Any], output: Path) -> list[dict[str, Any]]:
     rounds: list[dict[str, Any]] = []
     samples_dir = output / "read-samples"
@@ -373,16 +399,26 @@ def run_read_rounds(read_inputs: dict[str, Any], output: Path) -> list[dict[str,
             if read_inputs.get("raw_latency", False) and sample.get("status") != "PASS":
                 # Keep the first failure; do not repeat an unsupported cache or
                 # filesystem operation through the rest of a raw-latency case.
-                round_record = {"round": round_index, "measured": round_index >= WARMUP_ROUNDS,
-                                "order": paired_order(round_index), "samples": samples,
-                                "stopped_after_failure": True}
+                round_record = {
+                    "round": round_index,
+                    "measured": round_index >= WARMUP_ROUNDS,
+                    "order": paired_order(round_index),
+                    "samples": samples,
+                    "stopped_after_failure": True,
+                }
                 write_json(output / f"read-round-{round_index:02d}.json", round_record)
                 rounds.append(round_record)
                 return rounds
-        round_record = {"round": round_index, "measured": round_index >= WARMUP_ROUNDS, "order": paired_order(round_index), "samples": samples}
+        round_record = {
+            "round": round_index,
+            "measured": round_index >= WARMUP_ROUNDS,
+            "order": paired_order(round_index),
+            "samples": samples,
+        }
         write_json(output / f"read-round-{round_index:02d}.json", round_record)
         rounds.append(round_record)
     return rounds
+
 
 def expect_round_count(rounds: list[dict[str, Any]]) -> bool:
     return len(rounds) == WARMUP_ROUNDS + MEASUREMENT_ROUNDS
@@ -434,7 +470,9 @@ def validate_read_inputs(args: argparse.Namespace, owner_root: Path, moose_root:
     supplied = [args.io_tool, args.owner_read_file, args.moose_read_file]
     if not any(supplied):
         if args.raw_latency or args.read_cache != READ_DEFAULT_CACHE:
-            raise ValueError("--raw-latency and --read-cache require --io-tool, --owner-read-file, and --moose-read-file")
+            raise ValueError(
+                ("--raw-latency and --read-cache require --io-tool, --owner-read-file, and --moose-read-file")
+            )
         return None
     if not all(supplied):
         raise ValueError("--io-tool, --owner-read-file, and --moose-read-file must be supplied together")
@@ -468,7 +506,9 @@ def validate_read_inputs(args: argparse.Namespace, owner_root: Path, moose_root:
     }
 
 
-def preflight(args: argparse.Namespace, output: Path) -> tuple[Path, Path, Path, Path, dict[str, Any], dict[str, Any] | None]:
+def preflight(
+    args: argparse.Namespace, output: Path
+) -> tuple[Path, Path, Path, Path, dict[str, Any], dict[str, Any] | None]:
     owner_root = require_absolute_path(args.owner_root, "owner-root")
     owner_home_root = require_absolute_path(args.owner_home_root, "owner-home-root") if args.owner_home_root else None
     moose_root = require_absolute_path(args.moose_root, "moose-root")
@@ -477,7 +517,9 @@ def preflight(args: argparse.Namespace, output: Path) -> tuple[Path, Path, Path,
     if owner_home_root is not None:
         require_existing_directory(owner_home_root, "owner-home-root")
     if platform.system() != "Linux" or platform.machine() != "aarch64" or os.geteuid() != 0:
-        raise RuntimeError(f"requires Linux aarch64 root, got {platform.system()} {platform.machine()} uid={os.geteuid()}")
+        raise RuntimeError(
+            f"requires Linux aarch64 root, got {platform.system()} {platform.machine()} uid={os.geteuid()}"
+        )
     deps = {name: shutil.which(name) for name in ("findmnt",)}
     if not all(deps.values()):
         raise RuntimeError(f"missing dependencies: {deps}")
@@ -497,10 +539,11 @@ def preflight(args: argparse.Namespace, output: Path) -> tuple[Path, Path, Path,
         },
         "mounts": mounts,
         "read_inputs": {
-            key: str(value) if isinstance(value, Path) else value
-            for key, value in (read_inputs or {}).items()
+            key: str(value) if isinstance(value, Path) else value for key, value in (read_inputs or {}).items()
         },
-        "external_home_absence": "LOCAL_OWNER_HOME_CHECK" if owner_home_root is not None else "PENDING_PARENT_B_MOUNT_CHECK",
+        "external_home_absence": "LOCAL_OWNER_HOME_CHECK"
+        if owner_home_root is not None
+        else "PENDING_PARENT_B_MOUNT_CHECK",
         "output": str(output),
     }
     return owner_root, owner_home_root, moose_root, output, evidence, read_inputs
@@ -512,8 +555,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "scope": "small OwnerFs remote-vs-MooseFS diagnostic; not a performance acceptance pass",
         "cache_state": "unobserved",
         "external_home_absence": "PENDING_PARENT_B_MOUNT_CHECK",
-        "delete_shape": {"files": DELETE_FILE_COUNT, "file_bytes": DELETE_FILE_BYTES, "warmups": WARMUP_ROUNDS, "measurements": MEASUREMENT_ROUNDS},
-        "read_shape": {"bytes": READ_BYTES, "block_bytes": READ_BLOCK_BYTES, "concurrency": READ_CONCURRENCY, "pattern_byte": READ_PATTERN_BYTE},
+        "delete_shape": {
+            "files": DELETE_FILE_COUNT,
+            "file_bytes": DELETE_FILE_BYTES,
+            "warmups": WARMUP_ROUNDS,
+            "measurements": MEASUREMENT_ROUNDS,
+        },
+        "read_shape": {
+            "bytes": READ_BYTES,
+            "block_bytes": READ_BLOCK_BYTES,
+            "concurrency": READ_CONCURRENCY,
+            "pattern_byte": READ_PATTERN_BYTE,
+        },
         "read_latency_mode": {
             "raw_latency": args.raw_latency,
             "read_cache": args.read_cache,
@@ -568,7 +621,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--io-tool")
     parser.add_argument("--owner-read-file")
     parser.add_argument("--moose-read-file")
-    parser.add_argument("--raw-latency", action="store_true", help="require samples-enabled IO probe and validate raw latency intervals")
+    parser.add_argument(
+        "--raw-latency", action="store_true", help="require samples-enabled IO probe and validate raw latency intervals"
+    )
     parser.add_argument("--read-cache", choices=READ_RAW_CACHE_CHOICES, default=READ_DEFAULT_CACHE)
     return parser.parse_args()
 

@@ -1,10 +1,11 @@
 """Real Linux C-probe guards for optional, independently auditable IO samples."""
+
 import json
-from pathlib import Path
 import platform
 import subprocess
 import tempfile
 import unittest
+from pathlib import Path
 
 
 @unittest.skipUnless(platform.system() == "Linux", "Linux integration only")
@@ -14,8 +15,10 @@ class IoSamples(unittest.TestCase):
         cls.build = tempfile.TemporaryDirectory(prefix="afs-io-build-", dir="/var/tmp")
         cls.binary = Path(cls.build.name) / "probe"
         source = Path(__file__).with_name("ownerfs_native_closeout_io.c")
-        subprocess.run(["cc", "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror",
-                        "-pthread", str(source), "-o", str(cls.binary)], check=True)
+        subprocess.run(
+            ["cc", "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread", str(source), "-o", str(cls.binary)],
+            check=True,
+        )
 
     @classmethod
     def tearDownClass(cls):
@@ -28,9 +31,24 @@ class IoSamples(unittest.TestCase):
         self.file.write_bytes(bytes([97]) * 1048576)
 
     def run_probe(self, *extra, operation="seq-read", cache="unobserved", mode="existing"):
-        return subprocess.run([str(self.binary), str(self.file), operation, "1048576",
-                               "16384", "1", "close", "1048576", "97", mode,
-                               cache, *extra], capture_output=True, text=True)
+        return subprocess.run(
+            [
+                str(self.binary),
+                str(self.file),
+                operation,
+                "1048576",
+                "16384",
+                "1",
+                "close",
+                "1048576",
+                "97",
+                mode,
+                cache,
+                *extra,
+            ],
+            capture_output=True,
+            text=True,
+        )
 
     def test_legacy_output_and_corruption_propagation(self):
         result = self.run_probe()

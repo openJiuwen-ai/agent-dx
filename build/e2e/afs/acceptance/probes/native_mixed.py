@@ -10,6 +10,7 @@ workspace through two paths that should name the same directory:
 It records raw artifacts under --out and prints one JSON summary to stdout.
 It does not stop the container or claim full POSIX coverage.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -28,7 +29,6 @@ import time
 import traceback
 from pathlib import Path
 from typing import Any, Callable
-
 
 IN_CREATE = 0x00000100
 IN_MODIFY = 0x00000002
@@ -106,7 +106,9 @@ def concurrent_append_status(lines: list[str], mirror_lines: list[str] | None) -
     missing = sorted(expected - set(lines))
     extra = sorted(set(lines) - expected)
     return {
-        "status": "PASS" if len(lines) == 128 and not duplicates and not missing and not extra and mirror_lines == lines else "FAIL",
+        "status": "PASS"
+        if len(lines) == 128 and not duplicates and not missing and not extra and mirror_lines == lines
+        else "FAIL",
         "records": len(lines),
         "unique_records": len(set(lines)),
         "missing": missing,
@@ -140,7 +142,14 @@ def correlate_concurrent_offsets(content: bytes, child_records: list[dict[str, A
         roles.append(role)
         parsed_children.append({"index": child.get("index"), "role": payload.get("role"), "offsets": rows})
         if role not in ("primary", "secondary") or len(rows) != 64:
-            mismatches.append({"child": child.get("index"), "role": role, "rows": len(rows), "error": "expected 64 offsets for one role"})
+            mismatches.append(
+                {
+                    "child": child.get("index"),
+                    "role": role,
+                    "rows": len(rows),
+                    "error": "expected 64 offsets for one role",
+                }
+            )
         for row in rows:
             line = row.get("line")
             offset = row.get("offset")
@@ -155,16 +164,24 @@ def correlate_concurrent_offsets(content: bytes, child_records: list[dict[str, A
     missing = sorted(expected - set(coverage))
     extra = sorted(set(coverage) - expected)
     if sorted(roles) != ["primary", "secondary"] or len(coverage) != 128 or duplicates or missing or extra:
-        mismatches.append({
-            "error": "offset coverage mismatch",
-            "roles": roles,
-            "rows": len(coverage),
-            "duplicates": duplicates,
-            "missing": missing,
-            "extra": extra,
-        })
+        mismatches.append(
+            {
+                "error": "offset coverage mismatch",
+                "roles": roles,
+                "rows": len(coverage),
+                "duplicates": duplicates,
+                "missing": missing,
+                "extra": extra,
+            }
+        )
     if set(actual) != expected:
-        mismatches.append({"error": "final content records mismatch", "missing": sorted(expected - set(actual)), "extra": sorted(set(actual) - expected)})
+        mismatches.append(
+            {
+                "error": "final content records mismatch",
+                "missing": sorted(expected - set(actual)),
+                "extra": sorted(set(actual) - expected),
+            }
+        )
     return {"status": "PASS" if not mismatches else "FAIL", "mismatches": mismatches, "children": parsed_children}
 
 
@@ -192,10 +209,14 @@ def find_command_artifacts(control_dir: Path, before: set[Path]) -> list[dict[st
     return rows
 
 
-def run_command(argv: list[str], timeout: float, out_dir: Path, name: str, allowed: tuple[int, ...] = (0,)) -> dict[str, Any]:
+def run_command(
+    argv: list[str], timeout: float, out_dir: Path, name: str, allowed: tuple[int, ...] = (0,)
+) -> dict[str, Any]:
     started = time.time()
     try:
-        proc = subprocess.run(argv, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, check=False)
+        proc = subprocess.run(
+            argv, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, check=False
+        )
         record = {
             "argv": argv,
             "returncode": proc.returncode,
@@ -221,7 +242,17 @@ def run_command(argv: list[str], timeout: float, out_dir: Path, name: str, allow
     (out_dir / f"{name}.stdout").write_text(str(record["stdout"]), encoding="utf-8")
     (out_dir / f"{name}.stderr").write_text(str(record["stderr"]), encoding="utf-8")
     if record["timed_out"] or record["returncode"] not in allowed:
-        raise RuntimeError(json.dumps({"command": argv, "returncode": record["returncode"], "timed_out": record["timed_out"], "stderr": str(record["stderr"])[-2000:]}, sort_keys=True))
+        raise RuntimeError(
+            json.dumps(
+                {
+                    "command": argv,
+                    "returncode": record["returncode"],
+                    "timed_out": record["timed_out"],
+                    "stderr": str(record["stderr"])[-2000:],
+                },
+                sort_keys=True,
+            )
+        )
     return record
 
 
@@ -257,13 +288,15 @@ class Inotify:
                 raw_name = data[offset : offset + name_len]
                 offset += name_len
                 name = raw_name.rstrip(b"\0").decode("utf-8", "replace")
-                events.append({
-                    "watch": self.watches.get(wd, str(wd)),
-                    "mask": mask,
-                    "mask_names": mask_names(mask),
-                    "cookie": cookie,
-                    "name": name,
-                })
+                events.append(
+                    {
+                        "watch": self.watches.get(wd, str(wd)),
+                        "mask": mask,
+                        "mask_names": mask_names(mask),
+                        "cookie": cookie,
+                        "name": name,
+                    }
+                )
         return events
 
     def close(self) -> None:
@@ -330,12 +363,14 @@ class Probe:
             details = func(step_dir)
             record.update({"status": "PASS", "details": details})
         except Exception as exc:  # noqa: BLE001 - serialize probe failures
-            record.update({
-                "status": "FAIL",
-                "exception": type(exc).__name__,
-                "message": str(exc),
-                "traceback": traceback.format_exc(),
-            })
+            record.update(
+                {
+                    "status": "FAIL",
+                    "exception": type(exc).__name__,
+                    "message": str(exc),
+                    "traceback": traceback.format_exc(),
+                }
+            )
             self.failures.append(record)
         finally:
             record["duration_ms"] = round((time.time() - started) * 1000, 3)
@@ -364,7 +399,11 @@ class Probe:
         report_path = step_dir / "locks-smoke" / "report.json"
         expect(report_path.exists(), "locks_smoke report exists", str(report_path))
         report = json.loads(report_path.read_text(encoding="utf-8"))
-        expect(command["returncode"] == 0 and report.get("summary", {}).get("status") == "PASS", "locks_smoke passes", report.get("summary"))
+        expect(
+            command["returncode"] == 0 and report.get("summary", {}).get("status") == "PASS",
+            "locks_smoke passes",
+            report.get("summary"),
+        )
         return {
             "tool": str(script),
             "tool_sha256": sha256_file(script),
@@ -383,7 +422,9 @@ class Probe:
         concurrent_secondary = self.owned(self.secondary, "append-concurrent.log")
         start_primary = self.owned(self.primary, "append-start.flag")
         start_secondary = self.owned(self.secondary, "append-start.flag")
-        self.remember(primary_file, secondary_file, concurrent_primary, concurrent_secondary, start_primary, start_secondary)
+        self.remember(
+            primary_file, secondary_file, concurrent_primary, concurrent_secondary, start_primary, start_secondary
+        )
         fd_init = os.open(primary_file, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
         os.close(fd_init)
         pfd = os.open(primary_file, os.O_WRONLY | os.O_APPEND)
@@ -455,8 +496,18 @@ class Probe:
                 "    os.close(fd)\n"
             )
             children = [
-                subprocess.Popen([sys.executable, "-c", child_code, str(concurrent_primary), "primary", str(start_primary)], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE),
-                subprocess.Popen([sys.executable, "-c", child_code, str(concurrent_secondary), "secondary", str(start_secondary)], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE),
+                subprocess.Popen(
+                    [sys.executable, "-c", child_code, str(concurrent_primary), "primary", str(start_primary)],
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                ),
+                subprocess.Popen(
+                    [sys.executable, "-c", child_code, str(concurrent_secondary), "secondary", str(start_secondary)],
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                ),
             ]
             fd_start = os.open(start_primary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
             os.close(fd_start)
@@ -467,22 +518,40 @@ class Probe:
                 except subprocess.TimeoutExpired:
                     child.kill()
                     stdout, stderr = child.communicate(timeout=2)
-                    child_records.append({"index": index, "returncode": child.returncode, "timed_out": True, "stdout": stdout, "stderr": stderr})
+                    child_records.append(
+                        {
+                            "index": index,
+                            "returncode": child.returncode,
+                            "timed_out": True,
+                            "stdout": stdout,
+                            "stderr": stderr,
+                        }
+                    )
                     continue
-                child_records.append({"index": index, "returncode": child.returncode, "timed_out": False, "stdout": stdout, "stderr": stderr})
+                child_records.append(
+                    {
+                        "index": index,
+                        "returncode": child.returncode,
+                        "timed_out": False,
+                        "stdout": stdout,
+                        "stderr": stderr,
+                    }
+                )
             json_write(step_dir / "append-concurrent-children.json", child_records)
             if all(row["returncode"] == 0 and not row["timed_out"] for row in child_records):
                 content = concurrent_primary.read_bytes()
                 lines = content.decode("utf-8").splitlines()
                 mirror_lines = concurrent_secondary.read_text(encoding="utf-8").splitlines()
                 proof["concurrent_data"] = concurrent_append_status(lines, mirror_lines)
-                proof["concurrent_data"].update({
-                    "offset_correlation": correlate_concurrent_offsets(content, child_records),
-                    "primary": stat_record(concurrent_primary),
-                    "secondary": stat_record(concurrent_secondary),
-                    "content_sha256": sha256_file(concurrent_primary),
-                    "children": child_records,
-                })
+                proof["concurrent_data"].update(
+                    {
+                        "offset_correlation": correlate_concurrent_offsets(content, child_records),
+                        "primary": stat_record(concurrent_primary),
+                        "secondary": stat_record(concurrent_secondary),
+                        "content_sha256": sha256_file(concurrent_primary),
+                        "children": child_records,
+                    }
+                )
             else:
                 proof["concurrent_data"] = {"status": "FAIL", "children": child_records}
             json_write(step_dir / "append-proof.json", proof)
@@ -509,7 +578,10 @@ class Probe:
 
         watcher = Inotify()
         try:
-            same_watch_dir = self.primary.stat().st_dev == self.secondary.stat().st_dev and self.primary.stat().st_ino == self.secondary.stat().st_ino
+            same_watch_dir = (
+                self.primary.stat().st_dev == self.secondary.stat().st_dev
+                and self.primary.stat().st_ino == self.secondary.stat().st_ino
+            )
             watcher.add("primary", self.primary)
             if not same_watch_dir:
                 watcher.add("secondary", self.secondary)
@@ -529,7 +601,10 @@ class Probe:
                     os.fsync(nfd)
             finally:
                 os.close(nfd)
-            expect(primary_file.read_bytes()[128 : 128 + len(native_payload)] == native_payload, "FUSE read sees native MAP_SHARED write")
+            expect(
+                primary_file.read_bytes()[128 : 128 + len(native_payload)] == native_payload,
+                "FUSE read sees native MAP_SHARED write",
+            )
 
             nfd = os.open(secondary_file, os.O_RDWR)
             try:
@@ -541,12 +616,20 @@ class Probe:
                         os.fsync(pfd)
                     finally:
                         os.close(pfd)
-                    expect(view[512 : 512 + len(fuse_payload)] == fuse_payload, "native MAP_SHARED read sees FUSE write")
+                    expect(
+                        view[512 : 512 + len(fuse_payload)] == fuse_payload, "native MAP_SHARED read sees FUSE write"
+                    )
             finally:
                 os.close(nfd)
-            json_write(step_dir / "mmap-proof.json", {"status": "PASS", "bytes": 4096,
-                "native_map_to_primary_read": native_payload.decode(),
-                "primary_write_to_native_map": fuse_payload.decode()})
+            json_write(
+                step_dir / "mmap-proof.json",
+                {
+                    "status": "PASS",
+                    "bytes": 4096,
+                    "native_map_to_primary_read": native_payload.decode(),
+                    "primary_write_to_native_map": fuse_payload.decode(),
+                },
+            )
 
             self.create_write_rename(primary_watch_file, primary_watch_renamed, b"primary-watch\n")
             self.create_write_rename(secondary_watch_file, secondary_watch_renamed, b"secondary-watch\n")
@@ -563,8 +646,10 @@ class Probe:
             by_watch["secondary"] = list(by_watch["primary"])
         for watch_name, watch_events in by_watch.items():
             # Each view must observe both origins, including the other path.
-            for path, renamed in ((primary_watch_file, primary_watch_renamed),
-                                  (secondary_watch_file, secondary_watch_renamed)):
+            for path, renamed in (
+                (primary_watch_file, primary_watch_renamed),
+                (secondary_watch_file, secondary_watch_renamed),
+            ):
                 self.expect_watch_events(watch_name, watch_events, path.name, renamed.name)
         return {
             "primary": stat_record(primary_file),
@@ -579,7 +664,11 @@ class Probe:
             return any(event.get("name") == name and mask in event.get("mask_names", []) for event in events)
 
         expect(has(tmp_name, "CREATE"), f"{watch_name} watch observes CREATE for {tmp_name}", events)
-        expect(has(tmp_name, "MODIFY") or has(tmp_name, "CLOSE_WRITE"), f"{watch_name} watch observes write for {tmp_name}", events)
+        expect(
+            has(tmp_name, "MODIFY") or has(tmp_name, "CLOSE_WRITE"),
+            f"{watch_name} watch observes write for {tmp_name}",
+            events,
+        )
         expect(has(tmp_name, "MOVED_FROM"), f"{watch_name} watch observes MOVED_FROM for {tmp_name}", events)
         expect(has(done_name, "MOVED_TO"), f"{watch_name} watch observes MOVED_TO for {done_name}", events)
 
@@ -617,14 +706,14 @@ class Probe:
             "set +e\n"
             "uid=$(/bin/busybox id -u)\n"
             "/bin/busybox echo uid=$uid\n"
-            "test \"$uid\" = 501 || exit 7\n"
+            'test "$uid" = 501 || exit 7\n'
             f"/bin/busybox cat /workspace/{root_file.name}\n"
             "read_rc=$?\n"
             f"/bin/busybox sh -c 'printf blocked >> /workspace/{root_file.name}'\n"
             "write_rc=$?\n"
             "/bin/busybox echo read_rc=$read_rc\n"
             "/bin/busybox echo write_rc=$write_rc\n"
-            "test \"$read_rc\" != 0 && test \"$write_rc\" != 0\n"
+            'test "$read_rc" != 0 && test "$write_rc" != 0\n'
         )
         argv = [
             sys.executable,
@@ -648,9 +737,22 @@ class Probe:
         expect(response.get("status") == "Executed", "container permission script executed", response)
         expect("uid=501" in stdout_text, "container command runs as UID 501", stdout_text)
         expect(root_file.read_bytes() == secret, "root-owned file content unchanged")
-        expect(hashlib.sha256(root_file.read_bytes()).hexdigest() == hashlib.sha256(secret).hexdigest(), "root-owned file content hash unchanged")
-        expect(root_file.stat().st_uid == 0 and root_file.stat().st_gid == 0 and (root_file.stat().st_mode & 0o777) == 0o600, "root-owned mode unchanged", stat_record(root_file))
-        expect((stdout_text + stderr_text).count("Permission denied") >= 2, "raw container output records read and write Permission denied", {"stdout": stdout_text, "stderr": stderr_text})
+        expect(
+            hashlib.sha256(root_file.read_bytes()).hexdigest() == hashlib.sha256(secret).hexdigest(),
+            "root-owned file content hash unchanged",
+        )
+        expect(
+            root_file.stat().st_uid == 0
+            and root_file.stat().st_gid == 0
+            and (root_file.stat().st_mode & 0o777) == 0o600,
+            "root-owned mode unchanged",
+            stat_record(root_file),
+        )
+        expect(
+            (stdout_text + stderr_text).count("Permission denied") >= 2,
+            "raw container output records read and write Permission denied",
+            {"stdout": stdout_text, "stderr": stderr_text},
+        )
 
         missing = {}
         for label, path in (("primary", missing_primary), ("secondary", missing_secondary)):
@@ -707,9 +809,12 @@ class Probe:
             expect(self.primary.is_dir(), "--primary is a directory", str(self.primary))
             expect(self.secondary.is_dir(), "--secondary is a directory", str(self.secondary))
             result["path_identity"] = {"primary": stat_record(self.primary), "secondary": stat_record(self.secondary)}
-            for name, probe in (("locks", self.locks_probe), ("append", self.append_probe),
-                                ("mmap_inotify", self.mmap_inotify_probe),
-                                ("permissions_errno", self.permissions_errno_probe)):
+            for name, probe in (
+                ("locks", self.locks_probe),
+                ("append", self.append_probe),
+                ("mmap_inotify", self.mmap_inotify_probe),
+                ("permissions_errno", self.permissions_errno_probe),
+            ):
                 if name in self.args.groups:
                     self.step(name, probe)
         except Exception as exc:  # noqa: BLE001
@@ -737,7 +842,11 @@ class Probe:
                 "passed": sum(1 for step in self.steps if step.get("status") == "PASS"),
                 "failed": sum(1 for step in self.steps if step.get("status") != "PASS"),
             }
-            result["status"] = "PASS" if self.steps and not self.failures and all(step.get("status") == "PASS" for step in self.steps) else "FAIL"
+            result["status"] = (
+                "PASS"
+                if self.steps and not self.failures and all(step.get("status") == "PASS" for step in self.steps)
+                else "FAIL"
+            )
             json_write(self.out / "result.json", result)
         return result
 
@@ -750,9 +859,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--socket", type=Path, required=True, help="native workspace control socket")
     parser.add_argument("--out", type=Path, required=True, help="new output directory")
     parser.add_argument("--locks-probe", type=Path, help="optional fixed locks_smoke.py path")
-    parser.add_argument("--groups", nargs="+", choices=("locks", "append", "mmap_inotify", "permissions_errno"),
-                        default=["locks", "append", "mmap_inotify", "permissions_errno"],
-                        help="explicit affected groups; unselected groups are not tested")
+    parser.add_argument(
+        "--groups",
+        nargs="+",
+        choices=("locks", "append", "mmap_inotify", "permissions_errno"),
+        default=["locks", "append", "mmap_inotify", "permissions_errno"],
+        help="explicit affected groups; unselected groups are not tested",
+    )
     return parser
 
 

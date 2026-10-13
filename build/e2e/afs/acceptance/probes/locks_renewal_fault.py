@@ -7,6 +7,7 @@ commands.  Meta fault injection is allowed only through an explicit control
 prefix, PID file and executable SHA check; the probe validates the exact target
 before sending any signal and sends SIGCONT in a finally block after SIGSTOP.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -28,7 +29,6 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 import locks_cross  # noqa: E402
-
 
 DEFAULT_STOP_SECONDS = 15.0
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 10.0
@@ -73,88 +73,217 @@ class RenewalFaultProbe(locks_cross.CrossProbe):
         self.fault_records: list[dict[str, Any]] = []
         self.meta_was_stopped = False
         self.bound_meta_identity: dict[str, Any] | None = None
-        self.run_id = f"locks-renewal-fault-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-{os.getpid()}-{random.randrange(1_000_000):06d}"
+        self.run_id = (
+            f"locks-renewal-fault-"
+            f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}"
+            f"-"
+            f"{os.getpid()}"
+            f"-"
+            f"{random.randrange(1000000):06d}"
+        )
 
     def run_control(self, action: str) -> dict[str, Any]:
-        code = r'''
-import hashlib, json, os, signal, sys, time
-pid_file, expected_sha, action, expected_pid, expected_start_ticks, expected_boot_id = sys.argv[1:7]
-def read_pid(path):
-    raw = open(path, "r", encoding="utf-8").read().strip()
-    if not raw.isdecimal() or int(raw) <= 0:
-        raise RuntimeError(f"invalid pid file {path}: {raw!r}")
-    return int(raw)
-def sha256_file(path):
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            h.update(chunk)
-    return h.hexdigest()
-def proc_state(pid):
-    status = {}
-    with open(f"/proc/{pid}/status", "r", encoding="utf-8") as f:
-        for line in f:
-            if ":" in line:
-                key, value = line.split(":", 1)
-                status[key] = value.strip()
-    stat_text = open(f"/proc/{pid}/stat", "r", encoding="utf-8").read()
-    close = stat_text.rfind(")")
-    fields = stat_text[close + 2:].split()
-    start_ticks = int(fields[19]) if len(fields) > 19 else None
-    return {"status_state": status.get("State"), "stat_state": fields[0] if fields else None, "start_ticks": start_ticks}
-def boot_id():
-    with open("/proc/sys/kernel/random/boot_id", "r", encoding="utf-8") as f:
-        return f.read().strip()
-def stopped(state):
-    return "stopped" in str(state.get("status_state", "")).lower() or state.get("stat_state") == "T"
-pid = read_pid(pid_file)
-exe_path = os.readlink(f"/proc/{pid}/exe")
-actual_sha = sha256_file(f"/proc/{pid}/exe")
-before = proc_state(pid)
-actual_boot_id = boot_id()
-if actual_sha != expected_sha:
-    print(json.dumps({"event": "CONTROL", "action": action, "ok": False, "pid": pid, "exe_path": exe_path, "actual_sha256": actual_sha, "expected_sha256": expected_sha, "boot_id": actual_boot_id, "before": before, "error": "sha256 mismatch"}, sort_keys=True))
-    sys.exit(2)
-if expected_pid != "-" and pid != int(expected_pid):
-    print(json.dumps({"event": "CONTROL", "action": action, "ok": False, "pid": pid, "expected_pid": int(expected_pid), "exe_path": exe_path, "sha256": actual_sha, "boot_id": actual_boot_id, "before": before, "error": "pid mismatch"}, sort_keys=True))
-    sys.exit(2)
-if expected_start_ticks != "-" and before.get("start_ticks") != int(expected_start_ticks):
-    print(json.dumps({"event": "CONTROL", "action": action, "ok": False, "pid": pid, "exe_path": exe_path, "sha256": actual_sha, "boot_id": actual_boot_id, "before": before, "expected_start_ticks": int(expected_start_ticks), "error": "start_ticks mismatch"}, sort_keys=True))
-    sys.exit(2)
-if expected_boot_id != "-" and actual_boot_id != expected_boot_id:
-    print(json.dumps({"event": "CONTROL", "action": action, "ok": False, "pid": pid, "exe_path": exe_path, "sha256": actual_sha, "boot_id": actual_boot_id, "expected_boot_id": expected_boot_id, "before": before, "error": "boot_id mismatch"}, sort_keys=True))
-    sys.exit(2)
-if action == "validate":
-    if stopped(before):
-        print(json.dumps({"event": "CONTROL", "action": action, "ok": False, "pid": pid, "pid_file": pid_file, "exe_path": exe_path, "sha256": actual_sha, "boot_id": actual_boot_id, "before": before, "after": before, "error": "target already stopped"}, sort_keys=True))
-        sys.exit(1)
-    after = before
-elif action == "stop":
-    os.kill(pid, signal.SIGSTOP)
-    deadline = time.time() + 5.0
-    after = proc_state(pid)
-    while not stopped(after) and time.time() < deadline:
-        time.sleep(0.05)
-        after = proc_state(pid)
-elif action == "cont":
-    os.kill(pid, signal.SIGCONT)
-    deadline = time.time() + 5.0
-    after = proc_state(pid)
-    while stopped(after) and time.time() < deadline:
-        time.sleep(0.05)
-        after = proc_state(pid)
-elif action == "state":
-    after = before
-else:
-    raise RuntimeError(f"unknown action {action}")
-ok = True
-if action == "stop":
-    ok = stopped(after)
-elif action == "cont":
-    ok = not stopped(after)
-print(json.dumps({"event": "CONTROL", "action": action, "ok": ok, "pid": pid, "pid_file": pid_file, "exe_path": exe_path, "sha256": actual_sha, "boot_id": actual_boot_id, "before": before, "after": after}, sort_keys=True))
-sys.exit(0 if ok else 1)
-'''
+        code = (
+            "import hashlib, json, os, signal, sys, time\n"
+            "\n"
+            "pid_file, expected_sha, action, expected_pid, expected_start_tick"
+            "s, expected_boot_id = sys.argv[1:7]\n"
+            "\n"
+            "\n"
+            "def read_pid(path):\n"
+            '    raw = open(path, "r", encoding="utf-8").read().strip()\n'
+            "    if not raw.isdecimal() or int(raw) <= 0:\n"
+            '        raise RuntimeError(f"invalid pid file {path}: {raw!r}")\n'
+            "    return int(raw)\n"
+            "\n"
+            "\n"
+            "def sha256_file(path):\n"
+            "    h = hashlib.sha256()\n"
+            '    with open(path, "rb") as f:\n'
+            '        for chunk in iter(lambda: f.read(1024 * 1024), b""):\n'
+            "            h.update(chunk)\n"
+            "    return h.hexdigest()\n"
+            "\n"
+            "\n"
+            "def proc_state(pid):\n"
+            "    status = {}\n"
+            '    with open(f"/proc/{pid}/status", "r", encoding="utf-8") as f:'
+            "\n"
+            "        for line in f:\n"
+            '            if ":" in line:\n'
+            '                key, value = line.split(":", 1)\n'
+            "                status[key] = value.strip()\n"
+            '    stat_text = open(f"/proc/{pid}/stat", "r", encoding="utf-8").'
+            "read()\n"
+            '    close = stat_text.rfind(")")\n'
+            "    fields = stat_text[close + 2 :].split()\n"
+            "    start_ticks = int(fields[19]) if len(fields) > 19 else None\n"
+            "    return {\n"
+            '        "status_state": status.get("State"),\n'
+            '        "stat_state": fields[0] if fields else None,\n'
+            '        "start_ticks": start_ticks,\n'
+            "    }\n"
+            "\n"
+            "\n"
+            "def boot_id():\n"
+            '    with open("/proc/sys/kernel/random/boot_id", "r", encoding="u'
+            'tf-8") as f:\n'
+            "        return f.read().strip()\n"
+            "\n"
+            "\n"
+            "def stopped(state):\n"
+            '    return "stopped" in str(state.get("status_state", "")).lower('
+            ') or state.get("stat_state") == "T"\n'
+            "\n"
+            "\n"
+            "pid = read_pid(pid_file)\n"
+            'exe_path = os.readlink(f"/proc/{pid}/exe")\n'
+            'actual_sha = sha256_file(f"/proc/{pid}/exe")\n'
+            "before = proc_state(pid)\n"
+            "actual_boot_id = boot_id()\n"
+            "if actual_sha != expected_sha:\n"
+            "    print(\n"
+            "        json.dumps(\n"
+            "            {\n"
+            '                "event": "CONTROL",\n'
+            '                "action": action,\n'
+            '                "ok": False,\n'
+            '                "pid": pid,\n'
+            '                "exe_path": exe_path,\n'
+            '                "actual_sha256": actual_sha,\n'
+            '                "expected_sha256": expected_sha,\n'
+            '                "boot_id": actual_boot_id,\n'
+            '                "before": before,\n'
+            '                "error": "sha256 mismatch",\n'
+            "            },\n"
+            "            sort_keys=True,\n"
+            "        )\n"
+            "    )\n"
+            "    sys.exit(2)\n"
+            'if expected_pid != "-" and pid != int(expected_pid):\n'
+            "    print(\n"
+            "        json.dumps(\n"
+            "            {\n"
+            '                "event": "CONTROL",\n'
+            '                "action": action,\n'
+            '                "ok": False,\n'
+            '                "pid": pid,\n'
+            '                "expected_pid": int(expected_pid),\n'
+            '                "exe_path": exe_path,\n'
+            '                "sha256": actual_sha,\n'
+            '                "boot_id": actual_boot_id,\n'
+            '                "before": before,\n'
+            '                "error": "pid mismatch",\n'
+            "            },\n"
+            "            sort_keys=True,\n"
+            "        )\n"
+            "    )\n"
+            "    sys.exit(2)\n"
+            'if expected_start_ticks != "-" and before.get("start_ticks") != i'
+            "nt(expected_start_ticks):\n"
+            "    print(\n"
+            "        json.dumps(\n"
+            "            {\n"
+            '                "event": "CONTROL",\n'
+            '                "action": action,\n'
+            '                "ok": False,\n'
+            '                "pid": pid,\n'
+            '                "exe_path": exe_path,\n'
+            '                "sha256": actual_sha,\n'
+            '                "boot_id": actual_boot_id,\n'
+            '                "before": before,\n'
+            '                "expected_start_ticks": int(expected_start_ticks)'
+            ",\n"
+            '                "error": "start_ticks mismatch",\n'
+            "            },\n"
+            "            sort_keys=True,\n"
+            "        )\n"
+            "    )\n"
+            "    sys.exit(2)\n"
+            'if expected_boot_id != "-" and actual_boot_id != expected_boot_id'
+            ":\n"
+            "    print(\n"
+            "        json.dumps(\n"
+            "            {\n"
+            '                "event": "CONTROL",\n'
+            '                "action": action,\n'
+            '                "ok": False,\n'
+            '                "pid": pid,\n'
+            '                "exe_path": exe_path,\n'
+            '                "sha256": actual_sha,\n'
+            '                "boot_id": actual_boot_id,\n'
+            '                "expected_boot_id": expected_boot_id,\n'
+            '                "before": before,\n'
+            '                "error": "boot_id mismatch",\n'
+            "            },\n"
+            "            sort_keys=True,\n"
+            "        )\n"
+            "    )\n"
+            "    sys.exit(2)\n"
+            'if action == "validate":\n'
+            "    if stopped(before):\n"
+            "        print(\n"
+            "            json.dumps(\n"
+            "                {\n"
+            '                    "event": "CONTROL",\n'
+            '                    "action": action,\n'
+            '                    "ok": False,\n'
+            '                    "pid": pid,\n'
+            '                    "pid_file": pid_file,\n'
+            '                    "exe_path": exe_path,\n'
+            '                    "sha256": actual_sha,\n'
+            '                    "boot_id": actual_boot_id,\n'
+            '                    "before": before,\n'
+            '                    "after": before,\n'
+            '                    "error": "target already stopped",\n'
+            "                },\n"
+            "                sort_keys=True,\n"
+            "            )\n"
+            "        )\n"
+            "        sys.exit(1)\n"
+            "    after = before\n"
+            'elif action == "stop":\n'
+            "    os.kill(pid, signal.SIGSTOP)\n"
+            "    deadline = time.time() + 5.0\n"
+            "    after = proc_state(pid)\n"
+            "    while not stopped(after) and time.time() < deadline:\n"
+            "        time.sleep(0.05)\n"
+            "        after = proc_state(pid)\n"
+            'elif action == "cont":\n'
+            "    os.kill(pid, signal.SIGCONT)\n"
+            "    deadline = time.time() + 5.0\n"
+            "    after = proc_state(pid)\n"
+            "    while stopped(after) and time.time() < deadline:\n"
+            "        time.sleep(0.05)\n"
+            "        after = proc_state(pid)\n"
+            'elif action == "state":\n'
+            "    after = before\n"
+            "else:\n"
+            '    raise RuntimeError(f"unknown action {action}")\n'
+            "ok = True\n"
+            'if action == "stop":\n'
+            "    ok = stopped(after)\n"
+            'elif action == "cont":\n'
+            "    ok = not stopped(after)\n"
+            "print(\n"
+            "    json.dumps(\n"
+            "        {\n"
+            '            "event": "CONTROL",\n'
+            '            "action": action,\n'
+            '            "ok": ok,\n'
+            '            "pid": pid,\n'
+            '            "pid_file": pid_file,\n'
+            '            "exe_path": exe_path,\n'
+            '            "sha256": actual_sha,\n'
+            '            "boot_id": actual_boot_id,\n'
+            '            "before": before,\n'
+            '            "after": after,\n'
+            "        },\n"
+            "        sort_keys=True,\n"
+            "    )\n"
+            ")\n"
+            "sys.exit(0 if ok else 1)\n"
+        )
         bound = self.bound_meta_identity or {}
         argv = list(self.meta_control) + [
             "python3",
@@ -187,7 +316,9 @@ sys.exit(0 if ok else 1)
             "duration_ms": round((time.time() - started) * 1000, 3),
         }
         self.fault_records.append(record)
-        _expect(proc.returncode == 0 and events and events[-1].get("ok") is True, f"Meta control {action} succeeded", record)
+        _expect(
+            proc.returncode == 0 and events and events[-1].get("ok") is True, f"Meta control {action} succeeded", record
+        )
         return events[-1]
 
     def bind_meta_identity(self) -> dict[str, Any]:
@@ -202,9 +333,19 @@ sys.exit(0 if ok else 1)
             "pid_file": event.get("pid_file"),
         }
         _expect(isinstance(identity["pid"], int) and identity["pid"] > 0, "Meta PID identity is bound", identity)
-        _expect(isinstance(identity["start_ticks"], int) and identity["start_ticks"] > 0, "Meta start_ticks identity is bound", identity)
-        _expect(isinstance(identity["boot_id"], str) and bool(identity["boot_id"]), "Meta boot_id identity is bound", identity)
-        _expect(identity["sha256"] == self.args.meta_executable_sha256, "Meta executable SHA identity is bound", identity)
+        _expect(
+            isinstance(identity["start_ticks"], int) and identity["start_ticks"] > 0,
+            "Meta start_ticks identity is bound",
+            identity,
+        )
+        _expect(
+            isinstance(identity["boot_id"], str) and bool(identity["boot_id"]),
+            "Meta boot_id identity is bound",
+            identity,
+        )
+        _expect(
+            identity["sha256"] == self.args.meta_executable_sha256, "Meta executable SHA identity is bound", identity
+        )
         self.bound_meta_identity = identity
         return event
 
@@ -212,32 +353,49 @@ sys.exit(0 if ok else 1)
         _expect(self.bound_meta_identity is not None, "Meta identity has been bound")
         target = self.bound_meta_identity
         meta_processes = self.identity.get("worker_a", {}).get("identity", {}).get("meta_processes", {})
-        matches = [
-            {"role": role, **process}
-            for role, process in meta_processes.items()
-            if process.get("pid") == target.get("pid")
-            and process.get("start_ticks") == target.get("start_ticks")
-            and process.get("sha256") == target.get("sha256")
-        ]
-        _expect(bool(matches), "bound Meta target matches worker A collected Meta identity", {"target": target, "worker_a_meta_processes": meta_processes})
+        matches = []
+        for role, process in meta_processes.items():
+            if (process.get("pid"), process.get("start_ticks"), process.get("sha256")) == (
+                target.get("pid"),
+                target.get("start_ticks"),
+                target.get("sha256"),
+            ):
+                matches.append({"role": role, **process})
+        _expect(
+            bool(matches),
+            "bound Meta target matches worker A collected Meta identity",
+            {"target": target, "worker_a_meta_processes": meta_processes},
+        )
 
     def setup(self) -> None:
         super().setup()
-        _expect(self.identity.get("cross_mount_qualified") is True, "different-kernel AFS cross-mount identity is required", self.identity)
-        _expect(self.args.stop_seconds > 0 and self.args.stop_seconds < 30, "stop duration stays below the 30 second lease bound", {"stop_seconds": self.args.stop_seconds})
+        _expect(
+            self.identity.get("cross_mount_qualified") is True,
+            "different-kernel AFS cross-mount identity is required",
+            self.identity,
+        )
+        _expect(
+            self.args.stop_seconds > 0 and self.args.stop_seconds < 30,
+            "stop duration stays below the 30 second lease bound",
+            {"stop_seconds": self.args.stop_seconds},
+        )
         self.bind_meta_identity()
         self.assert_worker_a_meta_matches_bound_target()
 
-    def sleep_with_liveness(self, holder: locks_cross.WorkerProcess, waiter: locks_cross.WorkerProcess) -> dict[str, Any]:
+    def sleep_with_liveness(
+        self, holder: locks_cross.WorkerProcess, waiter: locks_cross.WorkerProcess
+    ) -> dict[str, Any]:
         started = time.monotonic()
         deadline = started + self.args.stop_seconds
         samples: list[dict[str, Any]] = []
         while time.monotonic() < deadline:
-            samples.append({
-                "elapsed_seconds": round(time.monotonic() - started, 3),
-                "holder_returncode": holder.proc.poll(),
-                "waiter_returncode": waiter.proc.poll(),
-            })
+            samples.append(
+                {
+                    "elapsed_seconds": round(time.monotonic() - started, 3),
+                    "holder_returncode": holder.proc.poll(),
+                    "waiter_returncode": waiter.proc.poll(),
+                }
+            )
             _expect(holder.proc.poll() is None, "holder remains alive while Meta is stopped", samples[-1])
             _expect(waiter.proc.poll() is None, "SETLKW waiter remains pending while Meta is stopped", samples[-1])
             time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
@@ -245,14 +403,18 @@ sys.exit(0 if ok else 1)
         return {"requested_seconds": self.args.stop_seconds, "elapsed_seconds": round(elapsed, 3), "samples": samples}
 
     def test_meta_stop_waiter_survives(self) -> dict[str, Any]:
-        holder = self.start_worker("A-lock-holder", "A", "hold_fcntl", self.path_a, mode="exclusive", start=0, length=10)
+        holder = self.start_worker(
+            "A-lock-holder", "A", "hold_fcntl", self.path_a, mode="exclusive", start=0, length=10
+        )
         waiter: locks_cross.WorkerProcess | None = None
         acquired: dict[str, Any] | None = None
         holder_rc: int | None = None
         waiter_rc: int | None = None
         try:
             ready = holder.read_event("READY")
-            waiter = self.start_worker("B-lock-waiter", "B", "wait_fcntl", self.path_b, mode="exclusive", start=0, length=10)
+            waiter = self.start_worker(
+                "B-lock-waiter", "B", "wait_fcntl", self.path_b, mode="exclusive", start=0, length=10
+            )
             waiting = waiter.read_event("WAITING")
             self.meta_was_stopped = True
             stopped = self.run_control("stop")
@@ -263,16 +425,32 @@ sys.exit(0 if ok else 1)
                     self.run_control("cont")
                     self.meta_was_stopped = False
                 except Exception as exc:  # noqa: BLE001 - preserve primary failure but keep evidence
-                    self.failures.append({"name": "meta_cont_finally", "ok": False, "exception": type(exc).__name__, "message": str(exc), "traceback": traceback.format_exc()})
+                    self.failures.append(
+                        {
+                            "name": "meta_cont_finally",
+                            "ok": False,
+                            "exception": type(exc).__name__,
+                            "message": str(exc),
+                            "traceback": traceback.format_exc(),
+                        }
+                    )
         state_after_cont = self.run_control("state")
         holder_rc = holder.release()
         _expect(waiter is not None, "waiter was started")
         acquired = waiter.read_event("ACQUIRED", timeout=self.args.child_timeout)
         waiter_rc = waiter.release()
         _expect(holder_rc == 0, "holder exits cleanly after unlock", {"returncode": holder_rc, "stderr": holder.stderr})
-        _expect(waiter_rc == 0, "waiter exits cleanly after acquiring lock", {"returncode": waiter_rc, "stderr": waiter.stderr, "acquired": acquired})
+        _expect(
+            waiter_rc == 0,
+            "waiter exits cleanly after acquiring lock",
+            {"returncode": waiter_rc, "stderr": waiter.stderr, "acquired": acquired},
+        )
         _expect(acquired.get("event") == "ACQUIRED", "waiter acquired after Meta resumes without EIO", acquired)
-        _expect(float(acquired.get("waited_seconds", 0.0)) >= self.args.stop_seconds, "waiter remained blocked through stopped Meta interval", acquired)
+        _expect(
+            float(acquired.get("waited_seconds", 0.0)) >= self.args.stop_seconds,
+            "waiter remained blocked through stopped Meta interval",
+            acquired,
+        )
         return {
             "ready": ready,
             "waiting": waiting,
@@ -312,7 +490,8 @@ sys.exit(0 if ok else 1)
                 "boot_id": _read_text_optional(Path("/proc/sys/kernel/random/boot_id")),
             },
             "identity": self.identity,
-            "timeout_config": self.timeout_config() | {
+            "timeout_config": self.timeout_config()
+            | {
                 "control_timeout_seconds": self.args.control_timeout,
                 "stop_seconds": self.args.stop_seconds,
             },
@@ -331,11 +510,16 @@ sys.exit(0 if ok else 1)
                 "All lock syscalls run in Linux worker processes through locks_cross.py worker commands.",
                 "The host may be macOS only as an orchestrator when --allow-host-non-linux is supplied.",
                 "Meta STOP/CONT is sent only after PID file and executable SHA identity validation.",
-                "Any unqualified identity, skipped fault, control failure, worker error, or waiter EIO makes the report FAIL.",
+                (
+                    "Any unqualified identity, skipped fault, control failure, "
+                    "worker error, or waiter EIO makes the report FAIL."
+                ),
             ],
         }
         self.evidence.mkdir(parents=True, exist_ok=True)
-        (self.evidence / "report.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        (self.evidence / "report.json").write_text(
+            json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
         (self.evidence / "summary.txt").write_text(
             f"status={report['status']} cross_mount_qualified={self.identity.get('cross_mount_qualified', False)} "
             f"steps={report['summary']['steps']} failed={report['summary']['failed']} "
@@ -346,16 +530,31 @@ sys.exit(0 if ok else 1)
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run bounded Meta SIGSTOP renewal fault check for cross-mount locks")
-    parser.add_argument("--worker-a-json", required=True, type=_json_argv, help="JSON argv prefix ending in locks_cross.py for worker A")
-    parser.add_argument("--worker-b-json", required=True, type=_json_argv, help="JSON argv prefix ending in locks_cross.py for worker B")
+    parser.add_argument(
+        "--worker-a-json", required=True, type=_json_argv, help="JSON argv prefix ending in locks_cross.py for worker A"
+    )
+    parser.add_argument(
+        "--worker-b-json", required=True, type=_json_argv, help="JSON argv prefix ending in locks_cross.py for worker B"
+    )
     parser.add_argument("--path-a", required=True, help="worker A path for the logical DFS test file")
     parser.add_argument("--path-b", required=True, help="worker B path for the same logical DFS test file")
     parser.add_argument("--renamed-a", help=argparse.SUPPRESS)
     parser.add_argument("--renamed-b", help=argparse.SUPPRESS)
     parser.add_argument("--evidence", required=True)
-    parser.add_argument("--meta-control-json", required=True, type=_json_argv, help="JSON command prefix used to run Python control snippets next to the Meta process, e.g. [\"limactl\",\"shell\",\"afs-test-node\",\"--\",\"sudo\"]")
+    parser.add_argument(
+        "--meta-control-json",
+        required=True,
+        type=_json_argv,
+        help=(
+            "JSON command prefix used to run Python control snippets next to "
+            'the Meta process, e.g. ["limactl","shell","afs-test-node","--","'
+            'sudo"]'
+        ),
+    )
     parser.add_argument("--meta-pid-file", required=True, help="PID file path as seen by the Meta control prefix")
-    parser.add_argument("--meta-executable-sha256", required=True, help="expected SHA256 of /proc/PID/exe for the Meta process")
+    parser.add_argument(
+        "--meta-executable-sha256", required=True, help="expected SHA256 of /proc/PID/exe for the Meta process"
+    )
     parser.add_argument("--command-timeout", type=float, default=DEFAULT_COMMAND_TIMEOUT_SECONDS)
     parser.add_argument("--control-timeout", type=float, default=DEFAULT_COMMAND_TIMEOUT_SECONDS)
     parser.add_argument("--child-timeout", type=float, default=DEFAULT_CHILD_TIMEOUT_SECONDS)
@@ -363,10 +562,34 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--peer-request-timeout-source", default="default common transport gRPC request timeout")
     parser.add_argument("--min-wait-seconds", type=float, default=locks_cross.DEFAULT_MIN_WAIT_SECONDS)
     parser.add_argument("--stop-seconds", type=float, default=DEFAULT_STOP_SECONDS)
-    parser.add_argument("--worker-a-process-pid-file", action="append", type=locks_cross._parse_named_path, default=[], metavar="ROLE=PID_FILE")
-    parser.add_argument("--worker-b-process-pid-file", action="append", type=locks_cross._parse_named_path, default=[], metavar="ROLE=PID_FILE")
-    parser.add_argument("--worker-a-meta-process-pid-file", action="append", type=locks_cross._parse_named_path, default=[], metavar="ROLE=PID_FILE")
-    parser.add_argument("--worker-b-meta-process-pid-file", action="append", type=locks_cross._parse_named_path, default=[], metavar="ROLE=PID_FILE")
+    parser.add_argument(
+        "--worker-a-process-pid-file",
+        action="append",
+        type=locks_cross.parse_named_path,
+        default=[],
+        metavar="ROLE=PID_FILE",
+    )
+    parser.add_argument(
+        "--worker-b-process-pid-file",
+        action="append",
+        type=locks_cross.parse_named_path,
+        default=[],
+        metavar="ROLE=PID_FILE",
+    )
+    parser.add_argument(
+        "--worker-a-meta-process-pid-file",
+        action="append",
+        type=locks_cross.parse_named_path,
+        default=[],
+        metavar="ROLE=PID_FILE",
+    )
+    parser.add_argument(
+        "--worker-b-meta-process-pid-file",
+        action="append",
+        type=locks_cross.parse_named_path,
+        default=[],
+        metavar="ROLE=PID_FILE",
+    )
     parser.add_argument("--keep-fixture", action="store_true")
     parser.add_argument("--allow-host-non-linux", action="store_true")
     parser.set_defaults(require_cross_mount=True)
@@ -380,13 +603,29 @@ def main(argv: list[str] | None = None) -> int:
         probe.setup()
         probe.run()
     except Exception as exc:  # noqa: BLE001
-        probe.failures.append({"name": "probe_setup_or_run", "ok": False, "exception": type(exc).__name__, "message": str(exc), "traceback": traceback.format_exc()})
+        probe.failures.append(
+            {
+                "name": "probe_setup_or_run",
+                "ok": False,
+                "exception": type(exc).__name__,
+                "message": str(exc),
+                "traceback": traceback.format_exc(),
+            }
+        )
         if probe.meta_was_stopped:
             try:
                 probe.run_control("cont")
                 probe.meta_was_stopped = False
             except Exception as cont_exc:  # noqa: BLE001
-                probe.failures.append({"name": "meta_cont_outer_finally", "ok": False, "exception": type(cont_exc).__name__, "message": str(cont_exc), "traceback": traceback.format_exc()})
+                probe.failures.append(
+                    {
+                        "name": "meta_cont_outer_finally",
+                        "ok": False,
+                        "exception": type(cont_exc).__name__,
+                        "message": str(cont_exc),
+                        "traceback": traceback.format_exc(),
+                    }
+                )
     finally:
         try:
             probe.cleanup()

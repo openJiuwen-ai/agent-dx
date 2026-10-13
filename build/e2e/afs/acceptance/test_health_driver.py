@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
-import shutil
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -63,6 +63,7 @@ def health_doc(status="ready", overrides=None, node_id="node-health-test", scope
 class Server:
     def __init__(self, routes):
         self.routes = routes
+        self.base = None
         parent = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -99,17 +100,26 @@ class HealthDriverTests(unittest.TestCase):
         root = Path(tempfile.mkdtemp(prefix="afs-health-driver-test-"))
         self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
         env = os.environ.copy()
-        env.update({
-            "AFS_ACCEPTANCE_CASE_ID": "OPS-01",
-            "AFS_ACCEPTANCE_PROFILE": profile,
-            "AFS_ACCEPTANCE_MATRIX": json.dumps({"backend": "DFS", "meta": "etcd"}),
-            "AFS_ACCEPTANCE_RUN_DIR": str(root / "run"),
-        })
+        env.update(
+            {
+                "AFS_ACCEPTANCE_CASE_ID": "OPS-01",
+                "AFS_ACCEPTANCE_PROFILE": profile,
+                "AFS_ACCEPTANCE_MATRIX": json.dumps({"backend": "DFS", "meta": "etcd"}),
+                "AFS_ACCEPTANCE_RUN_DIR": str(root / "run"),
+            }
+        )
         if binding is not None:
             path = root / "bindings.json"
             path.write_text(json.dumps(binding), encoding="utf-8")
             env["AFS_ACCEPTANCE_HEALTH_BINDINGS"] = str(path)
-        proc = subprocess.run([sys.executable, str(DRIVER)], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, check=False)
+        proc = subprocess.run(
+            [sys.executable, str(DRIVER)],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            check=False,
+        )
         lines = [line for line in proc.stdout.splitlines() if line.strip()]
         self.assertTrue(lines, proc.stderr)
         return proc, json.loads(lines[-1]), root
@@ -132,14 +142,30 @@ class HealthDriverTests(unittest.TestCase):
         self.assertIn("AFS_ACCEPTANCE_HEALTH_BINDINGS", proof["reason"])
 
     def test_smoke_passes_with_identity_artifacts_and_one_degraded_component(self):
-        with Server({
-            "/healthy": (200, health_doc()),
-            "/device-down": (503, health_doc("degraded", {"data_device": {"ready": False, "error": "read-only"}})),
-        }) as server:
-            proc, proof, root = self.run_driver(self.binding([
-                {"name": "healthy", "component": "all", "url": server.base + "/healthy", "expected_ready": True},
-                {"name": "device-down", "component": "device", "url": server.base + "/device-down", "expected_ready": False},
-            ]))
+        with Server(
+            {
+                "/healthy": (200, health_doc()),
+                "/device-down": (503, health_doc("degraded", {"data_device": {"ready": False, "error": "read-only"}})),
+            }
+        ) as server:
+            proc, proof, root = self.run_driver(
+                self.binding(
+                    [
+                        {
+                            "name": "healthy",
+                            "component": "all",
+                            "url": server.base + "/healthy",
+                            "expected_ready": True,
+                        },
+                        {
+                            "name": "device-down",
+                            "component": "device",
+                            "url": server.base + "/device-down",
+                            "expected_ready": False,
+                        },
+                    ]
+                )
+            )
         self.assertEqual(proc.returncode, 0, proof)
         self.assertEqual(proof["status"], "PASS")
         for check in proof["checks"]:
@@ -152,22 +178,36 @@ class HealthDriverTests(unittest.TestCase):
 
     def test_foundation_scope_degraded_mount_is_rejected_without_explicit_expected_scope(self):
         target = current_process_target(scope="configured_fs")
-        with Server({
-            "/mount-covered": (
-                503,
-                health_doc(
-                    "degraded",
-                    {"mounts": {"ready": False, "dfs": {"configured": True}, "error": "configured mount covered"}},
-                    scope="foundation",
+        with Server(
+            {
+                "/mount-covered": (
+                    503,
+                    health_doc(
+                        "degraded",
+                        {"mounts": {"ready": False, "dfs": {"configured": True}, "error": "configured mount covered"}},
+                        scope="foundation",
+                    ),
                 ),
-            ),
-        }) as server:
-            proc, proof, _root = self.run_driver(self.binding([
-                {"name": "mount-covered", "component": "mount", "url": server.base + "/mount-covered", "expected_ready": False},
-            ], target=target))
+            }
+        ) as server:
+            proc, proof, _root = self.run_driver(
+                self.binding(
+                    [
+                        {
+                            "name": "mount-covered",
+                            "component": "mount",
+                            "url": server.base + "/mount-covered",
+                            "expected_ready": False,
+                        },
+                    ],
+                    target=target,
+                )
+            )
         self.assertNotEqual(proc.returncode, 0)
         self.assertEqual(proof["status"], "FAIL")
-        self.assertIn("health scope 'foundation' does not match expected scope 'configured_fs'", json.dumps(proof["checks"]))
+        self.assertIn(
+            "health scope 'foundation' does not match expected scope 'configured_fs'", json.dumps(proof["checks"])
+        )
 
     def test_expected_scope_foundation_allows_only_prebound_degraded_mount_scope(self):
         target = current_process_target(scope="configured_fs")
@@ -181,100 +221,197 @@ class HealthDriverTests(unittest.TestCase):
             {"mounts": {"ready": False, "dfs": {"configured": True}, "error": "configured mount covered"}},
             scope="configured_fs",
         )
-        with Server({
-            "/mount-covered": (503, foundation_mount),
-            "/wrong-scope": (503, configured_mount),
-        }) as server:
-            proc, proof, _root = self.run_driver(self.binding([
-                {
-                    "name": "mount-covered",
-                    "component": "mount",
-                    "url": server.base + "/mount-covered",
-                    "expected_ready": False,
-                    "expected_scope": "foundation",
-                },
-            ], target=target))
-            wrong_proc, wrong_proof, _wrong_root = self.run_driver(self.binding([
-                {
-                    "name": "wrong-scope",
-                    "component": "mount",
-                    "url": server.base + "/wrong-scope",
-                    "expected_ready": False,
-                    "expected_scope": "foundation",
-                },
-            ], target=target))
+        with Server(
+            {
+                "/mount-covered": (503, foundation_mount),
+                "/wrong-scope": (503, configured_mount),
+            }
+        ) as server:
+            proc, proof, _root = self.run_driver(
+                self.binding(
+                    [
+                        {
+                            "name": "mount-covered",
+                            "component": "mount",
+                            "url": server.base + "/mount-covered",
+                            "expected_ready": False,
+                            "expected_scope": "foundation",
+                        },
+                    ],
+                    target=target,
+                )
+            )
+            wrong_proc, wrong_proof, _wrong_root = self.run_driver(
+                self.binding(
+                    [
+                        {
+                            "name": "wrong-scope",
+                            "component": "mount",
+                            "url": server.base + "/wrong-scope",
+                            "expected_ready": False,
+                            "expected_scope": "foundation",
+                        },
+                    ],
+                    target=target,
+                )
+            )
         self.assertEqual(proc.returncode, 0, proof)
         self.assertEqual(proof["status"], "PASS")
         self.assertEqual(proof["checks"][1]["evidence"]["http_status"], 503)
         self.assertEqual(proof["checks"][1]["evidence"]["component"], "mount")
-        self.assertEqual(proof["checks"][1]["evidence"]["component_ready"], False)
+        self.assertIs(proof["checks"][1]["evidence"]["component_ready"], False)
         self.assertNotEqual(wrong_proc.returncode, 0)
         self.assertEqual(wrong_proof["status"], "FAIL")
-        self.assertIn("health scope 'configured_fs' does not match expected scope 'foundation'", json.dumps(wrong_proof["checks"]))
+        self.assertIn(
+            "health scope 'configured_fs' does not match expected scope 'foundation'", json.dumps(wrong_proof["checks"])
+        )
 
     def test_invalid_expected_scope_is_blocked(self):
-        with Server({"/mount-covered": (503, health_doc("degraded", {"mounts": {"ready": False, "dfs": {"configured": True}}}, scope="foundation"))}) as server:
-            proc, proof, _root = self.run_driver(self.binding([
-                {
-                    "name": "mount-covered",
-                    "component": "mount",
-                    "url": server.base + "/mount-covered",
-                    "expected_ready": False,
-                    "expected_scope": "returned-by-server",
-                },
-            ]))
+        with Server(
+            {
+                "/mount-covered": (
+                    503,
+                    health_doc(
+                        "degraded", {"mounts": {"ready": False, "dfs": {"configured": True}}}, scope="foundation"
+                    ),
+                )
+            }
+        ) as server:
+            proc, proof, _root = self.run_driver(
+                self.binding(
+                    [
+                        {
+                            "name": "mount-covered",
+                            "component": "mount",
+                            "url": server.base + "/mount-covered",
+                            "expected_ready": False,
+                            "expected_scope": "returned-by-server",
+                        },
+                    ]
+                )
+            )
         self.assertNotEqual(proc.returncode, 0)
         self.assertEqual(proof["status"], "BLOCKED")
         self.assertIn("expected_scope", proof["reason"])
 
     def test_unknown_binding_field_is_blocked(self):
-        with Server({"/healthy": (200, health_doc()), "/device-down": (503, health_doc("degraded", {"data_device": {"ready": False}}))}) as server:
-            proc, proof, _root = self.run_driver(self.binding([
-                {"name": "healthy", "component": "all", "url": server.base + "/healthy", "expected_ready": True},
-                {"name": "device-down", "component": "device", "url": server.base + "/device-down", "expected_ready": False},
-            ], unexpected="loose"))
+        with Server(
+            {
+                "/healthy": (200, health_doc()),
+                "/device-down": (503, health_doc("degraded", {"data_device": {"ready": False}})),
+            }
+        ) as server:
+            proc, proof, _root = self.run_driver(
+                self.binding(
+                    [
+                        {
+                            "name": "healthy",
+                            "component": "all",
+                            "url": server.base + "/healthy",
+                            "expected_ready": True,
+                        },
+                        {
+                            "name": "device-down",
+                            "component": "device",
+                            "url": server.base + "/device-down",
+                            "expected_ready": False,
+                        },
+                    ],
+                    unexpected="loose",
+                )
+            )
         self.assertNotEqual(proc.returncode, 0)
         self.assertEqual(proof["status"], "BLOCKED")
         self.assertIn("unsupported binding field", proof["reason"])
 
     def test_unknown_scenario_field_is_blocked(self):
         with Server({"/device-down": (503, health_doc("degraded", {"data_device": {"ready": False}}))}) as server:
-            proc, proof, _root = self.run_driver(self.binding([
-                {"name": "device-down", "component": "device", "url": server.base + "/device-down", "expected_ready": False, "unexpected": "loose"},
-            ]))
+            proc, proof, _root = self.run_driver(
+                self.binding(
+                    [
+                        {
+                            "name": "device-down",
+                            "component": "device",
+                            "url": server.base + "/device-down",
+                            "expected_ready": False,
+                            "unexpected": "loose",
+                        },
+                    ]
+                )
+            )
         self.assertNotEqual(proc.returncode, 0)
         self.assertEqual(proof["status"], "BLOCKED")
         self.assertIn("unsupported field", proof["reason"])
 
     def test_duplicate_scenario_name_is_blocked(self):
         with Server({"/device-down": (503, health_doc("degraded", {"data_device": {"ready": False}}))}) as server:
-            proc, proof, _root = self.run_driver(self.binding([
-                {"name": "dup", "component": "device", "url": server.base + "/device-down", "expected_ready": False},
-                {"name": "dup", "component": "device", "url": server.base + "/device-down", "expected_ready": False},
-            ]))
+            proc, proof, _root = self.run_driver(
+                self.binding(
+                    [
+                        {
+                            "name": "dup",
+                            "component": "device",
+                            "url": server.base + "/device-down",
+                            "expected_ready": False,
+                        },
+                        {
+                            "name": "dup",
+                            "component": "device",
+                            "url": server.base + "/device-down",
+                            "expected_ready": False,
+                        },
+                    ]
+                )
+            )
         self.assertNotEqual(proc.returncode, 0)
         self.assertEqual(proof["status"], "BLOCKED")
         self.assertIn("duplicate scenario", proof["reason"])
 
     def test_endpoint_identity_mismatch_fails(self):
         target = current_process_target(node_id="expected-node")
-        with Server({
-            "/healthy": (200, health_doc(node_id="wrong-node")),
-            "/device-down": (503, health_doc("degraded", {"data_device": {"ready": False}}, node_id="wrong-node")),
-        }) as server:
-            proc, proof, _root = self.run_driver(self.binding([
-                {"name": "healthy", "component": "all", "url": server.base + "/healthy", "expected_ready": True},
-                {"name": "device-down", "component": "device", "url": server.base + "/device-down", "expected_ready": False},
-            ], target=target))
+        with Server(
+            {
+                "/healthy": (200, health_doc(node_id="wrong-node")),
+                "/device-down": (503, health_doc("degraded", {"data_device": {"ready": False}}, node_id="wrong-node")),
+            }
+        ) as server:
+            proc, proof, _root = self.run_driver(
+                self.binding(
+                    [
+                        {
+                            "name": "healthy",
+                            "component": "all",
+                            "url": server.base + "/healthy",
+                            "expected_ready": True,
+                        },
+                        {
+                            "name": "device-down",
+                            "component": "device",
+                            "url": server.base + "/device-down",
+                            "expected_ready": False,
+                        },
+                    ],
+                    target=target,
+                )
+            )
         self.assertNotEqual(proc.returncode, 0)
         self.assertEqual(proof["status"], "FAIL")
         self.assertIn("identity_errors", json.dumps(proof["checks"]))
 
     def test_wrong_http_status_fails(self):
         with Server({"/device-down": (200, health_doc("degraded", {"data_device": {"ready": False}}))}) as server:
-            proc, proof, _root = self.run_driver(self.binding([
-                {"name": "device-down", "component": "device", "url": server.base + "/device-down", "expected_ready": False},
-            ]))
+            proc, proof, _root = self.run_driver(
+                self.binding(
+                    [
+                        {
+                            "name": "device-down",
+                            "component": "device",
+                            "url": server.base + "/device-down",
+                            "expected_ready": False,
+                        },
+                    ]
+                )
+            )
         self.assertNotEqual(proc.returncode, 0)
         self.assertEqual(proof["status"], "FAIL")
         self.assertIn("expected_http_status", json.dumps(proof["checks"]))
@@ -282,13 +419,22 @@ class HealthDriverTests(unittest.TestCase):
     def test_full_requires_degraded_scenario_for_every_component(self):
         binding = {
             "schema_version": 1,
-            "bindings": [{
-                "case_id": "OPS-01",
-                "profile": "full",
-                "matrix": {"backend": "DFS", "meta": "etcd"},
-                "target": current_process_target(),
-                "scenarios": [{"name": "device-down", "component": "device", "url": "http://127.0.0.1:9/health", "expected_ready": False}],
-            }],
+            "bindings": [
+                {
+                    "case_id": "OPS-01",
+                    "profile": "full",
+                    "matrix": {"backend": "DFS", "meta": "etcd"},
+                    "target": current_process_target(),
+                    "scenarios": [
+                        {
+                            "name": "device-down",
+                            "component": "device",
+                            "url": "http://127.0.0.1:9/health",
+                            "expected_ready": False,
+                        }
+                    ],
+                }
+            ],
         }
         proc, proof, _root = self.run_driver(binding, profile="full")
         self.assertNotEqual(proc.returncode, 0)

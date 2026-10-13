@@ -150,11 +150,20 @@ def classify_tls_failure(exc: BaseException) -> dict[str, str]:
             return detail
         return detail
     if isinstance(exc, ssl.SSLError):
-        if "certificate required" in text or "certificate_required" in text or "peer did not return a certificate" in text:
+        if (
+            "certificate required" in text
+            or "certificate_required" in text
+            or "peer did not return a certificate" in text
+        ):
             return {"classification": "missing_client_cert", "detail": str(exc)}
         if "unknown ca" in text:
             return {"classification": "untrusted_ca", "detail": str(exc)}
-        if "bad certificate" in text or "bad_certificate" in text or "handshake failure" in text or "tlsv1 alert" in text:
+        if (
+            "bad certificate" in text
+            or "bad_certificate" in text
+            or "handshake failure" in text
+            or "tlsv1 alert" in text
+        ):
             return {"classification": "handshake_rejected", "detail": str(exc)}
         return {"classification": "tls_error", "detail": str(exc)}
     if isinstance(exc, OSError) and getattr(exc, "errno", None) in {errno.ECONNRESET, errno.EPIPE}:
@@ -232,7 +241,7 @@ def _serve_tls(sock: socket.socket, ctx: ssl.SSLContext, stop: threading.Event, 
                     if not _peer_allowed(tls.getpeercert(), expected):
                         continue
                     send_frame(tls, recv_frame(tls, MAX_TIMEOUT))
-            except (OSError, ssl.SSLError, ProbeError):
+            except (OSError, ProbeError):
                 continue
 
 
@@ -364,10 +373,17 @@ def check_udp(args: argparse.Namespace, token: bytes) -> dict[str, Any]:
         except TimeoutError:
             return {"status": "FAIL", "reason": "timeout", "elapsed_seconds": _now() - started}
         except OSError as exc:
-            return {"status": "FAIL", "reason": "socket_error", "detail": repr(exc), "elapsed_seconds": _now() - started}
+            return {
+                "status": "FAIL",
+                "reason": "socket_error",
+                "detail": repr(exc),
+                "elapsed_seconds": _now() - started,
+            }
 
 
-def _tls_attempt(args: argparse.Namespace, ca: Path, cert: Path | None, key: Path | None, hostname: str) -> dict[str, Any]:
+def _tls_attempt(
+    args: argparse.Namespace, ca: Path, cert: Path | None, key: Path | None, hostname: str
+) -> dict[str, Any]:
     try:
         raw = _connect_tcp(args.source_ip, args.target_ip, args.tls_port, args.timeout)
         with raw:
@@ -378,8 +394,11 @@ def _tls_attempt(args: argparse.Namespace, ca: Path, cert: Path | None, key: Pat
                 token = secrets.token_bytes(TOKEN_BYTES)
                 send_frame(tls, token)
                 echoed = recv_frame(tls, args.timeout)
-                result = ({"status": "PASS", "bytes": len(token)} if echoed == token
-                          else {"status": "FAIL", "reason": "mismatch", "received_len": len(echoed)})
+                result = (
+                    {"status": "PASS", "bytes": len(token)}
+                    if echoed == token
+                    else {"status": "FAIL", "reason": "mismatch", "received_len": len(echoed)}
+                )
                 result["tls_version"] = tls.version()
                 result["cipher"] = tls.cipher()[0] if tls.cipher() else None
                 return result
@@ -451,7 +470,9 @@ def client_main(args: argparse.Namespace) -> int:
         if not args.bad_ca:
             raise ProbeError("missing_bad_ca", "--bad-ca is required for --untrusted-ca")
         observed = _tls_attempt(args, args.bad_ca, args.client_cert, args.client_key, args.server_hostname)
-        checks["tls_untrusted_ca"] = _negative_result("untrusted_ca", observed, {"untrusted_ca", "certificate_verify_failed"})
+        checks["tls_untrusted_ca"] = _negative_result(
+            "untrusted_ca", observed, {"untrusted_ca", "certificate_verify_failed"}
+        )
     if args.untrusted_client_cert:
         if not args.bad_client_cert or not args.bad_client_key:
             raise ProbeError("missing_bad_client_cert", "--bad-client-cert and --bad-client-key are required")
@@ -484,7 +505,9 @@ def client_main(args: argparse.Namespace) -> int:
 def live_linux_arm64_guard() -> None:
     machine = platform.machine().lower()
     if platform.system() != "Linux" or machine not in {"aarch64", "arm64"}:
-        raise ProbeError("linux_arm64_required", f"live network probe requires Linux ARM64, got {platform.system()} {machine}")
+        raise ProbeError(
+            "linux_arm64_required", f"live network probe requires Linux ARM64, got {platform.system()} {machine}"
+        )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -527,10 +550,14 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return args.func(args)
     except ProbeError as exc:
-        print(json.dumps({"status": "FAIL", "reason": exc.reason, "detail": exc.detail}, sort_keys=True), file=sys.stderr)
+        print(
+            json.dumps({"status": "FAIL", "reason": exc.reason, "detail": exc.detail}, sort_keys=True), file=sys.stderr
+        )
         return 2
     except OSError as exc:
-        print(json.dumps({"status": "FAIL", "reason": "os_error", "detail": repr(exc)}, sort_keys=True), file=sys.stderr)
+        print(
+            json.dumps({"status": "FAIL", "reason": "os_error", "detail": repr(exc)}, sort_keys=True), file=sys.stderr
+        )
         return 2
 
 

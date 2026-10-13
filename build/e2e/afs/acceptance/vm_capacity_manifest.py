@@ -5,22 +5,29 @@ The full manifest stays outside Git. No image, filesystem or service is changed.
 Compare two manifests before accepting restoration; sockets are recorded by type,
 not read. A nested mount is an error rather than an omitted subtree.
 """
+
 import argparse
 import hashlib
 import json
 import os
-from pathlib import Path
 import platform
 import stat
+from pathlib import Path
 
 
 def entry(path):
     before = path.lstat()
-    result = {"mode": stat.S_IMODE(before.st_mode), "uid": before.st_uid,
-              "gid": before.st_gid, "type": stat.S_IFMT(before.st_mode),
-              "mtime_ns": before.st_mtime_ns}
-    result["xattrs"] = {name: os.getxattr(path, name, follow_symlinks=False).hex()
-                        for name in sorted(os.listxattr(path, follow_symlinks=False))}
+    result = {
+        "mode": stat.S_IMODE(before.st_mode),
+        "uid": before.st_uid,
+        "gid": before.st_gid,
+        "type": stat.S_IFMT(before.st_mode),
+        "mtime_ns": before.st_mtime_ns,
+    }
+    result["xattrs"] = {
+        name: os.getxattr(path, name, follow_symlinks=False).hex()
+        for name in sorted(os.listxattr(path, follow_symlinks=False))
+    }
     if stat.S_ISREG(before.st_mode):
         digest = hashlib.sha256()
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
@@ -36,10 +43,14 @@ def entry(path):
     elif stat.S_ISBLK(before.st_mode) or stat.S_ISCHR(before.st_mode):
         result["rdev"] = before.st_rdev
     after = path.lstat()
-    if (before.st_dev, before.st_ino, before.st_mode, before.st_size,
-            before.st_mtime_ns, before.st_ctime_ns) != (
-            after.st_dev, after.st_ino, after.st_mode, after.st_size,
-            after.st_mtime_ns, after.st_ctime_ns):
+    if (before.st_dev, before.st_ino, before.st_mode, before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_mode,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    ):
         raise RuntimeError(f"file changed while recording: {path}")
     return result
 
@@ -63,12 +74,15 @@ def manifest(root):
 def compare(before, after):
     missing = sorted(before.keys() - after.keys())
     added = sorted(after.keys() - before.keys())
-    changed = sorted(key for key in before.keys() & after.keys()
-                     if before[key] != after[key])
-    return {"status": "PASS" if not (missing or added or changed) else "FAIL",
-            "entries": len(before), "missing": missing, "added": added,
-            "changed": changed,
-            "regular_bytes": sum(v.get("size", 0) for v in before.values())}
+    changed = sorted(key for key in before.keys() & after.keys() if before[key] != after[key])
+    return {
+        "status": "PASS" if not (missing or added or changed) else "FAIL",
+        "entries": len(before),
+        "missing": missing,
+        "added": added,
+        "changed": changed,
+        "regular_bytes": sum(v.get("size", 0) for v in before.values()),
+    }
 
 
 def main():

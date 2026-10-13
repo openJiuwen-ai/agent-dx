@@ -39,9 +39,7 @@ def wait_mount(path: pathlib.Path, process: subprocess.Popen[bytes], timeout: fl
     while time.monotonic() < deadline:
         if process.poll() is not None:
             raise RuntimeError("afs-node exited before the DFS mount became ready")
-        if subprocess.run(
-            ["mountpoint", "-q", str(path)], check=False, capture_output=True
-        ).returncode == 0:
+        if subprocess.run(["mountpoint", "-q", str(path)], check=False, capture_output=True).returncode == 0:
             return
         time.sleep(0.1)
     raise RuntimeError("DFS FUSE mount did not become ready")
@@ -185,14 +183,10 @@ def main() -> int:
                 raise RuntimeError(f"expected two immutable versions, found {len(chunks)} chunks")
             chunk_payloads = {chunk.read_bytes() for chunk in chunks}
             if chunk_payloads != {expected_base, b"DFS"}:
-                raise RuntimeError(
-                    "immutable Chunks do not match the base-plus-patch FileVersion layout"
-                )
+                raise RuntimeError("immutable Chunks do not match the base-plus-patch FileVersion layout")
 
             resize_path = mount / "resize.txt"
-            resize_fd = os.open(
-                resize_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o640
-            )
+            resize_fd = os.open(resize_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o640)
             try:
                 os.write(resize_fd, b"abcdefgh")
                 os.fdatasync(resize_fd)
@@ -219,13 +213,9 @@ def main() -> int:
                 raise RuntimeError("path truncate reported the wrong file size")
 
             sparse_path = mount / "sparse.bin"
-            chunks_before_sparse = {
-                chunk.name for chunk in (work_dir / "node" / "dfs" / "chunks").iterdir()
-            }
+            chunks_before_sparse = {chunk.name for chunk in (work_dir / "node" / "dfs" / "chunks").iterdir()}
             sparse_offset = 1024 * 1024
-            sparse_fd = os.open(
-                sparse_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o640
-            )
+            sparse_fd = os.open(sparse_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o640)
             try:
                 os.pwrite(sparse_fd, b"tail", sparse_offset)
                 os.fsync(sparse_fd)
@@ -241,9 +231,7 @@ def main() -> int:
                     raise RuntimeError("sparse hole tail did not read as zero")
                 if sparse_file.read(4) != b"tail":
                     raise RuntimeError("sparse payload mismatch")
-            chunks_after_sparse = {
-                chunk.name for chunk in (work_dir / "node" / "dfs" / "chunks").iterdir()
-            }
+            chunks_after_sparse = {chunk.name for chunk in (work_dir / "node" / "dfs" / "chunks").iterdir()}
             if len(chunks_after_sparse - chunks_before_sparse) != 1:
                 raise RuntimeError("sparse hole was materialized as extra Chunk data")
 
@@ -264,9 +252,7 @@ def main() -> int:
     except Exception as error:  # noqa: BLE001 - emit bounded diagnostics for the E2E runner.
         result.update(error=str(error), meta_log=tail(meta_log), node_log=tail(node_log))
     finally:
-        if subprocess.run(
-            ["mountpoint", "-q", str(mount)], check=False, capture_output=True
-        ).returncode == 0:
+        if subprocess.run(["mountpoint", "-q", str(mount)], check=False, capture_output=True).returncode == 0:
             fusermount = shutil.which("fusermount3") or shutil.which("fusermount")
             if fusermount:
                 subprocess.run([fusermount, "-uz", str(mount)], check=False)

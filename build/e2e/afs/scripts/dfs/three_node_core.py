@@ -17,10 +17,10 @@ import http.client
 import importlib.util
 import json
 import os
-from pathlib import Path
 import subprocess
 import sys
 import time
+from pathlib import Path
 from typing import Any
 
 NODE_C_IP = "127.0.0.4"
@@ -43,8 +43,15 @@ def rewrite_trusted_line(text: str, trusted: str) -> str:
 
 
 def read_with_oracle(path: Path, expected_sha: str) -> subprocess.CompletedProcess[str]:
-    code = "import hashlib,sys;d=open(sys.argv[1],'rb').read();assert len(d)==65536;assert hashlib.sha256(d).hexdigest()==sys.argv[2]"
-    return subprocess.run(["python3", "-c", code, str(path), expected_sha], capture_output=True, text=True, timeout=30, check=False)
+    code = (
+        "import hashlib, sys\nd = open(sys.argv[1], 'rb').read()\nif not "
+        "len(d) == 65536:\n    raise AssertionError('len(d) == 65536')\nif "
+        "not hashlib.sha256(d).hexdigest() == sys.argv[2]:\n    raise "
+        "AssertionError('hashlib.sha256(d).hexdigest() == sys.argv[2]')\n"
+    )
+    return subprocess.run(
+        ["python3", "-c", code, str(path), expected_sha], capture_output=True, text=True, timeout=30, check=False
+    )
 
 
 class DfsCoreRun:
@@ -58,7 +65,8 @@ class DfsCoreRun:
         class Run(owner.Scenario):
             def start(self, name: str) -> None:
                 if name != "node-c":
-                    return super().start(name)
+                    super().start(name)
+                    return
                 log = open(self.root / f"node-c-{len(self.receipts)}.log", "ab")
                 self.logs.append(log)
                 proc = subprocess.Popen(
@@ -77,7 +85,9 @@ class DfsCoreRun:
                         conn = http.client.HTTPConnection(NODE_C_IP, owner.NODE_REST, timeout=1)
                         conn.request("GET", "/health")
                         response = conn.getresponse()
-                        ready, last = owner.health_ready(response.status, response.read().decode("utf-8", errors="replace"))
+                        ready, last = owner.health_ready(
+                            response.status, response.read().decode("utf-8", errors="replace")
+                        )
                         conn.close()
                         if ready:
                             self.check("node-c healthy", True, {"pid": proc.pid, "health": last})
@@ -107,8 +117,24 @@ class DfsCoreRun:
         run = self.run
         tls = run.root / "tls"
         run.command(["openssl", "genrsa", "-out", tls / "node-c-key.pem", "2048"], check_name="generate node-c key")
-        run.command(["openssl", "req", "-new", "-key", tls / "node-c-key.pem", "-subj", "/CN=node-c", "-out", tls / "node-c.csr"], check_name="generate node-c csr")
-        (tls / "node-c.ext").write_text(f"subjectAltName=DNS:afs-meta,DNS:node-c,IP:{NODE_C_IP}\nextendedKeyUsage=serverAuth,clientAuth\n", encoding="utf-8")
+        run.command(
+            [
+                "openssl",
+                "req",
+                "-new",
+                "-key",
+                tls / "node-c-key.pem",
+                "-subj",
+                "/CN=node-c",
+                "-out",
+                tls / "node-c.csr",
+            ],
+            check_name="generate node-c csr",
+        )
+        (tls / "node-c.ext").write_text(
+            f"subjectAltName=DNS:afs-meta,DNS:node-c,IP:{NODE_C_IP}\nextendedKeyUsage=serverAuth,clientAuth\n",
+            encoding="utf-8",
+        )
         run.command(
             [
                 "openssl",
@@ -135,7 +161,9 @@ class DfsCoreRun:
         (tls / "node-c.ext").unlink()
         os.chmod(tls / "node-c-key.pem", 0o600)
         os.chmod(tls / "node-c.pem", 0o644)
-        run.command(["openssl", "verify", "-CAfile", tls / "ca.pem", tls / "node-c.pem"], check_name="verify node-c certificate")
+        run.command(
+            ["openssl", "verify", "-CAfile", tls / "ca.pem", tls / "node-c.pem"], check_name="verify node-c certificate"
+        )
 
     def _rewrite_configs(self) -> None:
         owner = self.owner
@@ -160,7 +188,10 @@ class DfsCoreRun:
         (run.root / "etc/node-c.toml").write_text(node_c, encoding="utf-8")
         for name in ["meta", "node-a", "node-b", "node-c"]:
             role = "meta" if name == "meta" else "node"
-            run.command([run.binary_dir / f"afs-{role}", "--config", run.root / "etc" / f"{name}.toml", "--print-config"], check_name=f"print-config {name}")
+            run.command(
+                [run.binary_dir / f"afs-{role}", "--config", run.root / "etc" / f"{name}.toml", "--print-config"],
+                check_name=f"print-config {name}",
+            )
 
     def run_scenario(self) -> None:
         run = self.run
@@ -170,8 +201,17 @@ class DfsCoreRun:
                 run.start(name)
             roots = [run.root / name / "mount/dfs" for name in ["node-a", "node-b", "node-c"]]
             for root in roots:
-                mount = json.loads(run.command(["findmnt", "-J", "--mountpoint", root, "-o", "TARGET,SOURCE,FSTYPE"], check_name=f"find DFS mount {root}"))["filesystems"][0]
-                run.check(f"actual DFS mount {root}", mount["source"] == "afs-dfs" and mount["fstype"].startswith("fuse"), mount)
+                mount = json.loads(
+                    run.command(
+                        ["findmnt", "-J", "--mountpoint", root, "-o", "TARGET,SOURCE,FSTYPE"],
+                        check_name=f"find DFS mount {root}",
+                    )
+                )["filesystems"][0]
+                run.check(
+                    f"actual DFS mount {root}",
+                    mount["source"] == "afs-dfs" and mount["fstype"].startswith("fuse"),
+                    mount,
+                )
             writer = roots[0] / "migration-manyread.bin"
             for generation in range(GENERATIONS):
                 payload = bytes([(generation + 1) * 37]) * PAYLOAD_SIZE
@@ -188,7 +228,11 @@ class DfsCoreRun:
                 with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
                     results = list(pool.map(lambda root: read_with_oracle(root / writer.name, expected), roots[1:]))
                 for name, result in zip(["node-b", "node-c"], results):
-                    run.check(f"generation {generation} reader {name}", result.returncode == 0, {"returncode": result.returncode, "stderr": result.stderr, "sha256": expected})
+                    run.check(
+                        f"generation {generation} reader {name}",
+                        result.returncode == 0,
+                        {"returncode": result.returncode, "stderr": result.stderr, "sha256": expected},
+                    )
             writer.unlink()
             descriptor = os.open(roots[0], os.O_RDONLY | os.O_DIRECTORY)
             try:
@@ -199,12 +243,24 @@ class DfsCoreRun:
                 run.check(f"remote deletion visible {root}", not (root / writer.name).exists())
             for name in ["node-c", "node-b", "node-a", "meta"]:
                 run.stop(name)
-            run.check("normal unmount no owned mounts", not any(str(run.root) in line for line in Path("/proc/self/mountinfo").read_text(encoding="utf-8").splitlines()))
-            run._write_json(
+            run.check(
+                "normal unmount no owned mounts",
+                not any(
+                    str(run.root) in line
+                    for line in Path("/proc/self/mountinfo").read_text(encoding="utf-8").splitlines()
+                ),
+            )
+            run.write_json(
                 "result.json",
                 {
                     "status": "PASS",
-                    "scope": "one Linux VM, local-file Meta, three distinct DFS Node processes over mTLS TCP; one writer A, concurrent readers B+C, three 64KiB generations, fsync+close-to-open, deletion and normal stop; one required durable copy; no performance, 3FS parity, three-copy or cross-host claim",
+                    "scope": (
+                        "one Linux VM, local-file Meta, three distinct DFS Node "
+                        "processes over mTLS TCP; one writer A, concurrent readers B+C, "
+                        "three 64KiB generations, fsync+close-to-open, deletion and "
+                        "normal stop; one required durable copy; no performance, 3FS "
+                        "parity, three-copy or cross-host claim"
+                    ),
                     "checks": run.checks,
                     "waits": run.receipts,
                 },
@@ -228,7 +284,9 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", type=Path, required=True, help="target repository root")
     parser.add_argument("--binary-dir", type=Path, required=True, help="directory containing afs-meta and afs-node")
-    parser.add_argument("--work-root", type=Path, required=True, help="fresh absolute work/evidence directory on Linux ext4")
+    parser.add_argument(
+        "--work-root", type=Path, required=True, help="fresh absolute work/evidence directory on Linux ext4"
+    )
     return parser.parse_args()
 
 

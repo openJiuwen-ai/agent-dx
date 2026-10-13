@@ -1,13 +1,14 @@
 """Guard tests for the bounded DFS R3 multi-node cohort driver."""
+
 from __future__ import annotations
 
 import json
-from pathlib import Path
 import subprocess
 import sys
 import tempfile
-from types import SimpleNamespace
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import dfs_multinode_small as probe
@@ -50,25 +51,43 @@ def tuple_for(operation: str, batch: int, member: str, route: str | None) -> dic
 
 
 def content_verify(generation: int) -> dict[str, object]:
-    return {"status": "PASS", "bytes": 64 * 2**20,
-            "sha256": write_small.expected_content(generation)["sha256"],
-            "eof": {"status": "PASS", "offset": 64 * 2**20, "extra_bytes": 0}}
+    return {
+        "status": "PASS",
+        "bytes": 64 * 2**20,
+        "sha256": write_small.expected_content(generation)["sha256"],
+        "eof": {"status": "PASS", "offset": 64 * 2**20, "extra_bytes": 0},
+    }
 
 
-def coordinator_payload(operation: str = "write", route: str | None = None, failed_final: bool = False,
-                        duplicate_ready: bool = False, bad_result: bool = False,
-                        mono_raw_elapsed: int | None = 100_000_000,
-                        interleaved_final: bool = False, missing_fsync: bool = False,
-                        missing_pre_read: bool = False, bad_token: bool = False,
-                        bad_c_done_token: bool = False,
-                        bool_index: bool = False) -> str:
+def coordinator_payload(
+    operation: str = "write",
+    route: str | None = None,
+    failed_final: bool = False,
+    duplicate_ready: bool = False,
+    bad_result: bool = False,
+    mono_raw_elapsed: int | None = 100_000_000,
+    interleaved_final: bool = False,
+    missing_fsync: bool = False,
+    missing_pre_read: bool = False,
+    bad_token: bool = False,
+    bad_c_done_token: bool = False,
+    bool_index: bool = False,
+) -> str:
     lines: list[dict[str, object]] = []
     batch = 1
     identity = good_identity()
     for member in probe.MEMBERS:
-        lines.append({"event": "READY", "reader_id": member, "session_token": "s",
-                      "cohort_token": "c", "operation": operation, "identity": identity,
-                      **tuple_for(operation, batch, member, route)})
+        lines.append(
+            {
+                "event": "READY",
+                "reader_id": member,
+                "session_token": "s",
+                "cohort_token": "c",
+                "operation": operation,
+                "identity": identity,
+                **tuple_for(operation, batch, member, route),
+            }
+        )
     if duplicate_ready:
         lines[1] = dict(lines[0])
     tail: list[dict[str, object]] = []
@@ -82,20 +101,39 @@ def coordinator_payload(operation: str = "write", route: str | None = None, fail
             result["io_bytes"] = 1
         sample = {"result": result}
         start_token = "wrong" if bad_c_done_token and member == "A" else "s:c:start"
-        c_done = {"event": "C_DONE", "reader_id": member, "session_token": "s",
-                  "cohort_token": "c", "operation": operation, "start_token": start_token,
-                  "status": "PASS", "rc": 0, "result": result, "identity": identity,
-                  "py_monotonic_elapsed_ns": 100_000_000,
-                  "py_monotonic_raw_elapsed_ns": mono_raw_elapsed, **row}
-        final = {"event": "FINAL", "reader_id": member, "session_token": "s",
-                 "cohort_token": "c", "operation": operation, "start_token": start_token,
-                 "status": "BLOCKED" if failed_final and member == "B" else "DATA_RECORDED",
-                 "identity": identity, "sample": sample, "content": write_small.expected_content(generation),
-                 "content_verify": content_verify(generation),
-                 "parent_dir_fsync": False if missing_fsync and member == "A" else operation == "write",
-                 "root_dir_fsync": False if missing_fsync and member == "A" else operation == "write",
-                 "pre_read_content_verify": None if missing_pre_read and member == "A" else content_verify(generation),
-                 "source_member": row.get("source_member"), **row}
+        c_done = {
+            "event": "C_DONE",
+            "reader_id": member,
+            "session_token": "s",
+            "cohort_token": "c",
+            "operation": operation,
+            "start_token": start_token,
+            "status": "PASS",
+            "rc": 0,
+            "result": result,
+            "identity": identity,
+            "py_monotonic_elapsed_ns": 100_000_000,
+            "py_monotonic_raw_elapsed_ns": mono_raw_elapsed,
+            **row,
+        }
+        final = {
+            "event": "FINAL",
+            "reader_id": member,
+            "session_token": "s",
+            "cohort_token": "c",
+            "operation": operation,
+            "start_token": start_token,
+            "status": "BLOCKED" if failed_final and member == "B" else "DATA_RECORDED",
+            "identity": identity,
+            "sample": sample,
+            "content": write_small.expected_content(generation),
+            "content_verify": content_verify(generation),
+            "parent_dir_fsync": False if missing_fsync and member == "A" else operation == "write",
+            "root_dir_fsync": False if missing_fsync and member == "A" else operation == "write",
+            "pre_read_content_verify": None if missing_pre_read and member == "A" else content_verify(generation),
+            "source_member": row.get("source_member"),
+            **row,
+        }
         if bad_token and member == "A":
             final["start_token"] = "wrong"
         if interleaved_final and member == "A":
@@ -128,11 +166,18 @@ class MultiNodeSmallGuards(unittest.TestCase):
         identity = good_identity()
         row = probe.write_tuple(batch, member)
         result = good_c_result(row["generation"])
-        return {"event": "FINAL", "operation": "write", "status": "DATA_RECORDED",
-                "identity": identity, "sample": {"result": result},
-                "content": write_small.expected_content(row["generation"]),
-                "content_verify": content_verify(row["generation"]),
-                "parent_dir_fsync": True, "root_dir_fsync": True, **row}
+        return {
+            "event": "FINAL",
+            "operation": "write",
+            "status": "DATA_RECORDED",
+            "identity": identity,
+            "sample": {"result": result},
+            "content": write_small.expected_content(row["generation"]),
+            "content_verify": content_verify(row["generation"]),
+            "parent_dir_fsync": True,
+            "root_dir_fsync": True,
+            **row,
+        }
 
     def test_single_writer_manifest_accepts_warmup_and_rejects_wrong_source(self) -> None:
         identity = good_identity()
@@ -140,7 +185,9 @@ class MultiNodeSmallGuards(unittest.TestCase):
             path = Path(tmp) / "manifest.json"
             expected = probe.read_tuple(0, "r1", "A")
             path.write_text(json.dumps(self.writer_summary(0, "B")), encoding="utf-8")
-            self.assertEqual(probe.validate_single_write_manifest(str(path), identity, expected)["record"]["member"], "B")
+            self.assertEqual(
+                probe.validate_single_write_manifest(str(path), identity, expected)["record"]["member"], "B"
+            )
             path.write_text(json.dumps(self.writer_summary(1, "B")), encoding="utf-8")
             with self.assertRaises(ValueError):
                 probe.validate_single_write_manifest(str(path), identity, expected)
@@ -152,18 +199,39 @@ class MultiNodeSmallGuards(unittest.TestCase):
             with self.assertRaises(ValueError):
                 probe.validate_single_write_manifest(str(path), identity, expected)
 
-    def run_coordinator(self, payload: str, operation: str = "write", route: str | None = None) -> tuple[subprocess.CompletedProcess[str], dict[str, object]]:
+    def run_coordinator(
+        self, payload: str, operation: str = "write", route: str | None = None
+    ) -> tuple[subprocess.CompletedProcess[str], dict[str, object]]:
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp) / "coord"
-            command = [sys.executable, str(Path(probe.__file__)), "coordinator",
-                       "--operation", operation, "--batch", "1", "--session-token", "s",
-                       "--cohort-token", "c", "--round-timeout", "0.2", "--output", str(out)]
+            command = [
+                sys.executable,
+                str(Path(probe.__file__)),
+                "coordinator",
+                "--operation",
+                operation,
+                "--batch",
+                "1",
+                "--session-token",
+                "s",
+                "--cohort-token",
+                "c",
+                "--round-timeout",
+                "0.2",
+                "--output",
+                str(out),
+            ]
             if route:
                 command.extend(["--route", route])
-            completed = subprocess.run(command, input=payload, text=True, stdout=subprocess.PIPE,
-                                       stderr=subprocess.PIPE, timeout=5)
+            completed = subprocess.run(
+                command, input=payload, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5
+            )
             summary_path = out / "summary.json"
-            summary = json.loads(summary_path.read_text(encoding="utf-8")) if summary_path.exists() else {"error": completed.stderr}
+            summary = (
+                json.loads(summary_path.read_text(encoding="utf-8"))
+                if summary_path.exists()
+                else {"error": completed.stderr}
+            )
             return completed, summary
 
     def test_coordinator_accepts_three_members_and_waits_for_final_postcheck(self) -> None:
@@ -200,8 +268,13 @@ class MultiNodeSmallGuards(unittest.TestCase):
 
         args = SimpleNamespace(operation="write", batch=0, route=None, session_token="s", cohort_token="c")
         row = probe.write_tuple(0, "B")
-        event = {"event": "READY", "session_token": "s", "cohort_token": "c", "operation": "write",
-                 **dict(row, index=True)}
+        event = {
+            "event": "READY",
+            "session_token": "s",
+            "cohort_token": "c",
+            "operation": "write",
+            **dict(row, index=True),
+        }
         with self.assertRaises(ValueError):
             probe.require_event(event, "READY", args)
 
@@ -216,7 +289,12 @@ class MultiNodeSmallGuards(unittest.TestCase):
             (coordinator_payload(missing_fsync=True), "write", None, "fsync"),
             (coordinator_payload(bad_token=True), "write", None, "start token"),
             (coordinator_payload(bad_c_done_token=True), "write", None, "C_DONE start token"),
-            (coordinator_payload(operation="read", route="r1", missing_pre_read=True), "read", "r1", "content verification"),
+            (
+                coordinator_payload(operation="read", route="r1", missing_pre_read=True),
+                "read",
+                "r1",
+                "content verification",
+            ),
         ]:
             completed, summary = self.run_coordinator(payload, operation=operation, route=route)
             self.assertNotEqual(completed.returncode, 0)
@@ -232,48 +310,106 @@ class MultiNodeSmallGuards(unittest.TestCase):
         self.assertFalse(diag["proved_common_inner_overlap"])
 
     def test_worker_does_not_pass_when_postcheck_fails_after_c_done(self) -> None:
-        args = SimpleNamespace(operation="write", member="A", batch=0, route=None, session_token="s",
-                               cohort_token="c", round_timeout=1, output="/unused", dfs_root="/mnt",
-                               io_tool="/tool", identity="/id", candidate=None, manifest=None)
+        args = SimpleNamespace(
+            operation="write",
+            member="A",
+            batch=0,
+            route=None,
+            session_token="s",
+            cohort_token="c",
+            round_timeout=1,
+            output="/unused",
+            dfs_root="/mnt",
+            io_tool="/tool",
+            identity="/id",
+            candidate=None,
+            manifest=None,
+        )
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp) / "out"
             out.mkdir()
             root = Path(tmp) / "mnt"
             root.mkdir()
-            sample = {"status": "PASS", "rc": 0, "result": good_c_result(1),
-                      "py_monotonic_elapsed_ns": 100, "py_monotonic_raw_elapsed_ns": 100,
-                      "clock_info": {}}
-            start = {"event": "START", "member": "A", "session_token": "s", "operation": "write",
-                     "batch": 0, "cohort_token": "c", "start_token": "t"}
-            with patch.object(probe, "prepare_common", return_value=(out, root, Path(tmp) / "tool", good_identity(), {})), \
-                 patch.object(probe, "read_control", return_value=start), \
-                 patch.object(probe, "run_timed", return_value=sample), \
-                 patch.object(probe.sync, "fsync_directory"), \
-                 patch.object(probe.write_small, "verify_content", side_effect=ValueError("bad sha")), \
-                 patch.object(probe, "emit"):
+            sample = {
+                "status": "PASS",
+                "rc": 0,
+                "result": good_c_result(1),
+                "py_monotonic_elapsed_ns": 100,
+                "py_monotonic_raw_elapsed_ns": 100,
+                "clock_info": {},
+            }
+            start = {
+                "event": "START",
+                "member": "A",
+                "session_token": "s",
+                "operation": "write",
+                "batch": 0,
+                "cohort_token": "c",
+                "start_token": "t",
+            }
+            with (
+                patch.object(
+                    probe, "prepare_common", return_value=(out, root, Path(tmp) / "tool", good_identity(), {})
+                ),
+                patch.object(probe, "read_control", return_value=start),
+                patch.object(probe, "run_timed", return_value=sample),
+                patch.object(probe.sync, "fsync_directory"),
+                patch.object(probe.write_small, "verify_content", side_effect=ValueError("bad sha")),
+                patch.object(probe, "emit"),
+            ):
                 result = probe.worker(args)
         self.assertEqual(result["status"], "BLOCKED")
         self.assertIn("bad sha", result["error"])
 
     def test_failed_probe_sample_survives_error_summary(self) -> None:
-        args = SimpleNamespace(operation="write", member="A", batch=0, route=None, session_token="s",
-                               cohort_token="c", round_timeout=1, output="/unused", dfs_root="/mnt",
-                               io_tool="/tool", identity="/id", candidate=None, manifest=None)
+        args = SimpleNamespace(
+            operation="write",
+            member="A",
+            batch=0,
+            route=None,
+            session_token="s",
+            cohort_token="c",
+            round_timeout=1,
+            output="/unused",
+            dfs_root="/mnt",
+            io_tool="/tool",
+            identity="/id",
+            candidate=None,
+            manifest=None,
+        )
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp) / "out"
             out.mkdir()
             root = Path(tmp) / "mnt"
             root.mkdir()
-            sample = {"status": "FAIL", "rc": 2, "stdout": "partial diagnostic\n",
-                      "stderr": "create: Device or resource busy\n", "result": None,
-                      "error": "ValueError('probe exit 2')", "py_monotonic_elapsed_ns": 100,
-                      "py_monotonic_raw_elapsed_ns": 100, "clock_info": {}}
-            start = {"event": "START", "member": "A", "session_token": "s", "operation": "write",
-                     "batch": 0, "cohort_token": "c", "start_token": "t"}
-            with patch.object(probe, "prepare_common", return_value=(out, root, Path(tmp) / "tool", good_identity(), {})), \
-                 patch.object(probe, "read_control", return_value=start), \
-                 patch.object(probe, "run_timed", return_value=sample), \
-                 patch.object(probe, "emit"):
+            sample = {
+                "status": "FAIL",
+                "rc": 2,
+                "stdout": "partial diagnostic\n",
+                "stderr": "create: Device or resource busy\n",
+                "result": None,
+                "error": "ValueError('probe exit 2')",
+                "py_monotonic_elapsed_ns": 100,
+                "py_monotonic_raw_elapsed_ns": 100,
+                "clock_info": {},
+            }
+            start = {
+                "event": "START",
+                "member": "A",
+                "session_token": "s",
+                "operation": "write",
+                "batch": 0,
+                "cohort_token": "c",
+                "start_token": "t",
+            }
+            with (
+                patch.object(
+                    probe, "prepare_common", return_value=(out, root, Path(tmp) / "tool", good_identity(), {})
+                ),
+                patch.object(probe, "read_control", return_value=start),
+                patch.object(probe, "run_timed", return_value=sample),
+                patch.object(probe, "emit"),
+            ):
                 result = probe.worker(args)
             self.assertEqual(result["status"], "BLOCKED")
             self.assertEqual(result["sample"], sample)
@@ -281,9 +417,21 @@ class MultiNodeSmallGuards(unittest.TestCase):
             self.assertEqual(json.loads((out / "probe-sample.json").read_text()), sample)
 
     def test_read_worker_prechecks_before_ready_and_postchecks_after_c_done(self) -> None:
-        args = SimpleNamespace(operation="read", member="A", batch=0, route="r1", session_token="s",
-                               cohort_token="c", round_timeout=1, output="/unused", dfs_root="/mnt",
-                               io_tool="/tool", identity="/id", candidate=None, manifest="/manifest")
+        args = SimpleNamespace(
+            operation="read",
+            member="A",
+            batch=0,
+            route="r1",
+            session_token="s",
+            cohort_token="c",
+            round_timeout=1,
+            output="/unused",
+            dfs_root="/mnt",
+            io_tool="/tool",
+            identity="/id",
+            candidate=None,
+            manifest="/manifest",
+        )
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp) / "out"
             out.mkdir()
@@ -292,12 +440,25 @@ class MultiNodeSmallGuards(unittest.TestCase):
             payload.parent.mkdir(parents=True)
             payload.write_bytes(b"")
             content = write_small.expected_content(2)
-            sample = {"status": "PASS", "rc": 0, "result": good_c_result(2, "seq-read"),
-                      "py_monotonic_elapsed_ns": 100, "py_monotonic_raw_elapsed_ns": 100,
-                      "clock_info": {}}
-            start = {"event": "START", "member": "A", "session_token": "s", "operation": "read",
-                     "batch": 0, "cohort_token": "c", "start_token": "t",
-                     "route": "r1", "source_member": "B"}
+            sample = {
+                "status": "PASS",
+                "rc": 0,
+                "result": good_c_result(2, "seq-read"),
+                "py_monotonic_elapsed_ns": 100,
+                "py_monotonic_raw_elapsed_ns": 100,
+                "clock_info": {},
+            }
+            start = {
+                "event": "START",
+                "member": "A",
+                "session_token": "s",
+                "operation": "read",
+                "batch": 0,
+                "cohort_token": "c",
+                "start_token": "t",
+                "route": "r1",
+                "source_member": "B",
+            }
             calls: list[str] = []
 
             def fake_verify(_payload: Path, expected_content: dict[str, object]) -> dict[str, object]:
@@ -308,13 +469,20 @@ class MultiNodeSmallGuards(unittest.TestCase):
             def fake_emit(event: dict[str, object]) -> None:
                 calls.append(str(event["event"]))
 
-            with patch.object(probe, "prepare_common", return_value=(out, root, Path(tmp) / "tool", good_identity(), {})), \
-                 patch.object(probe, "validate_single_write_manifest",
-                              return_value={"record": {"content": content}, "path": "/manifest"}), \
-                 patch.object(probe, "read_control", return_value=start), \
-                 patch.object(probe, "run_timed", return_value=sample), \
-                 patch.object(probe.write_small, "verify_content", side_effect=fake_verify), \
-                 patch.object(probe, "emit", side_effect=fake_emit):
+            with (
+                patch.object(
+                    probe, "prepare_common", return_value=(out, root, Path(tmp) / "tool", good_identity(), {})
+                ),
+                patch.object(
+                    probe,
+                    "validate_single_write_manifest",
+                    return_value={"record": {"content": content}, "path": "/manifest"},
+                ),
+                patch.object(probe, "read_control", return_value=start),
+                patch.object(probe, "run_timed", return_value=sample),
+                patch.object(probe.write_small, "verify_content", side_effect=fake_verify),
+                patch.object(probe, "emit", side_effect=fake_emit),
+            ):
                 result = probe.worker(args)
 
         self.assertEqual(result["status"], "DATA_RECORDED")

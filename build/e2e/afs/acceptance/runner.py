@@ -26,10 +26,11 @@ from xml.etree import ElementTree as ET
 
 import environment
 
-
 STATUS_VALUES = {"PASS", "FAIL", "BLOCKED", "INCONCLUSIVE", "EXCLUDED"}
 NON_PASS_STATUSES = ("FAIL", "BLOCKED", "INCONCLUSIVE", "EXCLUDED")
 DEFAULT_TIMEOUT_SECONDS = 30
+
+
 def find_repo_root(start: Path) -> Path:
     for parent in [start, *start.parents]:
         if (parent / "Cargo.toml").is_file() and (parent / "build" / "e2e").is_dir():
@@ -169,7 +170,9 @@ def load_identity_attestation(path: str | None) -> dict[str, Any]:
 
 
 def observed_release_identity(
-    manifest_path: Path, attestation: dict[str, Any], contract_path: Path,
+    manifest_path: Path,
+    attestation: dict[str, Any],
+    contract_path: Path,
 ) -> dict[str, Any]:
     observed = {
         "runner": {"path": str(Path(__file__).resolve()), "sha256": sha256_file(Path(__file__).resolve())},
@@ -293,7 +296,9 @@ def manifest_matrix_axes(case: dict[str, Any], profile: str) -> dict[str, list[s
     return axes
 
 
-def select_matrix(case: dict[str, Any], requested: MatrixSelection, profile: str) -> tuple[list[MatrixSelection], dict[str, Any]]:
+def select_matrix(
+    case: dict[str, Any], requested: MatrixSelection, profile: str
+) -> tuple[list[MatrixSelection], dict[str, Any]]:
     expected = manifest_matrix_axes(case, profile)
     selected_values: dict[str, list[str]] = {}
     driver_owned_axes: dict[str, list[str]] = {}
@@ -328,12 +333,12 @@ def select_matrix(case: dict[str, Any], requested: MatrixSelection, profile: str
         for meta in metas
         for transport in transports
     ]
+    selected_axes = {}
+    for key, values in selected_values.items():
+        selected_axes[key] = [value for value in values if value is not None]
     coverage = {
         "expected": expected,
-        "selected": {
-            key: [value for value in values if value is not None]
-            for key, values in selected_values.items()
-        },
+        "selected": selected_axes,
         "missing_full_coverage": missing,
         "full_matrix_covered": not missing,
         "driver_owned_axes": driver_owned_axes,
@@ -424,7 +429,9 @@ def parse_driver_proof_from_file(stdout_path: Path) -> dict[str, Any] | None:
     return None
 
 
-def proof_identity_error(proof: dict[str, Any], case: dict[str, Any], profile: str, matrix: MatrixSelection) -> str | None:
+def proof_identity_error(
+    proof: dict[str, Any], case: dict[str, Any], profile: str, matrix: MatrixSelection
+) -> str | None:
     proof_case_id = proof.get("case_id")
     if proof_case_id is None and isinstance(proof.get("case"), dict):
         proof_case_id = proof["case"].get("id")
@@ -585,7 +592,10 @@ def validate_driver_axis_coverage(
             if check is None:
                 return f"driver coverage axis {axis!r} value {value!r} references unknown check {check_name!r}", proven
             if str(check.get("status", "")).upper() not in accepted_statuses:
-                return f"driver coverage axis {axis!r} value {value!r} references non-passing check {check_name!r}", proven
+                return (
+                    f"driver coverage axis {axis!r} value {value!r} references non-passing check {check_name!r}",
+                    proven,
+                )
             proven[axis][value] = check_name
     return None, proven
 
@@ -605,9 +615,7 @@ def proof_status(proof: dict[str, Any], returncode: int, case: dict[str, Any], r
             return "BLOCKED", validation_error
     if status == "PASS":
         bad_checks = [
-            check
-            for check in checks
-            if str(check.get("status", "")).upper() not in STRUCTURED_PASS_CHECK_STATUSES
+            check for check in checks if str(check.get("status", "")).upper() not in STRUCTURED_PASS_CHECK_STATUSES
         ]
         if bad_checks:
             return "FAIL", "driver reported PASS but at least one structured check did not pass"
@@ -666,7 +674,9 @@ def run_driver(
             )
         except OSError as exc:
             stderr_file.write(f"failed to start driver: {exc}\n".encode("utf-8", errors="replace"))
-            return failure_result(case, profile, matrix, f"failed to start driver: {exc}", run_dir, coverage, stdout_path, stderr_path)
+            return failure_result(
+                case, profile, matrix, f"failed to start driver: {exc}", run_dir, coverage, stdout_path, stderr_path
+            )
 
         deadline = time.monotonic() + timeout_seconds
         while True:
@@ -686,8 +696,12 @@ def run_driver(
                     except ProcessLookupError:
                         pass
                     process.wait()
-                stderr_file.write(f"driver timed out after {timeout_seconds}s; process group terminated\n".encode("utf-8"))
-                result = blocked_result(case, profile, matrix, f"driver timed out after {timeout_seconds}s", run_dir, coverage)
+                stderr_file.write(
+                    f"driver timed out after {timeout_seconds}s; process group terminated\n".encode("utf-8")
+                )
+                result = blocked_result(
+                    case, profile, matrix, f"driver timed out after {timeout_seconds}s", run_dir, coverage
+                )
                 result["stdout_path"] = str(stdout_path)
                 result["stderr_path"] = str(stderr_path)
                 return result
@@ -910,7 +924,9 @@ def run_acceptance(args: argparse.Namespace) -> dict[str, Any]:
             "meta": args.meta,
             "transport": args.transport,
         },
-        "identity": build_identity(manifest_path, lock_path, manifest, lock, observed_identity, release_identity_errors),
+        "identity": build_identity(
+            manifest_path, lock_path, manifest, lock, observed_identity, release_identity_errors
+        ),
         "summary": {
             "status": summary_status,
             "full_release_gate_pass": full_release_gate_pass,
@@ -919,8 +935,7 @@ def run_acceptance(args: argparse.Namespace) -> dict[str, Any]:
             "selected_active_case_count": len(selected_active_ids),
             "missing_active_case_ids": missing_active_case_ids,
             "result_counts": {
-                status: sum(1 for result in results if result["status"] == status)
-                for status in sorted(STATUS_VALUES)
+                status: sum(1 for result in results if result["status"] == status) for status in sorted(STATUS_VALUES)
             },
             "case_coverage": case_coverages,
         },
@@ -955,7 +970,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="AFS Linux ARM64 acceptance runner")
     parser.add_argument("--cases", default=str(DEFAULT_CASES), help="case manifest JSON")
     parser.add_argument("--lock", help="explicit run-specific acceptance lock JSON (required except with --list)")
-    parser.add_argument("--contract", default=str(DEFAULT_CONTRACT), help="actual AFS acceptance contract to hash against lock.contract")
+    parser.add_argument(
+        "--contract", default=str(DEFAULT_CONTRACT), help="actual AFS acceptance contract to hash against lock.contract"
+    )
     parser.add_argument("--identity-attestation", help="observed Linux source/binary identity JSON for full release")
     parser.add_argument("--results-dir", default=str(DEFAULT_RESULTS), help="immutable results root")
     parser.add_argument("--run-id", help="optional unique run id for tests/repro")

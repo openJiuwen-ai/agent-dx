@@ -5,6 +5,7 @@ Runs the pinned secfs.test ``tools/bin/fsx`` binary against a caller supplied
 mount directory, preserves per-seed raw logs and command accounting, and emits
 the acceptance runner proof JSON as the final stdout object.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -55,7 +56,9 @@ def sha256_file(path: Path) -> str:
 
 def run_text(argv: list[str], timeout: int = 10) -> dict[str, Any]:
     try:
-        proc = subprocess.run(argv, shell=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, check=False)
+        proc = subprocess.run(
+            argv, shell=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, check=False
+        )
         return {"argv": argv, "returncode": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr}
     except Exception as exc:  # noqa: BLE001 - evidence records exact failure
         return {"argv": argv, "returncode": None, "exception": type(exc).__name__, "message": str(exc)}
@@ -114,7 +117,11 @@ def fsx_identity(suite_root: Path, fsx_binary: Path) -> dict[str, Any]:
     git = ["git", "-c", f"safe.directory={root}", "-C", str(root)]
     head = run_text(git + ["rev-parse", "HEAD"])
     status = run_text(git + ["status", "--porcelain"])
-    help_output = run_text([str(fsx_binary), "-h"]) if fsx_binary.exists() else {"returncode": None, "stdout": "", "stderr": "missing fsx"}
+    help_output = (
+        run_text([str(fsx_binary), "-h"])
+        if fsx_binary.exists()
+        else {"returncode": None, "stdout": "", "stderr": "missing fsx"}
+    )
     source = suite_root / "fstools" / "src" / "fsx" / "fsx.c"
     return {
         "suite_root": str(suite_root),
@@ -220,8 +227,6 @@ def classify_seed(command_result: dict[str, Any], stdout_path: Path, stderr_path
     }
 
 
-
-
 def parse_failure_operation(stdout_path: Path, stderr_path: Path) -> int | None:
     """Best-effort extraction of the operation number associated with an FSx failure."""
     text = ""
@@ -273,7 +278,9 @@ def remove_option_with_value(command: list[str], option: str) -> list[str]:
     return updated
 
 
-def build_prefix_replay_command(original_command: list[str], prefix_ops: int, artifacts_dir: Path, test_file: Path) -> list[str]:
+def build_prefix_replay_command(
+    original_command: list[str], prefix_ops: int, artifacts_dir: Path, test_file: Path
+) -> list[str]:
     command = remove_option_with_value(original_command, "-d")
     command = replace_or_append_option(command, "-N", str(prefix_ops))
     command = replace_or_append_option(command, "-P", str(artifacts_dir))
@@ -284,8 +291,6 @@ def build_prefix_replay_command(original_command: list[str], prefix_ops: int, ar
 
 def command_sha256(command: list[str]) -> str:
     return hashlib.sha256(json.dumps(command, sort_keys=False, separators=(",", ":")).encode()).hexdigest()
-
-
 
 
 def read_combined_output(stdout_path: Path, stderr_path: Path) -> str:
@@ -317,13 +322,18 @@ def failure_fingerprint(command_result: dict[str, Any], stdout_path: Path, stder
 def fingerprints_match(original: dict[str, Any], replay: dict[str, Any]) -> bool:
     if original.get("timed_out") or replay.get("timed_out"):
         return original.get("timed_out") == replay.get("timed_out")
-    return original.get("returncode") == replay.get("returncode") and bool(original.get("signature_sha256")) and original.get("signature_sha256") == replay.get("signature_sha256")
+    return (
+        original.get("returncode") == replay.get("returncode")
+        and bool(original.get("signature_sha256"))
+        and original.get("signature_sha256") == replay.get("signature_sha256")
+    )
 
 
 def attempt_for_result(result: dict[str, Any], artifacts: Path) -> dict[str, Any]:
     converted = dict(result)
     converted["artifacts"] = {k: rel(Path(v), artifacts) for k, v in result["artifacts"].items()}
     return converted
+
 
 def run_prefix_replay_attempt(
     original_command: list[str],
@@ -364,11 +374,14 @@ def run_prefix_replay_attempt(
         "process": result,
         "classification": classification,
         "failure_fingerprint": replay_fingerprint,
-        "matches_original_failure": fingerprints_match(original_fingerprint, replay_fingerprint or {}) if classification["result"] == "FAIL" else False,
+        "matches_original_failure": fingerprints_match(original_fingerprint, replay_fingerprint or {})
+        if classification["result"] == "FAIL"
+        else False,
         "cleanup": cleanup,
     }
     write_json(attempt_root / "attempt.json", record)
     return record
+
 
 def minimize_failed_seed_prefix(
     seed_record: dict[str, Any],
@@ -427,22 +440,38 @@ def minimize_failed_seed_prefix(
         return result
 
     replay_root = seed_artifacts / "prefix-replay"
-    high_attempt = run_prefix_replay_attempt(seed_record["command"], seed, int(upper), replay_root / f"attempt-001-N{int(upper)}", tested_fixture_parent, timeout_seconds, original_fingerprint)
+    high_attempt = run_prefix_replay_attempt(
+        seed_record["command"],
+        seed,
+        int(upper),
+        replay_root / f"attempt-001-N{int(upper)}",
+        tested_fixture_parent,
+        timeout_seconds,
+        original_fingerprint,
+    )
     result["attempts"].append(attempt_for_result(high_attempt, artifacts))
     if high_attempt["classification"]["result"] not in {"PASS", "FAIL"}:
-        result.update({
-            "status": "INCONCLUSIVE",
-            "reason": "prefix replay hit a non PASS/FAIL result at the upper bound; original case remains FAIL",
-            "candidate_upper_bound": int(upper),
-        })
+        result.update(
+            {
+                "status": "INCONCLUSIVE",
+                "reason": "prefix replay hit a non PASS/FAIL result at the upper bound; original case remains FAIL",
+                "candidate_upper_bound": int(upper),
+            }
+        )
         write_json(seed_artifacts / "minimization.json", result)
         return result
     if high_attempt["classification"]["result"] != "FAIL" or not high_attempt.get("matches_original_failure"):
-        result.update({
-            "status": "INCONCLUSIVE",
-            "reason": "original failure did not reproduce with the same failure fingerprint at the parsed prefix bound; original case remains FAIL",
-            "candidate_upper_bound": int(upper),
-        })
+        result.update(
+            {
+                "status": "INCONCLUSIVE",
+                "reason": (
+                    "original failure did not reproduce with the same failure "
+                    "fingerprint at the parsed prefix bound; original case remains "
+                    "FAIL"
+                ),
+                "candidate_upper_bound": int(upper),
+            }
+        )
         write_json(seed_artifacts / "minimization.json", result)
         return result
 
@@ -452,28 +481,42 @@ def minimize_failed_seed_prefix(
     while low < high and attempts_used < max_attempts:
         mid = (low + high) // 2
         attempts_used += 1
-        attempt = run_prefix_replay_attempt(seed_record["command"], seed, mid, replay_root / f"attempt-{attempts_used:03d}-N{mid}", tested_fixture_parent, timeout_seconds, original_fingerprint)
+        attempt = run_prefix_replay_attempt(
+            seed_record["command"],
+            seed,
+            mid,
+            replay_root / f"attempt-{attempts_used:03d}-N{mid}",
+            tested_fixture_parent,
+            timeout_seconds,
+            original_fingerprint,
+        )
         result["attempts"].append(attempt_for_result(attempt, artifacts))
         attempt_result = attempt["classification"]["result"]
         if attempt_result not in {"PASS", "FAIL"}:
-            result.update({
-                "status": "INCONCLUSIVE",
-                "reason": "prefix replay produced a non PASS/FAIL result during search; original case remains FAIL",
-                "inconclusive_prefix_operations": mid,
-                "inconclusive_result": attempt_result,
-                "attempts_used": attempts_used,
-            })
+            result.update(
+                {
+                    "status": "INCONCLUSIVE",
+                    "reason": "prefix replay produced a non PASS/FAIL result during search; original case remains FAIL",
+                    "inconclusive_prefix_operations": mid,
+                    "inconclusive_result": attempt_result,
+                    "attempts_used": attempts_used,
+                }
+            )
             write_json(seed_artifacts / "minimization.json", result)
             return result
         if attempt_result == "FAIL" and attempt.get("matches_original_failure"):
             high = mid
         elif attempt_result == "FAIL":
-            result.update({
-                "status": "INCONCLUSIVE",
-                "reason": "prefix replay failed with a different fingerprint during search; original case remains FAIL",
-                "inconclusive_prefix_operations": mid,
-                "attempts_used": attempts_used,
-            })
+            result.update(
+                {
+                    "status": "INCONCLUSIVE",
+                    "reason": (
+                        "prefix replay failed with a different fingerprint during search; original case remains FAIL"
+                    ),
+                    "inconclusive_prefix_operations": mid,
+                    "attempts_used": attempts_used,
+                }
+            )
             write_json(seed_artifacts / "minimization.json", result)
             return result
         else:
@@ -484,23 +527,46 @@ def minimize_failed_seed_prefix(
         if result["attempts"][-1]["prefix_operations"] != final_prefix:
             if attempts_used < max_attempts:
                 attempts_used += 1
-                final_attempt = run_prefix_replay_attempt(seed_record["command"], seed, final_prefix, replay_root / f"attempt-{attempts_used:03d}-N{final_prefix}", tested_fixture_parent, timeout_seconds, original_fingerprint)
+                final_attempt = run_prefix_replay_attempt(
+                    seed_record["command"],
+                    seed,
+                    final_prefix,
+                    replay_root / f"attempt-{attempts_used:03d}-N{final_prefix}",
+                    tested_fixture_parent,
+                    timeout_seconds,
+                    original_fingerprint,
+                )
                 result["attempts"].append(attempt_for_result(final_attempt, artifacts))
-        status = "REPRODUCED" if any(a["prefix_operations"] == final_prefix and a["classification"]["result"] == "FAIL" and a.get("matches_original_failure") for a in result["attempts"]) else "INCONCLUSIVE"
-        result.update({
-            "status": status,
-            "reason": "minimal failing prefix found" if status == "REPRODUCED" else "attempt budget ended before final prefix confirmation; original case remains FAIL",
-            "minimal_failing_prefix_operations": final_prefix if status == "REPRODUCED" else None,
-            "attempts_used": attempts_used,
-        })
+        status = (
+            "REPRODUCED"
+            if any(
+                a["prefix_operations"] == final_prefix
+                and a["classification"]["result"] == "FAIL"
+                and a.get("matches_original_failure")
+                for a in result["attempts"]
+            )
+            else "INCONCLUSIVE"
+        )
+        result.update(
+            {
+                "status": status,
+                "reason": "minimal failing prefix found"
+                if status == "REPRODUCED"
+                else "attempt budget ended before final prefix confirmation; original case remains FAIL",
+                "minimal_failing_prefix_operations": final_prefix if status == "REPRODUCED" else None,
+                "attempts_used": attempts_used,
+            }
+        )
     else:
-        result.update({
-            "status": "INCONCLUSIVE",
-            "reason": "attempt budget exhausted during prefix search; original case remains FAIL",
-            "search_low": low,
-            "search_high": high,
-            "attempts_used": attempts_used,
-        })
+        result.update(
+            {
+                "status": "INCONCLUSIVE",
+                "reason": "attempt budget exhausted during prefix search; original case remains FAIL",
+                "search_low": low,
+                "search_high": high,
+                "attempts_used": attempts_used,
+            }
+        )
     write_json(seed_artifacts / "minimization.json", result)
     return result
 
@@ -517,6 +583,7 @@ def minimize_failed_seeds(
             minimizations.append(minimize_failed_seed_prefix(record, artifacts, max_attempts, timeout_seconds))
     write_json(artifacts / "failure-minimization.json", minimizations)
     return minimizations
+
 
 def preflight_fixture(base_dir: Path, artifacts: Path) -> dict[str, Any]:
     probe = base_dir / f".afs-fsx-write-probe-{uuid.uuid4().hex[:8]}"
@@ -581,7 +648,9 @@ def run_fsx_seeds(
         test_file = seed_fixture / "fsxfile"
         stdout = seed_artifacts / "stdout.log"
         stderr = seed_artifacts / "stderr.log"
-        timeout = duration_timeout(duration_seconds, per_seed_timeout) if profile == "full" else (per_seed_timeout or 60)
+        timeout = (
+            duration_timeout(duration_seconds, per_seed_timeout) if profile == "full" else (per_seed_timeout or 60)
+        )
         command = build_fsx_command(fsx_binary, profile, duration_seconds, operations, seed, seed_artifacts, test_file)
         command_result = run_bounded(command, cwd=seed_fixture, timeout=timeout, stdout_path=stdout, stderr_path=stderr)
         classification = classify_seed(command_result, stdout, stderr)
@@ -614,7 +683,9 @@ def proof_status_from_accounting(accounting: dict[str, Any], profile: str, cap_a
         return "BLOCKED", "one or more FSx seeds were blocked before execution"
     if profile == "full" and cap_applied:
         return "BLOCKED", "full FSx run was capped and did not execute the fixed 900s x 3 seed contract"
-    if profile == "full" and (accounting["duration_seconds_per_seed"] < FULL_DURATION_SECONDS or accounting["selected_seeds"] != FULL_SEEDS):
+    if profile == "full" and (
+        accounting["duration_seconds_per_seed"] < FULL_DURATION_SECONDS or accounting["selected_seeds"] != FULL_SEEDS
+    ):
         return "BLOCKED", "full FSx run did not match the fixed 900s x 3 seed contract"
     if counts.get("PASS", 0) == accounting["executed"] and accounting["executed"] > 0:
         return "PASS", ""
@@ -624,26 +695,82 @@ def proof_status_from_accounting(accounting: dict[str, Any], profile: str, cap_a
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run AFS STD-03 secfs.test FSx driver")
     parser.add_argument("--case-id", default=os.environ.get("AFS_ACCEPTANCE_CASE_ID", "STD-03"))
-    parser.add_argument("--profile", choices=["smoke", "full"], default=os.environ.get("AFS_ACCEPTANCE_PROFILE", "smoke"))
+    parser.add_argument(
+        "--profile", choices=["smoke", "full"], default=os.environ.get("AFS_ACCEPTANCE_PROFILE", "smoke")
+    )
     parser.add_argument("--matrix-json", default=os.environ.get("AFS_ACCEPTANCE_MATRIX", "{}"))
-    parser.add_argument("--run-dir", type=Path, default=Path(os.environ.get("AFS_ACCEPTANCE_RUN_DIR", "results/std-03-driver")))
-    parser.add_argument("--mount", type=Path, default=Path(os.environ["AFS_ACCEPTANCE_MOUNT"]) if os.environ.get("AFS_ACCEPTANCE_MOUNT") else None)
-    parser.add_argument("--base-dir", type=Path, default=Path(os.environ["AFS_ACCEPTANCE_BASE_DIR"]) if os.environ.get("AFS_ACCEPTANCE_BASE_DIR") else None, help="Directory under --mount that contains the temporary FSx fixture. Relative paths are resolved below --mount.")
+    parser.add_argument(
+        "--run-dir", type=Path, default=Path(os.environ.get("AFS_ACCEPTANCE_RUN_DIR", "results/std-03-driver"))
+    )
+    parser.add_argument(
+        "--mount",
+        type=Path,
+        default=Path(os.environ["AFS_ACCEPTANCE_MOUNT"]) if os.environ.get("AFS_ACCEPTANCE_MOUNT") else None,
+    )
+    parser.add_argument(
+        "--base-dir",
+        type=Path,
+        default=Path(os.environ["AFS_ACCEPTANCE_BASE_DIR"]) if os.environ.get("AFS_ACCEPTANCE_BASE_DIR") else None,
+        help=(
+            "Directory under --mount that contains the temporary FSx "
+            "fixture. Relative paths are resolved below --mount."
+        ),
+    )
     parser.add_argument("--suite-root", type=Path, default=DEFAULT_SUITE_ROOT)
     parser.add_argument("--fsx-binary", type=Path, default=DEFAULT_FSX_BINARY)
-    parser.add_argument("--duration-seconds", type=int, default=None, help="Override per-seed FSx -d duration for smoke/full driver testing. Full overrides below 900s block release PASS.")
+    parser.add_argument(
+        "--duration-seconds",
+        type=int,
+        default=None,
+        help=(
+            "Override per-seed FSx -d duration for smoke/full driver "
+            "testing. Full overrides below 900s block release PASS."
+        ),
+    )
     parser.add_argument("--operations", type=int, default=SMOKE_OPERATIONS, help="Smoke profile FSx -N operation count")
-    parser.add_argument("--seeds", default=None, help="Comma-separated seed list. Full overrides different from 1,2,3 block release PASS.")
-    parser.add_argument("--max-seeds", type=int, default=None, help="Cap selected seeds for bounded driver tests. Full caps block release PASS.")
+    parser.add_argument(
+        "--seeds",
+        default=None,
+        help="Comma-separated seed list. Full overrides different from 1,2,3 block release PASS.",
+    )
+    parser.add_argument(
+        "--max-seeds",
+        type=int,
+        default=None,
+        help="Cap selected seeds for bounded driver tests. Full caps block release PASS.",
+    )
     parser.add_argument("--per-seed-timeout", type=int, default=None, help="Per-seed process timeout in seconds")
-    parser.add_argument("--failure-replay-attempts", type=int, default=12, help="Maximum attempts per failed seed for deterministic prefix replay minimization")
-    parser.add_argument("--failure-replay-timeout", type=int, default=30, help="Timeout in seconds for each prefix replay attempt")
-    parser.add_argument("--skip-failure-replay", action="store_true", help="Preserve original failure only; mark minimization as not attempted")
+    parser.add_argument(
+        "--failure-replay-attempts",
+        type=int,
+        default=12,
+        help="Maximum attempts per failed seed for deterministic prefix replay minimization",
+    )
+    parser.add_argument(
+        "--failure-replay-timeout", type=int, default=30, help="Timeout in seconds for each prefix replay attempt"
+    )
+    parser.add_argument(
+        "--skip-failure-replay",
+        action="store_true",
+        help="Preserve original failure only; mark minimization as not attempted",
+    )
     parser.add_argument("--process-pid", default=os.environ.get("AFS_ACCEPTANCE_PROCESS_PID"))
     parser.add_argument("--meta-process-pid", default=os.environ.get("AFS_ACCEPTANCE_META_PROCESS_PID"))
-    parser.add_argument("--backend", default=os.environ.get("AFS_ACCEPTANCE_BACKEND"), help="Observed product backend label, for proof identity only.")
-    parser.add_argument("--meta", default=os.environ.get("AFS_ACCEPTANCE_META"), help="Observed Meta backend label, for proof identity only.")
-    parser.add_argument("--allow-unpinned-suite-fixture", action="store_true", help="Only for driver self-tests with fake secfs.test fixtures")
+    parser.add_argument(
+        "--backend",
+        default=os.environ.get("AFS_ACCEPTANCE_BACKEND"),
+        help="Observed product backend label, for proof identity only.",
+    )
+    parser.add_argument(
+        "--meta",
+        default=os.environ.get("AFS_ACCEPTANCE_META"),
+        help="Observed Meta backend label, for proof identity only.",
+    )
+    parser.add_argument(
+        "--allow-unpinned-suite-fixture",
+        action="store_true",
+        help="Only for driver self-tests with fake secfs.test fixtures",
+    )
     return parser.parse_args(argv)
 
 
@@ -682,7 +809,11 @@ def main(argv: list[str]) -> int:
         if args.max_seeds is not None:
             selected_seeds = selected_seeds[: args.max_seeds]
             cap_applied = True
-        duration_seconds = args.duration_seconds if args.duration_seconds is not None else (FULL_DURATION_SECONDS if args.profile == "full" else 0)
+        duration_seconds = (
+            args.duration_seconds
+            if args.duration_seconds is not None
+            else (FULL_DURATION_SECONDS if args.profile == "full" else 0)
+        )
         operations = args.operations if args.profile == "smoke" else None
 
         fsx = fsx_identity(args.suite_root, args.fsx_binary)
@@ -703,49 +834,156 @@ def main(argv: list[str]) -> int:
             "created_at": utc(),
             "host": run_text(["hostname"]),
             "uname": run_text(["uname", "-a"]),
-            "platform": {"system": platform.system(), "release": platform.release(), "machine": platform.machine(), "python": platform.python_version(), "uid": os.geteuid(), "gid": os.getegid()},
+            "platform": {
+                "system": platform.system(),
+                "release": platform.release(),
+                "machine": platform.machine(),
+                "python": platform.python_version(),
+                "uid": os.geteuid(),
+                "gid": os.getegid(),
+            },
             "suite": fsx,
             "mount": mnt,
             "base_mount": base_mnt,
             "process": proc,
             "meta_process": meta_proc,
             "product": product_identity,
-            "selection": {"profile": args.profile, "full_seeds": FULL_SEEDS, "selected_seeds": selected_seeds, "duration_seconds_per_seed": duration_seconds, "smoke_operations": operations, "cap_applied": cap_applied},
+            "selection": {
+                "profile": args.profile,
+                "full_seeds": FULL_SEEDS,
+                "selected_seeds": selected_seeds,
+                "duration_seconds_per_seed": duration_seconds,
+                "smoke_operations": operations,
+                "cap_applied": cap_applied,
+            },
             "lock_state_note": "acceptance.lock.json may remain PREPARING; driver readiness is not a release PASS.",
         }
         write_json(artifacts / "identity.json", identity)
 
         suite_ok = ((fsx["git_head"] == SECFS_REV) or args.allow_unpinned_suite_fixture) and fsx["fsx_binary_exists"]
-        checks.append(build_check("pinned-suite-identity", "PASS" if suite_ok else "FAIL", {"expected": SECFS_REV, "observed": fsx.get("git_head"), "binary_exists": fsx.get("fsx_binary_exists"), "allow_unpinned_suite_fixture": args.allow_unpinned_suite_fixture}, rel(artifacts / "identity.json", run_dir)))
-        help_ok = "-S seed" in str(fsx.get("fsx_help", {}).get("stdout", "") + fsx.get("fsx_help", {}).get("stderr", "")) and "-P dirpath" in str(fsx.get("fsx_help", {}).get("stdout", "") + fsx.get("fsx_help", {}).get("stderr", ""))
-        checks.append(build_check("fsx-help-contract", "PASS" if help_ok else "BLOCKED", {"requires": ["-S seed", "-P dirpath", "-d duration", "-N numops"], "returncode": fsx.get("fsx_help", {}).get("returncode")}, rel(artifacts / "identity.json", run_dir)))
+        checks.append(
+            build_check(
+                "pinned-suite-identity",
+                "PASS" if suite_ok else "FAIL",
+                {
+                    "expected": SECFS_REV,
+                    "observed": fsx.get("git_head"),
+                    "binary_exists": fsx.get("fsx_binary_exists"),
+                    "allow_unpinned_suite_fixture": args.allow_unpinned_suite_fixture,
+                },
+                rel(artifacts / "identity.json", run_dir),
+            )
+        )
+        help_ok = "-S seed" in str(
+            fsx.get("fsx_help", {}).get("stdout", "") + fsx.get("fsx_help", {}).get("stderr", "")
+        ) and "-P dirpath" in str(fsx.get("fsx_help", {}).get("stdout", "") + fsx.get("fsx_help", {}).get("stderr", ""))
+        checks.append(
+            build_check(
+                "fsx-help-contract",
+                "PASS" if help_ok else "BLOCKED",
+                {
+                    "requires": ["-S seed", "-P dirpath", "-d duration", "-N numops"],
+                    "returncode": fsx.get("fsx_help", {}).get("returncode"),
+                },
+                rel(artifacts / "identity.json", run_dir),
+            )
+        )
         mount_ok = mnt.get("returncode") == 0 and bool(mnt.get("stdout", "").strip())
         base_dir_ok = base_dir.is_dir() and is_under(base_dir, args.mount)
-        checks.append(build_check("mount-identity", "PASS" if mount_ok else "BLOCKED", {"mount": str(args.mount), "findmnt_returncode": mnt.get("returncode")}, rel(artifacts / "identity.json", run_dir)))
-        checks.append(build_check("base-dir-scope", "PASS" if base_dir_ok else "BLOCKED", {"mount": str(args.mount), "base_dir": str(base_dir), "exists": base_dir.exists(), "is_dir": base_dir.is_dir(), "under_mount": is_under(base_dir, args.mount)}, rel(artifacts / "identity.json", run_dir)))
+        checks.append(
+            build_check(
+                "mount-identity",
+                "PASS" if mount_ok else "BLOCKED",
+                {"mount": str(args.mount), "findmnt_returncode": mnt.get("returncode")},
+                rel(artifacts / "identity.json", run_dir),
+            )
+        )
+        checks.append(
+            build_check(
+                "base-dir-scope",
+                "PASS" if base_dir_ok else "BLOCKED",
+                {
+                    "mount": str(args.mount),
+                    "base_dir": str(base_dir),
+                    "exists": base_dir.exists(),
+                    "is_dir": base_dir.is_dir(),
+                    "under_mount": is_under(base_dir, args.mount),
+                },
+                rel(artifacts / "identity.json", run_dir),
+            )
+        )
         backend_ok = bool(product_identity["backend"])
-        checks.append(build_check("backend-selection", "PASS" if backend_ok else "BLOCKED", product_identity, rel(artifacts / "identity.json", run_dir)))
+        checks.append(
+            build_check(
+                "backend-selection",
+                "PASS" if backend_ok else "BLOCKED",
+                product_identity,
+                rel(artifacts / "identity.json", run_dir),
+            )
+        )
         observed_checks = target_checks(platform.system(), product_identity["backend"], mnt, base_mnt, proc, meta_proc)
         for name, passed in observed_checks.items():
-            checks.append(build_check(name, "PASS" if passed else "BLOCKED", {"observed": passed}, rel(artifacts / "identity.json", run_dir)))
+            checks.append(
+                build_check(
+                    name,
+                    "PASS" if passed else "BLOCKED",
+                    {"observed": passed},
+                    rel(artifacts / "identity.json", run_dir),
+                )
+            )
         target_ok = all(observed_checks.values())
-        full_contract_ok = args.profile != "full" or (selected_seeds == FULL_SEEDS and duration_seconds >= FULL_DURATION_SECONDS and not cap_applied)
-        checks.append(build_check("fixed-seed-duration-contract", "PASS" if full_contract_ok else "BLOCKED", {"profile": args.profile, "full_seeds": FULL_SEEDS, "selected_seeds": selected_seeds, "required_duration_seconds": FULL_DURATION_SECONDS, "duration_seconds_per_seed": duration_seconds, "cap_applied": cap_applied}, rel(artifacts / "identity.json", run_dir)))
+        full_contract_ok = args.profile != "full" or (
+            selected_seeds == FULL_SEEDS and duration_seconds >= FULL_DURATION_SECONDS and not cap_applied
+        )
+        checks.append(
+            build_check(
+                "fixed-seed-duration-contract",
+                "PASS" if full_contract_ok else "BLOCKED",
+                {
+                    "profile": args.profile,
+                    "full_seeds": FULL_SEEDS,
+                    "selected_seeds": selected_seeds,
+                    "required_duration_seconds": FULL_DURATION_SECONDS,
+                    "duration_seconds_per_seed": duration_seconds,
+                    "cap_applied": cap_applied,
+                },
+                rel(artifacts / "identity.json", run_dir),
+            )
+        )
 
         if not suite_ok or not help_ok or not mount_ok or not base_dir_ok or not backend_ok or not target_ok:
             status = "BLOCKED" if not (help_ok and mount_ok and base_dir_ok and backend_ok and target_ok) else "FAIL"
             reason = "FSx preflight failed"
         else:
-            fixture = base_dir / f".afs-std03-fsx-{dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}"
+            fixture = (
+                base_dir
+                / f".afs-std03-fsx-{dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}"
+            )
             fixture.mkdir(mode=0o755)
             os.chmod(fixture, 0o755)
             preflight = preflight_fixture(fixture, artifacts)
-            checks.append(build_check("fixture-writable", "PASS" if preflight.get("writable") else "BLOCKED", preflight, rel(artifacts / "fixture-preflight.json", run_dir)))
+            checks.append(
+                build_check(
+                    "fixture-writable",
+                    "PASS" if preflight.get("writable") else "BLOCKED",
+                    preflight,
+                    rel(artifacts / "fixture-preflight.json", run_dir),
+                )
+            )
             if not preflight.get("writable"):
                 status = "BLOCKED"
                 reason = "FSx fixture is not writable"
             else:
-                command_records, command_summary = run_fsx_seeds(args.fsx_binary, args.profile, fixture, artifacts, selected_seeds, duration_seconds, operations, args.per_seed_timeout)
+                command_records, command_summary = run_fsx_seeds(
+                    args.fsx_binary,
+                    args.profile,
+                    fixture,
+                    artifacts,
+                    selected_seeds,
+                    duration_seconds,
+                    operations,
+                    args.per_seed_timeout,
+                )
                 write_json(artifacts / "commands.json", command_records)
                 accounting = {
                     "profile": args.profile,
@@ -766,21 +1004,69 @@ def main(argv: list[str]) -> int:
                 write_json(artifacts / "accounting.json", accounting)
                 if command_summary["counts"].get("FAIL", 0) > 0:
                     if args.skip_failure_replay:
-                        failure_minimization = [{"status": "NOT_RUN", "reason": "--skip-failure-replay was set; original case remains FAIL"}]
+                        failure_minimization = [
+                            {"status": "NOT_RUN", "reason": "--skip-failure-replay was set; original case remains FAIL"}
+                        ]
                         write_json(artifacts / "failure-minimization.json", failure_minimization)
                     else:
-                        failure_minimization = minimize_failed_seeds(command_records, artifacts, args.failure_replay_attempts, args.failure_replay_timeout)
-                checks.append(build_check("command-accounting", "PASS", accounting, rel(artifacts / "accounting.json", run_dir)))
-                complete_execution = accounting["executed"] == accounting["selected_seed_count"] and accounting["executed"] > 0
-                checks.append(build_check("complete-selected-execution", "PASS" if complete_execution else "BLOCKED", {"selected": accounting["selected_seed_count"], "executed": accounting["executed"]}, rel(artifacts / "commands.json", run_dir)))
-                result_check_status = "PASS" if command_summary["counts"].get("PASS", 0) == accounting["executed"] and accounting["executed"] > 0 else "FAIL"
+                        failure_minimization = minimize_failed_seeds(
+                            command_records, artifacts, args.failure_replay_attempts, args.failure_replay_timeout
+                        )
+                checks.append(
+                    build_check("command-accounting", "PASS", accounting, rel(artifacts / "accounting.json", run_dir))
+                )
+                complete_execution = (
+                    accounting["executed"] == accounting["selected_seed_count"] and accounting["executed"] > 0
+                )
+                checks.append(
+                    build_check(
+                        "complete-selected-execution",
+                        "PASS" if complete_execution else "BLOCKED",
+                        {"selected": accounting["selected_seed_count"], "executed": accounting["executed"]},
+                        rel(artifacts / "commands.json", run_dir),
+                    )
+                )
+                result_check_status = (
+                    "PASS"
+                    if command_summary["counts"].get("PASS", 0) == accounting["executed"] and accounting["executed"] > 0
+                    else "FAIL"
+                )
                 if command_summary["counts"].get("TIMEOUT", 0) > 0:
                     result_check_status = "BLOCKED"
-                checks.append(build_check("fsx-results", result_check_status, {"counts": command_summary["counts"], "note": "TIMEOUT blocks because the process did not complete the intentional FSx duration; nonzero or missing A-OK marker fails."}, rel(artifacts / "commands.json", run_dir)))
+                checks.append(
+                    build_check(
+                        "fsx-results",
+                        result_check_status,
+                        {
+                            "counts": command_summary["counts"],
+                            "note": (
+                                "TIMEOUT blocks because the process did not complete the "
+                                "intentional FSx duration; nonzero or missing A-OK marker fails."
+                            ),
+                        },
+                        rel(artifacts / "commands.json", run_dir),
+                    )
+                )
                 if command_summary["counts"].get("FAIL", 0) > 0:
                     reproduced = sum(1 for item in failure_minimization if item.get("status") == "REPRODUCED")
                     inconclusive = sum(1 for item in failure_minimization if item.get("status") == "INCONCLUSIVE")
-                    checks.append(build_check("failure-prefix-replay-evidence", "PASS", {"reproduced": reproduced, "inconclusive": inconclusive, "total": len(failure_minimization), "note": "Prefix replay supplements raw FSx failure evidence. INCONCLUSIVE minimization is recorded inside failure-minimization.json and never hides the original FAIL."}, rel(artifacts / "failure-minimization.json", run_dir)))
+                    checks.append(
+                        build_check(
+                            "failure-prefix-replay-evidence",
+                            "PASS",
+                            {
+                                "reproduced": reproduced,
+                                "inconclusive": inconclusive,
+                                "total": len(failure_minimization),
+                                "note": (
+                                    "Prefix replay supplements raw FSx failure evidence. "
+                                    "INCONCLUSIVE minimization is recorded inside "
+                                    "failure-minimization.json and never hides the original FAIL."
+                                ),
+                            },
+                            rel(artifacts / "failure-minimization.json", run_dir),
+                        )
+                    )
                 status, reason = proof_status_from_accounting(accounting, args.profile, cap_applied)
                 if status == "PASS" and fixture.exists():
                     try:
@@ -790,8 +1076,27 @@ def main(argv: list[str]) -> int:
                     except Exception as cleanup_exc:  # noqa: BLE001
                         fixture_kept = True
                         cleanup_artifact = artifacts / "cleanup-error.json"
-                        write_json(cleanup_artifact, {"fixture": str(fixture), "exception": type(cleanup_exc).__name__, "message": str(cleanup_exc), "traceback": traceback.format_exc()})
-                        checks.append(build_check("cleanup-fixture", "FAIL", {"fixture": str(fixture), "kept": True, "error": f"{type(cleanup_exc).__name__}: {cleanup_exc}"}, rel(cleanup_artifact, run_dir)))
+                        write_json(
+                            cleanup_artifact,
+                            {
+                                "fixture": str(fixture),
+                                "exception": type(cleanup_exc).__name__,
+                                "message": str(cleanup_exc),
+                                "traceback": traceback.format_exc(),
+                            },
+                        )
+                        checks.append(
+                            build_check(
+                                "cleanup-fixture",
+                                "FAIL",
+                                {
+                                    "fixture": str(fixture),
+                                    "kept": True,
+                                    "error": f"{type(cleanup_exc).__name__}: {cleanup_exc}",
+                                },
+                                rel(cleanup_artifact, run_dir),
+                            )
+                        )
                         status = "FAIL"
                         reason = "FSx passed but fixture cleanup failed; accounting was preserved"
                 else:
@@ -799,7 +1104,10 @@ def main(argv: list[str]) -> int:
     except Exception as exc:  # noqa: BLE001
         status = "BLOCKED"
         reason = f"driver setup failed: {type(exc).__name__}: {exc}"
-        write_json(artifacts / "setup-error.json", {"exception": type(exc).__name__, "message": str(exc), "traceback": traceback.format_exc()})
+        write_json(
+            artifacts / "setup-error.json",
+            {"exception": type(exc).__name__, "message": str(exc), "traceback": traceback.format_exc()},
+        )
         checks.append(build_check("driver-setup", "BLOCKED", reason, rel(artifacts / "setup-error.json", run_dir)))
 
     suite_sha_value = str(matrix.get("suite_sha", f"secfs.test {SECFS_REV}"))
@@ -822,16 +1130,36 @@ def main(argv: list[str]) -> int:
         "checks": checks,
         "coverage": {"profile": args.profile, "axes": coverage_axes},
         "artifacts": {"root": rel(artifacts, run_dir)},
-        "fixture": {"path": str(fixture) if fixture else None, "base_dir": str(resolve_base_dir(args.mount, args.base_dir)) if args.mount else None, "kept": fixture_kept},
-        "identity": {"artifact": rel(artifacts / "identity.json", run_dir), "product": identity.get("product") if identity else None},
+        "fixture": {
+            "path": str(fixture) if fixture else None,
+            "base_dir": str(resolve_base_dir(args.mount, args.base_dir)) if args.mount else None,
+            "kept": fixture_kept,
+        },
+        "identity": {
+            "artifact": rel(artifacts / "identity.json", run_dir),
+            "product": identity.get("product") if identity else None,
+        },
         "accounting": accounting,
         "command_summary": command_summary,
-        "failure_minimization": {"artifact": rel(artifacts / "failure-minimization.json", run_dir), "items": failure_minimization} if failure_minimization else None,
+        "failure_minimization": {
+            "artifact": rel(artifacts / "failure-minimization.json", run_dir),
+            "items": failure_minimization,
+        }
+        if failure_minimization
+        else None,
         "notes": [
-            "STD-03 driver READY means the pinned FSx binary can run and report proof; it is not a release acceptance PASS by itself.",
+            (
+                "STD-03 driver READY means the pinned FSx binary can run and "
+                "report proof; it is not a release acceptance PASS by itself."
+            ),
             "Smoke uses a reduced fixed seed and operation count. Full requires exactly seeds 1,2,3 at >=900s each.",
             "No failures are filtered after execution. Per-seed stdout/stderr and raw argv are preserved.",
-            "Failed seeds get bounded deterministic prefix replay when possible. A replay result is a minimal failing prefix, not arbitrary ddmin; unreproduced minimization is INCONCLUSIVE while the original case remains FAIL.",
+            (
+                "Failed seeds get bounded deterministic prefix replay when "
+                "possible. A replay result is a minimal failing prefix, not "
+                "arbitrary ddmin; unreproduced minimization is INCONCLUSIVE "
+                "while the original case remains FAIL."
+            ),
         ],
     }
     write_json(artifacts / "proof.json", proof)

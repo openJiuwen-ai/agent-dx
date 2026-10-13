@@ -10,7 +10,6 @@ import time
 import unittest
 from pathlib import Path
 
-
 PROBE = Path(__file__).resolve().parent / "probes" / "owner_restart.py"
 
 
@@ -31,7 +30,13 @@ def ext4_or_skip(testcase: unittest.TestCase, path: Path) -> None:
 
 class OwnerRestartHelpTests(unittest.TestCase):
     def test_help_available_without_linux_runtime(self):
-        result = subprocess.run([sys.executable, str(PROBE), "--help"], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
+        result = subprocess.run(
+            [sys.executable, str(PROBE), "--help"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+        )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("writer", result.stdout)
         self.assertIn("check", result.stdout)
@@ -125,10 +130,25 @@ class OwnerRestartProtocolTests(unittest.TestCase):
             ready.write_text(json.dumps({"payload": {"size": 3, "sha256": "unused"}}))
             output = root / "read-error.json"
             started = time.monotonic()
-            result = subprocess.run([
-                sys.executable, str(PROBE), "check", "--target", str(root / "missing"),
-                "--ready-file", str(ready), "--result-file", str(output), "--open-timeout", "5",
-            ], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(PROBE),
+                    "check",
+                    "--target",
+                    str(root / "missing"),
+                    "--ready-file",
+                    str(ready),
+                    "--result-file",
+                    str(output),
+                    "--open-timeout",
+                    "5",
+                ],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=10,
+            )
             self.assertEqual(result.returncode, 1, result.stderr)
             self.assertLess(time.monotonic() - started, 2)
             report = json.loads(output.read_text())

@@ -5,6 +5,7 @@ The parent orchestrates writer on one node and readers on other nodes. This tool
 only prepares or reads a fixed DFS payload and records evidence; it does not
 manage cluster lifecycle and does not qualify DFS against 3FS.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -12,15 +13,15 @@ import hashlib
 import importlib.util
 import json
 import os
-import select
-from pathlib import Path
 import platform
 import re
+import select
 import shutil
 import stat
 import subprocess
 import sys
 import time
+from pathlib import Path
 from typing import Any, TextIO
 
 DATA_BYTES = 64 * 1024 * 1024
@@ -33,7 +34,7 @@ MEASUREMENT_ROUNDS = 5
 PAYLOAD_NAME = "payload64m.bin"
 DELETE_FILE_COUNT = 100
 DELETE_FILE_BYTES = 4096
-OWNER_REMOTE_SMALL_SHA256 = "a28a1bee8092705298a7fcb03311152d574917a0176d6fcbd056d40e10405480"
+OWNER_REMOTE_SMALL_SHA256 = "e488cd9d1741205b36b9915f3b5e7009416db60b1355ff39376631636228fc03"
 COMMIT_RE = re.compile(r"[0-9a-f]{40}")
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 
@@ -84,7 +85,14 @@ def validate_output_path(path: Path) -> None:
 
 def stat_identity(path: Path) -> dict[str, Any]:
     st = path.stat()
-    return {"path": str(path), "device": st.st_dev, "inode": st.st_ino, "mode": stat.S_IMODE(st.st_mode), "uid": st.st_uid, "gid": st.st_gid}
+    return {
+        "path": str(path),
+        "device": st.st_dev,
+        "inode": st.st_ino,
+        "mode": stat.S_IMODE(st.st_mode),
+        "uid": st.st_uid,
+        "gid": st.st_gid,
+    }
 
 
 def find_mount(path: Path) -> dict[str, Any]:
@@ -186,10 +194,21 @@ def validate_io_result(record: dict[str, Any], operation: str, barrier: str) -> 
         raise ValueError("io result missing positive wall_ns")
 
 
-def run_io(io_tool: Path, payload: Path, operation: str, barrier: str, mode: str, timeout: float | None = None) -> dict[str, Any]:
+def run_io(
+    io_tool: Path, payload: Path, operation: str, barrier: str, mode: str, timeout: float | None = None
+) -> dict[str, Any]:
     argv = [
-        str(io_tool), str(payload), operation, str(DATA_BYTES), str(BLOCK_BYTES), str(CONCURRENCY),
-        barrier, str(DATA_BYTES), str(PATTERN_BYTE), mode, "unobserved",
+        str(io_tool),
+        str(payload),
+        operation,
+        str(DATA_BYTES),
+        str(BLOCK_BYTES),
+        str(CONCURRENCY),
+        barrier,
+        str(DATA_BYTES),
+        str(PATTERN_BYTE),
+        mode,
+        "unobserved",
     ]
     began = time.monotonic_ns()
     try:
@@ -232,7 +251,13 @@ def verify_payload(path: Path, expected_sha256: str) -> dict[str, Any]:
     st = path.stat()
     digest = sha256_file(path)
     status = "PASS" if st.st_size == DATA_BYTES and digest == expected_sha256 else "FAIL"
-    return {"status": status, "path": str(path), "bytes": st.st_size, "sha256": digest, "expected_sha256": expected_sha256}
+    return {
+        "status": status,
+        "path": str(path),
+        "bytes": st.st_size,
+        "sha256": digest,
+        "expected_sha256": expected_sha256,
+    }
 
 
 def verify_eof(path: Path) -> dict[str, Any]:
@@ -265,8 +290,8 @@ class JsonLineReader:
         while True:
             newline = self.buffer.find(b"\n")
             if newline >= 0:
-                raw = bytes(self.buffer[:newline + 1])
-                del self.buffer[:newline + 1]
+                raw = bytes(self.buffer[: newline + 1])
+                del self.buffer[: newline + 1]
                 return raw.decode("utf-8", errors="replace")
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -288,7 +313,9 @@ def validate_sync_reader_id(reader_id: str) -> str:
     return reader_id
 
 
-def parse_start_event(line: str, expected_round: int, reader_id: str | None = None, session_token: str | None = None) -> dict[str, Any]:
+def parse_start_event(
+    line: str, expected_round: int, reader_id: str | None = None, session_token: str | None = None
+) -> dict[str, Any]:
     try:
         event = json.loads(line)
     except json.JSONDecodeError as error:
@@ -307,12 +334,24 @@ def parse_start_event(line: str, expected_round: int, reader_id: str | None = No
     return {"round": expected_round, "round_token": token, "token": token}
 
 
-def read_start_event(input_reader: JsonLineReader, expected_round: int, timeout: float, reader_id: str | None = None, session_token: str | None = None) -> dict[str, Any]:
+def read_start_event(
+    input_reader: JsonLineReader,
+    expected_round: int,
+    timeout: float,
+    reader_id: str | None = None,
+    session_token: str | None = None,
+) -> dict[str, Any]:
     line = input_reader.read_line(timeout)
     return parse_start_event(line, expected_round, reader_id=reader_id, session_token=session_token)
 
 
-def parse_ack_event(line: str, expected_round: int, reader_id: str | None = None, session_token: str | None = None, round_token: str | None = None) -> dict[str, Any]:
+def parse_ack_event(
+    line: str,
+    expected_round: int,
+    reader_id: str | None = None,
+    session_token: str | None = None,
+    round_token: str | None = None,
+) -> dict[str, Any]:
     try:
         event = json.loads(line)
     except json.JSONDecodeError as error:
@@ -330,29 +369,39 @@ def parse_ack_event(line: str, expected_round: int, reader_id: str | None = None
     return event
 
 
-def read_ack_event(input_reader: JsonLineReader, expected_round: int, timeout: float, reader_id: str | None = None,
-                   session_token: str | None = None, round_token: str | None = None) -> dict[str, Any]:
+def read_ack_event(
+    input_reader: JsonLineReader,
+    expected_round: int,
+    timeout: float,
+    reader_id: str | None = None,
+    session_token: str | None = None,
+    round_token: str | None = None,
+) -> dict[str, Any]:
     line = input_reader.read_line(timeout)
-    return parse_ack_event(line, expected_round, reader_id=reader_id, session_token=session_token, round_token=round_token)
+    return parse_ack_event(
+        line, expected_round, reader_id=reader_id, session_token=session_token, round_token=round_token
+    )
 
 
-def validate_ready_pair(events: list[dict[str, Any]], expected_round: int | None = None, session_token: str | None = None) -> dict[str, Any]:
+def validate_ready_pair(
+    events: list[dict[str, Any]], expected_round: int | None = None, session_token: str | None = None
+) -> dict[str, Any]:
     if len(events) != 2:
         raise ValueError(f"READY pair must contain exactly two events: {len(events)}")
     readers: dict[str, dict[str, Any]] = {}
     for event in events:
         if not isinstance(event, dict) or event.get("event") != "READY":
             continue
-        reader = event.get("reader_id")
-        if reader not in ("B", "C"):
-            raise ValueError(f"unexpected READY reader: {reader!r}")
-        if reader in readers:
-            raise ValueError(f"duplicate READY reader: {reader}")
+        reader_id = event.get("reader_id")
+        if reader_id not in ("B", "C"):
+            raise ValueError(f"unexpected READY reader: {reader_id!r}")
+        if reader_id in readers:
+            raise ValueError(f"duplicate READY reader: {reader_id}")
         if expected_round is not None and event.get("round") != expected_round:
             raise ValueError(f"unexpected READY round: {event.get('round')!r}")
         if session_token is not None and event.get("session_token") != session_token:
             raise ValueError("unexpected READY session_token")
-        readers[reader] = event
+        readers[reader_id] = event
     if set(readers) != {"B", "C"}:
         raise ValueError(f"READY pair must contain B and C exactly: {sorted(readers)}")
     return {"status": "PASS", "readers": sorted(readers)}
@@ -382,13 +431,22 @@ def load_owner_delete_helper() -> Any:
     for name in ("prepare_delete_files", "verify_delete_file_contents", "timed_unlink"):
         if not callable(getattr(module, name, None)):
             raise RuntimeError(f"owner delete helper missing {name}")
-    if getattr(module, "DELETE_FILE_COUNT", None) != DELETE_FILE_COUNT or getattr(module, "DELETE_FILE_BYTES", None) != DELETE_FILE_BYTES:
+    if (
+        getattr(module, "DELETE_FILE_COUNT", None) != DELETE_FILE_COUNT
+        or getattr(module, "DELETE_FILE_BYTES", None) != DELETE_FILE_BYTES
+    ):
         raise RuntimeError("owner delete helper shape differs")
     return module
 
 
 def safe_manifest_name(value: Any) -> str:
-    if not isinstance(value, str) or value in ("", ".", "..") or value.startswith("/") or "/" in value or ".." in Path(value).parts:
+    if (
+        not isinstance(value, str)
+        or value in ("", ".", "..")
+        or value.startswith("/")
+        or "/" in value
+        or ".." in Path(value).parts
+    ):
         raise ValueError(f"unsafe sample name: {value!r}")
     return value
 
@@ -421,7 +479,11 @@ def validate_delete_writer_root(manifest: dict[str, Any]) -> str:
     if not isinstance(mount, dict):
         raise ValueError("delete manifest missing mount identity")
     fstype = str(mount.get("fstype", ""))
-    if mount.get("source") != "afs-dfs" or mount.get("target") != dfs_root_path or not (fstype == "fuse" or fstype.startswith("fuse.")):
+    if (
+        mount.get("source") != "afs-dfs"
+        or mount.get("target") != dfs_root_path
+        or not (fstype == "fuse" or fstype.startswith("fuse."))
+    ):
         raise ValueError(f"delete manifest DFS mount identity mismatch: {mount!r}")
     return dfs_root_path
 
@@ -469,7 +531,11 @@ def run_delete_sample(dfs_root: Path, run_id: str, round_index: int, helper: Any
         record["unlink_timer"] = helper.timed_unlink(directory)
         fsync_directory(directory)
         remaining = sorted(path.name for path in directory.iterdir())
-        record["post_unlink"] = {"status": "PASS" if not remaining else "FAIL", "remaining": remaining, "parent_fsync": True}
+        record["post_unlink"] = {
+            "status": "PASS" if not remaining else "FAIL",
+            "remaining": remaining,
+            "parent_fsync": True,
+        }
         directory.rmdir()
         cleanup = {"status": "PASS", "removed_sample_dir": True}
         checks = [record["fresh_open_verify"], record["unlink_timer"], record["post_unlink"], cleanup]
@@ -493,7 +559,12 @@ def validate_delete_manifest(manifest: dict[str, Any], expected_identity: dict[s
     if not isinstance(helper, dict) or helper.get("sha256") != OWNER_REMOTE_SMALL_SHA256:
         raise ValueError("delete writer helper identity mismatch")
     shape = manifest.get("delete_shape")
-    expected_shape = {"files": DELETE_FILE_COUNT, "file_bytes": DELETE_FILE_BYTES, "warmups": WARMUP_ROUNDS, "measurements": MEASUREMENT_ROUNDS}
+    expected_shape = {
+        "files": DELETE_FILE_COUNT,
+        "file_bytes": DELETE_FILE_BYTES,
+        "warmups": WARMUP_ROUNDS,
+        "measurements": MEASUREMENT_ROUNDS,
+    }
     if shape != expected_shape:
         raise ValueError(f"delete shape mismatch: {shape!r}")
     rounds = manifest.get("delete_rounds")
@@ -519,16 +590,37 @@ def validate_delete_manifest(manifest: dict[str, Any], expected_identity: dict[s
         if sample.get("status") != "PASS" or sample.get("cleanup", {}).get("status") != "PASS":
             raise ValueError("delete sample did not pass")
         prepare = sample.get("prepare")
-        if not isinstance(prepare, dict) or prepare.get("files") != expected_delete_files() or prepare.get("fdatasync_per_file") is not True or prepare.get("parent_fsync") is not True:
+        if (
+            not isinstance(prepare, dict)
+            or prepare.get("files") != expected_delete_files()
+            or prepare.get("fdatasync_per_file") is not True
+            or prepare.get("parent_fsync") is not True
+        ):
             raise ValueError("delete prepare proof mismatch")
         fresh = sample.get("fresh_open_verify")
-        if not isinstance(fresh, dict) or fresh.get("status") != "PASS" or fresh.get("files_checked") != DELETE_FILE_COUNT or fresh.get("bytes_per_file") != DELETE_FILE_BYTES:
+        if (
+            not isinstance(fresh, dict)
+            or fresh.get("status") != "PASS"
+            or fresh.get("files_checked") != DELETE_FILE_COUNT
+            or fresh.get("bytes_per_file") != DELETE_FILE_BYTES
+        ):
             raise ValueError("delete fresh content proof mismatch")
         unlink = sample.get("unlink_timer")
-        if not isinstance(unlink, dict) or unlink.get("status") != "PASS" or unlink.get("files") != DELETE_FILE_COUNT or not isinstance(unlink.get("wall_ns"), int) or unlink.get("wall_ns") <= 0:
+        if (
+            not isinstance(unlink, dict)
+            or unlink.get("status") != "PASS"
+            or unlink.get("files") != DELETE_FILE_COUNT
+            or not isinstance(unlink.get("wall_ns"), int)
+            or unlink.get("wall_ns") <= 0
+        ):
             raise ValueError("delete unlink proof mismatch")
         post = sample.get("post_unlink")
-        if not isinstance(post, dict) or post.get("status") != "PASS" or post.get("remaining") != [] or post.get("parent_fsync") is not True:
+        if (
+            not isinstance(post, dict)
+            or post.get("status") != "PASS"
+            or post.get("remaining") != []
+            or post.get("parent_fsync") is not True
+        ):
             raise ValueError("delete post-unlink proof mismatch")
     return rounds
 
@@ -547,13 +639,24 @@ def check_deleted_paths(dfs_root: Path, rounds: list[dict[str, Any]]) -> dict[st
                 if error.errno != 2:
                     failures.append({"path": str(path), "status": "WRONG_ERRNO", "errno": error.errno})
             except OSError as error:
-                failures.append({"path": str(path), "status": "WRONG_ERRNO", "errno": error.errno, "error": repr(error)})
+                failures.append(
+                    {"path": str(path), "status": "WRONG_ERRNO", "errno": error.errno, "error": repr(error)}
+                )
             checked += 1
-    return {"status": "PASS" if not failures else "FAIL", "checked": checked, "expected_errno": "ENOENT", "failures": failures}
+    return {
+        "status": "PASS" if not failures else "FAIL",
+        "checked": checked,
+        "expected_errno": "ENOENT",
+        "failures": failures,
+    }
 
 
 def delete_writer(args: argparse.Namespace) -> dict[str, Any]:
-    result: dict[str, Any] = {"role": "delete-writer", "status": "BLOCKED", "scope": "small DFS delete diagnostic; candidate correctness/data collection only"}
+    result: dict[str, Any] = {
+        "role": "delete-writer",
+        "status": "BLOCKED",
+        "scope": "small DFS delete diagnostic; candidate correctness/data collection only",
+    }
     output: Path | None = None
     output_created = False
     rounds: list[dict[str, Any]] = []
@@ -571,19 +674,48 @@ def delete_writer(args: argparse.Namespace) -> dict[str, Any]:
         require_dfs_mount(mount, dfs_root)
         helper = load_owner_delete_helper()
         run_id = f"{time.time_ns()}-{os.getpid()}"
-        result.update({
-            "status": "FAIL",
-            "platform": platform_identity,
-            "fs": {"dfs_root": stat_identity(dfs_root)},
-            "mount": mount,
-            "run_id": run_id,
-            "delete_shape": {"files": DELETE_FILE_COUNT, "file_bytes": DELETE_FILE_BYTES, "warmups": WARMUP_ROUNDS, "measurements": MEASUREMENT_ROUNDS},
-            "owner_delete_helper": {"path": str(Path(__file__).with_name("owner_remote_small.py")), "sha256": OWNER_REMOTE_SMALL_SHA256},
-            "timer_scope": "unlink_timer covers exactly 100 unlink syscalls; prepare, fdatasync, fresh-open verification, directory fsync, namespace checks, and cleanup are outside timer",
-            "cache_state": "UNOBSERVED",
-            "comparison_status": "CANDIDATE_ONLY_3FS_COMPARATOR_NOT_RUN",
-        })
-        write_json(output / "preflight.json", {k: result[k] for k in ("product_source_commit", "compiler_input_map", "identity_source", "platform", "fs", "mount", "delete_shape", "owner_delete_helper")})
+        result.update(
+            {
+                "status": "FAIL",
+                "platform": platform_identity,
+                "fs": {"dfs_root": stat_identity(dfs_root)},
+                "mount": mount,
+                "run_id": run_id,
+                "delete_shape": {
+                    "files": DELETE_FILE_COUNT,
+                    "file_bytes": DELETE_FILE_BYTES,
+                    "warmups": WARMUP_ROUNDS,
+                    "measurements": MEASUREMENT_ROUNDS,
+                },
+                "owner_delete_helper": {
+                    "path": str(Path(__file__).with_name("owner_remote_small.py")),
+                    "sha256": OWNER_REMOTE_SMALL_SHA256,
+                },
+                "timer_scope": (
+                    "unlink_timer covers exactly 100 unlink syscalls; prepare, "
+                    "fdatasync, fresh-open verification, directory fsync, namespace "
+                    "checks, and cleanup are outside timer"
+                ),
+                "cache_state": "UNOBSERVED",
+                "comparison_status": "CANDIDATE_ONLY_3FS_COMPARATOR_NOT_RUN",
+            }
+        )
+        write_json(
+            output / "preflight.json",
+            {
+                k: result[k]
+                for k in (
+                    "product_source_commit",
+                    "compiler_input_map",
+                    "identity_source",
+                    "platform",
+                    "fs",
+                    "mount",
+                    "delete_shape",
+                    "owner_delete_helper",
+                )
+            },
+        )
         for index in range(WARMUP_ROUNDS + MEASUREMENT_ROUNDS):
             sample = run_delete_sample(dfs_root, run_id, index, helper)
             sample_path = output / "delete-samples" / f"round-{index:02d}.json"
@@ -608,7 +740,12 @@ def delete_writer(args: argparse.Namespace) -> dict[str, Any]:
 
 def delete_checker(args: argparse.Namespace) -> dict[str, Any]:
     checker_id = args.checker_id
-    result: dict[str, Any] = {"role": "delete-checker", "checker_id": checker_id, "status": "BLOCKED", "scope": "independent DFS mount ENOENT check for delete-writer manifest"}
+    result: dict[str, Any] = {
+        "role": "delete-checker",
+        "checker_id": checker_id,
+        "status": "BLOCKED",
+        "scope": "independent DFS mount ENOENT check for delete-writer manifest",
+    }
     output: Path | None = None
     output_created = False
     try:
@@ -630,14 +767,20 @@ def delete_checker(args: argparse.Namespace) -> dict[str, Any]:
         rounds = validate_delete_manifest(manifest, identity)
         check = check_deleted_paths(dfs_root, rounds)
         write_json(output / "enoent-check.json", check)
-        result.update({
-            "status": "DATA_RECORDED" if check.get("status") == "PASS" else "FAIL",
-            "platform": platform_identity,
-            "fs": {"dfs_root": stat_identity(dfs_root)},
-            "mount": mount,
-            "manifest": {"path": str(manifest_path), "run_id": manifest.get("run_id"), "delete_shape": manifest.get("delete_shape")},
-            "enoent_check": check,
-        })
+        result.update(
+            {
+                "status": "DATA_RECORDED" if check.get("status") == "PASS" else "FAIL",
+                "platform": platform_identity,
+                "fs": {"dfs_root": stat_identity(dfs_root)},
+                "mount": mount,
+                "manifest": {
+                    "path": str(manifest_path),
+                    "run_id": manifest.get("run_id"),
+                    "delete_shape": manifest.get("delete_shape"),
+                },
+                "enoent_check": check,
+            }
+        )
     except Exception as error:
         result["error"] = repr(error)
     finally:
@@ -651,7 +794,11 @@ def writer_directory_name() -> str:
 
 
 def writer(args: argparse.Namespace) -> dict[str, Any]:
-    result: dict[str, Any] = {"role": "writer", "status": "BLOCKED", "scope": "small DFS one-write/many-read diagnostic"}
+    result: dict[str, Any] = {
+        "role": "writer",
+        "status": "BLOCKED",
+        "scope": "small DFS one-write/many-read diagnostic",
+    }
     output: Path | None = None
     output_created = False
     try:
@@ -681,18 +828,32 @@ def writer(args: argparse.Namespace) -> dict[str, Any]:
         fsync_directory(sample_dir)
         expected_sha = expected_payload_sha()
         content = verify_payload(payload, expected_sha)
-        result.update({
-            "status": "DATA_RECORDED" if write_record.get("status") == "PASS" and content.get("status") == "PASS" else "FAIL",
-            "io_tool": io_identity,
-            "fs": {"dfs_root": stat_identity(dfs_root), "sample_dir": stat_identity(sample_dir), "payload": stat_identity(payload)},
-            "mount": mount,
-            "platform": platform_identity,
-            "payload": {"relative_dir": sample_dir.name, "name": PAYLOAD_NAME, "bytes": DATA_BYTES, "pattern_byte": PATTERN_BYTE, "sha256": expected_sha},
-            "write": write_record,
-            "content_verify": content,
-            "dir_fsync": True,
-            "parent_dir_fsync": True,
-        })
+        result.update(
+            {
+                "status": "DATA_RECORDED"
+                if write_record.get("status") == "PASS" and content.get("status") == "PASS"
+                else "FAIL",
+                "io_tool": io_identity,
+                "fs": {
+                    "dfs_root": stat_identity(dfs_root),
+                    "sample_dir": stat_identity(sample_dir),
+                    "payload": stat_identity(payload),
+                },
+                "mount": mount,
+                "platform": platform_identity,
+                "payload": {
+                    "relative_dir": sample_dir.name,
+                    "name": PAYLOAD_NAME,
+                    "bytes": DATA_BYTES,
+                    "pattern_byte": PATTERN_BYTE,
+                    "sha256": expected_sha,
+                },
+                "write": write_record,
+                "content_verify": content,
+                "dir_fsync": True,
+                "parent_dir_fsync": True,
+            }
+        )
     except Exception as error:
         result["error"] = repr(error)
     finally:
@@ -712,7 +873,11 @@ def validate_manifest_shape(manifest: dict[str, Any], expected_identity: dict[st
     payload = manifest.get("payload")
     if not isinstance(payload, dict):
         raise ValueError("writer manifest missing payload")
-    if payload.get("name") != PAYLOAD_NAME or payload.get("bytes") != DATA_BYTES or payload.get("pattern_byte") != PATTERN_BYTE:
+    if (
+        payload.get("name") != PAYLOAD_NAME
+        or payload.get("bytes") != DATA_BYTES
+        or payload.get("pattern_byte") != PATTERN_BYTE
+    ):
         raise ValueError("writer manifest payload shape mismatch")
     rel_dir = payload.get("relative_dir")
     digest = payload.get("sha256")
@@ -731,7 +896,12 @@ def validate_manifest_shape(manifest: dict[str, Any], expected_identity: dict[st
     if not isinstance(verify, dict) or verify.get("status") != "PASS":
         raise ValueError("writer manifest write verify did not pass")
     content = manifest.get("content_verify")
-    if not isinstance(content, dict) or content.get("status") != "PASS" or content.get("bytes") != DATA_BYTES or content.get("sha256") != digest:
+    if (
+        not isinstance(content, dict)
+        or content.get("status") != "PASS"
+        or content.get("bytes") != DATA_BYTES
+        or content.get("sha256") != digest
+    ):
         raise ValueError("writer manifest content verification mismatch")
     if manifest.get("dir_fsync") is not True or manifest.get("parent_dir_fsync") is not True:
         raise ValueError("writer manifest missing directory fsync proof")
@@ -770,14 +940,27 @@ def sync_reader(args: argparse.Namespace) -> dict[str, Any]:
     reader_id = validate_sync_reader_id(args.reader_id)
     timeout = args.round_timeout
     session_token = args.session_token
-    result: dict[str, Any] = {"role": "reader", "reader_id": reader_id, "status": "BLOCKED", "sync_stdio": True,
-                              "session_token": session_token,
-                              "scope": "small DFS synchronized many-reader diagnostic; parent owns common window"}
+    result: dict[str, Any] = {
+        "role": "reader",
+        "reader_id": reader_id,
+        "status": "BLOCKED",
+        "sync_stdio": True,
+        "session_token": session_token,
+        "scope": "small DFS synchronized many-reader diagnostic; parent owns common window",
+    }
     output: Path | None = None
     output_created = False
     rounds: list[dict[str, Any]] = []
-    emit_json_line(sys.stdout, {"event": "HELLO", "reader_id": reader_id, "session_token": session_token,
-                                "protocol": "afs.dfs_manyread.sync_stdio.v1", "rounds": MEASUREMENT_ROUNDS})
+    emit_json_line(
+        sys.stdout,
+        {
+            "event": "HELLO",
+            "reader_id": reader_id,
+            "session_token": session_token,
+            "protocol": "afs.dfs_manyread.sync_stdio.v1",
+            "rounds": MEASUREMENT_ROUNDS,
+        },
+    )
     control_reader = JsonLineReader(sys.stdin)
     try:
         identity = product_identity_from_args(args)
@@ -802,15 +985,27 @@ def sync_reader(args: argparse.Namespace) -> dict[str, Any]:
         payload = dfs_root / payload_shape["relative_dir"] / PAYLOAD_NAME
         pre_content = verify_payload(payload, payload_shape["sha256"])
         write_json(output / "manifest-precheck.json", {"manifest": str(manifest_path), "content_verify": pre_content})
-        result.update({
-            "platform": platform_identity,
-            "manifest": {"path": str(manifest_path), "payload": payload_shape, "product_source_commit": manifest.get("product_source_commit"), "compiler_input_map": manifest.get("compiler_input_map"), "identity_source": manifest.get("identity_source")},
-            "io_tool": io_identity,
-            "fs": {"dfs_root": stat_identity(dfs_root), "payload": stat_identity(payload)},
-            "mount": mount,
-            "content_verify": pre_content,
-            "timer_scope": "READY is emitted per round after manifest/content precheck and warmup; START..DONE rounds 1..5 are parent common-window inputs; final content/EOF check is after the measured rounds.",
-        })
+        result.update(
+            {
+                "platform": platform_identity,
+                "manifest": {
+                    "path": str(manifest_path),
+                    "payload": payload_shape,
+                    "product_source_commit": manifest.get("product_source_commit"),
+                    "compiler_input_map": manifest.get("compiler_input_map"),
+                    "identity_source": manifest.get("identity_source"),
+                },
+                "io_tool": io_identity,
+                "fs": {"dfs_root": stat_identity(dfs_root), "payload": stat_identity(payload)},
+                "mount": mount,
+                "content_verify": pre_content,
+                "timer_scope": (
+                    "READY is emitted per round after manifest/content precheck and "
+                    "warmup; START..DONE rounds 1..5 are parent common-window "
+                    "inputs; final content/EOF check is after the measured rounds."
+                ),
+            }
+        )
         if pre_content.get("status") != "PASS":
             raise ValueError("reader payload precheck failed")
         warmup = run_io(io_tool, payload, "seq-read", "close", "existing", timeout=timeout)
@@ -825,8 +1020,17 @@ def sync_reader(args: argparse.Namespace) -> dict[str, Any]:
         if warmup.get("status") != "PASS" or warmup.get("verify", {}).get("status") != "PASS":
             raise ValueError("reader warmup failed")
         for index in range(1, MEASUREMENT_ROUNDS + 1):
-            emit_json_line(sys.stdout, {"event": "READY", "reader_id": reader_id, "session_token": session_token,
-                                        "round": index, "payload_sha256": payload_shape["sha256"], "output": str(output)})
+            emit_json_line(
+                sys.stdout,
+                {
+                    "event": "READY",
+                    "reader_id": reader_id,
+                    "session_token": session_token,
+                    "round": index,
+                    "payload_sha256": payload_shape["sha256"],
+                    "output": str(output),
+                },
+            )
             start = read_start_event(control_reader, index, timeout, reader_id=reader_id, session_token=session_token)
             sample = run_io(io_tool, payload, "seq-read", "close", "existing", timeout=timeout)
             sample["round"] = index
@@ -838,14 +1042,28 @@ def sync_reader(args: argparse.Namespace) -> dict[str, Any]:
             round_record = {"round": index, "measured": True, "round_token": start["round_token"], "samples": [sample]}
             write_json(output / f"read-round-{index:02d}.json", round_record)
             rounds.append(round_record)
-            done = {"event": "DONE", "reader_id": reader_id, "session_token": session_token, "round": index,
-                    "round_token": start["round_token"], "status": sample.get("status"), "rc": sample.get("rc"),
-                    "result": sample.get("result"), "artifact": str(sample_path)}
+            done = {
+                "event": "DONE",
+                "reader_id": reader_id,
+                "session_token": session_token,
+                "round": index,
+                "round_token": start["round_token"],
+                "status": sample.get("status"),
+                "rc": sample.get("rc"),
+                "result": sample.get("result"),
+                "artifact": str(sample_path),
+            }
             emit_json_line(sys.stdout, done)
             if sample.get("status") != "PASS" or sample.get("verify", {}).get("status") != "PASS":
                 raise RuntimeError(f"reader round {index} failed")
-            read_ack_event(control_reader, index, timeout, reader_id=reader_id, session_token=session_token,
-                           round_token=start["round_token"])
+            read_ack_event(
+                control_reader,
+                index,
+                timeout,
+                reader_id=reader_id,
+                session_token=session_token,
+                round_token=start["round_token"],
+            )
         final_content = verify_payload(payload, payload_shape["sha256"])
         final_eof = verify_eof(payload)
         result["read_rounds"] = rounds
@@ -858,14 +1076,26 @@ def sync_reader(args: argparse.Namespace) -> dict[str, Any]:
     finally:
         if output_created and output is not None and output.exists() and output.is_dir():
             write_json(output / "summary.json", result)
-        emit_json_line(sys.stdout, {"event": "FINAL", "reader_id": reader_id, "session_token": session_token,
-                                    "status": result.get("status"), "error": result.get("error"),
-                                    "output": str(output) if output is not None else None})
+        emit_json_line(
+            sys.stdout,
+            {
+                "event": "FINAL",
+                "reader_id": reader_id,
+                "session_token": session_token,
+                "status": result.get("status"),
+                "error": result.get("error"),
+                "output": str(output) if output is not None else None,
+            },
+        )
     return result
 
 
 def reader(args: argparse.Namespace) -> dict[str, Any]:
-    result: dict[str, Any] = {"role": "reader", "status": "BLOCKED", "scope": "small DFS many-reader diagnostic; parent owns concurrency timing"}
+    result: dict[str, Any] = {
+        "role": "reader",
+        "status": "BLOCKED",
+        "scope": "small DFS many-reader diagnostic; parent owns concurrency timing",
+    }
     output: Path | None = None
     output_created = False
     try:
@@ -890,14 +1120,22 @@ def reader(args: argparse.Namespace) -> dict[str, Any]:
         payload = dfs_root / payload_shape["relative_dir"] / PAYLOAD_NAME
         content = verify_payload(payload, payload_shape["sha256"])
         write_json(output / "manifest-precheck.json", {"manifest": str(manifest_path), "content_verify": content})
-        result.update({
-            "platform": platform_identity,
-            "manifest": {"path": str(manifest_path), "payload": payload_shape, "product_source_commit": manifest.get("product_source_commit"), "compiler_input_map": manifest.get("compiler_input_map"), "identity_source": manifest.get("identity_source")},
-            "io_tool": io_identity,
-            "fs": {"dfs_root": stat_identity(dfs_root), "payload": stat_identity(payload)},
-            "mount": mount,
-            "content_verify": content,
-        })
+        result.update(
+            {
+                "platform": platform_identity,
+                "manifest": {
+                    "path": str(manifest_path),
+                    "payload": payload_shape,
+                    "product_source_commit": manifest.get("product_source_commit"),
+                    "compiler_input_map": manifest.get("compiler_input_map"),
+                    "identity_source": manifest.get("identity_source"),
+                },
+                "io_tool": io_identity,
+                "fs": {"dfs_root": stat_identity(dfs_root), "payload": stat_identity(payload)},
+                "mount": mount,
+                "content_verify": content,
+            }
+        )
         if content.get("status") != "PASS":
             raise ValueError("reader payload precheck failed")
         rounds = reader_rounds(io_tool, payload, output)
@@ -923,18 +1161,24 @@ def read_json_line(input_reader: JsonLineReader, timeout: float) -> dict[str, An
     return event
 
 
-def require_routed_event(event: dict[str, Any], expected_event: str, readers: set[str], session_token: str,
-                         seen: set[str] | None = None, expected_round: int | None = None,
-                         expected_token: str | None = None) -> dict[str, Any]:
+def require_routed_event(
+    event: dict[str, Any],
+    expected_event: str,
+    readers: set[str],
+    session_token: str,
+    seen: set[str] | None = None,
+    expected_round: int | None = None,
+    expected_token: str | None = None,
+) -> dict[str, Any]:
     if event.get("event") != expected_event:
         raise ValueError(f"expected {expected_event}, got {event.get('event')!r}")
-    reader = event.get("reader_id")
-    if reader not in readers:
-        raise ValueError(f"unexpected reader_id: {reader!r}")
+    reader_id = event.get("reader_id")
+    if reader_id not in readers:
+        raise ValueError(f"unexpected reader_id: {reader_id!r}")
     if seen is not None:
-        if reader in seen:
-            raise ValueError(f"duplicate {expected_event} from {reader}")
-        seen.add(reader)
+        if reader_id in seen:
+            raise ValueError(f"duplicate {expected_event} from {reader_id}")
+        seen.add(reader_id)
     if event.get("session_token") != session_token:
         raise ValueError("unexpected session_token")
     if expected_round is not None and event.get("round") != expected_round:
@@ -955,7 +1199,9 @@ def validate_done_event_io(done: dict[str, Any]) -> None:
     try:
         validate_io_result(result, "seq-read", "close")
     except Exception as error:
-        raise RuntimeError(f"reader {done.get('reader_id')} round {done.get('round')} invalid C result: {error}") from error
+        raise RuntimeError(
+            f"reader {done.get('reader_id')} round {done.get('round')} invalid C result: {error}"
+        ) from error
 
 
 def coordinator(args: argparse.Namespace) -> dict[str, Any]:
@@ -963,15 +1209,27 @@ def coordinator(args: argparse.Namespace) -> dict[str, Any]:
     validate_output_path(output)
     output.mkdir(mode=0o700)
     readers = set(args.readers)
-    result: dict[str, Any] = {"role": "coordinator", "status": "BLOCKED", "session_token": args.session_token,
-                              "readers": sorted(readers), "round_timeout": args.round_timeout,
-                              "timer_scope": "ctl Linux monotonic_ns; per-round elapsed starts before START emit and ends after both DONE events, including host relay/Lima control delay plus reader result write/emit overhead."}
+    result: dict[str, Any] = {
+        "role": "coordinator",
+        "status": "BLOCKED",
+        "session_token": args.session_token,
+        "readers": sorted(readers),
+        "round_timeout": args.round_timeout,
+        "timer_scope": (
+            "ctl Linux monotonic_ns; per-round elapsed starts before START "
+            "emit and ends after both DONE events, including host relay/Lima "
+            "control delay plus reader result write/emit overhead."
+        ),
+    }
     raw_events: list[dict[str, Any]] = []
     rounds: list[dict[str, Any]] = []
     try:
         platform_identity = verify_linux_aarch64_root()
         result["platform"] = platform_identity
-        result["monotonic_clock"] = {k: getattr(time.get_clock_info("monotonic"), k) for k in ("implementation", "monotonic", "adjustable", "resolution")}
+        result["monotonic_clock"] = {
+            k: getattr(time.get_clock_info("monotonic"), k)
+            for k in ("implementation", "monotonic", "adjustable", "resolution")
+        }
         if readers != {"B", "C"}:
             raise ValueError("coordinator readers must be B and C")
         input_reader = JsonLineReader(sys.stdin)
@@ -980,40 +1238,82 @@ def coordinator(args: argparse.Namespace) -> dict[str, Any]:
             event = read_json_line(input_reader, args.round_timeout)
             raw_events.append(event)
             require_routed_event(event, "HELLO", readers, args.session_token, seen=hello_seen)
-        for reader in args.readers:
-            emit_json_line(sys.stdout, {"event": "ACK", "reader_id": reader, "session_token": args.session_token,
-                                        "round": 0, "next_round": 1, "rounds": MEASUREMENT_ROUNDS})
+        for reader_id in args.readers:
+            emit_json_line(
+                sys.stdout,
+                {
+                    "event": "ACK",
+                    "reader_id": reader_id,
+                    "session_token": args.session_token,
+                    "round": 0,
+                    "next_round": 1,
+                    "rounds": MEASUREMENT_ROUNDS,
+                },
+            )
         for round_index in range(1, MEASUREMENT_ROUNDS + 1):
             ready_seen: set[str] = set()
             ready_events: list[dict[str, Any]] = []
             while ready_seen != readers:
                 event = read_json_line(input_reader, args.round_timeout)
                 raw_events.append(event)
-                ready_events.append(require_routed_event(event, "READY", readers, args.session_token, seen=ready_seen, expected_round=round_index))
+                ready_events.append(
+                    require_routed_event(
+                        event, "READY", readers, args.session_token, seen=ready_seen, expected_round=round_index
+                    )
+                )
             round_token = f"{args.session_token}:round:{round_index}"
             start_before_emit_ns = time.monotonic_ns()
-            for reader in args.readers:
-                emit_json_line(sys.stdout, {"event": "START", "reader_id": reader, "session_token": args.session_token,
-                                            "round": round_index, "round_token": round_token})
+            for reader_id in args.readers:
+                emit_json_line(
+                    sys.stdout,
+                    {
+                        "event": "START",
+                        "reader_id": reader_id,
+                        "session_token": args.session_token,
+                        "round": round_index,
+                        "round_token": round_token,
+                    },
+                )
             done_seen: set[str] = set()
             done_events: list[dict[str, Any]] = []
             while done_seen != readers:
                 event = read_json_line(input_reader, args.round_timeout)
                 raw_events.append(event)
-                done = require_routed_event(event, "DONE", readers, args.session_token, seen=done_seen,
-                                            expected_round=round_index, expected_token=round_token)
+                done = require_routed_event(
+                    event,
+                    "DONE",
+                    readers,
+                    args.session_token,
+                    seen=done_seen,
+                    expected_round=round_index,
+                    expected_token=round_token,
+                )
                 validate_done_event_io(done)
                 done_events.append(done)
             end_after_both_done_ns = time.monotonic_ns()
-            row = {"round": round_index, "round_token": round_token, "ready": ready_events, "done": done_events,
-                   "start_before_emit_ns": start_before_emit_ns, "end_after_both_done_ns": end_after_both_done_ns,
-                   "elapsed_ns": end_after_both_done_ns - start_before_emit_ns}
+            row = {
+                "round": round_index,
+                "round_token": round_token,
+                "ready": ready_events,
+                "done": done_events,
+                "start_before_emit_ns": start_before_emit_ns,
+                "end_after_both_done_ns": end_after_both_done_ns,
+                "elapsed_ns": end_after_both_done_ns - start_before_emit_ns,
+            }
             write_json(output / f"coordinator-round-{round_index:02d}.json", row)
             rounds.append(row)
-            for reader in args.readers:
-                emit_json_line(sys.stdout, {"event": "ACK", "reader_id": reader, "session_token": args.session_token,
-                                            "round": round_index, "round_token": round_token,
-                                            "next_round": round_index + 1 if round_index < MEASUREMENT_ROUNDS else None})
+            for reader_id in args.readers:
+                emit_json_line(
+                    sys.stdout,
+                    {
+                        "event": "ACK",
+                        "reader_id": reader_id,
+                        "session_token": args.session_token,
+                        "round": round_index,
+                        "round_token": round_token,
+                        "next_round": round_index + 1 if round_index < MEASUREMENT_ROUNDS else None,
+                    },
+                )
         final_seen: set[str] = set()
         final_events: list[dict[str, Any]] = []
         while final_seen != readers:
@@ -1061,7 +1361,9 @@ def parse_args() -> argparse.Namespace:
     coordinator_parser.add_argument("--round-timeout", type=float, default=30.0)
     coordinator_parser.add_argument("--readers", nargs=2, default=["B", "C"])
     sub.choices["reader"].add_argument("--manifest", required=True)
-    sub.choices["reader"].add_argument("--sync-stdio", action="store_true", help="emit HELLO/READY/DONE/FINAL JSON lines and wait for START JSON lines")
+    sub.choices["reader"].add_argument(
+        "--sync-stdio", action="store_true", help="emit HELLO/READY/DONE/FINAL JSON lines and wait for START JSON lines"
+    )
     sub.choices["reader"].add_argument("--reader-id", choices=("B", "C"), default="B")
     sub.choices["reader"].add_argument("--session-token", default="")
     sub.choices["reader"].add_argument("--round-timeout", type=float, default=30.0)

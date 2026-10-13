@@ -5,7 +5,6 @@ import tempfile
 import unittest
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[3]
 PACKAGED = ROOT / "build/config/examples/afs"
 SOURCE = ROOT / "afs/examples"
@@ -17,10 +16,12 @@ class AfsExampleTests(unittest.TestCase):
         # Keep this package-copy contract runnable in ADX's Python 3.9 image.
         for name, identity in (("meta", "meta"), ("node", "node-a")):
             text = (PACKAGED / f"{name}.toml").read_text()
-            lines = [line.strip() for line in text.splitlines()
-                     if line.strip() and not line.lstrip().startswith("#")]
-            source_lines = [line.strip() for line in (SOURCE / f"{name}.toml").read_text().splitlines()
-                            if line.strip() and not line.lstrip().startswith("#")]
+            lines = [line.strip() for line in text.splitlines() if line.strip() and not line.lstrip().startswith("#")]
+            source_lines = [
+                line.strip()
+                for line in (SOURCE / f"{name}.toml").read_text().splitlines()
+                if line.strip() and not line.lstrip().startswith("#")
+            ]
             self.assertEqual(lines, source_lines)
             expected = {
                 "fs": "all",
@@ -30,8 +31,7 @@ class AfsExampleTests(unittest.TestCase):
                 "tls_server_name": "afs-cluster",
             }
             if name == "node":
-                expected.update(meta_endpoint="https://127.0.0.1:7400",
-                                peer_endpoint="https://127.0.0.1:7500")
+                expected.update(meta_endpoint="https://127.0.0.1:7400", peer_endpoint="https://127.0.0.1:7500")
             for field, value in expected.items():
                 self.assertIn(f'{field} = "{value}"', lines)
             self.assertIn('[trusted_node_certs]\nnode-a = "/opt/adx/config/afs/tls/node-a.pem"', text)
@@ -46,9 +46,7 @@ class AfsExampleTests(unittest.TestCase):
         script = PACKAGED / "prepare-local-tls.sh"
         with tempfile.TemporaryDirectory() as temporary:
             destination = Path(temporary) / "tls"
-            first = subprocess.run(
-                [str(script), str(destination)], text=True, capture_output=True
-            )
+            first = subprocess.run([str(script), str(destination)], text=True, capture_output=True)
             self.assertEqual(first.returncode, 0, first.stderr)
             for name in ("ca-key.pem", "meta-key.pem", "node-a-key.pem"):
                 mode = stat.S_IMODE((destination / name).stat().st_mode)
@@ -67,9 +65,7 @@ class AfsExampleTests(unittest.TestCase):
                 )
                 self.assertEqual(verified.returncode, 0, verified.stderr)
 
-            second = subprocess.run(
-                [str(script), str(destination)], text=True, capture_output=True
-            )
+            second = subprocess.run([str(script), str(destination)], text=True, capture_output=True)
             self.assertNotEqual(second.returncode, 0)
             self.assertIn("refusing to replace", second.stderr)
 

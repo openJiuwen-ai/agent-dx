@@ -4,6 +4,7 @@
 This probe intentionally covers a small set of user-visible filesystem contracts.
 It is not a replacement for pjdfstest, LTP, FSx, or differential random suites.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -22,7 +23,6 @@ import time
 import traceback
 from pathlib import Path
 from typing import Any, Callable
-
 
 _LIBC = ctypes.CDLL(None, use_errno=True)
 _LIBC.getxattr.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_void_p, ctypes.c_size_t]
@@ -53,9 +53,13 @@ def _read(path: Path) -> bytes:
 
 def _stat_dict(path: Path) -> dict[str, Any]:
     st = path.lstat()
-    file_type = "regular" if stat_module.S_ISREG(st.st_mode) else (
-        "directory" if stat_module.S_ISDIR(st.st_mode) else (
-            "symlink" if stat_module.S_ISLNK(st.st_mode) else "other"
+    file_type = (
+        "regular"
+        if stat_module.S_ISREG(st.st_mode)
+        else (
+            "directory"
+            if stat_module.S_ISDIR(st.st_mode)
+            else ("symlink" if stat_module.S_ISLNK(st.st_mode) else "other")
         )
     )
     return {
@@ -111,7 +115,14 @@ class Probe:
         self.base_dir = self._resolve_base_dir(base_dir)
         self.records: list[dict[str, Any]] = []
         self.failures: list[dict[str, Any]] = []
-        self.run_id = f"posix-smoke-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-{os.getpid()}-{random.randrange(1_000_000):06d}"
+        self.run_id = (
+            f"posix-smoke-"
+            f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}"
+            f"-"
+            f"{os.getpid()}"
+            f"-"
+            f"{random.randrange(1000000):06d}"
+        )
         self.root = self.base_dir / f".afs-posix-smoke-{self.run_id}"
         self.fixture_kept = True
 
@@ -131,34 +142,40 @@ class Probe:
         }
         try:
             details = func()
-            record.update({
-                "ok": True,
-                "exit_status": 0,
-                "errno": None,
-                "errno_name": None,
-                "details": details,
-            })
+            record.update(
+                {
+                    "ok": True,
+                    "exit_status": 0,
+                    "errno": None,
+                    "errno_name": None,
+                    "details": details,
+                }
+            )
         except OSError as exc:
-            record.update({
-                "ok": False,
-                "exit_status": 1,
-                "errno": exc.errno,
-                "errno_name": _errno_name(exc.errno),
-                "exception": type(exc).__name__,
-                "message": str(exc),
-                "traceback": traceback.format_exc(),
-            })
+            record.update(
+                {
+                    "ok": False,
+                    "exit_status": 1,
+                    "errno": exc.errno,
+                    "errno_name": _errno_name(exc.errno),
+                    "exception": type(exc).__name__,
+                    "message": str(exc),
+                    "traceback": traceback.format_exc(),
+                }
+            )
             self.failures.append(record)
         except Exception as exc:  # noqa: BLE001 - probe must serialize raw failure
-            record.update({
-                "ok": False,
-                "exit_status": 1,
-                "errno": None,
-                "errno_name": None,
-                "exception": type(exc).__name__,
-                "message": str(exc),
-                "traceback": traceback.format_exc(),
-            })
+            record.update(
+                {
+                    "ok": False,
+                    "exit_status": 1,
+                    "errno": None,
+                    "errno_name": None,
+                    "exception": type(exc).__name__,
+                    "message": str(exc),
+                    "traceback": traceback.format_exc(),
+                }
+            )
             self.failures.append(record)
         finally:
             record["duration_ms"] = round((time.time() - started) * 1000, 3)
@@ -171,8 +188,8 @@ class Probe:
         _expect(self.base_dir.is_dir(), "base directory is a directory", {"base_dir": str(self.base_dir)})
         try:
             self.root.mkdir(mode=0o700)
-        except FileExistsError:
-            raise RuntimeError(f"exclusive fixture already exists: {self.root}")
+        except FileExistsError as exc:
+            raise RuntimeError(f"exclusive fixture already exists: {self.root}") from exc
 
     def cleanup_or_keep(self) -> None:
         if self.failures:
@@ -241,7 +258,10 @@ class Probe:
             "notes": [
                 "Short targeted probe only; not a complete POSIX suite.",
                 "Unsupported behavior is reported as failure for this probe.",
-                "xattr length query, ERANGE, exact-size and empty values use libc getxattr through ctypes to preserve raw Linux errno.",
+                (
+                    "xattr length query, ERANGE, exact-size and empty values use "
+                    "libc getxattr through ctypes to preserve raw Linux errno."
+                ),
             ],
         }
         (self.evidence / "report.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
@@ -261,7 +281,6 @@ class Probe:
         d.rmdir()
         _expect(not d.exists(), "rmdir removes empty directory")
         return {"directory": str(d), "listing": listing}
-
 
     def test_regular_mknod_readwrite(self) -> dict[str, Any]:
         p = self.root / "mknod-regular"
@@ -337,7 +356,11 @@ class Probe:
             os.write(fd, b"def")
             os.lseek(fd, 0, os.SEEK_SET)
             final = os.read(fd, 6)
-            _expect(first == b"abc" and final == b"abcdef", "unlinked fd remains readable and writable", {"first": _b64(first), "final": _b64(final)})
+            _expect(
+                first == b"abc" and final == b"abcdef",
+                "unlinked fd remains readable and writable",
+                {"first": _b64(first), "final": _b64(final)},
+            )
             return {"path": str(p), "first_b64": _b64(first), "final_b64": _b64(final)}
         finally:
             os.close(fd)
@@ -352,17 +375,31 @@ class Probe:
             raise AssertionError("missing xattr unexpectedly existed")
         except OSError as exc:
             missing_errno = exc.errno
-            _expect(exc.errno in {getattr(errno, "ENODATA", 61), getattr(errno, "ENOATTR", 93)}, "missing xattr returns ENODATA/ENOATTR", {"errno": exc.errno, "errno_name": _errno_name(exc.errno)})
+            _expect(
+                exc.errno in {getattr(errno, "ENODATA", 61), getattr(errno, "ENOATTR", 93)},
+                "missing xattr returns ENODATA/ENOATTR",
+                {"errno": exc.errno, "errno_name": _errno_name(exc.errno)},
+            )
         binary = b"\x00afs\xffvalue"
         os.setxattr(p, name, binary, os.XATTR_CREATE)
         got = os.getxattr(p, name)
         _expect(got == binary, "binary xattr roundtrips", {"value_b64": _b64(got)})
         length_query = _raw_getxattr(p, name)
-        _expect(length_query["result"] == len(binary), "libc getxattr length query returns binary value size", length_query)
+        _expect(
+            length_query["result"] == len(binary), "libc getxattr length query returns binary value size", length_query
+        )
         erange = _raw_getxattr(p, name, 1)
-        _expect(erange["result"] == -1 and erange["errno"] == errno.ERANGE, "libc getxattr small buffer returns ERANGE", erange)
+        _expect(
+            erange["result"] == -1 and erange["errno"] == errno.ERANGE,
+            "libc getxattr small buffer returns ERANGE",
+            erange,
+        )
         exact = _raw_getxattr(p, name, len(binary))
-        _expect(exact["result"] == len(binary) and exact["value_b64"] == _b64(binary), "libc getxattr exact buffer returns full binary value", exact)
+        _expect(
+            exact["result"] == len(binary) and exact["value_b64"] == _b64(binary),
+            "libc getxattr exact buffer returns full binary value",
+            exact,
+        )
         create_errno = None
         try:
             os.setxattr(p, name, b"again", os.XATTR_CREATE)
@@ -382,7 +419,11 @@ class Probe:
             raise AssertionError("XATTR_REPLACE unexpectedly created missing value")
         except OSError as exc:
             replace_errno = exc.errno
-            _expect(exc.errno in {getattr(errno, "ENODATA", 61), getattr(errno, "ENOATTR", 93)}, "XATTR_REPLACE missing returns ENODATA/ENOATTR", {"errno": exc.errno, "errno_name": _errno_name(exc.errno)})
+            _expect(
+                exc.errno in {getattr(errno, "ENODATA", 61), getattr(errno, "ENOATTR", 93)},
+                "XATTR_REPLACE missing returns ENODATA/ENOATTR",
+                {"errno": exc.errno, "errno_name": _errno_name(exc.errno)},
+            )
         return {
             "path": str(p),
             "name": name,
@@ -412,8 +453,18 @@ class Probe:
             _expect(hole == b"\x00" * 4096, "hole reads as zero")
             _expect(data == payload, "high-offset payload reads back")
             if allocated is not None:
-                _expect(allocated < st["size"], "st_blocks shows sparse allocation smaller than size", {"allocated_bytes": allocated, "size": st["size"], "stat": st})
-            return {"path": str(p), "offset": offset, "stat": st, "allocated_bytes": allocated, "hole_zero_bytes": len(hole)}
+                _expect(
+                    allocated < st["size"],
+                    "st_blocks shows sparse allocation smaller than size",
+                    {"allocated_bytes": allocated, "size": st["size"], "stat": st},
+                )
+            return {
+                "path": str(p),
+                "offset": offset,
+                "stat": st,
+                "allocated_bytes": allocated,
+                "hole_zero_bytes": len(hole),
+            }
         finally:
             os.close(fd)
 
@@ -431,7 +482,12 @@ class Probe:
             grown = os.read(fd, 3072)
             _expect(st_grow.st_size == 4096, "ftruncate grow updates size", {"size": st_grow.st_size})
             _expect(grown == b"\x00" * 3072, "grown region reads as zero")
-            return {"path": str(p), "shrink_size": st_shrink.st_size, "grow_size": st_grow.st_size, "grown_zero_bytes": len(grown)}
+            return {
+                "path": str(p),
+                "shrink_size": st_shrink.st_size,
+                "grow_size": st_grow.st_size,
+                "grown_zero_bytes": len(grown),
+            }
         finally:
             os.close(fd)
 
@@ -474,8 +530,17 @@ class Probe:
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run a short targeted POSIX smoke probe on a mounted filesystem.")
     parser.add_argument("--mount", required=True, type=Path, help="Mounted filesystem path to test.")
-    parser.add_argument("--evidence", required=True, type=Path, help="Directory where report.json and summary.txt will be written.")
-    parser.add_argument("--base-dir", type=Path, help="Optional directory under which the exclusive fixture is created. Relative paths are resolved under --mount.")
+    parser.add_argument(
+        "--evidence", required=True, type=Path, help="Directory where report.json and summary.txt will be written."
+    )
+    parser.add_argument(
+        "--base-dir",
+        type=Path,
+        help=(
+            "Optional directory under which the exclusive fixture is "
+            "created. Relative paths are resolved under --mount."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -490,7 +555,13 @@ def main(argv: list[str]) -> int:
             "schema": "afs.posix_smoke.v1",
             "created_at": _now(),
             "mount": str(args.mount),
-            "base_dir": str((args.mount / args.base_dir).resolve() if args.base_dir and not args.base_dir.is_absolute() else args.base_dir.resolve()) if args.base_dir else str(args.mount.resolve()),
+            "base_dir": str(
+                (args.mount / args.base_dir).resolve()
+                if args.base_dir and not args.base_dir.is_absolute()
+                else args.base_dir.resolve()
+            )
+            if args.base_dir
+            else str(args.mount.resolve()),
             "evidence": str(args.evidence),
             "summary": {"status": "FAIL", "steps": 0, "failed": 1, "passed": 0},
             "setup_failure": {

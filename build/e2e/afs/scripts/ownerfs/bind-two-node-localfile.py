@@ -34,8 +34,6 @@ WORKLOAD_UID = 501
 WORKLOAD_GID = 501
 
 
-
-
 class PreflightError(RuntimeError):
     pass
 
@@ -54,7 +52,12 @@ def health_ready(status: int, body: str) -> tuple[bool, object]:
         parsed = json.loads(body)
     except json.JSONDecodeError as exc:
         return False, {"status": status, "body": body[:1000], "error": str(exc)}
-    ready = isinstance(parsed, dict) and status == 200 and parsed.get("status") == "ready" and parsed.get("ready", True) is not False
+    ready = (
+        isinstance(parsed, dict)
+        and status == 200
+        and parsed.get("status") == "ready"
+        and parsed.get("ready", True) is not False
+    )
     return ready, {"status": status, "body": parsed}
 
 
@@ -71,7 +74,7 @@ class Scenario:
 
     def check(self, name: str, condition: bool, detail: object | None = None) -> None:
         self.checks.append({"name": name, "passed": bool(condition), "detail": detail})
-        self._write_json("checks.json", self.checks)
+        self.write_json("checks.json", self.checks)
         if not condition:
             raise AssertionError((name, detail))
 
@@ -98,18 +101,26 @@ class Scenario:
         )
         return proc.stdout
 
-    def _write_json(self, name: str, value: object) -> None:
+    def write_json(self, name: str, value: object) -> None:
         (self.root / name).write_text(json.dumps(value, indent=2, sort_keys=True), encoding="utf-8")
 
     def preflight(self) -> None:
         require_fresh_linux_root(self.root)
         self.root.mkdir(mode=0o755)
         self.check("work root initialized", True, str(self.root))
-        self.check("repo root", (self.repo / "Cargo.toml").is_file() and (self.repo / "afs/Cargo.toml").is_file(), str(self.repo))
+        self.check(
+            "repo root",
+            (self.repo / "Cargo.toml").is_file() and (self.repo / "afs/Cargo.toml").is_file(),
+            str(self.repo),
+        )
         free = shutil.disk_usage(self.root.parent).free
         self.check("work root parent has at least 1GiB free", free >= 1024**3, {"free_bytes": free})
         required_tools = ["bash", "python3", "openssl", "findmnt", "fusermount3"]
-        self.check("host tools", all(shutil.which(tool) for tool in required_tools), {tool: shutil.which(tool) for tool in required_tools})
+        self.check(
+            "host tools",
+            all(shutil.which(tool) for tool in required_tools),
+            {tool: shutil.which(tool) for tool in required_tools},
+        )
         for name in ["afs-meta", "afs-node"]:
             exe = self.binary_dir / name
             self.check(f"{name} executable", exe.is_file() and os.access(exe, os.X_OK), str(exe))
@@ -148,14 +159,26 @@ class Scenario:
                 for rel in source_files
                 if (self.repo / rel).is_file()
             },
-            "scope": "one Linux VM, local-file Meta, two distinct Node processes over mTLS TCP, OwnerFs only, functional 64KiB checks; no performance or distributed lock claim",
+            "scope": (
+                "one Linux VM, local-file Meta, two distinct Node processes over "
+                "mTLS TCP, OwnerFs only, functional 64KiB checks; no performance "
+                "or distributed lock claim"
+            ),
         }
-        self._write_json("identity.json", identity)
+        self.write_json("identity.json", identity)
 
     def generate_tls(self) -> None:
         tls = self.root / "tls"
         tls.mkdir(parents=True)
-        sans = f"DNS:afs-meta,DNS:meta,IP:{META_IP},DNS:node-a,IP:{NODE_A_IP},DNS:node-b,IP:{NODE_B_IP},DNS:127.0.0.1,IP:127.0.0.1"
+        sans = (
+            f"DNS:afs-meta,DNS:meta,IP:"
+            f"{META_IP}"
+            f",DNS:node-a,IP:"
+            f"{NODE_A_IP}"
+            f",DNS:node-b,IP:"
+            f"{NODE_B_IP}"
+            f",DNS:127.0.0.1,IP:127.0.0.1"
+        )
         self.command(["openssl", "genrsa", "-out", tls / "ca-key.pem", "2048"], check_name="generate CA key")
         self.command(
             [
@@ -179,12 +202,26 @@ class Scenario:
         os.chmod(tls / "ca-key.pem", 0o600)
         os.chmod(tls / "ca.pem", 0o644)
         for name, cn in [("meta", "afs-meta"), ("node-a", "node-a"), ("node-b", "node-b")]:
-            self.command(["openssl", "genrsa", "-out", tls / f"{name}-key.pem", "2048"], check_name=f"generate {name} key")
             self.command(
-                ["openssl", "req", "-new", "-key", tls / f"{name}-key.pem", "-subj", f"/CN={cn}", "-out", tls / f"{name}.csr"],
+                ["openssl", "genrsa", "-out", tls / f"{name}-key.pem", "2048"], check_name=f"generate {name} key"
+            )
+            self.command(
+                [
+                    "openssl",
+                    "req",
+                    "-new",
+                    "-key",
+                    tls / f"{name}-key.pem",
+                    "-subj",
+                    f"/CN={cn}",
+                    "-out",
+                    tls / f"{name}.csr",
+                ],
                 check_name=f"generate {name} csr",
             )
-            (tls / f"{name}.ext").write_text(f"subjectAltName = {sans}\nextendedKeyUsage = serverAuth,clientAuth\n", encoding="utf-8")
+            (tls / f"{name}.ext").write_text(
+                f"subjectAltName = {sans}\nextendedKeyUsage = serverAuth,clientAuth\n", encoding="utf-8"
+            )
             self.command(
                 [
                     "openssl",
@@ -211,7 +248,10 @@ class Scenario:
             (tls / f"{name}.ext").unlink()
             os.chmod(tls / f"{name}-key.pem", 0o600)
             os.chmod(tls / f"{name}.pem", 0o644)
-            self.command(["openssl", "verify", "-CAfile", tls / "ca.pem", tls / f"{name}.pem"], check_name=f"verify {name} certificate")
+            self.command(
+                ["openssl", "verify", "-CAfile", tls / "ca.pem", tls / f"{name}.pem"],
+                check_name=f"verify {name} certificate",
+            )
 
     def write_configs(self) -> None:
         etc = self.root / "etc"
@@ -269,7 +309,11 @@ trusted_node_certs = {trusted}
                 encoding="utf-8",
             )
         for role, cfg in [("meta", etc / "meta.toml"), ("node", etc / "node-a.toml"), ("node", etc / "node-b.toml")]:
-            self.command([self.binary_dir / f"afs-{role}", "--config", cfg, "--print-config"], timeout=20, check_name=f"print-config {cfg.name}")
+            self.command(
+                [self.binary_dir / f"afs-{role}", "--config", cfg, "--print-config"],
+                timeout=20,
+                check_name=f"print-config {cfg.name}",
+            )
 
     def enable_bind_for_node_a(self) -> None:
         cfg = self.root / "etc/node-a.toml"
@@ -281,21 +325,36 @@ experimental_ownerfs_workspace_bind = true
 workspace = "{WORKSPACE}"
 '''
             )
-        self.command([self.binary_dir / "afs-node", "--config", cfg, "--print-config"], timeout=20, check_name="print-config node-a bind ON")
+        self.command(
+            [self.binary_dir / "afs-node", "--config", cfg, "--print-config"],
+            timeout=20,
+            check_name="print-config node-a bind ON",
+        )
 
     def start(self, name: str) -> None:
         role = "meta" if name == "meta" else "node"
         cfg = self.root / "etc" / ("meta.toml" if name == "meta" else f"{name}.toml")
         log = open(self.root / f"{name}-{len(self.receipts)}.log", "ab")
         self.logs.append(log)
-        proc = subprocess.Popen([str(self.binary_dir / f"afs-{role}"), "--config", str(cfg)], stdout=log, stderr=log, start_new_session=True)
+        proc = subprocess.Popen(
+            [str(self.binary_dir / f"afs-{role}"), "--config", str(cfg)], stdout=log, stderr=log, start_new_session=True
+        )
         self.processes[name] = proc
-        ip, port = {"meta": (META_IP, META_REST), "node-a": (NODE_A_IP, NODE_REST), "node-b": (NODE_B_IP, NODE_REST)}[name]
+        ip, port = {"meta": (META_IP, META_REST), "node-a": (NODE_A_IP, NODE_REST), "node-b": (NODE_B_IP, NODE_REST)}[
+            name
+        ]
         deadline = time.monotonic() + 30
         last_error = None
         while time.monotonic() < deadline:
             if proc.poll() is not None:
-                raise AssertionError((name, "early exit", proc.returncode, (self.root / f"{name}-{len(self.receipts)}.log").read_text(errors="replace")[-4000:]))
+                raise AssertionError(
+                    (
+                        name,
+                        "early exit",
+                        proc.returncode,
+                        (self.root / f"{name}-{len(self.receipts)}.log").read_text(errors="replace")[-4000:],
+                    )
+                )
             try:
                 conn = http.client.HTTPConnection(ip, port, timeout=1)
                 conn.request("GET", "/health")
@@ -341,30 +400,53 @@ workspace = "{WORKSPACE}"
                 "tracked": True,
             }
             self.receipts.append(receipt)
-            self._write_json("waits.json", self.receipts)
+            self.write_json("waits.json", self.receipts)
             self.check(f"{name} actual wait0", False, receipt)
             return
-        receipt = {"name": name, "pid": proc.pid, "wait_status": status, "gone": not Path(f"/proc/{proc.pid}").exists(), "tracked": False}
+        receipt = {
+            "name": name,
+            "pid": proc.pid,
+            "wait_status": status,
+            "gone": not Path(f"/proc/{proc.pid}").exists(),
+            "tracked": False,
+        }
         self.receipts.append(receipt)
-        self._write_json("waits.json", self.receipts)
+        self.write_json("waits.json", self.receipts)
         if status == 0:
             self.processes.pop(name, None)
         self.check(f"{name} actual wait0", status == 0, receipt)
 
-    def user(self, script: str, *paths: object, uid: int = WORKLOAD_UID, gid: int = WORKLOAD_GID, input_text: str | None = None) -> None:
+    def user(
+        self,
+        script: str,
+        *paths: object,
+        uid: int = WORKLOAD_UID,
+        gid: int = WORKLOAD_GID,
+        input_text: str | None = None,
+    ) -> None:
         code = f"import os,sys\nos.setgroups([]);os.setgid({gid});os.setuid({uid})\n" + script
         self.command(["python3", "-c", code, *paths], input_text=input_text, check_name="workload user command")
 
     def write_payload(self, path: Path, payload: bytes) -> None:
         self.user(
-            "p=sys.argv[1];data=bytes.fromhex(sys.stdin.read());f=open(p,'wb');f.write(data);f.flush();os.fsync(f.fileno());f.close()",
+            (
+                "p=sys.argv[1];data=bytes.fromhex(sys.stdin.read());f=open(p,'wb'"
+                ");f.write(data);f.flush();os.fsync(f.fileno());f.close()"
+            ),
             path,
             input_text=payload.hex(),
         )
 
     def read_payload(self, path: Path, payload: bytes) -> None:
         self.user(
-            "import hashlib;data=open(sys.argv[1],'rb').read();assert len(data)==int(sys.argv[2]);assert hashlib.sha256(data).hexdigest()==sys.argv[3]",
+            (
+                "import hashlib\ndata = open(sys.argv[1], 'rb').read()\nif not "
+                "len(data) == int(sys.argv[2]):\n    raise "
+                "AssertionError('len(data) == int(sys.argv[2])')\nif not "
+                "hashlib.sha256(data).hexdigest() == sys.argv[3]:\n    raise "
+                "AssertionError('hashlib.sha256(data).hexdigest() == "
+                "sys.argv[3]')\n"
+            ),
             path,
             len(payload),
             hashlib.sha256(payload).hexdigest(),
@@ -394,14 +476,25 @@ workspace = "{WORKSPACE}"
 
             physical = list((self.root / "node-a/state/ownerfs").glob("root-776f726b7370616365-e*"))
             self.check("one physical Home epoch", len(physical) == 1, [str(path) for path in physical])
-            found = json.loads(self.command(["findmnt", "-J", "--mountpoint", home, "-o", "TARGET,SOURCE,FSTYPE,ID"], check_name="find bind mount"))["filesystems"][0]
+            found = json.loads(
+                self.command(
+                    ["findmnt", "-J", "--mountpoint", home, "-o", "TARGET,SOURCE,FSTYPE,ID"],
+                    check_name="find bind mount",
+                )
+            )["filesystems"][0]
             home_stat, physical_stat = home.stat(), physical[0].stat()
             self.check(
                 "real ext4 source bind",
-                found.get("fstype") == "ext4" and (home_stat.st_dev, home_stat.st_ino) == (physical_stat.st_dev, physical_stat.st_ino),
+                found.get("fstype") == "ext4"
+                and (home_stat.st_dev, home_stat.st_ino) == (physical_stat.st_dev, physical_stat.st_ino),
                 found,
             )
-            remote_mount = json.loads(self.command(["findmnt", "-J", "--mountpoint", remote.parent, "-o", "TARGET,SOURCE,FSTYPE,ID"], check_name="find remote fuse mount"))["filesystems"][0]
+            remote_mount = json.loads(
+                self.command(
+                    ["findmnt", "-J", "--mountpoint", remote.parent, "-o", "TARGET,SOURCE,FSTYPE,ID"],
+                    check_name="find remote fuse mount",
+                )
+            )["filesystems"][0]
             self.check("remote FUSE", remote_mount.get("source") == "afs-ownerfs", remote_mount)
 
             last_reverse = b""
@@ -418,7 +511,10 @@ workspace = "{WORKSPACE}"
             remote_privileged = remote / "privilege.bin"
             privileged.write_bytes(b"initial")
             os.chmod(privileged, 0o6777)
-            self.user("f=os.open(sys.argv[1],os.O_WRONLY);os.write(f,b'nonowner direct IO');os.fsync(f);os.close(f)", remote_privileged)
+            self.user(
+                ("f=os.open(sys.argv[1],os.O_WRONLY);os.write(f,b'nonowner direct IO');os.fsync(f);os.close(f)"),
+                remote_privileged,
+            )
             self.check("remote direct IO clears suid executable sgid", privileged.stat().st_mode & 0o7777 == 0o777)
             os.chmod(privileged, 0o6777)
             with open(remote_privileged, "wb") as handle:
@@ -431,8 +527,24 @@ workspace = "{WORKSPACE}"
             self.check("remote non executable sgid preserved", privileged.stat().st_mode & 0o7777 == 0o2666)
 
             for path in [home / "cross.bin", remote / "cross.bin"]:
-                self.user("\ntry: os.open(sys.argv[1],os.O_RDONLY)\nexcept PermissionError: pass\nelse: raise AssertionError('uid502 unexpectedly read workspace')", path, uid=502, gid=502)
-            self.user("\ntry: os.open(sys.argv[1],os.O_RDONLY)\nexcept FileNotFoundError: pass\nelse: raise AssertionError('missing file returned success')", remote / "missing")
+                self.user(
+                    (
+                        "\ntry: os.open(sys.argv[1],os.O_RDONLY)\nexcept PermissionError: "
+                        "pass\nelse: raise AssertionError('uid502 unexpectedly read "
+                        "workspace')"
+                    ),
+                    path,
+                    uid=502,
+                    gid=502,
+                )
+            self.user(
+                (
+                    "\ntry: os.open(sys.argv[1],os.O_RDONLY)\nexcept "
+                    "FileNotFoundError: pass\nelse: raise AssertionError('missing "
+                    "file returned success')"
+                ),
+                remote / "missing",
+            )
             for folder in [home, remote]:
                 self.user("f=os.open(sys.argv[1],os.O_RDONLY|os.O_DIRECTORY);os.fsync(f);os.close(f)", folder)
 
@@ -456,9 +568,7 @@ workspace = "{WORKSPACE}"
             self.stop("meta")
             for name in ["meta", "node-a", "node-b"]:
                 self.start(name)
-            recovered_physical = list(
-                (self.root / "node-a/state/ownerfs").glob("root-776f726b7370616365-e*")
-            )
+            recovered_physical = list((self.root / "node-a/state/ownerfs").glob("root-776f726b7370616365-e*"))
             self.check(
                 "restart preserves one physical Home inode",
                 len(recovered_physical) == 1
@@ -492,14 +602,20 @@ workspace = "{WORKSPACE}"
             )
             self.read_payload(home / "cross.bin", last_reverse)
             self.read_payload(remote / "cross.bin", last_reverse)
-            self.user("os.unlink(sys.argv[1]);d=os.open(sys.argv[2],os.O_RDONLY|os.O_DIRECTORY);os.fsync(d);os.close(d)", remote / "cross.bin", remote)
+            self.user(
+                ("os.unlink(sys.argv[1]);d=os.open(sys.argv[2],os.O_RDONLY|os.O_DIRECTORY);os.fsync(d);os.close(d)"),
+                remote / "cross.bin",
+                remote,
+            )
             self.check("delete visible at bind", not (home / "cross.bin").exists())
             self.stop("node-b")
             self.stop("node-a")
             self.stop("meta")
             mountinfo = Path("/proc/self/mountinfo").read_text(encoding="utf-8")
-            self.check("normal unmount no owned mounts", not any(str(self.root) in line for line in mountinfo.splitlines()))
-            self._write_json(
+            self.check(
+                "normal unmount no owned mounts", not any(str(self.root) in line for line in mountinfo.splitlines())
+            )
+            self.write_json(
                 "result.json",
                 {
                     "status": "PASS",
@@ -528,9 +644,17 @@ workspace = "{WORKSPACE}"
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", type=Path, default=Path.cwd(), help="target repository root; default: cwd")
-    parser.add_argument("--binary-dir", type=Path, required=True, help="directory containing target-built afs-meta and afs-node")
-    parser.add_argument("--work-root", type=Path, required=True, help="fresh absolute work/evidence directory on Linux ext4")
-    parser.add_argument("--keep-going", action="store_true", help="reserved for future multi-case drivers; current scenario remains fail-fast")
+    parser.add_argument(
+        "--binary-dir", type=Path, required=True, help="directory containing target-built afs-meta and afs-node"
+    )
+    parser.add_argument(
+        "--work-root", type=Path, required=True, help="fresh absolute work/evidence directory on Linux ext4"
+    )
+    parser.add_argument(
+        "--keep-going",
+        action="store_true",
+        help="reserved for future multi-case drivers; current scenario remains fail-fast",
+    )
     return parser.parse_args()
 
 

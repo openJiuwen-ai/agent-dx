@@ -6,12 +6,12 @@ from argparse import Namespace
 from pathlib import Path
 from unittest import mock
 
-
 HERE = Path(__file__).resolve().parent
 SPEC = importlib.util.spec_from_file_location("env_verbs", HERE / "env_verbs.py")
 env_verbs = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
 SPEC.loader.exec_module(env_verbs)
+
 
 def stock_log(role="client", size=256, count=3):
     rows = ["rdma_listen", "cma_event type RDMA_CM_EVENT_ESTABLISHED cma_id 0x1234 (parent)"]
@@ -35,23 +35,38 @@ def stock_log(role="client", size=256, count=3):
         rows.append("wait for RDMA_READ_ADV state 10")
     else:
         rows.append("DISCONNECTED")
-    rows.extend(["cma_event type RDMA_CM_EVENT_DISCONNECTED cma_id 0x1234 (parent)", "rping_free_buffers called on cb 0x1234", "destroy cm_id 0x1234"])
+    rows.extend(
+        [
+            "cma_event type RDMA_CM_EVENT_DISCONNECTED cma_id 0x1234 (parent)",
+            "rping_free_buffers called on cb 0x1234",
+            "destroy cm_id 0x1234",
+        ]
+    )
     return "\n".join(rows) + "\n"
 
 
 RUN_ID = "11111111-1111-4111-8111-111111111111"
 
+
 def inventory(bind, peer, *, binary_hash=None, route=True, gid=True, mtu="1500", link=True, provider=True):
     return {
         "binary": {"sha256": binary_hash or env_verbs.EXPECTED_RPING_SHA256},
         "route": {"stdout": f"{peer} dev eth0 src {bind}\n" if route else "default via 10.0.2.2\n"},
-        "rdma_link": {"stdout": "link rxe0/1 state ACTIVE physical_state LINK_UP netdev eth0\n" if link else "link rxe0/1 state DOWN\n"},
-        "sysfs": {"gid": "::ffff:" + ":".join(env_verbs.ipv4_mapped_gid(bind).split(":")[-2:]) if gid else "::", "eth0_mtu": mtu},
+        "rdma_link": {
+            "stdout": "link rxe0/1 state ACTIVE physical_state LINK_UP netdev eth0\n"
+            if link
+            else "link rxe0/1 state DOWN\n"
+        },
+        "sysfs": {
+            "gid": "::ffff:" + ":".join(env_verbs.ipv4_mapped_gid(bind).split(":")[-2:]) if gid else "::",
+            "eth0_mtu": mtu,
+        },
         "installed_provider": {
             "libibverbs_so_sha256": "a" * 64 if provider else None,
             "rxe_provider_so_sha256": "b" * 64 if provider else None,
         },
     }
+
 
 def endpoint(role, *, raw=None, binary_hash=None, route=True, rc=0, size=256, count=3, host=None, **inv):
     bind = "192.0.2.12" if role == "client" else "192.0.2.13"
@@ -91,7 +106,11 @@ class EnvVerbsTests(unittest.TestCase):
         client, server = endpoint("client"), endpoint("server")
         for ep in (client, server):
             ep["inventory"]["route"]["stdout"] = f"{ep['peer']} from {ep['bind']} dev eth0 uid 501\n    cache\n"
-        client["raw_log"] = client["raw_log"].replace("cma_event type RDMA_CM_EVENT_DISCONNECTED cma_id 0x1234 (parent)\n", "").replace("DISCONNECTED\n", "")
+        client["raw_log"] = (
+            client["raw_log"]
+            .replace("cma_event type RDMA_CM_EVENT_DISCONNECTED cma_id 0x1234 (parent)\n", "")
+            .replace("DISCONNECTED\n", "")
+        )
         client["raw_log_sha256"] = env_verbs.sha256_bytes(client["raw_log"].encode())
         self.assertEqual("PASS", env_verbs.evaluate_pair(client, server)["status"])
 
@@ -189,7 +208,9 @@ class EnvVerbsTests(unittest.TestCase):
             server.write_text(json.dumps(endpoint("server")))
             out.write_text("{}")
             with self.assertRaises(env_verbs.VerbsError):
-                env_verbs.main(["evaluate-pair", "--client", str(client), "--server", str(server), "--output", str(out)])
+                env_verbs.main(
+                    ["evaluate-pair", "--client", str(client), "--server", str(server), "--output", str(out)]
+                )
 
     def test_run_endpoint_uses_fake_subprocess_and_writes_raw_report(self):
         chunks = [b"rdma_listen\n", stock_log("client").encode("utf-8")]
@@ -207,33 +228,23 @@ class EnvVerbsTests(unittest.TestCase):
             def wait(self, timeout=None):
                 return 0
 
-        with tempfile.TemporaryDirectory() as td, \
-                mock.patch.object(env_verbs.subprocess, "Popen", FakePopen), \
-                mock.patch.object(env_verbs, "wait_rping_identity", return_value={"pid": 12345, "start_ticks": 7, "exe_sha256": env_verbs.EXPECTED_RPING_SHA256}), \
-                mock.patch.object(env_verbs, "rdma_inventory", return_value={"binary": {"sha256": env_verbs.EXPECTED_RPING_SHA256}}), \
-                mock.patch.object(env_verbs, "resources_snapshot", return_value={"rdma_resource": {"stdout": ""}}), \
-                mock.patch.object(env_verbs, "run_cmd", return_value={"stdout": ""}), \
-                mock.patch.object(env_verbs, "sha256_file", return_value=env_verbs.EXPECTED_RPING_SHA256):
-            rc = env_verbs.run_endpoint(Namespace(
-                role="client",
-                bind="192.0.2.12",
-                peer="192.0.2.13",
-                port=19669,
-                size=256,
-                count=3,
-                run_id=RUN_ID,
-                output=Path(td),
-                timeout=3,
-            ))
-            self.assertEqual(0, rc)
-            report = json.loads((Path(td) / f"{RUN_ID}-client.json").read_text())
-            self.assertEqual("client", report["role"])
-            self.assertEqual(env_verbs.sha256_bytes((Path(td) / f"{RUN_ID}-client.raw.log").read_bytes()), report["raw_log_sha256"])
-
-    def test_timeout_is_reported_without_claiming_success(self):
-        with tempfile.TemporaryDirectory() as td:
-            with self.assertRaises(env_verbs.VerbsError):
-                env_verbs.run_endpoint(Namespace(
+        with (
+            tempfile.TemporaryDirectory() as td,
+            mock.patch.object(env_verbs.subprocess, "Popen", FakePopen),
+            mock.patch.object(
+                env_verbs,
+                "wait_rping_identity",
+                return_value={"pid": 12345, "start_ticks": 7, "exe_sha256": env_verbs.EXPECTED_RPING_SHA256},
+            ),
+            mock.patch.object(
+                env_verbs, "rdma_inventory", return_value={"binary": {"sha256": env_verbs.EXPECTED_RPING_SHA256}}
+            ),
+            mock.patch.object(env_verbs, "resources_snapshot", return_value={"rdma_resource": {"stdout": ""}}),
+            mock.patch.object(env_verbs, "run_cmd", return_value={"stdout": ""}),
+            mock.patch.object(env_verbs, "sha256_file", return_value=env_verbs.EXPECTED_RPING_SHA256),
+        ):
+            rc = env_verbs.run_endpoint(
+                Namespace(
                     role="client",
                     bind="192.0.2.12",
                     peer="192.0.2.13",
@@ -242,8 +253,32 @@ class EnvVerbsTests(unittest.TestCase):
                     count=3,
                     run_id=RUN_ID,
                     output=Path(td),
-                    timeout=31,
-                ))
+                    timeout=3,
+                )
+            )
+            self.assertEqual(0, rc)
+            report = json.loads((Path(td) / f"{RUN_ID}-client.json").read_text())
+            self.assertEqual("client", report["role"])
+            self.assertEqual(
+                env_verbs.sha256_bytes((Path(td) / f"{RUN_ID}-client.raw.log").read_bytes()), report["raw_log_sha256"]
+            )
+
+    def test_timeout_is_reported_without_claiming_success(self):
+        with tempfile.TemporaryDirectory() as td:
+            with self.assertRaises(env_verbs.VerbsError):
+                env_verbs.run_endpoint(
+                    Namespace(
+                        role="client",
+                        bind="192.0.2.12",
+                        peer="192.0.2.13",
+                        port=19669,
+                        size=256,
+                        count=3,
+                        run_id=RUN_ID,
+                        output=Path(td),
+                        timeout=31,
+                    )
+                )
 
 
 if __name__ == "__main__":

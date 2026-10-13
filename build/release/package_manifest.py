@@ -88,9 +88,7 @@ def verify(directory: Path, *, enforce_host_architecture: bool = False) -> dict:
     if enforce_host_architecture:
         machine = {"x86_64": "x86_64", "aarch64": "aarch64"}.get(platform.machine())
         if machine is None or not target.startswith(machine + "-") or "linux" not in target:
-            raise ValueError(
-                f"package target {target!r} does not match Linux host {platform.machine()!r}"
-            )
+            raise ValueError(f"package target {target!r} does not match Linux host {platform.machine()!r}")
     return manifest
 
 
@@ -101,7 +99,7 @@ def main() -> None:
     args = parser.parse_args()
     try:
         manifest = verify(args.directory, enforce_host_architecture=args.host_architecture)
-    except (OSError, ValueError, json.JSONDecodeError) as error:
+    except (OSError, ValueError) as error:
         raise SystemExit(str(error)) from error
     print(f"package verified: {manifest['commit']} ({manifest.get('target', '')})")
 

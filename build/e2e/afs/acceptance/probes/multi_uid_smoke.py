@@ -6,6 +6,7 @@ provided mount and executes child processes with numeric uid/gid through
 setpriv. This exercises kernel default_permissions and backend caller-context
 handling; root-only checks are not a substitute for these non-root subcases.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -58,93 +59,160 @@ def _expect(condition: bool, message: str, details: dict[str, Any] | None = None
     return {"ok": True, "message": message, "details": details or {}}
 
 
-_CHILD = r'''
-import base64, errno, json, os, pathlib, sys, traceback
-
-def b64(v):
-    return base64.b64encode(v).decode('ascii')
-
-def emit(obj):
-    print(json.dumps(obj, sort_keys=True))
-
-def main():
-    op=sys.argv[1]
-    p=pathlib.Path(sys.argv[2])
-    out={'op':op,'uid':os.geteuid(),'gid':os.getegid(),'groups':os.getgroups()}
-    try:
-        if op == 'create_rw':
-            fd=os.open(p, os.O_CREAT|os.O_EXCL|os.O_RDWR, 0o664)
-            try:
-                os.write(fd,b'uid60001-data')
-                os.fsync(fd)
-                os.lseek(fd,0,os.SEEK_SET)
-                data=os.read(fd,64)
-            finally:
-                os.close(fd)
-            st=p.stat()
-            out.update({'ok':True,'data_b64':b64(data),'stat':{'uid':st.st_uid,'gid':st.st_gid,'mode':oct(st.st_mode & 0o7777),'size':st.st_size}})
-        elif op == 'rw_existing':
-            fd=os.open(p, os.O_RDWR)
-            try:
-                data=os.read(fd,64)
-                os.lseek(fd,0,os.SEEK_END)
-                os.write(fd,b'+group')
-                os.fsync(fd)
-            finally:
-                os.close(fd)
-            out.update({'ok':True,'read_b64':b64(data)})
-        elif op == 'xattr_cycle':
-            name='user.afs_multi_uid'
-            value=b'group-xattr\x00value'
-            os.setxattr(p,name,value)
-            got=os.getxattr(p,name)
-            os.removexattr(p,name)
-            try:
-                os.getxattr(p,name)
-                missing_errno=None
-            except OSError as exc:
-                missing_errno=exc.errno
-            out.update({'ok':True,'value_b64':b64(got),'missing_errno':missing_errno})
-        elif op == 'expect_denied_rw':
-            try:
-                os.open(p, os.O_RDWR)
-                out.update({'ok':False,'error':'open unexpectedly succeeded'})
-                emit(out); return 1
-            except OSError as exc:
-                out.update({'ok': exc.errno in (errno.EACCES, errno.EPERM), 'errno': exc.errno, 'errno_name': errno.errorcode.get(exc.errno)})
-                emit(out); return 0 if out['ok'] else 1
-        elif op == 'expect_denied_xattr':
-            try:
-                os.setxattr(p,'user.afs_multi_uid_denied',b'denied')
-                out.update({'ok':False,'error':'setxattr unexpectedly succeeded'})
-                emit(out); return 1
-            except OSError as exc:
-                out.update({'ok': exc.errno in (errno.EACCES, errno.EPERM), 'errno': exc.errno, 'errno_name': errno.errorcode.get(exc.errno)})
-                emit(out); return 0 if out['ok'] else 1
-        elif op == 'expect_nonowner_chmod_chown_denied':
-            results={}
-            try:
-                os.chmod(p,0o777)
-                results['chmod']={'ok':False,'error':'chmod unexpectedly succeeded'}
-            except OSError as exc:
-                results['chmod']={'ok': exc.errno in (errno.EPERM, errno.EACCES), 'errno': exc.errno, 'errno_name': errno.errorcode.get(exc.errno)}
-            try:
-                os.chown(p, os.geteuid(), os.getegid())
-                results['chown']={'ok':False,'error':'chown unexpectedly succeeded'}
-            except OSError as exc:
-                results['chown']={'ok': exc.errno in (errno.EPERM, errno.EACCES), 'errno': exc.errno, 'errno_name': errno.errorcode.get(exc.errno)}
-            out.update({'ok': all(v.get('ok') for v in results.values()), 'results': results})
-            emit(out); return 0 if out['ok'] else 1
-        else:
-            out.update({'ok':False,'error':'unknown op'})
-            emit(out); return 2
-        emit(out); return 0 if out.get('ok') else 1
-    except Exception as exc:
-        out.update({'ok':False,'exception':type(exc).__name__,'message':str(exc),'traceback':traceback.format_exc()})
-        emit(out); return 1
-
-raise SystemExit(main())
-'''
+_CHILD = (
+    "import base64, errno, json, os, pathlib, sys, traceback\n"
+    "\n"
+    "\n"
+    "def b64(v):\n"
+    '    return base64.b64encode(v).decode("ascii")\n'
+    "\n"
+    "\n"
+    "def emit(obj):\n"
+    "    print(json.dumps(obj, sort_keys=True))\n"
+    "\n"
+    "\n"
+    "def main():\n"
+    "    op = sys.argv[1]\n"
+    "    p = pathlib.Path(sys.argv[2])\n"
+    '    out = {"op": op, "uid": os.geteuid(), "gid": os.getegid(), "g'
+    'roups": os.getgroups()}\n'
+    "    try:\n"
+    '        if op == "create_rw":\n'
+    "            fd = os.open(p, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0"
+    "o664)\n"
+    "            try:\n"
+    '                os.write(fd, b"uid60001-data")\n'
+    "                os.fsync(fd)\n"
+    "                os.lseek(fd, 0, os.SEEK_SET)\n"
+    "                data = os.read(fd, 64)\n"
+    "            finally:\n"
+    "                os.close(fd)\n"
+    "            st = p.stat()\n"
+    "            out.update(\n"
+    "                {\n"
+    '                    "ok": True,\n'
+    '                    "data_b64": b64(data),\n'
+    '                    "stat": {\n'
+    '                        "uid": st.st_uid,\n'
+    '                        "gid": st.st_gid,\n'
+    '                        "mode": oct(st.st_mode & 0o7777),\n'
+    '                        "size": st.st_size,\n'
+    "                    },\n"
+    "                }\n"
+    "            )\n"
+    '        elif op == "rw_existing":\n'
+    "            fd = os.open(p, os.O_RDWR)\n"
+    "            try:\n"
+    "                data = os.read(fd, 64)\n"
+    "                os.lseek(fd, 0, os.SEEK_END)\n"
+    '                os.write(fd, b"+group")\n'
+    "                os.fsync(fd)\n"
+    "            finally:\n"
+    "                os.close(fd)\n"
+    '            out.update({"ok": True, "read_b64": b64(data)})\n'
+    '        elif op == "xattr_cycle":\n'
+    '            name = "user.afs_multi_uid"\n'
+    '            value = b"group-xattr\\x00value"\n'
+    "            os.setxattr(p, name, value)\n"
+    "            got = os.getxattr(p, name)\n"
+    "            os.removexattr(p, name)\n"
+    "            try:\n"
+    "                os.getxattr(p, name)\n"
+    "                missing_errno = None\n"
+    "            except OSError as exc:\n"
+    "                missing_errno = exc.errno\n"
+    '            out.update({"ok": True, "value_b64": b64(got), "missi'
+    'ng_errno": missing_errno})\n'
+    '        elif op == "expect_denied_rw":\n'
+    "            try:\n"
+    "                os.open(p, os.O_RDWR)\n"
+    '                out.update({"ok": False, "error": "open unexpecte'
+    'dly succeeded"})\n'
+    "                emit(out)\n"
+    "                return 1\n"
+    "            except OSError as exc:\n"
+    "                out.update(\n"
+    "                    {\n"
+    '                        "ok": exc.errno in (errno.EACCES, errno.E'
+    "PERM),\n"
+    '                        "errno": exc.errno,\n'
+    '                        "errno_name": errno.errorcode.get(exc.err'
+    "no),\n"
+    "                    }\n"
+    "                )\n"
+    "                emit(out)\n"
+    '                return 0 if out["ok"] else 1\n'
+    '        elif op == "expect_denied_xattr":\n'
+    "            try:\n"
+    '                os.setxattr(p, "user.afs_multi_uid_denied", b"den'
+    'ied")\n'
+    '                out.update({"ok": False, "error": "setxattr unexp'
+    'ectedly succeeded"})\n'
+    "                emit(out)\n"
+    "                return 1\n"
+    "            except OSError as exc:\n"
+    "                out.update(\n"
+    "                    {\n"
+    '                        "ok": exc.errno in (errno.EACCES, errno.E'
+    "PERM),\n"
+    '                        "errno": exc.errno,\n'
+    '                        "errno_name": errno.errorcode.get(exc.err'
+    "no),\n"
+    "                    }\n"
+    "                )\n"
+    "                emit(out)\n"
+    '                return 0 if out["ok"] else 1\n'
+    '        elif op == "expect_nonowner_chmod_chown_denied":\n'
+    "            results = {}\n"
+    "            try:\n"
+    "                os.chmod(p, 0o777)\n"
+    '                results["chmod"] = {"ok": False, "error": "chmod '
+    'unexpectedly succeeded"}\n'
+    "            except OSError as exc:\n"
+    '                results["chmod"] = {\n'
+    '                    "ok": exc.errno in (errno.EPERM, errno.EACCES'
+    "),\n"
+    '                    "errno": exc.errno,\n'
+    '                    "errno_name": errno.errorcode.get(exc.errno),'
+    "\n"
+    "                }\n"
+    "            try:\n"
+    "                os.chown(p, os.geteuid(), os.getegid())\n"
+    '                results["chown"] = {"ok": False, "error": "chown '
+    'unexpectedly succeeded"}\n'
+    "            except OSError as exc:\n"
+    '                results["chown"] = {\n'
+    '                    "ok": exc.errno in (errno.EPERM, errno.EACCES'
+    "),\n"
+    '                    "errno": exc.errno,\n'
+    '                    "errno_name": errno.errorcode.get(exc.errno),'
+    "\n"
+    "                }\n"
+    '            out.update({"ok": all(v.get("ok") for v in results.va'
+    'lues()), "results": results})\n'
+    "            emit(out)\n"
+    '            return 0 if out["ok"] else 1\n'
+    "        else:\n"
+    '            out.update({"ok": False, "error": "unknown op"})\n'
+    "            emit(out)\n"
+    "            return 2\n"
+    "        emit(out)\n"
+    '        return 0 if out.get("ok") else 1\n'
+    "    except Exception as exc:\n"
+    "        out.update(\n"
+    "            {\n"
+    '                "ok": False,\n'
+    '                "exception": type(exc).__name__,\n'
+    '                "message": str(exc),\n'
+    '                "traceback": traceback.format_exc(),\n'
+    "            }\n"
+    "        )\n"
+    "        emit(out)\n"
+    "        return 1\n"
+    "\n"
+    "\n"
+    "raise SystemExit(main())\n"
+)
 
 
 class Probe:
@@ -153,7 +221,14 @@ class Probe:
         self.evidence = evidence.resolve()
         self.setpriv = setpriv
         self.base_dir = self._resolve_base_dir(base_dir)
-        self.run_id = f"multi-uid-smoke-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-{os.getpid()}-{random.randrange(1_000_000):06d}"
+        self.run_id = (
+            f"multi-uid-smoke-"
+            f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}"
+            f"-"
+            f"{os.getpid()}"
+            f"-"
+            f"{random.randrange(1000000):06d}"
+        )
         self.root = self.base_dir / f".afs-multi-uid-smoke-{self.run_id}"
         self.child_script = self.root / "child.py"
         self.records: list[dict[str, Any]] = []
@@ -185,10 +260,30 @@ class Probe:
             details = func()
             record.update({"ok": True, "exit_status": 0, "errno": None, "errno_name": None, "details": details})
         except OSError as exc:
-            record.update({"ok": False, "exit_status": 1, "errno": exc.errno, "errno_name": _errno_name(exc.errno), "exception": type(exc).__name__, "message": str(exc), "traceback": traceback.format_exc()})
+            record.update(
+                {
+                    "ok": False,
+                    "exit_status": 1,
+                    "errno": exc.errno,
+                    "errno_name": _errno_name(exc.errno),
+                    "exception": type(exc).__name__,
+                    "message": str(exc),
+                    "traceback": traceback.format_exc(),
+                }
+            )
             self.failures.append(record)
         except Exception as exc:  # noqa: BLE001
-            record.update({"ok": False, "exit_status": 1, "errno": None, "errno_name": None, "exception": type(exc).__name__, "message": str(exc), "traceback": traceback.format_exc()})
+            record.update(
+                {
+                    "ok": False,
+                    "exit_status": 1,
+                    "errno": None,
+                    "errno_name": None,
+                    "exception": type(exc).__name__,
+                    "message": str(exc),
+                    "traceback": traceback.format_exc(),
+                }
+            )
             self.failures.append(record)
         finally:
             record["duration_ms"] = round((time.time() - started) * 1000, 3)
@@ -210,7 +305,13 @@ class Probe:
         parsed = None
         if proc.stdout.strip():
             parsed = json.loads(proc.stdout.strip().splitlines()[-1])
-        result = {"cmd": cmd, "returncode": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr, "parsed": parsed}
+        result = {
+            "cmd": cmd,
+            "returncode": proc.returncode,
+            "stdout": proc.stdout,
+            "stderr": proc.stderr,
+            "parsed": parsed,
+        }
         _expect(proc.returncode == 0 and parsed and parsed.get("ok"), f"child op {op} as uid {uid} succeeded", result)
         return result
 
@@ -226,7 +327,13 @@ class Probe:
         q = self.root / "uid60001-chgrp-source"
         child = self.child(60001, 60001, [60002], "create_rw", q)
         self.child(60001, 60001, [60002], "rw_existing", q)
-        subprocess.run([self.setpriv, "--reuid=60001", "--regid=60001", "--groups=60002", "chgrp", "60002", str(q)], check=True, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        subprocess.run(
+            [self.setpriv, "--reuid=60001", "--regid=60001", "--groups=60002", "chgrp", "60002", str(q)],
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
         st = _stat_dict(q)
         _expect(st["gid"] == 60002, "owner can chgrp to supplementary group", st)
         return {"path": str(q), "stat": st, "create_child": child}
@@ -241,8 +348,19 @@ class Probe:
         denied_rw = self.child(60004, 60004, [], "expect_denied_rw", p)
         denied_xattr = self.child(60004, 60004, [], "expect_denied_xattr", p)
         st = _stat_dict(p)
-        _expect(st["uid"] == 0 and st["gid"] == 60002 and st["mode_octal"] == "0o660", "root-owned group file retains mode/owner", st)
-        return {"path": str(p), "stat": st, "group_rw": group_rw, "xattr": xattr, "denied_rw": denied_rw, "denied_xattr": denied_xattr}
+        _expect(
+            st["uid"] == 0 and st["gid"] == 60002 and st["mode_octal"] == "0o660",
+            "root-owned group file retains mode/owner",
+            st,
+        )
+        return {
+            "path": str(p),
+            "stat": st,
+            "group_rw": group_rw,
+            "xattr": xattr,
+            "denied_rw": denied_rw,
+            "denied_xattr": denied_xattr,
+        }
 
     def test_nonowner_chmod_chown_denied(self) -> dict[str, Any]:
         p = self.root / "root-owned-deny-metadata"
@@ -279,7 +397,13 @@ class Probe:
             self.failures.append(record)
 
     def write_report(self) -> None:
-        mount_info = subprocess.run(["findmnt", "-T", str(self.mount), "-o", "TARGET,SOURCE,FSTYPE,OPTIONS", "--json"], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+        mount_info = subprocess.run(
+            ["findmnt", "-T", str(self.mount), "-o", "TARGET,SOURCE,FSTYPE,OPTIONS", "--json"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
         report = {
             "schema": "afs.multi_uid_smoke.v1",
             "run_id": self.run_id,
@@ -292,18 +416,45 @@ class Probe:
             "ok": not self.failures,
             "step_count": len(self.records),
             "failure_count": len(self.failures),
-            "platform": {"system": platform.system(), "release": platform.release(), "machine": platform.machine(), "python": platform.python_version(), "uid": os.geteuid(), "gid": os.getegid()},
+            "platform": {
+                "system": platform.system(),
+                "release": platform.release(),
+                "machine": platform.machine(),
+                "python": platform.python_version(),
+                "uid": os.geteuid(),
+                "gid": os.getegid(),
+            },
             "findmnt": {"exit_status": mount_info.returncode, "stdout": mount_info.stdout, "stderr": mount_info.stderr},
-            "summary": {"status": "PASS" if not self.failures else "FAIL", "steps": len(self.records), "failed": len(self.failures), "passed": len(self.records) - len(self.failures)},
+            "summary": {
+                "status": "PASS" if not self.failures else "FAIL",
+                "steps": len(self.records),
+                "failed": len(self.failures),
+                "passed": len(self.records) - len(self.failures),
+            },
             "steps": self.records,
             "notes": [
                 "Short targeted multi-UID probe only; not a complete POSIX suite.",
                 "Requires Linux root and util-linux setpriv.",
-                "Exercises both kernel default_permissions style checks and backend CallerContext propagation; root-only execution is not a substitute for these child uid/gid cases.",
+                (
+                    "Exercises both kernel default_permissions style checks and "
+                    "backend CallerContext propagation; root-only execution is not a "
+                    "substitute for these child uid/gid cases."
+                ),
             ],
         }
         self.evidence.mkdir(parents=True, exist_ok=True)
-        summary_line = f"status={report['summary']['status']} steps={report['summary']['steps']} failed={report['summary']['failed']} fixture={self.root} kept={self.fixture_kept}"
+        summary_line = (
+            f"status="
+            f"{report['summary']['status']}"
+            f" steps="
+            f"{report['summary']['steps']}"
+            f" failed="
+            f"{report['summary']['failed']}"
+            f" fixture="
+            f"{self.root}"
+            f" kept="
+            f"{self.fixture_kept}"
+        )
         (self.evidence / "report.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
         (self.evidence / "summary.txt").write_text(summary_line + "\n")
         print(summary_line)
@@ -324,7 +475,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--mount", required=True, type=Path)
     parser.add_argument("--evidence", required=True, type=Path)
     parser.add_argument("--setpriv", default="setpriv", help="Path to util-linux setpriv")
-    parser.add_argument("--base-dir", type=Path, help="Optional directory under which the exclusive fixture is created. Relative paths are resolved under --mount.")
+    parser.add_argument(
+        "--base-dir",
+        type=Path,
+        help=(
+            "Optional directory under which the exclusive fixture is "
+            "created. Relative paths are resolved under --mount."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -335,8 +493,27 @@ def main(argv: list[str]) -> int:
         return probe.run()
     except Exception as exc:
         args.evidence.mkdir(parents=True, exist_ok=True)
-        base_dir = (args.mount / args.base_dir).resolve() if args.base_dir and not args.base_dir.is_absolute() else (args.base_dir.resolve() if args.base_dir else args.mount.resolve())
-        failure = {"schema": "afs.multi_uid_smoke.v1", "created_at": _now(), "mount": str(args.mount), "base_dir": str(base_dir), "evidence": str(args.evidence), "ok": False, "step_count": 0, "failure_count": 1, "summary": {"status": "FAIL", "steps": 0, "failed": 1, "passed": 0}, "setup_failure": {"exception": type(exc).__name__, "message": str(exc), "traceback": traceback.format_exc()}}
+        base_dir = (
+            (args.mount / args.base_dir).resolve()
+            if args.base_dir and not args.base_dir.is_absolute()
+            else (args.base_dir.resolve() if args.base_dir else args.mount.resolve())
+        )
+        failure = {
+            "schema": "afs.multi_uid_smoke.v1",
+            "created_at": _now(),
+            "mount": str(args.mount),
+            "base_dir": str(base_dir),
+            "evidence": str(args.evidence),
+            "ok": False,
+            "step_count": 0,
+            "failure_count": 1,
+            "summary": {"status": "FAIL", "steps": 0, "failed": 1, "passed": 0},
+            "setup_failure": {
+                "exception": type(exc).__name__,
+                "message": str(exc),
+                "traceback": traceback.format_exc(),
+            },
+        }
         summary_line = f"status=FAIL setup_exception={type(exc).__name__} message={exc}"
         (args.evidence / "report.json").write_text(json.dumps(failure, indent=2, sort_keys=True) + "\n")
         (args.evidence / "summary.txt").write_text(summary_line + "\n")

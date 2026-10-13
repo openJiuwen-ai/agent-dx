@@ -6,6 +6,7 @@ reads a fixed manifest of STD-01..STD-04 proof files and their raw artifacts,
 then checks that no discovered suite item disappeared or was reclassified after
 execution.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -13,13 +14,12 @@ import datetime as dt
 import hashlib
 import importlib.util
 import json
-import random
 import os
+import random
 import sys
 import traceback
 from pathlib import Path
 from typing import Any
-
 
 STATUS_VALUES = {"PASS", "FAIL", "BLOCKED", "INCONCLUSIVE", "EXCLUDED"}
 SUITE_IDS = ("STD-01", "STD-02", "STD-03", "STD-04")
@@ -29,7 +29,14 @@ FULL_FSX_SECONDS = 900
 FULL_RANDOM_SEEDS = 10
 FULL_RANDOM_OPS = 10_000
 RAW_ID_ARTIFACTS = {
-    "STD-01": ("identity.json", "discovery.json", "tap-accounting.json", "command.json", "pjdfstest.stdout.tap", "pjdfstest.stderr.log"),
+    "STD-01": (
+        "identity.json",
+        "discovery.json",
+        "tap-accounting.json",
+        "command.json",
+        "pjdfstest.stdout.tap",
+        "pjdfstest.stderr.log",
+    ),
     "STD-02": ("identity.json", "discovery.json", "commands.json", "accounting.json"),
     "STD-03": ("identity.json", "commands.json", "accounting.json"),
     "STD-04": ("identity.json", "seed-results.json", "accounting.json"),
@@ -132,14 +139,28 @@ def validate_manifest_shape(manifest: Any) -> list[dict[str, Any]]:
     duplicates = sorted({case_id for case_id in ids if ids.count(case_id) > 1})
     extra = sorted(set(ids) - set(SUITE_IDS))
     if missing or duplicates or extra:
-        raise AccountingError("BLOCKED", f"manifest must contain exactly STD-01..STD-04 once; missing={missing} duplicates={duplicates} extra={extra}")
+        raise AccountingError(
+            "BLOCKED",
+            (
+                f"manifest must contain exactly STD-01..STD-04 once; missing="
+                f"{missing}"
+                f" duplicates="
+                f"{duplicates}"
+                f" extra="
+                f"{extra}"
+            ),
+        )
     return sorted(suites, key=lambda item: SUITE_IDS.index(str(item["case_id"])))
 
 
 def is_reference_preparation_only(doc: dict[str, Any]) -> bool:
     kind = str(doc.get("kind", "")).upper()
     accounting = doc.get("accounting") if isinstance(doc.get("accounting"), dict) else {}
-    return doc.get("reference_preparation_only") is True or accounting.get("reference_preparation_only") is True or "REFERENCE_PREPARATION_ONLY" in kind
+    return (
+        doc.get("reference_preparation_only") is True
+        or accounting.get("reference_preparation_only") is True
+        or "REFERENCE_PREPARATION_ONLY" in kind
+    )
 
 
 def load_bound_proof(entry: dict[str, Any], manifest_dir: Path) -> tuple[Path, Path, dict[str, Any]]:
@@ -152,14 +173,18 @@ def load_bound_proof(entry: dict[str, Any], manifest_dir: Path) -> tuple[Path, P
     expected = entry.get("proof_sha256")
     observed = sha256_file(proof_path)
     if not is_sha256(expected):
-        raise AccountingError("BLOCKED", f"{entry.get('case_id')} proof_sha256 is required and must be a sha256 hex digest")
+        raise AccountingError(
+            "BLOCKED", f"{entry.get('case_id')} proof_sha256 is required and must be a sha256 hex digest"
+        )
     if observed != expected:
         raise AccountingError("BLOCKED", f"{entry.get('case_id')} proof sha256 mismatch")
     proof = load_json(proof_path)
     if not isinstance(proof, dict):
         raise AccountingError("BLOCKED", f"{entry.get('case_id')} proof must be a JSON object")
     if is_reference_preparation_only(proof):
-        raise AccountingError("BLOCKED", f"{entry.get('case_id')} target proof is reference-preparation-only, not a formal suite proof")
+        raise AccountingError(
+            "BLOCKED", f"{entry.get('case_id')} target proof is reference-preparation-only, not a formal suite proof"
+        )
     return artifact_root, proof_path, proof
 
 
@@ -173,7 +198,12 @@ def validate_raw_artifacts(entry: dict[str, Any], artifact_root: Path) -> dict[s
         if not isinstance(item, dict):
             raise AccountingError("BLOCKED", f"{case_id} raw artifact entry must be an object")
         rel_path = item.get("path")
-        if not isinstance(rel_path, str) or not rel_path or Path(rel_path).is_absolute() or ".." in Path(rel_path).parts:
+        if (
+            not isinstance(rel_path, str)
+            or not rel_path
+            or Path(rel_path).is_absolute()
+            or ".." in Path(rel_path).parts
+        ):
             raise AccountingError("BLOCKED", f"{case_id} raw artifact path is not a safe relative path")
         if rel_path in observed:
             raise AccountingError("BLOCKED", f"{case_id} duplicate raw artifact binding: {rel_path}")
@@ -204,7 +234,9 @@ def load_raw_json(case_id: str, artifact_root: Path, raw_artifacts: dict[str, di
     return value
 
 
-def require_bound_artifact(case_id: str, artifact_root: Path, raw_artifacts: dict[str, dict[str, Any]], rel_path: Any) -> Path:
+def require_bound_artifact(
+    case_id: str, artifact_root: Path, raw_artifacts: dict[str, dict[str, Any]], rel_path: Any
+) -> Path:
     if not isinstance(rel_path, str) or not rel_path:
         raise AccountingError("BLOCKED", f"{case_id} original raw artifact path is missing")
     if rel_path not in raw_artifacts:
@@ -235,7 +267,9 @@ def driver_module(name: str) -> Any:
     return module
 
 
-def load_bound_raw_artifacts(case_id: str, binding: dict[str, Any], manifest_dir: Path) -> tuple[Path, dict[str, dict[str, Any]]]:
+def load_bound_raw_artifacts(
+    case_id: str, binding: dict[str, Any], manifest_dir: Path
+) -> tuple[Path, dict[str, dict[str, Any]]]:
     artifact_root = resolve_manifest_path(binding.get("artifact_root"), manifest_dir)
     if not artifact_root.is_dir():
         raise AccountingError("BLOCKED", f"{case_id} reference artifact_root is missing")
@@ -247,7 +281,12 @@ def load_bound_raw_artifacts(case_id: str, binding: dict[str, Any], manifest_dir
         if not isinstance(item, dict):
             raise AccountingError("BLOCKED", f"{case_id} reference raw artifact entry must be an object")
         rel_path = item.get("path")
-        if not isinstance(rel_path, str) or not rel_path or Path(rel_path).is_absolute() or ".." in Path(rel_path).parts:
+        if (
+            not isinstance(rel_path, str)
+            or not rel_path
+            or Path(rel_path).is_absolute()
+            or ".." in Path(rel_path).parts
+        ):
             raise AccountingError("BLOCKED", f"{case_id} reference raw artifact path is not a safe relative path")
         path = (artifact_root / rel_path).resolve()
         if not is_under(path, artifact_root) or not path.is_file():
@@ -277,7 +316,11 @@ def check_stable_process_identity(case_id: str, identity_doc: dict[str, Any]) ->
         pid = proc.get("pid")
         if pid in (None, ""):
             raise AccountingError("BLOCKED", f"{case_id} original stable {logical_name} pid is missing")
-        stable_tokens = [name for name in ("boot_id", "machine_id", "start_ticks", "exe_dev", "exe_inode", "cmdline", "exe") if proc.get(name) not in (None, "")]
+        stable_tokens = [
+            name
+            for name in ("boot_id", "machine_id", "start_ticks", "exe_dev", "exe_inode", "cmdline", "exe")
+            if proc.get(name) not in (None, "")
+        ]
         if len(stable_tokens) < 2:
             raise AccountingError("BLOCKED", f"{case_id} original stable {logical_name} identity lacks stable fields")
         result[logical_name] = {"sha256": str(sha), "pid": str(pid), "stable_fields": stable_tokens}
@@ -292,7 +335,9 @@ def stable_command_key(item: dict[str, Any]) -> str:
     return json.dumps({"test_id": test_id, "command": command}, sort_keys=True, separators=(",", ":"))
 
 
-def stable_item_evidence(case_id: str, artifact_root: Path, raw_artifacts: dict[str, dict[str, Any]], proof: dict[str, Any]) -> dict[str, Any]:
+def stable_item_evidence(
+    case_id: str, artifact_root: Path, raw_artifacts: dict[str, dict[str, Any]], proof: dict[str, Any]
+) -> dict[str, Any]:
     if case_id == "STD-01":
         discovery = load_raw_json(case_id, artifact_root, raw_artifacts, "discovery.json")
         tap = load_raw_json(case_id, artifact_root, raw_artifacts, "tap-accounting.json")
@@ -308,9 +353,19 @@ def stable_item_evidence(case_id: str, artifact_root: Path, raw_artifacts: dict[
         completed_ids = [str(item) for item in completed]
         missing = sorted(set(selected_ids) - set(completed_ids))
         extra = sorted(set(completed_ids) - set(selected_ids))
-        if (proof.get("status") == "PASS" or (proof.get("accounting") or {}).get("tap_todo", 0) == 0) and (missing or extra):
-            raise AccountingError("BLOCKED", f"STD-01 observed TAP IDs do not match selected IDs: missing={missing} extra={extra}")
-        return {"selected_tests": len(selected), "observed_completed_tests": len(completed), "missing_selected_ids": missing, "unexpected_observed_ids": extra, "discovered_files": discovery.get("discovered_files")}
+        if (proof.get("status") == "PASS" or (proof.get("accounting") or {}).get("tap_todo", 0) == 0) and (
+            missing or extra
+        ):
+            raise AccountingError(
+                "BLOCKED", f"STD-01 observed TAP IDs do not match selected IDs: missing={missing} extra={extra}"
+            )
+        return {
+            "selected_tests": len(selected),
+            "observed_completed_tests": len(completed),
+            "missing_selected_ids": missing,
+            "unexpected_observed_ids": extra,
+            "discovered_files": discovery.get("discovered_files"),
+        }
     if case_id == "STD-02":
         discovery = load_raw_json(case_id, artifact_root, raw_artifacts, "discovery.json")
         commands = load_raw_json(case_id, artifact_root, raw_artifacts, "commands.json")
@@ -320,7 +375,11 @@ def stable_item_evidence(case_id: str, artifact_root: Path, raw_artifacts: dict[
         if not isinstance(selected, list) or not selected:
             raise AccountingError("BLOCKED", "STD-02 frozen LTP selection is missing")
         stable_ids = [stable_command_key(item) for item in selected if isinstance(item, dict)]
-        if len(stable_ids) != len(selected) or len(set(stable_ids)) != len(stable_ids) or any(not item for item in stable_ids):
+        if (
+            len(stable_ids) != len(selected)
+            or len(set(stable_ids)) != len(stable_ids)
+            or any(not item for item in stable_ids)
+        ):
             raise AccountingError("BLOCKED", "STD-02 original stable LTP command IDs are missing or duplicated")
         command_ids = [stable_command_key(item) for item in commands if isinstance(item, dict)]
         if len(command_ids) != len(commands) or any(not item for item in command_ids):
@@ -328,37 +387,86 @@ def stable_item_evidence(case_id: str, artifact_root: Path, raw_artifacts: dict[
         missing = sorted(set(stable_ids) - set(command_ids))
         extra = sorted(set(command_ids) - set(stable_ids))
         if proof.get("status") == "PASS" and (missing or extra):
-            raise AccountingError("BLOCKED", f"STD-02 executed LTP command IDs do not match frozen selection: missing={len(missing)} extra={len(extra)}")
-        return {"selected_commands": len(selected), "executed_commands": len(commands), "missing_selected_ids": len(missing), "unexpected_executed_ids": len(extra), "total_commands": discovery.get("total_commands")}
+            raise AccountingError(
+                "BLOCKED",
+                (
+                    f"STD-02 executed LTP command IDs do not match frozen selection: "
+                    f"missing="
+                    f"{len(missing)}"
+                    f" extra="
+                    f"{len(extra)}"
+                ),
+            )
+        return {
+            "selected_commands": len(selected),
+            "executed_commands": len(commands),
+            "missing_selected_ids": len(missing),
+            "unexpected_executed_ids": len(extra),
+            "total_commands": discovery.get("total_commands"),
+        }
     if case_id == "STD-03":
         commands = load_raw_json(case_id, artifact_root, raw_artifacts, "commands.json")
         if not isinstance(commands, list) or not commands:
             raise AccountingError("BLOCKED", "STD-03 FSx seed command records are missing")
         seeds = [item.get("seed") for item in commands if isinstance(item, dict)]
-        if len(seeds) != len(commands) or len(set(map(str, seeds))) != len(seeds) or any(seed is None for seed in seeds):
+        if (
+            len(seeds) != len(commands)
+            or len(set(map(str, seeds))) != len(seeds)
+            or any(seed is None for seed in seeds)
+        ):
             raise AccountingError("BLOCKED", "STD-03 original stable FSx seed IDs are missing or duplicated")
-        selected = (proof.get("accounting") or {}).get("selected_seeds", []) if isinstance(proof.get("accounting"), dict) else []
+        selected = (
+            (proof.get("accounting") or {}).get("selected_seeds", [])
+            if isinstance(proof.get("accounting"), dict)
+            else []
+        )
         missing = sorted(set(map(str, selected)) - set(map(str, seeds)))
         extra = sorted(set(map(str, seeds)) - set(map(str, selected)))
         if proof.get("status") == "PASS" and (missing or extra):
-            raise AccountingError("BLOCKED", f"STD-03 FSx observed seed IDs do not match selected IDs: missing={missing} extra={extra}")
-        return {"seed_commands": len(commands), "seeds": seeds, "missing_selected_ids": missing, "unexpected_seed_ids": extra}
+            raise AccountingError(
+                "BLOCKED", f"STD-03 FSx observed seed IDs do not match selected IDs: missing={missing} extra={extra}"
+            )
+        return {
+            "seed_commands": len(commands),
+            "seeds": seeds,
+            "missing_selected_ids": missing,
+            "unexpected_seed_ids": extra,
+        }
     if case_id == "STD-04":
         seeds = load_raw_json(case_id, artifact_root, raw_artifacts, "seed-results.json")
         if not isinstance(seeds, list) or not seeds:
             raise AccountingError("BLOCKED", "STD-04 random seed results are missing")
         seed_ids = [item.get("seed") for item in seeds if isinstance(item, dict)]
-        if len(seed_ids) != len(seeds) or len(set(map(str, seed_ids))) != len(seed_ids) or any(seed is None for seed in seed_ids):
+        if (
+            len(seed_ids) != len(seeds)
+            or len(set(map(str, seed_ids))) != len(seed_ids)
+            or any(seed is None for seed in seed_ids)
+        ):
             raise AccountingError("BLOCKED", "STD-04 original stable random seed IDs are missing or duplicated")
-        missing_ops = [seed for seed, item in zip(seed_ids, seeds) if not isinstance(item, dict) or item.get("operations_executed") in (None, "")]
+        missing_ops = [
+            seed
+            for seed, item in zip(seed_ids, seeds)
+            if not isinstance(item, dict) or item.get("operations_executed") in (None, "")
+        ]
         if missing_ops:
             raise AccountingError("BLOCKED", "STD-04 per-seed operation counts are missing")
-        selected = (proof.get("accounting") or {}).get("selected_seeds", []) if isinstance(proof.get("accounting"), dict) else []
+        selected = (
+            (proof.get("accounting") or {}).get("selected_seeds", [])
+            if isinstance(proof.get("accounting"), dict)
+            else []
+        )
         missing = sorted(set(map(str, selected)) - set(map(str, seed_ids)))
         extra = sorted(set(map(str, seed_ids)) - set(map(str, selected)))
         if proof.get("status") == "PASS" and (missing or extra):
-            raise AccountingError("BLOCKED", f"STD-04 random observed seed IDs do not match selected IDs: missing={missing} extra={extra}")
-        return {"seeds": len(seeds), "seed_ids": seed_ids, "missing_selected_ids": missing, "unexpected_seed_ids": extra}
+            raise AccountingError(
+                "BLOCKED", f"STD-04 random observed seed IDs do not match selected IDs: missing={missing} extra={extra}"
+            )
+        return {
+            "seeds": len(seeds),
+            "seed_ids": seed_ids,
+            "missing_selected_ids": missing,
+            "unexpected_seed_ids": extra,
+        }
     raise AssertionError(case_id)
 
 
@@ -377,7 +485,9 @@ def validate_proof_identity(case_id: str, proof: dict[str, Any], profile: str, m
             raise AccountingError("BLOCKED", f"{case_id} proof matrix {key} mismatch")
 
 
-def validate_candidate(entry: dict[str, Any], proof: dict[str, Any], identity_doc: dict[str, Any], profile: str, matrix: dict[str, str]) -> dict[str, Any]:
+def validate_candidate(
+    entry: dict[str, Any], proof: dict[str, Any], identity_doc: dict[str, Any], profile: str, matrix: dict[str, str]
+) -> dict[str, Any]:
     candidate = entry.get("candidate")
     case_id = str(entry.get("case_id"))
     if not isinstance(candidate, dict):
@@ -385,7 +495,10 @@ def validate_candidate(entry: dict[str, Any], proof: dict[str, Any], identity_do
     required = ("afs_candidate", "backend", "meta", "profile", "node_sha256", "meta_sha256")
     result: dict[str, Any] = {key: str(candidate.get(key, "")) for key in required}
     if not all(result.values()):
-        raise AccountingError("BLOCKED", f"{case_id} candidate binding must include afs_candidate/backend/meta/profile/node_sha256/meta_sha256")
+        raise AccountingError(
+            "BLOCKED",
+            f"{case_id} candidate binding must include afs_candidate/backend/meta/profile/node_sha256/meta_sha256",
+        )
     if not is_sha256(result["node_sha256"]) or not is_sha256(result["meta_sha256"]):
         raise AccountingError("BLOCKED", f"{case_id} candidate Node/Meta SHA bindings must be sha256 hex digests")
     if result["profile"] != profile:
@@ -394,11 +507,15 @@ def validate_candidate(entry: dict[str, Any], proof: dict[str, Any], identity_do
         if matrix.get(key) and result[key] != matrix[key]:
             raise AccountingError("BLOCKED", f"{case_id} candidate {key} mismatch")
     product = identity_doc.get("product") if isinstance(identity_doc.get("product"), dict) else {}
-    proof_product = ((proof.get("identity") or {}).get("product") or {}) if isinstance(proof.get("identity"), dict) else {}
+    proof_product = (
+        ((proof.get("identity") or {}).get("product") or {}) if isinstance(proof.get("identity"), dict) else {}
+    )
     for source_name, observed in (("identity", product), ("proof", proof_product)):
         for key in ("backend", "meta"):
             if observed.get(key) is not None and str(observed.get(key)) != result[key]:
-                raise AccountingError("BLOCKED", f"{case_id} {source_name} product {key} conflicts with manifest candidate")
+                raise AccountingError(
+                    "BLOCKED", f"{case_id} {source_name} product {key} conflicts with manifest candidate"
+                )
     process = check_stable_process_identity(case_id, identity_doc)
     if process["node"]["sha256"] != result["node_sha256"]:
         raise AccountingError("BLOCKED", f"{case_id} candidate node_sha256 does not match original identity")
@@ -409,7 +526,10 @@ def validate_candidate(entry: dict[str, Any], proof: dict[str, Any], identity_do
 
 
 def check_named_pass(proof: dict[str, Any], name: str) -> bool:
-    return any(isinstance(check, dict) and check.get("name") == name and check.get("status") == "PASS" for check in proof.get("checks", []))
+    return any(
+        isinstance(check, dict) and check.get("name") == name and check.get("status") == "PASS"
+        for check in proof.get("checks", [])
+    )
 
 
 def load_reference_proof(entry: dict[str, Any], manifest_dir: Path, case_id: str, profile: str) -> dict[str, Any]:
@@ -442,7 +562,14 @@ def load_reference_proof(entry: dict[str, Any], manifest_dir: Path, case_id: str
     return {"filesystem": "ext4", "proof_path": str(proof_path), "proof_sha256": str(proof_sha), "status": "PASS"}
 
 
-def validate_reference(entry: dict[str, Any], proof: dict[str, Any], identity_doc: dict[str, Any], manifest_dir: Path, case_id: str, profile: str) -> dict[str, Any]:
+def validate_reference(
+    entry: dict[str, Any],
+    proof: dict[str, Any],
+    identity_doc: dict[str, Any],
+    manifest_dir: Path,
+    case_id: str,
+    profile: str,
+) -> dict[str, Any]:
     reference = entry.get("reference")
     if not isinstance(reference, dict):
         raise AccountingError("BLOCKED", f"{case_id} reference binding is missing")
@@ -451,7 +578,11 @@ def validate_reference(entry: dict[str, Any], proof: dict[str, Any], identity_do
     if case_id == "STD-04":
         if reference.get("internal_pairing") is not True:
             raise AccountingError("BLOCKED", "STD-04 must bind the driver's internal ext4/AFS operation pairing")
-        ref_fs = identity_doc.get("reference_filesystem") if isinstance(identity_doc.get("reference_filesystem"), dict) else {}
+        ref_fs = (
+            identity_doc.get("reference_filesystem")
+            if isinstance(identity_doc.get("reference_filesystem"), dict)
+            else {}
+        )
         if ref_fs.get("fstype") != "ext4" or not check_named_pass(proof, "reference-ext4-scope"):
             raise AccountingError("BLOCKED", "STD-04 internal reference pairing lacks ext4 scope proof")
         return {"filesystem": "ext4", "internal_pairing": True, "check": "reference-ext4-scope"}
@@ -482,9 +613,16 @@ def errno_name(value: Any) -> str | None:
     return text.upper()
 
 
-def raw_event(item_id: str, status: Any, *, errno_value: Any = None, skip_reason: Any = None, detail: Any = None) -> dict[str, Any]:
+def raw_event(
+    item_id: str, status: Any, *, errno_value: Any = None, skip_reason: Any = None, detail: Any = None
+) -> dict[str, Any]:
     normalized = normalize_status(status)
-    event = {"id": str(item_id), "status": normalized, "errno": errno_name(errno_value), "skip_reason": str(skip_reason) if skip_reason not in (None, "") else None}
+    event = {
+        "id": str(item_id),
+        "status": normalized,
+        "errno": errno_name(errno_value),
+        "skip_reason": str(skip_reason) if skip_reason not in (None, "") else None,
+    }
     if detail not in (None, ""):
         event["detail"] = detail
     return event
@@ -497,20 +635,36 @@ def explicit_raw_events(doc: Any) -> list[dict[str, Any]]:
     if not isinstance(events, list):
         return []
     if "raw_semantics" in doc or "semantic_results" in doc:
-        raise AccountingError("BLOCKED", "derived raw_semantics/semantic_results receipts are not original raw replay evidence")
+        raise AccountingError(
+            "BLOCKED", ("derived raw_semantics/semantic_results receipts are not original raw replay evidence")
+        )
     parsed: list[dict[str, Any]] = []
     for index, item in enumerate(events):
         if not isinstance(item, dict):
             continue
         item_id = item.get("id") or item.get("test_id") or item.get("seed") or item.get("name") or f"event-{index}"
-        status = item.get("status") or item.get("result") or ("PASS" if item.get("ok") is True else "FAIL" if item.get("ok") is False else "UNKNOWN")
-        parsed.append(raw_event(str(item_id), status, errno_value=item.get("errno_name", item.get("errno")), skip_reason=item.get("skip_reason", item.get("reason")), detail=item.get("detail")))
+        status = (
+            item.get("status")
+            or item.get("result")
+            or ("PASS" if item.get("ok") is True else "FAIL" if item.get("ok") is False else "UNKNOWN")
+        )
+        parsed.append(
+            raw_event(
+                str(item_id),
+                status,
+                errno_value=item.get("errno_name", item.get("errno")),
+                skip_reason=item.get("skip_reason", item.get("reason")),
+                detail=item.get("detail"),
+            )
+        )
     return parsed
 
 
 def reject_derived_semantics(case_id: str, doc: Any) -> None:
     if isinstance(doc, dict) and ("raw_semantics" in doc or "semantic_results" in doc):
-        raise AccountingError("BLOCKED", f"{case_id} derived raw_semantics/semantic_results receipts are not original raw replay evidence")
+        raise AccountingError(
+            "BLOCKED", f"{case_id} derived raw_semantics/semantic_results receipts are not original raw replay evidence"
+        )
 
 
 def replay_std01_raw(artifact_root: Path, raw_artifacts: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
@@ -527,19 +681,31 @@ def replay_std01_raw(artifact_root: Path, raw_artifacts: dict[str, dict[str, Any
     parser = driver_module("standard")
     parsed = parser.parse_tap_and_prove(stdout, stderr, [str(item) for item in selected])
     receipt_keys = ("tap_ok", "tap_not_ok", "tap_skip", "tap_todo", "tap_unexpected_fail", "tap_planned")
-    mismatched = {key: {"receipt": tap_receipt.get(key), "original": parsed.get(key)} for key in receipt_keys if tap_receipt.get(key) != parsed.get(key)}
+    mismatched = {
+        key: {"receipt": tap_receipt.get(key), "original": parsed.get(key)}
+        for key in receipt_keys
+        if tap_receipt.get(key) != parsed.get(key)
+    }
     if mismatched:
         raise AccountingError("BLOCKED", f"STD-01 TAP receipt contradicts original replay: {mismatched}")
     events: list[dict[str, Any]] = []
     selected = [str(item) for item in parsed.get("selected_tests", []) if item not in (None, "")]
     completed = {str(item) for item in parsed.get("observed_completed_tests", [])}
     for item_id in selected:
-        events.append(raw_event(item_id, "PASS" if item_id in completed else "BLOCKED", detail="selected TAP file completion"))
-    for index, line in enumerate(parsed.get("skip_lines", []) if isinstance(parsed.get("skip_lines", []), list) else []):
+        events.append(
+            raw_event(item_id, "PASS" if item_id in completed else "BLOCKED", detail="selected TAP file completion")
+        )
+    for index, line in enumerate(
+        parsed.get("skip_lines", []) if isinstance(parsed.get("skip_lines", []), list) else []
+    ):
         events.append(raw_event(f"tap-skip-{index}:{line}", "SKIP", skip_reason=line))
-    for index, line in enumerate(parsed.get("todo_lines", []) if isinstance(parsed.get("todo_lines", []), list) else []):
+    for index, line in enumerate(
+        parsed.get("todo_lines", []) if isinstance(parsed.get("todo_lines", []), list) else []
+    ):
         events.append(raw_event(f"tap-todo-{index}:{line}", "SKIP", skip_reason=line))
-    for index, line in enumerate(parsed.get("unexpected_fail_lines", []) if isinstance(parsed.get("unexpected_fail_lines", []), list) else []):
+    for index, line in enumerate(
+        parsed.get("unexpected_fail_lines", []) if isinstance(parsed.get("unexpected_fail_lines", []), list) else []
+    ):
         events.append(raw_event(f"tap-fail-{index}:{line}", "FAIL", detail=line))
     if not events:
         raise AccountingError("BLOCKED", "STD-01 raw TAP replay found no events")
@@ -562,19 +728,41 @@ def replay_std02_raw(artifact_root: Path, raw_artifacts: dict[str, dict[str, Any
         stdout = require_bound_artifact("STD-02", artifact_root, raw_artifacts, artifacts.get("stdout"))
         stderr = require_bound_artifact("STD-02", artifact_root, raw_artifacts, artifacts.get("stderr"))
         report_rel = artifacts.get("kirk_report")
-        report = require_bound_artifact("STD-02", artifact_root, raw_artifacts, report_rel) if isinstance(report_rel, str) else artifact_root / "__missing-kirk-report.json"
+        report = (
+            require_bound_artifact("STD-02", artifact_root, raw_artifacts, report_rel)
+            if isinstance(report_rel, str)
+            else artifact_root / "__missing-kirk-report.json"
+        )
         command_result = {"returncode": item.get("returncode"), "timed_out": bool(item.get("timed_out"))}
         classification = parser.classify_result(command_result, stdout, stderr, report)
         recorded = normalize_status(item.get("result") or item.get("status"))
         replayed = normalize_status(classification.get("result"))
         if recorded != replayed:
-            raise AccountingError("BLOCKED", f"STD-02 command receipt contradicts original replay for {item.get('test_id')}: receipt={recorded} original={replayed}")
+            raise AccountingError(
+                "BLOCKED",
+                (
+                    f"STD-02 command receipt contradicts original replay for "
+                    f"{item.get('test_id')}"
+                    f": receipt="
+                    f"{recorded}"
+                    f" original="
+                    f"{replayed}"
+                ),
+            )
         item_id = stable_command_key(item) or item.get("test_id") or item.get("name") or f"command-{index}"
-        events.append(raw_event(str(item_id), replayed, detail={"ltp_token_counts": classification.get("ltp_token_counts")}))
-        for event_index, event in enumerate(classification.get("ltp_events", []) if isinstance(classification.get("ltp_events"), list) else []):
+        events.append(
+            raw_event(str(item_id), replayed, detail={"ltp_token_counts": classification.get("ltp_token_counts")})
+        )
+        for event_index, event in enumerate(
+            classification.get("ltp_events", []) if isinstance(classification.get("ltp_events"), list) else []
+        ):
             if isinstance(event, dict):
                 event_id = event.get("id") or event.get("test_id") or f"{item_id}:event-{event_index}"
-                events.append(raw_event(str(event_id), event.get("status") or event.get("result"), skip_reason=event.get("message")))
+                events.append(
+                    raw_event(
+                        str(event_id), event.get("status") or event.get("result"), skip_reason=event.get("message")
+                    )
+                )
     if not events:
         raise AccountingError("BLOCKED", "STD-02 raw replay found no command events")
     return events
@@ -595,14 +783,35 @@ def replay_std03_raw(artifact_root: Path, raw_artifacts: dict[str, dict[str, Any
             raise AccountingError("BLOCKED", "STD-03 seed original artifact map is missing")
         stdout = require_bound_artifact("STD-03", artifact_root, raw_artifacts, artifacts.get("stdout"))
         stderr = require_bound_artifact("STD-03", artifact_root, raw_artifacts, artifacts.get("stderr"))
-        command_result = item.get("process") if isinstance(item.get("process"), dict) else {"returncode": item.get("returncode"), "timed_out": bool(item.get("timed_out"))}
+        command_result = (
+            item.get("process")
+            if isinstance(item.get("process"), dict)
+            else {"returncode": item.get("returncode"), "timed_out": bool(item.get("timed_out"))}
+        )
         classification = parser.classify_seed(command_result, stdout, stderr)
         recorded = normalize_status(item.get("result") or item.get("status"))
         replayed = normalize_status(classification.get("result"))
         if recorded != replayed:
-            raise AccountingError("BLOCKED", f"STD-03 seed receipt contradicts original replay for seed {item.get('seed')}: receipt={recorded} original={replayed}")
+            raise AccountingError(
+                "BLOCKED",
+                (
+                    f"STD-03 seed receipt contradicts original replay for seed "
+                    f"{item.get('seed')}"
+                    f": receipt="
+                    f"{recorded}"
+                    f" original="
+                    f"{replayed}"
+                ),
+            )
         seed = item.get("seed", index)
-        events.append(raw_event(f"seed-{seed}", replayed, skip_reason=classification.get("reason"), detail={"operations_completed": classification.get("operations_completed")}))
+        events.append(
+            raw_event(
+                f"seed-{seed}",
+                replayed,
+                skip_reason=classification.get("reason"),
+                detail={"operations_completed": classification.get("operations_completed")},
+            )
+        )
     if not events:
         raise AccountingError("BLOCKED", "STD-03 raw replay found no seed events")
     return events
@@ -628,19 +837,54 @@ def audit_std04_trace(seed: int, trace: Any, seed_result: dict[str, Any]) -> dic
         if event.get("index") != index:
             failures.append({"kind": "event-index", "index": index, "observed": event.get("index")})
         if event.get("operation") != expected_op:
-            failures.append({"kind": "operation-stream", "index": index, "expected": expected_op, "observed": event.get("operation")})
+            failures.append(
+                {
+                    "kind": "operation-stream",
+                    "index": index,
+                    "expected": expected_op,
+                    "observed": event.get("operation"),
+                }
+            )
         reference_result = event.get("reference_result")
         target_result = event.get("target_result")
         if not isinstance(reference_result, dict) or not isinstance(target_result, dict):
-            failures.append({"kind": "result-payload-shape", "index": index, "reference_type": type(reference_result).__name__, "target_type": type(target_result).__name__})
+            failures.append(
+                {
+                    "kind": "result-payload-shape",
+                    "index": index,
+                    "reference_type": type(reference_result).__name__,
+                    "target_type": type(target_result).__name__,
+                }
+            )
         elif reference_result != target_result:
-            failures.append({"kind": "result-divergence", "index": index, "reference_result": reference_result, "target_result": target_result})
+            failures.append(
+                {
+                    "kind": "result-divergence",
+                    "index": index,
+                    "reference_result": reference_result,
+                    "target_result": target_result,
+                }
+            )
         reference_tree = event.get("reference_tree_sha256")
         target_tree = event.get("target_tree_sha256")
         if not is_sha256(reference_tree) or not is_sha256(target_tree):
-            failures.append({"kind": "tree-digest-shape", "index": index, "reference_tree_sha256": reference_tree, "target_tree_sha256": target_tree})
+            failures.append(
+                {
+                    "kind": "tree-digest-shape",
+                    "index": index,
+                    "reference_tree_sha256": reference_tree,
+                    "target_tree_sha256": target_tree,
+                }
+            )
         elif reference_tree != target_tree:
-            failures.append({"kind": "tree-digest-divergence", "index": index, "reference_tree_sha256": reference_tree, "target_tree_sha256": target_tree})
+            failures.append(
+                {
+                    "kind": "tree-digest-divergence",
+                    "index": index,
+                    "reference_tree_sha256": reference_tree,
+                    "target_tree_sha256": target_tree,
+                }
+            )
         reference_count = event.get("reference_entry_count")
         target_count = event.get("target_entry_count")
         if (
@@ -651,11 +895,29 @@ def audit_std04_trace(seed: int, trace: Any, seed_result: dict[str, Any]) -> dic
             or reference_count < 0
             or target_count < 0
         ):
-            failures.append({"kind": "entry-count-shape", "index": index, "reference_entry_count": reference_count, "target_entry_count": target_count})
+            failures.append(
+                {
+                    "kind": "entry-count-shape",
+                    "index": index,
+                    "reference_entry_count": reference_count,
+                    "target_entry_count": target_count,
+                }
+            )
         elif reference_count != target_count:
-            failures.append({"kind": "entry-count-divergence", "index": index, "reference_entry_count": reference_count, "target_entry_count": target_count})
+            failures.append(
+                {
+                    "kind": "entry-count-divergence",
+                    "index": index,
+                    "reference_entry_count": reference_count,
+                    "target_entry_count": target_count,
+                }
+            )
         affected_paths = event.get("affected_paths")
-        if not isinstance(affected_paths, dict) or not isinstance(affected_paths.get("reference"), dict) or not isinstance(affected_paths.get("target"), dict):
+        if (
+            not isinstance(affected_paths, dict)
+            or not isinstance(affected_paths.get("reference"), dict)
+            or not isinstance(affected_paths.get("target"), dict)
+        ):
             failures.append({"kind": "affected-paths-shape", "index": index, "affected_paths": affected_paths})
         if failures:
             break
@@ -664,7 +926,9 @@ def audit_std04_trace(seed: int, trace: Any, seed_result: dict[str, Any]) -> dic
         "seed": seed,
         "events": len(trace),
         "trace_sha256": observed_sha,
-        "checked_contract": "deterministic op stream + per-step result equality + tree digest equality + canonical trace hash",
+        "checked_contract": (
+            "deterministic op stream + per-step result equality + tree digest equality + canonical trace hash"
+        ),
         "failures": failures[:5],
     }
 
@@ -686,24 +950,55 @@ def replay_std04_raw(artifact_root: Path, raw_artifacts: dict[str, dict[str, Any
             failures = audit.get("failures") if isinstance(audit.get("failures"), list) else []
             if any(isinstance(failure, dict) and failure.get("kind") == "trace-sha256" for failure in failures):
                 raise AccountingError("BLOCKED", f"STD-04 seed {seed} trace sha256 contradicts seed-results receipt")
-            if any(isinstance(failure, dict) and str(failure.get("kind", "")).startswith("result-") for failure in failures):
-                raise AccountingError("BLOCKED", f"STD-04 seed {seed} trace result payload semantic audit failed: {failures}")
-            if any(isinstance(failure, dict) and str(failure.get("kind", "")).startswith("tree-digest") for failure in failures):
-                raise AccountingError("BLOCKED", f"STD-04 seed {seed} trace tree digest semantic audit failed: {failures}")
-            raise AccountingError("BLOCKED", f"STD-04 seed {seed} trace semantic audit failed: {failures or audit.get('reason')}")
+            if any(
+                isinstance(failure, dict) and str(failure.get("kind", "")).startswith("result-") for failure in failures
+            ):
+                raise AccountingError(
+                    "BLOCKED", f"STD-04 seed {seed} trace result payload semantic audit failed: {failures}"
+                )
+            if any(
+                isinstance(failure, dict) and str(failure.get("kind", "")).startswith("tree-digest")
+                for failure in failures
+            ):
+                raise AccountingError(
+                    "BLOCKED", f"STD-04 seed {seed} trace tree digest semantic audit failed: {failures}"
+                )
+            raise AccountingError(
+                "BLOCKED", f"STD-04 seed {seed} trace semantic audit failed: {failures or audit.get('reason')}"
+            )
         mismatch = item.get("first_mismatch") if isinstance(item.get("first_mismatch"), dict) else {}
         target = mismatch.get("target_result") if isinstance(mismatch.get("target_result"), dict) else {}
         replayed_status = "FAIL" if mismatch else "INCONCLUSIVE" if item.get("timed_out") else "PASS"
         recorded = normalize_status(item.get("status") or item.get("result"))
         if recorded != normalize_status(replayed_status):
-            raise AccountingError("BLOCKED", f"STD-04 seed receipt contradicts original trace for seed {seed}: receipt={recorded} original={replayed_status}")
-        events.append(raw_event(f"seed-{seed}", replayed_status, errno_value=target.get("errno_name", target.get("errno")), skip_reason=item.get("reason"), detail={"operations_executed": len(trace), "trace_audit": audit}))
+            raise AccountingError(
+                "BLOCKED",
+                (
+                    f"STD-04 seed receipt contradicts original trace for seed "
+                    f"{seed}"
+                    f": receipt="
+                    f"{recorded}"
+                    f" original="
+                    f"{replayed_status}"
+                ),
+            )
+        events.append(
+            raw_event(
+                f"seed-{seed}",
+                replayed_status,
+                errno_value=target.get("errno_name", target.get("errno")),
+                skip_reason=item.get("reason"),
+                detail={"operations_executed": len(trace), "trace_audit": audit},
+            )
+        )
     if not events:
         raise AccountingError("BLOCKED", "STD-04 raw replay found no seed events")
     return events
 
 
-def replay_raw_suite(case_id: str, artifact_root: Path, raw_artifacts: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+def replay_raw_suite(
+    case_id: str, artifact_root: Path, raw_artifacts: dict[str, dict[str, Any]]
+) -> list[dict[str, Any]]:
     if case_id == "STD-01":
         return replay_std01_raw(artifact_root, raw_artifacts)
     if case_id == "STD-02":
@@ -732,7 +1027,12 @@ def policy_covers(difference: dict[str, Any], policy: dict[str, Any]) -> bool:
     for item in policy.get(field, []):
         if not isinstance(item, dict):
             continue
-        if item.get("pre_reviewed") is not True or item.get("post_run") is True or item.get("reference_only") is True or not item.get("explanation"):
+        if (
+            item.get("pre_reviewed") is not True
+            or item.get("post_run") is True
+            or item.get("reference_only") is True
+            or not item.get("explanation")
+        ):
             continue
         item_id = item.get("id") or item.get("test_id") or item.get("seed")
         if item_id not in (None, "", difference["id"]):
@@ -747,7 +1047,14 @@ def policy_covers(difference: dict[str, Any], policy: dict[str, Any]) -> bool:
     return False
 
 
-def raw_semantic_replay(case_id: str, target_root: Path, target_raw: dict[str, dict[str, Any]], reference_root: Path, reference_raw: dict[str, dict[str, Any]], policy: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+def raw_semantic_replay(
+    case_id: str,
+    target_root: Path,
+    target_raw: dict[str, dict[str, Any]],
+    reference_root: Path,
+    reference_raw: dict[str, dict[str, Any]],
+    policy: dict[str, Any],
+) -> tuple[str, dict[str, Any]]:
     target_events = replay_raw_suite(case_id, target_root, target_raw)
     reference_events = replay_raw_suite(case_id, reference_root, reference_raw)
     target_index = index_raw_events(case_id, target_events, "target")
@@ -763,14 +1070,48 @@ def raw_semantic_replay(case_id: str, target_root: Path, target_raw: dict[str, d
         target_status = str(target.get("status"))
         reference_status = str(reference.get("status"))
         if target_status in {"FAIL", "TIMEOUT", "INCONCLUSIVE", "BLOCKED", "UNKNOWN"}:
-            raw_target_failures.append({"id": item_id, "target_status": target_status, "target_errno": target.get("errno"), "reference_status": reference_status})
+            raw_target_failures.append(
+                {
+                    "id": item_id,
+                    "target_status": target_status,
+                    "target_errno": target.get("errno"),
+                    "reference_status": reference_status,
+                }
+            )
         if target_status == "SKIP":
-            raw_target_skips.append({"id": item_id, "target_status": target_status, "reference_status": reference_status, "target_skip_reason": target.get("skip_reason")})
+            raw_target_skips.append(
+                {
+                    "id": item_id,
+                    "target_status": target_status,
+                    "reference_status": reference_status,
+                    "target_skip_reason": target.get("skip_reason"),
+                }
+            )
         if target_status == "SKIP" or reference_status == "SKIP":
             if target_status != reference_status or target.get("skip_reason") != reference.get("skip_reason"):
-                differences.append({"kind": "skip", "id": item_id, "reference_status": reference_status, "target_status": target_status, "reference_skip_reason": reference.get("skip_reason"), "target_skip_reason": target.get("skip_reason")})
-        if target.get("errno") != reference.get("errno") or (target_status != reference_status and "SKIP" not in {target_status, reference_status}):
-            differences.append({"kind": "errno", "id": item_id, "reference_status": reference_status, "target_status": target_status, "reference_errno": reference.get("errno"), "target_errno": target.get("errno")})
+                differences.append(
+                    {
+                        "kind": "skip",
+                        "id": item_id,
+                        "reference_status": reference_status,
+                        "target_status": target_status,
+                        "reference_skip_reason": reference.get("skip_reason"),
+                        "target_skip_reason": target.get("skip_reason"),
+                    }
+                )
+        if target.get("errno") != reference.get("errno") or (
+            target_status != reference_status and "SKIP" not in {target_status, reference_status}
+        ):
+            differences.append(
+                {
+                    "kind": "errno",
+                    "id": item_id,
+                    "reference_status": reference_status,
+                    "target_status": target_status,
+                    "reference_errno": reference.get("errno"),
+                    "target_errno": target.get("errno"),
+                }
+            )
     uncovered = [difference for difference in differences if not policy_covers(difference, policy)]
     evidence = {
         "target_events": len(target_events),
@@ -803,7 +1144,13 @@ def validate_frozen_policy(entry: dict[str, Any], manifest_dir: Path, case_id: s
     if not is_sha256(expected) or not policy_path.is_file() or sha256_file(policy_path) != expected:
         raise AccountingError("BLOCKED", f"{case_id} frozen pre-review policy artifact is missing or hash mismatch")
     doc = load_json(policy_path)
-    if not isinstance(doc, dict) or doc.get("case_id") != case_id or doc.get("status") != "FROZEN" or doc.get("reviewed_before_run") is not True or doc.get("post_run") is True:
+    if (
+        not isinstance(doc, dict)
+        or doc.get("case_id") != case_id
+        or doc.get("status") != "FROZEN"
+        or doc.get("reviewed_before_run") is not True
+        or doc.get("post_run") is True
+    ):
         raise AccountingError("BLOCKED", f"{case_id} frozen pre-review policy artifact is invalid")
     return {"path": str(policy_path), "sha256": str(expected), "status": "FROZEN"}
 
@@ -851,7 +1198,12 @@ def validate_difference_policy(entry: dict[str, Any], case_id: str, manifest_dir
         frozen_policy = validate_frozen_policy(entry, manifest_dir, case_id)
     if problems:
         raise AccountingError("BLOCKED", f"{case_id} difference/exclusion policy invalid: {'; '.join(problems)}")
-    return {"errno_differences": policy.get("errno_differences", []), "skip_differences": policy.get("skip_differences", []), "pre_run_exclusions": exclusions, "frozen_policy": frozen_policy}
+    return {
+        "errno_differences": policy.get("errno_differences", []),
+        "skip_differences": policy.get("skip_differences", []),
+        "pre_run_exclusions": exclusions,
+        "frozen_policy": frozen_policy,
+    }
 
 
 def check_coverage_axes(proof: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
@@ -872,7 +1224,9 @@ def check_coverage_axes(proof: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
         for name in names:
             check = checks.get(name)
             if not check or check.get("status") != "PASS":
-                missing.append({"axis": axis_name, "check": name, "observed_status": check.get("status") if check else None})
+                missing.append(
+                    {"axis": axis_name, "check": name, "observed_status": check.get("status") if check else None}
+                )
     return not missing, {"axes": sorted(axes), "missing_or_nonpass": missing}
 
 
@@ -901,9 +1255,17 @@ def suite_conservation(case_id: str, proof: dict[str, Any]) -> tuple[str, dict[s
         failed = int(accounting.get("tap_unexpected_fail") or 0)
         todo = int(accounting.get("tap_todo") or 0)
         skip = int(accounting.get("tap_skip") or 0)
-        incomplete = int(accounting.get("observed_incomplete_files") or 0) + int(accounting.get("unobserved_files") or 0)
+        incomplete = int(accounting.get("observed_incomplete_files") or 0) + int(
+            accounting.get("unobserved_files") or 0
+        )
         complete = discovered > 0 and passed + int(accounting.get("tap_not_ok") or 0) == discovered and incomplete == 0
-        return ("PASS" if complete and status == "PASS" and failed == 0 and todo == 0 and skip == 0 else "FAIL" if status == "FAIL" or failed else "BLOCKED"), {
+        return (
+            "PASS"
+            if complete and status == "PASS" and failed == 0 and todo == 0 and skip == 0
+            else "FAIL"
+            if status == "FAIL" or failed
+            else "BLOCKED"
+        ), {
             "unit": "TAP subtests",
             "discovered": discovered,
             "pass": passed,
@@ -923,7 +1285,15 @@ def suite_conservation(case_id: str, proof: dict[str, Any]) -> tuple[str, dict[s
         applicability = proof.get("applicability") if isinstance(proof.get("applicability"), dict) else {}
         raw_applicable_nonpass = counts.get("TBROK", 0) + counts.get("TCONF", 0)
         applicability_ok = raw_applicable_nonpass == 0 or applicability.get("status") == "PASS"
-        pass_ok = status == "PASS" and discovered and executed and incomplete == 0 and timeout == 0 and fail == 0 and applicability_ok
+        pass_ok = (
+            status == "PASS"
+            and discovered
+            and executed
+            and incomplete == 0
+            and timeout == 0
+            and fail == 0
+            and applicability_ok
+        )
         return ("PASS" if pass_ok else "FAIL" if fail else "BLOCKED"), {
             "unit": "LTP commands/events",
             "discovered": discovered,
@@ -932,13 +1302,23 @@ def suite_conservation(case_id: str, proof: dict[str, Any]) -> tuple[str, dict[s
             "result_counts": counts,
             "raw_applicable_nonpass": raw_applicable_nonpass,
             "applicability_status": applicability.get("status", "NOT_APPLIED"),
-            "note": "TCONF/TBROK can pass only through the originating driver's event-level applicability proof; STD-05 does not reclassify raw summaries.",
+            "note": (
+                "TCONF/TBROK can pass only through the originating driver's "
+                "event-level applicability proof; STD-05 does not reclassify raw "
+                "summaries."
+            ),
         }
     if case_id == "STD-03":
         selected = int(accounting.get("selected_seed_count") or len(accounting.get("selected_seeds") or []))
         executed = int(accounting.get("executed") or 0)
         nonpass = sum(counts.get(name, 0) for name in ("FAIL", "TIMEOUT", "INCONCLUSIVE", "BLOCKED"))
-        return ("PASS" if status == "PASS" and selected > 0 and selected == executed and nonpass == 0 else "FAIL" if counts.get("FAIL", 0) else "BLOCKED"), {
+        return (
+            "PASS"
+            if status == "PASS" and selected > 0 and selected == executed and nonpass == 0
+            else "FAIL"
+            if counts.get("FAIL", 0)
+            else "BLOCKED"
+        ), {
             "unit": "FSx seeds",
             "selected": selected,
             "executed": executed,
@@ -950,7 +1330,13 @@ def suite_conservation(case_id: str, proof: dict[str, Any]) -> tuple[str, dict[s
         selected = len(accounting.get("selected_seeds") or [])
         executed = int(accounting.get("executed") or 0)
         nonpass = sum(counts.get(name, 0) for name in ("FAIL", "TIMEOUT", "INCONCLUSIVE", "BLOCKED"))
-        return ("PASS" if status == "PASS" and selected > 0 and selected == executed and nonpass == 0 else "FAIL" if counts.get("FAIL", 0) else "BLOCKED"), {
+        return (
+            "PASS"
+            if status == "PASS" and selected > 0 and selected == executed and nonpass == 0
+            else "FAIL"
+            if counts.get("FAIL", 0)
+            else "BLOCKED"
+        ), {
             "unit": "random seeds/operations",
             "selected_seeds": selected,
             "executed": executed,
@@ -965,9 +1351,14 @@ def full_contract_check(case_id: str, proof: dict[str, Any], profile: str) -> tu
     if profile != "full":
         return True, {"profile": profile, "full_contract_required": False}
     if case_id == "STD-01":
-        return accounting.get("not_selected_files") == 0 and int(accounting.get("discovered_files") or 0) > 0, {"required": "all discovered pjdfstest files", "accounting": accounting}
+        return accounting.get("not_selected_files") == 0 and int(accounting.get("discovered_files") or 0) > 0, {
+            "required": "all discovered pjdfstest files",
+            "accounting": accounting,
+        }
     if case_id == "STD-02":
-        return int(accounting.get("discovered") or 0) == FULL_LTP_COMMANDS and int(accounting.get("executed") or 0) == FULL_LTP_COMMANDS, {"required_commands": FULL_LTP_COMMANDS, "accounting": accounting}
+        return int(accounting.get("discovered") or 0) == FULL_LTP_COMMANDS and int(
+            accounting.get("executed") or 0
+        ) == FULL_LTP_COMMANDS, {"required_commands": FULL_LTP_COMMANDS, "accounting": accounting}
     if case_id == "STD-03":
         return (
             int(accounting.get("selected_seed_count") or 0) == FULL_FSX_SEEDS
@@ -980,11 +1371,17 @@ def full_contract_check(case_id: str, proof: dict[str, Any], profile: str) -> tu
             len(accounting.get("selected_seeds") or []) == FULL_RANDOM_SEEDS
             and int(accounting.get("executed") or 0) == FULL_RANDOM_SEEDS
             and int(accounting.get("operations_per_seed") or 0) == FULL_RANDOM_OPS
-        ), {"required_seeds": FULL_RANDOM_SEEDS, "required_operations_per_seed": FULL_RANDOM_OPS, "accounting": accounting}
+        ), {
+            "required_seeds": FULL_RANDOM_SEEDS,
+            "required_operations_per_seed": FULL_RANDOM_OPS,
+            "accounting": accounting,
+        }
     raise AssertionError(case_id)
 
 
-def analyze_suite(entry: dict[str, Any], manifest_dir: Path, run_dir: Path, profile: str, matrix: dict[str, str]) -> dict[str, Any]:
+def analyze_suite(
+    entry: dict[str, Any], manifest_dir: Path, run_dir: Path, profile: str, matrix: dict[str, str]
+) -> dict[str, Any]:
     case_id = str(entry["case_id"])
     artifact_root, proof_path, proof = load_bound_proof(entry, manifest_dir)
     validate_proof_identity(case_id, proof, profile, matrix)
@@ -1003,7 +1400,13 @@ def analyze_suite(entry: dict[str, Any], manifest_dir: Path, run_dir: Path, prof
 
     checks: list[dict[str, Any]] = []
     checks.append(build_check("binding-identity", "PASS", {"candidate": candidate, "reference": reference}))
-    checks.append(build_check("hash-bound-raw-artifacts", "PASS", {"artifact_root": str(artifact_root), "raw_artifacts": list(raw_artifacts.values())}))
+    checks.append(
+        build_check(
+            "hash-bound-raw-artifacts",
+            "PASS",
+            {"artifact_root": str(artifact_root), "raw_artifacts": list(raw_artifacts.values())},
+        )
+    )
     checks.append(build_check("original-stable-item-ids", "PASS", stable_items))
     coverage_ok, coverage_evidence = check_coverage_axes(proof)
     checks.append(build_check("coverage-axis-pass-checks", "PASS" if coverage_ok else "BLOCKED", coverage_evidence))
@@ -1012,9 +1415,17 @@ def analyze_suite(entry: dict[str, Any], manifest_dir: Path, run_dir: Path, prof
     full_ok, full_evidence = full_contract_check(case_id, proof, profile)
     checks.append(build_check("full-profile-contract", "PASS" if full_ok else "BLOCKED", full_evidence))
     suite_status = str(proof.get("status", "")).upper()
-    checks.append(build_check("suite-proof-status", "PASS" if suite_status == "PASS" else suite_status, {"status": suite_status, "reason": proof.get("reason")}))
+    checks.append(
+        build_check(
+            "suite-proof-status",
+            "PASS" if suite_status == "PASS" else suite_status,
+            {"status": suite_status, "reason": proof.get("reason")},
+        )
+    )
     checks.append(build_check("pre-run-difference-policy", "PASS", policy))
-    raw_status, raw_evidence = raw_semantic_replay(case_id, artifact_root, raw_artifacts, reference_root, reference_raw_artifacts, policy)
+    raw_status, raw_evidence = raw_semantic_replay(
+        case_id, artifact_root, raw_artifacts, reference_root, reference_raw_artifacts, policy
+    )
     checks.append(build_check("raw-semantic-replay", raw_status, raw_evidence))
     status, reason = status_from_checks(checks)
     if status == "PASS" and suite_status != "PASS":
@@ -1024,7 +1435,10 @@ def analyze_suite(entry: dict[str, Any], manifest_dir: Path, run_dir: Path, prof
         "case_id": case_id,
         "status": status,
         "reason": reason,
-        "proof": {"path": rel(proof_path, run_dir) if is_under(proof_path, run_dir) else str(proof_path), "sha256": sha256_file(proof_path)},
+        "proof": {
+            "path": rel(proof_path, run_dir) if is_under(proof_path, run_dir) else str(proof_path),
+            "sha256": sha256_file(proof_path),
+        },
         "artifact_root": rel(artifact_root, run_dir) if is_under(artifact_root, run_dir) else str(artifact_root),
         "candidate": candidate,
         "reference": reference,
@@ -1033,7 +1447,9 @@ def analyze_suite(entry: dict[str, Any], manifest_dir: Path, run_dir: Path, prof
     }
 
 
-def analyze_manifest(manifest_path: Path, run_dir: Path, profile: str, matrix: dict[str, str]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def analyze_manifest(
+    manifest_path: Path, run_dir: Path, profile: str, matrix: dict[str, str]
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     manifest = load_json(manifest_path)
     suites = validate_manifest_shape(manifest)
     observed: list[dict[str, Any]] = []
@@ -1045,15 +1461,47 @@ def analyze_manifest(manifest_path: Path, run_dir: Path, profile: str, matrix: d
         candidates.append(result["candidate"])
     first = candidates[0]
     same_candidate = all(candidate == first for candidate in candidates)
-    checks.append(build_check("same-candidate-binding", "PASS" if same_candidate else "BLOCKED", {"candidate": first, "all_candidates": candidates}))
+    checks.append(
+        build_check(
+            "same-candidate-binding",
+            "PASS" if same_candidate else "BLOCKED",
+            {"candidate": first, "all_candidates": candidates},
+        )
+    )
     suite_statuses = {item["case_id"]: item["status"] for item in observed}
     all_pass = all(status == "PASS" for status in suite_statuses.values())
-    checks.append(build_check("all-suite-accounting-pass", "PASS" if all_pass else "BLOCKED", {"suite_statuses": suite_statuses, "note": "Counts-only conservation is insufficient without each suite proof and coverage checks passing."}))
-    checks.append(build_check("formal-std05-pass-readiness", "PASS" if all_pass else "BLOCKED", {"required_evidence": "all STD-01..STD-04 suite proofs passed with hash-bound target/reference raw replay and pre-run difference policy checks", "mode": "raw-replay-checker", "suite_statuses": suite_statuses}))
+    checks.append(
+        build_check(
+            "all-suite-accounting-pass",
+            "PASS" if all_pass else "BLOCKED",
+            {
+                "suite_statuses": suite_statuses,
+                "note": (
+                    "Counts-only conservation is insufficient without each suite proof and coverage checks passing."
+                ),
+            },
+        )
+    )
+    checks.append(
+        build_check(
+            "formal-std05-pass-readiness",
+            "PASS" if all_pass else "BLOCKED",
+            {
+                "required_evidence": (
+                    "all STD-01..STD-04 suite proofs passed with hash-bound "
+                    "target/reference raw replay and pre-run difference policy checks"
+                ),
+                "mode": "raw-replay-checker",
+                "suite_statuses": suite_statuses,
+            },
+        )
+    )
     return observed, checks
 
 
-def blocked_proof(case_id: str, profile: str, matrix: dict[str, str], reason: str, status: str = "BLOCKED") -> dict[str, Any]:
+def blocked_proof(
+    case_id: str, profile: str, matrix: dict[str, str], reason: str, status: str = "BLOCKED"
+) -> dict[str, Any]:
     return {
         "case_id": case_id,
         "profile": profile,
@@ -1068,10 +1516,20 @@ def blocked_proof(case_id: str, profile: str, matrix: dict[str, str], reason: st
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Aggregate AFS STD-05 suite accounting")
     parser.add_argument("--case-id", default=os.environ.get("AFS_ACCEPTANCE_CASE_ID", "STD-05"))
-    parser.add_argument("--profile", choices=["smoke", "full"], default=os.environ.get("AFS_ACCEPTANCE_PROFILE", "smoke"))
+    parser.add_argument(
+        "--profile", choices=["smoke", "full"], default=os.environ.get("AFS_ACCEPTANCE_PROFILE", "smoke")
+    )
     parser.add_argument("--matrix-json", default=os.environ.get("AFS_ACCEPTANCE_MATRIX", "{}"))
-    parser.add_argument("--run-dir", type=Path, default=Path(os.environ.get("AFS_ACCEPTANCE_RUN_DIR", "results/std-05-accounting")))
-    parser.add_argument("--manifest", type=Path, default=Path(os.environ["AFS_ACCEPTANCE_ACCOUNTING_MANIFEST"]) if os.environ.get("AFS_ACCEPTANCE_ACCOUNTING_MANIFEST") else None)
+    parser.add_argument(
+        "--run-dir", type=Path, default=Path(os.environ.get("AFS_ACCEPTANCE_RUN_DIR", "results/std-05-accounting"))
+    )
+    parser.add_argument(
+        "--manifest",
+        type=Path,
+        default=Path(os.environ["AFS_ACCEPTANCE_ACCOUNTING_MANIFEST"])
+        if os.environ.get("AFS_ACCEPTANCE_ACCOUNTING_MANIFEST")
+        else None,
+    )
     return parser.parse_args(argv)
 
 
@@ -1086,7 +1544,9 @@ def main(argv: list[str]) -> int:
         print(json.dumps(proof, sort_keys=True))
         return 1
     if args.manifest is None:
-        proof = blocked_proof(args.case_id, args.profile, matrix, "AFS_ACCEPTANCE_ACCOUNTING_MANIFEST or --manifest is required")
+        proof = blocked_proof(
+            args.case_id, args.profile, matrix, "AFS_ACCEPTANCE_ACCOUNTING_MANIFEST or --manifest is required"
+        )
         print(json.dumps(proof, sort_keys=True))
         return 1
     try:
@@ -1105,29 +1565,57 @@ def main(argv: list[str]) -> int:
             "coverage": {
                 "profile": args.profile,
                 "axes": {
-                    "suites": {"values": list(SUITE_IDS), "checks": {case_id: "all-suite-accounting-pass" for case_id in SUITE_IDS}},
-                    "candidate": {"values": [suites[0]["candidate"]["afs_candidate"]] if suites else [], "checks": {"candidate": "same-candidate-binding"}},
+                    "suites": {
+                        "values": list(SUITE_IDS),
+                        "checks": {case_id: "all-suite-accounting-pass" for case_id in SUITE_IDS},
+                    },
+                    "candidate": {
+                        "values": [suites[0]["candidate"]["afs_candidate"]] if suites else [],
+                        "checks": {"candidate": "same-candidate-binding"},
+                    },
                 },
             },
-            "artifacts": {"root": rel(artifacts, run_dir), "manifest": rel(args.manifest.resolve(), run_dir) if is_under(args.manifest.resolve(), run_dir) else str(args.manifest.resolve())},
+            "artifacts": {
+                "root": rel(artifacts, run_dir),
+                "manifest": rel(args.manifest.resolve(), run_dir)
+                if is_under(args.manifest.resolve(), run_dir)
+                else str(args.manifest.resolve()),
+            },
             "suites": suites,
             "accounting": {
                 "suite_units_are_not_summed": True,
                 "suites": {suite["case_id"]: suite["accounting"] for suite in suites},
-                "note": "pjdfstest TAP subtests, LTP commands/events, FSx seeds and differential-random seeds/operations are distinct units.",
+                "note": (
+                    "pjdfstest TAP subtests, LTP commands/events, FSx seeds and "
+                    "differential-random seeds/operations are distinct units."
+                ),
             },
             "generated_at": utc(),
             "notes": [
-                "STD-05 is a strict read-only accounting checker. It never turns suite failures into PASS through counts-only conservation.",
-                "Formal STD-05 PASS requires each child suite proof, hash-bound target/reference raw replay and pre-run difference policy checks to pass.",
-                "TAP TODO/SKIP, LTP TCONF/TBROK/TFAIL/TIMEOUT, FSx timeout and random inconclusive cleanup remain non-PASS unless the originating suite proof already passed with pre-run policy evidence.",
+                (
+                    "STD-05 is a strict read-only accounting checker. It never turns "
+                    "suite failures into PASS through counts-only conservation."
+                ),
+                (
+                    "Formal STD-05 PASS requires each child suite proof, hash-bound "
+                    "target/reference raw replay and pre-run difference policy "
+                    "checks to pass."
+                ),
+                (
+                    "TAP TODO/SKIP, LTP TCONF/TBROK/TFAIL/TIMEOUT, FSx timeout and "
+                    "random inconclusive cleanup remain non-PASS unless the "
+                    "originating suite proof already passed with pre-run policy "
+                    "evidence."
+                ),
             ],
         }
     except AccountingError as exc:
         proof = blocked_proof("STD-05", args.profile, matrix, str(exc), exc.status)
     except Exception as exc:  # noqa: BLE001
         error_path = artifacts / "setup-error.json"
-        write_json(error_path, {"exception": type(exc).__name__, "message": str(exc), "traceback": traceback.format_exc()})
+        write_json(
+            error_path, {"exception": type(exc).__name__, "message": str(exc), "traceback": traceback.format_exc()}
+        )
         proof = blocked_proof("STD-05", args.profile, matrix, f"driver setup failed: {type(exc).__name__}: {exc}")
         proof["checks"][0]["artifact"] = rel(error_path, run_dir)
     write_json(artifacts / "proof.json", proof)

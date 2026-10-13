@@ -8,8 +8,8 @@ import sys
 import tempfile
 import textwrap
 import unittest
-from unittest import mock
 from pathlib import Path
+from unittest import mock
 
 DRIVER = Path(__file__).resolve().parent / "drivers" / "fsx.py"
 
@@ -132,7 +132,19 @@ class FsxDriverTests(unittest.TestCase):
         if platform.system() != "Linux":
             self.skipTest("FSx driver self-tests run in Linux so findmnt and mount semantics match acceptance")
 
-    def run_driver(self, behavior="pass", *, profile="smoke", duration=None, seeds=None, max_seeds=None, timeout=None, replay_timeout=None, replay_attempts=None, base_dir: Path | None = None):
+    def run_driver(
+        self,
+        behavior="pass",
+        *,
+        profile="smoke",
+        duration=None,
+        seeds=None,
+        max_seeds=None,
+        timeout=None,
+        replay_timeout=None,
+        replay_attempts=None,
+        base_dir: Path | None = None,
+    ):
         root = Path(tempfile.mkdtemp(prefix="afs-fsx-driver-test-"))
         self.addCleanup(lambda: subprocess.run(["rm", "-rf", str(root)], check=False))
         suite, fsx = write_fake_secfs(root, behavior)
@@ -233,7 +245,9 @@ class FsxDriverTests(unittest.TestCase):
         self.assertEqual(raw[0]["minimal_failing_prefix_operations"], 37)
         self.assertIn("minimal failing prefix", raw[0]["label"])
         original_parent = Path(raw[0]["original_failure"]["tested_fixture_parent"])
-        self.assertTrue(str(original_parent).endswith(".afs-std03-fsx-" + str(original_parent).split(".afs-std03-fsx-")[-1]))
+        self.assertTrue(
+            str(original_parent).endswith(".afs-std03-fsx-" + str(original_parent).split(".afs-std03-fsx-")[-1])
+        )
         for attempt in raw[0]["attempts"]:
             fixture = Path(attempt["fixture"])
             self.assertEqual(fixture.parent, original_parent)
@@ -279,19 +293,20 @@ class FsxDriverTests(unittest.TestCase):
         self.assertEqual(proof["status"], "BLOCKED")
         self.assertIn("timeout", proof["reason"])
 
-
     def test_readonly_base_dir_blocks(self):
         root = Path(tempfile.mkdtemp(prefix="afs-fsx-driver-readonly-"))
         mount = root / "mount"
         base = mount / "base"
         base.mkdir(parents=True)
         base.chmod(0o555)
+
         def cleanup():
             try:
                 base.chmod(0o755)
             except OSError:
                 pass
             subprocess.run(["rm", "-rf", str(root)], check=False)
+
         self.addCleanup(cleanup)
         proc, proof, _run_dir = self.run_driver(base_dir=base)
         self.assertNotEqual(proc.returncode, 0)

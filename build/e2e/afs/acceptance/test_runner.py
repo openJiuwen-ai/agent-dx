@@ -21,9 +21,10 @@ class RunnerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             results = Path(temporary) / "must-not-exist"
             process = subprocess.run(
-                [sys.executable, str(Path(runner.__file__)),
-                 "--case", "FUN-01", "--results-dir", str(results)],
-                capture_output=True, text=True, check=False,
+                [sys.executable, str(Path(runner.__file__)), "--case", "FUN-01", "--results-dir", str(results)],
+                capture_output=True,
+                text=True,
+                check=False,
             )
             self.assertEqual(process.returncode, 2, process.stderr)
             self.assertIn("--lock is required", process.stderr)
@@ -32,7 +33,9 @@ class RunnerTests(unittest.TestCase):
     def test_list_does_not_require_environment_lock(self):
         process = subprocess.run(
             [sys.executable, str(Path(runner.__file__)), "--list"],
-            capture_output=True, text=True, check=False,
+            capture_output=True,
+            text=True,
+            check=False,
         )
         self.assertEqual(process.returncode, 0, process.stderr)
         self.assertIn("FUN-01", process.stdout)
@@ -74,7 +77,6 @@ class RunnerTests(unittest.TestCase):
         write_json(cases_path, manifest)
         write_json(lock_path, lock)
         return temp, root, manifest, lock, cases_path, lock_path, results
-
 
     def test_default_paths_are_independent_clone_safe(self):
         repo_root = runner.REPO_ROOT
@@ -138,8 +140,7 @@ class RunnerTests(unittest.TestCase):
     def write_driver(self, root: Path, name: str, proof: dict):
         path = root / name
         path.write_text(
-            "import json\n"
-            f"print(json.dumps({proof!r}))\n",
+            f"import json\nprint(json.dumps({proof!r}))\n",
             encoding="utf-8",
         )
         return path
@@ -204,9 +205,7 @@ class RunnerTests(unittest.TestCase):
         child_code = f"import pathlib, time; time.sleep(4); pathlib.Path({str(marker)!r}).write_text('alive')"
         spawner = root / "spawner.py"
         spawner.write_text(
-            "import subprocess, sys, time\n"
-            f"subprocess.Popen([sys.executable, '-c', {child_code!r}])\n"
-            "time.sleep(30)\n",
+            f"import subprocess, sys, time\nsubprocess.Popen([sys.executable, '-c', {child_code!r}])\ntime.sleep(30)\n",
             encoding="utf-8",
         )
         manifest["cases"][0]["driver"] = {"state": "READY", "command": [sys.executable, str(spawner)]}
@@ -337,7 +336,9 @@ class RunnerTests(unittest.TestCase):
     def test_check_level_excluded_requires_approved_exclusion(self):
         temp, root, manifest, _lock, cases_path, lock_path, results = self.make_workspace()
         proof = self.pass_proof()
-        proof["checks"] = [{"name": "skipped-subcase", "status": "EXCLUDED", "evidence": "not applicable", "exclusion_id": "E1"}]
+        proof["checks"] = [
+            {"name": "skipped-subcase", "status": "EXCLUDED", "evidence": "not applicable", "exclusion_id": "E1"}
+        ]
         passing = self.write_driver(root, "bad_excluded_check.py", proof)
         manifest["cases"][0]["driver"] = {"state": "READY", "command": [sys.executable, str(passing)]}
         write_json(cases_path, manifest)
@@ -414,8 +415,13 @@ class RunnerTests(unittest.TestCase):
         write_json(cases_path, manifest)
         attestation_path = self.write_attestation_and_lock(root, cases_path, lock_path)
         # Isolate dispatch/coverage semantics; this fixture is not qualified ENV evidence.
-        with temp, mock.patch("runner.is_linux_arm64", return_value=True), mock.patch(
-            "runner.environment.qualification_errors", return_value=[],
+        with (
+            temp,
+            mock.patch("runner.is_linux_arm64", return_value=True),
+            mock.patch(
+                "runner.environment.qualification_errors",
+                return_value=[],
+            ),
         ):
             report = runner.run_acceptance(
                 self.args(
@@ -454,10 +460,19 @@ class RunnerTests(unittest.TestCase):
         lock["contract"] = {"sha256": runner.sha256_file(contract)}
         write_json(lock_path, lock)
         with temp, mock.patch("runner.is_linux_arm64", return_value=True):
-            report = runner.run_acceptance(self.args(
-                cases_path, lock_path, results, backend="DFS", meta="etcd", transport="TCP",
-                profile="full", identity_attestation=str(attestation), contract=str(contract),
-            ))
+            report = runner.run_acceptance(
+                self.args(
+                    cases_path,
+                    lock_path,
+                    results,
+                    backend="DFS",
+                    meta="etcd",
+                    transport="TCP",
+                    profile="full",
+                    identity_attestation=str(attestation),
+                    contract=str(contract),
+                )
+            )
         self.assertEqual(report["summary"]["status"], "BLOCKED")
         self.assertFalse(report["summary"]["full_release_gate_pass"])
         self.assertIn("environment", report["results"][0]["reason"])
@@ -473,13 +488,27 @@ class RunnerTests(unittest.TestCase):
         write_json(lock_path, lock)
         contract.write_text("altered requirements\n", encoding="utf-8")
         # Isolate contract validation; the environment guard is tested separately.
-        with temp, mock.patch("runner.is_linux_arm64", return_value=True), mock.patch(
-            "runner.environment.qualification_errors", return_value=[],
+        with (
+            temp,
+            mock.patch("runner.is_linux_arm64", return_value=True),
+            mock.patch(
+                "runner.environment.qualification_errors",
+                return_value=[],
+            ),
         ):
-            report = runner.run_acceptance(self.args(
-                cases_path, lock_path, results, backend="DFS", meta="etcd", transport="TCP",
-                profile="full", identity_attestation=str(attestation), contract=str(contract),
-            ))
+            report = runner.run_acceptance(
+                self.args(
+                    cases_path,
+                    lock_path,
+                    results,
+                    backend="DFS",
+                    meta="etcd",
+                    transport="TCP",
+                    profile="full",
+                    identity_attestation=str(attestation),
+                    contract=str(contract),
+                )
+            )
         self.assertEqual(report["summary"]["status"], "BLOCKED")
         self.assertFalse(report["summary"]["full_release_gate_pass"])
         self.assertIn("contract sha256 mismatch", report["results"][0]["reason"])
@@ -489,21 +518,41 @@ class RunnerTests(unittest.TestCase):
         self.write_full_passing_case(root, manifest, cases_path)
         attestation = self.write_attestation_and_lock(root, cases_path, lock_path)
         (root / "acceptance.md").unlink()
-        with temp, mock.patch("runner.is_linux_arm64", return_value=True), mock.patch(
-            "runner.environment.qualification_errors", return_value=[],
+        with (
+            temp,
+            mock.patch("runner.is_linux_arm64", return_value=True),
+            mock.patch(
+                "runner.environment.qualification_errors",
+                return_value=[],
+            ),
         ):
-            full = runner.run_acceptance(self.args(
-                cases_path, lock_path, results, backend="DFS", meta="etcd", transport="TCP",
-                profile="full", identity_attestation=str(attestation),
-            ))
+            full = runner.run_acceptance(
+                self.args(
+                    cases_path,
+                    lock_path,
+                    results,
+                    backend="DFS",
+                    meta="etcd",
+                    transport="TCP",
+                    profile="full",
+                    identity_attestation=str(attestation),
+                )
+            )
             self.assertEqual(full["summary"]["status"], "BLOCKED")
             self.assertIn("contract path does not exist", full["results"][0]["reason"])
             passing = self.write_driver(root, "smoke.py", self.pass_proof())
             manifest["cases"][0]["driver"]["command"] = [sys.executable, str(passing)]
             write_json(cases_path, manifest)
-            smoke = runner.run_acceptance(self.args(
-                cases_path, lock_path, results, backend="DFS", meta="etcd", transport="TCP",
-            ))
+            smoke = runner.run_acceptance(
+                self.args(
+                    cases_path,
+                    lock_path,
+                    results,
+                    backend="DFS",
+                    meta="etcd",
+                    transport="TCP",
+                )
+            )
             self.assertEqual(smoke["summary"]["status"], "PASS")
             self.assertFalse(smoke["summary"]["full_release_gate_pass"])
 
@@ -514,13 +563,26 @@ class RunnerTests(unittest.TestCase):
         lock = runner.load_json(lock_path)
         del lock["contract"]
         write_json(lock_path, lock)
-        with temp, mock.patch("runner.is_linux_arm64", return_value=True), mock.patch(
-            "runner.environment.qualification_errors", return_value=[],
+        with (
+            temp,
+            mock.patch("runner.is_linux_arm64", return_value=True),
+            mock.patch(
+                "runner.environment.qualification_errors",
+                return_value=[],
+            ),
         ):
-            report = runner.run_acceptance(self.args(
-                cases_path, lock_path, results, backend="DFS", meta="etcd", transport="TCP",
-                profile="full", identity_attestation=str(attestation),
-            ))
+            report = runner.run_acceptance(
+                self.args(
+                    cases_path,
+                    lock_path,
+                    results,
+                    backend="DFS",
+                    meta="etcd",
+                    transport="TCP",
+                    profile="full",
+                    identity_attestation=str(attestation),
+                )
+            )
         self.assertEqual(report["summary"]["status"], "BLOCKED")
         self.assertIn("lock contract identity is missing", report["results"][0]["reason"])
 
@@ -656,7 +718,9 @@ class RunnerTests(unittest.TestCase):
         (source_dir / "tracked.txt").write_text("clean\n", encoding="utf-8")
         subprocess.run(["git", "add", "tracked.txt"], cwd=source_dir, check=True)
         subprocess.run(["git", "commit", "-m", "initial"], cwd=source_dir, check=True, capture_output=True, text=True)
-        commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=source_dir, check=True, capture_output=True, text=True).stdout.strip()
+        commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=source_dir, check=True, capture_output=True, text=True
+        ).stdout.strip()
         (source_dir / "tracked.txt").write_text("dirty\n", encoding="utf-8")
         binary = root / "binary.pkg"
         binary.write_text("actual binary\n", encoding="utf-8")

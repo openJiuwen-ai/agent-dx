@@ -1,4 +1,5 @@
 """Exercise only the optional component boundary added by the AFS import."""
+
 import os
 import subprocess
 import tempfile
@@ -23,16 +24,19 @@ class AfsBuildBoundaryTests(unittest.TestCase):
                 tool = tools / name
                 tool.write_text("#!/bin/sh\n" + body)
                 tool.chmod(0o755)
-            env = dict(os.environ, PATH=str(tools) + os.pathsep + os.environ["PATH"],
-                       CARGO_TARGET_DIR=str(root / "target"),
-                       ADX_REDIS_SERVER=str(root / "redis-server"),
-                       ADX_REDIS_CLI=str(root / "redis-cli"),
-                       ADX_RELEASE_TARGET=host, ADX_RELEASE_OUTPUT=str(root / "output"),
-                       ADX_WITH_AFS=flag)
+            env = dict(
+                os.environ,
+                PATH=str(tools) + os.pathsep + os.environ["PATH"],
+                CARGO_TARGET_DIR=str(root / "target"),
+                ADX_REDIS_SERVER=str(root / "redis-server"),
+                ADX_REDIS_CLI=str(root / "redis-cli"),
+                ADX_RELEASE_TARGET=host,
+                ADX_RELEASE_OUTPUT=str(root / "output"),
+                ADX_WITH_AFS=flag,
+            )
             if legacy is not None:
                 env[legacy] = "1"
-            result = subprocess.run(["bash", str(SCRIPT)], cwd=ROOT, env=env,
-                                    capture_output=True, text=True)
+            result = subprocess.run(["bash", str(SCRIPT)], cwd=ROOT, env=env, capture_output=True, text=True)
             return result, marker.exists()
 
     def test_invalid_component_flag_stops_before_build(self):

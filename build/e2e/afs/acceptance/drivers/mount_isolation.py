@@ -6,6 +6,7 @@ binds that fixed context to two already-mounted AFS FUSE targets on one node
 and proves that identical relative paths, fd operations, permissions and
 errors remain scoped to the selected mount identity.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -23,7 +24,6 @@ import traceback
 import uuid
 from pathlib import Path
 from typing import Any
-
 
 STATUS_VALUES = {"PASS", "FAIL", "BLOCKED", "INCONCLUSIVE", "EXCLUDED"}
 EXPECTED_SOURCES = {"OwnerFs": "afs-ownerfs", "DFS": "afs-dfs"}
@@ -65,7 +65,9 @@ def sha256_file(path: Path) -> str:
 
 def run_text(argv: list[str], timeout: int = 10) -> dict[str, Any]:
     try:
-        proc = subprocess.run(argv, shell=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, check=False)
+        proc = subprocess.run(
+            argv, shell=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, check=False
+        )
         return {"argv": argv, "returncode": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr}
     except Exception as exc:  # noqa: BLE001 - exact failure is evidence
         return {"argv": argv, "returncode": None, "exception": type(exc).__name__, "message": str(exc)}
@@ -130,7 +132,9 @@ def process_identity(
     except Exception as exc:  # noqa: BLE001
         result["exe_error"] = f"{type(exc).__name__}: {exc}"
     try:
-        cmdline_items = [item.decode(errors="replace") for item in proc.joinpath("cmdline").read_bytes().split(b"\0") if item]
+        cmdline_items = [
+            item.decode(errors="replace") for item in proc.joinpath("cmdline").read_bytes().split(b"\0") if item
+        ]
         result["cmdline"] = " ".join(cmdline_items)
         result["cmdline_items"] = cmdline_items
     except Exception as exc:  # noqa: BLE001
@@ -148,13 +152,19 @@ def config_path_from_cmdline(items: list[str]) -> str | None:
     return None
 
 
-def attach_config_identity(identity: dict[str, Any], expected_path: str | None, expected_sha256: str | None) -> dict[str, Any]:
+def attach_config_identity(
+    identity: dict[str, Any], expected_path: str | None, expected_sha256: str | None
+) -> dict[str, Any]:
     if expected_path is None and expected_sha256 is None:
         identity.pop("config_identity", None)
         return identity
     items = identity.get("cmdline_items")
     observed_path = config_path_from_cmdline(items if isinstance(items, list) else [])
-    config: dict[str, Any] = {"observed_path": observed_path, "expected_path": expected_path, "expected_sha256": expected_sha256}
+    config: dict[str, Any] = {
+        "observed_path": observed_path,
+        "expected_path": expected_path,
+        "expected_sha256": expected_sha256,
+    }
     if observed_path:
         path = Path(observed_path)
         config["exists"] = path.is_file()
@@ -201,7 +211,9 @@ def validate_boot_id(value: Any, name: str) -> str:
     if not isinstance(value, str):
         raise BindingError(f"{name} must be a Linux boot_id string")
     parts = value.split("-")
-    if [len(part) for part in parts] != [8, 4, 4, 4, 12] or any(ch not in "0123456789abcdef" for part in parts for ch in part):
+    if [len(part) for part in parts] != [8, 4, 4, 4, 12] or any(
+        ch not in "0123456789abcdef" for part in parts for ch in part
+    ):
         raise BindingError(f"{name} must be a lowercase Linux boot_id UUID")
     return value
 
@@ -284,15 +296,24 @@ def remote_identity(worker: dict[str, Any]) -> dict[str, Any]:
     prefix.extend(["--", worker["host"], worker["python"], worker["driver"]])
     argv = prefix + [
         "identity",
-        "--role", "meta",
-        "--pid", str(expected["pid"]),
-        "--expected-sha256", expected["sha256"],
-        "--expected-boot-id", expected["boot_id"],
-        "--expected-start-ticks", str(expected["start_ticks"]),
+        "--role",
+        "meta",
+        "--pid",
+        str(expected["pid"]),
+        "--expected-sha256",
+        expected["sha256"],
+        "--expected-boot-id",
+        expected["boot_id"],
+        "--expected-start-ticks",
+        str(expected["start_ticks"]),
     ]
     if expected.get("config_path") and expected.get("config_sha256"):
-        argv.extend(["--expected-config-path", expected["config_path"], "--expected-config-sha256", expected["config_sha256"]])
-    proc = subprocess.run(argv, shell=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15, check=False)
+        argv.extend(
+            ["--expected-config-path", expected["config_path"], "--expected-config-sha256", expected["config_sha256"]]
+        )
+    proc = subprocess.run(
+        argv, shell=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15, check=False
+    )
     result = {"argv": argv, "returncode": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr}
     proof = parse_json_tail(proc.stdout)
     if isinstance(proof, dict):
@@ -357,8 +378,18 @@ def load_binding(path: Path, case_id: str, profile: str, matrix: dict[str, str])
 
 def validate_binding(binding: dict[str, Any], matrix: dict[str, str]) -> dict[str, Any]:
     allowed = {
-        "case_id", "profile", "matrix", "owner_mount", "dfs_mount", "owner_base_dir", "dfs_base_dir",
-        "node_process", "meta_process", "meta_worker", "access_uid", "access_gid",
+        "case_id",
+        "profile",
+        "matrix",
+        "owner_mount",
+        "dfs_mount",
+        "owner_base_dir",
+        "dfs_base_dir",
+        "node_process",
+        "meta_process",
+        "meta_worker",
+        "access_uid",
+        "access_gid",
     }
     unknown = sorted(set(binding) - allowed)
     if unknown:
@@ -377,8 +408,16 @@ def validate_binding(binding: dict[str, Any], matrix: dict[str, str]) -> dict[st
     meta_worker = binding.get("meta_worker")
     if (meta_process is None) == (meta_worker is None):
         raise BindingError("exactly one of meta_process or meta_worker is required")
-    owner_base = Path(validate_abs_path(binding.get("owner_base_dir"), "owner_base_dir")) if binding.get("owner_base_dir") else owner_mount
-    dfs_base = Path(validate_abs_path(binding.get("dfs_base_dir"), "dfs_base_dir")) if binding.get("dfs_base_dir") else dfs_mount
+    owner_base = (
+        Path(validate_abs_path(binding.get("owner_base_dir"), "owner_base_dir"))
+        if binding.get("owner_base_dir")
+        else owner_mount
+    )
+    dfs_base = (
+        Path(validate_abs_path(binding.get("dfs_base_dir"), "dfs_base_dir"))
+        if binding.get("dfs_base_dir")
+        else dfs_mount
+    )
     result = {
         "backend": backend,
         "owner_mount": owner_mount,
@@ -386,7 +425,9 @@ def validate_binding(binding: dict[str, Any], matrix: dict[str, str]) -> dict[st
         "owner_base_dir": validate_base_dir(owner_base, owner_mount, "owner_base_dir", "owner_mount"),
         "dfs_base_dir": validate_base_dir(dfs_base, dfs_mount, "dfs_base_dir", "dfs_mount"),
         "node_process": node,
-        "meta_process": local_expected_process(meta_process, "meta", "meta_process") if meta_process is not None else None,
+        "meta_process": local_expected_process(meta_process, "meta", "meta_process")
+        if meta_process is not None
+        else None,
         "meta_worker": remote_worker(meta_worker, "meta_worker") if meta_worker is not None else None,
     }
     if binding.get("access_uid") is None:
@@ -422,7 +463,10 @@ def path_is_within_mount(path: Path, mount: Path) -> tuple[bool, str]:
         return False, f"base or mount path cannot be resolved: {type(exc).__name__}: {exc}"
     if resolved_path == resolved_mount or resolved_mount in resolved_path.parents:
         return True, "base resolves under expected mount target"
-    return False, f"base path escapes mount target after resolving symlinks: base={resolved_path} mount={resolved_mount}"
+    return (
+        False,
+        f"base path escapes mount target after resolving symlinks: base={resolved_path} mount={resolved_mount}",
+    )
 
 
 def check_base(record: dict[str, Any], backend: str, expected_mount: Path, base_dir: Path) -> tuple[bool, str]:
@@ -466,29 +510,72 @@ def errno_name(value: int | None) -> str | None:
 
 def child_access(path_private: Path, path_public: Path, uid: int, gid: int) -> dict[str, Any]:
     code = (
-        "import errno,json,os,sys\n"
-        "uid=int(sys.argv[1]); gid=int(sys.argv[2]); private=sys.argv[3]; public=sys.argv[4]\n"
-        "os.setgid(gid); os.setuid(uid)\n"
+        "import errno, json, os, sys\n"
+        "\n"
+        "uid = int(sys.argv[1])\n"
+        "gid = int(sys.argv[2])\n"
+        "private = sys.argv[3]\n"
+        "public = sys.argv[4]\n"
+        "os.setgid(gid)\n"
+        "os.setuid(uid)\n"
+        "\n"
+        "\n"
         "def read(path):\n"
         "    try:\n"
-        "        data=open(path,'rb').read()\n"
-        "        return {'ok': True, 'errno': None, 'errno_name': None, 'sha256': __import__('hashlib').sha256(data).hexdigest(), 'length': len(data)}\n"
+        '        data = open(path, "rb").read()\n'
+        "        return {\n"
+        '            "ok": True,\n'
+        '            "errno": None,\n'
+        '            "errno_name": None,\n'
+        '            "sha256": __import__("hashlib").sha256(data).hexdiges'
+        "t(),\n"
+        '            "length": len(data),\n'
+        "        }\n"
         "    except OSError as exc:\n"
-        "        return {'ok': False, 'errno': exc.errno, 'errno_name': errno.errorcode.get(exc.errno, str(exc.errno))}\n"
-        "print(json.dumps({'uid': os.getuid(), 'gid': os.getgid(), 'private': read(private), 'public': read(public)}, sort_keys=True))\n"
+        "        return {\n"
+        '            "ok": False,\n'
+        '            "errno": exc.errno,\n'
+        '            "errno_name": errno.errorcode.get(exc.errno, str(exc.'
+        "errno)),\n"
+        "        }\n"
+        "\n"
+        "\n"
+        "print(\n"
+        "    json.dumps(\n"
+        '        {"uid": os.getuid(), "gid": os.getgid(), "private": read('
+        'private), "public": read(public)},\n'
+        "        sort_keys=True,\n"
+        "    )\n"
+        ")\n"
     )
-    proc = subprocess.run([sys.executable, "-c", code, str(uid), str(gid), str(path_private), str(path_public)], shell=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, timeout=10)
-    return {"argv": [sys.executable, "-c", "<uid-access>", str(uid), str(gid), str(path_private), str(path_public)], "returncode": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr, "result": parse_json_tail(proc.stdout)}
+    proc = subprocess.run(
+        [sys.executable, "-c", code, str(uid), str(gid), str(path_private), str(path_public)],
+        shell=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        timeout=10,
+    )
+    return {
+        "argv": [sys.executable, "-c", "<uid-access>", str(uid), str(gid), str(path_private), str(path_public)],
+        "returncode": proc.returncode,
+        "stdout": proc.stdout,
+        "stderr": proc.stderr,
+        "result": parse_json_tail(proc.stdout),
+    }
 
 
 def artifact_manifest(root: Path, run_dir: Path) -> list[dict[str, Any]]:
     entries: list[dict[str, Any]] = []
     for path in sorted(p for p in root.rglob("*") if p.is_file()):
-        entries.append({
-            "path": str(path.relative_to(run_dir)),
-            "bytes": path.stat().st_size,
-            "sha256": sha256_file(path),
-        })
+        entries.append(
+            {
+                "path": str(path.relative_to(run_dir)),
+                "bytes": path.stat().st_size,
+                "sha256": sha256_file(path),
+            }
+        )
     return entries
 
 
@@ -499,7 +586,9 @@ def build_check(name: str, status: str, evidence: Any, artifact: str | None = No
     return check
 
 
-def run_operations(args: argparse.Namespace, binding: dict[str, Any], matrix: dict[str, str], artifacts: Path, run_dir: Path) -> tuple[str, str, list[dict[str, Any]], dict[str, Any]]:
+def run_operations(
+    args: argparse.Namespace, binding: dict[str, Any], matrix: dict[str, str], artifacts: Path, run_dir: Path
+) -> tuple[str, str, list[dict[str, Any]], dict[str, Any]]:
     backend = matrix["backend"]
     peer = PEER_BACKEND[backend]
     if not path_within(binding["owner_base_dir"], binding["owner_mount"]):
@@ -603,8 +692,8 @@ def run_operations(args: argparse.Namespace, binding: dict[str, Any], matrix: di
         path.mkdir(parents=True, exist_ok=False)
         path.chmod(0o755)
 
-    primary_initial = (f"FUN13:{backend}:primary:{run_id}:".encode() + b"A" * 97)
-    peer_initial = (f"FUN13:{peer}:peer:{run_id}:".encode() + b"B" * 131)
+    primary_initial = f"FUN13:{backend}:primary:{run_id}:".encode() + b"A" * 97
+    peer_initial = f"FUN13:{peer}:peer:{run_id}:".encode() + b"B" * 131
     primary_patch = b"primary-pwrite-patch"
     peer_patch = b"peer-pwrite-patch-longer"
     operations: list[dict[str, Any]] = []
@@ -622,7 +711,15 @@ def run_operations(args: argparse.Namespace, binding: dict[str, Any], matrix: di
         os.fsync(fd_peer)
         primary_fd_data = os.pread(fd_primary, 4096, 0)
         peer_fd_data = os.pread(fd_peer, 4096, 0)
-        operations.append({"op": "fd-pwrite-pread", "primary_fd": fd_primary, "peer_fd": fd_peer, "primary_sha256": sha256_bytes(primary_fd_data), "peer_sha256": sha256_bytes(peer_fd_data)})
+        operations.append(
+            {
+                "op": "fd-pwrite-pread",
+                "primary_fd": fd_primary,
+                "peer_fd": fd_peer,
+                "primary_sha256": sha256_bytes(primary_fd_data),
+                "peer_sha256": sha256_bytes(peer_fd_data),
+            }
+        )
     finally:
         os.close(fd_primary)
         os.close(fd_peer)
@@ -734,12 +831,42 @@ def run_operations(args: argparse.Namespace, binding: dict[str, Any], matrix: di
     write_json(artifacts / "operations.json", records)
 
     checks = [
-        build_check("live-owner-dfs-mount-identity", "PASS" if owner_ok and dfs_ok and owner_base_ok and dfs_base_ok else "BLOCKED", identity_checks, "artifacts/fun-13-mount-isolation/operations.json"),
-        build_check("live-node-meta-process-identity", "PASS" if identity_checks["node_identity_ok"] and meta_identity_ok else "BLOCKED", {"node": node_identity, "meta": meta_identity_record}, "artifacts/fun-13-mount-isolation/operations.json"),
-        build_check("same-relative-path-divergent-content-and-fd", "PASS" if content_ok else "FAIL", records["content"] | {"fd_operations": operations}, "artifacts/fun-13-mount-isolation/operations.json"),
-        build_check("mount-scoped-inode-identity", "PASS" if collision_identity_ok else "INCONCLUSIVE" if not inode_collision else "FAIL", records["path_identity"], "artifacts/fun-13-mount-isolation/operations.json"),
-        build_check("mode-and-real-uid-access-isolation", "PASS" if mode_ok and uid_ok else "FAIL", {"mode_ok": mode_ok, "uid_ok": uid_ok, "uid_access": access_result}, "artifacts/fun-13-mount-isolation/operations.json"),
-        build_check("errno-isolation-same-relative-path", "PASS" if error_ok else "FAIL", records["error_isolation"], "artifacts/fun-13-mount-isolation/operations.json"),
+        build_check(
+            "live-owner-dfs-mount-identity",
+            "PASS" if owner_ok and dfs_ok and owner_base_ok and dfs_base_ok else "BLOCKED",
+            identity_checks,
+            "artifacts/fun-13-mount-isolation/operations.json",
+        ),
+        build_check(
+            "live-node-meta-process-identity",
+            "PASS" if identity_checks["node_identity_ok"] and meta_identity_ok else "BLOCKED",
+            {"node": node_identity, "meta": meta_identity_record},
+            "artifacts/fun-13-mount-isolation/operations.json",
+        ),
+        build_check(
+            "same-relative-path-divergent-content-and-fd",
+            "PASS" if content_ok else "FAIL",
+            records["content"] | {"fd_operations": operations},
+            "artifacts/fun-13-mount-isolation/operations.json",
+        ),
+        build_check(
+            "mount-scoped-inode-identity",
+            "PASS" if collision_identity_ok else "INCONCLUSIVE" if not inode_collision else "FAIL",
+            records["path_identity"],
+            "artifacts/fun-13-mount-isolation/operations.json",
+        ),
+        build_check(
+            "mode-and-real-uid-access-isolation",
+            "PASS" if mode_ok and uid_ok else "FAIL",
+            {"mode_ok": mode_ok, "uid_ok": uid_ok, "uid_access": access_result},
+            "artifacts/fun-13-mount-isolation/operations.json",
+        ),
+        build_check(
+            "errno-isolation-same-relative-path",
+            "PASS" if error_ok else "FAIL",
+            records["error_isolation"],
+            "artifacts/fun-13-mount-isolation/operations.json",
+        ),
     ]
     if any(check["status"] == "FAIL" for check in checks):
         status = "FAIL"
@@ -758,7 +885,17 @@ def run_operations(args: argparse.Namespace, binding: dict[str, Any], matrix: di
     return status, reason, checks, records
 
 
-def proof_template(case_id: str, profile: str, matrix: dict[str, str], status: str, reason: str, checks: list[dict[str, Any]], artifacts: Path, run_dir: Path, records: dict[str, Any] | None = None) -> dict[str, Any]:
+def proof_template(
+    case_id: str,
+    profile: str,
+    matrix: dict[str, str],
+    status: str,
+    reason: str,
+    checks: list[dict[str, Any]],
+    artifacts: Path,
+    run_dir: Path,
+    records: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     return {
         "case_id": case_id,
         "profile": profile,
@@ -766,7 +903,10 @@ def proof_template(case_id: str, profile: str, matrix: dict[str, str], status: s
         "status": status,
         "reason": reason,
         "checks": checks,
-        "artifacts": {"root": str(artifacts), "files": artifact_manifest(artifacts, run_dir) if artifacts.exists() else []},
+        "artifacts": {
+            "root": str(artifacts),
+            "files": artifact_manifest(artifacts, run_dir) if artifacts.exists() else [],
+        },
         "records": records or {},
     }
 
@@ -784,10 +924,22 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     identity.add_argument("--expected-config-sha256")
 
     parser.add_argument("--case-id", default=os.environ.get("AFS_ACCEPTANCE_CASE_ID", "FUN-13"))
-    parser.add_argument("--profile", default=os.environ.get("AFS_ACCEPTANCE_PROFILE", "smoke"), choices=["smoke", "full"])
+    parser.add_argument(
+        "--profile", default=os.environ.get("AFS_ACCEPTANCE_PROFILE", "smoke"), choices=["smoke", "full"]
+    )
     parser.add_argument("--matrix-json", default=os.environ.get("AFS_ACCEPTANCE_MATRIX", "{}"))
-    parser.add_argument("--run-dir", type=Path, default=Path(os.environ["AFS_ACCEPTANCE_RUN_DIR"]) if os.environ.get("AFS_ACCEPTANCE_RUN_DIR") else None)
-    parser.add_argument("--bindings", type=Path, default=Path(os.environ["AFS_ACCEPTANCE_MOUNT_ISOLATION_BINDINGS"]) if os.environ.get("AFS_ACCEPTANCE_MOUNT_ISOLATION_BINDINGS") else None)
+    parser.add_argument(
+        "--run-dir",
+        type=Path,
+        default=Path(os.environ["AFS_ACCEPTANCE_RUN_DIR"]) if os.environ.get("AFS_ACCEPTANCE_RUN_DIR") else None,
+    )
+    parser.add_argument(
+        "--bindings",
+        type=Path,
+        default=Path(os.environ["AFS_ACCEPTANCE_MOUNT_ISOLATION_BINDINGS"])
+        if os.environ.get("AFS_ACCEPTANCE_MOUNT_ISOLATION_BINDINGS")
+        else None,
+    )
     return parser.parse_args(argv)
 
 
@@ -798,7 +950,11 @@ def run_driver(args: argparse.Namespace) -> int:
         raise BindingError("--run-dir or AFS_ACCEPTANCE_RUN_DIR is required")
     if args.bindings is None:
         raise BindingError("--bindings or AFS_ACCEPTANCE_MOUNT_ISOLATION_BINDINGS is required")
-    matrix = matrix_from_env() if args.matrix_json == os.environ.get("AFS_ACCEPTANCE_MATRIX", "{}") else {str(k): str(v) for k, v in json.loads(args.matrix_json).items()}
+    matrix = (
+        matrix_from_env()
+        if args.matrix_json == os.environ.get("AFS_ACCEPTANCE_MATRIX", "{}")
+        else {str(k): str(v) for k, v in json.loads(args.matrix_json).items()}
+    )
     artifacts = args.run_dir / "artifacts" / "fun-13-mount-isolation"
     artifacts.mkdir(parents=True, exist_ok=True)
     try:

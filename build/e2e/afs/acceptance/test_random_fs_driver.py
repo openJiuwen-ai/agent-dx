@@ -15,12 +15,31 @@ class RandomFsDriverTests(unittest.TestCase):
         if platform.system() != "Linux":
             self.skipTest("STD-04 driver tests run in Linux so findmnt and errno behavior match acceptance")
 
-    def run_driver(self, *, profile="smoke", operations=None, seeds=None, max_seeds=None, fault_at=None, backend="ext4", allow_fixture=True, reference_under_tmpfs=False, timeout_seconds=None, skip_cleanup=False, process_pid=None, meta_process_pid=None):
+    def run_driver(
+        self,
+        *,
+        profile="smoke",
+        operations=None,
+        seeds=None,
+        max_seeds=None,
+        fault_at=None,
+        backend="ext4",
+        allow_fixture=True,
+        reference_under_tmpfs=False,
+        timeout_seconds=None,
+        skip_cleanup=False,
+        process_pid=None,
+        meta_process_pid=None,
+    ):
         root = Path(tempfile.mkdtemp(prefix="afs-random-fs-driver-"))
         self.addCleanup(lambda: subprocess.run(["rm", "-rf", str(root)], check=False))
         mount = root / "target-mount"
         target = mount / "workspace"
-        reference = (Path("/dev/shm") / f"afs-random-fs-driver-ref-{root.name}") if reference_under_tmpfs else root / "reference-ext4"
+        reference = (
+            (Path("/dev/shm") / f"afs-random-fs-driver-ref-{root.name}")
+            if reference_under_tmpfs
+            else root / "reference-ext4"
+        )
         target.mkdir(parents=True)
         reference.mkdir()
         if reference_under_tmpfs:
@@ -87,7 +106,9 @@ class RandomFsDriverTests(unittest.TestCase):
         self.assertEqual(len(json.loads(trace.read_text())), 25)
 
     def test_full_with_cap_is_blocked_not_pass(self):
-        proc, proof, _run_dir = self.run_driver(profile="full", operations=40, max_seeds=1, backend="ext4", allow_fixture=False)
+        proc, proof, _run_dir = self.run_driver(
+            profile="full", operations=40, max_seeds=1, backend="ext4", allow_fixture=False
+        )
         self.assertNotEqual(proc.returncode, 0)
         self.assertEqual(proof["status"], "BLOCKED")
         self.assertIn("10 fixed seeds", proof["reason"])
@@ -95,7 +116,9 @@ class RandomFsDriverTests(unittest.TestCase):
     def test_failure_preserves_raw_prefix(self):
         proc, proof, run_dir = self.run_driver(operations=20, fault_at=7)
         self.assertEqual(proof["status"], "FAIL")
-        first_failure = next(item for item in proof["checks"] if item["name"] == "differential-results")["evidence"]["first_failure"]
+        first_failure = next(item for item in proof["checks"] if item["name"] == "differential-results")["evidence"][
+            "first_failure"
+        ]
         self.assertEqual(first_failure["mismatch"]["failing_prefix_operations"], 8)
         self.assertTrue(first_failure["mismatch"]["minimized"])
         self.assertEqual(first_failure["mismatch"]["minimal_failing_prefix_operations"], 8)
@@ -121,26 +144,38 @@ class RandomFsDriverTests(unittest.TestCase):
         proc, proof, _run_dir = self.run_driver(backend="dfs", allow_fixture=False)
         self.assertNotEqual(proc.returncode, 0)
         self.assertEqual(proof["status"], "BLOCKED")
-        self.assertTrue(any(c["name"] == "observed-target-backend" and c["status"] == "BLOCKED" for c in proof["checks"]))
+        self.assertTrue(
+            any(c["name"] == "observed-target-backend" and c["status"] == "BLOCKED" for c in proof["checks"])
+        )
 
     def test_product_backend_on_ext4_is_blocked_even_with_fixture_override(self):
         proc, proof, _run_dir = self.run_driver(backend="dfs", allow_fixture=True)
         self.assertNotEqual(proc.returncode, 0)
         self.assertEqual(proof["status"], "BLOCKED")
-        self.assertTrue(any(c["name"] == "observed-target-backend" and c["status"] == "BLOCKED" for c in proof["checks"]))
+        self.assertTrue(
+            any(c["name"] == "observed-target-backend" and c["status"] == "BLOCKED" for c in proof["checks"])
+        )
 
     def test_product_backend_with_mismatched_pids_is_blocked(self):
         proc, proof, _run_dir = self.run_driver(backend="dfs", allow_fixture=True, process_pid=1, meta_process_pid=1)
         self.assertNotEqual(proc.returncode, 0)
         self.assertEqual(proof["status"], "BLOCKED")
-        self.assertTrue(any(c["name"] == "product-process-identity" and c["status"] == "BLOCKED" for c in proof["checks"]))
+        self.assertTrue(
+            any(c["name"] == "product-process-identity" and c["status"] == "BLOCKED" for c in proof["checks"])
+        )
 
     def test_full_reference_fixture_is_blocked(self):
-        proc, proof, _run_dir = self.run_driver(profile="full", operations=40, max_seeds=1, backend="ext4", allow_fixture=True)
+        proc, proof, _run_dir = self.run_driver(
+            profile="full", operations=40, max_seeds=1, backend="ext4", allow_fixture=True
+        )
         self.assertNotEqual(proc.returncode, 0)
         self.assertEqual(proof["status"], "BLOCKED")
-        self.assertTrue(any(c["name"] == "reference-fixture-scope" and c["status"] == "BLOCKED" for c in proof["checks"]))
-        self.assertTrue(any(c["name"] == "hypothesis-shrink-database" and c["status"] == "PASS" for c in proof["checks"]))
+        self.assertTrue(
+            any(c["name"] == "reference-fixture-scope" and c["status"] == "BLOCKED" for c in proof["checks"])
+        )
+        self.assertTrue(
+            any(c["name"] == "hypothesis-shrink-database" and c["status"] == "PASS" for c in proof["checks"])
+        )
 
     def test_wrong_reference_filesystem_is_blocked(self):
         if not Path("/dev/shm").is_dir():
@@ -154,13 +189,17 @@ class RandomFsDriverTests(unittest.TestCase):
         proc, proof, _run_dir = self.run_driver(operations=10, timeout_seconds=0)
         self.assertNotEqual(proc.returncode, 0)
         self.assertEqual(proof["status"], "INCONCLUSIVE")
-        self.assertTrue(any(c["name"] == "differential-results" and c["status"] == "INCONCLUSIVE" for c in proof["checks"]))
+        self.assertTrue(
+            any(c["name"] == "differential-results" and c["status"] == "INCONCLUSIVE" for c in proof["checks"])
+        )
 
     def test_cleanup_error_is_inconclusive_not_pass(self):
         proc, proof, _run_dir = self.run_driver(operations=1, skip_cleanup=True)
         self.assertNotEqual(proc.returncode, 0)
         self.assertEqual(proof["status"], "INCONCLUSIVE")
-        first_inconclusive = next(item for item in proof["checks"] if item["name"] == "differential-results")["evidence"]["first_inconclusive"]
+        first_inconclusive = next(item for item in proof["checks"] if item["name"] == "differential-results")[
+            "evidence"
+        ]["first_inconclusive"]
         self.assertFalse(first_inconclusive["cleanup_ok"])
 
 

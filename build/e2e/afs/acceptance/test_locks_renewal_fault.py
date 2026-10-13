@@ -8,9 +8,9 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
-
 
 PROBE = Path(__file__).resolve().parent / "probes" / "locks_renewal_fault.py"
 
@@ -128,9 +128,9 @@ class RenewalFaultControlTests(unittest.TestCase):
             proc, pid_file, sha = self.start_target(temp)
             try:
                 os.kill(proc.pid, signal.SIGSTOP)
-                deadline = __import__("time").time() + 5
-                while "stopped" not in process_state(proc.pid).lower() and __import__("time").time() < deadline:
-                    __import__("time").sleep(0.05)
+                deadline = time.time() + 5
+                while "stopped" not in process_state(proc.pid).lower() and time.time() < deadline:
+                    time.sleep(0.05)
                 self.assertIn("stopped", process_state(proc.pid).lower())
                 probe = self.make_probe(module, temp, pid_file, sha)
                 with self.assertRaises(AssertionError):

@@ -6,7 +6,6 @@ from argparse import Namespace
 from pathlib import Path
 from unittest import mock
 
-
 DRIVER = Path(__file__).resolve().parent / "drivers" / "mount_isolation.py"
 SPEC = importlib.util.spec_from_file_location("mount_isolation", DRIVER)
 mount_isolation = importlib.util.module_from_spec(SPEC)
@@ -28,12 +27,16 @@ def write_json(path: Path, value: object) -> None:
 def mount_command(source: str, target: Path) -> dict[str, object]:
     return {
         "returncode": 0,
-        "stdout": json.dumps({"filesystems": [{"target": str(target), "source": source, "fstype": "fuse.afs", "options": "rw"}]}),
+        "stdout": json.dumps(
+            {"filesystems": [{"target": str(target), "source": source, "fstype": "fuse.afs", "options": "rw"}]}
+        ),
         "stderr": "",
     }
 
 
-def identity(role: str, sha: str, executable: str = "afs-node", config_path: str = "/etc/afs/node.toml") -> dict[str, object]:
+def identity(
+    role: str, sha: str, executable: str = "afs-node", config_path: str = "/etc/afs/node.toml"
+) -> dict[str, object]:
     start_ticks = NODE_START_TICKS if role == "node" else META_START_TICKS
     return {
         "role": role,
@@ -74,19 +77,37 @@ class MountIsolationBindingTests(unittest.TestCase):
                         "matrix": {"backend": "DFS", "meta": "memory"},
                         "owner_mount": "/mnt/owner",
                         "dfs_mount": "/mnt/dfs",
-                        "node_process": {"role": "node", "pid": 10, "sha256": NODE_SHA, "boot_id": BOOT_ID, "start_ticks": NODE_START_TICKS, "config_path": "/etc/afs/node.toml", "config_sha256": CFG_SHA},
-                        "meta_process": {"role": "meta", "pid": 20, "sha256": META_SHA, "boot_id": BOOT_ID, "start_ticks": META_START_TICKS},
+                        "node_process": {
+                            "role": "node",
+                            "pid": 10,
+                            "sha256": NODE_SHA,
+                            "boot_id": BOOT_ID,
+                            "start_ticks": NODE_START_TICKS,
+                            "config_path": "/etc/afs/node.toml",
+                            "config_sha256": CFG_SHA,
+                        },
+                        "meta_process": {
+                            "role": "meta",
+                            "pid": 20,
+                            "sha256": META_SHA,
+                            "boot_id": BOOT_ID,
+                            "start_ticks": META_START_TICKS,
+                        },
                     }
                 ],
             }
             write_json(root / "bindings.json", binding)
-            selected = mount_isolation.load_binding(root / "bindings.json", "FUN-13", "smoke", {"backend": "DFS", "meta": "memory"})
+            selected = mount_isolation.load_binding(
+                root / "bindings.json", "FUN-13", "smoke", {"backend": "DFS", "meta": "memory"}
+            )
             self.assertEqual(selected["backend"], "DFS")
             self.assertEqual(selected["node_process"]["config_sha256"], CFG_SHA)
             self.assertEqual(selected["node_process"]["boot_id"], BOOT_ID)
             self.assertEqual(selected["node_process"]["start_ticks"], NODE_START_TICKS)
             with self.assertRaises(mount_isolation.BindingError):
-                mount_isolation.load_binding(root / "bindings.json", "FUN-13", "smoke", {"backend": "OwnerFs", "meta": "memory"})
+                mount_isolation.load_binding(
+                    root / "bindings.json", "FUN-13", "smoke", {"backend": "OwnerFs", "meta": "memory"}
+                )
 
     def test_process_identity_ok_requires_config_and_incarnation_when_supplied(self):
         good = identity("node", NODE_SHA, "afs-node")
@@ -114,13 +135,21 @@ class MountIsolationBindingTests(unittest.TestCase):
                         "owner_mount": "/mnt/owner",
                         "dfs_mount": "/mnt/dfs",
                         "node_process": {"role": "node", "pid": 10, "sha256": NODE_SHA},
-                        "meta_process": {"role": "meta", "pid": 20, "sha256": META_SHA, "boot_id": BOOT_ID, "start_ticks": META_START_TICKS},
+                        "meta_process": {
+                            "role": "meta",
+                            "pid": 20,
+                            "sha256": META_SHA,
+                            "boot_id": BOOT_ID,
+                            "start_ticks": META_START_TICKS,
+                        },
                     }
                 ],
             }
             write_json(root / "bindings.json", binding)
             with self.assertRaises(mount_isolation.BindingError):
-                mount_isolation.load_binding(root / "bindings.json", "FUN-13", "smoke", {"backend": "DFS", "meta": "memory"})
+                mount_isolation.load_binding(
+                    root / "bindings.json", "FUN-13", "smoke", {"backend": "DFS", "meta": "memory"}
+                )
 
     def test_binding_rejects_operation_bases_outside_verified_mounts(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -136,14 +165,28 @@ class MountIsolationBindingTests(unittest.TestCase):
                         "dfs_mount": "/mnt/dfs",
                         "owner_base_dir": "/mnt/sibling-owner",
                         "dfs_base_dir": "/mnt/dfs/subdir",
-                        "node_process": {"role": "node", "pid": 10, "sha256": NODE_SHA, "boot_id": BOOT_ID, "start_ticks": NODE_START_TICKS},
-                        "meta_process": {"role": "meta", "pid": 20, "sha256": META_SHA, "boot_id": BOOT_ID, "start_ticks": META_START_TICKS},
+                        "node_process": {
+                            "role": "node",
+                            "pid": 10,
+                            "sha256": NODE_SHA,
+                            "boot_id": BOOT_ID,
+                            "start_ticks": NODE_START_TICKS,
+                        },
+                        "meta_process": {
+                            "role": "meta",
+                            "pid": 20,
+                            "sha256": META_SHA,
+                            "boot_id": BOOT_ID,
+                            "start_ticks": META_START_TICKS,
+                        },
                     }
                 ],
             }
             write_json(root / "bindings.json", binding)
             with self.assertRaisesRegex(mount_isolation.BindingError, "owner_base_dir"):
-                mount_isolation.load_binding(root / "bindings.json", "FUN-13", "smoke", {"backend": "OwnerFs", "meta": "memory"})
+                mount_isolation.load_binding(
+                    root / "bindings.json", "FUN-13", "smoke", {"backend": "OwnerFs", "meta": "memory"}
+                )
 
 
 class MountIsolationOperationTests(unittest.TestCase):
@@ -168,8 +211,22 @@ class MountIsolationOperationTests(unittest.TestCase):
                 "dfs_mount": dfs,
                 "owner_base_dir": owner,
                 "dfs_base_dir": dfs,
-                "node_process": {"pid": 10, "sha256": NODE_SHA, "boot_id": BOOT_ID, "start_ticks": NODE_START_TICKS, "config_path": str(node_cfg), "config_sha256": node_cfg_sha},
-                "meta_process": {"pid": 20, "sha256": META_SHA, "boot_id": BOOT_ID, "start_ticks": META_START_TICKS, "config_path": str(meta_cfg), "config_sha256": meta_cfg_sha},
+                "node_process": {
+                    "pid": 10,
+                    "sha256": NODE_SHA,
+                    "boot_id": BOOT_ID,
+                    "start_ticks": NODE_START_TICKS,
+                    "config_path": str(node_cfg),
+                    "config_sha256": node_cfg_sha,
+                },
+                "meta_process": {
+                    "pid": 20,
+                    "sha256": META_SHA,
+                    "boot_id": BOOT_ID,
+                    "start_ticks": META_START_TICKS,
+                    "config_path": str(meta_cfg),
+                    "config_sha256": meta_cfg_sha,
+                },
                 "meta_worker": None,
                 "access_uid": 65534,
                 "access_gid": 65534,
@@ -188,8 +245,15 @@ class MountIsolationOperationTests(unittest.TestCase):
                     record["ino"] = 777
                 return record
 
-            def fake_process(pid: int, role: str, expected_sha256: str, expected_boot_id: str, expected_start_ticks: int) -> dict[str, object]:
-                observed = identity(role, expected_sha256, "afs-node" if role == "node" else "afs-meta", str(node_cfg if role == "node" else meta_cfg))
+            def fake_process(
+                pid: int, role: str, expected_sha256: str, expected_boot_id: str, expected_start_ticks: int
+            ) -> dict[str, object]:
+                observed = identity(
+                    role,
+                    expected_sha256,
+                    "afs-node" if role == "node" else "afs-meta",
+                    str(node_cfg if role == "node" else meta_cfg),
+                )
                 observed["expected_boot_id"] = expected_boot_id
                 observed["boot_id_ok"] = observed["boot_id"] == expected_boot_id
                 observed["expected_start_ticks"] = expected_start_ticks
@@ -206,7 +270,13 @@ class MountIsolationOperationTests(unittest.TestCase):
                         "uid": uid,
                         "gid": gid,
                         "private": {"ok": False, "errno": 13, "errno_name": "EACCES"},
-                        "public": {"ok": True, "errno": None, "errno_name": None, "sha256": mount_isolation.sha256_bytes(data), "length": len(data)},
+                        "public": {
+                            "ok": True,
+                            "errno": None,
+                            "errno_name": None,
+                            "sha256": mount_isolation.sha256_bytes(data),
+                            "length": len(data),
+                        },
                     },
                 }
 
@@ -220,13 +290,17 @@ class MountIsolationOperationTests(unittest.TestCase):
 
             args = Namespace(profile="smoke")
             matrix = {"backend": "OwnerFs", "meta": "memory"}
-            with mock.patch.object(mount_isolation.platform, "system", return_value="Linux"), \
-                mock.patch.object(mount_isolation.os, "geteuid", return_value=0), \
-                mock.patch.object(mount_isolation, "mount_identity", side_effect=fake_mount), \
-                mock.patch.object(mount_isolation, "process_identity", side_effect=fake_process), \
-                mock.patch.object(mount_isolation, "child_access", side_effect=fake_access), \
-                mock.patch.object(mount_isolation, "stat_record", side_effect=fake_stat):
-                status, reason, checks, records = mount_isolation.run_operations(args, binding, matrix, artifacts, run_dir)
+            with (
+                mock.patch.object(mount_isolation.platform, "system", return_value="Linux"),
+                mock.patch.object(mount_isolation.os, "geteuid", return_value=0),
+                mock.patch.object(mount_isolation, "mount_identity", side_effect=fake_mount),
+                mock.patch.object(mount_isolation, "process_identity", side_effect=fake_process),
+                mock.patch.object(mount_isolation, "child_access", side_effect=fake_access),
+                mock.patch.object(mount_isolation, "stat_record", side_effect=fake_stat),
+            ):
+                status, reason, checks, records = mount_isolation.run_operations(
+                    args, binding, matrix, artifacts, run_dir
+                )
 
             self.assertEqual(status, "PASS", reason)
             self.assertTrue(all(check["status"] == "PASS" for check in checks))
@@ -267,9 +341,26 @@ class MountIsolationOperationTests(unittest.TestCase):
                     return mount_command("afs-ownerfs", owner_mount)
                 return mount_command("afs-dfs", dfs_mount)
 
-            with mock.patch.object(mount_isolation.platform, "system", return_value="Linux"),                 mock.patch.object(mount_isolation.os, "geteuid", return_value=0),                 mock.patch.object(mount_isolation, "mount_identity", side_effect=fake_mount),                 mock.patch.object(mount_isolation, "process_identity", side_effect=lambda pid, role, sha, boot, ticks: identity(role, sha, "afs-node" if role == "node" else "afs-meta")):
+            with (
+                mock.patch.object(mount_isolation.platform, "system", return_value="Linux"),
+                mock.patch.object(mount_isolation.os, "geteuid", return_value=0),
+                mock.patch.object(mount_isolation, "mount_identity", side_effect=fake_mount),
+                mock.patch.object(
+                    mount_isolation,
+                    "process_identity",
+                    side_effect=lambda pid, role, sha, boot, ticks: identity(
+                        role, sha, "afs-node" if role == "node" else "afs-meta"
+                    ),
+                ),
+            ):
                 with self.assertRaises(mount_isolation.BindingError):
-                    mount_isolation.run_operations(Namespace(profile="smoke"), binding, {"backend": "OwnerFs", "meta": "memory"}, root / "artifacts", root / "run")
+                    mount_isolation.run_operations(
+                        Namespace(profile="smoke"),
+                        binding,
+                        {"backend": "OwnerFs", "meta": "memory"},
+                        root / "artifacts",
+                        root / "run",
+                    )
 
     def test_run_operations_blocks_pseudo_fuse_source(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -295,9 +386,26 @@ class MountIsolationOperationTests(unittest.TestCase):
                     return mount_command("not-afs-ownerfs", owner)
                 return mount_command("afs-dfs", dfs)
 
-            with mock.patch.object(mount_isolation.platform, "system", return_value="Linux"),                 mock.patch.object(mount_isolation.os, "geteuid", return_value=0),                 mock.patch.object(mount_isolation, "mount_identity", side_effect=fake_mount),                 mock.patch.object(mount_isolation, "process_identity", side_effect=lambda pid, role, sha, boot, ticks: identity(role, sha, "afs-node" if role == "node" else "afs-meta")):
+            with (
+                mock.patch.object(mount_isolation.platform, "system", return_value="Linux"),
+                mock.patch.object(mount_isolation.os, "geteuid", return_value=0),
+                mock.patch.object(mount_isolation, "mount_identity", side_effect=fake_mount),
+                mock.patch.object(
+                    mount_isolation,
+                    "process_identity",
+                    side_effect=lambda pid, role, sha, boot, ticks: identity(
+                        role, sha, "afs-node" if role == "node" else "afs-meta"
+                    ),
+                ),
+            ):
                 with self.assertRaises(mount_isolation.BindingError):
-                    mount_isolation.run_operations(Namespace(profile="smoke"), binding, {"backend": "OwnerFs", "meta": "memory"}, root / "artifacts", root / "run")
+                    mount_isolation.run_operations(
+                        Namespace(profile="smoke"),
+                        binding,
+                        {"backend": "OwnerFs", "meta": "memory"},
+                        root / "artifacts",
+                        root / "run",
+                    )
 
     def test_run_operations_inconclusive_without_inode_collision(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -320,12 +428,46 @@ class MountIsolationOperationTests(unittest.TestCase):
 
             def fake_access(private: Path, public: Path, uid: int, gid: int) -> dict[str, object]:
                 data = public.read_bytes()
-                return {"returncode": 0, "stdout": "{}", "stderr": "", "result": {"uid": uid, "gid": gid, "private": {"ok": False, "errno": 13}, "public": {"ok": True, "sha256": mount_isolation.sha256_bytes(data)}}}
+                return {
+                    "returncode": 0,
+                    "stdout": "{}",
+                    "stderr": "",
+                    "result": {
+                        "uid": uid,
+                        "gid": gid,
+                        "private": {"ok": False, "errno": 13},
+                        "public": {"ok": True, "sha256": mount_isolation.sha256_bytes(data)},
+                    },
+                }
 
-            with mock.patch.object(mount_isolation.platform, "system", return_value="Linux"),                 mock.patch.object(mount_isolation.os, "geteuid", return_value=0),                 mock.patch.object(mount_isolation, "mount_identity", side_effect=lambda path: mount_command("afs-ownerfs" if path == owner else "afs-dfs", path)),                 mock.patch.object(mount_isolation, "process_identity", side_effect=lambda pid, role, sha, boot, ticks: identity(role, sha, "afs-node" if role == "node" else "afs-meta")),                 mock.patch.object(mount_isolation, "child_access", side_effect=fake_access):
-                status, reason, checks, records = mount_isolation.run_operations(Namespace(profile="smoke"), binding, {"backend": "OwnerFs", "meta": "memory"}, root / "artifacts", root / "run")
+            with (
+                mock.patch.object(mount_isolation.platform, "system", return_value="Linux"),
+                mock.patch.object(mount_isolation.os, "geteuid", return_value=0),
+                mock.patch.object(
+                    mount_isolation,
+                    "mount_identity",
+                    side_effect=lambda path: mount_command("afs-ownerfs" if path == owner else "afs-dfs", path),
+                ),
+                mock.patch.object(
+                    mount_isolation,
+                    "process_identity",
+                    side_effect=lambda pid, role, sha, boot, ticks: identity(
+                        role, sha, "afs-node" if role == "node" else "afs-meta"
+                    ),
+                ),
+                mock.patch.object(mount_isolation, "child_access", side_effect=fake_access),
+            ):
+                status, reason, checks, records = mount_isolation.run_operations(
+                    Namespace(profile="smoke"),
+                    binding,
+                    {"backend": "OwnerFs", "meta": "memory"},
+                    root / "artifacts",
+                    root / "run",
+                )
             self.assertEqual(status, "INCONCLUSIVE", reason)
-            self.assertIn(("mount-scoped-inode-identity", "INCONCLUSIVE"), [(check["name"], check["status"]) for check in checks])
+            self.assertIn(
+                ("mount-scoped-inode-identity", "INCONCLUSIVE"), [(check["name"], check["status"]) for check in checks]
+            )
             self.assertFalse(records["path_identity"]["inode_numbers_collided"])
 
     def test_run_operations_fails_substituted_uid_result(self):
@@ -357,12 +499,47 @@ class MountIsolationOperationTests(unittest.TestCase):
 
             def fake_access(private: Path, public: Path, uid: int, gid: int) -> dict[str, object]:
                 data = public.read_bytes()
-                return {"returncode": 0, "stdout": "{}", "stderr": "", "result": {"uid": uid + 1, "gid": gid, "private": {"ok": False, "errno": 13}, "public": {"ok": True, "sha256": mount_isolation.sha256_bytes(data)}}}
+                return {
+                    "returncode": 0,
+                    "stdout": "{}",
+                    "stderr": "",
+                    "result": {
+                        "uid": uid + 1,
+                        "gid": gid,
+                        "private": {"ok": False, "errno": 13},
+                        "public": {"ok": True, "sha256": mount_isolation.sha256_bytes(data)},
+                    },
+                }
 
-            with mock.patch.object(mount_isolation.platform, "system", return_value="Linux"),                 mock.patch.object(mount_isolation.os, "geteuid", return_value=0),                 mock.patch.object(mount_isolation, "mount_identity", side_effect=lambda path: mount_command("afs-ownerfs" if path == owner else "afs-dfs", path)),                 mock.patch.object(mount_isolation, "process_identity", side_effect=lambda pid, role, sha, boot, ticks: identity(role, sha, "afs-node" if role == "node" else "afs-meta")),                 mock.patch.object(mount_isolation, "stat_record", side_effect=fake_stat),                 mock.patch.object(mount_isolation, "child_access", side_effect=fake_access):
-                status, reason, checks, records = mount_isolation.run_operations(Namespace(profile="smoke"), binding, {"backend": "OwnerFs", "meta": "memory"}, root / "artifacts", root / "run")
+            with (
+                mock.patch.object(mount_isolation.platform, "system", return_value="Linux"),
+                mock.patch.object(mount_isolation.os, "geteuid", return_value=0),
+                mock.patch.object(
+                    mount_isolation,
+                    "mount_identity",
+                    side_effect=lambda path: mount_command("afs-ownerfs" if path == owner else "afs-dfs", path),
+                ),
+                mock.patch.object(
+                    mount_isolation,
+                    "process_identity",
+                    side_effect=lambda pid, role, sha, boot, ticks: identity(
+                        role, sha, "afs-node" if role == "node" else "afs-meta"
+                    ),
+                ),
+                mock.patch.object(mount_isolation, "stat_record", side_effect=fake_stat),
+                mock.patch.object(mount_isolation, "child_access", side_effect=fake_access),
+            ):
+                status, reason, checks, records = mount_isolation.run_operations(
+                    Namespace(profile="smoke"),
+                    binding,
+                    {"backend": "OwnerFs", "meta": "memory"},
+                    root / "artifacts",
+                    root / "run",
+                )
             self.assertEqual(status, "FAIL", reason)
-            self.assertIn(("mode-and-real-uid-access-isolation", "FAIL"), [(check["name"], check["status"]) for check in checks])
+            self.assertIn(
+                ("mode-and-real-uid-access-isolation", "FAIL"), [(check["name"], check["status"]) for check in checks]
+            )
 
     def test_run_operations_blocks_pid_reuse_tamper(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -389,7 +566,9 @@ class MountIsolationOperationTests(unittest.TestCase):
             def fake_mount(path: Path) -> dict[str, object]:
                 return mount_command("afs-ownerfs" if path == owner else "afs-dfs", path)
 
-            def fake_process(pid: int, role: str, expected_sha256: str, expected_boot_id: str, expected_start_ticks: int) -> dict[str, object]:
+            def fake_process(
+                pid: int, role: str, expected_sha256: str, expected_boot_id: str, expected_start_ticks: int
+            ) -> dict[str, object]:
                 observed = identity(role, expected_sha256, "afs-node" if role == "node" else "afs-meta")
                 observed["expected_boot_id"] = expected_boot_id
                 observed["boot_id_ok"] = observed["boot_id"] == expected_boot_id
@@ -400,7 +579,12 @@ class MountIsolationOperationTests(unittest.TestCase):
 
             args = Namespace(profile="smoke")
             matrix = {"backend": "OwnerFs", "meta": "memory"}
-            with mock.patch.object(mount_isolation.platform, "system", return_value="Linux"),                 mock.patch.object(mount_isolation.os, "geteuid", return_value=0),                 mock.patch.object(mount_isolation, "mount_identity", side_effect=fake_mount),                 mock.patch.object(mount_isolation, "process_identity", side_effect=fake_process):
+            with (
+                mock.patch.object(mount_isolation.platform, "system", return_value="Linux"),
+                mock.patch.object(mount_isolation.os, "geteuid", return_value=0),
+                mock.patch.object(mount_isolation, "mount_identity", side_effect=fake_mount),
+                mock.patch.object(mount_isolation, "process_identity", side_effect=fake_process),
+            ):
                 with self.assertRaises(mount_isolation.BindingError):
                     mount_isolation.run_operations(args, binding, matrix, artifacts, run_dir)
 
@@ -429,7 +613,9 @@ class MountIsolationOperationTests(unittest.TestCase):
             def fake_mount(path: Path) -> dict[str, object]:
                 return mount_command("afs-ownerfs" if path == owner else "afs-dfs", path)
 
-            def fake_process(pid: int, role: str, expected_sha256: str, expected_boot_id: str, expected_start_ticks: int) -> dict[str, object]:
+            def fake_process(
+                pid: int, role: str, expected_sha256: str, expected_boot_id: str, expected_start_ticks: int
+            ) -> dict[str, object]:
                 observed = identity(role, expected_sha256, "afs-node" if role == "node" else "afs-meta")
                 observed["expected_boot_id"] = expected_boot_id
                 observed["boot_id_ok"] = observed["boot_id"] == expected_boot_id
@@ -447,18 +633,28 @@ class MountIsolationOperationTests(unittest.TestCase):
                         "uid": uid,
                         "gid": gid,
                         "private": {"ok": False, "errno": 13, "errno_name": "EACCES"},
-                        "public": {"ok": True, "errno": None, "errno_name": None, "sha256": mount_isolation.sha256_bytes(data), "length": len(data)},
+                        "public": {
+                            "ok": True,
+                            "errno": None,
+                            "errno_name": None,
+                            "sha256": mount_isolation.sha256_bytes(data),
+                            "length": len(data),
+                        },
                     },
                 }
 
             args = Namespace(profile="smoke")
             matrix = {"backend": "OwnerFs", "meta": "memory"}
-            with mock.patch.object(mount_isolation.platform, "system", return_value="Linux"), \
-                mock.patch.object(mount_isolation.os, "geteuid", return_value=0), \
-                mock.patch.object(mount_isolation, "mount_identity", side_effect=fake_mount), \
-                mock.patch.object(mount_isolation, "process_identity", side_effect=fake_process), \
-                mock.patch.object(mount_isolation, "child_access", side_effect=fake_access):
-                status, reason, checks, records = mount_isolation.run_operations(args, binding, matrix, artifacts, run_dir)
+            with (
+                mock.patch.object(mount_isolation.platform, "system", return_value="Linux"),
+                mock.patch.object(mount_isolation.os, "geteuid", return_value=0),
+                mock.patch.object(mount_isolation, "mount_identity", side_effect=fake_mount),
+                mock.patch.object(mount_isolation, "process_identity", side_effect=fake_process),
+                mock.patch.object(mount_isolation, "child_access", side_effect=fake_access),
+            ):
+                status, reason, checks, records = mount_isolation.run_operations(
+                    args, binding, matrix, artifacts, run_dir
+                )
 
             self.assertEqual(status, "INCONCLUSIVE")
             inode_check = next(check for check in checks if check["name"] == "mount-scoped-inode-identity")
@@ -490,7 +686,9 @@ class MountIsolationOperationTests(unittest.TestCase):
             def fake_mount(path: Path) -> dict[str, object]:
                 return mount_command("afs-ownerfs" if path == owner else "afs-dfs", path)
 
-            def fake_process(pid: int, role: str, expected_sha256: str, expected_boot_id: str, expected_start_ticks: int) -> dict[str, object]:
+            def fake_process(
+                pid: int, role: str, expected_sha256: str, expected_boot_id: str, expected_start_ticks: int
+            ) -> dict[str, object]:
                 observed = identity(role, expected_sha256, "afs-node" if role == "node" else "afs-meta")
                 observed["expected_boot_id"] = expected_boot_id
                 observed["boot_id_ok"] = observed["boot_id"] == expected_boot_id
@@ -508,7 +706,13 @@ class MountIsolationOperationTests(unittest.TestCase):
                         "uid": 0,
                         "gid": 0,
                         "private": {"ok": False, "errno": 13, "errno_name": "EACCES"},
-                        "public": {"ok": True, "errno": None, "errno_name": None, "sha256": mount_isolation.sha256_bytes(data), "length": len(data)},
+                        "public": {
+                            "ok": True,
+                            "errno": None,
+                            "errno_name": None,
+                            "sha256": mount_isolation.sha256_bytes(data),
+                            "length": len(data),
+                        },
                     },
                 }
 
@@ -522,13 +726,17 @@ class MountIsolationOperationTests(unittest.TestCase):
 
             args = Namespace(profile="smoke")
             matrix = {"backend": "OwnerFs", "meta": "memory"}
-            with mock.patch.object(mount_isolation.platform, "system", return_value="Linux"), \
-                mock.patch.object(mount_isolation.os, "geteuid", return_value=0), \
-                mock.patch.object(mount_isolation, "mount_identity", side_effect=fake_mount), \
-                mock.patch.object(mount_isolation, "process_identity", side_effect=fake_process), \
-                mock.patch.object(mount_isolation, "child_access", side_effect=fake_access), \
-                mock.patch.object(mount_isolation, "stat_record", side_effect=fake_stat):
-                status, reason, checks, records = mount_isolation.run_operations(args, binding, matrix, artifacts, run_dir)
+            with (
+                mock.patch.object(mount_isolation.platform, "system", return_value="Linux"),
+                mock.patch.object(mount_isolation.os, "geteuid", return_value=0),
+                mock.patch.object(mount_isolation, "mount_identity", side_effect=fake_mount),
+                mock.patch.object(mount_isolation, "process_identity", side_effect=fake_process),
+                mock.patch.object(mount_isolation, "child_access", side_effect=fake_access),
+                mock.patch.object(mount_isolation, "stat_record", side_effect=fake_stat),
+            ):
+                status, reason, checks, records = mount_isolation.run_operations(
+                    args, binding, matrix, artifacts, run_dir
+                )
 
             self.assertEqual(status, "FAIL")
             access_check = next(check for check in checks if check["name"] == "mode-and-real-uid-access-isolation")

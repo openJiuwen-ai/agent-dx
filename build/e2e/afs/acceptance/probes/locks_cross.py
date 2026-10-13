@@ -6,6 +6,7 @@ The host side starts two worker command prefixes. Each worker prefix receives a
 Linux ext4 selftests or route work through commands such as ``limactl shell``.
 All real file IO and advisory-lock syscalls happen inside worker processes.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -29,7 +30,6 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 import locks_smoke  # noqa: E402
-
 
 DEFAULT_PEER_REQUEST_TIMEOUT_SECONDS = 5.0
 DEFAULT_MIN_WAIT_SECONDS = 6.0
@@ -68,7 +68,7 @@ def _read_text_optional(path: Path) -> str | None:
         return None
 
 
-def _parse_named_path(value: str) -> tuple[str, str]:
+def parse_named_path(value: str) -> tuple[str, str]:
     if "=" not in value:
         raise argparse.ArgumentTypeError("expected ROLE=PID_FILE")
     name, file_path = value.split("=", 1)
@@ -85,7 +85,7 @@ def _collect_pid_file_identities(assignments: list[tuple[str, str]], kind: str) 
         raw = Path(pid_file).read_text(encoding="utf-8").strip()
         if not raw.isdecimal() or int(raw) <= 0:
             raise RuntimeError(f"{kind} pid file {pid_file} for {role} does not contain a positive pid")
-        identities[role] = locks_smoke._process_identity(int(raw), role, pid_file)
+        identities[role] = locks_smoke.process_identity(int(raw), role, pid_file)
     return identities
 
 
@@ -144,7 +144,7 @@ def _worker_identity(
         },
         "boot_id": _read_text_optional(Path("/proc/sys/kernel/random/boot_id")),
         "machine_id": _read_text_optional(Path("/etc/machine-id")),
-        "process": locks_smoke._process_identity(os.getpid(), "locks_cross_worker", "self"),
+        "process": locks_smoke.process_identity(os.getpid(), "locks_cross_worker", "self"),
     }
     if path is not None:
         identity["mount"] = _mount_identity(path)
@@ -183,7 +183,14 @@ def _getlk_reports_conflict(result: dict[str, Any]) -> bool:
 
 
 def _worker_result(op: str, path: Path | None, **extra: Any) -> dict[str, Any]:
-    return {"event": "RESULT", "op": op, "identity": _worker_identity(path, extra.pop("process_pid_files", None), extra.pop("meta_process_pid_files", None)), **extra}
+    return {
+        "event": "RESULT",
+        "op": op,
+        "identity": _worker_identity(
+            path, extra.pop("process_pid_files", None), extra.pop("meta_process_pid_files", None)
+        ),
+        **extra,
+    }
 
 
 def _worker_main(args: argparse.Namespace) -> int:
@@ -202,10 +209,13 @@ def _worker_main(args: argparse.Namespace) -> int:
 
     try:
         if op == "identity":
-            _emit(_worker_result(op, path, stat=_stat_json(path) if path and path.exists() else None, **identity_kwargs))
+            _emit(
+                _worker_result(op, path, stat=_stat_json(path) if path and path.exists() else None, **identity_kwargs)
+            )
             return 0
         if op == "init":
-            assert path is not None
+            if not path is not None:
+                raise AssertionError("path is not None")
             path.parent.mkdir(parents=True, exist_ok=True)
             fd = os.open(path, os.O_CREAT | os.O_TRUNC | os.O_RDWR, 0o666)
             try:
@@ -216,64 +226,106 @@ def _worker_main(args: argparse.Namespace) -> int:
             _emit(_worker_result(op, path, stat=_stat_json(path), **identity_kwargs))
             return 0
         if op == "read_stat":
-            assert path is not None
+            if not path is not None:
+                raise AssertionError("path is not None")
             data = path.read_bytes()
             _emit(_worker_result(op, path, stat=_stat_json(path), prefix=data[:32].hex(), **identity_kwargs))
             return 0
         if op == "unlink_path":
-            assert path is not None
+            if not path is not None:
+                raise AssertionError("path is not None")
             existed = path.exists()
             if existed:
                 path.unlink()
             _emit(_worker_result(op, path, existed=existed, removed=not path.exists(), **identity_kwargs))
             return 0
         if op == "try_fcntl":
-            assert path is not None
+            if not path is not None:
+                raise AssertionError("path is not None")
             fd = os.open(path, os.O_RDWR)
             try:
-                ok, err = locks_smoke._fcntl_set(fd, _fcntl_type(args.mode), args.start, args.length, blocking=False)
+                ok, err = locks_smoke.fcntl_set(fd, _fcntl_type(args.mode), args.start, args.length, blocking=False)
                 if ok:
-                    locks_smoke._fcntl_set(fd, fcntl.F_UNLCK, args.start, args.length, blocking=False)
-                _emit(_worker_result(op, path, ok=ok, errno=err, errno_name=locks_smoke._errno_name(err), stat=_stat_json(path), **identity_kwargs))
+                    locks_smoke.fcntl_set(fd, fcntl.F_UNLCK, args.start, args.length, blocking=False)
+                _emit(
+                    _worker_result(
+                        op,
+                        path,
+                        ok=ok,
+                        errno=err,
+                        errno_name=locks_smoke.errno_name(err),
+                        stat=_stat_json(path),
+                        **identity_kwargs,
+                    )
+                )
                 return 0 if ok or _fcntl_conflict_errno_ok(err) else 1
             finally:
                 os.close(fd)
         if op == "try_readonly_write_lock":
-            assert path is not None
+            if not path is not None:
+                raise AssertionError("path is not None")
             fd = os.open(path, os.O_RDONLY)
             try:
-                ok, err = locks_smoke._fcntl_set(fd, fcntl.F_WRLCK, args.start, args.length, blocking=False)
+                ok, err = locks_smoke.fcntl_set(fd, fcntl.F_WRLCK, args.start, args.length, blocking=False)
                 if ok:
-                    locks_smoke._fcntl_set(fd, fcntl.F_UNLCK, args.start, args.length, blocking=False)
-                _emit(_worker_result(op, path, ok=ok, errno=err, errno_name=locks_smoke._errno_name(err), stat=_stat_json(path), **identity_kwargs))
+                    locks_smoke.fcntl_set(fd, fcntl.F_UNLCK, args.start, args.length, blocking=False)
+                _emit(
+                    _worker_result(
+                        op,
+                        path,
+                        ok=ok,
+                        errno=err,
+                        errno_name=locks_smoke.errno_name(err),
+                        stat=_stat_json(path),
+                        **identity_kwargs,
+                    )
+                )
                 return 0
             finally:
                 os.close(fd)
         if op == "getlk":
-            assert path is not None
+            if not path is not None:
+                raise AssertionError("path is not None")
             fd = os.open(path, os.O_RDWR)
             try:
-                result = locks_smoke._fcntl_getlk(fd, _fcntl_type(args.mode), args.start, args.length)
+                result = locks_smoke.fcntl_getlk(fd, _fcntl_type(args.mode), args.start, args.length)
                 _emit(_worker_result(op, path, result=result, stat=_stat_json(path), **identity_kwargs))
                 return 0
             finally:
                 os.close(fd)
         if op == "hold_fcntl":
-            assert path is not None
+            if not path is not None:
+                raise AssertionError("path is not None")
             fd = os.open(path, os.O_RDWR)
             try:
-                ok, err = locks_smoke._fcntl_set(fd, _fcntl_type(args.mode), args.start, args.length, blocking=False)
+                ok, err = locks_smoke.fcntl_set(fd, _fcntl_type(args.mode), args.start, args.length, blocking=False)
                 if not ok:
-                    _emit({"event": "ERROR", "op": op, "errno": err, "errno_name": locks_smoke._errno_name(err), "identity": _worker_identity(path, **identity_kwargs)})
+                    _emit(
+                        {
+                            "event": "ERROR",
+                            "op": op,
+                            "errno": err,
+                            "errno_name": locks_smoke.errno_name(err),
+                            "identity": _worker_identity(path, **identity_kwargs),
+                        }
+                    )
                     return 1
-                _emit({"event": "READY", "op": op, "identity": _worker_identity(path, **identity_kwargs), "stat": _stat_meta_json(path)})
+                _emit(
+                    {
+                        "event": "READY",
+                        "op": op,
+                        "identity": _worker_identity(path, **identity_kwargs),
+                        "stat": _stat_meta_json(path),
+                    }
+                )
                 sys.stdin.readline()
-                locks_smoke._fcntl_set(fd, fcntl.F_UNLCK, args.start, args.length, blocking=False)
+                locks_smoke.fcntl_set(fd, fcntl.F_UNLCK, args.start, args.length, blocking=False)
                 return 0
             finally:
                 os.close(fd)
         if op == "wait_fcntl":
-            assert path is not None
+            if not path is not None:
+                raise AssertionError("path is not None")
             fd = os.open(path, os.O_RDWR)
             interrupted = False
 
@@ -287,35 +339,84 @@ def _worker_main(args: argparse.Namespace) -> int:
                     signal.signal(signal.SIGALRM, _handle_alarm)
                     signal.setitimer(signal.ITIMER_REAL, args.alarm_after)
                 started = time.monotonic()
-                _emit({"event": "WAITING", "op": op, "identity": _worker_identity(path, **identity_kwargs), "stat": _stat_meta_json(path)})
-                ok, err = locks_smoke._fcntl_set(fd, _fcntl_type(args.mode), args.start, args.length, blocking=True)
+                _emit(
+                    {
+                        "event": "WAITING",
+                        "op": op,
+                        "identity": _worker_identity(path, **identity_kwargs),
+                        "stat": _stat_meta_json(path),
+                    }
+                )
+                ok, err = locks_smoke.fcntl_set(fd, _fcntl_type(args.mode), args.start, args.length, blocking=True)
                 waited = time.monotonic() - started
                 signal.setitimer(signal.ITIMER_REAL, 0)
                 if not ok:
-                    _emit({"event": "ERROR", "op": op, "errno": err, "errno_name": locks_smoke._errno_name(err), "waited_seconds": waited, "identity": _worker_identity(path, **identity_kwargs)})
+                    _emit(
+                        {
+                            "event": "ERROR",
+                            "op": op,
+                            "errno": err,
+                            "errno_name": locks_smoke.errno_name(err),
+                            "waited_seconds": waited,
+                            "identity": _worker_identity(path, **identity_kwargs),
+                        }
+                    )
                     return 1
-                _emit({"event": "ACQUIRED", "op": op, "waited_seconds": waited, "identity": _worker_identity(path, **identity_kwargs), "stat": _stat_meta_json(path)})
+                _emit(
+                    {
+                        "event": "ACQUIRED",
+                        "op": op,
+                        "waited_seconds": waited,
+                        "identity": _worker_identity(path, **identity_kwargs),
+                        "stat": _stat_meta_json(path),
+                    }
+                )
                 sys.stdin.readline()
-                locks_smoke._fcntl_set(fd, fcntl.F_UNLCK, args.start, args.length, blocking=False)
+                locks_smoke.fcntl_set(fd, fcntl.F_UNLCK, args.start, args.length, blocking=False)
                 return 0
             except InterruptedError as exc:
                 signal.setitimer(signal.ITIMER_REAL, 0)
-                _emit({"event": "INTERRUPTED", "op": op, "message": str(exc), "interrupted": interrupted, "identity": _worker_identity(path, **identity_kwargs)})
+                _emit(
+                    {
+                        "event": "INTERRUPTED",
+                        "op": op,
+                        "message": str(exc),
+                        "interrupted": interrupted,
+                        "identity": _worker_identity(path, **identity_kwargs),
+                    }
+                )
                 return 0
             finally:
                 os.close(fd)
         if op == "fcntl_close_other_then_hold":
-            assert path is not None
+            if not path is not None:
+                raise AssertionError("path is not None")
             fd = os.open(path, os.O_RDWR)
             fd2 = os.open(path, os.O_RDWR)
             try:
-                ok, err = locks_smoke._fcntl_set(fd, fcntl.F_WRLCK, args.start, args.length, blocking=False)
+                ok, err = locks_smoke.fcntl_set(fd, fcntl.F_WRLCK, args.start, args.length, blocking=False)
                 if not ok:
-                    _emit({"event": "ERROR", "op": op, "errno": err, "errno_name": locks_smoke._errno_name(err), "identity": _worker_identity(path, **identity_kwargs)})
+                    _emit(
+                        {
+                            "event": "ERROR",
+                            "op": op,
+                            "errno": err,
+                            "errno_name": locks_smoke.errno_name(err),
+                            "identity": _worker_identity(path, **identity_kwargs),
+                        }
+                    )
                     return 1
                 os.close(fd2)
                 fd2 = -1
-                _emit({"event": "READY", "op": op, "closed_other_fd": True, "identity": _worker_identity(path, **identity_kwargs), "stat": _stat_meta_json(path)})
+                _emit(
+                    {
+                        "event": "READY",
+                        "op": op,
+                        "closed_other_fd": True,
+                        "identity": _worker_identity(path, **identity_kwargs),
+                        "stat": _stat_meta_json(path),
+                    }
+                )
                 sys.stdin.readline()
                 return 0
             finally:
@@ -323,22 +424,31 @@ def _worker_main(args: argparse.Namespace) -> int:
                     os.close(fd2)
                 os.close(fd)
         if op == "hold_flock":
-            assert path is not None
+            if not path is not None:
+                raise AssertionError("path is not None")
             fd = os.open(path, os.O_RDWR)
             try:
-                fcntl.flock(fd, locks_smoke._flock_op(args.mode) | fcntl.LOCK_NB)
-                _emit({"event": "READY", "op": op, "identity": _worker_identity(path, **identity_kwargs), "stat": _stat_json(path)})
+                fcntl.flock(fd, locks_smoke.flock_op(args.mode) | fcntl.LOCK_NB)
+                _emit(
+                    {
+                        "event": "READY",
+                        "op": op,
+                        "identity": _worker_identity(path, **identity_kwargs),
+                        "stat": _stat_json(path),
+                    }
+                )
                 sys.stdin.readline()
                 fcntl.flock(fd, fcntl.LOCK_UN)
                 return 0
             finally:
                 os.close(fd)
         if op == "try_flock":
-            assert path is not None
+            if not path is not None:
+                raise AssertionError("path is not None")
             fd = os.open(path, os.O_RDWR)
             try:
                 try:
-                    fcntl.flock(fd, locks_smoke._flock_op(args.mode) | fcntl.LOCK_NB)
+                    fcntl.flock(fd, locks_smoke.flock_op(args.mode) | fcntl.LOCK_NB)
                     ok = True
                     err = None
                 except OSError as exc:
@@ -346,32 +456,54 @@ def _worker_main(args: argparse.Namespace) -> int:
                     err = exc.errno
                 if ok:
                     fcntl.flock(fd, fcntl.LOCK_UN)
-                _emit(_worker_result(op, path, ok=ok, errno=err, errno_name=locks_smoke._errno_name(err), stat=_stat_json(path)))
+                _emit(
+                    _worker_result(
+                        op, path, ok=ok, errno=err, errno_name=locks_smoke.errno_name(err), stat=_stat_json(path)
+                    )
+                )
                 return 0 if ok or _flock_conflict_errno_ok(err) else 1
             finally:
                 os.close(fd)
         if op == "flock_dup_close_then_hold":
-            assert path is not None
+            if not path is not None:
+                raise AssertionError("path is not None")
             fd = os.open(path, os.O_RDWR)
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 dup_fd = os.dup(fd)
                 os.close(fd)
                 fd = dup_fd
-                _emit({"event": "READY", "op": op, "closed_original_fd": True, "identity": _worker_identity(path, **identity_kwargs), "stat": _stat_json(path)})
+                _emit(
+                    {
+                        "event": "READY",
+                        "op": op,
+                        "closed_original_fd": True,
+                        "identity": _worker_identity(path, **identity_kwargs),
+                        "stat": _stat_json(path),
+                    }
+                )
                 sys.stdin.readline()
                 fcntl.flock(fd, fcntl.LOCK_UN)
                 return 0
             finally:
                 os.close(fd)
         if op == "fcntl_rename_unlink_recreate":
-            assert path is not None
+            if not path is not None:
+                raise AssertionError("path is not None")
             renamed = Path(args.renamed_path).resolve() if args.renamed_path else path.with_name(path.name + ".held")
             fd = os.open(path, os.O_RDWR)
             try:
-                ok, err = locks_smoke._fcntl_set(fd, fcntl.F_WRLCK, args.start, args.length, blocking=False)
+                ok, err = locks_smoke.fcntl_set(fd, fcntl.F_WRLCK, args.start, args.length, blocking=False)
                 if not ok:
-                    _emit({"event": "ERROR", "op": op, "errno": err, "errno_name": locks_smoke._errno_name(err), "identity": _worker_identity(path, **identity_kwargs)})
+                    _emit(
+                        {
+                            "event": "ERROR",
+                            "op": op,
+                            "errno": err,
+                            "errno_name": locks_smoke.errno_name(err),
+                            "identity": _worker_identity(path, **identity_kwargs),
+                        }
+                    )
                     return 1
                 if renamed.exists():
                     renamed.unlink()
@@ -380,31 +512,59 @@ def _worker_main(args: argparse.Namespace) -> int:
                     handle.write(b"afs-locks-cross-recreated\n")
                     handle.flush()
                     os.fsync(handle.fileno())
-                _emit({
-                    "event": "READY",
-                    "op": op,
-                    "identity": _worker_identity(path, **identity_kwargs),
-                    "held_fd_stat": os.fstat(fd).st_ino,
-                    "renamed_stat": _stat_meta_json(renamed),
-                    "recreated_stat": _stat_json(path),
-                })
+                _emit(
+                    {
+                        "event": "READY",
+                        "op": op,
+                        "identity": _worker_identity(path, **identity_kwargs),
+                        "held_fd_stat": os.fstat(fd).st_ino,
+                        "renamed_stat": _stat_meta_json(renamed),
+                        "recreated_stat": _stat_json(path),
+                    }
+                )
                 line = sys.stdin.readline().strip()
                 unlinked = False
                 if line == "unlink":
                     renamed.unlink()
                     unlinked = True
-                    _emit({"event": "UNLINKED", "op": op, "renamed_path": str(renamed), "identity": _worker_identity(path, **identity_kwargs)})
+                    _emit(
+                        {
+                            "event": "UNLINKED",
+                            "op": op,
+                            "renamed_path": str(renamed),
+                            "identity": _worker_identity(path, **identity_kwargs),
+                        }
+                    )
                     sys.stdin.readline()
-                locks_smoke._fcntl_set(fd, fcntl.F_UNLCK, args.start, args.length, blocking=False)
+                locks_smoke.fcntl_set(fd, fcntl.F_UNLCK, args.start, args.length, blocking=False)
                 return 0 if unlinked or line in ("release", "") else 1
             finally:
                 os.close(fd)
         raise RuntimeError(f"unknown worker op {op}")
     except OSError as exc:
-        _emit({"event": "ERROR", "op": op, "exception": type(exc).__name__, "message": str(exc), "errno": exc.errno, "errno_name": locks_smoke._errno_name(exc.errno), "identity": safe_identity()})
+        _emit(
+            {
+                "event": "ERROR",
+                "op": op,
+                "exception": type(exc).__name__,
+                "message": str(exc),
+                "errno": exc.errno,
+                "errno_name": locks_smoke.errno_name(exc.errno),
+                "identity": safe_identity(),
+            }
+        )
         return 1
     except Exception as exc:  # noqa: BLE001
-        _emit({"event": "ERROR", "op": op, "exception": type(exc).__name__, "message": str(exc), "traceback": traceback.format_exc(), "identity": safe_identity()})
+        _emit(
+            {
+                "event": "ERROR",
+                "op": op,
+                "exception": type(exc).__name__,
+                "message": str(exc),
+                "traceback": traceback.format_exc(),
+                "identity": safe_identity(),
+            }
+        )
         return 1
 
 
@@ -442,7 +602,8 @@ class WorkerProcess:
 
     def send(self, line: str) -> None:
         if self.proc.poll() is None:
-            assert self.proc.stdin is not None
+            if not self.proc.stdin is not None:
+                raise AssertionError("self.proc.stdin is not None")
             self.proc.stdin.write(line + "\n")
             self.proc.stdin.flush()
 
@@ -480,7 +641,14 @@ class CrossProbe:
         self.failures: list[dict[str, Any]] = []
         self.children: list[WorkerProcess] = []
         self.commands: list[dict[str, Any]] = []
-        self.run_id = f"locks-cross-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-{os.getpid()}-{random.randrange(1_000_000):06d}"
+        self.run_id = (
+            f"locks-cross-"
+            f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}"
+            f"-"
+            f"{os.getpid()}"
+            f"-"
+            f"{random.randrange(1000000):06d}"
+        )
         self.fixture_kept = True
         self.identity: dict[str, Any] = {}
 
@@ -534,7 +702,9 @@ class CrossProbe:
         }
         self.commands.append(record)
         if proc.returncode != 0 and not events:
-            raise RuntimeError(_json_dumps({"worker": worker, "op": op, "returncode": proc.returncode, "stderr": proc.stderr}))
+            raise RuntimeError(
+                _json_dumps({"worker": worker, "op": op, "returncode": proc.returncode, "stderr": proc.stderr})
+            )
         if events and events[-1].get("event") == "ERROR":
             raise RuntimeError(_json_dumps({"worker": worker, "op": op, "event": events[-1]}))
         return record
@@ -550,7 +720,9 @@ class CrossProbe:
     def setup(self) -> None:
         self.evidence.mkdir(parents=True, exist_ok=True)
         if platform.system() != "Linux" and not self.args.allow_host_non_linux:
-            raise RuntimeError("locks_cross host selftests require Linux; use --allow-host-non-linux only for orchestration")
+            raise RuntimeError(
+                ("locks_cross host selftests require Linux; use --allow-host-non-linux only for orchestration")
+            )
         _expect(
             self.args.min_wait_seconds > self.args.peer_request_timeout,
             "--min-wait-seconds must be greater than --peer-request-timeout",
@@ -625,9 +797,19 @@ class CrossProbe:
         for worker, path in (("A", self.path_a), ("A", self.renamed_a)):
             try:
                 self.run_cmd(worker, "unlink_path", path)
-            except Exception:
-                pass
-        self.fixture_kept = False
+            except Exception as exc:
+                self.failures.append(
+                    {
+                        "name": "fixture_cleanup",
+                        "started_at": _now(),
+                        "ok": False,
+                        "worker": worker,
+                        "path": path,
+                        "exception": type(exc).__name__,
+                        "message": str(exc),
+                    }
+                )
+        self.fixture_kept = bool(self.failures)
 
     def write_report(self) -> None:
         report = {
@@ -664,19 +846,32 @@ class CrossProbe:
             "failures": self.failures,
             "commands": self.commands,
             "children": [
-                {"name": child.name, "events": child.events, "stderr": child.stderr,
-                 "returncode": child.proc.returncode}
+                {
+                    "name": child.name,
+                    "events": child.events,
+                    "stderr": child.stderr,
+                    "returncode": child.proc.returncode,
+                }
                 for child in self.children
             ],
             "notes": [
                 "PASS means the requested behavior checks passed for the observed worker/path pair.",
-                "cross_mount_qualified=false is reference evidence only and must not be counted as cross-mount AFS PASS.",
-                "Product qualification requires different worker kernels, AFS FUSE mount identity on both workers, product process identity on both workers and at least one Meta process identity.",
+                (
+                    "cross_mount_qualified=false is reference evidence only and must "
+                    "not be counted as cross-mount AFS PASS."
+                ),
+                (
+                    "Product qualification requires different worker kernels, AFS "
+                    "FUSE mount identity on both workers, product process identity "
+                    "on both workers and at least one Meta process identity."
+                ),
                 "All file IO and advisory-lock syscalls are executed by worker subprocesses.",
             ],
         }
         self.evidence.mkdir(parents=True, exist_ok=True)
-        (self.evidence / "report.json").write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        (self.evidence / "report.json").write_text(
+            json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
         (self.evidence / "summary.txt").write_text(
             f"status={report['status']} cross_mount_qualified={report['cross_mount_qualified']} "
             f"same_kernel_reference_only={report['same_kernel_reference_only']} steps={report['summary']['steps']} "
@@ -690,7 +885,9 @@ class CrossProbe:
         try:
             record.update({"ok": True, "details": func()})
         except Exception as exc:  # noqa: BLE001
-            record.update({"ok": False, "exception": type(exc).__name__, "message": str(exc), "traceback": traceback.format_exc()})
+            record.update(
+                {"ok": False, "exception": type(exc).__name__, "message": str(exc), "traceback": traceback.format_exc()}
+            )
             self.failures.append(record)
         finally:
             record["duration_ms"] = round((time.time() - started) * 1000, 3)
@@ -708,7 +905,9 @@ class CrossProbe:
         return {"a": a, "b": b, "cross_mount_qualified": self.identity.get("cross_mount_qualified", False)}
 
     def test_posix_overlap_getlk(self) -> dict[str, Any]:
-        holder = self.start_worker("A-fcntl-holder", "A", "hold_fcntl", self.path_a, mode="exclusive", start=0, length=10)
+        holder = self.start_worker(
+            "A-fcntl-holder", "A", "hold_fcntl", self.path_a, mode="exclusive", start=0, length=10
+        )
         ready = holder.read_event("READY")
         conflict = self.event(self.run_cmd("B", "try_fcntl", self.path_b, mode="exclusive", start=0, length=10))
         nonoverlap = self.event(self.run_cmd("B", "try_fcntl", self.path_b, mode="exclusive", start=10, length=10))
@@ -722,33 +921,83 @@ class CrossProbe:
         return {"ready": ready, "conflict": conflict, "nonoverlap": nonoverlap, "getlk": getlk, "holder_returncode": rc}
 
     def test_setlkw_wake_and_interrupt(self) -> dict[str, Any]:
-        holder = self.start_worker("A-fcntl-wake-holder", "A", "hold_fcntl", self.path_a, mode="exclusive", start=40, length=10)
+        holder = self.start_worker(
+            "A-fcntl-wake-holder", "A", "hold_fcntl", self.path_a, mode="exclusive", start=40, length=10
+        )
         ready = holder.read_event("READY")
-        waiter = self.start_worker("B-fcntl-wake-waiter", "B", "wait_fcntl", self.path_b, mode="exclusive", start=40, length=10)
+        waiter = self.start_worker(
+            "B-fcntl-wake-waiter", "B", "wait_fcntl", self.path_b, mode="exclusive", start=40, length=10
+        )
         waiting = waiter.read_event("WAITING")
         time.sleep(self.args.min_wait_seconds)
-        _expect(waiter.proc.poll() is None, "SETLKW waiter remains blocked past generic peer timeout", {"min_wait_seconds": self.args.min_wait_seconds})
+        _expect(
+            waiter.proc.poll() is None,
+            "SETLKW waiter remains blocked past generic peer timeout",
+            {"min_wait_seconds": self.args.min_wait_seconds},
+        )
         holder_rc = holder.release()
         acquired = waiter.read_event("ACQUIRED", timeout=self.args.child_timeout)
         waiter_rc = waiter.release()
-        _expect(acquired.get("waited_seconds", 0) >= self.args.peer_request_timeout, "SETLKW waited longer than configured peer request timeout", {"acquired": acquired, "timeout_config": self.timeout_config()})
-        _expect(holder_rc == 0 and waiter_rc == 0, "SETLKW holder and waiter exit cleanly", {"holder": holder_rc, "waiter": waiter_rc})
+        _expect(
+            acquired.get("waited_seconds", 0) >= self.args.peer_request_timeout,
+            "SETLKW waited longer than configured peer request timeout",
+            {"acquired": acquired, "timeout_config": self.timeout_config()},
+        )
+        _expect(
+            holder_rc == 0 and waiter_rc == 0,
+            "SETLKW holder and waiter exit cleanly",
+            {"holder": holder_rc, "waiter": waiter_rc},
+        )
 
-        interrupt_holder = self.start_worker("A-fcntl-interrupt-holder", "A", "hold_fcntl", self.path_a, mode="exclusive", start=60, length=10)
+        interrupt_holder = self.start_worker(
+            "A-fcntl-interrupt-holder", "A", "hold_fcntl", self.path_a, mode="exclusive", start=60, length=10
+        )
         interrupt_ready = interrupt_holder.read_event("READY")
-        interruptee = self.start_worker("B-fcntl-interrupt-waiter", "B", "wait_fcntl", self.path_b, mode="exclusive", start=60, length=10, alarm_after=0.2)
+        interruptee = self.start_worker(
+            "B-fcntl-interrupt-waiter",
+            "B",
+            "wait_fcntl",
+            self.path_b,
+            mode="exclusive",
+            start=60,
+            length=10,
+            alarm_after=0.2,
+        )
         interrupted = interruptee.read_event("INTERRUPTED", timeout=self.args.child_timeout)
         interrupt_waiter_rc = interruptee.wait()
         interrupt_holder_rc = interrupt_holder.release()
-        _expect(interrupt_waiter_rc == 0 and interrupted.get("interrupted") is True, "SETLKW waiter reports signal interruption", interrupted)
+        _expect(
+            interrupt_waiter_rc == 0 and interrupted.get("interrupted") is True,
+            "SETLKW waiter reports signal interruption",
+            interrupted,
+        )
         _expect(interrupt_holder_rc == 0, "interrupt holder exits cleanly", {"returncode": interrupt_holder_rc})
         return {
-            "wake": {"ready": ready, "waiting": waiting, "acquired": acquired, "holder_returncode": holder_rc, "waiter_returncode": waiter_rc},
-            "interrupt": {"ready": interrupt_ready, "interrupted": interrupted, "holder_returncode": interrupt_holder_rc, "waiter_returncode": interrupt_waiter_rc},
+            "wake": {
+                "ready": ready,
+                "waiting": waiting,
+                "acquired": acquired,
+                "holder_returncode": holder_rc,
+                "waiter_returncode": waiter_rc,
+            },
+            "interrupt": {
+                "ready": interrupt_ready,
+                "interrupted": interrupted,
+                "holder_returncode": interrupt_holder_rc,
+                "waiter_returncode": interrupt_waiter_rc,
+            },
         }
 
     def test_any_fd_close_releases_posix(self) -> dict[str, Any]:
-        holder = self.start_worker("A-fcntl-close-other", "A", "fcntl_close_other_then_hold", self.path_a, mode="exclusive", start=80, length=10)
+        holder = self.start_worker(
+            "A-fcntl-close-other",
+            "A",
+            "fcntl_close_other_then_hold",
+            self.path_a,
+            mode="exclusive",
+            start=80,
+            length=10,
+        )
         ready = holder.read_event("READY")
         acquired = self.event(self.run_cmd("B", "try_fcntl", self.path_b, mode="exclusive", start=80, length=10))
         rc = holder.release()
@@ -760,24 +1009,42 @@ class CrossProbe:
         dup = self.start_worker("A-flock-dup", "A", "flock_dup_close_then_hold", self.path_a, mode="exclusive")
         dup_ready = dup.read_event("READY")
         conflict = self.event(self.run_cmd("B", "try_flock", self.path_b, mode="exclusive"))
-        fcntl_independent = self.event(self.run_cmd("B", "try_fcntl", self.path_b, mode="exclusive", start=120, length=10))
+        fcntl_independent = self.event(
+            self.run_cmd("B", "try_fcntl", self.path_b, mode="exclusive", start=120, length=10)
+        )
         dup_rc = dup.release()
         after = self.event(self.run_cmd("B", "try_flock", self.path_b, mode="exclusive"))
         _expect(conflict.get("ok") is False, "flock survives closing original fd while duplicate remains", conflict)
         _expect(_flock_conflict_errno_ok(conflict.get("errno")), "flock conflict errno is EAGAIN/EWOULDBLOCK", conflict)
-        _expect(fcntl_independent.get("ok") is True, "POSIX fcntl lock remains independent of BSD flock", fcntl_independent)
+        _expect(
+            fcntl_independent.get("ok") is True, "POSIX fcntl lock remains independent of BSD flock", fcntl_independent
+        )
         _expect(after.get("ok") is True, "flock releases after final duplicate fd closes", after)
         _expect(dup_rc == 0, "flock dup holder exits cleanly", {"returncode": dup_rc})
 
-        posix = self.start_worker("A-posix-independence", "A", "hold_fcntl", self.path_a, mode="exclusive", start=140, length=10)
+        posix = self.start_worker(
+            "A-posix-independence", "A", "hold_fcntl", self.path_a, mode="exclusive", start=140, length=10
+        )
         posix_ready = posix.read_event("READY")
         flock_independent = self.event(self.run_cmd("B", "try_flock", self.path_b, mode="exclusive"))
         posix_rc = posix.release()
-        _expect(flock_independent.get("ok") is True, "BSD flock remains independent of POSIX fcntl locks", flock_independent)
+        _expect(
+            flock_independent.get("ok") is True, "BSD flock remains independent of POSIX fcntl locks", flock_independent
+        )
         _expect(posix_rc == 0, "POSIX independence holder exits cleanly", {"returncode": posix_rc})
         return {
-            "flock_dup": {"ready": dup_ready, "conflict": conflict, "fcntl_independent": fcntl_independent, "after_final_close": after, "returncode": dup_rc},
-            "posix_independence": {"ready": posix_ready, "flock_independent": flock_independent, "returncode": posix_rc},
+            "flock_dup": {
+                "ready": dup_ready,
+                "conflict": conflict,
+                "fcntl_independent": fcntl_independent,
+                "after_final_close": after,
+                "returncode": dup_rc,
+            },
+            "posix_independence": {
+                "ready": posix_ready,
+                "flock_independent": flock_independent,
+                "returncode": posix_rc,
+            },
         }
 
     def test_rename_unlink_open_inode_recreated_path(self) -> dict[str, Any]:
@@ -793,20 +1060,46 @@ class CrossProbe:
         )
         ready = holder.read_event("READY")
         new_path = self.event(self.run_cmd("B", "try_fcntl", self.path_b, mode="exclusive", start=180, length=10))
-        renamed_path = self.event(self.run_cmd("B", "try_fcntl", self.renamed_b, mode="exclusive", start=180, length=10))
+        renamed_path = self.event(
+            self.run_cmd("B", "try_fcntl", self.renamed_b, mode="exclusive", start=180, length=10)
+        )
         holder.send("unlink")
         unlinked = holder.read_event("UNLINKED")
-        recreated_after_unlink = self.event(self.run_cmd("B", "try_fcntl", self.path_b, mode="exclusive", start=180, length=10))
+        recreated_after_unlink = self.event(
+            self.run_cmd("B", "try_fcntl", self.path_b, mode="exclusive", start=180, length=10)
+        )
         holder_rc = holder.release()
-        _expect(new_path.get("ok") is True, "recreated path is a new inode and does not inherit old open-inode lock", new_path)
-        _expect(renamed_path.get("ok") is False, "renamed path still names locked open inode before unlink", renamed_path)
-        _expect(recreated_after_unlink.get("ok") is True, "recreated path remains independent after locked inode is unlinked", recreated_after_unlink)
-        _expect(holder_rc == 0, "rename/unlink holder exits cleanly", {"returncode": holder_rc, "stderr": holder.stderr})
-        return {"ready": ready, "new_path": new_path, "renamed_path": renamed_path, "unlinked": unlinked, "recreated_after_unlink": recreated_after_unlink}
+        _expect(
+            new_path.get("ok") is True,
+            "recreated path is a new inode and does not inherit old open-inode lock",
+            new_path,
+        )
+        _expect(
+            renamed_path.get("ok") is False, "renamed path still names locked open inode before unlink", renamed_path
+        )
+        _expect(
+            recreated_after_unlink.get("ok") is True,
+            "recreated path remains independent after locked inode is unlinked",
+            recreated_after_unlink,
+        )
+        _expect(
+            holder_rc == 0, "rename/unlink holder exits cleanly", {"returncode": holder_rc, "stderr": holder.stderr}
+        )
+        return {
+            "ready": ready,
+            "new_path": new_path,
+            "renamed_path": renamed_path,
+            "unlinked": unlinked,
+            "recreated_after_unlink": recreated_after_unlink,
+        }
 
     def test_readonly_fd_write_lock_ebadf(self) -> dict[str, Any]:
         result = self.event(self.run_cmd("B", "try_readonly_write_lock", self.path_b, start=220, length=10))
-        _expect(result.get("ok") is False and result.get("errno") == LINUX_EBADF, "write lock through readonly fd fails with EBADF", result)
+        _expect(
+            result.get("ok") is False and result.get("errno") == LINUX_EBADF,
+            "write lock through readonly fd fails with EBADF",
+            result,
+        )
         return {"readonly_write_lock": result}
 
     def run(self) -> None:
@@ -831,7 +1124,12 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command")
 
     host = sub.add_parser("host", help="orchestrate two worker command prefixes")
-    host.add_argument("--worker-a-json", required=True, type=_json_argv, help="JSON argv prefix for worker A, for example [\"python3\",\".../locks_cross.py\"]")
+    host.add_argument(
+        "--worker-a-json",
+        required=True,
+        type=_json_argv,
+        help='JSON argv prefix for worker A, for example ["python3",".../locks_cross.py"]',
+    )
     host.add_argument("--worker-b-json", required=True, type=_json_argv, help="JSON argv prefix for worker B")
     host.add_argument("--path-a", required=True, help="worker A path for the logical test file")
     host.add_argument("--path-b", required=True, help="worker B path for the same logical test file")
@@ -843,13 +1141,29 @@ def build_parser() -> argparse.ArgumentParser:
     host.add_argument("--peer-request-timeout", type=float, default=DEFAULT_PEER_REQUEST_TIMEOUT_SECONDS)
     host.add_argument("--peer-request-timeout-source", default="default common transport gRPC request timeout")
     host.add_argument("--min-wait-seconds", type=float, default=DEFAULT_MIN_WAIT_SECONDS)
-    host.add_argument("--worker-a-process-pid-file", action="append", type=_parse_named_path, default=[], metavar="ROLE=PID_FILE")
-    host.add_argument("--worker-b-process-pid-file", action="append", type=_parse_named_path, default=[], metavar="ROLE=PID_FILE")
-    host.add_argument("--worker-a-meta-process-pid-file", action="append", type=_parse_named_path, default=[], metavar="ROLE=PID_FILE")
-    host.add_argument("--worker-b-meta-process-pid-file", action="append", type=_parse_named_path, default=[], metavar="ROLE=PID_FILE")
+    host.add_argument(
+        "--worker-a-process-pid-file", action="append", type=parse_named_path, default=[], metavar="ROLE=PID_FILE"
+    )
+    host.add_argument(
+        "--worker-b-process-pid-file", action="append", type=parse_named_path, default=[], metavar="ROLE=PID_FILE"
+    )
+    host.add_argument(
+        "--worker-a-meta-process-pid-file", action="append", type=parse_named_path, default=[], metavar="ROLE=PID_FILE"
+    )
+    host.add_argument(
+        "--worker-b-meta-process-pid-file", action="append", type=parse_named_path, default=[], metavar="ROLE=PID_FILE"
+    )
     host.add_argument("--keep-fixture", action="store_true")
-    host.add_argument("--require-cross-mount", action="store_true", help="fail unless workers are different-kernel cross-mount evidence")
-    host.add_argument("--allow-host-non-linux", action="store_true", help="allow macOS host orchestration; workers must still be Linux")
+    host.add_argument(
+        "--require-cross-mount",
+        action="store_true",
+        help="fail unless workers are different-kernel cross-mount evidence",
+    )
+    host.add_argument(
+        "--allow-host-non-linux",
+        action="store_true",
+        help="allow macOS host orchestration; workers must still be Linux",
+    )
 
     worker = sub.add_parser("worker", help=argparse.SUPPRESS)
     worker.add_argument("--op", required=True)
@@ -859,8 +1173,12 @@ def build_parser() -> argparse.ArgumentParser:
     worker.add_argument("--start", type=int, default=0)
     worker.add_argument("--length", type=int, default=10)
     worker.add_argument("--alarm-after", type=float, default=0.0)
-    worker.add_argument("--process-pid-file", action="append", type=_parse_named_path, default=[], metavar="ROLE=PID_FILE")
-    worker.add_argument("--meta-process-pid-file", action="append", type=_parse_named_path, default=[], metavar="ROLE=PID_FILE")
+    worker.add_argument(
+        "--process-pid-file", action="append", type=parse_named_path, default=[], metavar="ROLE=PID_FILE"
+    )
+    worker.add_argument(
+        "--meta-process-pid-file", action="append", type=parse_named_path, default=[], metavar="ROLE=PID_FILE"
+    )
     return parser
 
 
@@ -869,7 +1187,14 @@ def main(argv: list[str]) -> int:
     args = parser.parse_args(argv)
     if args.command == "worker":
         if platform.system() != "Linux":
-            _emit({"event": "ERROR", "op": args.op, "message": "locks_cross worker requires Linux", "identity": {"platform": platform.system()}})
+            _emit(
+                {
+                    "event": "ERROR",
+                    "op": args.op,
+                    "message": "locks_cross worker requires Linux",
+                    "identity": {"platform": platform.system()},
+                }
+            )
             return 1
         return _worker_main(args)
     if args.command != "host":
@@ -880,19 +1205,30 @@ def main(argv: list[str]) -> int:
         probe.setup()
         probe.run()
     except Exception as exc:  # noqa: BLE001
-        probe.failures.append({
-            "name": "setup_or_runner",
-            "started_at": _now(),
-            "ok": False,
-            "exception": type(exc).__name__,
-            "message": str(exc),
-            "traceback": traceback.format_exc(),
-        })
+        probe.failures.append(
+            {
+                "name": "setup_or_runner",
+                "started_at": _now(),
+                "ok": False,
+                "exception": type(exc).__name__,
+                "message": str(exc),
+                "traceback": traceback.format_exc(),
+            }
+        )
     finally:
         probe.cleanup()
         probe.write_report()
     status = "PASS" if not probe.failures else "FAIL"
-    print(f"status={status} cross_mount_qualified={probe.identity.get('cross_mount_qualified', False)} evidence={probe.evidence}")
+    print(
+        (
+            f"status="
+            f"{status}"
+            f" cross_mount_qualified="
+            f"{probe.identity.get('cross_mount_qualified', False)}"
+            f" evidence="
+            f"{probe.evidence}"
+        )
+    )
     return 0 if not probe.failures else 1
 
 

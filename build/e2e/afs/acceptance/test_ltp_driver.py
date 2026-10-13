@@ -9,8 +9,8 @@ import sys
 import tempfile
 import textwrap
 import unittest
-from unittest import mock
 from pathlib import Path
+from unittest import mock
 
 DRIVER = Path(__file__).resolve().parent / "drivers" / "ltp.py"
 
@@ -179,21 +179,29 @@ class LtpDriverPureTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="afs-ltp-manifest-") as tmp:
             manifest = Path(tmp) / "manifest.json"
             manifest.write_text(
-                json.dumps({
-                    "binding": {
-                        "suite_revision": "suite-a",
-                        "expanded_tsv_sha256": "tsv-a",
-                        "machine": "x86_64",
-                        "kernel_release": "6.8.0-142-generic",
-                    },
-                    "entries": [{
-                        "test_id": "t001",
-                        "event_match": {"status": "TCONF", "source": "feature.c:10", "message_regex": "missing feature"},
-                        "scope": "kernel-feature",
-                        "disposition": "pre_reviewed_not_applicable",
-                        "rationale": "synthetic event",
-                    }],
-                }),
+                json.dumps(
+                    {
+                        "binding": {
+                            "suite_revision": "suite-a",
+                            "expanded_tsv_sha256": "tsv-a",
+                            "machine": "x86_64",
+                            "kernel_release": "6.8.0-142-generic",
+                        },
+                        "entries": [
+                            {
+                                "test_id": "t001",
+                                "event_match": {
+                                    "status": "TCONF",
+                                    "source": "feature.c:10",
+                                    "message_regex": "missing feature",
+                                },
+                                "scope": "kernel-feature",
+                                "disposition": "pre_reviewed_not_applicable",
+                                "rationale": "synthetic event",
+                            }
+                        ],
+                    }
+                ),
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(RuntimeError, "machine mismatch"):
@@ -209,22 +217,30 @@ class LtpDriverPureTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="afs-ltp-manifest-") as tmp:
             manifest = Path(tmp) / "manifest.json"
             manifest.write_text(
-                json.dumps({
-                    "binding": {
-                        "suite_revision": "suite-a",
-                        "expanded_tsv_sha256": "tsv-a",
-                        "machine": "aarch64",
-                        "kernel_release": "6.8.0-142-generic",
-                    },
-                    "policy": {"raw_commands_required": 657},
-                    "entries": [{
-                        "test_id": "t001",
-                        "event_match": {"status": "TCONF", "source": "feature.c:10", "message_regex": "missing feature"},
-                        "scope": "kernel-feature",
-                        "disposition": "pre_reviewed_not_applicable",
-                        "rationale": "synthetic event",
-                    }],
-                }),
+                json.dumps(
+                    {
+                        "binding": {
+                            "suite_revision": "suite-a",
+                            "expanded_tsv_sha256": "tsv-a",
+                            "machine": "aarch64",
+                            "kernel_release": "6.8.0-142-generic",
+                        },
+                        "policy": {"raw_commands_required": 657},
+                        "entries": [
+                            {
+                                "test_id": "t001",
+                                "event_match": {
+                                    "status": "TCONF",
+                                    "source": "feature.c:10",
+                                    "message_regex": "missing feature",
+                                },
+                                "scope": "kernel-feature",
+                                "disposition": "pre_reviewed_not_applicable",
+                                "rationale": "synthetic event",
+                            }
+                        ],
+                    }
+                ),
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(RuntimeError, "raw_commands_required mismatch"):
@@ -233,12 +249,22 @@ class LtpDriverPureTests(unittest.TestCase):
     def test_tfail_remains_blocking_even_with_applicability_enabled(self):
         driver = load_driver_module()
         app = driver.apply_applicability(
-            [{
-                "index": 1,
-                "test_id": "t001",
-                "ltp_event_counts": {"TPASS": 0, "TFAIL": 1},
-                "ltp_events": [{"line": 1, "status": "TFAIL", "source": "feature.c:10", "message": "actual failure", "raw": "feature.c:10: TFAIL: actual failure"}],
-            }],
+            [
+                {
+                    "index": 1,
+                    "test_id": "t001",
+                    "ltp_event_counts": {"TPASS": 0, "TFAIL": 1},
+                    "ltp_events": [
+                        {
+                            "line": 1,
+                            "status": "TFAIL",
+                            "source": "feature.c:10",
+                            "message": "actual failure",
+                            "raw": "feature.c:10: TFAIL: actual failure",
+                        }
+                    ],
+                }
+            ],
             {"path": "manifest.json", "sha256": "synthetic", "binding": {}, "entries": []},
         )
         self.assertEqual(app["status"], "BLOCKED")
@@ -252,28 +278,44 @@ class LtpDriverPureTests(unittest.TestCase):
             "sha256": "synthetic",
             "binding": {},
             "policy": {"reference_only_scopes": ["alternateFS-check"]},
-            "entries": [{
-                "id": "fallocate04:tconf",
-                "test_id": "fallocate04",
-                "status": "TCONF",
-                "source": "fallocate04.c:92",
-                "message_regex": "fallocate\\(\\) not supported",
-                "scope": "alternateFS-check",
-                "disposition": "pre_reviewed_not_applicable",
-                "rationale": "reference ext4 subcase context only",
-                "ordinary_subtests_required": True,
-                "ordinary_coverage_link": None,
-            }],
-        }
-        command_records = [{
-            "index": 1,
-            "test_id": "fallocate04",
-            "ltp_event_counts": {"TPASS": 1, "TCONF": 1},
-            "ltp_events": [
-                {"line": 1, "status": "TPASS", "source": "fallocate04.c:80", "message": "ordinary path ok", "raw": "fallocate04 1 TPASS: ordinary path ok"},
-                {"line": 2, "status": "TCONF", "source": "fallocate04.c:92", "message": "fallocate() not supported", "raw": "fallocate04.c:92: TCONF: fallocate() not supported"},
+            "entries": [
+                {
+                    "id": "fallocate04:tconf",
+                    "test_id": "fallocate04",
+                    "status": "TCONF",
+                    "source": "fallocate04.c:92",
+                    "message_regex": "fallocate\\(\\) not supported",
+                    "scope": "alternateFS-check",
+                    "disposition": "pre_reviewed_not_applicable",
+                    "rationale": "reference ext4 subcase context only",
+                    "ordinary_subtests_required": True,
+                    "ordinary_coverage_link": None,
+                }
             ],
-        }]
+        }
+        command_records = [
+            {
+                "index": 1,
+                "test_id": "fallocate04",
+                "ltp_event_counts": {"TPASS": 1, "TCONF": 1},
+                "ltp_events": [
+                    {
+                        "line": 1,
+                        "status": "TPASS",
+                        "source": "fallocate04.c:80",
+                        "message": "ordinary path ok",
+                        "raw": "fallocate04 1 TPASS: ordinary path ok",
+                    },
+                    {
+                        "line": 2,
+                        "status": "TCONF",
+                        "source": "fallocate04.c:92",
+                        "message": "fallocate() not supported",
+                        "raw": "fallocate04.c:92: TCONF: fallocate() not supported",
+                    },
+                ],
+            }
+        ]
         reference_app = driver.apply_applicability(command_records, manifest, {"product": {"backend": "reference"}})
         self.assertEqual(reference_app["status"], "PASS", reference_app)
         self.assertEqual(reference_app["pre_reviewed_event_count"], 1)
@@ -281,7 +323,9 @@ class LtpDriverPureTests(unittest.TestCase):
         self.assertEqual(product_app["status"], "BLOCKED")
         self.assertEqual(product_app["pre_reviewed_event_count"], 0)
         self.assertEqual(product_app["target_context_failure_count"], 1)
-        self.assertIn("pre-reviewed reference filesystem events cannot waive product backend results", product_app["errors"])
+        self.assertIn(
+            "pre-reviewed reference filesystem events cannot waive product backend results", product_app["errors"]
+        )
 
     def test_reference_only_missing_events_do_not_block_product_backend_pass(self):
         driver = load_driver_module()
@@ -290,18 +334,20 @@ class LtpDriverPureTests(unittest.TestCase):
             "sha256": "synthetic",
             "binding": {},
             "policy": {"reference_only_scopes": ["alternateFS-check"]},
-            "entries": [{
-                "id": "fallocate04:tconf",
-                "test_id": "fallocate04",
-                "status": "TCONF",
-                "source": "fallocate04.c:92",
-                "message_regex": "fallocate\\(\\) not supported",
-                "scope": "alternateFS-check",
-                "disposition": "pre_reviewed_not_applicable",
-                "rationale": "reference ext4 subcase context only",
-                "ordinary_subtests_required": True,
-                "ordinary_coverage_link": None,
-            }],
+            "entries": [
+                {
+                    "id": "fallocate04:tconf",
+                    "test_id": "fallocate04",
+                    "status": "TCONF",
+                    "source": "fallocate04.c:92",
+                    "message_regex": "fallocate\\(\\) not supported",
+                    "scope": "alternateFS-check",
+                    "disposition": "pre_reviewed_not_applicable",
+                    "rationale": "reference ext4 subcase context only",
+                    "ordinary_subtests_required": True,
+                    "ordinary_coverage_link": None,
+                }
+            ],
         }
         app = driver.apply_applicability(
             [{"index": 1, "test_id": "fallocate04", "ltp_event_counts": {"TPASS": 1}, "ltp_events": []}],
@@ -318,18 +364,20 @@ class LtpDriverPureTests(unittest.TestCase):
             "sha256": "synthetic",
             "binding": {},
             "policy": {"reference_only_scopes": ["alternateFS-check"]},
-            "entries": [{
-                "id": "fcntl40:tconf",
-                "test_id": "fcntl40",
-                "status": "TCONF",
-                "source": "tst_test.c:1080",
-                "message_regex": "requires kernel 6\\.12",
-                "scope": "irrelevantkernel",
-                "disposition": "pre_reviewed_not_applicable",
-                "rationale": "kernel version is independent of filesystem backend",
-                "ordinary_subtests_required": False,
-                "ordinary_coverage_link": None,
-            }],
+            "entries": [
+                {
+                    "id": "fcntl40:tconf",
+                    "test_id": "fcntl40",
+                    "status": "TCONF",
+                    "source": "tst_test.c:1080",
+                    "message_regex": "requires kernel 6\\.12",
+                    "scope": "irrelevantkernel",
+                    "disposition": "pre_reviewed_not_applicable",
+                    "rationale": "kernel version is independent of filesystem backend",
+                    "ordinary_subtests_required": False,
+                    "ordinary_coverage_link": None,
+                }
+            ],
         }
         app = driver.apply_applicability(
             [{"index": 1, "test_id": "fcntl40", "ltp_event_counts": {"TPASS": 1}, "ltp_events": []}],
@@ -360,8 +408,14 @@ class LtpDriverPureTests(unittest.TestCase):
             policy = driver.load_timeout_policy(policy_path, identity, selected, 120)
             self.assertEqual(policy["sha256"], hashlib.sha256(policy_path.read_bytes()).hexdigest())
             self.assertEqual(policy["size_bytes"], policy_path.stat().st_size)
-        self.assertEqual(driver.command_timeouts("gf16", 120, policy), {"exec_timeout_seconds": 180, "suite_timeout_seconds": 240, "source": "timeout-policy"})
-        self.assertEqual(driver.command_timeouts("plain01", 120, policy), {"exec_timeout_seconds": 120, "suite_timeout_seconds": 240, "source": "default"})
+        self.assertEqual(
+            driver.command_timeouts("gf16", 120, policy),
+            {"exec_timeout_seconds": 180, "suite_timeout_seconds": 240, "source": "timeout-policy"},
+        )
+        self.assertEqual(
+            driver.command_timeouts("plain01", 120, policy),
+            {"exec_timeout_seconds": 120, "suite_timeout_seconds": 240, "source": "default"},
+        )
 
     def test_timeout_policy_rejects_binding_mismatch_duplicate_and_unknown_ids(self):
         driver = load_driver_module()
@@ -385,7 +439,13 @@ class LtpDriverPureTests(unittest.TestCase):
                     ],
                 },
             )
-            with self.assertRaisesRegex(RuntimeError, "machine mismatch.*duplicate timeout policy test_id 'gf16'.*unknown timeout policy test_id 'missing01'"):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                (
+                    "machine mismatch.*duplicate timeout policy test_id "
+                    "'gf16'.*unknown timeout policy test_id 'missing01'"
+                ),
+            ):
                 driver.load_timeout_policy(policy_path, identity, selected, 120)
 
     def test_timeout_policy_rejects_unbounded_or_non_integer_budgets(self):
@@ -411,7 +471,9 @@ class LtpDriverPureTests(unittest.TestCase):
                     ],
                 },
             )
-            with self.assertRaisesRegex(RuntimeError, "below per-test baseline 120.*below baseline 240.*must be greater.*positive integer"):
+            with self.assertRaisesRegex(
+                RuntimeError, "below per-test baseline 120.*below baseline 240.*must be greater.*positive integer"
+            ):
                 driver.load_timeout_policy(policy_path, identity, selected, 120)
 
     def test_timeout_policy_rejects_duplicate_json_object_keys(self):
@@ -421,7 +483,11 @@ class LtpDriverPureTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="afs-ltp-timeout-policy-") as tmp:
             policy_path = Path(tmp) / "timeout-policy.json"
             policy_path.write_text(
-                '{"schema":1,"binding":{"suite_revision":"suite-a","suite_revision":"suite-b","expanded_tsv_sha256":"tsv-a","machine":"aarch64","kernel_release":"6.8.0-142-generic"},"timeouts":[]}',
+                (
+                    '{"schema":1,"binding":{"suite_revision":"suite-a","suite_revisio'
+                    'n":"suite-b","expanded_tsv_sha256":"tsv-a","machine":"aarch64","'
+                    'kernel_release":"6.8.0-142-generic"},"timeouts":[]}'
+                ),
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(RuntimeError, "duplicate JSON object key 'suite_revision'"):
@@ -433,7 +499,17 @@ class LtpDriverTests(unittest.TestCase):
         if platform.system() != "Linux":
             self.skipTest("LTP driver self-tests run in Linux so findmnt/proc semantics match acceptance")
 
-    def run_driver(self, outcomes: dict[str, object], *, profile="full", max_tests: int | None = None, timeout=2, manifest_entries: list[dict] | None = None, timeout_entries: list[dict] | None = None, backend: str = "reference"):
+    def run_driver(
+        self,
+        outcomes: dict[str, object],
+        *,
+        profile="full",
+        max_tests: int | None = None,
+        timeout=2,
+        manifest_entries: list[dict] | None = None,
+        timeout_entries: list[dict] | None = None,
+        backend: str = "reference",
+    ):
         root = Path(tempfile.mkdtemp(prefix="afs-ltp-driver-test-"))
         self.addCleanup(lambda: subprocess.run(["rm", "-rf", str(root)], check=False))
         suite, install, tsv = write_fake_ltp(root, outcomes)
@@ -445,7 +521,9 @@ class LtpDriverTests(unittest.TestCase):
         manifest_path = None
         timeout_policy_path = None
         if manifest_entries is not None:
-            suite_head = subprocess.run(["git", "-C", str(suite), "rev-parse", "HEAD"], check=True, text=True, stdout=subprocess.PIPE).stdout.strip()
+            suite_head = subprocess.run(
+                ["git", "-C", str(suite), "rev-parse", "HEAD"], check=True, text=True, stdout=subprocess.PIPE
+            ).stdout.strip()
             manifest = {
                 "binding": {
                     "suite_revision": suite_head,
@@ -458,7 +536,9 @@ class LtpDriverTests(unittest.TestCase):
             manifest_path = root / "applicability-manifest.json"
             manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
         if timeout_entries is not None:
-            suite_head = subprocess.run(["git", "-C", str(suite), "rev-parse", "HEAD"], check=True, text=True, stdout=subprocess.PIPE).stdout.strip()
+            suite_head = subprocess.run(
+                ["git", "-C", str(suite), "rev-parse", "HEAD"], check=True, text=True, stdout=subprocess.PIPE
+            ).stdout.strip()
             timeout_policy = {
                 "schema": 1,
                 "binding": {
@@ -506,13 +586,25 @@ class LtpDriverTests(unittest.TestCase):
         if timeout_policy_path is not None:
             argv.extend(["--timeout-policy", str(timeout_policy_path)])
         env = os.environ.copy()
-        proc = subprocess.run(argv, shell=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, check=False)
+        proc = subprocess.run(
+            argv, shell=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, check=False
+        )
         lines = [line for line in proc.stdout.splitlines() if line.strip()]
         self.assertTrue(lines, proc.stderr)
         return proc, json.loads(lines[-1]), run_dir
 
     def test_all_pass_can_pass_smoke(self):
-        proc, proof, run_dir = self.run_driver({"open01": "PASS", "read01": "PASS", "write01": "PASS", "stat01": "PASS", "chmod01": "PASS", "fcntl14": "PASS"}, profile="smoke")
+        proc, proof, run_dir = self.run_driver(
+            {
+                "open01": "PASS",
+                "read01": "PASS",
+                "write01": "PASS",
+                "stat01": "PASS",
+                "chmod01": "PASS",
+                "fcntl14": "PASS",
+            },
+            profile="smoke",
+        )
         self.assertEqual(proc.returncode, 0, proof)
         self.assertEqual(proof["status"], "PASS")
         self.assertEqual(proof["accounting"]["result_counts"]["PASS"], 6)
@@ -522,7 +614,18 @@ class LtpDriverTests(unittest.TestCase):
         self.assertTrue(commands.exists())
 
     def test_fake_product_label_on_ext4_is_blocked(self):
-        proc, proof, _run_dir = self.run_driver({"open01": "PASS", "read01": "PASS", "write01": "PASS", "stat01": "PASS", "chmod01": "PASS", "fcntl14": "PASS"}, profile="smoke", backend="dfs")
+        proc, proof, _run_dir = self.run_driver(
+            {
+                "open01": "PASS",
+                "read01": "PASS",
+                "write01": "PASS",
+                "stat01": "PASS",
+                "chmod01": "PASS",
+                "fcntl14": "PASS",
+            },
+            profile="smoke",
+            backend="dfs",
+        )
         self.assertNotEqual(proc.returncode, 0)
         self.assertEqual(proof["status"], "BLOCKED")
         target_check = next(check for check in proof["checks"] if check["name"] == "target-identity")
@@ -539,7 +642,9 @@ class LtpDriverTests(unittest.TestCase):
         self.assertEqual(proof["accounting"]["incomplete"], 655)
 
     def test_failure_is_fail_and_keeps_raw_output(self):
-        proc, proof, run_dir = self.run_driver({f"t{i:03d}": ("FAIL" if i == 1 else "PASS") for i in range(657)}, profile="full")
+        proc, proof, run_dir = self.run_driver(
+            {f"t{i:03d}": ("FAIL" if i == 1 else "PASS") for i in range(657)}, profile="full"
+        )
         self.assertNotEqual(proc.returncode, 0)
         self.assertEqual(proof["status"], "FAIL")
         self.assertIn("FAIL", proof["reason"])
@@ -548,7 +653,9 @@ class LtpDriverTests(unittest.TestCase):
         self.assertTrue(any("TFAIL" in path.read_text(errors="replace") for path in command_logs))
 
     def test_tconf_blocks_uncurated_acceptance(self):
-        proc, proof, _run_dir = self.run_driver({f"t{i:03d}": ("TCONF" if i == 1 else "PASS") for i in range(657)}, profile="full")
+        proc, proof, _run_dir = self.run_driver(
+            {f"t{i:03d}": ("TCONF" if i == 1 else "PASS") for i in range(657)}, profile="full"
+        )
         self.assertNotEqual(proc.returncode, 0)
         self.assertEqual(proof["status"], "BLOCKED")
         self.assertIn("TCONF", proof["reason"])
@@ -559,7 +666,11 @@ class LtpDriverTests(unittest.TestCase):
         outcomes["t001"] = {"result": "TCONF", "lines": ["feature.c:10: TCONF: optional feature unavailable"]}
         entry = {
             "test_id": "t001",
-            "event_match": {"status": "TCONF", "source": "feature.c:10", "message_regex": "optional feature unavailable"},
+            "event_match": {
+                "status": "TCONF",
+                "source": "feature.c:10",
+                "message_regex": "optional feature unavailable",
+            },
             "scope": "kernel-feature",
             "disposition": "pre_reviewed_not_applicable",
             "rationale": "synthetic feature is outside the required ordinary path",
@@ -578,7 +689,11 @@ class LtpDriverTests(unittest.TestCase):
         outcomes["t001"] = {"result": "TCONF", "lines": ["feature.c:10: TCONF: optional feature unavailable"]}
         entry = {
             "test_id": "t001",
-            "event_match": {"status": "TCONF", "source": "feature.c:11", "message_regex": "optional feature unavailable"},
+            "event_match": {
+                "status": "TCONF",
+                "source": "feature.c:11",
+                "message_regex": "optional feature unavailable",
+            },
             "scope": "kernel-feature",
             "disposition": "pre_reviewed_not_applicable",
             "rationale": "wrong source line should not match",
@@ -604,7 +719,10 @@ class LtpDriverTests(unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0)
         self.assertEqual(proof["status"], "BLOCKED")
         self.assertEqual(proof["applicability"]["ordinary_coverage_failure_count"], 1)
-        outcomes["t001"] = {"result": "TBROK", "lines": ["t001 1 TPASS: ordinary path ok", "feature.c:12: TBROK: alternate fs broke"]}
+        outcomes["t001"] = {
+            "result": "TBROK",
+            "lines": ["t001 1 TPASS: ordinary path ok", "feature.c:12: TBROK: alternate fs broke"],
+        }
         proc, proof, _run_dir = self.run_driver(outcomes, profile="full", manifest_entries=[entry])
         self.assertEqual(proc.returncode, 0, proof)
         self.assertEqual(proof["status"], "PASS")
@@ -613,7 +731,11 @@ class LtpDriverTests(unittest.TestCase):
         outcomes = {f"t{i:03d}": "PASS" for i in range(657)}
         entry = {
             "test_id": "t001",
-            "event_match": {"status": "TCONF", "source": "feature.c:10", "message_regex": "optional feature unavailable"},
+            "event_match": {
+                "status": "TCONF",
+                "source": "feature.c:10",
+                "message_regex": "optional feature unavailable",
+            },
             "scope": "kernel-feature",
             "disposition": "pre_reviewed_not_applicable",
             "rationale": "disappearing expected events must be reviewed",
@@ -642,7 +764,10 @@ class LtpDriverTests(unittest.TestCase):
         self.assertEqual(proof["status"], "PASS")
         self.assertEqual(proof["accounting"]["result_counts"]["PASS"], 5)
         self.assertTrue(proof["timeout_policy"]["enabled"])
-        self.assertEqual(proof["timeout_policy"]["timeouts"]["writev03"], {"exec_timeout_seconds": 1200, "suite_timeout_seconds": 1320})
+        self.assertEqual(
+            proof["timeout_policy"]["timeouts"]["writev03"],
+            {"exec_timeout_seconds": 1200, "suite_timeout_seconds": 1320},
+        )
         timeout_check = next(check for check in proof["checks"] if check["name"] == "timeout-policy")
         self.assertEqual(timeout_check["status"], "PASS")
         self.assertEqual(timeout_check["evidence"]["sha256"], proof["timeout_policy"]["sha256"])
@@ -651,19 +776,49 @@ class LtpDriverTests(unittest.TestCase):
         self.assertEqual(json.loads(normalized.read_text())["size_bytes"], proof["timeout_policy"]["size_bytes"])
         commands = json.loads((run_dir / "artifacts" / "std-02-ltp" / "commands.json").read_text())
         by_id = {command["test_id"]: command for command in commands}
-        self.assertEqual(by_id["gf16"]["timeout"], {"exec_timeout_seconds": 180, "suite_timeout_seconds": 240, "source": "timeout-policy", "process_timeout_seconds": 245})
-        self.assertEqual(by_id["writev03"]["timeout"], {"exec_timeout_seconds": 1200, "suite_timeout_seconds": 1320, "source": "timeout-policy", "process_timeout_seconds": 1325})
-        self.assertEqual(by_id["plain01"]["timeout"], {"exec_timeout_seconds": 120, "suite_timeout_seconds": 240, "source": "default", "process_timeout_seconds": 245})
-        gf16_command = json.loads((run_dir / "artifacts" / "std-02-ltp" / by_id["gf16"]["artifacts"]["command"]).read_text())
+        self.assertEqual(
+            by_id["gf16"]["timeout"],
+            {
+                "exec_timeout_seconds": 180,
+                "suite_timeout_seconds": 240,
+                "source": "timeout-policy",
+                "process_timeout_seconds": 245,
+            },
+        )
+        self.assertEqual(
+            by_id["writev03"]["timeout"],
+            {
+                "exec_timeout_seconds": 1200,
+                "suite_timeout_seconds": 1320,
+                "source": "timeout-policy",
+                "process_timeout_seconds": 1325,
+            },
+        )
+        self.assertEqual(
+            by_id["plain01"]["timeout"],
+            {
+                "exec_timeout_seconds": 120,
+                "suite_timeout_seconds": 240,
+                "source": "default",
+                "process_timeout_seconds": 245,
+            },
+        )
+        gf16_command = json.loads(
+            (run_dir / "artifacts" / "std-02-ltp" / by_id["gf16"]["artifacts"]["command"]).read_text()
+        )
         self.assertEqual(gf16_command["timeout"], by_id["gf16"]["timeout"])
         self.assertEqual(gf16_command["argv"][gf16_command["argv"].index("--exec-timeout") + 1], "180")
         self.assertEqual(gf16_command["argv"][gf16_command["argv"].index("--suite-timeout") + 1], "240")
-        writev03_command = json.loads((run_dir / "artifacts" / "std-02-ltp" / by_id["writev03"]["artifacts"]["command"]).read_text())
+        writev03_command = json.loads(
+            (run_dir / "artifacts" / "std-02-ltp" / by_id["writev03"]["artifacts"]["command"]).read_text()
+        )
         self.assertEqual(writev03_command["argv"][writev03_command["argv"].index("--exec-timeout") + 1], "1200")
         self.assertEqual(writev03_command["argv"][writev03_command["argv"].index("--suite-timeout") + 1], "1320")
 
     def test_timeout_is_blocked_and_counted(self):
-        proc, proof, _run_dir = self.run_driver({f"t{i:03d}": ("SLEEP" if i == 0 else "PASS") for i in range(657)}, profile="full", max_tests=1, timeout=1)
+        proc, proof, _run_dir = self.run_driver(
+            {f"t{i:03d}": ("SLEEP" if i == 0 else "PASS") for i in range(657)}, profile="full", max_tests=1, timeout=1
+        )
         self.assertNotEqual(proc.returncode, 0)
         self.assertEqual(proof["status"], "BLOCKED")
         self.assertGreaterEqual(proof["accounting"]["result_counts"]["TIMEOUT"], 1)

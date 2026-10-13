@@ -11,7 +11,6 @@ import time
 import unittest
 from pathlib import Path
 
-
 PROBE = Path(__file__).resolve().parent / "probes" / "locks_cross.py"
 
 
@@ -189,12 +188,33 @@ class LocksCrossTests(unittest.TestCase):
             temp = Path(temp_dir)
             fake = temp / "fake_worker.py"
             fake.write_text(
-                "import json, sys\n"
-                "args=sys.argv\n"
-                "op=args[args.index('--op')+1]\n"
-                "boot='boot-a' if '--path' in args and 'a.bin' in args[args.index('--path')+1] else 'boot-b'\n"
-                "event={'event':'RESULT','op':op,'identity':{'boot_id':boot,'product_processes':{'node':{'sha256':'0'*64}},'meta_processes':{'meta':{'sha256':'1'*64}},'mount':{'returncode':0,'stdout':json.dumps({'filesystems':[{'fstype':'ext4','source':'/dev/vda1','options':'rw'}]}),'stderr':''}},'stat':{'sha256':'same'}}\n"
-                "print(json.dumps(event))\n",
+                (
+                    "import json, sys\n"
+                    "\n"
+                    "args = sys.argv\n"
+                    'op = args[args.index("--op") + 1]\n'
+                    'boot = "boot-a" if "--path" in args and "a.bin" in args[args.inde'
+                    'x("--path") + 1] else "boot-b"\n'
+                    "event = {\n"
+                    '    "event": "RESULT",\n'
+                    '    "op": op,\n'
+                    '    "identity": {\n'
+                    '        "boot_id": boot,\n'
+                    '        "product_processes": {"node": {"sha256": "0" * 64}},\n'
+                    '        "meta_processes": {"meta": {"sha256": "1" * 64}},\n'
+                    '        "mount": {\n'
+                    '            "returncode": 0,\n'
+                    '            "stdout": json.dumps(\n'
+                    '                {"filesystems": [{"fstype": "ext4", "source": "/d'
+                    'ev/vda1", "options": "rw"}]}\n'
+                    "            ),\n"
+                    '            "stderr": "",\n'
+                    "        },\n"
+                    "    },\n"
+                    '    "stat": {"sha256": "same"},\n'
+                    "}\n"
+                    "print(json.dumps(event))\n"
+                ),
                 encoding="utf-8",
             )
             worker = json.dumps([sys.executable, str(fake)])
@@ -231,18 +251,48 @@ class LocksCrossTests(unittest.TestCase):
             temp = Path(temp_dir)
             fake = temp / "fake_enolck_worker.py"
             fake.write_text(
-                "import json, sys\n"
-                "op=sys.argv[sys.argv.index('--op')+1]\n"
-                "base={'identity':{'boot_id':'same','mount':{'returncode':0,'stdout':json.dumps({'filesystems':[{'fstype':'ext4','source':'/dev/vda1','options':'rw'}]}),'stderr':''}}}\n"
-                "if op in ('init','read_stat','identity'):\n"
-                "  print(json.dumps({'event':'RESULT','op':op,**base,'stat':{'sha256':'same'}})); sys.exit(0)\n"
-                "if op == 'hold_fcntl':\n"
-                "  print(json.dumps({'event':'READY','op':op,**base}), flush=True); sys.stdin.readline(); sys.exit(0)\n"
-                "if op == 'try_fcntl':\n"
-                "  print(json.dumps({'event':'RESULT','op':op,**base,'ok':False,'errno':37,'errno_name':'ENOLCK'})); sys.exit(1)\n"
-                "if op == 'getlk':\n"
-                "  print(json.dumps({'event':'RESULT','op':op,**base,'result':{'ok':True,'l_type':1}})); sys.exit(0)\n"
-                "print(json.dumps({'event':'RESULT','op':op,**base,'ok':True})); sys.exit(0)\n",
+                (
+                    "import json, sys\n"
+                    "\n"
+                    'op = sys.argv[sys.argv.index("--op") + 1]\n'
+                    "base = {\n"
+                    '    "identity": {\n'
+                    '        "boot_id": "same",\n'
+                    '        "mount": {\n'
+                    '            "returncode": 0,\n'
+                    '            "stdout": json.dumps(\n'
+                    '                {"filesystems": [{"fstype": "ext4", "source": "/d'
+                    'ev/vda1", "options": "rw"}]}\n'
+                    "            ),\n"
+                    '            "stderr": "",\n'
+                    "        },\n"
+                    "    }\n"
+                    "}\n"
+                    'if op in ("init", "read_stat", "identity"):\n'
+                    '    print(json.dumps({"event": "RESULT", "op": op, **base, "stat"'
+                    ': {"sha256": "same"}}))\n'
+                    "    sys.exit(0)\n"
+                    'if op == "hold_fcntl":\n'
+                    '    print(json.dumps({"event": "READY", "op": op, **base}), flush'
+                    "=True)\n"
+                    "    sys.stdin.readline()\n"
+                    "    sys.exit(0)\n"
+                    'if op == "try_fcntl":\n'
+                    "    print(\n"
+                    "        json.dumps(\n"
+                    '            {"event": "RESULT", "op": op, **base, "ok": False, "e'
+                    'rrno": 37, "errno_name": "ENOLCK"}\n'
+                    "        )\n"
+                    "    )\n"
+                    "    sys.exit(1)\n"
+                    'if op == "getlk":\n'
+                    '    print(json.dumps({"event": "RESULT", "op": op, **base, "resul'
+                    't": {"ok": True, "l_type": 1}}))\n'
+                    "    sys.exit(0)\n"
+                    'print(json.dumps({"event": "RESULT", "op": op, **base, "ok": True'
+                    "}))\n"
+                    "sys.exit(0)\n"
+                ),
                 encoding="utf-8",
             )
             worker = json.dumps([sys.executable, str(fake)])
@@ -278,9 +328,20 @@ class LocksCrossTests(unittest.TestCase):
             temp = Path(temp_dir)
             fake = temp / "fake_worker.py"
             fake.write_text(
-                "import json, sys\n"
-                "print(json.dumps({'event':'ERROR','op':sys.argv[sys.argv.index('--op')+1],'message':'controlled fake failure'}))\n"
-                "sys.exit(1)\n",
+                (
+                    "import json, sys\n"
+                    "\n"
+                    "print(\n"
+                    "    json.dumps(\n"
+                    "        {\n"
+                    '            "event": "ERROR",\n'
+                    '            "op": sys.argv[sys.argv.index("--op") + 1],\n'
+                    '            "message": "controlled fake failure",\n'
+                    "        }\n"
+                    "    )\n"
+                    ")\n"
+                    "sys.exit(1)\n"
+                ),
                 encoding="utf-8",
             )
             worker = json.dumps([sys.executable, str(fake)])

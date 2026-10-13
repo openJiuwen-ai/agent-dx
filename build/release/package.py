@@ -13,7 +13,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from package_manifest import AFS_BINARIES, BINARIES, verify as verify_manifest  # noqa: E402
+from package_manifest import AFS_BINARIES, BINARIES  # noqa: E402
+from package_manifest import verify as verify_manifest
 
 
 def sha(path):

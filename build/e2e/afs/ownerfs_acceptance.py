@@ -31,7 +31,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-
 DEFAULT_TIMEOUT = 20.0
 
 
@@ -99,8 +98,12 @@ class RemoteShell:
             )
             result = CmdResult(self.role, script, proc.returncode, proc.stdout, proc.stderr)
         except subprocess.TimeoutExpired as exc:
-            stdout = exc.stdout if isinstance(exc.stdout, str) else (exc.stdout or b"").decode("utf-8", errors="replace")
-            stderr = exc.stderr if isinstance(exc.stderr, str) else (exc.stderr or b"").decode("utf-8", errors="replace")
+            stdout = (
+                exc.stdout if isinstance(exc.stdout, str) else (exc.stdout or b"").decode("utf-8", errors="replace")
+            )
+            stderr = (
+                exc.stderr if isinstance(exc.stderr, str) else (exc.stderr or b"").decode("utf-8", errors="replace")
+            )
             result = CmdResult(self.role, script, 124, stdout, stderr + f"\ncommand timed out after {timeout}s")
         if check and result.returncode != 0:
             raise RunnerError(
@@ -166,7 +169,6 @@ class OwnerFsAcceptance:
             "gaps": [],
             "cleanup_errors": [],
         }
-
 
     def binary_args(self, role: str) -> str:
         parts: list[str] = []
@@ -255,11 +257,23 @@ class OwnerFsAcceptance:
                 f"test -x {shlex.quote(self.args.bin_dir)}/afs-meta",
                 f"test -x {shlex.quote(self.args.bin_dir)}/afs-node",
                 f"{shlex.quote(self.args.bin_dir)}/afs-meta --print-config {meta_extra} >/dev/null",
-                f"{shlex.quote(self.args.bin_dir)}/afs-node --print-config --fs ownerfs --ownerfs-mount /tmp/nonexistent {node_extra} >/dev/null",
+                (
+                    f"{shlex.quote(self.args.bin_dir)}"
+                    f"/afs-node --print-config --fs ownerfs --ownerfs-mount "
+                    f"/tmp/nonexistent "
+                    f"{node_extra}"
+                    f" >/dev/null"
+                ),
                 "command -v python3 >/dev/null",
             ]
             if role.role in ("A", "B"):
-                bin_checks.extend(["test -e /dev/fuse", "command -v fusermount3 >/dev/null || command -v fusermount >/dev/null", "command -v mountpoint >/dev/null"])
+                bin_checks.extend(
+                    [
+                        "test -e /dev/fuse",
+                        "command -v fusermount3 >/dev/null || command -v fusermount >/dev/null",
+                        "command -v mountpoint >/dev/null",
+                    ]
+                )
             role.run(" && ".join(bin_checks), timeout=20, check=True)
             detail[role.role] = {"kernel": linux, "bin_dir": self.args.bin_dir}
         if self.args.etcd_endpoint:
@@ -268,7 +282,12 @@ class OwnerFsAcceptance:
         elif self.args.allow_missing_etcd_for_scaffold:
             self.result["gaps"].append("no --etcd-endpoint supplied; MetaStore durability cannot be accepted")
         else:
-            raise RunnerError("--etcd-endpoint is required for OwnerFs acceptance; use --allow-missing-etcd-for-scaffold only for harness debugging")
+            raise RunnerError(
+                (
+                    "--etcd-endpoint is required for OwnerFs acceptance; use "
+                    "--allow-missing-etcd-for-scaffold only for harness debugging"
+                )
+            )
         if self.args.location_api == "grpcurl":
             self.c.run(f"command -v {shlex.quote(self.args.grpcurl)} >/dev/null", timeout=10, check=True)
         return detail
@@ -277,9 +296,25 @@ class OwnerFsAcceptance:
         for role, root_key in ((self.a, "A_ROOT"), (self.b, "B_ROOT"), (self.c, "C_ROOT")):
             root = self.paths[root_key]
             role.run(
-                "set -euo pipefail\n"
-                f"mkdir -p {shlex.quote(root)} {shlex.quote(root + '/logs')} {shlex.quote(root + '/data')} {shlex.quote(root + '/mnt')}\n"
-                f"if mountpoint -q {shlex.quote(root + '/mnt')}; then (fusermount3 -uz {shlex.quote(root + '/mnt')} || fusermount -uz {shlex.quote(root + '/mnt')} || umount -l {shlex.quote(root + '/mnt')} || true); fi",
+                (
+                    f"set -euo pipefail\nmkdir -p "
+                    f"{shlex.quote(root)}"
+                    f" "
+                    f"{shlex.quote(root + '/logs')}"
+                    f" "
+                    f"{shlex.quote(root + '/data')}"
+                    f" "
+                    f"{shlex.quote(root + '/mnt')}"
+                    f"\nif mountpoint -q "
+                    f"{shlex.quote(root + '/mnt')}"
+                    f"; then (fusermount3 -uz "
+                    f"{shlex.quote(root + '/mnt')}"
+                    f" || fusermount -uz "
+                    f"{shlex.quote(root + '/mnt')}"
+                    f" || umount -l "
+                    f"{shlex.quote(root + '/mnt')}"
+                    f" || true); fi"
+                ),
                 timeout=15,
                 check=True,
             )
@@ -408,10 +443,26 @@ class OwnerFsAcceptance:
             if self.args.tls_ca_certificate:
                 tls_args.extend(["-cacert", self.args.tls_ca_certificate])
             if self.args.tls_identity_certificate and self.args.tls_identity_private_key:
-                tls_args.extend(["-cert", self.args.tls_identity_certificate, "-key", self.args.tls_identity_private_key])
+                tls_args.extend(
+                    ["-cert", self.args.tls_identity_certificate, "-key", self.args.tls_identity_private_key]
+                )
             if self.args.tls_server_name:
                 tls_args.extend(["-authority", self.args.tls_server_name])
-        grpcurl_args = " ".join(shlex.quote(part) for part in [self.args.grpcurl, *tls_args, "-import-path", remote_proto_dir, "-proto", "meta.proto", "-d", f"@{remote_request}", f"127.0.0.1:{self.meta_grpc}", "afs.meta.v1.OwnerRoots/LookupRoot"])
+        grpcurl_args = " ".join(
+            shlex.quote(part)
+            for part in [
+                self.args.grpcurl,
+                *tls_args,
+                "-import-path",
+                remote_proto_dir,
+                "-proto",
+                "meta.proto",
+                "-d",
+                f"@{remote_request}",
+                f"127.0.0.1:{self.meta_grpc}",
+                "afs.meta.v1.OwnerRoots/LookupRoot",
+            ]
+        )
         script = (
             f"cat > {shlex.quote(remote_request)} <<'OWNERFS_LOOKUP_JSON'\n"
             f"{request_json}\n"
@@ -427,7 +478,10 @@ class OwnerFsAcceptance:
         if not payload.get("found"):
             raise RunnerError(f"LookupRoot did not find {root}: {payload}")
         location = payload.get("location") or {}
-        if location.get("homeNodeId") not in {"node-a-" + self.run_id, self.args.expected_home_node_id or "node-a-" + self.run_id}:
+        if location.get("homeNodeId") not in {
+            "node-a-" + self.run_id,
+            self.args.expected_home_node_id or "node-a-" + self.run_id,
+        }:
             raise RunnerError(f"LookupRoot returned unexpected home node for {root}: {payload}")
         return payload
 
@@ -440,7 +494,18 @@ class OwnerFsAcceptance:
     def step_close_to_open(self) -> dict[str, Any]:
         file_a = f"{self.owner_a}/{self.workspace}/dir/file.txt"
         file_b = f"{self.owner_b}/{self.workspace}/dir/file.txt"
-        self.a.run(f"mkdir -p {shlex.quote(str(Path(file_a).parent))} && printf 'alpha' > {shlex.quote(file_a)} && sync -f {shlex.quote(file_a)}", timeout=10, check=True)
+        self.a.run(
+            (
+                f"mkdir -p "
+                f"{shlex.quote(str(Path(file_a).parent))}"
+                f" && printf 'alpha' > "
+                f"{shlex.quote(file_a)}"
+                f" && sync -f "
+                f"{shlex.quote(file_a)}"
+            ),
+            timeout=10,
+            check=True,
+        )
         out = self.b.run(f"cat {shlex.quote(file_b)}", timeout=10, check=True).stdout
         if out != "alpha":
             raise RunnerError(f"B reopen read mismatch: {out!r}")
@@ -449,7 +514,9 @@ class OwnerFsAcceptance:
     def step_remote_reopen_after_rewrite(self) -> dict[str, Any]:
         file_a = f"{self.owner_a}/{self.workspace}/dir/file.txt"
         file_b = f"{self.owner_b}/{self.workspace}/dir/file.txt"
-        self.a.run(f"printf 'bravo-longer' > {shlex.quote(file_a)} && sync -f {shlex.quote(file_a)}", timeout=10, check=True)
+        self.a.run(
+            f"printf 'bravo-longer' > {shlex.quote(file_a)} && sync -f {shlex.quote(file_a)}", timeout=10, check=True
+        )
         out = self.b.run(f"cat {shlex.quote(file_b)}", timeout=10, check=True).stdout
         if out != "bravo-longer":
             raise RunnerError(f"B reopen after A rewrite mismatch: {out!r}")
@@ -458,7 +525,20 @@ class OwnerFsAcceptance:
     def step_rename_unlink_rmdir(self) -> dict[str, Any]:
         base_a = f"{self.owner_a}/{self.workspace}/mut"
         base_b = f"{self.owner_b}/{self.workspace}/mut"
-        self.a.run(f"mkdir -p {shlex.quote(base_a)} && printf 'rename' > {shlex.quote(base_a + '/old')} && mv {shlex.quote(base_a + '/old')} {shlex.quote(base_a + '/new')}", timeout=10, check=True)
+        self.a.run(
+            (
+                f"mkdir -p "
+                f"{shlex.quote(base_a)}"
+                f" && printf 'rename' > "
+                f"{shlex.quote(base_a + '/old')}"
+                f" && mv "
+                f"{shlex.quote(base_a + '/old')}"
+                f" "
+                f"{shlex.quote(base_a + '/new')}"
+            ),
+            timeout=10,
+            check=True,
+        )
         out = self.b.run(f"cat {shlex.quote(base_b + '/new')}", timeout=10, check=True).stdout
         if out != "rename":
             raise RunnerError(f"rename visibility mismatch: {out!r}")
@@ -470,13 +550,29 @@ class OwnerFsAcceptance:
 
     def step_concurrent_root_create_single_home(self) -> dict[str, Any]:
         root = f"race-{self.run_id}-{self.workspace}"
-        cmd_a = f"(mkdir {shlex.quote(self.owner_a + '/' + root)} && echo A || echo A_FAIL) > {shlex.quote(self.paths['A_ROOT'] + '/logs/race.out')} 2>&1 &"
-        cmd_b = f"(mkdir {shlex.quote(self.owner_b + '/' + root)} && echo B || echo B_FAIL) > {shlex.quote(self.paths['B_ROOT'] + '/logs/race.out')} 2>&1 &"
+        cmd_a = (
+            f"(mkdir "
+            f"{shlex.quote(self.owner_a + '/' + root)}"
+            f" && echo A || echo A_FAIL) > "
+            f"{shlex.quote(self.paths['A_ROOT'] + '/logs/race.out')}"
+            f" 2>&1 &"
+        )
+        cmd_b = (
+            f"(mkdir "
+            f"{shlex.quote(self.owner_b + '/' + root)}"
+            f" && echo B || echo B_FAIL) > "
+            f"{shlex.quote(self.paths['B_ROOT'] + '/logs/race.out')}"
+            f" 2>&1 &"
+        )
         self.a.run(cmd_a, timeout=5, check=True)
         self.b.run(cmd_b, timeout=5, check=True)
         time.sleep(1.0)
-        out_a = self.a.run(f"cat {shlex.quote(self.paths['A_ROOT'] + '/logs/race.out')} 2>/dev/null || true", timeout=5).stdout.strip()
-        out_b = self.b.run(f"cat {shlex.quote(self.paths['B_ROOT'] + '/logs/race.out')} 2>/dev/null || true", timeout=5).stdout.strip()
+        out_a = self.a.run(
+            f"cat {shlex.quote(self.paths['A_ROOT'] + '/logs/race.out')} 2>/dev/null || true", timeout=5
+        ).stdout.strip()
+        out_b = self.b.run(
+            f"cat {shlex.quote(self.paths['B_ROOT'] + '/logs/race.out')} 2>/dev/null || true", timeout=5
+        ).stdout.strip()
         if (out_a.endswith("A")) == (out_b.endswith("B")):
             raise RunnerError(f"concurrent mkdir requires exactly one winner: A={out_a!r}, B={out_b!r}")
         lookup = self.location_lookup(root)
@@ -485,7 +581,9 @@ class OwnerFsAcceptance:
     def step_old_fd_after_rename(self) -> dict[str, Any]:
         base_a = f"{self.owner_a}/{self.workspace}/fd"
         base_b = f"{self.owner_b}/{self.workspace}/fd"
-        self.a.run(f"mkdir -p {shlex.quote(base_a)} && printf 'oldfd' > {shlex.quote(base_a + '/x')}", timeout=10, check=True)
+        self.a.run(
+            f"mkdir -p {shlex.quote(base_a)} && printf 'oldfd' > {shlex.quote(base_a + '/x')}", timeout=10, check=True
+        )
         script_path = f"{self.paths['B_ROOT']}/logs/oldfd-reader.py"
         script_log = f"{self.paths['B_ROOT']}/logs/oldfd-reader.log"
         script = (
@@ -503,9 +601,22 @@ class OwnerFsAcceptance:
         )
         self.b.run(script, timeout=5, check=True)
         time.sleep(0.4)
-        self.a.run(f"mv {shlex.quote(base_a + '/x')} {shlex.quote(base_a + '/y')} && printf 'newname' > {shlex.quote(base_a + '/x')}", timeout=10, check=True)
+        self.a.run(
+            (
+                f"mv "
+                f"{shlex.quote(base_a + '/x')}"
+                f" "
+                f"{shlex.quote(base_a + '/y')}"
+                f" && printf 'newname' > "
+                f"{shlex.quote(base_a + '/x')}"
+            ),
+            timeout=10,
+            check=True,
+        )
         time.sleep(2.0)
-        out = self.b.run(f"cat {shlex.quote(self.paths['B_ROOT'] + '/logs/oldfd.out')} 2>/dev/null", timeout=5, check=True).stdout
+        out = self.b.run(
+            f"cat {shlex.quote(self.paths['B_ROOT'] + '/logs/oldfd.out')} 2>/dev/null", timeout=5, check=True
+        ).stdout
         if out != "oldfd":
             raise RunnerError(f"old fd after rename read {out!r}")
         return {"old_fd_bytes": out}
@@ -513,7 +624,9 @@ class OwnerFsAcceptance:
     def step_unlinked_fd_survives_name_reuse(self) -> dict[str, Any]:
         base_a = f"{self.owner_a}/{self.workspace}/unlinkfd"
         base_b = f"{self.owner_b}/{self.workspace}/unlinkfd"
-        self.a.run(f"mkdir -p {shlex.quote(base_a)} && printf 'survive' > {shlex.quote(base_a + '/x')}", timeout=10, check=True)
+        self.a.run(
+            f"mkdir -p {shlex.quote(base_a)} && printf 'survive' > {shlex.quote(base_a + '/x')}", timeout=10, check=True
+        )
         script_path = f"{self.paths['B_ROOT']}/logs/unlinkfd-reader.py"
         script_log = f"{self.paths['B_ROOT']}/logs/unlinkfd-reader.log"
         script = (
@@ -531,9 +644,13 @@ class OwnerFsAcceptance:
         )
         self.b.run(script, timeout=5, check=True)
         time.sleep(0.4)
-        self.a.run(f"rm {shlex.quote(base_a + '/x')} && printf 'reuse' > {shlex.quote(base_a + '/x')}", timeout=10, check=True)
+        self.a.run(
+            f"rm {shlex.quote(base_a + '/x')} && printf 'reuse' > {shlex.quote(base_a + '/x')}", timeout=10, check=True
+        )
         time.sleep(2.0)
-        out = self.b.run(f"cat {shlex.quote(self.paths['B_ROOT'] + '/logs/unlinkfd.out')} 2>/dev/null", timeout=5, check=True).stdout
+        out = self.b.run(
+            f"cat {shlex.quote(self.paths['B_ROOT'] + '/logs/unlinkfd.out')} 2>/dev/null", timeout=5, check=True
+        ).stdout
         if out != "survive":
             raise RunnerError(f"unlinked fd read {out!r}")
         return {"old_fd_bytes": out}
@@ -543,7 +660,11 @@ class OwnerFsAcceptance:
         file_b = f"{self.owner_b}/{self.workspace}/lengths.txt"
         seen: list[int] = []
         for payload in ("x", "yyyyyyyy", "zz", "qqqqqqqqqqqqqqq"):
-            self.a.run(f"printf {shlex.quote(payload)} > {shlex.quote(file_a)} && sync -f {shlex.quote(file_a)}", timeout=10, check=True)
+            self.a.run(
+                f"printf {shlex.quote(payload)} > {shlex.quote(file_a)} && sync -f {shlex.quote(file_a)}",
+                timeout=10,
+                check=True,
+            )
             out = self.b.run(f"cat {shlex.quote(file_b)}", timeout=10, check=True).stdout
             if out != payload:
                 raise RunnerError(f"length payload mismatch: expected {payload!r}, got {out!r}")
@@ -570,7 +691,9 @@ class OwnerFsAcceptance:
         self.procs.append(self.c.start("afs-meta", meta_cmd, f"{self.paths['C_ROOT']}/logs/afs-meta-restart.log"))
         self.remote_wait_http(self.c, f"http://127.0.0.1:{self.meta_rest}/health", timeout=20)
         lookup = self.location_lookup(self.workspace)
-        out = self.b.run(f"cat {shlex.quote(self.owner_b + '/' + self.workspace + '/dir/file.txt')}", timeout=10, check=True).stdout
+        out = self.b.run(
+            f"cat {shlex.quote(self.owner_b + '/' + self.workspace + '/dir/file.txt')}", timeout=10, check=True
+        ).stdout
         if out != "bravo-longer":
             raise RunnerError(f"post-meta-restart read mismatch: {out!r}")
         return {"location": lookup, "bytes": out}
@@ -601,7 +724,9 @@ class OwnerFsAcceptance:
         )
         self.procs.append(self.a.start("afs-node-a", node_a_cmd, f"{self.paths['A_ROOT']}/logs/afs-node-a-restart.log"))
         self.wait_mount(self.a, self.mount_a)
-        out = self.b.run(f"cat {shlex.quote(self.owner_b + '/' + self.workspace + '/dir/file.txt')}", timeout=10, check=True).stdout
+        out = self.b.run(
+            f"cat {shlex.quote(self.owner_b + '/' + self.workspace + '/dir/file.txt')}", timeout=10, check=True
+        ).stdout
         if out != "bravo-longer":
             raise RunnerError(f"post-home-restart read mismatch: {out!r}")
         return {"failure_observed": failure_observed, "bytes_after_restart": out, "failure_stderr": miss.stderr[-500:]}
@@ -609,7 +734,11 @@ class OwnerFsAcceptance:
     def step_cross_root_exdev(self) -> dict[str, Any]:
         r1 = f"{self.owner_a}/{self.workspace}"
         r2 = f"{self.owner_a}/exdev-{self.run_id}-{self.workspace}"
-        self.a.run(f"mkdir -p {shlex.quote(r1)} {shlex.quote(r2)} && printf x > {shlex.quote(r1 + '/move-me')}", timeout=10, check=True)
+        self.a.run(
+            f"mkdir -p {shlex.quote(r1)} {shlex.quote(r2)} && printf x > {shlex.quote(r1 + '/move-me')}",
+            timeout=10,
+            check=True,
+        )
         res = self.a.run(f"mv {shlex.quote(r1 + '/move-me')} {shlex.quote(r2 + '/move-me')}", timeout=10)
         # mv may hide EXDEV by copy+unlink. Use Python os.rename to require kernel errno.
         py = (
@@ -628,7 +757,18 @@ class OwnerFsAcceptance:
         )
         chk = self.a.run(py, timeout=10)
         if chk.returncode != 0:
-            raise RunnerError(f"cross-root rename did not return EXDEV: rc={chk.returncode} stdout={chk.stdout!r} stderr={chk.stderr!r}; mv_rc={res.returncode}")
+            raise RunnerError(
+                (
+                    f"cross-root rename did not return EXDEV: rc="
+                    f"{chk.returncode}"
+                    f" stdout="
+                    f"{chk.stdout!r}"
+                    f" stderr="
+                    f"{chk.stderr!r}"
+                    f"; mv_rc="
+                    f"{res.returncode}"
+                )
+            )
         return {"errno": chk.stdout.strip()}
 
     def note_cleanup_error(self, action: str, role: str, error: str) -> None:
@@ -638,7 +778,11 @@ class OwnerFsAcceptance:
         try:
             result = role.run(script, timeout=timeout, check=False)
             if result.returncode != 0:
-                self.note_cleanup_error(action, role.role, f"rc={result.returncode} stdout={result.stdout[-500:]} stderr={result.stderr[-1000:]}")
+                self.note_cleanup_error(
+                    action,
+                    role.role,
+                    f"rc={result.returncode} stdout={result.stdout[-500:]} stderr={result.stderr[-1000:]}",
+                )
         except Exception as exc:  # cleanup must not hide the acceptance result
             self.note_cleanup_error(action, role.role, repr(exc))
 
@@ -647,8 +791,19 @@ class OwnerFsAcceptance:
             self.cleanup_run(
                 role,
                 f"unmount {mount}",
-                f"(mountpoint -q {shlex.quote(mount)} || grep -qs ' {shlex.quote(mount)} ' /proc/mounts) && "
-                f"(fusermount3 -uz {shlex.quote(mount)} || fusermount -uz {shlex.quote(mount)} || umount -l {shlex.quote(mount)} || true) || true",
+                (
+                    f"(mountpoint -q "
+                    f"{shlex.quote(mount)}"
+                    f" || grep -qs ' "
+                    f"{shlex.quote(mount)}"
+                    f" ' /proc/mounts) && (fusermount3 -uz "
+                    f"{shlex.quote(mount)}"
+                    f" || fusermount -uz "
+                    f"{shlex.quote(mount)}"
+                    f" || umount -l "
+                    f"{shlex.quote(mount)}"
+                    f" || true) || true"
+                ),
                 timeout=8,
             )
         for proc in reversed(self.procs):
@@ -717,11 +872,28 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--host-b", required=True, help="node B ssh address")
     parser.add_argument("--host-c", required=True, help="meta node C ssh address")
     parser.add_argument("--ssh-user", default=os.environ.get("USER"), help="ssh user for B/C")
-    parser.add_argument("--ssh-option", action="append", default=["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no"], help="extra ssh option token; repeat for multiple tokens")
+    parser.add_argument(
+        "--ssh-option",
+        action="append",
+        default=["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no"],
+        help="extra ssh option token; repeat for multiple tokens",
+    )
     parser.add_argument("--bin-dir", required=True, help="directory containing afs-meta and afs-node on every host")
-    parser.add_argument("--etcd-endpoint", default=os.environ.get("AFS_ETCD_ENDPOINT"), help="etcd endpoint for afs-meta, e.g. http://127.0.0.1:2379")
-    parser.add_argument("--allow-missing-etcd-for-scaffold", action="store_true", help="only for harness debugging; full acceptance requires etcd")
-    parser.add_argument("--endpoint-scheme", choices=["http", "https"], help="gRPC URI scheme; defaults to https when TLS CA is supplied, else http")
+    parser.add_argument(
+        "--etcd-endpoint",
+        default=os.environ.get("AFS_ETCD_ENDPOINT"),
+        help="etcd endpoint for afs-meta, e.g. http://127.0.0.1:2379",
+    )
+    parser.add_argument(
+        "--allow-missing-etcd-for-scaffold",
+        action="store_true",
+        help="only for harness debugging; full acceptance requires etcd",
+    )
+    parser.add_argument(
+        "--endpoint-scheme",
+        choices=["http", "https"],
+        help="gRPC URI scheme; defaults to https when TLS CA is supplied, else http",
+    )
     parser.add_argument("--meta-config", help="afs-meta TOML config path on C")
     parser.add_argument("--node-a-config", help="afs-node TOML config path on A")
     parser.add_argument("--node-b-config", help="afs-node TOML config path on B")
@@ -734,18 +906,30 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--remote-tmp", default="/tmp/afs-ownerfs-acceptance", help="base temp dir on all hosts")
     parser.add_argument("--run-id", default=None)
     parser.add_argument("--workspace", default="job-42")
-    parser.add_argument("--port-base", type=int, help="first port for automatic allocation; defaults to a run-specific high port")
+    parser.add_argument(
+        "--port-base", type=int, help="first port for automatic allocation; defaults to a run-specific high port"
+    )
     parser.add_argument("--meta-grpc-port", type=int)
     parser.add_argument("--meta-rest-port", type=int)
     parser.add_argument("--node-a-grpc-port", type=int)
     parser.add_argument("--node-a-rest-port", type=int)
     parser.add_argument("--node-b-grpc-port", type=int)
     parser.add_argument("--node-b-rest-port", type=int)
-    parser.add_argument("--location-api", choices=["grpcurl", "rest"], default="rest", help="how to verify Meta root location")
+    parser.add_argument(
+        "--location-api", choices=["grpcurl", "rest"], default="rest", help="how to verify Meta root location"
+    )
     parser.add_argument("--grpcurl", default="grpcurl", help="grpcurl binary on meta host C for OwnerRoots.LookupRoot")
-    parser.add_argument("--proto-root", default=str(find_repo_root(Path(__file__).resolve()) / "afs" / "common" / "protocol" / "proto"), help="directory containing meta.proto on node A; copied to C for grpcurl")
+    parser.add_argument(
+        "--proto-root",
+        default=str(find_repo_root(Path(__file__).resolve()) / "afs" / "common" / "protocol" / "proto"),
+        help="directory containing meta.proto on node A; copied to C for grpcurl",
+    )
     parser.add_argument("--expected-home-node-id", help="override expected home node id in LookupRoot")
-    parser.add_argument("--location-path-template", default="/v1/roots/{root}", help="meta REST path expected to return root ownership when --location-api=rest")
+    parser.add_argument(
+        "--location-path-template",
+        default="/v1/roots/{root}",
+        help="meta REST path expected to return root ownership when --location-api=rest",
+    )
     parser.add_argument("--preflight-only", action="store_true")
     parser.add_argument("--keep-tmp", action="store_true")
     parser.add_argument("--output", help="write JSON result to path")

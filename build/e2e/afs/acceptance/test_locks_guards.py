@@ -9,7 +9,6 @@ import time
 import unittest
 from pathlib import Path
 
-
 PROBE = Path(__file__).resolve().parent / "probes" / "locks_smoke.py"
 
 
@@ -57,9 +56,7 @@ class LocksSmokeGuardTests(unittest.TestCase):
     def test_no_event_guard_rejects_alive_child_that_already_acquired(self):
         probe = load_probe_module()
         child_code = (
-            "import json, sys\n"
-            "print(json.dumps({'event': 'ACQUIRED', 'pid': 123}), flush=True)\n"
-            "sys.stdin.readline()\n"
+            "import json, sys\nprint(json.dumps({'event': 'ACQUIRED', 'pid': 123}), flush=True)\nsys.stdin.readline()\n"
         )
         proc = subprocess.Popen(
             [sys.executable, "-c", child_code],
@@ -81,7 +78,7 @@ class LocksSmokeGuardTests(unittest.TestCase):
         probe = load_probe_module()
         child_code = (
             "import os, sys\n"
-            "os.write(sys.stdout.fileno(), b'{\"event\":\"WAITING\"}\\n{\"event\":\"ACQUIRED\"}\\n')\n"
+            'os.write(sys.stdout.fileno(), b\'{"event":"WAITING"}\\n{"event":"ACQUIRED"}\\n\')\n'
             "sys.stdin.readline()\n"
         )
         proc = subprocess.Popen(
@@ -102,11 +99,7 @@ class LocksSmokeGuardTests(unittest.TestCase):
 
     def test_partial_line_without_newline_times_out_without_blocking(self):
         probe = load_probe_module()
-        child_code = (
-            "import os, sys, time\n"
-            "os.write(sys.stdout.fileno(), b'{\"event\":\"WAITING\"')\n"
-            "time.sleep(2)\n"
-        )
+        child_code = 'import os, sys, time\nos.write(sys.stdout.fileno(), b\'{"event":"WAITING"\')\ntime.sleep(2)\n'
         proc = subprocess.Popen(
             [sys.executable, "-c", child_code],
             text=True,

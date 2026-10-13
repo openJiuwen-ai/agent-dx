@@ -9,7 +9,6 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-
 DRIVERS = Path(__file__).resolve().parent / "drivers"
 SPEC = importlib.util.spec_from_file_location("suite_binding", DRIVERS / "suite_binding.py")
 suite_binding = importlib.util.module_from_spec(SPEC)
@@ -63,8 +62,30 @@ class SuiteBindingTests(unittest.TestCase):
         suite_binding.validate_binding(binding, "STD-01", "full", binding["matrix"])
         argv = suite_binding.build_child_argv(binding, "STD-01", "full", binding["matrix"], Path("/run/std01"))
         self.assertEqual(argv[:3], [sys.executable, str(DRIVERS / "standard.py"), "host"])
-        self.assertEqual(json.loads(argv[argv.index("--worker-a-json") + 1]), ["ssh", "-o", "BatchMode=yes", "--", "afs-meta-a", "/usr/bin/python3", "/opt/afs-acceptance/drivers/standard.py"])
-        self.assertEqual(json.loads(argv[argv.index("--worker-b-json") + 1]), ["ssh", "-o", "BatchMode=yes", "--", "afs-node-b", "/usr/bin/python3", "/opt/afs-acceptance/drivers/standard.py"])
+        self.assertEqual(
+            json.loads(argv[argv.index("--worker-a-json") + 1]),
+            [
+                "ssh",
+                "-o",
+                "BatchMode=yes",
+                "--",
+                "afs-meta-a",
+                "/usr/bin/python3",
+                "/opt/afs-acceptance/drivers/standard.py",
+            ],
+        )
+        self.assertEqual(
+            json.loads(argv[argv.index("--worker-b-json") + 1]),
+            [
+                "ssh",
+                "-o",
+                "BatchMode=yes",
+                "--",
+                "afs-node-b",
+                "/usr/bin/python3",
+                "/opt/afs-acceptance/drivers/standard.py",
+            ],
+        )
         self.assertIn("--worker-a-expected-process", argv)
         self.assertIn("meta=1234:" + "a" * 64, argv)
         self.assertIn("--worker-b-expected-process", argv)
@@ -88,7 +109,10 @@ class SuiteBindingTests(unittest.TestCase):
         suite_args = json.loads(argv[argv.index("--worker-suite-args-json") + 1])
         self.assertEqual(suite_args[:3], ["worker-driver", "--driver", "/opt/afs-acceptance/drivers/fsx.py"])
         self.assertIn("--fsx-binary", suite_args)
-        self.assertEqual(suite_args[suite_args.index("--fsx-binary") + 1], "/opt/afs-acceptance/suites-reference/src/secfs.test/tools/bin/fsx")
+        self.assertEqual(
+            suite_args[suite_args.index("--fsx-binary") + 1],
+            "/opt/afs-acceptance/suites-reference/src/secfs.test/tools/bin/fsx",
+        )
         self.assertEqual(suite_args[suite_args.index("--case-id") + 1], "STD-03")
         self.assertEqual(suite_args[suite_args.index("--meta") + 1], "etcd")
         self.assertEqual(suite_args[suite_args.index("--process-pid") + 1], "2345")
@@ -107,7 +131,9 @@ class SuiteBindingTests(unittest.TestCase):
             suite_binding.validate_binding(binding, "STD-02", "full", binding["matrix"])
 
     def test_std04_remote_host_requires_remote_reference_dir(self):
-        binding = self.remote_binding(case_id="STD-04", driver_matrix={"reference": "ext4", "seeds": 10, "operations_per_seed": 10000})
+        binding = self.remote_binding(
+            case_id="STD-04", driver_matrix={"reference": "ext4", "seeds": 10, "operations_per_seed": 10000}
+        )
         with self.assertRaises(suite_binding.BindingError):
             suite_binding.validate_binding(binding, "STD-04", "full", binding["matrix"])
 
@@ -129,10 +155,25 @@ class SuiteBindingTests(unittest.TestCase):
             suite_binding.validate_binding(binding, "STD-01", "full", binding["matrix"])
 
     def test_std01_remote_host_allows_absolute_ssh_config(self):
-        binding = self.remote_binding(worker_a=self.remote_worker("meta", "afs-meta-a", 1234, ssh_config="/etc/afs-acceptance/ssh_config"))
+        binding = self.remote_binding(
+            worker_a=self.remote_worker("meta", "afs-meta-a", 1234, ssh_config="/etc/afs-acceptance/ssh_config")
+        )
         suite_binding.validate_binding(binding, "STD-01", "full", binding["matrix"])
         argv = suite_binding.build_child_argv(binding, "STD-01", "full", binding["matrix"], Path("/run/std01"))
-        self.assertEqual(json.loads(argv[argv.index("--worker-a-json") + 1]), ["ssh", "-o", "BatchMode=yes", "-F", "/etc/afs-acceptance/ssh_config", "--", "afs-meta-a", "/usr/bin/python3", "/opt/afs-acceptance/drivers/standard.py"])
+        self.assertEqual(
+            json.loads(argv[argv.index("--worker-a-json") + 1]),
+            [
+                "ssh",
+                "-o",
+                "BatchMode=yes",
+                "-F",
+                "/etc/afs-acceptance/ssh_config",
+                "--",
+                "afs-meta-a",
+                "/usr/bin/python3",
+                "/opt/afs-acceptance/drivers/standard.py",
+            ],
+        )
 
     def test_std01_remote_host_rejects_relative_ssh_config(self):
         binding = self.remote_binding(worker_a=self.remote_worker("meta", "afs-meta-a", 1234, ssh_config="ssh_config"))
@@ -157,7 +198,9 @@ class SuiteBindingTests(unittest.TestCase):
         try:
             for case_id, config in suite_binding.CASE_CONFIG.items():
                 with self.subTest(case_id=case_id):
-                    spec = importlib.util.spec_from_file_location("binding_cli_" + case_id.replace("-", "_"), DRIVERS / config["driver"])
+                    spec = importlib.util.spec_from_file_location(
+                        "binding_cli_" + case_id.replace("-", "_"), DRIVERS / config["driver"]
+                    )
                     driver = importlib.util.module_from_spec(spec)
                     sys.modules[spec.name] = driver
                     spec.loader.exec_module(driver)
@@ -177,7 +220,17 @@ class SuiteBindingTests(unittest.TestCase):
             sys.path.remove(str(DRIVERS))
 
     def test_fixture_bypass_fields_are_rejected(self):
-        for field in ("allow_reference_fixture", "allow_nonroot_fixture", "allow_unpinned_suite_fixture", "max_tests", "max_seeds", "operations", "seeds", "command", "run_dir"):
+        for field in (
+            "allow_reference_fixture",
+            "allow_nonroot_fixture",
+            "allow_unpinned_suite_fixture",
+            "max_tests",
+            "max_seeds",
+            "operations",
+            "seeds",
+            "command",
+            "run_dir",
+        ):
             with self.subTest(field=field):
                 binding = self.binding(**{field: True})
                 with self.assertRaises(suite_binding.BindingError):
@@ -185,7 +238,11 @@ class SuiteBindingTests(unittest.TestCase):
 
     def test_child_proof_cannot_change_context(self):
         matrix = {"backend": "DFS", "meta": "etcd"}
-        for field, value in (("case_id", "STD-01"), ("profile", "full"), ("matrix", {"backend": "OwnerFs", "meta": "etcd"})):
+        for field, value in (
+            ("case_id", "STD-01"),
+            ("profile", "full"),
+            ("matrix", {"backend": "OwnerFs", "meta": "etcd"}),
+        ):
             with self.subTest(field=field):
                 proof = self.proof()
                 proof[field] = value
@@ -197,6 +254,7 @@ class SuiteBindingTests(unittest.TestCase):
 
     def test_manifest_has_profile_specific_workload_counts(self):
         import runner
+
         manifest = json.loads((DRIVERS.parent / "cases.json").read_text())
         cases = {case["id"]: case for case in manifest["cases"]}
         for case_id, full_seeds in (("STD-03", 3), ("STD-04", 10)):
@@ -257,7 +315,10 @@ class SuiteBindingTests(unittest.TestCase):
         err = io.StringIO()
         if proc is None:
             proc = subprocess.CompletedProcess(["child"], 0, stdout=json.dumps(self.proof()) + "\n", stderr="raw err\n")
-        with mock.patch.dict("os.environ", env, clear=True), mock.patch.object(suite_binding.subprocess, "run", return_value=proc) as run_mock:
+        with (
+            mock.patch.dict("os.environ", env, clear=True),
+            mock.patch.object(suite_binding.subprocess, "run", return_value=proc) as run_mock,
+        ):
             with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
                 code = suite_binding.main()
         return code, out.getvalue(), err.getvalue(), run_mock
@@ -265,7 +326,19 @@ class SuiteBindingTests(unittest.TestCase):
     def test_valid_dispatch_forwards_child_proof_and_builds_fixed_argv(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            write_json(root / "bindings.json", {"schema_version": 1, "bindings": [self.binding(driver_matrix={"reference": "ext4", "suite_sha": "secfs.test current", "seeds": 3}, suite_root="/s/secfs", fsx_binary="/s/secfs/tools/bin/fsx")]})
+            write_json(
+                root / "bindings.json",
+                {
+                    "schema_version": 1,
+                    "bindings": [
+                        self.binding(
+                            driver_matrix={"reference": "ext4", "suite_sha": "secfs.test current", "seeds": 3},
+                            suite_root="/s/secfs",
+                            fsx_binary="/s/secfs/tools/bin/fsx",
+                        )
+                    ],
+                },
+            )
             code, out, err, run_mock = self.run_main(self.env(root))
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(out.splitlines()[-1])["status"], "PASS")
@@ -301,7 +374,10 @@ class SuiteBindingTests(unittest.TestCase):
     def test_driver_matrix_cannot_override_runner_axes(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            write_json(root / "bindings.json", {"schema_version": 1, "bindings": [self.binding(driver_matrix={"backend": "OwnerFs"})]})
+            write_json(
+                root / "bindings.json",
+                {"schema_version": 1, "bindings": [self.binding(driver_matrix={"backend": "OwnerFs"})]},
+            )
             code, out, _err, run_mock = self.run_main(self.env(root))
         self.assertEqual(code, 1)
         self.assertFalse(run_mock.called)
@@ -310,7 +386,10 @@ class SuiteBindingTests(unittest.TestCase):
     def test_matrix_mismatch_blocks_as_missing(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            write_json(root / "bindings.json", {"schema_version": 1, "bindings": [self.binding(matrix={"backend": "OwnerFs", "meta": "etcd"})]})
+            write_json(
+                root / "bindings.json",
+                {"schema_version": 1, "bindings": [self.binding(matrix={"backend": "OwnerFs", "meta": "etcd"})]},
+            )
             code, out, _err, run_mock = self.run_main(self.env(root))
         self.assertEqual(code, 1)
         self.assertFalse(run_mock.called)
@@ -320,7 +399,9 @@ class SuiteBindingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             write_json(root / "bindings.json", {"schema_version": 1, "bindings": [self.binding()]})
-            proc = subprocess.CompletedProcess(["child"], 7, stdout="log\n" + json.dumps(self.proof(status="FAIL")) + "\n", stderr="bad\n")
+            proc = subprocess.CompletedProcess(
+                ["child"], 7, stdout="log\n" + json.dumps(self.proof(status="FAIL")) + "\n", stderr="bad\n"
+            )
             code, out, err, run_mock = self.run_main(self.env(root), proc=proc)
         self.assertEqual(code, 7)
         self.assertTrue(run_mock.called)
@@ -342,7 +423,10 @@ class SuiteBindingTests(unittest.TestCase):
     def test_unsupported_command_field_blocks(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            write_json(root / "bindings.json", {"schema_version": 1, "bindings": [self.binding(command=["python3", "anything.py"])]})
+            write_json(
+                root / "bindings.json",
+                {"schema_version": 1, "bindings": [self.binding(command=["python3", "anything.py"])]},
+            )
             code, out, _err, run_mock = self.run_main(self.env(root))
         self.assertEqual(code, 1)
         self.assertFalse(run_mock.called)
