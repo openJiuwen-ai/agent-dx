@@ -211,6 +211,7 @@ pub(crate) fn spawn(
             revision: 0,
             resources_held: held,
             checkpoint: None,
+            failure: None,
             last_operation: None,
         },
         services,
@@ -400,13 +401,17 @@ struct Controller {
 
 impl Controller {
     async fn reconcile(&mut self) -> Result<OperationResult> {
-        if self.record.state == EnvironmentState::Running
-            && self
-                .services
-                .runtime
-                .is_running(&self.record.runtime.id)
-                .await?
-        {
+        let observation = if self.record.state == EnvironmentState::Running {
+            Some(
+                self.services
+                    .runtime
+                    .observe(&self.record.runtime.id)
+                    .await?,
+            )
+        } else {
+            None
+        };
+        if observation.as_ref().is_some_and(|status| status.running) {
             self.services.readiness.expect_runtime(&self.record)?;
             if let Some(control) = &self.services.runtime_control {
                 control.expect_runtime(&self.record)?;
@@ -445,6 +450,9 @@ impl Controller {
                 Err(error) => return Err(error),
             }
         } else {
+            if let Some(status) = observation {
+                self.record.failure = status.failure;
+            }
             self.cleanup().await?;
             if !matches!(
                 self.record.state,
@@ -465,6 +473,9 @@ impl Controller {
         let next = self.record.state.apply(event)?;
         self.record.revision = self.record.revision.checked_add(1).ok_or(Error::Conflict)?;
         self.record.state = next;
+        if matches!(event, Event::Start | Event::Resume | Event::Ready) {
+            self.record.failure = None;
+        }
         self.record.last_operation = None;
         self.idle = None;
         self.health_failures = 0;

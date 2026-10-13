@@ -108,6 +108,7 @@ impl State {
             revision: 0,
             resources_held: true,
             checkpoint: None,
+            failure: None,
             last_operation: None,
             restart_attempts: 0,
             restart_pending: false,

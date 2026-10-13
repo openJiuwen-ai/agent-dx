@@ -138,6 +138,7 @@ fn record(id: &str, state: EnvironmentState) -> EnvironmentRecord {
             ip: Some("10.0.0.2".parse().unwrap()),
         },
         checkpoint: None,
+        failure: None,
         last_operation: None,
         resources_held: true,
     }

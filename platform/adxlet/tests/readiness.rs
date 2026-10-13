@@ -77,6 +77,7 @@ fn record() -> EnvironmentRecord {
         },
         resources_held: true,
         checkpoint: None,
+        failure: None,
         last_operation: None,
     }
 }

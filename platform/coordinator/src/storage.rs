@@ -178,6 +178,7 @@ impl StoredEnvironment {
             revision: 0,
             resources_held: true,
             checkpoint: None,
+            failure: None,
             last_operation: None,
         })
     }

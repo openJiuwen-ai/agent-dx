@@ -81,6 +81,7 @@ fn record(generation: u64) -> EnvironmentRecord {
         },
         resources_held: true,
         checkpoint: None,
+        failure: None,
         last_operation: None,
     }
 }

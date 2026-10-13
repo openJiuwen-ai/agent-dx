@@ -248,8 +248,25 @@ pub struct Runtime {
     pub ip: Option<std::net::IpAddr>,
 }
 
+/// The backend's terminal observation for one execution, retained before cleanup.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeFailure {
+    pub reason: RuntimeFailureReason,
+    pub exit_code: Option<i32>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RuntimeFailureReason {
+    OomKilled,
+    Exited,
+    Missing,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnvironmentRecord {
+    #[serde(default)]
+    pub failure: Option<RuntimeFailure>,
     #[serde(default)]
     pub restart_attempts: u32,
     #[serde(default)]

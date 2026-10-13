@@ -552,15 +552,25 @@ class CommandResult:
     error_message: Optional[str] = None
     stdout_truncated: bool = False
     stderr_truncated: bool = False
+    exit_signal: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class SandboxFailure:
+    """Terminal backend reason, scoped to the current Environment execution."""
+    reason: str
+    exit_code: Optional[int] = None
+    message: str = ""
 
 
 @dataclass(frozen=True)
 class SandboxInfo:
     id: str
-    state: str  # "running" | "stopped"
+    state: str  # "running" | "paused" | "failed" | other lifecycle states
     cpu: Optional[int]
     memory: Optional[int]
     image: Optional[str]
+    failure: Optional[SandboxFailure] = None
 
 
 @dataclass(frozen=True)
@@ -697,6 +707,7 @@ class CommandInfo:
     created_at: Optional[datetime] = None
     started_at: Optional[datetime] = None
     finished_at: Optional[datetime] = None
+    exit_signal: Optional[int] = None
 
     @property
     def command_id(self) -> str:

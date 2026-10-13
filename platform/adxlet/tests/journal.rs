@@ -57,6 +57,7 @@ fn record(revision: u64) -> EnvironmentRecord {
         revision,
         resources_held: true,
         checkpoint: None,
+        failure: None,
         last_operation: None,
     }
 }

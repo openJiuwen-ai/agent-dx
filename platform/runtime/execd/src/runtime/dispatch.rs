@@ -240,7 +240,7 @@ fn run_command(
     timeout_seconds: Option<f64>,
     trace_id: &str,
 ) -> rmpv::Value {
-    use std::os::unix::process::CommandExt;
+    use std::os::unix::process::{CommandExt, ExitStatusExt};
     use std::process::{Command, Stdio};
 
     let mut stdout = match tempfile::tempfile() {
@@ -369,7 +369,7 @@ fn run_command(
                 timed_out,
                 started.elapsed().as_millis()
             );
-            if timed_out {
+            let mut result = if timed_out {
                 command_result(
                     stdout,
                     format!("Command timed out after {timeout_label} seconds"),
@@ -377,7 +377,17 @@ fn run_command(
                 )
             } else {
                 command_result(stdout, captured_stderr, exit_code)
+            };
+            if let rmpv::Value::Map(fields) = &mut result {
+                fields.push((
+                    "exit_signal".into(),
+                    status
+                        .signal()
+                        .map(rmpv::Value::from)
+                        .unwrap_or(rmpv::Value::Nil),
+                ));
             }
+            result
         }
         Ok(None) => command_result(
             stdout,
@@ -677,6 +687,28 @@ mod tests {
             access_command_summary("cmd_run", &kw),
             format!("cmd_run {}...", "a".repeat(511))
         );
+    }
+
+    #[test]
+    fn direct_command_preserves_signal_without_claiming_oom() {
+        for (command, signal, code) in [
+            ("exec sh -c 'kill -9 $$'", Some(9), -1),
+            ("exit 137", None, 137),
+        ] {
+            let kw = BTreeMap::from([("cmd".into(), rmpv::Value::from(command))]);
+            let value = execute_sandbox_action("process.exec", &kw, "signal-test").unwrap();
+            let rmpv::Value::Map(fields) = value else {
+                panic!("expected command result")
+            };
+            let get = |name| {
+                fields
+                    .iter()
+                    .find_map(|(key, value)| (key.as_str() == Some(name)).then_some(value))
+            };
+            assert_eq!(get("exit_signal").unwrap().as_i64(), signal);
+            assert_eq!(get("exit_code").unwrap().as_i64(), Some(code));
+            assert!(get("error_code").is_none());
+        }
     }
 
     #[test]

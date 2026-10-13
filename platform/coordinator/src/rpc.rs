@@ -1033,6 +1033,7 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
                                 revision: 0,
                                 resources_held: true,
                                 checkpoint: None,
+                                failure: None,
                                 last_operation: None,
                             })
                             .try_into()
@@ -1387,6 +1388,7 @@ mod reconciliation_tests {
                 },
                 resources_held: false,
                 checkpoint: None,
+                failure: None,
                 last_operation: None,
                 restart_attempts: 0,
                 restart_pending: false,

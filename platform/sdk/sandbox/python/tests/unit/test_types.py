@@ -60,7 +60,7 @@ class TypesTests(unittest.TestCase):
     def test_akernel_value_type_fields_match(self):
         self.assertEqual(
             [item.name for item in fields(SandboxInfo)],
-            ["id", "state", "cpu", "memory", "image"],
+            ["id", "state", "cpu", "memory", "image", "failure"],
         )
         self.assertEqual(
             [item.name for item in fields(CommandInfo)],
@@ -74,6 +74,7 @@ class TypesTests(unittest.TestCase):
                 "created_at",
                 "started_at",
                 "finished_at",
+                "exit_signal",
             ],
         )
         self.assertEqual(

@@ -17,6 +17,7 @@ struct Dependencies {
     block_start: bool,
     actual: std::sync::atomic::AtomicBool,
     fail_cleanup: std::sync::atomic::AtomicBool,
+    failure: Mutex<Option<adx_core::RuntimeFailure>>,
 }
 
 impl Dependencies {
@@ -31,6 +32,7 @@ impl Dependencies {
             block_start,
             actual: std::sync::atomic::AtomicBool::new(false),
             fail_cleanup: std::sync::atomic::AtomicBool::new(false),
+            failure: Mutex::default(),
         })
     }
     fn event(&self, name: &str) -> Result<()> {
@@ -53,6 +55,12 @@ impl Dependencies {
 impl RuntimeDriver for Dependencies {
     async fn is_running(&self, _: &str) -> Result<bool> {
         Ok(self.actual.load(std::sync::atomic::Ordering::SeqCst))
+    }
+    async fn observe(&self, id: &str) -> Result<adxlet::RuntimeStatus> {
+        Ok(adxlet::RuntimeStatus {
+            running: self.is_running(id).await?,
+            failure: self.failure.lock().unwrap().clone(),
+        })
     }
     async fn start(
         &self,
@@ -979,4 +987,38 @@ async fn local_gpu_npu_tokens_transfer_and_stale_release_cannot_free_cards() {
     assert_eq!(next.devices, token.devices);
     manager.release_local("other", &next).unwrap();
     assert_eq!(manager.used(), Resources::default());
+}
+
+#[tokio::test]
+async fn backend_oom_is_committed_before_cleanup_and_retained_on_retry() {
+    let deps = Dependencies::new(false);
+    let node = node(&deps);
+    let environment = node.environment(spec("oom"), assignment("oom")).unwrap();
+    environment.create().await.unwrap();
+    let failure = adx_core::RuntimeFailure {
+        reason: adx_core::RuntimeFailureReason::OomKilled,
+        exit_code: Some(137),
+        message: "sandbox backend was OOM-killed".into(),
+    };
+    *deps.failure.lock().unwrap() = Some(failure.clone());
+    deps.actual
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    deps.fail_cleanup
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(environment.tick().await.is_err());
+    let record = environment.sync().await.unwrap().record;
+    assert_eq!(record.state, EnvironmentState::Failed);
+    assert_eq!(record.failure, Some(failure.clone()));
+    // Cleanup remains unresolved; publishing the reason must not claim the
+    // backend is absent or silently release a still-held reservation.
+    assert!(record.resources_held);
+    deps.fail_cleanup
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    environment.tick().await.unwrap();
+    assert_eq!(node.used(), Resources::default());
+    assert_eq!(
+        environment.sync().await.unwrap().record.failure,
+        Some(failure)
+    );
+    environment.delete().await.unwrap();
 }

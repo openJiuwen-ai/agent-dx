@@ -31,6 +31,7 @@ from .types import (
     ResumeResult,
     S3Config,
     SandboxInfo,
+    SandboxFailure,
     SnapshotInfo,
 )
 
@@ -871,6 +872,7 @@ class Sandbox:
             cpu=info.get("required_cpu", self._cpu),
             memory=info.get("required_mem", self._memory),
             image=info.get("image", self._image),
+            failure=SandboxFailure(**info["failure"]) if info.get("failure") else None,
         )
 
     def create_snapshot(

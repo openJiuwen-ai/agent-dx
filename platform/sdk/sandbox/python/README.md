@@ -31,6 +31,21 @@ tenant-facing contract. `upstream` reverse tunnel uses the published
 `/tunnel/{sandbox}` route; the legacy `/invoke` fallback remains unavailable. See the
 [current HTTP contract](https://gitcode.com/openJiuwen/agent-dx/blob/refactor/gateway/apiserver/docs/sandbox-lifecycle-api.md).
 
+## OOM diagnostics
+
+Command results and background-command info preserve `exit_signal`, such as
+SIGKILL=9. EXECD does not observe OOM. A user process can be killed while the
+Sandbox stays Running; a signal alone is not an OOM classification. The current
+sandboxd API does not expose a separate user-process OOM reason.
+
+If the execution backend itself is OOM-killed, `sandbox.get_info().failure`
+contains a `SandboxFailure(reason="OomKilled", exit_code=..., message=...)`
+after the terminal state is committed. A failed direct invocation can raise
+`SandboxError` with `code="SANDBOX_OOM"`, `retry="never"`, `outcome="terminal"`
+and `failure` details. Before publication, the caller may receive
+`OUTCOME_UNKNOWN`; query `get_info()` instead of interpreting route errors as
+OOM. Successful calls do not perform an additional catalog query.
+
 ## Image startup process
 
 Set `inherit_entrypoint=True` on a fresh image-backed sandbox to start the

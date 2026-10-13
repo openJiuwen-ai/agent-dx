@@ -1006,6 +1006,7 @@ async fn heartbeat_expiry_reconciliation_and_old_session_fencing() {
         },
         resources_held: true,
         checkpoint: None,
+        failure: None,
         last_operation: None,
     };
     session.commit(running.clone()).await.unwrap();
@@ -1419,6 +1420,7 @@ async fn coordinator_restart_bounds_re_registration_grace() {
             },
             resources_held: true,
             checkpoint: None,
+            failure: None,
             last_operation: None,
             restart_attempts: 0,
             restart_pending: false,
@@ -1656,6 +1658,7 @@ async fn published_routes_drive_real_gateway_streams_and_reconnect_to_new_coordi
         },
         resources_held: true,
         checkpoint: None,
+        failure: None,
         last_operation: None,
     };
     routes.activate(&record).await.unwrap();
@@ -2733,6 +2736,7 @@ async fn shared_checkpoint_moves_to_new_node_and_old_node_cleans_without_deletin
             source_runtime_id: "held-1".into(),
             origin: None,
         }),
+        failure: None,
         last_operation: None,
         restart_attempts: 0,
         restart_pending: false,

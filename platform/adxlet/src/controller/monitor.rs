@@ -18,7 +18,7 @@ impl Controller {
         if self.record.state == EnvironmentState::Running {
             let running = tokio::time::timeout(
                 self.services.operation_timeout,
-                self.services.runtime.is_running(&self.record.runtime.id),
+                self.services.runtime.observe(&self.record.runtime.id),
             )
             .await
             .unwrap_or_else(|_| Err(Error::Unavailable("runtime observation timed out".into())));
@@ -27,10 +27,11 @@ impl Controller {
                     self.idle = None;
                     return Err(error);
                 }
-                Ok(false) => {
+                Ok(status) if !status.running => {
+                    self.record.failure = status.failure;
                     return self.unexpected_exit().await;
                 }
-                Ok(true) => (),
+                Ok(_) => (),
             }
             if let Ok(Ok(usage)) = tokio::time::timeout(
                 self.services.operation_timeout,

@@ -219,6 +219,7 @@ impl TryFrom<control::EnvironmentRecord> for adx_core::EnvironmentRecord {
             resources_held: v.resources_held,
             checkpoint: v.checkpoint.map(TryInto::try_into).transpose()?,
             last_operation: v.last_operation.map(TryInto::try_into).transpose()?,
+            failure: v.failure.map(TryInto::try_into).transpose()?,
         })
     }
 }
@@ -250,6 +251,7 @@ impl TryFrom<adx_core::EnvironmentRecord> for control::EnvironmentRecord {
             resources_held: v.resources_held,
             checkpoint: v.checkpoint.map(Into::into),
             last_operation: v.last_operation.map(Into::into),
+            failure: v.failure.map(Into::into),
         })
     }
 }
@@ -403,3 +405,38 @@ pub mod runtime {
     tonic::include_proto!("adx.runtime.v1");
 }
 pub mod runtime_stream;
+
+impl TryFrom<control::RuntimeFailure> for adx_core::RuntimeFailure {
+    type Error = Error;
+    fn try_from(value: control::RuntimeFailure) -> Result<Self> {
+        use adx_core::RuntimeFailureReason as Reason;
+        use control::runtime_failure::Reason as Wire;
+        let reason = match Wire::try_from(value.reason) {
+            Ok(Wire::OomKilled) => Reason::OomKilled,
+            Ok(Wire::Exited) => Reason::Exited,
+            Ok(Wire::Missing) => Reason::Missing,
+            _ => return Err(Error::Invalid("invalid runtime failure reason".into())),
+        };
+        Ok(Self {
+            reason,
+            exit_code: value.exit_code,
+            message: value.message,
+        })
+    }
+}
+impl From<adx_core::RuntimeFailure> for control::RuntimeFailure {
+    fn from(value: adx_core::RuntimeFailure) -> Self {
+        use adx_core::RuntimeFailureReason as Reason;
+        use control::runtime_failure::Reason as Wire;
+        let reason = match value.reason {
+            Reason::OomKilled => Wire::OomKilled,
+            Reason::Exited => Wire::Exited,
+            Reason::Missing => Wire::Missing,
+        };
+        Self {
+            reason: reason as i32,
+            exit_code: value.exit_code,
+            message: value.message,
+        }
+    }
+}

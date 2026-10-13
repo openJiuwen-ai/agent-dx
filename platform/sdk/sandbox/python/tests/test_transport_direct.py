@@ -917,6 +917,8 @@ def test_direct_unknown_outcome_retry_exhaustion_does_not_fallback():
     calls = []
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, json=[{"id": "sandbox-demo", "status": "running"}])
         body = json.loads(request.content)
         calls.append(
             (
@@ -957,6 +959,8 @@ def test_direct_mixed_failures_preserve_unknown_outcome():
         calls = []
 
         def handler(request):
+            if request.method == "GET":
+                return httpx.Response(200, json=[{"id": "sandbox-demo", "status": "running"}])
             body = json.loads(request.content)
             calls.append((request.url.path, body["requestId"], request.headers["x-adx-request-id"]))
             _check(request.url.path.startswith("/direct/"), f"unknown outcome crossed to RuntimeRPC: {calls}")

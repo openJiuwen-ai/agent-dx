@@ -32,6 +32,7 @@ struct Server {
     settled_error: Option<tonic::Code>,
     settled_error_after_start: bool,
     retain_after_delete: bool,
+    exit_message: Option<String>,
 }
 impl Default for Server {
     fn default() -> Self {
@@ -53,6 +54,7 @@ impl Default for Server {
             settled_error: None,
             settled_error_after_start: false,
             retain_after_delete: false,
+            exit_message: None,
         }
     }
 }
@@ -123,7 +125,9 @@ impl sandbox_service_server::SandboxService for Server {
         let request = request.into_inner();
         let id = request.id;
         self.requests.lock().unwrap().push(format!("list:{id}"));
-        if !*self.running.lock().unwrap() || (!id.is_empty() && id != "generated-backend-id") {
+        if (!*self.running.lock().unwrap() && self.exit_message.is_none())
+            || (!id.is_empty() && id != "generated-backend-id")
+        {
             if !id.is_empty() {
                 return Err(Status::not_found("sandbox not found"));
             }
@@ -141,7 +145,11 @@ impl sandbox_service_server::SandboxService for Server {
             sandboxes: vec![SandboxStatus {
                 id: "generated-backend-id".into(),
                 labels,
-                state: SandboxState::Running as i32,
+                state: if *self.running.lock().unwrap() {
+                    SandboxState::Running as i32
+                } else {
+                    SandboxState::Exited as i32
+                },
                 ..Default::default()
             }],
         }))
@@ -177,8 +185,16 @@ impl sandbox_service_server::SandboxService for Server {
         *self.running.lock().unwrap() = r.leave_running;
         Ok(Response::new(CheckpointResponse {}))
     }
-    async fn wait(&self, _: Request<WaitRequest>) -> Result<Response<WaitResponse>, Status> {
-        Err(Status::unimplemented("unused"))
+    async fn wait(&self, request: Request<WaitRequest>) -> Result<Response<WaitResponse>, Status> {
+        self.requests
+            .lock()
+            .unwrap()
+            .push(format!("wait:{}", request.into_inner().id));
+        Ok(Response::new(WaitResponse {
+            status: 0,
+            exit_code: 137,
+            message: self.exit_message.clone().unwrap_or_default(),
+        }))
     }
     async fn list_available_runtimes(
         &self,
@@ -1294,5 +1310,44 @@ async fn stateful_policy_keeps_execd_replies_independent_of_conntrack_generation
             }),
             "Execd replies must survive updates to the stateful policy generation"
         );
+    }
+}
+
+#[tokio::test]
+async fn exited_backend_uses_wait_reason_before_deletion_and_not_exit_code_alone() {
+    for (message, reason) in [
+        (
+            "sandbox was oom-killed by the kernel (memory cgroup limit exceeded)",
+            adx_core::RuntimeFailureReason::OomKilled,
+        ),
+        ("", adx_core::RuntimeFailureReason::Exited),
+    ] {
+        let server = Server {
+            exit_message: Some(message.into()),
+            ..Default::default()
+        };
+        let (adapter, _guard) = connect(server.clone()).await;
+        RuntimeDriver::start(&adapter, &spec(), "i-1", 1, &[])
+            .await
+            .unwrap();
+        assert!(adapter.observe("i-1").await.unwrap().running);
+        assert!(!server
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|v| v.starts_with("wait:")));
+        *server.running.lock().unwrap() = false;
+        let status = adapter.observe("i-1").await.unwrap();
+        assert!(!status.running);
+        let failure = status.failure.unwrap();
+        assert_eq!(failure.reason, reason);
+        assert_eq!(failure.exit_code, Some(137));
+        assert!(server
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|v| v == "wait:generated-backend-id"));
     }
 }

@@ -60,6 +60,12 @@ pub struct RuntimeObservation {
     pub running: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeStatus {
+    pub running: bool,
+    pub failure: Option<adx_core::RuntimeFailure>,
+}
+
 #[async_trait]
 pub trait RuntimeDriver: Send + Sync {
     async fn stats(&self, _runtime_id: &str) -> Result<metrics::RuntimeUsage> {
@@ -133,6 +139,14 @@ pub trait RuntimeDriver: Send + Sync {
         devices: &[DeviceAllocation],
     ) -> Result<std::net::IpAddr>;
     async fn is_running(&self, runtime_id: &str) -> Result<bool>;
+    /// Observe terminal details before removing the backend. An unavailable
+    /// observation is not proof that an execution exited.
+    async fn observe(&self, runtime_id: &str) -> Result<RuntimeStatus> {
+        Ok(RuntimeStatus {
+            running: self.is_running(runtime_id).await?,
+            failure: None,
+        })
+    }
     /// Atomically replace the complete runtime network policy. `None` clears it.
     async fn set_network_policy(
         &self,

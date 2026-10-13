@@ -419,6 +419,44 @@ impl Sandboxd {
             .any(|x| x.id == id && x.state == proto::SandboxState::Running as i32))
     }
 
+    pub async fn observe(&self, id: &str) -> Result<crate::RuntimeStatus> {
+        use adx_core::{RuntimeFailure, RuntimeFailureReason};
+        let sandboxes = self.list_id(id).await?;
+        let Some(status) = sandboxes.iter().find(|status| status.id == id) else {
+            return Ok(crate::RuntimeStatus {
+                running: false,
+                failure: Some(RuntimeFailure {
+                    reason: RuntimeFailureReason::Missing,
+                    exit_code: None,
+                    message: "backend execution is absent".into(),
+                }),
+            });
+        };
+        match proto::SandboxState::try_from(status.state) {
+            Ok(proto::SandboxState::Running) => Ok(crate::RuntimeStatus {
+                running: true,
+                failure: None,
+            }),
+            Ok(proto::SandboxState::Exited) => {
+                let physical = self.physical_id(id).await?.ok_or(Error::NotFound)?;
+                // Wait is called only for an already-exited execution. Preserve
+                // its terminal reason before controller cleanup deletes it.
+                let result = self
+                    .client
+                    .clone()
+                    .wait(self.request(proto::WaitRequest { id: physical }))
+                    .await
+                    .map_err(unavailable)?
+                    .into_inner();
+                Ok(crate::RuntimeStatus {
+                    running: false,
+                    failure: Some(runtime_failure(result)),
+                })
+            }
+            _ => Err(unavailable("backend execution state is unknown")),
+        }
+    }
+
     pub async fn check_health(&self) -> Result<()> {
         self.client
             .clone()
@@ -1000,6 +1038,9 @@ impl RuntimeDriver for Sandboxd {
     async fn is_running(&self, runtime_id: &str) -> Result<bool> {
         Sandboxd::is_running(self, runtime_id).await
     }
+    async fn observe(&self, runtime_id: &str) -> Result<crate::RuntimeStatus> {
+        Sandboxd::observe(self, runtime_id).await
+    }
     async fn set_network_policy(
         &self,
         runtime_id: &str,
@@ -1146,6 +1187,25 @@ impl Sandboxd {
         })
         .await
         .map_err(unavailable)?
+    }
+}
+
+fn runtime_failure(result: proto::WaitResponse) -> adx_core::RuntimeFailure {
+    let oom = result
+        .message
+        .contains("sandbox was oom-killed by the kernel");
+    adx_core::RuntimeFailure {
+        reason: if oom {
+            adx_core::RuntimeFailureReason::OomKilled
+        } else {
+            adx_core::RuntimeFailureReason::Exited
+        },
+        exit_code: Some(result.exit_code),
+        message: if oom {
+            "sandbox backend was OOM-killed".into()
+        } else {
+            "sandbox backend exited".into()
+        },
     }
 }
 

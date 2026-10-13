@@ -21,7 +21,17 @@ The Rust Ingress maps resolver/connection failures in `gateway/src/ingress/serve
 
 These error bodies are plain text. Authentication and individual endpoint validation have their own rejection paths. After response headers have been sent, a transport failure may close the stream instead of returning a new HTTP response.
 
-Do not expect `SANDBOX_EXITED`, `SANDBOX_RECOVERING`, a 410 OOM envelope or ten-minute deleted-instance diagnostic retention from this backend. Loss of a route does not by itself diagnose an OOM. Use the Environment catalog, component logs and the backend execution identity when investigating failures.
+Loss of a route does not by itself diagnose an OOM. The authenticated Environment
+catalog includes `failure: {reason, exit_code, message}` for observed backend
+termination. `reason: OomKilled` is sourced from sandboxd Wait before cleanup;
+ordinary exit is `Exited`, absent backend is `Missing`. The SDK retains the
+catalog reason in `get_info().failure` and can classify an exhausted direct call
+as `SANDBOX_OOM` only after the Failed/OomKilled record is visible. An earlier
+call or unavailable catalog retains the unknown-result error. User-command termination
+retains `CommandResult.exit_signal`; the Sandbox may stay Running. EXECD does
+not observe OOM, and a command signal alone is not an OOM classification.
+See the [OOM contract](../../../platform/api/http/error-contract.md#oom-原因与-sdk).
+There is no 410 OOM envelope or deleted-instance diagnostic retention.
 
 ## Recovery and SDK boundary
 

@@ -57,6 +57,7 @@ fn record() -> EnvironmentRecord {
             ip: Some("10.0.0.2".parse().unwrap()),
         },
         checkpoint: None,
+        failure: None,
         last_operation: None,
         state: EnvironmentState::Starting,
         revision: 1,

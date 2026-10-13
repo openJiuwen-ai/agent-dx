@@ -64,6 +64,11 @@ paths:
         expires; the command keeps running. `process.kill` returns HTTP 200 with
         `killed: false` when the command is absent or already exited. Other
         operation errors retain their normal error status.
+        Command results include optional exit_signal (the actual POSIX signal).
+        SIGKILL or shell exit_code 137 alone does not prove OOM. EXECD does not
+        collect OOM counters. A backend-wide OOM withdraws its data route;
+        consult the authenticated /api/instances view for failure.reason:
+        OomKilled, rather than inferring OOM from 502/503.
       parameters:
         - $ref: "#/components/parameters/InstanceId"
         - $ref: "#/components/parameters/OperationId"

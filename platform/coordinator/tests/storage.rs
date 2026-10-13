@@ -56,6 +56,7 @@ fn running(spec: EnvironmentSpec, assignment: Assignment) -> EnvironmentRecord {
         revision: 2,
         resources_held: true,
         checkpoint: None,
+        failure: None,
         last_operation: None,
     }
 }

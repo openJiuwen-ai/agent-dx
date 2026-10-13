@@ -51,6 +51,7 @@ class SandboxError(RuntimeError):
         outcome: Optional[str] = None,
         operation_id: Optional[str] = None,
         instance_id: Optional[str] = None,
+        failure: Optional[Dict[str, Any]] = None,
     ):
         super().__init__(message)
         self.request_id = request_id
@@ -59,6 +60,7 @@ class SandboxError(RuntimeError):
         self.outcome = outcome
         self.operation_id = operation_id
         self.instance_id = instance_id
+        self.failure = failure
 
 
 class SandboxNotFound(SandboxError):
@@ -677,12 +679,12 @@ class SandboxClient:
             instance_id=sandbox_id,
         ) from last_error
 
-    def instance_info(self, sandbox_id: str) -> Dict[str, Any]:
+    def instance_info(self, sandbox_id: str, *, timeout: float = 60) -> Dict[str, Any]:
         """Return one instance summary from the existing frontend watcher API."""
         resp = self._http.get(
             f"{self._origin}/api/instances",
             params={"instance_id": sandbox_id},
-            timeout=60,
+            timeout=timeout,
         )
         if resp.status_code == 404:
             raise SandboxNotFound(sandbox_id)
@@ -913,6 +915,22 @@ class SandboxClient:
             self._direct_disabled = True
             return {}, True
         detail = last_error or "invoke deadline exhausted"
+        # The failed data connection alone cannot classify OOM. Consult the
+        # authenticated catalog only on this recovery path, within the same
+        # deadline. A still-running or unavailable record preserves uncertainty.
+        remaining = self._remaining_timeout(deadline)
+        if remaining is None or remaining > 0:
+            try:
+                info = self.instance_info(sandbox_id, timeout=min(2.0, remaining) if remaining is not None else 2.0)
+            except (SandboxError, httpx.RequestError):
+                info = {}
+            failure = info.get("failure")
+            if info.get("status") == "failed" and isinstance(failure, dict) and failure.get("reason") == "OomKilled":
+                raise SandboxError(
+                    "sandbox backend was OOM-killed",
+                    request_id=request_id, code="SANDBOX_OOM", retry="never", outcome="terminal",
+                    operation_id=request_id, instance_id=sandbox_id, failure=failure,
+                ) from last_error
         raise SandboxError(
             (f"direct invoke outcome is unknown after {attempts} attempts (requestId={request_id}): {detail}"),
             request_id=request_id,

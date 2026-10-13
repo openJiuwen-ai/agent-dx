@@ -8,7 +8,7 @@ use rmpv::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
-use std::os::unix::process::CommandExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -32,6 +32,7 @@ struct ExitState {
     // never be signalled after the OS has made it reusable.
     signal_guard: Mutex<()>,
     code: Mutex<Option<i64>>,
+    signal: Mutex<Option<i32>>,
     finished_at_ms: Mutex<Option<u64>>,
     killed: AtomicBool,
     timed_out: AtomicBool,
@@ -292,6 +293,7 @@ fn make_exit_state() -> Arc<ExitState> {
     Arc::new(ExitState {
         signal_guard: Mutex::new(()),
         code: Mutex::new(None),
+        signal: Mutex::new(None),
         finished_at_ms: Mutex::new(None),
         killed: AtomicBool::new(false),
         timed_out: AtomicBool::new(false),
@@ -526,6 +528,16 @@ fn record_value(record: &CommandSnapshot, include_output: bool) -> Value {
         ("stdout", Value::from(stdout)),
         ("stderr", Value::from(stderr)),
         ("exit_code", code.map(Value::from).unwrap_or(Value::Nil)),
+        (
+            "exit_signal",
+            record
+                .exit
+                .signal
+                .lock()
+                .unwrap()
+                .map(Value::from)
+                .unwrap_or(Value::Nil),
+        ),
         ("created_at_ms", Value::from(record.created_at_ms)),
         (
             "started_at_ms",
@@ -777,6 +789,7 @@ pub fn cmd_start(kw: &BTreeMap<String, Value>) -> Value {
             let signal_guard = waiter_exit.signal_guard.lock().unwrap();
             match child.try_wait() {
                 Ok(Some(result)) => {
+                    *waiter_exit.signal.lock().unwrap() = result.signal();
                     *waiter_exit.code.lock().unwrap() = Some(result.code().unwrap_or(-1) as i64);
                     *waiter_exit.finished_at_ms.lock().unwrap() = Some(now_ms());
                     waiter_exit.state_version.fetch_add(1, Ordering::AcqRel);
@@ -791,11 +804,9 @@ pub fn cmd_start(kw: &BTreeMap<String, Value>) -> Value {
                     unsafe {
                         libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
                     }
-                    let code = child
-                        .wait()
-                        .ok()
-                        .and_then(|result| result.code())
-                        .unwrap_or(-1) as i64;
+                    let result = child.wait().ok();
+                    *waiter_exit.signal.lock().unwrap() = result.and_then(|result| result.signal());
+                    let code = result.and_then(|result| result.code()).unwrap_or(-1) as i64;
                     *waiter_exit.code.lock().unwrap() = Some(code);
                     *waiter_exit.finished_at_ms.lock().unwrap() = Some(now_ms());
                     waiter_exit.state_version.fetch_add(1, Ordering::AcqRel);
@@ -1121,6 +1132,23 @@ mod tests {
             .iter()
             .find_map(|(key, value)| (key.as_str() == Some(name)).then_some(value))
             .unwrap()
+    }
+
+    #[test]
+    fn background_command_retains_the_signal_in_replayed_result() {
+        let started = cmd_start(&BTreeMap::from([(
+            "cmd".into(),
+            Value::from("exec sh -c 'kill -9 $$'"),
+        )]));
+        let lookup = BTreeMap::from([
+            ("pid".into(), field(&started, "pid").clone()),
+            ("wait_timeout".into(), Value::from(5)),
+        ]);
+        for _ in 0..2 {
+            let result = cmd_poll(&lookup);
+            assert_eq!(field(&result, "exit_signal").as_i64(), Some(9));
+            assert!(field(&result, "error_code").is_nil());
+        }
     }
 
     #[test]

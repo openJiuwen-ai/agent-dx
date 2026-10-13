@@ -124,6 +124,11 @@ fn record_roundtrip_preserves_identity_state_and_ownership() {
         },
         resources_held: true,
         checkpoint: None,
+        failure: Some(adx_core::RuntimeFailure {
+            reason: adx_core::RuntimeFailureReason::OomKilled,
+            exit_code: Some(137),
+            message: "sandbox backend was OOM-killed".into(),
+        }),
         last_operation: None,
     };
     let persisted = serde_json::to_vec(&r).unwrap();

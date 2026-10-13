@@ -85,6 +85,7 @@ impl Session {
                 },
                 resources_held: false,
                 checkpoint: Some(checkpoint),
+                failure: None,
                 last_operation: None,
                 restart_attempts: 0,
                 restart_pending: false,

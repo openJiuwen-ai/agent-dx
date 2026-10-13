@@ -891,6 +891,18 @@ components:
         required_cpu: {type: integer, format: int64, description: CPU millicores}
         required_mem: {type: integer, format: int64, description: Memory MiB}
         image: {type: string}
+        failure:
+          oneOf:
+            - type: "null"
+            - $ref: "#/components/schemas/SandboxFailure"
+    SandboxFailure:
+      type: object
+      additionalProperties: false
+      required: [reason, exit_code, message]
+      properties:
+        reason: {type: string, enum: [OomKilled, Exited, Missing]}
+        exit_code: {type: [integer, "null"], format: int32}
+        message: {type: string}
     PauseRequest:
       type: object
       additionalProperties: false

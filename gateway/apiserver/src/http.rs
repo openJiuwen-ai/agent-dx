@@ -957,10 +957,16 @@ pub(crate) fn instance_view(owner: pb::GetEnvironmentResponse) -> Result<Value, 
         .spec
         .ok_or_else(|| Status::data_loss("environment record returned no spec"))?;
     let resource = spec.resources.unwrap_or_default();
+    let failure = record
+        .failure
+        .map(adx_core::RuntimeFailure::try_from)
+        .transpose()
+        .map_err(adx_protocol::status)?;
     Ok(json!({
         "id": spec.id,
         "tenant_id": spec.tenant_id,
         "status": state(record.state),
+        "failure": failure,
         "required_cpu": resource.cpu_millis,
         "required_mem": resource.memory_bytes / 1048576,
         "image": spec.image,

@@ -161,6 +161,7 @@ def _result(snapshot: dict) -> CommandResult:
         error_message=snapshot.get("error_message"),
         stdout_truncated=stdout_truncated,
         stderr_truncated=stderr_truncated,
+        exit_signal=snapshot.get("exit_signal"),
     )
 
 
@@ -215,6 +216,7 @@ def _info(snapshot: dict) -> CommandInfo:
         created_at=datetime.fromtimestamp(int(created_at) / 1000, timezone.utc) if created_at is not None else None,
         started_at=datetime.fromtimestamp(int(started_at) / 1000, timezone.utc) if started_at is not None else None,
         finished_at=datetime.fromtimestamp(int(finished_at) / 1000, timezone.utc) if finished_at is not None else None,
+        exit_signal=snapshot.get("exit_signal"),
     )
 
 
@@ -365,6 +367,8 @@ class Commands:
         try:
             response = self._client.invoke(self._sid, "process.capabilities", {})
         except Exception as error:
+            if isinstance(error, SandboxError) and error.code == "SANDBOX_OOM" and error.outcome == "terminal":
+                raise
             raise UnsupportedFeature(
                 "sandbox runtime does not expose the recoverable command capability",
                 sandbox_id=self._sid,
@@ -447,6 +451,8 @@ class Commands:
                     ) from error
                 raise RuntimeError(str(error.payload.get("error", error))) from error
             except Exception as error:
+                if isinstance(error, SandboxError) and error.code == "SANDBOX_OOM" and error.outcome == "terminal":
+                    raise
                 raise CommandSubmissionError(
                     f"command submission outcome is unknown: {error}",
                     command_id=stable_id,
