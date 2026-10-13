@@ -824,6 +824,15 @@ pub struct DfsReadValidation {
     pub length: u64,
 }
 
+/// Read range whose SourceCandidate is intentionally absent from the Node cache.
+/// Meta resolves it and authorizes it in the same current-head read view.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DfsMissingReadSource {
+    pub chunk_id: ChunkId,
+    pub chunk_offset: u64,
+    pub length: u64,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DfsAuthorizedRead {
     pub validation: DfsReadValidation,
@@ -843,6 +852,32 @@ pub struct DfsExternalAuthorizedRead {
 pub struct ValidateExternalReadGrants {
     pub caller_id: String,
     pub validations: Vec<DfsReadValidation>,
+}
+
+/// Speculative fixed-version read plan requiring a fresh head and authorization
+/// from one Meta authority view. No file bytes are returned by this operation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AuthorizeCurrentExternalRead {
+    pub caller_id: String,
+    pub inode_id: InodeId,
+    pub namespace_id: NamespaceId,
+    pub expected_head_version: FileVersionId,
+    pub layout_root_id: LayoutRootId,
+    /// Existing grants that must be revalidated exactly as supplied.
+    pub validations: Vec<DfsReadValidation>,
+    /// Ranges whose source was missing from the Node cache and must be resolved
+    /// in the same Meta view before authorization.
+    pub missing_sources: Vec<DfsMissingReadSource>,
+}
+
+/// A changed head never carries authority to consume the speculative plan.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum AuthorizeCurrentExternalReadReply {
+    Authorized {
+        inode: InodeRecord,
+        authorizations: Vec<DfsExternalAuthorizedRead>,
+    },
+    HeadChanged(InodeRecord),
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

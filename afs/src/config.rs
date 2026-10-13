@@ -72,6 +72,22 @@ pub struct DfsExternalBackendConfig {
     #[serde(default)]
     pub allow_http: bool,
     pub credentials_file: Option<PathBuf>,
+    /// Optional disposable content cache; omission preserves backend-only reads.
+    pub cache: Option<DfsExternalCacheConfig>,
+}
+
+pub(crate) const MAX_DFS_EXTERNAL_CACHE_CAPACITY_BYTES: u64 = 1 << 40;
+
+/// Bounded asynchronous cache. Neither pending nor disk data is a durable replica.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DfsExternalCacheConfig {
+    pub directory: PathBuf,
+    pub capacity_bytes: u64,
+    pub pending_bytes: u64,
+    /// Like JuiceFS cache-large-write: full-sized write chunks are opt-in.
+    #[serde(default)]
+    pub cache_large_write: bool,
 }
 
 impl DfsExternalBackendConfig {
@@ -114,6 +130,18 @@ impl DfsExternalBackendConfig {
         {
             return Err(invalid(
                 "external backend credentials_file must be absolute",
+            ));
+        }
+        if let Some(cache) = &self.cache
+            && (!cache.directory.is_absolute()
+                || cache.capacity_bytes == 0
+                || cache.pending_bytes == 0
+                || cache.pending_bytes > cache.capacity_bytes
+                || cache.capacity_bytes > MAX_DFS_EXTERNAL_CACHE_CAPACITY_BYTES
+                || usize::try_from(cache.pending_bytes).is_err())
+        {
+            return Err(invalid(
+                "external cache requires an absolute directory, capacity up to 1 TiB and non-zero pending bytes no greater than capacity",
             ));
         }
         Ok(())

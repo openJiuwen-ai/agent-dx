@@ -69,6 +69,12 @@ pub struct StagedChunk {
     pub operation_id: OperationId,
     pub chunk: ChunkObject,
     bytes: Arc<[u8]>,
+    // This private identity is produced only by the complete initial hash. Public
+    // metadata remains compatible with replica callers, but is not itself proof.
+    #[cfg(feature = "dfs")]
+    sealed_chunk: ChunkObject,
+    #[cfg(feature = "dfs")]
+    write_budget: Vec<WriteBudgetReservation>,
 }
 
 impl StagedChunk {
@@ -87,18 +93,120 @@ impl StagedChunk {
         };
         Self {
             operation_id,
+            #[cfg(feature = "dfs")]
+            sealed_chunk: chunk.clone(),
             chunk,
             bytes,
+            #[cfg(feature = "dfs")]
+            write_budget: Vec::new(),
         }
     }
 
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }
+
+    /// Content proof only: operation identity, authorization and persistence
+    /// still require their own checks. No mutable payload is exposed.
+    #[cfg(feature = "dfs")]
+    pub(super) fn has_sealed_identity(&self) -> bool {
+        self.chunk == self.sealed_chunk && self.chunk.length == self.bytes.len() as u64
+    }
+
+    #[cfg(feature = "dfs")]
+    pub(super) fn retain_write_budget(&mut self, reservations: &[WriteBudgetReservation]) {
+        self.write_budget.extend_from_slice(reservations);
+    }
+
+    #[cfg(feature = "dfs")]
+    pub(crate) fn shared_bytes(&self) -> Arc<[u8]> {
+        self.bytes.clone()
+    }
+}
+
+#[cfg(feature = "dfs")]
+impl AsRef<[u8]> for StagedChunk {
+    fn as_ref(&self) -> &[u8] {
+        self.bytes()
+    }
+}
+
+// The VFS owns admission limits. These typed leases live beside their immutable
+// payload so HTTP body/retry ownership can outlive a ticket or a dirty window.
+#[cfg(feature = "dfs")]
+#[derive(Debug, Default)]
+pub(super) struct DeferredWriteBudget {
+    pub(super) state: Mutex<DeferredWriteBudgetState>,
+}
+
+#[cfg(feature = "dfs")]
+#[derive(Debug, Default)]
+pub(super) struct DeferredWriteBudgetState {
+    pub(super) normal_bytes: u64,
+    pub(super) descriptor_bytes: u64,
+    pub(super) descriptors: usize,
+}
+
+#[cfg(feature = "dfs")]
+#[derive(Clone, Debug)]
+pub(super) struct WriteBudgetReservation {
+    _inner: Arc<WriteBudgetReservationInner>,
+}
+
+#[cfg(feature = "dfs")]
+#[derive(Debug)]
+struct WriteBudgetReservationInner {
+    budget: Arc<DeferredWriteBudget>,
+    normal_bytes: u64,
+    descriptor_bytes: u64,
+    descriptors: usize,
+}
+
+#[cfg(feature = "dfs")]
+impl WriteBudgetReservation {
+    pub(super) fn new(
+        budget: Arc<DeferredWriteBudget>,
+        normal_bytes: u64,
+        descriptor_bytes: u64,
+        descriptors: usize,
+    ) -> Self {
+        Self {
+            _inner: Arc::new(WriteBudgetReservationInner {
+                budget,
+                normal_bytes,
+                descriptor_bytes,
+                descriptors,
+            }),
+        }
+    }
+}
+
+#[cfg(feature = "dfs")]
+impl Drop for WriteBudgetReservationInner {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.budget.state.lock() {
+            state.normal_bytes = state.normal_bytes.saturating_sub(self.normal_bytes);
+            state.descriptor_bytes = state.descriptor_bytes.saturating_sub(self.descriptor_bytes);
+            state.descriptors = state.descriptors.saturating_sub(self.descriptors);
+        }
+    }
 }
 
 pub trait ChunkStore: Send + Sync {
     fn put_batch(&self, staged: Vec<StagedChunk>) -> Result<Vec<ChunkReceipt>>;
+
+    fn supports_deferred_put(&self) -> bool {
+        false
+    }
+
+    /// Submit owned chunks without waiting for persistence. Unsupported backends
+    /// reject explicitly; callers must check supports_deferred_put first.
+    fn put_batch_deferred(&self, _staged: Vec<StagedChunk>) -> Result<Box<dyn DeferredChunkPut>> {
+        Err(Error::coded(
+            afs_error::NODE_VFS_UNIMPLEMENTED,
+            "deferred chunk PUT is unsupported for this backend",
+        ))
+    }
 
     fn put(&self, staged: StagedChunk) -> Result<ChunkReceipt> {
         self.put_batch(vec![staged])?
@@ -114,6 +222,10 @@ pub trait ChunkStore: Send + Sync {
             "ChunkStore capacity is unsupported for this backend",
         ))
     }
+}
+
+pub trait DeferredChunkPut: Send {
+    fn wait(self: Box<Self>) -> Result<Vec<ChunkReceipt>>;
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

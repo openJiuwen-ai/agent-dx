@@ -1,0 +1,138 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1320 1100" role="img" aria-labelledby="title desc">
+<title id="title">DFS 外部 S3 · 预上传、持久发布与独立读取</title><desc id="desc">顺序写满4MiB后预上传，共享四路PUT，最多64MiB窗口。fsync等待必要PUT回执及Meta持久确认。读Node独立取得Meta授权，从有界缓存或S3读取完整校验后的内容，检查对象身份和授权期限后返回。</desc>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10Z" fill="#516b83"/></marker></defs>
+<style>text{font-family:system-ui,-apple-system,"PingFang SC",sans-serif;fill:#17324d}.title{font-size:24px;font-weight:650}.head{font-size:18px;font-weight:650}.body{font-size:15px}.small{font-size:13px;fill:#526b7c}.edge{fill:none;stroke:#516b83;stroke-width:1.7;marker-end:url(#arrow)}.control{stroke-dasharray:6 4}.box{stroke:#b7ccd9;stroke-width:1.4}.life{stroke:#afc4d2;stroke-width:1.2;stroke-dasharray:5 5}</style>
+<rect width="1320" height="1100" rx="16" fill="#f5f8fb"/>
+<text x="32" y="40" class="title">DFS 外部 S3 · 预上传、持久发布与独立读取</text>
+<text x="32" y="68" class="small">仅外部 S3 模式；逻辑时序不表示固定 RPC 次数，也不代替节点复制模式。</text>
+<rect x="14" y="95" width="172" height="48" rx="10" fill="#e8f0fc" stroke="#b7ccd9"/>
+<text x="100" y="125" class="body" text-anchor="middle">写应用 A</text>
+<path d="M100 143V1020" class="life"/>
+<rect x="234" y="95" width="172" height="48" rx="10" fill="#e8f0fc" stroke="#b7ccd9"/>
+<text x="320" y="125" class="body" text-anchor="middle">写 Node A / DFS</text>
+<path d="M320 143V1020" class="life"/>
+<rect x="479" y="95" width="172" height="48" rx="10" fill="#e8f0fc" stroke="#b7ccd9"/>
+<text x="565" y="125" class="body" text-anchor="middle">S3 后端</text>
+<path d="M565 143V1020" class="life"/>
+<rect x="714" y="95" width="172" height="48" rx="10" fill="#e8f0fc" stroke="#b7ccd9"/>
+<text x="800" y="125" class="body" text-anchor="middle">afs-meta</text>
+<path d="M800 143V1020" class="life"/>
+<rect x="949" y="95" width="172" height="48" rx="10" fill="#e8f0fc" stroke="#b7ccd9"/>
+<text x="1035" y="125" class="body" text-anchor="middle">读 Node B / DFS</text>
+<path d="M1035 143V1020" class="life"/>
+<rect x="1144" y="95" width="172" height="48" rx="10" fill="#e8f0fc" stroke="#b7ccd9"/>
+<text x="1230" y="125" class="body" text-anchor="middle">读应用 B</text>
+<path d="M1230 143V1020" class="life"/>
+<path d="M100 185H320" class="edge"/>
+<text x="210.0" y="176" class="small" text-anchor="middle">顺序 write → dirty</text>
+<path d="M320 235H565" class="edge"/>
+<text x="442.5" y="226" class="small" text-anchor="middle">满 4MiB：预上传 PUT</text>
+<path d="M565 279H320" class="edge"/>
+<text x="442.5" y="270" class="small" text-anchor="middle">持久成功回执 / 失败</text>
+<rect x="217" y="308" width="440" height="76" rx="12" class="box" fill="#fff1db"/>
+<text x="233" y="337" class="head">有界流水线</text>
+<text x="233" y="363" class="body">后续 write 与 PUT 重叠；全 Node 最多四路 PUT</text>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<path d="M100 424H320" class="edge"/>
+<text x="210.0" y="415" class="small" text-anchor="middle">fsync / flush / 窗口封口</text>
+<text x="343" y="452" class="small">等待本窗口全部必要回执；最多 64MiB</text>
+<path d="M320 490H800" class="edge control"/>
+<text x="560.0" y="481" class="small" text-anchor="middle">精确提交：FileVersion / 布局 / 外部对象引用</text>
+<rect x="700" y="515" width="420" height="76" rx="12" class="box" fill="#e8f0fc"/>
+<text x="716" y="544" class="head">Meta 条件事务</text>
+<text x="716" y="570" class="body">校验租约与回执，持久后端接受后发布 head</text>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<path d="M800 625H320" class="edge control"/>
+<text x="560.0" y="616" class="small" text-anchor="middle">Meta 持久 ACK</text>
+<path d="M320 669H100" class="edge"/>
+<text x="210.0" y="660" class="small" text-anchor="middle">成功同步；失败不能伪成功</text>
+<path d="M1230 720H1035" class="edge"/>
+<text x="1132.5" y="711" class="small" text-anchor="middle">open / read</text>
+<path d="M1035 763H800" class="edge control"/>
+<text x="917.5" y="754" class="small" text-anchor="middle">版本视图 / 读授权</text>
+<path d="M800 807H1035" class="edge control"/>
+<text x="917.5" y="798" class="small" text-anchor="middle">对象身份、范围、期限</text>
+<path d="M1035 853H565" class="edge"/>
+<text x="800.0" y="844" class="small" text-anchor="middle">缓存未命中：GET 完整对象</text>
+<path d="M565 895H1035" class="edge"/>
+<text x="800.0" y="886" class="small" text-anchor="middle">对象字节 / 实际错误</text>
+<rect x="805" y="920" width="490" height="76" rx="12" class="box" fill="#e6f4ef"/>
+<text x="821" y="949" class="head">读端缓存与校验</text>
+<text x="821" y="975" class="body">新加载完整校验；命中仍核对身份、授权及最终期限</text>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<path d="M1035 1025H1230" class="edge"/>
+<text x="1132.5" y="1016" class="small" text-anchor="middle">返回授权范围</text>
+<text x="32" y="1062" class="body">PUT 失败不发布；Meta ACK 不明保留精确请求重试。缓存不算耐久副本，读取不要求 A 在线。</text>
+</svg>

@@ -33,7 +33,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "dfs")]
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-#[cfg(any(feature = "ownerfs", feature = "dfs"))]
+#[cfg(feature = "ownerfs")]
 use tonic::transport::Channel;
 use tonic::transport::Endpoint;
 
@@ -857,7 +857,7 @@ pub async fn register_node_with_readiness(
 /// Synchronous adapter used by the DFS Backend on FUSE worker threads.
 #[cfg(feature = "dfs")]
 pub struct GrpcDfsMeta {
-    channel: Channel,
+    channel: afs_tracing::TracedChannel,
     runtime: tokio::runtime::Handle,
     node_id: String,
     session_id: String,
@@ -891,7 +891,7 @@ impl GrpcDfsMeta {
             .configure_client(endpoint)
             .map_err(|error| Error::coded(CLIENT_ARGUMENT_INVALID, error.to_string()))?;
         Ok(Self {
-            channel: endpoint.connect_lazy(),
+            channel: afs_tracing::traced_channel(endpoint.connect_lazy()),
             runtime: tokio::runtime::Handle::current(),
             node_id,
             session_id,
@@ -958,11 +958,15 @@ impl GrpcDfsMeta {
         false
     }
 
-    fn client(&self) -> afs_protocol::meta::dfs_meta_client::DfsMetaClient<Channel> {
+    fn client(
+        &self,
+    ) -> afs_protocol::meta::dfs_meta_client::DfsMetaClient<afs_tracing::TracedChannel> {
         afs_protocol::meta::dfs_meta_client::DfsMetaClient::new(self.channel.clone())
     }
 
-    fn root_client(&self) -> afs_protocol::meta::meta_client::MetaClient<Channel> {
+    fn root_client(
+        &self,
+    ) -> afs_protocol::meta::meta_client::MetaClient<afs_tracing::TracedChannel> {
         afs_protocol::meta::meta_client::MetaClient::new(self.channel.clone())
     }
 
@@ -1037,14 +1041,16 @@ impl GrpcDfsMeta {
         let reply = self
             .run(
                 self.client().validate_external_read_grants(
-                    afs_protocol::meta::ValidateExternalReadGrantsRequest {
-                        caller_id: request.caller_id,
-                        validations: request
-                            .validations
-                            .into_iter()
-                            .map(wire_read_validation)
-                            .collect(),
-                    },
+                    afs_tracing::request_with_current_context(
+                        afs_protocol::meta::ValidateExternalReadGrantsRequest {
+                            caller_id: request.caller_id,
+                            validations: request
+                                .validations
+                                .into_iter()
+                                .map(wire_read_validation)
+                                .collect(),
+                        },
+                    ),
                 ),
             )?
             .into_inner();
@@ -1053,6 +1059,55 @@ impl GrpcDfsMeta {
             .into_iter()
             .map(domain_external_authorized_read)
             .collect()
+    }
+
+    pub fn authorize_current_external_read(
+        &self,
+        request: crate::dfs::AuthorizeCurrentExternalRead,
+    ) -> afs_error::Result<Option<crate::dfs::AuthorizeCurrentExternalReadReply>> {
+        let response = self.runtime.block_on(async {
+            tokio::time::timeout(
+                self.timeout,
+                self.client().authorize_current_external_read(
+                    afs_tracing::request_with_current_context(
+                        afs_protocol::meta::AuthorizeCurrentExternalReadRequest {
+                            caller_id: request.caller_id,
+                            inode_id: request.inode_id.0,
+                            namespace_id: request.namespace_id.0,
+                            expected_head_version_id: request.expected_head_version.0,
+                            layout_root_id: request.layout_root_id.0,
+                            validations: request
+                                .validations
+                                .into_iter()
+                                .map(wire_read_validation)
+                                .collect(),
+                            missing_sources: request
+                                .missing_sources
+                                .into_iter()
+                                .map(|missing| afs_protocol::meta::DfsMissingReadSource {
+                                    chunk_id: missing.chunk_id.0,
+                                    chunk_offset: missing.chunk_offset,
+                                    length: missing.length,
+                                })
+                                .collect(),
+                        },
+                    ),
+                ),
+            )
+            .await
+        });
+        let reply = match response {
+            Err(_) => {
+                return Err(Error::coded(
+                    afs_error::CLIENT_DEADLINE_EXCEEDED,
+                    "DFS Meta request timed out",
+                ));
+            }
+            Ok(Err(status)) if current_external_read_is_unimplemented(&status) => return Ok(None),
+            Ok(Err(status)) => return Err(Self::dfs_meta_status_to_error(status)),
+            Ok(Ok(response)) => response.into_inner(),
+        };
+        domain_authorize_current_external_read_reply(reply).map(Some)
     }
 
     pub fn validate_replica_write(
@@ -1223,17 +1278,19 @@ impl crate::node::dfs_read::ReadSourceProvider for GrpcDfsMeta {
         let reply = self
             .run(
                 self.client()
-                    .get_chunk_sources(afs_protocol::meta::GetDfsChunkSourcesRequest {
-                        caller_id: request.caller_id,
-                        namespace_id: request.namespace_id.0,
-                        file_version_id: request.file_version_id.0,
-                        layout_root_id: request.layout_root_id.0,
-                        chunk_ids: request
-                            .chunk_ids
-                            .into_iter()
-                            .map(|chunk_id| chunk_id.0)
-                            .collect(),
-                    }),
+                    .get_chunk_sources(afs_tracing::request_with_current_context(
+                        afs_protocol::meta::GetDfsChunkSourcesRequest {
+                            caller_id: request.caller_id,
+                            namespace_id: request.namespace_id.0,
+                            file_version_id: request.file_version_id.0,
+                            layout_root_id: request.layout_root_id.0,
+                            chunk_ids: request
+                                .chunk_ids
+                                .into_iter()
+                                .map(|chunk_id| chunk_id.0)
+                                .collect(),
+                        },
+                    )),
             )?
             .into_inner();
         Ok(crate::dfs::DfsChunkSourcesReply {
@@ -1249,6 +1306,13 @@ impl crate::node::dfs_read::ReadSourceProvider for GrpcDfsMeta {
 
 #[cfg(feature = "dfs")]
 impl crate::node::dfs_read::ExternalReadAuthorizer for GrpcDfsMeta {
+    fn authorize_current_external_read(
+        &self,
+        request: crate::dfs::AuthorizeCurrentExternalRead,
+    ) -> afs_error::Result<Option<crate::dfs::AuthorizeCurrentExternalReadReply>> {
+        GrpcDfsMeta::authorize_current_external_read(self, request)
+    }
+
     fn validate_external_read_grants(
         &self,
         caller_id: &str,
@@ -1608,9 +1672,11 @@ impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
         let reply = self
             .run(
                 self.client()
-                    .get_inode(afs_protocol::meta::GetDfsInodeRequest {
-                        inode_id: inode_id.0.clone(),
-                    }),
+                    .get_inode(afs_tracing::request_with_current_context(
+                        afs_protocol::meta::GetDfsInodeRequest {
+                            inode_id: inode_id.0.clone(),
+                        },
+                    )),
             )?
             .into_inner();
         required(reply.inode, "GetDfsInode.inode").and_then(domain_dfs_inode)
@@ -1623,9 +1689,11 @@ impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
         let reply = self
             .run(
                 self.client()
-                    .get_file_version(afs_protocol::meta::GetFileVersionRequest {
-                        version_id: version_id.0.clone(),
-                    }),
+                    .get_file_version(afs_tracing::request_with_current_context(
+                        afs_protocol::meta::GetFileVersionRequest {
+                            version_id: version_id.0.clone(),
+                        },
+                    )),
             )?
             .into_inner();
         Ok((
@@ -1832,24 +1900,26 @@ impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
         let reply = self
             .run_with_timeout(
                 self.client()
-                    .commit_file_version(afs_protocol::meta::CommitFileVersionRequest {
-                        caller_id: self.node_id.clone(),
-                        operation_id: commit.operation_id.0,
-                        inode_id: commit.inode_id.0,
-                        write_lease: Some(wire_dfs_write_lease(commit.write_lease)),
-                        expected_inode_revision: commit.expected_inode_revision,
-                        expected_head_version_id: commit
-                            .expected_head_version
-                            .map_or_else(String::new, |id| id.0),
-                        version: Some(wire_dfs_version(commit.file_version)),
-                        layout: Some(wire_dfs_layout(commit.layout_root)),
-                        chunk_receipts: commit
-                            .chunk_receipts
-                            .into_iter()
-                            .map(wire_chunk_receipt)
-                            .collect(),
-                        metadata_delta: Some(wire_dfs_metadata_delta(commit.metadata_delta)),
-                    }),
+                    .commit_file_version(afs_tracing::request_with_current_context(
+                        afs_protocol::meta::CommitFileVersionRequest {
+                            caller_id: self.node_id.clone(),
+                            operation_id: commit.operation_id.0,
+                            inode_id: commit.inode_id.0,
+                            write_lease: Some(wire_dfs_write_lease(commit.write_lease)),
+                            expected_inode_revision: commit.expected_inode_revision,
+                            expected_head_version_id: commit
+                                .expected_head_version
+                                .map_or_else(String::new, |id| id.0),
+                            version: Some(wire_dfs_version(commit.file_version)),
+                            layout: Some(wire_dfs_layout(commit.layout_root)),
+                            chunk_receipts: commit
+                                .chunk_receipts
+                                .into_iter()
+                                .map(wire_chunk_receipt)
+                                .collect(),
+                            metadata_delta: Some(wire_dfs_metadata_delta(commit.metadata_delta)),
+                        },
+                    )),
                 timeout,
             )?
             .into_inner();
@@ -2536,6 +2606,38 @@ fn wire_read_validation(
         chunk_offset: validation.chunk_offset,
         length: validation.length,
     }
+}
+
+#[cfg(feature = "dfs")]
+fn current_external_read_is_unimplemented(status: &tonic::Status) -> bool {
+    status.code() == tonic::Code::Unimplemented
+}
+
+#[cfg(feature = "dfs")]
+fn domain_authorize_current_external_read_reply(
+    reply: afs_protocol::meta::AuthorizeCurrentExternalReadReply,
+) -> afs_error::Result<crate::dfs::AuthorizeCurrentExternalReadReply> {
+    let inode = domain_dfs_inode(required(reply.inode, "AuthorizeCurrentExternalRead.inode")?)?;
+    if reply.head_changed {
+        if !reply.authorizations.is_empty() {
+            return Err(Error::coded(
+                CLIENT_PROTOCOL_VIOLATION,
+                "head-changed current external read must not include authorizations",
+            ));
+        }
+        return Ok(crate::dfs::AuthorizeCurrentExternalReadReply::HeadChanged(
+            inode,
+        ));
+    }
+    let authorizations = reply
+        .authorizations
+        .into_iter()
+        .map(domain_external_authorized_read)
+        .collect::<afs_error::Result<Vec<_>>>()?;
+    Ok(crate::dfs::AuthorizeCurrentExternalReadReply::Authorized {
+        inode,
+        authorizations,
+    })
 }
 
 #[cfg(feature = "dfs")]
@@ -3398,6 +3500,132 @@ mod tests {
             )),
         });
         assert!(domain_external_authorized_read(node_receiver).is_err());
+    }
+
+    fn current_read_inode(head: &str) -> afs_protocol::meta::DfsInodeRecord {
+        afs_protocol::meta::DfsInodeRecord {
+            namespace_id: "default".into(),
+            inode_id: "inode:test".into(),
+            kind: afs_protocol::meta::DfsInodeKind::Regular as i32,
+            attributes: Some(afs_protocol::meta::DfsInodeAttributes {
+                mode: 0o640,
+                uid: 1000,
+                gid: 1000,
+                nlink: 1,
+                atime_unix_ms: 1,
+                mtime_unix_ms: 1,
+                ctime_unix_ms: 1,
+            }),
+            head_version_id: head.into(),
+            revision: 1,
+            symlink_target: Vec::new(),
+            xattrs: Vec::new(),
+            special_node: None,
+        }
+    }
+
+    fn current_read_authorization() -> afs_protocol::meta::DfsExternalAuthorizedRead {
+        let chunk_id = crate::dfs::ChunkId::new(format!("blake3-{}-4", "b".repeat(64)));
+        let key = crate::dfs::external_object_key("filesystem", "g1", &chunk_id).unwrap();
+        afs_protocol::meta::DfsExternalAuthorizedRead {
+            authorized: Some(afs_protocol::meta::DfsAuthorizedRead {
+                validation: Some(afs_protocol::meta::DfsReadValidation {
+                    grant: Some(afs_protocol::meta::DfsReadGrant::default()),
+                    chunk_id: chunk_id.0.clone(),
+                    copy_id: "external-copy".into(),
+                    chunk_offset: 0,
+                    length: 4,
+                }),
+                allowed_ranges: vec![afs_protocol::meta::dfs_authorized_read::Range {
+                    offset: 0,
+                    length: 4,
+                }],
+                expires_at_unix_ms: 10,
+            }),
+            chunk: Some(afs_protocol::meta::DfsChunkObject {
+                chunk_id: chunk_id.0,
+                length: 4,
+                content_digest: vec![0xbb; 32],
+                content_digest_algorithm: afs_protocol::meta::DfsDigestAlgorithm::Blake3 as i32,
+            }),
+            location: Some(afs_protocol::meta::DfsCopyLocation {
+                location: Some(afs_protocol::meta::dfs_copy_location::Location::External(
+                    afs_protocol::meta::dfs_copy_location::External {
+                        store_id: "filesystem".into(),
+                        object_key: key,
+                        object_revision: "g1".into(),
+                    },
+                )),
+            }),
+        }
+    }
+
+    #[test]
+    fn current_external_reply_rejects_head_changed_authorizations() {
+        let reply = afs_protocol::meta::AuthorizeCurrentExternalReadReply {
+            inode: Some(current_read_inode("next")),
+            head_changed: true,
+            authorizations: vec![current_read_authorization()],
+        };
+        assert_eq!(
+            domain_authorize_current_external_read_reply(reply)
+                .unwrap_err()
+                .code(),
+            CLIENT_PROTOCOL_VIOLATION
+        );
+    }
+
+    #[test]
+    fn current_external_reply_requires_inode() {
+        let reply = afs_protocol::meta::AuthorizeCurrentExternalReadReply {
+            inode: None,
+            head_changed: false,
+            authorizations: Vec::new(),
+        };
+        assert_eq!(
+            domain_authorize_current_external_read_reply(reply)
+                .unwrap_err()
+                .code(),
+            CLIENT_PROTOCOL_VIOLATION
+        );
+    }
+
+    #[test]
+    fn current_external_reply_decodes_authorized_and_head_changed_shapes() {
+        let authorized = afs_protocol::meta::AuthorizeCurrentExternalReadReply {
+            inode: Some(current_read_inode("version")),
+            head_changed: false,
+            authorizations: vec![current_read_authorization()],
+        };
+        assert!(matches!(
+            domain_authorize_current_external_read_reply(authorized).unwrap(),
+            crate::dfs::AuthorizeCurrentExternalReadReply::Authorized { authorizations, .. }
+                if authorizations.len() == 1
+        ));
+
+        let head_changed = afs_protocol::meta::AuthorizeCurrentExternalReadReply {
+            inode: Some(current_read_inode("next")),
+            head_changed: true,
+            authorizations: Vec::new(),
+        };
+        assert!(matches!(
+            domain_authorize_current_external_read_reply(head_changed).unwrap(),
+            crate::dfs::AuthorizeCurrentExternalReadReply::HeadChanged(inode)
+                if inode.head_version == Some(crate::dfs::FileVersionId::new("next"))
+        ));
+    }
+
+    #[test]
+    fn current_external_unsupported_filter_is_exact_tonic_unimplemented() {
+        assert!(current_external_read_is_unimplemented(
+            &tonic::Status::unimplemented("old meta")
+        ));
+        assert!(!current_external_read_is_unimplemented(
+            &tonic::Status::permission_denied("no")
+        ));
+        assert!(!current_external_read_is_unimplemented(
+            &tonic::Status::deadline_exceeded("slow")
+        ));
     }
 
     use std::time::Instant;

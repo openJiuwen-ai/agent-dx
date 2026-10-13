@@ -1422,6 +1422,8 @@ async fn run_node(
         dfs_rdma_pool.clone(),
     )?;
     #[cfg(feature = "dfs")]
+    let mut dfs_external_store_for_shutdown: Option<Arc<external_chunk::S3ChunkStore>> = None;
+    #[cfg(feature = "dfs")]
     let dfs_instance = if cfg.dfs {
         let namespace = crate::dfs::NamespaceId::new("default");
         let meta = dfs_meta
@@ -1448,6 +1450,15 @@ async fn run_node(
                 ),
                 request_timeout: timeout,
                 max_retries: 2,
+                cache: backend
+                    .cache
+                    .as_ref()
+                    .map(|cache| external_chunk::S3ChunkCacheOptions {
+                        directory: cache.directory.clone(),
+                        capacity_bytes: cache.capacity_bytes,
+                        pending_bytes: cache.pending_bytes,
+                        cache_large_write: cache.cache_large_write,
+                    }),
             };
             Some(Arc::new(
                 tokio::task::spawn_blocking(move || external_chunk::S3ChunkStore::new(options))
@@ -1456,6 +1467,7 @@ async fn run_node(
         } else {
             None
         };
+        dfs_external_store_for_shutdown = external_store.clone();
         let chunk_store: Arc<dyn chunk::ChunkStore> = match &external_store {
             Some(store) => store.clone(),
             None => Arc::new(replication::DfsChunkStore::new_with_epoch(
@@ -2223,6 +2235,20 @@ async fn run_node(
             }
             Err(error) => {
                 afs_logging::error!("dfs.node_drain_worker_failed"; "error" => error.to_string());
+                remember_shutdown_error(&mut shutdown_error, error.into());
+            }
+        }
+    }
+    #[cfg(feature = "dfs")]
+    if let Some(store) = dfs_external_store_for_shutdown {
+        match tokio::task::spawn_blocking(move || store.shutdown_verifier()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                afs_logging::error!("dfs.external_store_shutdown_failed"; "error" => error.to_string());
+                remember_shutdown_error(&mut shutdown_error, error.into());
+            }
+            Err(error) => {
+                afs_logging::error!("dfs.external_store_shutdown_failed"; "error" => error.to_string());
                 remember_shutdown_error(&mut shutdown_error, error.into());
             }
         }

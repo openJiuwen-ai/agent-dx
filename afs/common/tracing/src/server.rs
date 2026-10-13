@@ -111,8 +111,19 @@ fn is_periodic_method(method: &str) -> bool {
     method.ends_with("/Heartbeat")
 }
 
-fn grpc_operation_name(_method: &str) -> &'static str {
-    "afs.grpc.server"
+fn grpc_operation_name(method: &str) -> &'static str {
+    match method {
+        "/afs.meta.v1.DfsMeta/GetInode" => "afs.meta.v1.DfsMeta.GetInode",
+        "/afs.meta.v1.DfsMeta/ValidateExternalReadGrants" => {
+            "afs.meta.v1.DfsMeta.ValidateExternalReadGrants"
+        }
+        "/afs.meta.v1.DfsMeta/AuthorizeCurrentExternalRead" => {
+            "afs.meta.v1.DfsMeta.AuthorizeCurrentExternalRead"
+        }
+        "/afs.meta.v1.DfsMeta/CommitFileVersion" => "afs.meta.v1.DfsMeta.CommitFileVersion",
+        "/afs.meta.v1.DfsMeta/Rename" => "afs.meta.v1.DfsMeta.Rename",
+        _ => "afs.grpc.server",
+    }
 }
 
 struct HeaderExtractor<'a>(&'a HeaderMap);
@@ -136,6 +147,30 @@ mod tests {
         assert_eq!(
             grpc_operation_name("/future.Service/Method"),
             "afs.grpc.server"
+        );
+    }
+
+    #[test]
+    fn dfs_critical_routes_use_bounded_operation_names() {
+        assert_eq!(
+            grpc_operation_name("/afs.meta.v1.DfsMeta/GetInode"),
+            "afs.meta.v1.DfsMeta.GetInode"
+        );
+        assert_eq!(
+            grpc_operation_name("/afs.meta.v1.DfsMeta/ValidateExternalReadGrants"),
+            "afs.meta.v1.DfsMeta.ValidateExternalReadGrants"
+        );
+        assert_eq!(
+            grpc_operation_name("/afs.meta.v1.DfsMeta/AuthorizeCurrentExternalRead"),
+            "afs.meta.v1.DfsMeta.AuthorizeCurrentExternalRead"
+        );
+        assert_eq!(
+            grpc_operation_name("/afs.meta.v1.DfsMeta/CommitFileVersion"),
+            "afs.meta.v1.DfsMeta.CommitFileVersion"
+        );
+        assert_eq!(
+            grpc_operation_name("/afs.meta.v1.DfsMeta/Rename"),
+            "afs.meta.v1.DfsMeta.Rename"
         );
     }
 

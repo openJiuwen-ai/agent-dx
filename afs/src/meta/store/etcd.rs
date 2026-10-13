@@ -4,6 +4,7 @@
 //! start with a fresh AFS namespace; there is no legacy data format to read.
 
 use afs_error::{Error, Result};
+use afs_tracing::{Instrument, tracing};
 use etcd_client::{Client, Compare, CompareOp, Txn, TxnOp};
 
 use super::{BackendPersistence, MetaFuture, StoreBackend};
@@ -67,42 +68,77 @@ impl EtcdBackend {
     /// A failed compare is reported as `IO_UNAVAILABLE` so callers fail closed
     /// and re-read rather than assuming their write was not committed.
     pub async fn commit(&self, expected_version: u64, bytes: &[u8]) -> Result<u64> {
-        let compare = if expected_version == 0 {
-            Compare::version(SNAPSHOT_KEY.to_vec(), CompareOp::Equal, 0)
-        } else {
-            Compare::mod_revision(
-                SNAPSHOT_KEY.to_vec(),
-                CompareOp::Equal,
-                u64_to_i64(
-                    expected_version,
-                    "snapshot version exceeds etcd i64 revision",
-                )?,
-            )
-        };
-        let txn = Txn::new().when([compare]).and_then([TxnOp::put(
-            SNAPSHOT_KEY.to_vec(),
-            bytes.to_vec(),
-            None,
-        )]);
-        let mut client = self
-            .client
-            .kv_client()
-            .max_decoding_message_size(SNAPSHOT_RPC_LIMIT)
-            .max_encoding_message_size(SNAPSHOT_RPC_LIMIT);
-        let response = client.txn(txn).await.map_err(etcd_error)?;
-        if !response.succeeded() {
-            return Err(cas_mismatch());
-        }
-        response
-            .header()
-            .map(|header| {
-                i64_to_u64(
-                    header.revision(),
-                    "etcd returned negative snapshot commit revision",
+        let span = tracing::info_span!(
+            "meta.store.etcd.commit",
+            store.backend = "etcd",
+            store.expected_version = expected_version,
+            store.snapshot_bytes = bytes.len() as u64,
+            store.committed_version = tracing::field::Empty,
+            result = tracing::field::Empty,
+        );
+        async move {
+            let compare = if expected_version == 0 {
+                Compare::version(SNAPSHOT_KEY.to_vec(), CompareOp::Equal, 0)
+            } else {
+                Compare::mod_revision(
+                    SNAPSHOT_KEY.to_vec(),
+                    CompareOp::Equal,
+                    u64_to_i64(
+                        expected_version,
+                        "snapshot version exceeds etcd i64 revision",
+                    )?,
                 )
-            })
-            .transpose()?
-            .ok_or_else(|| invalid_contract("etcd snapshot commit response had no header"))
+            };
+            let txn = Txn::new().when([compare]).and_then([TxnOp::put(
+                SNAPSHOT_KEY.to_vec(),
+                bytes.to_vec(),
+                None,
+            )]);
+            let mut client = self
+                .client
+                .kv_client()
+                .max_decoding_message_size(SNAPSHOT_RPC_LIMIT)
+                .max_encoding_message_size(SNAPSHOT_RPC_LIMIT);
+            let txn_span = tracing::info_span!(
+                "meta.store.etcd.txn",
+                store.backend = "etcd",
+                store.expected_version = expected_version,
+                store.snapshot_bytes = bytes.len() as u64,
+                store.succeeded = tracing::field::Empty,
+                result = tracing::field::Empty,
+            );
+            let response = client
+                .txn(txn)
+                .instrument(txn_span.clone())
+                .await
+                .map_err(|error| {
+                    txn_span.record("result", "error");
+                    tracing::Span::current().record("result", "error");
+                    etcd_error(error)
+                })?;
+            txn_span.record("store.succeeded", response.succeeded());
+            if !response.succeeded() {
+                txn_span.record("result", "cas_mismatch");
+                tracing::Span::current().record("result", "cas_mismatch");
+                return Err(cas_mismatch());
+            }
+            txn_span.record("result", "ok");
+            let committed_version = response
+                .header()
+                .map(|header| {
+                    i64_to_u64(
+                        header.revision(),
+                        "etcd returned negative snapshot commit revision",
+                    )
+                })
+                .transpose()?
+                .ok_or_else(|| invalid_contract("etcd snapshot commit response had no header"))?;
+            tracing::Span::current().record("store.committed_version", committed_version);
+            tracing::Span::current().record("result", "ok");
+            Ok(committed_version)
+        }
+        .instrument(span)
+        .await
     }
 }
 

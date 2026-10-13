@@ -1663,6 +1663,74 @@ impl DfsMetaService for DfsMetaRpc {
         ))
     }
 
+    async fn authorize_current_external_read(
+        &self,
+        request: Request<afs_protocol::meta::AuthorizeCurrentExternalReadRequest>,
+    ) -> Result<Response<afs_protocol::meta::AuthorizeCurrentExternalReadReply>, Status> {
+        let authenticated = authenticated_node_id(&self.0, &request)?;
+        let request = request.into_inner();
+        validate_caller(authenticated.as_deref(), &request.caller_id)?;
+        for (value, field) in [
+            (&request.caller_id, "caller_id"),
+            (&request.inode_id, "inode_id"),
+            (&request.namespace_id, "namespace_id"),
+            (
+                &request.expected_head_version_id,
+                "expected_head_version_id",
+            ),
+            (&request.layout_root_id, "layout_root_id"),
+        ] {
+            require_text(value, field)?;
+        }
+        let validations = request
+            .validations
+            .into_iter()
+            .map(domain_read_validation)
+            .collect::<Result<Vec<_>, Status>>()?;
+        let missing_sources = request
+            .missing_sources
+            .into_iter()
+            .map(domain_missing_read_source)
+            .collect::<Result<Vec<_>, Status>>()?;
+        let reply = dfs_service(&self.0)?
+            .authorize_current_external_read(crate::dfs::AuthorizeCurrentExternalRead {
+                caller_id: request.caller_id,
+                inode_id: crate::dfs::InodeId::new(request.inode_id),
+                namespace_id: crate::dfs::NamespaceId::new(request.namespace_id),
+                expected_head_version: crate::dfs::FileVersionId::new(
+                    request.expected_head_version_id,
+                ),
+                layout_root_id: crate::dfs::LayoutRootId::new(request.layout_root_id),
+                validations,
+                missing_sources,
+            })
+            .await
+            .map_err(afs_transport::grpc::error_status::error_to_status)?;
+        let (inode, head_changed, authorizations) = match reply {
+            crate::dfs::AuthorizeCurrentExternalReadReply::Authorized {
+                inode,
+                authorizations,
+            } => (inode, false, authorizations),
+            crate::dfs::AuthorizeCurrentExternalReadReply::HeadChanged(inode) => {
+                (inode, true, Vec::new())
+            }
+        };
+        Ok(Response::new(
+            afs_protocol::meta::AuthorizeCurrentExternalReadReply {
+                inode: Some(wire_dfs_inode(inode)),
+                head_changed,
+                authorizations: authorizations
+                    .into_iter()
+                    .map(|entry| afs_protocol::meta::DfsExternalAuthorizedRead {
+                        authorized: Some(wire_authorized_read(entry.authorized)),
+                        chunk: Some(wire_chunk_object(entry.chunk)),
+                        location: Some(wire_copy_location(entry.location)),
+                    })
+                    .collect(),
+            },
+        ))
+    }
+
     async fn get_chunk_sources(
         &self,
         request: Request<GetDfsChunkSourcesRequest>,
@@ -2419,6 +2487,17 @@ fn domain_replica_target(
             catalog_revision: device.catalog_revision,
             failure_domain: device.failure_domain,
         },
+    })
+}
+
+fn domain_missing_read_source(
+    missing: afs_protocol::meta::DfsMissingReadSource,
+) -> Result<crate::dfs::DfsMissingReadSource, Status> {
+    require_text(&missing.chunk_id, "missing_source.chunk_id")?;
+    Ok(crate::dfs::DfsMissingReadSource {
+        chunk_id: crate::dfs::ChunkId::new(missing.chunk_id),
+        chunk_offset: missing.chunk_offset,
+        length: missing.length,
     })
 }
 

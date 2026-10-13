@@ -22,6 +22,7 @@ use std::{
 };
 
 use afs_error::{Error, Result};
+use afs_tracing::tracing;
 use fuser::{
     AccessFlags, BackgroundSession, Config, Errno, FileAttr, FileHandle as FuseFileHandle,
     FileType, Filesystem, FopenFlags, Generation, INodeNo, InitFlags, KernelConfig, LockOwner,
@@ -609,6 +610,12 @@ impl AfsFuse {
         }
     }
 
+    fn filesystem_label(&self) -> &'static str {
+        self.requests
+            .as_ref()
+            .map_or("unknown", |(_, filesystem)| *filesystem)
+    }
+
     fn remember_cached_inode(&self, _inode: BackendInode, ino: u64) {
         #[cfg(feature = "ownerfs")]
         if let Some(ownerfs) = &self.ownerfs {
@@ -1190,28 +1197,47 @@ impl Filesystem for AfsFuse {
         let backend = self.backend.clone();
         let state = self.state.clone();
         let context = Self::context(req, 0);
+        let enqueue_at = std::time::Instant::now();
+        let filesystem = self.filesystem_label();
+        let fuse_span = tracing::info_span!(
+            "node.fuse.read",
+            filesystem,
+            ino,
+            fh,
+            offset,
+            requested_bytes = size as u64,
+            queue_wait_us = tracing::field::Empty,
+            returned_bytes = tracing::field::Empty,
+        );
         if inline_local_read {
             let mut scratch = self.inline_local_read_scratch.lock().unwrap();
-            let file = state.lock().unwrap().file_handle(fh);
-            let file = file
-                .ok_or(libc::ESTALE)
-                .and_then(|file| AfsFuse::validate_handle_inode_in(&state, ino).map(|()| file));
-            let result = match file {
-                Ok(file) => inline_local_read_data(&mut scratch, size as usize, |out| {
-                    backend
-                        .read(&context, file.handle, offset, out)
-                        .map_err(errno)
-                }),
-                Err(error) => Err(error),
-            };
+            let result = fuse_span.in_scope(|| {
+                fuse_span.record("queue_wait_us", 0_u64);
+                let file = state.lock().unwrap().file_handle(fh);
+                let file = file
+                    .ok_or(libc::ESTALE)
+                    .and_then(|file| AfsFuse::validate_handle_inode_in(&state, ino).map(|()| file));
+                match file {
+                    Ok(file) => inline_local_read_data(&mut scratch, size as usize, |out| {
+                        backend
+                            .read(&context, file.handle, offset, out)
+                            .map_err(errno)
+                    }),
+                    Err(error) => Err(error),
+                }
+            });
             match result {
-                Ok(data) => reply.data(&data),
+                Ok(data) => {
+                    fuse_span.record("returned_bytes", data.len() as u64);
+                    reply.data(&data)
+                }
                 Err(error) => reply.error(fuse_errno(error)),
             }
             return;
         }
         let run = move || {
-            let result = (|| {
+            let result = fuse_span.in_scope(|| {
+                fuse_span.record("queue_wait_us", enqueue_at.elapsed().as_micros() as u64);
                 let file = state.lock().unwrap().file_handle(fh).ok_or(libc::ESTALE)?;
                 AfsFuse::validate_handle_inode_in(&state, ino)?;
                 let mut out = vec![0; size as usize];
@@ -1224,9 +1250,12 @@ impl Filesystem for AfsFuse {
                         })
                         .map_err(errno)
                 })
-            })();
+            });
             match result {
-                Ok(data) => reply.data(&data),
+                Ok(data) => {
+                    fuse_span.record("returned_bytes", data.len() as u64);
+                    reply.data(&data)
+                }
                 Err(error) => reply.error(fuse_errno(error)),
             }
         };
@@ -1255,8 +1284,22 @@ impl Filesystem for AfsFuse {
         let options = WriteOptions {
             kill_suidgid: write_kill_suidgid(write_flags),
         };
+        let enqueue_at = std::time::Instant::now();
+        let requested_bytes = data.len() as u64;
+        let filesystem = self.filesystem_label();
+        let fuse_span = tracing::info_span!(
+            "node.fuse.write",
+            filesystem,
+            ino,
+            fh,
+            offset,
+            requested_bytes,
+            queue_wait_us = tracing::field::Empty,
+            returned_bytes = tracing::field::Empty,
+        );
         self.dispatch.submit_keyed(fh, move || {
-            let result = (|| {
+            let result = fuse_span.in_scope(|| {
+                fuse_span.record("queue_wait_us", enqueue_at.elapsed().as_micros() as u64);
                 let file = state.lock().unwrap().file_handle(fh).ok_or(libc::ESTALE)?;
                 AfsFuse::validate_handle_inode_in(&state, ino)?;
                 Ok(backend.as_ref()).and_then(|backend| {
@@ -1264,10 +1307,13 @@ impl Filesystem for AfsFuse {
                         .write_with_options(&context, file.handle, offset, &data, options)
                         .map_err(errno)
                 })
-            })();
+            });
             match result {
                 Ok(written) => match u32::try_from(written) {
-                    Ok(written) => reply.written(written),
+                    Ok(written) => {
+                        fuse_span.record("returned_bytes", written as u64);
+                        reply.written(written)
+                    }
                     Err(_) => reply.error(fuse_errno(libc::EIO)),
                 },
                 Err(error) => reply.error(fuse_errno(error)),

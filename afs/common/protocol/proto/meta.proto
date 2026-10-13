@@ -388,6 +388,7 @@ service DfsMeta {
   rpc GetChunkSources(GetDfsChunkSourcesRequest) returns (GetDfsChunkSourcesReply);
   rpc ValidateReadGrants(ValidateDfsReadGrantsRequest) returns (ValidateDfsReadGrantsReply);
   rpc ValidateExternalReadGrants(ValidateExternalReadGrantsRequest) returns (ValidateExternalReadGrantsReply);
+  rpc AuthorizeCurrentExternalRead(AuthorizeCurrentExternalReadRequest) returns (AuthorizeCurrentExternalReadReply);
   rpc SyncInodeMetadata(SyncDfsInodeMetadataRequest) returns (SyncDfsInodeMetadataReply);
   rpc CommitFileVersion(CommitFileVersionRequest) returns (CommitFileVersionReply);
 }
@@ -1134,6 +1135,11 @@ message DfsReadValidation {
   uint64 chunk_offset = 4;
   uint64 length = 5;
 }
+message DfsMissingReadSource {
+  string chunk_id = 1;
+  uint64 chunk_offset = 2;
+  uint64 length = 3;
+}
 message DfsAuthorizedRead {
   DfsReadValidation validation = 1;
   message Range { uint64 offset = 1; uint64 length = 2; }
@@ -1159,4 +1165,21 @@ message ValidateExternalReadGrantsRequest {
 }
 message ValidateExternalReadGrantsReply {
   repeated DfsExternalAuthorizedRead authorizations = 1;
+}
+
+// Validates a speculative immutable layout and the current inode head in one
+// Meta read view. A changed head never carries authority for the old layout.
+message AuthorizeCurrentExternalReadRequest {
+  string caller_id = 1;
+  string inode_id = 2;
+  string namespace_id = 3;
+  string expected_head_version_id = 4;
+  string layout_root_id = 5;
+  repeated DfsReadValidation validations = 6;
+  repeated DfsMissingReadSource missing_sources = 7;
+}
+message AuthorizeCurrentExternalReadReply {
+  DfsInodeRecord inode = 1;
+  bool head_changed = 2;
+  repeated DfsExternalAuthorizedRead authorizations = 3;
 }

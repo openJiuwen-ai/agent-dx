@@ -23,6 +23,10 @@ name = "afs-root-command-meta"
 path = "tests/support/root_command_meta.rs"
 required-features = ["ownerfs"]
 
+[[example]]
+name = "afs-trace-receiver"
+path = "tests/support/trace_receiver.rs"
+
 [dependencies]
 adx-transport = { path = "../crates/transport" }
 afs-error = { path = "common/error" }
@@ -45,7 +49,8 @@ prost = "0.14"
 axum = "0.8"
 thiserror = "2.0.16"
 libc = "0.2"
-blake3 = "1.8"
+blake3 = { version = "=1.8.7", features = ["rayon"] }
+rayon-core = "=1.13.0"
 object_store = { version = "0.14", default-features = false, features = ["aws-base", "reqwest", "ring"] }
 # Match ADX public TLS wiring; aws-base does not enable reqwest TLS by itself.
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }

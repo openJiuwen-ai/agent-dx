@@ -427,3 +427,40 @@ fn external_backend_validates_identity_transport_and_credentials_without_exposin
             .contains("secret_access_key")
     );
 }
+
+#[test]
+#[cfg(feature = "dfs")]
+fn external_backend_cache_is_optional_and_rejects_unbounded_or_relative_settings() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cache.toml");
+    let base = "fs='dfs'\n[dfs_external_backend]\nstore_id='test-fs'\ngeneration='1'\nendpoint='http://127.0.0.1:8333'\nbucket='afs-test'\nregion='us-east-1'\nallow_http=true\n";
+    let cache = "[dfs_external_backend.cache]\ndirectory='/var/tmp/afs-content-cache'\ncapacity_bytes=67108864\npending_bytes=8388608\n";
+    std::fs::write(&path, format!("{base}{cache}")).unwrap();
+    let resolve = || {
+        Config::resolve(
+            Role::Node,
+            Cli::parse_from(["afs-node", "--config", path.to_str().unwrap()]),
+        )
+    };
+    assert!(
+        resolve().is_ok(),
+        "explicit bounded cache ON must be accepted"
+    );
+    for bad in [
+        cache.replace("/var/tmp/afs-content-cache", "relative/cache"),
+        cache.replace("capacity_bytes=67108864", "capacity_bytes=0"),
+        cache.replace("pending_bytes=8388608", "pending_bytes=0"),
+        cache.replace("pending_bytes=8388608", "pending_bytes=134217728"),
+    ] {
+        std::fs::write(&path, format!("{base}{bad}")).unwrap();
+        assert!(
+            resolve().is_err(),
+            "invalid cache budget/path must be rejected"
+        );
+    }
+    std::fs::write(&path, base).unwrap();
+    assert!(
+        resolve().is_ok(),
+        "omitting cache preserves OFF configuration"
+    );
+}

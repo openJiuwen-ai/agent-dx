@@ -9,6 +9,10 @@ OwnerFs 与 DistributedFs（DFS）两种文件访问模式。`afs-meta` 管理�
 AFS 默认不进入普通 ADX 构建和发布包；通过 `ADX_WITH_AFS=1` 显式启用。
 当前部署必须使用 mTLS，并把每张受信节点证书精确绑定到一个 Node ID。
 
+![AFS 架构总览](../assets/architecture/afs.svg)
+
+详细路径见[AFS 架构与时序图](../docs/architecture/afs.md)。
+
 ## 组件范围
 
 | 目录 | 内容 |
@@ -94,12 +98,33 @@ python3 build/ci/run.py afs
 不作为该模式的耐久副本，数据可靠性取决于管理员提供的 S3 持久性合同；
 AFS Meta 的持久性仍需独立保证。
 
+S3 适配层复用一个自有 worker、runtime 和客户端，所有请求共享最多四路
+活动 PUT，完成一路即可补位。入口队列容量为1，队满等待形成回压；worker
+最多接收32个命令。外部模式顺序写的完整4MiB块可在后续 write 期间上传，
+每 inode 最多64MiB收口发布；fsync、fdatasync、可写 flush 和同步写强制
+收口。独立只读客户端仍只见 Meta 已提交版本，中间可见时机受最多64MiB的发布窗口约束；同挂载和 owner 代理的 dirty 读保持。只有所需成功回执
+齐全且 Meta 持久确认后才能报告同步成功；未知确认精确重试，PUT 失败
+保留窗口身份和已确认回执。服务端可能留下未发布对象，不能直接删除共享
+内容对象。正常退出关闭入口、排空并 join worker。
+
 每个不超过 4MiB 的不可变 chunk 对应一个原始字节对象，key 为
 `afs/v1/<store_id>/<generation>/chunks/<摘要前两位>/<ChunkId>`。
 读 Node 先取得 Meta 的独立外部读授权，再完整 GET 并验证长度和 BLAKE3，
 最后返回授权范围；不依赖写 Node 在线，不回退到 Peer。普通路径不增加
-HEAD、条件 PUT/GET 或版本 ID。当前内容 cache OFF，writeback OFF；
-有界异步磁盘 cache ON 尚未实现，不将上传成功等同于本地 cache 完成。
+HEAD、条件 PUT/GET 或版本 ID。内容 cache 默认 OFF，writeback OFF；
+Node 可配置有界异步磁盘 cache，pending 与磁盘内容分别限额，完整校验后
+填充。S3／磁盘读取完成一次完整校验后，以只读、绑定完整 chunk 身份的缓冲区
+交给读引擎，不重复计算同一缓冲区摘要。开启 cache 时，Node 共享一个最多4MiB的
+已验证对象槽，相邻读取按完整身份复用不可变内容；新磁盘加载仍检查文件安全性并
+完整校验。驻留、pending／worker及被读者持有的已接纳对象按实际分配计入原
+pending 额度，共享分配只计一次；预算不足则放弃驻留。此额度不是全部前台读缓冲
+或进程RSS上限。RAM命中不探测磁盘副本后来的变化，下次加载仍检测损坏并回源。
+每次读取仍刷新head并通过Meta授权；已有不可变layout的外部只读路径通过
+`AuthorizeCurrentExternalRead` 在同一Meta视图中合并两项检查。head变化或旧服务
+明确不支持该RPC时重新获取head走兼容路径，拒绝、超时及其它错误直接传播；
+缓存不能替代授权或S3持久化回执，不将上传成功等同于
+本地 cache 完成。小块写默认填充，全块写需显式 cache_large_write=true；
+队满或运行中写盘失败跳过填充，损坏缓存回源。配置及验证范围见下述链接。
 S3 容量查询暂不支持，statfs 明确返回不支持，不能用 Node 空间冒充后端容量。
 删除不立即删除 S3 对象；复杂对象回收后置。
 

@@ -13,14 +13,14 @@ use crate::dfs::{
     CommitMetadataMode, CopyId, CopyLocation, CopyRecord, CopyRole, CopyState, Dentry, DentryKey,
     DentryRecord, DfsChunkSourcesReply, DfsChunkSourcesRequest, DfsDurabilityPolicy, DfsReadGrant,
     FileVersion, FileVersionId, GetXattrRequest, InodeAttributes, InodeId, InodeKind, InodeRecord,
-    LayoutRoot, LinkRequest, ListXattrRequest, LocalCopyPolicy, MkdirRequest, MknodRequest,
-    NamespaceId, OperationId, PlacementHealth, PlacementRecord, PlacementSnapshot, ReadLinkRequest,
-    RemoveXattrRequest, RenameMode, RenameOutcome, RenameRequest, ReplicaAck, ReplicaGroup,
-    ReplicaGroupId, ReplicaTarget, ReplicaWriteGrant, ReplicationClaim, ReplicationConfig,
-    ReplicationTask, ReplicationTaskId, ReplicationTaskState, ReportChunkCorruption,
-    ReportReplicationTask, RmdirRequest, SetInodeAttrRequest, SetXattrRequest, SourceCandidate,
-    SpecialNodeKind, SymlinkRequest, SyncInodeMetadata, UnlinkRequest, ValidateReplicaWriteRequest,
-    WriteLease, XattrSetMode,
+    LayoutRoot, LayoutRootId, LinkRequest, ListXattrRequest, LocalCopyPolicy, MkdirRequest,
+    MknodRequest, NamespaceId, OperationId, PlacementHealth, PlacementRecord, PlacementSnapshot,
+    ReadLinkRequest, RemoveXattrRequest, RenameMode, RenameOutcome, RenameRequest, ReplicaAck,
+    ReplicaGroup, ReplicaGroupId, ReplicaTarget, ReplicaWriteGrant, ReplicationClaim,
+    ReplicationConfig, ReplicationTask, ReplicationTaskId, ReplicationTaskState,
+    ReportChunkCorruption, ReportReplicationTask, RmdirRequest, SetInodeAttrRequest,
+    SetXattrRequest, SourceCandidate, SpecialNodeKind, SymlinkRequest, SyncInodeMetadata,
+    UnlinkRequest, ValidateReplicaWriteRequest, WriteLease, XattrSetMode,
 };
 
 use super::store::{
@@ -34,6 +34,16 @@ pub struct DfsService {
     replication: ReplicationConfig,
     durability_policy: DfsDurabilityPolicy,
     read_grant_key: Arc<Option<[u8; 32]>>,
+}
+
+struct MissingExternalReadContext<'a> {
+    view: &'a MetaReadView,
+    caller_id: &'a str,
+    namespace_id: &'a NamespaceId,
+    file_version_id: &'a FileVersionId,
+    layout_root_id: &'a LayoutRootId,
+    layout: &'a LayoutRoot,
+    caller_session: &'a NodeSession,
 }
 
 // Store batches at most 64 submitted transactions in one durable commit pass.
@@ -2844,6 +2854,267 @@ impl DfsService {
         self.current_durability_policy().await?;
         let now = now_unix_ms();
         let view = self.store.read_view().await?;
+        self.validate_external_read_grants_in_view(&view, &caller_id, validations, now)
+            .await
+    }
+
+    /// Checks freshness and grants against one pinned view. Cached layouts are
+    /// only hints: no data authority is returned when their head has changed.
+    pub async fn authorize_current_external_read(
+        &self,
+        request: crate::dfs::AuthorizeCurrentExternalRead,
+    ) -> Result<crate::dfs::AuthorizeCurrentExternalReadReply> {
+        let view = self.store.read_view().await?;
+        self.authorize_current_external_read_in_view(&view, request, now_unix_ms())
+            .await
+    }
+
+    async fn authorize_current_external_read_in_view(
+        &self,
+        view: &MetaReadView,
+        request: crate::dfs::AuthorizeCurrentExternalRead,
+        now: u64,
+    ) -> Result<crate::dfs::AuthorizeCurrentExternalReadReply> {
+        use crate::dfs::AuthorizeCurrentExternalReadReply;
+        let requested_reads = request
+            .validations
+            .len()
+            .saturating_add(request.missing_sources.len());
+        if !self.is_external_backend() || requested_reads == 0 || requested_reads > 128 {
+            return Err(invalid(
+                "current external read requires the external policy and 1..128 entries",
+            ));
+        }
+        require_id(&request.caller_id, "caller_id")?;
+        require_id(&request.inode_id.0, "inode_id")?;
+        require_id(&request.namespace_id.0, "namespace_id")?;
+        require_id(&request.expected_head_version.0, "expected_head_version")?;
+        require_id(&request.layout_root_id.0, "layout_root_id")?;
+        match view.read(MetaRead::DfsDurabilityPolicy).await?.entity {
+            Some(MetaEntity::DfsDurabilityPolicy(policy)) if policy == self.durability_policy => {}
+            Some(MetaEntity::DfsDurabilityPolicy(_)) => {
+                return Err(conflict(
+                    "DFS durability policy differs from the initialized filesystem",
+                ));
+            }
+            _ => return Err(invalid("DFS durability policy is not initialized")),
+        }
+        let caller_id = request.caller_id.clone();
+        let inode_id = request.inode_id.clone();
+        let namespace_id = request.namespace_id.clone();
+        let expected_head_version = request.expected_head_version.clone();
+        let layout_root_id = request.layout_root_id.clone();
+        let inode = match view
+            .read(MetaRead::DfsInode(inode_id.clone()))
+            .await?
+            .entity
+        {
+            Some(MetaEntity::DfsInode(inode))
+                if inode.namespace_id == namespace_id && inode.kind == InodeKind::Regular =>
+            {
+                inode
+            }
+            _ => {
+                return Err(permission_denied(
+                    "current external read inode or namespace differs",
+                ));
+            }
+        };
+        match view
+            .read(MetaRead::DfsFileVersion(expected_head_version.clone()))
+            .await?
+            .entity
+        {
+            Some(MetaEntity::DfsFileVersion(version))
+                if version.inode_id == inode_id && version.layout_root == layout_root_id => {}
+            _ => {
+                return Err(permission_denied(
+                    "current external read version does not belong to the inode and layout",
+                ));
+            }
+        };
+        let layout = match view
+            .read(MetaRead::DfsLayoutRoot(layout_root_id.clone()))
+            .await?
+            .entity
+        {
+            Some(MetaEntity::DfsLayoutRoot(layout)) if layout.id == layout_root_id => layout,
+            _ => return Err(permission_denied("current external read layout is missing")),
+        };
+        if request.validations.iter().any(|validation| {
+            validation.grant.namespace_id != namespace_id
+                || validation.grant.file_version_id != expected_head_version
+                || validation.grant.layout_root_id != layout_root_id
+        }) {
+            return Err(permission_denied(
+                "current external read grants differ from the requested head",
+            ));
+        }
+        let validations = request.validations;
+        let missing_sources = request.missing_sources;
+        // A changed head must not turn invalid/revoked grants into a successful
+        // fallback signal. All existing checks run before choosing the reply.
+        let mut authorizations = self
+            .validate_external_read_grants_in_view(view, &caller_id, validations, now)
+            .await?;
+        let caller_session = if missing_sources.is_empty() {
+            None
+        } else {
+            match view
+                .read(MetaRead::CurrentNodeSession {
+                    node_id: caller_id.clone(),
+                })
+                .await?
+                .entity
+            {
+                Some(MetaEntity::NodeSession(session)) if session.is_live_at_unix_ms(now) => {
+                    Some(session)
+                }
+                _ => {
+                    return Err(permission_denied(
+                        "current external read missing source requires a live caller session",
+                    ));
+                }
+            }
+        };
+        if inode.head_version.as_ref() != Some(&expected_head_version) {
+            return Ok(AuthorizeCurrentExternalReadReply::HeadChanged(inode));
+        }
+        let mut resolved_missing = Vec::with_capacity(missing_sources.len());
+        for missing in &missing_sources {
+            let Some(caller_session) = caller_session.as_ref() else {
+                return Err(permission_denied(
+                    "current external read missing source requires a live caller session",
+                ));
+            };
+            resolved_missing.push(
+                self.resolve_missing_external_read_source_in_view(
+                    &MissingExternalReadContext {
+                        view,
+                        caller_id: &caller_id,
+                        namespace_id: &namespace_id,
+                        file_version_id: &expected_head_version,
+                        layout_root_id: &layout_root_id,
+                        layout: &layout,
+                        caller_session,
+                    },
+                    missing,
+                    now,
+                )
+                .await?,
+            );
+        }
+        authorizations.extend(resolved_missing);
+        Ok(AuthorizeCurrentExternalReadReply::Authorized {
+            inode,
+            authorizations,
+        })
+    }
+
+    async fn resolve_missing_external_read_source_in_view(
+        &self,
+        context: &MissingExternalReadContext<'_>,
+        missing: &crate::dfs::DfsMissingReadSource,
+        now: u64,
+    ) -> Result<crate::dfs::DfsExternalAuthorizedRead> {
+        if missing.length == 0 {
+            return Err(invalid(
+                "current external missing source length must be non-zero",
+            ));
+        }
+        let chunk = match context
+            .view
+            .read(MetaRead::DfsChunk(missing.chunk_id.clone()))
+            .await?
+            .entity
+        {
+            Some(MetaEntity::DfsChunk(chunk)) => chunk,
+            _ => {
+                return Err(permission_denied(
+                    "current external missing source chunk is missing",
+                ));
+            }
+        };
+        if missing
+            .chunk_offset
+            .checked_add(missing.length)
+            .is_none_or(|end| end > chunk.length)
+        {
+            return Err(permission_denied(
+                "current external missing source range exceeds the chunk",
+            ));
+        }
+        let intervals = read_chunk_intervals(context.layout, &chunk)?;
+        if !read_range_covered(&intervals, missing.chunk_offset, missing.length) {
+            return Err(permission_denied(
+                "current external missing source range is outside the committed layout",
+            ));
+        }
+        let placement_snapshot = context
+            .view
+            .read(MetaRead::DfsPlacement(missing.chunk_id.clone()))
+            .await?;
+        let mut revision = placement_snapshot.revision.0;
+        let Some(MetaEntity::DfsPlacement(placement)) = placement_snapshot.entity else {
+            return Err(permission_denied(
+                "current external missing source has no committed placement",
+            ));
+        };
+        for copy_id in placement.copies {
+            let copy_snapshot = context.view.read(MetaRead::DfsCopy(copy_id)).await?;
+            revision = revision.max(copy_snapshot.revision.0);
+            let Some(MetaEntity::DfsCopy(copy)) = copy_snapshot.entity else {
+                continue;
+            };
+            if !self.external_copy_matches(&copy, &chunk)? {
+                continue;
+            }
+            let mut grant = DfsReadGrant {
+                namespace_id: context.namespace_id.clone(),
+                file_version_id: context.file_version_id.clone(),
+                layout_root_id: context.layout_root_id.clone(),
+                caller_node_id: context.caller_id.to_owned(),
+                caller_node_epoch: context.caller_session.lease_epoch,
+                expires_at_unix_ms: now.saturating_add(30_000),
+                fence: revision,
+                token: String::new(),
+            };
+            grant.token = self.read_grant_token(&grant, &copy, &chunk, &intervals)?;
+            let allowed_ranges = if intervals.len() <= 128 {
+                intervals.clone()
+            } else {
+                vec![(missing.chunk_offset, missing.length)]
+            };
+            return Ok(crate::dfs::DfsExternalAuthorizedRead {
+                authorized: crate::dfs::DfsAuthorizedRead {
+                    validation: crate::dfs::DfsReadValidation {
+                        grant,
+                        chunk_id: missing.chunk_id.clone(),
+                        copy_id: copy.id.clone(),
+                        chunk_offset: missing.chunk_offset,
+                        length: missing.length,
+                    },
+                    allowed_ranges,
+                    expires_at_unix_ms: now
+                        .saturating_add(5_000)
+                        .min(context.caller_session.expires_at_unix_ms),
+                },
+                chunk,
+                location: copy.location,
+            });
+        }
+        Err(permission_denied(
+            "current external missing source has no committed Ready copy",
+        ))
+    }
+
+    async fn validate_external_read_grants_in_view(
+        &self,
+        view: &MetaReadView,
+        caller_id: &str,
+        validations: Vec<crate::dfs::DfsReadValidation>,
+        now: u64,
+    ) -> Result<Vec<crate::dfs::DfsExternalAuthorizedRead>> {
         let mut result = Vec::with_capacity(validations.len());
         for validation in validations {
             let grant = &validation.grant;
@@ -2855,7 +3126,7 @@ impl DfsService {
                     "external read grant caller or expiry differs",
                 ));
             }
-            let caller = live_read_session(&view, &caller_id, grant.caller_node_epoch, now).await?;
+            let caller = live_read_session(view, caller_id, grant.caller_node_epoch, now).await?;
             let version = match view
                 .read(MetaRead::DfsFileVersion(grant.file_version_id.clone()))
                 .await?
@@ -7012,6 +7283,336 @@ mod external_policy_tests {
                 kill_suidgid: false,
             },
         }
+    }
+
+    struct CurrentReadFixture {
+        _temp: tempfile::TempDir,
+        store: Arc<Store>,
+        service: DfsService,
+        request: crate::dfs::AuthorizeCurrentExternalRead,
+        inode: InodeRecord,
+    }
+
+    async fn current_read_fixture() -> CurrentReadFixture {
+        let temp = tempfile::tempdir().unwrap();
+        let backend = Arc::new(LocalFileBackend::open(temp.path()).unwrap());
+        let store = Arc::new(Store::open(backend).await.unwrap());
+        register(&store, "writer").await;
+        register(&store, "reader").await;
+        let service = DfsService::with_durability_policy(
+            store.clone(),
+            ReplicationConfig::local_single_copy(),
+            external_policy(),
+        );
+        service.initialize_replication_config().await.unwrap();
+        let commit = pending_commit(&service).await;
+        let inode = service
+            .commit_file_version("writer".into(), commit.clone())
+            .await
+            .unwrap();
+        let sources = service
+            .chunk_sources(DfsChunkSourcesRequest {
+                caller_id: "reader".into(),
+                namespace_id: inode.namespace_id.clone(),
+                file_version_id: commit.file_version.id.clone(),
+                layout_root_id: commit.layout_root.id.clone(),
+                chunk_ids: vec![commit.chunk_receipts[0].chunk.id.clone()],
+            })
+            .await
+            .unwrap();
+        let source = &sources.chunks[0].sources[0];
+        let request = crate::dfs::AuthorizeCurrentExternalRead {
+            caller_id: "reader".into(),
+            inode_id: inode.inode_id.clone(),
+            namespace_id: inode.namespace_id.clone(),
+            expected_head_version: commit.file_version.id,
+            layout_root_id: commit.layout_root.id,
+            validations: vec![crate::dfs::DfsReadValidation {
+                grant: source.read_grant.clone(),
+                chunk_id: source.chunk_id.clone(),
+                copy_id: source.copy_id.clone(),
+                chunk_offset: 0,
+                length: 4,
+            }],
+            missing_sources: Vec::new(),
+        };
+        CurrentReadFixture {
+            _temp: temp,
+            store,
+            service,
+            request,
+            inode,
+        }
+    }
+
+    async fn replace_current_read_inode(f: &CurrentReadFixture, mut inode: InodeRecord) {
+        inode.revision += 1;
+        let key = RequestKey::new("fixture", "replace-current-head");
+        let mut txn = MetaTxn::new(key.clone(), StoreOperation::DfsCommitFileVersion);
+        txn.conditions
+            .push(TxnCondition::RequestAbsent(key.clone()));
+        txn.conditions
+            .push(TxnCondition::EntityEquals(MetaEntity::DfsInode(
+                f.inode.clone(),
+            )));
+        txn.mutations.extend([
+            TxnMutation::Put(MetaEntity::DfsInode(inode.clone())),
+            TxnMutation::RecordRequestOutcome(RequestOutcome {
+                request: key,
+                operation: StoreOperation::DfsCommitFileVersion,
+                result: OperationResult::DfsInode(inode),
+            }),
+        ]);
+        assert!(matches!(
+            f.store.compare_and_commit(txn).await.unwrap(),
+            TxnOutcome::Committed { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn current_external_read_requires_exact_head_and_complete_authority() {
+        let f = current_read_fixture().await;
+        let reply = f
+            .service
+            .authorize_current_external_read(f.request.clone())
+            .await
+            .unwrap();
+        match reply {
+            crate::dfs::AuthorizeCurrentExternalReadReply::Authorized {
+                inode,
+                authorizations,
+            } => {
+                assert_eq!(inode, f.inode);
+                assert_eq!(authorizations.len(), 1);
+                assert_eq!(
+                    authorizations[0].authorized.validation,
+                    f.request.validations[0]
+                );
+                assert!(authorizations[0].authorized.expires_at_unix_ms > now_unix_ms());
+            }
+            _ => panic!("unchanged head did not return authorization"),
+        }
+        for case in 0..9 {
+            let mut bad = f.request.clone();
+            match case {
+                0 => bad.namespace_id = NamespaceId::new("other"),
+                1 => bad.inode_id = InodeId::new("1"),
+                2 => bad.layout_root_id = LayoutRootId::new("other"),
+                3 => bad.validations[0].grant.caller_node_epoch += 1,
+                4 => bad.validations[0].grant.expires_at_unix_ms = now_unix_ms(),
+                5 => bad.validations[0].grant.token = format!("dfs-read-v1:{}", "0".repeat(64)),
+                6 => bad.validations[0].length = 5,
+                7 => bad.validations[0].grant.file_version_id = FileVersionId::new("other"),
+                _ => bad.validations.clear(),
+            }
+            assert!(
+                f.service
+                    .authorize_current_external_read(bad)
+                    .await
+                    .is_err(),
+                "case {case}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn current_external_read_resolves_missing_sources_in_the_same_view() {
+        let f = current_read_fixture().await;
+        let mut missing = f.request.clone();
+        let chunk_id = missing.validations[0].chunk_id.clone();
+        missing.validations.clear();
+        missing
+            .missing_sources
+            .push(crate::dfs::DfsMissingReadSource {
+                chunk_id: chunk_id.clone(),
+                chunk_offset: 1,
+                length: 2,
+            });
+        let reply = f
+            .service
+            .authorize_current_external_read(missing)
+            .await
+            .unwrap();
+        match reply {
+            crate::dfs::AuthorizeCurrentExternalReadReply::Authorized {
+                inode,
+                authorizations,
+            } => {
+                assert_eq!(inode, f.inode);
+                assert_eq!(authorizations.len(), 1);
+                assert_eq!(authorizations[0].authorized.validation.chunk_id, chunk_id);
+                assert_eq!(authorizations[0].authorized.validation.chunk_offset, 1);
+                assert_eq!(authorizations[0].authorized.validation.length, 2);
+                assert!(authorizations[0].authorized.expires_at_unix_ms > now_unix_ms());
+            }
+            _ => panic!("unchanged head did not resolve missing source"),
+        }
+    }
+
+    #[tokio::test]
+    async fn current_external_read_mixes_cached_grants_and_missing_sources() {
+        let f = current_read_fixture().await;
+        let mut mixed = f.request.clone();
+        let chunk_id = mixed.validations[0].chunk_id.clone();
+        mixed
+            .missing_sources
+            .push(crate::dfs::DfsMissingReadSource {
+                chunk_id,
+                chunk_offset: 2,
+                length: 2,
+            });
+        let reply = f
+            .service
+            .authorize_current_external_read(mixed)
+            .await
+            .unwrap();
+        match reply {
+            crate::dfs::AuthorizeCurrentExternalReadReply::Authorized {
+                authorizations, ..
+            } => {
+                assert_eq!(authorizations.len(), 2);
+                assert_eq!(authorizations[0].authorized.validation.chunk_offset, 0);
+                assert_eq!(authorizations[1].authorized.validation.chunk_offset, 2);
+            }
+            _ => panic!("unchanged head did not authorize the mixed request"),
+        }
+    }
+
+    #[tokio::test]
+    async fn current_external_read_changed_head_never_returns_old_authority() {
+        let f = current_read_fixture().await;
+        let mut changed = f.inode.clone();
+        changed.head_version = None;
+        replace_current_read_inode(&f, changed).await;
+        assert!(
+            matches!(f.service.authorize_current_external_read(f.request.clone()).await.unwrap(),
+            crate::dfs::AuthorizeCurrentExternalReadReply::HeadChanged(inode) if inode.head_version.is_none())
+        );
+        // A changed head must not hide a revoked/expired requester, even when
+        // the same request also asks Meta to resolve a missing source.
+        let mut expired = f.request.clone();
+        expired.validations[0].grant.expires_at_unix_ms = 0;
+        expired
+            .missing_sources
+            .push(crate::dfs::DfsMissingReadSource {
+                chunk_id: expired.validations[0].chunk_id.clone(),
+                chunk_offset: 1,
+                length: 2,
+            });
+        assert!(
+            f.service
+                .authorize_current_external_read(expired)
+                .await
+                .is_err()
+        );
+        let mut missing_unknown_old_copy = f.request.clone();
+        missing_unknown_old_copy.validations.clear();
+        missing_unknown_old_copy
+            .missing_sources
+            .push(crate::dfs::DfsMissingReadSource {
+                chunk_id: crate::dfs::ChunkId::new(
+                    "blake3-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-4",
+                ),
+                chunk_offset: 0,
+                length: 4,
+            });
+        assert!(matches!(
+            f.service
+                .authorize_current_external_read(missing_unknown_old_copy)
+                .await
+                .unwrap(),
+            crate::dfs::AuthorizeCurrentExternalReadReply::HeadChanged(inode)
+                if inode.head_version.is_none()
+        ));
+        f.store
+            .register_node_session(
+                RequestKey::new("reader", "restart-current-read"),
+                NodeSessionLease {
+                    node_id: "reader".into(),
+                    session_id: "reader-restarted".into(),
+                    grpc_addr: "http://127.0.0.1:1".into(),
+                    data_addr: "http://127.0.0.1:2".into(),
+                    rest_addr: "http://127.0.0.1:3".into(),
+                    storage_devices: Vec::new(),
+                    lease_ttl: std::time::Duration::from_secs(60),
+                },
+            )
+            .await
+            .unwrap();
+        let mut missing_after_restart = f.request.clone();
+        missing_after_restart.validations.clear();
+        missing_after_restart
+            .missing_sources
+            .push(crate::dfs::DfsMissingReadSource {
+                chunk_id: f.request.validations[0].chunk_id.clone(),
+                chunk_offset: 1,
+                length: 2,
+            });
+        assert!(
+            f.service
+                .authorize_current_external_read(f.request)
+                .await
+                .is_err()
+        );
+        let current_view = f.store.read_view().await.unwrap();
+        assert!(
+            f.service
+                .authorize_current_external_read_in_view(
+                    &current_view,
+                    missing_after_restart,
+                    u64::MAX
+                )
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn current_external_read_head_and_grants_share_the_pinned_view() {
+        let f = current_read_fixture().await;
+        let mut missing = f.request.clone();
+        let chunk_id = missing.validations[0].chunk_id.clone();
+        missing.validations.clear();
+        missing
+            .missing_sources
+            .push(crate::dfs::DfsMissingReadSource {
+                chunk_id,
+                chunk_offset: 1,
+                length: 2,
+            });
+        let view = f.store.read_view().await.unwrap();
+        f.store
+            .register_node_session(
+                RequestKey::new("reader", "restart-after-pinned-view"),
+                NodeSessionLease {
+                    node_id: "reader".into(),
+                    session_id: "reader-new-session".into(),
+                    grpc_addr: "http://127.0.0.1:11".into(),
+                    data_addr: "http://127.0.0.1:12".into(),
+                    rest_addr: "http://127.0.0.1:13".into(),
+                    storage_devices: Vec::new(),
+                    lease_ttl: std::time::Duration::from_secs(60),
+                },
+            )
+            .await
+            .unwrap();
+        let mut changed = f.inode.clone();
+        changed.head_version = None;
+        replace_current_read_inode(&f, changed).await;
+        // The fixed view must authorize and resolve the old head consistently,
+        // while a new request observes the current head/session; no second view
+        // may slip into validation or missing-source resolution.
+        assert!(
+            matches!(f.service.authorize_current_external_read_in_view(&view, missing.clone(), now_unix_ms()).await.unwrap(),
+            crate::dfs::AuthorizeCurrentExternalReadReply::Authorized { inode, authorizations } if inode == f.inode && authorizations.len() == 1)
+        );
+        assert!(matches!(
+            f.service
+                .authorize_current_external_read(missing)
+                .await
+                .unwrap(),
+            crate::dfs::AuthorizeCurrentExternalReadReply::HeadChanged(_)
+        ));
     }
 
     #[tokio::test]

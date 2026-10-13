@@ -51,3 +51,11 @@ node-a = "/opt/adx/config/afs/tls/node-a.pem"
 # region = "us-east-1"
 # allow_http = false
 # credentials_file = "/opt/adx/config/afs/s3-credentials.json"
+
+# Optional Node-only disposable cache. Omit this table for cache OFF.
+# Use a dedicated private directory owned by the Node process (mode 0700).
+# [dfs_external_backend.cache]
+# directory = "/opt/adx/data/afs/s3-cache"
+# capacity_bytes = 268435456
+# pending_bytes = 37748736
+# cache_large_write = false

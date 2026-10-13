@@ -1,0 +1,80 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 1010" role="img" aria-labelledby="title desc">
+<title id="title">Agent FS（AFS）· 组件与数据路径</title><desc id="desc">AFS是ADX可选子系统。OwnerFs与DFS是平级模式，各自经Node连接Meta。OwnerFs数据位于Home真实目录，远端经OwnerFiles访问，本地workspace bind绕过FUSE。DFS可使用节点chunk副本或外部S3，Meta不转发文件正文。</desc>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10Z" fill="#516b83"/></marker></defs>
+<style>text{font-family:system-ui,-apple-system,"PingFang SC",sans-serif;fill:#17324d}.title{font-size:24px;font-weight:650}.head{font-size:18px;font-weight:650}.body{font-size:15px}.small{font-size:13px;fill:#526b7c}.edge{fill:none;stroke:#516b83;stroke-width:1.7;marker-end:url(#arrow)}.control{stroke-dasharray:6 4}.box{stroke:#b7ccd9;stroke-width:1.4}.life{stroke:#afc4d2;stroke-width:1.2;stroke-dasharray:5 5}</style>
+<rect width="1280" height="1010" rx="16" fill="#f5f8fb"/>
+<text x="32" y="40" class="title">Agent FS（AFS）· 组件与数据路径</text>
+<text x="32" y="65" class="small">逻辑组件图；外部 S3 为实验接入，能力范围与验收状态分别登记。</text>
+<rect x="36" y="85" width="1208" height="88" rx="12" class="box" fill="#e8f0fc"/>
+<text x="52" y="114" class="head">ADX 公共工程入口 · ADX_WITH_AFS=1</text>
+<text x="52" y="140" class="body">构建 / CI / 发布 / adxctl 进程管理；AFS 状态机独立于 Platform Environment 生命周期。</text>
+<text x="52" y="163" class="body">namespace、root grant 与挂载由 Operator 配置，Sandbox 尚不自动 provision / mount / reclaim。</text>
+<rect x="36" y="208" width="800" height="310" rx="16" fill="#edf5f8" stroke="#7895a8" stroke-dasharray="7 5"/>
+<text x="56" y="235" class="head">afs-node · 可同时启用两种模式，挂载和状态相互独立</text>
+<rect x="64" y="252" width="744" height="60" rx="12" class="box" fill="#fff1db"/>
+<text x="80" y="281" class="head">应用 / Agent workspace → Linux VFS / FUSE</text>
+<rect x="64" y="365" width="340" height="112" rx="12" class="box" fill="#e6f4ef"/>
+<text x="80" y="394" class="head">OwnerFs</text>
+<text x="80" y="420" class="body">Home 普通文件与授权句柄</text>
+<text x="80" y="443" class="body">本地访问 / 远端 OwnerFiles</text>
+<rect x="468" y="365" width="340" height="112" rx="12" class="box" fill="#e8f0fc"/>
+<text x="484" y="394" class="head">DFS</text>
+<text x="484" y="420" class="body">dirty → FileVersion / 不可变 chunk</text>
+<text x="484" y="443" class="body">布局、receipt、读授权和校验</text>
+<path d="M234 312V365" class="edge"/>
+<path d="M638 312V365" class="edge"/>
+<rect x="900" y="208" width="344" height="132" rx="12" class="box" fill="#e8f0fc"/>
+<text x="916" y="237" class="head">afs-meta</text>
+<text x="916" y="263" class="body">root / Home、inode、租约</text>
+<text x="916" y="286" class="body">版本 / 布局 / 副本目录</text>
+<text x="916" y="309" class="body">条件提交、身份与读授权</text>
+<path d="M836 326H900" class="edge control"/>
+<text x="900" y="190" class="small">Node ↔ Meta RPC / mTLS</text>
+<rect x="900" y="414" width="344" height="110" rx="12" class="box" fill="#fff"/>
+<text x="916" y="443" class="head">Meta 持久后端</text>
+<text x="916" y="469" class="body">local-file / etcd / Redis</text>
+<text x="916" y="492" class="body">memory 仅临时状态</text>
+<path d="M1072 340V414" class="edge control"/>
+<text x="1085" y="377" class="small">提交持久确认后发布</text>
+<rect x="36" y="600" width="380" height="125" rx="12" class="box" fill="#e6f4ef"/>
+<text x="52" y="629" class="head">Home 底层真实目录</text>
+<text x="52" y="655" class="body">OwnerFs 本地 FUSE → LocalFs</text>
+<text x="52" y="678" class="body">bind ON 子树：应用直接访问底层 FS</text>
+<text x="52" y="701" class="body">bind 默认 OFF，启用需授权与身份核验</text>
+<path d="M190 477V600" class="edge"/>
+<text x="204" y="563" class="small">本地数据</text>
+<rect x="36" y="790" width="380" height="125" rx="12" class="box" fill="#e6f4ef"/>
+<text x="52" y="819" class="head">远端 Home 的 afs-node</text>
+<text x="52" y="845" class="body">OwnerFiles RPC → Home 底层目录</text>
+<text x="52" y="868" class="body">校验授权、权限、句柄及 Home/root 身份</text>
+<text x="52" y="891" class="body">文件正文不经 Meta</text>
+<path d="M330 477V551H440V850H416" class="edge"/>
+<text x="344" y="537" class="small">远端数据</text>
+<rect x="468" y="600" width="340" height="125" rx="12" class="box" fill="#fff"/>
+<text x="484" y="629" class="head">DFS 节点存储路径</text>
+<text x="484" y="655" class="body">未配置外部后端时</text>
+<text x="484" y="678" class="body">本地 chunk / Peer 副本</text>
+<text x="484" y="701" class="body">持久 receipt → Meta 发布</text>
+<path d="M638 477V600" class="edge"/>
+<text x="652" y="563" class="small">节点复制模式</text>
+<rect x="468" y="790" width="340" height="125" rx="12" class="box" fill="#fff"/>
+<text x="484" y="819" class="head">其他 DFS Node</text>
+<text x="484" y="845" class="body">Peer 复制 / 远端 chunk 读取</text>
+<text x="484" y="868" class="body">读时核对版本、来源与内容</text>
+<path d="M638 725V790" class="edge"/>
+<text x="652" y="762" class="small">副本数据</text>
+<rect x="900" y="600" width="344" height="125" rx="12" class="box" fill="#fff1db"/>
+<text x="916" y="629" class="head">外部 S3 对象存储</text>
+<text x="916" y="655" class="body">配置 dfs_external_backend 时</text>
+<text x="916" y="678" class="body">PUT 持久确认 → Meta 发布</text>
+<text x="916" y="701" class="body">读端授权后 GET / 有界验证缓存</text>
+<path d="M808 421H866V662H900" class="edge"/>
+<text x="871" y="575" class="small">外部后端模式</text>
+<rect x="900" y="790" width="344" height="125" rx="12" class="box" fill="#fff"/>
+<text x="916" y="819" class="head">模式与耐久边界</text>
+<text x="916" y="845" class="body">节点复制与外部后端为替代路径</text>
+<text x="916" y="868" class="body">外部模式禁 Node 复制 / 修复</text>
+<text x="916" y="891" class="body">本地 cache 不算耐久副本</text>
+<text x="36" y="957" class="body">虚线箭头：控制与持久元数据；实线箭头：数据访问。Meta 不代理文件正文。</text>
+<text x="36" y="982" class="small">容器 / runc 是 workspace bind 的适配场景，不是该能力的核心依赖。</text>
+</svg>

@@ -8,17 +8,19 @@
 
 use std::{
     collections::{BTreeSet, HashMap},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Weak},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use afs_error::{Error, Result};
+use afs_tracing::tracing;
 
 use crate::{
     dfs::{
-        ChunkId, ChunkObject, ChunkSources, CopyLocation, CopyRole, DfsChunkSourcesReply,
-        DfsChunkSourcesRequest, DfsExternalAuthorizedRead, DfsReadValidation, FileVersionId,
-        LayoutRootId, SourceCandidate,
+        AuthorizeCurrentExternalRead, AuthorizeCurrentExternalReadReply, ChunkId, ChunkObject,
+        ChunkSources, CopyLocation, CopyRole, CopyState, DfsChunkSourcesReply,
+        DfsChunkSourcesRequest, DfsExternalAuthorizedRead, DfsMissingReadSource, DfsReadValidation,
+        FileVersionId, LayoutRootId, SourceCandidate,
     },
     node::chunk::{LocalChunkStore, PinnedChunkReader, VerifiedRangeCopy},
 };
@@ -144,6 +146,13 @@ pub trait ReadSourceProvider: Send + Sync {
 /// Revalidates committed external copy identity and allowed ranges on every
 /// read batch. A source-cache hit is never an authorization-cache hit.
 pub trait ExternalReadAuthorizer: Send + Sync {
+    fn authorize_current_external_read(
+        &self,
+        _request: AuthorizeCurrentExternalRead,
+    ) -> Result<Option<AuthorizeCurrentExternalReadReply>> {
+        Ok(None)
+    }
+
     fn validate_external_read_grants(
         &self,
         caller_id: &str,
@@ -151,12 +160,110 @@ pub trait ExternalReadAuthorizer: Send + Sync {
     ) -> Result<Vec<DfsExternalAuthorizedRead>>;
 }
 
+/// Immutable full-object content whose length and BLAKE3 match its chunk identity.
+/// Private fields prevent a reader from claiming verification of arbitrary bytes.
+#[derive(Clone, Debug)]
+pub struct VerifiedExternalChunk {
+    chunk: ChunkObject,
+    bytes: Arc<Vec<u8>>,
+}
+
+impl VerifiedExternalChunk {
+    /// Verify the entire object before any requested range can become visible.
+    /// Returns corrupt-data for a size/digest mismatch or an oversized object.
+    pub fn verify(chunk: &ChunkObject, bytes: Vec<u8>) -> Result<Self> {
+        Self::verify_with_digest(chunk, bytes, "serial", 1, 0, blake3::hash)
+    }
+
+    pub(super) fn verify_with_rayon_pool(
+        chunk: &ChunkObject,
+        bytes: Vec<u8>,
+        pool: &rayon_core::ThreadPool,
+        workers: usize,
+        gate_wait_us: u64,
+    ) -> Result<Self> {
+        Self::verify_with_digest(
+            chunk,
+            bytes,
+            "rayon",
+            workers as u64,
+            gate_wait_us,
+            |bytes| {
+                pool.install(|| {
+                    let mut hasher = blake3::Hasher::new();
+                    hasher.update_rayon(bytes);
+                    hasher.finalize()
+                })
+            },
+        )
+    }
+
+    fn verify_with_digest(
+        chunk: &ChunkObject,
+        bytes: Vec<u8>,
+        execution: &'static str,
+        workers: u64,
+        gate_wait_us: u64,
+        digest: impl FnOnce(&[u8]) -> blake3::Hash,
+    ) -> Result<Self> {
+        let span = tracing::info_span!(
+            "node.dfs.external.verify",
+            chunk_id = %chunk.id.0,
+            chunk_bytes = chunk.length,
+            hash_bytes = bytes.len() as u64,
+            hash_execution = tracing::field::Empty,
+            hash_workers = tracing::field::Empty,
+            gate_wait_us = tracing::field::Empty,
+        );
+        span.in_scope(|| {
+            if chunk.length > MAX_DFS_EXTERNAL_CHUNK_BYTES || bytes.len() as u64 != chunk.length {
+                return Err(corrupt("external Chunk length or content digest mismatch"));
+            }
+            tracing::Span::current().record("hash_execution", execution);
+            tracing::Span::current().record("hash_workers", workers);
+            tracing::Span::current().record("gate_wait_us", gate_wait_us);
+            if digest(&bytes).as_bytes() != &chunk.content_digest.bytes {
+                return Err(corrupt("external Chunk length or content digest mismatch"));
+            }
+            Ok(())
+        })?;
+        Ok(Self {
+            chunk: chunk.clone(),
+            bytes: Arc::new(bytes),
+        })
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub(super) fn matches(&self, chunk: &ChunkObject) -> bool {
+        self.chunk == *chunk
+    }
+
+    pub(super) fn allocation_weak(&self) -> Weak<Vec<u8>> {
+        Arc::downgrade(&self.bytes)
+    }
+
+    pub(super) fn allocation_bytes(&self) -> u64 {
+        self.bytes.capacity() as u64
+    }
+
+    pub(super) fn same_allocation(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.bytes, &other.bytes)
+    }
+}
+
 /// Fetch one complete immutable external chunk. Implementations must bound
-/// response allocation by the supplied chunk length and reject another store,
-/// key or generation. The engine independently checks length and BLAKE3 before
-/// making any requested range visible. This interface does not fill local cache.
+/// response allocation and reject another store, key or generation. Content
+/// crosses this boundary only through the validating immutable buffer above;
+/// the engine still checks its full identity and authorizes every read batch.
 pub trait ExternalChunkReader: Send + Sync {
-    fn read_chunk(&self, chunk: &ChunkObject, source: &SourceCandidate) -> Result<Vec<u8>>;
+    fn read_chunk(
+        &self,
+        chunk: &ChunkObject,
+        source: &SourceCandidate,
+    ) -> Result<VerifiedExternalChunk>;
 }
 
 struct ExternalReadBackend {
@@ -260,6 +367,45 @@ struct CachedSources {
     sources: ChunkSources,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CurrentExternalReadOutcome {
+    Read,
+    Unsupported,
+    HeadChanged(crate::dfs::InodeRecord),
+}
+
+struct ExternalReadSelection {
+    batch: ReadBatch,
+    selected: Vec<ExternalReadSelected>,
+    validations: Vec<DfsReadValidation>,
+    missing_sources: Vec<DfsMissingReadSource>,
+}
+
+struct ExternalReadSelected {
+    chunk_id: ChunkId,
+    chunk_offset: u64,
+    length: u64,
+    output_offset: usize,
+    chunk: Option<ChunkObject>,
+    source: Option<SourceCandidate>,
+}
+
+struct AuthorizedExternalRead {
+    chunk: ChunkObject,
+    source: SourceCandidate,
+    op: ChunkReadOp,
+}
+
+impl ExternalReadSelection {
+    fn unique_chunk_count(&self) -> usize {
+        self.selected
+            .iter()
+            .map(|entry| entry.chunk_id.clone())
+            .collect::<BTreeSet<_>>()
+            .len()
+    }
+}
+
 impl DfsReadEngine {
     pub fn new(
         namespace_id: crate::dfs::NamespaceId,
@@ -293,7 +439,23 @@ impl DfsReadEngine {
         self
     }
 
+    pub fn has_external_backend(&self) -> bool {
+        self.external_backend.is_some()
+    }
+
     pub fn read_batch(&self, batch: &ReadBatch, out: &mut [u8]) -> Result<()> {
+        let requested_bytes = batch
+            .ops
+            .iter()
+            .fold(0_u64, |sum, op| sum.saturating_add(op.length));
+        let span = tracing::info_span!(
+            "node.dfs.read.batch",
+            ops = batch.ops.len(),
+            requested_bytes,
+            output_bytes = out.len() as u64,
+            external = self.external_backend.is_some(),
+        );
+        let _entered = span.enter();
         batch.validate_for_output(out.len(), &self.config)?;
         // Stage only requested bytes, bounded by the validated batch budget.
         // Local successes and peer retries become visible together after every
@@ -323,10 +485,125 @@ impl DfsReadEngine {
                 continue;
             }
             let length = original.length as usize;
-            out[original.output_offset..original.output_offset + length]
-                .copy_from_slice(&staged[packed.output_offset..packed.output_offset + length]);
+            tracing::info_span!(
+                "node.dfs.read.copy",
+                copy_stage = "staged_to_output",
+                requested_bytes = original.length,
+                copied_bytes = length as u64,
+            )
+            .in_scope(|| {
+                out[original.output_offset..original.output_offset + length]
+                    .copy_from_slice(&staged[packed.output_offset..packed.output_offset + length]);
+            });
         }
         Ok(())
+    }
+
+    pub fn read_batch_current_external(
+        &self,
+        inode_id: &crate::dfs::InodeId,
+        batch: &ReadBatch,
+        out: &mut [u8],
+    ) -> Result<CurrentExternalReadOutcome> {
+        let Some(backend) = &self.external_backend else {
+            return Ok(CurrentExternalReadOutcome::Unsupported);
+        };
+        let requested_bytes = batch
+            .ops
+            .iter()
+            .fold(0_u64, |sum, op| sum.saturating_add(op.length));
+        let span = tracing::info_span!(
+            "node.dfs.read.current_external",
+            inode_id = %inode_id.0,
+            ops = batch.ops.len(),
+            requested_bytes,
+            output_bytes = out.len() as u64,
+            selected_chunks = tracing::field::Empty,
+            authorized_ranges = tracing::field::Empty,
+            fetched_chunks = tracing::field::Empty,
+            copied_bytes = tracing::field::Empty,
+        );
+        let _entered = span.enter();
+        batch.validate_for_output(out.len(), &self.config)?;
+        let mut staged_batch = batch.clone();
+        let mut length = 0;
+        for op in &mut staged_batch.ops {
+            op.output_offset = length;
+            length += op.length as usize;
+        }
+        let mut staged = vec![0; length];
+        if staged_batch.file_version_id.is_none() {
+            return Ok(CurrentExternalReadOutcome::Unsupported);
+        }
+        let Some(selection) = self.select_current_external_reads(&staged_batch)? else {
+            return Ok(CurrentExternalReadOutcome::Unsupported);
+        };
+        let Some(expected_head_version) = selection.batch.file_version_id.clone() else {
+            return Ok(CurrentExternalReadOutcome::Unsupported);
+        };
+        span.record("selected_chunks", selection.unique_chunk_count() as u64);
+        let reply = tracing::info_span!(
+            "node.dfs.read.current_auth_rpc",
+            validations = selection.validations.len(),
+            missing_sources = selection.missing_sources.len(),
+        )
+        .in_scope(|| {
+            backend
+                .authorizer
+                .authorize_current_external_read(AuthorizeCurrentExternalRead {
+                    caller_id: self.local_node_id.clone(),
+                    inode_id: inode_id.clone(),
+                    namespace_id: self.namespace_id.clone(),
+                    expected_head_version: expected_head_version.clone(),
+                    layout_root_id: selection.batch.layout_root_id.clone(),
+                    validations: selection.validations.clone(),
+                    missing_sources: selection.missing_sources.clone(),
+                })
+        })?;
+        let Some(reply) = reply else {
+            return Ok(CurrentExternalReadOutcome::Unsupported);
+        };
+        let expires_at = match reply {
+            AuthorizeCurrentExternalReadReply::Authorized {
+                inode,
+                authorizations,
+            } => {
+                self.validate_current_authorized_inode(&inode, inode_id, &expected_head_version)?;
+                span.record("authorized_ranges", authorizations.len() as u64);
+                self.read_external_authorized_selection(
+                    backend,
+                    &selection,
+                    authorizations,
+                    &mut staged,
+                )?
+            }
+            AuthorizeCurrentExternalReadReply::HeadChanged(inode) => {
+                self.validate_current_head_changed_inode(&inode, inode_id, &expected_head_version)?;
+                return Ok(CurrentExternalReadOutcome::HeadChanged(inode));
+            }
+        };
+        if expires_at.is_some_and(|deadline| deadline <= now_unix_ms()) {
+            return Err(external_denied(
+                "external read authority expired before publication",
+            ));
+        }
+        for (original, packed) in batch.ops.iter().zip(&staged_batch.ops) {
+            if original.length == 0 {
+                continue;
+            }
+            let length = original.length as usize;
+            tracing::info_span!(
+                "node.dfs.read.copy",
+                copy_stage = "staged_to_output",
+                requested_bytes = original.length,
+                copied_bytes = length as u64,
+            )
+            .in_scope(|| {
+                out[original.output_offset..original.output_offset + length]
+                    .copy_from_slice(&staged[packed.output_offset..packed.output_offset + length]);
+            });
+        }
+        Ok(CurrentExternalReadOutcome::Read)
     }
 
     fn read_external_batch(
@@ -335,6 +612,40 @@ impl DfsReadEngine {
         batch: &ReadBatch,
         out: &mut [u8],
     ) -> Result<Option<u64>> {
+        let input_ops = batch.ops.len();
+        let input_bytes = batch
+            .ops
+            .iter()
+            .fold(0_u64, |sum, op| sum.saturating_add(op.length));
+        let span = tracing::info_span!(
+            "node.dfs.read.external",
+            ops = input_ops,
+            requested_bytes = input_bytes,
+            selected_chunks = tracing::field::Empty,
+            authorized_ranges = tracing::field::Empty,
+            fetched_chunks = tracing::field::Empty,
+            copied_bytes = tracing::field::Empty,
+        );
+        let _entered = span.enter();
+        let Some(selection) = self.select_external_reads(batch)? else {
+            // Holes and EOF do not require fetching or authorizing a chunk.
+            return Ok(None);
+        };
+        span.record("selected_chunks", selection.unique_chunk_count() as u64);
+        let authorized = tracing::info_span!(
+            "node.dfs.read.auth_rpc",
+            validations = selection.validations.len(),
+        )
+        .in_scope(|| {
+            backend
+                .authorizer
+                .validate_external_read_grants(&self.local_node_id, selection.validations.clone())
+        })?;
+        span.record("authorized_ranges", authorized.len() as u64);
+        self.read_external_authorized_selection(backend, &selection, authorized, out)
+    }
+
+    fn select_external_reads(&self, batch: &ReadBatch) -> Result<Option<ExternalReadSelection>> {
         let batch = ReadBatch {
             file_version_id: batch.file_version_id.clone(),
             layout_root_id: batch.layout_root_id.clone(),
@@ -345,66 +656,194 @@ impl DfsReadEngine {
                 .cloned()
                 .collect(),
         };
-        // Holes and EOF do not require fetching or authorizing a chunk.
         if batch.ops.is_empty() {
             return Ok(None);
         }
         let sources = self.sources_for(&batch)?;
-        let mut selected = Vec::with_capacity(batch.ops.len());
-        let mut validations = Vec::with_capacity(batch.ops.len());
-        for op in &batch.ops {
-            let set = sources
+        self.select_external_reads_from_sources(batch, &sources, false)
+    }
+
+    fn select_current_external_reads(
+        &self,
+        batch: &ReadBatch,
+    ) -> Result<Option<ExternalReadSelection>> {
+        let batch = ReadBatch {
+            file_version_id: batch.file_version_id.clone(),
+            layout_root_id: batch.layout_root_id.clone(),
+            ops: batch
+                .ops
                 .iter()
-                .find(|set| set.chunk_id == op.chunk_id)
-                .ok_or_else(|| unavailable("external source lookup omitted a requested Chunk"))?;
-            let chunk = set
-                .chunk
-                .as_ref()
-                .ok_or_else(|| invalid("external source has no trusted Chunk identity"))?;
-            if chunk.id != op.chunk_id
-                || chunk.length > MAX_DFS_EXTERNAL_CHUNK_BYTES
-                || op
-                    .chunk_offset
-                    .checked_add(op.length)
-                    .is_none_or(|end| end > chunk.length)
-            {
-                return Err(invalid(
-                    "external Chunk identity, size or requested range is invalid",
-                ));
-            }
-            let source = set
-                .sources
-                .iter()
-                .find(|source| {
-                    source.role == CopyRole::ExternalCommitted
-                        && source.state.is_readable()
-                        && source.data_endpoint.is_none()
-                        && matches!(source.location, CopyLocation::External { .. })
-                })
-                .ok_or_else(|| unavailable("committed Chunk has no readable external copy"))?;
-            validations.push(DfsReadValidation {
-                grant: source.read_grant.clone(),
+                .filter(|op| op.length != 0)
+                .cloned()
+                .collect(),
+        };
+        if batch.ops.is_empty() || batch.file_version_id.is_none() {
+            return Ok(None);
+        }
+        let (sources, missing) = self.cached_sources_for(&batch)?;
+        let mut selection = self
+            .select_external_reads_from_sources(batch.clone(), &sources, true)?
+            .unwrap_or(ExternalReadSelection {
+                batch,
+                selected: Vec::new(),
+                validations: Vec::new(),
+                missing_sources: Vec::new(),
+            });
+        for op in missing {
+            selection.missing_sources.push(DfsMissingReadSource {
                 chunk_id: op.chunk_id.clone(),
-                copy_id: source.copy_id.clone(),
                 chunk_offset: op.chunk_offset,
                 length: op.length,
             });
-            selected.push((chunk, source));
+            selection.selected.push(ExternalReadSelected {
+                chunk_id: op.chunk_id,
+                chunk_offset: op.chunk_offset,
+                length: op.length,
+                output_offset: op.output_offset,
+                chunk: None,
+                source: None,
+            });
         }
-        let authorized = backend
-            .authorizer
-            .validate_external_read_grants(&self.local_node_id, validations.clone())?;
-        if authorized.len() != validations.len() {
+        if selection.selected.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(selection))
+    }
+
+    fn select_external_reads_from_sources(
+        &self,
+        batch: ReadBatch,
+        sources: &[ChunkSources],
+        allow_missing: bool,
+    ) -> Result<Option<ExternalReadSelection>> {
+        let mut selected = Vec::with_capacity(batch.ops.len());
+        let mut validations = Vec::with_capacity(batch.ops.len());
+        for op in &batch.ops {
+            let Some(set) = sources.iter().find(|set| set.chunk_id == op.chunk_id) else {
+                if allow_missing {
+                    continue;
+                }
+                return Err(unavailable(
+                    "external source lookup omitted a requested Chunk",
+                ));
+            };
+            let (chunk, source, validation) = self.select_external_read_source(set, op)?;
+            validations.push(validation);
+            selected.push(ExternalReadSelected {
+                chunk_id: op.chunk_id.clone(),
+                chunk_offset: op.chunk_offset,
+                length: op.length,
+                output_offset: op.output_offset,
+                chunk: Some(chunk),
+                source: Some(source),
+            });
+        }
+        if selected.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(ExternalReadSelection {
+            batch,
+            selected,
+            validations,
+            missing_sources: Vec::new(),
+        }))
+    }
+
+    fn select_external_read_source(
+        &self,
+        set: &ChunkSources,
+        op: &ChunkReadOp,
+    ) -> Result<(ChunkObject, SourceCandidate, DfsReadValidation)> {
+        let Some(chunk) = set.chunk.as_ref() else {
+            return Err(invalid("external source has no trusted Chunk identity"));
+        };
+        if chunk.id != op.chunk_id
+            || chunk.length > MAX_DFS_EXTERNAL_CHUNK_BYTES
+            || op
+                .chunk_offset
+                .checked_add(op.length)
+                .is_none_or(|end| end > chunk.length)
+        {
+            return Err(invalid(
+                "external Chunk identity, size or requested range is invalid",
+            ));
+        }
+        let Some(source) = set.sources.iter().find(|source| {
+            source.role == CopyRole::ExternalCommitted
+                && source.state.is_readable()
+                && source.data_endpoint.is_none()
+                && matches!(source.location, CopyLocation::External { .. })
+        }) else {
+            return Err(unavailable("committed Chunk has no readable external copy"));
+        };
+        let validation = DfsReadValidation {
+            grant: source.read_grant.clone(),
+            chunk_id: op.chunk_id.clone(),
+            copy_id: source.copy_id.clone(),
+            chunk_offset: op.chunk_offset,
+            length: op.length,
+        };
+        Ok((chunk.clone(), source.clone(), validation))
+    }
+
+    fn cached_sources_for(
+        &self,
+        batch: &ReadBatch,
+    ) -> Result<(Vec<ChunkSources>, Vec<ChunkReadOp>)> {
+        let version = batch
+            .file_version_id
+            .clone()
+            .ok_or_else(|| invalid("DFS peer read requires a fixed FileVersion"))?;
+        let now = Instant::now();
+        let mut resolved = Vec::new();
+        let mut misses = Vec::new();
+        let mut seen = BTreeSet::new();
+        let mut cache = self
+            .source_cache
+            .lock()
+            .map_err(|_| unavailable("DFS read source cache is poisoned"))?;
+        cache.retain(|_, entry| entry.expires_at > now);
+        let mut missing_chunks = BTreeSet::new();
+        for op in &batch.ops {
+            let key = (
+                version.clone(),
+                batch.layout_root_id.clone(),
+                op.chunk_id.clone(),
+            );
+            match cache.get(&key) {
+                Some(entry) => {
+                    if seen.insert(op.chunk_id.clone()) {
+                        resolved.push(entry.sources.clone());
+                    }
+                }
+                None => {
+                    missing_chunks.insert(op.chunk_id.clone());
+                    misses.push(op.clone());
+                }
+            }
+        }
+        resolved.retain(|set| !missing_chunks.contains(&set.chunk_id));
+        Ok((resolved, misses))
+    }
+
+    fn read_external_authorized_selection(
+        &self,
+        backend: &ExternalReadBackend,
+        selection: &ExternalReadSelection,
+        authorized: Vec<DfsExternalAuthorizedRead>,
+        out: &mut [u8],
+    ) -> Result<Option<u64>> {
+        if authorized.len() != selection.selected.len() {
             return Err(external_denied(
                 "external read authorization reply is incomplete",
             ));
         }
         let now = now_unix_ms();
         let mut expires_at = u64::MAX;
-        for ((entry, validation), (chunk, source)) in
-            authorized.iter().zip(&validations).zip(&selected)
-        {
+        let mut reads = Vec::with_capacity(authorized.len());
+        for (entry, selected) in authorized.into_iter().zip(&selection.selected) {
             let authorization = &entry.authorized;
+            let validation = &authorization.validation;
             let covered = authorization.allowed_ranges.iter().any(|(start, length)| {
                 validation.chunk_offset >= *start
                     && start.checked_add(*length).is_some_and(|end| {
@@ -414,24 +853,97 @@ impl DfsReadEngine {
                             .is_some_and(|requested_end| requested_end <= end)
                     })
             });
-            if authorization.validation != *validation
+            if validation.chunk_id != selected.chunk_id
+                || validation.chunk_offset != selected.chunk_offset
+                || validation.length != selected.length
                 || authorization.expires_at_unix_ms <= now
                 || authorization.expires_at_unix_ms > validation.grant.expires_at_unix_ms
                 || authorization.allowed_ranges.len() > MAX_DFS_READ_OPS
                 || !covered
-                || entry.chunk != **chunk
-                || entry.location != source.location
+                || entry.chunk.id != selected.chunk_id
+                || entry.chunk.length > MAX_DFS_EXTERNAL_CHUNK_BYTES
+                || validation
+                    .chunk_offset
+                    .checked_add(validation.length)
+                    .is_none_or(|end| end > entry.chunk.length)
             {
                 return Err(external_denied(
                     "external read authorization changed identity, range or expiry",
                 ));
             }
+            let source = SourceCandidate {
+                copy_id: validation.copy_id.clone(),
+                chunk_id: validation.chunk_id.clone(),
+                role: CopyRole::ExternalCommitted,
+                state: CopyState::Ready,
+                location: entry.location.clone(),
+                data_endpoint: None,
+                load_hint: 0,
+                read_grant: validation.grant.clone(),
+            };
+            if !self.source_matches(&selection.batch, &source)
+                || !matches!(source.location, CopyLocation::External { .. })
+            {
+                return Err(external_denied(
+                    "external read authorization returned an unusable source",
+                ));
+            }
+            if let CopyLocation::External {
+                store_id,
+                object_key,
+                object_revision,
+            } = &source.location
+            {
+                let expected_key =
+                    crate::dfs::external_object_key(store_id, object_revision, &entry.chunk.id)
+                        .map_err(|error| external_denied(error.to_string()))?;
+                if object_key != &expected_key {
+                    return Err(external_denied(
+                        "external read authorization returned a different object key",
+                    ));
+                }
+            }
+            if let (Some(expected_chunk), Some(expected_source)) =
+                (&selected.chunk, &selected.source)
+            {
+                if entry.chunk != *expected_chunk || source.location != expected_source.location {
+                    return Err(external_denied(
+                        "external read authorization changed cached source identity",
+                    ));
+                }
+                let expected_validation = DfsReadValidation {
+                    grant: expected_source.read_grant.clone(),
+                    chunk_id: expected_source.chunk_id.clone(),
+                    copy_id: expected_source.copy_id.clone(),
+                    chunk_offset: selected.chunk_offset,
+                    length: selected.length,
+                };
+                if authorization.validation != expected_validation {
+                    return Err(external_denied(
+                        "external read authorization changed cached grant identity",
+                    ));
+                }
+            }
             expires_at = expires_at.min(authorization.expires_at_unix_ms);
+            reads.push(AuthorizedExternalRead {
+                chunk: entry.chunk,
+                source,
+                op: ChunkReadOp {
+                    chunk_id: selected.chunk_id.clone(),
+                    chunk_offset: selected.chunk_offset,
+                    length: selected.length,
+                    output_offset: selected.output_offset,
+                },
+            });
         }
+        self.cache_authorized_external_sources(selection, &reads)?;
         // Retain at most one full object plus the requested-byte staging buffer.
         // Several ranges of one chunk share this fetch and full-content digest.
         let mut fetched = BTreeSet::new();
-        for (chunk, source) in &selected {
+        let mut fetched_chunks = 0_u64;
+        let mut copied_bytes = 0_u64;
+        for read in &reads {
+            let chunk = &read.chunk;
             if !fetched.insert(chunk.id.clone()) {
                 continue;
             }
@@ -440,22 +952,121 @@ impl DfsReadEngine {
                     "external read authority expired before the next fetch",
                 ));
             }
-            let bytes = backend.reader.read_chunk(chunk, source)?;
-            if bytes.len() as u64 != chunk.length
-                || blake3::hash(&bytes).as_bytes() != &chunk.content_digest.bytes
-            {
-                return Err(corrupt("external Chunk length or content digest mismatch"));
+            let bytes = tracing::info_span!(
+                "node.dfs.read.external_fetch",
+                chunk_id = %chunk.id.0,
+                chunk_bytes = chunk.length,
+            )
+            .in_scope(|| backend.reader.read_chunk(chunk, &read.source))?;
+            fetched_chunks = fetched_chunks.saturating_add(1);
+            if !bytes.matches(chunk) {
+                return Err(corrupt(
+                    "verified external Chunk identity does not match the request",
+                ));
             }
-            for op in batch.ops.iter().filter(|op| op.chunk_id == chunk.id) {
+            let bytes = bytes.as_slice();
+            for op in reads
+                .iter()
+                .filter(|read| read.chunk.id == chunk.id)
+                .map(|read| &read.op)
+            {
                 let start = usize::try_from(op.chunk_offset)
                     .map_err(|_| invalid("external Chunk offset is too large"))?;
                 let length = usize::try_from(op.length)
                     .map_err(|_| invalid("external Chunk range is too large"))?;
-                out[op.output_offset..op.output_offset + length]
-                    .copy_from_slice(&bytes[start..start + length]);
+                copied_bytes = copied_bytes.saturating_add(length as u64);
+                tracing::info_span!(
+                    "node.dfs.read.external_copy",
+                    copy_stage = "external_to_staged",
+                    chunk_id = %chunk.id.0,
+                    chunk_offset = op.chunk_offset,
+                    requested_bytes = op.length,
+                    copied_bytes = length as u64,
+                )
+                .in_scope(|| {
+                    out[op.output_offset..op.output_offset + length]
+                        .copy_from_slice(&bytes[start..start + length]);
+                });
             }
         }
+        tracing::Span::current().record("fetched_chunks", fetched_chunks);
+        tracing::Span::current().record("copied_bytes", copied_bytes);
         Ok(Some(expires_at))
+    }
+
+    fn cache_authorized_external_sources(
+        &self,
+        selection: &ExternalReadSelection,
+        reads: &[AuthorizedExternalRead],
+    ) -> Result<()> {
+        let Some(version) = selection.batch.file_version_id.clone() else {
+            return Ok(());
+        };
+        if reads.is_empty() {
+            return Ok(());
+        }
+        let mut cache = self
+            .source_cache
+            .lock()
+            .map_err(|_| unavailable("DFS read source cache is poisoned"))?;
+        if cache.len().saturating_add(reads.len()) > MAX_CACHED_SOURCES {
+            cache.clear();
+        }
+        let expires_at = Instant::now() + self.config.source_cache_ttl;
+        for read in reads {
+            cache.insert(
+                (
+                    version.clone(),
+                    selection.batch.layout_root_id.clone(),
+                    read.chunk.id.clone(),
+                ),
+                CachedSources {
+                    expires_at,
+                    sources: ChunkSources {
+                        chunk_id: read.chunk.id.clone(),
+                        chunk: Some(read.chunk.clone()),
+                        sources: vec![read.source.clone()],
+                    },
+                },
+            );
+        }
+        Ok(())
+    }
+
+    fn validate_current_authorized_inode(
+        &self,
+        inode: &crate::dfs::InodeRecord,
+        expected_inode_id: &crate::dfs::InodeId,
+        expected_head_version: &FileVersionId,
+    ) -> Result<()> {
+        if inode.namespace_id != self.namespace_id
+            || inode.inode_id != *expected_inode_id
+            || inode.kind != crate::dfs::InodeKind::Regular
+            || inode.head_version.as_ref() != Some(expected_head_version)
+        {
+            return Err(external_denied(
+                "current external read authorization returned a different inode head",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_current_head_changed_inode(
+        &self,
+        inode: &crate::dfs::InodeRecord,
+        expected_inode_id: &crate::dfs::InodeId,
+        expected_head_version: &FileVersionId,
+    ) -> Result<()> {
+        if inode.namespace_id != self.namespace_id
+            || inode.inode_id != *expected_inode_id
+            || inode.kind != crate::dfs::InodeKind::Regular
+            || inode.head_version.as_ref() == Some(expected_head_version)
+        {
+            return Err(external_denied(
+                "current external read head-changed reply returned an invalid inode",
+            ));
+        }
+        Ok(())
     }
 
     fn read_batch_into(&self, batch: &ReadBatch, out: &mut [u8]) -> Result<()> {
@@ -588,6 +1199,15 @@ impl DfsReadEngine {
         let mut resolved = Vec::new();
         let mut misses = Vec::new();
         let mut seen = BTreeSet::new();
+        let span = tracing::info_span!(
+            "node.dfs.read.sources",
+            ops = batch.ops.len(),
+            cache_hits = tracing::field::Empty,
+            cache_misses = tracing::field::Empty,
+            fresh_chunks = tracing::field::Empty,
+        );
+        let _entered = span.enter();
+        let mut cache_hits = 0_u64;
         {
             let mut cache = self
                 .source_cache
@@ -610,12 +1230,18 @@ impl DfsReadEngine {
                         .iter()
                         .all(|source| self.source_matches(batch, source))
                 }) {
-                    Some(entry) => resolved.push(entry.sources.clone()),
+                    Some(entry) => {
+                        cache_hits = cache_hits.saturating_add(1);
+                        resolved.push(entry.sources.clone())
+                    }
                     None => misses.push(op.clone()),
                 }
             }
         }
+        span.record("cache_hits", cache_hits);
+        span.record("cache_misses", misses.len() as u64);
         if misses.is_empty() {
+            span.record("fresh_chunks", 0_u64);
             return Ok(resolved);
         }
         let request = ReadBatch {
@@ -626,6 +1252,7 @@ impl DfsReadEngine {
         .source_request(self.local_node_id.clone(), self.namespace_id.clone())?;
         let expected: BTreeSet<_> = request.chunk_ids.iter().cloned().collect();
         let fresh = self.source_provider.sources_for(request)?.chunks;
+        span.record("fresh_chunks", fresh.len() as u64);
         let mut received = BTreeSet::new();
         for set in &fresh {
             if !expected.contains(&set.chunk_id)
@@ -1592,13 +2219,15 @@ mod tests {
         }
     }
 
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, Debug)]
     enum ExternalAuthorityFault {
         Chunk,
         Location,
         Validation,
         Range,
+        GrantVersion,
         MissingReply,
+        DuplicateReply,
     }
 
     struct ExternalFixture {
@@ -1623,10 +2252,16 @@ mod tests {
             let mut candidate = source("external-copy", &staged.chunk.id, "node-b");
             candidate.role = CopyRole::ExternalCommitted;
             candidate.data_endpoint = None;
+            let object_revision = "immutable-v1".to_owned();
             candidate.location = CopyLocation::External {
                 store_id: "store".into(),
-                object_key: "generation/chunk".into(),
-                object_revision: "immutable-v1".into(),
+                object_key: crate::dfs::external_object_key(
+                    "store",
+                    &object_revision,
+                    &staged.chunk.id,
+                )
+                .unwrap(),
+                object_revision,
             };
             Self {
                 chunk: staged.chunk,
@@ -1651,6 +2286,27 @@ mod tests {
                     sources: vec![self.candidate.clone()],
                 }],
             }))
+        }
+
+        fn empty_sources(&self) -> Arc<StaticSources> {
+            Arc::new(StaticSources::default())
+        }
+
+        fn current_authorizations(
+            &self,
+            request: crate::dfs::AuthorizeCurrentExternalRead,
+        ) -> Result<Vec<crate::dfs::DfsExternalAuthorizedRead>> {
+            let mut validations = request.validations;
+            validations.extend(request.missing_sources.into_iter().map(|missing| {
+                crate::dfs::DfsReadValidation {
+                    grant: self.candidate.read_grant.clone(),
+                    chunk_id: missing.chunk_id,
+                    copy_id: self.candidate.copy_id.clone(),
+                    chunk_offset: missing.chunk_offset,
+                    length: missing.length,
+                }
+            }));
+            self.validate_external_read_grants(&request.caller_id, validations)
         }
 
         fn batch(&self) -> ReadBatch {
@@ -1707,7 +2363,7 @@ mod tests {
                 || *self.expires_at.lock().unwrap(),
                 |duration| now_unix_ms() + duration.as_millis() as u64,
             );
-            Ok(validations
+            let mut replies = validations
                 .into_iter()
                 .map(|validation| {
                     let mut entry = crate::dfs::DfsExternalAuthorizedRead {
@@ -1736,11 +2392,23 @@ mod tests {
                         Some(ExternalAuthorityFault::Range) => {
                             entry.authorized.allowed_ranges = vec![(0, 1)]
                         }
+                        Some(ExternalAuthorityFault::GrantVersion) => {
+                            entry.authorized.validation.grant.file_version_id =
+                                FileVersionId::new("next-version")
+                        }
                         _ => {}
                     }
                     entry
                 })
-                .collect())
+                .collect::<Vec<_>>();
+            if matches!(
+                self.authority_fault,
+                Some(ExternalAuthorityFault::DuplicateReply)
+            ) && let Some(first) = replies.first().cloned()
+            {
+                replies.push(first);
+            }
+            Ok(replies)
         }
     }
 
@@ -1749,59 +2417,792 @@ mod tests {
             &self,
             chunk: &crate::dfs::ChunkObject,
             source: &SourceCandidate,
-        ) -> Result<Vec<u8>> {
+        ) -> Result<VerifiedExternalChunk> {
             assert_eq!(chunk, &self.chunk);
             assert_eq!(source.location, self.candidate.location);
             *self.fetches.lock().unwrap() += 1;
             std::thread::sleep(self.delay);
-            Ok(self.bytes.lock().unwrap().clone())
+            VerifiedExternalChunk::verify(chunk, self.bytes.lock().unwrap().clone())
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum CurrentReadMode {
+        Authorized,
+        AuthorizedWrongInode,
+        Denied,
+        HeadChanged,
+        HeadChangedSameHead,
+        DeadlineExceeded,
+    }
+
+    struct CurrentReadAuthorizer {
+        fixture: Arc<ExternalFixture>,
+        mode: CurrentReadMode,
+        legacy_calls: Mutex<u64>,
+        current_calls: Mutex<u64>,
+        last_validations: Mutex<usize>,
+        last_missing_sources: Mutex<usize>,
+        legacy_fallback_allowed: bool,
+    }
+
+    impl CurrentReadAuthorizer {
+        fn new(
+            fixture: Arc<ExternalFixture>,
+            mode: CurrentReadMode,
+            legacy_fallback_allowed: bool,
+        ) -> Self {
+            Self {
+                fixture,
+                mode,
+                legacy_calls: Mutex::new(0),
+                current_calls: Mutex::new(0),
+                last_validations: Mutex::new(0),
+                last_missing_sources: Mutex::new(0),
+                legacy_fallback_allowed,
+            }
+        }
+
+        fn legacy_calls(&self) -> u64 {
+            *self.legacy_calls.lock().unwrap()
+        }
+
+        fn current_calls(&self) -> u64 {
+            *self.current_calls.lock().unwrap()
+        }
+
+        fn last_request_shape(&self) -> (usize, usize) {
+            (
+                *self.last_validations.lock().unwrap(),
+                *self.last_missing_sources.lock().unwrap(),
+            )
+        }
+    }
+
+    impl ExternalReadAuthorizer for CurrentReadAuthorizer {
+        fn authorize_current_external_read(
+            &self,
+            request: crate::dfs::AuthorizeCurrentExternalRead,
+        ) -> Result<Option<crate::dfs::AuthorizeCurrentExternalReadReply>> {
+            *self.current_calls.lock().unwrap() += 1;
+            assert_eq!(request.caller_id, "node-a");
+            assert_eq!(
+                request.namespace_id,
+                crate::dfs::NamespaceId::new("default")
+            );
+            assert_eq!(request.expected_head_version, FileVersionId::new("version"));
+            assert_eq!(request.layout_root_id, LayoutRootId::new("layout"));
+            *self.last_validations.lock().unwrap() = request.validations.len();
+            *self.last_missing_sources.lock().unwrap() = request.missing_sources.len();
+            assert!(request.validations.len() + request.missing_sources.len() > 0);
+            for validation in &request.validations {
+                assert_eq!(validation.chunk_id, self.fixture.chunk.id);
+            }
+            for missing in &request.missing_sources {
+                assert_eq!(missing.chunk_id, self.fixture.chunk.id);
+            }
+            match self.mode {
+                CurrentReadMode::Authorized => {
+                    let authorizations = self.fixture.current_authorizations(request)?;
+                    Ok(Some(
+                        crate::dfs::AuthorizeCurrentExternalReadReply::Authorized {
+                            inode: inode_with_head("version"),
+                            authorizations,
+                        },
+                    ))
+                }
+                CurrentReadMode::AuthorizedWrongInode => {
+                    let authorizations = self.fixture.current_authorizations(request)?;
+                    let mut inode = inode_with_head("version");
+                    inode.inode_id = crate::dfs::InodeId::new("inode:other");
+                    Ok(Some(
+                        crate::dfs::AuthorizeCurrentExternalReadReply::Authorized {
+                            inode,
+                            authorizations,
+                        },
+                    ))
+                }
+                CurrentReadMode::Denied => Err(external_denied(
+                    "current external read authorization denied",
+                )),
+                CurrentReadMode::DeadlineExceeded => Err(Error::coded(
+                    afs_error::CLIENT_DEADLINE_EXCEEDED,
+                    "current external read authorization timed out",
+                )),
+                CurrentReadMode::HeadChanged => Ok(Some(
+                    crate::dfs::AuthorizeCurrentExternalReadReply::HeadChanged(inode_with_head(
+                        "next-version",
+                    )),
+                )),
+                CurrentReadMode::HeadChangedSameHead => Ok(Some(
+                    crate::dfs::AuthorizeCurrentExternalReadReply::HeadChanged(inode_with_head(
+                        "version",
+                    )),
+                )),
+            }
+        }
+
+        fn validate_external_read_grants(
+            &self,
+            caller_id: &str,
+            validations: Vec<crate::dfs::DfsReadValidation>,
+        ) -> Result<Vec<crate::dfs::DfsExternalAuthorizedRead>> {
+            *self.legacy_calls.lock().unwrap() += 1;
+            if self.legacy_fallback_allowed {
+                self.fixture
+                    .validate_external_read_grants(caller_id, validations)
+            } else {
+                Err(unavailable(
+                    "legacy external read authorization must not be used",
+                ))
+            }
+        }
+    }
+
+    fn prime_external_source_cache(engine: &DfsReadEngine, fixture: &ExternalFixture) {
+        prime_external_source_cache_with(
+            engine,
+            fixture,
+            fixture.candidate.clone(),
+            Duration::from_secs(60),
+        );
+    }
+
+    fn prime_external_source_cache_with(
+        engine: &DfsReadEngine,
+        fixture: &ExternalFixture,
+        source: SourceCandidate,
+        ttl: Duration,
+    ) {
+        engine.source_cache.lock().unwrap().insert(
+            (
+                FileVersionId::new("version"),
+                LayoutRootId::new("layout"),
+                fixture.chunk.id.clone(),
+            ),
+            CachedSources {
+                expires_at: Instant::now() + ttl,
+                sources: ChunkSources {
+                    chunk_id: fixture.chunk.id.clone(),
+                    chunk: Some(fixture.chunk.clone()),
+                    sources: vec![source],
+                },
+            },
+        );
+    }
+
+    struct CurrentExternalChunks {
+        fixtures: Vec<Arc<ExternalFixture>>,
+        current_calls: Mutex<u64>,
+        last_validations: Mutex<usize>,
+        last_missing_sources: Mutex<usize>,
+    }
+
+    impl CurrentExternalChunks {
+        fn new(fixtures: Vec<Arc<ExternalFixture>>) -> Self {
+            Self {
+                fixtures,
+                current_calls: Mutex::new(0),
+                last_validations: Mutex::new(0),
+                last_missing_sources: Mutex::new(0),
+            }
+        }
+
+        fn current_calls(&self) -> u64 {
+            *self.current_calls.lock().unwrap()
+        }
+
+        fn last_request_shape(&self) -> (usize, usize) {
+            (
+                *self.last_validations.lock().unwrap(),
+                *self.last_missing_sources.lock().unwrap(),
+            )
+        }
+    }
+
+    impl ExternalReadAuthorizer for CurrentExternalChunks {
+        fn authorize_current_external_read(
+            &self,
+            request: crate::dfs::AuthorizeCurrentExternalRead,
+        ) -> Result<Option<crate::dfs::AuthorizeCurrentExternalReadReply>> {
+            *self.current_calls.lock().unwrap() += 1;
+            *self.last_validations.lock().unwrap() = request.validations.len();
+            *self.last_missing_sources.lock().unwrap() = request.missing_sources.len();
+            let mut replies = Vec::new();
+            let mut validations = request.validations;
+            validations.extend(request.missing_sources.into_iter().map(|missing| {
+                let fixture = self
+                    .fixtures
+                    .iter()
+                    .find(|fixture| fixture.chunk.id == missing.chunk_id)
+                    .unwrap();
+                crate::dfs::DfsReadValidation {
+                    grant: fixture.candidate.read_grant.clone(),
+                    chunk_id: missing.chunk_id,
+                    copy_id: fixture.candidate.copy_id.clone(),
+                    chunk_offset: missing.chunk_offset,
+                    length: missing.length,
+                }
+            }));
+            for validation in validations {
+                let fixture = self
+                    .fixtures
+                    .iter()
+                    .find(|fixture| fixture.chunk.id == validation.chunk_id)
+                    .unwrap();
+                replies.extend(
+                    fixture.validate_external_read_grants(&request.caller_id, vec![validation])?,
+                );
+            }
+            Ok(Some(
+                crate::dfs::AuthorizeCurrentExternalReadReply::Authorized {
+                    inode: inode_with_head("version"),
+                    authorizations: replies,
+                },
+            ))
+        }
+
+        fn validate_external_read_grants(
+            &self,
+            _caller_id: &str,
+            _validations: Vec<crate::dfs::DfsReadValidation>,
+        ) -> Result<Vec<crate::dfs::DfsExternalAuthorizedRead>> {
+            Err(unavailable(
+                "legacy external read authorization must not be used",
+            ))
+        }
+    }
+
+    impl ExternalChunkReader for CurrentExternalChunks {
+        fn read_chunk(
+            &self,
+            chunk: &ChunkObject,
+            source: &SourceCandidate,
+        ) -> Result<VerifiedExternalChunk> {
+            self.fixtures
+                .iter()
+                .find(|fixture| fixture.chunk.id == chunk.id)
+                .unwrap()
+                .read_chunk(chunk, source)
+        }
+    }
+
+    fn inode_with_head(version_id: &str) -> crate::dfs::InodeRecord {
+        crate::dfs::InodeRecord {
+            namespace_id: crate::dfs::NamespaceId::new("default"),
+            inode_id: crate::dfs::InodeId::new("inode:test"),
+            kind: crate::dfs::InodeKind::Regular,
+            attributes: crate::dfs::InodeAttributes {
+                mode: 0o640,
+                uid: 1000,
+                gid: 1000,
+                nlink: 1,
+                atime_unix_ms: 1,
+                mtime_unix_ms: 1,
+                ctime_unix_ms: 1,
+            },
+            head_version: Some(FileVersionId::new(version_id)),
+            symlink_target: None,
+            xattrs: Default::default(),
+            revision: 1,
         }
     }
 
     #[test]
-    fn external_backend_bypasses_healthy_local_and_reauthorizes_cached_sources() {
+    fn external_backend_uses_current_head_authorization_when_available() {
         let temp = tempfile::tempdir().unwrap();
-        let local = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
-        put_local_chunk(&local, "healthy-local", b"abcdef");
         let fixture = Arc::new(ExternalFixture::new(b"abcdef"));
-        let sources = fixture.sources();
-        let engine = fixture.engine(local, sources.clone());
-        let mut batch = fixture.batch();
-        batch.ops.push(ChunkReadOp {
-            chunk_id: fixture.chunk.id.clone(),
-            chunk_offset: 3,
-            length: 2,
-            output_offset: 1,
-        });
-        let mut out = [b'!'; 4];
-        engine.read_batch(&batch, &mut out).unwrap();
-        assert_eq!(&out, b"bde!");
-        assert_eq!(*fixture.fetches.lock().unwrap(), 1, "one fetch per chunk");
-        // Sources remain cached; content is deliberately not cached in S1.
-        *fixture.denial.lock().unwrap() = true;
-        out.fill(b'!');
-        assert!(engine.read_batch(&batch, &mut out).is_err());
-        assert_eq!(&out, b"!!!!");
-        assert_eq!(*sources.calls.lock().unwrap(), 1);
-        assert_eq!(*fixture.authorizations.lock().unwrap(), 2);
+        let authorizer = Arc::new(CurrentReadAuthorizer::new(
+            fixture.clone(),
+            CurrentReadMode::Authorized,
+            false,
+        ));
+        let engine = fixture
+            .engine(
+                Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap()),
+                fixture.sources(),
+            )
+            .with_external_backend(fixture.clone(), authorizer.clone());
+        prime_external_source_cache(&engine, &fixture);
+
+        let mut out = [b'!'; 2];
+        let outcome = engine
+            .read_batch_current_external(
+                &crate::dfs::InodeId::new("inode:test"),
+                &fixture.batch(),
+                &mut out,
+            )
+            .unwrap();
+
+        assert_eq!(outcome, CurrentExternalReadOutcome::Read);
+        assert_eq!(&out, b"bc");
+        assert_eq!(authorizer.current_calls(), 1);
+        assert_eq!(authorizer.legacy_calls(), 0);
+        assert_eq!(authorizer.last_request_shape(), (1, 0));
         assert_eq!(*fixture.fetches.lock().unwrap(), 1);
     }
 
     #[test]
-    fn external_backend_verifies_full_chunk_before_publishing_any_range() {
-        for bytes in [b"abcde!".to_vec(), b"abc".to_vec(), b"abcdef!".to_vec()] {
+    fn external_backend_current_read_resolves_missing_source_without_source_lookup() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = Arc::new(ExternalFixture::new(b"abcdef"));
+        let sources = fixture.empty_sources();
+        let authorizer = Arc::new(CurrentReadAuthorizer::new(
+            fixture.clone(),
+            CurrentReadMode::Authorized,
+            false,
+        ));
+        let engine = fixture
+            .engine(
+                Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap()),
+                sources.clone(),
+            )
+            .with_external_backend(fixture.clone(), authorizer.clone());
+
+        let mut out = [b'!'; 2];
+        let outcome = engine
+            .read_batch_current_external(
+                &crate::dfs::InodeId::new("inode:test"),
+                &fixture.batch(),
+                &mut out,
+            )
+            .unwrap();
+
+        assert_eq!(outcome, CurrentExternalReadOutcome::Read);
+        assert_eq!(&out, b"bc");
+        assert_eq!(authorizer.last_request_shape(), (0, 1));
+        assert_eq!(*sources.calls.lock().unwrap(), 0);
+        assert_eq!(*fixture.fetches.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn external_backend_current_read_resolves_each_missing_range_on_same_chunk() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = Arc::new(ExternalFixture::new(b"abcdef"));
+        let sources = fixture.empty_sources();
+        let authorizer = Arc::new(CurrentReadAuthorizer::new(
+            fixture.clone(),
+            CurrentReadMode::Authorized,
+            false,
+        ));
+        let engine = fixture
+            .engine(
+                Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap()),
+                sources.clone(),
+            )
+            .with_external_backend(fixture.clone(), authorizer.clone());
+        let batch = ReadBatch {
+            file_version_id: Some(FileVersionId::new("version")),
+            layout_root_id: LayoutRootId::new("layout"),
+            ops: vec![
+                ChunkReadOp {
+                    chunk_id: fixture.chunk.id.clone(),
+                    chunk_offset: 1,
+                    length: 2,
+                    output_offset: 0,
+                },
+                ChunkReadOp {
+                    chunk_id: fixture.chunk.id.clone(),
+                    chunk_offset: 3,
+                    length: 2,
+                    output_offset: 2,
+                },
+            ],
+        };
+
+        let mut out = [b'!'; 4];
+        let outcome = engine
+            .read_batch_current_external(&crate::dfs::InodeId::new("inode:test"), &batch, &mut out)
+            .unwrap();
+
+        assert_eq!(outcome, CurrentExternalReadOutcome::Read);
+        assert_eq!(&out, b"bcde");
+        assert_eq!(authorizer.last_request_shape(), (0, 2));
+        assert_eq!(*sources.calls.lock().unwrap(), 0);
+        assert_eq!(*fixture.fetches.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn external_backend_current_read_mixes_cached_and_missing_sources_in_original_output_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let cached = Arc::new(ExternalFixture::new(b"abcdef"));
+        let missing = Arc::new(ExternalFixture::new(b"uvwxyz"));
+        let chunks = Arc::new(CurrentExternalChunks::new(vec![
+            cached.clone(),
+            missing.clone(),
+        ]));
+        let sources = Arc::new(StaticSources::default());
+        let engine = DfsReadEngine::new(
+            crate::dfs::NamespaceId::new("default"),
+            "node-a".into(),
+            Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap()),
+            sources.clone(),
+            Arc::new(UnimplementedChunkTransfer),
+            DfsReadConfig {
+                source_cache_ttl: Duration::from_secs(60),
+                ..DfsReadConfig::default()
+            },
+        )
+        .with_external_backend(chunks.clone(), chunks.clone());
+        prime_external_source_cache(&engine, &cached);
+        let batch = ReadBatch {
+            file_version_id: Some(FileVersionId::new("version")),
+            layout_root_id: LayoutRootId::new("layout"),
+            ops: vec![
+                ChunkReadOp {
+                    chunk_id: missing.chunk.id.clone(),
+                    chunk_offset: 1,
+                    length: 2,
+                    output_offset: 0,
+                },
+                ChunkReadOp {
+                    chunk_id: cached.chunk.id.clone(),
+                    chunk_offset: 2,
+                    length: 2,
+                    output_offset: 2,
+                },
+                ChunkReadOp {
+                    chunk_id: missing.chunk.id.clone(),
+                    chunk_offset: 3,
+                    length: 2,
+                    output_offset: 4,
+                },
+            ],
+        };
+
+        let mut out = [b'!'; 6];
+        let outcome = engine
+            .read_batch_current_external(&crate::dfs::InodeId::new("inode:test"), &batch, &mut out)
+            .unwrap();
+
+        assert_eq!(outcome, CurrentExternalReadOutcome::Read);
+        assert_eq!(&out, b"vwcdxy");
+        assert_eq!(chunks.current_calls(), 1);
+        assert_eq!(chunks.last_request_shape(), (1, 2));
+        assert_eq!(*sources.calls.lock().unwrap(), 0);
+        assert_eq!(*cached.fetches.lock().unwrap(), 1);
+        assert_eq!(*missing.fetches.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn external_backend_current_missing_authority_faults_do_not_fetch_or_fallback() {
+        for fault in [
+            ExternalAuthorityFault::Location,
+            ExternalAuthorityFault::Range,
+            ExternalAuthorityFault::GrantVersion,
+            ExternalAuthorityFault::MissingReply,
+            ExternalAuthorityFault::DuplicateReply,
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let fixture = Arc::new(ExternalFixture {
+                authority_fault: Some(fault),
+                ..ExternalFixture::new(b"abcdef")
+            });
+            let sources = fixture.empty_sources();
+            let authorizer = Arc::new(CurrentReadAuthorizer::new(
+                fixture.clone(),
+                CurrentReadMode::Authorized,
+                true,
+            ));
+            let engine = fixture
+                .engine(
+                    Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap()),
+                    sources.clone(),
+                )
+                .with_external_backend(fixture.clone(), authorizer.clone());
+
+            let mut out = [b'!'; 2];
+            assert!(
+                engine
+                    .read_batch_current_external(
+                        &crate::dfs::InodeId::new("inode:test"),
+                        &fixture.batch(),
+                        &mut out,
+                    )
+                    .is_err(),
+                "fault {fault:?}"
+            );
+
+            assert_eq!(&out, b"!!", "fault {fault:?}");
+            assert_eq!(authorizer.current_calls(), 1, "fault {fault:?}");
+            assert_eq!(authorizer.legacy_calls(), 0, "fault {fault:?}");
+            assert_eq!(authorizer.last_request_shape(), (0, 1), "fault {fault:?}");
+            assert_eq!(*sources.calls.lock().unwrap(), 0, "fault {fault:?}");
+            assert_eq!(*fixture.fetches.lock().unwrap(), 0, "fault {fault:?}");
+        }
+    }
+
+    #[test]
+    fn external_backend_current_cached_invalid_grant_is_not_resolved_as_missing() {
+        for case in 0..4 {
             let temp = tempfile::tempdir().unwrap();
             let fixture = Arc::new(ExternalFixture::new(b"abcdef"));
-            *fixture.bytes.lock().unwrap() = bytes;
-            let engine = fixture.engine(
+            let sources = fixture.sources();
+            let authorizer = Arc::new(CurrentReadAuthorizer::new(
+                fixture.clone(),
+                CurrentReadMode::Denied,
+                true,
+            ));
+            let engine = fixture
+                .engine(
+                    Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap()),
+                    sources.clone(),
+                )
+                .with_external_backend(fixture.clone(), authorizer.clone());
+            let mut source = fixture.candidate.clone();
+            match case {
+                0 => source.read_grant.namespace_id = crate::dfs::NamespaceId::new("other"),
+                1 => source.read_grant.caller_node_epoch = 0,
+                2 => source.read_grant.expires_at_unix_ms = 0,
+                _ => source.read_grant.token.clear(),
+            }
+            prime_external_source_cache_with(&engine, &fixture, source, Duration::from_secs(60));
+
+            let mut out = [b'!'; 2];
+            assert!(
+                engine
+                    .read_batch_current_external(
+                        &crate::dfs::InodeId::new("inode:test"),
+                        &fixture.batch(),
+                        &mut out,
+                    )
+                    .is_err(),
+                "case {case}"
+            );
+
+            assert_eq!(&out, b"!!", "case {case}");
+            assert_eq!(authorizer.current_calls(), 1, "case {case}");
+            assert_eq!(authorizer.legacy_calls(), 0, "case {case}");
+            assert_eq!(authorizer.last_request_shape(), (1, 0), "case {case}");
+            assert_eq!(*sources.calls.lock().unwrap(), 0, "case {case}");
+            assert_eq!(*fixture.fetches.lock().unwrap(), 0, "case {case}");
+        }
+    }
+
+    #[test]
+    fn external_backend_current_auth_errors_do_not_fallback_or_fetch() {
+        for mode in [CurrentReadMode::Denied, CurrentReadMode::DeadlineExceeded] {
+            let temp = tempfile::tempdir().unwrap();
+            let fixture = Arc::new(ExternalFixture::new(b"abcdef"));
+            let sources = fixture.empty_sources();
+            let authorizer = Arc::new(CurrentReadAuthorizer::new(fixture.clone(), mode, true));
+            let engine = fixture
+                .engine(
+                    Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap()),
+                    sources.clone(),
+                )
+                .with_external_backend(fixture.clone(), authorizer.clone());
+
+            let mut out = [b'!'; 2];
+            assert!(
+                engine
+                    .read_batch_current_external(
+                        &crate::dfs::InodeId::new("inode:test"),
+                        &fixture.batch(),
+                        &mut out,
+                    )
+                    .is_err(),
+                "mode {mode:?}"
+            );
+
+            assert_eq!(&out, b"!!", "mode {mode:?}");
+            assert_eq!(authorizer.current_calls(), 1, "mode {mode:?}");
+            assert_eq!(authorizer.legacy_calls(), 0, "mode {mode:?}");
+            assert_eq!(authorizer.last_request_shape(), (0, 1), "mode {mode:?}");
+            assert_eq!(*sources.calls.lock().unwrap(), 0, "mode {mode:?}");
+            assert_eq!(*fixture.fetches.lock().unwrap(), 0, "mode {mode:?}");
+        }
+    }
+
+    #[test]
+    fn external_backend_current_authorization_denial_is_not_legacy_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = Arc::new(ExternalFixture::new(b"abcdef"));
+        let authorizer = Arc::new(CurrentReadAuthorizer::new(
+            fixture.clone(),
+            CurrentReadMode::Denied,
+            true,
+        ));
+        let engine = fixture
+            .engine(
                 Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap()),
                 fixture.sources(),
-            );
-            let mut out = [b'!'; 2];
-            let error = engine.read_batch(&fixture.batch(), &mut out).unwrap_err();
-            assert_eq!(error.code(), afs_error::NODE_TRANSFER_CORRUPT_DATA);
-            assert_eq!(&out, b"!!");
+            )
+            .with_external_backend(fixture.clone(), authorizer.clone());
+
+        let mut out = [b'!'; 2];
+        assert!(
+            engine
+                .read_batch_current_external(
+                    &crate::dfs::InodeId::new("inode:test"),
+                    &fixture.batch(),
+                    &mut out,
+                )
+                .is_err()
+        );
+
+        assert_eq!(&out, b"!!");
+        assert_eq!(authorizer.current_calls(), 1);
+        assert_eq!(authorizer.legacy_calls(), 0);
+        assert_eq!(*fixture.fetches.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn external_backend_current_head_changed_does_not_consume_speculative_plan() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = Arc::new(ExternalFixture::new(b"abcdef"));
+        let authorizer = Arc::new(CurrentReadAuthorizer::new(
+            fixture.clone(),
+            CurrentReadMode::HeadChanged,
+            true,
+        ));
+        let engine = fixture
+            .engine(
+                Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap()),
+                fixture.sources(),
+            )
+            .with_external_backend(fixture.clone(), authorizer.clone());
+
+        let mut out = [b'!'; 2];
+        let outcome = engine
+            .read_batch_current_external(
+                &crate::dfs::InodeId::new("inode:test"),
+                &fixture.batch(),
+                &mut out,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            outcome,
+            CurrentExternalReadOutcome::HeadChanged(inode)
+                if inode.head_version == Some(FileVersionId::new("next-version"))
+        ));
+        assert_eq!(&out, b"!!");
+        assert_eq!(authorizer.current_calls(), 1);
+        assert_eq!(authorizer.legacy_calls(), 0);
+        assert_eq!(*fixture.fetches.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn external_backend_current_authorized_wrong_inode_is_rejected_without_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = Arc::new(ExternalFixture::new(b"abcdef"));
+        let authorizer = Arc::new(CurrentReadAuthorizer::new(
+            fixture.clone(),
+            CurrentReadMode::AuthorizedWrongInode,
+            true,
+        ));
+        let engine = fixture
+            .engine(
+                Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap()),
+                fixture.sources(),
+            )
+            .with_external_backend(fixture.clone(), authorizer.clone());
+
+        let mut out = [b'!'; 2];
+        assert!(
+            engine
+                .read_batch_current_external(
+                    &crate::dfs::InodeId::new("inode:test"),
+                    &fixture.batch(),
+                    &mut out,
+                )
+                .is_err()
+        );
+
+        assert_eq!(&out, b"!!");
+        assert_eq!(authorizer.current_calls(), 1);
+        assert_eq!(authorizer.legacy_calls(), 0);
+        assert_eq!(*fixture.fetches.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn external_backend_current_fake_head_changed_is_rejected_without_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = Arc::new(ExternalFixture::new(b"abcdef"));
+        let authorizer = Arc::new(CurrentReadAuthorizer::new(
+            fixture.clone(),
+            CurrentReadMode::HeadChangedSameHead,
+            true,
+        ));
+        let engine = fixture
+            .engine(
+                Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap()),
+                fixture.sources(),
+            )
+            .with_external_backend(fixture.clone(), authorizer.clone());
+
+        let mut out = [b'!'; 2];
+        assert!(
+            engine
+                .read_batch_current_external(
+                    &crate::dfs::InodeId::new("inode:test"),
+                    &fixture.batch(),
+                    &mut out,
+                )
+                .is_err()
+        );
+
+        assert_eq!(&out, b"!!");
+        assert_eq!(authorizer.current_calls(), 1);
+        assert_eq!(authorizer.legacy_calls(), 0);
+        assert_eq!(*fixture.fetches.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn external_backend_current_read_reports_unsupported_without_legacy_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = Arc::new(ExternalFixture::new(b"abcdef"));
+        let engine = fixture.engine(
+            Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap()),
+            fixture.sources(),
+        );
+
+        let mut out = [b'!'; 2];
+        let outcome = engine
+            .read_batch_current_external(
+                &crate::dfs::InodeId::new("inode:test"),
+                &fixture.batch(),
+                &mut out,
+            )
+            .unwrap();
+
+        assert_eq!(outcome, CurrentExternalReadOutcome::Unsupported);
+        assert_eq!(&out, b"!!");
+        assert_eq!(*fixture.authorizations.lock().unwrap(), 0);
+        assert_eq!(*fixture.fetches.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn external_backend_rejects_verified_content_for_another_chunk() {
+        struct WrongChunk(VerifiedExternalChunk);
+        impl ExternalChunkReader for WrongChunk {
+            fn read_chunk(
+                &self,
+                _: &ChunkObject,
+                _: &SourceCandidate,
+            ) -> Result<VerifiedExternalChunk> {
+                Ok(self.0.clone())
+            }
         }
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = Arc::new(ExternalFixture::new(b"abcdef"));
+        let other = crate::node::chunk::StagedChunk::new(
+            crate::dfs::OperationId::new("other"),
+            b"ghijkl".to_vec(),
+        );
+        let verified = VerifiedExternalChunk::verify(&other.chunk, other.bytes().to_vec()).unwrap();
+        let engine = fixture
+            .engine(
+                Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap()),
+                fixture.sources(),
+            )
+            .with_external_backend(Arc::new(WrongChunk(verified)), fixture.clone());
+        let mut out = [b'!'; 2];
+        let error = engine.read_batch(&fixture.batch(), &mut out).unwrap_err();
+        assert_eq!(error.code(), afs_error::NODE_TRANSFER_CORRUPT_DATA);
+        assert_eq!(&out, b"!!");
+        assert_eq!(*fixture.authorizations.lock().unwrap(), 1);
     }
 
     #[test]
@@ -1902,7 +3303,11 @@ mod tests {
     }
 
     impl ExternalChunkReader for ExternalChunks {
-        fn read_chunk(&self, chunk: &ChunkObject, source: &SourceCandidate) -> Result<Vec<u8>> {
+        fn read_chunk(
+            &self,
+            chunk: &ChunkObject,
+            source: &SourceCandidate,
+        ) -> Result<VerifiedExternalChunk> {
             self.0
                 .iter()
                 .find(|fixture| fixture.chunk.id == chunk.id)

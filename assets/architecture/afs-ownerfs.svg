@@ -1,0 +1,94 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 900" role="img" aria-labelledby="title desc">
+<title id="title">OwnerFs · 远端访问与本地 workspace bind</title><desc id="desc">远端FUSE通过OwnerFiles访问Home普通文件，Meta用于root和Home权威信息。workspace bind使用Home底层真实目录作为源，本地bind子树不经FUSE或OwnerFiles；挂载授权与身份验证不能替代远端逐操作检查。</desc>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10Z" fill="#516b83"/></marker></defs>
+<style>text{font-family:system-ui,-apple-system,"PingFang SC",sans-serif;fill:#17324d}.title{font-size:24px;font-weight:650}.head{font-size:18px;font-weight:650}.body{font-size:15px}.small{font-size:13px;fill:#526b7c}.edge{fill:none;stroke:#516b83;stroke-width:1.7;marker-end:url(#arrow)}.control{stroke-dasharray:6 4}.box{stroke:#b7ccd9;stroke-width:1.4}.life{stroke:#afc4d2;stroke-width:1.2;stroke-dasharray:5 5}</style>
+<rect width="1280" height="900" rx="16" fill="#f5f8fb"/>
+<text x="32" y="40" class="title">OwnerFs · 远端访问与本地 workspace bind</text>
+<text x="32" y="68" class="small">逻辑时序，不表示固定 RPC 次数；省略响应头和传输细节。</text>
+<rect x="10" y="95" width="200" height="48" rx="10" fill="#e8f0fc" stroke="#b7ccd9"/>
+<text x="110" y="125" class="body" text-anchor="middle">远端应用</text>
+<path d="M110 143V622" class="life"/>
+<rect x="250" y="95" width="200" height="48" rx="10" fill="#e8f0fc" stroke="#b7ccd9"/>
+<text x="350" y="125" class="body" text-anchor="middle">远端 Node / OwnerFs</text>
+<path d="M350 143V622" class="life"/>
+<rect x="490" y="95" width="200" height="48" rx="10" fill="#e8f0fc" stroke="#b7ccd9"/>
+<text x="590" y="125" class="body" text-anchor="middle">afs-meta</text>
+<path d="M590 143V622" class="life"/>
+<rect x="730" y="95" width="200" height="48" rx="10" fill="#e8f0fc" stroke="#b7ccd9"/>
+<text x="830" y="125" class="body" text-anchor="middle">Home Node / OwnerFs</text>
+<path d="M830 143V622" class="life"/>
+<rect x="1020" y="95" width="200" height="48" rx="10" fill="#e8f0fc" stroke="#b7ccd9"/>
+<text x="1120" y="125" class="body" text-anchor="middle">Home 底层文件系统</text>
+<path d="M1120 143V622" class="life"/>
+<path d="M110 185H350" class="edge"/>
+<text x="230.0" y="176" class="small" text-anchor="middle">open / 重新打开</text>
+<path d="M350 232H590" class="edge control"/>
+<text x="470.0" y="223" class="small" text-anchor="middle">按需解析 root / Home 与授权</text>
+<path d="M590 275H350" class="edge control"/>
+<text x="470.0" y="266" class="small" text-anchor="middle">权威 Home / root 身份</text>
+<path d="M350 325H830" class="edge"/>
+<text x="590.0" y="316" class="small" text-anchor="middle">OwnerFiles：open / read / write / sync</text>
+<rect x="714" y="350" width="490" height="76" rx="12" class="box" fill="#fff1db"/>
+<text x="730" y="379" class="head">Home 操作检查</text>
+<text x="730" y="405" class="body">授权、权限、句柄、root / Home session 与 fence</text>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<path d="M830 468H1120" class="edge"/>
+<text x="975.0" y="459" class="small" text-anchor="middle">文件操作 / 持久化屏障</text>
+<path d="M1120 510H830" class="edge"/>
+<text x="975.0" y="501" class="small" text-anchor="middle">数据或实际错误</text>
+<path d="M830 554H350" class="edge"/>
+<text x="590.0" y="545" class="small" text-anchor="middle">数据 / 同步结果 / 错误</text>
+<path d="M350 598H110" class="edge"/>
+<text x="230.0" y="589" class="small" text-anchor="middle">返回应用；正文不经 Meta</text>
+<text x="36" y="655" class="head">本地 workspace bind ON：独立数据路径</text>
+<rect x="36" y="687" width="330" height="100" rx="12" class="box" fill="#fff1db"/>
+<text x="52" y="716" class="head">本地应用</text>
+<text x="52" y="742" class="body">访问 OwnerFs 根下一级 workspace</text>
+<text x="52" y="765" class="body">如 /mnt/afs/ownerfs/agent1</text>
+<rect x="470" y="687" width="330" height="100" rx="12" class="box" fill="#e6f4ef"/>
+<text x="486" y="716" class="head">Linux VFS · bind 挂载</text>
+<text x="486" y="742" class="body">源：Home 底层真实目录</text>
+<text x="486" y="765" class="body">目标：FUSE 根下对应一级目录</text>
+<rect x="904" y="687" width="340" height="100" rx="12" class="box" fill="#e6f4ef"/>
+<text x="920" y="716" class="head">同一个 Home 底层目录</text>
+<text x="920" y="742" class="body">访问绕过 FUSE / OwnerFiles</text>
+<text x="920" y="765" class="body">文件权限由底层文件系统执行</text>
+<path d="M366 737H470" class="edge"/>
+<path d="M800 737H904" class="edge"/>
+<text x="36" y="832" class="body">启用 / 核验 / 卸载由 Node 生命周期接线与 bind_mount.rs 负责；远端仍走上方授权路径。</text>
+<text x="36" y="861" class="small">既有 FD / mmap 的即时撤权及 bind ↔ FUSE 跨节点锁一致性不在当前承诺内。</text>
+</svg>

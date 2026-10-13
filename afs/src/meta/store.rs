@@ -12,12 +12,13 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use afs_error::{Error, Result};
+use afs_tracing::{Instrument, tracing};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{RwLock, mpsc, oneshot};
 
@@ -545,6 +546,43 @@ pub enum StoreOperation {
     DfsReportChunkCorruption,
 }
 
+impl StoreOperation {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::RegisterNode => "register_node",
+            Self::ReserveRoot => "reserve_root",
+            Self::AbortRoot => "abort_root",
+            Self::ActivateRoot => "activate_root",
+            Self::AcquireRoot => "acquire_root",
+            Self::RecoverRoot => "recover_root",
+            Self::BeginRootRevocation => "begin_root_revocation",
+            Self::CommitRootRevocation => "commit_root_revocation",
+            Self::AckRootCommand => "ack_root_command",
+            Self::DfsCreate => "dfs_create",
+            Self::DfsMkdir => "dfs_mkdir",
+            Self::DfsMknod => "dfs_mknod",
+            Self::DfsInitializeNamespace => "dfs_initialize_namespace",
+            Self::DfsUnlink => "dfs_unlink",
+            Self::DfsRmdir => "dfs_rmdir",
+            Self::DfsRename => "dfs_rename",
+            Self::DfsLink => "dfs_link",
+            Self::DfsSymlink => "dfs_symlink",
+            Self::DfsSetInodeAttributes => "dfs_set_inode_attributes",
+            Self::DfsSetXattr => "dfs_set_xattr",
+            Self::DfsRemoveXattr => "dfs_remove_xattr",
+            Self::DfsAcquireWriteLease => "dfs_acquire_write_lease",
+            Self::DfsRenewWriteLease => "dfs_renew_write_lease",
+            Self::DfsSyncInodeMetadata => "dfs_sync_inode_metadata",
+            Self::DfsCommitFileVersion => "dfs_commit_file_version",
+            Self::DfsInitializeReplicationConfig => "dfs_initialize_replication_config",
+            Self::DfsInitializeDurabilityPolicy => "dfs_initialize_durability_policy",
+            Self::DfsClaimReplicationTask => "dfs_claim_replication_task",
+            Self::DfsReportReplicationTask => "dfs_report_replication_task",
+            Self::DfsReportChunkCorruption => "dfs_report_chunk_corruption",
+        }
+    }
+}
+
 /// Operation result that can be replayed to idempotent callers.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[allow(clippy::large_enum_variant)]
@@ -865,15 +903,28 @@ enum Mutation {
     RegisterNode(RequestKey, NodeSessionLease),
 }
 
+impl Mutation {
+    fn operation_name(&self) -> &'static str {
+        match self {
+            Self::Transaction(txn) => txn.operation.as_str(),
+            Self::RegisterNode(_, _) => StoreOperation::RegisterNode.as_str(),
+        }
+    }
+}
+
 struct Pending {
     operation: Mutation,
     reply: oneshot::Sender<Result<TxnOutcome>>,
+    request_span: tracing::Span,
+    store_request_id: u64,
+    operation_name: &'static str,
 }
 
 pub struct Store {
     visible: Arc<Visible>,
     writes: mpsc::Sender<Pending>,
     backend: Arc<dyn StoreBackend>,
+    next_request_id: AtomicU64,
 }
 
 impl Store {
@@ -897,6 +948,7 @@ impl Store {
             visible,
             writes,
             backend,
+            next_request_id: AtomicU64::new(1),
         })
     }
 
@@ -918,15 +970,49 @@ impl Store {
     }
 
     async fn mutate(&self, operation: Mutation) -> Result<TxnOutcome> {
-        self.ensure_available()?;
-        let (reply, result) = oneshot::channel();
-        self.writes
-            .send(Pending { operation, reply })
-            .await
-            .map_err(|_| unavailable("store commit loop stopped"))?;
-        result
-            .await
-            .map_err(|_| unavailable("store commit loop dropped reply"))?
+        let store_request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+        let operation_name = operation.operation_name();
+        let span = tracing::info_span!(
+            "meta.store.mutate",
+            store.request_id = store_request_id,
+            store.operation = operation_name,
+            store.batch_id = tracing::field::Empty,
+            result = tracing::field::Empty,
+        );
+        async move {
+            self.ensure_available()?;
+            let (reply, result) = oneshot::channel();
+            let request_span = tracing::Span::current();
+            self.writes
+                .send(Pending {
+                    operation,
+                    reply,
+                    request_span,
+                    store_request_id,
+                    operation_name,
+                })
+                .instrument(tracing::info_span!(
+                    "meta.store.enqueue",
+                    store.request_id = store_request_id,
+                    store.operation = operation_name,
+                    result = tracing::field::Empty,
+                ))
+                .await
+                .map_err(|_| unavailable("store commit loop stopped"))?;
+            let outcome = result
+                .instrument(tracing::info_span!(
+                    "meta.store.commit_wait",
+                    store.request_id = store_request_id,
+                    store.operation = operation_name,
+                    result = tracing::field::Empty,
+                ))
+                .await
+                .map_err(|_| unavailable("store commit loop dropped reply"))?;
+            tracing::Span::current().record("result", tracing_result(outcome.as_ref()));
+            outcome
+        }
+        .instrument(span)
+        .await
     }
 }
 
@@ -936,21 +1022,56 @@ async fn run_commit_loop(
     backend: Arc<dyn StoreBackend>,
     mut backend_version: u64,
 ) {
+    let mut next_batch_id = 1_u64;
     while let Some(first) = receiver.recv().await {
+        let batch_id = next_batch_id;
+        next_batch_id = next_batch_id.saturating_add(1);
         let mut batch = vec![first];
+        let batch_span = tracing::info_span!(
+            "meta.store.commit_batch",
+            store.batch_id = batch_id,
+            store.requests = tracing::field::Empty,
+            store.committed_requests = tracing::field::Empty,
+            store.dirty = tracing::field::Empty,
+            store.backend_version.before = backend_version,
+            store.backend_version.after = tracing::field::Empty,
+            result = tracing::field::Empty,
+        );
         // Meta is a coarse control path. A short gather window amortizes
         // backend fsync/CAS across concurrent callers without affecting data IO.
-        tokio::time::sleep(Duration::from_millis(1)).await;
-        while batch.len() < 64 {
-            match receiver.try_recv() {
-                Ok(item) => batch.push(item),
-                Err(_) => break,
+        let gather_span = tracing::info_span!(
+            parent: &batch_span,
+            "meta.store.batch_gather",
+            store.batch_id = batch_id,
+            store.requests = tracing::field::Empty,
+            store.limit = 64_u64,
+        );
+        async {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            while batch.len() < 64 {
+                match receiver.try_recv() {
+                    Ok(item) => batch.push(item),
+                    Err(_) => break,
+                }
             }
         }
+        .instrument(gather_span.clone())
+        .await;
+        gather_span.record("store.requests", batch.len() as u64);
+        batch_span.record("store.requests", batch.len() as u64);
+        link_batch_to_requests(&batch_span, &batch, batch_id);
         let base = Arc::clone(&*visible.committed.read().await);
-        let staged = match base.fork() {
+        let staged = match async { base.fork() }
+            .instrument(tracing::info_span!(
+                parent: &batch_span,
+                "meta.store.batch_fork",
+                store.batch_id = batch_id,
+            ))
+            .await
+        {
             Ok(staged) => staged,
             Err(error) => {
+                batch_span.record("result", "fork_error");
                 fail_batch(batch, error.to_string(), &visible);
                 break;
             }
@@ -958,26 +1079,71 @@ async fn run_commit_loop(
         let mut replies = Vec::with_capacity(batch.len());
         let mut dirty = false;
         for item in batch {
-            let result = match item.operation {
-                Mutation::Transaction(txn) => staged.compare_and_commit(txn).await,
-                Mutation::RegisterNode(request, lease) => {
-                    staged.register_node_session(request, lease).await
+            let request_span = tracing::info_span!(
+                parent: &batch_span,
+                "meta.store.apply_request",
+                store.batch_id = batch_id,
+                store.request_id = item.store_request_id,
+                store.operation = item.operation_name,
+                result = tracing::field::Empty,
+            );
+            if let Some(id) = item.request_span.id() {
+                request_span.follows_from(id);
+            }
+            let result = async {
+                match item.operation {
+                    Mutation::Transaction(txn) => staged.compare_and_commit(txn).await,
+                    Mutation::RegisterNode(request, lease) => {
+                        staged.register_node_session(request, lease).await
+                    }
                 }
-            };
+            }
+            .instrument(request_span.clone())
+            .await;
+            request_span.record("result", tracing_result(result.as_ref()));
             dirty |= matches!(result, Ok(TxnOutcome::Committed { .. }));
             replies.push((item.reply, result));
         }
+        let committed_requests = replies
+            .iter()
+            .filter(|(_, result)| matches!(result, Ok(TxnOutcome::Committed { .. })))
+            .count();
+        batch_span.record("store.committed_requests", committed_requests as u64);
+        batch_span.record("store.dirty", dirty);
         if dirty {
-            let persist = match staged.snapshot_bytes() {
-                Ok(bytes) => backend.commit(backend_version, bytes).await,
+            let snapshot = {
+                let _entered = batch_span.enter();
+                staged.snapshot_bytes_with_batch(batch_id)
+            };
+            let persist = match snapshot {
+                Ok(bytes) => {
+                    let snapshot_bytes = bytes.len();
+                    let commit_span = tracing::info_span!(
+                        parent: &batch_span,
+                        "meta.store.backend_commit",
+                        store.batch_id = batch_id,
+                        store.backend_version.before = backend_version,
+                        store.snapshot_bytes = snapshot_bytes as u64,
+                        result = tracing::field::Empty,
+                    );
+                    let result = backend
+                        .commit(backend_version, bytes)
+                        .instrument(commit_span.clone())
+                        .await;
+                    commit_span.record("result", backend_result(result.as_ref()));
+                    result
+                }
                 Err(error) => Err(error),
             };
             match persist {
                 Ok(version) => {
                     backend_version = version;
+                    batch_span.record("store.backend_version.after", version);
+                    batch_span.record("result", "ok");
                     *visible.committed.write().await = Arc::new(staged);
                 }
                 Err(error) => {
+                    batch_span.record("result", "commit_error");
                     visible.poisoned.store(true, Ordering::Release);
                     let message = format!("store backend commit failed: {error}");
                     for (reply, _) in replies {
@@ -986,6 +1152,8 @@ async fn run_commit_loop(
                     break;
                 }
             }
+        } else {
+            batch_span.record("result", "clean");
         }
         for (reply, result) in replies {
             let _ = reply.send(result);
@@ -997,7 +1165,32 @@ async fn run_commit_loop(
 fn fail_batch(batch: Vec<Pending>, message: String, visible: &Visible) {
     visible.poisoned.store(true, Ordering::Release);
     for item in batch {
+        item.request_span.record("result", "failed");
         let _ = item.reply.send(Err(unavailable(&message)));
+    }
+}
+
+fn link_batch_to_requests(batch_span: &tracing::Span, batch: &[Pending], batch_id: u64) {
+    for item in batch {
+        item.request_span.record("store.batch_id", batch_id);
+        if let Some(id) = item.request_span.id() {
+            batch_span.follows_from(id);
+        }
+    }
+}
+
+fn tracing_result(result: std::result::Result<&TxnOutcome, &Error>) -> &'static str {
+    match result {
+        Ok(TxnOutcome::Committed { .. }) => "committed",
+        Ok(TxnOutcome::ConditionFailed { .. }) => "condition_failed",
+        Err(_) => "error",
+    }
+}
+
+fn backend_result(result: std::result::Result<&u64, &Error>) -> &'static str {
+    match result {
+        Ok(_) => "ok",
+        Err(_) => "error",
     }
 }
 
@@ -1142,39 +1335,82 @@ impl StoreState {
         })
     }
 
+    #[cfg(test)]
     fn snapshot_bytes(&self) -> Result<Vec<u8>> {
+        self.snapshot_bytes_with_batch(0)
+    }
+
+    fn snapshot_bytes_with_batch(&self, batch_id: u64) -> Result<Vec<u8>> {
+        let span = tracing::info_span!(
+            "meta.store.snapshot_encode",
+            store.batch_id = batch_id,
+            store.revision = tracing::field::Empty,
+            store.entities = tracing::field::Empty,
+            store.requests = tracing::field::Empty,
+            store.events = tracing::field::Empty,
+            store.node_epochs = tracing::field::Empty,
+            store.snapshot_bytes = tracing::field::Empty,
+            result = tracing::field::Empty,
+        );
+        let _entered = span.enter();
         let state = self
             .state
             .lock()
             .map_err(|_| invalid_contract("meta store lock poisoned"))?;
+        span.record("store.revision", state.revision.0);
+        span.record("store.entities", state.entities.len() as u64);
+        span.record("store.requests", state.requests.len() as u64);
+        span.record("store.events", state.events.len() as u64);
+        span.record("store.node_epochs", state.node_epochs.len() as u64);
+        let clone_span = tracing::info_span!(
+            "meta.store.snapshot_clone_sort",
+            store.batch_id = batch_id,
+            store.entities = state.entities.len() as u64,
+            store.requests = state.requests.len() as u64,
+            store.events = state.events.len() as u64,
+            store.node_epochs = state.node_epochs.len() as u64,
+        );
+        let (entities, requests, events, node_epochs) = {
+            let _entered = clone_span.enter();
+            (
+                state
+                    .entities
+                    .iter()
+                    .map(|(key, entity)| (key.clone(), entity.clone()))
+                    .collect::<BTreeMap<_, _>>()
+                    .into_iter()
+                    .collect(),
+                state
+                    .requests
+                    .iter()
+                    .map(|(key, outcome)| (key.clone(), outcome.clone()))
+                    .collect::<BTreeMap<_, _>>()
+                    .into_iter()
+                    .collect(),
+                state.events.clone(),
+                state
+                    .node_epochs
+                    .iter()
+                    .map(|(node, epoch)| (node.clone(), *epoch))
+                    .collect::<BTreeMap<_, _>>()
+                    .into_iter()
+                    .collect(),
+            )
+        };
         let snapshot = PersistedMemoryState {
             schema_version: 1,
             revision: state.revision,
-            entities: state
-                .entities
-                .iter()
-                .map(|(key, entity)| (key.clone(), entity.clone()))
-                .collect::<BTreeMap<_, _>>()
-                .into_iter()
-                .collect(),
-            requests: state
-                .requests
-                .iter()
-                .map(|(key, outcome)| (key.clone(), outcome.clone()))
-                .collect::<BTreeMap<_, _>>()
-                .into_iter()
-                .collect(),
-            events: state.events.clone(),
-            node_epochs: state
-                .node_epochs
-                .iter()
-                .map(|(node, epoch)| (node.clone(), *epoch))
-                .collect::<BTreeMap<_, _>>()
-                .into_iter()
-                .collect(),
+            entities,
+            requests,
+            events,
+            node_epochs,
         };
-        serde_json::to_vec(&snapshot)
-            .map_err(|error| invalid_contract(format!("encode store snapshot: {error}")))
+        let bytes = tracing::info_span!("meta.store.snapshot_json", store.batch_id = batch_id)
+            .in_scope(|| serde_json::to_vec(&snapshot))
+            .map_err(|error| invalid_contract(format!("encode store snapshot: {error}")))?;
+        span.record("store.snapshot_bytes", bytes.len() as u64);
+        span.record("result", "ok");
+        Ok(bytes)
     }
 
     fn from_snapshot(bytes: &[u8]) -> Result<Self> {
@@ -2774,6 +3010,66 @@ mod tests {
                     self.inner.commit(expected_version, bytes).await
                 }
             })
+        }
+    }
+
+    struct CountingBackend {
+        inner: memory::MemoryBackend,
+        commits: Arc<std::sync::atomic::AtomicUsize>,
+        last_snapshot_bytes: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl StoreBackend for CountingBackend {
+        fn load(&self) -> MetaFuture<'_, Option<(u64, Vec<u8>)>> {
+            self.inner.load()
+        }
+
+        fn commit(&self, expected_version: u64, bytes: Vec<u8>) -> MetaFuture<'_, u64> {
+            self.commits
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.last_snapshot_bytes
+                .store(bytes.len(), std::sync::atomic::Ordering::SeqCst);
+            self.inner.commit(expected_version, bytes)
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_observability_preserves_group_commit_replay() {
+        let commits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let last_snapshot_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let backend = Arc::new(CountingBackend {
+            inner: memory::MemoryBackend::default(),
+            commits: Arc::clone(&commits),
+            last_snapshot_bytes: Arc::clone(&last_snapshot_bytes),
+        });
+        let store = Store::open(backend.clone()).await.unwrap();
+        let first_request = RequestKey::new("node-a", "batch-observe-1");
+        let second_request = RequestKey::new("node-a", "batch-observe-2");
+
+        let (first, second) = tokio::join!(
+            store.register_node_session(first_request.clone(), lease("session-1")),
+            store.register_node_session(second_request.clone(), lease("session-2")),
+        );
+        assert!(matches!(first.unwrap(), TxnOutcome::Committed { .. }));
+        assert!(matches!(second.unwrap(), TxnOutcome::Committed { .. }));
+        assert_eq!(
+            commits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "concurrent mutations should stay one physical batch after instrumentation"
+        );
+        assert!(
+            last_snapshot_bytes.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "instrumented snapshot path must still produce durable bytes"
+        );
+
+        drop(store);
+        let reopened = Store::open(backend).await.unwrap();
+        for request in [first_request, second_request] {
+            let snapshot = reopened
+                .read(MetaRead::RequestOutcome(request))
+                .await
+                .unwrap();
+            assert!(snapshot.request_outcome.is_some());
         }
     }
 
