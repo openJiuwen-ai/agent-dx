@@ -54,6 +54,23 @@ dfs_catalog_commit_queue = 256
 # dfs_source_cache_max_ms = 5000
 # dfs_source_lookahead_chunks = 64
 # dfs_source_cache_bytes = 4194304
+# Read-only DFS FUSE opens: cached (default) or direct for bulk reads.
+# Writable opens stay cached. Direct read-only mmap requires kernel support.
+dfs_fuse_read_mode = "cached"
+# DFS FUSE INIT request-capacity target in bytes. 1048576 is the product
+# default; 4096..=8388608 in 4096-byte steps. The kernel may clamp it, and the
+# observed READ distribution must be checked from FUSE metrics.
+dfs_fuse_max_io_bytes = 1048576
+# Opt-in prepared Host-to-Host payload measurement; baseline preserves streaming.
+dfs_read_measurement_mode = "baseline"
+# Sequential read aggregation: off (default) or sequential. When enabled, a
+# direct read-ahead group of dfs_read_group_bytes is prefetched per handle and
+# may be submitted as one native HIXL batch. Ranges: 1..=128 MiB, 4096-aligned.
+dfs_read_group_mode = "off"
+dfs_read_group_bytes = 8388608
+dfs_read_group_max_inflight = 1
+dfs_read_group_max_descriptors = 128
+dfs_read_group_host_budget_bytes = 1073741824
 timeout_ms = 5000
 log_level = "info"
 trace_enabled = false
@@ -128,3 +145,35 @@ node-a = "/opt/adx/config/afs/tls/node-a.pem"
 # [dfs_peer_cache]
 # directory = "/opt/adx/cache/afs/peer"
 # capacity_bytes = 268435456
+
+# Only immutable committed DFS reads; native build and trusted HIXL network required.
+[hixl]
+dfs_read_mode = "off"
+# Read transport: "roce" (default) or "hccs-buffer-pool".
+# hccs-buffer-pool uses synchronous A3 relay reads; both endpoints must
+# use matching transport, buffer_pool_count, and buffer_pool_size_mib values.
+transport = "roce"
+buffer_pool_count = 4
+buffer_pool_size_mib = 8
+# With HCCS selected, each device's two HBM pools default to 64 MiB combined.
+# Peers must also have the same SDK-reported super-pod ID.
+device_id = 0
+# engine_id = "192.0.2.10:7920" # replace with this node's reachable IP:port
+# Optional local SDK device listener. It is independent of engine_id's Host
+# port; assign a distinct value when multiple processes share one device.
+# device_listen_port = 27666
+window_bytes = 4194304
+receive_slots = 16
+export_slots = 16
+max_inflight_per_peer = 1
+# Idle peer control sessions are retired after this many milliseconds.
+# 0 keeps them for the process lifetime, avoiding a ~0.2 s reconnect on sparse reads.
+session_idle_ms = 300000
+# Optional ordered extra lanes; primary plus extras are limited to 16 SDK
+# logical devices. Both peers pair by lane order. Hardware validation is pending.
+# Multi-device mode requires distinct explicit listener ports on every lane,
+# including the primary device_listen_port above. Window/pool sizes are per lane.
+# [[hixl.additional_devices]]
+# device_id = 2
+# engine_id = "192.0.2.10:7921"
+# device_listen_port = 27667

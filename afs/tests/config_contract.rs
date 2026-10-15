@@ -480,6 +480,245 @@ fn ownerfs_mkdir_load_balance_is_opt_in() {
 }
 
 #[test]
+fn hixl_defaults_off_without_changing_existing_data_mode() {
+    let cfg = Config::resolve(Role::Node, Cli::parse_from(["afs-node"])).unwrap();
+    assert_eq!(cfg.data_mode, "grpc");
+    let printed = serde_json::to_value(&cfg).unwrap();
+    assert_eq!(printed["hixl"]["dfs_read_mode"], "off");
+}
+
+#[test]
+fn hixl_defaults_include_roce_transport_and_buffer_pool_defaults() {
+    let cfg = Config::resolve(Role::Node, Cli::parse_from(["afs-node"])).unwrap();
+    let printed = serde_json::to_value(&cfg).unwrap();
+    assert_eq!(printed["hixl"]["transport"], "roce");
+    assert_eq!(printed["hixl"]["buffer_pool_count"], 4);
+    assert_eq!(printed["hixl"]["buffer_pool_size_mib"], 8);
+    assert_eq!(printed["hixl"]["session_idle_ms"], 300000);
+    assert!(printed["hixl"].get("device_listen_port").is_some());
+    assert!(printed["hixl"]["device_listen_port"].is_null());
+}
+
+#[test]
+fn disabled_hixl_table_is_accepted_without_native_dependencies() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("node.toml");
+    std::fs::write(
+        &path,
+        "data_mode='grpc'\n[hixl]\ndfs_read_mode='off'\nwindow_bytes=4194304\nreceive_slots=2\nexport_slots=2\n",
+    )
+    .unwrap();
+    let cfg = Config::resolve(
+        Role::Node,
+        Cli::parse_from(["afs-node", "--config", path.to_str().unwrap()]),
+    )
+    .unwrap();
+    assert_eq!(cfg.data_mode, "grpc");
+    let printed = serde_json::to_value(&cfg).unwrap();
+    assert_eq!(printed["hixl"]["receive_slots"], 2);
+}
+
+fn resolve_hixl_table(prefix: &str, table: &str) -> afs_error::Result<Config> {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("node.toml");
+    std::fs::write(&path, format!("{prefix}\n[hixl]\n{table}\n")).unwrap();
+    Config::resolve(
+        Role::Node,
+        Cli::parse_from(["afs-node", "--config", path.to_str().unwrap()]),
+    )
+}
+
+#[test]
+fn hixl_toml_accepts_hccs_buffer_pool_transport_and_sizes() {
+    let cfg = resolve_hixl_table(
+        "",
+        "transport='hccs-buffer-pool'\nbuffer_pool_count=4\nbuffer_pool_size_mib=8",
+    )
+    .unwrap();
+    let printed = serde_json::to_value(&cfg).unwrap();
+    assert_eq!(printed["hixl"]["transport"], "hccs-buffer-pool");
+    assert_eq!(printed["hixl"]["buffer_pool_count"], 4);
+    assert_eq!(printed["hixl"]["buffer_pool_size_mib"], 8);
+}
+
+#[test]
+fn hixl_toml_accepts_device_listen_port_independent_of_engine_id() {
+    let cfg =
+        resolve_hixl_table("", "engine_id='192.0.2.10:7920'\ndevice_listen_port=27666").unwrap();
+    let printed = serde_json::to_value(&cfg).unwrap();
+    assert_eq!(printed["hixl"]["engine_id"], "192.0.2.10:7920");
+    assert_eq!(printed["hixl"]["device_listen_port"], 27666);
+    assert_eq!(cfg.hixl.runtime_options().device_listen_port, Some(27666));
+}
+
+#[test]
+fn hixl_accepts_max_device_listen_port() {
+    let cfg = resolve_hixl_table("", "device_listen_port=65535").unwrap();
+    assert_eq!(cfg.hixl.device_listen_port, Some(65535));
+    assert_eq!(cfg.hixl.runtime_options().device_listen_port, Some(65535));
+}
+
+#[test]
+fn hixl_rejects_zero_device_listen_port_at_config_boundary() {
+    let error = resolve_hixl_table("", "device_listen_port=0").unwrap_err();
+    assert!(
+        !error.to_string().contains("unknown field"),
+        "zero should reach device port validation: {error}"
+    );
+}
+
+#[test]
+fn hixl_rejects_device_listen_ports_outside_u16_during_toml_parse() {
+    for table in ["device_listen_port=-1", "device_listen_port=65536"] {
+        let error = resolve_hixl_table("", table).unwrap_err();
+        assert!(
+            !error.to_string().contains("unknown field"),
+            "out-of-range port should be rejected as a typed value: {table}: {error}"
+        );
+    }
+}
+
+#[test]
+fn hixl_runtime_options_map_transport_and_buffer_pool_fields() {
+    let hccs = resolve_hixl_table(
+        "",
+        "transport='hccs-buffer-pool'\nbuffer_pool_count=7\nbuffer_pool_size_mib=9",
+    )
+    .unwrap();
+    let hccs_options = hccs.hixl.runtime_options();
+    assert_eq!(
+        hccs_options.transport,
+        afs_transport::hixl::ReadTransport::HccsBufferPool
+    );
+    assert_eq!(hccs_options.buffer_pool_count, 7);
+    assert_eq!(hccs_options.buffer_pool_size_mib, 9);
+
+    let roce = Config::resolve(Role::Node, Cli::parse_from(["afs-node"])).unwrap();
+    let roce_options = roce.hixl.runtime_options();
+    assert_eq!(
+        roce_options.transport,
+        afs_transport::hixl::ReadTransport::Roce
+    );
+    assert_eq!(roce_options.device_listen_port, None);
+    assert_eq!(roce_options.buffer_pool_count, 4);
+    assert_eq!(roce_options.buffer_pool_size_mib, 8);
+}
+
+#[test]
+fn hixl_accepts_buffer_pool_bounds_and_512_mib_budget() {
+    for (count, size_mib) in [(1, 1), (64, 1), (1, 64), (32, 8)] {
+        let cfg = resolve_hixl_table(
+            "",
+            &format!(
+                "transport='hccs-buffer-pool'\nbuffer_pool_count={count}\nbuffer_pool_size_mib={size_mib}"
+            ),
+        )
+        .unwrap();
+        let printed = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(printed["hixl"]["buffer_pool_count"], count);
+        assert_eq!(printed["hixl"]["buffer_pool_size_mib"], size_mib);
+    }
+}
+
+#[test]
+fn hixl_rejects_non_kebab_case_transport() {
+    let error = resolve_hixl_table("", "transport='hccs_buffer_pool'").unwrap_err();
+    assert!(
+        !error.to_string().contains("unknown field"),
+        "transport should be parsed as a typed field: {error}"
+    );
+}
+
+#[test]
+fn hixl_rejects_buffer_pool_count_or_size_out_of_range() {
+    for table in [
+        "transport='hccs-buffer-pool'\nbuffer_pool_count=0",
+        "transport='hccs-buffer-pool'\nbuffer_pool_count=65",
+        "transport='hccs-buffer-pool'\nbuffer_pool_size_mib=0",
+        "transport='hccs-buffer-pool'\nbuffer_pool_size_mib=65",
+    ] {
+        let error = resolve_hixl_table("", table).unwrap_err();
+        assert!(
+            !error.to_string().contains("unknown field"),
+            "invalid pool values should reach validation: {table}: {error}"
+        );
+    }
+}
+
+#[test]
+fn hixl_rejects_buffer_pool_budget_over_512_mib_or_arithmetic_overflow() {
+    for table in [
+        "transport='hccs-buffer-pool'\nbuffer_pool_count=33\nbuffer_pool_size_mib=8",
+        "transport='hccs-buffer-pool'\nbuffer_pool_count=32\nbuffer_pool_size_mib=9",
+        "transport='hccs-buffer-pool'\nbuffer_pool_count=9223372036854775807\nbuffer_pool_size_mib=64",
+    ] {
+        let error = resolve_hixl_table("", table).unwrap_err();
+        assert!(
+            !error.to_string().contains("unknown field"),
+            "pool budget failures should reach checked validation: {table}: {error}"
+        );
+    }
+}
+
+#[test]
+fn hixl_rejects_unbounded_pools_and_unknown_options() {
+    for table in [
+        "window_bytes=0",
+        "window_bytes=4194305",
+        "receive_slots=0",
+        "export_slots=65",
+        "device_id=-1",
+        "max_inflight_per_peer=2",
+        "window_byets=1024",
+    ] {
+        assert!(resolve_hixl_table("", table).is_err(), "{table}");
+    }
+}
+
+#[test]
+fn preferred_hixl_requires_node_identity_and_concrete_endpoint() {
+    let table = "dfs_read_mode='preferred'\nengine_id='127.0.0.1:7920'";
+    assert!(
+        resolve_hixl_table("", table)
+            .unwrap_err()
+            .message()
+            .contains("mTLS")
+    );
+    for address in ["0.0.0.0:7920", "127.0.0.1:0", "224.0.0.1:7920", "node:7920"] {
+        assert!(
+            resolve_hixl_table(
+                "",
+                &format!("dfs_read_mode='preferred'\nengine_id='{address}'")
+            )
+            .is_err()
+        );
+    }
+}
+
+#[cfg(feature = "dfs")]
+#[test]
+fn preferred_hixl_is_independent_of_global_data_mode() {
+    let prefix = "fs='dfs'\ndata_mode='grpc'\ntls_ca_certificate='/tmp/ca.pem'\ntls_identity_certificate='/tmp/node.pem'\ntls_identity_private_key='/tmp/node.key'\ntls_server_name='node'\n[trusted_node_certs]\npeer='/tmp/peer.pem'";
+    let cfg = resolve_hixl_table(
+        prefix,
+        "dfs_read_mode='preferred'\nengine_id='127.0.0.1:7920'",
+    )
+    .unwrap();
+    assert_eq!(cfg.data_mode, "grpc");
+    assert!(!cfg.ownerfs);
+    #[cfg(not(feature = "hixl"))]
+    assert!(
+        resolve_hixl_table(
+            prefix,
+            "dfs_read_mode='required'\nengine_id='127.0.0.1:7920'"
+        )
+        .unwrap_err()
+        .message()
+        .contains("not compiled")
+    );
+}
+
+#[test]
 fn shipped_examples_resolve_with_mutual_tls_and_node_identity_binding() {
     let examples = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
     let meta_path = examples.join("meta.toml");
@@ -511,6 +750,9 @@ fn shipped_examples_resolve_with_mutual_tls_and_node_identity_binding() {
             .unwrap()
             .starts_with("https://")
     );
+    let printed = serde_json::to_value(&node).unwrap();
+    assert_eq!(printed["hixl"]["dfs_read_mode"], "off");
+    assert_eq!(printed["hixl"]["transport"], "roce");
     for tls in [meta.tls_config(), node.tls_config()] {
         assert!(matches!(
             tls,
@@ -2055,6 +2297,40 @@ fn tls_encryption_defaults_off_without_disabling_identity() {
 }
 
 #[test]
+fn dfs_fuse_read_mode_defaults_to_cached_and_cli_overrides_toml() {
+    let default = Config::resolve(Role::Node, Cli::parse_from(["afs-node"])).unwrap();
+    assert_eq!(
+        serde_json::to_value(default).unwrap()["dfs_fuse_read_mode"],
+        "cached"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("node.toml");
+    std::fs::write(&path, "dfs_fuse_read_mode='direct'\n").unwrap();
+    let from_file = Config::resolve(
+        Role::Node,
+        Cli::parse_from(["afs-node", "--config", path.to_str().unwrap()]),
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::to_value(from_file).unwrap()["dfs_fuse_read_mode"],
+        "direct"
+    );
+    let override_cli = Cli::try_parse_from([
+        "afs-node",
+        "--config",
+        path.to_str().unwrap(),
+        "--dfs-fuse-read-mode",
+        "cached",
+    ])
+    .unwrap();
+    let overridden = Config::resolve(Role::Node, override_cli).unwrap();
+    assert_eq!(
+        serde_json::to_value(overridden).unwrap()["dfs_fuse_read_mode"],
+        "cached"
+    );
+}
+
+#[test]
 fn tls_encryption_cli_file_precedence_and_identity_are_independent() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("tls.toml");
@@ -2098,4 +2374,196 @@ fn tls_encryption_cli_file_precedence_and_identity_are_independent() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn dfs_fuse_read_mode_rejects_unknown_values_at_the_boundary() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("node.toml");
+    std::fs::write(&path, "dfs_fuse_read_mode='automatic'\n").unwrap();
+    let error = Config::resolve(
+        Role::Node,
+        Cli::parse_from(["afs-node", "--config", path.to_str().unwrap()]),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("unknown variant"), "{error}");
+    assert!(Cli::try_parse_from(["afs-node", "--dfs-fuse-read-mode", "automatic"]).is_err());
+}
+
+#[test]
+fn dfs_fuse_max_io_bytes_defaults_to_one_mib_and_cli_overrides_toml() {
+    let default = Config::resolve(Role::Node, Cli::parse_from(["afs-node"])).unwrap();
+    assert_eq!(default.dfs_fuse_max_io_bytes, 1_048_576);
+    assert_eq!(
+        serde_json::to_value(&default).unwrap()["dfs_fuse_max_io_bytes"],
+        1_048_576
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("node.toml");
+    std::fs::write(&path, "dfs_fuse_max_io_bytes=4194304\n").unwrap();
+    let from_file = Config::resolve(
+        Role::Node,
+        Cli::parse_from(["afs-node", "--config", path.to_str().unwrap()]),
+    )
+    .unwrap();
+    assert_eq!(from_file.dfs_fuse_max_io_bytes, 4_194_304);
+
+    let overridden = Config::resolve(
+        Role::Node,
+        Cli::parse_from([
+            "afs-node",
+            "--config",
+            path.to_str().unwrap(),
+            "--dfs-fuse-max-io-bytes",
+            "1048576",
+        ]),
+    )
+    .unwrap();
+    assert_eq!(overridden.dfs_fuse_max_io_bytes, 1_048_576);
+}
+
+#[test]
+fn dfs_fuse_max_io_bytes_accepts_page_multiple_bounds() {
+    for value in [4_096u32, 1_048_576, 4_194_304, 8_388_608] {
+        let cfg = Config::resolve(
+            Role::Node,
+            Cli::parse_from(["afs-node", "--dfs-fuse-max-io-bytes", &value.to_string()]),
+        )
+        .unwrap();
+        assert_eq!(cfg.dfs_fuse_max_io_bytes, value);
+    }
+}
+
+#[test]
+fn dfs_fuse_max_io_bytes_rejects_invalid_sizes() {
+    for value in [0u32, 4_095, 4_097, 8_388_608 + 4_096] {
+        let error = Config::resolve(
+            Role::Node,
+            Cli::parse_from(["afs-node", "--dfs-fuse-max-io-bytes", &value.to_string()]),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), afs_error::CONFIG_INVALID);
+        assert!(
+            error.to_string().contains("dfs_fuse_max_io_bytes"),
+            "{value}: {error}"
+        );
+    }
+    for table in [
+        "dfs_fuse_max_io_bytes=-1",
+        "dfs_fuse_max_io_bytes=8388608.5",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("node.toml");
+        std::fs::write(&path, table).unwrap();
+        assert!(
+            Config::resolve(
+                Role::Node,
+                Cli::parse_from(["afs-node", "--config", path.to_str().unwrap()])
+            )
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn dfs_fuse_max_io_bytes_cannot_exceed_the_dfs_inflight_budget() {
+    let cfg = Config::resolve(
+        Role::Node,
+        Cli::parse_from([
+            "afs-node",
+            "--dfs-fuse-max-io-bytes",
+            "4194304",
+            "--dfs-read-max-inflight-bytes",
+            "2097152",
+        ]),
+    );
+    let error = cfg.unwrap_err();
+    assert_eq!(error.code(), afs_error::CONFIG_INVALID);
+    assert!(
+        error.to_string().contains("dfs_read_max_inflight_bytes"),
+        "{error}"
+    );
+
+    let equal = Config::resolve(
+        Role::Node,
+        Cli::parse_from([
+            "afs-node",
+            "--dfs-fuse-max-io-bytes",
+            "4194304",
+            "--dfs-read-max-inflight-bytes",
+            "4194304",
+        ]),
+    )
+    .unwrap();
+    assert_eq!(equal.dfs_read_max_inflight_bytes, 4_194_304);
+}
+
+#[test]
+fn prepared_payload_measurement_is_explicit_and_rejects_ambiguous_transport() {
+    let baseline = Config::resolve(Role::Node, Cli::parse_from(["afs-node"])).unwrap();
+    assert_eq!(
+        serde_json::to_value(baseline).unwrap()["dfs_read_measurement_mode"],
+        "baseline"
+    );
+    let prepared = Cli::try_parse_from([
+        "afs-node",
+        "--dfs-read-measurement-mode",
+        "prepared-payload",
+    ])
+    .unwrap();
+    let prepared = Config::resolve(Role::Node, prepared).unwrap();
+    assert_eq!(
+        serde_json::to_value(prepared).unwrap()["dfs_read_measurement_mode"],
+        "prepared-payload"
+    );
+    for mode in ["auto", "rdma"] {
+        let cli = Cli::try_parse_from([
+            "afs-node",
+            "--dfs-read-measurement-mode",
+            "prepared-payload",
+            "--data-mode",
+            mode,
+        ])
+        .unwrap();
+        assert!(Config::resolve(Role::Node, cli).is_err());
+    }
+}
+
+#[test]
+fn dfs_read_group_defaults_and_rejects_invalid_budgets() {
+    let cfg = Config::resolve(Role::Node, Cli::parse_from(["afs-node"])).unwrap();
+    let printed = serde_json::to_value(&cfg).unwrap();
+    assert_eq!(printed["dfs_read_group_mode"], "off");
+    assert_eq!(printed["dfs_read_group_bytes"], 8388608);
+    assert_eq!(printed["dfs_read_group_max_inflight"], 1);
+    assert_eq!(printed["dfs_read_group_max_descriptors"], 128);
+    assert_eq!(printed["dfs_read_group_host_budget_bytes"], 1073741824);
+    for args in [
+        vec!["afs-node", "--dfs-read-group-bytes", "1048575"],
+        vec!["afs-node", "--dfs-read-group-bytes", "1048580"],
+        vec!["afs-node", "--dfs-read-group-bytes", "134221824"],
+        vec!["afs-node", "--dfs-read-group-max-inflight", "3"],
+        vec!["afs-node", "--dfs-read-group-max-descriptors", "0"],
+        vec!["afs-node", "--dfs-read-group-host-budget-bytes", "1048576"],
+    ] {
+        let cli = Cli::try_parse_from(args.clone()).unwrap();
+        assert!(Config::resolve(Role::Node, cli).is_err(), "{args:?}");
+    }
+    let cli = Cli::try_parse_from([
+        "afs-node",
+        "--dfs-read-group-mode",
+        "sequential",
+        "--dfs-read-group-bytes",
+        "104857600",
+        "--dfs-read-group-host-budget-bytes",
+        "1073741824",
+    ])
+    .unwrap();
+    let cfg = Config::resolve(Role::Node, cli).unwrap();
+    assert_eq!(
+        serde_json::to_value(&cfg).unwrap()["dfs_read_group_mode"],
+        "sequential"
+    );
+    assert_eq!(cfg.dfs_read_group_bytes, 104857600);
 }

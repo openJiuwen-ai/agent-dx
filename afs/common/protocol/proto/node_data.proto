@@ -54,9 +54,17 @@ service DfsChunks {
   rpc PutReplicaRdma(DfsPutReplicaRdmaRequest) returns (DfsPutReplicaReply);
   rpc ConfirmReplica(DfsConfirmReplicaRequest) returns (DfsReplicaAck);
   rpc ReadRanges(DfsReadRangesRequest) returns (stream DfsReadRangesFrame);
+  rpc PrepareReadRanges(DfsReadRangesRequest) returns (DfsPreparedReadReply);
+  rpc FetchPreparedRead(DfsFetchPreparedReadRequest) returns (stream DfsReadRangesFrame);
+  rpc ReleasePreparedRead(DfsReleasePreparedReadRequest) returns (DfsReleasePreparedReadReply);
   rpc NegotiateRdma(DfsNegotiateRdmaRequest) returns (DfsNegotiateRdmaReply);
   rpc CloseRdma(DfsCloseRdmaRequest) returns (DfsCloseRdmaReply);
   rpc ReadRangesRdma(DfsReadRangesRdmaRequest) returns (DfsReadRangesRdmaReply);
+  rpc NegotiateHixl(DfsNegotiateHixlRequest) returns (DfsNegotiateHixlReply);
+  rpc PrepareReadRangesHixl(DfsPrepareReadRangesHixlRequest) returns (DfsPrepareReadRangesHixlReply);
+  rpc PrepareReadRangesHixlGroup(DfsPrepareReadRangesHixlGroupRequest) returns (DfsPrepareReadRangesHixlGroupReply);
+  rpc ReleaseHixlRead(DfsReleaseHixlReadRequest) returns (DfsReleaseHixlReadReply);
+  rpc CloseHixl(DfsCloseHixlRequest) returns (DfsCloseHixlReply);
 }
 
 message DfsPutReplicaHeader {
@@ -172,6 +180,166 @@ message DfsReadRangesRdmaReply {
   uint64 transferred_bytes = 4;
 }
 
+enum DfsHixlTransport {
+  DFS_HIXL_TRANSPORT_UNSPECIFIED = 0;
+  DFS_HIXL_TRANSPORT_ROCE = 1;
+  DFS_HIXL_TRANSPORT_HCCS_BUFFER_POOL = 2;
+}
+
+// HIXL rH2H source-window control messages. The AFS mTLS identity and each
+// operation's DfsReadGrant remain the authority; the HIXL descriptors only
+// describe a window that was prepared after those checks passed.
+message DfsNegotiateHixlRequest {
+  DfsReadRangesRequest read_request = 1;
+  string client_engine_id = 2;
+  uint64 client_engine_generation = 3;
+  uint32 protocol_version = 4;
+  uint64 caller_node_epoch = 5;
+  uint64 source_node_epoch = 6;
+  DfsHixlTransport transport = 7;
+  uint32 buffer_pool_count = 8;
+  uint32 buffer_pool_size_mib = 9;
+  optional uint64 hccs_domain_id = 10;
+  // Ordered source/reader device lanes must have the same cardinality.
+  uint32 lane_count = 11;
+}
+
+message DfsHixlLane {
+  uint32 lane_id = 1;
+  string engine_id = 2;
+  uint64 engine_generation = 3;
+  uint64 window_bytes = 4;
+  uint32 export_slots = 5;
+}
+
+message DfsNegotiateHixlReply {
+  uint64 session_id = 1;
+  bool hixl_supported = 2;
+  string source_node_id = 3;
+  uint64 source_node_epoch = 4;
+  string engine_id = 5;
+  uint64 engine_generation = 6;
+  uint64 window_bytes = 7;
+  uint32 export_slots = 8;
+  uint32 protocol_version = 9;
+  DfsHixlTransport transport = 10;
+  uint32 buffer_pool_count = 11;
+  uint32 buffer_pool_size_mib = 12;
+  optional uint64 hccs_domain_id = 13;
+  repeated DfsHixlLane lanes = 14;
+}
+
+message DfsPrepareReadRangesHixlRequest {
+  uint64 session_id = 1;
+  DfsReadRangesRequest read_request = 2;
+  uint64 caller_node_epoch = 3;
+  uint64 source_node_epoch = 4;
+  // Exact packed logical request, retained only until this batch is terminal.
+  // Each native window is derived from it; source disk verification runs once.
+  DfsReadRangesRequest batch_read_request = 5;
+  uint64 batch_offset = 6;
+  uint32 lane_id = 7;
+}
+
+message DfsHixlReadRange {
+  uint32 operation_index = 1;
+  string chunk_id = 2;
+  uint64 chunk_offset = 3;
+  uint64 length = 4;
+  uint64 packed_offset = 5;
+  string source_copy_id = 6;
+  bytes range_checksum = 7;
+  DfsDigestAlgorithm range_checksum_algorithm = 8;
+}
+
+message DfsPrepareReadRangesHixlReply {
+  uint64 session_id = 1;
+  string read_id = 2;
+  string attempt_id = 3;
+  string source_node_id = 4;
+  uint64 source_node_epoch = 5;
+  string engine_id = 6;
+  uint64 engine_generation = 7;
+  uint64 pool_generation = 8;
+  uint64 slot_id = 9;
+  uint64 slot_generation = 10;
+  uint64 address = 11;
+  uint64 capacity = 12;
+  uint64 packed_length = 13;
+  repeated DfsHixlReadRange ranges = 14;
+  repeated DfsReadRangesCompletion completions = 15;
+}
+
+// One ordered native window of a group. All windows in a group share the
+// parent batch snapshot and are exported by a single control round trip.
+message DfsHixlGroupWindow {
+  uint64 batch_offset = 1;
+  uint32 lane_id = 2;
+  DfsReadRangesRequest read_request = 3;
+}
+
+message DfsPrepareReadRangesHixlGroupRequest {
+  uint64 session_id = 1;
+  uint64 caller_node_epoch = 2;
+  uint64 source_node_epoch = 3;
+  DfsReadRangesRequest batch_read_request = 4;
+  repeated DfsHixlGroupWindow windows = 5;
+}
+
+message DfsHixlPreparedGroupWindow {
+  uint64 batch_offset = 1;
+  uint32 lane_id = 2;
+  DfsPrepareReadRangesHixlReply reply = 3;
+}
+
+message DfsPrepareReadRangesHixlGroupReply {
+  uint64 session_id = 1;
+  repeated DfsHixlPreparedGroupWindow windows = 2;
+}
+
+enum DfsHixlReleaseOutcome {
+  DFS_HIXL_RELEASE_OUTCOME_UNSPECIFIED = 0;
+  DFS_HIXL_RELEASE_OUTCOME_COMPLETED = 1;
+  DFS_HIXL_RELEASE_OUTCOME_FAILED = 2;
+  DFS_HIXL_RELEASE_OUTCOME_UNKNOWN = 3;
+  // The authenticated reader proves this window never entered native READ.
+  DFS_HIXL_RELEASE_OUTCOME_NOT_SUBMITTED = 4;
+}
+
+message DfsReleaseHixlReadRequest {
+  uint64 session_id = 1;
+  string read_id = 2;
+  string attempt_id = 3;
+  string source_node_id = 4;
+  uint64 source_node_epoch = 5;
+  string engine_id = 6;
+  uint64 engine_generation = 7;
+  uint64 pool_generation = 8;
+  uint64 slot_id = 9;
+  uint64 slot_generation = 10;
+  uint64 caller_node_epoch = 11;
+  DfsHixlReleaseOutcome outcome = 12;
+  bool content_validated = 13;
+}
+
+message DfsReleaseHixlReadReply {
+  bool consumed = 1;
+  bool already_released = 2;
+}
+
+message DfsCloseHixlRequest {
+  uint64 session_id = 1;
+  uint64 caller_node_epoch = 2;
+  uint64 source_node_epoch = 3;
+  string engine_id = 4;
+  uint64 engine_generation = 5;
+}
+
+message DfsCloseHixlReply {
+  bool admitted = 1;
+  bool drained = 2;
+}
+
 message DfsPutReplicaReply {
   repeated DfsReplicaAck durable_acks = 1;
 }
@@ -217,6 +385,32 @@ message DfsReadRangesRequest {
   // Only a full-object reader holding the trusted Meta ChunkObject requests
   // optional outboard metadata. Ordinary and legacy reads keep this false.
   bool include_blake3_outboard = 7;
+}
+
+// A bounded, authenticated source snapshot. Preparation returns completions
+// before any payload is sent; FetchPreparedRead consumes the opaque ID once.
+message DfsPreparedReadReply {
+  string prepared_read_id = 1;
+  string read_id = 2;
+  string attempt_id = 3;
+  uint64 packed_length = 4;
+  repeated DfsReadRangesCompletion completions = 5;
+}
+
+message DfsFetchPreparedReadRequest {
+  string prepared_read_id = 1;
+  string read_id = 2;
+  string attempt_id = 3;
+}
+
+message DfsReleasePreparedReadRequest {
+  string prepared_read_id = 1;
+  string read_id = 2;
+  string attempt_id = 3;
+}
+
+message DfsReleasePreparedReadReply {
+  bool released = 1;
 }
 
 message DfsReadRangesHeader {

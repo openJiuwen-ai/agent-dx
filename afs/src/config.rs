@@ -10,7 +10,7 @@ use afs_error::{Error, Result};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::SocketAddr,
     path::{Component, Path, PathBuf},
 };
@@ -19,6 +19,301 @@ use std::{
 pub enum Role {
     Meta,
     Node,
+}
+
+/// Kernel I/O policy for read-only DFS FUSE opens. Writable opens remain cached.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum DfsFuseReadMode {
+    #[default]
+    Cached,
+    Direct,
+}
+/// Explicit boundary for DFS transport bandwidth experiments.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum DfsReadMeasurementMode {
+    #[default]
+    Baseline,
+    PreparedPayload,
+}
+/// Optional immutable DFS read transport. Replication and OwnerFs retain data_mode.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HixlDfsReadMode {
+    #[default]
+    Off,
+    Preferred,
+    Required,
+}
+
+/// Sequential read aggregation. `off` keeps the legacy per-request path.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum DfsReadGroupMode {
+    #[default]
+    Off,
+    Sequential,
+}
+
+/// Immutable DFS read transport. HCCS uses two HBM buffer pools
+/// as the A3 relay path; RoCE remains the default direct transport.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HixlTransport {
+    #[default]
+    Roce,
+    HccsBufferPool,
+}
+
+/// One HIXL lane's device identity and administrator-managed endpoints.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HixlDeviceConfig {
+    pub device_id: i32,
+    pub engine_id: String,
+    pub device_listen_port: Option<u16>,
+}
+
+/// Fixed Host-memory pools and the administrator-managed HIXL device set.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct HixlConfig {
+    pub dfs_read_mode: HixlDfsReadMode,
+    pub transport: HixlTransport,
+    pub device_id: i32,
+    pub engine_id: String,
+    pub device_listen_port: Option<u16>,
+    pub additional_devices: Vec<HixlDeviceConfig>,
+    pub window_bytes: usize,
+    pub receive_slots: usize,
+    pub export_slots: usize,
+    pub max_inflight_per_peer: usize,
+    /// Idle peer control-session lifetime; zero keeps it for the process lifetime.
+    pub session_idle_ms: u64,
+    pub buffer_pool_count: usize,
+    pub buffer_pool_size_mib: usize,
+}
+
+impl Default for HixlConfig {
+    fn default() -> Self {
+        Self {
+            dfs_read_mode: HixlDfsReadMode::Off,
+            transport: HixlTransport::Roce,
+            device_id: 0,
+            engine_id: String::new(),
+            device_listen_port: None,
+            additional_devices: Vec::new(),
+            window_bytes: 4 * 1024 * 1024,
+            receive_slots: 16,
+            export_slots: 16,
+            max_inflight_per_peer: 1,
+            session_idle_ms: 300_000,
+            buffer_pool_count: 4,
+            buffer_pool_size_mib: 8,
+        }
+    }
+}
+
+impl HixlConfig {
+    fn validate(&self, role: Role, dfs: bool, mutual_tls: bool, bound_peers: bool) -> Result<()> {
+        let pool_bytes = self
+            .receive_slots
+            .checked_add(self.export_slots)
+            .and_then(|slots| slots.checked_mul(self.window_bytes));
+        let buffer_pool_bytes = self
+            .buffer_pool_count
+            .checked_mul(self.buffer_pool_size_mib)
+            .and_then(|mib| mib.checked_mul(2))
+            .and_then(|pools| pools.checked_mul(1024 * 1024));
+        if self.device_id < 0
+            || self.window_bytes == 0
+            || self.window_bytes > 4 * 1024 * 1024
+            || self.receive_slots == 0
+            || self.export_slots == 0
+            || self.receive_slots > 64
+            || self.export_slots > 64
+            || self.max_inflight_per_peer != 1
+            || self.session_idle_ms > 3_600_000
+            || pool_bytes.is_none_or(|bytes| bytes > 512 * 1024 * 1024)
+            || self.buffer_pool_count == 0
+            || self.buffer_pool_count > 64
+            || self.buffer_pool_size_mib == 0
+            || self.buffer_pool_size_mib > 64
+            || buffer_pool_bytes.is_none_or(|bytes| bytes > 512 * 1024 * 1024)
+        {
+            return Err(invalid(
+                "HIXL requires device_id >= 0, 1..4 MiB windows, 1..64 Host slots per pool, 1..64 HBM buffer-pool count and size, <=512 MiB Host and HBM budgets, max_inflight_per_peer=1, and session_idle_ms <= 3600000",
+            ));
+        }
+        if self.device_listen_port == Some(0) {
+            return Err(invalid(
+                "hixl.device_listen_port must be 1..=65535 when configured",
+            ));
+        }
+        self.validate_device_set()?;
+        if self.dfs_read_mode == HixlDfsReadMode::Off {
+            return Ok(());
+        }
+        if role != Role::Node || !dfs {
+            return Err(invalid("hixl.dfs_read_mode requires Node DFS"));
+        }
+        let endpoint: SocketAddr = self
+            .engine_id
+            .parse()
+            .map_err(|_| invalid("hixl.engine_id must be an explicit IP:port"))?;
+        if endpoint.port() == 0 || endpoint.ip().is_unspecified() || endpoint.ip().is_multicast() {
+            return Err(invalid(
+                "hixl.engine_id must advertise a concrete unicast address and non-zero port",
+            ));
+        }
+        if !mutual_tls || !bound_peers {
+            return Err(invalid(
+                "HIXL requires mTLS and administrator-managed trusted_node_certs",
+            ));
+        }
+        if self.dfs_read_mode == HixlDfsReadMode::Required && !cfg!(feature = "hixl") {
+            return Err(invalid("required HIXL feature is not compiled in"));
+        }
+        Ok(())
+    }
+
+    fn validate_device_set(&self) -> Result<()> {
+        const MAX_HIXL_DEVICES: usize = 16;
+
+        let device_count = self
+            .additional_devices
+            .len()
+            .checked_add(1)
+            .ok_or_else(|| invalid("hixl device count exceeds the supported range"))?;
+        if device_count > MAX_HIXL_DEVICES {
+            return Err(invalid(format!(
+                "hixl supports at most {MAX_HIXL_DEVICES} devices including the primary device"
+            )));
+        }
+
+        let multiple_devices = device_count > 1;
+        let primary = HixlDeviceConfig {
+            device_id: self.device_id,
+            engine_id: self.engine_id.clone(),
+            device_listen_port: self.device_listen_port,
+        };
+        let mut device_ids = HashSet::with_capacity(device_count);
+        let mut engine_ids = HashSet::with_capacity(device_count);
+        let mut listener_ports = HashSet::with_capacity(device_count);
+        for (index, device) in std::iter::once(&primary)
+            .chain(self.additional_devices.iter())
+            .enumerate()
+        {
+            if device.device_id < 0 {
+                return Err(invalid(format!(
+                    "hixl device at index {index} must have device_id >= 0"
+                )));
+            }
+            if !device_ids.insert(device.device_id) {
+                return Err(invalid(format!(
+                    "hixl device_id {} is configured more than once",
+                    device.device_id
+                )));
+            }
+
+            if device.device_listen_port == Some(0) {
+                return Err(invalid(format!(
+                    "hixl device at index {index} listener port must be in 1..=65535"
+                )));
+            }
+            if multiple_devices && device.device_listen_port.is_none() {
+                return Err(invalid(
+                    "hixl.device_listen_port must be set for every device in a multi-device config",
+                ));
+            }
+            if let Some(port) = device.device_listen_port
+                && !listener_ports.insert(port)
+            {
+                return Err(invalid(format!(
+                    "hixl device_listen_port {port} is configured more than once"
+                )));
+            }
+
+            if device.engine_id.is_empty() {
+                if index == 0 && self.dfs_read_mode == HixlDfsReadMode::Off {
+                    continue;
+                }
+                return Err(invalid(format!(
+                    "hixl device at index {index} engine_id must be an explicit IP:port"
+                )));
+            }
+            let endpoint: SocketAddr = device.engine_id.parse().map_err(|_| {
+                invalid(format!(
+                    "hixl device at index {index} engine_id must be an explicit IP:port"
+                ))
+            })?;
+            if endpoint.port() == 0
+                || endpoint.ip().is_unspecified()
+                || endpoint.ip().is_multicast()
+                || matches!(endpoint.ip(), std::net::IpAddr::V4(address) if address.is_broadcast())
+            {
+                return Err(invalid(format!(
+                    "hixl device at index {index} engine_id must be a non-zero unicast IP:port"
+                )));
+            }
+            if !engine_ids.insert(endpoint) {
+                return Err(invalid(format!(
+                    "hixl engine_id {} is configured more than once",
+                    device.engine_id
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn runtime_options_for_device(
+        &self,
+        device: &HixlDeviceConfig,
+    ) -> afs_transport::hixl::RuntimeOptions {
+        afs_transport::hixl::RuntimeOptions {
+            device_id: device.device_id,
+            engine_id: device.engine_id.clone(),
+            device_listen_port: device.device_listen_port,
+            window_bytes: self.window_bytes,
+            receive_slots: self.receive_slots,
+            export_slots: self.export_slots,
+            max_inflight_per_peer: self.max_inflight_per_peer,
+            transport: match self.transport {
+                HixlTransport::Roce => afs_transport::hixl::ReadTransport::Roce,
+                HixlTransport::HccsBufferPool => afs_transport::hixl::ReadTransport::HccsBufferPool,
+            },
+            buffer_pool_count: self.buffer_pool_count,
+            buffer_pool_size_mib: self.buffer_pool_size_mib,
+        }
+    }
+
+    pub fn runtime_options(&self) -> afs_transport::hixl::RuntimeOptions {
+        let device = HixlDeviceConfig {
+            device_id: self.device_id,
+            engine_id: self.engine_id.clone(),
+            device_listen_port: self.device_listen_port,
+        };
+        self.runtime_options_for_device(&device)
+    }
+
+    pub fn runtime_options_per_device(&self) -> Vec<afs_transport::hixl::RuntimeOptions> {
+        self.device_configs()
+            .iter()
+            .map(|device| self.runtime_options_for_device(device))
+            .collect()
+    }
+
+    pub fn device_configs(&self) -> Vec<HixlDeviceConfig> {
+        let mut devices = Vec::new();
+        devices.push(HixlDeviceConfig {
+            device_id: self.device_id,
+            engine_id: self.engine_id.clone(),
+            device_listen_port: self.device_listen_port,
+        });
+        devices.extend(self.additional_devices.iter().cloned());
+        devices
+    }
 }
 /// Meta authority backend. `memory` is useful for disposable local runs but
 /// loses root/session authority whenever afs-meta exits.
@@ -330,6 +625,15 @@ pub struct Cli {
     /// One native Peer admission wait deadline (0..=50 ms); zero never waits.
     #[arg(long)]
     pub dfs_peer_serve_wait_ms: Option<u64>,
+    /// Read-only DFS FUSE opens: cached (default) or direct. Direct mmap needs kernel support.
+    #[arg(long, value_enum)]
+    pub dfs_fuse_read_mode: Option<DfsFuseReadMode>,
+    /// DFS FUSE INIT request-capacity target in bytes; CLI overrides TOML.
+    #[arg(long)]
+    pub dfs_fuse_max_io_bytes: Option<u32>,
+    /// Prepare source data before timing transport payload delivery.
+    #[arg(long, value_enum)]
+    pub dfs_read_measurement_mode: Option<DfsReadMeasurementMode>,
     /// Filesystem-wide immutable DFS replica target count. Applied by Meta at initialization.
     #[arg(long)]
     pub dfs_desired_copies: Option<u16>,
@@ -368,6 +672,18 @@ pub struct Cli {
     /// Omit per-chunk GC registration; CRC commits fence their own write generations.
     #[arg(long)]
     pub dfs_optimistic_gc_commit: Option<bool>,
+    /// Sequential read aggregation: off or sequential.
+    #[arg(long, value_enum)]
+    pub dfs_read_group_mode: Option<DfsReadGroupMode>,
+    /// ReadGroup payload budget in bytes; 1 MiB..=128 MiB, 4 KiB aligned.
+    #[arg(long)]
+    pub dfs_read_group_bytes: Option<u64>,
+    #[arg(long)]
+    pub dfs_read_group_max_inflight: Option<usize>,
+    #[arg(long)]
+    pub dfs_read_group_max_descriptors: Option<usize>,
+    #[arg(long)]
+    pub dfs_read_group_host_budget_bytes: Option<u64>,
     #[arg(long)]
     pub timeout_ms: Option<u64>,
     #[arg(long)]
@@ -456,6 +772,7 @@ struct FileConfig {
     fs: Option<String>,
     data_mode: Option<String>,
     rdma_device: Option<String>,
+    hixl: Option<HixlConfig>,
     data_dir: Option<PathBuf>,
     uds_path: Option<PathBuf>,
     ownerfs_mount: Option<PathBuf>,
@@ -493,6 +810,9 @@ struct FileConfig {
     dfs_external_backend: Option<DfsExternalBackendConfig>,
     dfs_peer_cache: Option<DfsPeerCacheConfig>,
     dfs_write_buffer_idle_bytes: Option<u64>,
+    dfs_fuse_read_mode: Option<DfsFuseReadMode>,
+    dfs_fuse_max_io_bytes: Option<u32>,
+    dfs_read_measurement_mode: Option<DfsReadMeasurementMode>,
     dfs_desired_copies: Option<u16>,
     dfs_sync_required_copies: Option<u16>,
     dfs_min_distinct_nodes: Option<u16>,
@@ -508,6 +828,11 @@ struct FileConfig {
     dfs_read_crc_mode: Option<DfsReadCrcMode>,
     dfs_crc32c_writes: Option<bool>,
     dfs_optimistic_gc_commit: Option<bool>,
+    dfs_read_group_mode: Option<DfsReadGroupMode>,
+    dfs_read_group_bytes: Option<u64>,
+    dfs_read_group_max_inflight: Option<usize>,
+    dfs_read_group_max_descriptors: Option<usize>,
+    dfs_read_group_host_budget_bytes: Option<u64>,
     timeout_ms: Option<u64>,
     log_level: Option<String>,
     trace_enabled: Option<bool>,
@@ -568,6 +893,7 @@ pub struct Config {
     pub dfs: bool,
     pub data_mode: String,
     pub rdma_device: Option<String>,
+    pub hixl: HixlConfig,
     pub data_dir: PathBuf,
     pub uds_path: PathBuf,
     pub ownerfs_mount: Option<PathBuf>,
@@ -606,6 +932,9 @@ pub struct Config {
     pub dfs_peer_cache: Option<DfsPeerCacheConfig>,
     /// Reusable idle write-body capacity only, not a live-body quota.
     pub dfs_write_buffer_idle_bytes: u64,
+    pub dfs_fuse_read_mode: DfsFuseReadMode,
+    pub dfs_fuse_max_io_bytes: u32,
+    pub dfs_read_measurement_mode: DfsReadMeasurementMode,
     pub dfs_desired_copies: u16,
     pub dfs_sync_required_copies: u16,
     pub dfs_min_distinct_nodes: u16,
@@ -621,6 +950,11 @@ pub struct Config {
     pub dfs_read_crc_mode: DfsReadCrcMode,
     pub dfs_crc32c_writes: bool,
     pub dfs_optimistic_gc_commit: bool,
+    pub dfs_read_group_mode: DfsReadGroupMode,
+    pub dfs_read_group_bytes: u64,
+    pub dfs_read_group_max_inflight: usize,
+    pub dfs_read_group_max_descriptors: usize,
+    pub dfs_read_group_host_budget_bytes: u64,
     pub timeout_ms: u64,
     pub log_level: String,
     pub trace_enabled: bool,
@@ -764,6 +1098,26 @@ impl Config {
                 "DFS source metadata requires lookahead <= 128 chunks and cache <= 4194304 bytes",
             ));
         }
+        let dfs_read_group_mode = cli
+            .dfs_read_group_mode
+            .or(file.dfs_read_group_mode)
+            .unwrap_or_default();
+        let dfs_read_group_bytes = cli
+            .dfs_read_group_bytes
+            .or(file.dfs_read_group_bytes)
+            .unwrap_or(8 * 1024 * 1024);
+        let dfs_read_group_max_inflight = cli
+            .dfs_read_group_max_inflight
+            .or(file.dfs_read_group_max_inflight)
+            .unwrap_or(1);
+        let dfs_read_group_max_descriptors = cli
+            .dfs_read_group_max_descriptors
+            .or(file.dfs_read_group_max_descriptors)
+            .unwrap_or(128);
+        let dfs_read_group_host_budget_bytes = cli
+            .dfs_read_group_host_budget_bytes
+            .or(file.dfs_read_group_host_budget_bytes)
+            .unwrap_or(1024 * 1024 * 1024);
         if dfs_read_max_ops_per_batch == 0
             || dfs_read_max_inflight_bytes == 0
             || dfs_source_cache_max_ms > 60_000
@@ -946,6 +1300,32 @@ impl Config {
             .dfs_optimistic_gc_commit
             .or(file.dfs_optimistic_gc_commit)
             .unwrap_or(dfs_crc32c_writes);
+        if !(1024 * 1024..=128 * 1024 * 1024).contains(&dfs_read_group_bytes)
+            || !dfs_read_group_bytes.is_multiple_of(4096)
+            || !(1..=2).contains(&dfs_read_group_max_inflight)
+            || !(1..=128).contains(&dfs_read_group_max_descriptors)
+            || dfs_read_group_host_budget_bytes < dfs_read_group_bytes
+        {
+            return Err(invalid(
+                "DFS read group requires 1..=128 MiB 4 KiB-aligned bytes, 1..=2 inflight, 1..=128 descriptors and a sufficient Host budget",
+            ));
+        }
+        let dfs_fuse_max_io_bytes = cli
+            .dfs_fuse_max_io_bytes
+            .or(file.dfs_fuse_max_io_bytes)
+            .unwrap_or(1024 * 1024);
+        if !(4096..=8 * 1024 * 1024).contains(&dfs_fuse_max_io_bytes)
+            || !dfs_fuse_max_io_bytes.is_multiple_of(4096)
+        {
+            return Err(invalid(
+                "dfs_fuse_max_io_bytes must be 4096..=8388608 bytes and a multiple of 4096",
+            ));
+        }
+        if u64::from(dfs_fuse_max_io_bytes) > dfs_read_max_inflight_bytes {
+            return Err(invalid(
+                "dfs_fuse_max_io_bytes must not exceed dfs_read_max_inflight_bytes",
+            ));
+        }
         let cfg = Self {
             grpc_listen: cli.grpc_listen.or(file.grpc_listen).unwrap_or_else(|| {
                 ([127, 0, 0, 1], if role == Role::Meta { 7400 } else { 7500 }).into()
@@ -1046,6 +1426,7 @@ impl Config {
             dfs,
             data_mode,
             rdma_device: cli.rdma_device.or(file.rdma_device),
+            hixl: file.hixl.unwrap_or_default(),
             ownerfs_mount: cli.ownerfs_mount.or(file.ownerfs_mount),
             experimental_native_workspace: cli
                 .experimental_native_workspace
@@ -1094,6 +1475,15 @@ impl Config {
             dfs_write_buffer_idle_bytes: file
                 .dfs_write_buffer_idle_bytes
                 .unwrap_or(128 * 1024 * 1024),
+            dfs_fuse_read_mode: cli
+                .dfs_fuse_read_mode
+                .or(file.dfs_fuse_read_mode)
+                .unwrap_or_default(),
+            dfs_fuse_max_io_bytes,
+            dfs_read_measurement_mode: cli
+                .dfs_read_measurement_mode
+                .or(file.dfs_read_measurement_mode)
+                .unwrap_or_default(),
             dfs_desired_copies,
             dfs_sync_required_copies,
             dfs_min_distinct_nodes,
@@ -1115,6 +1505,11 @@ impl Config {
                 .unwrap_or(false),
             dfs_crc32c_writes,
             dfs_optimistic_gc_commit,
+            dfs_read_group_mode,
+            dfs_read_group_bytes,
+            dfs_read_group_max_inflight,
+            dfs_read_group_max_descriptors,
+            dfs_read_group_host_budget_bytes,
             timeout_ms: cli.timeout_ms.or(file.timeout_ms).unwrap_or(5000),
             log_level: cli
                 .log_level
@@ -1343,6 +1738,19 @@ impl Config {
         cfg.meta_log_limits()?;
         cfg.meta_maintenance_policy()?;
         cfg.meta_history_limits()?;
+        if cfg.dfs_read_measurement_mode == DfsReadMeasurementMode::PreparedPayload
+            && (cfg.data_mode != "grpc" || cfg.hixl.dfs_read_mode == HixlDfsReadMode::Preferred)
+        {
+            return Err(invalid(
+                "prepared-payload requires data_mode=grpc and HIXL off or required, without fallback",
+            ));
+        }
+        cfg.hixl.validate(
+            role,
+            cfg.dfs,
+            tls_count == 4,
+            !cfg.trusted_node_certs.is_empty(),
+        )?;
         Ok(cfg)
     }
 
@@ -1559,6 +1967,184 @@ fn decode_base64(input: &str) -> Result<Vec<u8>> {
         return Err(invalid("PEM certificate has empty base64 body"));
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod hixl_config_tests {
+    use super::{HixlConfig, HixlDeviceConfig, HixlDfsReadMode, Role};
+
+    fn valid_multi_device_config() -> HixlConfig {
+        HixlConfig {
+            dfs_read_mode: HixlDfsReadMode::Off,
+            device_id: 3,
+            engine_id: "127.0.0.1:7920".into(),
+            device_listen_port: Some(17920),
+            additional_devices: vec![HixlDeviceConfig {
+                device_id: 4,
+                engine_id: "127.0.0.1:7921".into(),
+                device_listen_port: Some(17921),
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn default_off_configuration_keeps_one_device_without_an_engine_address() {
+        let config = HixlConfig::default();
+
+        assert!(config.validate(Role::Node, false, false, false).is_ok());
+        assert_eq!(config.device_configs().len(), 1);
+        assert_eq!(config.device_configs()[0].engine_id, "");
+        assert_eq!(config.runtime_options_per_device().len(), 1);
+        assert_eq!(
+            config.runtime_options_per_device()[0],
+            config.runtime_options()
+        );
+    }
+
+    #[test]
+    fn session_idle_defaults_to_five_minutes_and_accepts_disable() {
+        assert_eq!(HixlConfig::default().session_idle_ms, 300_000);
+
+        let mut disabled = valid_multi_device_config();
+        disabled.session_idle_ms = 0;
+        assert!(disabled.validate(Role::Node, false, false, false).is_ok());
+
+        let mut too_long = valid_multi_device_config();
+        too_long.session_idle_ms = 3_600_001;
+        assert!(too_long.validate(Role::Node, false, false, false).is_err());
+    }
+
+    #[test]
+    fn toml_array_tables_deserialize_as_additional_device_lanes() {
+        let file: super::FileConfig = toml::from_str(
+            r#"
+                [hixl]
+                device_id = 3
+                engine_id = "127.0.0.1:7920"
+                device_listen_port = 17920
+
+                [[hixl.additional_devices]]
+                device_id = 4
+                engine_id = "127.0.0.1:7921"
+                device_listen_port = 17921
+            "#,
+        )
+        .unwrap();
+        let config = file.hixl.unwrap();
+
+        assert!(config.validate(Role::Node, false, false, false).is_ok());
+        assert_eq!(config.device_configs().len(), 2);
+        assert_eq!(config.device_configs()[1].device_id, 4);
+    }
+
+    #[test]
+    fn device_options_keep_primary_first_and_copy_shared_runtime_budgets() {
+        let config = valid_multi_device_config();
+        let options = config.runtime_options_per_device();
+
+        assert_eq!(options.len(), 2);
+        assert_eq!(config.runtime_options().device_id, 3);
+        assert_eq!(options[0], config.runtime_options());
+        assert_eq!(options[0].device_id, 3);
+        assert_eq!(options[0].engine_id, "127.0.0.1:7920");
+        assert_eq!(options[1].device_id, 4);
+        assert_eq!(options[1].engine_id, "127.0.0.1:7921");
+        assert_eq!(options[0].window_bytes, options[1].window_bytes);
+        assert_eq!(options[0].receive_slots, options[1].receive_slots);
+        assert_eq!(options[0].export_slots, options[1].export_slots);
+        assert_eq!(options[0].buffer_pool_count, options[1].buffer_pool_count);
+        assert_eq!(
+            options[0].buffer_pool_size_mib,
+            options[1].buffer_pool_size_mib
+        );
+    }
+
+    #[test]
+    fn device_set_rejects_duplicate_ids_engines_and_listener_ports() {
+        let mut duplicate_id = valid_multi_device_config();
+        duplicate_id.additional_devices[0].device_id = duplicate_id.device_id;
+        assert!(
+            duplicate_id
+                .validate(Role::Node, false, false, false)
+                .is_err()
+        );
+
+        let mut duplicate_engine = valid_multi_device_config();
+        duplicate_engine.additional_devices[0].engine_id = duplicate_engine.engine_id.clone();
+        assert!(
+            duplicate_engine
+                .validate(Role::Node, false, false, false)
+                .is_err()
+        );
+
+        let mut duplicate_port = valid_multi_device_config();
+        duplicate_port.additional_devices[0].device_listen_port = duplicate_port.device_listen_port;
+        assert!(
+            duplicate_port
+                .validate(Role::Node, false, false, false)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn multi_device_set_requires_explicit_nonzero_listener_ports() {
+        let mut config = valid_multi_device_config();
+        config.device_listen_port = None;
+        assert!(config.validate(Role::Node, false, false, false).is_err());
+
+        config.device_listen_port = Some(17920);
+        config.additional_devices[0].device_listen_port = None;
+        assert!(config.validate(Role::Node, false, false, false).is_err());
+
+        config.additional_devices[0].device_listen_port = Some(0);
+        assert!(config.validate(Role::Node, false, false, false).is_err());
+    }
+
+    #[test]
+    fn device_set_is_limited_to_sixteen_devices_including_primary() {
+        let mut config = valid_multi_device_config();
+        let primary_device_id = config.device_id;
+        config.additional_devices = (0..16)
+            .filter(|device_id| *device_id != primary_device_id)
+            .map(|device_id| HixlDeviceConfig {
+                device_id,
+                engine_id: format!("127.0.0.1:{}", 8000 + device_id),
+                device_listen_port: Some((18_000 + device_id) as u16),
+            })
+            .collect();
+        assert!(config.validate(Role::Node, false, false, false).is_ok());
+
+        config.additional_devices.push(HixlDeviceConfig {
+            device_id: 16,
+            engine_id: "127.0.0.1:8016".into(),
+            device_listen_port: Some(18016),
+        });
+        assert!(config.validate(Role::Node, false, false, false).is_err());
+    }
+
+    #[test]
+    fn off_configuration_still_rejects_invalid_nonempty_engine_addresses() {
+        let config = HixlConfig {
+            engine_id: "not-an-ip-port".into(),
+            ..Default::default()
+        };
+
+        assert!(config.validate(Role::Node, false, false, false).is_err());
+    }
+
+    #[test]
+    fn engine_endpoints_must_be_unicast_with_nonzero_ports() {
+        let mut config = HixlConfig {
+            device_id: 1,
+            engine_id: "224.0.0.1:7920".into(),
+            ..Default::default()
+        };
+        assert!(config.validate(Role::Node, false, false, false).is_err());
+
+        config.engine_id = "127.0.0.1:0".into();
+        assert!(config.validate(Role::Node, false, false, false).is_err());
+    }
 }
 
 #[cfg(test)]

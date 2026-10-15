@@ -50,6 +50,7 @@ use crate::node::vfs::{
 };
 
 use self::state::{FuseNode, FuseState, ROOT_INO};
+use crate::config::DfsFuseReadMode;
 
 const TTL: Duration = Duration::ZERO;
 const DIRECT_IO: FopenFlags = FopenFlags::FOPEN_DIRECT_IO;
@@ -95,6 +96,8 @@ pub struct FuseMountOptions {
     pub fuse_max_readahead_bytes: u32,
     /// Front-owned normal ordinary-write payload; downstream buffers are separate.
     pub dfs_write_queue_bytes: u64,
+    pub dfs_fuse_read_mode: DfsFuseReadMode,
+    pub dfs_fuse_max_io_bytes: u32,
 }
 
 impl Default for FuseMountOptions {
@@ -110,6 +113,8 @@ impl Default for FuseMountOptions {
             dfs_fuse_attr_ttl_ms: 0,
             fuse_max_readahead_bytes: 16 * 1024 * 1024,
             dfs_write_queue_bytes: 2 * 1024 * 1024 * 1024,
+            dfs_fuse_read_mode: DfsFuseReadMode::Cached,
+            dfs_fuse_max_io_bytes: DEFAULT_MAX_IO_BYTES,
         }
     }
 }
@@ -127,6 +132,8 @@ impl From<&crate::config::Config> for FuseMountOptions {
             dfs_fuse_attr_ttl_ms: config.dfs_fuse_attr_ttl_ms,
             fuse_max_readahead_bytes: config.fuse_max_readahead_bytes,
             dfs_write_queue_bytes: config.dfs_write_queue_bytes,
+            dfs_fuse_read_mode: config.dfs_fuse_read_mode,
+            dfs_fuse_max_io_bytes: config.dfs_fuse_max_io_bytes,
         }
     }
 }
@@ -149,6 +156,8 @@ impl FuseMountOptions {
             || self.fuse_max_readahead_bytes > 16 * 1024 * 1024
             || !(8 * 1024 * 1024..=1024 * 1024 * 1024 * 1024).contains(&self.dfs_write_queue_bytes)
             || usize::try_from(self.dfs_write_queue_bytes).is_err()
+            || !(4096..=8 * 1024 * 1024).contains(&self.dfs_fuse_max_io_bytes)
+            || !self.dfs_fuse_max_io_bytes.is_multiple_of(4096)
         {
             return Err(Error::coded(
                 afs_error::CONFIG_INVALID,
@@ -334,6 +343,47 @@ fn configure_readahead(
         }
     }
     Ok(())
+}
+
+const DEFAULT_MAX_IO_BYTES: u32 = 1024 * 1024;
+
+fn apply_max_write(
+    target: u32,
+    setter: impl FnOnce(u32) -> std::result::Result<u32, u32>,
+) -> io::Result<()> {
+    match setter(target) {
+        Ok(_) => Ok(()),
+        Err(nearest) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("FUSE rejected max write {target}; nearest supported value is {nearest}"),
+        )),
+    }
+}
+
+fn page_size_bytes() -> io::Result<u32> {
+    // SAFETY: sysconf reads a process-wide limit and does not dereference a pointer.
+    let value = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if value <= 0 {
+        return Err(io::Error::last_os_error());
+    }
+    u32::try_from(value)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "page size does not fit in u32"))
+}
+
+fn derive_max_pages(bytes: u32, page_size: u32) -> io::Result<u16> {
+    if bytes == 0 || page_size == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "max IO bytes and page size must be positive",
+        ));
+    }
+    let pages = u64::from(bytes).div_ceil(u64::from(page_size));
+    u16::try_from(pages).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("derived FUSE max_pages {pages} does not fit in u16"),
+        )
+    })
 }
 
 fn inline_local_read_data(
@@ -1993,11 +2043,34 @@ impl Drop for AfsFuse {
 impl Filesystem for AfsFuse {
     fn init(&mut self, _: &Request, config: &mut KernelConfig) -> io::Result<()> {
         self.record_request("init");
-        let _ = config.set_max_write(1024 * 1024);
         if self.cached_io {
             configure_readahead(self.mount_options.fuse_max_readahead_bytes, |limit| {
                 config.set_max_readahead(limit)
             })?;
+        }
+        let target = self.mount_options.dfs_fuse_max_io_bytes;
+        let max_pages_supported = config.capabilities().contains(InitFlags::FUSE_MAX_PAGES);
+        apply_max_write(target, |value| config.set_max_write(value))?;
+        let page_size = page_size_bytes()?;
+        let derived_pages = derive_max_pages(target, page_size)?;
+        afs_logging::info!(
+            "fuse.init_io";
+            "filesystem" => self.filesystem_label(),
+            "target_max_io_bytes" => target,
+            "accepted_max_write_bytes" => target,
+            "page_size_bytes" => page_size,
+            "max_pages_capability" => max_pages_supported,
+            "max_pages_flag_requested" => max_pages_supported,
+            "derived_max_pages_from_target" => derived_pages,
+            "derived_pages_note" => "ceil(target/page_size); fuser also considers kernel max_readahead"
+        );
+        if !max_pages_supported {
+            afs_logging::warn!(
+                "fuse.init_max_pages_unsupported";
+                "filesystem" => self.filesystem_label(),
+                "target_max_io_bytes" => target,
+                "impact" => "kernel keeps its default per-request page limit; large READ is not expected"
+            );
         }
         for capability in negotiated_init_flags(config.capabilities()) {
             let _ = config.add_capabilities(capability);
@@ -2632,6 +2705,7 @@ impl Filesystem for AfsFuse {
         let context = Self::context(req, 0);
         let cached_io = self.cached_io;
         let keep_cache = cached_io && self.mount_options.dfs_fuse_keep_cache;
+        let dfs_read_mode = self.mount_options.dfs_fuse_read_mode;
         let cache_ids = self.page_cache_ids.clone();
         let cache_gates = self.inode_cache_gates.clone();
         let active_cached_views = self.active_cached_views.clone();
@@ -2725,6 +2799,7 @@ impl Filesystem for AfsFuse {
                     });
                     let mut reply_flags =
                         native_open_reply_flags(cached_io, versioned_read, flags, cache_admitted);
+                    reply_flags |= dfs_open_reply_flags(dfs_read_mode, flags);
                     if keep {
                         reply_flags |= FopenFlags::FOPEN_KEEP_CACHE;
                     }
@@ -3660,7 +3735,13 @@ impl Filesystem for AfsFuse {
                         &file_attr(ino, &created.entry.attributes),
                         Generation(0),
                         FuseFileHandle(fh),
-                        open_reply_flags(!private && !self.cached_io),
+                        if private {
+                            FopenFlags::empty()
+                        } else if self.cached_io {
+                            dfs_open_reply_flags(self.mount_options.dfs_fuse_read_mode, flags)
+                        } else {
+                            DIRECT_IO
+                        },
                     )
                 });
             }
@@ -4074,6 +4155,8 @@ fn requested_init_flags() -> InitFlags {
     // DFS normally uses cached write-through and version-bound page reuse;
     // explicit direct IO and overlapping incompatible fixed-open views bypass
     // the shared inode cache. Cached handles follow close-to-open semantics.
+    // `dfs_fuse_read_mode = direct` additionally bypasses the page cache for
+    // read-only opens; it never changes writable opens.
     InitFlags::FUSE_PARALLEL_DIROPS | InitFlags::FUSE_DIRECT_IO_ALLOW_MMAP
 }
 
@@ -4113,6 +4196,12 @@ fn native_open_reply_flags(
     cache_admitted: bool,
 ) -> FopenFlags {
     open_reply_flags(!cached_io || (fixed_view && !cache_admitted) || flags & libc::O_DIRECT != 0)
+}
+
+fn dfs_open_reply_flags(mode: DfsFuseReadMode, flags: i32) -> FopenFlags {
+    // Bypass the kernel's small readahead window only for explicitly selected
+    // read-only opens. Cached write-through and writable mmap keep their policy.
+    open_reply_flags(mode == DfsFuseReadMode::Direct && flags & libc::O_ACCMODE == libc::O_RDONLY)
 }
 
 fn unsupported_lock_errno(start: u64, end: u64, typ: i32) -> i32 {
@@ -5269,6 +5358,132 @@ mod dispatch_tests {
             first.requests.with_label_values(&["ownerfs", "read"]).get(),
             2
         );
+    }
+
+    #[test]
+    fn dfs_direct_read_mode_keeps_writable_opens_cached() {
+        use crate::config::DfsFuseReadMode::{Cached, Direct};
+        for mode in [Cached, Direct] {
+            for flags in [libc::O_WRONLY, libc::O_RDWR, libc::O_RDWR | libc::O_APPEND] {
+                assert_eq!(
+                    super::dfs_open_reply_flags(mode, flags),
+                    fuser::FopenFlags::empty()
+                );
+            }
+        }
+        assert_eq!(
+            super::dfs_open_reply_flags(Cached, libc::O_RDONLY),
+            fuser::FopenFlags::empty()
+        );
+        for flags in [libc::O_RDONLY, libc::O_RDONLY | libc::O_CLOEXEC] {
+            assert_eq!(
+                super::dfs_open_reply_flags(Direct, flags),
+                fuser::FopenFlags::FOPEN_DIRECT_IO
+            );
+        }
+    }
+
+    struct RootOnlyBackend;
+
+    impl crate::node::vfs::Backend for RootOnlyBackend {
+        fn root_inode(&self) -> crate::node::vfs::types::BackendInode {
+            crate::node::vfs::types::BackendInode { value: 1 }
+        }
+    }
+
+    #[test]
+    fn dfs_max_io_bytes_is_configured_only_for_the_dfs_constructor() {
+        let default = super::AfsFuse::new(Arc::new(RootOnlyBackend));
+        assert_eq!(
+            default.mount_options.dfs_fuse_max_io_bytes,
+            super::DEFAULT_MAX_IO_BYTES
+        );
+        assert_eq!(default.mount_options.dfs_fuse_max_io_bytes, 1024 * 1024);
+
+        let dfs = super::AfsFuse::with_mount_options(
+            Arc::new(RootOnlyBackend),
+            super::FuseMountOptions {
+                dfs_fuse_read_mode: crate::config::DfsFuseReadMode::Direct,
+                dfs_fuse_max_io_bytes: 4 * 1024 * 1024,
+                ..Default::default()
+            },
+        );
+        assert_eq!(dfs.mount_options.dfs_fuse_max_io_bytes, 4 * 1024 * 1024);
+    }
+
+    #[test]
+    fn max_write_rejection_is_returned_instead_of_ignored() {
+        assert!(super::apply_max_write(4 * 1024 * 1024, |_| Ok(1024 * 1024)).is_ok());
+        let error = super::apply_max_write(4 * 1024 * 1024, |_| Err(16 * 1024 * 1024)).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("4194304"), "{error}");
+        assert!(error.to_string().contains("16777216"), "{error}");
+    }
+
+    #[test]
+    fn derived_pages_round_up_for_four_and_sixty_four_kib_pages() {
+        assert_eq!(super::derive_max_pages(1024 * 1024, 4096).unwrap(), 256);
+        assert_eq!(
+            super::derive_max_pages(4 * 1024 * 1024, 4096).unwrap(),
+            1024
+        );
+        assert_eq!(
+            super::derive_max_pages(8 * 1024 * 1024, 4096).unwrap(),
+            2048
+        );
+        assert_eq!(super::derive_max_pages(4 * 1024 * 1024, 65536).unwrap(), 64);
+        assert_eq!(super::derive_max_pages(4096, 65536).unwrap(), 1);
+        assert_eq!(super::derive_max_pages(4097, 4096).unwrap(), 2);
+        assert!(super::derive_max_pages(0, 4096).is_err());
+        assert!(super::derive_max_pages(4096, 0).is_err());
+        assert!(super::derive_max_pages(u32::MAX, 1).is_err());
+        assert!(super::page_size_bytes().unwrap() > 0);
+    }
+
+    #[test]
+    fn fuse_read_request_sizes_share_registry_without_cross_filesystem_leak() {
+        let registry = afs_metrics::Registry::new();
+        let first = super::FuseRequestMetrics::register(&registry).unwrap();
+        let same = super::FuseRequestMetrics::register(&registry.clone()).unwrap();
+        first.record_io("dfs", "read", 131_072);
+        same.record_io("dfs", "read", 1_048_576);
+        let read = first.io_size_bytes.with_label_values(&["dfs", "read"]);
+        assert_eq!(read.get_sample_count(), 2);
+        assert_eq!(read.get_sample_sum(), 1_179_648.0);
+        assert_eq!(first.requests.with_label_values(&["dfs", "read"]).get(), 2);
+        assert_eq!(
+            first.requests.with_label_values(&["ownerfs", "read"]).get(),
+            0
+        );
+        let other_registry = afs_metrics::Registry::new();
+        let other = super::FuseRequestMetrics::register(&other_registry).unwrap();
+        assert_eq!(
+            other
+                .io_size_bytes
+                .with_label_values(&["dfs", "read"])
+                .get_sample_count(),
+            0
+        );
+    }
+
+    #[test]
+    fn fuse_read_request_histogram_exports_zeros_for_both_filesystems() {
+        let registry = afs_metrics::Registry::new();
+        super::FuseRequestMetrics::register(&registry).unwrap();
+        let text = afs_metrics::encode_text(&registry).unwrap();
+        for filesystem in ["ownerfs", "dfs"] {
+            for operation in ["read", "write"] {
+                assert!(
+                    text.lines().any(|line| {
+                        line.starts_with("afs_fuse_callback_size_bytes_count{")
+                            && line.contains(&format!("filesystem=\"{filesystem}\""))
+                            && line.contains(&format!("operation=\"{operation}\""))
+                            && line.ends_with(" 0")
+                    }),
+                    "missing zero histogram count for {filesystem}/{operation}: {text}"
+                );
+            }
+        }
     }
 
     #[test]

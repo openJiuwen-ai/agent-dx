@@ -13,6 +13,7 @@ default = ["grpc"]
 grpc = ["dep:thiserror", "dep:tonic", "dep:afs-error", "dep:afs-protocol", "dep:prost", "dep:prost-types", "dep:tonic-types", "dep:tokio", "dep:tokio-rustls", "dep:rustls-pemfile", "dep:hyper-util", "dep:tower", "dep:futures-util", "dep:afs-logging", "dep:blake3", "dep:rustls"]
 rdma = []
 shm = ["dep:libc", "dep:nix"]
+hixl = ["dep:getrandom"]
 
 [dependencies]
 tokio = { version = "1.47.1", features = ["net", "io-util", "time"], optional = true }
@@ -33,6 +34,7 @@ thiserror = { version = "2.0.16", optional = true }
 tonic = { version = "0.14.6", features = ["tls-ring"], optional = true }
 libc = { version = "0.2", optional = true }
 nix = { version = "0.29", features = ["socket", "uio"], optional = true }
+getrandom = { version = "0.3", optional = true }
 
 [build-dependencies]
 cc = "1.2"
@@ -42,6 +44,7 @@ tempfile = "3"
 # 仅供真实 TCP socket 测试使用，复用工作区已锁定的库，不进入生产依赖。
 tokio = { version = "1.47.1", features = ["macros", "net", "rt", "rt-multi-thread"] }
 tokio-stream = { version = "0.1.17", features = ["net"] }
+getrandom = "0.3"
 
 [lints]
 workspace = true

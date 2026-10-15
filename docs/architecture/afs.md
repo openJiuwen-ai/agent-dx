@@ -98,6 +98,52 @@ DFS 的 `copy_file_range` 通过元数据 COW 为目标创建独立 FileVersion�
 
 文件提交和完整元数据同步遇到事务 CAS 未命中时，会重新验证 head 和写租约身份；同身份续期或并发 inode 属性变化不再永久污染 writer。换主和 head 变化仍拒绝。单次处理的持续竞争返回可重试错误，保留原 operation，避免把暂时竞争带到退出 drain。
 
+DFS FUSE 默认采用缓存的 write-through 模式，内核预读窗口可能把大的应用 read 拆成小请求。
+`dfs_fuse_read_mode = "direct"` 仅让 `O_RDONLY` 打开回复 `FOPEN_DIRECT_IO`，使批量读取
+绕过页缓存及预读窗口；`O_WRONLY`、`O_RDWR` 继续走原缓存路径，默认值为 `"cached"`。
+直接读取的实际大小受应用 read、协商的页数和内核限制约束，配置本身不保证 MiB 请求。
+DFS INIT 的请求容量目标由根配置 `dfs_fuse_max_io_bytes`（默认 1 MiB，上限 8 MiB 且不超过
+`dfs_read_max_inflight_bytes`）设置；它经 `set_max_write` 驱动库的 `max_pages` 推导，
+只作用于 DFS 挂载，并同时影响写请求容量。内核缺少 `FUSE_MAX_PAGES` 或
+`max_pages_limit` 更小时会保留可用但被钳制的路径，实际 READ 分布只看 FUSE 回调直方图和
+DFS batch，不从配置或 INIT 记录推导。
+只读 direct 句柄的 mmap 仍依赖协商的 `FUSE_DIRECT_IO_ALLOW_MMAP`，不具备该能力的
+内核使用 cached 模式执行只读 mmap。两种传输共享此策略，每个新 DFS 请求仍重新验证
+相关 chunk，不跨请求缓存“验证通过”标记。入口指标
+`afs_fuse_read_request_bytes{filesystem}` 记录内核请求字节数的直方图，包含失败回调；
+其 sum 不是成功读取字节数，INIT 日志中的上限也不是实际请求分布。
+
+DFS 传输计量默认 `dfs_read_measurement_mode = "baseline"`。显式的实验模式
+`"prepared-payload"` 为 TCP 增加经同一 mTLS/grant 授权的 Prepare/Fetch/Release：
+Prepare 完成不可变快照与范围 checksum，Fetch 单次消费，Release 幂等确认回收。
+TCP 快照独立限制为 128 MiB/批、8 项/256 MiB，准备与传输持有预算至实际数据释放；
+Ready 租约最多 5 秒且不超过 grant 过期时间。它不复用 HIXL 会话权威或独立 64 MiB
+快照预算。两条 reader 路径在源准备和接收分配完成后，计量到私有 Host 缓冲的数据交付；
+HIXL 按 wave 墙钟累计为 batch 样本，校验、释放成功后提交指标与数据。该模式要求
+`data_mode = "grpc"` 且 HIXL 为 off/required，拒绝 fallback 歧义；不改变现有 lane
+调度及逐请求完整性验证。
+
+顺序预读组由根配置 `dfs_read_group_mode = "sequential"` 开启，默认 `"off"` 保持原路径。
+只读 direct 句柄收到连续读时，把当前需求及其后最多 `dfs_read_group_bytes` 的连续范围
+规划成一个 DFS 批次，裁剪到 EOF；首个请求不等待后续 FUSE 请求到达。组绑定当前
+file version、layout 和每个窗口的授权，单个组合最多 128 MiB / 512 个 range，
+超过时由 planner 切成多个合法组。HIXL 只在单 lane 且启用 prepared 计量时把整组窗口
+一次提交给 native batch API；多 lane 和 TCP 使用同一聚合范围，但按各自传输方式提交。
+跨 FUSE 请求复用预取字节是有意行为变化：seek、倒退、重开、版本变化或写入可见性变化
+会丢弃窗口并重新走完整性验证；hole 仍为零填充。Host 预算按预取快照和 staging
+临时副本双份计入 `dfs_read_group_host_budget_bytes`，不足时退回原逐请求读取。
+`dfs_read_group_max_inflight` 当前只接受 1 或 2，实际组间流水线尚未实现；RDMA 数据面
+不接受组批次，因此该模式只对 gRPC 或 HIXL prepared 路径生效。单 lane 时 reader 通过
+`PrepareReadRangesHixlGroup` 一次提交整波有序 window，源端只授权父批次一次并从同一
+不可变快照切片导出全部 window；导出失败会回收本次已准入的 slot 并丢弃新建快照。
+快照保留批次读取时已计算的 range checksum，window 操作与批次操作对齐时直接复用，
+只有拆分或跨操作时才重算；复用与重算次数分别由
+`afs_hixl_source_range_checksums_reused_total` 和 `..._computed_total` 记录。
+range checksum 在同一次 Chunk 完整性扫描中生成；range 恰好覆盖整个 Chunk 时直接
+复用已验证的 Chunk content digest，不再对相同字节二次哈希。
+Release 仍按 window 执行。调用次数、descriptor 数和提交字节由
+`afs_hixl_reader_native_batch_*` 指标记录；组级 current/peak 资源指标仍未实现。
+
 所有启用 OwnerFs 或 DFS 权威能力的 Meta 都要求双向证书身份认证和
 `trusted_node_certs`。CA 只证明证书链可信；Meta 还把握手得到的叶证书 DER 精确
 映射到一个 Node ID，并校验 RPC 中声明的 caller／holder／owner 身份。DFS-only
@@ -695,6 +741,64 @@ release 撤销注册并等待活跃执行，后端打开对象由原 FUSE 路径
 SDK 活跃导入及待清理任务合计最多 64 个；取消/丢失回复由工作线程和守卫继续负责注销，
 Drop 仅安排有界后台清理，失败持有 fd/配额重试，显式 unregister 才是确认交回的接口。
 这不承诺跨 Node 已打开缓存 fd 的即时一致性或任意 POSIX/SDK 并发混写。
+
+## HIXL 不可变 DFS 远端读
+
+可选 Cargo feature `hixl` 提供首版 `HixlChunkTransfer`，接入既有 `DfsReadEngine`。
+读取节点先经 mTLS 调用 `NegotiateHixl`、`PrepareReadRangesHixl`，源节点逐 operation
+校验 grant、版本、copy 与 range，验证本地 chunk 后填入固定 ACL Host 窗口。
+源端将同一逻辑 batch 中同 chunk 的范围合并到一次完整扫描，生成不可变的私有快照；
+后续窗口仅从快照取片段。单 batch 沿用 DFS 8 MiB 上限，单源节点快照总预算为 64 MiB。
+该预算独立于 native Host/HBM 池，且不计入现有 native 内存指标。每个 session 只允许一个
+活动父 batch，每窗重新授权并核对完整父请求及连续偏移。batch 的窗口全部终态释放后，
+或 close、过期、drain、quarantine 时丢弃快照；不跨独立读取缓存完整性判定。
+读取节点按两端协商的最小窗口容量切片，不为占满设备而缩小 IO。窗口从当前 peer 的
+起始 lane 按配置顺序分波，成功 batch 后轮转到下一 lane，失败不推进；小 batch 只用
+一个 lane。每波按偏移顺序 Prepare，再由各 lane
+并行发起 HIXL `READ`。完成并逐 range 校验 BLAKE3，全部成功后验证 scatter 范围并
+按原请求顺序填入输出，保留目的区重叠语义；scheduler 仍在整个 batch 成功后发布 staging 数据。
+`ReleaseHixlRead` 与 `CloseHixl` 分别管理窗口释放和停止准入。
+
+`afs/common/transport` 的 `HixlRuntimeGroup` 按配置管理 1..16 个 SDK 逻辑设备，
+每设备拥有独立 engine、ACL context owner 线程与固定 Host 两池；两池在 Connect 前
+一次性分配，每设备默认各 16 个 4 MiB slot，Host 合计最多 512 MiB。进程 ACL 初始化与
+设备 reset 使用共享 lease，仅最后一个托管使用者可以清理；失败时保留 lease 与资源。
+正常完成才能复用窗口。各 lane 共享一个源 session 和快照，不按设备复制完整快照。
+`[hixl].transport` 默认 `roce`：注册 `MEM_HOST`、禁用中转池，使用 Device RoCE 异步
+READ。可选 `hccs-buffer-pool` 使用未注册 Host 业务窗口与同步 READ；不传
+`protocol_desc`/`LocalCommRes`，使 SDK 使用支持中转的通信域引擎。两组内部 HBM 池合计
+预算为每设备 `2 * buffer_pool_count * buffer_pool_size_mib` MiB，默认 64 MiB，最多 512 MiB。
+Host 与 HBM 分开统计，HBM 数值表示配置容量；聚合预算随设备数增长，两类各最多 8 GiB。
+
+协议 v4 携带精确父 batch、窗口偏移与 lane ID，协商有序 lane engine/generation/容量。
+在授权后校验两端 lane 数、transport、BufferPool 参数和 SDK 实际查询到的 super-pod ID，
+匹配后才分配 session/建链。HCCS 模式只接受配套 SDK 支持的 A3 型号和已知同域 peer，
+并拒绝强制 RoCE 的 HCCL 环境。SDK 仍负责选物理路径；真实 HCCS 使用情况需硬件日志
+与计数器证明。没有 RoCE/HCCS 自动切换。
+未知提交、超时、FAILED、失联或未决窗口使整个 engine/pool generation 停止准入并保留
+资源；close、TTL、Disconnect 与进程退出不能单独证明 DMA 排空。`/health` 和
+`/metrics` 暴露代际状态和保留资源量。每 peer 控制会话在空闲
+`[hixl].session_idle_ms`（默认 300000 ms，0 表示不回收）后关闭；关闭前必须已释放
+全部窗口，关闭后下一次读取重新协商并建链，实测约 0.2 s。
+`preferred` 下冷 peer 的当前 batch 由同一授权走 gRPC，后台 warm 任务串行协商/建链；
+建链期间的 batch 不等待，会话就绪后恢复 HIXL，失败则下一次读取重试。
+`required` 不启用该冷启动回退。故障后的 fencing/reset
+与自动恢复仍待硬件验收。
+
+默认一设备，有序的 `[[hixl.additional_devices]]` 增加独立 lanes；各 lane 的 owner
+串行等待自己的 READ，同一波的不同 lane 并行。每 peer 仍只准入一个逻辑读取任务。
+Prepare 失败回收同波未提交窗口；提交后等待全部 sibling 清理，调用方超时后后台继续受管清理。
+普通远端拒绝只影响对应 peer；本地 native 生命周期不确定才隔离本地整个组。
+单 lane 的流水线和多设备吞吐收益仍需后续硬件验证。
+
+HIXL 参数面不具备 AFS mTLS 的 Node 身份绑定，注册池的访问边界也不是每个 grant。
+只能在管理员控制、隔离的可信节点网络使用，不能据此宣称租户 MR 级隔离。
+首期不改变 Meta source schema、OwnerFs、dirty-owner 读、复制写入或持久 receipt。
+`data_mode` 继续控制这些原有路径，独立的 `[hixl].dfs_read_mode` 默认 `off`。
+
+当前代码与软件状态机检查不构成 A2/A3 双机 RoCE、A3 HCCS、性能或故障恢复通过证据。
+请求级快照、合并扫描、多设备调度和 ACL lease 已通过本地 Linux/WSL 构建及 CPU/fake SDK
+回归；带宽收益仍待真机测量。配置见 [部署文档](../deployment/afs.md#hixl-dfs-远端读)。
 
 ## OwnerFs workspace bind mount
 

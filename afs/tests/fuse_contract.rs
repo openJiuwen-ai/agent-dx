@@ -11,6 +11,7 @@ use std::{
     time::{Duration, UNIX_EPOCH},
 };
 
+use afs::config::DfsFuseReadMode;
 use afs::node::{
     fuse,
     vfs::{
@@ -208,6 +209,93 @@ fn fuse_mount_binds_backend_at_mount_root() {
         .arg("-u")
         .arg(&mount)
         .status();
+}
+
+#[test]
+#[ignore = "requires Linux /dev/fuse, fusermount3 and root for allow_other"]
+fn fuse_dfs_large_request_target_changes_observed_read_sizes_and_writes() {
+    let temp = tempfile::tempdir().unwrap();
+    let mount = temp.path().join("mnt");
+    std::fs::create_dir(&mount).unwrap();
+    let backend = Arc::new(MockBackend::default());
+    let registry = afs_metrics::Registry::new();
+    let metrics = fuse::FuseRequestMetrics::register(&registry).unwrap();
+    let session = fuse::mount_dfs_with_metrics_and_options(
+        backend,
+        &mount,
+        metrics,
+        fuse::FuseMountOptions {
+            dfs_fuse_read_mode: DfsFuseReadMode::Direct,
+            dfs_fuse_max_io_bytes: 4 * 1024 * 1024,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    wait_until_mounted(&mount).unwrap();
+
+    let size = 4 * 1024 * 1024 + 12_345;
+    let payload = (0..size)
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    std::fs::write(mount.join("large.bin"), &payload).unwrap();
+    let read_back = std::fs::read(mount.join("large.bin")).unwrap();
+    assert_eq!(read_back, payload);
+
+    let text = afs_metrics::encode_text(&registry).unwrap();
+    let metric = "afs_fuse_callback_size_bytes";
+    let labels = "filesystem=\"dfs\",operation=\"read\"";
+    let count =
+        metric_value(&text, &format!("{metric}_count{{{labels}}}")).expect("DFS read count");
+    let sum = metric_value(&text, &format!("{metric}_sum{{{labels}}}")).expect("DFS read sum");
+    let up_to_64k = metric_value(&text, &format!("{metric}_bucket{{{labels},le=\"65536\"}}"))
+        .expect("64 KiB bucket");
+    let up_to_256k = metric_value(&text, &format!("{metric}_bucket{{{labels},le=\"262144\"}}"))
+        .expect("256 KiB bucket");
+    let up_to_one_mib = metric_value(
+        &text,
+        &format!("{metric}_bucket{{{labels},le=\"1048576\"}}"),
+    )
+    .expect("1 MiB bucket");
+    assert!(count >= 2.0, "{text}");
+    assert!(sum >= size as f64, "{text}");
+    assert!(
+        up_to_64k >= 1.0,
+        "the non-aligned tail or an EOF probe must be visible as a small request: {text}"
+    );
+    assert!(
+        up_to_256k < count,
+        "at least one READ must exceed 256 KiB; a smaller value means the kernel ignored max_pages: {text}"
+    );
+    assert_eq!(
+        up_to_one_mib, count,
+        "every READ should fit the kernel's 1 MiB request cap: {text}"
+    );
+    println!("FUSE large-request histogram:\n{text}");
+
+    let file = std::fs::File::open(mount.join("large.bin")).unwrap();
+    assert_eq!(
+        file.read_at(&mut vec![0; 1024 * 1024], 4097).unwrap(),
+        1024 * 1024
+    );
+    assert_eq!(
+        file.read_at(&mut vec![0; 1024 * 1024], size - 1024)
+            .unwrap(),
+        1024
+    );
+    drop(file);
+
+    session.join().unwrap();
+    let _ = std::process::Command::new("fusermount3")
+        .arg("-u")
+        .arg(&mount)
+        .status();
+}
+
+fn metric_value(text: &str, key: &str) -> Option<f64> {
+    text.lines().find_map(|line| {
+        let (name, value) = line.rsplit_once(' ')?;
+        (name == key).then(|| value.parse().ok())?
+    })
 }
 
 #[test]

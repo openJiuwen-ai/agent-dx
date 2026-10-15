@@ -47,6 +47,35 @@ Meta 默认使用唯一持久后端 `local-file`。`memory` 仅适合一次性�
 Operator 负责创建 namespace/root grant、配置挂载和回收引用；Environment 创建尚不会
 自动 provision/mount/reclaim AFS。
 
+DFS FUSE 的 `dfs_fuse_read_mode` 默认 `"cached"`。批量顺序读取可显式选择 `"direct"`，
+让只读打开绕过内核页缓存和预读窗口；实际请求大小仍由内核协商和应用读取大小决定。
+可写打开继续使用缓存的 write-through 路径。只读 direct 句柄的 mmap 依赖内核
+`FUSE_DIRECT_IO_ALLOW_MMAP`；需要在不支持该能力的内核上执行只读 mmap 时使用 cached。
+该开关同时作用于 TCP 与 HIXL，不改变 chunk 校验和请求授权。
+
+DFS FUSE 的 INIT 请求容量目标由 `dfs_fuse_max_io_bytes` 配置，默认 `1048576` 字节，
+CLI 对应 `--dfs-fuse-max-io-bytes`，范围 4096..=8388608 且必须是 4096 的倍数；CLI
+优先于 TOML，且不得超过 `dfs_read_max_inflight_bytes`。该值只传给 DFS 挂载，OwnerFs
+和测试 backend 继续使用 1 MiB 默认值。实现通过 `set_max_write` 驱动库的 `max_pages`
+推导，因此同时改变写请求容量；内核缺少 `FUSE_MAX_PAGES` 或存在页数上限时可能钳制，
+实际是否形成大 READ 必须以 `afs_fuse_read_request_bytes` 和 DFS batch 证据判断，
+不能从配置或 INIT 日志推导。
+
+顺序预读组由根配置 `dfs_read_group_mode` 控制，默认 `"off"`。设为 `"sequential"` 时，
+只读 direct 句柄把当前读及后续最多 `dfs_read_group_bytes`（默认 8 MiB，上限 128 MiB，
+必须 4 KiB 对齐）的连续范围合并为一个 DFS 批次，并用
+`dfs_read_group_max_descriptors`（1..=128）和 `dfs_read_group_host_budget_bytes`
+约束 descriptor 数与 Host 预算。该模式只对 gRPC 或 HIXL prepared 路径生效；RDMA
+数据面继续使用原逐批预算。seek、重开、版本变化或写入可见性变化会丢弃预取窗口并
+重新验证，预取命中的请求不重复计入传输字节。边界见[架构说明](../docs/architecture/afs.md)。
+
+带宽对照可显式设置 Node 根配置 `dfs_read_measurement_mode = "prepared-payload"`
+（CLI：`--dfs-read-measurement-mode prepared-payload`），默认 `"baseline"` 保留原流式读取。
+该实验模式支持 `data_mode = "grpc"` 与 HIXL `off`/`required`，拒绝自动回退；
+TCP 使用认证的 Prepare/Fetch/Release，HIXL 在原有准备窗口后计时。共同指标
+`afs_dfs_read_payload_seconds` 与 `afs_dfs_read_payload_bytes_total` 只用校验、释放成功的
+字节计算带宽。
+
 ## 构建入口
 
 默认入口保持 Agent DX 原行为：
@@ -70,6 +99,38 @@ python3 build/ci/run.py afs
 默认包始终排除 `afs-meta`、`afs-node` 和 AFS 示例配置。
 
 SHM 的 memfd、sealing 与原子 CLOEXEC FD 传递实现及对应运行测试只在 Linux 编译。macOS 上返回 `ShmError::Unsupported`，仅检查该不支持契约；这不代表 AFS/FUSE 在 macOS 可运行。
+
+HIXL 的首版代码仅加速 DFS 已提交不可变 chunk 的远端读。默认不编译 native HIXL；
+支持要求为 CANN ≥ 9.1.0、HDK ≥ 25.5.0，CANN、HDK 与设备型号需使用配套组合。
+在已安装匹配 HIXL/ACL 头文件及共享库的 Linux 环境中，可运行
+`make afs-check ADX_WITH_AFS=1 ADX_AFS_WITH_HIXL=1 ADX_CANN_PATH=/opt/ascend/cann`。
+节点再通过 `[hixl].dfs_read_mode = "preferred" | "required"` 显式启用。
+`[hixl].transport` 默认 `"roce"`，可选 `"hccs-buffer-pool"` 接入 A3 同 super-pod
+域的同步中转读取；两端的模式和 BufferPool 参数必须相同。每设备默认两组 HBM 池合计预算
+64 MiB，与固定 Host 池分别统计。默认使用一个 `device_id`，可通过有序的
+`[[hixl.additional_devices]]` 配置最多 16 个 SDK 逻辑设备，各设备使用独立 engine、
+监听端口和 ACL owner；同一 batch 按协商窗口容量切片并分波并行读取，完整成功后按原请求顺序发布。
+小 batch 不为占满设备而进一步均分，成功 batch 之间轮转起始 lane；每 peer 仍只准入一个
+逻辑 batch。默认 4 MiB 窗口下，128 KiB batch 只用一个 lane，8 MiB batch 使用两个 lanes。
+Node 先完成本地 HIXL 初始化，再向 Meta 首次注册，避免多设备初始化消耗已注册会话的租约。
+每个 peer 的 HIXL 控制会话默认在空闲 300 秒后回收，可用 `[hixl].session_idle_ms` 调整；
+0 表示进程生命周期内不回收，避免稀疏小读每次重付约 0.2 秒建链开销。
+`dfs_read_mode = "preferred"` 时，peer 尚无控制会话或会话正在建立，当前 batch 使用同一
+授权经 gRPC 读取，同时后台协商并建链；建链期间到达的 batch 不等待，会话就绪后恢复 HIXL。
+成功走该路径的 batch 计入 `afs_hixl_cold_tcp_fallbacks_total`；`"required"` 不启用该回退。
+注册失败或启动取消时清理已初始化的 runtime；设备清理在阻塞线程中执行。
+进程正常停止仍须完成排空；15 秒进程停机期限耗尽时，以失败码 124 直接退出并跳过
+可能阻塞的 native 退出处理器，不把该路径标记为正常关闭或已证明设备排空。
+源端按逻辑读取 batch 生成已校验的不可变快照，同一 chunk 的多个范围合并为一次完整校验；
+后续 native 窗口从快照取片段。单 batch 最多 8 MiB、每源节点快照合计最多 64 MiB，
+与 Host/HBM 池预算独立；每窗仍重新授权，完整释放或关闭、过期、drain 时清理快照。
+此请求级准备优化、多设备并行与内部协议 v4 已通过本地 Linux/WSL 构建及 CPU/fake SDK
+回归。吞吐与链路收益待真机验证。
+同卡多进程可通过可选 `[hixl].device_listen_port` 分离 SDK 设备侧监听端口，
+其取值为 1..65535，与 `engine_id` 的 Host 端口独立；未配置时沿用 SDK 默认。
+OwnerFs、DFS dirty-owner 读和复制写入仍使用原 `data_mode`。
+这版代码尚未经过 A2/A3 双机 RoCE、A3 HCCS 与故障恢复验收，配置与信任边界见
+[部署文档](../docs/deployment/afs.md#hixl-dfs-远端读)。
 
 ## 当前能力边界
 

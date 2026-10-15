@@ -187,6 +187,206 @@ path、mount ID 和 source 同时作为 readiness 身份；挂载被替换时健
 - 同一 Node 只启用管理员控制的 host bind entry；
 - 停机、root/epoch 变化或授权失效前，先停止受管用户并排空引用。
 
+## HIXL DFS 远端读
+
+DFS FUSE 的读取策略独立于传输选择。Node 根配置 `dfs_fuse_read_mode = "cached"`
+为默认值；批量顺序读可设置 `"direct"`，CLI 对应 `--dfs-fuse-read-mode direct`。
+它仅改变只读打开的 FUSE 回复，可写打开保留缓存的 write-through 和 mmap 路径。
+direct 可绕过小的内核预读窗口，但不保证每次请求达到配置的窗口容量。需要只读 mmap
+且内核不支持 `FUSE_DIRECT_IO_ALLOW_MMAP` 时保留 cached。此字段放在 TOML 根部，
+不能写入 `[hixl]`；TCP/HIXL 对照应使用相同值。完整性检查及源快照预算保持相同。
+
+DFS FUSE 的 INIT 请求容量目标为根配置 `dfs_fuse_max_io_bytes`，默认 `1048576`，
+CLI 为 `--dfs-fuse-max-io-bytes`；范围 4096..=8388608，必须为 4096 的倍数，且不能
+超过 `dfs_read_max_inflight_bytes`。该值只影响 DFS 挂载，OwnerFs 与测试 backend 保持
+1 MiB。它经 `set_max_write` 影响库推导的 `max_pages`，也同时提高写请求容量；宿主内核
+缺少 `FUSE_MAX_PAGES` 或 `max_pages_limit` 更小时会钳制，不能把配置值当作实际 READ
+大小。验收需同时查看 `afs_fuse_read_request_bytes`、`afs_dfs_read_transport_*` 和
+真实 DFS batch。
+
+Node 根配置 `dfs_read_measurement_mode` 默认为 `"baseline"`，CLI 同名参数采用短横线。
+实验性 `"prepared-payload"` 要求 `data_mode = "grpc"`，且 `[hixl].dfs_read_mode`
+为 `"off"` 或 `"required"`；`preferred` 和 RDMA/auto 被拒绝，避免回退污染对照。
+该模式先准备源端已验证快照和接收缓冲，再统计到私有目标缓冲的传输墙钟，校验与释放
+在计时外。TCP 快照独立限制 128 MiB/批、8 项/256 MiB、最长 5 秒且不超过授权到期；
+HIXL 原有 64 MiB 快照预算独立保留，组批次使用 128 MiB 独立预算。
+两端测试配置须使用相同 measurement mode，脚本会核对身份和指标。
+
+顺序预读组由 Node 根配置 `dfs_read_group_mode` 开启，默认 `"off"`，CLI 为
+`--dfs-read-group-mode sequential`。其他相关字段：
+
+- `dfs_read_group_bytes`：单个组合的目标字节数，默认 8388608，范围
+  1048576..=134217728 且为 4096 的倍数。
+- `dfs_read_group_max_inflight`：1 或 2，默认 1；当前实现为单组串行，2 只用于
+  配置与预算校验，不表示已经存在流水线重叠。
+- `dfs_read_group_max_descriptors`：1..=128，默认 128，并受 `[hixl].receive_slots`
+  约束；一次 native batch 最多 64 个 descriptor。
+- `dfs_read_group_host_budget_bytes`：预取快照与 staging 副本的共享预算，默认
+  1073741824，且不得小于 `dfs_read_group_bytes`。
+
+该模式只对 gRPC 或 HIXL prepared 路径生效；RDMA 数据面保持原逐批预算，配置值不会
+暗中缩小 native descriptor 数。100 MiB 单 lane 测试需要
+`[hixl].receive_slots` 与 `[hixl].export_slots` 至少 25，并保持单 lane。
+seek、倒退、重开、版本变化或写入可见性变化会丢弃预取窗口；组内存不足时退回原读取路径。
+
+HIXL 是单独的 native 编译开关，默认 `ADX_AFS_WITH_HIXL=0`。启用构建必须同时设置
+`ADX_WITH_AFS=1` 和 `ADX_CANN_PATH`，例如在 Linux/WSL 中执行：
+
+```sh
+make afs-build ADX_WITH_AFS=1 ADX_AFS_WITH_HIXL=1 ADX_CANN_PATH=/opt/ascend/cann
+make platform-release ADX_WITH_AFS=1 ADX_AFS_WITH_HIXL=1 ADX_CANN_PATH=/opt/ascend/cann
+```
+
+AFS HIXL 支持 CANN ≥ 9.1.0、HDK ≥ 25.5.0。运行节点的 CANN、HDK 与设备型号需使用
+配套组合；容器部署时，CANN 来自容器，HDK 来自宿主机。
+安装根需提供同一配套版本的 HIXL/ACL 头文件及共享库。已有软件验证使用 CANN 9.1.1。
+构建不会下载或把 CANN 复制进 ADX 包。运行节点应加载正式 CANN 环境、驱动库及 Ascend 设备；SDK 的 devlib
+stub 只可用于无硬件的编译/软件单测，不能代替驱动完成真实 READ。
+启用 HIXL 的二进制即使配置 `preferred`，仍需动态加载 CANN 依赖；它不是运行时 dlopen 插件。
+
+每个节点配置不同且可达的 engine 地址；以下为 TOML 结构示例，必须替换成节点真实地址：
+
+```toml
+[hixl]
+dfs_read_mode = "required"
+transport = "roce"
+buffer_pool_count = 4
+buffer_pool_size_mib = 8
+device_id = 0
+engine_id = "192.0.2.10:7920"
+# Optional device NIC port for sharing a device with other processes.
+# device_listen_port = 27666
+window_bytes = 4194304
+receive_slots = 16
+export_slots = 16
+max_inflight_per_peer = 1
+# Idle peer control sessions are retired after this many milliseconds.
+# 0 keeps them for the process lifetime; the range is 0..=3600000.
+session_idle_ms = 300000
+```
+
+`off` 不初始化 CANN；`preferred` 只在本地明确能力缺失且清理已完成，或 peer 在任何
+数据提交前明确返回 AFS capability unsupported 时回退 gRPC；`required` 能力缺失时
+拒绝启动或读取。启动清理失败会保留资源并返回 drain incomplete，阻止继续启动。
+身份/授权错误、连接错误和提交后的错误不会通过降级重放。`preferred` 还会在 peer 尚无
+控制会话或建链进行中时，用同一授权经 gRPC 服务当前 batch，并在后台完成协商/建链；
+`required` 不启用该路径。配置要求 Node DFS、完整
+mTLS、`trusted_node_certs`、非零端口的具体单播 IP、正数且有界的池预算。窗口为
+1 字节至 4 MiB，两池各 1..64 slot，每设备 Host 总量最多 512 MiB；空闲会话时限为
+0..=3600000 ms，默认 300000，0 表示不回收。不会动态增长或新建代际绕过预算。
+
+Node 在本地 HIXL 初始化完成后才首次向 Meta 注册；多设备初始化期间尚未持有 Meta 会话租约。
+注册失败时等待阻塞线程清理已初始化的 runtime，并保留原注册错误；启动取消或后续启动失败时
+由启动 guard 派发清理。正常停止仍先停消费者，再关闭全部 lanes，不重复尝试原生 shutdown。
+这些启动路径已有 Linux 回归测试；真机验证与吞吐证据分别记录，启动修复本身不代表多卡吞吐提升。
+Node 的进程停机期限为 15 秒。期限耗尽走失败退出码 124，并绕过 C/native 退出处理器，
+避免它们在设备清理未完成时触发全局析构；正常完成路径仍执行资源清理并解除期限。
+退出码 124 不证明设备已排空，恢复测试前仍须核对遗留进程和设备状态。
+
+默认只使用主项 `device_id`。多设备时在同一配置追加有序的设备表，例如以下两设备
+HCCS 结构示例（实现已通过本地软件门禁，真机验证待执行；IP 和逻辑设备号需按环境替换）：
+
+```toml
+[hixl]
+dfs_read_mode = "required"
+transport = "hccs-buffer-pool"
+device_id = 0
+engine_id = "192.0.2.10:7920"
+device_listen_port = 30600
+window_bytes = 4194304
+receive_slots = 4
+export_slots = 4
+buffer_pool_count = 4
+buffer_pool_size_mib = 8
+max_inflight_per_peer = 1
+
+[[hixl.additional_devices]]
+device_id = 2
+engine_id = "192.0.2.10:7921"
+device_listen_port = 30601
+```
+
+主项加附加项合计 1..16 个设备，SDK 逻辑 device ID 必须非负并由运行环境识别；本地 device ID、
+engine endpoint、显式设备监听端口必须分别唯一。多设备要求每 lane 都显式配置监听
+端口。两端按列表顺序配对，数量与公共 transport/池参数相同；两端本地 device ID
+可以不同，需先核实其物理卡、NUMA 与链路拓扑。`0,2` 不是已验证的物理卡组合。
+同一个 batch 按协商窗口容量切片，不按设备数强制均分；小 batch 保留一个窗口。
+窗口从当前 peer 的起始 lane 轮转分配，成功 batch 后从下一 lane 开始，失败不推进。
+多窗口在 lanes 间分波并行，只有完整成功后发布；每 peer 仍只准入一个逻辑读取任务，
+跨 batch 轮转不等于跨 batch 并发。4 MiB 窗口下，128 KiB batch 仅使用一个 lane，
+8 MiB batch 使用两个 lanes；增加设备不保证每个 batch 都用满全部设备。
+上述 Host 为每 lane 32 MiB、合计 64 MiB，HCCS HBM 为每 lane
+64 MiB、合计 128 MiB。生产配置的各类聚合上限分别为 8 GiB，不包含源快照普通内存。
+将公共 transport 改为 `roce` 同样使用多 lane，此时中转 HBM 预算为 0。
+
+`window_bytes` 是每次 native 导出的容量上限，默认 4 MiB；实际窗口仍受逻辑读取长度和
+FUSE 请求拆分影响。64 KiB 是此前最小资源诊断配置，不是产品默认值或 HIXL 限制。
+源端另保留请求级已校验快照：单逻辑 batch 最多 8 MiB、每源节点合计最多 64 MiB，
+预算不足在读取源数据前返回 `NODE_TRANSFER_RESOURCE_EXHAUSTED`。每个认证 session
+同时只准备一个父 batch，各窗口必须按偏移顺序覆盖该 batch；每窗重新校验整个父请求的
+授权。完整 batch 的窗口全部终态释放后，或 close、过期、drain、quarantine 时清理快照。
+这些普通内存副本与 native Host/HBM 池分别计量；清快照不表示未知 native 传输已排空。
+当前 `/health` 和 native 内存指标只报告 Host/HBM 池，不包含快照普通内存。
+此优化的本地 CPU/fake SDK 回归已通过；硬件验证与后续对照待执行。
+
+AFS 控制 RPC 仍使用原 gRPC endpoint；engine 地址用于 HIXL 独立参数交换。
+可选 `device_listen_port` 是 SDK 的设备侧监听端口，取值为 1..65535；
+未配置时沿用 SDK 默认。多进程共用同一设备时应分别选择未占用端口，
+避免与默认设备端口或其他任务冲突。它与 Host `engine_id` 端口独立，
+只配置本节点，不要求两端取值相同，也不写入 AFS peer 能力协商。
+RoCE 会同时保留 `roce:device` 协议选择；HCCS 仅增加设备端口，不配置 `protocol_desc`。
+默认 `transport = "roce"` 使用 `roce:device`，两端均注册 `aclrtMallocHost` 分配的
+`MEM_HOST`，显式关闭 SDK 中转池（`BufferPool=0:0`），由 owner 线程提交异步 READ 并查询完成。
+
+A3 HCCS 中转读在两端改为以下配置，其余身份、engine 地址与 Host 窗口配置沿用上例：
+
+```toml
+[hixl]
+dfs_read_mode = "required"
+transport = "hccs-buffer-pool"
+buffer_pool_count = 4
+buffer_pool_size_mib = 8
+device_id = 0
+engine_id = "192.0.2.10:7920"
+```
+
+此模式使用未注册的 ACL Host 业务窗口和 SDK 通信域引擎，在专用 ACL owner 线程执行
+`TransferSync(READ)`，将剩余读取 deadline 传给 SDK。不会同时配置 `protocol_desc` 或
+`LocalCommRes`，因为配套 HIXL 9.1.1 的该组合会选择不支持中转的 HixlCS 引擎。
+`buffer_pool_count` 和 `buffer_pool_size_mib` 各为 1..64；两组 HBM 池的合计预算为
+`2 * count * size_mib` MiB，最多 512 MiB，默认 64 MiB。RoCE 不分配中转 HBM；这些字段
+仍需满足配置范围。Host 池预算独立计算，不因开启中转而减少。
+
+启动时检查 A3 型号，并通过 `aclrtGetDeviceInfo(ACL_DEV_ATTR_SUPER_POD_ID)` 查询实际
+super-pod ID；查询失败或负数视为能力缺失。协议 v4 在授权后、分配 session 和建链前
+检查两端 lane 数、transport、池参数和 domain；domain 0 是有效值。不同域、模式或池参数返回
+协议/参数错误，不能当作 `preferred` 的 capability fallback。v4 同时携带精确父 batch、窗口
+偏移、lane 身份与每 lane 的 engine/generation/容量，节点升级需统一使用 v4。
+
+HCCS 模式要求 `HCCL_INTRA_ROCE_ENABLE` 未设置或为 `0`，
+`HCCL_INTER_HCCS_DISABLE` 未设置或为 `FALSE`，冲突配置在初始化 engine 前拒绝。
+后者的取值含义见 [HCCL 官方说明](https://www.hiascend.com/doc_center/source/zh/canncommercial/850/commlib/hcclug/hcclug_000079.html)。
+同域检查与环境检查用于阻止已知错误配置；通信域引擎仍由 SDK/HCCL 选择物理链路。
+部署必须具备同 super-pod 的 HCCS 拓扑，并通过真实 HCCS 日志和链路计数器确认路径，
+不能只凭配置值或 READ 成功声称已使用 HCCS。代码不做 RoCE/HCCS 自动切换。
+
+参数 TCP 与数据网络仅允许可信受管节点互访；隔离该网络并由管理员管理地址。
+AFS grant 不限制 HIXL 参数面暴露的注册池或中转地址访问范围。
+
+`/health` 的 `checks.hixl` 报告模式、transport、super-pod ID、代际、Host
+allocated/quarantined bytes、`relay_hbm_budget_bytes` 和 slot 使用数；资源字段为组内聚合。
+`lane_count` 和有序 `lanes` 另列配置的设备/监听端口、engine/generation、状态及资源，
+活动 runtime 的 `internal_protocol_version` 为 4。设备监听端口来自启动配置，并非 SDK
+实测端口。HBM 字段表示
+SDK 两组池的配置容量，不是实测使用量；无 runtime 时为 0、domain 为 null。
+已有代际进入 quarantine 后，即使为 `preferred` 也显示 degraded，不静默切换通道。
+正常停止先关闭源节点新窗口准入，保留 release RPC 最多 5 秒等待已发出的窗口；
+随后结束服务与 FUSE 消费者，再由 native owner 核验已知完成与窗口引用。
+故障情况下可能返回 `NODE_TRANSFER_DRAIN_INCOMPLETE` 并保留资源；恢复前需要经过
+硬件验证的 fencing/reset 流程。本版没有自动恢复代际能力。
+同步中转 READ 一旦进入 SDK，超时、失败或异常同样不能证明远端 DMA 已停止，
+Host 窗口、HBM 池与整个 engine 会保留并停止准入；不重试、不降级、不自动释放。
+
 ## 运维边界
 
 启动前一次性检查二进制身份、配置 SHA、端口、TLS、数据目录、运行目录、日志目录、挂载目录、FUSE 设备、`fusermount3`/`umount`、旧 PID、旧 UDS、旧挂载和磁盘余量。遇到环境阻塞时保存证据并停止受影响项，不把环境修补混入产品结论。

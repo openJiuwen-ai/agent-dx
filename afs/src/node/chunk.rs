@@ -1626,6 +1626,40 @@ impl PinnedChunkReader {
             self.read_work.as_ref(),
         )
     }
+
+    /// Verify the pinned file once, scatter the requested ranges and return
+    /// each range's BLAKE3 digest from the same scan.
+    pub(crate) fn read_ranges_at_uncommitted_with_checksums(
+        &self,
+        ranges: &[VerifiedRangeCopy],
+        out: &mut [u8],
+    ) -> Result<(Vec<usize>, Vec<[u8; 32]>)> {
+        let mut checksums = Vec::with_capacity(ranges.len());
+        let counts = verified_ranges_with_checksums_into(
+            &self.file,
+            &self.chunk,
+            ranges,
+            out,
+            false,
+            Some(&mut checksums),
+        )?;
+        Ok((counts, checksums))
+    }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static VERIFIED_SCAN_COUNT_FOR_TEST: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_verified_scan_count_for_test() {
+    VERIFIED_SCAN_COUNT_FOR_TEST.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn verified_scan_count_for_test() -> usize {
+    VERIFIED_SCAN_COUNT_FOR_TEST.with(std::cell::Cell::get)
 }
 
 #[cfg(unix)]
@@ -4243,6 +4277,69 @@ impl LocalChunkStore {
         })
     }
 
+    /// Verify one immutable Chunk while scattering all requested ranges into
+    /// an uncommitted output buffer. The output may be partially written when
+    /// this returns an error; callers must not publish it on failure.
+    pub(crate) fn read_ranges_at_uncommitted(
+        &self,
+        chunk_id: &ChunkId,
+        ranges: &[VerifiedRangeCopy],
+        out: &mut [u8],
+    ) -> Result<Vec<usize>> {
+        self.open_unverified_reader(chunk_id)?
+            .read_ranges_at_uncommitted(ranges, out)
+            .inspect_err(|error| {
+                if verified_copy_is_invalid(error) {
+                    self.try_quarantine(chunk_id);
+                }
+            })
+    }
+
+    /// Read requested ranges and return each range's BLAKE3 digest from the
+    /// same verifying scan, so callers do not hash the bytes a second time.
+    pub(crate) fn read_ranges_at_uncommitted_with_checksums(
+        &self,
+        chunk_id: &ChunkId,
+        ranges: &[VerifiedRangeCopy],
+        out: &mut [u8],
+    ) -> Result<(Vec<usize>, Vec<[u8; 32]>)> {
+        self.open_unverified_reader(chunk_id)?
+            .read_ranges_at_uncommitted_with_checksums(ranges, out)
+            .inspect_err(|error| {
+                if verified_copy_is_invalid(error) {
+                    self.try_quarantine(chunk_id);
+                }
+            })
+    }
+
+    fn open_unverified_reader(&self, chunk_id: &ChunkId) -> Result<PinnedChunkReader> {
+        let record = self
+            .catalog
+            .lock()
+            .map_err(|_| invalid("local chunk catalog lock is poisoned"))?
+            .records
+            .get(chunk_id)
+            .cloned()
+            .ok_or_else(|| invalid(format!("local Chunk '{}' is not cataloged", chunk_id.0)))?;
+        if record.state != LocalChunkState::Durable {
+            return Err(corrupt(chunk_id, "local copy is quarantined"));
+        }
+        let path = self.path_for_record(&record)?;
+        let file = match File::open(path).map_err(Error::from) {
+            Ok(file) => file,
+            Err(error) => {
+                if verified_copy_is_invalid(&error) {
+                    self.try_quarantine(chunk_id);
+                }
+                return Err(error);
+            }
+        };
+        Ok(PinnedChunkReader {
+            file,
+            chunk: record.chunk,
+        })
+    }
+
     #[cfg(any(all(feature = "dfs", feature = "rdma"), test))]
     fn reserve_peer_read_payload_inner(&self, bytes: usize) -> Result<PeerReadReservation> {
         self.reserve_peer_read_payload_until(bytes, Instant::now())
@@ -5707,7 +5804,19 @@ fn verified_ranges_into(
     force_scan: bool,
     metrics: Option<&super::read_work::ReadWorkMetrics>,
 ) -> Result<Vec<usize>> {
-    verified_ranges_into_building(file, chunk, ranges, out, force_scan, metrics, None)
+    verified_ranges_into_building(file, chunk, ranges, out, force_scan, metrics, None, None)
+        .map(|(counts, _)| counts)
+}
+
+fn verified_ranges_with_checksums_into(
+    file: &File,
+    chunk: &ChunkObject,
+    ranges: &[VerifiedRangeCopy],
+    out: &mut [u8],
+    force_scan: bool,
+    checksums: Option<&mut Vec<[u8; 32]>>,
+) -> Result<Vec<usize>> {
+    verified_ranges_into_building(file, chunk, ranges, out, force_scan, None, None, checksums)
         .map(|(counts, _)| counts)
 }
 
@@ -5719,10 +5828,20 @@ fn verified_ranges_into_building(
     force_scan: bool,
     metrics: Option<&super::read_work::ReadWorkMetrics>,
     mut builder: Option<OutboardBuilder>,
+    checksums: Option<&mut Vec<[u8; 32]>>,
 ) -> Result<(Vec<usize>, Option<SharedOutboard>)> {
     let mut counts = Vec::with_capacity(ranges.len());
     let mut active = Vec::new();
-    for range in ranges.iter().copied() {
+    let mut range_hashers = checksums.as_ref().map(|_| {
+        ranges
+            .iter()
+            .map(|range| {
+                let whole_chunk = range.chunk_offset == 0 && range.length as u64 == chunk.length;
+                (!whole_chunk).then(blake3::Hasher::new)
+            })
+            .collect::<Vec<_>>()
+    });
+    for (index, range) in ranges.iter().copied().enumerate() {
         let allowed = if range.chunk_offset >= chunk.length || range.length == 0 {
             0
         } else {
@@ -5738,10 +5857,11 @@ fn verified_ranges_into_building(
         }
         counts.push(allowed);
         if allowed != 0 {
-            active.push((range, allowed));
+            active.push((index, range, allowed));
         }
     }
     if active.is_empty() && !force_scan {
+        finalize_range_hashers(range_hashers, checksums, chunk.content_digest.bytes);
         return Ok((counts, None));
     }
     if file.metadata().map_err(Error::from)?.len() != chunk.length {
@@ -5751,6 +5871,8 @@ fn verified_ranges_into_building(
     let mut scratch = [0; 64 * 1024];
     let mut hasher = blake3::Hasher::new();
     let mut position = 0;
+    #[cfg(test)]
+    VERIFIED_SCAN_COUNT_FOR_TEST.with(|count| count.set(count.get().saturating_add(1)));
     while position < chunk.length {
         let limit = (chunk.length - position).min(scratch.len() as u64) as usize;
         let count = read_positioned(file, position, &mut scratch[..limit])?;
@@ -5768,21 +5890,25 @@ fn verified_ranges_into_building(
         #[cfg(test)]
         VERIFIED_SCAN_BYTES.with(|bytes| bytes.set(bytes.get() + count as u64));
         let next = position + count as u64;
-        for (range, allowed) in &active {
+        for (index, range, allowed) in &active {
             let range_end = range.chunk_offset + *allowed as u64;
             let overlap_start = position.max(range.chunk_offset);
             let overlap_end = next.min(range_end);
             if overlap_start < overlap_end {
+                let source_start = (overlap_start - position) as usize;
+                let source_end = (overlap_end - position) as usize;
                 let output_start =
                     range.output_offset + (overlap_start - range.chunk_offset) as usize;
                 let output_end = range.output_offset + (overlap_end - range.chunk_offset) as usize;
                 if let Some(work) = &mut work {
                     work.copied += (output_end - output_start) as u64;
                 }
-                out[output_start..output_end].copy_from_slice(
-                    &scratch
-                        [(overlap_start - position) as usize..(overlap_end - position) as usize],
-                );
+                out[output_start..output_end].copy_from_slice(&scratch[source_start..source_end]);
+                if let Some(hashers) = range_hashers.as_mut()
+                    && let Some(hasher) = hashers[*index].as_mut()
+                {
+                    hasher.update(&scratch[source_start..source_end]);
+                }
             }
         }
         position = next;
@@ -5809,7 +5935,21 @@ fn verified_ranges_into_building(
     if actual != chunk.content_digest {
         return Err(corrupt(&chunk.id, "digest mismatch"));
     }
+    finalize_range_hashers(range_hashers, checksums, chunk.content_digest.bytes);
     Ok((counts, proof))
+}
+
+fn finalize_range_hashers(
+    hashers: Option<Vec<Option<blake3::Hasher>>>,
+    checksums: Option<&mut Vec<[u8; 32]>>,
+    whole_chunk_digest: [u8; 32],
+) {
+    if let (Some(hashers), Some(checksums)) = (hashers, checksums) {
+        checksums.clear();
+        checksums.extend(hashers.into_iter().map(|hasher| {
+            hasher.map_or(whole_chunk_digest, |hasher| *hasher.finalize().as_bytes())
+        }));
+    }
 }
 
 fn digest(bytes: &[u8]) -> ContentDigest {
@@ -10296,6 +10436,121 @@ mod replica_replay_tests {
             afs_error::NODE_TRANSFER_CORRUPT_DATA
         );
         assert_eq!(out, [9; 19]);
+    }
+
+    #[test]
+    fn checksummed_range_reads_hash_each_range_in_one_scan() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+        let bytes: Vec<_> = (0..300_000).map(|index| (index % 251) as u8).collect();
+        let staged = StagedChunk::new(OperationId::new("range-checksums"), bytes.clone());
+        store.put(staged.clone()).unwrap();
+        let ranges = [
+            VerifiedRangeCopy {
+                chunk_offset: 100_000,
+                length: 50_000,
+                output_offset: 0,
+            },
+            VerifiedRangeCopy {
+                chunk_offset: 0,
+                length: 200,
+                output_offset: 50_000,
+            },
+            VerifiedRangeCopy {
+                chunk_offset: 90_000,
+                length: 20_000,
+                output_offset: 50_200,
+            },
+            VerifiedRangeCopy {
+                chunk_offset: 300_000,
+                length: 10,
+                output_offset: 70_200,
+            },
+            VerifiedRangeCopy {
+                chunk_offset: 0,
+                length: 0,
+                output_offset: 70_200,
+            },
+        ];
+        let mut out = vec![9; 70_200];
+        reset_verified_scan_count_for_test();
+        let (counts, checksums) = store
+            .read_ranges_at_uncommitted_with_checksums(&staged.chunk.id, &ranges, &mut out)
+            .unwrap();
+        assert_eq!(verified_scan_count_for_test(), 1);
+        assert_eq!(counts, vec![50_000, 200, 20_000, 0, 0]);
+        assert_eq!(&out[..50_000], &bytes[100_000..150_000]);
+        assert_eq!(&out[50_000..50_200], &bytes[..200]);
+        assert_eq!(&out[50_200..], &bytes[90_000..110_000]);
+        assert_eq!(checksums.len(), ranges.len());
+        assert_eq!(
+            checksums[0],
+            *blake3::hash(&bytes[100_000..150_000]).as_bytes()
+        );
+        assert_eq!(checksums[1], *blake3::hash(&bytes[..200]).as_bytes());
+        assert_eq!(
+            checksums[2],
+            *blake3::hash(&bytes[90_000..110_000]).as_bytes()
+        );
+        assert_eq!(checksums[3], *blake3::hash(&[]).as_bytes());
+        assert_eq!(checksums[4], *blake3::hash(&[]).as_bytes());
+    }
+
+    #[test]
+    fn whole_chunk_ranges_reuse_the_verified_content_digest() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+        let bytes: Vec<_> = (0..140_000).map(|index| (index % 251) as u8).collect();
+        let staged = StagedChunk::new(OperationId::new("whole-chunk-digest"), bytes.clone());
+        store.put(staged.clone()).unwrap();
+        let ranges = [
+            VerifiedRangeCopy {
+                chunk_offset: 0,
+                length: 140_000,
+                output_offset: 0,
+            },
+            VerifiedRangeCopy {
+                chunk_offset: 0,
+                length: 70_000,
+                output_offset: 140_000,
+            },
+        ];
+        let mut out = vec![9; 210_000];
+        reset_verified_scan_count_for_test();
+        let (counts, checksums) = store
+            .read_ranges_at_uncommitted_with_checksums(&staged.chunk.id, &ranges, &mut out)
+            .unwrap();
+        assert_eq!(verified_scan_count_for_test(), 1);
+        assert_eq!(counts, vec![140_000, 70_000]);
+        assert_eq!(&out[..140_000], &bytes[..]);
+        assert_eq!(&out[140_000..], &bytes[..70_000]);
+        assert_eq!(checksums[0], staged.chunk.content_digest.bytes);
+        assert_eq!(checksums[1], *blake3::hash(&bytes[..70_000]).as_bytes());
+    }
+
+    #[test]
+    fn checksummed_range_reads_reject_damage_outside_the_ranges() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+        let bytes: Vec<_> = (0..140_000).map(|index| (index % 251) as u8).collect();
+        let staged = StagedChunk::new(OperationId::new("range-checksum-damage"), bytes.clone());
+        store.put(staged.clone()).unwrap();
+        let ranges = [VerifiedRangeCopy {
+            chunk_offset: 70_000,
+            length: 19,
+            output_offset: 0,
+        }];
+        let mut damaged = bytes;
+        damaged[139_999] ^= 1;
+        fs::write(temp.path().join("chunks").join(&staged.chunk.id.0), damaged).unwrap();
+        let mut out = [9; 19];
+        assert_eq!(
+            store
+                .read_ranges_at_uncommitted_with_checksums(&staged.chunk.id, &ranges, &mut out)
+                .unwrap_err()
+                .code(),
+            afs_error::NODE_TRANSFER_CORRUPT_DATA
+        );
     }
 
     #[test]

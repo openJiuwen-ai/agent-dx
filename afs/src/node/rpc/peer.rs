@@ -36,6 +36,10 @@ use crate::{
         },
     },
 };
+pub mod hixl;
+#[cfg(feature = "dfs")]
+mod prepared;
+
 #[cfg(any(feature = "ownerfs", feature = "dfs", feature = "rdma", test))]
 use std::sync::Arc;
 #[cfg(feature = "rdma")]
@@ -157,6 +161,22 @@ impl PeerRuntime {
         match self {
             Self::Existing(handle) => handle.block_on(future),
             Self::Owned(runtime) => runtime.block_on(future),
+        }
+    }
+
+    /// Runs a detached task only when an external runtime keeps polling it. An
+    /// owned current-thread runtime makes no progress outside `block_on`, so
+    /// callers keep their synchronous path in that case.
+    fn spawn_background<F>(&self, future: F) -> bool
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        match self {
+            Self::Existing(handle) => {
+                handle.spawn(future);
+                true
+            }
+            Self::Owned(_) => false,
         }
     }
 }
@@ -1207,6 +1227,9 @@ pub struct GrpcChunkTransfer {
     runtime: PeerRuntime,
     timeout: Duration,
     next_read: std::sync::atomic::AtomicU64,
+    move_metrics: Option<crate::node::dfs_read::DfsReadMoveMetrics>,
+    payload_metrics: Option<crate::node::dfs_read::DfsReadPayloadMetrics>,
+    group_bytes: Option<u64>,
 }
 
 #[cfg(feature = "dfs")]
@@ -1234,7 +1257,31 @@ impl GrpcChunkTransfer {
             next_read: std::sync::atomic::AtomicU64::new(1),
             open_read_peers,
             fast_open_ready: std::sync::Mutex::new(std::collections::HashSet::new()),
+            move_metrics: None,
+            payload_metrics: None,
+            group_bytes: None,
         })
+    }
+
+    /// Keeps the TCP control path on the same aggregated group budget as HIXL.
+    pub fn with_read_group(mut self, group_bytes: Option<u64>) -> Self {
+        self.group_bytes = group_bytes;
+        self
+    }
+
+    pub fn with_payload_metrics(
+        mut self,
+        metrics: crate::node::dfs_read::DfsReadPayloadMetrics,
+    ) -> Self {
+        self.payload_metrics = Some(metrics);
+        self
+    }
+
+    /// Attaches the shared payload-movement measurement handle. Without it the
+    /// transport keeps its previous behaviour and records no movement samples.
+    pub fn with_move_metrics(mut self, metrics: crate::node::dfs_read::DfsReadMoveMetrics) -> Self {
+        self.move_metrics = Some(metrics);
+        self
     }
 }
 
@@ -1266,7 +1313,10 @@ impl GrpcChunkTransfer {
                 chunk,
                 out.len(),
             )?,
-            None => batch.validate(out.len())?,
+            None => match self.group_bytes {
+                Some(group_bytes) => batch.validate_group(out.len(), group_bytes)?,
+                None => batch.validate(out.len())?,
+            },
         }
         let first = &batch.operations[0].source;
         self.remember_open_read(first)?;
@@ -1325,6 +1375,9 @@ impl GrpcChunkTransfer {
                 let mut client = DfsChunksClient::new(channel)
                     .max_encoding_message_size(self.peers.config.max_encoding_message_bytes)
                     .max_decoding_message_size(self.peers.config.max_decoding_message_bytes);
+                if let Some(metrics) = &self.payload_metrics {
+                    return prepared::read(&mut client, &request, out, self.timeout, metrics).await;
+                }
                 let mut rpc_request = request_with_current_context(request.clone());
                 rpc_request.set_timeout(timeout);
                 if let Some(metrics) = &self.peers.read_work_metrics {
@@ -1340,6 +1393,7 @@ impl GrpcChunkTransfer {
                     out,
                     response.into_inner(),
                     self.peers.read_work_metrics.as_ref(),
+                    self.move_metrics.as_ref(),
                     proof_budget,
                 )
                 .await
@@ -2715,6 +2769,10 @@ impl crate::node::dfs_read::ChunkTransfer for GrpcChunkTransfer {
         self.read_crc32c_impl(batch, chunk, out)
     }
 
+    fn transport(&self) -> &'static str {
+        "grpc"
+    }
+
     fn supports_verified_object_sink(&self) -> bool {
         self.stream_sink_supported()
     }
@@ -2916,12 +2974,29 @@ impl<'a> CompletedPeerObjectProof<'a> {
 }
 
 #[cfg(feature = "dfs")]
+struct GrpcMoveSample<'a> {
+    metrics: Option<&'a crate::node::dfs_read::DfsReadMoveMetrics>,
+    moved: std::time::Duration,
+    ok: bool,
+}
+
+#[cfg(feature = "dfs")]
+impl Drop for GrpcMoveSample<'_> {
+    fn drop(&mut self) {
+        if let Some(metrics) = self.metrics {
+            metrics.observe("grpc", if self.ok { "ok" } else { "error" }, self.moved);
+        }
+    }
+}
+
+#[cfg(feature = "dfs")]
 async fn consume_peer_read_stream<'a, S>(
     request: &DfsReadRangesRequest,
     chunk: Option<&'a ChunkObject>,
     out: &'a mut [u8],
     mut stream: S,
     metrics: Option<&ReadWorkMetrics>,
+    move_metrics: Option<&crate::node::dfs_read::DfsReadMoveMetrics>,
     proof_budget: Option<Arc<OutboardBudget>>,
 ) -> afs_error::Result<Option<VerifiedPeerChunk<'a>>>
 where
@@ -2936,7 +3011,17 @@ where
         None => ReadFrameDecoder::new(request),
     };
     decoder.work_metrics = metrics.cloned();
-    while let Some(frame) = stream.next().await {
+    let mut sample = GrpcMoveSample {
+        metrics: move_metrics,
+        moved: std::time::Duration::ZERO,
+        ok: false,
+    };
+    while let Some(frame) = {
+        let started = std::time::Instant::now();
+        let next = stream.next().await;
+        sample.moved += started.elapsed();
+        next
+    } {
         let frame = frame.map_err(afs_transport::grpc::error_status::status_to_error)?;
         let copied = match &frame.body {
             Some(dfs_read_ranges_frame::Body::Data(bytes)) => bytes.len() as u64,
@@ -2948,14 +3033,16 @@ where
         }
     }
     // EOF, including a possible late gRPC Status, precedes proof creation.
-    match chunk {
+    let result = match chunk {
         Some(chunk) => {
             let body: &'a [u8] = out;
             let proof = decoder.finish_object(body)?;
             VerifiedPeerChunk::from_completed_stream(chunk, body, proof).map(Some)
         }
         None => decoder.finish().map(|()| None),
-    }
+    };
+    sample.ok = result.is_ok();
+    result
 }
 
 #[cfg(feature = "dfs")]
@@ -2969,6 +3056,7 @@ struct ReadFrameDecoder<'a> {
     producer_outboard_installed: bool,
     root_mode: PeerRootMode,
     work_metrics: Option<ReadWorkMetrics>,
+    deferred: Option<Vec<afs_protocol::node_data::DfsReadRangesCompletion>>,
 }
 
 #[cfg(feature = "dfs")]
@@ -3033,7 +3121,36 @@ impl<'a> ReadFrameDecoder<'a> {
             producer_outboard_installed: false,
             root_mode: PeerRootMode::Producer,
             work_metrics: None,
+            deferred: None,
         }
+    }
+
+    fn prepared(request: &'a DfsReadRangesRequest) -> Self {
+        let mut decoder = Self::new(request);
+        decoder.deferred = Some(Vec::with_capacity(request.operations.len()));
+        decoder
+    }
+
+    fn finish_prepared(mut self, out: &[u8]) -> afs_error::Result<()> {
+        let completions = self
+            .deferred
+            .take()
+            .ok_or_else(|| dfs_protocol_error("decoder is not prepared"))?;
+        for completion in completions {
+            let op = &self.request.operations[completion.operation_index as usize];
+            let start = usize::try_from(op.destination_offset)
+                .map_err(|_| dfs_protocol_error("destination overflow"))?;
+            let length =
+                usize::try_from(op.length).map_err(|_| dfs_protocol_error("length overflow"))?;
+            let bytes = start
+                .checked_add(length)
+                .and_then(|end| out.get(start..end))
+                .ok_or_else(|| dfs_protocol_error("prepared range exceeds private buffer"))?;
+            if blake3::hash(bytes).as_bytes().as_slice() != completion.range_checksum {
+                return Err(dfs_corrupt_error("prepared payload checksum mismatch"));
+            }
+        }
+        self.finish()
     }
 
     fn for_object(
@@ -3265,7 +3382,8 @@ impl<'a> ReadFrameDecoder<'a> {
                     start,
                     end,
                     cursor: start,
-                    checksum: (!self.producer_root_pending
+                    checksum: (self.deferred.is_none()
+                        && !self.producer_root_pending
                         && self.root_mode == PeerRootMode::Producer)
                         .then(blake3::Hasher::new),
                 });
@@ -3292,41 +3410,52 @@ impl<'a> ReadFrameDecoder<'a> {
                         "peer read completion identity/length mismatch",
                     ));
                 }
-                let digest =
-                    if self.producer_root_pending {
-                        blake3::Hash::from(
-                            <[u8; 32]>::try_from(completion.range_checksum.as_slice()).map_err(
-                                |_| dfs_corrupt_error("peer read completion checksum mismatch"),
-                            )?,
-                        )
-                    } else if self.root_mode == PeerRootMode::ConsumerTree {
-                        let object = self.verified_object.as_mut().ok_or_else(|| {
-                            dfs_protocol_error("consumer tree lacks trusted object")
-                        })?;
-                        let root = object.finish_outboard(observation)?.ok_or_else(|| {
-                            dfs_protocol_error("consumer tree root was not completed")
-                        })?;
-                        blake3::Hash::from(root)
-                    } else {
-                        let checksum = active.checksum.as_ref().ok_or_else(|| {
-                            dfs_protocol_error("Peer consumer root state is missing")
-                        })?;
+                let digest = if self.deferred.is_some() {
+                    None
+                } else if self.producer_root_pending {
+                    Some(blake3::Hash::from(
+                        <[u8; 32]>::try_from(completion.range_checksum.as_slice()).map_err(
+                            |_| dfs_corrupt_error("peer read completion checksum mismatch"),
+                        )?,
+                    ))
+                } else if self.root_mode == PeerRootMode::ConsumerTree {
+                    let object = self
+                        .verified_object
+                        .as_mut()
+                        .ok_or_else(|| dfs_protocol_error("consumer tree lacks trusted object"))?;
+                    let root = object
+                        .finish_outboard(observation)?
+                        .ok_or_else(|| dfs_protocol_error("consumer tree root was not completed"))?;
+                    Some(blake3::Hash::from(root))
+                } else {
+                    let checksum = active
+                        .checksum
+                        .as_ref()
+                        .ok_or_else(|| dfs_protocol_error("Peer consumer root state is missing"))?;
+                    Some(
                         observation.measure(ReadDiagnosticConsumerStage::RootBlake3, 0, || {
                             checksum.finalize()
-                        })
-                    };
-                if completion.range_checksum.as_slice() != digest.as_bytes() {
-                    return Err(dfs_corrupt_error("peer read completion checksum mismatch"));
-                }
-                if let Some(object) = &mut self.verified_object {
-                    if !self.producer_root_pending && digest.as_bytes() != &object.expected_root {
-                        return Err(dfs_corrupt_error(
-                            "peer read object differs from trusted Meta root",
-                        ));
+                        }),
+                    )
+                };
+                if let Some(digest) = digest {
+                    if completion.range_checksum.as_slice() != digest.as_bytes() {
+                        return Err(dfs_corrupt_error("peer read completion checksum mismatch"));
                     }
-                    object.actual_root = Some(*digest.as_bytes());
+                    if let Some(object) = &mut self.verified_object {
+                        if !self.producer_root_pending && digest.as_bytes() != &object.expected_root
+                        {
+                            return Err(dfs_corrupt_error(
+                                "peer read object differs from trusted Meta root",
+                            ));
+                        }
+                        object.actual_root = Some(*digest.as_bytes());
+                    }
                 }
                 self.completed[active.index] = true;
+                if let Some(completions) = &mut self.deferred {
+                    completions.push(completion);
+                }
             }
             None => return Err(dfs_protocol_error("empty peer frame")),
         }
@@ -3524,6 +3653,10 @@ impl crate::node::dfs_read::ChunkTransfer for RdmaChunkTransfer {
         future: crate::node::read_pipeline::ReadFuture<'_, ()>,
     ) -> afs_error::Result<()> {
         self.runtime.block_on(future)
+    }
+
+    fn transport(&self) -> &'static str {
+        "rdma"
     }
 
     fn verification_metrics(&self) -> Option<&ReadWorkMetrics> {
@@ -3805,11 +3938,23 @@ fn validate_dfs_rdma_read_reply(
 }
 
 #[cfg(feature = "dfs")]
+fn grpc_with_move_metrics(
+    transfer: GrpcChunkTransfer,
+    metrics: Option<crate::node::dfs_read::DfsReadMoveMetrics>,
+) -> GrpcChunkTransfer {
+    match metrics {
+        Some(metrics) => transfer.with_move_metrics(metrics),
+        None => transfer,
+    }
+}
+
+#[cfg(feature = "dfs")]
 pub fn make_chunk_transfer(
     mode: DataMode,
     peers: Arc<PeerConnectionPool>,
     timeout: Duration,
     rdma: Option<Arc<DfsRdmaPool>>,
+    move_metrics: Option<crate::node::dfs_read::DfsReadMoveMetrics>,
 ) -> afs_error::Result<Arc<dyn crate::node::dfs_read::ChunkTransfer>> {
     match mode {
         DataMode::Rdma => Ok(Arc::new(RdmaChunkTransfer::new(
@@ -3821,10 +3966,16 @@ pub fn make_chunk_transfer(
                     rdma, peers, timeout,
                 )?))
             } else {
-                Ok(Arc::new(GrpcChunkTransfer::new(peers, timeout)?))
+                Ok(Arc::new(grpc_with_move_metrics(
+                    GrpcChunkTransfer::new(peers, timeout)?,
+                    move_metrics,
+                )))
             }
         }
-        DataMode::Grpc => Ok(Arc::new(GrpcChunkTransfer::new(peers, timeout)?)),
+        DataMode::Grpc => Ok(Arc::new(grpc_with_move_metrics(
+            GrpcChunkTransfer::new(peers, timeout)?,
+            move_metrics,
+        ))),
     }
 }
 
@@ -9496,7 +9647,7 @@ mod tests {
                 .unwrap()
                 .into_inner();
             let mut output = vec![0; payload.len()];
-            consume_peer_read_stream(&request, None, &mut output, stream, None, None)
+            consume_peer_read_stream(&request, None, &mut output, stream, None, None, None)
                 .await
                 .unwrap();
             assert_eq!(output, payload);
@@ -9969,6 +10120,7 @@ mod tests {
             &mut out,
             tokio_stream::iter(frames.into_iter().map(Ok)),
             Some(&metrics),
+            None,
             Some(budget.clone()),
         )
         .await
@@ -10056,6 +10208,7 @@ mod tests {
                     &mut private,
                     tokio_stream::iter(stream),
                     None,
+                    None,
                     Some(budget.clone()),
                 )
                 .await
@@ -10086,6 +10239,7 @@ mod tests {
             &mut out,
             tokio_stream::iter(frames.into_iter().map(Ok)),
             Some(&metrics),
+            None,
             None,
         )
         .await
@@ -10120,6 +10274,7 @@ mod tests {
             tokio_stream::iter(frames.into_iter().map(Ok)),
             None,
             None,
+            None,
         )
         .await
         .unwrap_err();
@@ -10146,6 +10301,7 @@ mod tests {
                     Some(&chunk),
                     &mut out,
                     tokio_stream::iter(stream),
+                    None,
                     None,
                     None,
                 )
@@ -10250,6 +10406,21 @@ mod tests {
             );
             assert_eq!(LegacyFrame::decode(new_wire.as_slice()).unwrap(), legacy);
         }
+    }
+
+    #[cfg(feature = "dfs")]
+    #[test]
+    fn prepared_decoder_defers_hashing_but_rejects_corrupt_private_payload() {
+        let request = range_request();
+        let mut out = vec![0; 32];
+        let mut decoder = ReadFrameDecoder::prepared(&request);
+        for mut frame in (0..2).flat_map(|index| range_frames(&request, index)) {
+            if let Some(dfs_read_ranges_frame::Body::Data(bytes)) = frame.body.as_mut() {
+                bytes[0] ^= 1;
+            }
+            decoder.accept(frame, &mut out).unwrap();
+        }
+        assert!(decoder.finish_prepared(&out).is_err());
     }
 
     #[cfg(feature = "dfs")]
@@ -10548,7 +10719,8 @@ mod tests {
         );
 
         let _transfer =
-            make_chunk_transfer(DataMode::Auto, peers, Duration::from_millis(10), None).unwrap();
+            make_chunk_transfer(DataMode::Auto, peers, Duration::from_millis(10), None, None)
+                .unwrap();
         assert!(
             make_chunk_transfer(
                 DataMode::Rdma,
@@ -10561,6 +10733,7 @@ mod tests {
                     .unwrap()
                 ),
                 Duration::from_millis(10),
+                None,
                 None
             )
             .is_err()

@@ -39,11 +39,21 @@ use afs_protocol::node_data::{
     node_data_server::{NodeData, NodeDataServer},
 };
 #[cfg(feature = "dfs")]
+pub mod hixl;
+#[cfg(feature = "dfs")]
+pub mod prepared;
+
+#[cfg(feature = "dfs")]
 use afs_protocol::node_data::{
-    DfsCloseRdmaReply, DfsCloseRdmaRequest, DfsConfirmReplicaRequest, DfsNegotiateRdmaReply,
-    DfsNegotiateRdmaRequest, DfsPutReplicaFrame, DfsPutReplicaRdmaRequest, DfsPutReplicaReply,
-    DfsReadRangesCompletion, DfsReadRangesFrame, DfsReadRangesHeader, DfsReadRangesRdmaReply,
-    DfsReadRangesRdmaRequest, DfsReadRangesRequest, DfsReplicaAck,
+    DfsCloseHixlReply, DfsCloseHixlRequest, DfsCloseRdmaReply, DfsCloseRdmaRequest,
+    DfsConfirmReplicaRequest, DfsFetchPreparedReadRequest, DfsNegotiateHixlReply,
+    DfsNegotiateHixlRequest, DfsNegotiateRdmaReply, DfsNegotiateRdmaRequest,
+    DfsPrepareReadRangesHixlGroupReply, DfsPrepareReadRangesHixlGroupRequest,
+    DfsPrepareReadRangesHixlReply, DfsPrepareReadRangesHixlRequest, DfsPreparedReadReply,
+    DfsPutReplicaFrame, DfsPutReplicaRdmaRequest, DfsPutReplicaReply, DfsReadRangesCompletion,
+    DfsReadRangesFrame, DfsReadRangesHeader, DfsReadRangesRdmaReply, DfsReadRangesRdmaRequest,
+    DfsReadRangesRequest, DfsReleaseHixlReadReply, DfsReleaseHixlReadRequest,
+    DfsReleasePreparedReadReply, DfsReleasePreparedReadRequest, DfsReplicaAck,
     dfs_chunks_server::{DfsChunks, DfsChunksServer},
     dfs_read_ranges_frame,
 };
@@ -53,14 +63,17 @@ use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
 
 #[cfg(feature = "dfs")]
-use crate::node::{
-    chunk::LocalChunkStore,
-    dfs_read::{MAX_DFS_READ_BYTES, MAX_DFS_READ_OPS},
-};
+use crate::node::chunk::LocalChunkStore;
+#[cfg(all(feature = "dfs", test))]
+use crate::node::dfs_read::MAX_DFS_GROUP_BYTES;
 use crate::node::{
     rpc::control::RdmaSessionRegistry,
     storage::{MAX_TRANSFER_BYTES, Storage, StorageError},
 };
+#[cfg(all(feature = "dfs", test))]
+use prepared::packed_dfs_read_length;
+#[cfg(all(feature = "dfs", any(test, feature = "rdma")))]
+use prepared::{read_packed_dfs_ranges, validate_packed_dfs_read};
 
 #[cfg(feature = "dfs")]
 use afs_protocol::node_data::{
@@ -515,6 +528,7 @@ pub struct DfsChunkTransportResources {
     pub read_pipeline: crate::node::read_pipeline::ReadPipelineLimits,
     pub rdma_sessions: super::control::RdmaSessionRegistry,
     pub payload_metrics: Option<DfsPayloadMetrics>,
+    pub hixl: Option<Arc<hixl::HixlReadService>>,
 }
 
 // Existing constructors remain wrappers passing a disabled registry and no
@@ -536,6 +550,8 @@ pub struct DfsChunksService {
     replica_timeout: std::time::Duration,
     rdma_sessions: super::control::RdmaSessionRegistry,
     payload_metrics: Option<DfsPayloadMetrics>,
+    hixl: Option<Arc<hixl::HixlReadService>>,
+    prepared_reads: Arc<prepared::PreparedReadRegistry>,
 }
 
 /// Verifies grant authenticity, caller epoch, namespace/version/layout membership
@@ -886,6 +902,7 @@ pub fn make_dfs_chunks_server_with_replication(
             read_pipeline: Default::default(),
             rdma_sessions: super::control::RdmaSessionRegistry::new(None),
             payload_metrics: None,
+            hixl: None,
         },
     )
 }
@@ -916,6 +933,8 @@ pub fn make_dfs_chunks_server_with_transport(
         replica_timeout,
         rdma_sessions: resources.rdma_sessions,
         payload_metrics: resources.payload_metrics,
+        hixl: resources.hixl,
+        prepared_reads: Arc::new(prepared::PreparedReadRegistry::new()),
     })
 }
 
@@ -937,6 +956,29 @@ impl DfsChunks for DfsChunksService {
 
     type ReadRangesStream =
         Pin<Box<dyn Stream<Item = Result<DfsReadRangesFrame, Status>> + Send + 'static>>;
+    type FetchPreparedReadStream =
+        Pin<Box<dyn Stream<Item = Result<DfsReadRangesFrame, Status>> + Send + 'static>>;
+
+    async fn prepare_read_ranges(
+        &self,
+        request: Request<DfsReadRangesRequest>,
+    ) -> Result<Response<DfsPreparedReadReply>, Status> {
+        self.prepare_prepared_read(request).await
+    }
+
+    async fn fetch_prepared_read(
+        &self,
+        request: Request<DfsFetchPreparedReadRequest>,
+    ) -> Result<Response<Self::FetchPreparedReadStream>, Status> {
+        self.fetch_prepared_read_snapshot(request).await
+    }
+
+    async fn release_prepared_read(
+        &self,
+        request: Request<DfsReleasePreparedReadRequest>,
+    ) -> Result<Response<DfsReleasePreparedReadReply>, Status> {
+        self.release_prepared_read_snapshot(request).await
+    }
 
     async fn put_replica_stream(
         &self,
@@ -1296,15 +1338,15 @@ impl DfsChunks for DfsChunksService {
                 self.replica_timeout,
                 tokio::task::spawn_blocking(move || {
                     let _permit = permit;
-                    let packed = read_packed_dfs_ranges(&local, &read, length)?;
+                    let (bytes, completions) = read_packed_dfs_ranges(&local, &read, length)?;
                     validate_dfs_read_request(&read)?;
                     let mut endpoint = session.endpoint.blocking_lock();
                     if session.poisoned.load(std::sync::atomic::Ordering::SeqCst) {
                         return Err(Status::permission_denied("RDMA session is poisoned"));
                     }
-                    endpoint.put_local(&packed.bytes).map_err(rdma_status)?;
+                    endpoint.put_local(&bytes).map_err(rdma_status)?;
                     endpoint
-                        .transfer_write(packed.bytes.len())
+                        .transfer_write(bytes.len())
                         .map_err(|error| {
                             session
                                 .poisoned
@@ -1317,7 +1359,7 @@ impl DfsChunks for DfsChunksService {
                     Ok::<_, Status>(DfsReadRangesRdmaReply {
                         read_id: read.read_id,
                         attempt_id: read.attempt_id,
-                        completions: packed.completions,
+                        completions,
                         transferred_bytes: length as u64,
                     })
                 }),
@@ -1481,6 +1523,67 @@ impl DfsChunks for DfsChunksService {
             tokio_stream::wrappers::ReceiverStream::new(receiver),
         )))
     }
+
+    async fn negotiate_hixl(
+        &self,
+        request: Request<DfsNegotiateHixlRequest>,
+    ) -> Result<Response<DfsNegotiateHixlReply>, Status> {
+        let peer = authenticate_peer(self.authenticator.as_ref(), &request)?;
+        let service = self.hixl.clone().ok_or_else(hixl::unsupported_status)?;
+        service
+            .negotiate(peer, request.into_inner(), self.authorizer.clone())
+            .await
+    }
+
+    async fn prepare_read_ranges_hixl(
+        &self,
+        request: Request<DfsPrepareReadRangesHixlRequest>,
+    ) -> Result<Response<DfsPrepareReadRangesHixlReply>, Status> {
+        let peer = authenticate_peer(self.authenticator.as_ref(), &request)?;
+        let service = self.hixl.clone().ok_or_else(hixl::unsupported_status)?;
+        service
+            .prepare(
+                peer,
+                request.into_inner(),
+                self.authorizer.clone(),
+                self.local_chunks.clone(),
+            )
+            .await
+    }
+
+    async fn prepare_read_ranges_hixl_group(
+        &self,
+        request: Request<DfsPrepareReadRangesHixlGroupRequest>,
+    ) -> Result<Response<DfsPrepareReadRangesHixlGroupReply>, Status> {
+        let peer = authenticate_peer(self.authenticator.as_ref(), &request)?;
+        let service = self.hixl.clone().ok_or_else(hixl::unsupported_status)?;
+        service
+            .prepare_group(
+                peer,
+                request.into_inner(),
+                self.authorizer.clone(),
+                self.local_chunks.clone(),
+            )
+            .await
+    }
+
+    async fn release_hixl_read(
+        &self,
+        request: Request<DfsReleaseHixlReadRequest>,
+    ) -> Result<Response<DfsReleaseHixlReadReply>, Status> {
+        let peer = authenticate_peer(self.authenticator.as_ref(), &request)?;
+        let service = self.hixl.clone().ok_or_else(hixl::unsupported_status)?;
+        service.release(peer, request.into_inner()).await
+    }
+
+    async fn close_hixl(
+        &self,
+        request: Request<DfsCloseHixlRequest>,
+    ) -> Result<Response<DfsCloseHixlReply>, Status> {
+        let peer = authenticate_peer(self.authenticator.as_ref(), &request)?;
+        let service = self.hixl.clone().ok_or_else(hixl::unsupported_status)?;
+        service.close(peer, request.into_inner()).await
+    }
 }
 
 #[tonic::async_trait]
@@ -1608,7 +1711,7 @@ fn validate_dfs_read_request(request: &DfsReadRangesRequest) -> Result<(), Statu
         || request.file_version_id.is_empty()
         || request.layout_root_id.is_empty()
         || request.operations.is_empty()
-        || request.operations.len() > MAX_DFS_READ_OPS
+        || request.operations.len() > crate::node::dfs_read::MAX_DFS_GROUP_OPS
     {
         return Err(coded_status(
             afs_error::NODE_TRANSFER_INVALID,
@@ -1650,7 +1753,7 @@ fn validate_dfs_read_request(request: &DfsReadRangesRequest) -> Result<(), Statu
         }
         total = total
             .checked_add(op.length)
-            .filter(|total| *total <= MAX_DFS_READ_BYTES)
+            .filter(|total| *total <= crate::node::dfs_read::MAX_DFS_GROUP_BYTES)
             .ok_or_else(|| {
                 coded_status(
                     afs_error::NODE_TRANSFER_INVALID,
@@ -4443,23 +4546,6 @@ fn dfs_read_caller_epoch(peer: &str, request: &DfsReadRangesRequest) -> Result<u
     Ok(epoch)
 }
 
-#[cfg(all(feature = "dfs", any(feature = "rdma", test)))]
-fn validate_packed_dfs_read(request: &DfsReadRangesRequest) -> Result<usize, Status> {
-    let mut length = 0_u64;
-    for op in &request.operations {
-        if op.destination_offset != length {
-            return Err(Status::invalid_argument(
-                "RDMA read windows must be tightly packed",
-            ));
-        }
-        length = length
-            .checked_add(op.length)
-            .filter(|length| *length <= crate::node::chunk::MAX_STAGED_CHUNK_BYTES as u64)
-            .ok_or_else(|| Status::invalid_argument("RDMA read exceeds registered capacity"))?;
-    }
-    Ok(length as usize)
-}
-
 #[cfg(all(feature = "dfs", feature = "rdma"))]
 struct DfsServerRdmaGuard {
     session: Arc<super::control::RdmaSession>,
@@ -4514,89 +4600,30 @@ fn persist_dfs_replica(
     Ok(acks)
 }
 
-#[cfg(all(feature = "dfs", feature = "rdma"))]
-#[derive(Debug)]
-struct PackedDfsRead {
-    // Struct fields drop in declaration order: release the actual payload before
-    // returning its shared reservation, including early errors during transfer.
-    bytes: Vec<u8>,
-    completions: Vec<DfsReadRangesCompletion>,
-    _reservation: crate::node::chunk::PeerReadReservation,
-}
-
-#[cfg(all(feature = "dfs", feature = "rdma"))]
-fn read_packed_dfs_ranges(
-    local: &LocalChunkStore,
-    request: &DfsReadRangesRequest,
-    length: usize,
-) -> Result<PackedDfsRead, Status> {
-    // Packed RDMA bytes share the same pool as retained verified objects.
-    // The owner keeps them charged through DMA completion and payload release.
-    let mut reservation = local
-        .reserve_peer_read_payload(length)
-        .map_err(error_to_status)?;
-    let mut bytes = vec![0; length];
-    reservation
-        .retain_capacity(bytes.capacity())
-        .map_err(error_to_status)?;
-    let mut completions = Vec::with_capacity(request.operations.len());
-    for op in &request.operations {
-        let start = op.destination_offset as usize;
-        let end = start + op.length as usize;
-        let range = &mut bytes[start..end];
-        if local
-            .read_range_at_uncommitted(
-                &crate::dfs::ChunkId::new(op.chunk_id.clone()),
-                op.chunk_offset,
-                range,
-            )
-            .map_err(error_to_status)?
-            != range.len()
-        {
-            return Err(coded_status(
-                afs_error::NODE_TRANSFER_CORRUPT_DATA,
-                "immutable Chunk ended before RDMA range",
-            ));
-        }
-        let table = local
-            .peer_crc32c_table(&crate::dfs::ChunkId::new(op.chunk_id.clone()))
-            .map_err(error_to_status)?;
-        let (checksum, algorithm, descriptor) = if let Some(table) = table {
-            (
-                crate::node::chunk_crc32c::checksum(range)
-                    .to_le_bytes()
-                    .to_vec(),
-                afs_protocol::node_data::DfsDigestAlgorithm::Crc32c as i32,
-                serde_json::to_vec(&table).map_err(|error| Status::internal(error.to_string()))?,
-            )
-        } else {
-            (
-                blake3::hash(range).as_bytes().to_vec(),
-                afs_protocol::node_data::DfsDigestAlgorithm::Blake3 as i32,
-                Vec::new(),
-            )
-        };
-        completions.push(DfsReadRangesCompletion {
-            crc32c_table: descriptor,
-            read_id: request.read_id.clone(),
-            attempt_id: request.attempt_id.clone(),
-            operation_index: op.operation_index,
-            source_copy_id: op.source_copy_id.clone(),
-            transferred_bytes: op.length,
-            range_checksum: checksum,
-            range_checksum_algorithm: algorithm,
-        });
-    }
-    Ok(PackedDfsRead {
-        bytes,
-        completions,
-        _reservation: reservation,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "dfs")]
+    #[test]
+    fn packed_batch_budget_does_not_expand_native_rdma_window_capacity() {
+        let request = DfsReadRangesRequest {
+            operations: (0..2)
+                .map(|index| afs_protocol::node_data::DfsChunkReadOp {
+                    operation_index: index,
+                    length: 4 * 1024 * 1024,
+                    destination_offset: u64::from(index) * 4 * 1024 * 1024,
+                    ..afs_protocol::node_data::DfsChunkReadOp::default()
+                })
+                .collect(),
+            ..DfsReadRangesRequest::default()
+        };
+        assert_eq!(
+            packed_dfs_read_length(&request, 8 * 1024 * 1024).unwrap(),
+            8 * 1024 * 1024
+        );
+        assert!(validate_packed_dfs_read(&request).is_err());
+    }
     #[cfg(feature = "ownerfs")]
     use super::{make_owner_files_server, make_owner_files_server_with_handler};
     #[cfg(feature = "dfs")]
@@ -5918,6 +5945,7 @@ mod tests {
                 read_pipeline: Default::default(),
                 rdma_sessions: super::super::control::RdmaSessionRegistry::new(None),
                 payload_metrics: Some(metrics),
+                hixl: None,
             },
         );
         let target_server = tokio::spawn(async move {
@@ -6900,6 +6928,7 @@ mod tests {
                 read_pipeline: Default::default(),
                 rdma_sessions: rdma_registry.clone(),
                 payload_metrics: Some(metrics.clone()),
+                hixl: None,
             },
         );
         let server = tokio::spawn(async move {
@@ -7231,6 +7260,7 @@ mod tests {
                     server_rdma.then(|| device.clone()),
                 ),
                 payload_metrics: Some(metrics.clone()),
+                hixl: None,
             },
         );
         let server = tokio::spawn(async move {
@@ -7322,9 +7352,14 @@ mod tests {
             }],
         };
         if acks.is_none() {
-            let transfer =
-                make_chunk_transfer(mode, peers, std::time::Duration::from_secs(10), Some(pool))
-                    .unwrap();
+            let transfer = make_chunk_transfer(
+                mode,
+                peers,
+                std::time::Duration::from_secs(10),
+                Some(pool),
+                None,
+            )
+            .unwrap();
             let bytes = tokio::task::spawn_blocking(move || {
                 let mut bytes = vec![0; 75_000];
                 let error = transfer.read_ranges(&batch, &mut bytes).unwrap_err();
@@ -7356,9 +7391,14 @@ mod tests {
             server.abort();
             return;
         }
-        let transfer =
-            make_chunk_transfer(mode, peers, std::time::Duration::from_secs(10), Some(pool))
-                .unwrap();
+        let transfer = make_chunk_transfer(
+            mode,
+            peers,
+            std::time::Duration::from_secs(10),
+            Some(pool),
+            None,
+        )
+        .unwrap();
         let bytes = tokio::task::spawn_blocking(move || {
             let mut bytes = vec![0; 75_000];
             transfer.read_ranges(&batch, &mut bytes).unwrap();
@@ -7609,6 +7649,61 @@ mod tests {
 
     #[cfg(feature = "dfs")]
     #[test]
+    fn dfs_packed_ranges_group_and_verify_each_chunk_once_per_request() {
+        use crate::node::chunk::{StagedChunk, reset_verified_scan_count_for_test};
+
+        let temp = tempfile::tempdir().unwrap();
+        let local = LocalChunkStore::open(temp.path(), "node").unwrap();
+        let first = StagedChunk::new(
+            crate::dfs::OperationId::new("packed-first"),
+            (0..64).collect(),
+        );
+        let second = StagedChunk::new(
+            crate::dfs::OperationId::new("packed-second"),
+            (64..128).collect(),
+        );
+        local.put(first.clone()).unwrap();
+        local.put(second.clone()).unwrap();
+
+        let mut request = dfs_read_request(first.chunk.id.0.clone(), 3);
+        let mut first_op = request.operations.remove(0);
+        first_op.chunk_offset = 4;
+        first_op.destination_offset = 0;
+        first_op.length = 3;
+        let mut second_op = first_op.clone();
+        second_op.operation_index = 1;
+        second_op.chunk_offset = 20;
+        second_op.destination_offset = 3;
+        second_op.length = 2;
+        let mut third_op = first_op.clone();
+        third_op.operation_index = 2;
+        third_op.chunk_id = second.chunk.id.0.clone();
+        third_op.chunk_offset = 10;
+        third_op.destination_offset = 5;
+        request.operations = vec![first_op, second_op, third_op];
+
+        reset_verified_scan_count_for_test();
+        let (bytes, completions) = read_packed_dfs_ranges(&local, &request, 8).unwrap();
+        assert_eq!(bytes, [4, 5, 6, 20, 21, 74, 75, 76]);
+        assert_eq!(
+            completions
+                .iter()
+                .map(|completion| completion.range_checksum.clone())
+                .collect::<Vec<_>>(),
+            [
+                blake3::hash(&[4, 5, 6]).as_bytes().to_vec(),
+                blake3::hash(&[20, 21]).as_bytes().to_vec(),
+                blake3::hash(&[74, 75, 76]).as_bytes().to_vec(),
+            ]
+        );
+        assert_eq!(crate::node::chunk::verified_scan_count_for_test(), 2);
+
+        read_packed_dfs_ranges(&local, &request, 8).unwrap();
+        assert_eq!(crate::node::chunk::verified_scan_count_for_test(), 4);
+    }
+
+    #[cfg(feature = "dfs")]
+    #[test]
     fn p2_r4_corrupt_first_group_sends_no_unverified_data() {
         use crate::node::chunk::StagedChunk;
         let temp = tempfile::tempdir().unwrap();
@@ -7641,122 +7736,6 @@ mod tests {
     }
 
     #[cfg(feature = "dfs")]
-    #[test]
-    fn dfs_stream_whole_digest_reuse_preserves_wire_and_partial_hash_work() {
-        use crate::node::chunk::StagedChunk;
-        let temp = tempfile::tempdir().unwrap();
-        let registry = afs_metrics::Registry::new();
-        let metrics = crate::node::read_work::ReadWorkMetrics::register(&registry)
-            .unwrap()
-            .with_read_diagnostics(true);
-        let local = LocalChunkStore::open(temp.path(), "node")
-            .unwrap()
-            .with_read_work_metrics(metrics.clone());
-        let bytes: Vec<_> = (0..150_001).map(|n| (n % 251) as u8).collect();
-        let staged = StagedChunk::new(
-            crate::dfs::OperationId::new("stream-whole-proof"),
-            bytes.clone(),
-        );
-        local.put(staged.clone()).unwrap();
-        let hash_bytes = || {
-            afs_metrics::encode_text(&registry)
-                .unwrap()
-                .lines()
-                .find_map(|line| {
-                    line.strip_prefix("afs_dfs_read_hash_bytes_total{stage=\"stream_range_hash\"} ")
-                })
-                .unwrap()
-                .parse::<u64>()
-                .unwrap()
-        };
-        for (offset, length, want_proof) in [
-            (0, bytes.len(), false),
-            (0, bytes.len(), true),
-            (1, 75_000, false),
-            (1, 75_000, true),
-        ] {
-            let before = hash_bytes();
-            let mut request = dfs_read_request(staged.chunk.id.0.clone(), length as u64);
-            request.include_blake3_outboard = want_proof;
-            request.operations[0].chunk_offset = offset as u64;
-            let (sender, mut receiver) = tokio::sync::mpsc::channel(8);
-            std::thread::scope(|scope| {
-                let producer = scope.spawn(|| {
-                    let result = stream_dfs_ranges(&local, &request, &sender, None);
-                    drop(sender);
-                    result
-                });
-                let mut received = Vec::new();
-                let mut header_count = 0;
-                let mut completions = 0;
-                while let Some(frame) = receiver.blocking_recv() {
-                    match frame.unwrap().body.unwrap() {
-                        dfs_read_ranges_frame::Body::Header(header) => {
-                            header_count += 1;
-                            assert_eq!(header.chunk_offset, offset as u64);
-                            assert_eq!(header.length, length as u64);
-                            if want_proof && offset == 0 {
-                                assert!(!header.blake3_outboard.is_empty());
-                                crate::node::chunk::outboard::ChunkOutboard::validate_encoded_shape(
-                                &staged.chunk,
-                                &header.blake3_outboard,
-                            )
-                            .unwrap();
-                            } else {
-                                assert!(
-                                    header.blake3_outboard.is_empty(),
-                                    "ordinary/partial reads keep their original wire contract"
-                                );
-                            }
-                        }
-                        dfs_read_ranges_frame::Body::Data(data) => received.extend(data),
-                        dfs_read_ranges_frame::Body::Completion(completion) => {
-                            completions += 1;
-                            assert_eq!(completion.transferred_bytes, length as u64);
-                            assert_eq!(
-                                completion.range_checksum_algorithm,
-                                afs_protocol::node_data::DfsDigestAlgorithm::Blake3 as i32
-                            );
-                            assert_eq!(
-                                completion.range_checksum,
-                                blake3::hash(&received).as_bytes().to_vec()
-                            );
-                        }
-                    }
-                }
-                assert_eq!(header_count, 1);
-                assert_eq!(completions, 1);
-                assert_eq!(received, bytes[offset..offset + length]);
-                assert_eq!(
-                    hash_bytes() - before,
-                    if offset == 0 { 0 } else { length as u64 }
-                );
-                producer.join().unwrap().unwrap();
-            });
-        }
-        assert_eq!(dfs_reuse_scan_bytes(&registry), bytes.len() as u64);
-        let diagnostic = metrics.diagnostics_snapshot().unwrap();
-        assert_eq!(diagnostic.overflow, 0);
-        let served = diagnostic
-            .records
-            .iter()
-            .filter(|record| record.stage == crate::node::read_work::ReadDiagnosticStage::PeerServe)
-            .collect::<Vec<_>>();
-        assert_eq!(served.len(), 4);
-        for record in served {
-            assert!(record.completed && record.success);
-            assert!(record.first_data_ns >= record.start_ns);
-            assert!(record.end_ns >= record.first_data_ns);
-        }
-        let enqueue = diagnostic
-            .coarse_phases
-            .iter()
-            .find(|phase| phase.phase == "peer_first_frame_enqueue")
-            .unwrap();
-        assert_eq!(enqueue.calls, 4);
-    }
-
-    #[cfg(feature = "dfs")]
     fn dfs_reuse_test_service(
         local: Arc<LocalChunkStore>,
         authorizer: Arc<dyn DfsReadAuthorizer>,
@@ -7775,626 +7754,47 @@ mod tests {
             replica_timeout: std::time::Duration::from_secs(30),
             rdma_sessions: crate::node::rpc::control::RdmaSessionRegistry::new(None),
             payload_metrics: None,
+            hixl: None,
+            prepared_reads: Arc::new(prepared::PreparedReadRegistry::new()),
         }
     }
 
     #[cfg(feature = "dfs")]
-    fn dfs_reuse_scan_bytes(registry: &afs_metrics::Registry) -> u64 {
-        afs_metrics::encode_text(registry)
-            .unwrap()
-            .lines()
-            .find_map(|line| line.strip_prefix("afs_dfs_read_scan_bytes_total "))
-            .unwrap()
-            .parse()
-            .unwrap()
-    }
-
-    #[cfg(feature = "dfs")]
-    #[tokio::test]
-    async fn p2_t1_native_read_waits_for_an_existing_rpc_slot() {
-        use crate::node::chunk::StagedChunk;
-        use std::{future::Future, task::Poll};
-        use tokio_stream::StreamExt;
-
-        let temp = tempfile::tempdir().unwrap();
-        let local = Arc::new(LocalChunkStore::open(temp.path(), "node").unwrap());
-        let staged = StagedChunk::new(
-            crate::dfs::OperationId::new("t1-rpc-admission"),
-            vec![37; 65536],
-        );
-        local.put(staged.clone()).unwrap();
-        let service = dfs_reuse_test_service(local, Arc::new(AllowDfsTestGrant));
-        let held = service
-            .read_permits
-            .clone()
-            .acquire_many_owned(8)
-            .await
-            .unwrap();
-        let request = dfs_read_request(staged.chunk.id.0.clone(), staged.chunk.length);
-        let mut pending = Box::pin(service.read_ranges(Request::new(request)));
-        // Poll exactly once while all eight real slots are held. This tests
-        // admission behavior without inferring it from scheduler/timing noise.
-        let waiting =
-            std::future::poll_fn(|cx| Poll::Ready(pending.as_mut().poll(cx).is_pending())).await;
-        assert!(
-            waiting,
-            "temporary slot pressure must wait within the fixed admission deadline"
-        );
-        drop(held);
-        let mut stream = pending.await.unwrap().into_inner();
-        let mut received = Vec::new();
-        let mut completions = 0;
-        while let Some(frame) = stream.next().await {
-            match frame.unwrap().body.unwrap() {
-                dfs_read_ranges_frame::Body::Data(data) => received.extend(data),
-                dfs_read_ranges_frame::Body::Completion(_) => completions += 1,
-                dfs_read_ranges_frame::Body::Header(_) => {}
-            }
-        }
-        assert_eq!(received, staged.bytes());
-        assert_eq!(completions, 1);
-        assert_eq!(service.read_permits.available_permits(), 8);
-    }
-
-    #[cfg(feature = "dfs")]
-    #[tokio::test]
-    async fn p2_t1_zero_wait_rpc_slots_fail_without_queueing() {
-        use std::{future::Future, task::Poll};
-        let temp = tempfile::tempdir().unwrap();
-        let local = Arc::new(
-            LocalChunkStore::open(temp.path(), "node")
-                .unwrap()
-                .with_peer_serve_wait(std::time::Duration::ZERO)
-                .unwrap(),
-        );
-        let service = dfs_reuse_test_service(local, Arc::new(AllowDfsTestGrant));
-        let _held = service
-            .read_permits
-            .clone()
-            .acquire_many_owned(8)
-            .await
-            .unwrap();
-        let mut pending =
-            Box::pin(service.read_ranges(Request::new(dfs_read_request("chunk".into(), 1))));
-        let result = std::future::poll_fn(|cx| Poll::Ready(pending.as_mut().poll(cx))).await;
-        match result {
-            Poll::Ready(Err(error)) => assert_eq!(error.code(), tonic::Code::ResourceExhausted),
-            _ => panic!("zero admission allowance must not queue behind occupied RPC slots"),
-        }
-    }
-
-    #[cfg(feature = "dfs")]
-    #[tokio::test]
-    async fn p2_t1_rpc_slot_timeout_and_node_stop_return_no_stream() {
-        use std::{future::Future, task::Poll};
-        for stop in [false, true] {
-            let temp = tempfile::tempdir().unwrap();
-            let local = Arc::new(LocalChunkStore::open(temp.path(), "node").unwrap());
-            let service = dfs_reuse_test_service(local.clone(), Arc::new(AllowDfsTestGrant));
-            let _held = service
-                .read_permits
-                .clone()
-                .acquire_many_owned(8)
-                .await
-                .unwrap();
-            let mut pending =
-                Box::pin(service.read_ranges(Request::new(dfs_read_request("chunk".into(), 1))));
-            assert!(
-                std::future::poll_fn(|cx| Poll::Ready(pending.as_mut().poll(cx).is_pending()))
-                    .await
-            );
-            if stop {
-                local.close_peer_serve_admission();
-            }
-            let error = pending.await.err().unwrap();
-            assert_eq!(
-                error.code(),
-                if stop {
-                    tonic::Code::Unavailable
-                } else {
-                    tonic::Code::ResourceExhausted
-                }
-            );
-        }
-    }
-
-    #[cfg(feature = "dfs")]
-    #[tokio::test]
-    async fn p2_t1_grant_expiry_is_rechecked_after_rpc_queue() {
-        use std::{future::Future, task::Poll};
-        let temp = tempfile::tempdir().unwrap();
-        let local = Arc::new(
-            LocalChunkStore::open(temp.path(), "node")
-                .unwrap()
-                .with_peer_serve_wait(std::time::Duration::from_millis(50))
-                .unwrap(),
-        );
-        let service = dfs_reuse_test_service(local, Arc::new(AllowDfsTestGrant));
-        let held = service
-            .read_permits
-            .clone()
-            .acquire_many_owned(8)
-            .await
-            .unwrap();
-        let mut request = dfs_read_request("chunk".into(), 1);
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
-        request.operations[0]
-            .grant
-            .as_mut()
-            .unwrap()
-            .expires_at_unix_ms = now + 10;
-        let mut pending = Box::pin(service.read_ranges(Request::new(request)));
-        assert!(
-            std::future::poll_fn(|cx| Poll::Ready(pending.as_mut().poll(cx).is_pending())).await
-        );
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        drop(held);
-        assert_eq!(
-            pending.await.err().unwrap().code(),
-            tonic::Code::PermissionDenied
-        );
-        assert_eq!(service.read_permits.available_permits(), 8);
-    }
-
-    #[cfg(feature = "dfs")]
-    #[tokio::test]
-    async fn dfs_peer_object_reuse_scans_once_and_still_checks_authority() {
-        use crate::node::chunk::StagedChunk;
-        use tokio_stream::StreamExt;
-        let temp = tempfile::tempdir().unwrap();
-        let registry = afs_metrics::Registry::new();
-        let local = Arc::new(
-            LocalChunkStore::open(temp.path(), "node")
-                .unwrap()
-                .with_read_work_metrics(
-                    crate::node::read_work::ReadWorkMetrics::register(&registry).unwrap(),
-                ),
-        );
-        let bytes: Vec<u8> = (0..4 * 1024 * 1024).map(|n| (n % 251) as u8).collect();
-        let staged = StagedChunk::new(crate::dfs::OperationId::new("reuse"), bytes.clone());
-        local.put(staged.clone()).unwrap();
-        let scans_before = dfs_reuse_scan_bytes(&registry);
-        let allowed = dfs_reuse_test_service(local.clone(), Arc::new(AllowDfsTestGrant));
-        for part in 0..4 {
-            let start = part * 1024 * 1024;
-            let mut request = dfs_read_request(staged.chunk.id.0.clone(), 1024 * 1024);
-            request.operations[0].chunk_offset = start as u64;
-            let mut stream = allowed
-                .read_ranges(Request::new(request))
-                .await
-                .unwrap()
-                .into_inner();
-            let mut received = Vec::new();
-            let mut completions = 0;
-            while let Some(frame) = stream.next().await {
-                match frame.unwrap().body.unwrap() {
-                    dfs_read_ranges_frame::Body::Data(data) => {
-                        assert!(data.len() <= 64 * 1024);
-                        received.extend(data);
-                    }
-                    dfs_read_ranges_frame::Body::Completion(completion) => {
-                        assert_eq!(
-                            completion.range_checksum,
-                            blake3::hash(&received).as_bytes().to_vec()
-                        );
-                        completions += 1;
-                    }
-                    dfs_read_ranges_frame::Body::Header(_) => {}
-                }
-            }
-            assert_eq!(received, bytes[start..start + 1024 * 1024]);
-            assert_eq!(completions, 1);
-        }
-        assert_eq!(
-            dfs_reuse_scan_bytes(&registry) - scans_before,
-            bytes.len() as u64
-        );
-        let encoded = afs_metrics::encode_text(&registry).unwrap();
-        let count = |prefix: &str| {
-            encoded
-                .lines()
-                .find_map(|line| line.strip_prefix(prefix))
-                .unwrap()
-                .parse::<u64>()
-                .unwrap()
-        };
-        assert_eq!(
-            count("afs_dfs_peer_read_events_total{event=\"blocking_combined\"} "),
-            4
-        );
-        assert_eq!(
-            count("afs_dfs_peer_read_events_total{event=\"data_frame\"} "),
-            64
-        );
-        assert_eq!(
-            count("afs_dfs_peer_read_events_total{event=\"shared_frame\"} "),
-            64
-        );
-        for event in [
-            "blocking_authorize",
-            "blocking_produce",
-            "body_vec_allocation",
-        ] {
-            assert_eq!(
-                count(&format!(
-                    "afs_dfs_peer_read_events_total{{event=\"{event}\"}} "
-                )),
-                0
-            );
-        }
-        assert_eq!(
-            count("afs_dfs_read_copy_bytes_total{stage=\"range_to_frame\"} "),
-            0
-        );
-        // A warmed immutable object is data reuse, never permission reuse.
-        let denied = dfs_reuse_test_service(local.clone(), Arc::new(DenyDfsReadAuthorizer));
-        assert!(
-            denied
-                .read_ranges(Request::new(dfs_read_request(staged.chunk.id.0, 1024)))
-                .await
-                .is_err()
-        );
-        assert_eq!(
-            dfs_reuse_scan_bytes(&registry) - scans_before,
-            bytes.len() as u64
-        );
-    }
-
-    #[cfg(feature = "dfs")]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn dfs_peer_r6_followers_keep_independent_expiry_and_stop_checks() {
-        use crate::node::chunk::StagedChunk;
-        use tokio_stream::StreamExt;
-        struct CountingAuthorizer(std::sync::atomic::AtomicUsize);
-        impl DfsReadAuthorizer for CountingAuthorizer {
-            fn authorize(
-                &self,
-                peer: &str,
-                request: &DfsReadRangesRequest,
-            ) -> afs_error::Result<()> {
-                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                AllowDfsTestGrant.authorize(peer, request)
-            }
-        }
-        for stop in [false, true] {
-            let temp = tempfile::tempdir().unwrap();
-            let local = Arc::new(LocalChunkStore::open(temp.path(), "node").unwrap());
-            let staged =
-                StagedChunk::new(crate::dfs::OperationId::new("r6-delivery"), vec![73; 4096]);
-            local.put(staged.clone()).unwrap();
-            let (entered, release) = local.pause_next_peer_fill_for_test(staged.chunk.id.clone());
-            let authorizer = Arc::new(CountingAuthorizer(std::sync::atomic::AtomicUsize::new(0)));
-            let service = dfs_reuse_test_service(local.clone(), authorizer.clone());
-            let mut leader = service
-                .read_ranges(Request::new(dfs_read_request(
-                    staged.chunk.id.0.clone(),
-                    4096,
-                )))
-                .await
-                .unwrap()
-                .into_inner();
-            entered
-                .recv_timeout(std::time::Duration::from_secs(3))
-                .unwrap();
-            let expires = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as u64
-                + 100;
-            let mut request = dfs_read_request(staged.chunk.id.0.clone(), 4096);
-            if !stop {
-                request.operations[0]
-                    .grant
-                    .as_mut()
-                    .unwrap()
-                    .expires_at_unix_ms = expires;
-            }
-            let mut follower = service
-                .read_ranges(Request::new(request))
-                .await
-                .unwrap()
-                .into_inner();
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-            while local.waiting_peer_fill_readers_for_test() == 0 {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "RPC follower did not join flight"
-                );
-                tokio::task::yield_now().await;
-            }
-            assert_eq!(authorizer.0.load(std::sync::atomic::Ordering::SeqCst), 2);
-            if stop {
-                local.close_peer_serve_admission();
-            } else {
-                while std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis()
-                    <= u128::from(expires)
-                {
-                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                }
-            }
-            release.send(()).unwrap();
-            let failure = follower.next().await.unwrap().unwrap_err();
-            if !stop {
-                assert_eq!(failure.code(), tonic::Code::PermissionDenied);
-            } else {
-                assert_eq!(failure.code(), tonic::Code::Unavailable);
-            }
-            assert!(
-                follower.next().await.is_none(),
-                "rejected follower must receive no Header or body"
-            );
-            let mut bytes = Vec::new();
-            while let Some(frame) = leader.next().await {
-                if stop {
-                    assert!(frame.is_err());
-                } else if let Some(dfs_read_ranges_frame::Body::Data(data)) = frame.unwrap().body {
-                    bytes.extend_from_slice(&data);
-                }
-            }
-            if !stop {
-                assert_eq!(bytes, staged.bytes());
-            }
-            drop(leader);
-            drop(follower);
-            tokio::time::timeout(std::time::Duration::from_secs(3), async {
-                while service.read_permits.available_permits() != 8 {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .unwrap();
-            local.shutdown_peer_serve().unwrap();
-        }
-    }
-
-    #[cfg(feature = "dfs")]
-    #[tokio::test]
-    async fn dfs_peer_object_reuse_cancel_releases_slot_and_shared_budget() {
-        use crate::node::chunk::StagedChunk;
-        use tokio_stream::StreamExt;
-        let temp = tempfile::tempdir().unwrap();
-        let local = Arc::new(
-            LocalChunkStore::open(temp.path(), "node")
-                .unwrap()
-                .with_peer_serve_config(1, 8 * 1024 * 1024)
-                .unwrap(),
-        );
-        let staged = StagedChunk::new(
-            crate::dfs::OperationId::new("cancel"),
-            vec![7; 4 * 1024 * 1024],
-        );
-        local.put(staged.clone()).unwrap();
-        let service = dfs_reuse_test_service(local.clone(), Arc::new(AllowDfsTestGrant));
-        let mut stream = service
-            .read_ranges(Request::new(dfs_read_request(
-                staged.chunk.id.0,
-                4 * 1024 * 1024,
-            )))
-            .await
-            .unwrap()
-            .into_inner();
-        assert!(stream.next().await.unwrap().is_ok());
-        drop(stream);
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            while service.read_permits.available_permits() != 8 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        // The retained slot can be evicted; no cancelled producer owns a hidden lease.
-        let reservation = local.reserve_peer_read_payload(8 * 1024 * 1024).unwrap();
-        drop(reservation);
-    }
-
-    #[cfg(feature = "dfs")]
-    #[tokio::test]
-    async fn dfs_peer_cancel_during_authorization_keeps_permit_until_exit_and_skips_io() {
-        use crate::node::chunk::StagedChunk;
-        struct BlockedAuthorizer {
-            started: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
-            release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
-        }
-        impl DfsReadAuthorizer for BlockedAuthorizer {
-            fn authorize(
-                &self,
-                _peer: &str,
-                _request: &DfsReadRangesRequest,
-            ) -> afs_error::Result<()> {
-                self.started
-                    .lock()
-                    .unwrap()
-                    .take()
-                    .unwrap()
-                    .send(())
-                    .unwrap();
-                self.release.lock().unwrap().recv().unwrap();
-                Ok(())
-            }
-        }
-        let temp = tempfile::tempdir().unwrap();
-        let registry = afs_metrics::Registry::new();
-        let local = Arc::new(
-            LocalChunkStore::open(temp.path(), "node")
-                .unwrap()
-                .with_read_work_metrics(
-                    crate::node::read_work::ReadWorkMetrics::register(&registry).unwrap(),
-                ),
-        );
-        let staged = StagedChunk::new(
-            crate::dfs::OperationId::new("cancel-authorization"),
-            vec![31; 4 * 1024 * 1024],
-        );
-        local.put(staged.clone()).unwrap();
-        let before = dfs_reuse_scan_bytes(&registry);
-        let (started, observed) = tokio::sync::oneshot::channel();
-        let (release, wait) = std::sync::mpsc::channel();
-        let service = Arc::new(dfs_reuse_test_service(
-            local,
-            Arc::new(BlockedAuthorizer {
-                started: std::sync::Mutex::new(Some(started)),
-                release: std::sync::Mutex::new(wait),
-            }),
-        ));
-        let call = {
-            let service = service.clone();
-            tokio::spawn(async move {
-                service
-                    .read_ranges(Request::new(dfs_read_request(staged.chunk.id.0, 1024)))
-                    .await
-                    .map(|_| ())
-            })
-        };
-        tokio::time::timeout(std::time::Duration::from_secs(2), observed)
-            .await
-            .unwrap()
-            .unwrap();
-        call.abort();
-        assert!(call.await.unwrap_err().is_cancelled());
-        assert_eq!(service.read_permits.available_permits(), 7);
-        release.send(()).unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            while service.read_permits.available_permits() != 8 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        assert_eq!(dfs_reuse_scan_bytes(&registry), before);
-    }
-
-    #[cfg(feature = "dfs")]
-    #[tokio::test]
-    async fn dfs_peer_frame_keeps_shared_lease_after_cancel_and_object_replacement() {
-        use crate::node::chunk::StagedChunk;
-        use tokio_stream::StreamExt;
-        let temp = tempfile::tempdir().unwrap();
-        let local = Arc::new(
-            LocalChunkStore::open(temp.path(), "node")
-                .unwrap()
-                .with_peer_serve_config(1, 8 * 1024 * 1024)
-                .unwrap(),
-        );
-        let first = StagedChunk::new(
-            crate::dfs::OperationId::new("held-frame"),
-            vec![7; 4 * 1024 * 1024],
-        );
-        let replacement = StagedChunk::new(
-            crate::dfs::OperationId::new("replace-held-frame"),
-            vec![9; 4 * 1024 * 1024],
-        );
-        local.put(first.clone()).unwrap();
-        local.put(replacement.clone()).unwrap();
-        let service = dfs_reuse_test_service(local.clone(), Arc::new(AllowDfsTestGrant));
-        let mut stream = service
-            .read_ranges(Request::new(dfs_read_request(
-                first.chunk.id.0,
-                4 * 1024 * 1024,
-            )))
-            .await
-            .unwrap()
-            .into_inner();
-        let held_frame = loop {
-            let frame = stream.next().await.unwrap().unwrap();
-            if matches!(&frame.body, Some(dfs_read_ranges_frame::Body::Data(_))) {
-                break frame;
-            }
-        };
-        drop(stream);
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            while service.read_permits.available_permits() != 8 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-
-        // Replace the resident slot; the consumer still owns the old frame.
-        let next = local
-            .read_peer_range(&replacement.chunk.id, 0, 64 * 1024)
-            .unwrap();
-        assert_eq!(next.as_slice(), &[9; 64 * 1024]);
-        drop(next);
-        if let Some(dfs_read_ranges_frame::Body::Data(data)) = &held_frame.body {
-            assert_eq!(&data[..], &[7; 64 * 1024]);
-        } else {
-            unreachable!();
-        }
-        // Even evicting the replacement cannot reclaim the held object's lease.
-        assert!(local.reserve_peer_read_payload(5 * 1024 * 1024).is_err());
-        drop(held_frame);
-        let all = local.reserve_peer_read_payload(8 * 1024 * 1024).unwrap();
-        drop(all);
-    }
-
-    #[cfg(feature = "dfs")]
-    #[tokio::test]
-    async fn dfs_peer_object_reuse_full_budget_returns_error_before_any_frame() {
-        use crate::node::chunk::StagedChunk;
-        use tokio_stream::StreamExt;
-        let temp = tempfile::tempdir().unwrap();
-        let local = Arc::new(
-            LocalChunkStore::open(temp.path(), "node")
-                .unwrap()
-                .with_peer_serve_config(1, 8 * 1024 * 1024)
-                .unwrap(),
-        );
-        let staged = StagedChunk::new(crate::dfs::OperationId::new("full-budget"), vec![3; 1024]);
-        local.put(staged.clone()).unwrap();
-        let reservation = local.reserve_peer_read_payload(8 * 1024 * 1024).unwrap();
-        let service = dfs_reuse_test_service(local, Arc::new(AllowDfsTestGrant));
-        let mut stream = service
-            .read_ranges(Request::new(dfs_read_request(staged.chunk.id.0, 1024)))
-            .await
-            .unwrap()
-            .into_inner();
-        assert_eq!(
-            stream.next().await.unwrap().unwrap_err().code(),
-            tonic::Code::ResourceExhausted
-        );
-        assert!(stream.next().await.is_none());
-        drop(reservation);
-    }
-
-    #[cfg(all(feature = "dfs", feature = "rdma"))]
     #[test]
-    fn dfs_peer_object_reuse_rdma_packed_shares_budget_until_payload_drop() {
+    fn dfs_packed_ranges_quarantine_corruption_outside_selected_ranges() {
         use crate::node::chunk::StagedChunk;
+
         let temp = tempfile::tempdir().unwrap();
-        let local = LocalChunkStore::open(temp.path(), "node")
-            .unwrap()
-            .with_peer_serve_config(1, 8 * 1024 * 1024)
-            .unwrap();
-        let staged = StagedChunk::new(crate::dfs::OperationId::new("packed"), vec![9; 1024]);
+        let local = LocalChunkStore::open(temp.path(), "node").unwrap();
+        let staged = StagedChunk::new(
+            crate::dfs::OperationId::new("packed-corrupt"),
+            (0..64).collect(),
+        );
         local.put(staged.clone()).unwrap();
-        let request = dfs_read_request(staged.chunk.id.0, 1024);
-        let all = local.reserve_peer_read_payload(8 * 1024 * 1024).unwrap();
+        let path = temp.path().join("chunks").join(&staged.chunk.id.0);
+        let mut damaged = staged.bytes().to_vec();
+        damaged[63] ^= 1;
+        std::fs::write(path, damaged).unwrap();
+
+        let mut request = dfs_read_request(staged.chunk.id.0.clone(), 2);
+        let mut first_op = request.operations.remove(0);
+        first_op.chunk_offset = 1;
+        first_op.destination_offset = 0;
+        let mut second_op = first_op.clone();
+        second_op.operation_index = 1;
+        second_op.chunk_offset = 20;
+        second_op.destination_offset = 2;
+        request.operations = vec![first_op, second_op];
+
         assert_eq!(
-            read_packed_dfs_ranges(&local, &request, 1024)
-                .err()
-                .unwrap()
+            read_packed_dfs_ranges(&local, &request, 4)
+                .unwrap_err()
                 .code(),
-            tonic::Code::ResourceExhausted
+            tonic::Code::DataLoss
         );
-        drop(all);
-        let packed = read_packed_dfs_ranges(&local, &request, 1024).unwrap();
-        assert_eq!(packed.bytes, vec![9; 1024]);
-        assert_eq!(
-            packed.completions[0].range_checksum,
-            blake3::hash(&packed.bytes).as_bytes().to_vec()
-        );
-        assert!(local.reserve_peer_read_payload(8 * 1024 * 1024).is_err());
-        drop(packed);
-        assert!(local.reserve_peer_read_payload(8 * 1024 * 1024).is_ok());
+        assert_eq!(local.quarantined_chunks().unwrap().len(), 1);
     }
 
-    #[cfg(feature = "dfs")]
     #[tokio::test]
     async fn dfs_range_service_requires_authority_and_streams_bounded_frames() {
         use crate::node::chunk::StagedChunk;
@@ -8419,6 +7819,8 @@ mod tests {
             replica_timeout: std::time::Duration::from_secs(30),
             rdma_sessions: crate::node::rpc::control::RdmaSessionRegistry::new(None),
             payload_metrics: None,
+            hixl: None,
+            prepared_reads: Arc::new(prepared::PreparedReadRegistry::new()),
         };
         assert!(
             denied
@@ -8440,6 +7842,8 @@ mod tests {
             replica_timeout: std::time::Duration::from_secs(30),
             rdma_sessions: crate::node::rpc::control::RdmaSessionRegistry::new(None),
             payload_metrics: None,
+            hixl: None,
+            prepared_reads: Arc::new(prepared::PreparedReadRegistry::new()),
         };
         let mut stream = allowed
             .read_ranges(Request::new(request))
@@ -8483,8 +7887,59 @@ mod tests {
             .as_mut()
             .unwrap()
             .expires_at_unix_ms = u64::MAX;
-        request.operations[0].length = MAX_DFS_READ_BYTES + 1;
+        request.operations[0].length = MAX_DFS_GROUP_BYTES + 1;
         assert!(validate_dfs_read_request(&request).is_err());
+        request.operations[0].length = MAX_DFS_GROUP_BYTES;
+        assert!(validate_dfs_read_request(&request).is_ok());
+    }
+
+    #[cfg(feature = "dfs")]
+    #[tokio::test]
+    async fn dfs_hixl_disabled_authenticates_before_capability_status() {
+        struct RejectPeer;
+
+        impl PeerAuthenticator for RejectPeer {
+            fn authenticate(
+                &self,
+                _: &MetadataMap,
+                _: Option<SocketAddr>,
+                _: Option<&[u8]>,
+            ) -> afs_error::Result<String> {
+                Err(afs_error::Error::coded(
+                    afs_error::NODE_TRANSFER_INVALID,
+                    "fixture peer rejected",
+                ))
+            }
+        }
+
+        let service = DfsChunksService {
+            local_chunks: None,
+            authenticator: Arc::new(RejectPeer),
+            authorizer: Arc::new(DenyDfsReadAuthorizer),
+            replica_authorizer: Arc::new(DenyDfsReplicaAuthorizer),
+            replica_data_plane: None,
+            replica_permits: Arc::new(tokio::sync::Semaphore::new(1)),
+            read_permits: Arc::new(tokio::sync::Semaphore::new(1)),
+            replica_timeout: std::time::Duration::from_secs(1),
+            rdma_sessions: crate::node::rpc::control::RdmaSessionRegistry::new(None),
+            payload_metrics: None,
+            hixl: None,
+            prepared_reads: Arc::new(prepared::PreparedReadRegistry::new()),
+        };
+
+        let status = service
+            .negotiate_hixl(Request::new(DfsNegotiateHixlRequest::default()))
+            .await
+            .expect_err("unauthenticated HIXL calls must fail before capability lookup");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+
+        let mut capability_only = service;
+        capability_only.authenticator = Arc::new(AllowDfsTestPeer);
+        let status = capability_only
+            .negotiate_hixl(Request::new(DfsNegotiateHixlRequest::default()))
+            .await
+            .expect_err("authenticated disabled HIXL calls must return capability status");
+        assert_eq!(status.code(), tonic::Code::Unimplemented);
     }
     #[cfg(feature = "dfs")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

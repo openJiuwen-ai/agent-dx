@@ -50,6 +50,32 @@ const MAX_SOURCE_CACHE_BYTES: usize = 4 * 1024 * 1024;
 const SOURCE_GRANT_SAFETY_MS: u64 = 1_000;
 pub(super) const MAX_SOURCE_LOOKAHEAD_ID_BYTES: usize = 512;
 
+/// A ReadGroup may aggregate several small batches into one native submission.
+pub const MAX_DFS_GROUP_OPS: usize = 512;
+pub const MAX_DFS_GROUP_BYTES: u64 = 128 * 1024 * 1024;
+pub const DFS_READ_GROUP_ALIGNMENT: u64 = 4096;
+
+/// Sequential read-ahead policy. `bytes` bounds one group; the legacy
+/// per-batch limit is unchanged for callers that keep group mode off.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReadGroupPolicy {
+    pub bytes: usize,
+    pub max_inflight: usize,
+    pub max_descriptors: usize,
+    pub host_budget_bytes: usize,
+}
+
+impl Default for ReadGroupPolicy {
+    fn default() -> Self {
+        Self {
+            bytes: 8 * 1024 * 1024,
+            max_inflight: 1,
+            max_descriptors: 128,
+            host_budget_bytes: 1024 * 1024 * 1024,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct DfsReadConfig {
     pub max_ops_per_batch: usize,
@@ -115,11 +141,32 @@ pub struct ReadBatch {
 impl ReadBatch {
     pub fn validate_for_output(&self, output_len: usize, config: &DfsReadConfig) -> Result<()> {
         config.validate()?;
+        self.validate_with_limits(
+            output_len,
+            config.max_ops_per_batch,
+            config.max_inflight_bytes,
+        )
+    }
+
+    /// Group batches keep their own budget so the small-batch limit stays intact.
+    pub fn validate_group_for_output(&self, output_len: usize, group_bytes: u64) -> Result<()> {
+        if group_bytes == 0 || group_bytes > MAX_DFS_GROUP_BYTES {
+            return Err(invalid("DFS read group byte budget is invalid"));
+        }
+        self.validate_with_limits(output_len, MAX_DFS_GROUP_OPS, group_bytes)
+    }
+
+    fn validate_with_limits(
+        &self,
+        output_len: usize,
+        max_ops: usize,
+        max_bytes: u64,
+    ) -> Result<()> {
         self.validate_lookahead()?;
         if self.layout_root_id.0.is_empty() {
             return Err(invalid("DFS read batch has no LayoutRoot"));
         }
-        if self.ops.len() > config.max_ops_per_batch {
+        if self.ops.len() > max_ops {
             return Err(invalid("DFS read batch contains too many ranges"));
         }
         let mut total = 0_u64;
@@ -140,7 +187,7 @@ impl ReadBatch {
                 return Err(invalid("DFS read output range exceeds buffer"));
             }
         }
-        if total > config.max_inflight_bytes {
+        if total > max_bytes {
             return Err(invalid("DFS read batch exceeds inflight byte budget"));
         }
         Ok(())
@@ -460,17 +507,29 @@ pub struct PeerReadBatch {
 
 impl PeerReadBatch {
     pub fn validate(&self, output_len: usize) -> Result<()> {
+        self.validate_with(output_len, None)
+    }
+
+    /// Group transfers keep the same identity checks with the group budget.
+    pub fn validate_group(&self, output_len: usize, group_bytes: u64) -> Result<()> {
+        self.validate_with(output_len, Some(group_bytes))
+    }
+
+    fn validate_with(&self, output_len: usize, group_bytes: Option<u64>) -> Result<()> {
         let first = self
             .operations
             .first()
             .ok_or_else(|| invalid("empty peer read batch"))?;
-        ReadBatch {
+        let batch = ReadBatch {
             lookahead: Vec::new(),
             file_version_id: Some(self.file_version_id.clone()),
             layout_root_id: self.layout_root_id.clone(),
             ops: self.operations.iter().map(|item| item.op.clone()).collect(),
+        };
+        match group_bytes {
+            Some(group_bytes) => batch.validate_group_for_output(output_len, group_bytes)?,
+            None => batch.validate_for_output(output_len, &DfsReadConfig::default())?,
         }
-        .validate_for_output(output_len, &DfsReadConfig::default())?;
         for item in &self.operations {
             let grant = &item.source.read_grant;
             if item.op.length == 0
@@ -698,6 +757,12 @@ pub trait ChunkTransfer: Send + Sync {
         let verified = VerifiedPeerChunk::verify(chunk, out, proof_budget)?;
         Ok(verified)
     }
+
+    /// Bounded transport identity for observability. Never a node, address,
+    /// grant or chunk identity. Unlabelled adapters stay `unknown`.
+    fn transport(&self) -> &'static str {
+        "unknown"
+    }
 }
 
 pub(super) fn validate_verified_peer_object_request(
@@ -731,6 +796,190 @@ pub(super) fn validate_verified_peer_object_request(
         ));
     }
     Ok(())
+}
+
+/// Peer transport wall time and completed payload bytes per logical batch.
+/// The read engine records one sample around every `ChunkTransfer::read_ranges`
+/// call, so grpc, rdma and hixl share a single measurement point.
+#[derive(Clone)]
+pub struct DfsReadTransportMetrics {
+    duration: afs_metrics::HistogramVec,
+    bytes: afs_metrics::IntCounterVec,
+}
+
+impl DfsReadTransportMetrics {
+    pub fn register(
+        registry: &afs_metrics::Registry,
+    ) -> std::result::Result<Self, afs_metrics::MetricsError> {
+        registry.get_or_register(|registry| {
+            let duration = afs_metrics::HistogramVec::new(
+                afs_metrics::HistogramOpts::new(
+                    "afs_dfs_read_transport_seconds",
+                    "Wall time of one peer transport read batch, by transport and result.",
+                ),
+                &["transport", "result"],
+            )?;
+            let bytes = afs_metrics::IntCounterVec::new(
+                afs_metrics::Opts::new(
+                    "afs_dfs_read_transport_bytes_total",
+                    "Payload bytes of completed peer transport read batches, by transport.",
+                ),
+                &["transport"],
+            )?;
+            afs_metrics::register_collector(registry, &duration)?;
+            afs_metrics::register_collector(registry, &bytes)?;
+            for transport in ["grpc", "rdma", "hixl", "unknown"] {
+                for result in ["ok", "error"] {
+                    duration.with_label_values(&[transport, result]);
+                }
+                bytes.with_label_values(&[transport]);
+            }
+            Ok(Self { duration, bytes })
+        })
+    }
+
+    fn record(
+        &self,
+        transport: &'static str,
+        result: &'static str,
+        bytes: usize,
+        elapsed: Duration,
+    ) {
+        self.duration
+            .with_label_values(&[transport, result])
+            .observe(elapsed.as_secs_f64());
+        if result == "ok" {
+            self.bytes
+                .with_label_values(&[transport])
+                .inc_by(bytes as u64);
+        }
+    }
+}
+
+/// Prepared payload bandwidth samples committed only after successful validation and release.
+#[derive(Clone)]
+pub struct DfsReadPayloadMetrics {
+    duration: afs_metrics::HistogramVec,
+    bytes: afs_metrics::IntCounterVec,
+    phase: afs_metrics::HistogramVec,
+}
+
+/// Fixed prepared-read stages; never node, chunk or address labels.
+pub(crate) const PREPARED_READ_PHASES: [&str; 7] = [
+    "prepare", "allocate", "transfer", "scatter", "validate", "release", "buffers",
+];
+
+impl DfsReadPayloadMetrics {
+    pub fn register(
+        registry: &afs_metrics::Registry,
+    ) -> std::result::Result<Self, afs_metrics::MetricsError> {
+        registry.get_or_register(|registry| {
+            let duration = afs_metrics::HistogramVec::new(
+                afs_metrics::HistogramOpts::new(
+                    "afs_dfs_read_payload_seconds",
+                    "Prepared Host-to-Host payload delivery wall time, excluding preparation, validation and release.",
+                ),
+                &["transport", "result"],
+            )?;
+            let bytes = afs_metrics::IntCounterVec::new(
+                afs_metrics::Opts::new(
+                    "afs_dfs_read_payload_bytes_total",
+                    "Validated bytes delivered by prepared payload samples.",
+                ),
+                &["transport"],
+            )?;
+            let phase = afs_metrics::HistogramVec::new(
+                afs_metrics::HistogramOpts::new(
+                    "afs_dfs_read_phase_seconds",
+                    "Prepared read stage wall time, by transport and fixed phase.",
+                ),
+                &["transport", "phase"],
+            )?;
+            afs_metrics::register_collector(registry, &duration)?;
+            afs_metrics::register_collector(registry, &bytes)?;
+            afs_metrics::register_collector(registry, &phase)?;
+            for transport in ["grpc", "hixl"] {
+                for result in ["ok", "error"] {
+                    duration.with_label_values(&[transport, result]);
+                }
+                bytes.with_label_values(&[transport]);
+                for phase_name in PREPARED_READ_PHASES {
+                    phase.with_label_values(&[transport, phase_name]);
+                }
+            }
+            Ok(Self {
+                duration,
+                bytes,
+                phase,
+            })
+        })
+    }
+
+    pub(crate) fn observe(
+        &self,
+        transport: &'static str,
+        result: &'static str,
+        bytes: usize,
+        elapsed: Duration,
+    ) {
+        self.duration
+            .with_label_values(&[transport, result])
+            .observe(elapsed.as_secs_f64());
+        if result == "ok" {
+            self.bytes
+                .with_label_values(&[transport])
+                .inc_by(bytes as u64);
+        }
+    }
+
+    pub(crate) fn observe_phase(
+        &self,
+        transport: &'static str,
+        phase: &'static str,
+        elapsed: Duration,
+    ) {
+        self.phase
+            .with_label_values(&[transport, phase])
+            .observe(elapsed.as_secs_f64());
+    }
+}
+
+/// Payload movement time of one peer transport read, without the protocol
+/// steps that surround it. `hixl` records its native window read; `grpc`
+/// records the frame receive awaits. This is the observed data movement of the
+/// peer pull, never a physical link-bandwidth claim.
+#[derive(Clone)]
+pub struct DfsReadMoveMetrics {
+    seconds: afs_metrics::HistogramVec,
+}
+
+impl DfsReadMoveMetrics {
+    pub fn register(
+        registry: &afs_metrics::Registry,
+    ) -> std::result::Result<Self, afs_metrics::MetricsError> {
+        registry.get_or_register(|registry| {
+            let seconds = afs_metrics::HistogramVec::new(
+                afs_metrics::HistogramOpts::new(
+                    "afs_dfs_read_move_seconds",
+                    "Payload movement time of one peer transport read, by transport and result.",
+                ),
+                &["transport", "result"],
+            )?;
+            afs_metrics::register_collector(registry, &seconds)?;
+            for transport in ["grpc", "rdma", "hixl", "unknown"] {
+                for result in ["ok", "error"] {
+                    seconds.with_label_values(&[transport, result]);
+                }
+            }
+            Ok(Self { seconds })
+        })
+    }
+
+    pub(crate) fn observe(&self, transport: &'static str, result: &'static str, elapsed: Duration) {
+        self.seconds
+            .with_label_values(&[transport, result])
+            .observe(elapsed.as_secs_f64());
+    }
 }
 
 fn same_peer_context(left: &SourceCandidate, right: &SourceCandidate) -> bool {
@@ -1242,6 +1491,7 @@ pub struct DfsReadEngine {
     source_provider: Arc<dyn ReadSourceProvider>,
     transfer: Arc<dyn ChunkTransfer>,
     config: DfsReadConfig,
+    transport_metrics: Option<DfsReadTransportMetrics>,
     external_backend: Option<ExternalReadBackend>,
     peer_cache: Option<Arc<DiskPeerCache>>,
     read_authority: Arc<LocalReadAuthority>,
@@ -1669,6 +1919,7 @@ impl DfsReadEngine {
             source_provider,
             transfer,
             config,
+            transport_metrics: None,
             external_backend: None,
             peer_cache: None,
             read_authority: Arc::new(LocalReadAuthority::unbounded_for_tests_and_legacy()),
@@ -1740,6 +1991,7 @@ impl DfsReadEngine {
             source_provider: self.source_provider.clone(),
             transfer: self.transfer.clone(),
             config: self.config.clone(),
+            transport_metrics: self.transport_metrics.clone(),
             external_backend: None,
             peer_cache: self.peer_cache.clone(),
             read_authority: self.read_authority.clone(),
@@ -1927,6 +2179,47 @@ impl DfsReadEngine {
         );
         let _entered = span.enter();
         batch.validate_for_output(out.len(), &self.config)?;
+        self.read_batch_limited(batch, out)
+    }
+
+    /// Attaches the shared peer transport measurement handle. Without it the
+    /// engine keeps its previous behaviour and records no transport samples.
+    pub fn with_transport_metrics(mut self, metrics: DfsReadTransportMetrics) -> Self {
+        self.transport_metrics = Some(metrics);
+        self
+    }
+
+    /// Runs one transport attempt and records exactly one bounded sample for
+    /// the batch. Bytes count only when the attempt completed.
+    async fn transfer_batch(&self, batch: &PeerReadBatch, out: &mut [u8]) -> Result<()> {
+        let started = Instant::now();
+        let bytes = out.len();
+        let result = self.transfer.read_ranges_async(batch, out).await;
+        if let Some(metrics) = &self.transport_metrics {
+            let outcome = if result.is_ok() { "ok" } else { "error" };
+            metrics.record(
+                self.transfer.transport(),
+                outcome,
+                bytes,
+                started.elapsed(),
+            );
+        }
+        result
+    }
+
+    /// Aggregated sequential read-ahead. The group limit is separate from the
+    /// legacy per-batch budget, and all ranges still publish together.
+    pub fn read_group_batch(
+        &self,
+        batch: &ReadBatch,
+        out: &mut [u8],
+        group_bytes: u64,
+    ) -> Result<()> {
+        batch.validate_group_for_output(out.len(), group_bytes)?;
+        self.read_batch_limited(batch, out)
+    }
+
+    fn read_batch_limited(&self, batch: &ReadBatch, out: &mut [u8]) -> Result<()> {
         let native_authority = if self.external_backend.is_none() {
             Some(self.capture_native_read_authority()?)
         } else {
@@ -4924,7 +5217,7 @@ impl DfsReadEngine {
                         .read_crc32c_range_async(&attempt, chunk, target)
                         .await
                 } else {
-                    self.transfer.read_ranges_async(&attempt, target).await
+                    self.transfer_batch(&attempt, target).await
                 };
                 match result {
                     Ok(()) => {
@@ -4977,11 +5270,7 @@ impl DfsReadEngine {
                                     operations: vec![single],
                                 };
                                 let mut single_scratch = vec![0; item.op.length as usize];
-                                match self
-                                    .transfer
-                                    .read_ranges_async(&single_batch, &mut single_scratch)
-                                    .await
-                                {
+                                match self.transfer_batch(&single_batch, &mut single_scratch).await {
                                     Ok(()) => {
                                         if !self.source_matches(batch, &item.source) {
                                             return Err(external_denied(
@@ -10134,6 +10423,200 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    struct LabelledTransfer {
+        fail: bool,
+    }
+
+    impl ChunkTransfer for LabelledTransfer {
+        fn transport(&self) -> &'static str {
+            "grpc"
+        }
+
+        fn read_ranges(&self, batch: &PeerReadBatch, out: &mut [u8]) -> Result<()> {
+            batch.validate(out.len())?;
+            if self.fail {
+                return Err(unavailable("injected transport failure"));
+            }
+            out.fill(7);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn prepared_phase_metrics_use_bounded_transport_and_phase_labels() {
+        let registry = afs_metrics::Registry::new();
+        let metrics = DfsReadPayloadMetrics::register(&registry).unwrap();
+        metrics.observe_phase("grpc", "prepare", Duration::from_millis(2));
+        metrics.observe_phase("hixl", "scatter", Duration::from_millis(3));
+        let text = afs_metrics::encode_text(&registry).unwrap();
+        assert!(
+            text.contains(
+                "afs_dfs_read_phase_seconds_count{phase=\"prepare\",transport=\"grpc\"} 1"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "afs_dfs_read_phase_seconds_count{phase=\"scatter\",transport=\"hixl\"} 1"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("phase=\"copy_out\""), "{text}");
+        assert!(
+            text.contains(
+                "afs_dfs_read_phase_seconds_count{phase=\"buffers\",transport=\"hixl\"} 0"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn peer_transport_metrics_record_one_bounded_sample_per_transport_batch() {
+        let temp = tempfile::tempdir().unwrap();
+        let chunk = ChunkId::new("metrics");
+        let sources = Arc::new(StaticSources::new(DfsChunkSourcesReply {
+            revision: 1,
+            chunks: vec![ChunkSources {
+                chunk_id: chunk.clone(),
+                sources: vec![source("a-copy", &chunk, "node-b")],
+            }],
+        }));
+        let registry = afs_metrics::Registry::new();
+        let metrics = DfsReadTransportMetrics::register(&registry).unwrap();
+        let engine = DfsReadEngine::new(
+            crate::dfs::NamespaceId::new("default"),
+            "node-a".into(),
+            Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap()),
+            sources,
+            Arc::new(LabelledTransfer { fail: false }),
+            DfsReadConfig::default(),
+        )
+        .with_transport_metrics(metrics.clone());
+        let batch = ReadBatch {
+            file_version_id: Some(FileVersionId::new("version")),
+            layout_root_id: LayoutRootId::new("layout"),
+            ops: vec![ChunkReadOp {
+                chunk_id: chunk,
+                chunk_offset: 0,
+                length: 3,
+                output_offset: 0,
+            }],
+        };
+        engine.read_batch(&batch, &mut [0; 3]).unwrap();
+        let text = afs_metrics::encode_text(&registry).unwrap();
+        assert!(
+            text.contains(
+                "afs_dfs_read_transport_seconds_count{result=\"ok\",transport=\"grpc\"} 1"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("afs_dfs_read_transport_bytes_total{transport=\"grpc\"} 3"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "afs_dfs_read_transport_seconds_count{result=\"ok\",transport=\"unknown\"} 0"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn peer_transport_metrics_count_only_completed_bytes_and_keep_failures_labelled() {
+        let temp = tempfile::tempdir().unwrap();
+        let chunk = ChunkId::new("failing");
+        let sources = Arc::new(StaticSources::new(DfsChunkSourcesReply {
+            revision: 1,
+            chunks: vec![ChunkSources {
+                chunk_id: chunk.clone(),
+                sources: vec![source("a-copy", &chunk, "node-b")],
+            }],
+        }));
+        let registry = afs_metrics::Registry::new();
+        let metrics = DfsReadTransportMetrics::register(&registry).unwrap();
+        let engine = DfsReadEngine::new(
+            crate::dfs::NamespaceId::new("default"),
+            "node-a".into(),
+            Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap()),
+            sources,
+            Arc::new(LabelledTransfer { fail: true }),
+            DfsReadConfig::default(),
+        )
+        .with_transport_metrics(metrics);
+        let batch = ReadBatch {
+            file_version_id: Some(FileVersionId::new("version")),
+            layout_root_id: LayoutRootId::new("layout"),
+            ops: vec![ChunkReadOp {
+                chunk_id: chunk,
+                chunk_offset: 0,
+                length: 4,
+                output_offset: 0,
+            }],
+        };
+        assert!(engine.read_batch(&batch, &mut [0; 4]).is_err());
+        let text = afs_metrics::encode_text(&registry).unwrap();
+        assert!(
+            text.contains(
+                "afs_dfs_read_transport_seconds_count{result=\"error\",transport=\"grpc\"} 1"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("afs_dfs_read_transport_bytes_total{transport=\"grpc\"} 0"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn payload_metrics_count_only_validated_success_bytes() {
+        let registry = afs_metrics::Registry::new();
+        let metrics = DfsReadPayloadMetrics::register(&registry).unwrap();
+        metrics.observe("grpc", "ok", 1024, Duration::from_millis(2));
+        metrics.observe("grpc", "error", 2048, Duration::from_millis(3));
+        let text = afs_metrics::encode_text(&registry).unwrap();
+        assert!(
+            text.contains("afs_dfs_read_payload_bytes_total{transport=\"grpc\"} 1024"),
+            "{text}"
+        );
+        assert!(
+            text.contains("afs_dfs_read_payload_seconds_count{result=\"ok\",transport=\"grpc\"} 1"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "afs_dfs_read_payload_seconds_count{result=\"error\",transport=\"grpc\"} 1"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn move_metrics_register_all_transports_and_record_one_bounded_sample() {
+        let registry = afs_metrics::Registry::new();
+        let metrics = DfsReadMoveMetrics::register(&registry).unwrap();
+        metrics.observe("grpc", "ok", Duration::from_millis(3));
+        metrics.observe("hixl", "ok", Duration::from_millis(1));
+        metrics.observe("grpc", "error", Duration::from_millis(2));
+        let text = afs_metrics::encode_text(&registry).unwrap();
+        assert!(
+            text.contains("afs_dfs_read_move_seconds_count{result=\"ok\",transport=\"grpc\"} 1"),
+            "{text}"
+        );
+        assert!(
+            text.contains("afs_dfs_read_move_seconds_count{result=\"ok\",transport=\"hixl\"} 1"),
+            "{text}"
+        );
+        assert!(
+            text.contains("afs_dfs_read_move_seconds_count{result=\"error\",transport=\"grpc\"} 1"),
+            "{text}"
+        );
+        assert!(
+            text.contains("afs_dfs_read_move_seconds_count{result=\"ok\",transport=\"unknown\"} 0"),
+            "{text}"
+        );
     }
 
     #[test]
