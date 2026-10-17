@@ -56,7 +56,9 @@ def build_parser(environ: Mapping[str, str] | None = None) -> argparse.ArgumentP
     parser.add_argument(
         "--timeout-seconds",
         type=float,
-        default=float(values.get("ADX_ADMIN_TIMEOUT_SECONDS", "30")),
+        # Keep the environment value as a string: argparse then applies `type`
+        # and reports a usage error instead of an uncaught ValueError traceback.
+        default=values.get("ADX_ADMIN_TIMEOUT_SECONDS", "30"),
     )
     parser.add_argument("--allow-loopback-http", action="store_true")
     commands = parser.add_subparsers(dest="command", required=True)
