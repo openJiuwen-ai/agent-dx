@@ -87,6 +87,41 @@ async fn wait_for_graceful_services(root: &Path, binaries: &[&str]) {
     .expect("graceful service fixtures must install their signal handlers");
 }
 
+#[tokio::test]
+async fn request_explains_a_missing_supervisor() {
+    let directory = tempfile::Builder::new()
+        .prefix("adx-supervisor-missing-")
+        .tempdir_in("/tmp")
+        .unwrap();
+
+    let error = supervisor::request(directory.path(), Request::Status, Duration::from_secs(1))
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("supervisor"), "{error}");
+    assert!(error.contains("state_dir"), "{error}");
+}
+
+#[tokio::test]
+async fn request_explains_a_stale_supervisor_socket() {
+    let directory = tempfile::Builder::new()
+        .prefix("adx-supervisor-stale-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let socket = directory.path().join("supervisor.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    drop(listener);
+
+    let error = supervisor::request(directory.path(), Request::Status, Duration::from_secs(1))
+        .await
+        .unwrap_err()
+        .to_string();
+
+    assert!(error.contains("supervisor"), "{error}");
+    assert!(error.contains("state_dir"), "{error}");
+}
+
 fn service_status<'a>(status: &'a serde_json::Value, service_id: &str) -> &'a serde_json::Value {
     status
         .get("services")
