@@ -23,6 +23,11 @@ fn decode_hex(data: &str) -> Result<Vec<u8>, String> {
     if !data.len().is_multiple_of(2) {
         return Err("hex data length must be even".to_string());
     }
+    // Slicing by byte offsets below is only safe once every byte is ASCII hex;
+    // multi-byte UTF-8 input would otherwise panic on a non-char-boundary.
+    if !data.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("invalid hex data: non-hexadecimal character".to_string());
+    }
     (0..data.len())
         .step_by(2)
         .map(|i| {
@@ -102,10 +107,18 @@ pub fn fs_write(kw: &BTreeMap<String, Value>) -> Value {
     let binary = kw.get("binary").and_then(|v| v.as_bool()).unwrap_or(false);
     let data = kw_str(kw, "data").unwrap_or_default();
     let bytes: Vec<u8> = if binary {
-        (0..data.len())
-            .step_by(2)
-            .filter_map(|i| u8::from_str_radix(data.get(i..i + 2)?, 16).ok())
-            .collect()
+        match decode_hex(&data) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                return map_value(vec![
+                    ("path", Value::from(path)),
+                    ("name", Value::from("")),
+                    ("type", Value::from("")),
+                    ("size", Value::from(0i64)),
+                    ("error", err(error)),
+                ])
+            }
+        }
     } else {
         data.into_bytes()
     };
@@ -372,5 +385,55 @@ mod tests {
         );
 
         fs::remove_dir_all(root).expect("remove fixture");
+    }
+
+    fn field<'a>(value: &'a Value, key: &str) -> &'a Value {
+        let Value::Map(fields) = value else {
+            panic!("expected map: {value:?}");
+        };
+        fields
+            .iter()
+            .find_map(|(name, value)| (name.as_str() == Some(key)).then_some(value))
+            .unwrap_or_else(|| panic!("missing field {key}: {value:?}"))
+    }
+
+    fn fixture_path(label: &str) -> std::path::PathBuf {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "adx-execd-fs-{label}-{}-{suffix}.bin",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn binary_single_shot_write_rejects_invalid_hex() {
+        let path = fixture_path("invalid-hex");
+        let value = fs_write(&args(&[
+            ("path", Value::from(path.to_string_lossy().as_ref())),
+            ("binary", Value::Boolean(true)),
+            ("data", Value::from("zz")),
+        ]));
+        assert!(
+            !field(&value, "error").is_nil(),
+            "invalid hex must be reported: {value:?}"
+        );
+        assert!(!path.exists(), "a failed write must not create the file");
+    }
+
+    #[test]
+    fn binary_chunk_write_rejects_non_ascii_hex_without_panicking() {
+        let path = fixture_path("non-ascii-hex");
+        let value = fs_write_chunk(&args(&[
+            ("path", Value::from(path.to_string_lossy().as_ref())),
+            ("data", Value::from("a€")),
+        ]));
+        assert!(
+            !field(&value, "error").is_nil(),
+            "non-ASCII hex must be an error: {value:?}"
+        );
+        assert!(!path.exists(), "a failed write must not create the file");
     }
 }
