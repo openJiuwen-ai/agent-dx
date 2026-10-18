@@ -123,8 +123,11 @@ impl ManagedService {
                 binding.scope != *scope || binding.current.version != view.template.version
             })
         {
-            return Err(Error::Unavailable(
+            // prepare_binding is a committed write: a mismatched result must not
+            // be reported as a retry-safe Unavailable.
+            return Err(Error::OutcomeUnknown(
                 "Binding/template identity mismatch".into(),
+            ));
             ));
         }
         view.template.validate().map_err(Error::Invalid)?;
@@ -298,7 +301,9 @@ impl ManagedService {
                 .iter()
                 .any(|service| service.protocol == protocol && service.port == selected_port)
         {
-            return Err(Error::Unavailable(
+            // Activation is a committed write; a mismatched target is an
+            // unknown outcome, not a safe-to-retry Unavailable.
+            return Err(Error::OutcomeUnknown(
                 "Activator target identity or service mismatch".into(),
             ));
         }
