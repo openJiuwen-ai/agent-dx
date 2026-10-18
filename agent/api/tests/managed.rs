@@ -74,3 +74,119 @@ fn service_selection_matches_protocol_and_requires_an_unambiguous_port() {
         ));
     }
 }
+
+mod post_write_outcome {
+    use adx_agent_api::{
+        activator::Control, managed::ManagedService, request::RequestContext, Error,
+    };
+    use adx_agent_core::{
+        activator::{BindingList, BindingPage, Target},
+        AgentBinding, BindingPhase, Scope, TemplateVersion,
+    };
+    use async_trait::async_trait;
+    use std::{collections::BTreeMap, sync::Arc, time::Duration};
+
+    struct MismatchedPrepare;
+
+    #[async_trait]
+    impl Control for MismatchedPrepare {
+        async fn prepare_binding(
+            &self,
+            ctx: &RequestContext,
+            scope: &Scope,
+            _launch: &adx_agent_core::launch::LaunchConfig,
+            _parameters: &adx_agent_core::mounts::Parameters,
+        ) -> adx_agent_api::Result<AgentBinding> {
+            ctx.start_write();
+            Ok(AgentBinding {
+                scope: Scope {
+                    binding_id: "different-binding".into(),
+                    ..scope.clone()
+                },
+                generation: "generation-1".into(),
+                environment_id: "environment-1".into(),
+                phase: BindingPhase::Active,
+                parameters: BTreeMap::new(),
+            })
+        }
+        async fn publish(
+            &self,
+            _ctx: &RequestContext,
+            _tenant: &str,
+            _template: &TemplateVersion,
+        ) -> adx_agent_api::Result<()> {
+            Err(Error::Unsupported("unused".into()))
+        }
+        async fn template(
+            &self,
+            _ctx: &RequestContext,
+            _tenant: &str,
+            _name: &str,
+            _version: &str,
+        ) -> adx_agent_api::Result<TemplateVersion> {
+            Err(Error::Unsupported("unused".into()))
+        }
+        async fn binding(
+            &self,
+            _ctx: &RequestContext,
+            _scope: &Scope,
+        ) -> adx_agent_api::Result<AgentBinding> {
+            Err(Error::Unsupported("unused".into()))
+        }
+        async fn list_bindings(
+            &self,
+            _ctx: &RequestContext,
+            _query: &BindingList,
+        ) -> adx_agent_api::Result<BindingPage> {
+            Err(Error::Unsupported("unused".into()))
+        }
+        async fn delete_binding(
+            &self,
+            _ctx: &RequestContext,
+            _scope: &Scope,
+        ) -> adx_agent_api::Result<()> {
+            Err(Error::Unsupported("unused".into()))
+        }
+        async fn activate(
+            &self,
+            _ctx: &RequestContext,
+            _scope: &Scope,
+            _expected_generation: Option<&str>,
+        ) -> adx_agent_api::Result<Target> {
+            Err(Error::Unsupported("unused".into()))
+        }
+        async fn activate_with_cache(
+            &self,
+            _ctx: &RequestContext,
+            _scope: &Scope,
+            _expected_generation: Option<&str>,
+            _bypass_cache: bool,
+        ) -> adx_agent_api::Result<Target> {
+            Err(Error::Unsupported("unused".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn committed_prepare_with_mismatched_identity_is_outcome_unknown() {
+        let service = ManagedService::new(Arc::new(MismatchedPrepare));
+        let ctx = RequestContext::new(Duration::from_secs(5));
+        let scope = Scope {
+            tenant: "tenant-a".into(),
+            template: "demo".into(),
+            version: "1".into(),
+            binding_id: "binding-a".into(),
+        };
+        let launch = adx_agent_core::launch::LaunchConfig {
+            credential_version: "v1".into(),
+            env: BTreeMap::new(),
+        };
+        let error = service
+            .prepare_binding(&ctx, &scope, &launch, &BTreeMap::new())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, Error::OutcomeUnknown(_)),
+            "committed mismatch must not be retry-safe: {error:?}"
+        );
+    }
+}
