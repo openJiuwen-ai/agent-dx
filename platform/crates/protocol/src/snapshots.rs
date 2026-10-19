@@ -15,6 +15,7 @@ impl TryFrom<Snapshot> for pb::ReusableSnapshot {
             source_runtime_id: s.source_runtime_id,
             artifact: Some(pb::CheckpointArtifact {
                 storage: s.artifact.storage,
+                scope: s.artifact.scope,
                 location: s.artifact.location,
                 size_bytes: s.artifact.size_bytes,
             }),
@@ -84,6 +85,7 @@ impl TryFrom<pb::ReusableSnapshot> for Snapshot {
             source_runtime_id: s.source_runtime_id,
             artifact: CheckpointArtifact {
                 storage: artifact.storage,
+                scope: artifact.scope,
                 location: artifact.location,
                 size_bytes: artifact.size_bytes,
             },

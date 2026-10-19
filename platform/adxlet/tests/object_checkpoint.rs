@@ -8,6 +8,7 @@ async fn remote_checkpoint_survives_source_disk_loss_and_verifies_content() {
     let source_dir = tempfile::tempdir().unwrap();
     let source = ObjectCheckpointStore::new(
         "shared".into(),
+        "test-scope".into(),
         remote.clone(),
         "test".into(),
         source_dir.path().into(),
@@ -27,6 +28,7 @@ async fn remote_checkpoint_survives_source_disk_loss_and_verifies_content() {
     let destination_dir = tempfile::tempdir().unwrap();
     let destination = ObjectCheckpointStore::new(
         "shared".into(),
+        "test-scope".into(),
         remote.clone(),
         "test".into(),
         destination_dir.path().into(),
@@ -62,6 +64,7 @@ async fn cache_budget_evicts_only_unpinned_downloads() {
     let dir = tempfile::tempdir().unwrap();
     let store = ObjectCheckpointStore::new(
         "shared".into(),
+        "test-scope".into(),
         remote,
         "test".into(),
         dir.path().into(),
@@ -98,6 +101,7 @@ async fn committed_pause_seeds_cache_without_an_obs_read() {
     let root = tempfile::tempdir().unwrap();
     let store = ObjectCheckpointStore::new(
         "shared".into(),
+        "scope".into(),
         remote.clone(),
         "test".into(),
         root.path().into(),
@@ -134,6 +138,7 @@ async fn checkpoint_larger_than_cache_still_restores() {
     let root = tempfile::tempdir().unwrap();
     let store = ObjectCheckpointStore::new(
         "shared".into(),
+        "scope".into(),
         Arc::new(InMemory::new()),
         "test".into(),
         root.path().into(),
@@ -156,6 +161,7 @@ async fn upload_rejects_symlinks_and_leaves_staging_for_rollback() {
     let dir = tempfile::tempdir().unwrap();
     let store = ObjectCheckpointStore::new(
         "shared".into(),
+        "test-scope".into(),
         Arc::new(InMemory::new()),
         "test".into(),
         dir.path().into(),
@@ -174,6 +180,7 @@ async fn reusable_copy_has_independent_artifact_lifetime() {
     let root = tempfile::tempdir().unwrap();
     let store = ObjectCheckpointStore::new(
         "shared".into(),
+        "test-scope".into(),
         Arc::new(InMemory::new()),
         "test".into(),
         root.path().into(),
@@ -219,6 +226,7 @@ async fn orphan_gc_requires_reconciliation_and_preserves_live_and_foreign_upload
     let old_root = tempfile::tempdir().unwrap();
     let old = ObjectCheckpointStore::new(
         "shared".into(),
+        "test-scope".into(),
         remote.clone(),
         "test".into(),
         old_root.path().into(),
@@ -244,6 +252,7 @@ async fn orphan_gc_requires_reconciliation_and_preserves_live_and_foreign_upload
     let new_root = tempfile::tempdir().unwrap();
     let current = ObjectCheckpointStore::new(
         "shared".into(),
+        "test-scope".into(),
         remote.clone(),
         "test".into(),
         new_root.path().into(),
@@ -264,6 +273,7 @@ async fn orphan_gc_requires_reconciliation_and_preserves_live_and_foreign_upload
     let foreign_root = tempfile::tempdir().unwrap();
     let foreign = ObjectCheckpointStore::new(
         "shared".into(),
+        "test-scope".into(),
         remote.clone(),
         "test".into(),
         foreign_root.path().into(),
@@ -296,6 +306,7 @@ async fn orphan_gc_keeps_unknown_objects_and_retries_pinned_artifacts() {
     let root = tempfile::tempdir().unwrap();
     let source = ObjectCheckpointStore::new(
         "shared".into(),
+        "test-scope".into(),
         remote.clone(),
         "test".into(),
         root.path().join("old"),
@@ -309,6 +320,7 @@ async fn orphan_gc_keeps_unknown_objects_and_retries_pinned_artifacts() {
     let artifact = source.publish(&staged).await.unwrap();
     let store = ObjectCheckpointStore::new(
         "shared".into(),
+        "test-scope".into(),
         remote.clone(),
         "test".into(),
         root.path().join("new"),
@@ -390,6 +402,7 @@ async fn orphan_gc_grace_period_protects_recent_uploads() {
         .unwrap();
     let store = ObjectCheckpointStore::new(
         "shared".into(),
+        "test-scope".into(),
         remote.clone(),
         "test".into(),
         root.path().into(),
@@ -401,4 +414,62 @@ async fn orphan_gc_grace_period_protects_recent_uploads() {
     store.authorize_remote_gc(&[]).await.unwrap();
     assert_eq!(store.collect_remote_orphans().await.unwrap(), 0);
     assert!(remote.head(&key).await.is_ok());
+}
+
+#[tokio::test]
+async fn remote_checkpoint_rejects_a_different_nonempty_scope() {
+    let remote: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let source_root = tempfile::tempdir().unwrap();
+    let source = ObjectCheckpointStore::new(
+        "shared".into(),
+        "scope-a".into(),
+        remote.clone(),
+        "test".into(),
+        source_root.path().into(),
+        1024,
+    )
+    .unwrap();
+    let staged = source.allocate().await.unwrap();
+    std::fs::write(staged.join("memory"), b"saved").unwrap();
+    let artifact = source.publish(&staged).await.unwrap();
+    let collector_root = tempfile::tempdir().unwrap();
+    let collector = ObjectCheckpointStore::new(
+        "shared".into(),
+        "scope-b".into(),
+        remote,
+        "test".into(),
+        collector_root.path().into(),
+        1024,
+    )
+    .unwrap();
+
+    assert!(collector.materialize(&artifact).await.is_err());
+    assert!(collector.remove(&artifact).await.is_err());
+}
+
+#[tokio::test]
+async fn scoped_store_accepts_legacy_unscoped_artifacts_from_its_alias() {
+    let remote: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let root = tempfile::tempdir().unwrap();
+    let store = ObjectCheckpointStore::new(
+        "shared".into(),
+        "scope-a".into(),
+        remote,
+        "test".into(),
+        root.path().into(),
+        1024,
+    )
+    .unwrap();
+    let staged = store.allocate().await.unwrap();
+    std::fs::write(staged.join("memory"), b"saved").unwrap();
+    let artifact = store.publish(&staged).await.unwrap();
+    let mut encoded = serde_json::to_value(&artifact).unwrap();
+    encoded.as_object_mut().unwrap().remove("scope");
+    let legacy: adx_core::CheckpointArtifact = serde_json::from_value(encoded).unwrap();
+    assert!(legacy.scope.is_empty());
+
+    let lease = store.materialize(&legacy).await.unwrap();
+    assert_eq!(std::fs::read(lease.join("memory")).unwrap(), b"saved");
+    drop(lease);
+    store.remove(&legacy).await.unwrap();
 }

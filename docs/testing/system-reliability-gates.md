@@ -29,6 +29,15 @@
 | TIME-04 | 分阶段 deadline | 调度、启动、Execd ready、持久化分别耗尽；下游 deadline 不增长 | 待 E2E |
 | TIME-05 | 上游超时后的结果 | 最终结果可由同一 request/instance 查询，物理 backend 唯一 | 部分组件覆盖，待 E2E |
 
+## Coordinator 退出与重启
+
+Coordinator 收到退出信号后先停止节点健康判定、期限检查、恢复、回收与路由刷新等后台任务，再等待 RPC 连接退出。关闭心跳入口后不能继续将节点判为失联；新进程仍须关闭旧路由，等待节点完成重新登记与对账。
+
+| 门禁 | 场景 | 通过条件 | 当前状态 |
+|---|---|---|---|
+| COORD-01 | 长连接使 RPC 退出等待超过心跳期限 | 退出等待期间不执行后台节点失效；新进程登记后保留原实例和绝对期限 | 2026-10-16 Linux 周期维护 RED/GREEN 回归通过；隔离 CCE 控制面与真实 Firecracker 上，12秒心跳期限、15秒 SIGTERM 等待后重启，E2B 原沙箱期限、文件与命令检查通过。详见 [E2B 生命周期验证记录](2026-10-15-e2b-checkpoint-cooperation.md) |
+| COORD-02 | 持久删除与已排队恢复竞争 | 删除后撤销 recovery request；权威重建不将陈旧 spec 当作新创建，保留独立 pending create | 2026-10-16 两项 Linux RED/GREEN、release 标记回归；真实 KVM 上 adxlet 超时后返回再删除，15秒无复活且检查点对象为0。详见 [E2B 生命周期验证记录](2026-10-15-e2b-checkpoint-cooperation.md) |
+
 ## sandboxd 故障
 
 | 门禁 | 场景 | 通过条件 | 当前状态 |
@@ -49,7 +58,7 @@ Start 失败专项：RPC 失败、超时、应答丢失及无效成功载荷均�
 | NM-03 | 对账期间再次崩溃 | 再次启动继续从 Redis 权威状态收敛，不复活旧 generation | 已有中断物理清理后新 adxlet 重读 inventory、重复幂等删除并保持准入关闭的组件测试；[Full #43](https://buildkite.com/agent-dx/agent-dx-full-test/builds/43) 在双物理 worker 真实注入失联、runc init 暂挂、对账中 Adxlet 崩溃，随后验证换 session、清理旧 backend 再准入 |
 | NM-04 | Environment 删除后的 Runtime 控制连接 | Readiness 与 Checkpoint 共用按 Environment、Runtime、generation 和 endpoint 隔离的连接；撤路由后主动关闭该 Runtime 的空闲连接，再删除 sandboxd Runtime；旧 generation 的迟到清理不能关闭复用同一 IP 的新 Runtime；5 秒 idle close 只作为异常兜底 | 组件测试覆盖连接主动关闭和 generation 隔离；连续 create/delete 后 adxlet FD、连接与内存回归仍待使用新产物复测 |
 | NODE-01 | 节点故障且无 checkpoint | Failed、撤路由，不从镜像冷启动 | 已有组件覆盖；[Full #31](https://buildkite.com/agent-dx/agent-dx-full-test/builds/31) 在双物理 worker 网络隔离期间验证失效和公开入口拒绝。完整三 VM 门禁仍待执行 |
-| NODE-02 | 共享 checkpoint | 跨节点恢复同一 Environment ID，generation 递增，旧执行不能复活 | 已有本地 FC 覆盖，待多 VM 门禁 |
+| NODE-02 | 共享 checkpoint | 跨节点恢复同一 Environment ID，generation 递增，旧执行不能复活 | 2026-10-16 双物理 worker 两次实际 OS reboot，跨节点进入 Paused 后 SDK Connect 保留 ID 和 RAM 身份；无 checkpoint 对照 Failed，不冷启动。旧 Coordinator 工件与后续修复版本分开记录；未执行硬断电或完整三 VM 矩阵。详见 [E2B 生命周期验证记录](2026-10-15-e2b-checkpoint-cooperation.md) |
 | NODE-03 | local-only checkpoint | 明确恢复失败，不在其他节点创建空白实例 | 已有组件覆盖，待多 VM 门禁 |
 | NODE-04 | 原节点迟到返回 | 清理旧执行后才开放准入，旧提交和旧路由全部拒绝 | 已有本地进程失联 E2E；[Full #31](https://buildkite.com/agent-dx/agent-dx-full-test/builds/31) 验证恢复节点的旧 backend 清理和准入顺序。旧 session 的直接写入拒绝仍由组件及三 VM 专项用例分别覆盖 |
 

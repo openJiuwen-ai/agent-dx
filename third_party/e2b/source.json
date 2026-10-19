@@ -1,0 +1,32 @@
+{
+  "repository": "https://github.com/e2b-dev/infra.git",
+  "revision": "92197909dce5a1bef33e764ae4af76f0732fd7a8",
+  "envd_version": "0.9.0",
+  "go_toolchain": "go1.26.8",
+  "files": [
+    {
+      "source": "LICENSE",
+      "sha256": "b4ef1bf811cb4095229fb86b574199e467c78f0ac4078cf8be62189e1fbd0818"
+    },
+    {
+      "source": "packages/envd/go.mod",
+      "sha256": "5ebd33d50e7cd6d744f0977f1c27af89919a894ea71a3345c721995817974795"
+    },
+    {
+      "source": "packages/envd/go.sum",
+      "sha256": "7eb80e00e25a5ce015cffeabe3f1457a76fa38414c100f4a7126c69ee14e5d3f"
+    },
+    {
+      "source": "packages/envd/pkg/version.go",
+      "sha256": "48cab73534b8cb2516e4add7c6f7c621457da1e4a88891d449ad1e592550f853"
+    },
+    {
+      "source": "packages/shared/go.mod",
+      "sha256": "dcac7c6d9788f2cd531d89f43666bc7657c2efe0cca0bbd5cf923f912394859e"
+    },
+    {
+      "source": "packages/shared/go.sum",
+      "sha256": "26fbdf0c07e362511444a98fc8dde36a4a78b552cd4f48fc7ecbe73605daebf9"
+    }
+  ]
+}

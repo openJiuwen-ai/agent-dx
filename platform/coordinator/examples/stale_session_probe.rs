@@ -67,6 +67,7 @@ async fn run() -> ProbeResult<()> {
     }
     let rejected = rpc
         .commit_environment(pb::CommitEnvironmentRequest {
+            cleanup_artifacts: vec![],
             record: Some(before.clone()),
             node_session_id: old_session.clone(),
         })

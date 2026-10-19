@@ -1,4 +1,5 @@
 use super::protocol::ConnectTarget;
+use crate::ingress::e2b_route::E2bRouteConfig;
 use serde::{de, Deserialize, Deserializer};
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
@@ -46,6 +47,9 @@ pub struct RouteInfo {
     pub port_forward_security_mode: DataPlaneSecurityMode,
     #[serde(rename = "portForwardRoutes", default)]
     pub port_forward_routes: Vec<PortForwardRoute>,
+    /// E2B-only data-plane policy. Native routes remain unchanged when absent.
+    #[serde(rename = "e2b", default)]
+    pub e2b: Option<E2bRouteConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]

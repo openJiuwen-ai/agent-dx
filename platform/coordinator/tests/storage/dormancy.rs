@@ -32,6 +32,7 @@ async fn paused_fixture() -> (
         expires_at_unix_seconds: None,
         source_runtime_id: "sleep-1".into(),
         artifact: adx_core::CheckpointArtifact {
+            scope: String::new(),
             storage: "obs".into(),
             location: "artifact".into(),
             size_bytes: 8,
@@ -233,6 +234,7 @@ async fn node_loss_preserves_dormancy_and_does_not_enqueue_restore() {
         expires_at_unix_seconds: None,
         source_runtime_id: "sleeper-1".into(),
         artifact: adx_core::CheckpointArtifact {
+            scope: String::new(),
             storage: "obs".into(),
             location: "artifact".into(),
             size_bytes: 8,

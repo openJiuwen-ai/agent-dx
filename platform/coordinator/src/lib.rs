@@ -53,6 +53,7 @@ pub struct Coordinator {
     shards: Vec<ShardScheduler>,
     node_shards: BTreeMap<String, usize>,
     requests: BTreeMap<String, (usize, EnvironmentSpec)>,
+    recovery_requests: BTreeSet<String>,
     next_shard: usize,
     next_node_shard: usize,
     generation: u64,
@@ -158,6 +159,7 @@ impl Coordinator {
                 .collect(),
             node_shards: BTreeMap::new(),
             requests: BTreeMap::new(),
+            recovery_requests: BTreeSet::new(),
             next_shard: 0,
             next_node_shard: 0,
             generation: 0,
@@ -210,7 +212,10 @@ impl Coordinator {
                 }
             }
         }
-        self.submit(spec)
+        let id = spec.id.clone();
+        let shard = self.submit(spec)?;
+        self.recovery_requests.insert(id);
+        Ok(shard)
     }
     pub fn submit(&mut self, spec: EnvironmentSpec) -> Result<usize> {
         spec.validate()?;
@@ -245,6 +250,7 @@ impl Coordinator {
             shard.forget_queued(id);
         }
         self.requests.remove(id);
+        self.recovery_requests.remove(id);
         true
     }
 
@@ -274,6 +280,7 @@ impl Coordinator {
             shard.forget_queued(&spec.id);
         }
         self.requests.remove(&spec.id);
+        self.recovery_requests.remove(&spec.id);
         self.restore_assignment(spec, assignment)?;
         self.generation = self.generation.max(assignment.generation);
         Ok(())
@@ -293,11 +300,15 @@ impl Coordinator {
             shard.forget_queued(id);
         }
         self.requests.remove(id);
+        self.recovery_requests.remove(id);
         self.retired.insert(id.to_string());
         Ok(())
     }
     /// Clear the retired scheduling marker after storage confirms explicit deletion.
     pub(crate) fn forget_deleted(&mut self, id: &str) -> Result<()> {
+        if self.recovery_requests.contains(id) {
+            self.retire_claim(id)?;
+        }
         if self.requests.contains_key(id) || self.snapshot.environments().contains_key(id) {
             return Err(Error::Conflict);
         }
@@ -499,9 +510,48 @@ impl Coordinator {
             .ok_or(Error::NotFound)?
             .release(assignment)?;
         self.requests.remove(&assignment.environment_id);
+        self.recovery_requests.remove(&assignment.environment_id);
         Arc::make_mut(&mut self.snapshot).remove(&assignment.environment_id);
         self.journal.record(&assignment.node_id);
         self.wake_pending(None);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec() -> EnvironmentSpec {
+        serde_json::from_value(serde_json::json!({
+            "id": "assigned-recovery", "tenant_id": "tenant", "image": "image",
+            "runtime_class": "runsc", "priority": 0,
+            "resources": {"cpu_millis": 100, "memory_bytes": 128, "disk_bytes": 0}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn releasing_an_assigned_recovery_request_clears_its_marker() {
+        let spec = spec();
+        let mut coordinator = Coordinator::new(1, Placement::Pack).unwrap();
+        coordinator
+            .register(Node {
+                id: "node".into(),
+                capacity: spec.resources,
+                available: true,
+                labels: Default::default(),
+                devices: vec![],
+                runtime_classes: vec![spec.runtime_class.clone()],
+            })
+            .unwrap();
+        coordinator.submit_recovery(spec.clone()).unwrap();
+        let assignment = coordinator.schedule(0).unwrap().unwrap();
+        assert!(coordinator.recovery_requests.contains(&spec.id));
+
+        coordinator.release(&assignment).unwrap();
+
+        assert!(!coordinator.recovery_requests.contains(&spec.id));
+        assert!(coordinator.submit(spec).is_ok());
     }
 }

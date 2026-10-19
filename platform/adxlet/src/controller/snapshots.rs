@@ -72,6 +72,7 @@ impl Controller {
             self.record.runtime.id.clone(),
             adx_core::CheckpointArtifact {
                 storage: "pending".into(),
+                scope: String::new(),
                 location: "pending".into(),
                 size_bytes: 1,
             },

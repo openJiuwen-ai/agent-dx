@@ -2,6 +2,7 @@ pub mod auth;
 pub mod connector;
 #[cfg(feature = "activity-client")]
 pub mod coordinator_routes;
+pub mod e2b_route;
 pub mod http_pool;
 pub mod path;
 pub mod pool;

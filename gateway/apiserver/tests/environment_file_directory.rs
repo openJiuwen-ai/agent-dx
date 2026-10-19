@@ -73,6 +73,7 @@ async fn embedded_file_directory_accepts_new_specs_without_legacy_credentials() 
             }),
             node_address: "127.0.0.1:1".into(),
             relay_address: "127.0.0.1:2".into(),
+            compatibility: None,
         });
     }
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

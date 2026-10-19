@@ -1,0 +1,164 @@
+diff --git a/cmd/firecracker-agent/main.go b/cmd/firecracker-agent/main.go
+index a3cb7c1..5d1ad5c 100644
+--- a/cmd/firecracker-agent/main.go
++++ b/cmd/firecracker-agent/main.go
+@@ -858,10 +858,23 @@ func (handoff *checkpointHandoff) close() {
+ 	<-handoff.done
+ }
+ 
++var setRealtimeClock = func(unixNanos int64) error {
++	if unixNanos <= 0 {
++		return errors.New("restore realtime timestamp is required")
++	}
++	timeval := unix.NsecToTimeval(unixNanos)
++	return unix.Settimeofday(&timeval)
++}
++
+ func releaseCheckpoint(request firecrackerproto.CheckpointRequest) error {
+ 	if request.Outcome != "resume" && request.Outcome != "restore" && request.Outcome != "error" {
+ 		return fmt.Errorf("invalid checkpoint outcome %q", request.Outcome)
+ 	}
++	if request.Outcome == "restore" {
++		if err := setRealtimeClock(request.RealtimeUnixNanos); err != nil {
++			return fmt.Errorf("set restored realtime clock: %w", err)
++		}
++	}
+ 	state.mu.RLock()
+ 	handoff := state.handoff
+ 	state.mu.RUnlock()
+diff --git a/cmd/firecracker-agent/main_test.go b/cmd/firecracker-agent/main_test.go
+index 1e3f447..00ae5de 100644
+--- a/cmd/firecracker-agent/main_test.go
++++ b/cmd/firecracker-agent/main_test.go
+@@ -634,3 +634,55 @@ func (w *recordingWriteCloser) Close() error {
+ 	w.closed = true
+ 	return nil
+ }
++
++func TestReleaseCheckpointRestoreSetsRealtimeBeforeHandoff(t *testing.T) {
++	old := setRealtimeClock
++	defer func() { setRealtimeClock = old }()
++	var got int64
++	setRealtimeClock = func(value int64) error { got = value; return nil }
++	reader := make(chan string, 1)
++	handoff := &checkpointHandoff{environmentPath: filepath.Join(t.TempDir(), "restore-env"), reader: reader}
++	state.mu.Lock()
++	previous := state.handoff
++	state.handoff = handoff
++	state.mu.Unlock()
++	defer func() { state.mu.Lock(); state.handoff = previous; state.mu.Unlock() }()
++	request := firecrackerproto.CheckpointRequest{Outcome: "restore", RealtimeUnixNanos: 1234, Environment: []string{"A=B"}}
++	if err := releaseCheckpoint(request); err != nil {
++		t.Fatal(err)
++	}
++	if got != request.RealtimeUnixNanos {
++		t.Fatalf("clock = %d", got)
++	}
++	select {
++	case outcome := <-reader:
++		if outcome != "restore" {
++			t.Fatalf("outcome = %q", outcome)
++		}
++	default:
++		t.Fatal("restore was not handed off")
++	}
++}
++
++func TestReleaseCheckpointRestoreClockFailureDoesNotHandoff(t *testing.T) {
++	old := setRealtimeClock
++	defer func() { setRealtimeClock = old }()
++	setRealtimeClock = func(int64) error { return errors.New("denied") }
++	handoff := &checkpointHandoff{environmentPath: filepath.Join(t.TempDir(), "restore-env"), reader: make(chan string, 1)}
++	state.mu.Lock()
++	previous := state.handoff
++	state.handoff = handoff
++	state.mu.Unlock()
++	defer func() { state.mu.Lock(); state.handoff = previous; state.mu.Unlock() }()
++	if err := releaseCheckpoint(firecrackerproto.CheckpointRequest{Outcome: "restore", RealtimeUnixNanos: 1234}); err == nil {
++		t.Fatal("restore clock failure accepted")
++	}
++	select {
++	case <-handoff.reader:
++		t.Fatal("failed restore was handed off")
++	default:
++	}
++	if _, err := os.Stat(handoff.environmentPath); !os.IsNotExist(err) {
++		t.Fatalf("restore environment written: %v", err)
++	}
++}
+diff --git a/internal/firecrackerproto/protocol.go b/internal/firecrackerproto/protocol.go
+index f145367..12b03cf 100644
+--- a/internal/firecrackerproto/protocol.go
++++ b/internal/firecrackerproto/protocol.go
+@@ -70,8 +70,9 @@ const (
+ 
+ // CheckpointRequest carries the checkpoint lifecycle event to the guest agent.
+ type CheckpointRequest struct {
+-	Outcome     string   `json:"outcome"`               // "resume", "error", or "restore"
+-	Environment []string `json:"environment,omitempty"` // target env after restore
++	Outcome           string   `json:"outcome"`                       // "resume", "error", or "restore"
++	Environment       []string `json:"environment,omitempty"`         // target env after restore
++	RealtimeUnixNanos int64    `json:"realtime_unix_nanos,omitempty"` // required for restore
+ }
+ 
+ type Response struct {
+diff --git a/internal/firecrackerproto/protocol_test.go b/internal/firecrackerproto/protocol_test.go
+index ba5abed..a7e4b8a 100644
+--- a/internal/firecrackerproto/protocol_test.go
++++ b/internal/firecrackerproto/protocol_test.go
+@@ -199,3 +199,22 @@ type testError struct {
+ func (err *testError) Error() string {
+ 	return err.value
+ }
++
++func TestCheckpointRequestRealtimeRoundTrip(t *testing.T) {
++	request := CheckpointRequest{Outcome: "restore", RealtimeUnixNanos: 1_700_000_000_123_456_789}
++	var encoded bytes.Buffer
++	if err := WriteMessage(&encoded, MessageCheckpoint, request); err != nil {
++		t.Fatal(err)
++	}
++	_, payload, err := ReadMessage(&encoded)
++	if err != nil {
++		t.Fatal(err)
++	}
++	var decoded CheckpointRequest
++	if err := Decode(payload, &decoded); err != nil {
++		t.Fatal(err)
++	}
++	if decoded.RealtimeUnixNanos != request.RealtimeUnixNanos {
++		t.Fatalf("realtime = %d", decoded.RealtimeUnixNanos)
++	}
++}
+diff --git a/pkg/runtime/firecracker/checkpoint_handler.go b/pkg/runtime/firecracker/checkpoint_handler.go
+index f20e7ce..eae806c 100644
+--- a/pkg/runtime/firecracker/checkpoint_handler.go
++++ b/pkg/runtime/firecracker/checkpoint_handler.go
+@@ -694,6 +694,16 @@ func checkRestoredMemorySize(memorySize int64) error {
+ 	return nil
+ }
+ 
++// restoreCheckpointRequest samples host realtime immediately before releasing the
++// restored guest, so the guest can correct the snapshot's stale wall clock.
++func restoreCheckpointRequest(environment []string) firecrackerproto.CheckpointRequest {
++	return firecrackerproto.CheckpointRequest{
++		Outcome:           "restore",
++		Environment:       environment,
++		RealtimeUnixNanos: time.Now().UnixNano(),
++	}
++}
++
+ func (handler *Handler) Restore(
+ 	ctx context.Context,
+ 	startConfig runtimecore.StartConfig,
+@@ -988,10 +998,7 @@ func (handler *Handler) Restore(
+ 		agentCtx,
+ 		vsockPath,
+ 		firecrackerproto.MessageCheckpoint,
+-		firecrackerproto.CheckpointRequest{
+-			Outcome:     "restore",
+-			Environment: plan.configure.Process.Env,
+-		},
++		restoreCheckpointRequest(plan.configure.Process.Env),
+ 	); err != nil {
+ 		return fmt.Errorf("release restored Firecracker sandbox: %w", err)
+ 	}

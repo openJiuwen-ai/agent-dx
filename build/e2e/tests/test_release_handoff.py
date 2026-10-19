@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import os
 import py_compile
 import shutil
@@ -76,7 +77,9 @@ class ReleaseArchiveTests(unittest.TestCase):
             self.assertTrue((restored / 'bin/redis-cli').stat().st_mode & 0o111)
             self.assertTrue((restored / 'etc/examples/deployment.yaml').is_file())
             self.assertTrue((restored / 'third_party/sandboxd/source.json').is_file())
-            self.assertFalse((restored / 'third_party/sandboxd/patches').exists())
+            sandboxd_source = json.loads((restored / 'third_party/sandboxd/source.json').read_text())
+            for patch in sandboxd_source['patches']:
+                self.assertEqual(package.sha(restored / patch['path']), patch['sha256'])
 
     def test_python_bytecode_does_not_dirty_build_sources(self):
         with tempfile.TemporaryDirectory() as temp:

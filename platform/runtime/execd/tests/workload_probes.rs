@@ -98,6 +98,7 @@ fn start(config: ProbeConfig) -> Process {
     let record = EnvironmentRecord {
         failure: None,
         spec: EnvironmentSpec {
+            compatibility: None,
             runtime_profile: None,
             snapshot_id: None,
             lifecycle: Default::default(),

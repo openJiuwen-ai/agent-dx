@@ -3,6 +3,7 @@ use crate::common::protocol::ConnectTarget;
 use crate::common::route::{
     DataPlaneAuthMode, DataPlaneSecurityMode, EnvironmentStatus, RouteInfo,
 };
+use crate::ingress::e2b_route::E2bRouteConfig;
 use crate::ingress::route_store::{RouteChange, RouteStore};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -92,6 +93,7 @@ pub struct RouteHandle {
     pub tenant_id: String,
     pub tunnel_security_mode: DataPlaneSecurityMode,
     pub port_forward_auth_mode: DataPlaneAuthMode,
+    pub e2b: Option<E2bRouteConfig>,
     pub target: ConnectTarget,
 }
 
@@ -226,6 +228,7 @@ impl IngressRouteResolver {
                     && route.relay_address == handle.relay_address
                     && route.environment_id == handle.target.workload_id
                     && route.environment_ip.parse().ok() == Some(handle.target.target_ip)
+                    && route.e2b == handle.e2b
             })
     }
 
@@ -360,6 +363,7 @@ impl IngressRouteResolver {
             tenant_id: route.tenant_id,
             tunnel_security_mode: route.tunnel_security_mode,
             port_forward_auth_mode,
+            e2b: route.e2b,
             target,
         })
     }
@@ -391,6 +395,7 @@ mod tests {
             tunnel_security_mode: DataPlaneSecurityMode::Inherit,
             port_forward_security_mode: DataPlaneSecurityMode::Inherit,
             port_forward_routes: Vec::new(),
+            e2b: None,
         }
     }
 

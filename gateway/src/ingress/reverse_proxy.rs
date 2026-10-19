@@ -164,6 +164,10 @@ impl ReverseProxy {
         route: &ProxyRoute,
         peer: SocketAddr,
     ) -> Response<ProxyBody> {
+        // Hyper represents HTTP/2 :authority in the URI rather than a Host
+        // field. Preserve that client authority before rewriting the URI to
+        // the configured HTTP/1 upstream.
+        normalize_http1_request(&mut request);
         let upgrade = requested_upgrade(request.headers());
         let downstream_upgrade = upgrade.as_ref().map(|_| hyper::upgrade::on(&mut request));
         let original_host = request.headers().get(header::HOST).cloned();
@@ -272,6 +276,21 @@ fn requested_upgrade(headers: &HeaderMap) -> Option<HeaderValue> {
     requested
         .then(|| headers.get(header::UPGRADE).cloned())
         .flatten()
+}
+
+fn normalize_http1_request<B>(request: &mut Request<B>) {
+    if !request.headers().contains_key(header::HOST) {
+        let authority = request
+            .uri()
+            .authority()
+            .map(|value| value.as_str().to_owned());
+        if let Some(authority) = authority {
+            if let Ok(host) = HeaderValue::from_str(&authority) {
+                request.headers_mut().insert(header::HOST, host);
+            }
+        }
+    }
+    *request.version_mut() = http::Version::HTTP_11;
 }
 
 fn remove_hop_headers(headers: &mut HeaderMap) {
@@ -395,5 +414,35 @@ mod tests {
         remove_hop_headers(&mut headers);
         assert_eq!(headers.len(), 2);
         assert_eq!(headers.get_all(header::SET_COOKIE).iter().count(), 2);
+    }
+
+    #[test]
+    fn http2_authority_becomes_host_for_http1_upstreams() {
+        let mut request = Request::builder()
+            .version(http::Version::HTTP_2)
+            .uri("https://sdk.example.test:443/v2/sandboxes")
+            .body(())
+            .unwrap();
+        normalize_http1_request(&mut request);
+        assert_eq!(request.version(), http::Version::HTTP_11);
+        assert_eq!(
+            request.headers().get(header::HOST).unwrap(),
+            "sdk.example.test:443"
+        );
+    }
+
+    #[test]
+    fn existing_http1_host_is_preserved() {
+        let mut request = Request::builder()
+            .version(http::Version::HTTP_11)
+            .uri("http://upstream.example.test/v2/sandboxes")
+            .header(header::HOST, "sdk.example.test")
+            .body(())
+            .unwrap();
+        normalize_http1_request(&mut request);
+        assert_eq!(
+            request.headers().get(header::HOST).unwrap(),
+            "sdk.example.test"
+        );
     }
 }

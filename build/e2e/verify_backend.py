@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 from prepare import BACKEND_BINARIES, ROOT, sha
+from build_backend import patch_identity
 
 
 def verify(directory, target):
@@ -13,6 +14,8 @@ def verify(directory, target):
     manifest = json.loads((directory / 'manifest.json').read_text())
     if manifest['sandboxd_revision'] != pinned['revision'] or manifest['target'] != target:
         raise ValueError('cached backend revision or architecture mismatch')
+    if manifest.get('sandboxd_patches', []) != patch_identity(pinned):
+        raise ValueError('cached backend patch identity mismatch')
     if set(manifest['files']) != set(BACKEND_BINARIES):
         raise ValueError('cached backend file set mismatch')
     for name in BACKEND_BINARIES:

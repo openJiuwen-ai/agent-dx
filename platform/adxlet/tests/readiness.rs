@@ -46,6 +46,7 @@ fn record() -> EnvironmentRecord {
         restart_attempts: 0,
         restart_pending: false,
         spec: EnvironmentSpec {
+            compatibility: None,
             runtime_profile: None,
             snapshot_id: None,
             lifecycle: Default::default(),
@@ -88,9 +89,10 @@ impl Drop for Server {
     }
 }
 async fn serve(
-    body: &'static str,
+    body: impl Into<String>,
     stopped: Option<Arc<Runtime>>,
 ) -> (u16, Server, Arc<AtomicUsize>) {
+    let body = body.into();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let requests = Arc::new(AtomicUsize::new(0));
@@ -210,6 +212,100 @@ async fn active_client_request_still_blocks_idle_activity() {
             .unwrap(),
         (8, 1)
     );
+}
+
+#[tokio::test]
+async fn e2b_requires_ready_envd_with_the_requested_protocol_version() {
+    for (service, ready) in [
+        (serde_json::json!({}), false),
+        (
+            serde_json::json!({"envd":{"phase":"starting","version":"0.9.0"}}),
+            false,
+        ),
+        (serde_json::json!({"envd":{"phase":"ready"}}), false),
+        (
+            serde_json::json!({"envd":{"phase":"ready","version":"0.8.0"}}),
+            false,
+        ),
+        (
+            serde_json::json!({"envd":{"phase":"failed","version":"0.9.0"}}),
+            false,
+        ),
+        (
+            serde_json::json!({"envd":{"phase":"ready","version":"0.9.0"}}),
+            true,
+        ),
+    ] {
+        let mut record = record();
+        record.spec.compatibility = Some(adx_core::environment_control::EnvironmentCompatibility {
+            template_id: "base".into(),
+            envd_version: "0.9.0".into(),
+            envd_access_token: "a".repeat(32),
+            traffic_access_token: "b".repeat(32),
+            timeout_seconds: 60,
+            timeout_action: "delete".into(),
+            pause_retention_seconds: 90000,
+            allow_public_traffic: true,
+            metadata: Default::default(),
+        });
+        let body = serde_json::json!({
+            "identity":{"environment_id":"i","runtime_id":"i-1","ownership_generation":1},
+            "revision":1,"phase":"running","checkpoint":null,"active_requests":0,"active_commands":0,
+            "required_services":service,
+        }).to_string();
+        let (port, _server, _) = serve(body, None).await;
+        assert_eq!(
+            checker(runtime(true), port)
+                .wait_ready(&record)
+                .await
+                .is_ok(),
+            ready
+        );
+    }
+}
+
+#[tokio::test]
+async fn e2b_activity_requires_ready_envd_with_matching_version() {
+    for (service, healthy) in [
+        (serde_json::json!({}), false),
+        (
+            serde_json::json!({"envd":{"phase":"failed","version":"0.9.0"}}),
+            false,
+        ),
+        (
+            serde_json::json!({"envd":{"phase":"ready","version":"0.8.0"}}),
+            false,
+        ),
+        (
+            serde_json::json!({"envd":{"phase":"ready","version":"0.9.0"}}),
+            true,
+        ),
+    ] {
+        let mut record = record();
+        record.spec.compatibility = Some(adx_core::environment_control::EnvironmentCompatibility {
+            template_id: "base".into(),
+            envd_version: "0.9.0".into(),
+            envd_access_token: "a".repeat(32),
+            traffic_access_token: "b".repeat(32),
+            allow_public_traffic: true,
+            timeout_seconds: 60,
+            timeout_action: "delete".into(),
+            pause_retention_seconds: 90_000,
+            metadata: Default::default(),
+        });
+        let body = serde_json::json!({
+            "identity":{"environment_id":"i","runtime_id":"i-1","ownership_generation":1},
+            "revision":1,"phase":"running","checkpoint":null,
+            "active_requests":0,"active_commands":0,"activity_revision":1,
+            "required_services":service,
+        })
+        .to_string();
+        let (port, _server, _) = serve(body, None).await;
+        assert_eq!(
+            checker(runtime(true), port).activity(&record).await.is_ok(),
+            healthy
+        );
+    }
 }
 
 #[tokio::test]

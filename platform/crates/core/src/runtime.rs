@@ -1,6 +1,7 @@
 //! Shared Execd HTTP/stream control payloads; lifecycle decisions remain in Adxlet.
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeIdentity {
     pub environment_id: String,
@@ -99,6 +100,32 @@ pub struct RuntimeStatus {
     /// Changes on request/command entry and exit, including bursts between polls.
     #[serde(default)]
     pub activity_revision: u64,
+    /// Deployment-owned services required by the selected runtime profile.
+    /// An omitted map is the legacy/native profile and carries no extra
+    /// readiness requirements.
+    #[serde(default)]
+    pub required_services: BTreeMap<String, RequiredServiceStatus>,
+}
+
+/// State reported by a guest service which participates in runtime readiness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequiredServicePhase {
+    Disabled,
+    Starting,
+    Ready,
+    Failed,
+}
+
+/// Version and failure information for one deployment-owned guest service.
+/// The error text is diagnostic only and must never contain credentials.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequiredServiceStatus {
+    pub phase: RequiredServicePhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

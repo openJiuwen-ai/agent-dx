@@ -27,6 +27,10 @@ Environment 自动暂停复用 idle timeout，策略为 delete/pause；匿名恢
 
 AFS（Agent FS）是可选文件系统组件，源码、整体文档、构建、CI 和发布入口统一使用 `afs`。OwnerFs 与 DFS 是其内部平级模式；模式模块及 `ownerfs_*`／`dfs_*` 配置沿用各自名称。参见 [AFS 架构与关键时序图](afs.md)，其中包含 OwnerFs／DFS 总览、workspace bind 与远端路径、DFS 外部 S3 发布和读取流程。
 
+## 可选 E2B 兼容链路
+
+E2B 管理协议适配属于 `gateway/apiserver/src/e2b`，复用 EnvironmentService；独立绝对期限与 metadata 属于平台 `EnvironmentControlRecord`，随 Redis StoredEnvironment 原子保存。Ingress 读取平台发布的凭据摘要、envd Ready 与期限，经 Relay 将 commands/files/PTY 请求发往 guest envd 49983。Execd 管理固定 envd 的初始化和健康，adxlet 的 Ready 同时要求 Execd 与 envd 成功；原生 ADX 沙箱不启动 envd。Firecracker 受信任 guest metadata 由打补丁的 sandboxd 在 boot/load-resume 间写入 MMDS。profile 只配置受信任 rootfs/bootstrap，不成为第二个生命周期状态机。接口、配置与请求图见 [E2B 部署指南](../deployment/e2b-compatibility.md)，当前证明范围见 [CCE 验证记录](../testing/2026-10-10-e2b-compatibility.md)。
+
 ## 实际目录
 
 ```text

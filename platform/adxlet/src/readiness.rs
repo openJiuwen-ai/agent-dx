@@ -1,7 +1,7 @@
 //! Execd Ready notification, or HTTP readiness when no stream is configured.
 use crate::runtime_control::RuntimeControlClient;
 use crate::{Readiness, RuntimeDriver};
-use adx_core::runtime::RuntimePhase;
+use adx_core::runtime::{RequiredServicePhase, RuntimePhase};
 use adx_core::{EnvironmentRecord, Error, Result};
 use async_trait::async_trait;
 use std::{sync::Arc, time::Duration};
@@ -65,8 +65,23 @@ impl ExecdReadiness {
         if let Some(failure) = status.failure {
             return Err(Error::ProbeFailed(failure));
         }
+        self.validate_status(record, &status)
+    }
+    fn validate_status(
+        &self,
+        record: &EnvironmentRecord,
+        status: &adx_core::runtime::RuntimeStatus,
+    ) -> Result<()> {
         if status.phase != RuntimePhase::Running {
             return Err(unavailable("runtime control is not running"));
+        }
+        if let Some(compatibility) = &record.spec.compatibility {
+            if !status.required_services.get("envd").is_some_and(|service| {
+                service.phase == RequiredServicePhase::Ready
+                    && service.version.as_deref() == Some(compatibility.envd_version.as_str())
+            }) {
+                return Err(unavailable("required envd service/version is not ready"));
+            }
         }
         Ok(())
     }
@@ -88,7 +103,8 @@ impl Readiness for ExecdReadiness {
     }
     async fn activity(&self, record: &EnvironmentRecord) -> Result<(u64, u64)> {
         let status = self.client.status(record).await?;
-        if status.phase != RuntimePhase::Running || status.activity_revision == 0 {
+        self.validate_status(record, &status)?;
+        if status.activity_revision == 0 {
             return Err(unavailable("runtime activity observation is not ready"));
         }
         // A detached background command belongs to the runtime, not to a live

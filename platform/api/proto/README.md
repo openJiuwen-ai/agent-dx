@@ -120,3 +120,15 @@ conflicting cursor or regressed execution version causes a fresh subscription.
 Coordinator publishes only committed, Running Environments on routable nodes. API key
 verification is shared by trusted API Server and Ingress callers. Route publication
 and credentials do not transfer Environment lifecycle ownership to Coordinator.
+
+## Durable checkpoint cleanup after deletion
+
+A Deleted `CommitEnvironmentRequest` may include `cleanup_artifacts`. Coordinator
+unions these with the previously persisted checkpoint and writes a durable cleanup
+task atomically with Environment retirement. Nodes hand off physical artifact
+removal after publication. `CollectCheckpointCleanup` is a Coordinator-only,
+node-session-fenced RPC; its ACK identifies the Environment, generation and
+Deleted revision. Coordinator compares the full persisted task before retiring
+it. Missing objects are idempotent success; incomplete removal keeps the task.
+A matching scoped shared collector may handle a retired source's objects; local
+artifacts remain source-only. See the [cleanup contract](../../../docs/testing/failed-environment-gc.md).

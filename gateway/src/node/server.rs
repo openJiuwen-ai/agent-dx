@@ -446,6 +446,7 @@ impl Relay {
         } else {
             (None, self.track_stream(&target.instance_id, passive))
         };
+        let connect_started = tokio::time::Instant::now();
         let connect = tokio::select! {
             result = connect_within_budget(target.socket_addr(), self.connect_timeout) => result,
             _ = connection_closed.changed() => return,
@@ -454,12 +455,30 @@ impl Relay {
             Ok(stream) => stream,
             Err(ConnectFailure::Io(error)) => {
                 self.metrics.connect_errors.fetch_add(1, Ordering::Relaxed);
-                tracing::debug!(address = %target.socket_addr(), %error, "environment TCP connect failed");
+                tracing::warn!(
+                    instance_id = %target.instance_id,
+                    workload_id = %target.workload_id,
+                    request_id = %target.request_id,
+                    address = %target.socket_addr(),
+                    elapsed_ms = connect_started.elapsed().as_millis(),
+                    %error,
+                    "environment TCP connect failed"
+                );
                 send_error(&mut respond, StatusCode::BAD_GATEWAY);
                 return;
             }
             Err(ConnectFailure::Timeout) => {
                 self.metrics.connect_errors.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(
+                    instance_id = %target.instance_id,
+                    workload_id = %target.workload_id,
+                    request_id = %target.request_id,
+                    address = %target.socket_addr(),
+                    elapsed_ms = connect_started.elapsed().as_millis(),
+                    budget_ms = self.connect_timeout.as_millis(),
+                    bindings_ready = self.ready(),
+                    "sandbox TCP connect timed out"
+                );
                 send_error(&mut respond, StatusCode::GATEWAY_TIMEOUT);
                 return;
             }

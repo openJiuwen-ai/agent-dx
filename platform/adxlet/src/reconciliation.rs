@@ -24,9 +24,9 @@ impl Adxlet {
 
     /// Called only with a Coordinator-authorized, unreferenced deletion record.
     /// A lost acknowledgement can safely repeat the same artifact removal.
-    pub async fn collect_snapshot(&self, snapshot: &Snapshot) -> Result<()> {
+    pub async fn collect_snapshot(&self, snapshot: &Snapshot, delegated: bool) -> Result<()> {
         snapshot.validate()?;
-        if snapshot.source_node_id != self.node_id || !snapshot.collectable() {
+        if !snapshot.collectable() {
             return Err(Error::Conflict);
         }
         let checkpoint = self
@@ -34,7 +34,47 @@ impl Adxlet {
             .checkpoint
             .as_ref()
             .ok_or_else(|| Error::Unavailable("checkpoint storage is not configured".into()))?;
+        if delegated {
+            let Some(scope) = checkpoint.store.shared_scope() else {
+                return Err(Error::Conflict);
+            };
+            if snapshot.artifact.scope.is_empty() || snapshot.artifact.scope != scope {
+                return Err(Error::Conflict);
+            }
+        } else if snapshot.source_node_id != self.node_id {
+            return Err(Error::Conflict);
+        }
         checkpoint.store.remove(&snapshot.artifact).await
+    }
+
+    /// Remove artifacts authorized by a durable Coordinator cleanup task.
+    /// Repeating a task after a lost acknowledgement is safe because storage
+    /// removal is idempotent; a later artifact remains pending on failure.
+    pub async fn collect_checkpoint_cleanup(
+        &self,
+        cleanup: &adx_core::CheckpointCleanup,
+        delegated: bool,
+    ) -> Result<()> {
+        cleanup.validate()?;
+        let checkpoint = self
+            .services
+            .checkpoint
+            .as_ref()
+            .ok_or_else(|| Error::Unavailable("checkpoint storage is not configured".into()))?;
+        if delegated {
+            let scope = checkpoint.store.shared_scope().ok_or(Error::Conflict)?;
+            if cleanup.artifacts.iter().any(|artifact| {
+                artifact.storage == "local" || artifact.scope.is_empty() || artifact.scope != scope
+            }) {
+                return Err(Error::Conflict);
+            }
+        } else if cleanup.assignment.node_id != self.node_id {
+            return Err(Error::Conflict);
+        }
+        for artifact in &cleanup.artifacts {
+            checkpoint.store.remove(artifact).await?;
+        }
+        Ok(())
     }
 
     /// Caller must obtain the entire catalog from the current Coordinator while node

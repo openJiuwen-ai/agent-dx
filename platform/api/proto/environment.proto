@@ -9,6 +9,9 @@ import public "credentials.proto";
 import public "routes.proto";
 
 service CoordinatorService {
+  rpc GetEnvironmentControl(GetEnvironmentControlRequest) returns (EnvironmentControlRecord);
+  rpc UpdateEnvironmentControl(UpdateEnvironmentControlRequest) returns (EnvironmentControlRecord);
+  rpc ListEnvironmentControls(ListEnvironmentControlsRequest) returns (ListEnvironmentControlsResponse);
   rpc WatchNodes(WatchNodesRequest) returns (stream NodeDirectory);
   rpc GetSchedulingQueue(GetSchedulingQueueRequest) returns (GetSchedulingQueueResponse);
   rpc SetNodeScheduling(SetNodeSchedulingRequest) returns (NodeSchedulingState);
@@ -27,6 +30,16 @@ service CoordinatorService {
   rpc CommitEnvironment(CommitEnvironmentRequest) returns (CommitEnvironmentResponse);
 }
 
+message GetEnvironmentControlRequest { string id = 1; CallerContext caller = 2; }
+message UpdateEnvironmentControlRequest {
+  string id = 1;
+  CallerContext caller = 2;
+  uint64 timeout_seconds = 3;
+  bool extend_only = 4;
+}
+message ListEnvironmentControlsRequest { CallerContext caller = 1; }
+message ListEnvironmentControlsResponse { repeated EnvironmentControlRecord records = 1; }
+
 service NodeService {
   rpc CreateLocalEnvironment(LocalEnvironmentCreateRequest) returns (EnvironmentResult);
   rpc RecoverEnvironment(RecoverEnvironmentRequest) returns (EnvironmentResult);
@@ -42,6 +55,7 @@ service NodeService {
   rpc ReloadEnvironment(ReloadEnvironmentRequest) returns (EnvironmentResult);
   rpc CreateSnapshot(CreateSnapshotRequest) returns (CreateSnapshotResponse);
   rpc CollectSnapshot(CollectSnapshotRequest) returns (CollectSnapshotResponse);
+  rpc CollectCheckpointCleanup(CollectCheckpointCleanupRequest) returns (CollectCheckpointCleanupResponse);
 }
 
 message RecoverEnvironmentRequest { EnvironmentRecord record = 1; string node_session_id = 2; }
@@ -71,7 +85,8 @@ message RegisterNodeRequest {
   uint64 heartbeat_sequence = 9;
   bool reconciling = 10;
   repeated string runtime_classes = 11; // Available classes discovered through sandboxd's UDS.
-
+  // Stable non-secret identities of configured shared checkpoint backends.
+  repeated string checkpoint_scopes = 12;
 }
 
 message RegisterNodeResponse { uint32 shard_id = 1; uint64 coordinator_epoch = 2; }
@@ -107,9 +122,31 @@ message DeleteEnvironmentRequest {
   // Coordinator GC only: the node rechecks Failed and revision in the serial lifecycle task.
   optional uint64 failed_revision = 3;
   string node_session_id = 4;
+  optional uint64 expiry_revision = 5;
 }
 
-message CommitEnvironmentRequest { EnvironmentRecord record = 1; string node_session_id = 2; }
+message CommitEnvironmentRequest {
+  EnvironmentRecord record = 1;
+  string node_session_id = 2;
+  // Deleted only. Stored atomically with catalog retirement, before physical GC.
+  repeated CheckpointArtifact cleanup_artifacts = 3;
+}
+
+message CheckpointCleanup {
+  Assignment assignment = 1;
+  uint64 revision = 2;
+  repeated CheckpointArtifact artifacts = 3;
+}
+message CollectCheckpointCleanupRequest {
+  CheckpointCleanup cleanup = 1;
+  string node_session_id = 2;
+  bool delegated = 3;
+}
+message CollectCheckpointCleanupResponse {
+  string environment_id = 1;
+  uint64 generation = 2;
+  uint64 revision = 3;
+}
 
 message CommitEnvironmentResponse { EnvironmentRecord record = 1; }
 
@@ -117,7 +154,7 @@ message InspectNodeRequest { string node_id = 1; string session_id = 2; }
 
 message InspectNodeResponse { repeated EnvironmentRecord records = 1; uint64 coordinator_epoch = 2; repeated ReusableSnapshot snapshots = 3; repeated RestorePoint retained_checkpoints = 4; }
 
-message PauseEnvironmentRequest { Assignment assignment = 1; CallerContext caller = 2; string operation_id = 3; uint64 expected_revision = 4; reserved 5; uint64 timeout_seconds = 6; RetentionPolicy retention = 7; }
+message PauseEnvironmentRequest { Assignment assignment = 1; CallerContext caller = 2; string operation_id = 3; uint64 expected_revision = 4; reserved 5; uint64 timeout_seconds = 6; RetentionPolicy retention = 7; optional uint64 expiry_revision = 8; string node_session_id = 9; }
 
 message ResumeEnvironmentRequest { Assignment assignment = 1; CallerContext caller = 2; string operation_id = 3; uint64 expected_revision = 4; }
 

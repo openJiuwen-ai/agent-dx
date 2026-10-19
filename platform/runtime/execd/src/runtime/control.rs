@@ -1,6 +1,7 @@
 //! HTTP control state independent of transport connections and request lifetime.
 use adx_core::{runtime::*, Error, Result};
 use std::{
+    collections::BTreeMap,
     future::Future,
     io,
     pin::Pin,
@@ -10,6 +11,8 @@ use std::{
 use tokio::sync::watch;
 
 pub type Handoff = Pin<Box<dyn Future<Output = io::Result<HandoffOutcome>> + Send>>;
+pub type Restore<'a> = Pin<Box<dyn Future<Output = io::Result<RuntimeRestore>> + Send + 'a>>;
+pub type Cooperation<'a> = Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'a>>;
 #[derive(Debug, Clone, Copy)]
 pub enum HandoffOutcome {
     Resume,
@@ -17,15 +20,37 @@ pub enum HandoffOutcome {
     Error,
 }
 pub trait CheckpointHooks: Send + Sync + 'static {
+    /// Prepare guest services before acknowledging a checkpoint.
+    fn prepare_checkpoint(&self) -> Cooperation<'_> {
+        Box::pin(async { Ok(()) })
+    }
+    /// Release guest preparation only when checkpointing never started.
+    fn rollback_checkpoint_prepare(&self) -> Cooperation<'_> {
+        Box::pin(async { Ok(()) })
+    }
+    /// Release guest preparation after the backend confirms source continuation.
+    fn resume_after_checkpoint(&self) -> Cooperation<'_> {
+        Box::pin(async { Ok(()) })
+    }
     /// Open the backend's handoff before publishing Prepared.
     fn open(&self) -> io::Result<Handoff>;
     /// Validate restored identity, refresh environment and rearm listeners.
-    fn restore(&self, previous: &RuntimeIdentity) -> io::Result<RuntimeIdentity>;
+    fn restore(&self, _previous: &RuntimeIdentity) -> io::Result<RuntimeIdentity> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "checkpoint hook requires asynchronous restore",
+        ))
+    }
     fn restore_context(&self, previous: &RuntimeIdentity) -> io::Result<RuntimeRestore> {
         Ok(RuntimeRestore {
             target: self.restore(previous)?,
             origin: None,
         })
+    }
+    /// Await required guest services before publishing the restored runtime as Running.
+    /// The default preserves synchronous hooks without blocking the Tokio runtime.
+    fn restore_context_async<'a>(&'a self, previous: &'a RuntimeIdentity) -> Restore<'a> {
+        Box::pin(async move { self.restore_context(previous) })
     }
 }
 struct State {
@@ -42,6 +67,7 @@ pub struct Controller {
     hooks: Arc<dyn CheckpointHooks>,
     changed: watch::Sender<u64>,
     probe_readiness: std::sync::atomic::AtomicBool,
+    cooperation: tokio::sync::Mutex<()>,
 }
 static CURRENT: OnceLock<Arc<Controller>> = OnceLock::new();
 pub(crate) fn install(controller: Arc<Controller>) -> Result<()> {
@@ -68,6 +94,7 @@ impl Controller {
                     active_requests: 0,
                     active_commands: 0,
                     activity_revision: 1,
+                    required_services: BTreeMap::new(),
                 },
                 probe_epoch: 1,
                 probe_phase: RuntimePhase::Running,
@@ -79,6 +106,7 @@ impl Controller {
             hooks,
             changed,
             probe_readiness: std::sync::atomic::AtomicBool::new(false),
+            cooperation: tokio::sync::Mutex::new(()),
         }))
     }
     pub fn begin_probe_initialization(&self) -> Result<()> {
@@ -250,6 +278,26 @@ impl Controller {
             .map_err(|_| Error::Unavailable("runtime state lock poisoned".into()))?;
         Ok((state.status.clone(), state.probe_epoch))
     }
+    /// Update a deployment-owned guest service without changing the platform
+    /// runtime phase. A failed auxiliary service must not erase Execd's
+    /// control path, which is still needed for diagnosis and deletion.
+    pub fn set_required_service(
+        &self,
+        name: impl Into<String>,
+        service: RequiredServiceStatus,
+    ) -> Result<()> {
+        let name = name.into();
+        if name.trim().is_empty() {
+            return Err(Error::Invalid("required service name is empty".into()));
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| Error::Unavailable("runtime state poisoned".into()))?;
+        state.status.required_services.insert(name, service);
+        self.publish(&mut state);
+        Ok(())
+    }
     pub fn subscribe(&self) -> watch::Receiver<u64> {
         self.changed.subscribe()
     }
@@ -266,11 +314,6 @@ impl Controller {
             return Err(Error::Invalid("operation id required".into()));
         }
         let operation_id = request.operation_id.clone();
-        execd_info!(
-            "[checkpoint-control] prepare_received operation={} expected_revision={}",
-            operation_id,
-            request.expected_revision
-        );
         let mut changes = self.subscribe();
         {
             let mut state = self.state.lock().unwrap();
@@ -302,32 +345,19 @@ impl Controller {
                 if let Some(revision) = request.idle_revision {
                     super::activity::quiesce(revision)?;
                 }
-                let prepared = state.reader_running;
-                state.status.phase = if prepared {
-                    RuntimePhase::Prepared
-                } else {
-                    RuntimePhase::Preparing
-                };
+                state.status.phase = RuntimePhase::Preparing;
                 state.status.checkpoint = Some(CheckpointStatus {
                     operation_id: request.operation_id.clone(),
-                    phase: if prepared {
-                        CheckpointPhase::Prepared
-                    } else {
-                        CheckpointPhase::Preparing
-                    },
+                    phase: CheckpointPhase::Preparing,
                     error: None,
                 });
                 state.prepare = Some(request);
                 self.publish(&mut state);
-                if !prepared {
-                    state.reader_running = true;
-                    let controller = self.clone();
-                    // The accepted operation survives cancellation of the HTTP request.
-                    let reader_operation = operation_id.clone();
-                    tokio::spawn(async move {
-                        controller.read_handoff(reader_operation).await;
-                    });
-                }
+                let controller = self.clone();
+                // Accepted preparation survives cancellation of either transport.
+                tokio::spawn(async move {
+                    controller.prepare_guest().await;
+                });
             }
         }
         loop {
@@ -340,12 +370,6 @@ impl Controller {
                 return Err(Error::Conflict);
             }
             if status.phase != RuntimePhase::Preparing {
-                execd_info!(
-                    "[checkpoint-control] prepare_ack operation={} phase={:?} revision={}",
-                    operation_id,
-                    status.phase,
-                    status.revision
-                );
                 return Ok(status);
             }
             changes
@@ -354,73 +378,89 @@ impl Controller {
                 .map_err(|_| Error::Unavailable("control stopped".into()))?;
         }
     }
-    async fn read_handoff(self: Arc<Self>, operation_id: String) {
-        let hooks = self.hooks.clone();
-        let opening_operation = operation_id.clone();
-        execd_info!(
-            "[checkpoint-control] handoff_task_started operation={}",
-            operation_id
-        );
-        let opened = tokio::task::spawn_blocking(move || {
-            execd_info!(
-                "[checkpoint-control] handoff_open_started operation={}",
-                opening_operation
-            );
-            let result = hooks.open();
-            execd_info!(
-                "[checkpoint-control] handoff_open_completed operation={} success={}",
-                opening_operation,
-                result.is_ok()
-            );
-            result
-        })
-        .await;
-        execd_info!(
-            "[checkpoint-control] handoff_open_joined operation={}",
-            operation_id
-        );
-        let reader = match opened {
-            Ok(Ok(reader)) => reader,
-            error => {
-                let mut state = self.state.lock().unwrap();
-                state.reader_running = false;
-                state.status.phase = RuntimePhase::Running;
-                super::activity::reopen();
-                if let Some(checkpoint) = &mut state.status.checkpoint {
-                    checkpoint.phase = CheckpointPhase::Failed;
-                    checkpoint.error = Some(match error {
+    async fn prepare_guest(self: Arc<Self>) {
+        // Serialize guest preparation, rollback, and backend completion. A retained
+        // reader can finish while a later operation is preparing guest services.
+        let _cooperation = self.cooperation.lock().await;
+        if self.status().phase != RuntimePhase::Preparing {
+            return;
+        }
+        let open_reader = !self.status_reader_running();
+        let reader = if open_reader {
+            let hooks = self.hooks.clone();
+            match tokio::task::spawn_blocking(move || hooks.open()).await {
+                Ok(Ok(reader)) => Some(reader),
+                result => {
+                    let error = match result {
                         Ok(Err(error)) => error.to_string(),
                         Err(error) => error.to_string(),
-                        _ => unreachable!(),
-                    });
+                        Ok(Ok(_)) => return,
+                    };
+                    self.fail_preparation(error, RuntimePhase::Running);
+                    return;
                 }
-                self.publish(&mut state);
-                return;
             }
+        } else {
+            None
         };
-        {
-            let mut state = self.state.lock().unwrap();
-            if state.status.phase == RuntimePhase::Preparing {
-                state.status.phase = RuntimePhase::Prepared;
-                state.status.checkpoint.as_mut().unwrap().phase = CheckpointPhase::Prepared;
-                self.publish(&mut state);
-                execd_info!(
-                    "[checkpoint-control] prepared_published operation={} revision={}",
-                    operation_id,
-                    state.status.revision
-                );
+        if let Err(error) = self.hooks.prepare_checkpoint().await {
+            let rollback = self.hooks.rollback_checkpoint_prepare().await;
+            let (phase, message) = match rollback {
+                Ok(()) => (RuntimePhase::Running, error.to_string()),
+                Err(rollback) => (
+                    RuntimePhase::Failed,
+                    format!("{error}; rollback failed: {rollback}"),
+                ),
+            };
+            // Preserve the handoff reader even when guest preparation fails.
+            if let Some(reader) = reader {
+                self.spawn_reader(reader);
             }
+            self.fail_preparation(message, phase);
+            return;
         }
-        execd_info!(
-            "[checkpoint-control] handoff_wait_started operation={}",
-            operation_id
-        );
+        {
+            let Ok(mut state) = self.state.lock() else {
+                return;
+            };
+            state.status.phase = RuntimePhase::Prepared;
+            if let Some(checkpoint) = &mut state.status.checkpoint {
+                checkpoint.phase = CheckpointPhase::Prepared;
+            }
+            self.publish(&mut state);
+        }
+        if let Some(reader) = reader {
+            self.spawn_reader(reader);
+        }
+    }
+    fn status_reader_running(&self) -> bool {
+        self.state
+            .lock()
+            .map(|state| state.reader_running)
+            .unwrap_or(true)
+    }
+    fn spawn_reader(self: &Arc<Self>, reader: Handoff) {
+        if let Ok(mut state) = self.state.lock() {
+            state.reader_running = true;
+        }
+        let controller = self.clone();
+        tokio::spawn(async move {
+            controller.read_handoff(reader).await;
+        });
+    }
+    fn fail_preparation(&self, error: String, phase: RuntimePhase) {
+        if let Ok(mut state) = self.state.lock() {
+            state.status.phase = phase;
+            if let Some(checkpoint) = &mut state.status.checkpoint {
+                checkpoint.phase = CheckpointPhase::Failed;
+                checkpoint.error = Some(error);
+            }
+            self.publish(&mut state);
+        }
+    }
+    async fn read_handoff(self: Arc<Self>, reader: Handoff) {
         let outcome = reader.await;
-        execd_info!(
-            "[checkpoint-control] handoff_wait_completed operation={} outcome={:?}",
-            operation_id,
-            outcome
-        );
+        let _cooperation = self.cooperation.lock().await;
         let previous = {
             let mut state = self.state.lock().unwrap();
             state.reader_running = false;
@@ -449,36 +489,52 @@ impl Controller {
             state.status.identity.clone()
         };
         let restored = if matches!(outcome, Ok(HandoffOutcome::Restore)) {
-            Some(self.hooks.restore_context(&previous).and_then(|restored| {
-                restored.validate(&previous).map_err(io::Error::other)?;
-                Ok(restored.target)
-            }))
+            Some(
+                self.hooks
+                    .restore_context_async(&previous)
+                    .await
+                    .and_then(|restored| {
+                        restored.validate(&previous).map_err(io::Error::other)?;
+                        Ok(restored.target)
+                    }),
+            )
         } else {
             None
+        };
+        let released = match &outcome {
+            Ok(HandoffOutcome::Resume | HandoffOutcome::Error) => {
+                self.hooks.resume_after_checkpoint().await
+            }
+            _ => Ok(()),
         };
         let mut state = self.state.lock().unwrap();
         state.status.phase = self.handoff_probe_phase();
         state.status.failure = None;
         super::activity::reopen();
-        let (phase, error) = match (outcome, restored) {
-            (Ok(HandoffOutcome::Restore), Some(Ok(identity))) => {
-                state.status.identity = identity;
-                (CheckpointPhase::Restored, None)
+        let (phase, error) = if let Err(error) = released {
+            state.status.phase = RuntimePhase::Failed;
+            (CheckpointPhase::Failed, Some(error.to_string()))
+        } else {
+            match (outcome, restored) {
+                (Ok(HandoffOutcome::Restore), Some(Ok(identity))) => {
+                    state.status.identity = identity;
+                    (CheckpointPhase::Restored, None)
+                }
+                (Ok(HandoffOutcome::Restore), Some(Err(error))) => {
+                    state.status.phase = RuntimePhase::Failed;
+                    (CheckpointPhase::Failed, Some(error.to_string()))
+                }
+                (Ok(HandoffOutcome::Resume), _) => (CheckpointPhase::Resumed, None),
+                (Ok(HandoffOutcome::Error), _) => (
+                    CheckpointPhase::Failed,
+                    Some("backend handoff reported error".into()),
+                ),
+                (Err(error), _) => {
+                    state.status.phase = RuntimePhase::Failed;
+                    (CheckpointPhase::Failed, Some(error.to_string()))
+                }
+                _ => unreachable!(),
             }
-            (Ok(HandoffOutcome::Restore), Some(Err(error))) => {
-                state.status.phase = RuntimePhase::Failed;
-                (CheckpointPhase::Failed, Some(error.to_string()))
-            }
-            (Ok(HandoffOutcome::Resume), _) => (CheckpointPhase::Resumed, None),
-            (Ok(HandoffOutcome::Error), _) => (
-                CheckpointPhase::Failed,
-                Some("backend handoff reported error".into()),
-            ),
-            (Err(error), _) => {
-                state.status.phase = RuntimePhase::Failed;
-                (CheckpointPhase::Failed, Some(error.to_string()))
-            }
-            _ => unreachable!(),
         };
         if let Some(checkpoint) = &mut state.status.checkpoint {
             checkpoint.phase = phase;
@@ -488,33 +544,85 @@ impl Controller {
     }
     /// Caller may use this only when the backend confirms checkpoint never started.
     /// Keep the existing reader: the next attempt must not leak another reader.
-    pub fn abort_unstarted(
+    pub async fn abort_unstarted(
+        self: &Arc<Self>,
+        operation_id: &str,
+        identity: &RuntimeIdentity,
+        revision: u64,
+    ) -> Result<RuntimeStatus> {
+        let controller = self.clone();
+        let operation_id = operation_id.to_owned();
+        let identity = identity.clone();
+        // Own the rollback independently of the HTTP/stream request lifetime.
+        tokio::spawn(async move {
+            controller
+                .abort_guest(&operation_id, &identity, revision)
+                .await
+        })
+        .await
+        .map_err(|error| Error::Unavailable(error.to_string()))?
+    }
+    async fn abort_guest(
         &self,
         operation_id: &str,
         identity: &RuntimeIdentity,
         revision: u64,
     ) -> Result<RuntimeStatus> {
-        let mut state = self.state.lock().unwrap();
-        if &state.status.identity != identity
-            || state
+        let _cooperation = self.cooperation.lock().await;
+        {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| Error::Unavailable("runtime state poisoned".into()))?;
+            if &state.status.identity != identity
+                || state
+                    .status
+                    .checkpoint
+                    .as_ref()
+                    .is_none_or(|checkpoint| checkpoint.operation_id != operation_id)
+            {
+                return Err(Error::Conflict);
+            }
+            if state
                 .status
                 .checkpoint
                 .as_ref()
-                .is_none_or(|checkpoint| checkpoint.operation_id != operation_id)
-        {
-            return Err(Error::Conflict);
+                .is_some_and(|checkpoint| checkpoint.phase == CheckpointPhase::Aborted)
+            {
+                return Ok(state.status.clone());
+            }
+            if state.status.revision != revision || state.status.phase != RuntimePhase::Prepared {
+                return Err(Error::Conflict);
+            }
         }
-        if state.status.checkpoint.as_ref().unwrap().phase == CheckpointPhase::Aborted {
-            return Ok(state.status.clone());
+        let reopen_admission = self
+            .state
+            .lock()
+            .map_err(|_| Error::Unavailable("runtime state poisoned".into()))?
+            .prepare
+            .as_ref()
+            .is_some_and(|prepare| prepare.idle_revision.is_some());
+        let released = self.hooks.rollback_checkpoint_prepare().await;
+        if released.is_ok() && reopen_admission {
+            super::activity::reopen();
         }
-        if state.status.revision != revision
-            || !matches!(state.status.phase, RuntimePhase::Prepared)
-        {
-            return Err(Error::Conflict);
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| Error::Unavailable("runtime state poisoned".into()))?;
+        state.status.phase = if released.is_ok() {
+            self.handoff_probe_phase()
+        } else {
+            RuntimePhase::Failed
+        };
+        if let Some(checkpoint) = &mut state.status.checkpoint {
+            checkpoint.phase = if released.is_ok() {
+                CheckpointPhase::Aborted
+            } else {
+                CheckpointPhase::Failed
+            };
+            checkpoint.error = released.err().map(|error| error.to_string());
         }
-        state.status.phase = RuntimePhase::Running;
-        super::activity::reopen();
-        state.status.checkpoint.as_mut().unwrap().phase = CheckpointPhase::Aborted;
         self.publish(&mut state);
         Ok(state.status.clone())
     }

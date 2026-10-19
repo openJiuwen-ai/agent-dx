@@ -23,7 +23,7 @@ adxlet 可使用原来的 `checkpoint_dir`，或显式选择 `checkpoint_storage
 }
 ```
 
-部署环境通过标准 AWS 凭证环境变量或环境提供的身份机制配置 S3 访问。实例记录只保存存储别名、制品 ID 与字节数，不保存端点和密钥。每个集群使用独立的 bucket/prefix；共享该存储的节点必须为同一别名配置相同 bucket/prefix，并保持节点 ID 和存储别名稳定；本地目录是节点私有的暂存与下载缓存。
+部署环境通过标准 AWS 凭证环境变量或环境提供的身份机制配置 S3 访问。实例记录保存存储别名、制品 ID、字节数和可选的非敏感 scope，不保存端点和密钥。scope 由存储别名及显式配置的 endpoint、bucket、region 和 prefix 计算；未显式配置 endpoint（包括仅由 SDK/AWS 环境变量解析的 endpoint）时 scope 为空，制品仍可由源节点操作但不能跨节点委托回收。每个集群使用独立的 bucket/prefix；共享该存储的节点必须为同一别名配置相同 bucket/prefix，并保持节点 ID 和存储别名稳定；本地目录是节点私有的暂存与下载缓存。
 
 ### Environment 匿名恢复点策略
 
@@ -53,6 +53,8 @@ OBS 使用既有 S3 兼容适配器和标准凭据配置，上面的 endpoint �
 - 上传失败保留本地制品，adxlet 尝试回滚恢复。回滚使用的本地恢复点写入实例结果，保持 local-only 语义；成功上传后的本地目录在结果全局提交后直接登记到节点 LRU，复用原有文件和路径，不复制快照、不重新从对象存储下载。
 - 运行中的 Execd 通过 Unix Socket 发起 workload checkpoint 时，按 Environment 的 `pause.storage` 策略使用节点配置的存储后端或保留本地制品。S3 上传及实例结果提交完成后才回复成功；上传失败向 Execd 返回错误，运行中的源实例保持运行，不把本地暂存误报为共享恢复点。
 - 制品清理与快照复制保留接口边界。复制产生独立制品 ID；源暂停恢复点删除不影响可复用副本。远端文件支持服务端复制，大文件使用有界流式复制。
+
+Environment 删除后的制品回收使用 Coordinator 持久 outbox，任务与 Deleted 退役原子提交，节点不在发布成功后自行丢失清理责任。公开 DELETE 与对象最终删除分开；任务、scope、重试及不可复用制品身份的完整合同见 [Failed Environment GC](failed-environment-gc.md#deleted-后的持久对象清理)。新 Snapshot 发布同时推进共享控制 header，以与清理退役串行化；Environment 路由的 binding revision 不变。
 
 ## 缓存与实际执行引用
 
@@ -108,7 +110,7 @@ Lima `adx-fc`，运行目录 `/var/lib/adx-pause-r11`，`package-v9`（基于 `0
 
 Coordinator 的 `InspectNode` 同时返回 Environment 及来源属于该节点的 Ready/Deleting 快照。SQLite 补写后重新获取完整目录，节点先校验所有记录再执行清理。本地快照即使源 Environment 已删除或处于延迟删除阶段，也不会因节点重启被当作孤儿制品移除。
 
-Coordinator 每 5 秒独立扫描删除中且无引用的快照，通过带节点会话的 mTLS RPC 请求源节点清理。维护开关不阻止清理；未完成对账或失联的节点暂不接收请求。adxlet 确认存储后端删除后，Coordinator 以目录版本及 epoch 复核完成状态。丢失确认、存储错误和进程重启可重试；仍被其他目录或实例恢复点使用的制品拒绝清理。节点不可用期间物理删除会保持待处理。
+Coordinator 每 5 秒独立扫描删除中且无引用的快照，通过带节点会话的 mTLS RPC 请求源节点清理。维护开关不阻止清理；未完成对账或失联的节点暂不接收请求。`invalidate_node` 在同一次 Redis 提交中失效执行归属、撤销源会话路由并设置 `checkpoint_gc_fenced=true` 后，只有已完成对账、当前会话有效、声明完全相同非空 scope 的健康节点才可代为回收；普通对账或 Coordinator 启动造成的不可路由不产生该失效标记。心跳暂时缺失、旧的无 scope 制品、本地存储或 scope 不匹配时物理删除保持待处理。adxlet 再次验证 scope 后才删除，Coordinator 以目录版本及 epoch 复核完成状态。丢失确认、存储错误和进程重启可重试；仍被其他目录或实例恢复点使用的制品拒绝清理。
 
 本轮定向证据：`reconciliation-red.log` / `reconciliation-green.log`、`gc-red.log` / `gc-green.log`、`create-red.log` / `create-green-1.log`、`snapshot-commit-red.log` / `create-final-rust.log`，均位于 `out/ci/stage-3/`。节点 80 项测试、Coordinator 7 项真实 Redis/mTLS 测试、Clippy、全部 Go 测试/vet、SDK 139 项单测及部署驱动 47 项测试已通过。
 

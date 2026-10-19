@@ -1,9 +1,11 @@
 //! Async RPC coordination around the synchronous scheduler and Redis repository.
 use adx_transport::rpc::RpcClient;
 mod autoscaling;
+mod checkpoint_cleanup;
 mod claims;
 mod cloning;
 mod collection;
+mod environment_control;
 mod metrics;
 mod recovery;
 mod resume;
@@ -45,6 +47,8 @@ struct State {
     recovery_cursor: Option<String>,
     resume_cursor: Option<String>,
     collection_cursor: Option<String>,
+    checkpoint_cleanup_cursor: Option<String>,
+    expiry_cursor: Option<String>,
     live: BTreeMap<String, LiveNode>,
     recovering: BTreeMap<String, tokio::time::Instant>,
     retired_sessions: BTreeSet<(String, String)>,
@@ -361,11 +365,12 @@ impl CoordinatorRpc {
                 })
                 .routable = false;
             *node = session
-                .register_session(
+                .register_session_with_scopes(
                     node.node.clone(),
                     node.address.clone(),
                     node.proxy_address.clone(),
                     node.session.clone(),
+                    node.checkpoint_scopes.clone(),
                 )
                 .await?;
         }
@@ -405,6 +410,8 @@ impl CoordinatorRpc {
                 recovery_cursor: None,
                 resume_cursor: None,
                 collection_cursor: None,
+                checkpoint_cleanup_cursor: None,
+                expiry_cursor: None,
                 live: BTreeMap::new(),
                 recovering,
                 retired_sessions: BTreeSet::new(),
@@ -760,6 +767,15 @@ impl CoordinatorRpc {
         record: EnvironmentRecord,
         session_id: String,
     ) -> Result<EnvironmentRecord> {
+        self.commit_with_cleanup(record, session_id, &[]).await
+    }
+
+    async fn commit_with_cleanup(
+        &self,
+        record: EnvironmentRecord,
+        session_id: String,
+        cleanup_artifacts: &[adx_core::CheckpointArtifact],
+    ) -> Result<EnvironmentRecord> {
         let mut state = self.0.state.lock().await;
         state.recover_authoritative_state().await?;
         state.healthy()?;
@@ -780,7 +796,10 @@ impl CoordinatorRpc {
         {
             return Err(Error::Conflict);
         }
-        let accepted = state.session.commit(record).await?;
+        let accepted = state
+            .session
+            .commit_with_cleanup(record, cleanup_artifacts)
+            .await?;
         if accepted.state == EnvironmentState::Failed {
             let durable = state.session.get(&accepted.spec.id).await?;
             state.remember_environment(durable);
@@ -899,6 +918,24 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
         })
         .await
         .map_err(|_| Status::internal("resume task failed"))?
+    }
+    async fn get_environment_control(
+        &self,
+        request: Request<pb::GetEnvironmentControlRequest>,
+    ) -> std::result::Result<Response<pb::EnvironmentControlRecord>, Status> {
+        self.get_environment_control_rpc(request).await
+    }
+    async fn update_environment_control(
+        &self,
+        request: Request<pb::UpdateEnvironmentControlRequest>,
+    ) -> std::result::Result<Response<pb::EnvironmentControlRecord>, Status> {
+        self.update_environment_control_rpc(request).await
+    }
+    async fn list_environment_controls(
+        &self,
+        request: Request<pb::ListEnvironmentControlsRequest>,
+    ) -> std::result::Result<Response<pb::ListEnvironmentControlsResponse>, Status> {
+        self.list_environment_controls_rpc(request).await
     }
     type WatchNodesStream =
         tokio_stream::wrappers::ReceiverStream<std::result::Result<pb::NodeDirectory, Status>>;
@@ -1279,7 +1316,7 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
             }
             let saved = match state
                 .session
-                .register_session(
+                .register_session_with_scopes(
                     node.clone(),
                     r.node_address.clone(),
                     r.proxy_address.clone(),
@@ -1288,6 +1325,7 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
                         sequence: r.heartbeat_sequence,
                         routable: !r.reconciling,
                     }),
+                    r.checkpoint_scopes.iter().cloned().collect(),
                 )
                 .await
             {
@@ -1440,11 +1478,17 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
                 if principal != Principal::Node(record.assignment.node_id.clone()) {
                     return Err(Status::permission_denied("only owning node may commit"));
                 }
+                let cleanup_artifacts = r
+                    .cleanup_artifacts
+                    .into_iter()
+                    .map(TryInto::try_into)
+                    .collect::<Result<Vec<adx_core::CheckpointArtifact>>>()
+                    .map_err(status)?;
                 let service = self.clone();
                 tokio::spawn(
                     adx_observability::trace::Trace::child("coordinator.commit").run(async move {
                         let record = service
-                            .commit(record, r.node_session_id)
+                            .commit_with_cleanup(record, r.node_session_id, &cleanup_artifacts)
                             .await
                             .map_err(status)?;
                         Ok(Response::new(pb::CommitEnvironmentResponse {
@@ -1498,6 +1542,21 @@ mod reconciliation_tests {
     }
 
     #[test]
+    fn deleting_a_queued_recovery_retires_it_before_clearing_the_fence() {
+        let spec: EnvironmentSpec = serde_json::from_value(serde_json::json!({
+            "id": "queued-recovery", "tenant_id": "tenant", "image": "image",
+            "runtime_class": "runsc", "priority": 0,
+            "resources": {"cpu_millis": 100, "memory_bytes": 128, "disk_bytes": 0}
+        }))
+        .unwrap();
+        let mut scheduler = Coordinator::new(1, Placement::Pack).unwrap();
+        scheduler.submit_recovery(spec.clone()).unwrap();
+        scheduler.forget_deleted(&spec.id).unwrap();
+        assert_eq!(scheduler.pending(0).unwrap(), 0);
+        assert!(scheduler.submit(spec).is_ok());
+    }
+
+    #[test]
     fn failed_without_resources_remains_deletable_after_node_restart() {
         let spec: EnvironmentSpec = serde_json::from_value(serde_json::json!({
             "id": "failed", "tenant_id": "tenant", "image": "image",
@@ -1514,6 +1573,7 @@ mod reconciliation_tests {
         };
         let mut environment = StoredEnvironment {
             resume: None,
+            control: None,
             failed_since_unix_seconds: None,
             recovery: None,
             invalidated: false,

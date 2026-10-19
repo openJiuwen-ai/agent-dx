@@ -5,8 +5,10 @@ pub mod lifecycle;
 pub mod runtime_profile;
 pub mod snapshots;
 pub use checkpoint::{
-    valid_runtime_id, CheckpointArtifact, CompletedOperation, LifecycleKind, RestorePoint,
+    valid_runtime_id, CheckpointArtifact, CheckpointCleanup, CompletedOperation, LifecycleKind,
+    RestorePoint,
 };
+pub mod environment_control;
 pub mod execution;
 pub mod probes;
 pub mod runtime;
@@ -104,6 +106,8 @@ impl Resources {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnvironmentSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compatibility: Option<environment_control::EnvironmentCompatibility>,
     #[serde(default)]
     pub runtime_profile: Option<runtime_profile::RuntimeProfile>,
     #[serde(default)]
@@ -126,6 +130,9 @@ pub struct EnvironmentSpec {
 
 impl EnvironmentSpec {
     pub fn validate(&self) -> Result<()> {
+        if let Some(compatibility) = &self.compatibility {
+            compatibility.validate()?;
+        }
         for (name, value) in [
             ("id", &self.id),
             ("tenant", &self.tenant_id),

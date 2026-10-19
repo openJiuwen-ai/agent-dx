@@ -296,6 +296,7 @@ async fn snapshot_claim_requires_existing_restore_reference() {
         "source-1".into(),
         adx_core::CheckpointArtifact {
             storage: "shared".into(),
+            scope: String::new(),
             location: "artifact".into(),
             size_bytes: 1,
         },

@@ -18,6 +18,7 @@ fn weighted(name: &'static str, value: u32, weight: u32) -> WeightedScore {
 }
 fn request() -> EnvironmentSpec {
     EnvironmentSpec {
+        compatibility: None,
         runtime_profile: None,
         snapshot_id: None,
         lifecycle: Default::default(),

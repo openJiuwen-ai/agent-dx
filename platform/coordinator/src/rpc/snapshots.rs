@@ -48,6 +48,9 @@ impl CoordinatorRpc {
                 // snapshot or Environment recovery point's bytes.
                 let same = |a: &adx_core::CheckpointArtifact| {
                     a.storage == snapshot.artifact.storage
+                        && (a.scope.is_empty()
+                            || snapshot.artifact.scope.is_empty()
+                            || a.scope == snapshot.artifact.scope)
                         && a.location == snapshot.artifact.location
                 };
                 if snapshots
@@ -62,25 +65,71 @@ impl CoordinatorRpc {
                 {
                     continue;
                 }
-                let Some(live) = state.live.get(&snapshot.source_node_id) else {
-                    continue;
-                };
-                if !live.inspected
-                    || live.report.reconciling
-                    || live.last_seen.elapsed() >= self.0.heartbeat_timeout
-                {
+                let source = state.nodes.get(&snapshot.source_node_id);
+                let source_live = state.live.get(&snapshot.source_node_id);
+                let source_ready = source.zip(source_live).is_some_and(|(node, live)| {
+                    node.session
+                        .as_ref()
+                        .is_some_and(|session| session.routable && session.id == live.session)
+                        && live.inspected
+                        && !live.report.reconciling
+                        && live.last_seen.elapsed() < self.0.heartbeat_timeout
+                });
+                if source_ready {
+                    let node = source.ok_or(Error::Conflict)?;
+                    let live = source_live.ok_or(Error::Conflict)?;
+                    candidates.push((
+                        snapshot.clone(),
+                        node.address.clone(),
+                        live.session.clone(),
+                        false,
+                    ));
                     continue;
                 }
-                let Some(node) = state.nodes.get(&snapshot.source_node_id) else {
+                // A missed heartbeat is not a fence. Delegate only after the
+                // persisted session was explicitly made unroutable.
+                let source_fenced =
+                    source
+                        .and_then(|node| node.session.as_ref())
+                        .is_some_and(|session| {
+                            !session.routable
+                                && source.is_some_and(|node| node.checkpoint_gc_fenced)
+                        });
+                if !source_fenced || snapshot.artifact.scope.is_empty() {
                     continue;
-                };
-                candidates.push((snapshot.clone(), node.address.clone(), live.session.clone()));
+                }
+                let collector = state.live.iter().find_map(|(id, live)| {
+                    let node = state.nodes.get(id)?;
+                    let current_session = node.session.as_ref()?;
+                    (id != &snapshot.source_node_id
+                        && current_session.routable
+                        && current_session.id == live.session
+                        && live.inspected
+                        && !live.report.reconciling
+                        && live.last_seen.elapsed() < self.0.heartbeat_timeout
+                        && node.checkpoint_scopes.contains(&snapshot.artifact.scope)
+                        && live
+                            .report
+                            .checkpoint_scopes
+                            .iter()
+                            .any(|scope| scope == &snapshot.artifact.scope))
+                    .then(|| (node.address.clone(), live.session.clone()))
+                });
+                if let Some((address, session_id)) = collector {
+                    candidates.push((snapshot.clone(), address, session_id, true));
+                } else {
+                    adx_observability::warn!(
+                        snapshot_id = %snapshot.id,
+                        source_node_id = %snapshot.source_node_id,
+                        "shared snapshot deletion awaits a compatible reconciled collector"
+                    );
+                }
             }
             (state.session.clone(), candidates)
         };
         let mut completed = 0;
         let mut error = None;
-        for (snapshot, address, node_session_id) in candidates {
+        for (snapshot, address, node_session_id, delegated) in candidates {
             let result = async {
                 // Recheck persistent authority before issuing each destructive RPC.
                 if session.get_snapshot(&snapshot.id).await? != snapshot {
@@ -103,6 +152,7 @@ impl CoordinatorRpc {
                         .collect_snapshot(pb::CollectSnapshotRequest {
                             snapshot: Some(snapshot.clone().try_into()?),
                             node_session_id,
+                            delegated,
                         })
                         .await
                         .map_err(|_| {

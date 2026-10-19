@@ -99,6 +99,7 @@ impl RoutePublisher {
             next.insert(
                 r.environment_id.clone(),
                 pb::PublishedRoute {
+                    compatibility: route_compatibility(i),
                     environment_id: r.environment_id,
                     tenant_id: i.spec.tenant_id.clone(),
                     runtime_id: record.runtime.id.clone(),
@@ -128,6 +129,7 @@ impl RoutePublisher {
             next_environments.insert(
                 id.clone(),
                 pb::PublishedEnvironment {
+                    compatibility: route_compatibility(environment),
                     record: Some(record.try_into()?),
                     node_address: node.address.clone(),
                     relay_address: node.proxy_address.clone(),
@@ -399,10 +401,32 @@ fn published_environment(
     node: &StoredNode,
 ) -> Result<pb::PublishedEnvironment> {
     Ok(pb::PublishedEnvironment {
+        compatibility: route_compatibility(environment),
         record: Some(environment.effective_record().try_into()?),
         node_address: node.address.clone(),
         relay_address: node.proxy_address.clone(),
     })
+}
+
+fn route_compatibility(environment: &StoredEnvironment) -> Option<pb::SandboxRouteCompatibility> {
+    use sha2::{Digest, Sha256};
+    environment
+        .control
+        .as_ref()
+        .map(|c| pb::SandboxRouteCompatibility {
+            envd_token_sha256: format!(
+                "{:x}",
+                Sha256::digest(c.compatibility.envd_access_token.as_bytes())
+            ),
+            traffic_token_sha256: format!(
+                "{:x}",
+                Sha256::digest(c.compatibility.traffic_access_token.as_bytes())
+            ),
+            allow_public_traffic: c.compatibility.allow_public_traffic,
+            envd_ready: !c.expiry_claimed && c.expires_at_unix_ms != 0,
+            expires_at_unix_ms: c.expires_at_unix_ms,
+            control_revision: c.revision,
+        })
 }
 
 fn published_route(
@@ -416,6 +440,7 @@ fn published_route(
         return Ok(None);
     };
     Ok(Some(pb::PublishedRoute {
+        compatibility: route_compatibility(environment),
         environment_id: record.spec.id.clone(),
         tenant_id: record.spec.tenant_id.clone(),
         runtime_id: record.runtime.id.clone(),
@@ -448,10 +473,11 @@ fn route_from_published(
     let spec = record.spec.as_ref().ok_or(Error::Conflict)?;
     let assignment = record.assignment.as_ref().ok_or(Error::Conflict)?;
     let runtime = record.runtime.as_ref().ok_or(Error::Conflict)?;
-    let environment = spec.execution.as_ref().ok_or(Error::Conflict)?;
-    let data_plane = environment.data_plane.as_ref().ok_or(Error::Conflict)?;
+    let execution = spec.execution.as_ref().ok_or(Error::Conflict)?;
+    let data_plane = execution.data_plane.as_ref().ok_or(Error::Conflict)?;
     let inherited = pb::DataPlaneSecurityMode::DataPlaneSecurityTlsToken as i32;
     Ok(Some(pb::PublishedRoute {
+        compatibility: environment.compatibility.clone(),
         environment_id: spec.id.clone(),
         tenant_id: spec.tenant_id.clone(),
         runtime_id: runtime.id.clone(),
@@ -469,7 +495,7 @@ fn route_from_published(
         } else {
             data_plane.port_forward
         },
-        forwarded_ports: environment.ports.clone(),
+        forwarded_ports: execution.ports.clone(),
     }))
 }
 

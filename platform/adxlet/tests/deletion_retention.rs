@@ -3,16 +3,29 @@ use adx_protocol::{auth::Peers, control as pb};
 use adxlet::{Adxlet, Durability, Readiness, Routes, RuntimeDriver, StateSink};
 use async_trait::async_trait;
 use std::{
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 use tonic::Request;
 
-struct Dependencies(Mutex<Durability>);
+struct Dependencies {
+    durability: Mutex<Durability>,
+    block_deleted_commit: AtomicBool,
+    deleted_commit_started: tokio::sync::Notify,
+    allow_deleted_commit: tokio::sync::Notify,
+}
 
 impl Default for Dependencies {
     fn default() -> Self {
-        Self(Mutex::new(Durability::Published))
+        Self {
+            durability: Mutex::new(Durability::Published),
+            block_deleted_commit: AtomicBool::new(false),
+            deleted_commit_started: tokio::sync::Notify::new(),
+            allow_deleted_commit: tokio::sync::Notify::new(),
+        }
     }
 }
 
@@ -57,13 +70,20 @@ impl Routes for Dependencies {
 
 #[async_trait]
 impl StateSink for Dependencies {
-    async fn commit(&self, _: &EnvironmentRecord) -> Result<Durability> {
-        Ok(*self.0.lock().expect("test state lock is healthy"))
+    async fn commit(&self, record: &EnvironmentRecord) -> Result<Durability> {
+        if record.state == adx_core::EnvironmentState::Deleted
+            && self.block_deleted_commit.load(Ordering::SeqCst)
+        {
+            self.deleted_commit_started.notify_waiters();
+            self.allow_deleted_commit.notified().await;
+        }
+        Ok(*self.durability.lock().expect("test state lock is healthy"))
     }
 }
 
 fn spec() -> EnvironmentSpec {
     EnvironmentSpec {
+        compatibility: None,
         runtime_profile: None,
         snapshot_id: None,
         lifecycle: Default::default(),
@@ -96,6 +116,7 @@ fn assignment() -> Assignment {
 fn delete_request() -> Request<pb::DeleteEnvironmentRequest> {
     let mut request = Request::new(pb::DeleteEnvironmentRequest {
         failed_revision: None,
+        expiry_revision: None,
         node_session_id: String::new(),
         assignment: Some(assignment().try_into().expect("test assignment is valid")),
         caller: Some(pb::CallerContext {
@@ -108,6 +129,252 @@ fn delete_request() -> Request<pb::DeleteEnvironmentRequest> {
         "apiserver".parse().expect("static metadata is valid"),
     );
     request
+}
+
+fn coordinator_delete_request(
+    failed_revision: Option<u64>,
+    expiry_revision: Option<u64>,
+    node_session_id: &str,
+) -> Request<pb::DeleteEnvironmentRequest> {
+    let mut request = Request::new(pb::DeleteEnvironmentRequest {
+        failed_revision,
+        expiry_revision,
+        node_session_id: node_session_id.into(),
+        assignment: Some(assignment().try_into().expect("test assignment is valid")),
+        caller: None,
+    });
+    request.metadata_mut().insert(
+        "adx-component",
+        "coordinator".parse().expect("static metadata is valid"),
+    );
+    request
+}
+
+fn coordinator_delete_request_for_assignment(
+    failed_revision: Option<u64>,
+    expiry_revision: Option<u64>,
+    node_session_id: &str,
+    assignment: Assignment,
+) -> Request<pb::DeleteEnvironmentRequest> {
+    let mut request = coordinator_delete_request(failed_revision, expiry_revision, node_session_id);
+    request.get_mut().assignment = Some(assignment.try_into().expect("test assignment is valid"));
+    request
+}
+
+async fn running_service() -> (Arc<Adxlet>, adxlet::rpc::NodeRpc, u64) {
+    let dependencies = Arc::new(Dependencies::default());
+    let manager = Arc::new(
+        Adxlet::new(
+            "node".into(),
+            dependencies.clone(),
+            dependencies.clone(),
+            dependencies.clone(),
+            dependencies,
+        )
+        .with_operation_timeout(Duration::from_secs(1))
+        .expect("test timeout is valid"),
+    );
+    manager
+        .update_capacity(
+            Resources {
+                cpu_millis: 1,
+                memory_bytes: 1,
+                disk_bytes: 1,
+            },
+            Duration::from_secs(30),
+        )
+        .expect("test capacity is valid");
+    let created = manager
+        .environment(spec(), assignment())
+        .expect("test Environment is admitted")
+        .create()
+        .await
+        .expect("test Environment starts");
+    let service = adxlet::rpc::NodeRpc::new(manager.clone(), Peers::network(), "session".into());
+    (manager, service, created.record.revision)
+}
+
+#[tokio::test]
+async fn coordinator_failed_gc_rejects_ambiguous_or_untrusted_fences() {
+    use adx_protocol::control::node_service_server::NodeService;
+
+    let (manager, service, revision) = running_service().await;
+    assert_eq!(
+        service
+            .delete_environment(coordinator_delete_request(None, None, "session"))
+            .await
+            .expect_err("Coordinator must select exactly one fence")
+            .code(),
+        tonic::Code::InvalidArgument
+    );
+    assert_eq!(
+        service
+            .delete_environment(coordinator_delete_request(
+                Some(revision),
+                Some(revision),
+                "session",
+            ))
+            .await
+            .expect_err("Coordinator cannot combine expiry and failed fences")
+            .code(),
+        tonic::Code::InvalidArgument
+    );
+    assert_eq!(
+        service
+            .delete_environment(coordinator_delete_request(Some(revision), None, "other"))
+            .await
+            .expect_err("Coordinator session must match")
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
+    let mut api_request = delete_request();
+    api_request.get_mut().failed_revision = Some(revision);
+    assert_eq!(
+        service
+            .delete_environment(api_request)
+            .await
+            .expect_err("API Server cannot supply a Coordinator fence")
+            .code(),
+        tonic::Code::InvalidArgument
+    );
+    assert_eq!(
+        service
+            .delete_environment(coordinator_delete_request(Some(revision), None, "session"))
+            .await
+            .expect_err("Failed GC cannot delete a live Running environment")
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
+    assert!(manager
+        .metrics()
+        .contains("adx_node_managed_environments 1\n"));
+}
+
+#[tokio::test]
+async fn coordinator_expiry_retry_requires_the_original_fence() {
+    use adx_protocol::control::node_service_server::NodeService;
+
+    let (_manager, service, revision) = running_service().await;
+    let first = service
+        .delete_environment(coordinator_delete_request(None, Some(revision), "session"))
+        .await
+        .expect("expiry collection succeeds")
+        .into_inner();
+    assert_eq!(
+        service
+            .delete_environment(coordinator_delete_request(None, Some(revision), "session"))
+            .await
+            .expect("lost-response expiry retry replays the delete")
+            .into_inner(),
+        first
+    );
+    assert_eq!(
+        service
+            .delete_environment(coordinator_delete_request(
+                None,
+                Some(revision + 1),
+                "session"
+            ))
+            .await
+            .expect_err("a different expiry revision cannot replay the tombstone")
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
+    assert_eq!(
+        service
+            .delete_environment(coordinator_delete_request(Some(revision), None, "session"))
+            .await
+            .expect_err("a failed fence cannot replay an expiry tombstone")
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
+    let mut other_assignment = assignment();
+    other_assignment.generation += 1;
+    assert_eq!(
+        service
+            .delete_environment(coordinator_delete_request_for_assignment(
+                None,
+                Some(revision),
+                "session",
+                other_assignment,
+            ))
+            .await
+            .expect_err("a new assignment cannot replay an old tombstone")
+            .code(),
+        tonic::Code::FailedPrecondition
+    );
+}
+
+#[tokio::test]
+async fn cancelled_coordinator_delete_still_records_its_fence() {
+    use adx_protocol::control::node_service_server::NodeService;
+
+    let dependencies = Arc::new(Dependencies::default());
+    let manager = Arc::new(
+        Adxlet::new(
+            "node".into(),
+            dependencies.clone(),
+            dependencies.clone(),
+            dependencies.clone(),
+            dependencies.clone(),
+        )
+        .with_operation_timeout(Duration::from_secs(1))
+        .expect("test timeout is valid"),
+    );
+    manager
+        .update_capacity(
+            Resources {
+                cpu_millis: 1,
+                memory_bytes: 1,
+                disk_bytes: 1,
+            },
+            Duration::from_secs(30),
+        )
+        .expect("test capacity is valid");
+    let created = manager
+        .environment(spec(), assignment())
+        .expect("test Environment is admitted")
+        .create()
+        .await
+        .expect("test Environment starts");
+    let service = adxlet::rpc::NodeRpc::new(manager.clone(), Peers::network(), "session".into());
+    dependencies
+        .block_deleted_commit
+        .store(true, Ordering::SeqCst);
+    let deleting = tokio::spawn({
+        let service = service.clone();
+        async move {
+            service
+                .delete_environment(coordinator_delete_request(
+                    None,
+                    Some(created.record.revision),
+                    "session",
+                ))
+                .await
+        }
+    });
+    dependencies.deleted_commit_started.notified().await;
+    deleting.abort();
+    dependencies.allow_deleted_commit.notify_waiters();
+    tokio::task::yield_now().await;
+    assert_eq!(
+        service
+            .delete_environment(coordinator_delete_request(
+                None,
+                Some(created.record.revision),
+                "session",
+            ))
+            .await
+            .expect("retry after a dropped response replays the fenced tombstone")
+            .into_inner()
+            .record
+            .expect("delete result exists")
+            .state,
+        pb::EnvironmentState::Deleted as i32
+    );
+    assert!(manager
+        .metrics()
+        .contains("adx_node_retired_environment_tombstones 1\n"));
 }
 
 #[tokio::test(start_paused = true)]
@@ -217,7 +484,10 @@ async fn journaled_delete_keeps_controller_until_cluster_publication() {
         .await
         .expect("test Environment starts");
 
-    *dependencies.0.lock().expect("test state lock is healthy") = Durability::Journaled;
+    *dependencies
+        .durability
+        .lock()
+        .expect("test state lock is healthy") = Durability::Journaled;
     let service = adxlet::rpc::NodeRpc::new(manager.clone(), Peers::network(), "session".into());
     let journaled = service
         .delete_environment(delete_request())
@@ -229,7 +499,10 @@ async fn journaled_delete_keeps_controller_until_cluster_publication() {
     assert!(metrics.contains("adx_node_managed_environments 1\n"));
     assert!(metrics.contains("adx_node_retired_environment_tombstones 0\n"));
 
-    *dependencies.0.lock().expect("test state lock is healthy") = Durability::Published;
+    *dependencies
+        .durability
+        .lock()
+        .expect("test state lock is healthy") = Durability::Published;
     let published = service
         .delete_environment(delete_request())
         .await

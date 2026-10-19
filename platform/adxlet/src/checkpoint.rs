@@ -14,6 +14,7 @@ fn default_cache_max_entries() -> usize {
 fn default_cache_budget_bytes() -> u64 {
     DEFAULT_CACHE_BUDGET_BYTES
 }
+use sha2::{Digest, Sha256};
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
@@ -246,6 +247,11 @@ pub trait CheckpointStore: Send + Sync {
     async fn collect_remote_orphans(&self) -> Result<usize> {
         Ok(0)
     }
+    /// A nonempty, stable identifier for the actual shared backend. Local stores
+    /// return None and are never eligible to collect another node's artifacts.
+    fn shared_scope(&self) -> Option<&str> {
+        None
+    }
     /// Admission is closed and backend reconciliation has completed. Only remove
     /// node-private unreferenced files, never cluster-shared objects.
     async fn reconcile_local(&self, _retained: &[CheckpointArtifact]) -> Result<()> {
@@ -367,6 +373,7 @@ impl CheckpointStore for LocalCheckpointStore {
     async fn discard_staged(&self, staged: &Path) -> Result<()> {
         self.remove(&CheckpointArtifact {
             storage: "local".into(),
+            scope: String::new(),
             location: staged.to_string_lossy().into_owned(),
             size_bytes: 0,
         })
@@ -386,6 +393,7 @@ impl CheckpointStore for LocalCheckpointStore {
         }
         Ok(CheckpointArtifact {
             storage: "local".into(),
+            scope: String::new(),
             location: path.to_string_lossy().into_owned(),
             size_bytes: size,
         })
@@ -448,6 +456,41 @@ pub enum StorageConfig {
     },
 }
 impl StorageConfig {
+    /// Returns a stable, non-secret identity for the exact remote target used by
+    /// this process. An endpoint inherited only through an SDK environment lookup
+    /// is deliberately not accepted: the configured value is the only resolved
+    /// target that this layer can bind to its artifact record.
+    pub fn shared_scope(&self) -> Option<String> {
+        let Self::S3 {
+            alias,
+            bucket,
+            region,
+            endpoint: Some(endpoint),
+            prefix,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        if bucket.is_empty() || region.is_empty() || endpoint.trim().is_empty() || prefix.is_empty()
+        {
+            return None;
+        }
+        let mut hash = Sha256::new();
+        for value in [
+            "s3-v1",
+            alias.as_str(),
+            endpoint.as_str(),
+            bucket.as_str(),
+            region.as_str(),
+            prefix.as_str(),
+        ] {
+            hash.update(value.as_bytes());
+            hash.update([0]);
+        }
+        Some(format!("s3:{:x}", hash.finalize()))
+    }
+
     pub fn build(self) -> Result<Arc<dyn CheckpointStore>> {
         self.build_owned(None)
     }
@@ -464,6 +507,7 @@ impl StorageConfig {
         self,
         owner: Option<(String, String, RemoteGcConfig)>,
     ) -> Result<Arc<dyn CheckpointStore>> {
+        let scope = self.shared_scope().unwrap_or_default();
         match self {
             Self::Local { root } => Ok(Arc::new(LocalCheckpointStore::new(root)?)),
             Self::S3 {
@@ -488,6 +532,7 @@ impl StorageConfig {
                 let remote = builder.build().map_err(io_error)?;
                 let store = ObjectCheckpointStore::new(
                     alias,
+                    scope,
                     Arc::new(remote),
                     prefix,
                     root,

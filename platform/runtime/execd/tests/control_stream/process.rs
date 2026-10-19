@@ -81,6 +81,7 @@ fn record() -> EnvironmentRecord {
     EnvironmentRecord {
         failure: None,
         spec: EnvironmentSpec {
+            compatibility: None,
             id: "i".into(),
             tenant_id: "t".into(),
             runtime_profile: None,

@@ -39,6 +39,7 @@ enum Command {
         Option<tokio::time::Instant>,
     ),
     Delete,
+    DeleteAt(u64),
     CollectFailed(u64),
     Sync,
     Reconcile,
@@ -163,6 +164,11 @@ impl EnvironmentHandle {
     }
     pub async fn delete(&self) -> Result<OperationResult> {
         self.send(Command::Delete).await
+    }
+    /// Expiry cleanup is fenced to the exact record revision that Coordinator
+    /// claimed. It must not delete a later resume or replacement execution.
+    pub async fn delete_at_revision(&self, expected_revision: u64) -> Result<OperationResult> {
+        self.send(Command::DeleteAt(expected_revision)).await
     }
     /// GC must not delete an execution that moved on after the candidate was read.
     pub async fn collect_failed(&self, expected_revision: u64) -> Result<OperationResult> {
@@ -332,10 +338,31 @@ impl Controller {
                     Ok(())
                 } else {
                     async {
-                        if !self.runtime_probe_failure().await? {
-                            self.workload_checkpoint().await?;
+                        if self.runtime_probe_failure().await? {
+                            return Ok(());
                         }
-                        Ok(())
+                        match self.workload_checkpoint().await {
+                            // A guest checkpoint deliberately changes RuntimeStatus before
+                            // resuming. Its own checkpoint protocol owns that transition.
+                            Ok(true) => Ok(()),
+                            Err(error) => Err(error),
+                            Ok(false) if self.record.spec.compatibility.is_some() => {
+                                let health = tokio::time::timeout(
+                                    self.services.operation_timeout,
+                                    self.services.readiness.activity(&self.record),
+                                )
+                                .await
+                                .unwrap_or_else(|_| {
+                                    Err(Error::Unavailable("runtime health timed out".into()))
+                                });
+                                if health.is_err() {
+                                    self.unexpected_exit().await.map(|_| ())
+                                } else {
+                                    Ok(())
+                                }
+                            }
+                            Ok(false) => Ok(()),
+                        }
                     }
                     .await
                 };
@@ -380,6 +407,7 @@ impl Controller {
             Command::Recover(_) => "recover",
             Command::Create(_) | Command::Clone(_, _) => "create",
             Command::Delete => "delete",
+            Command::DeleteAt(_) => "delete_expired",
             Command::CollectFailed(_) => "collect_failed",
             Command::Sync => "sync",
             Command::Reconcile => "reconcile",
@@ -432,6 +460,13 @@ impl Controller {
                 result
             }
             Command::Delete => self.delete().await,
+            Command::DeleteAt(revision) => {
+                if self.record.revision != revision {
+                    Err(Error::Conflict)
+                } else {
+                    self.delete().await
+                }
+            }
             Command::CollectFailed(revision) => {
                 if self.record.state != EnvironmentState::Failed
                     || self.record.restart_pending
@@ -645,10 +680,23 @@ impl Controller {
         ) {
             return Err(Error::Conflict);
         }
+        let cleanup_artifacts = if self.record.state == EnvironmentState::Deleted {
+            self.obsolete_checkpoints.clone()
+        } else {
+            Vec::new()
+        };
         let durability = timeout(
             self.services.operation_timeout,
-            adx_observability::trace::Trace::child("environment.state.commit")
-                .run_result(self.services.sink.commit(&self.record)),
+            adx_observability::trace::Trace::child("environment.state.commit").run_result(async {
+                if self.record.state == EnvironmentState::Deleted {
+                    self.services
+                        .sink
+                        .commit_deleted(&self.record, &cleanup_artifacts)
+                        .await
+                } else {
+                    self.services.sink.commit(&self.record).await
+                }
+            }),
         )
         .await
         .map_err(|_| Error::Unavailable("state commit timed out".into()))??;
@@ -674,6 +722,13 @@ impl Controller {
 
     async fn clean_obsolete_checkpoints(&mut self) -> Result<()> {
         if self.durability != Some(Durability::Published) {
+            return Ok(());
+        }
+        if self.record.state == EnvironmentState::Deleted {
+            // Coordinator has atomically retained the cleanup task with the
+            // Deleted record. Its collector applies the live Environment and
+            // Snapshot alias fences before removing physical bytes.
+            self.obsolete_checkpoints.clear();
             return Ok(());
         }
         if let (Some(cp), Some(services)) = (&self.record.checkpoint, &self.services.checkpoint) {

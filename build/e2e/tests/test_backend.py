@@ -13,9 +13,27 @@ spec.loader.exec_module(backend)
 
 
 class ReleaseChecksumTests(unittest.TestCase):
-    def test_backend_build_does_not_patch_sandboxd(self):
+    def test_verified_runc_cache_requires_the_pinned_digest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / 'runc'
+            destination = Path(tmp) / 'output' / 'runc'
+            source.write_bytes(b'pinned-runc')
+            expected = backend.sha(source)
+
+            backend.copy_verified_runc(source, destination, expected)
+            self.assertEqual(backend.sha(destination), expected)
+            self.assertTrue(destination.stat().st_mode & 0o111)
+
+            with self.assertRaises(ValueError):
+                backend.copy_verified_runc(source, destination, '0' * 64)
+
+    def test_backend_patch_set_is_integrity_pinned(self):
         pinned = json.loads((backend.ROOT / 'third_party/sandboxd/source.json').read_text())
-        self.assertNotIn('patches', pinned)
+        self.assertEqual([p['path'] for p in backend.patch_identity(pinned)], [
+            'third_party/sandboxd/patches/trusted-guest-metadata.patch',
+            'third_party/sandboxd/patches/firecracker-realtime-restore.patch',
+            'third_party/sandboxd/patches/firecracker-restore-network-fence.patch',
+        ])
         self.assertNotIn('firecracker-initrd', backend.SANDBOXD_BUILD_TARGETS)
         self.assertNotIn('firecracker-initrd.img', backend.SANDBOXD_OUTPUTS)
 

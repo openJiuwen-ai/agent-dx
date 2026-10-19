@@ -99,7 +99,10 @@ async fn run(cli: Cli) -> Result<()> {
         .map_err(|_| "invalid configured Redis endpoint")?;
     let mut connection = match tokio::time::timeout(
         QUERY_TIMEOUT,
-        client.get_multiplexed_async_connection(),
+        // QUERY_TIMEOUT is the inspection command's authoritative response budget.
+        client.get_multiplexed_async_connection_with_config(
+            &redis::AsyncConnectionConfig::new().set_response_timeout(None),
+        ),
     )
     .await
     {

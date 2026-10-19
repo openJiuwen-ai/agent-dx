@@ -36,6 +36,7 @@ struct Rig {
     rpc: CoordinatorRpc,
     coordinator: pb::coordinator_service_client::CoordinatorServiceClient<Channel>,
     nodes: Vec<pb::node_service_client::NodeServiceClient<Channel>>,
+    coordinator_nodes: Vec<pb::node_service_client::NodeServiceClient<Channel>>,
     claimants: Vec<pb::coordinator_service_client::CoordinatorServiceClient<Channel>>,
     managers: Vec<Arc<Adxlet>>,
     backends: Vec<Arc<Backend>>,
@@ -86,6 +87,7 @@ impl Rig {
         let mut managers = vec![];
         let mut backends = vec![];
         let mut nodes = vec![];
+        let mut coordinator_nodes = vec![];
         let mut claimants = vec![];
         for (id, cert) in [("a", "node"), ("b", "ingress")] {
             let client = channel(ma, cert).await;
@@ -127,6 +129,7 @@ impl Rig {
             let mut coordinator =
                 pb::coordinator_service_client::CoordinatorServiceClient::new(client);
             let mut register = pb::RegisterNodeRequest {
+                checkpoint_scopes: vec![],
                 runtime_classes: vec![
                     "runsc".into(),
                     "runc".into(),
@@ -163,6 +166,9 @@ impl Rig {
             nodes.push(pb::node_service_client::NodeServiceClient::new(
                 channel(na, "apiserver").await,
             ));
+            coordinator_nodes.push(pb::node_service_client::NodeServiceClient::new(
+                channel(na, "coordinator").await,
+            ));
         }
         Self {
             _redis: redis,
@@ -173,6 +179,7 @@ impl Rig {
                 channel(ma, "apiserver").await,
             ),
             nodes,
+            coordinator_nodes,
             claimants,
             managers,
             backends,
@@ -192,6 +199,7 @@ impl Rig {
         self.nodes[index]
             .delete_environment(pb::DeleteEnvironmentRequest {
                 failed_revision: None,
+                expiry_revision: None,
                 node_session_id: String::new(),
                 assignment: Some(owner.clone()),
                 caller: caller(),
@@ -231,11 +239,69 @@ async fn failed_gc_cleans_node_controller_redis_and_allows_same_name() {
     rig.managers[0].pause_lifecycle().await;
     assert!(rig.rpc.collect_failed(Duration::ZERO).await.is_err());
     assert!(rig.session.get("failed-gc").await.is_ok());
+    let failed_record = failed.result.unwrap();
     rig.managers[0]
-        .reconcile(vec![failed.result.unwrap()])
+        .reconcile(vec![failed_record.clone()])
         .await
         .unwrap();
+    let collection_record = rig.session.get("failed-gc").await.unwrap().result.unwrap();
     assert_eq!(rig.rpc.collect_failed(Duration::ZERO).await.unwrap(), 1);
+    let failed_fence = collection_record.revision;
+    let assignment = pb::Assignment {
+        environment_id: collection_record.assignment.environment_id.clone(),
+        node_id: collection_record.assignment.node_id.clone(),
+        shard_id: collection_record
+            .assignment
+            .shard_id
+            .try_into()
+            .expect("test shard id fits protocol"),
+        generation: collection_record.assignment.generation,
+        devices: vec![],
+    };
+    let replay = pb::DeleteEnvironmentRequest {
+        failed_revision: Some(failed_fence),
+        expiry_revision: None,
+        node_session_id: "boot-a".into(),
+        assignment: Some(assignment.clone()),
+        caller: None,
+    };
+    let replayed = rig.coordinator_nodes[0]
+        .delete_environment(replay.clone())
+        .await
+        .expect("Coordinator mTLS retry with the original failed fence replays deletion")
+        .into_inner();
+    assert_eq!(
+        replayed.record.unwrap().state,
+        pb::EnvironmentState::Deleted as i32
+    );
+    for invalid in [
+        pb::DeleteEnvironmentRequest {
+            failed_revision: Some(failed_fence + 1),
+            ..replay.clone()
+        },
+        pb::DeleteEnvironmentRequest {
+            failed_revision: None,
+            expiry_revision: Some(failed_fence),
+            ..replay.clone()
+        },
+        {
+            let mut changed_assignment = assignment.clone();
+            changed_assignment.generation += 1;
+            pb::DeleteEnvironmentRequest {
+                assignment: Some(changed_assignment),
+                ..replay.clone()
+            }
+        },
+    ] {
+        assert_eq!(
+            rig.coordinator_nodes[0]
+                .delete_environment(invalid)
+                .await
+                .expect_err("only the original Coordinator fence may replay deletion")
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+    }
     assert_eq!(
         rig.session.get("failed-gc").await.unwrap_err(),
         adx_core::Error::NotFound
@@ -278,6 +344,7 @@ async fn failed_gc_cleans_invalidated_owner_and_fences_delayed_running() {
     );
     assert!(rig.claimants[0]
         .commit_environment(pb::CommitEnvironmentRequest {
+            cleanup_artifacts: vec![],
             record: Some(created),
             node_session_id: "boot-a".into()
         })
@@ -301,6 +368,7 @@ async fn redis_restart_recovers_scheduler_after_failed_node_heartbeat() {
     let stored = rig.session.snapshot().await.unwrap();
     let node = &stored.nodes["a"];
     let heartbeat = pb::RegisterNodeRequest {
+        checkpoint_scopes: vec![],
         runtime_classes: vec!["runsc".into(), "runc".into()],
         node_id: "a".into(),
         node_address: node.address.clone(),
@@ -647,6 +715,7 @@ async fn environment_directory_increment_does_not_rescan_control_history() {
     let heartbeat_before = redis_command_calls(&rig._redis, "hgetall").await;
     rig.claimants[0]
         .register_node(pb::RegisterNodeRequest {
+            checkpoint_scopes: vec![],
             runtime_classes: stored.node.runtime_classes,
             node_id: stored.node.id,
             node_address: stored.address,
@@ -1115,6 +1184,7 @@ async fn local_first_https_directory_round_robin_and_concurrent_creation() {
                     tenant_id: tenant.into(),
                     administrator: false,
                     expires_at_unix_seconds: 0,
+                    metadata: None,
                 },
             )
             .await
@@ -1132,6 +1202,7 @@ async fn local_first_https_directory_round_robin_and_concurrent_creation() {
         let node = &rig.session.snapshot().await.unwrap().nodes[if i == 0 { "a" } else { "b" }];
         rig.claimants[i]
             .register_node(pb::RegisterNodeRequest {
+                checkpoint_scopes: vec![],
                 runtime_classes: vec![
                     "runsc".into(),
                     "runc".into(),
@@ -1330,6 +1401,7 @@ async fn existing_terminal_claim_reconciles_a_late_commit_into_scheduler_account
     assert!(rig.nodes[0]
         .delete_environment(pb::DeleteEnvironmentRequest {
             failed_revision: None,
+            expiry_revision: None,
             node_session_id: String::new(),
             assignment: running.assignment,
             caller: caller(),

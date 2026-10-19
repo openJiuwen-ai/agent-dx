@@ -1,6 +1,11 @@
 //! Replay capacity is a cache budget, never a create admission limit.
-use adx_apiserver::{clients::Clients, config::Config, environment_service::EnvironmentService};
+use adx_apiserver::{
+    clients::Clients, config::Config, environment_service::EnvironmentService, http::Api,
+    operations::Kind,
+};
 use adx_protocol::control as pb;
+use hyper::service::service_fn;
+use hyper_util::rt::TokioIo;
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
@@ -10,7 +15,10 @@ use std::{
     },
     time::Duration,
 };
-use tokio::sync::Notify;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    sync::Notify,
+};
 use tonic::{Request, Response, Status};
 
 #[derive(Default)]
@@ -55,6 +63,13 @@ service_impl!(pb::coordinator_service_server::CoordinatorService, {
         self.0.deadlines.lock().unwrap().push(request.get_ref().create_deadline_unix_millis);
         self.0.create_calls.fetch_add(1, Ordering::SeqCst);
         let spec = request.into_inner().spec.unwrap();
+        // The coordinator validates and canonicalizes E2B Environment specs
+        // through the core model before publishing them.
+        let spec = if spec.compatibility.is_some() {
+            adx_core::EnvironmentSpec::try_from(spec).unwrap().into()
+        } else {
+            spec
+        };
         let record = {
             let mut owners = self.0.owners.lock().unwrap();
             if let Some(owner) = owners.get_mut(&spec.id) {
@@ -107,7 +122,27 @@ assignment: Some(pb::Assignment { environment_id: spec.id.clone(), node_id: "nod
         }
         Ok(Response::new(pb::EnvironmentResult { record: Some(record), durability: pb::Durability::Published as i32 }))
     }
+    async fn get_environment_control(&self, request: Request<pb::GetEnvironmentControlRequest>) -> Result<Response<pb::EnvironmentControlRecord>, Status> {
+        let id = request.into_inner().id;
+        let owner = self.0.owners.lock().unwrap().get(&id).cloned()
+            .ok_or_else(|| Status::not_found("environment not found"))?;
+        let compatibility = owner.record
+            .and_then(|record| record.spec)
+            .and_then(|spec| spec.compatibility)
+            .ok_or_else(|| Status::not_found("sandbox control not found"))?;
+        Ok(Response::new(pb::EnvironmentControlRecord {
+            environment_id: id,
+            compatibility: Some(compatibility),
+            expires_at_unix_ms: 1,
+            started_at_unix_ms: 1,
+            revision: 1,
+            generation: 1,
+            expiry_claimed: false,
+        }))
+    }
 }, [
+    update_environment_control(UpdateEnvironmentControlRequest) -> EnvironmentControlRecord,
+    list_environment_controls(ListEnvironmentControlsRequest) -> ListEnvironmentControlsResponse,
     get_scheduling_queue(GetSchedulingQueueRequest) -> GetSchedulingQueueResponse,
     set_node_scheduling(SetNodeSchedulingRequest) -> NodeSchedulingState,
     prepare_create(LocalEnvironmentCreateRequest) -> PreparedEnvironment,
@@ -119,6 +154,22 @@ assignment: Some(pb::Assignment { environment_id: spec.id.clone(), node_id: "nod
     ensure_running(EnsureRunningRequest) -> GetEnvironmentResponse,
     retire_dormant(GetEnvironmentRequest) -> EnvironmentResult,
 ]);
+
+#[tonic::async_trait]
+impl pb::auth_service_server::AuthService for Service {
+    async fn verify_api_key(
+        &self,
+        request: Request<pb::VerifyApiKeyRequest>,
+    ) -> Result<Response<pb::VerifyApiKeyResponse>, Status> {
+        if request.into_inner().api_key.len() < 32 {
+            return Err(Status::unauthenticated("invalid API key"));
+        }
+        Ok(Response::new(pb::VerifyApiKeyResponse {
+            caller: Some(caller()),
+            expires_at_unix_seconds: 0,
+        }))
+    }
+}
 #[tonic::async_trait]
 impl pb::environment_directory_service_server::EnvironmentDirectoryService for Service {
     type WatchEnvironmentsStream = std::pin::Pin<
@@ -145,6 +196,7 @@ use futures_util::StreamExt;
 struct Fixture {
     service: Arc<EnvironmentService>,
     clients: Arc<Clients>,
+    api: Arc<Api>,
     state: Arc<State>,
     server: tokio::task::JoinHandle<()>,
 }
@@ -158,10 +210,12 @@ impl Fixture {
         Self::with_retention(600).await
     }
     async fn with_retention(retention: u64) -> Self {
+        adx_transport::install_crypto_provider();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap().to_string();
         let state = Arc::new(State::default());
         let endpoint = Service(state.clone());
+        let auth = endpoint.clone();
         let server = tokio::spawn(async move {
             let incoming = futures_util::stream::unfold(listener, |listener| async {
                 let socket = listener.accept().await.map(|(socket, _)| socket);
@@ -170,15 +224,32 @@ impl Fixture {
             tonic::transport::Server::builder()
                 .add_service(pb::coordinator_service_server::CoordinatorServiceServer::new(endpoint.clone()))
                 .add_service(pb::environment_directory_service_server::EnvironmentDirectoryServiceServer::new(endpoint))
+                .add_service(pb::auth_service_server::AuthServiceServer::new(auth))
                 .serve_with_incoming(incoming).await.unwrap();
         });
         let config: Config = serde_json::from_value(json!({
             "listen":"127.0.0.1:0", "coordinator_address":address, "internal_security":"network", "ingress_mode":"standalone",
             "rpc_timeout_seconds":2, "cache_entries":1, "auth_cache_ttl_seconds":1,
-            "create_unknown_retention_seconds":retention
+            "create_unknown_retention_seconds":retention,
+            "e2b": {
+                "domain":"sandbox.test",
+                "envdVersion":"0.9.0",
+                "runtimeProfiles": {
+                    "e2b": {
+                        "rootfs":{"runtime_class":"runsc","type":"local","path":"/rootfs","readonly":true},
+                        "bootstrap":{"type":"erofs","root":"/rootfs","target":"/rootfs","entrypoint":["/rootfs/init"]},
+                        "env":{"ADX_ENVD_PATH":"/usr/local/bin/envd","ADX_ENVD_SHA256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+                    }
+                },
+                "templates":{"templates":{"base":{
+                    "runtimeProfileRef":"e2b","defaultUser":"user","defaultWorkdir":"/workspace",
+                    "cpuMillicores":1000,"memoryMiB":512,"capabilities":["envd"]
+                }}}
+            }
         })).unwrap();
         let clients = Clients::new(config).unwrap();
         let service = EnvironmentService::new(clients.clone());
+        let api = Api::new(clients.clone()).unwrap();
         tokio::time::timeout(Duration::from_secs(3), async {
             while service.inspect("tenant", "not-created").await.is_err() {
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -189,6 +260,7 @@ impl Fixture {
         Self {
             service,
             clients,
+            api,
             state,
             server,
         }
@@ -212,6 +284,7 @@ impl Fixture {
 }
 fn spec(id: &str) -> pb::EnvironmentSpec {
     pb::EnvironmentSpec {
+        compatibility: None,
         id: id.into(),
         tenant_id: "tenant".into(),
         runtime_class: "runsc".into(),
@@ -288,6 +361,41 @@ async fn completed_cache_capacity_never_rejects_new_creates() {
         "environment-0"
     );
     assert_eq!(fixture.state.starts.load(Ordering::SeqCst), 12);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn e2b_create_through_http_listener_completes_on_default_worker_stack() {
+    let fixture = Fixture::new().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let api = fixture.api.clone();
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        hyper::server::conn::http1::Builder::new()
+            .serve_connection(
+                TokioIo::new(socket),
+                service_fn(move |request| api.clone().serve(request)),
+            )
+            .await
+            .unwrap();
+    });
+    let request = br#"{"templateID":"base"}"#;
+    let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+    let request = format!(
+        "POST /v2/sandboxes HTTP/1.1\r\nHost: localhost\r\nX-API-Key: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "k".repeat(32),
+        request.len(),
+        std::str::from_utf8(request).unwrap(),
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.unwrap();
+    server.await.unwrap();
+    assert!(
+        response.starts_with(b"HTTP/1.1 201"),
+        "{}",
+        String::from_utf8_lossy(&response)
+    );
 }
 #[tokio::test]
 async fn unknown_results_do_not_block_new_names_and_retry_original_identity() {
@@ -507,4 +615,61 @@ async fn pending_retry_rejects_a_changed_generation() {
         tonic::Code::FailedPrecondition
     );
     assert_eq!(fixture.state.create_calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn revision_fenced_operation_refreshes_and_rejects_a_stale_merge_before_node_rpc() {
+    let fixture = Fixture::new().await;
+    fixture.create("revision", "create-revision").await.unwrap();
+    {
+        let mut owners = fixture.state.owners.lock().unwrap();
+        owners
+            .get_mut("revision")
+            .unwrap()
+            .record
+            .as_mut()
+            .unwrap()
+            .revision = 2;
+    }
+    let lookups = fixture.state.lookups.load(Ordering::SeqCst);
+    let stale = fixture
+        .service
+        .execute_at_revision(
+            Kind::Network,
+            "revision",
+            "stale-network",
+            network_payload(),
+            &caller(),
+            1,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(stale.code(), tonic::Code::Aborted);
+    assert_eq!(fixture.state.lookups.load(Ordering::SeqCst), lookups + 1);
+
+    let current = fixture
+        .service
+        .execute_at_revision(
+            Kind::Network,
+            "revision",
+            "current-network",
+            network_payload(),
+            &caller(),
+            2,
+        )
+        .await
+        .unwrap_err();
+    assert_ne!(current.code(), tonic::Code::Aborted);
+}
+
+fn network_payload() -> Value {
+    json!({
+        "schemaVersion": 2,
+        "traffic": {
+            "ingressDefaultAction": "allow",
+            "egressDefaultAction": "allow",
+            "rules": [],
+            "mode": "stateful"
+        }
+    })
 }

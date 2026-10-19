@@ -80,7 +80,10 @@ impl ObjectCheckpointStore {
         // Preserve the union for this boot. Once registered, ordinary Environment /
         // snapshot deletion owns the artifact's cleanup, not this orphan collector.
         let mut validated = BTreeSet::new();
-        for artifact in retained.iter().filter(|a| a.storage == self.alias) {
+        for artifact in retained
+            .iter()
+            .filter(|a| a.storage == self.alias && (a.scope.is_empty() || a.scope == self.scope))
+        {
             self.validate(artifact)?;
             validated.insert(artifact.location.clone());
         }

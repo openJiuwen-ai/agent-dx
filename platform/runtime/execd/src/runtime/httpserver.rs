@@ -500,11 +500,15 @@ async fn control_response(method: &str, path: &str, body: &[u8]) -> CachedRespon
         }
         ("POST", "/control/v1/checkpoint/abort-unstarted") => {
             match serde_json::from_slice::<AbortCheckpoint>(body) {
-                Ok(request) => controller.abort_unstarted(
-                    &request.operation_id,
-                    &request.identity,
-                    request.expected_revision,
-                ),
+                Ok(request) => {
+                    controller
+                        .abort_unstarted(
+                            &request.operation_id,
+                            &request.identity,
+                            request.expected_revision,
+                        )
+                        .await
+                }
                 Err(error) => Err(Error::Invalid(error.to_string())),
             }
         }

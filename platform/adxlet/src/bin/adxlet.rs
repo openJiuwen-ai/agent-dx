@@ -321,6 +321,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err("configure only one of checkpoint_dir and checkpoint_storage".into())
         }
     };
+    let checkpoint_scopes = checkpoint_storage
+        .as_ref()
+        .and_then(adxlet::checkpoint::StorageConfig::shared_scope)
+        .into_iter()
+        .collect();
     if let Some(storage) = checkpoint_storage {
         manager = manager
             .with_checkpointing(
@@ -377,6 +382,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         heartbeat_sequence: 0,
         reconciling: true,
         runtime_classes: vec![],
+        checkpoint_scopes,
     };
     // Bind before registration so dispatch cannot race an unbound address.
     let node_rpc = NodeRpc::new(manager.clone(), peers, session_id.clone())

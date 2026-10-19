@@ -481,6 +481,7 @@ mod tests {
             active_requests: 0,
             active_commands: 0,
             activity_revision: 1,
+            required_services: Default::default(),
         }
     }
     #[tokio::test]

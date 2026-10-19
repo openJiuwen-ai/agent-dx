@@ -4,6 +4,7 @@ pub mod activator;
 pub mod clients;
 pub mod config;
 pub mod contract;
+pub mod e2b;
 pub mod environment_service;
 pub mod errors;
 pub mod http;

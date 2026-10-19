@@ -50,6 +50,7 @@ fn spec() -> EnvironmentSpec {
         priority: 0,
         scheduling: Default::default(),
         execution: Default::default(),
+        compatibility: None,
     }
 }
 fn caller() -> Option<pb::CallerContext> {
@@ -242,6 +243,7 @@ async fn worker(
     let store = Arc::new(
         ObjectCheckpointStore::new(
             "obs".into(),
+            "test-shared".into(),
             remote,
             "checkpoints".into(),
             dir.path().into(),
@@ -288,6 +290,7 @@ async fn worker(
             proxy_address: format!("{id}:9002"),
             capacity: Some(spec().resources.into()),
             runtime_classes: vec!["test-runtime".into()],
+            checkpoint_scopes: vec!["test-shared".into()],
             labels: [("ADX_CHECKPOINT_STORAGE".into(), "obs".into())].into(),
             session_id: session,
             heartbeat_sequence: 1,
@@ -412,6 +415,8 @@ impl Rig {
             assignment: record.assignment,
             caller: caller(),
             operation_id: "pause-original".into(),
+            expiry_revision: None,
+            node_session_id: String::new(),
             expected_revision: record.revision,
             retention: Some(adx_core::lifecycle::RetentionPolicy::Ttl { ttl_seconds }.into()),
             timeout_seconds: 10,
@@ -1295,6 +1300,7 @@ async fn multiple_ingress_traffic(timeout_retry: bool) {
                 tenant_id: "tenant".into(),
                 administrator: false,
                 expires_at_unix_seconds: 0,
+                metadata: Default::default(),
             },
         )
         .await
@@ -1615,6 +1621,7 @@ async fn delete_serializes_with_restore_and_fences_its_late_result() {
         assignment: Some(paused.assignment.clone().try_into().unwrap()),
         caller: caller(),
         failed_revision: None,
+        expiry_revision: None,
         node_session_id: String::new(),
     }));
     assert!(futures_util::poll!(deleting.as_mut()).is_pending());

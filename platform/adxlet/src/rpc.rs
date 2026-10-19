@@ -1,7 +1,7 @@
 //! Node RPC adaptation; EnvironmentHandle remains the lifecycle owner.
 use adx_transport::rpc::{authenticated_channel, RpcChannel};
 mod local_create;
-use crate::{Adxlet, Durability, StateSink};
+use crate::{Adxlet, Durability, RetiredDeleteFence, StateSink};
 use adx_core::{EnvironmentRecord, Error, Result};
 use adx_protocol::{
     auth::{tenant, Peers, Principal},
@@ -47,6 +47,30 @@ impl NodeRpc {
         }
         Ok(handle)
     }
+    /// Coordinator expiry intents are already tenant-authorized by the durable
+    /// control record. They still need the exact assignment fence locally.
+    fn owned_handle_for_coordinator(
+        &self,
+        assignment: Option<pb::Assignment>,
+    ) -> std::result::Result<crate::EnvironmentHandle, Box<Status>> {
+        let assignment: adx_core::Assignment = assignment
+            .ok_or_else(|| Box::new(Status::invalid_argument("assignment required")))?
+            .try_into()
+            .map_err(|error| Box::new(status(error)))?;
+        let environments = self
+            .manager
+            .environments
+            .lock()
+            .map_err(|_| Box::new(Status::unavailable("shared state lock poisoned")))?;
+        let (_, owner, handle) = environments
+            .get(&assignment.environment_id)
+            .cloned()
+            .ok_or_else(|| Box::new(Status::not_found("environment not managed on this node")))?;
+        if owner != assignment {
+            return Err(Box::new(Status::failed_precondition("assignment changed")));
+        }
+        Ok(handle)
+    }
     pub fn with_local_creation(mut self, coordinator: CoordinatorStateSink) -> Self {
         self.coordinator = Some(coordinator);
         self
@@ -73,6 +97,35 @@ fn response(result: crate::OperationResult) -> Result<Response<pb::EnvironmentRe
         } as i32,
     }))
 }
+
+#[allow(clippy::result_large_err)] // tonic status is returned directly at the RPC boundary.
+fn delete_fence(
+    principal: Principal,
+    expiry_revision: Option<u64>,
+    failed_revision: Option<u64>,
+) -> std::result::Result<Option<RetiredDeleteFence>, Status> {
+    match principal {
+        Principal::ApiServer => {
+            if expiry_revision.is_some() || failed_revision.is_some() {
+                return Err(Status::invalid_argument(
+                    "Coordinator deletion fences are not accepted from API Server",
+                ));
+            }
+            Ok(None)
+        }
+        Principal::Coordinator => match (expiry_revision, failed_revision) {
+            (Some(expiry), None) => Ok(Some(RetiredDeleteFence::Expiry(expiry))),
+            (None, Some(failed)) => Ok(Some(RetiredDeleteFence::Failed(failed))),
+            (None, None) | (Some(_), Some(_)) => Err(Status::invalid_argument(
+                "Coordinator delete requires exactly one expiry or failed revision",
+            )),
+        },
+        _ => Err(Status::permission_denied(
+            "Coordinator or API Server required",
+        )),
+    }
+}
+
 #[tonic::async_trait]
 impl pb::node_service_server::NodeService for NodeRpc {
     async fn ensure_environment_running(
@@ -254,12 +307,48 @@ impl pb::node_service_server::NodeService for NodeRpc {
                     .try_into()
                     .map_err(status)?;
                 self.manager
-                    .collect_snapshot(&snapshot)
+                    .collect_snapshot(&snapshot, r.delegated)
                     .await
                     .map_err(status)?;
                 Ok(Response::new(pb::CollectSnapshotResponse {
                     snapshot_id: snapshot.id,
                     revision: snapshot.revision,
+                }))
+            })
+            .await
+    }
+    async fn collect_checkpoint_cleanup(
+        &self,
+        request: Request<pb::CollectCheckpointCleanupRequest>,
+    ) -> std::result::Result<Response<pb::CollectCheckpointCleanupResponse>, Status> {
+        let trace =
+            adx_observability::trace::Trace::rpc("node.collect_checkpoint_cleanup", &request);
+        trace
+            .run_result(async {
+                if self.peers.authenticate(&request)? != Principal::Coordinator {
+                    return Err(Status::permission_denied("Coordinator identity required"));
+                }
+                let gate = self.manager.lifecycle_ready.read().await;
+                if !*gate {
+                    return Err(Status::unavailable("node is reconciling"));
+                }
+                let request = request.into_inner();
+                if self.session_id.is_empty() || request.node_session_id != self.session_id {
+                    return Err(Status::failed_precondition("node process session changed"));
+                }
+                let cleanup: adx_core::CheckpointCleanup = request
+                    .cleanup
+                    .ok_or_else(|| Status::invalid_argument("checkpoint cleanup required"))?
+                    .try_into()
+                    .map_err(status)?;
+                self.manager
+                    .collect_checkpoint_cleanup(&cleanup, request.delegated)
+                    .await
+                    .map_err(status)?;
+                Ok(Response::new(pb::CollectCheckpointCleanupResponse {
+                    environment_id: cleanup.assignment.environment_id,
+                    generation: cleanup.assignment.generation,
+                    revision: cleanup.revision,
                 }))
             })
             .await
@@ -337,7 +426,8 @@ impl pb::node_service_server::NodeService for NodeRpc {
         let trace = adx_observability::trace::Trace::rpc("node.pause_environment", &request);
         trace
             .run_result(async {
-                if self.peers.authenticate(&request)? != Principal::ApiServer {
+                let principal = self.peers.authenticate(&request)?;
+                if !matches!(principal, Principal::ApiServer | Principal::Coordinator) {
                     return Err(Status::permission_denied(
                         "validated Frontend caller required",
                     ));
@@ -347,7 +437,32 @@ impl pb::node_service_server::NodeService for NodeRpc {
                     return Err(Status::unavailable("node is reconciling"));
                 }
                 let r = request.into_inner();
-                let handle = self.owned_handle(r.assignment, r.caller.as_ref())?;
+                let handle = if principal == Principal::Coordinator {
+                    if r.expiry_revision.is_none() {
+                        return Err(Status::permission_denied(
+                            "Coordinator pause requires expiry revision",
+                        ));
+                    }
+                    if self.session_id.is_empty() || r.node_session_id != self.session_id {
+                        return Err(Status::failed_precondition("node session changed"));
+                    }
+                    self.owned_handle_for_coordinator(r.assignment.clone())
+                        .map_err(|status| *status)?
+                } else {
+                    if r.expiry_revision.is_some() {
+                        return Err(Status::invalid_argument(
+                            "expiry revision is Coordinator-only",
+                        ));
+                    }
+                    self.owned_handle(r.assignment.clone(), r.caller.as_ref())?
+                };
+                if principal == Principal::Coordinator
+                    && r.expected_revision != r.expiry_revision.unwrap_or_default()
+                {
+                    return Err(Status::invalid_argument(
+                        "expiry and expected revisions must match",
+                    ));
+                }
                 response(
                     handle
                         .pause(crate::checkpoint::PauseRequest {
@@ -486,12 +601,16 @@ impl pb::node_service_server::NodeService for NodeRpc {
                         "validated Frontend caller required",
                     ));
                 }
-                let gate = self.manager.lifecycle_ready.read().await;
+                let lifecycle_ready = Arc::clone(&self.manager.lifecycle_ready);
+                let gate = lifecycle_ready.read_owned().await;
                 if !*gate {
                     return Err(Status::unavailable("node is reconciling"));
                 }
                 let r = request.into_inner();
-                if principal == Principal::Coordinator && r.node_session_id != self.session_id {
+                let fence = delete_fence(principal.clone(), r.expiry_revision, r.failed_revision)?;
+                if principal == Principal::Coordinator
+                    && (self.session_id.is_empty() || r.node_session_id != self.session_id)
+                {
                     return Err(Status::failed_precondition("node session changed"));
                 }
                 let assignment: adx_core::Assignment = r
@@ -520,6 +639,11 @@ impl pb::node_service_server::NodeService for NodeRpc {
                     if result.record.assignment != assignment {
                         return Err(Status::failed_precondition("assignment changed"));
                     }
+                    if fence.is_some_and(|fence| retired.coordinator_delete_fence != Some(fence)) {
+                        return Err(Status::failed_precondition(
+                            "environment deletion fence changed",
+                        ));
+                    }
                     return response(result).map_err(status);
                 };
                 if principal == Principal::ApiServer {
@@ -528,18 +652,32 @@ impl pb::node_service_server::NodeService for NodeRpc {
                 if owner != assignment {
                     return Err(Status::failed_precondition("assignment changed"));
                 }
-                let result =
-                    if principal == Principal::Coordinator {
-                        handle
-                            .collect_failed(r.failed_revision.ok_or_else(|| {
-                                Status::invalid_argument("Failed revision required")
-                            })?)
-                            .await
-                    } else {
-                        handle.delete().await
-                    }
-                    .map_err(status)?;
-                self.manager.release_published_controller(&result);
+                let result = if principal == Principal::Coordinator {
+                    let fence =
+                        fence.ok_or_else(|| Status::invalid_argument("deletion fence required"))?;
+                    let manager = self.manager.clone();
+                    tokio::spawn(async move {
+                        let _lifecycle_guard = gate;
+                        let result = match fence {
+                            RetiredDeleteFence::Expiry(revision) => {
+                                handle.delete_at_revision(revision).await
+                            }
+                            RetiredDeleteFence::Failed(revision) => {
+                                handle.collect_failed(revision).await
+                            }
+                        }?;
+                        manager.release_published_controller_with_fence(&result, Some(fence));
+                        Ok::<_, Error>(result)
+                    })
+                    .await
+                    .map_err(|_| Status::internal("Coordinator deletion task failed"))?
+                } else {
+                    handle.delete().await
+                }
+                .map_err(status)?;
+                if principal == Principal::ApiServer {
+                    self.manager.release_published_controller(&result);
+                }
                 response(result).map_err(status)
             })
             .await
@@ -590,9 +728,29 @@ impl CoordinatorStateSink {
 #[async_trait::async_trait]
 impl StateSink for CoordinatorStateSink {
     async fn commit(&self, record: &EnvironmentRecord) -> Result<Durability> {
+        self.commit_with_cleanup(record, Vec::new()).await
+    }
+
+    async fn commit_deleted(
+        &self,
+        record: &EnvironmentRecord,
+        cleanup_artifacts: &[adx_core::CheckpointArtifact],
+    ) -> Result<Durability> {
+        self.commit_with_cleanup(record, cleanup_artifacts.to_vec())
+            .await
+    }
+}
+
+impl CoordinatorStateSink {
+    async fn commit_with_cleanup(
+        &self,
+        record: &EnvironmentRecord,
+        cleanup_artifacts: Vec<adx_core::CheckpointArtifact>,
+    ) -> Result<Durability> {
         let mut request = Request::new(pb::CommitEnvironmentRequest {
             record: Some(record.clone().try_into()?),
             node_session_id: self.session_id.clone(),
+            cleanup_artifacts: cleanup_artifacts.into_iter().map(Into::into).collect(),
         });
         adx_observability::trace::inject_metadata(request.metadata_mut());
         request.set_timeout(self.timeout);

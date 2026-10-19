@@ -2,8 +2,10 @@
 //! atomic hash writes; JSON and u64 counters are validated in Rust, never Lua doubles.
 mod claims;
 pub use claims::{ClaimOutcome, LocalClaim};
+mod checkpoint_cleanup;
 mod collection;
 mod credentials;
+pub(crate) mod environment_control;
 mod failure;
 mod recovery;
 mod resume;
@@ -16,7 +18,11 @@ use adx_core::{
 use redis::{aio::MultiplexedConnection, FromRedisValue};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+    time::Duration,
+};
 use tokio::{
     sync::{broadcast, Mutex},
     time::timeout,
@@ -46,6 +52,14 @@ return 1
 const RETIRE_ENVIRONMENT: &str = r#"
 if redis.call('HGET', KEYS[1], 'header') ~= ARGV[1] then return 0 end
 if redis.call('HGET', KEYS[1], ARGV[3]) ~= ARGV[4] then return 0 end
+if ARGV[7] ~= '' then
+  if redis.call('HEXISTS', KEYS[4], ARGV[7]) ~= 0 then return 0 end
+  redis.call('HSET', KEYS[3], ARGV[7], ARGV[8])
+  redis.call('HSET', KEYS[4], ARGV[7], ARGV[9])
+  for i = 10, #ARGV, 2 do
+    redis.call('HSET', KEYS[5], ARGV[i], ARGV[i+1])
+  end
+end
 redis.call('SET', KEYS[2], ARGV[5], 'PX', ARGV[6])
 redis.call('HSET', KEYS[1], 'header', ARGV[2])
 redis.call('HDEL', KEYS[1], ARGV[3])
@@ -99,6 +113,13 @@ pub struct StoredNode {
     /// Administrative admission override. Heartbeats cannot clear it.
     #[serde(default)]
     pub scheduling_paused: bool,
+    /// Non-secret identities of shared checkpoint backends declared by the
+    /// current node session. Old records remain unscoped and cannot delegate GC.
+    #[serde(default)]
+    pub checkpoint_scopes: BTreeSet<String>,
+    /// Set only by durable node invalidation, never by ordinary reconciliation.
+    #[serde(default)]
+    pub checkpoint_gc_fenced: bool,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Recovery {
@@ -120,6 +141,9 @@ pub struct ResumeIntent {
 pub struct StoredEnvironment {
     #[serde(default)]
     pub resume: Option<ResumeIntent>,
+    /// Platform-owned mutable control data; node result commits preserve it.
+    #[serde(default)]
+    pub control: Option<adx_core::environment_control::EnvironmentControlRecord>,
     /// Durable age of a terminal failure; retries and Coordinator restarts do not reset it.
     #[serde(default)]
     pub failed_since_unix_seconds: Option<u64>,
@@ -198,6 +222,16 @@ impl StoredEnvironment {
     }
     fn validate(&self) -> Result<()> {
         self.spec.validate()?;
+        if let Some(control) = &self.control {
+            control.compatibility.validate()?;
+            if self.spec.compatibility.is_none()
+                || control.environment_id != self.spec.id
+                || control.revision == 0
+                || (control.expiry_claimed && control.expires_at_unix_ms == 0)
+            {
+                return Err(Error::Conflict);
+            }
+        }
         if self.spec.id != self.assignment.environment_id || self.assignment.generation == 0 {
             return Err(Error::Conflict);
         }
@@ -485,7 +519,10 @@ impl RedisStore {
                 *guard = Some(
                     self.connection
                         .client
-                        .get_multiplexed_async_connection()
+                        // The store's outer operation timeout is the authoritative budget.
+                        .get_multiplexed_async_connection_with_config(
+                            &redis::AsyncConnectionConfig::new().set_response_timeout(None),
+                        )
                         .await?,
                 );
             }
@@ -588,23 +625,39 @@ impl RedisStore {
         expected_header: &str,
         expected_environment: &str,
         header: &Header,
-        field: &str,
         receipt: &DeletedReceipt,
+        cleanup: Option<&adx_core::CheckpointCleanup>,
+        artifact_fences: &[(String, String)],
     ) -> Result<bool> {
+        let field = format!("environment:{}", receipt.environment_id);
         let mut cmd = redis::cmd("EVAL");
         cmd.arg(RETIRE_ENVIRONMENT)
-            .arg(2)
+            .arg(5)
             .arg(&self.key)
             .arg(self.deleted_receipt_key(&receipt.environment_id))
+            .arg(format!("{}:checkpoint-cleanups", self.key))
+            .arg(format!("{}:checkpoint-cleanup-fences", self.key))
+            .arg(format!("{}:checkpoint-artifact-fences", self.key))
             .arg(expected_header)
             .arg(encode(header)?)
-            .arg(field)
+            .arg(&field)
             .arg(expected_environment)
             .arg(encode(receipt)?)
-            .arg(DELETED_RECEIPT_TTL.as_millis() as u64);
+            .arg(DELETED_RECEIPT_TTL.as_millis() as u64)
+            .arg(cleanup.map(|task| task.id()).unwrap_or_default())
+            .arg(cleanup.map(encode).transpose()?.unwrap_or_default())
+            .arg(
+                cleanup
+                    .map(|task| checkpoint_cleanup::encode_fence(task, receipt))
+                    .transpose()?
+                    .unwrap_or_default(),
+            );
+        for (key, scopes) in artifact_fences {
+            cmd.arg(key).arg(scopes);
+        }
         let applied: u8 = self.query(cmd).await?;
         if applied == 1 {
-            self.notify_committed_change(header.revision, vec![field.to_owned()]);
+            self.notify_committed_change(header.revision, vec![field]);
         }
         Ok(applied == 1)
     }
@@ -920,10 +973,21 @@ impl Session {
     }
     pub async fn register_session(
         &self,
+        node: Node,
+        address: String,
+        proxy_address: String,
+        session: Option<NodeSession>,
+    ) -> Result<StoredNode> {
+        self.register_session_with_scopes(node, address, proxy_address, session, BTreeSet::new())
+            .await
+    }
+    pub async fn register_session_with_scopes(
+        &self,
         mut node: Node,
         address: String,
         proxy_address: String,
         session: Option<NodeSession>,
+        checkpoint_scopes: BTreeSet<String>,
     ) -> Result<StoredNode> {
         node.validate()?;
         if address.trim().is_empty() || proxy_address.trim().is_empty() {
@@ -938,8 +1002,13 @@ impl Session {
                 .as_deref()
                 .map(decode::<StoredNode>)
                 .transpose()?;
-            let (shard, scheduling_paused) = if let Some(previous) = &previous {
-                (previous.shard_id, previous.scheduling_paused)
+            let (shard, scheduling_paused, checkpoint_gc_fenced) = if let Some(previous) = &previous
+            {
+                (
+                    previous.shard_id,
+                    previous.scheduling_paused,
+                    previous.checkpoint_gc_fenced && !session.as_ref().is_some_and(|s| s.routable),
+                )
             } else {
                 let current = self.snapshot().await?;
                 if current.revision != header.revision {
@@ -954,7 +1023,7 @@ impl Session {
                     .min_by_key(|shard| counts[*shard])
                     .expect("nonempty shards");
                 header.next_node_shard = (shard + 1) % header.shards;
-                (shard, false)
+                (shard, false, false)
             };
             if scheduling_paused {
                 node.available = false;
@@ -966,6 +1035,8 @@ impl Session {
                 proxy_address: proxy_address.clone(),
                 session: session.clone(),
                 scheduling_paused,
+                checkpoint_scopes: checkpoint_scopes.clone(),
+                checkpoint_gc_fenced,
             };
             let encoded = encode(&record)?;
             if node_value.as_ref() == Some(&encoded) {
@@ -1053,6 +1124,7 @@ impl Session {
         }
         let record = StoredEnvironment {
             resume: None,
+            control: environment_control::seed(&spec, assignment.generation),
             failed_since_unix_seconds: None,
             recovery: None,
             invalidated: false,
@@ -1175,6 +1247,19 @@ impl Session {
     /// One result write: state and the route publication cursor change atomically.
     /// Identical replay is idempotent; older versions never roll state backward.
     pub async fn commit(&self, result: EnvironmentRecord) -> Result<EnvironmentRecord> {
+        self.commit_with_cleanup(result, &[]).await
+    }
+
+    /// Retire a completed execution and its object cleanup authority atomically.
+    /// Submitted cleanup artifacts are valid only on a Deleted result.
+    pub async fn commit_with_cleanup(
+        &self,
+        result: EnvironmentRecord,
+        cleanup_artifacts: &[adx_core::CheckpointArtifact],
+    ) -> Result<EnvironmentRecord> {
+        if !cleanup_artifacts.is_empty() && result.state != EnvironmentState::Deleted {
+            return Err(Error::Invalid("cleanup artifacts require Deleted".into()));
+        }
         if let Some(cp) = &result.checkpoint {
             if let Some(origin) = cp
                 .origin
@@ -1200,8 +1285,25 @@ impl Session {
             let Some(environment_value) = environment_value.as_deref() else {
                 if result.state == EnvironmentState::Deleted {
                     return match self.store.deleted_receipt(&result.spec.id).await? {
-                        Some(receipt) if receipt.matches(&result)? => Ok(result),
+                        Some(receipt) if receipt.matches(&result)? => {
+                            self.validate_cleanup_replay(&result, cleanup_artifacts)
+                                .await?;
+                            Ok(result)
+                        }
+                        Some(_)
+                            if self
+                                .cleanup_receipt_matches(&result, cleanup_artifacts)
+                                .await? =>
+                        {
+                            Ok(result)
+                        }
                         Some(_) => Err(Error::Conflict),
+                        None if self
+                            .cleanup_receipt_matches(&result, cleanup_artifacts)
+                            .await? =>
+                        {
+                            Ok(result)
+                        }
                         None => Err(Error::NotFound),
                     };
                 }
@@ -1213,6 +1315,27 @@ impl Session {
             {
                 return Ok(result);
             }
+            if let Some(cp) = &result.checkpoint {
+                if stored_environment
+                    .result
+                    .as_ref()
+                    .and_then(|r| r.checkpoint.as_ref())
+                    .is_none_or(|old| old.artifact != cp.artifact)
+                {
+                    self.ensure_artifact_not_retired(&cp.artifact).await?;
+                }
+            }
+            let cleanup = if result.state == EnvironmentState::Deleted {
+                self.prepare_checkpoint_cleanup(&stored_environment, &result, cleanup_artifacts)
+                    .await?
+            } else {
+                None
+            };
+            let artifact_fences = if let Some(task) = &cleanup {
+                self.artifact_fence_updates(task).await?
+            } else {
+                vec![]
+            };
             if result.state != EnvironmentState::Paused {
                 stored_environment.resume = None;
                 if let Some(recovery) = &mut stored_environment.recovery {
@@ -1225,6 +1348,7 @@ impl Session {
             // runtime, while every placement and resource field remains
             // fenced by `next_result` above.
             stored_environment.spec = result.spec.clone();
+            environment_control::transition(&mut stored_environment, &result)?;
             stored_environment.result = Some(result.clone());
             stored_environment.track_failure(collection::now()?);
             stored_environment.validate()?;
@@ -1238,8 +1362,9 @@ impl Session {
                         expected_header,
                         environment_value,
                         &header,
-                        &field,
                         &DeletedReceipt::from_result(&result)?,
+                        cleanup.as_ref(),
+                        &artifact_fences,
                     )
                     .await?
             } else {

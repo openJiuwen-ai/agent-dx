@@ -1,4 +1,6 @@
 //! Generated transport contracts and validated conversions, without services.
+mod checkpoint_cleanup;
+mod environment_control;
 mod runtime_profile;
 mod snapshots;
 pub mod control {
@@ -28,6 +30,7 @@ impl TryFrom<control::EnvironmentSpec> for adx_core::EnvironmentSpec {
             .resources
             .ok_or_else(|| Error::Invalid("resources are required".into()))?;
         let spec = Self {
+            compatibility: value.compatibility.map(Into::into),
             runtime_profile: value.runtime_profile.map(TryInto::try_into).transpose()?,
             snapshot_id: value.snapshot_id,
             lifecycle: value
@@ -65,6 +68,7 @@ impl TryFrom<control::EnvironmentSpec> for adx_core::EnvironmentSpec {
 impl From<adx_core::EnvironmentSpec> for control::EnvironmentSpec {
     fn from(value: adx_core::EnvironmentSpec) -> Self {
         Self {
+            compatibility: value.compatibility.map(Into::into),
             runtime_profile: value.runtime_profile.map(Into::into),
             snapshot_id: value.snapshot_id,
             lifecycle: Some(value.lifecycle.into()),
@@ -137,6 +141,7 @@ mod tests {
     #[test]
     fn environment_spec_round_trip_preserves_units_and_priority() {
         let value = adx_core::EnvironmentSpec {
+            compatibility: None,
             runtime_profile: None,
             snapshot_id: None,
             lifecycle: Default::default(),
@@ -337,6 +342,7 @@ impl From<adx_core::RestorePoint> for control::RestorePoint {
             source_runtime_id: v.source_runtime_id,
             artifact: Some(control::CheckpointArtifact {
                 storage: v.artifact.storage,
+                scope: v.artifact.scope,
                 location: v.artifact.location,
                 size_bytes: v.artifact.size_bytes,
             }),
@@ -365,6 +371,7 @@ impl TryFrom<control::RestorePoint> for adx_core::RestorePoint {
             source_runtime_id: v.source_runtime_id,
             artifact: adx_core::CheckpointArtifact {
                 storage: a.storage,
+                scope: a.scope,
                 location: a.location,
                 size_bytes: a.size_bytes,
             },

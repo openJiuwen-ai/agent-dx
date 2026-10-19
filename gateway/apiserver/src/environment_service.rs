@@ -115,6 +115,21 @@ impl EnvironmentService {
             .await
     }
 
+    /// Execute a read-merge-write operation only at the inspected revision.
+    pub async fn execute_at_revision(
+        &self,
+        kind: Kind,
+        id: &str,
+        request_id: &str,
+        body: Value,
+        caller: &pb::CallerContext,
+        required_revision: u64,
+    ) -> Result<Value, Status> {
+        self.operations
+            .execute_at_revision(kind, id, request_id, body, caller, required_revision)
+            .await
+    }
+
     /// Inspect the caller-visible Environment through the same versioned
     /// ownership directory used by REST lifecycle requests.
     pub async fn inspect(
@@ -548,6 +563,7 @@ fn matches_spec(want: &pb::EnvironmentSpec, got: &pb::EnvironmentSpec) -> bool {
     want.id == got.id
         && want.tenant_id == got.tenant_id
         && want.snapshot_id == got.snapshot_id
+        && want.compatibility == got.compatibility
         && (!got.image.is_empty() || got.runtime_profile.is_some())
         && !got.runtime_class.is_empty()
         && (want.image.is_empty() || want.image == got.image)
@@ -621,6 +637,7 @@ mod tests {
         let operation = Arc::new(Mutex::new(CreateOperation {
             digest: Vec::new(),
             spec: pb::EnvironmentSpec {
+                compatibility: None,
                 id: "environment".into(),
                 ..Default::default()
             },
@@ -656,6 +673,7 @@ mod tests {
                 Arc::new(Mutex::new(CreateOperation {
                     digest: Vec::new(),
                     spec: pb::EnvironmentSpec {
+                        compatibility: None,
                         id: "environment".into(),
                         ..Default::default()
                     },
@@ -680,6 +698,7 @@ mod tests {
     #[test]
     fn existing_running_name_converges_only_for_identical_spec() {
         let spec = pb::EnvironmentSpec {
+            compatibility: None,
             id: "tenant-worker".into(),
             tenant_id: "tenant".into(),
             runtime_class: "runsc".into(),
@@ -716,6 +735,7 @@ mod tests {
     #[test]
     fn custom_reverse_tunnel_port_is_encoded_in_public_path() {
         let mut spec = pb::EnvironmentSpec {
+            compatibility: None,
             id: "tenant-worker".into(),
             tenant_id: "tenant".into(),
             ..Default::default()
@@ -743,6 +763,7 @@ mod tests {
         let record = pb::EnvironmentRecord {
             failure: None,
             spec: Some(pb::EnvironmentSpec {
+                compatibility: None,
                 id: "tenant-worker".into(),
                 tenant_id: "tenant".into(),
                 ..Default::default()

@@ -16,7 +16,11 @@ impl Session {
     async fn snapshot_cas(&self, id: &str, old: Option<&str>, next: &Snapshot) -> Result<bool> {
         next.validate()?;
         let [header_value] = self.store.fields([HEADER.into()]).await?;
-        self.header(&header_value)?;
+        let mut header = self.header(&header_value)?;
+        if old.is_none() {
+            self.ensure_artifact_not_retired(&next.artifact).await?;
+            header.advance()?;
+        }
         let mut command = redis::cmd("EVAL");
         command
             .arg(
@@ -26,7 +30,9 @@ impl Session {
             if ARGV[3] == '' then
                 if old then return 0 end
             elseif old ~= ARGV[3] then return 0 end
-            redis.call('HSET', KEYS[2], ARGV[2], ARGV[4]); return 1
+            redis.call('HSET', KEYS[2], ARGV[2], ARGV[4])
+            if ARGV[5] ~= '' then redis.call('HSET', KEYS[1], 'header', ARGV[5]) end
+            return 1
         "#,
             )
             .arg(2)
@@ -35,8 +41,17 @@ impl Session {
             .arg(header_value.as_deref().ok_or(Error::Conflict)?)
             .arg(id)
             .arg(old.unwrap_or(""))
-            .arg(encode(next)?);
-        Ok(self.store.query::<u64>(command).await? == 1)
+            .arg(encode(next)?)
+            .arg(if old.is_none() {
+                encode(&header)?
+            } else {
+                String::new()
+            });
+        let applied = self.store.query::<u64>(command).await? == 1;
+        if applied && old.is_none() {
+            self.store.notify_committed_change(header.revision, vec![]);
+        }
+        Ok(applied)
     }
     pub async fn publish_snapshot(&self, record: Snapshot) -> Result<Snapshot> {
         record.validate()?;

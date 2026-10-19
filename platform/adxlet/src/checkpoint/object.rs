@@ -38,6 +38,7 @@ pub struct ObjectCheckpointStore {
     pub(super) gc_config: super::RemoteGcConfig,
     pub(super) gc_authority: tokio::sync::Mutex<Option<std::collections::BTreeSet<String>>>,
     pub(super) alias: String,
+    pub(super) scope: String,
     pub(super) remote: Arc<dyn ObjectStore>,
     pub(super) prefix: Key,
     staging: LocalCheckpointStore,
@@ -65,6 +66,7 @@ fn relative(path: &str) -> Result<()> {
 impl ObjectCheckpointStore {
     pub fn new(
         alias: String,
+        scope: String,
         remote: Arc<dyn ObjectStore>,
         prefix: String,
         root: PathBuf,
@@ -93,6 +95,7 @@ impl ObjectCheckpointStore {
             gc_config: Default::default(),
             gc_authority: Default::default(),
             alias,
+            scope,
             remote,
             prefix: Key::from(prefix),
             staging,
@@ -108,6 +111,7 @@ impl ObjectCheckpointStore {
     }
     pub(super) fn validate(&self, a: &CheckpointArtifact) -> Result<()> {
         if a.storage != self.alias
+            || (!a.scope.is_empty() && a.scope != self.scope)
             || uuid::Uuid::parse_str(&a.location).is_err()
             || a.size_bytes == 0
         {
@@ -357,6 +361,9 @@ impl CheckpointStore for ObjectCheckpointStore {
     fn storage_alias(&self) -> &str {
         &self.alias
     }
+    fn shared_scope(&self) -> Option<&str> {
+        (!self.scope.is_empty()).then_some(self.scope.as_str())
+    }
     async fn allocate(&self) -> Result<PathBuf> {
         self.staging.allocate().await
     }
@@ -413,6 +420,7 @@ impl CheckpointStore for ObjectCheckpointStore {
                 .map_err(io_error)?;
             Ok(CheckpointArtifact {
                 storage: self.alias.clone(),
+                scope: self.scope.clone(),
                 location: id.clone(),
                 size_bytes: artifact.size_bytes,
             })
@@ -526,6 +534,7 @@ impl CheckpointStore for ObjectCheckpointStore {
             }
             Ok(CheckpointArtifact {
                 storage: self.alias.clone(),
+                scope: self.scope.clone(),
                 location: id.clone(),
                 size_bytes: manifest.size,
             })

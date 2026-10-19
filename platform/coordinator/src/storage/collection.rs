@@ -41,6 +41,7 @@ impl Session {
     }
 
     /// Only invalidated, released terminal failures can be retired without an owner RPC.
+    /// Checkpoints require owner cleanup; retain even expired artifact references.
     /// Returning nodes clean executions absent from the authoritative directory.
     pub async fn retire_invalidated_failed(
         &self,
@@ -52,6 +53,10 @@ impl Session {
             || !stored.invalidated
             || stored.resources_held()
             || !stored.failed_collectable(now, 0)
+            || stored
+                .result
+                .as_ref()
+                .is_some_and(|record| record.checkpoint.is_some())
         {
             return Err(Error::Conflict);
         }

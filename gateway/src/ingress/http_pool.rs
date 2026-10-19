@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use http::{header, Request, Response};
+use http::{header, HeaderValue, Request, Response};
 use hyper::body::{Body, Frame, Incoming};
 use hyper::client::conn::http1::SendRequest;
 use hyper_util::rt::TokioIo;
@@ -173,7 +173,7 @@ impl BackendHttpPool {
     pub async fn send_recoverable<F, Fut, T>(
         &self,
         key: BackendHttpPoolKey,
-        request: Request<Incoming>,
+        mut request: Request<Incoming>,
         open: F,
     ) -> Result<Response<PooledResponseBody>, (BackendHttpPoolError, Option<Request<Incoming>>)>
     where
@@ -181,6 +181,10 @@ impl BackendHttpPool {
         Fut: Future<Output = io::Result<T>>,
         T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        // The pool always opens HTTP/1.1 connections to the sandbox. An
+        // HTTP/2 client request therefore must not retain its inbound version
+        // when Hyper serializes it on that backend connection.
+        normalize_http1_request(&mut request);
         let prepared = async {
             let endpoint = self.inner.endpoint(&key);
             let permit = timeout(
@@ -459,13 +463,45 @@ fn has_connection_close(headers: &http::HeaderMap) -> bool {
         .any(|token| token.trim().eq_ignore_ascii_case("close"))
 }
 
+fn normalize_http1_request<B>(request: &mut Request<B>) {
+    if !request.headers().contains_key(header::HOST) {
+        let authority = request
+            .uri()
+            .authority()
+            .map(|value| value.as_str().to_owned());
+        if let Some(authority) = authority {
+            if let Ok(host) = HeaderValue::from_str(&authority) {
+                request.headers_mut().insert(header::HOST, host);
+            }
+        }
+    }
+    // A Hyper HTTP/1 client serializes an absolute URI in absolute-form. The
+    // backend is an application server, not a proxy, so all non-CONNECT
+    // requests must use origin-form. CONNECT deliberately retains authority-
+    // form; OPTIONS `*` is already a valid path-and-query and is preserved.
+    if request.method() != http::Method::CONNECT {
+        let mut parts = request.uri().clone().into_parts();
+        parts.scheme = None;
+        parts.authority = None;
+        if parts.path_and_query.is_none() {
+            parts.path_and_query = Some(http::uri::PathAndQuery::from_static("/"));
+        }
+        // The retained path-and-query came from an already-valid URI, so
+        // clearing scheme and authority cannot make the origin URI invalid.
+        if let Ok(origin) = http::Uri::from_parts(parts) {
+            *request.uri_mut() = origin;
+        }
+    }
+    *request.version_mut() = http::Version::HTTP_11;
+}
+
 #[cfg(test)]
 mod retry_tests {
     use super::*;
     use http_body_util::{BodyExt, Full};
     use hyper::service::service_fn;
     use std::convert::Infallible;
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     async fn exercise(fail_before_send: bool) {
         let pool = BackendHttpPool::new(BackendHttpPoolConfig::default());
@@ -560,5 +596,102 @@ mod retry_tests {
     #[tokio::test]
     async fn lost_response_never_returns_a_replayable_business_body() {
         exercise(false).await;
+    }
+
+    #[test]
+    fn http2_authority_becomes_host_for_the_http1_backend_pool() {
+        let mut request = Request::builder()
+            .version(http::Version::HTTP_2)
+            .uri("https://sdk.example.test:443/envd.Process/Start")
+            .body(())
+            .unwrap();
+        normalize_http1_request(&mut request);
+        assert_eq!(request.version(), http::Version::HTTP_11);
+        assert_eq!(
+            request.headers().get(header::HOST).unwrap(),
+            "sdk.example.test:443"
+        );
+    }
+
+    #[test]
+    fn existing_http1_host_is_preserved() {
+        let mut request = Request::builder()
+            .version(http::Version::HTTP_11)
+            .uri("http://upstream.example.test/path")
+            .header(header::HOST, "sdk.example.test")
+            .body(())
+            .unwrap();
+        normalize_http1_request(&mut request);
+        assert_eq!(
+            request.headers().get(header::HOST).unwrap(),
+            "sdk.example.test"
+        );
+    }
+
+    #[test]
+    fn connect_retains_authority_form() {
+        let authority = http::Uri::builder()
+            .authority("sandbox.example.test:443")
+            .build()
+            .unwrap();
+        let mut request = Request::builder()
+            .method(http::Method::CONNECT)
+            .version(http::Version::HTTP_2)
+            .uri(authority)
+            .body(())
+            .unwrap();
+        normalize_http1_request(&mut request);
+        assert_eq!(request.uri(), "sandbox.example.test:443");
+    }
+
+    #[test]
+    fn options_asterisk_is_preserved() {
+        let mut request = Request::builder()
+            .method(http::Method::OPTIONS)
+            .version(http::Version::HTTP_2)
+            .uri("*")
+            .body(())
+            .unwrap();
+        normalize_http1_request(&mut request);
+        assert_eq!(request.uri(), "*");
+    }
+
+    #[tokio::test]
+    async fn http2_absolute_uri_serializes_as_origin_form_on_the_http1_backend() {
+        let (client, mut backend) = tokio::io::duplex(4096);
+        let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(client))
+            .await
+            .unwrap();
+        let connection = tokio::spawn(connection);
+        let received = tokio::spawn(async move {
+            let mut bytes = Vec::new();
+            let mut chunk = [0_u8; 512];
+            while !bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                let count = backend.read(&mut chunk).await.unwrap();
+                assert!(count > 0);
+                bytes.extend_from_slice(&chunk[..count]);
+            }
+            backend
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            bytes
+        });
+        let mut request = Request::builder()
+            .method("GET")
+            .version(http::Version::HTTP_2)
+            .uri("https://localhost:8443/request-form-probe?source=sdk")
+            .body(http_body_util::Empty::<Bytes>::new())
+            .unwrap();
+        normalize_http1_request(&mut request);
+        let response = sender.send_request(request).await.unwrap();
+        assert_eq!(response.status(), http::StatusCode::OK);
+        let request = received.await.unwrap();
+        assert!(request.starts_with(b"GET /request-form-probe?source=sdk HTTP/1.1\r\n"));
+        assert!(request
+            .windows(b"host: localhost:8443\r\n".len())
+            .any(|window| { window.eq_ignore_ascii_case(b"host: localhost:8443\r\n") }));
+        drop(sender);
+        connection.abort();
     }
 }

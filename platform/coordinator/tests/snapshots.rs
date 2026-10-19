@@ -7,6 +7,7 @@ fn snapshot() -> Snapshot {
         "snapshot-1".into(),
         vec!["base".into()],
         EnvironmentSpec {
+            compatibility: None,
             runtime_profile: None,
             snapshot_id: None,
             id: "source".into(),
@@ -28,6 +29,7 @@ fn snapshot() -> Snapshot {
         "source-1".into(),
         CheckpointArtifact {
             storage: "shared".into(),
+            scope: String::new(),
             location: "artifact-1".into(),
             size_bytes: 100,
         },

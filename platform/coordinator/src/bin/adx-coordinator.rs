@@ -9,7 +9,7 @@ use adx_process::{read_config, shutdown};
 use adx_protocol::control as pb;
 use adx_transport::tls::TlsFiles;
 use serde::Deserialize;
-use std::{net::SocketAddr, path::PathBuf, time::Duration};
+use std::{future::Future, net::SocketAddr, path::PathBuf, time::Duration};
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Bootstrap {
@@ -50,6 +50,25 @@ fn default_ttl() -> u64 {
 fn default_failed_retention() -> u64 {
     600
 }
+
+async fn supervise<S, H, B>(
+    server: S,
+    shutdown_signal: H,
+    background: B,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    S: Future<Output = Result<(), Box<dyn std::error::Error>>>,
+    H: Future<Output = ()>,
+    B: Future<Output = Result<(), Box<dyn std::error::Error>>>,
+{
+    tokio::pin!(server);
+    tokio::select! {
+        result = &mut server => result,
+        _ = shutdown_signal => server.await,
+        result = background => result,
+    }
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _logging_guard = adx_observability::logging::init("adx-coordinator", false)?;
@@ -167,6 +186,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     };
+    let expiry_rpc = rpc.clone();
+    let expiry = async {
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            tick.tick().await;
+            if let Err(error) = expiry_rpc.expire_environments().await {
+                adx_observability::warn!("environment expiry incomplete: {error}");
+            }
+        }
+    };
     let recovery_rpc = rpc.clone();
     let recovery = async {
         let mut tick = tokio::time::interval(Duration::from_secs(2));
@@ -191,6 +220,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Err(error) = collection_rpc.expire_dormant().await {
                 adx_observability::warn!("dormant expiration incomplete: {error}");
             }
+            if let Err(error) = collection_rpc.collect_checkpoint_cleanups().await {
+                adx_observability::warn!("checkpoint cleanup incomplete: {error}");
+            }
             if let Err(error) = collection_rpc
                 .collect_failed(Duration::from_secs(config.failed_retention_seconds))
                 .await
@@ -204,6 +236,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(tls) = server_tls {
         builder = builder.tls_config(tls)?;
     }
+    let (server_shutdown_tx, server_shutdown_rx) = tokio::sync::oneshot::channel();
     let server = builder
         .add_service(pb::snapshot_service_server::SnapshotServiceServer::new(
             rpc.clone(),
@@ -225,16 +258,97 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .serve_with_incoming_shutdown(
             tokio_stream::wrappers::TcpListenerStream::new(listener),
-            shutdown(),
+            async move {
+                let _ = server_shutdown_rx.await;
+            },
         );
-    tokio::select! {
-        result = server => result?,
-        _ = maintenance => {}
-        _ = route_task => {}
-        _ = collection => {}
-        _ = recovery => {}
-        result = metrics => result?,
-        result = autoscaling => result?,
+    let server = async move {
+        server
+            .await
+            .map_err(|error| Box::new(error) as Box<dyn std::error::Error>)
+    };
+    let background = async {
+        tokio::select! {
+            result = autoscaling => result.map_err(|error| Box::new(error) as Box<dyn std::error::Error>),
+            _ = expiry => Err("expiry worker stopped".into()),
+            _ = maintenance => Ok(()),
+            _ = route_task => Ok(()),
+            _ = collection => Ok(()),
+            _ = recovery => Ok(()),
+            result = metrics => result.map_err(|error| Box::new(error) as Box<dyn std::error::Error>),
+        }
+    };
+    supervise(
+        server,
+        async move {
+            shutdown().await;
+            let _ = server_shutdown_tx.send(());
+        },
+        background,
+    )
+    .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::supervise;
+    use std::{
+        error::Error,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+        time::Duration,
+    };
+    use tokio::sync::{oneshot, Notify};
+
+    #[tokio::test]
+    async fn shutdown_stops_background_polling_while_server_drains() {
+        let (signal_tx, signal_rx) = oneshot::channel();
+        let (server_shutdown_tx, server_shutdown_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let draining = Arc::new(Notify::new());
+        let server_draining = draining.clone();
+        let server = async move {
+            let _ = server_shutdown_rx.await;
+            server_draining.notify_one();
+            let _ = release_rx.await;
+            Ok::<(), Box<dyn Error>>(())
+        };
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let background_ticks = ticks.clone();
+        let mut interval = tokio::time::interval(Duration::from_millis(1));
+        let background = std::future::poll_fn(move |cx| {
+            while interval.poll_tick(cx).is_ready() {
+                background_ticks.fetch_add(1, Ordering::SeqCst);
+            }
+            std::task::Poll::<Result<(), Box<dyn Error>>>::Pending
+        });
+        let controller = async {
+            signal_tx.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(1), draining.notified())
+                .await
+                .expect("server did not enter drain");
+            let before = ticks.load(Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert_eq!(
+                ticks.load(Ordering::SeqCst),
+                before,
+                "background polled during drain"
+            );
+            release_tx.send(()).unwrap();
+        };
+        let (result, ()) = tokio::join!(
+            supervise(
+                server,
+                async move {
+                    let _ = signal_rx.await;
+                    let _ = server_shutdown_tx.send(());
+                },
+                background,
+            ),
+            controller,
+        );
+        result.unwrap();
     }
-    Ok(())
 }

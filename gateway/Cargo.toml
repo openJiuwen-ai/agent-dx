@@ -54,12 +54,12 @@ base64 = "0.22"
 bytes = "1"
 percent-encoding = "2"
 h2 = "0.4"
-hyper-util = { version = "0.1", features = ["tokio", "client-legacy", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "client-legacy", "server-auto"] }
 etcd-client = { version = "0.14", optional = true, features = ["tls"] }
 futures-util = "0.3"
 http = "1"
 http-body-util = "0.1"
-hyper = { version = "1", features = ["client", "server", "http1"] }
+hyper = { version = "1", features = ["client", "server", "http1", "http2"] }
 ipnet = "2"
 libc = "0.2"
 prost = { version = "0.13", optional = true }

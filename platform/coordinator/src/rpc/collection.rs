@@ -55,7 +55,15 @@ impl CoordinatorRpc {
                     && live.last_seen.elapsed() < self.0.heartbeat_timeout
             });
             if live.is_none() {
-                if !stored.invalidated || stored.resources_held() {
+                if !stored.invalidated
+                    || stored.resources_held()
+                    || stored
+                        .result
+                        .as_ref()
+                        .is_some_and(|record| record.checkpoint.is_some())
+                {
+                    // Storage-only retirement cannot remove checkpoint objects.
+                    // Keep their durable reference until an owner can clean them.
                     return Ok(false);
                 }
                 // Any failure after the durable retirement must rebuild the in-memory
@@ -111,6 +119,7 @@ impl CoordinatorRpc {
         let response =
             pb::node_service_client::NodeServiceClient::new(self.0.node_tls.wrap(channel))
                 .delete_environment(pb::DeleteEnvironmentRequest {
+                    expiry_revision: None,
                     assignment: Some(record.assignment.clone().try_into()?),
                     caller: None,
                     failed_revision: Some(record.revision),

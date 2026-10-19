@@ -123,7 +123,7 @@ async fn session(controller: Arc<Controller>, config: ControlStreamConfig) -> Re
                 let result = match serde_json::from_slice::<ControlOperation>(&command.operation_json) {
                     Ok(ControlOperation::Status) => Ok(controller.status()),
                     Ok(ControlOperation::Prepare(request)) => controller.prepare(request).await,
-                    Ok(ControlOperation::Abort(request)) => controller.abort_unstarted(&request.operation_id, &request.identity, request.expected_revision),
+                    Ok(ControlOperation::Abort(request)) => controller.abort_unstarted(&request.operation_id, &request.identity, request.expected_revision).await,
                     Ok(ControlOperation::Finish(request)) => controller.finish_checkpoint(request),
                     Err(_) => Err(Error::Invalid("invalid runtime control operation".into())),
                 };

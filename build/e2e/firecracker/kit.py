@@ -4,6 +4,22 @@ import hashlib
 import json
 from pathlib import Path
 
+ROOT = Path(__file__).resolve().parents[3]
+SOURCE = ROOT / 'third_party/sandboxd/source.json'
+
+
+def expected_sandboxd_source():
+    return json.loads(SOURCE.read_text())
+
+
+def expected_sandboxd_revision():
+    return expected_sandboxd_source()['revision']
+
+
+def expected_sandboxd_patches():
+    return expected_sandboxd_source().get('patches', [])
+
+
 REQUIRED = {
     'bin/sandboxd',
     'bin/sbox',
@@ -24,12 +40,21 @@ def verify(directory, backend):
     if root.is_symlink() or (root / 'manifest.json').is_symlink():
         raise ValueError('runtime kit symlink rejected')
     manifest = json.loads((root / 'manifest.json').read_text())
-    if (
-        manifest.get('schema_version') != 1
-        or manifest.get('target') != backend['target']
-        or manifest.get('sandboxd_revision') != backend['sandboxd_revision']
-    ):
+    revision = expected_sandboxd_revision()
+    patches = expected_sandboxd_patches()
+    if manifest.get('schema_version') != 1 or manifest.get('target') != backend['target']:
         raise ValueError('runtime kit architecture or sandboxd revision mismatch')
+    if manifest.get('sandboxd_revision') != revision or backend.get('sandboxd_revision') != revision:
+        raise ValueError('runtime kit architecture or sandboxd revision mismatch')
+    if manifest.get('sandboxd_patches') != patches or backend.get('sandboxd_patches') != patches:
+        raise ValueError('runtime kit sandboxd patch identity mismatch')
+    initrd_provenance = manifest.get('initrd_provenance')
+    if initrd_provenance != {
+        'source_revision': revision,
+        'patches': patches,
+        'sha256': manifest.get('files', {}).get('artifacts/initrd.img'),
+    }:
+        raise ValueError('runtime kit initrd provenance mismatch')
     if set(manifest.get('files', {})) != REQUIRED:
         raise ValueError('runtime kit file inventory mismatch')
     for name, expected in manifest['files'].items():

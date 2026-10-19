@@ -97,6 +97,7 @@ async fn channel(address: std::net::SocketAddr, name: &str) -> Channel {
 }
 fn spec(id: &str) -> EnvironmentSpec {
     EnvironmentSpec {
+        compatibility: None,
         runtime_profile: None,
         snapshot_id: None,
         lifecycle: Default::default(),
@@ -169,30 +170,7 @@ impl RuntimeDriver for Backend {
         let allocation = self.session.get(&spec.id).await?;
         assert_eq!(allocation.assignment.generation, generation);
         assert_eq!(allocation.spec, *spec);
-        // Validate public HTTP input at the execution boundary, before deletion
-        // retires its authoritative record.
-        match spec.id.as_str() {
-            "t-http-case" => {
-                assert_eq!(spec.tenant_id, "tenant");
-                assert_eq!(spec.env["USER_VALUE"], "propagated");
-            }
-            "t-http-peer" => assert_eq!(spec.scheduling.labels["app"], "db"),
-            "t-http-affinity" => {
-                assert_eq!(spec.scheduling.placement_groups.len(), 3);
-                assert!(spec.scheduling.placement_groups.iter().any(|g| g.ordered));
-                assert!(spec
-                    .scheduling
-                    .placement_groups
-                    .iter()
-                    .any(|g| g.required && g.terms.len() == 2));
-                assert!(spec
-                    .scheduling
-                    .placement_groups
-                    .iter()
-                    .any(|g| g.anti && g.terms[0].weight == 7));
-            }
-            _ => (),
-        }
+        assert_http_spec_at_execution(spec, &allocation.assignment.node_id);
         self.started.fetch_add(1, Ordering::SeqCst);
         self.running.lock().unwrap().insert(id.into());
         Ok("10.0.0.2".parse().unwrap())
@@ -252,6 +230,26 @@ impl RuntimeDriver for Backend {
         Ok(())
     }
 }
+
+fn assert_http_spec_at_execution(spec: &EnvironmentSpec, node_id: &str) {
+    match spec.id.as_str() {
+        "lf-first" => assert_eq!(node_id, "a"),
+        "lf-second" => assert_eq!(node_id, "b"),
+        "t-http-case" => {
+            assert_eq!(spec.tenant_id, "tenant");
+            assert_eq!(spec.env["USER_VALUE"], "propagated");
+        }
+        "t-http-peer" => assert_eq!(spec.scheduling.labels["app"], "db"),
+        "t-http-affinity" => {
+            let groups = &spec.scheduling.placement_groups;
+            assert_eq!(groups.len(), 3);
+            assert!(groups.iter().any(|g| g.ordered));
+            assert!(groups.iter().any(|g| g.required && g.terms.len() == 2));
+            assert!(groups.iter().any(|g| g.anti && g.terms[0].weight == 7));
+        }
+        _ => (),
+    }
+}
 struct LocalChecks;
 #[async_trait::async_trait]
 impl Readiness for LocalChecks {
@@ -297,6 +295,7 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
     .await
     .unwrap();
     let metrics_rpc = coordinator.clone();
+    let cleanup_rpc = coordinator.clone();
     let metrics_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let metrics_address = metrics_listener.local_addr().unwrap();
     let ml = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -379,6 +378,7 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
     let mut node_coordinator =
         pb::coordinator_service_client::CoordinatorServiceClient::new(channel(ma, "node").await);
     let mut register = pb::RegisterNodeRequest {
+        checkpoint_scopes: vec![],
         runtime_classes: vec![
             "runsc".into(),
             "runc".into(),
@@ -492,6 +492,7 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
     assert_eq!(
         frontend
             .commit_environment(pb::CommitEnvironmentRequest {
+                cleanup_artifacts: vec![],
                 node_session_id: "boot-1".into(),
                 record: Some(first_record.clone())
             })
@@ -517,6 +518,8 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
         tonic::Code::PermissionDenied
     );
     let mut pause = pb::PauseEnvironmentRequest {
+        expiry_revision: None,
+        node_session_id: String::new(),
         assignment: Some(assignment.clone()),
         caller: caller(),
         operation_id: "pause-auth".into(),
@@ -566,6 +569,7 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
     );
     let mut bad_delete = pb::DeleteEnvironmentRequest {
         failed_revision: None,
+        expiry_revision: None,
         node_session_id: String::new(),
         assignment: Some(assignment.clone()),
         caller: caller(),
@@ -585,6 +589,7 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
         node_frontend
             .delete_environment(pb::DeleteEnvironmentRequest {
                 failed_revision: None,
+                expiry_revision: None,
                 node_session_id: String::new(),
                 assignment: Some(stale),
                 caller: caller()
@@ -627,6 +632,7 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
     );
     let delete = pb::DeleteEnvironmentRequest {
         failed_revision: None,
+        expiry_revision: None,
         node_session_id: String::new(),
         assignment: Some(assignment),
         caller: caller(),
@@ -654,6 +660,7 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
     assert_eq!(
         node_coordinator
             .commit_environment(pb::CommitEnvironmentRequest {
+                cleanup_artifacts: vec![],
                 node_session_id: "boot-1".into(),
                 record: Some(first_record)
             })
@@ -665,6 +672,7 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
     redis.crash();
     let delete = pb::DeleteEnvironmentRequest {
         failed_revision: None,
+        expiry_revision: None,
         node_session_id: String::new(),
         assignment: Some(second.assignment.try_into().unwrap()),
         caller: caller(),
@@ -707,6 +715,7 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
                         tenant_id: tenant.into(),
                         administrator: false,
                         expires_at_unix_seconds: 0,
+                        metadata: None,
                     },
                 )
                 .await
@@ -719,6 +728,7 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
                     tenant_id: "tenant".into(),
                     administrator: false,
                     expires_at_unix_seconds: 1,
+                    metadata: None,
                 },
             )
             .await
@@ -730,6 +740,7 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
                     tenant_id: "admin".into(),
                     administrator: true,
                     expires_at_unix_seconds: 0,
+                    metadata: None,
                 },
             )
             .await
@@ -789,12 +800,15 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
             "{}",
             String::from_utf8_lossy(&result.stderr)
         );
+        // Spec propagation was asserted at Start while ownership existed.
+        // Successful DELETE retires full records instead of preserving history.
         for id in ["t-http-case", "t-http-peer", "t-http-affinity"] {
-            assert!(matches!(
-                session.get(id).await,
-                Err(adx_core::Error::NotFound)
-            ));
+            assert_eq!(
+                session.get(id).await.unwrap_err(),
+                adx_core::Error::NotFound
+            );
         }
+        cleanup_rpc.collect_checkpoint_cleanups().await.unwrap();
         assert!(backend.running.lock().unwrap().is_empty());
         assert!(session
             .snapshot()
@@ -1100,6 +1114,7 @@ async fn heartbeat_expiry_reconciliation_and_old_session_fencing() {
 
     assert_eq!(
         node.commit_environment(pb::CommitEnvironmentRequest {
+            cleanup_artifacts: vec![],
             record: Some(running.clone().try_into().unwrap()),
             node_session_id: "first-boot".into()
         })
@@ -1110,6 +1125,7 @@ async fn heartbeat_expiry_reconciliation_and_old_session_fencing() {
     );
     assert_eq!(
         node.commit_environment(pb::CommitEnvironmentRequest {
+            cleanup_artifacts: vec![],
             record: Some(running.try_into().unwrap()),
             node_session_id: "second-boot".into(),
         })
@@ -1334,6 +1350,7 @@ async fn node_restart_before_expiry_requires_new_session_at_registered_endpoint(
     assert_eq!(
         node_coordinator
             .commit_environment(pb::CommitEnvironmentRequest {
+                cleanup_artifacts: vec![],
                 record: Some(running.clone()),
                 node_session_id: "boot-1".into(),
             })
@@ -1506,6 +1523,7 @@ async fn coordinator_restart_bounds_re_registration_grace() {
             assert!(result.runtime.ip.is_none());
             assert!(
                 node.commit_environment(pb::CommitEnvironmentRequest {
+                    cleanup_artifacts: vec![],
                     record: Some(running.try_into().unwrap()),
                     node_session_id: "boot".into(),
                 })
@@ -1517,6 +1535,7 @@ async fn coordinator_restart_bounds_re_registration_grace() {
             deleted.state = EnvironmentState::Deleted;
             deleted.revision += 1;
             node.commit_environment(pb::CommitEnvironmentRequest {
+                cleanup_artifacts: vec![],
                 record: Some(deleted.try_into().unwrap()),
                 node_session_id: "boot".into(),
             })
@@ -1569,6 +1588,7 @@ async fn published_routes_drive_real_gateway_streams_and_reconnect_to_new_coordi
                 tenant_id: "tenant".into(),
                 administrator: false,
                 expires_at_unix_seconds: 0,
+                metadata: None,
             },
         )
         .await
@@ -1864,6 +1884,7 @@ async fn snapshot_rpc_enforces_component_tenant_and_deferred_deletion() {
         "source-1".into(),
         CheckpointArtifact {
             storage: "shared".into(),
+            scope: String::new(),
             location: "artifact".into(),
             size_bytes: 100,
         },
@@ -2019,6 +2040,7 @@ async fn tenant_key_rpc_requires_frontend_admin_and_revokes_verification() {
         caller: admin.clone(),
         tenant_id: "tenant".into(),
         expires_at_unix_seconds: 0,
+        name: None,
     };
     let mut ingress =
         pb::credential_service_client::CredentialServiceClient::new(channel(addr, "ingress").await);
@@ -2087,11 +2109,14 @@ async fn tenant_key_rpc_requires_frontend_admin_and_revokes_verification() {
         .into_inner();
     assert_eq!(page.keys.len(), 1);
     assert_eq!(page.keys[0].id, id);
+    assert!(page.keys[0].metadata.is_none());
     for _ in 0..2 {
         client
             .revoke_tenant_key(pb::RevokeTenantKeyRequest {
                 caller: admin.clone(),
                 id: id.clone(),
+                public_id: String::new(),
+                tenant_id: String::new(),
             })
             .await
             .unwrap();
@@ -2100,6 +2125,131 @@ async fn tenant_key_rpc_requires_frontend_admin_and_revokes_verification() {
         verify
             .verify_api_key(pb::VerifyApiKeyRequest {
                 api_key: created.api_key
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::Unauthenticated
+    );
+
+    // Metadata management preserves native digest-ID behavior above, while
+    // public IDs are tenant-bound and have a distinct missing-key contract.
+    for name in [" ".to_owned(), "x".repeat(257), "bad\nname".to_owned()] {
+        let error = client
+            .create_tenant_key(pb::CreateTenantKeyRequest {
+                caller: admin.clone(),
+                tenant_id: "admin".into(),
+                expires_at_unix_seconds: 0,
+                name: Some(name),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    }
+    assert_eq!(
+        client
+            .create_tenant_key(pb::CreateTenantKeyRequest {
+                caller: admin.clone(),
+                tenant_id: "another".into(),
+                expires_at_unix_seconds: 0,
+                name: Some("managed".into()),
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+    let managed = client
+        .create_tenant_key(pb::CreateTenantKeyRequest {
+            caller: admin.clone(),
+            tenant_id: "admin".into(),
+            expires_at_unix_seconds: 0,
+            name: Some("managed key".into()),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let metadata = managed.key.as_ref().unwrap().metadata.as_ref().unwrap();
+    assert!(uuid::Uuid::parse_str(&metadata.public_id).is_ok());
+    assert_eq!(metadata.name, "managed key");
+    assert!(metadata.created_at_unix_ms > 0);
+    assert_eq!(metadata.prefix, "adx_");
+    let value = managed.api_key.strip_prefix("adx_").unwrap();
+    assert_eq!(metadata.value_length as usize, value.len());
+    assert_eq!(metadata.masked_value_prefix, &value[..2]);
+    assert_eq!(metadata.masked_value_suffix, &value[value.len() - 4..]);
+    let public_id = metadata.public_id.clone();
+    let page = client
+        .list_tenant_keys(pb::ListTenantKeysRequest {
+            caller: admin.clone(),
+            tenant_id: "admin".into(),
+            page_size: 1000,
+            page_token: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(page.keys[0].metadata.as_ref().unwrap(), metadata);
+    let redis_client = redis::Client::open(redis.url.as_str()).unwrap();
+    let mut connection = redis_client
+        .get_multiplexed_async_connection()
+        .await
+        .unwrap();
+    let persisted: String = redis::cmd("HGET")
+        .arg("adx:{test}:control:v1:credentials")
+        .arg(&managed.key.as_ref().unwrap().id)
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    assert!(!persisted.contains(&managed.api_key));
+    let persisted: serde_json::Value = serde_json::from_str(&persisted).unwrap();
+    assert_eq!(persisted["metadata"]["public_id"], metadata.public_id);
+    assert!(persisted.get("api_key").is_none());
+    assert!(persisted.get("key").is_none());
+    let public_revoke = pb::RevokeTenantKeyRequest {
+        caller: admin.clone(),
+        id: String::new(),
+        public_id,
+        tenant_id: "admin".into(),
+    };
+    assert_eq!(
+        client
+            .revoke_tenant_key(pb::RevokeTenantKeyRequest {
+                caller: Some(pb::CallerContext {
+                    tenant_id: "another".into(),
+                    administrator: true
+                }),
+                tenant_id: "another".into(),
+                ..public_revoke.clone()
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::NotFound
+    );
+    // A failed cross-team lookup did not revoke the target.
+    assert!(verify
+        .verify_api_key(pb::VerifyApiKeyRequest {
+            api_key: managed.api_key.clone()
+        })
+        .await
+        .is_ok());
+    client
+        .revoke_tenant_key(public_revoke.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        client
+            .revoke_tenant_key(public_revoke)
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::NotFound
+    );
+    assert_eq!(
+        verify
+            .verify_api_key(pb::VerifyApiKeyRequest {
+                api_key: managed.api_key
             })
             .await
             .unwrap_err()
@@ -2206,6 +2356,7 @@ async fn snapshot_gc_waits_for_node_ack_and_recovers_from_lost_ack() {
     let mut client =
         pb::coordinator_service_client::CoordinatorServiceClient::new(channel(ma, "node").await);
     let mut report = pb::RegisterNodeRequest {
+        checkpoint_scopes: vec![],
         runtime_classes: vec![
             "runsc".into(),
             "runc".into(),
@@ -2271,6 +2422,7 @@ async fn snapshot_gc_waits_for_node_ack_and_recovers_from_lost_ack() {
     let request = pb::CollectSnapshotRequest {
         snapshot: Some(deleting.clone().try_into().unwrap()),
         node_session_id: "gc-boot".into(),
+        delegated: false,
     };
     let mut frontend =
         pb::node_service_client::NodeServiceClient::new(channel(na, "apiserver").await);
@@ -2353,6 +2505,7 @@ async fn snapshot_gc_waits_for_node_ack_and_recovers_from_lost_ack() {
     frontend
         .delete_environment(pb::DeleteEnvironmentRequest {
             failed_revision: None,
+            expiry_revision: None,
             node_session_id: String::new(),
             assignment: source.assignment,
             caller: caller(),
@@ -2361,6 +2514,32 @@ async fn snapshot_gc_waits_for_node_ack_and_recovers_from_lost_ack() {
         .unwrap();
     assert!(std::path::Path::new(&reusable.artifact.as_ref().unwrap().location).exists());
     let mut request = create("snapshot-clone");
+    let cleanup = session.checkpoint_cleanups().await.unwrap().pop().unwrap();
+    assert_eq!(cleanup.assignment.environment_id, "snapshot-source");
+    assert!(cleanup
+        .artifacts
+        .iter()
+        .all(|a| std::path::Path::new(&a.location).exists()));
+    // Physical deletion completes, but its response is lost before the outbox ACK.
+    trusted
+        .collect_checkpoint_cleanup(pb::CollectCheckpointCleanupRequest {
+            cleanup: Some(cleanup.clone().try_into().unwrap()),
+            node_session_id: "gc-boot".into(),
+            delegated: false,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        session.checkpoint_cleanups().await.unwrap(),
+        vec![cleanup.clone()]
+    );
+    assert!(cleanup
+        .artifacts
+        .iter()
+        .all(|a| !std::path::Path::new(&a.location).exists()));
+    assert_eq!(coordinator.collect_checkpoint_cleanups().await.unwrap(), 1);
+    assert!(session.checkpoint_cleanups().await.unwrap().is_empty());
+    assert!(std::path::Path::new(&reusable.artifact.as_ref().unwrap().location).exists());
     let raw = request.spec.as_mut().unwrap();
     raw.snapshot_id = Some(reusable.id.clone());
     raw.image.clear();
@@ -2447,12 +2626,14 @@ async fn snapshot_gc_waits_for_node_ack_and_recovers_from_lost_ack() {
     frontend
         .delete_environment(pb::DeleteEnvironmentRequest {
             failed_revision: None,
+            expiry_revision: None,
             node_session_id: String::new(),
             assignment: created.assignment,
             caller: caller(),
         })
         .await
         .unwrap();
+    assert_eq!(coordinator.collect_checkpoint_cleanups().await.unwrap(), 1);
     assert!(!std::path::Path::new(&clone_artifact.location).exists());
 }
 
@@ -2471,6 +2652,7 @@ async fn coordinator_restart_releases_snapshot_pins_for_lost_memory_queue_only()
         "source-1".into(),
         adx_core::CheckpointArtifact {
             storage: "shared".into(),
+            scope: String::new(),
             location: "immutable".into(),
             size_bytes: 10,
         },
@@ -2609,6 +2791,7 @@ async fn shared_checkpoint_moves_to_new_node_and_old_node_cleans_without_deletin
     let src_dir = tempfile::tempdir().unwrap();
     let source_store = ObjectCheckpointStore::new(
         "shared".into(),
+        "test-scope".into(),
         remote.clone(),
         "test".into(),
         src_dir.path().into(),
@@ -2628,6 +2811,7 @@ async fn shared_checkpoint_moves_to_new_node_and_old_node_cleans_without_deletin
     let target_store = Arc::new(
         ObjectCheckpointStore::new(
             "shared".into(),
+            "test-scope".into(),
             remote.clone(),
             "test".into(),
             target_dir.path().into(),
@@ -2804,6 +2988,7 @@ async fn shared_checkpoint_moves_to_new_node_and_old_node_cleans_without_deletin
     );
     assert!(source
         .commit_environment(pb::CommitEnvironmentRequest {
+            cleanup_artifacts: vec![],
             record: Some(old.clone().try_into().unwrap()),
             node_session_id: "source-boot".into()
         })
@@ -2827,6 +3012,7 @@ async fn shared_checkpoint_moves_to_new_node_and_old_node_cleans_without_deletin
     let returned_store = Arc::new(
         ObjectCheckpointStore::new(
             "shared".into(),
+            "test-scope".into(),
             remote.clone(),
             "test".into(),
             returned_dir.path().into(),
@@ -2881,3 +3067,6 @@ mod local_first;
 
 #[path = "rpc/network.rs"]
 mod network;
+
+#[path = "rpc/snapshot_gc.rs"]
+mod snapshot_gc;

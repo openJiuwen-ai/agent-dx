@@ -36,6 +36,9 @@ PYTHONPATH="$PWD/build${PYTHONPATH:+:$PYTHONPATH}" \
 echo "--- :test_tube: Release tooling tests"
 python3 -u -m unittest discover -s build/release/tests -v \
   2>&1 | tee out/buildkite/logs/release-tests.log
+echo "--- :test_tube: E2B tooling tests"
+python3 -u -m unittest discover -s build/e2b -p 'test_*.py' -v \
+  2>&1 | tee out/buildkite/logs/e2b-tooling-tests.log
 echo "--- :rust: Rust guideline gate"
 ADX_WITH_AFS="$ADX_WITH_AFS" ADX_AFS_ALL_FEATURES="$ADX_AFS_ALL_FEATURES" \
   make rust-check JOBS="${JOBS:-4}" \

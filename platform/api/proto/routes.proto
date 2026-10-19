@@ -23,6 +23,16 @@ message PublishedRoute {
  DataPlaneSecurityMode tunnel_security_mode = 8;
  DataPlaneSecurityMode port_forward_security_mode = 9;
  repeated uint32 forwarded_ports = 10;
+ SandboxRouteCompatibility compatibility = 11;
+}
+
+message SandboxRouteCompatibility {
+ string envd_token_sha256 = 1;
+ string traffic_token_sha256 = 2;
+ bool allow_public_traffic = 3;
+ bool envd_ready = 4;
+ uint64 expires_at_unix_ms = 5;
+ uint64 control_revision = 6;
 }
 
 message RouteFrame {
@@ -37,6 +47,7 @@ message RouteFrame {
 message WatchEnvironmentsRequest {}
 
 message PublishedEnvironment {
+  SandboxRouteCompatibility compatibility = 4;
   EnvironmentRecord record = 1;
   string node_address = 2;
   string relay_address = 3;
