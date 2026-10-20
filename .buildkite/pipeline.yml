@@ -1,9 +1,25 @@
 steps:
-- label: ':pipeline: Select ADX pipeline'
-  key: select-pipeline
+- label: 'CI · Inspect publication Secret permissions'
+  key: ci-secret-access
   agents:
     queue: default
     os: linux
     arch: amd64
-  command: bash .buildkite/select-pipeline.sh
+  command: python3 .buildkite/check-ci-secret-access.py
   timeout_in_minutes: 5
+  artifact_paths:
+  - out/buildkite/ci-secret-access.json
+  plugins:
+  - kubernetes:
+      podSpec:
+        imagePullSecrets:
+        - name: swr-pull-secret
+        containers:
+        - image: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/sandbox-deployer@sha256:6cf47d937f48c089030c7f936c6bdd9b389bdea13de6f93fcefcae5d95cb2fb1
+          resources:
+            requests:
+              cpu: '1'
+              memory: 512Mi
+            limits:
+              cpu: '1'
+              memory: 1Gi
