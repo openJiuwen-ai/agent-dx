@@ -120,7 +120,9 @@ impl ManagedService {
             || binding.phase != BindingPhase::Active
             || binding.parameters != *parameters
         {
-            return Err(Error::Unavailable(
+            // prepare_binding is a committed write: a mismatched result must not
+            // be reported as a retry-safe Unavailable.
+            return Err(Error::OutcomeUnknown(
                 "prepared binding identity mismatch".into(),
             ));
         }
@@ -200,7 +202,9 @@ impl ManagedService {
             || target.binding.environment_id.is_empty()
             || target.service != template.service
         {
-            return Err(Error::Unavailable(
+            // Activation is a committed write; a mismatched target is an
+            // unknown outcome, not a safe-to-retry Unavailable.
+            return Err(Error::OutcomeUnknown(
                 "Activator target identity or service mismatch".into(),
             ));
         }
