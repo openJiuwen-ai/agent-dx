@@ -92,6 +92,8 @@ message DfsOwnerOpenRequest {
   // Monotonic non-zero caller admission sequence scoped by the authenticated
   // caller node, caller process session, owner process session, and request body.
   uint64 open_seq = 9;
+  // Internal caller context; not an authentication credential.
+  string caller_node_id = 10;
 }
 message DfsOwnerOpenReply { DfsOwnerHandle handle = 1; }
 message DfsOwnerGetAttrRequest { DfsOwnerHandle handle = 1; }
@@ -106,6 +108,7 @@ message DfsOwnerMknodRequest {
   bytes name = 7;
   uint32 mode = 8;
   DfsOwnerSpecialNode special_node = 9;
+  string caller_node_id = 10;
 }
 message DfsOwnerMknodReply { DfsOwnerFileAttr attr = 1; }
 message DfsOwnerGetLockRequest {

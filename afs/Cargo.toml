@@ -55,6 +55,7 @@ tokio-stream = { version = "0.1.17", features = ["net"] }
 tonic = { version = "0.14.6", features = ["tls-ring"] }
 prost = "0.14"
 axum = "0.8"
+http-body = "1"
 thiserror = "2.0.16"
 libc = "0.2"
 blake3 = { version = "=1.8.7", features = ["rayon"] }

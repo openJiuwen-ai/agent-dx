@@ -1965,7 +1965,8 @@ impl Filesystem for AfsFuse {
         );
         let file = self.state.lock().unwrap().file_handle(fh);
         let inline_local_read = file.as_ref().is_some_and(|file| file.inline_local_read);
-        // The capability is local and excludes writable/remote-owner handles.
+        // The capability is local; the backend keeps per-read snapshot and
+        // authority checks. Writable reads still obey every exclusive barrier.
         // Clone the handle under the table lock; never hold it across backend work.
         let parallel_read = self.cached_io
             && file

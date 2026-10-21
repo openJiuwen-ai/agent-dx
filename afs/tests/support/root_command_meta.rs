@@ -237,9 +237,9 @@ fn validate_config(cfg: &Config) -> Result<(), BoxError> {
             "root_command_meta requires ownerfs=true so production OwnerRoots RPC is active",
         ));
     }
-    if cfg.trusted_node_certs.is_empty() {
+    if !cfg.internal_tls_enabled || cfg.trusted_node_certs.is_empty() {
         return Err(simple_error(
-            "root_command_meta requires trusted_node_certs for production mTLS node identity binding",
+            "root_command_meta explicitly tests mTLS identity binding; enable internal_tls_enabled and configure trusted_node_certs",
         ));
     }
     Ok(())

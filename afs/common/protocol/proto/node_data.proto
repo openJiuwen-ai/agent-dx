@@ -147,6 +147,8 @@ message DfsNegotiateRdmaReply {
 message DfsCloseRdmaRequest {
   uint64 session_id = 1;
   uint64 peer_node_epoch = 2;
+  // Internal caller context for the existing RDMA session fence.
+  string caller_node_id = 3;
 }
 
 message DfsCloseRdmaReply {}
@@ -222,6 +224,30 @@ message DfsReadRangesHeader {
   // The encoded version/length/root header and parent CVs are bounded to 8192
   // bytes for a 4MiB object. This never expands the granted body range.
   bytes blake3_outboard = 8;
+}
+
+// Optional reuse transport. Each read retains its independent result and
+// deadline; End follows the real producer join, not only body Completion.
+service DfsReadSessions {
+  rpc ReadSession(stream DfsReadSessionRequest) returns (stream DfsReadSessionFrame);
+}
+
+message DfsReadSessionRequest {
+  DfsReadRangesRequest request = 1;
+  // Remaining original caller budget, never a renewable session deadline.
+  uint64 timeout_millis = 2;
+}
+
+message DfsReadSessionEnd {
+  string read_id = 1;
+  string attempt_id = 2;
+}
+
+message DfsReadSessionFrame {
+  oneof body {
+    DfsReadRangesFrame frame = 1;
+    DfsReadSessionEnd end = 2;
+  }
 }
 
 message DfsReadRangesCompletion {

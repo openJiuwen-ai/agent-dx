@@ -337,6 +337,233 @@ mod allocator {
         }
 
         #[test]
+        fn cp09v2_actual_tonic_server_encoder_retained_allocation_is_bounded() {
+            use afs_protocol::node_data::{
+                DfsReadRangeReply, DfsReadRangesFrame, DfsReadSessionEnd, DfsReadSessionFrame,
+                dfs_read_ranges_frame, dfs_read_session_frame,
+            };
+            use http_body::Body;
+            use prost::Message;
+            use tonic::codec::{EncodeBody, EncodeBuf, Encoder};
+
+            struct SessionEncoder;
+            impl Encoder for SessionEncoder {
+                type Item = DfsReadSessionFrame;
+                type Error = tonic::Status;
+                fn encode(
+                    &mut self,
+                    frame: Self::Item,
+                    buf: &mut EncodeBuf<'_>,
+                ) -> Result<(), Self::Error> {
+                    frame
+                        .encode(buf)
+                        .map_err(|error| tonic::Status::internal(error.to_string()))
+                }
+            }
+            let _serial = ALLOCATOR_TESTS.lock().unwrap();
+            initialize().unwrap();
+            let allocated = tikv_jemalloc_ctl::thread::allocatedp::read().unwrap();
+            let deallocated = tikv_jemalloc_ctl::thread::deallocatedp::read().unwrap();
+            let executor = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            let frames = std::sync::Arc::new(vec![
+                DfsReadSessionFrame {
+                    body: Some(dfs_read_session_frame::Body::Frame(DfsReadRangesFrame {
+                        body: Some(dfs_read_ranges_frame::Body::Compact(DfsReadRangeReply {
+                            operation_index: u32::MAX,
+                            data: vec![73; 128 * 1024].into(),
+                            range_checksum: vec![19; 32],
+                        })),
+                    })),
+                },
+                DfsReadSessionFrame {
+                    body: Some(dfs_read_session_frame::Body::End(DfsReadSessionEnd {
+                        read_id: "r".repeat(128),
+                        attempt_id: "a".repeat(128),
+                    })),
+                },
+            ]);
+            for pending_between_messages in [false, true] {
+                let source = frames.clone();
+                let mut index = 0;
+                let mut pending = false;
+                // poll_fn for Stream uses an explicit small local adapter;
+                // fixture message owners remain outside the measured lifetime.
+                struct Frames<F>(F);
+                impl<F> tokio_stream::Stream for Frames<F>
+                where
+                    F: FnMut(
+                            &mut std::task::Context<'_>,
+                        )
+                            -> std::task::Poll<Option<Result<DfsReadSessionFrame, tonic::Status>>>
+                        + Unpin,
+                {
+                    type Item = Result<DfsReadSessionFrame, tonic::Status>;
+                    fn poll_next(
+                        mut self: std::pin::Pin<&mut Self>,
+                        cx: &mut std::task::Context<'_>,
+                    ) -> std::task::Poll<Option<Self::Item>> {
+                        (self.0)(cx)
+                    }
+                }
+                let source = Frames(move |cx: &mut std::task::Context<'_>| {
+                    if pending {
+                        pending = false;
+                        cx.waker().wake_by_ref();
+                        return std::task::Poll::Pending;
+                    }
+                    if index == 128 {
+                        return std::task::Poll::Ready(None);
+                    }
+                    let frame = source[index % 2].clone();
+                    index += 1;
+                    pending = pending_between_messages;
+                    std::task::Poll::Ready(Some(Ok(frame)))
+                });
+                let mut delivered_bytes = 0;
+                let a0 = allocated.get();
+                let d0 = deallocated.get();
+                let mut body = Box::pin(EncodeBody::new_server(
+                    SessionEncoder,
+                    source,
+                    None,
+                    Default::default(),
+                    Some(128 * 1024 + 128),
+                ));
+                let mut peak = 0;
+                while let Some(frame) =
+                    executor.block_on(std::future::poll_fn(|cx| body.as_mut().poll_frame(cx)))
+                {
+                    let frame = frame.unwrap();
+                    let retained = (allocated.get() - a0).saturating_sub(deallocated.get() - d0);
+                    peak = peak.max(retained);
+                    if let Ok(bytes) = frame.into_data() {
+                        delivered_bytes += bytes.len();
+                    }
+                }
+                assert!(delivered_bytes >= 64 * 128 * 1024);
+                assert!(
+                    peak <= 512 * 1024,
+                    "server encoder retained={peak}, pending={pending_between_messages}"
+                );
+                drop(body);
+                assert_eq!(std::sync::Arc::strong_count(&frames), 1);
+                eprintln!(
+                    "cp09v2 actual server encoder retained: pending={pending_between_messages}, peak_bytes={peak}"
+                );
+            }
+        }
+
+        #[test]
+        fn cp09v2_actual_tonic_decoder_retained_allocation_is_bounded() {
+            use afs_protocol::node_data::{
+                DfsReadRangeReply, DfsReadRangesFrame, DfsReadSessionEnd, DfsReadSessionFrame,
+                dfs_read_ranges_frame, dfs_read_session_frame,
+            };
+            use prost::Message;
+            use tokio_stream::StreamExt;
+            use tonic::codec::{DecodeBuf, Decoder, Streaming};
+
+            struct SessionDecoder;
+            impl Decoder for SessionDecoder {
+                type Item = DfsReadSessionFrame;
+                type Error = tonic::Status;
+                fn decode(
+                    &mut self,
+                    buf: &mut DecodeBuf<'_>,
+                ) -> Result<Option<Self::Item>, Self::Error> {
+                    Message::decode(buf)
+                        .map(Some)
+                        .map_err(|error| tonic::Status::internal(error.to_string()))
+                }
+            }
+
+            let _serial = ALLOCATOR_TESTS.lock().unwrap();
+            initialize().unwrap();
+            let executor = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            let allocated = tikv_jemalloc_ctl::thread::allocatedp::read().unwrap();
+            let deallocated = tikv_jemalloc_ctl::thread::deallocatedp::read().unwrap();
+            let compact = DfsReadSessionFrame {
+                body: Some(dfs_read_session_frame::Body::Frame(DfsReadRangesFrame {
+                    body: Some(dfs_read_ranges_frame::Body::Compact(DfsReadRangeReply {
+                        operation_index: 0,
+                        data: vec![73; 128 * 1024].into(),
+                        range_checksum: vec![19; 32],
+                    })),
+                })),
+            };
+            let end = DfsReadSessionFrame {
+                body: Some(dfs_read_session_frame::Body::End(DfsReadSessionEnd {
+                    read_id: "read".to_owned(),
+                    attempt_id: "attempt".to_owned(),
+                })),
+            };
+            let mut wire = Vec::new();
+            for _ in 0..64 {
+                for frame in [&compact, &end] {
+                    let message = frame.encode_to_vec();
+                    wire.push(0);
+                    wire.extend_from_slice(&u32::try_from(message.len()).unwrap().to_be_bytes());
+                    wire.extend_from_slice(&message);
+                }
+            }
+            let wire = prost::bytes::Bytes::from(wire);
+            for pattern in [&[16384_usize][..], &[131072][..], &[1, 4, 8192, 131072][..]] {
+                let mut chunks = Vec::new();
+                let mut offset = 0;
+                while offset < wire.len() {
+                    let length = pattern[chunks.len() % pattern.len()].min(wire.len() - offset);
+                    chunks.push(wire.slice(offset..offset + length));
+                    offset += length;
+                }
+                // Hold all fixture owners outside the measured codec lifetime:
+                // their frees must not hide decoder allocation in the delta.
+                let chunks = std::sync::Arc::new(chunks);
+                let source = chunks.clone();
+                let body = axum::body::Body::from_stream(
+                    tokio_stream::iter(0..source.len())
+                        .map(move |index| Ok::<_, std::io::Error>(source[index].clone())),
+                );
+                let a0 = allocated.get();
+                let d0 = deallocated.get();
+                let mut stream = Streaming::new_response(
+                    SessionDecoder,
+                    body,
+                    axum::http::StatusCode::OK,
+                    None,
+                    Some(128 * 1024 + 128),
+                );
+                let mut peak = 0;
+                for index in 0..128 {
+                    let frame = executor.block_on(stream.message()).unwrap().unwrap();
+                    if index % 2 == 0 {
+                        assert_eq!(frame, compact);
+                    } else {
+                        assert_eq!(frame, end);
+                    }
+                    let retained = (allocated.get() - a0).saturating_sub(deallocated.get() - d0);
+                    peak = peak.max(retained);
+                    drop(frame);
+                }
+                assert!(
+                    peak <= 768 * 1024,
+                    "retained decoder/frame allocation={peak}, pattern={pattern:?}"
+                );
+                drop(stream);
+                assert_eq!(std::sync::Arc::strong_count(&chunks), 1);
+                eprintln!(
+                    "cp09v2 actual tonic decoder retained allocation: pattern={pattern:?}, peak_bytes={peak}"
+                );
+            }
+            // This observes real pinned tonic decoding and allocator-backed live
+            // owners at every message. It is not a transient malloc high-water,
+            // HTTP2-window measurement, server encoder result or performance run.
+        }
+
+        #[test]
         fn allocator_sampler_is_cancelled_and_joined_before_runtime_drop() {
             let _serial = ALLOCATOR_TESTS.lock().unwrap();
             let executor = tokio::runtime::Builder::new_current_thread()

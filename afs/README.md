@@ -7,11 +7,18 @@ OwnerFs 与 DistributedFs（DFS）两种文件访问模式。`afs-meta` 管理�
 保持独立，只复用 ADX 的构建、发布与进程管理入口。
 
 AFS 默认不进入普通 ADX 构建和发布包；通过 `ADX_WITH_AFS=1` 显式启用。
-当前部署必须使用 mTLS，并把每张受信节点证书精确绑定到一个 Node ID。
+AFS 内部 gRPC 使用 `internal_tls_enabled` 开关，默认关闭；启用时使用完整证书集合和
+`https://` endpoint。节点间按内部互信传递调用者上下文，用户入口仍检查权限。
+此开关独立于 Platform、Gateway 和外部 S3 的安全配置，详见[部署说明](../docs/deployment/afs.md)。
 
-DFS 对不带 proof、长度不超过 128 KiB 的普通 Peer 范围读使用单条有界业务消息，
-并允许 Peer 客户端接收 128 KiB HTTP/2 DATA 帧。更大范围和带 proof 的请求继续
-使用原有有界流式协议；消息、正文、流控窗口及并发预算保持不变。
+普通Peer客户端（含DFS）的HTTP/2接收帧上限为128KiB，OwnerFiles客户端仍为256KiB；
+Node监听端策略保持。接收帧仍计原流控窗口，不增加消息、正文或并发预算。
+业务消息、HTTP/2帧、TLS记录和TCP分段分别计量，不能从帧上限推导性能。
+
+普通DFS范围读在元数据、窗口和并发条件成立时复用有界`DfsReadSessions` RPC；
+服务端session的codec每条占原Peer正文池512KiB，由HTTP响应body与入站解码任务共享至最后真实owner退出；
+不足时在发送业务前回原RPC，不增加正文池、不驱逐健康resident。
+对象proof读取保持原路径。复用保留每次读取独立结果和总期限，无正文缓存，详见架构说明。
 
 ![AFS 架构总览](../assets/architecture/afs.svg)
 
@@ -82,8 +89,9 @@ SHM 的 memfd、sealing 与原子 CLOEXEC FD 传递实现及对应运行测试�
 
 必要正确性边界仍需保留：读写新鲜度、close-to-open、权限和 suid/sgid 清除、错误传播、持久化屏障、direct-I/O mmap 能力协商、正常卸载和受管引用排空。
 
-原生DFS新open取得fresh状态，已打开读视图最多复用5秒、命中不续期；Node/session
-授权与版本视图分别检查，已知失效停止交付。A当前已验证对象单槽最多4MiB，与在途
+原生DFS新open取得fresh状态，已打开读视图最多复用5秒、命中不续期；这个缓存期限
+决定下次read是否刷新head，不截短已准入read自身的操作期限。每次read保留原操作截止，
+心跳或共享刷新不续期；Node/session与已知失效仍在交付前检查。A当前已验证对象单槽最多4MiB，与在途
 正文共用8MiB容量；B可显式启用可丢弃的磁盘读缓存，不新增常驻正文RAM缓存。具体期限、断链、失效与资源范围见
 [读取上下文边界](../docs/architecture/afs.md#dfs-原生节点读取上下文)及
 [验收与指标](../docs/testing/afs.md)。这不改变成功fsync的持久要求。

@@ -259,6 +259,12 @@ class RemoteTargetIdentityTest(unittest.TestCase):
         checks = self.remote_checks(node=node, node_after=node_after)
         self.assertFalse(checks["tls-digests-recorded"])
 
+    def test_p7_tls_mode_change_cannot_reuse_identity_pass(self):
+        self.assertFalse(target_driver._configured_tls_digests_stable(
+            {"internal_tls_enabled": False}, {"internal_tls_enabled": True}
+        ))
+
+
 
 if __name__ == "__main__":
     unittest.main()

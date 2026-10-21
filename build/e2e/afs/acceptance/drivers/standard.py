@@ -531,16 +531,20 @@ def config_summary(path: Path) -> dict[str, Any]:
     text = path.read_text(encoding="utf-8")
     parsed = tomllib.loads(text)
     values = flattened_toml_values(parsed)
+    tls_enabled = parsed.get("internal_tls_enabled", False)
+    if not isinstance(tls_enabled, bool):
+        raise ValueError("internal_tls_enabled must be a boolean")
     tls_names = ("tls_ca_certificate", "tls_identity_certificate", "tls_identity_private_key")
-    tls = {name: file_digest(string_toml_value(values, name)) for name in tls_names if string_toml_value(values, name)}
-    trusted_node_certs = {
-        name: file_digest(cert_path) for name, cert_path in string_map_toml_value(values, "trusted_node_certs").items()
+    tls = {
+        name: file_digest(string_toml_value(values, name))
+        for name in tls_names if tls_enabled and string_toml_value(values, name)
     }
-    tls_required = bool(
-        any(string_toml_value(values, name) for name in tls_names)
-        or string_toml_value(values, "tls_server_name")
-        or trusted_node_certs
-    )
+    trusted_node_certs = {
+        name: file_digest(cert_path)
+        for name, cert_path in string_map_toml_value(values, "trusted_node_certs").items()
+        if tls_enabled
+    }
+    tls_required = tls_enabled
     tls_missing = [name for name in tls_names if tls_required and not string_toml_value(values, name)]
     return {
         "path": str(path),
@@ -549,6 +553,7 @@ def config_summary(path: Path) -> dict[str, Any]:
         "rest_listen": string_toml_value(values, "rest_listen"),
         "meta_endpoint": string_toml_value(values, "meta_endpoint"),
         "tls_server_name": string_toml_value(values, "tls_server_name"),
+        "internal_tls_enabled": tls_enabled,
         "tls_required": tls_required,
         "tls_missing": tls_missing,
         "tls": tls,

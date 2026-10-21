@@ -28,13 +28,14 @@ dfs_local_copy = "required"
 log_level = "info"
 trace_enabled = false
 
+internal_tls_enabled = false
+# To enable mTLS, set true on all AFS peers and use https:// endpoints.
+# Certificate paths are unused while internal TLS is off.
 tls_ca_certificate = "/opt/adx/config/afs/tls/ca.pem"
 tls_identity_certificate = "/opt/adx/config/afs/tls/meta.pem"
 tls_identity_private_key = "/opt/adx/config/afs/tls/meta-key.pem"
 tls_server_name = "afs-cluster"
 
-[trusted_node_certs]
-node-a = "/opt/adx/config/afs/tls/node-a.pem"
 
 # Optional external S3 durability for a NEW DFS filesystem only.
 # Configure the same store/generation on Meta and every DFS Node; retain R1

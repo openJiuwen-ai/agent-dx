@@ -2114,17 +2114,14 @@ async fn run_node(
         grpc_config.configure_tcp_incoming(tonic::transport::server::TcpIncoming::from(grpc));
     // 业务 Handler 在 Node，公共 transport 只提供 builder 配置和低层搬运机制。
     #[cfg(any(feature = "ownerfs", feature = "dfs"))]
-    let dfs_trusted = cfg
-        .trusted_node_certs
-        .iter()
-        .map(|(node_id, path)| Ok((node_id.clone(), crate::config::read_certificate_der(path)?)))
-        .collect::<afs_error::Result<Vec<_>>>()?;
+    let internal_peers: Arc<dyn rpc::data::PeerAuthenticator> =
+        Arc::new(rpc::data::InternalPeerAuthenticator);
     #[cfg(feature = "dfs")]
     let control = if let Some(dfs) = state.dfs.as_ref() {
         rpc::control::NodeControlService::with_dfs_owner(
             sessions.clone(),
             dfs.clone(),
-            Arc::new(rpc::data::MtlsPeerAuthenticator::new(dfs_trusted.clone())?),
+            internal_peers.clone(),
         )
     } else {
         rpc::control::NodeControlService::new(sessions.clone())
@@ -2134,10 +2131,7 @@ async fn run_node(
     #[cfg(feature = "ownerfs")]
     let control = if let Some(owner) = state.ownerfs.as_ref() {
         control
-            .with_owner_locks(
-                owner.peer_executor()?,
-                Arc::new(rpc::data::MtlsPeerAuthenticator::new(dfs_trusted.clone())?),
-            )
+            .with_owner_locks(owner.peer_executor()?, internal_peers.clone())
             .with_owner_rdma_registry(owner_rdma_sessions.clone())
     } else {
         control
@@ -2163,9 +2157,9 @@ async fn run_node(
         None => Arc::new(rpc::data::DenyDfsReplicaAuthorizer),
     };
     #[cfg(feature = "dfs")]
-    let dfs_chunks = rpc::data::make_dfs_chunks_server_with_transport(
+    let (dfs_chunks, dfs_read_sessions) = rpc::data::make_dfs_chunk_services_with_transport(
         local_chunk_store.clone(),
-        Arc::new(rpc::data::MtlsPeerAuthenticator::new(dfs_trusted.clone())?),
+        internal_peers.clone(),
         dfs_read_authorizer,
         dfs_replica_authorizer,
         Some(dfs_replica_plane.clone()),
@@ -2179,18 +2173,10 @@ async fn run_node(
     );
     #[cfg(feature = "ownerfs")]
     let owner_files = if let Some(ownerfs) = state.ownerfs.as_ref() {
-        let trusted = cfg
-            .trusted_node_certs
-            .iter()
-            .map(|(node_id, path)| {
-                Ok((node_id.clone(), crate::config::read_certificate_der(path)?))
-            })
-            .collect::<afs_error::Result<Vec<_>>>()?;
-        let authenticator = Arc::new(rpc::data::MtlsPeerAuthenticator::new(trusted)?);
         let handler = rpc::data::make_owner_files_handler(ownerfs.peer_executor()?);
         rpc::data::make_owner_files_server_with_handler_metrics_and_rdma(
             handler,
-            authenticator,
+            internal_peers.clone(),
             owner_rpc_metrics.clone(),
             owner_rdma_sessions.clone(),
         )
@@ -2211,12 +2197,15 @@ async fn run_node(
             let dfs_owner_files = if let Some(dfs) = grpc_state.dfs.as_ref() {
                 rpc::data::make_dfs_owner_files_server(rpc::data::DfsOwnerFilesService::new(
                     dfs.clone(),
-                    Arc::new(rpc::data::MtlsPeerAuthenticator::new(dfs_trusted.clone())?),
+                    internal_peers.clone(),
                 ))
             } else {
                 rpc::data::make_dfs_owner_files_server(rpc::data::DfsOwnerFilesService::default())
             };
-            router.add_service(dfs_chunks).add_service(dfs_owner_files)
+            router
+                .add_service(dfs_chunks)
+                .add_service(dfs_read_sessions)
+                .add_service(dfs_owner_files)
         };
         router
             .serve_with_incoming_shutdown(incoming, cancelled(stop))

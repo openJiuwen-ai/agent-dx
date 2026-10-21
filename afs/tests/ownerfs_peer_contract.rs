@@ -1886,6 +1886,17 @@ async fn ownerfiles_rejects_rdma_plane_without_negotiated_owner_session_before_w
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mtls_ownerfiles_grpc_roundtrip_uses_real_ownerfs_backend() {
+    ownerfiles_roundtrip(true, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn p7_internal_ownerfiles_roundtrip_both_tls_modes() {
+    for tls_enabled in [false, true] {
+        ownerfiles_roundtrip(tls_enabled, true).await;
+    }
+}
+
+async fn ownerfiles_roundtrip(tls_enabled: bool, internal_trust: bool) {
     let temp = tempfile::tempdir().expect("tempdir");
     let disk = Arc::new(LocalFs::open(temp.path()).expect("localfs"));
     let meta = Arc::new(ContractMeta::default());
@@ -1913,28 +1924,36 @@ async fn mtls_ownerfiles_grpc_roundtrip_uses_real_ownerfs_backend() {
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let endpoint = format!(
-        "https://localhost:{}",
+        "{}://localhost:{}",
+        if tls_enabled { "https" } else { "http" },
         listener.local_addr().unwrap().port()
     );
+    let authenticator: Arc<dyn afs::node::rpc::data::PeerAuthenticator> = if internal_trust {
+        Arc::new(afs::node::rpc::data::InternalPeerAuthenticator)
+    } else {
+        Arc::new(RequireMtlsNodeB)
+    };
     let executor = fs.peer_executor().expect("peer executor");
     let control = afs::node::rpc::control::NodeControlService::new(
         afs::node::rpc::control::RdmaSessionRegistry::new(None),
     )
-    .with_owner_locks(executor.clone(), Arc::new(RequireMtlsNodeB))
+    .with_owner_locks(executor.clone(), authenticator.clone())
     .into_server();
     let handler = make_owner_files_handler(executor);
     let server_tls = ServerTlsConfig::new()
         .client_ca_root(Certificate::from_pem(CA_PEM))
         .identity(Identity::from_pem(SERVER_CERT_PEM, SERVER_KEY_PEM));
     let server = tokio::spawn(async move {
-        Server::builder()
-            .tls_config(server_tls)
-            .expect("server tls")
+        let mut builder = if tls_enabled {
+            Server::builder()
+                .tls_config(server_tls)
+                .expect("server tls")
+        } else {
+            Server::builder()
+        };
+        builder
             .add_service(control)
-            .add_service(make_owner_files_server_with_handler(
-                handler,
-                Arc::new(RequireMtlsNodeB),
-            ))
+            .add_service(make_owner_files_server_with_handler(handler, authenticator))
             .serve_with_incoming(TcpListenerStream::new(listener))
             .await
             .expect("owner files server");
@@ -1948,11 +1967,15 @@ async fn mtls_ownerfiles_grpc_roundtrip_uses_real_ownerfs_backend() {
     std::fs::write(&key, CLIENT_KEY_PEM).unwrap();
     let peers = afs::node::rpc::peer::PeerConnectionPool::new(
         afs_transport::GrpcConfig::default(),
-        afs_transport::TlsConfig::MutualTls {
-            ca_certificate: ca,
-            identity_certificate: cert,
-            identity_private_key: key,
-            server_name: "localhost".into(),
+        if tls_enabled {
+            afs_transport::TlsConfig::MutualTls {
+                ca_certificate: ca,
+                identity_certificate: cert,
+                identity_private_key: key,
+                server_name: "localhost".into(),
+            }
+        } else {
+            afs_transport::TlsConfig::Disabled
         },
         4,
     )
@@ -1965,6 +1988,31 @@ async fn mtls_ownerfiles_grpc_roundtrip_uses_real_ownerfs_backend() {
         .long_wait_channel("node-a", 1, &endpoint)
         .await
         .unwrap();
+    if tls_enabled && internal_trust {
+        let without_client_certificate = Endpoint::from_shared(endpoint.clone())
+            .unwrap()
+            .tls_config(
+                ClientTlsConfig::new()
+                    .ca_certificate(Certificate::from_pem(CA_PEM))
+                    .domain_name("localhost"),
+            )
+            .unwrap()
+            .connect()
+            .await;
+        if let Ok(unidentified) = without_client_certificate {
+            let reply = OwnerFilesClient::new(unidentified)
+                .stat_fs(afs_protocol::node_data::OwnerStatFsRequest {
+                    access: Some(root_access_for(&grant)),
+                    path: Vec::new(),
+                    expected_file_identity: None,
+                })
+                .await;
+            assert!(
+                reply.is_err(),
+                "TLS accepted a valid internal request without a client certificate"
+            );
+        }
+    }
     let missing_parent_status = OwnerFilesClient::new(channel.clone())
         .lookup(OwnerLookupRequest {
             access: Some(root_access_for(&grant)),
@@ -2064,7 +2112,7 @@ async fn mtls_ownerfiles_grpc_roundtrip_uses_real_ownerfs_backend() {
             0o644,
             &root_parent,
         )?;
-        // Exercise a full-size payload across the production pool's mTLS profile.
+        // Exercise a full-size payload through the selected internal transport.
         let payload = vec![0x9d; 1024 * 1024];
         assert_eq!(
             client.write(&grant, &created.file, 0, &payload)?,

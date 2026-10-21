@@ -218,6 +218,9 @@ pub struct Cli {
     /// 对外发布的本 Node gRPC URI；监听 0.0.0.0 时必须显式指定。
     #[arg(long)]
     pub advertise_endpoint: Option<String>,
+    /// Encrypt internal AFS gRPC links with mutual TLS; disabled by default.
+    #[arg(long)]
+    pub internal_tls_enabled: Option<bool>,
     #[arg(long)]
     pub tls_ca_certificate: Option<PathBuf>,
     #[arg(long)]
@@ -415,11 +418,13 @@ struct FileConfig {
     allow_volatile_meta: Option<bool>,
     peer_endpoint: Option<String>,
     advertise_endpoint: Option<String>,
+    internal_tls_enabled: Option<bool>,
     tls_ca_certificate: Option<PathBuf>,
     tls_identity_certificate: Option<PathBuf>,
     tls_identity_private_key: Option<PathBuf>,
     tls_server_name: Option<String>,
-    /// TLS 验证后再用证书 DER 的完整字节绑定 Node ID；仅由受信管理配置设置。
+    /// Explicit authenticated test adapters may bind leaf DER to Node IDs.
+    /// Production internal services do not load this optional identity table.
     trusted_node_certs: Option<HashMap<String, PathBuf>>,
     fs: Option<String>,
     data_mode: Option<String>,
@@ -498,6 +503,7 @@ pub struct Config {
     pub allow_volatile_meta: bool,
     pub peer_endpoint: Option<String>,
     pub advertise_endpoint: Option<String>,
+    pub internal_tls_enabled: bool,
     pub tls_ca_certificate: Option<PathBuf>,
     pub tls_identity_certificate: Option<PathBuf>,
     pub tls_identity_private_key: Option<PathBuf>,
@@ -894,6 +900,10 @@ impl Config {
                 .unwrap_or(false),
             peer_endpoint: cli.peer_endpoint.or(file.peer_endpoint),
             advertise_endpoint: cli.advertise_endpoint.or(file.advertise_endpoint),
+            internal_tls_enabled: cli
+                .internal_tls_enabled
+                .or(file.internal_tls_enabled)
+                .unwrap_or(false),
             tls_ca_certificate: cli.tls_ca_certificate.or(file.tls_ca_certificate),
             tls_identity_certificate: cli
                 .tls_identity_certificate
@@ -1178,8 +1188,10 @@ impl Config {
         .into_iter()
         .filter(|value| *value)
         .count();
-        if tls_count != 0 && tls_count != 4 {
-            return Err(invalid("all four tls_* fields are required together"));
+        if cfg.internal_tls_enabled && tls_count != 4 {
+            return Err(invalid(
+                "internal_tls_enabled requires all four tls_* fields together",
+            ));
         }
         for path in cfg.trusted_node_certs.values() {
             if !path.is_absolute() {
@@ -1243,10 +1255,13 @@ impl Config {
         .map_err(|error| invalid(error.to_string()))
     }
 
-    /// gRPC builders共用安全配置；只有配置了完整证书集合才启用 mTLS。
-    /// Meta authority and node-to-node filesystem RPCs also require
-    /// `trusted_node_certs` to bind a verified certificate to one Node ID.
+    /// Internal gRPC transport policy, independent of request identity context.
+    /// Certificate paths alone never enable TLS. Resolution rejects an enabled
+    /// policy without the complete certificate set.
     pub fn tls_config(&self) -> afs_transport::grpc::TlsConfig {
+        if !self.internal_tls_enabled {
+            return afs_transport::grpc::TlsConfig::Disabled;
+        }
         match (
             &self.tls_ca_certificate,
             &self.tls_identity_certificate,
