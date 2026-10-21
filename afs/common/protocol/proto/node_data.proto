@@ -147,6 +147,8 @@ message DfsNegotiateRdmaReply {
 message DfsCloseRdmaRequest {
   uint64 session_id = 1;
   uint64 peer_node_epoch = 2;
+  // Internal caller context for the existing RDMA session fence.
+  string caller_node_id = 3;
 }
 
 message DfsCloseRdmaReply {}
@@ -224,6 +226,30 @@ message DfsReadRangesHeader {
   bytes blake3_outboard = 8;
 }
 
+// Optional reuse transport. Each read retains its independent result and
+// deadline; End follows the real producer join, not only body Completion.
+service DfsReadSessions {
+  rpc ReadSession(stream DfsReadSessionRequest) returns (stream DfsReadSessionFrame);
+}
+
+message DfsReadSessionRequest {
+  DfsReadRangesRequest request = 1;
+  // Remaining original caller budget, never a renewable session deadline.
+  uint64 timeout_millis = 2;
+}
+
+message DfsReadSessionEnd {
+  string read_id = 1;
+  string attempt_id = 2;
+}
+
+message DfsReadSessionFrame {
+  oneof body {
+    DfsReadRangesFrame frame = 1;
+    DfsReadSessionEnd end = 2;
+  }
+}
+
 message DfsReadRangesCompletion {
   string read_id = 1;
   string attempt_id = 2;
@@ -234,11 +260,22 @@ message DfsReadRangesCompletion {
   DfsDigestAlgorithm range_checksum_algorithm = 7;
 }
 
+// One complete ordinary range, at most 128KiB. The RPC and operation_index
+// bind it to the request; there is no separate header or completion. The
+// checksum retains the ordinary range contract, not an original-root proof.
+// Requests for outboard metadata and larger ranges use the bounded stream.
+message DfsReadRangeReply {
+  uint32 operation_index = 1;
+  bytes data = 2;
+  bytes range_checksum = 3; // BLAKE3, exactly 32 bytes.
+}
+
 message DfsReadRangesFrame {
   oneof body {
     DfsReadRangesHeader header = 1;
     bytes data = 2;
     DfsReadRangesCompletion completion = 3;
+    DfsReadRangeReply compact = 4;
   }
 }
 

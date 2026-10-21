@@ -69,8 +69,9 @@ use afs_protocol::node_data::{
 };
 #[cfg(feature = "dfs")]
 use afs_protocol::node_data::{
-    DfsChunkReadOp, DfsReadGrant as PbDfsReadGrant, DfsReadRangesRequest,
-    dfs_chunks_client::DfsChunksClient, dfs_read_ranges_frame,
+    DfsChunkReadOp, DfsReadGrant as PbDfsReadGrant, DfsReadRangesRequest, DfsReadSessionFrame,
+    DfsReadSessionRequest, dfs_chunks_client::DfsChunksClient, dfs_read_ranges_frame,
+    dfs_read_session_frame, dfs_read_sessions_client::DfsReadSessionsClient,
 };
 #[cfg(feature = "rdma")]
 use afs_tracing::Instrument;
@@ -99,6 +100,7 @@ use crate::node::vfs::{
 };
 
 const MAX_TRANSFER_BYTES: usize = crate::node::storage::MAX_TRANSFER_BYTES;
+const DFS_PEER_RECEIVE_FRAME_BYTES: u32 = 128 * 1024;
 #[cfg(feature = "ownerfs")]
 const MAX_PENDING_RELEASES: usize = 64;
 #[cfg(feature = "ownerfs")]
@@ -564,6 +566,7 @@ struct DfsRdmaSession {
     poisoned: Arc<AtomicBool>,
     session_id: u64,
     caller_epoch: u64,
+    caller_node_id: String,
     client: DfsChunksClient<Channel>,
     timeout: Duration,
     _permit: tokio::sync::OwnedSemaphorePermit,
@@ -621,6 +624,12 @@ impl DfsRdmaPool {
         authority: afs_protocol::node_data::dfs_negotiate_rdma_request::Authority,
         caller_epoch: u64,
     ) -> afs_error::Result<DfsRdmaAcquire> {
+        use super::data::InternalPeerRequest;
+        let caller_node_id = authority
+            .caller_node_id()
+            .filter(|node_id| !node_id.is_empty())
+            .ok_or_else(|| dfs_protocol_error("DFS RDMA authority has no caller node context"))?
+            .to_owned();
         let channel = self.peers.channel(node_id, node_epoch, address).await?;
         let key = (node_id.to_owned(), node_epoch, address.to_owned());
         let slot = {
@@ -652,7 +661,9 @@ impl DfsRdmaPool {
         };
         let mut guard = slot.lock_owned().await;
         if guard.as_ref().is_some_and(|connection| {
-            connection.poisoned.load(Ordering::SeqCst) || connection.caller_epoch != caller_epoch
+            connection.poisoned.load(Ordering::SeqCst)
+                || connection.caller_epoch != caller_epoch
+                || connection.caller_node_id != caller_node_id
         }) {
             *guard = None;
         }
@@ -693,6 +704,7 @@ impl DfsRdmaPool {
                 client: client.clone(),
                 session_id: reply.session_id,
                 caller_epoch,
+                caller_node_id: caller_node_id.clone(),
                 timeout: self.timeout,
                 armed: true,
             };
@@ -728,6 +740,7 @@ impl DfsRdmaPool {
                 poisoned: Arc::new(AtomicBool::new(false)),
                 session_id: reply.session_id,
                 caller_epoch,
+                caller_node_id: caller_node_id.clone(),
                 client,
                 timeout: self.timeout,
                 _permit: permit,
@@ -753,9 +766,11 @@ impl Drop for DfsRdmaSession {
             let session_id = self.session_id;
             let epoch = self.caller_epoch;
             let timeout = self.timeout;
+            let caller_node_id = self.caller_node_id.clone();
             handle.spawn(async move {
                 let mut request =
                     request_with_current_context(afs_protocol::node_data::DfsCloseRdmaRequest {
+                        caller_node_id,
                         session_id,
                         peer_node_epoch: epoch,
                     });
@@ -780,6 +795,7 @@ struct DfsRdmaRemoteClose {
     client: DfsChunksClient<Channel>,
     session_id: u64,
     caller_epoch: u64,
+    caller_node_id: String,
     timeout: Duration,
     armed: bool,
 }
@@ -794,9 +810,11 @@ impl Drop for DfsRdmaRemoteClose {
             let session_id = self.session_id;
             let peer_node_epoch = self.caller_epoch;
             let timeout = self.timeout;
+            let caller_node_id = self.caller_node_id.clone();
             handle.spawn(async move {
                 let mut request =
                     request_with_current_context(afs_protocol::node_data::DfsCloseRdmaRequest {
+                        caller_node_id,
                         session_id,
                         peer_node_epoch,
                     });
@@ -845,6 +863,8 @@ pub struct PeerConnectionPool {
     state: tokio::sync::Mutex<PeerPoolState>,
     #[cfg(feature = "dfs")]
     stream_work: Arc<PeerStreamWorkPool>,
+    #[cfg(feature = "dfs")]
+    range_sessions: Arc<std::sync::Mutex<[RangeSessionSlot; 2]>>,
 }
 
 #[derive(Default)]
@@ -874,13 +894,17 @@ impl PeerConnectionPool {
         let security = afs_transport::SecurityManager::new(tls).map_err(|error| {
             afs_error::Error::coded(afs_error::CLIENT_ARGUMENT_INVALID, error.to_string())
         })?;
+        #[cfg(feature = "dfs")]
+        let stream_work = Arc::new(PeerStreamWorkPool::default());
         Ok(Self {
             config,
             security,
             capacity,
             state: tokio::sync::Mutex::new(PeerPoolState::default()),
             #[cfg(feature = "dfs")]
-            stream_work: Arc::new(PeerStreamWorkPool::default()),
+            stream_work: stream_work.clone(),
+            #[cfg(feature = "dfs")]
+            range_sessions: stream_work.range_sessions.clone(),
             #[cfg(feature = "dfs")]
             read_work_metrics: None,
         })
@@ -986,13 +1010,14 @@ impl PeerConnectionPool {
         } else {
             self.config.configure_long_wait_client(endpoint)
         };
-        // This bounds each incoming frame, not the message/flow-control window.
-        // Smaller frames remain valid; TLS, deadlines and message limits remain.
-        let endpoint = if owner_files {
-            endpoint.max_frame_size(256 * 1024)
+        // Only the client's receive cap changes; the Node listener retains its
+        // existing policy. Frames still consume the original flow-control window,
+        // and message limits, payload budgets, TLS and deadlines are unchanged.
+        let endpoint = endpoint.max_frame_size(if owner_files {
+            256 * 1024
         } else {
-            endpoint
-        };
+            DFS_PEER_RECEIVE_FRAME_BYTES
+        });
         let endpoint = self.security.configure_client(endpoint).map_err(|error| {
             afs_error::Error::coded(afs_error::CLIENT_ARGUMENT_INVALID, error.to_string())
         })?;
@@ -1024,6 +1049,19 @@ impl PeerConnectionPool {
         node_epoch: u64,
         endpoint: &str,
         background: bool,
+    ) -> afs_error::Result<Option<Arc<PeerStreamActive>>> {
+        self.acquire_transport_work(node_id, node_epoch, endpoint, background, true)
+            .await
+    }
+
+    #[cfg(feature = "dfs")]
+    async fn acquire_transport_work(
+        &self,
+        node_id: &str,
+        node_epoch: u64,
+        endpoint: &str,
+        background: bool,
+        need_blocks: bool,
     ) -> afs_error::Result<Option<Arc<PeerStreamActive>>> {
         let _waiting = if background {
             None
@@ -1088,24 +1126,75 @@ impl PeerConnectionPool {
                 if background && state.foreground_waiters != 0 {
                     return Ok(None);
                 }
-                if state.active == 0 {
-                    let candidate = self.channel_locked(&mut channels, &key, true)?;
-                    let mut blocks = Vec::with_capacity(2);
-                    for _ in 0..2 {
-                        blocks.push(PeerStreamBlock::new(self.read_work_metrics.as_ref())?);
+                if need_blocks {
+                    let mut ranges = self
+                        .range_sessions
+                        .lock()
+                        .map_err(|_| dfs_protocol_error("Peer read session lock poisoned"))?;
+                    for slot in ranges.iter_mut() {
+                        if matches!(slot, RangeSessionSlot::Idle(_)) {
+                            *slot = RangeSessionSlot::Vacant;
+                        }
                     }
+                }
+                let reuse_range_channel = if state.active == 0 {
+                    let mut ranges = self
+                        .range_sessions
+                        .lock()
+                        .map_err(|_| dfs_protocol_error("Peer read session lock poisoned"))?;
+                    let same = state
+                        .session
+                        .as_ref()
+                        .is_some_and(|session| session.key == key)
+                        && ranges
+                            .iter()
+                            .any(|slot| matches!(slot, RangeSessionSlot::Idle(_)));
+                    if !same {
+                        // No active transport owner remains. Retire idle RPCs
+                        // before selecting another connection/window, including
+                        // when the original channel LRU evicted their entry.
+                        for slot in ranges.iter_mut() {
+                            *slot = RangeSessionSlot::Vacant;
+                        }
+                    }
+                    same
+                } else {
+                    false
+                };
+                if state.active == 0 && !reuse_range_channel {
+                    let candidate = self.channel_locked(&mut channels, &key, true)?;
+                    state.blocks_ready = false;
                     state.session = Some(Arc::new(PeerStreamSession {
                         key: key.clone(),
                         channel: candidate,
-                        blocks: std::sync::Mutex::new(blocks),
+                        blocks: std::sync::Mutex::new(Vec::new()),
                         available: tokio::sync::Notify::new(),
                         controls: Arc::new(tokio::sync::Semaphore::new(STREAM_FRAME_BACKING_BYTES)),
-                        _work: std::sync::Mutex::new(
-                            self.read_work_metrics
-                                .as_ref()
-                                .map(|metrics| metrics.peer_stream_pipeline(0)),
-                        ),
+                        _work: std::sync::Mutex::new(None),
                     }));
+                }
+                if need_blocks
+                    && !state.blocks_ready
+                    && let Some(session) = &state.session
+                    && session.key == key
+                    && state.active < 2
+                {
+                    let mut blocks = session
+                        .blocks
+                        .lock()
+                        .map_err(|_| dfs_protocol_error("Peer stream block lock poisoned"))?;
+                    for _ in 0..2 {
+                        blocks.push(PeerStreamBlock::new(self.read_work_metrics.as_ref())?);
+                    }
+                    *session
+                        ._work
+                        .lock()
+                        .map_err(|_| dfs_protocol_error("Peer stream work lock poisoned"))? = self
+                        .read_work_metrics
+                        .as_ref()
+                        .map(|metrics| metrics.peer_stream_pipeline(0));
+                    drop(blocks);
+                    state.blocks_ready = true;
                 }
                 if let Some(session) = &state.session
                     && state.active < 2
@@ -1113,9 +1202,13 @@ impl PeerConnectionPool {
                 {
                     let session = session.clone();
                     state.active += 1;
+                    if need_blocks {
+                        state.block_users += 1;
+                    }
                     return Ok(Some(Arc::new(PeerStreamActive {
                         pool: self.stream_work.clone(),
                         session,
+                        needs_blocks: need_blocks,
                     })));
                 }
             }
@@ -1158,6 +1251,97 @@ impl PeerConnectionPool {
                 touched: std::time::Instant::now(),
             },
         );
+    }
+}
+
+#[cfg(feature = "dfs")]
+#[derive(Default)]
+enum RangeSessionSlot {
+    #[default]
+    Vacant,
+    Busy,
+    Idle(Box<RangeReadSession>),
+}
+
+#[cfg(feature = "dfs")]
+struct RangeReadSession {
+    key: PeerChannelKey,
+    sender: tokio::sync::mpsc::Sender<DfsReadSessionRequest>,
+    incoming: tonic::Streaming<DfsReadSessionFrame>,
+    touched: std::time::Instant,
+}
+
+// Two fixed slots, no pending request map/body cache/background client task.
+// The optional session accepts Compact up to128KiB plus its bounded envelope.
+// Decoder/encoder capacities are included in the original transport envelope;
+// a session never owns separate body blocks or a pending request map.
+#[cfg(feature = "dfs")]
+struct RangeSessionLease {
+    pool: Arc<std::sync::Mutex<[RangeSessionSlot; 2]>>,
+    index: usize,
+    session: Option<Box<RangeReadSession>>,
+    transport: Option<Arc<PeerStreamActive>>,
+}
+
+#[cfg(feature = "dfs")]
+impl RangeSessionLease {
+    fn acquire(
+        pool: &Arc<std::sync::Mutex<[RangeSessionSlot; 2]>>,
+        key: &PeerChannelKey,
+    ) -> afs_error::Result<Option<Self>> {
+        let mut slots = pool
+            .lock()
+            .map_err(|_| dfs_protocol_error("Peer read session lock poisoned"))?;
+        let matching = slots.iter().position(|slot| {
+            matches!(slot, RangeSessionSlot::Idle(session)
+            if session.key == *key && session.touched.elapsed() < Duration::from_secs(1))
+        });
+        let available = matching.or_else(|| {
+            slots
+                .iter()
+                .position(|slot| !matches!(slot, RangeSessionSlot::Busy))
+        });
+        let Some(index) = available else {
+            return Ok(None);
+        };
+        let old = std::mem::replace(&mut slots[index], RangeSessionSlot::Busy);
+        let session = match old {
+            RangeSessionSlot::Idle(session) if Some(index) == matching => Some(session),
+            _ => None,
+        };
+        Ok(Some(Self {
+            pool: pool.clone(),
+            index,
+            session,
+            transport: None,
+        }))
+    }
+
+    fn keep(mut self) -> afs_error::Result<()> {
+        let mut slots = self
+            .pool
+            .lock()
+            .map_err(|_| dfs_protocol_error("Peer read session lock poisoned"))?;
+        if let Some(mut session) = self.session.take() {
+            session.touched = std::time::Instant::now();
+            slots[self.index] = RangeSessionSlot::Idle(session);
+        }
+        // Drop must not clear the successfully returned slot.
+        self.index = usize::MAX;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "dfs")]
+impl Drop for RangeSessionLease {
+    fn drop(&mut self) {
+        // Actual stream/codec owners drop before the slot is available again.
+        drop(self.session.take());
+        if self.index < 2
+            && let Ok(mut slots) = self.pool.lock()
+        {
+            slots[self.index] = RangeSessionSlot::Vacant;
+        }
     }
 }
 
@@ -1237,6 +1421,7 @@ impl GrpcChunkTransfer {
         self.runtime.block_on(async {
             // One deadline covers connection, response headers and every frame.
             tokio::time::timeout(self.timeout, async {
+                let deadline = tokio::time::Instant::now() + self.timeout;
                 let channel = self
                     .peers
                     .channel(
@@ -1247,6 +1432,142 @@ impl GrpcChunkTransfer {
                             .ok_or_else(|| dfs_protocol_error("peer source has no endpoint"))?,
                     )
                     .await?;
+                let endpoint = first
+                    .node_data_endpoint()
+                    .ok_or_else(|| dfs_protocol_error("peer source has no endpoint"))?;
+                let key = (node_id.clone(), *node_epoch, endpoint.to_owned(), false);
+                // Larger metadata uses the unchanged unary stream before any
+                // business message. Contention also falls back before send.
+                let mut lease = if chunk.is_none()
+                    && self.stream_sink_supported()
+                    && super::data::read_session_request_bytes(&request).is_some()
+                    && key.0.capacity().saturating_add(key.2.capacity()) <= STREAM_KEY_BYTES
+                {
+                    match self
+                        .peers
+                        .acquire_transport_work(node_id, *node_epoch, endpoint, true, false)
+                        .await?
+                    {
+                        Some(transport) => {
+                            let mut lease =
+                                RangeSessionLease::acquire(&self.peers.range_sessions, &key)?;
+                            if let Some(lease) = &mut lease {
+                                lease.transport = Some(transport);
+                            }
+                            lease
+                        }
+                        None => None,
+                    }
+                } else {
+                    None
+                };
+                if let Some(active) = &mut lease
+                    && active.session.is_none()
+                {
+                    let (sender, receiver) = tokio::sync::mpsc::channel(1);
+                    let session_channel = active
+                        .transport
+                        .as_ref()
+                        .ok_or_else(|| {
+                            dfs_protocol_error("Peer read session has no transport owner")
+                        })?
+                        .session
+                        .channel
+                        .clone();
+                    let mut client = DfsReadSessionsClient::new(session_channel)
+                        .max_encoding_message_size(
+                            8192.min(self.peers.config.max_encoding_message_bytes),
+                        )
+                        .max_decoding_message_size(
+                            (128 * 1024 + 128).min(self.peers.config.max_decoding_message_bytes),
+                        );
+                    if let Some(metrics) = &self.peers.read_work_metrics {
+                        metrics.read_rpc("peer_read_session");
+                    }
+                    // Do not set grpc-timeout on a reusable session. The
+                    // outer absolute timeout still covers opening and reading.
+                    let open = client
+                        .read_session(request_with_current_context(
+                            tokio_stream::wrappers::ReceiverStream::new(receiver),
+                        ))
+                        .await;
+                    match open {
+                        Ok(response) => {
+                            active.session = Some(Box::new(RangeReadSession {
+                                key: key.clone(),
+                                sender,
+                                incoming: response.into_inner(),
+                                touched: std::time::Instant::now(),
+                            }))
+                        }
+                        Err(status)
+                            if matches!(
+                                status.code(),
+                                tonic::Code::Unimplemented | tonic::Code::ResourceExhausted
+                            ) =>
+                        {
+                            // The response failed before any business message:
+                            // unsupported service or bounded session admission
+                            // can use the original per-request transport.
+                            lease = None;
+                        }
+                        Err(status) => {
+                            return Err(afs_transport::grpc::error_status::status_to_error(status));
+                        }
+                    }
+                }
+                if let Some(mut lease) = lease {
+                    let session = lease
+                        .session
+                        .as_mut()
+                        .ok_or_else(|| dfs_protocol_error("Peer read session did not open"))?;
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    let timeout_millis = u64::try_from(remaining.as_millis())
+                        .map_err(|_| dfs_protocol_error("Peer read deadline overflows"))?;
+                    if timeout_millis == 0 {
+                        return Err(afs_error::Error::coded(
+                            afs_error::CLIENT_DEADLINE_EXCEEDED,
+                            "DFS peer read total deadline exceeded",
+                        ));
+                    }
+                    session
+                        .sender
+                        .send(DfsReadSessionRequest {
+                            request: Some(request.clone()),
+                            timeout_millis,
+                        })
+                        .await
+                        .map_err(|_| {
+                            dfs_protocol_error("Peer read session request stream closed")
+                        })?;
+                    if let Some(metrics) = &self.peers.read_work_metrics {
+                        metrics.peer_read_event("range_session_request");
+                    }
+                    let result = consume_peer_session_stream(
+                        &request,
+                        chunk,
+                        out,
+                        &mut session.incoming,
+                        self.peers.read_work_metrics.as_ref(),
+                        proof_budget,
+                    )
+                    .await?;
+                    // The same high-water fence applies to reused streams and
+                    // to publication after the last End, not just connection.
+                    let state = self.peers.state.lock().await;
+                    if state
+                        .high_water_epochs
+                        .get(node_id)
+                        .is_some_and(|epoch| *epoch > *node_epoch)
+                    {
+                        return Err(afs_error::Error::coded(
+                            afs_error::NODE_TRANSFER_UNAVAILABLE,
+                            "Peer session Node epoch was retired",
+                        ));
+                    }
+                    lease.keep()?;
+                    return Ok(result);
+                }
                 let mut client = DfsChunksClient::new(channel)
                     .max_encoding_message_size(self.peers.config.max_encoding_message_bytes)
                     .max_decoding_message_size(self.peers.config.max_decoding_message_bytes);
@@ -1322,25 +1643,28 @@ impl PeerStreamBlock {
     }
 }
 
-// One Node owns the original two payload allocations and control allowance.
-// Active operations pin one exact Channel, even if the connection LRU evicts it.
-// Thus two streams share one <=2MiB connection window; a different connection
-// waits. Two bounded decoders add <=256KiB: 2MiB + 512KiB + 256KiB + 256KiB
-// plus <=256KiB bounded request/key/fixed metadata remains below the original
-// 4MiB transport envelope (private output/proof separate). A key owns <=8KiB;
-// each operation retains two <=32KiB request representations. The cache/pool
-// guards admit only two operations and one shared session.
+// One Node still owns two active transport lanes and one <=2MiB connection
+// window. Ordinary range sessions hold no proof or body aliases across frames;
+// allow768KiB per session for codec growth, fixed request encoding included.
+// Two sessions need no sink blocks:2MiB+2*768KiB+256KiB control+256KiB
+// request/key/fixed metadata <=4MiB. One session plus one sink needs the
+// original512KiB blocks and128KiB sink decoder, still <=4MiB. Idle sessions
+// retire before sink admission; the last actual block owner drops the blocks.
+// Object/proof reads use their unchanged transport and original proof budget.
 #[cfg(feature = "dfs")]
 #[derive(Default)]
 struct PeerStreamWorkPool {
     state: std::sync::Mutex<PeerStreamWorkState>,
     changed: tokio::sync::Notify,
+    range_sessions: Arc<std::sync::Mutex<[RangeSessionSlot; 2]>>,
 }
 #[cfg(feature = "dfs")]
 #[derive(Default)]
 struct PeerStreamWorkState {
     active: usize,
     foreground_waiters: usize,
+    blocks_ready: bool,
+    block_users: usize,
     session: Option<Arc<PeerStreamSession>>,
 }
 #[cfg(feature = "dfs")]
@@ -1381,6 +1705,7 @@ struct PeerStreamSession {
 struct PeerStreamActive {
     pool: Arc<PeerStreamWorkPool>,
     session: Arc<PeerStreamSession>,
+    needs_blocks: bool,
 }
 #[cfg(feature = "dfs")]
 impl PeerStreamActive {
@@ -1414,7 +1739,7 @@ impl Drop for PeerStreamActive {
                 .state
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            if state.active == 1 {
+            if self.needs_blocks && state.block_users == 1 {
                 // Retire the actual allocations and observation before publishing
                 // zero. Waking another admission before our Arc fields drop could
                 // otherwise overlap the old two blocks with two new allocations.
@@ -1430,9 +1755,20 @@ impl Drop for PeerStreamActive {
                         .unwrap_or_else(|error| error.into_inner())
                         .take(),
                 );
+                state.blocks_ready = false;
+            }
+            if self.needs_blocks {
+                state.block_users = state.block_users.saturating_sub(1);
             }
             state.active = state.active.saturating_sub(1);
-            if state.active == 0 {
+            let range_idle = self
+                .pool
+                .range_sessions
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .iter()
+                .any(|slot| matches!(slot, RangeSessionSlot::Idle(_)));
+            if state.active == 0 && !range_idle {
                 state.session.take()
             } else {
                 None
@@ -1525,7 +1861,7 @@ fn peer_stream_control_capacity(
             *data = prost::bytes::Bytes::new();
             0
         }
-        Some(dfs_read_ranges_frame::Body::Data(_)) => {
+        Some(dfs_read_ranges_frame::Body::Data(_) | dfs_read_ranges_frame::Body::Compact(_)) => {
             return Err(dfs_protocol_error(
                 "Peer data cannot enter the control queue",
             ));
@@ -2695,6 +3031,62 @@ impl<'a> CompletedPeerObjectProof<'a> {
 }
 
 #[cfg(feature = "dfs")]
+async fn consume_peer_session_stream<'a, S>(
+    request: &DfsReadRangesRequest,
+    chunk: Option<&'a ChunkObject>,
+    out: &'a mut [u8],
+    stream: &mut S,
+    metrics: Option<&ReadWorkMetrics>,
+    proof_budget: Option<Arc<OutboardBudget>>,
+) -> afs_error::Result<Option<VerifiedPeerChunk<'a>>>
+where
+    S: tokio_stream::Stream<Item = Result<DfsReadSessionFrame, tonic::Status>> + Unpin,
+{
+    let mut decoder = match chunk {
+        Some(chunk) => {
+            ReadFrameDecoder::for_object(request, chunk)?.with_outboard_budget(proof_budget)
+        }
+        None => ReadFrameDecoder::new(request),
+    };
+    decoder.work_metrics = metrics.cloned();
+    loop {
+        let frame = stream
+            .next()
+            .await
+            .ok_or_else(|| dfs_protocol_error("Peer session omitted request End"))?
+            .map_err(afs_transport::grpc::error_status::status_to_error)?;
+        match frame.body {
+            Some(dfs_read_session_frame::Body::Frame(frame)) => {
+                let copied = match &frame.body {
+                    Some(dfs_read_ranges_frame::Body::Data(bytes)) => bytes.len() as u64,
+                    Some(dfs_read_ranges_frame::Body::Compact(reply)) => reply.data.len() as u64,
+                    _ => 0,
+                };
+                decoder.accept(frame, out)?;
+                if let Some(metrics) = metrics {
+                    metrics.copy("frame_to_attempt", copied);
+                }
+            }
+            Some(dfs_read_session_frame::Body::End(end)) => {
+                if end.read_id != request.read_id || end.attempt_id != request.attempt_id {
+                    return Err(dfs_protocol_error("Peer session End identity differs"));
+                }
+                break;
+            }
+            None => return Err(dfs_protocol_error("Peer session frame has no body")),
+        }
+    }
+    match chunk {
+        Some(chunk) => {
+            let body: &'a [u8] = out;
+            let proof = decoder.finish_object(body)?;
+            VerifiedPeerChunk::from_completed_stream(chunk, body, proof).map(Some)
+        }
+        None => decoder.finish().map(|()| None),
+    }
+}
+
+#[cfg(feature = "dfs")]
 async fn consume_peer_read_stream<'a, S>(
     request: &DfsReadRangesRequest,
     chunk: Option<&'a ChunkObject>,
@@ -2719,6 +3111,7 @@ where
         let frame = frame.map_err(afs_transport::grpc::error_status::status_to_error)?;
         let copied = match &frame.body {
             Some(dfs_read_ranges_frame::Body::Data(bytes)) => bytes.len() as u64,
+            Some(dfs_read_ranges_frame::Body::Compact(reply)) => reply.data.len() as u64,
             _ => 0,
         };
         decoder.accept(frame, out)?;
@@ -2981,6 +3374,9 @@ impl<'a> ReadFrameDecoder<'a> {
         observation: PeerConsumerObservation<'_>,
     ) -> afs_error::Result<()> {
         match frame.body {
+            Some(dfs_read_ranges_frame::Body::Compact(reply)) => {
+                self.accept_compact(reply, output_length, write, observation)?;
+            }
             Some(dfs_read_ranges_frame::Body::Header(header)) => {
                 let index = header.operation_index as usize;
                 let op = self
@@ -3109,6 +3505,58 @@ impl<'a> ReadFrameDecoder<'a> {
             }
             None => return Err(dfs_protocol_error("empty peer frame")),
         }
+        Ok(())
+    }
+
+    fn accept_compact(
+        &mut self,
+        reply: afs_protocol::node_data::DfsReadRangeReply,
+        output_length: usize,
+        mut write: impl FnMut(usize, &[u8]) -> afs_error::Result<()>,
+        observation: PeerConsumerObservation<'_>,
+    ) -> afs_error::Result<()> {
+        // A compact reply is a complete ordinary operation, never a substitute
+        // for a full-object proof or a control frame in the disk pipeline.
+        if self.request.include_blake3_outboard
+            || self.verified_object.is_some()
+            || self.active.is_some()
+            || reply.data.is_empty()
+            || reply.data.len() > afs_protocol::node_data::DFS_COMPACT_RANGE_MAX_BYTES
+        {
+            return Err(dfs_protocol_error("unexpected compact Peer range reply"));
+        }
+        let index = usize::try_from(reply.operation_index)
+            .map_err(|_| dfs_protocol_error("compact Peer operation index overflow"))?;
+        let op = self
+            .request
+            .operations
+            .get(index)
+            .ok_or_else(|| dfs_protocol_error("unknown compact Peer read operation"))?;
+        if op.operation_index != reply.operation_index
+            || self.completed[index]
+            || op.length != reply.data.len() as u64
+        {
+            return Err(dfs_protocol_error("compact Peer operation/length mismatch"));
+        }
+        let start = usize::try_from(op.destination_offset)
+            .map_err(|_| dfs_protocol_error("compact Peer destination overflow"))?;
+        start
+            .checked_add(reply.data.len())
+            .filter(|end| *end <= output_length)
+            .ok_or_else(|| dfs_protocol_error("compact Peer reply exceeds destination"))?;
+        let digest = observation.measure(
+            ReadDiagnosticConsumerStage::RootBlake3,
+            reply.data.len() as u64,
+            || blake3::hash(&reply.data),
+        );
+        if let Some(metrics) = observation.metrics {
+            metrics.hash("peer_range_in_receive", reply.data.len() as u64);
+        }
+        if reply.range_checksum.as_slice() != digest.as_bytes() {
+            return Err(dfs_corrupt_error("compact Peer range checksum mismatch"));
+        }
+        write(start, &reply.data)?;
+        self.completed[index] = true;
         Ok(())
     }
 
@@ -6696,6 +7144,1174 @@ mod tests {
     type FetchFixtureObjects = std::collections::BTreeMap<String, (ChunkObject, Vec<u8>)>;
 
     #[cfg(feature = "dfs")]
+    struct SessionTestPeer;
+
+    #[cfg(feature = "dfs")]
+    impl crate::node::rpc::data::PeerAuthenticator for SessionTestPeer {
+        fn authenticate(
+            &self,
+            _metadata: &tonic::metadata::MetadataMap,
+            _remote_addr: Option<std::net::SocketAddr>,
+            _peer_cert_der: Option<&[u8]>,
+        ) -> afs_error::Result<String> {
+            Ok("reader".to_owned())
+        }
+    }
+
+    #[cfg(feature = "dfs")]
+    #[derive(Default)]
+    struct SessionTestAuthority {
+        calls: std::sync::atomic::AtomicUsize,
+        deny_on: std::sync::atomic::AtomicUsize,
+        delay_millis: std::sync::atomic::AtomicU64,
+        pause_on: std::sync::atomic::AtomicUsize,
+        released: std::sync::Mutex<bool>,
+        proceed: std::sync::Condvar,
+    }
+
+    #[cfg(feature = "dfs")]
+    impl crate::node::rpc::data::DfsReadAuthorizer for SessionTestAuthority {
+        fn authorize(&self, peer: &str, request: &DfsReadRangesRequest) -> afs_error::Result<()> {
+            assert_eq!(peer, "reader");
+            assert!(request.operations.iter().all(|operation| {
+                operation
+                    .grant
+                    .as_ref()
+                    .is_some_and(|grant| grant.caller_node_id == peer)
+            }));
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            if self.pause_on.load(std::sync::atomic::Ordering::SeqCst) == call {
+                let mut released = self.released.lock().unwrap();
+                while !*released {
+                    released = self.proceed.wait(released).unwrap();
+                }
+            }
+            std::thread::sleep(Duration::from_millis(
+                self.delay_millis.load(std::sync::atomic::Ordering::SeqCst),
+            ));
+            if self.deny_on.load(std::sync::atomic::Ordering::SeqCst) == call {
+                return Err(afs_error::Error::coded(
+                    afs_error::CLIENT_PROTOCOL_VIOLATION,
+                    "test authority revoked this request",
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    #[cfg(feature = "dfs")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cp09v2_repeated_compact_ranges_reuse_one_rpc() {
+        cp09v2_repeated_ranges(false).await;
+    }
+
+    #[cfg(feature = "dfs")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cp09v2_internal_trust_uses_real_business_caller() {
+        cp09v2_repeated_ranges(true).await;
+    }
+
+    #[cfg(feature = "dfs")]
+    async fn cp09v2_repeated_ranges(internal_trust: bool) {
+        use crate::node::{
+            chunk::{ChunkStore, LocalChunkStore, StagedChunk},
+            dfs_read::ChunkTransfer,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let local = Arc::new(LocalChunkStore::open(directory.path(), "server").unwrap());
+        let staged = StagedChunk::new(
+            crate::dfs::OperationId::new("session-ranges"),
+            (0..384 * 1024).map(|index| (index % 251) as u8).collect(),
+        );
+        local.put(staged.clone()).unwrap();
+        let authority = Arc::new(SessionTestAuthority::default());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let (service, sessions) = cp09v2_services(local, authority.clone(), internal_trust);
+        let (stop_server, server_done) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(
+            Server::builder()
+                .add_service(service)
+                .add_service(sessions)
+                .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
+                    let _ = server_done.await;
+                }),
+        );
+        let registry = afs_metrics::Registry::new();
+        let metrics = ReadWorkMetrics::register(&registry).unwrap();
+        let peers = Arc::new(
+            PeerConnectionPool::new(
+                afs_transport::GrpcConfig::default(),
+                afs_transport::TlsConfig::Disabled,
+                1,
+            )
+            .unwrap()
+            .with_read_work_metrics(metrics),
+        );
+        let transfer = GrpcChunkTransfer::new(peers, Duration::from_secs(5)).unwrap();
+        tokio::task::spawn_blocking(move || {
+            for offset in [0, 131072, 262144] {
+                let mut batch = disk_stream_batch(&staged.chunk, endpoint.clone());
+                batch.operations[0].op.chunk_offset = offset;
+                batch.operations[0].op.length = 131072;
+                let mut out = vec![0; 131072];
+                transfer.read_ranges(&batch, &mut out).unwrap();
+                assert_eq!(
+                    out,
+                    staged.bytes()[offset as usize..offset as usize + 131072]
+                );
+            }
+        })
+        .await
+        .unwrap();
+        let _ = stop_server.send(());
+        tokio::time::timeout(Duration::from_secs(3), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            authority.calls.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "session transport must preserve each explicit boundary-adapter decision"
+        );
+        let text = afs_metrics::encode_text(&registry).unwrap();
+        let calls: f64 = text
+            .lines()
+            .filter(|line| {
+                line.starts_with("afs_dfs_read_rpc_calls_total{method=\"peer_read_ranges\"}")
+                    || line
+                        .starts_with("afs_dfs_read_rpc_calls_total{method=\"peer_read_session\"}")
+            })
+            .map(|line| line.rsplit_once(' ').unwrap().1.parse::<f64>().unwrap())
+            .sum();
+        eprintln!("cp09v2 three complete128KiB reads: actual_rpc_calls={calls}");
+        assert_eq!(
+            calls, 1.0,
+            "three reads need one RPC stream, not three independent RPCs"
+        );
+    }
+
+    #[cfg(feature = "dfs")]
+    fn cp09v2_services(
+        local: Arc<crate::node::chunk::LocalChunkStore>,
+        authority: Arc<SessionTestAuthority>,
+        internal_trust: bool,
+    ) -> (
+        afs_protocol::node_data::dfs_chunks_server::DfsChunksServer<
+            crate::node::rpc::data::DfsChunksService,
+        >,
+        crate::node::rpc::data::DfsReadSessionService,
+    ) {
+        let authenticator: Arc<dyn crate::node::rpc::data::PeerAuthenticator> = if internal_trust {
+            Arc::new(crate::node::rpc::data::InternalPeerAuthenticator)
+        } else {
+            Arc::new(SessionTestPeer)
+        };
+        crate::node::rpc::data::make_dfs_chunk_services_with_transport(
+            Some(local),
+            authenticator,
+            authority,
+            Arc::new(crate::node::rpc::data::DenyDfsReplicaAuthorizer),
+            None,
+            Duration::from_secs(30),
+            crate::node::rpc::data::DfsChunkTransportResources {
+                rdma_sessions: crate::node::rpc::control::RdmaSessionRegistry::new(None),
+                payload_metrics: None,
+            },
+        )
+    }
+
+    #[cfg(feature = "dfs")]
+    struct SessionRpcCase {
+        _temp: tempfile::TempDir,
+        local: Arc<crate::node::chunk::LocalChunkStore>,
+        staged: crate::node::chunk::StagedChunk,
+        authority: Arc<SessionTestAuthority>,
+        pool: Arc<PeerConnectionPool>,
+        endpoint: String,
+        registry: afs_metrics::Registry,
+        server: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+    }
+
+    #[cfg(feature = "dfs")]
+    async fn cp09_session_case() -> SessionRpcCase {
+        use crate::node::chunk::{ChunkStore, LocalChunkStore, StagedChunk};
+        let directory = tempfile::tempdir().unwrap();
+        let local = Arc::new(LocalChunkStore::open(directory.path(), "server").unwrap());
+        let staged = StagedChunk::new(
+            crate::dfs::OperationId::new("session-safety"),
+            vec![31; 384 * 1024],
+        );
+        local.put(staged.clone()).unwrap();
+        let authority = Arc::new(SessionTestAuthority::default());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let (service, sessions) = cp09v2_services(local.clone(), authority.clone(), false);
+        let server = tokio::spawn(
+            Server::builder()
+                .add_service(service)
+                .add_service(sessions)
+                .serve_with_incoming(TcpListenerStream::new(listener)),
+        );
+        let registry = afs_metrics::Registry::new();
+        let metrics = ReadWorkMetrics::register(&registry).unwrap();
+        let pool = Arc::new(
+            PeerConnectionPool::new(
+                afs_transport::GrpcConfig::default(),
+                afs_transport::TlsConfig::Disabled,
+                1,
+            )
+            .unwrap()
+            .with_read_work_metrics(metrics),
+        );
+        SessionRpcCase {
+            _temp: directory,
+            local,
+            staged,
+            authority,
+            pool,
+            endpoint,
+            registry,
+            server,
+        }
+    }
+
+    #[cfg(feature = "dfs")]
+    async fn cp09_read(
+        case: &SessionRpcCase,
+        timeout: Duration,
+        expiry_millis: Option<u64>,
+    ) -> afs_error::Result<Vec<u8>> {
+        use crate::node::dfs_read::ChunkTransfer;
+        let transfer = GrpcChunkTransfer::new(case.pool.clone(), timeout).unwrap();
+        let mut batch = disk_stream_batch(&case.staged.chunk, case.endpoint.clone());
+        batch.operations[0].op.length = 65536;
+        if let Some(lifetime) = expiry_millis {
+            batch.operations[0].source.read_grant.expires_at_unix_ms = u64::try_from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis(),
+            )
+            .unwrap()
+                + lifetime;
+        }
+        tokio::task::spawn_blocking(move || {
+            let mut out = vec![0; 65536];
+            transfer.read_ranges(&batch, &mut out)?;
+            Ok(out)
+        })
+        .await
+        .unwrap()
+    }
+
+    #[cfg(feature = "dfs")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cp09_reuse_rechecks_authority_expiry_stop_and_epoch_without_replay() {
+        use std::sync::atomic::Ordering::SeqCst;
+        for mode in 0..4 {
+            let case = cp09_session_case().await;
+            assert_eq!(
+                cp09_read(&case, Duration::from_secs(5), None)
+                    .await
+                    .unwrap(),
+                vec![31; 65536]
+            );
+            match mode {
+                0 => case.authority.deny_on.store(2, SeqCst),
+                1 => case.authority.delay_millis.store(120, SeqCst),
+                2 => case.local.close_peer_serve_admission(),
+                3 => {
+                    case.pool
+                        .channel("server", 2, &case.endpoint)
+                        .await
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                cp09_read(&case, Duration::from_secs(5), (mode == 1).then_some(50))
+                    .await
+                    .is_err(),
+                "mode {mode}"
+            );
+            let calls = case.authority.calls.load(SeqCst);
+            if mode <= 1 {
+                assert_eq!(
+                    calls, 2,
+                    "denied/expired business must not replay on legacy RPC"
+                );
+                case.authority.delay_millis.store(0, SeqCst);
+                assert!(cp09_read(&case, Duration::from_secs(5), None).await.is_ok());
+                assert_eq!(case.authority.calls.load(SeqCst), 3);
+            }
+            if mode == 3 {
+                assert_eq!(calls, 1, "known old epoch must not reach server");
+            }
+            case.server.abort();
+            let _ = case.server.await;
+        }
+    }
+
+    #[cfg(feature = "dfs")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cp09_original_total_deadline_retires_session_before_reconnect() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let case = cp09_session_case().await;
+        cp09_read(&case, Duration::from_secs(5), None)
+            .await
+            .unwrap();
+        case.authority.delay_millis.store(200, SeqCst);
+        let start = std::time::Instant::now();
+        assert!(
+            cp09_read(&case, Duration::from_millis(30), None)
+                .await
+                .is_err()
+        );
+        assert!(start.elapsed() < Duration::from_secs(1));
+        assert!(
+            case.pool
+                .range_sessions
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|slot| matches!(slot, RangeSessionSlot::Vacant))
+        );
+        // The cancelled blocking authorizer retains its slot/metadata until
+        // real exit; allow that original owner to drain before a fresh read.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(case.authority.calls.load(SeqCst), 2);
+        case.authority.delay_millis.store(0, SeqCst);
+        cp09_read(&case, Duration::from_secs(5), None)
+            .await
+            .unwrap();
+        assert_eq!(case.authority.calls.load(SeqCst), 3);
+        case.server.abort();
+        let _ = case.server.await;
+    }
+
+    #[cfg(feature = "dfs")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cp09_full_transport_slots_use_legacy_before_business_send() {
+        let case = cp09_session_case().await;
+        let first = case
+            .pool
+            .acquire_stream_work("server", 1, &case.endpoint)
+            .await
+            .unwrap();
+        let second = case
+            .pool
+            .acquire_stream_work("server", 1, &case.endpoint)
+            .await
+            .unwrap();
+        cp09_read(&case, Duration::from_secs(5), None)
+            .await
+            .unwrap();
+        let text = afs_metrics::encode_text(&case.registry).unwrap();
+        assert!(text.contains("afs_dfs_read_rpc_calls_total{method=\"peer_read_ranges\"} 1\n"));
+        assert!(text.contains("afs_dfs_read_rpc_calls_total{method=\"peer_read_session\"} 0\n"));
+        drop((first, second));
+        cp09_read(&case, Duration::from_secs(5), None)
+            .await
+            .unwrap();
+        case.server.abort();
+        let _ = case.server.await;
+    }
+
+    #[cfg(feature = "dfs")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cp09_session_outlives_channel_header_timeout_but_idle_checkout_retires_it() {
+        let mut case = cp09_session_case().await;
+        let metrics = case.pool.read_work_metrics.clone().unwrap();
+        case.pool = Arc::new(
+            PeerConnectionPool::new(
+                afs_transport::GrpcConfig {
+                    // The first RPC includes real TCP/HTTP2 admission. The
+                    // old 30ms test expired there, before testing reuse.
+                    request_timeout: Duration::from_millis(500),
+                    ..Default::default()
+                },
+                afs_transport::TlsConfig::Disabled,
+                1,
+            )
+            .unwrap()
+            .with_read_work_metrics(metrics),
+        );
+        cp09_read(&case, Duration::from_secs(5), None)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(650)).await;
+        cp09_read(&case, Duration::from_secs(5), None)
+            .await
+            .unwrap();
+        let text = afs_metrics::encode_text(&case.registry).unwrap();
+        assert!(text.contains("afs_dfs_read_rpc_calls_total{method=\"peer_read_session\"} 1\n"));
+        for slot in case.pool.range_sessions.lock().unwrap().iter_mut() {
+            if let RangeSessionSlot::Idle(session) = slot {
+                session.touched = std::time::Instant::now() - Duration::from_secs(2);
+            }
+        }
+        cp09_read(&case, Duration::from_secs(5), None)
+            .await
+            .unwrap();
+        let text = afs_metrics::encode_text(&case.registry).unwrap();
+        assert!(text.contains("afs_dfs_read_rpc_calls_total{method=\"peer_read_session\"} 2\n"));
+        case.server.abort();
+        let _ = case.server.await;
+    }
+
+    #[cfg(feature = "dfs")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cp09_idle_session_limit_does_not_take_original_read_execution_slots() {
+        let case = cp09_session_case().await;
+        let channel = Endpoint::from_shared(case.endpoint.clone())
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let mut client = DfsReadSessionsClient::new(channel.clone());
+        let mut idle = Vec::new();
+        for _ in 0..8 {
+            let (sender, receiver) = tokio::sync::mpsc::channel(1);
+            let response = client
+                .read_session(Request::new(tokio_stream::wrappers::ReceiverStream::new(
+                    receiver,
+                )))
+                .await
+                .unwrap();
+            idle.push((sender, response));
+        }
+        let (_sender, receiver) = tokio::sync::mpsc::channel(1);
+        let error = client
+            .read_session(Request::new(tokio_stream::wrappers::ReceiverStream::new(
+                receiver,
+            )))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+        assert_eq!(
+            case.authority
+                .calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        let (_, mut request, _) = verified_object_frames(case.staged.bytes());
+        let batch = disk_stream_batch(&case.staged.chunk, case.endpoint.clone());
+        request.file_version_id = batch.file_version_id.0.clone();
+        request.layout_root_id = batch.layout_root_id.0.clone();
+        request.operations[0].grant =
+            Some(wire_dfs_read_grant(&batch.operations[0].source.read_grant));
+        let mut legacy = DfsChunksClient::new(channel);
+        let mut stream = legacy
+            .read_ranges(Request::new(request))
+            .await
+            .unwrap()
+            .into_inner();
+        let mut read = 0;
+        while let Some(frame) = stream.message().await.unwrap() {
+            if let Some(dfs_read_ranges_frame::Body::Data(bytes)) = frame.body {
+                read += bytes.len();
+            }
+        }
+        assert_eq!(read, case.staged.bytes().len());
+        assert_eq!(
+            cp09_read(&case, Duration::from_secs(5), None)
+                .await
+                .unwrap(),
+            vec![31; 65536]
+        );
+        drop((idle, stream, client));
+        let local = case.local.clone();
+        tokio::task::spawn_blocking(move || local.shutdown_peer_serve())
+            .await
+            .unwrap()
+            .unwrap();
+        case.server.abort();
+        let _ = case.server.await;
+    }
+
+    #[cfg(feature = "dfs")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cp09_two_concurrent_reads_share_transport_but_not_request_authority() {
+        let case = cp09_session_case().await;
+        cp09_read(&case, Duration::from_secs(5), None)
+            .await
+            .unwrap();
+        // Hold the first read inside its authorizer, after client transport
+        // checkout locks have gone. Ungated simultaneous starts may correctly
+        // use legacy on a contended try-lock, so they cannot assert two slots.
+        case.authority
+            .pause_on
+            .store(2, std::sync::atomic::Ordering::SeqCst);
+        let second = async {
+            let until = tokio::time::Instant::now() + Duration::from_secs(5);
+            while case
+                .authority
+                .calls
+                .load(std::sync::atomic::Ordering::SeqCst)
+                < 2
+            {
+                assert!(tokio::time::Instant::now() < until);
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            let result = cp09_read(&case, Duration::from_secs(5), None).await;
+            *case.authority.released.lock().unwrap() = true;
+            case.authority.proceed.notify_all();
+            result
+        };
+        let (one, two) = tokio::join!(cp09_read(&case, Duration::from_secs(5), None), second);
+        assert_eq!(one.unwrap(), vec![31; 65536]);
+        assert_eq!(two.unwrap(), vec![31; 65536]);
+        assert_eq!(
+            case.authority
+                .calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            3
+        );
+        assert_eq!(
+            case.pool
+                .range_sessions
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|slot| matches!(slot, RangeSessionSlot::Idle(_)))
+                .count(),
+            2
+        );
+        let text = afs_metrics::encode_text(&case.registry).unwrap();
+        assert!(text.contains("afs_dfs_read_rpc_calls_total{method=\"peer_read_session\"} 2\n"));
+        assert!(text.contains("afs_dfs_read_rpc_calls_total{method=\"peer_read_ranges\"} 0\n"));
+        case.server.abort();
+        let _ = case.server.await;
+    }
+
+    #[cfg(feature = "dfs")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cp09_verified_objects_keep_original_transport_root_and_proof_budget() {
+        use crate::node::dfs_read::ChunkTransfer;
+        let case = cp09_session_case().await;
+        let transfer = GrpcChunkTransfer::new(case.pool.clone(), Duration::from_secs(5)).unwrap();
+        let batch = disk_stream_batch(&case.staged.chunk, case.endpoint.clone());
+        let chunk = case.staged.chunk.clone();
+        let budget = OutboardBudget::new(1024 * 1024);
+        tokio::task::spawn_blocking(move || {
+            for _ in 0..2 {
+                let mut out = vec![0; chunk.length as usize];
+                let proof = transfer
+                    .read_verified_object(&batch, &chunk, &mut out, budget.clone())
+                    .unwrap();
+                assert_eq!(proof.bytes(), vec![31; chunk.length as usize]);
+                drop(proof);
+                assert_eq!(budget.used(), 0);
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            case.authority
+                .calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+        let text = afs_metrics::encode_text(&case.registry).unwrap();
+        assert!(text.contains("afs_dfs_read_rpc_calls_total{method=\"peer_read_session\"} 0\n"));
+        assert!(text.contains("afs_dfs_read_rpc_calls_total{method=\"peer_read_ranges\"} 2\n"));
+        case.server.abort();
+        let _ = case.server.await;
+    }
+
+    #[cfg(feature = "dfs")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cp09_backpressured_cancel_drains_real_payload_and_control_owners() {
+        let case = cp09_session_case().await;
+        let channel = Endpoint::from_shared(case.endpoint.clone())
+            .unwrap()
+            .initial_stream_window_size(1024)
+            .initial_connection_window_size(1024)
+            .connect()
+            .await
+            .unwrap();
+        let mut client = DfsReadSessionsClient::new(channel.clone());
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        let response = client
+            .read_session(Request::new(tokio_stream::wrappers::ReceiverStream::new(
+                receiver,
+            )))
+            .await
+            .unwrap();
+        let (_, mut request, _) = verified_object_frames(case.staged.bytes());
+        request.include_blake3_outboard = false;
+        // Use a real test capability, not the decoder-only fixture caller.
+        let batch = disk_stream_batch(&case.staged.chunk, case.endpoint.clone());
+        request.file_version_id = batch.file_version_id.0.clone();
+        request.layout_root_id = batch.layout_root_id.0.clone();
+        request.operations[0].grant =
+            Some(wire_dfs_read_grant(&batch.operations[0].source.read_grant));
+        sender
+            .send(DfsReadSessionRequest {
+                request: Some(request),
+                timeout_millis: 80,
+            })
+            .await
+            .unwrap();
+        let wait_end = tokio::time::Instant::now() + Duration::from_secs(1);
+        while case
+            .authority
+            .calls
+            .load(std::sync::atomic::Ordering::SeqCst)
+            == 0
+        {
+            assert!(tokio::time::Instant::now() < wait_end);
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        // Do not read the response. It has only a 1KiB HTTP2 window while the
+        // original 4-frame channel and shared body owners backpressure.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        drop((response, sender, client));
+        let local = case.local.clone();
+        tokio::task::spawn_blocking(move || local.shutdown_peer_serve())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            case.authority
+                .calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        case.server.abort();
+        let _ = case.server.await;
+    }
+
+    #[cfg(feature = "dfs")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cp09_idle_session_cannot_pin_an_extra_connection_across_lru_or_peer_switch() {
+        let case = cp09_session_case().await;
+        cp09_read(&case, Duration::from_secs(5), None)
+            .await
+            .unwrap();
+        let original = case
+            .pool
+            .stream_work
+            .state
+            .lock()
+            .unwrap()
+            .session
+            .clone()
+            .unwrap();
+        // Capacity one: evict the LRU, then revisit. Reuse must still use the
+        // exact pinned transport, not open a second HTTP2 receive window.
+        case.pool
+            .channel("other", 1, "http://127.0.0.1:9")
+            .await
+            .unwrap();
+        cp09_read(&case, Duration::from_secs(5), None)
+            .await
+            .unwrap();
+        let same = case
+            .pool
+            .stream_work
+            .state
+            .lock()
+            .unwrap()
+            .session
+            .clone()
+            .unwrap();
+        assert!(Arc::ptr_eq(&original, &same));
+        drop((original, same));
+        let next = case
+            .pool
+            .acquire_stream_work("other", 1, "http://127.0.0.1:9")
+            .await
+            .unwrap();
+        assert!(
+            case.pool
+                .range_sessions
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|slot| matches!(slot, RangeSessionSlot::Vacant))
+        );
+        drop(next);
+        let local = case.local.clone();
+        tokio::task::spawn_blocking(move || local.shutdown_peer_serve())
+            .await
+            .unwrap()
+            .unwrap();
+        case.server.abort();
+        let _ = case.server.await;
+    }
+
+    #[cfg(feature = "dfs")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cp09_idle_session_releases_original_control_on_node_stop() {
+        let case = cp09_session_case().await;
+        cp09_read(&case, Duration::from_secs(5), None)
+            .await
+            .unwrap();
+        let local = case.local.clone();
+        let started = std::time::Instant::now();
+        tokio::task::spawn_blocking(move || local.shutdown_peer_serve())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(
+            cp09_read(&case, Duration::from_secs(5), None)
+                .await
+                .is_err()
+        );
+        case.server.abort();
+        let _ = case.server.await;
+    }
+
+    #[cfg(feature = "dfs")]
+    #[test]
+    fn cp09_metadata_accounting_checks_capacity_and_large_proof_fallback() {
+        use prost::Message;
+        let (_, mut request, _) = verified_object_frames(b"tiny");
+        request.include_blake3_outboard = false;
+        let initial = super::super::data::read_session_request_bytes(&request).unwrap();
+        assert!(initial < 32 * 1024);
+        request.read_id.reserve(64 * 1024);
+        assert!(request.encoded_len() < 8000);
+        assert!(super::super::data::read_session_request_bytes(&request).is_none());
+        let (_, mut request, _) = verified_object_frames(b"tiny");
+        request.include_blake3_outboard = true;
+        assert!(super::super::data::read_session_request_bytes(&request).is_none());
+        request.operations[0].length = 4 * 1024 * 1024 + 1;
+        assert!(super::super::data::read_session_request_bytes(&request).is_none());
+    }
+
+    #[cfg(feature = "dfs")]
+    #[test]
+    fn cp09_two_slots_cancel_without_retaining_payload_or_blocking_fallback() {
+        let slots = Arc::new(std::sync::Mutex::new(std::array::from_fn(|_| {
+            RangeSessionSlot::Vacant
+        })));
+        let key = ("peer".to_owned(), 1, "http://localhost:9".to_owned(), false);
+        let first = RangeSessionLease::acquire(&slots, &key).unwrap().unwrap();
+        let second = RangeSessionLease::acquire(&slots, &key).unwrap().unwrap();
+        assert!(RangeSessionLease::acquire(&slots, &key).unwrap().is_none());
+        drop(first);
+        let replacement = RangeSessionLease::acquire(&slots, &key).unwrap().unwrap();
+        drop((second, replacement));
+        assert!(
+            slots
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|slot| matches!(slot, RangeSessionSlot::Vacant))
+        );
+        assert!(std::mem::size_of::<RangeReadSession>() < 4096);
+        assert!(std::mem::size_of::<RangeSessionLease>() < 4096);
+    }
+
+    #[cfg(feature = "dfs")]
+    #[tokio::test]
+    async fn cp09_end_identity_completion_corruption_and_late_errors_remain_fatal() {
+        use afs_protocol::node_data::{DfsReadRangesFrame, DfsReadSessionEnd};
+        let body: Vec<u8> = (0..96 * 1024 + 17)
+            .map(|index| (index % 251) as u8)
+            .collect();
+        for mode in 0..8 {
+            let (chunk, request, mut frames) = verified_object_frames(&body);
+            if mode == 5 {
+                // A self-reported completion is not a trusted object root.
+                for frame in &mut frames {
+                    if let Some(dfs_read_ranges_frame::Body::Data(data)) = &mut frame.body {
+                        let mut bad = data.to_vec();
+                        bad[0] ^= 1;
+                        *data = bad.into();
+                        break;
+                    }
+                }
+            }
+            if mode == 6 {
+                frames.pop();
+            }
+            let mut wire: Vec<Result<DfsReadSessionFrame, Status>> = frames
+                .into_iter()
+                .map(|frame| {
+                    Ok(DfsReadSessionFrame {
+                        body: Some(dfs_read_session_frame::Body::Frame(frame)),
+                    })
+                })
+                .collect();
+            let mut end = DfsReadSessionEnd {
+                read_id: request.read_id.clone(),
+                attempt_id: request.attempt_id.clone(),
+            };
+            if mode == 2 {
+                end.attempt_id.push_str("-other");
+            }
+            if mode == 3 {
+                end.read_id.push_str("-other");
+            }
+            if mode == 4 {
+                wire.push(Err(Status::permission_denied("late revocation before End")));
+            }
+            if mode != 1 {
+                wire.push(Ok(DfsReadSessionFrame {
+                    body: Some(dfs_read_session_frame::Body::End(end)),
+                }));
+            }
+            if mode == 7 {
+                wire.insert(
+                    0,
+                    Ok(DfsReadSessionFrame {
+                        body: Some(dfs_read_session_frame::Body::Frame(DfsReadRangesFrame {
+                            body: None,
+                        })),
+                    }),
+                );
+            }
+            let mut out = vec![0; body.len()];
+            let mut stream = tokio_stream::iter(wire);
+            let result = consume_peer_session_stream(
+                &request,
+                Some(&chunk),
+                &mut out,
+                &mut stream,
+                None,
+                Some(OutboardBudget::new(0)),
+            )
+            .await;
+            if mode == 0 {
+                assert_eq!(result.unwrap().unwrap().bytes(), body);
+            } else {
+                assert!(result.is_err(), "invalid terminal/root mode {mode}");
+            }
+        }
+    }
+
+    #[cfg(feature = "dfs")]
+    #[tokio::test]
+    async fn cp09v2_last_sink_owner_releases_blocks_while_range_is_active() {
+        let pool = PeerConnectionPool::new(
+            afs_transport::GrpcConfig::default(),
+            afs_transport::TlsConfig::Disabled,
+            1,
+        )
+        .unwrap();
+        let range = pool
+            .acquire_transport_work("server", 1, "http://127.0.0.1:9", false, false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(range.session.blocks.lock().unwrap().is_empty());
+        let sink = pool
+            .acquire_stream_work("server", 1, "http://127.0.0.1:9")
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&range.session, &sink.session));
+        assert_eq!(range.session.blocks.lock().unwrap().len(), 2);
+        let held_block = sink.block().await.unwrap();
+        drop(sink);
+        assert_eq!(pool.stream_work.state.lock().unwrap().block_users, 1);
+        drop(held_block);
+        assert!(range.session.blocks.lock().unwrap().is_empty());
+        {
+            let state = pool.stream_work.state.lock().unwrap();
+            assert_eq!(state.active, 1);
+            assert_eq!(state.block_users, 0);
+            assert!(!state.blocks_ready);
+        }
+        let replacement = pool
+            .acquire_stream_work("server", 1, "http://127.0.0.1:9")
+            .await
+            .unwrap();
+        assert_eq!(replacement.session.blocks.lock().unwrap().len(), 2);
+        drop((replacement, range));
+        assert!(pool.stream_work.state.lock().unwrap().session.is_none());
+    }
+
+    #[cfg(feature = "dfs")]
+    #[test]
+    fn cp09v2_compact_wire_and_mixed_transport_bounds() {
+        use prost::Message;
+        let reply = afs_protocol::node_data::DfsReadRangeReply {
+            operation_index: u32::MAX,
+            data: vec![73; 128 * 1024].into(),
+            range_checksum: vec![19; 32],
+        };
+        let frame = DfsReadSessionFrame {
+            body: Some(dfs_read_session_frame::Body::Frame(
+                afs_protocol::node_data::DfsReadRangesFrame {
+                    body: Some(dfs_read_ranges_frame::Body::Compact(reply)),
+                },
+            )),
+        };
+        let wire = frame.encode_to_vec();
+        assert!(wire.len() <= 128 * 1024 + 128);
+        let decoded = DfsReadSessionFrame::decode(wire.as_slice()).unwrap();
+        assert_eq!(decoded, frame);
+        for sessions in 0..=2 {
+            let sinks = 2 - sessions;
+            let blocks = if sinks == 0 {
+                0
+            } else {
+                2 * STREAM_FRAME_BACKING_BYTES
+            };
+            let budget = 2 * 1024 * 1024
+                + STREAM_FRAME_BACKING_BYTES
+                + 256 * 1024
+                + sessions * 768 * 1024
+                + sinks * STREAM_MESSAGE_BYTES
+                + blocks;
+            assert!(
+                budget <= 4 * 1024 * 1024,
+                "sessions={sessions}, budget={budget}"
+            );
+        }
+    }
+
+    #[cfg(feature = "dfs")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn cp09v2_codec_charge_outlives_response_until_incoming_is_dropped() {
+        use crate::node::chunk::{LocalChunkStore, PEER_READ_PAYLOAD_LIMIT};
+        use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+
+        struct IncomingProbe {
+            local: Arc<LocalChunkStore>,
+            polled: Arc<AtomicBool>,
+            dropped: Arc<AtomicBool>,
+            charged_at_drop: Arc<AtomicBool>,
+        }
+        impl http_body::Body for IncomingProbe {
+            type Data = prost::bytes::Bytes;
+            type Error = std::convert::Infallible;
+            fn poll_frame(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>>
+            {
+                self.polled.store(true, SeqCst);
+                std::task::Poll::Pending
+            }
+        }
+        impl Drop for IncomingProbe {
+            fn drop(&mut self) {
+                let whole = self
+                    .local
+                    .reserve_peer_read_payload(PEER_READ_PAYLOAD_LIMIT);
+                self.charged_at_drop.store(whole.is_err(), SeqCst);
+                drop(whole);
+                self.dropped.store(true, SeqCst);
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let local = Arc::new(LocalChunkStore::open(directory.path(), "server").unwrap());
+        let authority = Arc::new(SessionTestAuthority::default());
+        let (_, mut sessions) = cp09v2_services(local.clone(), authority.clone(), false);
+        let polled = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let charged_at_drop = Arc::new(AtomicBool::new(false));
+        let request = tonic::codegen::http::Request::builder()
+            .method("POST")
+            .uri("/afs.node.data.v1.DfsReadSessions/ReadSession")
+            .header("content-type", "application/grpc")
+            .body(IncomingProbe {
+                local: local.clone(),
+                polled: polled.clone(),
+                dropped: dropped.clone(),
+                charged_at_drop: charged_at_drop.clone(),
+            })
+            .unwrap();
+        let response = tonic::codegen::Service::call(&mut sessions, request)
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        assert!(response.headers().get("grpc-status").is_none());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !polled.load(SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!dropped.load(SeqCst));
+        // A single-thread runtime makes the order deterministic: response
+        // destruction finishes before the incoming owner can run again.
+        drop(response);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !dropped.load(SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(whole) = local.reserve_peer_read_payload(PEER_READ_PAYLOAD_LIMIT) {
+                    drop(whole);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(authority.calls.load(SeqCst), 0);
+        assert!(
+            charged_at_drop.load(SeqCst),
+            "codec charge released before the incoming body owner"
+        );
+    }
+
+    #[cfg(feature = "dfs")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cp09v2_codec_pool_full_falls_back_before_business_send() {
+        use crate::node::chunk::PEER_READ_PAYLOAD_LIMIT;
+        let case = cp09_session_case().await;
+        let occupied = case
+            .local
+            .reserve_peer_read_payload(PEER_READ_PAYLOAD_LIMIT - 511 * 1024)
+            .unwrap();
+        assert_eq!(
+            cp09_read(&case, Duration::from_secs(5), None)
+                .await
+                .unwrap(),
+            vec![31; 65536]
+        );
+        let text = afs_metrics::encode_text(&case.registry).unwrap();
+        assert!(text.contains("afs_dfs_read_rpc_calls_total{method=\"peer_read_session\"} 1\n"));
+        assert!(text.contains("afs_dfs_read_rpc_calls_total{method=\"peer_read_ranges\"} 1\n"));
+        assert_eq!(
+            case.authority
+                .calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        drop(occupied);
+        cp09_read(&case, Duration::from_secs(5), None)
+            .await
+            .unwrap();
+        let text = afs_metrics::encode_text(&case.registry).unwrap();
+        assert!(text.contains("afs_dfs_read_rpc_calls_total{method=\"peer_read_session\"} 2\n"));
+        assert!(text.contains("afs_dfs_read_rpc_calls_total{method=\"peer_read_ranges\"} 1\n"));
+        assert_eq!(
+            case.authority
+                .calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+        case.server.abort();
+        let _ = case.server.await;
+    }
+
+    #[cfg(feature = "dfs")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cp09v2_idle_server_codec_shares_original_payload_budget() {
+        use crate::node::chunk::{LocalChunkStore, PEER_READ_PAYLOAD_LIMIT};
+        let directory = tempfile::tempdir().unwrap();
+        let local = Arc::new(LocalChunkStore::open(directory.path(), "server").unwrap());
+        let authority = Arc::new(SessionTestAuthority::default());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let (chunks, sessions) = cp09v2_services(local.clone(), authority.clone(), false);
+        let (shutdown, stopped) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(
+            Server::builder()
+                .add_service(chunks)
+                .add_service(sessions)
+                .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
+                    let _ = stopped.await;
+                }),
+        );
+        let channel = Endpoint::from_shared(endpoint)
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let mut client = DfsReadSessionsClient::new(channel);
+        let mut idle = Vec::new();
+        for _ in 0..2 {
+            let (sender, receiver) = tokio::sync::mpsc::channel(1);
+            let response = client
+                .read_session(Request::new(tokio_stream::wrappers::ReceiverStream::new(
+                    receiver,
+                )))
+                .await
+                .unwrap();
+            idle.push((sender, response));
+        }
+        let remaining = local
+            .reserve_peer_read_payload(PEER_READ_PAYLOAD_LIMIT - 2 * 512 * 1024)
+            .unwrap();
+        // No business read or object cache exists: the two live HTTP response
+        // bodies must account their persistent codecs in the original pool.
+        let extra = local.reserve_peer_read_payload(1);
+        let codec_was_charged = extra.is_err();
+        drop((extra, remaining, idle, client));
+        shutdown.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(authority.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let whole = local
+            .reserve_peer_read_payload(PEER_READ_PAYLOAD_LIMIT)
+            .unwrap();
+        drop(whole);
+        assert!(
+            codec_was_charged,
+            "two idle server codecs were outside the original payload budget"
+        );
+    }
+
+    #[cfg(feature = "dfs")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cp09v2_generated_request_limit_rejects_before_business() {
+        let case = cp09_session_case().await;
+        let channel = Endpoint::from_shared(case.endpoint.clone())
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let mut client = DfsReadSessionsClient::new(channel);
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        let mut stream = client
+            .read_session(Request::new(tokio_stream::wrappers::ReceiverStream::new(
+                receiver,
+            )))
+            .await
+            .unwrap()
+            .into_inner();
+        let (_, mut request, _) = verified_object_frames(case.staged.bytes());
+        request.read_id = "r".repeat(9000);
+        sender
+            .send(DfsReadSessionRequest {
+                request: Some(request),
+                timeout_millis: 1000,
+            })
+            .await
+            .unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(3), stream.message())
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::OutOfRange);
+        assert!(error.message().contains("8192"));
+        assert_eq!(
+            case.authority
+                .calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        drop((sender, stream, client));
+        let local = case.local.clone();
+        tokio::task::spawn_blocking(move || local.shutdown_peer_serve())
+            .await
+            .unwrap()
+            .unwrap();
+        case.server.abort();
+        let _ = case.server.await;
+    }
+
+    #[cfg(feature = "dfs")]
     #[derive(Clone)]
     struct DiskStreamFixture {
         chunk: ChunkObject,
@@ -6824,6 +8440,17 @@ mod tests {
         ) -> Result<Response<Self::ReadRangesStream>, Status> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let request = request.into_inner();
+            if self.mode == 17 {
+                assert!(!request.include_blake3_outboard);
+                assert_eq!(request.operations.len(), 1);
+                assert_eq!(request.operations[0].length as usize, self.body.len());
+                return Ok(Response::new(Box::pin(tokio_stream::iter([Ok(
+                    compact_range_frame(
+                        request.operations[0].operation_index,
+                        self.body.as_ref().clone(),
+                    ),
+                )]))));
+            }
             if let Some(objects) = &self.fetch_objects {
                 if let Some((target, gate)) = &self.fetch_gate
                     && request.operations.iter().any(|operation| {
@@ -8888,6 +10515,268 @@ mod tests {
     }
 
     #[cfg(feature = "dfs")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cp05v2_actual_compact_rpc_reduces_http2_data_frames() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut observations = Vec::new();
+        for production in [false, true] {
+            let payload = vec![37; 128 * 1024];
+            let chunk = crate::node::chunk::StagedChunk::new(
+                crate::dfs::OperationId::new("cp05v2-frames"),
+                payload.clone(),
+            )
+            .chunk;
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let server_address = listener.local_addr().unwrap();
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let fixture = DiskStreamFixture {
+                chunk,
+                body: Arc::new(payload.clone()),
+                mode: 17,
+                calls: calls.clone(),
+                fetch_objects: None,
+                fetch_gate: None,
+            };
+            let (stop_server, server_done) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(
+                Server::builder()
+                    .add_service(
+                        afs_protocol::node_data::dfs_chunks_server::DfsChunksServer::new(fixture),
+                    )
+                    .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
+                        let _ = server_done.await;
+                    }),
+            );
+            let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}", proxy_listener.local_addr().unwrap());
+            let data_frames = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let frames = data_frames.clone();
+            let (stop_proxy, proxy_done) = tokio::sync::oneshot::channel();
+            let proxy = tokio::spawn(async move {
+                let (client, _) = proxy_listener.accept().await.unwrap();
+                let upstream = tokio::net::TcpStream::connect(server_address)
+                    .await
+                    .unwrap();
+                let (mut client_read, mut client_write) = client.into_split();
+                let (mut upstream_read, mut upstream_write) = upstream.into_split();
+                let responses = async {
+                    loop {
+                        let mut header = [0; 9];
+                        if let Err(error) = upstream_read.read_exact(&mut header).await {
+                            assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+                            break;
+                        }
+                        let length = (usize::from(header[0]) << 16)
+                            | (usize::from(header[1]) << 8)
+                            | usize::from(header[2]);
+                        assert!(length <= 2 * 1024 * 1024);
+                        let mut body = vec![0; length];
+                        upstream_read.read_exact(&mut body).await.unwrap();
+                        let stream_id =
+                            u32::from_be_bytes([header[5] & 0x7f, header[6], header[7], header[8]]);
+                        if header[3] == 0 && stream_id != 0 && length != 0 {
+                            frames.lock().unwrap().push(length);
+                        }
+                        client_write.write_all(&header).await.unwrap();
+                        client_write.write_all(&body).await.unwrap();
+                    }
+                };
+                tokio::select! {
+                    result = tokio::io::copy(&mut client_read, &mut upstream_write) => { result.unwrap(); }
+                    () = responses => {}
+                    _ = proxy_done => {}
+                }
+            });
+            let config = afs_transport::GrpcConfig::default();
+            assert_eq!(config.initial_connection_window_size, 2 * 1024 * 1024);
+            assert_eq!(config.initial_stream_window_size, 2 * 1024 * 1024);
+            let pool =
+                PeerConnectionPool::new(config.clone(), afs_transport::TlsConfig::Disabled, 1)
+                    .unwrap();
+            let channel = if production {
+                pool.channel("node-a", 1, &endpoint).await.unwrap()
+            } else {
+                config
+                    .configure_client(Endpoint::from_shared(endpoint).unwrap())
+                    .max_frame_size(16 * 1024)
+                    .connect_lazy()
+            };
+            let mut client =
+                afs_protocol::node_data::dfs_chunks_client::DfsChunksClient::new(channel);
+            let mut request = range_request();
+            request.operations.truncate(1);
+            request.operations[0].length = payload.len() as u64;
+            let stream = client
+                .read_ranges(request.clone())
+                .await
+                .unwrap()
+                .into_inner();
+            let mut output = vec![0; payload.len()];
+            consume_peer_read_stream(&request, None, &mut output, stream, None, None)
+                .await
+                .unwrap();
+            assert_eq!(output, payload);
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            let lengths = data_frames.lock().unwrap().clone();
+            assert!(!lengths.is_empty());
+            observations.push(lengths);
+            drop(client);
+            drop(pool);
+            let _ = stop_proxy.send(());
+            tokio::time::timeout(Duration::from_secs(3), proxy)
+                .await
+                .unwrap()
+                .unwrap();
+            let _ = stop_server.send(());
+            tokio::time::timeout(Duration::from_secs(3), server)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        }
+        eprintln!(
+            "cp05v2 actual HTTP2 DATA payload lengths: control={:?}, production={:?}",
+            observations[0], observations[1]
+        );
+        assert!(observations[0].iter().all(|length| *length <= 16 * 1024));
+        assert!(
+            observations[1].len() < observations[0].len(),
+            "production must reduce actual HTTP2 DATA frames, after identical complete application delivery"
+        );
+        assert!(observations[1].iter().any(|length| *length > 16 * 1024));
+    }
+
+    #[cfg(feature = "dfs")]
+    fn compact_range_frame(
+        index: u32,
+        data: Vec<u8>,
+    ) -> afs_protocol::node_data::DfsReadRangesFrame {
+        afs_protocol::node_data::DfsReadRangesFrame {
+            body: Some(dfs_read_ranges_frame::Body::Compact(
+                afs_protocol::node_data::DfsReadRangeReply {
+                    operation_index: index,
+                    range_checksum: blake3::hash(&data).as_bytes().to_vec(),
+                    data: data.into(),
+                },
+            )),
+        }
+    }
+
+    #[cfg(feature = "dfs")]
+    #[test]
+    fn cp04v2_compact_codec_bounds_share_backing_and_exclude_disk_controls() {
+        use prost::Message;
+        let maximum = afs_protocol::node_data::DFS_COMPACT_RANGE_MAX_BYTES;
+        let frame = compact_range_frame(u32::MAX, vec![37; maximum]);
+        let encoded = prost::bytes::Bytes::from(frame.encode_to_vec());
+        assert!(encoded.len() > STREAM_MESSAGE_BYTES);
+        assert!(encoded.len() <= maximum + 64);
+        let mut decoded =
+            afs_protocol::node_data::DfsReadRangesFrame::decode(encoded.clone()).unwrap();
+        let Some(dfs_read_ranges_frame::Body::Compact(reply)) = &decoded.body else {
+            panic!("compact tag must round-trip");
+        };
+        let start = encoded.as_ptr() as usize;
+        let body_start = reply.data.as_ptr() as usize;
+        assert!(body_start >= start);
+        assert!(body_start + reply.data.len() <= start + encoded.len());
+        assert_eq!(reply.data.as_ref(), &[37; 128 * 1024]);
+        assert!(peer_stream_control_capacity(&mut decoded).is_err());
+    }
+
+    #[cfg(feature = "dfs")]
+    #[test]
+    fn cp04v2_compact_decoder_preserves_mixed_operations_eof_and_duplicate_checks() {
+        let request = range_request();
+        let compact = compact_range_frame(0, vec![b'a']);
+        let mut decoder = ReadFrameDecoder::new(&request);
+        let mut out = [0; 2];
+        decoder.accept(compact.clone(), &mut out).unwrap();
+        assert!(decoder.check_finished().is_err());
+        assert!(decoder.accept(compact, &mut out).is_err());
+        for frame in range_frames(&request, 1) {
+            decoder.accept(frame, &mut out).unwrap();
+        }
+        decoder.finish().unwrap();
+        assert_eq!(&out, b"ab");
+    }
+
+    #[cfg(feature = "dfs")]
+    #[test]
+    fn cp04v2_compact_decoder_rejects_invalid_shapes_without_writing() {
+        for case in 0..9 {
+            let mut request = range_request();
+            let mut frame = compact_range_frame(0, vec![b'a']);
+            let Some(dfs_read_ranges_frame::Body::Compact(reply)) = &mut frame.body else {
+                unreachable!();
+            };
+            match case {
+                0 => reply.operation_index = 9,
+                1 => reply.data = vec![b'a'; 2].into(),
+                2 => {
+                    let length = afs_protocol::node_data::DFS_COMPACT_RANGE_MAX_BYTES + 1;
+                    request.operations[0].length = length as u64;
+                    reply.data = vec![b'a'; length].into();
+                    reply.range_checksum = blake3::hash(&reply.data).as_bytes().to_vec();
+                }
+                3 => reply.range_checksum[0] ^= 1,
+                4 => request.include_blake3_outboard = true,
+                5 => request.operations[0].destination_offset = u64::MAX,
+                6 => reply.data = Default::default(),
+                7 => request.operations[0].operation_index = 1,
+                _ => {}
+            }
+            let mut decoder = ReadFrameDecoder::new(&request);
+            let mut out = [0x93; 2];
+            if case == 8 {
+                decoder
+                    .accept(range_frames(&request, 0).remove(0), &mut out)
+                    .unwrap();
+            }
+            let error = decoder.accept(frame, &mut out).unwrap_err();
+            assert_eq!(out, [0x93; 2], "case {case}");
+            assert_eq!(
+                error.code(),
+                if case == 3 {
+                    afs_error::NODE_TRANSFER_CORRUPT_DATA
+                } else {
+                    afs_error::CLIENT_PROTOCOL_VIOLATION
+                }
+            );
+        }
+        let body = vec![7; 32];
+        let (chunk, mut request, _) = verified_object_frames(&body);
+        request.include_blake3_outboard = false;
+        let mut decoder = ReadFrameDecoder::for_object(&request, &chunk).unwrap();
+        let mut out = vec![0x93; body.len()];
+        assert!(
+            decoder
+                .accept(compact_range_frame(0, body), &mut out)
+                .is_err()
+        );
+        assert!(out.iter().all(|byte| *byte == 0x93));
+    }
+
+    #[cfg(feature = "dfs")]
+    #[tokio::test]
+    async fn cp04v2_compact_reply_never_hides_late_grpc_status() {
+        let mut request = range_request();
+        request.operations.truncate(1);
+        let stream = tokio_stream::iter([
+            Ok(compact_range_frame(0, vec![b'a'])),
+            Err(tonic::Status::unavailable(
+                "late failure after compact result",
+            )),
+        ]);
+        let mut output = [0; 1];
+        assert!(
+            consume_peer_read_stream(&request, None, &mut output, stream, None, None)
+                .await
+                .is_err()
+        );
+    }
+
+    #[cfg(feature = "dfs")]
     fn verified_object_frames(
         body: &[u8],
     ) -> (
@@ -9544,7 +11433,7 @@ mod tests {
 
     #[cfg(feature = "dfs")]
     #[test]
-    fn range_frame_bytes_preserve_vec_wire_compatibility() {
+    fn legacy_stream_frames_preserve_vec_wire_compatibility() {
         use afs_protocol::node_data::{
             DfsReadRangesCompletion, DfsReadRangesFrame, DfsReadRangesHeader,
         };
@@ -9593,6 +11482,9 @@ mod tests {
                     }
                     dfs_read_ranges_frame::Body::Completion(completion) => {
                         LegacyBody::Completion(completion.clone())
+                    }
+                    dfs_read_ranges_frame::Body::Compact(_) => {
+                        panic!("legacy stream representation has no compact tag")
                     }
                 }),
             };

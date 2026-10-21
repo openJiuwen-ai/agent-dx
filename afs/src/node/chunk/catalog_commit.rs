@@ -33,6 +33,8 @@ struct State {
     groups: u64,
     max_group: usize,
     actual_peak: usize,
+    persist_reused_objects: u64,
+    persist_reused_bytes: u64,
 }
 
 #[derive(Debug)]
@@ -78,6 +80,8 @@ impl Default for CatalogCommitter {
                 groups: 0,
                 max_group: 0,
                 actual_peak: std::mem::size_of::<Self>(),
+                persist_reused_objects: 0,
+                persist_reused_bytes: 0,
             }),
             changed: Condvar::new(),
             metrics: Mutex::new(None),
@@ -120,8 +124,20 @@ impl CatalogCommitter {
                 ("max_group", state.max_group as u64),
                 ("failed", u64::from(state.failure.is_some())),
                 ("exclusive", u64::from(state.exclusive)),
+                ("persist_reused_objects", state.persist_reused_objects),
+                ("persist_reused_bytes", state.persist_reused_bytes),
             ]);
         }
+    }
+
+    pub(super) fn note_persist_reuse(&self, objects: u64, bytes: u64) {
+        if objects == 0 {
+            return;
+        }
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.persist_reused_objects = state.persist_reused_objects.saturating_add(objects);
+        state.persist_reused_bytes = state.persist_reused_bytes.saturating_add(bytes);
+        self.publish(&state);
     }
 
     #[cfg(any(feature = "dfs", test))]

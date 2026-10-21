@@ -27,7 +27,7 @@ use std::{
 };
 
 #[cfg(any(feature = "ownerfs", feature = "dfs"))]
-use crate::node::rpc::data::{PeerAuthenticator, authenticate_peer};
+use crate::node::rpc::data::{InternalPeerRequest, PeerAuthenticator, authenticate_peer};
 #[cfg(feature = "dfs")]
 use crate::node::vfs::types::OpenOptions;
 use afs_protocol::node_control::{
@@ -582,7 +582,10 @@ impl NodeControlService {
     }
 
     #[cfg(feature = "ownerfs")]
-    async fn dispatch_owner_lock<Req: Send + 'static, Reply: Send + 'static>(
+    async fn dispatch_owner_lock<
+        Req: InternalPeerRequest + Send + 'static,
+        Reply: Send + 'static,
+    >(
         &self,
         request: Request<Req>,
         blocking: bool,
@@ -657,7 +660,10 @@ impl NodeControlService {
     }
 
     #[cfg(feature = "dfs")]
-    async fn dispatch_dfs_owner<Req: Send + 'static, Reply: Send + 'static>(
+    async fn dispatch_dfs_owner<
+        Req: InternalPeerRequest + Send + 'static,
+        Reply: Send + 'static,
+    >(
         &self,
         request: Request<Req>,
         call: impl FnOnce(Arc<dyn DfsOwnerLifecycleHandler>, String, Req) -> afs_error::Result<Reply>
@@ -682,7 +688,10 @@ impl NodeControlService {
     }
 
     #[cfg(feature = "dfs")]
-    async fn dispatch_blocking_dfs_owner_lock<Req: Send + 'static, Reply: Send + 'static>(
+    async fn dispatch_blocking_dfs_owner_lock<
+        Req: InternalPeerRequest + Send + 'static,
+        Reply: Send + 'static,
+    >(
         &self,
         request: Request<Req>,
         call: impl FnOnce(Arc<dyn DfsOwnerLifecycleHandler>, String, Req) -> afs_error::Result<Reply>

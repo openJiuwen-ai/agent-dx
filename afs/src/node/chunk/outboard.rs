@@ -669,6 +669,19 @@ impl ChunkOutboard {
                 return result.map(|()| counts);
             }
         }
+        if let ([range], [allowed]) = (ranges, counts.as_slice())
+            && *allowed != 0
+        {
+            let start =
+                range.chunk_offset / OUTBOARD_GROUP_BYTES as u64 * OUTBOARD_GROUP_BYTES as u64;
+            let stop = (start + OUTBOARD_GROUP_BYTES as u64).min(self.length);
+            if range.chunk_offset + *allowed as u64 <= stop {
+                let result =
+                    read_single_coverage_group(&source, bao, *range, *allowed, start..stop, out);
+                work.add(&observed.into_inner());
+                return result.map(|()| counts);
+            }
+        }
         if ranges.len() <= groups.len()
             && nonaliased_ranges(ranges, &counts)
             && ranges.iter().zip(&counts).any(|(range, allowed)| {
@@ -813,6 +826,51 @@ impl ChunkOutboard {
         work.add(&observed.into_inner());
         result
     }
+}
+
+// Keep the extra coverage buffer out of the aligned-read stack frame: only
+// callers holding the larger partial-range work ticket enter this helper.
+#[inline(never)]
+fn read_single_coverage_group(
+    source: &OffsetFile<'_>,
+    bao: PreOrderMemOutboard<&[u8]>,
+    range: VerifiedRangeCopy,
+    allowed: usize,
+    coverage: std::ops::Range<u64>,
+    out: &mut [u8],
+) -> Result<()> {
+    // Authenticate the complete group before copying its requested subrange.
+    // This buffer and Bao's official validation scratch fit the original
+    // partial-range ticket, without an encoded body or retained allocation.
+    let mut group = [0; OUTBOARD_GROUP_BYTES];
+    let length = (coverage.end - coverage.start) as usize;
+    source
+        .read_exact_at(coverage.start, &mut group[..length])
+        .map_err(Error::from)?;
+    source.work.borrow_mut().scratch_peak = 2 * OUTBOARD_GROUP_BYTES;
+    let input = BorrowedRange {
+        bytes: &group[..length],
+        start: coverage.start,
+        work: source.work,
+    };
+    let checked = ObservedOutboard {
+        inner: bao,
+        work: source.work,
+    };
+    let query = ChunkRanges::from(ChunkNum(coverage.start / 1024)..ChunkNum::chunks(coverage.end));
+    let verify_started = Instant::now();
+    let verified = bao_tree::io::sync::encode_ranges_validated(input, checked, &query, io::sink())
+        .map_err(|error| match error {
+            bao_tree::io::EncodeError::Io(error) => Error::from(error),
+            other => bad_proof(&format!("Bao range verification failed: {other}")),
+        });
+    source.work.borrow_mut().verify_ns += nanos(verify_started);
+    verified?;
+    let from = (range.chunk_offset - coverage.start) as usize;
+    out[range.output_offset..range.output_offset + allowed]
+        .copy_from_slice(&group[from..from + allowed]);
+    source.work.borrow_mut().copied_bytes += allowed as u64;
+    Ok(())
 }
 
 // Object-relative ReadAt over the already-filled private result. Only the
@@ -1805,6 +1863,95 @@ mod tests {
     fn expected(body: &[u8]) -> ChunkObject {
         super::super::StagedChunk::new(crate::dfs::OperationId::new("outboard-test"), body.to_vec())
             .chunk
+    }
+
+    #[test]
+    fn checkpoint_small_range_avoids_encoded_body_and_keeps_one_coverage_read() {
+        use std::io::Write;
+        let body = (0..3 * OUTBOARD_GROUP_BYTES + 777)
+            .map(|n| (n % 251) as u8)
+            .collect::<Vec<_>>();
+        let chunk = expected(&body);
+        let budget = OutboardBudget::new(DEFAULT_OUTBOARD_BUDGET_BYTES);
+        let proof = build_borrowed(&body, &budget).outboard.unwrap();
+        let before = budget.used();
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&[0xa5; 4096]).unwrap();
+        file.write_all(&body).unwrap();
+        for (offset, length) in [
+            (19, 4096),
+            (OUTBOARD_GROUP_BYTES + 17, 4096),
+            (3 * OUTBOARD_GROUP_BYTES + 13, 900),
+        ] {
+            let allowed = length.min(body.len() - offset);
+            let group_start = offset / OUTBOARD_GROUP_BYTES * OUTBOARD_GROUP_BYTES;
+            let coverage = OUTBOARD_GROUP_BYTES.min(body.len() - group_start);
+            let mut out = vec![0xa5; allowed + 14];
+            let mut work = OutboardReadWork::default();
+            assert_eq!(
+                proof
+                    .read_ranges_into_with_work(
+                        &file,
+                        4096,
+                        &chunk,
+                        &[VerifiedRangeCopy {
+                            chunk_offset: offset as u64,
+                            length,
+                            output_offset: 7
+                        }],
+                        &mut out,
+                        &mut work,
+                    )
+                    .unwrap(),
+                vec![allowed]
+            );
+            assert_eq!(&out[7..7 + allowed], &body[offset..offset + allowed]);
+            assert!(
+                out[..7]
+                    .iter()
+                    .chain(&out[7 + allowed..])
+                    .all(|byte| *byte == 0xa5)
+            );
+            assert_eq!(work.read_calls, 1);
+            assert_eq!(work.hash_bytes, coverage as u64);
+            assert_eq!(
+                work.copied_bytes,
+                (coverage + allowed) as u64,
+                "coverage into official verifier scratch, then only the requested output; no encoded body"
+            );
+            assert!(work.scratch_peak <= 2 * OUTBOARD_GROUP_BYTES);
+            assert_eq!(budget.used(), before);
+        }
+    }
+
+    #[test]
+    fn checkpoint_small_range_checks_unrequested_padding_before_delivery() {
+        use std::io::Write;
+        let body = vec![7; 2 * OUTBOARD_GROUP_BYTES];
+        let chunk = expected(&body);
+        let budget = OutboardBudget::new(DEFAULT_OUTBOARD_BUDGET_BYTES);
+        let proof = build_borrowed(&body, &budget).outboard.unwrap();
+        let mut damaged = body.clone();
+        damaged[20 * 1024] ^= 1;
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&damaged).unwrap();
+        let mut out = vec![0xa5; 4096];
+        assert!(
+            proof
+                .read_ranges_into(
+                    &file,
+                    0,
+                    &chunk,
+                    &[VerifiedRangeCopy {
+                        chunk_offset: 17,
+                        length: out.len(),
+                        output_offset: 0
+                    }],
+                    &mut out,
+                )
+                .is_err()
+        );
+        assert!(out.iter().all(|byte| *byte == 0xa5));
     }
 
     #[test]

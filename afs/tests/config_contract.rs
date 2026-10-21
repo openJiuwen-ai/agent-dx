@@ -2,6 +2,100 @@ use afs::config::{Cli, Config, MetaStoreBackend, Role};
 use clap::Parser;
 
 #[test]
+fn p7_internal_tls_is_explicit_and_defaults_off_even_with_certificates() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("internal-tls.toml");
+    let certificates = "tls_ca_certificate='/ca.pem'\n\
+                        tls_identity_certificate='/node.pem'\n\
+                        tls_identity_private_key='/node.key'\n\
+                        tls_server_name='afs-cluster'\n";
+    for (role, binary) in [(Role::Meta, "afs-meta"), (Role::Node, "afs-node")] {
+        for (setting, enabled) in [
+            ("", false),
+            ("internal_tls_enabled=false\n", false),
+            ("internal_tls_enabled=true\n", true),
+        ] {
+            std::fs::write(&path, format!("{certificates}{setting}")).unwrap();
+            let config = Config::resolve(
+                role,
+                Cli::parse_from([binary, "--config", path.to_str().unwrap()]),
+            )
+            .unwrap();
+            assert_eq!(
+                matches!(
+                    config.tls_config(),
+                    afs_transport::TlsConfig::MutualTls { .. }
+                ),
+                enabled,
+                "{binary}: {setting:?}",
+            );
+            let config = Config::resolve(
+                role,
+                Cli::parse_from([
+                    binary,
+                    "--config",
+                    path.to_str().unwrap(),
+                    "--internal-tls-enabled",
+                    if enabled { "false" } else { "true" },
+                ]),
+            )
+            .unwrap();
+            assert_eq!(
+                matches!(
+                    config.tls_config(),
+                    afs_transport::TlsConfig::MutualTls { .. }
+                ),
+                !enabled,
+            );
+        }
+    }
+}
+
+#[test]
+fn p7_internal_tls_enabled_without_certificates_fails_configuration() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("internal-tls.toml");
+    std::fs::write(&path, "internal_tls_enabled=true\n").unwrap();
+    for (role, binary) in [(Role::Meta, "afs-meta"), (Role::Node, "afs-node")] {
+        let error = Config::resolve(
+            role,
+            Cli::parse_from([binary, "--config", path.to_str().unwrap()]),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), afs_error::CONFIG_INVALID);
+        assert!(
+            error
+                .to_string()
+                .contains("internal_tls_enabled requires all four tls_*"),
+            "{binary}: {error}"
+        );
+    }
+}
+
+#[test]
+fn p7_disabled_internal_tls_does_not_open_certificate_paths() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("internal-tls.toml");
+    // An incomplete, absent certificate set is unused when transport TLS is off.
+    std::fs::write(&path, "tls_ca_certificate='/absent/ca.pem'\n").unwrap();
+    let config = Config::resolve(
+        Role::Node,
+        Cli::parse_from(["afs-node", "--config", path.to_str().unwrap()]),
+    )
+    .unwrap();
+    assert!(!config.internal_tls_enabled);
+    let security = afs_transport::grpc::SecurityManager::new(config.tls_config()).unwrap();
+    security
+        .configure_server(tonic::transport::Server::builder())
+        .unwrap();
+    security
+        .configure_client(tonic::transport::Endpoint::from_static(
+            "http://127.0.0.1:1",
+        ))
+        .unwrap();
+}
+
+#[test]
 fn p2_w2_native_write_limits_use_cli_file_defaults_and_bounded_resources() {
     fn limits(config: &Config) -> (u64, usize, usize, u64) {
         (
@@ -76,8 +170,8 @@ fn p2_w2_complete_node_examples_resolve_top_level_write_limits() {
         assert_eq!(config.dfs_upload_inflight_chunks, 8, "{name}");
         assert_eq!(config.dfs_background_commit_ms, 5000, "{name}");
         assert_eq!(config.dfs_catalog_commit_queue, 256, "{name}");
-        assert_eq!(config.trusted_node_certs.len(), 1, "{name}");
-        assert!(config.trusted_node_certs.contains_key("node-a"), "{name}");
+        assert!(!config.internal_tls_enabled, "{name}");
+        assert!(config.trusted_node_certs.is_empty(), "{name}");
     }
 }
 
@@ -421,7 +515,7 @@ fn p2_c1a_outboard_wait_defaults_and_file_cli_boundaries() {
 }
 
 #[test]
-fn shipped_examples_resolve_with_mutual_tls_and_node_identity_binding() {
+fn shipped_examples_resolve_with_internal_tls_disabled() {
     let examples = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
     let meta_path = examples.join("meta.toml");
     let node_path = examples.join("node.toml");
@@ -438,22 +532,22 @@ fn shipped_examples_resolve_with_mutual_tls_and_node_identity_binding() {
 
     assert!(meta.ownerfs && meta.dfs);
     assert!(node.ownerfs && node.dfs);
-    assert_eq!(meta.trusted_node_certs.len(), 1);
-    assert_eq!(node.trusted_node_certs.len(), 1);
+    assert!(!meta.internal_tls_enabled && !node.internal_tls_enabled);
+    assert!(meta.trusted_node_certs.is_empty() && node.trusted_node_certs.is_empty());
     assert!(
         node.meta_endpoint
             .as_deref()
             .unwrap()
-            .starts_with("https://")
+            .starts_with("http://")
     );
     assert!(
         node.peer_endpoint
             .as_deref()
             .unwrap()
-            .starts_with("https://")
+            .starts_with("http://")
     );
     for tls in [meta.tls_config(), node.tls_config()] {
-        assert!(matches!(tls, afs_transport::TlsConfig::MutualTls { .. }));
+        assert!(matches!(tls, afs_transport::TlsConfig::Disabled));
     }
 }
 

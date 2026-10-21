@@ -2916,7 +2916,15 @@ impl DfsReadEngine {
         {
             return Ok(reader);
         }
-        let reader = Arc::new(self.local.open_verified(chunk_id)?);
+        // A canonical committed identity already binds root and length. Pin
+        // its descriptor here; the caller still authenticates every delivered
+        // coverage group and checks authority before publishing any output.
+        // Missing/invalid sidecars retain the existing complete-root fallback.
+        // Eagerly scanning at pin time would repeat that read's verification.
+        let reader = Arc::new(match ChunkObject::from_content_addressed_id(chunk_id) {
+            Some(expected) => self.local.open_receipt_reader(&expected)?,
+            None => self.local.open_verified(chunk_id)?,
+        });
         #[cfg(test)]
         {
             // Deterministically hold concurrent cold opens before installation.
@@ -6057,6 +6065,74 @@ mod tests {
         let mut output = [b'!'; 6];
         assert!(engine.read_batch(&batch, &mut output).is_err());
         assert_eq!(output, [b'!'; 6]);
+        assert_eq!(*sources.calls.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn checkpoint_published_local_range_does_not_prescan_the_entire_object() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = afs_metrics::Registry::new();
+        let local = Arc::new(
+            LocalChunkStore::open(temp.path(), "node-a")
+                .unwrap()
+                .with_read_work_metrics(
+                    crate::node::read_work::ReadWorkMetrics::register(&registry).unwrap(),
+                ),
+        );
+        let bytes = (0..4 * 1024 * 1024)
+            .map(|n| (n % 251) as u8)
+            .collect::<Vec<_>>();
+        let chunk_id = put_local_chunk(&local, "checkpoint-local-proof", &bytes);
+        // Finish the optional proof independently of the operation under test.
+        // This also works when the ACK preceded the asynchronous installer.
+        drop(local.open_verified(&chunk_id).unwrap());
+        let metric = |stage: &str| -> u64 {
+            let text = afs_metrics::encode_text(&registry).unwrap();
+            let key = format!("afs_dfs_read_hash_bytes_total{{stage=\"{stage}\"}} ");
+            text.lines()
+                .find_map(|line| line.strip_prefix(&key))
+                .unwrap()
+                .parse()
+                .unwrap()
+        };
+        let before_root = metric("root_local_scan");
+        let before_groups = metric("outboard_body_hash");
+        let sources = Arc::new(StaticSources::default());
+        let engine = DfsReadEngine::new(
+            crate::dfs::NamespaceId::new("default"),
+            "node-a".into(),
+            local,
+            sources.clone(),
+            Arc::new(UnimplementedChunkTransfer),
+            DfsReadConfig::default(),
+        );
+        let mut out = vec![0xa5; 128 * 1024];
+        engine
+            .read_batch_native_into_private(
+                &ReadBatch {
+                    lookahead: Vec::new(),
+                    file_version_id: Some(FileVersionId::new("published")),
+                    layout_root_id: LayoutRootId::new("committed-layout"),
+                    ops: vec![ChunkReadOp {
+                        chunk_id,
+                        chunk_offset: 1024 * 1024,
+                        length: out.len() as u64,
+                        output_offset: 0,
+                    }],
+                },
+                &mut out,
+            )
+            .unwrap();
+        assert_eq!(&out, &bytes[1024 * 1024..1024 * 1024 + out.len()]);
+        assert_eq!(
+            metric("root_local_scan"),
+            before_root,
+            "pinning metadata must not scan a complete object before the range validates itself"
+        );
+        assert_eq!(
+            metric("outboard_body_hash") - before_groups,
+            out.len() as u64
+        );
         assert_eq!(*sources.calls.lock().unwrap(), 0);
     }
 

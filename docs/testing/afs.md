@@ -259,7 +259,11 @@ peer_outboard_metadata；proof小元数据复制与正文复制分别解释，�
 复用已提交读视图最多5秒，截止从fresh请求前开始并受原Node/session期限约束，
 命中和心跳不延长本次视图。到期重新取得head，本机发布、truncate、getattr等已有
 刷新点使旧视图失效；不承诺旧句柄每次read立即看到其他客户端修改，也不是永久快照。
-read开始和最终交付均检查session/epoch、停止及原截止，borrowed输出在成功前不修改。
+缓存视图截止只决定新read是否刷新head；本次read在准入时独立捕获最多5秒、且受当时
+Node/session期限约束的操作截止。取head、排队和共享刷新不重置它，命中缓存也不继承
+旧视图较短的剩余预算。定向用例覆盖缓存到期后已准入读取仍可交付、心跳不能延长
+已开始操作，以及失败时borrowed输出不变；固定FD版本及mmap隔离仍是另一项合同。
+read开始和最终交付均检查session/epoch、停止及本次原截止，borrowed输出在成功前不修改。
 普通Meta断链不会伪造撤销，但新open、head刷新、source miss或授权刷新需要Meta时
 失败直接报错。read/grant拒绝清除受影响上下文，Node注册拒绝、epoch变化或停止才
 停止共享授权。源缓存默认max5秒、grant安全余量1秒，命中不续期；A授权缓存最多5秒，
@@ -587,6 +591,15 @@ RSS允许偏差和观测窗口，完成原提交入口、释放所有引用后�
 必须补充不对齐／跨块／稀疏／截断扩展／并发覆盖、合法短写与同步标志、prepare失败恢复和
 未知 Meta ACK 精确重试、停止排空，以及受影响 OwnerFs／RN／RDMA／S3 回归。完整BLAKE3、授权、
 成功 fsync 和 close-to-open 不因这些优化放松；RDMA仍按现有独立注册 endpoint 缓冲合同验证。
+
+## Peer HTTP/2接收帧验证
+
+`cp05v2_actual_compact_rpc_reduces_http2_data_frames`用实际PeerConnectionPool Channel
+与显式16KiB控制Channel交付相同128KiB紧凑结果，先核正文、原解码器、EOF和单次RPC，
+正常退出测试server/proxy后再比较透明代理按HTTP/2头长度读取的真实DATA帧。
+代理只用于机制断言，不以代理下耗时/CPU当产品收益；不把SETTINGS上限当减帧结果。
+OwnerFiles接收上限、Node监听端、原流控/消息/载荷/控制/并发预算保持；相关RPC回归仍需
+覆盖大范围、proof、取消、晚到Status、错误与排空。Linux功能与性能通过范围各自绑定输入。
 
 ## Peer 完整对象唯一核根回归
 
@@ -947,3 +960,17 @@ ACK来自可信Node测试夹具，不声称真实TCP、正文持久化或物理�
 直接构造的超大Store事务仍须遵守帧、结构及历史预算；未证明的组合不能宣称全部支持。
 Full FSx和FUN/REL完整harness的未执行状态保持，已有标准、组件和故障证据只能按
 版本及改动影响复用；该有限出口不等于完整P3、完整POSIX或正式性能通过。
+
+
+### 有界范围RPC复用
+
+`cargo test --locked --release -p afs --all-features --lib cp09 -- --nocapture`
+覆盖真实三次128KiB完整交付只建一个RPC、显式认证adapter与生产内部互信caller、
+每次读取独立拒绝/超时/已知停止与epoch、总期限不续期、双并发和真实取消排空。
+独立session服务的实际8KiB解码上限须在进入业务前拒绝超大消息；原Chunks方法保持原限制。
+对象proof读取须明确回原路径并保持原根/完整交付与proof预算，不能为复用跳过校验。
+完整Compact编码大小和混合传输包络检查、最后真实块owner退出后释放与重新准入分别覆盖。
+Codec消息cap、静态容量核算、实际分配和运行资源是不同证据，不能相互替代；
+有限AFS与必要真实checkpoint传导另按绑定身份、数据和预算报告，不将该命令当E2E通过。
+
+CP09 session软件门禁还覆盖空闲服务端codec的原池准入/释放、额度不足先回退再发送业务，以及实际tonic服务端编码retained分配；消息交付点观测不代表瞬时malloc或HTTP/2总量。

@@ -142,6 +142,10 @@ def _digest_map_stable(before_items: dict[str, Any], after_items: dict[str, Any]
 
 
 def _configured_tls_digests_stable(before_cfg: dict[str, Any], after_cfg: dict[str, Any]) -> bool:
+    before_enabled = before_cfg.get("internal_tls_enabled", before_cfg.get("tls_required", False))
+    after_enabled = after_cfg.get("internal_tls_enabled", after_cfg.get("tls_required", False))
+    if before_enabled != after_enabled:
+        return False
     required_names = {"tls_ca_certificate", "tls_identity_certificate", "tls_identity_private_key"}
     before_tls = before_cfg.get("tls") or {}
     after_tls = after_cfg.get("tls") or {}

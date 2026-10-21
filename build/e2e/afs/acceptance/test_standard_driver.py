@@ -234,6 +234,7 @@ class StandardRemoteIdentityHelpersTest(unittest.TestCase):
                         f"tls_identity_certificate = '{root / 'node.pem'}'",
                         f"tls_identity_private_key = '{root / 'node-key.pem'}'",
                         "tls_server_name = 'afs-cluster'",
+                        "internal_tls_enabled = true",
                         (
                             f"trusted_node_certs = {{ memory-node-a = '"
                             f"{root / 'peer-a.pem'}"
@@ -262,11 +263,22 @@ class StandardRemoteIdentityHelpersTest(unittest.TestCase):
             (root / "ca.pem").write_text("ca", encoding="utf-8")
             cfg_path = root / "meta.toml"
             cfg_path.write_text(
-                f"grpc_listen = '0.0.0.0:17880'\ntls_ca_certificate = '{root / 'ca.pem'}'\n", encoding="utf-8"
+                f"grpc_listen = '0.0.0.0:17880'\ninternal_tls_enabled = true\ntls_ca_certificate = '{root / 'ca.pem'}'\n", encoding="utf-8"
             )
             summary = standard.config_summary(cfg_path)
             self.assertTrue(summary["tls_required"])
             self.assertEqual(set(summary["tls_missing"]), {"tls_identity_certificate", "tls_identity_private_key"})
+
+    def test_p7_config_summary_disabled_tls_does_not_require_unused_certificates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "node.toml"
+            for switch in ("", "internal_tls_enabled = false\n"):
+                path.write_text(switch + "tls_ca_certificate='/absent/ca.pem'\n", encoding="utf-8")
+                summary = standard.config_summary(path)
+                self.assertFalse(summary["internal_tls_enabled"])
+                self.assertFalse(summary["tls_required"])
+                self.assertEqual(summary["tls"], {})
+                self.assertEqual(summary["tls_missing"], [])
 
     def test_run_worker_json_times_out_and_terminates_silent_child(self):
         record = standard.run_worker_json([sys.executable, "-c", "import time; time.sleep(30)"], [], timeout=1)

@@ -130,28 +130,33 @@ LocalLog锁绑定创建进程，不能把fork继承的对象当成新写者；�
 旧快照后端、etcd／Redis适配及其依赖已移除；不保留双写、旧格式导入或兼容feature。
 这些改动不表示已有 FUSE、物理掉电或性能验收自动适用于新格式。
 
-单机试用前先准备配置、数据、运行时、挂载目录和本机临时证书：
+单机试用前先准备配置、数据、运行时和挂载目录：
 
 ```sh
 sudo install -d -m 0755 /opt/adx/config/afs /opt/adx/run/afs /mnt/adx/ownerfs /mnt/adx/dfs
 sudo install -d -m 0700 /opt/adx/data/afs/meta /opt/adx/data/afs/node-a
 sudo cp /opt/adx/current/etc/examples/afs/meta.toml /opt/adx/config/afs/meta.toml
 sudo cp /opt/adx/current/etc/examples/afs/node.toml /opt/adx/config/afs/node.toml
-sudo /opt/adx/current/etc/examples/afs/prepare-local-tls.sh
 sudo cp /opt/adx/current/etc/examples/afs/deployment-ownerfs-local.yaml \
   /opt/adx/config/deployment.yaml
 sudo adxctl validate
 ```
 
-证书脚本只创建 30 天有效的本机隔离试用 CA、Meta 和 `node-a` 身份，并在已有
-任一目标文件时拒绝覆盖；它不分发固定私钥，也不适用于生产或多主机扩容。生产部署
-必须由自己的 CA 为每个 Node 签发独立身份，并在 Meta 和 peer 的
-`trusted_node_certs` 中把证书精确映射到该 Node ID。不要复制 Node 私钥到其他主机。
-证书绑定表不能替代 TLS 配置；启用 OwnerFs 或 DFS 权威的 Meta 缺少 mTLS 时，
-必须在监听端口和打开持久后端前拒绝启动。
+示例默认 `internal_tls_enabled = false`，内部 endpoint 为 `http://`，无需证书文件。
+此模式把 AFS gRPC 当作系统内部互信服务；用户和三方从受控的挂载/SDK入口访问，
+入口权限检查、状态失效、持久化和排空规则保持。外部 S3 的 HTTPS、Platform 和
+Gateway 的安全配置不受此开关影响。
 
-示例 Node 配置使用 mTLS `https://` endpoint、`/opt/adx/data/afs/node-a` 和
-`/opt/adx/run/afs/node-a.sock`。前台运行 `sudo adxctl run` 后，在另一终端用
+需要内部传输加密时，在所有相关 Meta/Node 配置中设置
+`internal_tls_enabled = true`，填写完整四个 `tls_*` 字段，并将内部 endpoint 改为
+`https://`。不要混用同一连接的明文与 TLS 配置。本机隔离试用可先运行
+`sudo /opt/adx/current/etc/examples/afs/prepare-local-tls.sh`；脚本只创建 30 天有效的
+临时 CA、Meta 和 `node-a` 证书，拒绝覆盖已有材料。生产多主机应分发各自的证书，
+不要复制节点私钥。TLS 在握手验证 CA/服务端名，不再要求每 RPC 的 Node 证书映射；
+`trusted_node_certs` 仅供显式认证的测试适配器使用，生产内部服务不依赖它。
+
+Node 示例使用 `/opt/adx/data/afs/node-a` 与 `/opt/adx/run/afs/node-a.sock`。
+前台运行 `sudo adxctl run` 后，在另一终端用
 `sudo adxctl status` 检查 Meta 与 Node 都返回 `status=ready`，并用
 `sudo adxctl stop` 正常停止。Supervisor 按 Meta→Node 排序启动；Node 在尚未挂载或
 暴露本地 API 前对首次 Meta 注册做有界、可取消重试。预算耗尽、证书/身份拒绝或运行后

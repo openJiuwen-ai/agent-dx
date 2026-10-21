@@ -1,8 +1,8 @@
 id = "node-a"
 grpc_listen = "127.0.0.1:7500"
 rest_listen = "127.0.0.1:7501"
-meta_endpoint = "https://127.0.0.1:7400"
-peer_endpoint = "https://127.0.0.1:7500"
+meta_endpoint = "http://127.0.0.1:7400"
+peer_endpoint = "http://127.0.0.1:7500"
 fs = "all"
 data_mode = "grpc"
 data_dir = "/opt/adx/data/afs/node-a"
@@ -76,6 +76,9 @@ experimental_ownerfs_workspace_bind = false
 # [ownerfs_workspace_bind]
 # workspace = "agent1"
 
+internal_tls_enabled = false
+# To enable mTLS, set true on all AFS peers and use https:// endpoints.
+# Certificate paths are unused while internal TLS is off.
 tls_ca_certificate = "/opt/adx/config/afs/tls/ca.pem"
 tls_identity_certificate = "/opt/adx/config/afs/tls/node-a.pem"
 tls_identity_private_key = "/opt/adx/config/afs/tls/node-a-key.pem"
@@ -92,8 +95,6 @@ dfs_background_commit_ms = 5000
 # Zero disables idle retention. This does not change S3 pipeline budgets.
 dfs_write_buffer_idle_bytes = 134217728
 
-[trusted_node_certs]
-node-a = "/opt/adx/config/afs/tls/node-a.pem"
 
 # Optional external S3 durability for a NEW DFS filesystem only.
 # Configure the same store/generation on Meta and every DFS Node; retain R1

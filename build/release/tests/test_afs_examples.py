@@ -11,7 +11,7 @@ SOURCE = ROOT / "afs/examples"
 
 
 class AfsExampleTests(unittest.TestCase):
-    def test_packaged_examples_are_secure_and_match_crate_examples(self):
+    def test_packaged_examples_default_to_internal_plaintext_and_match_crate_examples(self):
         # Config::resolve is exercised by afs/tests/config_contract.rs.
         # Keep this package-copy contract runnable in ADX's Python 3.9 image.
         for name, identity in (("meta", "meta"), ("node", "node-a")):
@@ -31,10 +31,11 @@ class AfsExampleTests(unittest.TestCase):
                 "tls_server_name": "afs-cluster",
             }
             if name == "node":
-                expected.update(meta_endpoint="https://127.0.0.1:7400", peer_endpoint="https://127.0.0.1:7500")
+                expected.update(meta_endpoint="http://127.0.0.1:7400", peer_endpoint="http://127.0.0.1:7500")
             for field, value in expected.items():
                 self.assertIn(f'{field} = "{value}"', lines)
-            self.assertIn('[trusted_node_certs]\nnode-a = "/opt/adx/config/afs/tls/node-a.pem"', text)
+            self.assertIn("internal_tls_enabled = false", lines)
+            self.assertNotIn("[trusted_node_certs]", text)
 
         deployment = (PACKAGED / "deployment-ownerfs-local.yaml").read_text()
         self.assertIn("with_afs: true", deployment)

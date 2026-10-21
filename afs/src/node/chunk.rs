@@ -1791,7 +1791,7 @@ fn peer_serve_fixed_control_bytes() -> usize {
 
 #[derive(Debug)]
 #[cfg(any(feature = "dfs", test))]
-struct PeerControlLease {
+pub(crate) struct PeerControlLease {
     budget: Arc<PeerReadBudget>,
     bytes: u64,
     metrics: Option<super::read_work::ReadWorkMetrics>,
@@ -2804,7 +2804,6 @@ fn run_sidecar_installer(
             );
         }
         drop(state);
-        let mut installed_items = 0usize;
         for item in batch.iter().flatten() {
             let expired = queue
                 .state
@@ -2823,7 +2822,7 @@ fn run_sidecar_installer(
                 .join(format!("{}.bao", safe_id(&item.chunk_id.0)));
             let _diagnostic = context.metrics.as_ref().and_then(|metrics| {
                 metrics.coarse_diagnostic(
-                    "persist_proof_install_sync",
+                    "persist_proof_install",
                     item.proof.proof().encoded().len() as u64,
                 )
             });
@@ -2839,45 +2838,14 @@ fn run_sidecar_installer(
                     }
                     Ok(())
                 });
-            if installed.is_ok() {
-                installed_items += 1;
-            } else {
+            if installed.is_err() {
                 context.budget.sidecar_event("sidecar_install_failed");
             }
         }
+        // Optional proof publication has no durability barrier. Keep the
+        // owned proof charged until the completed installation is retired.
         #[cfg(test)]
-        if installed_items != 0 {
-            context.test.pause_before_directory_sync();
-        }
-        let directory_expired = queue
-            .state
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .deadline
-            .is_some_and(|deadline| Instant::now() >= deadline);
-        if installed_items != 0 && directory_expired {
-            // Files already installed remain optional and may be repaired on
-            // a later read. Do not begin another filesystem barrier after the
-            // absolute stop decision; active references retire only below.
-            for _ in 0..installed_items {
-                context.budget.sidecar_event("sidecar_install_dropped");
-            }
-        } else if installed_items != 0 {
-            let _diagnostic = context
-                .metrics
-                .as_ref()
-                .and_then(|metrics| metrics.coarse_diagnostic("persist_proof_dir_sync", 0));
-            #[cfg(test)]
-            let fail_directory = context
-                .test
-                .fail_directory_sync
-                .swap(false, Ordering::Relaxed);
-            #[cfg(not(test))]
-            let fail_directory = false;
-            if fail_directory || sync_outboard_directory(&context.directory).is_err() {
-                context.budget.sidecar_event("sidecar_install_failed");
-            }
-        }
+        context.test.pause_before_retire();
         #[cfg(test)]
         {
             let io = OUTBOARD_PERSIST_IO.with(|counts| std::mem::take(&mut *counts.borrow_mut()));
@@ -2914,10 +2882,8 @@ fn run_sidecar_installer(
 #[derive(Debug, Default)]
 struct SidecarInstallTestControl {
     block: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
-    before_directory_sync:
-        Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+    before_retire: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
     optional_io: Mutex<OutboardPersistIo>,
-    fail_directory_sync: std::sync::atomic::AtomicBool,
     fail_worker_start: std::sync::atomic::AtomicBool,
 }
 
@@ -2930,8 +2896,8 @@ impl SidecarInstallTestControl {
             let _ = release.recv();
         }
     }
-    fn pause_before_directory_sync(&self) {
-        let block = self.before_directory_sync.lock().unwrap().take();
+    fn pause_before_retire(&self) {
+        let block = self.before_retire.lock().unwrap().take();
         if let Some((entered, release)) = block {
             let _ = entered.send(());
             let _ = release.recv();
@@ -3195,7 +3161,7 @@ impl LocalChunkStore {
     }
 
     #[cfg(any(feature = "dfs", test))]
-    fn reserve_peer_control_until(
+    pub(crate) fn reserve_peer_control_until(
         &self,
         bytes: usize,
         deadline: Instant,
@@ -3718,6 +3684,8 @@ impl LocalChunkStore {
 
             let mut records = Vec::new();
             let mut installed_chunk_ids = HashSet::new();
+            let mut reused_objects = 0_u64;
+            let mut reused_bytes = 0_u64;
             for item in staged {
                 let mut replace_existing = false;
                 let existing = self
@@ -3753,13 +3721,13 @@ impl LocalChunkStore {
                     if existing.state == LocalChunkState::Quarantined {
                         replace_existing = true;
                     } else {
-                        match verify_file(&self.path_for_record(existing)?, &item.chunk) {
-                            Ok(()) => continue,
-                            Err(error) if verified_copy_is_invalid(&error) => {
-                                replace_existing = true
-                            }
-                            Err(error) => return Err(error),
-                        }
+                        // The catalog already records completed body/namespace/WAL
+                        // barriers for this immutable object. A retry reuses that
+                        // fact; it is not another storage-health scan. Delivery
+                        // still validates the original root and quarantines damage.
+                        reused_objects = reused_objects.saturating_add(1);
+                        reused_bytes = reused_bytes.saturating_add(item.chunk.length);
+                        continue;
                     }
                 }
                 let temp_path = self.staging.join(format!(
@@ -3835,6 +3803,8 @@ impl LocalChunkStore {
             drop(installed_chunk_ids);
             let catalog_revision = self.commit_catalog(&admission, records)?;
             admission.confirm();
+            self.catalog_committer
+                .note_persist_reuse(reused_objects, reused_bytes);
             // Optional proof installation remains after every required durability barrier.
             self.sidecar_installer.enqueue_batch(self, staged);
             let acks = staged
@@ -4014,6 +3984,21 @@ impl LocalChunkStore {
             }
         }
         result?;
+        Ok(PeerReadReservation {
+            budget: self.peer_read_budget.clone(),
+            bytes,
+            metrics: self.read_work.clone(),
+        })
+    }
+
+    /// Persistent RPC codecs share the original body pool. Admission does not
+    /// evict a healthy resident or wait: lack of room selects the original RPC
+    /// before business is sent. The HTTP body must own the returned lease.
+    #[cfg(feature = "dfs")]
+    pub(crate) fn reserve_peer_session_codec(&self, bytes: usize) -> Result<PeerReadReservation> {
+        let _reader = self.begin_peer_serve_read()?;
+        let bytes = u64::try_from(bytes).map_err(|_| peer_payload_capacity())?;
+        reserve_peer_bytes(&self.peer_read_budget, bytes, self.read_work.as_ref())?;
         Ok(PeerReadReservation {
             budget: self.peer_read_budget.clone(),
             bytes,
@@ -4408,8 +4393,16 @@ impl LocalChunkStore {
         let mut repair_proof = None;
         let result = (|| {
             let record = self.peer_catalog_record(chunk_id)?;
-            let file = File::open(self.path_for_record(&record)?).map_err(Error::from)?;
-            let before = PeerFileIdentity::read(&file)?;
+            // Pin the catalog snapshot and the one opened body together. The
+            // partial-proof path must not open the same body again just to load
+            // its disposable sidecar; all reads and final checks use this FD.
+            let reader = self.open_cataloged_record(record.clone())?;
+            let file = &reader.file;
+            let before = reader
+                .proof_identity
+                .lock()
+                .map_err(|_| peer_serve_unavailable("Peer file identity poisoned"))?
+                .clone();
             if before.length != record.chunk.length {
                 return Err(corrupt(chunk_id, "length mismatch"));
             }
@@ -4425,7 +4418,7 @@ impl LocalChunkStore {
                 && object.identity.as_ref() == Some(&(record.clone(), before.clone()))
             {
                 if self.peer_catalog_record(chunk_id)? != record
-                    || PeerFileIdentity::read(&file)? != before
+                    || PeerFileIdentity::read(file)? != before
                 {
                     return Err(corrupt(chunk_id, "identity changed during cached read"));
                 }
@@ -4468,7 +4461,6 @@ impl LocalChunkStore {
                 && (offset != 0 || allowed as u64 != record.chunk.length)
                 && ChunkObject::from_content_addressed_id(chunk_id).as_ref() == Some(&record.chunk)
             {
-                let reader = self.open_cataloged(chunk_id)?;
                 let loaded = self
                     .outboard_budget
                     .reserve_range_work(
@@ -4508,7 +4500,7 @@ impl LocalChunkStore {
                         bytes.resize(allowed, 0);
                         let mut work = OutboardReadWork::default();
                         let verified = proof.read_ranges_into_with_reserved_work(
-                            &file,
+                            file,
                             0,
                             &record.chunk,
                             &[VerifiedRangeCopy {
@@ -4530,7 +4522,7 @@ impl LocalChunkStore {
                             metrics.copy("outboard_range_delivery", work.copied_bytes);
                         }
                         if verified.is_ok()
-                            && PeerFileIdentity::read(&file)? == before
+                            && PeerFileIdentity::read(file)? == before
                             && self.peer_catalog_record(chunk_id)? == record
                         {
                             return Ok(PeerReadPayload {
@@ -4584,7 +4576,7 @@ impl LocalChunkStore {
                 self.outboard_budget.record_range_fullscan_fallback();
             }
             let (_, outboard) = verified_ranges_into_building(
-                &file,
+                file,
                 &record.chunk,
                 &[VerifiedRangeCopy {
                     chunk_offset: if resident { 0 } else { offset },
@@ -4596,7 +4588,7 @@ impl LocalChunkStore {
                 self.read_work.as_ref(),
                 builder,
             )?;
-            if PeerFileIdentity::read(&file)? != before
+            if PeerFileIdentity::read(file)? != before
                 || self.peer_catalog_record(chunk_id)? != record
             {
                 return Err(corrupt(chunk_id, "identity changed during verification"));
@@ -4703,6 +4695,11 @@ impl LocalChunkStore {
             .get(chunk_id)
             .cloned()
             .ok_or_else(|| invalid(format!("local Chunk '{}' is not cataloged", chunk_id.0)))?;
+        self.open_cataloged_record(record)
+    }
+
+    fn open_cataloged_record(&self, record: LocalChunkRecord) -> Result<PinnedChunkReader> {
+        let chunk_id = &record.chunk.id;
         if record.state != LocalChunkState::Durable {
             return Err(corrupt(chunk_id, "local copy is quarantined"));
         }
@@ -4860,19 +4857,14 @@ fn repair_outboard_if_needed(path: &Path, proof: &SharedOutboard, gates: &Outboa
     // Compare again under the shared gate: another reader may have repaired
     // this exact sidecar after our body scan. No catalog or body is rewritten.
     if !outboard_file_matches(path, proof).unwrap_or(false) {
-        let _ = persist_outboard_file(path, proof);
+        let _ = install_outboard_file(path, proof);
     }
 }
 
-fn persist_outboard_file(path: &Path, proof: &SharedOutboard) -> Result<()> {
-    install_outboard_file(path, proof)?;
-    let parent = path
-        .parent()
-        .ok_or_else(|| invalid("outboard path has no parent"))?;
-    sync_outboard_directory(parent)
-}
-
 fn install_outboard_file(path: &Path, proof: &SharedOutboard) -> Result<()> {
+    // This file is a reconstructable hint, never evidence for a durable ACK.
+    // Publish complete bytes atomically; reads validate against the original
+    // root and rebuild the hint if a crash leaves it missing or damaged.
     #[cfg(test)]
     OUTBOARD_INSTALL_HOOK.with(|hook| {
         if let Some(hook) = hook.borrow_mut().take() {
@@ -4893,9 +4885,6 @@ fn install_outboard_file(path: &Path, proof: &SharedOutboard) -> Result<()> {
         file.write_all(proof.encoded()).map_err(Error::from)?;
         #[cfg(test)]
         OUTBOARD_PERSIST_IO.with(|counts| counts.borrow_mut().writes += 1);
-        file.sync_all().map_err(Error::from)?;
-        #[cfg(test)]
-        OUTBOARD_PERSIST_IO.with(|counts| counts.borrow_mut().file_syncs += 1);
         fs::rename(&temp, path).map_err(Error::from)?;
         #[cfg(test)]
         OUTBOARD_PERSIST_IO.with(|counts| counts.borrow_mut().renames += 1);
@@ -4905,21 +4894,6 @@ fn install_outboard_file(path: &Path, proof: &SharedOutboard) -> Result<()> {
         let _ = fs::remove_file(&temp);
     }
     result
-}
-
-fn sync_outboard_directory(path: &Path) -> Result<()> {
-    #[cfg(test)]
-    if FAIL_OUTBOARD_DIRECTORY_SYNC.with(|fail| fail.replace(false)) {
-        return Err(Error::from(std::io::Error::other(
-            "injected outboard directory-sync failure",
-        )));
-    }
-    File::open(path)
-        .and_then(|directory| directory.sync_all())
-        .map_err(Error::from)?;
-    #[cfg(test)]
-    OUTBOARD_PERSIST_IO.with(|counts| counts.borrow_mut().directory_syncs += 1);
-    Ok(())
 }
 
 fn verified_copy_is_invalid(error: &Error) -> bool {
@@ -5308,9 +5282,6 @@ std::thread_local! {
     static OUTBOARD_INSTALL_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const {
         std::cell::RefCell::new(None)
     };
-    static FAIL_OUTBOARD_DIRECTORY_SYNC: std::cell::Cell<bool> = const {
-        std::cell::Cell::new(false)
-    };
 }
 
 #[cfg(test)]
@@ -5326,6 +5297,148 @@ struct OutboardPersistIo {
 #[cfg(test)]
 mod replica_replay_tests {
     use super::*;
+
+    #[test]
+    fn cp13v2_repeat_confirmation_reuses_durable_fact_without_body_scan() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+        let target = ReplicaTarget {
+            node_id: "node-a".into(),
+            node_epoch: 3,
+            data_endpoint: String::new(),
+            device: store.device_descriptor().unwrap(),
+        };
+        let staged = StagedChunk::new(OperationId::new("initial"), vec![37; 65_537]);
+        let first = store.persist(&staged, &target, 4, 5).unwrap();
+        VERIFIED_SCAN_BYTES.with(|bytes| bytes.set(0));
+        for number in 1..=4 {
+            let mut replay = staged.clone();
+            replay.operation_id = OperationId::new(format!("retry-{number}"));
+            let ack = store
+                .persist(&replay, &target, 4 + number, 5 + number)
+                .unwrap();
+            assert_eq!(ack.operation_id, replay.operation_id);
+            assert_eq!(ack.placement_revision, 4 + number);
+            assert_eq!(ack.placement_epoch, 5 + number);
+            assert_eq!(ack.node_epoch, target.node_epoch);
+            assert_eq!(ack.device_id, target.device.device_id);
+            assert_eq!(ack.device_epoch, target.device.device_epoch);
+            assert_eq!(ack.chunk_id, staged.chunk.id);
+            assert_eq!(ack.verified_digest, staged.chunk.content_digest);
+            assert_eq!(ack.persisted_bytes, staged.chunk.length);
+            assert_eq!(ack.catalog_revision, first.catalog_revision);
+        }
+        let scanned = VERIFIED_SCAN_BYTES.with(|bytes| bytes.replace(0));
+        let mut output = vec![0; staged.bytes().len()];
+        assert_eq!(
+            store.read_at(&staged.chunk.id, 0, &mut output).unwrap(),
+            output.len()
+        );
+        assert_eq!(output, staged.bytes());
+        assert_eq!(
+            scanned, 0,
+            "internal retry rescanned an already durable body"
+        );
+    }
+
+    #[test]
+    fn cp13v2_reused_confirmation_still_rejects_damage_before_delivery_and_repairs() {
+        for damage in ["same-length", "truncated", "missing"] {
+            let temp = tempfile::tempdir().unwrap();
+            let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+            let staged = StagedChunk::new(OperationId::new(damage), b"abcdef".to_vec());
+            let first = store.put(staged.clone()).unwrap();
+            let path = store.chunk_path(&staged.chunk.id);
+            match damage {
+                "same-length" => fs::write(&path, b"abXdef").unwrap(),
+                "truncated" => fs::write(&path, b"abc").unwrap(),
+                "missing" => fs::remove_file(&path).unwrap(),
+                _ => unreachable!(),
+            }
+            // A replay acknowledges the original durable fact, not fresh media
+            // health. Unknown storage damage is checked before data delivery.
+            VERIFIED_SCAN_BYTES.with(|bytes| bytes.set(0));
+            let replay = store.put(staged.clone()).unwrap();
+            let scanned = VERIFIED_SCAN_BYTES.with(|bytes| bytes.replace(0));
+            assert_eq!(replay.durable_acks, first.durable_acks);
+            assert_eq!(scanned, 0);
+            assert!(store.quarantined_chunks().unwrap().is_empty());
+            let mut rejected = [99; 6];
+            assert!(store.read_at(&staged.chunk.id, 0, &mut rejected).is_err());
+            assert_eq!(rejected, [99; 6], "unverified body escaped delivery");
+            assert_eq!(store.quarantined_chunks().unwrap().len(), 1);
+            let repaired = store.put(staged.clone()).unwrap();
+            assert!(
+                repaired.durable_acks[0].catalog_revision > first.durable_acks[0].catalog_revision
+            );
+            assert!(store.quarantined_chunks().unwrap().is_empty());
+            let mut output = [0; 6];
+            assert_eq!(store.read_at(&staged.chunk.id, 0, &mut output).unwrap(), 6);
+            assert_eq!(&output, staged.bytes());
+            drop(store);
+            let recovered = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+            assert_eq!(
+                recovered.read_at(&staged.chunk.id, 0, &mut output).unwrap(),
+                6
+            );
+            assert_eq!(&output, staged.bytes());
+        }
+    }
+
+    #[test]
+    fn cp13v2_metrics_export_completed_reuse_without_counting_rejected_requests() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = afs_metrics::Registry::new();
+        let store = LocalChunkStore::open(temp.path(), "node-a")
+            .unwrap()
+            .with_read_work_metrics(
+                super::super::read_work::ReadWorkMetrics::register(&registry).unwrap(),
+            );
+        let staged = StagedChunk::new(OperationId::new("metrics"), b"abcdef".to_vec());
+        let first = store.put(staged.clone()).unwrap();
+        let target = ReplicaTarget {
+            node_id: "node-a".into(),
+            node_epoch: 3,
+            data_endpoint: String::new(),
+            device: store.device_descriptor().unwrap(),
+        };
+        let mut future = target.clone();
+        future.device.catalog_revision += 1;
+        assert!(store.persist(&staged, &future, 4, 5).is_err());
+        let mut foreign = target.clone();
+        foreign.node_id = "node-b".into();
+        assert!(store.persist(&staged, &foreign, 4, 5).is_err());
+        let mut collision = staged.clone();
+        collision.chunk.length += 1;
+        assert!(store.persist(&collision, &target, 4, 5).is_err());
+        let before = afs_metrics::encode_text(&registry).unwrap();
+        for label in ["persist_reused_objects", "persist_reused_bytes"] {
+            assert!(
+                before.contains(&format!(
+                    "afs_dfs_catalog_commit_resources{{resource=\"{label}\"}} 0\n"
+                )),
+                "{before}"
+            );
+        }
+        let ack = store.persist(&staged, &target, 4, 5).unwrap();
+        assert_eq!(ack.catalog_revision, first.durable_acks[0].catalog_revision);
+        let _ = store.catalog_committer.fail(invalid("known store failure"));
+        assert!(store.persist(&staged, &target, 4, 5).is_err());
+        let after = afs_metrics::encode_text(&registry).unwrap();
+        for (label, count) in [("persist_reused_objects", 1), ("persist_reused_bytes", 6)] {
+            assert!(
+                after.contains(&format!(
+                    "afs_dfs_catalog_commit_resources{{resource=\"{label}\"}} {count}\n"
+                )),
+                "{after}"
+            );
+        }
+        let stats = store.catalog_commit_stats();
+        assert_eq!(stats.requests, 0);
+        assert_eq!(stats.groups, 1);
+        assert!(stats.actual_peak_bytes <= stats.peak_reserved_bytes);
+        assert!(stats.peak_reserved_bytes <= 1024 * 1024);
+    }
 
     #[test]
     fn p2_w3_uncontrolled_sixteen_requests_report_actual_groups_and_barriers() {
@@ -6051,6 +6164,13 @@ mod replica_replay_tests {
                 StagedChunk::new(OperationId::new("healthy-replace"), b"healthy".to_vec());
             store.put(healthy.clone()).unwrap();
             fs::write(store.chunk_path(&healthy.chunk.id), b"BROKEN!").unwrap();
+            // A replay no longer performs an implicit media-health scan. First
+            // establish corruption at the delivery boundary; the replacement
+            // below must still obey every original namespace/WAL barrier.
+            let mut rejected = [9; 7];
+            assert!(store.read_at(&healthy.chunk.id, 0, &mut rejected).is_err());
+            assert_eq!(rejected, [9; 7]);
+            assert_eq!(store.quarantined_chunks().unwrap().len(), 1);
             if later_prepare_failure {
                 store
                     .catalog_commit_test
@@ -6092,11 +6212,18 @@ mod replica_replay_tests {
             let syncs = STORE_DIRECTORY_SYNCS.with(|syncs| syncs.borrow_mut().take().unwrap());
             assert_eq!(syncs.first(), Some(&temp.path().join("chunks")));
             assert!(syncs.contains(&temp.path().to_path_buf()));
-            assert!(recovered.put(healthy).is_ok());
+            let repaired = recovered.put(healthy.clone()).unwrap();
             assert_eq!(
                 recovered.catalog_commit_stats().groups,
-                0,
-                "healthy replay uses the proven startup barriers"
+                1,
+                "persisted quarantine still requires a fresh durable repair"
+            );
+            let replay = recovered.put(healthy).unwrap();
+            assert_eq!(replay.durable_acks, repaired.durable_acks);
+            assert_eq!(
+                recovered.catalog_commit_stats().groups,
+                1,
+                "only the completed repair may be reused without another group"
             );
         }
     }
@@ -6411,17 +6538,15 @@ mod replica_replay_tests {
             );
             previous_end = phase.last_end_ns;
         }
-        for name in ["persist_proof_install_sync", "persist_proof_dir_sync"] {
-            assert_eq!(
-                snapshot
-                    .coarse_phases
-                    .iter()
-                    .find(|phase| phase.phase == name)
-                    .unwrap()
-                    .calls,
-                0
-            );
-        }
+        assert_eq!(
+            snapshot
+                .coarse_phases
+                .iter()
+                .find(|phase| phase.phase == "persist_proof_install")
+                .unwrap()
+                .calls,
+            0
+        );
         assert_eq!(receipt.durable_acks.len(), 1);
         assert_eq!(
             *store.sidecar_install_test.optional_io.lock().unwrap(),
@@ -6481,7 +6606,7 @@ mod replica_replay_tests {
         let io = *store.sidecar_install_test.optional_io.lock().unwrap();
         assert_eq!(
             (io.writes, io.file_syncs, io.renames, io.directory_syncs),
-            (64, 64, 64, 3)
+            (64, 0, 64, 0)
         );
         let retained = staged[0].outboard.clone();
         drop(staged);
@@ -6704,7 +6829,7 @@ mod replica_replay_tests {
     }
 
     #[test]
-    fn p2_w0_deadline_between_install_and_directory_barrier_skips_new_sync() {
+    fn p2_w0_stop_after_install_retires_owned_proof_without_more_io() {
         let temp = tempfile::tempdir().unwrap();
         let registry = afs_metrics::Registry::new();
         let metrics = super::super::read_work::ReadWorkMetrics::register(&registry).unwrap();
@@ -6719,11 +6844,7 @@ mod replica_replay_tests {
             .with_read_work_metrics(metrics);
         let (entered, entered_rx) = std::sync::mpsc::channel();
         let (release, release_rx) = std::sync::mpsc::channel();
-        *store
-            .sidecar_install_test
-            .before_directory_sync
-            .lock()
-            .unwrap() = Some((entered, release_rx));
+        *store.sidecar_install_test.before_retire.lock().unwrap() = Some((entered, release_rx));
         let receipt = store.put(staged.clone()).unwrap();
         entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(
@@ -6741,12 +6862,12 @@ mod replica_replay_tests {
         let io = *store.sidecar_install_test.optional_io.lock().unwrap();
         assert_eq!(
             (io.writes, io.file_syncs, io.renames, io.directory_syncs),
-            (1, 1, 1, 0)
+            (1, 0, 1, 0)
         );
         assert!(
             afs_metrics::encode_text(&registry)
                 .unwrap()
-                .contains("afs_dfs_outboard_events_total{event=\"sidecar_install_dropped\"} 1\n")
+                .contains("afs_dfs_outboard_events_total{event=\"sidecar_install_dropped\"} 0\n")
         );
         assert_eq!(receipt.chunk, staged.chunk);
         assert_eq!(
@@ -6980,7 +7101,7 @@ mod replica_replay_tests {
     }
 
     #[test]
-    fn coarse_persist_diagnostics_preserve_body_proof_barriers_and_receipts() {
+    fn coarse_persist_diagnostics_preserve_required_body_barriers_and_receipts() {
         for enabled in [false, true] {
             let temp = tempfile::tempdir().unwrap();
             let registry = afs_metrics::Registry::new();
@@ -7001,9 +7122,9 @@ mod replica_replay_tests {
                 take_store_outboard_persist_io(&store),
                 OutboardPersistIo {
                     writes: 2,
-                    file_syncs: 2,
+                    file_syncs: 0,
                     renames: 2,
-                    directory_syncs: 1,
+                    directory_syncs: 0,
                 }
             );
             for (receipt, item) in receipts.iter().zip(&staged) {
@@ -7036,8 +7157,7 @@ mod replica_replay_tests {
                         ("persist_catalog_write", 1),
                         ("persist_catalog_sync", 1),
                         ("persist_catalog_parent_sync", 1),
-                        ("persist_proof_install_sync", 2),
-                        ("persist_proof_dir_sync", 1),
+                        ("persist_proof_install", 2),
                     ] {
                         let phase = snapshot
                             .coarse_phases
@@ -7155,9 +7275,9 @@ mod replica_replay_tests {
             total,
             OutboardPersistIo {
                 writes: 1,
-                file_syncs: 1,
+                file_syncs: 0,
                 renames: 1,
-                directory_syncs: 1
+                directory_syncs: 0
             }
         );
         assert_eq!(
@@ -7245,9 +7365,9 @@ mod replica_replay_tests {
             take_store_outboard_persist_io(&store),
             OutboardPersistIo {
                 writes: 1,
-                file_syncs: 1,
+                file_syncs: 0,
                 renames: 1,
-                directory_syncs: 1
+                directory_syncs: 0
             }
         );
         assert_eq!(
@@ -7358,9 +7478,9 @@ mod replica_replay_tests {
             take_store_outboard_persist_io(&store),
             OutboardPersistIo {
                 writes: 1,
-                file_syncs: 1,
+                file_syncs: 0,
                 renames: 1,
-                directory_syncs: 1,
+                directory_syncs: 0,
             }
         );
     }
@@ -7454,7 +7574,119 @@ mod replica_replay_tests {
     }
 
     #[test]
-    fn wi6_outboard_batch_syncs_directory_once_and_replay_skips_writes() {
+    fn cp03v2_background_install_needs_no_disposable_proof_barriers() {
+        let temp = tempfile::tempdir().unwrap();
+        let budget = OutboardBudget::new(DEFAULT_OUTBOARD_BUDGET_BYTES);
+        let staged = pooled_outboard_chunks(&budget, 2, 128 * 1024);
+        let store = LocalChunkStore::open(temp.path(), "node-a")
+            .unwrap()
+            .with_outboard_budget(budget);
+        take_store_outboard_persist_io(&store);
+        let receipts = store.put_batch(staged.clone()).unwrap();
+        let io = take_store_outboard_persist_io(&store);
+        for (receipt, item) in receipts.iter().zip(&staged) {
+            assert_eq!(receipt.chunk, item.chunk);
+            let mut out = [0; 17];
+            assert_eq!(store.read_at(&item.chunk.id, 3, &mut out).unwrap(), 17);
+            assert_eq!(&out, &item.bytes()[3..20]);
+        }
+        assert_eq!((io.writes, io.renames), (2, 2));
+        assert_eq!(
+            (io.file_syncs, io.directory_syncs),
+            (0, 0),
+            "background proof is disposable after the durable body ACK"
+        );
+    }
+
+    #[test]
+    fn cp03v2_read_repair_needs_no_disposable_proof_barriers() {
+        let temp = tempfile::tempdir().unwrap();
+        let budget = OutboardBudget::new(DEFAULT_OUTBOARD_BUDGET_BYTES);
+        let staged = pooled_outboard_chunks(&budget, 1, 128 * 1024)
+            .pop()
+            .unwrap();
+        let store = LocalChunkStore::open(temp.path(), "node-a")
+            .unwrap()
+            .with_outboard_budget(budget);
+        store.put(staged.clone()).unwrap();
+        store.sidecar_installer.wait_idle();
+        let path = store
+            .outboards
+            .join(format!("{}.bao", safe_id(&staged.chunk.id.0)));
+        fs::remove_file(&path).unwrap();
+        let catalog = fs::read(&store.catalog_path).unwrap();
+        take_store_outboard_persist_io(&store);
+        let reader = store.open_verified(&staged.chunk.id).unwrap();
+        let mut out = [0; 23];
+        assert_eq!(reader.read_at(7, &mut out).unwrap(), out.len());
+        assert_eq!(&out, &staged.bytes()[7..30]);
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            staged.outboard.as_ref().unwrap().encoded()
+        );
+        assert_eq!(fs::read(&store.catalog_path).unwrap(), catalog);
+        let io = take_store_outboard_persist_io(&store);
+        assert_eq!((io.writes, io.renames), (1, 1));
+        assert_eq!(
+            (io.file_syncs, io.directory_syncs),
+            (0, 0),
+            "repairing a disposable proof must not add a persistence barrier"
+        );
+    }
+
+    #[test]
+    fn cp03v2_damaged_sidecars_reopen_with_original_root_and_reject_bad_body() {
+        for damage in 0..3 {
+            let temp = tempfile::tempdir().unwrap();
+            let budget = OutboardBudget::new(DEFAULT_OUTBOARD_BUDGET_BYTES);
+            let staged = pooled_outboard_chunks(&budget, 1, 128 * 1024)
+                .pop()
+                .unwrap();
+            let store = LocalChunkStore::open(temp.path(), "node-a")
+                .unwrap()
+                .with_outboard_budget(budget);
+            store.put(staged.clone()).unwrap();
+            store.sidecar_installer.wait_idle();
+            let path = store
+                .outboards
+                .join(format!("{}.bao", safe_id(&staged.chunk.id.0)));
+            let catalog = fs::read(&store.catalog_path).unwrap();
+            let body_path = store.chunk_path(&staged.chunk.id);
+            drop(store);
+            match damage {
+                0 => fs::remove_file(&path).unwrap(),
+                1 => fs::write(&path, [0; 31]).unwrap(),
+                _ => {
+                    let mut bytes = fs::read(&path).unwrap();
+                    bytes[64] ^= 1;
+                    fs::write(&path, bytes).unwrap();
+                }
+            }
+            let recovered = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+            let reader = recovered.open_verified(&staged.chunk.id).unwrap();
+            let mut out = vec![0; staged.bytes().len()];
+            assert_eq!(reader.read_at(0, &mut out).unwrap(), out.len());
+            assert_eq!(&out, staged.bytes());
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                staged.outboard.as_ref().unwrap().encoded()
+            );
+            assert_eq!(fs::read(&recovered.catalog_path).unwrap(), catalog);
+            assert_eq!(fs::read(&body_path).unwrap(), staged.bytes());
+            drop(reader);
+            drop(recovered);
+            let mut corrupt = staged.bytes().to_vec();
+            corrupt[7] ^= 1;
+            fs::write(&body_path, corrupt).unwrap();
+            let recovered = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+            let mut out = [9; 23];
+            assert!(recovered.read_at(&staged.chunk.id, 0, &mut out).is_err());
+            assert_eq!(out, [9; 23]);
+        }
+    }
+
+    #[test]
+    fn wi6_outboard_batch_publishes_without_barriers_and_replay_skips_writes() {
         let temp = tempfile::tempdir().unwrap();
         let budget = OutboardBudget::new(DEFAULT_OUTBOARD_BUDGET_BYTES);
         let staged = pooled_outboard_chunks(&budget, 16, 4 * 1024 * 1024);
@@ -7469,9 +7701,9 @@ mod replica_replay_tests {
             take_store_outboard_persist_io(&store),
             OutboardPersistIo {
                 writes: 16,
-                file_syncs: 16,
+                file_syncs: 0,
                 renames: 16,
-                directory_syncs: 1,
+                directory_syncs: 0,
             }
         );
         for item in &staged {
@@ -7497,7 +7729,7 @@ mod replica_replay_tests {
                 writes: 0,
                 file_syncs: 0,
                 renames: 0,
-                directory_syncs: 1,
+                directory_syncs: 0,
             }
         );
     }
@@ -7521,9 +7753,9 @@ mod replica_replay_tests {
             take_store_outboard_persist_io(&store),
             OutboardPersistIo {
                 writes: 4,
-                file_syncs: 4,
+                file_syncs: 0,
                 renames: 4,
-                directory_syncs: 2,
+                directory_syncs: 0,
             }
         );
         store.put_batch(Vec::new()).unwrap();
@@ -7570,15 +7802,15 @@ mod replica_replay_tests {
             take_store_outboard_persist_io(&store),
             OutboardPersistIo {
                 writes: 1,
-                file_syncs: 1,
+                file_syncs: 0,
                 renames: 1,
-                directory_syncs: 1,
+                directory_syncs: 0,
             }
         );
     }
 
     #[test]
-    fn wi6_outboard_batch_optional_failures_keep_acks_and_retry_barriers() {
+    fn wi6_outboard_batch_optional_failures_keep_acks_and_retry_installs() {
         let temp = tempfile::tempdir().unwrap();
         let budget = OutboardBudget::new(DEFAULT_OUTBOARD_BUDGET_BYTES);
         let staged = pooled_outboard_chunks(&budget, 2, 128 * 1024);
@@ -7595,9 +7827,9 @@ mod replica_replay_tests {
             take_store_outboard_persist_io(&store),
             OutboardPersistIo {
                 writes: 2,
-                file_syncs: 2,
+                file_syncs: 0,
                 renames: 1,
-                directory_syncs: 1,
+                directory_syncs: 0,
             }
         );
         assert!(fs::read_dir(&store.outboards).unwrap().all(|entry| {
@@ -7608,16 +7840,12 @@ mod replica_replay_tests {
                 .ends_with(".tmp")
         }));
         fs::remove_dir(blocked).unwrap();
-        store
-            .sidecar_install_test
-            .fail_directory_sync
-            .store(true, Ordering::Relaxed);
         assert_eq!(store.put_batch(staged.clone()).unwrap().len(), 2);
         assert_eq!(
             take_store_outboard_persist_io(&store),
             OutboardPersistIo {
                 writes: 1,
-                file_syncs: 1,
+                file_syncs: 0,
                 renames: 1,
                 directory_syncs: 0,
             }
@@ -7629,7 +7857,7 @@ mod replica_replay_tests {
                 writes: 0,
                 file_syncs: 0,
                 renames: 0,
-                directory_syncs: 1,
+                directory_syncs: 0,
             }
         );
         drop(store);
@@ -9366,11 +9594,11 @@ mod replica_replay_tests {
             text.contains("afs_dfs_read_copy_bytes_total{stage=\"pinned_range_to_output\"} 3\n"),
             "{text}"
         );
-        // The verified range passes through the official Bao codec before
-        // exact extraction: two full covering-group copies plus three bytes.
+        // The private coverage buffer goes straight into official Bao
+        // validation: one group copy into its scratch, then three output bytes.
         assert!(
             text.contains(
-                "afs_dfs_read_copy_bytes_total{stage=\"outboard_range_delivery\"} 65539\n"
+                "afs_dfs_read_copy_bytes_total{stage=\"outboard_range_delivery\"} 32771\n"
             ),
             "{text}"
         );
@@ -9414,7 +9642,7 @@ mod replica_replay_tests {
     }
 
     #[test]
-    fn corrupt_cataloged_chunk_is_replaced_by_immutable_retry() {
+    fn boundary_detected_corrupt_chunk_is_replaced_by_immutable_retry() {
         let temp = tempfile::tempdir().unwrap();
         let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
         let staged = StagedChunk::new(OperationId::new("retry-corrupt"), b"abcdef".to_vec());
@@ -9425,6 +9653,12 @@ mod replica_replay_tests {
             b"abXdef",
         )
         .unwrap();
+        // Replays reuse completed durability; corruption is established at the
+        // delivery boundary before the subsequent immutable retry repairs it.
+        let mut rejected = [9; 6];
+        assert!(store.read_at(&staged.chunk.id, 0, &mut rejected).is_err());
+        assert_eq!(rejected, [9; 6]);
+        assert_eq!(store.quarantined_chunks().unwrap().len(), 1);
         let repaired = store.put(staged.clone()).unwrap();
         assert!(repaired.durable_acks[0].catalog_revision > first.durable_acks[0].catalog_revision);
         let mut out = [9; 6];
@@ -9526,7 +9760,7 @@ mod replica_replay_tests {
     }
 
     #[test]
-    fn pinned_reader_verifies_partial_ranges_and_rejects_damage_outside_them() {
+    fn pinned_reader_verifies_ranges_and_rechecks_full_body_on_identity_change() {
         let temp = tempfile::tempdir().unwrap();
         let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
         let bytes: Vec<_> = (0..524_289).map(|index| (index % 251) as u8).collect();
@@ -9541,9 +9775,44 @@ mod replica_replay_tests {
             assert_eq!(&out, &bytes[offset as usize..offset as usize + 19]);
         }
         let path = temp.path().join("chunks").join(&staged.chunk.id.0);
-        let mut damaged = bytes;
+        let before = PeerFileIdentity::read(&reader.file).unwrap();
+        let modified = reader.file.metadata().unwrap().modified().unwrap();
+        let mut damaged = bytes.clone();
         damaged[524_288] ^= 1;
-        fs::write(path, damaged).unwrap();
+        fs::write(&path, damaged).unwrap();
+        let after = PeerFileIdentity::read(&reader.file).unwrap();
+        eprintln!("pinned damage identity before={before:?} after={after:?}");
+        // A fast same-size mutation can retain the same coarse timestamps.
+        // A range proof still validates the unchanged requested bytes against
+        // the original root; it makes no claim about an unread coverage group.
+        out.fill(9);
+        let first = reader.read_at(65_531, &mut out);
+        if before == after {
+            assert_eq!(first.unwrap(), 19);
+            assert_eq!(&out, &bytes[65_531..65_550]);
+        } else {
+            assert_eq!(
+                first.unwrap_err().code(),
+                afs_error::NODE_TRANSFER_CORRUPT_DATA
+            );
+            assert_eq!(out, [9; 19]);
+        }
+        // The damaged coverage group must never be delivered in either case.
+        out.fill(9);
+        assert_eq!(
+            reader.read_at(524_280, &mut out).unwrap_err().code(),
+            afs_error::NODE_TRANSFER_CORRUPT_DATA
+        );
+        assert_eq!(out, [9; 19]);
+        // Explicitly change identity instead of depending on wall-clock ticks.
+        // This preserves the original full-body fallback guard on any range.
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(modified.checked_add(Duration::from_secs(1)).unwrap())
+            .unwrap();
+        assert_ne!(PeerFileIdentity::read(&reader.file).unwrap(), before);
         out.fill(9);
         assert_eq!(
             reader.read_at(65_531, &mut out).unwrap_err().code(),

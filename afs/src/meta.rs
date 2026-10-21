@@ -25,12 +25,9 @@ pub struct Meta {
     pub store: Option<Arc<dyn store::MetaStore>>,
     pub owner_roots: Arc<dyn owner_roots::OwnerRootAuthority>,
     pub dfs: Option<dfs::DfsService>,
-    /// Exact leaf certificate DER -> trusted AFS node id.
-    ///
-    /// The map is populated only by production startup from `trusted_node_certs`;
-    /// tests that construct `Meta` directly leave it empty and do not enforce
-    /// transport identity. Runtime authority RPCs must use this map instead of
-    /// trusting node ids carried in request bodies.
+    /// Optional identity binding for explicitly authenticated RPC adapters.
+    /// Production internal services trust caller context and leave this disabled;
+    /// TLS independently verifies certificate chains during the handshake.
     pub trusted_nodes_by_der: Arc<HashMap<Vec<u8>, String>>,
     pub enforce_peer_identity: bool,
     watch_budget: Arc<watch::Budget>,
@@ -163,10 +160,6 @@ impl Meta {
 }
 /// 先恢复权威并初始化，再绑定两个端口并启动共享 Meta 的 gRPC 和 REST。
 pub async fn run(cfg: Config, obs: Observability) -> Result<(), BoxError> {
-    // Validate the transport identity policy before opening listeners or
-    // touching a configured persistent backend. A filesystem authority must
-    // never become partially available with CA-only authentication.
-    let (trusted_nodes_by_der, enforce_peer_identity) = peer_identity_policy(&cfg)?;
     let concrete_store = open_configured_store(&cfg).await?;
     if let Some(store) = &concrete_store {
         store.register_metrics(&obs.registry)?;
@@ -217,8 +210,8 @@ pub async fn run(cfg: Config, obs: Observability) -> Result<(), BoxError> {
         owner_roots,
         dfs,
         watch_budget: watch::Budget::standard(),
-        trusted_nodes_by_der: Arc::new(trusted_nodes_by_der),
-        enforce_peer_identity,
+        trusted_nodes_by_der: Arc::new(HashMap::new()),
+        enforce_peer_identity: false,
     });
     let grpc = tokio::net::TcpListener::bind(cfg.grpc_listen).await?;
     let rest = tokio::net::TcpListener::bind(cfg.rest_listen).await?;
@@ -292,53 +285,6 @@ pub async fn open_configured_store(cfg: &Config) -> Result<Option<Arc<store::Sto
     Ok(Some(Arc::new(
         store::Store::open_log_with_history(log, history).await?,
     )))
-}
-
-fn peer_identity_policy(
-    cfg: &Config,
-) -> Result<(HashMap<Vec<u8>, String>, bool), afs_error::Error> {
-    let trusted_nodes_by_der = load_trusted_node_certs(&cfg.trusted_node_certs)?;
-    let enforce_peer_identity = cfg.ownerfs || cfg.dfs;
-    if enforce_peer_identity && trusted_nodes_by_der.is_empty() {
-        return Err(config_invalid(
-            "meta filesystem authority requires trusted_node_certs for mTLS node identity binding",
-        ));
-    }
-    if enforce_peer_identity
-        && !matches!(
-            cfg.tls_config(),
-            afs_transport::grpc::TlsConfig::MutualTls { .. }
-        )
-    {
-        return Err(config_invalid(
-            "meta filesystem authority requires mTLS transport as well as trusted_node_certs",
-        ));
-    }
-    Ok((trusted_nodes_by_der, enforce_peer_identity))
-}
-
-fn load_trusted_node_certs(
-    certs: &HashMap<String, std::path::PathBuf>,
-) -> Result<HashMap<Vec<u8>, String>, afs_error::Error> {
-    let mut out = HashMap::new();
-    for (node_id, path) in certs {
-        if node_id.is_empty() {
-            return Err(config_invalid(
-                "trusted_node_certs contains an empty node id",
-            ));
-        }
-        let cert = crate::config::read_certificate_der(path)?;
-        if let Some(previous) = out.insert(cert, node_id.clone()) {
-            return Err(config_invalid(format!(
-                "trusted_node_certs maps the same certificate to both {previous} and {node_id}"
-            )));
-        }
-    }
-    Ok(out)
-}
-
-fn config_invalid(message: impl Into<String>) -> afs_error::Error {
-    afs_error::Error::coded(afs_error::CONFIG_INVALID, message)
 }
 
 #[cfg(test)]
@@ -724,79 +670,25 @@ mod tests {
         assert!(!root.join("wal-00000000000000000001.log").exists());
     }
 
-    #[test]
-    fn dfs_authority_requires_exact_node_certificate_bindings() {
-        let mut cfg = Config::resolve(Role::Meta, Cli::parse_from(["afs-meta"])).unwrap();
-        cfg.ownerfs = false;
-        cfg.dfs = true;
-        cfg.trusted_node_certs.clear();
-
-        let error = peer_identity_policy(&cfg).unwrap_err();
-        assert_eq!(error.code(), afs_error::CONFIG_INVALID);
-        assert!(error.to_string().contains("trusted_node_certs"));
-
-        cfg.dfs = false;
-        let (trusted, enforced) = peer_identity_policy(&cfg).unwrap();
-        assert!(trusted.is_empty());
-        assert!(!enforced);
-    }
-
     #[tokio::test]
-    async fn production_dfs_startup_rejects_ca_only_identity_before_backend_or_listeners() {
-        let mut cfg = Config::resolve(Role::Meta, Cli::parse_from(["afs-meta"])).unwrap();
-        cfg.ownerfs = false;
-        cfg.dfs = true;
-        cfg.trusted_node_certs.clear();
-
-        let error = run(cfg, Observability::new().unwrap()).await.unwrap_err();
-        assert!(error.to_string().contains("trusted_node_certs"));
-    }
-
-    #[tokio::test]
-    async fn filesystem_authority_rejects_disabled_tls_before_backend_or_listeners() {
+    async fn p7_internal_meta_startup_does_not_require_peer_identity_files() {
         let dir = tempfile::tempdir().unwrap();
-        let cert = dir.path().join("node.der");
-        // Identity-table fixtures do not perform a TLS handshake.
-        std::fs::write(&cert, [1, 2, 3, 4]).unwrap();
         let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         for (ownerfs, dfs) in [(true, false), (false, true)] {
             let mut cfg = Config::resolve(Role::Meta, Cli::parse_from(["afs-meta"])).unwrap();
             cfg.ownerfs = ownerfs;
             cfg.dfs = dfs;
             cfg.grpc_listen = occupied.local_addr().unwrap();
-            cfg.meta_store = MetaStoreBackend::LocalFile;
-            cfg.data_dir = dir.path().join("must-not-be-created");
-            cfg.trusted_node_certs.insert("node-a".into(), cert.clone());
-
+            cfg.meta_store = MetaStoreBackend::InMemory;
+            cfg.data_dir = dir.path().join("unused-memory-store");
+            // This optional table is for explicit authenticated adapters, not
+            // the production internal trust policy. No file is opened here.
+            cfg.trusted_node_certs
+                .insert("node-a".into(), dir.path().join("absent.pem"));
             let error = run(cfg, Observability::new().unwrap()).await.unwrap_err();
-            let coded = error.downcast_ref::<afs_error::Error>().unwrap();
-            assert_eq!(coded.code(), afs_error::CONFIG_INVALID);
-            assert!(coded.to_string().contains("mTLS transport"));
-            assert!(!dir.path().join("must-not-be-created").exists());
-        }
-    }
-
-    #[test]
-    fn filesystem_authority_accepts_mutual_tls_with_exact_node_bindings() {
-        let dir = tempfile::tempdir().unwrap();
-        let cert = dir.path().join("node.der");
-        std::fs::write(&cert, [1, 2, 3, 4]).unwrap();
-        for (ownerfs, dfs) in [(true, false), (false, true)] {
-            let mut cfg = Config::resolve(Role::Meta, Cli::parse_from(["afs-meta"])).unwrap();
-            cfg.ownerfs = ownerfs;
-            cfg.dfs = dfs;
-            cfg.trusted_node_certs.insert("node-a".into(), cert.clone());
-            cfg.tls_ca_certificate = Some(dir.path().join("ca.crt"));
-            cfg.tls_identity_certificate = Some(dir.path().join("meta.crt"));
-            cfg.tls_identity_private_key = Some(dir.path().join("meta.key"));
-            cfg.tls_server_name = Some("afs-cluster".into());
-
-            let (trusted, enforced) = peer_identity_policy(&cfg).unwrap();
-            assert!(enforced);
-            assert_eq!(
-                trusted.get([1, 2, 3, 4].as_slice()).map(String::as_str),
-                Some("node-a")
-            );
+            let io = error.downcast_ref::<std::io::Error>().unwrap();
+            assert_eq!(io.kind(), std::io::ErrorKind::AddrInUse);
+            assert!(!dir.path().join("unused-memory-store").exists());
         }
     }
 

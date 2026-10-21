@@ -277,6 +277,7 @@ dfs_min_distinct_nodes = 1
 dfs_min_distinct_failure_domains = 1
 dfs_local_copy = "required"
 
+internal_tls_enabled = true
 tls_ca_certificate = "{tls / "ca.pem"}"
 tls_identity_certificate = "{tls / "meta.pem"}"
 tls_identity_private_key = "{tls / "meta-key.pem"}"
@@ -300,6 +301,7 @@ data_mode = "grpc"
 log_level = "warn"
 trace_enabled = false
 
+internal_tls_enabled = true
 tls_ca_certificate = "{tls / "ca.pem"}"
 tls_identity_certificate = "{tls / f"{node}.pem"}"
 tls_identity_private_key = "{tls / f"{node}-key.pem"}"

@@ -28,6 +28,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Share the owned decode buffer for bulk reads; protobuf wire tags stay unchanged.
         .bytes(".afs.node.data.v1.OwnerReadReply.data")
         .bytes(".afs.node.data.v1.DfsReadRangesFrame.data")
+        .bytes(".afs.node.data.v1.DfsReadRangeReply.data")
         .bytes(".afs.node.data.v1.DfsReadRangesHeader.blake3_outboard")
         .bytes(".afs.node.data.v1.DfsPutReplicaFrame.data")
         .compile_protos(&["proto/node_data.proto"], &["proto"])?;

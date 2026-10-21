@@ -205,7 +205,7 @@ impl ReadWorkMetrics {
                 afs_metrics::Opts::new("afs_dfs_catalog_commit_resources", "Catalog control capacity and completed groups; excludes caller-owned bodies and the existing oversized-batch path."),
                 &["resource"],
             )?;
-            for resource in ["requests", "reserved_bytes", "peak_reserved_bytes", "actual_peak_bytes", "control_limit_bytes", "groups", "max_group", "failed", "exclusive"] {
+            for resource in ["requests", "reserved_bytes", "peak_reserved_bytes", "actual_peak_bytes", "control_limit_bytes", "groups", "max_group", "failed", "exclusive", "persist_reused_objects", "persist_reused_bytes"] {
                 catalog_commit_resources.with_label_values(&[resource]);
             }
             afs_metrics::register_collector(registry, &catalog_commit_resources)?;
@@ -511,6 +511,7 @@ impl ReadWorkMetrics {
                 "stream_verified_group",
                 "stream_group_corrupt",
                 "stream_proof_retired",
+                "range_session_request",
             ] {
                 peer_read_events.with_label_values(&[event]);
             }
@@ -521,6 +522,7 @@ impl ReadWorkMetrics {
                 "get_chunk_sources",
                 "validate_read_grants",
                 "peer_read_ranges",
+                "peer_read_session",
             ] {
                 read_rpc_calls.with_label_values(&[method]);
             }
@@ -984,6 +986,8 @@ impl ReadWorkMetrics {
                     | "max_group"
                     | "failed"
                     | "exclusive"
+                    | "persist_reused_objects"
+                    | "persist_reused_bytes"
             ) && let Ok(value) = i64::try_from(*value)
             {
                 self.catalog_commit_resources
@@ -1111,6 +1115,7 @@ impl ReadWorkMetrics {
                 | "get_chunk_sources"
                 | "validate_read_grants"
                 | "peer_read_ranges"
+                | "peer_read_session"
         ) {
             self.read_rpc_calls.with_label_values(&[method]).inc();
         }
@@ -1135,6 +1140,7 @@ impl ReadWorkMetrics {
                 | "stream_verified_group"
                 | "stream_group_corrupt"
                 | "stream_proof_retired"
+                | "range_session_request"
         ) {
             self.peer_read_events.with_label_values(&[event]).inc();
         }
@@ -1372,7 +1378,7 @@ impl ReadDiagnosticConsumerWork {
 // One fixed entry per phase, not one event per frame or syscall. First/last
 // endpoints describe the aggregate envelope, not a contiguous critical path.
 #[cfg(any(feature = "dfs", test))]
-const READ_COARSE_PHASES: [&str; 24] = [
+const READ_COARSE_PHASES: [&str; 23] = [
     "peer_slot_wait",
     "peer_read_verify",
     "peer_first_frame_enqueue",
@@ -1388,8 +1394,7 @@ const READ_COARSE_PHASES: [&str; 24] = [
     "persist_catalog_write",
     "persist_catalog_sync",
     "persist_catalog_parent_sync",
-    "persist_proof_install_sync",
-    "persist_proof_dir_sync",
+    "persist_proof_install",
     "meta_publish_rpc",
     "meta_placement_rpc",
     "meta_create_rpc",
@@ -1708,7 +1713,7 @@ impl ReadDiagnostics {
             })
             .collect();
         ReadDiagnosticsSnapshot {
-            schema_version: 4,
+            schema_version: 5,
             sampled_monotonic_ns: monotonic_ns(),
             process_cpu_ns: process_cpu_ns(),
             capacity: READ_DIAGNOSTIC_CAPACITY,
@@ -2218,7 +2223,7 @@ mod tests {
         token.first_data();
         span.finish(true);
         let snapshot = metrics.diagnostics_snapshot().unwrap();
-        assert_eq!(snapshot.schema_version, 4);
+        assert_eq!(snapshot.schema_version, 5);
         assert_eq!(snapshot.records.len(), 1);
         assert_eq!(snapshot.records[0].first_data_ns, first);
         assert!(first >= snapshot.records[0].start_ns);
@@ -2366,7 +2371,7 @@ mod tests {
         }
         drop(span);
         let snapshot = metrics.diagnostics_snapshot().unwrap();
-        assert_eq!(snapshot.schema_version, 4);
+        assert_eq!(snapshot.schema_version, 5);
         assert!(snapshot.metadata_bytes <= super::READ_DIAGNOSTIC_MAX_METADATA_BYTES);
         let record = &snapshot.records[0];
         assert!(record.completed && !record.success);
@@ -2672,6 +2677,7 @@ mod tests {
             "stream_verified_group",
             "stream_group_corrupt",
             "stream_proof_retired",
+            "range_session_request",
         ] {
             metrics.peer_read_event(event);
             assert_eq!(same.peer_read_events.with_label_values(&[event]).get(), 1);
@@ -2682,7 +2688,7 @@ mod tests {
             .iter()
             .find(|family| family.name() == "afs_dfs_peer_read_events_total")
             .unwrap();
-        assert_eq!(events.get_metric().len(), 15);
+        assert_eq!(events.get_metric().len(), 16);
     }
 
     #[test]
@@ -2696,6 +2702,7 @@ mod tests {
             "get_chunk_sources",
             "validate_read_grants",
             "peer_read_ranges",
+            "peer_read_session",
         ] {
             metrics.read_rpc(method);
             assert_eq!(same.read_rpc_calls.with_label_values(&[method]).get(), 1);
@@ -2706,7 +2713,7 @@ mod tests {
             .iter()
             .find(|family| family.name() == "afs_dfs_read_rpc_calls_total")
             .unwrap();
-        assert_eq!(calls.get_metric().len(), 5);
+        assert_eq!(calls.get_metric().len(), 6);
     }
 
     #[test]
