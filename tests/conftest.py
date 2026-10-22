@@ -108,8 +108,6 @@ def _install_yr_stubs() -> None:
         yr.get = _passthrough_get
     if not hasattr(yr, "Config"):
         yr.Config = type("Config", (), {})
-    if not hasattr(yr, "InvokeOptions"):
-        yr.InvokeOptions = type("InvokeOptions", (), {})
 
     # yr.config — InvokeOptions / PortForwarding are imported by name at top of
     # sandbox.py. Provide dataclass-like stubs that accept arbitrary kwargs.
@@ -140,6 +138,12 @@ def _install_yr_stubs() -> None:
         yr_config.PortForwarding = _PortForwarding
         sys.modules["yr.config"] = yr_config
         yr.config = yr_config
+
+    # Real SDK re-exports yr.config.InvokeOptions as the top-level
+    # yr.InvokeOptions; mirror that so both entry points expose the same
+    # attribute shape (e.g. ``port_forwardings`` read after create).
+    if not hasattr(yr, "InvokeOptions"):
+        yr.InvokeOptions = sys.modules["yr.config"].InvokeOptions
 
     # yr.runtime_holder — only ``global_runtime`` is imported at top of sandbox.py.
     if "yr.runtime_holder" not in sys.modules or not hasattr(sys.modules["yr.runtime_holder"], "global_runtime"):

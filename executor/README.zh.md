@@ -36,518 +36,281 @@ pre-stop:    yr.agentexecutor.handler.pre_stop
 
 ## 沙箱 API
 
-Executor 启动时创建 `SandboxManager` 并注入 HTTP Server，默认监听
-`0.0.0.0:18093`（可用环境变量 `YR_AGENT_EXECUTOR_HOST`/`YR_AGENT_EXECUTOR_PORT`
-覆盖），但仅接受回环来源的请求。同机进程通过回环 HTTP 按需创建、操控和销毁
-**远程子沙箱容器**——操作对象是独立的子容器，不是函数实例容器本身。沙箱不预建：
-调用方先 `POST /v1/sandbox/sandboxes` 创建，拿到 `instance_id` 后把它放进后续
-请求的 URL 路径；多个沙箱按 id 隔离，各自独立生命周期。
+执行器启动时创建 `SandboxManager` 并注入 HTTP Server,后者默认监听
+`0.0.0.0:18093`(可用环境变量 `YR_AGENT_EXECUTOR_HOST`/
+`YR_AGENT_EXECUTOR_PORT` 覆盖),但仅接受回环来源的请求。同机进程通过回环
+HTTP 创建、操作与销毁**远端子沙箱容器**——目标是独立的子容器,不是函数实例
+容器本身。沙箱不预创建:调用方先 `POST /api/sandbox/v1/sandboxes` 创建一个,
+拿到沙箱 id 后放入后续请求的 URL 路径;多个沙箱按 id 隔离,各自独立生命周期。
+
+本 API 遵循平台 yaml 契约(管理面 `sandbox.yaml` + 数据面 `data-plane.yaml`),
+由两族端点组成:
+
+- **管理面**——`POST /api/sandbox/v1/sandboxes`(创建)与
+  `DELETE /api/sandbox/v1/sandboxes/{sandboxId}`(删除)。成功响应为
+  Envelope 形态(`data` 为 Base64 编码的 JSON);失败响应为 ErrorEnvelope
+  形态。
+- **数据面**——`POST /direct/{instanceId}/invoke`,单一动作分发端点,携带
+  原生动作 JSON;action 级失败走 HTTP 200、错误在 body。
+
+旧前缀 `/v1/sandbox/sandboxes` **不再注册**:任何请求一律返回 404
+`{"message": "endpoint not found"}`。
 
 ### 通用约定
 
-- **调用地址**：沙箱 API 只服务同机进程，必须用回环地址访问
-  `http://127.0.0.1:{port}/...`。请求来源 IP 不属于回环段（IPv4 `127.0.0.0/8`、
-  IPv6 `::1` 及 IPv4-mapped 回环地址）时返回 403——即使调用方与 Executor 同机，
-  使用机器 IP 访问也会被拒绝：
+- **基础地址**:沙箱 API 仅服务同机进程,必须通过回环地址
+  `http://127.0.0.1:{port}/...` 访问。来源 IP 不在回环范围(IPv4
+  `127.0.0.0/8`、IPv6 `::1` 及 IPv4 映射回环地址)内的请求一律 403 拒绝
+  ——即使同机调用方使用本机 IP 也会被拒:
 
   ```json
   {"message": "sandbox API is loopback-only"}
   ```
 
-- **资源式 URL**：路径为 `/v1/sandbox/sandboxes[/{id}[/{action}]]`，按 HTTP 语义
-  选方法——纯读 GET、创建/动作 POST、覆写 PUT、删除 DELETE。
-- **请求格式**：`create`/`execute` 的请求体为 JSON，必须带
-  `Content-Type: application/json`（否则 400），body 用 `Content-Length` 或
-  chunked 传输均可；`files/write` 的 body 为文件原始内容（非 JSON），必须带
-  `Content-Length`（缺失返回 400）。
-- **尺寸上限**：沙箱 API 的请求（JSON body 与 `files/write` 的原始 body）与
-  响应各有独立的 512 MiB 默认上限，超限均返回 413，不受 Frontend 文件接口
-  `max_file_size` 影响。Base64 传输的二进制实际大小约为上限的四分之三。
-- **并发**：HTTP Server 全局最多同时处理 64 个请求（含所有端点），超限返回 503
-  并关闭连接：
+- **X-Request-Id(管理面)**:可选的请求标识(幂等键:重试须保持同一 id 且
+  同一 body)。携带时在成功与错误响应的 `X-Request-Id` 响应头中回显;缺省
+  时服务端生成 UUID 并同样回显。生效的 id 也会以 `requestId` 出现在
+  Envelope 内。
+- **X-Trace-ID**(私有约定,契约外):两族端点均可选的链路追踪 id,适配层
+  读取后传给底层 RPC,并复用于 agent 进出日志对。旧的 `trace_id` body 字段
+  返回 400(`trace_id moved to X-Trace-ID header`)。
+- **请求格式**:请求体为 JSON,必须携带 `Content-Type: application/json`
+  (否则 400);body 可用 `Content-Length` 或 chunked 传输编码。非合法 JSON
+  或非 JSON 对象一律 400。
+- **尺寸上限**:沙箱 API 的请求与响应各自独立默认上限 512 MiB,超出返回
+  413;该上限与前端文件 API 的 `max_file_size` 相互独立。二进制内容以 hex
+  编码传输(见各文件 action),有效负载为上限的一半。
+- **并发**:HTTP Server 全局(所有端点合计)最多同时处理 64 个请求,超限
+  返回 503 并断开连接:
 
   ```json
   {"message":"executor is busy"}
   ```
 
-- **trace_id**：所有端点接受可选 `trace_id`（`create`/`execute` 放 JSON body，
-  其余端点放 URL query），透传到整条调用链便于日志排查。1-128 个字符，仅允许
-  `A-Z a-z 0-9 _ - . :`（覆盖 UUID、hex、点分名）；不传时由后端自行生成。
-  注意格式非法时报 500 而非 400（校验发生在底层调用）。
-- **状态码**：
+- **管理面错误模型**:管理面所有非 200 响应为 ErrorEnvelope,携带符号码、
+  重试提示与结果语义,生效请求 id 同时出现在响应头与 body:
 
-  | 状态码 | 触发条件 |
-  |---|---|
-  | 200 | 成功（含命令执行失败等业务性结果，见各端点说明） |
-  | 400 | 参数缺失、类型/取值非法、`Content-Type` 不符等请求错误 |
-  | 403 | 请求来源非回环地址 |
-  | 404 | URL 形状未注册，或路径中的 `{id}` 对应的沙箱不存在（`DELETE` 对不存在的 `{id}` 返回幂等 200） |
-  | 405 | 路径存在但 HTTP 方法未注册，响应带 `Allow` 头（如对 `.../{id}/execute` 发 GET 返回 `Allow: POST`）；`{id}` 不存在时优先返回 404 |
-  | 413 | 请求体或响应体超过 512 MiB 上限 |
-  | 500 | 底层 RPC/IO 异常，`message` 为带操作前缀的底层真实原因（如 `execute failed: rpc timeout`） |
-  | 503 | 并发超过 64 |
+  ```json
+  {"code": 400, "message": "cpu must be an integer", "data": null,
+   "error": {"code": "invalid", "retry": "never",
+             "outcome": "not_started", "requestId": "req-create-013"}}
+  ```
 
-所有错误响应的 body 均为 `{"message": "..."}` 形式的 JSON。
+  | HTTP | error.code | retry | outcome | 触发条件 |
+  |---|---|---|---|---|
+  | 400 | `invalid` | `never` | `not_started` | 参数类型/取值错误、Content-Type 错误、JSON 非法 |
+  | 404 | `not_found` | `never` | `terminal` | 沙箱 id 未知、子资源未注册 |
+  | 405 | `method_not_allowed` | `never` | `not_started` | 路径存在但方法未注册,响应携带 `Allow` 头 |
+  | 413 | `too_large` | `never` | `not_started` | 请求或响应超尺寸上限 |
+  | 500 | `internal` | `after_backoff` | `unknown` | 底层 RPC/IO 失败 |
 
-### 1. 创建沙箱：`POST /v1/sandbox/sandboxes`
+- **数据面错误模型**:传输与参数类错误(400 未知 action 或参数非法、404
+  实例或路径形状未知、405 带 `Allow`、413、500)返回 `{"error": "..."}`
+  形态。action 级失败——分发已完成但操作本身失败(缺文件、RPC 失败等)——
+  走 HTTP 200,错误在动作结果 body 内(见各 action)。
+
+### 1. 创建沙箱:`POST /api/sandbox/v1/sandboxes`
 
 ```http
-POST /v1/sandbox/sandboxes HTTP/1.1
+POST /api/sandbox/v1/sandboxes HTTP/1.1
 Content-Type: application/json
+X-Request-Id: req-create-013
+X-Trace-ID: trace-abc
 
 {
   "image": "python:3.12-slim",
-  "cpu": 1000,
-  "memory": 2048,
-  "sandbox_type": "supervisor",
-  "ports": ["tcp:8080", "9090"],
-  "upstream": "127.0.0.1:8000",
-  "working_dir": "/sandbox",
+  "runtime": "supervisor",
+  "cpu": 2000,
+  "memory": 4096,
   "env": {"PATH": "/usr/bin"},
-  "idle_timeout": 600
+  "ports": ["tcp:8080"],
+  "idle_timeout": 600,
+  "extra_config": {"working_dir": "/sandbox"}
 }
 ```
 
-| 参数             | 类型                      | 必填 | 默认值            | 说明                                                                                                    |
-|-----------------|---------------------------|------|------------------|---------------------------------------------------------------------------------------------------------|
-| `image`         | string                    | 否   | 无                | docker 镜像名，`sandbox_type="docker"` 时生效                                                              |
-| `cpu`           | int                       | 否   | 无                | CPU 资源，millicores                                                                                      |
-| `memory`        | int                       | 否   | 无                | 内存，MB                                                                                                  |
-| `sandbox_type`  | string                    | 否   | `""`              | 沙箱执行器类型：`""`/`"supervisor"`/`"docker"`                                                              |
-| `ports`         | array\<string\>           | 否   | 无                | 端口转发列表，元素为 `"proto:port"`（如 `"tcp:8080"`）或 `"port"`                                             |
-| `upstream`      | string                    | 否   | 无                | 反向隧道 upstream，本机服务地址 `host:port`，如 `"127.0.0.1:8000"`                                             |
-| `working_dir`   | string                    | 否   | 沙箱内临时目录      | 沙箱内工作目录                                                                                              |
-| `env`           | object\<string,string\>   | 否   | 继承沙箱运行环境    | 环境变量；指定时整体生效（不与默认环境合并）                                                                    |
-| `idle_timeout`  | int                       | 否   | `300`             | 空闲超时（秒），必须大于 0                                                                                  |
-| `user`          | string                    | 否   | 平台默认 `agentos` | 容器 run-as 用户，透传为 Docker 的 `Config.User`；支持 `"1000"`、`"1000:1000"`、`"root"` 等 Docker 接受的格式；仅 `sandbox_type="docker"` 时生效 |
-| `trace_id`      | string                    | 否   | `""`              | 链路追踪 ID，1-128 字符，仅允许 `A-Z a-z 0-9 _ - . :`；不传由后端生成                                          |
+请求头:`X-Request-Id`(可选,生成/回显)、`X-Trace-ID`(可选,私有追踪)。
 
-**成功响应（200）**——create 为同步阻塞语义，返回 200 即子沙箱已就绪（创建过程
-内含就绪验证），无需轮询状态：
+请求体字段(适配层消费的 13 个契约字段):
+
+| 参数 | 类型 | 必填 | 默认值 | 说明 |
+|---|---|---|---|---|
+| `name` | string | 否 | 无 | 沙箱名称;实例以该名称创建并寻址 |
+| `image` | string | 否 | 无 | 镜像名;仅 `runtime="docker"` 时生效 |
+| `runtime` | string | 否 | `""` | 运行时/执行器类型,直通底层执行器选择;空串走底层默认执行器 |
+| `rootfs` | string 或 object | 否 | 无 | 根文件系统:字符串原样透传;对象 `{type, imageurl, ...}` 由适配层组装为 rootfs JSON(mounts 并入)。与 `image` 互斥 |
+| `cpu` | int | 否 | 无 | CPU 资源(millicores) |
+| `memory` | int | 否 | 无 | 内存(MiB) |
+| `env` | object\<string,string\> | 否 | 继承沙箱运行时 | 环境变量;指定后整体生效(不与默认环境合并) |
+| `ports` | array\<string\> | 否 | 无 | 端口转发列表;元素为 `"proto:port"`(如 `"tcp:8080"`)或 `"port"` |
+| `idleTimeoutSeconds` | int | 否 | `300` | 空闲回收超时(秒);须非负(允许 0)。`idle_timeout` 为兼容别名 |
+| `mounts` | array\<object\> | 否 | 无 | 挂载声明;原样并入 rootfs JSON 的 `mounts` 键透传后端。须搭配对象形态 `rootfs` 或 `image`(字符串 `rootfs` 不接受 mounts) |
+| `snapshotId` | string | 否 | 无 | 从快照创建:分流到恢复链路(`Sandbox(checkpoint_id=...)`),其余参数忽略 |
+| `tunnel` | object | 否 | 无 | `{enabled, proxyPort}`:`proxyPort` 接底层代理端口;`enabled=true` 须搭配 `extra_config.upstream`(否则 400);`enabled=false` 显式关断 upstream 隐含的隧道 |
+| `extra_config` | object | 否 | 无 | 运行时自定义键通道:`upstream`/`working_dir`/`user` 三键提取映射底层字段,剩余键整体透传 |
+
+执行器类型由 body 顶层的 `runtime` 字段承载。私有字段
+`upstream`/`working_dir`/`user` 位于 `extra_config` 内,`trace_id` 位于
+`X-Trace-ID` 头:顶层携带这些字段、或在 `extra_config` 内携带
+`sandbox_type`,均返回 400 并提示正确位置。
+
+**成功(200)**——创建同步阻塞:200 即子沙箱就绪(创建含就绪验证),无需
+轮询。响应头回显 `X-Request-Id`;`data` 为 Base64 编码的 JSON:
 
 ```json
-{
-  "instance_id": "34420000-0000-4000-886a-980025037460"
-}
+{"code": 200, "message": "ok",
+ "data": "eyJzYW5kYm94SWQiOiJzYngtMTIzIi..."}
 ```
 
-`instance_id` 为平台实例 ID（UUID 形态），后续所有操作把它填进 URL 路径的 `{id}` 段。
+`data` 明文:
 
-**失败响应**：
+```json
+{"sandboxId": "34420000-0000-4000-886a-980025037460",
+ "instanceId": "34420000-0000-4000-886a-980025037460",
+ "status": "running", "requestId": "req-create-013"}
+```
 
-- 400——参数类型/取值非法，如 `ports` 非字符串数组、`env` 键值非字符串、
-  `cpu`/`memory`/`idle_timeout` 非整数、`idle_timeout <= 0`、`trace_id` 非字符串：
+`sandboxId` 与 `instanceId` 同值(底层 create 返回的平台实例 id);
+`status` 恒为 `"running"`,`requestId` 为本次生效的请求 id。后续所有操作
+将该 id 放入 URL 路径。
 
-  ```json
-  {"message": "idle_timeout must be greater than zero"}
-  ```
+**失败响应**为 ErrorEnvelope 形态,例如:
 
-- 500——创建失败，`message` 为 `create sandbox failed: ` 加底层原因。注意
-  `ports` 元素的格式（`proto:port`）在创建阶段才校验，非法格式（如
-  `"tcp:8080:9"`、`"tcp:abc"`）也走 500 而非 400：
+- 400——参数类型/取值非法(`cpu must be an integer`、
+  `idle_timeout must be non-negative`、`rootfs and image are mutually
+  exclusive`、`tunnel.enabled=true requires extra_config.upstream` 等)。
+- 500——创建失败;`message` 为 `create sandbox failed: ` 加底层原因
+  (`Failed to initialize sandbox instance: ...`)。注意 `ports` 元素格式
+  (`proto:port`)仅在创建时校验,非法元素同样表现为 500。
 
-  ```json
-  {"message": "create sandbox failed: rpc timeout"}
-  ```
-
-### 2. 删除沙箱：`DELETE /v1/sandbox/sandboxes/{id}`
+### 2. 删除沙箱:`DELETE /api/sandbox/v1/sandboxes/{sandboxId}`
 
 ```http
-DELETE /v1/sandbox/sandboxes/34420000-0000-4000-886a-980025037460 HTTP/1.1
+DELETE /api/sandbox/v1/sandboxes/34420000-0000-4000-886a-980025037460 HTTP/1.1
+X-Request-Id: req-del-007
 ```
 
-| 参数         | 类型 | 必填 | 默认值 | 说明                                        |
-|-------------|------|------|--------|---------------------------------------------|
-| `{id}`（路径） | string | 是 | — | 沙箱实例 ID，create 返回的 `instance_id`     |
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `{sandboxId}`(路径) | string | 是 | 沙箱 id,即 create 返回的 `sandboxId`/`instanceId` |
+| `X-Request-Id`(头) | string | 否 | 同创建,生成/回显 |
 
-无请求 body。
+无请求体。
 
-**成功响应（200）**：
+**成功(200)**——`data` 明文为 `{"success": true}`:
 
 ```json
-{
-  "success": true
-}
+{"code": 200, "message": "ok", "data": "eyJzdWNjZXNzIjp0cnVlfQ=="}
 ```
 
-**幂等删除（200）**——`{id}` 不存在时不发底层 terminate 请求，仍返回 200，
-重复删除安全：
+**沙箱不存在(404)**——删除未知或已删除的沙箱返回 404 + ErrorEnvelope
+(旧接口为 200 + `success:false`,已变更):
 
 ```json
-{
-  "success": false,
-  "message": "sandbox not found"
-}
+{"code": 404, "message": "sandbox sbx-123 not found", "data": null,
+ "error": {"code": "not_found", "retry": "never", "outcome": "terminal",
+           "requestId": "req-del-007"}}
 ```
 
-**失败响应（500）**——仅当底层 terminate RPC 抛异常（例如平台侧实例已被
-回收）时返回，`message` 为底层原始原因：
+### 3. 运行时动作分发:`POST /direct/{instanceId}/invoke`
+
+数据面单一端点分发受支持的动作。响应为原生动作 JSON(无 Envelope);
+action 级失败走 HTTP 200、错误在 body。
+
+公共参数:
+
+| 参数 | 位置 | 必填 | 默认值 | 说明 |
+|---|---|---|---|---|
+| `{instanceId}` | path | 是 | — | 沙箱实例 id |
+| `X-ADX-Request-ID` | header | 否 | 见 `requestId` | 请求标识(幂等键);优先级:头 > body.requestId > 服务端生成 UUID |
+| `X-Trace-ID` | header | 否 | `""` | 链路追踪(私有约定,契约外) |
+| `action` | body | 是 | — | 6 个受支持动作之一:`process.exec`、`process.run`、`file.read`、`file.write`、`file.list`、`file.search`;契约其余 action(含分块 `file.read_chunk`/`file.write_chunk`)一律返回 400 |
+| `args` | body | 否 | `{}` | 各动作参数(见下) |
+| `requestId` | body | 否 | 服务端生成 UUID | 请求标识的 body 形式 |
+
+**action `process.exec` / `process.run`**——命令执行(两个名字同义):
+
+| args | 类型 | 必填 | 默认值 | 说明 |
+|---|---|---|---|---|
+| `cmd` | string | 与 `command` 二选一(`cmd` 优先) | 无 | shell 命令 |
+| `command` | string | 否 | 无 | `cmd` 别名 |
+| `cwd` | string | 否 | 无 | 工作目录(`working_dir` 别名同收) |
+| `envs` | object\<string,string\> | 否 | 无 | 环境变量(`env` 别名同收) |
+| `timeout` | number,≥0 | 否 | 不限 | 超时秒数 |
 
 ```json
-{
-  "message": "instance not found"
-}
+{"action": "process.exec", "args": {"cmd": "ls -la", "cwd": "/ws", "timeout": 300},
+ "requestId": "invoke-001"}
 ```
 
-### 3. 执行命令：`POST /v1/sandbox/sandboxes/{id}/execute`
+响应:`{"stdout": "...", "stderr": "...", "exit_code": 0}`——注意字段为
+`exit_code`(旧接口 `returncode` 已改名)。RPC 失败仍返回 200:
+`{"stdout": "", "stderr": "execute failed: ...", "exit_code": -1}`。
 
-```http
-POST /v1/sandbox/sandboxes/34420000-0000-4000-886a-980025037460/execute HTTP/1.1
-Content-Type: application/json
+**action `file.read`**——整读:
 
-{
-  "command": ["ls", "-la"],
-  "working_dir": "/tmp",
-  "env": {"PATH": "/usr/bin"},
-  "timeout": 30
-}
-```
+| args | 类型 | 必填 | 默认值 | 说明 |
+|---|---|---|---|---|
+| `path` | string | 是 | — | 文件绝对路径 |
+| `binary` | bool | 否 | `false` | `true` 时 `data` 为 **hex** 编码;`false` 为 UTF-8 文本 |
 
-| 参数          | 类型                       | 必填 | 默认值         | 说明                                                                 |
-|---------------|----------------------------|------|----------------|----------------------------------------------------------------------|
-| `{id}`（路径） | string                     | 是   | —              | 沙箱实例 ID，create 返回的 `instance_id`                               |
-| `command`     | string \| array\<string\>  | 是   | —              | 命令。字符串经沙箱内 `/bin/sh -c` 执行；数组直接执行、不经 shell          |
-| `working_dir` | string                     | 否   | 沙箱工作目录    | 本次命令的工作目录                                                     |
-| `env`         | object\<string,string\>    | 否   | 继承沙箱环境变量 | 命令环境变量；指定时**整体替换**沙箱默认环境（不合并）                     |
-| `timeout`     | number                     | 否   | 不限时         | 超时秒数，必须大于 0                                                    |
-| `trace_id`    | string                     | 否   | 后端自行生成    | 链路追踪 ID，1-128 字符，仅允许 `A-Z a-z 0-9 _ - . :`                    |
+响应:`{"data": "...", "error": null}`;action 级失败(如缺文件):
+`{"data": null, "error": "read file failed: ..."}`(仍 HTTP 200)。
 
-**成功响应（200）**：
+**action `file.write`**——整写(自动创建父目录):
+
+| args | 类型 | 必填 | 默认值 | 说明 |
+|---|---|---|---|---|
+| `path` | string | 是 | — | 目标路径 |
+| `data` | string | 是 | — | 内容;`binary=true` 时为 **hex** |
+| `binary` | bool | 否 | `false` | 编码选择,同 `file.read` |
+
+响应:`{"name": "a.txt", "path": "/ws/a.txt", "type": "file", "size": 5,
+"error": null}`。
+
+**action `file.list`**——目录列表:
+
+| args | 类型 | 必填 | 默认值 | 说明 |
+|---|---|---|---|---|
+| `path` | string | 是 | — | 目录路径 |
+| `depth` | int | 否 | `1`(clamp 1–64) | 递归深度 |
+
+响应条目对齐 execd 结构——`type` 为类别(`file`/`dir`)、`modified_time`
+为 unix 秒、`permissions` 恒 `null`(py 底层无权限数据;execd 实现返回
+八进制权限串,属两实现的已知差异):
 
 ```json
-{
-  "returncode": 0,
-  "stdout": "total 0\ndrwxr-xr-x  2 root root  40 Aug 31 12:00 .\n",
-  "stderr": ""
-}
+{"entries": [{"name": "a.py", "path": "/ws/a.py", "type": "file",
+              "size": 1024, "permissions": null,
+              "modified_time": 1695441203.5}], "error": null}
 ```
 
-**命令执行失败不是 HTTP 错误**——命令非零退出、超时、非法命令均在 200 响应中
-以 `returncode` 表达：
-
-命令超时（200，命令进程被终止）：
-
-```json
-{
-  "returncode": -1,
-  "stdout": "",
-  "stderr": "Command timed out after 30 seconds"
-}
-```
-
-非法命令（200，如空数组、数组含非字符串元素，命令不执行）：
-
-```json
-{
-  "returncode": -1,
-  "stdout": "",
-  "stderr": "Error: cmd list cannot be empty"
-}
-```
-
-**失败响应**：
-
-- 400——缺 `command`，或 `working_dir`/`env`/`timeout`/`trace_id` 类型非法、
-  `timeout <= 0`：
-
-  ```json
-  {"message": "command is required"}
-  ```
-
-- 404——`{id}` 对应的沙箱不存在：
-
-  ```json
-  {"message": "sandbox 34420000-0000-4000-886a-980025037460 not found"}
-  ```
-
-- 500——底层 RPC 异常：
-
-  ```json
-  {"message": "execute failed: rpc timeout"}
-  ```
-
-### 4. 读文件：`GET /v1/sandbox/sandboxes/{id}/files/read`
-
-```http
-GET /v1/sandbox/sandboxes/34420000-0000-4000-886a-980025037460/files/read?path=/sandbox/data.txt&mode=r HTTP/1.1
-```
-
-| 参数          | 类型  | 必填 | 默认值       | 说明                                                  |
-|---------------|-------|------|--------------|-------------------------------------------------------|
-| `{id}`（路径） | string | 是  | —            | 沙箱实例 ID，create 返回的 `instance_id`                |
-| `path`        | query | 是   | —            | 沙箱内文件绝对路径                                      |
-| `mode`        | query | 否   | `rb`         | 打开模式：`rb`（二进制）/ `r`（文本）                     |
-| `trace_id`    | query | 否   | 后端自行生成  | 链路追踪 ID，1-128 字符，仅允许 `A-Z a-z 0-9 _ - . :`     |
-
-**成功响应（200），文本模式**——`mode=r` 时 `content` 为文件文本，
-`content_encoding` 为 `text`：
-
-```json
-{
-  "path": "/sandbox/data.txt",
-  "mode": "r",
-  "content": "hello sandbox",
-  "content_encoding": "text"
-}
-```
-
-**成功响应（200），二进制模式**——`mode=rb`（默认）时 `content` 为文件内容的
-Base64 编码，`content_encoding` 为 `base64`：
-
-```json
-{
-  "path": "/sandbox/payload.bin",
-  "mode": "rb",
-  "content": "AAECAw==",
-  "content_encoding": "base64"
-}
-```
-
-读取通过 RPC 调用沙箱内原生 Python `open`，不依赖沙箱内的 shell 工具，
-最小镜像（无 tar/cat/sh）也可用。
-
-**失败响应**：
-
-- 400——缺 `path`：
-
-  ```json
-  {"message": "path is required"}
-  ```
-
-- 404——`{id}` 对应的沙箱不存在：
-
-  ```json
-  {"message": "sandbox 34420000-0000-4000-886a-980025037460 not found"}
-  ```
-
-- 500——沙箱内文件不存在或不可读：
-
-  ```json
-  {"message": "read file failed: [Errno 2] No such file or directory: '/sandbox/data.txt'"}
-  ```
-
-### 5. 写文件：`PUT /v1/sandbox/sandboxes/{id}/files/write`
-
-`path`/`mode` 走 URL query，文件内容为请求 body（原始内容，非 JSON）。
-
-文本写入（`mode=w`，body 为原文本，须为 UTF-8 编码）：
-
-```http
-PUT /v1/sandbox/sandboxes/34420000-0000-4000-886a-980025037460/files/write?path=/sandbox/output.txt&mode=w HTTP/1.1
-Content-Type: text/plain
-
-hello sandbox
-```
-
-二进制写入（`mode=wb`，body 为 Base64 编码字符串）：
-
-```http
-PUT /v1/sandbox/sandboxes/34420000-0000-4000-886a-980025037460/files/write?path=/sandbox/payload.bin&mode=wb HTTP/1.1
-Content-Type: text/plain
-
-AAECAw==
-```
-
-| 参数          | 类型                  | 必填 | 默认值       | 说明                                                              |
-|---------------|-----------------------|------|--------------|-------------------------------------------------------------------|
-| `{id}`（路径） | string                | 是   | —            | 沙箱实例 ID，create 返回的 `instance_id`                            |
-| `path`        | query                 | 是   | —            | 沙箱内文件绝对路径，父目录自动创建                                   |
-| `mode`        | query                 | 否   | `wb`         | `wb`（写二进制）/ `w`（写文本）/ `a`（追加文本）/ `ab`（追加二进制）    |
-| body          | string                | 是   | —            | 文件内容。`mode` 含 `b` 时 body 须为 Base64 字符串，否则为 UTF-8 文本 |
-| `trace_id`    | query                 | 否   | 后端自行生成  | 链路追踪 ID，1-128 字符，仅允许 `A-Z a-z 0-9 _ - . :`                 |
-
-body 编码方式由 `mode` 自动决定，调用方无需额外声明。注意：空 body 会被拒绝
-（400），因此无法通过本接口写入空文件。
-
-**成功响应（200）**：
-
-```json
-{
-  "success": true,
-  "path": "/sandbox/output.txt"
-}
-```
-
-**失败响应**：
-
-- 400——缺 `path`、body 为空、缺 `Content-Length`、二进制模式 body 非法
-  Base64、文本模式 body 非 UTF-8：
-
-  ```json
-  {"message": "invalid base64 content: Incorrect padding"}
-  ```
-
-- 404——`{id}` 对应的沙箱不存在：
-
-  ```json
-  {"message": "sandbox 34420000-0000-4000-886a-980025037460 not found"}
-  ```
-
-- 500——沙箱内写入失败（如权限不足）：
-
-  ```json
-  {"message": "write file failed: [Errno 13] Permission denied: '/sandbox/output.txt'"}
-  ```
-
-### 6. 列目录：`GET /v1/sandbox/sandboxes/{id}/files/list`
-
-```http
-GET /v1/sandbox/sandboxes/34420000-0000-4000-886a-980025037460/files/list?path=/sandbox&recursive=true&max_depth=2&include_files=true&include_dirs=true HTTP/1.1
-```
-
-| 参数              | 类型          | 必填 | 默认值      | 说明                                                                  |
-|-------------------|---------------|------|-------------|-----------------------------------------------------------------------|
-| `{id}`（路径）     | string        | 是   | —           | 沙箱实例 ID，create 返回的 `instance_id`                                 |
-| `path`            | query         | 是   | —           | 沙箱内目录绝对路径                                                      |
-| `recursive`       | query（bool） | 否   | `false`     | 是否递归列举子目录；仅接受 `true`/`false`（大小写不敏感）                  |
-| `include_files`   | query（bool） | 否   | `true`      | 结果是否包含文件                                                        |
-| `include_dirs`    | query（bool） | 否   | `true`      | 结果是否包含目录                                                        |
-| `max_depth`       | query（int）  | 否   | `20`        | 最大递归深度，`>=0`；仅在 `recursive=true` 时生效，传 `0` 等同未指定       |
-| `trace_id`        | query         | 否   | 后端自行生成 | 链路追踪 ID，1-128 字符，仅允许 `A-Z a-z 0-9 _ - . :`                     |
-
-**成功响应（200）**：
-
-```json
-{
-  "items": [
-    {
-      "name": "data.txt",
-      "path": "/sandbox/data.txt",
-      "size": 12,
-      "is_directory": false,
-      "modified_time": "2026-08-31T12:00:00.123456",
-      "type": ".txt"
-    },
-    {
-      "name": "logs",
-      "path": "/sandbox/logs",
-      "size": 0,
-      "is_directory": true,
-      "modified_time": "2026-08-31T11:30:00.456789",
-      "type": null
-    }
-  ]
-}
-```
-
-`items` 内每个条目的字段：
-
-- `name`：文件/目录名（不含路径）。
-- `path`：沙箱内绝对路径。
-- `size`：字节数；目录恒为 `0`。
-- `is_directory`：是否为目录。
-- `modified_time`：最后修改时间，沙箱本地时间、微秒精度、不带时区
-  （格式 `YYYY-MM-DDTHH:MM:SS.ffffff`）。
-- `type`：文件扩展名（含点，如 `.txt`）；目录或无扩展名的文件为 `null`。
-
-结果最多返回 10000 条，达到上限后静默截断；无法读取的子目录会被跳过。
-
-**失败响应**：
-
-- 400——缺 `path`、`max_depth` 非整数或为负、布尔参数非 `true`/`false`：
-
-  ```json
-  {"message": "recursive must be a boolean ('true' or 'false')"}
-  ```
-
-- 404——`{id}` 对应的沙箱不存在：
-
-  ```json
-  {"message": "sandbox 34420000-0000-4000-886a-980025037460 not found"}
-  ```
-
-- 500——沙箱内目录不存在：
-
-  ```json
-  {"message": "list files failed: path not found: /sandbox"}
-  ```
-
-### 7. 搜索文件：`GET /v1/sandbox/sandboxes/{id}/files/search`
-
-```http
-GET /v1/sandbox/sandboxes/34420000-0000-4000-886a-980025037460/files/search?path=/sandbox&pattern=*.txt&exclude_patterns=ignore*,*.bak HTTP/1.1
-```
-
-| 参数                 | 类型           | 必填 | 默认值       | 说明                                                                   |
-|----------------------|----------------|------|--------------|------------------------------------------------------------------------|
-| `{id}`（路径）        | string         | 是   | —            | 沙箱实例 ID，create 返回的 `instance_id`                                  |
-| `path`               | query          | 是   | —            | 搜索根目录绝对路径                                                       |
-| `pattern`            | query          | 是   | —            | glob 匹配模式（如 `*.txt`），对**文件名**匹配；只返回文件，不返回目录       |
-| `exclude_patterns`   | query（array） | 否   | 无           | 排除模式列表，逗号分隔（如 `ignore*,*.bak`），同样对文件名匹配              |
-| `trace_id`           | query          | 否   | 后端自行生成 | 链路追踪 ID，1-128 字符，仅允许 `A-Z a-z 0-9 _ - . :`                      |
-
-搜索在 `path` 下递归进行，匹配的文件按条目返回。
-
-**成功响应（200）**：
-
-```json
-{
-  "items": [
-    {
-      "name": "data.txt",
-      "path": "/sandbox/data.txt",
-      "size": 12,
-      "is_directory": false,
-      "modified_time": "2026-08-31T12:00:00.123456",
-      "type": ".txt"
-    }
-  ]
-}
-```
-
-`items` 内每个条目的字段：
-
-- `name`：文件名（不含路径）。
-- `path`：沙箱内绝对路径。
-- `size`：字节数。
-- `is_directory`：是否为目录（本接口恒为 `false`）。
-- `modified_time`：最后修改时间，沙箱本地时间、微秒精度、不带时区
-  （格式 `YYYY-MM-DDTHH:MM:SS.ffffff`）。
-- `type`：文件扩展名（含点，如 `.txt`）；无扩展名的文件为 `null`。
-
-**无匹配（200）**——没有文件命中，或搜索根目录不存在（不报错），均返回空
-列表；无法读取的子目录会被跳过：
-
-```json
-{
-  "items": []
-}
-```
-
-**失败响应**：
-
-- 400——缺 `path` 或 `pattern`：
-
-  ```json
-  {"message": "pattern is required"}
-  ```
-
-- 404——`{id}` 对应的沙箱不存在：
-
-  ```json
-  {"message": "sandbox 34420000-0000-4000-886a-980025037460 not found"}
-  ```
-
-- 500——底层 RPC 异常：
-
-  ```json
-  {"message": "search files failed: rpc timeout"}
-  ```
+**action `file.search`**——文件名通配符递归搜索:
+
+| args | 类型 | 必填 | 默认值 | 说明 |
+|---|---|---|---|---|
+| `path` | string | 是 | — | 搜索根目录 |
+| `pattern` | string | 是 | — | 文件名 fnmatch 通配符(如 `*.log`) |
+| `exclude_patterns` | array\<string\> | 否 | 无 | 排除模式(同为文件名 fnmatch) |
+| `depth` | int | 否 | `64`(clamp 1–64) | 递归深度上限,适配层按相对路径层数过滤 |
+
+响应:`file.list` 形态的文件条目,仅含匹配文件。
 
 ### 生命周期与回收
 
-- `instance_id` 即平台实例 ID（UUID 形态）；functionsystem 内部维护实例到
-  物理沙箱的映射，调用方无需感知物理沙箱 ID。
-- create 同步阻塞：返回 200 即就绪，失败 500，无需轮询。
-- 多实例：可同时 create 多个沙箱，按 id 各自操作、互相隔离，删除一个不影响
-  其他。
-- 兜底销毁：FaaS `pre_stop` 触发 Executor `stop()` 时，按「停 HTTP Server →
-  按 grace 停用户进程 → `terminate_all()` 尽力销毁全部子沙箱」的顺序收尾；
-  启动失败路径同样兜底销毁已创建的沙箱，避免远程容器泄漏。
+- `sandboxId` 与 `instanceId` 同值(平台实例 id,UUID 形态);functionsystem
+  内部维护实例到物理沙箱的映射,调用方无需感知物理沙箱 id。
+- 命名创建:设置 `name` 时,实例以运行时命名空间(`{ns}-{name}`)创建并
+  寻址;适配层钉住 namespace,保证 create 侧注册与 invoke 侧寻址一致。
+- 创建同步阻塞:200 即就绪,500 即失败,无需轮询。
+- 多实例:可同时创建多个沙箱,按 id 独立操作与隔离;删除互不影响。
+- 删除为终态:同一 id 再次删除返回 404。
+- 尽力回收:FaaS `pre_stop` 触发执行器 `stop()` 时,按"停 HTTP Server →
+  宽限停用户进程 → `terminate_all()` 尽力销毁全部子沙箱"的顺序收尾;
+  启动失败路径同样回收已创建的沙箱,避免远端容器泄漏。
 - 沙箱 API 与 `/v1/files/upload`、`/v1/files/download`、`/v1/files/list`
-  管理面文件接口相互独立：后者是 Frontend 与函数实例容器之间的文件传输通道，
-  沙箱 handler 不复用其 `FileHandler`，尺寸上限也各自独立。
-
+  管理面文件端点相互独立:后者是前端与函数实例容器之间的文件传输通道,
+  沙箱 handler 不复用其 `FileHandler`,尺寸上限也相互独立。
 ## 用户进程
 
 Executor 从 `YR_RUNTIME_BOOTSTRAP_CMD` 读取用户进程命令，并保持原 Python

@@ -50,9 +50,23 @@ accepts only loopback-originated requests. Same-machine processes create,
 operate, and destroy **remote child sandbox containers** over loopback HTTP —
 the target is a separate child container, not the function-instance container
 itself. Sandboxes are not precreated: the caller first creates one with
-`POST /v1/sandbox/sandboxes`, receives an `instance_id`, and puts it into the
+`POST /api/sandbox/v1/sandboxes`, receives a sandbox id, and puts it into the
 URL path of subsequent requests; multiple sandboxes are isolated by id, each
 with an independent lifecycle.
+
+The API follows the platform yaml contracts (management plane `sandbox.yaml` +
+data plane `data-plane.yaml`) and consists of two families:
+
+- **Management plane** — `POST /api/sandbox/v1/sandboxes` (create) and
+  `DELETE /api/sandbox/v1/sandboxes/{sandboxId}` (delete). Successes use the
+  Envelope form (`data` is a Base64-encoded JSON payload); failures use the
+  ErrorEnvelope form.
+- **Data plane** — `POST /direct/{instanceId}/invoke`, a single
+  action-dispatch endpoint carrying raw action JSON; action-level failures
+  ride HTTP 200 with the error in the body.
+
+The legacy `/v1/sandbox/sandboxes` prefix is **not registered**: every request
+to it returns 404 `{"message": "endpoint not found"}`.
 
 ### Common conventions
 
@@ -67,519 +81,269 @@ with an independent lifecycle.
   {"message": "sandbox API is loopback-only"}
   ```
 
-- **Resource-style URLs**: paths follow
-  `/v1/sandbox/sandboxes[/{id}[/{action}]]`, with methods chosen by HTTP
-  semantics — pure reads GET, create/action POST, overwrite PUT, delete
-  DELETE.
-- **Request format**: `create`/`execute` request bodies are JSON and must
-  carry `Content-Type: application/json` (otherwise 400); the body may use
-  either `Content-Length` or chunked transfer encoding. The `files/write`
-  body is the raw file content (not JSON) and must carry `Content-Length`
-  (missing → 400).
-- **Size limits**: sandbox API requests (JSON bodies and the raw
-  `files/write` body) and responses each have an independent default limit of
-  512 MiB; exceeding either returns 413. The limits are independent of the
-  Frontend file API's `max_file_size`. Binary content travels Base64-encoded,
-  so its effective size is about three quarters of the limit.
+- **X-Request-Id (management plane)**: optional request identifier (the
+  idempotency key: a retry must keep the same id and the same body). When
+  present it is echoed in the `X-Request-Id` response header on success and
+  error responses alike; when omitted the server generates a UUID and echoes
+  it the same way. The effective id is also reported as `requestId` inside
+  the envelope.
+- **X-Trace-ID** (private convention, outside the contract): optional trace id
+  on both planes. The adapter reads it and passes it to the underlying RPC,
+  and reuses it for the agent enter/exit log pair. The old `trace_id` body
+  field is rejected with 400 (`trace_id moved to X-Trace-ID header`).
+- **Request format**: request bodies are JSON and must carry
+  `Content-Type: application/json` (otherwise 400); the body may use either
+  `Content-Length` or chunked transfer encoding. A body that is not valid
+  JSON, or is not a JSON object, yields 400.
+- **Size limits**: sandbox API requests and responses each have an
+  independent default limit of 512 MiB; exceeding either returns 413. The
+  limits are independent of the Frontend file API's `max_file_size`. Binary
+  content travels hex-encoded (see the file actions), so its effective size
+  is half the limit.
 - **Concurrency**: the HTTP Server processes at most 64 concurrent requests
   globally (across all endpoints); beyond the limit it returns 503 and closes
   the connection:
 
   ```json
-  {"message":"executor is busy"}
+  {"message": "executor is busy"}
   ```
 
-- **trace_id**: every endpoint accepts an optional `trace_id` (in the JSON
-  body for `create`/`execute`, in the URL query for the others), propagated
-  through the whole invoke chain for log correlation. 1-128 characters,
-  restricted to `A-Z a-z 0-9 _ - . :` (covers UUIDs, hex, dotted names); when
-  omitted the backend generates one. Note that an invalid format yields 500,
-  not 400 (validation happens in the underlying call).
-- **Status codes**:
+- **Management-plane error model**: every non-200 management-plane response
+  is an ErrorEnvelope carrying a symbolic code, a retry hint and an outcome,
+  plus the effective request id both in the header and the body:
 
-  | Code | Trigger |
-  |---|---|
-  | 200 | Success (including business-level results such as a command exiting non-zero; see each endpoint) |
-  | 400 | Request errors: missing parameters, invalid types/values, wrong `Content-Type`, etc. |
-  | 403 | Request source is not a loopback address |
-  | 404 | URL shape unregistered, or the `{id}` in the path has no matching sandbox (`DELETE` returns an idempotent 200 for a nonexistent `{id}`) |
-  | 405 | Path exists but the HTTP method is unregistered; the response carries an `Allow` header (e.g. GET on `.../{id}/execute` returns `Allow: POST`); a nonexistent `{id}` takes precedence and returns 404 |
-  | 413 | Request or response body exceeds the 512 MiB limit |
-  | 500 | Underlying RPC/IO failure; `message` is the underlying cause prefixed with the operation (e.g. `execute failed: rpc timeout`) |
-  | 503 | Concurrency exceeds 64 |
+  ```json
+  {"code": 400, "message": "cpu must be an integer", "data": null,
+   "error": {"code": "invalid", "retry": "never",
+             "outcome": "not_started", "requestId": "req-create-013"}}
+  ```
 
-All error response bodies are JSON of the form `{"message": "..."}`.
+  | HTTP | error.code | retry | outcome | Trigger |
+  |---|---|---|---|---|
+  | 400 | `invalid` | `never` | `not_started` | Parameter type/value errors, wrong `Content-Type`, invalid JSON |
+  | 404 | `not_found` | `never` | `terminal` | Unknown sandbox id, unregistered sub-resource |
+  | 405 | `method_not_allowed` | `never` | `not_started` | Path exists but the method is not registered; the response carries `Allow` |
+  | 413 | `too_large` | `never` | `not_started` | Request or response exceeds the size limit |
+  | 500 | `internal` | `after_backoff` | `unknown` | Underlying RPC/IO failure |
 
-### 1. Create sandbox: `POST /v1/sandbox/sandboxes`
+- **Data-plane error model**: transport and argument errors (400 unknown
+  action or bad args, 404 unknown instance or path shape, 405 with `Allow`,
+  413, 500) return `{"error": "..."}` bodies. Action-level failures — the
+  dispatch went through but the operation itself failed (missing file, RPC
+  failure, ...) — ride HTTP 200 with the error inside the action result (see
+  each action below).
+
+### 1. Create sandbox: `POST /api/sandbox/v1/sandboxes`
 
 ```http
-POST /v1/sandbox/sandboxes HTTP/1.1
+POST /api/sandbox/v1/sandboxes HTTP/1.1
 Content-Type: application/json
+X-Request-Id: req-create-013
+X-Trace-ID: trace-abc
 
 {
   "image": "python:3.12-slim",
-  "cpu": 1000,
-  "memory": 2048,
-  "sandbox_type": "supervisor",
-  "ports": ["tcp:8080", "9090"],
-  "upstream": "127.0.0.1:8000",
-  "working_dir": "/sandbox",
+  "runtime": "supervisor",
+  "cpu": 2000,
+  "memory": 4096,
   "env": {"PATH": "/usr/bin"},
-  "idle_timeout": 600
+  "ports": ["tcp:8080"],
+  "idle_timeout": 600,
+  "extra_config": {"working_dir": "/sandbox"}
 }
 ```
 
-| Parameter      | Type                     | Required | Default                  | Description                                                                                          |
-|----------------|--------------------------|----------|--------------------------|------------------------------------------------------------------------------------------------------|
-| `image`        | string                   | no       | none                     | Docker image name; effective only when `sandbox_type="docker"`                                        |
-| `cpu`          | int                      | no       | none                     | CPU resource, millicores                                                                             |
-| `memory`       | int                      | no       | none                     | Memory, MB                                                                                           |
-| `sandbox_type` | string                   | no       | `""`                     | Sandbox executor type: `""`/`"supervisor"`/`"docker"`                                                |
-| `ports`        | array\<string\>          | no       | none                     | Port forwarding list; each element is `"proto:port"` (e.g. `"tcp:8080"`) or `"port"`                  |
-| `upstream`     | string                   | no       | none                     | Reverse tunnel upstream, a local service address `host:port`, e.g. `"127.0.0.1:8000"`                |
-| `working_dir`  | string                   | no       | temp dir inside sandbox  | Working directory inside the sandbox                                                                  |
-| `env`          | object\<string,string\>  | no       | inherit sandbox runtime  | Environment variables; when specified they apply wholesale (not merged with the default environment)  |
-| `idle_timeout` | int                      | no       | `300`                    | Idle timeout in seconds; must be greater than 0                                                      |
-| `user`         | string                   | no       | platform default `agentos` | Container run-as user, passed through as Docker's `Config.User`; accepts any format Docker accepts, e.g. `"1000"`, `"1000:1000"`, `"root"`; effective only when `sandbox_type="docker"` |
-| `trace_id`     | string                   | no       | `""`                     | Trace ID, 1-128 characters restricted to `A-Z a-z 0-9 _ - . :`; generated by the backend when omitted |
+Headers: `X-Request-Id` (optional, generated/echoed), `X-Trace-ID`
+(optional, private tracing).
+
+Body fields (the 13 contract fields the adapter consumes):
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `name` | string | no | none | Sandbox name; the instance is created and addressed under this name |
+| `image` | string | no | none | Docker image name; effective only when `runtime="docker"` |
+| `runtime` | string | no | `""` | Runtime/executor type, passed through to the underlying executor selection; an empty string keeps the backend default executor |
+| `rootfs` | string or object | no | none | Root filesystem: a string is passed through as-is; an object `{type, imageurl, ...}` is assembled into the rootfs JSON with `mounts` merged in. Mutually exclusive with `image` |
+| `cpu` | int | no | none | CPU resource, millicores |
+| `memory` | int | no | none | Memory, MiB |
+| `env` | object\<string,string\> | no | inherit sandbox runtime | Environment variables; when specified they apply wholesale (not merged with the default environment) |
+| `ports` | array\<string\> | no | none | Port forwarding list; each element is `"proto:port"` (e.g. `"tcp:8080"`) or `"port"` |
+| `idleTimeoutSeconds` | int | no | `300` | Idle timeout in seconds; must be non-negative (0 allowed). `idle_timeout` is accepted as a legacy alias |
+| `mounts` | array\<object\> | no | none | Mount declarations; merged verbatim into the rootfs JSON `mounts` key and passed to the backend. Requires an object `rootfs` or `image` (a string `rootfs` cannot carry mounts) |
+| `snapshotId` | string | no | none | Create from a snapshot: the request is routed to the restore branch (`Sandbox(checkpoint_id=...)`) and all other parameters are ignored |
+| `tunnel` | object | no | none | `{enabled, proxyPort}`: `proxyPort` maps to the underlying proxy port; `enabled=true` requires `extra_config.upstream` (else 400); `enabled=false` explicitly disables the upstream-implied tunnel |
+| `extra_config` | object | no | none | Runtime custom-key channel: the keys `upstream`/`working_dir`/`user` are extracted and mapped to the corresponding underlying fields; the remaining keys are passed through as a whole |
+
+The executor type is carried by the top-level `runtime` field. The private
+fields `upstream`/`working_dir`/`user` live inside `extra_config`, and
+`trace_id` in the `X-Trace-ID` header: a body carrying any of them at the top
+level — or `sandbox_type` inside `extra_config` — returns 400 with a hint
+about the accepted location.
 
 **Success (200)** — create is synchronous and blocking: a 200 means the child
 sandbox is ready (creation includes a readiness verification), no polling
-required:
+required. The response header echoes `X-Request-Id`; `data` is a Base64-encoded
+JSON payload:
 
 ```json
-{
-  "instance_id": "34420000-0000-4000-886a-980025037460"
-}
+{"code": 200, "message": "ok",
+ "data": "eyJzYW5kYm94SWQiOiJzYngtMTIzIi..."}
 ```
 
-`instance_id` is the platform instance ID (UUID form); all subsequent
-operations put it into the `{id}` segment of the URL path.
+The `data` payload decodes to:
 
-**Failure responses**:
+```json
+{"sandboxId": "34420000-0000-4000-886a-980025037460",
+ "instanceId": "34420000-0000-4000-886a-980025037460",
+ "status": "running", "requestId": "req-create-013"}
+```
 
-- 400 — invalid parameter type/value, e.g. `ports` not an array of strings,
-  `env` with non-string keys/values, `cpu`/`memory`/`idle_timeout` not
-  integers, `idle_timeout <= 0`, `trace_id` not a string:
+`sandboxId` and `instanceId` carry the same value (the platform instance id
+returned by the underlying create); `status` is always `"running"` and
+`requestId` is the effective request id. All subsequent operations put the id
+into the URL path.
 
-  ```json
-  {"message": "idle_timeout must be greater than zero"}
-  ```
+**Failure responses** use the ErrorEnvelope form, e.g.:
 
+- 400 — invalid parameter type/value (`cpu must be an integer`,
+  `idle_timeout must be non-negative`, `rootfs and image are mutually
+  exclusive`, `tunnel.enabled=true requires extra_config.upstream`, ...).
 - 500 — creation failed; `message` is `create sandbox failed: ` plus the
-  underlying cause. Note that `ports` element format (`proto:port`) is only
-  validated at creation time, so an invalid element (e.g. `"tcp:8080:9"`,
-  `"tcp:abc"`) also yields 500, not 400:
+  underlying cause (`Failed to initialize sandbox instance: ...`). Note that
+  `ports` element format (`proto:port`) is only validated at creation time,
+  so an invalid element also surfaces as 500.
 
-  ```json
-  {"message": "create sandbox failed: rpc timeout"}
-  ```
-
-### 2. Delete sandbox: `DELETE /v1/sandbox/sandboxes/{id}`
+### 2. Delete sandbox: `DELETE /api/sandbox/v1/sandboxes/{sandboxId}`
 
 ```http
-DELETE /v1/sandbox/sandboxes/34420000-0000-4000-886a-980025037460 HTTP/1.1
+DELETE /api/sandbox/v1/sandboxes/34420000-0000-4000-886a-980025037460 HTTP/1.1
+X-Request-Id: req-del-007
 ```
 
-| Parameter      | Type   | Required | Default | Description                                                |
-|----------------|--------|----------|---------|-------------------------------------------------------------|
-| `{id}` (path)  | string | yes      | —       | Sandbox instance ID, the `instance_id` returned by create   |
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `{sandboxId}` (path) | string | yes | Sandbox id, the `sandboxId`/`instanceId` returned by create |
+| `X-Request-Id` (header) | string | no | Generated/echoed like on create |
 
 No request body.
 
-**Success (200)**:
+**Success (200)** — `data` decodes to `{"success": true}`:
 
 ```json
-{
-  "success": true
-}
+{"code": 200, "message": "ok", "data": "eyJzdWNjZXNzIjp0cnVlfQ=="}
 ```
 
-**Idempotent delete (200)** — when `{id}` does not exist no underlying
-terminate request is sent and the response is still 200; repeated deletes are
-safe:
+**Sandbox not found (404)** — deleting an unknown or already-deleted sandbox
+returns 404 with an ErrorEnvelope (changed from the legacy 200 +
+`success:false`):
 
 ```json
-{
-  "success": false,
-  "message": "sandbox not found"
-}
+{"code": 404, "message": "sandbox sbx-123 not found", "data": null,
+ "error": {"code": "not_found", "retry": "never", "outcome": "terminal",
+           "requestId": "req-del-007"}}
 ```
 
-**Failure (500)** — returned only when the underlying terminate RPC raises
-(e.g. the platform-side instance was already reclaimed); `message` is the
-underlying original cause:
+### 3. Invoke action: `POST /direct/{instanceId}/invoke`
+
+A single data-plane endpoint dispatches the supported actions. The response
+is raw action JSON (no envelope); action-level failures ride HTTP 200 with
+the error in the body.
+
+Common parameters:
+
+| Parameter | Location | Required | Default | Description |
+|---|---|---|---|---|
+| `{instanceId}` | path | yes | — | Sandbox instance id |
+| `X-ADX-Request-ID` | header | no | see `requestId` | Request identifier (idempotency key); priority: header > body.requestId > server-generated UUID |
+| `X-Trace-ID` | header | no | `""` | Trace id (private convention, outside the contract) |
+| `action` | body | yes | — | One of the 6 supported actions: `process.exec`, `process.run`, `file.read`, `file.write`, `file.list`, `file.search`. Contract actions outside this set — including the chunked `file.read_chunk`/`file.write_chunk` — return 400 |
+| `args` | body | no | `{}` | Per-action arguments (below) |
+| `requestId` | body | no | server-generated UUID | Body form of the request identifier |
+
+**action `process.exec` / `process.run`** — command execution (the two names
+are synonyms):
+
+| args | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `cmd` | string | one of `cmd`/`command` (`cmd` wins) | none | Shell command |
+| `command` | string | no | none | `cmd` alias |
+| `cwd` | string | no | none | Working directory (`working_dir` accepted as an alias) |
+| `envs` | object\<string,string\> | no | none | Environment variables (`env` accepted as an alias) |
+| `timeout` | number, >= 0 | no | unlimited | Timeout in seconds |
 
 ```json
-{
-  "message": "instance not found"
-}
+{"action": "process.exec", "args": {"cmd": "ls -la", "cwd": "/ws", "timeout": 300},
+ "requestId": "invoke-001"}
 ```
 
-### 3. Execute command: `POST /v1/sandbox/sandboxes/{id}/execute`
+Response: `{"stdout": "...", "stderr": "...", "exit_code": 0}` — note
+`exit_code` (the legacy `returncode` field was renamed). An RPC failure still
+returns 200: `{"stdout": "", "stderr": "execute failed: ...", "exit_code": -1}`.
 
-```http
-POST /v1/sandbox/sandboxes/34420000-0000-4000-886a-980025037460/execute HTTP/1.1
-Content-Type: application/json
+**action `file.read`** — whole-file read:
 
-{
-  "command": ["ls", "-la"],
-  "working_dir": "/tmp",
-  "env": {"PATH": "/usr/bin"},
-  "timeout": 30
-}
-```
+| args | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `path` | string | yes | — | Absolute file path |
+| `binary` | bool | no | `false` | `true`: `data` is **hex**-encoded; `false`: UTF-8 text |
 
-| Parameter      | Type                      | Required | Default                | Description                                                                    |
-|----------------|---------------------------|----------|------------------------|---------------------------------------------------------------------------------|
-| `{id}` (path)  | string                    | yes      | —                      | Sandbox instance ID, the `instance_id` returned by create                        |
-| `command`      | string \| array\<string\> | yes      | —                      | Command. A string runs via `/bin/sh -c` inside the sandbox; an array executes directly without a shell |
-| `working_dir`  | string                    | no       | sandbox working dir    | Working directory for this command                                               |
-| `env`          | object\<string,string\>   | no       | inherit sandbox env    | Command environment variables; when specified they **replace** the sandbox default environment wholesale (not merged) |
-| `timeout`      | number                    | no       | no limit               | Timeout in seconds; must be greater than 0                                       |
-| `trace_id`     | string                    | no       | generated by backend   | Trace ID, 1-128 characters restricted to `A-Z a-z 0-9 _ - . :`                    |
+Response: `{"data": "...", "error": null}`; action failure (e.g. missing
+file): `{"data": null, "error": "read file failed: ..."}` (still HTTP 200).
 
-**Success (200)**:
+**action `file.write`** — whole-file write (parent directories created
+automatically):
+
+| args | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `path` | string | yes | — | Target path |
+| `data` | string | yes | — | Content; **hex** when `binary=true` |
+| `binary` | bool | no | `false` | Encoding selector, same as `file.read` |
+
+Response: `{"name": "a.txt", "path": "/ws/a.txt", "type": "file", "size": 5,
+"error": null}`.
+
+**action `file.list`** — directory listing:
+
+| args | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `path` | string | yes | — | Directory path |
+| `depth` | int | no | `1` (clamped to 1–64) | Recursion depth |
+
+Response entries align with the execd structure — `type` is the category
+(`file`/`dir`), `modified_time` is unix seconds, and `permissions` is always
+`null` (the Python layer has no permission data; a known difference from the
+execd implementation, which returns an octal permission string):
 
 ```json
-{
-  "returncode": 0,
-  "stdout": "total 0\ndrwxr-xr-x  2 root root  40 Aug 31 12:00 .\n",
-  "stderr": ""
-}
+{"entries": [{"name": "a.py", "path": "/ws/a.py", "type": "file",
+              "size": 1024, "permissions": null,
+              "modified_time": 1695441203.5}], "error": null}
 ```
 
-**A failed command is not an HTTP error** — non-zero exit, timeout, and
-invalid command are all reported in a 200 response via `returncode`:
-
-Command timeout (200, the command process is killed):
-
-```json
-{
-  "returncode": -1,
-  "stdout": "",
-  "stderr": "Command timed out after 30 seconds"
-}
-```
-
-Invalid command (200, e.g. an empty array or an array with non-string
-elements; the command does not run):
-
-```json
-{
-  "returncode": -1,
-  "stdout": "",
-  "stderr": "Error: cmd list cannot be empty"
-}
-```
-
-**Failure responses**:
-
-- 400 — missing `command`, or invalid type for
-  `working_dir`/`env`/`timeout`/`trace_id`, or `timeout <= 0`:
-
-  ```json
-  {"message": "command is required"}
-  ```
-
-- 404 — no sandbox for `{id}`:
-
-  ```json
-  {"message": "sandbox 34420000-0000-4000-886a-980025037460 not found"}
-  ```
-
-- 500 — underlying RPC failure:
-
-  ```json
-  {"message": "execute failed: rpc timeout"}
-  ```
-
-### 4. Read file: `GET /v1/sandbox/sandboxes/{id}/files/read`
-
-```http
-GET /v1/sandbox/sandboxes/34420000-0000-4000-886a-980025037460/files/read?path=/sandbox/data.txt&mode=r HTTP/1.1
-```
-
-| Parameter      | Type  | Required | Default              | Description                                                       |
-|----------------|-------|----------|----------------------|--------------------------------------------------------------------|
-| `{id}` (path)  | string | yes     | —                    | Sandbox instance ID, the `instance_id` returned by create           |
-| `path`         | query | yes      | —                    | Absolute path of the file inside the sandbox                       |
-| `mode`         | query | no       | `rb`                 | Open mode: `rb` (binary) / `r` (text)                              |
-| `trace_id`     | query | no       | generated by backend | Trace ID, 1-128 characters restricted to `A-Z a-z 0-9 _ - . :`      |
-
-**Success (200), text mode** — with `mode=r`, `content` is the file text and
-`content_encoding` is `text`:
-
-```json
-{
-  "path": "/sandbox/data.txt",
-  "mode": "r",
-  "content": "hello sandbox",
-  "content_encoding": "text"
-}
-```
-
-**Success (200), binary mode** — with `mode=rb` (default), `content` is the
-Base64-encoded file content and `content_encoding` is `base64`:
-
-```json
-{
-  "path": "/sandbox/payload.bin",
-  "mode": "rb",
-  "content": "AAECAw==",
-  "content_encoding": "base64"
-}
-```
-
-Reading goes through RPC to native Python `open` inside the sandbox, so it
-does not depend on shell tools in the sandbox and works with minimal images
-(no tar/cat/sh).
-
-**Failure responses**:
-
-- 400 — missing `path`:
-
-  ```json
-  {"message": "path is required"}
-  ```
-
-- 404 — no sandbox for `{id}`:
-
-  ```json
-  {"message": "sandbox 34420000-0000-4000-886a-980025037460 not found"}
-  ```
-
-- 500 — file missing or unreadable inside the sandbox:
-
-  ```json
-  {"message": "read file failed: [Errno 2] No such file or directory: '/sandbox/data.txt'"}
-  ```
-
-### 5. Write file: `PUT /v1/sandbox/sandboxes/{id}/files/write`
-
-`path`/`mode` go in the URL query; the file content is the request body (raw
-content, not JSON).
-
-Text write (`mode=w`, body is the raw text, must be UTF-8):
-
-```http
-PUT /v1/sandbox/sandboxes/34420000-0000-4000-886a-980025037460/files/write?path=/sandbox/output.txt&mode=w HTTP/1.1
-Content-Type: text/plain
-
-hello sandbox
-```
-
-Binary write (`mode=wb`, body is a Base64-encoded string):
-
-```http
-PUT /v1/sandbox/sandboxes/34420000-0000-4000-886a-980025037460/files/write?path=/sandbox/payload.bin&mode=wb HTTP/1.1
-Content-Type: text/plain
-
-AAECAw==
-```
-
-| Parameter      | Type    | Required | Default              | Description                                                                    |
-|----------------|---------|----------|----------------------|---------------------------------------------------------------------------------|
-| `{id}` (path)  | string  | yes      | —                    | Sandbox instance ID, the `instance_id` returned by create                        |
-| `path`         | query   | yes      | —                    | Absolute path of the file inside the sandbox; parent directories are created     |
-| `mode`         | query   | no       | `wb`                 | `wb` (write binary) / `w` (write text) / `a` (append text) / `ab` (append binary) |
-| body           | string  | yes      | —                    | File content. When `mode` contains `b` the body must be a Base64 string, otherwise UTF-8 text |
-| `trace_id`     | query   | no       | generated by backend | Trace ID, 1-128 characters restricted to `A-Z a-z 0-9 _ - . :`                   |
-
-The body encoding is decided by `mode`; the caller declares nothing extra.
-Note: an empty body is rejected (400), so an empty file cannot be written
-through this endpoint.
-
-**Success (200)**:
-
-```json
-{
-  "success": true,
-  "path": "/sandbox/output.txt"
-}
-```
-
-**Failure responses**:
-
-- 400 — missing `path`, empty body, missing `Content-Length`, invalid Base64
-  body in a binary mode, or non-UTF-8 body in a text mode:
-
-  ```json
-  {"message": "invalid base64 content: Incorrect padding"}
-  ```
-
-- 404 — no sandbox for `{id}`:
-
-  ```json
-  {"message": "sandbox 34420000-0000-4000-886a-980025037460 not found"}
-  ```
-
-- 500 — write failed inside the sandbox (e.g. permission denied):
-
-  ```json
-  {"message": "write file failed: [Errno 13] Permission denied: '/sandbox/output.txt'"}
-  ```
-
-### 6. List directory: `GET /v1/sandbox/sandboxes/{id}/files/list`
-
-```http
-GET /v1/sandbox/sandboxes/34420000-0000-4000-886a-980025037460/files/list?path=/sandbox&recursive=true&max_depth=2&include_files=true&include_dirs=true HTTP/1.1
-```
-
-| Parameter       | Type           | Required | Default              | Description                                                                    |
-|-----------------|----------------|----------|----------------------|---------------------------------------------------------------------------------|
-| `{id}` (path)   | string         | yes      | —                    | Sandbox instance ID, the `instance_id` returned by create                        |
-| `path`          | query          | yes      | —                    | Absolute path of the directory inside the sandbox                                |
-| `recursive`     | query (bool)   | no       | `false`              | Whether to list subdirectories recursively; accepts only `true`/`false` (case-insensitive) |
-| `include_files` | query (bool)   | no       | `true`               | Whether results include files                                                   |
-| `include_dirs`  | query (bool)   | no       | `true`               | Whether results include directories                                             |
-| `max_depth`     | query (int)    | no       | `20`                 | Maximum recursion depth, `>=0`; effective only with `recursive=true`, passing `0` is the same as omitting it |
-| `trace_id`      | query          | no       | generated by backend | Trace ID, 1-128 characters restricted to `A-Z a-z 0-9 _ - . :`                   |
-
-**Success (200)**:
-
-```json
-{
-  "items": [
-    {
-      "name": "data.txt",
-      "path": "/sandbox/data.txt",
-      "size": 12,
-      "is_directory": false,
-      "modified_time": "2026-08-31T12:00:00.123456",
-      "type": ".txt"
-    },
-    {
-      "name": "logs",
-      "path": "/sandbox/logs",
-      "size": 0,
-      "is_directory": true,
-      "modified_time": "2026-08-31T11:30:00.456789",
-      "type": null
-    }
-  ]
-}
-```
-
-Fields of each entry in `items`:
-
-- `name`: file/directory name (no path).
-- `path`: absolute path inside the sandbox.
-- `size`: size in bytes; always `0` for directories.
-- `is_directory`: whether the entry is a directory.
-- `modified_time`: last modification time — sandbox-local, microsecond
-  precision, no timezone (format `YYYY-MM-DDTHH:MM:SS.ffffff`).
-- `type`: file extension including the dot (e.g. `.txt`); `null` for
-  directories and extensionless files.
-
-At most 10000 entries are returned, silently truncated at the limit;
-unreadable subdirectories are skipped.
-
-**Failure responses**:
-
-- 400 — missing `path`, `max_depth` not an integer or negative, or a boolean
-  parameter that is not `true`/`false`:
-
-  ```json
-  {"message": "recursive must be a boolean ('true' or 'false')"}
-  ```
-
-- 404 — no sandbox for `{id}`:
-
-  ```json
-  {"message": "sandbox 34420000-0000-4000-886a-980025037460 not found"}
-  ```
-
-- 500 — directory does not exist inside the sandbox:
-
-  ```json
-  {"message": "list files failed: path not found: /sandbox"}
-  ```
-
-### 7. Search files: `GET /v1/sandbox/sandboxes/{id}/files/search`
-
-```http
-GET /v1/sandbox/sandboxes/34420000-0000-4000-886a-980025037460/files/search?path=/sandbox&pattern=*.txt&exclude_patterns=ignore*,*.bak HTTP/1.1
-```
-
-| Parameter          | Type            | Required | Default              | Description                                                                     |
-|--------------------|-----------------|----------|----------------------|----------------------------------------------------------------------------------|
-| `{id}` (path)      | string          | yes      | —                    | Sandbox instance ID, the `instance_id` returned by create                         |
-| `path`             | query           | yes      | —                    | Absolute path of the search root inside the sandbox                               |
-| `pattern`          | query           | yes      | —                    | Glob pattern (e.g. `*.txt`) matched against **file names**; only files are returned, never directories |
-| `exclude_patterns` | query (array)   | no       | none                 | Exclusion patterns, comma-separated (e.g. `ignore*,*.bak`), also matched against file names |
-| `trace_id`         | query           | no       | generated by backend | Trace ID, 1-128 characters restricted to `A-Z a-z 0-9 _ - . :`                    |
-
-The search runs recursively under `path`; matching files are returned as
-entries.
-
-**Success (200)**:
-
-```json
-{
-  "items": [
-    {
-      "name": "data.txt",
-      "path": "/sandbox/data.txt",
-      "size": 12,
-      "is_directory": false,
-      "modified_time": "2026-08-31T12:00:00.123456",
-      "type": ".txt"
-    }
-  ]
-}
-```
-
-Fields of each entry in `items`:
-
-- `name`: file name (no path).
-- `path`: absolute path inside the sandbox.
-- `size`: size in bytes.
-- `is_directory`: whether the entry is a directory (always `false` for this
-  endpoint).
-- `modified_time`: last modification time — sandbox-local, microsecond
-  precision, no timezone (format `YYYY-MM-DDTHH:MM:SS.ffffff`).
-- `type`: file extension including the dot (e.g. `.txt`); `null` for
-  extensionless files.
-
-**No match (200)** — no file matched, or the search root does not exist (not
-an error); both return an empty list. Unreadable subdirectories are skipped:
-
-```json
-{
-  "items": []
-}
-```
-
-**Failure responses**:
-
-- 400 — missing `path` or `pattern`:
-
-  ```json
-  {"message": "pattern is required"}
-  ```
-
-- 404 — no sandbox for `{id}`:
-
-  ```json
-  {"message": "sandbox 34420000-0000-4000-886a-980025037460 not found"}
-  ```
-
-- 500 — underlying RPC failure:
-
-  ```json
-  {"message": "search files failed: rpc timeout"}
-  ```
+**action `file.search`** — recursive filename glob search:
+
+| args | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `path` | string | yes | — | Search root |
+| `pattern` | string | yes | — | Filename fnmatch glob (e.g. `*.log`) |
+| `exclude_patterns` | array\<string\> | no | none | Exclusion globs (also filename fnmatch) |
+| `depth` | int | no | `64` (clamped to 1–64) | Recursion depth cap, applied by the adapter over relative path depth |
+
+Response: file entries in the `file.list` shape, only matching files.
 
 ### Lifecycle and reclamation
 
-- `instance_id` is the platform instance ID (UUID form); functionsystem
-  maintains the instance-to-physical-sandbox mapping internally, so callers
-  never need to know the physical sandbox ID.
+- `sandboxId` equals `instanceId` (the platform instance id, UUID form);
+  functionsystem maintains the instance-to-physical-sandbox mapping
+  internally, so callers never need to know the physical sandbox id.
+- Named creates: when `name` is set, the instance is created and addressed
+  under the runtime namespace (`{ns}-{name}`); the adapter pins the namespace
+  so create-side registration and invoke-side addressing stay consistent.
 - create is synchronous and blocking: 200 means ready, 500 means failure, no
   polling.
 - Multiple instances: several sandboxes may be created at once, operated
   independently and isolated by id; deleting one does not affect the others.
+- Delete is terminal: a second delete of the same id returns 404.
 - Best-effort teardown: when the FaaS `pre_stop` triggers the Executor's
   `stop()`, it shuts down in the order "stop HTTP Server → stop user
   processes with grace → `terminate_all()` best-effort destroys every child
@@ -590,7 +354,6 @@ an error); both return an empty list. Unreadable subdirectories are skipped:
   the latter are the file-transfer channel between the Frontend and the
   function-instance container; the sandbox handler does not reuse their
   `FileHandler`, and size limits are separate.
-
 ## User processes
 
 Bootstrap commands are read from `YR_RUNTIME_BOOTSTRAP_CMD` with the same
