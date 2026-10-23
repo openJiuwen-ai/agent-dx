@@ -56,6 +56,8 @@ The API always uses the verified tenant, not tenant fields supplied in a request
 
 Creates with `snapshotId` go directly to Coordinator even in `local_first` mode. Coordinator resolves the snapshot template and, unless the caller supplies placement rules, prefers its source node across scheduling shards for S3/AFS/JuiceFS. Other eligible nodes provide fallback when the source cannot admit the request; local-only snapshots retain a hard source-node constraint.
 
+For E2B `POST /v2/sandboxes`, `Unavailable` from the shared create call or its subsequent control/detail reads maps to HTTP 500. The instance may already exist, so this response must not invite the E2B SDK's automatic retry of HTTP 503 with a new sandbox identity. Authentication and template-preflight failures retain their existing mappings, including 503; create timeouts remain 504, and other E2B routes retain their existing mappings. This adapter rule does not change the native ADX error contract, add request deduplication, or roll back a possibly successful create.
+
 The API Server's legacy `/api/agent` compatibility routes forward to `agent_address` when configured and preserve streaming responses. The separate Agent v2 entrypoint in embedded Ingress may call an in-process Activator; Agent authorization and product rules remain in the Agent layer.
 
 See [HTTP contract](docs/environment-lifecycle-api.md), [failure behavior](docs/environment-runtime-failure.md), [deployment](../../docs/testing/process-deployment.md), and [Rust migration status](../../docs/testing/rust-apiserver.md).

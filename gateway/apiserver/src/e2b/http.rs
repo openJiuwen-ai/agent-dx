@@ -152,9 +152,28 @@ async fn create(
         caller,
         input.metadata.clone(),
     ))
-    .await?;
-    let control = Box::pin(api.clients.environment_control(&id, caller)).await?;
-    Box::pin(sandbox_detail(api, &control, caller)).await
+    .await
+    .map_err(create_execution_error)?;
+    let control = Box::pin(api.clients.environment_control(&id, caller))
+        .await
+        .map_err(create_execution_error)?;
+    Box::pin(sandbox_detail(api, &control, caller))
+        .await
+        .map_err(create_execution_error)
+}
+fn create_execution_error(status: Status) -> Status {
+    // E2B SDKs may retry a create after 503 with a new sandbox identity.
+    // Once creation is attempted, Unavailable cannot prove that nothing started.
+    if status.code() == Code::Unavailable {
+        Status::with_details_and_metadata(
+            Code::Internal,
+            status.message().to_owned(),
+            Bytes::copy_from_slice(status.details()),
+            status.metadata().clone(),
+        )
+    } else {
+        status
+    }
 }
 async fn list(api: &Api, query: &str, caller: &pb::CallerContext) -> Result<Value, Status> {
     let query = list_query(query)?;

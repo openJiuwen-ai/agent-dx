@@ -1,4 +1,6 @@
 //! Replay capacity is a cache budget, never a create admission limit.
+#[path = "support/e2b_create_errors.rs"]
+mod e2b_create_errors;
 #[path = "support/http.rs"]
 mod http;
 #[path = "support/templates.rs"]
@@ -41,6 +43,8 @@ struct State {
     create_calls: AtomicUsize,
     lookups: AtomicUsize,
     response_error: AtomicUsize,
+    auth_error: AtomicUsize,
+    control_error: AtomicUsize,
     scheduling_expired: AtomicBool,
     block_response: AtomicBool,
     pending_response: AtomicBool,
@@ -200,6 +204,10 @@ assignment: Some(pb::Assignment { environment_id: spec.id.clone(), node_id: "nod
         Ok(Response::new(pb::ListEnvironmentMetadataResponse { records: records[start..end].to_vec(), next_cursor }))
     }
     async fn get_environment_control(&self, request: Request<pb::GetEnvironmentControlRequest>) -> Result<Response<pb::EnvironmentControlRecord>, Status> {
+        let error = tonic::Code::from_i32(self.0.control_error.load(Ordering::SeqCst) as i32);
+        if error != tonic::Code::Ok {
+            return Err(Status::new(error, "injected control read failure"));
+        }
         let id = request.into_inner().id;
         let owner = self.0.owners.lock().unwrap().get(&id).cloned()
             .ok_or_else(|| Status::not_found("environment not found"))?;
@@ -239,6 +247,10 @@ impl pb::auth_service_server::AuthService for Service {
         &self,
         request: Request<pb::VerifyApiKeyRequest>,
     ) -> Result<Response<pb::VerifyApiKeyResponse>, Status> {
+        let error = tonic::Code::from_i32(self.0.auth_error.load(Ordering::SeqCst) as i32);
+        if error != tonic::Code::Ok {
+            return Err(Status::new(error, "injected authentication failure"));
+        }
         if request.into_inner().api_key.len() < 32 {
             return Err(Status::unauthenticated("invalid API key"));
         }
